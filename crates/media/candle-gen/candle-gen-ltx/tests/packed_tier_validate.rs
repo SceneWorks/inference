@@ -98,7 +98,7 @@ fn render_tier(env: &str, tag: &str) {
 
     let (frames, fps) = match out {
         GenerationOutput::Video { frames, fps, .. } => (frames, fps),
-        GenerationOutput::Images(_) => panic!("{tag}: expected video, got images"),
+        _ => panic!("{tag}: expected video, got images"),
     };
     assert!(!frames.is_empty(), "{tag}: no frames rendered");
     eprintln!("[{tag}] {} frame(s) @ {fps}fps", frames.len());

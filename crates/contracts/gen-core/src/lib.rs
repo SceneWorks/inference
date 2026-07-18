@@ -40,9 +40,9 @@ pub use control::{require_base_dir, require_control, AcceptedControlKinds, Contr
 pub use error::{Error, Result};
 pub use face::{DetectedFace, FaceEmbedder, FaceEmbedderDescriptor};
 pub use generator::{
-    default_seed, Capabilities, Conditioning, ConditioningKind, ControlClipRef, ControlKind,
-    GenerationOutput, GenerationRequest, Generator, KeyframeRef, Modality, ModelDescriptor,
-    ReplacementMode, VideoClipRef,
+    default_seed, AudioParams, Capabilities, Conditioning, ConditioningKind, ControlClipRef,
+    ControlKind, GenerationOutput, GenerationRequest, Generator, KeyframeRef, Modality,
+    ModelDescriptor, ReplacementMode, VideoClipRef,
 };
 pub use image_embed::{ImageEmbedder, ImageEmbedderDescriptor};
 pub use json_constraint::JsonState;

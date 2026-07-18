@@ -1,9 +1,10 @@
-//! The `Generator` contract — prompt-conditioned synthesis of image **or** video (or both),
-//! including multi-modal models. See `docs/MODEL_ARCHITECTURE.md` §3.1.
+//! The `Generator` contract — prompt-conditioned synthesis of image, video, **or** audio
+//! (or a mix), including multi-modal models. See `docs/MODEL_ARCHITECTURE.md` §3.1.
 //!
 //! One trait covers everything text→media: T2I, T2V, edit (image+text→image), LTX
-//! (text→video+audio). Modality is a [`ModelDescriptor`] property plus a [`GenerationOutput`]
-//! variant — *not* a per-modality trait split (which breaks on multi-modal models).
+//! (text→video+audio), and pure audio synthesis (TTS / music). Modality is a
+//! [`ModelDescriptor`] property plus a [`GenerationOutput`] variant — *not* a per-modality
+//! trait split (which breaks on multi-modal models).
 
 use crate::media::{AudioTrack, Image};
 use crate::runtime::{CancelFlag, Progress, Quant};
@@ -29,7 +30,9 @@ pub trait Generator {
 }
 
 /// What a [`Generator`] produced. The `Video` variant's `audio` is `Some` for LTX (always
-/// audio) and `None` for Wan — no contract change needed across the two.
+/// audio) and `None` for Wan — no contract change needed across the two. The `Audio` variant
+/// is a **pure** audio synthesis (TTS / music — `Modality::Audio`); audio attached to a video
+/// stays on the `Video` variant.
 #[derive(Clone, Debug)]
 pub enum GenerationOutput {
     Images(Vec<Image>),
@@ -38,6 +41,7 @@ pub enum GenerationOutput {
         fps: u32,
         audio: Option<AudioTrack>,
     },
+    Audio(AudioTrack),
 }
 
 /// The request union (lifted from the SceneWorks worker's `ImageRequest`/`VideoRequest`). Most
@@ -197,8 +201,46 @@ pub struct GenerationRequest {
     /// than silently ignoring the request (see `mlx_gen_pid::resolve_pid_decoder`).
     pub pid_capture_sigma: Option<f32>,
 
+    // --- Audio (Option; consumed by audio models — `Modality::Audio`) ---
+    /// The typed audio sub-block (sc-12834). `None` for every image/video request — the top-level
+    /// request stays un-bloated, mirroring the planned typed video guider block (§9 known additive
+    /// extensions). Audio models read what they support; the shared floor gates the values against
+    /// the [`Capabilities`] audio surface. See [`AudioParams`].
+    pub audio: Option<AudioParams>,
+
     // --- Control ---
     pub cancel: CancelFlag,
+}
+
+/// The typed audio request sub-block carried by [`GenerationRequest::audio`] (sc-12834). A single
+/// `Default`-able struct (no builder), like the request itself: every field is optional so the
+/// struct stays **additively extensible** — a later story adds e.g. a multi-speaker script field
+/// without breaking `AudioParams { voice: Some(..), ..Default::default() }` construction.
+///
+/// A model reads what it supports and ignores the rest; the shared validation floor
+/// ([`Capabilities::validate_request`] and its size-skipping siblings) rejects values outside the
+/// advertised audio surface ([`Capabilities::audio_voices`] / [`audio_languages`](Capabilities::audio_languages)
+/// / [`audio_sample_rates`](Capabilities::audio_sample_rates) /
+/// [`max_audio_duration_secs`](Capabilities::max_audio_duration_secs)).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AudioParams {
+    /// Voice / speaker id (TTS). Gated by [`Capabilities::audio_voices`] when supplied.
+    pub voice: Option<String>,
+    /// Language code (e.g. `"en"`). Gated by [`Capabilities::audio_languages`] when supplied.
+    pub language: Option<String>,
+    /// Requested output duration in seconds. Range-checked against
+    /// [`Capabilities::max_audio_duration_secs`] (and the shared duration sanity cap).
+    pub target_duration: Option<f32>,
+    /// Requested output sample rate in Hz. Gated by [`Capabilities::audio_sample_rates`] when
+    /// supplied; `None` ⇒ the model's native rate.
+    pub sample_rate: Option<u32>,
+    /// Musical tempo in beats per minute (music models). Must be finite and positive.
+    pub bpm: Option<f32>,
+    /// Musical key (e.g. `"C minor"`; music models). Free-form — each model documents what it
+    /// accepts and rejects the rest in its own `validate`.
+    pub musical_key: Option<String>,
+    /// Lyrics to sing / condition on (music models). Free-form text, distinct from `prompt`.
+    pub lyrics: Option<String>,
 }
 
 impl Default for GenerationRequest {
@@ -242,6 +284,7 @@ impl Default for GenerationRequest {
             enhance_temperature: None,
             use_pid: false,
             pid_capture_sigma: None,
+            audio: None,
             cancel: CancelFlag::default(),
         }
     }
@@ -315,6 +358,8 @@ impl GenerationRequest {
             enhance_max_tokens: _,
             use_pid: _,
             cancel: _,
+            // The audio sub-block carries its own floats — destructured below the flat knobs.
+            audio,
             // Every `Option<f32>` knob the floor owns.
             guidance,
             true_cfg,
@@ -358,6 +403,31 @@ impl GenerationRequest {
                 }
             }
         }
+        // Audio sub-block floats (sc-12834): destructured exhaustively (no `..`) for the same
+        // reason as the request itself — a new `AudioParams` float field fails to compile here
+        // until it is classified into the floor.
+        if let Some(AudioParams {
+            voice: _,
+            language: _,
+            sample_rate: _,
+            musical_key: _,
+            lyrics: _,
+            target_duration,
+            bpm,
+        }) = audio
+        {
+            let audio_floats: [(&'static str, Option<f32>); 2] = [
+                ("audio.target_duration", *target_duration),
+                ("audio.bpm", *bpm),
+            ];
+            for (name, v) in audio_floats {
+                if let Some(x) = v {
+                    if !x.is_finite() {
+                        return Some((name, x));
+                    }
+                }
+            }
+        }
         // Conditioning-carried floats the floor also owns (F-001): the Control-branch scale and the
         // per-Reference img2img strength both flow into the same denoise/scheduler math.
         for c in conditioning {
@@ -369,6 +439,11 @@ impl GenerationRequest {
                     strength: Some(s), ..
                 } if !s.is_finite() => {
                     return Some(("conditioning.reference.strength", *s));
+                }
+                Conditioning::ReferenceAudio {
+                    strength: Some(s), ..
+                } if !s.is_finite() => {
+                    return Some(("conditioning.reference_audio.strength", *s));
                 }
                 _ => {}
             }
@@ -473,6 +548,14 @@ pub fn default_seed() -> u64 {
 pub enum Conditioning {
     /// img2img / IP-Adapter / identity reference.
     Reference { image: Image, strength: Option<f32> },
+    /// A reference **audio** clip — voice cloning / style reference for audio models
+    /// (sc-12834; the audio analogue of [`Conditioning::Reference`]). `strength` mirrors the
+    /// per-reference img2img strength: `None` ⇒ the model default. Video→audio conditioning
+    /// later reuses [`Conditioning::VideoClip`] — this variant is audio-in only.
+    ReferenceAudio {
+        audio: AudioTrack,
+        strength: Option<f32>,
+    },
     /// Multiple references with no per-image strength (Qwen-Image-Edit).
     MultiReference { images: Vec<Image> },
     /// FLUX.1-Redux references, each with its own strength.
@@ -534,6 +617,7 @@ impl Conditioning {
     pub fn kind(&self) -> ConditioningKind {
         match self {
             Conditioning::Reference { .. } => ConditioningKind::Reference,
+            Conditioning::ReferenceAudio { .. } => ConditioningKind::ReferenceAudio,
             Conditioning::MultiReference { .. } => ConditioningKind::MultiReference,
             Conditioning::ReduxRefs { .. } => ConditioningKind::ReduxRefs,
             Conditioning::Control { .. } => ConditioningKind::Control,
@@ -571,6 +655,8 @@ pub enum ControlKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConditioningKind {
     Reference,
+    /// Voice/style reference audio ([`Conditioning::ReferenceAudio`]).
+    ReferenceAudio,
     MultiReference,
     ReduxRefs,
     Control,
@@ -589,7 +675,12 @@ pub enum ConditioningKind {
 pub enum Modality {
     Image,
     Video,
+    /// Emits both image and video (e.g. the SeedVR2 upscaler over either).
     Both,
+    /// Pure audio synthesis — TTS / music (sc-12834). Emits [`GenerationOutput::Audio`];
+    /// `width`/`height` are unused, so audio models validate through the size-skipping floor
+    /// ([`Capabilities::validate_request_audio`]).
+    Audio,
 }
 
 /// A model's stable identity + advertised capabilities. Returned by `descriptor()` and also
@@ -627,6 +718,23 @@ pub struct Capabilities {
     pub max_size: u32,
     pub max_count: u32,
     pub mac_only: bool,
+    // Audio surface (sc-12834) — read by the floor when a request carries
+    // [`GenerationRequest::audio`]; all `Default` to the empty/no-audio surface so image/video
+    // descriptors are untouched.
+    /// Output sample rates (Hz) this model can synthesize. Empty ⇒ no selectable sample-rate
+    /// surface: an explicit `audio.sample_rate` is rejected as [`Error::Unsupported`] (the
+    /// same convention as [`samplers`](Self::samplers)); `None` on the request always passes
+    /// (the model's native rate).
+    pub audio_sample_rates: Vec<u32>,
+    /// Longest audio clip (seconds) this model synthesizes. `None` ⇒ no advertised cap — an
+    /// `audio.target_duration` is then bounded only by the shared duration sanity cap.
+    pub max_audio_duration_secs: Option<f32>,
+    /// Voice / speaker ids this model offers (TTS). Empty ⇒ no selectable voice surface: an
+    /// explicit `audio.voice` is rejected as [`Error::Unsupported`].
+    pub audio_voices: Vec<&'static str>,
+    /// Language codes this model supports. Empty ⇒ no selectable language surface: an explicit
+    /// `audio.language` is rejected as [`Error::Unsupported`].
+    pub audio_languages: Vec<&'static str>,
     /// On-the-fly quantization levels this engine offers (empty slice = none). Read by the worker's
     /// capability advertisement (sc-3723) instead of a hardcoded per-row flag. `Default` is `&[]`.
     pub supported_quants: &'static [Quant],
@@ -677,7 +785,11 @@ impl Capabilities {
     /// - `negative_prompt` / `guidance` / `true_cfg` only when the matching `supports_*` flag is set,
     ///   and `guidance` / `true_cfg` must be finite (a NaN would poison the guidance math, F-053),
     /// - `sampler` / `scheduler` / `guidance_method` (when supplied) must name an advertised entry,
-    /// - every `conditioning` entry must be an [`accepts`](Self::accepts)ed kind.
+    /// - every `conditioning` entry must be an [`accepts`](Self::accepts)ed kind,
+    /// - the [`audio`](GenerationRequest::audio) sub-block's supplied values must sit inside the
+    ///   advertised audio surface (voice / language / sample-rate membership,
+    ///   `target_duration` within `(0, `[`max_audio_duration_secs`](Self::max_audio_duration_secs)`]`,
+    ///   positive `bpm` — sc-12834).
     ///
     /// Capability-gap rejections (unsupported negative_prompt / guidance / true_cfg / sampler /
     /// scheduler / guidance_method / conditioning) return the typed [`Error::Unsupported`] so a
@@ -704,6 +816,19 @@ impl Capabilities {
         self.validate_request_inner(id, req, false)
     }
 
+    /// The audio-aware floor (sc-12834): the shared floor **minus the width/height range check**,
+    /// for pure-audio models (`Modality::Audio`) where the request's `width`/`height` are unused
+    /// and the visual size range would wrongly reject every request. Parallel to
+    /// [`validate_request_skip_size`](Self::validate_request_skip_size) — every other floor check
+    /// still runs unconditionally: count / steps / frame / fps / duration caps, capability gating,
+    /// finiteness (F-053, including the [`AudioParams`] floats), sampler / scheduler /
+    /// guidance_method membership, the conditioning allowlist, and the audio-surface checks
+    /// (voice / language / sample-rate membership, `target_duration` vs
+    /// [`max_audio_duration_secs`](Self::max_audio_duration_secs)).
+    pub fn validate_request_audio(&self, id: &str, req: &GenerationRequest) -> Result<()> {
+        self.validate_request_inner(id, req, false)
+    }
+
     /// Shared implementation of the floor. `check_size` gates only the size-range check so the
     /// auto-size path ([`validate_request_skip_size`](Self::validate_request_skip_size)) still runs
     /// every other check; the public [`validate_request`](Self::validate_request) passes `true`.
@@ -716,8 +841,10 @@ impl Capabilities {
         // Footgun guard (F-084): a descriptor that enables a capability but leaves max_count/max_size
         // at the `Default` 0 would reject EVERY request with a confusing "out of range 0..=0". A real
         // model always sets non-zero bounds, so catch the descriptor mistake in debug/test builds.
+        // `max_size` is only asserted when the size check runs: on the size-skipping floors the size
+        // bounds are legitimately unused (a pure-audio descriptor leaves them at 0 — sc-12834).
         debug_assert!(
-            self.max_count > 0 && self.max_size > 0,
+            self.max_count > 0 && (!check_size || self.max_size > 0),
             "{id}: Capabilities max_count={} max_size={} left at Default 0 — descriptor forgot its bounds",
             self.max_count,
             self.max_size
@@ -772,6 +899,64 @@ impl Capabilities {
                 return Err(Error::Msg(format!(
                     "{id}: duration {d}s exceeds the sanity cap {MAX_DURATION_SECS}s"
                 )));
+            }
+        }
+        // Audio sub-block (sc-12834): gate the supplied values against the advertised audio
+        // surface. Membership gaps (voice / language / sample rate) are capability gaps →
+        // typed `Error::Unsupported` (F-008); malformed values (non-positive / over-cap
+        // duration, non-positive bpm) are range errors → `Error::Msg`. Finiteness of the audio
+        // floats is enforced by `ensure_finite_floats` below (a NaN compares false here and
+        // falls through to that guard, like `duration`).
+        if let Some(audio) = &req.audio {
+            if let Some(d) = audio.target_duration {
+                if d <= 0.0 {
+                    return Err(Error::Msg(format!(
+                        "{id}: audio.target_duration must be > 0 (got {d}s)"
+                    )));
+                }
+                if d > MAX_DURATION_SECS {
+                    return Err(Error::Msg(format!(
+                        "{id}: audio.target_duration {d}s exceeds the sanity cap {MAX_DURATION_SECS}s"
+                    )));
+                }
+                if let Some(cap) = self.max_audio_duration_secs {
+                    if d > cap {
+                        return Err(Error::Msg(format!(
+                            "{id}: audio.target_duration {d}s exceeds the supported maximum {cap}s"
+                        )));
+                    }
+                }
+            }
+            if let Some(bpm) = audio.bpm {
+                if bpm <= 0.0 {
+                    return Err(Error::Msg(format!(
+                        "{id}: audio.bpm must be > 0 (got {bpm})"
+                    )));
+                }
+            }
+            if let Some(sr) = audio.sample_rate {
+                if !self.audio_sample_rates.contains(&sr) {
+                    return Err(Error::Unsupported(format!(
+                        "{id}: unsupported audio.sample_rate {sr} (supported: {:?})",
+                        self.audio_sample_rates
+                    )));
+                }
+            }
+            if let Some(v) = &audio.voice {
+                if !self.audio_voices.contains(&v.as_str()) {
+                    return Err(Error::Unsupported(format!(
+                        "{id}: unsupported audio.voice {v:?} (supported: {:?})",
+                        self.audio_voices
+                    )));
+                }
+            }
+            if let Some(l) = &audio.language {
+                if !self.audio_languages.contains(&l.as_str()) {
+                    return Err(Error::Unsupported(format!(
+                        "{id}: unsupported audio.language {l:?} (supported: {:?})",
+                        self.audio_languages
+                    )));
+                }
             }
         }
         if check_size
@@ -1311,6 +1496,320 @@ mod tests {
                 "gap case {i} should be typed Unsupported, got {err:?}"
             );
         }
+    }
+
+    /// A pure-audio capability surface (sc-12834): no visual size bounds (unused for
+    /// `Modality::Audio`), an advertised voice/language/sample-rate surface, a 60 s cap, and
+    /// `ReferenceAudio` conditioning.
+    fn audio_caps() -> Capabilities {
+        Capabilities {
+            conditioning: vec![ConditioningKind::ReferenceAudio],
+            audio_sample_rates: vec![24_000, 48_000],
+            max_audio_duration_secs: Some(60.0),
+            audio_voices: vec!["nova"],
+            audio_languages: vec!["en"],
+            max_count: 1,
+            ..Default::default()
+        }
+    }
+
+    fn track() -> AudioTrack {
+        AudioTrack {
+            samples: vec![0.0; 16],
+            sample_rate: 24_000,
+            channels: 1,
+        }
+    }
+
+    /// A TTS-shaped request: prompt + typed audio sub-block, size left at the unused 0x0.
+    fn audio_req() -> GenerationRequest {
+        GenerationRequest {
+            prompt: "read this aloud".into(),
+            width: 0,
+            height: 0,
+            audio: Some(AudioParams {
+                voice: Some("nova".into()),
+                language: Some("en".into()),
+                target_duration: Some(12.5),
+                sample_rate: Some(24_000),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn audio_request_validates_against_audio_descriptor() {
+        // sc-12834 acceptance: a `GenerationRequest { prompt, audio: Some(..) }` validates against
+        // an audio Capabilities descriptor through the size-skipping audio floor.
+        let c = audio_caps();
+        assert!(c.validate_request_audio("tts", &audio_req()).is_ok());
+        // A reference-audio conditioned request (voice cloning) passes when advertised.
+        let cloned = GenerationRequest {
+            conditioning: vec![Conditioning::ReferenceAudio {
+                audio: track(),
+                strength: Some(0.8),
+            }],
+            ..audio_req()
+        };
+        assert!(c.validate_request_audio("tts", &cloned).is_ok());
+        // The music-shaped knobs are free-form/positive-gated, not membership-gated.
+        let music = GenerationRequest {
+            audio: Some(AudioParams {
+                target_duration: Some(30.0),
+                bpm: Some(120.0),
+                musical_key: Some("C minor".into()),
+                lyrics: Some("la la la".into()),
+                ..Default::default()
+            }),
+            ..audio_req()
+        };
+        assert!(c.validate_request_audio("music", &music).is_ok());
+    }
+
+    #[test]
+    fn audio_floor_rejects_visual_only_mismatches_with_typed_errors() {
+        // sc-12834 acceptance: the audio floor still runs every non-size check — capability gaps
+        // are typed `Unsupported`, malformed values are `Msg`.
+        let c = audio_caps();
+        // Capability gaps (visual-only surface the audio descriptor does not advertise).
+        let gap_cases: Vec<GenerationRequest> = vec![
+            GenerationRequest {
+                negative_prompt: Some("n".into()),
+                ..audio_req()
+            },
+            GenerationRequest {
+                guidance: Some(3.5),
+                ..audio_req()
+            },
+            GenerationRequest {
+                sampler: Some("euler".into()),
+                ..audio_req()
+            },
+            GenerationRequest {
+                conditioning: vec![Conditioning::Depth { image: img(8, 8) }],
+                ..audio_req()
+            },
+        ];
+        for (i, req) in gap_cases.iter().enumerate() {
+            let err = c.validate_request_audio("tts", req).unwrap_err();
+            assert!(
+                matches!(err, Error::Unsupported(_)),
+                "gap case {i} should be typed Unsupported, got {err:?}"
+            );
+        }
+        // Malformed values stay `Msg`.
+        let msg_cases: Vec<GenerationRequest> = vec![
+            GenerationRequest {
+                count: 0,
+                ..audio_req()
+            },
+            GenerationRequest {
+                count: 2,
+                ..audio_req()
+            },
+            GenerationRequest {
+                steps: Some(0),
+                ..audio_req()
+            },
+        ];
+        for (i, req) in msg_cases.iter().enumerate() {
+            let err = c.validate_request_audio("tts", req).unwrap_err();
+            assert!(
+                matches!(err, Error::Msg(_)),
+                "msg case {i} should be a Msg range error, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn audio_surface_membership_and_ranges_are_enforced() {
+        let c = audio_caps();
+        let with_audio = |a: AudioParams| GenerationRequest {
+            audio: Some(a),
+            ..audio_req()
+        };
+        // Membership gaps → typed Unsupported naming the field.
+        let gaps: [(&str, AudioParams); 3] = [
+            (
+                "audio.voice",
+                AudioParams {
+                    voice: Some("santa".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "audio.language",
+                AudioParams {
+                    language: Some("xx".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "audio.sample_rate",
+                AudioParams {
+                    sample_rate: Some(44_100),
+                    ..Default::default()
+                },
+            ),
+        ];
+        for (field, params) in gaps {
+            let err = c
+                .validate_request_audio("tts", &with_audio(params))
+                .unwrap_err();
+            assert!(matches!(err, Error::Unsupported(_)), "{field}: got {err:?}");
+            assert!(err.to_string().contains(field), "{field}: got {err}");
+        }
+        // Range violations → Msg.
+        let over_cap = with_audio(AudioParams {
+            target_duration: Some(61.0),
+            ..Default::default()
+        });
+        let err = c.validate_request_audio("tts", &over_cap).unwrap_err();
+        assert!(matches!(err, Error::Msg(_)), "got {err:?}");
+        assert!(
+            err.to_string().contains("audio.target_duration"),
+            "got {err}"
+        );
+        for bad in [0.0, -3.0] {
+            let req = with_audio(AudioParams {
+                target_duration: Some(bad),
+                ..Default::default()
+            });
+            assert!(
+                matches!(
+                    c.validate_request_audio("tts", &req).unwrap_err(),
+                    Error::Msg(_)
+                ),
+                "target_duration {bad} must be rejected"
+            );
+        }
+        let bad_bpm = with_audio(AudioParams {
+            bpm: Some(0.0),
+            ..Default::default()
+        });
+        assert!(matches!(
+            c.validate_request_audio("tts", &bad_bpm).unwrap_err(),
+            Error::Msg(_)
+        ));
+        // No advertised duration cap ⇒ only the sanity cap applies.
+        let uncapped = Capabilities {
+            max_audio_duration_secs: None,
+            ..audio_caps()
+        };
+        assert!(uncapped
+            .validate_request_audio(
+                "tts",
+                &with_audio(AudioParams {
+                    target_duration: Some(3600.0),
+                    ..Default::default()
+                })
+            )
+            .is_ok());
+        assert!(uncapped
+            .validate_request_audio(
+                "tts",
+                &with_audio(AudioParams {
+                    target_duration: Some(MAX_DURATION_SECS + 1.0),
+                    ..Default::default()
+                })
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn audio_floats_join_the_finiteness_floor() {
+        // The `AudioParams` floats inherit the F-053/F-001 finiteness floor by construction.
+        let c = audio_caps();
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            for (field, params) in [
+                (
+                    "audio.target_duration",
+                    AudioParams {
+                        target_duration: Some(bad),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "audio.bpm",
+                    AudioParams {
+                        bpm: Some(bad),
+                        ..Default::default()
+                    },
+                ),
+            ] {
+                let req = GenerationRequest {
+                    audio: Some(params),
+                    ..audio_req()
+                };
+                let err = c.validate_request_audio("tts", &req).unwrap_err();
+                assert!(matches!(err, Error::Msg(_)), "{field} {bad} → Msg");
+                // ±Inf may trip the range/sanity-cap branch first (same convention as the
+                // request-level `duration`); NaN falls through every comparison and must be
+                // caught by the finiteness floor naming the field.
+                assert!(err.to_string().contains(field), "{field} {bad}: got {err}");
+                if bad.is_nan() {
+                    assert!(
+                        err.to_string().contains("must be finite"),
+                        "{field} NaN: got {err}"
+                    );
+                }
+            }
+        }
+        // The ReferenceAudio conditioning strength is guarded too.
+        let cloned = GenerationRequest {
+            conditioning: vec![Conditioning::ReferenceAudio {
+                audio: track(),
+                strength: Some(f32::NAN),
+            }],
+            ..audio_req()
+        };
+        let err = c.validate_request_audio("tts", &cloned).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("conditioning.reference_audio.strength"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn reference_audio_is_gated_by_the_conditioning_allowlist() {
+        // A visual descriptor that does not advertise ReferenceAudio rejects it, typed.
+        let visual = caps();
+        let req = GenerationRequest {
+            conditioning: vec![Conditioning::ReferenceAudio {
+                audio: track(),
+                strength: None,
+            }],
+            ..base_req()
+        };
+        let err = visual.validate_request("m", &req).unwrap_err();
+        assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
+        assert_eq!(
+            Conditioning::ReferenceAudio {
+                audio: track(),
+                strength: None
+            }
+            .kind(),
+            ConditioningKind::ReferenceAudio
+        );
+    }
+
+    #[test]
+    fn audio_output_and_modality_variants_carry_the_track() {
+        // The additive output variant round-trips the host-type track (tensor-free invariant).
+        let out = GenerationOutput::Audio(track());
+        match out {
+            GenerationOutput::Audio(t) => {
+                assert_eq!(t.sample_rate, 24_000);
+                assert_eq!(t.channels, 1);
+                assert_eq!(t.samples.len(), 16);
+            }
+            other => panic!("expected Audio output, got {other:?}"),
+        }
+        assert_ne!(Modality::Audio, Modality::Both);
+        // A visual request is untouched by the audio block: `Default` carries `audio: None`.
+        assert!(GenerationRequest::default().audio.is_none());
     }
 
     #[test]

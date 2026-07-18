@@ -89,7 +89,7 @@ fn real_weight_base_img2img() {
             .unwrap_or_else(|e| panic!("generate (s={strength} \"{prompt}\"): {e}"))
         {
             GenerationOutput::Images(mut imgs) => imgs.pop().expect("one image"),
-            GenerationOutput::Video { .. } => panic!("expected images, got video"),
+            _ => panic!("expected images, got video"),
         }
     };
 
@@ -168,7 +168,7 @@ fn real_weight_base_img2img() {
         };
         match model.generate(&req, &mut noop).expect("txt2img generate") {
             GenerationOutput::Images(mut imgs) => imgs.pop().expect("one image"),
-            GenerationOutput::Video { .. } => panic!("expected images"),
+            _ => panic!("expected images"),
         }
     };
     write_ppm(&out_dir.join("zimage_base_txt2img.ppm"), &txt2img);

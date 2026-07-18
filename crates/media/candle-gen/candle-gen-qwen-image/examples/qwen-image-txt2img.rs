@@ -124,7 +124,7 @@ fn main() -> Result<()> {
     let secs = t0.elapsed().as_secs_f32();
     let images = match output {
         GenerationOutput::Images(imgs) => imgs,
-        GenerationOutput::Video { .. } => return Err("expected images, got video".into()),
+        _ => return Err("expected images, got video".into()),
     };
     println!("[smoke] {} image(s) in {secs:.1}s", images.len());
 

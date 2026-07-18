@@ -97,7 +97,8 @@ pub enum GenerationOutput {
 
 One trait covers everything text→media: T2I, T2V, edit (image+text→image), LTX (text→video+audio),
 even a model that does both image and video — the request is shared, the output enum + a
-`descriptor().modality` of `Image | Video | Both` carry the variance. `generate` is **sync**
+`descriptor().modality` of `Image | Video | Both | Audio` carry the variance (pure audio —
+TTS / music — is `Modality::Audio` + `GenerationOutput::Audio(AudioTrack)`, sc-12834). `generate` is **sync**
 (long/blocking; the worker runs each job on its own thread); the request carries a cancel flag and
 `on_progress` streams step/decode progress.
 
@@ -274,6 +275,14 @@ No edits to `mlx-gen` or any other provider crate are required.
   `validate()`.
 - **Video:** modes (i2v, first-last, extend, bridge, replace-person) + audio (LTX) → `video_mode`
   + source-clip handles; `GenerationOutput::Video { audio }`.
+- **Pure audio (sc-12834):** TTS / music is a modality on the SAME `Generator` (`Modality::Audio`
+  + `GenerationOutput::Audio(AudioTrack)`), not a new trait. The typed `GenerationRequest.audio`
+  sub-block (voice, language, target_duration, sample_rate, bpm, musical_key, lyrics — additively
+  extensible) keeps the top-level request un-bloated; `Conditioning::ReferenceAudio` carries the
+  voice/style reference. `width`/`height` are unused for pure audio — audio models validate
+  through the size-skipping floor (`Capabilities::validate_request_audio`, parallel to the
+  auto-size `validate_request_skip_size`), which keeps every other check (count / steps /
+  finiteness / conditioning / audio-surface gating).
 - **Quantization at load:** `LoadSpec.quantize` + a capability for which models support Q4/Q8.
 
 ---

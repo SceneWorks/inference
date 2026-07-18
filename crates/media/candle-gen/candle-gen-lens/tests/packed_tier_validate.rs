@@ -103,7 +103,7 @@ fn render_tier(env: &str, tag: &str) {
 
     let images = match out {
         GenerationOutput::Images(imgs) => imgs,
-        GenerationOutput::Video { .. } => panic!("{tag}: expected images"),
+        _ => panic!("{tag}: expected images"),
     };
     assert_eq!(images.len(), 1, "{tag}: expected 1 image");
     assert_coherent(&images[0], tag);

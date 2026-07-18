@@ -83,7 +83,7 @@ fn staged_peak_bounds_below_whole_model_sum() {
             assert_eq!(v.len(), 1, "1-frame t2i yields one image");
             v.pop().unwrap()
         }
-        GenerationOutput::Video { .. } => panic!("expected Images for a 1-frame request"),
+        _ => panic!("expected Images for a 1-frame request"),
     };
     // Output stays coherent (the sc-10840 clear_cache calls are memory-only, not compute).
     let Image {

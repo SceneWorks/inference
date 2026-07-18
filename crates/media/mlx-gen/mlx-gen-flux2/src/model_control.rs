@@ -80,6 +80,11 @@ pub fn descriptor_dev_control() -> ModelDescriptor {
             // Mistral-3 text encoder drops after the prompt encode, then the control transformer (dev
             // DiT + control branch) + VAE load, bounding peak to `max(TE, DiT+control+VAE)`.
             supports_sequential_offload: true,
+            // No audio surface (sc-12834): pure image/video model.
+            audio_sample_rates: vec![],
+            max_audio_duration_secs: None,
+            audio_voices: vec![],
+            audio_languages: vec![],
         },
     }
 }

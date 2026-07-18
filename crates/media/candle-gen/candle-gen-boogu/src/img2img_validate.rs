@@ -85,7 +85,7 @@ fn run_img2img_gate(id: &str, guidance: Option<f32>, steps: u32, tag: &str) {
             .unwrap_or_else(|e| panic!("generate (s={strength} \"{prompt}\"): {e}"))
         {
             GenerationOutput::Images(mut imgs) => imgs.pop().expect("one image"),
-            GenerationOutput::Video { .. } => panic!("expected images, got video"),
+            _ => panic!("expected images, got video"),
         }
     };
 
@@ -172,7 +172,7 @@ fn run_img2img_gate(id: &str, guidance: Option<f32>, steps: u32, tag: &str) {
         let mut noop = |_p: Progress| {};
         match model.generate(&req, &mut noop).expect("txt2img generate") {
             GenerationOutput::Images(mut imgs) => imgs.pop().expect("one image"),
-            GenerationOutput::Video { .. } => panic!("expected images"),
+            _ => panic!("expected images"),
         }
     };
     write_ppm(&out_dir.join(format!("boogu_{tag}_txt2img.ppm")), &txt2img);

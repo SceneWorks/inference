@@ -186,7 +186,7 @@ fn main() -> Result<()> {
         call_secs.push(t_call.elapsed().as_secs_f32());
         images = match output {
             GenerationOutput::Images(imgs) => imgs,
-            GenerationOutput::Video { .. } => return Err("expected images, got video".into()),
+            _ => return Err("expected images, got video".into()),
         };
     }
     if let Some(p) = &probe {

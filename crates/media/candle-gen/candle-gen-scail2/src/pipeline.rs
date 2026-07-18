@@ -92,6 +92,11 @@ pub fn descriptor() -> ModelDescriptor {
             supports_kv_cache: false,
             requires_sigma_shift: false,
             supports_sequential_offload: false,
+            // No audio surface (sc-12834): pure image/video model.
+            audio_sample_rates: vec![],
+            max_audio_duration_secs: None,
+            audio_voices: vec![],
+            audio_languages: vec![],
         },
     }
 }

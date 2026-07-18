@@ -128,6 +128,11 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
             // Flow-match schedule uses a timestep shift (mapped from scheduler_shift).
             requires_sigma_shift: true,
             supports_sequential_offload: false,
+            // No audio surface (sc-12834): pure image/video model.
+            audio_sample_rates: vec![],
+            max_audio_duration_secs: None,
+            audio_voices: vec![],
+            audio_languages: vec![],
         },
     }
 }

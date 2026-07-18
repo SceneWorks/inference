@@ -143,6 +143,7 @@ fn main() -> Result<()> {
     let frames_out = match output {
         GenerationOutput::Images(imgs) => imgs,
         GenerationOutput::Video { frames, .. } => frames,
+        _ => return Err("expected a visual output, got a non-visual output".into()),
     };
     for (i, f) in frames_out.iter().enumerate() {
         let buf = image::RgbImage::from_raw(f.width, f.height, f.pixels.clone())
