@@ -4,12 +4,13 @@
 //! **zero tensor dependencies**: it owns the `Generator` / `Trainer` / `Captioner` / `Transform`
 //! contracts, the request/output/conditioning/progress/cancel/error types, the explicit provider
 //! registry, and the pure host-side policy math (tokenization, PIL-compatible resize, tiling,
-//! LR schedule). The tensor backends — `mlx-gen` (Apple MLX) and the forthcoming `candle-gen`
+//! LR schedule, audio mixdown + BS.1770-4 loudness/true-peak). The tensor backends — `mlx-gen` (Apple MLX) and the forthcoming `candle-gen`
 //! (Windows/CUDA) — implement these contracts and re-export this crate at their own paths.
 //!
 //! Numeric types here are restricted to `f32`/`f64`/`Vec<f32>`/`Vec<i32>`/`&[u8]` — never an
 //! `mlx_rs::Array` or candle tensor. See epic 3720 (the unified-contract roadmap, Phase 0).
 
+pub mod audio_dsp;
 pub mod caption;
 pub mod control;
 pub mod error;
@@ -32,6 +33,10 @@ pub mod train;
 pub mod transform;
 pub mod weightsmeta;
 
+pub use audio_dsp::{
+    db_to_linear, measure_loudness, measure_track_loudness, mixdown, LoudnessStats, MixClip,
+    MixRequest, SILENCE_FLOOR_LUFS,
+};
 pub use caption::{
     CaptionCapabilities, CaptionFinishReason, CaptionOptions, CaptionOutput, CaptionRequest,
     CaptionSampling, Captioner, CaptionerDescriptor,
