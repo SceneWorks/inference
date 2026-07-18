@@ -899,8 +899,8 @@ mod tests {
         );
     }
 
-    /// The reduced dims stay legal multiples of 16 for a non-square, odd-multiple request — the pipeline's
-    /// `validate_multiple_of_16` must never trip on a resolution-lever output.
+    /// The reduced dims stay legal multiples of `RES_MULTIPLE` (16) for a non-square, odd-multiple
+    /// request — the pipeline's `validate_multiple_of` must never trip on a resolution-lever output.
     #[test]
     fn resolution_lever_output_is_16_aligned() {
         assert_eq!(scale_render_dim(1024, 0.75), 768);

@@ -28,7 +28,7 @@ use mlx_rs::{random, Array, Dtype};
 
 use mlx_gen::adapters::loader::apply_adapters_strict;
 use mlx_gen::array::scalar;
-use mlx_gen::image::{decoded_to_image, validate_multiple_of_16};
+use mlx_gen::image::{decoded_to_image, validate_multiple_of};
 use mlx_gen::img2img::{add_noise_by_interpolation, init_time_step, preprocess_init_image};
 use mlx_gen::media::Image;
 use mlx_gen::runtime::AdapterSpec;
@@ -308,7 +308,7 @@ impl KreaHeavy {
         // Single-image convenience: build the count-invariant plan (F-073) then render one seed. The
         // count loop in [`crate::model`] calls `prepare_t2i` + `render_turbo_from` directly so the plan
         // is shared across seeds.
-        validate_multiple_of_16(opts.width, opts.height, "krea_2_turbo")?;
+        validate_multiple_of(opts.width, opts.height, crate::RES_MULTIPLE, "krea_2_turbo")?;
         let plan = self.prepare_t2i(context, None, opts.width, opts.height)?;
         self.render_turbo_from(&plan, opts, decoder, keep, cancel, on_progress)
     }
@@ -357,7 +357,7 @@ impl KreaHeavy {
         width: u32,
         height: u32,
     ) -> Result<ControlPlan> {
-        validate_multiple_of_16(width, height, "krea_2_turbo_control")?;
+        validate_multiple_of(width, height, crate::RES_MULTIPLE, "krea_2_turbo_control")?;
 
         // Pose skeleton → control latent [1, 16, H/8, W/8] (`QwenVae::encode` returns the normalized
         // `(e − mean)/std` latent, the same space as `init_noise`; drop the singleton temporal axis).
@@ -436,7 +436,7 @@ impl KreaHeavy {
     ) -> Result<Image> {
         // Single-image convenience; the count loop calls `prepare_img2img` + `render_turbo_img2img_from`
         // directly so the clean-latent VAE encode + prep are shared across seeds (F-073).
-        validate_multiple_of_16(opts.width, opts.height, "krea_2_turbo")?;
+        validate_multiple_of(opts.width, opts.height, crate::RES_MULTIPLE, "krea_2_turbo")?;
         let plan = self.prepare_img2img(context, None, init, opts.width, opts.height)?;
         // `usize::MAX` = the clean σ=0 default (no from_ldm capture); the Generator (`model.rs`) resolves
         // and threads a real `keep` when a PiD capture is requested (sc-10121).
@@ -547,7 +547,7 @@ impl KreaHeavy {
     ) -> Result<Image> {
         // Single-image convenience; the count loop in [`crate::model`] calls `prepare_t2i` +
         // `render_base_from` directly so the preps are shared across seeds (F-073).
-        validate_multiple_of_16(opts.width, opts.height, "krea_2_raw")?;
+        validate_multiple_of(opts.width, opts.height, crate::RES_MULTIPLE, "krea_2_raw")?;
         let plan = self.prepare_t2i(ctx_pos, ctx_neg, opts.width, opts.height)?;
         self.render_base_from(&plan, guidance, opts, decoder, keep, cancel, on_progress)
     }
@@ -623,7 +623,7 @@ impl KreaHeavy {
     ) -> Result<Image> {
         // Single-image convenience; the count loop calls `prepare_img2img` + `render_base_img2img_from`
         // directly so the clean-latent VAE encode + preps are shared across seeds (F-073).
-        validate_multiple_of_16(opts.width, opts.height, "krea_2_raw")?;
+        validate_multiple_of(opts.width, opts.height, crate::RES_MULTIPLE, "krea_2_raw")?;
         let plan = self.prepare_img2img(ctx_pos, ctx_neg, init, opts.width, opts.height)?;
         // `usize::MAX` = the clean σ=0 default (no from_ldm capture); the Generator (`model.rs`) resolves
         // and threads a real `keep` when a PiD capture is requested (sc-10121).
@@ -728,7 +728,7 @@ impl KreaHeavy {
         // Single-image convenience; the count loop in [`crate::model`] calls `prepare_edit_plan` +
         // `render_edit_from` directly so the reference VAE encodes + preps are shared across seeds
         // (F-073).
-        validate_multiple_of_16(opts.width, opts.height, "krea_2_raw")?;
+        validate_multiple_of(opts.width, opts.height, crate::RES_MULTIPLE, "krea_2_raw")?;
         let plan = self.prepare_edit_plan(ctx_pos, ctx_neg, sources, opts.width, opts.height)?;
         self.render_edit_from(
             &plan,
@@ -754,7 +754,7 @@ impl KreaHeavy {
         width: u32,
         height: u32,
     ) -> Result<EditPlan> {
-        validate_multiple_of_16(width, height, "krea_2_raw")?;
+        validate_multiple_of(width, height, crate::RES_MULTIPLE, "krea_2_raw")?;
         if sources.is_empty() {
             return Err(mlx_gen::Error::Msg(
                 "krea_2 edit: at least one source image is required".into(),

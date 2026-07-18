@@ -7,7 +7,7 @@
 //! → **pack** to the transformer token sequence `[1, (height/16)·(width/16), 128]`. txt2img
 //! samples noise directly in the packed 128-channel space.
 
-use mlx_gen::image::{resize_lanczos_u8, validate_multiple_of_16};
+use mlx_gen::image::{resize_lanczos_u8, validate_multiple_of};
 use mlx_gen::media::Image;
 use mlx_gen::scheduler::{compute_mu, image_seq_len};
 use mlx_gen::{resolve_flow_schedule, Error, FlowMatchEuler, Result};
@@ -132,7 +132,7 @@ pub fn prepare_text_ids(seq: usize) -> Array {
 /// Mirrors `Flux2LatentCreator.prepare_packed_latents` — sample at `[1, in_channels, lat_h,
 /// lat_w]` then pack — so the seeded RNG and token order match the fork (verified e2e in S4).
 pub fn create_noise(seed: u64, width: u32, height: u32, in_channels: usize) -> Result<Array> {
-    validate_multiple_of_16(width, height, "flux2")?;
+    validate_multiple_of(width, height, crate::SIZE_MULTIPLE, "flux2")?;
     let key = random::key(seed)?;
     let lat_h = (height / 16) as i32;
     let lat_w = (width / 16) as i32;

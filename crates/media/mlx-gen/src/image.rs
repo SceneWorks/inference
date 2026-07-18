@@ -72,13 +72,20 @@ pub fn decoded_to_image(decoded: &Array) -> Result<Image> {
     })
 }
 
-/// Reject generation dimensions that aren't multiples of 16 — the latent-pack requirement shared by
-/// the FLUX-family pipelines (FLUX.1 / FLUX.2). `family` names the model in the error message so the
-/// single shared check reads like the per-crate copies it replaces (F-083).
-pub fn validate_multiple_of_16(width: u32, height: u32, family: &str) -> Result<()> {
-    if !width.is_multiple_of(16) || !height.is_multiple_of(16) {
+/// Reject pipeline dimensions that aren't multiples of `multiple` — the latent-pack requirement
+/// shared by the mlx image pipelines that pack an /8 VAE latent with a 2×2 patchify (FLUX.1 / FLUX.2
+/// / Boogu / Krea). `family` names the model in the error message so the single shared check reads
+/// like the per-crate copies it replaces (F-083).
+///
+/// `multiple` is the caller's own family stride const — each family passes the SAME crate-root
+/// `pub const` its `validate_request` enforces (`mlx_gen_flux::SIZE_MULTIPLE`,
+/// `mlx_gen_boogu::RES_MULTIPLE`, …, all `= 16` today), so this pipeline-layer enforcement site can
+/// never drift from the request-dimension stride sc-12612 tied. Passing the value rather than
+/// hardcoding `16` is what makes "wired into every enforcement site" (sc-12612) true here (sc-12701).
+pub fn validate_multiple_of(width: u32, height: u32, multiple: u32, family: &str) -> Result<()> {
+    if !width.is_multiple_of(multiple) || !height.is_multiple_of(multiple) {
         return Err(Error::Msg(format!(
-            "{family}: width and height must be multiples of 16, got {width}x{height}"
+            "{family}: width and height must be multiples of {multiple}, got {width}x{height}"
         )));
     }
     Ok(())
@@ -87,6 +94,43 @@ pub fn validate_multiple_of_16(width: u32, height: u32, family: &str) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `validate_multiple_of` must enforce the `multiple` it is PASSED, not a hardcoded literal
+    /// (sc-12701). The discriminating case is 496×480: a multiple of 16 but not of 32 — it must be
+    /// accepted at `multiple = 16` and rejected at `multiple = 32`. A regression that ignored the
+    /// argument (e.g. the old body's literal `16`) would accept it in both, so this fails RED on the
+    /// mutation the tie exists to prevent. The error text must also surface the actual `multiple`.
+    #[test]
+    fn validate_multiple_of_enforces_the_passed_stride() {
+        // On-stride passes at its own stride.
+        assert!(validate_multiple_of(512, 512, 16, "flux1").is_ok());
+        assert!(validate_multiple_of(1024, 768, 32, "stride32_probe").is_ok());
+
+        // Off-stride rejects, and the message names the stride it enforced (not a baked 16).
+        let err =
+            validate_multiple_of(500, 512, 16, "flux1").expect_err("500 is not a multiple of 16");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("multiples of 16"),
+            "message must name the stride: {msg}"
+        );
+        assert!(msg.contains("500x512"), "message must echo the dims: {msg}");
+
+        // Height alone off-stride also rejects (both axes are checked).
+        assert!(validate_multiple_of(512, 500, 16, "flux1").is_err());
+
+        // Discriminator: 496×480 is ÷16 but not ÷32 — the argument, not a literal, decides.
+        assert!(
+            validate_multiple_of(496, 480, 16, "flux1").is_ok(),
+            "496×480 is a multiple of 16"
+        );
+        let stride32 = validate_multiple_of(496, 480, 32, "stride32_probe")
+            .expect_err("496 is not a multiple of 32");
+        assert!(
+            stride32.to_string().contains("multiples of 32"),
+            "a ÷32 caller must reject a ÷16-only size with a ÷32 message: {stride32}"
+        );
+    }
 
     /// `resize_u8` (now in gen-core) must be **bit-identical** to PIL `Image.BICUBIC` (the
     /// fixed-point integer path), not merely close — this is what gives the conditioning images
