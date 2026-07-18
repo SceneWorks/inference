@@ -11,6 +11,7 @@ use candle_gen::candle_nn::ops::softmax_last_dim;
 use candle_gen::candle_nn::{Linear, VarBuilder};
 
 use crate::config::TransformerConfig;
+use crate::gguf::{GgufDit, WeightSrc};
 use crate::quant::QLinear;
 use crate::rope::apply_rope;
 
@@ -97,15 +98,20 @@ struct Attention {
 }
 
 impl Attention {
-    fn new(cfg: &TransformerConfig, vb: VarBuilder) -> Result<Self> {
+    /// Build this attention's projections + qk-norms from `src` — the dense (`WeightSrc::Dense`) and
+    /// native-GGUF k-quant (`WeightSrc::Gguf`, sc-12735) paths share this ONE builder, so the resident-
+    /// QTensor path reads the identical projection set the dense/packed path does. On the dense arm each
+    /// `qlinear` is `QLinear::linear_detect` (packed-detecting, unchanged); on the GGUF arm it is a
+    /// resident k-quant QTensor. The qk-norms are dense sidecars either way.
+    fn build(cfg: &TransformerConfig, src: WeightSrc) -> Result<Self> {
         let inner = cfg.dim;
         Ok(Self {
-            to_q: QLinear::linear_detect(cfg.dim, inner, &vb, "to_q", true)?,
-            to_k: QLinear::linear_detect(cfg.dim, inner, &vb, "to_k", true)?,
-            to_v: QLinear::linear_detect(cfg.dim, inner, &vb, "to_v", true)?,
-            to_out: QLinear::linear_detect(inner, cfg.dim, &vb, "to_out.0", true)?,
-            norm_q: vb.pp("norm_q").get(inner, "weight")?,
-            norm_k: vb.pp("norm_k").get(inner, "weight")?,
+            to_q: src.qlinear(cfg.dim, inner, "to_q", true)?,
+            to_k: src.qlinear(cfg.dim, inner, "to_k", true)?,
+            to_v: src.qlinear(cfg.dim, inner, "to_v", true)?,
+            to_out: src.qlinear(inner, cfg.dim, "to_out.0", true)?,
+            norm_q: src.get(inner, "norm_q.weight")?,
+            norm_k: src.get(inner, "norm_k.weight")?,
             num_heads: cfg.num_heads,
             head_dim: cfg.head_dim,
             eps: cfg.eps,
@@ -166,10 +172,12 @@ struct Ffn {
 }
 
 impl Ffn {
-    fn new(cfg: &TransformerConfig, vb: VarBuilder) -> Result<Self> {
+    /// Build the FFN's two projections from `src` (dense or native-GGUF k-quant, sc-12735) — one builder
+    /// for both paths.
+    fn build(cfg: &TransformerConfig, src: WeightSrc) -> Result<Self> {
         Ok(Self {
-            proj: QLinear::linear_detect(cfg.dim, cfg.ffn_dim, &vb, "net.0.proj", true)?,
-            out: QLinear::linear_detect(cfg.ffn_dim, cfg.dim, &vb, "net.2", true)?,
+            proj: src.qlinear(cfg.dim, cfg.ffn_dim, "net.0.proj", true)?,
+            out: src.qlinear(cfg.ffn_dim, cfg.dim, "net.2", true)?,
         })
     }
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -200,19 +208,27 @@ pub(crate) struct Block {
 }
 
 impl Block {
+    /// Dense (or MLX-packed) block loader — the unchanged path (used by the VACE model, `vace.rs`, and the
+    /// inference DiT's snapshot/packed tiers). Delegates to [`Self::build`] with a dense [`WeightSrc`], so
+    /// its behavior is byte-identical to before.
     pub(crate) fn new(cfg: &TransformerConfig, vb: VarBuilder) -> Result<Self> {
+        Self::build(cfg, WeightSrc::dense(vb))
+    }
+
+    /// Build a block from `src` — the ONE builder the dense/MLX-packed path (`WeightSrc::Dense`) and the
+    /// native-GGUF k-quant path (`WeightSrc::Gguf`, sc-12735) share, so the resident-QTensor DiT reads the
+    /// identical block structure. The `scale_shift_table` / `norm2` / qk-norms are dense sidecars either
+    /// way; the attention/FFN projections route through [`WeightSrc::qlinear`].
+    fn build(cfg: &TransformerConfig, src: WeightSrc) -> Result<Self> {
         Ok(Self {
-            scale_shift_table: vb
+            scale_shift_table: src
                 .get((1, 6, cfg.dim), "scale_shift_table")?
                 .to_dtype(DType::F32)?,
-            attn1: Attention::new(cfg, vb.pp("attn1"))?,
-            norm2_w: vb
-                .pp("norm2")
-                .get(cfg.dim, "weight")?
-                .to_dtype(DType::F32)?,
-            norm2_b: vb.pp("norm2").get(cfg.dim, "bias")?.to_dtype(DType::F32)?,
-            attn2: Attention::new(cfg, vb.pp("attn2"))?,
-            ffn: Ffn::new(cfg, vb.pp("ffn"))?,
+            attn1: Attention::build(cfg, src.pp("attn1"))?,
+            norm2_w: src.get(cfg.dim, "norm2.weight")?.to_dtype(DType::F32)?,
+            norm2_b: src.get(cfg.dim, "norm2.bias")?.to_dtype(DType::F32)?,
+            attn2: Attention::build(cfg, src.pp("attn2"))?,
+            ffn: Ffn::build(cfg, src.pp("ffn"))?,
             eps: cfg.eps,
         })
     }
@@ -313,42 +329,52 @@ pub struct WanTransformer {
 }
 
 impl WanTransformer {
+    /// Build the DiT from a dense (or MLX-packed) [`VarBuilder`] — the unchanged path (the
+    /// `Wan-AI/*-Diffusers` snapshot and the `SceneWorks/*-mlx` packed tiers). Delegates to the shared
+    /// [`Self::build`] with a dense [`WeightSrc`], so its behavior is byte-identical to before.
     pub fn new(cfg: &TransformerConfig, vb: VarBuilder) -> Result<Self> {
+        Self::build(cfg, WeightSrc::dense(vb))
+    }
+
+    /// Build the DiT from a **native-GGUF k-quant** source ([`GgufDit`], sc-12735) — the Linears are held
+    /// as resident `Q4_K` [`QTensor`]s that dequantize per-matmul (ComfyUI-GGUF parity), the dense sidecars
+    /// are the GGUF's F16/F32 blocks. Shares [`Self::build`] with [`Self::new`], so the resident-QTensor DiT
+    /// reads the identical structure the dense/packed path does; the result reports [`Self::is_packed`].
+    pub(crate) fn from_gguf(cfg: &TransformerConfig, dit: &GgufDit) -> Result<Self> {
+        Self::build(cfg, WeightSrc::gguf(dit))
+    }
+
+    /// The ONE DiT builder shared by [`Self::new`] (dense / MLX-packed) and [`Self::from_gguf`] (native
+    /// GGUF k-quant, sc-12735). Every projection routes through [`WeightSrc::qlinear`] and every dense
+    /// sidecar through [`WeightSrc::get`], so the two load paths can never drift in shape/key handling —
+    /// the dense arm forwards to the exact `VarBuilder`/`QLinear::linear_detect` calls as before.
+    fn build(cfg: &TransformerConfig, src: WeightSrc) -> Result<Self> {
         let (pt, ph, pw) = cfg.patch;
         // patch_embedding is a Conv3d (1,2,2); temporal kernel 1 → squeeze to a per-frame conv2d.
-        let pw_full = vb.get(
+        let pw_full = src.get(
             (cfg.dim, cfg.in_channels, pt, ph, pw),
             "patch_embedding.weight",
         )?;
         let patch_w = pw_full.narrow(2, 0, 1)?.squeeze(2)?.contiguous()?; // [dim,48,ph,pw]
-        let patch_b = vb
+        let patch_b = src
             .get(cfg.dim, "patch_embedding.bias")?
             .reshape((1, cfg.dim, 1, 1))?;
 
-        let ce = vb.pp("condition_embedder");
-        let text_l1 =
-            QLinear::linear_detect(cfg.text_dim, cfg.dim, &ce, "text_embedder.linear_1", true)?;
-        let text_l2 =
-            QLinear::linear_detect(cfg.dim, cfg.dim, &ce, "text_embedder.linear_2", true)?;
-        let time_l1 =
-            QLinear::linear_detect(cfg.freq_dim, cfg.dim, &ce, "time_embedder.linear_1", true)?;
-        let time_l2 =
-            QLinear::linear_detect(cfg.dim, cfg.dim, &ce, "time_embedder.linear_2", true)?;
-        let time_proj = QLinear::linear_detect(cfg.dim, 6 * cfg.dim, &ce, "time_proj", true)?;
+        let ce = src.pp("condition_embedder");
+        let text_l1 = ce.qlinear(cfg.text_dim, cfg.dim, "text_embedder.linear_1", true)?;
+        let text_l2 = ce.qlinear(cfg.dim, cfg.dim, "text_embedder.linear_2", true)?;
+        let time_l1 = ce.qlinear(cfg.freq_dim, cfg.dim, "time_embedder.linear_1", true)?;
+        let time_l2 = ce.qlinear(cfg.dim, cfg.dim, "time_embedder.linear_2", true)?;
+        let time_proj = ce.qlinear(cfg.dim, 6 * cfg.dim, "time_proj", true)?;
 
+        let blocks_src = src.pp("blocks");
         let mut blocks = Vec::with_capacity(cfg.num_layers);
         for i in 0..cfg.num_layers {
-            blocks.push(Block::new(cfg, vb.pp("blocks").pp(i))?);
+            blocks.push(Block::build(cfg, blocks_src.pp(i))?);
         }
 
-        let proj_out = QLinear::linear_detect(
-            cfg.dim,
-            cfg.out_channels * pt * ph * pw,
-            &vb,
-            "proj_out",
-            true,
-        )?;
-        let scale_shift_table = vb
+        let proj_out = src.qlinear(cfg.dim, cfg.out_channels * pt * ph * pw, "proj_out", true)?;
+        let scale_shift_table = src
             .get((1, 2, cfg.dim), "scale_shift_table")?
             .to_dtype(DType::F32)?;
 
@@ -365,8 +391,8 @@ impl WanTransformer {
             proj_out,
             scale_shift_table,
             cfg: *cfg,
-            device: vb.device().clone(),
-            dtype: vb.dtype(),
+            device: src.device(),
+            dtype: src.dtype(),
         })
     }
 

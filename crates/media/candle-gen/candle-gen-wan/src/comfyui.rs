@@ -213,7 +213,11 @@ fn cast_dense(what: &str, key: &str, t: &Tensor, dtype: DType) -> Result<Tensor>
 /// Native-Wan → diffusers key rename ([`crate::transformer::WanTransformer`]'s schema). Every rule is
 /// exact/prefix/segment-scoped so no two collide; a key matching no rule (e.g. `patch_embedding.*`)
 /// passes through unchanged.
-fn remap_wan_key(key: &str) -> String {
+///
+/// Hoisted to `pub(crate)` so the native-GGUF k-quant loader ([`crate::gguf`], sc-12735) reuses the
+/// SAME native→diffusers mapping the ComfyUI scaled-fp8 seam uses (QuantStack GGUF ships the native-Wan
+/// key layout too) — one source of truth for the rename, tested here and in [`crate::gguf`].
+pub(crate) fn remap_wan_key(key: &str) -> String {
     // --- top-level head ---
     if let Some(rest) = key.strip_prefix("head.head.") {
         return format!("proj_out.{rest}"); // native head Linear → diffusers proj_out

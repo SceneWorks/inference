@@ -28,6 +28,11 @@ mod comfyui;
 pub mod config;
 pub mod conv3d;
 pub mod dit_train;
+// Native GGUF k-quant DiT loader (sc-12735, epic 12732 Pillar 2 — the 24 GB lever): opens a
+// `QuantStack/Wan2.2-TI2V-5B-GGUF` `.gguf` and holds the DiT as resident Q4_K_M `QTensor`s that
+// dequantize per-matmul (ComfyUI-GGUF parity), NEVER pre-dequantized to dense at load. Selected on the
+// 5B by the `CANDLE_GEN_WAN_GGUF` sub-story-1 test seam (manifest/catalog routing is sub-story 2).
+mod gguf;
 pub mod model_vace;
 pub mod pipeline;
 pub mod quant;
@@ -160,6 +165,27 @@ impl Pipeline {
     /// fold into, and LoKr/LoHa on it is rejected there (deferred to sc-10050/10051). The 5B is a single
     /// (non-MoE) DiT, so every adapter is shared (`moe_expert = None`); the `expert` arg is a formality.
     fn build_dit(&self) -> CResult<WanTransformer> {
+        // sub-story-1 test seam (sc-12735): a native-GGUF k-quant DiT path, selected by the
+        // `CANDLE_GEN_WAN_GGUF` env var pointing at a downloaded `QuantStack/Wan2.2-TI2V-5B-GGUF` `.gguf`.
+        // The DiT is held as resident Q4_K_M `QTensor`s (dequant-on-matmul) — the loader-proof this PR
+        // lands. Manifest/catalog/tier routing is sub-story 2; adapter routing on this path is a later
+        // sub-story, so a LoRA/LoKr spec on the GGUF seam is rejected loudly rather than silently ignored.
+        if let Some(gguf) = crate::gguf::env_gguf_path() {
+            if !self.adapters.is_empty() {
+                return Err(CandleError::Msg(format!(
+                    "wan: LoRA/LoKr on the native-GGUF 5B path ({}) is not wired yet — sc-12735 sub-story \
+                     1 is the GGUF loader mechanism; adapter routing on the GGUF tier is a later sub-story",
+                    crate::gguf::GGUF_ENV
+                )));
+            }
+            // candle_core::Result → CResult (CandleError) via the `?` bridge.
+            return Ok(crate::gguf::load_wan_dit_gguf(
+                &gguf,
+                &self.dit_cfg,
+                &self.device,
+                DIT_DTYPE,
+            )?);
+        }
         let vb = self.component_vb("transformer", DIT_DTYPE)?;
         // Packed-tier marker: the sc-10025 seam packs every DiT Linear (incl. `proj_out`).
         let packed = vb.contains_tensor("proj_out.scales");
