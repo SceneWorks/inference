@@ -198,6 +198,82 @@ pub fn require_hf_snapshot_dir(repo: &str) -> PathBuf {
 pub use gpu_peak::{probe_gpu, used_mib, PeakSampler};
 pub use vram_probe::{VramProbe, VramReport};
 
+#[cfg(feature = "cuda")]
+pub use cuda_mempool::{reset_cuda_mempool_high_water, cuda_mempool_used_high_bytes};
+
+/// Driver memory-pool `USED_MEM_HIGH` probe — the ACCURATE concurrent-live VRAM peak (sc-12818).
+///
+/// The [`PeakSampler`] samples `nvidia-smi memory.used` (the driver's **reserved** bytes) every ~40 ms
+/// and so **misses sub-poll transients** — the brief im2col / VAE-decode / attention spikes the
+/// stream-ordered pool allocates then releases back to the driver between polls — which understated the
+/// Wan A14B peak ~2×. The CUDA driver instead tracks `CU_MEMPOOL_ATTR_USED_MEM_HIGH` continuously: the
+/// high-water of bytes actually **live** in the device's default async-alloc pool — the true
+/// concurrent-live peak. candle 0.10 allocates every tensor via `cuMemAllocAsync` on cuda:0's default
+/// stream (cudarc's `has_async_alloc`, true on any pools-capable card), which draws from that default
+/// pool, so its high-water IS candle's real peak.
+///
+/// Best-effort: any driver error yields `None`/`false`. The ordinal is candle's **logical** device (the
+/// driver API honours `CUDA_VISIBLE_DEVICES`, so logical 0 is the card candle renders on — NOT
+/// [`probe_gpu`]'s physical nvidia-smi ordinal). The attribute is resettable (write-to-zero), so
+/// bracketing a phase with [`reset_cuda_mempool_high_water`] → work → [`cuda_mempool_used_high_bytes`]
+/// yields that phase's isolated true peak.
+#[cfg(feature = "cuda")]
+mod cuda_mempool {
+    use std::ffi::c_void;
+
+    use candle_core::cuda::cudarc::driver::sys;
+
+    const USED_MEM_HIGH: sys::CUmemPool_attribute =
+        sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_USED_MEM_HIGH;
+
+    /// The default stream-ordered memory pool `cuMemAllocAsync` draws from for **logical** device
+    /// `ordinal`, or `None` on any driver error. `cuInit` is idempotent (candle calls it too), so this is
+    /// safe to run before candle builds its context — the default pool is a stable per-device handle,
+    /// unaffected by context retain.
+    fn default_pool(ordinal: i32) -> Option<sys::CUmemoryPool> {
+        unsafe {
+            if sys::cuInit(0) != sys::CUresult::CUDA_SUCCESS {
+                return None;
+            }
+            let mut dev: sys::CUdevice = 0;
+            if sys::cuDeviceGet(&mut dev, ordinal) != sys::CUresult::CUDA_SUCCESS {
+                return None;
+            }
+            let mut pool: sys::CUmemoryPool = std::ptr::null_mut();
+            if sys::cuDeviceGetDefaultMemPool(&mut pool, dev) != sys::CUresult::CUDA_SUCCESS {
+                return None;
+            }
+            Some(pool)
+        }
+    }
+
+    /// Reset logical device `ordinal`'s pool `USED_MEM_HIGH` watermark (the attribute is write-to-zero
+    /// per the driver ABI) so a later [`cuda_mempool_used_high_bytes`] reads the peak of just the work
+    /// since this call. Returns whether the reset landed.
+    pub fn reset_cuda_mempool_high_water(ordinal: i32) -> bool {
+        let Some(pool) = default_pool(ordinal) else {
+            return false;
+        };
+        let mut zero: u64 = 0;
+        unsafe {
+            sys::cuMemPoolSetAttribute(pool, USED_MEM_HIGH, (&mut zero as *mut u64).cast::<c_void>())
+                == sys::CUresult::CUDA_SUCCESS
+        }
+    }
+
+    /// Logical device `ordinal`'s pool `USED_MEM_HIGH` watermark in bytes — the driver's continuous
+    /// high-water of concurrently-live pool bytes — or `None` on any driver error.
+    pub fn cuda_mempool_used_high_bytes(ordinal: i32) -> Option<u64> {
+        let pool = default_pool(ordinal)?;
+        let mut bytes: u64 = 0;
+        let ok = unsafe {
+            sys::cuMemPoolGetAttribute(pool, USED_MEM_HIGH, (&mut bytes as *mut u64).cast::<c_void>())
+                == sys::CUresult::CUDA_SUCCESS
+        };
+        ok.then_some(bytes)
+    }
+}
+
 mod vram_probe {
     //! sc-9094 — the per-tier VRAM measuring harness (epic 9083's packed-load rollout). Wraps the
     //! device-level [`PeakSampler`] into the three phase quantities the manifest's per-variant

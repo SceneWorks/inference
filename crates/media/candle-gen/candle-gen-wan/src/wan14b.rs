@@ -15,9 +15,11 @@
 //! — the reference image's first-frame z16 latent + a temporal mask form a 20-channel `y` appended to
 //! the 16-channel noise latent (in_dim 36) every forward (the image enters via the channels, not noise).
 //!
-//! **Dtypes:** UMT5 + VAE run **f32**; the experts run **bf16** (norms/modulation upcast to f32),
+//! **Dtypes:** the experts, UMT5 (sc-12778), and the z16 VAE (sc-12818) all run **bf16** — the experts
+//! and VAE with their norms/modulation (and the VAE's channel-L2 + attention softmax) upcast to f32,
 //! mirroring the 5B. The VAE decode **streams one latent frame at a time** (sc-5176) to bound the
-//! decode-stage peak — the heavier-than-5B fix the story (sc-5174) requires.
+//! decode-stage peak — the heavier-than-5B fix the story (sc-5174) requires — and the bf16 VAE halves
+//! that stage's otherwise-fixed ~30 GiB floor so the 1280×720/81f A14B decode fits a 24 GiB card.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -51,11 +53,17 @@ use crate::vae16::WanVae16;
 /// The experts run bf16 (the diffusers fp32 weights load as bf16, the 5B regime); UMT5 runs bf16
 /// (sc-12778 — halving the f32 encoder resident + its ENCODE-stage transient; the DiT `embed_text`
 /// already casts the context to bf16, so this removes the old f32→bf16 boundary. The A14B is
-/// decode-bound so the peak win is smaller than the 5B's, but the resident encoder still halves);
-/// the VAE runs f32.
+/// decode-bound so the peak win is smaller than the 5B's, but the resident encoder still halves).
+///
+/// The z16 VAE runs **bf16** (sc-12818): rigorously measured (driver `CU_MEMPOOL_ATTR_USED_MEM_HIGH`,
+/// the accurate concurrent-live peak), the sequential A14B decode's TRUE peak was a **fixed ~30.1 GiB
+/// floor, independent of the VAE spatial-tile budget** (weights + the un-tileable f32 decode
+/// activations, not something tiling can shrink). Running the z16 VAE bf16 ~halves that floor → it fits
+/// a 24 GiB card. bf16 keeps f32's 8-bit exponent (no fp16 overflow risk), and the L2/softmax
+/// reductions stay f32-reduced in [`WanVae16`], so decode parity holds (GPU-checked ≥35 dB PSNR vs f32).
 const DIT_DTYPE: DType = DType::BF16;
 const ENC_DTYPE: DType = DType::BF16;
-const VAE_DTYPE: DType = DType::F32;
+const VAE_DTYPE: DType = DType::BF16;
 const Z_DIM: usize = 16;
 
 /// Which A14B model this generator serves — selects in_dim (16 vs 36), the MoE knobs, and whether the
@@ -200,8 +208,9 @@ impl Pipeline {
     /// Build the z16 VAE from an in-place ComfyUI file (sc-10909): load its native tensor map on CPU,
     /// remap the native WAN-VAE keys to the diffusers schema
     /// ([`crate::comfyui::remap_vae_wan_to_diffusers`], values pass through as bf16), then build via
-    /// `VarBuilder::from_tensors` at [`VAE_DTYPE`] (f32 upcast on `get`, byte-matching the snapshot VAE
-    /// mmap). I2V builds the encoder too (the conditioning image's first-frame latent).
+    /// `VarBuilder::from_tensors` at [`VAE_DTYPE`] (**bf16**, sc-12818 — the weights load bf16, the
+    /// decode-floor win; `get` casts each tensor to that dtype). I2V builds the encoder too (the
+    /// conditioning image's first-frame latent).
     fn build_vae_comfyui(&self, file: &Path) -> CResult<WanVae16> {
         let map = cst::load(file, &Device::Cpu)?;
         let map = crate::comfyui::remap_vae_wan_to_diffusers(map)?;
@@ -327,9 +336,10 @@ impl Pipeline {
         }
     }
 
-    /// Build the z16 VAE (f32). In-place ComfyUI mode (sc-10909) reads it from the user's tree
-    /// (native→diffusers key remap); else the snapshot `vae/`. I2V builds the encoder too (the
-    /// conditioning image's first-frame latent). Shared by the resident and staged paths (sc-12733).
+    /// Build the z16 VAE (**bf16**, sc-12818 — the decode-floor win). In-place ComfyUI mode (sc-10909)
+    /// reads it from the user's tree (native→diffusers key remap); else the snapshot `vae/`. I2V builds
+    /// the encoder too (the conditioning image's first-frame latent). Shared by the resident and staged
+    /// paths (sc-12733).
     fn load_vae(&self) -> CResult<WanVae16> {
         match self.comfyui.as_ref().and_then(|c| c.vae_file.as_deref()) {
             Some(vae_file) => self.build_vae_comfyui(vae_file),
