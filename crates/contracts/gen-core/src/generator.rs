@@ -1654,7 +1654,9 @@ mod tests {
             ),
         ];
         for (field, params) in gaps {
-            let err = c.validate_request_audio("tts", &with_audio(params)).unwrap_err();
+            let err = c
+                .validate_request_audio("tts", &with_audio(params))
+                .unwrap_err();
             assert!(matches!(err, Error::Unsupported(_)), "{field}: got {err:?}");
             assert!(err.to_string().contains(field), "{field}: got {err}");
         }
@@ -1665,14 +1667,20 @@ mod tests {
         });
         let err = c.validate_request_audio("tts", &over_cap).unwrap_err();
         assert!(matches!(err, Error::Msg(_)), "got {err:?}");
-        assert!(err.to_string().contains("audio.target_duration"), "got {err}");
+        assert!(
+            err.to_string().contains("audio.target_duration"),
+            "got {err}"
+        );
         for bad in [0.0, -3.0] {
             let req = with_audio(AudioParams {
                 target_duration: Some(bad),
                 ..Default::default()
             });
             assert!(
-                matches!(c.validate_request_audio("tts", &req).unwrap_err(), Error::Msg(_)),
+                matches!(
+                    c.validate_request_audio("tts", &req).unwrap_err(),
+                    Error::Msg(_)
+                ),
                 "target_duration {bad} must be rejected"
             );
         }
@@ -1758,7 +1766,8 @@ mod tests {
         };
         let err = c.validate_request_audio("tts", &cloned).unwrap_err();
         assert!(
-            err.to_string().contains("conditioning.reference_audio.strength"),
+            err.to_string()
+                .contains("conditioning.reference_audio.strength"),
             "got {err}"
         );
     }

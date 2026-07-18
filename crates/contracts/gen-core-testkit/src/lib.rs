@@ -155,11 +155,9 @@ fn output_bytes(out: &GenerationOutput) -> Vec<u8> {
             .flat_map(|f| f.pixels.iter().copied())
             .collect(),
         // Pure audio (sc-12834): the PCM samples' little-endian bytes are the deterministic unit.
-        GenerationOutput::Audio(track) => track
-            .samples
-            .iter()
-            .flat_map(|s| s.to_le_bytes())
-            .collect(),
+        GenerationOutput::Audio(track) => {
+            track.samples.iter().flat_map(|s| s.to_le_bytes()).collect()
+        }
     }
 }
 
