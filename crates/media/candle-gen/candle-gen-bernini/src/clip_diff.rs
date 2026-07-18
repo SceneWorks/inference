@@ -9,8 +9,8 @@
 //! in channels == 3584, so `rest` is empty).
 //!
 //! `SimpleMLPAdaLN`: `input_proj`(in→width) + `time_embed`(GLIDE sinusoidal→MLP) + `cond_embed`(z→width)
-//! → `y = t+c` → N adaLN-zero `ResBlock`s → `FinalLayer`. LayerNorm reductions run in f32 (the parity
-//! goldens are f32).
+//! → `y = t+c` → N adaLN-zero `ResBlock`s → `FinalLayer`. LayerNorm reductions and affine arithmetic
+//! run in f32, then cast back to the activation dtype, matching torch's mixed-precision kernel.
 //!
 //! Validated bit-near against `tests/fixtures/clip_diff_golden.safetensors` (the same synthetic golden
 //! the MLX lane asserts): `for_gen`/`for_vit` (via [`crate::connector`]), the net forward, and a full
