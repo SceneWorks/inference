@@ -639,9 +639,13 @@ pub struct Capabilities {
     /// wired the load→use→drop residency lifecycle silently treats it as `Resident` (never an error),
     /// which makes the fallback undiscoverable from the outside. This bit is the discovery signal: a
     /// consumer (worker / UI) reads it to know whether requesting `Sequential` will actually bound peak
-    /// memory on this engine or be a no-op. `Default` is `false` so an unwired engine does not
-    /// over-advertise; a provider that drives the shared [`crate::runtime`] residency seam sets it
-    /// `true`.
+    /// **footprint** on this engine or be a no-op. "Bound peak footprint" covers both shapes: an engine
+    /// that holds several components co-resident (e.g. the Wan A14B MoE) bounds the peak **active** set
+    /// by dropping the inactive ones, while an engine that already stages its active set (e.g. the dense
+    /// Wan TI2V-5B) bounds the peak **retained cache / RSS** by `clear_cache`-flushing each dead
+    /// component off-GPU instead of leaving it warm — the fit-gate models both via the staged
+    /// max-single-component estimate. `Default` is `false` so an unwired engine does not over-advertise;
+    /// a provider that drives the shared [`crate::runtime`] residency seam sets it `true`.
     pub supports_sequential_offload: bool,
 }
 

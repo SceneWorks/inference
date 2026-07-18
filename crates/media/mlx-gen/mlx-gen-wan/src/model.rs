@@ -129,8 +129,13 @@ pub fn descriptor() -> ModelDescriptor {
             supports_kv_cache: true,
             // Wan pins a static `sample_shift` from config (not the empirical per-resolution mu).
             requires_sigma_shift: false,
-            // Not wired onto the shared `Residency` seam (F-176); Sequential is a no-op fallback.
-            supports_sequential_offload: false,
+            // Honors `OffloadPolicy::Sequential` (epic 12732, sc-12796): the dense path is already
+            // staged (TE → DiT → z48 VAE, each loaded → used → dropped in turn), so Sequential adds no
+            // expert swap (there are none) — it `clear_cache`-flushes the dead UMT5 TE / VAE-encoder
+            // buffers off-GPU after each stage, so they don't linger in MLX's buffer cache (RSS /
+            // wired-memory pressure) through denoise + decode. Advertised so the worker's fit-gate can
+            // tell "bounds footprint here" from a no-op fallback.
+            supports_sequential_offload: true,
         },
     }
 }
@@ -149,6 +154,14 @@ pub struct Wan {
     /// Optional Q4/Q8 quantization for the transformer (sc-2682). `None` = dense bf16 (or a
     /// pre-quantized snapshot, which `from_weights` builds packed from its `config.json` manifest).
     quant: Option<Quant>,
+    /// Component-residency strategy for the dense render (epic 12732, sc-12796). [`OffloadPolicy::Resident`]
+    /// (default) is the byte-identical pre-offload path — the staged components are dropped by scope but
+    /// their freed buffers stay warm in MLX's cache. [`OffloadPolicy::Sequential`] additionally
+    /// `clear_cache`-flushes each dead component (UMT5 TE, TI2V VAE-encoder, DiT) out to the OS as soon
+    /// as it is dropped, so it is truly off-GPU (not just off the active set) for the stages that
+    /// follow — bounding the unified-memory RSS / wired footprint. No expert swap (single dense DiT).
+    /// Captured from [`LoadSpec::offload_policy`] at load.
+    offload_policy: OffloadPolicy,
 }
 
 impl Wan {
@@ -254,6 +267,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         root,
         adapters: spec.adapters.clone(),
         quant,
+        offload_policy: spec.offload_policy,
     }))
 }
 
@@ -349,6 +363,13 @@ impl Wan {
         // an unknown `sampler`, which `solver_kind` would otherwise silently map to UniPC.
         self.validate(req)?;
         let cfg = &self.config;
+        // Sequential offload (epic 12732, sc-12796): the dense render is already staged (TE → DiT → z48
+        // VAE, each loaded → used → dropped in turn), so there is no expert swap. Under `Sequential`,
+        // `clear_cache`-flush each dead component's buffers off-GPU as soon as it is dropped, so the
+        // freed UMT5 TE / VAE-encoder don't linger in MLX's buffer cache (RSS / wired footprint) through
+        // the denoise + decode that follow. `Resident` (default) leaves the cache warm — the
+        // byte-identical pre-offload path (residency/lifetime change only, numerics untouched).
+        let sequential = self.offload_policy == OffloadPolicy::Sequential;
 
         // --- Resolve request knobs against config defaults ---
         let frames = req.frames.map(|f| f as usize).unwrap_or(cfg.frame_num);
@@ -369,6 +390,11 @@ impl Wan {
         let lat = latent_shape(gen_frames, height, width, cfg.vae_z_dim, cfg.vae_stride)?;
 
         // sc-4986 — fail fast (catchable) if the DiT-denoise stage won't fit, before any heavy load.
+        // sc-12796: this is policy-INdependent for the dense 5B (unlike the A14B's `moe_denoise_resident_bytes`,
+        // whose resident-expert count is 1 under the swap vs 2 otherwise). The 5B holds exactly ONE DiT
+        // resident during denoise under both `Resident` and `Sequential` — the TE/VAE are staged out
+        // either way; `Sequential` only additionally `clear_cache`-flushes their dead buffers — so the
+        // single-DiT byte count is already the correct budget for both policies.
         preflight_denoise_memory_guard(
             self.descriptor.id,
             dit_resident_bytes(&[self.root.join("model.safetensors")], self.quant),
@@ -388,6 +414,15 @@ impl Wan {
         // --- Stage 1: UMT5 text encode (loaded → used → freed) ---
         let (context, context_null) =
             encode_text_staged(&self.root, cfg, &req.prompt, &neg_prompt, cfg_disabled)?;
+        // sc-12796: `encode_text_staged` already drops the UMT5 encoder before returning (only the small
+        // `[L, dim]` contexts survive — the DiT projects them through its own `text_embedding` below).
+        // Under `Sequential`, flush its ~11 GB bf16 weights (f32 activations — text_encoder.rs) out of
+        // MLX's buffer cache to the OS now, so the TE is truly off-GPU for the whole denoise + decode.
+        // `Resident` leaves the cache warm (byte-identical pre-offload behavior). `context`/`context_null`
+        // are already eval'd.
+        if sequential {
+            mlx_rs::memory::clear_cache();
+        }
 
         // Seeded init noise (f32) — shape matches the reference; exact RNG values differ across the
         // mlx-python/mlx-rs split (expected).
@@ -452,6 +487,14 @@ impl Wan {
                 None => (init_noise.clone(), None),
             }
         };
+        // sc-12796: the TI2V/keyframe path above loads the z48 VAE **encoder** to encode the reference
+        // image(s), then drops it at the brace (`latents_init`/`z` are eval'd and independent of it).
+        // Under `Sequential`, flush the VAE encoder out of the cache before the DiT loads so the denoise
+        // stage's footprint is the DiT alone, not the DiT + a cache-resident VAE encoder. Pure-noise T2V
+        // (`ti2v` is `None`) loaded no VAE here — nothing to flush.
+        if sequential && ti2v.is_some() {
+            mlx_rs::memory::clear_cache();
+        }
 
         // --- Stage 2: load the DiT, merge adapters + quantize, embed contexts, denoise (→ freed) ---
         let latents = {
@@ -554,6 +597,15 @@ impl Wan {
                 }
             }
         };
+        // sc-12796: the DiT drops at the brace above; `latents` is fully materialized (the per-step
+        // `eval` in `denoise` / `denoise_ti2v` / `denoise_curated` detached it from the DiT weights), so
+        // nothing live references the transformer. Under `Sequential`, flush the dropped DiT out of the
+        // cache before the z48 VAE **decoder** loads, so the decode stage doesn't stack on a
+        // cache-resident DiT. On the dense 5B the DiT is small (~10 GB bf16 / ~2.9 GB q4) but the z48
+        // `vae22` decode is the heavy stage, so keeping its dead buffers off-GPU is the point.
+        if sequential {
+            mlx_rs::memory::clear_cache();
+        }
 
         // --- Stage 3: z48 vae22 decode → RGB8 frames ---
         on_progress(Progress::Decoding);
@@ -1570,12 +1622,13 @@ mod tests {
         assert_eq!(1280 * 720, a14b.max_area);
     }
 
-    /// sc-12736 (epic 12732): BOTH A14B MoE variants advertise `supports_sequential_offload` so the
-    /// worker's fit-gate can select the expert swap under a unified-memory ceiling. The dense TI2V-5B
-    /// is a **separate** story and stays `false` here — flipping it to `true` (or an A14B variant back
-    /// to `false`) is the mutation this guards against.
+    /// sc-12736 + sc-12796 (epic 12732): ALL three Wan2.2 MLX variants advertise
+    /// `supports_sequential_offload` so the worker's fit-gate can tell "bounds footprint under
+    /// `Sequential`" from a no-op fallback — the two A14B MoE variants via the expert swap (sc-12736),
+    /// the dense TI2V-5B via the staged-component `clear_cache` flush (sc-12796). Mutation guard:
+    /// flipping ANY of these back to `false` regresses the advertisement its offload path relies on.
     #[test]
-    fn both_a14b_variants_advertise_sequential_offload_but_the_5b_does_not() {
+    fn all_wan_mlx_variants_advertise_sequential_offload() {
         assert!(
             descriptor_t2v_14b()
                 .capabilities
@@ -1589,8 +1642,9 @@ mod tests {
             "I2V-A14B must advertise the expert-swap sequential offload"
         );
         assert!(
-            !descriptor().capabilities.supports_sequential_offload,
-            "the dense TI2V-5B is a separate story — it must NOT advertise it here"
+            descriptor().capabilities.supports_sequential_offload,
+            "the dense TI2V-5B must advertise sequential offload (sc-12796) — the staged TE/VAE \
+             clear_cache flush bounds its unified-memory footprint"
         );
     }
 
@@ -1655,6 +1709,7 @@ mod tests {
             root: PathBuf::new(),
             adapters: vec![],
             quant: None,
+            offload_policy: OffloadPolicy::Resident,
         }
     }
 
@@ -2032,6 +2087,7 @@ mod tests {
             root: tmp_dir(),
             adapters,
             quant: None,
+            offload_policy: OffloadPolicy::Resident,
         }
     }
 
