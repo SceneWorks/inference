@@ -291,13 +291,19 @@ fn concat_story_geometry_128x42x480x848() {
     assert!(bad == 0, "concat had {bad} corrupted sample(s); max_abs={max_abs:e}");
 }
 
-/// Does creating / reshaping a >i32::MAX array through the mlx-rs wrappers stay intact? `from_slice`
-/// asserts `len == shape.product::<i32>()` (overflows), and `reshape(&[-1])` infers the flat dim as
-/// i32 — both cap MLX arrays at i32::MAX elements *through this binding* even though MLX core can hold
-/// the buffer (a `pad` here builds a 2.188e9-element array and reads back). This is why the safe path
-/// must NEVER flatten or `from_slice` the full oversized output.
+/// Which reshape/read ops on a >i32::MAX array survive on this pin. **sc-12748 corrects the earlier
+/// weak check here** (which used `catch_unwind(...).is_ok()` and so only saw *panics*, silently passing
+/// an MLX `Err`). The real ground truth, which `contiguous`'s materialization depends on:
+///  - `as_slice` and elementwise over the oversized array: **correct**.
+///  - `reshape(&[-1])` — flatten to a single >i32::MAX dimension: **RAISES** (`Err`) — MLX's
+///    `check_shape_dim` (#3524) rejects any single dimension outside the `i32` range. This is why
+///    `contiguous` must NOT flatten the full output.
+///  - a **multi-dimensional** reshape whose total > i32::MAX but every dimension ≤ i32::MAX (e.g.
+///    `[c, d·h·w]`): **works** — the per-dimension check passes and the size product is computed wide.
+///    This is the int64-safe materialization the decode read-back uses.
+///  - `from_slice` (host `Vec` → over-bound `Array`) stays i32-capped (mlx-rs assert), untested here.
 #[test]
-#[ignore = "sc-12438 MLX >i32::MAX reshape/contiguous probe (~9 GB); run with --ignored on Metal"]
+#[ignore = "sc-12438/sc-12748 MLX >i32::MAX reshape/contiguous probe (~9 GB); run with --ignored on Metal"]
 fn reshape_and_contiguous_on_oversized_array() {
     let (c, d, h, w): (i64, i64, i64, i64) = (128, 41, 480, 848);
     let xhost: Vec<f32> = (0..c * d * h * w).map(pv).collect();
@@ -306,36 +312,58 @@ fn reshape_and_contiguous_on_oversized_array() {
     drop(xhost);
     let y = pad(&x, &[(0, 0), (0, 1), (0, 0), (0, 0)][..], None, None).unwrap();
     y.eval().unwrap();
-    let out_elems = c * (d + 1) * h * w;
+    let dout = d + 1;
+    let out_elems = c * dout * h * w;
     assert!(out_elems > I32_MAX);
 
-    // (a) as_slice on the oversized array — expected to WORK (read side is fine).
+    // (a) as_slice on the oversized array — read side is fine. Touch the last (>2^31) element.
     let read_ok = std::panic::catch_unwind(|| {
         let s = y.as_slice::<f32>();
-        s[out_elems as usize - 1] // touch the last element
+        s[out_elems as usize - 1]
     })
     .is_ok();
 
-    // (b) elementwise 2·y+1 over the oversized array — expected to WORK (elementwise is safe).
+    // (b) elementwise 2·y+1 over the oversized array — elementwise is safe.
     let two = Array::from_slice(&[2.0f32], &[1]);
     let one = Array::from_slice(&[1.0f32], &[1]);
     let elementwise_ok = std::panic::catch_unwind(|| {
         let z = add(multiply(&y, &two).unwrap(), &one).unwrap();
         z.eval().unwrap();
         let zs = z.as_slice::<f32>();
-        // sample an above-2^31 element: c=127,d=0,h=0,w=0 → should be 2·pv(127*d*h*w)+1.
-        let off = (127i64 * (d + 1) * h * w) as usize;
+        let off = (127i64 * dout * h * w) as usize; // above 2^31
         (zs[off] - (2.0 * pv(127 * d * h * w) + 1.0)).abs() < 1e-3
     })
     .unwrap_or(false);
 
-    // (c) reshape(&[-1]) — expected to FAIL/overflow (i32 flat-dim inference) on this binding.
-    let reshape_flat_ok =
-        std::panic::catch_unwind(|| y.reshape(&[-1]).map(|r| r.shape().to_vec())).is_ok();
+    // (c) reshape(&[-1]) — flatten to one >i32::MAX dim. Check the Result (not just panic-freedom).
+    let reshape_flat_ok = y.reshape(&[-1]).is_ok();
+
+    // (d) multi-dim reshape [c, dout·h·w] — total > i32::MAX, each dim ≤ i32::MAX. This is the
+    //     materialization `contiguous` uses. Verify it returns Ok AND reads back correctly at an
+    //     above-2^31 flat offset (position-dependent), then reshape back to the 4-D shape.
+    let per = dout * h * w; // 42·480·848 = 17,111,040 < i32::MAX
+    assert!(per < I32_MAX && c < I32_MAX && c * per > I32_MAX);
+    let r2 = y.reshape(&[c as i32, per as i32]);
+    let reshape_2d_ok = r2.is_ok();
+    let mut reshape_2d_value_ok = false;
+    let mut reshape_back_ok = false;
+    if let Ok(r2) = r2 {
+        r2.eval().unwrap();
+        // Element [c=127, k] flat offset = 127·per + k (> 2^31). y[127,dd,hh,ww] = pv(orig) for dd<d
+        // else 0; pick dd=0,hh=0,ww=0 → k=0 → pv(127·d·h·w).
+        let rs = r2.as_slice::<f32>();
+        let off = (127 * per) as usize;
+        reshape_2d_value_ok = (rs[off] - pv(127 * d * h * w)).abs() < 1e-3;
+        reshape_back_ok = r2
+            .reshape(&[c as i32, dout as i32, h as i32, w as i32])
+            .is_ok();
+    }
 
     eprintln!(
         "[oversized array ops] as_slice_read_ok={read_ok}  elementwise_ok={elementwise_ok}  \
-         reshape(-1)_ok={reshape_flat_ok}  (out_elems={out_elems} = {:.4}× 2^31)",
+         reshape(-1)_ok={reshape_flat_ok}  reshape_2d_ok={reshape_2d_ok}  \
+         reshape_2d_value_ok={reshape_2d_value_ok}  reshape_back_ok={reshape_back_ok}  \
+         (out_elems={out_elems} = {:.4}× 2^31)",
         out_elems as f64 / I32_MAX as f64
     );
     assert!(read_ok, "reading back an oversized array must work");
@@ -343,5 +371,14 @@ fn reshape_and_contiguous_on_oversized_array() {
         elementwise_ok,
         "elementwise over an oversized array must be correct (the safe path relies on this)"
     );
-    // reshape(-1) is expected to be unsupported here; we only record it (no hard assert either way).
+    assert!(
+        !reshape_flat_ok,
+        "reshape(-1) to a single >i32::MAX dim is expected to RAISE on this pin (#3524 \
+         check_shape_dim) — if it now works, contiguous() can be simplified"
+    );
+    assert!(
+        reshape_2d_ok && reshape_2d_value_ok && reshape_back_ok,
+        "the multi-dim reshape contiguous() relies on must work AND read back correctly above 2^31 \
+         (2d_ok={reshape_2d_ok} value_ok={reshape_2d_value_ok} back_ok={reshape_back_ok})"
+    );
 }

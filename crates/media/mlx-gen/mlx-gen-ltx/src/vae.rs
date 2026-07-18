@@ -57,12 +57,12 @@ fn f32(w: &Weights, key: &str) -> Result<Array> {
     to_dtype(w.require(key)?, Dtype::Float32)
 }
 
-/// Force a logically-contiguous copy (see Wan `vae.rs`): host reads return the *physical* buffer, so
-/// an array left strided by the final NDHWC→NCTHW transpose reads scrambled. Only needed at the
-/// public decode/encode output boundary.
+/// Force a logically-contiguous copy at the public decode/encode output boundary: host reads return
+/// the *physical* buffer, so an array left strided by the final NDHWC→NCTHW transpose reads scrambled.
+/// sc-12748: delegates to the shared [`mlx_gen::array::contiguous`], which is int64-safe (an over-
+/// `i32::MAX` assembled output flattens via a 2-D split, not a single-dim `reshape(-1)` that raises).
 fn contiguous(x: &Array) -> Result<Array> {
-    let shape = x.shape().to_vec();
-    Ok(x.reshape(&[-1])?.reshape(&shape)?)
+    mlx_gen::array::contiguous(x)
 }
 
 /// Slice `x` along `axis` to `[start, end)`.

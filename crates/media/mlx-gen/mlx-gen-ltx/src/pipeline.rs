@@ -57,11 +57,12 @@ fn scalar(v: f32) -> Array {
     Array::from_slice(&[v], &[1])
 }
 
-/// Force a logically-contiguous copy (see `vae.rs`): host reads (`as_slice`) return the *physical*
-/// buffer, so an array left strided by the `(F,H,W,C)` transpose reads scrambled.
+/// Force a logically-contiguous copy: host reads (`as_slice`) return the *physical* buffer, so an
+/// array left strided by the `(F,H,W,C)` transpose reads scrambled. sc-12748: delegates to the shared
+/// [`mlx_gen::array::contiguous`], int64-safe for over-`i32::MAX` outputs (LTX reaches 1280²×1025f =
+/// 5e9 elements — a single-dim `reshape(-1)` would raise there).
 fn contiguous(x: &Array) -> Result<Array> {
-    let shape = x.shape().to_vec();
-    Ok(x.reshape(&[-1])?.reshape(&shape)?)
+    mlx_gen::array::contiguous(x)
 }
 
 /// The legacy dtype-preserving Euler update (the `use_legacy_euler` branch): for `σ_next > 0`,
@@ -374,7 +375,10 @@ fn frame0_to_image(frames: &Array) -> Result<Image> {
     }
     let (h, w, c) = (sh[1] as usize, sh[2] as usize, sh[3] as usize);
     let n = h * w * c;
-    let flat = frames.reshape(&[-1])?;
+    // sc-12748: reshape to the frame-major `[F, H·W·C]` (int64-safe; forces the contiguous copy
+    // `as_slice` needs) rather than `reshape(-1)`, which would raise once F·H·W·3 crosses i32::MAX.
+    // Frame 0 is the first `n` elements of the C-order buffer either way.
+    let flat = frames.reshape(&[sh[0], (h * w * c) as i32])?;
     let pixels = flat.as_slice::<u8>()[..n].to_vec();
     Ok(Image {
         width: w as u32,

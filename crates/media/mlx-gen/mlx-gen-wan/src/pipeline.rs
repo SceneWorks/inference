@@ -1663,13 +1663,14 @@ mod tests {
         assert_eq!(tracker.peak.get(), 1);
     }
 
-    /// **sc-12349: the z16 decode must never take the single pass past the write bound**, no matter how
-    /// much memory the machine has. Wan z16 writes 96 channels at full output resolution, so at 720p
-    /// only 24 output frames fit under `MAX_WRITABLE_ELEMS` — while the shipped `frame_num` is 81.
+    /// **sc-12349: the z16 selector tiles past the write bound**, no matter how much memory the machine
+    /// has. Wan z16 writes 96 channels at full output resolution, so at 720p only 24 output frames fit
+    /// under `MAX_WRITABLE_ELEMS` — while the shipped `frame_num` is 81.
     ///
-    /// This previously depended on the machine: the selector decided purely on memory, so a large
-    /// enough Mac (the audit put the crossover near ~161 GB) would have chosen the single pass and
-    /// decoded silently-wrong pixels. An unlimited budget is the sharpest form of that test.
+    /// On MLX 0.31.2 taking the single pass past the cap decoded silently-wrong pixels (the conv3d
+    /// corruption). **sc-12748: on 0.32.0 that single pass is now correct** (#3524), so this cap is
+    /// defense-in-depth rather than a correctness necessity — but the selector still tiles past it (a
+    /// cheap, always-correct default), which this pins on an unlimited budget (the sharpest form).
     #[test]
     fn z16_tiles_past_the_write_bound_on_an_unlimited_budget() {
         let (h, w, f) = (720i32, 1280i32, 81i32);

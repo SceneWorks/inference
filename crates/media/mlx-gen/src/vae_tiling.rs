@@ -48,14 +48,6 @@ pub fn check_output_writable(full_elems: i64, out_f: i32, out_h: i32, out_w: i32
     Ok(())
 }
 
-/// Force a logically-contiguous copy. mlx-rs host reads (`as_slice`) return the *physical* buffer, so
-/// an array left strided by a `transpose` is read scrambled; a reshape round-trip materializes logical
-/// order. Only needed at the host-read boundary (the public decode output) — internal mlx ops are
-/// stride-aware.
-fn contiguous(x: &Array) -> Result<Array> {
-    let shape = x.shape().to_vec();
-    Ok(x.reshape(&[-1])?.reshape(&shape)?)
-}
 
 /// Gather the contiguous range `[start, end)` along `axis` (mlx-rs has no slice op). Layout-agnostic.
 fn slice_axis(x: &Array, axis: i32, start: i32, end: i32) -> Result<Array> {
@@ -158,7 +150,9 @@ pub fn tiled_decode(
     let output = output.ok_or_else(|| Error::Msg("vae tiled decode: plan had no tiles".into()))?;
     let weights =
         weights.ok_or_else(|| Error::Msg("vae tiled decode: plan had no tiles".into()))?;
-    contiguous(&divide(&output, &maximum(&weights, scalar(1e-8))?)?)
+    // sc-12748: int64-safe contiguity (the assembled output can exceed i32::MAX — a single-dim
+    // reshape(-1) would raise; `array::contiguous` flattens via a 2-D split instead).
+    crate::array::contiguous(&divide(&output, &maximum(&weights, scalar(1e-8))?)?)
 }
 
 #[cfg(test)]

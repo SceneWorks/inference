@@ -12,13 +12,12 @@ pub(crate) fn scalar(v: f32) -> Array {
     Array::from_slice(&[v], &[1])
 }
 
-/// Force a logically-contiguous copy. mlx-rs host reads (`as_slice`) return the *physical* buffer,
-/// so an array left strided by a `transpose` is read scrambled. A reshape round-trip materializes
-/// logical order. Internal mlx ops are stride-aware, so this is only needed at the host-read
-/// boundary (the public decode/encode output).
+/// Force a logically-contiguous copy at the host-read boundary (the public decode/encode output) —
+/// mlx-rs `as_slice` returns the *physical* buffer, so a `transpose`-strided array reads scrambled.
+/// sc-12748: delegates to the shared [`mlx_gen::array::contiguous`], which is int64-safe (an over-
+/// `i32::MAX` output flattens via a 2-D split, not a single-dim `reshape(-1)` that would raise).
 pub(crate) fn contiguous(x: &Array) -> Result<Array> {
-    let shape = x.shape().to_vec();
-    Ok(x.reshape(&[-1])?.reshape(&shape)?)
+    mlx_gen::array::contiguous(x)
 }
 
 /// Gather the contiguous range `[start, end)` along `axis` (mlx-rs has no slice op). Layout-agnostic:
