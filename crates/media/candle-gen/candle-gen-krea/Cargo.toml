@@ -26,7 +26,7 @@ candle-gen-boogu = { path = "../candle-gen-boogu" }
 # it shares the `qwenimage` PiD latent-space student. Wired behind `req.use_pid` (default off → the
 # byte-exact native QwenVae decode).
 candle-gen-pid = { path = "../candle-gen-pid" }
-# Link-time self-registration of the `krea_2_turbo` generator into the `candle_gen` registry
+# The `krea_2_turbo` provider entry is composed explicitly by the platform bundles.
 # Deterministic CPU-seeded initial noise (sc-3673 parity, shared with z-image/ideogram/boogu).
 rand = { workspace = true }
 rand_distr = { workspace = true }

@@ -30,6 +30,12 @@
 //! bit-exact by `tests/i2v_parity.rs`). **LoRA in generate** (sc-2687) is wired (forward-time residuals
 //! + per-pass strength; see [`adapters`]). LoKr (sc-2393) is a sibling.
 
+/// Force a logically contiguous copy at public output boundaries. Host reads return the physical
+/// buffer, so transposed arrays must be materialized before exposure.
+pub(crate) fn contiguous(x: &mlx_rs::Array) -> mlx_gen::Result<mlx_rs::Array> {
+    mlx_gen::array::contiguous(x)
+}
+
 pub mod adapters;
 pub mod audio_vae;
 pub mod conditioning;

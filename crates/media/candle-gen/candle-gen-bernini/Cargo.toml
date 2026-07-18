@@ -16,7 +16,7 @@ candle-gen = { path = "../candle-gen" }
 # glue all come from candle-gen-wan (mirrors mlx-gen-bernini → mlx-gen-wan). The Bernini deltas
 # (dual-expert switch boundary + APG guidance + the Bernini knobs) layer on top.
 candle-gen-wan = { path = "../candle-gen-wan" }
-# Link-time self-registration into candle-gen's model registry.
+# The Bernini provider entry is composed explicitly by the platform bundles.
 # bernini_renderer.json knob sidecar reading + the converter's config emit.
 serde_json = { workspace = true }
 # The candle turnkey tier converter reads the ByteDance/Bernini-Diffusers combined `bernini/` index.

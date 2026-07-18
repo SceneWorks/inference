@@ -18,7 +18,7 @@ candle-gen = { path = "../candle-gen" }
 # per-channel latents_mean/std). Reuse `candle_gen_qwen_image::vae::QwenVae` wholesale rather than
 # re-porting the Conv3d VAE; this crate only ports the original→diffusers key rename (`vae::convert_vae_key`).
 candle-gen-qwen-image = { path = "../candle-gen-qwen-image" }
-# Link-time self-registration of the three anima generators into gen-core's model registry.
+# The three Anima provider entries are composed explicitly by the platform bundles.
 # Deterministic CPU-seeded initial noise (sc-3673 parity) — NOT candle's CUDA `randn`.
 rand = { workspace = true }
 rand_distr = { workspace = true }
