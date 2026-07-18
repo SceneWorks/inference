@@ -13,13 +13,13 @@
 
 use std::path::Path;
 
-use mlx_gen::tokenizer::{to_arrays, TextTokenizer};
+use mlx_gen::tokenizer::to_arrays;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 use mlx_gen_flux::T5TextEncoder;
 use mlx_rs::{Array, Dtype};
 
-use crate::tokenizer::PAD_TOKEN_ID;
+use crate::tokenizer::{MochiTokenizer, PAD_TOKEN_ID};
 
 /// Large negative added to padded keys in the T5 self-attention (softmax → exactly 0 weight in f32).
 /// Matches Chroma's `T5_MASK_NEG`; the HF reference uses `finfo(dtype).min`, but any value that drives
@@ -120,7 +120,7 @@ pub(crate) fn attention_mask(input_ids: &Array) -> Result<Array> {
 /// Tokenizes at `max_length` (pad-to-max), runs the T5 encoder **with** the additive key-padding mask,
 /// and returns the `[1, L, 4096]` embeds + the `[1, L]` 0/1 attention mask.
 pub fn encode_prompt(
-    tokenizer: &TextTokenizer,
+    tokenizer: &MochiTokenizer,
     t5: &T5TextEncoder,
     prompt: &str,
 ) -> Result<MochiTextConditioning> {

@@ -14,7 +14,6 @@
 use mlx_rs::ops::concatenate_axis;
 use mlx_rs::{random, Dtype};
 
-use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
     default_seed, Capabilities, Error, GenerationOutput, GenerationRequest, Generator, Image,
     LoadSpec, Modality, ModelDescriptor, Precision, Progress, Result, WeightsSource,
@@ -25,7 +24,7 @@ use std::path::{Path, PathBuf};
 
 use crate::config::{MochiConfig, MochiSplitModel, MochiVaeConfig};
 use crate::text_encoder::{encode_prompt, load_t5_encoder};
-use crate::tokenizer::load_tokenizer;
+use crate::tokenizer::{load_tokenizer, MochiTokenizer};
 use crate::transformer::{
     load_transformer_weights, MochiDitConfig, MochiQuant, MochiTransformer3DModel,
 };
@@ -100,7 +99,7 @@ pub fn descriptor() -> ModelDescriptor {
 /// A4 loads everything up front — the milestone is a working end-to-end path, not a memory-minimal one.)
 pub struct Mochi {
     descriptor: ModelDescriptor,
-    tokenizer: TextTokenizer,
+    tokenizer: MochiTokenizer,
     t5: T5TextEncoder,
     transformer: MochiTransformer3DModel,
     vae: MochiVaeDecoder,

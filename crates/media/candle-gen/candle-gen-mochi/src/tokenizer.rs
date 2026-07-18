@@ -6,9 +6,9 @@
 //!
 //! Mochi's `_get_t5_prompt_embeds` tokenizes with `padding="max_length"`, `max_length=256`,
 //! `truncation=True`, `add_special_tokens=True`. We disable the JSON's baked-in padding and pad
-//! **explicitly** to [`MAX_SEQUENCE_LENGTH`] on the right with pad id `0`, right-truncating any overflow
-//! after the appended EOS `</s>` (id 1) — `text_encoder::tokenize` owns that padding so it can build the
-//! matching 0/1 attention mask.
+//! **explicitly** to [`MAX_SEQUENCE_LENGTH`] on the right with pad id `0`. On overflow,
+//! `text_encoder::tokenize` reserves the final slot for EOS `</s>` (id 1), matching diffusers while it
+//! builds the corresponding 0/1 attention mask.
 
 use candle_gen::{CandleError, Result};
 use tokenizers::Tokenizer;
@@ -21,6 +21,9 @@ pub const MAX_SEQUENCE_LENGTH: usize = 256;
 
 /// T5 `<pad>` token id.
 pub const PAD_TOKEN_ID: u32 = 0;
+
+/// T5 `</s>` token id.
+pub const EOS_TOKEN_ID: u32 = 1;
 
 /// Load the vendored T5 tokenizer with the JSON's baked-in padding **disabled** (so `encode` returns
 /// natural-length ids, including the appended `</s>`; [`crate::text_encoder::tokenize`] pads to
