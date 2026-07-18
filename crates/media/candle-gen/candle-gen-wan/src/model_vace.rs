@@ -239,9 +239,13 @@ impl Pipeline {
             latents
         };
 
-        // Stage 4: z16 VAE decode → RGB frames.
-        on_progress(Progress::Decoding);
-        let decoded = comps.vae.decode(&latents)?;
+        // Stage 4: z16 VAE decode → RGB frames. VACE-14B decodes the SAME z16 `WanVae16` at up to
+        // 1280×720 as the A14B render, so it needs the SAME memory-bounded + im2col-safe path
+        // (sc-12758): `decode_budgeted` streams the temporal axis, adds budgeted **spatial** tiling so a
+        // single high-res frame can't spike VRAM (48 GiB single-pass would OOM a 24 GB card), forces
+        // tiling below the candle conv2d im2col-safe cap so the untiled decode can't silently corrupt,
+        // and returns a catchable error rather than OOM-ing when over budget.
+        let decoded = comps.vae.decode_budgeted(&latents)?;
         let images = frames_to_images(&decoded)?;
         Ok((images, fps))
     }
