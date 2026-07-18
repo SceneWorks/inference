@@ -299,6 +299,19 @@ impl QLinear {
         }
     }
 
+    /// [`Self::forward`] for the Qwen3-VL TE's **bf16-store / f32-compute** regime (sc-12828): the
+    /// `Adapt` dense base upcasts its weight to `x`'s dtype per matmul, so the bf16-resident projection
+    /// runs against the f32 hidden state bit-identically to an f32 store — at half the resident TE
+    /// footprint. The quant legs (NVFP4 / probed / int8-ConvRot) already dequantize to the activation
+    /// dtype, so they delegate to [`Self::forward`] unchanged. Inert (an `Arc` clone) on the f32-store
+    /// training / ControlNet paths, where `x` already matches the base dtype.
+    pub fn forward_upcast(&self, x: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::Adapt(l) => l.forward_upcast(x),
+            Self::ConvRotInt8(_) | Self::Nvfp4(_) | Self::Probed(_) => self.forward(x),
+        }
+    }
+
     /// The NVFP4 leg, when this projection is served through [`candle_gen::quant::Nvfp4Linear`] — the
     /// accounting seam [`crate::transformer::Krea2Transformer::nvfp4_report`] walks for SC#6/SC#4.
     pub(crate) fn nvfp4(&self) -> Option<&candle_gen::quant::Nvfp4Linear> {

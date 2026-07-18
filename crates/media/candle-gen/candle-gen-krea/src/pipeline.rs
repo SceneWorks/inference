@@ -42,11 +42,26 @@ use crate::text_encoder::{KreaTeConfig, KreaTextEncoder};
 use crate::transformer::Krea2Transformer;
 use crate::vae::{load_vae, load_vae_encoder, QwenVaeEncoder};
 
-/// Component compute dtypes. The Qwen3-VL TE runs in **f32** (parity-grade for this encoder, shared
-/// with the ideogram/boogu ports); the 12B DiT runs **bf16** (native on candle's CUDA backend); the
-/// Qwen-Image VAE runs **f32** (decode-precision-sensitive).
-const TE_DTYPE: DType = DType::F32;
+/// Component dtypes. The Qwen3-VL TE **computes in f32** (parity-grade for this encoder, shared with
+/// the ideogram/boogu ports — the select-layer taps feeding the DiT's `TextFusionTransformer` are
+/// accumulation-sensitive) but its weights are **stored bf16** ([`TE_STORE_DTYPE`], sc-12828): the
+/// hosted TE ships bf16 on disk, so an f32 *store* only widens those exact bf16 values — it carries
+/// no extra precision, yet holds ~15.6 GB resident (the single biggest non-DiT resident item, paid on
+/// every Krea tier). Storing bf16 and upcasting each projection to f32 per matmul
+/// ([`candle_gen::QLinear::forward_upcast`], with the RMSNorm weights loaded f32) is **bit-identical**
+/// to the f32-store forward (bf16→f32 widening is exact and every matmul still runs f32) at half the
+/// footprint (~8 GB). The 12B DiT runs **bf16** (native on candle's CUDA backend); the Qwen-Image VAE
+/// runs **f32** (decode-precision-sensitive).
 const DIT_DTYPE: DType = DType::BF16;
+
+/// The TE weight **storage** dtype (sc-12828). Distinct from the encoder's **compute** dtype (f32,
+/// enforced inside [`KreaTextEncoder`] by upcasting the embedding to f32 and each projection via
+/// `forward_upcast`): the encoder holds bf16 weights and upcasts to f32 at each op, byte-identical to
+/// an f32 store but at half the resident footprint. Applied by [`load_te_weights`] **only when the
+/// snapshot's TE actually ships bf16 on disk** — the premise the bit-identity rests on — else that
+/// loader keeps an f32 store (no silent truncation). The training / ControlNet paths deliberately keep
+/// their own f32 TE load (they are not the resident-during-render path this halves).
+const TE_STORE_DTYPE: DType = DType::BF16;
 
 /// VAE spatial downscale (the latent is image/8 per side) and latent channel count.
 const SPATIAL_SCALE: u32 = 8;
@@ -303,11 +318,30 @@ fn pid_to_load(pid_spec: Option<&PidWeights>, use_pid: bool) -> Option<&PidWeigh
 /// sc-12089). The same two loads [`load_components`] runs first; factored out so the `Sequential` path
 /// can scope them to the encode and drop them before the DiT loads. Mirrors qwen-image's `load_te_seq`
 /// (sc-10867).
+/// Load the Qwen3-VL text-encoder weights at a **bf16 store** (sc-12828), the resident-TE-halving win —
+/// but only when the snapshot's TE actually ships **bf16 on disk** (the hosted tiers: probed here from
+/// one tiny norm weight). The bit-identity of bf16-store vs f32-store holds *only* because the disk
+/// weights are already bf16, so f32 merely widened them; a snapshot whose TE is a wider dtype keeps its
+/// **f32** store rather than being silently truncated to bf16 (the compute is f32 either way — the
+/// encoder upcasts each projection — so both render correctly; only the resident footprint differs).
+fn load_te_weights(root: &Path, device: &Device) -> Result<Weights> {
+    let dir = root.join("text_encoder");
+    let w = Weights::from_dir(&dir, device, TE_STORE_DTYPE)?;
+    if w.get_native("language_model.layers.0.input_layernorm.weight")?
+        .dtype()
+        == TE_STORE_DTYPE
+    {
+        Ok(w)
+    } else {
+        Ok(Weights::from_dir(&dir, device, DType::F32)?)
+    }
+}
+
 pub(crate) fn load_text(root: &Path, device: &Device) -> Result<KreaText> {
     let tok = crate::tokenizer::KreaTokenizer::from_snapshot(root, device)?;
 
     let te_cfg = KreaTeConfig::from_snapshot(root)?;
-    let te_w = Weights::from_dir(&root.join("text_encoder"), device, TE_DTYPE)?;
+    let te_w = load_te_weights(root, device)?;
     let te = KreaTextEncoder::load(&te_w, "language_model", &te_cfg, MAX_TEXT_TOKENS)?;
 
     Ok(KreaText {
@@ -1525,6 +1559,61 @@ pub(crate) fn to_image(decoded: &Tensor) -> Result<Image> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// sc-12828: `load_text` stores the Qwen3-VL TE at **bf16**, not f32 — the deliberate, non-default
+    /// choice the ~7.6 GB/tier resident saving rides on (the encoder still computes f32 via
+    /// `forward_upcast`, bit-identical — see `text_encoder::tests`). Pinned so a revert to an f32 store
+    /// (which would silently restore the tax) fails here rather than only showing up in a VRAM probe.
+    #[test]
+    fn te_is_stored_bf16() {
+        assert_eq!(TE_STORE_DTYPE, DType::BF16);
+        assert_eq!(DIT_DTYPE, DType::BF16);
+    }
+
+    /// sc-12828 H1: `load_te_weights` stores bf16 **only** when the snapshot's TE ships bf16 on disk
+    /// (probed from a norm weight); a wider snapshot keeps its f32 store rather than being silently
+    /// truncated to bf16. Guards the premise the bit-identity claim rests on.
+    #[test]
+    fn te_store_falls_back_to_f32_off_bf16_disk() {
+        fn write_te(dir: &std::path::Path, dtype: DType) {
+            let te = dir.join("text_encoder");
+            std::fs::create_dir_all(&te).unwrap();
+            let w = Tensor::ones(4usize, DType::F32, &Device::Cpu)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap();
+            let mut m = std::collections::HashMap::new();
+            m.insert(
+                "language_model.layers.0.input_layernorm.weight".to_string(),
+                w,
+            );
+            candle_gen::candle_core::safetensors::save(&m, te.join("model.safetensors")).unwrap();
+            std::fs::write(te.join("config.json"), b"{}").unwrap();
+        }
+        let base = std::env::temp_dir().join(format!(
+            "krea_te_store_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+
+        let bf = base.join("bf16");
+        write_te(&bf, DType::BF16);
+        assert_eq!(
+            load_te_weights(&bf, &Device::Cpu).unwrap().dtype(),
+            DType::BF16,
+            "bf16-on-disk TE → bf16 store (the win)"
+        );
+
+        let f = base.join("f32");
+        write_te(&f, DType::F32);
+        assert_eq!(
+            load_te_weights(&f, &Device::Cpu).unwrap().dtype(),
+            DType::F32,
+            "non-bf16 TE → f32 store (never silently truncated)"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     /// F-177 (sc-12089): the PiD student is loaded only when the request will actually decode through
     /// it, so a `Sequential` generate that never asked for PiD does not pay for the student + its

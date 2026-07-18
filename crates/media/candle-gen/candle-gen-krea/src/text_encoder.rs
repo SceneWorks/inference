@@ -7,8 +7,13 @@
 //!
 //! GQA (32 query / 8 kv heads, **decoupled** head_dim 128 so q_proj is 4096-wide while hidden is
 //! 2560), bias-less q/k/v/o, **per-head q/k RMSNorm**, HF half-split RoPE (θ = 5e6), SwiGLU MLP,
-//! pre-norm causal decoder blocks. Runs in **f32** — the parity-grade precision for this exact encoder
-//! in the sibling boogu/ideogram ports; the DiT casts the features down to bf16.
+//! pre-norm causal decoder blocks. **Computes in f32** — the parity-grade precision for this exact
+//! encoder in the sibling boogu/ideogram ports; the DiT casts the features down to bf16. The weights
+//! are **stored bf16** (sc-12828): the embedding is upcast to f32 and each projection runs
+//! `QLinear::forward_upcast` (bf16 weight → f32 per matmul), with the RMSNorm weights loaded f32, so
+//! the forward is bit-identical to an f32 store at half the resident footprint (the disk weights are
+//! bf16, so an f32 store only widened them). The `load_text` render path stores bf16; the
+//! training/ControlNet paths load f32, where `forward_upcast` is inert.
 //!
 //! HF `hidden_states` indexing: `hidden_states[i]` is the state after running `i` decoder layers
 //! (`hidden_states[0]` = the raw embedding), so the reference's `select_hidden = [2,5,…,35]` capture
@@ -209,8 +214,12 @@ impl Attention {
             k_proj: linear_detect(w, &format!("{prefix}.k_proj"), false)?,
             v_proj: linear_detect(w, &format!("{prefix}.v_proj"), false)?,
             o_proj: linear_detect(w, &format!("{prefix}.o_proj"), false)?,
-            q_norm: w.get(&format!("{prefix}.q_norm.weight"))?,
-            k_norm: w.get(&format!("{prefix}.k_norm.weight"))?,
+            // f32 store (sc-12828): the norm weights are tiny, always kept f32 regardless of the
+            // encoder's bf16 weight store, so `rmsnorm` runs on the f32 hidden state with an f32
+            // weight — bit-identical to the old all-f32 load (the disk weights are bf16, so f32 just
+            // widens them). The bulk projections stay bf16 and upcast per matmul (`forward_upcast`).
+            q_norm: w.get_f32(&format!("{prefix}.q_norm.weight"))?,
+            k_norm: w.get_f32(&format!("{prefix}.k_norm.weight"))?,
             n_heads: cfg.num_heads,
             n_kv_heads: cfg.num_kv_heads,
             head_dim: cfg.head_dim,
@@ -222,9 +231,13 @@ impl Attention {
         let (b, s, _) = x.dims3()?;
         let (nh, nkv, hd) = (self.n_heads, self.n_kv_heads, self.head_dim);
 
-        let q = self.q_proj.forward(x)?.reshape((b, s, nh, hd))?;
-        let k = self.k_proj.forward(x)?.reshape((b, s, nkv, hd))?;
-        let v = self.v_proj.forward(x)?.reshape((b, s, nkv, hd))?;
+        // `forward_upcast`, not `forward` (sc-12828): the projections are stored bf16 but the hidden
+        // state is f32, so each weight is upcast to f32 per matmul — bit-identical to an f32-stored
+        // projection (bf16→f32 is exact) at half the resident footprint. Inert (an `Arc` clone, no
+        // copy) on the f32-stored training/control paths, where `x` already matches the weight dtype.
+        let q = self.q_proj.forward_upcast(x)?.reshape((b, s, nh, hd))?;
+        let k = self.k_proj.forward_upcast(x)?.reshape((b, s, nkv, hd))?;
+        let v = self.v_proj.forward_upcast(x)?.reshape((b, s, nkv, hd))?;
         // Per-head q/k RMSNorm over the head dim, then transpose to [B, H, S, D].
         let q = rmsnorm(&q, &self.q_norm, self.eps)?
             .transpose(1, 2)?
@@ -256,7 +269,7 @@ impl Attention {
             candle_gen::ATTN_SCORES_BUDGET,
         )?; // [B, nh, S, D]
         let o = o.transpose(1, 2)?.contiguous()?.reshape((b, s, nh * hd))?;
-        self.o_proj.forward(&o)
+        self.o_proj.forward_upcast(&o)
     }
 }
 
@@ -276,8 +289,9 @@ impl Mlp {
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let gated = (self.gate.forward(x)?.silu()? * self.up.forward(x)?)?;
-        self.down.forward(&gated)
+        // `forward_upcast` (sc-12828): bf16-stored projections, f32 hidden — see `Attention::forward`.
+        let gated = (self.gate.forward_upcast(x)?.silu()? * self.up.forward_upcast(x)?)?;
+        self.down.forward_upcast(&gated)
     }
 }
 
@@ -292,8 +306,10 @@ struct DecoderLayer {
 impl DecoderLayer {
     fn load(w: &Weights, prefix: &str, cfg: &KreaTeConfig) -> Result<Self> {
         Ok(Self {
-            input_ln: w.get(&format!("{prefix}.input_layernorm.weight"))?,
-            post_ln: w.get(&format!("{prefix}.post_attention_layernorm.weight"))?,
+            // f32 norm weights (sc-12828): tiny, kept f32 so `rmsnorm` runs f32-on-f32 regardless of
+            // the encoder's bf16 weight store — bit-identical to the old all-f32 load.
+            input_ln: w.get_f32(&format!("{prefix}.input_layernorm.weight"))?,
+            post_ln: w.get_f32(&format!("{prefix}.post_attention_layernorm.weight"))?,
             attn: Attention::load(w, &format!("{prefix}.self_attn"), cfg)?,
             mlp: Mlp::load(w, &format!("{prefix}.mlp"))?,
             eps: cfg.rms_norm_eps,
@@ -610,5 +626,155 @@ mod tests {
         assert_eq!(&ph[7..9], &[5, 6]);
         assert_eq!(&pw[7..9], &[5, 5]);
         assert_eq!(pt[9], 7);
+    }
+
+    // ── sc-12828: bf16 weight store, f32 compute — bit-identical to an f32 store ──────────────────
+
+    /// A tiny valid Qwen3-VL text-encoder weight map (2 layers, hidden 6, GQA 2/1, decoupled head_dim
+    /// 4) drawn as **bf16** — modelling the hosted TE, whose weights ship bf16 on disk. Serialized so it
+    /// can be loaded at either store dtype through the shipping `Weights` path.
+    fn tiny_te_map() -> (std::collections::HashMap<String, Tensor>, KreaTeConfig) {
+        let cfg = KreaTeConfig {
+            num_layers: 2,
+            num_heads: 2,
+            num_kv_heads: 1,
+            head_dim: 4,
+            rms_norm_eps: 1e-6,
+            rope_theta: 5_000_000.0,
+            select_hidden: vec![1, 2], // out layers 0, 1
+            prefix_tokens: 1,
+            image_token_id: IMG,
+            mrope_section: [24, 20, 20],
+        };
+        let (hidden, inter, vocab) = (6usize, 8usize, 12usize);
+        let (nh, nkv, hd) = (cfg.num_heads, cfg.num_kv_heads, cfg.head_dim);
+        let bf16 = |shape: &[usize]| {
+            Tensor::randn(0f32, 0.5f32, shape, &Device::Cpu)
+                .unwrap()
+                .to_dtype(DType::BF16)
+                .unwrap()
+        };
+        let mut t = std::collections::HashMap::new();
+        t.insert(
+            "language_model.embed_tokens.weight".to_string(),
+            bf16(&[vocab, hidden]),
+        );
+        for i in 0..cfg.num_layers {
+            let p = format!("language_model.layers.{i}");
+            t.insert(format!("{p}.input_layernorm.weight"), bf16(&[hidden]));
+            t.insert(format!("{p}.post_attention_layernorm.weight"), bf16(&[hidden]));
+            t.insert(format!("{p}.self_attn.q_proj.weight"), bf16(&[nh * hd, hidden]));
+            t.insert(
+                format!("{p}.self_attn.k_proj.weight"),
+                bf16(&[nkv * hd, hidden]),
+            );
+            t.insert(
+                format!("{p}.self_attn.v_proj.weight"),
+                bf16(&[nkv * hd, hidden]),
+            );
+            t.insert(format!("{p}.self_attn.o_proj.weight"), bf16(&[hidden, nh * hd]));
+            t.insert(format!("{p}.self_attn.q_norm.weight"), bf16(&[hd]));
+            t.insert(format!("{p}.self_attn.k_norm.weight"), bf16(&[hd]));
+            t.insert(format!("{p}.mlp.gate_proj.weight"), bf16(&[inter, hidden]));
+            t.insert(format!("{p}.mlp.up_proj.weight"), bf16(&[inter, hidden]));
+            t.insert(format!("{p}.mlp.down_proj.weight"), bf16(&[hidden, inter]));
+        }
+        (t, cfg)
+    }
+
+    fn save_tiny_te(map: &std::collections::HashMap<String, Tensor>, tag: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "krea_te_bf16_{tag}_{}_{:?}.safetensors",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        candle_gen::candle_core::safetensors::save(map, &path).unwrap();
+        path
+    }
+
+    /// The parity gate (sc-12828): a bf16 weight **store** with f32 **compute** is bit-identical to an
+    /// f32 store. The hosted TE ships bf16 on disk, so an f32 store only widens those exact values and
+    /// every matmul still runs f32 (the projections upcast via `forward_upcast`, the RMSNorm weights
+    /// load f32). Reverting `forward_upcast` → `forward` or the f32 norm load turns the bf16 path into a
+    /// dtype-mismatch error, so this test goes RED — it is not a tautology that passes with the win
+    /// ripped out. Runs on CPU precisely because the compute never leaves f32 (no bf16 matmul).
+    #[test]
+    fn bf16_store_forward_is_bit_identical_to_f32_store() {
+        let (map, cfg) = tiny_te_map();
+        let path = save_tiny_te(&map, "biteq");
+        let ids = Tensor::from_vec(vec![1u32, 5, 3, 9], (1, 4), &Device::Cpu).unwrap();
+
+        let w_f32 = Weights::from_file(&path, &Device::Cpu, DType::F32).unwrap();
+        let te_f32 = KreaTextEncoder::load(&w_f32, "language_model", &cfg, 64).unwrap();
+        let out_f32 = te_f32.forward(&ids).unwrap();
+
+        let w_bf16 = Weights::from_file(&path, &Device::Cpu, DType::BF16).unwrap();
+        let te_bf16 = KreaTextEncoder::load(&w_bf16, "language_model", &cfg, 64).unwrap();
+        let out_bf16 = te_bf16.forward(&ids).unwrap();
+
+        // The encoder computes f32 either way; output is the prefix-trimmed [1, S-1, n_select, hidden].
+        assert_eq!(out_f32.dtype(), DType::F32);
+        assert_eq!(out_bf16.dtype(), DType::F32);
+        assert_eq!(out_f32.dims(), &[1, 3, 2, 6]);
+        let a = out_f32.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let b = out_bf16.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert!(a.iter().all(|x| x.is_finite()), "context must be finite");
+        assert_eq!(
+            a, b,
+            "bf16-store forward must be bit-identical to the f32-store forward"
+        );
+
+        // The footprint win is real, not just an output cast: at the bf16 store the bulk projection
+        // weight is bf16 (half the f32 resident); `linear_detect`'s dense arm stores exactly
+        // `Weights::get`, so this pins the storage dtype the resident-VRAM saving rides on.
+        let q = "language_model.layers.0.self_attn.q_proj.weight";
+        assert_eq!(w_bf16.get(q).unwrap().dtype(), DType::BF16);
+        assert_eq!(w_f32.get(q).unwrap().dtype(), DType::F32);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The **image-grounded edit** path (`forward_with_images`) is bit-identical under the bf16 store
+    /// too (sc-12828): same shared decoder layers as the text path (`forward_upcast`), plus the
+    /// vision-embed splice + deepstack injection on the f32 hidden. Pins that the edit encode stays f32.
+    #[test]
+    fn bf16_store_grounded_is_bit_identical_to_f32_store() {
+        let (map, mut cfg) = tiny_te_map();
+        cfg.image_token_id = 0; // in-vocab (vocab 12) so the tiny embed table is valid
+        let path = save_tiny_te(&map, "grounded");
+        let dev = Device::Cpu;
+
+        // 1 text, a 4-token image block (id 0, a 2×2 merged grid → grid [1,4,4]), 1 text. S=6 > prefix 1.
+        let ids = Tensor::from_vec(vec![1u32, 0, 0, 0, 0, 1], (1, 6), &dev).unwrap();
+        let (n, hidden) = (4usize, 6usize);
+        let embeds = vec![(Tensor::ones((n, hidden), DType::F32, &dev).unwrap() * 0.5).unwrap()];
+        let deepstack = vec![(0..3)
+            .map(|k| {
+                (Tensor::ones((n, hidden), DType::F32, &dev).unwrap() * (0.01 * (k + 1) as f64)).unwrap()
+            })
+            .collect::<Vec<_>>()];
+        let grids = [[1i32, 4, 4]];
+
+        let run = |store: DType| -> Tensor {
+            let w = Weights::from_file(&path, &dev, store).unwrap();
+            KreaTextEncoder::load(&w, "language_model", &cfg, 64)
+                .unwrap()
+                .forward_with_images(&ids, &embeds, &deepstack, &grids)
+                .unwrap()
+        };
+        let out_f32 = run(DType::F32);
+        let out_bf16 = run(DType::BF16);
+
+        assert_eq!(out_bf16.dtype(), DType::F32);
+        assert_eq!(out_f32.dims(), &[1, 5, 2, 6]);
+        let a = out_f32.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let b = out_bf16.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert!(a.iter().all(|x| x.is_finite()));
+        assert_eq!(
+            a, b,
+            "bf16-store grounded context must be bit-identical to the f32-store forward"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 }

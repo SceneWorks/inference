@@ -66,6 +66,23 @@ impl QLinear {
         }
     }
 
+    /// [`Self::forward`] for the Qwen3-VL TE's **bf16-store / f32-compute** regime (sc-12828): the
+    /// **dense** base weight (and bias) is upcast to `x`'s dtype per matmul, so a bf16-resident
+    /// projection runs against the f32 hidden state bit-identically to an f32 store — at half the
+    /// resident TE footprint. Inert (an `Arc` clone) when the base already matches `x`'s dtype. The
+    /// **packed** base already dequantizes to the activation dtype, so it delegates to [`Self::forward`].
+    pub fn forward_upcast(&self, x: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::Dense(l) => {
+                let dt = x.dtype();
+                let w = l.weight().to_dtype(dt)?;
+                let b = l.bias().map(|b| b.to_dtype(dt)).transpose()?;
+                Linear::new(w, b).forward(x)
+            }
+            Self::Packed(l) => l.forward(x),
+        }
+    }
+
     /// Whether this projection loaded directly from the MLX-packed tier (the packed path) — used by
     /// the loaders + tests to assert a packed tier fired the packed path (not a silent dense fallback).
     #[cfg_attr(not(test), allow(dead_code))]

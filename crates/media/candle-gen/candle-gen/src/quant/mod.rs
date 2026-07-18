@@ -995,7 +995,8 @@ pub fn embedding(vb: &VarBuilder, base: &str, vocab: usize, hidden: usize) -> Re
     embedding_gs(vb, base, vocab, hidden, MLX_GROUP_SIZE)
 }
 
-/// As [`embedding`], but at an explicit MLX `group_size` (sc-9410, the boogu group-32 tier).
+/// As [`embedding`], but at an explicit MLX `group_size` (sc-9410, the boogu group-32 tier). The
+/// packed table dequantizes to `vb.dtype()` (dtype parity with the dense path).
 pub fn embedding_gs(
     vb: &VarBuilder,
     base: &str,
@@ -1003,20 +1004,47 @@ pub fn embedding_gs(
     hidden: usize,
     group_size: usize,
 ) -> Result<QEmbedding> {
+    embedding_dtype_gs(vb, base, vocab, hidden, group_size, vb.dtype())
+}
+
+/// As [`embedding`], but the **packed** table dequantizes to an explicit `packed_dtype` rather than
+/// `vb.dtype()` (sc-12828); the **dense** table still loads at `vb.dtype()`. A store-dtype ≠
+/// compute-dtype caller — the Qwen3-VL text encoders (bf16 weight store, f32 compute) — passes `f32` so
+/// the packed embedding dequantizes to f32 (bit-identical to an f32 store — a dequant to bf16 would
+/// round the q4/q8 rows), while the bulk dense projections keep the bf16 store. The packed table's
+/// resident footprint is its codes, so the dequant dtype costs nothing; the dense table rides the bf16
+/// store, where the encoder's f32 upcast makes that widening exact.
+pub fn embedding_dtype(
+    vb: &VarBuilder,
+    base: &str,
+    vocab: usize,
+    hidden: usize,
+    packed_dtype: DType,
+) -> Result<QEmbedding> {
+    embedding_dtype_gs(vb, base, vocab, hidden, MLX_GROUP_SIZE, packed_dtype)
+}
+
+/// [`embedding_dtype`] at an explicit MLX `group_size`.
+pub fn embedding_dtype_gs(
+    vb: &VarBuilder,
+    base: &str,
+    vocab: usize,
+    hidden: usize,
+    group_size: usize,
+    packed_dtype: DType,
+) -> Result<QEmbedding> {
     let scales_key = format!("{base}.scales");
     if vb.contains_tensor(&scales_key) {
         let device = vb.device().clone();
         let wq = vb.get_unchecked_dtype(&format!("{base}.weight"), DType::U32)?;
         let scales = vb.get_unchecked_dtype(&scales_key, DType::F32)?;
         let biases = vb.get_unchecked_dtype(&format!("{base}.biases"), DType::F32)?;
-        // Dequantize the table to the dense-path table dtype (`vb.dtype()`), so a packed bf16
-        // text-encoder embedding yields bf16 rows exactly as the dense path would (dtype parity).
         return QEmbedding::from_packed_dtype_gs(
             &wq,
             &scales,
             &biases,
             &device,
-            vb.dtype(),
+            packed_dtype,
             group_size,
         );
     }

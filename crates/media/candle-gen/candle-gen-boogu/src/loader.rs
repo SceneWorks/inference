@@ -195,7 +195,13 @@ pub fn embedding_detect(w: &Weights, base: &str) -> Result<QEmbedding> {
         let wq = w.get_native(&format!("{base}.weight"))?;
         let scales = w.get_f32(&scales_key)?;
         let biases = w.get_f32(&format!("{base}.biases"))?;
-        return QEmbedding::packed(&wq, &scales, &biases, w.dtype(), cfg.group_size as usize);
+        // Dequantize the packed table to **f32**, not `w.dtype()` (sc-12828). The TE now stores its
+        // weights bf16, but it computes f32 (the encoder upcasts the embedding to f32 immediately), so
+        // the packed embedding must dequantize to f32 to stay bit-identical to the old f32 store — a
+        // dequant-to-bf16 would round the q4/q8 rows before the widen. The packed table's resident
+        // footprint is the codes, so the dequant dtype costs nothing; only the dense table (below)
+        // rides the bf16 store, where the encoder's f32 upcast makes that widening exact.
+        return QEmbedding::packed(&wq, &scales, &biases, DType::F32, cfg.group_size as usize);
     }
     let weight = w.get(&format!("{base}.weight"))?;
     let hidden = weight.dim(1)?;
@@ -480,6 +486,46 @@ mod tests {
             dev_max, 0.0,
             "group-32 packed embedding deviates from the grid"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+        Ok(())
+    }
+
+    /// sc-12828: on a **bf16 store**, a packed `embed_tokens` still dequantizes to **f32** (the
+    /// encoder's compute dtype), NOT the bf16 store dtype — the pin (`embedding_detect` packed arm
+    /// passes `DType::F32`, not `w.dtype()`) that keeps the packed embed bit-identical to the old f32
+    /// store, since a dequant to bf16 would round the q4 rows before the encoder's f32 widen. Reverting
+    /// the pin to `w.dtype()` makes this dequantize to bf16 → the dtype assertion below fails RED.
+    #[test]
+    fn packed_embedding_dequants_f32_on_bf16_store() -> Result<()> {
+        let dev = Device::Cpu;
+        let (vocab, hidden) = (96usize, 128usize);
+        let (wq, s, b, grid) = q4_packed(vocab, hidden);
+
+        let mut map: HashMap<String, Tensor> = HashMap::new();
+        map.insert("embed_tokens.weight".into(), wq);
+        map.insert("embed_tokens.scales".into(), s);
+        map.insert("embed_tokens.biases".into(), b);
+        let dir = std::env::temp_dir().join(format!("sc12828_emb_{}", std::process::id()));
+        write_component(&dir, map, true);
+
+        // bf16 store — the sc-12828 regime (the projections would ride bf16; the packed embed must not).
+        let w = Weights::from_dir(&dir, &dev, DType::BF16)?;
+        let emb = embedding_detect(&w, "embed_tokens")?;
+        assert!(emb.is_packed(), "`.scales` ⇒ packed embedding");
+
+        let idx = Tensor::from_vec(vec![0u32, 5, 95, 12, 5], (5,), &dev)?;
+        let p = emb.forward(&idx)?;
+        // The pin: dequant to f32, NOT the bf16 store dtype.
+        assert_eq!(
+            p.dtype(),
+            DType::F32,
+            "packed embed must dequantize to f32 under a bf16 store, not bf16"
+        );
+        // And the f32 dequant still exactly reproduces the affine grid (bit-identical to the f32 store).
+        let d = QEmbedding::dense(Embedding::new(grid, hidden)).forward(&idx)?;
+        let dev_max = (p.sub(&d)?).abs()?.max_all()?.to_scalar::<f32>()?;
+        assert_eq!(dev_max, 0.0, "f32-dequant packed embed deviates from the grid");
 
         std::fs::remove_dir_all(&dir).ok();
         Ok(())

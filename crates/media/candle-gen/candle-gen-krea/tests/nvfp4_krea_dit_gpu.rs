@@ -148,10 +148,12 @@ fn trunk_weights(root: &std::path::Path, dev: &Device, dtype: DType) -> Weights 
 /// activations, which only a real caption encode produces. A synthetic `randn` context would carry no
 /// massive activations at all and hand the gate a false green.
 ///
-/// The TE loads at **f32**, matching `pipeline::load_text`'s `TE_DTYPE` — the shipping path's dtype,
-/// deliberately not the DiT's bf16. A bf16 TE yields a bf16 context and the trunk's front-end then
-/// fails `dtype mismatch in binary op`; more importantly it would be a *different* encode than the one
-/// that ships, i.e. the wrong activations to be measuring at all.
+/// The TE loads at **f32** here. Post-sc-12828 the shipping `load_text` stores the TE **bf16**, but the
+/// encoder still **computes in f32** (it upcasts the embedding and runs each projection via
+/// `forward_upcast`), so this f32-store load emits the *bit-identical* f32 `[1, n_tok, 12, 2560]`
+/// context the shipping bf16-store path does — the right activations to measure. Storing f32 here just
+/// skips the per-matmul upcast; the emitted context is unchanged, and still deliberately not the DiT's
+/// bf16 (a bf16 *context* would fail the trunk front-end's `dtype mismatch in binary op`).
 fn encode_context(root: &std::path::Path, dev: &Device) -> Tensor {
     let tok = KreaTokenizer::from_snapshot(root, dev).expect("tokenizer");
     let te_cfg = KreaTeConfig::from_snapshot(root).expect("te config");
