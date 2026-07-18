@@ -203,7 +203,9 @@ version = "0.0.0"
 dependencies = [
  "candle-core",
  "hf-hub",
+ "libc",
  "sceneworks-gen-core",
+ "sha2",
  "thiserror 2.0.18",
 ]
 
