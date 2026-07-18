@@ -49,9 +49,19 @@ use crate::scheduler::{make_step_intervals, preset_mu_std, LogitNormalSchedule};
 use crate::text_encoder::Ideogram4TextEncoder;
 use crate::transformer::Ideogram4Transformer;
 
-/// The conditional DiT is the bottleneck — bf16. Encoder + VAE run f32.
+/// The conditional DiT is the bottleneck — bf16. The Qwen3-VL encoder **computes f32** but its weights
+/// are **stored bf16** ([`TE_STORE_DTYPE`], sc-12828); the VAE runs f32.
 const DIT_DTYPE: DType = DType::BF16;
+/// f32 for the VAE build (decode-precision-sensitive) and the zero `llm` context (which must match the
+/// encoder's f32 output). NOT the TE weight store — see [`TE_STORE_DTYPE`].
 const ENC_DTYPE: DType = DType::F32;
+/// The Qwen3-VL-8B text-encoder weight **storage** dtype (sc-12828). The encoder still computes f32
+/// (it upcasts the embedding and each projection via `forward_upcast`, RMSNorm weights loaded f32), so
+/// bf16 storage is bit-identical to an f32 store — the disk weights are bf16 — at half the ~16 GB
+/// resident TE. Applied by [`te_store_dtype`] only when the snapshot's TE is bf16 on disk (else f32,
+/// never truncated). Only the `text_encoder` VarBuilder loads at this dtype; the VAE and the llm-zeros
+/// context stay [`ENC_DTYPE`] (f32).
+const TE_STORE_DTYPE: DType = DType::BF16;
 
 /// patch (2) × VAE scale (8) — height/width must be a multiple of this (=16).
 const PATCH_AE: u32 = 16;
@@ -103,6 +113,33 @@ fn component_vb(
     candle_gen::component_vb(root, sub, dtype, device, "ideogram")
 }
 
+/// The TE weight **store** dtype for this snapshot (sc-12828): [`TE_STORE_DTYPE`] (bf16) when the
+/// Qwen3-VL text encoder ships bf16 on disk — the hosted case, where the f32 compute upcasts it
+/// losslessly and the resident TE halves — else f32, so a snapshot whose TE is a wider dtype is never
+/// silently truncated (the encoder computes f32 either way; only the footprint differs). Probed from
+/// one tiny norm weight in the `text_encoder` shards (the bit-identity of bf16-store rests on the disk
+/// weights already being bf16).
+fn te_store_dtype(root: &Path, device: &Device) -> DType {
+    let dir = root.join("text_encoder");
+    let disk_is_bf16 = candle_gen::sorted_safetensors(&dir, "ideogram")
+        .ok()
+        .and_then(|files| unsafe {
+            candle_gen::candle_core::safetensors::MmapedSafetensors::multi(&files)
+        }
+        .ok())
+        .and_then(|st| {
+            st.load("language_model.layers.0.input_layernorm.weight", device)
+                .ok()
+        })
+        .map(|t| t.dtype() == TE_STORE_DTYPE)
+        .unwrap_or(false);
+    if disk_is_bf16 {
+        TE_STORE_DTYPE
+    } else {
+        DType::F32
+    }
+}
+
 /// Load all components from a candle-readable (bf16) Ideogram 4 snapshot dir (`transformer/`,
 /// `unconditional_transformer/`, `text_encoder/`, `vae/`, `tokenizer/`) — the quality (asymmetric
 /// CFG) mode.
@@ -128,7 +165,7 @@ pub fn load_components(
         &te_cfg,
         &EXTRACTED_LAYERS,
         MAX_TEXT_TOKENS,
-        component_vb(root, "text_encoder", ENC_DTYPE, device)?,
+        component_vb(root, "text_encoder", te_store_dtype(root, device), device)?,
     )?;
     // With the encoder (img2img/edit needs `vae.encode`); the encoder adds only ~the decoder's worth
     // of weights on top of the multi-GB DiTs, so it is always loaded — a Generator serves both T2I and
@@ -183,7 +220,7 @@ pub fn load_components_turbo(
         &te_cfg,
         &EXTRACTED_LAYERS,
         MAX_TEXT_TOKENS,
-        component_vb(root, "text_encoder", ENC_DTYPE, device)?,
+        component_vb(root, "text_encoder", te_store_dtype(root, device), device)?,
     )?;
     // With the encoder (img2img/edit needs `vae.encode`); the encoder adds only ~the decoder's worth
     // of weights on top of the multi-GB DiTs, so it is always loaded — a Generator serves both T2I and
@@ -731,6 +768,51 @@ impl Packing {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// sc-12828: the text-encoder VarBuilder loads at **bf16** (`TE_STORE_DTYPE`), not `ENC_DTYPE`
+    /// (f32) — the deliberate, non-default store the ~half-resident TE saving rides on. The encoder
+    /// still computes f32 (`forward_upcast` + f32 norms + f32 packed-embed dequant), bit-identical (see
+    /// `text_encoder::tests`). `ENC_DTYPE` stays f32 for the VAE build and the llm-zeros context.
+    #[test]
+    fn te_is_stored_bf16() {
+        assert_eq!(TE_STORE_DTYPE, DType::BF16);
+        assert_eq!(ENC_DTYPE, DType::F32);
+    }
+
+    /// sc-12828 H1: `te_store_dtype` returns bf16 only when the `text_encoder` ships bf16 on disk
+    /// (probed from a norm weight); a wider snapshot resolves to f32, so it is never silently truncated.
+    #[test]
+    fn te_store_falls_back_to_f32_off_bf16_disk() {
+        fn write_te(root: &Path, dtype: DType) {
+            let te = root.join("text_encoder");
+            std::fs::create_dir_all(&te).unwrap();
+            let w = Tensor::ones(4usize, DType::F32, &Device::Cpu)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap();
+            let mut m = std::collections::HashMap::new();
+            m.insert(
+                "language_model.layers.0.input_layernorm.weight".to_string(),
+                w,
+            );
+            candle_gen::candle_core::safetensors::save(&m, te.join("model.safetensors")).unwrap();
+        }
+        let base = std::env::temp_dir().join(format!(
+            "ideo_te_store_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+
+        let bf = base.join("bf16");
+        write_te(&bf, DType::BF16);
+        assert_eq!(te_store_dtype(&bf, &Device::Cpu), DType::BF16);
+
+        let f = base.join("f32");
+        write_te(&f, DType::F32);
+        assert_eq!(te_store_dtype(&f, &Device::Cpu), DType::F32);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     fn img(w: u32, h: u32, pixels: Vec<u8>) -> Image {
         Image {

@@ -16,15 +16,28 @@
 //!     wrong order yields a coherent but prompt-agnostic image.
 //!
 //! The text-only path uses plain 1-D RoPE: Qwen3-VL's MRoPE sections all index the same sequential
-//! text position when there are no image tokens, so it reduces to standard RoPE. Runs in **f32**.
+//! text position when there are no image tokens, so it reduces to standard RoPE. **Computes in f32**;
+//! its weights are **stored bf16** (sc-12828). The Qwen3-VL-8B weights ship bf16 on disk, so an f32
+//! store only widens them (~16 GB resident to carry no extra precision). The embedding is upcast to f32
+//! and each projection runs [`QLinear::forward_upcast`] (bf16 weight → f32 per matmul), with the
+//! RMSNorm weights loaded f32 ([`rms_norm_f32`]), so the forward is bit-identical to an f32 store at
+//! half the resident footprint.
 
 use candle_gen::candle_core::{DType, Device, Result, Tensor, D};
-use candle_gen::candle_nn::{
-    ops::softmax_last_dim, rms_norm, rotary_emb::rope, Module, RmsNorm, VarBuilder,
-};
-use candle_gen::quant::{embedding, lin, QEmbedding, QLinear};
+use candle_gen::candle_nn::{ops::softmax_last_dim, rotary_emb::rope, Module, RmsNorm, VarBuilder};
+use candle_gen::quant::{embedding_dtype, lin, QEmbedding, QLinear};
 
 use crate::config::Ideogram4TextEncoderConfig;
+
+/// Build a candle_nn [`RmsNorm`] whose weight is forced to **f32** (sc-12828). The encoder stores its
+/// bulk weights bf16 but computes in f32 (module docs); candle_nn's RmsNorm applies its weight at the
+/// input's dtype — f32 here — so the tiny norm weight must be f32. Byte-identical to the old f32-store
+/// build (the disk weight is bf16, so f32 only widens it); replaces the plain `candle_nn::rms_norm`
+/// builder, which would read the weight at the VarBuilder's (now bf16) dtype.
+fn rms_norm_f32(size: usize, eps: f64, vb: VarBuilder) -> Result<RmsNorm> {
+    let weight = vb.get(size, "weight")?.to_dtype(DType::F32)?;
+    Ok(RmsNorm::new(weight, eps))
+}
 
 /// HF half-split RoPE table (θ over `head_dim`), built once for the max sequence length.
 struct Rotary {
@@ -81,8 +94,8 @@ impl Attention {
             k_proj: lin(&vb, "k_proj", h, nkv * hd, false)?,
             v_proj: lin(&vb, "v_proj", h, nkv * hd, false)?,
             o_proj: lin(&vb, "o_proj", nh * hd, h, false)?,
-            q_norm: rms_norm(hd, cfg.rms_norm_eps, vb.pp("q_norm"))?,
-            k_norm: rms_norm(hd, cfg.rms_norm_eps, vb.pp("k_norm"))?,
+            q_norm: rms_norm_f32(hd, cfg.rms_norm_eps, vb.pp("q_norm"))?,
+            k_norm: rms_norm_f32(hd, cfg.rms_norm_eps, vb.pp("k_norm"))?,
             n_heads: nh,
             n_kv_heads: nkv,
             head_dim: hd,
@@ -94,9 +107,11 @@ impl Attention {
         let (nh, nkv, hd) = (self.n_heads, self.n_kv_heads, self.head_dim);
 
         // Project, reshape to [B, H, S, D], apply per-head q/k RMSNorm (over the head_dim axis).
-        let q = self.q_proj.forward(x)?.reshape((b, s, nh, hd))?;
-        let k = self.k_proj.forward(x)?.reshape((b, s, nkv, hd))?;
-        let v = self.v_proj.forward(x)?.reshape((b, s, nkv, hd))?;
+        // `forward_upcast` (sc-12828): bf16-stored projections upcast to the f32 hidden per matmul —
+        // bit-identical to an f32 store, inert when `x` already matches the weight dtype.
+        let q = self.q_proj.forward_upcast(x)?.reshape((b, s, nh, hd))?;
+        let k = self.k_proj.forward_upcast(x)?.reshape((b, s, nkv, hd))?;
+        let v = self.v_proj.forward_upcast(x)?.reshape((b, s, nkv, hd))?;
         let q = self.q_norm.forward(&q)?.transpose(1, 2)?; // [B, nh, S, D]
         let k = self.k_norm.forward(&k)?.transpose(1, 2)?; // [B, nkv, S, D]
         let v = v.transpose(1, 2)?.contiguous()?;
@@ -112,7 +127,7 @@ impl Attention {
         let probs = softmax_last_dim(&scores)?;
         let o = probs.matmul(&v)?; // [B, nh, S, D]
         let o = o.transpose(1, 2)?.reshape((b, s, nh * hd))?;
-        self.o_proj.forward(&o)
+        self.o_proj.forward_upcast(&o)
     }
 }
 
@@ -144,9 +159,10 @@ impl Mlp {
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let g = self.gate.forward(x)?.silu()?;
-        let u = self.up.forward(x)?;
-        self.down.forward(&(g * u)?)
+        // `forward_upcast` (sc-12828): bf16-stored projections, f32 hidden — see `Attention::forward`.
+        let g = self.gate.forward_upcast(x)?.silu()?;
+        let u = self.up.forward_upcast(x)?;
+        self.down.forward_upcast(&(g * u)?)
     }
 }
 
@@ -160,8 +176,8 @@ struct DecoderLayer {
 impl DecoderLayer {
     fn new(cfg: &Ideogram4TextEncoderConfig, vb: VarBuilder) -> Result<Self> {
         Ok(Self {
-            input_ln: rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?,
-            post_ln: rms_norm(
+            input_ln: rms_norm_f32(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?,
+            post_ln: rms_norm_f32(
                 cfg.hidden_size,
                 cfg.rms_norm_eps,
                 vb.pp("post_attention_layernorm"),
@@ -200,7 +216,15 @@ impl Ideogram4TextEncoder {
         vb: VarBuilder,
     ) -> Result<Self> {
         let model = vb.pp("language_model");
-        let embed_tokens = embedding(&model, "embed_tokens", cfg.vocab_size, cfg.hidden_size)?;
+        // Dense embed rides the bf16 store (widened to f32 in `prompt_embeds`, exact); the packed embed
+        // dequantizes to f32 — bit-identical to the old f32 store (sc-12828).
+        let embed_tokens = embedding_dtype(
+            &model,
+            "embed_tokens",
+            cfg.vocab_size,
+            cfg.hidden_size,
+            DType::F32,
+        )?;
         let max_layer = *out_layers.iter().max().unwrap_or(&0);
         let mut layers = Vec::with_capacity(max_layer + 1);
         let vb_layers = model.pp("layers");
@@ -276,4 +300,99 @@ fn build_mask(attention_mask: &Tensor, b: usize, s: usize, device: &Device) -> R
         }
     }
     Tensor::from_vec(data, (b, 1, s, s), device)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// A tiny valid Qwen3-VL text-encoder weight map (2 layers, hidden 6, GQA 2/1, head_dim 4) drawn
+    /// as **bf16** — modelling the hosted TE, whose weights ship bf16 on disk.
+    fn tiny_ideogram_te_map() -> (HashMap<String, Tensor>, Ideogram4TextEncoderConfig) {
+        let cfg = Ideogram4TextEncoderConfig {
+            hidden_size: 6,
+            num_layers: 2,
+            num_heads: 2,
+            num_kv_heads: 1,
+            head_dim: 4,
+            intermediate_size: 8,
+            rms_norm_eps: 1e-6,
+            rope_theta: 5_000_000.0,
+            vocab_size: 12,
+        };
+        let (nh, nkv, hd, h, inter, vocab) = (
+            cfg.num_heads,
+            cfg.num_kv_heads,
+            cfg.head_dim,
+            cfg.hidden_size,
+            cfg.intermediate_size,
+            cfg.vocab_size,
+        );
+        let bf16 = |shape: &[usize]| {
+            Tensor::randn(0f32, 0.5f32, shape, &Device::Cpu)
+                .unwrap()
+                .to_dtype(DType::BF16)
+                .unwrap()
+        };
+        let mut t = HashMap::new();
+        t.insert(
+            "language_model.embed_tokens.weight".to_string(),
+            bf16(&[vocab, h]),
+        );
+        for i in 0..cfg.num_layers {
+            let p = format!("language_model.layers.{i}");
+            t.insert(format!("{p}.input_layernorm.weight"), bf16(&[h]));
+            t.insert(format!("{p}.post_attention_layernorm.weight"), bf16(&[h]));
+            t.insert(format!("{p}.self_attn.q_proj.weight"), bf16(&[nh * hd, h]));
+            t.insert(format!("{p}.self_attn.k_proj.weight"), bf16(&[nkv * hd, h]));
+            t.insert(format!("{p}.self_attn.v_proj.weight"), bf16(&[nkv * hd, h]));
+            t.insert(format!("{p}.self_attn.o_proj.weight"), bf16(&[h, nh * hd]));
+            t.insert(format!("{p}.self_attn.q_norm.weight"), bf16(&[hd]));
+            t.insert(format!("{p}.self_attn.k_norm.weight"), bf16(&[hd]));
+            t.insert(format!("{p}.mlp.gate_proj.weight"), bf16(&[inter, h]));
+            t.insert(format!("{p}.mlp.up_proj.weight"), bf16(&[inter, h]));
+            t.insert(format!("{p}.mlp.down_proj.weight"), bf16(&[h, inter]));
+        }
+        (t, cfg)
+    }
+
+    /// The parity gate (sc-12828): a bf16 weight **store** with f32 **compute** is bit-identical to an
+    /// f32 store — the disk weights are bf16, so an f32 store only widens them and every matmul still
+    /// runs f32 (the projections upcast via `QLinear::forward_upcast`, the RMSNorm weights load f32 via
+    /// [`rms_norm_f32`], and the embedding is upcast to f32). Reverting any of those makes the bf16 path
+    /// a dtype-mismatch error, so this goes RED — it is not a tautology that passes with the win ripped
+    /// out. CPU-runnable precisely because the compute never leaves f32.
+    #[test]
+    fn bf16_store_prompt_embeds_is_bit_identical_to_f32_store() {
+        let (map, cfg) = tiny_ideogram_te_map();
+        let out_layers = [0usize, 1];
+        let dev = Device::Cpu;
+        let ids = Tensor::from_vec(vec![1u32, 5, 3, 9], (1, 4), &dev).unwrap();
+        let attn = Tensor::ones((1, 4), DType::U32, &dev).unwrap();
+
+        let vb_f32 = VarBuilder::from_tensors(map.clone(), DType::F32, &dev);
+        let out_f32 = Ideogram4TextEncoder::new(&cfg, &out_layers, 64, vb_f32)
+            .unwrap()
+            .prompt_embeds(&ids, &attn)
+            .unwrap();
+
+        let vb_bf16 = VarBuilder::from_tensors(map, DType::BF16, &dev);
+        let out_bf16 = Ideogram4TextEncoder::new(&cfg, &out_layers, 64, vb_bf16)
+            .unwrap()
+            .prompt_embeds(&ids, &attn)
+            .unwrap();
+
+        // Interleaved features [B, S, hidden·n] (n = out_layers.len()); f32 either way.
+        assert_eq!(out_f32.dtype(), DType::F32);
+        assert_eq!(out_bf16.dtype(), DType::F32);
+        assert_eq!(out_f32.dims(), &[1, 4, 12]);
+        let a = out_f32.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let b = out_bf16.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert!(a.iter().all(|x| x.is_finite()), "prompt embeds must be finite");
+        assert_eq!(
+            a, b,
+            "bf16-store prompt_embeds must be bit-identical to the f32-store forward"
+        );
+    }
 }

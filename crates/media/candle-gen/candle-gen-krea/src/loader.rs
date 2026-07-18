@@ -701,7 +701,12 @@ pub fn embedding_detect(w: &Weights, base: &str) -> Result<QEmbedding> {
         let wq = w.get_native(&format!("{base}.weight"))?;
         let scales = w.get_f32(&scales_key)?;
         let biases = w.get_f32(&format!("{base}.biases"))?;
-        return QEmbedding::packed(&wq, &scales, &biases, w.dtype(), cfg.group_size as usize);
+        // Dequantize the packed table to **f32** (the encoder's compute dtype), not `w.dtype()`
+        // (sc-12828): the TE now stores its weights bf16, but the embedding is upcast to f32 in the
+        // forward, so a packed embed must dequantize to f32 to stay bit-identical to the old f32 store
+        // (a dequant to bf16 would round the rows before the widen). Uniform with the sibling
+        // boogu/ideogram ports, which pack this table on their MLX tiers.
+        return QEmbedding::packed(&wq, &scales, &biases, DType::F32, cfg.group_size as usize);
     }
     let weight = w.get(&format!("{base}.weight"))?;
     let hidden = weight.dim(1)?;

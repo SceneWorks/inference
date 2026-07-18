@@ -81,12 +81,22 @@ pub(crate) const MAX_TEXT_TOKENS: usize = 1280;
 /// reference-token count (not the prompt).
 pub(crate) const MAX_EDIT_TOKENS: usize = 8192;
 
-/// Component compute dtypes. The Qwen3-VL TE runs in **f32** (parity-grade for this encoder, shared
-/// with the ideogram port); the 10 B DiT runs **bf16** (native on candle's CUDA backend); the small
-/// FLUX.1 VAE runs **f32** (decode-precision-sensitive).
-const TE_DTYPE: DType = DType::F32;
+/// Component dtypes. The Qwen3-VL TE **computes in f32** (parity-grade for this encoder, shared with
+/// the ideogram port) but its weights are **stored bf16** ([`TE_STORE_DTYPE`], sc-12828): the hosted
+/// TE ships bf16 on disk, so an f32 store only widens those exact values (~16 GB resident to carry no
+/// extra precision). The encoder upcasts the embedding to f32 and runs each projection via
+/// `forward_upcast`, so bf16 storage is bit-identical to an f32 store at half the resident footprint.
+/// The 10 B DiT runs **bf16** (native on candle's CUDA backend); the FLUX.1 VAE runs **f32**
+/// (decode-precision-sensitive).
 const DIT_DTYPE: DType = DType::BF16;
 const VAE_DTYPE: DType = DType::F32;
+/// The Qwen3-VL-8B text-encoder weight **storage** dtype (sc-12828) — distinct from its f32 compute,
+/// applied by [`load_te_weights`] only when the snapshot's TE is bf16 on disk (else f32, never
+/// truncated). Both t2i **and** grounded-edit encode through the SAME `load_components` TE
+/// (`comps.te`): edit calls `last_hidden_with_images` on it, so `forward_upcast` is active there too.
+/// The separate f32 `mllm` load in `load_edit_components` builds only the **vision tower**
+/// (`model.visual.*`) — no text encoder — so the bf16 TE store governs the edit encode as well.
+const TE_STORE_DTYPE: DType = DType::BF16;
 
 /// The loaded Boogu components, `Arc`-shared so the generator caches them across `generate` calls.
 pub(crate) struct Components {
@@ -101,6 +111,25 @@ pub(crate) struct Components {
 /// Load the text-to-image components from a Boogu snapshot (`mllm/ transformer/ vae/`). `pid_spec` is
 /// the optional `LoadSpec::pid` component (epic 7840 / sc-7853): when `Some`, the PiD super-resolving
 /// decoder loads once here alongside the base model; `None` keeps the byte-exact native VAE decode.
+/// Load the Qwen3-VL text-encoder (`mllm`) weights at a **bf16 store** (sc-12828, halving the resident
+/// TE) — but only when the snapshot's TE actually ships **bf16 on disk** (the hosted tiers: probed from
+/// one tiny norm weight). bf16-store vs f32-store is bit-identical *because* the disk weights are
+/// already bf16; a snapshot whose TE is a wider dtype keeps its **f32** store rather than being silently
+/// truncated (the compute is f32 either way — the encoder upcasts — so both render correctly; only the
+/// resident footprint differs).
+fn load_te_weights(root: &Path, device: &Device) -> Result<Weights> {
+    let dir = root.join("mllm");
+    let w = Weights::from_dir(&dir, device, TE_STORE_DTYPE)?;
+    if w.get_native("model.language_model.layers.0.input_layernorm.weight")?
+        .dtype()
+        == TE_STORE_DTYPE
+    {
+        Ok(w)
+    } else {
+        Ok(Weights::from_dir(&dir, device, DType::F32)?)
+    }
+}
+
 pub(crate) fn load_components(
     root: &Path,
     device: &Device,
@@ -108,7 +137,7 @@ pub(crate) fn load_components(
 ) -> Result<Components> {
     let tok = BooguTokenizer::from_snapshot(root, device, MAX_TEXT_TOKENS)?;
 
-    let te_w = Weights::from_dir(&root.join("mllm"), device, TE_DTYPE)?;
+    let te_w = load_te_weights(root, device)?;
     let te = BooguTextEncoder::load(
         &te_w,
         "model.language_model",
@@ -791,6 +820,58 @@ fn turbo_native_sigmas(conditioning_sigma: f32, steps: usize) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// sc-12828: the t2i `load_components` stores the Qwen3-VL TE at **bf16**, not f32 — the deliberate,
+    /// non-default choice the ~half-resident TE saving rides on (the encoder still computes f32 via
+    /// `forward_upcast`, bit-identical — see `text_encoder::tests`). Pinned so a revert to an f32 store
+    /// fails here rather than only in a VRAM probe.
+    #[test]
+    fn te_is_stored_bf16() {
+        assert_eq!(TE_STORE_DTYPE, DType::BF16);
+        assert_eq!(VAE_DTYPE, DType::F32);
+    }
+
+    /// sc-12828 H1: `load_te_weights` stores bf16 only when the `mllm` TE ships bf16 on disk (probed
+    /// from a norm weight); a wider snapshot keeps its f32 store rather than being silently truncated.
+    #[test]
+    fn te_store_falls_back_to_f32_off_bf16_disk() {
+        fn write_te(dir: &Path, dtype: DType) {
+            let mllm = dir.join("mllm");
+            std::fs::create_dir_all(&mllm).unwrap();
+            let w = Tensor::ones(4usize, DType::F32, &Device::Cpu)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap();
+            let mut m = std::collections::HashMap::new();
+            m.insert(
+                "model.language_model.layers.0.input_layernorm.weight".to_string(),
+                w,
+            );
+            candle_gen::candle_core::safetensors::save(&m, mllm.join("model.safetensors")).unwrap();
+            std::fs::write(mllm.join("config.json"), b"{}").unwrap();
+        }
+        let base = std::env::temp_dir().join(format!(
+            "boogu_te_store_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+
+        let bf = base.join("bf16");
+        write_te(&bf, DType::BF16);
+        assert_eq!(
+            load_te_weights(&bf, &Device::Cpu).unwrap().dtype(),
+            DType::BF16
+        );
+
+        let f = base.join("f32");
+        write_te(&f, DType::F32);
+        assert_eq!(
+            load_te_weights(&f, &Device::Cpu).unwrap().dtype(),
+            DType::F32
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn base_mu_is_static_max_shift() {

@@ -149,3 +149,57 @@ fn grounded_forward_splices_vision_through() -> Result<()> {
     );
     Ok(())
 }
+
+/// sc-12828 parity gate on the **real** Qwen3-VL assembly (not a synthetic one). The TE now stores its
+/// weights **bf16** and computes f32. On the hosted tiers the disk weights are already bf16, so that is
+/// *bit-identical* (proven in `text_encoder::tests`); this committed fixture is a full-**f32**
+/// transformers dump — the worst case, where a bf16 store genuinely rounds the projection/embedding
+/// WEIGHTS — yet the stacked `[b, n_tok, n_select, hidden]` context stays within parity of both the
+/// f32-store forward AND the transformers golden (`out.hiddens`). This is exactly the story's parity
+/// gate (cosine / max|Δ| on the context). CPU-runnable: the compute never leaves f32 (each bf16 weight
+/// is upcast per matmul), so there is no bf16 matmul.
+#[test]
+fn bf16_store_te_stays_within_parity() -> Result<()> {
+    let cfg = tiny_te_config();
+
+    let w_f32 = Weights::from_file(Path::new(FIXTURE), &Device::Cpu, DType::F32)
+        .unwrap_or_else(|e| panic!("load te fixture: {e}"));
+    let input_ids = w_f32.get_raw("in.input_ids")?.to_dtype(DType::U32)?;
+    let ctx_f32 = KreaTextEncoder::load(&w_f32, "language_model", &cfg, 64)?.forward(&input_ids)?;
+
+    let w_bf16 = Weights::from_file(Path::new(FIXTURE), &Device::Cpu, DType::BF16)
+        .unwrap_or_else(|e| panic!("load te fixture (bf16): {e}"));
+    let ctx_bf16 = KreaTextEncoder::load(&w_bf16, "language_model", &cfg, 64)?.forward(&input_ids)?;
+    assert_eq!(
+        ctx_bf16.dtype(),
+        DType::F32,
+        "the encoder computes f32 regardless of the weight store"
+    );
+    assert_eq!(ctx_bf16.dims(), ctx_f32.dims());
+
+    let c_store = cosine(&ctx_bf16, &ctx_f32);
+    let want = w_f32.get("out.hiddens")?;
+    let c_ref = cosine(&ctx_bf16, &want);
+    println!(
+        "bf16-store TE: cosine(vs f32 store)={c_store:.7} max_abs(vs f32 store)={:e}; cosine(vs golden)={c_ref:.7}",
+        max_abs_diff(&ctx_bf16, &ctx_f32)
+    );
+    // Storing the f32 fixture weights as bf16 rounds them, but the context stays within the golden's own
+    // 0.999 parity band against BOTH the f32 store and the transformers reference.
+    assert!(
+        c_store > 0.999,
+        "bf16-store vs f32-store cosine {c_store:.7} <= 0.999"
+    );
+    assert!(
+        c_ref > 0.999,
+        "bf16-store vs transformers golden cosine {c_ref:.7} <= 0.999"
+    );
+    // The footprint win is real: the bulk projection weight is bf16 at the bf16 store.
+    assert_eq!(
+        w_bf16
+            .get("language_model.layers.0.self_attn.q_proj.weight")?
+            .dtype(),
+        DType::BF16
+    );
+    Ok(())
+}

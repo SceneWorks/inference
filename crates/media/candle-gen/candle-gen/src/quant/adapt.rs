@@ -46,6 +46,24 @@ impl Base {
         }
     }
 
+    /// [`Self::forward`] with a **dense** base weight (and bias) upcast to `x`'s dtype per call — the
+    /// storage-dtype ≠ compute-dtype regime (bf16 weights, f32 activations, sc-12828). Only the one
+    /// weight in flight is transiently materialized at the compute dtype, so the resident footprint
+    /// stays at the storage dtype's. Inert when the base already matches `x`'s dtype (`Tensor::to_dtype`
+    /// short-circuits to an `Arc` clone), so byte-identical to [`Self::forward`]. The **packed** base
+    /// already dequantizes to the activation dtype, so it delegates unchanged.
+    fn forward_upcast(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+        match self {
+            Base::Dense(l) => {
+                let dt = x.dtype();
+                let w = l.weight().to_dtype(dt)?;
+                let b = l.bias().map(|b| b.to_dtype(dt)).transpose()?;
+                Linear::new(w, b).forward(x)
+            }
+            Base::Packed(q) => q.forward(x),
+        }
+    }
+
     fn is_packed(&self) -> bool {
         matches!(self, Base::Packed(_))
     }
@@ -436,6 +454,21 @@ impl AdaptLinear {
     /// byte-identical to the bare base forward.
     pub fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         let mut y = self.base.forward(x)?;
+        for ad in &self.adapters {
+            y = (y + ad.residual(x)?)?;
+        }
+        Ok(y)
+    }
+
+    /// [`Self::forward`] for a **storage-dtype ≠ compute-dtype** site (sc-12828): the dense base weight
+    /// is upcast to `x`'s dtype per call, so a bf16-resident projection runs against f32 activations
+    /// without materializing the whole weight at f32 (only the one weight in flight is transient). The
+    /// additive residuals already cast their factors to `x`'s dtype ([`Adapter::residual`]), so they are
+    /// unchanged. Inert (byte-identical to [`Self::forward`], an `Arc` clone with no copy) when `x`
+    /// already matches the base dtype — the f32-store training/control paths. Used by the Qwen3-VL text
+    /// encoders (krea/boogu), whose bf16-stored projections run against an f32 hidden state.
+    pub fn forward_upcast(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+        let mut y = self.base.forward_upcast(x)?;
         for ad in &self.adapters {
             y = (y + ad.residual(x)?)?;
         }
