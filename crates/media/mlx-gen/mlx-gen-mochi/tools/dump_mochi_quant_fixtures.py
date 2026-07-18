@@ -11,15 +11,28 @@ reference forward output. The Rust gate reproduces this **bit-for-bit** via BOTH
     `MochiLinear::load` consumes it; and
   * **consume-prequantized** — `MochiLinear::load` reads the packed `wq`/`scales`/`biases` dumped here.
 
-Both must equal the dumped `q{bits}.y` — the packing is byte-identical (same MLX `quantize` on the same
-bf16 weight) and `quantized_matmul` is deterministic, so the quantized forward is bit-exact.
+The two routes agree with each other **bit-exact** on any single platform (byte-identical packs +
+deterministic `quantized_matmul`), and each matches the dumped `q{bits}.y` within a tight ULP
+tolerance — the small slack absorbs the NAX/non-NAX forward drift described below.
 
 The op surface is stable MLX (`quantize`/`quantized_matmul`) — no torch/diffusers, no real Mochi
-weights — but `quantized_matmul` is version-sensitive (the forward `q{bits}.y` drifted 1-2 ULP-f32 on
-the 0.31.2->0.32.0 bump, epic 12742), so run it on the MLX core the Rust build links — now 0.32.0
-(`pmetal-mlx-rs` 932beb4e). The committed fixture was re-dumped on 0.32.0 in sc-12747:
+weights.
 
-    uv run --with "mlx==0.32.0" python tools/dump_mochi_quant_fixtures.py
+`quantized_matmul`'s f32 forward `q{bits}.y` is version- AND hardware-path-sensitive: under the
+0.32.0 pin (epic 12742) the Apple-matrix-unit "NAX" path (deployment-target 26.2, self-hosted M-series)
+and the non-NAX path (deployment-target 15.0, hosted PR CI) differ ~1-2 ULP-f32 (Q4 1.31e-6 / Q8
+9.54e-7 on this fixture; MLX #3631/#3632/#3810). Only `q{bits}.y` moves — the packs `wq`/`scales`/
+`biases` (and `x`/`w`) are byte-identical across 0.31.2->0.32.0 AND across NAX/non-NAX. On 0.31.2 both
+Metal paths were bit-identical, so one golden served both; 0.32.0's NAX quant fixes broke that tie.
+
+**The committed golden must be the NON-NAX (CI-matching) value**, which is identical to the original
+0.31.2 dump (the non-NAX path did not move on the bump). The Rust gate (`tests/quant_parity.rs`)
+compares against it with a tight relative ULP tolerance (`MOCHI_QUANT_GOLDEN_ULP_TOL`) so the
+self-hosted NAX runner passes too. DO NOT re-dump this fixture on a NAX host (M-series at dt26.2) and
+commit it — that captures the NAX value and re-breaks non-NAX CI (sc-12747). Regenerate only on a
+non-NAX MLX build (hosted-CI-class Metal, dt15.0), or leave the 0.31.2-equivalent golden in place:
+
+    uv run --with "mlx==0.32.0" python tools/dump_mochi_quant_fixtures.py   # ONLY on a non-NAX host
 
 Writes (committed; ~0.3 MB):
   tests/fixtures/mochi_quant_slice.safetensors
