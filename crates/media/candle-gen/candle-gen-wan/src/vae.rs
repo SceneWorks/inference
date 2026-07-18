@@ -469,8 +469,8 @@ impl WanVae {
     ///
     /// **Streams one latent frame at a time** (sc-5176): the original single pass decoded every frame
     /// at once, spiking VAE memory ~60 GB on a 320²×17 clip (OOM). Each `CausalConv3d` carries its
-    /// causal `feat_cache` across frames, so this is bit-equivalent to [`Self::decode_full`] while
-    /// bounding peak memory to ~one frame's activations. Frame 0 expands to 1 output frame, each later
+    /// causal `feat_cache` across frames while bounding peak memory to ~one frame's activations.
+    /// Frame 0 expands to 1 output frame, each later
     /// latent frame to 4 (the two temporal upsamplers) — total `1+(T-1)·4`.
     pub fn decode(&self, z: &Tensor) -> Result<Tensor> {
         let z = self.unnormalize(z)?;
@@ -488,14 +488,6 @@ impl WanVae {
         self.reset_caches();
         assert!(!chunks.is_empty(), "decode needs >= 1 latent frame");
         Tensor::cat(&chunks, 2)?.clamp(-1f32, 1f32)
-    }
-
-    /// Single-pass decode over all frames (the original path). Retained for the streaming-parity test
-    /// (`decode` must match this bit-for-bit); not used in production (it OOMs on real clips).
-    pub fn decode_full(&self, z: &Tensor) -> Result<Tensor> {
-        let z = self.unnormalize(z)?;
-        self.decode_inner(&z, &Ctx::single_pass())?
-            .clamp(-1f32, 1f32)
     }
 
     /// Decode with **spatial tiling** for memory-bounded high-resolution video (`cfg`) — the candle
