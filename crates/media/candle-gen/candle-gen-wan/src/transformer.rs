@@ -331,7 +331,7 @@ pub struct WanTransformer {
 impl WanTransformer {
     /// Build the DiT from a dense (or MLX-packed) [`VarBuilder`] — the unchanged path (the
     /// `Wan-AI/*-Diffusers` snapshot and the `SceneWorks/*-mlx` packed tiers). Delegates to the shared
-    /// [`Self::build`] with a dense [`WeightSrc`], so its behavior is byte-identical to before.
+    /// `build` with a dense `WeightSrc`, so its behavior is byte-identical to before.
     pub fn new(cfg: &TransformerConfig, vb: VarBuilder) -> Result<Self> {
         Self::build(cfg, WeightSrc::dense(vb))
     }
