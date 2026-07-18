@@ -57,8 +57,13 @@ pub fn descriptor() -> ModelDescriptor {
             // `Mask` (white = repaint) alongside the `Reference`. The prompt stays the model's native
             // JSON caption. No control/pose/multi-reference. Edit works in both quality and turbo.
             conditioning: vec![ConditioningKind::Reference, ConditioningKind::Mask],
-            supports_lora: false,
-            supports_lokr: false,
+            // User LoRA/LoKr adapters apply onto the **conditional** DiT via the shared strict
+            // loader (`apply_ideogram_adapters` — the same seam the bundled TurboTime LoRA uses;
+            // asymmetric CFG then amplifies the adapter's direction, matching how single-DiT
+            // Ideogram community LoRAs are trained). Applied after any Q4/Q8 quantize; on turbo
+            // they stack after the bundled TurboTime LoRA.
+            supports_lora: true,
+            supports_lokr: true,
             // Bespoke-by-architecture (epic 7114, sc-7120, task 7184): Ideogram is NOT routed through
             // the unified curated-sampler framework. Its `LogitNormalSchedule` is an INVERTED, clamped
             // logit-normal time grid (no `σ = 0` terminal), so the FLOW `x0 = x − σ·v` estimate the
@@ -135,17 +140,13 @@ pub(crate) struct Ideogram4HeavyOwned {
 /// Construct an [`Ideogram4`] from a [`LoadSpec`]. `spec.weights` must be a [`WeightsSource::Dir`]
 /// pointing at a converted snapshot (`transformer/ unconditional_transformer/ text_encoder/ vae/
 /// tokenizer/`). Dense bf16 by default; `spec.quantize` (Q4/Q8) quantizes the whole model in place
-/// after the dense load. A precision override and LoRA/LoKr adapters are not wired and are rejected
+/// after the dense load. `spec.adapters` (user LoRA/LoKr) apply onto the conditional DiT after the
+/// quantize, via the shared strict loader. A precision override is not wired and is rejected
 /// rather than silently ignored.
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     if spec.precision != Precision::Bf16 {
         return Err(Error::Msg(
             "ideogram_4: only dense bf16 is wired (drop the precision override)".into(),
-        ));
-    }
-    if !spec.adapters.is_empty() {
-        return Err(Error::Msg(
-            "ideogram_4: LoRA/LoKr adapters are not supported".into(),
         ));
     }
     // Fail-fast the single-file source up front for BOTH policies (Sequential defers the component
@@ -163,19 +164,13 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 /// must be a [`WeightsSource::Dir`] pointing at a turbo snapshot — the conditional `transformer/`,
 /// `text_encoder/`, `vae/`, `tokenizer/`, plus the bundled [`TURBO_LORA_FILE`]; the unconditional
 /// DiT is not loaded. The heavy loader loads the single DiT, quantizes (Q4/Q8) if requested, then
-/// installs the TurboTime LoRA at scale 1.0 — the CFG-free few-step path. A precision override or
-/// **user** LoRA/LoKr adapters are rejected (the TurboTime LoRA is part of the snapshot).
+/// installs the TurboTime LoRA at scale 1.0 — the CFG-free few-step path. `spec.adapters` (user
+/// LoRA/LoKr) stack AFTER the bundled TurboTime LoRA, onto the same conditional DiT. A precision
+/// override is rejected.
 pub fn load_turbo(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     if spec.precision != Precision::Bf16 {
         return Err(Error::Msg(
             "ideogram_4_turbo: only dense bf16 is wired (drop the precision override)".into(),
-        ));
-    }
-    if !spec.adapters.is_empty() {
-        return Err(Error::Msg(
-            "ideogram_4_turbo: user LoRA/LoKr adapters are not supported (the TurboTime LoRA is \
-             bundled in the snapshot)"
-                .into(),
         ));
     }
     let root = snapshot_dir(spec, IDEOGRAM_4_TURBO_ID)?;
@@ -286,6 +281,10 @@ fn load_heavy_owned(
             moe_expert: None,
         }])?;
     }
+    // User LoRA/LoKr adapters, onto the conditional DiT — after the quantize (residual over the
+    // possibly-quantized base) and, on turbo, stacked after the bundled TurboTime LoRA. No-op for
+    // an empty list.
+    heavy.apply_adapters(&spec.adapters)?;
     let pid = if use_pid { load_pid(spec)? } else { None };
     Ok(Ideogram4HeavyOwned { heavy, pid })
 }
@@ -866,21 +865,24 @@ mod tests {
     }
 
     #[test]
-    fn load_turbo_rejects_user_adapters() {
-        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into())).with_adapters(vec![
-            AdapterSpec {
-                path: "/tmp/user.safetensors".into(),
-                scale: 1.0,
-                kind: AdapterKind::Lora,
-                pass_scales: None,
-                moe_expert: None,
-            },
-        ]);
-        let e = load_turbo(&spec)
-            .err()
-            .expect("expected an error")
-            .to_string();
-        assert!(e.contains("not supported"), "got: {e}");
+    fn load_accepts_user_adapter_specs() {
+        // User adapters are wired (supports_lora advertisement): a spec carrying one must get PAST
+        // the old up-front rejection on both entry points — weight-free, so the load still errors,
+        // but on the missing snapshot, never on "adapters are not supported".
+        let adapters = vec![AdapterSpec {
+            path: "/tmp/user.safetensors".into(),
+            scale: 1.0,
+            kind: AdapterKind::Lora,
+            pass_scales: None,
+            moe_expert: None,
+        }];
+        for f in [load, load_turbo] {
+            let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()))
+                .with_adapters(adapters.clone());
+            // Still errors (no weights on disk) — but on the load, never the old adapter gate.
+            let e = f(&spec).err().expect("expected an error").to_string();
+            assert!(!e.contains("not supported"), "adapter gate resurfaced: {e}");
+        }
     }
 
     #[test]
