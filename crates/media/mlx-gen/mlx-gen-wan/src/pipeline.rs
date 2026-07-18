@@ -14,7 +14,7 @@
 //! **precomputed once per expert** before the loop (the reference's `prepare_cross_kv` / `prepare_rope`)
 //! and reused across all steps, instead of recomputed every forward.
 
-use mlx_rs::memory::get_memory_limit;
+use mlx_rs::memory::{get_active_memory, get_memory_limit};
 use mlx_rs::ops::{add, concatenate_axis, maximum, minimum, multiply, subtract};
 use mlx_rs::Array;
 
@@ -217,10 +217,18 @@ fn estimated_denoise_peak_gib(
 // **60 GB** on a routine 1024×576×97 video (OOMs a 64 GB Mac) while the *larger* 1280×704×145
 // decode peaked at only 12.6 GB with 256 px tiles: it traded memory the wrong way (non-monotonic).
 //
-// [`auto_tiling_budgeted`] replaces that with a peak-GB target derived from `get_memory_limit()`:
-// it picks the *largest* tile whose estimated decode peak stays under the safe budget, so the peak
-// is bounded and monotonic in output size, and — being the largest fitting tile — it minimizes the
+// [`auto_tiling_budgeted`] replaces that with a **free-aware** peak-GB target ([`wan_vae_safe_budget_gib`],
+// sc-12737): it picks the *largest* tile whose estimated decode peak stays under the safe budget, so the
+// peak is bounded and monotonic in output size, and — being the largest fitting tile — it minimizes the
 // overlap-recompute that dominates the aggressive path's wall-clock.
+//
+// sc-12737 — the budget was `get_memory_limit() × 0.85` (the **total** MLX working-set ceiling), which
+// ignored whatever was already resident when the render starts. That mirrors the total-based bug the
+// candle Wan tiler fixed (sc-12734): the candle decode over-budgeted on top of the resident denoise
+// weights + pool. On unified memory the analogue is `free = get_memory_limit() − get_active_memory()`
+// (the soft ceiling minus bytes held by live arrays — e.g. a co-resident model in the video-lane
+// residency worker, epic 10975, or a prior render's live tensors). The budget is now `free × 0.85`,
+// with the same `WAN_VAE_BUDGET_GIB` env override + accumulator-floor semantics as candle.
 
 /// Bytes of GPU working-set per **output voxel** (`out_f·out_h·out_w`) for the two terms of a z48
 /// `vae22` tiled decode, fit from the real-weight `wedge_sweep.rs` anchors (M5 Max):
@@ -279,9 +287,102 @@ const VAE22_SPATIAL_PX: [i32; 8] = [768, 640, 512, 448, 384, 320, 256, 192];
 /// overlaps: 24 for the longer tiles, 16/8 for the shorter).
 const VAE22_TEMPORAL_FR: [(i32, i32); 4] = [(96, 24), (64, 24), (48, 16), (32, 8)];
 
-/// **Memory-budgeted** tiling for the z48 `vae22` decode (sc-4998). Derives a safe peak-GB ceiling
-/// from this machine's MLX memory limit (× 0.85, matching [`preflight_denoise_memory_guard`]) and
-/// returns the *largest* tile that fits — see `plan_vae22_tiling` for the cases and the catchable
+// --- sc-12737: free-aware VAE-decode budget (contract-aligned with candle sc-12734) --------------
+//
+// Both Wan VAE-decode tilers (`auto_tiling_budgeted` z48 + `auto_tiling_budgeted_z16`) resolve their
+// safe peak-GB ceiling through [`wan_vae_safe_budget_gib`], the MLX analogue of candle-gen's
+// `vae_tiling::free_aware_safe_budget_gib`. Same three-step precedence, the same `WAN_VAE_BUDGET_GIB`
+// env knob, and the same `free × 0.85` framing — so one operator contract governs the Wan VAE decode
+// budget on both backends. The accumulator floor stays in the shared gen-core [`budgeted_plan`]
+// selector (its step-2 `AccumulatorsExceedBudget`): only the *budget value* fed to it changed, so
+// decode geometry / blend / output parity are untouched.
+
+/// Env override for the Wan VAE-decode budget (GiB, positive float). The deterministic injection point
+/// for the worker/tests, and **the same knob the candle Wan tiler honors** (`candle-gen-wan`'s
+/// `WAN_VAE_BUDGET_GIB`, sc-12734): set `WAN_VAE_BUDGET_GIB=N` to pin the Wan VAE-decode budget to N GiB
+/// regardless of backend. Wins over the live free-memory probe.
+const WAN_VAE_BUDGET_ENV: &str = "WAN_VAE_BUDGET_GIB";
+/// Fraction of **free** unified memory a decode may target (headroom for allocator churn + the OS).
+/// Matches the 0.85 the mlx denoise guard and candle's free-aware Wan tiler both use.
+const WAN_VAE_BUDGET_SAFE_FRAC: f64 = 0.85;
+/// Conservative fallback budget, used only when the MLX memory limit is disabled (`0`) so no free
+/// figure can be derived. Mirrors candle's `WAN22_VAE_DEFAULT_BUDGET_GIB` (16 GiB, the smallest shipped
+/// Apple-silicon tier). In practice unreachable — MLX's default limit is 1.5× the recommended working
+/// set, never 0 unless a caller explicitly disabled it via `set_memory_limit(0)`.
+const WAN_VAE_DEFAULT_BUDGET_GIB: f64 = 16.0;
+
+/// Live **free** unified memory in GiB — the MLX analogue of candle's `nvidia-smi memory.free`
+/// (`total − used`). On unified memory "free" is the MLX memory limit (the soft working-set ceiling,
+/// [`get_memory_limit`]) MINUS the bytes held by live arrays ([`get_active_memory`]) — i.e.
+/// `limit − currently_resident`. The reclaimable buffer **cache** (`get_cache_memory`) is deliberately
+/// NOT subtracted: MLX auto-reclaims it under allocation pressure, so it is genuinely available to the
+/// decode (subtracting it would over-tile with no safety gain). `None` when the limit is disabled (`0`)
+/// — there is no ceiling to subtract from — so the resolver falls back to the conservative default.
+fn live_free_gib() -> Option<f64> {
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    let limit = get_memory_limit();
+    if limit == 0 {
+        return None;
+    }
+    let active = get_active_memory();
+    Some(limit.saturating_sub(active) as f64 / GIB)
+}
+
+/// Pure `free × safe_frac` (clamped at 0). Split out so the free-aware budget arithmetic is
+/// unit-testable with an injected `free_gib` (`= limit − resident`) and no live probe — the
+/// "N GiB artificially resident ⇒ smaller budget" seam the acceptance criteria call for. Mirrors
+/// candle-gen's `vae_tiling::free_aware_budget_gib`.
+fn free_aware_budget_gib(free_gib: f64, safe_frac: f64) -> f64 {
+    free_gib.max(0.0) * safe_frac
+}
+
+/// Core of [`wan_vae_safe_budget_gib`] with the free-memory probe injected, so the env-override
+/// precedence + the probe→default fallback are unit-testable without touching the global memory limit.
+/// The live entry point passes [`live_free_gib`]; tests pass a stub closure. Mirrors candle-gen's
+/// `vae_tiling::resolve_free_aware_budget`.
+fn resolve_free_aware_budget(
+    env_var: &str,
+    safe_frac: f64,
+    default_gib: f64,
+    free_probe: impl Fn() -> Option<f64>,
+) -> f64 {
+    if let Ok(raw) = std::env::var(env_var) {
+        if let Ok(gib) = raw.trim().parse::<f64>() {
+            if gib > 0.0 {
+                return gib;
+            }
+        }
+    }
+    match free_probe() {
+        Some(free) => free_aware_budget_gib(free, safe_frac),
+        None => default_gib,
+    }
+}
+
+/// The **free-aware** safe peak-GiB budget shared by both Wan VAE-decode tilers (sc-12737), aligning
+/// the mlx contract with candle's sc-12734 free-aware resolver. Resolved in order (mirrors candle-gen's
+/// `vae_tiling::free_aware_safe_budget_gib`):
+///  1. the `WAN_VAE_BUDGET_GIB` env override (a positive float — the deterministic worker/test knob,
+///     shared with candle);
+///  2. `free × WAN_VAE_BUDGET_SAFE_FRAC` via the live [`live_free_gib`] probe (`limit − resident`);
+///  3. `WAN_VAE_DEFAULT_BUDGET_GIB` when the limit is disabled.
+///
+/// This replaces the previous `get_memory_limit() × 0.85`, which budgeted against **total** and so
+/// ignored whatever was already resident when the render starts (a co-resident model in the video-lane
+/// residency worker, epic 10975, or a prior render's live tensors) — the same over-budgeting the candle
+/// side fixed.
+fn wan_vae_safe_budget_gib() -> f64 {
+    resolve_free_aware_budget(
+        WAN_VAE_BUDGET_ENV,
+        WAN_VAE_BUDGET_SAFE_FRAC,
+        WAN_VAE_DEFAULT_BUDGET_GIB,
+        live_free_gib,
+    )
+}
+
+/// **Memory-budgeted** tiling for the z48 `vae22` decode (sc-4998). Resolves a **free-aware** safe
+/// peak-GB ceiling via `wan_vae_safe_budget_gib` (`free × 0.85`, `free = limit − resident`; sc-12737)
+/// and returns the *largest* tile that fits — see `plan_vae22_tiling` for the cases and the catchable
 /// over-budget error. Caller passes the **output** dimensions (the decoded video size).
 pub fn auto_tiling_budgeted(
     height: i32,
@@ -289,9 +390,7 @@ pub fn auto_tiling_budgeted(
     out_frames: i32,
     bf16: bool,
 ) -> Result<Option<TilingConfig>> {
-    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
-    let budget_gib = get_memory_limit() as f64 / GIB;
-    plan_vae22_tiling(height, width, out_frames, budget_gib * 0.85, bf16)
+    plan_vae22_tiling(height, width, out_frames, wan_vae_safe_budget_gib(), bf16)
 }
 
 /// Pure tile selector behind [`auto_tiling_budgeted`] (the `safe_gib` ceiling is injected so this is
@@ -407,16 +506,15 @@ fn estimated_z16_decode_peak_gib(
 
 /// **Memory-budgeted** tiling for the z16 Wan 2.1 VAE decode (sc-6894 F-009): the z16 analogue of
 /// [`auto_tiling_budgeted`], routing the shared [`budgeted_plan`] selector through the z16 cost model.
-/// Replaces the unbudgeted [`TilingConfig::auto`] on the 14B T2V/I2V + VACE decode paths. Caller passes
-/// the **output** dims (the decoded video size).
+/// Replaces the unbudgeted [`TilingConfig::auto`] on the 14B T2V/I2V + VACE decode paths. Uses the same
+/// **free-aware** budget as the z48 path (`wan_vae_safe_budget_gib`, sc-12737). Caller passes the
+/// **output** dims (the decoded video size).
 pub fn auto_tiling_budgeted_z16(
     height: i32,
     width: i32,
     out_frames: i32,
 ) -> Result<Option<TilingConfig>> {
-    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
-    let budget_gib = get_memory_limit() as f64 / GIB;
-    plan_z16_tiling(height, width, out_frames, budget_gib * 0.85)
+    plan_z16_tiling(height, width, out_frames, wan_vae_safe_budget_gib())
 }
 
 /// Pure z16 tile selector behind [`auto_tiling_budgeted_z16`] (the `safe_gib` ceiling is injected so it
@@ -1524,14 +1622,119 @@ mod tests {
     }
 
     #[test]
-    fn vae22_tiling_budgeted_reads_memory_limit() {
+    fn vae22_tiling_budgeted_reads_free_memory() {
         use mlx_rs::memory::set_memory_limit;
-        // Exercise the public wrapper end-to-end on a pinned 64 GiB limit (restore after).
+        // Exercise the public wrapper end-to-end. Pin a 64 GiB limit; with a low baseline residency the
+        // free-aware budget (≈ 64 × 0.85) still forces the 1024×576×97 decode to tile. Restore after.
+        std::env::remove_var(WAN_VAE_BUDGET_ENV); // ensure the free-probe path, not an ambient override
         let prev = set_memory_limit(64 << 30);
         let plan = auto_tiling_budgeted(576, 1024, 97, false);
         set_memory_limit(prev);
-        let cfg = plan.unwrap().expect("moderate res tiles at 64 GiB");
+        let cfg = plan.unwrap().expect("moderate res tiles at 64 GiB free");
         assert!(cfg.spatial.is_some() || cfg.temporal.is_some());
+    }
+
+    // --- sc-12737: free-aware VAE-decode budget (contract-aligned with candle sc-12734) ----------
+
+    #[test]
+    fn free_aware_budget_is_free_times_frac_clamped() {
+        // The pure arithmetic: `(limit − resident) × frac`. With 24 GiB resident under a 96 GiB limit,
+        // free = 72; at 0.85 → 61.2 GiB, strictly below the total-based 96×0.85 the old code used.
+        let frac = WAN_VAE_BUDGET_SAFE_FRAC;
+        let (limit, resident) = (96.0, 24.0);
+        let free = limit - resident;
+        assert!((free_aware_budget_gib(free, frac) - free * frac).abs() < 1e-9);
+        assert!(
+            free_aware_budget_gib(free, frac) < limit * frac,
+            "resident memory must shrink the budget vs the total-based 0.85×limit"
+        );
+        // Never negative even if resident somehow exceeds the limit (defensive clamp).
+        assert_eq!(free_aware_budget_gib(-5.0, frac), 0.0);
+    }
+
+    #[test]
+    fn free_aware_resolver_uses_probe_and_env_override_wins() {
+        // With N GiB resident the probe reports (limit − resident); the resolver returns free × frac,
+        // strictly below the total-based budget for the same limit.
+        let frac = WAN_VAE_BUDGET_SAFE_FRAC;
+        let (limit, resident) = (96.0, 30.0);
+        let stub_free = move || Some(limit - resident);
+        let free_budget =
+            resolve_free_aware_budget("WAN_VAE_TEST_BUDGET_UNSET", frac, 16.0, stub_free);
+        assert!((free_budget - (limit - resident) * frac).abs() < 1e-9);
+        assert!(
+            free_budget < limit * frac,
+            "free-aware budget must be below the total-based budget"
+        );
+
+        // The env override wins over the live probe (the deterministic worker/test injection point).
+        // Capture then remove before asserting so a failure can't leak the var into other tests.
+        std::env::set_var("WAN_VAE_TEST_BUDGET", "42.5");
+        let overridden = resolve_free_aware_budget("WAN_VAE_TEST_BUDGET", frac, 16.0, || Some(1.0));
+        std::env::remove_var("WAN_VAE_TEST_BUDGET");
+        assert_eq!(overridden, 42.5);
+
+        // No env + no probe (limit disabled → None) → the conservative default.
+        assert_eq!(
+            resolve_free_aware_budget("WAN_VAE_TEST_BUDGET_UNSET", frac, 16.0, || None),
+            16.0
+        );
+    }
+
+    #[test]
+    fn wan_vae_budget_honors_env_override() {
+        // The shared resolver both tilers use must let WAN_VAE_BUDGET_GIB pin the budget (the same knob
+        // candle honors). Capture then remove before asserting so a failure can't leak the var.
+        std::env::set_var(WAN_VAE_BUDGET_ENV, "42.5");
+        let got = wan_vae_safe_budget_gib();
+        std::env::remove_var(WAN_VAE_BUDGET_ENV);
+        assert_eq!(got, 42.5);
+    }
+
+    #[test]
+    fn free_aware_budget_tracks_resident_memory_end_to_end() {
+        // The discriminating test: prove the LIVE budget shrinks as resident memory grows — i.e. it
+        // budgets against FREE (limit − active), not TOTAL. A revert to `get_memory_limit() × 0.85`
+        // would leave the budget unchanged when active rises AND equal to 48×0.85 exactly — both
+        // assertions below would then fail.
+        use mlx_rs::memory::{get_active_memory, set_memory_limit};
+        const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+        std::env::remove_var(WAN_VAE_BUDGET_ENV); // force the free-probe path, not an ambient override
+        let prev = set_memory_limit(48 << 30); // pin a deterministic 48 GiB ceiling
+        let total_based = 48.0 * WAN_VAE_BUDGET_SAFE_FRAC; // what the old get_memory_limit()×0.85 gave
+
+        let a_before = get_active_memory();
+        let b_before = wan_vae_safe_budget_gib();
+
+        // Raise resident memory by a live, materialized 1 GiB f32 array (256Mi elems, < i32::MAX).
+        let resident = Array::zeros::<f32>(&[268_435_456]).unwrap();
+        mlx_rs::transforms::eval([&resident]).unwrap();
+
+        let a_after = get_active_memory();
+        let b_after = wan_vae_safe_budget_gib();
+
+        set_memory_limit(prev);
+
+        let delta_active_gib = a_after.saturating_sub(a_before) as f64 / GIB;
+        assert!(
+            delta_active_gib > 0.5,
+            "test precondition: the live array must raise active memory (Δ {delta_active_gib:.2} GiB)"
+        );
+        // Free-aware ⇒ the budget drops by ≈ Δactive × frac. A total-based budget would not move.
+        let expected_drop = delta_active_gib * WAN_VAE_BUDGET_SAFE_FRAC;
+        let actual_drop = b_before - b_after;
+        assert!(
+            (actual_drop - expected_drop).abs() < 0.25,
+            "budget must track FREE memory: dropped {actual_drop:.3} GiB, expected ~{expected_drop:.3} \
+             (Δactive {delta_active_gib:.3} × {WAN_VAE_BUDGET_SAFE_FRAC}). Total-based would not move."
+        );
+        // And it must be strictly below the total-based 48×0.85 while memory is resident (active > 0).
+        assert!(
+            b_after < total_based,
+            "free-aware budget {b_after:.2} must be below the total-based {total_based:.2} while \
+             memory is resident"
+        );
+        drop(resident);
     }
 
     #[test]
