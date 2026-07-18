@@ -4,7 +4,7 @@
 //! Like `imageops` / `tiling` / `train::LrSchedule`, this is **pure policy math** — plain
 //! `f32` slices in, plain values out, zero tensor deps, no I/O, no engine or trait. The math is
 //! ported from the retired SoundWorks reference (`composition_mixdown.rs` + `loudness.rs`),
-//! adapted to gen-core idioms: typed [`Error`](crate::Error) validation instead of silent
+//! adapted to gen-core idioms: typed [`Error`] validation instead of silent
 //! clamping, and [`AudioTrack`] as the interleaved-PCM carrier.
 //!
 //! Two halves:
