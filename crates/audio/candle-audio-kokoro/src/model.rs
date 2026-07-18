@@ -23,7 +23,8 @@
 //! `language` (`en` family only), `sample_rate` (native 24 000 Hz only), and
 //! `target_duration` — honored by deriving a speed factor from the duration head's natural
 //! estimate (clamped to 0.5–2.0×, the model's usable range). Progress is 5 stage steps;
-//! cancellation is checked at every stage boundary and returns the typed
+//! cancellation is checked before generate, at every stage boundary, AND inside the
+//! dominant-cost decoder/vocoder stage (`crate::decoder::CancelProbe`), returning the typed
 //! [`gen_core::Error::Canceled`]. Determinism: same request + seed ⇒ byte-identical samples.
 
 use std::collections::HashMap;
@@ -338,7 +339,13 @@ impl Generator for KokoroGenerator {
             }
             Ok(())
         };
-        let samples = pipeline.synthesize(&tokens, &ref_s, speed, seed, &mut stage)?;
+        // The probe reaches inside the dominant stage-5 decoder/vocoder so a cancel lands
+        // promptly mid-synthesis, not only at stage boundaries.
+        let probe = req.cancel.clone();
+        let samples =
+            pipeline.synthesize(&tokens, &ref_s, speed, seed, &mut stage, &move || {
+                probe.is_cancelled()
+            })?;
 
         // Guard the advertised duration cap at the output too (the floor already bounds
         // target_duration; a runaway duration head must not exceed the advertisement wildly).

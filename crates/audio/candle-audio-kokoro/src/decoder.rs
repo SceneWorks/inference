@@ -33,6 +33,19 @@ use crate::nn::{reflection_pad_left1, AdaInResBlock1, AdainResBlk1d, LRELU_SLOPE
 /// Kokoro's native output sample rate (Hz).
 pub const SAMPLE_RATE: u32 = 24_000;
 
+/// A cheap cooperative-cancellation probe threaded through the decoder/vocoder — the vocoder
+/// dominates synthesis cost, so cancellation must be observable *inside* it, not only at the
+/// pipeline's stage boundaries (sc-12836 review). Returns `true` when the request is cancelled.
+pub type CancelProbe<'a> = &'a dyn Fn() -> bool;
+
+/// Bail with the typed [`AudioError::Canceled`] when the probe fires.
+fn check_cancel(cancel: CancelProbe<'_>) -> Result<()> {
+    if cancel() {
+        return Err(AudioError::Canceled);
+    }
+    Ok(())
+}
+
 /// SineGen amplitude / noise constants (istftnet.py `SourceModuleHnNSF` defaults as
 /// instantiated by `Generator`: harmonic_num = 8, voiced threshold = 10).
 const SINE_AMP: f32 = 0.1;
@@ -389,13 +402,15 @@ impl Generator {
     }
 
     /// `x: [1, C, F]` decoder features, `s: [1, style]`, `f0_frames`: the per-frame F0 curve
-    /// (length F) → waveform samples (`F · upsample_scale` of them).
+    /// (length F) → waveform samples (`F · upsample_scale` of them). `cancel` is probed
+    /// between every heavy sub-operation (noise branch, upsample, each resblock, the head).
     pub fn forward(
         &self,
         x: &Tensor,
         s: &Tensor,
         f0_frames: &[f32],
         rng: &mut StdRng,
+        cancel: CancelProbe<'_>,
     ) -> Result<Vec<f32>> {
         // Harmonic excitation + its spectrogram (host DSP).
         let har = harmonic_source(
@@ -405,12 +420,14 @@ impl Generator {
             self.m_source_bias,
             rng,
         );
+        check_cancel(cancel)?;
         let (har_mag, har_phase, har_frames) = stft_small(&har, self.n_fft, self.hop)?;
         let n_bins = self.n_fft / 2 + 1;
         let mut har_cat = Vec::with_capacity(2 * n_bins * har_frames);
         har_cat.extend_from_slice(&har_mag);
         har_cat.extend_from_slice(&har_phase);
         let har = Tensor::from_vec(har_cat, (1, 2 * n_bins, har_frames), x.device())?;
+        check_cancel(cancel)?;
 
         let mut x = x.clone();
         let n_up = self.ups.len();
@@ -418,14 +435,17 @@ impl Generator {
             x = ops::leaky_relu(&x, LRELU_SLOPE_GENERATOR)?;
             let x_source = self.noise_convs[i].forward(&har)?;
             let x_source = self.noise_res[i].forward(&x_source, s)?;
+            check_cancel(cancel)?;
             x = self.ups[i].forward(&x)?;
             if i == n_up - 1 {
                 x = reflection_pad_left1(&x)?;
             }
             x = (x + x_source)?;
+            check_cancel(cancel)?;
             let mut xs: Option<Tensor> = None;
             for j in 0..self.num_kernels {
                 let r = self.resblocks[i * self.num_kernels + j].forward(&x, s)?;
+                check_cancel(cancel)?;
                 xs = Some(match xs {
                     Some(acc) => (acc + r)?,
                     None => r,
@@ -433,9 +453,11 @@ impl Generator {
             }
             x = (xs.expect("num_kernels >= 1") / self.num_kernels as f64)?;
         }
+        check_cancel(cancel)?;
         // F.leaky_relu's default slope (0.01) — distinct from the 0.1 used inside the loop.
         let x = ops::leaky_relu(&x, 0.01)?;
         let x = self.conv_post.forward(&x)?; // [1, n_fft + 2, Fr]
+        check_cancel(cancel)?;
         let frames = x.dim(2)?;
         let spec = x
             .i((0, ..n_bins, ..))?
@@ -498,7 +520,8 @@ impl Decoder {
     }
 
     /// `asr: [1, 512, F]` aligned text features, `f0_curve` / `n_curve`: the predictor's 2F
-    /// pitch/energy curves, `s: [1, 128]` decoder style → waveform samples.
+    /// pitch/energy curves, `s: [1, 128]` decoder style → waveform samples. `cancel` is
+    /// probed after every styled block and throughout the vocoder head.
     pub fn forward(
         &self,
         asr: &Tensor,
@@ -506,6 +529,7 @@ impl Decoder {
         n_curve: &[f32],
         s: &Tensor,
         rng: &mut StdRng,
+        cancel: CancelProbe<'_>,
     ) -> Result<Vec<f32>> {
         let device = asr.device();
         let f0_t = Tensor::from_slice(f0_curve, (1, 1, f0_curve.len()), device)?;
@@ -514,6 +538,7 @@ impl Decoder {
         let n_down = self.n_conv.forward(&n_t)?;
         let mut x = Tensor::cat(&[asr, &f0_down, &n_down], 1)?;
         x = self.encode.forward(&x, s)?;
+        check_cancel(cancel)?;
         let asr_res = self.asr_res.forward(asr)?; // [1, 64, F]
         let mut res = true;
         for (i, block) in self.decode.iter().enumerate() {
@@ -521,12 +546,13 @@ impl Decoder {
                 x = Tensor::cat(&[&x, &asr_res, &f0_down, &n_down], 1)?;
             }
             x = block.forward(&x, s)?;
+            check_cancel(cancel)?;
             if i == self.decode.len() - 1 {
                 res = false;
             }
         }
         let _ = res;
-        self.generator.forward(&x, s, f0_curve, rng)
+        self.generator.forward(&x, s, f0_curve, rng, cancel)
     }
 }
 

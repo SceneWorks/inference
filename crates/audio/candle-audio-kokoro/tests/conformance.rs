@@ -142,6 +142,44 @@ fn kokoro_wav_conformance() {
          constant energy is not speech"
     );
 
+    // VOICED PERIODICITY: the highest-energy 50 ms window must autocorrelate strongly at a
+    // plausible pitch lag (70–400 Hz → lags 60–343 at 24 kHz). This is what an
+    // amplitude-modulated rumble or shaped noise cannot fake: real voiced speech is
+    // quasi-periodic at the speaker's F0 (the af_heart reference run measures r ≈ 0.86 at
+    // ~316 Hz; 0.4 leaves generous headroom without admitting noise).
+    let best = frame_rms
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.total_cmp(b.1))
+        .map(|(i, _)| i)
+        .unwrap();
+    let start = best * frame_len;
+    let seg = &track.samples[start..(start + 2 * frame_len).min(track.samples.len())];
+    let mean = seg.iter().sum::<f32>() / seg.len() as f32;
+    let seg: Vec<f32> = seg.iter().map(|s| s - mean).collect();
+    let r0: f32 = seg.iter().map(|s| s * s).sum();
+    assert!(r0 > 0.0, "voiced window has no energy");
+    let mut best_r = 0.0f32;
+    let mut best_lag = 0usize;
+    for lag in 60..=343usize {
+        let r: f32 = seg[..seg.len() - lag]
+            .iter()
+            .zip(&seg[lag..])
+            .map(|(a, b)| a * b)
+            .sum::<f32>()
+            / r0;
+        if r > best_r {
+            best_r = r;
+            best_lag = lag;
+        }
+    }
+    assert!(
+        best_r > 0.4,
+        "voiced-window autocorrelation peak {best_r:.3} (lag {best_lag} ≈ {:.0} Hz) below 0.4 — \
+         no pitch periodicity means this is not voiced speech",
+        24_000.0 / best_lag.max(1) as f32
+    );
+
     // Spectral tilt: speech concentrates energy in the low band. Compare sub-4 kHz vs
     // supra-8 kHz energy via the shared radix-2 STFT (n_fft 512 @ 24 kHz → 46.9 Hz bins).
     let window = candle_audio::dsp::hann_window(512);
@@ -171,8 +209,10 @@ fn kokoro_wav_conformance() {
         .unwrap_or_else(|_| std::env::temp_dir().join("kokoro-sc12836.wav"));
     candle_audio::wav::write_wav_pcm16(&out_path, &track).expect("write WAV");
     println!(
-        "kokoro_wav_conformance: wrote {} ({secs:.2}s, RMS {rms:.4}, peak frame RMS {max_frame:.4})",
-        out_path.display()
+        "kokoro_wav_conformance: wrote {} ({secs:.2}s, RMS {rms:.4}, peak frame RMS \
+         {max_frame:.4}, pitch autocorr {best_r:.3} @ {:.0} Hz)",
+        out_path.display(),
+        24_000.0 / best_lag.max(1) as f32,
     );
 
     // Determinism at the WAV layer too: the same request+seed re-synthesizes byte-identically.

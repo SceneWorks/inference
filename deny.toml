@@ -33,13 +33,17 @@ allow = [
     "MPL-2.0",
     "OpenSSL",
     "Unicode-3.0",
-    # WTFPL (FSF-approved, no-conditions permissive): `language-tokenizer`, a dependency of the
-    # audio lane's pure-Rust misaki G2P engine (`misaki-rs`, sc-12836). The crate ships its
-    # license as a LICENSE.md file rather than an SPDX `license` field; cargo-deny synthesizes
-    # the WTFPL expression from that file.
-    "WTFPL",
     "Zlib",
 ]
+
+# WTFPL (FSF-approved, no-conditions permissive) is accepted ONLY for `language-tokenizer`, a
+# dependency of the audio lane's pure-Rust misaki G2P engine (`misaki-rs`, sc-12836). The crate
+# ships its license as a LICENSE.md file rather than an SPDX `license` field; cargo-deny
+# synthesizes the WTFPL expression from that file. Scoped per-crate so a future WTFPL crate
+# still needs a deliberate policy edit.
+[[licenses.exceptions]]
+name = "language-tokenizer"
+allow = ["WTFPL"]
 
 [bans]
 multiple-versions = "warn"

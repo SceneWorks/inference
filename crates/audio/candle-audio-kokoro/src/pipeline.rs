@@ -103,7 +103,9 @@ impl KokoroPipeline {
 
     /// Synthesize `tokens` (phoneme ids WITHOUT the boundary sentinels — they are added here)
     /// with the voice's 256-wide `ref_s` style row. `speed` > 1 speaks faster. Deterministic
-    /// per `seed`.
+    /// per `seed`. `cancel` is a cheap cooperative-cancellation probe threaded INSIDE the
+    /// dominant stage-5 decoder/vocoder (the stage boundaries alone are too coarse there);
+    /// when it fires, synthesis returns the typed [`AudioError::Canceled`].
     pub fn synthesize(
         &self,
         tokens: &[u32],
@@ -111,6 +113,7 @@ impl KokoroPipeline {
         speed: f32,
         seed: u64,
         stage: StageSink<'_>,
+        cancel: crate::decoder::CancelProbe<'_>,
     ) -> Result<Vec<f32>> {
         if tokens.is_empty() {
             return Err(AudioError::Msg(
@@ -176,10 +179,10 @@ impl KokoroPipeline {
         let asr = gather_frames(&t_en_rows, &frame_token, &self.device)?; // [1, 512, F]
         stage(4)?;
 
-        // Stage 5: decoder + vocoder.
-        let samples = self
-            .decoder
-            .forward(&asr, &f0, &n_curve, &style_decoder, &mut rng)?;
+        // Stage 5: decoder + vocoder (cancellation probed inside — the dominant-cost stage).
+        let samples =
+            self.decoder
+                .forward(&asr, &f0, &n_curve, &style_decoder, &mut rng, cancel)?;
         if samples.len() != total_frames * SAMPLES_PER_FRAME {
             return Err(AudioError::Msg(format!(
                 "kokoro: vocoder produced {} samples for {} frames (expected {})",

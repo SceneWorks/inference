@@ -4,7 +4,7 @@ version = "0.0.0"
 edition = "2021"
 description = "Kokoro-82M TTS provider for the SceneWorks Candle audio lane (sc-12836) — the first real audio Generator: StyleTTS2-derived acoustic model + iSTFT-Net vocoder ported natively onto the pinned candle revision, with a pure-Rust misaki G2P front-end (no espeak, no Python)."
 license = "Apache-2.0"
-repository = "https://github.com/michaeltrefry/candle-gen"
+repository = "https://github.com/SceneWorks/inference"
 keywords = ["candle", "tts", "kokoro", "audio", "speech"]
 categories = ["science"]
 
