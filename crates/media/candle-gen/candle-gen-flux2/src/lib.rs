@@ -510,51 +510,6 @@ impl Pipeline {
         Ok(te.prompt_embeds(&input_ids, &attn_mask)?)
     }
 
-    #[allow(dead_code)]
-    fn render(
-        &self,
-        req: &GenerationRequest,
-        comps: &Components,
-        on_progress: &mut dyn FnMut(Progress),
-    ) -> CResult<Vec<Image>> {
-        let steps = req
-            .steps
-            .map(|s| s as usize)
-            .unwrap_or(self.variant.default_steps() as usize);
-        let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
-        let guidance = req.guidance.unwrap_or(self.variant.default_guidance());
-
-        // Prompt embeds are seed-independent: encode once.
-        let prompt_embeds = self.encode(&comps.te, &comps.tokenizer, &req.prompt)?;
-        // Two guidance regimes. dev is guidance-distilled: a single forward feeds the guidance scalar
-        // to the DiT's embedded-guidance embedder (no negative pass). klein is distilled / true-CFG:
-        // a classifier-free negative pass only when guidance > 1 (it runs CFG-free at 1.0).
-        let negative = self.encode_negative(&comps.te, &comps.tokenizer, req, guidance)?;
-
-        // Resolve the decode seam once for the whole batch (epic 7840 / sc-7853): a per-generation PiD
-        // decoder bound to this prompt when `req.use_pid` is set (errors if requested but not loaded),
-        // else `None` → the native Flux2Vae decode. Shared across `count` images (same prompt).
-        let pid_decoder = candle_gen_pid::resolve_pid_decoder(
-            comps.pid.as_deref(),
-            req,
-            base_seed,
-            self.variant.id(),
-        )?;
-
-        self.sample(
-            req,
-            &comps.transformer,
-            &comps.vae,
-            &prompt_embeds,
-            negative.as_ref(),
-            pid_decoder.as_ref(),
-            guidance,
-            steps,
-            base_seed,
-            on_progress,
-        )
-    }
-
     /// Encode the optional classifier-free **negative** prompt for the klein CFG blend: `Some` only on a
     /// non-embedded-guidance variant with `guidance > 1` (klein runs CFG-free at 1.0; dev is embedded-
     /// guidance, single-forward, so always `None`). Takes the TE + tokenizer directly so both the

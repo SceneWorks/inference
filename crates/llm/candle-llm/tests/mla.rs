@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use candle_core::{Device, Tensor};
 
 use candle_llm::primitives::{input_ids, SplitMix64, TokenRng, Weights};
-use candle_llm::{CausalLm, ModelConfig};
+use candle_llm::{CausalLm, Error, ModelConfig};
 
 const VOCAB: usize = 32;
 const HIDDEN: usize = 32;
@@ -173,6 +173,43 @@ fn argmax(logits: &Tensor) -> i32 {
         .max_by(|a, b| a.1.total_cmp(b.1))
         .map(|(i, _)| i as i32)
         .unwrap()
+}
+
+#[test]
+fn deepseek_config_without_kv_lora_rank_returns_config_error() {
+    let config = serde_json::json!({
+        "architectures": ["DeepseekV2ForCausalLM"],
+        "model_type": "deepseek_v2",
+        "hidden_size": HIDDEN,
+        "intermediate_size": DENSE_INTER,
+        "num_hidden_layers": 1,
+        "num_attention_heads": NUM_HEADS,
+        "num_key_value_heads": NUM_HEADS,
+        "vocab_size": VOCAB,
+        "tie_word_embeddings": false
+    });
+    let cfg = ModelConfig::from_json(&config).unwrap();
+    assert_eq!(cfg.architecture.family(), "deepseek_v2");
+    assert!(cfg.mla.is_none());
+
+    let mut tensors = HashMap::new();
+    tensors.insert(
+        "model.embed_tokens.weight".into(),
+        Tensor::zeros((VOCAB, HIDDEN), candle_core::DType::F32, &Device::Cpu).unwrap(),
+    );
+    tensors.insert("model.norm.weight".into(), ones(HIDDEN));
+    tensors.insert(
+        "lm_head.weight".into(),
+        Tensor::zeros((VOCAB, HIDDEN), candle_core::DType::F32, &Device::Cpu).unwrap(),
+    );
+
+    let err = CausalLm::from_weights(&Weights::from_map(tensors, Device::Cpu), "", cfg)
+        .err()
+        .expect("missing kv_lora_rank must reject the config");
+    assert!(
+        matches!(&err, Error::Config(message) if message.contains("kv_lora_rank")),
+        "expected actionable config error, got {err:?}"
+    );
 }
 
 /// Drive a prefill + several cached decode steps through the MLA path and check every step yields

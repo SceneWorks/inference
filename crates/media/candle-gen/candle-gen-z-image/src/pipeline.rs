@@ -158,15 +158,7 @@ pub(crate) use crate::common::{ENC_DTYPE, LATENT_CHANNELS, PATCH_SIZE, SPATIAL_S
 /// inverse of the SDXL knob, matched here so the strength knob behaves identically on the Mac (MLX) and
 /// Windows (candle) base lanes. `floor` because Python `int(steps · strength)` truncates toward zero for
 /// `s ≥ 0`. Pure function so the cross-backend-parity law is unit-testable without a GPU.
-pub(crate) fn init_time_step(num_steps: usize, strength: Option<f32>) -> usize {
-    match strength {
-        Some(s) if s > 0.0 => {
-            let s = s.clamp(0.0, 1.0);
-            ((num_steps as f32 * s) as usize).max(1)
-        }
-        _ => 0,
-    }
-}
+pub(crate) use crate::common::init_time_step;
 
 /// Resolve the single img2img init image + its effective strength from the request's conditioning
 /// (sc-8646), mirroring `mlx-gen-z-image::pipeline::resolve_reference`. A per-reference `strength`

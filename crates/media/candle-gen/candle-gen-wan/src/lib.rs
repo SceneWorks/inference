@@ -50,11 +50,10 @@ pub mod vae;
 pub mod vae16;
 pub mod wan14b;
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use candle_gen::candle_core::{safetensors as cst, DType, Device, Tensor};
+use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::runtime::{CancelFlag, LoadPhase};
 use candle_gen::gen_core::tokenizer::TextTokenizer;
@@ -219,22 +218,10 @@ impl Pipeline {
         // Dense tier + adapters: fold the delta into the dense weights before build (`merge_adapters`
         // hard-errors on its own zero-match).
         drop(vb);
-        let mut map = self.load_component_map("transformer")?;
+        let mut map = text_encode::load_component_map(&self.root, "transformer", "wan")?;
         adapters::merge_adapters(&mut map, &self.adapters)?;
         let vb = VarBuilder::from_tensors(map, DIT_DTYPE, &self.device);
         Ok(WanTransformer::new(&self.dit_cfg, vb)?)
-    }
-
-    /// Load every `.safetensors` in the component subdir `sub` into one CPU tensor map (native dtype) —
-    /// the merge-ready form the dense adapter fold needs (vs the mmap `component_vb` fast path).
-    fn load_component_map(&self, sub: &str) -> CResult<HashMap<String, Tensor>> {
-        let dir = self.root.join(sub);
-        let files = candle_gen::sorted_safetensors(&dir, "wan")?;
-        let mut map: HashMap<String, Tensor> = HashMap::new();
-        for f in &files {
-            map.extend(cst::load(f, &Device::Cpu)?);
-        }
-        Ok(map)
     }
 
     /// Tokenize + UMT5-encode `prompt` → `[1, 512, 4096]` (bf16, zero-padded to `max_length`). Shared
@@ -863,7 +850,9 @@ mod explicit_registry_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle_gen::candle_core::safetensors as cst;
     use candle_gen::gen_core::ConditioningKind;
+    use std::collections::HashMap;
 
     #[test]
     fn registers_and_resolves_as_candle_video() {

@@ -17,15 +17,30 @@
 //!   misleading `CUBLAS_STATUS_EXECUTION_FAILED`). Emit one pad token so a 0-length sequence never
 //!   reaches the gather.
 
+use std::collections::HashMap;
 use std::path::Path;
 
-use candle_gen::candle_core::{DType, Device, Tensor};
+use candle_gen::candle_core::{safetensors as cst, DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use candle_gen::{CandleError, Result as CResult};
 
 use crate::config::TextEncoderConfig;
 use crate::text_encoder::Umt5Encoder;
+
+/// Load every safetensors shard in a component directory into a CPU tensor map for adapter folding.
+pub(crate) fn load_component_map(
+    root: &Path,
+    sub: &str,
+    label: &str,
+) -> CResult<HashMap<String, Tensor>> {
+    let files = candle_gen::sorted_safetensors(&root.join(sub), label)?;
+    let mut map = HashMap::new();
+    for file in files {
+        map.extend(cst::load(file, &Device::Cpu)?);
+    }
+    Ok(map)
+}
 
 /// mmap a snapshot component subdir `sub` (under `root`) into a [`VarBuilder`] at `dtype`/`device`.
 ///

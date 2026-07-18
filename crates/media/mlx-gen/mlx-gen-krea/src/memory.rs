@@ -321,8 +321,8 @@ pub fn plan_control_adaptation(safe_gib: f64, inputs: ControlLaneInputs<'_>) -> 
     plan_memory_adaptation(safe_gib, levers, |scale| {
         // Scale the render dimensions; keep them multiple-of-16 legal (the DiT/VAE alignment) by
         // flooring to the nearest 16 — the same alignment the pipeline validates.
-        let w = (((inputs.width as f64 * scale) as u32) / 16 * 16).max(16);
-        let h = (((inputs.height as f64 * scale) as u32) / 16 * 16).max(16);
+        let w = scale_render_dim(inputs.width, scale);
+        let h = scale_render_dim(inputs.height, scale);
         // The branch is estimated at bf16 here; the branch-quant *saving* is applied by the policy via
         // `branch_quant_saves_gib`, so the peaks must NOT also pre-apply it (double counting).
         StagePeaks {

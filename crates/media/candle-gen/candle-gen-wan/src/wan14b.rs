@@ -21,7 +21,6 @@
 //! decode-stage peak — the heavier-than-5B fix the story (sc-5174) requires — and the bf16 VAE halves
 //! that stage's otherwise-fixed ~30 GiB floor so the 1280×720/81f A14B decode fits a 24 GiB card.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -276,24 +275,10 @@ impl Pipeline {
         // Dense tier + adapters: fold the delta into the dense weights before building (the legacy
         // merge-not-residual fast path). `merge_adapters` hard-errors on its own zero-match.
         drop(vb);
-        let mut map = self.load_component_map(sub)?;
+        let mut map = crate::text_encode::load_component_map(&self.root, sub, "wan-14b")?;
         crate::adapters::merge_adapters(&mut map, &specs)?;
         let vb = VarBuilder::from_tensors(map, DIT_DTYPE, &self.device);
         Ok((WanTransformer::new(&self.dit_cfg, vb)?, None))
-    }
-
-    /// Load every `.safetensors` in the component subdir `sub` into one CPU tensor map (native dtype) —
-    /// the merge-ready form the adapter fold needs (vs the mmap `component_vb` fast path).
-    fn load_component_map(&self, sub: &str) -> CResult<HashMap<String, Tensor>> {
-        let dir = self.root.join(sub);
-        // Shared sorted-`.safetensors` resolver (sc-8999 / F-019); this path then loads the shards
-        // into a CPU map for adapter merging (not the mmap fast path), so it keeps its own loop.
-        let files = candle_gen::sorted_safetensors(&dir, "wan-14b")?;
-        let mut map: HashMap<String, Tensor> = HashMap::new();
-        for f in &files {
-            map.extend(cst::load(f, &Device::Cpu)?);
-        }
-        Ok(map)
     }
 
     /// Build the UMT5 text encoder (bf16, sc-12778) — the ~11 GB phase-A component (was ~21 GB f32).

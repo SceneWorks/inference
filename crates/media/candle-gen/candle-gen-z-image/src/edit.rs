@@ -70,20 +70,6 @@ const DEFAULT_STEPS: usize = 4;
 /// torch `ZImageImg2ImgPipeline` 0.6). With the fork's `init_time_step`, higher → closer to the source.
 pub const DEFAULT_EDIT_STRENGTH: f32 = 0.6;
 
-/// img2img start step (the Z-Image fork's `init_time_step`): for strength in `(0, 1]`,
-/// `max(1, floor(steps·strength))`; otherwise 0 (full regeneration from the max-σ prior). Higher strength
-/// → later start → fewer denoise steps → output stays closer to the init image — the upstream Z-Image
-/// convention, matched here so the strength knob behaves identically on the Mac (MLX) and Windows
-/// (candle) lanes. `floor` because Python `int(steps · strength)` truncates toward zero for `s ≥ 0`.
-fn init_time_step(num_steps: usize, strength: f32) -> usize {
-    if strength > 0.0 {
-        let s = strength.clamp(0.0, 1.0);
-        ((num_steps as f32 * s) as usize).max(1)
-    } else {
-        0
-    }
-}
-
 /// Paths to the Z-Image edit checkpoints — just the base `Tongyi-MAI/Z-Image-Turbo` snapshot (img2img
 /// reuses the Turbo weights; no extra checkpoint, unlike the Fun-ControlNet overlay).
 pub struct ZImageEditPaths {
@@ -223,7 +209,7 @@ impl ZImageEdit {
         // img2img start step + the sigma to noise the source to. `sigmas` has `steps + 1` entries
         // (indices 0..=steps); `start == steps` ⇒ σ_start = 0 ⇒ x_t = clean and an empty denoise loop
         // (the honest result of a max-strength structure-preserving edit: the source VAE round-trip).
-        let start = init_time_step(steps, req.strength);
+        let start = common::init_time_step(steps, Some(req.strength));
         let sigma_start = scheduler.sigmas[start];
 
         // Deterministic, launch-portable init noise (sc-3673, shared [`common::seed_noise`]).
@@ -339,20 +325,20 @@ mod tests {
     #[test]
     fn init_time_step_is_fork_convention() {
         // strength 0 / negative ⇒ full regeneration from step 0.
-        assert_eq!(init_time_step(4, 0.0), 0);
-        assert_eq!(init_time_step(4, -1.0), 0);
+        assert_eq!(common::init_time_step(4, Some(0.0)), 0);
+        assert_eq!(common::init_time_step(4, Some(-1.0)), 0);
         // floor(steps·strength), min 1.
-        assert_eq!(init_time_step(4, 0.05), 1); // floor(0.2)=0 → max(1,0)=1
-        assert_eq!(init_time_step(4, 0.25), 1); // floor(1.0)=1
-        assert_eq!(init_time_step(4, 0.6), 2); // floor(2.4)=2 (the default)
-        assert_eq!(init_time_step(4, 0.75), 3); // floor(3.0)=3
-        assert_eq!(init_time_step(4, 1.0), 4); // floor(4.0)=4 == steps ⇒ empty loop, source round-trip
-                                               // clamp above 1.
-        assert_eq!(init_time_step(4, 2.0), 4);
+        assert_eq!(common::init_time_step(4, Some(0.05)), 1); // floor(0.2)=0 → max(1,0)=1
+        assert_eq!(common::init_time_step(4, Some(0.25)), 1); // floor(1.0)=1
+        assert_eq!(common::init_time_step(4, Some(0.6)), 2); // floor(2.4)=2 (the default)
+        assert_eq!(common::init_time_step(4, Some(0.75)), 3); // floor(3.0)=3
+        assert_eq!(common::init_time_step(4, Some(1.0)), 4); // floor(4.0)=4 == steps ⇒ empty loop, source round-trip
+                                                             // clamp above 1.
+        assert_eq!(common::init_time_step(4, Some(2.0)), 4);
         // Higher strength is monotonically a later (or equal) start ⇒ fewer (or equal) steps.
         let starts: Vec<usize> = [0.1, 0.3, 0.5, 0.7, 0.9]
             .iter()
-            .map(|&s| init_time_step(8, s))
+            .map(|&s| common::init_time_step(8, Some(s)))
             .collect();
         assert!(starts.windows(2).all(|w| w[0] <= w[1]), "{starts:?}");
     }
@@ -375,12 +361,12 @@ mod tests {
         assert!((s.sigmas[0] - 1.0).abs() < 1e-9);
         assert!(s.sigmas[DEFAULT_STEPS].abs() < 1e-12);
         // At the default strength 0.6 the loop starts at index 2, runs 2 steps, and noises to sigmas[2].
-        let start = init_time_step(DEFAULT_STEPS, DEFAULT_EDIT_STRENGTH);
+        let start = common::init_time_step(DEFAULT_STEPS, Some(DEFAULT_EDIT_STRENGTH));
         assert_eq!(start, 2);
         assert_eq!(DEFAULT_STEPS - start, 2);
         assert!(s.sigmas[start] > 0.0 && s.sigmas[start] < 1.0);
         // Max strength ⇒ start == steps ⇒ σ_start == 0 (x_t = clean) and an empty loop.
-        let full = init_time_step(DEFAULT_STEPS, 1.0);
+        let full = common::init_time_step(DEFAULT_STEPS, Some(1.0));
         assert_eq!(full, DEFAULT_STEPS);
         assert!(s.sigmas[full].abs() < 1e-12);
     }
