@@ -102,7 +102,7 @@ fn run_sweep(sweep: &Sweep) {
             .unwrap_or_else(|e| panic!("generate (s={strength:?} \"{prompt}\"): {e}"))
         {
             GenerationOutput::Images(mut imgs) => imgs.pop().expect("one image"),
-            GenerationOutput::Video { .. } => panic!("expected images, got video"),
+            _ => panic!("expected images, got video"),
         }
     };
 

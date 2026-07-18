@@ -100,7 +100,7 @@ fn comfyui_zimage_renders_in_place() {
 
     let images = match out {
         GenerationOutput::Images(imgs) => imgs,
-        GenerationOutput::Video { .. } => panic!("expected images, got video"),
+        _ => panic!("expected images, got video"),
     };
     assert_eq!(images.len(), 1, "expected 1 image");
     assert_coherent(&images[0], "comfyui");

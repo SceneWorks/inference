@@ -158,7 +158,7 @@ fn main() -> Result<()> {
 
     let images = match output {
         GenerationOutput::Images(imgs) => imgs,
-        GenerationOutput::Video { .. } => return Err("expected images, got video".into()),
+        _ => return Err("expected images, got a non-image output".into()),
     };
     println!("[sana-sprint] {} image(s) in {secs:.2}s", images.len());
 

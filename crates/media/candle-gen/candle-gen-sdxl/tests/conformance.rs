@@ -149,7 +149,7 @@ fn realvisxl_lightning_render() {
 
     let images = match out {
         GenerationOutput::Images(imgs) => imgs,
-        GenerationOutput::Video { .. } => panic!("expected images, got video"),
+        _ => panic!("expected images, got video"),
     };
     assert_eq!(images.len(), 1, "count=1 ⇒ one image");
     let img = &images[0];

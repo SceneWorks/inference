@@ -216,6 +216,11 @@ impl Flux2Variant {
                 // bounding peak to `max(TE, DiT+VAE)`. The edit variants' reference conditioning that
                 // must persist through denoise is VAE-encoded in the heavy phase (after the TE drop).
                 supports_sequential_offload: true,
+                // No audio surface (sc-12834): pure image/video model.
+                audio_sample_rates: vec![],
+                max_audio_duration_secs: None,
+                audio_voices: vec![],
+                audio_languages: vec![],
             },
         }
     }

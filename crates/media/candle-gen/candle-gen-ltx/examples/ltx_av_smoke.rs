@@ -130,7 +130,7 @@ fn main() -> Result<()> {
     let secs = t0.elapsed().as_secs_f32();
     let (frames_out, out_fps, audio) = match output {
         GenerationOutput::Video { frames, fps, audio } => (frames, fps, audio),
-        GenerationOutput::Images(_) => return Err("expected video, got images".into()),
+        _ => return Err("expected video, got images".into()),
     };
     println!(
         "[smoke] {} frame(s) @ {out_fps}fps in {secs:.1}s",

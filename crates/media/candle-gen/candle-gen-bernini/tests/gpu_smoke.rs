@@ -71,6 +71,7 @@ fn gpu_smoke_raw_render() {
     let image = match out {
         GenerationOutput::Images(mut imgs) => imgs.remove(0),
         GenerationOutput::Video { mut frames, .. } => frames.remove(0),
+        _ => panic!("expected a visual output, got a non-visual output"),
     };
     assert!(
         image.width >= 16 && image.height >= 16,

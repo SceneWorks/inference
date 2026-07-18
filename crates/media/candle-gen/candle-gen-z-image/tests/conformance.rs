@@ -101,7 +101,7 @@ fn base_z_image_smoke() {
     let out = gen.generate(&req, &mut on_progress).expect("base generate");
     let images = match out {
         GenerationOutput::Images(imgs) => imgs,
-        GenerationOutput::Video { .. } => panic!("expected images, got video"),
+        _ => panic!("expected images, got video"),
     };
     assert_eq!(images.len(), 1);
     let img = &images[0];
@@ -176,7 +176,7 @@ fn base_z_image_cfg_no_negative_smoke() {
         .expect("base CFG generate with an unset negative prompt (sc-8646)");
     let images = match out {
         GenerationOutput::Images(imgs) => imgs,
-        GenerationOutput::Video { .. } => panic!("expected images, got video"),
+        _ => panic!("expected images, got video"),
     };
     assert_eq!(images.len(), 1);
     let img = &images[0];

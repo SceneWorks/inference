@@ -116,7 +116,7 @@ fn txt2img(
     let mut noop = |_: Progress| {};
     match gen.generate(&req, &mut noop)? {
         GenerationOutput::Images(mut imgs) => imgs.pop().ok_or_else(|| "no image".into()),
-        GenerationOutput::Video { .. } => Err("expected images".into()),
+        _ => Err("expected images".into()),
     }
 }
 

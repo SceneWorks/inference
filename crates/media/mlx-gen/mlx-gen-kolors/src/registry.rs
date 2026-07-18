@@ -122,6 +122,11 @@ pub fn descriptor() -> ModelDescriptor {
             // DENSE at load, so a `Sequential` + `quantize` load re-quantizes each generate (F-181
             // advisory in `load`).
             supports_sequential_offload: true,
+            // No audio surface (sc-12834): pure image/video model.
+            audio_sample_rates: vec![],
+            max_audio_duration_secs: None,
+            audio_voices: vec![],
+            audio_languages: vec![],
         },
     }
 }

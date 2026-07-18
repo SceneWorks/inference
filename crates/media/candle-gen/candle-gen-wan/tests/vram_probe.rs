@@ -380,7 +380,7 @@ fn measure(engine_id: &str) {
 
     let out_frames = match output {
         GenerationOutput::Video { frames, .. } => frames,
-        GenerationOutput::Images(_) => panic!("expected video, got images"),
+        _ => panic!("expected video, got images"),
     };
     assert!(!out_frames.is_empty(), "engine returned no frames");
     // Guard the CREDIBILITY of the number: a black/uniform clip means the run failed silently and
