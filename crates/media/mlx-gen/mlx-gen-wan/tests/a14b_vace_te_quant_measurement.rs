@@ -93,7 +93,7 @@ fn measure(label: &str, root: &Path, cfg: &WanModelConfig) {
         "{label}: Q8 embedding cosine {cos:.6} fell below 0.998"
     );
     assert!(
-        q8_peak as f64 < bf16_peak as f64 * 0.75,
+        (q8_peak as f64) < bf16_peak as f64 * 0.75,
         "{label}: Q8 peak {:.2} GiB is not at least 25% below bf16 {:.2} GiB; the TE may have been left dense",
         gib(q8_peak),
         gib(bf16_peak)
