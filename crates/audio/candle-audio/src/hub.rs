@@ -65,9 +65,19 @@ pub fn pinned_weights_file(repo: &str, revision: &str, path: &str) -> Result<Wei
 /// the hf-hub cache lays every file of one revision under a single `snapshots/<rev>/` dir.
 /// For a provider whose `LoadSpec` names a snapshot directory (weights + voices + config).
 ///
+/// `probe_file` must be a **top-level** filename in the repo: a nested path (e.g.
+/// `voices/af.pt`) is rejected up front, because its parent would be the subdirectory, not
+/// the snapshot root this function promises.
+///
 /// Note this materializes only `probe_file`; the provider fetches its remaining files through
 /// [`hf_get_pinned`] with the same pin (they land in the same snapshot dir).
 pub fn pinned_snapshot_dir(repo: &str, revision: &str, probe_file: &str) -> Result<WeightsSource> {
+    if probe_file.contains(['/', '\\']) {
+        return Err(AudioError::Msg(format!(
+            "hf-hub snapshot probe {probe_file:?} for {repo} must be a top-level filename — a \
+             nested path would resolve its subdirectory, not the snapshot root"
+        )));
+    }
     let probe = hf_get_pinned(repo, revision, probe_file)?;
     let dir = probe.parent().ok_or_else(|| {
         AudioError::Msg(format!(
@@ -94,6 +104,20 @@ mod tests {
             assert!(
                 err.to_string().contains("not a full 40-hex commit SHA"),
                 "revision {bad:?} must be refused as unpinned, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_probe_must_be_a_top_level_filename() {
+        // Also offline: the nested-path refusal fires before any network use, even with a
+        // well-formed pin.
+        let pin = "91b3b1eb141d1a1b30bd5a58c2b1c9dfd7b31469";
+        for nested in ["voices/af.pt", "sub\\model.safetensors"] {
+            let err = pinned_snapshot_dir("owner/repo", pin, nested).unwrap_err();
+            assert!(
+                err.to_string().contains("must be a top-level filename"),
+                "probe {nested:?} must be refused, got: {err}"
             );
         }
     }

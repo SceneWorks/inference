@@ -28,11 +28,15 @@ pub fn encode_wav_pcm16(track: &AudioTrack) -> Result<Vec<u8>> {
             track.channels
         )));
     }
+    // The RIFF chunk size field stores `36 + data_len`, so data alone must leave headroom for
+    // the 36 header bytes — a bare `<= u32::MAX` bound would overflow the `36 +` below for a
+    // track within 36 bytes of 4 GiB.
     let data_len = track
         .samples
         .len()
         .checked_mul(2)
         .and_then(|n| u32::try_from(n).ok())
+        .filter(|&n| n <= u32::MAX - 36)
         .ok_or_else(|| {
             AudioError::Msg(format!(
                 "WAV encode: {} samples exceed the 32-bit RIFF size field",

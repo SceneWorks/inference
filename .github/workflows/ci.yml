@@ -119,10 +119,14 @@ jobs:
           rustup component add clippy
       - name: Cache Cargo
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      # `candle-audio/testkit` is compiled here explicitly: until the first audio provider
+      # dev-depends on it (sc-12836), no target in the graph pulls the feature in, so without
+      # this flag the testkit module would be merged unguarded (the sc-11990 cfg-hole shape).
       - name: Clippy Candle packages
         run: >-
           cargo clippy --locked
           -p candle-llm -p 'candle-gen*' -p 'candle-audio*' -p runtime-cpu
+          --features candle-audio/testkit
           --all-targets -- -D warnings
       - name: Reclaim Clippy artifacts before linking tests
         # The complete all-target Clippy graph and the test graph do not fit concurrently on the
@@ -164,6 +168,10 @@ jobs:
       # LLM+audio composition (ChatWorks TTS without the media graph) is a supported profile.
       - name: Test LLM+audio CPU bundle
         run: cargo test --locked --no-default-features --features audio --lib -p runtime-cpu
+      # The fourth documented profile (audio-backend-strategy.md feature matrix): media without
+      # the audio lane must keep composing — one lane covers it, on the cheapest platform.
+      - name: Test media-only CPU bundle
+        run: cargo test --locked --no-default-features --features media --lib -p runtime-cpu
       - name: Guard poison-tolerant shared locks
         run: bash crates/media/candle-gen/scripts/check-lock-poison.sh
       - name: Self-test the gen-core skew verdict
