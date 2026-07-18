@@ -25,10 +25,10 @@ The bundle contains:
 - an SPDX 2.3 JSON SBOM for the complete cross-platform lockfile graph;
 - `SHA256SUMS` covering the source archive, manifest, and SBOM.
 
-The verification step checks the manifest/SBOM relationship graph and builds a
-small external Cargo consumer against the contract crates extracted from the
-source archive. This is deliberately independent of provider bundles, which land
-in Phase 4.
+The verification step checks the manifest/SBOM relationship graph, requires the
+landed runtime provider bundles, and builds a small external Cargo consumer
+against the contract crates extracted from the source archive. The external
+consumer smoke remains deliberately contract-only.
 
 ## Release gates
 
