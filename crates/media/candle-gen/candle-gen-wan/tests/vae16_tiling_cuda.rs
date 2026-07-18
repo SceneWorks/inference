@@ -87,8 +87,8 @@ fn wan_z16_spatial_tiling_decode() {
         return;
     };
 
-    // 640²×5-frame output (80×80 latent, 2 latent frames). 640 > 512 ⇒ a single high-res frame. Small
-    // enough that the ×8 write bound (96 ch) does not force tiling on the huge-budget check below.
+    // 640²×5-frame output (80×80 latent, 2 latent frames). 640 > the im2col SAFE_PX cap (512), so the
+    // budgeted decode is forced to the 512 px cap tile even at a huge budget (see the huge-budget check).
     let z = Tensor::randn(0f32, 1f32, (1, 16, 2, 80, 80), &dev).unwrap();
 
     // Baseline: the streaming single-pass decode.
@@ -112,13 +112,21 @@ fn wan_z16_spatial_tiling_decode() {
         "tiled decode diverged from baseline: PSNR={psnr:.2} dB (expected seam-free ~35 dB)"
     );
 
-    // Budgeted routing — huge budget ⇒ single-pass ⇒ bit-exact with `decode`.
+    // Budgeted routing — huge budget, but 640 > the im2col SAFE_PX cap (512), so `decode_budgeted` is
+    // FORCED to the 512 px cap tile regardless of budget (sc-12758 `cap_spatial_for_im2col`). It is
+    // therefore the 512-cap tiling — bit-exactly (same `decode_tiled` routing) — NOT the untiled
+    // single-pass `decode`. (Pre-cap this asserted `== decode`; the cap diverts any >512 px frame to
+    // tiling, and the untiled path stays correct on its own via the sc-12773 conv2d chunking — exercised
+    // by `wan_z16_render_scale_seamfree_parity`.)
+    let cap_tiled = vae
+        .decode_tiled(&z, &TilingConfig::spatial_only(512, 64))
+        .unwrap();
     std::env::set_var("WAN_VAE_BUDGET_GIB", "100000");
     let big = vae.decode_budgeted(&z).unwrap();
-    let (_, maxd_big) = psnr_and_maxdiff(&base, &big);
+    let (_, maxd_big) = psnr_and_maxdiff(&cap_tiled, &big);
     assert!(
         maxd_big < 1e-6,
-        "decode_budgeted(huge budget) must equal single-pass decode, max_abs_diff={maxd_big}"
+        "decode_budgeted(huge budget) at 640² must equal the im2col-capped 512 px tiling (sc-12758 cap), max_abs_diff={maxd_big}"
     );
 
     // Budgeted routing — tight budget ⇒ must tile, stay finite/in-range, and differ from single-pass.
@@ -149,11 +157,14 @@ fn wan_z16_spatial_tiling_decode() {
 ///  - `untiled` — the single-pass `decode` (the ~48 GB spike this story tiles away).
 ///
 /// The seam-free AC is asserted on **`prod448` vs `ref256`** (~35 dB standing rule) — both are tiled
-/// paths through the same blend/stitch, so this isolates the seam quality. The `untiled` comparison is
-/// recorded for the finding that the single-pass decode of a 1280×720 frame drives its final conv2d
-/// im2col (~796M elems) into candle's CUDA overflow zone (this box's raw z16 conv2d is NOT chunked),
-/// so it corrupts — which the tiling avoids (the MLX write-cap + the budget both force tiling at this
-/// geometry, so the shipped A14B decode never takes the untiled path here).
+/// paths through the same blend/stitch, so this isolates the seam quality. sc-12773: the **`untiled`**
+/// single-pass decode used to silently corrupt at this geometry — its final conv2d im2col (~796M elems)
+/// overflowed candle's CUDA conv2d, so the untiled decode diverged from BOTH tiled decodes by an
+/// identical ~15.6 dB while the two tiled decodes agreed at ~55 dB (the untiled path was the corrupt
+/// one). Now that the z16 VAE conv2d is im2col-chunked (`chunked_conv2d`), the untiled decode is
+/// **correct**: it must agree with the trusted 256 px reference far above that corrupt floor (measured
+/// ~52.6 dB — the untiled path attends globally, so it is if anything *closer* to the true decode than
+/// the tiled approximation). This test now asserts that untiled parity as the sc-12773 acceptance.
 #[test]
 #[ignore = "needs WAN_VAE16_SNAPSHOT + CUDA; decodes an untiled 1280×720×81 frame (~48 GB) — big-VRAM box only"]
 fn wan_z16_render_scale_seamfree_parity() {
@@ -184,19 +195,31 @@ fn wan_z16_render_scale_seamfree_parity() {
          PSNR={psnr:.2} dB  max_abs_diff={maxd:.4}"
     );
 
-    // Record the untiled comparison (the ~48 GB single-pass spike — expected to diverge, corrupted by
-    // the un-chunked conv2d im2col overflow at 1280×720; the tiling is what avoids it).
+    // sc-12773: the *untiled* single-pass decode (the ~48 GB spike). It used to silently corrupt at this
+    // geometry (final conv2d im2col ~796M elems → candle's CUDA overflow band), diverging from BOTH tiled
+    // decodes by an identical ~15.6 dB. With the VAE conv2d now im2col-chunked it decodes correctly.
     let untiled = vae.decode(&z).unwrap();
+    assert_eq!(untiled.dims(), ref256.dims());
+    assert_finite_and_in_range(&untiled, "decode(untiled render-scale)");
     let (psnr_u_ref, _) = psnr_and_maxdiff(&ref256, &untiled);
     let (psnr_u_prod, _) = psnr_and_maxdiff(&prod448, &untiled);
     eprintln!(
-        "[sc-12758] RENDER-SCALE untiled decode vs ref256={psnr_u_ref:.2} dB, vs prod448={psnr_u_prod:.2} dB \
-         (low ⇒ the untiled 796M-elem conv2d im2col is corrupted; tiling is the correct path)"
+        "[sc-12773] RENDER-SCALE untiled decode vs ref256={psnr_u_ref:.2} dB, vs prod448={psnr_u_prod:.2} dB \
+         (was ~15.6 dB pre-fix ⇒ corrupt; high now ⇒ the chunked conv2d decodes the untiled path correctly)"
     );
 
     assert!(
         psnr > 35.0,
         "render-scale production tiling must be seam-free vs the trusted 256 px reference \
          (~35 dB rule): PSNR={psnr:.2} dB"
+    );
+    // sc-12773 acceptance: the untiled hi-res decode is no longer corrupt — it agrees with the trusted
+    // 256 px tiling far above the old ~15.6 dB corruption floor (a conv2d-chunking regression craters it
+    // back down). Threshold 48 dB honors the AC's "~50+ dB": measured ~52.6 (stable — PSNR averages over
+    // 224M output elems), corrupt ~15.6 — a wide, unambiguous separation.
+    assert!(
+        psnr_u_ref > 48.0,
+        "untiled hi-res decode must be uncorrupted (sc-12773): vs trusted ref256 PSNR={psnr_u_ref:.2} dB \
+         (corrupt was ~15.6 dB) — the VAE conv2d im2col chunking regressed"
     );
 }

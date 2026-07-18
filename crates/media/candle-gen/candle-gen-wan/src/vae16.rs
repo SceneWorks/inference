@@ -24,7 +24,7 @@ use candle_gen::gen_core::tiling::{SpatialTiling, TileCandidates, TilingConfig, 
 use candle_gen::vae_tiling;
 
 use crate::config::{Vae16Config, LATENTS16_MEAN, LATENTS16_STD};
-use crate::conv3d::{CausalConv3d, Ctx};
+use crate::conv3d::{chunked_conv2d, CausalConv3d, Ctx};
 use crate::vae::{causal, ChanNorm, Conv2dW, MidAttn, Resnet, Upsampler};
 
 /// One z16 decoder up-stage: residual blocks then an optional spatial/temporal upsampler (no `Dup`
@@ -80,7 +80,9 @@ impl SpatialDown {
             .contiguous()?;
         // ZeroPad2d((left,right,top,bottom)) = (0,1,0,1): pad right (W, dim 3) + bottom (H, dim 2).
         let padded = merged.pad_with_zeros(2, 0, 1)?.pad_with_zeros(3, 0, 1)?;
-        let y = padded.conv2d(&self.w, 0, 2, 1, 1)?.broadcast_add(&self.b)?;
+        // im2col-chunked (stride-2): a hi-res I2V conditioning frame's first spatial down (96-ch 3×3 at
+        // 720×1280 ⇒ ~199M-elem im2col) would otherwise hit candle's conv2d corruption band (sc-12773).
+        let y = chunked_conv2d(&padded, &self.w, 0, 2)?.broadcast_add(&self.b)?;
         let (_, oc, oh, ow) = y.dims4()?;
         y.reshape((b, t, oc, oh, ow))?
             .permute((0, 2, 1, 3, 4))?
@@ -147,7 +149,9 @@ impl TemporalDown {
                 .reshape((b * out_t, c, h, w))?
                 .contiguous()?;
             let wk = self.w.narrow(2, k, 1)?.squeeze(2)?.contiguous()?; // [O,I,1,1]
-            let yk = merged.conv2d(&wk, 0, 1, 1, 1)?;
+            // im2col-chunked for parity with the other VAE convs (1×1 ⇒ tiny im2col at these dims, so in
+            // practice a single un-chunked pass; keeps every z16 encoder conv uniformly safe, sc-12773).
+            let yk = chunked_conv2d(&merged, &wk, 0, 1)?;
             acc = Some(match acc {
                 Some(a) => (a + yk)?,
                 None => yk,
@@ -623,23 +627,23 @@ const WAN_Z16_VAE_SPATIAL_OVERLAP_PX: i32 = 64;
 /// budgeted selector only ever tiles the spatial axes (see the module note above).
 const WAN_Z16_VAE_TEMPORAL_FR: [(i32, i32); 0] = [];
 
-/// candle **conv2d im2col spatial cap** (output px per side) — a *correctness* bound the VRAM budget
-/// and the MLX `i32` write bound both miss (sc-12758 / sc-12773). candle's CUDA `conv2d` unrolls each
+/// candle **conv2d im2col spatial cap** (output px per side) — historically a *correctness* bound the
+/// VRAM budget and the MLX `i32` write bound both miss (sc-12758). candle's CUDA `conv2d` unrolls each
 /// decoded frame into an im2col buffer of `out_h·out_w·C·kH·kW` elements; the z16 decoder's widest
 /// full-res stage is 96-ch 3×3, so a single frame's im2col is `out_h·out_w·96·9`. Past a few hundred
-/// million elements that buffer **silently corrupts** (the same class the repo's `IM2COL_BUDGET`
-/// 128M-elem `chunked_conv2d` splitter in `candle-gen-seedvr2` guards; sc-10023 / sc-11744). Reviewer
-/// GPU data on this z16 decoder: 640² per frame (≈1.42e9 B ⇒ 3.5e8 elems) is CLEAN,
-/// 1280×720 (≈3.18e9 B ⇒ 8.0e8 elems) CORRUPTS.
+/// million elements *an un-chunked* buffer **silently corrupts**. Reviewer GPU data on this z16 decoder:
+/// 640² per frame (≈1.42e9 B ⇒ 3.5e8 elems) is CLEAN, 1280×720 (≈3.18e9 B ⇒ 8.0e8 elems) CORRUPTS.
 ///
-/// This bound is **independent of frame count and of how much VRAM is free** — it is purely
-/// per-decoded-frame spatial. The MLX write bound gen-core's `budgeted_plan` enforces
-/// ([`VaeTiling::writable_frame_cap`], `i32::MAX` total elems) does NOT fire for candle (that doc calls
-/// it MLX-only), so on a large-VRAM card a hi-res / low-frame-count decode (e.g. 1280×720 / 17f, whose
-/// 24-frame write cap and ample budget both admit single-pass) would otherwise fall through to the
-/// plain untiled [`WanVae16::decode`] and corrupt. Forcing every decoded tile ≤ this cap closes that
-/// path at any frame count / budget. 512 is GPU-validated clean here and conservative vs the 640² the
-/// reviewer measured clean; `512²·96·9 = 2.26e8` elems sits well under the corruption band.
+/// **As of sc-12773 the corruption is fixed at the source**: every VAE conv2d now im2col-chunks
+/// ([`crate::conv3d::chunked_conv2d`], the 128M-elem splitter — the twin of the `candle-gen-seedvr2`
+/// one sc-10023 / sc-11744), so the plain untiled [`WanVae16::decode`] is correct at any resolution
+/// (GPU-validated: untiled 1280×720 now matches the trusted 256 px tiling at ~52.6 dB, was ~15.6 dB
+/// corrupt). **This cap is therefore no longer required for correctness** — it is retained only as a
+/// conservative memory/tile bound (redundant defense-in-depth). Removing it (and re-adding the 640/768
+/// tile candidates dropped by sc-12758) so hi-res decodes on big-VRAM cards run un-tiled — higher quality
+/// than the tiling approximation — is a deliberate **follow-up** (it changes sc-12758's shipped A14B
+/// decode routing, so it needs a render-level GPU re-validation of the 24 GB fit, out of scope here).
+/// 512 is GPU-validated clean; `512²·96·9 = 2.26e8` elems sits well under the corruption band.
 const WAN_Z16_VAE_IM2COL_SAFE_PX: i32 = 512;
 
 /// Clamp a budgeted plan so **every** decoded tile's per-frame spatial extent stays ≤
@@ -667,8 +671,10 @@ fn cap_spatial_for_im2col(
         overlap_px: WAN_Z16_VAE_SPATIAL_OVERLAP_PX,
     };
     Some(match plan {
-        // Budget said single-pass fits, but a full 1280×720-class frame would overflow candle's im2col
-        // and corrupt — force the largest im2col-safe spatial tile (temporal already streams).
+        // Budget said single-pass fits, but a full 1280×720-class frame's per-frame im2col is over the
+        // cap — force the largest capped spatial tile (temporal already streams). Post-sc-12773 the
+        // untiled conv2d self-chunks and is correct, so this is a conservative memory/tile bound, not a
+        // correctness necessity (see WAN_Z16_VAE_IM2COL_SAFE_PX).
         None => TilingConfig {
             spatial: Some(capped_tile(None)),
             temporal: None,

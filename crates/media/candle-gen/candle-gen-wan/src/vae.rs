@@ -18,7 +18,7 @@ use candle_gen::gen_core::tiling::{TileCandidates, TilingConfig, VaeTiling};
 use candle_gen::vae_tiling;
 
 use crate::config::{VaeConfig, LATENTS_MEAN, LATENTS_STD};
-use crate::conv3d::{CausalConv3d, Ctx};
+use crate::conv3d::{chunked_conv2d, CausalConv3d, Ctx};
 
 const NORM_EPS: f64 = 1e-12;
 
@@ -73,9 +73,11 @@ impl Conv2dW {
             pad,
         })
     }
-    /// `x`: `[N, C, H, W]`.
+    /// `x`: `[N, C, H, W]`. The conv2d is im2col-chunked ([`chunked_conv2d`]) so the hi-res VAE path —
+    /// e.g. the last z16 upsampler resample (192-ch 3×3 at 1280×720, ~1.59B-elem im2col) — cannot drive
+    /// candle's CUDA conv2d into its silent-corruption band; low-res stays a single un-chunked pass.
     pub(crate) fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        x.conv2d(&self.w, self.pad, 1, 1, 1)?.broadcast_add(&self.b)
+        chunked_conv2d(x, &self.w, self.pad, 1)?.broadcast_add(&self.b)
     }
 }
 
