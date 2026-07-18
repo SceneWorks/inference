@@ -14,8 +14,9 @@ categories = ["science"]
 [dependencies]
 # mlx-rs is pinned to the pmetal fork by commit SHA — the SAME pin mlx-gen uses, so the two
 # build ONE mlx-rs and share a single `Array` type (the inversion: mlx-gen will consume mlx-llm).
-# `pmetal-mlx-rs` is mlx-rs 0.25 whose mlx-sys builds MLX core 0.31.2 (faster Metal kernels +
-# the command-buffer-recoverable patch). Aliased as `mlx-rs` so `use mlx_rs::…` is unchanged.
+# `pmetal-mlx-rs` is mlx-rs 0.25 whose mlx-sys builds MLX core 0.32.0 (epic 12742; faster Metal
+# kernels + the regenerated metallib-search-path patch — command-buffer recovery is upstream in
+# 0.32.0). Aliased as `mlx-rs` so `use mlx_rs::…` is unchanged.
 # Crates.io publish (a later epic-7153 story) will swap this for a registry/patch arrangement;
 # during development it is the fork so the engine actually runs correctly on-device.
 # SHA 38e1cc17 = 44929a00 + sc-7898: metallib resolver (device.cpp) now prefers the build's own

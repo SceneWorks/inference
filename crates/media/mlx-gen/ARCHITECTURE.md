@@ -3,7 +3,7 @@
 Rust-native inference for generative image/video models on Apple MLX, built on the
 [`mlx-rs`](https://crates.io/crates/mlx-rs) API surface but on the SceneWorks `pmetal-mlx-rs`
 fork ([`michaeltrefry/mlx-rs`](https://github.com/michaeltrefry/mlx-rs), rev-pinned in the root
-`Cargo.toml` — its `mlx-sys` builds MLX core 0.31.2 vs upstream's 0.25.1). It reimplements the (now frozen) SceneWorks
+`Cargo.toml` — its `mlx-sys` builds MLX core 0.32.0 (epic 12742) vs upstream's 0.25.1). It reimplements the (now frozen) SceneWorks
 **mflux fork** — the Python MLX inference sidecar — as a single statically-linked Rust
 component. The fork is the **reference spec**, not an upstream: we diverge permanently and
 do not merge back.

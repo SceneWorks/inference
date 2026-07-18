@@ -2253,7 +2253,19 @@ mod tests {
             let fc = gelu_ffn(&h).unwrap();
             crate::set_compile_glue(false);
             assert_eq!(fc.dtype(), dt, "gelu_ffn dtype {dt:?}");
-            assert_eq!(max_abs(&fc, &fe), 0.0, "gelu_ffn {dt:?}");
+            // sc-12747: under MLX 0.32.0 the compiled tanh-GELU FFN rounds ~1 ULP-f32 differently
+            // from eager (0-ULP on the prior 0.31.2 pin); bf16 stays bit-identical. f32 takes the
+            // shared re-baselined tolerance; bf16 stays exact.
+            let tol = if dt == Dtype::Float32 {
+                mlx_gen::nn::COMPILED_GLUE_F32_ULP_TOL
+            } else {
+                0.0
+            };
+            let rel = mlx_gen::nn::max_rel_diff(&fc, &fe);
+            assert!(
+                rel <= tol,
+                "gelu_ffn {dt:?}: rel|Δ|={rel:e} exceeds {tol:e}"
+            );
         }
     }
 

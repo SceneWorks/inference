@@ -162,6 +162,35 @@ impl Drop for CompileGlueGuard {
     }
 }
 
+/// Shared f32 tolerance for the compiled-vs-eager elementwise-glue fast paths — the fused tanh-GELU
+/// FFN (over [`gelu_tanh`]), [`silu`], and the family-crate SwiGLU/GELU-FFN wrappers that defer to
+/// them.
+///
+/// These fused kernels are **bit-identical** to their eager core op at fp16/bf16, but under MLX
+/// 0.32.0 the *f32* fusion rounds 1–2 ULP differently from the eager op (epic 12742 pin bump —
+/// sc-12744 measured it, sc-12747 re-baselined it; the prior 0.31.2 pin was 0-ULP). Expressed in f32
+/// ULPs (`f32::EPSILON` = 2⁻²³ ≈ 1.19e-7) and applied **relative** to the reference peak magnitude
+/// (see [`max_rel_diff`]): the observed drift is ≤1 ULP relative (abs `max|Δ|` 2.4e-7…4.8e-7 on the
+/// fixed-seed compiled-glue parity tests), so 4 ULP accepts the harmless rounding with margin while
+/// staying ~1000× under every golden tolerance. A real regression (wrong fusion / scale / transpose)
+/// is O(1e-1) — orders of magnitude above this floor, so it is still caught. fp16/bf16 stay asserted
+/// **exact** (`0.0`) by their guards; only the f32 path uses this tolerance.
+pub const COMPILED_GLUE_F32_ULP_TOL: f32 = 4.0 * f32::EPSILON;
+
+/// Peak **relative** divergence `max|a−b| / max(max|b|, 1e-12)` between two arrays (cast to f32),
+/// as f32 — `0.0` iff bit-identical. Companion to [`COMPILED_GLUE_F32_ULP_TOL`]: the compiled-glue
+/// parity guards compare this against that tolerance at f32 and against `0.0` (exact) at fp16/bf16.
+pub fn max_rel_diff(a: &Array, b: &Array) -> f32 {
+    use mlx_rs::ops::{abs, max};
+    let a = a.as_dtype(Dtype::Float32).unwrap();
+    let b = b.as_dtype(Dtype::Float32).unwrap();
+    let num = max(abs(subtract(&a, &b).unwrap()).unwrap(), None)
+        .unwrap()
+        .item::<f32>();
+    let den = max(abs(&b).unwrap(), None).unwrap().item::<f32>();
+    num / den.max(1e-12)
+}
+
 /// Gated residual `x + gate·y` (`gate` pre-broadcast). One fused kernel when [`compile_glue`] is on;
 /// bit-identical to the eager `add(x, gate·y)`. Shared by the FLUX.1/FLUX.2 MMDiTs (F-101).
 pub fn gated(x: &Array, gate: &Array, y: &Array) -> Result<Array> {

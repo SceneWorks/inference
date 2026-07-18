@@ -2,15 +2,33 @@
 //!
 //! Two layers of gate:
 //!
-//! 1. **Bit-exact vs the reference `mx.quantize` golden** (non-ignored, CI-green) — a single
-//!    `to_q`-shaped Linear slice. The committed fixture `tests/fixtures/mochi_quant_slice.safetensors`
-//!    (from `tools/dump_mochi_quant_fixtures.py`) carries the bf16 weight `w`, the f32 activations `x`,
-//!    the packed `q{4,8}.{wq,scales,biases}`, and the reference forward `q{4,8}.y`. Both packed-load
-//!    routes reproduce `y` **bit-for-bit** — (a) *convert-then-load*: [`quantize_transformer_map`]
-//!    packs the same bf16 `w` (the packing `convert.rs` applies), then [`MochiLinear::load`] consumes
-//!    it; (b) *consume-prequantized*: [`MochiLinear::load`] reads the dumped packs off a `Weights`.
-//!    Same MLX `quantize` on the same bf16 weight ⇒ byte-identical scales ⇒ deterministic
-//!    `quantized_matmul` ⇒ bit-exact. Needs only MLX + the ~0.1 MB fixture (no real weights).
+//! 1. **Packed-load parity vs the reference `mx.quantize` golden** (non-ignored, CI-green) — a
+//!    single `to_q`-shaped Linear slice. The committed fixture
+//!    `tests/fixtures/mochi_quant_slice.safetensors` (from `tools/dump_mochi_quant_fixtures.py`)
+//!    carries the bf16 weight `w`, the f32 activations `x`, the packed `q{4,8}.{wq,scales,biases}`,
+//!    and the reference forward `q{4,8}.y`. Two packed-load routes exercise the loader — (a)
+//!    *convert-then-load*: [`quantize_transformer_map`] packs the same bf16 `w` (the packing
+//!    `convert.rs` applies), then [`MochiLinear::load`] consumes it; (b) *consume-prequantized*:
+//!    [`MochiLinear::load`] reads the dumped packs off a `Weights`. Needs only MLX + the ~0.1 MB
+//!    fixture (no real weights). This gate has **two comparisons** with deliberately different
+//!    strictness:
+//!
+//!    * **routes-agree — BIT-EXACT** (`max|y_a − y_b| == 0.0`): both routes run the *same*
+//!      `quantized_matmul` on the *same* platform off byte-identical packs, so they must be
+//!      bit-for-bit identical on every platform. This is the real packing/scale/transpose
+//!      tripwire and stays asserted exact.
+//!    * **vs-golden — TIGHT ULP TOLERANCE** ([`MOCHI_QUANT_GOLDEN_ULP_TOL`], relative): under
+//!      the MLX 0.32.0 pin (epic 12742) `quantized_matmul`'s f32 output is **NAX-path-dependent**
+//!      — the self-hosted Apple-matrix-unit "NAX" path (macOS 26.2, deployment-target 26.2) and
+//!      the hosted non-NAX path (macOS 15, deployment-target 15.0 — what PR CI runs) differ by
+//!      ~1–2 ULP-f32 (Q4 abs 1.31e-6, Q8 9.54e-7 on this fixture; ≤2 ULP relative). The packs
+//!      (`wq`/`scales`/`biases`) are byte-identical across 0.31.2→0.32.0 and across NAX/non-NAX —
+//!      only the accumulation drifted, and only on the NAX path (MLX #3631/#3632/#3810). On
+//!      0.31.2 both Metal paths were bit-identical so one golden served both; 0.32.0's NAX quant
+//!      fixes broke that tie. The committed golden is the **non-NAX (CI-matching) reference**,
+//!      which is unchanged from the 0.31.2 dump — so CI reproduces it ~exactly while the
+//!      self-hosted NAX runner sits ~1–2 ULP away. A predicate/scale/transpose bug is O(1e-1),
+//!      orders of magnitude above this ULP floor, so it is still caught loudly.
 //!
 //! 2. **Real-tier transformer-forward residual** (`#[ignore]`d) — loads a built `q4`/`q8` tier dir's
 //!    transformer (the consume-prequantized path on the whole 10B AsymmDiT) and reports the residual of
@@ -42,6 +60,21 @@ const DIT_GOLDEN: &str = concat!(
 const GROUP: i32 = 64;
 /// A real quant-target key so [`quantize_transformer_map`]'s predicate fires on the slice.
 const SLICE_KEY: &str = "transformer_blocks.0.attn1.to_q";
+
+/// Relative tolerance for the packed-forward **vs the committed golden** comparison (see the
+/// module doc, gate 1). Under the MLX 0.32.0 pin `quantized_matmul`'s f32 accumulation is
+/// NAX-path-dependent: the self-hosted Apple-matrix-unit ("NAX", dt26.2) path and the hosted
+/// non-NAX (dt15.0, PR-CI) path differ by ~1–2 ULP-f32. On this fixture the measured gap is
+/// **≤2 ULP relative** — Q4 `1.311e-6 / max|y|≈5.503 = 2.383e-7` (= 2.00 ULP), Q8
+/// `9.537e-7 / 5.662 = 1.684e-7` (= 1.41 ULP). The committed golden is the non-NAX (CI) value,
+/// so CI reproduces it ~exactly and the self-hosted NAX runner lands one drift away; a single
+/// bound has to cover the larger of the two. `16 ULP` gives ~8× headroom over the worst (Q4,
+/// 2 ULP) gap while staying ~5e4× below a real predicate/scale/transpose bug (O(1e-1) relative),
+/// so that class of regression is still caught loudly. Applied **relative** via [`peak_rel`],
+/// mirroring [`mlx_gen::nn::COMPILED_GLUE_F32_ULP_TOL`] (the 0.32.0 compiled-glue f32 gate). The
+/// two packed-load routes still agree **bit-exact** with each other — only the vs-golden compare
+/// uses this tolerance.
+const MOCHI_QUANT_GOLDEN_ULP_TOL: f32 = 16.0 * f32::EPSILON;
 
 fn max_abs(a: &Array) -> f32 {
     max(abs(a).unwrap(), None).unwrap().item::<f32>()
@@ -77,7 +110,10 @@ fn packed_weights(prefix: &str, wq: Array, scales: Array, biases: Array) -> Weig
     w
 }
 
-/// The bit-exact fixture gate for one bit-width, covering both packed-load routes.
+/// The fixture gate for one bit-width, covering both packed-load routes: the two routes must agree
+/// **bit-exact** with each other, and each must match the committed golden within a tight ULP
+/// tolerance (the golden is the non-NAX/CI value; the self-hosted NAX path drifts ~1–2 ULP under
+/// MLX 0.32.0). See the module doc and [`MOCHI_QUANT_GOLDEN_ULP_TOL`].
 fn slice_matches_reference(bits: i32) {
     let f = Weights::from_file(FIXTURE).expect("quant slice fixture");
     let x = f.require("x").expect("x").clone(); // [B, in] f32
@@ -97,6 +133,7 @@ fn slice_matches_reference(bits: i32) {
         MochiLinear::load(&wa, SLICE_KEY, false, quant, Dtype::Float32).expect("load route-A");
     let y_a = lin_a.forward(&x).expect("forward route-A");
     let d_a = max_abs_diff(&y_a, &y_ref);
+    let rel_a = peak_rel(&y_a, &y_ref);
 
     // Route B — consume-prequantized: read the dumped packs directly.
     let wb = packed_weights(
@@ -109,17 +146,33 @@ fn slice_matches_reference(bits: i32) {
         MochiLinear::load(&wb, SLICE_KEY, false, quant, Dtype::Float32).expect("load route-B");
     let y_b = lin_b.forward(&x).expect("forward route-B");
     let d_b = max_abs_diff(&y_b, &y_ref);
+    let rel_b = peak_rel(&y_b, &y_ref);
 
     eprintln!(
-        "[Q{bits}] slice packed-forward max|Δ| vs reference: route-A(convert)={d_a:.3e} \
-         route-B(consume)={d_b:.3e}; route-A vs route-B={:.3e}",
+        "[Q{bits}] slice packed-forward vs reference: route-A(convert) abs={d_a:.3e} rel={rel_a:.3e} \
+         route-B(consume) abs={d_b:.3e} rel={rel_b:.3e}; route-A vs route-B={:.3e} \
+         (vs-golden tol={MOCHI_QUANT_GOLDEN_ULP_TOL:.3e})",
         max_abs_diff(&y_a, &y_b)
     );
 
-    // Same MLX quantize on the same bf16 weight + deterministic quantized_matmul ⇒ bit-exact. A
-    // predicate/scale/transpose bug is O(1e-1+); flag any real divergence loudly.
-    assert_eq!(d_a, 0.0, "Q{bits} convert-then-load route not bit-exact");
-    assert_eq!(d_b, 0.0, "Q{bits} consume-prequantized route not bit-exact");
+    // vs-golden: TIGHT ULP tolerance. Under MLX 0.32.0 `quantized_matmul`'s f32 output is
+    // NAX-path-dependent — the self-hosted NAX (dt26.2) path and the hosted non-NAX (dt15.0, CI)
+    // path differ ~1–2 ULP. The committed golden is the non-NAX (CI) value, so CI reproduces it
+    // ~exactly while this NAX runner sits one drift (≤2 ULP rel) away; both stay under the bound.
+    // A predicate/scale/transpose bug is O(1e-1) — orders above this floor — so it is still caught.
+    assert!(
+        rel_a <= MOCHI_QUANT_GOLDEN_ULP_TOL,
+        "Q{bits} convert-then-load route rel {rel_a:.3e} exceeds vs-golden tol \
+         {MOCHI_QUANT_GOLDEN_ULP_TOL:.3e} (NAX/non-NAX drift is ≤2 ULP; this is larger)"
+    );
+    assert!(
+        rel_b <= MOCHI_QUANT_GOLDEN_ULP_TOL,
+        "Q{bits} consume-prequantized route rel {rel_b:.3e} exceeds vs-golden tol \
+         {MOCHI_QUANT_GOLDEN_ULP_TOL:.3e} (NAX/non-NAX drift is ≤2 ULP; this is larger)"
+    );
+    // routes-agree: BIT-EXACT. Both routes run the same `quantized_matmul` on the same platform
+    // off byte-identical packs — they must be bit-for-bit identical everywhere. The real packing/
+    // scale/transpose tripwire; stays asserted exact on NAX and non-NAX alike.
     assert_eq!(
         max_abs_diff(&y_a, &y_b),
         0.0,

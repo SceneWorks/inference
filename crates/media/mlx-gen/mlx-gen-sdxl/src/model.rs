@@ -257,7 +257,9 @@ impl SdxlHeavyOwned {
 /// **Dtype:** the U-Net + both CLIP text encoders run **fp16**, matching the production reference
 /// (`StableDiffusionXL(float16=True)`); the **VAE stays f32** (the vendored always loads the
 /// autoencoder f32 — the SDXL VAE is fp16-unstable). The whole fp16 path is byte-identical to the
-/// reference on MLX 0.31.2 (sc-2721; needs sc-2772's NAX 16-bit fix + the compiled `gelu_exact`).
+/// reference at the matched MLX — now 0.32.0 (epic 12742; re-confirm/re-dump the fp16 golden on the
+/// 0.32.0 env, sc-12747). Established on 0.31.2 by sc-2721 (needs sc-2772's NAX 16-bit fix + the
+/// compiled `gelu_exact`); fp16 is bit-identical across the 0.31.2→0.32.0 bump (the drift is f32-only).
 /// The lower-level `load_unet`/`load_text_encoder_*` keep an f32 path for the tight stage gates.
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     if spec.precision != Precision::Bf16 {

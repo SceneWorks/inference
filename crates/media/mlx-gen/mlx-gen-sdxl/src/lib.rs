@@ -160,8 +160,21 @@ mod sc2963 {
             super::set_compile_glue(false);
             assert_eq!(compiled.dtype(), dt, "silu_glue preserves dtype {dt:?}");
             let d = max_abs(&compiled, &eager);
-            println!("[sdxl silu {dt:?}] max|Δ|={d:.3e}");
-            assert_eq!(d, 0.0, "SDXL compiled SiLU diverged from eager in {dt:?}");
+            let rel = mlx_gen::nn::max_rel_diff(&compiled, &eager);
+            println!("[sdxl silu {dt:?}] max|Δ|={d:.3e} rel|Δ|={rel:.3e}");
+            // sc-12747: under MLX 0.32.0 the compiled SiLU rounds ~1 ULP-f32 differently from eager
+            // (0-ULP on the prior 0.31.2 pin); fp16 (the precision-load-bearing UNet dtype whose
+            // golden matches eager SiLU) stays bit-identical. f32 takes the shared re-baselined
+            // tolerance; fp16 stays exact.
+            let tol = if dt == Dtype::Float32 {
+                mlx_gen::nn::COMPILED_GLUE_F32_ULP_TOL
+            } else {
+                0.0
+            };
+            assert!(
+                rel <= tol,
+                "SDXL compiled SiLU diverged from eager in {dt:?}: rel|Δ|={rel:e} exceeds {tol:e}"
+            );
         }
     }
 }
