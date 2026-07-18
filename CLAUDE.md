@@ -21,8 +21,8 @@ exclusive platform targets, not additive features. Build/test per platform lane 
 cargo test --locked -p core-llm -p core-llm-testkit -p sceneworks-gen-core -p sceneworks-gen-core-testkit
 
 # Candle CPU lane (Linux/any)
-cargo clippy --locked -p candle-llm -p 'candle-gen*' -p runtime-cpu --all-targets -- -D warnings
-cargo test --locked --lib -j 1 -p candle-llm -p 'candle-gen*' -p runtime-cpu   # -j 1 avoids lld OOM
+cargo clippy --locked -p candle-llm -p 'candle-gen*' -p 'candle-audio*' -p runtime-cpu --all-targets -- -D warnings
+cargo test --locked --lib -j 1 -p candle-llm -p 'candle-gen*' -p 'candle-audio*' -p runtime-cpu   # -j 1 avoids lld OOM
 cargo test --locked -j 1 -p candle-llm --test conformance
 
 # MLX + Candle Metal lane (macOS only)
@@ -30,11 +30,13 @@ cargo test --locked --lib --tests -p mlx-llm -p mlx-llm-server -p mlx-gen -p 'ml
 
 # Candle CUDA lane (Windows self-hosted; needs vcvars64 + CUDA_COMPUTE_CAP)
 # CUDA 12.9's nvcc rejects MSVC 14.51+ — use the VS2022 BuildTools vcvars64, not a VS18 one.
-cargo clippy --locked -p candle-llm -p 'candle-gen*' -p runtime-cuda --all-targets --features cuda -- -D warnings
-cargo test --locked --lib --tests -p candle-llm -p 'candle-gen*' -p runtime-cuda --features cuda
+cargo clippy --locked -p candle-llm -p 'candle-gen*' -p 'candle-audio*' -p runtime-cuda --all-targets --features cuda -- -D warnings
+cargo test --locked --lib --tests -p candle-llm -p 'candle-gen*' -p 'candle-audio*' -p runtime-cuda --features cuda
 
 # LLM-only composition profile of any bundle (no media provider graph compiled)
 cargo test --locked --no-default-features --lib -p runtime-cpu   # or runtime-macos / runtime-cuda
+# LLM + Candle audio lane, no media graph (the sc-12835 additive `audio` feature)
+cargo test --locked --no-default-features --features audio --lib -p runtime-cpu
 ```
 
 Run a **single test**: `cargo test --locked -p <crate> <test_name>`
@@ -76,8 +78,13 @@ backend-neutral contracts  →  MLX/Candle engines  →  provider-family crates
 - `crates/llm/` — `mlx-llm` (+ `server`) and `candle-llm` engines.
 - `crates/media/` — `mlx-gen` / `candle-gen` engines and provider families, plus the
   `mlx-gen-catalog` / `candle-gen-catalog` composition roots.
+- `crates/audio/` — the Candle-native audio family (`candle-audio` commons + the
+  `candle-audio-catalog` composition root). Candle on **every** platform — on `runtime-macos` it
+  rides the catalog's dedicated audio lane beside the mlx media graph, the one sanctioned
+  cross-backend seam (`docs/architecture/audio-backend-strategy.md`).
 - `crates/bundles/` — `runtime-macos`, `runtime-cuda`, `runtime-cpu` (each assembles one media +
-  one LLM + one snapshot-preparer registry) validated by `runtime-catalog`.
+  one LLM + one snapshot-preparer registry, plus the candle audio lane) validated by
+  `runtime-catalog`.
 
 **Provider registration is explicit, not linker-discovered.** There is deliberately no
 process-global provider state. Provider crates publish named registration constants; family crates
@@ -88,9 +95,11 @@ reintroduce `inventory` submissions or `force_link` anchors** as a shortcut. Add
 export its registration → add its family to the right platform catalog → update that catalog's
 ordered surface test.
 
-Bundles carry a `default = ["media"]` feature. SceneWorks consumes the full bundle; LLM-only
-products (ChatWorks) build with `--no-default-features` to get the same explicit LLM/preparer catalog
-without the media graph. Both consume a **named `runtime-*` bundle**, never assembled backend crates.
+Bundles carry a `default = ["media", "audio"]` feature set. SceneWorks consumes the full bundle;
+LLM-only products (ChatWorks) build with `--no-default-features` to get the same explicit
+LLM/preparer catalog without the media graph, optionally adding `--features audio` for the Candle
+audio lane without the image/video graph. Both consume a **named `runtime-*` bundle**, never
+assembled backend crates.
 
 ## Compatibility boundaries (treat as breaking changes)
 

@@ -151,6 +151,17 @@ def select_lanes(paths: Iterable[str], force_all: bool = False) -> dict[str, boo
             )
             continue
 
+        # The Candle audio family (sc-12835) is candle-classified: it builds and runs on the
+        # CPU, macOS (candle audio rides every bundle incl. mlx), and CUDA lanes.
+        if _under(path, "crates/audio"):
+            lanes.update(
+                candle_cpu=True,
+                macos_metal=True,
+                windows_cuda=True,
+                real_weights=True,
+            )
+            continue
+
         if _under(path, "crates/llm/mlx-llm") or _under(path, "crates/media/mlx-gen"):
             lanes.update(macos_metal=True, real_weights=True)
             continue

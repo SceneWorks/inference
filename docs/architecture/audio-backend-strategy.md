@@ -99,12 +99,34 @@ Evidence gathered for this decision:
 | `runtime-macos` | `mlx`         | `candle`           | Candle audio catalog in the dedicated audio section        |
 | `runtime-cuda`  | `candle`      | `candle`           | Same audio catalog, CUDA device selection per provider     |
 | `runtime-cpu`   | `candle`      | `candle`           | Same audio catalog, CPU device                             |
-| LLM-only profile (`--no-default-features`) | per bundle | *none* | Audio is part of the media composition profile |
+| LLM-only profile (`--no-default-features`) | per bundle | *none* | Audio is its own additive `audio` bundle feature (see the sc-12835 note below) |
 
 Every bundle gets the **same** audio provider surface from one composition root
 — platform differences (device selection, quant tiers) stay inside providers or
 are pinned explicitly in bundle surface tests, exactly like the existing NVFP4
 difference.
+
+### Feature wiring (decided in sc-12835)
+
+Audio ships as a **separate additive `audio` bundle feature**, not inside the
+bundles' `media` feature. Every bundle defaults to `["media", "audio"]` (the
+complete SceneWorks composition is unchanged), and the profiles compose:
+
+| Build                                              | Composition                             |
+| -------------------------------------------------- | --------------------------------------- |
+| default                                            | media + LLM + audio lane                |
+| `--no-default-features`                            | LLM-only (no media, no audio lane)      |
+| `--no-default-features --features audio`           | LLM + audio lane (no media graph)       |
+| `--no-default-features --features media`           | media + LLM (no audio lane)             |
+
+Rationale: the audio lane is composed through its own catalog
+(`candle-audio-catalog`) and its own `RuntimeCatalog` section, so nothing forces
+it to ride the media flag — and an LLM-only product (ChatWorks) plausibly wants
+TTS without compiling the image/video provider graph. Folding audio into
+`media` would have made that composition impossible without a breaking feature
+split later; a separate additive feature costs one `cfg` seam per bundle now.
+On `runtime-macos` the `audio` feature also pulls in `candle-llm` for the
+lane's snapshot preparer (see Consequences below).
 
 ## Rejected alternatives
 
@@ -142,8 +164,8 @@ first WAV (Kokoro's Candle precedent exists) with none of the debt.
 
 ## Consequences and accepted tradeoffs
 
-- `runtime-macos` (with default `media` feature) will additionally compile the
-  Candle audio provider graph once sc-12835 lands. Candle CPU compiles cleanly
+- `runtime-macos` (with the default `audio` feature) additionally compiles the
+  Candle audio provider graph since sc-12835. Candle CPU compiles cleanly
   on `aarch64-apple-darwin` (it is already a supported `runtime-cpu` triple);
   binary-size and build-time cost is accepted for one shipped audio surface.
 - The "one backend per bundle" invariant is refined to "one backend **per
@@ -153,13 +175,20 @@ first WAV (Kokoro's Candle precedent exists) with none of the debt.
 - `RuntimeCatalogSnapshot` gains two additive fields (`audio_backend`,
   `audio_generator_ids`); existing serialized fields are unchanged
   (CONTRIBUTING: serialized compatibility surface, additive only).
-- Snapshot preparation for audio weights reuses the Candle preparer path; on
-  `runtime-macos` the preparer registry is mlx-only today, so audio snapshot
-  preparation on macOS is an explicit integration point for sc-12835 (the
-  Candle preparer is in-repo; carrying it in the mac bundle mirrors the audio
-  section decision).
+- Snapshot preparation for audio weights reuses the Candle preparer path; the
+  main preparer registry stays single-backend, so the audio lane carries its
+  **own** preparer registry (`AudioLane::preparers`, sc-12835) — the candle
+  preparer on every bundle. On `runtime-macos` this is what makes candle audio
+  snapshots preparable at all (the `audio` feature pulls in `candle-llm` for
+  it); on the candle bundles it mirrors the main registry, so a consumer
+  prepares audio snapshots through `catalog.audio_preparers()` identically
+  everywhere.
 
 ## Recommendation for sc-12835 (audio lane scaffold)
+
+> Landed: items 1–3 shipped in sc-12835 (`crates/audio/`, the per-bundle
+> `audio_lane()` under the additive `audio` feature, and the tightened
+> `validate_audio` modality rules). Item 4 is the sc-12836 scope.
 
 Build the Candle audio lane as a sibling of the existing media families:
 

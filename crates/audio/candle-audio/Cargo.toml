@@ -1,0 +1,39 @@
+[package]
+name = "candle-audio"
+version = "0.0.0"
+edition = "2021"
+description = "Shared candle audio commons for SceneWorks audio-generation providers — device seam, pinned hf-hub weight resolution, STFT/mel/iSTFT DSP, and WAV encoding over the gen-core audio contract."
+license = "Apache-2.0"
+repository = "https://github.com/SceneWorks/inference"
+keywords = ["candle", "audio", "tts", "inference"]
+categories = ["science"]
+
+[dependencies]
+# The backend-neutral contract (audio surface landed in sc-12834: `Modality::Audio`,
+# `GenerationOutput::Audio(AudioTrack)`, `AudioParams`, `Capabilities::validate_request_audio`).
+# The root workspace path keeps every provider family on one contract package and type identity.
+sceneworks-gen-core = { workspace = true }
+# The candle tensor backend — the audio lane is Candle-native on every platform
+# (docs/architecture/audio-backend-strategy.md). Same workspace pin the candle-gen and candle-llm
+# families use, so the whole on-device stack resolves ONE candle build. CPU by default; the
+# `metal` / `cuda` features select a GPU backend per platform.
+candle-core = { workspace = true }
+# Error plumbing for the engine surface (mirrors candle-gen's CandleError seam).
+thiserror = { workspace = true }
+# Pinned-revision runtime weight fetch (F-029 discipline — see `hub`). Same workspace pin the
+# candle-gen-sdxl tokenizer fetch uses.
+hf-hub = { workspace = true }
+
+[features]
+# Default works with NO extra features: candle-core defaults to the CPU backend (builds anywhere),
+# and the walking-skeleton audio models synthesize in real time on CPU (audio-backend-strategy.md).
+default = []
+# Test-support helpers (HF-cache snapshot resolution, mirroring candle-gen's testkit / the sc-9057
+# F-071 `$HF_HOME` fix). Test-only — provider crates enable it under `[dev-dependencies]` so it
+# never compiles into a production build.
+testkit = []
+# Apple Metal GPU backend — a per-model implementation option on runtime-macos (the audio lane
+# ships Candle-CPU there today; see audio-backend-strategy.md). NOT in `default`.
+metal = ["candle-core/metal"]
+# NVIDIA CUDA backend (the Windows target). MUST NOT be in `default` — it needs the CUDA toolkit.
+cuda = ["candle-core/cuda"]

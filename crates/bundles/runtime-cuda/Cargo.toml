@@ -9,11 +9,16 @@ repository = "https://github.com/SceneWorks/inference"
 [dependencies]
 runtime-catalog = { workspace = true }
 candle-gen-catalog = { workspace = true, features = ["cuda"], optional = true }
+candle-audio-catalog = { workspace = true, features = ["cuda"], optional = true }
 candle-llm = { workspace = true, features = ["cuda"] }
 
 [features]
-default = ["media"]
+default = ["media", "audio"]
 # SceneWorks consumes the complete bundle. LLM-only products can disable default features while
 # retaining the explicitly composed CUDA LLM catalog.
 media = ["dep:candle-gen-catalog"]
+# The Candle audio lane (sc-12835, docs/architecture/audio-backend-strategy.md). A separate
+# additive feature — NOT folded into `media` — so an LLM-only product (ChatWorks) can compose
+# text + TTS via `--no-default-features --features audio` without the image/video provider graph.
+audio = ["dep:candle-audio-catalog"]
 flash-attn = ["candle-llm/flash-attn"]

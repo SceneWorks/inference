@@ -183,6 +183,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
+name = "candle-audio"
+version = "0.0.0"
+dependencies = [
+ "candle-core",
+ "hf-hub",
+ "sceneworks-gen-core",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "candle-audio-catalog"
+version = "0.0.0"
+dependencies = [
+ "candle-audio",
+]
+
+[[package]]
 name = "candle-core"
 version = "0.10.2"
 source = "git+https://github.com/huggingface/candle?rev=1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d#1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d"
@@ -3438,6 +3455,7 @@ dependencies = [
 name = "runtime-cpu"
 version = "0.0.0"
 dependencies = [
+ "candle-audio-catalog",
  "candle-gen-catalog",
  "candle-llm",
  "runtime-catalog",
@@ -3447,6 +3465,7 @@ dependencies = [
 name = "runtime-cuda"
 version = "0.0.0"
 dependencies = [
+ "candle-audio-catalog",
  "candle-gen-catalog",
  "candle-llm",
  "runtime-catalog",
@@ -3456,6 +3475,8 @@ dependencies = [
 name = "runtime-macos"
 version = "0.0.0"
 dependencies = [
+ "candle-audio-catalog",
+ "candle-llm",
  "mlx-gen-catalog",
  "mlx-llm",
  "runtime-catalog",
