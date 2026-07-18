@@ -20,7 +20,7 @@ use std::sync::Mutex;
 
 use candle_gen::candle_core::{DType, Result, Tensor};
 use candle_gen::candle_nn::VarBuilder;
-use candle_gen::gen_core::tiling::{TileCandidates, TilingConfig, VaeTiling};
+use candle_gen::gen_core::tiling::{SpatialTiling, TileCandidates, TilingConfig, VaeTiling};
 use candle_gen::vae_tiling;
 
 use crate::config::{Vae16Config, LATENTS16_MEAN, LATENTS16_STD};
@@ -457,10 +457,12 @@ impl WanVae16 {
     /// **Free-aware budgeted** decode (sc-12758): derive the decoded output dims from the z16 latent
     /// geometry (×8 spatial, ×4 **causal** temporal ⇒ `out_f = 1 + (T_lat−1)·4`), pick a budgeted
     /// **spatial** tiling via [`auto_tiling_budgeted_wan_z16`] (which budgets against **FREE** VRAM, the
-    /// sc-12734 resolver), and run [`decode_tiled`](Self::decode_tiled) — or the streaming
-    /// [`decode`](Self::decode) when a single high-res frame already fits the budget (behavior-identical
-    /// to plain `decode` when the budget is ample). An over-budget decode returns a **catchable** error
-    /// here instead of OOM-ing the worker. The z16 analogue of the z48
+    /// sc-12734 resolver, and additionally forces tiling below the candle conv2d im2col-safe cap
+    /// `WAN_Z16_VAE_IM2COL_SAFE_PX`), and run [`decode_tiled`](Self::decode_tiled) — or the streaming
+    /// [`decode`](Self::decode) only when a single high-res frame both fits the budget **and** stays
+    /// under the im2col cap (so a hi-res / low-frame-count decode on a large-VRAM card still tiles rather
+    /// than silently corrupting). An over-budget decode returns a **catchable** error here instead of
+    /// OOM-ing the worker. The z16 analogue of the z48
     /// [`WanVae::decode_budgeted`](crate::vae::WanVae::decode_budgeted).
     pub fn decode_budgeted(&self, z: &Tensor) -> Result<Tensor> {
         let (_b, _c, f, h, w) = z.dims5()?;
@@ -609,10 +611,75 @@ const WAN_Z16_VAE_FRAME_BYTES_PER_OUT_PX: f64 = 64_000.0;
 /// Candidate spatial tile sizes (output px, multiples of the z16 ×8 scale, overlap 64). Coarser at the
 /// top (fewer tiles = faster) down to a 192 px floor (past which per-tile decoder overhead amortizes
 /// worse — the speed cliff). All are multiples of 8.
-const WAN_Z16_VAE_SPATIAL_PX: [i32; 8] = [768, 640, 512, 448, 384, 320, 256, 192];
+///
+/// **Capped at 512** (sc-12758): 512 is the largest tile this PR GPU-validated clean (parity at 448 &
+/// 256) — the earlier 768 (≈2.04e9 B im2col) / 640 (≈1.42e9 B) entries were never GPU-validated and sit
+/// near candle's conv2d im2col-overflow band ([`WAN_Z16_VAE_IM2COL_SAFE_PX`]), so they are removed. The
+/// selector now only ever picks a GPU-validated-clean tile.
+const WAN_Z16_VAE_SPATIAL_PX: [i32; 6] = [512, 448, 384, 320, 256, 192];
+/// Spatial tile overlap (output px) stamped onto whichever tile the selector / im2col cap picks.
+const WAN_Z16_VAE_SPATIAL_OVERLAP_PX: i32 = 64;
 /// **No temporal candidates** — the candle z16 decode is already temporally streaming-bounded, so the
 /// budgeted selector only ever tiles the spatial axes (see the module note above).
 const WAN_Z16_VAE_TEMPORAL_FR: [(i32, i32); 0] = [];
+
+/// candle **conv2d im2col spatial cap** (output px per side) — a *correctness* bound the VRAM budget
+/// and the MLX `i32` write bound both miss (sc-12758 / sc-12773). candle's CUDA `conv2d` unrolls each
+/// decoded frame into an im2col buffer of `out_h·out_w·C·kH·kW` elements; the z16 decoder's widest
+/// full-res stage is 96-ch 3×3, so a single frame's im2col is `out_h·out_w·96·9`. Past a few hundred
+/// million elements that buffer **silently corrupts** (the same class the repo's `IM2COL_BUDGET`
+/// 128M-elem `chunked_conv2d` splitter in `candle-gen-seedvr2` guards; sc-10023 / sc-11744). Reviewer
+/// GPU data on this z16 decoder: 640² per frame (≈1.42e9 B ⇒ 3.5e8 elems) is CLEAN,
+/// 1280×720 (≈3.18e9 B ⇒ 8.0e8 elems) CORRUPTS.
+///
+/// This bound is **independent of frame count and of how much VRAM is free** — it is purely
+/// per-decoded-frame spatial. The MLX write bound gen-core's `budgeted_plan` enforces
+/// ([`VaeTiling::writable_frame_cap`], `i32::MAX` total elems) does NOT fire for candle (that doc calls
+/// it MLX-only), so on a large-VRAM card a hi-res / low-frame-count decode (e.g. 1280×720 / 17f, whose
+/// 24-frame write cap and ample budget both admit single-pass) would otherwise fall through to the
+/// plain untiled [`WanVae16::decode`] and corrupt. Forcing every decoded tile ≤ this cap closes that
+/// path at any frame count / budget. 512 is GPU-validated clean here and conservative vs the 640² the
+/// reviewer measured clean; `512²·96·9 = 2.26e8` elems sits well under the corruption band.
+const WAN_Z16_VAE_IM2COL_SAFE_PX: i32 = 512;
+
+/// Clamp a budgeted plan so **every** decoded tile's per-frame spatial extent stays ≤
+/// [`WAN_Z16_VAE_IM2COL_SAFE_PX`] — the candle conv2d im2col-safe cap that neither the VRAM budget nor
+/// the MLX write bound can see (sc-12758). The effective spatial tile is `min(VRAM-budget tile,
+/// im2col-safe tile)`:
+///  - output already ≤ cap on both sides ⇒ per-frame im2col is safe, keep the budget's decision
+///    verbatim (including a single-pass `None`);
+///  - output over the cap on either side ⇒ a full-frame (or over-cap) decode would corrupt, so force a
+///    spatial tile ≤ cap: override a single-pass `None` to the cap tile, or shrink an already-tiled
+///    plan's spatial tile to the cap (never enlarge). A forced cap tile always fits a budget that
+///    admitted single-pass — the streaming cost model is monotonic in tile area, so a smaller tile can
+///    only lower the peak.
+fn cap_spatial_for_im2col(
+    plan: Option<TilingConfig>,
+    out_h: i32,
+    out_w: i32,
+) -> Option<TilingConfig> {
+    let cap = WAN_Z16_VAE_IM2COL_SAFE_PX;
+    if out_h <= cap && out_w <= cap {
+        return plan; // per-frame extent already im2col-safe — the budget's decision stands
+    }
+    let capped_tile = |tile_px: Option<i32>| SpatialTiling {
+        tile_px: tile_px.map_or(cap, |t| t.min(cap)),
+        overlap_px: WAN_Z16_VAE_SPATIAL_OVERLAP_PX,
+    };
+    Some(match plan {
+        // Budget said single-pass fits, but a full 1280×720-class frame would overflow candle's im2col
+        // and corrupt — force the largest im2col-safe spatial tile (temporal already streams).
+        None => TilingConfig {
+            spatial: Some(capped_tile(None)),
+            temporal: None,
+        },
+        // Budget already tiles; clamp its spatial tile down to the im2col cap (preserving any temporal).
+        Some(cfg) => TilingConfig {
+            spatial: Some(capped_tile(cfg.spatial.map(|s| s.tile_px))),
+            temporal: cfg.temporal,
+        },
+    })
+}
 
 /// Estimated concurrent VRAM peak (GiB) of the streaming z16 decode while assembling an `out_*` video,
 /// the largest spatial tile spanning `tile_h·tile_w` output px. `ACCUM·out_voxels` is the unavoidable
@@ -648,9 +715,11 @@ pub fn wan_z16_vae_safe_budget_gib() -> f64 {
 }
 
 /// **Memory-budgeted** spatial tiling for the z16 decode — routes the shared `budgeted_plan` selector
-/// through the z16 cost model. Caller passes the **output** dims. `Ok(None)` → a single high-res frame
-/// already fits (streaming single-pass); `Ok(Some)` → the largest spatial tile that fits; `Err` → a
-/// catchable over-budget signal returned before the decode (not an OOM).
+/// through the z16 cost model, then clamps the result to the candle im2col-safe spatial cap
+/// (`cap_spatial_for_im2col`). Caller passes the **output** dims. `Ok(None)` → a single high-res frame
+/// both fits the budget **and** is under the im2col cap (streaming single-pass); `Ok(Some)` → the largest
+/// spatial tile that fits and is im2col-safe; `Err` → a catchable over-budget signal returned before the
+/// decode (not an OOM).
 pub fn auto_tiling_budgeted_wan_z16(
     height: i32,
     width: i32,
@@ -670,10 +739,10 @@ fn plan_wan_z16_tiling(
 ) -> Result<Option<TilingConfig>> {
     let candidates = TileCandidates {
         spatial_px: &WAN_Z16_VAE_SPATIAL_PX,
-        spatial_overlap_px: 64,
+        spatial_overlap_px: WAN_Z16_VAE_SPATIAL_OVERLAP_PX,
         temporal: &WAN_Z16_VAE_TEMPORAL_FR,
     };
-    vae_tiling::plan_tiling(
+    let budget_plan = vae_tiling::plan_tiling(
         "wan z16 vae decode",
         WAN_Z16,
         height,
@@ -682,7 +751,11 @@ fn plan_wan_z16_tiling(
         safe_gib,
         candidates,
         estimated_wan_z16_decode_peak_gib,
-    )
+    )?;
+    // The VRAM budget (and the MLX write bound gen-core enforces) can OK a single-pass / over-cap tile
+    // that overflows candle's conv2d im2col and silently corrupts — bound every decoded tile to the
+    // im2col-safe spatial cap on top of the budget decision (sc-12758 / sc-12773).
+    Ok(cap_spatial_for_im2col(budget_plan, height, width))
 }
 
 #[cfg(test)]
@@ -693,6 +766,61 @@ mod budget_tests {
     fn wan_z16_tiling_single_pass_when_small() {
         // A short, low-res clip fits a single streaming decode → no tiling.
         assert!(plan_wan_z16_tiling(256, 256, 25, 60.0).unwrap().is_none());
+    }
+
+    #[test]
+    fn wan_z16_im2col_cap_forces_tiling_at_low_frame_count() {
+        // sc-12758 BLOCKER: a 1280×720 render with a LOW frame count on a LARGE-VRAM card. The MLX
+        // write bound admits single-pass (24-frame cap ≥ these frame counts) and the budget is ample,
+        // so the pure memory/write-bound selector returns `None` → the plain untiled `decode` → candle
+        // conv2d im2col corruption (sc-12773). The im2col spatial cap must force a TILED plan for EVERY
+        // frame count, independent of the (here effectively infinite) budget.
+        for frames in [5, 9, 13, 17, 21] {
+            let cfg = plan_wan_z16_tiling(720, 1280, frames, 1_000_000.0)
+                .unwrap()
+                .unwrap_or_else(|| {
+                    panic!("1280×720/{frames}f must tile under the im2col cap, not take single-pass")
+                });
+            let s = cfg.spatial.expect("the im2col cap must tile the spatial axis");
+            assert!(
+                s.tile_px <= WAN_Z16_VAE_IM2COL_SAFE_PX,
+                "chosen tile {} exceeds the im2col-safe cap {}",
+                s.tile_px,
+                WAN_Z16_VAE_IM2COL_SAFE_PX
+            );
+            assert!(
+                cfg.temporal.is_none(),
+                "temporal axis streams — the cap only tiles the spatial axes"
+            );
+        }
+    }
+
+    #[test]
+    fn wan_z16_im2col_cap_keeps_single_pass_below_cap() {
+        // At/under the cap on both sides the per-frame im2col is safe (512² is GPU-validated clean), so
+        // an ample budget still returns a single-pass `None` — the cap must not tile needlessly.
+        assert!(plan_wan_z16_tiling(512, 512, 17, 1_000_000.0)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn cap_spatial_for_im2col_forces_and_clamps() {
+        let cap = WAN_Z16_VAE_IM2COL_SAFE_PX;
+        // Below the cap on both sides: the budget decision (incl. a single-pass `None`) is kept verbatim.
+        assert!(cap_spatial_for_im2col(None, cap, cap).is_none());
+        // Over the cap: a single-pass `None` is forced to a cap-sized spatial tile; temporal still streams.
+        let forced = cap_spatial_for_im2col(None, 720, 1280).expect("over-cap None must force a tile");
+        assert_eq!(forced.spatial.expect("forced spatial tile").tile_px, cap);
+        assert!(forced.temporal.is_none());
+        // Over the cap: an already-tiled plan's spatial tile is clamped DOWN to the cap, never enlarged.
+        let over = TilingConfig::spatial_only(cap + 256, WAN_Z16_VAE_SPATIAL_OVERLAP_PX);
+        let clamped = cap_spatial_for_im2col(Some(over), 720, 1280).unwrap();
+        assert_eq!(clamped.spatial.expect("clamped spatial tile").tile_px, cap);
+        // A smaller-than-cap tile is left as-is (min, not overwrite).
+        let small = TilingConfig::spatial_only(256, WAN_Z16_VAE_SPATIAL_OVERLAP_PX);
+        let kept = cap_spatial_for_im2col(Some(small), 720, 1280).unwrap();
+        assert_eq!(kept.spatial.expect("kept spatial tile").tile_px, 256);
     }
 
     #[test]
