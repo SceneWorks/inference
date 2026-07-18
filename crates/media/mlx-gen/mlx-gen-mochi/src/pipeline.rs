@@ -25,10 +25,11 @@ fn scalar(v: f32) -> Array {
 }
 
 /// Force a logically-contiguous copy: host reads (`as_slice`) return the *physical* buffer, so an
-/// array left strided by the `(F,H,W,C)` transpose reads scrambled (mirrors LTX `to_uint8_frames`).
+/// array left strided by the `(F,H,W,C)` transpose reads scrambled. sc-12748: delegates to the shared
+/// int64-safe [`mlx_gen::array::contiguous`] (Mochi's RGB output stays under `i32::MAX` at its 848×480
+/// design point, but this keeps every video model on one materialization helper).
 fn contiguous(x: &Array) -> Result<Array> {
-    let shape = x.shape().to_vec();
-    Ok(x.reshape(&[-1])?.reshape(&shape)?)
+    mlx_gen::array::contiguous(x)
 }
 
 /// N-step 1st-order FlowMatchEuler **true-CFG** denoise (Mochi is not distilled).

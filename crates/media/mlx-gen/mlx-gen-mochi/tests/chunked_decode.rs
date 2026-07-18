@@ -376,31 +376,41 @@ fn an_over_large_chunk_is_clamped_not_honored() {
     );
 }
 
-/// A single-shot decode whose intermediates would cross the element ceiling must return an actionable
-/// error rather than silently-wrong pixels.
+/// sc-12748: a single-shot decode whose intermediates cross the element ceiling now **renders** (the
+/// sc-12291/sc-12349 refusal is retired — the over-bound write is `block_out`'s conv3d, int64-safe on
+/// MLX 0.32.0 via #3524) and equals the below-bound chunked reference exactly. The synthetic-weight
+/// companion to the real-weights `decode_memory_real_weights::untiled_matches_chunked_past_the_bound` —
+/// proving the lift is weight-independent. `#[ignore]`d: crossing the bound inherently allocates a
+/// ~2.6e9-element (~10 GiB) intermediate, too heavy for the default lane.
 #[test]
-fn single_shot_decode_refuses_over_the_element_ceiling() {
+#[ignore = "sc-12748 heavy over-bound single-shot decode (~10 GiB); run with --ignored on Metal"]
+fn single_shot_decode_renders_over_the_element_ceiling() {
     let (_cfg, dec) = real_geometry_decoder();
     // Just over the bound, not far over: 26 latent frames at 90² latent is ~2.6e9 elements for this
-    // 32-wide decoder. The guard is shape-only and fires before any compute, so keep the allocation
-    // small — a CI runner has to hold this.
+    // 32-wide decoder — the exact geometry the guard used to refuse shape-only, now decoded through.
     let latent = rnd(&[1, 12, 26, 90, 90], 1);
     assert!(
         dec.max_safe_chunk_frames(90, 90) < 26,
-        "test precondition: 26 latent frames at 90² must be over the bound"
+        "test precondition: 26 latent frames at 90² must be over the (now-memory-only) chunk cap"
     );
-    match dec.decode_denormalized(&latent) {
-        Err(mlx_gen::Error::Msg(m)) => {
-            assert!(
-                m.contains("ceiling") && m.contains("chunk"),
-                "the error must name the ceiling and point at chunking, got: {m}"
-            );
-        }
-        Err(e) => panic!("expected an element-ceiling Msg error, got {e}"),
-        Ok(_) => panic!(
-            "a decode over the element ceiling must error — MLX returns wrong pixels without one"
-        ),
-    }
+    // Renders instead of refusing.
+    let single = dec
+        .decode_denormalized(&latent)
+        .expect("a single-shot decode past the ceiling must now render, not refuse (sc-12748)");
+    let signal = max_abs(&single);
+    assert!(
+        signal.is_finite() && signal < 5.0,
+        "the over-bound decode must be a sane range (±{signal}), not corruption/garbage"
+    );
+    // Equals the below-bound chunked reference exactly (Mochi's chunked decode is numerically identical).
+    let chunked = dec
+        .decode_denormalized_chunked(&latent, 1, None)
+        .expect("chunked reference");
+    assert_eq!(
+        max_abs(&subtract(&single, &chunked).unwrap()),
+        0.0,
+        "the over-bound single-shot decode must equal the below-bound chunked reference exactly"
+    );
 }
 
 /// A pre-tripped cancel is honored before any chunk work (mirrors the LTX/Wan tiled-decode gates).

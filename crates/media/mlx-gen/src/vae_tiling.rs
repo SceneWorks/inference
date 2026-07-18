@@ -20,39 +20,34 @@ use crate::{CancelFlag, Error, Result};
 use mlx_rs::ops::{add, divide, maximum, multiply, pad};
 use mlx_rs::Array;
 
-/// Refuse — with a catchable error — a tiled decode whose **assembled full output** would exceed
-/// [`MAX_WRITABLE_ELEMS`]. `full_elems` is the element count of the `output` accumulator this decode
-/// must build (`batch × out_channels × out_f × out_h × out_w`); `out_*` are for the message.
+/// Refuse — with a catchable error — building an over-[`MAX_WRITABLE_ELEMS`] array **from a host
+/// buffer via `from_slice`** (the one write path still `i32`-capped on this pin). `full_elems` is the
+/// element count; `out_*` are for the message.
 ///
-/// Why refuse rather than tile smaller (sc-12438): no tiling shrinks the *full* output — every tile is
-/// `pad`-ed to it and added — and on the pinned MLX 0.31.2 an `output`/`pad` write past this bound
-/// silently returns wrong pixels (measured: `pad` at `128×42×480×848` corrupts from ~1.003× the bound;
-/// `conv3d` likewise, fixed upstream only for convolution by MLX PR #3524 in 0.32.0 — **`pad` still
-/// corrupts on 0.32.0**). The binding compounds it: `from_slice` and `reshape(-1)` compute the flat size
-/// in `i32` and overflow past the bound (MLX issue #3327), so an over-bound result cannot even be
-/// materialized or normalized. There is therefore no way to *produce* a correct output over the bound on
-/// this stack; a decode that would has to be refused up front, not tiled. The blend-weight accumulator
-/// (`batch × 1 × out_f × out_h × out_w`) is strictly smaller, so this single check covers both.
+/// **sc-12748 — this is now a narrow backstop, not the tiled-decode gate.** sc-12438 added this as an
+/// up-front refusal on MLX 0.31.2, where every way to *produce* an over-bound assembled output was
+/// broken: `pad` corrupted (~1.003× the bound), `conv3d` corrupted, and `from_slice`/`reshape(-1)`
+/// overflowed the flat `i32` size (MLX #3327). On this pin (0.32.0 fork `932beb4e` + the sc-12746
+/// copy-gate patch) all of those are fixed **except** `from_slice`: `mlx-gen/tests/mlx_write_bound_probe.rs`
+/// probe-verifies `pad`/`concat`/`conv3d`/`reshape(-1)`/`as_slice`/elementwise EXACT above `i32::MAX`, so
+/// the tiled `pad`-and-accumulate decode now renders past the bound (the refusal was lifted from
+/// [`tiled_decode`]). The residual is `mlx-rs`'s `Array::from_slice`, which still asserts
+/// `len == shape.product::<i32>()` (a fork-side bug) — so this guard is kept as **defense-in-depth** for
+/// any caller that would materialize an over-bound array directly from a host `Vec` (which the decode
+/// paths, reading back via `as_slice`, never do). The blend-weight accumulator is strictly smaller than
+/// the output, so a single check covers both.
 pub fn check_output_writable(full_elems: i64, out_f: i32, out_h: i32, out_w: i32) -> Result<()> {
     if full_elems > MAX_WRITABLE_ELEMS {
         return Err(Error::Msg(format!(
-            "vae tiled decode: the assembled {out_f}×{out_h}×{out_w} output is a {full_elems}-element \
-             buffer, over the {MAX_WRITABLE_ELEMS}-element ceiling above which MLX silently returns \
-             wrong pixels and the array cannot be materialized. No tiling shrinks the full output — \
-             reduce the resolution or frame count."
+            "vae output materialization: a {out_f}×{out_h}×{out_w} = {full_elems}-element buffer is \
+             over the {MAX_WRITABLE_ELEMS}-element ceiling above which mlx-rs `from_slice` overflows \
+             its i32 length assert. Read back via `as_slice` / tile the host build — do not `from_slice` \
+             the full buffer."
         )));
     }
     Ok(())
 }
 
-/// Force a logically-contiguous copy. mlx-rs host reads (`as_slice`) return the *physical* buffer, so
-/// an array left strided by a `transpose` is read scrambled; a reshape round-trip materializes logical
-/// order. Only needed at the host-read boundary (the public decode output) — internal mlx ops are
-/// stride-aware.
-fn contiguous(x: &Array) -> Result<Array> {
-    let shape = x.shape().to_vec();
-    Ok(x.reshape(&[-1])?.reshape(&shape)?)
-}
 
 /// Gather the contiguous range `[start, end)` along `axis` (mlx-rs has no slice op). Layout-agnostic.
 fn slice_axis(x: &Array, axis: i32, start: i32, end: i32) -> Result<Array> {
@@ -104,19 +99,16 @@ pub fn tiled_decode(
 
                 let ds = dec.shape();
 
-                // On the first tile, refuse before allocating if the full output accumulator (dec's
-                // non-tiled dims with the tiled axes at their full output extent) would cross the write
-                // bound — no tiling shrinks it, and past the bound the `pad`/`add` below silently
-                // corrupt (sc-12438). Catchable, so the caller errors instead of returning wrong pixels.
-                if output.is_none() {
-                    let mut full = ds.to_vec();
-                    full[t_ax as usize] = plan.out_f;
-                    full[h_ax as usize] = plan.out_h;
-                    full[w_ax as usize] = plan.out_w;
-                    let full_elems: i64 = full.iter().map(|&d| d as i64).product();
-                    check_output_writable(full_elems, plan.out_f, plan.out_h, plan.out_w)?;
-                }
-
+                // sc-12748: the sc-12438 over-bound REFUSAL is RETIRED here. This assembly builds the
+                // full output only with `pad` (+`add`/`divide`/`maximum`) and reads it back through
+                // `contiguous`'s `reshape` + `as_slice` — and every one of those ops is probe-verified
+                // int64-safe above `i32::MAX` on this pin (`mlx-gen/tests/mlx_write_bound_probe.rs`: pad
+                // & concat EXACT via the sc-12746 copy-gate patch; reshape(-1)/as_slice/elementwise all
+                // correct). So a tiled decode whose *assembled* output crosses the bound now RENDERS
+                // correctly instead of erroring (validated end-to-end vs a below-bound reference in
+                // `tiled_decode_renders_over_bound_output` and the LTX real-weights render). The
+                // `check_output_writable` backstop is kept for the one path still i32-capped — a
+                // `from_slice` host→Array materialization — which this loop never takes.
                 let at = ds[t_ax as usize].min(t.out_stop - t.out_start);
                 let ah = ds[h_ax as usize].min(hh.out_stop - hh.out_start);
                 let aw = ds[w_ax as usize].min(ww.out_stop - ww.out_start);
@@ -158,7 +150,9 @@ pub fn tiled_decode(
     let output = output.ok_or_else(|| Error::Msg("vae tiled decode: plan had no tiles".into()))?;
     let weights =
         weights.ok_or_else(|| Error::Msg("vae tiled decode: plan had no tiles".into()))?;
-    contiguous(&divide(&output, &maximum(&weights, scalar(1e-8))?)?)
+    // sc-12748: int64-safe contiguity (the assembled output can exceed i32::MAX — a single-dim
+    // reshape(-1) would raise; `array::contiguous` flattens via a 2-D split instead).
+    crate::array::contiguous(&divide(&output, &maximum(&weights, scalar(1e-8))?)?)
 }
 
 #[cfg(test)]
@@ -316,14 +310,27 @@ mod tests {
         assert!(check_output_writable(over, 441, 1280, 1280).is_err());
     }
 
-    /// sc-12438: a tiled decode whose assembled output would cross the write bound is REFUSED at the
-    /// first tile — before any full-size accumulator is allocated — with a catchable error, rather than
-    /// building a silently-corrupt `pad`-and-add accumulator. Drives the real loop with a tiny latent
-    /// but an over-bound output geometry (`out_h·out_w·3 > i32::MAX`) and an identity decode.
+    /// sc-12748: a tiled decode whose **assembled output crosses `i32::MAX`** now RENDERS (the sc-12438
+    /// refusal is retired) and reads back correctly — the payoff of this slice, on the shared loop. Drives
+    /// the real `pad`-and-accumulate + `contiguous`(`reshape(-1)`)+`as_slice` path with a tiny
+    /// position-dependent latent placed into an over-bound `out_h·out_w·3 > i32::MAX` output, and checks
+    /// the placed voxels (sub-bound offsets) hold the identity-decoded values while the rest is zero.
+    /// `#[ignore]`d — it allocates a ~2.19e9-element (8.7 GiB) output accumulator.
     #[test]
-    fn tiled_decode_refuses_over_bound_output() {
-        // Small NCTHW latent, channel axis 1, tiled axes [2,3,4]; a single tile per axis.
-        let denorm = Array::from_slice(&[0f32; 3 * 4 * 4], &[1, 3, 1, 4, 4]);
+    #[ignore = "sc-12748 heavy over-bound tiled-decode render (~12 GiB); run with --ignored on Metal"]
+    fn tiled_decode_renders_over_bound_output() {
+        const I32_MAX: i64 = i32::MAX as i64;
+        // Small NCTHW latent, channel axis 1, tiled axes [2,3,4]. Position-dependent so a scrambled
+        // read-back is caught: latent[0,c,0,h,w] = c*100 + h*10 + w (distinct over c,h,w ∈ 0..4).
+        let mut vals = vec![0f32; 3 * 4 * 4];
+        for c in 0..3 {
+            for h in 0..4 {
+                for w in 0..4 {
+                    vals[(c * 4 + h) * 4 + w] = (c * 100 + h * 10 + w) as f32;
+                }
+            }
+        }
+        let denorm = Array::from_slice(&vals, &[1, 3, 1, 4, 4]);
         let axis = |out_stop: i32| AxisTile {
             start: 0,
             end: 4,
@@ -331,8 +338,10 @@ mod tests {
             out_stop,
             mask: vec![1.0; out_stop as usize],
         };
-        // out_f=1, out_h=out_w=40_000 → 3·1·40000·40000 = 4.8e9 > i32::MAX. The h/w tiles slice the
-        // 4-wide latent; only the FULL output extent is over-bound.
+        // out_f=1, out_h=out_w=27_000 → 3·1·27000·27000 = 2.187e9 = 1.019× i32::MAX (in the probed band).
+        // The h/w tiles place the 4-wide identity-decoded tile at offset 0; the rest is zero-padded.
+        let out_hw = 27_000i32;
+        assert!(3 * (out_hw as i64) * (out_hw as i64) > I32_MAX, "geometry must cross the bound");
         let plan = TilePlan {
             t: vec![AxisTile {
                 start: 0,
@@ -341,18 +350,37 @@ mod tests {
                 out_stop: 1,
                 mask: vec![1.0; 1],
             }],
-            h: vec![axis(40_000)],
-            w: vec![axis(40_000)],
+            h: vec![axis(out_hw)],
+            w: vec![axis(out_hw)],
             out_f: 1,
-            out_h: 40_000,
-            out_w: 40_000,
+            out_h: out_hw,
+            out_w: out_hw,
         };
-        let res = tiled_decode(&denorm, &plan, [2, 3, 4], None, |tile| Ok(tile.clone()));
-        let err = res.expect_err("an over-bound output must be refused, not assembled");
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("over the") && msg.contains("ceiling"),
-            "refusal must explain the write-bound ceiling, got: {msg}"
-        );
+        // Must NOT refuse — it renders the over-bound accumulator.
+        let out = tiled_decode(&denorm, &plan, [2, 3, 4], None, |tile| Ok(tile.clone()))
+            .expect("over-bound tiled decode must render, not refuse (sc-12748)");
+        out.eval().unwrap();
+        assert_eq!(out.shape(), &[1, 3, 1, out_hw, out_hw]);
+        let flat = out.as_slice::<f32>();
+        assert_eq!(flat.len() as i64, 3 * out_hw as i64 * out_hw as i64);
+        // Placed region: [0,c,0,h,w] at flat ((c*out_hw + h)*out_hw + w) must equal the identity latent.
+        let at = |c: i64, h: i64, w: i64| flat[((c * out_hw as i64 + h) * out_hw as i64 + w) as usize];
+        for c in 0..3i64 {
+            for h in 0..4i64 {
+                for w in 0..4i64 {
+                    let want = (c * 100 + h * 10 + w) as f32;
+                    let got = at(c, h, w);
+                    assert!(
+                        (got - want).abs() < 1e-3,
+                        "over-bound read-back scrambled at (c={c},h={h},w={w}): got {got}, want {want}"
+                    );
+                }
+            }
+        }
+        // An above-2^31 flat offset (c=2 is beyond ~1.46e9; h=w=13000 → offset ≈ 1.81e9; and the very
+        // last element at ≈2.187e9) must read back as the zero pad, proving the >i32::MAX region is
+        // addressed correctly, not aliased onto the placed tile.
+        assert_eq!(at(2, 13_000, 13_000), 0.0, "over-bound zero-pad region must read 0");
+        assert_eq!(flat[(3 * out_hw as i64 * out_hw as i64 - 1) as usize], 0.0, "last (>2^31) elem");
     }
 }

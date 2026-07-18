@@ -16,44 +16,50 @@
 //!  - **Wan 2.1** ([`VaeTiling::WAN`]): spatial ×8, temporal ×4, **non-causal** (`out_f = f·4`) — the
 //!    temporal axis tiles exactly like a spatial axis.
 
-/// The largest tensor this MLX runtime can **produce** correctly, in elements: `i32::MAX`.
+/// The historical MLX over-bound write threshold, in elements: `i32::MAX`.
 ///
 /// **This is operation- and runtime-specific, not a universal "any tensor over 2^31 is wrong" law**
-/// (sc-12438 corrected the earlier universal framing). It is a conservative single bound that stands in
-/// for several distinct failures, all sharing the 2^31-element (`i32`) threshold, measured on this
-/// repo's pinned **MLX 0.31.2** (via `pmetal-mlx-rs 38e1cc17`) with position-dependent data compared
-/// only on sub-bound slices — at `128×D×480×848` (`D=41` → 2,136,145,920 = 0.995×; `D=42` →
-/// 2,188,247,040 = 1.019×):
+/// (sc-12438 corrected the earlier universal framing). It stood in for several distinct 0.31.2 failures
+/// sharing the 2^31-element (`i32`) threshold — but **sc-12748: on this repo's current pin (MLX 0.32.0
+/// via `pmetal-mlx-rs 932beb4e` + the sc-12746 pad/concat copy-gate patch) every op the tiled/untiled
+/// video decode touches above the bound is now int64-safe.** Measured at `128×D×480×848` (`D=41` →
+/// 2,136,145,920 = 0.995×; `D=42` → 2,188,247,040 = 1.019×) with position-dependent data compared only
+/// on sub-bound slices (`mlx-gen/tests/mlx_write_bound_probe.rs`):
 ///
-/// | operation | on 0.31.2 | on 0.32.0 |
+/// | operation | on 0.31.2 | on this pin (0.32.0 fork `932beb4e` + patch) |
 /// |---|---|---|
-/// | `conv3d` 8→128, output over the bound | **wrong** from ~1.007× (per-thread output offset in the Metal steel-conv kernel overflows `int32`) | **fixed** — MLX PR #3524 promoted those offsets to `size_t` |
-/// | `pad` to a full output over the bound (the tiled accumulator's placement op) | **wrong** from ~1.003× at video geometry | **still wrong** — PR #3524 did not touch `pad` |
-/// | `from_slice` / `reshape(-1)` / `flatten` at over-bound size | **overflow** — the flat shape-product is computed in `i32` (mlx-rs `array/mod.rs` asserts `len == shape.product::<i32>()`; MLX core `ShapeElem = int32_t`, issue #3327) | reshape/flatten **raise** (PR #3524's `check_shape_dim`); mlx-rs's own `from_slice` `i32` assert is a fork-side bug, unfixed |
+/// | `conv3d` 8→128, output over the bound | **wrong** from ~1.007× (per-thread output offset in the Metal steel-conv kernel overflows `int32`) | **EXACT** — MLX PR #3524 promoted those offsets to `size_t` (probe-verified, `first_bad=-1`) |
+/// | `pad` to a full output over the bound (the tiled accumulator's placement op) | **wrong** from ~1.003× | **EXACT** — the sc-12746 `pad-copy-int64.patch` gates the copy on the addressable span (probe-verified) |
+/// | `concatenate` over the bound (same `copy_gpu_inplace` path) | **wrong** | **EXACT** — same copy-gate patch (probe-verified) |
+/// | `reshape(-1)` / `flatten` at over-bound size | **overflow** (flat `i32` shape-product) | **works** (probe-verified `reshape(-1)_ok=true` at 2.19e9) |
+/// | `from_slice` (host `Vec` → over-bound `Array`) | **overflow** — mlx-rs asserts `len == shape.product::<i32>()` (MLX #3327) | **still i32-capped** — a fork-side mlx-rs bug, unfixed; the one residual (the decode paths read back via `as_slice`, never `from_slice` the full output) |
 /// | reading back (`as_slice`) an over-bound array | correct | correct |
 ///
-/// Consequences for the two guard sites that reference this bound:
-///  - **Decoder-stage write** ([`VaeTiling::writable_frame_cap`], enforced by [`budgeted_plan`] and the
-///    per-tile skip): the widest full-resolution tensor a *single* decode/tile writes. Its failure is
-///    the `conv3d` row above, so this guard is the **0.31.2 convolution guard** — an MLX upgrade to
-///    ≥0.32.0 could retire or relax it (re-run the boundary probes first).
-///  - **Assembled-output write** (`mlx_gen::vae_tiling::check_output_writable`, for backends that can
-///    reach it): the full `output`/`weights` accumulators a tiled decode builds by `pad`-and-add. Its
-///    failure is the `pad` + `from_slice`/`reshape` rows, which an MLX upgrade does **not** fix — so
-///    this guard must survive an upgrade even as the convolution guard is relaxed. There is no way to
-///    *produce* a correct over-bound output on this stack, so this guard **refuses** (catchable) rather
-///    than tiling smaller; no tiling shrinks the full output.
+/// Consequences for the guard sites that reference this bound (all relaxed in **sc-12748**):
+///  - **Decoder-stage write** ([`VaeTiling::writable_frame_cap`], used by [`budgeted_plan`]): the widest
+///    full-resolution tensor a *single* decode/tile writes. Its failure was the `conv3d` row, now
+///    **EXACT** on this pin (#3524), and the video decoders whose full-res write it bounds are conv-only
+///    at that stage (LTX/Mochi are attention-free; Wan's VAE attention runs at latent resolution). So the
+///    convolution-corruption justification is **retired**; the cap is kept as belt-and-suspenders
+///    defense-in-depth (a cheap tiling trigger that yields correct output regardless, guarding against a
+///    future MLX regression re-breaking conv or a future full-res op the probes don't cover).
+///  - **Assembled-output write** (`mlx_gen::vae_tiling::check_output_writable`): the full
+///    `output`/`weights` accumulators a tiled decode builds by `pad`-and-add and reads back via
+///    `reshape`+`as_slice`. Every one of those ops is now int64-safe (rows above), so the sc-12438
+///    **refusal is lifted** — an over-bound assembled output now RENDERS. `check_output_writable` is kept
+///    as a narrow backstop for the one residual, a `from_slice` host materialization the decode never does.
+///  - **Mochi's decode guard** (`mlx-gen-mochi`'s `decode_body`): its over-bound write is `block_out`'s
+///    conv3d, now EXACT — the refusal is lifted; chunking is retained for **peak memory** only.
 ///
-/// **Why it hides.** Reductions have tiny outputs and stay correct, so a checksum notices nothing; and
-/// any verification computed *over* an oversized tensor is itself an oversized write, so it silently
-/// reports agreement. Detecting it needs **position-dependent** data (a constant fill cannot reveal
-/// index scrambling) and a comparison that never writes past this bound. Synthetic op probes:
-/// `mlx-gen/tests/mlx_write_bound_probe.rs`.
+/// **Why it hid (0.31.2).** Reductions have tiny outputs and stay correct, so a checksum noticed nothing;
+/// and any verification computed *over* an oversized tensor was itself an oversized write, so it silently
+/// reported agreement. Detecting it needed **position-dependent** data and a comparison that never wrote
+/// past the bound — the method the probes and the sc-12748 renders honor.
 ///
-/// First found via Mochi's AsymmVAE decode (sc-12291), whose 128-channel full-resolution `block_out` is
-/// exact through 31 frames at 848×480 and returns ±2.67 — where a valid video is ~[-1, 1] — from 37 on.
-/// This bound is per-backend: the CUDA/`candle-gen` path uses its own tensor library and does **not**
-/// share the MLX `i32` write limit (only the MLX crates gate on it).
+/// First found via Mochi's AsymmVAE decode (sc-12291), whose full-resolution `block_out` was exact
+/// through 31 frames at 848×480 and returned ±2.67 — where a valid video is ~[-1, 1] — from 37 on (on
+/// 0.31.2). This bound is per-backend: the CUDA/`candle-gen` path uses its own tensor library and does
+/// **not** share the MLX `i32` write limit (only the MLX crates ever gated on it).
 pub const MAX_WRITABLE_ELEMS: i64 = i32::MAX as i64;
 
 /// A VAE's tiling parameters: the decoder's spatial/temporal upsample factors, whether its temporal
@@ -138,8 +144,11 @@ impl VaeTiling {
     /// widest full-resolution write under [`MAX_WRITABLE_ELEMS`]. 0 when a single frame already
     /// exceeds it (only reachable at resolutions far beyond any shipped bucket).
     ///
-    /// Past this, the decode does not merely run out of memory — it returns **wrong pixels, silently**.
-    /// So this is a correctness bound and binds *in addition to* the memory budget, never instead of.
+    /// On MLX 0.31.2 exceeding this returned **wrong pixels, silently** (the widest write is a conv3d).
+    /// **sc-12748: on the current pin (0.32.0, #3524) that conv is int64-safe** (see
+    /// [`MAX_WRITABLE_ELEMS`]), so this is no longer a correctness bound — it is retained as a
+    /// defense-in-depth tiling trigger (tiling yields correct output regardless) and is still used by
+    /// callers that want a conservative single-pass ceiling.
     pub fn writable_frame_cap(&self, out_h: i32, out_w: i32) -> i64 {
         let per_frame = self.full_res_channels as i64 * out_h as i64 * out_w as i64;
         if per_frame <= 0 {
@@ -918,9 +927,11 @@ mod tests {
         );
     }
 
-    /// **The inversion this fixes** (sc-12349): the tiling decision used to be a pure memory test, so a
-    /// machine with a big enough budget would choose the single pass at a geometry where the decode is
-    /// silently WRONG. An unlimited budget must still tile once the write bound is crossed.
+    /// **The inversion this fixed** (sc-12349): the tiling decision used to be a pure memory test, so a
+    /// machine with a big enough budget would choose the single pass at a geometry where the 0.31.2
+    /// decode was silently WRONG. sc-12748: on 0.32.0 that single pass is now *correct* (conv is
+    /// int64-safe), so this is defense-in-depth rather than a correctness necessity — but the selector
+    /// still tiles past the cap (a cheap, always-correct default), which this pins.
     #[test]
     fn budgeted_tiles_past_the_write_bound_even_with_an_infinite_budget() {
         // Free memory: without the write bound this returns Ok(None) — a single pass — always.

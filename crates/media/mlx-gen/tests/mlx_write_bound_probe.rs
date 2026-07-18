@@ -4,11 +4,14 @@
 //! boundary. They exist to establish — on *this* pinned runtime (MLX core 0.32.0 via pmetal-mlx-rs
 //! `932beb4e`) — the exact per-operation behaviour the tiling fix depends on. On this pin the
 //! `pad`/`concat` copy-gate overflow is FIXED (sc-12746, pad-copy-int64.patch): those probes now
-//! assert EXACT writes above 2^31, not merely below. NOTE: `conv3d_8to128_output_across_i32max`
-//! still encodes the 0.31.2 above-bound *corruption* claim — MLX 0.32.0 also fixes the conv
-//! overflow (upstream #3524), so that probe's above-bound assertion is expected to invert on this
-//! pin; its re-derivation + the conv-stage write-guard retirement are tracked in sc-12748 (slice 6),
-//! not here. Run explicitly:
+//! assert EXACT writes above 2^31, not merely below. **sc-12748 (slice 6):**
+//! `conv3d_8to128_output_across_i32max` now asserts the FIXED behaviour too — MLX 0.32.0 fixes the
+//! conv output-offset overflow (upstream #3524 promoted the per-thread offset to `size_t`), so on
+//! this pin conv3d is EXACT above 2^31 (measured `first_bad_offset=-1`, 216 positions checked below
+//! and above the bound). The old 0.31.2 *corruption* claim inverted here; the conv-stage write-guard
+//! retirement it justified is done in sc-12748. Every op the tiled/untiled decode touches above the
+//! bound (conv3d, pad, concat, reshape, as_slice, elementwise) is now probe-verified int64-safe.
+//! Run explicitly:
 //!
 //! ```text
 //! cargo test -p mlx-gen --test mlx_write_bound_probe -- --ignored --nocapture --test-threads=1
@@ -32,14 +35,16 @@ fn pv(i: i64) -> f32 {
     (i % 251) as f32
 }
 
-/// **The core claim.** `conv3d` 8→128 whose OUTPUT crosses `i32::MAX` on MLX 0.31.2 (the story's exact
+/// **The core claim.** `conv3d` 8→128 whose OUTPUT crosses `i32::MAX` (the story's exact
 /// `128×D×480×848` geometry, D=41 below / D=42 above). A pointwise (1×1×1) conv with a permutation
-/// weight makes `out[..,co] = in[..,co%8]`, so every output element is predictable. Below the bound the
-/// decode must be exact; above it, MLX 0.31.2's per-thread output offset overflows int32 (fixed upstream
-/// by MLX PR #3524 in 0.32.0) → this is what justifies keeping the convolution-stage write guard while
-/// pinned to 0.31.2.
+/// weight makes `out[..,co] = in[..,co%8]`, so every output element is predictable. On MLX 0.31.2 the
+/// per-thread output offset overflowed int32 and this conv corrupted above the bound; MLX 0.32.0's
+/// upstream #3524 promotes that offset to `size_t`, so **on this pin (0.32.0 fork `932beb4e`) the conv
+/// is EXACT both below AND above the bound** (sc-12748). This probe therefore now asserts the *fixed*
+/// behaviour — the inversion of the 0.31.2 corruption claim — which is what retires the conv-stage
+/// write guard (`writable_frame_cap` / Mochi's decode guard).
 #[test]
-#[ignore = "sc-12438 heavy MLX conv write probe (~9 GB); run with --ignored on Metal"]
+#[ignore = "sc-12438/sc-12748 heavy MLX conv write probe (~9 GB); run with --ignored on Metal"]
 fn conv3d_8to128_output_across_i32max() {
     let (h, w): (i64, i64) = (480, 848);
     let (cin, cout): (i64, i64) = (8, 128);
@@ -104,15 +109,15 @@ fn conv3d_8to128_output_across_i32max() {
         bf < 0,
         "conv BELOW the bound must be exact — corruption at offset {bf} breaks the premise"
     );
+    // sc-12748: on MLX 0.32.0 (#3524) the conv is EXACT above the bound too. `first_bad < 0` means no
+    // corruption was found at any sampled above-2^31 position (measured `af == -1`, 216 positions).
+    // A regression to 0.31.2's behaviour — a future MLX bump re-breaking the size_t offset — would
+    // set `af >= 0` and re-fail this, the signal to re-instate the conv-stage write guard.
     assert!(
-        af >= 0,
-        "conv ABOVE the bound was EXACT on this runtime — MLX 0.31.2 conv did NOT corrupt at \
-         128×42×480×848. If so, the convolution write guard's premise no longer holds here and must \
-         be re-derived from measurement."
-    );
-    assert!(
-        af >= I32_MAX,
-        "conv corruption began BELOW 2^31 (offset {af}) — not the int32 output-index boundary"
+        af < 0,
+        "conv ABOVE the bound CORRUPTED (first bad offset {af}) — MLX 0.32.0's #3524 conv fix has \
+         regressed on this pin. Re-instate the conv-stage write guard (writable_frame_cap / Mochi \
+         decode guard) and re-open sc-12748."
     );
 }
 
@@ -286,13 +291,19 @@ fn concat_story_geometry_128x42x480x848() {
     assert!(bad == 0, "concat had {bad} corrupted sample(s); max_abs={max_abs:e}");
 }
 
-/// Does creating / reshaping a >i32::MAX array through the mlx-rs wrappers stay intact? `from_slice`
-/// asserts `len == shape.product::<i32>()` (overflows), and `reshape(&[-1])` infers the flat dim as
-/// i32 — both cap MLX arrays at i32::MAX elements *through this binding* even though MLX core can hold
-/// the buffer (a `pad` here builds a 2.188e9-element array and reads back). This is why the safe path
-/// must NEVER flatten or `from_slice` the full oversized output.
+/// Which reshape/read ops on a >i32::MAX array survive on this pin. **sc-12748 corrects the earlier
+/// weak check here** (which used `catch_unwind(...).is_ok()` and so only saw *panics*, silently passing
+/// an MLX `Err`). The real ground truth, which `contiguous`'s materialization depends on:
+///  - `as_slice` and elementwise over the oversized array: **correct**.
+///  - `reshape(&[-1])` — flatten to a single >i32::MAX dimension: **RAISES** (`Err`) — MLX's
+///    `check_shape_dim` (#3524) rejects any single dimension outside the `i32` range. This is why
+///    `contiguous` must NOT flatten the full output.
+///  - a **multi-dimensional** reshape whose total > i32::MAX but every dimension ≤ i32::MAX (e.g.
+///    `[c, d·h·w]`): **works** — the per-dimension check passes and the size product is computed wide.
+///    This is the int64-safe materialization the decode read-back uses.
+///  - `from_slice` (host `Vec` → over-bound `Array`) stays i32-capped (mlx-rs assert), untested here.
 #[test]
-#[ignore = "sc-12438 MLX >i32::MAX reshape/contiguous probe (~9 GB); run with --ignored on Metal"]
+#[ignore = "sc-12438/sc-12748 MLX >i32::MAX reshape/contiguous probe (~9 GB); run with --ignored on Metal"]
 fn reshape_and_contiguous_on_oversized_array() {
     let (c, d, h, w): (i64, i64, i64, i64) = (128, 41, 480, 848);
     let xhost: Vec<f32> = (0..c * d * h * w).map(pv).collect();
@@ -301,36 +312,58 @@ fn reshape_and_contiguous_on_oversized_array() {
     drop(xhost);
     let y = pad(&x, &[(0, 0), (0, 1), (0, 0), (0, 0)][..], None, None).unwrap();
     y.eval().unwrap();
-    let out_elems = c * (d + 1) * h * w;
+    let dout = d + 1;
+    let out_elems = c * dout * h * w;
     assert!(out_elems > I32_MAX);
 
-    // (a) as_slice on the oversized array — expected to WORK (read side is fine).
+    // (a) as_slice on the oversized array — read side is fine. Touch the last (>2^31) element.
     let read_ok = std::panic::catch_unwind(|| {
         let s = y.as_slice::<f32>();
-        s[out_elems as usize - 1] // touch the last element
+        s[out_elems as usize - 1]
     })
     .is_ok();
 
-    // (b) elementwise 2·y+1 over the oversized array — expected to WORK (elementwise is safe).
+    // (b) elementwise 2·y+1 over the oversized array — elementwise is safe.
     let two = Array::from_slice(&[2.0f32], &[1]);
     let one = Array::from_slice(&[1.0f32], &[1]);
     let elementwise_ok = std::panic::catch_unwind(|| {
         let z = add(multiply(&y, &two).unwrap(), &one).unwrap();
         z.eval().unwrap();
         let zs = z.as_slice::<f32>();
-        // sample an above-2^31 element: c=127,d=0,h=0,w=0 → should be 2·pv(127*d*h*w)+1.
-        let off = (127i64 * (d + 1) * h * w) as usize;
+        let off = (127i64 * dout * h * w) as usize; // above 2^31
         (zs[off] - (2.0 * pv(127 * d * h * w) + 1.0)).abs() < 1e-3
     })
     .unwrap_or(false);
 
-    // (c) reshape(&[-1]) — expected to FAIL/overflow (i32 flat-dim inference) on this binding.
-    let reshape_flat_ok =
-        std::panic::catch_unwind(|| y.reshape(&[-1]).map(|r| r.shape().to_vec())).is_ok();
+    // (c) reshape(&[-1]) — flatten to one >i32::MAX dim. Check the Result (not just panic-freedom).
+    let reshape_flat_ok = y.reshape(&[-1]).is_ok();
+
+    // (d) multi-dim reshape [c, dout·h·w] — total > i32::MAX, each dim ≤ i32::MAX. This is the
+    //     materialization `contiguous` uses. Verify it returns Ok AND reads back correctly at an
+    //     above-2^31 flat offset (position-dependent), then reshape back to the 4-D shape.
+    let per = dout * h * w; // 42·480·848 = 17,111,040 < i32::MAX
+    assert!(per < I32_MAX && c < I32_MAX && c * per > I32_MAX);
+    let r2 = y.reshape(&[c as i32, per as i32]);
+    let reshape_2d_ok = r2.is_ok();
+    let mut reshape_2d_value_ok = false;
+    let mut reshape_back_ok = false;
+    if let Ok(r2) = r2 {
+        r2.eval().unwrap();
+        // Element [c=127, k] flat offset = 127·per + k (> 2^31). y[127,dd,hh,ww] = pv(orig) for dd<d
+        // else 0; pick dd=0,hh=0,ww=0 → k=0 → pv(127·d·h·w).
+        let rs = r2.as_slice::<f32>();
+        let off = (127 * per) as usize;
+        reshape_2d_value_ok = (rs[off] - pv(127 * d * h * w)).abs() < 1e-3;
+        reshape_back_ok = r2
+            .reshape(&[c as i32, dout as i32, h as i32, w as i32])
+            .is_ok();
+    }
 
     eprintln!(
         "[oversized array ops] as_slice_read_ok={read_ok}  elementwise_ok={elementwise_ok}  \
-         reshape(-1)_ok={reshape_flat_ok}  (out_elems={out_elems} = {:.4}× 2^31)",
+         reshape(-1)_ok={reshape_flat_ok}  reshape_2d_ok={reshape_2d_ok}  \
+         reshape_2d_value_ok={reshape_2d_value_ok}  reshape_back_ok={reshape_back_ok}  \
+         (out_elems={out_elems} = {:.4}× 2^31)",
         out_elems as f64 / I32_MAX as f64
     );
     assert!(read_ok, "reading back an oversized array must work");
@@ -338,5 +371,14 @@ fn reshape_and_contiguous_on_oversized_array() {
         elementwise_ok,
         "elementwise over an oversized array must be correct (the safe path relies on this)"
     );
-    // reshape(-1) is expected to be unsupported here; we only record it (no hard assert either way).
+    assert!(
+        !reshape_flat_ok,
+        "reshape(-1) to a single >i32::MAX dim is expected to RAISE on this pin (#3524 \
+         check_shape_dim) — if it now works, contiguous() can be simplified"
+    );
+    assert!(
+        reshape_2d_ok && reshape_2d_value_ok && reshape_back_ok,
+        "the multi-dim reshape contiguous() relies on must work AND read back correctly above 2^31 \
+         (2d_ok={reshape_2d_ok} value_ok={reshape_2d_value_ok} back_ok={reshape_back_ok})"
+    );
 }

@@ -33,9 +33,59 @@ pub fn scalar(v: f32) -> Array {
     Array::from_slice(&[v], &[1])
 }
 
+/// Force a **logically-contiguous** copy so a subsequent [`Array::as_slice`] reads logical (C-)order
+/// rather than the physical buffer of a transpose-strided array. A reshape round-trip materializes it.
+///
+/// **Over-`i32::MAX` safe (sc-12748).** MLX rejects any single tensor dimension outside the `i32`
+/// range (`check_shape_dim`, #3524), so the old `reshape(&[-1])` RAISES once the flattened dim crosses
+/// the bound (a 1280²×441f VAE output is 2.168e9 elements). This instead flattens to a **2-D** `[a, b]`
+/// whose factors are both ≤ `i32::MAX` — a contiguous regrouping of the existing dims, so the row-major
+/// bytes are unchanged — then restores the shape. A multi-dim reshape whose *total* exceeds `i32::MAX`
+/// while every *dimension* stays within it is int64-safe on this pin (probe-verified in
+/// `mlx-gen/tests/mlx_write_bound_probe.rs::reshape_and_contiguous_on_oversized_array`). Below the bound
+/// `a == total, b == 1`, byte-identical to the old round-trip.
+pub fn contiguous(x: &Array) -> Result<Array> {
+    let shape = x.shape().to_vec();
+    let (a, b) = flat_2d(&shape);
+    Ok(x.reshape(&[a, b])?.reshape(&shape)?)
+}
+
+/// Split `shape` into two contiguous dimension groups `[a, b]` (`a·b == Π shape`) with each factor
+/// ≤ `i32::MAX`. Greedily accumulate leading dims into `a` until the next would overflow `i32`; `b` is
+/// the product of the rest. Every real tensor has total ≪ `i32::MAX²` and each single dim already
+/// ≤ `i32::MAX` (or it could not exist), so both factors fit. Empty/scalar shapes yield `[1, 1]`.
+fn flat_2d(shape: &[i32]) -> (i32, i32) {
+    let total: i64 = shape.iter().map(|&d| d as i64).product::<i64>().max(1);
+    let mut a: i64 = 1;
+    for &d in shape {
+        let d = d as i64;
+        if a.saturating_mul(d) > i32::MAX as i64 {
+            break;
+        }
+        a *= d;
+    }
+    let a = a.max(1);
+    let b = (total / a).max(1);
+    (a as i32, b as i32)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flat_2d_splits_stay_within_i32() {
+        // Below the bound: a == total, b == 1 (byte-identical to reshape(-1) round-trip).
+        assert_eq!(flat_2d(&[2, 3, 4]), (24, 1));
+        // The 1280²×441f VAE output (2.168e9 > i32::MAX): both factors ≤ i32::MAX and multiply back.
+        let (a, b) = flat_2d(&[1, 3, 441, 1280, 1280]);
+        assert!(a as i64 <= i32::MAX as i64 && b as i64 <= i32::MAX as i64);
+        assert_eq!(a as i64 * b as i64, 3i64 * 441 * 1280 * 1280);
+        // A Wan 720p×800f output (3·800·1280·720 = 2.21e9): still splits within i32.
+        let (a, b) = flat_2d(&[3, 800, 1280, 720]);
+        assert!(a as i64 <= i32::MAX as i64 && b as i64 <= i32::MAX as i64);
+        assert_eq!(a as i64 * b as i64, 3i64 * 800 * 1280 * 720);
+    }
 
     #[test]
     fn reads_i32_array() {
