@@ -427,8 +427,8 @@ impl WanVae16 {
     }
 
     /// Decode latents `[B,16,T,H,W]` → RGB frames `[B,3, 1+(T-1)·4, 8H, 8W]` in `[-1,1]`. **Streams one
-    /// latent frame at a time** (sc-5176): bit-equivalent to a single pass (the causal `feat_cache`) but
-    /// bounds peak memory to ~one frame's activations — the 14B's heavier clips would otherwise OOM the
+    /// latent frame at a time** (sc-5176), carrying the causal `feat_cache` while bounding peak memory
+    /// to ~one frame's activations — the 14B's heavier clips would otherwise OOM the
     /// VAE-decode stage exactly as the 5B did.
     pub fn decode(&self, z: &Tensor) -> Result<Tensor> {
         let z = self.unnormalize(z)?;
@@ -446,14 +446,6 @@ impl WanVae16 {
         self.reset_caches();
         assert!(!chunks.is_empty(), "decode needs >= 1 latent frame");
         Tensor::cat(&chunks, 2)?.clamp(-1f32, 1f32)
-    }
-
-    /// Single-pass decode over all frames (the original path). Retained for the streaming-parity test;
-    /// not used in production (it spikes VAE memory on real clips).
-    pub fn decode_full(&self, z: &Tensor) -> Result<Tensor> {
-        let z = self.unnormalize(z)?;
-        self.decode_inner(&z, &Ctx::single_pass())?
-            .clamp(-1f32, 1f32)
     }
 
     /// Decode with **spatial tiling** for the memory-bounded A14B decode (sc-12758) — the z16 twin of the

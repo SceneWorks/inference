@@ -6,7 +6,7 @@
 //!
 //! Architecture (from the `ideogram-ai/ideogram-4-fp8` checkpoint, sc-5984):
 //! * **Text encoder** — `Qwen3-VL-8B-Instruct` (text path), hidden states from 13 layers
-//!   (`config::EXTRACTED_LAYERS`) concatenated to 53248 features. Reuses the `mlx-gen-flux2`
+//!   (`config::EXTRACTED_LAYERS`) concatenated to 53248 features. Mirrors the `mlx-gen-flux2`
 //!   Qwen3 blocks + a multi-layer capture hook.
 //! * **Transformer** — single-stream 34-layer `Ideogram4Transformer2DModel` (AdaLN-modulated
 //!   SwiGLU, fused QKV + per-head QK-norm, 3D MRoPE), instantiated **twice**

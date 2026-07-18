@@ -37,6 +37,16 @@ expected_files = [
 ]
 
 [[models]]
+key = "kokoro-82m"
+repository = "hexgrad/Kokoro-82M"
+revision = "f3ff3571791e39611d31c381e3a41a3af07b4987"
+license = "Apache-2.0"
+size_class = "small"
+profiles = ["audio-macos"]
+environment = ["KOKORO_SNAPSHOT"]
+expected_files = ["config.json", "kokoro-v1_0.pth", "voices/af_heart.pt"]
+
+[[models]]
 key = "mochi-1-preview"
 repository = "genmo/mochi-1-preview"
 revision = "14be5fcea23095ed330cb214647916a451e38b6e"

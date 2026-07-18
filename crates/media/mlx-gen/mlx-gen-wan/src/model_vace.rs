@@ -28,25 +28,25 @@ use std::path::{Path, PathBuf};
 use mlx_gen::weights::Weights;
 use mlx_gen::{
     AdapterSpec, Capabilities, ConditioningKind, Error, GenerationOutput, GenerationRequest,
-    Generator, Image, LoadSpec, Modality, ModelDescriptor, MoeExpert, Precision, Progress, Quant,
-    Result, WeightsSource,
+    Generator, Image, LoadPhase, LoadSpec, Modality, ModelDescriptor, MoeExpert, OffloadPolicy,
+    Precision, Progress, Quant, Result, WeightsSource,
 };
 use mlx_rs::ops::{add, concatenate_axis, multiply};
 use mlx_rs::{random, Array, Dtype};
 
 use crate::adapters::{merge_vace_adapters, merge_vace_adapters_expert, warn_skipped_adapters};
-use crate::config::{WanModelConfig, WanQuant, WanVaceConfig};
-use crate::model::{dit_resident_bytes, effective_te_quant};
+use crate::config::{WanModelConfig, WanVaceConfig};
+use crate::model::{dit_resident_bytes, is_wan_curated, moe_denoise_resident_bytes};
 use crate::pipeline::{
-    align_dim, auto_tiling_budgeted_z16, decode_to_frames, frames_to_images, latent_shape,
-    preflight_denoise_memory_guard, preprocess_i2v_image, reject_off_grid, reject_over_area,
-    resolve_sampler_knobs, seq_len,
+    align_dim, auto_tiling_budgeted_z16, crossing_index, decode_to_frames, frames_to_images,
+    latent_shape, preflight_denoise_memory_guard, preprocess_i2v_image, reject_off_grid,
+    reject_over_area, resolve_sampler_knobs, seq_len, staged_expert_swap,
 };
-use crate::scheduler::SolverKind;
-use crate::text_encoder::encode_text_staged;
+use crate::scheduler::{make_scheduler, SolverKind, WanScheduler};
+use crate::text_encoder::encode_text_staged_for_tier;
 use crate::vace::{
-    build_vace_control, denoise_vace, denoise_vace_moe, prepare_masks, prepare_video_latents,
-    WanVaceTransformer,
+    build_vace_control, denoise_vace, denoise_vace_moe, denoise_vace_range, prepare_masks,
+    prepare_video_latents, WanVaceTransformer,
 };
 use crate::vae::WanVae;
 
@@ -132,7 +132,7 @@ fn vace_prep(
     config: &WanVaceConfig,
     req: &GenerationRequest,
     cfg_disabled: bool,
-    te_quant: Option<WanQuant>,
+    load_quant: Option<Quant>,
 ) -> Result<VacePrep> {
     let base = &config.base;
     let clip = req.control_clip().expect("validated present");
@@ -169,8 +169,14 @@ fn vace_prep(
     let num_ref = references.len();
 
     // --- Stage 1: UMT5 text encode ---
-    let (context, context_null) =
-        encode_text_staged(root, base, &req.prompt, &neg_prompt, cfg_disabled, te_quant)?;
+    let (context, context_null) = encode_text_staged_for_tier(
+        root,
+        base,
+        &req.prompt,
+        &neg_prompt,
+        cfg_disabled,
+        load_quant,
+    )?;
 
     // --- Stage 2: z16 VAE encode the control + mask → 96-ch control latent ---
     let control = {
@@ -438,13 +444,7 @@ impl WanVace {
         let cfg_disabled = guidance <= 1.0;
 
         // Stages 1–2 + noise seeding (shared with the dual-expert path, F-072).
-        let prep = vace_prep(
-            &self.root,
-            &self.config,
-            req,
-            cfg_disabled,
-            effective_te_quant(&self.config.base, self.quantize),
-        )?;
+        let prep = vace_prep(&self.root, &self.config, req, cfg_disabled, self.quantize)?;
 
         // --- Stage 3: load the VACE DiT, embed contexts, CFG denoise ---
         let latents = {
@@ -547,10 +547,12 @@ pub const MODEL_ID_VACE_FUN: &str = "wan2_2_vace_fun_14b";
 /// Stable identity + advertised capabilities for `wan2_2_vace_fun_14b` (same surface as `wan_vace`:
 /// a masked `ControlClip` + optional `Reference` images, CFG, Q4/Q8, LoRA/LoKr).
 pub fn descriptor_vace_fun() -> ModelDescriptor {
-    ModelDescriptor {
+    let mut descriptor = ModelDescriptor {
         id: MODEL_ID_VACE_FUN,
         ..descriptor_vace()
-    }
+    };
+    descriptor.capabilities.supports_sequential_offload = true;
+    descriptor
 }
 
 /// The loaded Wan2.2 VACE-Fun model (dual-expert). Mirrors [`WanVace`] but stages **two** transformers
@@ -561,6 +563,7 @@ pub struct WanVaceFun {
     root: PathBuf,
     quantize: Option<Quant>,
     adapters: Vec<AdapterSpec>,
+    offload_policy: OffloadPolicy,
 }
 
 impl WanVaceFun {
@@ -581,6 +584,129 @@ impl WanVaceFun {
         let report = merge_vace_adapters_expert(w, &self.adapters, expert)?;
         warn_skipped_adapters(MODEL_ID_VACE_FUN, &report.skipped);
         Ok(report.applied)
+    }
+
+    /// Load, adapt, build, and quantize one VACE-Fun expert without materializing its sibling.
+    fn build_expert_staged(&self, expert: MoeExpert) -> Result<(WanVaceTransformer, usize)> {
+        let mut weights = load_vace_fun_expert_weights(&self.root, expert)?;
+        let applied = self.merge_expert_adapters(&mut weights, expert)?;
+        let mut transformer =
+            WanVaceTransformer::from_weights(&weights, &self.config, Dtype::Bfloat16)?;
+        if let Some(q) = self.quantize {
+            transformer.quantize(q.bits(), None)?;
+        }
+        Ok((transformer, applied))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn denoise_vace_moe_swapped(
+        &self,
+        control: &Array,
+        scales: &[f32],
+        kind: SolverKind,
+        num_train_timesteps: usize,
+        steps: usize,
+        shift: f32,
+        boundary_timestep: f32,
+        guidance_low: f32,
+        guidance_high: f32,
+        ctx_cond: &Array,
+        ctx_uncond: Option<&Array>,
+        init_noise: &Array,
+        cancel: &mlx_gen::CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Array> {
+        let mut sched = make_scheduler(kind, num_train_timesteps);
+        sched.set_timesteps(steps, shift);
+        let timesteps = sched.timesteps().to_vec();
+        let k = crossing_index(&timesteps, boundary_timestep);
+        if k == 0 || k == steps {
+            return Err(Error::Msg(format!(
+                "{}: denoise schedule must cross the expert boundary exactly once (boundary {}, \
+                 crossing index {k}/{steps})",
+                MODEL_ID_VACE_FUN, boundary_timestep
+            )));
+        }
+        let mut latents = init_noise.clone();
+        let total = steps as u32;
+        let high_applied = std::cell::Cell::new(0usize);
+        let low_applied = std::cell::Cell::new(0usize);
+
+        struct VaceSwapState<'a> {
+            sched: &'a mut dyn WanScheduler,
+            latents: &'a mut Array,
+            on_progress: &'a mut dyn FnMut(Progress),
+        }
+
+        let denoise_expert = |transformer: &WanVaceTransformer,
+                              guidance: f32,
+                              range: std::ops::Range<usize>,
+                              state: &mut VaceSwapState| {
+            let progress = &mut *state.on_progress;
+            let mut on_step = |i: usize| {
+                progress(Progress::Step {
+                    current: i as u32,
+                    total,
+                })
+            };
+            denoise_vace_range(
+                &mut *state.sched,
+                transformer,
+                control,
+                scales,
+                guidance,
+                ctx_cond,
+                ctx_uncond,
+                &mut *state.latents,
+                &timesteps,
+                range,
+                cancel,
+                &mut on_step,
+            )
+        };
+
+        let mut state = VaceSwapState {
+            sched: &mut *sched,
+            latents: &mut latents,
+            on_progress,
+        };
+        staged_expert_swap(
+            k,
+            steps,
+            &mut state,
+            |state| {
+                if cancel.is_cancelled() {
+                    return Err(Error::Canceled);
+                }
+                (state.on_progress)(Progress::Loading(LoadPhase::Renderer));
+                let (transformer, applied) = self.build_expert_staged(MoeExpert::High)?;
+                high_applied.set(applied);
+                Ok(transformer)
+            },
+            |transformer, state| denoise_expert(transformer, guidance_high, 0..k, state),
+            |state| {
+                if cancel.is_cancelled() {
+                    return Err(Error::Canceled);
+                }
+                (state.on_progress)(Progress::Loading(LoadPhase::Renderer));
+                let (transformer, applied) = self.build_expert_staged(MoeExpert::Low)?;
+                low_applied.set(applied);
+                if !self.adapters.is_empty() && high_applied.get() + low_applied.get() == 0 {
+                    return Err(Error::Msg(format!(
+                        "{}: {} adapter file(s) matched no module across either expert",
+                        MODEL_ID_VACE_FUN,
+                        self.adapters.len()
+                    )));
+                }
+                Ok(transformer)
+            },
+            |transformer, state| denoise_expert(transformer, guidance_low, k..steps, state),
+            || {
+                mlx_rs::memory::clear_cache();
+                Ok(())
+            },
+        )?;
+        Ok(latents)
     }
 }
 
@@ -608,6 +734,7 @@ pub fn load_vace_fun(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         root,
         quantize: spec.quantize,
         adapters: spec.adapters.clone(),
+        offload_policy: spec.offload_policy,
     }))
 }
 
@@ -628,6 +755,7 @@ impl WanVaceFun {
     ) -> Result<GenerationOutput> {
         self.validate(req)?;
         let base = &self.config.base;
+        let sequential = self.offload_policy == OffloadPolicy::Sequential;
 
         // sc-4986 / sc-12459 (F-008) — fail fast (catchable) if the DiT-denoise stage won't fit,
         // BEFORE the UMT5 encode, the VAE conditioning encode, and the 27–54 GB dual-expert load.
@@ -640,14 +768,21 @@ impl WanVaceFun {
         // forward's working set ~20-30% above this estimate (partially offset by the 0.85
         // headroom) — see the fuller note at the single-expert call site
         // (`WanVace::generate_impl`). Recalibration is hardware-gated and not attempted here.
+        let high_bytes = dit_resident_bytes(
+            &[vace_fun_expert_weights_path(&self.root, MoeExpert::High)],
+            self.quantize,
+        );
+        let low_bytes = dit_resident_bytes(
+            &[vace_fun_expert_weights_path(&self.root, MoeExpert::Low)],
+            self.quantize,
+        );
         preflight_denoise_memory_guard(
             self.descriptor.id,
-            dit_resident_bytes(
-                &[
-                    vace_fun_expert_weights_path(&self.root, MoeExpert::High),
-                    vace_fun_expert_weights_path(&self.root, MoeExpert::Low),
-                ],
-                self.quantize,
+            moe_denoise_resident_bytes(
+                self.offload_policy,
+                req.sampler.as_deref(),
+                low_bytes,
+                high_bytes,
             ),
             vace_denoise_tokens(&self.config, req)?,
             base.dim,
@@ -659,16 +794,35 @@ impl WanVaceFun {
         let cfg_disabled = low_gs <= 1.0 && high_gs <= 1.0;
 
         // Stages 1–2 + noise seeding (shared with the single-expert path, F-072).
-        let prep = vace_prep(
-            &self.root,
-            &self.config,
-            req,
-            cfg_disabled,
-            effective_te_quant(&self.config.base, self.quantize),
-        )?;
+        let prep = vace_prep(&self.root, &self.config, req, cfg_disabled, self.quantize)?;
 
-        // --- Stage 3: load BOTH experts, embed contexts per expert, dual-expert MoE VACE denoise ---
-        let latents = {
+        if sequential {
+            // `vace_prep` materializes the raw text contexts and control latent before returning;
+            // flush the dropped UMT5/VAE buffers so they do not overlap the active expert.
+            mlx_rs::memory::clear_cache();
+        }
+
+        // --- Stage 3: native Sequential uses the one-resident expert swap. Curated solvers are not
+        // currently advertised by VACE, but retain the conservative resident fallback if added. ---
+        let latents = if sequential && !is_wan_curated(req.sampler.as_deref()) {
+            let boundary_timestep = base.boundary * base.num_train_timesteps as f32;
+            self.denoise_vace_moe_swapped(
+                &prep.control,
+                &prep.scales,
+                prep.kind,
+                base.num_train_timesteps,
+                prep.steps,
+                prep.shift,
+                boundary_timestep,
+                low_gs,
+                high_gs,
+                &prep.context,
+                prep.context_null.as_ref(),
+                &prep.init_noise,
+                &req.cancel,
+                on_progress,
+            )?
+        } else {
             // High-noise expert = `transformer/`; low-noise = `transformer_2/` (diffusers naming, the
             // same high/low split the base A14B converter uses, model.rs:806).
             let mut high_w = load_vace_fun_expert_weights(&self.root, MoeExpert::High)?;
@@ -826,12 +980,121 @@ mlx_gen::register_generators! {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mlx_gen::{Conditioning, ReplacementMode};
+    use mlx_gen::{Conditioning, OffloadPolicy, ReplacementMode};
 
     fn test_config() -> WanVaceConfig {
         // The 14B-defaults fallback config (dim 5120, patch (1,2,2), z16 / stride (4,8,8)) — the
         // same one `from_model_dir` returns for an empty dir.
         WanVaceConfig::from_model_dir(std::path::Path::new("/nonexistent-sc12459")).unwrap()
+    }
+
+    #[test]
+    fn only_dual_expert_vace_advertises_sequential_offload() {
+        assert!(!descriptor_vace().capabilities.supports_sequential_offload);
+        assert!(
+            descriptor_vace_fun()
+                .capabilities
+                .supports_sequential_offload
+        );
+    }
+
+    #[test]
+    fn vace_swap_ranges_match_resident_boundary_choice() {
+        let timesteps = [999.0, 930.0, 875.0, 874.0, 500.0, 0.0];
+        let boundary = 875.0;
+        let k = crossing_index(&timesteps, boundary);
+        assert_eq!(k, 3);
+
+        let resident: Vec<_> = timesteps
+            .iter()
+            .map(|&t| if t >= boundary { "high" } else { "low" })
+            .collect();
+        let swapped: Vec<_> = (0..timesteps.len())
+            .map(|i| if i < k { "high" } else { "low" })
+            .collect();
+        assert_eq!(resident, swapped);
+        assert_eq!(resident.windows(2).filter(|w| w[0] != w[1]).count(), 1);
+    }
+
+    #[test]
+    fn vace_cache_lifetime_is_bounded_to_one_resident_expert() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        struct Expert(Rc<Cell<usize>>);
+        impl Drop for Expert {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() - 1);
+            }
+        }
+        struct Cache(Rc<Cell<usize>>);
+        impl Drop for Cache {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() - 1);
+            }
+        }
+
+        let experts = Rc::new(Cell::new(0));
+        let caches = Rc::new(Cell::new(0));
+        let peak_experts = Rc::new(Cell::new(0));
+        let peak_caches = Rc::new(Cell::new(0));
+        let mut state = ();
+        staged_expert_swap(
+            2,
+            4,
+            &mut state,
+            |_| {
+                experts.set(experts.get() + 1);
+                peak_experts.set(peak_experts.get().max(experts.get()));
+                Ok(Expert(experts.clone()))
+            },
+            |_, _| {
+                caches.set(caches.get() + 1);
+                peak_caches.set(peak_caches.get().max(caches.get()));
+                let _cache = Cache(caches.clone());
+                Ok(())
+            },
+            |_| {
+                assert_eq!((experts.get(), caches.get()), (0, 0));
+                experts.set(1);
+                peak_experts.set(peak_experts.get().max(experts.get()));
+                Ok(Expert(experts.clone()))
+            },
+            |_, _| {
+                caches.set(1);
+                peak_caches.set(peak_caches.get().max(caches.get()));
+                let _cache = Cache(caches.clone());
+                Ok(())
+            },
+            || {
+                assert_eq!((experts.get(), caches.get()), (0, 0));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!((peak_experts.get(), peak_caches.get()), (1, 1));
+    }
+
+    #[test]
+    fn vace_fun_preflight_budgets_one_expert_only_for_native_sequential() {
+        let (low, high) = (8, 11);
+        assert_eq!(
+            moe_denoise_resident_bytes(OffloadPolicy::Sequential, Some("unipc"), low, high),
+            high
+        );
+        assert_eq!(
+            moe_denoise_resident_bytes(OffloadPolicy::Resident, Some("unipc"), low, high),
+            low + high
+        );
+        assert_eq!(
+            moe_denoise_resident_bytes(
+                OffloadPolicy::Sequential,
+                Some("euler_ancestral"),
+                low,
+                high
+            ),
+            low + high
+        );
     }
 
     fn img() -> Image {
@@ -872,12 +1135,21 @@ mod tests {
     fn vace_denoise_tokens_matches_control_latent_grid() {
         let cfg = test_config();
         // 64×64, 5 frames, no refs: h_lat = w_lat = 8, t_lat = 2 → 8·8·2 / (2·2) = 32 tokens.
-        assert_eq!(vace_denoise_tokens(&cfg, &clip_request(5, 64, 64, 0)).unwrap(), 32);
+        assert_eq!(
+            vace_denoise_tokens(&cfg, &clip_request(5, 64, 64, 0)).unwrap(),
+            32
+        );
         // A reference image prepends one latent frame: t = 3 → 48 tokens.
-        assert_eq!(vace_denoise_tokens(&cfg, &clip_request(5, 64, 64, 1)).unwrap(), 48);
+        assert_eq!(
+            vace_denoise_tokens(&cfg, &clip_request(5, 64, 64, 1)).unwrap(),
+            48
+        );
         // Dims align DOWN to the patch·VAE_S = 16 grid before the latent divide (never larger):
         // 79 → 64. And the frame axis follows 1 + 4·k: 9 frames → t_lat = 3.
-        assert_eq!(vace_denoise_tokens(&cfg, &clip_request(9, 79, 64, 0)).unwrap(), 48);
+        assert_eq!(
+            vace_denoise_tokens(&cfg, &clip_request(9, 79, 64, 0)).unwrap(),
+            48
+        );
     }
 
     /// sc-12459 — `validate_vace_clip` enforces the real frame ceiling (the gen-core floor only

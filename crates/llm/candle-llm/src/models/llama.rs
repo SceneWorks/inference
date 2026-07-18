@@ -18,7 +18,7 @@ use candle_nn::{Linear, Module};
 
 use crate::config::{Architecture, ModelConfig};
 use crate::device::compute_dtype;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::models::deepstack::{self, deepstack_fused_decoder_layers, MropePositions};
 use crate::primitives::attention::{sdpa, AttnMask};
 use crate::primitives::kv_cache::KvCache;
@@ -1258,9 +1258,9 @@ impl MlaAttention {
         dtype: DType,
         quant: Option<QuantSpec>,
     ) -> Result<Self> {
-        let mla = cfg
-            .mla
-            .expect("MLA config present for a DeepSeek-V2 decoder");
+        let mla = cfg.mla.ok_or_else(|| {
+            Error::Config("DeepSeek-V2 config missing integer `kv_lora_rank`".into())
+        })?;
         let req = |key: String| -> Result<Tensor> { Ok(w.require(&key)?.to_dtype(dtype)?) };
         let proj = |key: String| -> Result<Projection> { Projection::load(req(key)?, quant) };
 

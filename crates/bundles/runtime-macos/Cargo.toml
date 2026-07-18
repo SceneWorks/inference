@@ -13,10 +13,9 @@ mlx-gen-catalog = { workspace = true, optional = true }
 # carries its audio generators on candle through the catalog's dedicated audio section
 # (docs/architecture/audio-backend-strategy.md). Candle-CPU on this platform today.
 candle-audio-catalog = { workspace = true, optional = true }
-# The candle snapshot preparer, carried in the audio lane (never in the mlx-only main preparer
-# registry) so audio model snapshots are preparable on macOS — the same
-# `snapshot_preparer_registry()` wiring runtime-cpu/cuda use for their main registries.
-candle-llm = { workspace = true, optional = true }
+# The lane's candle snapshot preparer (never in the mlx-only main preparer registry) now rides
+# inside candle-audio-catalog's composed registration (sc-12836) — the catalog owns the
+# candle-llm delegation, so this bundle no longer names candle-llm directly.
 mlx-llm = { workspace = true }
 
 [features]
@@ -27,4 +26,4 @@ media = ["dep:mlx-gen-catalog"]
 # The Candle audio lane (sc-12835, docs/architecture/audio-backend-strategy.md). A separate
 # additive feature — NOT folded into `media` — so an LLM-only product (ChatWorks) can compose
 # text + TTS via `--no-default-features --features audio` without the mlx media provider graph.
-audio = ["dep:candle-audio-catalog", "dep:candle-llm"]
+audio = ["dep:candle-audio-catalog"]

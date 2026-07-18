@@ -10,10 +10,18 @@ repository = "https://github.com/SceneWorks/inference"
 # Family core crate — re-exports gen_core + candle, so every audio provider links exactly one
 # gen-core / candle build (the same single-resolution discipline as candle-gen-catalog).
 candle-audio = { path = "../candle-audio" }
+# Audio provider crates, in catalog order (sc-12836: the first shipped provider).
+candle-audio-kokoro = { path = "../candle-audio-kokoro" }
+# The audio lane's snapshot-preparer composition (sc-12836): the lane's single `candle`
+# registration recognizes audio snapshots and delegates everything else to candle-llm's
+# preparer unchanged. This crate is the composition owner (previously each bundle wired
+# candle-llm's registry into the lane directly); candle-llm re-exports `core_llm` so the
+# preparer contract types resolve to one package.
+candle-llm = { workspace = true }
 
 [features]
 default = []
 # Pass the backend selection through so a bundle's `--features metal`/`cuda` on this catalog
 # selects the matching candle backend across the whole audio family (mirrors candle-gen-catalog).
-metal = ["candle-audio/metal"]
-cuda = ["candle-audio/cuda"]
+metal = ["candle-audio/metal", "candle-audio-kokoro/metal"]
+cuda = ["candle-audio/cuda", "candle-audio-kokoro/cuda"]

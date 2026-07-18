@@ -44,16 +44,19 @@ fn media_registry() -> gen_core::Result<gen_core::ProviderRegistry> {
 }
 
 /// The bundle's explicit audio lane (sc-12835): the complete Candle audio catalog from the audio
-/// composition root — never `mlx-gen-catalog` — plus the **candle** snapshot preparer carried in
-/// the lane. The main preparer registry stays mlx-only (the single-backend invariant is
-/// unchanged); without the lane's preparer, candle audio model snapshots could not be prepared
-/// on macOS at all (audio-backend-strategy.md, "Consequences").
+/// composition root — never `mlx-gen-catalog` — plus the lane's **candle** snapshot preparer
+/// carried in the lane. The main preparer registry stays mlx-only (the single-backend invariant
+/// is unchanged); without the lane's preparer, candle audio model snapshots could not be
+/// prepared on macOS at all (audio-backend-strategy.md, "Consequences"). Since sc-12836 the lane
+/// preparer is the catalog's composed `candle` registration — audio-shaped snapshots (Kokoro's
+/// pickle layout) take the audio path; everything else delegates to `candle-llm`'s preparer
+/// unchanged (candle-llm now arrives via the audio catalog, which owns the composition).
 #[cfg(feature = "audio")]
 fn audio_lane() -> runtime_catalog::AudioLane {
     runtime_catalog::AudioLane {
         backend: AUDIO_BACKEND,
         generators: candle_audio_catalog::provider_registry(),
-        preparers: candle_llm::snapshot_preparer_registry(),
+        preparers: candle_audio_catalog::snapshot_preparer_registry(),
     }
 }
 
@@ -98,17 +101,17 @@ mod tests {
         assert_eq!(snapshot.text_llm_ids, ["mlx-llama", "mlx-joycaption"]);
         assert_eq!(snapshot.snapshot_preparer_backends, ["mlx"]);
         // The audio lane is declared Candle-native on this mlx bundle (sc-12901) — the
-        // sanctioned cross-backend seam. Its ordered id surface is the audio catalog's — pinned
-        // EMPTY at this release; sc-12836+ extend this exact assertion with each shipped audio
-        // provider id, in catalog order. The lane carries the candle preparer (sc-12835) while
-        // the main preparer registry stays mlx-only.
+        // sanctioned cross-backend seam. Its ordered id surface is the audio catalog's — first
+        // shipped provider: kokoro_82m (sc-12836); later stories extend this exact assertion in
+        // catalog order. The lane carries the composed candle preparer (sc-12835/sc-12836)
+        // while the main preparer registry stays mlx-only.
         #[cfg(feature = "audio")]
         {
             assert_eq!(
                 snapshot.audio_backend.as_deref(),
                 Some(super::AUDIO_BACKEND)
             );
-            assert_eq!(snapshot.audio_generator_ids, Vec::<String>::new());
+            assert_eq!(snapshot.audio_generator_ids, ["kokoro_82m"]);
             assert_eq!(snapshot.audio_snapshot_preparer_backends, ["candle"]);
         }
         #[cfg(not(feature = "audio"))]
@@ -169,7 +172,7 @@ mod tests {
             runtime_catalog::AudioLane {
                 backend: super::AUDIO_BACKEND,
                 generators: audio,
-                preparers: candle_llm::snapshot_preparer_registry(),
+                preparers: candle_audio_catalog::snapshot_preparer_registry(),
             },
         )
         .unwrap();
@@ -187,7 +190,7 @@ mod tests {
         assert!(matches!(descriptor.modality, gen_core::Modality::Audio));
         let snapshot = catalog.snapshot();
         assert!(snapshot.generator_ids.len() > 50);
-        assert_eq!(snapshot.audio_generator_ids, ["dummy-audio"]);
+        assert_eq!(snapshot.audio_generator_ids, ["kokoro_82m", "dummy-audio"]);
         assert_eq!(snapshot.audio_snapshot_preparer_backends, ["candle"]);
         assert_eq!(snapshot.snapshot_preparer_backends, ["mlx"]);
     }

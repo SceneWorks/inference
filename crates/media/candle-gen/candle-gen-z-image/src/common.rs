@@ -57,6 +57,21 @@ pub(crate) const TOKENIZER_MAX_LEN: usize = 512;
 /// compute dtype (bf16) for the init/control latent.
 pub(crate) const ENC_DTYPE: DType = DType::F32;
 
+/// Img2img start step — the Z-Image "structure-preservation" convention (the fork's
+/// `init_time_step`, mirrored from `mlx-gen`'s shared `img2img::init_time_step`): for a reference
+/// with `strength` in `(0, 1]`, `max(1, floor(num_steps · strength))`; otherwise `0` (pure txt2img,
+/// no reference blend). Higher strength means a later start and fewer denoise steps, so the output
+/// stays closer to the reference. `floor` matches Python's truncation toward zero for `s >= 0`.
+pub(crate) fn init_time_step(num_steps: usize, strength: Option<f32>) -> usize {
+    match strength {
+        Some(s) if s > 0.0 => {
+            let s = s.clamp(0.0, 1.0);
+            ((num_steps as f32 * s) as usize).max(1)
+        }
+        _ => 0,
+    }
+}
+
 /// How a site fits a source image to the render size before the `[0,255] → [-1,1]` normalize — a
 /// genuine per-entry-point difference (preserved, not flattened, sc-9002).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

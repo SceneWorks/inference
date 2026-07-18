@@ -46,16 +46,17 @@ fn media_registry() -> gen_core::Result<gen_core::ProviderRegistry> {
 }
 
 /// The bundle's explicit audio lane (sc-12835): the complete Candle audio catalog from the audio
-/// composition root, plus the candle snapshot preparer carried **in the lane** so audio model
-/// snapshots are prepared through the same registry shape on every platform (on this candle
-/// bundle it mirrors the main preparer registry; on `runtime-macos` it is the only candle
-/// preparer in the composition).
+/// composition root, plus the lane's snapshot preparer carried **in the lane** so audio model
+/// snapshots are prepared through the same registry shape on every platform. Since sc-12836 the
+/// lane preparer is the catalog's composed `candle` registration — audio-shaped snapshots
+/// (Kokoro's pickle layout) take the audio path; everything else delegates to `candle-llm`'s
+/// preparer unchanged.
 #[cfg(feature = "audio")]
 fn audio_lane() -> runtime_catalog::AudioLane {
     runtime_catalog::AudioLane {
         backend: AUDIO_BACKEND,
         generators: candle_audio_catalog::provider_registry(),
-        preparers: candle_llm::snapshot_preparer_registry(),
+        preparers: candle_audio_catalog::snapshot_preparer_registry(),
     }
 }
 
@@ -100,16 +101,16 @@ mod tests {
         assert_eq!(snapshot.text_llm_ids, ["candle-llama", "candle-llava"]);
         assert_eq!(snapshot.snapshot_preparer_backends, ["candle"]);
         // The audio lane is Candle-native (sc-12901) and matches this bundle's own backend. Its
-        // ordered id surface is the audio catalog's — pinned EMPTY at this release; sc-12836+
-        // extend this exact assertion with each shipped audio provider id, in catalog order.
-        // The lane carries its own candle preparer (sc-12835).
+        // ordered id surface is the audio catalog's — first shipped provider: kokoro_82m
+        // (sc-12836); later stories extend this exact assertion in catalog order.
+        // The lane carries its own composed candle preparer (sc-12835/sc-12836).
         #[cfg(feature = "audio")]
         {
             assert_eq!(
                 snapshot.audio_backend.as_deref(),
                 Some(super::AUDIO_BACKEND)
             );
-            assert_eq!(snapshot.audio_generator_ids, Vec::<String>::new());
+            assert_eq!(snapshot.audio_generator_ids, ["kokoro_82m"]);
             assert_eq!(snapshot.audio_snapshot_preparer_backends, ["candle"]);
         }
         #[cfg(not(feature = "audio"))]
@@ -184,7 +185,10 @@ mod tests {
             .expect("dummy audio generator resolves in the bundle catalog");
         assert_eq!(descriptor.backend, "candle");
         assert!(matches!(descriptor.modality, gen_core::Modality::Audio));
-        assert_eq!(catalog.snapshot().audio_generator_ids, ["dummy-audio"]);
+        assert_eq!(
+            catalog.snapshot().audio_generator_ids,
+            ["kokoro_82m", "dummy-audio"]
+        );
     }
 
     /// The CPU candle bundle does **not** surface the NVFP4 FP4 tier (no FP4 compute win off Blackwell)

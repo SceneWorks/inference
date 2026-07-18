@@ -34,6 +34,7 @@ use crate::conditioning::{
     append_keyframe_clip, apply_conditioning, apply_denoise_mask, apply_keyframes, token_timesteps,
     unpatchify_grid, I2vConditioning, Keyframe, VideoTokenState,
 };
+use crate::contiguous;
 use crate::positions::{DEFAULT_FPS, SPATIAL_SCALE, TEMPORAL_SCALE};
 use crate::transformer::{to_denoised, AvDiT, LtxDiT};
 use crate::upsampler::{upsample_latents, LatentUpsampler};
@@ -55,14 +56,6 @@ pub const STAGE2_SIGMAS: [f32; 4] = [0.909_375, 0.725, 0.421_875, 0.0];
 
 fn scalar(v: f32) -> Array {
     Array::from_slice(&[v], &[1])
-}
-
-/// Force a logically-contiguous copy: host reads (`as_slice`) return the *physical* buffer, so an
-/// array left strided by the `(F,H,W,C)` transpose reads scrambled. sc-12748: delegates to the shared
-/// [`mlx_gen::array::contiguous`], int64-safe for over-`i32::MAX` outputs (LTX reaches 1280²×1025f =
-/// 5e9 elements — a single-dim `reshape(-1)` would raise there).
-fn contiguous(x: &Array) -> Result<Array> {
-    mlx_gen::array::contiguous(x)
 }
 
 /// The legacy dtype-preserving Euler update (the `use_legacy_euler` branch): for `σ_next > 0`,

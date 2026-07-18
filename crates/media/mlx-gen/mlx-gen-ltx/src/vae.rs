@@ -40,6 +40,7 @@ use mlx_gen::weights::{to_dtype, Weights};
 use mlx_gen::{CancelFlag, Error, Result};
 
 use crate::config::{LtxVaeConfig, VaeBlock};
+use crate::contiguous;
 use mlx_gen::tiling::{TilingConfig, VaeTiling};
 
 /// Decoder inline `pixel_norm` epsilon (`decoder.py` `ResnetBlock3DSimple.pixel_norm`).
@@ -55,14 +56,6 @@ fn scalar(v: f32) -> Array {
 /// already MLX conv layout `[O, kt, kh, kw, I]`, so no transpose is needed.
 fn f32(w: &Weights, key: &str) -> Result<Array> {
     to_dtype(w.require(key)?, Dtype::Float32)
-}
-
-/// Force a logically-contiguous copy at the public decode/encode output boundary: host reads return
-/// the *physical* buffer, so an array left strided by the final NDHWC→NCTHW transpose reads scrambled.
-/// sc-12748: delegates to the shared [`mlx_gen::array::contiguous`], which is int64-safe (an over-
-/// `i32::MAX` assembled output flattens via a 2-D split, not a single-dim `reshape(-1)` that raises).
-fn contiguous(x: &Array) -> Result<Array> {
-    mlx_gen::array::contiguous(x)
 }
 
 /// Slice `x` along `axis` to `[start, end)`.

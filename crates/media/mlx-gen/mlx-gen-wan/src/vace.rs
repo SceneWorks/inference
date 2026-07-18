@@ -37,7 +37,7 @@ use mlx_rs::{Array, Dtype};
 use crate::config::WanVaceConfig;
 use crate::patchify::{patchify, unpatchify};
 use crate::rope::{rope_apply, RopeTable};
-use crate::scheduler::{make_scheduler, SolverKind};
+use crate::scheduler::{make_scheduler, SolverKind, WanScheduler};
 use crate::text_encoder::gelu_tanh;
 use crate::vae::WanVae;
 
@@ -940,44 +940,78 @@ pub fn denoise_vace_moe(
     sched.set_timesteps(steps, shift);
     let timesteps: Vec<f32> = sched.timesteps().to_vec();
 
-    // Hoist the step-invariant work out of the loop (F-023), per expert: each expert's RoPE +
-    // patch-embedded control latent (its `vace_patch_embedding` differs) and its projected text
-    // contexts (its `text_embedder` differs). The RoPE grid is shared (same latent shape) but cheap
-    // to build twice; keeping the caches fully per-expert mirrors `denoise_moe`'s `build_cache`.
-    let low_cache = low.build_vace_cache(init_noise, control)?;
-    let high_cache = high.build_vace_cache(init_noise, control)?;
-    let low_cond = low.text_embed(ctx_cond)?;
-    let high_cond = high.text_embed(ctx_cond)?;
-    let low_uncond = ctx_uncond.map(|u| low.text_embed(u)).transpose()?;
-    let high_uncond = ctx_uncond.map(|u| high.text_embed(u)).transpose()?;
+    let k = crate::pipeline::crossing_index(&timesteps, boundary_timestep);
+    let mut latents = init_noise.clone();
+    denoise_vace_range(
+        &mut *sched,
+        high,
+        control,
+        scales,
+        guidance_high,
+        ctx_cond,
+        ctx_uncond,
+        &mut latents,
+        &timesteps,
+        0..k,
+        cancel,
+        on_step,
+    )?;
+    denoise_vace_range(
+        &mut *sched,
+        low,
+        control,
+        scales,
+        guidance_low,
+        ctx_cond,
+        ctx_uncond,
+        &mut latents,
+        &timesteps,
+        k..steps,
+        cancel,
+        on_step,
+    )?;
+    Ok(latents)
+}
+
+/// Run one expert over an absolute timestep range while preserving a shared scheduler and latent
+/// stream. The VACE cache and projected contexts are built inside this call, so a staged caller can
+/// drop them with the expert before loading the next expert.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn denoise_vace_range(
+    sched: &mut dyn WanScheduler,
+    transformer: &WanVaceTransformer,
+    control: &Array,
+    scales: &[f32],
+    guidance: f32,
+    ctx_cond: &Array,
+    ctx_uncond: Option<&Array>,
+    latents: &mut Array,
+    timesteps: &[f32],
+    range: std::ops::Range<usize>,
+    cancel: &CancelFlag,
+    on_step: &mut dyn FnMut(usize),
+) -> Result<()> {
+    let cache = transformer.build_vace_cache(latents, control)?;
+    let ctx_cond_emb = transformer.text_embed(ctx_cond)?;
+    let ctx_uncond_emb = ctx_uncond.map(|u| transformer.text_embed(u)).transpose()?;
     mlx_rs::transforms::eval([
-        &low_cache.cos_t,
-        &low_cache.sin_t,
-        &low_cache.control_emb,
-        &high_cache.control_emb,
-        &low_cond,
-        &high_cond,
+        &cache.cos_t,
+        &cache.sin_t,
+        &cache.control_emb,
+        &ctx_cond_emb,
     ])?;
 
-    // F-073: cond/uncond run as two sequential B=1 forwards, not a B=2 batch — the same documented
-    // divergence (and parity rationale) as [`denoise_vace`]'s loop.
-    let mut latents = init_noise.clone();
-    for (i, &t) in timesteps.iter().enumerate() {
+    for i in range {
         // Honor the engine cancellation contract — check before each (minutes-long) step (sc-5551).
         if cancel.is_cancelled() {
             return Err(Error::Canceled);
         }
-        // Boundary swap: high-noise expert at/above the boundary, low-noise below — switching the
-        // transformer, its cache, its projected contexts, and its guidance together.
-        let (dit, cache, cond_emb, uncond_emb, guidance) = if t >= boundary_timestep {
-            (high, &high_cache, &high_cond, &high_uncond, guidance_high)
-        } else {
-            (low, &low_cache, &low_cond, &low_uncond, guidance_low)
-        };
-        let cond = dit.forward_vace_cached(&latents, t, cache, cond_emb, scales)?;
-        let pred = match uncond_emb {
+        let t = timesteps[i];
+        let cond = transformer.forward_vace_cached(latents, t, &cache, &ctx_cond_emb, scales)?;
+        let pred = match &ctx_uncond_emb {
             Some(uncond_emb) => {
-                let uncond = dit.forward_vace_cached(&latents, t, cache, uncond_emb, scales)?;
+                let uncond =
+                    transformer.forward_vace_cached(latents, t, &cache, uncond_emb, scales)?;
                 add(
                     &uncond,
                     &multiply(&subtract(&cond, &uncond)?, scalar(guidance))?,
@@ -985,16 +1019,127 @@ pub fn denoise_vace_moe(
             }
             None => cond,
         };
-        latents = sched.step(&pred, &latents)?;
-        mlx_rs::transforms::eval([&latents])?;
+        *latents = sched.step(&pred, latents)?;
+        mlx_rs::transforms::eval([&*latents])?;
         on_step(i + 1);
     }
-    Ok(latents)
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tiny_vace_fixture() -> (Weights, WanVaceConfig) {
+        let mut weights = Weights::from_file(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/wanvace_transformer_golden.safetensors"
+        ))
+        .unwrap();
+        let aliases: Vec<_> = weights
+            .keys()
+            .filter_map(|key| {
+                key.strip_prefix("model.")
+                    .map(|name| (key.to_string(), name.to_string()))
+            })
+            .collect();
+        for (from, to) in aliases {
+            weights.alias(&from, &to);
+        }
+        weights.cast_all(Dtype::Float32).unwrap();
+        let config = WanVaceConfig::from_config_json(&serde_json::json!({
+            "model_type": "t2v",
+            "model_version": "2.1",
+            "dim": 64,
+            "num_heads": 4,
+            "num_layers": 4,
+            "ffn_dim": 128,
+            "freq_dim": 64,
+            "text_dim": 32,
+            "in_dim": 16,
+            "out_dim": 16,
+            "eps": 1e-6,
+            "dual_model": true,
+            "vace_layers": [0, 2],
+            "vace_in_channels": 96
+        }));
+        (weights, config)
+    }
+
+    #[test]
+    fn vace_range_split_matches_per_step_resident_selection() {
+        let (weights, config) = tiny_vace_fixture();
+        let low = WanVaceTransformer::from_weights(&weights, &config, Dtype::Float32).unwrap();
+        let high = WanVaceTransformer::from_weights(&weights, &config, Dtype::Float32).unwrap();
+        let init_noise = weights
+            .require("in.hidden_states")
+            .unwrap()
+            .reshape(&[16, 4, 8, 8])
+            .unwrap();
+        let control = weights
+            .require("in.control_hidden_states")
+            .unwrap()
+            .reshape(&[96, 4, 8, 8])
+            .unwrap();
+        let context = weights.require("in.encoder_hidden_states").unwrap();
+        let scales = [1.0, 0.5];
+        let cancel = CancelFlag::new();
+        let steps = 4;
+        let boundary = 500.0;
+
+        // Production range-split path (also used by the staged one-resident caller).
+        let ranged = denoise_vace_moe(
+            &low,
+            &high,
+            &control,
+            &scales,
+            SolverKind::UniPC,
+            1000,
+            steps,
+            1.0,
+            boundary,
+            2.0,
+            3.0,
+            context,
+            None,
+            &init_noise,
+            &cancel,
+            &mut |_| {},
+        )
+        .unwrap();
+
+        // Pre-swap resident oracle: build both expert caches first and select expert/cache/guidance
+        // independently at every step, matching the original `denoise_vace_moe` implementation.
+        let mut sched = make_scheduler(SolverKind::UniPC, 1000);
+        sched.set_timesteps(steps, 1.0);
+        let timesteps = sched.timesteps().to_vec();
+        let low_cache = low.build_vace_cache(&init_noise, &control).unwrap();
+        let high_cache = high.build_vace_cache(&init_noise, &control).unwrap();
+        let low_context = low.text_embed(context).unwrap();
+        let high_context = high.text_embed(context).unwrap();
+        let mut resident = init_noise.clone();
+        for &t in &timesteps {
+            let (transformer, cache, embedded, guidance) = if t >= boundary {
+                (&high, &high_cache, &high_context, 3.0)
+            } else {
+                (&low, &low_cache, &low_context, 2.0)
+            };
+            let prediction = transformer
+                .forward_vace_cached(&resident, t, cache, embedded, &scales)
+                .unwrap();
+            // CFG is disabled in both paths, so guidance is deliberately unused by the resident
+            // oracle; assert the routing value to keep both per-expert choices visible in the test.
+            assert!(guidance == 2.0 || guidance == 3.0);
+            resident = sched.step(&prediction, &resident).unwrap();
+            mlx_rs::transforms::eval([&resident]).unwrap();
+        }
+
+        assert_eq!(
+            ranged.as_slice::<f32>(),
+            resident.as_slice::<f32>(),
+            "range split changed VACE denoise numerics"
+        );
+    }
 
     #[test]
     fn vace_scales_len_check_rejects_mismatch() {
