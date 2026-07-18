@@ -43,28 +43,92 @@ pub(crate) fn rms(x: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor> {
         .to_dtype(dt)
 }
 
-/// Scaled-dot-product attention. `q,k,v`: `[B, H, S*, d]`; softmax upcast to f32.
+/// sc-12894 — Wan's **denoise self-attention** scores-chunk budget, deliberately smaller than the
+/// shared [`candle_gen::ATTN_SCORES_BUDGET`] (1e9). sc-12434 chunks the query rows so the full
+/// `[B,H,S,S]` matrix is never materialized, but at the A14B 720p ceiling (S ≈ 75.6k tokens, 40 heads)
+/// the *per-chunk* transient — the block's `[B,H,block,Sk]` scores + softmax probs, upcast to f32 for
+/// the softmax — is the DENOISE peak's dominant term (~8 GiB at the 1e9 budget, GPU-proven via the #95
+/// `USED_MEM_HIGH` probe: the A14B q4 true peak was 30.11 GiB, denoise-owned). The transient scales
+/// linearly with the budget (fewer score elements per chunk, proportionally more chunks), so an 8×
+/// smaller budget shrinks it to ~1 GiB and drops the A14B true peak under the 24 GiB card. Still far
+/// below `i32::MAX` (2.147e9) — sc-12434's CUDA-i32 overflow safety is preserved (strictly tightened),
+/// and cross-attention (S_kv = text tokens, ≪ budget) stays a single un-chunked pass, untouched.
+const WAN_SELF_ATTN_SCORES_BUDGET: usize = 125_000_000;
+
+// sc-12894 compile-time invariants: the Wan budget must not exceed the shared i32-safe ceiling, and
+// must itself stay under candle's CUDA i32 element limit — so the sc-12434 overflow safety is preserved
+// (strictly tightened) no matter how this const is edited.
+const _: () = assert!(WAN_SELF_ATTN_SCORES_BUDGET <= candle_gen::ATTN_SCORES_BUDGET);
+const _: () = assert!(WAN_SELF_ATTN_SCORES_BUDGET < i32::MAX as usize);
+
+/// sc-12894 measurement knob (mirrors the `WAN_VRAM_*` probe envs): override
+/// [`WAN_SELF_ATTN_SCORES_BUDGET`] for a GPU A/B budget sweep without a rebuild. Unset / non-positive /
+/// unparseable ⇒ the shipped default. Read once (the sweep sets it before the first render).
+fn wan_self_attn_budget() -> usize {
+    use std::sync::OnceLock;
+    static BUDGET: OnceLock<usize> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        std::env::var("WAN_ATTN_SCORES_BUDGET")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&b| b > 0)
+            .unwrap_or(WAN_SELF_ATTN_SCORES_BUDGET)
+    })
+}
+
+/// sc-12894 measurement knob: when set (`WAN_ATTN_SOFTMAX_BF16=1`), run the scores softmax in the
+/// scores' native **bf16** instead of the f32 upcast — the candle CUDA softmax kernel max-stabilizes
+/// and accumulates the sum in f32 regardless (`SOFTMAX_OP(__nv_bfloat16, float, …)`), so only the
+/// `exp`/probs carry bf16 rounding, which halves the per-chunk transient. Off by default (the f32
+/// upcast is numerically exact — the chunk lever alone is byte-identical to the un-chunked pass);
+/// gated on only after a parity A/B confirms the bf16 path stays within tolerance. Read once.
+fn wan_self_attn_bf16_softmax() -> bool {
+    use std::sync::OnceLock;
+    static BF16: OnceLock<bool> = OnceLock::new();
+    *BF16.get_or_init(|| {
+        std::env::var("WAN_ATTN_SOFTMAX_BF16")
+            .ok()
+            .map(|v| {
+                let v = v.trim();
+                v == "1" || v.eq_ignore_ascii_case("true")
+            })
+            .unwrap_or(false)
+    })
+}
+
+/// Scaled-dot-product attention. `q,k,v`: `[B, H, S*, d]`; softmax upcast to f32 (bf16 under the
+/// sc-12894 knob).
 ///
 /// Delegates to the shared i32-overflow-safe [`candle_gen::sdpa_budgeted_bhsd`] — the sc-6217 /
 /// sc-9116 query-row chunking Qwen and Krea already carry, ported to Wan here (sc-12434). It chunks
-/// over the query rows once the `[B, H, Sq, Sk]` score block would exceed
-/// [`candle_gen::ATTN_SCORES_BUDGET`], so the full `[B, H, S, S]` matrix is never materialized. Both
-/// A14B experts and the 5B share this one attention; at every advertised A14B geometry the un-chunked
-/// score block (S ≈ 33k tokens at 480p, up to ≈ 76k at the 720p `MAX_AREA_14B` ceiling; 40 heads) is
-/// hundreds of GiB and OOMs a 96 GB card before the first denoise step — chunking caps each block's
-/// transient near the budget instead. Each query row's softmax is over all keys and independent of the
-/// others, so the chunked result equals the single pass; the chunking engages only on the over-budget
-/// denoise self-attention and stays a no-op single pass for the small cross-attention (S_kv = text
-/// tokens) and every in-budget size.
+/// over the query rows once the `[B, H, Sq, Sk]` score block would exceed [`wan_self_attn_budget`], so
+/// the full `[B, H, S, S]` matrix is never materialized. Both A14B experts and the 5B share this one
+/// attention; at every advertised A14B geometry the un-chunked score block (S ≈ 33k tokens at 480p, up
+/// to ≈ 76k at the 720p `MAX_AREA_14B` ceiling; 40 heads) is hundreds of GiB and OOMs a 96 GB card
+/// before the first denoise step — chunking caps each block's transient near the budget instead. The
+/// budget is Wan's own reduced [`WAN_SELF_ATTN_SCORES_BUDGET`] (sc-12894): small enough that the
+/// per-chunk f32 scores + probs transient fits the denoise peak under 24 GiB, still ≪ `i32::MAX`. Each
+/// query row's softmax is over all keys and independent of the others, so the chunked result equals the
+/// single pass; the chunking engages only on the over-budget denoise self-attention and stays a no-op
+/// single pass for the small cross-attention (S_kv = text tokens) and every in-budget size.
 fn sdpa(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64) -> Result<Tensor> {
     let dtype = q.dtype();
+    let bf16 = wan_self_attn_bf16_softmax();
     sdpa_budgeted(
         q,
         k,
         v,
         scale,
-        candle_gen::ATTN_SCORES_BUDGET,
-        |scores: &Tensor| softmax_last_dim(&scores.to_dtype(DType::F32)?)?.to_dtype(dtype),
+        wan_self_attn_budget(),
+        move |scores: &Tensor| {
+            if bf16 {
+                // sc-12894: softmax in the scores' native bf16 (the CUDA kernel still max-stabilizes
+                // and sums in f32) — no f32 upcast/downcast pair, so the per-chunk transient halves.
+                softmax_last_dim(scores)
+            } else {
+                softmax_last_dim(&scores.to_dtype(DType::F32)?)?.to_dtype(dtype)
+            }
+        },
     )
 }
 
@@ -849,17 +913,63 @@ mod tests {
 
         // The production budget genuinely engages at the story's 832x480 A14B proof geometry
         // (h = 40, S ≈ 32,760, b = 1 under Lightning CFG-off): one query row's score contribution
-        // already exceeds the budget, so `sdpa`'s fixed ATTN_SCORES_BUDGET forces chunking there, and
-        // each resulting block stays under candle's CUDA i32 element ceiling.
+        // already exceeds the budget, so `sdpa`'s Wan budget forces chunking there, and each resulting
+        // block stays under candle's CUDA i32 element ceiling. sc-12894 tightened the budget below the
+        // shared 1e9 ceiling to cap the denoise transient — so chunking engages harder, never less (the
+        // budget-vs-ceiling invariants are the compile-time `const _` assertions by the const itself).
         let rows_per_query = 40 * 32_760usize;
         assert!(
-            rows_per_query * 32_760 > candle_gen::ATTN_SCORES_BUDGET,
+            rows_per_query * 32_760 > WAN_SELF_ATTN_SCORES_BUDGET,
             "A14B 480p self-attention must be over budget (chunking engages)"
         );
-        let block = candle_gen::ATTN_SCORES_BUDGET / rows_per_query;
+        let block = WAN_SELF_ATTN_SCORES_BUDGET / rows_per_query;
         assert!(
             rows_per_query * block <= i32::MAX as usize,
             "each chunk's score block must stay under the CUDA i32 element ceiling"
+        );
+    }
+
+    /// sc-12894 parity gate for the **bf16-softmax** lever (the `WAN_ATTN_SOFTMAX_BF16` knob). The
+    /// chunk lever is byte-exact (proven above); the bf16 softmax is not — it trades the f32 upcast for
+    /// half the per-chunk transient. This bounds that trade against the actual CUDA kernels (bf16 matmul
+    /// and softmax are CUDA-only — CPU has no bf16 matmul), so a regression that widened the gap (say a
+    /// bf16 sum accumulator) is caught here and the delta the GPU render's PSNR check corroborates is
+    /// quantified. The two paths must stay tightly correlated: the CUDA bf16 softmax still max-stabilizes
+    /// and sums in f32, so only the `exp`/probs carry ~2^-8 bf16 rounding and the attention output — a
+    /// convex combination of unit-scale values — tracks the f32 path to well within a distilled sampler's
+    /// tolerance.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn bf16_softmax_attention_matches_f32_within_tolerance() {
+        let dev = Device::new_cuda(0).expect("cuda:0");
+        let (b, h, s, d) = (1usize, 4usize, 96usize, 64usize);
+        let mk = || {
+            Tensor::randn(0f32, 1f32, (b, h, s, d), &dev)
+                .and_then(|t| t.to_dtype(DType::BF16))
+                .unwrap()
+        };
+        let (q, k, v) = (mk(), mk(), mk());
+        let scale = (d as f64).powf(-0.5);
+
+        let f32_path = sdpa_budgeted(&q, &k, &v, scale, usize::MAX, |scores: &Tensor| {
+            softmax_last_dim(&scores.to_dtype(DType::F32)?)?.to_dtype(DType::BF16)
+        })
+        .unwrap();
+        let bf16_path = sdpa_budgeted(&q, &k, &v, scale, usize::MAX, |scores: &Tensor| {
+            softmax_last_dim(scores)
+        })
+        .unwrap();
+
+        // Compare in f32. bf16 has ~7-bit mantissa (step ~1/128 near 1.0); the attention output is a
+        // convex combination of the (unit-scale) values, so a max-abs a few bf16 ULPs wide is expected
+        // and acceptable — an order of magnitude tighter would demand the f32 upcast we are dropping.
+        let a = f32_path.to_dtype(DType::F32).unwrap();
+        let bpath = bf16_path.to_dtype(DType::F32).unwrap();
+        let max_abs = max_abs(&a, &bpath);
+        eprintln!("[sc-12894] bf16-vs-f32 softmax attention max_abs = {max_abs:.5}");
+        assert!(
+            max_abs < 0.05,
+            "bf16-softmax attention drifted {max_abs} from the f32 path (> 0.05 bf16 ULPs)"
         );
     }
 }
