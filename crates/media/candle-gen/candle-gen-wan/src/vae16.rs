@@ -536,6 +536,11 @@ impl WanVae16 {
         // vanish from the latent. All in-repo callers pre-align, but this method (and `Scail2Job`)
         // is `pub`, so reject the unaligned length with a typed error rather than dropping frames.
         require_aligned_encode_frames(t)?;
+        // sc-12894: the encoder convs run in the VAE's working dtype (bf16 on the A14B since sc-12818);
+        // the I2V conditioning video arrives f32, so cast it to match — the encode-side mirror of
+        // [`unnormalize`]'s decode cast. A no-op on the f32 5B/test path; without it the bf16 encoder's
+        // first conv2d hits a `dtype mismatch, lhs: F32, rhs: BF16` and every I2V render crashes.
+        let video = video.to_dtype(self.dtype)?;
         let num_chunks = 1 + (t - 1) / 4;
         encoder.reset_cache();
         // Collect the per-chunk encoded features and `cat` once (sc-9037): cat-ing onto a growing
