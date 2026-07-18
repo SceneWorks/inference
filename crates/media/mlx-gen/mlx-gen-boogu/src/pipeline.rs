@@ -31,7 +31,7 @@ use mlx_rs::ops::{add, multiply, subtract};
 use mlx_rs::transforms::eval;
 use mlx_rs::{random, Array, Dtype};
 
-use mlx_gen::image::{decoded_to_image, validate_multiple_of_16};
+use mlx_gen::image::{decoded_to_image, validate_multiple_of};
 use mlx_gen::img2img::{add_noise_by_interpolation, preprocess_init_image};
 use mlx_gen::media::Image;
 use mlx_gen::{
@@ -398,7 +398,7 @@ impl BooguHeavy {
         references
             .iter()
             .map(|r| {
-                validate_multiple_of_16(r.width, r.height, "boogu")?;
+                validate_multiple_of(r.width, r.height, crate::RES_MULTIPLE, "boogu")?;
                 self.vae.encode(&image_to_pixels(r)?)
             })
             .collect()
@@ -492,7 +492,7 @@ impl BooguHeavy {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
-        validate_multiple_of_16(opts.width, opts.height, "boogu")?;
+        validate_multiple_of(opts.width, opts.height, crate::RES_MULTIPLE, "boogu")?;
         let lat = init_noise(opts.height, opts.width, opts.seed, 0)?;
         let scale = opts.text_guidance_scale;
         let lat = run_flow_sampler(
@@ -525,7 +525,7 @@ impl BooguHeavy {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
-        validate_multiple_of_16(opts.width, opts.height, "boogu")?;
+        validate_multiple_of(opts.width, opts.height, crate::RES_MULTIPLE, "boogu")?;
         let noise = init_noise(opts.height, opts.width, opts.seed, 0)?;
         let start = start_step.min(sigmas.len().saturating_sub(1));
         let lat = add_noise_by_interpolation(clean, &noise, sigmas[start])?;
@@ -556,7 +556,7 @@ impl BooguHeavy {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
-        validate_multiple_of_16(opts.width, opts.height, "boogu")?;
+        validate_multiple_of(opts.width, opts.height, crate::RES_MULTIPLE, "boogu")?;
 
         if turbo_uses_curated(opts.sampler.as_deref(), opts.scheduler.as_deref()) {
             // F-093 / sc-11122: a scheduler-only request defaults the sampler to `lcm` so the curated
@@ -611,7 +611,7 @@ impl BooguHeavy {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
-        validate_multiple_of_16(opts.width, opts.height, "boogu")?;
+        validate_multiple_of(opts.width, opts.height, crate::RES_MULTIPLE, "boogu")?;
 
         let noise = init_noise(opts.height, opts.width, opts.seed, 0)?;
 
@@ -671,7 +671,7 @@ impl BooguHeavy {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
-        validate_multiple_of_16(opts.width, opts.height, "boogu")?;
+        validate_multiple_of(opts.width, opts.height, crate::RES_MULTIPLE, "boogu")?;
         let lat = init_noise(opts.height, opts.width, opts.seed, 0)?;
         let scale = opts.text_guidance_scale;
         let lat = run_flow_sampler(
