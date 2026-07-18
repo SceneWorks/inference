@@ -264,7 +264,8 @@ fn wan_ti2v_5b_real_weight_e2e_matches_reference() {
     // to latents 1.99e-1/1.46e-1 and video 1.28e-1/1.51e-1 (measured 2026-07-18; frame0 freeze
     // stays EXACT 0.0 — the mask-blend pin is a copy, not compute). Envelope-gated below; a
     // conversion/wiring bug still gives mean_rel ~O(1) on the per-forward gate, well above 5e-2.
-    // T5 + vae22 encode stay at the tight sub-ULP-class bounds (measured ~3e-6 mean_rel).
+    // T5 + vae22 encode measured at the sub-ULP class (~3e-6 mean_rel); their asserts keep the
+    // historical loose 1e-2 bounds below.
     assert!(
         pf_mr < 5e-2 && ptf_mr < 5e-2,
         "per-forward exceeds the 0.32.0 cross-stack dense-bf16 bound: {pf_mr:.3e}/{ptf_mr:.3e} (sc-12896)"

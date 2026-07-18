@@ -1,13 +1,14 @@
 """LTX-2.3 e2e golden — PHASE A: reference text encoder (sc-2679 S6).
 
-sc-12896: goldens now MUST be dumped on the version-matched **0.32.0 non-NAX** env — mlx 0.32.0
-built from source at MACOSX_DEPLOYMENT_TARGET=15.0 (e.g. ~/Repos/mflux/.venv-0320); the old
-/tmp/mlx312 (0.31.2) instructions below are retained for provenance only.
+sc-12896: the blessed `ltx_e2e_te.safetensors` was re-dumped with `~/Repos/mflux/.venv-0320`
+(mlx 0.32.0 built from source at MACOSX_DEPLOYMENT_TARGET=15.0, non-NAX + transformers 5.10.1) —
+use that env for any future re-dump so PHASE A and PHASE B stay version-matched. (The original
+0.31.x recipe ran PHASE A in the mflux 0.31.0 venv because only it had `transformers`; .venv-0320
+carries the full stack, so the split is no longer needed.)
 
 Tokenizes a fixed prompt with the Gemma-3 `AutoTokenizer` (left-pad, `max_length`, `add_special_
 tokens`) and runs the reference TE (Gemma backbone → per-token-RMS feature extractor → connector) →
-`video_embeddings`. The TE is pure dense, so this runs in the **mflux venv (0.31.0)** (it has
-`transformers`); the quantized pipeline (PHASE B) needs 0.31.2.
+`video_embeddings`. The TE is pure dense.
 
 Writes the intermediate `tools/golden/ltx_e2e_te.safetensors` (input_ids + video_embeddings) consumed
 by `dump_ltx_e2e_golden.py` (PHASE B).

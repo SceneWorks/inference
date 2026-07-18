@@ -380,7 +380,8 @@ fn e2e_transformer_v0_matches_golden() {
         "transformer v0: peak_rel={pr:.3e} mean_rel={mr:.3e} shape={:?}",
         v.shape()
     );
-    // Bit-exact vs the bf16 fork after the RoPE/time_proj host→MLX fixes (sc-2787).
+    // Was bit-exact vs the bf16 fork after the RoPE/time_proj host→MLX fixes (sc-2787); on
+    // 0.32.0 the cross-stack per-forward drift (sc-12896) sits well inside this 1e-3 bound.
     assert!(
         pr < 1e-3,
         "transformer single forward diverged: peak_rel {pr:.3e}"

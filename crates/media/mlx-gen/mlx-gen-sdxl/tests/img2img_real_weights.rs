@@ -4,9 +4,9 @@
 //! Run: cargo test -p mlx-gen-sdxl --release --test img2img_real_weights -- --ignored --nocapture
 //!
 //! Two gates:
-//! - `img2img_components_bit_exact` — the init pipeline (preprocess → VAE-encode mean `x_0`,
-//!   `add_noise` → `x_t`, and the step-1 U-Net eps) is **bit-exact** to the reference. This is the
-//!   correctness proof.
+//! - `img2img_components_match_reference` — the init pipeline (preprocess → VAE-encode mean `x_0`,
+//!   `add_noise` → `x_t`, and the step-1 U-Net eps) matches the reference within the tight sc-12896
+//!   cross-stack bounds (near-bit-exact at 0.31.2). This is the correctness proof.
 //! - `img2img_matches_vendored` — the public `generate()` render is the **same generation** as the
 //!   reference. At a fractional strength the per-step sigmas are non-round, where pmetal's
 //!   source-built MLX 0.31.1 and the golden's wheel MLX 0.31.0 differ by 1 ULP in f32
@@ -69,7 +69,7 @@ fn init_image(g: &Weights, w: u32, h: u32) -> Image {
 
 #[test]
 #[ignore = "needs the real SDXL snapshot + img2img golden"]
-fn img2img_components_bit_exact() {
+fn img2img_components_match_reference() {
     let g = Weights::from_file(GOLDEN).unwrap();
     let seed: u64 = g.metadata("seed").unwrap().parse().unwrap();
     let cfg: f32 = g.metadata("cfg").unwrap().parse().unwrap();

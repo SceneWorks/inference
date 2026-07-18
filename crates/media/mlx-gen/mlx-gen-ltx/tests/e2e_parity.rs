@@ -233,9 +233,11 @@ fn run_e2e_gate(dir: &std::path::Path, golden: &str, bf16: bool) {
         "renoise bit-exact"
     );
 
-    // Stage-2 denoise (3 steps) from the reference's exact `renoised` input — carries 3 steps of the
-    // 0.32.0 per-forward cross-stack drift (sc-12896; was bit-exact at 0.31.2 per sc-2842). Bounded
-    // tightly: only mild compounding is possible over 3 teacher-entered steps.
+    // Stage-2 denoise (3 steps) from the reference's exact `renoised` input. sc-12896 measured at
+    // matched 0.32.0: bf16 = 0.000e0 in BOTH quant tiers (teacher-forcing removes the upsampler
+    // seed, and the quant-bf16 per-forward is byte-exact) — so bf16 stays asserted EXACT. The f32
+    // path carries 3 teacher-entered steps of the per-forward cross-stack drift (measured mean_rel
+    // 4.234e-6 (Q8) / 6.258e-6 (Q4)); bounded ~8× the worst measurement.
     let s2 = denoise(
         &dit,
         g.require("renoised").unwrap(),
@@ -249,10 +251,17 @@ fn run_e2e_gate(dir: &std::path::Path, golden: &str, bf16: bool) {
     .expect("stage2");
     let s2_mr = mean_rel(&s2, g.require("final_latents").unwrap());
     eprintln!("stage2 (from ref input) mean_rel = {s2_mr:.3e}");
-    assert!(
-        s2_mr <= 3.0e-2,
-        "stage2 denoise from correct input mean_rel {s2_mr:.3e} exceeds the 0.32.0 cross-stack bound (sc-12896)"
-    );
+    if bf16 {
+        assert!(
+            s2_mr == 0.0,
+            "bf16 stage2 denoise from correct input must be bit-exact: {s2_mr:.3e}"
+        );
+    } else {
+        assert!(
+            s2_mr <= 5.0e-5,
+            "stage2 denoise from correct input mean_rel {s2_mr:.3e} exceeds the 0.32.0 cross-stack f32 bound 5e-5 (sc-12896)"
+        );
+    }
 
     // --- GATED: the full 2-stage e2e — the chaos-sensitive distilled stage-1 from pure noise. ---
     let latents = generate_t2v_latents(

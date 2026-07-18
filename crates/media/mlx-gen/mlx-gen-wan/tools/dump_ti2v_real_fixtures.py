@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 """Dump a sc-2680 **real-weight** parity fixture: small **T2V** + **TI2V** runs of the `mlx_video`
+reference on the *actual converted* Wan2.2-TI2V-5B weights, for the Rust dense 5B pipeline (the z48
+`Wan22Vae` + `denoise`/`denoise_ti2v` + the DiT `forward`/`forward_tokens`) to gate against e2e.
 
 sc-12896: fixtures now MUST be dumped on the version-matched **0.32.0 non-NAX** env — mlx 0.32.0
 built from source at MACOSX_DEPLOYMENT_TARGET=15.0 (e.g. ~/Repos/mflux/.venv-0320 +
 PYTHONPATH=<mlx_video src>); the SceneWorks-venv instructions below are the original recipe.
-
-reference on the *actual converted* Wan2.2-TI2V-5B weights, for the Rust dense 5B pipeline (the z48
-`Wan22Vae` + `denoise`/`denoise_ti2v` + the DiT `forward`/`forward_tokens`) to gate against e2e.
-
 Unlike the tiny seeded gates, this loads the **real** 5B snapshot (10 GB DiT + 11 GB UMT5 + 2.8 GB
 z48 VAE) and runs the genuine chain. Only the init **noise** and the **preprocessed image tensor**
 are injected (seeded RNG isn't portable across mlx-python/mlx-rs; the PIL preprocess is gated

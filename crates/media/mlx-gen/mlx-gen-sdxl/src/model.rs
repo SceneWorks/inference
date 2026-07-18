@@ -265,8 +265,8 @@ impl SdxlHeavyOwned {
 /// reference at the matched MLX — now 0.32.0, RE-CONFIRMED by sc-12896: the fp16 UNet golden was
 /// re-dumped on the 0.32.0 non-NAX env and `unet_single_forward_matches_vendored_fp16` measures
 /// 100.00% byte-exact (16384/16384). Established on 0.31.2 by sc-2721 (needs sc-2772's NAX 16-bit
-/// fix + the compiled `gelu_exact`); fp16 is bit-identical across the 0.31.2→0.32.0 bump (the
-/// cross-stack drift is f32-only — see sc-12896).
+/// fix + the compiled `gelu_exact`); fp16 is bit-identical across the 0.31.2→0.32.0 bump (on
+/// SDXL's path the sc-12896 cross-stack drift is f32-only; dense-bf16 paths drift in other crates).
 /// The lower-level `load_unet`/`load_text_encoder_*` keep an f32 path for the tight stage gates.
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     if spec.precision != Precision::Bf16 {
