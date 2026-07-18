@@ -19,6 +19,7 @@
 
 use candle_gen::candle_core::{DType, Tensor};
 use candle_gen::candle_nn::VarBuilder;
+use candle_gen::gen_core::CancelFlag;
 use candle_gen_lens::text::LensTokenizer;
 use candle_gen_lens::text_encoder::{Config, LensReasonerModel};
 
@@ -95,7 +96,7 @@ fn lens_reasoner_matches_reference() -> Result<(), AnyErr> {
     //    reproduce torch's greedy tokens. Only the first token is hard-gated: cross-build bf16 makes the
     //    per-step logits diverge enough to flip argmax on a late near-tie (the same effect as the
     //    encoder e2e's 0.997 cosine); the deterministic correctness proof is gate #3.
-    let got_new = model.generate_greedy(&input_ids, max_new)?;
+    let got_new = model.generate_greedy(&input_ids, max_new, &CancelFlag::new())?;
     let match_len = got_new
         .iter()
         .zip(&want_new)
