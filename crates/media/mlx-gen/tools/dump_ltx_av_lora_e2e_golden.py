@@ -15,12 +15,14 @@ Inputs (synthetic video/audio conditioning + per-stage noise) are reused verbati
 **base** AV e2e golden, so this differs from it only by the LoRA — a clean A/B. Runs **f32** (the Rust
 `quant_f32` path), the same regime as the base AV e2e gate.
 
-Default LoRA = `Samantha_ltx2.3` (trains video + audio + cross-modal attn/ff/gate — 1632 targets,
-exercising the whole AvDiT surface). Override with `LTX_LORA_MULTI=/path/to/lora.safetensors`.
+Default LoRA = `DR34ML4Y_LTXXX_V2` (full-surface: video + audio + cross-modal). Override with
+`LTX_LORA_MULTI=/path/to/lora.safetensors` — ANY full-surface lora works (sc-13019): the golden
+records `lora_path` (home-relative when under `$HOME`) in its metadata and the Rust gate derives the
+structural expectations from the lora file's own key inventory, so no counts are hardcoded anywhere.
 
-**MUST run with mlx 0.31.2.** Run the base AV e2e dump first.
-    MLX_VIDEO_SRC=~/.cache/uv/archive-v0/DtG1XO51ABFxUGHg /tmp/mlx312/bin/python tools/dump_ltx_av_e2e_golden.py
-    MLX_VIDEO_SRC=~/.cache/uv/archive-v0/DtG1XO51ABFxUGHg /tmp/mlx312/bin/python tools/dump_ltx_av_lora_e2e_golden.py
+Run the base AV e2e dump first (same env):
+    MLX_VIDEO_SRC=~/.cache/uv/archive-v0/DtG1XO51ABFxUGHg ~/Repos/mflux/.venv-0320/bin/python tools/dump_ltx_av_e2e_golden.py
+    MLX_VIDEO_SRC=~/.cache/uv/archive-v0/DtG1XO51ABFxUGHg ~/Repos/mflux/.venv-0320/bin/python tools/dump_ltx_av_lora_e2e_golden.py
 """
 
 import glob
@@ -76,10 +78,16 @@ LORA = Path(
         "LTX_LORA_MULTI",
         str(
             Path.home()
-            / "Library/Application Support/SceneWorks/data/loras/samantha/Samantha_ltx2.3.safetensors"
+            / "SceneWorks/data/loras/ltx_video_dr34ml4y_ltx/DR34ML4Y_LTXXX_V2.safetensors"
         ),
     )
 )
+# Recorded in the golden metadata (sc-13019) so the Rust gate loads the SAME lora; home-relative
+# when under $HOME so the golden is portable across machines/users.
+try:
+    LORA_META = "~/" + str(LORA.relative_to(Path.home()))
+except ValueError:
+    LORA_META = str(LORA)
 LF, AF = 2, 9  # 256×256, 9 frames → 2 latent frames; 9 audio frames
 
 
@@ -202,5 +210,6 @@ tensors = {
 out = fixture("mlx-gen-ltx/tests/fixtures/ltx_av_lora_e2e_golden.safetensors")
 Path(out).parent.mkdir(parents=True, exist_ok=True)
 mx.save_safetensors(out, tensors, metadata={"sr": str(audio_sr), "lora": LORA.name,
+                                            "lora_path": LORA_META,
                                             "applied": str(applied), "skipped": str(len(skipped))})
 print(f"wrote {out}")

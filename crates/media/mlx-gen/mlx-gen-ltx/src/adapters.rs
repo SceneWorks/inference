@@ -106,6 +106,50 @@ const SUFFIXES: [(&str, Role); 9] = [
     (".alpha", Role::Alpha),
 ];
 
+/// Surface inventory of the LoRA **targets a file carries** (sc-13019): unique normalized module
+/// paths with BOTH a down and an up factor, split into `(video, audio_or_cross_modal)`. The
+/// audio/cross bucket is classified textually from the LTX module namespace (`audio*` blocks,
+/// `av_ca`/`a2v` cross-modal attention) — the same classification the reference's video-only skip
+/// behavior produces.
+///
+/// This is the file-derived half of the structural adapter gates: the tests assert the *routing
+/// report* (what [`apply_ltx_adapters`] resolved on a given model) against this *key-inventory*
+/// expectation, so the counts follow whatever lora is under test instead of hardcoding one training
+/// recipe's shape (the old gates baked in one character lora's 576/1632 counts, making the suites
+/// un-runnable without that exact asset), while a routing regression that drops modules still trips
+/// the comparison.
+pub fn lora_target_inventory(w: &Weights) -> (Vec<String>, Vec<String>) {
+    use std::collections::BTreeSet;
+    let mut downs: BTreeSet<String> = BTreeSet::new();
+    let mut ups: BTreeSet<String> = BTreeSet::new();
+    for key in w.keys() {
+        let Some((stem, role)) = SUFFIXES
+            .iter()
+            .find_map(|(suf, role)| key.strip_suffix(suf).map(|s| (s, *role)))
+        else {
+            continue;
+        };
+        match role {
+            Role::Down => {
+                downs.insert(normalize_ltx_key(stem));
+            }
+            Role::Up => {
+                ups.insert(normalize_ltx_key(stem));
+            }
+            Role::Alpha => {}
+        }
+    }
+    let (mut video, mut audio) = (Vec::new(), Vec::new());
+    for path in downs.intersection(&ups) {
+        if path.contains("audio") || path.contains("av_ca") || path.contains("a2v") {
+            audio.push(path.clone());
+        } else {
+            video.push(path.clone());
+        }
+    }
+    (video, audio)
+}
+
 /// Read a scalar `.alpha` as f32 regardless of on-disk dtype (real files ship it bf16; a direct
 /// `as_slice::<f32>()` would panic on a dtype mismatch). A `[]`- or `[1]`-shaped scalar both read.
 fn read_alpha(a: &Array) -> Result<f32> {

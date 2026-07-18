@@ -11,8 +11,12 @@
 //! bit-exact `LtxDiT` gate + a full-surface `AvDiT` routing gate together cover the production path.
 //!
 //! Default video LoRA = `LTX2.3_Crisp_Enhance` (attn + ff + gate, 576 video targets, no audio/adaLN);
-//! default multi-surface LoRA = `Samantha_ltx2.3` (also trains audio + cross-modal). Override with
+//! default multi-surface LoRA = `DR34ML4Y_LTXXX_V2` (also trains audio + cross-modal). Override with
 //! `LTX_LORA` / `LTX_LORA_MULTI` (regenerate the golden the same way for a different `LTX_LORA`).
+//! sc-13019: the multi-surface gates derive expected counts from the lora FILE's own key inventory
+//! (`adapters::lora_target_inventory`) instead of hardcoding one lora's training-recipe shape, so
+//! any full-surface lora satisfies them (the old 576/1632 literals encoded a single character lora
+//! and made the suites un-runnable without that exact asset).
 //!
 //! Gates (all `#[ignore]`, ~20 GB model + the LoRA):
 //!  1. `lora_routing_resolves_full_crisp_surface` — every Crisp target resolves (applied 576, 0 skipped).
@@ -20,7 +24,7 @@
 //!  3. `lora_multi_surface_skips_audio_without_error` — on the video-only `LtxDiT` building block, a
 //!     LoRA's audio targets are reported skipped, never errored.
 //!  4. `lora_full_surface_routes_on_avdit` — on the production `AvDiT`, the same LoRA's audio +
-//!     cross-modal targets all resolve (1632, 0 skipped).
+//!     cross-modal targets all resolve (file-derived count, 0 skipped).
 //!  5. `lora_per_pass_strength_changes_output` — a `[1.0, 0.0]` per-pass schedule (stage-2 LoRA off)
 //!     diverges from the uniform golden, proving the per-pass wiring drives the pipeline.
 //!
@@ -31,7 +35,7 @@ use mlx_rs::{Array, Dtype};
 
 use mlx_gen::runtime::{AdapterKind, AdapterSpec};
 use mlx_gen::weights::Weights;
-use mlx_gen_ltx::adapters::apply_ltx_adapters;
+use mlx_gen_ltx::adapters::{apply_ltx_adapters, lora_target_inventory};
 use mlx_gen_ltx::config::{LtxConfig, LtxVaeConfig, SplitModel};
 use mlx_gen_ltx::pipeline::{decode_to_frames, generate_t2v_latents, NUM_DENOISE_PASSES};
 use mlx_gen_ltx::positions::create_position_grid;
@@ -63,15 +67,32 @@ fn lora_path() -> std::path::PathBuf {
     )
 }
 
-/// A multi-surface LoRA that also trains the audio + cross-modal stacks (default `Samantha_ltx2.3`).
+/// A multi-surface LoRA that also trains the audio + cross-modal stacks (default
+/// `DR34ML4Y_LTXXX_V2`; any full-surface lora works — the gates derive expectations from the file).
 fn multi_lora_path() -> std::path::PathBuf {
     if let Ok(p) = std::env::var("LTX_LORA_MULTI") {
         return p.into();
     }
     let home = std::env::var("HOME").unwrap();
-    std::path::PathBuf::from(home).join(
-        "Library/Application Support/SceneWorks/data/loras/samantha/Samantha_ltx2.3.safetensors",
-    )
+    std::path::PathBuf::from(home)
+        .join("SceneWorks/data/loras/ltx_video_dr34ml4y_ltx/DR34ML4Y_LTXXX_V2.safetensors")
+}
+
+/// File-derived per-surface expectations for the multi-surface gates (sc-13019): unique
+/// `(video, audio_or_cross_modal)` lora target paths carried by the file at `multi_lora_path()`.
+/// Panics with a clear message if the file is not actually multi-surface — the gates' premise.
+fn multi_lora_expected() -> (usize, usize) {
+    let w = Weights::from_file(multi_lora_path()).expect("multi-surface lora file");
+    let (video, audio) = lora_target_inventory(&w);
+    assert!(
+        !video.is_empty() && !audio.is_empty(),
+        "LTX_LORA_MULTI must point at a FULL-surface lora (video + audio/cross-modal); {} carries \
+         video={} audio/cross={}",
+        multi_lora_path().display(),
+        video.len(),
+        audio.len()
+    );
+    (video.len(), audio.len())
 }
 
 fn f32(x: &Array) -> Array {
@@ -208,30 +229,34 @@ fn lora_frames_match_reference() {
 }
 
 #[test]
-#[ignore = "needs ltx_2_3_base_q8 (~20 GB) + a multi-surface LTX LoRA with audio (default Samantha)"]
+#[ignore = "needs ltx_2_3_base_q8 (~20 GB) + a multi-surface LTX LoRA with audio"]
 fn lora_multi_surface_skips_audio_without_error() {
-    // A real character LoRA (`Samantha_ltx2.3`) trains the **audio** stack too. The video-only port
-    // must apply every video attn/ff/gate target (576) and *skip* every audio target (1056) — reported,
+    // A full-surface production LoRA trains the **audio** stack too. The video-only port must apply
+    // every video target the FILE carries and *skip* every audio/cross-modal target — reported,
     // never errored (the reference `apply_loras_to_weights` likewise only counts skips). This guards
     // the "full capability, no silent error" property: loading a production LoRA must not blow up.
+    // sc-13019: expectations derive from the file's key inventory, so the gate follows whatever
+    // multi-surface lora is provided (historically Samantha: 576 video / 1056 audio+cross; the
+    // DR34ML4Y default: 480 video (attn+ff, no gates) / 960 audio+cross).
+    let (video_n, audio_n) = multi_lora_expected();
     let dir = base_dir();
     let (_dit, report) = dit_with_adapters(
         &dir,
         &[AdapterSpec::new(multi_lora_path(), 1.0, AdapterKind::Lora)],
     );
     eprintln!(
-        "video-only (LtxDiT) routing: applied={} skipped={}",
+        "video-only (LtxDiT) routing: applied={} skipped={} (file carries video={video_n} audio/cross={audio_n})",
         report.applied,
         report.skipped.len()
     );
     assert_eq!(
-        report.applied, 576,
-        "all 576 video attn/ff/gate targets apply"
+        report.applied, video_n,
+        "every video target the file carries must apply on the video-only LtxDiT"
     );
     assert_eq!(
         report.skipped.len(),
-        1056,
-        "every audio target is skipped (reported, not errored)"
+        audio_n,
+        "every audio/cross-modal target is skipped (reported, not errored)"
     );
     // Every skipped path is an audio / cross-modal target (none of the video surface leaked in).
     assert!(
@@ -244,12 +269,13 @@ fn lora_multi_surface_skips_audio_without_error() {
 }
 
 #[test]
-#[ignore = "needs ltx_2_3_base_q8 (~20 GB) + a multi-surface LTX LoRA with audio (default Samantha)"]
+#[ignore = "needs ltx_2_3_base_q8 (~20 GB) + a multi-surface LTX LoRA with audio"]
 fn lora_full_surface_routes_on_avdit() {
-    // On the **production** dual-modality AvDiT (sc-2684), the same Samantha LoRA's audio + cross-modal
-    // targets now RESOLVE (vs skipped on the video-only LtxDiT building block above): 576 video +
-    // 1056 audio/cross-modal (audio_attn1/2 + audio_ff + audio_to_video_attn + video_to_audio_attn,
-    // 22 per block × 48) = 1632, no skips. Proves the full-surface routing (sc-2687 over sc-2684).
+    // On the **production** dual-modality AvDiT (sc-2684), the same LoRA's audio + cross-modal
+    // targets now RESOLVE (vs skipped on the video-only LtxDiT building block above): every target
+    // the file carries applies, no skips. Proves the full-surface routing (sc-2687 over sc-2684).
+    // sc-13019: the expected total derives from the file's key inventory (see the sibling gate).
+    let (video_n, audio_n) = multi_lora_expected();
     let dir = base_dir();
     let cfg = LtxConfig::from_model_dir(&dir).expect("config");
     let split = SplitModel::from_model_dir(&dir).expect("split_model.json");
@@ -263,17 +289,18 @@ fn lora_full_surface_routes_on_avdit() {
     )
     .expect("apply adapters");
     eprintln!(
-        "AvDiT full-surface routing: applied={} skipped={}",
+        "AvDiT full-surface routing: applied={} skipped={} (file carries video={video_n} audio/cross={audio_n})",
         report.applied,
         report.skipped.len()
     );
     assert_eq!(
-        report.applied, 1632,
-        "576 video + 1056 audio/cross-modal targets all resolve on AvDiT"
+        report.applied,
+        video_n + audio_n,
+        "every video + audio/cross-modal target the file carries must resolve on AvDiT"
     );
     assert!(
         report.skipped.is_empty(),
-        "no Samantha target should be skipped on AvDiT: {:?}",
+        "no target should be skipped on AvDiT: {:?}",
         report.skipped
     );
 }
