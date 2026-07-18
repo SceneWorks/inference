@@ -120,7 +120,7 @@ const SUFFIXES: [(&str, Role); 9] = [
 /// the comparison.
 ///
 /// Scope notes: orphan down/up factors and `.alpha`-only keys are counted by NEITHER bucket (the
-/// gates assume a well-formed lora; [`apply_one`] surfaces such keys as `skipped`, so a malformed
+/// gates assume a well-formed lora; the apply path surfaces such keys as `skipped`, so a malformed
 /// file fails the skipped-exact asserts rather than passing silently). Flattened kohya keys (no
 /// dots) are inventoried as-is but resolve to no module — same failure direction.
 pub fn lora_target_inventory(w: &Weights) -> (Vec<String>, Vec<String>) {
