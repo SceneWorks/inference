@@ -328,8 +328,16 @@ mod tests {
         // with no `pad_token` (or an unknown token) falls back to eos.
         let l_dir = synthetic_clip_tokenizer_dir("padl", "<|endoftext|>");
         let g_dir = synthetic_clip_tokenizer_dir("padg", "!");
-        assert_eq!(resolve_clip_pad_id(&l_dir), 49407, "CLIP-L pad = eos");
-        assert_eq!(resolve_clip_pad_id(&g_dir), 0, "CLIP-bigG pad = `!` = 0");
+        assert_eq!(
+            resolve_clip_pad_id(&l_dir).unwrap(),
+            49407,
+            "CLIP-L pad = eos"
+        );
+        assert_eq!(
+            resolve_clip_pad_id(&g_dir).unwrap(),
+            0,
+            "CLIP-bigG pad = `!` = 0"
+        );
 
         // Fallback: a dir whose config lacks `pad_token` -> eos.
         let f_dir = std::env::temp_dir().join(format!(
@@ -339,9 +347,31 @@ mod tests {
         std::fs::create_dir_all(&f_dir).unwrap();
         std::fs::write(f_dir.join("tokenizer_config.json"), "{}").unwrap();
         assert_eq!(
-            resolve_clip_pad_id(&f_dir),
+            resolve_clip_pad_id(&f_dir).unwrap(),
             CLIP_EOS_ID,
             "missing pad_token -> eos fallback"
+        );
+
+        std::fs::remove_file(f_dir.join("tokenizer_config.json")).unwrap();
+        assert_eq!(
+            resolve_clip_pad_id(&f_dir).unwrap(),
+            CLIP_EOS_ID,
+            "absent config -> eos fallback"
+        );
+
+        std::fs::write(f_dir.join("tokenizer_config.json"), "{").unwrap();
+        let error = resolve_clip_pad_id(&f_dir).unwrap_err();
+        assert!(
+            matches!(error, mlx_gen::Error::Msg(ref message) if
+            message.contains("parse") && message.contains("tokenizer_config.json")),
+            "corrupt config must return a contextual parse error, got: {error}"
+        );
+
+        std::fs::remove_file(f_dir.join("tokenizer_config.json")).unwrap();
+        std::fs::create_dir(f_dir.join("tokenizer_config.json")).unwrap();
+        assert!(
+            matches!(resolve_clip_pad_id(&f_dir), Err(mlx_gen::Error::Io(_))),
+            "a present unreadable config must preserve the typed IO error"
         );
     }
 
