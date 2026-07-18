@@ -32,10 +32,16 @@ use mlx_rs::Array;
 /// probe-verifies `pad`/`concat`/`conv3d`/`reshape(-1)`/`as_slice`/elementwise EXACT above `i32::MAX`, so
 /// the tiled `pad`-and-accumulate decode now renders past the bound (the refusal was lifted from
 /// [`tiled_decode`]). The residual is `mlx-rs`'s `Array::from_slice`, which still asserts
-/// `len == shape.product::<i32>()` (a fork-side bug) — so this guard is kept as **defense-in-depth** for
-/// any caller that would materialize an over-bound array directly from a host `Vec` (which the decode
-/// paths, reading back via `as_slice`, never do). The blend-weight accumulator is strictly smaller than
-/// the output, so a single check covers both.
+/// `len == shape.product::<i32>()` (a fork-side bug).
+///
+/// **sc-12926 — status: retained latent tripwire, NO production caller.** When sc-12748 lifted the
+/// refusal it removed both call sites, so nothing in the decode paths invokes this today (they read
+/// back via `as_slice` and never `from_slice` a full output — there is currently no host→Array
+/// materialization of output-scale buffers anywhere to guard). It is deliberately kept, with its
+/// boundary unit test, as the ready-made guard for any **future** code that builds an over-bound
+/// array from a host `Vec`: call it before that `from_slice` (the mlx-rs assert would still abort
+/// loudly without it, but as a panic rather than a catchable [`Error`]). The blend-weight
+/// accumulator is strictly smaller than the output, so a single check covers both.
 pub fn check_output_writable(full_elems: i64, out_f: i32, out_h: i32, out_w: i32) -> Result<()> {
     if full_elems > MAX_WRITABLE_ELEMS {
         return Err(Error::Msg(format!(
@@ -106,9 +112,10 @@ pub fn tiled_decode(
                 // & concat EXACT via the sc-12746 copy-gate patch; reshape(-1)/as_slice/elementwise all
                 // correct). So a tiled decode whose *assembled* output crosses the bound now RENDERS
                 // correctly instead of erroring (validated end-to-end vs a below-bound reference in
-                // `tiled_decode_renders_over_bound_output` and the LTX real-weights render). The
-                // `check_output_writable` backstop is kept for the one path still i32-capped — a
-                // `from_slice` host→Array materialization — which this loop never takes.
+                // `tiled_decode_renders_over_bound_output` and the LTX real-weights render). The one
+                // path still i32-capped is a `from_slice` host→Array materialization, which this loop
+                // never takes (`check_output_writable` is retained as an uncalled latent tripwire for
+                // future code that would — sc-12926).
                 let at = ds[t_ax as usize].min(t.out_stop - t.out_start);
                 let ah = ds[h_ax as usize].min(hh.out_stop - hh.out_start);
                 let aw = ds[w_ax as usize].min(ww.out_stop - ww.out_start);

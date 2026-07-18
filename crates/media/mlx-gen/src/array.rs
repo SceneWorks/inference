@@ -66,6 +66,15 @@ fn flat_2d(shape: &[i32]) -> (i32, i32) {
     }
     let a = a.max(1);
     let b = (total / a).max(1);
+    // sc-12926: if no leading group fits (e.g. a hypothetical [46341, 46341, 46341]), `b` overflows
+    // i32 and the cast below would silently wrap — turn that into a loud debug failure instead.
+    // Unreachable for any real VAE shape (their totals split comfortably), and release builds would
+    // still RAISE downstream (MLX rejects the wrapped dim in `reshape`), not corrupt.
+    debug_assert!(
+        b <= i32::MAX as i64,
+        "flat_2d: residual factor {b} > i32::MAX — shape {shape:?} has no contiguous 2-D split \
+         with both factors in i32 range"
+    );
     (a as i32, b as i32)
 }
 
@@ -85,6 +94,18 @@ mod tests {
         let (a, b) = flat_2d(&[3, 800, 1280, 720]);
         assert!(a as i64 <= i32::MAX as i64 && b as i64 <= i32::MAX as i64);
         assert_eq!(a as i64 * b as i64, 3i64 * 800 * 1280 * 720);
+    }
+
+    /// sc-12926: the `b ≤ i32::MAX` debug_assert fires when no contiguous 2-group split exists —
+    /// here every grouping of `[46341, 46341, 46341]` leaves one factor over the bound. Debug-only
+    /// (tests run in debug), and mutation-discriminating: deleting the assert makes this pass a
+    /// silently-wrapped cast instead of panicking.
+    #[test]
+    #[should_panic(expected = "flat_2d: residual factor")]
+    #[cfg(debug_assertions)]
+    fn flat_2d_unsplittable_shape_fails_loudly() {
+        // 46341² = 2_147_488_281 > i32::MAX, so a = 46341 and b = 46341² overflows the bound.
+        let _ = flat_2d(&[46_341, 46_341, 46_341]);
     }
 
     #[test]

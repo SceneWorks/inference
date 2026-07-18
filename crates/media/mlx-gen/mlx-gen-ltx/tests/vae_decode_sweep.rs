@@ -21,7 +21,7 @@ use mlx_rs::memory::{get_memory_limit, get_peak_memory, reset_peak_memory, set_m
 use mlx_rs::ops::{abs, max, subtract};
 use mlx_rs::{random, Array};
 
-use mlx_gen::tiling::{SpatialTiling, TemporalTiling, TilingConfig};
+use mlx_gen::tiling::{SpatialTiling, TemporalTiling, TilingConfig, VaeTiling};
 use mlx_gen::weights::Weights;
 use mlx_gen_ltx::{LtxVaeConfig, LtxVideoVae};
 
@@ -195,13 +195,23 @@ fn discover_ltx_vae() -> Option<PathBuf> {
 /// Geometry: **1280²×441f** (t_lat 56) → assembled RGB output `3·441·1280·1280 = 2.168e9 = 1.009×
 /// i32::MAX` — the exact "1280²·441f class" the `check_output_writable` unit test names. Each decode
 /// TILE stays below the bound (only the assembled output crosses), so this isolates the assembled-output
-/// path. Validation honours the sc-12438 probe rule: the causal LTX prefix `[0..32]` is *the same
-/// content* whether the clip is 441 or 65 frames long, so it must match a below-bound reference decode of
-/// the frame-prefix latent (same tiling, so the shared first tile is bit-identical); and a tail voxel at
-/// a **>i32::MAX flat offset** is read back (via `as_slice`, the proven path) and checked finite/sane —
-/// proving the over-bound region is addressed, not garbage. Peak + wall-clock are reported.
+/// path. Validation honours the sc-12438 probe rule, in three tiers:
+///  1. the causal LTX prefix `[0..32]` is *the same content* whether the clip is 441 or 65 frames long,
+///     so it must match a below-bound reference decode of the frame-prefix latent (same tiling, so the
+///     shared first tile is bit-identical) — sub-bound-offset exactness;
+///  2. a tail voxel at a **>i32::MAX flat offset** is read back (via `as_slice`, the proven path) and
+///     checked finite/sane — the over-bound region is addressed, not garbage;
+///  3. **sc-12926 — position-dependent OVER-bound exactness**: the tiled loop's per-tile closure is a
+///     plain slice-decode, so a standalone decode of the LAST temporal tile's latent slice must agree
+///     (≤1e-3) with the assembled output wherever that tile is the sole contributor at blend weight 1
+///     (there the accumulate is `dec·1.0` + zero-pads and the normalize divides by exactly 1). Channel-2
+///     late frames sit past `i32::MAX`, so a ±2.67-class corruption of the over-bound region — which
+///     tier 2's finite+|v|<5 check would PASS — fails this comparison. Over-bound exactness is thereby
+///     render-covered, not just probe-covered.
+///
+/// Peak + wall-clock are reported.
 #[test]
-#[ignore = "sc-12748 real LTX VAE over-bound assembled-output render (~25 GiB); auto-discovers the q4 vae"]
+#[ignore = "sc-12748 real LTX VAE over-bound assembled-output render (peak ~46 GiB measured); auto-discovers the q4 vae"]
 fn over_bound_output_matches_below_bound_reference() {
     let Some(dir) = discover_ltx_vae() else {
         eprintln!("skip: no LTX_VAE_DIR and no ltx-2.3-mlx vae_decoder.safetensors under the HF cache");
@@ -300,5 +310,71 @@ fn over_bound_output_matches_below_bound_reference() {
         worst < 5.0,
         "over-bound tail voxels are out of a sane video range (|v|={worst:.3}) — the >i32::MAX region \
          read back as garbage"
+    );
+
+    // Tier 3 (sc-12926): position-dependent over-bound exactness. Recompute the temporal plan the
+    // tiled decode used, standalone-decode the LAST tile's latent slice, and compare it against the
+    // assembled output in that tile's sole-contributor weight-1 frames — at flat offsets PAST i32::MAX.
+    let plan = cfg.plan(VaeTiling::LTX, t_lat, h_lat, w_lat);
+    assert!(plan.t.len() >= 2, "geometry must produce multiple temporal tiles");
+    let last = plan.t.last().unwrap();
+    let prev_stop = plan.t[plan.t.len() - 2].out_stop; // frames ≥ this are covered only by `last`
+    let tile_idx: Vec<i32> = (last.start..last.end).collect();
+    let tile_latent = latent
+        .take_axis(Array::from_slice(&tile_idx, &[tile_idx.len() as i32]), 2)
+        .unwrap();
+    let tile_ref = vae.decode(&tile_latent).expect("standalone decode of the last temporal tile");
+    mlx_rs::transforms::eval([&tile_ref]).unwrap();
+    let rf = tile_ref.shape()[2] as i64;
+    assert!(
+        rf >= (last.out_stop - last.out_start) as i64,
+        "last-tile standalone decode must cover the tile's output span"
+    );
+    let ref_flat = tile_ref.as_slice::<f32>();
+
+    // Frames where the last tile is the sole contributor at blend weight 1 (assembled == standalone).
+    let sole: Vec<i64> = (prev_stop.max(last.out_start)..last.out_stop)
+        .filter(|&f| last.mask[(f - last.out_start) as usize] >= 1.0 - 1e-6)
+        .map(i64::from)
+        .collect();
+    assert!(!sole.is_empty(), "no sole-contributor weight-1 frames in the last tile");
+
+    // Check EVERY sole-contributor frame (the decodes are already paid for; this is host reads) at
+    // four positions × 3 channels. Channel-2 frames from ~429 sit past i32::MAX, so the over-bound
+    // band gets dense coverage, not a token sample.
+    let (oh, ow) = (out_h as i64, out_w as i64);
+    let mut max_d = 0f32;
+    let mut above = 0i64;
+    let mut checked = 0i64;
+    for &f in &sole {
+        for c in 0..3i64 {
+            for &(y, x) in &[(0i64, 0i64), (oh / 2, ow / 2), (oh - 1, ow - 1), (123i64, 456i64)] {
+                let off = ((c * out_f as i64 + f) * oh + y) * ow + x;
+                let r_off = ((c * rf + (f - last.out_start as i64)) * oh + y) * ow + x;
+                let dd = (flat[off as usize] - ref_flat[r_off as usize]).abs();
+                checked += 1;
+                if off > I32_MAX {
+                    above += 1;
+                }
+                if dd > max_d {
+                    max_d = dd;
+                }
+            }
+        }
+    }
+    println!(
+        "[sc-12926 LTX tier-3] last-tile frames {}..={}: checked={checked} \
+         above_2^31_offsets={above} max|Δ|={max_d:.3e} vs standalone tile decode",
+        sole[0],
+        sole[sole.len() - 1]
+    );
+    assert!(
+        above > 0,
+        "tier-3 sampled no flat offsets past i32::MAX — the over-bound region went unvalidated"
+    );
+    assert!(
+        max_d < 1e-3,
+        "assembled over-bound output diverged from the standalone last-tile decode by {max_d:.3e} — \
+         the >i32::MAX region of the pad-and-accumulate assembly is corrupted (sc-12926 tier-3)"
     );
 }
