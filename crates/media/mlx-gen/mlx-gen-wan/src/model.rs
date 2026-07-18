@@ -18,9 +18,9 @@ use std::path::PathBuf;
 
 use mlx_gen::weights::Weights;
 use mlx_gen::{
-    AdapterSpec, Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput,
-    GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, MoeExpert, Precision,
-    Progress, Quant, Result, WeightsSource,
+    AdapterSpec, CancelFlag, Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput,
+    GenerationRequest, Generator, Image, LoadPhase, LoadSpec, Modality, ModelDescriptor, MoeExpert,
+    OffloadPolicy, Precision, Progress, Quant, Result, WeightsSource,
 };
 use mlx_rs::random;
 use mlx_rs::Array;
@@ -32,11 +32,13 @@ use crate::adapters::{
 use crate::config::{WanModelConfig, MIN_SIZE};
 use crate::pipeline::{
     align_dim, auto_tiling_budgeted, auto_tiling_budgeted_z16, build_i2v_y, build_ti2v_keyframe_z,
-    build_ti2v_mask, build_ti2v_multi_mask, decode_to_frames, decode_to_frames_22, denoise,
-    denoise_curated, denoise_moe, denoise_moe_curated, denoise_ti2v, frames_to_images,
-    latent_shape, preflight_denoise_memory_guard, preprocess_ti2v_image, reject_off_grid,
-    reject_over_area, resolve_sampler_knobs, seq_len, ti2v_blend_init, Expert,
+    build_ti2v_mask, build_ti2v_multi_mask, crossing_index, decode_to_frames, decode_to_frames_22,
+    denoise, denoise_curated, denoise_moe, denoise_moe_curated, denoise_range, denoise_ti2v,
+    frames_to_images, latent_shape, preflight_denoise_memory_guard, preprocess_ti2v_image,
+    reject_off_grid, reject_over_area, resolve_sampler_knobs, seq_len, staged_expert_swap,
+    ti2v_blend_init, Expert,
 };
+use crate::scheduler::{make_scheduler, SolverKind, WanScheduler};
 use crate::text_encoder::encode_text_staged;
 use crate::transformer::WanTransformer;
 use crate::vae::WanVae;
@@ -619,8 +621,11 @@ pub fn descriptor_t2v_14b() -> ModelDescriptor {
             // Cross-attention text K/V is cached across denoise steps (per expert).
             supports_kv_cache: true,
             requires_sigma_shift: false,
-            // Not wired onto the shared `Residency` seam (F-176); Sequential is a no-op fallback.
-            supports_sequential_offload: false,
+            // A14B honors `OffloadPolicy::Sequential` (epic 12732, sc-12736): the staged expert swap
+            // holds only the ACTIVE MoE expert resident (never both) and frees the UMT5 TE / VAE
+            // off-GPU during denoise, dropping the unified-memory peak to ~one expert. Advertised so
+            // the worker's fit-gate can tell "bounds peak here" from a no-op fallback.
+            supports_sequential_offload: true,
         },
     }
 }
@@ -641,6 +646,14 @@ pub struct Wan14b {
     /// see [`resolve_load_time_quant`]). When `Some`, [`Wan14b::generate`] quantizes **each** expert
     /// independently after load (transformer-only: attn `q/k/v/o` + `ffn.fc1/fc2`; T5 + VAE stay f32).
     quant: Option<Quant>,
+    /// Component-residency strategy for the denoise (epic 12732, sc-12736). [`OffloadPolicy::Resident`]
+    /// (default) holds **both** ~8-9 GB MoE experts resident for the whole loop (the byte-identical
+    /// pre-swap path). [`OffloadPolicy::Sequential`] runs the **expert swap** — only the ACTIVE expert
+    /// is resident (high `0..k`, then evict-then-load the low `k..steps`, never co-resident) and the
+    /// UMT5 TE / VAE encoder are `clear_cache`-freed off-GPU during denoise — bounding the unified-memory
+    /// peak to ~one expert. Advertised via `supports_sequential_offload` so the worker's fit-gate can
+    /// select it under a memory ceiling. Captured from [`LoadSpec::offload_policy`] at load.
+    offload_policy: OffloadPolicy,
 }
 
 impl Wan14b {
@@ -708,6 +721,198 @@ impl Wan14b {
         let high = apply_wan_adapters_additive(high_dit, &self.adapters, MoeExpert::High)?;
         self.finalize_dual_report(low, high)
     }
+
+    /// Build **one** MoE expert's transformer, staged (sc-12736): load its
+    /// `{high,low}_noise_model.safetensors`, apply *this* expert's adapters (dense FOLD before the
+    /// build / packed ADDITIVE install after it), and quantize if requested — the per-expert half of
+    /// the resident Stage-2 build, extracted so the sequential expert swap can materialize exactly one
+    /// expert at a time. Returns the transformer plus its adapter report (`Some` iff adapters are
+    /// configured); the caller feeds both experts' reports to [`Wan14b::finalize_dual_report`] for the
+    /// cross-expert "matched no module across either expert" guard, exactly as the resident path does.
+    /// The build is byte-identical to the resident per-expert build — the experts are independent
+    /// weight files, so building one never touches the other (the numerics-preserving requirement).
+    fn build_expert_staged(
+        &self,
+        which: MoeExpert,
+    ) -> Result<(WanTransformer, Option<WanLoraReport>)> {
+        let cfg = &self.config;
+        let file = match which {
+            MoeExpert::Low => "low_noise_model.safetensors",
+            MoeExpert::High => "high_noise_model.safetensors",
+        };
+        let mut w = Weights::from_file(self.root.join(file))?;
+        let prequantized = cfg.quantization.is_some();
+        let has_adapters = !self.adapters.is_empty();
+        // DENSE bf16 snapshot: FOLD this expert's LoRA/LoKr into the weights BEFORE building (fold,
+        // then `spec.quantize` may quantize the merged weight) — mirrors `merge_adapters`, per expert.
+        let fold_report = if !prequantized && has_adapters {
+            Some(merge_wan_adapters(&mut w, &self.adapters, which)?)
+        } else {
+            None
+        };
+        let mut dit = WanTransformer::from_weights(&w, cfg)?;
+        if let Some(q) = self.quant {
+            dit.quantize(q.bits(), None)?;
+        }
+        // PRE-QUANTIZED (packed Q4/Q8) snapshot: install this expert's adapters as forward-time
+        // residuals AFTER building (the bases stay packed) — mirrors `install_adapters_additive`.
+        let report = if prequantized && has_adapters {
+            reject_loha_on_packed(self.descriptor.id, &self.adapters)?;
+            Some(apply_wan_adapters_additive(
+                &mut dit,
+                &self.adapters,
+                which,
+            )?)
+        } else {
+            fold_report
+        };
+        Ok((dit, report))
+    }
+
+    /// The **sequential-offload** dual-expert denoise (sc-12736, epic 12732) — the staged twin of the
+    /// resident [`denoise_moe`] that keeps only the ACTIVE ~8-9 GB expert resident, dropping the
+    /// unified-memory denoise peak to ~one expert on a Mac ceiling. High runs steps `0..k`
+    /// (`t ≥ boundary_timestep`); then, via [`staged_expert_swap`]'s **evict-then-load** discipline, the
+    /// high expert is dropped and its buffers `clear_cache`-flushed **before** the low expert loads,
+    /// which runs `k..steps`. Flow-match timesteps decrease monotonically ⇒ exactly one boundary
+    /// crossing ⇒ at most one swap; the two experts are **never co-resident** (the Pillar-1 win).
+    ///
+    /// **Parity:** one continuous scheduler advances across the swap and each expert drives the
+    /// identical per-step [`denoise_range`] the resident [`denoise_moe`] drives, so the prefix/suffix
+    /// split reproduces the resident per-step `t ≥ boundary` choice bit-for-bit — only residency /
+    /// lifetime changes. Each expert projects the raw UMT5 `context`/`context_null` through its **own**
+    /// `text_embedder` after it loads (the entangled per-expert projection), so the small raw contexts
+    /// stay resident across the swap. **Native solvers only** — the caller routes curated multi-eval
+    /// solvers (whose per-step sub-evals can straddle the boundary) to the resident path.
+    #[allow(clippy::too_many_arguments)]
+    fn denoise_moe_swapped(
+        &self,
+        context: &Array,
+        context_null: &Array,
+        low_gs: f32,
+        high_gs: f32,
+        kind: SolverKind,
+        num_train_timesteps: usize,
+        steps: usize,
+        shift: f32,
+        boundary_timestep: f32,
+        init_noise: &Array,
+        y: Option<&Array>,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Array> {
+        // sc-2957 compiled elementwise glue, active for the whole (both-expert) denoise — see
+        // `denoise_moe`. Scoped + restored on drop by the RAII guard.
+        let _compile_glue = crate::transformer::CompileGlueGuard::enable();
+        let mut sched = make_scheduler(kind, num_train_timesteps);
+        sched.set_timesteps(steps, shift);
+        let timesteps: Vec<f32> = sched.timesteps().to_vec();
+        // High runs `0..k` (`t ≥ boundary`), low runs `k..steps` — the single high→low crossing.
+        let k = crossing_index(&timesteps, boundary_timestep);
+        let mut latents = init_noise.clone();
+        let total = steps as u32;
+
+        // Each expert's adapter report, carried out of its (dropped-before-the-next-loads) load closure
+        // so the cross-expert "matched no module across either expert" guard runs once both are known.
+        let high_report: std::cell::Cell<Option<WanLoraReport>> = std::cell::Cell::new(None);
+        let low_report: std::cell::Cell<Option<WanLoraReport>> = std::cell::Cell::new(None);
+
+        // Build a borrowed `Expert` (per-expert `text_embedder` projection of the raw contexts) and run
+        // its step range through the shared scheduler/latents — the identical per-step math as resident.
+        let denoise_expert = |dit: &WanTransformer,
+                              guidance: f32,
+                              range: std::ops::Range<usize>,
+                              st: &mut SwapState| {
+            let e = Expert {
+                transformer: dit,
+                ctx_cond: dit.embed_text(context)?,
+                ctx_uncond: Some(dit.embed_text(context_null)?),
+                guidance,
+            };
+            let grid = dit.patch_grid(init_noise);
+            let op = &mut *st.on_progress;
+            let mut on_step = |i: usize| {
+                op(Progress::Step {
+                    current: i as u32,
+                    total,
+                })
+            };
+            denoise_range(
+                &mut *st.sched,
+                &e,
+                grid,
+                y,
+                &mut *st.latents,
+                &timesteps,
+                range,
+                cancel,
+                &mut on_step,
+            )
+        };
+
+        let mut state = SwapState {
+            sched: &mut *sched,
+            latents: &mut latents,
+            on_progress: &mut *on_progress,
+        };
+        staged_expert_swap(
+            k,
+            steps,
+            &mut state,
+            // load high
+            |st| {
+                if cancel.is_cancelled() {
+                    return Err(Error::Canceled);
+                }
+                (st.on_progress)(Progress::Loading(LoadPhase::Renderer));
+                let (dit, report) = self.build_expert_staged(MoeExpert::High)?;
+                high_report.set(report);
+                Ok(dit)
+            },
+            // use high over `0..k`
+            |dit, st| denoise_expert(dit, high_gs, 0..k, st),
+            // load low
+            |st| {
+                if cancel.is_cancelled() {
+                    return Err(Error::Canceled);
+                }
+                (st.on_progress)(Progress::Loading(LoadPhase::Renderer));
+                let (dit, report) = self.build_expert_staged(MoeExpert::Low)?;
+                low_report.set(report);
+                // Both experts' reports are now known → run the cross-expert zero-match guard before
+                // the low denoise (fail fast). An expert that owned no steps (didn't load) contributes
+                // a default (applied 0) report, so the guard still requires SOME loaded expert to have
+                // matched. No-op without adapters. (For the A14B the schedule always spans ~999→0, so
+                // both experts always own steps — `k` is strictly inside `0..steps`.)
+                if !self.adapters.is_empty() {
+                    self.finalize_dual_report(
+                        low_report.take().unwrap_or_default(),
+                        high_report.take().unwrap_or_default(),
+                    )?;
+                }
+                Ok(dit)
+            },
+            // use low over `k..steps`
+            |dit, st| denoise_expert(dit, low_gs, k..steps, st),
+            // evict: flush the just-dropped expert's buffers to the OS BEFORE the next loads.
+            || {
+                mlx_rs::memory::clear_cache();
+                Ok(())
+            },
+        )?;
+        Ok(latents)
+    }
+}
+
+/// The mutable denoise state threaded through [`staged_expert_swap`] (sc-12736): the continuous
+/// scheduler, the in-place latents, and the progress sink. Held as `&mut` references so exclusive
+/// access moves between the load/use closures via the `&mut SwapState` param (disjoint-field borrows)
+/// rather than being captured by each closure — the borrow-checker-clean way to let the two swap
+/// stages share the scheduler/latents/progress without a `RefCell`.
+struct SwapState<'a> {
+    sched: &'a mut dyn WanScheduler,
+    latents: &'a mut Array,
+    on_progress: &'a mut dyn FnMut(Progress),
 }
 
 /// Resolve the **load-time** quantization to apply in [`Wan14b::generate`], reconciling the requested
@@ -777,6 +982,7 @@ pub fn load_t2v_14b(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         root,
         adapters: spec.adapters.clone(),
         quant,
+        offload_policy: spec.offload_policy,
     }))
 }
 
@@ -846,6 +1052,10 @@ impl Wan14b {
         // an unknown `sampler`, which `solver_kind` would otherwise silently map to UniPC.
         self.validate(req)?;
         let cfg = &self.config;
+        // Sequential offload (epic 12732, sc-12736): free the UMT5 TE / VAE off-GPU during denoise and
+        // hold only the ACTIVE MoE expert resident (the expert swap). `Resident` (default) is the
+        // byte-identical pre-swap path (both experts co-resident, no per-stage `clear_cache`).
+        let sequential = self.offload_policy == OffloadPolicy::Sequential;
 
         // --- Resolve request knobs against config defaults ---
         let frames = req.frames.map(|f| f as usize).unwrap_or(cfg.frame_num);
@@ -894,6 +1104,14 @@ impl Wan14b {
         let (context, context_null) =
             encode_text_staged(&self.root, cfg, &req.prompt, &neg_prompt, false)?;
         let context_null = context_null.expect("a14b always encodes the negative context");
+        // sc-12736: `encode_text_staged` already drops the UMT5 encoder before returning (only the
+        // small `[1, L, dim]` raw contexts survive — each expert projects them through its own
+        // `text_embedder` below). Under `Sequential`, flush its ~11 GB f32 weights out of MLX's buffer
+        // cache to the OS now, so the TE is truly off-GPU for the whole denoise. `Resident` leaves the
+        // cache warm (byte-identical pre-swap behavior). `context`/`context_null` are already eval'd.
+        if sequential {
+            mlx_rs::memory::clear_cache();
+        }
 
         // Seeded init noise (f32, no batch dim) — matches the reference's `mx.random.normal(shape)`
         // shape; exact seeded-RNG values differ across the mlx-python/mlx-rs split (expected). I2V
@@ -920,9 +1138,36 @@ impl Wan14b {
         } else {
             None
         };
+        // sc-12736: the VAE encoder (loaded only to build `y`) drops at the brace above; `y` is eval'd
+        // and independent of it. Under `Sequential`, flush the VAE out of the cache before the experts
+        // load so the denoise peak is one expert, not one expert + a resident VAE. No-op for T2V.
+        if sequential && y.is_some() {
+            mlx_rs::memory::clear_cache();
+        }
 
-        // --- Stage 2: load both experts, embed per-expert, dual-expert MoE denoise (→ freed) ---
-        let latents = {
+        // --- Stage 2: dual-expert MoE denoise (→ freed). Under `Sequential` with a NATIVE solver this
+        // is the EXPERT SWAP — only the active expert is resident at a time (sc-12736). Otherwise
+        // (`Resident`, or a curated multi-eval solver whose per-step sub-evals can straddle the boundary
+        // and so can't be cleanly prefix/suffix-split without a parity risk) both experts stay
+        // co-resident for the loop; under `Sequential` the TE/VAE were still freed above. ---
+        let latents = if sequential && !is_wan_curated(req.sampler.as_deref()) {
+            let boundary_timestep = cfg.boundary * cfg.num_train_timesteps as f32;
+            self.denoise_moe_swapped(
+                &context,
+                &context_null,
+                low_gs,
+                high_gs,
+                kind,
+                cfg.num_train_timesteps,
+                steps,
+                shift,
+                boundary_timestep,
+                &init_noise,
+                y.as_ref(),
+                &req.cancel,
+                on_progress,
+            )?
+        } else {
             let mut low_w = Weights::from_file(self.root.join("low_noise_model.safetensors"))?;
             let mut high_w = Weights::from_file(self.root.join("high_noise_model.safetensors"))?;
             // Adapter routing (sc-2683 / sc-2393 / sc-10045), two mutually-exclusive paths:
@@ -1167,8 +1412,11 @@ pub fn descriptor_i2v_14b() -> ModelDescriptor {
             supported_quants: &[Quant::Q4, Quant::Q8],
             supports_kv_cache: true,
             requires_sigma_shift: false,
-            // Not wired onto the shared `Residency` seam (F-176); Sequential is a no-op fallback.
-            supports_sequential_offload: false,
+            // A14B honors `OffloadPolicy::Sequential` (epic 12732, sc-12736): the staged expert swap
+            // holds only the ACTIVE MoE expert resident (never both) and frees the UMT5 TE / VAE
+            // off-GPU during denoise, dropping the unified-memory peak to ~one expert. Advertised so
+            // the worker's fit-gate can tell "bounds peak here" from a no-op fallback.
+            supports_sequential_offload: true,
         },
     }
 }
@@ -1218,6 +1466,7 @@ pub fn load_i2v_14b(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         root,
         adapters: spec.adapters.clone(),
         quant,
+        offload_policy: spec.offload_policy,
     }))
 }
 
@@ -1272,6 +1521,30 @@ mod tests {
         assert_eq!(1280 * 720, a14b.max_area);
     }
 
+    /// sc-12736 (epic 12732): BOTH A14B MoE variants advertise `supports_sequential_offload` so the
+    /// worker's fit-gate can select the expert swap under a unified-memory ceiling. The dense TI2V-5B
+    /// is a **separate** story and stays `false` here — flipping it to `true` (or an A14B variant back
+    /// to `false`) is the mutation this guards against.
+    #[test]
+    fn both_a14b_variants_advertise_sequential_offload_but_the_5b_does_not() {
+        assert!(
+            descriptor_t2v_14b()
+                .capabilities
+                .supports_sequential_offload,
+            "T2V-A14B must advertise the expert-swap sequential offload"
+        );
+        assert!(
+            descriptor_i2v_14b()
+                .capabilities
+                .supports_sequential_offload,
+            "I2V-A14B must advertise the expert-swap sequential offload"
+        );
+        assert!(
+            !descriptor().capabilities.supports_sequential_offload,
+            "the dense TI2V-5B is a separate story — it must NOT advertise it here"
+        );
+    }
+
     fn wan_5b() -> Wan {
         Wan {
             descriptor: descriptor(),
@@ -1289,6 +1562,7 @@ mod tests {
             root: PathBuf::new(),
             adapters: vec![],
             quant: None,
+            offload_policy: OffloadPolicy::Resident,
         }
     }
 
@@ -1374,7 +1648,9 @@ mod tests {
     /// A fresh, empty scratch dir for one sizing test (recreated per run; RUST_TEST_THREADS=1 is
     /// forced repo-wide, so no cross-test races on the shared temp root).
     fn sizing_dir(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join("mlx_gen_wan_dit_sizing").join(name);
+        let d = std::env::temp_dir()
+            .join("mlx_gen_wan_dit_sizing")
+            .join(name);
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
@@ -1671,6 +1947,7 @@ mod tests {
             root: tmp_dir(),
             adapters,
             quant: None,
+            offload_policy: OffloadPolicy::Resident,
         }
     }
 

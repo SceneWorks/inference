@@ -22,7 +22,7 @@ use mlx_gen::image::resize_lanczos_u8;
 use mlx_gen::tiling::{budgeted_plan, TileCandidates, TilingBudgetError, TilingConfig, VaeTiling};
 use mlx_gen::{default_seed, CancelFlag, Error, GenerationRequest, Image, Progress, Result};
 
-use crate::scheduler::{compute_sigmas, make_scheduler, SolverKind};
+use crate::scheduler::{compute_sigmas, make_scheduler, SolverKind, WanScheduler};
 use crate::transformer::WanTransformer;
 use crate::vae::WanVae;
 use crate::vae22::Wan22Vae;
@@ -736,11 +736,69 @@ pub struct Expert<'a> {
     pub guidance: f32,
 }
 
-/// The dual-expert MoE denoise loop (Wan2.2-A14B). Each step picks the **high-noise** expert while
-/// the integer timestep is `≥ boundary_timestep` (`config.boundary · num_train_timesteps`, e.g.
-/// `0.875 · 1000 = 875`) and the **low-noise** expert below it — switching the transformer, the
-/// per-expert contexts, and the per-expert guidance together. Reduces to [`denoise`] when both
-/// experts are the same model.
+/// First step index whose integer timestep drops **below** `boundary_timestep` — the single high→low
+/// MoE crossing (sc-12736, mirroring candle's `crossing_index`). Steps `0..k` run the high-noise
+/// expert (`t ≥ boundary_timestep`), `k..steps` the low-noise expert. The flow-match integer timesteps
+/// are monotonically non-increasing (built from a decreasing σ schedule), so this prefix/suffix split
+/// is **exactly** the per-step `t ≥ boundary_timestep` choice the resident loop makes — returns
+/// `timesteps.len()` if the boundary is never crossed (all high), `0` if it is crossed at the first
+/// step (all low). Pure + GPU-free, so both the resident [`denoise_moe`] and the sequential
+/// expert-swap share it and a unit test can pin the split against the per-step rule.
+pub fn crossing_index(timesteps: &[f32], boundary_timestep: f32) -> usize {
+    timesteps
+        .iter()
+        .position(|&t| t < boundary_timestep)
+        .unwrap_or(timesteps.len())
+}
+
+/// Run the denoise steps `range` on a **single** expert, advancing the (shared, continuous) scheduler
+/// and mutating `latents` in place. Extracted (sc-12736) so the resident MoE loop ([`denoise_moe`]) and
+/// the sequential expert-swap drive the **identical** per-step math over their respective step ranges:
+/// the prefix/suffix split is bit-exact to the resident per-step `t ≥ boundary` choice because the same
+/// `sched` advances through every step in order (a multistep solver's history therefore carries across
+/// the crossing unchanged). The per-expert `StepCache` (RoPE + cross-K/V) is built once here, at the
+/// start of the range.
+///
+/// `y` is the optional I2V channel-concat conditioning (see `predict`). `grid` is the shared patch
+/// grid (both experts see the same F/H/W). `on_step(i)` is called with the **global** step index after
+/// each completed step.
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_range(
+    sched: &mut dyn WanScheduler,
+    e: &Expert,
+    grid: (usize, usize, usize),
+    y: Option<&Array>,
+    latents: &mut Array,
+    timesteps: &[f32],
+    range: std::ops::Range<usize>,
+    cancel: &CancelFlag,
+    on_step: &mut dyn FnMut(usize),
+) -> Result<()> {
+    let cache = build_cache(e.transformer, &e.ctx_cond, e.ctx_uncond.as_ref(), grid)?;
+    for i in range {
+        // Honor the engine cancellation contract — check before each (minutes-long) step (sc-5551).
+        if cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
+        let t = timesteps[i];
+        let pred = predict(e.transformer, latents, t, &cache, e.guidance, y)?;
+        *latents = sched.step(&pred, latents)?;
+        mlx_rs::transforms::eval([&*latents])?;
+        on_step(i + 1);
+    }
+    Ok(())
+}
+
+/// The dual-expert MoE denoise loop (Wan2.2-A14B). The **high-noise** expert runs while the integer
+/// timestep is `≥ boundary_timestep` (`config.boundary · num_train_timesteps`, e.g. `0.875 · 1000 =
+/// 875`) and the **low-noise** expert below it — switching the transformer, the per-expert contexts,
+/// and the per-expert guidance together. Reduces to [`denoise`] when both experts are the same model.
+///
+/// This is the **resident** path: BOTH experts are held resident by the caller for the whole loop. The
+/// single high→low boundary crossing is a prefix/suffix split ([`crossing_index`] + two
+/// [`denoise_range`] calls over one continuous scheduler), so it is bit-exact to the old per-step
+/// `t ≥ boundary` choice — and drives the *identical* per-step math the sequential expert-swap
+/// (sc-12736) drives, so the residency change stays numerics-preserving.
 ///
 /// `y` is the optional I2V-14B channel-concat conditioning `[20, F, H, W]` ([`build_i2v_y`]),
 /// concatenated onto each forward's noise latent (see `predict`); `None` for T2V. It is constant
@@ -767,42 +825,35 @@ pub fn denoise_moe(
     // restored on drop by the RAII guard (F-006/F-007) instead of leaking the process-global on.
     let _compile_glue = crate::transformer::CompileGlueGuard::enable();
 
-    // Precompute each expert's RoPE + cross-K/V caches once (the grid is shared — the channel-concat
-    // `y` doesn't change F/H/W — and each expert's contexts are constant across steps).
+    // The grid is shared — the channel-concat `y` doesn't change F/H/W and each expert's contexts are
+    // constant across steps. The single high→low crossing: high runs `0..k` (`t ≥ boundary`), low runs
+    // `k..steps`. One continuous `sched` advances across the split, so a multistep solver's history is
+    // unbroken (bit-exact to the old per-step choice).
     let grid = low.transformer.patch_grid(init_noise);
-    let low_cache = build_cache(
-        low.transformer,
-        &low.ctx_cond,
-        low.ctx_uncond.as_ref(),
-        grid,
-    )?;
-    let high_cache = build_cache(
-        high.transformer,
-        &high.ctx_cond,
-        high.ctx_uncond.as_ref(),
-        grid,
-    )?;
-
+    let k = crossing_index(&timesteps, boundary_timestep);
     let mut latents = init_noise.clone();
-    for (i, &t) in timesteps.iter().enumerate() {
-        // Honor the engine cancellation contract — check before each (minutes-long) step (sc-5551).
-        if cancel.is_cancelled() {
-            return Err(Error::Canceled);
-        }
-        // Boundary swap: high-noise expert at/above the boundary, low-noise below (mirrors
-        // `vace::denoise_moe`). `t` is the scheduler's integer-valued timestep and
-        // `boundary_timestep = config.boundary · num_train_timesteps`, so this `>=` is an exact
-        // integer-vs-constant comparison — the exact boundary deterministically routes to high-noise.
-        let (e, cache) = if t >= boundary_timestep {
-            (high, &high_cache)
-        } else {
-            (low, &low_cache)
-        };
-        let pred = predict(e.transformer, &latents, t, cache, e.guidance, y)?;
-        latents = sched.step(&pred, &latents)?;
-        mlx_rs::transforms::eval([&latents])?;
-        on_step(i + 1);
-    }
+    denoise_range(
+        &mut *sched,
+        high,
+        grid,
+        y,
+        &mut latents,
+        &timesteps,
+        0..k,
+        cancel,
+        on_step,
+    )?;
+    denoise_range(
+        &mut *sched,
+        low,
+        grid,
+        y,
+        &mut latents,
+        &timesteps,
+        k..timesteps.len(),
+        cancel,
+        on_step,
+    )?;
     Ok(latents)
 }
 
@@ -861,6 +912,57 @@ pub fn denoise_moe_curated(
             predict(e.transformer, x, t, cache, e.guidance, y)
         },
     )
+}
+
+/// Drive the A14B high→low MoE expert swap so the two ~8-9 GB experts are **never co-resident**
+/// (sc-12736, epic 12732 — the mlx Pillar-1 win, the residency twin of candle's `staged_expert_swap`):
+/// load the high expert, `use_high` it over steps `0..k`, DROP it + `evict`, then load the low expert
+/// and `use_low` it over `k..steps`. Each expert is loaded, used, then **explicitly dropped before the
+/// next loads** — the evict-then-load discipline: MLX frees the dropped expert's arrays to its buffer
+/// cache and `evict` (`mlx_rs::memory::clear_cache`) returns them to the OS *before* the incoming
+/// expert materializes, so the peak is one expert, not both. A naive "load low, then drop high" would
+/// momentarily co-reside both and the footprint would NOT drop; the ordering here is the whole point.
+///
+/// There is exactly ONE boundary crossing per denoise (`t ≥ boundary` ⇒ high, below ⇒ low; flow-match
+/// timesteps decrease monotonically), so at most one swap. An expert whose step range is empty
+/// (`k == 0` all-low, or `k == steps` all-high) is skipped entirely — it never loads.
+///
+/// Callers must `eval` any output that must survive the drop (the latents) *before* the expert is
+/// dropped, or MLX's lazy graph would keep the expert's weights referenced and freeing it would reclaim
+/// nothing — [`denoise_range`] already `eval`s the latents after every step, so by the time `use_high`
+/// returns they are materialized and independent of the expert.
+///
+/// Generic over the expert type `E` and threaded state `St` so a weight-free unit test can pin the
+/// never-co-resident property with a lightweight liveness witness — no GPU, no real weights — exactly as
+/// the resident/sequential parity rests on [`denoise_range`]. The load closures receive `&mut St` so
+/// they can emit their [`Progress::Loading`] before the (heavy) load; the use closures receive `&mut St`
+/// to advance the shared scheduler/latents.
+#[allow(clippy::too_many_arguments)]
+pub fn staged_expert_swap<E, St>(
+    k: usize,
+    steps: usize,
+    state: &mut St,
+    load_high: impl FnOnce(&mut St) -> Result<E>,
+    use_high: impl FnOnce(&E, &mut St) -> Result<()>,
+    load_low: impl FnOnce(&mut St) -> Result<E>,
+    use_low: impl FnOnce(&E, &mut St) -> Result<()>,
+    mut evict: impl FnMut() -> Result<()>,
+) -> Result<()> {
+    if k > 0 {
+        let high = load_high(state)?;
+        use_high(&high, state)?;
+        // Evict-then-load: drop the high expert (its arrays return to MLX's buffer cache) BEFORE the
+        // low expert is ever loaded, then flush the cache to the OS — the never-co-resident invariant.
+        drop(high);
+        evict()?;
+    }
+    if k < steps {
+        let low = load_low(state)?;
+        use_low(&low, state)?;
+        drop(low);
+        evict()?;
+    }
+    Ok(())
 }
 
 /// Decode denoised latents `[C, F, H, W]` → an RGB video tensor `[F_out, H_out, W_out, 3]` of
@@ -1202,6 +1304,265 @@ pub fn ti2v_blend_init(z_img: &Array, mask: &Array, noise: &Array) -> Result<Arr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── sc-12736: the A14B expert-swap residency contract (mlx Pillar-1). ────────────────────────
+
+    /// [`crossing_index`] is the prefix/suffix boundary the resident loop and the sequential swap both
+    /// split on — it must be **exactly** the per-step `t ≥ boundary` choice. Pinned against a
+    /// hand-rolled per-step scan over a monotonically-decreasing integer-timestep schedule (T2V's 875
+    /// boundary), including the two corners (never crossed / crossed at step 0).
+    #[test]
+    fn crossing_index_equals_the_per_step_boundary_choice() {
+        let boundary = 875.0_f32; // 0.875 · 1000 (T2V)
+        let timesteps = [1000.0, 950.0, 900.0, 875.0, 874.0, 500.0, 100.0, 0.0];
+        let k = crossing_index(&timesteps, boundary);
+        // Per-step witness: the first index whose `t < boundary` (t == boundary stays HIGH).
+        let expected = timesteps.iter().position(|&t| t < boundary).unwrap();
+        assert_eq!(k, expected);
+        assert_eq!(k, 4, "875 (== boundary) is HIGH; 874 is the first LOW step");
+        for (i, &t) in timesteps.iter().enumerate() {
+            let is_high_by_split = i < k;
+            let is_high_by_step = t >= boundary;
+            assert_eq!(
+                is_high_by_split, is_high_by_step,
+                "step {i} (t={t}) disagrees between the split and the per-step rule"
+            );
+        }
+        // Never crossed → all high (k == len); crossed at step 0 → all low (k == 0).
+        assert_eq!(crossing_index(&[1000.0, 900.0, 880.0], boundary), 3);
+        assert_eq!(crossing_index(&[800.0, 700.0], boundary), 0);
+    }
+
+    /// A liveness witness for the expert-swap residency tests (mirrors candle's `LiveTracker`): bumps a
+    /// shared live-counter on construction and drops it on `Drop`, recording the peak concurrency and an
+    /// ordered load/drop/note log.
+    struct LiveTracker {
+        live: std::cell::Cell<usize>,
+        peak: std::cell::Cell<usize>,
+        log: std::cell::RefCell<Vec<&'static str>>,
+    }
+    impl LiveTracker {
+        fn new() -> Self {
+            Self {
+                live: std::cell::Cell::new(0),
+                peak: std::cell::Cell::new(0),
+                log: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+        fn born(&self, tag: &'static str) {
+            self.live.set(self.live.get() + 1);
+            if self.live.get() > self.peak.get() {
+                self.peak.set(self.live.get());
+            }
+            self.log.borrow_mut().push(tag);
+        }
+        fn died(&self, tag: &'static str) {
+            self.live.set(self.live.get() - 1);
+            self.log.borrow_mut().push(tag);
+        }
+        fn note(&self, tag: &'static str) {
+            self.log.borrow_mut().push(tag);
+        }
+    }
+
+    /// Stands in for a loaded 14B expert: its lifetime on the live-counter is exactly the expert's
+    /// residency window inside [`staged_expert_swap`].
+    struct ExpertWitness<'a> {
+        tracker: &'a LiveTracker,
+        drop_tag: &'static str,
+    }
+    impl<'a> ExpertWitness<'a> {
+        fn new(tracker: &'a LiveTracker, born_tag: &'static str, drop_tag: &'static str) -> Self {
+            tracker.born(born_tag);
+            Self { tracker, drop_tag }
+        }
+    }
+    impl Drop for ExpertWitness<'_> {
+        fn drop(&mut self) {
+            self.tracker.died(self.drop_tag);
+        }
+    }
+
+    /// The Pillar-1 invariant (sc-12736): the two experts are **never co-resident**. Driven through the
+    /// production [`staged_expert_swap`] with `0 < k < steps` (a genuine swap), the peak live-expert
+    /// count is 1 and the high expert drops (and is evicted) before the low expert loads — a drop-order
+    /// witness, structural rather than a VRAM read (MLX's buffer cache makes a live memory probe blind
+    /// to the drop until `clear_cache`).
+    #[test]
+    fn expert_swap_is_never_co_resident_and_high_drops_before_low_loads() {
+        let tracker = LiveTracker::new();
+        let mut state = ();
+        let out = staged_expert_swap(
+            3, // k: 0 < k < steps → both experts own steps → a genuine swap
+            8, // steps
+            &mut state,
+            |_st| Ok(ExpertWitness::new(&tracker, "load-high", "drop-high")),
+            |_w, _st| Ok(()),
+            |_st| Ok(ExpertWitness::new(&tracker, "load-low", "drop-low")),
+            |_w, _st| Ok(()),
+            || {
+                tracker.note("evict");
+                Ok(())
+            },
+        );
+        assert!(out.is_ok());
+        assert_eq!(
+            tracker.peak.get(),
+            1,
+            "the two 14B experts must NEVER be co-resident (the whole Pillar-1 win)"
+        );
+        assert_eq!(
+            *tracker.log.borrow(),
+            vec![
+                "load-high",
+                "drop-high",
+                "evict", // high freed + cache flushed …
+                "load-low",
+                "drop-low",
+                "evict", // … BEFORE low ever loads
+            ],
+            "high must be dropped AND evicted before the low expert loads (evict-then-load)"
+        );
+    }
+
+    /// Mutation-check (sc-12736 acceptance): force both experts resident and confirm the
+    /// never-co-resident assertion regresses — proving the passing test above is not a default-value
+    /// false green. This is the exact both-resident behavior the sequential path removes (the resident
+    /// `denoise_moe` holds both for the whole loop): binding `high` and `low` in one scope co-resides
+    /// them, and the SAME liveness witness now reports peak concurrency 2, so `peak == 1` goes RED.
+    #[test]
+    fn forcing_both_experts_resident_regresses_the_never_co_resident_assertion() {
+        let tracker = LiveTracker::new();
+        {
+            // MUTATION: the inactive expert is NOT dropped before the next loads.
+            let _high = ExpertWitness::new(&tracker, "load-high", "drop-high");
+            let _low = ExpertWitness::new(&tracker, "load-low", "drop-low");
+            tracker.note("both-resident-denoise");
+        }
+        assert_eq!(
+            tracker.peak.get(),
+            2,
+            "the forced-both-resident mutation co-resides the two experts"
+        );
+        assert!(
+            tracker.peak.get() > 1,
+            "the never-co-resident assertion (peak == 1) MUST fail under the both-resident mutation — \
+             the passing test genuinely discriminates co-residence, it is not a false green"
+        );
+    }
+
+    /// [`staged_expert_swap`] skips loading the expert whose step range is empty (memory-optimal single
+    /// crossing): `k == 0` loads only the low expert, `k == steps` only the high expert.
+    #[test]
+    fn expert_swap_skips_the_expert_that_owns_no_steps() {
+        // k == 0 → all-low: the high loader is never called.
+        let low_only = LiveTracker::new();
+        let mut st = ();
+        staged_expert_swap(
+            0,
+            8,
+            &mut st,
+            |_st| Ok(ExpertWitness::new(&low_only, "load-high", "drop-high")),
+            |_w, _st| Ok(()),
+            |_st| Ok(ExpertWitness::new(&low_only, "load-low", "drop-low")),
+            |_w, _st| Ok(()),
+            || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(
+            *low_only.log.borrow(),
+            vec!["load-low", "drop-low"],
+            "k == 0 must load ONLY the low expert"
+        );
+
+        // k == steps → all-high: the low loader is never called.
+        let high_only = LiveTracker::new();
+        let mut st = ();
+        staged_expert_swap(
+            8,
+            8,
+            &mut st,
+            |_st| Ok(ExpertWitness::new(&high_only, "load-high", "drop-high")),
+            |_w, _st| Ok(()),
+            |_st| Ok(ExpertWitness::new(&high_only, "load-low", "drop-low")),
+            |_w, _st| Ok(()),
+            || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(
+            *high_only.log.borrow(),
+            vec!["load-high", "drop-high"],
+            "k == steps must load ONLY the high expert"
+        );
+    }
+
+    /// The evict runs after each expert is **used and dropped**, before the next loads (sc-12736): the
+    /// MLX free-after-drop discipline — `clear_cache` returns the dropped expert's pages to the OS once
+    /// its arrays are freed and before the incoming expert allocates.
+    #[test]
+    fn expert_swap_evicts_after_each_expert_drops_and_before_the_next_loads() {
+        let tracker = LiveTracker::new();
+        let mut st = ();
+        staged_expert_swap(
+            3,
+            8,
+            &mut st,
+            |_st| Ok(ExpertWitness::new(&tracker, "load-high", "drop-high")),
+            |_w, _st| {
+                tracker.note("use-high");
+                Ok(())
+            },
+            |_st| Ok(ExpertWitness::new(&tracker, "load-low", "drop-low")),
+            |_w, _st| {
+                tracker.note("use-low");
+                Ok(())
+            },
+            || {
+                tracker.note("evict");
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            *tracker.log.borrow(),
+            vec![
+                "load-high",
+                "use-high",
+                "drop-high",
+                "evict", //
+                "load-low",
+                "use-low",
+                "drop-low",
+                "evict",
+            ],
+            "each expert must be used, dropped, then evicted before the next loads"
+        );
+    }
+
+    /// A load failure on the low expert still drops the (already-used-and-evicted) high expert via the
+    /// explicit drop before the `?` — no leak, peak stays 1, and the error propagates.
+    #[test]
+    fn expert_swap_propagates_a_low_load_failure_after_dropping_high() {
+        let tracker = LiveTracker::new();
+        let mut st = ();
+        let out: Result<()> = staged_expert_swap(
+            3,
+            8,
+            &mut st,
+            |_st| Ok(ExpertWitness::new(&tracker, "load-high", "drop-high")),
+            |_w, _st| Ok(()),
+            |_st| Err(Error::Msg("low expert OOM".into())),
+            |_w: &ExpertWitness, _st| Ok(()),
+            || Ok(()),
+        );
+        assert!(matches!(out, Err(Error::Msg(_))));
+        assert_eq!(
+            *tracker.log.borrow(),
+            vec!["load-high", "drop-high"],
+            "high must have dropped before the low load was even attempted"
+        );
+        assert_eq!(tracker.peak.get(), 1);
+    }
 
     /// **sc-12349: the z16 decode must never take the single pass past the write bound**, no matter how
     /// much memory the machine has. Wan z16 writes 96 channels at full output resolution, so at 720p
