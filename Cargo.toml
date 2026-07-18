@@ -30,9 +30,10 @@ runtime-catalog = { path = "crates/bundles/runtime-catalog" }
 mlx-gen-catalog = { path = "crates/media/mlx-gen/mlx-gen-catalog" }
 candle-gen-catalog = { path = "crates/media/candle-gen/candle-gen-catalog" }
 
-# MLX fork pins are unchanged from the imported repositories.
-mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/michaeltrefry/mlx-rs", rev = "38e1cc1730a11b1e40c2c8ecda01606763a12d51" }
-mlx-sys = { package = "pmetal-mlx-sys", git = "https://github.com/michaeltrefry/mlx-rs", rev = "38e1cc1730a11b1e40c2c8ecda01606763a12d51" }
+# MLX fork pinned by commit SHA. rev 932beb4e = MLX 0.32.0 bump + pad/concat >i32::MAX copy-gate fix
+# + regenerated patches (epic 12742). See crates/media/mlx-gen/Cargo.toml for the full SHA lineage.
+mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/michaeltrefry/mlx-rs", rev = "932beb4e60db44d378ffa1fe648defea59b5cbd0" }
+mlx-sys = { package = "pmetal-mlx-sys", git = "https://github.com/michaeltrefry/mlx-rs", rev = "932beb4e60db44d378ffa1fe648defea59b5cbd0" }
 
 # Candle pins are shared by media and LLM providers.
 # Upstream PR #3531 removes O(groups) launches from unit-stride depthwise convs (sc-12111).

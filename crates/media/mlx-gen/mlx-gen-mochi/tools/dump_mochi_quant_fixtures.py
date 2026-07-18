@@ -15,9 +15,11 @@ Both must equal the dumped `q{bits}.y` — the packing is byte-identical (same M
 bf16 weight) and `quantized_matmul` is deterministic, so the quantized forward is bit-exact.
 
 The op surface is stable MLX (`quantize`/`quantized_matmul`) — no torch/diffusers, no real Mochi
-weights — so this runs anywhere MLX is installed (matches the mlx-rs `pmetal-mlx-rs` 0.25.x pin):
+weights — but `quantized_matmul` is version-sensitive (the forward `q{bits}.y` drifted 1-2 ULP-f32 on
+the 0.31.2->0.32.0 bump, epic 12742), so run it on the MLX core the Rust build links — now 0.32.0
+(`pmetal-mlx-rs` 932beb4e). The committed fixture was re-dumped on 0.32.0 in sc-12747:
 
-    uv run --with "mlx==0.25.2" python tools/dump_mochi_quant_fixtures.py
+    uv run --with "mlx==0.32.0" python tools/dump_mochi_quant_fixtures.py
 
 Writes (committed; ~0.3 MB):
   tests/fixtures/mochi_quant_slice.safetensors

@@ -84,7 +84,7 @@ fn gelu_ffn(x: &Array) -> Result<Array> {
 #[cfg(test)]
 mod sc2963 {
     use super::*;
-    use crate::transformer::compile_test_util::{max_abs, rnd};
+    use crate::transformer::compile_test_util::rnd;
     use crate::transformer::set_compile_glue;
     use mlx_rs::Dtype::{Bfloat16, Float32};
 
@@ -100,7 +100,19 @@ mod sc2963 {
             let c = gelu_ffn(&x).unwrap();
             set_compile_glue(false);
             assert_eq!(c.dtype(), e.dtype(), "gelu_ffn preserves dtype {dt:?}");
-            assert_eq!(max_abs(&c, &e), 0.0, "gelu_ffn compiled vs eager {dt:?}");
+            // sc-12747: under MLX 0.32.0 the compiled tanh-GELU FFN rounds ~1 ULP-f32 differently
+            // from eager (0-ULP on the prior 0.31.2 pin); bf16 stays bit-identical. f32 takes the
+            // shared re-baselined tolerance; bf16 stays exact.
+            let tol = if dt == Float32 {
+                mlx_gen::nn::COMPILED_GLUE_F32_ULP_TOL
+            } else {
+                0.0
+            };
+            let rel = mlx_gen::nn::max_rel_diff(&c, &e);
+            assert!(
+                rel <= tol,
+                "gelu_ffn compiled vs eager {dt:?}: rel|Δ|={rel:e} exceeds {tol:e}"
+            );
         }
     }
 }
