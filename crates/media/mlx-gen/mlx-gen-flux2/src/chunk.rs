@@ -138,11 +138,10 @@ where
     Ok(concatenate_axis(&refs, 1)?)
 }
 
-/// Contiguous `[:, start:start+len, …]` slice along the sequence axis (axis 1), via the arange-index
-/// `take_axis` idiom used throughout the crate.
+/// Contiguous `[:, start:start+len, …]` slice along the sequence axis (axis 1). Use boundary splits
+/// so the opt-in FFN chunking path does not build and gather through a host index vector per chunk.
 fn slice_seq(x: &Array, start: i32, len: i32) -> Result<Array> {
-    let idx = Array::from_slice(&(start..start + len).collect::<Vec<i32>>(), &[len]);
-    Ok(x.take_axis(&idx, 1)?)
+    Ok(x.split_axis(&[start, start + len], 1)?.swap_remove(1))
 }
 
 #[cfg(test)]
