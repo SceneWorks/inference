@@ -7,7 +7,7 @@
 //! materialized on-device.
 //!
 //! Application is **interleaved** (adjacent-pair): lanes `2i` / `2i+1` of each head are the real /
-//! imaginary parts rotated by `(cos[i], sin[i])` — `out0 = r·cos − i·sin`, `out1 = i·cos + r·cos`.
+//! imaginary parts rotated by `(cos[i], sin[i])` — `out0 = r·cos − i·sin`, `out1 = i·cos + r·sin`.
 //! candle's [`candle_nn::rotary_emb::rope_i`] implements exactly this, so it is reused for the apply
 //! (the same reuse `candle-gen-flux2`'s `pos_embed` makes). The text tokens sit at the RoPE origin
 //! `(0,0,0)`; the packed image tokens carry `(0, row, col)` over the `(height/16, width/16)` grid.
