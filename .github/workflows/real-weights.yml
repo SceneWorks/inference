@@ -113,6 +113,11 @@ jobs:
           cargo test --locked -p candle-audio-chatterbox --test conformance chatterbox_t3_produces_valid_speech_tokens -- --ignored --nocapture
           cargo test --locked -p candle-audio-chatterbox --test conformance chatterbox_t3_responds_to_the_reference_voice -- --ignored --nocapture
           cargo test --locked -p candle-audio-chatterbox --test conformance chatterbox_generate_stops_honestly_at_the_s3gen_boundary -- --ignored --nocapture
+          # S3Gen flow token->mel decoder (sc-13237): the UpsampleConformerEncoder + CausalConditionalCFM
+          # + ConditionalDecoder on real flow.* weights render a sane 80-bin log-mel (shape [80, ~2*n_tokens],
+          # finite, non-degenerate range) from real conditioning (s3tokenizer tokens + CAMPPlus 80-d spk +
+          # 24 kHz prompt mel) and are deterministic. Needs the full CHATTERBOX_SNAPSHOT (s3gen.safetensors).
+          cargo test --locked -p candle-audio-chatterbox --test conformance flow_synthesizes_a_sane_mel_from_speech_tokens -- --ignored --nocapture
           # Whisper ASR (sc-12850): the first real Transcriber (audio→text, the Captioner-analog).
           # Kokoro TTS → Whisper ASR round-trip — known text synthesized by kokoro_82m (snapshot
           # above) transcribes back within a small CER, with monotonic segment timestamps.

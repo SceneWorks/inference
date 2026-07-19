@@ -478,3 +478,118 @@ fn campplus_derives_discriminative_x_vectors() {
         "flow speaker embedding lost discrimination: same {same80:.4} vs cross {cross80:.4}"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// S3Gen flow (sc-13237): the CosyVoice flow-matching token→mel decoder.
+// ---------------------------------------------------------------------------------------------
+
+/// The sc-13237 DoD gate: the ported flow (UpsampleConformerEncoder + encoder_proj +
+/// CausalConditionalCFM + ConditionalDecoder) renders a **sane 80-bin mel** from real `flow.*`
+/// weights, with real conditioning derived end-to-end — the s3tokenizer's speech tokens, the
+/// CAMPPlus 80-d flow speaker embedding, and the new 24 kHz prompt-mel front-end — of a Kokoro
+/// reference clip. A broken encoder / rel-pos attention / CFM schedule / U-Net estimator / weight
+/// mapping degenerates to a NaN, constant, or wrongly-shaped mel and fails here. It also asserts
+/// the flow is deterministic under a fixed seed (the reproducibility law).
+#[test]
+#[ignore = "real weights: needs s3gen.safetensors + a Kokoro snapshot; run with --ignored"]
+fn flow_synthesizes_a_sane_mel_from_speech_tokens() {
+    let dir = s3gen_snapshot();
+    let flow = cb::Flow::from_snapshot(&dir).expect("load the flow from s3gen.safetensors");
+    let tok = cb::S3Tokenizer::from_snapshot(&dir).expect("load the s3tokenizer");
+    let spk = cb::Campplus::from_snapshot(&dir).expect("load CAMPPlus");
+
+    // Reference voice (prompt) and a target clip whose tokens we render in that voice.
+    let reference = kokoro_clip(
+        "The quick brown fox jumps over the lazy dog near the river bank.",
+        "af_heart",
+    );
+    let target = kokoro_clip("She sells seashells by the seashore at dawn.", "af_heart");
+
+    // Real conditioning, derived exactly as the reference pipeline does.
+    let prompt_tokens: Vec<u32> = tok
+        .encode(&reference.samples, reference.sample_rate)
+        .expect("tokenize the reference")
+        .into_iter()
+        .map(|c| c as u32)
+        .collect();
+    let prompt_mel = flow
+        .mel_extractor()
+        .mel(&reference.samples, reference.sample_rate, flow.device())
+        .expect("prompt mel");
+    let spk_embed = spk
+        .spk_embed_flow(&reference.samples, reference.sample_rate)
+        .expect("flow speaker embedding");
+    let speech_tokens: Vec<u32> = tok
+        .encode(&target.samples, target.sample_rate)
+        .expect("tokenize the target")
+        .into_iter()
+        .map(|c| c as u32)
+        .collect();
+
+    let (pm_frames, _) = prompt_mel.dims2().expect("prompt mel dims");
+    eprintln!(
+        "flow inputs: {} prompt tokens, {} prompt-mel frames, {} speech tokens, spk {}-d",
+        prompt_tokens.len(),
+        pm_frames,
+        speech_tokens.len(),
+        spk_embed.len()
+    );
+
+    let mel = flow
+        .inference(
+            &speech_tokens,
+            &prompt_tokens,
+            &prompt_mel,
+            &spk_embed,
+            20260719,
+        )
+        .expect("flow token→mel inference");
+
+    let (bins, frames) = mel.dims2().expect("mel must be [80, T]");
+    let vals: Vec<f32> = mel.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    let n = vals.len() as f32;
+    let mean = vals.iter().sum::<f32>() / n;
+    let var = vals.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / n;
+    let std = var.sqrt();
+    let min = vals.iter().cloned().fold(f32::INFINITY, f32::min);
+    let max = vals.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    eprintln!(
+        "flow mel: shape [{bins}, {frames}]; min {min:.4} max {max:.4} mean {mean:.4} std {std:.4}"
+    );
+
+    // Shape: 80 bins, ≈ 2 × speech tokens (token_mel_ratio = 2), within framing/alignment slack.
+    assert_eq!(bins, 80, "mel must have 80 bins");
+    let expected = 2 * speech_tokens.len();
+    assert!(
+        (frames as i64 - expected as i64).abs() <= 2,
+        "mel frames {frames} not ≈ 2×{} = {expected}",
+        speech_tokens.len()
+    );
+    // Sane: finite, non-degenerate (a collapsed decoder emits a constant or NaN mel), and in a
+    // plausible log-mel range (the reference mel is log-compressed, roughly [-12, 3]).
+    assert!(vals.iter().all(|v| v.is_finite()), "mel must be finite");
+    assert!(
+        std > 0.1,
+        "mel is degenerate (std {std:.4}) — the decoder is not modeling speech"
+    );
+    assert!(
+        (-30.0..=10.0).contains(&min) && (-30.0..=10.0).contains(&max),
+        "mel values out of a plausible log-mel range: [{min:.4}, {max:.4}]"
+    );
+
+    // Deterministic under a fixed seed (the reproducibility law).
+    let mel2 = flow
+        .inference(
+            &speech_tokens,
+            &prompt_tokens,
+            &prompt_mel,
+            &spk_embed,
+            20260719,
+        )
+        .expect("re-run the flow");
+    let vals2: Vec<f32> = mel2.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    assert_eq!(
+        vals, vals2,
+        "the flow must be deterministic for a fixed seed"
+    );
+}
