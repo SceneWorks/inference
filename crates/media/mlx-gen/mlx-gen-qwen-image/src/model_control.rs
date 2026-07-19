@@ -160,7 +160,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     // the Sequential-over-dense combination that actually pays the repeated cost.
     if let Some(q) = spec.quantize {
         if matches!(spec.offload_policy, OffloadPolicy::Sequential)
-            && loader::needs_load_time_quant(root, q.bits(), MODEL_ID)?
+            && mlx_gen::quant::needs_load_time_quant(root, "transformer", q.bits(), MODEL_ID)?
         {
             mlx_gen::residency::warn_sequential_requantize(MODEL_ID, q.bits());
         }
@@ -248,7 +248,7 @@ fn load_heavy(
         // silently serving its tier; skip the no-op base quantize when the turnkey is already packed
         // at the requested bits (see `loader::needs_load_time_quant`). The control checkpoint has no
         // packed-marker convention (it ships dense), so it always takes the load-time quantize.
-        if loader::needs_load_time_quant(root, bits, MODEL_ID)? {
+        if mlx_gen::quant::needs_load_time_quant(root, "transformer", bits, MODEL_ID)? {
             transformer.quantize(bits)?;
         }
         // F-076 parity for the control tier (sc-9517): a **published packed** control tier (built by

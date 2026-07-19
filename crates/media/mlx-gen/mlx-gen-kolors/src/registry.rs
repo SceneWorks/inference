@@ -273,7 +273,7 @@ fn load_heavy_owned(
         // silently no-ops on already-packed weights, so a Q4 request over a pre-quantized Q8 snapshot
         // would serve Q8 with no diagnostic. Reuses the SDXL-family marker check — the Kolors U-Net is
         // the SDXL `UNet2DConditionModel` under `unet/`, the representative heavy component.
-        mlx_gen_sdxl::loader::needs_load_time_quant(root, q.bits(), MODEL_ID)?;
+        mlx_gen::quant::needs_load_time_quant(root, "unet", q.bits(), MODEL_ID)?;
         heavy.quantize_unet(q.bits())?;
     }
 

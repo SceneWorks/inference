@@ -16,7 +16,7 @@ use std::path::Path;
 
 use mlx_gen::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use mlx_gen::weights::Weights;
-use mlx_gen::{Error, Result, WeightsSource};
+use mlx_gen::{Result, WeightsSource};
 
 use crate::control_transformer::ZImageControlTransformer;
 use crate::text_encoder::{TextEncoder, ZTextEncoderConfig};
@@ -27,37 +27,6 @@ use crate::vae::{Vae, VaeDecoderConfig, VaeEncoderConfig};
 const PAD_TOKEN_ID: i32 = 151643;
 /// Prompts pad to this length (the fork's `padding="max_length"`).
 const MAX_LENGTH: usize = 512;
-
-/// Read the on-disk packed-quantization bits from `transformer/config.json`, if the snapshot is a
-/// pre-quantized (Group-B packed) turnkey. The converter writes
-/// `"quantization": {"bits", "group_size"}` (see `mlx_gen::quant::write_quantized_config`); a dense
-/// snapshot has no such marker. Returns `None` for a dense snapshot or a missing/unreadable config.
-fn packed_quant_bits(root: &Path) -> Option<i32> {
-    let cfg = std::fs::read(root.join("transformer").join("config.json")).ok()?;
-    let v: serde_json::Value = serde_json::from_slice(&cfg).ok()?;
-    v.get("quantization")?
-        .get("bits")?
-        .as_i64()
-        .map(|b| b as i32)
-}
-
-/// Tier guard mirroring `mlx_gen_qwen_image::loader::needs_load_time_quant`: if the snapshot is
-/// already a pre-quantized packed turnkey, the loaders detect the packed weights (`{base}.scales`)
-/// and skip `quantize()`, so a load-time (re)quant never happens. Compares the requested bits against
-/// the `packed_quant_bits` marker: errors on a tier mismatch; returns `false` (no load-time quant)
-/// when the turnkey is already packed at the requested bits; and returns `true` (load-time quantize
-/// needed) for a dense snapshot, where the request stands.
-pub fn needs_load_time_quant(root: &Path, requested_bits: i32, model_id: &str) -> Result<bool> {
-    match packed_quant_bits(root) {
-        Some(packed) if packed != requested_bits => Err(Error::Msg(format!(
-            "{model_id}: snapshot is a pre-quantized Q{packed} turnkey but Q{requested_bits} was \
-             requested; quantize() is a no-op on packed weights so the request would silently \
-             serve Q{packed}. Point at a Q{requested_bits} snapshot (or a dense one)."
-        ))),
-        Some(_) => Ok(false),
-        None => Ok(true),
-    }
-}
 
 /// Load the Qwen tokenizer with the Z-Image chat-template + padding policy.
 pub fn load_tokenizer(root: &Path) -> Result<TextTokenizer> {
@@ -300,7 +269,7 @@ pub(crate) fn packed_snapshot_fixture(tag: &str, bits: i32) -> std::path::PathBu
 /// turnkey loads packed and must NOT warn. Weight-free: writes only a `transformer/config.json`.
 #[cfg(test)]
 mod quant_tier_tests {
-    use super::needs_load_time_quant;
+    use mlx_gen::quant::needs_load_time_quant;
 
     /// Make a fresh temp snapshot root with `transformer/config.json` = `body` (skip the file when
     /// `body` is `None` — a dense snapshot with no quantization marker).
@@ -326,7 +295,7 @@ mod quant_tier_tests {
         for body in [None, Some("{}"), Some(r#"{"in_channels": 16}"#)] {
             let root = snapshot(body);
             assert!(
-                needs_load_time_quant(&root, 4, "z-image").unwrap(),
+                needs_load_time_quant(&root, "transformer", 4, "z-image").unwrap(),
                 "dense snapshot must report a load-time quant (→ warn)"
             );
             std::fs::remove_dir_all(&root).ok();
@@ -337,7 +306,7 @@ mod quant_tier_tests {
     fn already_packed_at_requested_bits_does_not_warn() {
         let root = snapshot(Some(r#"{"quantization": {"bits": 4, "group_size": 64}}"#));
         assert!(
-            !needs_load_time_quant(&root, 4, "z-image").unwrap(),
+            !needs_load_time_quant(&root, "transformer", 4, "z-image").unwrap(),
             "an already-packed Q4 turnkey must NOT report a load-time quant (no warn)"
         );
         std::fs::remove_dir_all(&root).ok();
@@ -346,7 +315,7 @@ mod quant_tier_tests {
     #[test]
     fn tier_mismatch_errors() {
         let root = snapshot(Some(r#"{"quantization": {"bits": 8, "group_size": 64}}"#));
-        let err = needs_load_time_quant(&root, 4, "z-image").unwrap_err();
+        let err = needs_load_time_quant(&root, "transformer", 4, "z-image").unwrap_err();
         assert!(
             format!("{err}").contains("pre-quantized Q8"),
             "requesting Q4 over a packed Q8 turnkey must error, got: {err}"

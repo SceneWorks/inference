@@ -193,7 +193,8 @@ pub(crate) fn load_residency(
         // serving Q8 (`quantize()` is a no-op on packed weights). Before this fix only the
         // Sequential warn gate below evaluated it, so the DEFAULT `Resident` load skipped the guard
         // entirely; `load_heavy` re-checks for the Sequential per-generate reload path.
-        let load_time_quant = loader::needs_load_time_quant(root, q.bits(), model_id)?;
+        let load_time_quant =
+            mlx_gen::quant::needs_load_time_quant(root, "transformer", q.bits(), model_id)?;
         // F-181: a `Sequential` + load-time (re)quant over a *dense* snapshot re-quantizes the whole
         // model on every generate. An already-packed turnkey loads packed (no re-quant); `Resident`
         // quantizes once. So warn only for the Sequential-over-dense combination that actually pays
@@ -292,7 +293,7 @@ fn load_heavy(
     // are documented no-ops (`AdaptableLinear::quantize` on a packed base); on a dense snapshot
     // they do the load-time quant — either way the request stands, so no gating on the bool.
     if let Some(q) = spec.quantize {
-        loader::needs_load_time_quant(root, q.bits(), model_id)?;
+        mlx_gen::quant::needs_load_time_quant(root, "transformer", q.bits(), model_id)?;
     }
     let mut transformer = loader::load_transformer(root)?;
     let mut vae = loader::load_vae(root)?;

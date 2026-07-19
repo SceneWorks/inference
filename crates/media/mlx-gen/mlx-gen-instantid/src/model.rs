@@ -329,7 +329,7 @@ impl InstantId {
         // silently no-ops on an already-packed U-Net, so a Q4 request over a pre-quantized Q8 snapshot
         // would serve Q8 with no diagnostic. Reuses the SDXL-family marker check on the base snapshot
         // (the U-Net `unet/config.json` is the representative heavy component).
-        mlx_gen_sdxl::loader::needs_load_time_quant(&self.sdxl_root, bits, "instantid")?;
+        mlx_gen::quant::needs_load_time_quant(&self.sdxl_root, "unet", bits, "instantid")?;
         self.unet.quantize(bits)?;
         self.te1.quantize(bits)?;
         self.te2.quantize(bits)?;

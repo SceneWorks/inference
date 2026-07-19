@@ -27,17 +27,6 @@ use crate::pipeline::{
     KreaText, T2iPlan, TurboOptions,
 };
 
-/// Read the on-disk packed-quantization bits from `transformer/config.json` for a pre-quantized
-/// (Group-B packed) Krea turnkey (`"quantization": {"bits", "group_size"}`); `None` for dense.
-fn packed_quant_bits(root: &Path) -> Option<i32> {
-    let cfg = std::fs::read(root.join("transformer").join("config.json")).ok()?;
-    let v: serde_json::Value = serde_json::from_slice(&cfg).ok()?;
-    v.get("quantization")?
-        .get("bits")?
-        .as_i64()
-        .map(|b| b as i32)
-}
-
 /// Registry id for the Krea 2 Turbo text-to-image variant. Matches the SceneWorks worker's
 /// `payload.model` and the manifest `engine_id` (sc-7572).
 pub const KREA_2_TURBO_ID: &str = "krea_2_turbo";
@@ -366,20 +355,10 @@ pub(crate) fn load_time_quant_bits(spec: &LoadSpec, root: &Path, id: &str) -> Re
     let Some(q) = spec.quantize else {
         return Ok(None);
     };
-    match packed_quant_bits(root) {
-        Some(packed) => {
-            if packed != q.bits() {
-                return Err(Error::Msg(format!(
-                    "{id}: snapshot is a pre-quantized Q{packed} turnkey but Q{} was \
-                     requested; quantize() is a no-op on packed weights so the request would \
-                     silently serve Q{packed}. Point at a Q{} snapshot (or a dense one).",
-                    q.bits(),
-                    q.bits()
-                )));
-            }
-            Ok(None)
-        }
-        None => Ok(Some(q.bits())),
+    if mlx_gen::quant::needs_load_time_quant(root, "transformer", q.bits(), id)? {
+        Ok(Some(q.bits()))
+    } else {
+        Ok(None)
     }
 }
 
@@ -394,7 +373,7 @@ pub(crate) fn effective_base_quant_bits(
     root: &Path,
     id: &str,
 ) -> Result<Option<i32>> {
-    if let Some(packed) = packed_quant_bits(root) {
+    if let Some(packed) = mlx_gen::quant::packed_quant_bits(root, "transformer")? {
         // Pre-packed turnkey: run load_time_quant_bits for its packed-vs-requested mismatch guard (e.g. a
         // Q4 request over a Q8 turnkey), then report the on-disk tier (load_time_quant_bits itself
         // returns None here).
@@ -1480,5 +1459,44 @@ mod tests {
             !msg.contains("single .safetensors file") && !msg.contains("precision override"),
             "expected an eager-load failure, got the up-front guard: {msg}"
         );
+    }
+
+    #[test]
+    fn shared_quant_guard_drives_load_time_and_effective_tiers() {
+        let root = std::env::temp_dir().join(format!(
+            "krea-shared-tier-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+        ));
+        std::fs::create_dir_all(root.join("transformer")).unwrap();
+        std::fs::write(
+            root.join("transformer/config.json"),
+            r#"{"quantization":{"bits":8,"group_size":64}}"#,
+        )
+        .unwrap();
+
+        let mut q8 = LoadSpec::new(WeightsSource::Dir(root.clone()));
+        q8.quantize = Some(Quant::Q8);
+        assert_eq!(
+            load_time_quant_bits(&q8, &root, KREA_2_TURBO_ID).unwrap(),
+            None
+        );
+        assert_eq!(
+            effective_base_quant_bits(&q8, &root, KREA_2_TURBO_ID).unwrap(),
+            Some(8)
+        );
+
+        q8.quantize = Some(Quant::Q4);
+        let error = load_time_quant_bits(&q8, &root, KREA_2_TURBO_ID)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(KREA_2_TURBO_ID), "{error}");
+        assert!(error.contains("Q8") && error.contains("Q4"), "{error}");
+
+        std::fs::write(root.join("transformer/config.json"), "{").unwrap();
+        assert!(effective_base_quant_bits(&q8, &root, KREA_2_TURBO_ID).is_err());
+        std::fs::remove_dir_all(root).ok();
     }
 }
