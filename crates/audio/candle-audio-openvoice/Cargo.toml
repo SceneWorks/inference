@@ -29,9 +29,13 @@ serde_json = { workspace = true }
 candle-audio = { path = "../candle-audio", features = ["testkit"] }
 # Kokoro TTS supplies the distinct source + target reference voices the discriminative real-weight
 # test converts between (the sanctioned "Kokoro-generated reference audio" path — no external audio
-# fixtures). Chatterbox VE measures the timbre shift (speaker-embedding cosine). Dev-only.
+# fixtures). Chatterbox VE measures the timbre shift (speaker-embedding cosine). Whisper ASR
+# (whisper_base) measures the linguistic-content preservation (CER of the converted clip's
+# transcript vs the known source text) — the garbling gate the timbre+duration gate can't catch.
+# All dev-only (test-scoped): a dev-dep does not change the resolved runtime graph.
 candle-audio-kokoro = { path = "../candle-audio-kokoro" }
 candle-audio-chatterbox-ve = { path = "../candle-audio-chatterbox-ve" }
+candle-audio-whisper = { path = "../candle-audio-whisper" }
 
 [features]
 default = []

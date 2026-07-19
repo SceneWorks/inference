@@ -314,6 +314,7 @@ dependencies = [
  "candle-audio",
  "candle-audio-chatterbox-ve",
  "candle-audio-kokoro",
+ "candle-audio-whisper",
  "candle-nn",
  "core-llm",
  "serde_json",
