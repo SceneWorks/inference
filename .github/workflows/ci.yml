@@ -60,6 +60,23 @@ jobs:
             python3 scripts/ci/select_lanes.py --base "$BASE_SHA" --head "$HEAD_SHA" --github-output "$GITHUB_OUTPUT"
           fi
 
+  # Whole-workspace manifest resolution. Deliberately NOT gated by `changes`: path-based
+  # lane selection never resolves the full member graph, so a manifest that any single lane
+  # would tolerate can still break `cargo metadata` for the workspace and reach main. A
+  # byte-identical duplicate `[dev-dependencies]` key in candle-gen-ideogram did exactly
+  # that — TOML forbids duplicate keys, so `cargo metadata`, `cargo tree`, and `cargo fmt
+  # --all` all failed hard on main until it was found by hand. `--no-deps` keeps this to a
+  # fast manifest parse (no dependency resolution, no compile).
+  resolve:
+    name: workspace manifest resolution
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Install pinned Rust toolchain
+        run: rustup show
+      - name: Resolve the full workspace manifest graph
+        run: cargo metadata --locked --no-deps --format-version 1 > /dev/null
+
   workspace:
     name: workspace graph invariants
     needs: changes
