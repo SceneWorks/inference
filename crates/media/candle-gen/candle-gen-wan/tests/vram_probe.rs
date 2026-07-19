@@ -73,9 +73,7 @@ use candle_gen::gen_core::{
     AdapterKind, AdapterSpec, Conditioning, GenerationOutput, GenerationRequest, Image, LoadSpec,
     MoeExpert, Progress, WeightsSource,
 };
-use candle_gen::testkit::{
-    cuda_mempool_used_high_bytes, reset_cuda_mempool_high_water, VramProbe,
-};
+use candle_gen::testkit::{cuda_mempool_used_high_bytes, reset_cuda_mempool_high_water, VramProbe};
 
 /// Max idle-baseline VRAM (GB) tolerated before the sampled peak is considered contaminated by
 /// another process. Matches the flux2 harness's `assert_trustworthy(1.0)`.
@@ -444,4 +442,3 @@ fn wan_vram_t2v_14b() {
 fn wan_vram_i2v_14b() {
     measure("wan2_2_i2v_14b");
 }
-

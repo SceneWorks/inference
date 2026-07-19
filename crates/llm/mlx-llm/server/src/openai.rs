@@ -184,7 +184,13 @@ pub fn finish_reason_str(f: mlx_llm::core_llm::FinishReason) -> &'static str {
 
 /// The first SSE chunk: an empty assistant-role delta (matches OpenAI clients' expectations).
 pub fn role_chunk(id: &str, model: &str, created: u64) -> String {
-    chunk(id, model, created, json!({ "role": "assistant" }), Value::Null)
+    chunk(
+        id,
+        model,
+        created,
+        json!({ "role": "assistant" }),
+        Value::Null,
+    )
 }
 
 /// A content SSE chunk carrying the next text delta.
@@ -331,7 +337,8 @@ mod tests {
         assert_eq!(role["choices"][0]["delta"]["role"], "assistant");
         assert_eq!(role["choices"][0]["finish_reason"], Value::Null);
 
-        let content = serde_json::from_str::<Value>(&content_chunk("id1", "m", 100, "hello")).unwrap();
+        let content =
+            serde_json::from_str::<Value>(&content_chunk("id1", "m", 100, "hello")).unwrap();
         assert_eq!(content["choices"][0]["delta"]["content"], "hello");
 
         let fin = serde_json::from_str::<Value>(&final_chunk("id1", "m", 100, "length")).unwrap();
@@ -341,7 +348,8 @@ mod tests {
 
     #[test]
     fn completion_body_carries_usage_and_message() {
-        let v = serde_json::from_str::<Value>(&completion("id", "m", 1, "hi there", "stop", 3, 2)).unwrap();
+        let v = serde_json::from_str::<Value>(&completion("id", "m", 1, "hi there", "stop", 3, 2))
+            .unwrap();
         assert_eq!(v["object"], "chat.completion");
         assert_eq!(v["choices"][0]["message"]["content"], "hi there");
         assert_eq!(v["choices"][0]["finish_reason"], "stop");

@@ -46,7 +46,10 @@ fn main() {
         };
         let out = generate(&model, &ids, &config, &CancelFlag::new(), &mut |_| {}).unwrap();
         let text = tok
-            .decode(&out.tokens.iter().map(|&i| i as u32).collect::<Vec<_>>(), true)
+            .decode(
+                &out.tokens.iter().map(|&i| i as u32).collect::<Vec<_>>(),
+                true,
+            )
             .unwrap();
         (n, text)
     };

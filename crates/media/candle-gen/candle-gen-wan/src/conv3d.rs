@@ -65,7 +65,12 @@ pub(crate) const IM2COL_BUDGET: usize = 128 * 1024 * 1024;
 /// one frame's im2col exceeds the budget (a hi-res still frame, `B·T_out == 1`) it falls back to chunking
 /// the **output rows** ([`row_chunked_conv2d`]). Shared by the z16 [`crate::vae16`] and z48
 /// [`crate::vae`] decoders/encoders (`Conv2dW`, `CausalConv3d`, the z16 encoder down-samplers).
-pub(crate) fn chunked_conv2d(x: &Tensor, w: &Tensor, padding: usize, stride: usize) -> Result<Tensor> {
+pub(crate) fn chunked_conv2d(
+    x: &Tensor,
+    w: &Tensor,
+    padding: usize,
+    stride: usize,
+) -> Result<Tensor> {
     chunked_conv2d_budgeted(x, w, padding, stride, IM2COL_BUDGET)
 }
 
@@ -325,8 +330,8 @@ mod tests {
         let (o, i) = (5usize, 3usize);
         for (kh, kw, padding, stride) in [
             (3usize, 3usize, 1usize, 1usize), // CausalConv3d 3×3 "same"
-            (3, 3, 0, 2),                     // z16 encoder SpatialDown (caller pre-pads asymmetrically)
-            (1, 1, 0, 1),                     // 1×1 taps (post_quant / mid-attn / temporal down)
+            (3, 3, 0, 2), // z16 encoder SpatialDown (caller pre-pads asymmetrically)
+            (1, 1, 0, 1), // 1×1 taps (post_quant / mid-attn / temporal down)
         ] {
             let w = Tensor::randn(0f32, 1.0, (o, i, kh, kw), &dev)?;
             // Several merged-batch items (B·T) and a tall-enough H to split into multiple row bands.
@@ -379,7 +384,11 @@ mod tests {
                 dt,
                 "CausalConv3d weight must load at the VarBuilder dtype ({dt:?})"
             );
-            assert_eq!(conv.bias.dtype(), dt, "bias must load at the VarBuilder dtype");
+            assert_eq!(
+                conv.bias.dtype(),
+                dt,
+                "bias must load at the VarBuilder dtype"
+            );
         }
         Ok(())
     }

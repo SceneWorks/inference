@@ -63,7 +63,10 @@ fn hf_prepare_dense_q4_q8_loads_and_generates() {
     assert!(!reference.is_quantized(), "source is dense");
     let ref_text = reference.complete(&greedy_request()).unwrap().text;
     println!("source ({PROMPT:?}) => {ref_text:?}");
-    assert!(!ref_text.trim().is_empty(), "source generation must be non-empty");
+    assert!(
+        !ref_text.trim().is_empty(),
+        "source generation must be non-empty"
+    );
 
     for (label, quantize) in [
         ("dense", None),
@@ -72,7 +75,10 @@ fn hf_prepare_dense_q4_q8_loads_and_generates() {
     ] {
         let out = tmp_out(label);
         let report = write_hf_snapshot(&source, &out, quantize).unwrap();
-        assert_eq!(report.quantized, quantize, "{label}: report records the scheme");
+        assert_eq!(
+            report.quantized, quantize,
+            "{label}: report records the scheme"
+        );
 
         // Load via the provider (the snapshot IS the loader's input contract — no loader change).
         let provider = LlamaProvider::load(&LoadSpec::dense(out.to_str().unwrap())).unwrap();
@@ -87,17 +93,28 @@ fn hf_prepare_dense_q4_q8_loads_and_generates() {
         println!("{label:>5}: {:?}", a.text);
         assert!(!a.text.trim().is_empty(), "{label}: produced no text");
         assert!(a.usage.generated_tokens > 0, "{label}: no generated tokens");
-        assert_eq!(a.text, b.text, "{label}: greedy generation must be reproducible");
+        assert_eq!(
+            a.text, b.text,
+            "{label}: greedy generation must be reproducible"
+        );
 
         // The dense snapshot is a faithful passthrough — it must generate exactly what the source
         // does. (Q4/Q8 are lossy, so only coherence is asserted for them.)
         if quantize.is_none() {
-            assert_eq!(a.text, ref_text, "dense snapshot must match the source's generation");
+            assert_eq!(
+                a.text, ref_text,
+                "dense snapshot must match the source's generation"
+            );
         }
 
         // Also confirm the registry route resolves to the same provider id.
-        let routed = mlx_llm::load_textllm(PROVIDER_ID, &LoadSpec::dense(out.to_str().unwrap())).unwrap();
-        assert_eq!(routed.descriptor().id, PROVIDER_ID, "{label}: registry routes to mlx provider");
+        let routed =
+            mlx_llm::load_textllm(PROVIDER_ID, &LoadSpec::dense(out.to_str().unwrap())).unwrap();
+        assert_eq!(
+            routed.descriptor().id,
+            PROVIDER_ID,
+            "{label}: registry routes to mlx provider"
+        );
 
         std::fs::remove_dir_all(&out).ok();
     }
@@ -122,12 +139,27 @@ fn hf_dense_passthrough_is_bit_identical() {
         let s = src.require(key).unwrap();
         let d = snap.require(key).unwrap();
         assert_eq!(d.shape(), s.shape(), "{key}: shape preserved");
-        assert_eq!(d.dtype(), s.dtype(), "{key}: dtype preserved (no cast on dense passthrough)");
-        let sv = s.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>().to_vec();
-        let dv = d.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>().to_vec();
+        assert_eq!(
+            d.dtype(),
+            s.dtype(),
+            "{key}: dtype preserved (no cast on dense passthrough)"
+        );
+        let sv = s
+            .as_dtype(Dtype::Float32)
+            .unwrap()
+            .as_slice::<f32>()
+            .to_vec();
+        let dv = d
+            .as_dtype(Dtype::Float32)
+            .unwrap()
+            .as_slice::<f32>()
+            .to_vec();
         assert_eq!(dv, sv, "{key}: values must reload bit-identical");
     }
-    println!("dense passthrough bit-identical across {} tensors", src.len());
+    println!(
+        "dense passthrough bit-identical across {} tensors",
+        src.len()
+    );
 
     std::fs::remove_dir_all(&out).ok();
 }

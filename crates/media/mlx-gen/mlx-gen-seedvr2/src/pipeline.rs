@@ -897,11 +897,7 @@ mod tests {
 
         clear_cache();
         let base = get_active_memory();
-        let old = cast_weights(
-            &convert::convert_dit(&raw).unwrap(),
-            Dtype::Bfloat16,
-        )
-        .unwrap();
+        let old = cast_weights(&convert::convert_dit(&raw).unwrap(), Dtype::Bfloat16).unwrap();
         eval_all(&old);
         clear_cache();
         let old_bytes = get_active_memory().saturating_sub(base);
@@ -929,7 +925,10 @@ mod tests {
             "new order must hold ~one bf16 copy: {new_bytes} vs {shared_bytes_bf16}"
         );
         assert!(
-            old_bytes.saturating_sub(new_bytes).abs_diff(shared_bytes_bf16) < tol,
+            old_bytes
+                .saturating_sub(new_bytes)
+                .abs_diff(shared_bytes_bf16)
+                < tol,
             "reorder must save ~one bf16 copy (~1.15 GB): old {old_bytes} new {new_bytes}"
         );
     }

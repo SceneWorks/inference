@@ -118,7 +118,10 @@ impl BlockPool {
     /// sharing (sc-7363). The allocator reuses a freed id when available.
     fn alloc_empty(&mut self) -> usize {
         let id = self.alloc.alloc();
-        let block = Some(PhysBlock { k: Vec::new(), v: Vec::new() });
+        let block = Some(PhysBlock {
+            k: Vec::new(),
+            v: Vec::new(),
+        });
         if id == self.blocks.len() {
             self.blocks.push(block);
         } else {
@@ -264,8 +267,12 @@ impl PagedKvCache {
             let mut ks = Vec::with_capacity(self.num_layers);
             let mut vs = Vec::with_capacity(self.num_layers);
             for l in 0..self.num_layers {
-                let fk = self.frozen_k[l].as_ref().expect("frozen present after ensure_frozen");
-                let fv = self.frozen_v[l].as_ref().expect("frozen present after ensure_frozen");
+                let fk = self.frozen_k[l]
+                    .as_ref()
+                    .expect("frozen present after ensure_frozen");
+                let fv = self.frozen_v[l]
+                    .as_ref()
+                    .expect("frozen present after ensure_frozen");
                 ks.push(seq_range(fk, b as i32 * bs, bs)?);
                 vs.push(seq_range(fv, b as i32 * bs, bs)?);
             }
@@ -367,8 +374,16 @@ impl PagedKvCache {
             self.block_ids.iter().all(|&id| pool.is_materialized(id)),
             "ensure_frozen over an unmaterialized block — frozen_k must stay valid for unshared blocks (sc-7363)"
         );
-        let ks: Vec<&Array> = self.block_ids.iter().map(|&id| &pool.block(id).k[layer]).collect();
-        let vs: Vec<&Array> = self.block_ids.iter().map(|&id| &pool.block(id).v[layer]).collect();
+        let ks: Vec<&Array> = self
+            .block_ids
+            .iter()
+            .map(|&id| &pool.block(id).k[layer])
+            .collect();
+        let vs: Vec<&Array> = self
+            .block_ids
+            .iter()
+            .map(|&id| &pool.block(id).v[layer])
+            .collect();
         self.frozen_k[layer] = Some(concat_or_clone(&ks)?);
         self.frozen_v[layer] = Some(concat_or_clone(&vs)?);
         Ok(())
@@ -398,7 +413,11 @@ impl KvCache for PagedKvCache {
     }
 
     fn batch_size(&self) -> i32 {
-        i32::from(!self.block_ids.is_empty() || self.tail_len > 0 || self.tail_k.iter().any(Option::is_some))
+        i32::from(
+            !self.block_ids.is_empty()
+                || self.tail_len > 0
+                || self.tail_k.iter().any(Option::is_some),
+        )
     }
 
     fn num_layers(&self) -> usize {
@@ -437,8 +456,14 @@ impl KvCache for PagedKvCache {
                     self.tail_k[l] = None;
                     self.tail_v[l] = None;
                 } else {
-                    let k = slice_prefix(self.tail_k[l].as_ref().expect("tail present"), new_tail as i32)?;
-                    let v = slice_prefix(self.tail_v[l].as_ref().expect("tail present"), new_tail as i32)?;
+                    let k = slice_prefix(
+                        self.tail_k[l].as_ref().expect("tail present"),
+                        new_tail as i32,
+                    )?;
+                    let v = slice_prefix(
+                        self.tail_v[l].as_ref().expect("tail present"),
+                        new_tail as i32,
+                    )?;
                     self.tail_k[l] = Some(k);
                     self.tail_v[l] = Some(v);
                 }
@@ -454,8 +479,12 @@ impl KvCache for PagedKvCache {
         let boundary = (keep_full * self.block_size) as i32; // first dropped position
         for l in 0..self.num_layers {
             self.ensure_frozen(l)?;
-            let fk = self.frozen_k[l].as_ref().expect("frozen present after ensure_frozen");
-            let fv = self.frozen_v[l].as_ref().expect("frozen present after ensure_frozen");
+            let fk = self.frozen_k[l]
+                .as_ref()
+                .expect("frozen present after ensure_frozen");
+            let fv = self.frozen_v[l]
+                .as_ref()
+                .expect("frozen present after ensure_frozen");
             // Unfreeze the boundary block's remainder into the tail before shrinking the frozen prefix.
             if rem > 0 {
                 self.tail_k[l] = Some(seq_range(fk, boundary, rem as i32)?);
@@ -465,7 +494,10 @@ impl KvCache for PagedKvCache {
                 self.tail_v[l] = None;
             }
             let (nfk, nfv) = if keep_full > 0 {
-                (Some(slice_prefix(fk, boundary)?), Some(slice_prefix(fv, boundary)?))
+                (
+                    Some(slice_prefix(fk, boundary)?),
+                    Some(slice_prefix(fv, boundary)?),
+                )
             } else {
                 (None, None)
             };
@@ -586,7 +618,10 @@ mod tests {
     }
 
     fn host(a: &Array) -> Vec<f32> {
-        a.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>().to_vec()
+        a.as_dtype(Dtype::Float32)
+            .unwrap()
+            .as_slice::<f32>()
+            .to_vec()
     }
 
     #[test]
@@ -615,7 +650,11 @@ mod tests {
         assert_eq!(c.offset(), 5);
         assert_eq!(c.block_ids.len(), 2);
         assert_eq!(c.tail_len, 1);
-        assert_eq!(host(&g1), vec![0.0, 1.0, 2.0, 3.0, 4.0], "gather is in position order");
+        assert_eq!(
+            host(&g1),
+            vec![0.0, 1.0, 2.0, 3.0, 4.0],
+            "gather is in position order"
+        );
     }
 
     #[test]
@@ -662,8 +701,16 @@ mod tests {
             contig.update(layer, &prefix, &prefix).unwrap();
             let (ck, cv) = contig.update(layer, &suffix, &suffix).unwrap();
             let (bk, bv) = b.update(layer, &suffix, &suffix).unwrap();
-            assert_eq!(host(&bk), host(&ck), "layer {layer}: seeded prefix + frozen suffix keys");
-            assert_eq!(host(&bv), host(&cv), "layer {layer}: seeded prefix + frozen suffix values");
+            assert_eq!(
+                host(&bk),
+                host(&ck),
+                "layer {layer}: seeded prefix + frozen suffix keys"
+            );
+            assert_eq!(
+                host(&bv),
+                host(&cv),
+                "layer {layer}: seeded prefix + frozen suffix values"
+            );
         }
         assert_eq!(b.offset(), 7, "4 seeded + 3 suffix");
         assert_eq!(b.block_ids.len(), 3, "2 seeded + 1 newly frozen block");
@@ -695,16 +742,32 @@ mod tests {
         let shared = a.shareable_prefix_blocks(4).unwrap();
         assert_eq!(shared.len(), 2);
         let mut b = PagedKvCache::new_seeded(pool.clone(), 1, &shared);
-        assert_eq!(b.offset(), 4, "seeded sequence starts past the shared prefix");
-        assert_eq!(pool.borrow().live_blocks(), 2, "no new blocks: prefix is shared");
+        assert_eq!(
+            b.offset(),
+            4,
+            "seeded sequence starts past the shared prefix"
+        );
+        assert_eq!(
+            pool.borrow().live_blocks(),
+            2,
+            "no new blocks: prefix is shared"
+        );
         assert_eq!(pool.borrow().shared_blocks(), 2);
 
         // B diverges in its own private tail; the shared full blocks are untouched (refcount stays 2).
         let bk = seq(1, 1, 1, 99.0);
         b.update(0, &bk, &bk).unwrap();
-        assert_eq!(pool.borrow().shared_blocks(), 2, "divergence touches only the private tail");
+        assert_eq!(
+            pool.borrow().shared_blocks(),
+            2,
+            "divergence touches only the private tail"
+        );
         let (bg, _) = b.gather(0).unwrap();
-        assert_eq!(host(&bg), vec![0.0, 1.0, 2.0, 3.0, 99.0], "shared prefix + private suffix");
+        assert_eq!(
+            host(&bg),
+            vec![0.0, 1.0, 2.0, 3.0, 99.0],
+            "shared prefix + private suffix"
+        );
 
         // Dropping B releases its references; the shared blocks return to refcount 1 (still A's).
         drop(b);
@@ -723,11 +786,17 @@ mod tests {
         let k = seq(1, 6, 1, 0.0); // 6 tokens -> 3 full blocks (block_size 2), empty tail
         a.update(0, &k, &k).unwrap();
         assert_eq!(a.block_ids.len(), 3);
-        assert!(a.frozen_k[0].is_some(), "frozen KV is held contiguously (the sole copy)");
+        assert!(
+            a.frozen_k[0].is_some(),
+            "frozen KV is held contiguously (the sole copy)"
+        );
         {
             let p = pool.borrow();
             for &id in &a.block_ids {
-                assert!(!p.is_materialized(id), "unshared block {id} holds no bytes (no duplicate)");
+                assert!(
+                    !p.is_materialized(id),
+                    "unshared block {id} holds no bytes (no duplicate)"
+                );
             }
         }
         // Offering the first two blocks for sharing materializes exactly those (sliced from frozen_k);
@@ -735,8 +804,14 @@ mod tests {
         let shared = a.shareable_prefix_blocks(4).unwrap();
         assert_eq!(shared.len(), 2);
         let p = pool.borrow();
-        assert!(p.is_materialized(shared[0]) && p.is_materialized(shared[1]), "shared blocks materialized");
-        assert!(!p.is_materialized(a.block_ids[2]), "the unshared third block stays byte-less");
+        assert!(
+            p.is_materialized(shared[0]) && p.is_materialized(shared[1]),
+            "shared blocks materialized"
+        );
+        assert!(
+            !p.is_materialized(a.block_ids[2]),
+            "the unshared third block stays byte-less"
+        );
     }
 
     #[test]
@@ -749,18 +824,31 @@ mod tests {
         // Case A: within the tail.
         c.truncate(9).unwrap();
         assert_eq!(c.offset(), 9);
-        assert_eq!(host(&c.gather(0).unwrap().0), (0..9).map(|x| x as f32).collect::<Vec<_>>());
+        assert_eq!(
+            host(&c.gather(0).unwrap().0),
+            (0..9).map(|x| x as f32).collect::<Vec<_>>()
+        );
 
         // Case B: drop into a block, unfreezing its remainder into a fresh tail.
         c.truncate(5).unwrap();
         assert_eq!(c.offset(), 5);
-        assert_eq!(host(&c.gather(0).unwrap().0), (0..5).map(|x| x as f32).collect::<Vec<_>>());
-        assert_eq!(c.pool().borrow().live_blocks(), 1, "the dropped block is freed");
+        assert_eq!(
+            host(&c.gather(0).unwrap().0),
+            (0..5).map(|x| x as f32).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            c.pool().borrow().live_blocks(),
+            1,
+            "the dropped block is freed"
+        );
 
         // Case A again, landing exactly on a block boundary (empty tail).
         c.truncate(4).unwrap();
         assert_eq!(c.offset(), 4);
-        assert_eq!(host(&c.gather(0).unwrap().0), (0..4).map(|x| x as f32).collect::<Vec<_>>());
+        assert_eq!(
+            host(&c.gather(0).unwrap().0),
+            (0..4).map(|x| x as f32).collect::<Vec<_>>()
+        );
 
         // No-op for len >= current length.
         c.truncate(100).unwrap();

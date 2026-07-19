@@ -27,7 +27,9 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use mlx_llm::core_llm::{self, CancelFlag, Error as CoreError, LoadSpec, Quantize, StreamEvent, TextLlm};
+use mlx_llm::core_llm::{
+    self, CancelFlag, Error as CoreError, LoadSpec, Quantize, StreamEvent, TextLlm,
+};
 
 /// How long a connected peer may stay silent before its connection is dropped (F-022). The server
 /// is single-threaded, so a peer that connects and sends nothing (a stray `nc`) would otherwise
@@ -108,8 +110,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .id
         }
     };
-    eprintln!("loading model from {} via provider '{provider_id}' …", args.model);
-    let spec = LoadSpec { source: args.model.clone(), quantize: args.quantize };
+    eprintln!(
+        "loading model from {} via provider '{provider_id}' …",
+        args.model
+    );
+    let spec = LoadSpec {
+        source: args.model.clone(),
+        quantize: args.quantize,
+    };
     let provider = registry.load_textllm(&provider_id, &spec)?;
 
     // A friendly default model name for responses (the snapshot dir's basename).
@@ -128,7 +136,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 /// The serial accept loop. A per-connection error (including a read timeout) drops that connection
 /// only — the loop always continues serving subsequent clients.
-fn serve(listener: &TcpListener, provider: &dyn TextLlm, default_model: &str, read_timeout: Duration) {
+fn serve(
+    listener: &TcpListener,
+    provider: &dyn TextLlm,
+    default_model: &str,
+    read_timeout: Duration,
+) {
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
@@ -158,22 +171,39 @@ fn handle_connection(
         Ok(None) => return Ok(()), // idle disconnect
         // Read timeout (F-022): the peer went silent mid-request — treat it as a dropped
         // connection, not an error worth replying to (the peer isn't reading anyway).
-        Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ) =>
+        {
             return Ok(());
         }
         Err(e) => {
             let status = http::error_status(&e);
-            return write_json(&mut stream, status, &openai::error_body(&e.to_string(), "invalid_request"));
+            return write_json(
+                &mut stream,
+                status,
+                &openai::error_body(&e.to_string(), "invalid_request"),
+            );
         }
     };
 
     match (req.method.as_str(), req.path.as_str()) {
-        ("POST", "/v1/chat/completions") => handle_chat(&mut stream, provider, &req.body, default_model),
-        ("GET", "/v1/models") => {
-            write_json(&mut stream, 200, &openai::models_list(default_model, unix_secs()))
+        ("POST", "/v1/chat/completions") => {
+            handle_chat(&mut stream, provider, &req.body, default_model)
         }
+        ("GET", "/v1/models") => write_json(
+            &mut stream,
+            200,
+            &openai::models_list(default_model, unix_secs()),
+        ),
         ("GET", "/" | "/health") => write_text(&mut stream, 200, "ok"),
-        _ => write_json(&mut stream, 404, &openai::error_body("not found", "not_found")),
+        _ => write_json(
+            &mut stream,
+            404,
+            &openai::error_body("not found", "not_found"),
+        ),
     }
 }
 
@@ -187,10 +217,17 @@ fn handle_chat(
     let chat: openai::ChatRequest = match serde_json::from_slice(body) {
         Ok(c) => c,
         Err(e) => {
-            return write_json(stream, 400, &openai::error_body(&e.to_string(), "invalid_request"))
+            return write_json(
+                stream,
+                400,
+                &openai::error_body(&e.to_string(), "invalid_request"),
+            )
         }
     };
-    let model = chat.model.clone().unwrap_or_else(|| default_model.to_string());
+    let model = chat
+        .model
+        .clone()
+        .unwrap_or_else(|| default_model.to_string());
     let want_stream = chat.stream;
 
     let mut req = match chat.into_text_llm_request() {
@@ -199,7 +236,11 @@ fn handle_chat(
     };
     // Reject anything outside the provider's declared surface before sending any 200.
     if let Err(e) = provider.validate(&req) {
-        return write_json(stream, 400, &openai::error_body(&e.to_string(), "invalid_request"));
+        return write_json(
+            stream,
+            400,
+            &openai::error_body(&e.to_string(), "invalid_request"),
+        );
     }
 
     let cancel = CancelFlag::new();
@@ -212,7 +253,10 @@ fn handle_chat(
     } else {
         match provider.complete(&req) {
             Ok(out) => {
-                let finish = out.finish_reason.map(openai::finish_reason_str).unwrap_or("stop");
+                let finish = out
+                    .finish_reason
+                    .map(openai::finish_reason_str)
+                    .unwrap_or("stop");
                 let body = openai::completion(
                     &id,
                     &model,
@@ -278,7 +322,10 @@ fn stream_chat(
     }
     match result {
         Ok(out) => {
-            let finish = out.finish_reason.map(openai::finish_reason_str).unwrap_or("stop");
+            let finish = out
+                .finish_reason
+                .map(openai::finish_reason_str)
+                .unwrap_or("stop");
             let _ = sse(stream, &openai::final_chunk(id, model, created, finish));
         }
         Err(CoreError::Canceled) => return Ok(()),
@@ -314,7 +361,12 @@ fn server_error_body(error: &CoreError) -> String {
     openai::error_body(INTERNAL_ERROR_MESSAGE, "server_error")
 }
 
-fn write_response(stream: &mut TcpStream, status: u16, content_type: &str, body: &[u8]) -> io::Result<()> {
+fn write_response(
+    stream: &mut TcpStream,
+    status: u16,
+    content_type: &str,
+    body: &[u8],
+) -> io::Result<()> {
     let reason = match status {
         200 => "OK",
         400 => "Bad Request",
@@ -334,7 +386,10 @@ fn write_response(stream: &mut TcpStream, status: u16, content_type: &str, body:
 
 /// Seconds since the Unix epoch (the OpenAI `created` field).
 fn unix_secs() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// A per-process-monotonic completion id (`chatcmpl-…`).
@@ -396,11 +451,16 @@ mod tests {
     fn silent_connection_times_out_and_next_client_is_served() {
         let addr = spawn_server(Duration::from_millis(200));
         let mut silent = TcpStream::connect(addr).unwrap();
-        silent.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        silent
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
 
         // Served only after the silent peer times out (the server is strictly serial).
         let resp = get_health(addr);
-        assert!(resp.starts_with("HTTP/1.1 200"), "unexpected response: {resp:?}");
+        assert!(
+            resp.starts_with("HTTP/1.1 200"),
+            "unexpected response: {resp:?}"
+        );
         assert!(resp.ends_with("ok"), "unexpected response: {resp:?}");
 
         // The silent connection was dropped (clean EOF), not answered.
@@ -415,10 +475,15 @@ mod tests {
         let addr = spawn_server(Duration::from_millis(200));
         let mut stalled = TcpStream::connect(addr).unwrap();
         // A valid request line and a header fragment with no terminator, then silence.
-        stalled.write_all(b"GET /health HTTP/1.1\r\nHost: x").unwrap();
+        stalled
+            .write_all(b"GET /health HTTP/1.1\r\nHost: x")
+            .unwrap();
 
         let resp = get_health(addr);
-        assert!(resp.starts_with("HTTP/1.1 200"), "unexpected response: {resp:?}");
+        assert!(
+            resp.starts_with("HTTP/1.1 200"),
+            "unexpected response: {resp:?}"
+        );
     }
 
     /// F-006, end to end: a no-newline flood gets a 431 response (not OOM), and the server keeps
@@ -428,14 +493,24 @@ mod tests {
     fn request_line_flood_gets_431_and_server_keeps_serving() {
         let addr = spawn_server(Duration::from_secs(30));
         let mut flood = TcpStream::connect(addr).unwrap();
-        flood.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
-        flood.write_all(&vec![b'A'; http::MAX_LINE as usize + 1]).unwrap();
+        flood
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        flood
+            .write_all(&vec![b'A'; http::MAX_LINE as usize + 1])
+            .unwrap();
         let mut resp = String::new();
         flood.read_to_string(&mut resp).unwrap();
-        assert!(resp.starts_with("HTTP/1.1 431"), "unexpected response: {resp:?}");
+        assert!(
+            resp.starts_with("HTTP/1.1 431"),
+            "unexpected response: {resp:?}"
+        );
 
         let resp2 = get_health(addr);
-        assert!(resp2.starts_with("HTTP/1.1 200"), "unexpected response: {resp2:?}");
+        assert!(
+            resp2.starts_with("HTTP/1.1 200"),
+            "unexpected response: {resp2:?}"
+        );
     }
 
     #[test]

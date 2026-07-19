@@ -69,7 +69,10 @@ fn base_spec() -> LoadSpec {
 
 fn render_measured(policy: OffloadPolicy, req: &GenerationRequest) -> (Vec<u8>, usize) {
     let spec = base_spec().with_offload_policy(policy);
-    let model = mlx_gen_sd3::provider_registry().expect("build provider registry").load("sd3_5_large", &spec).expect("load sd3_5_large");
+    let model = mlx_gen_sd3::provider_registry()
+        .expect("build provider registry")
+        .load("sd3_5_large", &spec)
+        .expect("load sd3_5_large");
     reset_peak_memory();
     let out = model.generate(req, &mut |_| {}).expect("generate");
     let peak = get_peak_memory();

@@ -82,10 +82,14 @@ pub fn reconstruct(g: &GgufFile) -> Result<TokenizerOutcome> {
 /// Build a byte-level BPE `tokenizer.json` from the GGUF metadata (gpt2 family).
 fn reconstruct_byte_level_bpe(g: &GgufFile) -> Result<TokenizerOutcome> {
     let Some(tokens) = str_array(g, "tokenizer.ggml.tokens") else {
-        return Ok(unsupported("GGUF has tokenizer.ggml.model but no tokenizer.ggml.tokens"));
+        return Ok(unsupported(
+            "GGUF has tokenizer.ggml.model but no tokenizer.ggml.tokens",
+        ));
     };
     let Some(merges) = str_array(g, "tokenizer.ggml.merges") else {
-        return Ok(unsupported("GGUF byte-level BPE tokenizer has no tokenizer.ggml.merges"));
+        return Ok(unsupported(
+            "GGUF byte-level BPE tokenizer has no tokenizer.ggml.merges",
+        ));
     };
     let token_types = i64_array(g, "tokenizer.ggml.token_type");
     let pre = g.meta_str("tokenizer.ggml.pre").unwrap_or("default");
@@ -113,20 +117,31 @@ fn reconstruct_byte_level_bpe(g: &GgufFile) -> Result<TokenizerOutcome> {
         "vocab": Value::Object(vocab),
         "merges": Value::Array(merge_pairs),
     });
-    let tokenizer_json = assemble(added, normalizer, pre_tokenizer, post_processor, decoder, model);
+    let tokenizer_json = assemble(
+        added,
+        normalizer,
+        pre_tokenizer,
+        post_processor,
+        decoder,
+        model,
+    );
     let tokenizer_config_json = build_tokenizer_config(g, &tokens);
 
-    Ok(TokenizerOutcome::Reconstructed(Box::new(ReconstructedTokenizer {
-        tokenizer_json,
-        tokenizer_config_json,
-        kind: format!("gpt2 byte-level BPE (pre={pre})"),
-    })))
+    Ok(TokenizerOutcome::Reconstructed(Box::new(
+        ReconstructedTokenizer {
+            tokenizer_json,
+            tokenizer_config_json,
+            kind: format!("gpt2 byte-level BPE (pre={pre})"),
+        },
+    )))
 }
 
 /// Build a SentencePiece BPE `tokenizer.json` (Llama-2 / Mistral family) from the GGUF metadata.
 fn reconstruct_spm(g: &GgufFile) -> Result<TokenizerOutcome> {
     let Some(tokens) = str_array(g, "tokenizer.ggml.tokens") else {
-        return Ok(unsupported("GGUF has tokenizer.ggml.model but no tokenizer.ggml.tokens"));
+        return Ok(unsupported(
+            "GGUF has tokenizer.ggml.model but no tokenizer.ggml.tokens",
+        ));
     };
     let token_types = i64_array(g, "tokenizer.ggml.token_type");
 
@@ -181,11 +196,13 @@ fn reconstruct_spm(g: &GgufFile) -> Result<TokenizerOutcome> {
     let tokenizer_json = assemble(added, normalizer, Value::Null, Value::Null, decoder, model);
     let tokenizer_config_json = build_tokenizer_config(g, &tokens);
 
-    Ok(TokenizerOutcome::Reconstructed(Box::new(ReconstructedTokenizer {
-        tokenizer_json,
-        tokenizer_config_json,
-        kind: format!("llama SentencePiece BPE (merges={merge_source})"),
-    })))
+    Ok(TokenizerOutcome::Reconstructed(Box::new(
+        ReconstructedTokenizer {
+            tokenizer_json,
+            tokenizer_config_json,
+            kind: format!("llama SentencePiece BPE (merges={merge_source})"),
+        },
+    )))
 }
 
 /// `model.vocab`: every token by its id. The GGUF token list has no duplicate strings (verified on
@@ -195,7 +212,9 @@ fn build_vocab(tokens: &[&str]) -> std::result::Result<Map<String, Value>, Strin
     let mut vocab = Map::with_capacity(tokens.len());
     for (id, tok) in tokens.iter().enumerate() {
         if vocab.insert((*tok).to_string(), json!(id)).is_some() {
-            return Err(format!("duplicate token {tok:?} in GGUF vocab — cannot build a 1:1 vocab"));
+            return Err(format!(
+                "duplicate token {tok:?} in GGUF vocab — cannot build a 1:1 vocab"
+            ));
         }
     }
     Ok(vocab)
@@ -275,7 +294,8 @@ fn spm_components(add_space_prefix: bool) -> (Value, Value) {
     if add_space_prefix {
         normalizers.push(json!({ "type": "Prepend", "prepend": SPM_SPACE }));
     }
-    normalizers.push(json!({ "type": "Replace", "pattern": { "String": " " }, "content": SPM_SPACE }));
+    normalizers
+        .push(json!({ "type": "Replace", "pattern": { "String": " " }, "content": SPM_SPACE }));
     let normalizer = json!({ "type": "Sequence", "normalizers": normalizers });
     let decoder = json!({
         "type": "Sequence",
@@ -341,9 +361,7 @@ fn bpe_components(pre: &str) -> (Value, Value, Value, Value) {
             ]
         })
     };
-    let bytelevel = |apsf: bool, trim: bool, use_regex: bool| {
-        json!({ "type": "ByteLevel", "add_prefix_space": apsf, "trim_offsets": trim, "use_regex": use_regex })
-    };
+    let bytelevel = |apsf: bool, trim: bool, use_regex: bool| json!({ "type": "ByteLevel", "add_prefix_space": apsf, "trim_offsets": trim, "use_regex": use_regex });
 
     match pre {
         "qwen2" => (
@@ -404,10 +422,16 @@ fn build_tokenizer_config(g: &GgufFile, tokens: &[&str]) -> Value {
     if let Some(pad) = token_str("tokenizer.ggml.padding_token_id") {
         cfg.insert("pad_token".into(), json!(pad));
     }
-    if let Some(add_bos) = g.meta("tokenizer.ggml.add_bos_token").and_then(|v| v.as_bool()) {
+    if let Some(add_bos) = g
+        .meta("tokenizer.ggml.add_bos_token")
+        .and_then(|v| v.as_bool())
+    {
         cfg.insert("add_bos_token".into(), json!(add_bos));
     }
-    if let Some(add_eos) = g.meta("tokenizer.ggml.add_eos_token").and_then(|v| v.as_bool()) {
+    if let Some(add_eos) = g
+        .meta("tokenizer.ggml.add_eos_token")
+        .and_then(|v| v.as_bool())
+    {
         cfg.insert("add_eos_token".into(), json!(add_eos));
     }
     Value::Object(cfg)
@@ -445,7 +469,10 @@ mod tests {
     }
     impl Builder {
         fn new() -> Self {
-            Self { meta: Vec::new(), count: 0 }
+            Self {
+                meta: Vec::new(),
+                count: 0,
+            }
         }
         fn key(&mut self, k: &str) {
             self.meta.extend_from_slice(&(k.len() as u64).to_le_bytes());
@@ -472,7 +499,8 @@ mod tests {
             self.key(k);
             self.meta.extend_from_slice(&9u32.to_le_bytes()); // T_ARRAY
             self.meta.extend_from_slice(&8u32.to_le_bytes()); // elem T_STRING
-            self.meta.extend_from_slice(&(vals.len() as u64).to_le_bytes());
+            self.meta
+                .extend_from_slice(&(vals.len() as u64).to_le_bytes());
             for v in vals {
                 self.str_val(v);
             }
@@ -482,7 +510,8 @@ mod tests {
             self.key(k);
             self.meta.extend_from_slice(&9u32.to_le_bytes()); // T_ARRAY
             self.meta.extend_from_slice(&5u32.to_le_bytes()); // elem T_INT32
-            self.meta.extend_from_slice(&(vals.len() as u64).to_le_bytes());
+            self.meta
+                .extend_from_slice(&(vals.len() as u64).to_le_bytes());
             for v in vals {
                 self.meta.extend_from_slice(&v.to_le_bytes());
             }
@@ -492,7 +521,8 @@ mod tests {
             self.key(k);
             self.meta.extend_from_slice(&9u32.to_le_bytes()); // T_ARRAY
             self.meta.extend_from_slice(&6u32.to_le_bytes()); // elem T_FLOAT32
-            self.meta.extend_from_slice(&(vals.len() as u64).to_le_bytes());
+            self.meta
+                .extend_from_slice(&(vals.len() as u64).to_le_bytes());
             for v in vals {
                 self.meta.extend_from_slice(&v.to_le_bytes());
             }
@@ -525,7 +555,9 @@ mod tests {
 
     #[test]
     fn absent_without_tokenizer_metadata() {
-        let g = Builder::new().string("general.architecture", "llama").build();
+        let g = Builder::new()
+            .string("general.architecture", "llama")
+            .build();
         assert!(matches!(reconstruct(&g).unwrap(), TokenizerOutcome::Absent));
     }
 
@@ -546,7 +578,16 @@ mod tests {
             .string("tokenizer.ggml.model", "llama")
             .str_array(
                 "tokenizer.ggml.tokens",
-                &["<unk>", "<s>", "</s>", "\u{2581}", "h", "i", "\u{2581}h", "<0x0A>"],
+                &[
+                    "<unk>",
+                    "<s>",
+                    "</s>",
+                    "\u{2581}",
+                    "h",
+                    "i",
+                    "\u{2581}h",
+                    "<0x0A>",
+                ],
             )
             .i32_array("tokenizer.ggml.token_type", &[2, 3, 3, 1, 1, 1, 1, 6])
             .str_array("tokenizer.ggml.merges", &["\u{2581} h"])
@@ -563,7 +604,10 @@ mod tests {
         assert_eq!(tj["model"]["byte_fallback"], true);
         assert_eq!(tj["model"]["fuse_unk"], true);
         assert_eq!(tj["model"]["unk_token"], "<unk>");
-        assert_eq!(tj["model"]["merges"], serde_json::json!([["\u{2581}", "h"]]));
+        assert_eq!(
+            tj["model"]["merges"],
+            serde_json::json!([["\u{2581}", "h"]])
+        );
 
         // The byte token stays in the plain vocab (byte_fallback handles it), NOT added_tokens.
         assert_eq!(tj["model"]["vocab"]["<0x0A>"], 7);
@@ -589,9 +633,15 @@ mod tests {
         // determinable: scores descending so "ab" (-4) and "bc" (-5) precede "abc"'s two splits (-6).
         let g = Builder::new()
             .string("tokenizer.ggml.model", "llama")
-            .str_array("tokenizer.ggml.tokens", &["<unk>", "a", "b", "c", "ab", "bc", "abc"])
+            .str_array(
+                "tokenizer.ggml.tokens",
+                &["<unk>", "a", "b", "c", "ab", "bc", "abc"],
+            )
             .i32_array("tokenizer.ggml.token_type", &[2, 1, 1, 1, 1, 1, 1])
-            .f32_array("tokenizer.ggml.scores", &[0.0, -1.0, -2.0, -3.0, -4.0, -5.0, -6.0])
+            .f32_array(
+                "tokenizer.ggml.scores",
+                &[0.0, -1.0, -2.0, -3.0, -4.0, -5.0, -6.0],
+            )
             .u32("tokenizer.ggml.unknown_token_id", 0)
             .build();
         let t = reconstructed(&g);
@@ -610,7 +660,10 @@ mod tests {
             .string("tokenizer.ggml.model", "llama")
             .str_array("tokenizer.ggml.tokens", &["<unk>", "a", "b"])
             .build();
-        assert!(matches!(reconstruct(&g).unwrap(), TokenizerOutcome::Unsupported(_)));
+        assert!(matches!(
+            reconstruct(&g).unwrap(),
+            TokenizerOutcome::Unsupported(_)
+        ));
     }
 
     #[test]
@@ -671,7 +724,10 @@ mod tests {
         // smollm: no normalizer, Digits-led pre-tokenizer.
         let sm = reconstructed(&base("smollm"));
         assert!(sm.tokenizer_json["normalizer"].is_null());
-        assert_eq!(sm.tokenizer_json["pre_tokenizer"]["pretokenizers"][0]["type"], "Digits");
+        assert_eq!(
+            sm.tokenizer_json["pre_tokenizer"]["pretokenizers"][0]["type"],
+            "Digits"
+        );
         // unknown pre: plain GPT-2 byte-level (single ByteLevel pre-tokenizer, no normalizer).
         let def = reconstructed(&base("totally-unknown-pre"));
         assert!(def.tokenizer_json["normalizer"].is_null());
@@ -685,6 +741,9 @@ mod tests {
             .str_array("tokenizer.ggml.tokens", &["a", "a"])
             .str_array("tokenizer.ggml.merges", &["a a"])
             .build();
-        assert!(matches!(reconstruct(&g).unwrap(), TokenizerOutcome::Unsupported(_)));
+        assert!(matches!(
+            reconstruct(&g).unwrap(),
+            TokenizerOutcome::Unsupported(_)
+        ));
     }
 }

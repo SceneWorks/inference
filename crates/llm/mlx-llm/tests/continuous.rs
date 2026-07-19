@@ -50,7 +50,11 @@ fn load_from(env: &str) -> Option<Fixture> {
 }
 
 fn encode(tok: &Tokenizer, text: &str) -> Vec<i32> {
-    tok.encode(text, true).unwrap().into_iter().map(|id| id as i32).collect()
+    tok.encode(text, true)
+        .unwrap()
+        .into_iter()
+        .map(|id| id as i32)
+        .collect()
 }
 
 fn request(fx: &Fixture, prompt: &[i32], max_new: usize) -> BatchRequest {
@@ -75,10 +79,18 @@ fn run_single(fx: &Fixture, prompt: &[i32], max_new: usize) -> (Vec<i32>, Finish
 }
 
 fn cfg(max_batch: usize, exactness: BatchExactness) -> ContinuousConfig {
-    ContinuousConfig { max_batch, block_size: BLOCK, exactness }
+    ContinuousConfig {
+        max_batch,
+        block_size: BLOCK,
+        exactness,
+    }
 }
 
-fn run_continuous(fx: &Fixture, reqs: &[BatchRequest], config: &ContinuousConfig) -> Vec<GenerationOutput> {
+fn run_continuous(
+    fx: &Fixture,
+    reqs: &[BatchRequest],
+    config: &ContinuousConfig,
+) -> Vec<GenerationOutput> {
     generate_continuous(&fx.model, reqs, config, &CancelFlag::new(), &mut |_, _| {}).unwrap()
 }
 
@@ -93,7 +105,10 @@ fn exact_equals_batch1(fx: &Fixture) {
     let prompts = [
         encode(&fx.tok, "Hi"),
         encode(&fx.tok, "The capital of France is"),
-        encode(&fx.tok, "Once upon a time in a small village there lived a curious"),
+        encode(
+            &fx.tok,
+            "Once upon a time in a small village there lived a curious",
+        ),
         // A long prompt (25+ tokens) so prefill spans several whole paged blocks (BLOCK = 8),
         // exercising freeze-on-full + multi-block gather inside the continuous path.
         encode(
@@ -109,11 +124,15 @@ fn exact_equals_batch1(fx: &Fixture) {
         let (single, single_fin) = run_single(fx, p, 24);
         assert!(!single.is_empty(), "row {i} should generate");
         assert_eq!(
-            batched[i].tokens, single,
+            batched[i].tokens,
+            single,
             "row {i} (len {}) must be BIT-EXACT to its batch-1 run under Exact mode",
             p.len()
         );
-        assert_eq!(batched[i].finish_reason, single_fin, "row {i} finish reason");
+        assert_eq!(
+            batched[i].finish_reason, single_fin,
+            "row {i} finish reason"
+        );
     }
 }
 
@@ -131,8 +150,11 @@ fn admit_on_retire_equals_batch1(fx: &Fixture) {
         ("The quick brown fox", 12),
     ];
     let prompts: Vec<Vec<i32>> = specs.iter().map(|(t, _)| encode(&fx.tok, t)).collect();
-    let reqs: Vec<BatchRequest> =
-        prompts.iter().zip(specs).map(|(p, (_, b))| request(fx, p, b)).collect();
+    let reqs: Vec<BatchRequest> = prompts
+        .iter()
+        .zip(specs)
+        .map(|(p, (_, b))| request(fx, p, b))
+        .collect();
 
     let batched = run_continuous(fx, &reqs, &cfg(2, BatchExactness::Exact));
     assert_eq!(batched.len(), specs.len());
@@ -144,7 +166,10 @@ fn admit_on_retire_equals_batch1(fx: &Fixture) {
             batched[i].tokens, single,
             "row {i} (admitted into a freed slot) must be bit-exact to its batch-1 run"
         );
-        assert_eq!(batched[i].finish_reason, single_fin, "row {i} finish reason");
+        assert_eq!(
+            batched[i].finish_reason, single_fin,
+            "row {i} finish reason"
+        );
     }
 }
 
@@ -155,7 +180,10 @@ fn throughput_tracks_batch1(fx: &Fixture) {
     let prompts = [
         encode(&fx.tok, "Hi"),
         encode(&fx.tok, "The capital of France is"),
-        encode(&fx.tok, "Once upon a time in a small village there lived a curious"),
+        encode(
+            &fx.tok,
+            "Once upon a time in a small village there lived a curious",
+        ),
     ];
     let reqs: Vec<BatchRequest> = prompts.iter().map(|p| request(fx, p, 24)).collect();
     let batched = run_continuous(fx, &reqs, &cfg(prompts.len(), BatchExactness::Throughput));
@@ -164,12 +192,25 @@ fn throughput_tracks_batch1(fx: &Fixture) {
         let (single, single_fin) = run_single(fx, p, 24);
         let got = &batched[i].tokens;
         let cp = common_prefix(got, &single);
-        let text = fx.tok.decode(&got.iter().map(|&x| x as u32).collect::<Vec<_>>(), true).unwrap();
-        println!("throughput row {i} (len {}): common prefix {cp}/{} :: {text}", p.len(), single.len());
+        let text = fx
+            .tok
+            .decode(&got.iter().map(|&x| x as u32).collect::<Vec<_>>(), true)
+            .unwrap();
+        println!(
+            "throughput row {i} (len {}): common prefix {cp}/{} :: {text}",
+            p.len(),
+            single.len()
+        );
         assert!(!got.is_empty(), "row {i} produced no tokens");
         assert!(!text.trim().is_empty(), "row {i} should decode to text");
-        assert_eq!(batched[i].finish_reason, single_fin, "row {i} finish reason");
-        assert!(cp >= 1, "row {i} must track batch-1 on at least the prefill argmax");
+        assert_eq!(
+            batched[i].finish_reason, single_fin,
+            "row {i} finish reason"
+        );
+        assert!(
+            cp >= 1,
+            "row {i} must track batch-1 on at least the prefill argmax"
+        );
     }
 }
 
@@ -217,7 +258,11 @@ fn throughput_scales_with_occupancy() {
         let mut r = request(&fx, &prompt, budget);
         r.stop_tokens = Vec::new(); // run the full budget so the token count is fixed
         let reqs: Vec<BatchRequest> = (0..n).map(|_| r.clone()).collect();
-        let config = ContinuousConfig { max_batch: n, block_size: BLOCK, exactness: mode };
+        let config = ContinuousConfig {
+            max_batch: n,
+            block_size: BLOCK,
+            exactness: mode,
+        };
         let _ = run_continuous(&fx, &reqs, &config); // warm
         let t = std::time::Instant::now();
         let out = run_continuous(&fx, &reqs, &config);
@@ -228,14 +273,23 @@ fn throughput_scales_with_occupancy() {
     println!("occupancy | Exact tok/s | Throughput tok/s | speedup");
     let mut thru_by_n = Vec::new();
     for &n in &[1usize, 2, 4, 8] {
-        let (e, tp) = (agg(n, BatchExactness::Exact), agg(n, BatchExactness::Throughput));
+        let (e, tp) = (
+            agg(n, BatchExactness::Exact),
+            agg(n, BatchExactness::Throughput),
+        );
         println!("{n:>9} | {e:>11.1} | {tp:>16.1} | {:>5.2}x", tp / e);
         thru_by_n.push((n, e, tp));
     }
     let (_, exact8, thru8) = *thru_by_n.last().unwrap();
     let (_, _, thru1) = thru_by_n[0];
-    assert!(thru8 > thru1 * 1.5, "Throughput@8 ({thru8:.0}) should scale well past Throughput@1 ({thru1:.0})");
-    assert!(thru8 > exact8 * 1.3, "Throughput@8 ({thru8:.0}) should beat Exact@8 ({exact8:.0}) via batched matmul");
+    assert!(
+        thru8 > thru1 * 1.5,
+        "Throughput@8 ({thru8:.0}) should scale well past Throughput@1 ({thru1:.0})"
+    );
+    assert!(
+        thru8 > exact8 * 1.3,
+        "Throughput@8 ({thru8:.0}) should beat Exact@8 ({exact8:.0}) via batched matmul"
+    );
 }
 
 /// A mid-stream cancel stops the whole continuous run promptly; every request finishes `Cancelled`
@@ -273,8 +327,15 @@ fn cancel_stops_continuous() {
     .unwrap();
 
     for out in &batched {
-        assert_eq!(out.finish_reason, FinishReason::Cancelled, "cancelled rows finish Cancelled");
-        assert!(out.tokens.len() < 200, "cancel should stop well before the budget");
+        assert_eq!(
+            out.finish_reason,
+            FinishReason::Cancelled,
+            "cancelled rows finish Cancelled"
+        );
+        assert!(
+            out.tokens.len() < 200,
+            "cancel should stop well before the budget"
+        );
     }
 }
 
@@ -326,17 +387,28 @@ fn cancel_emits_one_done_per_request() {
             }
             mlx_llm::StreamEvent::Done { reason, .. } => {
                 done_count[ri] += 1;
-                assert_eq!(reason, FinishReason::Cancelled, "request {ri} Done must be Cancelled");
+                assert_eq!(
+                    reason,
+                    FinishReason::Cancelled,
+                    "request {ri} Done must be Cancelled"
+                );
             }
         },
     )
     .unwrap();
 
     for (i, c) in done_count.iter().enumerate() {
-        assert_eq!(*c, 1, "request {i} must emit exactly one Done (incl. never-admitted queued rows)");
+        assert_eq!(
+            *c, 1,
+            "request {i} must emit exactly one Done (incl. never-admitted queued rows)"
+        );
     }
     for (i, o) in out.iter().enumerate() {
-        assert_eq!(o.finish_reason, FinishReason::Cancelled, "request {i} output Cancelled");
+        assert_eq!(
+            o.finish_reason,
+            FinishReason::Cancelled,
+            "request {i} output Cancelled"
+        );
     }
 }
 
@@ -367,9 +439,18 @@ fn zero_budget_request_completes_empty() {
     )
     .unwrap();
 
-    assert!(out[0].tokens.is_empty(), "zero-budget request generates nothing");
+    assert!(
+        out[0].tokens.is_empty(),
+        "zero-budget request generates nothing"
+    );
     assert_eq!(out[0].finish_reason, FinishReason::MaxTokens);
-    assert_eq!(done_count[0], 1, "zero-budget request emits exactly one Done");
-    assert!(!out[1].tokens.is_empty(), "the budgeted request still generates");
+    assert_eq!(
+        done_count[0], 1,
+        "zero-budget request emits exactly one Done"
+    );
+    assert!(
+        !out[1].tokens.is_empty(),
+        "the budgeted request still generates"
+    );
     assert_eq!(done_count[1], 1);
 }

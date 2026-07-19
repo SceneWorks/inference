@@ -487,7 +487,11 @@ impl ModelConfig {
     /// image (3-D) RoPE path; the text path (all rows equal) is independent of the split.
     pub fn mrope_section_resolved(&self) -> [usize; 3] {
         if let Some(s) = self.mrope_section {
-            return [s[0].max(0) as usize, s[1].max(0) as usize, s[2].max(0) as usize];
+            return [
+                s[0].max(0) as usize,
+                s[1].max(0) as usize,
+                s[2].max(0) as usize,
+            ];
         }
         let half = (self.rotary_dim() / 2) as usize;
         let base = half / 3;

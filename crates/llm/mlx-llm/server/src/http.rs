@@ -154,7 +154,10 @@ mod tests {
 
     #[test]
     fn oversized_body_rejected() {
-        let raw = format!("POST / HTTP/1.1\r\nContent-Length: {}\r\n\r\n", MAX_BODY + 1);
+        let raw = format!(
+            "POST / HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+            MAX_BODY + 1
+        );
         let mut c = Cursor::new(raw.into_bytes());
         let err = read_request(&mut c).unwrap_err();
         assert_eq!(error_status(&err), 400);
@@ -207,7 +210,10 @@ mod tests {
                 Ok(n)
             }
         }
-        let mut r = std::io::BufReader::new(HeaderFlood { sent_request_line: false, pos: 0 });
+        let mut r = std::io::BufReader::new(HeaderFlood {
+            sent_request_line: false,
+            pos: 0,
+        });
         let err = read_request(&mut r).unwrap_err();
         assert_eq!(error_status(&err), 431);
     }

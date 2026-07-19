@@ -160,7 +160,10 @@ mod tests {
     #[test]
     fn stop_within_a_single_delta_trims_and_halts() {
         let (out, stopped, _) = run(&["END"], &["abcENDxyz"]);
-        assert_eq!(out, "abc", "text before the stop is emitted; the stop and tail are dropped");
+        assert_eq!(
+            out, "abc",
+            "text before the stop is emitted; the stop and tail are dropped"
+        );
         assert!(stopped);
     }
 

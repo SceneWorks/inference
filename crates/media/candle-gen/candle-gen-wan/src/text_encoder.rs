@@ -270,6 +270,9 @@ mod tests {
         assert_eq!(out.dtype(), DType::F32);
         assert_eq!(out.dims3().unwrap(), (1, 3, 8));
         let flat: Vec<f32> = out.flatten_all().unwrap().to_vec1().unwrap();
-        assert!(flat.iter().all(|v| v.is_finite()), "f32 encode must be finite");
+        assert!(
+            flat.iter().all(|v| v.is_finite()),
+            "f32 encode must be finite"
+        );
     }
 }

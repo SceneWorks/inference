@@ -130,12 +130,18 @@ fn img2img_components_match_reference() {
     // eps1 2.783e-5 — fp16 UNet + f32 CFG). Bounds ~4× the measurements; the render gate below
     // stays the semantic check (measured 0.023% px>8 — pixel-parity). A real wiring bug (wrong
     // sigma/noise/CFG) lands O(1e-1+).
-    assert!(pr_x0 < 4e-3, "img2img x_0 (encode) diverged: {pr_x0:.3e} (sc-12896 bound)");
+    assert!(
+        pr_x0 < 4e-3,
+        "img2img x_0 (encode) diverged: {pr_x0:.3e} (sc-12896 bound)"
+    );
     assert!(
         pr_xt < 5e-4,
         "img2img x_t (add_noise) diverged: {pr_xt:.3e} (sc-12896 bound)"
     );
-    assert!(pr_eps < 1.5e-4, "img2img step-1 eps diverged: {pr_eps:.3e} (sc-12896 bound)");
+    assert!(
+        pr_eps < 1.5e-4,
+        "img2img step-1 eps diverged: {pr_eps:.3e} (sc-12896 bound)"
+    );
     println!("✓ img2img init pipeline (encode + add_noise + eps) matches the reference within the sc-12896 cross-stack bounds");
 }
 

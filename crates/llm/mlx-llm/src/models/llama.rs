@@ -12,7 +12,9 @@
 //! Shapes are batch-capable (`[batch, seq, …]`). `head_dim` is taken from config and may differ from
 //! `hidden_size / num_heads`. Cached decode runs in bf16.
 
-use mlx_rs::ops::{add, broadcast_to, concatenate_axis, multiply, sigmoid, split_sections, zeros_dtype};
+use mlx_rs::ops::{
+    add, broadcast_to, concatenate_axis, multiply, sigmoid, split_sections, zeros_dtype,
+};
 use mlx_rs::{Array, Dtype};
 
 use crate::config::{Architecture, ModelConfig};
@@ -65,10 +67,19 @@ impl CausalLm {
         // lives at the checkpoint root (untied). A plain `*ForCausalLM` keeps the historical
         // `[{prefix}.]model.*` / `[{prefix}.]lm_head.weight` layout.
         let vlm_nested = cfg.architecture.is_qwen3_vl();
-        let decoder_root = if vlm_nested { "model.language_model".to_string() } else { join(prefix, "model") };
+        let decoder_root = if vlm_nested {
+            "model.language_model".to_string()
+        } else {
+            join(prefix, "model")
+        };
         let p = |suffix: &str| join(&decoder_root, suffix);
-        let head_key = if vlm_nested { "lm_head.weight".to_string() } else { join(prefix, "lm_head.weight") };
-        let req_bf16 = |key: String| -> Result<Array> { Ok(w.require(&key)?.as_dtype(COMPUTE_DTYPE)?) };
+        let head_key = if vlm_nested {
+            "lm_head.weight".to_string()
+        } else {
+            join(prefix, "lm_head.weight")
+        };
+        let req_bf16 =
+            |key: String| -> Result<Array> { Ok(w.require(&key)?.as_dtype(COMPUTE_DTYPE)?) };
 
         // A snapshot may store pre-quantized projections (the GGUF converter's MLX-requant output);
         // those are loaded from `weight`/`scales`/`biases` as-is. Otherwise the dense weight is loaded
@@ -102,7 +113,11 @@ impl CausalLm {
         let proj_b = |wkey: String| -> Result<Projection> {
             let base = wkey.strip_suffix(".weight").unwrap_or(&wkey);
             let bkey = format!("{base}.bias");
-            let bias = if w.contains(&bkey) { Some(req_bf16(bkey)?) } else { None };
+            let bias = if w.contains(&bkey) {
+                Some(req_bf16(bkey)?)
+            } else {
+                None
+            };
             load_proj(&wkey, bias)
         };
         // Gemma's norms are `(1 + weight)`; fold the +1 into the stored weight so the standard
@@ -242,7 +257,10 @@ impl CausalLm {
                             Projection::load(parts[1].clone(), quant)?,
                         )
                     } else {
-                        (proj(lp("mlp.gate_proj.weight"))?, proj(lp("mlp.up_proj.weight"))?)
+                        (
+                            proj(lp("mlp.gate_proj.weight"))?,
+                            proj(lp("mlp.up_proj.weight"))?,
+                        )
                     }
                 };
                 Ffn::Dense(LlamaMlp {
@@ -333,7 +351,10 @@ impl CausalLm {
     pub fn rope_tables(&self, positions: &[i32], rows: i32, cols: i32) -> Result<(Array, Array)> {
         let (cos, sin) = self.rope.cos_sin_at(positions, COMPUTE_DTYPE)?; // [1, rows*cols, rope_dim]
         let hd = self.rope.dim();
-        Ok((cos.reshape(&[rows, cols, hd])?, sin.reshape(&[rows, cols, hd])?))
+        Ok((
+            cos.reshape(&[rows, cols, hd])?,
+            sin.reshape(&[rows, cols, hd])?,
+        ))
     }
 
     /// Embed token ids `[batch, seq]` → `[batch, seq, hidden]` (bf16). Gemma scales by √hidden.
@@ -626,7 +647,13 @@ impl crate::models::VlmDecode for CausalLm {
         vision_features: &Array,
         placeholder_tokens: &[i32],
     ) -> Result<Array> {
-        CausalLm::splice_vision_features(self, embeds, input_ids, vision_features, placeholder_tokens)
+        CausalLm::splice_vision_features(
+            self,
+            embeds,
+            input_ids,
+            vision_features,
+            placeholder_tokens,
+        )
     }
 
     fn mrope_positions_mm(
@@ -658,7 +685,13 @@ impl crate::models::VlmDecode for CausalLm {
         deepstack: &[Array],
     ) -> Result<Array> {
         // The generic decoder's cache is already the trait-object form — no downcast needed.
-        self.decode_logits_from_embeds_mrope_deepstack(embeds, positions, cache, visual_pos_mask, deepstack)
+        self.decode_logits_from_embeds_mrope_deepstack(
+            embeds,
+            positions,
+            cache,
+            visual_pos_mask,
+            deepstack,
+        )
     }
 }
 
@@ -697,7 +730,9 @@ impl LlamaLayer {
         layer_idx: usize,
     ) -> Result<Array> {
         let normed = rms_norm(x, &self.input_ln, self.eps)?;
-        let attn = self.attn.forward(&normed, cos, sin, mask, cache, layer_idx)?;
+        let attn = self
+            .attn
+            .forward(&normed, cos, sin, mask, cache, layer_idx)?;
         self.combine_ffn(x, &attn)
     }
 
@@ -710,7 +745,9 @@ impl LlamaLayer {
         layer_idx: usize,
     ) -> Result<Array> {
         let normed = rms_norm(x, &self.input_ln, self.eps)?;
-        let attn = self.attn.forward_per_seq(&normed, cos, sin, caches, layer_idx)?;
+        let attn = self
+            .attn
+            .forward_per_seq(&normed, cos, sin, caches, layer_idx)?;
         self.combine_ffn(x, &attn)
     }
 
@@ -808,9 +845,18 @@ impl LlamaAttention {
         let sh = x.shape();
         let (b, s) = (sh[0], sh[1]);
 
-        let mut q = self.q.forward(x)?.reshape(&[b, s, self.num_heads, self.head_dim])?;
-        let mut k = self.k.forward(x)?.reshape(&[b, s, self.num_kv_heads, self.head_dim])?;
-        let v = self.v.forward(x)?.reshape(&[b, s, self.num_kv_heads, self.head_dim])?;
+        let mut q = self
+            .q
+            .forward(x)?
+            .reshape(&[b, s, self.num_heads, self.head_dim])?;
+        let mut k = self
+            .k
+            .forward(x)?
+            .reshape(&[b, s, self.num_kv_heads, self.head_dim])?;
+        let v = self
+            .v
+            .forward(x)?
+            .reshape(&[b, s, self.num_kv_heads, self.head_dim])?;
 
         if let Some(qn) = &self.q_norm {
             q = rms_norm(&q, qn, self.eps)?;
@@ -829,9 +875,9 @@ impl LlamaAttention {
     fn output(&self, attn: &Array) -> Result<Array> {
         let sh = attn.shape(); // [b, heads, s, head_dim]
         let (b, s) = (sh[0], sh[2]);
-        let merged = attn
-            .transpose_axes(&[0, 2, 1, 3])?
-            .reshape(&[b, s, self.num_heads * self.head_dim])?;
+        let merged =
+            attn.transpose_axes(&[0, 2, 1, 3])?
+                .reshape(&[b, s, self.num_heads * self.head_dim])?;
         self.o.forward(&merged)
     }
 
@@ -866,7 +912,14 @@ impl LlamaAttention {
             let i = i as i32;
             let (qi, ki, vi) = (row_axis0(&q, i)?, row_axis0(&k, i)?, row_axis0(&v, i)?);
             let (k_all, v_all) = cache.update(layer_idx, &ki, &vi)?;
-            outs.push(sdpa_capped(&qi, &k_all, &v_all, self.scale, self.softcap, AttnMask::Causal)?);
+            outs.push(sdpa_capped(
+                &qi,
+                &k_all,
+                &v_all,
+                self.scale,
+                self.softcap,
+                AttnMask::Causal,
+            )?);
         }
         let refs: Vec<&Array> = outs.iter().collect();
         let out = concatenate_axis(&refs, 0)?; // [b, heads, s, head_dim]
@@ -914,7 +967,9 @@ impl MlaAttention {
         load_proj: &dyn Fn(&str, Option<Array>) -> Result<Projection>,
         req_bf16: &dyn Fn(String) -> Result<Array>,
     ) -> Result<Self> {
-        let mla = cfg.mla.expect("MLA config present for a DeepSeek-V2 decoder");
+        let mla = cfg
+            .mla
+            .expect("MLA config present for a DeepSeek-V2 decoder");
         // Query: a low-rank `q_a → norm → q_b` when the model has a query LoRA, else a full `q_proj`.
         let (q_proj, q_a_proj, q_a_layernorm, q_b_proj) =
             if w.contains(&lp("self_attn.q_a_proj.weight")) {
@@ -925,7 +980,12 @@ impl MlaAttention {
                     Some(load_proj(&lp("self_attn.q_b_proj.weight"), None)?),
                 )
             } else {
-                (Some(load_proj(&lp("self_attn.q_proj.weight"), None)?), None, None, None)
+                (
+                    Some(load_proj(&lp("self_attn.q_proj.weight"), None)?),
+                    None,
+                    None,
+                    None,
+                )
             };
         Ok(Self {
             q_proj,
@@ -958,7 +1018,11 @@ impl MlaAttention {
         let sh = x.shape();
         let (b, s) = (sh[0], sh[1]);
         let nh = self.num_heads;
-        let (nope, rope, vhd) = (self.qk_nope_head_dim, self.qk_rope_head_dim, self.v_head_dim);
+        let (nope, rope, vhd) = (
+            self.qk_nope_head_dim,
+            self.qk_rope_head_dim,
+            self.v_head_dim,
+        );
         let qhd = nope + rope; // per-head q/k dim attended over
 
         // Query → [b, s, nh, qhd], split into content (nope) and rotary (rope) parts.
@@ -983,7 +1047,10 @@ impl MlaAttention {
         let k_pe = kv_parts[1].reshape(&[b, s, 1, rope])?; // shared across heads
 
         // Up-project to per-head content keys and values: [b, s, nh, nope + vhd].
-        let kv_b = self.kv_b_proj.forward(&compressed)?.reshape(&[b, s, nh, nope + vhd])?;
+        let kv_b = self
+            .kv_b_proj
+            .forward(&compressed)?
+            .reshape(&[b, s, nh, nope + vhd])?;
         let kv_b_parts = split_sections(&kv_b, &[nope], 3)?; // [k_nope, value]
         let k_nope = &kv_b_parts[0];
         let value = &kv_b_parts[1];
@@ -1001,7 +1068,9 @@ impl MlaAttention {
         let (k_all, v_all) = cache.update(layer_idx, &k, &v)?;
         // q/k head dim (qhd) ≠ v head dim (vhd) → `sdpa_capped` takes the eager path.
         let out = sdpa_capped(&q, &k_all, &v_all, self.scale, None, mask)?; // [b, nh, s, vhd]
-        let out = out.transpose_axes(&[0, 2, 1, 3])?.reshape(&[b, s, nh * vhd])?;
+        let out = out
+            .transpose_axes(&[0, 2, 1, 3])?
+            .reshape(&[b, s, nh * vhd])?;
         self.o_proj.forward(&out)
     }
 }
@@ -1093,7 +1162,13 @@ impl MoeMlp {
             let top = &idx[..k];
             // Renormalize the top-k weights to sum to 1, or apply the routed scaling factor.
             let (denom, post_scale) = if self.norm_topk_prob {
-                (top.iter().map(|&e| probs[e]).sum::<f32>().max(f32::MIN_POSITIVE), 1.0)
+                (
+                    top.iter()
+                        .map(|&e| probs[e])
+                        .sum::<f32>()
+                        .max(f32::MIN_POSITIVE),
+                    1.0,
+                )
             } else {
                 (1.0, self.routed_scaling_factor)
             };
@@ -1155,5 +1230,4 @@ mod tests {
             "language_model.model.norm.weight"
         );
     }
-
 }

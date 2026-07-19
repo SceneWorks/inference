@@ -112,7 +112,10 @@ mod tests {
                 snapshot.audio_backend.as_deref(),
                 Some(super::AUDIO_BACKEND)
             );
-            assert_eq!(snapshot.audio_generator_ids, ["kokoro_82m", "moss_sfx_v2", "acestep_v15_turbo"]);
+            assert_eq!(
+                snapshot.audio_generator_ids,
+                ["kokoro_82m", "moss_sfx_v2", "acestep_v15_turbo"]
+            );
             assert_eq!(snapshot.audio_voice_embedder_ids, ["chatterbox_ve"]);
             assert_eq!(snapshot.audio_transform_ids, ["openvoice_v2"]);
             assert_eq!(snapshot.audio_transcriber_ids, ["whisper_base"]);
@@ -199,7 +202,12 @@ mod tests {
         assert!(snapshot.generator_ids.len() > 50);
         assert_eq!(
             snapshot.audio_generator_ids,
-            ["kokoro_82m", "moss_sfx_v2", "acestep_v15_turbo", "dummy-audio"]
+            [
+                "kokoro_82m",
+                "moss_sfx_v2",
+                "acestep_v15_turbo",
+                "dummy-audio"
+            ]
         );
         assert_eq!(snapshot.audio_snapshot_preparer_backends, ["candle"]);
         assert_eq!(snapshot.snapshot_preparer_backends, ["mlx"]);

@@ -58,7 +58,12 @@ pub struct TurboLoraReport {
 }
 
 impl TurboLoraReport {
-    fn from_counts(applied: usize, resolved: usize, matched: usize, shape_mismatched: usize) -> Self {
+    fn from_counts(
+        applied: usize,
+        resolved: usize,
+        matched: usize,
+        shape_mismatched: usize,
+    ) -> Self {
         Self {
             applied,
             absent_targets: resolved - matched,

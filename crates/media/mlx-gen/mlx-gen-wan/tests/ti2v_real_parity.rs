@@ -274,8 +274,20 @@ fn wan_ti2v_5b_real_weight_e2e_matches_reference() {
     assert!(cn_mr < 1e-2, "t5 context_null diverged: {cn_mr:.3e}");
     assert!(zi_mr < 1e-2, "vae22 z_img encode diverged: {zi_mr:.3e}");
     assert!(f0 < 1e-4, "ti2v first frame not frozen to z_img: {f0:.3e}");
-    assert!(t2l_mr < 3e-1, "t2v latents diverged: {t2l_mr:.3e} (sc-12896 envelope)");
-    assert!(til_mr < 3e-1, "ti2v latents diverged: {til_mr:.3e} (sc-12896 envelope)");
-    assert!(t2v_mr < 3e-1, "t2v video diverged: {t2v_mr:.3e} (sc-12896 envelope)");
-    assert!(ti2v_mr < 3e-1, "ti2v video diverged: {ti2v_mr:.3e} (sc-12896 envelope)");
+    assert!(
+        t2l_mr < 3e-1,
+        "t2v latents diverged: {t2l_mr:.3e} (sc-12896 envelope)"
+    );
+    assert!(
+        til_mr < 3e-1,
+        "ti2v latents diverged: {til_mr:.3e} (sc-12896 envelope)"
+    );
+    assert!(
+        t2v_mr < 3e-1,
+        "t2v video diverged: {t2v_mr:.3e} (sc-12896 envelope)"
+    );
+    assert!(
+        ti2v_mr < 3e-1,
+        "ti2v video diverged: {ti2v_mr:.3e} (sc-12896 envelope)"
+    );
 }

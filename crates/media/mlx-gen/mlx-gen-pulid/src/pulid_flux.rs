@@ -673,8 +673,8 @@ mod tests {
 
         // IdFormer with depth 0 — no perceiver layers; just latents/proj_out + the 6 mapping MLPs.
         let mlp = [
-            "0.weight", "0.bias", "1.weight", "1.bias", "3.weight", "3.bias", "4.weight",
-            "4.bias", "6.weight", "6.bias",
+            "0.weight", "0.bias", "1.weight", "1.bias", "3.weight", "3.bias", "4.weight", "4.bias",
+            "6.weight", "6.bias",
         ];
         let mut ikeys: Vec<String> = vec!["enc.latents".into(), "enc.proj_out".into()];
         for m in [
@@ -734,7 +734,10 @@ mod tests {
         // ONLY rejection — and it must arrive through `generate` itself, typed.
         assert!(select_reference_face(&req.conditioning).is_ok());
         let err = Generator::generate(&model, &req, &mut |_| {}).unwrap_err();
-        assert!(matches!(err, gen_core::Error::Unsupported(_)), "got: {err:?}");
+        assert!(
+            matches!(err, gen_core::Error::Unsupported(_)),
+            "got: {err:?}"
+        );
     }
 
     /// Two reference faces are rejected, and an empty request is rejected as missing.

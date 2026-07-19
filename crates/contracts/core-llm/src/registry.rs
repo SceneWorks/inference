@@ -233,11 +233,7 @@ fn select<'a>(
     //    (non-vision *for this snapshot*) provider so a plain load never hands back a model that
     //    expects an image; otherwise take the first-registered viable provider.
     if viable.len() > 1 && !reqs.vision {
-        if let Some(text) = viable
-            .iter()
-            .copied()
-            .find(|r| !serves_vision(r, spec))
-        {
+        if let Some(text) = viable.iter().copied().find(|r| !serves_vision(r, spec)) {
             return Ok(text);
         }
     }
@@ -294,7 +290,11 @@ fn summary(regs: &[&TextLlmRegistration]) -> String {
 /// error names the real decoder a provider would dispatch on, not just the multimodal wrapper.
 fn raw_arch_hint(spec: &LoadSpec) -> Option<String> {
     let p = std::path::Path::new(&spec.source);
-    let cfg = if p.is_dir() { p.join("config.json") } else { p.to_path_buf() };
+    let cfg = if p.is_dir() {
+        p.join("config.json")
+    } else {
+        p.to_path_buf()
+    };
     let text = std::fs::read_to_string(&cfg).ok()?;
     let v: serde_json::Value = serde_json::from_str(&text).ok()?;
     let str_at = |val: &serde_json::Value, key: &str| -> Option<String> {
@@ -454,7 +454,11 @@ mod tests {
     /// This is the contract-side stand-in for the mlx-llm provider's own probe.
     fn qwen_vl_vision_probe(spec: &LoadSpec) -> bool {
         let p = std::path::Path::new(&spec.source);
-        let cfg = if p.is_dir() { p.join("config.json") } else { p.to_path_buf() };
+        let cfg = if p.is_dir() {
+            p.join("config.json")
+        } else {
+            p.to_path_buf()
+        };
         let Ok(text) = std::fs::read_to_string(&cfg) else {
             return false;
         };
@@ -512,10 +516,7 @@ mod tests {
         }
     }
 
-    fn picked<'a>(
-        regs: &'a [&'a TextLlmRegistration],
-        reqs: &ModelRequirements,
-    ) -> Result<String> {
+    fn picked<'a>(regs: &'a [&'a TextLlmRegistration], reqs: &ModelRequirements) -> Result<String> {
         let spec = LoadSpec::dense("/no/such/snapshot");
         select(regs.iter().copied(), &spec, reqs).map(|r| (r.descriptor)().id)
     }
@@ -569,7 +570,10 @@ mod tests {
             Error::Unsupported(m) => {
                 assert!(m.contains("no registered provider can serve"), "{m}");
                 // The available providers are surfaced so the caller sees what IS present.
-                assert!(m.contains("text (test)") && m.contains("vision (test)"), "{m}");
+                assert!(
+                    m.contains("text (test)") && m.contains("vision (test)"),
+                    "{m}"
+                );
             }
             other => panic!("expected Unsupported, got {other:?}"),
         }
@@ -601,7 +605,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
 
         // A flat (non-wrapped) config still works and omits the nested part.
-        let flat = std::env::temp_dir().join(format!("core-llm-archhint-flat-{}", std::process::id()));
+        let flat =
+            std::env::temp_dir().join(format!("core-llm-archhint-flat-{}", std::process::id()));
         std::fs::create_dir_all(&flat).unwrap();
         std::fs::write(
             flat.join("config.json"),
@@ -662,7 +667,10 @@ mod tests {
         let err = picked(&[&text, &vision], &reqs).unwrap_err();
         match err {
             Error::Unsupported(m) => {
-                assert!(m.contains("is loadable, but no available provider meets"), "{m}");
+                assert!(
+                    m.contains("is loadable, but no available provider meets"),
+                    "{m}"
+                );
                 assert!(m.contains("vision (test)"), "{m}");
             }
             other => panic!("expected Unsupported, got {other:?}"),
@@ -748,7 +756,12 @@ mod tests {
         let (dir, spec) = qwen3vl_snapshot("default");
         let joycaption = reg(joycaption_desc, no);
         let generic = reg_with_vision_probe(generic_text_desc, yes, qwen_vl_vision_probe);
-        let id = picked_for(&[&joycaption, &generic], &spec, &ModelRequirements::default()).unwrap();
+        let id = picked_for(
+            &[&joycaption, &generic],
+            &spec,
+            &ModelRequirements::default(),
+        )
+        .unwrap();
         assert_eq!(id, "mlx-llama");
         let _ = std::fs::remove_dir_all(&dir);
     }

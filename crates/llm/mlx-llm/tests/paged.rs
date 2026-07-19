@@ -39,15 +39,27 @@ fn load_from(env: &str) -> Option<Fixture> {
     let max_ctx = cfg.max_position_embeddings;
     let model = CausalLm::from_weights(&Weights::from_dir(&dir).unwrap(), "", cfg).unwrap();
     let tok = Tokenizer::from_file(format!("{dir}/tokenizer.json")).unwrap();
-    Some(Fixture { model, tok, max_ctx })
+    Some(Fixture {
+        model,
+        tok,
+        max_ctx,
+    })
 }
 
 fn encode(tok: &Tokenizer, text: &str) -> Vec<i32> {
-    tok.encode(text, true).unwrap().into_iter().map(|id| id as i32).collect()
+    tok.encode(text, true)
+        .unwrap()
+        .into_iter()
+        .map(|id| id as i32)
+        .collect()
 }
 
 fn encode_no_bos(tok: &Tokenizer, text: &str) -> Vec<i32> {
-    tok.encode(text, false).unwrap().into_iter().map(|id| id as i32).collect()
+    tok.encode(text, false)
+        .unwrap()
+        .into_iter()
+        .map(|id| id as i32)
+        .collect()
 }
 
 fn config(max_new: usize) -> GenerationConfig {
@@ -60,9 +72,15 @@ fn config(max_new: usize) -> GenerationConfig {
 }
 
 fn cold(fx: &Fixture, prompt: &[i32], max_new: usize) -> Vec<i32> {
-    generate(&fx.model, prompt, &config(max_new), &CancelFlag::new(), &mut |_| {})
-        .unwrap()
-        .tokens
+    generate(
+        &fx.model,
+        prompt,
+        &config(max_new),
+        &CancelFlag::new(),
+        &mut |_| {},
+    )
+    .unwrap()
+    .tokens
 }
 
 fn run_suite(fx: Fixture) {
@@ -74,17 +92,33 @@ fn run_suite(fx: Fixture) {
     assert!(!base.is_empty());
 
     let mut paged = fx.model.new_paged_cache(BLOCK_SIZE);
-    let out = generate_with_cache(&fx.model, &prompt, &mut paged, &config(max_new), &CancelFlag::new(), &mut |_| {})
-        .unwrap()
-        .tokens;
-    assert_eq!(out, base, "paged cache must be token-for-token identical to the contiguous cache");
+    let out = generate_with_cache(
+        &fx.model,
+        &prompt,
+        &mut paged,
+        &config(max_new),
+        &CancelFlag::new(),
+        &mut |_| {},
+    )
+    .unwrap()
+    .tokens;
+    assert_eq!(
+        out, base,
+        "paged cache must be token-for-token identical to the contiguous cache"
+    );
 
     // ---- Near-zero reservation waste vs naive max-context ----
     let len = prompt.len() + out.len();
     let reserved = paged.reserved_tokens();
     let naive = fx.max_ctx.max(2048) as usize; // a naive cache reserves a full max_position slab/seq
-    assert!(reserved <= len + BLOCK_SIZE, "paged reserves ~len, not a fixed max");
-    assert!(reserved * 8 < naive, "paged reservation must be a small fraction of naive max-context");
+    assert!(
+        reserved <= len + BLOCK_SIZE,
+        "paged reserves ~len, not a fixed max"
+    );
+    assert!(
+        reserved * 8 < naive,
+        "paged reservation must be a small fraction of naive max-context"
+    );
     println!(
         "reservation: paged {reserved} tokens for a {len}-token sequence vs naive {naive} \
          ({:.1}x less)",
@@ -111,26 +145,50 @@ fn run_suite(fx: Fixture) {
     let pool = BlockPool::new(BLOCK_SIZE);
     // Sequence 1 (cold) populates the shared system-prefix blocks.
     let mut c1 = PagedKvCache::with_pool(pool.clone(), fx.model.config().num_layers);
-    let out1 = generate_with_cache(&fx.model, &p1, &mut c1, &config(max_new), &CancelFlag::new(), &mut |_| {})
-        .unwrap()
-        .tokens;
+    let out1 = generate_with_cache(
+        &fx.model,
+        &p1,
+        &mut c1,
+        &config(max_new),
+        &CancelFlag::new(),
+        &mut |_| {},
+    )
+    .unwrap()
+    .tokens;
     assert_eq!(out1, cold1, "paged seq 1 must match its cold run");
 
     // Sequence 2 adopts seq 1's whole system-prefix blocks (no recompute, no copy).
     let shared = c1.shareable_prefix_blocks(sys.len()).unwrap();
     let shared_tokens = shared.len() * BLOCK_SIZE;
-    assert!(!shared.is_empty(), "the system prefix should span at least one block");
+    assert!(
+        !shared.is_empty(),
+        "the system prefix should span at least one block"
+    );
     let mut c2 = PagedKvCache::new_seeded(pool.clone(), fx.model.config().num_layers, &shared);
-    let out2 = generate_with_cache(&fx.model, &p2, &mut c2, &config(max_new), &CancelFlag::new(), &mut |_| {})
-        .unwrap()
-        .tokens;
-    assert_eq!(out2, cold2, "paged seq 2 (sharing seq 1's prefix blocks) must match its cold run");
+    let out2 = generate_with_cache(
+        &fx.model,
+        &p2,
+        &mut c2,
+        &config(max_new),
+        &CancelFlag::new(),
+        &mut |_| {},
+    )
+    .unwrap()
+    .tokens;
+    assert_eq!(
+        out2, cold2,
+        "paged seq 2 (sharing seq 1's prefix blocks) must match its cold run"
+    );
 
     // The shared blocks are physically shared (refcount > 1) and counted once: the pool holds the
     // union of both sequences' blocks minus the de-duplicated shared prefix.
     {
         let p = pool.borrow();
-        assert_eq!(p.shared_blocks(), shared.len(), "the whole system prefix is shared");
+        assert_eq!(
+            p.shared_blocks(),
+            shared.len(),
+            "the whole system prefix is shared"
+        );
         assert_eq!(
             p.live_blocks(),
             c1.blocks() + c2.blocks() - shared.len(),
@@ -144,11 +202,18 @@ fn run_suite(fx: Fixture) {
             p.live_blocks(),
             c1.blocks() + c2.blocks(),
         );
-        assert!(p.live_blocks() < c1.blocks() + c2.blocks(), "sharing reduces the block count");
+        assert!(
+            p.live_blocks() < c1.blocks() + c2.blocks(),
+            "sharing reduces the block count"
+        );
     }
 
     drop(c2);
-    assert_eq!(pool.borrow().shared_blocks(), 0, "dropping seq 2 releases the shared references");
+    assert_eq!(
+        pool.borrow().shared_blocks(),
+        0,
+        "dropping seq 2 releases the shared references"
+    );
 }
 
 #[test]

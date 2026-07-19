@@ -43,7 +43,10 @@ pub fn mrope_positions_mm(
     let mut video_frames: Vec<[i32; 3]> = Vec::new();
     for &[t, h, w] in video_grid_thw {
         if t <= 0 {
-            return Err(Error::Msg(format!("vlm mrope: bad video grid {:?}", [t, h, w])));
+            return Err(Error::Msg(format!(
+                "vlm mrope: bad video grid {:?}",
+                [t, h, w]
+            )));
         }
         for _ in 0..t {
             video_frames.push([1, h, w]);
@@ -166,7 +169,11 @@ pub fn splice_vision_features(
 /// visual-token rows of decoder hidden states `h` `[1, S, hidden]` (the rows where
 /// `visual_pos_mask` is `true`), leaving text rows unchanged. The DeepStack fusion step. The number
 /// of `true` mask positions must equal the feature-row count; batch must be 1.
-pub fn add_visual_features(h: &Tensor, visual_pos_mask: &[bool], visual: &Tensor) -> Result<Tensor> {
+pub fn add_visual_features(
+    h: &Tensor,
+    visual_pos_mask: &[bool],
+    visual: &Tensor,
+) -> Result<Tensor> {
     let (b, s, hidden) = h.dims3()?;
     if b != 1 {
         return Err(Error::Msg(format!(
@@ -331,11 +338,7 @@ mod tests {
         .unwrap();
         let out = splice_vision_features(&embeds, &ids, &feats, &[9, 8]).unwrap();
         assert_eq!(out.dims(), &[1, s, hidden]);
-        let rows: Vec<Vec<f32>> = out
-            .i(0)
-            .unwrap()
-            .to_vec2::<f32>()
-            .unwrap();
+        let rows: Vec<Vec<f32>> = out.i(0).unwrap().to_vec2::<f32>().unwrap();
         assert_eq!(rows[1], vec![10., 10., 10., 10.]); // image row 0
         assert_eq!(rows[2], vec![20., 20., 20., 20.]); // image row 1
         assert_eq!(rows[4], vec![30., 30., 30., 30.]); // video row 0
@@ -354,12 +357,7 @@ mod tests {
         let s = 4usize;
         let h = Tensor::ones((1, s, hidden), candle_core::DType::F32, &dev).unwrap();
         let mask = [false, true, true, false];
-        let visual = Tensor::from_vec(
-            vec![5f32, 5., 5., 7., 7., 7.],
-            (2, hidden),
-            &dev,
-        )
-        .unwrap();
+        let visual = Tensor::from_vec(vec![5f32, 5., 5., 7., 7., 7.], (2, hidden), &dev).unwrap();
         let out = add_visual_features(&h, &mask, &visual).unwrap();
         let rows: Vec<Vec<f32>> = out.i(0).unwrap().to_vec2::<f32>().unwrap();
         assert_eq!(rows[0], vec![1., 1., 1.]); // unmasked

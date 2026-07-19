@@ -120,14 +120,20 @@ pub fn generate_continuous(
         return Err(Error::Msg("generate_continuous: no requests".into()));
     }
     if config.max_batch == 0 {
-        return Err(Error::Msg("generate_continuous: max_batch must be > 0".into()));
+        return Err(Error::Msg(
+            "generate_continuous: max_batch must be > 0".into(),
+        ));
     }
     if config.block_size == 0 {
-        return Err(Error::Msg("generate_continuous: block_size must be > 0".into()));
+        return Err(Error::Msg(
+            "generate_continuous: block_size must be > 0".into(),
+        ));
     }
     for (i, r) in requests.iter().enumerate() {
         if r.prompt_ids.is_empty() {
-            return Err(Error::Msg(format!("generate_continuous: request {i} has an empty prompt")));
+            return Err(Error::Msg(format!(
+                "generate_continuous: request {i} has an empty prompt"
+            )));
         }
     }
     if cancel.is_cancelled() {
@@ -142,7 +148,13 @@ pub fn generate_continuous(
     let mut sched = Scheduler::new();
     let seq_ids: Vec<SeqId> = requests
         .iter()
-        .map(|r| sched.admit(SeqSpec::new(r.prompt_ids.clone(), r.max_new_tokens, r.stop_tokens.clone())))
+        .map(|r| {
+            sched.admit(SeqSpec::new(
+                r.prompt_ids.clone(),
+                r.max_new_tokens,
+                r.stop_tokens.clone(),
+            ))
+        })
         .collect();
 
     let mut lanes: Vec<Lane> = Vec::new();
@@ -150,7 +162,9 @@ pub fn generate_continuous(
 
     // Fill the initial slots (prefill is per-sequence: each prompt at its own length, no left-pad).
     while lanes.len() < config.max_batch && next_req < requests.len() {
-        if let Some(lane) = admit_lane(model, &pool, num_layers, requests, &seq_ids, next_req, &mut sched, on_event)? {
+        if let Some(lane) = admit_lane(
+            model, &pool, num_layers, requests, &seq_ids, next_req, &mut sched, on_event,
+        )? {
             lanes.push(lane);
         }
         next_req += 1;
@@ -177,7 +191,9 @@ pub fn generate_continuous(
 
         // Admit-on-retire: refill every freed slot from the waiting requests.
         while lanes.len() < config.max_batch && next_req < requests.len() {
-            if let Some(lane) = admit_lane(model, &pool, num_layers, requests, &seq_ids, next_req, &mut sched, on_event)? {
+            if let Some(lane) = admit_lane(
+                model, &pool, num_layers, requests, &seq_ids, next_req, &mut sched, on_event,
+            )? {
                 lanes.push(lane);
             }
             next_req += 1;
@@ -192,10 +208,13 @@ pub fn generate_continuous(
     // `next_req..`), so no request is signalled twice.
     if cancel.is_cancelled() {
         for lane in &lanes {
-            on_event(lane.req_index, StreamEvent::Done {
-                reason: FinishReason::Cancelled,
-                generated: sched.generated(lane.seq).len(),
-            });
+            on_event(
+                lane.req_index,
+                StreamEvent::Done {
+                    reason: FinishReason::Cancelled,
+                    generated: sched.generated(lane.seq).len(),
+                },
+            );
         }
         for (ri, &seq) in seq_ids.iter().enumerate().skip(next_req) {
             // Never admitted, so never generated: Cancelled — unless it was a zero-budget request the
@@ -204,7 +223,13 @@ pub fn generate_continuous(
                 Some(CoreFinish::Length) => FinishReason::MaxTokens,
                 _ => FinishReason::Cancelled,
             };
-            on_event(ri, StreamEvent::Done { reason, generated: 0 });
+            on_event(
+                ri,
+                StreamEvent::Done {
+                    reason,
+                    generated: 0,
+                },
+            );
         }
     }
 
@@ -242,7 +267,13 @@ fn admit_lane(
     if !sched.is_active(seq) {
         // The scheduler retires a zero-budget request (`max_new_tokens == 0`) at admission, so it is
         // already inactive here: emit its terminal event and skip the prefill entirely.
-        on_event(ri, StreamEvent::Done { reason: FinishReason::MaxTokens, generated: 0 });
+        on_event(
+            ri,
+            StreamEvent::Done {
+                reason: FinishReason::MaxTokens,
+                generated: 0,
+            },
+        );
         return Ok(None);
     }
 
@@ -267,13 +298,21 @@ fn admit_lane(
 /// One decode step's logits, one `[1, vocab]` per live lane (in lane order). `Exact` builds each
 /// sequence's own batch-1 forward and evaluates them together (a single device round-trip for the
 /// step); `Throughput` runs one batched forward with per-sequence attention and splits the rows.
-fn step_logits(model: &CausalLm, lanes: &mut [Lane], exactness: BatchExactness) -> Result<Vec<Array>> {
+fn step_logits(
+    model: &CausalLm,
+    lanes: &mut [Lane],
+    exactness: BatchExactness,
+) -> Result<Vec<Array>> {
     match exactness {
         BatchExactness::Exact => {
             let mut logits = Vec::with_capacity(lanes.len());
             for lane in lanes.iter_mut() {
                 let off = lane.cache.offset();
-                logits.push(model.decode_logits(&input_ids(&[lane.next_token]), &mut lane.cache, off)?);
+                logits.push(model.decode_logits(
+                    &input_ids(&[lane.next_token]),
+                    &mut lane.cache,
+                    off,
+                )?);
             }
             eval(logits.iter())?; // force the whole step in one go
             Ok(logits)
@@ -283,7 +322,8 @@ fn step_logits(model: &CausalLm, lanes: &mut [Lane], exactness: BatchExactness) 
             let feed: Vec<i32> = lanes.iter().map(|l| l.next_token).collect();
             let ids = Array::from_slice(&feed, &[b as i32, 1]);
             let positions: Vec<i32> = lanes.iter().map(|l| l.cache.offset()).collect();
-            let mut caches: Vec<&mut PagedKvCache> = lanes.iter_mut().map(|l| &mut l.cache).collect();
+            let mut caches: Vec<&mut PagedKvCache> =
+                lanes.iter_mut().map(|l| &mut l.cache).collect();
             let logits = model.decode_logits_per_seq(&ids, &mut caches, &positions)?; // [b, vocab]
             (0..b as i32)
                 .map(|i| {

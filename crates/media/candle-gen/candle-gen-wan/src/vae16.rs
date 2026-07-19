@@ -159,8 +159,8 @@ impl TemporalDown {
                 .reshape((b * out_t, c, h, w))?
                 .contiguous()?;
             let wk = self.w.narrow(2, k, 1)?.squeeze(2)?.contiguous()?; // [O,I,1,1]
-            // im2col-chunked for parity with the other VAE convs (1×1 ⇒ tiny im2col at these dims, so in
-            // practice a single un-chunked pass; keeps every z16 encoder conv uniformly safe, sc-12773).
+                                                                        // im2col-chunked for parity with the other VAE convs (1×1 ⇒ tiny im2col at these dims, so in
+                                                                        // practice a single un-chunked pass; keeps every z16 encoder conv uniformly safe, sc-12773).
             let yk = chunked_conv2d(&merged, &wk, 0, 1)?;
             acc = Some(match acc {
                 Some(a) => (a + yk)?,
@@ -747,8 +747,7 @@ fn estimated_wan_z16_decode_peak_gib(
 ) -> f64 {
     let out_voxels = (out_f * out_h * out_w) as f64;
     let frame_px = (tile_h * tile_w) as f64;
-    (WAN_Z16_VAE_ACCUM_BYTES_PER_VOXEL * out_voxels
-        + WAN_Z16_VAE_FRAME_BYTES_PER_OUT_PX * frame_px)
+    (WAN_Z16_VAE_ACCUM_BYTES_PER_VOXEL * out_voxels + WAN_Z16_VAE_FRAME_BYTES_PER_OUT_PX * frame_px)
         / GIB_F64
 }
 
@@ -830,9 +829,13 @@ mod budget_tests {
             let cfg = plan_wan_z16_tiling(720, 1280, frames, 1_000_000.0)
                 .unwrap()
                 .unwrap_or_else(|| {
-                    panic!("1280×720/{frames}f must tile under the im2col cap, not take single-pass")
+                    panic!(
+                        "1280×720/{frames}f must tile under the im2col cap, not take single-pass"
+                    )
                 });
-            let s = cfg.spatial.expect("the im2col cap must tile the spatial axis");
+            let s = cfg
+                .spatial
+                .expect("the im2col cap must tile the spatial axis");
             assert!(
                 s.tile_px <= WAN_Z16_VAE_IM2COL_SAFE_PX,
                 "chosen tile {} exceeds the im2col-safe cap {}",
@@ -861,7 +864,8 @@ mod budget_tests {
         // Below the cap on both sides: the budget decision (incl. a single-pass `None`) is kept verbatim.
         assert!(cap_spatial_for_im2col(None, cap, cap).is_none());
         // Over the cap: a single-pass `None` is forced to a cap-sized spatial tile; temporal still streams.
-        let forced = cap_spatial_for_im2col(None, 720, 1280).expect("over-cap None must force a tile");
+        let forced =
+            cap_spatial_for_im2col(None, 720, 1280).expect("over-cap None must force a tile");
         assert_eq!(forced.spatial.expect("forced spatial tile").tile_px, cap);
         assert!(forced.temporal.is_none());
         // Over the cap: an already-tiled plan's spatial tile is clamped DOWN to the cap, never enlarged.
@@ -896,7 +900,10 @@ mod budget_tests {
         assert!(peak <= safe, "chosen peak {peak:.1} over safe {safe:.1}");
         // …and strictly below the single-pass spike it replaces.
         let single = estimated_wan_z16_decode_peak_gib(81, 720, 1280, 81, 720, 1280);
-        assert!(peak < single, "tiling must lower the peak ({peak:.1} vs {single:.1})");
+        assert!(
+            peak < single,
+            "tiling must lower the peak ({peak:.1} vs {single:.1})"
+        );
     }
 
     #[test]
@@ -976,7 +983,10 @@ mod budget_tests {
             .unwrap()
             .expect("A14B 720p/81f must tile at a 20 GiB budget");
         let s = cfg.spatial.expect("spatial tile");
-        assert!(cfg.temporal.is_none(), "no temporal tiling for the streaming z16 decode");
+        assert!(
+            cfg.temporal.is_none(),
+            "no temporal tiling for the streaming z16 decode"
+        );
         assert!(
             (s.tile_px as i64) < 1280,
             "the chosen tile {} must be smaller than the 1280 spatial extent",
@@ -999,7 +1009,7 @@ mod budget_tests {
         let anchors: [(i64, i64, i64, i64, i64, f64); 3] = [
             (81, 720, 1280, 720, 1280, 48.10), // single-pass A14B T2V spike (vae16_decode_sweep)
             (81, 720, 1280, 512, 512, 19.82),  // tiled 512px (vae16_decode_sweep)
-            (81, 720, 1280, 256, 256, 5.85),   // tiled 256px (vae16_decode_sweep, accumulator-dominated)
+            (81, 720, 1280, 256, 256, 5.85), // tiled 256px (vae16_decode_sweep, accumulator-dominated)
         ];
         for (of, oh, ow, th, tw, measured) in anchors {
             let est = estimated_wan_z16_decode_peak_gib(of, oh, ow, of, th, tw);

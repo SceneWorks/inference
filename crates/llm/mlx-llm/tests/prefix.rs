@@ -39,12 +39,20 @@ fn load_from(env: &str) -> Option<Fixture> {
 }
 
 fn encode(tok: &Tokenizer, text: &str) -> Vec<i32> {
-    tok.encode(text, true).unwrap().into_iter().map(|id| id as i32).collect()
+    tok.encode(text, true)
+        .unwrap()
+        .into_iter()
+        .map(|id| id as i32)
+        .collect()
 }
 
 /// Encode without the BOS so a fragment can be appended after a prefix without a spurious token.
 fn encode_no_bos(tok: &Tokenizer, text: &str) -> Vec<i32> {
-    tok.encode(text, false).unwrap().into_iter().map(|id| id as i32).collect()
+    tok.encode(text, false)
+        .unwrap()
+        .into_iter()
+        .map(|id| id as i32)
+        .collect()
 }
 
 fn config(_fx: &Fixture, max_new: usize) -> GenerationConfig {
@@ -60,15 +68,28 @@ fn config(_fx: &Fixture, max_new: usize) -> GenerationConfig {
 }
 
 fn cold(fx: &Fixture, prompt: &[i32], max_new: usize) -> Vec<i32> {
-    generate(&fx.model, prompt, &config(fx, max_new), &CancelFlag::new(), &mut |_| {})
-        .unwrap()
-        .tokens
+    generate(
+        &fx.model,
+        prompt,
+        &config(fx, max_new),
+        &CancelFlag::new(),
+        &mut |_| {},
+    )
+    .unwrap()
+    .tokens
 }
 
 fn cached(fx: &Fixture, prompt: &[i32], max_new: usize, pc: &mut PrefixCache) -> Vec<i32> {
-    generate_cached(&fx.model, prompt, &config(fx, max_new), &CancelFlag::new(), &mut |_| {}, pc)
-        .unwrap()
-        .tokens
+    generate_cached(
+        &fx.model,
+        prompt,
+        &config(fx, max_new),
+        &CancelFlag::new(),
+        &mut |_| {},
+        pc,
+    )
+    .unwrap()
+    .tokens
 }
 
 /// Build a [`system prefix tokens, suffix tokens]` prompt by concatenating token ids (the BOS lives
@@ -82,11 +103,18 @@ fn prompt(sys: &[i32], suffix: &[i32]) -> Vec<i32> {
 
 /// The body shared by the per-model tests.
 fn run_suite(fx: Fixture) {
-    let sys = encode(&fx.tok, "You are a helpful assistant. Answer concisely and accurately.\n\n");
+    let sys = encode(
+        &fx.tok,
+        "You are a helpful assistant. Answer concisely and accurately.\n\n",
+    );
     // Two questions that diverge on their very first token after the shared system prefix.
     let q1 = encode_no_bos(&fx.tok, "What is the capital of France?");
     let q2 = encode_no_bos(&fx.tok, "Name three primary colors.");
-    assert_ne!(q1.first(), q2.first(), "questions must diverge immediately after the prefix");
+    assert_ne!(
+        q1.first(),
+        q2.first(),
+        "questions must diverge immediately after the prefix"
+    );
 
     let p1 = prompt(&sys, &q1);
     let p2 = prompt(&sys, &q2);
@@ -94,14 +122,20 @@ fn run_suite(fx: Fixture) {
     // Cold baselines (plain single-sequence loop).
     let base1 = cold(&fx, &p1, 24);
     let base2 = cold(&fx, &p2, 24);
-    assert!(!base1.is_empty() && !base2.is_empty(), "baselines should generate");
+    assert!(
+        !base1.is_empty() && !base2.is_empty(),
+        "baselines should generate"
+    );
 
     let mut pc = PrefixCache::new(16);
 
     // First cached request: cold (nothing stored yet) but must equal the baseline, and it stores
     // p1 + base1 for reuse.
     let out1 = cached(&fx, &p1, 24, &mut pc);
-    assert_eq!(out1, base1, "first cached run must equal the cold baseline (bit-exact)");
+    assert_eq!(
+        out1, base1,
+        "first cached run must equal the cold baseline (bit-exact)"
+    );
     let s = pc.stats();
     assert_eq!(s.hits, 0, "nothing to reuse on the first request");
     assert_eq!(s.computed_prefill_tokens, p1.len());
@@ -109,10 +143,17 @@ fn run_suite(fx: Fixture) {
     // Second cached request shares exactly the system prefix: KV for `sys` is reused, only `q2` is
     // prefilled — and the output is still bit-exact vs the cold baseline.
     let out2 = cached(&fx, &p2, 24, &mut pc);
-    assert_eq!(out2, base2, "shared-prefix cached run must equal the cold baseline (bit-exact)");
+    assert_eq!(
+        out2, base2,
+        "shared-prefix cached run must equal the cold baseline (bit-exact)"
+    );
     let s = pc.stats();
     assert_eq!(s.hits, 1, "second request hits the cached system prefix");
-    assert_eq!(s.reused_prefix_tokens, sys.len(), "the whole system span is reused");
+    assert_eq!(
+        s.reused_prefix_tokens,
+        sys.len(),
+        "the whole system span is reused"
+    );
     // Total computed prefill = p1 (cold) + q2 only (suffix after the shared sys).
     assert_eq!(s.computed_prefill_tokens, p1.len() + q2.len());
     println!(
@@ -125,7 +166,10 @@ fn run_suite(fx: Fixture) {
     // Re-issuing p1 verbatim now matches the *whole* stored prompt; reuse clamps to recompute only
     // the final token, and the output is unchanged.
     let out1_again = cached(&fx, &p1, 24, &mut pc);
-    assert_eq!(out1_again, base1, "whole-prompt reuse must still be bit-exact");
+    assert_eq!(
+        out1_again, base1,
+        "whole-prompt reuse must still be bit-exact"
+    );
     let s = pc.stats();
     assert_eq!(s.hits, 2);
     // This hit reused p1.len() - 1 positions (recomputing only the last prompt token).
@@ -206,11 +250,17 @@ fn tiny_model(cfg: &ModelConfig) -> CausalLm {
 
     let mut m: HashMap<String, Array> = HashMap::new();
     m.insert("model.embed_tokens.weight".into(), randn(&[v, h], &mut rng));
-    m.insert("model.norm.weight".into(), Array::ones::<f32>(&[h]).unwrap());
+    m.insert(
+        "model.norm.weight".into(),
+        Array::ones::<f32>(&[h]).unwrap(),
+    );
     m.insert("lm_head.weight".into(), randn(&[v, h], &mut rng));
     for i in 0..cfg.num_layers {
         let p = |s: &str| format!("model.layers.{i}.{s}");
-        m.insert(p("input_layernorm.weight"), Array::ones::<f32>(&[h]).unwrap());
+        m.insert(
+            p("input_layernorm.weight"),
+            Array::ones::<f32>(&[h]).unwrap(),
+        );
         m.insert(
             p("post_attention_layernorm.weight"),
             Array::ones::<f32>(&[h]).unwrap(),

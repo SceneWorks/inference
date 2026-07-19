@@ -102,7 +102,8 @@ fn t5_encode_matches_golden() {
     let tok = load_tokenizer().unwrap();
     // The production regime: bf16 weights, f32 activations (MLX's T5 regime; see
     // `MochiT5::load_reference_regime`).
-    let t5 = MochiT5::load_reference_regime(&root.join("text_encoder"), &device).expect("load T5-XXL");
+    let t5 =
+        MochiT5::load_reference_regime(&root.join("text_encoder"), &device).expect("load T5-XXL");
     let g = Weights::from_file(Path::new(GOLDEN), &device, DType::F32).expect("te golden");
 
     let pos = encode_prompt(&tok, &t5, PROMPT, &device).expect("encode prompt");

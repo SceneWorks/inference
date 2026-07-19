@@ -14,9 +14,9 @@
 use mlx_rs::Array;
 
 use crate::error::{Error, Result};
+use crate::primitives::input_ids;
 use crate::primitives::kv_cache::KvCache;
 use crate::primitives::sampler::{sample, SamplingParams, SplitMix64};
-use crate::primitives::input_ids;
 
 /// A decoder the streaming loop can drive: it makes its own cache and produces last-position logits.
 pub trait Decode {
@@ -243,7 +243,16 @@ pub fn generate_from_prefill(
     }
     let rng = SplitMix64::new(config.seed.unwrap_or_else(default_seed));
     decode_loop(
-        decoder, cache, first_logits, rng, history, config, cancel, on_event, constraint, should_stop,
+        decoder,
+        cache,
+        first_logits,
+        rng,
+        history,
+        config,
+        cancel,
+        on_event,
+        constraint,
+        should_stop,
     )
 }
 

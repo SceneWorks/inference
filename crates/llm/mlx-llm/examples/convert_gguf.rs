@@ -47,7 +47,9 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 quantize = Some(match v.as_str() {
                     "q4" => QuantSpec::q4(),
                     "q8" => QuantSpec::q8(),
-                    other => return Err(format!("unknown --quant {other:?} (expected q4|q8)").into()),
+                    other => {
+                        return Err(format!("unknown --quant {other:?} (expected q4|q8)").into())
+                    }
                 });
             }
             "--tokenizer" => tokenizer = Some(args.next().ok_or("--tokenizer needs a path")?),
@@ -76,7 +78,10 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         report.out_dir.display(),
         report.num_tensors,
         match report.quantized {
-            Some(q) => format!(", projections quantized to {}-bit (group {})", q.bits, q.group_size),
+            Some(q) => format!(
+                ", projections quantized to {}-bit (group {})",
+                q.bits, q.group_size
+            ),
             None => ", dense bf16".into(),
         },
     );

@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use mlx_rs::Array;
 
 use core_llm::{
-    Content, Error as CoreError, ImageRef, LoadSpec, Message, Sampling, StreamEvent,
-    TextLlm, TextLlmRequest,
+    Content, Error as CoreError, ImageRef, LoadSpec, Message, Sampling, StreamEvent, TextLlm,
+    TextLlmRequest,
 };
 use mlx_llm::load_textllm;
 use mlx_llm::primitives::sampler::{SplitMix64, TokenRng};
@@ -64,11 +64,17 @@ fn write_tiny_snapshot() -> PathBuf {
     let mut rng = SplitMix64::new(0xC0FFEE);
     let mut arrays: Vec<(String, Array)> = Vec::new();
     arrays.push(("model.embed_tokens.weight".into(), randn(&[v, h], &mut rng)));
-    arrays.push(("model.norm.weight".into(), Array::ones::<f32>(&[h]).unwrap()));
+    arrays.push((
+        "model.norm.weight".into(),
+        Array::ones::<f32>(&[h]).unwrap(),
+    ));
     arrays.push(("lm_head.weight".into(), randn(&[v, h], &mut rng)));
     for i in 0..2 {
         let p = |s: &str| format!("model.layers.{i}.{s}");
-        arrays.push((p("input_layernorm.weight"), Array::ones::<f32>(&[h]).unwrap()));
+        arrays.push((
+            p("input_layernorm.weight"),
+            Array::ones::<f32>(&[h]).unwrap(),
+        ));
         arrays.push((
             p("post_attention_layernorm.weight"),
             Array::ones::<f32>(&[h]).unwrap(),
@@ -120,7 +126,10 @@ fn provider_loads_and_streams_through_the_contract() {
                 tokens += 1;
                 streamed.push_str(&text);
             }
-            StreamEvent::Done { finish_reason, usage } => {
+            StreamEvent::Done {
+                finish_reason,
+                usage,
+            } => {
                 saw_done = true;
                 assert_eq!(finish_reason, core_llm::FinishReason::Length);
                 assert_eq!(usage.generated_tokens, 6);
@@ -188,6 +197,9 @@ fn validate_rejects_unsupported_vision_input() {
         max_new_tokens: 4,
         ..Default::default()
     };
-    assert!(matches!(provider.validate(&req), Err(CoreError::Unsupported(_))));
+    assert!(matches!(
+        provider.validate(&req),
+        Err(CoreError::Unsupported(_))
+    ));
     cleanup(&dir);
 }

@@ -30,7 +30,11 @@ fn assert_streams_coherent(env: &str, family: &str) {
         "{family}: can_load must accept the snapshot"
     );
     let provider = load_for_model(&spec).expect("resolve + load provider by model");
-    assert_eq!(provider.descriptor().id, "candle-llama", "resolved provider id");
+    assert_eq!(
+        provider.descriptor().id,
+        "candle-llama",
+        "resolved provider id"
+    );
     assert_eq!(provider.descriptor().family, family, "reported family tag");
 
     let req = TextLlmRequest {

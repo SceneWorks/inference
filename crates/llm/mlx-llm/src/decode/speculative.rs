@@ -25,10 +25,14 @@
 
 use mlx_rs::Array;
 
-use core_llm::speculative::{accept_greedy_run, accept_token, ngram_propose, sample_weighted, Acceptance};
+use core_llm::speculative::{
+    accept_greedy_run, accept_token, ngram_propose, sample_weighted, Acceptance,
+};
 
 use crate::decode::cancel::CancelFlag;
-use crate::decode::stream::{default_seed, FinishReason, GenerationConfig, GenerationOutput, StreamEvent};
+use crate::decode::stream::{
+    default_seed, FinishReason, GenerationConfig, GenerationOutput, StreamEvent,
+};
 use crate::error::{Error, Result};
 use crate::models::CausalLm;
 use crate::primitives::input_ids;
@@ -90,8 +94,17 @@ pub fn generate_prompt_lookup(
     let mut finish = FinishReason::MaxTokens;
 
     if config.max_new_tokens == 0 {
-        on_event(StreamEvent::Done { reason: finish, generated: 0 });
-        return Ok((GenerationOutput { tokens: generated, finish_reason: finish }, stats));
+        on_event(StreamEvent::Done {
+            reason: finish,
+            generated: 0,
+        });
+        return Ok((
+            GenerationOutput {
+                tokens: generated,
+                finish_reason: finish,
+            },
+            stats,
+        ));
     }
 
     let mut rng = SplitMix64::new(config.seed.unwrap_or_else(default_seed));
@@ -106,8 +119,17 @@ pub fn generate_prompt_lookup(
     let first = sample(&logits_last, &history, &config.sampling, &mut rng, None)?;
     if config.stop_tokens.contains(&first) {
         finish = FinishReason::StopToken;
-        on_event(StreamEvent::Done { reason: finish, generated: 0 });
-        return Ok((GenerationOutput { tokens: generated, finish_reason: finish }, stats));
+        on_event(StreamEvent::Done {
+            reason: finish,
+            generated: 0,
+        });
+        return Ok((
+            GenerationOutput {
+                tokens: generated,
+                finish_reason: finish,
+            },
+            stats,
+        ));
     }
     on_event(StreamEvent::Token { id: first, step: 0 });
     generated.push(first);
@@ -142,7 +164,14 @@ pub fn generate_prompt_lookup(
         let (committed, accepted) = if greedy {
             decide_greedy(&logits_all, &drafts, &history, config, &mut rng)?
         } else {
-            decide_stochastic(&logits_all, &drafts, &point_mass_dists(&drafts), &history, config, &mut rng)?
+            decide_stochastic(
+                &logits_all,
+                &drafts,
+                &point_mass_dists(&drafts),
+                &history,
+                config,
+                &mut rng,
+            )?
         };
         stats.accepted += accepted;
 
@@ -155,7 +184,10 @@ pub fn generate_prompt_lookup(
                 finish = FinishReason::StopToken;
                 break 'outer;
             }
-            on_event(StreamEvent::Token { id: t, step: generated.len() });
+            on_event(StreamEvent::Token {
+                id: t,
+                step: generated.len(),
+            });
             generated.push(t);
             history.push(t);
             cur = t;
@@ -166,8 +198,17 @@ pub fn generate_prompt_lookup(
         }
     }
 
-    on_event(StreamEvent::Done { reason: finish, generated: generated.len() });
-    Ok((GenerationOutput { tokens: generated, finish_reason: finish }, stats))
+    on_event(StreamEvent::Done {
+        reason: finish,
+        generated: generated.len(),
+    });
+    Ok((
+        GenerationOutput {
+            tokens: generated,
+            finish_reason: finish,
+        },
+        stats,
+    ))
 }
 
 /// Generate from `prompt_ids` with **draft-model** speculative decoding: the small `draft` model
@@ -193,7 +234,9 @@ pub fn generate_draft_speculative(
         return Err(Error::Canceled);
     }
     if prompt_ids.is_empty() {
-        return Err(Error::Msg("generate_draft_speculative: empty prompt".into()));
+        return Err(Error::Msg(
+            "generate_draft_speculative: empty prompt".into(),
+        ));
     }
     if target.config().vocab_size != draft.config().vocab_size {
         return Err(Error::Msg(format!(
@@ -208,8 +251,17 @@ pub fn generate_draft_speculative(
     let mut finish = FinishReason::MaxTokens;
 
     if config.max_new_tokens == 0 {
-        on_event(StreamEvent::Done { reason: finish, generated: 0 });
-        return Ok((GenerationOutput { tokens: generated, finish_reason: finish }, stats));
+        on_event(StreamEvent::Done {
+            reason: finish,
+            generated: 0,
+        });
+        return Ok((
+            GenerationOutput {
+                tokens: generated,
+                finish_reason: finish,
+            },
+            stats,
+        ));
     }
 
     let mut rng = SplitMix64::new(config.seed.unwrap_or_else(default_seed));
@@ -226,8 +278,17 @@ pub fn generate_draft_speculative(
     let first = sample(&logits_last, &history, &config.sampling, &mut rng, None)?;
     if config.stop_tokens.contains(&first) {
         finish = FinishReason::StopToken;
-        on_event(StreamEvent::Done { reason: finish, generated: 0 });
-        return Ok((GenerationOutput { tokens: generated, finish_reason: finish }, stats));
+        on_event(StreamEvent::Done {
+            reason: finish,
+            generated: 0,
+        });
+        return Ok((
+            GenerationOutput {
+                tokens: generated,
+                finish_reason: finish,
+            },
+            stats,
+        ));
     }
     on_event(StreamEvent::Token { id: first, step: 0 });
     generated.push(first);
@@ -268,13 +329,21 @@ pub fn generate_draft_speculative(
         let mut verify = Vec::with_capacity(1 + drafts.len());
         verify.push(cur);
         verify.extend_from_slice(&drafts);
-        let logits_all = target.decode_logits_all(&input_ids(&verify), &mut target_cache, base_target)?;
+        let logits_all =
+            target.decode_logits_all(&input_ids(&verify), &mut target_cache, base_target)?;
         stats.forwards += 1;
 
         let (committed, accepted) = if greedy {
             decide_greedy(&logits_all, &drafts, &history, config, &mut rng)?
         } else {
-            decide_stochastic(&logits_all, &drafts, &draft_dists, &history, config, &mut rng)?
+            decide_stochastic(
+                &logits_all,
+                &drafts,
+                &draft_dists,
+                &history,
+                config,
+                &mut rng,
+            )?
         };
         stats.accepted += accepted;
 
@@ -287,7 +356,10 @@ pub fn generate_draft_speculative(
                 finish = FinishReason::StopToken;
                 break 'outer;
             }
-            on_event(StreamEvent::Token { id: t, step: generated.len() });
+            on_event(StreamEvent::Token {
+                id: t,
+                step: generated.len(),
+            });
             generated.push(t);
             history.push(t);
             cur = t;
@@ -298,8 +370,17 @@ pub fn generate_draft_speculative(
         }
     }
 
-    on_event(StreamEvent::Done { reason: finish, generated: generated.len() });
-    Ok((GenerationOutput { tokens: generated, finish_reason: finish }, stats))
+    on_event(StreamEvent::Done {
+        reason: finish,
+        generated: generated.len(),
+    });
+    Ok((
+        GenerationOutput {
+            tokens: generated,
+            finish_reason: finish,
+        },
+        stats,
+    ))
 }
 
 /// Greedy acceptance: the target's argmax at each verify position (penalty-aware, via the sampler),

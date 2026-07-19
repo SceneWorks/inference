@@ -86,18 +86,29 @@ fn nvfp4_device() -> Option<Device> {
     let lt = CublasLt::new(&dev).expect("cuBLASLt handle");
     match lt.meets_nvfp4_floor() {
         Ok(true) => {
-            eprintln!("[sc-11044] device cap = {:?} (NVFP4 eligible)", lt.compute_cap().unwrap());
+            eprintln!(
+                "[sc-11044] device cap = {:?} (NVFP4 eligible)",
+                lt.compute_cap().unwrap()
+            );
             Some(dev)
         }
         _ => {
-            eprintln!("[sc-11044] device not sm_120 ({:?}); skipping", lt.compute_cap().ok());
+            eprintln!(
+                "[sc-11044] device not sm_120 ({:?}); skipping",
+                lt.compute_cap().ok()
+            );
             None
         }
     }
 }
 
 fn to_vec_f32(t: &Tensor) -> Vec<f32> {
-    t.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap()
+    t.to_dtype(DType::F32)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap()
 }
 
 /// (1) The on-device activation quantize matches the CPU `Nvfp4Tensor::pack` reference: feeding the
@@ -112,8 +123,14 @@ fn nvfp4_w4a4_ondevice_activation_quant_matches_cpu_pack_ref() {
 
     let x_f32 = pseudo_random(m * k, 101);
     let w_f32 = pseudo_random(n * k, 202);
-    let x = Tensor::from_vec(x_f32.clone(), (m, k), &dev).unwrap().to_dtype(DType::BF16).unwrap();
-    let w = Tensor::from_vec(w_f32.clone(), (n, k), &dev).unwrap().to_dtype(DType::BF16).unwrap();
+    let x = Tensor::from_vec(x_f32.clone(), (m, k), &dev)
+        .unwrap()
+        .to_dtype(DType::BF16)
+        .unwrap();
+    let w = Tensor::from_vec(w_f32.clone(), (n, k), &dev)
+        .unwrap()
+        .to_dtype(DType::BF16)
+        .unwrap();
 
     // Resident weight (staged once from the CPU packer, as in sc-11041).
     let w_pk = Nvfp4Tensor::pack(&w).unwrap();
@@ -125,18 +142,33 @@ fn nvfp4_w4a4_ondevice_activation_quant_matches_cpu_pack_ref() {
 
     let y_dev = to_vec_f32(&lt.matmul_nvfp4_staged(&w_stg, &x_dev).unwrap());
     let y_cpu = to_vec_f32(&lt.matmul_nvfp4_staged(&w_stg, &x_cpu).unwrap());
-    assert!(y_dev.iter().all(|v| v.is_finite()), "on-device quant produced NaN/Inf");
+    assert!(
+        y_dev.iter().all(|v| v.is_finite()),
+        "on-device quant produced NaN/Inf"
+    );
 
     let rr = rel_rms(&y_dev, &y_cpu);
     eprintln!("[sc-11044] on-device vs CPU-pack activation quant: GEMM rel-RMS = {rr:.6}");
-    assert!(rr < 0.02, "on-device activation quant diverges from the CPU pack ref (rel-RMS {rr:.6})");
+    assert!(
+        rr < 0.02,
+        "on-device activation quant diverges from the CPU pack ref (rel-RMS {rr:.6})"
+    );
 
     // Both also track the CPU dequant reference (X_dq · W_dqᵀ).
     let x_pk = Nvfp4Tensor::pack(&x).unwrap();
-    let dq_ref = ref_matmul(&x_pk.dequantize_to_vec(), &w_pk.dequantize_to_vec(), m, k, n);
+    let dq_ref = ref_matmul(
+        &x_pk.dequantize_to_vec(),
+        &w_pk.dequantize_to_vec(),
+        m,
+        k,
+        n,
+    );
     let rr_dq = rel_rms(&y_dev, &dq_ref);
     eprintln!("[sc-11044] on-device W4A4 vs CPU dequant reference rel-RMS = {rr_dq:.5}");
-    assert!(rr_dq < 0.03, "on-device W4A4 does not track the dequant reference (rel-RMS {rr_dq:.5})");
+    assert!(
+        rr_dq < 0.03,
+        "on-device W4A4 does not track the dequant reference (rel-RMS {rr_dq:.5})"
+    );
 }
 
 /// (1b) **sc-12078 bit-faithfulness gate:** the FUSED activation quantizer produces the same FP4 GEMM
@@ -156,28 +188,42 @@ fn nvfp4_fused_activation_quant_matches_cpu_pack_ref() {
 
     let x_f32 = pseudo_random(m * k, 101);
     let w_f32 = pseudo_random(n * k, 202);
-    let x = Tensor::from_vec(x_f32, (m, k), &dev).unwrap().to_dtype(DType::BF16).unwrap();
-    let w = Tensor::from_vec(w_f32, (n, k), &dev).unwrap().to_dtype(DType::BF16).unwrap();
+    let x = Tensor::from_vec(x_f32, (m, k), &dev)
+        .unwrap()
+        .to_dtype(DType::BF16)
+        .unwrap();
+    let w = Tensor::from_vec(w_f32, (n, k), &dev)
+        .unwrap()
+        .to_dtype(DType::BF16)
+        .unwrap();
 
     let w_pk = Nvfp4Tensor::pack(&w).unwrap();
     let w_stg = lt.stage_nvfp4(&w_pk).unwrap();
 
     // Three activation-quantize routes against the same resident weight.
-    let x_fused = lt.quantize_nvfp4_activation_fused(&x, w_pk.cols_padded).unwrap();
+    let x_fused = lt
+        .quantize_nvfp4_activation_fused(&x, w_pk.cols_padded)
+        .unwrap();
     let x_candle = lt.quantize_nvfp4_activation(&x, w_pk.cols_padded).unwrap();
     let x_cpu = lt.stage_nvfp4(&Nvfp4Tensor::pack(&x).unwrap()).unwrap();
 
     let y_fused = to_vec_f32(&lt.matmul_nvfp4_staged(&w_stg, &x_fused).unwrap());
     let y_candle = to_vec_f32(&lt.matmul_nvfp4_staged(&w_stg, &x_candle).unwrap());
     let y_cpu = to_vec_f32(&lt.matmul_nvfp4_staged(&w_stg, &x_cpu).unwrap());
-    assert!(y_fused.iter().all(|v| v.is_finite()), "fused quant produced NaN/Inf");
+    assert!(
+        y_fused.iter().all(|v| v.is_finite()),
+        "fused quant produced NaN/Inf"
+    );
 
     let rr_cpu = rel_rms(&y_fused, &y_cpu);
     let rr_candle = rel_rms(&y_fused, &y_candle);
     eprintln!(
         "[sc-12078] fused vs CPU-pack GEMM rel-RMS = {rr_cpu:.6}; fused vs unfused on-device = {rr_candle:.6}"
     );
-    assert!(rr_cpu < 0.02, "fused activation quant diverges from the CPU pack ref (rel-RMS {rr_cpu:.6})");
+    assert!(
+        rr_cpu < 0.02,
+        "fused activation quant diverges from the CPU pack ref (rel-RMS {rr_cpu:.6})"
+    );
     assert!(
         rr_candle < 0.001,
         "fused must match the unfused on-device recipe (rel-RMS {rr_candle:.6})"
@@ -342,14 +388,23 @@ fn assert_e2m1_tie_nibbles(lt: &CublasLt, stg: &DevNvfp4, route: &str) {
     let sf_cols = 4; // 2 blocks padded to the 4-block SF atom
     let block1_scale = stg.scales_to_host(lt).unwrap()[rowmajor_scale_offset(0, 1, sf_cols)];
     assert_eq!(
-        (e4m3_to_f32(block1_scale) * E2M1_TIE_GLOBAL_SCALE, block1_scale),
+        (
+            e4m3_to_f32(block1_scale) * E2M1_TIE_GLOBAL_SCALE,
+            block1_scale
+        ),
         (1.0, e4m3_from_f32(8.0)),
         "{route}: the construction relies on block 1's scale being exactly 8.0 (0x50) so that \
          elem_scale == 1.0 and ratio == value"
     );
     let packed = stg.packed_to_host(lt).unwrap();
     // Row 0, row-major `[1, cols/2]`: even column = low nibble, odd column = high nibble.
-    let nibble = |c: usize| if c.is_multiple_of(2) { packed[c / 2] & 0x0F } else { packed[c / 2] >> 4 };
+    let nibble = |c: usize| {
+        if c.is_multiple_of(2) {
+            packed[c / 2] & 0x0F
+        } else {
+            packed[c / 2] >> 4
+        }
+    };
     let mut bad = Vec::new();
     for (i, &t) in E2M1_TIES.iter().enumerate() {
         for (c, v) in [(17 + i, t), (24 + i, -t)] {
@@ -386,7 +441,11 @@ fn nvfp4_e2m1_element_nibbles_match_cpu_at_exact_ties() {
     let Some(dev) = nvfp4_device() else { return };
     let lt = CublasLt::new(&dev).unwrap();
     let (x, cols) = e2m1_tie_activation(&dev);
-    assert_e2m1_tie_nibbles(&lt, &lt.quantize_nvfp4_activation(&x, cols).unwrap(), "unfused candle path");
+    assert_e2m1_tie_nibbles(
+        &lt,
+        &lt.quantize_nvfp4_activation(&x, cols).unwrap(),
+        "unfused candle path",
+    );
     assert_e2m1_tie_nibbles(
         &lt,
         &lt.quantize_nvfp4_activation_fused(&x, cols).unwrap(),
@@ -403,11 +462,21 @@ fn nvfp4_w4a4_forward_ondevice_no_nan_vs_bf16() {
     let (m, k, n) = (512usize, 512usize, 512usize);
     let x_f32 = pseudo_random(m * k, 7);
     let w_f32 = pseudo_random(n * k, 8);
-    let x = Tensor::from_vec(x_f32.clone(), (m, k), &dev).unwrap().to_dtype(DType::BF16).unwrap();
-    let w = Tensor::from_vec(w_f32.clone(), (n, k), &dev).unwrap().to_dtype(DType::BF16).unwrap();
+    let x = Tensor::from_vec(x_f32.clone(), (m, k), &dev)
+        .unwrap()
+        .to_dtype(DType::BF16)
+        .unwrap();
+    let w = Tensor::from_vec(w_f32.clone(), (n, k), &dev)
+        .unwrap()
+        .to_dtype(DType::BF16)
+        .unwrap();
 
     let lin = Nvfp4Linear::from_dense(&w, None, &dev, ActPrecision::W4A4).unwrap();
-    assert_eq!(lin.regime(), Nvfp4Regime::Fp4W4A4, "W4A4 must light the FP4 cores on sm_120");
+    assert_eq!(
+        lin.regime(),
+        Nvfp4Regime::Fp4W4A4,
+        "W4A4 must light the FP4 cores on sm_120"
+    );
 
     // Repeat to emulate steps: the guard must never trip, output must stay finite.
     let mut last = None;
@@ -423,7 +492,10 @@ fn nvfp4_w4a4_forward_ondevice_no_nan_vs_bf16() {
     let bf16_ref = ref_matmul(&x_f32, &w_f32, m, k, n);
     let rr = rel_rms(&got, &bf16_ref);
     eprintln!("[sc-11044] on-device W4A4 forward vs bf16-dense rel-RMS = {rr:.5}");
-    assert!(rr < 0.2, "on-device W4A4 vs bf16 {rr:.5} exceeds NVFP4 tolerance");
+    assert!(
+        rr < 0.2,
+        "on-device W4A4 vs bf16 {rr:.5} exceeds NVFP4 tolerance"
+    );
 }
 
 /// (2b) **sc-12078 fallback policy: no fused quantizer ⇒ W4A16, never W4A4-via-unfused.**
@@ -450,7 +522,10 @@ fn nvfp4_fused_unavailable_forces_w4a16() {
     let Some(dev) = nvfp4_device() else { return };
     let (n, k) = (256usize, 512usize);
     let w_f32 = pseudo_random(n * k, 0x1_2078);
-    let w = Tensor::from_vec(w_f32.clone(), (n, k), &dev).unwrap().to_dtype(DType::BF16).unwrap();
+    let w = Tensor::from_vec(w_f32.clone(), (n, k), &dev)
+        .unwrap()
+        .to_dtype(DType::BF16)
+        .unwrap();
 
     // Baseline: with the fused kernel available, this exact weight lights the FP4 cores. Without this
     // the test could pass for the boring reason that the shape/device was never eligible.
@@ -475,19 +550,30 @@ fn nvfp4_fused_unavailable_forces_w4a16() {
         "with no fused quantizer, W4A4 must fall back to W4A16 — staying Fp4W4A4 means the forward \
          is serving the unfused chain at 0.01× vs bf16 (~100× worse than this fallback)"
     );
-    assert!(!gated.lights_up_fp4(), "a fallback layer must not report the FP4 cores as lit");
+    assert!(
+        !gated.lights_up_fp4(),
+        "a fallback layer must not report the FP4 cores as lit"
+    );
 
     // The probe is a capability gate, not a numerics change: the fallback still computes.
     let m = 64usize;
     let x_f32 = pseudo_random(m * k, 0x2_2078);
-    let x = Tensor::from_vec(x_f32.clone(), (m, k), &dev).unwrap().to_dtype(DType::BF16).unwrap();
-    let y = gated.forward_checked(&x).expect("W4A16 fallback must forward");
+    let x = Tensor::from_vec(x_f32.clone(), (m, k), &dev)
+        .unwrap()
+        .to_dtype(DType::BF16)
+        .unwrap();
+    let y = gated
+        .forward_checked(&x)
+        .expect("W4A16 fallback must forward");
     assert_eq!(y.dims(), &[m, n]);
     let got = to_vec_f32(&y);
     assert!(got.iter().all(|v| v.is_finite()));
     let rr = rel_rms(&got, &ref_matmul(&x_f32, &w_f32, m, k, n));
     eprintln!("[sc-12078] no-fused-quantizer W4A16 fallback vs bf16-dense rel-RMS = {rr:.5}");
-    assert!(rr < 0.2, "W4A16 fallback vs bf16 {rr:.5} exceeds NVFP4 tolerance");
+    assert!(
+        rr < 0.2,
+        "W4A16 fallback vs bf16 {rr:.5} exceeds NVFP4 tolerance"
+    );
 
     // Honest accounting through the fallback (the sc-11045 MAJOR-3 shape): this layer holds a dense
     // bf16 weight now, and must say so rather than reporting its packed host container's size.
@@ -496,7 +582,11 @@ fn nvfp4_fused_unavailable_forces_w4a16() {
         gated.bf16_footprint_bytes(),
         "a W4A16 fallback holds dense bf16 resident — it must not report the packed NVFP4 footprint"
     );
-    assert_eq!(gated.resident_device_bytes(), None, "nothing is staged packed on-device in W4A16");
+    assert_eq!(
+        gated.resident_device_bytes(),
+        None,
+        "nothing is staged packed on-device in W4A16"
+    );
 }
 
 /// (3) Throughput: on-device **W4A4** vs **W4A16** (and a bf16-dense baseline) layer forwards on
@@ -717,7 +807,10 @@ fn nvfp4_w4a4_outlier_sparsity_capture_confirms_partition() {
 
     // Benign self-attn/FF-style activation.
     let benign = Tensor::from_vec(
-        pseudo_random(m * k, 11).iter().map(|v| v * 0.3).collect::<Vec<_>>(),
+        pseudo_random(m * k, 11)
+            .iter()
+            .map(|v| v * 0.3)
+            .collect::<Vec<_>>(),
         (m, k),
         &dev,
     )
@@ -730,16 +823,25 @@ fn nvfp4_w4a4_outlier_sparsity_capture_confirms_partition() {
         s_benign.benign_fraction,
         s_benign.class()
     );
-    assert!(s_benign.w4a4_viable(), "benign activation must be W4A4-viable");
+    assert!(
+        s_benign.w4a4_viable(),
+        "benign activation must be W4A4-viable"
+    );
 
     // Dense-outlier (caption/cross-attn-style) activation: an outlier in most blocks.
-    let mut dense = pseudo_random(m * k, 22).iter().map(|v| v * 0.3).collect::<Vec<_>>();
+    let mut dense = pseudo_random(m * k, 22)
+        .iter()
+        .map(|v| v * 0.3)
+        .collect::<Vec<_>>();
     for r in 0..m {
         for b in 0..(k / OutlierSparsity::BLOCK) {
             dense[r * k + b * OutlierSparsity::BLOCK + 1] = 100.0;
         }
     }
-    let dense_t = Tensor::from_vec(dense, (m, k), &dev).unwrap().to_dtype(DType::BF16).unwrap();
+    let dense_t = Tensor::from_vec(dense, (m, k), &dev)
+        .unwrap()
+        .to_dtype(DType::BF16)
+        .unwrap();
     let s_dense = OutlierSparsity::from_tensor(&dense_t, OutlierSparsity::DEFAULT_TAU).unwrap();
     eprintln!(
         "[sc-11044] dense-outlier layer: benign_fraction={:.4} class={:?} crush={:.0}",
@@ -747,8 +849,15 @@ fn nvfp4_w4a4_outlier_sparsity_capture_confirms_partition() {
         s_dense.class(),
         s_dense.max_crush_ratio
     );
-    assert_eq!(s_dense.class(), OutlierClass::Dense, "dense outliers must flag collapse (W4A16)");
-    assert!(!s_dense.w4a4_viable(), "dense-outlier layer must NOT be W4A4-viable — partition holds");
+    assert_eq!(
+        s_dense.class(),
+        OutlierClass::Dense,
+        "dense outliers must flag collapse (W4A16)"
+    );
+    assert!(
+        !s_dense.w4a4_viable(),
+        "dense-outlier layer must NOT be W4A4-viable — partition holds"
+    );
 }
 
 /// (5) Real Sana-1.6B DiT projection weight, W4A4 vs bf16 (env-gated, `#[ignore]` per repo convention
@@ -783,16 +892,26 @@ fn nvfp4_w4a4_real_sana_dit_weight() {
     let (name, w_cpu) = chosen.expect("no eligible 2-D linear weight in the shard");
     let (n, k) = w_cpu.dims2().unwrap();
     eprintln!("[sc-11044] real Sana DiT weight '{name}' shape [N={n}, K={k}]");
-    let w = w_cpu.to_dtype(DType::BF16).unwrap().to_device(&dev).unwrap();
+    let w = w_cpu
+        .to_dtype(DType::BF16)
+        .unwrap()
+        .to_device(&dev)
+        .unwrap();
 
     let m = 1024usize;
     let x_f32 = pseudo_random(m * k, 42);
-    let x = Tensor::from_vec(x_f32.clone(), (m, k), &dev).unwrap().to_dtype(DType::BF16).unwrap();
+    let x = Tensor::from_vec(x_f32.clone(), (m, k), &dev)
+        .unwrap()
+        .to_dtype(DType::BF16)
+        .unwrap();
 
     let lin = Nvfp4Linear::from_dense(&w, None, &dev, ActPrecision::W4A4).unwrap();
     assert_eq!(lin.regime(), Nvfp4Regime::Fp4W4A4);
     let got = to_vec_f32(&lin.forward_checked(&x).unwrap());
-    assert!(got.iter().all(|v| v.is_finite()), "real-weight W4A4 produced NaN/Inf");
+    assert!(
+        got.iter().all(|v| v.is_finite()),
+        "real-weight W4A4 produced NaN/Inf"
+    );
 
     let w_ref = to_vec_f32(&w);
     let bf16_ref = ref_matmul(&x_f32, &w_ref, m, k, n);
@@ -805,5 +924,8 @@ fn nvfp4_w4a4_real_sana_dit_weight() {
         ws.benign_fraction,
         ws.class()
     );
-    assert!(rr < 0.25, "real-weight W4A4 vs bf16 {rr:.5} unexpectedly large");
+    assert!(
+        rr < 0.25,
+        "real-weight W4A4 vs bf16 {rr:.5} unexpectedly large"
+    );
 }

@@ -190,7 +190,11 @@ mod tests {
         a.release(y);
         a.release(z);
         assert_eq!(a.live_blocks(), 0);
-        assert_eq!(a.peak_live_blocks(), 3, "peak is a high-water mark, not the current count");
+        assert_eq!(
+            a.peak_live_blocks(),
+            3,
+            "peak is a high-water mark, not the current count"
+        );
     }
 
     #[test]

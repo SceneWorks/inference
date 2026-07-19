@@ -123,21 +123,36 @@ fn nvfp4_linear_w4a4_matches_bf16_reference() {
         .unwrap()
         .to_vec1::<f32>()
         .unwrap();
-    assert!(got.iter().all(|v| v.is_finite()), "Nvfp4Linear produced NaN/Inf");
+    assert!(
+        got.iter().all(|v| v.is_finite()),
+        "Nvfp4Linear produced NaN/Inf"
+    );
 
     // Tight: vs the CPU dequant reference (X_dq · W_dqᵀ) — what the FP4 GEMM computes.
     let w_pk = Nvfp4Tensor::pack(&w_bf16).unwrap();
     let x_pk = Nvfp4Tensor::pack(&x_bf16).unwrap();
-    let dq_ref = ref_matmul(&x_pk.dequantize_to_vec(), &w_pk.dequantize_to_vec(), m, k, n);
+    let dq_ref = ref_matmul(
+        &x_pk.dequantize_to_vec(),
+        &w_pk.dequantize_to_vec(),
+        m,
+        k,
+        n,
+    );
     let rr_dq = rel_rms(&got, &dq_ref);
     eprintln!("[sc-11041] Nvfp4Linear vs CPU-dequant reference rel-RMS = {rr_dq:.5}");
-    assert!(rr_dq < 0.02, "Nvfp4Linear does not track the dequant reference (rel-RMS {rr_dq:.5})");
+    assert!(
+        rr_dq < 0.02,
+        "Nvfp4Linear does not track the dequant reference (rel-RMS {rr_dq:.5})"
+    );
 
     // Looser: vs the original bf16 dense matmul — within NVFP4 tolerance.
     let bf16_ref = ref_matmul(&x_f32, &w_f32, m, k, n);
     let rr_bf16 = rel_rms(&got, &bf16_ref);
     eprintln!("[sc-11041] Nvfp4Linear vs bf16-dense reference rel-RMS = {rr_bf16:.5}");
-    assert!(rr_bf16 < 0.2, "Nvfp4Linear vs bf16 dense {rr_bf16:.5} exceeds NVFP4 tolerance");
+    assert!(
+        rr_bf16 < 0.2,
+        "Nvfp4Linear vs bf16 dense {rr_bf16:.5} exceeds NVFP4 tolerance"
+    );
 }
 
 /// (2) **SC#6 packed-forward.** The resident W4A4 weight occupies the NVFP4 footprint on-device
@@ -218,9 +233,9 @@ fn nvfp4_linear_handles_non_aligned_m() {
             .unwrap()
             .to_dtype(DType::BF16)
             .unwrap();
-        let y = lin
-            .forward(&x_bf16)
-            .unwrap_or_else(|e| panic!("non-aligned M={m} forward failed (M-align not handled): {e}"));
+        let y = lin.forward(&x_bf16).unwrap_or_else(|e| {
+            panic!("non-aligned M={m} forward failed (M-align not handled): {e}")
+        });
         assert_eq!(y.dims(), &[m, n], "M={m} output shape");
         let got = y
             .to_dtype(DType::F32)
@@ -233,10 +248,19 @@ fn nvfp4_linear_handles_non_aligned_m() {
 
         // Real rows match the dequant reference (padding rows are sliced off and must not leak in).
         let x_pk = Nvfp4Tensor::pack(&x_bf16).unwrap();
-        let dq_ref = ref_matmul(&x_pk.dequantize_to_vec(), &w_pk.dequantize_to_vec(), m, k, n);
+        let dq_ref = ref_matmul(
+            &x_pk.dequantize_to_vec(),
+            &w_pk.dequantize_to_vec(),
+            m,
+            k,
+            n,
+        );
         let rr = rel_rms(&got, &dq_ref);
         eprintln!("[sc-11041] non-aligned M={m:>3}: forward OK, rel-RMS vs dequant ref = {rr:.5}");
-        assert!(rr < 0.03, "M={m} real rows do not match the dequant reference (rel-RMS {rr:.5})");
+        assert!(
+            rr < 0.03,
+            "M={m} real rows do not match the dequant reference (rel-RMS {rr:.5})"
+        );
     }
 }
 
@@ -258,7 +282,10 @@ fn nvfp4_linear_w4a16_override_forces_dequant_on_sm120() {
         "W4A16 override must run the dequant→bf16 path (no FP4 compute), even on sm_120"
     );
     assert!(!lin.lights_up_fp4());
-    assert!(lin.resident_device_bytes().is_none(), "W4A16 has no staged FP4 weight");
+    assert!(
+        lin.resident_device_bytes().is_none(),
+        "W4A16 has no staged FP4 weight"
+    );
 
     // It still forwards coherently.
     let x = Tensor::from_vec(pseudo_random(4 * in_dim, 3), (4, in_dim), &dev)
@@ -326,7 +353,10 @@ fn nvfp4_linear_shares_one_cublaslt_workspace_across_layers() {
     };
 
     eprintln!("\n[sc-12274] ===== PER-LAYER cuBLASLt WORKSPACE (isolated, weights-free) =====");
-    eprintln!("[sc-12274] predicted CublasLt::WORKSPACE = {} B (32 MiB)", WORKSPACE);
+    eprintln!(
+        "[sc-12274] predicted CublasLt::WORKSPACE = {} B (32 MiB)",
+        WORKSPACE
+    );
 
     // --- Leg 1: bare handles ------------------------------------------------------------------
     let base = free_at();
@@ -379,7 +409,9 @@ fn nvfp4_linear_shares_one_cublaslt_workspace_across_layers() {
     let leg2_used = base2.saturating_sub(free_at()) as f64;
     let leg2_per_layer = leg2_used / N as f64;
 
-    let packed_per_layer = layers[0].resident_device_bytes().expect("W4A4 stages a packed weight");
+    let packed_per_layer = layers[0]
+        .resident_device_bytes()
+        .expect("W4A4 stages a packed weight");
     let accounted = (packed_per_layer * N) as f64; // what SC#6's `resident_weight_bytes` would sum
     let unaccounted = leg2_used - accounted;
 
@@ -423,7 +455,8 @@ fn nvfp4_linear_shares_one_cublaslt_workspace_across_layers() {
     );
     let mut shared: Vec<Nvfp4Linear> = Vec::with_capacity(N);
     for _ in 0..N {
-        let lin = Nvfp4Linear::from_dense_in(&w_bf16, None, &dev, ActPrecision::W4A4, &ctx).unwrap();
+        let lin =
+            Nvfp4Linear::from_dense_in(&w_bf16, None, &dev, ActPrecision::W4A4, &ctx).unwrap();
         assert_eq!(
             lin.regime(),
             Nvfp4Regime::Fp4W4A4,

@@ -367,7 +367,10 @@ mod tests {
         );
 
         assert!(matches!(out, Err(CandleError::Canceled)));
-        assert!(!*loaded.borrow(), "no loader may run for a cancelled request");
+        assert!(
+            !*loaded.borrow(),
+            "no loader may run for a cancelled request"
+        );
     }
 
     /// Cancelling during the encode is caught at the NEXT boundary, so the heavy load never starts —
@@ -394,7 +397,10 @@ mod tests {
         );
 
         assert!(matches!(out, Err(CandleError::Canceled)));
-        assert!(!*heavy_loaded.borrow(), "heavy load must not start after a cancel");
+        assert!(
+            !*heavy_loaded.borrow(),
+            "heavy load must not start after a cancel"
+        );
     }
 
     /// Both loads announce themselves (F-179), in phase order, before the render runs — the worker

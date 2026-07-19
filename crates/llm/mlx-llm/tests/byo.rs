@@ -52,9 +52,15 @@ fn qwen3_dense_dispatch_and_stream() {
     // model streamed coherent text on *either* channel — the reasoning/answer split itself is
     // covered by tests/thinking.rs.
     let (out, n) = run(&provider, "The capital of France is", 16);
-    println!("\n[qwen3 dense] answer={:?} thinking={:?}\n", out.text, out.thinking);
-    let produced =
-        !out.text.trim().is_empty() || out.thinking.as_deref().is_some_and(|t| !t.trim().is_empty());
+    println!(
+        "\n[qwen3 dense] answer={:?} thinking={:?}\n",
+        out.text, out.thinking
+    );
+    let produced = !out.text.trim().is_empty()
+        || out
+            .thinking
+            .as_deref()
+            .is_some_and(|t| !t.trim().is_empty());
     assert!(n > 0 && produced);
 }
 

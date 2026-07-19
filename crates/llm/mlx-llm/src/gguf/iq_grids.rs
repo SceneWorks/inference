@@ -8,6 +8,7 @@
 //! grid to `const uint8_t *` (IQ2/IQ3, unsigned) or `const int8_t *` (IQ1, signed).
 
 /// llama.cpp `iq2xxs_grid` (256 entries).
+#[rustfmt::skip]
 pub(crate) static IQ2XXS_GRID: [u64; 256] = [
     0x0808080808080808, 0x080808080808082b, 0x0808080808081919, 0x0808080808082b08,
     0x0808080808082b2b, 0x0808080808190819, 0x0808080808191908, 0x08080808082b0808,
@@ -76,6 +77,7 @@ pub(crate) static IQ2XXS_GRID: [u64; 256] = [
 ];
 
 /// llama.cpp `iq2xs_grid` (512 entries).
+#[rustfmt::skip]
 pub(crate) static IQ2XS_GRID: [u64; 512] = [
     0x0808080808080808, 0x080808080808082b, 0x0808080808081919, 0x0808080808082b08,
     0x0808080808082b2b, 0x0808080808190819, 0x0808080808191908, 0x080808080819192b,
@@ -208,6 +210,7 @@ pub(crate) static IQ2XS_GRID: [u64; 512] = [
 ];
 
 /// llama.cpp `iq2s_grid` (1024 entries).
+#[rustfmt::skip]
 pub(crate) static IQ2S_GRID: [u64; 1024] = [
     0x0808080808080808, 0x080808080808082b, 0x0808080808081919, 0x0808080808082b08,
     0x0808080808082b2b, 0x0808080808190819, 0x0808080808191908, 0x080808080819192b,
@@ -468,6 +471,7 @@ pub(crate) static IQ2S_GRID: [u64; 1024] = [
 ];
 
 /// llama.cpp `iq3xxs_grid` (256 entries).
+#[rustfmt::skip]
 pub(crate) static IQ3XXS_GRID: [u32; 256] = [
     0x04040404, 0x04040414, 0x04040424, 0x04040c0c, 0x04040c1c, 0x04040c3e,
     0x04041404, 0x04041414, 0x04041c0c, 0x04042414, 0x04043e1c, 0x04043e2c,
@@ -515,6 +519,7 @@ pub(crate) static IQ3XXS_GRID: [u32; 256] = [
 ];
 
 /// llama.cpp `iq3s_grid` (512 entries).
+#[rustfmt::skip]
 pub(crate) static IQ3S_GRID: [u32; 512] = [
     0x01010101, 0x01010103, 0x01010105, 0x0101010b, 0x0101010f, 0x01010301,
     0x01010303, 0x01010305, 0x01010309, 0x0101030d, 0x01010501, 0x01010503,
@@ -605,6 +610,7 @@ pub(crate) static IQ3S_GRID: [u32; 512] = [
 ];
 
 /// llama.cpp `iq1s_grid` (2048 entries).
+#[rustfmt::skip]
 pub(crate) static IQ1S_GRID: [u64; 2048] = [
     0xffffffffffffffff, 0xffffffffffffff01, 0xffffffffffff0000, 0xffffffffffff01ff,
     0xffffffffffff0101, 0xffffffffff00ff00, 0xffffffffff000000, 0xffffffffff01ffff,
@@ -1121,6 +1127,7 @@ pub(crate) static IQ1S_GRID: [u64; 2048] = [
 ];
 
 /// llama.cpp `ksigns_iq2xs` (128 entries).
+#[rustfmt::skip]
 pub(crate) static KSIGNS_IQ2XS: [u8; 128] = [
     0, 129, 130, 3, 132, 5, 6, 135, 136, 9, 10, 139, 12, 141, 142, 15,
     144, 17, 18, 147, 20, 149, 150, 23, 24, 153, 154, 27, 156, 29, 30, 159,
@@ -1133,7 +1140,7 @@ pub(crate) static KSIGNS_IQ2XS: [u8; 128] = [
 ];
 
 /// llama.cpp `kmask_iq2xs` (8 entries).
+#[rustfmt::skip]
 pub(crate) static KMASK_IQ2XS: [u8; 8] = [
     1, 2, 4, 8, 16, 32, 64, 128,
 ];
-

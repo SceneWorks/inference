@@ -778,7 +778,13 @@ impl crate::models::VlmDecode for CausalLm {
         vision_features: &Tensor,
         placeholder_tokens: &[i32],
     ) -> Result<Tensor> {
-        CausalLm::splice_vision_features(self, embeds, input_ids, vision_features, placeholder_tokens)
+        CausalLm::splice_vision_features(
+            self,
+            embeds,
+            input_ids,
+            vision_features,
+            placeholder_tokens,
+        )
     }
 
     fn mrope_positions_mm(

@@ -113,7 +113,11 @@ fn wan_z16_bf16_vs_f32_decode_parity() {
     let dec_f32 = vae_f32.decode(&z).unwrap();
     // candle's CPU has no bf16 matmul, but this decode runs on CUDA; cast to f32 on host for comparison.
     let dec_bf16 = vae_bf16.decode(&z).unwrap().to_dtype(DType::F32).unwrap();
-    assert_eq!(dec_f32.dims(), &[1, 3, 21, 512, 512], "unexpected output shape");
+    assert_eq!(
+        dec_f32.dims(),
+        &[1, 3, 21, 512, 512],
+        "unexpected output shape"
+    );
     assert_eq!(dec_bf16.dims(), dec_f32.dims());
     assert_finite_and_in_range(&dec_bf16, "bf16 decode");
 
@@ -150,7 +154,9 @@ fn wan_z16_spatial_tiling_decode() {
     assert_finite_and_in_range(&tiled, "decode_tiled");
 
     let (psnr, maxd) = psnr_and_maxdiff(&base, &tiled);
-    eprintln!("[sc-12758] decode vs decode_tiled(256/64): PSNR={psnr:.2} dB  max_abs_diff={maxd:.4}");
+    eprintln!(
+        "[sc-12758] decode vs decode_tiled(256/64): PSNR={psnr:.2} dB  max_abs_diff={maxd:.4}"
+    );
     // Global-attention tiling perturbs the result, but the overlapping trapezoidal blend keeps it
     // seam-free by PSNR. 30 dB floor leaves margin while still cratering on a blend/offset regression
     // (a broken stitch drops PSNR to the teens). The anchor record is the printed PSNR above.

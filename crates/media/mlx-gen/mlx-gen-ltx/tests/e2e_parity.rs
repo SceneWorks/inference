@@ -295,7 +295,11 @@ fn run_e2e_gate(dir: &std::path::Path, golden: &str, bf16: bool) {
     // bf16-ULP upsampler drift and decoheres (measured fmr 7.051e-2 (Q8) / 1.962e-1 (Q4), px
     // 4.67%/17.19%) → gross-error envelope only; the regression-catching load in bf16 rides on the
     // structural gates above (upsample bound, teacher-forced stage-2, shapes, positions, renoise).
-    let (fmr_bound, px_bound) = if bf16 { (3.0e-1, 2.5e-1) } else { (1.0e-2, 1.0e-2) };
+    let (fmr_bound, px_bound) = if bf16 {
+        (3.0e-1, 2.5e-1)
+    } else {
+        (1.0e-2, 1.0e-2)
+    };
     assert!(
         fmr < fmr_bound,
         "full e2e final latents mean_rel {fmr:.3e} above the cross-stack compounding envelope {fmr_bound:.1e} (sc-12896)"

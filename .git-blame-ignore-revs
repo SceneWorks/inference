@@ -1,0 +1,14 @@
+# Revisions to skip in `git blame` — bulk, mechanical, semantics-preserving commits
+# (whole-workspace reformats and the like) that would otherwise obscure real authorship.
+# This repo preserves history across the five-repo migration, so keeping blame pointed at
+# the original authors matters.
+#
+# GitHub honors this file automatically in its blame view. Locally, opt in once with:
+#   git config blame.ignoreRevsFile .git-blame-ignore-revs
+#
+# NOTE: entries must be full 40-char SHAs as they land on `main`. This repo normally merges
+# PRs (preserving commit SHAs); if a listed commit is ever squash-merged, replace the SHA
+# below with the resulting one on `main`.
+
+# style: normalize whole workspace with cargo fmt --all (sc-13275)
+448f10f061f1e7f7ea716ce2b4a5e22b903d3f7f

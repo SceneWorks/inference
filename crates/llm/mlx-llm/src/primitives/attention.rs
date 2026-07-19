@@ -140,7 +140,8 @@ fn sdpa_chunked_prefill(
     let k_len = keys.shape()[2];
     let offset = k_len - q_len; // cached prefix before the new queries; ≥ 0 for cached decode/prefill
 
-    let mut outs: Vec<Array> = Vec::with_capacity(((q_len + SDPA_MAX_FUSED_QLEN - 1) / SDPA_MAX_FUSED_QLEN) as usize);
+    let mut outs: Vec<Array> =
+        Vec::with_capacity(((q_len + SDPA_MAX_FUSED_QLEN - 1) / SDPA_MAX_FUSED_QLEN) as usize);
     let mut c0 = 0;
     while c0 < q_len {
         let c1 = (c0 + SDPA_MAX_FUSED_QLEN).min(q_len);
@@ -279,14 +280,20 @@ mod tests {
 
     #[test]
     fn repeat_kv_noop_for_one_group() {
-        let x = Array::from_slice(&(0..24).map(|i| i as f32).collect::<Vec<_>>(), &[1, 2, 3, 4]);
+        let x = Array::from_slice(
+            &(0..24).map(|i| i as f32).collect::<Vec<_>>(),
+            &[1, 2, 3, 4],
+        );
         let y = repeat_kv(&x, 1).unwrap();
         assert_eq!(y.shape(), &[1, 2, 3, 4]);
     }
 
     #[test]
     fn repeat_kv_expands_head_axis() {
-        let x = Array::from_slice(&(0..16).map(|i| i as f32).collect::<Vec<_>>(), &[1, 2, 2, 4]);
+        let x = Array::from_slice(
+            &(0..16).map(|i| i as f32).collect::<Vec<_>>(),
+            &[1, 2, 2, 4],
+        );
         let y = repeat_kv(&x, 4).unwrap();
         assert_eq!(y.shape(), &[1, 8, 2, 4]);
     }
@@ -304,7 +311,10 @@ mod tests {
     #[test]
     fn sdpa_causal_runs_and_shapes() {
         // [b=1, heads=1, seq=2, hd=4]
-        let q = Array::from_slice(&(0..8).map(|i| i as f32 * 0.1).collect::<Vec<_>>(), &[1, 1, 2, 4]);
+        let q = Array::from_slice(
+            &(0..8).map(|i| i as f32 * 0.1).collect::<Vec<_>>(),
+            &[1, 1, 2, 4],
+        );
         let out = sdpa_causal(&q, &q, &q, 0.5).unwrap();
         assert_eq!(out.shape(), &[1, 1, 2, 4]);
     }
@@ -314,7 +324,9 @@ mod tests {
         let mut s = seed;
         let data: Vec<f32> = (0..n)
             .map(|_| {
-                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 ((s >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
             })
             .collect();
@@ -329,11 +341,11 @@ mod tests {
     fn sdpa_native_gqa_matches_repeat_kv() {
         // (b, n_heads, n_kv_heads, seq, head_dim)
         let cases = [
-            (1, 8, 2, 1, 64),    // decode, groups=4 (vector path)
-            (1, 32, 8, 1, 128),  // decode, Qwen3-like hd=128, groups=4
-            (1, 8, 2, 16, 64),   // prefill q_len=16>8 (full/steel path), groups=4
-            (2, 6, 3, 5, 64),    // batched, groups=2
-            (1, 4, 4, 7, 64),    // MHA groups=1 (repeat_kv is a no-op — must be unchanged)
+            (1, 8, 2, 1, 64),   // decode, groups=4 (vector path)
+            (1, 32, 8, 1, 128), // decode, Qwen3-like hd=128, groups=4
+            (1, 8, 2, 16, 64),  // prefill q_len=16>8 (full/steel path), groups=4
+            (2, 6, 3, 5, 64),   // batched, groups=2
+            (1, 4, 4, 7, 64),   // MHA groups=1 (repeat_kv is a no-op — must be unchanged)
         ];
         for (b, nh, nkv, s, hd) in cases {
             let scale = 1.0 / (hd as f32).sqrt();
@@ -357,7 +369,11 @@ mod tests {
                     native.as_slice::<f32>().to_vec(),
                     expanded.as_slice::<f32>().to_vec(),
                 );
-                let maxdiff = a.iter().zip(&e).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+                let maxdiff = a
+                    .iter()
+                    .zip(&e)
+                    .map(|(x, y)| (x - y).abs())
+                    .fold(0.0f32, f32::max);
                 assert!(
                     maxdiff < 1e-4,
                     "shape {b}/{nh}/{nkv}/{s}/{hd} mask {mask:?}: max|Δ| = {maxdiff}"
@@ -370,23 +386,40 @@ mod tests {
     /// (kv expanded to `h`), f64 accumulation — the ground truth the chunked-prefill mitigation is
     /// gated against. Causal aligns the `ql` queries to the bottom-right of the `kl` keys
     /// (offset = kl − ql), so it also covers a cached prefix.
-    fn host_attn_gqa(q: &Array, k: &Array, v: &Array, groups: i32, scale: f32, causal: bool) -> Vec<f32> {
+    fn host_attn_gqa(
+        q: &Array,
+        k: &Array,
+        v: &Array,
+        groups: i32,
+        scale: f32,
+        causal: bool,
+    ) -> Vec<f32> {
         let kx = repeat_kv(k, groups).unwrap();
         let vx = repeat_kv(v, groups).unwrap();
         let (qs, ks) = (q.shape(), kx.shape());
         let (h, ql, hd) = (qs[1] as usize, qs[2] as usize, qs[3] as usize);
         let kl = ks[2] as usize;
-        let (qh, kh, vh) = (q.as_slice::<f32>(), kx.as_slice::<f32>(), vx.as_slice::<f32>());
+        let (qh, kh, vh) = (
+            q.as_slice::<f32>(),
+            kx.as_slice::<f32>(),
+            vx.as_slice::<f32>(),
+        );
         let offset = kl as isize - ql as isize;
         let mut out = vec![0f32; h * ql * hd];
         for head in 0..h {
             let (qb, kb) = (head * ql * hd, head * kl * hd);
             for i in 0..ql {
-                let jmax = if causal { (offset + i as isize) as usize } else { kl - 1 };
+                let jmax = if causal {
+                    (offset + i as isize) as usize
+                } else {
+                    kl - 1
+                };
                 let mut logits = vec![0f64; kl];
                 let mut m = f64::MIN;
                 for j in 0..=jmax {
-                    let dot: f64 = (0..hd).map(|d| qh[qb + i * hd + d] as f64 * kh[kb + j * hd + d] as f64).sum();
+                    let dot: f64 = (0..hd)
+                        .map(|d| qh[qb + i * hd + d] as f64 * kh[kb + j * hd + d] as f64)
+                        .sum();
                     logits[j] = dot * scale as f64;
                     m = m.max(logits[j]);
                 }
@@ -396,7 +429,9 @@ mod tests {
                     denom += *lj;
                 }
                 for d in 0..hd {
-                    let acc: f64 = (0..=jmax).map(|j| logits[j] / denom * vh[kb + j * hd + d] as f64).sum();
+                    let acc: f64 = (0..=jmax)
+                        .map(|j| logits[j] / denom * vh[kb + j * hd + d] as f64)
+                        .sum();
                     out[(head * ql + i) * hd + d] = acc as f32;
                 }
             }
@@ -414,7 +449,11 @@ mod tests {
         let (qs, vs) = (q.shape(), v.shape());
         let (h, s, hd) = (qs[1] as usize, qs[2] as usize, qs[3] as usize);
         let vhd = vs[3] as usize;
-        let (qh, kh, vh) = (q.as_slice::<f32>(), k.as_slice::<f32>(), v.as_slice::<f32>());
+        let (qh, kh, vh) = (
+            q.as_slice::<f32>(),
+            k.as_slice::<f32>(),
+            v.as_slice::<f32>(),
+        );
         let qk_at = |t: &[f32], head: usize, i: usize, d: usize| t[(head * s + i) * hd + d];
         let v_at = |head: usize, j: usize, d: usize| vh[(head * s + j) * vhd + d];
         let mut out = vec![0f32; h * s * vhd];
@@ -422,7 +461,9 @@ mod tests {
             for i in 0..s {
                 let mut logits = vec![0f32; s];
                 for (j, lj) in logits.iter_mut().enumerate() {
-                    let dot: f32 = (0..hd).map(|d| qk_at(qh, head, i, d) * qk_at(kh, head, j, d)).sum();
+                    let dot: f32 = (0..hd)
+                        .map(|d| qk_at(qh, head, i, d) * qk_at(kh, head, j, d))
+                        .sum();
                     *lj = dot * scale;
                 }
                 let jmax = if causal { i } else { s - 1 };
@@ -443,7 +484,11 @@ mod tests {
     }
 
     fn rel_err(a: &[f32], host: &[f32]) -> f32 {
-        let maxd = a.iter().zip(host).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        let maxd = a
+            .iter()
+            .zip(host)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
         let maxh = host.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
         maxd / (maxh + 1e-20)
     }
@@ -457,12 +502,12 @@ mod tests {
     fn fused_sdpa_correct_vs_host_for_short_qlen() {
         // (n_heads, n_kv_heads, q_len, k_len, head_dim)
         let cases = [
-            (8, 2, 1, 64, 64),   // decode, long cache, hd=64
+            (8, 2, 1, 64, 64),    // decode, long cache, hd=64
             (32, 8, 1, 256, 128), // decode, long cache, hd=128 (Qwen3-like)
-            (8, 2, 8, 8, 64),    // short prefill q_len=8 (chunk boundary)
-            (8, 2, 8, 256, 64),  // chunked prefill: 8 new queries into a 256-key cache
-            (8, 2, 8, 8, 128),   // q_len=8 at hd=128 (chunk boundary for the Qwen3 head dim)
-            (4, 4, 4, 64, 128),  // MHA, hd=128
+            (8, 2, 8, 8, 64),     // short prefill q_len=8 (chunk boundary)
+            (8, 2, 8, 256, 64),   // chunked prefill: 8 new queries into a 256-key cache
+            (8, 2, 8, 8, 128),    // q_len=8 at hd=128 (chunk boundary for the Qwen3 head dim)
+            (4, 4, 4, 64, 128),   // MHA, hd=128
         ];
         for (nh, nkv, ql, kl, hd) in cases {
             let scale = 1.0 / (hd as f32).sqrt();
@@ -493,7 +538,10 @@ mod tests {
             (1, 2, 2, 5, 6, 4),    // MLA-style: q/k head_dim 6, v head_dim 4
         ];
         let maxdiff = |a: &[f32], b: &[f32]| {
-            a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max)
+            a.iter()
+                .zip(b)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max)
         };
         for (b, nh, nkv, s, hd, vhd) in cases {
             let scale = 1.0 / (hd as f32).sqrt();
@@ -507,7 +555,10 @@ mod tests {
                 let href = host_attn(&q, &kx, &vx, scale, causal);
                 let eager = sdpa_eager(&q, &k, &v, scale, None, mask).unwrap();
                 let de = maxdiff(&href, eager.as_slice::<f32>());
-                assert!(de < 2e-3, "eager {b}/{nh}/{nkv}/{s}/{hd}/{vhd} causal={causal}: max|Δ| vs host = {de}");
+                assert!(
+                    de < 2e-3,
+                    "eager {b}/{nh}/{nkv}/{s}/{hd}/{vhd} causal={causal}: max|Δ| vs host = {de}"
+                );
             }
         }
     }
@@ -527,7 +578,12 @@ mod tests {
             let k = randf(&[1, 8, 16, hd], 2);
             let v = randf(&[1, 8, 16, hd], 3);
             let raw = scaled_dot_product_attention(
-                &q, &k, &v, scale, Some(ScaledDotProductAttentionMask::Causal), None,
+                &q,
+                &k,
+                &v,
+                scale,
+                Some(ScaledDotProductAttentionMask::Causal),
+                None,
             )
             .unwrap();
             let host = host_attn_gqa(&q, &k, &v, 1, scale, true);
@@ -567,7 +623,10 @@ mod tests {
                 assert_eq!(out.shape(), &[1, nh, ql, hd]);
                 let host = host_attn_gqa(&q, &k, &v, groups, scale, causal);
                 let e = rel_err(out.as_slice::<f32>(), &host);
-                assert!(e < 2e-3, "chunked sdpa wrong {nh}/{nkv}/{ql}/{kl}/{hd} causal={causal}: rel={e}");
+                assert!(
+                    e < 2e-3,
+                    "chunked sdpa wrong {nh}/{nkv}/{ql}/{kl}/{hd} causal={causal}: rel={e}"
+                );
             }
         }
     }
@@ -627,6 +686,9 @@ mod tests {
         let mean = 3.0f32; // mean of v[:,0] = (1+3+5)/3
         let u = uncapped.as_slice::<f32>()[0];
         let c = capped.as_slice::<f32>()[0];
-        assert!((c - mean).abs() < (u - mean).abs(), "capped {c} should be nearer mean {mean} than uncapped {u}");
+        assert!(
+            (c - mean).abs() < (u - mean).abs(),
+            "capped {c} should be nearer mean {mean} than uncapped {u}"
+        );
     }
 }

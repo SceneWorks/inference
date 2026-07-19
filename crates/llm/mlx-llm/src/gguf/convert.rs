@@ -87,7 +87,11 @@ pub fn convert_file(
 }
 
 /// Convert an already-parsed GGUF file into an MLX snapshot directory.
-pub fn convert(g: &GgufFile, out_dir: impl AsRef<Path>, opts: ConvertOptions) -> Result<ConvertReport> {
+pub fn convert(
+    g: &GgufFile,
+    out_dir: impl AsRef<Path>,
+    opts: ConvertOptions,
+) -> Result<ConvertReport> {
     let out_dir = out_dir.as_ref();
 
     let arch = g
@@ -107,10 +111,12 @@ pub fn convert(g: &GgufFile, out_dir: impl AsRef<Path>, opts: ConvertOptions) ->
 
     // Head counts + whether the q/k projections need un-permuting (see `permute_inverse_qk`).
     let mkey = |s: &str| format!("{arch}.{s}");
-    let num_heads = g
-        .meta_u64(&mkey("attention.head_count"))
-        .ok_or_else(|| Error::Config(format!("gguf: missing metadata {}", mkey("attention.head_count"))))?
-        as usize;
+    let num_heads = g.meta_u64(&mkey("attention.head_count")).ok_or_else(|| {
+        Error::Config(format!(
+            "gguf: missing metadata {}",
+            mkey("attention.head_count")
+        ))
+    })? as usize;
     let num_kv_heads = g
         .meta_u64(&mkey("attention.head_count_kv"))
         .unwrap_or(num_heads as u64) as usize;
@@ -166,9 +172,10 @@ pub fn convert(g: &GgufFile, out_dir: impl AsRef<Path>, opts: ConvertOptions) ->
             },
             TokenizerStatus::Reconstructed(t.kind),
         ),
-        TokenizerOutcome::Unsupported(reason) => {
-            (SnapshotTokenizer::default(), TokenizerStatus::Unsupported(reason))
-        }
+        TokenizerOutcome::Unsupported(reason) => (
+            SnapshotTokenizer::default(),
+            TokenizerStatus::Unsupported(reason),
+        ),
         TokenizerOutcome::Absent => (SnapshotTokenizer::default(), TokenizerStatus::Absent),
     };
 
@@ -231,7 +238,11 @@ pub fn remap_key(name: &str) -> Option<String> {
 /// `[out, in]` weight where `out = n_head · head_dim`.
 fn permute_inverse_qk(data: &[f32], shape: &[usize], n_head: usize) -> Result<Vec<f32>> {
     let out = shape[0];
-    let in_dim = if shape.len() == 2 { shape[1] } else { data.len() / out };
+    let in_dim = if shape.len() == 2 {
+        shape[1]
+    } else {
+        data.len() / out
+    };
     if n_head == 0 || !out.is_multiple_of(n_head) {
         return Err(Error::Msg(format!(
             "gguf: q/k permute: out {out} not divisible by n_head {n_head}"
@@ -239,7 +250,9 @@ fn permute_inverse_qk(data: &[f32], shape: &[usize], n_head: usize) -> Result<Ve
     }
     let head_dim = out / n_head;
     if !head_dim.is_multiple_of(2) {
-        return Err(Error::Msg(format!("gguf: q/k permute: odd head_dim {head_dim}")));
+        return Err(Error::Msg(format!(
+            "gguf: q/k permute: odd head_dim {head_dim}"
+        )));
     }
     let half = head_dim / 2;
     let mut res = vec![0f32; data.len()];
@@ -278,7 +291,9 @@ fn reconstruct_config(
     let hidden = req_u64("embedding_length")? as i64;
     let blocks = req_u64("block_count")? as i64;
     let heads = req_u64("attention.head_count")? as i64;
-    let kv_heads = g.meta_u64(&key("attention.head_count_kv")).unwrap_or(heads as u64) as i64;
+    let kv_heads = g
+        .meta_u64(&key("attention.head_count_kv"))
+        .unwrap_or(heads as u64) as i64;
     let ffn = req_u64("feed_forward_length")? as i64;
     let head_dim = g
         .meta_u64(&key("attention.key_length"))
@@ -359,8 +374,14 @@ mod tests {
 
     #[test]
     fn remaps_non_layer_keys() {
-        assert_eq!(remap_key("token_embd.weight").unwrap(), "model.embed_tokens.weight");
-        assert_eq!(remap_key("output_norm.weight").unwrap(), "model.norm.weight");
+        assert_eq!(
+            remap_key("token_embd.weight").unwrap(),
+            "model.embed_tokens.weight"
+        );
+        assert_eq!(
+            remap_key("output_norm.weight").unwrap(),
+            "model.norm.weight"
+        );
         assert_eq!(remap_key("output.weight").unwrap(), "lm_head.weight");
     }
 

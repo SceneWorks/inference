@@ -27,15 +27,14 @@
 use std::path::PathBuf;
 
 use core_llm::{
-    Channel, Content, ImageRef, LoadSpec, Message,
-    ModelRequirements, Quantize, Role, Sampling, StreamEvent as CoreEvent, TextLlm, TextLlmRequest,
-    ThinkingMode, Tokenizer, VideoRef,
+    Channel, Content, ImageRef, LoadSpec, Message, ModelRequirements, Quantize, Role, Sampling,
+    StreamEvent as CoreEvent, TextLlm, TextLlmRequest, ThinkingMode, Tokenizer, VideoRef,
 };
 use mlx_llm::{load_for_model_with, load_textllm};
 
 use mlx_llm::config::{Architecture, ModelConfig};
-use mlx_llm::decode::{generate, CancelFlag, GenerationConfig};
 use mlx_llm::decode::StreamEvent;
+use mlx_llm::decode::{generate, CancelFlag, GenerationConfig};
 use mlx_llm::models::CausalLm;
 use mlx_llm::primitives::sampler::SamplingParams;
 use mlx_llm::primitives::Weights;
@@ -85,8 +84,12 @@ fn qwen3vl_text_decoder_loads_and_generates_coherently() {
     let tok = Tokenizer::from_file(dir.join("tokenizer.json")).expect("tokenizer");
     // Render via the model's own chat template so the prompt is in-distribution.
     let prompt = "<|im_start|>user\nWhat is the capital of France? Answer in one word.<|im_end|>\n<|im_start|>assistant\n";
-    let prompt_ids: Vec<i32> =
-        tok.encode(prompt, false).unwrap().into_iter().map(|id| id as i32).collect();
+    let prompt_ids: Vec<i32> = tok
+        .encode(prompt, false)
+        .unwrap()
+        .into_iter()
+        .map(|id| id as i32)
+        .collect();
 
     let config = GenerationConfig {
         max_new_tokens: 16,
@@ -96,17 +99,27 @@ fn qwen3vl_text_decoder_loads_and_generates_coherently() {
     };
 
     let run = || {
-        generate(&model, &prompt_ids, &config, &CancelFlag::new(), &mut |_| {})
-            .unwrap()
-            .tokens
+        generate(
+            &model,
+            &prompt_ids,
+            &config,
+            &CancelFlag::new(),
+            &mut |_| {},
+        )
+        .unwrap()
+        .tokens
     };
     let a = run();
     let b = run();
     assert!(!a.is_empty(), "expected non-empty generation");
     assert_eq!(a, b, "greedy generation must be reproducible");
 
-    let text = tok.decode(&a.iter().map(|&i| i as u32).collect::<Vec<_>>(), true).unwrap();
-    println!("\n=== Qwen3-VL text-only generation ===\n{text}\n=====================================");
+    let text = tok
+        .decode(&a.iter().map(|&i| i as u32).collect::<Vec<_>>(), true)
+        .unwrap();
+    println!(
+        "\n=== Qwen3-VL text-only generation ===\n{text}\n====================================="
+    );
     assert!(!text.trim().is_empty());
     assert!(
         text.to_lowercase().contains("paris"),
@@ -125,10 +138,15 @@ fn qwen3vl_round_trips_through_core_llm_contract() {
     let provider = load_textllm(PROVIDER_ID, &LoadSpec::dense(dir.to_str().unwrap())).unwrap();
     assert_eq!(provider.descriptor().id, PROVIDER_ID);
     assert_eq!(provider.descriptor().family, "qwen3_vl");
-    assert_eq!(provider.descriptor().capabilities.max_context_tokens, 262144);
+    assert_eq!(
+        provider.descriptor().capabilities.max_context_tokens,
+        262144
+    );
 
     let req = TextLlmRequest {
-        messages: vec![Message::user("What is the capital of France? Answer in one word.")],
+        messages: vec![Message::user(
+            "What is the capital of France? Answer in one word.",
+        )],
         sampling: Sampling::greedy(),
         max_new_tokens: 16,
         seed: Some(0),
@@ -145,7 +163,10 @@ fn qwen3vl_round_trips_through_core_llm_contract() {
             }
         })
         .unwrap();
-    println!("\n=== contract output ===\n{}\n=======================", out.text);
+    println!(
+        "\n=== contract output ===\n{}\n=======================",
+        out.text
+    );
     assert!(out.usage.generated_tokens > 0);
     assert!(out.usage.prompt_tokens > 0);
     assert!(
@@ -166,9 +187,14 @@ fn qwen3vl_mid_stream_cancel() {
     let weights = Weights::from_dir(&dir).unwrap();
     let model = CausalLm::from_weights(&weights, "", cfg).unwrap();
     let tok = Tokenizer::from_file(dir.join("tokenizer.json")).unwrap();
-    let prompt = "<|im_start|>user\nWrite a long story about a robot.<|im_end|>\n<|im_start|>assistant\n";
-    let prompt_ids: Vec<i32> =
-        tok.encode(prompt, false).unwrap().into_iter().map(|id| id as i32).collect();
+    let prompt =
+        "<|im_start|>user\nWrite a long story about a robot.<|im_end|>\n<|im_start|>assistant\n";
+    let prompt_ids: Vec<i32> = tok
+        .encode(prompt, false)
+        .unwrap()
+        .into_iter()
+        .map(|id| id as i32)
+        .collect();
 
     let cancel = CancelFlag::new();
     let mut count = 0;
@@ -272,7 +298,11 @@ fn qwen3vl_vision_grounds_single_image_via_core_llm() {
         &ModelRequirements::default(),
     )
     .expect("load_for_model must resolve the Qwen3-VL snapshot to a provider");
-    assert_eq!(provider.descriptor().id, PROVIDER_ID, "must route to mlx-llama, not a misrouted provider");
+    assert_eq!(
+        provider.descriptor().id,
+        PROVIDER_ID,
+        "must route to mlx-llama, not a misrouted provider"
+    );
     assert_eq!(provider.descriptor().family, "qwen3_vl");
     assert!(
         provider.descriptor().capabilities.supports_vision,
@@ -280,7 +310,10 @@ fn qwen3vl_vision_grounds_single_image_via_core_llm() {
     );
 
     // Two solid colors: a correct vision path names each; a broken one cannot ground on both.
-    for (rgb, want, label) in [([205u8, 35, 35], "red", "red"), ([35u8, 70, 200], "blue", "blue")] {
+    for (rgb, want, label) in [
+        ([205u8, 35, 35], "red", "red"),
+        ([35u8, 70, 200], "blue", "blue"),
+    ] {
         let req = vision_request(
             vec![user_turn(vec![
                 Content::Image(solid_image(256, 256, rgb)),
@@ -291,7 +324,10 @@ fn qwen3vl_vision_grounds_single_image_via_core_llm() {
         let (content, usage) = run_vision(provider.as_ref(), &req);
         println!("\n=== Qwen3-VL VISION single ({label}) ===\n[answer] {content:?}\n");
         assert!(usage.prompt_tokens > 0 && usage.generated_tokens > 0);
-        assert!(!content.trim().is_empty(), "{label}: must produce an answer");
+        assert!(
+            !content.trim().is_empty(),
+            "{label}: must produce an answer"
+        );
         assert!(
             content.to_lowercase().contains(want),
             "{label}: greedy answer must ground on the image and name '{want}', got: {content:?}"
@@ -326,10 +362,12 @@ fn qwen3vl_vision_required_routing_resolves_via_core_llm() {
     );
 
     // The gap closed: with_vision() requirement no longer rejects the snapshot at the gate.
-    let provider = load_for_model_with(&spec, &ModelRequirements::default().with_vision())
-        .expect("vision-required model-first load must resolve the Qwen3-VL snapshot (sc-8077 gap)");
+    let provider = load_for_model_with(&spec, &ModelRequirements::default().with_vision()).expect(
+        "vision-required model-first load must resolve the Qwen3-VL snapshot (sc-8077 gap)",
+    );
     assert_eq!(
-        provider.descriptor().id, PROVIDER_ID,
+        provider.descriptor().id,
+        PROVIDER_ID,
         "vision-required routing must land on mlx-llama, not a misrouted vision provider"
     );
     assert_eq!(provider.descriptor().family, "qwen3_vl");
@@ -373,7 +411,9 @@ fn qwen3vl_vision_grounds_two_images_via_core_llm() {
             Content::Image(solid_image(256, 256, [205, 35, 35])),
             Content::text("The second:"),
             Content::Image(solid_image(256, 256, [35, 70, 200])),
-            Content::text("Name the dominant color of the first image, then the second, as two words."),
+            Content::text(
+                "Name the dominant color of the first image, then the second, as two words.",
+            ),
         ])],
         32,
     );
@@ -381,8 +421,14 @@ fn qwen3vl_vision_grounds_two_images_via_core_llm() {
     println!("\n=== Qwen3-VL VISION multi-image ===\n[answer] {content:?}\n");
     assert!(usage.generated_tokens > 0);
     let lc = content.to_lowercase();
-    assert!(lc.contains("red"), "multi-image answer must name the first image (red), got: {content:?}");
-    assert!(lc.contains("blue"), "multi-image answer must name the second image (blue), got: {content:?}");
+    assert!(
+        lc.contains("red"),
+        "multi-image answer must name the first image (red), got: {content:?}"
+    );
+    assert!(
+        lc.contains("blue"),
+        "multi-image answer must name the second image (blue), got: {content:?}"
+    );
     assert!(
         lc.find("red") < lc.find("blue"),
         "multi-image answer must name the images in order (red before blue), got: {content:?}"
@@ -412,12 +458,18 @@ fn qwen3vl_vision_q4_q8_import_path() {
         (Quantize::Q4, [205u8, 35, 35], "red", "q4"),
         (Quantize::Q8, [35u8, 70, 200], "blue", "q8"),
     ] {
-        let spec = LoadSpec { source: source.clone(), quantize: Some(q) };
+        let spec = LoadSpec {
+            source: source.clone(),
+            quantize: Some(q),
+        };
 
         // The concrete provider exposes `is_quantized()` — assert the decoder actually quantized
         // (not silently fell back to dense).
         let concrete = mlx_llm::LlamaProvider::load(&spec).expect("load quantized Qwen3-VL");
-        assert!(concrete.is_quantized(), "{label}: decoder projections must be quantized on load");
+        assert!(
+            concrete.is_quantized(),
+            "{label}: decoder projections must be quantized on load"
+        );
         assert!(
             concrete.descriptor().capabilities.supports_vision,
             "{label}: quantized Qwen3-VL must still advertise vision"
@@ -477,7 +529,11 @@ fn qwen3vl_video_grounds_temporal_order_via_core_llm() {
         &ModelRequirements::default(),
     )
     .expect("load_for_model must resolve the Qwen3-VL snapshot");
-    assert_eq!(provider.descriptor().id, PROVIDER_ID, "must route to mlx-llama");
+    assert_eq!(
+        provider.descriptor().id,
+        PROVIDER_ID,
+        "must route to mlx-llama"
+    );
     assert_eq!(provider.descriptor().family, "qwen3_vl");
     assert!(
         provider.descriptor().capabilities.supports_video,
@@ -488,7 +544,10 @@ fn qwen3vl_video_grounds_temporal_order_via_core_llm() {
     // frames at 1 fps fold (temporal_patch_size=2) into **two** merged temporal patches — patch 0 =
     // red+red (≈0.5s), patch 1 = blue+blue (≈2.5s) — so the model sees two distinct timestamped
     // vision frames in order. (Two frames would fold into a single patch with no temporal extent.)
-    let video = solid_video(&[[205, 35, 35], [205, 35, 35], [35, 70, 200], [35, 70, 200]], 1.0);
+    let video = solid_video(
+        &[[205, 35, 35], [205, 35, 35], [35, 70, 200], [35, 70, 200]],
+        1.0,
+    );
     let req = vision_request(
         vec![user_turn(vec![
             Content::Video(video),
@@ -501,7 +560,10 @@ fn qwen3vl_video_grounds_temporal_order_via_core_llm() {
     );
     let (content, usage) = run_vision(provider.as_ref(), &req);
     println!("\n=== Qwen3-VL VIDEO temporal-order ===\n[answer] {content:?}\n");
-    assert!(usage.prompt_tokens > 0 && usage.generated_tokens > 0, "must run the video prefill");
+    assert!(
+        usage.prompt_tokens > 0 && usage.generated_tokens > 0,
+        "must run the video prefill"
+    );
     assert!(!content.trim().is_empty(), "must produce an answer");
     let lc = content.to_lowercase();
     // The video path must ground on *both* frames' colors. Temporal ordering (red before blue) is the
@@ -515,7 +577,11 @@ fn qwen3vl_video_grounds_temporal_order_via_core_llm() {
         // Log whether temporal order was correct; this is the grounding signal we care about.
         println!(
             "temporal order {}: red@{r} blue@{b}",
-            if r < b { "CORRECT (red before blue)" } else { "out-of-order" }
+            if r < b {
+                "CORRECT (red before blue)"
+            } else {
+                "out-of-order"
+            }
         );
         assert!(r < b, "temporally-grounded answer must name the starting color (red) before the ending color (blue), got: {content:?}");
     }
@@ -536,7 +602,10 @@ fn qwen3vl_video_temporal_order_reversed_via_core_llm() {
     let provider = load_textllm(PROVIDER_ID, &LoadSpec::dense(dir.to_str().unwrap())).unwrap();
 
     // Solid BLUE for the first half, then solid GREEN for the second half.
-    let video = solid_video(&[[35, 70, 200], [35, 70, 200], [40, 180, 60], [40, 180, 60]], 1.0);
+    let video = solid_video(
+        &[[35, 70, 200], [35, 70, 200], [40, 180, 60], [40, 180, 60]],
+        1.0,
+    );
     let req = vision_request(
         vec![user_turn(vec![
             Content::Video(video),
@@ -559,7 +628,11 @@ fn qwen3vl_video_temporal_order_reversed_via_core_llm() {
     if let (Some(b), Some(g)) = (lc.find("blue"), lc.find("green")) {
         println!(
             "temporal order {}: blue@{b} green@{g}",
-            if b < g { "CORRECT (blue before green)" } else { "out-of-order" }
+            if b < g {
+                "CORRECT (blue before green)"
+            } else {
+                "out-of-order"
+            }
         );
         assert!(b < g, "temporally-grounded answer must name the starting color (blue) before the ending color (green), got: {content:?}");
     }
@@ -583,5 +656,7 @@ fn qwen3vl_video_capability_and_validate() {
         ])],
         8,
     );
-    provider.validate(&req).expect("a video request must validate on a video-capable provider");
+    provider
+        .validate(&req)
+        .expect("a video request must validate on a video-capable provider");
 }

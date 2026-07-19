@@ -53,7 +53,11 @@ fn load() -> Option<Fixture> {
 }
 
 fn encode(tok: &Tokenizer, text: &str) -> Vec<i32> {
-    tok.encode(text, true).unwrap().into_iter().map(|id| id as i32).collect()
+    tok.encode(text, true)
+        .unwrap()
+        .into_iter()
+        .map(|id| id as i32)
+        .collect()
 }
 
 fn request(fx: &Fixture, prompt: &[i32], max_new: usize) -> BatchRequest {
@@ -106,13 +110,21 @@ fn batch_of_one_matches_single() {
     ] {
         let p = encode(&fx.tok, text);
         let (single, single_fin) = run_single(&fx, &p, 24);
-        let batched = generate_batch(&fx.model, &[request(&fx, &p, 24)], &CancelFlag::new(), &mut |ri, ev| {
-            assert_eq!(ri, 0);
-            let _ = ev;
-        })
+        let batched = generate_batch(
+            &fx.model,
+            &[request(&fx, &p, 24)],
+            &CancelFlag::new(),
+            &mut |ri, ev| {
+                assert_eq!(ri, 0);
+                let _ = ev;
+            },
+        )
         .unwrap();
         assert!(!single.is_empty(), "'{text}' should generate");
-        assert_eq!(batched[0].tokens, single, "batch-of-one must equal single for '{text}'");
+        assert_eq!(
+            batched[0].tokens, single,
+            "batch-of-one must equal single for '{text}'"
+        );
         assert_eq!(batched[0].finish_reason, single_fin);
     }
 }
@@ -130,7 +142,12 @@ fn identical_rows_are_identical() {
     let mut streamed: Vec<Vec<i32>> = vec![Vec::new(); 4];
     let batched = generate_batch(
         &fx.model,
-        &[request(&fx, &p, 24), request(&fx, &p, 24), request(&fx, &p, 24), request(&fx, &p, 24)],
+        &[
+            request(&fx, &p, 24),
+            request(&fx, &p, 24),
+            request(&fx, &p, 24),
+            request(&fx, &p, 24),
+        ],
         &CancelFlag::new(),
         &mut |ri, ev| {
             if let mlx_llm::StreamEvent::Token { id, .. } = ev {
@@ -140,11 +157,17 @@ fn identical_rows_are_identical() {
     )
     .unwrap();
     for i in 1..batched.len() {
-        assert_eq!(batched[i].tokens, batched[0].tokens, "row {i} must equal row 0 (identical inputs)");
+        assert_eq!(
+            batched[i].tokens, batched[0].tokens,
+            "row {i} must equal row 0 (identical inputs)"
+        );
     }
     for (i, out) in batched.iter().enumerate() {
         assert!(!out.tokens.is_empty());
-        assert_eq!(streamed[i], out.tokens, "row {i} streamed ids must reconstruct the output");
+        assert_eq!(
+            streamed[i], out.tokens,
+            "row {i} streamed ids must reconstruct the output"
+        );
     }
 }
 
@@ -159,7 +182,14 @@ fn batched_decode_is_reproducible() {
     let reqs = vec![
         request(&fx, &encode(&fx.tok, "Hi"), 24),
         request(&fx, &encode(&fx.tok, "The capital of France is"), 24),
-        request(&fx, &encode(&fx.tok, "Once upon a time in a small village there lived a curious"), 24),
+        request(
+            &fx,
+            &encode(
+                &fx.tok,
+                "Once upon a time in a small village there lived a curious",
+            ),
+            24,
+        ),
     ];
     let a = run_batch(&fx, &reqs);
     let b = run_batch(&fx, &reqs);
@@ -189,7 +219,10 @@ fn differing_lengths_complete_and_track_batch1() {
     let prompts = [
         encode(&fx.tok, "Hi"),
         encode(&fx.tok, "The capital of France is"),
-        encode(&fx.tok, "Once upon a time in a small village there lived a curious"),
+        encode(
+            &fx.tok,
+            "Once upon a time in a small village there lived a curious",
+        ),
     ];
     let lens: Vec<usize> = prompts.iter().map(|p| p.len()).collect();
     println!("prompt token lengths: {lens:?}");
@@ -202,7 +235,11 @@ fn differing_lengths_complete_and_track_batch1() {
     let exact = generate_continuous(
         &fx.model,
         &reqs,
-        &ContinuousConfig { max_batch: reqs.len(), block_size: 8, exactness: BatchExactness::Exact },
+        &ContinuousConfig {
+            max_batch: reqs.len(),
+            block_size: 8,
+            exactness: BatchExactness::Exact,
+        },
         &CancelFlag::new(),
         &mut |_, _| {},
     )
@@ -215,16 +252,37 @@ fn differing_lengths_complete_and_track_batch1() {
         let (single, single_fin) = &singles[i];
         assert!(!single.is_empty(), "row {i} should generate");
 
-        assert_eq!(&exact[i].tokens, single, "row {i} (len {}) Exact must equal batch-1", p.len());
-        assert_eq!(exact[i].finish_reason, *single_fin, "row {i} Exact finish reason");
+        assert_eq!(
+            &exact[i].tokens,
+            single,
+            "row {i} (len {}) Exact must equal batch-1",
+            p.len()
+        );
+        assert_eq!(
+            exact[i].finish_reason, *single_fin,
+            "row {i} Exact finish reason"
+        );
 
         let got = &batched[i].tokens;
         let cp = common_prefix(got, single);
-        let text = fx.tok.decode(&got.iter().map(|&x| x as u32).collect::<Vec<_>>(), true).unwrap();
-        println!("row {i} (len {}): generate_batch common prefix {cp}/{} :: {text}", p.len(), single.len());
+        let text = fx
+            .tok
+            .decode(&got.iter().map(|&x| x as u32).collect::<Vec<_>>(), true)
+            .unwrap();
+        println!(
+            "row {i} (len {}): generate_batch common prefix {cp}/{} :: {text}",
+            p.len(),
+            single.len()
+        );
         assert!(!got.is_empty(), "row {i} produced no tokens");
-        assert_eq!(batched[i].finish_reason, *single_fin, "row {i} generate_batch finish reason");
-        assert!(cp >= 1, "row {i} must agree with batch-1 on at least the prefill argmax");
+        assert_eq!(
+            batched[i].finish_reason, *single_fin,
+            "row {i} generate_batch finish reason"
+        );
+        assert!(
+            cp >= 1,
+            "row {i} must agree with batch-1 on at least the prefill argmax"
+        );
     }
 }
 
@@ -245,18 +303,33 @@ fn retirement_and_compaction_respects_budgets() {
     ];
     let budgets = [3usize, 8, 16]; // staggered ⇒ row 0 retires first, then row 1, then row 2
 
-    let reqs: Vec<BatchRequest> = prompts.iter().zip(budgets).map(|(p, b)| request(&fx, p, b)).collect();
+    let reqs: Vec<BatchRequest> = prompts
+        .iter()
+        .zip(budgets)
+        .map(|(p, b)| request(&fx, p, b))
+        .collect();
     let batched = generate_batch(&fx.model, &reqs, &CancelFlag::new(), &mut |_, _| {}).unwrap();
 
     for (i, p) in prompts.iter().enumerate() {
         let (single, single_fin) = run_single(&fx, p, budgets[i]);
-        assert_eq!(batched[i].finish_reason, single_fin, "row {i} finish reason");
+        assert_eq!(
+            batched[i].finish_reason, single_fin,
+            "row {i} finish reason"
+        );
         if single_fin == FinishReason::MaxTokens {
             // Structural: a length-bounded row generates exactly its budget regardless of batching.
-            assert_eq!(batched[i].tokens.len(), budgets[i], "row {i} should fill its budget");
+            assert_eq!(
+                batched[i].tokens.len(),
+                budgets[i],
+                "row {i} should fill its budget"
+            );
         }
         let cp = common_prefix(&batched[i].tokens, &single);
-        println!("row {i} (budget {}): common prefix {cp}/{}", budgets[i], single.len());
+        println!(
+            "row {i} (budget {}): common prefix {cp}/{}",
+            budgets[i],
+            single.len()
+        );
         assert!(cp >= 1, "row {i} must track its batch-1 run");
     }
 }
@@ -289,7 +362,14 @@ fn mid_stream_cancel_stops_the_batch() {
     .unwrap();
 
     for out in &batched {
-        assert_eq!(out.finish_reason, FinishReason::Cancelled, "cancelled rows finish Cancelled");
-        assert!(out.tokens.len() < 200, "cancel should stop well before the budget");
+        assert_eq!(
+            out.finish_reason,
+            FinishReason::Cancelled,
+            "cancelled rows finish Cancelled"
+        );
+        assert!(
+            out.tokens.len() < 200,
+            "cancel should stop well before the budget"
+        );
     }
 }

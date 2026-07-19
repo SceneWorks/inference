@@ -54,7 +54,11 @@ impl ImageRef {
                 pixels.len()
             ));
         }
-        Ok(Self { width, height, pixels })
+        Ok(Self {
+            width,
+            height,
+            pixels,
+        })
     }
 }
 

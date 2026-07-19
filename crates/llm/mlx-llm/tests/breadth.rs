@@ -48,7 +48,11 @@ fn assert_prefills_and_decodes(cfg: Value, weights: HashMap<String, Array>, fami
     let mut cache = model.new_cache();
 
     let logits = model.decode_logits(&ids, &mut cache, 0).unwrap();
-    assert_eq!(logits.shape(), &[1, vocab], "{family}: prefill logits shape");
+    assert_eq!(
+        logits.shape(),
+        &[1, vocab],
+        "{family}: prefill logits shape"
+    );
     let mut next = assert_finite_argmax(&logits, family);
 
     for step in 0..4 {
@@ -58,13 +62,20 @@ fn assert_prefills_and_decodes(cfg: Value, weights: HashMap<String, Array>, fami
         assert_eq!(logits.shape(), &[1, vocab], "{family}: decode logits shape");
         next = assert_finite_argmax(&logits, family);
     }
-    assert_eq!(cache.offset(), prompt.len() as i32 + 4, "{family}: cache grew per step");
+    assert_eq!(
+        cache.offset(),
+        prompt.len() as i32 + 4,
+        "{family}: cache grew per step"
+    );
 }
 
 fn assert_finite_argmax(logits: &Array, family: &str) -> i32 {
     let host = logits.as_dtype(Dtype::Float32).unwrap();
     let v = host.as_slice::<f32>();
-    assert!(v.iter().all(|x| x.is_finite()), "{family}: non-finite logits");
+    assert!(
+        v.iter().all(|x| x.is_finite()),
+        "{family}: non-finite logits"
+    );
     v.iter()
         .enumerate()
         .max_by(|a, b| a.1.total_cmp(b.1))
@@ -73,7 +84,12 @@ fn assert_finite_argmax(logits: &Array, family: &str) -> i32 {
 }
 
 /// Insert a dense gated MLP (`gate`/`up` `[inter, hidden]`, `down` `[hidden, inter]`).
-fn dense_mlp(m: &mut HashMap<String, Array>, p: &dyn Fn(&str) -> String, inter: i32, rng: &mut SplitMix64) {
+fn dense_mlp(
+    m: &mut HashMap<String, Array>,
+    p: &dyn Fn(&str) -> String,
+    inter: i32,
+    rng: &mut SplitMix64,
+) {
     m.insert(p("mlp.gate_proj.weight"), randn(&[inter, HIDDEN], rng));
     m.insert(p("mlp.up_proj.weight"), randn(&[inter, HIDDEN], rng));
     m.insert(p("mlp.down_proj.weight"), randn(&[HIDDEN, inter], rng));
@@ -92,16 +108,25 @@ fn phi3_prefills_and_decodes() {
     });
     let mut rng = SplitMix64::new(0x9117_3001);
     let mut m = HashMap::new();
-    m.insert("model.embed_tokens.weight".into(), randn(&[VOCAB, HIDDEN], &mut rng));
+    m.insert(
+        "model.embed_tokens.weight".into(),
+        randn(&[VOCAB, HIDDEN], &mut rng),
+    );
     m.insert("model.norm.weight".into(), ones(HIDDEN));
     m.insert("lm_head.weight".into(), randn(&[VOCAB, HIDDEN], &mut rng));
     for i in 0..LAYERS {
         let p = |s: &str| format!("model.layers.{i}.{s}");
         m.insert(p("input_layernorm.weight"), ones(HIDDEN));
         m.insert(p("post_attention_layernorm.weight"), ones(HIDDEN));
-        m.insert(p("self_attn.qkv_proj.weight"), randn(&[qd + 2 * kvd, HIDDEN], &mut rng));
+        m.insert(
+            p("self_attn.qkv_proj.weight"),
+            randn(&[qd + 2 * kvd, HIDDEN], &mut rng),
+        );
         m.insert(p("self_attn.o_proj.weight"), randn(&[HIDDEN, qd], &mut rng));
-        m.insert(p("mlp.gate_up_proj.weight"), randn(&[2 * inter, HIDDEN], &mut rng));
+        m.insert(
+            p("mlp.gate_up_proj.weight"),
+            randn(&[2 * inter, HIDDEN], &mut rng),
+        );
         m.insert(p("mlp.down_proj.weight"), randn(&[HIDDEN, inter], &mut rng));
     }
     assert_prefills_and_decodes(cfg, m, "phi3");
@@ -123,7 +148,10 @@ fn qwen2_moe_prefills_and_decodes() {
     });
     let mut rng = SplitMix64::new(0x9217_3002);
     let mut m = HashMap::new();
-    m.insert("model.embed_tokens.weight".into(), randn(&[VOCAB, HIDDEN], &mut rng));
+    m.insert(
+        "model.embed_tokens.weight".into(),
+        randn(&[VOCAB, HIDDEN], &mut rng),
+    );
     m.insert("model.norm.weight".into(), ones(HIDDEN));
     m.insert("lm_head.weight".into(), randn(&[VOCAB, HIDDEN], &mut rng));
     for i in 0..LAYERS {
@@ -133,23 +161,47 @@ fn qwen2_moe_prefills_and_decodes() {
         // q/k/v carry bias (Qwen2); o_proj has none.
         m.insert(p("self_attn.q_proj.weight"), randn(&[qd, HIDDEN], &mut rng));
         m.insert(p("self_attn.q_proj.bias"), randn(&[qd], &mut rng));
-        m.insert(p("self_attn.k_proj.weight"), randn(&[kvd, HIDDEN], &mut rng));
+        m.insert(
+            p("self_attn.k_proj.weight"),
+            randn(&[kvd, HIDDEN], &mut rng),
+        );
         m.insert(p("self_attn.k_proj.bias"), randn(&[kvd], &mut rng));
-        m.insert(p("self_attn.v_proj.weight"), randn(&[kvd, HIDDEN], &mut rng));
+        m.insert(
+            p("self_attn.v_proj.weight"),
+            randn(&[kvd, HIDDEN], &mut rng),
+        );
         m.insert(p("self_attn.v_proj.bias"), randn(&[kvd], &mut rng));
         m.insert(p("self_attn.o_proj.weight"), randn(&[HIDDEN, qd], &mut rng));
         // MoE FFN: router + routed experts + a sigmoid-gated shared expert.
         m.insert(p("mlp.gate.weight"), randn(&[n_exp, HIDDEN], &mut rng));
         for e in 0..n_exp {
             let ep = |s: &str| format!("model.layers.{i}.mlp.experts.{e}.{s}");
-            m.insert(ep("gate_proj.weight"), randn(&[moe_inter, HIDDEN], &mut rng));
+            m.insert(
+                ep("gate_proj.weight"),
+                randn(&[moe_inter, HIDDEN], &mut rng),
+            );
             m.insert(ep("up_proj.weight"), randn(&[moe_inter, HIDDEN], &mut rng));
-            m.insert(ep("down_proj.weight"), randn(&[HIDDEN, moe_inter], &mut rng));
+            m.insert(
+                ep("down_proj.weight"),
+                randn(&[HIDDEN, moe_inter], &mut rng),
+            );
         }
-        m.insert(p("mlp.shared_expert.gate_proj.weight"), randn(&[shared_inter, HIDDEN], &mut rng));
-        m.insert(p("mlp.shared_expert.up_proj.weight"), randn(&[shared_inter, HIDDEN], &mut rng));
-        m.insert(p("mlp.shared_expert.down_proj.weight"), randn(&[HIDDEN, shared_inter], &mut rng));
-        m.insert(p("mlp.shared_expert_gate.weight"), randn(&[1, HIDDEN], &mut rng));
+        m.insert(
+            p("mlp.shared_expert.gate_proj.weight"),
+            randn(&[shared_inter, HIDDEN], &mut rng),
+        );
+        m.insert(
+            p("mlp.shared_expert.up_proj.weight"),
+            randn(&[shared_inter, HIDDEN], &mut rng),
+        );
+        m.insert(
+            p("mlp.shared_expert.down_proj.weight"),
+            randn(&[HIDDEN, shared_inter], &mut rng),
+        );
+        m.insert(
+            p("mlp.shared_expert_gate.weight"),
+            randn(&[1, HIDDEN], &mut rng),
+        );
     }
     assert_prefills_and_decodes(cfg, m, "qwen2_moe");
 }
@@ -171,7 +223,10 @@ fn gemma2_prefills_and_decodes() {
     });
     let mut rng = SplitMix64::new(0x9317_3003);
     let mut m = HashMap::new();
-    m.insert("model.embed_tokens.weight".into(), randn(&[VOCAB, HIDDEN], &mut rng));
+    m.insert(
+        "model.embed_tokens.weight".into(),
+        randn(&[VOCAB, HIDDEN], &mut rng),
+    );
     m.insert("model.norm.weight".into(), ones(HIDDEN));
     for i in 0..LAYERS {
         let p = |s: &str| format!("model.layers.{i}.{s}");
@@ -181,8 +236,14 @@ fn gemma2_prefills_and_decodes() {
         m.insert(p("pre_feedforward_layernorm.weight"), ones(HIDDEN));
         m.insert(p("post_feedforward_layernorm.weight"), ones(HIDDEN));
         m.insert(p("self_attn.q_proj.weight"), randn(&[qd, HIDDEN], &mut rng));
-        m.insert(p("self_attn.k_proj.weight"), randn(&[kvd, HIDDEN], &mut rng));
-        m.insert(p("self_attn.v_proj.weight"), randn(&[kvd, HIDDEN], &mut rng));
+        m.insert(
+            p("self_attn.k_proj.weight"),
+            randn(&[kvd, HIDDEN], &mut rng),
+        );
+        m.insert(
+            p("self_attn.v_proj.weight"),
+            randn(&[kvd, HIDDEN], &mut rng),
+        );
         m.insert(p("self_attn.o_proj.weight"), randn(&[HIDDEN, qd], &mut rng));
         dense_mlp(&mut m, &p, inter, &mut rng);
     }
@@ -204,7 +265,10 @@ fn glm4_prefills_and_decodes() {
     });
     let mut rng = SplitMix64::new(0x9417_3004);
     let mut m = HashMap::new();
-    m.insert("model.embed_tokens.weight".into(), randn(&[VOCAB, HIDDEN], &mut rng));
+    m.insert(
+        "model.embed_tokens.weight".into(),
+        randn(&[VOCAB, HIDDEN], &mut rng),
+    );
     m.insert("model.norm.weight".into(), ones(HIDDEN));
     m.insert("lm_head.weight".into(), randn(&[VOCAB, HIDDEN], &mut rng));
     for i in 0..LAYERS {
@@ -217,13 +281,22 @@ fn glm4_prefills_and_decodes() {
         // q/k/v carry bias (GLM-4); o_proj has none.
         m.insert(p("self_attn.q_proj.weight"), randn(&[qd, HIDDEN], &mut rng));
         m.insert(p("self_attn.q_proj.bias"), randn(&[qd], &mut rng));
-        m.insert(p("self_attn.k_proj.weight"), randn(&[kvd, HIDDEN], &mut rng));
+        m.insert(
+            p("self_attn.k_proj.weight"),
+            randn(&[kvd, HIDDEN], &mut rng),
+        );
         m.insert(p("self_attn.k_proj.bias"), randn(&[kvd], &mut rng));
-        m.insert(p("self_attn.v_proj.weight"), randn(&[kvd, HIDDEN], &mut rng));
+        m.insert(
+            p("self_attn.v_proj.weight"),
+            randn(&[kvd, HIDDEN], &mut rng),
+        );
         m.insert(p("self_attn.v_proj.bias"), randn(&[kvd], &mut rng));
         m.insert(p("self_attn.o_proj.weight"), randn(&[HIDDEN, qd], &mut rng));
         // Packed gate_up.
-        m.insert(p("mlp.gate_up_proj.weight"), randn(&[2 * inter, HIDDEN], &mut rng));
+        m.insert(
+            p("mlp.gate_up_proj.weight"),
+            randn(&[2 * inter, HIDDEN], &mut rng),
+        );
         m.insert(p("mlp.down_proj.weight"), randn(&[HIDDEN, inter], &mut rng));
     }
     assert_prefills_and_decodes(cfg, m, "glm4");
@@ -261,7 +334,10 @@ fn qwen3vl_prefills_decodes_and_fuses_deepstack() {
     let mut rng = SplitMix64::new(0x9617_3006);
     let mut m = HashMap::new();
     // VLM-nested layout: decoder under `model.language_model.*`, `lm_head.weight` at the root.
-    m.insert("model.language_model.embed_tokens.weight".into(), randn(&[VOCAB, HIDDEN], &mut rng));
+    m.insert(
+        "model.language_model.embed_tokens.weight".into(),
+        randn(&[VOCAB, HIDDEN], &mut rng),
+    );
     m.insert("model.language_model.norm.weight".into(), ones(HIDDEN));
     m.insert("lm_head.weight".into(), randn(&[VOCAB, HIDDEN], &mut rng));
     for i in 0..LAYERS {
@@ -269,8 +345,14 @@ fn qwen3vl_prefills_decodes_and_fuses_deepstack() {
         m.insert(p("input_layernorm.weight"), ones(HIDDEN));
         m.insert(p("post_attention_layernorm.weight"), ones(HIDDEN));
         m.insert(p("self_attn.q_proj.weight"), randn(&[qd, HIDDEN], &mut rng));
-        m.insert(p("self_attn.k_proj.weight"), randn(&[kvd, HIDDEN], &mut rng));
-        m.insert(p("self_attn.v_proj.weight"), randn(&[kvd, HIDDEN], &mut rng));
+        m.insert(
+            p("self_attn.k_proj.weight"),
+            randn(&[kvd, HIDDEN], &mut rng),
+        );
+        m.insert(
+            p("self_attn.v_proj.weight"),
+            randn(&[kvd, HIDDEN], &mut rng),
+        );
         m.insert(p("self_attn.o_proj.weight"), randn(&[HIDDEN, qd], &mut rng));
         m.insert(p("self_attn.q_norm.weight"), ones(HEAD_DIM)); // per-head q/k norm (Qwen3)
         m.insert(p("self_attn.k_norm.weight"), ones(HEAD_DIM));
@@ -286,7 +368,12 @@ fn qwen3vl_prefills_decodes_and_fuses_deepstack() {
     let mut cache = model.new_cache();
     let logits = model.decode_logits(&ids, &mut cache, 0).unwrap();
     assert_eq!(logits.shape(), &[1, VOCAB], "qwen3_vl prefill logits shape");
-    assert!(logits.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>().iter().all(|x| x.is_finite()));
+    assert!(logits
+        .as_dtype(Dtype::Float32)
+        .unwrap()
+        .as_slice::<f32>()
+        .iter()
+        .all(|x| x.is_finite()));
 
     // (b) Text-only invariant: the interleaved-M-RoPE + DeepStack prefill with **equal** t/h/w rows
     // and an **empty** deepstack must be bit-identical to the plain 1-D-RoPE prefill.
@@ -294,7 +381,9 @@ fn qwen3vl_prefills_decodes_and_fuses_deepstack() {
     let pos: Vec<i32> = (0..s).collect();
     let embeds = model.embed_input_ids(&ids).unwrap();
     let mut cache_a = model.new_cache();
-    let plain = model.decode_logits_from_embeds(&embeds, &mut cache_a, 0).unwrap();
+    let plain = model
+        .decode_logits_from_embeds(&embeds, &mut cache_a, 0)
+        .unwrap();
     let mut cache_b = model.new_cache();
     let visual_mask = vec![false; s as usize];
     let mrope = model
@@ -314,7 +403,10 @@ fn qwen3vl_prefills_decodes_and_fuses_deepstack() {
         .zip(mb.as_slice::<f32>())
         .map(|(a, b)| (a - b).abs())
         .fold(0.0f32, f32::max);
-    assert!(max_diff < 1e-4, "text-only M-RoPE must equal plain RoPE, max diff {max_diff}");
+    assert!(
+        max_diff < 1e-4,
+        "text-only M-RoPE must equal plain RoPE, max diff {max_diff}"
+    );
 
     // (c) Image path: expand a single image placeholder to its merged-token count, splice synthetic
     // features, compute interleaved-M-RoPE 3-D positions, and run the DeepStack-fused prefill. A 2×2
@@ -331,17 +423,27 @@ fn qwen3vl_prefills_decodes_and_fuses_deepstack() {
     assert_eq!(expanded.len(), raw.len() - 1 + count);
     let visual_pos_mask: Vec<bool> = expanded.iter().map(|&id| id == img_id).collect();
 
-    let features = randn(&[count as i32, HIDDEN], &mut rng).as_dtype(Dtype::Bfloat16).unwrap();
+    let features = randn(&[count as i32, HIDDEN], &mut rng)
+        .as_dtype(Dtype::Bfloat16)
+        .unwrap();
     let exp_ids = input_ids(&expanded);
     let img_embeds = model.embed_input_ids(&exp_ids).unwrap();
-    let spliced = model.splice_image_features(&img_embeds, &expanded, &features, img_id).unwrap();
-    let (t, h, w, delta) = model.mrope_positions(&expanded, &[grid], img_id, merge).unwrap();
+    let spliced = model
+        .splice_image_features(&img_embeds, &expanded, &features, img_id)
+        .unwrap();
+    let (t, h, w, delta) = model
+        .mrope_positions(&expanded, &[grid], img_id, merge)
+        .unwrap();
     assert_eq!(t.len(), expanded.len());
 
     // Two synthetic DeepStack taps (one per decoder layer), each [count, hidden].
     let deepstack = vec![
-        randn(&[count as i32, HIDDEN], &mut rng).as_dtype(Dtype::Bfloat16).unwrap(),
-        randn(&[count as i32, HIDDEN], &mut rng).as_dtype(Dtype::Bfloat16).unwrap(),
+        randn(&[count as i32, HIDDEN], &mut rng)
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap(),
+        randn(&[count as i32, HIDDEN], &mut rng)
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap(),
     ];
     let mut cache_img = model.new_cache();
     let img_logits = model
@@ -353,8 +455,17 @@ fn qwen3vl_prefills_decodes_and_fuses_deepstack() {
             &deepstack,
         )
         .unwrap();
-    assert_eq!(img_logits.shape(), &[1, VOCAB], "qwen3_vl image prefill logits shape");
-    assert!(img_logits.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>().iter().all(|x| x.is_finite()));
+    assert_eq!(
+        img_logits.shape(),
+        &[1, VOCAB],
+        "qwen3_vl image prefill logits shape"
+    );
+    assert!(img_logits
+        .as_dtype(Dtype::Float32)
+        .unwrap()
+        .as_slice::<f32>()
+        .iter()
+        .all(|x| x.is_finite()));
 
     // DeepStack fusion must change the output vs. an empty deepstack (the features are added in).
     let mut cache_nods = model.new_cache();
@@ -375,7 +486,10 @@ fn qwen3vl_prefills_decodes_and_fuses_deepstack() {
         .zip(no_ds.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>())
         .map(|(a, b)| (a - b).abs())
         .fold(0.0f32, f32::max);
-    assert!(diff > 1e-3, "DeepStack fusion must change the logits, max diff {diff}");
+    assert!(
+        diff > 1e-3,
+        "DeepStack fusion must change the logits, max diff {diff}"
+    );
 
     // The continuation decode uses `cache_len + mrope_delta` as the M-RoPE position (image tokens
     // compress the cursor, so `delta` may be negative). It must run and yield finite logits.
@@ -383,8 +497,17 @@ fn qwen3vl_prefills_decodes_and_fuses_deepstack() {
     let cont = model
         .decode_logits(&next, &mut cache_img, expanded.len() as i32 + delta)
         .unwrap();
-    assert_eq!(cont.shape(), &[1, VOCAB], "qwen3_vl continuation logits shape");
-    assert!(cont.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>().iter().all(|x| x.is_finite()));
+    assert_eq!(
+        cont.shape(),
+        &[1, VOCAB],
+        "qwen3_vl continuation logits shape"
+    );
+    assert!(cont
+        .as_dtype(Dtype::Float32)
+        .unwrap()
+        .as_slice::<f32>()
+        .iter()
+        .all(|x| x.is_finite()));
 }
 
 /// DeepSeek-V2: Multi-head Latent Attention (full `q_proj`, low-rank KV path, decoupled YaRN RoPE)
@@ -409,7 +532,10 @@ fn deepseek_v2_prefills_and_decodes() {
     });
     let mut rng = SplitMix64::new(0x9517_3005);
     let mut m = HashMap::new();
-    m.insert("model.embed_tokens.weight".into(), randn(&[VOCAB, HIDDEN], &mut rng));
+    m.insert(
+        "model.embed_tokens.weight".into(),
+        randn(&[VOCAB, HIDDEN], &mut rng),
+    );
     m.insert("model.norm.weight".into(), ones(HIDDEN));
     m.insert("lm_head.weight".into(), randn(&[VOCAB, HIDDEN], &mut rng));
     for i in 0..LAYERS {
@@ -417,11 +543,23 @@ fn deepseek_v2_prefills_and_decodes() {
         m.insert(p("input_layernorm.weight"), ones(HIDDEN));
         m.insert(p("post_attention_layernorm.weight"), ones(HIDDEN));
         // MLA projections (full q_proj — DeepSeek-V2-Lite shape).
-        m.insert(p("self_attn.q_proj.weight"), randn(&[heads * q_head, HIDDEN], &mut rng));
-        m.insert(p("self_attn.kv_a_proj_with_mqa.weight"), randn(&[kv_lora + qk_rope, HIDDEN], &mut rng));
+        m.insert(
+            p("self_attn.q_proj.weight"),
+            randn(&[heads * q_head, HIDDEN], &mut rng),
+        );
+        m.insert(
+            p("self_attn.kv_a_proj_with_mqa.weight"),
+            randn(&[kv_lora + qk_rope, HIDDEN], &mut rng),
+        );
         m.insert(p("self_attn.kv_a_layernorm.weight"), ones(kv_lora));
-        m.insert(p("self_attn.kv_b_proj.weight"), randn(&[heads * (qk_nope + v_head), kv_lora], &mut rng));
-        m.insert(p("self_attn.o_proj.weight"), randn(&[HIDDEN, heads * v_head], &mut rng));
+        m.insert(
+            p("self_attn.kv_b_proj.weight"),
+            randn(&[heads * (qk_nope + v_head), kv_lora], &mut rng),
+        );
+        m.insert(
+            p("self_attn.o_proj.weight"),
+            randn(&[HIDDEN, heads * v_head], &mut rng),
+        );
         if i == 0 {
             // Leading dense layer (first_k_dense_replace = 1).
             dense_mlp(&mut m, &p, dense_inter, &mut rng);
@@ -430,14 +568,29 @@ fn deepseek_v2_prefills_and_decodes() {
             m.insert(p("mlp.gate.weight"), randn(&[n_routed, HIDDEN], &mut rng));
             for e in 0..n_routed {
                 let ep = |s: &str| format!("model.layers.{i}.mlp.experts.{e}.{s}");
-                m.insert(ep("gate_proj.weight"), randn(&[moe_inter, HIDDEN], &mut rng));
+                m.insert(
+                    ep("gate_proj.weight"),
+                    randn(&[moe_inter, HIDDEN], &mut rng),
+                );
                 m.insert(ep("up_proj.weight"), randn(&[moe_inter, HIDDEN], &mut rng));
-                m.insert(ep("down_proj.weight"), randn(&[HIDDEN, moe_inter], &mut rng));
+                m.insert(
+                    ep("down_proj.weight"),
+                    randn(&[HIDDEN, moe_inter], &mut rng),
+                );
             }
             let shared_inter = n_shared * moe_inter;
-            m.insert(p("mlp.shared_experts.gate_proj.weight"), randn(&[shared_inter, HIDDEN], &mut rng));
-            m.insert(p("mlp.shared_experts.up_proj.weight"), randn(&[shared_inter, HIDDEN], &mut rng));
-            m.insert(p("mlp.shared_experts.down_proj.weight"), randn(&[HIDDEN, shared_inter], &mut rng));
+            m.insert(
+                p("mlp.shared_experts.gate_proj.weight"),
+                randn(&[shared_inter, HIDDEN], &mut rng),
+            );
+            m.insert(
+                p("mlp.shared_experts.up_proj.weight"),
+                randn(&[shared_inter, HIDDEN], &mut rng),
+            );
+            m.insert(
+                p("mlp.shared_experts.down_proj.weight"),
+                randn(&[HIDDEN, shared_inter], &mut rng),
+            );
         }
     }
     assert_prefills_and_decodes(cfg, m, "deepseek_v2");

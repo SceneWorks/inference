@@ -96,7 +96,11 @@ impl ThinkingSegmenter {
         let mut spans: Vec<ThinkingSpan> = Vec::new();
         loop {
             let channel = self.channel();
-            let marker = if self.in_thinking { &self.close } else { &self.open };
+            let marker = if self.in_thinking {
+                &self.close
+            } else {
+                &self.open
+            };
             if let Some(pos) = self.pending.find(marker.as_str()) {
                 // Emit any text before the marker in the current channel, drop the marker, toggle.
                 if pos > 0 {
@@ -200,7 +204,8 @@ mod tests {
 
     #[test]
     fn block_spread_across_deltas() {
-        let (content, thinking, _) = run(&["<think>", "step 1 ", "step 2", "</think>", "the answer"]);
+        let (content, thinking, _) =
+            run(&["<think>", "step 1 ", "step 2", "</think>", "the answer"]);
         assert_eq!(thinking, "step 1 step 2");
         assert_eq!(content, "the answer");
     }
@@ -286,8 +291,14 @@ mod tests {
         assert_eq!(
             spans,
             vec![
-                ThinkingSpan { channel: Channel::Thinking, text: "why".into() },
-                ThinkingSpan { channel: Channel::Content, text: "ok".into() },
+                ThinkingSpan {
+                    channel: Channel::Thinking,
+                    text: "why".into()
+                },
+                ThinkingSpan {
+                    channel: Channel::Content,
+                    text: "ok".into()
+                },
             ]
         );
     }

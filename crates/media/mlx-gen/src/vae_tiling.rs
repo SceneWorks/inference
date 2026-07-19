@@ -54,7 +54,6 @@ pub fn check_output_writable(full_elems: i64, out_f: i32, out_h: i32, out_w: i32
     Ok(())
 }
 
-
 /// Gather the contiguous range `[start, end)` along `axis` (mlx-rs has no slice op). Layout-agnostic.
 fn slice_axis(x: &Array, axis: i32, start: i32, end: i32) -> Result<Array> {
     let idx: Vec<i32> = (start..end).collect();
@@ -348,7 +347,10 @@ mod tests {
         // out_f=1, out_h=out_w=27_000 → 3·1·27000·27000 = 2.187e9 = 1.019× i32::MAX (in the probed band).
         // The h/w tiles place the 4-wide identity-decoded tile at offset 0; the rest is zero-padded.
         let out_hw = 27_000i32;
-        assert!(3 * (out_hw as i64) * (out_hw as i64) > I32_MAX, "geometry must cross the bound");
+        assert!(
+            3 * (out_hw as i64) * (out_hw as i64) > I32_MAX,
+            "geometry must cross the bound"
+        );
         let plan = TilePlan {
             t: vec![AxisTile {
                 start: 0,
@@ -371,7 +373,8 @@ mod tests {
         let flat = out.as_slice::<f32>();
         assert_eq!(flat.len() as i64, 3 * out_hw as i64 * out_hw as i64);
         // Placed region: [0,c,0,h,w] at flat ((c*out_hw + h)*out_hw + w) must equal the identity latent.
-        let at = |c: i64, h: i64, w: i64| flat[((c * out_hw as i64 + h) * out_hw as i64 + w) as usize];
+        let at =
+            |c: i64, h: i64, w: i64| flat[((c * out_hw as i64 + h) * out_hw as i64 + w) as usize];
         for c in 0..3i64 {
             for h in 0..4i64 {
                 for w in 0..4i64 {
@@ -387,7 +390,15 @@ mod tests {
         // An above-2^31 flat offset (c=2 is beyond ~1.46e9; h=w=13000 → offset ≈ 1.81e9; and the very
         // last element at ≈2.187e9) must read back as the zero pad, proving the >i32::MAX region is
         // addressed correctly, not aliased onto the placed tile.
-        assert_eq!(at(2, 13_000, 13_000), 0.0, "over-bound zero-pad region must read 0");
-        assert_eq!(flat[(3 * out_hw as i64 * out_hw as i64 - 1) as usize], 0.0, "last (>2^31) elem");
+        assert_eq!(
+            at(2, 13_000, 13_000),
+            0.0,
+            "over-bound zero-pad region must read 0"
+        );
+        assert_eq!(
+            flat[(3 * out_hw as i64 * out_hw as i64 - 1) as usize],
+            0.0,
+            "last (>2^31) elem"
+        );
     }
 }

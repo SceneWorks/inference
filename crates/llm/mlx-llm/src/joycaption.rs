@@ -99,7 +99,8 @@ pub struct LlavaProjector {
 impl LlavaProjector {
     /// Load HF `multi_modal_projector.{linear_1,linear_2}.{weight,bias}` (cast to bf16).
     pub fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
-        let bf16 = |key: String| -> Result<Array> { Ok(w.require(&key)?.as_dtype(Dtype::Bfloat16)?) };
+        let bf16 =
+            |key: String| -> Result<Array> { Ok(w.require(&key)?.as_dtype(Dtype::Bfloat16)?) };
         Ok(Self {
             linear1_w: bf16(format!("{prefix}.linear_1.weight"))?,
             linear1_b: bf16(format!("{prefix}.linear_1.bias"))?,
@@ -214,8 +215,11 @@ impl JoyCaptionModel {
 
         let w = Weights::from_dir(dir)?;
         let language = CausalLm::from_weights(&w, "language_model", llama_cfg)?;
-        let vision =
-            SiglipVisionTower::from_weights(&w, "vision_tower.vision_model", SiglipVisionConfig::default())?;
+        let vision = SiglipVisionTower::from_weights(
+            &w,
+            "vision_tower.vision_model",
+            SiglipVisionConfig::default(),
+        )?;
         let projector = LlavaProjector::from_weights(&w, "multi_modal_projector")?;
         Ok(Self {
             vision,
@@ -272,7 +276,9 @@ impl JoyCaptionModel {
         let mut history = expanded.clone();
         let mut generated: Vec<i32> = Vec::new();
         let prompt_len = expanded.len() as i32;
-        let mut logits = self.language.decode_logits_from_embeds(&spliced, &mut cache, 0)?;
+        let mut logits = self
+            .language
+            .decode_logits_from_embeds(&spliced, &mut cache, 0)?;
         let mut finish = FinishReason::MaxTokens;
 
         for step in 0..max_new_tokens {
@@ -292,7 +298,9 @@ impl JoyCaptionModel {
                 break;
             }
             let tok = input_ids(&[next]);
-            logits = self.language.decode_logits(&tok, &mut cache, prompt_len + step as i32)?;
+            logits = self
+                .language
+                .decode_logits(&tok, &mut cache, prompt_len + step as i32)?;
         }
 
         Ok(JoyGeneration {
@@ -328,7 +336,10 @@ impl JoyCaptionProvider {
     }
 
     /// Render the request's messages into the model's LLaVA chat prompt + the single image.
-    fn build_inputs<'a>(&self, req: &'a TextLlmRequest) -> CoreResult<(String, &'a core_llm::ImageRef)> {
+    fn build_inputs<'a>(
+        &self,
+        req: &'a TextLlmRequest,
+    ) -> CoreResult<(String, &'a core_llm::ImageRef)> {
         let mut image = None;
         let mut user_text = String::new();
         let mut system = None;
@@ -356,9 +367,13 @@ impl JoyCaptionProvider {
                 }
             }
         }
-        let image = image.ok_or_else(|| CoreError::InvalidRequest("joycaption: request has no image".into()))?;
+        let image = image
+            .ok_or_else(|| CoreError::InvalidRequest("joycaption: request has no image".into()))?;
         let system = system.unwrap_or_else(|| SYSTEM_PROMPT.to_string());
-        Ok((build_chat_text_with_system(&user_text, &system, DEFAULT_DATE_STRING, true), image))
+        Ok((
+            build_chat_text_with_system(&user_text, &system, DEFAULT_DATE_STRING, true),
+            image,
+        ))
     }
 }
 
@@ -368,7 +383,9 @@ impl TextLlm for JoyCaptionProvider {
     }
 
     fn validate(&self, req: &TextLlmRequest) -> CoreResult<()> {
-        self.descriptor.capabilities.validate_request(&self.descriptor.id, req)
+        self.descriptor
+            .capabilities
+            .validate_request(&self.descriptor.id, req)
     }
 
     fn generate(
@@ -524,7 +541,11 @@ fn load_registered(spec: &LoadSpec) -> CoreResult<Box<dyn TextLlm>> {
 /// tower) — which `JoyCaptionModel::from_dir` requires. Never opens a safetensors shard.
 pub fn can_load(spec: &LoadSpec) -> bool {
     let dir = Path::new(&spec.source);
-    let path = if dir.is_dir() { dir.join("config.json") } else { dir.to_path_buf() };
+    let path = if dir.is_dir() {
+        dir.join("config.json")
+    } else {
+        dir.to_path_buf()
+    };
     let Ok(text) = std::fs::read_to_string(path) else {
         return false;
     };
@@ -604,7 +625,9 @@ mod tests {
         let expanded = expand_image_tokens(&ids);
         assert_eq!(expanded.len(), 2 + IMAGE_SEQ_LENGTH);
         assert_eq!(expanded[0], 1);
-        assert!(expanded[1..1 + IMAGE_SEQ_LENGTH].iter().all(|&t| t == IMAGE_TOKEN_ID));
+        assert!(expanded[1..1 + IMAGE_SEQ_LENGTH]
+            .iter()
+            .all(|&t| t == IMAGE_TOKEN_ID));
         assert_eq!(*expanded.last().unwrap(), 2);
     }
 
@@ -623,11 +646,15 @@ mod tests {
     #[test]
     fn splice_replaces_only_image_rows() {
         // [1,4,2]: rows for ids [5, IMG, IMG, 6]; features [1,2,2].
-        let embeds = Array::from_slice(&[1.0f32, 1.0, 10.0, 10.0, 20.0, 20.0, 2.0, 2.0], &[1, 4, 2]);
+        let embeds =
+            Array::from_slice(&[1.0f32, 1.0, 10.0, 10.0, 20.0, 20.0, 2.0, 2.0], &[1, 4, 2]);
         let ids = [5, IMAGE_TOKEN_ID, IMAGE_TOKEN_ID, 6];
         let features = Array::from_slice(&[100.0f32, 101.0, 200.0, 201.0], &[1, 2, 2]);
         let got = splice_image_features(&embeds, &ids, &features).unwrap();
-        assert_eq!(got.as_slice::<f32>(), &[1.0, 1.0, 100.0, 101.0, 200.0, 201.0, 2.0, 2.0]);
+        assert_eq!(
+            got.as_slice::<f32>(),
+            &[1.0, 1.0, 100.0, 101.0, 200.0, 201.0, 2.0, 2.0]
+        );
     }
 
     #[test]

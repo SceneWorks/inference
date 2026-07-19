@@ -387,8 +387,7 @@ pub fn write_hf_snapshot(
 fn write_json_string(path: &Path, value: &Value) -> Result<()> {
     let text = serde_json::to_string_pretty(value)
         .map_err(|e| Error::Msg(format!("serialize {}: {e}", path.display())))?;
-    std::fs::write(path, text)
-        .map_err(|e| Error::Msg(format!("write {}: {e}", path.display())))?;
+    std::fs::write(path, text).map_err(|e| Error::Msg(format!("write {}: {e}", path.display())))?;
     Ok(())
 }
 
@@ -427,12 +426,21 @@ mod tests {
         let mut rng = SplitMix64::new(0xABCDEF);
         let mut t: Vec<(String, Array)> = Vec::new();
         t.push(("model.embed_tokens.weight".into(), randn(&[v, h], &mut rng)));
-        t.push(("model.norm.weight".into(), Array::ones::<f32>(&[h]).unwrap()));
+        t.push((
+            "model.norm.weight".into(),
+            Array::ones::<f32>(&[h]).unwrap(),
+        ));
         t.push(("lm_head.weight".into(), randn(&[v, h], &mut rng)));
         for i in 0..layers {
             let p = |s: &str| format!("model.layers.{i}.{s}");
-            t.push((p("input_layernorm.weight"), Array::ones::<f32>(&[h]).unwrap()));
-            t.push((p("post_attention_layernorm.weight"), Array::ones::<f32>(&[h]).unwrap()));
+            t.push((
+                p("input_layernorm.weight"),
+                Array::ones::<f32>(&[h]).unwrap(),
+            ));
+            t.push((
+                p("post_attention_layernorm.weight"),
+                Array::ones::<f32>(&[h]).unwrap(),
+            ));
             t.push((p("self_attn.q_proj.weight"), randn(&[qd, h], &mut rng)));
             t.push((p("self_attn.k_proj.weight"), randn(&[kvd, h], &mut rng)));
             t.push((p("self_attn.v_proj.weight"), randn(&[kvd, h], &mut rng)));
@@ -511,7 +519,10 @@ mod tests {
             ("model.layers.0.mlp.shared_expert_gate.weight", &m),
             ("model.layers.0.self_attn.q_proj.bias", &v),
             ("model.layers.0.input_layernorm.weight", &v),
-            ("vision_tower.vision_model.encoder.layers.0.self_attn.out_proj.weight", &m),
+            (
+                "vision_tower.vision_model.encoder.layers.0.self_attn.out_proj.weight",
+                &m,
+            ),
             ("model.visual.blocks.0.mlp.linear_fc1.weight", &m),
         ] {
             assert!(!is_unrecognized_projection(k, a), "{k} must not be flagged");
@@ -528,7 +539,8 @@ mod tests {
             .map(|(k, a)| (k.clone(), bytes_of(a)))
             .collect();
 
-        let report = write_snapshot(&dir, tensors, config, &SnapshotTokenizer::default(), None).unwrap();
+        let report =
+            write_snapshot(&dir, tensors, config, &SnapshotTokenizer::default(), None).unwrap();
         assert_eq!(report.quantized, None);
 
         let reloaded = Weights::from_dir(&dir).unwrap();
@@ -551,7 +563,14 @@ mod tests {
         let (tensors, config) = tiny_model();
         let spec = QuantSpec::q8();
 
-        let report = write_snapshot(&dir, tensors, config, &SnapshotTokenizer::default(), Some(spec)).unwrap();
+        let report = write_snapshot(
+            &dir,
+            tensors,
+            config,
+            &SnapshotTokenizer::default(),
+            Some(spec),
+        )
+        .unwrap();
         assert_eq!(report.quantized, Some(spec));
         assert_eq!(report.quantized_projections, 14, "2 layers × 7 projections");
 
@@ -561,10 +580,17 @@ mod tests {
         assert!(w.contains(&format!("{base}.weight")));
         assert!(w.contains(&format!("{base}.scales")));
         assert!(w.contains(&format!("{base}.biases")));
-        assert!(!w.contains("model.embed_tokens.scales"), "embeddings stay dense");
+        assert!(
+            !w.contains("model.embed_tokens.scales"),
+            "embeddings stay dense"
+        );
 
         let cfg = ModelConfig::from_dir(&dir).unwrap();
-        assert_eq!(cfg.quantization, Some(spec), "config carries quantization block");
+        assert_eq!(
+            cfg.quantization,
+            Some(spec),
+            "config carries quantization block"
+        );
 
         // Loads through `from_weights` (no load-time quant) as a quantized model and runs.
         let model = CausalLm::from_weights(&w, "", cfg).unwrap();
@@ -586,7 +612,11 @@ mod tests {
             .iter()
             .map(|(k, a)| (k.clone(), bytes_of(a)))
             .collect();
-        std::fs::write(src.join("config.json"), serde_json::to_string_pretty(&config).unwrap()).unwrap();
+        std::fs::write(
+            src.join("config.json"),
+            serde_json::to_string_pretty(&config).unwrap(),
+        )
+        .unwrap();
         std::fs::write(src.join("tokenizer.json"), "{\"tok\":true}").unwrap();
         std::fs::write(src.join("tokenizer_config.json"), "{\"cfg\":true}").unwrap();
         let refs: Vec<(&str, &Array)> = tensors.iter().map(|(k, a)| (k.as_str(), a)).collect();
@@ -597,10 +627,17 @@ mod tests {
 
         let reloaded = Weights::from_dir(&out).unwrap();
         for (k, want) in &original {
-            assert_eq!(&bytes_of(reloaded.require(k).unwrap()), want, "tensor {k} bit-identical");
+            assert_eq!(
+                &bytes_of(reloaded.require(k).unwrap()),
+                want,
+                "tensor {k} bit-identical"
+            );
         }
         // Tokenizer files copied verbatim.
-        assert_eq!(std::fs::read_to_string(out.join("tokenizer.json")).unwrap(), "{\"tok\":true}");
+        assert_eq!(
+            std::fs::read_to_string(out.join("tokenizer.json")).unwrap(),
+            "{\"tok\":true}"
+        );
         assert_eq!(
             std::fs::read_to_string(out.join("tokenizer_config.json")).unwrap(),
             "{\"cfg\":true}"
@@ -619,7 +656,11 @@ mod tests {
         std::fs::create_dir_all(&src).unwrap();
 
         let (tensors, config) = tiny_model();
-        std::fs::write(src.join("config.json"), serde_json::to_string_pretty(&config).unwrap()).unwrap();
+        std::fs::write(
+            src.join("config.json"),
+            serde_json::to_string_pretty(&config).unwrap(),
+        )
+        .unwrap();
         let refs: Vec<(&str, &Array)> = tensors.iter().map(|(k, a)| (k.as_str(), a)).collect();
         Array::save_safetensors(refs, None, src.join("model.safetensors")).unwrap();
 
@@ -643,14 +684,26 @@ mod tests {
         let mut rng = SplitMix64::new(0x5EED);
         let mut t: Vec<(String, Array)> = Vec::new();
         t.push(("model.embed_tokens.weight".into(), randn(&[v, h], &mut rng)));
-        t.push(("model.norm.weight".into(), Array::ones::<f32>(&[h]).unwrap()));
+        t.push((
+            "model.norm.weight".into(),
+            Array::ones::<f32>(&[h]).unwrap(),
+        ));
         t.push(("lm_head.weight".into(), randn(&[v, h], &mut rng)));
         let p = |s: &str| format!("model.layers.0.{s}");
-        t.push((p("input_layernorm.weight"), Array::ones::<f32>(&[h]).unwrap()));
-        t.push((p("post_attention_layernorm.weight"), Array::ones::<f32>(&[h]).unwrap()));
+        t.push((
+            p("input_layernorm.weight"),
+            Array::ones::<f32>(&[h]).unwrap(),
+        ));
+        t.push((
+            p("post_attention_layernorm.weight"),
+            Array::ones::<f32>(&[h]).unwrap(),
+        ));
         t.push((p("self_attn.qkv_proj.weight"), randn(&[128, h], &mut rng)));
         t.push((p("self_attn.o_proj.weight"), randn(&[h, 64], &mut rng)));
-        t.push((p("mlp.gate_up_proj.weight"), randn(&[2 * inter, h], &mut rng)));
+        t.push((
+            p("mlp.gate_up_proj.weight"),
+            randn(&[2 * inter, h], &mut rng),
+        ));
         t.push((p("mlp.down_proj.weight"), randn(&[h, inter], &mut rng)));
         let config = json!({
             "architectures": ["Phi3ForCausalLM"], "model_type": "phi3",
@@ -676,8 +729,14 @@ mod tests {
             .unwrap();
         let spec = QuantSpec::q8();
 
-        let report =
-            write_snapshot(&dir, tensors, config, &SnapshotTokenizer::default(), Some(spec)).unwrap();
+        let report = write_snapshot(
+            &dir,
+            tensors,
+            config,
+            &SnapshotTokenizer::default(),
+            Some(spec),
+        )
+        .unwrap();
         assert_eq!(report.quantized, Some(spec));
         assert_eq!(report.quantized_projections, 7, "q,k,v,o + gate,up,down");
 
@@ -712,7 +771,10 @@ mod tests {
             "stored packed q_proj must equal the loader-equivalent split-then-quantize"
         );
         let f32s = |a: &Array| -> Vec<f32> {
-            a.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>().to_vec()
+            a.as_dtype(Dtype::Float32)
+                .unwrap()
+                .as_slice::<f32>()
+                .to_vec()
         };
         let stored_s = w.require("model.layers.0.self_attn.q_proj.scales").unwrap();
         assert_eq!(f32s(stored_s), f32s(&expected.scales), "scales match");
@@ -721,7 +783,10 @@ mod tests {
         let cfg = ModelConfig::from_dir(&dir).unwrap();
         assert_eq!(cfg.quantization, Some(spec));
         let model = CausalLm::from_weights(&Weights::from_dir(&dir).unwrap(), "", cfg).unwrap();
-        assert!(model.is_quantized(), "packed snapshot must load as quantized");
+        assert!(
+            model.is_quantized(),
+            "packed snapshot must load as quantized"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -750,14 +815,25 @@ mod tests {
         ] {
             t.push((p(key), randn(&[inter, h], &mut rng)));
         }
-        t.push((p("mlp.experts.0.down_proj.weight"), randn(&[h, inter], &mut rng)));
-        t.push((p("self_attn.q_a_layernorm.weight"), Array::ones::<f32>(&[h]).unwrap()));
+        t.push((
+            p("mlp.experts.0.down_proj.weight"),
+            randn(&[h, inter], &mut rng),
+        ));
+        t.push((
+            p("self_attn.q_a_layernorm.weight"),
+            Array::ones::<f32>(&[h]).unwrap(),
+        ));
         t.push((p("mlp.gate.weight"), randn(&[4, h], &mut rng))); // MoE router — dense
         let config = json!({ "model_type": "deepseek_v2" });
 
-        let report =
-            write_snapshot(&dir, t, config, &SnapshotTokenizer::default(), Some(QuantSpec::q4()))
-                .unwrap();
+        let report = write_snapshot(
+            &dir,
+            t,
+            config,
+            &SnapshotTokenizer::default(),
+            Some(QuantSpec::q4()),
+        )
+        .unwrap();
         assert_eq!(report.quantized_projections, 10);
 
         let w = Weights::from_dir(&dir).unwrap();
@@ -773,7 +849,10 @@ mod tests {
             "model.layers.0.mlp.experts.1.gate_proj",
             "model.layers.0.mlp.shared_experts.gate_proj",
         ] {
-            assert!(w.contains(&format!("{base}.scales")), "{base} must be quantized");
+            assert!(
+                w.contains(&format!("{base}.scales")),
+                "{base} must be quantized"
+            );
         }
         // Router and MLA norm stay dense.
         assert!(w.contains("model.layers.0.mlp.gate.weight"));
@@ -795,9 +874,18 @@ mod tests {
             Array::zeros::<f32>(&[4, 64]).unwrap(),
         )];
         let config = json!({ "model_type": "qwen3_5" });
-        match write_snapshot(&dir, t, config, &SnapshotTokenizer::default(), Some(QuantSpec::q4())) {
+        match write_snapshot(
+            &dir,
+            t,
+            config,
+            &SnapshotTokenizer::default(),
+            Some(QuantSpec::q4()),
+        ) {
             Err(Error::Unsupported(msg)) => {
-                assert!(msg.contains("linear-attention"), "message names the family: {msg}");
+                assert!(
+                    msg.contains("linear-attention"),
+                    "message names the family: {msg}"
+                );
             }
             other => panic!("expected Unsupported, got {other:?}"),
         }
@@ -859,7 +947,13 @@ mod tests {
             Array::zeros::<f32>(&[4, 64]).unwrap(),
         )];
         let config = json!({ "model_type": "llama" });
-        match write_snapshot(&dir, t, config, &SnapshotTokenizer::default(), Some(QuantSpec::q4())) {
+        match write_snapshot(
+            &dir,
+            t,
+            config,
+            &SnapshotTokenizer::default(),
+            Some(QuantSpec::q4()),
+        ) {
             Err(Error::Unsupported(msg)) => {
                 assert!(msg.contains("no attention/MLP projection"), "{msg}");
             }
@@ -873,6 +967,9 @@ mod tests {
         // Compare in the stored dtype without converting: read the f32 view is lossy for bf16, so
         // round-trip through the array's own element bytes via safetensors-equivalent f32 cast only
         // when float — here all tiny-model tensors are f32, so a direct f32 slice is exact.
-        a.as_slice::<f32>().iter().flat_map(|x| x.to_le_bytes()).collect()
+        a.as_slice::<f32>()
+            .iter()
+            .flat_map(|x| x.to_le_bytes())
+            .collect()
     }
 }

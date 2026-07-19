@@ -19,7 +19,14 @@ pub(crate) fn splice_image_features(
     hidden: i32,
     compute_dtype: mlx_rs::Dtype,
 ) -> Result<Array> {
-    splice_vision_features(embeds, input_ids, image_features, &[image_token_id], hidden, compute_dtype)
+    splice_vision_features(
+        embeds,
+        input_ids,
+        image_features,
+        &[image_token_id],
+        hidden,
+        compute_dtype,
+    )
 }
 
 /// Generalised VLM splice: replace every row whose id is **any** of `placeholder_tokens` (image
@@ -93,7 +100,10 @@ pub(crate) fn mrope_positions_mm(
     let mut video_frames: Vec<[i32; 3]> = Vec::new();
     for &[t, h, w] in video_grid_thw {
         if t <= 0 {
-            return Err(Error::Msg(format!("vlm mrope: bad video grid {:?}", [t, h, w])));
+            return Err(Error::Msg(format!(
+                "vlm mrope: bad video grid {:?}",
+                [t, h, w]
+            )));
         }
         for _ in 0..t {
             video_frames.push([1, h, w]);
@@ -150,7 +160,13 @@ pub(crate) fn mrope_positions_mm(
             i += 1;
         }
     }
-    let maxpos = t.iter().chain(h.iter()).chain(w.iter()).copied().max().unwrap_or(-1);
+    let maxpos = t
+        .iter()
+        .chain(h.iter())
+        .chain(w.iter())
+        .copied()
+        .max()
+        .unwrap_or(-1);
     let delta = maxpos + 1 - input_ids.len() as i32;
     Ok((t, h, w, delta))
 }

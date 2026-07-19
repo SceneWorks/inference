@@ -376,7 +376,8 @@ fn convrot_int8_in_rejects_a_context_that_is_not_bound_to_the_compute_device() {
     );
     // `match`, not `expect_err`: the latter needs `QLinear: Debug`, and a production type should not
     // grow a derive just to widen a test's error reporting.
-    let err = match QLinear::convrot_int8_in(w_i8.clone(), scale.clone(), 256, None, &dev, &cpu_ctx) {
+    let err = match QLinear::convrot_int8_in(w_i8.clone(), scale.clone(), 256, None, &dev, &cpu_ctx)
+    {
         Ok(_) => panic!(
             "an empty context on a CUDA projection must be a typed error, not a silent \
              dequant-dense fallback (F-121)"

@@ -103,7 +103,11 @@ fn conv3d_8to128_output_across_i32max() {
         "[conv D=42 above] out_elems={ae} (={:.4}× 2^31)  checked={ac}  first_bad_offset={af} \
          (={:.4}× 2^31)",
         ae as f64 / I32_MAX as f64,
-        if af < 0 { 0.0 } else { af as f64 / I32_MAX as f64 }
+        if af < 0 {
+            0.0
+        } else {
+            af as f64 / I32_MAX as f64
+        }
     );
 
     assert!(be < I32_MAX && ae > I32_MAX, "geometry must bracket 2^31");
@@ -144,18 +148,30 @@ fn conv3d_128ch_input_across_i32max() {
     let ch: i64 = 128;
     let d: i64 = 41;
     let in_elems = d * h * w * ch; // 2_136_145_920
-    assert!(in_elems < I32_MAX, "pre-pad input must stay under the bound (from_slice)");
+    assert!(
+        in_elems < I32_MAX,
+        "pre-pad input must stay under the bound (from_slice)"
+    );
     let xhost: Vec<f32> = (0..in_elems).map(pv).collect();
     let x = Array::from_slice(&xhost, &[1, d as i32, h as i32, w as i32, ch as i32]);
     x.eval().unwrap();
     drop(xhost);
     // Front-pad the frame axis: XP[0,0,..] = 0, XP[0,dd,..] = X[0,dd-1,..] for dd ≥ 1. The padded
     // input is 42·480·848·128 = 2_188_247_040 > 2^31, with REAL data (frames 40→dd=41) above it.
-    let xp = pad(&x, &[(0, 0), (1, 0), (0, 0), (0, 0), (0, 0)][..], None, None).unwrap();
+    let xp = pad(
+        &x,
+        &[(0, 0), (1, 0), (0, 0), (0, 0), (0, 0)][..],
+        None,
+        None,
+    )
+    .unwrap();
     xp.eval().unwrap();
     drop(x);
     let din = d + 1;
-    assert!(din * h * w * ch > I32_MAX, "padded conv INPUT must cross the bound");
+    assert!(
+        din * h * w * ch > I32_MAX,
+        "padded conv INPUT must cross the bound"
+    );
 
     // weight [cout,1,1,1,cin]: W[co,ci] = 1 iff ci == (co+1)%ch → out[..,co] = in[..,(co+1)%ch].
     let mut wbuf = vec![0f32; (ch * ch) as usize];
@@ -235,7 +251,10 @@ fn conv3d_128ch_input_across_i32max() {
 fn pad_story_geometry_128x42x480x848() {
     let (c, d, h, w): (i64, i64, i64, i64) = (128, 41, 480, 848);
     let in_elems = c * d * h * w;
-    assert!(in_elems < I32_MAX, "input must stay under the bound (from_slice)");
+    assert!(
+        in_elems < I32_MAX,
+        "input must stay under the bound (from_slice)"
+    );
     let xhost: Vec<f32> = (0..in_elems).map(pv).collect();
     let x = Array::from_slice(&xhost, &[c as i32, d as i32, h as i32, w as i32]);
     x.eval().unwrap();
@@ -301,7 +320,10 @@ fn pad_story_geometry_128x42x480x848() {
     // the copy dispatch on the addressable span (offset+Σ(shape-1)·|stride|), turning the int32
     // dst-offset overflow (unpatched 0.32.0 here: bad=24, first_bad_above=2_153_241_600) into an int64
     // copy. Both invariants must hold.
-    assert!(above_checked > 0, "pad probe must sample positions above 2^31 to prove the fix");
+    assert!(
+        above_checked > 0,
+        "pad probe must sample positions above 2^31 to prove the fix"
+    );
     assert!(
         !(0..I32_MAX).contains(&first_bad),
         "pad corrupted a BELOW-2^31 position (offset {first_bad}) — the write-index boundary is not at \
@@ -312,7 +334,10 @@ fn pad_story_geometry_128x42x480x848() {
         "pad corrupted an ABOVE-2^31 position (offset {first_bad_above}); max_abs={max_abs:e} — the \
          pad-copy-int64 gate did not cover this geometry"
     );
-    assert!(bad == 0, "pad had {bad} corrupted sample(s); max_abs={max_abs:e}");
+    assert!(
+        bad == 0,
+        "pad had {bad} corrupted sample(s); max_abs={max_abs:e}"
+    );
 }
 
 /// sc-12746 companion to the pad probe: `concatenate` hits the SAME `copy_gpu_inplace`
@@ -327,7 +352,10 @@ fn concat_story_geometry_128x42x480x848() {
     use mlx_rs::ops::concatenate_axis;
     let (c, dh, h, w): (i64, i64, i64, i64) = (128, 21, 480, 848);
     let in_elems = c * dh * h * w;
-    assert!(in_elems < I32_MAX, "each input must stay under the bound (from_slice)");
+    assert!(
+        in_elems < I32_MAX,
+        "each input must stay under the bound (from_slice)"
+    );
     // Position-dependent, and DISTINCT per input so a scrambled index is caught: input k's flat
     // element j holds pv(j + k*OFFSET). We reconstruct the same value on the host for comparison.
     let off_b: i64 = 500_000_009; // shift so the two inputs don't alias mod 251
@@ -344,7 +372,10 @@ fn concat_story_geometry_128x42x480x848() {
     let dout = 2 * dh; // 42
     assert_eq!(y.shape(), &[c as i32, dout as i32, h as i32, w as i32]);
     let out_elems = c * dout * h * w;
-    assert!(out_elems > I32_MAX, "concatenated output must cross the bound");
+    assert!(
+        out_elems > I32_MAX,
+        "concatenated output must cross the bound"
+    );
     let ys = y.as_slice::<f32>();
 
     // Y[cc,dd,hh,ww] = input_k[cc, dd-k*dh, hh, ww] with k = dd/dh; its flat index within input k
@@ -390,10 +421,22 @@ fn concat_story_geometry_128x42x480x848() {
          first_bad_offset={first_bad}  first_bad_above={first_bad_above}",
         out_elems as f64 / I32_MAX as f64,
     );
-    assert!(above_checked > 0, "probe must sample positions above 2^31 to prove the fix");
-    assert!(!(0..I32_MAX).contains(&first_bad), "concat corrupted a BELOW-2^31 position (offset {first_bad})");
-    assert_eq!(first_bad_above, -1, "concat corrupted an ABOVE-2^31 position (offset {first_bad_above})");
-    assert!(bad == 0, "concat had {bad} corrupted sample(s); max_abs={max_abs:e}");
+    assert!(
+        above_checked > 0,
+        "probe must sample positions above 2^31 to prove the fix"
+    );
+    assert!(
+        !(0..I32_MAX).contains(&first_bad),
+        "concat corrupted a BELOW-2^31 position (offset {first_bad})"
+    );
+    assert_eq!(
+        first_bad_above, -1,
+        "concat corrupted an ABOVE-2^31 position (offset {first_bad_above})"
+    );
+    assert!(
+        bad == 0,
+        "concat had {bad} corrupted sample(s); max_abs={max_abs:e}"
+    );
 }
 
 /// Which reshape/read ops on a >i32::MAX array survive on this pin. **sc-12748 corrects the earlier

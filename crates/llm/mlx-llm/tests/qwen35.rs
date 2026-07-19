@@ -56,7 +56,11 @@ fn qwen35_dispatch_and_coherent_text() {
 
     // Architecture dispatch: the hybrid decoder loads and reports itself as `qwen3_5`.
     assert_eq!(p.descriptor().id, PROVIDER_ID);
-    assert_eq!(p.descriptor().family, "qwen3_5", "must dispatch to the qwen3_5 hybrid decoder");
+    assert_eq!(
+        p.descriptor().family,
+        "qwen3_5",
+        "must dispatch to the qwen3_5 hybrid decoder"
+    );
     assert!(p.descriptor().capabilities.max_context_tokens > 0);
     assert!(!p.is_quantized());
 
@@ -64,7 +68,11 @@ fn qwen35_dispatch_and_coherent_text() {
     // l2-norm, schedule, RoPE…) produces token soup, not "Paris".
     let (out, _think, content) = run(
         &p,
-        &req("What is the capital of France? Answer with just the city name.", ThinkingMode::Disabled, 24),
+        &req(
+            "What is the capital of France? Answer with just the city name.",
+            ThinkingMode::Disabled,
+            24,
+        ),
     );
     println!("\n=== qwen3.6 NO-THINK ===\n[answer] {:?}\n", out.text);
     assert!(!content.trim().is_empty(), "must produce a direct answer");
@@ -82,16 +90,29 @@ fn qwen35_thinking_and_nothink() {
         p.descriptor().capabilities.supports_thinking,
         "Qwen3.6's chat template gates enable_thinking → supports_thinking must be on"
     );
-    for mode in [ThinkingMode::Auto, ThinkingMode::Enabled, ThinkingMode::Disabled] {
-        p.validate(&req("hi", mode, 8)).unwrap_or_else(|e| panic!("validate {mode:?}: {e}"));
+    for mode in [
+        ThinkingMode::Auto,
+        ThinkingMode::Enabled,
+        ThinkingMode::Disabled,
+    ] {
+        p.validate(&req("hi", mode, 8))
+            .unwrap_or_else(|e| panic!("validate {mode:?}: {e}"));
     }
 
     // Thinking: a <think>…</think> block is emitted and split into output.thinking; the answer
     // excludes the reasoning and the markers.
-    let (out, think, content) = run(&p, &req("What is 2+2? Reply briefly.", ThinkingMode::Enabled, 512));
-    println!("\n=== qwen3.6 THINK ===\n[reasoning]\n{think}\n[answer]\n{}\n", out.text);
+    let (out, think, content) = run(
+        &p,
+        &req("What is 2+2? Reply briefly.", ThinkingMode::Enabled, 512),
+    );
+    println!(
+        "\n=== qwen3.6 THINK ===\n[reasoning]\n{think}\n[answer]\n{}\n",
+        out.text
+    );
     assert!(
-        out.thinking.as_deref().is_some_and(|t| !t.trim().is_empty()),
+        out.thinking
+            .as_deref()
+            .is_some_and(|t| !t.trim().is_empty()),
         "thinking run must produce a reasoning block"
     );
     assert!(
@@ -99,26 +120,53 @@ fn qwen35_thinking_and_nothink() {
         "markers must be stripped from the answer: {:?}",
         out.text
     );
-    assert_eq!(content, out.text, "content-channel deltas reconstruct output.text");
+    assert_eq!(
+        content, out.text,
+        "content-channel deltas reconstruct output.text"
+    );
     assert_eq!(think, out.thinking.clone().unwrap_or_default());
 
     // No-think: the empty <think></think> echo is injected, so the model answers directly.
-    let (nout, nthink, ncontent) = run(&p, &req("What is 2+2? Reply briefly.", ThinkingMode::Disabled, 64));
+    let (nout, nthink, ncontent) = run(
+        &p,
+        &req("What is 2+2? Reply briefly.", ThinkingMode::Disabled, 64),
+    );
     println!("=== qwen3.6 NO-THINK ===\n[answer]\n{}\n", nout.text);
-    assert!(nthink.is_empty(), "no-think must emit no Thinking-channel tokens");
-    assert!(nout.thinking.is_none(), "no-think output.thinking must be None");
-    assert!(!ncontent.trim().is_empty(), "no-think must produce a direct answer");
+    assert!(
+        nthink.is_empty(),
+        "no-think must emit no Thinking-channel tokens"
+    );
+    assert!(
+        nout.thinking.is_none(),
+        "no-think output.thinking must be None"
+    );
+    assert!(
+        !ncontent.trim().is_empty(),
+        "no-think must produce a direct answer"
+    );
 }
 
 #[test]
 #[ignore = "needs a Qwen3.6 snapshot (27B dense or 35B-A3B MoE) via MLX_LLM_QWEN35_MODEL"]
 fn qwen35_quantize_on_load_q8() {
     let dir = model_dir();
-    let q8 = LlamaProvider::load(&LoadSpec { source: dir, quantize: Some(Quantize::Q8) })
-        .expect("load q8");
+    let q8 = LlamaProvider::load(&LoadSpec {
+        source: dir,
+        quantize: Some(Quantize::Q8),
+    })
+    .expect("load q8");
     assert!(q8.is_quantized(), "Q8 load must report quantized");
-    let (_out, _think, content) =
-        run(&q8, &req("Name a primary color. One word.", ThinkingMode::Disabled, 16));
+    let (_out, _think, content) = run(
+        &q8,
+        &req(
+            "Name a primary color. One word.",
+            ThinkingMode::Disabled,
+            16,
+        ),
+    );
     println!("\n=== qwen3.6 Q8 ===\n[answer] {content:?}\n");
-    assert!(!content.trim().is_empty(), "quantized model must still generate text");
+    assert!(
+        !content.trim().is_empty(),
+        "quantized model must still generate text"
+    );
 }

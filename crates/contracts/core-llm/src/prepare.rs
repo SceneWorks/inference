@@ -108,7 +108,10 @@ fn file_has_gguf_magic(path: &Path) -> bool {
 
 fn dir_contains_gguf(dir: &Path) -> bool {
     std::fs::read_dir(dir)
-        .map(|rd| rd.flatten().any(|e| e.path().extension().and_then(|x| x.to_str()) == Some("gguf")))
+        .map(|rd| {
+            rd.flatten()
+                .any(|e| e.path().extension().and_then(|x| x.to_str()) == Some("gguf"))
+        })
         .unwrap_or(false)
 }
 
@@ -133,7 +136,11 @@ pub struct PrepareSpec {
 impl PrepareSpec {
     /// A dense (non-quantized) preparation.
     pub fn dense(source: impl Into<PathBuf>, out_dir: impl Into<PathBuf>) -> Self {
-        Self { source: source.into(), out_dir: out_dir.into(), quantize: None }
+        Self {
+            source: source.into(),
+            out_dir: out_dir.into(),
+            quantize: None,
+        }
     }
 
     /// A preparation that re-quantizes projections to `quantize`.
@@ -142,7 +149,11 @@ impl PrepareSpec {
         out_dir: impl Into<PathBuf>,
         quantize: Quantize,
     ) -> Self {
-        Self { source: source.into(), out_dir: out_dir.into(), quantize: Some(quantize) }
+        Self {
+            source: source.into(),
+            out_dir: out_dir.into(),
+            quantize: Some(quantize),
+        }
     }
 }
 
@@ -233,9 +244,7 @@ pub struct SnapshotPreparerRegistry {
 
 impl SnapshotPreparerRegistry {
     /// Iterate the registry in deterministic insertion order.
-    pub fn registrations(
-        &self,
-    ) -> impl ExactSizeIterator<Item = &SnapshotPreparerRegistration> {
+    pub fn registrations(&self) -> impl ExactSizeIterator<Item = &SnapshotPreparerRegistration> {
         self.registrations.iter()
     }
 
@@ -293,7 +302,8 @@ mod tests {
     /// process-id scheme).
     fn tmp(tag: &str) -> PathBuf {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("core-llm-prepare-{}-{tag}-{n}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("core-llm-prepare-{}-{tag}-{n}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -397,7 +407,11 @@ mod tests {
         backend: fn() -> &'static str,
         can_prepare: fn(&PrepareSpec) -> bool,
     ) -> SnapshotPreparerRegistration {
-        SnapshotPreparerRegistration { backend, can_prepare, prepare: never_prepares }
+        SnapshotPreparerRegistration {
+            backend,
+            can_prepare,
+            prepare: never_prepares,
+        }
     }
 
     #[test]
@@ -447,7 +461,9 @@ mod tests {
             .build()
             .err()
             .unwrap();
-        assert!(error.to_string().contains("duplicate snapshot preparer backend 'mlx'"));
+        assert!(error
+            .to_string()
+            .contains("duplicate snapshot preparer backend 'mlx'"));
     }
 
     #[test]

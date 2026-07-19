@@ -81,13 +81,13 @@ pub fn load_joycaption(spec: &LoadSpec) -> Result<JoyCaptioner> {
     let provider = candle_llm::text_registry()
         .map_err(map_core_err)?
         .load_for_model_with(
-        &CoreLoadSpec {
-            source: root.to_string_lossy().into_owned(),
-            quantize: None,
-        },
-        &ModelRequirements::default().with_vision(),
-    )
-    .map_err(map_core_err)?;
+            &CoreLoadSpec {
+                source: root.to_string_lossy().into_owned(),
+                quantize: None,
+            },
+            &ModelRequirements::default().with_vision(),
+        )
+        .map_err(map_core_err)?;
 
     Ok(JoyCaptioner {
         descriptor: descriptor(),
