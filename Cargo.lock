@@ -214,9 +214,19 @@ name = "candle-audio-catalog"
 version = "0.0.0"
 dependencies = [
  "candle-audio",
+ "candle-audio-chatterbox-ve",
  "candle-audio-kokoro",
  "candle-audio-moss-sfx",
  "candle-llm",
+]
+
+[[package]]
+name = "candle-audio-chatterbox-ve"
+version = "0.0.0"
+dependencies = [
+ "candle-audio",
+ "candle-audio-kokoro",
+ "candle-nn",
 ]
 
 [[package]]
