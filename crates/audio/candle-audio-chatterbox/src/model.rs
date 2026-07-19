@@ -354,6 +354,7 @@ impl Generator for ChatterboxGenerator {
                 samples,
                 sample_rate: S3GEN_SR,
                 channels: 1,
+                ..Default::default()
             })),
             Err(e) => Err(gen_core::Error::Msg(format!(
                 "{MODEL_ID}: T3 produced {} speech tokens ({} after dropping specials), but {e}",

@@ -1715,6 +1715,7 @@ mod tests {
             samples: vec![0.0; samples],
             sample_rate: rate,
             channels: 1,
+            ..Default::default()
         }
     }
 
@@ -1854,6 +1855,7 @@ mod tests {
             samples: vec![0.0; samples],
             sample_rate: 24_000,
             channels: 1,
+            ..Default::default()
         }
     }
 

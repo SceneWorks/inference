@@ -57,7 +57,7 @@ pub use generator::{
 };
 pub use image_embed::{ImageEmbedder, ImageEmbedderDescriptor};
 pub use json_constraint::JsonState;
-pub use media::{AudioTrack, Image};
+pub use media::{AudioStem, AudioTrack, Image};
 pub use mempolicy::{plan_memory_adaptation, LaneLevers, Lever, MemoryPlan, StagePeaks};
 pub use registry::{
     AudioTransformRegistration, CaptionerRegistration, ImageEmbedderRegistration,

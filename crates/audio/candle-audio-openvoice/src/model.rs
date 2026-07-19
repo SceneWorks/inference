@@ -227,6 +227,7 @@ impl AudioTransform for OpenVoiceTransform {
             samples,
             sample_rate: OUTPUT_SAMPLE_RATE,
             channels: 1,
+            ..Default::default()
         }])
     }
 }
@@ -296,6 +297,7 @@ mod tests {
             samples: vec![0.01; n],
             sample_rate: rate,
             channels: 1,
+            ..Default::default()
         }
     }
 

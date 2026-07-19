@@ -232,6 +232,7 @@ mod tests {
             samples: vec![0.0; 8],
             sample_rate: 16_000,
             channels: 1,
+            ..Default::default()
         };
         // Fails on the length gate before any weight I/O (weights need not exist).
         assert!(e.embed(&clip).is_err());

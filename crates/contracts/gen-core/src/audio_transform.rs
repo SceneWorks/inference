@@ -196,6 +196,7 @@ mod tests {
             samples: vec![0.0; samples],
             sample_rate: rate,
             channels: 1,
+            ..Default::default()
         }
     }
 
