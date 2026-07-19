@@ -11,6 +11,7 @@
 //! `mlx_rs::Array` or candle tensor. See epic 3720 (the unified-contract roadmap, Phase 0).
 
 pub mod audio_dsp;
+pub mod audio_embed;
 pub mod audio_transform;
 pub mod caption;
 pub mod control;
@@ -40,6 +41,7 @@ pub use audio_dsp::{
     db_to_linear, measure_loudness, measure_track_loudness, mixdown, LoudnessStats, MixClip,
     MixRequest, SILENCE_FLOOR_LUFS,
 };
+pub use audio_embed::{AudioEmbedder, AudioEmbedderDescriptor};
 pub use audio_transform::{
     AudioTarget, AudioTransform, AudioTransformCapabilities, AudioTransformDescriptor,
     AudioTransformKind, AudioTransformRequest,
@@ -61,10 +63,10 @@ pub use json_constraint::JsonState;
 pub use media::{AudioStem, AudioTrack, Image};
 pub use mempolicy::{plan_memory_adaptation, LaneLevers, Lever, MemoryPlan, StagePeaks};
 pub use registry::{
-    AudioTransformRegistration, CaptionerRegistration, ImageEmbedderRegistration,
-    ModelRegistration, PerComponentBytes, ProviderRegistry, ProviderRegistryBuilder,
-    TextEmbedderRegistration, TrainerRegistration, TranscriberRegistration, TransformRegistration,
-    VoiceEmbedderRegistration,
+    AudioEmbedderRegistration, AudioTransformRegistration, CaptionerRegistration,
+    ImageEmbedderRegistration, ModelRegistration, PerComponentBytes, ProviderRegistry,
+    ProviderRegistryBuilder, TextEmbedderRegistration, TrainerRegistration,
+    TranscriberRegistration, TransformRegistration, VoiceEmbedderRegistration,
 };
 pub use runtime::{
     AdapterKind, AdapterSpec, CancelFlag, IdentityWeights, LoadPhase, LoadSpec, MoeExpert,

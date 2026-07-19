@@ -132,6 +132,19 @@ profiles = ["audio-macos"]
 environment = ["WHISPER_SNAPSHOT"]
 expected_files = ["config.json", "tokenizer.json", "model.safetensors"]
 
+# sc-12851: LAION CLAP (the first real AudioEmbedder, semantic audio-text retrieval).
+# laion/clap-htsat-unfused (Apache-2.0) — the HTSAT audio tower + RoBERTa text tower CLAP checkpoint,
+# projected into one CLIP-style joint space. Ships pytorch_model.bin (pickle), loaded via from_pth.
+[[models]]
+key = "clap-htsat-unfused"
+repository = "laion/clap-htsat-unfused"
+revision = "8fa0f1c6d0433df6e97c127f64b2a1d6c0dcda8a"
+license = "Apache-2.0"
+size_class = "small"
+profiles = ["audio-macos"]
+environment = ["CLAP_SNAPSHOT"]
+expected_files = ["config.json", "tokenizer.json", "pytorch_model.bin"]
+
 [[models]]
 key = "mochi-1-preview"
 repository = "genmo/mochi-1-preview"
