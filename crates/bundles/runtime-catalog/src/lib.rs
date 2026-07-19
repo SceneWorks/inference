@@ -1222,7 +1222,9 @@ mod tests {
                 family: "test-audio",
                 backend: "candle",
                 modality: gen_core::Modality::Audio,
-                // max_count 0 + Default size bounds — two conformance violations.
+                // max_count 0 is a conformance violation; the Default-0 size bounds are NOT (the
+                // sweep exempts Modality::Audio from the size floor — sc-13314), so this is a single
+                // violation (max_count), which is enough for the audio-prefix message under test.
                 capabilities: gen_core::Capabilities::default(),
             }
         }
