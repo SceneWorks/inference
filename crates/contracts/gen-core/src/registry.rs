@@ -18,8 +18,10 @@ use crate::{Error, Result};
 
 use std::path::Path;
 
-/// The per-component on-disk weight footprint (bytes) of a model, the provider-owned staged-residency
-/// signal (sc-10894). Each field is the summed `.safetensors` byte size of one component category:
+/// The provider-owned per-component resident-weight estimate (bytes), used by pre-load fit gates for
+/// staged residency (sc-10894/sc-11924). Each component defaults to its summed on-disk
+/// `.safetensors` size; a provider whose load materializes a larger representation must replace that
+/// component with the conservative in-memory size:
 ///
 /// - `text_encoder` — the phase-A prompt encoder(s) that [`OffloadPolicy::Sequential`](crate::runtime::OffloadPolicy)
 ///   drops *before* the heavy render bundle loads (one or more, e.g. SDXL's two CLIPs, SD3's three);
@@ -34,9 +36,9 @@ use std::path::Path;
 /// collapsing the staged peak back to the resident peak so no saving is ever selected. Each provider,
 /// by contrast, computes the split from the exact subdir paths its own loader resolves.
 ///
-/// All three are tensor-free on-disk sums ([`crate::safetensors_dir_bytes`]) — **zero** MLX allocation, no
-/// whole-file reads — so this is safe to call from a pre-load admission gate. A component a model does
-/// not have (or cannot separate) is `0`.
+/// The default constructors are tensor-free on-disk sums ([`crate::safetensors_dir_bytes`]) — **zero**
+/// MLX allocation and no whole-file reads — so this remains safe in a pre-load gate. A component a
+/// model does not have (or cannot separate) is `0`.
 ///
 /// **On-disk byte SUMS, not load-exact.** Each field totals *every* `.safetensors` under the named
 /// path(s), which can exceed what a single load materializes: one component dir may ship multiple
