@@ -6,14 +6,17 @@
 //! sampled at the previous position (through its own `embed_tokens.N`), and every depth position
 //! projects through its own per-codebook LM head (`local_lm_heads.N`). Weight-for-weight this
 //! mirrors the reference `MossTTSRealtimeLocalTransformerForCausalLM.generate_local_transformer`
-//! loop; sampling here is deterministic **greedy** (argmax) so a given backbone state maps to one
-//! reproducible RVQ frame (the gen-core determinism law).
+//! loop, **including its sampling** ([`crate::sampling`]: temperature / top-k / top-p + a
+//! per-codebook cross-frame repetition penalty). The reference is `do_sample=True`; greedy (argmax)
+//! decoding collapses this model into a repeating loop whose codec decode is silent. A **seeded**
+//! PRNG keeps the sampled decode reproducible (same seed ⇒ same frame — the gen-core determinism law).
 
 use candle_audio::candle_core::{Device, IndexOp, Result as CandleResult, Tensor};
 use candle_nn::{Embedding, Linear, Module, RmsNorm, VarBuilder};
 
 use crate::blocks::{causal_mask, rope_tables, BlockConfig, Layer};
 use crate::config::LocalConfig;
+use crate::sampling::{sample, Rng, SamplingParams};
 
 /// The local/depth transformer: the `rvq - 1` depth embeddings, the decoder stack, the final norm,
 /// and the `rvq` per-codebook LM heads.
@@ -98,16 +101,29 @@ impl LocalTransformer {
         h.i((.., depth - 1..depth, ..))?.reshape((1, h.dim(2)?))
     }
 
-    /// Decode one frame's `rvq` RVQ codebook tokens (greedy) from the backbone's last hidden state
-    /// `[1, 1, H]`. Deterministic: same seed hidden ⇒ same frame.
-    pub fn decode_frame(&self, backbone_last_hidden: &Tensor) -> CandleResult<Vec<u32>> {
+    /// Decode one frame's `rvq` RVQ codebook tokens from the backbone's last hidden state `[1, 1, H]`,
+    /// sampling each codebook (temperature / top-k / top-p + per-codebook cross-frame repetition
+    /// penalty — the reference `generate_local_transformer`) with the seeded `rng`. `history` is the
+    /// frames emitted so far (previous frames); codebook `i`'s repetition penalty uses `history`'s
+    /// codebook-`i` column. Deterministic per seed: same backbone state + same `rng` sequence ⇒ same
+    /// frame, so `generate` and `generate_streaming` agree.
+    pub fn decode_frame(
+        &self,
+        backbone_last_hidden: &Tensor,
+        history: &[Vec<u32>],
+        params: &SamplingParams,
+        rng: &mut Rng,
+    ) -> CandleResult<Vec<u32>> {
         // Depth position 0 embedding = the backbone hidden state.
         let mut depth_embeds = backbone_last_hidden.clone(); // [1, 1, H]
         let mut tokens = Vec::with_capacity(self.rvq);
         for i in 0..self.rvq {
             let hidden = self.hidden_last(&depth_embeds)?; // [1, H]
             let logits = self.heads[i].forward(&hidden)?; // [1, audio_vocab]
-            let token = argmax_last(&logits)?;
+            let mut row: Vec<f32> = logits.reshape((logits.elem_count(),))?.to_vec1::<f32>()?;
+            // Codebook i's tokens from previous frames (the repetition-penalty history).
+            let hist_i: Vec<u32> = history.iter().filter_map(|f| f.get(i).copied()).collect();
+            let token = sample(&mut row, &hist_i, params, rng);
             tokens.push(token);
             if i + 1 < self.rvq {
                 // Next depth position embedding = embed_tokens[i](token).
@@ -118,18 +134,4 @@ impl LocalTransformer {
         }
         Ok(tokens)
     }
-}
-
-/// Argmax over the last dim of a `[1, V]` logits tensor → the winning token id.
-fn argmax_last(logits: &Tensor) -> CandleResult<u32> {
-    let row: Vec<f32> = logits.reshape((logits.elem_count(),))?.to_vec1::<f32>()?;
-    let mut best = 0usize;
-    let mut best_v = f32::NEG_INFINITY;
-    for (i, &v) in row.iter().enumerate() {
-        if v > best_v {
-            best_v = v;
-            best = i;
-        }
-    }
-    Ok(best as u32)
 }

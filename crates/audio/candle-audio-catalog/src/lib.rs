@@ -47,13 +47,15 @@ pub mod providers {
     pub use candle_audio_clap;
     pub use candle_audio_kokoro;
     pub use candle_audio_moss_sfx;
+    pub use candle_audio_moss_tts_realtime;
     pub use candle_audio_openvoice;
     pub use candle_audio_whisper;
 }
 
 /// Add every provider shipped by the Candle audio lane to an explicit registry builder, in
-/// stable catalog order: the generators first (Kokoro TTS, MOSS SFX, ACE-Step music), then the
-/// voice-cloning identity embedder (Chatterbox `ve`, sc-12844), then the audio transforms
+/// stable catalog order: the generators first (Kokoro TTS, MOSS SFX, ACE-Step music, MOSS-TTS-Realtime
+/// streaming TTS — sc-13392), then the voice-cloning identity embedder (Chatterbox `ve`, sc-12844),
+/// then the audio transforms
 /// (OpenVoice V2 voice conversion, sc-13223 — the first real `AudioTransform`), then the
 /// transcribers (Whisper ASR, sc-12850 — the first real `Transcriber`, the audio Captioner-analog),
 /// then the audio embedders (LAION CLAP, sc-12851 — the first real `AudioEmbedder`, semantic
@@ -62,6 +64,7 @@ pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistry
     let registry = candle_audio_kokoro::register_providers(registry);
     let registry = candle_audio_moss_sfx::register_providers(registry);
     let registry = candle_audio_acestep::register_providers(registry);
+    let registry = candle_audio_moss_tts_realtime::register_providers(registry);
     let registry = candle_audio_chatterbox_ve::register_providers(registry);
     let registry = candle_audio_openvoice::register_providers(registry);
     let registry = candle_audio_whisper::register_providers(registry);
@@ -95,6 +98,7 @@ pub fn weight_licenses() -> Vec<gen_core::WeightLicenseEntry> {
     entries.extend_from_slice(candle_audio_kokoro::WEIGHT_LICENSES);
     entries.extend_from_slice(candle_audio_moss_sfx::WEIGHT_LICENSES);
     entries.extend_from_slice(candle_audio_acestep::WEIGHT_LICENSES);
+    entries.extend_from_slice(candle_audio_moss_tts_realtime::WEIGHT_LICENSES);
     entries.extend_from_slice(candle_audio_chatterbox_ve::WEIGHT_LICENSES);
     entries.extend_from_slice(candle_audio_openvoice::WEIGHT_LICENSES);
     entries.extend_from_slice(candle_audio_whisper::WEIGHT_LICENSES);
@@ -180,6 +184,7 @@ fn lane_can_prepare(spec: &core_llm::PrepareSpec) -> bool {
     candle_audio_kokoro::prepare::can_prepare(spec)
         || candle_audio_moss_sfx::prepare::can_prepare(spec)
         || candle_audio_acestep::prepare::can_prepare(spec)
+        || candle_audio_moss_tts_realtime::prepare::can_prepare(spec)
         || candle_audio_openvoice::prepare::can_prepare(spec)
         || candle_audio_whisper::prepare::can_prepare(spec)
         || candle_audio_clap::prepare::can_prepare(spec)
@@ -193,6 +198,8 @@ fn lane_prepare(spec: &core_llm::PrepareSpec) -> core_llm::Result<core_llm::Prep
         candle_audio_moss_sfx::prepare::prepare(spec)
     } else if candle_audio_acestep::prepare::can_prepare(spec) {
         candle_audio_acestep::prepare::prepare(spec)
+    } else if candle_audio_moss_tts_realtime::prepare::can_prepare(spec) {
+        candle_audio_moss_tts_realtime::prepare::prepare(spec)
     } else if candle_audio_openvoice::prepare::can_prepare(spec) {
         candle_audio_openvoice::prepare::prepare(spec)
     } else if candle_audio_whisper::prepare::can_prepare(spec) {
@@ -240,7 +247,12 @@ mod tests {
 
         assert_eq!(
             generators,
-            ["kokoro_82m", "moss_sfx_v2", "acestep_v15_turbo"]
+            [
+                "kokoro_82m",
+                "moss_sfx_v2",
+                "acestep_v15_turbo",
+                "moss_tts_realtime"
+            ]
         );
         // The voice-cloning identity embedder surfaces as its own kind (sc-12844), in catalog order.
         let voice_embedders: Vec<String> = registry
@@ -368,7 +380,7 @@ mod tests {
                 entry.provider_id
             );
         }
-        // The seven currently-shipped audio providers, in catalog order, with their verified SPDX
+        // The eight currently-shipped audio providers, in catalog order, with their verified SPDX
         // ids — all permissive (MIT / Apache-2.0). This pins the surface so a change is deliberate.
         let ordered: Vec<(&str, &str, bool)> = super::weight_licenses()
             .iter()
@@ -380,6 +392,7 @@ mod tests {
                 ("kokoro_82m", "Apache-2.0", true),
                 ("moss_sfx_v2", "Apache-2.0", true),
                 ("acestep_v15_turbo", "MIT", true),
+                ("moss_tts_realtime", "Apache-2.0", true),
                 ("chatterbox_ve", "MIT", true),
                 ("openvoice_v2", "MIT", true),
                 ("whisper_base", "Apache-2.0", true),

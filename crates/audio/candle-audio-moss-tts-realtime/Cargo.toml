@@ -28,6 +28,9 @@ serde_json = { workspace = true }
 [dev-dependencies]
 # HF-cache snapshot resolution for the `#[ignore]`d real-weight conformance test.
 candle-audio = { path = "../candle-audio", features = ["testkit"] }
+# The backend-neutral audio-generator conformance suite (streaming reassembly law, seed
+# determinism) the real-weight test runs against the loaded provider.
+sceneworks-gen-core-testkit = { workspace = true }
 
 [features]
 default = []

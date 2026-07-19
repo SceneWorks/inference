@@ -169,9 +169,9 @@ expected_files = [
 
 [[models]]
 # MOSS-TTS-Realtime-1.7B AR brain (sc-13334): the Qwen3-1.7B backbone + CSM-style local/depth
-# transformer emitting real 16-codebook RVQ speech-token frames. The MOSS-Audio-Tokenizer codec
-# (RVQ -> 24 kHz waveform) is a separate ~7 GB model, not yet ported; this snapshot is the AR
-# stack only (config.json + model.safetensors + tokenizer).
+# transformer emitting real 16-codebook RVQ speech-token frames. Paired with the MOSS-Audio-Tokenizer
+# codec below (RVQ -> 24 kHz waveform); this snapshot is the AR stack (config.json +
+# model.safetensors + tokenizer).
 key = "moss-tts-realtime"
 repository = "OpenMOSS-Team/MOSS-TTS-Realtime"
 revision = "6acbc7f161a0db71c291f2d0aaa9eee59334cab2"
@@ -184,4 +184,22 @@ expected_files = [
     "model.safetensors",
     "tokenizer.json",
     "tokenizer_config.json",
+]
+
+[[models]]
+# MOSS-Audio-Tokenizer (sc-13392): the RLFQ streaming codec that decodes MOSS-TTS-Realtime's RVQ
+# frames into a 24 kHz waveform (~7.1 GB, 2-shard safetensors). Decode path ported natively in
+# candle-audio-moss-tts-realtime::codec; paired with the AR snapshot above.
+key = "moss-audio-tokenizer"
+repository = "OpenMOSS-Team/MOSS-Audio-Tokenizer"
+revision = "3cd226ba2947efa357ef453bcad111b6eafba782"
+license = "Apache-2.0"
+size_class = "large"
+profiles = ["audio-macos"]
+environment = ["MOSS_AUDIO_TOKENIZER_SNAPSHOT"]
+expected_files = [
+    "config.json",
+    "model.safetensors.index.json",
+    "model-00001-of-00002.safetensors",
+    "model-00002-of-00002.safetensors",
 ]

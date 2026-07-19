@@ -1,27 +1,25 @@
 //! `MossTtsRealtimeGenerator` — the [`gen_core::Generator`] for **MOSS-TTS-Realtime-1.7B** on the
-//! candle audio lane (sc-13334), plus its [`descriptor`]/[`load`] entry points, the pinned-SHA hub
-//! path, and the model-weight license.
+//! candle audio lane (sc-13334 + sc-13392), plus its [`descriptor`]/[`load`] entry points, the
+//! pinned-SHA hub paths (AR + codec), and the model-weight license.
 //!
-//! ## Honest partial (see [`crate`] docs)
+//! ## Full streaming TTS (sc-13392)
 //!
 //! The AR brain — the Qwen3-1.7B backbone ([`crate::backbone`]) + the CSM-style local/depth
-//! transformer ([`crate::local`]) — is ported and, on real weights, emits real 16-codebook RVQ
-//! speech-token frames ([`crate::decode`]). Turning those frames into a 24 kHz waveform needs the
-//! **MOSS-Audio-Tokenizer** codec (a separate ~7 GB RLFQ streaming codec), which is **not yet
-//! ported**. So [`generate`](MossTtsRealtimeGenerator::generate) runs the AR loop to produce real
-//! frames and then returns a typed error at the codec boundary rather than fabricate audio — and
-//! this generator is deliberately **not registered** into `candle-audio-catalog`'s shipping surface
-//! (registering an audio generator that cannot render audio would fail the gen-core audio
-//! conformance suite and mis-advertise the lane). The [`REGISTRATION`] constant, the ordered-id
-//! surface extension, and the bundle smokes land with the codec follow-up.
+//! transformer ([`crate::local`]) — emits real 16-codebook RVQ speech-token frames
+//! ([`crate::decode`]), and the ported **MOSS-Audio-Tokenizer** codec ([`crate::codec`]) turns those
+//! into a 24 kHz waveform. [`generate`](MossTtsRealtimeGenerator::generate) and
+//! [`generate_streaming`](MossTtsRealtimeGenerator::generate_streaming) share one deterministic
+//! synthesis path (AR frames → incremental causal codec decode → PCM chunks), so the one-shot output
+//! is byte-identical to the concatenated stream. This generator is **registered** into
+//! `candle-audio-catalog`'s shipping surface.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use candle_audio::candle_core::DType;
 use candle_audio::gen_core::{
-    self, Capabilities, GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality,
-    ModelDescriptor, Progress, WeightsSource,
+    self, AudioChunk, AudioTrack, Capabilities, GenerationOutput, GenerationRequest, Generator,
+    LoadSpec, Modality, ModelDescriptor, Progress, WeightsSource,
 };
 use candle_audio::hub::{hf_get_pinned, pinned_snapshot_dir};
 use candle_audio::Result as AudioResult;
@@ -29,11 +27,12 @@ use candle_nn::VarBuilder;
 use tokenizers::Tokenizer;
 
 use crate::backbone::Backbone;
+use crate::codec::MossAudioCodec;
 use crate::config::MossTtsRealtimeConfig;
 use crate::decode::{build_prompt_frames, Decoder};
 use crate::local::LocalTransformer;
 
-/// Registry id (the id the ordered-generator surface will carry once the codec lands).
+/// Registry id — the id the catalog's ordered-generator surface carries.
 pub const MODEL_ID: &str = "moss_tts_realtime";
 
 /// Hub pin: `OpenMOSS-Team/MOSS-TTS-Realtime` at an immutable commit SHA (Apache-2.0 weights +
@@ -42,8 +41,8 @@ pub const MODEL_ID: &str = "moss_tts_realtime";
 pub const HUB_REPO: &str = "OpenMOSS-Team/MOSS-TTS-Realtime";
 pub const HUB_REVISION: &str = "6acbc7f161a0db71c291f2d0aaa9eee59334cab2";
 
-/// The MOSS-Audio-Tokenizer codec repo — the separate model that decodes RVQ frames into a 24 kHz
-/// waveform. Recorded here for the follow-up that ports it; not fetched by this crate.
+/// The MOSS-Audio-Tokenizer codec repo — the separate ~7.1 GB model that decodes RVQ frames into a
+/// 24 kHz waveform (ported in [`crate::codec`], resolved by [`resolve_pinned_codec_snapshot`]).
 pub const CODEC_HUB_REPO: &str = "OpenMOSS-Team/MOSS-Audio-Tokenizer";
 pub const CODEC_HUB_REVISION: &str = "3cd226ba2947efa357ef453bcad111b6eafba782";
 
@@ -65,7 +64,7 @@ pub const WEIGHT_LICENSE_ENTRY: gen_core::WeightLicenseEntry = gen_core::WeightL
     license: WEIGHT_LICENSE,
 };
 
-/// Native output sample rate of the (not-yet-ported) codec (Hz).
+/// Native output sample rate of the codec (Hz).
 pub const SAMPLE_RATE: u32 = 24_000;
 
 /// The RVQ frame rate: 24 kHz / the codec's 1920 downsample = 12.5 frames/second.
@@ -77,13 +76,17 @@ pub const MAX_DURATION_SECS: f32 = 2400.0;
 /// Default clip length when a request does not set `audio.target_duration` (seconds).
 pub const DEFAULT_SECONDS: f32 = 10.0;
 
+/// Sampler seed used when a request carries no `seed` — keeps decoding deterministic (the gen-core
+/// reproducibility law) while still using the reference's sampling (not greedy, which collapses).
+pub const DEFAULT_SAMPLING_SEED: u64 = 13_392;
+
 /// Prompt languages advertised for the scaffold (the model card lists 20; the full set lands with
 /// registration). English + Chinese are the primary verified pair.
 pub const LANGUAGES: &[&str] = &["en", "zh"];
 
 /// MOSS-TTS-Realtime's identity + capabilities — constructible without weights. `supports_streaming`
 /// is `true`: this is the family's realtime/streaming model, and the AR loop emits one RVQ frame at
-/// a time (the codec, once ported, decodes a block of frames into a streamed PCM chunk).
+/// a time (the codec decodes a block of frames into a streamed PCM chunk).
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
         id: MODEL_ID,
@@ -195,11 +198,25 @@ impl Loaded {
     }
 }
 
+/// Default RVQ frames per streaming block (≈ 0.64 s at 12.5 fps). Sized down per request so a short
+/// clip still yields ≥ 2 chunks (the streaming incrementality law).
+const DEFAULT_FRAMES_PER_BLOCK: usize = 8;
+
+/// The streaming block size for a clip of `budget_frames` (the AR frame budget): at most
+/// [`DEFAULT_FRAMES_PER_BLOCK`], but never more than half the budget, so a budget-reaching run of
+/// `≥ 2` frames always streams `≥ 2` chunks.
+fn frames_per_block(budget_frames: usize) -> usize {
+    DEFAULT_FRAMES_PER_BLOCK
+        .min(budget_frames.div_ceil(2))
+        .max(1)
+}
+
 /// A loaded (lazy) MOSS-TTS-Realtime generator.
 pub struct MossTtsRealtimeGenerator {
     descriptor: ModelDescriptor,
     root: PathBuf,
     loaded: Mutex<Option<Arc<Loaded>>>,
+    codec: Mutex<Option<Arc<MossAudioCodec>>>,
 }
 
 fn lock_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -222,7 +239,7 @@ impl MossTtsRealtimeGenerator {
 
     /// Run the AR brain on real weights and return the emitted RVQ frames (each `rvq` codebook
     /// tokens). Exposed for the real-weights conformance test, which asserts on the token stream
-    /// (the codec that would turn these into audio is not yet ported).
+    /// before it is handed to the codec ([`crate::codec`]).
     pub fn rvq_frames(
         &self,
         req: &GenerationRequest,
@@ -237,20 +254,115 @@ impl MossTtsRealtimeGenerator {
             .map_err(gen_core::Error::Msg)?;
         let budget = frame_budget(req);
         let total = budget as u32;
+        // Deterministic token sampling seeded by the request (a `None` seed maps to a fixed constant),
+        // so the gen-core reproducibility law holds and generate/generate_streaming agree.
+        let seed = req.seed.unwrap_or(DEFAULT_SAMPLING_SEED);
         let cancel = req.cancel.clone();
         let probe = move || cancel.is_cancelled();
-        let mut on_frame = |step: usize| {
+        let mut on_frame = |step: usize, _frame: &[u32]| {
             on_progress(Progress::Step {
                 current: (step as u32) + 1,
                 total,
             });
+            Ok(())
         };
         let result = pipeline
             .decoder
-            .run(frames, budget, &probe, &mut on_frame)
+            .run(frames, budget, seed, &probe, &mut on_frame)
             .map_err(|e| gen_core::Error::Msg(format!("{MODEL_ID}: AR decode: {e}")))?;
         match result {
             Some(r) => Ok(r),
+            None => Err(gen_core::Error::Canceled),
+        }
+    }
+
+    /// Load (once, lazily) the MOSS-Audio-Tokenizer codec decoder for `rvq` codebooks. The codec is
+    /// a separate pinned snapshot resolved through the audio lane's hub path (or the
+    /// `MOSS_AUDIO_TOKENIZER_SNAPSHOT` override); see [`resolve_pinned_codec_snapshot`].
+    fn codec(&self, rvq: usize) -> gen_core::Result<Arc<MossAudioCodec>> {
+        let mut guard = lock_recover(&self.codec);
+        if let Some(c) = guard.as_ref() {
+            return Ok(c.clone());
+        }
+        let dir = resolve_pinned_codec_snapshot().map_err(gen_core::Error::from)?;
+        let built = Arc::new(MossAudioCodec::load(&dir, rvq).map_err(gen_core::Error::from)?);
+        *guard = Some(built.clone());
+        Ok(built)
+    }
+
+    /// The single deterministic synthesis path shared by [`generate`](Self::generate) and
+    /// [`generate_streaming`](Self::generate_streaming): drive the AR brain and, **from inside the AR
+    /// loop**, decode the codec block-wise over the growing RVQ-frame prefix — emitting one
+    /// [`AudioChunk`] per newly-revealed PCM block *while later frames are still being generated*
+    /// ([`crate::chunk::StreamingChunker`]).
+    ///
+    /// Because the codec decode graph is fully causal, decoding a growing prefix reproduces the
+    /// earlier samples byte-for-byte — so the concatenated chunks equal the returned track exactly
+    /// (the reassembly law), and the two entry points return byte-identical audio for the same
+    /// request+seed (they call this one function). The first chunk is emitted after the first block
+    /// of AR frames rather than after the whole track, so first-chunk latency is proportional to one
+    /// block of AR frames, not the full synthesis time.
+    ///
+    /// The AR itself is still full-sequence-recompute (no KV cache); that latency optimization is a
+    /// separate tracked follow-up and does not change the streaming interleaving here.
+    fn synthesize(
+        &self,
+        req: &GenerationRequest,
+        on_chunk: &mut dyn FnMut(AudioChunk),
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<AudioTrack> {
+        self.validate(req)?;
+        if req.cancel.is_cancelled() {
+            return Err(gen_core::Error::Canceled);
+        }
+        let pipeline = self.pipeline()?;
+        let codec = self.codec(pipeline.decoder.cfg.rvq)?;
+
+        let frames = build_prompt_frames(&pipeline.tokenizer, &pipeline.decoder.cfg, &req.prompt)
+            .map_err(gen_core::Error::Msg)?;
+        let budget = frame_budget(req);
+        let total = budget as u32;
+        // Deterministic token sampling seeded by the request (a `None` seed maps to a fixed constant),
+        // so the gen-core reproducibility law holds and generate/generate_streaming agree.
+        let seed = req.seed.unwrap_or(DEFAULT_SAMPLING_SEED);
+        // Block sizing is driven by the frame budget (known up front, before the loop): at most
+        // DEFAULT_FRAMES_PER_BLOCK and never more than half the budget, so a budget-reaching run
+        // always streams >= 2 chunks.
+        let block = frames_per_block(budget);
+
+        let cancel = req.cancel.clone();
+        let probe = move || cancel.is_cancelled();
+
+        let mut chunker = crate::chunk::StreamingChunker::new(codec.as_ref(), block);
+        let mut canceled = false;
+        let run = {
+            // The AR loop hands each emitted frame here; the chunker decodes + streams block-wise.
+            let mut on_frame =
+                |step: usize, frame: &[u32]| -> candle_audio::candle_core::Result<()> {
+                    on_progress(Progress::Step {
+                        current: (step as u32) + 1,
+                        total,
+                    });
+                    if chunker.push(frame.to_vec(), &probe, on_chunk)?.is_none() {
+                        canceled = true;
+                    }
+                    Ok(())
+                };
+            pipeline
+                .decoder
+                .run(frames, budget, seed, &probe, &mut on_frame)
+                .map_err(|e| gen_core::Error::Msg(format!("{MODEL_ID}: AR decode: {e}")))?
+        };
+        if canceled || run.is_none() {
+            return Err(gen_core::Error::Canceled);
+        }
+        on_progress(Progress::Decoding);
+        // Flush any remaining frames below a full block into a final chunk and take the full track.
+        match chunker
+            .finish(&probe, on_chunk)
+            .map_err(|e| gen_core::Error::Msg(format!("{MODEL_ID}: codec decode: {e}")))?
+        {
+            Some(track) => Ok(track),
             None => Err(gen_core::Error::Canceled),
         }
     }
@@ -270,21 +382,20 @@ impl Generator for MossTtsRealtimeGenerator {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
-        // AR stage (real weights) → real RVQ frames.
-        let result = self.rvq_frames(req, on_progress)?;
-        // Codec boundary: announce decode, then hit the honest boundary — the AR brain produced
-        // real frames; the MOSS-Audio-Tokenizer codec (RVQ → 24 kHz waveform) is not yet ported, so
-        // refuse rather than fabricate audio.
-        on_progress(Progress::Decoding);
-        let n = result.frames.len();
-        Err(gen_core::Error::Msg(format!(
-            "{MODEL_ID}: AR brain produced {n} real {rvq}-codebook RVQ frame(s) (stop: {stop:?}), \
-             but the MOSS-Audio-Tokenizer codec ({CODEC_HUB_REPO}, RVQ → {SAMPLE_RATE} Hz waveform) \
-             is not yet ported — refusing to fabricate audio. This generator is intentionally \
-             unregistered until the codec lands (see the sc-13334 follow-up).",
-            rvq = result.frames.first().map(Vec::len).unwrap_or(0),
-            stop = result.stop,
-        )))
+        // Same deterministic path as generate_streaming, with the chunk sink discarded — so the
+        // one-shot output is byte-identical to the concatenated stream.
+        let track = self.synthesize(req, &mut |_| {}, on_progress)?;
+        Ok(GenerationOutput::Audio(track))
+    }
+
+    fn generate_streaming(
+        &self,
+        req: &GenerationRequest,
+        on_chunk: &mut dyn FnMut(AudioChunk),
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationOutput> {
+        let track = self.synthesize(req, on_chunk, on_progress)?;
+        Ok(GenerationOutput::Audio(track))
     }
 }
 
@@ -320,6 +431,7 @@ pub fn load_generator(spec: &LoadSpec) -> gen_core::Result<MossTtsRealtimeGenera
         descriptor: descriptor(),
         root,
         loaded: Mutex::new(None),
+        codec: Mutex::new(None),
     })
 }
 
@@ -328,16 +440,37 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     Ok(Box::new(load_generator(spec)?))
 }
 
-// Explicit registration constant for `moss_tts_realtime`. NOTE: `candle-audio-catalog` does NOT
-// call this yet — registration is gated on the MOSS-Audio-Tokenizer codec landing (see crate docs),
-// exactly as `candle-audio-chatterbox` gates its registration on the S3Gen stack.
+// Explicit registration constant for `moss_tts_realtime` (sc-13392): the MOSS-Audio-Tokenizer codec
+// is ported, so this generator renders real 24 kHz audio and `candle-audio-catalog` registers it.
 candle_audio::register_generators! {
     pub const REGISTRATION = descriptor => load
 }
 
-/// Materialize the pinned MOSS-TTS-Realtime snapshot through the audio lane's F-029 hub path:
+/// Add the MOSS-TTS-Realtime streaming-TTS generator to an explicit audio registry builder (catalog
+/// composition), mirroring the sibling audio provider crates (e.g. `candle-audio-kokoro`).
+pub fn register_providers(
+    registry: gen_core::ProviderRegistryBuilder,
+) -> gen_core::ProviderRegistryBuilder {
+    registry.register_generator(REGISTRATION)
+}
+
+/// Build this crate's own explicit provider catalog (its single-generator surface).
+pub fn provider_registry() -> gen_core::Result<gen_core::ProviderRegistry> {
+    register_providers(gen_core::ProviderRegistryBuilder::new()).build()
+}
+
+/// The codec snapshot's sharded weight files (the 2-shard `model*.safetensors` + its index).
+const CODEC_WEIGHT_FILES: &[&str] = &[
+    "model.safetensors.index.json",
+    "model-00001-of-00002.safetensors",
+    "model-00002-of-00002.safetensors",
+];
+
+/// Materialize the pinned MOSS-TTS-Realtime AR snapshot through the audio lane's F-029 hub path:
 /// `config.json` (the snapshot-dir probe), the single-file `model.safetensors`, and the Qwen
-/// tokenizer — all at [`HUB_REVISION`], landing in the ordinary HF cache.
+/// tokenizer — all at [`HUB_REVISION`]. Also materializes the pinned MOSS-Audio-Tokenizer codec
+/// snapshot (see [`resolve_pinned_codec_snapshot`]) so a single call warms both models the provider
+/// needs to render audio. Returns the AR snapshot dir.
 pub fn resolve_pinned_snapshot() -> AudioResult<WeightsSource> {
     let dir = pinned_snapshot_dir(HUB_REPO, HUB_REVISION, "config.json")?;
     for file in [
@@ -347,7 +480,29 @@ pub fn resolve_pinned_snapshot() -> AudioResult<WeightsSource> {
     ] {
         hf_get_pinned(HUB_REPO, HUB_REVISION, file)?;
     }
+    // Also warm the codec snapshot — the provider needs both to render a waveform.
+    let _ = resolve_pinned_codec_snapshot()?;
     Ok(dir)
+}
+
+/// Materialize the pinned MOSS-Audio-Tokenizer codec snapshot (`config.json` + the sharded
+/// `model*.safetensors` + its index) at [`CODEC_HUB_REVISION`] through the audio lane's F-029 hub
+/// path, returning its snapshot directory. `MOSS_AUDIO_TOKENIZER_SNAPSHOT` overrides with a local
+/// dir (for the real-weight test / air-gapped runs).
+pub fn resolve_pinned_codec_snapshot() -> AudioResult<PathBuf> {
+    if let Ok(dir) = std::env::var("MOSS_AUDIO_TOKENIZER_SNAPSHOT") {
+        return Ok(PathBuf::from(dir));
+    }
+    let dir = pinned_snapshot_dir(CODEC_HUB_REPO, CODEC_HUB_REVISION, "config.json")?;
+    for file in CODEC_WEIGHT_FILES {
+        hf_get_pinned(CODEC_HUB_REPO, CODEC_HUB_REVISION, file)?;
+    }
+    match dir {
+        WeightsSource::Dir(p) => Ok(p),
+        other => Err(candle_audio::AudioError::Msg(format!(
+            "{MODEL_ID}: expected a codec snapshot dir, got {other:?}"
+        ))),
+    }
 }
 
 #[cfg(test)]
