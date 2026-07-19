@@ -35,7 +35,7 @@ use std::sync::Mutex;
 
 use candle_gen::candle_core::Device;
 use candle_gen::gen_core::{
-    self, Capabilities, GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality,
+    self, Capabilities, GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality,
     ModelDescriptor, Progress, WeightsSource,
 };
 
@@ -70,6 +70,47 @@ pub struct SanaGenerator {
     device: Device,
     /// Cached composed pipeline. `Mutex` because `Generator` is shared and `generate` takes `&self`.
     pipeline: Mutex<Option<std::sync::Arc<SanaPipeline>>>,
+}
+
+trait BaseBatchPipeline {
+    type Conditioning;
+
+    fn encode_batch(
+        &self,
+        req: &SanaGenerateRequest<'_>,
+        guidance: f32,
+    ) -> candle_gen::Result<Self::Conditioning>;
+    fn render_seed(
+        &self,
+        req: &SanaGenerateRequest<'_>,
+        conditioning: &Self::Conditioning,
+        device: &Device,
+        cancel: &gen_core::CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::Result<Image>;
+}
+
+impl BaseBatchPipeline for SanaPipeline {
+    type Conditioning = crate::pipeline::SanaConditioning;
+
+    fn encode_batch(
+        &self,
+        req: &SanaGenerateRequest<'_>,
+        guidance: f32,
+    ) -> candle_gen::Result<Self::Conditioning> {
+        self.encode_conditioning(req, guidance)
+    }
+
+    fn render_seed(
+        &self,
+        req: &SanaGenerateRequest<'_>,
+        conditioning: &Self::Conditioning,
+        device: &Device,
+        cancel: &gen_core::CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::Result<Image> {
+        self.generate_with_conditioning(req, conditioning, device, cancel, on_progress)
+    }
 }
 
 impl SanaGenerator {
@@ -245,6 +286,55 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     }))
 }
 
+fn generate_base_images(
+    pipeline: &impl BaseBatchPipeline,
+    req: &GenerationRequest,
+    device: &Device,
+    on_progress: &mut dyn FnMut(Progress),
+) -> gen_core::Result<Vec<Image>> {
+    let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
+    let steps = req.steps.map(|s| s as usize);
+    let guidance = req.guidance.unwrap_or(crate::pipeline::DEFAULT_GUIDANCE);
+    let conditioning = pipeline
+        .encode_batch(
+            &SanaGenerateRequest {
+                prompt: &req.prompt,
+                negative_prompt: req.negative_prompt.as_deref(),
+                height: req.height,
+                width: req.width,
+                steps,
+                guidance_scale: req.guidance,
+                seed: None,
+                sampler: req.sampler.as_deref(),
+                scheduler: req.scheduler.as_deref(),
+            },
+            guidance,
+        )
+        .map_err(gen_core::Error::from)?;
+
+    candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
+        pipeline
+            .render_seed(
+                &SanaGenerateRequest {
+                    prompt: &req.prompt,
+                    negative_prompt: req.negative_prompt.as_deref(),
+                    height: req.height,
+                    width: req.width,
+                    steps,
+                    guidance_scale: req.guidance,
+                    seed: Some(seed),
+                    sampler: req.sampler.as_deref(),
+                    scheduler: req.scheduler.as_deref(),
+                },
+                &conditioning,
+                device,
+                &req.cancel,
+                on_progress,
+            )
+            .map_err(gen_core::Error::from)
+    })
+}
+
 impl Generator for SanaGenerator {
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
@@ -262,25 +352,7 @@ impl Generator for SanaGenerator {
         self.validate(req)?;
         let pipeline = self.pipeline()?;
 
-        let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
-        let steps = req.steps.map(|s| s as usize);
-        // Each image of a `count`-batch renders at `base_seed + index` (the shared reproducibility law).
-        let images = candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
-            let sana_req = SanaGenerateRequest {
-                prompt: &req.prompt,
-                negative_prompt: req.negative_prompt.as_deref(),
-                height: req.height,
-                width: req.width,
-                steps,
-                guidance_scale: req.guidance,
-                seed: Some(seed),
-                sampler: req.sampler.as_deref(),
-                scheduler: req.scheduler.as_deref(),
-            };
-            pipeline
-                .generate_with(&sana_req, &self.device, &req.cancel, on_progress)
-                .map_err(gen_core::Error::from)
-        })?;
+        let images = generate_base_images(pipeline.as_ref(), req, &self.device, on_progress)?;
         Ok(GenerationOutput::Images(images))
     }
 }
@@ -308,6 +380,74 @@ impl SanaSprintGenerator {
         *guard = Some(built.clone());
         Ok(built)
     }
+}
+
+trait SprintBatchPipeline {
+    type Conditioning;
+
+    fn encode_batch(&self, prompt: &str) -> candle_gen::Result<Self::Conditioning>;
+    fn render_seed(
+        &self,
+        req: &SanaGenerateRequest<'_>,
+        conditioning: &Self::Conditioning,
+        device: &Device,
+        cancel: &gen_core::CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::Result<Image>;
+}
+
+impl SprintBatchPipeline for SanaSprintPipeline {
+    type Conditioning = candle_gen::candle_core::Tensor;
+
+    fn encode_batch(&self, prompt: &str) -> candle_gen::Result<Self::Conditioning> {
+        self.encode_conditioning(prompt)
+    }
+
+    fn render_seed(
+        &self,
+        req: &SanaGenerateRequest<'_>,
+        conditioning: &Self::Conditioning,
+        device: &Device,
+        cancel: &gen_core::CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::Result<Image> {
+        self.generate_with_conditioning(req, conditioning, device, cancel, on_progress)
+    }
+}
+
+fn generate_sprint_images(
+    pipeline: &impl SprintBatchPipeline,
+    req: &GenerationRequest,
+    device: &Device,
+    on_progress: &mut dyn FnMut(Progress),
+) -> gen_core::Result<Vec<Image>> {
+    let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
+    let steps = req.steps.map(|s| s as usize);
+    let conditioning = pipeline
+        .encode_batch(&req.prompt)
+        .map_err(gen_core::Error::from)?;
+
+    candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
+        pipeline
+            .render_seed(
+                &SanaGenerateRequest {
+                    prompt: &req.prompt,
+                    negative_prompt: None,
+                    height: req.height,
+                    width: req.width,
+                    steps,
+                    guidance_scale: req.guidance,
+                    seed: Some(seed),
+                    sampler: None,
+                    scheduler: None,
+                },
+                &conditioning,
+                device,
+                &req.cancel,
+                on_progress,
+            )
+            .map_err(gen_core::Error::from)
+    })
 }
 
 /// Construct the (lazy) candle **SANA-Sprint** generator (sc-11781) from a [`LoadSpec`]. Identical
@@ -368,25 +508,7 @@ impl Generator for SanaSprintGenerator {
         self.validate(req)?;
         let pipeline = self.pipeline()?;
 
-        let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
-        let steps = req.steps.map(|s| s as usize);
-        let images = candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
-            let sana_req = SanaGenerateRequest {
-                prompt: &req.prompt,
-                // Sprint is CFG-free; the negative prompt / curated sampler+scheduler are ignored.
-                negative_prompt: None,
-                height: req.height,
-                width: req.width,
-                steps,
-                guidance_scale: req.guidance,
-                seed: Some(seed),
-                sampler: None,
-                scheduler: None,
-            };
-            pipeline
-                .generate_with(&sana_req, &self.device, &req.cancel, on_progress)
-                .map_err(gen_core::Error::from)
-        })?;
+        let images = generate_sprint_images(pipeline.as_ref(), req, &self.device, on_progress)?;
         Ok(GenerationOutput::Images(images))
     }
 }
@@ -403,6 +525,154 @@ candle_gen::register_generators! {
 mod tests {
     use super::*;
     use candle_gen::gen_core::Quant;
+
+    use std::cell::{Cell, RefCell};
+
+    struct BaseFixturePipeline {
+        encoder_calls: Cell<usize>,
+        rendered_seeds: RefCell<Vec<u64>>,
+    }
+
+    impl BaseBatchPipeline for BaseFixturePipeline {
+        type Conditioning = Vec<u8>;
+
+        fn encode_batch(
+            &self,
+            req: &SanaGenerateRequest<'_>,
+            guidance: f32,
+        ) -> candle_gen::Result<Self::Conditioning> {
+            self.encoder_calls
+                .set(self.encoder_calls.get() + if guidance > 1.0 { 2 } else { 1 });
+            let mut bytes = req.prompt.as_bytes().to_vec();
+            if guidance > 1.0 {
+                bytes.extend_from_slice(req.negative_prompt.unwrap_or("").as_bytes());
+            }
+            Ok(bytes)
+        }
+
+        fn render_seed(
+            &self,
+            req: &SanaGenerateRequest<'_>,
+            conditioning: &Self::Conditioning,
+            _device: &Device,
+            _cancel: &gen_core::CancelFlag,
+            _on_progress: &mut dyn FnMut(Progress),
+        ) -> candle_gen::Result<Image> {
+            let seed = req.seed.expect("the adapter supplies every per-image seed");
+            self.rendered_seeds.borrow_mut().push(seed);
+            Ok(fixture_image(conditioning, seed))
+        }
+    }
+
+    struct SprintFixturePipeline {
+        encoder_calls: Cell<usize>,
+        rendered_seeds: RefCell<Vec<u64>>,
+    }
+
+    impl SprintBatchPipeline for SprintFixturePipeline {
+        type Conditioning = Vec<u8>;
+
+        fn encode_batch(&self, prompt: &str) -> candle_gen::Result<Self::Conditioning> {
+            self.encoder_calls.set(self.encoder_calls.get() + 1);
+            Ok(prompt.as_bytes().to_vec())
+        }
+
+        fn render_seed(
+            &self,
+            req: &SanaGenerateRequest<'_>,
+            conditioning: &Self::Conditioning,
+            _device: &Device,
+            _cancel: &gen_core::CancelFlag,
+            _on_progress: &mut dyn FnMut(Progress),
+        ) -> candle_gen::Result<Image> {
+            let seed = req.seed.expect("the adapter supplies every per-image seed");
+            self.rendered_seeds.borrow_mut().push(seed);
+            Ok(fixture_image(conditioning, seed))
+        }
+    }
+
+    #[test]
+    fn base_adapter_encodes_cfg_once_and_preserves_per_seed_tail() {
+        let pipeline = BaseFixturePipeline {
+            encoder_calls: Cell::new(0),
+            rendered_seeds: RefCell::new(Vec::new()),
+        };
+        let request = GenerationRequest {
+            prompt: "cond".into(),
+            negative_prompt: Some("uncond".into()),
+            guidance: Some(4.5),
+            seed: Some(u64::MAX - 1),
+            count: 4,
+            ..req(256, 256)
+        };
+        let expected_conditioning = b"conduncond";
+        let expected = [u64::MAX - 1, u64::MAX, 0, 1]
+            .map(|seed| fixture_image(expected_conditioning, seed))
+            .to_vec();
+
+        let actual = generate_base_images(&pipeline, &request, &Device::Cpu, &mut |_| {}).unwrap();
+
+        assert_eq!(pipeline.encoder_calls.get(), 2);
+        assert_eq!(
+            *pipeline.rendered_seeds.borrow(),
+            vec![u64::MAX - 1, u64::MAX, 0, 1]
+        );
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn base_adapter_without_cfg_encodes_only_cond_once() {
+        let pipeline = BaseFixturePipeline {
+            encoder_calls: Cell::new(0),
+            rendered_seeds: RefCell::new(Vec::new()),
+        };
+        let request = GenerationRequest {
+            guidance: Some(1.0),
+            seed: Some(7),
+            count: 3,
+            ..req(256, 256)
+        };
+
+        let images = generate_base_images(&pipeline, &request, &Device::Cpu, &mut |_| {}).unwrap();
+
+        assert_eq!(pipeline.encoder_calls.get(), 1);
+        assert_eq!(*pipeline.rendered_seeds.borrow(), vec![7, 8, 9]);
+        assert_eq!(images.len(), 3);
+    }
+
+    #[test]
+    fn sprint_adapter_encodes_once_and_preserves_per_seed_tail() {
+        let pipeline = SprintFixturePipeline {
+            encoder_calls: Cell::new(0),
+            rendered_seeds: RefCell::new(Vec::new()),
+        };
+        let request = GenerationRequest {
+            prompt: "sprint cond".into(),
+            seed: Some(11),
+            count: 3,
+            ..req(256, 256)
+        };
+        let expected = [11, 12, 13]
+            .map(|seed| fixture_image(b"sprint cond", seed))
+            .to_vec();
+
+        let actual =
+            generate_sprint_images(&pipeline, &request, &Device::Cpu, &mut |_| {}).unwrap();
+
+        assert_eq!(pipeline.encoder_calls.get(), 1);
+        assert_eq!(*pipeline.rendered_seeds.borrow(), vec![11, 12, 13]);
+        assert_eq!(actual, expected);
+    }
+
+    fn fixture_image(conditioning: &[u8], seed: u64) -> Image {
+        let mut pixels = conditioning.to_vec();
+        pixels.extend_from_slice(&seed.to_le_bytes());
+        Image {
+            width: pixels.len() as u32,
+            height: 1,
+            pixels,
+        }
+    }
 
     fn req(w: u32, h: u32) -> GenerationRequest {
         GenerationRequest {
