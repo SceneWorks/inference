@@ -75,6 +75,19 @@ environment = ["CHATTERBOX_VE_SNAPSHOT"]
 expected_files = ["ve.safetensors"]
 
 [[models]]
+# The Chatterbox clone-TTS generator (sc-13222) — same pinned repo as the voice embedder above.
+# The T3 LM stage is ported and gated on real weights here; the S3Gen stack (s3gen.safetensors) is
+# listed so the snapshot is complete once that slice lands.
+key = "chatterbox"
+repository = "ResembleAI/chatterbox"
+revision = "5bb1f6ee58e50c3b8d408bc82a6d3740c2db6e18"
+license = "MIT"
+size_class = "large"
+profiles = ["audio-macos"]
+environment = ["CHATTERBOX_SNAPSHOT"]
+expected_files = ["t3_cfg.safetensors", "s3gen.safetensors", "tokenizer.json"]
+
+[[models]]
 key = "openvoice-v2"
 repository = "myshell-ai/OpenVoiceV2"
 revision = "f36e7edfe1684461a8343844af60babc2efbb727"

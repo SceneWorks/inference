@@ -68,6 +68,7 @@ jobs:
       KOKORO_SNAPSHOT: ${{ vars.KOKORO_SNAPSHOT }}
       MOSS_SFX_SNAPSHOT: ${{ vars.MOSS_SFX_SNAPSHOT }}
       CHATTERBOX_VE_SNAPSHOT: ${{ vars.CHATTERBOX_VE_SNAPSHOT }}
+      CHATTERBOX_SNAPSHOT: ${{ vars.CHATTERBOX_SNAPSHOT }}
       OPENVOICE_V2_SNAPSHOT: ${{ vars.OPENVOICE_V2_SNAPSHOT }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -79,6 +80,7 @@ jobs:
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model kokoro-82m --snapshot "$KOKORO_SNAPSHOT"
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model moss-soundeffect-v2 --snapshot "$MOSS_SFX_SNAPSHOT"
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model chatterbox-ve --snapshot "$CHATTERBOX_VE_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model chatterbox --snapshot "$CHATTERBOX_SNAPSHOT"
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model openvoice-v2 --snapshot "$OPENVOICE_V2_SNAPSHOT"
       - name: Run provider conformance
         run: |
@@ -95,6 +97,12 @@ jobs:
           # chatterbox_ve above.
           cargo test --locked -p candle-audio-openvoice --test conformance openvoice_v2_converts_toward_the_target_voice -- --ignored --nocapture
           cargo test --locked -p candle-audio-openvoice --test conformance openvoice_v2_is_deterministic -- --ignored --nocapture
+          # Chatterbox clone-TTS (sc-13222): the T3 speech-token LM stage on real t3_cfg.safetensors
+          # weights — a valid, non-degenerate, voice-responsive token sequence, plus the honest
+          # S3Gen boundary. The full sc-12838 clone-WAV gate is deferred to the S3Gen slice.
+          cargo test --locked -p candle-audio-chatterbox --test conformance chatterbox_t3_produces_valid_speech_tokens -- --ignored --nocapture
+          cargo test --locked -p candle-audio-chatterbox --test conformance chatterbox_t3_responds_to_the_reference_voice -- --ignored --nocapture
+          cargo test --locked -p candle-audio-chatterbox --test conformance chatterbox_generate_stops_honestly_at_the_s3gen_boundary -- --ignored --nocapture
       # Regression fixture (sc-12854): the validation harness's committed metric envelope +
       # PCM repeatability hash; this runner IS the fixture's canonical platform
       # (macos/aarch64), so the exact-hash check gates here.
