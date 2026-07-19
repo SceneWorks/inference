@@ -124,6 +124,7 @@ pub fn descriptor() -> ModelDescriptor {
             max_audio_duration_secs: Some(MAX_DURATION_SECS),
             audio_voices: VOICES.to_vec(),
             audio_languages: LANGUAGES.to_vec(),
+            audio_edit_modes: vec![],
             supported_quants: &[],
             supports_kv_cache: false,
             requires_sigma_shift: false,

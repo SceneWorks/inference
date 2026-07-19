@@ -240,6 +240,7 @@ impl Sd3Variant {
                 max_audio_duration_secs: None,
                 audio_voices: vec![],
                 audio_languages: vec![],
+                audio_edit_modes: vec![],
             },
         }
     }

@@ -309,6 +309,56 @@ pub struct VideoClipRef<'a> {
     pub strength: f32,
 }
 
+/// Which edit operation a [`Conditioning::AudioEdit`] requests of a prompted audio editor (sc-12847),
+/// mapped by the provider onto ACE-Step 1.5's native audio-to-audio task modes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AudioEditMode {
+    /// Regenerate a bounded interior span fresh from the prompt while keeping the rest of the clip
+    /// (ACE-Step `repaint`, the edit window silence-substituted so the model fills it anew).
+    /// Requires a [`TimeRegion`].
+    Inpaint,
+    /// Regenerate a bounded span, the model conditioning on the surrounding source for continuity
+    /// (ACE-Step `repaint`). Requires a [`TimeRegion`]. Distinct from [`Inpaint`](Self::Inpaint) at
+    /// the contract level; the shared ACE-Step machinery differs only in whether the window is
+    /// seeded from silence.
+    Repaint,
+    /// Continue the clip past its end: the appended tail is generated from the prompt while the
+    /// original audio is preserved (ACE-Step `repaint` with the generate window at the tail). The
+    /// [`TimeRegion`]'s `start_secs` is where generation begins (defaults to the source length) and
+    /// `end_secs` names the new total length.
+    Extend,
+    /// Restyle the whole clip from a new prompt (ACE-Step `cover`). Whole-clip; any [`TimeRegion`]
+    /// is ignored.
+    Cover,
+}
+
+/// A half-open time span `[start_secs, end_secs)` in seconds — the edit region of a
+/// [`Conditioning::AudioEdit`] (sc-12847). `end_secs = None` means "to the end of the clip" (and for
+/// [`AudioEditMode::Extend`] names the new total length). Both bounds join the finiteness floor.
+///
+/// Expressed in **seconds** (not latent frames) so the contract stays VAE-stride-agnostic: the
+/// provider converts to latent-frame indices via its own `latents_per_second`. This is the audio
+/// analogue of the image lane's masked-region conditioning (the pixel [`Conditioning::Mask`] / the
+/// video [`Conditioning::ControlClip`]'s `start_frame`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TimeRegion {
+    /// Region start (seconds from the clip start). Must be finite and `>= 0`.
+    pub start_secs: f32,
+    /// Region end (seconds). `None` ⇒ the end of the clip. When present must be finite and
+    /// `> start_secs`.
+    pub end_secs: Option<f32>,
+}
+
+/// A prompted source-audio edit — a borrowed, normalized view of a [`Conditioning::AudioEdit`].
+/// Returned by [`GenerationRequest::audio_edit`] (sc-12847).
+#[derive(Clone, Copy, Debug)]
+pub struct AudioEditRef<'a> {
+    pub audio: &'a AudioTrack,
+    pub mode: AudioEditMode,
+    pub region: Option<TimeRegion>,
+    pub strength: Option<f32>,
+}
+
 /// A replace_person masked control clip — a borrowed view of a [`Conditioning::ControlClip`].
 /// Returned by [`GenerationRequest::control_clip`].
 #[derive(Clone, Copy, Debug)]
@@ -446,6 +496,29 @@ impl GenerationRequest {
                 } if !s.is_finite() => {
                     return Some(("conditioning.reference_audio.strength", *s));
                 }
+                // The audio-edit strength and its region bounds all flow into the edit-window /
+                // blend math; a NaN would silently poison the region conversion or the strength
+                // gate (sc-12847).
+                Conditioning::AudioEdit {
+                    strength: Some(s), ..
+                } if !s.is_finite() => {
+                    return Some(("conditioning.audio_edit.strength", *s));
+                }
+                Conditioning::AudioEdit {
+                    region: Some(r), ..
+                } if !r.start_secs.is_finite() => {
+                    return Some(("conditioning.audio_edit.region.start_secs", r.start_secs));
+                }
+                Conditioning::AudioEdit {
+                    region:
+                        Some(TimeRegion {
+                            end_secs: Some(end),
+                            ..
+                        }),
+                    ..
+                } if !end.is_finite() => {
+                    return Some(("conditioning.audio_edit.region.end_secs", *end));
+                }
                 Conditioning::VoiceEmbedding {
                     strength: Some(s), ..
                 } if !s.is_finite() => {
@@ -526,6 +599,26 @@ impl GenerationRequest {
             _ => None,
         })
     }
+
+    /// The prompted audio-edit conditioning ([`Conditioning::AudioEdit`]), if present. The first one
+    /// wins (a request carries at most one source-audio edit per generation, mirroring
+    /// [`control_clip`](Self::control_clip)). sc-12847.
+    pub fn audio_edit(&self) -> Option<AudioEditRef<'_>> {
+        self.conditioning.iter().find_map(|c| match c {
+            Conditioning::AudioEdit {
+                audio,
+                mode,
+                region,
+                strength,
+            } => Some(AudioEditRef {
+                audio,
+                mode: *mode,
+                region: *region,
+                strength: *strength,
+            }),
+            _ => None,
+        })
+    }
 }
 
 /// Seed when a [`GenerationRequest`] omits one: nanos since the epoch (any nonzero value works —
@@ -560,6 +653,32 @@ pub enum Conditioning {
     /// later reuses [`Conditioning::VideoClip`] — this variant is audio-in only.
     ReferenceAudio {
         audio: AudioTrack,
+        strength: Option<f32>,
+    },
+    /// **Prompted source-audio editing** (sc-12847) — the audio analogue of the image lane's masked
+    /// edit / inpaint conditioning ([`Conditioning::Mask`] and the region-carrying
+    /// [`Conditioning::ControlClip`]): a source clip plus an edit *mode* and an optional *region*,
+    /// so the prompt (+ lyrics/metadata) restyles or regenerates part or all of the clip.
+    ///
+    /// This is a **distinct variant**, not an extension of [`Conditioning::ReferenceAudio`] — that
+    /// variant is deliberately scoped to a whole-clip voice/style reference (audio-in only), and an
+    /// edit carries a fundamentally different shape (a task mode + a bounded region). Bundling the
+    /// clip, mode, region, and strength in one self-contained variant mirrors how
+    /// [`Conditioning::ControlClip`] carries `frames` + `mask` + `mode` + `start_frame` +
+    /// `masking_strength` together for the video replace_person edit, and keeps
+    /// `ReferenceAudio`'s serialized/semantic contract stable (CONTRIBUTING.md compatibility).
+    ///
+    /// - `audio` — the source clip to edit.
+    /// - `mode` — which edit operation ([`AudioEditMode`]); the provider maps it onto ACE-Step's
+    ///   native task modes.
+    /// - `region` — the span to edit ([`TimeRegion`], seconds); `None` = whole clip. Region modes
+    ///   ([`AudioEditMode::Inpaint`] / [`AudioEditMode::Repaint`] / [`AudioEditMode::Extend`])
+    ///   require it; [`AudioEditMode::Cover`] ignores it.
+    /// - `strength` — edit strength; `None` ⇒ the model default. Joins the finiteness floor.
+    AudioEdit {
+        audio: AudioTrack,
+        mode: AudioEditMode,
+        region: Option<TimeRegion>,
         strength: Option<f32>,
     },
     /// A precomputed **voice-identity embedding** — a cloned voice driving TTS (sc-12838; the audio
@@ -636,6 +755,7 @@ impl Conditioning {
         match self {
             Conditioning::Reference { .. } => ConditioningKind::Reference,
             Conditioning::ReferenceAudio { .. } => ConditioningKind::ReferenceAudio,
+            Conditioning::AudioEdit { .. } => ConditioningKind::AudioEdit,
             Conditioning::VoiceEmbedding { .. } => ConditioningKind::VoiceEmbedding,
             Conditioning::MultiReference { .. } => ConditioningKind::MultiReference,
             Conditioning::ReduxRefs { .. } => ConditioningKind::ReduxRefs,
@@ -676,6 +796,8 @@ pub enum ConditioningKind {
     Reference,
     /// Voice/style reference audio ([`Conditioning::ReferenceAudio`]).
     ReferenceAudio,
+    /// Prompted source-audio editing ([`Conditioning::AudioEdit`]).
+    AudioEdit,
     /// A precomputed cloned-voice identity embedding ([`Conditioning::VoiceEmbedding`]).
     VoiceEmbedding,
     MultiReference,
@@ -756,6 +878,13 @@ pub struct Capabilities {
     /// Language codes this model supports. Empty ⇒ no selectable language surface: an explicit
     /// `audio.language` is rejected as [`Error::Unsupported`].
     pub audio_languages: Vec<&'static str>,
+    /// The prompted-audio-edit modes this model serves ([`AudioEditMode`]) — advertised so a
+    /// consumer knows which edits the (edit-capable) generator accepts, and the shared floor
+    /// rejects an [`Conditioning::AudioEdit`] whose `mode` is not listed as
+    /// [`Error::Unsupported`] (sc-12847). Empty ⇒ the model is not an audio editor; combined with
+    /// admitting [`ConditioningKind::AudioEdit`] in [`conditioning`](Self::conditioning) it names
+    /// exactly the editable surface.
+    pub audio_edit_modes: Vec<AudioEditMode>,
     /// On-the-fly quantization levels this engine offers (empty slice = none). Read by the worker's
     /// capability advertisement (sc-3723) instead of a hardcoded per-row flag. `Default` is `&[]`.
     pub supported_quants: &'static [Quant],
@@ -1042,6 +1171,38 @@ impl Capabilities {
                 return Err(Error::Unsupported(format!(
                     "{id}: {kind:?} conditioning is not supported"
                 )));
+            }
+        }
+        // Audio-edit sub-surface (sc-12847): once the `AudioEdit` kind is admitted above, the
+        // requested *mode* must sit inside the advertised [`audio_edit_modes`] (an unlisted mode is
+        // a capability gap → typed `Error::Unsupported`, like an unadvertised sampler), and the
+        // region — when present — must be well-formed (`start >= 0`, `end > start`). Region
+        // finiteness is already enforced by `ensure_finite_floats` above; clip-bound checks (region
+        // inside the source duration) belong to the provider, which knows the clip length.
+        for c in &req.conditioning {
+            if let Conditioning::AudioEdit { mode, region, .. } = c {
+                if !self.audio_edit_modes.contains(mode) {
+                    return Err(Error::Unsupported(format!(
+                        "{id}: unsupported audio edit mode {mode:?} (supported: {:?})",
+                        self.audio_edit_modes
+                    )));
+                }
+                if let Some(r) = region {
+                    if r.start_secs < 0.0 {
+                        return Err(Error::Msg(format!(
+                            "{id}: audio edit region start {}s must be >= 0",
+                            r.start_secs
+                        )));
+                    }
+                    if let Some(end) = r.end_secs {
+                        if end <= r.start_secs {
+                            return Err(Error::Msg(format!(
+                                "{id}: audio edit region end {end}s must be > start {}s",
+                                r.start_secs
+                            )));
+                        }
+                    }
+                }
             }
         }
         Ok(())
@@ -1872,6 +2033,170 @@ mod tests {
                     true_cfg: Some(2.0),
                     ..base_req()
                 }
+            )
+            .is_ok());
+    }
+
+    // ---- Prompted audio editing (sc-12847) -------------------------------------------------
+
+    /// An audio-edit capability surface: admits the `AudioEdit` kind and advertises two modes.
+    fn edit_caps() -> Capabilities {
+        Capabilities {
+            conditioning: vec![ConditioningKind::AudioEdit],
+            audio_edit_modes: vec![AudioEditMode::Repaint, AudioEditMode::Extend],
+            min_size: 1,
+            max_size: 4096,
+            max_count: 1,
+            ..Default::default()
+        }
+    }
+
+    fn edit_req(
+        mode: AudioEditMode,
+        region: Option<TimeRegion>,
+        strength: Option<f32>,
+    ) -> GenerationRequest {
+        GenerationRequest {
+            prompt: "x".into(),
+            width: 512,
+            height: 512,
+            conditioning: vec![Conditioning::AudioEdit {
+                audio: track(),
+                mode,
+                region,
+                strength,
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn audio_edit_kind_and_accessor_round_trip() {
+        let region = TimeRegion {
+            start_secs: 4.0,
+            end_secs: Some(8.0),
+        };
+        let req = edit_req(AudioEditMode::Repaint, Some(region), Some(0.7));
+        assert_eq!(
+            req.conditioning[0].kind(),
+            ConditioningKind::AudioEdit,
+            "AudioEdit maps to its own kind"
+        );
+        let e = req.audio_edit().expect("audio_edit present");
+        assert_eq!(e.mode, AudioEditMode::Repaint);
+        assert_eq!(e.region, Some(region));
+        assert_eq!(e.strength, Some(0.7));
+        assert_eq!(e.audio.sample_rate, 24_000);
+        // A request without an AudioEdit yields None.
+        assert!(GenerationRequest::default().audio_edit().is_none());
+    }
+
+    #[test]
+    fn audio_edit_mode_is_gated_by_the_advertised_surface() {
+        let c = edit_caps();
+        // Advertised modes pass; the region is well-formed.
+        assert!(c
+            .validate_request(
+                "m",
+                &edit_req(
+                    AudioEditMode::Repaint,
+                    Some(TimeRegion {
+                        start_secs: 4.0,
+                        end_secs: Some(8.0),
+                    }),
+                    None,
+                ),
+            )
+            .is_ok());
+        // An unadvertised mode is a typed capability gap.
+        let err = c
+            .validate_request("m", &edit_req(AudioEditMode::Cover, None, None))
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Unsupported(_)),
+            "unlisted mode → Unsupported"
+        );
+        assert!(err.to_string().contains("unsupported audio edit mode"));
+        // The whole kind is rejected when not admitted at all.
+        let no_edit = Capabilities {
+            conditioning: vec![ConditioningKind::Reference],
+            ..edit_caps()
+        };
+        assert!(matches!(
+            no_edit
+                .validate_request("m", &edit_req(AudioEditMode::Repaint, None, None))
+                .unwrap_err(),
+            Error::Unsupported(_)
+        ));
+    }
+
+    #[test]
+    fn audio_edit_region_and_strength_are_floored() {
+        let c = edit_caps();
+        // start < 0 and end <= start are malformed ranges → Msg.
+        for region in [
+            TimeRegion {
+                start_secs: -1.0,
+                end_secs: Some(4.0),
+            },
+            TimeRegion {
+                start_secs: 8.0,
+                end_secs: Some(4.0),
+            },
+            TimeRegion {
+                start_secs: 4.0,
+                end_secs: Some(4.0),
+            },
+        ] {
+            let err = c
+                .validate_request("m", &edit_req(AudioEditMode::Repaint, Some(region), None))
+                .unwrap_err();
+            assert!(matches!(err, Error::Msg(_)), "{region:?} → Msg range error");
+        }
+        // Non-finite strength / region bounds are caught by the finiteness floor.
+        for bad in [f32::NAN, f32::INFINITY] {
+            assert!(c
+                .validate_request("m", &edit_req(AudioEditMode::Repaint, None, Some(bad)))
+                .is_err());
+            assert!(c
+                .validate_request(
+                    "m",
+                    &edit_req(
+                        AudioEditMode::Repaint,
+                        Some(TimeRegion {
+                            start_secs: bad,
+                            end_secs: None,
+                        }),
+                        None,
+                    ),
+                )
+                .is_err());
+            assert!(c
+                .validate_request(
+                    "m",
+                    &edit_req(
+                        AudioEditMode::Repaint,
+                        Some(TimeRegion {
+                            start_secs: 1.0,
+                            end_secs: Some(bad),
+                        }),
+                        None,
+                    ),
+                )
+                .is_err());
+        }
+        // A well-formed open-ended region (end None) passes.
+        assert!(c
+            .validate_request(
+                "m",
+                &edit_req(
+                    AudioEditMode::Extend,
+                    Some(TimeRegion {
+                        start_secs: 2.0,
+                        end_secs: None,
+                    }),
+                    Some(0.5),
+                ),
             )
             .is_ok());
     }

@@ -17,7 +17,8 @@ use std::path::PathBuf;
 
 use candle_audio_acestep::candle_audio;
 use candle_audio_acestep::gen_core::{
-    AudioParams, GenerationOutput, GenerationRequest, LoadSpec, Progress, WeightsSource,
+    AudioEditMode, AudioParams, AudioTrack, Conditioning, GenerationOutput, GenerationRequest,
+    LoadSpec, Progress, TimeRegion, WeightsSource,
 };
 
 /// Resolve the snapshot: `ACESTEP_SNAPSHOT` env (a snapshot dir) or the pinned hub path.
@@ -290,5 +291,259 @@ fn acestep_music_wav_conformance() {
     assert_eq!(
         track.samples, track2.samples,
         "seeded synthesis must be deterministic"
+    );
+}
+
+// ============================ Prompted audio editing (sc-12847) ============================
+
+/// Mono downmix of an interleaved track.
+fn mono(track: &AudioTrack) -> Vec<f32> {
+    let ch = track.channels as usize;
+    track
+        .samples
+        .chunks(ch)
+        .map(|c| c.iter().sum::<f32>() / c.len() as f32)
+        .collect()
+}
+
+/// RMS of a slice.
+fn rms(x: &[f32]) -> f32 {
+    if x.is_empty() {
+        return 0.0;
+    }
+    (x.iter().map(|s| s * s).sum::<f32>() / x.len() as f32).sqrt()
+}
+
+/// Relative L2 change `‖a − b‖ / ‖a‖` over a paired span (0 = identical, ~√2 = uncorrelated
+/// same-energy).
+fn rel_l2(a: &[f32], b: &[f32]) -> f32 {
+    let num: f32 = a
+        .iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).powi(2))
+        .sum::<f32>()
+        .sqrt();
+    let den: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-9);
+    num / den
+}
+
+/// Pearson correlation over a paired span (1 = identical shape, ~0 = unrelated).
+fn corr(a: &[f32], b: &[f32]) -> f32 {
+    let n = a.len().min(b.len());
+    if n == 0 {
+        return 0.0;
+    }
+    let (a, b) = (&a[..n], &b[..n]);
+    let ma = a.iter().sum::<f32>() / n as f32;
+    let mb = b.iter().sum::<f32>() / n as f32;
+    let mut num = 0.0f32;
+    let mut da = 0.0f32;
+    let mut db = 0.0f32;
+    for (x, y) in a.iter().zip(b) {
+        let (dx, dy) = (x - ma, y - mb);
+        num += dx * dy;
+        da += dx * dx;
+        db += dy * dy;
+    }
+    num / (da.sqrt() * db.sqrt()).max(1e-9)
+}
+
+/// The prompted-edit real-WAV DoD (sc-12847): synthesize a source clip via text-to-music, then
+/// **repaint seconds 4–8** with a contrasting prompt and assert the edited track
+/// - is 48 kHz stereo, finite, non-silent, and the same duration as the source;
+/// - **preserves the untouched span** — the samples outside the region are ~identical to the
+///   source (relative-L2 ≈ 0, correlation ≈ 1). This fails if the edit ignored the region and
+///   changed the whole clip;
+/// - **changed the edited span** — the samples inside the region differ substantially from the
+///   source (relative-L2 well above 0, correlation well below 1) and are non-silent. This fails if
+///   the edit ignored the prompt and nothing changed.
+///
+/// The source + edited WAVs are written for human listening (`ACESTEP_EDIT_SOURCE_WAV` /
+/// `ACESTEP_EDIT_RESULT_WAV` override the paths).
+#[test]
+#[ignore = "real weights: needs an ACE-Step snapshot (ACESTEP_SNAPSHOT or network); run with --ignored"]
+fn acestep_edit_repaint_wav_conformance() {
+    let spec = LoadSpec::new(snapshot());
+    let registry = candle_audio_acestep::provider_registry().unwrap();
+    let generator = registry
+        .load(candle_audio_acestep::MODEL_ID, &spec)
+        .expect("acestep_v15_turbo loads through the explicit registry");
+
+    const TARGET_SECS: f32 = 12.0;
+    const STEPS: u32 = 8;
+    const SEED: u64 = 42;
+    const REGION_START: f32 = 4.0;
+    const REGION_END: f32 = 8.0;
+
+    // 1. A source clip via ordinary text-to-music.
+    let source_req = GenerationRequest {
+        prompt: "gentle ambient piano with soft warm pads, slow and calm".into(),
+        seed: Some(SEED),
+        steps: Some(STEPS),
+        audio: Some(AudioParams {
+            target_duration: Some(TARGET_SECS),
+            sample_rate: Some(48_000),
+            language: Some("en".into()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let source = match generator
+        .generate(&source_req, &mut |_| {})
+        .expect("source generate")
+    {
+        GenerationOutput::Audio(t) => t,
+        other => panic!("expected audio, got {other:?}"),
+    };
+    assert_eq!(source.channels, 2);
+    assert_eq!(source.sample_rate, 48_000);
+
+    // 2. Repaint seconds 4–8 with a contrasting prompt (loud distorted guitar) — same seed/steps.
+    let edit_req = GenerationRequest {
+        prompt: "aggressive loud distorted electric guitar solo with driving drums".into(),
+        seed: Some(SEED),
+        steps: Some(STEPS),
+        audio: Some(AudioParams {
+            sample_rate: Some(48_000),
+            language: Some("en".into()),
+            ..Default::default()
+        }),
+        conditioning: vec![Conditioning::AudioEdit {
+            audio: source.clone(),
+            mode: AudioEditMode::Repaint,
+            region: Some(TimeRegion {
+                start_secs: REGION_START,
+                end_secs: Some(REGION_END),
+            }),
+            strength: None,
+        }],
+        ..Default::default()
+    };
+    let mut steps = 0u32;
+    let edited = match generator.generate(&edit_req, &mut |p| {
+        if let Progress::Step { .. } = p {
+            steps += 1;
+        }
+    }) {
+        Ok(GenerationOutput::Audio(t)) => t,
+        Ok(other) => panic!("expected audio, got {other:?}"),
+        Err(e) => panic!("edit generate failed: {e}"),
+    };
+    assert_eq!(steps, STEPS, "one progress step per solver step");
+
+    // 3. Shape + finiteness + duration.
+    assert_eq!(edited.sample_rate, 48_000);
+    assert_eq!(edited.channels, 2, "edit output is stereo");
+    assert!(
+        edited.samples.iter().all(|s| s.is_finite()),
+        "finite samples"
+    );
+    assert_eq!(
+        edited.samples.len(),
+        source.samples.len(),
+        "repaint preserves the source duration"
+    );
+
+    let src_m = mono(&source);
+    let edit_m = mono(&edited);
+    let n = src_m.len().min(edit_m.len());
+    let (src_m, edit_m) = (&src_m[..n], &edit_m[..n]);
+
+    // Region → mono-frame indices, with a 0.15 s guard excluding the crossfade seam.
+    let sr = source.sample_rate as f32;
+    let guard = (0.15 * sr) as usize;
+    let r0 = (REGION_START * sr) as usize;
+    let r1 = (REGION_END * sr) as usize;
+
+    // Untouched span = source (before the region) ∪ (after the region), inside the guard.
+    let mut src_out = Vec::new();
+    let mut edit_out = Vec::new();
+    for i in 0..n {
+        if i + guard < r0 || i > r1 + guard {
+            src_out.push(src_m[i]);
+            edit_out.push(edit_m[i]);
+        }
+    }
+    // Edited span = strictly inside the region, inside the guard.
+    let src_in = &src_m[r0 + guard..r1 - guard];
+    let edit_in = &edit_m[r0 + guard..r1 - guard];
+
+    let untouched_l2 = rel_l2(&src_out, &edit_out);
+    let untouched_corr = corr(&src_out, &edit_out);
+    let edited_l2 = rel_l2(src_in, edit_in);
+    let edited_corr = corr(src_in, edit_in);
+    let edited_rms = rms(edit_in);
+    let overall_rms = rms(edit_m);
+
+    // Write the evidence pair BEFORE the gates so a failing run still yields listenable WAVs.
+    let src_path = std::env::var("ACESTEP_EDIT_SOURCE_WAV")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir().join("acestep-edit-source-sc12847.wav"));
+    let out_path = std::env::var("ACESTEP_EDIT_RESULT_WAV")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir().join("acestep-edit-result-sc12847.wav"));
+    candle_audio::wav::write_wav_pcm16(&src_path, &source).expect("write source WAV");
+    candle_audio::wav::write_wav_pcm16(&out_path, &edited).expect("write edited WAV");
+    eprintln!(
+        "acestep edit evidence: source {} | edited {}\n  region [{REGION_START}, {REGION_END}] s | \
+         untouched: rel-L2 {untouched_l2:.5} corr {untouched_corr:.5} | \
+         edited: rel-L2 {edited_l2:.4} corr {edited_corr:.4} rms {edited_rms:.4} | overall rms {overall_rms:.4}",
+        src_path.display(),
+        out_path.display(),
+    );
+
+    // Non-silent overall.
+    assert!(
+        overall_rms > 0.01,
+        "edited clip is silent (rms {overall_rms:.5})"
+    );
+
+    // (a) PRESERVES THE UNTOUCHED SPAN — near-identity outside the region. Fails if the edit
+    //     ignored the region and changed the whole clip.
+    assert!(
+        untouched_l2 < 0.02,
+        "untouched span drifted from the source (rel-L2 {untouched_l2:.5}) — the edit changed \
+         audio outside the region"
+    );
+    assert!(
+        untouched_corr > 0.999,
+        "untouched span decorrelated from the source (corr {untouched_corr:.5})"
+    );
+
+    // (b) CHANGED THE EDITED SPAN — the region genuinely differs and is non-silent. Fails if the
+    //     edit ignored the prompt and nothing changed.
+    assert!(
+        edited_rms > 0.01,
+        "edited region is silent (rms {edited_rms:.5}) — the region was blanked, not repainted"
+    );
+    assert!(
+        edited_l2 > 0.3,
+        "edited region barely differs from the source (rel-L2 {edited_l2:.4}) — the prompt was \
+         ignored"
+    );
+    assert!(
+        edited_corr < 0.9,
+        "edited region is still highly correlated with the source (corr {edited_corr:.4})"
+    );
+
+    println!(
+        "acestep_edit_repaint_wav_conformance: region [{REGION_START},{REGION_END}]s | \
+         untouched rel-L2 {untouched_l2:.5} corr {untouched_corr:.5} | \
+         edited rel-L2 {edited_l2:.4} corr {edited_corr:.4} | wrote {} + {}",
+        src_path.display(),
+        out_path.display(),
+    );
+
+    // Determinism: the same edit request re-synthesizes byte-identically.
+    let edited2 = match generator
+        .generate(&edit_req, &mut |_| {})
+        .expect("second edit generate")
+    {
+        GenerationOutput::Audio(t) => t,
+        other => panic!("expected audio, got {other:?}"),
+    };
+    assert_eq!(
+        edited.samples, edited2.samples,
+        "seeded edit must be deterministic"
     );
 }

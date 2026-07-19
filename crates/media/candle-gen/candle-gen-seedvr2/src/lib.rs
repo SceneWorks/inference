@@ -94,6 +94,7 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
             max_audio_duration_secs: None,
             audio_voices: vec![],
             audio_languages: vec![],
+            audio_edit_modes: vec![],
             supported_quants: &[Quant::Q4, Quant::Q8], // Linear-only DiT quant (sc-5927)
         },
     }
