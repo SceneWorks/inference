@@ -80,10 +80,9 @@ fn align(value: u32) -> usize {
     (value / DIM_ALIGN).max(1) as usize * DIM_ALIGN as usize
 }
 
-/// Decode an `Image` (RGB24 `u8`) → `[3, th, tw]` f32 in `[-1, 1]`, resizing if its native size differs.
-/// `mode` is `Bicubic` for photographic images, `Bilinear` for color masks (bounded — avoids the bicubic
-/// overshoot that would invent out-of-gamut colors at mask edges).
-fn image_to_chw(img: &Image, tw: usize, th: usize, mode: Interp, dev: &Device) -> CResult<Tensor> {
+/// Decode and resize an RGB24 image on the host. Keeping the native-resolution tensor on CPU avoids
+/// uploading it only for [`interpolate`] to read it back into a host buffer (F-070 / sc-12517).
+fn image_to_chw_host(img: &Image, tw: usize, th: usize, mode: Interp) -> CResult<Tensor> {
     let (iw, ih) = (img.width as usize, img.height as usize);
     if img.pixels.len() != iw * ih * 3 {
         return Err(CandleError::Msg(format!(
@@ -92,7 +91,7 @@ fn image_to_chw(img: &Image, tw: usize, th: usize, mode: Interp, dev: &Device) -
         )));
     }
     let px: Vec<f32> = img.pixels.iter().map(|&p| p as f32 / 127.5 - 1.0).collect();
-    let chw = Tensor::from_vec(px, (ih, iw, 3), dev)?.permute((2, 0, 1))?; // [3,H,W]
+    let chw = Tensor::from_vec(px, (ih, iw, 3), &Device::Cpu)?.permute((2, 0, 1))?; // [3,H,W]
     let nchw = chw.reshape((1, 3, ih, iw))?;
     let out = if (ih, iw) != (th, tw) {
         interpolate(&nchw, th, tw, mode)?
@@ -102,12 +101,18 @@ fn image_to_chw(img: &Image, tw: usize, th: usize, mode: Interp, dev: &Device) -
     Ok(out.reshape((3, th, tw))?)
 }
 
-/// Stack driving frames → `[T, 3, H, W]`.
-fn stack_frames(frames: &[Image], tw: usize, th: usize, dev: &Device) -> CResult<Tensor> {
+/// Host-first image preparation followed by exactly one upload of the resized tensor.
+fn image_to_chw(img: &Image, tw: usize, th: usize, mode: Interp, dev: &Device) -> CResult<Tensor> {
+    Ok(image_to_chw_host(img, tw, th, mode)?.to_device(dev)?)
+}
+
+/// Stack driving frames on CPU → `[T, 3, H, W]`. Segments stay host-resident through the half-size
+/// resize and cross the device boundary only immediately before model preprocessing.
+fn stack_frames(frames: &[Image], tw: usize, th: usize) -> CResult<Tensor> {
     let chw: Vec<Tensor> = frames
         .iter()
         .map(|f| -> CResult<Tensor> {
-            Ok(image_to_chw(f, tw, th, Interp::Bicubic, dev)?.reshape((1, 3, th, tw))?)
+            Ok(image_to_chw_host(f, tw, th, Interp::Bicubic)?.reshape((1, 3, th, tw))?)
         })
         .collect::<CResult<_>>()?;
     let refs: Vec<&Tensor> = chw.iter().collect();
@@ -115,11 +120,11 @@ fn stack_frames(frames: &[Image], tw: usize, th: usize, dev: &Device) -> CResult
 }
 
 /// Stack per-frame masks → `[3, T, H, W]` (the `extract_and_compress` input layout).
-fn stack_masks(masks: &[Image], tw: usize, th: usize, dev: &Device) -> CResult<Tensor> {
+fn stack_masks(masks: &[Image], tw: usize, th: usize) -> CResult<Tensor> {
     let chw: Vec<Tensor> = masks
         .iter()
         .map(|m| -> CResult<Tensor> {
-            Ok(image_to_chw(m, tw, th, Interp::Bilinear, dev)?.reshape((3, 1, th, tw))?)
+            Ok(image_to_chw_host(m, tw, th, Interp::Bilinear)?.reshape((3, 1, th, tw))?)
         })
         .collect::<CResult<_>>()?;
     let refs: Vec<&Tensor> = chw.iter().collect();
@@ -308,8 +313,8 @@ pub fn generate(
     // --- decode + resize all pixel inputs to (tw, th) ---
     let ref_chw = image_to_chw(job.reference.image, tw, th, Interp::Bicubic, dev)?; // [3,H,W]
     let ref_mask_chw = image_to_chw(job.reference.mask, tw, th, Interp::Bilinear, dev)?; // [3,H,W]
-    let driving = stack_frames(job.driving_frames, tw, th, dev)?; // [T,3,H,W]
-    let driving_mask = stack_masks(job.driving_masks, tw, th, dev)?; // [3,T,H,W]
+    let driving = stack_frames(job.driving_frames, tw, th)?; // CPU [T,3,H,W]
+    let driving_mask = stack_masks(job.driving_masks, tw, th)?; // CPU [3,T,H,W]
 
     // Reference char latent + its 28-ch mask (1 latent frame).
     let ref_latent = vae_encode_cthw(&comps.vae, &ref_chw.reshape((3, 1, th, tw))?)?;
@@ -371,12 +376,17 @@ pub fn generate(
         // Pose latent (half spatial res) + driving mask for this segment.
         let pose_seg = driving.narrow(0, seg_start, seg_end - seg_start)?; // [T,3,H,W]
         let pose_half = downsample_half(&pose_seg)?; // [T,3,H/2,W/2]
-        let pose_cthw = pose_half.permute((1, 0, 2, 3))?.contiguous()?; // [3,T,H/2,W/2]
+        let pose_cthw = pose_half
+            .permute((1, 0, 2, 3))?
+            .contiguous()?
+            .to_device(dev)?; // one upload: [3,T,H/2,W/2]
         let pose_latent = vae_encode_cthw(&comps.vae, &pose_cthw)?; // [16,T_lat,h/2,w/2]
         let lat_t = pose_latent.dim(1)?;
 
         let dmask_seg = driving_mask.narrow(1, seg_start, seg_end - seg_start)?; // [3,T,H,W]
-        let dmask_half = downsample_half(&dmask_seg)?; // [3,T,H/2,W/2]
+        let dmask_half = downsample_half(&dmask_seg)?.to_device(dev)?; // one upload: [3,T,H/2,W/2]
+                                                                       // Keep threshold/pool/pack on the model device exactly as before; only its input transfer
+                                                                       // moved from full resolution to half resolution.
         let driving_masks = extract_and_compress_mask_to_latent(&dmask_half, TEMPORAL_STRIDE)?;
 
         // ref_masks = ref_mask_28 ++ zero null-noisy-mask over the latent length.
@@ -484,11 +494,122 @@ pub fn generate(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_segments, segment_step_progress, vae_align, TEMPORAL_STRIDE};
+    use super::{
+        build_segments, image_to_chw_host, segment_step_progress, stack_frames, stack_masks,
+        vae_align, Image, Interp, TEMPORAL_STRIDE,
+    };
+    use crate::preprocess::extract_and_compress_mask_to_latent;
+    use crate::resize::{downsample_half, interpolate};
+    use candle_gen::candle_core::{Device, Tensor};
+
+    /// The pre-sc-12517 ordering: upload the native-sized normalized tensor to `dev`, then call the
+    /// host-backed resize, which reads it back and recreates the output on `dev`.
+    fn legacy_image_to_chw(
+        img: &Image,
+        tw: usize,
+        th: usize,
+        mode: Interp,
+        dev: &Device,
+    ) -> Tensor {
+        let (iw, ih) = (img.width as usize, img.height as usize);
+        let px: Vec<f32> = img.pixels.iter().map(|&p| p as f32 / 127.5 - 1.0).collect();
+        let chw = Tensor::from_vec(px, (ih, iw, 3), dev)
+            .unwrap()
+            .permute((2, 0, 1))
+            .unwrap();
+        let nchw = chw.reshape((1, 3, ih, iw)).unwrap();
+        let out = if (ih, iw) != (th, tw) {
+            interpolate(&nchw, th, tw, mode).unwrap()
+        } else {
+            nchw
+        };
+        out.reshape((3, th, tw)).unwrap()
+    }
+
+    /// The pre-sc-12517 half-resize contract: the host kernel recreates its result on the input
+    /// device immediately. On the CPU test lane this has the same values while remaining an
+    /// independent route through `interpolate`; on CUDA it was the redundant host→device leg.
+    fn legacy_downsample_half(x: &Tensor) -> Tensor {
+        let (_, _, h, w) = x.dims4().unwrap();
+        interpolate(x, h / 2, w / 2, Interp::Bilinear).unwrap()
+    }
+
+    fn sample_image(width: u32, height: u32, salt: u8) -> Image {
+        let len = width as usize * height as usize * 3;
+        Image {
+            width,
+            height,
+            pixels: (0..len)
+                .map(|i| (i as u8).wrapping_mul(37).wrapping_add(salt))
+                .collect(),
+        }
+    }
+
+    fn values(t: &Tensor) -> Vec<f32> {
+        t.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+    }
 
     // Shipped defaults (see `pipeline.rs`).
     const LEN: usize = 81;
     const OVERLAP: usize = 5;
+
+    #[test]
+    fn host_first_image_resize_is_bit_identical_to_legacy_order() {
+        let image = sample_image(5, 4, 11);
+        for mode in [Interp::Bicubic, Interp::Bilinear] {
+            let legacy = legacy_image_to_chw(&image, 7, 6, mode, &Device::Cpu);
+            let host = image_to_chw_host(&image, 7, 6, mode).unwrap();
+            assert_eq!(host.dims(), legacy.dims());
+            assert_eq!(values(&host), values(&legacy));
+            assert!(matches!(host.device(), Device::Cpu));
+        }
+    }
+
+    #[test]
+    fn driving_stacks_and_half_resizes_remain_cpu_until_transfer() {
+        let frames: Vec<Image> = (0..5).map(|i| sample_image(5, 4, 3 + i * 16)).collect();
+        let masks: Vec<Image> = (0..5).map(|i| sample_image(5, 4, 71 + i * 16)).collect();
+        let driving = stack_frames(&frames, 16, 16).unwrap();
+        let driving_mask = stack_masks(&masks, 16, 16).unwrap();
+        assert_eq!(driving.dims(), &[5, 3, 16, 16]);
+        assert_eq!(driving_mask.dims(), &[3, 5, 16, 16]);
+        assert!(matches!(driving.device(), Device::Cpu));
+        assert!(matches!(driving_mask.device(), Device::Cpu));
+
+        let pose_half = downsample_half(&driving).unwrap();
+        let mask_half = downsample_half(&driving_mask).unwrap();
+        assert_eq!(pose_half.dims(), &[5, 3, 8, 8]);
+        assert_eq!(mask_half.dims(), &[3, 5, 8, 8]);
+        assert!(matches!(pose_half.device(), Device::Cpu));
+        assert!(matches!(mask_half.device(), Device::Cpu));
+
+        let legacy_pose_half = legacy_downsample_half(&driving);
+        let legacy_mask_half = legacy_downsample_half(&driving_mask);
+
+        // These are the exact weight-free conditioning boundaries consumed by the models. Pose is
+        // permuted/contiguous immediately before VAE encode; mask is thresholded into seven colors,
+        // 8× pooled, and temporally packed immediately before the DiT. Bit equality here proves the
+        // transfer-only optimization cannot change generated output without invoking model weights.
+        let pose_condition = pose_half
+            .permute((1, 0, 2, 3))
+            .unwrap()
+            .contiguous()
+            .unwrap();
+        let legacy_pose_condition = legacy_pose_half
+            .permute((1, 0, 2, 3))
+            .unwrap()
+            .contiguous()
+            .unwrap();
+        assert_eq!(pose_condition.dims(), &[3, 5, 8, 8]);
+        assert_eq!(values(&pose_condition), values(&legacy_pose_condition));
+
+        let mask_condition =
+            extract_and_compress_mask_to_latent(&mask_half, TEMPORAL_STRIDE).unwrap();
+        let legacy_mask_condition =
+            extract_and_compress_mask_to_latent(&legacy_mask_half, TEMPORAL_STRIDE).unwrap();
+        assert_eq!(mask_condition.dims(), &[28, 2, 1, 1]);
+        assert_eq!(values(&mask_condition), values(&legacy_mask_condition));
+    }
 
     /// Every emitted window is VAE-temporal-aligned (`4k + 1`) so the z16 encoder accepts it, and non
     /// empty.
