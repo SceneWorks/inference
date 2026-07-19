@@ -15,16 +15,20 @@
 //!   reference. This is the "Chatterbox needs MORE than the 256-d ve vector" case the story calls
 //!   out.
 //! - [`Conditioning::ReferenceAudio`] — the raw reference clip. The provider derives the 256-d
-//!   speaker vector from it *inside the provider* via the merged `chatterbox_ve` embedder, and (once
-//!   the S3Gen stack lands) will derive the prompt mel + prompt speech tokens + CAMPPlus x-vector
-//!   from the same clip. ReferenceAudio is therefore the fuller conditioning path.
+//!   speaker vector from it *inside the provider* via the merged `chatterbox_ve` embedder, and (in
+//!   `generate()`) the S3Gen prompt mel + prompt speech tokens + CAMPPlus x-vector from the same
+//!   clip ([`crate::s3gen::S3Gen`]). ReferenceAudio is therefore the fuller conditioning path — and
+//!   the **only** one that can render a full clone WAV, since S3Gen's reference is not recoverable
+//!   from a bare voice vector.
 //!
-//! ## Port status (honest partial — see [`crate::s3gen`])
+//! ## Pipeline (sc-13239 — end-to-end)
 //!
-//! This slice ports the **T3 speech-token LM** (real `t3_cfg.safetensors` weights, CFG decode) and
-//! the full provider/conditioning surface. The **S3Gen** token→waveform stack (four networks) is
-//! not yet ported; the generator's `generate()` runs T3 to produce real speech tokens and then
-//! returns a typed error at the S3Gen boundary rather than fabricate audio.
+//! `generate()` runs the full clone: **T3** ([`crate::t3`]) decodes speech tokens from the text +
+//! speaker conditioning, then **S3Gen** ([`crate::s3gen::S3Gen`]) renders those tokens into a 24 kHz
+//! waveform in the reference voice (flow-matching token→mel + HiFTNet vocoder), and the **PerTh**
+//! provenance watermark ([`crate::perth`]) is applied to the output — always, matching the reference
+//! (no disable flag). A VoiceEmbedding-only request drives T3 but returns a typed error at S3Gen,
+//! because the reference clip S3Gen needs is absent.
 
 use std::sync::Mutex;
 
@@ -41,9 +45,10 @@ use rand::rngs::StdRng;
 use rand::SeedableRng;
 
 use crate::config::{
-    GenerationDefaults, S3GenConfig, T3Config, ENC_COND_LEN, S3GEN_SR, S3_SR,
-    SPEECH_COND_PROMPT_LEN,
+    GenerationDefaults, T3Config, ENC_COND_LEN, S3GEN_SR, S3_SR, SPEECH_COND_PROMPT_LEN,
 };
+use crate::perth::PerthWatermarker;
+use crate::s3gen::S3Gen;
 use crate::s3tokenizer::S3Tokenizer;
 use crate::t3::{strip_special_speech_tokens, T3Cond, T3};
 use crate::text::EnTokenizer;
@@ -60,6 +65,25 @@ pub const HUB_REVISION: &str = "5bb1f6ee58e50c3b8d408bc82a6d3740c2db6e18";
 pub const T3_WEIGHTS_FILE: &str = "t3_cfg.safetensors";
 /// The text tokenizer filename inside a snapshot.
 pub const TOKENIZER_FILE: &str = "tokenizer.json";
+
+/// The license of the pinned Chatterbox weight checkpoint (sc-13332) — surfaced for SceneWorks'
+/// end-product licenses page. MIT (permissive), verified against the `ResembleAI/chatterbox`
+/// model card. The clone TTS generator ships the same `ResembleAI/chatterbox` weights the
+/// `chatterbox_ve` sibling does, keyed here by this provider's own [`MODEL_ID`].
+pub const WEIGHT_LICENSE: gen_core::WeightLicense = gen_core::WeightLicense {
+    spdx_id: "MIT",
+    name: "MIT License",
+    source_url: "https://huggingface.co/ResembleAI/chatterbox",
+    attribution: Some("Chatterbox © Resemble AI — licensed under MIT"),
+    commercial_use: true,
+    restriction: None,
+};
+
+/// This provider's weight-license entry (keyed by [`MODEL_ID`]) for catalog aggregation.
+pub const WEIGHT_LICENSE_ENTRY: gen_core::WeightLicenseEntry = gen_core::WeightLicenseEntry {
+    provider_id: MODEL_ID,
+    license: WEIGHT_LICENSE,
+};
 
 /// Advertised language codes (the base English model).
 pub const LANGUAGES: &[&str] = &["en", "en-us"];
@@ -150,8 +174,6 @@ pub(crate) fn validate_request(
 pub struct ChatterboxGenerator {
     descriptor: ModelDescriptor,
     t3_config: T3Config,
-    #[allow(dead_code)] // consumed once the remaining S3Gen networks land (see crate::s3gen).
-    s3gen_config: S3GenConfig,
     root: std::path::PathBuf,
     t3: Mutex<Option<T3>>,
     tokenizer: Mutex<Option<EnTokenizer>>,
@@ -159,6 +181,12 @@ pub struct ChatterboxGenerator {
     /// The s3tokenizer (sc-13235), loaded lazily from the snapshot's `s3gen.safetensors` the first
     /// time a `ReferenceAudio` request needs the T3 conditioning prompt tokens.
     s3tokenizer: Mutex<Option<S3Tokenizer>>,
+    /// The assembled S3Gen token→waveform stack (sc-13239), loaded lazily from `s3gen.safetensors`
+    /// the first time `generate()` renders a clone.
+    s3gen: Mutex<Option<S3Gen>>,
+    /// The PerTh provenance watermarker (sc-13240/sc-13239), loaded lazily; its weights are
+    /// resolved off-hub via [`crate::perth::resolve_perth_weights`].
+    perth: Mutex<Option<PerthWatermarker>>,
 }
 
 fn lock_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -289,6 +317,42 @@ impl ChatterboxGenerator {
         }
         Ok(())
     }
+
+    /// Lazily assemble the S3Gen token→waveform stack (s3tokenizer + CAMPPlus + flow + HiFTNet) from
+    /// the snapshot's `s3gen.safetensors` (sc-13239).
+    fn ensure_s3gen(&self) -> gen_core::Result<()> {
+        let mut guard = lock_recover(&self.s3gen);
+        if guard.is_none() {
+            let s3gen = S3Gen::from_snapshot(&self.root)
+                .map_err(|e| gen_core::Error::Msg(format!("{MODEL_ID}: load S3Gen: {e}")))?;
+            *guard = Some(s3gen);
+        }
+        Ok(())
+    }
+
+    /// Apply the PerTh provenance watermark to a rendered 24 kHz clone (sc-13239). The watermarker is
+    /// loaded lazily; its weights are resolved off-hub via [`crate::perth::resolve_perth_weights`].
+    /// The clone ALWAYS watermarks (the reference behavior — no disable flag), so a failure to obtain
+    /// the weights is a typed error rather than a silently un-watermarked clone.
+    fn watermark(&self, samples: &[f32]) -> gen_core::Result<Vec<f32>> {
+        let mut guard = lock_recover(&self.perth);
+        if guard.is_none() {
+            let weights = crate::perth::resolve_perth_weights().map_err(|e| {
+                gen_core::Error::Msg(format!(
+                    "{MODEL_ID}: resolve PerTh watermarker weights: {e}"
+                ))
+            })?;
+            let wm = PerthWatermarker::from_safetensors(&weights).map_err(|e| {
+                gen_core::Error::Msg(format!("{MODEL_ID}: load PerTh watermarker: {e}"))
+            })?;
+            *guard = Some(wm);
+        }
+        guard
+            .as_ref()
+            .unwrap()
+            .embed(samples, S3GEN_SR)
+            .map_err(|e| gen_core::Error::Msg(format!("{MODEL_ID}: apply PerTh watermark: {e}")))
+    }
 }
 
 impl ChatterboxGenerator {
@@ -390,23 +454,60 @@ impl Generator for ChatterboxGenerator {
     ) -> gen_core::Result<GenerationOutput> {
         // T3 stage (real weights) → speech tokens.
         let (raw_tokens, real_tokens) = self.speech_tokens(req, on_progress)?;
-
-        // S3Gen token→waveform. Announce the decode phase, then hit the honest boundary: the T3
-        // stage produced real speech tokens; the S3Gen stack is not yet ported (crate::s3gen).
-        on_progress(Progress::Decoding);
-        match crate::s3gen::decode(&real_tokens) {
-            Ok(samples) => Ok(GenerationOutput::Audio(AudioTrack {
-                samples,
-                sample_rate: S3GEN_SR,
-                channels: 1,
-                ..Default::default()
-            })),
-            Err(e) => Err(gen_core::Error::Msg(format!(
-                "{MODEL_ID}: T3 produced {} speech tokens ({} after dropping specials), but {e}",
-                raw_tokens.len(),
-                real_tokens.len()
-            ))),
+        if req.cancel.is_cancelled() {
+            return Err(gen_core::Error::Canceled);
         }
+
+        // S3Gen needs the reference CLIP: VoiceEmbedding alone conditions the T3 LM but cannot
+        // supply S3Gen's reference mel / prompt tokens / speaker x-vector, so a full clone WAV
+        // requires Conditioning::ReferenceAudio. This is the honest "Chatterbox needs MORE than the
+        // 256-d ve vector" boundary — a VoiceEmbedding-only request drives T3 and stops here.
+        let reference = req
+            .conditioning
+            .iter()
+            .find_map(|c| match c {
+                Conditioning::ReferenceAudio { audio, .. } => Some(audio),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                gen_core::Error::Msg(format!(
+                    "{MODEL_ID}: a full cloned WAV requires Conditioning::ReferenceAudio (the \
+                     reference clip); VoiceEmbedding conditions the T3 LM but cannot supply S3Gen's \
+                     reference mel / prompt tokens / speaker x-vector. T3 produced {} speech tokens \
+                     ({} after dropping specials).",
+                    raw_tokens.len(),
+                    real_tokens.len()
+                ))
+            })?;
+
+        // S3Gen token→waveform: derive the reference conditioning, run the flow-matching decoder,
+        // and vocode with HiFTNet → a real 24 kHz cloned-voice waveform.
+        on_progress(Progress::Decoding);
+        self.ensure_s3gen()?;
+        let seed = req.seed.unwrap_or_else(gen_core::default_seed);
+        let cancel = req.cancel.clone();
+        let should_cancel = move || cancel.is_cancelled();
+        let rendered = {
+            let guard = lock_recover(&self.s3gen);
+            let s3gen = guard.as_ref().unwrap();
+            s3gen
+                .render(&real_tokens, reference, seed, on_progress, &should_cancel)
+                .map_err(gen_core::Error::from)?
+        };
+        let samples = match rendered {
+            Some(s) => s,
+            None => return Err(gen_core::Error::Canceled),
+        };
+
+        // Provenance watermark — always applied (the reference behavior; no disable flag).
+        let samples = self.watermark(&samples)?;
+
+        Ok(GenerationOutput::Audio(AudioTrack {
+            samples,
+            sample_rate: S3GEN_SR,
+            channels: 1,
+            ..Default::default()
+        }))
     }
 }
 
@@ -441,12 +542,13 @@ pub fn load_generator(spec: &LoadSpec) -> gen_core::Result<ChatterboxGenerator> 
     Ok(ChatterboxGenerator {
         descriptor: descriptor(),
         t3_config: T3Config::LLAMA_520M,
-        s3gen_config: S3GenConfig::DEFAULT,
         root,
         t3: Mutex::new(None),
         tokenizer: Mutex::new(None),
         embedder: Mutex::new(None),
         s3tokenizer: Mutex::new(None),
+        s3gen: Mutex::new(None),
+        perth: Mutex::new(None),
     })
 }
 

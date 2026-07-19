@@ -1,10 +1,9 @@
-//! Real-weight conformance for the Chatterbox clone-TTS generator (sc-13222).
+//! Real-weight conformance for the Chatterbox clone-TTS generator (sc-13222 → sc-13239).
 //!
-//! ## What this slice gates (honest partial)
+//! ## What this gates (end-to-end)
 //!
-//! This slice ports the **T3 speech-token LM** (real `t3_cfg.safetensors`), not yet the S3Gen
-//! token→waveform stack (see `candle_audio_chatterbox::s3gen`). So the conformance here is the
-//! **T3 stage** — the ported half — exercised on real weights:
+//! The whole clone pipeline is ported: T3 speech-token LM → S3Gen token→waveform → PerTh watermark.
+//! The **T3 stage** is gated on real weights on its own here:
 //!
 //! - [`chatterbox_t3_produces_valid_speech_tokens`] — a text prompt + a real `chatterbox_ve`
 //!   voice embedding → the T3 LM decodes a non-empty, in-range, non-degenerate speech-token
@@ -16,14 +15,16 @@
 //!   speaker conditioning (a generic/default voice) — the same "must not ignore the reference"
 //!   property the sc-12838 gate demands, applied at the T3 stage.
 //!
-//! ## What remains blocked
+//! ## The full clone gate (sc-13239)
 //!
 //! The **full sc-12838 clone gate** — a cloned-voice WAV whose `chatterbox_ve` embedding is closer
-//! to the reference than to a different-voice control — requires the S3Gen stack (s3tokenizer FSQ +
-//! CAMPPlus + flow-matching decoder + HiFTNet vocoder) to turn these tokens into a waveform. That
-//! is **not yet ported**; [`chatterbox_generate_stops_honestly_at_the_s3gen_boundary`] asserts that
-//! `generate()` runs T3 and then returns a typed error naming the gap — it must never emit fake
-//! audio. The full WAV gate is deferred to the S3Gen follow-up stories.
+//! to the reference than to a different-voice control — is
+//! [`chatterbox_clones_a_reference_voice_end_to_end`]: it runs the whole registry path
+//! (`generate()`) end-to-end through the assembled S3Gen stack (s3tokenizer FSQ + CAMPPlus +
+//! flow-matching decoder + HiFTNet vocoder + PerTh watermark) and asserts voice similarity,
+//! non-silence, the 24 kHz rate, a token-proportional duration, and the provenance watermark. A
+//! VoiceEmbedding-only request still stops honestly, since S3Gen's reference is not recoverable from
+//! the ve vector ([`chatterbox_generate_requires_reference_audio_for_a_full_clone`]).
 //!
 //! `#[ignore]`d and snapshot-gated like every audio family's real-weight tests:
 //! ```text
@@ -176,16 +177,16 @@ fn chatterbox_t3_produces_valid_speech_tokens() {
         "speech tokens collapsed to {distinct} distinct value(s) — the LM is not modeling speech"
     );
 
-    // Honest WAV evidence: this slice cannot render the CLONE waveform (S3Gen unported), so the
-    // artifact written is the REFERENCE clip the T3 conditioning consumed — the pipeline INPUT, not
-    // a clone output. Never a fabricated clone.
-    if let Ok(out) = std::env::var("CHATTERBOX_WAV_OUT") {
+    // This T3-stage test writes the REFERENCE clip the conditioning consumed — the pipeline INPUT,
+    // not a clone output (the full clone WAV is rendered + gated by
+    // `chatterbox_clones_a_reference_voice_end_to_end`). Never a fabricated clone.
+    if let Ok(out) = std::env::var("CHATTERBOX_T3_REF_WAV_OUT") {
         candle_audio::wav::write_wav_pcm16(std::path::Path::new(&out), &clip)
             .expect("write reference clip");
         let secs = clip.samples.len() as f32 / clip.sample_rate as f32;
         eprintln!(
-            "wrote REFERENCE input clip (NOT a clone — S3Gen unported): {out} ({secs:.2}s, {} tokens \
-             decoded by T3)",
+            "wrote REFERENCE input clip (the T3 conditioning input, not a clone): {out} \
+             ({secs:.2}s, {} tokens decoded by T3)",
             real.len()
         );
     }
@@ -223,23 +224,31 @@ fn chatterbox_t3_responds_to_the_reference_voice() {
     );
 }
 
-/// The S3Gen boundary is honest: `generate()` runs T3 and then errors, never emitting fake audio.
+/// VoiceEmbedding-only conditioning is an honest boundary: `generate()` runs T3 but cannot render a
+/// full clone WAV (S3Gen needs the reference clip's mel / prompt tokens / x-vector, none recoverable
+/// from the 256-d ve vector), so it returns a typed error naming `ReferenceAudio` rather than
+/// fabricating a voice-agnostic clone. The full clone WAV is gated by
+/// [`chatterbox_clones_a_reference_voice_end_to_end`] (ReferenceAudio conditioning).
 #[test]
 #[ignore = "real weights: needs t3_cfg.safetensors + ve + a Kokoro snapshot; run with --ignored"]
-fn chatterbox_generate_stops_honestly_at_the_s3gen_boundary() {
+fn chatterbox_generate_requires_reference_audio_for_a_full_clone() {
     use candle_audio_chatterbox::gen_core::Generator;
     let gen = load_generator();
     let emb = voice_embedding(&kokoro_clip("Testing the boundary.", "af_heart"));
-    let req = request("The vocoder is not yet ported.", emb, 1);
+    let req = request(
+        "A bare voice vector cannot supply the S3Gen reference.",
+        emb,
+        1,
+    );
 
     let err = gen
         .generate(&req, &mut |_| {})
-        .expect_err("generate must stop at the S3Gen boundary, not fabricate audio");
+        .expect_err("VoiceEmbedding-only generate must not fabricate a voice-agnostic clone");
     let msg = format!("{err}");
     eprintln!("honest boundary error: {msg}");
     assert!(
-        msg.contains("S3Gen"),
-        "the boundary error must name S3Gen: {msg}"
+        msg.contains("ReferenceAudio"),
+        "the boundary error must name the required ReferenceAudio conditioning: {msg}"
     );
     assert!(
         msg.contains("speech tokens"),
@@ -784,4 +793,170 @@ fn perth_watermark_roundtrips_and_is_imperceptible() {
         snr24 > 12.0,
         "24 kHz watermarked signal too degraded: SNR {snr24:.2} dB"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// The sc-12838 clone-WAV DoD gate (sc-13239): the epic-releasing end-to-end test.
+// ---------------------------------------------------------------------------------------------
+
+/// A `ReferenceAudio`-conditioned request: the reference clip drives BOTH T3 (via the ve vector the
+/// provider derives internally) and S3Gen (prompt mel + prompt tokens + CAMPPlus x-vector).
+fn reference_request(prompt: &str, reference: AudioTrack, seed: u64) -> GenerationRequest {
+    GenerationRequest {
+        prompt: prompt.to_string(),
+        audio: Some(AudioParams {
+            language: Some("en".to_string()),
+            sample_rate: Some(24_000),
+            ..Default::default()
+        }),
+        conditioning: vec![Conditioning::ReferenceAudio {
+            audio: reference,
+            strength: None,
+        }],
+        seed: Some(seed),
+        ..Default::default()
+    }
+}
+
+/// **The sc-12838 clone gate — the make-or-break test this epic releases.** The FULL registry path
+/// (`generate()` on the loaded provider) renders a real 24 kHz cloned-voice WAV from a reference clip
+/// and text, and it must be voice-similar to the reference: the `chatterbox_ve` embedding of the
+/// output is closer to the reference voice than to a DIFFERENT control voice, by a material margin.
+/// The assertion FAILS if the clone ignores the reference (a voice-agnostic pipeline). It also gates
+/// non-silence, finiteness, the 24 kHz rate, a token-proportional duration, speech-shaped energy, and
+/// the always-applied PerTh provenance watermark.
+///
+/// Needs the FULL `CHATTERBOX_SNAPSHOT` (`s3gen.safetensors`), a Kokoro snapshot (reference/control
+/// voices), the ve embedder, and `PERTH_SNAPSHOT` (converted `perth_implicit.safetensors`).
+#[test]
+#[ignore = "real weights: needs the full chatterbox snapshot (s3gen.safetensors) + Kokoro + ve + PERTH_SNAPSHOT; run with --ignored"]
+fn chatterbox_clones_a_reference_voice_end_to_end() {
+    use candle_audio_chatterbox::campplus::cosine_similarity;
+
+    let spec = LoadSpec::new(WeightsSource::Dir(s3gen_snapshot()));
+    let gen = cb::load(&spec).expect("load the chatterbox generator");
+
+    // The reference voice (af_heart) and a DIFFERENT control voice (am_michael) — distinct Kokoro
+    // voices so voice similarity is a genuine, falsifiable claim.
+    let reference = kokoro_clip(
+        "The quick brown fox jumps over the lazy dog near the river bank at first light.",
+        "af_heart",
+    );
+    let control = kokoro_clip(
+        "The quick brown fox jumps over the lazy dog near the river bank at first light.",
+        "am_michael",
+    );
+
+    let text = "Hello there. This sentence is spoken in a cloned voice by the synthesizer.";
+    let seed = 20260719u64;
+
+    // The full provider path: reference clip + text → cloned WAV.
+    let out = match gen
+        .generate(
+            &reference_request(text, reference.clone(), seed),
+            &mut |_| {},
+        )
+        .expect("generate the cloned WAV")
+    {
+        GenerationOutput::Audio(track) => track,
+        other => panic!("expected audio, got {other:?}"),
+    };
+
+    let n = out.samples.len();
+    let secs = n as f32 / out.sample_rate as f32;
+    let peak = out.samples.iter().fold(0f32, |m, v| m.max(v.abs()));
+    let rms = (out.samples.iter().map(|v| v * v).sum::<f32>() / n.max(1) as f32).sqrt();
+
+    // Token-proportional expected duration: mel_len2 ≈ 2·speech_tokens, hift emits 480 samples/frame
+    // → duration ≈ speech_tokens/25 s (the 25 Hz token rate).
+    let (_, real_tokens) = gen_speech_tokens(&spec, text, reference.clone(), seed);
+    let expected_secs = real_tokens.len() as f32 / 25.0;
+
+    eprintln!(
+        "clone WAV: {n} samples @ {} Hz = {secs:.2}s (T3 {} tokens → expected ≈ {expected_secs:.2}s); \
+         peak {peak:.4}, rms {rms:.4}",
+        out.sample_rate,
+        real_tokens.len(),
+    );
+
+    // Shape / sanity.
+    assert_eq!(out.sample_rate, 24_000, "clone must be 24 kHz");
+    assert_eq!(out.channels, 1, "clone must be mono");
+    assert!(
+        out.samples.iter().all(|v| v.is_finite()),
+        "clone must be finite"
+    );
+    assert!(rms > 1e-3, "clone is (near-)silent: rms {rms:.6}");
+    assert!(peak > 1e-2, "clone peak {peak:.6} below an audible floor");
+    assert!(
+        peak <= 0.99 + 1e-6,
+        "clone exceeds the audio_limit clamp: {peak:.4}"
+    );
+    assert!(
+        (secs - expected_secs).abs() <= 0.25 * expected_secs + 0.2,
+        "clone duration {secs:.2}s not ≈ token-proportional {expected_secs:.2}s"
+    );
+    // Speech-shaped: not a DC offset / constant tone — the waveform crosses zero many times.
+    let zero_crossings = out
+        .samples
+        .windows(2)
+        .filter(|w| (w[0] <= 0.0) != (w[1] <= 0.0))
+        .count();
+    let zcr = zero_crossings as f32 / secs;
+    eprintln!("clone zero-crossing rate: {zcr:.1} Hz");
+    assert!(
+        (200.0..6000.0).contains(&zcr),
+        "zero-crossing rate {zcr:.1} Hz is not speech-shaped"
+    );
+
+    // VOICE SIMILARITY — the crux. cos(ve(out), ve(reference)) must beat cos(ve(out), ve(control)).
+    let ve_out = voice_embedding(&out);
+    let ve_ref = voice_embedding(&reference);
+    let ve_ctrl = voice_embedding(&control);
+    let cos_ref = cosine_similarity(&ve_out, &ve_ref);
+    let cos_ctrl = cosine_similarity(&ve_out, &ve_ctrl);
+    let margin = cos_ref - cos_ctrl;
+    eprintln!(
+        "voice similarity: cos(out, reference af_heart) = {cos_ref:.4}; \
+         cos(out, control am_michael) = {cos_ctrl:.4}; margin = {margin:.4}"
+    );
+    assert!(
+        margin > 0.02,
+        "clone is not voice-similar to the reference: cos_ref {cos_ref:.4} vs cos_ctrl \
+         {cos_ctrl:.4} (margin {margin:.4}) — the clone IGNORED the reference voice"
+    );
+
+    // Provenance watermark: always applied, detected with high confidence.
+    let wm = cb::PerthWatermarker::from_safetensors(
+        &cb::resolve_perth_weights().expect("resolve PerTh weights"),
+    )
+    .expect("load PerTh watermarker");
+    let conf = wm
+        .get_watermark(&out.samples, out.sample_rate)
+        .expect("detect the watermark");
+    eprintln!("PerTh watermark confidence on the clone: {conf:.4}");
+    assert!(
+        conf > 0.5,
+        "the clone is not watermarked (confidence {conf:.4}) — generate() must always watermark"
+    );
+
+    // Demo WAV to the scratchpad (or CHATTERBOX_WAV_OUT).
+    let out_path = std::env::var("CHATTERBOX_WAV_OUT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir().join("chatterbox_clone_demo.wav"));
+    candle_audio::wav::write_wav_pcm16(&out_path, &out).expect("write the demo clone WAV");
+    eprintln!("wrote cloned-voice demo WAV: {}", out_path.display());
+}
+
+/// The T3 speech tokens for a `ReferenceAudio` request (a fresh generator so the DoD test's `dyn`
+/// generator stays untouched), used to compute the token-proportional expected duration.
+fn gen_speech_tokens(
+    spec: &LoadSpec,
+    text: &str,
+    reference: AudioTrack,
+    seed: u64,
+) -> (Vec<u32>, Vec<u32>) {
+    let gen = cb::load_generator(spec).expect("load the chatterbox generator");
+    gen.speech_tokens(&reference_request(text, reference, seed), &mut |_| {})
+        .expect("T3 speech tokens")
 }

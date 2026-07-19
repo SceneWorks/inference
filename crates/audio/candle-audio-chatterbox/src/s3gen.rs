@@ -1,5 +1,4 @@
-//! S3Gen — the speech-token→waveform stack (sc-13222). **This is the port boundary of the current
-//! slice.**
+//! S3Gen — the speech-token→waveform stack, assembled end-to-end (sc-13239).
 //!
 //! Chatterbox's S3Gen is a CosyVoice-derived stack of **four large neural networks** plus custom
 //! DSP, none of which candle-transformers provides (verified against the pinned candle revision).
@@ -12,54 +11,148 @@
 //! | `flow` (CausalMaskedDiffWithXvec + CausalConditionalCFM) | 1121 | an UpsampleConformerEncoder + a ConditionalDecoder U-Net/DiT CFM estimator (flow-matching token→mel) |
 //! | `mel2wav` (HiFTGenerator)    | 328     | an NSF harmonic-source + F0-predictor + iSTFT vocoder → 24 kHz |
 //!
-//! Reproducing intelligible, voice-similar speech requires **all four** to be numerically exact
-//! simultaneously (any single error yields noise), plus a non-power-of-two STFT mel front-end
-//! (`n_fft = 1920`) and arbitrary-rate resampling — neither available in the shared audio commons.
-//! FSQ in particular is absent from the entire candle ecosystem and must be ported from scratch.
-//!
-//! The T3 LM (the clone's text→speech-token brain — see [`crate::t3`]) and the full provider
-//! contract/conditioning surface were ported in sc-13222. The **s3tokenizer** — the first of the
-//! four S3Gen networks (the Whisper-v2 FSMN mel encoder + FSQ quantizer) — is ported natively
-//! (sc-13235; see [`crate::s3tokenizer`]): it derives the 25 Hz reference speech tokens T3's
-//! conditioning prompt and S3Gen's `prompt_token` need. The **CAMPPlus speaker encoder** — the
-//! second network (an 80-bin Kaldi-fbank → 192-d D-TDNN x-vector) — is ported (sc-13236;
-//! see [`crate::campplus`]): it derives the S3Gen flow's speaker conditioning. The **flow-matching
-//! token→mel decoder** — the third network — is ported (sc-13237; see [`crate::flow`]). The
-//! **HiFTNet vocoder** — the fourth and last network (an NSF harmonic-source + F0-predictor + iSTFT
-//! mel→waveform) — is now ported too (sc-13238; see [`crate::hift`]). So **all four** S3Gen networks
-//! are ported, each exercised end-to-end on real weights by the conformance test.
-//!
-//! What remains is not a *network* but the end-to-end **token→waveform integration** and the catalog
-//! **registration** (sc-13239): assembling s3tokenizer → flow → [`crate::hift`] behind
-//! [`decode`], then registering the generator into `candle-audio-catalog`. Until that lands
-//! [`decode`] returns a typed, precise error rather than emit fake audio (the honest-partial law).
+//! Each of the four networks is ported natively and gated on real weights on its own
+//! (s3tokenizer — sc-13235, [`crate::s3tokenizer`]; CAMPPlus — sc-13236, [`crate::campplus`]; the
+//! flow-matching token→mel decoder — sc-13237, [`crate::flow`]; the HiFTNet vocoder — sc-13238,
+//! [`crate::hift`]). This module is the sc-13239 **integration**: it assembles them behind
+//! [`S3Gen`] so a real 24 kHz cloned-voice waveform is rendered from T3's speech tokens plus the
+//! reference clip's S3Gen conditioning (prompt tokens + prompt mel + the CAMPPlus x-vector), the
+//! stage [`crate::model`]'s `generate()` calls after the T3 LM.
 
+use std::path::Path;
+
+use candle_audio::gen_core::{AudioTrack, Progress};
 use candle_audio::{AudioError, Result};
+
+use crate::campplus::Campplus;
+use crate::config::{DEC_COND_LEN, S3GEN_SR};
+use crate::flow::Flow;
+use crate::hift::HiftGenerator;
+use crate::s3tokenizer::S3Tokenizer;
 
 /// The relative filename of the S3Gen checkpoint inside a Chatterbox snapshot.
 pub const S3GEN_WEIGHTS_FILE: &str = "s3gen.safetensors";
 
-/// Number of S3Gen **networks** still to port — now **zero**: the s3tokenizer (sc-13235;
-/// [`crate::s3tokenizer`]), the CAMPPlus x-vector (sc-13236; [`crate::campplus`]), the flow-matching
-/// token→mel decoder (sc-13237; [`crate::flow`]), and the HiFTNet vocoder (sc-13238; [`crate::hift`])
-/// are all ported. What remains is the end-to-end token→waveform *integration* + catalog
-/// registration (sc-13239), not a model port.
+/// Number of S3Gen **networks** still to port — **zero**: the s3tokenizer (sc-13235), the CAMPPlus
+/// x-vector (sc-13236), the flow-matching token→mel decoder (sc-13237), and the HiFTNet vocoder
+/// (sc-13238) are all ported, and sc-13239 assembles them here into an end-to-end token→waveform
+/// pipeline ([`S3Gen`]).
 pub const S3GEN_REMAINING_NETWORKS: usize = 0;
 
-/// The S3Gen token→waveform decode. The end-to-end assembly (s3tokenizer → flow → HiFTNet vocoder)
-/// and the provider registration are sc-13239; until they land this returns a typed error naming the
-/// gap rather than fabricated audio (the honest-partial law — a fake waveform would pass a naive
-/// "non-silent" check while the clone gate must fail honestly). Every S3Gen *network* — including
-/// the mel→waveform HiFTNet vocoder ([`crate::hift`]) — is ported and runs on real weights.
-pub fn decode(_speech_tokens: &[u32]) -> Result<Vec<f32>> {
-    Err(AudioError::Msg(
-        "chatterbox: all four S3Gen networks (s3tokenizer, CAMPPlus x-vector, flow-matching \
-         token\u{2192}mel decoder, and HiFTNet mel\u{2192}waveform vocoder) ARE ported and run on \
-         real weights, but the end-to-end S3Gen token\u{2192}waveform integration and provider \
-         registration are not yet wired (sc-13239); this stops at the S3Gen boundary rather than \
-         emit fake audio. See the crate docs."
-            .to_string(),
-    ))
+/// Cap a reference clip at the S3Gen decoder-conditioning length ([`DEC_COND_LEN`], 10 s at
+/// [`S3GEN_SR`]) expressed in the clip's own sample rate — the reference truncates the S3Gen
+/// reference to 10 s before deriving its mel / tokens / x-vector.
+fn cap_reference(samples: &[f32], sample_rate: u32) -> &[f32] {
+    // DEC_COND_LEN is defined at 24 kHz; scale to the clip's rate so 10 s is 10 s at any input rate.
+    let max = (DEC_COND_LEN as u64 * sample_rate as u64 / S3GEN_SR as u64) as usize;
+    &samples[..samples.len().min(max)]
+}
+
+/// The assembled S3Gen token→waveform stack: the s3tokenizer (reference prompt tokens), the CAMPPlus
+/// speaker encoder (the 80-d flow x-vector), the flow-matching token→mel decoder, and the HiFTNet
+/// vocoder. Built once from a Chatterbox snapshot and reused across requests.
+pub struct S3Gen {
+    tokenizer: S3Tokenizer,
+    campplus: Campplus,
+    flow: Flow,
+    hift: HiftGenerator,
+}
+
+impl S3Gen {
+    /// Load all four S3Gen networks from a Chatterbox snapshot directory (each reads its own
+    /// prefix of `s3gen.safetensors`).
+    pub fn from_snapshot(dir: &Path) -> Result<Self> {
+        let tokenizer = S3Tokenizer::from_snapshot(dir)?;
+        let campplus = Campplus::from_snapshot(dir)?;
+        let flow = Flow::from_snapshot(dir)?;
+        let hift = HiftGenerator::from_snapshot(dir)?;
+        Ok(Self {
+            tokenizer,
+            campplus,
+            flow,
+            hift,
+        })
+    }
+
+    /// Derive S3Gen's reference conditioning from a clip: the 25 Hz prompt speech tokens, the 24 kHz
+    /// 80-bin prompt mel, and the 80-d flow speaker embedding (L2-normalized CAMPPlus x-vector →
+    /// `spk_embed_affine_layer`). VoiceEmbedding-only conditioning cannot supply any of these (see
+    /// [`crate::model`]), so a full clone requires a reference clip.
+    fn reference_conditioning(
+        &self,
+        reference: &AudioTrack,
+    ) -> Result<(Vec<u32>, candle_audio::candle_core::Tensor, Vec<f32>)> {
+        let sr = reference.sample_rate;
+        let clip = cap_reference(&reference.samples, sr);
+        if clip.is_empty() {
+            return Err(AudioError::Msg(
+                "s3gen: the reference clip is empty — cannot derive the S3Gen conditioning".into(),
+            ));
+        }
+        let prompt_tokens: Vec<u32> = self
+            .tokenizer
+            .encode(clip, sr)?
+            .into_iter()
+            .map(|c| c as u32)
+            .collect();
+        let prompt_mel = self
+            .flow
+            .mel_extractor()
+            .mel(clip, sr, self.flow.device())?;
+        let spk_embed = self.campplus.spk_embed_flow(clip, sr)?;
+        Ok((prompt_tokens, prompt_mel, spk_embed))
+    }
+
+    /// Render T3's `speech_tokens` into a **24 kHz** cloned-voice waveform in the reference voice:
+    /// derive the reference conditioning, run the flow-matching token→mel decoder, then vocode the
+    /// mel with HiFTNet. `seed` seeds the flow noise and the NSF source (the reproducibility law:
+    /// same tokens + reference + seed ⇒ byte-identical samples). Progress is reported over the three
+    /// stages; `should_cancel` is polled between them and returns `Ok(None)` when tripped (mirroring
+    /// the T3 stage's cooperative cancellation).
+    pub fn render(
+        &self,
+        speech_tokens: &[u32],
+        reference: &AudioTrack,
+        seed: u64,
+        on_progress: &mut dyn FnMut(Progress),
+        should_cancel: &dyn Fn() -> bool,
+    ) -> Result<Option<Vec<f32>>> {
+        if speech_tokens.is_empty() {
+            return Err(AudioError::Msg(
+                "s3gen: T3 produced no speech tokens to render".into(),
+            ));
+        }
+        if should_cancel() {
+            return Ok(None);
+        }
+        // Stage 1/3 — reference conditioning (tokenize + prompt mel + speaker x-vector).
+        on_progress(Progress::Step {
+            current: 1,
+            total: 3,
+        });
+        let (prompt_tokens, prompt_mel, spk_embed) = self.reference_conditioning(reference)?;
+        if should_cancel() {
+            return Ok(None);
+        }
+        // Stage 2/3 — flow-matching token→mel decode.
+        on_progress(Progress::Step {
+            current: 2,
+            total: 3,
+        });
+        let mel =
+            self.flow
+                .inference(speech_tokens, &prompt_tokens, &prompt_mel, &spk_embed, seed)?;
+        if should_cancel() {
+            return Ok(None);
+        }
+        // Stage 3/3 — HiFTNet vocode → 24 kHz waveform.
+        on_progress(Progress::Step {
+            current: 3,
+            total: 3,
+        });
+        let wav = self.hift.decode(&mel, seed)?;
+        Ok(Some(wav.flatten_all()?.to_vec1::<f32>()?))
+    }
 }
 
 #[cfg(test)]
@@ -67,23 +160,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn decode_is_an_honest_typed_boundary_not_fake_audio() {
-        let err = decode(&[1, 2, 3]).unwrap_err();
-        match err {
-            AudioError::Msg(m) => {
-                assert!(m.contains("S3Gen"));
-                // All four networks are ported; the honest boundary is now the end-to-end
-                // integration (sc-13239), not a missing model.
-                assert!(m.contains("integration"));
-                assert!(m.contains("sc-13239"));
-                // It must NOT silently return samples.
-            }
-            other => panic!("expected a typed Msg boundary, got {other:?}"),
-        }
+    fn all_four_networks_are_ported() {
+        assert_eq!(S3GEN_REMAINING_NETWORKS, 0);
     }
 
     #[test]
-    fn all_four_networks_are_ported() {
-        assert_eq!(S3GEN_REMAINING_NETWORKS, 0);
+    fn cap_reference_bounds_to_ten_seconds_at_any_rate() {
+        // 24 kHz: 10 s cap = 240_000 samples.
+        let long = vec![0.0f32; 24_000 * 15];
+        assert_eq!(cap_reference(&long, 24_000).len(), 240_000);
+        // 16 kHz: the same 10 s window = 160_000 samples.
+        let long16 = vec![0.0f32; 16_000 * 15];
+        assert_eq!(cap_reference(&long16, 16_000).len(), 160_000);
+        // A short clip is returned whole.
+        let short = vec![0.0f32; 4_000];
+        assert_eq!(cap_reference(&short, 24_000).len(), 4_000);
     }
 }
