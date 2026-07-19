@@ -34,6 +34,7 @@ use core_llm::FinishReason as CoreFinish;
 
 use crate::decode::cancel::CancelFlag;
 use crate::decode::stream::{default_seed, Decode, FinishReason, GenerationOutput, StreamEvent};
+use crate::decode::{record_lane_token, LaneStep};
 use crate::error::{Error, Result};
 use crate::models::CausalLm;
 use crate::primitives::sampler::{sample, SamplingParams, SplitMix64};
@@ -70,12 +71,6 @@ struct Lane {
     history: Vec<i32>,
     /// The most recently sampled token, awaiting its feed into the next decode step.
     next_token: i32,
-}
-
-/// Whether a lane keeps decoding after a token, or has retired.
-enum LaneStep {
-    Continue,
-    Done,
 }
 
 /// Generate for a batch of requests in one continuous-batched run, returning a
@@ -147,7 +142,7 @@ pub fn generate_batch(
             continue;
         }
         let tok = sample_row(&logits, ri, &mut lane)?;
-        if let LaneStep::Continue = apply_token(&mut sched, &mut lane, tok, on_event) {
+        if let LaneStep::Continue = record_token(&mut sched, &mut lane, tok, on_event) {
             keep.push(ri as i32);
             active.push(lane);
         }
@@ -184,7 +179,7 @@ pub fn generate_batch(
         let mut next_active: Vec<Lane> = Vec::new();
         for (row, mut lane) in std::mem::take(&mut active).into_iter().enumerate() {
             let tok = sample_row(&logits, row, &mut lane)?;
-            if let LaneStep::Continue = apply_token(&mut sched, &mut lane, tok, on_event) {
+            if let LaneStep::Continue = record_token(&mut sched, &mut lane, tok, on_event) {
                 next_keep.push(row as i32);
                 next_active.push(lane);
             }
@@ -271,38 +266,19 @@ fn sample_row(logits: &Array, row: usize, lane: &mut Lane) -> Result<i32> {
 /// Record `tok` for `lane` through the scheduler and emit its stream events, mirroring the
 /// single-sequence loop: a stop token retires the lane (excluded, no `Token` event); otherwise the
 /// token is emitted + kept, and a filled budget retires the lane after including it.
-fn apply_token(
+fn record_token(
     sched: &mut Scheduler,
     lane: &mut Lane,
     tok: i32,
     on_event: &mut dyn FnMut(usize, StreamEvent),
 ) -> LaneStep {
-    let ri = lane.seq.0;
-    match sched.record(lane.seq, tok) {
-        Some(CoreFinish::Stop) => {
-            on_event(ri, StreamEvent::Done {
-                reason: FinishReason::StopToken,
-                generated: sched.generated(lane.seq).len(),
-            });
-            LaneStep::Done
-        }
-        other => {
-            let step = sched.generated(lane.seq).len() - 1;
-            on_event(ri, StreamEvent::Token { id: tok, step });
-            lane.history.push(tok);
-            match other {
-                Some(CoreFinish::Length) => {
-                    on_event(ri, StreamEvent::Done {
-                        reason: FinishReason::MaxTokens,
-                        generated: sched.generated(lane.seq).len(),
-                    });
-                    LaneStep::Done
-                }
-                _ => {
-                    lane.next_token = tok;
-                    LaneStep::Continue
-                }
-            }
-        }
-    }
+    record_lane_token(
+        sched,
+        lane.seq,
+        lane.seq.0,
+        tok,
+        &mut lane.history,
+        &mut lane.next_token,
+        on_event,
+    )
 }
