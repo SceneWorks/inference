@@ -299,7 +299,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     // the Sequential-over-dense combination that actually pays the repeated cost.
     if let Some(q) = spec.quantize {
         if matches!(spec.offload_policy, OffloadPolicy::Sequential)
-            && loader::needs_load_time_quant(root, q.bits(), descriptor().id)?
+            && mlx_gen::quant::needs_load_time_quant(root, "unet", q.bits(), descriptor().id)?
         {
             mlx_gen::residency::warn_sequential_requantize(descriptor().id, q.bits());
         }
@@ -365,7 +365,7 @@ fn load_text_encoders(
         // otherwise serve Q8 with no diagnostic. `needs_load_time_quant` errors on a mismatch; on a
         // matching-packed or dense snapshot it returns Ok and the quantize below stands (a no-op on the
         // already-packed encoders, a real pack on a dense snapshot).
-        loader::needs_load_time_quant(root, q.bits(), descriptor().id)?;
+        mlx_gen::quant::needs_load_time_quant(root, "unet", q.bits(), descriptor().id)?;
         let bits = q.bits();
         te1.quantize(bits)?;
         te2.quantize(bits)?;
@@ -451,7 +451,7 @@ fn load_heavy(spec: &LoadSpec, root: &Path, load_pid: bool) -> Result<SdxlHeavyO
         // no-ops on an already-packed snapshot, so a Q4 request over a pre-quantized Q8 turnkey would
         // silently serve Q8. On a matching-packed or dense snapshot this returns Ok and the quantize
         // below stands (a no-op on the packed U-Net, a real pack on the dense control branches).
-        loader::needs_load_time_quant(root, q.bits(), descriptor().id)?;
+        mlx_gen::quant::needs_load_time_quant(root, "unet", q.bits(), descriptor().id)?;
         let bits = q.bits();
         unet.quantize(bits)?;
         for cn in &mut controls {

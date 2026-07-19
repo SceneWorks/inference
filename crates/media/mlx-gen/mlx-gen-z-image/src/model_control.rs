@@ -173,7 +173,7 @@ pub(crate) fn load_control_heavy(
     // the DENSE control branch, which needs the load-time quantize (`quantize()` no-ops on the
     // packed base Linears but packs the dense control ones).
     if let Some(q) = spec.quantize {
-        loader::needs_load_time_quant(root, q.bits(), model_id)?;
+        mlx_gen::quant::needs_load_time_quant(root, "transformer", q.bits(), model_id)?;
     }
     // Base + control applied dense first, THEN quantize together (the fork's ordering): quantizing
     // before the overlay would replace the control Linears with QuantizedLinear that can't accept
@@ -219,7 +219,8 @@ pub(crate) fn load_control_residency(
         // silently serving Q8 (`quantize()` is a no-op on packed weights). Before this fix only the
         // Sequential warn gate below evaluated it, so the DEFAULT `Resident` load skipped the guard
         // entirely; `load_control_heavy` re-checks for the Sequential per-generate reload path.
-        let load_time_quant = loader::needs_load_time_quant(root, q.bits(), model_id)?;
+        let load_time_quant =
+            mlx_gen::quant::needs_load_time_quant(root, "transformer", q.bits(), model_id)?;
         // F-181: Sequential + a load-time quant over a dense snapshot re-quantizes every generate;
         // only that combination pays the repeated cost, so gate the warning on it.
         if load_time_quant && matches!(spec.offload_policy, OffloadPolicy::Sequential) {

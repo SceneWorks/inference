@@ -164,7 +164,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     // the Sequential-over-dense combination that actually pays the repeated cost.
     if let Some(q) = spec.quantize {
         if matches!(spec.offload_policy, OffloadPolicy::Sequential)
-            && loader::needs_load_time_quant(root, q.bits(), MODEL_ID)?
+            && mlx_gen::quant::needs_load_time_quant(root, "transformer", q.bits(), MODEL_ID)?
         {
             mlx_gen::residency::warn_sequential_requantize(MODEL_ID, q.bits());
         }
@@ -240,7 +240,7 @@ fn load_heavy(spec: &LoadSpec, root: &Path, load_pid: bool) -> Result<QwenEditHe
         // F-076: reject a requested-vs-packed quant-tier mismatch instead of silently serving the
         // snapshot's tier; skip the no-op quantize when the turnkey is already packed at the
         // requested bits (see `loader::needs_load_time_quant`) — same guard as the T2I loader.
-        if loader::needs_load_time_quant(root, q.bits(), MODEL_ID)? {
+        if mlx_gen::quant::needs_load_time_quant(root, "transformer", q.bits(), MODEL_ID)? {
             transformer.quantize(q.bits())?;
         }
     }
@@ -516,7 +516,9 @@ fn validate_reference_images(req: &GenerationRequest) -> Result<()> {
                 "qwen_image_edit: reference image has a zero dimension ({w}x{h})"
             )));
         }
-        if img.pixels.len() != w * h * 3 {
+        if img.pixels.len()
+            != mlx_gen::gen_core::imageops::checked_image_buffer_len(w, h, 3).unwrap_or(usize::MAX)
+        {
             return Err(Error::Msg(format!(
                 "qwen_image_edit: reference image pixel buffer {} != {w}x{h}x3",
                 img.pixels.len()

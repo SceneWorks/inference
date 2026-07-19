@@ -180,7 +180,7 @@ fn load_with(spec: &LoadSpec, defaults: Defaults) -> Result<Box<dyn Generator>> 
     Ok(Box::new(LensGenerator {
         descriptor: descriptor_for(defaults.id),
         defaults,
-        residency: build_residency(spec)?,
+        residency: build_residency(spec, defaults.id)?,
     }))
 }
 
@@ -194,7 +194,10 @@ fn load_with(spec: &LoadSpec, defaults: Defaults) -> Result<Box<dyn Generator>> 
 /// unsupported-overlay rejection, plus the precision→dtype mapping). Weight-free-testable: under
 /// `Sequential` this touches no component weights, so a dispatch that ignored `offload_policy` would
 /// eager-load and fail the "Sequential defers" unit test.
-pub(crate) fn build_residency(spec: &LoadSpec) -> Result<Residency<LensText, LensHeavyOwned>> {
+pub(crate) fn build_residency(
+    spec: &LoadSpec,
+    model_id: &'static str,
+) -> Result<Residency<LensText, LensHeavyOwned>> {
     // Up-front fail-fast for both policies (mirrors the pre-seam load order).
     let (root, _) = resolve_root(spec)?;
     // F-010 (sc-12462): fail-fast requested-vs-packed tier guard for BOTH policies — `Sequential`
@@ -203,8 +206,15 @@ pub(crate) fn build_residency(spec: &LoadSpec) -> Result<Residency<LensText, Len
     // quantized components carry the converter's marker; check both so a half-converted snapshot
     // still errors.
     if let Some(q) = spec.quantize {
-        crate::quant::needs_load_time_quant(&root, "text_encoder", q.bits(), "lens")?;
-        crate::quant::needs_load_time_quant(&root, "transformer", q.bits(), "lens")?;
+        let text_needs_quant =
+            mlx_gen::quant::needs_load_time_quant(&root, "text_encoder", q.bits(), model_id)?;
+        let transformer_needs_quant =
+            mlx_gen::quant::needs_load_time_quant(&root, "transformer", q.bits(), model_id)?;
+        if matches!(spec.offload_policy, mlx_gen::OffloadPolicy::Sequential)
+            && (text_needs_quant || transformer_needs_quant)
+        {
+            mlx_gen::residency::warn_sequential_requantize(model_id, q.bits());
+        }
     }
     let spec_text = spec.clone();
     let spec_heavy = spec.clone();
@@ -212,11 +222,11 @@ pub(crate) fn build_residency(spec: &LoadSpec) -> Result<Residency<LensText, Len
         spec.offload_policy,
         move || {
             let (root, dtype) = resolve_root(&spec_text)?;
-            load_text_phase(&spec_text, &root, dtype)
+            load_text_phase(&spec_text, &root, dtype, model_id)
         },
         move |use_pid| {
             let (root, dtype) = resolve_root(&spec_heavy)?;
-            load_heavy_phase(&spec_heavy, &root, dtype, use_pid)
+            load_heavy_phase(&spec_heavy, &root, dtype, use_pid, model_id)
         },
     )
 }
@@ -247,14 +257,14 @@ fn resolve_root(spec: &LoadSpec) -> Result<(std::path::PathBuf, Dtype)> {
 
 /// Load the text-encode phase — the gpt-oss encoder dropped first under `Sequential`. `spec.quantize`
 /// quantizes the encoder's MoE experts at load (sc-3172).
-fn load_text_phase(spec: &LoadSpec, root: &Path, dtype: Dtype) -> Result<LensText> {
+fn load_text_phase(spec: &LoadSpec, root: &Path, dtype: Dtype, model_id: &str) -> Result<LensText> {
     // F-010 (sc-12462): reject a requested-vs-packed tier mismatch BEFORE any weights load — a
     // packed turnkey's experts build `ExpertBank::Quant` from the on-disk shapes, so e.g. a Q4
     // request over a Q8 turnkey would otherwise silently serve Q8. The returned bool is unused:
     // `from_weights_quant` auto-detects packed vs dense itself ("lens" — the snapshot tree is
     // shared by both registry ids).
     if let Some(q) = spec.quantize {
-        crate::quant::needs_load_time_quant(root, "text_encoder", q.bits(), "lens")?;
+        mlx_gen::quant::needs_load_time_quant(root, "text_encoder", q.bits(), model_id)?;
     }
     LensText::load(root, dtype, spec.quantize)
 }
@@ -268,6 +278,7 @@ fn load_heavy_phase(
     root: &Path,
     dtype: Dtype,
     load_pid: bool,
+    model_id: &str,
 ) -> Result<LensHeavyOwned> {
     // F-010 (sc-12462): reject a requested-vs-packed tier mismatch BEFORE any weights load — the
     // DiT projections load packed via `quant::lin` (a Quantized base on which
@@ -275,7 +286,7 @@ fn load_heavy_phase(
     // silently serve Q8. `false` (already packed at the requested bits) also skips the no-op
     // `quantize_dit` below.
     let needs_quant = match spec.quantize {
-        Some(q) => crate::quant::needs_load_time_quant(root, "transformer", q.bits(), "lens")?,
+        Some(q) => mlx_gen::quant::needs_load_time_quant(root, "transformer", q.bits(), model_id)?,
         None => false,
     };
     let mut heavy = LensHeavy::load(root, dtype)?;
@@ -841,7 +852,7 @@ mod tests {
     fn heavy_phase_rejects_q4_over_q8_turnkey() {
         let root = tier_fixture(&["transformer"], 8);
         let spec = q4_spec(&root, mlx_gen::OffloadPolicy::Resident);
-        let err = load_heavy_phase(&spec, &root, Dtype::Bfloat16, false)
+        let err = load_heavy_phase(&spec, &root, Dtype::Bfloat16, false, MODEL_ID_BASE)
             .err()
             .expect("Q4 over a packed Q8 DiT must error");
         let msg = err.to_string();
@@ -859,7 +870,7 @@ mod tests {
     fn text_phase_rejects_q4_over_q8_turnkey() {
         let root = tier_fixture(&["text_encoder"], 8);
         let spec = q4_spec(&root, mlx_gen::OffloadPolicy::Resident);
-        let err = load_text_phase(&spec, &root, Dtype::Bfloat16)
+        let err = load_text_phase(&spec, &root, Dtype::Bfloat16, MODEL_ID_BASE)
             .err()
             .expect("Q4 over a packed Q8 encoder must error");
         let msg = err.to_string();
@@ -882,7 +893,7 @@ mod tests {
                 Err(e) => e.to_string(),
             };
             assert!(
-                err.contains("pre-quantized Q8"),
+                err.contains("pre-quantized Q8") && err.contains(id),
                 "{id}: expected the tier-mismatch error, got: {err}"
             );
             std::fs::remove_dir_all(&root).ok();
@@ -894,9 +905,12 @@ mod tests {
     #[test]
     fn sequential_fails_fast_on_tier_mismatch() {
         let root = tier_fixture(&["transformer", "text_encoder"], 8);
-        let err = build_residency(&q4_spec(&root, mlx_gen::OffloadPolicy::Sequential))
-            .err()
-            .expect("Sequential must fail-fast on a tier mismatch at load, not at first generate");
+        let err = build_residency(
+            &q4_spec(&root, mlx_gen::OffloadPolicy::Sequential),
+            MODEL_ID_BASE,
+        )
+        .err()
+        .expect("Sequential must fail-fast on a tier mismatch at load, not at first generate");
         assert!(err.to_string().contains("pre-quantized Q8"), "got: {err}");
         std::fs::remove_dir_all(&root).ok();
     }
@@ -911,19 +925,23 @@ mod tests {
         let mut spec = LoadSpec::new(WeightsSource::Dir(root.clone()))
             .with_offload_policy(mlx_gen::OffloadPolicy::Sequential);
         spec.quantize = Some(Quant::Q8);
-        build_residency(&spec).expect("Q8 over a packed Q8 turnkey must pass the tier guard");
+        build_residency(&spec, MODEL_ID_BASE)
+            .expect("Q8 over a packed Q8 turnkey must pass the tier guard");
 
         // No quantize requested over a packed turnkey: guard not consulted, load proceeds.
         spec.quantize = None;
-        build_residency(&spec)
+        build_residency(&spec, MODEL_ID_BASE)
             .expect("a packed turnkey with no quantize requested must load at its shipped tier");
         std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn build_residency_sequential_defers_all_component_loads() {
-        let res = build_residency(&missing_snapshot_spec(mlx_gen::OffloadPolicy::Sequential))
-            .expect("Sequential must defer loads and not touch the (missing) snapshot dir");
+        let res = build_residency(
+            &missing_snapshot_spec(mlx_gen::OffloadPolicy::Sequential),
+            MODEL_ID_BASE,
+        )
+        .expect("Sequential must defer loads and not touch the (missing) snapshot dir");
         assert!(
             res.is_sequential(),
             "Sequential policy must build a Sequential (deferred) residency"
@@ -932,9 +950,12 @@ mod tests {
 
     #[test]
     fn build_residency_resident_eager_loads_and_fails_on_missing_snapshot() {
-        let err = build_residency(&missing_snapshot_spec(mlx_gen::OffloadPolicy::Resident))
-            .err()
-            .expect("Resident must eager-load and fail on a missing snapshot dir");
+        let err = build_residency(
+            &missing_snapshot_spec(mlx_gen::OffloadPolicy::Resident),
+            MODEL_ID_BASE,
+        )
+        .err()
+        .expect("Resident must eager-load and fail on a missing snapshot dir");
         let msg = err.to_string();
         assert!(
             !msg.contains("single .safetensors file") && !msg.contains("precision override"),

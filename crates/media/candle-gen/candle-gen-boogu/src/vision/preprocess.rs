@@ -72,7 +72,10 @@ pub fn preprocess_image(
             "boogu vision: zero dimension ({width}x{height})"
         )));
     }
-    if pixels_hwc.len() != height * width * 3 {
+    if pixels_hwc.len()
+        != candle_gen::gen_core::imageops::checked_image_buffer_len(width, height, 3)
+            .unwrap_or(usize::MAX)
+    {
         return Err(CandleError::Msg(format!(
             "boogu vision: pixel buffer {} != {width}x{height}x3",
             pixels_hwc.len()

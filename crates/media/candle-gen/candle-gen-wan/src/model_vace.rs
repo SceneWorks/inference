@@ -249,7 +249,9 @@ impl Pipeline {
         // single high-res frame can't spike VRAM (48 GiB single-pass would OOM a 24 GB card), forces
         // tiling below the candle conv2d im2col-safe cap so the untiled decode can't silently corrupt,
         // and returns a catchable error rather than OOM-ing when over budget.
-        let decoded = comps.vae.decode_budgeted(&latents)?;
+        let decoded = comps
+            .vae
+            .decode_budgeted_with_cancel(&latents, &req.cancel)?;
         let images = frames_to_images(&decoded)?;
         Ok((images, fps))
     }
@@ -329,6 +331,33 @@ impl Generator for WanVaceGenerator {
             return Err(gen_core::Error::Msg(format!(
                 "wan-vace: control clip frame count must be 1 + 4·k (got {})",
                 clip.frames.len()
+            )));
+        }
+        if clip.frames.len() > crate::MAX_WAN_FRAMES {
+            return Err(gen_core::Error::Msg(format!(
+                "wan-vace: control clip frame count {} exceeds the maximum {}",
+                clip.frames.len(),
+                crate::MAX_WAN_FRAMES
+            )));
+        }
+        let reference_count = req
+            .conditioning
+            .iter()
+            .filter(|conditioning| matches!(conditioning, Conditioning::Reference { .. }))
+            .count();
+        let combined = crate::combined_conditioning_latents(clip.frames.len(), reference_count)
+            .ok_or_else(|| {
+                gen_core::Error::Msg(
+                    "wan-vace: control/reference temporal conditioning size overflowed".into(),
+                )
+            })?;
+        if combined > crate::MAX_WAN_CONDITIONING_LATENTS {
+            let control_latents = 1 + (clip.frames.len() - 1) / VAE_T;
+            return Err(gen_core::Error::Msg(format!(
+                "wan-vace: control clip uses {control_latents} latent frames and {reference_count} \
+                 reference images, totaling {combined}; the maximum combined temporal conditioning \
+                 budget is {}",
+                crate::MAX_WAN_CONDITIONING_LATENTS
             )));
         }
         // The VACE output frame count is driven solely by the ControlClip (`render` derives the
@@ -480,6 +509,28 @@ mod tests {
         }
     }
 
+    fn control_req_with_counts(frames: usize, references: usize) -> GenerationRequest {
+        let image = Image {
+            width: 64,
+            height: 64,
+            pixels: vec![0u8; 64 * 64 * 3],
+        };
+        let mut req = control_req();
+        req.conditioning = vec![Conditioning::ControlClip {
+            frames: vec![image.clone(); frames],
+            mask: vec![image.clone(); frames],
+            masking_strength: 1.0,
+            start_frame: 0,
+            mode: ReplacementMode::default(),
+        }];
+        req.conditioning
+            .extend((0..references).map(|_| Conditioning::Reference {
+                image: image.clone(),
+                strength: None,
+            }));
+        req
+    }
+
     #[test]
     fn registers_as_candle_video() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
@@ -540,6 +591,33 @@ mod tests {
         let mut bad_size = control_req();
         bad_size.width = 70;
         assert!(g.validate(&bad_size).is_err());
+    }
+
+    #[test]
+    fn validate_enforces_control_and_combined_conditioning_ceilings() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let g = crate::provider_registry()
+            .unwrap()
+            .load(MODEL_ID_VACE, &spec)
+            .unwrap();
+
+        assert!(g.validate(&control_req_with_counts(1025, 0)).is_ok());
+        let error = g
+            .validate(&control_req_with_counts(1029, 0))
+            .expect_err("1029 control frames must fail");
+        assert!(error.to_string().contains("maximum 1025"), "{error}");
+
+        assert!(g.validate(&control_req_with_counts(5, 2)).is_ok());
+        assert!(g.validate(&control_req_with_counts(5, 255)).is_ok());
+        let error = g
+            .validate(&control_req_with_counts(5, 256))
+            .expect_err("258 combined conditioning latents must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("maximum combined temporal conditioning budget is 257"),
+            "{error}"
+        );
     }
 
     #[test]

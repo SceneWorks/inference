@@ -16,6 +16,15 @@
 use crate::media::Image;
 use crate::Error;
 
+/// Returns the number of scalar elements in an interleaved image buffer without overflowing.
+///
+/// Zero-sized images remain representable as a zero-length buffer; validation of whether zero
+/// dimensions are permitted belongs to the caller's image contract.
+#[inline]
+pub fn checked_image_buffer_len(width: usize, height: usize, channels: usize) -> Option<usize> {
+    width.checked_mul(height)?.checked_mul(channels)
+}
+
 /// PIL `bicubic_filter` (Keys cubic, a = -0.5), support 2.0.
 fn cubic(x: f64) -> f64 {
     const A: f64 = -0.5;
@@ -384,6 +393,16 @@ pub fn union_masks(a: &Image, b: &Image) -> crate::Result<Image> {
 
 #[cfg(test)]
 mod tests {
+    use super::checked_image_buffer_len;
+
+    #[test]
+    fn checked_image_buffer_len_handles_valid_zero_and_overflow_dimensions() {
+        assert_eq!(checked_image_buffer_len(640, 480, 3), Some(921_600));
+        assert_eq!(checked_image_buffer_len(0, usize::MAX, 4), Some(0));
+        assert_eq!(checked_image_buffer_len(usize::MAX, 2, 1), None);
+        assert_eq!(checked_image_buffer_len(usize::MAX / 2 + 1, 1, 2), None);
+    }
+
     use super::*;
 
     #[test]

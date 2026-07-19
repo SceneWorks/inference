@@ -102,19 +102,32 @@ fn resize_nchw(
     out
 }
 
-/// `F.interpolate(x, size=(out_h, out_w), mode, align_corners=False)` for an `[N, C, H, W]` image.
-pub fn interpolate(x: &Tensor, out_h: usize, out_w: usize, mode: Interp) -> Result<Tensor> {
+/// Run the host resize kernel and keep its result on CPU.
+fn interpolate_host(x: &Tensor, out_h: usize, out_w: usize, mode: Interp) -> Result<Tensor> {
     let (n, c, ih, iw) = x.dims4()?;
     let src: Vec<f32> = x.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
     let out = resize_nchw(&src, (n, c, ih, iw), (out_h, out_w), mode);
-    Tensor::from_vec(out, (n, c, out_h, out_w), x.device())
+    Tensor::from_vec(
+        out,
+        (n, c, out_h, out_w),
+        &candle_gen::candle_core::Device::Cpu,
+    )
+}
+
+/// `F.interpolate(x, size=(out_h, out_w), mode, align_corners=False)` for an `[N, C, H, W]` image,
+/// preserving the input device. Callers that can defer upload should use [`downsample_half`], whose
+/// result intentionally remains on CPU.
+pub fn interpolate(x: &Tensor, out_h: usize, out_w: usize, mode: Interp) -> Result<Tensor> {
+    interpolate_host(x, out_h, out_w, mode)?.to_device(x.device())
 }
 
 /// `F.interpolate(x, scale_factor=0.5, mode='bilinear', align_corners=False)` (pose video / driving
-/// mask half-resolution), `[N, C, H, W] → [N, C, H/2, W/2]`.
+/// mask half-resolution), `[N, C, H, W] → [N, C, H/2, W/2]`. The output stays on CPU so the host
+/// kernel does not immediately re-upload it; generation transfers the compact result once at the
+/// model boundary (F-070 / sc-12517).
 pub fn downsample_half(x: &Tensor) -> Result<Tensor> {
     let (_, _, h, w) = x.dims4()?;
-    interpolate(x, h / 2, w / 2, Interp::Bilinear)
+    interpolate_host(x, h / 2, w / 2, Interp::Bilinear)
 }
 
 /// CLIP image preprocessing (upstream `CLIPModel.visual`): bicubic-resize an `[B, 3, H, W]` image in

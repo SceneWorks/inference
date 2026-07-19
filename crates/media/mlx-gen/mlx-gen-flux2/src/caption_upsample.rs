@@ -252,7 +252,14 @@ fn preprocess_upsample_image(references: &[&Image]) -> Result<(Array, (i32, i32)
 /// reference `concatenate_images`). A single image is returned as-is.
 fn concatenate_horizontal(images: &[&Image]) -> Result<Image> {
     for im in images {
-        if im.pixels.len() != im.width as usize * im.height as usize * 3 {
+        if im.pixels.len()
+            != mlx_gen::gen_core::imageops::checked_image_buffer_len(
+                im.width as usize,
+                im.height as usize,
+                3,
+            )
+            .unwrap_or(usize::MAX)
+        {
             return Err(Error::Msg(format!(
                 "flux2 caption-upsample: image pixel buffer {} != {}x{}x3",
                 im.pixels.len(),

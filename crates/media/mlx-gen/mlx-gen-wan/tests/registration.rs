@@ -207,6 +207,49 @@ fn load_reads_config_and_wires_generate() {
 }
 
 #[test]
+fn dense_wan_ids_enforce_the_shared_frame_ceiling() {
+    for (id, config, needs_reference) in [
+        (MODEL_ID, TI2V_5B_CONFIG, false),
+        (MODEL_ID_T2V_14B, T2V_14B_CONFIG, false),
+        (MODEL_ID_I2V_14B, I2V_14B_CONFIG, true),
+    ] {
+        let dir = temp_model_dir_with(&format!("{id}-frame-cap"), config);
+        let g = mlx_gen_wan::provider_registry()
+            .unwrap()
+            .load(id, &LoadSpec::new(WeightsSource::Dir(dir.clone())))
+            .unwrap();
+        let conditioning = if needs_reference {
+            vec![Conditioning::Reference {
+                image: mlx_gen::media::Image {
+                    width: 16,
+                    height: 16,
+                    pixels: vec![0; 16 * 16 * 3],
+                },
+                strength: None,
+            }]
+        } else {
+            vec![]
+        };
+        let at_cap = GenerationRequest {
+            width: 512,
+            height: 512,
+            frames: Some(1025),
+            conditioning,
+            ..Default::default()
+        };
+        assert!(g.validate(&at_cap).is_ok(), "{id}");
+        let error = g
+            .validate(&GenerationRequest {
+                frames: Some(1029),
+                ..at_cap
+            })
+            .expect_err("1029 must exceed the Wan frame ceiling");
+        assert!(error.to_string().contains("maximum 1025"), "{id}: {error}");
+        std::fs::remove_dir_all(dir).ok();
+    }
+}
+
+#[test]
 fn load_rejects_bad_source_and_precision() {
     let dir = temp_model_dir("reject");
     // Single-file source.
@@ -774,6 +817,44 @@ fn wan_vace_lanes_reject_over_cap_control_clip_frames() {
         assert!(g.validate(&control_clip_request(1025)).is_ok(), "{id}");
     }
     std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn wan_vace_lanes_bound_combined_control_and_reference_latents() {
+    let dir = temp_model_dir_with("vace_combined_cap", VACE_CONFIG);
+    let reference = || Conditioning::Reference {
+        image: mlx_gen::media::Image {
+            width: 64,
+            height: 64,
+            pixels: vec![0; 64 * 64 * 3],
+        },
+        strength: None,
+    };
+    for id in [MODEL_ID_VACE, MODEL_ID_VACE_FUN] {
+        let g = mlx_gen_wan::provider_registry()
+            .unwrap()
+            .load(id, &LoadSpec::new(WeightsSource::Dir(dir.clone())))
+            .unwrap();
+
+        let mut two_refs = control_clip_request(5);
+        two_refs.conditioning.extend([reference(), reference()]);
+        assert!(g.validate(&two_refs).is_ok(), "{id}: two references");
+
+        let mut exact = control_clip_request(5); // two control latent frames
+        exact.conditioning.extend((0..255).map(|_| reference()));
+        assert!(g.validate(&exact).is_ok(), "{id}: exact combined budget");
+        exact.conditioning.push(reference());
+        let error = g
+            .validate(&exact)
+            .expect_err("258 combined latent frames must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("maximum combined temporal conditioning budget is 257"),
+            "{id}: {error}"
+        );
+    }
+    std::fs::remove_dir_all(dir).ok();
 }
 
 /// sc-12459 (F-008): both VACE lanes run the sc-4986 preflight denoise memory guard **before any

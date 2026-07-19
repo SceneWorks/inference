@@ -126,7 +126,9 @@ fn align(value: u32) -> usize {
 /// the bicubic overshoot that would invent out-of-gamut colors at mask edges).
 fn image_to_chw(img: &Image, tw: usize, th: usize, mode: Interp) -> Result<Array> {
     let (iw, ih) = (img.width as usize, img.height as usize);
-    if img.pixels.len() != iw * ih * 3 {
+    if img.pixels.len()
+        != mlx_gen::gen_core::imageops::checked_image_buffer_len(iw, ih, 3).unwrap_or(usize::MAX)
+    {
         return Err(Error::Msg(format!(
             "scail2: image pixel buffer {} != {iw}x{ih}x3",
             img.pixels.len()

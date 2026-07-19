@@ -155,7 +155,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     // the Sequential-over-dense combination that actually pays the repeated cost.
     if let Some(q) = spec.quantize {
         if matches!(spec.offload_policy, OffloadPolicy::Sequential)
-            && loader::needs_load_time_quant(root, q.bits(), MODEL_ID)?
+            && mlx_gen::quant::needs_load_time_quant(root, "transformer", q.bits(), MODEL_ID)?
         {
             mlx_gen::residency::warn_sequential_requantize(MODEL_ID, q.bits());
         }
@@ -235,7 +235,7 @@ fn load_heavy(spec: &LoadSpec, root: &Path, load_pid: bool) -> Result<QwenHeavyO
         // F-076: reject a requested-vs-packed quant-tier mismatch instead of silently serving the
         // snapshot's tier; skip the no-op quantize when the turnkey is already packed at the
         // requested bits (see `loader::needs_load_time_quant`).
-        if loader::needs_load_time_quant(root, q.bits(), MODEL_ID)? {
+        if mlx_gen::quant::needs_load_time_quant(root, "transformer", q.bits(), MODEL_ID)? {
             transformer.quantize(q.bits())?;
         }
     }
@@ -719,6 +719,43 @@ mod tests {
             LoadSpec::new(WeightsSource::Dir("/nonexistent".into())).with_quant(mlx_gen::Quant::Q8);
         let err = load(&spec).err().expect("expected an error").to_string();
         assert!(!err.contains("quantization"), "got: {err}");
+    }
+
+    #[test]
+    fn load_uses_shared_tier_guard_before_weights() {
+        let root = std::env::temp_dir().join(format!(
+            "qwen-shared-tier-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+        ));
+        std::fs::create_dir_all(root.join("transformer")).unwrap();
+        std::fs::write(
+            root.join("transformer/config.json"),
+            r#"{"quantization":{"bits":8,"group_size":64}}"#,
+        )
+        .unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir(root.clone()))
+            .with_quant(mlx_gen::Quant::Q4)
+            .with_offload_policy(OffloadPolicy::Sequential);
+        let error = load(&spec)
+            .err()
+            .expect("tier mismatch must fail")
+            .to_string();
+        assert!(error.contains(MODEL_ID), "{error}");
+        assert!(error.contains("Q8") && error.contains("Q4"), "{error}");
+
+        std::fs::write(root.join("transformer/config.json"), "{").unwrap();
+        let error = load(&spec)
+            .err()
+            .expect("malformed marker must fail")
+            .to_string();
+        assert!(
+            error.contains("parse") && error.contains("config.json"),
+            "{error}"
+        );
+        std::fs::remove_dir_all(root).ok();
     }
 
     // ── F-180 (sc-11126): weight-free, default-run proof that Qwen-Image's dispatch HONORS

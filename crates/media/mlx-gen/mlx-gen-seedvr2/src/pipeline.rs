@@ -45,6 +45,12 @@ fn cast_weights(w: &Weights, dt: Dtype) -> Result<Weights> {
     Ok(out)
 }
 
+/// Prepare raw SeedVR2 DiT weights exactly as the production loader does: cast each source tensor
+/// once, then duplicate the converted shared-block keys as refcounted handles of that cast buffer.
+fn prepare_dit(raw: &Weights, dt: Dtype) -> Result<Weights> {
+    convert::convert_dit(&cast_weights(raw, dt)?)
+}
+
 /// Estimate resident weight bytes for the video memory budget: the raw `fp16` checkpoint file sizes
 /// scaled by the load `dtype` (`Bfloat16` keeps the 2 B/param footprint, `Float32` doubles it). File
 /// sizes (vs summing per-tensor) match the wan `dit_resident_bytes` convention; the safetensors header
@@ -118,7 +124,7 @@ impl Seedvr2Pipeline {
         // share the single cast buffer. The reorder is exact for every key: `cast_weights` is
         // key-independent and `convert_dit` is dtype-independent (renames + handle clones only).
         // The VAE has no duplicated keys, so its order stays as-is.
-        let dit_w = convert::convert_dit(&cast_weights(&Weights::from_file(&dit_path)?, dt)?)?;
+        let dit_w = prepare_dit(&Weights::from_file(&dit_path)?, dt)?;
         let mut p = Self::from_weights(&vae_w, &dit_w, cfg)?;
         p.neg_embed = Some(load_neg_embed(dt)?);
         p.dtype = dt;
@@ -841,8 +847,8 @@ mod tests {
         let mut raw = Weights::empty();
         synth_shared_attn_block(&mut raw, 10, 64, 2, 32);
 
-        // the `load` order: cast the raw (fp16 → f32, a real cast) BEFORE duplicating keys.
-        let shared = convert::convert_dit(&cast_weights(&raw, Dtype::Float32).unwrap()).unwrap();
+        // Exercise the exact preparation function used by `Seedvr2Pipeline::load`.
+        let shared = prepare_dit(&raw, Dtype::Float32).unwrap();
         for sub in ["proj_qkv", "proj_out"] {
             let v = shared
                 .require(&format!("blocks.10.attn.{sub}_vid.weight"))

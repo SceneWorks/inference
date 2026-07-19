@@ -96,7 +96,12 @@ impl DepthAnythingV2 {
     /// `width`·`height` (min/max-normalized, grayscale broadcast; near = bright). The model runs at
     /// its native 518² and the result is bilinearly resized back to the input dimensions on the host.
     pub fn estimate_control_rgb8(&self, rgb: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
-        let expected = width as usize * height as usize * 3;
+        let expected = mlx_gen::gen_core::imageops::checked_image_buffer_len(
+            width as usize,
+            height as usize,
+            3,
+        )
+        .unwrap_or(usize::MAX);
         if rgb.len() != expected {
             return Err(Error::Msg(format!(
                 "depth input buffer is {} bytes, expected {expected} ({width}×{height}×3)",

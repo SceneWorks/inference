@@ -36,7 +36,7 @@ use std::sync::{Arc, Mutex};
 use image::RgbImage;
 
 use candle_gen::candle_core::{DType, Device, Tensor};
-use candle_gen::gen_core::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
+use candle_gen::gen_core::tokenizer::TextTokenizer;
 use candle_gen::gen_core::{
     self, CancelFlag, Capabilities, Conditioning, ConditioningKind, GenerationOutput,
     GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, Progress, Quant,
@@ -45,7 +45,7 @@ use candle_gen::gen_core::{
 use candle_gen::{CandleError, Result as CResult};
 
 use candle_gen_wan::config::{
-    TextEncoderConfig, TransformerConfig, Vae16Config, DEFAULT_FRAMES_14B, NUM_TRAIN_TIMESTEPS,
+    TextEncoderConfig, TransformerConfig, DEFAULT_FRAMES_14B, NUM_TRAIN_TIMESTEPS,
     VAE16_STRIDE_SPATIAL, VAE16_STRIDE_TEMPORAL,
 };
 use candle_gen_wan::pipeline::{create_noise, frames_to_images};
@@ -53,10 +53,10 @@ use candle_gen_wan::rope::assign_source_ids;
 use candle_gen_wan::scheduler::{flow_sigmas, FlowScheduler, Sampler};
 use candle_gen_wan::text_encoder::Umt5Encoder;
 use candle_gen_wan::transformer::WanTransformer;
-use candle_gen_wan::vae16::WanVae16;
 
 use crate::assembly::{concat_with_zero_init, format_mllm_inputs_embeds};
 use crate::clip_diff::DiffLossFm;
+use crate::components::RendererComponents;
 use crate::config::BerniniKnobs;
 use crate::connector::MlpConnector;
 use crate::convert::{
@@ -90,8 +90,6 @@ const Z_DIM: usize = 16;
 /// The planner + renderer contexts run bf16 on the DiT side; UMT5 + z16 VAE run f32.
 const PLANNER_DTYPE: DType = DType::BF16;
 const ENC_DTYPE: DType = DType::F32;
-const VAE_DTYPE: DType = DType::F32;
-const DIT_DTYPE: DType = DType::BF16;
 
 /// Full-pipeline CLI defaults (`bernini/cli.py` for the `BerniniPipeline` path). A request's `guidance`
 /// overrides `omega_txt`; the rest are fixed until the worker surfaces them.
@@ -590,76 +588,29 @@ pub fn descriptor() -> ModelDescriptor {
     }
 }
 
-/// The heavy resident renderer components, loaded once on the first `generate` and cached across calls
-/// (F-097). Mirrors [`crate::pipeline::BerniniRenderer`]'s `Components`: unlike the planner (which is
-/// deliberately load-use-drop per request for peak VRAM), these — UMT5, both 14B experts, the z16 VAE,
-/// and the UMT5 tokenizer — are reloaded on every `generate` without a cache, so back-to-back or
-/// concurrent renders each re-mmap + re-upload ~50 GB of weights. Caching them behind
-/// [`candle_gen::cached`] loads them once and serializes racing first-callers on the load lock.
-struct Components {
-    /// UMT5-xxl text encoder (f32), reused across the pos/neg encodes.
-    te: Umt5Encoder,
-    /// `transformer/` — the **high-noise** expert (timestep ≥ boundary).
-    high: WanTransformer,
-    /// `transformer_2/` — the **low-noise** expert (timestep < boundary).
-    low: WanTransformer,
-    /// z16 VAE **with encoder** (encodes the source media up front, decodes the final latent).
-    vae: WanVae16,
-    /// UMT5 tokenizer, parsed once at component load and reused across the pos/neg encodes.
-    tok: TextTokenizer,
-}
-
 /// The loaded full Bernini pipeline: the snapshot dir + the resolved renderer knobs, with the heavy
-/// renderer components (`Components`) loaded lazily on the first `generate` and cached (F-097). The
-/// planner is intentionally **not** cached — it is loaded, used, and dropped per request (peak VRAM).
+/// renderer components loaded lazily on the first `generate` and cached (F-097). The planner is
+/// intentionally **not** cached — it is loaded, used, and dropped per request (peak VRAM).
 pub struct Bernini {
     descriptor: ModelDescriptor,
     knobs: BerniniKnobs,
     root: PathBuf,
     device: Device,
-    components: Mutex<Option<Arc<Components>>>,
+    components: Mutex<Option<Arc<RendererComponents>>>,
 }
 
 impl Bernini {
-    /// Load the cached renderer components (UMT5 + both experts + z16 VAE + tokenizer). Sequential
-    /// build: one component's staging VarBuilder at a time (mirrors the renderer sibling).
-    fn load_components(&self) -> CResult<Components> {
-        let dev = &self.device;
-        let te = Umt5Encoder::new(
-            &TextEncoderConfig::umt5_xxl(),
-            candle_gen::component_vb(&self.root, "text_encoder", ENC_DTYPE, dev, MODEL_ID)?,
-        )?;
-        let dit_cfg = TransformerConfig::t2v_14b();
-        // transformer/ = high-noise, transformer_2/ = low-noise (diffusers WanPipeline convention).
-        let high = WanTransformer::new(
-            &dit_cfg,
-            candle_gen::component_vb(&self.root, "transformer", DIT_DTYPE, dev, MODEL_ID)?,
-        )?;
-        let low = WanTransformer::new(
-            &dit_cfg,
-            candle_gen::component_vb(&self.root, "transformer_2", DIT_DTYPE, dev, MODEL_ID)?,
-        )?;
-        // The z16 VAE carries its encoder: the source media (Reference / MultiReference / VideoClip) is
-        // VAE-encoded into z16 source latents up front, and the final latent is decoded at the end.
-        let vae = WanVae16::new_with_encoder(
-            &Vae16Config::wan21(),
-            candle_gen::component_vb(&self.root, "vae", VAE_DTYPE, dev, MODEL_ID)?,
-        )?;
-        let tok = build_tokenizer(&self.root)?;
-        Ok(Components {
-            te,
-            high,
-            low,
-            vae,
-            tok,
+    /// The cached shared renderer components — loaded once, then cloned (`Arc`) on every subsequent
+    /// generate. The load lock serializes racing first-callers so two concurrent generates don't
+    /// both mmap + upload ~50 GB (F-097).
+    fn components(&self) -> CResult<Arc<RendererComponents>> {
+        candle_gen::cached(&self.components, || {
+            Ok(Arc::new(RendererComponents::load(
+                &self.root,
+                &self.device,
+                MODEL_ID,
+            )?))
         })
-    }
-
-    /// The cached renderer components — loaded once, then cloned (`Arc`) on every subsequent generate.
-    /// The load lock serializes racing first-callers so two concurrent generates don't both mmap +
-    /// upload ~50 GB (F-097).
-    fn components(&self) -> CResult<Arc<Components>> {
-        candle_gen::cached(&self.components, || Ok(Arc::new(self.load_components()?)))
     }
 }
 
@@ -1062,7 +1013,7 @@ impl Bernini {
 
         // --- Stage 4: z16 VAE decode → image / video ---
         on_progress(Progress::Decoding);
-        let decoded = vae.decode(&latents)?;
+        let decoded = vae.decode_with_cancel(&latents, &req.cancel)?;
         let images_out = frames_to_images(&decoded)?;
 
         if frames == 1 {
@@ -1186,21 +1137,6 @@ pub fn denoise_bernini_wvitcfg(
         latent = sched.step(&v, &latent)?;
     }
     Ok(latent)
-}
-
-/// Build the UMT5 tokenizer from `root/tokenizer/tokenizer.json` (byte-identical config to the renderer).
-fn build_tokenizer(root: &Path) -> CResult<TextTokenizer> {
-    let te_cfg = TextEncoderConfig::umt5_xxl();
-    TextTokenizer::from_file(
-        root.join("tokenizer/tokenizer.json"),
-        TokenizerConfig {
-            max_length: te_cfg.max_length,
-            pad_token_id: te_cfg.pad_token_id,
-            chat_template: ChatTemplate::None,
-            pad_to_max_length: false,
-        },
-    )
-    .map_err(|e| CandleError::Msg(format!("bernini: load tokenizer: {e}")))
 }
 
 /// UMT5-encode `prompt` → **unpadded** `[1, S, 4096]` f32 (the `concat_with_zero_init` prepend expects

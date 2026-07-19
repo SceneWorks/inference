@@ -131,7 +131,12 @@ impl DepthAnythingV2 {
                 "depth input image has a zero dimension ({width}×{height})"
             )));
         }
-        let expected = width as usize * height as usize * 3;
+        let expected = candle_gen::gen_core::imageops::checked_image_buffer_len(
+            width as usize,
+            height as usize,
+            3,
+        )
+        .unwrap_or(usize::MAX);
         if rgb.len() != expected {
             return Err(CandleError::Msg(format!(
                 "depth input buffer is {} bytes, expected {expected} ({width}×{height}×3)",
@@ -164,7 +169,12 @@ fn validate_rgb8(rgb: &[u8], width: u32, height: u32) -> Result<()> {
             "depth input image has a zero dimension ({width}×{height})"
         )));
     }
-    let expected = width as usize * height as usize * 3;
+    let expected = candle_gen::gen_core::imageops::checked_image_buffer_len(
+        width as usize,
+        height as usize,
+        3,
+    )
+    .unwrap_or(usize::MAX);
     if rgb.len() < expected {
         return Err(CandleError::Msg(format!(
             "depth input buffer is {} bytes, too small for {width}×{height}×3 ({expected})",

@@ -68,6 +68,22 @@ pub mod vae;
 pub mod vae22;
 mod vae_common;
 
+/// Operational Wan video ceiling: `1 + 4 * 256` pixel frames.
+pub(crate) const MAX_WAN_FRAMES: usize = 1025;
+/// Matching z16/z48 temporal-conditioning budget after 4x causal compression.
+pub(crate) const MAX_WAN_CONDITIONING_LATENTS: usize = 257;
+
+pub(crate) fn combined_conditioning_latents(
+    control_frames: usize,
+    reference_images: usize,
+) -> Option<usize> {
+    let control_latents = control_frames
+        .checked_sub(1)?
+        .checked_div(4)?
+        .checked_add(1)?;
+    control_latents.checked_add(reference_images)
+}
+
 pub use adapters::{
     apply_wan_adapters_additive, merge_vace_adapters, merge_vace_adapters_expert,
     merge_wan_adapters, WanLoraReport,
@@ -91,6 +107,17 @@ pub use scheduler::{
     compute_sigmas, make_scheduler, FlowDpmpp2m, FlowMatchEuler, FlowUniPC, SolverKind,
     WanScheduler,
 };
+
+#[cfg(test)]
+mod conditioning_budget_tests {
+    #[test]
+    fn combined_conditioning_latents_is_checked() {
+        assert_eq!(super::combined_conditioning_latents(1025, 0), Some(257));
+        assert_eq!(super::combined_conditioning_latents(5, 255), Some(257));
+        assert_eq!(super::combined_conditioning_latents(5, usize::MAX), None);
+        assert_eq!(super::combined_conditioning_latents(0, 0), None);
+    }
+}
 #[doc(hidden)]
 pub use text_encoder::encode_text_staged_for_tier;
 pub use text_encoder::{clean_text, load_tokenizer, umt5_tokenizer_config, Umt5Encoder};

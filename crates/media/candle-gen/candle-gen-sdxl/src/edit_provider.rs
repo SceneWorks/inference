@@ -288,7 +288,10 @@ impl SdxlEdit {
     /// clean latent mean `[1, 4, h/8, w/8]` × 0.13025 — the deterministic img2img/inpaint init.
     fn encode_source(&self, source: &Image, width: u32, height: u32) -> Result<Tensor> {
         let (iw, ih) = (source.width as usize, source.height as usize);
-        if source.pixels.len() != iw * ih * 3 {
+        if source.pixels.len()
+            != candle_gen::gen_core::imageops::checked_image_buffer_len(iw, ih, 3)
+                .unwrap_or(usize::MAX)
+        {
             return Err(CandleError::Msg(format!(
                 "sdxl edit: source pixel buffer {} != {iw}x{ih}x3",
                 source.pixels.len()
@@ -399,7 +402,9 @@ fn draw_noise(rng: &mut StdRng, c: usize, h: usize, w: usize, device: &Device) -
 /// → `to_rgb8`), so the luma is taken over the three channels.
 fn encode_mask(mask: &Image, width: u32, height: u32, device: &Device) -> Result<Tensor> {
     let (iw, ih) = (mask.width as usize, mask.height as usize);
-    if mask.pixels.len() != iw * ih * 3 {
+    if mask.pixels.len()
+        != candle_gen::gen_core::imageops::checked_image_buffer_len(iw, ih, 3).unwrap_or(usize::MAX)
+    {
         return Err(CandleError::Msg(format!(
             "sdxl edit: mask pixel buffer {} != {iw}x{ih}x3",
             mask.pixels.len()

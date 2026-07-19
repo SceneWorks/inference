@@ -84,7 +84,14 @@ impl QwenImageProcessor {
                 image.width, image.height
             )));
         }
-        if image.data.len() != image.height * image.width * 3 {
+        if image.data.len()
+            != candle_gen::gen_core::imageops::checked_image_buffer_len(
+                image.width,
+                image.height,
+                3,
+            )
+            .unwrap_or(usize::MAX)
+        {
             return Err(CandleError::Msg(format!(
                 "qwen image processor: pixel buffer {} != {}x{}x3",
                 image.data.len(),

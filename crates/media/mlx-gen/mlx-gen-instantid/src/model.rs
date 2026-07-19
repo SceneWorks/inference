@@ -329,7 +329,7 @@ impl InstantId {
         // silently no-ops on an already-packed U-Net, so a Q4 request over a pre-quantized Q8 snapshot
         // would serve Q8 with no diagnostic. Reuses the SDXL-family marker check on the base snapshot
         // (the U-Net `unet/config.json` is the representative heavy component).
-        mlx_gen_sdxl::loader::needs_load_time_quant(&self.sdxl_root, bits, "instantid")?;
+        mlx_gen::quant::needs_load_time_quant(&self.sdxl_root, "unet", bits, "instantid")?;
         self.unet.quantize(bits)?;
         self.te1.quantize(bits)?;
         self.te2.quantize(bits)?;
@@ -343,19 +343,7 @@ impl InstantId {
     /// Detect the largest face in `img` (RGB `u8` HWC, `h×w`) and return it (bbox + 5 kps + 512-d
     /// embedding). Requires [`with_face`](Self::with_face).
     pub fn largest_face(&self, img: &[u8], h: usize, w: usize) -> Result<Face> {
-        let face = self
-            .face
-            .as_ref()
-            .ok_or_else(|| Error::Msg("instantid: face stack not attached (with_face)".into()))?;
-        // Detect all faces but embed only the largest (F-090): the identity comes from a single
-        // ArcFace forward, not one per detected face.
-        let dets = face.detect(img, h, w)?;
-        if dets.is_empty() {
-            return Err(Error::Msg(
-                "instantid: no face detected in the reference".into(),
-            ));
-        }
-        face.embed(img, h, w, &dets[0]) // detect() sorts largest-first
+        largest_face_from(self.face.as_ref(), img, h, w)
     }
 
     /// Full T2I: letterbox the reference to the output size (the sc-2009 kps-distortion rule), detect
@@ -846,14 +834,9 @@ impl InstantId {
         if req.cancel.is_cancelled() {
             return Err(Error::Canceled);
         }
-        let face = self
-            .face
-            .as_ref()
-            .ok_or_else(|| Error::Msg("instantid: face stack not attached (with_face)".into()))?;
-        let (bw, bh) = (base.width as usize, base.height as usize);
         // Only the box/landmarks are used here (the identity embedding is a separate parameter), so
         // detect without embedding any face (F-090).
-        let dets = face.detect(&base.pixels, bh, bw)?;
+        let dets = restore_face_detections(self.face.as_ref(), base)?;
         if dets.is_empty() {
             return Ok(base.clone()); // no face to restore — leave the base untouched
         }
@@ -893,13 +876,8 @@ impl InstantId {
             ..req.clone()
         };
         let restored = self.generate_with(&restore_req, embedding, &kps, on_progress)?;
-        let small_f = resize_lanczos_u8(
-            &restored.pixels,
-            side as usize,
-            side as usize,
-            crop_h,
-            crop_w,
-        )?;
+        let (restored_h, restored_w) = restored_image_dims(&restored);
+        let small_f = resize_lanczos_u8(&restored.pixels, restored_h, restored_w, crop_h, crop_w)?;
         let small: Vec<u8> = small_f.iter().map(|&v| v as u8).collect();
 
         // Feathered elliptical paste-back onto a copy of the base.
@@ -910,9 +888,110 @@ impl InstantId {
     }
 }
 
+/// Validate an InstantID face image before consulting the optional face stack. Raw face primitives
+/// intentionally accept a larger backing slice, but these InstantID entry points consume a concrete
+/// image payload and therefore require non-zero dimensions and exactly one interleaved RGB image.
+fn validate_face_rgb(img: &[u8], h: usize, w: usize) -> Result<()> {
+    if h == 0 || w == 0 {
+        return Err(Error::Msg(format!(
+            "instantid: face image has a zero dimension ({h}×{w})"
+        )));
+    }
+    let expected =
+        mlx_gen::gen_core::imageops::checked_image_buffer_len(w, h, 3).ok_or_else(|| {
+            Error::Msg(format!(
+                "instantid: face image RGB buffer size overflows for {h}×{w}"
+            ))
+        })?;
+    if img.len() != expected {
+        return Err(Error::Msg(format!(
+            "instantid: face image buffer must contain exactly {expected} bytes for {h}×{w}×3, got {}",
+            img.len()
+        )));
+    }
+    Ok(())
+}
+
+/// Full public `largest_face` boundary implementation, factored so validation ordering is testable
+/// without loading the multi-gigabyte diffusion stack.
+fn largest_face_from(face: Option<&FaceAnalysis>, img: &[u8], h: usize, w: usize) -> Result<Face> {
+    validate_face_rgb(img, h, w)?;
+    let face =
+        face.ok_or_else(|| Error::Msg("instantid: face stack not attached (with_face)".into()))?;
+    let dets = face.detect(img, h, w)?;
+    if dets.is_empty() {
+        return Err(Error::Msg(
+            "instantid: no face detected in the reference".into(),
+        ));
+    }
+    face.embed(img, h, w, &dets[0])
+}
+
+/// Validation + detect-only prefix of the public `restore_face` path.
+fn restore_face_detections(
+    face: Option<&FaceAnalysis>,
+    image: &Image,
+) -> Result<Vec<mlx_gen_face::Detection>> {
+    let (w, h) = (image.width as usize, image.height as usize);
+    validate_face_rgb(&image.pixels, h, w)?;
+    let face =
+        face.ok_or_else(|| Error::Msg("instantid: face stack not attached (with_face)".into()))?;
+    face.detect(&image.pixels, h, w)
+}
+
+fn restored_image_dims(image: &Image) -> (usize, usize) {
+    (image.height as usize, image.width as usize)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restore_resize_uses_generated_image_dimensions() {
+        let image = Image {
+            width: 7,
+            height: 5,
+            pixels: vec![0; 7 * 5 * 3],
+        };
+        assert_eq!(restored_image_dims(&image), (5, 7));
+    }
+
+    #[test]
+    fn largest_face_and_restore_face_public_paths_reject_malformed_before_face_stack() {
+        for (h, w) in [(0, 0), (0, 2), (3, 0)] {
+            let image = Image {
+                width: w as u32,
+                height: h as u32,
+                pixels: Vec::new(),
+            };
+            for err in [
+                largest_face_from(None, &[], h, w).unwrap_err().to_string(),
+                restore_face_detections(None, &image)
+                    .unwrap_err()
+                    .to_string(),
+            ] {
+                assert!(err.contains("zero dimension"), "{h}×{w}: {err}");
+                assert!(!err.contains("not attached"), "{err}");
+            }
+        }
+        let image = Image {
+            width: 3,
+            height: 2,
+            pixels: vec![0; 19],
+        };
+        for err in [
+            largest_face_from(None, &image.pixels, 2, 3)
+                .unwrap_err()
+                .to_string(),
+            restore_face_detections(None, &image)
+                .unwrap_err()
+                .to_string(),
+        ] {
+            assert!(err.contains("exactly 18 bytes"), "{err}");
+            assert!(!err.contains("not attached"), "{err}");
+        }
+    }
 
     #[test]
     fn validate_kps_rejects_short_slices() {

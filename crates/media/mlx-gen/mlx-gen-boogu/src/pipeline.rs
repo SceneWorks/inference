@@ -979,7 +979,12 @@ fn image_to_pixels(img: &Image) -> Result<Array> {
     let (h, w) = (img.height as i32, img.width as i32);
     // Reject a buffer that violates the `w·h·3` Image invariant before `Array::from_slice` panics on
     // the shape mismatch — mirrors ideogram's `image_to_pixels` guard (pipeline.rs ~109) (F-020/L-A).
-    let expected = (img.height as usize) * (img.width as usize) * 3;
+    let expected = mlx_gen::gen_core::imageops::checked_image_buffer_len(
+        img.width as usize,
+        img.height as usize,
+        3,
+    )
+    .unwrap_or(usize::MAX);
     if img.pixels.len() != expected {
         return Err(Error::Msg(format!(
             "boogu: reference pixel buffer {} bytes != {}x{}x3 ({expected})",

@@ -380,7 +380,9 @@ pub(crate) fn preprocess_ref(
     dtype: DType,
 ) -> Result<Tensor> {
     let (iw, ih) = (image.width as usize, image.height as usize);
-    if image.pixels.len() != iw * ih * 3 {
+    if image.pixels.len()
+        != candle_gen::gen_core::imageops::checked_image_buffer_len(iw, ih, 3).unwrap_or(usize::MAX)
+    {
         return Err(CandleError::Msg(format!(
             "flux2 edit: reference pixel buffer {} != {iw}x{ih}x3",
             image.pixels.len()

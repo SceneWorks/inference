@@ -13,8 +13,8 @@ const MAX_BODY: usize = 16 * 1024 * 1024;
 /// Without this, a peer streaming bytes with no `\n` grows one `String` without bound (F-006).
 pub(crate) const MAX_LINE: u64 = 8 * 1024;
 
-/// Cap on the number of header lines (Apache's `LimitRequestFields` default). Together with
-/// [`MAX_LINE`] this bounds total header bytes at ~800 KiB and guarantees the header loop
+/// Cap on header-loop lines, including the terminating blank line. The effective field cap is 99.
+/// Together with [`MAX_LINE`] this bounds total header bytes below 800 KiB and guarantees the loop
 /// terminates even on an endless header stream (F-006).
 const MAX_HEADERS: usize = 100;
 
@@ -233,7 +233,7 @@ mod tests {
         assert_eq!(req.path, target);
     }
 
-    /// Exactly [`MAX_HEADERS`] headers still parse; the cap only rejects floods beyond it.
+    /// Exactly 99 header fields plus the terminating blank line still parse.
     #[test]
     fn header_count_at_cap_still_parses() {
         let mut raw = b"GET / HTTP/1.1\r\n".to_vec();

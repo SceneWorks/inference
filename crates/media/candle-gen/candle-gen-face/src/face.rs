@@ -36,7 +36,9 @@ fn det_area(d: &Detection) -> f32 {
 
 /// cv2 `resize` `INTER_LINEAR` for an RGB `u8` HWC image — the SCRFD detector preprocessing. Faithful
 /// fixed-point bilinear (half-pixel coords, 11-bit weights, two integer passes, `>>22` with rounding),
-/// identical to the MLX sibling.
+/// identical to the MLX sibling. The explicit dimensions must be non-zero. `src` may be larger than
+/// `in_h·in_w·3`; only that prefix is read, preserving the raw-slice API's original `len >= need`
+/// contract.
 pub fn resize_bilinear_cv2(
     src: &[u8],
     in_h: usize,
@@ -45,9 +47,17 @@ pub fn resize_bilinear_cv2(
     out_w: usize,
 ) -> Result<Vec<u8>> {
     const C: usize = 3;
+    if in_h == 0 || in_w == 0 || out_h == 0 || out_w == 0 {
+        return Err(CandleError::Msg(format!(
+            "resize_bilinear_cv2: zero dimension — {in_w}×{in_h} → {out_w}×{out_h} (all edges must be > 0)"
+        )));
+    }
     // Public boundary: reject an undersized source buffer with a typed error rather than
     // aborting the process on caller-supplied input (sc-9025 / F-041).
-    if src.len() < in_h * in_w * C {
+    if src.len()
+        < candle_gen::gen_core::imageops::checked_image_buffer_len(in_w, in_h, C)
+            .unwrap_or(usize::MAX)
+    {
         return Err(CandleError::Msg(format!(
             "resize_bilinear_cv2: src buffer of {} bytes too small for {in_h}×{in_w}×3",
             src.len()
@@ -121,11 +131,19 @@ pub fn resize_bilinear_cv2(
 
 /// Build the SCRFD detector blob from an RGB `u8` image: insightface-faithful resize-to-fit 640
 /// (aspect-preserving) → top-left pad to 640² → `(rgb − 127.5) / 128`. Returns the **NCHW**
-/// `[1,3,640,640]` f32 blob (MLX returns NHWC) and `det_scale` (= `new_h / h`).
+/// `[1,3,640,640]` f32 blob (MLX returns NHWC) and `det_scale` (= `new_h / h`). Dimensions must be
+/// non-zero; an oversized raw slice is accepted and only its `h·w·3` prefix is read.
 pub fn detector_blob(img: &[u8], h: usize, w: usize, device: &Device) -> Result<(Tensor, f32)> {
+    if h == 0 || w == 0 {
+        return Err(CandleError::Msg(format!(
+            "detector_blob: image has a zero dimension ({h}×{w})"
+        )));
+    }
     // Public boundary: reject an undersized image buffer with a typed error rather than
     // aborting the process on caller-supplied input (sc-9025 / F-041).
-    if img.len() < h * w * 3 {
+    if img.len()
+        < candle_gen::gen_core::imageops::checked_image_buffer_len(w, h, 3).unwrap_or(usize::MAX)
+    {
         return Err(CandleError::Msg(format!(
             "detector_blob: img buffer of {} bytes too small for {h}×{w}×3",
             img.len()
@@ -206,7 +224,10 @@ impl FaceAnalysis {
                 "face detect: image has a zero dimension ({h}×{w})"
             )));
         }
-        if img.len() < h * w * 3 {
+        if img.len()
+            < candle_gen::gen_core::imageops::checked_image_buffer_len(w, h, 3)
+                .unwrap_or(usize::MAX)
+        {
             return Err(CandleError::Msg(format!(
                 "face detect: img buffer of {} bytes too small for {h}×{w}×3",
                 img.len()
@@ -305,6 +326,35 @@ mod tests {
             err.to_string().contains("too small for 4×4×3"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn resize_rejects_every_zero_edge() {
+        for (in_h, in_w, out_h, out_w) in [(0, 2, 4, 4), (2, 0, 4, 4), (2, 2, 0, 4), (2, 2, 4, 0)] {
+            let err = resize_bilinear_cv2(&[0; 12], in_h, in_w, out_h, out_w)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("zero dimension"), "{err}");
+        }
+    }
+
+    #[test]
+    fn resize_accepts_oversized_raw_slice_and_ignores_suffix() {
+        let exact: Vec<u8> = (0..4 * 3 * 3).map(|i| (i * 29 % 256) as u8).collect();
+        let mut oversized = exact.clone();
+        oversized.extend_from_slice(&[255; 11]);
+        let expected = resize_bilinear_cv2(&exact, 4, 3, 7, 5).unwrap();
+        let actual = resize_bilinear_cv2(&oversized, 4, 3, 7, 5).unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn detector_blob_rejects_zero_edges_before_device_work() {
+        let device = Device::Cpu;
+        for (h, w) in [(0, 0), (0, 2), (3, 0)] {
+            let err = detector_blob(&[], h, w, &device).unwrap_err().to_string();
+            assert!(err.contains("zero dimension"), "{h}×{w}: {err}");
+        }
     }
 
     #[test]

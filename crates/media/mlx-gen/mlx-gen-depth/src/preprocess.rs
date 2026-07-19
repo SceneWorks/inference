@@ -54,7 +54,9 @@ pub fn rgb8_to_input_sized(rgb: &[u8], width: u32, height: u32, size: i32) -> Re
             "depth input image has a zero dimension ({width}x{height})"
         )));
     }
-    if rgb.len() != w * h * 3 {
+    if rgb.len()
+        != mlx_gen::gen_core::imageops::checked_image_buffer_len(w, h, 3).unwrap_or(usize::MAX)
+    {
         return Err(Error::Msg(format!(
             "depth input buffer is {} bytes, expected {} ({width}x{height}x3)",
             rgb.len(),

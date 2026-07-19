@@ -46,6 +46,7 @@
 pub mod assembly;
 pub mod bernini;
 pub mod clip_diff;
+mod components;
 pub mod config;
 pub mod connector;
 pub mod convert;

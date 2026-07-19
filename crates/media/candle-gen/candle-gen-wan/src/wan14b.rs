@@ -650,7 +650,9 @@ impl Pipeline {
         // sc-12758: free-aware budgeted **spatial** tiling for the z16 decode. Falls back to plain
         // `decode` when a single high-res frame already fits (behavior-identical when the budget is
         // ample); tiles the 42 GB A14B decode spike down to fit a small card otherwise.
-        let decoded = comps.vae.decode_budgeted(&latents)?;
+        let decoded = comps
+            .vae
+            .decode_budgeted_with_cancel(&latents, &req.cancel)?;
         let images = frames_to_images(&decoded)?;
         Ok((images, knobs.fps))
     }
@@ -830,7 +832,7 @@ impl Pipeline {
         // sc-12758: the experts + TE are offloaded by now, so the decode budgets against nearly the
         // whole card. Free-aware budgeted spatial tiling drives the 42 GB z16 decode spike down to fit
         // the free VRAM — the sole thing that kept the A14B off a 24 GB card (denoise is only ~11 GB).
-        let decoded = vae.decode_budgeted(&latents)?;
+        let decoded = vae.decode_budgeted_with_cancel(&latents, cancel)?;
         let images = frames_to_images(&decoded)?;
         Ok((images, knobs.fps))
     }
@@ -939,7 +941,9 @@ pub fn preprocess_i2v_image(
 ) -> CResult<Tensor> {
     let (iw, ih) = (image.width as usize, image.height as usize);
     let (tw, th) = (width as usize, height as usize);
-    if image.pixels.len() != iw * ih * 3 {
+    if image.pixels.len()
+        != candle_gen::gen_core::imageops::checked_image_buffer_len(iw, ih, 3).unwrap_or(usize::MAX)
+    {
         return Err(CandleError::Msg(format!(
             "wan-14b i2v image buffer {} != {iw}x{ih}x3",
             image.pixels.len()
@@ -1065,6 +1069,12 @@ impl Generator for Wan14bGenerator {
             if f == 0 || f % 4 != 1 {
                 return Err(gen_core::Error::Msg(format!(
                     "{id}: frames must satisfy frames % 4 == 1 (got {f})"
+                )));
+            }
+            if f as usize > crate::MAX_WAN_FRAMES {
+                return Err(gen_core::Error::Msg(format!(
+                    "{id}: frames {f} exceeds the maximum {}",
+                    crate::MAX_WAN_FRAMES
                 )));
             }
         }
@@ -1365,6 +1375,19 @@ mod tests {
             ..Default::default()
         };
         assert!(t2v.validate(&ok).is_ok());
+        assert!(t2v
+            .validate(&GenerationRequest {
+                frames: Some(1025),
+                ..ok.clone()
+            })
+            .is_ok());
+        let over = t2v
+            .validate(&GenerationRequest {
+                frames: Some(1029),
+                ..ok.clone()
+            })
+            .expect_err("1029 must exceed the Wan frame ceiling");
+        assert!(over.to_string().contains("maximum 1025"), "{over}");
         // Legacy `unipc` spelling stays accepted (sc-7296 alias).
         assert!(t2v
             .validate(&GenerationRequest {
@@ -1412,6 +1435,27 @@ mod tests {
             .load(MODEL_ID_I2V_14B, &spec)
             .unwrap();
         assert!(i2v.validate(&ok).is_err(), "i2v needs a reference image");
+        let reference = Conditioning::Reference {
+            image: Image {
+                width: 16,
+                height: 16,
+                pixels: vec![0; 16 * 16 * 3],
+            },
+            strength: None,
+        };
+        let i2v_at_cap = GenerationRequest {
+            conditioning: vec![reference],
+            frames: Some(1025),
+            ..ok.clone()
+        };
+        assert!(i2v.validate(&i2v_at_cap).is_ok());
+        let over = i2v
+            .validate(&GenerationRequest {
+                frames: Some(1029),
+                ..i2v_at_cap
+            })
+            .expect_err("1029 must exceed the Wan frame ceiling");
+        assert!(over.to_string().contains("maximum 1025"), "{over}");
     }
 
     #[test]

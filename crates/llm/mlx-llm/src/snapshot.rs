@@ -95,7 +95,9 @@ fn under_vision_root(key: &str) -> bool {
 /// Whether a weight key is a quantization-eligible attention/MLP projection (packed Phi-3 / GLM-4
 /// tensors are handled separately by [`write_snapshot`] — they are split first).
 pub fn is_projection(key: &str) -> bool {
-    !under_vision_root(key) && PROJECTION_SUFFIXES.iter().any(|s| key.ends_with(s))
+    !under_vision_root(key)
+        && !is_packed_projection(key)
+        && PROJECTION_SUFFIXES.iter().any(|s| key.ends_with(s))
 }
 
 /// Whether a weight key is a packed projection that must be split before quantizing.
@@ -125,9 +127,11 @@ fn is_unrecognized_projection(key: &str, arr: &Array) -> bool {
     {
         return false;
     }
-    // A 2-D `.weight` matmul operand, or a projection tensor without the `.weight` suffix
-    // (e.g. Qwen3.5-MoE's stacked `mlp.experts.gate_up_proj`).
-    (key.ends_with(".weight") && arr.shape().len() == 2) || key.ends_with("_proj")
+    // A matrix-or-stacked-matrices `.weight` operand, or a projection tensor without the `.weight`
+    // suffix (e.g. Qwen3.5-MoE's stacked `mlp.experts.gate_up_proj`). Refuse ndim > 2 too: a future
+    // stacked-expert layout must get an explicit quantization path rather than reaching the 2-D
+    // `QuantizedLinear` implementation and failing with an opaque shape error.
+    (key.ends_with(".weight") && arr.shape().len() >= 2) || key.ends_with("_proj")
 }
 
 /// Tokenizer files to drop into a snapshot, written verbatim. The GGUF path supplies its
@@ -203,6 +207,20 @@ pub fn write_snapshot(
                  quantization instead"
                     .to_string(),
             ));
+        }
+        // Both packed and ordinary recognized projections feed rank-2 quantization operations.
+        // Validate the common invariant before dispatch so neither branch can reach MLX with an
+        // opaque shape failure (and before any output directory is created).
+        if let Some((key, arr)) = tensors
+            .iter()
+            .find(|(key, arr)| (is_packed_projection(key) || is_projection(key)) && arr.ndim() != 2)
+        {
+            return Err(Error::Unsupported(format!(
+                "cannot quantize projection `{key}` with shape {:?} (rank {}): expected a \
+                 rank-2 weight matrix",
+                arr.shape(),
+                arr.ndim()
+            )));
         }
         // Splitting packed Phi-3 / GLM-4 tensors needs the config's head/intermediate dims, derived
         // through the same `ModelConfig` parse the loader uses so the split points are identical.
@@ -489,6 +507,7 @@ mod tests {
             "model.layers.0.mlp.gate.weight",         // MoE router stays dense
             "model.layers.0.mlp.shared_expert_gate.weight", // Qwen2-MoE gate stays dense
             "model.layers.0.linear_attn.out_proj.weight", // Qwen3.6 hybrid: refused, not quantized
+            "model.layers.0.mlp.gate_up_proj.weight", // packed: split before quantizing
             // VLM vision towers stay dense (their loaders are dense-only)
             "vision_tower.vision_model.encoder.layers.0.self_attn.q_proj.weight",
             "model.visual.blocks.0.attn.proj.weight",
@@ -509,6 +528,7 @@ mod tests {
             ("model.layers.0.linear_attn.out_proj.weight", &m),
             ("model.layers.0.mlp.experts.gate_up_proj", &stacked), // Qwen3.5-MoE stacked
             ("model.layers.0.self_attn.w_qkv.weight", &m),         // unknown layout
+            ("model.layers.0.mlp.experts.w1.weight", &stacked),    // future stacked-expert layout
         ] {
             assert!(is_unrecognized_projection(k, a), "{k} must be refused");
         }
@@ -934,6 +954,80 @@ mod tests {
         assert_eq!(report.quantized, None);
         assert_eq!(report.quantized_projections, 0);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A recognized projection suffix with a future stacked-expert layout must fail before the
+    /// rank-2 quantizer, naming the offending key and shape, and must not create a partial snapshot.
+    #[test]
+    fn quantize_refuses_rank_three_recognized_projection() {
+        let dir = unique_dir("refuse-rank-three-projection");
+        std::fs::remove_dir_all(&dir).ok();
+        let key = "model.layers.0.mlp.experts.gate_proj.weight";
+        let tensors = vec![(key.to_string(), Array::zeros::<f32>(&[4, 128, 64]).unwrap())];
+        let config = json!({ "model_type": "llama" });
+
+        match write_snapshot(
+            &dir,
+            tensors,
+            config,
+            &SnapshotTokenizer::default(),
+            Some(QuantSpec::q4()),
+        ) {
+            Err(Error::Unsupported(msg)) => {
+                assert!(msg.contains(key), "message names the key: {msg}");
+                assert!(
+                    msg.contains("[4, 128, 64]"),
+                    "message gives the shape: {msg}"
+                );
+                assert!(
+                    msg.contains("rank 3"),
+                    "message gives the actual rank: {msg}"
+                );
+                assert!(
+                    msg.contains("rank-2"),
+                    "message gives the expected rank: {msg}"
+                );
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+        assert!(!dir.exists(), "a refused quantize must write nothing");
+    }
+
+    /// Packed projections share the same rank guard; malformed packed shapes must be rejected
+    /// before the split logic indexes rows or invokes the rank-2 quantizer.
+    #[test]
+    fn quantize_refuses_rank_three_packed_projection() {
+        let dir = unique_dir("refuse-rank-three-packed");
+        std::fs::remove_dir_all(&dir).ok();
+        let key = "model.layers.0.mlp.gate_up_proj.weight";
+        let tensors = vec![(key.to_string(), Array::zeros::<f32>(&[2, 128, 64]).unwrap())];
+        let (_, config) = tiny_phi3();
+
+        match write_snapshot(
+            &dir,
+            tensors,
+            config,
+            &SnapshotTokenizer::default(),
+            Some(QuantSpec::q4()),
+        ) {
+            Err(Error::Unsupported(msg)) => {
+                assert!(msg.contains(key), "message names the key: {msg}");
+                assert!(
+                    msg.contains("[2, 128, 64]"),
+                    "message gives the shape: {msg}"
+                );
+                assert!(
+                    msg.contains("rank 3"),
+                    "message gives the actual rank: {msg}"
+                );
+                assert!(
+                    msg.contains("rank-2"),
+                    "message gives the expected rank: {msg}"
+                );
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+        assert!(!dir.exists(), "a refused quantize must write nothing");
     }
 
     /// A quantize request that matches no projections at all is refused — the report must never

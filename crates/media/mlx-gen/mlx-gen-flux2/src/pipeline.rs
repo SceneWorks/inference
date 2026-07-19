@@ -187,7 +187,9 @@ pub fn timesteps_x1000(schedule: &FlowMatchEuler) -> Vec<f32> {
 pub fn preprocess_ref_image(image: &Image, target_width: u32, target_height: u32) -> Result<Array> {
     let (iw, ih) = (image.width as usize, image.height as usize);
     let (tw, th) = (target_width as usize, target_height as usize);
-    if image.pixels.len() != iw * ih * 3 {
+    if image.pixels.len()
+        != mlx_gen::gen_core::imageops::checked_image_buffer_len(iw, ih, 3).unwrap_or(usize::MAX)
+    {
         return Err(Error::Msg(format!(
             "flux2 ref image pixel buffer {} != {iw}x{ih}x3",
             image.pixels.len()

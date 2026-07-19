@@ -330,6 +330,12 @@ impl Wan {
                     "wan2_2_ti2v_5b: num_frames must be 1 + 4·k (got {frames})"
                 )));
             }
+            if frames as usize > crate::MAX_WAN_FRAMES {
+                return Err(Error::Msg(format!(
+                    "{MODEL_ID}: num_frames {frames} exceeds the maximum {}",
+                    crate::MAX_WAN_FRAMES
+                )));
+            }
         }
         // Reject an off-grid or over-area geometry rather than silently align-down refitting it — one
         // request means one geometry on both backends. sc-12607: the 32-px grid stride (candle rejects
@@ -1111,6 +1117,12 @@ impl Wan14b {
             if frames % 4 != 1 {
                 return Err(Error::Msg(format!(
                     "{id}: num_frames must be 1 + 4·k (got {frames})"
+                )));
+            }
+            if frames as usize > crate::MAX_WAN_FRAMES {
+                return Err(Error::Msg(format!(
+                    "{id}: num_frames {frames} exceeds the maximum {}",
+                    crate::MAX_WAN_FRAMES
                 )));
             }
         }

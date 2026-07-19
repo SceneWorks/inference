@@ -22,10 +22,10 @@
 mod http;
 mod openai;
 
-use std::io::{self, BufReader, Write};
+use std::io::{self, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mlx_llm::core_llm::{
     self, CancelFlag, Error as CoreError, LoadSpec, Quantize, StreamEvent, TextLlm,
@@ -37,7 +37,33 @@ use mlx_llm::core_llm::{
 /// legitimate client writing a request (even by hand over a slow link) while bounding how long one
 /// idle connection can monopolise the serving thread.
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
+/// Maximum wall time allowed to receive one request. This is independent of model execution time.
+const REQUEST_DEADLINE: Duration = Duration::from_secs(30);
+/// Maximum response-write lifetime, starting lazily at the first emitted byte. The OpenAI adapter's
+/// default output is 512 tokens; ten minutes permits even a sub-1-token/s local model to complete
+/// while still bounding a streaming client that continues accepting only intermittent progress.
+const RESPONSE_DEADLINE: Duration = Duration::from_secs(10 * 60);
+/// Maximum time spent waiting for a peer to accept response bytes. A client that submits a valid
+/// request and then stops reading is dropped so the serial accept loop can serve the next client.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const INTERNAL_ERROR_MESSAGE: &str = "internal server error";
+
+#[derive(Clone, Copy)]
+struct ConnectionLimits {
+    read_idle: Duration,
+    request_total: Duration,
+    write: Duration,
+    response_total: Duration,
+}
+
+impl ConnectionLimits {
+    const PRODUCTION: Self = Self {
+        read_idle: READ_TIMEOUT,
+        request_total: REQUEST_DEADLINE,
+        write: WRITE_TIMEOUT,
+        response_total: RESPONSE_DEADLINE,
+    };
+}
 
 fn main() {
     if let Err(e) = run() {
@@ -130,7 +156,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let addr = listener.local_addr()?;
     eprintln!("mlx-llm-server listening on http://{addr}  (model: {default_model})");
 
-    serve(&listener, provider.as_ref(), &default_model, READ_TIMEOUT);
+    serve(
+        &listener,
+        provider.as_ref(),
+        &default_model,
+        ConnectionLimits::PRODUCTION,
+    );
     Ok(())
 }
 
@@ -140,17 +171,12 @@ fn serve(
     listener: &TcpListener,
     provider: &dyn TextLlm,
     default_model: &str,
-    read_timeout: Duration,
+    limits: ConnectionLimits,
 ) {
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                // F-022: bound how long a silent peer can hold the single serving thread.
-                if let Err(e) = stream.set_read_timeout(Some(read_timeout)) {
-                    eprintln!("connection error: {e}");
-                    continue;
-                }
-                if let Err(e) = handle_connection(stream, provider, default_model) {
+                if let Err(e) = handle_connection(stream, provider, default_model, limits) {
                     eprintln!("connection error: {e}");
                 }
             }
@@ -161,11 +187,19 @@ fn serve(
 
 /// Serve one request on a connection, then close it (`Connection: close`).
 fn handle_connection(
-    mut stream: TcpStream,
+    stream: TcpStream,
     provider: &dyn TextLlm,
     default_model: &str,
+    limits: ConnectionLimits,
 ) -> io::Result<()> {
-    let mut reader = BufReader::new(stream.try_clone()?);
+    let request_deadline = Instant::now() + limits.request_total;
+    let read_stream = stream.try_clone()?;
+    let mut reader = BufReader::new(DeadlineReader::new(
+        read_stream,
+        limits.read_idle,
+        request_deadline,
+    ));
+    let mut writer = DeadlineWriter::new(stream, limits.write, limits.response_total);
     let req = match http::read_request(&mut reader) {
         Ok(Some(req)) => req,
         Ok(None) => return Ok(()), // idle disconnect
@@ -182,7 +216,7 @@ fn handle_connection(
         Err(e) => {
             let status = http::error_status(&e);
             return write_json(
-                &mut stream,
+                &mut writer,
                 status,
                 &openai::error_body(&e.to_string(), "invalid_request"),
             );
@@ -191,25 +225,105 @@ fn handle_connection(
 
     match (req.method.as_str(), req.path.as_str()) {
         ("POST", "/v1/chat/completions") => {
-            handle_chat(&mut stream, provider, &req.body, default_model)
+            handle_chat(&mut writer, provider, &req.body, default_model)
         }
         ("GET", "/v1/models") => write_json(
-            &mut stream,
+            &mut writer,
             200,
             &openai::models_list(default_model, unix_secs()),
         ),
-        ("GET", "/" | "/health") => write_text(&mut stream, 200, "ok"),
+        ("GET", "/" | "/health") => write_text(&mut writer, 200, "ok"),
         _ => write_json(
-            &mut stream,
+            &mut writer,
             404,
             &openai::error_body("not found", "not_found"),
         ),
     }
 }
 
+/// A socket reader with both an idle timeout and an absolute request-receive deadline.
+///
+/// `TcpStream::set_read_timeout` alone is a per-read idle bound: a slow-loris peer can reset it by
+/// periodically sending a byte. Before every OS read, this wrapper caps the timeout at the time
+/// remaining on the fixed deadline and returns `TimedOut` once that deadline has elapsed.
+struct DeadlineReader {
+    stream: TcpStream,
+    idle_timeout: Duration,
+    deadline: Instant,
+}
+
+impl DeadlineReader {
+    fn new(stream: TcpStream, idle_timeout: Duration, deadline: Instant) -> Self {
+        Self {
+            stream,
+            idle_timeout,
+            deadline,
+        }
+    }
+}
+
+/// A response writer with both an idle timeout and an absolute response deadline.
+///
+/// The deadline starts lazily on the first write, so request parsing and non-streaming model compute
+/// do not consume the response budget. Every JSON, text, and SSE response uses this writer. Capping
+/// each socket timeout by the fixed remaining duration prevents partial write progress from
+/// extending the response indefinitely.
+struct DeadlineWriter {
+    stream: TcpStream,
+    idle_timeout: Duration,
+    total_timeout: Duration,
+    deadline: Option<Instant>,
+}
+
+impl DeadlineWriter {
+    fn new(stream: TcpStream, idle_timeout: Duration, total_timeout: Duration) -> Self {
+        Self {
+            stream,
+            idle_timeout,
+            total_timeout,
+            deadline: None,
+        }
+    }
+
+    fn prepare_write(&mut self) -> io::Result<()> {
+        let deadline = *self
+            .deadline
+            .get_or_insert_with(|| Instant::now() + self.total_timeout);
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "response deadline exceeded"))?;
+        self.stream
+            .set_write_timeout(Some(self.idle_timeout.min(remaining)))
+    }
+}
+
+impl Write for DeadlineWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.prepare_write()?;
+        self.stream.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.prepare_write()?;
+        self.stream.flush()
+    }
+}
+
+impl Read for DeadlineReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let remaining = self
+            .deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "request deadline exceeded"))?;
+        self.stream
+            .set_read_timeout(Some(self.idle_timeout.min(remaining)))?;
+        self.stream.read(buf)
+    }
+}
+
 /// Handle a chat completion: parse → validate → stream SSE or return one JSON body.
 fn handle_chat(
-    stream: &mut TcpStream,
+    stream: &mut DeadlineWriter,
     provider: &dyn TextLlm,
     body: &[u8],
     default_model: &str,
@@ -278,7 +392,7 @@ fn handle_chat(
 /// request's [`CancelFlag`], so the decode loop stops promptly — i.e. **cancel disconnects the
 /// stream** and frees the engine.
 fn stream_chat(
-    stream: &mut TcpStream,
+    stream: &mut DeadlineWriter,
     provider: &dyn TextLlm,
     req: &core_llm::TextLlmRequest,
     cancel: &CancelFlag,
@@ -345,12 +459,12 @@ fn sse(w: &mut impl Write, data: &str) -> io::Result<()> {
 }
 
 /// Write a fixed-length JSON response with the given status.
-fn write_json(stream: &mut TcpStream, status: u16, body: &str) -> io::Result<()> {
+fn write_json(stream: &mut DeadlineWriter, status: u16, body: &str) -> io::Result<()> {
     write_response(stream, status, "application/json", body.as_bytes())
 }
 
 /// Write a fixed-length plain-text response.
-fn write_text(stream: &mut TcpStream, status: u16, body: &str) -> io::Result<()> {
+fn write_text(stream: &mut DeadlineWriter, status: u16, body: &str) -> io::Result<()> {
     write_response(stream, status, "text/plain; charset=utf-8", body.as_bytes())
 }
 
@@ -362,7 +476,7 @@ fn server_error_body(error: &CoreError) -> String {
 }
 
 fn write_response(
-    stream: &mut TcpStream,
+    stream: &mut DeadlineWriter,
     status: u16,
     content_type: &str,
     body: &[u8],
@@ -425,11 +539,23 @@ mod tests {
 
     /// Run the real [`serve`] loop on an ephemeral port; returns the address to connect to.
     fn spawn_server(read_timeout: Duration) -> SocketAddr {
+        spawn_server_with(
+            "test-model".into(),
+            ConnectionLimits {
+                read_idle: read_timeout,
+                request_total: Duration::from_secs(30),
+                write: Duration::from_secs(30),
+                response_total: Duration::from_secs(30),
+            },
+        )
+    }
+
+    fn spawn_server_with(default_model: String, limits: ConnectionLimits) -> SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
             let stub = StubLlm;
-            serve(&listener, &stub, "test-model", read_timeout);
+            serve(&listener, &stub, &default_model, limits);
         });
         addr
     }
@@ -483,6 +609,147 @@ mod tests {
         assert!(
             resp.starts_with("HTTP/1.1 200"),
             "unexpected response: {resp:?}"
+        );
+    }
+
+    /// sc-12548: successful reads do not reset the request's wall-clock deadline. A peer that
+    /// trickles bytes faster than the idle timeout is still dropped, then the next client is served.
+    #[test]
+    fn trickling_request_hits_receive_deadline_and_next_client_is_served() {
+        let addr = spawn_server_with(
+            "test-model".into(),
+            ConnectionLimits {
+                read_idle: Duration::from_secs(1),
+                request_total: Duration::from_millis(120),
+                write: Duration::from_secs(30),
+                response_total: Duration::from_secs(30),
+            },
+        );
+        let mut trickle = TcpStream::connect(addr).unwrap();
+        trickle.write_all(b"G").unwrap();
+        for _ in 0..4 {
+            std::thread::sleep(Duration::from_millis(30));
+            // The final write may race the server closing at the deadline; either outcome proves
+            // the peer cannot keep the request alive by resetting the idle timeout.
+            if trickle.write_all(b"E").is_err() {
+                break;
+            }
+        }
+
+        let resp = get_health(addr);
+        assert!(
+            resp.starts_with("HTTP/1.1 200"),
+            "unexpected response: {resp:?}"
+        );
+    }
+
+    /// sc-12548: a peer that requests a response larger than the socket buffer and never reads is
+    /// dropped at the absolute deadline; the serial accept loop then serves the queued request.
+    #[test]
+    fn blocked_write_times_out_and_next_client_is_served() {
+        let addr = spawn_server_with(
+            "x".repeat(16 * 1024 * 1024),
+            ConnectionLimits {
+                read_idle: Duration::from_secs(30),
+                request_total: Duration::from_secs(30),
+                // Longer than the response deadline: this pins that cumulative progress cannot
+                // reset the bound and accidentally reduce it to SO_SNDTIMEO semantics.
+                write: Duration::from_secs(10),
+                response_total: Duration::from_millis(200),
+            },
+        );
+        let mut blocked = TcpStream::connect(addr).unwrap();
+        blocked
+            .write_all(b"GET /v1/models HTTP/1.1\r\n\r\n")
+            .unwrap();
+
+        let started = Instant::now();
+        let resp = get_health(addr);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "blocked response outlived its configured connection deadline"
+        );
+        assert!(
+            resp.starts_with("HTTP/1.1 200"),
+            "unexpected response: {resp:?}"
+        );
+        drop(blocked);
+    }
+
+    /// Exercise the bounded writer directly: output larger than loopback socket buffers must return
+    /// a timeout within the absolute deadline even though the kernel accepts partial progress.
+    #[test]
+    fn bounded_writer_observes_absolute_deadline_on_blocked_output() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _non_reader = TcpStream::connect(addr).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let total = Duration::from_millis(150);
+        let mut writer = DeadlineWriter::new(server, Duration::from_secs(10), total);
+
+        let started = Instant::now();
+        let err = writer.write_all(&vec![b'x'; 32 * 1024 * 1024]).unwrap_err();
+        assert!(
+            matches!(
+                err.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ),
+            "unexpected blocked-write error: {err}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "bounded writer did not honor its absolute deadline"
+        );
+    }
+
+    /// Model compute before the first response byte does not consume the response-write budget.
+    #[test]
+    fn response_deadline_starts_on_first_write() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(addr).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let mut writer =
+            DeadlineWriter::new(server, Duration::from_secs(1), Duration::from_millis(50));
+
+        std::thread::sleep(Duration::from_millis(100));
+        writer.write_all(b"ok").unwrap();
+        let mut got = [0u8; 2];
+        client.read_exact(&mut got).unwrap();
+        assert_eq!(&got, b"ok");
+    }
+
+    /// JSON, plain text, and SSE all route through the same deadline-aware writer.
+    #[test]
+    fn every_response_mode_uses_the_bounded_writer() {
+        fn expired_writer() -> DeadlineWriter {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let _client = TcpStream::connect(addr).unwrap();
+            let (server, _) = listener.accept().unwrap();
+            let mut writer =
+                DeadlineWriter::new(server, Duration::from_secs(1), Duration::from_secs(1));
+            writer.deadline = Some(Instant::now() - Duration::from_millis(1));
+            writer
+        }
+
+        let mut json = expired_writer();
+        assert_eq!(
+            write_json(&mut json, 200, "{}").unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+        let mut text = expired_writer();
+        assert_eq!(
+            write_text(&mut text, 200, "ok").unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+        let mut event = expired_writer();
+        assert_eq!(
+            sse(&mut event, "{}").unwrap_err().kind(),
+            io::ErrorKind::TimedOut
         );
     }
 

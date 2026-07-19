@@ -53,47 +53,6 @@ pub(crate) fn lin(w: &Weights, base: &str, bias: bool) -> Result<AdaptableLinear
     mlx_gen::quant::lin(w, base, bias, GROUP_SIZE)
 }
 
-/// Read the on-disk packed-quantization bits from `<component>/config.json`, if that component is a
-/// pre-quantized (Group-B packed) turnkey. The converter writes `"quantization": {"bits",
-/// "group_size"}` into **both** quantized component dirs (`transformer/` and `text_encoder/` — see
-/// [`crate::convert`] / `mlx_gen::quant::write_quantized_config`); a dense snapshot has no such
-/// marker. Returns `None` for a dense snapshot or a missing/unreadable config.
-fn packed_quant_bits(root: &std::path::Path, component: &str) -> Option<i32> {
-    let cfg = std::fs::read(root.join(component).join("config.json")).ok()?;
-    let v: serde_json::Value = serde_json::from_slice(&cfg).ok()?;
-    v.get("quantization")?
-        .get("bits")?
-        .as_i64()
-        .map(|b| b as i32)
-}
-
-/// F-010 tier guard mirroring `mlx_gen_qwen_image::loader::needs_load_time_quant`, per quantized
-/// Lens component (`"transformer"` for the DiT, `"text_encoder"` for the gpt-oss encoder): if the
-/// component is already a pre-quantized packed turnkey, the loaders detect the packed weights
-/// (`{base}.scales` via [`lin`] / the stacked expert triple) and the load-time `quantize` no-ops, so
-/// e.g. Q4 requested over a Q8 turnkey would silently serve Q8. Compares the requested bits against
-/// the [`packed_quant_bits`] marker: errors on a tier mismatch; returns `false` (skip the no-op
-/// quantize) when the component is already packed at the requested bits; and returns `true`
-/// (load-time quantize needed) for a dense snapshot, where the request stands. A packed turnkey with
-/// **no** quantize requested is not routed here (sibling semantics: the callers gate on
-/// `spec.quantize`, so it loads packed at its shipped tier).
-pub(crate) fn needs_load_time_quant(
-    root: &std::path::Path,
-    component: &str,
-    requested_bits: i32,
-    model_id: &str,
-) -> Result<bool> {
-    match packed_quant_bits(root, component) {
-        Some(packed) if packed != requested_bits => Err(Error::Msg(format!(
-            "{model_id}: {component}/ is a pre-quantized Q{packed} turnkey but Q{requested_bits} \
-             was requested; quantize is a no-op on packed weights so the request would silently \
-             serve Q{packed}. Point at a Q{requested_bits} snapshot (or a dense one)."
-        ))),
-        Some(_) => Ok(false),
-        None => Ok(true),
-    }
-}
-
 /// Bits inferred from the **stacked** packed shapes at [`GROUP_SIZE`]: the expert triple is
 /// `[E, out, …]`, so the last axis carries the packed columns — `scales` `[E, out, in/gs]` ⇒
 /// `in = scales.cols·gs`; the u32-packed `weight` `[E, out, in·bits/32]` ⇒ `bits = wq.cols·32/in`.
@@ -274,7 +233,7 @@ mod tests {
 /// the component `config.json`.
 #[cfg(test)]
 mod quant_tier_tests {
-    use super::needs_load_time_quant;
+    use mlx_gen::quant::needs_load_time_quant;
 
     /// Make a fresh temp snapshot root with `<component>/config.json` = `body` (skip the file when
     /// `body` is `None` — a dense snapshot with no quantization marker).

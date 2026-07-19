@@ -15,7 +15,8 @@
 //! constant (and its target predicate) and passes them in (6935).
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::io::ErrorKind;
+use std::path::{Component, Path};
 
 use mlx_rs::ops::quantize;
 use mlx_rs::transforms::eval;
@@ -30,6 +31,102 @@ use crate::Result;
 /// quantization seams ([`AdaptableLinear::quantize`](crate::adapters::AdaptableLinear::quantize) and
 /// the Kolors ChatGLM3 quantizer).
 pub const DEFAULT_GROUP_SIZE: i32 = 64;
+
+/// Read the packed Q4/Q8 tier declared by `<root>/<component>/config.json`.
+///
+/// A missing config, or a valid config with no `quantization` member, denotes a dense component.
+/// Every other read/JSON/marker failure is an error: a present but damaged marker must never be
+/// mistaken for dense weights and silently load-time quantized. `component` is a provider-owned,
+/// non-empty relative path; absolute paths and `..` are rejected.
+pub fn packed_quant_bits(root: &Path, component: &str) -> Result<Option<i32>> {
+    let component_path = Path::new(component);
+    if component_path.as_os_str().is_empty()
+        || component_path
+            .components()
+            .any(|part| !matches!(part, Component::Normal(_)))
+    {
+        return Err(crate::Error::Msg(format!(
+            "packed quant: component path must be a non-empty relative path without `..`, got \
+             {component:?}"
+        )));
+    }
+
+    let config_path = root.join(component_path).join("config.json");
+    let bytes = match std::fs::read(&config_path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(crate::Error::Msg(format!(
+                "packed quant: read {}: {err}",
+                config_path.display()
+            )))
+        }
+    };
+    let config: serde_json::Value = serde_json::from_slice(&bytes).map_err(|err| {
+        crate::Error::Msg(format!(
+            "packed quant: parse {}: {err}",
+            config_path.display()
+        ))
+    })?;
+    let Some(marker) = config.get("quantization") else {
+        return Ok(None);
+    };
+    let marker = marker.as_object().ok_or_else(|| {
+        crate::Error::Msg(format!(
+            "packed quant: {} `quantization` must be an object",
+            config_path.display()
+        ))
+    })?;
+    let bits_i64 = marker
+        .get("bits")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| {
+            crate::Error::Msg(format!(
+                "packed quant: {} `quantization.bits` must be an integer",
+                config_path.display()
+            ))
+        })?;
+    let bits = i32::try_from(bits_i64).map_err(|_| {
+        crate::Error::Msg(format!(
+            "packed quant: {} `quantization.bits` is out of range: {bits_i64}",
+            config_path.display()
+        ))
+    })?;
+    if !matches!(bits, 4 | 8) {
+        return Err(crate::Error::Msg(format!(
+            "packed quant: {} declares unsupported `quantization.bits` {bits}; expected 4 or 8",
+            config_path.display()
+        )));
+    }
+    Ok(Some(bits))
+}
+
+/// Decide whether a requested Q4/Q8 tier must be produced by load-time quantization.
+///
+/// Packed turnkeys must match the request exactly; a mismatch is a hard error because provider
+/// `quantize` methods intentionally no-op over packed weights. Direct provider struct loaders that
+/// bypass the registry/load seam also bypass this guard by design and must pin their own source tier.
+pub fn needs_load_time_quant(
+    root: &Path,
+    component: &str,
+    requested_bits: i32,
+    model_id: &str,
+) -> Result<bool> {
+    if !matches!(requested_bits, 4 | 8) {
+        return Err(crate::Error::Msg(format!(
+            "{model_id}: unsupported requested quantization tier Q{requested_bits}; expected Q4 or Q8"
+        )));
+    }
+    match packed_quant_bits(root, component)? {
+        Some(packed) if packed != requested_bits => Err(crate::Error::Msg(format!(
+            "{model_id}: {component}/ is a pre-quantized Q{packed} turnkey but Q{requested_bits} \
+             was requested; quantize is a no-op on packed weights so the request would silently \
+             serve Q{packed}. Point at a Q{requested_bits} snapshot (or a dense one)."
+        ))),
+        Some(_) => Ok(false),
+        None => Ok(true),
+    }
+}
 
 /// Derive the quant bit-width from the packed shapes at group size `group_size`: `scales` is
 /// `[out, in/gs]` ⇒ `in = scales.cols·gs`; the u32-packed `weight` is `[out, in·bits/32]` ⇒
@@ -273,6 +370,81 @@ pub fn copy_turnkey_assets(src_root: &Path, dst_root: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn marker_fixture(body: Option<&str>) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "mlx-gen-quant-marker-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+        ));
+        let dir = root.join("transformer");
+        std::fs::create_dir_all(&dir).unwrap();
+        if let Some(body) = body {
+            std::fs::write(dir.join("config.json"), body).unwrap();
+        }
+        root
+    }
+
+    #[test]
+    fn quant_tier_missing_or_unmarked_config_is_dense() {
+        for body in [None, Some("{}"), Some(r#"{"hidden_size": 64}"#)] {
+            let root = marker_fixture(body);
+            assert_eq!(packed_quant_bits(&root, "transformer").unwrap(), None);
+            assert!(needs_load_time_quant(&root, "transformer", 4, "model").unwrap());
+            std::fs::remove_dir_all(root).ok();
+        }
+    }
+
+    #[test]
+    fn quant_tier_match_skips_and_mismatch_names_context() {
+        let root = marker_fixture(Some(r#"{"quantization":{"bits":8,"group_size":64}}"#));
+        assert!(!needs_load_time_quant(&root, "transformer", 8, "lens_turbo").unwrap());
+        let error = needs_load_time_quant(&root, "transformer", 4, "lens_turbo")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("lens_turbo"), "{error}");
+        assert!(error.contains("transformer"), "{error}");
+        assert!(error.contains("Q8") && error.contains("Q4"), "{error}");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn quant_tier_rejects_every_present_but_malformed_marker() {
+        for body in [
+            "{",
+            r#"{"quantization":null}"#,
+            r#"{"quantization":[]}"#,
+            r#"{"quantization":{}}"#,
+            r#"{"quantization":{"bits":"4"}}"#,
+            r#"{"quantization":{"bits":4.0}}"#,
+            r#"{"quantization":{"bits":3}}"#,
+            r#"{"quantization":{"bits":2147483648}}"#,
+        ] {
+            let root = marker_fixture(Some(body));
+            assert!(
+                packed_quant_bits(&root, "transformer").is_err(),
+                "marker must fail: {body}"
+            );
+            std::fs::remove_dir_all(root).ok();
+        }
+    }
+
+    #[test]
+    fn quant_tier_only_swallows_not_found_and_rejects_unsafe_components() {
+        let root = marker_fixture(None);
+        std::fs::create_dir(root.join("transformer/config.json")).unwrap();
+        assert!(packed_quant_bits(&root, "transformer").is_err());
+        for component in ["", "../transformer", "/transformer", "transformer/../vae"] {
+            assert!(
+                packed_quant_bits(&root, component).is_err(),
+                "{component:?}"
+            );
+        }
+        assert!(needs_load_time_quant(&root, "vae", 3, "model").is_err());
+        std::fs::remove_dir_all(root).ok();
+    }
 
     /// F-011: a Q4 pack at group_size 64 derives bits == 4 from the standard shapes.
     #[test]

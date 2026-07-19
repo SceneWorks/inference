@@ -321,11 +321,7 @@ impl InstantId {
     /// Detect + embed the largest face in `image` (the reference): bbox + 5 kps + 512-d ArcFace
     /// embedding. Requires [`with_face`](Self::with_face).
     pub fn largest_face(&self, image: &Image) -> Result<DetectedFace> {
-        let face = self.face.as_ref().ok_or_else(|| {
-            CandleError::Msg("instantid: face stack not attached (with_face)".into())
-        })?;
-        face.largest_face(image)
-            .map_err(|e| CandleError::Msg(e.to_string()))
+        largest_face_from(self.face.as_ref(), image)
     }
 
     /// Full T2I: letterbox the reference to the output size (the sc-2009 kps-distortion rule), detect
@@ -732,13 +728,7 @@ impl InstantId {
             return Err(CandleError::Canceled);
         }
         // Detect (no embed — only the box/landmarks are used; the identity is the `embedding` param).
-        let dets = {
-            let face = self.face.as_ref().ok_or_else(|| {
-                CandleError::Msg("instantid: face stack not attached (with_face)".into())
-            })?;
-            face.detect(base)
-                .map_err(|e| CandleError::Msg(e.to_string()))?
-        };
+        let dets = restore_face_detections(self.face.as_ref(), base)?;
         let Some(f) = dets.first() else {
             return Ok(base.clone()); // no face to restore — leave the base untouched
         };
@@ -777,13 +767,8 @@ impl InstantId {
             ..req.clone()
         };
         let restored = self.generate_with(&restore_req, embedding, &kps, on_progress)?;
-        let small_f = resize_lanczos_u8(
-            &restored.pixels,
-            side as usize,
-            side as usize,
-            crop_h,
-            crop_w,
-        );
+        let (restored_h, restored_w) = restored_image_dims(&restored);
+        let small_f = resize_lanczos_u8(&restored.pixels, restored_h, restored_w, crop_h, crop_w);
         let small: Vec<u8> = small_f.iter().map(|&v| v as u8).collect();
 
         // Feathered elliptical paste-back onto a copy of the base.
@@ -792,6 +777,58 @@ impl InstantId {
         restore::paste_alpha(&mut out, &small, crop_w, crop_h, ax, ay, &alpha);
         Ok(out)
     }
+}
+
+/// Validate the concrete RGB [`Image`] before either InstantID face entry point consults the
+/// optional face stack. The face backend repeats this check at its own public boundary; keeping the
+/// cheap guard here makes `largest_face` and `restore_face` reject malformed/zero images even when
+/// `with_face` was not attached yet.
+fn validate_face_image(image: &Image) -> Result<()> {
+    let (w, h) = (image.width as usize, image.height as usize);
+    if w == 0 || h == 0 {
+        return Err(CandleError::Msg(format!(
+            "instantid: face image has a zero dimension ({w}×{h})"
+        )));
+    }
+    let expected =
+        candle_gen::gen_core::imageops::checked_image_buffer_len(w, h, 3).ok_or_else(|| {
+            CandleError::Msg(format!(
+                "instantid: face image RGB buffer size overflows for {w}×{h}"
+            ))
+        })?;
+    if image.pixels.len() != expected {
+        return Err(CandleError::Msg(format!(
+            "instantid: face image buffer must contain exactly {expected} bytes for {w}×{h}×3, got {}",
+            image.pixels.len()
+        )));
+    }
+    Ok(())
+}
+
+/// Full public `largest_face` boundary implementation, factored so validation ordering is testable
+/// without loading the multi-gigabyte diffusion stack.
+fn largest_face_from(face: Option<&CandleFaceAnalysis>, image: &Image) -> Result<DetectedFace> {
+    validate_face_image(image)?;
+    let face = face
+        .ok_or_else(|| CandleError::Msg("instantid: face stack not attached (with_face)".into()))?;
+    face.largest_face(image)
+        .map_err(|e| CandleError::Msg(e.to_string()))
+}
+
+/// Validation + detect-only prefix of the public `restore_face` path.
+fn restore_face_detections(
+    face: Option<&CandleFaceAnalysis>,
+    image: &Image,
+) -> Result<Vec<DetectedFace>> {
+    validate_face_image(image)?;
+    let face = face
+        .ok_or_else(|| CandleError::Msg("instantid: face stack not attached (with_face)".into()))?;
+    face.detect(image)
+        .map_err(|e| CandleError::Msg(e.to_string()))
+}
+
+fn restored_image_dims(image: &Image) -> (usize, usize) {
+    (image.height as usize, image.width as usize)
 }
 
 /// Re-place a detected face's 5-point landmarks at a pose's head box (the vendored
@@ -829,6 +866,60 @@ fn place_face_kps(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restore_resize_uses_generated_image_dimensions() {
+        let image = Image {
+            width: 7,
+            height: 5,
+            pixels: vec![0; 7 * 5 * 3],
+        };
+        assert_eq!(restored_image_dims(&image), (5, 7));
+    }
+
+    #[test]
+    fn largest_face_and_restore_face_public_paths_reject_zero_before_face_stack() {
+        for (width, height) in [(0, 0), (0, 2), (3, 0)] {
+            let image = Image {
+                width,
+                height,
+                pixels: Vec::new(),
+            };
+            for err in [
+                largest_face_from(None, &image).unwrap_err().to_string(),
+                restore_face_detections(None, &image)
+                    .unwrap_err()
+                    .to_string(),
+            ] {
+                assert!(err.contains("zero dimension"), "{width}×{height}: {err}");
+                assert!(!err.contains("not attached"), "{err}");
+            }
+        }
+    }
+
+    #[test]
+    fn largest_face_and_restore_face_public_paths_reject_extra_before_face_stack() {
+        let valid = Image {
+            width: 3,
+            height: 2,
+            pixels: vec![0; 18],
+        };
+        for len in [19] {
+            let malformed = Image {
+                pixels: vec![0; len],
+                ..valid.clone()
+            };
+            for err in [
+                largest_face_from(None, &malformed).unwrap_err().to_string(),
+                restore_face_detections(None, &malformed)
+                    .unwrap_err()
+                    .to_string(),
+            ] {
+                assert!(err.contains("exactly 18 bytes"), "len {len}: {err}");
+                assert!(!err.contains("not attached"), "{err}");
+            }
+        }
+    }
 
     #[test]
     fn validate_kps_rejects_short_slices() {

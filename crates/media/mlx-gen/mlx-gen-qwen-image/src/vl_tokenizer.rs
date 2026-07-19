@@ -176,7 +176,9 @@ fn reference_image_nchw(image: &ImageInput, calc_w: u32, calc_h: u32) -> Result<
             image.width, image.height
         )));
     }
-    let expected = image.height * image.width * 3;
+    let expected =
+        mlx_gen::gen_core::imageops::checked_image_buffer_len(image.width, image.height, 3)
+            .unwrap_or(usize::MAX);
     if image.data.len() != expected {
         return Err(Error::Msg(format!(
             "qwen reference image buffer {} bytes != {}x{}x3 ({expected})",

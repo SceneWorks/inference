@@ -199,7 +199,10 @@ pub fn warp_affine(
 ) -> Result<Vec<u8>> {
     // Public boundary: reject an undersized source buffer with a typed error rather than
     // aborting the process on caller-supplied input (sc-9025 / F-041).
-    if src.len() < in_h * in_w * 3 {
+    if src.len()
+        < candle_gen::gen_core::imageops::checked_image_buffer_len(in_w, in_h, 3)
+            .unwrap_or(usize::MAX)
+    {
         return Err(CandleError::Msg(format!(
             "warp_affine: src buffer of {} bytes too small for {in_h}×{in_w}×3",
             src.len()

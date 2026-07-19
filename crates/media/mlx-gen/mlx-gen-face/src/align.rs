@@ -212,7 +212,9 @@ pub fn warp_affine(
     // `src` is indexed as `(y·in_w + x)·3 + ch` with bounds from `in_h`/`in_w` only; a `(buf,h,w)`
     // mismatch would otherwise index out of bounds deep in the sample loop. Reject the contract
     // violation at the entry as a typed error (F-020/L-A). Callers that decode their own buffers uphold it.
-    if src.len() < in_h * in_w * 3 {
+    if src.len()
+        < mlx_gen::gen_core::imageops::checked_image_buffer_len(in_w, in_h, 3).unwrap_or(usize::MAX)
+    {
         return Err(Error::Msg(format!(
             "warp_affine: src buffer of {} bytes too small for {in_h}×{in_w}×3",
             src.len()

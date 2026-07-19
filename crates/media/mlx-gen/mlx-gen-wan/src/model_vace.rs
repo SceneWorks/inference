@@ -64,7 +64,7 @@ const VAE_S: usize = 8;
 /// above the 81/121-frame lengths the Wan checkpoints are trained on) mirrors the LTX lane's real
 /// `MAX_FRAMES = 1025` ceiling; realistic-but-large requests below it are still bounded by the
 /// sc-4986 [`preflight_denoise_memory_guard`] both VACE `generate_impl`s now run.
-const MAX_CONTROL_FRAMES: usize = 1025;
+const MAX_CONTROL_FRAMES: usize = crate::MAX_WAN_FRAMES;
 
 /// Drop the leading `num_ref` reference latent frames along the temporal axis (axis 1) — the diffusers
 /// `latents[:, :, num_reference_images:]` slice both VACE variants apply after denoise, before the VAE
@@ -969,6 +969,25 @@ fn validate_vace_clip(
         return Err(Error::Msg(format!(
             "{id}: control clip frame count {} exceeds the maximum {MAX_CONTROL_FRAMES}",
             clip.frames.len()
+        )));
+    }
+    let reference_count = req
+        .conditioning
+        .iter()
+        .filter(|conditioning| matches!(conditioning, mlx_gen::Conditioning::Reference { .. }))
+        .count();
+    let combined = crate::combined_conditioning_latents(clip.frames.len(), reference_count)
+        .ok_or_else(|| {
+            Error::Msg(format!(
+                "{id}: control/reference temporal conditioning size overflowed"
+            ))
+        })?;
+    if combined > crate::MAX_WAN_CONDITIONING_LATENTS {
+        let control_latents = 1 + (clip.frames.len() - 1) / VAE_T;
+        return Err(Error::Msg(format!(
+            "{id}: control clip uses {control_latents} latent frames and {reference_count} reference \
+             images, totaling {combined}; the maximum combined temporal conditioning budget is {}",
+            crate::MAX_WAN_CONDITIONING_LATENTS
         )));
     }
     Ok(())

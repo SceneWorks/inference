@@ -50,15 +50,16 @@ use gen_core::tiling::{
 /// latent is decoded in one `decode_fn` call (no tiling), exactly as the per-crate copies did. The
 /// tile loop, narrow offsets, blend arithmetic, and normalization are unchanged; only placement now
 /// updates the destination slice instead of padding each tile to the full output volume.
-pub fn decode_tiled<F>(
+pub fn decode_tiled<F, E>(
     vae: VaeTiling,
     label: &str,
     latent: &Tensor,
     cfg: &TilingConfig,
     decode_fn: F,
-) -> Result<Tensor>
+) -> std::result::Result<Tensor, E>
 where
-    F: Fn(&Tensor) -> Result<Tensor>,
+    F: Fn(&Tensor) -> std::result::Result<Tensor, E>,
+    E: From<Error>,
 {
     let (_b, _c, f, h, w) = latent.dims5()?;
     if !cfg.needs_tiling(vae, f as i32, h as i32, w as i32) {
@@ -72,9 +73,15 @@ where
 /// known `plan` + synthetic decode closure without a [`TilingConfig`]). Loops `plan.t × plan.h ×
 /// plan.w`, narrows each latent tile, decodes it, blends via the trapezoidal outer-product mask, and
 /// accumulates into the full-output `output`/`weights` buffers, finally normalizing.
-fn blend_plan<F>(label: &str, latent: &Tensor, plan: &TilePlan, decode_fn: F) -> Result<Tensor>
+fn blend_plan<F, E>(
+    label: &str,
+    latent: &Tensor,
+    plan: &TilePlan,
+    decode_fn: F,
+) -> std::result::Result<Tensor, E>
 where
-    F: Fn(&Tensor) -> Result<Tensor>,
+    F: Fn(&Tensor) -> std::result::Result<Tensor, E>,
+    E: From<Error>,
 {
     let dev = latent.device();
 
@@ -164,7 +171,7 @@ where
     let weights =
         weights.ok_or_else(|| Error::Msg(format!("{label}: tile-decode plan had no tiles")))?;
     // Normalize by the summed blend weight (clamped away from 0), broadcasting [1,1,F,H,W] over C.
-    output.broadcast_div(&weights.maximum(1e-8f64)?)
+    Ok(output.broadcast_div(&weights.maximum(1e-8f64)?)?)
 }
 
 /// Resolve the safe peak-GiB budget for a video-VAE decode tiler. Resolved in order:

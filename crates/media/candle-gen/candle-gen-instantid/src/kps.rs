@@ -570,7 +570,10 @@ pub fn letterbox(image: &Image, width: u32, height: u32) -> Result<Image> {
             "instantid letterbox: image has a zero dimension ({iw}x{ih} -> {width}x{height})"
         )));
     }
-    if image.pixels.len() != iw as usize * ih as usize * 3 {
+    if image.pixels.len()
+        != candle_gen::gen_core::imageops::checked_image_buffer_len(iw as usize, ih as usize, 3)
+            .unwrap_or(usize::MAX)
+    {
         return Err(CandleError::Msg(format!(
             "instantid letterbox: image pixel buffer {} != {iw}x{ih}x3",
             image.pixels.len()
