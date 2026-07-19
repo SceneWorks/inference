@@ -10,6 +10,16 @@ use mlx_rs::Array;
 use crate::image::resize_lanczos_u8;
 use crate::{Error, Image, Result};
 
+/// Default strength for a supplied img2img reference when neither the reference nor request sets
+/// one. A reference must not silently fall back to the pure-noise txt2img path.
+pub const DEFAULT_IMG2IMG_STRENGTH: f32 = 0.5;
+
+/// Resolve img2img strength with the common precedence: per-reference, request, then the positive
+/// default. An explicit `Some(0.0)` is preserved as the deliberate no-op/txt2img selection.
+pub fn resolve_strength(reference: Option<f32>, request: Option<f32>) -> f32 {
+    reference.or(request).unwrap_or(DEFAULT_IMG2IMG_STRENGTH)
+}
+
 /// Resolve the img2img start step (the fork's `Config.init_time_step`): for a reference image with
 /// `strength` in `(0, 1]`, `max(1, floor(num_steps · strength))`; otherwise `0` (pure txt2img).
 /// Higher strength → later start → fewer denoise steps → output stays closer to the init image

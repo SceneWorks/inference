@@ -347,11 +347,9 @@ fn load_components<'a>(spec: &'a LoadSpec, id: &str) -> Result<&'a Path> {
 
 /// Resolve the optional img2img reference from the request conditioning (sc-10190): at most one
 /// `Conditioning::Reference` (multiple → error), returning its image and the effective strength
-/// (`per-reference strength.or(req.strength)`). Mirrors the sibling img2img families (Z-Image).
-fn resolve_reference<'a>(
-    req: &'a GenerationRequest,
-    id: &str,
-) -> Result<Option<(&'a Image, Option<f32>)>> {
+/// (per-reference → request → [`mlx_gen::img2img::DEFAULT_IMG2IMG_STRENGTH`]). An explicit zero
+/// remains a deliberate no-op/txt2img selection. Mirrors the sibling img2img families (Z-Image).
+fn resolve_reference<'a>(req: &'a GenerationRequest, id: &str) -> Result<Option<(&'a Image, f32)>> {
     let mut reference = None;
     for c in &req.conditioning {
         if let Conditioning::Reference { image, strength } = c {
@@ -360,7 +358,10 @@ fn resolve_reference<'a>(
                     "{id}: multiple reference images are not supported (single img2img init only)"
                 )));
             }
-            reference = Some((image, strength.or(req.strength)));
+            reference = Some((
+                image,
+                mlx_gen::img2img::resolve_strength(*strength, req.strength),
+            ));
         }
     }
     Ok(reference)
@@ -414,7 +415,7 @@ impl Sana {
         // above the residency lifecycle.
         let reference = resolve_reference(req, self.descriptor.id)?;
         let (init_image, strength) = match reference {
-            Some((image, strength)) => (Some(image), strength),
+            Some((image, strength)) => (Some(image), Some(strength)),
             None => (None, None),
         };
 
@@ -580,7 +581,7 @@ mod tests {
         let (_, strength) = resolve_reference(&r, MODEL_ID)
             .unwrap()
             .expect("a reference");
-        assert_eq!(strength, Some(0.6));
+        assert_eq!(strength, 0.6);
         assert!(validate_request(&descriptor(), &r).is_ok());
     }
 
@@ -596,7 +597,36 @@ mod tests {
         let (_, strength) = resolve_reference(&r, MODEL_ID)
             .unwrap()
             .expect("a reference");
-        assert_eq!(strength, Some(0.4));
+        assert_eq!(strength, 0.4);
+    }
+
+    #[test]
+    fn img2img_strength_precedence_default_and_start_step_are_explicit() {
+        let resolve = |per_reference, request| {
+            let mut r = req(1024, 1024);
+            r.strength = request;
+            r.conditioning = vec![Conditioning::Reference {
+                image: ref_image(),
+                strength: per_reference,
+            }];
+            resolve_reference(&r, MODEL_ID).unwrap().unwrap().1
+        };
+
+        assert_eq!(resolve(Some(0.7), Some(0.3)), 0.7);
+        assert_eq!(resolve(None, Some(0.3)), 0.3);
+        assert_eq!(
+            resolve(None, None),
+            mlx_gen::img2img::DEFAULT_IMG2IMG_STRENGTH
+        );
+        assert_eq!(
+            mlx_gen::img2img::init_time_step(20, Some(resolve(None, None))),
+            10
+        );
+        assert_eq!(resolve(Some(0.0), Some(0.3)), 0.0);
+        assert_eq!(
+            mlx_gen::img2img::init_time_step(20, Some(resolve(Some(0.0), None))),
+            0
+        );
     }
 
     #[test]

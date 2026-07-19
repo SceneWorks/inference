@@ -354,7 +354,7 @@ impl Boogu {
         // Seed-independent — resolved above the residency lifecycle.
         let reference = resolve_reference(req, id)?;
         let start_step = reference
-            .map(|(_, strength)| init_time_step(steps, strength))
+            .map(|(_, strength)| init_time_step(steps, Some(strength)))
             .unwrap_or(0);
         let sigmas = base_flow_schedule(steps, req.scheduler.as_deref());
 
@@ -533,7 +533,7 @@ impl Boogu {
         // the VAE-encoded reference at a strength-derived start step; no reference → pure t2i.
         let reference = resolve_reference(req, id)?;
         let start_step = reference
-            .map(|(_, strength)| init_time_step(steps, strength))
+            .map(|(_, strength)| init_time_step(steps, Some(strength)))
             .unwrap_or(0);
 
         self.residency.run(
@@ -904,7 +904,7 @@ mod tests {
         assert!(validate_request(&descriptor_turbo(), &one).is_ok());
         // resolve_reference returns the image + strength (falling back to req.strength when unset).
         let (_, strength) = resolve_reference(&one, "boogu_image").unwrap().unwrap();
-        assert_eq!(strength, Some(0.6));
+        assert_eq!(strength, 0.6);
 
         // Two references on the t2i path → error (single img2img init only; multi is the Edit path).
         let two = GenerationRequest {
@@ -939,8 +939,36 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .1,
-            Some(0.4)
+            0.4
         );
+    }
+
+    #[test]
+    fn img2img_strength_precedence_default_and_start_step_are_explicit() {
+        let resolve = |per_reference, request| {
+            let request = GenerationRequest {
+                strength: request,
+                conditioning: vec![Conditioning::Reference {
+                    image: img(512, 512),
+                    strength: per_reference,
+                }],
+                ..req(512, 512)
+            };
+            resolve_reference(&request, BOOGU_IMAGE_ID)
+                .unwrap()
+                .unwrap()
+                .1
+        };
+
+        assert_eq!(resolve(Some(0.7), Some(0.3)), 0.7);
+        assert_eq!(resolve(None, Some(0.3)), 0.3);
+        assert_eq!(
+            resolve(None, None),
+            mlx_gen::img2img::DEFAULT_IMG2IMG_STRENGTH
+        );
+        assert_eq!(init_time_step(20, Some(resolve(None, None))), 10);
+        assert_eq!(resolve(Some(0.0), Some(0.3)), 0.0);
+        assert_eq!(init_time_step(20, Some(resolve(Some(0.0), None))), 0);
     }
 
     #[test]

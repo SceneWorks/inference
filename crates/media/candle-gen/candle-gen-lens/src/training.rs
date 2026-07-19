@@ -247,7 +247,8 @@ fn sample_noise_latent(
 /// of the inference `to_image` composed with [`crate::vae::decode`] (`(x.clamp(-1,1)+1)·127.5`).
 fn decode_preview(vae: &Flux2Vae, lat: &Tensor, latent_h: usize, latent_w: usize) -> Result<Image> {
     let decoded = vae_decode(vae, lat, latent_h, latent_w)?; // [1, 3, H, W] in [-1, 1]
-    let img = ((decoded.clamp(-1f32, 1f32)? + 1.0)? * 127.5)?.to_dtype(DType::U8)?;
+    let scaled = ((decoded.clamp(-1f32, 1f32)? + 1.0)? * 127.5)?;
+    let img = candle_gen::round_rgb8(&scaled)?;
     let img = img.i(0)?.to_device(&Device::Cpu)?;
     let (c, h, w) = img.dims3()?;
     if c != 3 {

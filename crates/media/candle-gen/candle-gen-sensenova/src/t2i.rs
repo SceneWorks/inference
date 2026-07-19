@@ -1195,8 +1195,7 @@ fn gaussian(shape: (usize, usize, usize, usize), seed: u64, device: &Device) -> 
 /// Map a model-space image `[1,3,H,W]` (≈ `[-1,1]`) to an RGB8 [`Image`] (`x·0.5+0.5`, clamp, ×255).
 pub fn tensor_to_image(img: &Tensor) -> CResult<Image> {
     let img = ((img * 0.5)? + 0.5)?.clamp(0f32, 1f32)?;
-    let img = (img * 255.)?
-        .to_dtype(candle_gen::candle_core::DType::U8)?
+    let img = candle_gen::round_rgb8(&(img * 255.)?)?
         .i(0)?
         .to_device(&Device::Cpu)?;
     let (c, h, w) = img.dims3()?;
@@ -1219,6 +1218,14 @@ mod tests {
 
     fn flat(t: &Tensor) -> Vec<f32> {
         t.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+    }
+
+    #[test]
+    fn tensor_to_image_rounds_rgb8_half_up() {
+        let channels = vec![-1.0f32, 0.0, 1.0, -1.0, 0.0, 1.0, -1.0, 0.0, 1.0];
+        let tensor = Tensor::from_vec(channels, (1, 3, 1, 3), &Device::Cpu).unwrap();
+        let image = tensor_to_image(&tensor).unwrap();
+        assert_eq!(image.pixels, vec![0, 0, 0, 128, 128, 128, 255, 255, 255]);
     }
 
     #[test]

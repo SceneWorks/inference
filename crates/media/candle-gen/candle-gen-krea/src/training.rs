@@ -214,7 +214,8 @@ fn sample_noise_latent(edge: u32, seed: u64, device: &Device) -> Result<Tensor> 
 /// in `[-1, 1]`; the `(x+1)·127.5` is the reference `clamp(-1,1)·0.5 + 0.5` denormalize) (sc-8650).
 fn decode_preview(vae: &QwenVae, lat: &Tensor) -> Result<Image> {
     let decoded = vae.decode(lat)?.to_dtype(DType::F32)?; // [1, 3, H, W] in [-1, 1]
-    let img = ((decoded.clamp(-1f32, 1f32)? + 1.0)? * 127.5)?.to_dtype(DType::U8)?;
+    let scaled = ((decoded.clamp(-1f32, 1f32)? + 1.0)? * 127.5)?;
+    let img = candle_gen::round_rgb8(&scaled)?;
     let img = img.i(0)?.to_device(&Device::Cpu)?;
     let (c, h, w) = img.dims3()?;
     if c != 3 {

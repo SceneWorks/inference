@@ -125,7 +125,7 @@ pub fn to_uint8_frames(video: &Array) -> Result<Array> {
         &scalar(1.0).as_dtype(dt)?,
     )?;
     let scaled = multiply(&clipped, &scalar(255.0).as_dtype(dt)?)?;
-    contiguous(&scaled.as_dtype(Dtype::Uint8)?)
+    contiguous(&mlx_rs::ops::round(&scaled, None)?.as_dtype(Dtype::Uint8)?)
 }
 
 /// `(F, H, W, 3)` uint8 → one [`Image`] per frame.
@@ -157,13 +157,13 @@ mod tests {
     #[test]
     fn to_uint8_frames_clips_and_scales() {
         // 1 frame, 1×2 pixels, 3 channels: values chosen to hit clip low / mid / high.
-        // pixel0 = (-2, -1, 0) → ((x+1)/2) = (-0.5, 0, 0.5) → clip → (0, 0, 127)
+        // pixel0 = (-2, -1, 0) → ((x+1)/2) = (-0.5, 0, 0.5) → nearest-even → (0, 0, 128)
         // pixel1 = ( 1,  2, 3) → (1, 1.5, 2)   → clip → (255, 255, 255)
         let v = Array::from_slice(&[-2.0f32, 1.0, -1.0, 2.0, 0.0, 3.0], &[1, 3, 1, 1, 2]);
         let out = to_uint8_frames(&v).unwrap();
         assert_eq!(out.shape(), &[1, 1, 2, 3]);
         let px: Vec<u8> = out.as_slice::<u8>().to_vec();
-        assert_eq!(px, vec![0, 0, 127, 255, 255, 255]);
+        assert_eq!(px, vec![0, 0, 128, 255, 255, 255]);
     }
 
     /// `frames_to_images` splits `(F, H, W, 3)` into per-frame RGB8 `Image`s.

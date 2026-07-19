@@ -1004,12 +1004,13 @@ fn image_to_pixels(img: &Image) -> Result<Array> {
 
 /// The single img2img reference for the Base/Turbo t2i path (epic 8588 A4.3, sc-10191): at most one
 /// [`Conditioning::Reference`] — multiple is an error (Boogu's multi-image path is the Edit
-/// checkpoint's `resolve_edit_references`, not img2img) — with its per-reference `strength` falling
-/// back to `req.strength`. `None` ⇒ pure txt2img. Mirrors Z-Image's `resolve_reference`.
+/// checkpoint's `resolve_edit_references`, not img2img) — with strength precedence per-reference →
+/// request → [`mlx_gen::img2img::DEFAULT_IMG2IMG_STRENGTH`]. An explicit zero remains a deliberate
+/// no-op/txt2img selection. Mirrors Z-Image's `resolve_reference`.
 pub(crate) fn resolve_reference<'a>(
     req: &'a GenerationRequest,
     id: &str,
-) -> Result<Option<(&'a Image, Option<f32>)>> {
+) -> Result<Option<(&'a Image, f32)>> {
     let mut reference = None;
     for c in &req.conditioning {
         if let Conditioning::Reference { image, strength } = c {
@@ -1019,7 +1020,10 @@ pub(crate) fn resolve_reference<'a>(
                      init only; the Edit checkpoint handles multi-image edits)"
                 )));
             }
-            reference = Some((image, strength.or(req.strength)));
+            reference = Some((
+                image,
+                mlx_gen::img2img::resolve_strength(*strength, req.strength),
+            ));
         }
     }
     Ok(reference)

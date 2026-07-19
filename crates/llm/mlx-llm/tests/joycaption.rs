@@ -16,12 +16,15 @@
 //! port differs numerically from the reference.
 
 use core_llm::{
-    Content, ImageRef, LoadSpec, Message, Role, Sampling, TextLlm, TextLlmRequest, Tokenizer,
+    Content, ImageRef, LoadSpec, Message, PrepareSpec, Quantize, Role, Sampling, TextLlm,
+    TextLlmRequest, Tokenizer,
 };
 
 use mlx_llm::decode::CancelFlag;
 use mlx_llm::joycaption::{build_chat_text, JoyCaptionModel, JoyCaptionProvider, STOP_TOKENS};
 use mlx_llm::primitives::sampler::SamplingParams;
+use mlx_llm::primitives::Weights;
+use mlx_llm::{load_for_model, prepare_snapshot};
 
 /// Pure-greedy golden tokens for the gray-384 fixture + "Write a very short caption." (16 tokens).
 const GOLDEN: &[i32] = &[
@@ -51,6 +54,148 @@ fn gradient_image() -> (Vec<u8>, u32, u32) {
         }
     }
     (px, 512, 384)
+}
+
+struct PreparedSnapshot(std::path::PathBuf);
+
+impl Drop for PreparedSnapshot {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.0).ok();
+    }
+}
+
+/// Release gate for stored-quantized VLM snapshots: prepare the pinned full JoyCaption source,
+/// prove only the Llama text projections were packed, reload the prepared directory, and execute
+/// SigLIP → projector → image splice → quantized Llama generation with an actual RGB image.
+#[test]
+#[ignore = "needs pinned MLX_LLM_JOYCAPTION_SNAPSHOT and several GiB of temporary disk"]
+fn prepared_q4_snapshot_runs_full_vlm() {
+    let source = std::env::var("MLX_LLM_JOYCAPTION_SNAPSHOT").expect(
+        "MLX_LLM_JOYCAPTION_SNAPSHOT must name the verified pinned JoyCaption source snapshot",
+    );
+    let source = std::path::Path::new(&source);
+    assert!(
+        source.is_dir(),
+        "JoyCaption source snapshot is not a directory: {}",
+        source.display()
+    );
+
+    let out = std::env::temp_dir().join(format!("mlx-llm-joycaption-q4-{}", std::process::id()));
+    std::fs::remove_dir_all(&out).ok();
+    let prepared = PreparedSnapshot(out);
+    let report = prepare_snapshot(&PrepareSpec::quantized(source, &prepared.0, Quantize::Q4))
+        .expect("registered quantize-prepare of the pinned JoyCaption source must succeed");
+    assert_eq!(report.quantized, Some(Quantize::Q4));
+    assert!(
+        report.num_tensors > 0,
+        "JoyCaption prepare must report written tensors"
+    );
+
+    let config: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(prepared.0.join("config.json"))
+            .expect("prepared config.json must exist"),
+    )
+    .expect("prepared config.json must remain valid JSON");
+    assert_eq!(config["quantization"]["bits"], 4);
+    assert_eq!(config["text_config"]["quantization"]["bits"], 4);
+
+    let weights = Weights::from_dir(&prepared.0).expect("prepared weights must reload");
+    for base in [
+        "language_model.model.layers.0.self_attn.q_proj",
+        "language_model.model.layers.0.mlp.gate_proj",
+    ] {
+        assert!(
+            weights.contains(&format!("{base}.weight")),
+            "missing {base}.weight"
+        );
+        assert!(
+            weights.contains(&format!("{base}.scales")),
+            "missing {base}.scales"
+        );
+        assert!(
+            weights.contains(&format!("{base}.biases")),
+            "missing {base}.biases"
+        );
+    }
+    for base in [
+        "vision_tower.vision_model.encoder.layers.0.self_attn.q_proj",
+        "multi_modal_projector.linear_1",
+    ] {
+        assert!(
+            weights.contains(&format!("{base}.weight")),
+            "missing dense {base}.weight"
+        );
+        assert!(
+            !weights.contains(&format!("{base}.scales")),
+            "{base} must remain dense"
+        );
+    }
+
+    let provider = load_for_model(&LoadSpec::dense(prepared.0.to_string_lossy().to_string()))
+        .expect("registered provider selection must load the prepared JoyCaption VLM");
+    assert_eq!(provider.descriptor().id, "mlx-joycaption");
+    assert!(provider.descriptor().capabilities.supports_vision);
+    let (pixels, width, height) = gradient_image();
+    let request = TextLlmRequest {
+        messages: vec![Message {
+            role: Role::User,
+            content: vec![
+                Content::Image(
+                    ImageRef::new(width, height, pixels).expect("gradient image must be valid RGB"),
+                ),
+                Content::text("Write a very short caption."),
+            ],
+            thinking: None,
+            tool_calls: Vec::new(),
+        }],
+        sampling: Sampling::greedy(),
+        max_new_tokens: 2,
+        seed: Some(0),
+        ..Default::default()
+    };
+    let mut streamed_tokens = 0u32;
+    let mut streamed_text = String::new();
+    let mut done_usage = None;
+    let generated = provider
+        .generate(&request, &mut |event| match event {
+            core_llm::StreamEvent::Token { text, .. } => {
+                streamed_tokens += 1;
+                streamed_text.push_str(&text);
+            }
+            core_llm::StreamEvent::Done { usage, .. } => {
+                assert!(
+                    done_usage.is_none(),
+                    "public streaming contract emitted Done twice"
+                );
+                done_usage = Some(usage);
+            }
+        })
+        .expect("registered JoyCaption provider must generate from the real image request");
+    assert!(
+        generated.usage.generated_tokens > 0,
+        "prepared JoyCaption generation stopped before producing a token"
+    );
+    assert!(
+        streamed_tokens > 0,
+        "public streaming contract must emit Token"
+    );
+    assert_eq!(
+        streamed_tokens, generated.usage.generated_tokens,
+        "streamed Token count must equal returned generated-token usage"
+    );
+    assert!(
+        !streamed_text.is_empty(),
+        "public streaming contract must emit non-empty caption text"
+    );
+    assert_eq!(
+        streamed_text, generated.text,
+        "concatenated Token text must equal returned generation text"
+    );
+    assert_eq!(
+        done_usage,
+        Some(generated.usage),
+        "terminal Done usage must equal returned generation usage"
+    );
 }
 
 /// Model-level parity: vision tower → projector → splice → Llama decode reproduces the reference

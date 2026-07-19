@@ -185,7 +185,8 @@ impl AnimaPipeline {
 /// `[1, 3, H, W]` in `[-1, 1]` → an 8-bit RGB [`Image`].
 fn to_image(decoded: &candle_gen::candle_core::Tensor) -> Result<Image> {
     use candle_gen::candle_core::IndexOp;
-    let img = ((decoded.clamp(-1f32, 1f32)? + 1.0)? * 127.5)?.to_dtype(DType::U8)?;
+    let scaled = ((decoded.clamp(-1f32, 1f32)? + 1.0)? * 127.5)?;
+    let img = candle_gen::round_rgb8(&scaled)?;
     let img = img.i(0)?.to_device(&Device::Cpu)?;
     let (c, h, w) = img.dims3()?;
     if c != 3 {

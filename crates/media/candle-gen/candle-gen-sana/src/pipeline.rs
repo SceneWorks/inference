@@ -152,9 +152,7 @@ pub fn decode_to_image(decoder: &DcAeDecoder, cfg: &DcAeConfig, latents: &Tensor
     // when it fits; seam-free when it tiles.
     let decoded = decoder.decode_fit(&unscaled)?; // [1, 3, H, W] NCHW, f32 in [-1, 1]
     let rgb = (((decoded * 0.5)? + 0.5)?.clamp(0f32, 1f32)? * 255.0)?;
-    let rgb = rgb
-        .round()?
-        .to_dtype(DType::U8)?
+    let rgb = candle_gen::round_rgb8(&rgb)?
         .i(0)?
         .to_device(&Device::Cpu)?; // [3, H, W]
     let (c, h, w) = rgb.dims3()?;

@@ -2879,6 +2879,7 @@ dependencies = [
  "core-llm",
  "core-llm-testkit",
  "half",
+ "memmap2",
  "pmetal-mlx-rs",
  "serde_json",
  "thiserror 2.0.18",

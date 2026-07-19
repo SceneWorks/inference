@@ -1,7 +1,7 @@
 //! Pipeline glue for Wan txt2video: latent geometry, deterministic CPU-seeded noise (sc-3673),
 //! classifier-free guidance, and the frames → `gen_core::Image` conversion.
 
-use candle_gen::candle_core::{DType, Device, Result, Tensor};
+use candle_gen::candle_core::{Device, Result, Tensor};
 use candle_gen::gen_core::Image;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
@@ -39,9 +39,8 @@ pub fn cfg(cond: &Tensor, uncond: &Tensor, guidance: f64) -> Result<Tensor> {
 
 /// Decoded video `[1, 3, T, H, W]` in `[-1, 1]` → one RGB8 [`Image`] per frame.
 pub fn frames_to_images(decoded: &Tensor) -> Result<Vec<Image>> {
-    let u8s = ((decoded.clamp(-1f32, 1f32)? + 1.0)? * 127.5)?
-        .to_dtype(DType::U8)?
-        .to_device(&Device::Cpu)?;
+    let scaled = ((decoded.clamp(-1f32, 1f32)? + 1.0)? * 127.5)?;
+    let u8s = candle_gen::round_rgb8(&scaled)?.to_device(&Device::Cpu)?;
     let (_b, c, t, h, w) = u8s.dims5()?;
     let frames = u8s.squeeze(0)?; // [3,T,H,W]
     let mut out = Vec::with_capacity(t);

@@ -173,8 +173,8 @@ pub fn decode_image(
         }
     };
     let img = ((img / 2.)? + 0.5)?.clamp(0f32, 1f32)?;
-    let img = (img * 255.)?
-        .to_dtype(DType::U8)?
+    let scaled = (img * 255.)?;
+    let img = candle_gen::round_rgb8(&scaled)?
         .i(0)?
         .to_device(&Device::Cpu)?;
     let (c, h, w) = img.dims3()?;

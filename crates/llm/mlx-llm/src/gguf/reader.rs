@@ -11,6 +11,7 @@
 //! torch/row-major `[out, in]` a linear weight uses; [`TensorInfo::shape`] is already reversed back
 //! to torch order so the rest of the engine sees its native layout.
 
+use memmap2::Mmap;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -166,23 +167,46 @@ pub struct GgufFile {
     /// Data-section alignment (`general.alignment`, default 32).
     pub alignment: u64,
     /// The whole file, kept so tensor data can be sliced lazily.
-    bytes: Vec<u8>,
+    bytes: Backing,
     /// File offset where the (aligned) tensor data section begins.
     data_start: usize,
+}
+
+#[derive(Debug)]
+enum Backing {
+    Owned(Vec<u8>),
+    Mapped(Mmap),
+}
+impl AsRef<[u8]> for Backing {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Owned(v) => v,
+            Self::Mapped(m) => m,
+        }
+    }
 }
 
 impl GgufFile {
     /// Read and parse a `.gguf` file from disk.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        let bytes = std::fs::read(path)
-            .map_err(|e| Error::Msg(format!("gguf: read {}: {e}", path.display())))?;
-        Self::parse(bytes)
+        let file = std::fs::File::open(path)
+            .map_err(|e| Error::Msg(format!("gguf: open {}: {e}", path.display())))?;
+        // SAFETY: the mapping is read-only and owned for the lifetime of GgufFile; callers must not
+        // mutate the source while conversion is running.
+        let mmap = unsafe { Mmap::map(&file) }
+            .map_err(|e| Error::Msg(format!("gguf: mmap {}: {e}", path.display())))?;
+        Self::parse_backing(Backing::Mapped(mmap))
     }
 
     /// Parse an in-memory GGUF image.
     pub fn parse(bytes: Vec<u8>) -> Result<Self> {
-        let mut c = Cursor::new(&bytes);
+        Self::parse_backing(Backing::Owned(bytes))
+    }
+
+    fn parse_backing(bytes: Backing) -> Result<Self> {
+        let raw = bytes.as_ref();
+        let mut c = Cursor::new(raw);
 
         let magic = c.u32()?;
         if magic != GGUF_MAGIC {
@@ -200,7 +224,7 @@ impl GgufFile {
         let metadata_count = c.u64()? as usize;
 
         let mut metadata =
-            HashMap::with_capacity(metadata_count.min(MAX_CONTAINER_ITEMS).min(bytes.len()));
+            HashMap::with_capacity(metadata_count.min(MAX_CONTAINER_ITEMS).min(raw.len()));
         for _ in 0..metadata_count {
             let key = c.string()?;
             let vtype = c.u32()?;
@@ -208,8 +232,7 @@ impl GgufFile {
             metadata.insert(key, value);
         }
 
-        let mut tensors =
-            Vec::with_capacity(tensor_count.min(MAX_CONTAINER_ITEMS).min(bytes.len()));
+        let mut tensors = Vec::with_capacity(tensor_count.min(MAX_CONTAINER_ITEMS).min(raw.len()));
         for _ in 0..tensor_count {
             let name = c.string()?;
             let n_dims = c.u32()? as usize;
@@ -246,7 +269,7 @@ impl GgufFile {
         // A metadata-only file (no tensors) legitimately ends before the aligned data boundary; only
         // require the data section to be in-range when tensors actually reference it (each tensor's
         // own slice is bounds-checked in `tensor_data`).
-        if !tensors.is_empty() && (data_start as usize) > bytes.len() {
+        if !tensors.is_empty() && (data_start as usize) > raw.len() {
             return Err(Error::Msg(
                 "gguf: data section starts past end of file".into(),
             ));
@@ -292,11 +315,11 @@ impl GgufFile {
         let end = start
             .checked_add(nbytes)
             .ok_or_else(|| Error::Msg("gguf: tensor length overflow".into()))?;
-        self.bytes.get(start..end).ok_or_else(|| {
+        self.bytes.as_ref().get(start..end).ok_or_else(|| {
             Error::Msg(format!(
                 "gguf: tensor {:?} data [{start}..{end}] out of range (file {} bytes)",
                 info.name,
-                self.bytes.len()
+                self.bytes.as_ref().len()
             ))
         })
     }

@@ -32,6 +32,7 @@ thiserror = { workspace = true }
 serde_json = { workspace = true }
 # half-precision scalar helpers for host-side dtype handling.
 half = "2"
+memmap2 = "0.9"
 
 [dev-dependencies]
 # (Tokenizing for the example + real-weights tests goes through core_llm::Tokenizer — no direct

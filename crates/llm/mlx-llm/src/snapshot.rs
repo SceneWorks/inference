@@ -24,11 +24,13 @@
 //! per-expert / shared-expert MoE MLPs, and the DeepSeek-V2 MLA low-rank projections. VLM vision
 //! towers stay dense (their loaders are dense-only, matching load-time behavior). Anything else that
 //! looks like an attention/FFN projection but is not recognized is a **loud [`Error::Unsupported`]**,
-//! never a silent dense fallback — including the Qwen3.5/3.6 hybrid linear-attention family
-//! (`linear_attn.*`), whose loader has no pre-quantized snapshot branch (prepare it dense and use
-//! load-time quantization instead).
+//! never a silent dense fallback. Qwen3.5/3.6's hybrid `linear_attn.*` projections and stacked MoE
+//! experts are covered explicitly so prepared and load-time quantization have the same surface.
 
+use std::collections::BTreeMap;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use mlx_rs::ops::split_sections;
 use mlx_rs::{Array, Dtype};
@@ -36,6 +38,7 @@ use serde_json::{json, Value};
 
 use crate::config::{Architecture, ModelConfig};
 use crate::error::{Error, Result};
+use crate::models::qwen35::Qwen35Config;
 use crate::primitives::quant::QuantizedLinear;
 use crate::primitives::QuantSpec;
 use crate::primitives::Weights;
@@ -43,6 +46,170 @@ use crate::primitives::Weights;
 /// The engine's bf16 compute/storage dtype. Projection weights are cast to it before requant so a
 /// quantized snapshot matches the loader's compute path (and the GGUF converter's behavior).
 const STORE_DTYPE: Dtype = Dtype::Bfloat16;
+
+struct StagedTensor {
+    dtype: &'static str,
+    shape: Vec<usize>,
+    path: PathBuf,
+    len: usize,
+}
+
+static STAGE_NONCE: AtomicU64 = AtomicU64::new(0);
+
+fn create_stage_dir(out_dir: &Path) -> Result<PathBuf> {
+    let name = out_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("snapshot");
+    let parent = out_dir.parent().unwrap_or_else(|| Path::new("."));
+    for _ in 0..128 {
+        let nonce = STAGE_NONCE.fetch_add(1, Ordering::Relaxed);
+        let stage = parent.join(format!(".{name}.tmp-{}-{nonce}", std::process::id()));
+        match std::fs::create_dir(&stage) {
+            Ok(()) => return Ok(stage),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err(Error::Msg(format!(
+        "could not allocate unique staging directory beside {}",
+        out_dir.display()
+    )))
+}
+
+/// Write a snapshot while retaining at most one source tensor and its transformed outputs.
+/// Tensor payloads are spooled to disk, then assembled in canonical `(dtype, name)` order.
+pub(crate) fn write_streaming_snapshot(
+    out_dir: &Path,
+    keys: &[String],
+    mut config: Value,
+    tokenizer: &SnapshotTokenizer,
+    quantize: Option<QuantSpec>,
+    mut load: impl FnMut(&str) -> Result<Array>,
+) -> Result<SnapshotReport> {
+    if out_dir.exists() {
+        if out_dir.is_dir() && std::fs::read_dir(out_dir)?.next().is_none() {
+            std::fs::remove_dir(out_dir)?;
+        } else {
+            return Err(Error::Msg(format!(
+                "snapshot output already exists and is not empty: {}",
+                out_dir.display()
+            )));
+        }
+    }
+    if let Some(spec) = quantize {
+        config
+            .as_object_mut()
+            .ok_or_else(|| Error::Config("snapshot config.json is not a JSON object".into()))?
+            .insert(
+                "quantization".into(),
+                json!({"group_size": spec.group_size, "bits": spec.bits}),
+            );
+    }
+    std::fs::create_dir_all(out_dir.parent().unwrap_or_else(|| Path::new(".")))?;
+    let stage = create_stage_dir(out_dir)?;
+    let result = (|| {
+        let mut staged = BTreeMap::new();
+        let mut quantized_projections = 0;
+        for (index, key) in keys.iter().enumerate() {
+            let arr = load(key)?.as_dtype(STORE_DTYPE)?;
+            let outputs = if let Some(spec) = quantize.filter(|_| is_projection(key)) {
+                let base = key.strip_suffix(".weight").unwrap();
+                let q = QuantizedLinear::quantize(&arr, spec.group_size, spec.bits, None)?;
+                quantized_projections += 1;
+                vec![
+                    (format!("{base}.weight"), q.weight),
+                    (format!("{base}.scales"), q.scales),
+                    (format!("{base}.biases"), q.biases),
+                ]
+            } else {
+                vec![(key.clone(), arr)]
+            };
+            for (part, (name, value)) in outputs.into_iter().enumerate() {
+                let (dtype, bytes) = array_payload(&value)?;
+                let path = stage.join(format!("tensor-{index}-{part}"));
+                std::fs::write(&path, &bytes)?;
+                staged.insert(
+                    name,
+                    StagedTensor {
+                        dtype,
+                        shape: value.shape().iter().map(|&d| d as usize).collect(),
+                        path,
+                        len: bytes.len(),
+                    },
+                );
+            }
+        }
+        if quantize.is_some() && quantized_projections == 0 {
+            return Err(Error::Unsupported(
+                "cannot quantize snapshot: no attention/MLP projection weights matched".into(),
+            ));
+        }
+        let mut order: Vec<_> = staged.iter().collect();
+        order.sort_by(|(an, a), (bn, b)| b.dtype.cmp(a.dtype).then(an.cmp(bn)));
+        let mut offset = 0usize;
+        let mut header = serde_json::Map::new();
+        for (name, tensor) in &order {
+            header.insert((*name).clone(), json!({"dtype": tensor.dtype, "shape": tensor.shape, "data_offsets": [offset, offset + tensor.len]}));
+            offset += tensor.len;
+        }
+        let mut header_bytes = serde_json::to_vec(&Value::Object(header))
+            .map_err(|e| Error::Msg(format!("serialize safetensors header: {e}")))?;
+        header_bytes.resize(header_bytes.len().div_ceil(8) * 8, b' ');
+        let model = stage.join("model.safetensors");
+        let mut writer = BufWriter::new(std::fs::File::create(&model)?);
+        writer.write_all(&(header_bytes.len() as u64).to_le_bytes())?;
+        writer.write_all(&header_bytes)?;
+        for (_, tensor) in order {
+            std::io::copy(&mut std::fs::File::open(&tensor.path)?, &mut writer)?;
+        }
+        writer.flush()?;
+        write_json_string(&stage.join("config.json"), &config)?;
+        if let Some(t) = &tokenizer.tokenizer_json {
+            std::fs::write(stage.join("tokenizer.json"), t)?;
+        }
+        if let Some(t) = &tokenizer.tokenizer_config_json {
+            std::fs::write(stage.join("tokenizer_config.json"), t)?;
+        }
+        for tensor in staged.values() {
+            std::fs::remove_file(&tensor.path)?;
+        }
+        std::fs::rename(&stage, out_dir)?;
+        Ok(SnapshotReport {
+            num_tensors: staged.len(),
+            quantized: quantize,
+            quantized_projections,
+            out_dir: out_dir.to_path_buf(),
+        })
+    })();
+    let _ = std::fs::remove_dir_all(&stage);
+    result
+}
+
+fn array_payload(array: &Array) -> Result<(&'static str, Vec<u8>)> {
+    use half::bf16;
+    match array.dtype() {
+        Dtype::Bfloat16 => Ok((
+            "BF16",
+            array
+                .as_slice::<bf16>()
+                .iter()
+                .flat_map(|v| v.to_bits().to_le_bytes())
+                .collect(),
+        )),
+        Dtype::Uint32 => Ok((
+            "U32",
+            array
+                .as_slice::<u32>()
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect(),
+        )),
+        other => Err(Error::Unsupported(format!(
+            "streaming safetensors dtype {other:?}"
+        ))),
+    }
+}
 
 /// The attention/MLP projection weight suffixes quantization targets, mirroring the set the
 /// llama-family loader quantizes on load ([`crate::models::CausalLm::from_weights_with`]): split
@@ -55,7 +222,7 @@ const STORE_DTYPE: Dtype = Dtype::Bfloat16;
 /// engine's quant invariant. Packed Phi-3 / GLM-4 tensors are handled separately (split first, see
 /// [`write_snapshot`]), and keys under a VLM vision tower are excluded entirely
 /// (vision loaders are dense-only).
-pub const PROJECTION_SUFFIXES: [&str; 11] = [
+pub const PROJECTION_SUFFIXES: [&str; 14] = [
     "self_attn.q_proj.weight",
     "self_attn.k_proj.weight",
     "self_attn.v_proj.weight",
@@ -65,6 +232,10 @@ pub const PROJECTION_SUFFIXES: [&str; 11] = [
     "self_attn.q_b_proj.weight",
     "self_attn.kv_a_proj_with_mqa.weight",
     "self_attn.kv_b_proj.weight",
+    // Qwen3.5/3.6 Gated DeltaNet. in_proj_a/b intentionally stay dense.
+    "linear_attn.in_proj_qkv.weight",
+    "linear_attn.in_proj_z.weight",
+    "linear_attn.out_proj.weight",
     // Gated MLP — bare so dense, per-expert, and shared-expert keys all match.
     "gate_proj.weight",
     "up_proj.weight",
@@ -75,6 +246,8 @@ pub const PROJECTION_SUFFIXES: [&str; 11] = [
 const PACKED_QKV_SUFFIX: &str = "self_attn.qkv_proj.weight";
 /// Packed Phi-3 / GLM-4 gate‖up MLP projection, split into `gate/up_proj` before quantizing.
 const PACKED_GATE_UP_SUFFIX: &str = "mlp.gate_up_proj.weight";
+const QWEN35_EXPERT_GATE_UP_SUFFIX: &str = "mlp.experts.gate_up_proj";
+const QWEN35_EXPERT_DOWN_SUFFIX: &str = "mlp.experts.down_proj";
 
 /// Weight-key roots of VLM vision towers / projectors (JoyCaption's SigLIP + LLaVA projector,
 /// the Qwen3-VL ViT). Vision weights are never quantized at load time — their loaders are
@@ -106,6 +279,10 @@ fn is_packed_projection(key: &str) -> bool {
         && (key.ends_with(PACKED_QKV_SUFFIX) || key.ends_with(PACKED_GATE_UP_SUFFIX))
 }
 
+fn is_qwen35_stacked_expert(key: &str) -> bool {
+    key.ends_with(QWEN35_EXPERT_GATE_UP_SUFFIX) || key.ends_with(QWEN35_EXPERT_DOWN_SUFFIX)
+}
+
 /// Whether a key that stayed dense under a quantize request looks like an attention/FFN projection
 /// the writer does not know how to cover. Used as the loud-refusal net: matching keys abort the
 /// write instead of silently producing a mixed-tier snapshot. Tensors the loader deliberately keeps
@@ -124,6 +301,9 @@ fn is_unrecognized_projection(key: &str, arr: &Array) -> bool {
     if key.ends_with("norm.weight")
         || key.ends_with(".mlp.gate.weight")
         || key.ends_with("shared_expert_gate.weight")
+        || key.ends_with("linear_attn.in_proj_a.weight")
+        || key.ends_with("linear_attn.in_proj_b.weight")
+        || key.ends_with("linear_attn.conv1d.weight")
     {
         return false;
     }
@@ -177,10 +357,7 @@ pub struct SnapshotReport {
 ///
 /// A quantize request fails with [`Error::Unsupported`] — writing nothing rather than a snapshot
 /// with silent dense fallbacks — when:
-/// - the config names the Qwen3.5/3.6 hybrid linear-attention family (its loader has no
-///   pre-quantized snapshot branch; prepare dense and quantize on load instead),
-/// - the tensor set contains attention/FFN projection-like keys the writer does not recognize
-///   (e.g. `linear_attn.*`), or
+/// - the tensor set contains attention/FFN projection-like keys the writer does not recognize, or
 /// - no projection matched at all (the "quantized" snapshot would be entirely dense).
 pub fn write_snapshot(
     out_dir: &Path,
@@ -191,22 +368,16 @@ pub fn write_snapshot(
 ) -> Result<SnapshotReport> {
     let tensors: Vec<(String, Array)> = tensors.into_iter().collect();
 
-    // Quantization is only writable for families whose loader reads stored packed projections back
-    // (the llama-family pre-quantized branch). Refuse the Qwen3.5/3.6 hybrid loudly: its loader
-    // quantizes on load but has no pre-quantized snapshot branch, so a quantized snapshot would be
-    // unloadable garbage.
     let mut split_dims: Option<(i32, i32, i32)> = None; // (q_dim, kv_dim, intermediate)
+    let mut qwen35_moe: Option<(i32, i32, i32)> = None; // (experts, expert_inter, hidden)
     if quantize.is_some() {
         let arch = Architecture::from_config(&config)
             .map_err(|e| Error::Unsupported(format!("cannot quantize snapshot: {e}")))?;
         if arch == Architecture::Qwen35 {
-            return Err(Error::Unsupported(
-                "cannot quantize snapshot: the Qwen3.5/3.6 hybrid linear-attention family \
-                 (`linear_attn.*` Gated DeltaNet layers) has no pre-quantized snapshot loader \
-                 branch; prepare the snapshot dense (quantize: None) and use load-time \
-                 quantization instead"
-                    .to_string(),
-            ));
+            let cfg = Qwen35Config::from_json(&config)?;
+            qwen35_moe = cfg
+                .moe
+                .map(|moe| (moe.num_experts, moe.moe_intermediate_size, cfg.hidden_size));
         }
         // Both packed and ordinary recognized projections feed rank-2 quantization operations.
         // Validate the common invariant before dispatch so neither branch can reach MLX with an
@@ -242,6 +413,62 @@ pub fn write_snapshot(
     let mut uncovered: Vec<String> = Vec::new();
     for (key, arr) in tensors {
         match quantize {
+            Some(spec) if is_qwen35_stacked_expert(&key) => {
+                let (num_experts, inter, hidden) = qwen35_moe.ok_or_else(|| {
+                    Error::Unsupported(format!(
+                        "cannot quantize stacked Qwen3.5 expert tensor `{key}` without MoE config"
+                    ))
+                })?;
+                let expected = if key.ends_with(QWEN35_EXPERT_GATE_UP_SUFFIX) {
+                    vec![num_experts, 2 * inter, hidden]
+                } else {
+                    vec![num_experts, hidden, inter]
+                };
+                if arr.shape() != expected {
+                    return Err(Error::Config(format!(
+                        "stacked `{key}` has shape {:?}; expected {:?} from config",
+                        arr.shape(),
+                        expected
+                    )));
+                }
+                let w = arr.as_dtype(STORE_DTYPE)?;
+                let stem = key
+                    .strip_suffix(if key.ends_with(QWEN35_EXPERT_GATE_UP_SUFFIX) {
+                        QWEN35_EXPERT_GATE_UP_SUFFIX
+                    } else {
+                        QWEN35_EXPERT_DOWN_SUFFIX
+                    })
+                    .unwrap();
+                for expert in 0..num_experts {
+                    let selected = w
+                        .take_axis(Array::from_slice(&[expert], &[1]), 0)?
+                        .reshape(&expected[1..])?;
+                    if key.ends_with(QWEN35_EXPERT_GATE_UP_SUFFIX) {
+                        let parts = split_sections(&selected, &[inter], 0)?;
+                        push_quantized(
+                            &mut out,
+                            &format!("{stem}mlp.experts.{expert}.gate_proj"),
+                            &parts[0],
+                            spec,
+                        )?;
+                        push_quantized(
+                            &mut out,
+                            &format!("{stem}mlp.experts.{expert}.up_proj"),
+                            &parts[1],
+                            spec,
+                        )?;
+                        quantized_projections += 2;
+                    } else {
+                        push_quantized(
+                            &mut out,
+                            &format!("{stem}mlp.experts.{expert}.down_proj"),
+                            &selected,
+                            spec,
+                        )?;
+                        quantized_projections += 1;
+                    }
+                }
+            }
             Some(spec) if is_packed_projection(&key) => {
                 let (q_dim, kv_dim, inter) = split_dims.expect("packed key implies parsed dims");
                 let w = arr.as_dtype(STORE_DTYPE)?;
@@ -317,11 +544,12 @@ pub fn write_snapshot(
     // A `quantization` block marks the snapshot pre-quantized so the loader reads the stored
     // projections as-is (its `stored_quant` branch) rather than re-quantizing on load.
     if let Some(spec) = quantize {
+        let block = json!({ "group_size": spec.group_size, "bits": spec.bits });
         if let Value::Object(map) = &mut config {
-            map.insert(
-                "quantization".into(),
-                json!({ "group_size": spec.group_size, "bits": spec.bits }),
-            );
+            map.insert("quantization".into(), block.clone());
+            if let Some(Value::Object(text)) = map.get_mut("text_config") {
+                text.insert("quantization".into(), block);
+            }
         } else {
             return Err(Error::Config(
                 "snapshot config.json is not a JSON object".into(),
@@ -422,7 +650,7 @@ fn read_to_string_if_exists(path: &Path) -> Result<Option<String>> {
 mod tests {
     use super::*;
     use crate::config::ModelConfig;
-    use crate::models::CausalLm;
+    use crate::models::{CausalLm, Qwen35Config, Qwen35Model};
     use crate::primitives::sampler::{SplitMix64, TokenRng};
     use std::collections::HashMap;
 
@@ -476,6 +704,93 @@ mod tests {
         (t, config)
     }
 
+    fn tiny_qwen35(moe: bool) -> (Vec<(String, Array)>, Value) {
+        let (h, vocab, inter, layers) = (64i32, 8i32, 128i32, 4usize);
+        let mut rng = SplitMix64::new(if moe { 0x35A3B } else { 0x3527B });
+        let mut t = Vec::new();
+        let pfx = "model.language_model";
+        t.push((
+            format!("{pfx}.embed_tokens.weight"),
+            randn(&[vocab, h], &mut rng),
+        ));
+        t.push((format!("{pfx}.norm.weight"), randn(&[h], &mut rng)));
+        t.push(("lm_head.weight".into(), randn(&[vocab, h], &mut rng)));
+        for i in 0..layers {
+            let p = |s: &str| format!("{pfx}.layers.{i}.{s}");
+            t.push((p("input_layernorm.weight"), randn(&[h], &mut rng)));
+            t.push((p("post_attention_layernorm.weight"), randn(&[h], &mut rng)));
+            if i < 3 {
+                t.push((
+                    p("linear_attn.in_proj_qkv.weight"),
+                    randn(&[192, h], &mut rng),
+                ));
+                t.push((p("linear_attn.in_proj_z.weight"), randn(&[64, h], &mut rng)));
+                t.push((p("linear_attn.in_proj_a.weight"), randn(&[2, h], &mut rng)));
+                t.push((p("linear_attn.in_proj_b.weight"), randn(&[2, h], &mut rng)));
+                t.push((
+                    p("linear_attn.conv1d.weight"),
+                    randn(&[192, 1, 4], &mut rng),
+                ));
+                t.push((p("linear_attn.A_log"), randn(&[2], &mut rng)));
+                t.push((p("linear_attn.dt_bias"), randn(&[2], &mut rng)));
+                t.push((p("linear_attn.norm.weight"), randn(&[32], &mut rng)));
+                t.push((p("linear_attn.out_proj.weight"), randn(&[h, 64], &mut rng)));
+            } else {
+                t.push((p("self_attn.q_proj.weight"), randn(&[128, h], &mut rng)));
+                t.push((p("self_attn.k_proj.weight"), randn(&[64, h], &mut rng)));
+                t.push((p("self_attn.v_proj.weight"), randn(&[64, h], &mut rng)));
+                t.push((p("self_attn.o_proj.weight"), randn(&[h, 64], &mut rng)));
+                t.push((p("self_attn.q_norm.weight"), randn(&[32], &mut rng)));
+                t.push((p("self_attn.k_norm.weight"), randn(&[32], &mut rng)));
+            }
+            if moe {
+                t.push((p("mlp.experts.gate_up_proj"), randn(&[2, 128, h], &mut rng)));
+                t.push((p("mlp.experts.down_proj"), randn(&[2, h, 64], &mut rng)));
+                t.push((p("mlp.gate.weight"), randn(&[2, h], &mut rng)));
+                for (name, shape) in [
+                    ("gate_proj.weight", vec![64, h]),
+                    ("up_proj.weight", vec![64, h]),
+                    ("down_proj.weight", vec![h, 64]),
+                ] {
+                    t.push((
+                        p(&format!("mlp.shared_expert.{name}")),
+                        randn(&shape, &mut rng),
+                    ));
+                }
+                t.push((p("mlp.shared_expert_gate.weight"), randn(&[1, h], &mut rng)));
+            } else {
+                t.push((p("mlp.gate_proj.weight"), randn(&[inter, h], &mut rng)));
+                t.push((p("mlp.up_proj.weight"), randn(&[inter, h], &mut rng)));
+                t.push((p("mlp.down_proj.weight"), randn(&[h, inter], &mut rng)));
+            }
+        }
+        let mut text = json!({
+            "model_type": if moe { "qwen3_5_moe" } else { "qwen3_5_text" },
+            "hidden_size": h, "intermediate_size": inter, "num_hidden_layers": layers,
+            "num_attention_heads": 2, "num_key_value_heads": 2, "head_dim": 32,
+            "vocab_size": vocab, "rms_norm_eps": 1e-6, "full_attention_interval": 4,
+            "linear_num_value_heads": 2, "linear_num_key_heads": 2,
+            "linear_key_head_dim": 32, "linear_value_head_dim": 32,
+            "linear_conv_kernel_dim": 4, "partial_rotary_factor": 0.5,
+            "tie_word_embeddings": false
+        });
+        if moe {
+            let obj = text.as_object_mut().unwrap();
+            obj.insert("num_experts".into(), json!(2));
+            obj.insert("num_experts_per_tok".into(), json!(1));
+            obj.insert("moe_intermediate_size".into(), json!(64));
+            obj.insert("shared_expert_intermediate_size".into(), json!(64));
+        }
+        (t, json!({ "model_type": "qwen3_5", "text_config": text }))
+    }
+
+    fn qwen35_load_error(result: Result<Qwen35Model>, context: &str) -> Error {
+        match result {
+            Ok(_) => panic!("{context}"),
+            Err(error) => error,
+        }
+    }
+
     #[test]
     fn projection_predicate_selects_only_attn_mlp_projections() {
         for k in [
@@ -506,13 +821,484 @@ mod tests {
             "model.layers.0.self_attn.q_a_layernorm.weight", // MLA norms stay dense
             "model.layers.0.mlp.gate.weight",         // MoE router stays dense
             "model.layers.0.mlp.shared_expert_gate.weight", // Qwen2-MoE gate stays dense
-            "model.layers.0.linear_attn.out_proj.weight", // Qwen3.6 hybrid: refused, not quantized
             "model.layers.0.mlp.gate_up_proj.weight", // packed: split before quantizing
             // VLM vision towers stay dense (their loaders are dense-only)
             "vision_tower.vision_model.encoder.layers.0.self_attn.q_proj.weight",
             "model.visual.blocks.0.attn.proj.weight",
         ] {
             assert!(!is_projection(k), "{k} should NOT be a projection");
+        }
+        for k in [
+            "model.layers.0.linear_attn.in_proj_qkv.weight",
+            "model.layers.0.linear_attn.in_proj_z.weight",
+            "model.layers.0.linear_attn.out_proj.weight",
+        ] {
+            assert!(is_projection(k), "{k} should be a Qwen3.5 projection");
+        }
+    }
+
+    #[test]
+    fn qwen35_dense_and_moe_q4_q8_round_trip_match_load_time_quantization() {
+        for moe in [false, true] {
+            for spec in [QuantSpec::q4(), QuantSpec::q8()] {
+                let dir = unique_dir(&format!(
+                    "qwen35-{}-q{}",
+                    if moe { "moe" } else { "dense" },
+                    spec.bits
+                ));
+                let (tensors, config) = tiny_qwen35(moe);
+                let dense_weights = Weights::from_map(tensors.iter().cloned().collect());
+                let dense_cfg = Qwen35Config::from_json(&config).unwrap();
+                let load_time = Qwen35Model::from_weights_with(
+                    &dense_weights,
+                    "model.language_model",
+                    dense_cfg,
+                    Some(spec),
+                )
+                .unwrap();
+
+                let report = write_snapshot(
+                    &dir,
+                    tensors,
+                    config,
+                    &SnapshotTokenizer::default(),
+                    Some(spec),
+                )
+                .unwrap();
+                assert_eq!(report.quantized_projections, if moe { 49 } else { 25 });
+
+                let stored_weights = Weights::from_dir(&dir).unwrap();
+                let stored_json: Value = serde_json::from_str(
+                    &std::fs::read_to_string(dir.join("config.json")).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(stored_json["quantization"]["bits"], spec.bits);
+                assert_eq!(
+                    stored_json["text_config"]["quantization"]["bits"],
+                    spec.bits
+                );
+                let stored_cfg = Qwen35Config::from_json(&stored_json).unwrap();
+                assert_eq!(stored_cfg.quantization, Some(spec));
+                let stored = Qwen35Model::from_weights_with(
+                    &stored_weights,
+                    "model.language_model",
+                    stored_cfg,
+                    None,
+                )
+                .unwrap();
+                assert!(stored.is_quantized());
+
+                for base in [
+                    "model.language_model.layers.0.linear_attn.in_proj_qkv",
+                    "model.language_model.layers.0.linear_attn.in_proj_z",
+                    "model.language_model.layers.0.linear_attn.out_proj",
+                    "model.language_model.layers.3.self_attn.q_proj",
+                    "model.language_model.layers.3.self_attn.k_proj",
+                    "model.language_model.layers.3.self_attn.v_proj",
+                    "model.language_model.layers.3.self_attn.o_proj",
+                ] {
+                    assert!(stored_weights.contains(&format!("{base}.scales")), "{base}");
+                }
+                for dense in [
+                    "model.language_model.layers.0.linear_attn.in_proj_a.scales",
+                    "model.language_model.layers.0.linear_attn.in_proj_b.scales",
+                    "model.language_model.layers.0.linear_attn.conv1d.scales",
+                    "model.language_model.layers.0.linear_attn.norm.scales",
+                ] {
+                    assert!(!stored_weights.contains(dense), "{dense} must stay dense");
+                }
+                if moe {
+                    assert!(!stored_weights
+                        .contains("model.language_model.layers.0.mlp.experts.gate_up_proj"));
+                    for base in [
+                        "model.language_model.layers.0.mlp.experts.0.gate_proj",
+                        "model.language_model.layers.0.mlp.experts.0.up_proj",
+                        "model.language_model.layers.0.mlp.experts.0.down_proj",
+                        "model.language_model.layers.0.mlp.shared_expert.gate_proj",
+                    ] {
+                        assert!(stored_weights.contains(&format!("{base}.scales")), "{base}");
+                    }
+                    assert!(
+                        !stored_weights.contains("model.language_model.layers.0.mlp.gate.scales")
+                    );
+                    assert!(!stored_weights
+                        .contains("model.language_model.layers.0.mlp.shared_expert_gate.scales"));
+                } else {
+                    assert!(stored_weights
+                        .contains("model.language_model.layers.0.mlp.gate_proj.scales"));
+                }
+
+                let ids = Array::from_slice(&[1i32, 2], &[1, 2]);
+                let expected = load_time
+                    .forward(&ids, &mut load_time.new_cache(), 0)
+                    .unwrap();
+                let actual = stored.forward(&ids, &mut stored.new_cache(), 0).unwrap();
+                expected.eval().unwrap();
+                actual.eval().unwrap();
+                let expected = expected.as_dtype(Dtype::Float32).unwrap();
+                let actual = actual.as_dtype(Dtype::Float32).unwrap();
+                let max_abs = expected
+                    .as_slice::<f32>()
+                    .iter()
+                    .zip(actual.as_slice::<f32>())
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                assert!(max_abs <= 1e-5, "stored/load-time parity max_abs={max_abs}");
+
+                std::fs::remove_dir_all(&dir).ok();
+            }
+        }
+    }
+
+    #[test]
+    fn streaming_writer_is_semantically_equivalent_and_canonical() {
+        let (tensors, config) = tiny_model();
+        let keys: Vec<_> = tensors.iter().map(|(k, _)| k.clone()).collect();
+        let source: HashMap<_, _> = tensors.into_iter().collect();
+        let a = unique_dir("stream-a");
+        let b = unique_dir("stream-b");
+        let _ = std::fs::remove_dir_all(&a);
+        let _ = std::fs::remove_dir_all(&b);
+        for out in [&a, &b] {
+            write_streaming_snapshot(
+                out,
+                &keys,
+                config.clone(),
+                &SnapshotTokenizer::default(),
+                None,
+                |key| Ok(source[key].clone()),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            std::fs::read(a.join("model.safetensors")).unwrap(),
+            std::fs::read(b.join("model.safetensors")).unwrap()
+        );
+        let loaded = Array::load_safetensors(a.join("model.safetensors")).unwrap();
+        assert_eq!(loaded.len(), source.len());
+        for (key, expected) in source {
+            let got = &loaded[&key];
+            assert_eq!(got.shape(), expected.shape());
+            assert_eq!(got.dtype(), Dtype::Bfloat16);
+            let expected = expected.as_dtype(Dtype::Bfloat16).unwrap();
+            assert_eq!(
+                got.as_slice::<half::bf16>(),
+                expected.as_slice::<half::bf16>(),
+                "{key}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(a);
+        let _ = std::fs::remove_dir_all(b);
+    }
+
+    #[test]
+    fn streaming_writer_cleans_staging_after_error() {
+        let out = unique_dir("stream-error");
+        let sibling = out.with_file_name(format!(
+            ".{}-unrelated",
+            out.file_name().unwrap().to_string_lossy()
+        ));
+        let _ = std::fs::remove_dir_all(&out);
+        std::fs::write(&sibling, b"keep").unwrap();
+        let error = write_streaming_snapshot(
+            &out,
+            &["broken".into()],
+            json!({}),
+            &SnapshotTokenizer::default(),
+            None,
+            |_| Err(Error::Msg("injected".into())),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("injected"));
+        assert!(!out.join("model.safetensors").exists());
+        assert_eq!(std::fs::read(&sibling).unwrap(), b"keep");
+        std::fs::remove_file(sibling).unwrap();
+    }
+
+    #[test]
+    fn streaming_writer_refuses_nonempty_output_without_touching_it() {
+        let out = unique_dir("stream-no-overwrite");
+        let _ = std::fs::remove_dir_all(&out);
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("sentinel"), b"keep").unwrap();
+        assert!(write_streaming_snapshot(
+            &out,
+            &[],
+            json!({}),
+            &SnapshotTokenizer::default(),
+            None,
+            |_| unreachable!()
+        )
+        .is_err());
+        assert_eq!(std::fs::read(out.join("sentinel")).unwrap(), b"keep");
+        std::fs::remove_dir_all(out).unwrap();
+    }
+
+    #[test]
+    fn stage_allocation_skips_collision_without_deleting_it() {
+        let out = unique_dir("stream-collision");
+        let parent = out.parent().unwrap();
+        let name = out.file_name().unwrap().to_string_lossy();
+        let nonce = STAGE_NONCE.load(Ordering::Relaxed);
+        let collision = parent.join(format!(".{name}.tmp-{}-{nonce}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&collision);
+        std::fs::create_dir(&collision).unwrap();
+        std::fs::write(collision.join("sentinel"), b"keep").unwrap();
+        let allocated = create_stage_dir(&out).unwrap();
+        assert_ne!(allocated, collision);
+        assert_eq!(std::fs::read(collision.join("sentinel")).unwrap(), b"keep");
+        std::fs::remove_dir_all(allocated).unwrap();
+        std::fs::remove_dir_all(collision).unwrap();
+    }
+
+    #[test]
+    fn concurrent_stage_allocations_are_unique() {
+        let out = unique_dir("stream-concurrent");
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let out = out.clone();
+                std::thread::spawn(move || create_stage_dir(&out).unwrap())
+            })
+            .collect();
+        let mut allocated: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        allocated.sort();
+        allocated.dedup();
+        assert_eq!(allocated.len(), 8);
+        for path in allocated {
+            std::fs::remove_dir_all(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn streaming_q4_q8_match_direct_quantization() {
+        let key = "model.layers.0.self_attn.q_proj.weight".to_string();
+        let data: Vec<f32> = (0..128)
+            .map(|i| ((i * 17 % 101) as f32 - 50.0) / 37.0)
+            .collect();
+        let dense = Array::from_slice(&data, &[2, 64]);
+        for spec in [QuantSpec::q4(), QuantSpec::q8()] {
+            let out = unique_dir(&format!("stream-q{}", spec.bits));
+            let _ = std::fs::remove_dir_all(&out);
+            write_streaming_snapshot(
+                &out,
+                std::slice::from_ref(&key),
+                json!({}),
+                &SnapshotTokenizer::default(),
+                Some(spec),
+                |_| Ok(dense.clone()),
+            )
+            .unwrap();
+            let loaded = Array::load_safetensors(out.join("model.safetensors")).unwrap();
+            assert_eq!(loaded[&key].dtype(), Dtype::Uint32);
+            assert_eq!(
+                loaded[&key].shape(),
+                &[2, if spec.bits == 4 { 8 } else { 16 }]
+            );
+            assert_eq!(
+                loaded["model.layers.0.self_attn.q_proj.scales"].shape(),
+                &[2, 1]
+            );
+            assert_eq!(
+                loaded["model.layers.0.self_attn.q_proj.biases"].shape(),
+                &[2, 1]
+            );
+            let direct = QuantizedLinear::quantize(
+                &dense.as_dtype(Dtype::Bfloat16).unwrap(),
+                spec.group_size,
+                spec.bits,
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                loaded[&key].as_slice::<u32>(),
+                direct.weight.as_slice::<u32>()
+            );
+            let reloaded = QuantizedLinear {
+                weight: loaded[&key].clone(),
+                scales: loaded["model.layers.0.self_attn.q_proj.scales"].clone(),
+                biases: loaded["model.layers.0.self_attn.q_proj.biases"].clone(),
+                group_size: spec.group_size,
+                bits: spec.bits,
+                bias: None,
+            };
+            let x = Array::from_slice(
+                &(0..64)
+                    .map(|i| ((i * 11 % 47) as f32 - 23.0) / 19.0)
+                    .collect::<Vec<_>>(),
+                &[1, 64],
+            );
+            assert_eq!(
+                reloaded.forward(&x).unwrap().as_slice::<f32>(),
+                direct.forward(&x).unwrap().as_slice::<f32>(),
+                "Q{} reloaded forward must equal load-time quantization",
+                spec.bits
+            );
+            let config: Value =
+                serde_json::from_str(&std::fs::read_to_string(out.join("config.json")).unwrap())
+                    .unwrap();
+            assert_eq!(config["quantization"]["bits"], spec.bits);
+            std::fs::remove_dir_all(out).unwrap();
+        }
+    }
+
+    /// Scaled synthetic RSS probe: 16 × 2048² f32 source tensors (256 MiB aggregate,
+    /// 128 MiB bf16 output). Run under `/usr/bin/time -l`; the writer must not retain the aggregate.
+    #[test]
+    #[ignore = "manual peak-RSS measurement harness"]
+    fn streaming_writer_scaled_rss_probe() {
+        let keys: Vec<_> = (0..16).map(|i| format!("probe.tensor.{i:02}")).collect();
+        let out = unique_dir("stream-rss");
+        let _ = std::fs::remove_dir_all(&out);
+        write_streaming_snapshot(
+            &out,
+            &keys,
+            json!({}),
+            &SnapshotTokenizer::default(),
+            None,
+            |_| Ok(Array::zeros::<f32>(&[2048, 2048]).unwrap()),
+        )
+        .unwrap();
+        assert!(
+            std::fs::metadata(out.join("model.safetensors"))
+                .unwrap()
+                .len()
+                > 128 * 1024 * 1024
+        );
+        let _ = std::fs::remove_dir_all(out);
+    }
+
+    #[test]
+    fn qwen35_quantization_config_is_strict_and_unambiguous() {
+        let (_, wrapper) = tiny_qwen35(false);
+        for (label, block) in [
+            ("non-object", json!("q4")),
+            ("missing field", json!({ "bits": 4 })),
+            ("unsupported bits", json!({ "group_size": 64, "bits": 3 })),
+            ("unsupported group", json!({ "group_size": 32, "bits": 4 })),
+        ] {
+            let mut bad = wrapper.clone();
+            bad["text_config"]["quantization"] = block;
+            assert!(
+                Qwen35Config::from_json(&bad).is_err(),
+                "{label} quantization block must fail"
+            );
+        }
+        let mut conflict = wrapper;
+        conflict["quantization"] = json!({ "group_size": 64, "bits": 4 });
+        conflict["text_config"]["quantization"] = json!({ "group_size": 64, "bits": 8 });
+        let err = Qwen35Config::from_json(&conflict).unwrap_err().to_string();
+        assert!(err.contains("conflicting"), "{err}");
+    }
+
+    #[test]
+    fn qwen35_rejects_mislabeled_mixed_and_corrupt_stored_quantization() {
+        for moe in [false, true] {
+            let dir = unique_dir(if moe {
+                "qwen35-corrupt-moe"
+            } else {
+                "qwen35-corrupt-dense"
+            });
+            let (dense_tensors, dense_json) = tiny_qwen35(moe);
+            let dense_weights = Weights::from_map(dense_tensors.iter().cloned().collect());
+
+            let mut mislabeled_json = dense_json.clone();
+            let q4 = json!({ "group_size": 64, "bits": 4 });
+            mislabeled_json["quantization"] = q4.clone();
+            mislabeled_json["text_config"]["quantization"] = q4;
+            let mislabeled_cfg = Qwen35Config::from_json(&mislabeled_json).unwrap();
+            let err = qwen35_load_error(
+                Qwen35Model::from_weights_with(
+                    &dense_weights,
+                    "model.language_model",
+                    mislabeled_cfg,
+                    None,
+                ),
+                "mislabeled dense snapshot must fail",
+            )
+            .to_string();
+            assert!(
+                err.contains("incomplete"),
+                "dense snapshot must not be mislabeled: {err}"
+            );
+
+            write_snapshot(
+                &dir,
+                dense_tensors,
+                dense_json.clone(),
+                &SnapshotTokenizer::default(),
+                Some(QuantSpec::q4()),
+            )
+            .unwrap();
+            let stored_json: Value =
+                serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap())
+                    .unwrap();
+            let stored_cfg = Qwen35Config::from_json(&stored_json).unwrap();
+            let packed = Weights::from_dir(&dir).unwrap().into_map();
+            let base = if moe {
+                "model.language_model.layers.0.mlp.experts.0.gate_proj"
+            } else {
+                "model.language_model.layers.0.mlp.gate_proj"
+            };
+
+            let no_config = Qwen35Config::from_json(&dense_json).unwrap();
+            let err = qwen35_load_error(
+                Qwen35Model::from_weights_with(
+                    &Weights::from_map(packed.clone()),
+                    "model.language_model",
+                    no_config,
+                    None,
+                ),
+                "packed parts without config must fail",
+            )
+            .to_string();
+            assert!(err.contains("no `quantization` block"), "{err}");
+
+            let err = qwen35_load_error(
+                Qwen35Model::from_weights_with(
+                    &Weights::from_map(packed.clone()),
+                    "model.language_model",
+                    stored_cfg.clone(),
+                    Some(QuantSpec::q4()),
+                ),
+                "stored and load-time quantization must conflict",
+            )
+            .to_string();
+            assert!(err.contains("cannot combine"), "{err}");
+
+            for missing in ["scales", "biases"] {
+                let mut corrupt = packed.clone();
+                corrupt.remove(&format!("{base}.{missing}"));
+                let err = qwen35_load_error(
+                    Qwen35Model::from_weights_with(
+                        &Weights::from_map(corrupt),
+                        "model.language_model",
+                        stored_cfg.clone(),
+                        None,
+                    ),
+                    "incomplete packed projection must fail",
+                )
+                .to_string();
+                assert!(err.contains("incomplete") && err.contains(missing), "{err}");
+            }
+
+            let mut corrupt_shape = packed;
+            corrupt_shape.insert(
+                format!("{base}.scales"),
+                Array::zeros::<f32>(&[1, 1]).unwrap(),
+            );
+            let err = qwen35_load_error(
+                Qwen35Model::from_weights_with(
+                    &Weights::from_map(corrupt_shape),
+                    "model.language_model",
+                    stored_cfg,
+                    None,
+                ),
+                "invalid packed shapes must fail",
+            )
+            .to_string();
+            assert!(err.contains("invalid part shapes"), "{err}");
+
+            std::fs::remove_dir_all(&dir).ok();
         }
     }
 
@@ -524,11 +1310,8 @@ mod tests {
         let v = Array::zeros::<f32>(&[64]).unwrap(); // 1-D vector
         let stacked = Array::zeros::<f32>(&[4, 128, 64]).unwrap(); // stacked experts
         for (k, a) in [
-            ("model.layers.0.linear_attn.in_proj_qkv.weight", &m),
-            ("model.layers.0.linear_attn.out_proj.weight", &m),
-            ("model.layers.0.mlp.experts.gate_up_proj", &stacked), // Qwen3.5-MoE stacked
-            ("model.layers.0.self_attn.w_qkv.weight", &m),         // unknown layout
-            ("model.layers.0.mlp.experts.w1.weight", &stacked),    // future stacked-expert layout
+            ("model.layers.0.self_attn.w_qkv.weight", &m), // unknown layout
+            ("model.layers.0.mlp.experts.w1.weight", &stacked), // future stacked-expert layout
         ] {
             assert!(is_unrecognized_projection(k, a), "{k} must be refused");
         }
@@ -883,35 +1666,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// The Qwen3.5/3.6 hybrid linear-attention family is refused loudly (its loader has no
-    /// pre-quantized snapshot branch), and nothing is written.
-    #[test]
-    fn quantize_refuses_qwen35_hybrid() {
-        let dir = unique_dir("refuse-qwen35");
-        std::fs::remove_dir_all(&dir).ok();
-        let t = vec![(
-            "model.embed_tokens.weight".to_string(),
-            Array::zeros::<f32>(&[4, 64]).unwrap(),
-        )];
-        let config = json!({ "model_type": "qwen3_5" });
-        match write_snapshot(
-            &dir,
-            t,
-            config,
-            &SnapshotTokenizer::default(),
-            Some(QuantSpec::q4()),
-        ) {
-            Err(Error::Unsupported(msg)) => {
-                assert!(
-                    msg.contains("linear-attention"),
-                    "message names the family: {msg}"
-                );
-            }
-            other => panic!("expected Unsupported, got {other:?}"),
-        }
-        assert!(!dir.exists(), "a refused quantize must write nothing");
-    }
-
     /// Projection-like keys the writer does not cover abort the write (loud refusal, never a silent
     /// mixed-tier snapshot). Dense writes of the same set still pass through fine.
     #[test]
@@ -925,7 +1679,7 @@ mod tests {
                     randn(&[64, 64], &mut SplitMix64::new(2)),
                 ),
                 (
-                    "model.layers.0.linear_attn.in_proj_qkv.weight".to_string(),
+                    "model.layers.0.linear_attn.unknown_proj.weight".to_string(),
                     randn(&[128, 64], &mut SplitMix64::new(3)),
                 ),
             ]
@@ -940,7 +1694,7 @@ mod tests {
         ) {
             Err(Error::Unsupported(msg)) => {
                 assert!(
-                    msg.contains("model.layers.0.linear_attn.in_proj_qkv.weight"),
+                    msg.contains("model.layers.0.linear_attn.unknown_proj.weight"),
                     "message lists the uncovered key: {msg}"
                 );
             }

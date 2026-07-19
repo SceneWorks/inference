@@ -1155,7 +1155,7 @@ pub fn decode_to_frames(
                                          // [-1,1] → [0,255] uint8
     let scaled = multiply(&add(&chw, scalar(1.0))?, scalar(127.5))?;
     let clamped = minimum(&maximum(&scaled, scalar(0.0))?, scalar(255.0))?;
-    Ok(clamped.as_dtype(mlx_rs::Dtype::Uint8)?)
+    Ok(mlx_rs::ops::round(&clamped, None)?.as_dtype(mlx_rs::Dtype::Uint8)?)
 }
 
 /// Decode denoised z48 latents `[C, F, H, W]` → an RGB video tensor `[F_out, H_out, W_out, 3]` of
@@ -1183,7 +1183,7 @@ pub fn decode_to_frames_22(
     let frames = video.reshape(&[f, h, w, 3])?;
     let scaled = multiply(&add(&frames, scalar(1.0))?, scalar(127.5))?;
     let clamped = minimum(&maximum(&scaled, scalar(0.0))?, scalar(255.0))?;
-    Ok(clamped.as_dtype(mlx_rs::Dtype::Uint8)?)
+    Ok(mlx_rs::ops::round(&clamped, None)?.as_dtype(mlx_rs::Dtype::Uint8)?)
 }
 
 /// Split a `[F, H, W, 3]` `uint8` video tensor (the [`decode_to_frames`] output) into one

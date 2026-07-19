@@ -55,6 +55,26 @@ const IP_DEFAULT_SCALE: f32 = 0.6;
 /// explicit `Some(x)`, including `Some(0.0)` for an inert branch, overrides it.
 const DEFAULT_CONTROLNET_SCALE: f32 = 1.0;
 
+/// Resolve an img2img-style strength, preserving the existing default-and-clamp semantics.
+fn resolve_strength(requested: Option<f32>, default: f32) -> f32 {
+    requested.unwrap_or(default).clamp(0.0, 1.0)
+}
+
+/// Resolve the ancestral schedule window for an img2img or inpaint run.
+fn ancestral_strength_schedule(steps: usize, max_time: f32, strength: f32) -> (usize, f32) {
+    ((steps as f32 * strength) as usize, max_time * strength)
+}
+
+/// Select the strength tail of a curated sigma schedule.
+fn curated_strength_schedule(full_sigmas: &[f32], steps: usize, strength: f32) -> Vec<f32> {
+    let effective_steps = (steps as f32 * strength) as usize;
+    let run_start = full_sigmas
+        .len()
+        .saturating_sub(1)
+        .saturating_sub(effective_steps);
+    full_sigmas[run_start..].to_vec()
+}
+
 /// The SDXL compute dtype: the U-Net + both CLIP text encoders run **fp16** (the production
 /// reference `StableDiffusionXL(float16=True)`); the VAE loads f32 inside its own loader. Shared by
 /// the eager (`Resident`) load and the per-generation (`Sequential`) component loaders so both build
@@ -732,23 +752,21 @@ impl Sdxl {
                     .unwrap_or(Scheduler::Normal);
                 let full_sigmas = schedule_sigmas(sched, &ms, steps);
                 if init_latents.is_some() {
-                    let strength = reference
-                        .and_then(|(_, s)| s)
-                        .unwrap_or(DEFAULT_STRENGTH)
-                        .clamp(0.0, 1.0);
-                    let eff = (steps as f32 * strength) as usize;
-                    let run_start = full_sigmas.len().saturating_sub(1).saturating_sub(eff);
-                    full_sigmas[run_start..].to_vec()
+                    let strength = resolve_strength(
+                        reference.and_then(|(_, strength)| strength),
+                        DEFAULT_STRENGTH,
+                    );
+                    curated_strength_schedule(&full_sigmas, steps, strength)
                 } else {
                     full_sigmas
                 }
             } else {
                 let (eff, start_time) = if init_latents.is_some() {
-                    let strength = reference
-                        .and_then(|(_, s)| s)
-                        .unwrap_or(DEFAULT_STRENGTH)
-                        .clamp(0.0, 1.0);
-                    ((steps as f32 * strength) as usize, max_time * strength)
+                    let strength = resolve_strength(
+                        reference.and_then(|(_, strength)| strength),
+                        DEFAULT_STRENGTH,
+                    );
+                    ancestral_strength_schedule(steps, max_time, strength)
                 } else {
                     (steps, max_time)
                 };
@@ -794,13 +812,11 @@ impl Sdxl {
                 // schedule, seeded `x₀ + ε·σ_start` (diffusers EulerDiscrete add_noise). A strength that
                 // rounds to 0 effective steps leaves the schedule at `[0.0]` → the init is returned.
                 let (run_sigmas, init) = if let Some(x_0) = &init_latents {
-                    let strength = reference
-                        .and_then(|(_, s)| s)
-                        .unwrap_or(DEFAULT_STRENGTH)
-                        .clamp(0.0, 1.0);
-                    let eff = (steps as f32 * strength) as usize;
-                    let run_start = full_sigmas.len().saturating_sub(1).saturating_sub(eff);
-                    let rs = full_sigmas[run_start..].to_vec();
+                    let strength = resolve_strength(
+                        reference.and_then(|(_, strength)| strength),
+                        DEFAULT_STRENGTH,
+                    );
+                    let rs = curated_strength_schedule(&full_sigmas, steps, strength);
                     let init = add(x_0, &multiply(&noise, scalar(rs[0]))?)?;
                     (rs, init)
                 } else {
@@ -888,14 +904,14 @@ impl Sdxl {
                 // Masked inpaint (sc-3057): same ancestral img2img start, but keep the FIXED prior
                 // noise so the per-step blend can pin the black (keep) region to the init noised to
                 // each step's σ. Default strength 0.85 (the worker's inpaint default).
-                let strength = reference
-                    .and_then(|(_, s)| s)
-                    .unwrap_or(INPAINT_DEFAULT_STRENGTH)
-                    .clamp(0.0, 1.0);
-                let start_step = max_time * strength;
+                let strength = resolve_strength(
+                    reference.and_then(|(_, strength)| strength),
+                    INPAINT_DEFAULT_STRENGTH,
+                );
+                let (eff, start_step) =
+                    ancestral_strength_schedule(steps, max_time, strength);
                 let noise = mlx_rs::random::normal::<f32>(&latent_shape, None, None, None)?;
                 let x_t = self.sampler.add_noise_with(x_0, &noise, start_step)?;
-                let eff = (steps as f32 * strength) as usize;
                 // The kept region is noised to each step's "next" time `t_prev` (schedule[i].1).
                 let t_prev: Vec<f32> = self
                     .sampler
@@ -920,13 +936,13 @@ impl Sdxl {
                 // `max_time·strength`, run `int(steps·strength)` steps — NO min-1 floor (strength ≤
                 // 1/steps ⇒ 0 steps ⇒ init returned unchanged, dodging the σ=0 ancestral `σ_up` 0/0
                 // → NaN).
-                let strength = reference
-                    .and_then(|(_, s)| s)
-                    .unwrap_or(DEFAULT_STRENGTH)
-                    .clamp(0.0, 1.0);
-                let start_step = max_time * strength;
+                let strength = resolve_strength(
+                    reference.and_then(|(_, strength)| strength),
+                    DEFAULT_STRENGTH,
+                );
+                let (eff, start_step) =
+                    ancestral_strength_schedule(steps, max_time, strength);
                 let x_t = self.sampler.add_noise(x_0, start_step)?;
-                let eff = (steps as f32 * strength) as usize;
                 // PiD from_ldm early-stop (sc-8049): truncate to the VP-capture `keep` steps; the stored
                 // ancestral latent is already the VP frame, so it is handed to PiD as-is. Clean path
                 // (`vp_plan = None`) keeps the full schedule.
@@ -1170,6 +1186,53 @@ mlx_gen::register_generators! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strength_resolution_preserves_defaults_explicit_values_and_clamping() {
+        for (requested, default) in [
+            (None, DEFAULT_STRENGTH),
+            (None, INPAINT_DEFAULT_STRENGTH),
+            (Some(0.0), DEFAULT_STRENGTH),
+            (Some(0.37), DEFAULT_STRENGTH),
+            (Some(1.0), DEFAULT_STRENGTH),
+            (Some(-0.25), DEFAULT_STRENGTH),
+            (Some(1.25), INPAINT_DEFAULT_STRENGTH),
+        ] {
+            let previous = requested.unwrap_or(default).clamp(0.0, 1.0);
+            assert_eq!(resolve_strength(requested, default), previous);
+        }
+    }
+
+    #[test]
+    fn ancestral_strength_schedule_matches_previous_formula() {
+        let steps = 30;
+        let max_time = 999.0;
+        for strength in [0.0, 0.01, 0.6, DEFAULT_STRENGTH, 0.85, 1.0] {
+            let previous = ((steps as f32 * strength) as usize, max_time * strength);
+            assert_eq!(
+                ancestral_strength_schedule(steps, max_time, strength),
+                previous
+            );
+        }
+    }
+
+    #[test]
+    fn curated_strength_schedule_matches_previous_tail_selection() {
+        let full_sigmas = vec![14.0, 8.0, 4.0, 2.0, 1.0, 0.0];
+        let steps = 5;
+        for strength in [0.0, 0.01, 0.2, 0.6, DEFAULT_STRENGTH, 1.0] {
+            let effective_steps = (steps as f32 * strength) as usize;
+            let run_start = full_sigmas
+                .len()
+                .saturating_sub(1)
+                .saturating_sub(effective_steps);
+            let previous = full_sigmas[run_start..].to_vec();
+            assert_eq!(
+                curated_strength_schedule(&full_sigmas, steps, strength),
+                previous
+            );
+        }
+    }
 
     #[test]
     fn descriptor_is_sdxl() {

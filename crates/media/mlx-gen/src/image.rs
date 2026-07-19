@@ -95,6 +95,18 @@ pub fn validate_multiple_of(width: u32, height: u32, multiple: u32, family: &str
 mod tests {
     use super::*;
 
+    #[test]
+    fn decoded_rgb8_policy_rounds_midpoints_to_even() {
+        // Pin native MLX/PyTorch midpoint semantics directly. A cast without round would truncate.
+        let scaled = Array::from_slice(&[0.5f32, 1.5, 2.5, 3.5, 254.5], &[5]);
+        let rounded = mlx_rs::ops::round(&scaled, 0).unwrap();
+        assert_eq!(rounded.as_slice::<f32>(), &[0.0, 2.0, 2.0, 4.0, 254.0]);
+
+        // Zero decoded is the exact midpoint in `(x + 1) * 127.5`: it maps to 128, not 127.
+        let image = decoded_to_image(&Array::from_slice(&[0.0f32; 3], &[1, 3, 1, 1])).unwrap();
+        assert_eq!(image.pixels, [128, 128, 128]);
+    }
+
     /// `validate_multiple_of` must enforce the `multiple` it is PASSED, not a hardcoded literal
     /// (sc-12701). The discriminating case is 496×480: a multiple of 16 but not of 32 — it must be
     /// accepted at `multiple = 16` and rejected at `multiple = 32`. A regression that ignored the

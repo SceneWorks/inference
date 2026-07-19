@@ -20,11 +20,13 @@
 //!   output (one token per merged 2×2 block) is what the decoder consumes.
 //!
 //! Attention is per **frame** (`grid_t × grid_h·grid_w` patches): a single image is one fully
-//! bidirectional block; multiple images/frames get a block-diagonal mask from `vision_cu_seqlens`.
+//! bidirectional block; multiple images/frames are sliced at `vision_cu_seqlens` and attended
+//! independently, then concatenated in their original order.
 //! Compute follows the SigLIP path — runs in the loaded weights' dtype against the f32 patches, which
 //! MLX promotes to f32.
 
-use mlx_rs::ops::{add, multiply, split, sum_axis};
+use mlx_rs::ops::indexing::TryIndexOp;
+use mlx_rs::ops::{add, concatenate_axis, multiply, split, sum_axis};
 use mlx_rs::Array;
 
 use crate::error::{Error, Result};
@@ -37,10 +39,6 @@ use crate::primitives::Weights;
 const LN_EPS: f32 = 1e-6;
 /// Vision rotary base — fixed in the reference (`Qwen3_5VisionRotaryEmbedding(theta=10000.0)`).
 const ROPE_THETA: f32 = 10000.0;
-/// Disallowed-attention fill for the block-diagonal mask (a large finite negative; matches the
-/// attention primitive's convention — avoids `-inf` through the softmax).
-const MASK_NEG: f32 = -1e30;
-
 /// Geometry of the Qwen3.6 vision tower (`vision_config`).
 #[derive(Clone, Debug)]
 pub struct Qwen35VisionConfig {
@@ -150,10 +148,13 @@ impl VisionBlock {
         sin: &Array,
         num_heads: i32,
         head_dim: i32,
-        mask: AttnMask<'_>,
+        cu_seqlens: &[i32],
     ) -> Result<Array> {
         let y = layer_norm(x, Some(&self.n1_w), Some(&self.n1_b), LN_EPS)?;
-        let x = add(x, &self.attn(&y, cos, sin, num_heads, head_dim, mask)?)?;
+        let x = add(
+            x,
+            &self.attn(&y, cos, sin, num_heads, head_dim, cu_seqlens)?,
+        )?;
         let y = layer_norm(&x, Some(&self.n2_w), Some(&self.n2_b), LN_EPS)?;
         Ok(add(&x, &self.mlp(&y)?)?)
     }
@@ -165,7 +166,7 @@ impl VisionBlock {
         sin: &Array,
         num_heads: i32,
         head_dim: i32,
-        mask: AttnMask<'_>,
+        cu_seqlens: &[i32],
     ) -> Result<Array> {
         let n = x.shape()[0];
         let hidden = num_heads * head_dim;
@@ -192,7 +193,7 @@ impl VisionBlock {
         let k = k.transpose_axes(&[0, 2, 1, 3])?;
         let v = v.transpose_axes(&[0, 2, 1, 3])?;
         let scale = (head_dim as f32).powf(-0.5);
-        let out = sdpa(&q, &k, &v, scale, mask)?;
+        let out = vision_sdpa(&q, &k, &v, scale, cu_seqlens)?;
         let out = out.transpose_axes(&[0, 2, 1, 3])?.reshape(&[n, hidden])?;
         linear(&out, &self.proj_w, self.proj_b.as_ref())
     }
@@ -347,15 +348,10 @@ impl Qwen35VisionModel {
         let pos_ids = vision_position_ids(grid_thw, merge);
         let (cos, sin) = vision_rotary(&pos_ids, head_dim, ROPE_THETA)?;
         let cu = vision_cu_seqlens(grid_thw);
-        let mask_arr = block_diag_mask(&cu, n);
-        let mask = match &mask_arr {
-            Some(a) => AttnMask::Additive(a),
-            None => AttnMask::None,
-        };
 
         let mut deepstack_features = Vec::with_capacity(self.deepstack_mergers.len());
         for (layer_num, blk) in self.blocks.iter().enumerate() {
-            hs = blk.forward(&hs, &cos, &sin, cfg.num_heads, head_dim, mask)?;
+            hs = blk.forward(&hs, &cos, &sin, cfg.num_heads, head_dim, &cu)?;
             if let Some(tap) = cfg
                 .deepstack_visual_indexes
                 .iter()
@@ -545,28 +541,24 @@ fn vision_rotary(pos_ids: &[(i32, i32)], head_dim: i32, theta: f32) -> Result<(A
     ))
 }
 
-/// Block-diagonal additive attention mask `[1, 1, n, n]` from per-frame `cu_seqlens` — `0` within a
-/// frame, [`MASK_NEG`] across frames. `None` when there is a single frame (fully bidirectional, the
-/// fast unmasked path).
-fn block_diag_mask(cu: &[i32], n: i32) -> Option<Array> {
+/// Run bidirectional attention independently for each frame. The single-frame path remains one
+/// direct, maskless SDPA call. Multi-frame Q/K/V are range-sliced views, so auxiliary storage is
+/// linear in the number of frames rather than a dense `n × n` host mask.
+fn vision_sdpa(q: &Array, k: &Array, v: &Array, scale: f32, cu: &[i32]) -> Result<Array> {
     if cu.len() <= 2 {
-        return None;
+        return sdpa(q, k, v, scale, AttnMask::None);
     }
-    let mut block_of = vec![0usize; n as usize];
-    for b in 0..cu.len() - 1 {
-        for j in cu[b]..cu[b + 1] {
-            block_of[j as usize] = b;
-        }
+
+    let mut outputs = Vec::with_capacity(cu.len() - 1);
+    for frame in cu.windows(2) {
+        let (start, end) = (frame[0], frame[1]);
+        let q_frame = q.try_index((.., .., start..end, ..))?;
+        let k_frame = k.try_index((.., .., start..end, ..))?;
+        let v_frame = v.try_index((.., .., start..end, ..))?;
+        outputs.push(sdpa(&q_frame, &k_frame, &v_frame, scale, AttnMask::None)?);
     }
-    let mut data = vec![0f32; (n * n) as usize];
-    for i in 0..n as usize {
-        for j in 0..n as usize {
-            if block_of[i] != block_of[j] {
-                data[i * n as usize + j] = MASK_NEG;
-            }
-        }
-    }
-    Some(Array::from_slice(&data, &[1, 1, n, n]))
+    let refs: Vec<&Array> = outputs.iter().collect();
+    Ok(concatenate_axis(&refs, 2)?)
 }
 
 /// Join a weight-key `prefix` and `leaf` with `.` (no leading dot when empty).
@@ -661,6 +653,71 @@ mod tests {
             md < 1e-6,
             "bilinear weights vs reference: max abs diff {md}"
         );
+    }
+
+    #[test]
+    fn per_frame_sdpa_matches_dense_block_diagonal_reference() {
+        const NEG: f32 = -1e30;
+        let (heads, n, dim) = (2, 7, 4);
+        let values: Vec<f32> = (0..heads * n * dim)
+            .map(|i| ((i as f32) * 0.17).sin())
+            .collect();
+        let q = Array::from_slice(&values, &[1, heads, n, dim]);
+        let k = Array::from_slice(
+            &values.iter().map(|x| x * 0.7 + 0.1).collect::<Vec<_>>(),
+            &[1, heads, n, dim],
+        );
+        let v = Array::from_slice(
+            &values.iter().map(|x| x * -0.4 + 0.2).collect::<Vec<_>>(),
+            &[1, heads, n, dim],
+        );
+        let cu = [0, 2, 5, 7];
+        let mut dense = vec![0.0f32; (n * n) as usize];
+        for i in 0..n {
+            for j in 0..n {
+                let same_frame = cu
+                    .windows(2)
+                    .any(|frame| i >= frame[0] && i < frame[1] && j >= frame[0] && j < frame[1]);
+                if !same_frame {
+                    dense[(i * n + j) as usize] = NEG;
+                }
+            }
+        }
+        let mask = Array::from_slice(&dense, &[1, 1, n, n]);
+        let scale = (dim as f32).powf(-0.5);
+
+        let segmented = vision_sdpa(&q, &k, &v, scale, &cu).unwrap();
+        let reference = sdpa(&q, &k, &v, scale, AttnMask::Additive(&mask)).unwrap();
+        let got = segmented.as_slice::<f32>();
+        let expected = reference.as_slice::<f32>();
+        let (rel, max_abs, _) = max_rel(got, expected);
+        assert!(
+            rel < 2e-3,
+            "per-frame SDPA differs from dense block-diagonal reference: rel={rel}, max_abs={max_abs}"
+        );
+    }
+
+    #[test]
+    fn multi_frame_attention_has_no_quadratic_mask_allocation() {
+        // A 64-frame 32×32 video has 65,536 patches; its former f32 mask would require 16 GiB.
+        // cu_seqlens stays one boundary per frame, and the production attention body is pinned to
+        // range views + concatenation with no host Array construction.
+        let cu = vision_cu_seqlens(&[[64, 32, 32]]);
+        assert_eq!(cu.len(), 65);
+        assert_eq!(cu.last(), Some(&65_536));
+
+        let source = include_str!("qwen35_vision.rs");
+        let body = source
+            .split("fn vision_sdpa(")
+            .nth(1)
+            .unwrap()
+            .split("/// Join a weight-key")
+            .next()
+            .unwrap();
+        assert!(body.contains("try_index"));
+        assert!(body.contains("concatenate_axis"));
+        assert!(!body.contains("Array::from_slice"));
+        assert!(!body.contains("n * n"));
     }
 
     /// End-to-end encoder vs the reference `Qwen3_5VisionModel.forward` (patch embed → bilinear pos

@@ -22,6 +22,67 @@ environment = ["MLX_LLM_QWEN3_MODEL", "CANDLE_LLM_QWEN3_MODEL"]
 expected_files = ["config.json", "tokenizer.json", "model.safetensors"]
 
 [[models]]
+# Full SigLIP2 + projector + Llama-3.1 8B JoyCaption VLM. The MLX real-weight gate prepares this
+# dense source into a Q4 text-stack snapshot while retaining the vision tower/projector dense.
+key = "joycaption-beta-one"
+repository = "fancyfeast/llama-joycaption-beta-one-hf-llava"
+revision = "ebf414ea497a020da0f82df3913e5b6cb8e9663a"
+license = "Llama 3.1 Community License"
+size_class = "very-large"
+profiles = ["llm-macos"]
+environment = ["MLX_LLM_JOYCAPTION_SNAPSHOT"]
+expected_files = [
+    "config.json",
+    "tokenizer.json",
+    "model.safetensors.index.json",
+    "model-00001-of-00004.safetensors",
+    "model-00002-of-00004.safetensors",
+    "model-00003-of-00004.safetensors",
+    "model-00004-of-00004.safetensors",
+]
+
+[[models]]
+key = "qwen-image"
+repository = "Qwen/Qwen-Image"
+revision = "75e0b4be04f60ec59a75f475837eced720f823b6"
+license = "Apache-2.0"
+size_class = "very-large"
+profiles = ["media-cuda-residency-ab"]
+environment = ["QWEN_IMAGE_SNAPSHOT"]
+expected_files = [
+    "model_index.json",
+    "tokenizer/tokenizer.json",
+    "text_encoder/config.json",
+    "text_encoder/model.safetensors.index.json",
+    "transformer/config.json",
+    "transformer/diffusion_pytorch_model.safetensors.index.json",
+    "vae/config.json",
+    "vae/diffusion_pytorch_model.safetensors",
+]
+
+[[models]]
+key = "flux-1-dev"
+repository = "black-forest-labs/FLUX.1-dev"
+revision = "3de623fc3c33e44ffbe2bad470d0f45bccf2eb21"
+license = "FLUX-1-dev Non-Commercial License"
+size_class = "very-large"
+profiles = ["media-cuda-residency-ab"]
+environment = ["FLUX_DEV_DIR"]
+expected_files = [
+    "model_index.json",
+    "tokenizer/vocab.json",
+    "tokenizer_2/tokenizer.json",
+    "text_encoder/config.json",
+    "text_encoder/model.safetensors",
+    "text_encoder_2/config.json",
+    "text_encoder_2/model.safetensors.index.json",
+    "transformer/config.json",
+    "transformer/diffusion_pytorch_model.safetensors.index.json",
+    "vae/config.json",
+    "vae/diffusion_pytorch_model.safetensors",
+]
+
+[[models]]
 key = "z-image-turbo"
 repository = "Tongyi-MAI/Z-Image-Turbo"
 revision = "f332072aa78be7aecdf3ee76d5c247082da564a6"

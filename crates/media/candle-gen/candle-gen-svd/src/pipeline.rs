@@ -4,7 +4,7 @@
 //! candle port of `mlx-gen-svd`'s `pipeline.rs`. Latents are `[1, F, 4, h, w]` (B=1; CFG doubles to
 //! B=2 inside the step). Deterministic CPU-seeded noise (sc-3673 convention, matching candle-gen-wan).
 
-use candle_gen::candle_core::{DType, Device, Tensor};
+use candle_gen::candle_core::{Device, Tensor};
 use candle_gen::gen_core::sampling::EdmModelSampling;
 use candle_gen::gen_core::{CancelFlag, Image, Progress};
 use candle_gen::{CandleError, Result as CResult};
@@ -233,9 +233,8 @@ pub fn decode(vae: &SvdVae, latents: &Tensor, num_frames: usize, chunk: usize) -
 
 /// Decoded frames `[1, F, 3, H, W]` (roughly `[-1, 1]`) → `Vec<Image>` (`clip(x·0.5+0.5)·255`).
 pub fn frames_to_images(decoded: &Tensor) -> CResult<Vec<Image>> {
-    let u8s = ((decoded.clamp(-1f32, 1f32)? + 1.0)? * 127.5)?
-        .to_dtype(DType::U8)?
-        .to_device(&Device::Cpu)?;
+    let scaled = ((decoded.clamp(-1f32, 1f32)? + 1.0)? * 127.5)?;
+    let u8s = candle_gen::round_rgb8(&scaled)?.to_device(&Device::Cpu)?;
     let (_b, f, c, h, w) = u8s.dims5()?;
     debug_assert_eq!(c, 3);
     let frames = u8s.squeeze(0)?; // [F, 3, H, W]
