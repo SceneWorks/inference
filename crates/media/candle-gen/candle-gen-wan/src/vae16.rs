@@ -28,12 +28,17 @@ use std::sync::Mutex;
 
 use candle_gen::candle_core::{DType, Result, Tensor};
 use candle_gen::candle_nn::VarBuilder;
+use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::tiling::{SpatialTiling, TileCandidates, TilingConfig, VaeTiling};
 use candle_gen::vae_tiling;
+use candle_gen::Result as CResult;
 
 use crate::config::{Vae16Config, LATENTS16_MEAN, LATENTS16_STD};
 use crate::conv3d::{chunked_conv2d, CausalConv3d, Ctx};
-use crate::vae::{causal, ChanNorm, Conv2dW, MidAttn, Resnet, Upsampler};
+use crate::vae::{
+    candle_error, causal, preflight_streaming_decode, run_streaming_chunks, ChanNorm, Conv2dW,
+    MidAttn, Resnet, Upsampler,
+};
 
 /// One z16 decoder up-stage: residual blocks then an optional spatial/temporal upsampler (no `Dup`
 /// residual — the z16 VAE is non-residual).
@@ -433,21 +438,30 @@ impl WanVae16 {
     /// to ~one frame's activations — the 14B's heavier clips would otherwise OOM the
     /// VAE-decode stage exactly as the 5B did.
     pub fn decode(&self, z: &Tensor) -> Result<Tensor> {
+        self.decode_with_cancel(z, &CancelFlag::default())
+            .map_err(candle_error)
+    }
+
+    /// Cancellable streaming decode. The flag is checked before every latent-frame decoder pass.
+    pub fn decode_with_cancel(&self, z: &Tensor, cancel: &CancelFlag) -> CResult<Tensor> {
+        preflight_streaming_decode(cancel, || self.reset_caches())?;
         let z = self.unnormalize(z)?;
         let t_lat = z.dim(2)?;
-        self.reset_caches();
         // Collect the per-frame decoded chunks and `cat` once (sc-9037): cat-ing onto a growing
         // accumulator each iteration re-copies every prior frame → O(T²) copy traffic and briefly
         // holds old+new. A single `Tensor::cat` at the end is O(T) and equivalent (same frames, same
         // order along the temporal axis).
-        let mut chunks: Vec<Tensor> = Vec::with_capacity(t_lat);
-        for i in 0..t_lat {
-            let zi = z.narrow(2, i, 1)?.contiguous()?;
-            chunks.push(self.decode_inner(&zi, &Ctx::streaming(i == 0))?);
-        }
-        self.reset_caches();
+        let chunks = run_streaming_chunks(
+            t_lat,
+            cancel,
+            |i| {
+                let zi = z.narrow(2, i, 1)?.contiguous()?;
+                Ok(self.decode_inner(&zi, &Ctx::streaming(i == 0))?)
+            },
+            || self.reset_caches(),
+        )?;
         assert!(!chunks.is_empty(), "decode needs >= 1 latent frame");
-        Tensor::cat(&chunks, 2)?.clamp(-1f32, 1f32)
+        Ok(Tensor::cat(&chunks, 2)?.clamp(-1f32, 1f32)?)
     }
 
     /// Decode with **spatial tiling** for the memory-bounded A14B decode (sc-12758) — the z16 twin of the
@@ -467,6 +481,16 @@ impl WanVae16 {
     /// not bit-exact) — exactly the z48 tradeoff. Falls back to a single streaming `decode` when `cfg`
     /// does not fire for these dims. `cfg` is expected to carry **spatial** tiling only.
     pub fn decode_tiled(&self, z: &Tensor, cfg: &TilingConfig) -> Result<Tensor> {
+        self.decode_tiled_with_cancel(z, cfg, &CancelFlag::default())
+            .map_err(candle_error)
+    }
+
+    pub fn decode_tiled_with_cancel(
+        &self,
+        z: &Tensor,
+        cfg: &TilingConfig,
+        cancel: &CancelFlag,
+    ) -> CResult<Tensor> {
         // The tile/narrow/blend/slice-accumulate/normalize DRIVER is the shared
         // `candle_gen::vae_tiling::decode_tiled`; what stays z16-specific is the `WAN_Z16` geometry and
         // the per-frame-streaming `decode` closure. With a spatial-only `cfg`, `plan.t` is a single
@@ -478,7 +502,9 @@ impl WanVae16 {
         // accumulator is small vs. the per-tile activations, so f32 there costs little and keeps the
         // stitch precise). A no-op cast on the f32 path.
         vae_tiling::decode_tiled(WAN_Z16, "wan z16 vae", z, cfg, |tile| {
-            self.decode(tile)?.to_dtype(DType::F32)
+            Ok(self
+                .decode_with_cancel(tile, cancel)?
+                .to_dtype(DType::F32)?)
         })
     }
 
@@ -493,13 +519,18 @@ impl WanVae16 {
     /// OOM-ing the worker. The z16 analogue of the z48
     /// [`WanVae::decode_budgeted`](crate::vae::WanVae::decode_budgeted).
     pub fn decode_budgeted(&self, z: &Tensor) -> Result<Tensor> {
+        self.decode_budgeted_with_cancel(z, &CancelFlag::default())
+            .map_err(candle_error)
+    }
+
+    pub fn decode_budgeted_with_cancel(&self, z: &Tensor, cancel: &CancelFlag) -> CResult<Tensor> {
         let (_b, _c, f, h, w) = z.dims5()?;
         let out_f = 1 + (f as i32 - 1) * WAN_Z16.temporal_scale; // causal ×4
         let out_h = h as i32 * WAN_Z16.spatial_scale; // ×8
         let out_w = w as i32 * WAN_Z16.spatial_scale;
         match auto_tiling_budgeted_wan_z16(out_h, out_w, out_f)? {
-            Some(cfg) => self.decode_tiled(z, &cfg),
-            None => self.decode(z),
+            Some(cfg) => self.decode_tiled_with_cancel(z, &cfg, cancel),
+            None => self.decode_with_cancel(z, cancel),
         }
     }
 

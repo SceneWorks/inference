@@ -387,13 +387,7 @@ impl Scail2 {
         };
         let comps = self.components()?;
         let te_cfg = TextEncoderConfig::umt5_xxl();
-        crate::generate::generate(
-            &comps,
-            &te_cfg,
-            &job,
-            &|| req.cancel.is_cancelled(),
-            on_progress,
-        )
+        crate::generate::generate(&comps, &te_cfg, &job, &req.cancel, on_progress)
     }
 }
 

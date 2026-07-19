@@ -1012,7 +1012,7 @@ impl Bernini {
 
         // --- Stage 4: z16 VAE decode → image / video ---
         on_progress(Progress::Decoding);
-        let decoded = vae.decode(&latents)?;
+        let decoded = vae.decode_with_cancel(&latents, &req.cancel)?;
         let images_out = frames_to_images(&decoded)?;
 
         if frames == 1 {

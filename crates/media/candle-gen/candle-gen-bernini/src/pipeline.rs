@@ -316,7 +316,7 @@ impl BerniniRenderer {
         }
 
         on_progress(Progress::Decoding);
-        let decoded = comps.vae.decode(&latents)?;
+        let decoded = comps.vae.decode_with_cancel(&latents, &req.cancel)?;
         let out_images = frames_to_images(&decoded)?;
 
         // num_frames == 1 ⇒ a still image (t2i). A single latent frame still decodes to one VAE

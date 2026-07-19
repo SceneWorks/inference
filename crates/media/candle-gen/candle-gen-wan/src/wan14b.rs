@@ -650,7 +650,9 @@ impl Pipeline {
         // sc-12758: free-aware budgeted **spatial** tiling for the z16 decode. Falls back to plain
         // `decode` when a single high-res frame already fits (behavior-identical when the budget is
         // ample); tiles the 42 GB A14B decode spike down to fit a small card otherwise.
-        let decoded = comps.vae.decode_budgeted(&latents)?;
+        let decoded = comps
+            .vae
+            .decode_budgeted_with_cancel(&latents, &req.cancel)?;
         let images = frames_to_images(&decoded)?;
         Ok((images, knobs.fps))
     }
@@ -830,7 +832,7 @@ impl Pipeline {
         // sc-12758: the experts + TE are offloaded by now, so the decode budgets against nearly the
         // whole card. Free-aware budgeted spatial tiling drives the 42 GB z16 decode spike down to fit
         // the free VRAM — the sole thing that kept the A14B off a 24 GB card (denoise is only ~11 GB).
-        let decoded = vae.decode_budgeted(&latents)?;
+        let decoded = vae.decode_budgeted_with_cancel(&latents, cancel)?;
         let images = frames_to_images(&decoded)?;
         Ok((images, knobs.fps))
     }

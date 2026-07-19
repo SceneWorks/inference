@@ -15,6 +15,7 @@
 use std::path::Path;
 
 use candle_gen::candle_core::{DType, Device, Tensor};
+use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use candle_gen::gen_core::{GenerationOutput, Image, Progress};
 use candle_gen::{CandleError, Result as CResult};
@@ -280,7 +281,7 @@ pub fn generate(
     comps: &Components,
     te_cfg: &TextEncoderConfig,
     job: &Scail2Job,
-    cancel: &dyn Fn() -> bool,
+    cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> CResult<GenerationOutput> {
     if job.driving_frames.is_empty() {
@@ -425,7 +426,7 @@ pub fn generate(
         let mut sched = FlowScheduler::new(job.sampler, job.steps, job.shift);
         let mut latent = apply_clean_history(&noise, history_latent.as_ref())?;
         for i in 0..job.steps {
-            if cancel() {
+            if cancel.is_cancelled() {
                 return Err(CandleError::Canceled);
             }
             let t = sched.timestep(i);
@@ -466,7 +467,7 @@ pub fn generate(
         }
         let video = comps
             .vae
-            .decode(&latent.reshape((1, 16, lat_t, lat_h, lat_w))?)?; // [1,3,T_out,H,W]
+            .decode_with_cancel(&latent.reshape((1, 16, lat_t, lat_h, lat_w))?, cancel)?; // [1,3,T_out,H,W]
         let (_, vc, vt, vh, vw) = video.dims5()?;
         let seg_video = video.reshape((vc, vt, vh, vw))?; // [3,T_out,H,W]
         let t_out = seg_video.dim(1)?;

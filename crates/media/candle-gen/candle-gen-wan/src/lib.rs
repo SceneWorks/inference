@@ -403,7 +403,9 @@ impl Pipeline {
         // Memory-bounded z48 vae22 decode (sc-7111): the per-frame streaming `decode` already bounds
         // the temporal axis; `decode_budgeted` adds budgeted **spatial** tiling so a single high-res
         // frame can't spike VRAM, and returns a catchable error rather than OOM-ing when over budget.
-        let decoded = comps.vae.decode_budgeted(&latents)?;
+        let decoded = comps
+            .vae
+            .decode_budgeted_with_cancel(&latents, &req.cancel)?;
         let images = pipeline::frames_to_images(&decoded)?;
         Ok((images, knobs.fps))
     }
@@ -511,7 +513,7 @@ impl Pipeline {
             |vae, st| {
                 (st.on_progress)(Progress::Decoding);
                 let latents = st.latents.as_ref().expect("latents denoised in stage 2");
-                let decoded = vae.decode_budgeted(latents)?;
+                let decoded = vae.decode_budgeted_with_cancel(latents, cancel)?;
                 let images = pipeline::frames_to_images(&decoded)?;
                 Ok((images, knobs.fps))
             },

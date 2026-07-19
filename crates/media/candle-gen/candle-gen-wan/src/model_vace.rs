@@ -249,7 +249,9 @@ impl Pipeline {
         // single high-res frame can't spike VRAM (48 GiB single-pass would OOM a 24 GB card), forces
         // tiling below the candle conv2d im2col-safe cap so the untiled decode can't silently corrupt,
         // and returns a catchable error rather than OOM-ing when over budget.
-        let decoded = comps.vae.decode_budgeted(&latents)?;
+        let decoded = comps
+            .vae
+            .decode_budgeted_with_cancel(&latents, &req.cancel)?;
         let images = frames_to_images(&decoded)?;
         Ok((images, fps))
     }

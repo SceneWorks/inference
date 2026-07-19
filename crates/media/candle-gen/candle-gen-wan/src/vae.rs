@@ -14,13 +14,60 @@
 use candle_gen::candle_core::{DType, Result, Tensor};
 use candle_gen::candle_nn::ops::softmax_last_dim;
 use candle_gen::candle_nn::VarBuilder;
+use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::tiling::{TileCandidates, TilingConfig, VaeTiling};
 use candle_gen::vae_tiling;
+use candle_gen::{CandleError, Result as CResult};
 
 use crate::config::{VaeConfig, LATENTS_MEAN, LATENTS_STD};
 use crate::conv3d::{chunked_conv2d, CausalConv3d, Ctx};
 
 const NORM_EPS: f64 = 1e-12;
+
+/// Run a streaming decode loop with cooperative cancellation and unconditional cache cleanup.
+/// Kept tensor-free so the cancellation/cleanup contract is unit-testable without a device.
+pub(crate) fn run_streaming_chunks<T>(
+    count: usize,
+    cancel: &CancelFlag,
+    mut decode_one: impl FnMut(usize) -> CResult<T>,
+    mut reset: impl FnMut(),
+) -> CResult<Vec<T>> {
+    reset();
+    let result = (|| {
+        let mut chunks = Vec::with_capacity(count);
+        for i in 0..count {
+            if cancel.is_cancelled() {
+                return Err(CandleError::Canceled);
+            }
+            chunks.push(decode_one(i)?);
+        }
+        Ok(chunks)
+    })();
+    reset();
+    result
+}
+
+/// Reset any stale streaming state, then reject a cancellation that was already set before decode.
+pub(crate) fn preflight_streaming_decode(
+    cancel: &CancelFlag,
+    mut reset: impl FnMut(),
+) -> CResult<()> {
+    reset();
+    if cancel.is_cancelled() {
+        Err(CandleError::Canceled)
+    } else {
+        Ok(())
+    }
+}
+
+pub(crate) fn candle_error(error: CandleError) -> candle_gen::candle_core::Error {
+    match error {
+        CandleError::Candle(error) => error,
+        CandleError::Msg(message) => candle_gen::candle_core::Error::Msg(message),
+        // Compatibility wrappers use a fresh, never-cancelled flag, so this arm is defensive only.
+        CandleError::Canceled => candle_gen::candle_core::Error::Msg("cancelled".into()),
+    }
+}
 
 /// Channel-L2 norm (`F.normalize(dim=channel) · √C · γ`). Works on 4-D `[N,C,H,W]` and 5-D
 /// `[B,C,T,H,W]` tensors (channel axis 1). `pub(crate)` so the z16 [`crate::vae16`] sibling reuses it.
@@ -474,21 +521,30 @@ impl WanVae {
     /// Frame 0 expands to 1 output frame, each later
     /// latent frame to 4 (the two temporal upsamplers) — total `1+(T-1)·4`.
     pub fn decode(&self, z: &Tensor) -> Result<Tensor> {
+        self.decode_with_cancel(z, &CancelFlag::default())
+            .map_err(candle_error)
+    }
+
+    /// Cancellable streaming decode. The flag is checked before every latent-frame decoder pass.
+    pub fn decode_with_cancel(&self, z: &Tensor, cancel: &CancelFlag) -> CResult<Tensor> {
+        preflight_streaming_decode(cancel, || self.reset_caches())?;
         let z = self.unnormalize(z)?;
         let t_lat = z.dim(2)?;
-        self.reset_caches();
         // Collect the per-frame decoded chunks and `cat` once (sc-9037): cat-ing onto a growing
         // accumulator each iteration re-copies every prior frame → O(T²) copy traffic and briefly
         // holds old+new. A single `Tensor::cat` at the end is O(T) and equivalent (same frames, same
         // order along the temporal axis).
-        let mut chunks: Vec<Tensor> = Vec::with_capacity(t_lat);
-        for i in 0..t_lat {
-            let zi = z.narrow(2, i, 1)?.contiguous()?;
-            chunks.push(self.decode_inner(&zi, &Ctx::streaming(i == 0))?);
-        }
-        self.reset_caches();
+        let chunks = run_streaming_chunks(
+            t_lat,
+            cancel,
+            |i| {
+                let zi = z.narrow(2, i, 1)?.contiguous()?;
+                Ok(self.decode_inner(&zi, &Ctx::streaming(i == 0))?)
+            },
+            || self.reset_caches(),
+        )?;
         assert!(!chunks.is_empty(), "decode needs >= 1 latent frame");
-        Tensor::cat(&chunks, 2)?.clamp(-1f32, 1f32)
+        Ok(Tensor::cat(&chunks, 2)?.clamp(-1f32, 1f32)?)
     }
 
     /// Decode with **spatial tiling** for memory-bounded high-resolution video (`cfg`) — the candle
@@ -511,13 +567,23 @@ impl WanVae {
     /// selector never tiles the temporal axis here); a temporal `cfg` would split the causal stream at
     /// tile boundaries and is not bit-exact vs. the streaming `decode`.
     pub fn decode_tiled(&self, z: &Tensor, cfg: &TilingConfig) -> Result<Tensor> {
+        self.decode_tiled_with_cancel(z, cfg, &CancelFlag::default())
+            .map_err(candle_error)
+    }
+
+    pub fn decode_tiled_with_cancel(
+        &self,
+        z: &Tensor,
+        cfg: &TilingConfig,
+        cancel: &CancelFlag,
+    ) -> CResult<Tensor> {
         // The tile/narrow/blend/pad-accumulate/normalize DRIVER is shared with the LTX half in
         // `candle_gen::vae_tiling::decode_tiled` (sc-9006 / F-026). What stays wan-specific: the
         // `VaeTiling::WAN22` geometry and the per-frame-streaming `decode` closure. With a
         // spatial-only `cfg`, `plan.t` is a single full-extent temporal tile, so the temporal loop
         // runs once and each `decode` call streams the whole clip.
         vae_tiling::decode_tiled(VaeTiling::WAN22, "wan z48 vae22", z, cfg, |tile| {
-            self.decode(tile)
+            self.decode_with_cancel(tile, cancel)
         })
     }
 
@@ -528,13 +594,18 @@ impl WanVae {
     /// budget. An over-budget decode returns a **catchable** error here instead of OOM-ing the worker.
     /// The candle z48 analogue of the LTX [`decode_budgeted`](crate::vae) wiring (sc-7076).
     pub fn decode_budgeted(&self, z: &Tensor) -> Result<Tensor> {
+        self.decode_budgeted_with_cancel(z, &CancelFlag::default())
+            .map_err(candle_error)
+    }
+
+    pub fn decode_budgeted_with_cancel(&self, z: &Tensor, cancel: &CancelFlag) -> CResult<Tensor> {
         let (_b, _c, f, h, w) = z.dims5()?;
         let out_f = 1 + (f as i32 - 1) * VaeTiling::WAN22.temporal_scale; // causal ×4
         let out_h = h as i32 * VaeTiling::WAN22.spatial_scale; // ×16
         let out_w = w as i32 * VaeTiling::WAN22.spatial_scale;
         match auto_tiling_budgeted_wan22(out_h, out_w, out_f)? {
-            Some(cfg) => self.decode_tiled(z, &cfg),
-            None => self.decode(z),
+            Some(cfg) => self.decode_tiled_with_cancel(z, &cfg, cancel),
+            None => self.decode_with_cancel(z, cancel),
         }
     }
 
@@ -729,6 +800,77 @@ fn plan_wan22_tiling(
 #[cfg(test)]
 mod budget_tests {
     use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn streaming_driver_cancels_between_chunks_and_cleans_up() {
+        let cancel = CancelFlag::new();
+        let decoded = Cell::new(0usize);
+        let resets = Cell::new(0usize);
+        let result = run_streaming_chunks(
+            4,
+            &cancel,
+            |i| {
+                decoded.set(decoded.get() + 1);
+                if i == 0 {
+                    cancel.cancel();
+                }
+                Ok(i)
+            },
+            || resets.set(resets.get() + 1),
+        );
+        assert!(matches!(result, Err(CandleError::Canceled)));
+        assert_eq!(decoded.get(), 1, "cancel must stop before the second chunk");
+        assert_eq!(
+            resets.get(),
+            2,
+            "caches reset before and after cancellation"
+        );
+
+        let before_decode = CancelFlag::new();
+        let on_progress = |progress| {
+            if matches!(progress, candle_gen::gen_core::Progress::Decoding) {
+                before_decode.cancel();
+            }
+        };
+        on_progress(candle_gen::gen_core::Progress::Decoding);
+        decoded.set(0);
+        resets.set(0);
+        let result = preflight_streaming_decode(&before_decode, || resets.set(resets.get() + 1));
+        assert!(matches!(result, Err(CandleError::Canceled)));
+        assert_eq!(decoded.get(), 0, "pre-decode cancel must skip frame zero");
+        assert_eq!(resets.get(), 1, "preflight cancellation must reset caches");
+    }
+
+    #[test]
+    fn streaming_driver_preserves_noncancel_output_and_cleans_errors() {
+        let resets = Cell::new(0usize);
+        let chunks = run_streaming_chunks(
+            3,
+            &CancelFlag::default(),
+            |i| Ok(i * 2),
+            || resets.set(resets.get() + 1),
+        )
+        .unwrap();
+        assert_eq!(chunks, vec![0, 2, 4]);
+        assert_eq!(resets.get(), 2);
+
+        resets.set(0);
+        let result = run_streaming_chunks::<usize>(
+            3,
+            &CancelFlag::default(),
+            |i| {
+                if i == 1 {
+                    Err(CandleError::Msg("decode failed".into()))
+                } else {
+                    Ok(i)
+                }
+            },
+            || resets.set(resets.get() + 1),
+        );
+        assert!(matches!(result, Err(CandleError::Msg(_))));
+        assert_eq!(resets.get(), 2, "caches reset after decoder errors too");
+    }
 
     #[test]
     fn wan22_tiling_single_pass_when_small() {
