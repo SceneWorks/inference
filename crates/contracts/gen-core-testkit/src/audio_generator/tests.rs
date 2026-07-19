@@ -180,6 +180,9 @@ struct StreamingStubAudioGen {
     desc: ModelDescriptor,
     chunks: u32,
     reassemble: bool,
+    /// Games the count-only gate: emit a zero-length chunk followed by one full-track chunk (2
+    /// chunks that reassemble and frame-align, but the whole track arrived in one block).
+    empty_then_full: bool,
     honor_cancel: bool,
     runs: Cell<u32>,
 }
@@ -196,12 +199,20 @@ impl StreamingStubAudioGen {
             desc: streaming_stub_desc(),
             chunks,
             reassemble,
+            empty_then_full: false,
             honor_cancel: true,
             runs: Cell::new(0),
         }
     }
     fn boxed(chunks: u32, reassemble: bool) -> Box<dyn Generator> {
         Box::new(Self::new(chunks, reassemble))
+    }
+    /// A streaming stub that games the `>= 2` count with `[empty chunk, full-track chunk]`.
+    fn empty_then_full() -> Self {
+        Self {
+            empty_then_full: true,
+            ..Self::new(2, true)
+        }
     }
     /// The deterministic one-shot track: `STREAM_TOTAL_SAMPLES` samples filled from the seed.
     fn track(&self, req: &GenerationRequest) -> AudioTrack {
@@ -257,6 +268,24 @@ impl Generator for StreamingStubAudioGen {
         let GenerationOutput::Audio(track) = &out else {
             return Ok(out);
         };
+        // The gaming variant: a zero-length chunk then one full-track chunk — 2 chunks that
+        // reassemble and frame-align, so it slips past the count-only gate while the whole track
+        // actually arrived in a single block.
+        if self.empty_then_full {
+            on_chunk(AudioChunk {
+                samples: Vec::new(),
+                sample_rate: track.sample_rate,
+                channels: track.channels,
+                index: 0,
+            });
+            on_chunk(AudioChunk {
+                samples: track.samples.clone(),
+                sample_rate: track.sample_rate,
+                channels: track.channels,
+                index: 1,
+            });
+            return Ok(out);
+        }
         let n = self.chunks.max(1) as usize;
         let len = track.samples.len();
         let base = len / n;
@@ -500,6 +529,16 @@ fn streaming_stub_with_nonreassembling_chunks_fails_reassembly() {
     let g = StreamingStubAudioGen::new(4, false);
     let err = check_audio_streaming(&g, &cheap()).unwrap_err();
     assert!(err.contains("reassembly law is violated"), "got: {err}");
+}
+
+#[test]
+fn streaming_stub_empty_then_full_chunk_fails_incrementality() {
+    // Games the >= 2 count with [empty chunk, full-track chunk]: 2 chunks that reassemble and
+    // frame-align, but a single chunk carries the entire track — the hardened per-chunk length gate
+    // must reject it as non-incremental.
+    let g = StreamingStubAudioGen::empty_then_full();
+    let err = check_audio_streaming(&g, &cheap()).unwrap_err();
+    assert!(err.contains("carries the entire track"), "got: {err}");
 }
 
 #[test]

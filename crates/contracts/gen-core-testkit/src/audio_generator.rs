@@ -376,8 +376,10 @@ pub fn check_audio_seed_determinism(
 ///   one-shot contract, never a different rendering;
 /// - **opt-in shape**: a provider advertising
 ///   [`supports_streaming`](gen_core::Capabilities::supports_streaming) must emit **≥ 2** chunks
-///   before completion (genuine incrementality — this is the assertion that fails if a provider
-///   buffers everything and emits one terminal chunk); a provider that does **not** advertise it
+///   before completion **and no single chunk may carry the entire track** (each chunk is strictly
+///   shorter than the full track) — the two together are genuine incrementality: the count alone is
+///   gameable by a zero-length chunk plus one full-track chunk, and the per-chunk length bound closes
+///   that (the audio must not arrive in one block); a provider that does **not** advertise streaming
 ///   must be byte-for-byte unaffected by the additive method — the default passthrough emits exactly
 ///   one chunk equal to the whole track.
 ///
@@ -498,6 +500,21 @@ pub fn check_audio_streaming(g: &dyn Generator, profile: &AudioProfile) -> Resul
                  provider must emit >= 2 chunks before completion (it appears to buffer everything and \
                  emit one terminal chunk)",
                 chunks.len()
+            ));
+        }
+        // The chunk-count gate alone is gameable: a provider could emit a zero-length chunk plus one
+        // full-track chunk (2 chunks, reassembles, frame-aligned) while not being incremental at all.
+        // Harden it — no single chunk may hold the entire track. Since the chunks reassemble to the
+        // track, any chunk whose length equals the total forces every other chunk to be empty, i.e.
+        // the whole output arrived in one block. Every chunk must therefore be strictly shorter than
+        // the full track.
+        let total = streamed_track.samples.len();
+        if let Some(i) = chunks.iter().position(|c| c.samples.len() >= total) {
+            return Err(format!(
+                "streaming[{id}]: advertises supports_streaming but chunk {i} carries the entire track \
+                 ({} of {total} samples) — the audio arrived in a single block (an empty chunk plus one \
+                 full-track chunk games the >= 2 count), so the provider is not genuinely incremental",
+                chunks[i].samples.len()
             ));
         }
     } else {
