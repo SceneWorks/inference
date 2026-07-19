@@ -817,6 +817,13 @@ impl MMAttention {
     }
 
     fn quantize(&mut self, bits: i32, group: i32) -> Result<()> {
+        if self.shared {
+            // `convert_dit` must have duplicated each `.all` source tensor as two handles of one
+            // dense buffer. Check that invariant before mutating the vid fields and replacing the
+            // txt fields; otherwise a future per-stream checkpoint layout could be clobbered here.
+            debug_assert_shared_dense("qkv", &self.qkv_vid.w, &self.qkv_txt.w);
+            debug_assert_shared_dense("out", &self.out_vid.w, &self.out_txt.w);
+        }
         self.qkv_vid.quantize(bits, group)?;
         self.out_vid.quantize(bits, group)?;
         if self.shared {
@@ -836,6 +843,24 @@ impl MMAttention {
         }
     }
 }
+
+#[cfg(debug_assertions)]
+fn debug_assert_shared_dense(label: &str, vid: &LinearWeight, txt: &LinearWeight) {
+    let (LinearWeight::Dense(vid), LinearWeight::Dense(txt)) = (vid, txt) else {
+        return;
+    };
+    // We only inspect the address. `as_slice_unchecked` is needed because production loads may be
+    // bf16 or f32; it evaluates the array and returns the same underlying byte address for either.
+    let vid_ptr = unsafe { vid.as_slice_unchecked::<u8>().as_ptr() };
+    let txt_ptr = unsafe { txt.as_slice_unchecked::<u8>().as_ptr() };
+    debug_assert_eq!(
+        vid_ptr, txt_ptr,
+        "shared SeedVR2 {label} vid/txt weights must reference one dense buffer"
+    );
+}
+
+#[cfg(not(debug_assertions))]
+fn debug_assert_shared_dense(_label: &str, _vid: &LinearWeight, _txt: &LinearWeight) {}
 
 // ---------------------------------------------------------------------------
 // block
@@ -1288,14 +1313,56 @@ mod stage_tests {
             );
         }
 
-        // quantized: one packed tensor set shared across both streams.
+        // Quantize independent copies too: the production branch relies on quantize_affine being
+        // deterministic when it replaces the txt result with handles to the vid result.
+        let mut independently_quantized = [
+            Linear {
+                w: attn.qkv_txt.w.clone(),
+                b: None,
+            },
+            Linear {
+                w: attn.out_txt.w.clone(),
+                b: None,
+            },
+        ];
+        for linear in &mut independently_quantized {
+            linear
+                .quantize(8, mlx_gen::quant::DEFAULT_GROUP_SIZE)
+                .unwrap();
+        }
+
+        // Production quantization: one packed tensor set shared across both streams.
         attn.quantize(8, mlx_gen::quant::DEFAULT_GROUP_SIZE)
             .unwrap();
-        for (label, v, t) in [
-            ("qkv", &attn.qkv_vid.w, &attn.qkv_txt.w),
-            ("out", &attn.out_vid.w, &attn.out_txt.w),
+        for (label, v, t, independent) in [
+            (
+                "qkv",
+                &attn.qkv_vid.w,
+                &attn.qkv_txt.w,
+                &independently_quantized[0].w,
+            ),
+            (
+                "out",
+                &attn.out_vid.w,
+                &attn.out_txt.w,
+                &independently_quantized[1].w,
+            ),
         ] {
-            let (LinearWeight::Quant { wq: a, .. }, LinearWeight::Quant { wq: b, .. }) = (v, t)
+            let (
+                LinearWeight::Quant {
+                    wq: a,
+                    scales: a_scales,
+                    biases: a_biases,
+                    ..
+                },
+                LinearWeight::Quant { wq: b, .. },
+                LinearWeight::Quant {
+                    wq: expected,
+                    scales: expected_scales,
+                    biases: expected_biases,
+                    ..
+                },
+            ) = (v, t, independent)
             else {
                 panic!("{label}: expected quantized after quantize");
             };
@@ -1303,6 +1370,15 @@ mod stage_tests {
                 a.as_slice::<u32>().as_ptr(),
                 b.as_slice::<u32>().as_ptr(),
                 "{label}: packed _vid/_txt must share one tensor set"
+            );
+            assert_eq!(a, expected, "{label}: packed weights must be deterministic");
+            assert_eq!(
+                a_scales, expected_scales,
+                "{label}: quantization scales must be deterministic"
+            );
+            assert_eq!(
+                a_biases, expected_biases,
+                "{label}: quantization biases must be deterministic"
             );
         }
     }
