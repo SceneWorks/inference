@@ -268,21 +268,162 @@ impl OobleckDecoder {
 
 /// Read the `decoder.*` tensors of a safetensors file into an f32 name→tensor map.
 fn read_decoder_tensors(path: &Path, device: &Device) -> Result<HashMap<String, Tensor>> {
+    read_prefixed_tensors(path, device, "decoder.")
+}
+
+/// Read every tensor whose name starts with `prefix` into an f32 name→tensor map (the VAE ships
+/// both `encoder.*` and `decoder.*` in one file; each path materializes only its half).
+fn read_prefixed_tensors(
+    path: &Path,
+    device: &Device,
+    prefix: &str,
+) -> Result<HashMap<String, Tensor>> {
     let tensors = candle_audio::candle_core::safetensors::load(path, device)
         .map_err(|e| AudioError::Msg(format!("load {}: {e}", path.display())))?;
     let mut out = HashMap::new();
     for (name, t) in tensors {
-        if name.starts_with("decoder.") {
+        if name.starts_with(prefix) {
             out.insert(name, t.to_dtype(DType::F32)?);
         }
     }
     if out.is_empty() {
         return Err(AudioError::Msg(format!(
-            "{}: no decoder.* tensors — not an ACE-Step Oobleck VAE checkpoint",
+            "{}: no {prefix}* tensors — not an ACE-Step Oobleck VAE checkpoint",
             path.display()
         )));
     }
     Ok(out)
+}
+
+/// The ACE-Step 1.5 **`AutoencoderOobleck` encoder** (sc-12847) — the stereo music VAE *encode*
+/// path used to latent-encode a source clip for prompted editing, ported from the diffusers
+/// `OobleckEncoder`:
+///
+/// ```text
+///   waveform [B, 2, T] → conv1 WNConv1d(2 → channels, k7, p3)
+///     5 × OobleckEncoderBlock(in → out, downsample-stride s):
+///         3 × ResidualUnit(dil 1/3/9) → Snake1d → WNConv1d(in → out, k=2s, s, p=⌈s/2⌉)
+///     Snake1d → WNConv1d(channels·mult[-1] → 2·latent, k3, p1) → parameters [B, 2·64, T/1920]
+///   mean, scale = parameters.chunk(2, dim=1)     # OobleckDiagonalGaussianDistribution
+///   src_latents = mean.transpose(1, 2)           # [B, T/1920, 64] — the DiT src-latent space
+/// ```
+///
+/// `downsampling_ratios = [2,4,4,6,10]` are walked in **forward** order (the mirror of the decoder,
+/// which walks them reversed). The deterministic **mode** (the Gaussian mean) is used, not a
+/// stochastic `.sample()`, so encoding a clip is reproducible (the gen-core seed law) — the mean is
+/// the conditioning signal the reference feeds as `src_latents`, and the pinned `silence_latent`
+/// buffer is itself a raw encoder mean, so no `scaling_factor` rescale is applied (the same space
+/// the decoder consumes and the DiT integrates in).
+pub struct OobleckEncoder {
+    conv1: Conv1d,
+    blocks: Vec<EncoderBlock>,
+    snake_out: Snake,
+    conv_out: Conv1d,
+    hop_length: usize,
+    latent_channels: usize,
+}
+
+/// One `OobleckEncoderBlock`: three residual units, a Snake, then the strided downsample conv.
+struct EncoderBlock {
+    res: [ResidualUnit; 3],
+    snake: Snake,
+    down: Conv1d,
+}
+
+impl EncoderBlock {
+    fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
+        let mut x = x.clone();
+        for r in &self.res {
+            x = r.forward(&x)?;
+        }
+        self.down.forward(&self.snake.forward(&x)?)
+    }
+}
+
+impl OobleckEncoder {
+    /// Load the encode path from `vae/diffusion_pytorch_model.safetensors`. Only the `encoder.*`
+    /// tensors are materialized; the decoder is skipped.
+    pub fn load(path: &Path, cfg: &VaeConfig, device: &Device) -> Result<Self> {
+        let raw = read_prefixed_tensors(path, device, "encoder.")?;
+        let map = resolve_weight_norm(&raw)?;
+        let w = W { map: &map };
+
+        // Forward-order temporal ratios (the mirror of the decoder's reversed walk).
+        let strides: Vec<usize> = cfg.downsampling_ratios.to_vec();
+
+        let conv1 = w.conv(
+            "encoder.conv1",
+            Conv1dConfig {
+                padding: 3,
+                ..Default::default()
+            },
+        )?;
+        let mut blocks = Vec::with_capacity(strides.len());
+        for (i, &stride) in strides.iter().enumerate() {
+            let base = format!("encoder.block.{i}");
+            blocks.push(EncoderBlock {
+                res: [
+                    w.residual_unit(&format!("{base}.res_unit1"), 1)?,
+                    w.residual_unit(&format!("{base}.res_unit2"), 3)?,
+                    w.residual_unit(&format!("{base}.res_unit3"), 9)?,
+                ],
+                snake: w.snake(&format!("{base}.snake1"))?,
+                down: w.conv(
+                    &format!("{base}.conv1"),
+                    Conv1dConfig {
+                        stride,
+                        padding: stride.div_ceil(2),
+                        ..Default::default()
+                    },
+                )?,
+            });
+        }
+        let snake_out = w.snake("encoder.snake1")?;
+        let conv_out = w.conv(
+            "encoder.conv2",
+            Conv1dConfig {
+                padding: 1,
+                ..Default::default()
+            },
+        )?;
+        Ok(Self {
+            conv1,
+            blocks,
+            snake_out,
+            conv_out,
+            hop_length: cfg.hop_length(),
+            latent_channels: cfg.decoder_input_channels,
+        })
+    }
+
+    pub fn hop_length(&self) -> usize {
+        self.hop_length
+    }
+
+    /// Encode a waveform `[1, audio_channels, T]` → deterministic latents `[1, T/hop, latent]`
+    /// (the Gaussian **mean**, in the DiT src-latent space). `T` should be a multiple of
+    /// [`hop_length`](Self::hop_length) (the caller pads); the strided convs otherwise floor the
+    /// last partial frame. `cancel` is polled between downsampling stages.
+    pub fn encode(
+        &self,
+        waveform: &Tensor,
+        cancel: &dyn Fn() -> bool,
+    ) -> CandleResult<Option<Tensor>> {
+        let mut x = self.conv1.forward(waveform)?;
+        for block in &self.blocks {
+            if cancel() {
+                return Ok(None);
+            }
+            x = block.forward(&x)?;
+        }
+        if cancel() {
+            return Ok(None);
+        }
+        let params = self.conv_out.forward(&self.snake_out.forward(&x)?)?; // [1, 2·latent, T']
+                                                                           // OobleckDiagonalGaussianDistribution: mean = first `latent` channels; deterministic mode.
+        let mean = params.narrow(1, 0, self.latent_channels)?;
+        Ok(Some(mean.transpose(1, 2)?.contiguous()?)) // [1, T', latent]
+    }
 }
 
 #[cfg(test)]
@@ -305,6 +446,29 @@ mod tests {
             for l in [1usize, 4, 25] {
                 let out = (l - 1) * s + 2 * s + op - 2 * s.div_ceil(2);
                 assert_eq!(out, s * l, "stride {s} len {l}");
+            }
+        }
+    }
+
+    #[test]
+    fn encoder_downsample_product_matches_hop_length() {
+        // The encoder walks the ratios in FORWARD order; each strided conv (k=2s, stride s,
+        // padding ⌈s/2⌉) is exactly ×(1/s), so a hop-aligned input yields hop_length⁻¹ frames.
+        let cfg: VaeConfig = serde_json::from_str(
+            r#"{"audio_channels": 2, "channel_multiples": [1,2,4,8,16], "decoder_channels": 128,
+                "decoder_input_channels": 64, "downsampling_ratios": [2,4,4,6,10],
+                "encoder_hidden_size": 128, "sampling_rate": 48000}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.hop_length(), 1920);
+        for &s in &cfg.downsampling_ratios {
+            let pad = s.div_ceil(2);
+            let k = 2 * s;
+            for frames_out in [1usize, 4, 25] {
+                let t_in = frames_out * s;
+                // Conv1d output length: floor((T + 2p − k)/s) + 1.
+                let out = (t_in + 2 * pad - k) / s + 1;
+                assert_eq!(out, frames_out, "stride {s}: {t_in} in → {frames_out} out");
             }
         }
     }

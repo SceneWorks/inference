@@ -32,14 +32,15 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use candle_audio::gen_core::{
-    self, AudioTrack, Capabilities, GenerationOutput, GenerationRequest, Generator, LoadSpec,
-    Modality, ModelDescriptor, Progress, WeightsSource,
+    self, AudioEditMode, AudioTrack, Capabilities, ConditioningKind, GenerationOutput,
+    GenerationRequest, Generator, LoadSpec, Modality, ModelDescriptor, Progress, WeightsSource,
 };
 use candle_audio::hub::{hf_get_pinned, pinned_snapshot_dir};
 use candle_audio::{AudioError, Result as AudioResult};
 
 use crate::pipeline::{
-    AceStepPipeline, PipelineProgress, SynthesisParams, DEFAULT_SECONDS, DEFAULT_STEPS,
+    AceStepPipeline, EditParams, EditTask, PipelineProgress, SynthesisParams, DEFAULT_SECONDS,
+    DEFAULT_STEPS,
 };
 use crate::scheduler::DEFAULT_SHIFT;
 use crate::text::Metadata;
@@ -84,7 +85,10 @@ pub fn descriptor() -> ModelDescriptor {
             supports_negative_prompt: false,
             supports_guidance: false,
             supports_true_cfg: false,
-            conditioning: Vec::new(),
+            // Prompted source-audio editing (sc-12847): the SAME turbo weights natively serve
+            // ACE-Step's audio-to-audio task modes, so the edit capability rides this existing
+            // generator via a new conditioning kind rather than a distinct provider id.
+            conditioning: vec![ConditioningKind::AudioEdit],
             supports_lora: false,
             supports_lokr: false,
             samplers: vec![],
@@ -100,6 +104,17 @@ pub fn descriptor() -> ModelDescriptor {
             // No voice/speaker surface — music, not TTS.
             audio_voices: vec![],
             audio_languages: LANGUAGES.to_vec(),
+            // The edit modes the pinned diffusers checkpoint supports. Inpaint / Repaint / Extend
+            // ride ACE-Step's `repaint` task (region regenerate + seamless stitch, sc-12847). Cover
+            // (the `cover` task) is deliberately NOT advertised: it needs the audio
+            // quantizer/detokenizer weights that this diffusers snapshot does not ship (tracked
+            // follow-up) — so a Cover request is a typed Unsupported at the contract floor, honest
+            // about the pinned weights rather than erroring mid-generate.
+            audio_edit_modes: vec![
+                AudioEditMode::Inpaint,
+                AudioEditMode::Repaint,
+                AudioEditMode::Extend,
+            ],
             supported_quants: &[],
             supports_kv_cache: false,
             requires_sigma_shift: false,
@@ -164,6 +179,62 @@ pub(crate) fn validate_request(
         }
         // musical_key / lyrics are free-form; the model accepts any text (empty lyrics ⇒
         // instrumental). No enum to gate.
+    }
+    // Prompted source-audio editing (sc-12847): the shared floor gates the edit *mode* against the
+    // advertised surface and the region shape; here we add the checks that need the source clip —
+    // native sample rate, and region/extend bounds against the clip duration.
+    if let Some(edit) = req.audio_edit() {
+        let src = edit.audio;
+        if src.channels == 0 || src.samples.is_empty() {
+            return Err(gen_core::Error::Msg(format!(
+                "{id}: audio edit source clip is empty"
+            )));
+        }
+        if src.sample_rate != SAMPLE_RATE {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{id}: audio edit source must be {SAMPLE_RATE} Hz (the model's native rate), got {}",
+                src.sample_rate
+            )));
+        }
+        let src_secs = (src.samples.len() / src.channels as usize) as f32 / src.sample_rate as f32;
+        match edit.mode {
+            AudioEditMode::Extend => {
+                let end = edit.region.and_then(|r| r.end_secs).ok_or_else(|| {
+                    gen_core::Error::Msg(format!(
+                        "{id}: extend requires region.end_secs (the new total length in seconds)"
+                    ))
+                })?;
+                if end <= src_secs {
+                    return Err(gen_core::Error::Msg(format!(
+                        "{id}: extend length {end}s must exceed the source length {src_secs:.3}s"
+                    )));
+                }
+            }
+            AudioEditMode::Inpaint | AudioEditMode::Repaint => {
+                let region = edit.region.ok_or_else(|| {
+                    gen_core::Error::Msg(format!(
+                        "{id}: {:?} editing requires a region (start/end seconds)",
+                        edit.mode
+                    ))
+                })?;
+                if region.start_secs >= src_secs {
+                    return Err(gen_core::Error::Msg(format!(
+                        "{id}: audio edit region start {}s is at/beyond the {src_secs:.3}s clip",
+                        region.start_secs
+                    )));
+                }
+                if let Some(end) = region.end_secs {
+                    if end > src_secs + 1e-3 {
+                        return Err(gen_core::Error::Msg(format!(
+                            "{id}: audio edit region end {end}s is beyond the {src_secs:.3}s clip"
+                        )));
+                    }
+                }
+            }
+            // Cover is not in the advertised `audio_edit_modes`, so the floor below rejects it as a
+            // typed Unsupported; no clip-specific check needed here.
+            AudioEditMode::Cover => {}
+        }
     }
     caps.validate_request_audio(id, req)
 }
@@ -277,9 +348,52 @@ impl Generator for AceStepGenerator {
             }),
             PipelineProgress::Decoding => on_progress(Progress::Decoding),
         };
-        let samples = pipeline
-            .synthesize(&req.prompt, &params, &mut progress, &probe)
-            .map_err(gen_core::Error::from)?;
+
+        // Prompted source-audio editing (sc-12847): a request carrying an `AudioEdit` conditioning
+        // dispatches to the mask-conditioned edit path (regenerate the region + seamless stitch);
+        // otherwise this is plain text-to-music synthesis.
+        let samples = if let Some(edit) = req.audio_edit() {
+            let task = match edit.mode {
+                AudioEditMode::Inpaint => EditTask::Inpaint,
+                AudioEditMode::Repaint => EditTask::Repaint,
+                AudioEditMode::Extend => EditTask::Extend,
+                // Defensive: `validate` already rejects Cover (unadvertised — the pinned diffusers
+                // checkpoint ships no audio quantizer), but never reach the pipeline with it.
+                AudioEditMode::Cover => {
+                    return Err(gen_core::Error::Unsupported(format!(
+                        "{}: cover editing is unavailable on the pinned checkpoint (no audio \
+                         quantizer weights)",
+                        self.descriptor.id
+                    )));
+                }
+            };
+            let (region_start_secs, region_end_secs) = edit
+                .region
+                .map(|r| (r.start_secs, r.end_secs))
+                .unwrap_or((0.0, None));
+            let source = edit.audio.samples.clone();
+            let source_channels = edit.audio.channels as usize;
+            let eparams = EditParams {
+                task,
+                region_start_secs,
+                region_end_secs,
+                base: params,
+            };
+            pipeline
+                .edit(
+                    &req.prompt,
+                    &source,
+                    source_channels,
+                    &eparams,
+                    &mut progress,
+                    &probe,
+                )
+                .map_err(gen_core::Error::from)?
+        } else {
+            pipeline
+                .synthesize(&req.prompt, &params, &mut progress, &probe)
+                .map_err(gen_core::Error::from)?
+        };
 
         Ok(GenerationOutput::Audio(AudioTrack {
             samples,
@@ -447,6 +561,122 @@ mod tests {
         let mut r = music_req(AudioParams::default());
         r.prompt = "   ".into();
         assert!(validate_request(&d, &r).is_err());
+    }
+
+    #[test]
+    fn descriptor_advertises_the_edit_surface() {
+        let d = descriptor();
+        assert!(
+            d.capabilities
+                .conditioning
+                .contains(&gen_core::ConditioningKind::AudioEdit),
+            "advertises the AudioEdit conditioning kind"
+        );
+        // Exactly the checkpoint-supported modes, in order; Cover is absent (no audio quantizer).
+        assert_eq!(
+            d.capabilities.audio_edit_modes,
+            vec![
+                AudioEditMode::Inpaint,
+                AudioEditMode::Repaint,
+                AudioEditMode::Extend
+            ]
+        );
+    }
+
+    fn edit_track(secs: f32) -> AudioTrack {
+        let frames = (secs * SAMPLE_RATE as f32) as usize;
+        AudioTrack {
+            samples: vec![0.0; frames * CHANNELS as usize],
+            sample_rate: SAMPLE_RATE,
+            channels: CHANNELS,
+            stems: Vec::new(),
+        }
+    }
+
+    fn edit_req(mode: AudioEditMode, region: Option<gen_core::TimeRegion>) -> GenerationRequest {
+        GenerationRequest {
+            prompt: "energetic guitar solo".into(),
+            conditioning: vec![gen_core::Conditioning::AudioEdit {
+                audio: edit_track(12.0),
+                mode,
+                region,
+                strength: None,
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn validate_gates_the_edit_surface() {
+        let d = descriptor();
+        // A well-formed interior repaint (seconds 4–8 of a 12 s clip) passes.
+        assert!(validate_request(
+            &d,
+            &edit_req(
+                AudioEditMode::Repaint,
+                Some(gen_core::TimeRegion {
+                    start_secs: 4.0,
+                    end_secs: Some(8.0),
+                }),
+            )
+        )
+        .is_ok());
+        // Cover is unadvertised on the pinned checkpoint → typed Unsupported.
+        assert!(matches!(
+            validate_request(&d, &edit_req(AudioEditMode::Cover, None)).unwrap_err(),
+            gen_core::Error::Unsupported(_)
+        ));
+        // A region past the clip is rejected.
+        assert!(validate_request(
+            &d,
+            &edit_req(
+                AudioEditMode::Repaint,
+                Some(gen_core::TimeRegion {
+                    start_secs: 4.0,
+                    end_secs: Some(20.0),
+                }),
+            )
+        )
+        .is_err());
+        // Extend without an end (the new total length) is rejected.
+        assert!(validate_request(
+            &d,
+            &edit_req(
+                AudioEditMode::Extend,
+                Some(gen_core::TimeRegion {
+                    start_secs: 12.0,
+                    end_secs: None,
+                }),
+            )
+        )
+        .is_err());
+        // Extend to a longer clip passes.
+        assert!(validate_request(
+            &d,
+            &edit_req(
+                AudioEditMode::Extend,
+                Some(gen_core::TimeRegion {
+                    start_secs: 12.0,
+                    end_secs: Some(20.0),
+                }),
+            )
+        )
+        .is_ok());
+        // A source at the wrong sample rate is rejected.
+        let mut wrong = edit_req(
+            AudioEditMode::Repaint,
+            Some(gen_core::TimeRegion {
+                start_secs: 1.0,
+                end_secs: Some(2.0),
+            }),
+        );
+        if let gen_core::Conditioning::AudioEdit { audio, .. } = &mut wrong.conditioning[0] {
+            audio.sample_rate = 44_100;
+        }
+        assert!(matches!(
+            validate_request(&d, &wrong).unwrap_err(),
+            gen_core::Error::Unsupported(_)
+        ));
     }
 
     #[test]

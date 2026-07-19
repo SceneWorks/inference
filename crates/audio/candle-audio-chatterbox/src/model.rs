@@ -93,6 +93,7 @@ pub fn descriptor() -> ModelDescriptor {
             // The voice is supplied by conditioning, not a named voice id.
             audio_voices: vec![],
             audio_languages: LANGUAGES.to_vec(),
+            audio_edit_modes: vec![],
             supported_quants: &[],
             supports_kv_cache: true,
             requires_sigma_shift: false,
