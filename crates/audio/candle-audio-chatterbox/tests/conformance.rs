@@ -396,3 +396,85 @@ fn chatterbox_reference_audio_fills_the_t3_prompt_tokens() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// CAMPPlus speaker encoder (sc-13236): the D-TDNN x-vector network → 192-d speaker vector.
+// ---------------------------------------------------------------------------------------------
+
+/// The DoD gate: the ported CAMPPlus derives DISCRIMINATIVE 192-d x-vectors from real
+/// `speaker_encoder.*` weights on distinct Kokoro voices — same-voice cosine materially exceeds
+/// cross-voice cosine — and is deterministic. This is the sc-13236 clone-conditioning gate (a
+/// broken fbank / TDNN / CAM / stats-pool / weight mapping degenerates to non-discriminative or
+/// NaN vectors and fails here).
+#[test]
+#[ignore = "real weights: needs s3gen.safetensors + a Kokoro snapshot; run with --ignored"]
+fn campplus_derives_discriminative_x_vectors() {
+    use candle_audio_chatterbox::campplus::{cosine_similarity, SPK_EMBED_DIM, XVECTOR_DIM};
+
+    let enc = cb::Campplus::from_snapshot(&s3gen_snapshot())
+        .expect("load CAMPPlus from s3gen.safetensors");
+
+    // Two clips of the SAME voice (different text) + one clip of a DIFFERENT voice.
+    let a1 = kokoro_clip(
+        "The quick brown fox jumps over the lazy dog near the river bank.",
+        "af_heart",
+    );
+    let a2 = kokoro_clip("She sells seashells by the seashore at dawn.", "af_heart");
+    let b1 = kokoro_clip(
+        "The quick brown fox jumps over the lazy dog near the river bank.",
+        "am_michael",
+    );
+
+    let xa1 = enc.embed(&a1.samples, a1.sample_rate).expect("x-vector a1");
+    let xa2 = enc.embed(&a2.samples, a2.sample_rate).expect("x-vector a2");
+    let xb1 = enc.embed(&b1.samples, b1.sample_rate).expect("x-vector b1");
+
+    assert_eq!(xa1.len(), XVECTOR_DIM, "x-vector must be 192-d");
+    assert!(
+        xa1.iter().chain(&xa2).chain(&xb1).all(|v| v.is_finite()),
+        "x-vectors must be finite (no NaN/inf from the trunk)"
+    );
+
+    let same = cosine_similarity(&xa1, &xa2); // same voice, different text
+    let cross_ab = cosine_similarity(&xa1, &xb1); // different voice
+    let cross_a2b = cosine_similarity(&xa2, &xb1);
+    eprintln!(
+        "CAMPPlus x-vector cosine — same-voice(af_heart) = {same:.4}; \
+         cross-voice(af_heart vs am_michael) = {cross_ab:.4} / {cross_a2b:.4}"
+    );
+
+    // Discrimination: the same-voice pair is materially closer than the cross-voice pairs.
+    assert!(
+        same > cross_ab + 0.05 && same > cross_a2b + 0.05,
+        "x-vectors are not discriminative: same {same:.4} vs cross {cross_ab:.4}/{cross_a2b:.4}"
+    );
+
+    // Deterministic: same clip ⇒ byte-identical x-vector (the reproducibility law).
+    let xa1_again = enc.embed(&a1.samples, a1.sample_rate).expect("re-embed a1");
+    assert_eq!(xa1, xa1_again, "CAMPPlus must be deterministic");
+
+    // The flow-ready 80-d speaker embedding (L2-norm + spk_embed_affine_layer 192→80) is well-formed
+    // and still voice-discriminative.
+    let fa1 = enc
+        .spk_embed_flow(&a1.samples, a1.sample_rate)
+        .expect("flow spk-embed a1");
+    let fa2 = enc
+        .spk_embed_flow(&a2.samples, a2.sample_rate)
+        .expect("flow spk-embed a2");
+    let fb1 = enc
+        .spk_embed_flow(&b1.samples, b1.sample_rate)
+        .expect("flow spk-embed b1");
+    assert_eq!(
+        fa1.len(),
+        SPK_EMBED_DIM,
+        "flow speaker embedding must be 80-d"
+    );
+    assert!(fa1.iter().all(|v| v.is_finite()));
+    let same80 = cosine_similarity(&fa1, &fa2);
+    let cross80 = cosine_similarity(&fa1, &fb1);
+    eprintln!("flow 80-d spk-embed cosine — same {same80:.4} vs cross {cross80:.4}");
+    assert!(
+        same80 > cross80,
+        "flow speaker embedding lost discrimination: same {same80:.4} vs cross {cross80:.4}"
+    );
+}
