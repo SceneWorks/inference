@@ -1718,6 +1718,102 @@ mod tests {
         }
     }
 
+    // Malformed audio-transform descriptors exercising the kind/stem_count coherence guard's
+    // *rejection* branches (an inverted condition would otherwise pass the whole suite, since the
+    // positive test only asserts an empty sweep). The `load` fn is never invoked by the sweep.
+    fn bad_load(_spec: &LoadSpec) -> Result<Box<dyn AudioTransform>> {
+        Ok(Box::new(DummyAudioTransform {
+            desc: dummy_voice_conversion_descriptor(),
+            out_tracks: 1,
+        }))
+    }
+
+    fn separator_stem_count(id: &'static str, stem_count: u16) -> AudioTransformDescriptor {
+        AudioTransformDescriptor {
+            id,
+            family: "audio",
+            backend: "candle",
+            capabilities: AudioTransformCapabilities {
+                kind: AudioTransformKind::StemSeparation,
+                stem_count,
+                ..Default::default()
+            },
+        }
+    }
+    fn single_output_stem_count(
+        id: &'static str,
+        kind: AudioTransformKind,
+    ) -> AudioTransformDescriptor {
+        AudioTransformDescriptor {
+            id,
+            family: "audio",
+            backend: "candle",
+            capabilities: AudioTransformCapabilities {
+                kind,
+                stem_count: 3,
+                ..Default::default()
+            },
+        }
+    }
+
+    fn bad_stems_zero_descriptor() -> AudioTransformDescriptor {
+        separator_stem_count("bad_stems_zero", 0)
+    }
+    fn bad_stems_one_descriptor() -> AudioTransformDescriptor {
+        separator_stem_count("bad_stems_one", 1)
+    }
+    fn bad_vc_stems_descriptor() -> AudioTransformDescriptor {
+        single_output_stem_count("bad_vc_stems", AudioTransformKind::VoiceConversion)
+    }
+    fn bad_sr_stems_descriptor() -> AudioTransformDescriptor {
+        single_output_stem_count("bad_sr_stems", AudioTransformKind::SuperResolution)
+    }
+
+    crate::register_audio_transform! {
+        const BAD_STEMS_ZERO_REGISTRATION = bad_stems_zero_descriptor => bad_load
+    }
+    crate::register_audio_transform! {
+        const BAD_STEMS_ONE_REGISTRATION = bad_stems_one_descriptor => bad_load
+    }
+    crate::register_audio_transform! {
+        const BAD_VC_STEMS_REGISTRATION = bad_vc_stems_descriptor => bad_load
+    }
+    crate::register_audio_transform! {
+        const BAD_SR_STEMS_REGISTRATION = bad_sr_stems_descriptor => bad_load
+    }
+
+    #[test]
+    fn audio_transform_kind_stem_count_incoherence_is_rejected() {
+        let errs = ProviderRegistryBuilder::new()
+            .register_audio_transform(BAD_STEMS_ZERO_REGISTRATION)
+            .register_audio_transform(BAD_STEMS_ONE_REGISTRATION)
+            .register_audio_transform(BAD_VC_STEMS_REGISTRATION)
+            .register_audio_transform(BAD_SR_STEMS_REGISTRATION)
+            .build()
+            .unwrap()
+            .descriptor_conformance_errors();
+        let has = |needle: &str| errs.iter().any(|e| e.contains(needle));
+
+        // A separator advertising < 2 stems (0 and 1) is rejected with the specific message.
+        assert!(
+            has("audio transform 'bad_stems_zero': StemSeparation advertises stem_count 0 (a separator must produce ≥ 2 stems)"),
+            "{errs:?}"
+        );
+        assert!(
+            has("audio transform 'bad_stems_one': StemSeparation advertises stem_count 1 (a separator must produce ≥ 2 stems)"),
+            "{errs:?}"
+        );
+        // A single-output kind advertising any stems is rejected.
+        assert!(
+            has("audio transform 'bad_vc_stems': VoiceConversion advertises stem_count 3 — only StemSeparation produces stems"),
+            "{errs:?}"
+        );
+        assert!(
+            has("audio transform 'bad_sr_stems': SuperResolution advertises stem_count 3 — only StemSeparation produces stems"),
+            "{errs:?}"
+        );
+    }
+
     struct DummyVoiceEmbedder {
         desc: VoiceEmbedderDescriptor,
     }
