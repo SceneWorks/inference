@@ -78,7 +78,7 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: Toolchain versions
         run: rustc --version && cargo --version
-      - name: Materialize and verify immutable snapshots
+      - name: Materialize public snapshot and verify licensed cache
         run: |
           python3 -m pip install --disable-pip-version-check --target "$RUNNER_TEMP/huggingface-hub" "huggingface_hub==1.20.1"
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model kokoro-82m --snapshot "$KOKORO_SNAPSHOT"
@@ -236,7 +236,9 @@ jobs:
           python -m pip install --disable-pip-version-check --target "%RUNNER_TEMP%\huggingface-hub" "huggingface_hub==1.20.1"
           set "PYTHONPATH=%RUNNER_TEMP%\huggingface-hub"
           python scripts/release/ensure_model_snapshot.py --model qwen-image --snapshot "%QWEN_IMAGE_SNAPSHOT%"
-          python scripts/release/ensure_model_snapshot.py --model flux-1-dev --snapshot "%FLUX_DEV_DIR%"
+          rem FLUX.1-dev is license-gated. Operators provision this immutable cache after accepting
+          rem its license; CI deliberately does not receive or print a Hugging Face credential.
+          python scripts/release/verify_model_snapshot.py --model flux-1-dev --snapshot "%FLUX_DEV_DIR%"
       - name: Run Qwen Image and FLUX.1-dev resident/sequential processes
         shell: cmd
         run: |
@@ -277,6 +279,15 @@ jobs:
           if not "%TEST_EXIT%"=="0" exit /b %TEST_EXIT%
           fc /b "%AB_DIR%\flux-dev-resident.rgb" "%AB_DIR%\flux-dev-sequential.rgb" > "%AB_DIR%\flux-dev-byte-compare.log"
           if errorlevel 1 exit /b 1
+
+          python scripts/release/verify_residency_ab.py --model qwen-image --resident "%AB_DIR%\qwen-resident.log" --sequential "%AB_DIR%\qwen-sequential.log" --min-reduction-mib 512 > "%AB_DIR%\qwen-vram-compare.log"
+          set "TEST_EXIT=%ERRORLEVEL%"
+          type "%AB_DIR%\qwen-vram-compare.log"
+          if not "%TEST_EXIT%"=="0" exit /b %TEST_EXIT%
+          python scripts/release/verify_residency_ab.py --model flux1_dev --resident "%AB_DIR%\flux-dev-resident.log" --sequential "%AB_DIR%\flux-dev-sequential.log" --min-reduction-mib 512 > "%AB_DIR%\flux-dev-vram-compare.log"
+          set "TEST_EXIT=%ERRORLEVEL%"
+          type "%AB_DIR%\flux-dev-vram-compare.log"
+          if not "%TEST_EXIT%"=="0" exit /b %TEST_EXIT%
 
           certutil -hashfile "%AB_DIR%\qwen-resident.rgb" SHA256 > "%AB_DIR%\checksums.sha256"
           certutil -hashfile "%AB_DIR%\qwen-sequential.rgb" SHA256 >> "%AB_DIR%\checksums.sha256"

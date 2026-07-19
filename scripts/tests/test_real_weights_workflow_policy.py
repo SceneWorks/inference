@@ -29,8 +29,9 @@ class RealWeightsWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("QWEN_IMAGE_SNAPSHOT: ${{ vars.QWEN_IMAGE_SNAPSHOT }}", self.job)
         self.assertIn("FLUX_DEV_DIR: ${{ vars.FLUX_DEV_DIR }}", self.job)
         self.assertNotIn("secrets.", self.job)
-        self.assertIn("--model qwen-image --snapshot \"%QWEN_IMAGE_SNAPSHOT%\"", self.job)
-        self.assertIn("--model flux-1-dev --snapshot \"%FLUX_DEV_DIR%\"", self.job)
+        self.assertIn("ensure_model_snapshot.py --model qwen-image --snapshot \"%QWEN_IMAGE_SNAPSHOT%\"", self.job)
+        self.assertIn("verify_model_snapshot.py --model flux-1-dev --snapshot \"%FLUX_DEV_DIR%\"", self.job)
+        self.assertNotIn("ensure_model_snapshot.py --model flux-1-dev", self.job)
 
         models = {
             model["key"]: model
@@ -44,6 +45,8 @@ class RealWeightsWorkflowPolicyTests(unittest.TestCase):
             models["flux-1-dev"]["revision"],
             "3de623fc3c33e44ffbe2bad470d0f45bccf2eb21",
         )
+        self.assertIn("tokenizer/tokenizer.json", models["qwen-image"]["expected_files"])
+        self.assertIn("tokenizer_2/tokenizer.json", models["flux-1-dev"]["expected_files"])
 
     def test_each_model_runs_resident_and_sequential_in_separate_processes(self):
         qwen_command = "cargo test --locked -p candle-gen-qwen-image --features cuda qwen_image_probed_generate_for_offload_ab"
@@ -53,6 +56,8 @@ class RealWeightsWorkflowPolicyTests(unittest.TestCase):
         self.assertIn('set "QWEN_OFFLOAD_MODE=spec-sequential"', self.job)
         self.assertIn('set "FLUX_OFFLOAD_MODE=spec-sequential"', self.job)
         self.assertIn('set "CANDLE_GEN_OFFLOAD="', self.job)
+        self.assertEqual(self.job.count("verify_residency_ab.py"), 2)
+        self.assertEqual(self.job.count("--min-reduction-mib 512"), 2)
 
     def test_raw_outputs_are_compared_and_always_uploaded_with_logs(self):
         self.assertEqual(self.job.count("fc /b"), 2)
@@ -65,6 +70,8 @@ class RealWeightsWorkflowPolicyTests(unittest.TestCase):
             "qwen-sequential.log",
             "flux-dev-resident.log",
             "flux-dev-sequential.log",
+            "qwen-vram-compare.log",
+            "flux-dev-vram-compare.log",
         ):
             self.assertIn(name, self.job)
         self.assertIn("if: always()", self.job)

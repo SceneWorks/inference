@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -41,6 +42,29 @@ class ModelSnapshotTests(unittest.TestCase):
             (snapshot / "config.json").unlink()
             with self.assertRaisesRegex(RuntimeError, "missing: config.json"):
                 verify_snapshot(MODEL, snapshot)
+
+    def test_weight_index_requires_every_referenced_shard(self) -> None:
+        indexed = {**MODEL, "expected_files": ["weights/model.safetensors.index.json"]}
+        with tempfile.TemporaryDirectory() as temporary:
+            snapshot = Path(temporary) / MODEL["revision"]
+            (snapshot / "weights").mkdir(parents=True)
+            (snapshot / "weights/model.safetensors.index.json").write_text(
+                json.dumps({"weight_map": {"layer.weight": "model-00001-of-00001.safetensors"}}),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(RuntimeError, "references missing shards"):
+                verify_snapshot(indexed, snapshot)
+            (snapshot / "weights/model-00001-of-00001.safetensors").write_bytes(b"fixture")
+            verify_snapshot(indexed, snapshot)
+
+    def test_rejects_invalid_weight_index(self) -> None:
+        indexed = {**MODEL, "expected_files": ["weights/model.safetensors.index.json"]}
+        with tempfile.TemporaryDirectory() as temporary:
+            snapshot = Path(temporary) / MODEL["revision"]
+            (snapshot / "weights").mkdir(parents=True)
+            (snapshot / "weights/model.safetensors.index.json").write_text("{}", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "invalid weight index"):
+                verify_snapshot(indexed, snapshot)
 
     def test_ensure_reuses_a_valid_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
