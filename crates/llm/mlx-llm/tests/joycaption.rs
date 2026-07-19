@@ -153,11 +153,17 @@ fn prepared_q4_snapshot_runs_full_vlm() {
         seed: Some(0),
         ..Default::default()
     };
-    let mut saw_done = false;
+    let mut streamed_tokens = 0u32;
+    let mut done_usage = None;
     let generated = provider
-        .generate(&request, &mut |event| {
-            if matches!(event, core_llm::StreamEvent::Done { .. }) {
-                saw_done = true;
+        .generate(&request, &mut |event| match event {
+            core_llm::StreamEvent::Token { .. } => streamed_tokens += 1,
+            core_llm::StreamEvent::Done { usage, .. } => {
+                assert!(
+                    done_usage.is_none(),
+                    "public streaming contract emitted Done twice"
+                );
+                done_usage = Some(usage);
             }
         })
         .expect("registered JoyCaption provider must generate from the real image request");
@@ -166,8 +172,17 @@ fn prepared_q4_snapshot_runs_full_vlm() {
         "prepared JoyCaption generation stopped before producing a token"
     );
     assert!(
-        saw_done,
-        "public streaming contract must emit terminal Done"
+        streamed_tokens > 0,
+        "public streaming contract must emit Token"
+    );
+    assert_eq!(
+        streamed_tokens, generated.usage.generated_tokens,
+        "streamed Token count must equal returned generated-token usage"
+    );
+    assert_eq!(
+        done_usage,
+        Some(generated.usage),
+        "terminal Done usage must equal returned generation usage"
     );
 }
 
