@@ -464,7 +464,11 @@ fn campplus_derives_discriminative_x_vectors() {
     let fb1 = enc
         .spk_embed_flow(&b1.samples, b1.sample_rate)
         .expect("flow spk-embed b1");
-    assert_eq!(fa1.len(), SPK_EMBED_DIM, "flow speaker embedding must be 80-d");
+    assert_eq!(
+        fa1.len(),
+        SPK_EMBED_DIM,
+        "flow speaker embedding must be 80-d"
+    );
     assert!(fa1.iter().all(|v| v.is_finite()));
     let same80 = cosine_similarity(&fa1, &fa2);
     let cross80 = cosine_similarity(&fa1, &fb1);
