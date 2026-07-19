@@ -83,6 +83,7 @@ mod tests {
             samples,
             sample_rate,
             channels,
+            ..Default::default()
         }
     }
 

@@ -359,6 +359,7 @@ impl Generator for KokoroGenerator {
             samples,
             sample_rate: SAMPLE_RATE,
             channels: 1,
+            ..Default::default()
         }))
     }
 }

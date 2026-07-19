@@ -213,6 +213,7 @@ pub fn mixdown(request: &MixRequest) -> Result<AudioTrack> {
         samples: out,
         sample_rate: request.sample_rate,
         channels: request.channels,
+        ..Default::default()
     })
 }
 

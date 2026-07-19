@@ -110,6 +110,7 @@ pub fn decode_audio_track(
         samples: interleaved.flatten_all()?.to_vec1::<f32>()?,
         sample_rate,
         channels: channels as u16,
+        ..Default::default()
     })
 }
 

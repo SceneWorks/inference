@@ -106,7 +106,7 @@ mod tests {
         assert_eq!(snapshot.snapshot_preparer_backends, ["candle"]);
         // The audio lane is Candle-native (sc-12901) and matches this bundle's own backend. Its
         // ordered id surface is the audio catalog's — shipped generators kokoro_82m (sc-12836) and
-        // moss_sfx_v2 (sc-12841), plus the voice-cloning identity embedder chatterbox_ve
+        // moss_sfx_v2 (sc-12841), acestep_v15_turbo (sc-12842), plus the voice-cloning identity embedder chatterbox_ve
         // (sc-12844); later stories extend these exact assertions in catalog order. The lane
         // carries its own composed candle preparer (sc-12835/sc-12836).
         #[cfg(feature = "audio")]
@@ -115,7 +115,7 @@ mod tests {
                 snapshot.audio_backend.as_deref(),
                 Some(super::AUDIO_BACKEND)
             );
-            assert_eq!(snapshot.audio_generator_ids, ["kokoro_82m", "moss_sfx_v2"]);
+            assert_eq!(snapshot.audio_generator_ids, ["kokoro_82m", "moss_sfx_v2", "acestep_v15_turbo"]);
             assert_eq!(snapshot.audio_voice_embedder_ids, ["chatterbox_ve"]);
             assert_eq!(snapshot.audio_transform_ids, ["openvoice_v2"]);
             assert_eq!(snapshot.audio_snapshot_preparer_backends, ["candle"]);
@@ -196,7 +196,7 @@ mod tests {
         assert!(matches!(descriptor.modality, gen_core::Modality::Audio));
         assert_eq!(
             catalog.snapshot().audio_generator_ids,
-            ["kokoro_82m", "moss_sfx_v2", "dummy-audio"]
+            ["kokoro_82m", "moss_sfx_v2", "acestep_v15_turbo", "dummy-audio"]
         );
     }
 

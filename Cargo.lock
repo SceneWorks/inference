@@ -210,10 +210,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "candle-audio-acestep"
+version = "0.0.0"
+dependencies = [
+ "candle-audio",
+ "candle-nn",
+ "core-llm",
+ "rand 0.9.5",
+ "rand_distr",
+ "sceneworks-gen-core-testkit",
+ "serde",
+ "serde_json",
+ "tokenizers 0.22.2",
+]
+
+[[package]]
 name = "candle-audio-catalog"
 version = "0.0.0"
 dependencies = [
  "candle-audio",
+ "candle-audio-acestep",
  "candle-audio-chatterbox-ve",
  "candle-audio-kokoro",
  "candle-audio-moss-sfx",

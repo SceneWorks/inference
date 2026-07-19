@@ -295,6 +295,7 @@ impl Generator for MossSfxGenerator {
             samples,
             sample_rate: SAMPLE_RATE,
             channels: 1,
+            ..Default::default()
         }))
     }
 }

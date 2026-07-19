@@ -1,0 +1,49 @@
+[package]
+name = "candle-audio-acestep"
+version = "0.0.0"
+edition = "2021"
+description = "ACE-Step 1.5 text-to-music (+ lyrics) provider for the SceneWorks Candle audio lane (sc-12842) — a native port of the ACE-Step 1.5 stack through the Generator contract: a Qwen3-0.6B text encoder + AceStepConditionEncoder (lyric/timbre) planner, a ~2B AceStepTransformer1DModel DiT with flow-matching sampling, and a stereo AutoencoderOobleck VAE decoder at 48 kHz / 25 fps latents (MIT weights)."
+license = "Apache-2.0"
+repository = "https://github.com/SceneWorks/inference"
+keywords = ["candle", "audio", "music", "diffusion", "flow-matching"]
+categories = ["science"]
+
+[dependencies]
+# Shared candle audio commons (device seam, pinned-SHA hub resolution, WAV encode, DSP,
+# `AudioError → gen_core::Error` bridge). Re-exports `gen_core` and `candle_core`, so this crate
+# resolves the SAME candle build + gen-core rev as the catalog it registers into.
+candle-audio = { path = "../candle-audio" }
+# candle-nn at the workspace's pinned candle revision (Linear/Conv1d/ConvTranspose1d/RmsNorm/
+# LayerNorm/VarBuilder — the DiT, condition encoder, Qwen3 encoder, and Oobleck decoder are built
+# from these primitives).
+candle-nn = { workspace = true }
+# Snapshot-preparer contract types for the audio-lane ACE-Step preparer probe
+# (`SnapshotPreparerRegistration` lives in core-llm; composed by candle-audio-catalog).
+core-llm = { workspace = true }
+# The Qwen tokenizer (`tokenizer/tokenizer.json` in the pinned snapshot). Workspace pin — the
+# 0.22 side of the intentional tokenizers 0.21/0.22 split (check-workspace.py).
+tokenizers = { workspace = true }
+# Config parsing (model_index.json / per-component configs / scheduler config). serde is not a
+# [workspace.dependencies] entry (siblings use serde_json only); the version matches the one
+# already resolved in the workspace lockfile.
+serde = { version = "1", features = ["derive"] }
+serde_json = { workspace = true }
+# Seeded RNG for the flow-matching initial noise (the reproducibility law: same request+seed ⇒
+# byte-identical samples). Same crates the media providers use for seeded noise draws.
+rand = { workspace = true }
+rand_distr = { workspace = true }
+
+[dev-dependencies]
+# HF-cache snapshot resolution for the `#[ignore]`d real-weight conformance test.
+candle-audio = { path = "../candle-audio", features = ["testkit"] }
+# The backend-neutral generator conformance suite (validate-honesty, progress, typed
+# cancellation, seed determinism) the real-weight test runs against the loaded provider.
+sceneworks-gen-core-testkit = { workspace = true }
+
+[features]
+default = []
+# Apple Metal GPU backend — forwarded to the shared audio commons. Not in `default` (the audio
+# lane ships CPU-first everywhere; see docs/architecture/audio-backend-strategy.md).
+metal = ["candle-audio/metal"]
+# NVIDIA CUDA backend — forwarded to the shared audio commons. Not in `default`.
+cuda = ["candle-audio/cuda"]

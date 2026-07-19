@@ -321,6 +321,7 @@ mod tests {
             samples,
             sample_rate,
             channels: 1,
+            ..Default::default()
         }
     }
 
