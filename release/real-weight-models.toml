@@ -65,6 +65,29 @@ expected_files = [
 ]
 
 [[models]]
+key = "acestep-v15-turbo"
+repository = "ACE-Step/acestep-v15-xl-turbo-diffusers"
+revision = "200ba991ae448051e14b0183157e35c2d27c9fb0"
+license = "MIT"
+size_class = "large"
+profiles = ["audio-macos"]
+environment = ["ACESTEP_SNAPSHOT"]
+expected_files = [
+    "model_index.json",
+    "scheduler/scheduler_config.json",
+    "transformer/config.json",
+    "transformer/diffusion_pytorch_model.safetensors.index.json",
+    "condition_encoder/config.json",
+    "condition_encoder/diffusion_pytorch_model.safetensors",
+    "text_encoder/config.json",
+    "text_encoder/model.safetensors",
+    "tokenizer/tokenizer.json",
+    "vae/config.json",
+    "vae/diffusion_pytorch_model.safetensors",
+    "silence_latent.pt",
+]
+
+[[models]]
 key = "chatterbox-ve"
 repository = "ResembleAI/chatterbox"
 revision = "5bb1f6ee58e50c3b8d408bc82a6d3740c2db6e18"

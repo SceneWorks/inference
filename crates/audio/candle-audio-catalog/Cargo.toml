@@ -15,6 +15,7 @@ candle-audio = { path = "../candle-audio" }
 # OpenVoice V2 voice conversion — the first real AudioTransform).
 candle-audio-kokoro = { path = "../candle-audio-kokoro" }
 candle-audio-moss-sfx = { path = "../candle-audio-moss-sfx" }
+candle-audio-acestep = { path = "../candle-audio-acestep" }
 candle-audio-chatterbox-ve = { path = "../candle-audio-chatterbox-ve" }
 candle-audio-openvoice = { path = "../candle-audio-openvoice" }
 # The audio lane's snapshot-preparer composition (sc-12836): the lane's single `candle`
@@ -32,6 +33,7 @@ metal = [
     "candle-audio/metal",
     "candle-audio-kokoro/metal",
     "candle-audio-moss-sfx/metal",
+    "candle-audio-acestep/metal",
     "candle-audio-chatterbox-ve/metal",
     "candle-audio-openvoice/metal",
 ]
@@ -39,6 +41,7 @@ cuda = [
     "candle-audio/cuda",
     "candle-audio-kokoro/cuda",
     "candle-audio-moss-sfx/cuda",
+    "candle-audio-acestep/cuda",
     "candle-audio-chatterbox-ve/cuda",
     "candle-audio-openvoice/cuda",
 ]

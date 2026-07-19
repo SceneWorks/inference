@@ -67,6 +67,7 @@ jobs:
     env:
       KOKORO_SNAPSHOT: ${{ vars.KOKORO_SNAPSHOT }}
       MOSS_SFX_SNAPSHOT: ${{ vars.MOSS_SFX_SNAPSHOT }}
+      ACESTEP_SNAPSHOT: ${{ vars.ACESTEP_SNAPSHOT }}
       CHATTERBOX_VE_SNAPSHOT: ${{ vars.CHATTERBOX_VE_SNAPSHOT }}
       CHATTERBOX_SNAPSHOT: ${{ vars.CHATTERBOX_SNAPSHOT }}
       OPENVOICE_V2_SNAPSHOT: ${{ vars.OPENVOICE_V2_SNAPSHOT }}
@@ -79,6 +80,7 @@ jobs:
           python3 -m pip install --disable-pip-version-check --target "$RUNNER_TEMP/huggingface-hub" "huggingface_hub==1.20.1"
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model kokoro-82m --snapshot "$KOKORO_SNAPSHOT"
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model moss-soundeffect-v2 --snapshot "$MOSS_SFX_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model acestep-v15-turbo --snapshot "$ACESTEP_SNAPSHOT"
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model chatterbox-ve --snapshot "$CHATTERBOX_VE_SNAPSHOT"
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model chatterbox --snapshot "$CHATTERBOX_SNAPSHOT"
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model openvoice-v2 --snapshot "$OPENVOICE_V2_SNAPSHOT"
@@ -88,6 +90,10 @@ jobs:
           cargo test --locked -p candle-audio-kokoro --test conformance kokoro_wav_conformance -- --ignored --nocapture
           cargo test --locked -p candle-audio-moss-sfx --test conformance moss_sfx_conformance -- --ignored --nocapture
           cargo test --locked -p candle-audio-moss-sfx --test conformance moss_sfx_wav_conformance -- --ignored --nocapture
+          # ACE-Step 1.5 music/song (sc-12842): the flow-matching DiT + Oobleck VAE producing a
+          # non-degenerate, rhythmic stereo mix (frame-energy variation, broadband spectrum, beat).
+          cargo test --locked -p candle-audio-acestep --test conformance acestep_conformance -- --ignored --nocapture
+          cargo test --locked -p candle-audio-acestep --test conformance acestep_music_wav_conformance -- --ignored --nocapture
           # Chatterbox voice embedder (sc-12844): the sc-12838 release gate. Uses the Kokoro
           # snapshot above for the distinct reference voices it embeds.
           cargo test --locked -p candle-audio-chatterbox-ve --test conformance chatterbox_ve_discriminates_speakers -- --ignored --nocapture

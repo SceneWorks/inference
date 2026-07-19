@@ -37,6 +37,7 @@ pub const AUDIO_BACKEND: &str = "candle";
 
 /// Complete audio provider package surface owned by the Candle audio lane, in catalog order.
 pub mod providers {
+    pub use candle_audio_acestep;
     pub use candle_audio_chatterbox_ve;
     pub use candle_audio_kokoro;
     pub use candle_audio_moss_sfx;
@@ -50,6 +51,7 @@ pub mod providers {
 pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistryBuilder {
     let registry = candle_audio_kokoro::register_providers(registry);
     let registry = candle_audio_moss_sfx::register_providers(registry);
+    let registry = candle_audio_acestep::register_providers(registry);
     let registry = candle_audio_chatterbox_ve::register_providers(registry);
     candle_audio_openvoice::register_providers(registry)
 }
@@ -75,6 +77,7 @@ fn lane_backend() -> &'static str {
 fn lane_can_prepare(spec: &core_llm::PrepareSpec) -> bool {
     candle_audio_kokoro::prepare::can_prepare(spec)
         || candle_audio_moss_sfx::prepare::can_prepare(spec)
+        || candle_audio_acestep::prepare::can_prepare(spec)
         || candle_audio_openvoice::prepare::can_prepare(spec)
         || (candle_llm::prepare::REGISTRATION.can_prepare)(spec)
 }
@@ -84,6 +87,8 @@ fn lane_prepare(spec: &core_llm::PrepareSpec) -> core_llm::Result<core_llm::Prep
         candle_audio_kokoro::prepare::prepare(spec)
     } else if candle_audio_moss_sfx::prepare::can_prepare(spec) {
         candle_audio_moss_sfx::prepare::prepare(spec)
+    } else if candle_audio_acestep::prepare::can_prepare(spec) {
+        candle_audio_acestep::prepare::prepare(spec)
     } else if candle_audio_openvoice::prepare::can_prepare(spec) {
         candle_audio_openvoice::prepare::prepare(spec)
     } else {
@@ -125,7 +130,7 @@ mod tests {
             .map(|r| (r.descriptor)().id.to_string())
             .collect();
 
-        assert_eq!(generators, ["kokoro_82m", "moss_sfx_v2"]);
+        assert_eq!(generators, ["kokoro_82m", "moss_sfx_v2", "acestep_v15_turbo"]);
         // The voice-cloning identity embedder surfaces as its own kind (sc-12844), in catalog order.
         let voice_embedders: Vec<String> = registry
             .voice_embedders()
@@ -209,6 +214,23 @@ mod tests {
         let spec = super::core_llm::PrepareSpec::dense(&moss, moss.join("out"));
         assert!((regs[0].can_prepare)(&spec));
         let _ = std::fs::remove_dir_all(&moss);
+        // ...an ACE-Step snapshot dir is accepted too (sc-12842)...
+        let ace = std::env::temp_dir().join("audio-catalog-acestep-probe");
+        let _ = std::fs::remove_dir_all(&ace);
+        std::fs::create_dir_all(ace.join("transformer")).unwrap();
+        std::fs::write(
+            ace.join("model_index.json"),
+            r#"{"_class_name": "AceStepPipeline"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            ace.join("transformer/diffusion_pytorch_model.safetensors.index.json"),
+            r#"{"weight_map": {"a": "diffusion_pytorch_model.safetensors"}}"#,
+        )
+        .unwrap();
+        let spec = super::core_llm::PrepareSpec::dense(&ace, ace.join("out"));
+        assert!((regs[0].can_prepare)(&spec));
+        let _ = std::fs::remove_dir_all(&ace);
         // ...an OpenVoice V2 converter snapshot dir is accepted too (sc-13223)...
         let ov = std::env::temp_dir().join("audio-catalog-openvoice-probe");
         let _ = std::fs::remove_dir_all(&ov);

@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/audio/candle-audio",
+    "crates/audio/candle-audio-acestep",
     "crates/audio/candle-audio-catalog",
     "crates/audio/candle-audio-chatterbox",
     "crates/audio/candle-audio-chatterbox-ve",
