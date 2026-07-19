@@ -103,6 +103,81 @@ pub fn nvidia_smi_min_free_gib() -> Option<f64> {
     query_min_gib("memory.free")
 }
 
+/// **Free** VRAM (GiB) of the GPU the render is PINNED to — Candle's `cuda:0`, i.e. the FIRST entry of
+/// `CUDA_VISIBLE_DEVICES` (unset ⇒ physical 0), resolved the same way `testkit::probe_gpu` derives the
+/// sampled ordinal so a decode and the peak probe stay on the same card. Reads a trusted absolute
+/// `nvidia-smi -i <ordinal> --query-gpu=memory.free` (never a bare `PATH` lookup; sc-9014 / F-030).
+///
+/// Unlike [`nvidia_smi_min_free_gib`], a busy CO-TENANT GPU cannot shrink this: a decode pinned to an
+/// idle card budgets against THAT card's free, not the least-free card on the box (sc-13298). The
+/// worker pins one GPU per render via `CUDA_VISIBLE_DEVICES` (worker `supervisor.rs`), so `cuda:0` IS
+/// that device and its CVD entry IS the physical ordinal `-i` wants.
+///
+/// ⚠️ The `-i <ordinal>` mapping assumes Candle's `CUDA_VISIBLE_DEVICES` ordinal equals nvidia-smi's
+/// PCI-bus index — true when `CUDA_DEVICE_ORDER=PCI_BUS_ID` or the GPUs are HOMOGENEOUS (the prod boxes
+/// run 2× identical cards, where the default `FASTEST_FIRST` order tie-breaks on PCI id and coincides).
+/// On a HETEROGENEOUS box under the default order the two can diverge and this could sample the wrong
+/// card (over-budgeting if that card has more free); that is the SAME assumption the existing
+/// `testkit::probe_gpu` / `used_mib` already make, so this stays consistent with them rather than
+/// forking a second contract. Export `CUDA_DEVICE_ORDER=PCI_BUS_ID` to make it exact on mixed hardware.
+///
+/// Falls back to [`nvidia_smi_min_free_gib`] (the all-GPU min — the prior behaviour, conservative) when
+/// the pinned ordinal cannot be resolved (an empty "no devices" value, or a UUID/MIG handle nvidia-smi
+/// cannot map) or the per-device query fails, so the safe direction is preserved rather than lost.
+/// `None` only when even that min has no trusted `nvidia-smi` to read.
+pub fn nvidia_smi_rendered_free_gib() -> Option<f64> {
+    rendered_gpu_ordinal()
+        .and_then(query_free_gib_for)
+        .or_else(nvidia_smi_min_free_gib)
+}
+
+/// The physical GPU ordinal Candle's `cuda:0` renders on, from `CUDA_VISIBLE_DEVICES` (`std::env`).
+/// The production-path twin of `testkit::probe_gpu`, delegating to [`parse_rendered_ordinal`].
+fn rendered_gpu_ordinal() -> Option<usize> {
+    parse_rendered_ordinal(std::env::var("CUDA_VISIBLE_DEVICES").ok().as_deref())
+}
+
+/// Pure core of [`rendered_gpu_ordinal`] — split out so the `CUDA_VISIBLE_DEVICES` parsing is unit-
+/// testable without mutating process-global env (mirrors `testkit::parse_probe_gpu`). Unset (`None`) ⇒
+/// physical 0; a numeric FIRST entry ⇒ that ordinal (`CUDA_VISIBLE_DEVICES` remaps Candle's logical
+/// indices but nvidia-smi ignores it, so `cuda:0` = the first visible physical ordinal). An empty /
+/// UUID / MIG / otherwise non-numeric first entry ⇒ `None`, so the caller falls back to the all-GPU
+/// min rather than sample the wrong card. Returns `None` instead of panicking (unlike the test-harness
+/// probe) because this runs inside a live render.
+fn parse_rendered_ordinal(raw: Option<&str>) -> Option<usize> {
+    match raw {
+        None => Some(0),
+        Some(raw) => raw
+            .split(',')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .parse::<usize>()
+            .ok(),
+    }
+}
+
+/// **Free** VRAM (GiB) of a SINGLE physical GPU `gpu`, via a trusted absolute
+/// `nvidia-smi -i <gpu> --query-gpu=memory.free`. `None` when no trusted `nvidia-smi` exists, the query
+/// fails (e.g. `gpu` is out of range), or the value is missing. Reuses [`parse_min_mib_line_gib`] — with
+/// `-i` the output is a single line, so its "MIN across lines" is just that one device's value.
+fn query_free_gib_for(gpu: usize) -> Option<f64> {
+    let exe = resolve_nvidia_smi()?;
+    let out = Command::new(exe)
+        .args([
+            "--query-gpu=memory.free",
+            "--format=csv,noheader,nounits",
+            "-i",
+            &gpu.to_string(),
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_min_mib_line_gib(&String::from_utf8_lossy(&out.stdout))
+}
+
 /// Run the trusted-absolute `nvidia-smi` for a single `--query-gpu=<field>` (one MiB value per line,
 /// one line per GPU) and reduce to the MIN across GPUs in GiB. Shared by the total and free probes so
 /// the trusted-path resolution + parsing lives in exactly one place.
@@ -200,5 +275,50 @@ mod tests {
         assert_eq!(parse_min_mib_line_gib("no gpus\n\n"), None);
         // Zero/negative are filtered out (a driver quirk) → None, not 0.
         assert_eq!(parse_min_mib_line_gib("0\n"), None);
+    }
+
+    #[test]
+    fn parse_rendered_ordinal_maps_cuda_visible_devices() {
+        // Unset ⇒ every device visible; Candle's cuda:0 is physical 0.
+        assert_eq!(parse_rendered_ordinal(None), Some(0));
+        // The worker pins one GPU: CUDA_VISIBLE_DEVICES=<gpu_id> ⇒ that physical ordinal.
+        assert_eq!(parse_rendered_ordinal(Some("1")), Some(1));
+        // Multiple visible ⇒ cuda:0 is the FIRST entry (what `-i` must sample).
+        assert_eq!(parse_rendered_ordinal(Some("2,3")), Some(2));
+        assert_eq!(parse_rendered_ordinal(Some(" 1 ")), Some(1));
+        // Set-but-empty ("no devices"), a UUID, or a MIG handle cannot map to an `-i` ordinal ⇒ None,
+        // so the caller falls back to the all-GPU min rather than sample the wrong card. Unlike
+        // `testkit::probe_gpu`, this NEVER panics — it runs inside a live render.
+        assert_eq!(parse_rendered_ordinal(Some("")), None);
+        assert_eq!(parse_rendered_ordinal(Some("GPU-1a2b3c4d")), None);
+        assert_eq!(parse_rendered_ordinal(Some("MIG-abc")), None);
+    }
+
+    /// Real-hardware proof (sc-13298) that `nvidia_smi_rendered_free_gib` samples the PINNED device,
+    /// not the all-GPU min. Needs a box with ≥2 GPUs at different free levels; run manually, once per
+    /// card: `CUDA_VISIBLE_DEVICES=0 cargo test ... rendered_free_reads_the_pinned_device -- --ignored
+    /// --nocapture`, then `=1`. `rendered_free` must track the selected card (so on the MORE-free card
+    /// it is STRICTLY above the all-GPU min — the poison the old min-based probe suffered), while
+    /// `nvidia_smi_min_free_gib` stays the least-free card regardless of `CUDA_VISIBLE_DEVICES`.
+    #[test]
+    #[ignore = "needs a real multi-GPU box; run per-card with CUDA_VISIBLE_DEVICES set + --ignored"]
+    fn rendered_free_reads_the_pinned_device_not_the_all_gpu_min() {
+        let rendered = nvidia_smi_rendered_free_gib().expect("rendered free (needs nvidia-smi)");
+        let min = nvidia_smi_min_free_gib().expect("all-gpu min free");
+        let ordinal = rendered_gpu_ordinal().expect("a resolvable pinned ordinal");
+        let pinned_direct = query_free_gib_for(ordinal).expect("pinned device direct free");
+        let cvd = std::env::var("CUDA_VISIBLE_DEVICES").unwrap_or_else(|_| "<unset>".into());
+        eprintln!(
+            "CUDA_VISIBLE_DEVICES={cvd} (ordinal {ordinal}): rendered_free={rendered:.3} GiB | \
+             pinned-direct={pinned_direct:.3} GiB | all-gpu min={min:.3} GiB"
+        );
+        // The real guard: rendered_free must equal the PINNED device's free, not the all-GPU min. This
+        // FAILS if the probe is wired back to `nvidia_smi_min_free_gib` on any box where the pinned card
+        // is not the least-free one (the sc-13298 regression) — pin the MORE-free card to exercise it.
+        assert!(
+            (rendered - pinned_direct).abs() < 0.05,
+            "rendered_free {rendered} must equal the pinned device's free {pinned_direct}, \
+             not the all-gpu min {min}"
+        );
     }
 }
