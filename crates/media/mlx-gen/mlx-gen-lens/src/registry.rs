@@ -530,7 +530,7 @@ fn load_base(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     load_with(spec, BASE_DEFAULTS)
 }
 
-/// Per-component on-disk footprint (sc-10894) for the MLX fit-gate's staged-residency split — the
+/// Per-component resident-weight estimate (sc-10894/sc-11924) for the MLX fit-gate's staged split —
 /// gpt-oss MoE text encoder (`text_encoder/`), the DiT (`transformer/`), and the Flux.2 VAE (`vae/`),
 /// summed from the exact snapshot subdirs [`crate::pipeline`] loads. The text encoder is the ~38 GB /
 /// 20B-param bulk the `Sequential` schedule drops before the DiT loads, so an accurate split here is
@@ -538,12 +538,27 @@ fn load_base(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 pub(crate) fn component_footprint(
     spec: &mlx_gen::LoadSpec,
 ) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
-    mlx_gen::PerComponentBytes::from_spec_subdirs(
+    let mut footprint = mlx_gen::PerComponentBytes::from_spec_subdirs(
         spec,
         &["text_encoder"],
         &["transformer"],
         &["vae"],
-    )
+    )?;
+    let root = match &spec.weights {
+        mlx_gen::WeightsSource::Dir(root) => root,
+        mlx_gen::WeightsSource::File(_) => return Ok(footprint),
+    };
+    let packed_turnkey = mlx_gen::quant::packed_quant_bits(root, "text_encoder")?.is_some();
+    if spec.quantize.is_none() && !packed_turnkey {
+        // sc-11924: the dense Lens snapshot stores the gpt-oss MoE experts as MXFP4 but the loader
+        // materializes them at bf16. The 1024² real-weight calibration measured 30.07 GiB resident
+        // for the encoder (vs 12.83 GiB on disk). Keep this provider-specific: measured q4/q8 and
+        // packed turnkeys retain their disk-derived footprint, while other bf16 families receive no
+        // blanket uplift.
+        const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+        footprint.text_encoder = footprint.text_encoder.max((30.07 * GIB).ceil() as u64);
+    }
+    Ok(footprint)
 }
 
 mlx_gen::register_generators! {
@@ -558,6 +573,84 @@ mlx_gen::register_generators! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn footprint_spec(quantize: Option<mlx_gen::Quant>) -> (std::path::PathBuf, LoadSpec) {
+        let tier = if quantize.is_some() { "q8" } else { "dense" };
+        let root = std::env::temp_dir().join(format!(
+            "mlx_gen_lens_sc11924_{}_{}",
+            std::process::id(),
+            tier
+        ));
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::create_dir(&root).expect("tempdir");
+        for (component, bytes) in [("text_encoder", 13), ("transformer", 11), ("vae", 3)] {
+            let dir = root.join(component);
+            std::fs::create_dir(&dir).expect("component dir");
+            std::fs::write(dir.join("model.safetensors"), vec![0; bytes]).expect("fixture");
+        }
+        let mut spec = LoadSpec::new(mlx_gen::WeightsSource::Dir(root.clone()));
+        spec.quantize = quantize;
+        (root, spec)
+    }
+
+    #[test]
+    fn dense_footprint_accounts_for_mxfp4_materialization() {
+        let (root, spec) = footprint_spec(None);
+        let fp = component_footprint(&spec).expect("footprint");
+        let gib: f64 = 1024.0 * 1024.0 * 1024.0;
+        assert_eq!(fp.text_encoder, (30.07 * gib).ceil() as u64);
+        assert_eq!(fp.dit, 11);
+        assert_eq!(fp.vae, 3);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn quantized_footprint_remains_disk_derived() {
+        for quant in [mlx_gen::Quant::Q4, mlx_gen::Quant::Q8] {
+            let (root, spec) = footprint_spec(Some(quant));
+            assert_eq!(
+                component_footprint(&spec).expect("footprint"),
+                mlx_gen::PerComponentBytes {
+                    text_encoder: 13,
+                    dit: 11,
+                    vae: 3,
+                }
+            );
+            std::fs::remove_dir_all(root).ok();
+        }
+    }
+
+    #[test]
+    fn packed_turnkey_without_quant_request_remains_disk_derived() {
+        let (root, spec) = footprint_spec(None);
+        std::fs::write(
+            root.join("text_encoder").join("config.json"),
+            r#"{"quantization":{"bits":8,"group_size":64}}"#,
+        )
+        .expect("packed marker");
+        assert_eq!(
+            component_footprint(&spec).expect("footprint").text_encoder,
+            13
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn dense_calibration_never_reduces_a_larger_disk_estimate() {
+        let (root, spec) = footprint_spec(None);
+        let larger = (30.07_f64 * 1024.0 * 1024.0 * 1024.0).ceil() as u64 + 1;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(root.join("text_encoder").join("model.safetensors"))
+            .expect("fixture")
+            .set_len(larger)
+            .expect("sparse fixture");
+        assert_eq!(
+            component_footprint(&spec).expect("footprint").text_encoder,
+            larger
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
 
     /// F-030 (sc-11133): the emitted `total` tracks the (possibly truncated) schedule so the bar
     /// reaches its total and the `cur >= total` Decoding trigger fires. Full schedule → `steps`;
