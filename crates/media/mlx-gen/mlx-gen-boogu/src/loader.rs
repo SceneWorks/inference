@@ -13,10 +13,27 @@ use crate::text_encoder::{BooguTextEncoder, BooguTextEncoderConfig};
 use crate::transformer::BooguTransformer;
 use crate::vision::{VisionConfig, VisionTower};
 
+fn prepare_text_weights(mut w: Weights) -> Result<Weights> {
+    let packed: std::collections::HashSet<String> = w
+        .keys()
+        .filter_map(|key| key.strip_suffix(".scales").map(str::to_owned))
+        .collect();
+    w.cast_matching(mlx_rs::Dtype::Bfloat16, |key| {
+        key.starts_with("model.language_model.")
+            && key.ends_with(".weight")
+            && !key.contains("norm")
+            && !packed.contains(key.strip_suffix(".weight").unwrap_or(key))
+    })?;
+    w.cast_matching(mlx_rs::Dtype::Float32, |key| {
+        key.starts_with("model.language_model.") && key.ends_with("norm.weight")
+    })?;
+    Ok(w)
+}
+
 /// Load the Qwen3-VL-8B condition encoder from a snapshot's `mllm/` dir. The text tower lives under
 /// `model.language_model.*`; the visual tower + `lm_head` are loaded but unused for text-to-image.
 pub fn load_text_encoder(root: impl AsRef<Path>) -> Result<BooguTextEncoder> {
-    let w = Weights::from_dir(root.as_ref().join("mllm"))?;
+    let w = prepare_text_weights(Weights::from_dir(root.as_ref().join("mllm"))?)?;
     BooguTextEncoder::from_weights(
         &w,
         "model.language_model",

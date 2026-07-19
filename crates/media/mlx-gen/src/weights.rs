@@ -145,6 +145,22 @@ impl Weights {
         }
         Ok(())
     }
+
+    /// Cast tensors selected by key while preserving every unselected tensor verbatim.
+    /// This is useful for mixed-storage modules whose large projection/embedding weights use a
+    /// compact dtype while norms, packed codes, scales, and unrelated subtrees retain theirs.
+    pub fn cast_matching(
+        &mut self,
+        dtype: Dtype,
+        mut selected: impl FnMut(&str) -> bool,
+    ) -> Result<()> {
+        for (key, value) in &mut self.tensors {
+            if selected(key) && value.dtype() != dtype {
+                *value = value.as_dtype(dtype)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Cast to a target compute dtype (e.g. bf16, mirroring mflux's torch_convert downcast). A thin
@@ -201,6 +217,35 @@ mod tests {
         assert_eq!(
             to_dtype(&a, Dtype::Bfloat16).unwrap().dtype(),
             Dtype::Bfloat16
+        );
+    }
+
+    #[test]
+    fn cast_matching_only_casts_selected_tensors() {
+        let mut w = Weights::empty();
+        w.insert(
+            "language_model.layers.0.mlp.weight",
+            Array::from_slice(&[1.0f32], &[1]),
+        );
+        w.insert(
+            "language_model.layers.0.norm.weight",
+            Array::from_slice(&[1.0f32], &[1]),
+        );
+
+        w.cast_matching(Dtype::Bfloat16, |key| key.contains("mlp"))
+            .unwrap();
+
+        assert_eq!(
+            w.require("language_model.layers.0.mlp.weight")
+                .unwrap()
+                .dtype(),
+            Dtype::Bfloat16
+        );
+        assert_eq!(
+            w.require("language_model.layers.0.norm.weight")
+                .unwrap()
+                .dtype(),
+            Dtype::Float32
         );
     }
 
