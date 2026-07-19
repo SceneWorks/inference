@@ -265,7 +265,7 @@ mod tests {
     #[test]
     fn to_uint8_frames_clips_and_scales() {
         let dev = Device::Cpu;
-        // 1 frame, 1×2 pixels, 3 channels: pixel0=(-2,-1,0)→((x+1)/2)=(-0.5,0,0.5)→clip→(0,0,127);
+        // 1 frame, 1×2 pixels, 3 channels: pixel0=(-2,-1,0)→((x+1)/2)=(-0.5,0,0.5)→round→(0,0,128);
         // pixel1=(1,2,3)→(1,1.5,2)→clip→(255,255,255).
         let v = Tensor::from_vec(
             vec![-2.0f32, 1.0, -1.0, 2.0, 0.0, 3.0],
@@ -276,7 +276,7 @@ mod tests {
         let out = to_uint8_frames(&v).unwrap();
         assert_eq!(out.dims(), &[1, 1, 2, 3]);
         let px = out.flatten_all().unwrap().to_vec1::<u8>().unwrap();
-        assert_eq!(px, vec![0, 0, 127, 255, 255, 255]);
+        assert_eq!(px, vec![0, 0, 128, 255, 255, 255]);
     }
 
     /// `frames_to_images` splits `(F, H, W, 3)` into per-frame RGB8 `Image`s.
