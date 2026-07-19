@@ -28,9 +28,10 @@
 //!
 //! ## Checkpoint provenance
 //!
-//! `openai/whisper-base` (MIT) — the 74 M-param multilingual base checkpoint, chosen for a fast CPU
-//! real-weights test. Pinned at commit [`HUB_REVISION`] (a config.json + tokenizer.json +
-//! model.safetensors revision; 80-mel).
+//! `openai/whisper-base` (Apache-2.0 — the checkpoint's model-card license, distinct from the MIT
+//! license on OpenAI's Whisper *source* repository) — the 74 M-param multilingual base checkpoint,
+//! chosen for a fast CPU real-weights test. Pinned at commit [`HUB_REVISION`] (a config.json +
+//! tokenizer.json + model.safetensors revision; 80-mel).
 
 use std::path::PathBuf;
 use std::sync::Mutex;

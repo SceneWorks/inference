@@ -23,8 +23,10 @@
 //! - [`prepare`] — the audio-lane snapshot-preparation accommodation (a validated passthrough;
 //!   Whisper snapshots describe an ASR arch the LLM preparer should not own).
 //!
-//! Weights resolve through the audio lane's pinned-SHA hub path: `openai/whisper-base` (MIT) at an
-//! immutable commit, never a mutable ref. **No Python at runtime.**
+//! Weights resolve through the audio lane's pinned-SHA hub path: `openai/whisper-base`
+//! (Apache-2.0 — the checkpoint's model-card license, distinct from the MIT license on OpenAI's
+//! Whisper *source* repository) at an immutable commit, never a mutable ref. **No Python at
+//! runtime.**
 
 pub use candle_audio;
 pub use candle_audio::gen_core;
