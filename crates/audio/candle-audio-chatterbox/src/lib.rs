@@ -25,10 +25,13 @@
 //! ([`text`] — `punc_norm` + the `EnTokenizer` BPE), the full provider contract, and the
 //! conditioning mapping ([`model`]). sc-13235 ports the **s3tokenizer** ([`s3tokenizer`]) — the
 //! first of S3Gen's four networks (a Whisper-v2 FSMN mel encoder + FSQ quantizer → 25 Hz speech
-//! tokens); it now fills T3's reference-conditioning prompt (empty before). The remaining **three**
-//! S3Gen networks (CAMPPlus x-vector, CosyVoice flow-matching decoder, HiFTNet vocoder — see
-//! [`s3gen`]) are **not yet ported**; the generator's `generate()` runs T3 to produce real speech
-//! tokens and then returns a typed error at the S3Gen boundary rather than fabricate audio.
+//! tokens); it now fills T3's reference-conditioning prompt (empty before). sc-13236 ports the
+//! **CAMPPlus speaker encoder** ([`campplus`]) — the D-TDNN x-vector network (an 80-bin Kaldi-fbank
+//! → 192-d x-vector) S3Gen's flow conditions on, plus its L2-norm + `spk_embed_affine_layer`
+//! (192→80) derivation. The remaining **two** S3Gen networks (the CosyVoice flow-matching decoder
+//! and the HiFTNet vocoder — see [`s3gen`]) are **not yet ported**; the generator's `generate()`
+//! runs T3 to produce real speech tokens and then returns a typed error at the S3Gen boundary
+//! rather than fabricate audio.
 //! Consequently the generator is **not yet registered into `candle-audio-catalog`'s shipping
 //! surface** (registering a generator that cannot render audio would be a false advertisement, and
 //! would fail the gen-core generator conformance suite): that registration, the ordered-id surface
@@ -42,6 +45,7 @@
 pub use candle_audio;
 pub use candle_audio::gen_core;
 
+pub mod campplus;
 pub mod config;
 pub mod model;
 pub mod prepare;
@@ -50,6 +54,7 @@ pub mod s3tokenizer;
 pub mod t3;
 pub mod text;
 
+pub use campplus::Campplus;
 pub use config::{S3GenConfig, S3TokenizerConfig, T3Config};
 pub use model::{
     descriptor, load, load_generator, resolve_pinned_snapshot, ChatterboxGenerator, HUB_REPO,

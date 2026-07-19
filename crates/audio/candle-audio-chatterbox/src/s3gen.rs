@@ -19,22 +19,26 @@
 //!
 //! The T3 LM (the clone's text→speech-token brain — see [`crate::t3`]) and the full provider
 //! contract/conditioning surface were ported in sc-13222. The **s3tokenizer** — the first of the
-//! four S3Gen networks (the Whisper-v2 FSMN mel encoder + FSQ quantizer) — is now ported natively
+//! four S3Gen networks (the Whisper-v2 FSMN mel encoder + FSQ quantizer) — is ported natively
 //! (sc-13235; see [`crate::s3tokenizer`]): it derives the 25 Hz reference speech tokens T3's
-//! conditioning prompt and S3Gen's `prompt_token` need. The **three remaining** networks (CAMPPlus
-//! x-vector, CosyVoice flow-matching decoder, HiFTNet vocoder) are still to port, so rather than
+//! conditioning prompt and S3Gen's `prompt_token` need. The **CAMPPlus speaker encoder** — the
+//! second network (an 80-bin Kaldi-fbank → 192-d D-TDNN x-vector) — is now ported too (sc-13236;
+//! see [`crate::campplus`]): it derives the S3Gen flow's speaker conditioning. The **two remaining**
+//! networks (CosyVoice flow-matching decoder, HiFTNet vocoder) are still to port, so rather than
 //! emit fake audio [`decode`] returns a typed, precise error naming exactly what remains. The T3
-//! stage and the s3tokenizer are each exercised end-to-end on real weights by the conformance test.
+//! stage, the s3tokenizer, and the CAMPPlus x-vector are each exercised end-to-end on real weights
+//! by the conformance test.
 
 use candle_audio::{AudioError, Result};
 
 /// The relative filename of the S3Gen checkpoint inside a Chatterbox snapshot.
 pub const S3GEN_WEIGHTS_FILE: &str = "s3gen.safetensors";
 
-/// Number of neural networks in the S3Gen stack still to port (CAMPPlus, flow, HiFTNet) — surfaced
-/// in the boundary error so the gap is never silent. The fourth network, the s3tokenizer, is ported
-/// (sc-13235; see [`crate::s3tokenizer`]).
-pub const S3GEN_REMAINING_NETWORKS: usize = 3;
+/// Number of neural networks in the S3Gen stack still to port (flow, HiFTNet) — surfaced in the
+/// boundary error so the gap is never silent. The other two networks, the s3tokenizer (sc-13235;
+/// see [`crate::s3tokenizer`]) and the CAMPPlus x-vector (sc-13236; see [`crate::campplus`]), are
+/// ported.
+pub const S3GEN_REMAINING_NETWORKS: usize = 2;
 
 /// The S3Gen token→waveform decode. Not yet implemented: returns a typed error describing precisely
 /// which components remain, never fabricated audio (the honest-partial law — a fake waveform would
@@ -42,10 +46,10 @@ pub const S3GEN_REMAINING_NETWORKS: usize = 3;
 pub fn decode(_speech_tokens: &[u32]) -> Result<Vec<f32>> {
     Err(AudioError::Msg(format!(
         "chatterbox: the S3Gen token\u{2192}waveform stack is not yet ported ({} networks: \
-         CAMPPlus x-vector, CosyVoice flow-matching decoder, HiFTNet vocoder). The T3 speech-token \
-         LM and the s3tokenizer (Whisper-v2 encoder + FSQ) ARE ported and run on real weights; this \
-         stops at the remaining S3Gen boundary rather than emit fake audio. See the crate docs and \
-         sc-13222 follow-ups.",
+         CosyVoice flow-matching decoder, HiFTNet vocoder). The T3 speech-token LM, the \
+         s3tokenizer (Whisper-v2 encoder + FSQ), and the CAMPPlus x-vector ARE ported and run on \
+         real weights; this stops at the remaining S3Gen boundary rather than emit fake audio. See \
+         the crate docs and sc-13222 follow-ups.",
         S3GEN_REMAINING_NETWORKS
     )))
 }
