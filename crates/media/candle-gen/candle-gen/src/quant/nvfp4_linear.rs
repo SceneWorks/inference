@@ -564,7 +564,12 @@ impl Nvfp4Linear {
         device: &Device,
         layer_name: &str,
     ) -> Result<Self> {
-        Self::from_dense(weight, bias, device, ActPrecision::for_outlier_layer(layer_name))
+        Self::from_dense(
+            weight,
+            bias,
+            device,
+            ActPrecision::for_outlier_layer(layer_name),
+        )
     }
 
     /// Attempt to build the resident FP4 (W4A4) compute leg **against a shared handle**. `Ok(None)`
@@ -705,7 +710,10 @@ impl Nvfp4Linear {
     /// SC#6 packed-forward path.
     #[cfg(feature = "cuda")]
     fn forward_fp4(&self, x: &Tensor) -> Result<Tensor> {
-        let fp4 = self.fp4.as_ref().expect("Fp4W4A4 regime holds a staged weight");
+        let fp4 = self
+            .fp4
+            .as_ref()
+            .expect("Fp4W4A4 regime holds a staged weight");
         let dims = x.dims().to_vec();
         let k = *dims.last().expect("linear input has a last dim");
         let m: usize = dims[..dims.len() - 1].iter().product();
@@ -732,7 +740,9 @@ impl Nvfp4Linear {
         // reference chain would answer a bug with a ~50×-slower projection while hiding the bug
         // (the unfused path allocates too, so it would not survive an OOM either). Fail loud instead.
         let cols_padded = fp4.w_staged.shape_padded().1;
-        let x_stg = fp4.lt.quantize_nvfp4_activation_fused(&x_pad, cols_padded)?;
+        let x_stg = fp4
+            .lt
+            .quantize_nvfp4_activation_fused(&x_pad, cols_padded)?;
         let y = fp4.lt.matmul_nvfp4_staged(&fp4.w_staged, &x_stg)?; // [m_pad, N] bf16
         let y = if m_pad != m { y.narrow(0, 0, m)? } else { y };
 
@@ -755,7 +765,11 @@ impl Nvfp4Linear {
     /// leave on around a denoise step. Callers wanting max throughput use [`Self::forward`] directly.
     pub fn forward_checked(&self, x: &Tensor) -> Result<Tensor> {
         let y = self.forward(x)?;
-        let energy = y.to_dtype(DType::F32)?.sqr()?.sum_all()?.to_scalar::<f32>()?;
+        let energy = y
+            .to_dtype(DType::F32)?
+            .sqr()?
+            .sum_all()?
+            .to_scalar::<f32>()?;
         if !energy.is_finite() {
             candle_core::bail!(
                 "Nvfp4Linear::forward_checked: non-finite output (NaN/inf) from the {:?} regime — \
@@ -883,7 +897,10 @@ mod tests {
     fn w4a4_forward_never_routes_to_the_unfused_quantizer() {
         // Production source only: split at the test module, whose own text contains these needles.
         let src = include_str!("nvfp4_linear.rs");
-        let production = src.split("#[cfg(test)]").next().expect("split yields a prefix");
+        let production = src
+            .split("#[cfg(test)]")
+            .next()
+            .expect("split yields a prefix");
         assert!(
             !production.contains(".quantize_nvfp4_activation("),
             "the W4A4 forward calls the UNFUSED quantizer. It must not: that path measured 0.01× vs \
@@ -905,7 +922,9 @@ mod tests {
         let dev = Device::Cpu;
         let (out_dim, in_dim) = (64usize, 128usize);
         let mut seed = 0x11FED00Du64;
-        let w: Vec<f32> = (0..out_dim * in_dim).map(|_| prng(&mut seed) * 0.4).collect();
+        let w: Vec<f32> = (0..out_dim * in_dim)
+            .map(|_| prng(&mut seed) * 0.4)
+            .collect();
         let w_t = Tensor::from_vec(w, (out_dim, in_dim), &dev)?;
 
         let lin = Nvfp4Linear::from_dense(&w_t, None, &dev, ActPrecision::W4A4)?;
@@ -928,7 +947,10 @@ mod tests {
             &got.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?,
             &reference.flatten_all()?.to_vec1::<f32>()?,
         );
-        assert!(rr < 0.02, "dequant fallback forward rel-RMS {rr} vs its own dequant ref");
+        assert!(
+            rr < 0.02,
+            "dequant fallback forward rel-RMS {rr} vs its own dequant ref"
+        );
         Ok(())
     }
 
@@ -940,7 +962,9 @@ mod tests {
         let (out_dim, in_dim) = (48usize, 64usize);
         let mut seed = 0xABCDEF01u64;
         let w = Tensor::from_vec(
-            (0..out_dim * in_dim).map(|_| prng(&mut seed) * 0.3).collect::<Vec<_>>(),
+            (0..out_dim * in_dim)
+                .map(|_| prng(&mut seed) * 0.3)
+                .collect::<Vec<_>>(),
             (out_dim, in_dim),
             &dev,
         )?;
@@ -954,7 +978,9 @@ mod tests {
         assert_eq!(lin.act_precision(), ActPrecision::W4A16);
 
         let x = Tensor::from_vec(
-            (0..2 * 5 * in_dim).map(|_| prng(&mut seed)).collect::<Vec<_>>(),
+            (0..2 * 5 * in_dim)
+                .map(|_| prng(&mut seed))
+                .collect::<Vec<_>>(),
             (2, 5, in_dim),
             &dev,
         )?;
@@ -988,7 +1014,7 @@ mod tests {
             );
         }
         for name in [
-            "transformer_blocks.7.attn1.to_q", // self-attn
+            "transformer_blocks.7.attn1.to_q",     // self-attn
             "transformer_blocks.7.attn1.to_out.0", // self-attn OUTPUT proj stays benign
             "transformer_blocks.7.ff.net.0.proj",
         ] {
@@ -1192,14 +1218,26 @@ mod tests {
             .iter()
             .map(|(n, p)| (n.as_str(), *p))
             .collect();
-        assert_eq!(by_name["transformer_blocks.4.attn1.to_q"], ActPrecision::W4A4);
-        assert_eq!(by_name["transformer_blocks.4.attn2.to_k"], ActPrecision::W4A16);
-        assert_eq!(by_name["transformer_blocks.4.attn2.to_q"], ActPrecision::W4A16);
+        assert_eq!(
+            by_name["transformer_blocks.4.attn1.to_q"],
+            ActPrecision::W4A4
+        );
+        assert_eq!(
+            by_name["transformer_blocks.4.attn2.to_k"],
+            ActPrecision::W4A16
+        );
+        assert_eq!(
+            by_name["transformer_blocks.4.attn2.to_q"],
+            ActPrecision::W4A16
+        );
         assert_eq!(
             by_name["transformer_blocks.4.attn2.to_out.0"],
             ActPrecision::W4A16
         );
-        assert_eq!(by_name["transformer.caption_projection.linear_1"], ActPrecision::W4A16);
+        assert_eq!(
+            by_name["transformer.caption_projection.linear_1"],
+            ActPrecision::W4A16
+        );
     }
 
     /// Footprint accounting: the NVFP4 footprint is far below the bf16 size (~4.5 vs 16 bits/weight).
@@ -1210,7 +1248,9 @@ mod tests {
         let (out_dim, in_dim) = (1024usize, 4096usize);
         let mut seed = 0x5EED_1234u64;
         let w = Tensor::from_vec(
-            (0..out_dim * in_dim).map(|_| prng(&mut seed) * 0.2).collect::<Vec<_>>(),
+            (0..out_dim * in_dim)
+                .map(|_| prng(&mut seed) * 0.2)
+                .collect::<Vec<_>>(),
             (out_dim, in_dim),
             &dev,
         )?;

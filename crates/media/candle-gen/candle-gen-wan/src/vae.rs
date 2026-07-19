@@ -935,7 +935,10 @@ mod norm_tests {
 
         let g = got.flatten_all()?.to_vec1::<f32>()?;
         let e = expected.flatten_all()?.to_vec1::<f32>()?;
-        assert_eq!(g, e, "the f32 ChanNorm forward must be bit-identical to pre-sc-12818");
+        assert_eq!(
+            g, e,
+            "the f32 ChanNorm forward must be bit-identical to pre-sc-12818"
+        );
         Ok(())
     }
 }

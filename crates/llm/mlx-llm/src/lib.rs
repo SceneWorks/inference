@@ -103,9 +103,7 @@ pub fn load_textllm(
 }
 
 /// Select and load the bundled MLX provider that accepts `spec`.
-pub fn load_for_model(
-    spec: &core_llm::LoadSpec,
-) -> core_llm::Result<Box<dyn core_llm::TextLlm>> {
+pub fn load_for_model(spec: &core_llm::LoadSpec) -> core_llm::Result<Box<dyn core_llm::TextLlm>> {
     text_registry()?.load_for_model(spec)
 }
 

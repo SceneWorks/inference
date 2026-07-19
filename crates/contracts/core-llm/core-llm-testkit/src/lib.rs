@@ -22,9 +22,9 @@
 //! with a combined message.
 
 use core_llm::{
-    Channel, Content, Error, FinishReason, ImageRef, LoadSpec, Message, PrepareSpec, Quantize, Role,
-    Sampling, SnapshotPreparerRegistry, StreamEvent, TextLlm, TextLlmRegistry, TextLlmRequest,
-    ThinkingMode, ToolSpec, VideoRef, VERSION,
+    Channel, Content, Error, FinishReason, ImageRef, LoadSpec, Message, PrepareSpec, Quantize,
+    Role, Sampling, SnapshotPreparerRegistry, StreamEvent, TextLlm, TextLlmRegistry,
+    TextLlmRequest, ThinkingMode, ToolSpec, VideoRef, VERSION,
 };
 use std::path::PathBuf;
 
@@ -107,7 +107,10 @@ impl TextLlmProfile {
         TextLlmRequest {
             messages: vec![Message {
                 role: Role::User,
-                content: vec![Content::Text(self.prompt.clone()), Content::Image(img.clone())],
+                content: vec![
+                    Content::Text(self.prompt.clone()),
+                    Content::Image(img.clone()),
+                ],
                 thinking: None,
                 tool_calls: Vec::new(),
             }],
@@ -122,7 +125,10 @@ impl TextLlmProfile {
         TextLlmRequest {
             messages: vec![Message {
                 role: Role::User,
-                content: vec![Content::Text(self.prompt.clone()), Content::Video(video.clone())],
+                content: vec![
+                    Content::Text(self.prompt.clone()),
+                    Content::Video(video.clone()),
+                ],
                 thinking: None,
                 tool_calls: Vec::new(),
             }],
@@ -241,14 +247,22 @@ pub fn check_streaming(p: &dyn TextLlm, profile: &TextLlmProfile) -> Result<(), 
     let out = p
         .generate(&req, &mut |ev| match ev {
             // Content deltas reconstruct output.text; thinking deltas reconstruct output.thinking.
-            StreamEvent::Token { text, index, channel, .. } => {
+            StreamEvent::Token {
+                text,
+                index,
+                channel,
+                ..
+            } => {
                 indices.push(index);
                 match channel {
                     Channel::Thinking => streamed_thinking.push_str(&text),
                     Channel::Content => streamed.push_str(&text),
                 }
             }
-            StreamEvent::Done { finish_reason, usage } => {
+            StreamEvent::Done {
+                finish_reason,
+                usage,
+            } => {
                 done = Some((finish_reason, usage.generated_tokens));
             }
         })
@@ -377,7 +391,9 @@ pub fn check_seed_determinism(p: &dyn TextLlm, profile: &TextLlmProfile) -> Resu
     // Compare the answer *and* the reasoning: a thinking model on a short budget may produce only a
     // `<think>` block (empty answer), so comparing `text` alone would see two empty strings and
     // falsely flag the seed as ignored.
-    let key = |o: &core_llm::TextLlmOutput| format!("{}\u{1}{}", o.text, o.thinking.clone().unwrap_or_default());
+    let key = |o: &core_llm::TextLlmOutput| {
+        format!("{}\u{1}{}", o.text, o.thinking.clone().unwrap_or_default())
+    };
     let req = profile.request(profile.determinism_sampling, Some(profile.determinism_seed));
     let a = p
         .generate(&req, &mut |_| {})
@@ -451,7 +467,9 @@ pub fn check_video(p: &dyn TextLlm, profile: &TextLlmProfile) -> Result<(), Stri
             .generate(&req, &mut |_| {})
             .map_err(|e| format!("check_video[{id}]: video generate() failed: {e}"))?;
         if out.usage.generated_tokens == 0 {
-            return Err(format!("check_video[{id}]: video generation produced no tokens"));
+            return Err(format!(
+                "check_video[{id}]: video generation produced no tokens"
+            ));
         }
         Ok(())
     } else {
@@ -507,9 +525,14 @@ pub fn check_thinking(p: &dyn TextLlm, profile: &TextLlmProfile) -> Result<(), S
     }
 
     // Thinking-capable: every mode validates.
-    for mode in [ThinkingMode::Auto, ThinkingMode::Enabled, ThinkingMode::Disabled] {
-        p.validate(&with_mode(mode))
-            .map_err(|e| format!("check_thinking[{id}]: thinking provider rejected {mode:?}: {e}"))?;
+    for mode in [
+        ThinkingMode::Auto,
+        ThinkingMode::Enabled,
+        ThinkingMode::Disabled,
+    ] {
+        p.validate(&with_mode(mode)).map_err(|e| {
+            format!("check_thinking[{id}]: thinking provider rejected {mode:?}: {e}")
+        })?;
     }
 
     // Stream/result sync: the streamed channels must reconstruct (text, thinking). Run with Auto —
@@ -541,7 +564,11 @@ pub fn check_thinking(p: &dyn TextLlm, profile: &TextLlmProfile) -> Result<(), S
     let mut saw_thinking = false;
     let nout = p
         .generate(&with_mode(ThinkingMode::Disabled), &mut |ev| {
-            if let StreamEvent::Token { channel: Channel::Thinking, .. } = ev {
+            if let StreamEvent::Token {
+                channel: Channel::Thinking,
+                ..
+            } = ev
+            {
                 saw_thinking = true;
             }
         })
@@ -594,7 +621,12 @@ pub fn check_tools(p: &dyn TextLlm, profile: &TextLlmProfile) -> Result<(), Stri
     let mut content = String::new();
     let out = p
         .generate(&req, &mut |ev| {
-            if let StreamEvent::Token { text, channel: Channel::Content, .. } = ev {
+            if let StreamEvent::Token {
+                text,
+                channel: Channel::Content,
+                ..
+            } = ev
+            {
                 content.push_str(&text);
             }
         })
@@ -680,7 +712,10 @@ pub fn check_snapshot_preparer(
     }
 
     // The headline guarantee: the prepared snapshot is loadable through the contract.
-    text.load_for_model(&LoadSpec::dense(report.out_dir.to_string_lossy().to_string())).map_err(|e| {
+    text.load_for_model(&LoadSpec::dense(
+        report.out_dir.to_string_lossy().to_string(),
+    ))
+    .map_err(|e| {
         format!(
             "check_snapshot_preparer: prepared snapshot '{}' not loadable via load_for_model: {e}",
             report.out_dir.display()

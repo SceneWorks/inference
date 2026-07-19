@@ -87,13 +87,13 @@ pub use repack::{
     repack_mlx_q4_to_q4_1_gs, MLX_GROUP_SIZE,
 };
 
-#[cfg(feature = "cuda")]
-pub use cublaslt::{CublasLt, DevNvfp4, NVFP4_K_ALIGN};
 pub use cublaslt::{
     quantize_activation_fp8, quantize_activation_int8, quantize_weight_fp8, quantize_weight_int8,
     quantize_weight_int8_per_channel, Int8Context, PerChannelInt8Weight, QuantizedActivation,
     F8E4M3_MAX, I8_MAX,
 };
+#[cfg(feature = "cuda")]
+pub use cublaslt::{CublasLt, DevNvfp4, NVFP4_K_ALIGN};
 #[cfg(feature = "cuda")]
 pub use eight_bit_linear::{Fp8Linear, Int8Linear};
 
@@ -1148,7 +1148,10 @@ mod tests {
         let qt = std::sync::Arc::new(QTensor::quantize(&w, GgmlDType::Q4K)?);
 
         let ql = QLinear::from_qtensor_dequant(qt, Some(bias.clone()));
-        assert!(ql.is_quantized(), "the ingested QTensor must load quantized, not dense");
+        assert!(
+            ql.is_quantized(),
+            "the ingested QTensor must load quantized, not dense"
+        );
         assert_eq!(
             ql.quant_dtype(),
             Some(GgmlDType::Q4K),
@@ -1427,8 +1430,7 @@ mod tests {
     /// [`MatmulStrategy::Nvfp4`]; any other packed tier to `DequantDense`; a dense component to `None`.
     #[test]
     fn detect_strategy_routes_nvfp4_vs_affine_vs_dense() {
-        let nvfp4 =
-            serde_json::json!({ "quantization": { "bits": 4, "format": "nvfp4" } });
+        let nvfp4 = serde_json::json!({ "quantization": { "bits": 4, "format": "nvfp4" } });
         assert!(PackedConfig::is_nvfp4(&nvfp4));
         assert_eq!(
             PackedConfig::detect_strategy(&nvfp4),
@@ -1654,7 +1656,10 @@ mod tests {
                 .abs()?
                 .max_all()?
                 .to_scalar::<f32>()?;
-            assert_eq!(dev_max, 0.0, "{name}: forward_upcast must be inert at matching dtype");
+            assert_eq!(
+                dev_max, 0.0,
+                "{name}: forward_upcast must be inert at matching dtype"
+            );
         }
         Ok(())
     }
@@ -1676,7 +1681,11 @@ mod tests {
         // Plain forward can't mix f32 activations with bf16 weights; upcast can.
         assert!(bf16.forward(&x).is_err(), "sanity: mismatch must fail");
         let got = bf16.forward_upcast(&x)?;
-        assert_eq!(got.dtype(), DType::F32, "output follows the activation dtype");
+        assert_eq!(
+            got.dtype(),
+            DType::F32,
+            "output follows the activation dtype"
+        );
 
         // Reference: the same bf16-rounded weight, materialized at f32.
         let ref_lin = QLinear::Dense(DenseLinear::Linear(Linear::new(

@@ -60,7 +60,10 @@ fn base_spec() -> LoadSpec {
 
 fn render_measured(policy: OffloadPolicy, req: &GenerationRequest) -> (Vec<u8>, usize) {
     let spec = base_spec().with_offload_policy(policy);
-    let model = mlx_gen_boogu::provider_registry().expect("build provider registry").load("boogu_image", &spec).expect("load boogu_image");
+    let model = mlx_gen_boogu::provider_registry()
+        .expect("build provider registry")
+        .load("boogu_image", &spec)
+        .expect("load boogu_image");
     reset_peak_memory();
     let out = model.generate(req, &mut |_| {}).expect("generate");
     let peak = get_peak_memory();

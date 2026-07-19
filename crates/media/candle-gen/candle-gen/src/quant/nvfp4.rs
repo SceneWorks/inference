@@ -278,7 +278,7 @@ impl Nvfp4Tensor {
             for blk in 0..n_blocks {
                 let c0 = blk * NVFP4_BLOCK;
                 let c1 = (c0 + NVFP4_BLOCK).min(cols); // real columns in this block
-                // Block amax over the real (non-padding) columns.
+                                                       // Block amax over the real (non-padding) columns.
                 let a_blk = if c0 < cols {
                     row[c0..c1].iter().fold(0f32, |m, &x| m.max(x.abs()))
                 } else {
@@ -342,7 +342,11 @@ impl Nvfp4Tensor {
                         break; // padding column — not part of the logical tensor
                     }
                     let byte = self.packed[r * row_bytes + c / 2];
-                    let code = if c.is_multiple_of(2) { byte & 0x0F } else { byte >> 4 };
+                    let code = if c.is_multiple_of(2) {
+                        byte & 0x0F
+                    } else {
+                        byte >> 4
+                    };
                     out[r * self.cols + c] = E2M1_LUT[code as usize] * elem_scale;
                 }
             }
@@ -352,7 +356,11 @@ impl Nvfp4Tensor {
 
     /// [`Self::dequantize_to_vec`] as a `[rows, cols]` CPU f32 [`Tensor`].
     pub fn dequantize(&self) -> Result<Tensor> {
-        Tensor::from_vec(self.dequantize_to_vec(), (self.rows, self.cols), &Device::Cpu)
+        Tensor::from_vec(
+            self.dequantize_to_vec(),
+            (self.rows, self.cols),
+            &Device::Cpu,
+        )
     }
 }
 
@@ -395,7 +403,7 @@ mod tests {
         assert_eq!(e4m3_to_f32(0x7E), 448.0); // max finite
         assert!(e4m3_to_f32(0x7F).is_nan()); // reserved NaN
         assert_eq!(e4m3_to_f32(0x01), 2f32.powi(-9)); // min subnormal
-        // Encode picks the nearest representable code.
+                                                      // Encode picks the nearest representable code.
         assert_eq!(e4m3_from_f32(1.0), 0x38);
         assert_eq!(e4m3_from_f32(448.0), 0x7E);
         assert_eq!(e4m3_from_f32(1e9), 0x7E); // saturates, never NaN
@@ -412,7 +420,7 @@ mod tests {
         }
         assert_eq!(E2M1_LUT[e2m1_from_f32(6.0) as usize], 6.0);
         assert_eq!(E2M1_LUT[e2m1_from_f32(100.0) as usize], 6.0); // saturates
-        // Sign preserved.
+                                                                  // Sign preserved.
         assert_eq!(e2m1_from_f32(-1.0) & 0x08, 0x08);
         // Ties-to-even at 2.5 (between 2.0@idx4 and 3.0@idx5) → even index 4 → 2.0.
         assert_eq!(E2M1_LUT[e2m1_from_f32(2.5) as usize], 2.0);
@@ -463,7 +471,10 @@ mod tests {
 
         let t = Nvfp4Tensor::pack_from_slice(&data, rows, cols);
         let back = t.dequantize_to_vec();
-        assert!(back.iter().all(|v| v.is_finite()), "no NaN/Inf from dequant");
+        assert!(
+            back.iter().all(|v| v.is_finite()),
+            "no NaN/Inf from dequant"
+        );
 
         let rr = rel_rms(&data, &back);
         assert!(rr < 0.12, "rel-RMS {rr} exceeds NVFP4 tolerance");
@@ -482,7 +493,8 @@ mod tests {
         let (rows, cols) = (64, 128);
         let mut seed = 0xABCD_1234u64;
         let data: Vec<f32> = (0..rows * cols).map(|_| prng(&mut seed)).collect();
-        let w = Tensor::from_vec(data.clone(), (rows, cols), &Device::Cpu)?.to_dtype(DType::BF16)?;
+        let w =
+            Tensor::from_vec(data.clone(), (rows, cols), &Device::Cpu)?.to_dtype(DType::BF16)?;
         let t = Nvfp4Tensor::pack(&w)?;
         let back = t.dequantize()?;
         assert_eq!(back.dims(), &[rows, cols]);
@@ -540,7 +552,10 @@ mod tests {
             for blk in 0..t.sf_cols {
                 let off = Nvfp4Tensor::scale_offset_for(r, blk, t.sf_rows);
                 assert!(off < 512, "offset {off} out of atom");
-                assert!(!seen[off], "collision at offset {off} for (r={r}, blk={blk})");
+                assert!(
+                    !seen[off],
+                    "collision at offset {off} for (r={r}, blk={blk})"
+                );
                 seen[off] = true;
             }
         }

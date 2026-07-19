@@ -378,7 +378,11 @@ mod cuda_impl {
         /// **NaN-free by construction**: E2M1 saturates at ±6 and every divisor is clamped positive, so
         /// an all-zero or outlier-carrying block yields finite codes (the W4A4 risk is signal collapse
         /// over steps, not a quantizer NaN — spike sc-11038).
-        pub fn quantize_nvfp4_activation(&self, x: &Tensor, cols_padded: usize) -> Result<DevNvfp4> {
+        pub fn quantize_nvfp4_activation(
+            &self,
+            x: &Tensor,
+            cols_padded: usize,
+        ) -> Result<DevNvfp4> {
             use super::super::nvfp4::{E2M1_MAX, E4M3_MAX, NVFP4_BLOCK};
             let dev = Device::Cuda(self.device.clone());
             let (m, k) = x.dims2()?;
@@ -492,7 +496,8 @@ mod cuda_impl {
                 }
             }
             let t = Tensor::from_vec(idx, scales_len, dev)?;
-            crate::lock_recover(&self.nvfp4_act_scale_gather_idx).insert((rows, n_blocks), t.clone());
+            crate::lock_recover(&self.nvfp4_act_scale_gather_idx)
+                .insert((rows, n_blocks), t.clone());
             Ok(t)
         }
 
@@ -515,7 +520,9 @@ mod cuda_impl {
             match guard.as_ref() {
                 Some(Some(k)) => return Ok(k.clone()),
                 Some(None) => {
-                    candle_core::bail!("sc-12078 fused NVFP4 quant kernels previously failed to compile")
+                    candle_core::bail!(
+                        "sc-12078 fused NVFP4 quant kernels previously failed to compile"
+                    )
                 }
                 None => {}
             }
@@ -608,7 +615,10 @@ mod cuda_impl {
                 .stream
                 .alloc_zeros::<u8>(m * (cols_padded / 2))
                 .map_err(drv_err)?;
-            let mut scales = self.stream.alloc_zeros::<u8>(sf_rows * sf_cols).map_err(drv_err)?;
+            let mut scales = self
+                .stream
+                .alloc_zeros::<u8>(sf_rows * sf_cols)
+                .map_err(drv_err)?;
 
             let (mi, ki, nbi) = (m as i32, k as i32, n_blocks as i32);
             let (cpi, sci) = (cols_padded as i32, sf_cols as i32);
@@ -1197,7 +1207,9 @@ mod cuda_impl {
             // On an sm_120 device the heuristic returns the FP4 tensor-core algos (the spike saw 6); an
             // empty result surfaces as a cuBLASLt error (the caller reads that as "cuBLASLt did not
             // deliver an FP4 kernel" → the MMQ fallback would be needed).
-            let cached = crate::lock_recover(&self.nvfp4_algos).get(&(m, k, n)).copied();
+            let cached = crate::lock_recover(&self.nvfp4_algos)
+                .get(&(m, k, n))
+                .copied();
             let algo = match cached {
                 Some(a) => a,
                 None => {
@@ -1480,10 +1492,10 @@ mod cuda_impl {
         let qc = q.clamp(E4M3_MIN_SUBNORMAL, E4M3_MAXV)?;
         let e = qc.log()?.affine(1.0 / LN2, 0.0)?.floor()?; // floor(log2 q)
         let pow_e = e.affine(LN2, 0.0)?.exp()?; // 2^e
-        // Normal: E = e + 7, M = round(q / 2^e · 8) - 8  -> byte = E·8 + M = (e+7)·8 + round(...) - 8.
+                                                // Normal: E = e + 7, M = round(q / 2^e · 8) - 8  -> byte = E·8 + M = (e+7)·8 + round(...) - 8.
         let mant = q.broadcast_div(&pow_e)?.affine(8.0, 0.0)?.round()?; // round(q/2^e·8), 8..16
         let byte_normal = e.affine(8.0, 8.0 * 7.0 - 8.0)?.add(&mant)?; // (e·8) + (56-8) + mant
-        // Subnormal: byte = round(q · 512).
+                                                                       // Subnormal: byte = round(q · 512).
         let byte_sub = q.affine(512.0, 0.0)?.round()?;
         let zeros = q.zeros_like()?;
         let byte = is_sub.where_cond(&byte_sub, &byte_normal)?;
@@ -1512,7 +1524,11 @@ mod cuda_impl {
         const MIDS: [f64; 7] = [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0];
         let mut idx = mag.zeros_like()?;
         for (i, &mid) in MIDS.iter().enumerate() {
-            let past = if i.is_multiple_of(2) { mag.gt(mid)? } else { mag.ge(mid)? };
+            let past = if i.is_multiple_of(2) {
+                mag.gt(mid)?
+            } else {
+                mag.ge(mid)?
+            };
             idx = idx.add(&past.to_dtype(DType::F32)?)?;
         }
         // sign bit (8) where negative; -0.0 (sign set, magnitude 0) decodes to 0.0 so is harmless.

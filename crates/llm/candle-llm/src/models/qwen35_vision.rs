@@ -74,7 +74,11 @@ impl Qwen35VisionConfig {
         let deepstack_visual_indexes = c
             .get("deepstack_visual_indexes")
             .and_then(|x| x.as_array())
-            .map(|xs| xs.iter().filter_map(|x| x.as_u64().map(|x| x as usize)).collect())
+            .map(|xs| {
+                xs.iter()
+                    .filter_map(|x| x.as_u64().map(|x| x as usize))
+                    .collect()
+            })
             .unwrap_or_default();
         Ok(Self {
             depth: req("depth")? as usize,
@@ -332,7 +336,9 @@ impl Qwen35VisionModel {
     /// one embedding per merged `merge×merge` block, in the same merge-block order the preprocessor
     /// emits patches.
     pub fn forward(&self, pixel_values: &Tensor, grid_thw: &[[i32; 3]]) -> Result<Tensor> {
-        Ok(self.forward_with_deepstack(pixel_values, grid_thw)?.pooler_output)
+        Ok(self
+            .forward_with_deepstack(pixel_values, grid_thw)?
+            .pooler_output)
     }
 
     /// Encode like [`Self::forward`] but also return the per-tap **DeepStack** feature sets
@@ -866,6 +872,9 @@ mod tests {
             .zip(&exp_bw)
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
-        assert!(md < 1e-6, "qwen3-vl bilinear weights vs oracle: max abs diff {md}");
+        assert!(
+            md < 1e-6,
+            "qwen3-vl bilinear weights vs oracle: max abs diff {md}"
+        );
     }
 }

@@ -349,7 +349,8 @@ impl<'a> Cursor<'a> {
     fn string(&mut self) -> Result<String> {
         let len = self.u64()? as usize;
         let raw = self.take(len)?;
-        String::from_utf8(raw.to_vec()).map_err(|e| Error::Msg(format!("gguf: bad utf-8 string: {e}")))
+        String::from_utf8(raw.to_vec())
+            .map_err(|e| Error::Msg(format!("gguf: bad utf-8 string: {e}")))
     }
 
     /// Read a single typed value of the given GGUF value-type tag.
@@ -380,7 +381,9 @@ impl<'a> Cursor<'a> {
                 MetaValue::Array(items)
             }
             other => {
-                return Err(Error::Msg(format!("gguf: unknown metadata value type {other}")))
+                return Err(Error::Msg(format!(
+                    "gguf: unknown metadata value type {other}"
+                )))
             }
         })
     }

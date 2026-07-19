@@ -662,8 +662,14 @@ mod tests {
         for i in 0..cfg.num_layers {
             let p = format!("language_model.layers.{i}");
             t.insert(format!("{p}.input_layernorm.weight"), bf16(&[hidden]));
-            t.insert(format!("{p}.post_attention_layernorm.weight"), bf16(&[hidden]));
-            t.insert(format!("{p}.self_attn.q_proj.weight"), bf16(&[nh * hd, hidden]));
+            t.insert(
+                format!("{p}.post_attention_layernorm.weight"),
+                bf16(&[hidden]),
+            );
+            t.insert(
+                format!("{p}.self_attn.q_proj.weight"),
+                bf16(&[nh * hd, hidden]),
+            );
             t.insert(
                 format!("{p}.self_attn.k_proj.weight"),
                 bf16(&[nkv * hd, hidden]),
@@ -672,7 +678,10 @@ mod tests {
                 format!("{p}.self_attn.v_proj.weight"),
                 bf16(&[nkv * hd, hidden]),
             );
-            t.insert(format!("{p}.self_attn.o_proj.weight"), bf16(&[hidden, nh * hd]));
+            t.insert(
+                format!("{p}.self_attn.o_proj.weight"),
+                bf16(&[hidden, nh * hd]),
+            );
             t.insert(format!("{p}.self_attn.q_norm.weight"), bf16(&[hd]));
             t.insert(format!("{p}.self_attn.k_norm.weight"), bf16(&[hd]));
             t.insert(format!("{p}.mlp.gate_proj.weight"), bf16(&[inter, hidden]));
@@ -682,7 +691,10 @@ mod tests {
         (t, cfg)
     }
 
-    fn save_tiny_te(map: &std::collections::HashMap<String, Tensor>, tag: &str) -> std::path::PathBuf {
+    fn save_tiny_te(
+        map: &std::collections::HashMap<String, Tensor>,
+        tag: &str,
+    ) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!(
             "krea_te_bf16_{tag}_{}_{:?}.safetensors",
             std::process::id(),
@@ -750,7 +762,8 @@ mod tests {
         let embeds = vec![(Tensor::ones((n, hidden), DType::F32, &dev).unwrap() * 0.5).unwrap()];
         let deepstack = vec![(0..3)
             .map(|k| {
-                (Tensor::ones((n, hidden), DType::F32, &dev).unwrap() * (0.01 * (k + 1) as f64)).unwrap()
+                (Tensor::ones((n, hidden), DType::F32, &dev).unwrap() * (0.01 * (k + 1) as f64))
+                    .unwrap()
             })
             .collect::<Vec<_>>()];
         let grids = [[1i32, 4, 4]];

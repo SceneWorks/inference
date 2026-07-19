@@ -909,10 +909,17 @@ mod tests {
     fn qwen3vl_visual_weights(snapshot: &Path) -> Weights {
         let index_path = snapshot.join("model.safetensors.index.json");
         let index_raw = std::fs::read_to_string(&index_path).unwrap_or_else(|e| {
-            panic!("qwen3vl oracle: reading index {}: {e}", index_path.display())
+            panic!(
+                "qwen3vl oracle: reading index {}: {e}",
+                index_path.display()
+            )
         });
-        let index: serde_json::Value = serde_json::from_str(&index_raw)
-            .unwrap_or_else(|e| panic!("qwen3vl oracle: parsing index {}: {e}", index_path.display()));
+        let index: serde_json::Value = serde_json::from_str(&index_raw).unwrap_or_else(|e| {
+            panic!(
+                "qwen3vl oracle: parsing index {}: {e}",
+                index_path.display()
+            )
+        });
         let weight_map = index["weight_map"]
             .as_object()
             .expect("qwen3vl oracle: index missing `weight_map` object");
@@ -932,8 +939,12 @@ mod tests {
         let mut tensors = HashMap::new();
         for shard in shards {
             let shard_path = snapshot.join(&shard);
-            let weights = Weights::from_file(&shard_path)
-                .unwrap_or_else(|e| panic!("qwen3vl oracle: loading shard {}: {e}", shard_path.display()));
+            let weights = Weights::from_file(&shard_path).unwrap_or_else(|e| {
+                panic!(
+                    "qwen3vl oracle: loading shard {}: {e}",
+                    shard_path.display()
+                )
+            });
             for (k, v) in weights.into_map() {
                 if !k.starts_with("model.visual.") {
                     continue;

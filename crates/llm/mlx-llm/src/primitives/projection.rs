@@ -22,12 +22,18 @@ pub struct QuantSpec {
 impl QuantSpec {
     /// 4-bit, group size 64.
     pub fn q4() -> Self {
-        Self { group_size: 64, bits: 4 }
+        Self {
+            group_size: 64,
+            bits: 4,
+        }
     }
 
     /// 8-bit, group size 64.
     pub fn q8() -> Self {
-        Self { group_size: 64, bits: 8 }
+        Self {
+            group_size: 64,
+            bits: 8,
+        }
     }
 }
 
@@ -73,12 +79,7 @@ impl Projection {
     /// Load from **already-quantized** parts stored in a snapshot (the packed `weight`, per-group
     /// `scales`/`biases`) — the read side of the GGUF converter's optional MLX requant. No
     /// quantization happens here; the parts are used as-is.
-    pub fn from_quantized(
-        weight: Array,
-        scales: Array,
-        biases: Array,
-        spec: QuantSpec,
-    ) -> Self {
+    pub fn from_quantized(weight: Array, scales: Array, biases: Array, spec: QuantSpec) -> Self {
         Projection::Quantized(QuantizedLinear {
             weight,
             scales,

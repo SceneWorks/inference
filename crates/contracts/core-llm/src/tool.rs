@@ -56,7 +56,10 @@ impl ToolSpec {
     pub fn to_template_json(&self) -> Value {
         let mut func = Map::new();
         func.insert("name".into(), Value::String(self.name.clone()));
-        func.insert("description".into(), Value::String(self.description.clone()));
+        func.insert(
+            "description".into(),
+            Value::String(self.description.clone()),
+        );
         func.insert("parameters".into(), self.parameters.clone());
         let mut obj = Map::new();
         obj.insert("type".into(), Value::String("function".into()));
@@ -150,7 +153,10 @@ impl ToolCallSegmenter {
     /// Build a segmenter that coerces arguments against `tools`' declared schemas. Pass `&[]` to keep
     /// every argument as a raw string (no schema-typed coercion).
     pub fn new(tools: &[ToolSpec]) -> Self {
-        let schemas = tools.iter().map(|t| (t.name.clone(), t.param_types())).collect();
+        let schemas = tools
+            .iter()
+            .map(|t| (t.name.clone(), t.param_types()))
+            .collect();
         Self {
             schemas,
             in_call: false,
@@ -389,7 +395,11 @@ mod tests {
         let block = "<tool_call>\n<function=get_weather>\n<parameter=location>\nParis\n</parameter>\n<parameter=days>\n3\n</parameter>\n<parameter=metric>\ntrue\n</parameter>\n</function>\n</tool_call>";
         let (_content, calls) = run(&[weather_tool()], &[block]);
         let args = &calls[0].arguments;
-        assert_eq!(args.get("location"), Some(&json!("Paris")), "string stays string");
+        assert_eq!(
+            args.get("location"),
+            Some(&json!("Paris")),
+            "string stays string"
+        );
         assert_eq!(args.get("days"), Some(&json!(3)), "integer coerced");
         assert_eq!(args.get("metric"), Some(&json!(true)), "boolean coerced");
         // Argument order is insertion order, not alphabetical.
@@ -411,7 +421,10 @@ mod tests {
         let deltas: Vec<String> = block.chars().map(|c| c.to_string()).collect();
         let refs: Vec<&str> = deltas.iter().map(String::as_str).collect();
         let (content, calls) = run(&[weather_tool()], &refs);
-        assert_eq!(content, "", "all markup is consumed, nothing leaks to content");
+        assert_eq!(
+            content, "",
+            "all markup is consumed, nothing leaks to content"
+        );
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].arguments.get("location"), Some(&json!("Paris")));
     }
@@ -423,14 +436,22 @@ mod tests {
         assert_eq!(content, "");
         assert_eq!(calls[0].name, "get_weather");
         assert_eq!(calls[0].arguments.get("location"), Some(&json!("Paris")));
-        assert_eq!(calls[0].arguments.get("days"), Some(&json!(2)), "JSON args keep their type");
+        assert_eq!(
+            calls[0].arguments.get("days"),
+            Some(&json!(2)),
+            "JSON args keep their type"
+        );
     }
 
     #[test]
     fn multiple_calls_in_one_stream() {
         let block = "<tool_call>\n<function=get_weather>\n<parameter=location>\nParis\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=get_weather>\n<parameter=location>\nRome\n</parameter>\n</function>\n</tool_call>";
         let (content, calls) = run(&[weather_tool()], &[block]);
-        assert_eq!(content.trim(), "", "only the inter-call separator is content");
+        assert_eq!(
+            content.trim(),
+            "",
+            "only the inter-call separator is content"
+        );
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].arguments.get("location"), Some(&json!("Paris")));
         assert_eq!(calls[1].arguments.get("location"), Some(&json!("Rome")));

@@ -132,10 +132,9 @@ fn te_store_dtype(root: &Path, device: &Device) -> DType {
     let dir = root.join("text_encoder");
     let disk_is_bf16 = candle_gen::sorted_safetensors(&dir, "ideogram")
         .ok()
-        .and_then(|files| unsafe {
-            candle_gen::candle_core::safetensors::MmapedSafetensors::multi(&files)
-        }
-        .ok())
+        .and_then(|files| {
+            unsafe { candle_gen::candle_core::safetensors::MmapedSafetensors::multi(&files) }.ok()
+        })
         .and_then(|st| {
             st.load("language_model.layers.0.input_layernorm.weight", device)
                 .ok()

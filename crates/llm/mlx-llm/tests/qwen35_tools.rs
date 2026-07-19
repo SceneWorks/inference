@@ -12,9 +12,7 @@
 //! `ToolCallSegmenter` lifts it out of the answer text and parses it into a structured
 //! `output.tool_calls`. A grounded call (the right function + a Paris-ish location) is the proof.
 
-use core_llm::{
-    LoadSpec, Message, Sampling, TextLlm, TextLlmRequest, ToolSpec,
-};
+use core_llm::{LoadSpec, Message, Sampling, TextLlm, TextLlmRequest, ToolSpec};
 use mlx_llm::LlamaProvider;
 
 fn model_dir() -> String {
@@ -86,7 +84,12 @@ fn qwen35_emits_and_parses_a_tool_call() {
         .arguments
         .get("location")
         .and_then(|v| v.as_str())
-        .unwrap_or_else(|| panic!("get_weather call missing a string `location`: {:?}", call.arguments));
+        .unwrap_or_else(|| {
+            panic!(
+                "get_weather call missing a string `location`: {:?}",
+                call.arguments
+            )
+        });
     assert!(
         location.to_lowercase().contains("paris"),
         "the parsed tool call must ground on Paris, got location={location:?}"

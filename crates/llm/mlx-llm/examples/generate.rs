@@ -51,7 +51,10 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .into_iter()
         .map(|id| id as i32)
         .collect();
-    eprintln!("prompt: {} tokens; streaming up to {max_new_tokens} …\n", prompt_ids.len());
+    eprintln!(
+        "prompt: {} tokens; streaming up to {max_new_tokens} …\n",
+        prompt_ids.len()
+    );
 
     let config = GenerationConfig {
         max_new_tokens,
@@ -69,17 +72,23 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // split across BPE tokens prints intact (no mid-char slice panic) — sc-12452.
     let mut acc: Vec<u32> = Vec::new();
     let mut detok = core_llm::IncrementalDetok::new();
-    let out = generate(&model, &prompt_ids, &config, &CancelFlag::new(), &mut |event| {
-        if let StreamEvent::Token { id, .. } = event {
-            acc.push(id as u32);
-            if let Ok(full) = tokenizer.decode(&acc, true) {
-                if let Some(delta) = detok.push(&full) {
-                    print!("{delta}");
-                    let _ = std::io::stdout().flush();
+    let out = generate(
+        &model,
+        &prompt_ids,
+        &config,
+        &CancelFlag::new(),
+        &mut |event| {
+            if let StreamEvent::Token { id, .. } = event {
+                acc.push(id as u32);
+                if let Ok(full) = tokenizer.decode(&acc, true) {
+                    if let Some(delta) = detok.push(&full) {
+                        print!("{delta}");
+                        let _ = std::io::stdout().flush();
+                    }
                 }
             }
-        }
-    })?;
+        },
+    )?;
 
     println!(
         "\n\n[{} tokens, finish: {:?}]",

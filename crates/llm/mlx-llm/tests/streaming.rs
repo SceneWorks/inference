@@ -60,11 +60,17 @@ fn tiny_model(cfg: &ModelConfig) -> CausalLm {
 
     let mut m: HashMap<String, Array> = HashMap::new();
     m.insert("model.embed_tokens.weight".into(), randn(&[v, h], &mut rng));
-    m.insert("model.norm.weight".into(), Array::ones::<f32>(&[h]).unwrap());
+    m.insert(
+        "model.norm.weight".into(),
+        Array::ones::<f32>(&[h]).unwrap(),
+    );
     m.insert("lm_head.weight".into(), randn(&[v, h], &mut rng));
     for i in 0..cfg.num_layers {
         let p = |s: &str| format!("model.layers.{i}.{s}");
-        m.insert(p("input_layernorm.weight"), Array::ones::<f32>(&[h]).unwrap());
+        m.insert(
+            p("input_layernorm.weight"),
+            Array::ones::<f32>(&[h]).unwrap(),
+        );
         m.insert(
             p("post_attention_layernorm.weight"),
             Array::ones::<f32>(&[h]).unwrap(),
@@ -129,9 +135,15 @@ fn generation_is_deterministic_for_fixed_seed() {
     let cfg = tiny_config();
     let model = tiny_model(&cfg);
     let run = || {
-        generate(&model, &[1, 2, 3], &greedy(8), &CancelFlag::new(), &mut |_| {})
-            .unwrap()
-            .tokens
+        generate(
+            &model,
+            &[1, 2, 3],
+            &greedy(8),
+            &CancelFlag::new(),
+            &mut |_| {},
+        )
+        .unwrap()
+        .tokens
     };
     assert_eq!(run(), run());
 }
@@ -175,9 +187,15 @@ fn stop_token_halts_before_emitting_it() {
     let model = tiny_model(&cfg);
 
     // Find the first greedy token, then make it a stop token: generation must halt immediately.
-    let first = generate(&model, &[1, 2, 3], &greedy(1), &CancelFlag::new(), &mut |_| {})
-        .unwrap()
-        .tokens[0];
+    let first = generate(
+        &model,
+        &[1, 2, 3],
+        &greedy(1),
+        &CancelFlag::new(),
+        &mut |_| {},
+    )
+    .unwrap()
+    .tokens[0];
 
     let mut cfg2 = greedy(10);
     cfg2.stop_tokens = vec![first];
@@ -212,6 +230,13 @@ fn decode_trait_object_works() {
     let cfg = tiny_config();
     let model = tiny_model(&cfg);
     let decoder: &dyn Decode = &model;
-    let out = generate(decoder, &[5, 6], &greedy(3), &CancelFlag::new(), &mut |_| {}).unwrap();
+    let out = generate(
+        decoder,
+        &[5, 6],
+        &greedy(3),
+        &CancelFlag::new(),
+        &mut |_| {},
+    )
+    .unwrap();
     assert_eq!(out.tokens.len(), 3);
 }

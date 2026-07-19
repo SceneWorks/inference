@@ -139,6 +139,8 @@ mod tests {
         assert_eq!(at(1, 1), 7.5);
         assert_eq!(at(2, 2), 22.5);
         assert_eq!(at(3, 3), 30.0);
-        assert!(out.chunks_exact(3).all(|px| px[0] == px[1] && px[1] == px[2]));
+        assert!(out
+            .chunks_exact(3)
+            .all(|px| px[0] == px[1] && px[1] == px[2]));
     }
 }

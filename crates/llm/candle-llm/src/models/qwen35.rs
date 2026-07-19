@@ -1109,7 +1109,13 @@ impl crate::models::VlmDecode for Qwen35Model {
             .as_any_mut()
             .downcast_mut::<Qwen35Cache>()
             .ok_or_else(|| Error::Msg("qwen3_5 prefill: expected a Qwen35Cache".into()))?;
-        self.decode_logits_from_embeds_deepstack(embeds, positions, cache, visual_pos_mask, deepstack)
+        self.decode_logits_from_embeds_deepstack(
+            embeds,
+            positions,
+            cache,
+            visual_pos_mask,
+            deepstack,
+        )
     }
 }
 

@@ -121,7 +121,11 @@ pub fn gated_delta_recurrence(
 /// step's tail). Returns `(silu(conv) [B,S,C], new_conv_state [B,K-1,C])` — a port of the Qwen3-Next
 /// short-conv path: `out[b,s,c] = silu(Σ_j weight[c,j] · concat(conv_state, x)[b, s+j, c])`. Mixing
 /// q/k/v through this 1-D conv before the recurrence is what gives Gated DeltaNet its local context.
-pub fn causal_depthwise_conv(x: &Array, weight: &Array, conv_state: &Array) -> Result<(Array, Array)> {
+pub fn causal_depthwise_conv(
+    x: &Array,
+    weight: &Array,
+    conv_state: &Array,
+) -> Result<(Array, Array)> {
     let xs = x.shape();
     let (s, c) = (xs[1], xs[2]);
     let kk = weight.shape()[1]; // kernel size K (weight is [C, K])
@@ -266,8 +270,9 @@ mod tests {
     ];
     const V: &[f32] = &[
         0.9033704, 0.9242766, -0.5594231, 0.5815381, -0.9665546, 0.8363392, 0.8484675, -0.1261052,
-        -0.8719618, 0.0562458, 0.8790255, 0.7971791, -0.8360307, -0.2071904, -0.6701862, -0.7691332,
-        -0.2697922, -0.7519733, 0.0098643, -0.2587476, 0.5248392, 0.9719371, -0.0304079, -0.2898675,
+        -0.8719618, 0.0562458, 0.8790255, 0.7971791, -0.8360307, -0.2071904, -0.6701862,
+        -0.7691332, -0.2697922, -0.7519733, 0.0098643, -0.2587476, 0.5248392, 0.9719371,
+        -0.0304079, -0.2898675,
     ];
     const A: &[f32] = &[
         -0.6942793, -1.9834223, 1.6954608, 1.8882596, 1.5180013, 1.9647338, -0.7497661, -1.9337821,
@@ -291,7 +296,10 @@ mod tests {
 
     fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
         assert_eq!(a.len(), b.len());
-        a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max)
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0, f32::max)
     }
 
     #[test]
@@ -312,9 +320,21 @@ mod tests {
         assert_eq!(y.shape(), &[1, 3, 4, 2]);
         assert_eq!(state.shape(), &[1, 4, 2, 2]);
 
-        let yh = y.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>().to_vec();
-        let sh = state.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>().to_vec();
-        assert!(max_abs_diff(&yh, EXP_Y) < 1e-4, "y diff {}", max_abs_diff(&yh, EXP_Y));
+        let yh = y
+            .as_dtype(Dtype::Float32)
+            .unwrap()
+            .as_slice::<f32>()
+            .to_vec();
+        let sh = state
+            .as_dtype(Dtype::Float32)
+            .unwrap()
+            .as_slice::<f32>()
+            .to_vec();
+        assert!(
+            max_abs_diff(&yh, EXP_Y) < 1e-4,
+            "y diff {}",
+            max_abs_diff(&yh, EXP_Y)
+        );
         assert!(
             max_abs_diff(&sh, EXP_STATE) < 1e-4,
             "state diff {}",
@@ -330,18 +350,23 @@ mod tests {
         let k = Array::from_slice(K, &[1, 3, 2, 2]);
         let v = Array::from_slice(V, &[1, 3, 4, 2]);
         let g = Array::from_slice(
-            &[0.6f32, 0.7, 0.8, 0.9, 0.5, 0.55, 0.65, 0.75, 0.85, 0.95, 0.4, 0.45],
+            &[
+                0.6f32, 0.7, 0.8, 0.9, 0.5, 0.55, 0.65, 0.75, 0.85, 0.95, 0.4, 0.45,
+            ],
             &[1, 3, 4],
         );
         let beta = Array::from_slice(
-            &[0.2f32, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.1, 0.15, 0.25, 0.35],
+            &[
+                0.2f32, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.1, 0.15, 0.25, 0.35,
+            ],
             &[1, 3, 4],
         );
 
         let (y_full, s_full) = gated_delta_recurrence(&q, &k, &v, &g, &beta, None).unwrap();
 
         // Step one token at a time, carrying the state.
-        let pick = |x: &Array, t: i32| -> Array { slice_time(x, t).unwrap().expand_dims(1).unwrap() };
+        let pick =
+            |x: &Array, t: i32| -> Array { slice_time(x, t).unwrap().expand_dims(1).unwrap() };
         let mut state: Option<Array> = None;
         let mut ys = Vec::new();
         for t in 0..3 {
@@ -364,7 +389,11 @@ mod tests {
         let ys = y_step.as_slice::<f32>().to_vec();
         let sf = s_full.as_slice::<f32>().to_vec();
         let ss = state.unwrap().as_slice::<f32>().to_vec();
-        assert!(max_abs_diff(&yf, &ys) < 1e-5, "prefill vs step y: {}", max_abs_diff(&yf, &ys));
+        assert!(
+            max_abs_diff(&yf, &ys) < 1e-5,
+            "prefill vs step y: {}",
+            max_abs_diff(&yf, &ys)
+        );
         assert!(max_abs_diff(&sf, &ss) < 1e-5, "prefill vs step state");
     }
 
@@ -386,12 +415,16 @@ mod tests {
         0.2422637, 0.3207079, 0.3157361, 0.493552, 0.6888506, 0.2758986, -0.2604986, 0.5719915,
         -0.677193, -0.1786878, -0.1721832, 0.024104,
     ];
-    const CX: &[f32] = &[-0.3929182, -0.15279, -0.0340949, -0.1223795, -0.5179096, 0.7106992];
+    const CX: &[f32] = &[
+        -0.3929182, -0.15279, -0.0340949, -0.1223795, -0.5179096, 0.7106992,
+    ];
     const CSTATE: &[f32] = &[
         0.2526282, 0.8012137, 0.0075967, -0.7815045, -0.8113322, -0.8019857, 0.0879031, 0.8514872,
         0.00599,
     ];
-    const CEXP_OUT: &[f32] = &[-0.1465172, 0.0095216, 0.0727914, -0.1432332, -0.2082713, 0.3602719];
+    const CEXP_OUT: &[f32] = &[
+        -0.1465172, 0.0095216, 0.0727914, -0.1432332, -0.2082713, 0.3602719,
+    ];
     const CEXP_STATE: &[f32] = &[
         0.0879031, 0.8514872, 0.00599, -0.3929182, -0.15279, -0.0340949, -0.1223795, -0.5179096,
         0.7106992,

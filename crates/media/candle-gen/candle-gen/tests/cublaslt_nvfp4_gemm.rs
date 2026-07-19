@@ -111,7 +111,13 @@ fn run_gemm(dev: &Device, lt: &CublasLt, m: usize, k: usize, n: usize) -> (Vec<f
         .unwrap()
         .to_vec1::<f32>()
         .unwrap();
-    let dq_ref = ref_matmul(&x_pk.dequantize_to_vec(), &w_pk.dequantize_to_vec(), m, k, n);
+    let dq_ref = ref_matmul(
+        &x_pk.dequantize_to_vec(),
+        &w_pk.dequantize_to_vec(),
+        m,
+        k,
+        n,
+    );
     (got, dq_ref)
 }
 
@@ -124,10 +130,10 @@ fn nvfp4_gemm_roundtrip_vs_bf16_dense() {
     // Shapes chosen to exercise: a single scale atom, >128 weight rows (2 row-atoms on A), and >128
     // activation rows (2 row-atoms on B) — the multi-atom regime that pins the scale tiling order.
     for &(m, k, n) in &[
-        (64usize, 256usize, 128usize),  // single 128-row atom
-        (64, 256, 256),                 // weight has 2 row-atoms (handoff a)
-        (256, 256, 256),                // both operands have 2 row-atoms
-        (256, 512, 128),                // 4 col-atoms on K
+        (64usize, 256usize, 128usize), // single 128-row atom
+        (64, 256, 256),                // weight has 2 row-atoms (handoff a)
+        (256, 256, 256),               // both operands have 2 row-atoms
+        (256, 512, 128),               // 4 col-atoms on K
     ] {
         let (got, dq_ref) = run_gemm(&dev, &lt, m, k, n);
         assert!(
@@ -146,7 +152,13 @@ fn nvfp4_gemm_roundtrip_vs_bf16_dense() {
     // End-to-end NVFP4 error vs the original bf16 dense matmul — within NVFP4 tolerance.
     let (m, k, n) = (256usize, 256usize, 256usize);
     let (got, _) = run_gemm(&dev, &lt, m, k, n);
-    let bf16_ref = ref_matmul(&pseudo_random(m * k, 11), &pseudo_random(n * k, 22), m, k, n);
+    let bf16_ref = ref_matmul(
+        &pseudo_random(m * k, 11),
+        &pseudo_random(n * k, 22),
+        m,
+        k,
+        n,
+    );
     let rr_e2e = rel_rms(&got, &bf16_ref);
     eprintln!("[sc-11039] NVFP4 GEMM vs bf16-dense end-to-end rel-RMS = {rr_e2e:.5}");
     // Uniform-random [-1,1] is a worst-case for NVFP4 (per-block dynamic range is large); the tight
@@ -176,8 +188,12 @@ fn nvfp4_gemm_throughput_vs_bf16() {
         .unwrap();
 
     // Pre-stage the FP4 operands (weight resident, activation staged once — the honest compute path).
-    let w_stg = lt.stage_nvfp4(&Nvfp4Tensor::pack(&w_bf16).unwrap()).unwrap();
-    let x_stg = lt.stage_nvfp4(&Nvfp4Tensor::pack(&x_bf16).unwrap()).unwrap();
+    let w_stg = lt
+        .stage_nvfp4(&Nvfp4Tensor::pack(&w_bf16).unwrap())
+        .unwrap();
+    let x_stg = lt
+        .stage_nvfp4(&Nvfp4Tensor::pack(&x_bf16).unwrap())
+        .unwrap();
 
     let iters = 100;
     // Warm up both paths (the FP4 warmup also primes the per-shape algo cache so the loop times the
@@ -249,7 +265,13 @@ fn nvfp4_k_alignment_probe() {
                     .unwrap()
                     .to_vec1::<f32>()
                     .unwrap();
-                let dq_ref = ref_matmul(&x_pk.dequantize_to_vec(), &w_pk.dequantize_to_vec(), m, k, n);
+                let dq_ref = ref_matmul(
+                    &x_pk.dequantize_to_vec(),
+                    &w_pk.dequantize_to_vec(),
+                    m,
+                    k,
+                    n,
+                );
                 let rr = rel_rms(&got, &dq_ref);
                 let ok = got.iter().all(|v| v.is_finite()) && rr < 0.05;
                 eprintln!(

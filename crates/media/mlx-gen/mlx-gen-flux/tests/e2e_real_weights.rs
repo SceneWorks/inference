@@ -569,7 +569,10 @@ fn e2e_denoise_loop_matches_golden() {
     // dit_parity.rs) chaos-amplifies over the free-running loop — measured mean_rel 3.538e-3 (dev)
     // / 8.377e-3 (schnell). Envelope ~3× the worst measurement; the per-forward transformer gates
     // stay the tight protection (a wiring/table bug lands O(1e-1+), the pre-sc-2787 states).
-    assert!(mr < 3e-2, "denoise loop diverged: mean_rel {mr:.3e} (sc-12896 envelope)");
+    assert!(
+        mr < 3e-2,
+        "denoise loop diverged: mean_rel {mr:.3e} (sc-12896 envelope)"
+    );
 
     // Decode these (golden-embed) latents to pixels — isolates transformer+denoise+VAE px>8 from the
     // text-encoder f32-vs-bf16 contribution that the full-pipeline test additionally includes.

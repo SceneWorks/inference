@@ -32,7 +32,13 @@ fn run(p: &dyn TextLlm, r: &TextLlmRequest) -> (TextLlmOutput, String, String, V
     let (mut think, mut content, mut indices) = (String::new(), String::new(), Vec::new());
     let out = p
         .generate(r, &mut |ev| {
-            if let StreamEvent::Token { text, index, channel, .. } = ev {
+            if let StreamEvent::Token {
+                text,
+                index,
+                channel,
+                ..
+            } = ev
+            {
                 indices.push(index);
                 match channel {
                     Channel::Thinking => think.push_str(&text),
@@ -55,18 +61,29 @@ fn qwen3_thinking_and_nothink() {
     );
 
     // validate accepts every mode on a thinking model.
-    for mode in [ThinkingMode::Auto, ThinkingMode::Enabled, ThinkingMode::Disabled] {
+    for mode in [
+        ThinkingMode::Auto,
+        ThinkingMode::Enabled,
+        ThinkingMode::Disabled,
+    ] {
         p.validate(&req("hi", mode, 8))
             .unwrap_or_else(|e| panic!("validate {mode:?}: {e}"));
     }
 
     // Thinking (Auto = Qwen3's template default = on): the model emits a <think>…</think> block,
     // which is split into output.thinking; the answer excludes the reasoning and the markers.
-    let (out, think, content, indices) =
-        run(&p, &req("What is 2+2? Reply briefly.", ThinkingMode::Auto, 256));
-    println!("\n=== Qwen3 THINK ===\n[reasoning]\n{think}\n[answer]\n{}\n", out.text);
+    let (out, think, content, indices) = run(
+        &p,
+        &req("What is 2+2? Reply briefly.", ThinkingMode::Auto, 256),
+    );
+    println!(
+        "\n=== Qwen3 THINK ===\n[reasoning]\n{think}\n[answer]\n{}\n",
+        out.text
+    );
     assert!(
-        out.thinking.as_deref().is_some_and(|t| !t.trim().is_empty()),
+        out.thinking
+            .as_deref()
+            .is_some_and(|t| !t.trim().is_empty()),
         "thinking run must produce a reasoning block"
     );
     assert!(
@@ -78,7 +95,10 @@ fn qwen3_thinking_and_nothink() {
         !think.contains("<think>") && !think.contains("</think>"),
         "markers must be stripped from reasoning"
     );
-    assert_eq!(content, out.text, "Content-channel deltas reconstruct output.text");
+    assert_eq!(
+        content, out.text,
+        "Content-channel deltas reconstruct output.text"
+    );
     assert_eq!(
         think,
         out.thinking.clone().unwrap_or_default(),
@@ -92,13 +112,27 @@ fn qwen3_thinking_and_nothink() {
 
     // No-think (Disabled): the empty <think></think> echo is injected into the prompt, so the model
     // answers directly — no reasoning channel at all.
-    let (nout, nthink, ncontent, _) =
-        run(&p, &req("What is 2+2? Reply briefly.", ThinkingMode::Disabled, 64));
+    let (nout, nthink, ncontent, _) = run(
+        &p,
+        &req("What is 2+2? Reply briefly.", ThinkingMode::Disabled, 64),
+    );
     println!("=== Qwen3 NO-THINK ===\n[answer]\n{}\n", nout.text);
-    assert!(nthink.is_empty(), "no-think must emit no Thinking-channel tokens");
-    assert!(nout.thinking.is_none(), "no-think output.thinking must be None");
-    assert!(!nout.text.contains("<think>"), "no marker leak in the no-think answer");
-    assert!(!ncontent.trim().is_empty(), "no-think must produce a direct answer");
+    assert!(
+        nthink.is_empty(),
+        "no-think must emit no Thinking-channel tokens"
+    );
+    assert!(
+        nout.thinking.is_none(),
+        "no-think output.thinking must be None"
+    );
+    assert!(
+        !nout.text.contains("<think>"),
+        "no marker leak in the no-think answer"
+    );
+    assert!(
+        !ncontent.trim().is_empty(),
+        "no-think must produce a direct answer"
+    );
 }
 
 #[test]
@@ -126,7 +160,9 @@ fn qwen3_multi_turn_carries_reasoning() {
     let q1 = "What is 2+2? Reply briefly.";
     let (out1, _t, _c, _) = run(&p, &req(q1, ThinkingMode::Auto, 256));
     assert!(
-        out1.thinking.as_deref().is_some_and(|t| !t.trim().is_empty()),
+        out1.thinking
+            .as_deref()
+            .is_some_and(|t| !t.trim().is_empty()),
         "turn 1 should reason"
     );
 
@@ -149,7 +185,11 @@ fn qwen3_multi_turn_carries_reasoning() {
     let (out2, _t2, _c2, indices2) = run(&p, &req2);
     println!("\n=== Qwen3 turn 2 ===\n[answer]\n{}\n", out2.text);
     assert!(
-        !out2.text.trim().is_empty() || out2.thinking.as_deref().is_some_and(|t| !t.trim().is_empty()),
+        !out2.text.trim().is_empty()
+            || out2
+                .thinking
+                .as_deref()
+                .is_some_and(|t| !t.trim().is_empty()),
         "turn 2 must produce an answer or reasoning"
     );
     assert!(
@@ -179,6 +219,9 @@ fn non_thinking_model_rejects_enable() {
     // It still generates normally, with no reasoning channel.
     let (out, think, _content, _) =
         run(&p, &req("The capital of France is", ThinkingMode::Auto, 8));
-    assert!(think.is_empty() && out.thinking.is_none(), "non-thinking model emits no reasoning");
+    assert!(
+        think.is_empty() && out.thinking.is_none(),
+        "non-thinking model emits no reasoning"
+    );
     assert!(!out.text.is_empty());
 }

@@ -104,14 +104,14 @@ use candle_gen_pid::PidEngine;
 /// student + 4× SR (`candle_gen_pid::registry`). Shared with Krea (which reuses [`vae::QwenVae`]).
 const PID_BACKBONE: &str = "qwenimage";
 
-use config::{
-    TextEncoderConfig, TransformerConfig, DEFAULT_GUIDANCE, DEFAULT_STEPS, MODEL_ID,
-    NEGATIVE_FALLBACK,
-};
 /// The pinned image-lane stride (16), re-exported at the crate root so the SceneWorks worker can tie
 /// each advertised Qwen-Image bucket to the real engine stride instead of a hand-copied literal
 /// (sc-12612). `validate` enforces exactly this value, so the const cannot drift from the check.
 pub use config::SIZE_MULTIPLE;
+use config::{
+    TextEncoderConfig, TransformerConfig, DEFAULT_GUIDANCE, DEFAULT_STEPS, MODEL_ID,
+    NEGATIVE_FALLBACK,
+};
 use text_encoder::QwenTextEncoder;
 use transformer::QwenTransformer;
 use vae::QwenVae;

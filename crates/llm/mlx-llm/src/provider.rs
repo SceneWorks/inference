@@ -14,10 +14,11 @@ use std::path::Path;
 
 use core_llm::{
     Channel, ChatTemplate, Constraint, ConstraintDecodeTable, Content, Error as CoreError,
-    FinishReason as CoreFinish, ImageRef, JinjaChatTemplate, JsonConstraint, Llama3Template, LoadSpec,
-    IncrementalDetok, Message, Quantize, RenderOptions, Result as CoreResult, Sampling, StopMatcher,
-    StreamEvent as CoreEvent, TextLlm, TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput,
-    TextLlmRequest, ThinkingSegmenter, Tokenizer, ToolCallSegmenter, Usage, VideoRef,
+    FinishReason as CoreFinish, ImageRef, IncrementalDetok, JinjaChatTemplate, JsonConstraint,
+    Llama3Template, LoadSpec, Message, Quantize, RenderOptions, Result as CoreResult, Sampling,
+    StopMatcher, StreamEvent as CoreEvent, TextLlm, TextLlmCapabilities, TextLlmDescriptor,
+    TextLlmOutput, TextLlmRequest, ThinkingSegmenter, Tokenizer, ToolCallSegmenter, Usage,
+    VideoRef,
 };
 
 use crate::config::{Architecture, ModelConfig};
@@ -55,7 +56,12 @@ impl Decode for Decoder {
         }
     }
 
-    fn step(&self, input_ids: &Array, cache: &mut dyn KvCache, offset: i32) -> crate::error::Result<Array> {
+    fn step(
+        &self,
+        input_ids: &Array,
+        cache: &mut dyn KvCache,
+        offset: i32,
+    ) -> crate::error::Result<Array> {
         match self {
             Decoder::Causal(m) => m.step(input_ids, cache, offset),
             Decoder::Qwen35(m) => m.step(input_ids, cache, offset),
@@ -109,7 +115,10 @@ impl Qwen35Vision {
             .processor
             .preprocess(&img.pixels, img.width as usize, img.height as usize)
             .map_err(to_core)?;
-        let out = self.tower.forward_with_deepstack(&pixels, &grid).map_err(to_core)?;
+        let out = self
+            .tower
+            .forward_with_deepstack(&pixels, &grid)
+            .map_err(to_core)?;
         Ok((out.pooler_output, out.deepstack_features, grid[0]))
     }
 
@@ -126,7 +135,10 @@ impl Qwen35Vision {
             .map(|f| (f.pixels.as_slice(), f.width as usize, f.height as usize))
             .collect();
         let (pixels, grid) = self.processor.preprocess_video(&frames).map_err(to_core)?;
-        let out = self.tower.forward_with_deepstack(&pixels, &[grid]).map_err(to_core)?;
+        let out = self
+            .tower
+            .forward_with_deepstack(&pixels, &[grid])
+            .map_err(to_core)?;
         Ok((out.pooler_output, out.deepstack_features, grid))
     }
 }
@@ -159,7 +171,12 @@ impl Decode for Shifted<'_> {
         self.model.make_cache()
     }
 
-    fn step(&self, ids: &Array, cache: &mut dyn KvCache, offset: i32) -> crate::error::Result<Array> {
+    fn step(
+        &self,
+        ids: &Array,
+        cache: &mut dyn KvCache,
+        offset: i32,
+    ) -> crate::error::Result<Array> {
         self.model.step(ids, cache, offset + self.delta)
     }
 }
@@ -231,7 +248,10 @@ fn video_placeholder_text(video: &VideoRef, temporal_patch_size: usize) -> Strin
 /// per-frame Text–Timestamp-Alignment string `<{t} seconds><|vision_start|><|video_pad|><|vision_end|>`
 /// (one `video_pad` per frame, each expanded to `frame_seqlen` after tokenizing). Keeps the core-llm
 /// template contract image/video-free.
-fn substitute_vision_placeholders(messages: &[Message], temporal_patch_size: usize) -> Vec<Message> {
+fn substitute_vision_placeholders(
+    messages: &[Message],
+    temporal_patch_size: usize,
+) -> Vec<Message> {
     const IMAGE_PLACEHOLDER: &str = "<|vision_start|><|image_pad|><|vision_end|>";
     messages
         .iter()
@@ -242,7 +262,9 @@ fn substitute_vision_placeholders(messages: &[Message], temporal_patch_size: usi
                 .iter()
                 .map(|c| match c {
                     Content::Image(_) => Content::text(IMAGE_PLACEHOLDER),
-                    Content::Video(v) => Content::text(video_placeholder_text(v, temporal_patch_size)),
+                    Content::Video(v) => {
+                        Content::text(video_placeholder_text(v, temporal_patch_size))
+                    }
                     Content::Text(t) => Content::Text(t.clone()),
                 })
                 .collect(),
@@ -302,7 +324,9 @@ impl LlamaProvider {
         // (`qwen3_vl`), which share the identical Qwen3-VL ViT tower. Absent → a text-only checkpoint.
         let vision = if (arch == Architecture::Qwen35 || arch == Architecture::Qwen3Vl)
             && cfg_value.get("vision_config").is_some()
-            && weights.get("model.visual.patch_embed.proj.weight").is_some()
+            && weights
+                .get("model.visual.patch_embed.proj.weight")
+                .is_some()
         {
             let vcfg = Qwen35VisionConfig::from_json(&cfg_value).map_err(to_core)?;
             let tower = Qwen35VisionModel::from_weights(&weights, "model.visual", vcfg.clone())
@@ -381,10 +405,9 @@ impl LlamaProvider {
         prompt_ids: &[i32],
         messages: &[Message],
     ) -> CoreResult<MultimodalPrefill> {
-        let vision = self
-            .vision
-            .as_ref()
-            .ok_or_else(|| CoreError::Load("qwen-vl vision: provider has no vision tower".into()))?;
+        let vision = self.vision.as_ref().ok_or_else(|| {
+            CoreError::Load("qwen-vl vision: provider has no vision tower".into())
+        })?;
 
         // Walk the conversation in document order; encode each visual once, in order, so the
         // concatenated feature buffer lines up one-to-one with the visual placeholder spans of the
@@ -446,13 +469,16 @@ impl LlamaProvider {
         // own token, so order across the two is preserved and the result interleaves correctly.
         let img_id = vision.image_token_id;
         let vid_id = vision.video_token_id;
-        let expanded = crate::models::qwen35::expand_vision_placeholders(prompt_ids, img_id, &image_counts)
-            .map_err(to_core)?;
+        let expanded =
+            crate::models::qwen35::expand_vision_placeholders(prompt_ids, img_id, &image_counts)
+                .map_err(to_core)?;
         let expanded =
             crate::models::qwen35::expand_vision_placeholders(&expanded, vid_id, &video_counts)
                 .map_err(to_core)?;
-        let visual_pos_mask: Vec<bool> =
-            expanded.iter().map(|&id| id == img_id || id == vid_id).collect();
+        let visual_pos_mask: Vec<bool> = expanded
+            .iter()
+            .map(|&id| id == img_id || id == vid_id)
+            .collect();
 
         let refs: Vec<&Array> = feats.iter().collect();
         let all_features = match refs.as_slice() {
@@ -474,7 +500,9 @@ impl LlamaProvider {
         // Qwen3-VL generic-causal).
         let placeholders = [img_id, vid_id];
         let model = self.model.as_vlm();
-        let embeds = model.embed_input_ids(&input_ids(&expanded)).map_err(to_core)?;
+        let embeds = model
+            .embed_input_ids(&input_ids(&expanded))
+            .map_err(to_core)?;
         let spliced = model
             .splice_vision_features(&embeds, &expanded, &all_features, &placeholders)
             .map_err(to_core)?;
@@ -635,7 +663,10 @@ impl TextLlm for LlamaProvider {
         } else {
             None
         };
-        let prompt_len = mm.as_ref().map(|m| m.expanded_ids.len()).unwrap_or(prompt_ids.len());
+        let prompt_len = mm
+            .as_ref()
+            .map(|m| m.expanded_ids.len())
+            .unwrap_or(prompt_ids.len());
 
         let config = GenerationConfig {
             max_new_tokens: req.max_new_tokens as usize,
@@ -738,7 +769,8 @@ impl TextLlm for LlamaProvider {
                                             Channel::Content => {
                                                 // Answer text → tool segmenter (lifts out tool-call
                                                 // blocks) → stop matcher → emit.
-                                                for piece in tool_pieces(&mut tool_seg, &span.text) {
+                                                for piece in tool_pieces(&mut tool_seg, &span.text)
+                                                {
                                                     emit_content(
                                                         &piece,
                                                         id,
@@ -773,9 +805,7 @@ impl TextLlm for LlamaProvider {
                     }
                 }
             };
-            let constraint = json_mask
-                .as_mut()
-                .map(|m| m as &mut dyn ConstraintMask);
+            let constraint = json_mask.as_mut().map(|m| m as &mut dyn ConstraintMask);
             let should_stop = || halt.get();
             let should_stop_opt = stop_active.then_some(&should_stop as &dyn Fn() -> bool);
             match &mm {
@@ -796,7 +826,10 @@ impl TextLlm for LlamaProvider {
                             &m.deepstack,
                         )
                         .map_err(to_core)?;
-                    let shifted = Shifted { model, delta: *delta };
+                    let shifted = Shifted {
+                        model,
+                        delta: *delta,
+                    };
                     generate_from_prefill(
                         &shifted,
                         cache.as_mut(),
@@ -1019,7 +1052,10 @@ fn read_json(dir: &Path, name: &str) -> Option<serde_json::Value> {
 fn parse_token_ids(v: Option<&serde_json::Value>) -> Option<Vec<i32>> {
     let ids = match v? {
         serde_json::Value::Number(n) => vec![n.as_i64()? as i32],
-        serde_json::Value::Array(a) => a.iter().filter_map(|x| x.as_i64().map(|x| x as i32)).collect(),
+        serde_json::Value::Array(a) => a
+            .iter()
+            .filter_map(|x| x.as_i64().map(|x| x as i32))
+            .collect(),
         _ => return None,
     };
     (!ids.is_empty()).then_some(ids)
@@ -1079,7 +1115,11 @@ fn load_registered(spec: &LoadSpec) -> CoreResult<Box<dyn TextLlm>> {
 /// (its nested text decoder) so it no longer misroutes to JoyCaption (sc-7626).
 pub fn can_load(spec: &LoadSpec) -> bool {
     let dir = Path::new(&spec.source);
-    let path = if dir.is_dir() { dir.join("config.json") } else { dir.to_path_buf() };
+    let path = if dir.is_dir() {
+        dir.join("config.json")
+    } else {
+        dir.to_path_buf()
+    };
     let Ok(text) = std::fs::read_to_string(path) else {
         return false;
     };
@@ -1112,7 +1152,11 @@ fn can_load_value(v: &serde_json::Value) -> bool {
 /// per-snapshot probe a genuine Qwen3-VL snapshot would be rejected at the gate (the story-D gap).
 pub fn weightless_vision(spec: &LoadSpec) -> bool {
     let dir = Path::new(&spec.source);
-    let path = if dir.is_dir() { dir.join("config.json") } else { dir.to_path_buf() };
+    let path = if dir.is_dir() {
+        dir.join("config.json")
+    } else {
+        dir.to_path_buf()
+    };
     let Ok(text) = std::fs::read_to_string(path) else {
         return false;
     };
@@ -1177,8 +1221,12 @@ mod tests {
         // LLaVA: ceded to the JoyCaption vision provider.
         assert!(!can_load_value(&llava_wrapper()));
         // Plain text models (no vision_config) are unaffected.
-        assert!(can_load_value(&json!({ "architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3" })));
-        assert!(can_load_value(&json!({ "architectures": ["LlamaForCausalLM"], "model_type": "llama" })));
+        assert!(can_load_value(
+            &json!({ "architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3" })
+        ));
+        assert!(can_load_value(
+            &json!({ "architectures": ["LlamaForCausalLM"], "model_type": "llama" })
+        ));
     }
 
     #[test]
@@ -1194,8 +1242,12 @@ mod tests {
         assert!(!weightless_vision_value(&llava_wrapper()));
         // Plain text checkpoints (no vision_config) ⇒ NOT vision-capable (the static descriptor
         // already reports supports_vision=false; the probe must not flip it on).
-        assert!(!weightless_vision_value(&json!({ "architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3" })));
-        assert!(!weightless_vision_value(&json!({ "architectures": ["LlamaForCausalLM"], "model_type": "llama" })));
+        assert!(!weightless_vision_value(
+            &json!({ "architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3" })
+        ));
+        assert!(!weightless_vision_value(
+            &json!({ "architectures": ["LlamaForCausalLM"], "model_type": "llama" })
+        ));
     }
 
     /// Locate the cached Qwen3-VL-8B-Instruct snapshot (rev 0c351dd0) for the chat-template oracle.
@@ -1240,7 +1292,10 @@ mod tests {
         match case {
             "text_only" => vec![user(vec![Content::text("What is the capital of France?")])],
             "system_user_text" => {
-                vec![sys("You are a helpful assistant."), user(vec![Content::text("Hello!")])]
+                vec![
+                    sys("You are a helpful assistant."),
+                    user(vec![Content::text("Hello!")]),
+                ]
             }
             "single_image" => vec![user(vec![img(), Content::text("Describe this image.")])],
             "multi_image_mixed" => vec![user(vec![
@@ -1270,9 +1325,10 @@ mod tests {
             eprintln!("skipping: Qwen3-VL-8B snapshot not present (set QWEN3VL_SNAPSHOT)");
             return;
         };
-        let oracle: serde_json::Value =
-            serde_json::from_str(include_str!("models/testdata/qwen3vl_chat_template_oracle.json"))
-                .expect("parse chat-template oracle");
+        let oracle: serde_json::Value = serde_json::from_str(include_str!(
+            "models/testdata/qwen3vl_chat_template_oracle.json"
+        ))
+        .expect("parse chat-template oracle");
 
         // Sanity: the dispatch and config see Qwen3-VL (and parse the nested 256K-context text decoder).
         let cfg_value = read_config_value(&dir).expect("read config.json");
@@ -1321,7 +1377,10 @@ mod tests {
                 .into_iter()
                 .map(|id| id as i32)
                 .collect();
-            assert_eq!(got, want, "case {case}: tokenized prompt ids must byte-match HF processor");
+            assert_eq!(
+                got, want,
+                "case {case}: tokenized prompt ids must byte-match HF processor"
+            );
         }
     }
 
@@ -1330,9 +1389,13 @@ mod tests {
         // Qwen3.6 thinking/auto generation prompt: opens the block, leaves it unclosed.
         assert!(prompt_opens_thinking("<|im_start|>assistant\n<think>\n"));
         // Disabled mode renders a *closed* empty block: must not prime.
-        assert!(!prompt_opens_thinking("<|im_start|>assistant\n<think>\n\n</think>\n\n"));
+        assert!(!prompt_opens_thinking(
+            "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        ));
         // A prior closed reasoning turn followed by a fresh open block still opens.
-        assert!(prompt_opens_thinking("<think>\nold\n</think>\n\nq<|im_start|>assistant\n<think>\n"));
+        assert!(prompt_opens_thinking(
+            "<think>\nold\n</think>\n\nq<|im_start|>assistant\n<think>\n"
+        ));
         // No reasoning markers at all (non-thinking template).
         assert!(!prompt_opens_thinking("<|im_start|>assistant\n"));
     }
@@ -1413,7 +1476,10 @@ mod tests {
         // The timestamp tags themselves must appear verbatim (the core of Text–Timestamp Alignment).
         for t in j["merged_timestamps"].as_array().unwrap() {
             let tag = format!("<{:.1} seconds>", t.as_f64().unwrap());
-            assert!(got.contains(&tag), "placeholder must carry the `{tag}` timestamp tag: {got}");
+            assert!(
+                got.contains(&tag),
+                "placeholder must carry the `{tag}` timestamp tag: {got}"
+            );
         }
     }
 
@@ -1425,15 +1491,23 @@ mod tests {
     #[test]
     fn video_token_expansion_matches_hf_reference() {
         let j = qwen3vl_video_oracle();
-        let expanded_hf: Vec<i32> =
-            j["expanded_ids"].as_array().unwrap().iter().map(|x| x.as_i64().unwrap() as i32).collect();
+        let expanded_hf: Vec<i32> = j["expanded_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_i64().unwrap() as i32)
+            .collect();
         let vid = j["video_token_id"].as_i64().unwrap() as i32;
         let grid_t = j["grid_t"].as_u64().unwrap() as usize;
         let frame_seqlen = j["frame_seqlen"].as_u64().unwrap() as usize;
         let expected_video_tokens = j["expected_video_tokens"].as_u64().unwrap() as usize;
 
         // The merged-token count per frame, and total, must agree with the HF processor.
-        assert_eq!(grid_t * frame_seqlen, expected_video_tokens, "total video tokens vs HF");
+        assert_eq!(
+            grid_t * frame_seqlen,
+            expected_video_tokens,
+            "total video tokens vs HF"
+        );
         assert_eq!(
             expanded_hf.iter().filter(|&&x| x == vid).count(),
             expected_video_tokens,
@@ -1462,7 +1536,8 @@ mod tests {
 
         // Expanding each per-frame placeholder to `frame_seqlen` reproduces the HF id stream exactly.
         let counts = vec![frame_seqlen; grid_t];
-        let expanded = crate::models::qwen35::expand_vision_placeholders(&raw, vid, &counts).unwrap();
+        let expanded =
+            crate::models::qwen35::expand_vision_placeholders(&raw, vid, &counts).unwrap();
         assert_eq!(expanded, expanded_hf, "expanded video ids vs HF processor");
     }
 
@@ -1475,12 +1550,22 @@ mod tests {
     #[test]
     fn video_mrope_positions_split_frames() {
         let j = qwen3vl_video_oracle();
-        let expanded_hf: Vec<i32> =
-            j["expanded_ids"].as_array().unwrap().iter().map(|x| x.as_i64().unwrap() as i32).collect();
+        let expanded_hf: Vec<i32> = j["expanded_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_i64().unwrap() as i32)
+            .collect();
         let vid = j["video_token_id"].as_i64().unwrap() as i32;
         let img = j["video_token_id"].as_i64().unwrap() as i32 - 1; // a distinct unused image id
-        let g = j["video_grid_thw"].as_array().unwrap()[0].as_array().unwrap();
-        let grid = [g[0].as_i64().unwrap() as i32, g[1].as_i64().unwrap() as i32, g[2].as_i64().unwrap() as i32];
+        let g = j["video_grid_thw"].as_array().unwrap()[0]
+            .as_array()
+            .unwrap();
+        let grid = [
+            g[0].as_i64().unwrap() as i32,
+            g[1].as_i64().unwrap() as i32,
+            g[2].as_i64().unwrap() as i32,
+        ];
         let merge = j["merge"].as_i64().unwrap() as i32;
 
         let (t, h, w, _delta) = crate::models::deepstack::mrope_positions_mm(
@@ -1501,7 +1586,11 @@ mod tests {
             .filter_map(|(&id, &tt)| (id == vid).then_some(tt))
             .collect();
         let distinct: std::collections::BTreeSet<i32> = frame_temporals.iter().copied().collect();
-        assert_eq!(distinct.len(), grid[0] as usize, "one distinct temporal index per frame");
+        assert_eq!(
+            distinct.len(),
+            grid[0] as usize,
+            "one distinct temporal index per frame"
+        );
         // h/w spans are bounded by the per-frame grid (h/merge, w/merge).
         let max_w = (grid[2] / merge) - 1;
         let frame_ws: Vec<i32> = expanded_hf
@@ -1510,7 +1599,10 @@ mod tests {
             .zip(&t)
             .filter_map(|((&id, &ww), &tt)| (id == vid).then_some(ww - tt))
             .collect();
-        assert!(frame_ws.iter().all(|&rel| (0..=max_w).contains(&rel)), "w within per-frame grid");
+        assert!(
+            frame_ws.iter().all(|&rel| (0..=max_w).contains(&rel)),
+            "w within per-frame grid"
+        );
         let _ = h;
     }
 }

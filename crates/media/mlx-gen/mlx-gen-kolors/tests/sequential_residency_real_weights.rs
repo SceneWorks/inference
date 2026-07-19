@@ -41,7 +41,10 @@ fn probe_request() -> GenerationRequest {
 
 fn render_measured(policy: OffloadPolicy, req: &GenerationRequest) -> (Vec<u8>, usize) {
     let spec = LoadSpec::new(WeightsSource::Dir(common::snapshot())).with_offload_policy(policy);
-    let model = mlx_gen_kolors::provider_registry().expect("build provider registry").load("kolors", &spec).expect("load kolors");
+    let model = mlx_gen_kolors::provider_registry()
+        .expect("build provider registry")
+        .load("kolors", &spec)
+        .expect("load kolors");
     reset_peak_memory();
     let out = model.generate(req, &mut |_| {}).expect("generate");
     let peak = get_peak_memory();

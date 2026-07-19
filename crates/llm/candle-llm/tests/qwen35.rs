@@ -12,12 +12,12 @@
 //! `qwen3_5`), coherent greedy text on real weights, the thinking / no-think split driven by the
 //! model's own chat template, quantize-on-load, and the full `core-llm-testkit` conformance suite.
 
+use candle_llm::load_for_model;
 use candle_llm::provider::{can_load, PROVIDER_ID};
 use candle_llm::LlamaProvider;
-use candle_llm::load_for_model;
 use core_llm::{
-    Channel, LoadSpec, Message, Quantize, Sampling, StreamEvent, TextLlm,
-    TextLlmOutput, TextLlmRequest, ThinkingMode,
+    Channel, LoadSpec, Message, Quantize, Sampling, StreamEvent, TextLlm, TextLlmOutput,
+    TextLlmRequest, ThinkingMode,
 };
 use core_llm_testkit::{textllm_conformance, TextLlmProfile};
 

@@ -59,7 +59,10 @@ fn probe_request() -> GenerationRequest {
 
 fn render_measured(policy: OffloadPolicy, req: &GenerationRequest) -> (Vec<u8>, usize) {
     let spec = LoadSpec::new(WeightsSource::Dir(split_files())).with_offload_policy(policy);
-    let model = mlx_gen_anima::provider_registry().expect("build provider registry").load("anima_base", &spec).expect("load anima_base");
+    let model = mlx_gen_anima::provider_registry()
+        .expect("build provider registry")
+        .load("anima_base", &spec)
+        .expect("load anima_base");
     reset_peak_memory();
     let out = model.generate(req, &mut |_| {}).expect("generate");
     let peak = get_peak_memory();

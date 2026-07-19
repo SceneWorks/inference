@@ -4,8 +4,8 @@
 use super::*;
 
 use core_llm::{
-    Channel, Error, FinishReason, Result as CoreResult, StreamEvent, TextLlm,
-    TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput, TextLlmRequest, Usage,
+    Channel, Error, FinishReason, Result as CoreResult, StreamEvent, TextLlm, TextLlmCapabilities,
+    TextLlmDescriptor, TextLlmOutput, TextLlmRequest, Usage,
 };
 
 #[derive(Clone)]

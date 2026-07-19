@@ -896,10 +896,7 @@ mod tests {
         let err = build_residency(&q4_spec(&root, mlx_gen::OffloadPolicy::Sequential))
             .err()
             .expect("Sequential must fail-fast on a tier mismatch at load, not at first generate");
-        assert!(
-            err.to_string().contains("pre-quantized Q8"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("pre-quantized Q8"), "got: {err}");
         std::fs::remove_dir_all(&root).ok();
     }
 

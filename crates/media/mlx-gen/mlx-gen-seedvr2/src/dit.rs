@@ -1289,7 +1289,8 @@ mod stage_tests {
         }
 
         // quantized: one packed tensor set shared across both streams.
-        attn.quantize(8, mlx_gen::quant::DEFAULT_GROUP_SIZE).unwrap();
+        attn.quantize(8, mlx_gen::quant::DEFAULT_GROUP_SIZE)
+            .unwrap();
         for (label, v, t) in [
             ("qkv", &attn.qkv_vid.w, &attn.qkv_txt.w),
             ("out", &attn.out_vid.w, &attn.out_txt.w),

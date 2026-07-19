@@ -330,7 +330,8 @@ impl ModelConfig {
         } else {
             v
         };
-        let int = |key: &str| -> Option<i32> { v.get(key).and_then(|x| x.as_i64()).map(|x| x as i32) };
+        let int =
+            |key: &str| -> Option<i32> { v.get(key).and_then(|x| x.as_i64()).map(|x| x as i32) };
         let req_int = |key: &str| -> Result<i32> {
             int(key).ok_or_else(|| Error::Config(format!("config.json missing integer `{key}`")))
         };
@@ -406,7 +407,8 @@ impl ModelConfig {
                         .and_then(|x| x.as_bool())
                         .unwrap_or(false),
                     routed_scaling_factor: f32_opt("routed_scaling_factor").unwrap_or(1.0),
-                    first_k_dense_replace: int("first_k_dense_replace").unwrap_or(0).max(0) as usize,
+                    first_k_dense_replace: int("first_k_dense_replace").unwrap_or(0).max(0)
+                        as usize,
                 }
             });
 
@@ -509,7 +511,11 @@ impl ModelConfig {
     /// the image (3-D) RoPE path; the text path (all rows equal) is independent of the split.
     pub fn mrope_section_resolved(&self) -> [usize; 3] {
         if let Some(s) = self.mrope_section {
-            return [s[0].max(0) as usize, s[1].max(0) as usize, s[2].max(0) as usize];
+            return [
+                s[0].max(0) as usize,
+                s[1].max(0) as usize,
+                s[2].max(0) as usize,
+            ];
         }
         let half = (self.rotary_dim() / 2) as usize;
         let base = half / 3;
@@ -535,7 +541,11 @@ impl ModelConfig {
     /// Read and parse `config.json` from a snapshot directory (or a file path).
     pub fn from_dir(dir: impl AsRef<Path>) -> Result<Self> {
         let dir = dir.as_ref();
-        let path = if dir.is_dir() { dir.join("config.json") } else { dir.to_path_buf() };
+        let path = if dir.is_dir() {
+            dir.join("config.json")
+        } else {
+            dir.to_path_buf()
+        };
         let text = std::fs::read_to_string(&path)?;
         let v: Value = serde_json::from_str(&text)
             .map_err(|e| Error::Config(format!("parse {}: {e}", path.display())))?;
@@ -562,7 +572,11 @@ impl ModelConfig {
         }
         let rotary_dim = self.rotary_dim();
         if rotary_dim < self.head_dim || self.architecture.rope_interleaved() {
-            return Rope::partial(rotary_dim, self.rope_theta, self.architecture.rope_interleaved());
+            return Rope::partial(
+                rotary_dim,
+                self.rope_theta,
+                self.architecture.rope_interleaved(),
+            );
         }
         match self.rope_scaling {
             Some(rs) => Rope::llama3(
@@ -652,13 +666,22 @@ mod tests {
     #[test]
     fn architecture_dispatch() {
         let qwen3 = json!({ "architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3" });
-        assert_eq!(Architecture::from_config(&qwen3).unwrap(), Architecture::Qwen3);
+        assert_eq!(
+            Architecture::from_config(&qwen3).unwrap(),
+            Architecture::Qwen3
+        );
 
         let llama = json!({ "architectures": ["LlamaForCausalLM"], "model_type": "llama" });
-        assert_eq!(Architecture::from_config(&llama).unwrap(), Architecture::Llama);
+        assert_eq!(
+            Architecture::from_config(&llama).unwrap(),
+            Architecture::Llama
+        );
 
         let mistral = json!({ "architectures": ["MistralForCausalLM"] });
-        assert_eq!(Architecture::from_config(&mistral).unwrap(), Architecture::Llama);
+        assert_eq!(
+            Architecture::from_config(&mistral).unwrap(),
+            Architecture::Llama
+        );
 
         // Dense Qwen2 shares the Llama decoder shape (q/k/v bias auto-detected); routed to Llama.
         let qwen2 = json!({ "architectures": ["Qwen2ForCausalLM"], "model_type": "qwen2" });
@@ -668,11 +691,17 @@ mod tests {
 
         // Minimal config (no arch fields) defaults to Llama.
         let minimal = json!({ "hidden_size": 8 });
-        assert_eq!(Architecture::from_config(&minimal).unwrap(), Architecture::Llama);
+        assert_eq!(
+            Architecture::from_config(&minimal).unwrap(),
+            Architecture::Llama
+        );
 
         // A named-but-unsupported arch is rejected.
         let unknown = json!({ "architectures": ["MambaForCausalLM"], "model_type": "mamba" });
-        assert!(matches!(Architecture::from_config(&unknown), Err(Error::Unsupported(_))));
+        assert!(matches!(
+            Architecture::from_config(&unknown),
+            Err(Error::Unsupported(_))
+        ));
 
         // Phi-3 (packed qkv / gate_up; otherwise the Llama shape).
         let phi3 = json!({ "architectures": ["Phi3ForCausalLM"], "model_type": "phi3" });
@@ -682,7 +711,8 @@ mod tests {
         assert!(!a.has_qk_norm());
 
         // Qwen2-MoE (sparse FFN + q/k/v bias; no q/k norm).
-        let qwen2_moe = json!({ "architectures": ["Qwen2MoeForCausalLM"], "model_type": "qwen2_moe" });
+        let qwen2_moe =
+            json!({ "architectures": ["Qwen2MoeForCausalLM"], "model_type": "qwen2_moe" });
         let a = Architecture::from_config(&qwen2_moe).unwrap();
         assert_eq!(a, Architecture::Qwen2Moe);
         assert_eq!(a.family(), "qwen2_moe");
@@ -837,7 +867,11 @@ mod tests {
         // Attention scale folds in the YaRN mscale²: q_head_dim^-0.5 · (0.1·0.707·ln40 + 1)².
         let mscale = 0.1 * 0.707 * 40f32.ln() + 1.0;
         let expected = (192f32).powf(-0.5) * mscale * mscale;
-        assert!((cfg.attn_scale() - expected).abs() < 1e-6, "{}", cfg.attn_scale());
+        assert!(
+            (cfg.attn_scale() - expected).abs() < 1e-6,
+            "{}",
+            cfg.attn_scale()
+        );
 
         // The RoPE rotates only the 64-dim sub-vector, interleaved.
         let rope = cfg.build_rope();
@@ -853,7 +887,13 @@ mod tests {
             "quantization": { "group_size": 64, "bits": 4 }
         });
         let cfg = ModelConfig::from_json(&v).unwrap();
-        assert_eq!(cfg.quantization, Some(QuantSpec { group_size: 64, bits: 4 }));
+        assert_eq!(
+            cfg.quantization,
+            Some(QuantSpec {
+                group_size: 64,
+                bits: 4
+            })
+        );
 
         // Absent block ⇒ dense snapshot.
         let dense = json!({
@@ -930,7 +970,10 @@ mod tests {
             },
             "vision_config": { "model_type": "qwen3_vl", "depth": 27 }
         });
-        assert_eq!(Architecture::from_config(&v).unwrap(), Architecture::Qwen3Vl);
+        assert_eq!(
+            Architecture::from_config(&v).unwrap(),
+            Architecture::Qwen3Vl
+        );
         assert_eq!(Architecture::Qwen3Vl.family(), "qwen3_vl");
         assert!(Architecture::Qwen3Vl.is_qwen3_vl());
         assert!(Architecture::Qwen3Vl.has_qk_norm());
@@ -956,7 +999,10 @@ mod tests {
         // Interleaved M-RoPE section parsed from rope_scaling.
         assert_eq!(cfg.mrope_section, Some([24, 20, 20]));
         assert_eq!(cfg.mrope_section_resolved(), [24, 20, 20]); // sums to dim/2 = 64
-        assert_eq!(cfg.mrope_section_resolved().iter().sum::<usize>(), (cfg.rotary_dim() / 2) as usize);
+        assert_eq!(
+            cfg.mrope_section_resolved().iter().sum::<usize>(),
+            (cfg.rotary_dim() / 2) as usize
+        );
         // The text-path RoPE is plain full-width NeoX (theta 5e6); not interleaved, not partial, no yarn.
         let rope = cfg.build_rope();
         assert_eq!(rope.dim(), 128);

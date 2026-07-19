@@ -14,7 +14,13 @@ use crate::error::Result;
 /// `stride`/`padding`, no dilation, groups = 1 — the patch-embedding conv the SigLIP vision tower
 /// uses (story 7157). HF stores the conv weight `[out, in, kH, kW]`; transpose to `[out, kH, kW, in]`
 /// before calling.
-pub fn conv2d(x: &Array, weight: &Array, bias: Option<&Array>, stride: i32, padding: i32) -> Result<Array> {
+pub fn conv2d(
+    x: &Array,
+    weight: &Array,
+    bias: Option<&Array>,
+    stride: i32,
+    padding: i32,
+) -> Result<Array> {
     let y = conv2d_op(x, weight, (stride, stride), (padding, padding), (1, 1), 1)?;
     match bias {
         Some(b) => Ok(add(&y, b)?),

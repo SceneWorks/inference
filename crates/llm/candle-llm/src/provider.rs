@@ -126,7 +126,10 @@ impl Qwen35Vision {
                 &self.device,
             )
             .map_err(to_core)?;
-        let out = self.tower.forward_with_deepstack(&pixels, &grid).map_err(to_core)?;
+        let out = self
+            .tower
+            .forward_with_deepstack(&pixels, &grid)
+            .map_err(to_core)?;
         Ok((out.pooler_output, out.deepstack_features, grid[0]))
     }
 
@@ -146,7 +149,10 @@ impl Qwen35Vision {
             .processor
             .preprocess_video(&frames, &self.device)
             .map_err(to_core)?;
-        let out = self.tower.forward_with_deepstack(&pixels, &[grid]).map_err(to_core)?;
+        let out = self
+            .tower
+            .forward_with_deepstack(&pixels, &[grid])
+            .map_err(to_core)?;
         Ok((out.pooler_output, out.deepstack_features, grid))
     }
 }
@@ -260,7 +266,10 @@ fn video_placeholder_text(video: &VideoRef, temporal_patch_size: usize) -> Strin
 /// per-frame Text–Timestamp-Alignment string
 /// `<{t} seconds><|vision_start|><|video_pad|><|vision_end|>` (one `video_pad` per frame, each
 /// expanded to `frame_seqlen` after tokenizing). Keeps the core-llm template contract image/video-free.
-fn substitute_vision_placeholders(messages: &[Message], temporal_patch_size: usize) -> Vec<Message> {
+fn substitute_vision_placeholders(
+    messages: &[Message],
+    temporal_patch_size: usize,
+) -> Vec<Message> {
     const IMAGE_PLACEHOLDER: &str = "<|vision_start|><|image_pad|><|vision_end|>";
     messages
         .iter()
@@ -271,7 +280,9 @@ fn substitute_vision_placeholders(messages: &[Message], temporal_patch_size: usi
                 .iter()
                 .map(|c| match c {
                     Content::Image(_) => Content::text(IMAGE_PLACEHOLDER),
-                    Content::Video(v) => Content::text(video_placeholder_text(v, temporal_patch_size)),
+                    Content::Video(v) => {
+                        Content::text(video_placeholder_text(v, temporal_patch_size))
+                    }
                     Content::Text(t) => Content::Text(t.clone()),
                 })
                 .collect(),
@@ -581,8 +592,10 @@ impl LlamaProvider {
             expand_vision_placeholders(prompt_ids, img_id, &image_counts).map_err(to_core)?;
         let expanded =
             expand_vision_placeholders(&expanded, vid_id, &video_counts).map_err(to_core)?;
-        let visual_pos_mask: Vec<bool> =
-            expanded.iter().map(|&id| id == img_id || id == vid_id).collect();
+        let visual_pos_mask: Vec<bool> = expanded
+            .iter()
+            .map(|&id| id == img_id || id == vid_id)
+            .collect();
 
         let refs: Vec<&Tensor> = feats.iter().collect();
         let all_features = match refs.as_slice() {
@@ -1448,7 +1461,9 @@ mod tests {
             .collect();
         let vid = j["video_token_id"].as_i64().unwrap() as i32;
         let img = vid - 1; // a distinct unused image id
-        let g = j["video_grid_thw"].as_array().unwrap()[0].as_array().unwrap();
+        let g = j["video_grid_thw"].as_array().unwrap()[0]
+            .as_array()
+            .unwrap();
         let grid = [
             g[0].as_i64().unwrap() as i32,
             g[1].as_i64().unwrap() as i32,
@@ -1456,9 +1471,15 @@ mod tests {
         ];
         let merge = j["merge"].as_i64().unwrap() as i32;
 
-        let (t, h, w, _delta) =
-            crate::models::deepstack::mrope_positions_mm(&expanded_hf, &[], img, &[grid], vid, merge)
-                .unwrap();
+        let (t, h, w, _delta) = crate::models::deepstack::mrope_positions_mm(
+            &expanded_hf,
+            &[],
+            img,
+            &[grid],
+            vid,
+            merge,
+        )
+        .unwrap();
         assert_eq!(t.len(), expanded_hf.len());
         // Each frame's video tokens share one temporal index (gt = 1 per frame after the split), and
         // the two frames sit at *different* temporal positions (the cursor advances between them).

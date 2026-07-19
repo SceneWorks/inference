@@ -431,13 +431,7 @@ mod tests {
     #[test]
     fn nucleus_matches_full_sort_for_distinct_weights() {
         // Cross-check the heap nucleus against a brute-force descending sort + prefix.
-        let weights: Vec<(usize, f32)> = vec![
-            (0, 0.05),
-            (1, 0.4),
-            (2, 0.25),
-            (3, 0.2),
-            (4, 0.1),
-        ];
+        let weights: Vec<(usize, f32)> = vec![(0, 0.05), (1, 0.4), (2, 0.25), (3, 0.2), (4, 0.1)];
         for &top_p in &[0.3f32, 0.5, 0.7, 0.9, 0.99] {
             let got = nucleus_select(&weights, top_p);
             let mut sorted = weights.clone();

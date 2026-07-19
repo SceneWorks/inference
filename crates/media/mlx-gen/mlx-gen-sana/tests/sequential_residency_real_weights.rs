@@ -74,7 +74,10 @@ fn render_measured(
     req: &GenerationRequest,
 ) -> (Vec<u8>, usize) {
     let spec = LoadSpec::new(WeightsSource::Dir(snap)).with_offload_policy(policy);
-    let model = mlx_gen_sana::provider_registry().expect("build provider registry").load(model_id(), &spec).expect("load sana");
+    let model = mlx_gen_sana::provider_registry()
+        .expect("build provider registry")
+        .load(model_id(), &spec)
+        .expect("load sana");
     reset_peak_memory();
     let out = model.generate(req, &mut |_| {}).expect("generate");
     let peak = get_peak_memory();

@@ -42,7 +42,11 @@ fn load_from(env: &str) -> Option<Fixture> {
 }
 
 fn encode(tok: &Tokenizer, text: &str) -> Vec<i32> {
-    tok.encode(text, true).unwrap().into_iter().map(|id| id as i32).collect()
+    tok.encode(text, true)
+        .unwrap()
+        .into_iter()
+        .map(|id| id as i32)
+        .collect()
 }
 
 fn greedy_config(max_new: usize) -> GenerationConfig {
@@ -60,7 +64,10 @@ fn common_prefix(a: &[i32], b: &[i32]) -> usize {
 
 fn run_suite(fx: Fixture) {
     // ---- Exactness gate: num_draft = 0 ⇒ single-token verify ⇒ identical to non-speculative. ----
-    let no_draft = SpeculativeConfig { max_ngram: 3, num_draft: 0 };
+    let no_draft = SpeculativeConfig {
+        max_ngram: 3,
+        num_draft: 0,
+    };
     for text in [
         "The capital of France is",
         "Once upon a time in a small village there lived a curious",
@@ -68,10 +75,22 @@ fn run_suite(fx: Fixture) {
     ] {
         let p = encode(&fx.tok, text);
         let cfg = greedy_config(32);
-        let base = generate(&fx.model, &p, &cfg, &CancelFlag::new(), &mut |_| {}).unwrap().tokens;
-        let (spec_out, stats) =
-            generate_prompt_lookup(&fx.model, &p, &cfg, &no_draft, &CancelFlag::new(), &mut |_| {}).unwrap();
-        assert_eq!(spec_out.tokens, base, "num_draft=0 speculative must equal non-speculative for '{text}'");
+        let base = generate(&fx.model, &p, &cfg, &CancelFlag::new(), &mut |_| {})
+            .unwrap()
+            .tokens;
+        let (spec_out, stats) = generate_prompt_lookup(
+            &fx.model,
+            &p,
+            &cfg,
+            &no_draft,
+            &CancelFlag::new(),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(
+            spec_out.tokens, base,
+            "num_draft=0 speculative must equal non-speculative for '{text}'"
+        );
         assert_eq!(stats.proposed, 0);
         assert_eq!(stats.accepted, 0);
     }
@@ -83,9 +102,18 @@ fn run_suite(fx: Fixture) {
         "List: alpha beta gamma alpha beta gamma alpha beta gamma alpha beta gamma alpha beta gamma",
     );
     let cfg = greedy_config(48);
-    let base = generate(&fx.model, &rep, &cfg, &CancelFlag::new(), &mut |_| {}).unwrap().tokens;
-    let (spec_out, stats) =
-        generate_prompt_lookup(&fx.model, &rep, &cfg, &spec, &CancelFlag::new(), &mut |_| {}).unwrap();
+    let base = generate(&fx.model, &rep, &cfg, &CancelFlag::new(), &mut |_| {})
+        .unwrap()
+        .tokens;
+    let (spec_out, stats) = generate_prompt_lookup(
+        &fx.model,
+        &rep,
+        &cfg,
+        &spec,
+        &CancelFlag::new(),
+        &mut |_| {},
+    )
+    .unwrap();
     let n = spec_out.tokens.len();
     let cp = common_prefix(&spec_out.tokens, &base);
     println!(
@@ -97,22 +125,42 @@ fn run_suite(fx: Fixture) {
         stats.proposed,
         base.len(),
     );
-    assert!(stats.accepted > 0, "the repetitive prompt should yield n-gram hits");
-    assert!(stats.forwards < n + 1, "speculation must use fewer forwards than tokens generated");
-    assert!(cp >= 1, "speculative output must track non-speculative (diverges only on bf16 near-ties)");
+    assert!(
+        stats.accepted > 0,
+        "the repetitive prompt should yield n-gram hits"
+    );
+    assert!(
+        stats.forwards < n + 1,
+        "speculation must use fewer forwards than tokens generated"
+    );
+    assert!(
+        cp >= 1,
+        "speculative output must track non-speculative (diverges only on bf16 near-ties)"
+    );
     assert!(!spec_out.tokens.is_empty());
 
     // ---- Stochastic: deterministic for a fixed seed, and valid. ----
     let scfg = GenerationConfig {
         max_new_tokens: 24,
-        sampling: SamplingParams { temperature: 0.8, top_p: 0.95, ..Default::default() },
+        sampling: SamplingParams {
+            temperature: 0.8,
+            top_p: 0.95,
+            ..Default::default()
+        },
         seed: Some(7),
         stop_tokens: Vec::new(),
     };
     let p = encode(&fx.tok, "Write a short sentence about the sea:");
-    let a = generate_prompt_lookup(&fx.model, &p, &scfg, &spec, &CancelFlag::new(), &mut |_| {}).unwrap().0;
-    let b = generate_prompt_lookup(&fx.model, &p, &scfg, &spec, &CancelFlag::new(), &mut |_| {}).unwrap().0;
-    assert_eq!(a.tokens, b.tokens, "stochastic speculative must be deterministic for a fixed seed");
+    let a = generate_prompt_lookup(&fx.model, &p, &scfg, &spec, &CancelFlag::new(), &mut |_| {})
+        .unwrap()
+        .0;
+    let b = generate_prompt_lookup(&fx.model, &p, &scfg, &spec, &CancelFlag::new(), &mut |_| {})
+        .unwrap()
+        .0;
+    assert_eq!(
+        a.tokens, b.tokens,
+        "stochastic speculative must be deterministic for a fixed seed"
+    );
     assert!(!a.tokens.is_empty());
 }
 
@@ -123,34 +171,66 @@ fn load_draft_target(env: &str) -> Option<(CausalLm, CausalLm, Tokenizer)> {
     let dir = std::env::var(env).ok()?;
     let w = Weights::from_dir(&dir).unwrap();
     let target = CausalLm::from_weights(&w, "", ModelConfig::from_dir(&dir).unwrap()).unwrap();
-    let draft =
-        CausalLm::from_weights_with(&w, "", ModelConfig::from_dir(&dir).unwrap(), Some(QuantSpec::q4()))
-            .unwrap();
+    let draft = CausalLm::from_weights_with(
+        &w,
+        "",
+        ModelConfig::from_dir(&dir).unwrap(),
+        Some(QuantSpec::q4()),
+    )
+    .unwrap();
     let tok = Tokenizer::from_file(format!("{dir}/tokenizer.json")).unwrap();
     Some((target, draft, tok))
 }
 
 fn run_draft_suite(target: CausalLm, draft: CausalLm, tok: Tokenizer) {
     // ---- Exactness gate: num_draft = 0 ⇒ identical to non-speculative target decoding. ----
-    let no_draft = SpeculativeConfig { max_ngram: 3, num_draft: 0 };
+    let no_draft = SpeculativeConfig {
+        max_ngram: 3,
+        num_draft: 0,
+    };
     for text in ["The capital of France is", "Q: What is 2+2? A:"] {
         let p = encode(&tok, text);
         let cfg = greedy_config(28);
-        let base = generate(&target, &p, &cfg, &CancelFlag::new(), &mut |_| {}).unwrap().tokens;
-        let (out, stats) =
-            generate_draft_speculative(&target, &draft, &p, &cfg, &no_draft, &CancelFlag::new(), &mut |_| {})
-                .unwrap();
-        assert_eq!(out.tokens, base, "num_draft=0 draft-spec must equal non-speculative for '{text}'");
+        let base = generate(&target, &p, &cfg, &CancelFlag::new(), &mut |_| {})
+            .unwrap()
+            .tokens;
+        let (out, stats) = generate_draft_speculative(
+            &target,
+            &draft,
+            &p,
+            &cfg,
+            &no_draft,
+            &CancelFlag::new(),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(
+            out.tokens, base,
+            "num_draft=0 draft-spec must equal non-speculative for '{text}'"
+        );
         assert_eq!(stats.accepted, 0);
     }
 
     // ---- Draft-model greedy: tracks non-spec + measured latency win from accepted drafts. ----
     let spec = SpeculativeConfig::default();
-    let p = encode(&tok, "Once upon a time in a small village there lived a curious");
+    let p = encode(
+        &tok,
+        "Once upon a time in a small village there lived a curious",
+    );
     let cfg = greedy_config(48);
-    let base = generate(&target, &p, &cfg, &CancelFlag::new(), &mut |_| {}).unwrap().tokens;
-    let (out, stats) =
-        generate_draft_speculative(&target, &draft, &p, &cfg, &spec, &CancelFlag::new(), &mut |_| {}).unwrap();
+    let base = generate(&target, &p, &cfg, &CancelFlag::new(), &mut |_| {})
+        .unwrap()
+        .tokens;
+    let (out, stats) = generate_draft_speculative(
+        &target,
+        &draft,
+        &p,
+        &cfg,
+        &spec,
+        &CancelFlag::new(),
+        &mut |_| {},
+    )
+    .unwrap();
     let n = out.tokens.len();
     let cp = common_prefix(&out.tokens, &base);
     println!(
@@ -162,21 +242,57 @@ fn run_draft_suite(target: CausalLm, draft: CausalLm, tok: Tokenizer) {
         stats.proposed,
         base.len(),
     );
-    assert!(stats.accepted > 0, "the Q4 draft should agree with the dense target on some tokens");
-    assert!(stats.forwards < n + 1, "accepted drafts must reduce target forwards below token count");
-    assert!(cp >= 1, "draft-spec output must track non-speculative (diverges only on bf16 near-ties)");
+    assert!(
+        stats.accepted > 0,
+        "the Q4 draft should agree with the dense target on some tokens"
+    );
+    assert!(
+        stats.forwards < n + 1,
+        "accepted drafts must reduce target forwards below token count"
+    );
+    assert!(
+        cp >= 1,
+        "draft-spec output must track non-speculative (diverges only on bf16 near-ties)"
+    );
 
     // ---- Stochastic: deterministic for a fixed seed, valid output. ----
     let scfg = GenerationConfig {
         max_new_tokens: 24,
-        sampling: SamplingParams { temperature: 0.8, top_p: 0.95, ..Default::default() },
+        sampling: SamplingParams {
+            temperature: 0.8,
+            top_p: 0.95,
+            ..Default::default()
+        },
         seed: Some(11),
         stop_tokens: Vec::new(),
     };
     let p = encode(&tok, "Describe the morning sky:");
-    let a = generate_draft_speculative(&target, &draft, &p, &scfg, &spec, &CancelFlag::new(), &mut |_| {}).unwrap().0;
-    let b = generate_draft_speculative(&target, &draft, &p, &scfg, &spec, &CancelFlag::new(), &mut |_| {}).unwrap().0;
-    assert_eq!(a.tokens, b.tokens, "stochastic draft-spec must be deterministic for a fixed seed");
+    let a = generate_draft_speculative(
+        &target,
+        &draft,
+        &p,
+        &scfg,
+        &spec,
+        &CancelFlag::new(),
+        &mut |_| {},
+    )
+    .unwrap()
+    .0;
+    let b = generate_draft_speculative(
+        &target,
+        &draft,
+        &p,
+        &scfg,
+        &spec,
+        &CancelFlag::new(),
+        &mut |_| {},
+    )
+    .unwrap()
+    .0;
+    assert_eq!(
+        a.tokens, b.tokens,
+        "stochastic draft-spec must be deterministic for a fixed seed"
+    );
     assert!(!a.tokens.is_empty());
 }
 
@@ -204,7 +320,10 @@ fn draft_speculative_qwen3() {
 #[test]
 #[ignore = "needs both MLX_LLM_TEST_MODEL and MLX_LLM_QWEN3_MODEL"]
 fn draft_speculative_rejects_vocab_mismatch() {
-    let (Some(a), Some(b)) = (load_from("MLX_LLM_TEST_MODEL"), load_from("MLX_LLM_QWEN3_MODEL")) else {
+    let (Some(a), Some(b)) = (
+        load_from("MLX_LLM_TEST_MODEL"),
+        load_from("MLX_LLM_QWEN3_MODEL"),
+    ) else {
         eprintln!("skip: set both MLX_LLM_TEST_MODEL and MLX_LLM_QWEN3_MODEL");
         return;
     };

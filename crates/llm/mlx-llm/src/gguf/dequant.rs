@@ -17,7 +17,8 @@
 
 use crate::error::{Error, Result};
 use crate::gguf::iq_grids::{
-    IQ1S_GRID, IQ2S_GRID, IQ2XS_GRID, IQ2XXS_GRID, IQ3S_GRID, IQ3XXS_GRID, KMASK_IQ2XS, KSIGNS_IQ2XS,
+    IQ1S_GRID, IQ2S_GRID, IQ2XS_GRID, IQ2XXS_GRID, IQ3S_GRID, IQ3XXS_GRID, KMASK_IQ2XS,
+    KSIGNS_IQ2XS,
 };
 
 /// `QK_K` — elements per k-quant super-block.
@@ -107,9 +108,7 @@ impl GgmlType {
             23 => GgmlType::Iq4Xs,
             29 => GgmlType::Iq1M,
             30 => GgmlType::BF16,
-            other => {
-                return Err(Error::Unsupported(format!("GGUF type tag {other}")))
-            }
+            other => return Err(Error::Unsupported(format!("GGUF type tag {other}"))),
         })
     }
 
@@ -128,12 +127,12 @@ impl GgmlType {
             GgmlType::Q4K => (QK_K, 2 + 2 + 12 + QK_K / 2), // d + dmin + scales + qs = 144
             GgmlType::Q5K => (QK_K, 2 + 2 + 12 + QK_K / 8 + QK_K / 2), // + qh = 176
             GgmlType::Q6K => (QK_K, QK_K / 2 + QK_K / 4 + QK_K / 16 + 2), // ql + qh + scales + d = 210
-            GgmlType::Iq4Nl => (QK, 2 + QK / 2),                 // d + qs = 18
+            GgmlType::Iq4Nl => (QK, 2 + QK / 2),                          // d + qs = 18
             GgmlType::Iq4Xs => (QK_K, 2 + 2 + QK_K / 64 + QK_K / 2), // d + scales_h + scales_l + qs = 136
-            GgmlType::Iq2Xxs => (QK_K, 2 + QK_K / 8 * 2),        // d + qs(u16) = 66
+            GgmlType::Iq2Xxs => (QK_K, 2 + QK_K / 8 * 2),            // d + qs(u16) = 66
             GgmlType::Iq2Xs => (QK_K, 2 + QK_K / 8 * 2 + QK_K / 32), // d + qs(u16) + scales = 74
             GgmlType::Iq2S => (QK_K, 2 + QK_K / 4 + QK_K / 32 + QK_K / 32), // d + qs + qh + scales = 82
-            GgmlType::Iq3Xxs => (QK_K, 2 + 3 * (QK_K / 8)),      // d + qs(grid+signs) = 98
+            GgmlType::Iq3Xxs => (QK_K, 2 + 3 * (QK_K / 8)), // d + qs(grid+signs) = 98
             GgmlType::Iq3S => (QK_K, 2 + QK_K / 4 + QK_K / 32 + QK_K / 8 + QK_K / 64), // d+qs+qh+signs+scales = 110
             GgmlType::Iq1S => (QK_K, 2 + QK_K / 8 + QK_K / 32 * 2), // d + qs + qh(u16) = 50
             GgmlType::Iq1M => (QK_K, QK_K / 8 + QK_K / 16 + QK_K / 32), // qs + qh + scales = 56 (scale packed in scales)
@@ -212,7 +211,13 @@ pub fn dequantize(tag: u32, data: &[u8], num_elements: usize) -> Result<Vec<f32>
 
 /// Apply a per-block dequant closure across the tensor: each call gets one block's bytes and the
 /// matching `block_elems`-wide output window.
-fn blocks(data: &[u8], out: &mut [f32], be: usize, bb: usize, mut f: impl FnMut(&[u8], &mut [f32])) {
+fn blocks(
+    data: &[u8],
+    out: &mut [f32],
+    be: usize,
+    bb: usize,
+    mut f: impl FnMut(&[u8], &mut [f32]),
+) {
     for (b, ys) in out.chunks_mut(be).enumerate() {
         f(&data[b * bb..b * bb + bb], ys);
     }
@@ -661,7 +666,11 @@ fn dequant_iq1_s(b: &[u8], y: &mut [f32]) {
     for ib in 0..QK_K / 32 {
         let h = u16::from_le_bytes([qh[2 * ib], qh[2 * ib + 1]]);
         let dl = d * (2 * ((h >> 12) & 7) + 1) as f32;
-        let delta = if h & 0x8000 != 0 { -IQ1S_DELTA } else { IQ1S_DELTA };
+        let delta = if h & 0x8000 != 0 {
+            -IQ1S_DELTA
+        } else {
+            IQ1S_DELTA
+        };
         for l in 0..4 {
             let idx = qs[4 * ib + l] as usize | ((((h >> (3 * l)) & 7) as usize) << 8);
             let grid = IQ1S_GRID[idx].to_le_bytes();
@@ -703,10 +712,26 @@ fn dequant_iq1_m(b: &[u8], y: &mut [f32]) {
             qs[4 * ib + 3] as usize | ((qh1 << 4) & 0x700),
         ];
         let delta = [
-            if qh0 & 0x08 != 0 { -IQ1S_DELTA } else { IQ1S_DELTA },
-            if qh0 & 0x80 != 0 { -IQ1S_DELTA } else { IQ1S_DELTA },
-            if qh1 & 0x08 != 0 { -IQ1S_DELTA } else { IQ1S_DELTA },
-            if qh1 & 0x80 != 0 { -IQ1S_DELTA } else { IQ1S_DELTA },
+            if qh0 & 0x08 != 0 {
+                -IQ1S_DELTA
+            } else {
+                IQ1S_DELTA
+            },
+            if qh0 & 0x80 != 0 {
+                -IQ1S_DELTA
+            } else {
+                IQ1S_DELTA
+            },
+            if qh1 & 0x08 != 0 {
+                -IQ1S_DELTA
+            } else {
+                IQ1S_DELTA
+            },
+            if qh1 & 0x80 != 0 {
+                -IQ1S_DELTA
+            } else {
+                IQ1S_DELTA
+            },
         ];
         for l in 0..4 {
             let dl = if l < 2 { dl1 } else { dl2 };
@@ -763,7 +788,10 @@ mod tests {
         // Intermediate/quantization-only types stay unsupported.
         assert!(matches!(GgmlType::from_tag(9), Err(Error::Unsupported(_)))); // Q8_1 (intermediate)
         assert!(matches!(GgmlType::from_tag(15), Err(Error::Unsupported(_)))); // Q8_K (intermediate)
-        assert!(matches!(tensor_byte_len(9, 256), Err(Error::Unsupported(_))));
+        assert!(matches!(
+            tensor_byte_len(9, 256),
+            Err(Error::Unsupported(_))
+        ));
     }
 
     /// IQ4_NL maps each 4-bit index through the fixed codebook and scales by the block's f16 `d`.
@@ -771,7 +799,7 @@ mod tests {
     fn iq4_nl_codebook_decode() {
         let mut b = Vec::new();
         b.extend_from_slice(&half::f16::from_f32(2.0).to_bits().to_le_bytes()); // d = 2.0
-        // qs[0] = 0x80 => low nibble 0 (codebook[-127]) at y[0], high nibble 8 (codebook[1]) at y[16].
+                                                                                // qs[0] = 0x80 => low nibble 0 (codebook[-127]) at y[0], high nibble 8 (codebook[1]) at y[16].
         b.push(0x80);
         b.extend([0x00u8; 15]); // both nibbles 0 => codebook[0] = -127
         let out = dequantize(20, &b, 32).unwrap();
@@ -812,7 +840,10 @@ mod tests {
         }
         let out = dequantize(8, &b, 32).unwrap();
         for (i, v) in out.iter().enumerate() {
-            assert!((v - (i as i32 - 16) as f32 * 0.5).abs() < 1e-3, "idx {i}: {v}");
+            assert!(
+                (v - (i as i32 - 16) as f32 * 0.5).abs() < 1e-3,
+                "idx {i}: {v}"
+            );
         }
     }
 
@@ -847,7 +878,10 @@ mod tests {
         b.extend_from_slice(&half::f16::from_f32(1.0).to_bits().to_le_bytes()); // d
         b.extend_from_slice(&half::f16::from_f32(1.0).to_bits().to_le_bytes()); // dmin (unused: sc>>4==0)
         let out = dequantize(10, &b, 256).unwrap();
-        assert!(out.iter().all(|&v| v == 3.0), "every q2_k output should be 1*3 - 0 = 3");
+        assert!(
+            out.iter().all(|&v| v == 3.0),
+            "every q2_k output should be 1*3 - 0 = 3"
+        );
     }
 
     /// A k-quant round-trips structurally: a Q6_K block whose quant nibbles all encode the centered
@@ -872,7 +906,10 @@ mod tests {
         b[208] = dbytes[0];
         b[209] = dbytes[1];
         let out = dequantize(14, &b, 256).unwrap();
-        assert!(out.iter().all(|&v| v == 0.0), "all centered q6_k values are zero");
+        assert!(
+            out.iter().all(|&v| v == 0.0),
+            "all centered q6_k values are zero"
+        );
     }
 
     /// Push an f16 `d` as the first two bytes of an IQ block, then `n` zero payload bytes.
@@ -890,12 +927,18 @@ mod tests {
     fn iq2_xxs_grid_scale_and_offset() {
         let b = iq_block_d1(66);
         let out = dequantize(16, &b, 256).unwrap();
-        assert!(out.iter().all(|&v| v == 1.0), "grid-0 decode = 0.125*8 = 1.0");
+        assert!(
+            out.iter().all(|&v| v == 1.0),
+            "grid-0 decode = 0.125*8 = 1.0"
+        );
 
         let mut b2 = iq_block_d1(66);
         b2[9] = 0x30; // second u32 of block 0 = 0x30000000 => scale nibble 3, sign indices 0
         let out2 = dequantize(16, &b2, 256).unwrap();
-        assert!(out2[..32].iter().all(|&v| v == 7.0), "block 0 scaled to 7.0");
+        assert!(
+            out2[..32].iter().all(|&v| v == 7.0),
+            "block 0 scaled to 7.0"
+        );
         assert_eq!(out2[32], 1.0, "block 1 unaffected");
     }
 
@@ -914,7 +957,10 @@ mod tests {
     #[test]
     fn iq3_xxs_and_s_grid_zero_decode() {
         let out_xxs = dequantize(18, &iq_block_d1(98), 256).unwrap();
-        assert!(out_xxs.iter().all(|&v| v == 1.0), "iq3_xxs grid-0 = 0.25*4 = 1.0");
+        assert!(
+            out_xxs.iter().all(|&v| v == 1.0),
+            "iq3_xxs grid-0 = 0.25*4 = 1.0"
+        );
         let out_s = dequantize(21, &iq_block_d1(110), 256).unwrap();
         assert!(out_s.iter().all(|&v| v == 1.0), "iq3_s grid-0 = 1*1 = 1.0");
     }
@@ -925,12 +971,18 @@ mod tests {
     #[test]
     fn iq1_s_signed_grid_and_scale() {
         let out = dequantize(19, &iq_block_d1(50), 256).unwrap();
-        assert!(out.iter().all(|&v| v == -0.875), "iq1_s grid-0 = 1*(-1+0.125) = -0.875");
+        assert!(
+            out.iter().all(|&v| v == -0.875),
+            "iq1_s grid-0 = 1*(-1+0.125) = -0.875"
+        );
 
         let mut b = iq_block_d1(50);
         b[35] = 0x10; // qh[0] = 0x1000 => (h>>12)&7 = 1 => scale 3
         let out2 = dequantize(19, &b, 256).unwrap();
-        assert!(out2[..32].iter().all(|&v| v == -2.625), "block 0 scaled to -2.625");
+        assert!(
+            out2[..32].iter().all(|&v| v == -2.625),
+            "block 0 scaled to -2.625"
+        );
         assert_eq!(out2[32], -0.875, "block 1 unaffected");
     }
 
@@ -946,11 +998,17 @@ mod tests {
         b[54] = 0x00; // sc3 = 0x3000
         b[55] = 0x30;
         let out = dequantize(29, &b, 256).unwrap();
-        assert!(out.iter().all(|&v| v == -0.875), "iq1_m reconstructed d=1 => -0.875");
+        assert!(
+            out.iter().all(|&v| v == -0.875),
+            "iq1_m reconstructed d=1 => -0.875"
+        );
 
         // A broken scale reconstruction (all-zero scales => d=0) would instead give all zeros — guard
         // that the nibble assembly is actually doing work.
         let zero = dequantize(29, &[0u8; 56], 256).unwrap();
-        assert!(zero.iter().all(|&v| v == 0.0), "zero scales => d=0 => all zero");
+        assert!(
+            zero.iter().all(|&v| v == 0.0),
+            "zero scales => d=0 => all zero"
+        );
     }
 }

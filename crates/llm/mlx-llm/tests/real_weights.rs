@@ -10,9 +10,7 @@
 //! Asserts the engine loads the snapshot and streams non-empty text, that greedy decoding is
 //! reproducible, and that a mid-stream cancel stops promptly with a partial result.
 
-use core_llm::{
-    LoadSpec, Message, Sampling, StreamEvent as CoreEvent, TextLlmRequest, Tokenizer,
-};
+use core_llm::{LoadSpec, Message, Sampling, StreamEvent as CoreEvent, TextLlmRequest, Tokenizer};
 use mlx_llm::load_textllm;
 
 use mlx_llm::config::ModelConfig;
@@ -50,9 +48,15 @@ fn streams_text_from_snapshot() {
     };
 
     let run = || {
-        generate(&model, &prompt_ids, &config, &CancelFlag::new(), &mut |_| {})
-            .unwrap()
-            .tokens
+        generate(
+            &model,
+            &prompt_ids,
+            &config,
+            &CancelFlag::new(),
+            &mut |_| {},
+        )
+        .unwrap()
+        .tokens
     };
     let a = run();
     let b = run();
@@ -135,10 +139,16 @@ fn round_trips_a_generation_through_the_core_llm_contract() {
         })
         .unwrap();
 
-    println!("\n=== contract output ===\n{}\n=======================", out.text);
+    println!(
+        "\n=== contract output ===\n{}\n=======================",
+        out.text
+    );
     assert!(token_events > 0, "expected streamed tokens");
     assert!(!out.text.trim().is_empty(), "expected non-empty output");
     assert!(out.usage.generated_tokens > 0);
     assert!(out.usage.prompt_tokens > 0);
-    assert_eq!(streamed, out.text, "streamed deltas must reconstruct the output");
+    assert_eq!(
+        streamed, out.text,
+        "streamed deltas must reconstruct the output"
+    );
 }

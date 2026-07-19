@@ -274,7 +274,11 @@ mod tests {
         // Touch `a` so it is most-recently-used; the next insert must then evict `b`, not `a`.
         assert_eq!(idx.longest_match(&[1, 1]).unwrap().id, a);
         let out = idx.insert(vec![3, 3]);
-        assert_eq!(out.evicted, vec![b], "the now-LRU entry b is evicted, not the refreshed a");
+        assert_eq!(
+            out.evicted,
+            vec![b],
+            "the now-LRU entry b is evicted, not the refreshed a"
+        );
         assert!(idx.contains(a));
         assert!(!idx.contains(b));
     }

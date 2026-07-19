@@ -193,7 +193,9 @@ impl Scheduler {
 
     /// The tokens generated so far for `id` (excludes the prompt and any stop token).
     pub fn generated(&self, id: SeqId) -> &[i32] {
-        self.state(id).map(|s| s.generated.as_slice()).unwrap_or(&[])
+        self.state(id)
+            .map(|s| s.generated.as_slice())
+            .unwrap_or(&[])
     }
 
     /// Why `id` retired, or `None` if it is still active (or unknown).

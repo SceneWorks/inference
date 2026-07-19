@@ -112,7 +112,8 @@ fn cached_causal_mask(q_len: usize, k_len: usize, dtype: DType, device: &Device)
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(e) = guard.as_ref() {
-        if e.q_len == q_len && e.k_len == k_len && e.dtype == dtype && e.device.same_device(device) {
+        if e.q_len == q_len && e.k_len == k_len && e.dtype == dtype && e.device.same_device(device)
+        {
             return Ok(e.mask.clone());
         }
     }

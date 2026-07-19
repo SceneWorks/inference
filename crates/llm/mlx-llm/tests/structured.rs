@@ -31,7 +31,10 @@ fn json_constrained_output_is_valid_json() {
         ..Default::default()
     };
     let out = provider.complete(&req).unwrap();
-    println!("\n[json-constrained] {:?}\n  finish={:?}", out.text, out.finish_reason);
+    println!(
+        "\n[json-constrained] {:?}\n  finish={:?}",
+        out.text, out.finish_reason
+    );
 
     // Core guarantee: every emitted token kept the output a valid JSON prefix.
     assert!(

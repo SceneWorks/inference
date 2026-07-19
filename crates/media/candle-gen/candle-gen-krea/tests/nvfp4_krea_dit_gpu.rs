@@ -1188,7 +1188,10 @@ fn nvfp4_krea_dit_sc6_cublaslt_workspace_gap() {
     let (warm_exc_w4a4, w4a4_measured, bf16_bytes) =
         (w4a4.warm_excess, w4a4.warm_measured, w4a4.bf16_bytes);
     let w4a16_measured = pts[0].warm_measured;
-    assert_eq!(w4a4.handles, 260.0, "blanket W4A4 must light all 260 lane projections");
+    assert_eq!(
+        w4a4.handles, 260.0,
+        "blanket W4A4 must light all 260 lane projections"
+    );
     assert_eq!(
         pts[0].handles, 0.0,
         "blanket W4A16 lights nothing — it is the dense-bf16 baseline"

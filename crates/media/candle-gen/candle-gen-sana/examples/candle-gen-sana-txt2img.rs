@@ -22,7 +22,9 @@
 
 use std::path::PathBuf;
 
-use candle_gen::gen_core::{GenerationOutput, GenerationRequest, LoadSpec, Progress, WeightsSource};
+use candle_gen::gen_core::{
+    GenerationOutput, GenerationRequest, LoadSpec, Progress, WeightsSource,
+};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 

@@ -22,10 +22,10 @@ use std::path::PathBuf;
 
 use candle_core::{DType, Device, Tensor};
 
+use candle_llm::load_for_model;
 use candle_llm::primitives::sampler::{SplitMix64, TokenRng};
 use candle_llm::provider::PROVIDER_ID;
 use candle_llm::LlamaProvider;
-use candle_llm::load_for_model;
 use core_llm::{LoadSpec, Message, Quantize, TextLlmRequest};
 use core_llm_testkit::{textllm_conformance, TextLlmProfile};
 
@@ -278,8 +278,14 @@ fn can_load_is_weightless_and_architecture_aware() {
             "vision_config":{"hidden_size":16}}"#,
     );
     let vspec = LoadSpec::dense(vlm.to_str().unwrap().to_string());
-    assert!(!candle_llm::provider::can_load(&vspec), "text provider must decline a VLM");
-    assert!(candle_llm::llava::can_load(&vspec), "vision provider must claim a VLM");
+    assert!(
+        !candle_llm::provider::can_load(&vspec),
+        "text provider must decline a VLM"
+    );
+    assert!(
+        candle_llm::llava::can_load(&vspec),
+        "vision provider must claim a VLM"
+    );
     let _ = std::fs::remove_dir_all(&vlm);
 
     // A `*.gguf` file: the text provider reads ONLY the header (the fixtures below carry zero tensor
@@ -311,10 +317,14 @@ fn can_load_is_weightless_and_architecture_aware() {
 
     // A `*.gguf` path that doesn't exist (or isn't a parseable GGUF) is declined gracefully — the
     // header probe fails closed rather than claiming a file it can't read.
-    assert!(!candle_llm::provider::can_load(&LoadSpec::dense("/no/such/model-Q4_K_M.gguf")));
+    assert!(!candle_llm::provider::can_load(&LoadSpec::dense(
+        "/no/such/model-Q4_K_M.gguf"
+    )));
 
     // A nonexistent snapshot path is declined gracefully.
-    assert!(!candle_llm::provider::can_load(&LoadSpec::dense("/no/such/dir")));
+    assert!(!candle_llm::provider::can_load(&LoadSpec::dense(
+        "/no/such/dir"
+    )));
 }
 
 #[test]
@@ -344,7 +354,10 @@ fn load_for_model_unknown_architecture_is_a_typed_error() {
     match load_for_model(&spec) {
         Err(core_llm::Error::Unsupported(m)) => {
             assert!(m.contains("no registered provider can serve"), "{m}");
-            assert!(m.contains("bert"), "error should surface the model arch: {m}");
+            assert!(
+                m.contains("bert"),
+                "error should surface the model arch: {m}"
+            );
         }
         Err(e) => panic!("expected Unsupported, got error: {e}"),
         Ok(_) => panic!("expected Unsupported, got a loaded provider"),
@@ -394,7 +407,9 @@ fn gguf_resolves_through_load_for_model_and_probe_is_weightless() {
     // table, with NO tensor blocks) and confirm can_load still resolves — proving the probe read no
     // weights even on a real checkpoint.
     let mut f = std::fs::File::open(&gguf).expect("open gguf");
-    let header_len = Content::read(&mut f).expect("read gguf header").tensor_data_offset as usize;
+    let header_len = Content::read(&mut f)
+        .expect("read gguf header")
+        .tensor_data_offset as usize;
     let mut bytes = std::fs::read(&gguf).expect("read gguf");
     bytes.truncate(header_len);
     let dir = std::env::temp_dir().join(format!("candle-llm-gguf-trunc-{}", std::process::id()));

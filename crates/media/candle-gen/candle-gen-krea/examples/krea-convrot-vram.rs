@@ -76,8 +76,8 @@ fn main() {
     eprintln!("[sc-12381] loading INT8-ConvRot trunk...");
     let t0 = Instant::now();
     let phase = probe.phase();
-    let comps =
-        pipeline::load_components_convrot(&root, &convrot, &device).expect("load_components_convrot");
+    let comps = pipeline::load_components_convrot(&root, &convrot, &device)
+        .expect("load_components_convrot");
     probe.end_load(phase);
     let load_s = t0.elapsed().as_secs_f64();
 

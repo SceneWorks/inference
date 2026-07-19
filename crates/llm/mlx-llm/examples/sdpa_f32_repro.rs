@@ -48,13 +48,20 @@ fn randf(n: usize, seed: u64) -> Vec<f32> {
 /// f32 — the host reference consumes the rounded values so we measure kernel error, not rounding.
 fn to_dtype(data: &[f32], shape: &[i32], dt: Dtype) -> (Array, Vec<f32>) {
     let a = Array::from_slice(data, shape).as_dtype(dt).unwrap();
-    let rounded = a.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>().to_vec();
+    let rounded = a
+        .as_dtype(Dtype::Float32)
+        .unwrap()
+        .as_slice::<f32>()
+        .to_vec();
     (a, rounded)
 }
 
 /// Read an MLX array back as f32 regardless of stored dtype (forces evaluation).
 fn read_f32(a: &Array) -> Vec<f32> {
-    a.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>().to_vec()
+    a.as_dtype(Dtype::Float32)
+        .unwrap()
+        .as_slice::<f32>()
+        .to_vec()
 }
 
 /// Relative max error: `max|mlx − host| / (max|host| + ε)`. Scale-free so dtypes are comparable.
@@ -211,7 +218,15 @@ struct AttnRow {
     manual4d: f32,
 }
 
-fn run_attn(dt_name: &'static str, dt: Dtype, h: usize, ql: usize, kl: usize, hd: usize, causal: bool) -> AttnRow {
+fn run_attn(
+    dt_name: &'static str,
+    dt: Dtype,
+    h: usize,
+    ql: usize,
+    kl: usize,
+    hd: usize,
+    causal: bool,
+) -> AttnRow {
     let scale = 1.0 / (hd as f32).sqrt();
     let qsh = [1, h as i32, ql as i32, hd as i32];
     let ksh = [1, h as i32, kl as i32, hd as i32];
@@ -226,7 +241,13 @@ fn run_attn(dt_name: &'static str, dt: Dtype, h: usize, ql: usize, kl: usize, hd
         None
     };
     let sdpa_gpu = scaled_dot_product_attention_device(
-        &q, &k, &v, scale, mask_arg, None::<&Array>, StreamOrDevice::gpu(),
+        &q,
+        &k,
+        &v,
+        scale,
+        mask_arg,
+        None::<&Array>,
+        StreamOrDevice::gpu(),
     )
     .map(|a| rel_err(&read_f32(&a), &host))
     .unwrap_or(f32::NAN);
@@ -236,7 +257,13 @@ fn run_attn(dt_name: &'static str, dt: Dtype, h: usize, ql: usize, kl: usize, hd
         None
     };
     let sdpa_cpu = scaled_dot_product_attention_device(
-        &q, &k, &v, scale, mask_arg_cpu, None::<&Array>, StreamOrDevice::cpu(),
+        &q,
+        &k,
+        &v,
+        scale,
+        mask_arg_cpu,
+        None::<&Array>,
+        StreamOrDevice::cpu(),
     )
     .map(|a| rel_err(&read_f32(&a), &host))
     .unwrap_or(f32::NAN);
@@ -286,7 +313,16 @@ fn run_attn(dt_name: &'static str, dt: Dtype, h: usize, ql: usize, kl: usize, hd
 /// force a *peaked* softmax) — to test whether the fused-SDPA bug is data-dependent (i.e. whether
 /// the structured/peaked distributions real weights produce avoid it) or structural (hits any data).
 /// Returns the GPU fused-SDPA relative error vs the f64 host reference.
-fn run_attn_amp(dt: Dtype, h: usize, ql: usize, kl: usize, hd: usize, causal: bool, amp: f32, peaked: bool) -> f32 {
+fn run_attn_amp(
+    dt: Dtype,
+    h: usize,
+    ql: usize,
+    kl: usize,
+    hd: usize,
+    causal: bool,
+    amp: f32,
+    peaked: bool,
+) -> f32 {
     let scale = 1.0 / (hd as f32).sqrt();
     let qsh = [1, h as i32, ql as i32, hd as i32];
     let ksh = [1, h as i32, kl as i32, hd as i32];
@@ -308,10 +344,22 @@ fn run_attn_amp(dt: Dtype, h: usize, ql: usize, kl: usize, hd: usize, causal: bo
     let (k, kr) = to_dtype(&kd, &ksh, dt);
     let (v, vr) = to_dtype(&vd, &ksh, dt);
     let host = host_attn(&qr, &kr, &vr, h, ql, kl, hd, scale, causal);
-    let mask_arg = if causal { Some(ScaledDotProductAttentionMask::Causal) } else { None };
-    scaled_dot_product_attention_device(&q, &k, &v, scale, mask_arg, None::<&Array>, StreamOrDevice::gpu())
-        .map(|a| rel_err(&read_f32(&a), &host))
-        .unwrap_or(f32::NAN)
+    let mask_arg = if causal {
+        Some(ScaledDotProductAttentionMask::Causal)
+    } else {
+        None
+    };
+    scaled_dot_product_attention_device(
+        &q,
+        &k,
+        &v,
+        scale,
+        mask_arg,
+        None::<&Array>,
+        StreamOrDevice::gpu(),
+    )
+    .map(|a| rel_err(&read_f32(&a), &host))
+    .unwrap_or(f32::NAN)
 }
 
 /// Expand GQA KV `[kvh, len, hd]` (logical row-major) to `[kvh*groups, len, hd]` — each kv head
@@ -332,7 +380,14 @@ fn expand_kv(data: &[f32], kvh: usize, len: usize, hd: usize, groups: usize) -> 
 /// `strided`, the array is a transposed view of `[1, len, heads, hd]` storage — exactly the layout
 /// the model hands SDPA (`apply_rope(...).transpose_axes([0,2,1,3])`). Returns the array plus its
 /// dtype-rounded logical values for the host reference.
-fn mk(logical: &[f32], heads: usize, len: usize, hd: usize, dt: Dtype, strided: bool) -> (Array, Vec<f32>) {
+fn mk(
+    logical: &[f32],
+    heads: usize,
+    len: usize,
+    hd: usize,
+    dt: Dtype,
+    strided: bool,
+) -> (Array, Vec<f32>) {
     let a = if strided {
         let mut st = vec![0f32; len * heads * hd];
         for g in 0..heads {
@@ -358,7 +413,16 @@ fn mk(logical: &[f32], heads: usize, len: usize, hd: usize, dt: Dtype, strided: 
 
 /// Fused-SDPA-GPU rel error for an arbitrary GQA config and input layout — used to bisect the real
 /// trigger (MHA vs GQA, contiguous vs strided) at the engine's actual prefill shape.
-fn run_attn_gqa(dt: Dtype, qh: usize, kvh: usize, ql: usize, kl: usize, hd: usize, causal: bool, strided: bool) -> f32 {
+fn run_attn_gqa(
+    dt: Dtype,
+    qh: usize,
+    kvh: usize,
+    ql: usize,
+    kl: usize,
+    hd: usize,
+    causal: bool,
+    strided: bool,
+) -> f32 {
     let groups = qh / kvh;
     let scale = 1.0 / (hd as f32).sqrt();
     let (q, qr) = mk(&randf(qh * ql * hd, 1), qh, ql, hd, dt, strided);
@@ -367,10 +431,22 @@ fn run_attn_gqa(dt: Dtype, qh: usize, kvh: usize, ql: usize, kl: usize, hd: usiz
     let kx = expand_kv(&kr, kvh, kl, hd, groups);
     let vx = expand_kv(&vr, kvh, kl, hd, groups);
     let host = host_attn(&qr, &kx, &vx, qh, ql, kl, hd, scale, causal);
-    let mask_arg = if causal { Some(ScaledDotProductAttentionMask::Causal) } else { None };
-    scaled_dot_product_attention_device(&q, &k, &v, scale, mask_arg, None::<&Array>, StreamOrDevice::gpu())
-        .map(|a| rel_err(&read_f32(&a), &host))
-        .unwrap_or(f32::NAN)
+    let mask_arg = if causal {
+        Some(ScaledDotProductAttentionMask::Causal)
+    } else {
+        None
+    };
+    scaled_dot_product_attention_device(
+        &q,
+        &k,
+        &v,
+        scale,
+        mask_arg,
+        None::<&Array>,
+        StreamOrDevice::gpu(),
+    )
+    .map(|a| rel_err(&read_f32(&a), &host))
+    .unwrap_or(f32::NAN)
 }
 
 fn main() {
@@ -407,7 +483,14 @@ fn main() {
             }
             println!(
                 "{:>5} {:>2} {:>2} {:>3} {:>4} | {} {} {}",
-                r.dt_name, r.b, r.h, r.s, r.hd, cell(r.mm4_gpu, r.dt), cell(r.mm4_cpu, r.dt), cell(r.mm3_gpu, r.dt)
+                r.dt_name,
+                r.b,
+                r.h,
+                r.s,
+                r.hd,
+                cell(r.mm4_gpu, r.dt),
+                cell(r.mm4_cpu, r.dt),
+                cell(r.mm3_gpu, r.dt)
             );
         }
     }
@@ -417,7 +500,9 @@ fn main() {
     );
 
     // ---- Section B: attention ---------------------------------------------------------------
-    println!("== SECTION B: attention vs f64 host (decode q=1/large-k, prefill q=k; none + causal) ==");
+    println!(
+        "== SECTION B: attention vs f64 host (decode q=1/large-k, prefill q=k; none + causal) =="
+    );
     println!(
         "{:>5} {:>2} {:>3} {:>3} {:>4} {:>7} | {:>10} {:>10} {:>10}",
         "dt", "h", "ql", "kl", "hd", "mask", "sdpa_gpu", "sdpa_cpu", "manual4d"
@@ -488,8 +573,13 @@ fn main() {
     // ---- Section E: GQA vs MHA × contiguous vs strided, at the engine's real prefill shape -----
     // SmolLM2-135M prefill = q9/kv3 (GQA), strided inputs, ql=kl=26, hd=64 — and that WORKS in the
     // real model. So which dimension flips the broken MHA-contiguous case to correct?
-    println!("\n== SECTION E: real prefill shape (qh=9 ql=26 kl=26 hd=64 causal); MHA/GQA × layout ==");
-    println!("{:>5} | {:>14} {:>14} {:>14} {:>16}", "dt", "MHA contig", "MHA strided", "GQA contig", "GQA strided(real)");
+    println!(
+        "\n== SECTION E: real prefill shape (qh=9 ql=26 kl=26 hd=64 causal); MHA/GQA × layout =="
+    );
+    println!(
+        "{:>5} | {:>14} {:>14} {:>14} {:>16}",
+        "dt", "MHA contig", "MHA strided", "GQA contig", "GQA strided(real)"
+    );
     println!("{}", "-".repeat(72));
     for (name, dt) in dtypes {
         let mha_c = run_attn_gqa(dt, 9, 9, 26, 26, 64, true, false);
@@ -499,12 +589,22 @@ fn main() {
         let f = |v: f32| if v > fail_threshold(dt) { "*" } else { " " };
         println!(
             "{:>5} | {:>13.2e}{} {:>13.2e}{} {:>13.2e}{} {:>15.2e}{}",
-            name, mha_c, f(mha_c), mha_s, f(mha_s), gqa_c, f(gqa_c), gqa_s, f(gqa_s)
+            name,
+            mha_c,
+            f(mha_c),
+            mha_s,
+            f(mha_s),
+            gqa_c,
+            f(gqa_c),
+            gqa_s,
+            f(gqa_s)
         );
     }
 
     // ---- Section F: is q_len<=8 safe even with a large cache? (chunked-prefill mitigation) ------
-    println!("\n== SECTION F: fused-SDPA-GPU rel error, q_len<=8 vs large k_len (h=8 hd=64 causal) ==");
+    println!(
+        "\n== SECTION F: fused-SDPA-GPU rel error, q_len<=8 vs large k_len (h=8 hd=64 causal) =="
+    );
     print!("{:>5} |", "dt");
     for &(ql, kl) in &[(2usize, 64usize), (4, 64), (8, 64), (8, 256), (2, 256)] {
         print!("{:>11}", format!("q{ql}/k{kl}"));
@@ -541,7 +641,10 @@ fn main() {
 
     // ---- Section D: data dependence (does the bug avoid the structured data real weights make?) -
     println!("\n== SECTION D: is the bug data-dependent? fused-SDPA-GPU rel error, h=8 ql16 kl16 hd64 causal ==");
-    println!("{:>5} | {:>12} {:>12} {:>12} {:>14}", "dt", "amp=1.0", "amp=0.1", "amp=0.02", "peaked(amp1)");
+    println!(
+        "{:>5} | {:>12} {:>12} {:>12} {:>14}",
+        "dt", "amp=1.0", "amp=0.1", "amp=0.02", "peaked(amp1)"
+    );
     println!("{}", "-".repeat(64));
     for (name, dt) in dtypes {
         let a = run_attn_amp(dt, 8, 16, 16, 64, true, 1.0, false);
@@ -551,7 +654,15 @@ fn main() {
         let f = |v: f32| if v > fail_threshold(dt) { "*" } else { " " };
         println!(
             "{:>5} | {:>11.2e}{} {:>11.2e}{} {:>11.2e}{} {:>13.2e}{}",
-            name, a, f(a), b, f(b), c, f(c), p, f(p)
+            name,
+            a,
+            f(a),
+            b,
+            f(b),
+            c,
+            f(c),
+            p,
+            f(p)
         );
     }
 }

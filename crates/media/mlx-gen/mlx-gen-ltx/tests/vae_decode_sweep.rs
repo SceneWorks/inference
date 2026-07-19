@@ -214,10 +214,15 @@ fn discover_ltx_vae() -> Option<PathBuf> {
 #[ignore = "sc-12748 real LTX VAE over-bound assembled-output render (peak ~46 GiB measured); auto-discovers the q4 vae"]
 fn over_bound_output_matches_below_bound_reference() {
     let Some(dir) = discover_ltx_vae() else {
-        eprintln!("skip: no LTX_VAE_DIR and no ltx-2.3-mlx vae_decoder.safetensors under the HF cache");
+        eprintln!(
+            "skip: no LTX_VAE_DIR and no ltx-2.3-mlx vae_decoder.safetensors under the HF cache"
+        );
         return;
     };
-    if let Some(g) = std::env::var("LTX_LIMIT_GB").ok().and_then(|s| s.parse::<usize>().ok()) {
+    if let Some(g) = std::env::var("LTX_LIMIT_GB")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+    {
         set_memory_limit(g << 30);
     }
     let vae_cfg = LtxVaeConfig::from_model_dir(&dir).expect("read LtxVaeConfig");
@@ -259,7 +264,11 @@ fn over_bound_output_matches_below_bound_reference() {
     mlx_rs::transforms::eval([&video]).unwrap();
     let secs = t.elapsed().as_secs_f64();
     let peak = gb(get_peak_memory());
-    assert_eq!(video.shape(), &[1, 3, out_f, out_h, out_w], "output geometry");
+    assert_eq!(
+        video.shape(),
+        &[1, 3, out_f, out_h, out_w],
+        "output geometry"
+    );
     println!(
         "\n[sc-12748 LTX mode-2] out {out_w}x{out_h}x{out_f}  assembled={assembled} ({:.3}× i32::MAX)  \
          peak={peak:.2} GiB  {secs:.1}s",
@@ -270,7 +279,10 @@ fn over_bound_output_matches_below_bound_reference() {
     // bound), same tiling ⇒ its first temporal tile is bit-identical to the full decode's first tile.
     let ref_t_lat = 9i32;
     let ref_latent = latent
-        .take_axis(Array::from_slice(&(0..ref_t_lat).collect::<Vec<i32>>(), &[ref_t_lat]), 2)
+        .take_axis(
+            Array::from_slice(&(0..ref_t_lat).collect::<Vec<i32>>(), &[ref_t_lat]),
+            2,
+        )
         .unwrap();
     let reference = vae
         .decode_tiled(&ref_latent, &cfg, &Default::default())
@@ -286,7 +298,9 @@ fn over_bound_output_matches_below_bound_reference() {
     let d = max(abs(subtract(&o_pre, &r_pre).unwrap()).unwrap(), None)
         .unwrap()
         .item::<f32>();
-    println!("[sc-12748 LTX mode-2] prefix[0..{cmp_frames}] over-bound-vs-below-bound max|Δ| = {d:.3e}");
+    println!(
+        "[sc-12748 LTX mode-2] prefix[0..{cmp_frames}] over-bound-vs-below-bound max|Δ| = {d:.3e}"
+    );
     assert!(
         d < 1e-3,
         "the over-bound tiled decode's prefix diverged from the below-bound reference by {d:.3e} — the \
@@ -296,13 +310,24 @@ fn over_bound_output_matches_below_bound_reference() {
     // Read a TAIL voxel at a >i32::MAX flat offset via `as_slice` (the proven read path) and check it is
     // finite and in a sane video range — proving the over-bound region is addressed, not aliased/garbage.
     let flat = video.as_slice::<f32>();
-    assert_eq!(flat.len() as i64, assembled, "as_slice must expose the whole over-bound buffer");
+    assert_eq!(
+        flat.len() as i64,
+        assembled,
+        "as_slice must expose the whole over-bound buffer"
+    );
     let tail_off = (out_f as i64 - 1) * out_h as i64 * out_w as i64 * 3 + 12345; // frame 440, > i32::MAX
-    assert!(tail_off > I32_MAX, "tail sample offset {tail_off} must be past i32::MAX");
+    assert!(
+        tail_off > I32_MAX,
+        "tail sample offset {tail_off} must be past i32::MAX"
+    );
     let mut worst = 0f32;
     for k in 0..8i64 {
         let v = flat[(tail_off + k) as usize];
-        assert!(v.is_finite(), "over-bound tail voxel {} is not finite: {v}", tail_off + k);
+        assert!(
+            v.is_finite(),
+            "over-bound tail voxel {} is not finite: {v}",
+            tail_off + k
+        );
         worst = worst.max(v.abs());
     }
     println!("[sc-12748 LTX mode-2] tail voxels @ flat offset {tail_off} (>i32::MAX): max|v| = {worst:.4}");
@@ -316,14 +341,19 @@ fn over_bound_output_matches_below_bound_reference() {
     // tiled decode used, standalone-decode the LAST tile's latent slice, and compare it against the
     // assembled output in that tile's sole-contributor weight-1 frames — at flat offsets PAST i32::MAX.
     let plan = cfg.plan(VaeTiling::LTX, t_lat, h_lat, w_lat);
-    assert!(plan.t.len() >= 2, "geometry must produce multiple temporal tiles");
+    assert!(
+        plan.t.len() >= 2,
+        "geometry must produce multiple temporal tiles"
+    );
     let last = plan.t.last().unwrap();
     let prev_stop = plan.t[plan.t.len() - 2].out_stop; // frames ≥ this are covered only by `last`
     let tile_idx: Vec<i32> = (last.start..last.end).collect();
     let tile_latent = latent
         .take_axis(Array::from_slice(&tile_idx, &[tile_idx.len() as i32]), 2)
         .unwrap();
-    let tile_ref = vae.decode(&tile_latent).expect("standalone decode of the last temporal tile");
+    let tile_ref = vae
+        .decode(&tile_latent)
+        .expect("standalone decode of the last temporal tile");
     mlx_rs::transforms::eval([&tile_ref]).unwrap();
     let rf = tile_ref.shape()[2] as i64;
     assert!(
@@ -337,7 +367,10 @@ fn over_bound_output_matches_below_bound_reference() {
         .filter(|&f| last.mask[(f - last.out_start) as usize] >= 1.0 - 1e-6)
         .map(i64::from)
         .collect();
-    assert!(!sole.is_empty(), "no sole-contributor weight-1 frames in the last tile");
+    assert!(
+        !sole.is_empty(),
+        "no sole-contributor weight-1 frames in the last tile"
+    );
 
     // Check EVERY sole-contributor frame (the decodes are already paid for; this is host reads) at
     // four positions × 3 channels. Channel-2 frames from ~429 sit past i32::MAX, so the over-bound
@@ -348,7 +381,12 @@ fn over_bound_output_matches_below_bound_reference() {
     let mut checked = 0i64;
     for &f in &sole {
         for c in 0..3i64 {
-            for &(y, x) in &[(0i64, 0i64), (oh / 2, ow / 2), (oh - 1, ow - 1), (123i64, 456i64)] {
+            for &(y, x) in &[
+                (0i64, 0i64),
+                (oh / 2, ow / 2),
+                (oh - 1, ow - 1),
+                (123i64, 456i64),
+            ] {
                 let off = ((c * out_f as i64 + f) * oh + y) * ow + x;
                 let r_off = ((c * rf + (f - last.out_start as i64)) * oh + y) * ow + x;
                 let dd = (flat[off as usize] - ref_flat[r_off as usize]).abs();

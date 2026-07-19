@@ -28,7 +28,11 @@ fn cubic(x: f64) -> f64 {
 
 /// Per-output-pixel 1-D resampling coefficients, matching PIL `precompute_coeffs`: antialias by
 /// scaling the filter support when downscaling, clamp the window to the input bounds, renormalize.
-fn precompute_coeffs(in_size: usize, out_size: usize, support_radius: f64) -> Vec<(usize, Vec<f64>)> {
+fn precompute_coeffs(
+    in_size: usize,
+    out_size: usize,
+    support_radius: f64,
+) -> Vec<(usize, Vec<f64>)> {
     let scale = in_size as f64 / out_size as f64;
     let filterscale = scale.max(1.0);
     let support = support_radius * filterscale;
@@ -81,7 +85,13 @@ fn quantize_coeffs(coeffs: &[(usize, Vec<f64>)]) -> Vec<(usize, Vec<i64>)> {
         .map(|(xmin, w)| {
             let ik = w
                 .iter()
-                .map(|&c| if c < 0.0 { (c * scale - 0.5) as i64 } else { (c * scale + 0.5) as i64 })
+                .map(|&c| {
+                    if c < 0.0 {
+                        (c * scale - 0.5) as i64
+                    } else {
+                        (c * scale + 0.5) as i64
+                    }
+                })
                 .collect();
             (*xmin, ik)
         })
@@ -90,7 +100,13 @@ fn quantize_coeffs(coeffs: &[(usize, Vec<f64>)]) -> Vec<(usize, Vec<i64>)> {
 
 /// PIL `Image.BICUBIC` resize of a uint8 RGB HWC image (two separable passes, fixed-point). Returns
 /// f32 HWC, integer-valued in `[0, 255]`. Assumes 3 channels.
-pub fn resize_bicubic_u8(src: &[u8], in_h: usize, in_w: usize, out_h: usize, out_w: usize) -> Result<Vec<f32>> {
+pub fn resize_bicubic_u8(
+    src: &[u8],
+    in_h: usize,
+    in_w: usize,
+    out_h: usize,
+    out_w: usize,
+) -> Result<Vec<f32>> {
     const C: usize = 3;
     if in_h == 0 || in_w == 0 || out_h == 0 || out_w == 0 {
         return Err(Error::Msg(format!(
@@ -222,9 +238,9 @@ impl Default for Qwen35ImageProcessor {
             patch_size: 16,
             temporal_patch_size: 2,
             merge_size: 2,
-            min_pixels: 65536,    // image size.shortest_edge (256²)
-            max_pixels: 16777216, // image size.longest_edge (4096²)
-            video_min_pixels: 4096, // video_preprocessor_config size.shortest_edge
+            min_pixels: 65536,          // image size.shortest_edge (256²)
+            max_pixels: 16777216,       // image size.longest_edge (4096²)
+            video_min_pixels: 4096,     // video_preprocessor_config size.shortest_edge
             video_max_pixels: 25165824, // video_preprocessor_config size.longest_edge
             mean: [0.5, 0.5, 0.5],
             std: [0.5, 0.5, 0.5],
@@ -256,7 +272,9 @@ impl Qwen35ImageProcessor {
         let factor = self.patch_size * self.merge_size;
         let (hi, lo) = (height.max(width), height.min(width));
         if lo == 0 {
-            return Err(Error::Msg(format!("smart_resize: zero dimension {width}x{height}")));
+            return Err(Error::Msg(format!(
+                "smart_resize: zero dimension {width}x{height}"
+            )));
         }
         if hi as f64 / lo as f64 > 200.0 {
             return Err(Error::Msg(format!(
@@ -264,9 +282,8 @@ impl Qwen35ImageProcessor {
                 hi as f64 / lo as f64
             )));
         }
-        let round_factor = |x: usize| -> usize {
-            (x as f64 / factor as f64).round_ties_even() as usize * factor
-        };
+        let round_factor =
+            |x: usize| -> usize { (x as f64 / factor as f64).round_ties_even() as usize * factor };
         let (mut hb, mut wb) = (round_factor(height), round_factor(width));
         let (hw, fac) = ((height * width) as f64, factor as f64);
         let t = temporal.max(1) as f64;
@@ -285,7 +302,12 @@ impl Qwen35ImageProcessor {
     }
 
     /// Preprocess raw interleaved RGB8 `pixels` (`width*height*3` bytes) → `(pixel_values, grid_thw)`.
-    pub fn preprocess(&self, pixels: &[u8], width: usize, height: usize) -> Result<(Array, Vec<[i32; 3]>)> {
+    pub fn preprocess(
+        &self,
+        pixels: &[u8],
+        width: usize,
+        height: usize,
+    ) -> Result<(Array, Vec<[i32; 3]>)> {
         let expected = width * height * 3;
         if pixels.len() != expected {
             return Err(Error::Msg(format!(
@@ -351,10 +373,7 @@ impl Qwen35ImageProcessor {
     /// Returns `pixel_values_videos` `[grid_t·grid_h·grid_w, C·T·P·P]` plus the single
     /// `video_grid_thw` `[grid_t, grid_h, grid_w]` (patch units). One video → one grid entry; the
     /// per-frame timestamp tokens are rendered separately by the provider (Text–Timestamp Alignment).
-    pub fn preprocess_video(
-        &self,
-        frames: &[(&[u8], usize, usize)],
-    ) -> Result<(Array, [i32; 3])> {
+    pub fn preprocess_video(&self, frames: &[(&[u8], usize, usize)]) -> Result<(Array, [i32; 3])> {
         if frames.is_empty() {
             return Err(Error::Msg("qwen3.6 video preprocess: no frames".into()));
         }
@@ -454,7 +473,9 @@ mod tests {
     fn preprocess_normalizes_to_minus_one_one() {
         // 384x384 so no resize; mean/std 0.5 maps 0->-1, 255->1, 128->~0.004.
         let pixels = [0u8, 128, 255].repeat(384 * 384);
-        let out = SiglipImageProcessor::default().preprocess(&pixels, 384, 384).unwrap();
+        let out = SiglipImageProcessor::default()
+            .preprocess(&pixels, 384, 384)
+            .unwrap();
         assert_eq!(out.shape(), &[1, 384, 384, 3]);
         let v = host_f32(&out);
         assert_eq!(v[0], -1.0);
@@ -464,7 +485,9 @@ mod tests {
 
     #[test]
     fn preprocess_rejects_bad_buffer() {
-        assert!(SiglipImageProcessor::default().preprocess(&[0u8; 3], 2, 2).is_err());
+        assert!(SiglipImageProcessor::default()
+            .preprocess(&[0u8; 3], 2, 2)
+            .is_err());
     }
 
     /// `preprocess_video` produces the right `video_grid_thw` (frames folded `temporal_patch_size`
@@ -473,9 +496,9 @@ mod tests {
     #[test]
     fn preprocess_video_grid_and_temporal_layout() {
         let proc = Qwen35ImageProcessor::default(); // patch 16, merge 2, temporal 2
-        // 64x64 frames → grid_h = grid_w = 4 (64/16). With the video pixel budget (t_bar=2,
-        // 2·64·64 = 8192 ∈ [4096, max]) the resize is a no-op, so the grid is exact. Two distinct
-        // solid frames so the temporal slots are distinguishable.
+                                                    // 64x64 frames → grid_h = grid_w = 4 (64/16). With the video pixel budget (t_bar=2,
+                                                    // 2·64·64 = 8192 ∈ [4096, max]) the resize is a no-op, so the grid is exact. Two distinct
+                                                    // solid frames so the temporal slots are distinguishable.
         let frame0 = [10u8, 20, 30].repeat(64 * 64); // first frame color
         let frame1 = [200u8, 210, 220].repeat(64 * 64); // second frame color
         let frames: Vec<(&[u8], usize, usize)> = vec![(&frame0, 64, 64), (&frame1, 64, 64)];
@@ -495,7 +518,10 @@ mod tests {
         let want0 = (10.0f32 / 255.0 - 0.5) / 0.5;
         let want1 = (200.0f32 / 255.0 - 0.5) / 0.5;
         assert!((v[0] - want0).abs() < 1e-4, "temporal slot 0 = frame 0 red");
-        assert!((v[p2] - want1).abs() < 1e-4, "temporal slot 1 = frame 1 red (distinct frame)");
+        assert!(
+            (v[p2] - want1).abs() < 1e-4,
+            "temporal slot 1 = frame 1 red (distinct frame)"
+        );
     }
 
     /// A frame count not divisible by `temporal_patch_size` is padded by repeating the last frame
@@ -540,7 +566,10 @@ mod tests {
     }
 
     fn preprocess_oracle() -> serde_json::Value {
-        serde_json::from_str(include_str!("models/testdata/qwen35_preprocess_oracle.json")).unwrap()
+        serde_json::from_str(include_str!(
+            "models/testdata/qwen35_preprocess_oracle.json"
+        ))
+        .unwrap()
     }
 
     fn arr_f32(j: &serde_json::Value, path: &[&str], k: &str) -> Vec<f32> {
@@ -548,7 +577,11 @@ mod tests {
         for p in path {
             v = &v[p];
         }
-        v[k].as_array().unwrap().iter().map(|x| x.as_f64().unwrap() as f32).collect()
+        v[k].as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_f64().unwrap() as f32)
+            .collect()
     }
 
     fn arr_u8(j: &serde_json::Value, path: &[&str], k: &str) -> Vec<u8> {
@@ -556,7 +589,11 @@ mod tests {
         for p in path {
             v = &v[p];
         }
-        v[k].as_array().unwrap().iter().map(|x| x.as_i64().unwrap() as u8).collect()
+        v[k].as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_i64().unwrap() as u8)
+            .collect()
     }
 
     /// `smart_resize` is pure integer math and must reproduce the reference `Qwen2VL.smart_resize`
@@ -567,11 +604,17 @@ mod tests {
         let j = preprocess_oracle();
         let proc = Qwen35ImageProcessor::default(); // production bounds
         for case in j["smart_cases"].as_array().unwrap() {
-            let (h, w) = (case["h"].as_u64().unwrap() as usize, case["w"].as_u64().unwrap() as usize);
+            let (h, w) = (
+                case["h"].as_u64().unwrap() as usize,
+                case["w"].as_u64().unwrap() as usize,
+            );
             let (rh, rw) = proc.smart_resize(h, w).unwrap();
             assert_eq!(
                 (rh, rw),
-                (case["rh"].as_u64().unwrap() as usize, case["rw"].as_u64().unwrap() as usize),
+                (
+                    case["rh"].as_u64().unwrap() as usize,
+                    case["rw"].as_u64().unwrap() as usize
+                ),
                 "smart_resize({h},{w})"
             );
         }
@@ -588,14 +631,21 @@ mod tests {
             min_pixels: j["params"]["min_pixels_small"].as_u64().unwrap() as usize,
             ..Default::default()
         };
-        let (h, w) = (j["exact"]["h"].as_u64().unwrap() as usize, j["exact"]["w"].as_u64().unwrap() as usize);
+        let (h, w) = (
+            j["exact"]["h"].as_u64().unwrap() as usize,
+            j["exact"]["w"].as_u64().unwrap() as usize,
+        );
         let img = arr_u8(&j, &["exact"], "image_u8");
         let (pv, grid) = proc.preprocess(&img, w, h).unwrap();
         assert_eq!(grid, vec![[1, (h / 16) as i32, (w / 16) as i32]]);
         let got = host_f32(&pv);
         let exp = arr_f32(&j, &["exact"], "pixel_values");
         assert_eq!(got.len(), exp.len());
-        let md = got.iter().zip(&exp).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        let md = got
+            .iter()
+            .zip(&exp)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
         assert!(md < 1e-5, "patchify layout vs reference: max abs diff {md}");
     }
 
@@ -610,13 +660,23 @@ mod tests {
             min_pixels: j["params"]["min_pixels_small"].as_u64().unwrap() as usize,
             ..Default::default()
         };
-        let (h, w) = (j["e2e"]["h"].as_u64().unwrap() as usize, j["e2e"]["w"].as_u64().unwrap() as usize);
+        let (h, w) = (
+            j["e2e"]["h"].as_u64().unwrap() as usize,
+            j["e2e"]["w"].as_u64().unwrap() as usize,
+        );
         let img = arr_u8(&j, &["e2e"], "image_u8");
         let (pv, grid) = proc.preprocess(&img, w, h).unwrap();
         assert_eq!(grid, vec![[1, 4, 4]]); // 50x70 -> 64x64 -> grid 4x4
         let got = host_f32(&pv);
         let exp = arr_f32(&j, &["e2e"], "pixel_values");
-        let md = got.iter().zip(&exp).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-        assert!(md < 0.02, "e2e vs reference (resampler tol): max abs diff {md}");
+        let md = got
+            .iter()
+            .zip(&exp)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            md < 0.02,
+            "e2e vs reference (resampler tol): max abs diff {md}"
+        );
     }
 }

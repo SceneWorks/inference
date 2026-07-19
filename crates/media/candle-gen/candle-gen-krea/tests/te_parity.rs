@@ -169,7 +169,8 @@ fn bf16_store_te_stays_within_parity() -> Result<()> {
 
     let w_bf16 = Weights::from_file(Path::new(FIXTURE), &Device::Cpu, DType::BF16)
         .unwrap_or_else(|e| panic!("load te fixture (bf16): {e}"));
-    let ctx_bf16 = KreaTextEncoder::load(&w_bf16, "language_model", &cfg, 64)?.forward(&input_ids)?;
+    let ctx_bf16 =
+        KreaTextEncoder::load(&w_bf16, "language_model", &cfg, 64)?.forward(&input_ids)?;
     assert_eq!(
         ctx_bf16.dtype(),
         DType::F32,

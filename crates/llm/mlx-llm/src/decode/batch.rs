@@ -92,7 +92,9 @@ pub fn generate_batch(
     }
     for (i, r) in requests.iter().enumerate() {
         if r.prompt_ids.is_empty() {
-            return Err(Error::Msg(format!("generate_batch: request {i} has an empty prompt")));
+            return Err(Error::Msg(format!(
+                "generate_batch: request {i} has an empty prompt"
+            )));
         }
     }
     if cancel.is_cancelled() {
@@ -107,7 +109,13 @@ pub fn generate_batch(
     let mut sched = Scheduler::new();
     let seq_ids: Vec<SeqId> = requests
         .iter()
-        .map(|r| sched.admit(SeqSpec::new(r.prompt_ids.clone(), r.max_new_tokens, r.stop_tokens.clone())))
+        .map(|r| {
+            sched.admit(SeqSpec::new(
+                r.prompt_ids.clone(),
+                r.max_new_tokens,
+                r.stop_tokens.clone(),
+            ))
+        })
         .collect();
 
     let mut lanes: Vec<Lane> = requests
@@ -129,7 +137,8 @@ pub fn generate_batch(
     let (ids, positions, mask_h) = build_prefill(requests, max_prompt);
     let ids = Array::from_slice(&ids, &[n as i32, max_prompt]);
     let (cos, sin) = model.rope_tables(&positions, n as i32, max_prompt)?;
-    let mask = Array::from_slice(&mask_h, &[n as i32, 1, max_prompt, max_prompt]).as_dtype(dtype)?;
+    let mask =
+        Array::from_slice(&mask_h, &[n as i32, 1, max_prompt, max_prompt]).as_dtype(dtype)?;
     let logits = model.decode_logits_masked(&ids, cache.as_mut(), &cos, &sin, &mask)?;
 
     // Sample the first token per sequence; keep the lanes that did not immediately retire.
@@ -138,7 +147,13 @@ pub fn generate_batch(
     for (ri, mut lane) in std::mem::take(&mut lanes).into_iter().enumerate() {
         if !sched.is_active(lane.seq) {
             // Zero-budget sequence: admitted already finished, never generates.
-            on_event(ri, StreamEvent::Done { reason: FinishReason::MaxTokens, generated: 0 });
+            on_event(
+                ri,
+                StreamEvent::Done {
+                    reason: FinishReason::MaxTokens,
+                    generated: 0,
+                },
+            );
             continue;
         }
         let tok = sample_row(&logits, ri, &mut lane)?;
@@ -157,7 +172,13 @@ pub fn generate_batch(
         if cancel.is_cancelled() {
             for lane in &active {
                 let generated = sched.generated(lane.seq).len();
-                on_event(lane.seq.0, StreamEvent::Done { reason: FinishReason::Cancelled, generated });
+                on_event(
+                    lane.seq.0,
+                    StreamEvent::Done {
+                        reason: FinishReason::Cancelled,
+                        generated,
+                    },
+                );
             }
             break;
         }
@@ -169,7 +190,10 @@ pub fn generate_batch(
         let feed: Vec<i32> = active.iter().map(|l| l.next_token).collect();
         let feed = Array::from_slice(&feed, &[b as i32, 1]);
         // Per-row absolute position of the token being fed: prompt_len + (#tokens already cached).
-        let positions: Vec<i32> = active.iter().map(|l| sched.offset(l.seq) as i32 - 1).collect();
+        let positions: Vec<i32> = active
+            .iter()
+            .map(|l| sched.offset(l.seq) as i32 - 1)
+            .collect();
         let (cos, sin) = model.rope_tables(&positions, b as i32, 1)?;
         let mask = decode_mask(&active, k_total, dtype)?;
 
@@ -248,7 +272,11 @@ fn decode_mask(active: &[Lane], k_total: i32, dtype: mlx_rs::Dtype) -> Result<Ar
     let mut mask = Vec::with_capacity(b * k_total as usize);
     for lane in active {
         for j in 0..k_total {
-            mask.push(if j >= lane.pad_len { 0.0 } else { f32::NEG_INFINITY });
+            mask.push(if j >= lane.pad_len {
+                0.0
+            } else {
+                f32::NEG_INFINITY
+            });
         }
     }
     Ok(Array::from_slice(&mask, &[b as i32, 1, 1, k_total]).as_dtype(dtype)?)

@@ -301,7 +301,11 @@ impl JsonState {
                     if is_ws(c) {
                         return Ok(());
                     }
-                    return if self.begin_value(c)? { Ok(()) } else { Err(()) };
+                    return if self.begin_value(c)? {
+                        Ok(())
+                    } else {
+                        Err(())
+                    };
                 }
                 Mode::ArrayFirst => {
                     if is_ws(c) {
@@ -312,7 +316,11 @@ impl JsonState {
                         self.mode = Mode::AfterValue;
                         return Ok(());
                     }
-                    return if self.begin_value(c)? { Ok(()) } else { Err(()) };
+                    return if self.begin_value(c)? {
+                        Ok(())
+                    } else {
+                        Err(())
+                    };
                 }
                 Mode::ObjFirstKey => {
                     if is_ws(c) {
@@ -531,8 +539,17 @@ mod tests {
     #[test]
     fn valid_prefixes_are_accepted_but_not_complete() {
         for s in [
-            "{", "{\"a\"", "{\"a\":", "{\"a\": 1,", "[1,", "\"unterminated", "-", "1.", "1e",
-            "tru", "",
+            "{",
+            "{\"a\"",
+            "{\"a\":",
+            "{\"a\": 1,",
+            "[1,",
+            "\"unterminated",
+            "-",
+            "1.",
+            "1e",
+            "tru",
+            "",
         ] {
             assert!(run(s).is_some(), "should be a valid prefix: {s:?}");
             assert!(!is_complete(s), "should NOT be complete: {s:?}");

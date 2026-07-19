@@ -158,7 +158,11 @@ impl Qwen35Config {
     /// the remainder toward `t` then `h` (matching the released `[11, 11, 10]` for `rotary_dim/2 = 32`).
     pub fn mrope_section_resolved(&self) -> [usize; 3] {
         if let Some(s) = self.mrope_section {
-            return [s[0].max(0) as usize, s[1].max(0) as usize, s[2].max(0) as usize];
+            return [
+                s[0].max(0) as usize,
+                s[1].max(0) as usize,
+                s[2].max(0) as usize,
+            ];
         }
         let half = (self.rotary_dim() / 2) as usize;
         let base = half / 3;
@@ -275,7 +279,9 @@ impl GatedDeltaNet {
 
         // Gated RMS-norm with z (back in the layer dtype), then the output projection.
         let out = rms_norm_gated(&y.as_dtype(dt)?, &self.norm_weight, &z, self.eps)?;
-        let result = self.out_proj.forward(&out.reshape(&[b, s, self.value_dim])?)?;
+        let result = self
+            .out_proj
+            .forward(&out.reshape(&[b, s, self.value_dim])?)?;
         cache.update(new_conv, new_ssm, s);
         Ok(result)
     }
@@ -311,11 +317,17 @@ impl Qwen35Attention {
         let gate = qp[1].reshape(&[b, s, self.num_heads * self.head_dim])?;
 
         let k = rms_norm(
-            &self.k_proj.forward(x)?.reshape(&[b, s, self.num_kv_heads, self.head_dim])?,
+            &self
+                .k_proj
+                .forward(x)?
+                .reshape(&[b, s, self.num_kv_heads, self.head_dim])?,
             &self.k_norm,
             self.eps,
         )?;
-        let v = self.v_proj.forward(x)?.reshape(&[b, s, self.num_kv_heads, self.head_dim])?;
+        let v = self
+            .v_proj
+            .forward(x)?
+            .reshape(&[b, s, self.num_kv_heads, self.head_dim])?;
 
         // Partial RoPE (NeoX), then transpose into head-major [B,H,S,hd].
         let q = apply_rope(&q, cos, sin, false)?.transpose_axes(&[0, 2, 1, 3])?;
@@ -324,9 +336,9 @@ impl Qwen35Attention {
 
         let (k_all, v_all) = cache.update(&k, &v)?;
         let out = sdpa_capped(&q, &k_all, &v_all, self.scale, None, AttnMask::Causal)?; // [B,H,S,hd]
-        let merged = out
-            .transpose_axes(&[0, 2, 1, 3])?
-            .reshape(&[b, s, self.num_heads * self.head_dim])?;
+        let merged =
+            out.transpose_axes(&[0, 2, 1, 3])?
+                .reshape(&[b, s, self.num_heads * self.head_dim])?;
         // Output gate: multiply by sigmoid(gate) before the output projection.
         let gated = multiply(&merged, &sigmoid(&gate)?)?;
         self.o_proj.forward(&gated)
@@ -388,7 +400,11 @@ impl MoeFfn {
             let mut idx: Vec<usize> = (0..num_experts).collect();
             idx.sort_unstable_by(|&a, &b| probs[b].total_cmp(&probs[a]));
             let top = &idx[..k];
-            let denom = top.iter().map(|&e| probs[e]).sum::<f32>().max(f32::MIN_POSITIVE);
+            let denom = top
+                .iter()
+                .map(|&e| probs[e])
+                .sum::<f32>()
+                .max(f32::MIN_POSITIVE);
             for &e in top {
                 routed[e].push((ti as i32, probs[e] / denom));
             }
@@ -480,7 +496,10 @@ pub struct AttnKv {
 impl AttnKv {
     fn update(&mut self, k: &Array, v: &Array) -> Result<(Array, Array)> {
         let merged = match self.kv.take() {
-            Some((pk, pv)) => (concatenate_axis(&[&pk, k], 2)?, concatenate_axis(&[&pv, v], 2)?),
+            Some((pk, pv)) => (
+                concatenate_axis(&[&pk, k], 2)?,
+                concatenate_axis(&[&pv, v], 2)?,
+            ),
             None => (k.clone(), v.clone()),
         };
         self.kv = Some((merged.0.clone(), merged.1.clone()));
@@ -610,7 +629,12 @@ impl Qwen35Model {
 
     /// Run the decoder over `input_ids` `[B, S]` at sequence `offset`, returning logits for **every**
     /// position `[B, S, vocab]`.
-    pub fn forward(&self, input_ids: &Array, cache: &mut Qwen35Cache, offset: i32) -> Result<Array> {
+    pub fn forward(
+        &self,
+        input_ids: &Array,
+        cache: &mut Qwen35Cache,
+        offset: i32,
+    ) -> Result<Array> {
         let h = self.hidden(input_ids, cache, offset)?;
         self.project(&h)
     }
@@ -973,7 +997,9 @@ impl KvCache for Qwen35Cache {
     }
 
     fn retain_sequences(&mut self, _keep: &[i32]) -> Result<()> {
-        Err(Error::Msg("Qwen35Cache: retain_sequences not yet supported".into()))
+        Err(Error::Msg(
+            "Qwen35Cache: retain_sequences not yet supported".into(),
+        ))
     }
 
     fn truncate(&mut self, _len: i32) -> Result<()> {
@@ -1011,7 +1037,13 @@ impl crate::models::VlmDecode for Qwen35Model {
         vision_features: &Array,
         placeholder_tokens: &[i32],
     ) -> Result<Array> {
-        Qwen35Model::splice_vision_features(self, embeds, input_ids, vision_features, placeholder_tokens)
+        Qwen35Model::splice_vision_features(
+            self,
+            embeds,
+            input_ids,
+            vision_features,
+            placeholder_tokens,
+        )
     }
 
     fn mrope_positions_mm(
@@ -1050,7 +1082,13 @@ impl crate::models::VlmDecode for Qwen35Model {
             .ok_or_else(|| {
                 Error::Msg("Qwen35Model::prefill_with_deepstack: cache is not a Qwen35Cache".into())
             })?;
-        self.decode_logits_from_embeds_with_deepstack(embeds, positions, cache, visual_pos_mask, deepstack)
+        self.decode_logits_from_embeds_with_deepstack(
+            embeds,
+            positions,
+            cache,
+            visual_pos_mask,
+            deepstack,
+        )
     }
 }
 
@@ -1142,7 +1180,11 @@ mod tests {
         // Mirror the real VLM-wrapped layout: the text decoder nests under `model.language_model`,
         // with `lm_head.weight` at the checkpoint root.
         let pfx = "model.language_model";
-        t(&mut m, &format!("{pfx}.embed_tokens.weight"), &[cfg.vocab_size, h]);
+        t(
+            &mut m,
+            &format!("{pfx}.embed_tokens.weight"),
+            &[cfg.vocab_size, h],
+        );
         t(&mut m, &format!("{pfx}.norm.weight"), &[h]);
         t(&mut m, "lm_head.weight", &[cfg.vocab_size, h]);
         for i in 0..cfg.num_layers {
@@ -1151,15 +1193,35 @@ mod tests {
             t(&mut m, &lp("post_attention_layernorm.weight"), &[h]);
             match &cfg.moe {
                 None => {
-                    t(&mut m, &lp("mlp.gate_proj.weight"), &[cfg.intermediate_size, h]);
-                    t(&mut m, &lp("mlp.up_proj.weight"), &[cfg.intermediate_size, h]);
-                    t(&mut m, &lp("mlp.down_proj.weight"), &[h, cfg.intermediate_size]);
+                    t(
+                        &mut m,
+                        &lp("mlp.gate_proj.weight"),
+                        &[cfg.intermediate_size, h],
+                    );
+                    t(
+                        &mut m,
+                        &lp("mlp.up_proj.weight"),
+                        &[cfg.intermediate_size, h],
+                    );
+                    t(
+                        &mut m,
+                        &lp("mlp.down_proj.weight"),
+                        &[h, cfg.intermediate_size],
+                    );
                 }
                 Some(moe) => {
                     let mi = moe.moe_intermediate_size;
                     let si = moe.shared_expert_intermediate_size;
-                    t(&mut m, &lp("mlp.experts.gate_up_proj"), &[moe.num_experts, 2 * mi, h]);
-                    t(&mut m, &lp("mlp.experts.down_proj"), &[moe.num_experts, h, mi]);
+                    t(
+                        &mut m,
+                        &lp("mlp.experts.gate_up_proj"),
+                        &[moe.num_experts, 2 * mi, h],
+                    );
+                    t(
+                        &mut m,
+                        &lp("mlp.experts.down_proj"),
+                        &[moe.num_experts, h, mi],
+                    );
                     t(&mut m, &lp("mlp.gate.weight"), &[moe.num_experts, h]);
                     t(&mut m, &lp("mlp.shared_expert.gate_proj.weight"), &[si, h]);
                     t(&mut m, &lp("mlp.shared_expert.up_proj.weight"), &[si, h]);
@@ -1169,20 +1231,64 @@ mod tests {
             }
             if cfg.is_linear(i) {
                 // 4-way split projections (real qwen3_5 layout).
-                t(&mut m, &lp("linear_attn.in_proj_qkv.weight"), &[conv_dim, h]);
+                t(
+                    &mut m,
+                    &lp("linear_attn.in_proj_qkv.weight"),
+                    &[conv_dim, h],
+                );
                 t(&mut m, &lp("linear_attn.in_proj_z.weight"), &[value_dim, h]);
-                t(&mut m, &lp("linear_attn.in_proj_a.weight"), &[cfg.linear_num_value_heads, h]);
-                t(&mut m, &lp("linear_attn.in_proj_b.weight"), &[cfg.linear_num_value_heads, h]);
-                t(&mut m, &lp("linear_attn.conv1d.weight"), &[conv_dim, 1, cfg.linear_conv_kernel_dim]);
-                t(&mut m, &lp("linear_attn.A_log"), &[cfg.linear_num_value_heads]);
-                t(&mut m, &lp("linear_attn.dt_bias"), &[cfg.linear_num_value_heads]);
-                t(&mut m, &lp("linear_attn.norm.weight"), &[cfg.linear_value_head_dim]);
+                t(
+                    &mut m,
+                    &lp("linear_attn.in_proj_a.weight"),
+                    &[cfg.linear_num_value_heads, h],
+                );
+                t(
+                    &mut m,
+                    &lp("linear_attn.in_proj_b.weight"),
+                    &[cfg.linear_num_value_heads, h],
+                );
+                t(
+                    &mut m,
+                    &lp("linear_attn.conv1d.weight"),
+                    &[conv_dim, 1, cfg.linear_conv_kernel_dim],
+                );
+                t(
+                    &mut m,
+                    &lp("linear_attn.A_log"),
+                    &[cfg.linear_num_value_heads],
+                );
+                t(
+                    &mut m,
+                    &lp("linear_attn.dt_bias"),
+                    &[cfg.linear_num_value_heads],
+                );
+                t(
+                    &mut m,
+                    &lp("linear_attn.norm.weight"),
+                    &[cfg.linear_value_head_dim],
+                );
                 t(&mut m, &lp("linear_attn.out_proj.weight"), &[h, value_dim]);
             } else {
-                t(&mut m, &lp("self_attn.q_proj.weight"), &[cfg.num_heads * cfg.head_dim * 2, h]);
-                t(&mut m, &lp("self_attn.k_proj.weight"), &[cfg.num_kv_heads * cfg.head_dim, h]);
-                t(&mut m, &lp("self_attn.v_proj.weight"), &[cfg.num_kv_heads * cfg.head_dim, h]);
-                t(&mut m, &lp("self_attn.o_proj.weight"), &[h, cfg.num_heads * cfg.head_dim]);
+                t(
+                    &mut m,
+                    &lp("self_attn.q_proj.weight"),
+                    &[cfg.num_heads * cfg.head_dim * 2, h],
+                );
+                t(
+                    &mut m,
+                    &lp("self_attn.k_proj.weight"),
+                    &[cfg.num_kv_heads * cfg.head_dim, h],
+                );
+                t(
+                    &mut m,
+                    &lp("self_attn.v_proj.weight"),
+                    &[cfg.num_kv_heads * cfg.head_dim, h],
+                );
+                t(
+                    &mut m,
+                    &lp("self_attn.o_proj.weight"),
+                    &[h, cfg.num_heads * cfg.head_dim],
+                );
                 t(&mut m, &lp("self_attn.q_norm.weight"), &[cfg.head_dim]);
                 t(&mut m, &lp("self_attn.k_norm.weight"), &[cfg.head_dim]);
             }
@@ -1196,7 +1302,7 @@ mod tests {
         assert_eq!(cfg.hidden_size, 32);
         assert_eq!(cfg.full_attention_interval, 4);
         assert_eq!(cfg.rotary_dim(), 4); // head_dim 8 * 0.5
-        // 3 linear : 1 full.
+                                         // 3 linear : 1 full.
         assert!(cfg.is_linear(0) && cfg.is_linear(1) && cfg.is_linear(2));
         assert!(!cfg.is_linear(3));
     }
@@ -1221,14 +1327,21 @@ mod tests {
     #[test]
     fn decode_after_prefill_advances_cache() {
         let cfg = Qwen35Config::from_json(&cfg_json()).unwrap();
-        let model =
-            Qwen35Model::from_weights(&synthetic_weights(&cfg), "model.language_model", cfg.clone())
-                .unwrap();
+        let model = Qwen35Model::from_weights(
+            &synthetic_weights(&cfg),
+            "model.language_model",
+            cfg.clone(),
+        )
+        .unwrap();
         let mut cache = model.new_cache();
-        model.forward(&Array::from_slice(&[1i32, 2, 3], &[1, 3]), &mut cache, 0).unwrap();
+        model
+            .forward(&Array::from_slice(&[1i32, 2, 3], &[1, 3]), &mut cache, 0)
+            .unwrap();
         assert_eq!(cache.offset(), 3);
         // One decode step at offset 3.
-        let logits = model.forward(&Array::from_slice(&[4i32], &[1, 1]), &mut cache, 3).unwrap();
+        let logits = model
+            .forward(&Array::from_slice(&[4i32], &[1, 1]), &mut cache, 3)
+            .unwrap();
         assert_eq!(logits.shape(), &[1, 1, cfg.vocab_size]);
         assert_eq!(cache.offset(), 4);
         for x in logits.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>() {
@@ -1295,14 +1408,21 @@ mod tests {
         let out = layer.forward(&x, &mut cache).unwrap();
         assert_eq!(out.shape(), &[b, s, h]);
 
-        let got = out.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>().to_vec();
+        let got = out
+            .as_dtype(Dtype::Float32)
+            .unwrap()
+            .as_slice::<f32>()
+            .to_vec();
         let exp = arr("expected_output");
         let md = got
             .iter()
             .zip(&exp)
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
-        assert!(md < 2e-4, "deltanet layer vs reference: max abs diff {md}\n got {got:?}\n exp {exp:?}");
+        assert!(
+            md < 2e-4,
+            "deltanet layer vs reference: max abs diff {md}\n got {got:?}\n exp {exp:?}"
+        );
 
         // The cache advanced and holds both the recurrent and conv state for a follow-on decode step.
         assert_eq!(cache.offset(), s);
@@ -1324,7 +1444,11 @@ mod tests {
         // One-shot prefill of the whole sequence; keep the last-token logits.
         let mut c_pre = model.new_cache();
         let prefill = model
-            .decode_logits(&Array::from_slice(&toks, &[1, toks.len() as i32]), &mut c_pre, 0)
+            .decode_logits(
+                &Array::from_slice(&toks, &[1, toks.len() as i32]),
+                &mut c_pre,
+                0,
+            )
             .unwrap();
 
         // Token-by-token with cache carry; keep the final step's logits.
@@ -1341,11 +1465,26 @@ mod tests {
 
         assert_eq!(c_pre.offset(), toks.len() as i32);
         assert_eq!(c_step.offset(), toks.len() as i32);
-        let a = prefill.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>().to_vec();
-        let b = step.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>().to_vec();
-        let md = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        let a = prefill
+            .as_dtype(Dtype::Float32)
+            .unwrap()
+            .as_slice::<f32>()
+            .to_vec();
+        let b = step
+            .as_dtype(Dtype::Float32)
+            .unwrap()
+            .as_slice::<f32>()
+            .to_vec();
+        let md = a
+            .iter()
+            .zip(&b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
         // Both bf16 paths; allow small per-op bf16 reorder noise, far below any structural error.
-        assert!(md < 5e-2, "prefill vs stepwise last-token logits diverged: max abs diff {md}");
+        assert!(
+            md < 5e-2,
+            "prefill vs stepwise last-token logits diverged: max abs diff {md}"
+        );
     }
 
     /// A MoE config (`qwen3_5_moe`, the 35B-A3B shape, scaled down): 6 experts, top-2, with a shared
@@ -1371,7 +1510,12 @@ mod tests {
         let json: serde_json::Value =
             serde_json::from_str(include_str!("testdata/qwen35_moe_oracle.json")).unwrap();
         let arr = |k: &str| -> Vec<f32> {
-            json[k].as_array().unwrap().iter().map(|x| x.as_f64().unwrap() as f32).collect()
+            json[k]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_f64().unwrap() as f32)
+                .collect()
         };
         let (h, e, k, mi) = (8i32, 6i32, 2usize, 4i32);
         let mk = |key: &str, shape: &[i32]| Array::from_slice(&arr(key), shape);
@@ -1383,10 +1527,18 @@ mod tests {
         let mut experts = Vec::new();
         for ei in 0..e {
             let sel = Array::from_slice(&[ei], &[1]);
-            let gu = gate_up.take_axis(&sel, 0).unwrap().reshape(&[2 * mi, h]).unwrap();
+            let gu = gate_up
+                .take_axis(&sel, 0)
+                .unwrap()
+                .reshape(&[2 * mi, h])
+                .unwrap();
             let parts = split_sections(&gu, &[mi], 0).unwrap();
             let dn = down.take_axis(&sel, 0).unwrap().reshape(&[h, mi]).unwrap();
-            experts.push(Mlp { gate: proj(parts[0].clone()), up: proj(parts[1].clone()), down: proj(dn) });
+            experts.push(Mlp {
+                gate: proj(parts[0].clone()),
+                up: proj(parts[1].clone()),
+                down: proj(dn),
+            });
         }
         let moe = MoeFfn {
             router: mk("router", &[e, h]),
@@ -1402,10 +1554,21 @@ mod tests {
 
         let out = moe.forward(&mk("x", &[1, 1, h])).unwrap();
         assert_eq!(out.shape(), &[1, 1, h]);
-        let got = out.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>().to_vec();
+        let got = out
+            .as_dtype(Dtype::Float32)
+            .unwrap()
+            .as_slice::<f32>()
+            .to_vec();
         let exp = arr("expected_output");
-        let md = got.iter().zip(&exp).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-        assert!(md < 2e-4, "moe ffn vs reference: max abs diff {md}\n got {got:?}\n exp {exp:?}");
+        let md = got
+            .iter()
+            .zip(&exp)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            md < 2e-4,
+            "moe ffn vs reference: max abs diff {md}\n got {got:?}\n exp {exp:?}"
+        );
     }
 
     #[test]
@@ -1413,15 +1576,22 @@ mod tests {
         let cfg = Qwen35Config::from_json(&cfg_json_moe()).unwrap();
         assert!(cfg.moe.is_some());
         assert_eq!(cfg.moe.unwrap().num_experts, 6);
-        let model =
-            Qwen35Model::from_weights(&synthetic_weights(&cfg), "model.language_model", cfg.clone())
-                .unwrap();
+        let model = Qwen35Model::from_weights(
+            &synthetic_weights(&cfg),
+            "model.language_model",
+            cfg.clone(),
+        )
+        .unwrap();
 
         // Multi-token prefill exercises routing/scatter across tokens; logits are finite + shaped.
         let toks = [1i32, 7, 3, 42, 9];
         let mut c_pre = model.new_cache();
         let logits = model
-            .forward(&Array::from_slice(&toks, &[1, toks.len() as i32]), &mut c_pre, 0)
+            .forward(
+                &Array::from_slice(&toks, &[1, toks.len() as i32]),
+                &mut c_pre,
+                0,
+            )
             .unwrap();
         assert_eq!(logits.shape(), &[1, toks.len() as i32, cfg.vocab_size]);
         for x in logits.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>() {
@@ -1430,19 +1600,41 @@ mod tests {
 
         // Prefill == stepwise decode over the hybrid cache, with the MoE FFN in the loop.
         let pre_last = model
-            .decode_logits(&Array::from_slice(&toks, &[1, toks.len() as i32]), &mut model.new_cache(), 0)
+            .decode_logits(
+                &Array::from_slice(&toks, &[1, toks.len() as i32]),
+                &mut model.new_cache(),
+                0,
+            )
             .unwrap();
         let mut c_step = model.new_cache();
         let mut last = None;
         for (i, &tok) in toks.iter().enumerate() {
             last = Some(
-                model.decode_logits(&Array::from_slice(&[tok], &[1, 1]), &mut c_step, i as i32).unwrap(),
+                model
+                    .decode_logits(&Array::from_slice(&[tok], &[1, 1]), &mut c_step, i as i32)
+                    .unwrap(),
             );
         }
-        let a = pre_last.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>().to_vec();
-        let b = last.unwrap().as_dtype(Dtype::Float32).unwrap().as_slice::<f32>().to_vec();
-        let md = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
-        assert!(md < 5e-2, "MoE prefill vs stepwise diverged: max abs diff {md}");
+        let a = pre_last
+            .as_dtype(Dtype::Float32)
+            .unwrap()
+            .as_slice::<f32>()
+            .to_vec();
+        let b = last
+            .unwrap()
+            .as_dtype(Dtype::Float32)
+            .unwrap()
+            .as_slice::<f32>()
+            .to_vec();
+        let md = a
+            .iter()
+            .zip(&b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            md < 5e-2,
+            "MoE prefill vs stepwise diverged: max abs diff {md}"
+        );
     }
 
     fn synthetic_model() -> (Qwen35Config, Qwen35Model) {
@@ -1460,12 +1652,20 @@ mod tests {
             serde_json::from_str(include_str!("testdata/qwen35_mrope_oracle.json")).unwrap();
         let r = &j["rope_index"];
         let ints = |k: &str| -> Vec<i32> {
-            r[k].as_array().unwrap().iter().map(|x| x.as_i64().unwrap() as i32).collect()
+            r[k].as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_i64().unwrap() as i32)
+                .collect()
         };
         let ids = ints("input_ids");
         let grid = {
             let g = &r["image_grid_thw"][0];
-            vec![[g[0].as_i64().unwrap() as i32, g[1].as_i64().unwrap() as i32, g[2].as_i64().unwrap() as i32]]
+            vec![[
+                g[0].as_i64().unwrap() as i32,
+                g[1].as_i64().unwrap() as i32,
+                g[2].as_i64().unwrap() as i32,
+            ]]
         };
         let img_tok = r["image_token_id"].as_i64().unwrap() as i32;
         let merge = r["merge"].as_i64().unwrap() as i32;
@@ -1485,14 +1685,24 @@ mod tests {
     }
 
     fn ints_of(v: &serde_json::Value) -> Vec<i32> {
-        v.as_array().unwrap().iter().map(|x| x.as_i64().unwrap() as i32).collect()
+        v.as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_i64().unwrap() as i32)
+            .collect()
     }
 
     fn grids_of(v: &serde_json::Value) -> Vec<[i32; 3]> {
         v.as_array()
             .unwrap()
             .iter()
-            .map(|g| [g[0].as_i64().unwrap() as i32, g[1].as_i64().unwrap() as i32, g[2].as_i64().unwrap() as i32])
+            .map(|g| {
+                [
+                    g[0].as_i64().unwrap() as i32,
+                    g[1].as_i64().unwrap() as i32,
+                    g[2].as_i64().unwrap() as i32,
+                ]
+            })
             .collect()
     }
 
@@ -1514,7 +1724,11 @@ mod tests {
         assert_eq!(t, ints_of(&r["t"]), "image t-row vs HF get_rope_index");
         assert_eq!(h, ints_of(&r["h"]), "image h-row vs HF get_rope_index");
         assert_eq!(w, ints_of(&r["w"]), "image w-row vs HF get_rope_index");
-        assert_eq!(delta, r["delta"].as_i64().unwrap() as i32, "image mrope_delta");
+        assert_eq!(
+            delta,
+            r["delta"].as_i64().unwrap() as i32,
+            "image mrope_delta"
+        );
     }
 
     /// **Interleaved-MRoPE position ids — synthetic time / multi-frame video axis.** Qwen3-VL splits a
@@ -1536,10 +1750,18 @@ mod tests {
         let (t, h, w, delta) = model
             .mrope_positions_mm(&ids, &[], img, &vgrid, vid, merge)
             .unwrap();
-        assert_eq!(t, ints_of(&r["t"]), "video t-row vs HF get_rope_index (per-frame reset)");
+        assert_eq!(
+            t,
+            ints_of(&r["t"]),
+            "video t-row vs HF get_rope_index (per-frame reset)"
+        );
         assert_eq!(h, ints_of(&r["h"]), "video h-row vs HF get_rope_index");
         assert_eq!(w, ints_of(&r["w"]), "video w-row vs HF get_rope_index");
-        assert_eq!(delta, r["delta"].as_i64().unwrap() as i32, "video mrope_delta");
+        assert_eq!(
+            delta,
+            r["delta"].as_i64().unwrap() as i32,
+            "video mrope_delta"
+        );
     }
 
     /// **Interleaved-MRoPE table — end to end at Qwen3-VL config.** Build the partial-rotary RoPE at
@@ -1562,7 +1784,12 @@ mod tests {
         let sections = [section[0], section[1], section[2]];
         let (t, h, w) = (ints_of(&il["t"]), ints_of(&il["h"]), ints_of(&il["w"]));
         let expect = |k: &str| -> Vec<f32> {
-            il[k].as_array().unwrap().iter().map(|x| x.as_f64().unwrap() as f32).collect()
+            il[k]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_f64().unwrap() as f32)
+                .collect()
         };
 
         // Qwen3-VL text rope is full-rotary (partial_rotary_factor 1.0 ⇒ rotary_dim == head_dim),
@@ -1574,12 +1801,21 @@ mod tests {
         assert_eq!(cos.shape(), &[1, t.len() as i32, head_dim]);
         let cmp = |got: &[f32], exp: &[f32]| {
             assert_eq!(got.len(), exp.len(), "table length");
-            got.iter().zip(exp).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max)
+            got.iter()
+                .zip(exp)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max)
         };
         let dc = cmp(cos.as_slice::<f32>(), &expect("cos"));
         let ds = cmp(sin.as_slice::<f32>(), &expect("sin"));
-        assert!(dc < 1e-5, "interleaved cos vs HF reference: max abs diff {dc}");
-        assert!(ds < 1e-5, "interleaved sin vs HF reference: max abs diff {ds}");
+        assert!(
+            dc < 1e-5,
+            "interleaved cos vs HF reference: max abs diff {dc}"
+        );
+        assert!(
+            ds < 1e-5,
+            "interleaved sin vs HF reference: max abs diff {ds}"
+        );
     }
 
     /// **Image-placeholder token expansion matches the HF processor.** Given the raw chat ids with a
@@ -1601,7 +1837,10 @@ mod tests {
 
         // The count the vision tower / processor agree on.
         let count = vision_merged_token_count(grid, merge);
-        assert_eq!(count, expected_count, "merged-token count formula vs HF processor");
+        assert_eq!(
+            count, expected_count,
+            "merged-token count formula vs HF processor"
+        );
 
         // Reconstruct the *raw* (pre-expansion) chat ids: the single image placeholder framed by
         // vision_start/vision_end, with all surrounding (non-image) tokens preserved in order. The HF
@@ -1628,8 +1867,15 @@ mod tests {
         // between, and the count matches what the merger emits.
         let si = expanded.iter().position(|&x| x == vs).unwrap();
         let ei = expanded.iter().position(|&x| x == ve).unwrap();
-        assert_eq!(ei - si - 1, count, "image tokens framed between vision_start/vision_end");
-        assert_eq!(expanded[si + 1..ei].iter().filter(|&&x| x == img).count(), count);
+        assert_eq!(
+            ei - si - 1,
+            count,
+            "image tokens framed between vision_start/vision_end"
+        );
+        assert_eq!(
+            expanded[si + 1..ei].iter().filter(|&&x| x == img).count(),
+            count
+        );
     }
 
     /// **The text-path invariant.** Feeding token embeds + equal (text) 3-D positions through
@@ -1642,7 +1888,9 @@ mod tests {
         let toks = [1i32, 7, 3, 42, 9, 2];
         let ids = Array::from_slice(&toks, &[1, toks.len() as i32]);
 
-        let a = model.decode_logits(&ids, &mut model.new_cache(), 0).unwrap();
+        let a = model
+            .decode_logits(&ids, &mut model.new_cache(), 0)
+            .unwrap();
         let embeds = model.embed_input_ids(&ids).unwrap();
         let pos: Vec<i32> = (0..toks.len() as i32).collect();
         let b = model
@@ -1651,11 +1899,24 @@ mod tests {
 
         assert_eq!(a.shape(), b.shape());
         let (av, bv) = (
-            a.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>().to_vec(),
-            b.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>().to_vec(),
+            a.as_dtype(Dtype::Float32)
+                .unwrap()
+                .as_slice::<f32>()
+                .to_vec(),
+            b.as_dtype(Dtype::Float32)
+                .unwrap()
+                .as_slice::<f32>()
+                .to_vec(),
         );
-        let md = av.iter().zip(&bv).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
-        assert!(md == 0.0, "embeds text path must equal token-id path bit-for-bit; max abs diff {md}");
+        let md = av
+            .iter()
+            .zip(&bv)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            md == 0.0,
+            "embeds text path must equal token-id path bit-for-bit; max abs diff {md}"
+        );
     }
 
     /// The splice hook overwrites exactly the image-token rows (in order) with the feature rows and
@@ -1665,12 +1926,14 @@ mod tests {
         let (cfg, model) = synthetic_model();
         let hidden = cfg.hidden_size as usize;
         let ids = [7i32, 49, 49, 8, 9]; // two image tokens (id 49) at positions 1,2
-        // embeds[1,5,hidden]: row r filled with value r.
+                                        // embeds[1,5,hidden]: row r filled with value r.
         let mut e = Vec::new();
         for r in 0..5 {
             e.extend(std::iter::repeat_n(r as f32, hidden));
         }
-        let embeds = Array::from_slice(&e, &[1, 5, hidden as i32]).as_dtype(COMPUTE_DTYPE).unwrap();
+        let embeds = Array::from_slice(&e, &[1, 5, hidden as i32])
+            .as_dtype(COMPUTE_DTYPE)
+            .unwrap();
         // feats[2,hidden]: row j filled with 100 + j.
         let mut f = Vec::new();
         for j in 0..2 {
@@ -1678,11 +1941,20 @@ mod tests {
         }
         let feats = Array::from_slice(&f, &[2, hidden as i32]);
 
-        let out = model.splice_image_features(&embeds, &ids, &feats, 49).unwrap();
+        let out = model
+            .splice_image_features(&embeds, &ids, &feats, 49)
+            .unwrap();
         assert_eq!(out.shape(), &[1, 5, hidden as i32]);
-        let v = out.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>().to_vec();
+        let v = out
+            .as_dtype(Dtype::Float32)
+            .unwrap()
+            .as_slice::<f32>()
+            .to_vec();
         let row = |r: usize| v[r * hidden]; // first element of each row (whole row is constant)
-        assert_eq!([row(0), row(1), row(2), row(3), row(4)], [0.0, 100.0, 101.0, 3.0, 4.0]);
+        assert_eq!(
+            [row(0), row(1), row(2), row(3), row(4)],
+            [0.0, 100.0, 101.0, 3.0, 4.0]
+        );
     }
 
     /// DeepStack fusion is actually wired through the decoder: feeding non-zero tapped features
@@ -1699,16 +1971,22 @@ mod tests {
 
         let embeds = model.embed_input_ids(&ids_arr).unwrap();
         let feats = Array::from_slice(
-            &(0..4 * cfg.hidden_size).map(|i| (i % 7) as f32 * 0.1 - 0.3).collect::<Vec<_>>(),
+            &(0..4 * cfg.hidden_size)
+                .map(|i| (i % 7) as f32 * 0.1 - 0.3)
+                .collect::<Vec<_>>(),
             &[4, cfg.hidden_size],
         );
-        let spliced = model.splice_image_features(&embeds, &ids, &feats, img).unwrap();
+        let spliced = model
+            .splice_image_features(&embeds, &ids, &feats, img)
+            .unwrap();
         let (t, h, w, _delta) = model.mrope_positions(&ids, &grid, img, 2).unwrap();
         let visual_pos_mask: Vec<bool> = ids.iter().map(|&id| id == img).collect();
 
         let ds = |scale: f32| {
             Array::from_slice(
-                &(0..4 * cfg.hidden_size).map(|i| (i % 5) as f32 * scale + 0.05).collect::<Vec<_>>(),
+                &(0..4 * cfg.hidden_size)
+                    .map(|i| (i % 5) as f32 * scale + 0.05)
+                    .collect::<Vec<_>>(),
                 &[4, cfg.hidden_size],
             )
         };
@@ -1737,15 +2015,38 @@ mod tests {
             .unwrap();
 
         assert_eq!(fused.shape(), &[1, cfg.vocab_size]);
-        let fv = fused.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>().to_vec();
-        let uv = unfused.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>().to_vec();
-        let bv = baseline.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>().to_vec();
+        let fv = fused
+            .as_dtype(Dtype::Float32)
+            .unwrap()
+            .as_slice::<f32>()
+            .to_vec();
+        let uv = unfused
+            .as_dtype(Dtype::Float32)
+            .unwrap()
+            .as_slice::<f32>()
+            .to_vec();
+        let bv = baseline
+            .as_dtype(Dtype::Float32)
+            .unwrap()
+            .as_slice::<f32>()
+            .to_vec();
         assert!(fv.iter().all(|x| x.is_finite()), "non-finite fused logit");
 
-        let unfused_vs_baseline = uv.iter().zip(&bv).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-        assert_eq!(unfused_vs_baseline, 0.0, "empty-deepstack path must equal plain embeds path");
+        let unfused_vs_baseline = uv
+            .iter()
+            .zip(&bv)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert_eq!(
+            unfused_vs_baseline, 0.0,
+            "empty-deepstack path must equal plain embeds path"
+        );
 
-        let fused_vs_unfused = fv.iter().zip(&uv).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        let fused_vs_unfused = fv
+            .iter()
+            .zip(&uv)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
         assert!(
             fused_vs_unfused > 1e-3,
             "DeepStack fusion did not change the logits (features dropped?): max abs diff {fused_vs_unfused}"
@@ -1765,8 +2066,16 @@ mod tests {
             &deepstack,
         )
         .unwrap();
-        let tv = via_trait.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>().to_vec();
-        let trait_vs_inherent = fv.iter().zip(&tv).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        let tv = via_trait
+            .as_dtype(Dtype::Float32)
+            .unwrap()
+            .as_slice::<f32>()
+            .to_vec();
+        let trait_vs_inherent = fv
+            .iter()
+            .zip(&tv)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
         assert_eq!(
             trait_vs_inherent, 0.0,
             "VlmDecode::prefill_with_deepstack must equal the inherent fused path (cache downcast seam)"
@@ -1790,9 +2099,12 @@ mod tests {
         let feat_val = [0.25f32, 0.5, 0.75];
         let deepstack: Vec<Array> = (0..taps.len())
             .map(|t| {
-                Array::from_slice(&vec![feat_val[t]; (num_visual * hidden) as usize], &[num_visual, hidden])
-                    .as_dtype(COMPUTE_DTYPE)
-                    .unwrap()
+                Array::from_slice(
+                    &vec![feat_val[t]; (num_visual * hidden) as usize],
+                    &[num_visual, hidden],
+                )
+                .as_dtype(COMPUTE_DTYPE)
+                .unwrap()
             })
             .collect();
 
@@ -1809,16 +2121,17 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(calls, (0..num_layers).collect::<Vec<_>>(), "every decoder layer must run once, in order");
+        assert_eq!(
+            calls,
+            (0..num_layers).collect::<Vec<_>>(),
+            "every decoder layer must run once, in order"
+        );
 
-        let unfused = deepstack_fused_decoder_layers(
-            &h0,
-            &visual_pos_mask,
-            &[],
-            num_layers,
-            |_i, h| Ok(multiply(h, &two)?),
-        )
-        .unwrap();
+        let unfused =
+            deepstack_fused_decoder_layers(&h0, &visual_pos_mask, &[], num_layers, |_i, h| {
+                Ok(multiply(h, &two)?)
+            })
+            .unwrap();
 
         let scale = 2f32.powi(num_layers as i32);
         let text_expected = v0 * scale;
@@ -1827,22 +2140,47 @@ mod tests {
                 .map(|t| feat_val[t] * 2f32.powi((num_layers - 1 - t) as i32))
                 .sum::<f32>();
 
-        let fv = fused.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>().to_vec();
-        let uv = unfused.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>().to_vec();
+        let fv = fused
+            .as_dtype(Dtype::Float32)
+            .unwrap()
+            .as_slice::<f32>()
+            .to_vec();
+        let uv = unfused
+            .as_dtype(Dtype::Float32)
+            .unwrap()
+            .as_slice::<f32>()
+            .to_vec();
         let row = |buf: &[f32], r: i32| buf[(r * hidden) as usize];
         for r in 0..seq {
             let got = row(&fv, r);
-            let want = if visual_pos_mask[r as usize] { visual_expected } else { text_expected };
-            assert!((got - want).abs() < 1e-1, "fused row {r}: got {got}, want {want}");
+            let want = if visual_pos_mask[r as usize] {
+                visual_expected
+            } else {
+                text_expected
+            };
+            assert!(
+                (got - want).abs() < 1e-1,
+                "fused row {r}: got {got}, want {want}"
+            );
         }
         assert!((visual_expected - 54.0).abs() < 1e-3);
         assert!((text_expected - 32.0).abs() < 1e-3);
 
         for r in 0..seq {
-            assert!((row(&uv, r) - text_expected).abs() < 1e-1, "unfused row {r} must skip injection");
+            assert!(
+                (row(&uv, r) - text_expected).abs() < 1e-1,
+                "unfused row {r} must skip injection"
+            );
         }
-        let fused_vs_unfused = fv.iter().zip(&uv).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-        assert!(fused_vs_unfused > 1.0, "fused path must differ from non-fused: max abs diff {fused_vs_unfused}");
+        let fused_vs_unfused = fv
+            .iter()
+            .zip(&uv)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            fused_vs_unfused > 1.0,
+            "fused path must differ from non-fused: max abs diff {fused_vs_unfused}"
+        );
     }
 
     /// Smoke: the full image+text path (embed → splice features → M-RoPE positions →
@@ -1857,15 +2195,24 @@ mod tests {
 
         let embeds = model.embed_input_ids(&ids_arr).unwrap();
         let feats = Array::from_slice(
-            &(0..4 * cfg.hidden_size).map(|i| (i % 7) as f32 * 0.1 - 0.3).collect::<Vec<_>>(),
+            &(0..4 * cfg.hidden_size)
+                .map(|i| (i % 7) as f32 * 0.1 - 0.3)
+                .collect::<Vec<_>>(),
             &[4, cfg.hidden_size],
         );
-        let spliced = model.splice_image_features(&embeds, &ids, &feats, img).unwrap();
+        let spliced = model
+            .splice_image_features(&embeds, &ids, &feats, img)
+            .unwrap();
         let (t, h, w, _delta) = model.mrope_positions(&ids, &grid, img, 2).unwrap();
         let logits = model
             .decode_logits_from_embeds(&spliced, [&t, &h, &w], &mut model.new_cache())
             .unwrap();
         assert_eq!(logits.shape(), &[1, cfg.vocab_size]);
-        assert!(logits.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>().iter().all(|x| x.is_finite()));
+        assert!(logits
+            .as_dtype(Dtype::Float32)
+            .unwrap()
+            .as_slice::<f32>()
+            .iter()
+            .all(|x| x.is_finite()));
     }
 }

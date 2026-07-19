@@ -15,7 +15,9 @@
 //! short caption.", 16 tokens). A divergence means the vision tower / projector / splice / decode
 //! port differs numerically from the reference.
 
-use core_llm::{Content, ImageRef, LoadSpec, Message, Role, Sampling, TextLlm, TextLlmRequest, Tokenizer};
+use core_llm::{
+    Content, ImageRef, LoadSpec, Message, Role, Sampling, TextLlm, TextLlmRequest, Tokenizer,
+};
 
 use mlx_llm::decode::CancelFlag;
 use mlx_llm::joycaption::{build_chat_text, JoyCaptionModel, JoyCaptionProvider, STOP_TOKENS};
@@ -25,7 +27,8 @@ use mlx_llm::primitives::sampler::SamplingParams;
 const GOLDEN: &[i32] = &[
     53304, 3257, 315, 264, 6573, 11, 10269, 11, 18004, 4092, 449, 912, 9621, 6302, 11, 30953,
 ];
-const GOLDEN_TEXT: &str = "Photograph of a solid, flat, gray background with no visible objects, textures";
+const GOLDEN_TEXT: &str =
+    "Photograph of a solid, flat, gray background with no visible objects, textures";
 
 fn snapshot() -> Option<String> {
     std::env::var("MLX_LLM_JOYCAPTION_SNAPSHOT").ok()
@@ -63,10 +66,17 @@ fn joycaption_model_matches_golden_tokens() {
     let tok = Tokenizer::from_file(format!("{snap}/tokenizer.json")).unwrap();
 
     let (pixels, w, h) = gray_image();
-    let features = model.image_features(&pixels, w as usize, h as usize).unwrap();
+    let features = model
+        .image_features(&pixels, w as usize, h as usize)
+        .unwrap();
 
     let chat = build_chat_text("Write a very short caption.");
-    let prompt_ids: Vec<i32> = tok.encode(&chat, false).unwrap().into_iter().map(|id| id as i32).collect();
+    let prompt_ids: Vec<i32> = tok
+        .encode(&chat, false)
+        .unwrap()
+        .into_iter()
+        .map(|id| id as i32)
+        .collect();
 
     let greedy = SamplingParams {
         temperature: 0.0,
@@ -76,13 +86,30 @@ fn joycaption_model_matches_golden_tokens() {
         repetition_context: 0,
     };
     let gen = model
-        .generate(&prompt_ids, &features, &greedy, 16, Some(0), STOP_TOKENS, &CancelFlag::new(), &mut |_, _| {})
+        .generate(
+            &prompt_ids,
+            &features,
+            &greedy,
+            16,
+            Some(0),
+            STOP_TOKENS,
+            &CancelFlag::new(),
+            &mut |_, _| {},
+        )
         .unwrap();
 
-    let text = tok.decode(&gen.tokens.iter().map(|&x| x as u32).collect::<Vec<_>>(), true).unwrap();
+    let text = tok
+        .decode(
+            &gen.tokens.iter().map(|&x| x as u32).collect::<Vec<_>>(),
+            true,
+        )
+        .unwrap();
     println!("tokens = {:?}", gen.tokens);
     println!("text   = {text:?}");
-    assert_eq!(gen.tokens, GOLDEN, "greedy tokens must match the reference engine");
+    assert_eq!(
+        gen.tokens, GOLDEN,
+        "greedy tokens must match the reference engine"
+    );
     assert_eq!(text.trim(), GOLDEN_TEXT);
 }
 
@@ -92,8 +119,11 @@ fn joycaption_model_matches_golden_tokens() {
 #[test]
 #[ignore = "needs MLX_LLM_JOYCAPTION_SNAPSHOT"]
 fn joycaption_resize_path_matches_golden() {
-    const GRAD: &[i32] = &[39212, 8278, 5497, 16850, 38336, 11, 34966, 11, 20779, 43546, 304, 43120];
-    const GRAD_TEXT: &str = "Digital abstract pattern featuring diagonal, colorful, gradient triangles in vivid";
+    const GRAD: &[i32] = &[
+        39212, 8278, 5497, 16850, 38336, 11, 34966, 11, 20779, 43546, 304, 43120,
+    ];
+    const GRAD_TEXT: &str =
+        "Digital abstract pattern featuring diagonal, colorful, gradient triangles in vivid";
 
     let Some(snap) = snapshot() else {
         eprintln!("skip: set MLX_LLM_JOYCAPTION_SNAPSHOT");
@@ -103,9 +133,16 @@ fn joycaption_resize_path_matches_golden() {
     let tok = Tokenizer::from_file(format!("{snap}/tokenizer.json")).unwrap();
 
     let (pixels, w, h) = gradient_image();
-    let features = model.image_features(&pixels, w as usize, h as usize).unwrap();
+    let features = model
+        .image_features(&pixels, w as usize, h as usize)
+        .unwrap();
     let chat = build_chat_text("Write a very short caption.");
-    let prompt_ids: Vec<i32> = tok.encode(&chat, false).unwrap().into_iter().map(|id| id as i32).collect();
+    let prompt_ids: Vec<i32> = tok
+        .encode(&chat, false)
+        .unwrap()
+        .into_iter()
+        .map(|id| id as i32)
+        .collect();
     let greedy = SamplingParams {
         temperature: 0.0,
         top_p: 1.0,
@@ -114,11 +151,28 @@ fn joycaption_resize_path_matches_golden() {
         repetition_context: 0,
     };
     let gen = model
-        .generate(&prompt_ids, &features, &greedy, 12, Some(0), STOP_TOKENS, &CancelFlag::new(), &mut |_, _| {})
+        .generate(
+            &prompt_ids,
+            &features,
+            &greedy,
+            12,
+            Some(0),
+            STOP_TOKENS,
+            &CancelFlag::new(),
+            &mut |_, _| {},
+        )
         .unwrap();
-    let text = tok.decode(&gen.tokens.iter().map(|&x| x as u32).collect::<Vec<_>>(), true).unwrap();
+    let text = tok
+        .decode(
+            &gen.tokens.iter().map(|&x| x as u32).collect::<Vec<_>>(),
+            true,
+        )
+        .unwrap();
     println!("resize tokens = {:?}\nresize text = {text:?}", gen.tokens);
-    assert_eq!(gen.tokens, GRAD, "resized-image greedy tokens must match the reference engine");
+    assert_eq!(
+        gen.tokens, GRAD,
+        "resized-image greedy tokens must match the reference engine"
+    );
     assert_eq!(text.trim(), GRAD_TEXT);
 }
 
@@ -165,8 +219,16 @@ fn joycaption_provider_streams_caption_through_contract() {
         .unwrap();
 
     println!("streamed = {streamed:?}");
-    assert_eq!(out.text.trim(), GOLDEN_TEXT, "provider caption must match the reference engine");
-    assert_eq!(streamed.trim(), GOLDEN_TEXT, "streamed deltas must reconstruct the caption");
+    assert_eq!(
+        out.text.trim(),
+        GOLDEN_TEXT,
+        "provider caption must match the reference engine"
+    );
+    assert_eq!(
+        streamed.trim(),
+        GOLDEN_TEXT,
+        "streamed deltas must reconstruct the caption"
+    );
     assert!(saw_done);
     assert_eq!(out.usage.generated_tokens, 16);
     assert!(tokens >= 1);

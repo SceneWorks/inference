@@ -72,14 +72,26 @@ fn qwen35_vision_grounds_on_image() {
 
     // Two solid colors: a correct vision path names each; a broken one (preprocess / encoder / splice
     // / M-RoPE) cannot ground reliably, and certainly not on both.
-    for (rgb, want, label) in [([205u8, 35, 35], "red", "red"), ([35u8, 70, 200], "blue", "blue")] {
+    for (rgb, want, label) in [
+        ([205u8, 35, 35], "red", "red"),
+        ([35u8, 70, 200], "blue", "blue"),
+    ] {
         let img = solid_image(256, 256, rgb);
         let (out, content) = run(
             &p,
-            &image_request(img, "What is the dominant color of this image? Answer with one word."),
+            &image_request(
+                img,
+                "What is the dominant color of this image? Answer with one word.",
+            ),
         );
-        println!("\n=== qwen3.6 VISION ({label}) ===\n[answer] {:?}\n", out.text);
-        assert!(!content.trim().is_empty(), "{label}: must produce an answer");
+        println!(
+            "\n=== qwen3.6 VISION ({label}) ===\n[answer] {:?}\n",
+            out.text
+        );
+        assert!(
+            !content.trim().is_empty(),
+            "{label}: must produce an answer"
+        );
         assert!(
             content.to_lowercase().contains(want),
             "{label}: greedy answer must ground on the image and name '{want}', got: {content:?}"

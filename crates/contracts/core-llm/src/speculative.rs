@@ -60,7 +60,11 @@ pub fn ngram_propose(tokens: &[i32], max_ngram: usize, max_proposal: usize) -> V
 /// `target_argmax.len()` must be `drafts.len() + 1` (one extra for the always-present bonus). Returns
 /// a value in `0..=drafts.len()`.
 pub fn accept_greedy_run(target_argmax: &[i32], drafts: &[i32]) -> usize {
-    debug_assert_eq!(target_argmax.len(), drafts.len() + 1, "need a bonus slot past the drafts");
+    debug_assert_eq!(
+        target_argmax.len(),
+        drafts.len() + 1,
+        "need a bonus slot past the drafts"
+    );
     let mut accepted = 0;
     while accepted < drafts.len() && target_argmax[accepted] == drafts[accepted] {
         accepted += 1;
@@ -154,7 +158,11 @@ pub fn sample_weighted(candidates: &[(i32, f32)], u: f32, fallback: i32) -> i32 
 
 /// Weight of `token` in a candidate set (`0` if absent).
 fn weight_of(candidates: &[(i32, f32)], token: i32) -> f32 {
-    candidates.iter().find(|&&(t, _)| t == token).map(|&(_, w)| w).unwrap_or(0.0)
+    candidates
+        .iter()
+        .find(|&&(t, _)| t == token)
+        .map(|&(_, w)| w)
+        .unwrap_or(0.0)
 }
 
 #[cfg(test)]
@@ -252,7 +260,10 @@ mod tests {
         assert!((q_total - 1.0).abs() < 1e-6);
         for (i, &(_, pi)) in p.iter().enumerate() {
             let emp = counts[i] as f32 / n as f32;
-            assert!((emp - pi).abs() < 0.01, "token {i}: empirical {emp} vs target {pi}");
+            assert!(
+                (emp - pi).abs() < 0.01,
+                "token {i}: empirical {emp} vs target {pi}"
+            );
         }
     }
 
@@ -264,6 +275,9 @@ mod tests {
         assert_eq!(accept_token(&p, &q, 3, 0.999, 0.5), Acceptance::Accepted(3));
         let p2 = [(3, 1.0f32)];
         let q2 = [(1, 1.0f32)];
-        assert_eq!(accept_token(&p2, &q2, 1, 0.999, 0.5), Acceptance::Rejected(3));
+        assert_eq!(
+            accept_token(&p2, &q2, 1, 0.999, 0.5),
+            Acceptance::Rejected(3)
+        );
     }
 }

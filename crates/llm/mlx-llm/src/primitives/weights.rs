@@ -101,16 +101,16 @@ mod tests {
     #[test]
     fn require_and_get_on_in_memory_map() {
         let mut m = HashMap::new();
-        m.insert("a.weight".to_string(), Array::from_slice(&[1.0f32, 2.0], &[2]));
+        m.insert(
+            "a.weight".to_string(),
+            Array::from_slice(&[1.0f32, 2.0], &[2]),
+        );
         let w = Weights::from_map(m);
         assert_eq!(w.len(), 1);
         assert!(w.contains("a.weight"));
         assert!(w.require("a.weight").is_ok());
         assert!(w.get("missing").is_none());
-        assert!(matches!(
-            w.require("missing"),
-            Err(Error::MissingTensor(_))
-        ));
+        assert!(matches!(w.require("missing"), Err(Error::MissingTensor(_))));
     }
 
     #[test]

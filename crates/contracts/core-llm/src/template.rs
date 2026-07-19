@@ -228,7 +228,8 @@ impl ChatTemplate for JinjaChatTemplate {
                 // tool template re-renders. Inserted only when present, so a `message.tool_calls`
                 // truthiness test is false otherwise.
                 if !m.tool_calls.is_empty() {
-                    let calls: Vec<Json> = m.tool_calls.iter().map(|c| c.to_template_json()).collect();
+                    let calls: Vec<Json> =
+                        m.tool_calls.iter().map(|c| c.to_template_json()).collect();
                     map.insert("tool_calls".into(), Json::Array(calls));
                 }
                 Json::Object(map)
@@ -241,7 +242,10 @@ impl ChatTemplate for JinjaChatTemplate {
         // `Value::UNDEFINED` would not read as undefined to that test.
         let mut ctx: BTreeMap<&str, Value> = BTreeMap::new();
         ctx.insert("messages", Value::from_serialize(&msgs));
-        ctx.insert("add_generation_prompt", Value::from(opts.add_generation_prompt));
+        ctx.insert(
+            "add_generation_prompt",
+            Value::from(opts.add_generation_prompt),
+        );
         ctx.insert("bos_token", Value::from(self.bos_token.clone()));
         ctx.insert("eos_token", Value::from(self.eos_token.clone()));
         if let Some(enable_thinking) = opts.enable_thinking {
@@ -294,7 +298,9 @@ fn extract_chat_template(config: &serde_json::Value) -> Option<String> {
                 .iter()
                 .find(|e| e.get("name").and_then(|n| n.as_str()) == Some("default"))
                 .or_else(|| entries.first())?;
-            pick.get("template").and_then(|t| t.as_str()).map(String::from)
+            pick.get("template")
+                .and_then(|t| t.as_str())
+                .map(String::from)
         }
         _ => None,
     }
@@ -339,8 +345,18 @@ fn format_date(fmt: &str, y: i64, m: u32, d: u32) -> String {
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ];
     const FULL: [&str; 12] = [
-        "January", "February", "March", "April", "May", "June", "July", "August", "September",
-        "October", "November", "December",
+        "January",
+        "February",
+        "March",
+        "April",
+        "May",
+        "June",
+        "July",
+        "August",
+        "September",
+        "October",
+        "November",
+        "December",
     ];
     let mut out = String::new();
     let mut chars = fmt.chars().peekable();
@@ -490,7 +506,10 @@ mod tests {
         let t = JinjaChatTemplate::new(QWEN36_TOOLS_BRANCH);
         let tools = [weather_tool()];
         let out = t
-            .render_with(&[Message::user("hi")], &RenderOptions::generation().with_tools(&tools))
+            .render_with(
+                &[Message::user("hi")],
+                &RenderOptions::generation().with_tools(&tools),
+            )
             .unwrap();
         // The tool renders in the OpenAI function shape, keys in insertion order (preserve_order).
         assert_eq!(
@@ -538,19 +557,26 @@ mod tests {
         // offers a tool renders the `<tools>` section + the call format instructions, and a prior
         // assistant tool_call turn re-renders as the `<function=…>` / `<parameter=…>` XML.
         let dir = std::env::var("MLX_LLM_QWEN35_MODEL").expect("set MLX_LLM_QWEN35_MODEL");
-        let t = JinjaChatTemplate::from_tokenizer_config_file(format!("{dir}/tokenizer_config.json"))
-            .expect("load real Qwen3.6 chat template");
+        let t =
+            JinjaChatTemplate::from_tokenizer_config_file(format!("{dir}/tokenizer_config.json"))
+                .expect("load real Qwen3.6 chat template");
 
         let tools = [weather_tool()];
         let offered = t
-            .render_with(&[Message::user("weather in Paris?")], &RenderOptions::generation().with_tools(&tools))
+            .render_with(
+                &[Message::user("weather in Paris?")],
+                &RenderOptions::generation().with_tools(&tools),
+            )
             .unwrap();
         assert!(offered.contains("<tools>"), "tools section: {offered}");
         assert!(
             offered.contains("{\"type\":\"function\",\"function\":{\"name\":\"get_weather\""),
             "tool json: {offered}"
         );
-        assert!(offered.contains("<tool_call>"), "call-format instructions: {offered}");
+        assert!(
+            offered.contains("<tool_call>"),
+            "call-format instructions: {offered}"
+        );
 
         let mut args = serde_json::Map::new();
         args.insert("location".into(), serde_json::json!("Paris"));
@@ -580,8 +606,9 @@ mod tests {
         use crate::message::{Content, ImageRef};
 
         let dir = std::env::var("MLX_LLM_QWEN35_MODEL").expect("set MLX_LLM_QWEN35_MODEL");
-        let t = JinjaChatTemplate::from_tokenizer_config_file(format!("{dir}/tokenizer_config.json"))
-            .expect("load real Qwen3.6 chat template");
+        let t =
+            JinjaChatTemplate::from_tokenizer_config_file(format!("{dir}/tokenizer_config.json"))
+                .expect("load real Qwen3.6 chat template");
 
         // ChatML structure: a user turn renders as an `<|im_start|>user … <|im_end|>` block.
         let chatml = t.render(&[Message::user("Hello")], false).unwrap();
@@ -595,7 +622,10 @@ mod tests {
         // model produces its own. (Generation prompt is the tail of the rendered string.)
         let msgs = [Message::user("What is 2+2?")];
         let disabled = t
-            .render_with(&msgs, &RenderOptions::generation().with_enable_thinking(Some(false)))
+            .render_with(
+                &msgs,
+                &RenderOptions::generation().with_enable_thinking(Some(false)),
+            )
             .unwrap();
         assert!(
             disabled.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"),
@@ -607,7 +637,10 @@ mod tests {
             "auto opens <think>: {auto}"
         );
         let enabled = t
-            .render_with(&msgs, &RenderOptions::generation().with_enable_thinking(Some(true)))
+            .render_with(
+                &msgs,
+                &RenderOptions::generation().with_enable_thinking(Some(true)),
+            )
             .unwrap();
         assert!(
             enabled.ends_with("<|im_start|>assistant\n<think>\n"),
@@ -654,7 +687,10 @@ mod tests {
             tool_calls: Vec::new(),
         };
         let img_rendered = t.render(std::slice::from_ref(&with_image), false).unwrap();
-        assert!(img_rendered.contains("describe this"), "text kept: {img_rendered}");
+        assert!(
+            img_rendered.contains("describe this"),
+            "text kept: {img_rendered}"
+        );
         assert!(
             !img_rendered.contains("<|image_pad|>"),
             "the template does NOT insert vision tokens for flattened content — the provider \
@@ -708,8 +744,10 @@ mod tests {
         // provider's substituted placeholder text passes through verbatim).
         use crate::message::{Content, ImageRef, Role, VideoRef};
         let Some(dir) = qwen3vl_snapshot_dir() else {
-            eprintln!("skipping qwen3vl_real_template_chatml_tools_and_vision: Qwen3-VL-8B snapshot \
-                       not present (set MLX_LLM_QWEN3VL_MODEL or QWEN3VL_SNAPSHOT)");
+            eprintln!(
+                "skipping qwen3vl_real_template_chatml_tools_and_vision: Qwen3-VL-8B snapshot \
+                       not present (set MLX_LLM_QWEN3VL_MODEL or QWEN3VL_SNAPSHOT)"
+            );
             return;
         };
         let t = JinjaChatTemplate::from_tokenizer_config_file(dir.join("tokenizer_config.json"))
@@ -731,13 +769,22 @@ mod tests {
 
         // ChatML structure + the generation-prompt tail.
         let chatml = t.render(&[Message::user("Hello")], true).unwrap();
-        assert!(chatml.contains("<|im_start|>user\nHello<|im_end|>\n"), "ChatML user block: {chatml}");
-        assert!(chatml.ends_with("<|im_start|>assistant\n"), "generation prompt tail: {chatml}");
+        assert!(
+            chatml.contains("<|im_start|>user\nHello<|im_end|>\n"),
+            "ChatML user block: {chatml}"
+        );
+        assert!(
+            chatml.ends_with("<|im_start|>assistant\n"),
+            "generation prompt tail: {chatml}"
+        );
 
         // Tools section: offering a tool renders the `<tools>` block with the OpenAI function json.
         let tools = [weather_tool()];
         let offered = t
-            .render_with(&[Message::user("weather in Paris?")], &RenderOptions::generation().with_tools(&tools))
+            .render_with(
+                &[Message::user("weather in Paris?")],
+                &RenderOptions::generation().with_tools(&tools),
+            )
             .unwrap();
         assert!(offered.contains("<tools>"), "tools section: {offered}");
         assert!(
@@ -758,7 +805,10 @@ mod tests {
             tool_calls: Vec::new(),
         };
         let img_rendered = t.render(std::slice::from_ref(&with_image), false).unwrap();
-        assert!(img_rendered.contains("describe this"), "text kept: {img_rendered}");
+        assert!(
+            img_rendered.contains("describe this"),
+            "text kept: {img_rendered}"
+        );
         assert!(
             !img_rendered.contains("<|image_pad|>"),
             "flattened content must NOT insert vision tokens — the provider substitutes the \
@@ -770,7 +820,9 @@ mod tests {
         // branch (one `<|image_pad|>` per image, expanded to the patch count after tokenizing).
         let substituted = t
             .render(
-                &[Message::user("<|vision_start|><|image_pad|><|vision_end|>describe this")],
+                &[Message::user(
+                    "<|vision_start|><|image_pad|><|vision_end|>describe this",
+                )],
                 false,
             )
             .unwrap();
@@ -792,7 +844,10 @@ mod tests {
             tool_calls: Vec::new(),
         };
         let vid_rendered = t.render(std::slice::from_ref(&with_video), false).unwrap();
-        assert!(vid_rendered.contains("what happens"), "video-turn text kept: {vid_rendered}");
+        assert!(
+            vid_rendered.contains("what happens"),
+            "video-turn text kept: {vid_rendered}"
+        );
         assert!(
             !vid_rendered.contains("<|video_pad|>"),
             "flattened video content must NOT insert video tokens — the provider substitutes the \
@@ -825,7 +880,10 @@ mod tests {
             "eos_token": { "content": "</s>", "lstrip": false }
         });
         let t = JinjaChatTemplate::from_tokenizer_config(&cfg).unwrap();
-        assert_eq!(t.render(&[Message::user("hi")], false).unwrap(), "<s>user:hi</s>");
+        assert_eq!(
+            t.render(&[Message::user("hi")], false).unwrap(),
+            "<s>user:hi</s>"
+        );
     }
 
     #[test]
@@ -867,17 +925,27 @@ mod tests {
         // `render` / the pre-fix behavior produced, and is why no-think was previously unreachable.
         let auto = t.render_with(&msgs, &RenderOptions::generation()).unwrap();
         assert_eq!(auto, "<|im_start|>assistant\n");
-        assert_eq!(t.render(&msgs, true).unwrap(), auto, "render == render_with(Auto)");
+        assert_eq!(
+            t.render(&msgs, true).unwrap(),
+            auto,
+            "render == render_with(Auto)"
+        );
 
         // Enabled ⇒ defined and true ⇒ branch (which only fires on `is false`) does not inject.
         let enabled = t
-            .render_with(&msgs, &RenderOptions::generation().with_enable_thinking(Some(true)))
+            .render_with(
+                &msgs,
+                &RenderOptions::generation().with_enable_thinking(Some(true)),
+            )
             .unwrap();
         assert_eq!(enabled, "<|im_start|>assistant\n");
 
         // Disabled ⇒ defined and false ⇒ the empty think block is injected (no-think now reachable).
         let disabled = t
-            .render_with(&msgs, &RenderOptions::generation().with_enable_thinking(Some(false)))
+            .render_with(
+                &msgs,
+                &RenderOptions::generation().with_enable_thinking(Some(false)),
+            )
             .unwrap();
         assert_eq!(disabled, "<|im_start|>assistant\n<think>\n\n</think>\n\n");
     }
@@ -904,9 +972,15 @@ mod tests {
     #[test]
     fn jinja_reasoning_kept_for_latest_turn() {
         let t = JinjaChatTemplate::new(REASONING_RETENTION);
-        let msgs = [Message::user("q1"), Message::assistant("A1").with_thinking("R1")];
+        let msgs = [
+            Message::user("q1"),
+            Message::assistant("A1").with_thinking("R1"),
+        ];
         let out = t.render(&msgs, false).unwrap();
-        assert!(out.contains("<|im_start|>assistant\n<think>\nR1\n</think>\n\nA1<|im_end|>"), "{out}");
+        assert!(
+            out.contains("<|im_start|>assistant\n<think>\nR1\n</think>\n\nA1<|im_end|>"),
+            "{out}"
+        );
     }
 
     #[test]
@@ -921,7 +995,10 @@ mod tests {
         ];
         let out = t.render(&msgs, false).unwrap();
         assert!(out.contains("<|im_start|>assistant\nA1<|im_end|>"), "{out}");
-        assert!(!out.contains("<think>"), "prior-turn reasoning must be stripped: {out}");
+        assert!(
+            !out.contains("<think>"),
+            "prior-turn reasoning must be stripped: {out}"
+        );
     }
 
     #[test]
@@ -931,8 +1008,9 @@ mod tests {
         // Message::thinking re-renders the reasoning for the latest assistant turn and the template's
         // own policy strips it once a newer user turn follows.
         let dir = std::env::var("MLX_LLM_QWEN3_MODEL").expect("set MLX_LLM_QWEN3_MODEL");
-        let t = JinjaChatTemplate::from_tokenizer_config_file(format!("{dir}/tokenizer_config.json"))
-            .expect("load real Qwen3 chat template");
+        let t =
+            JinjaChatTemplate::from_tokenizer_config_file(format!("{dir}/tokenizer_config.json"))
+                .expect("load real Qwen3 chat template");
 
         // Assistant is the most recent turn → its reasoning is re-emitted from reasoning_content.
         let latest = [
@@ -952,7 +1030,10 @@ mod tests {
             Message::user("And 3+3?"),
         ];
         let rendered = t.render_with(&prior, &RenderOptions::generation()).unwrap();
-        assert!(rendered.contains("<|im_start|>assistant\n2+2 is 4.<|im_end|>"), "{rendered}");
+        assert!(
+            rendered.contains("<|im_start|>assistant\n2+2 is 4.<|im_end|>"),
+            "{rendered}"
+        );
         assert!(
             !rendered.contains("The user asks 2+2"),
             "prior-turn reasoning must be stripped by Qwen3's template: {rendered}"

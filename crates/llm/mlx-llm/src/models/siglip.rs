@@ -19,9 +19,9 @@ use mlx_rs::ops::add;
 use mlx_rs::Array;
 
 use crate::error::{Error, Result};
+use crate::primitives::attention::AttnMask;
 use crate::primitives::nn::{conv2d, gelu_tanh, layer_norm, linear};
 use crate::primitives::sdpa;
-use crate::primitives::attention::AttnMask;
 use crate::primitives::Weights;
 
 /// Geometry of a SigLIP vision tower.
@@ -108,7 +108,9 @@ impl SiglipVisionTower {
             .require(&p("embeddings.patch_embedding.weight"))?
             .transpose_axes(&[0, 2, 3, 1])?;
         let patch_bias = w.get(&p("embeddings.patch_embedding.bias")).cloned();
-        let position_embedding = w.require(&p("embeddings.position_embedding.weight"))?.clone();
+        let position_embedding = w
+            .require(&p("embeddings.position_embedding.weight"))?
+            .clone();
         let layers = (0..cfg.num_hidden_layers)
             .map(|i| SiglipEncoderLayer::from_weights(w, &p(&format!("encoder.layers.{i}")), &cfg))
             .collect::<Result<Vec<_>>>()?;
@@ -134,9 +136,9 @@ impl SiglipVisionTower {
             0,
         )?;
         let patches = patches.reshape(&[b, self.cfg.num_patches(), self.cfg.hidden_size])?;
-        let pos = self
-            .position_embedding
-            .reshape(&[1, self.cfg.num_patches(), self.cfg.hidden_size])?;
+        let pos =
+            self.position_embedding
+                .reshape(&[1, self.cfg.num_patches(), self.cfg.hidden_size])?;
         Ok(add(&patches, &pos)?)
     }
 
@@ -256,9 +258,9 @@ impl SiglipAttention {
         let v = to_heads(linear(x, &self.v_w, self.v_b.as_ref())?)?;
         // SigLIP attention is fully bidirectional — no mask.
         let out = sdpa(&q, &k, &v, self.scale, AttnMask::None)?;
-        let out = out
-            .transpose_axes(&[0, 2, 1, 3])?
-            .reshape(&[b, n, self.num_heads * self.head_dim])?;
+        let out =
+            out.transpose_axes(&[0, 2, 1, 3])?
+                .reshape(&[b, n, self.num_heads * self.head_dim])?;
         linear(&out, &self.out_w, self.out_b.as_ref())
     }
 }
@@ -319,8 +321,14 @@ mod tests {
             last_hidden_state: hs[2].clone(),
             hidden_states: hs,
         };
-        assert_eq!(select_vision_feature(&out, -2).unwrap().as_slice::<f32>(), &[2.0]);
+        assert_eq!(
+            select_vision_feature(&out, -2).unwrap().as_slice::<f32>(),
+            &[2.0]
+        );
         assert!(select_vision_feature(&out, -4).is_err());
-        assert_eq!(select_vision_feature(&out, 0).unwrap().as_slice::<f32>(), &[1.0]);
+        assert_eq!(
+            select_vision_feature(&out, 0).unwrap().as_slice::<f32>(),
+            &[1.0]
+        );
     }
 }

@@ -42,7 +42,8 @@ pub use chunk::{map_seq_chunks, MemoryConfig};
 pub use config::{
     Flux2Config, Flux2Quant, Flux2Variant, DEFAULT_GUIDANCE, DEFAULT_GUIDANCE_DEV, DEFAULT_HEIGHT,
     DEFAULT_STEPS, DEFAULT_STEPS_DEV, DEFAULT_WIDTH, FLUX2_DEV_CONTROL_ID, FLUX2_DEV_EDIT_ID,
-    FLUX2_DEV_ID, FLUX2_KLEIN_9B_EDIT_ID, FLUX2_KLEIN_9B_ID, FLUX2_KLEIN_9B_KV_EDIT_ID, SIZE_MULTIPLE,
+    FLUX2_DEV_ID, FLUX2_KLEIN_9B_EDIT_ID, FLUX2_KLEIN_9B_ID, FLUX2_KLEIN_9B_KV_EDIT_ID,
+    SIZE_MULTIPLE,
 };
 pub use convert::{
     build_target_state_dict, convert_and_assemble, quantize_flux2_dit, quantize_flux2_text_encoder,

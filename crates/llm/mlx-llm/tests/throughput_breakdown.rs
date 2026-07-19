@@ -85,12 +85,16 @@ fn synth(shape: &[i32]) -> Array {
 fn grown_caches(cfg: &ModelConfig, n: usize, l: usize) -> Vec<PagedKvCache> {
     let pool = BlockPool::new(BLOCK);
     let (kvh, hd) = (cfg.num_kv_heads, cfg.head_dim);
-    let mut caches: Vec<PagedKvCache> =
-        (0..n).map(|_| PagedKvCache::with_pool(pool.clone(), cfg.num_layers)).collect();
+    let mut caches: Vec<PagedKvCache> = (0..n)
+        .map(|_| PagedKvCache::with_pool(pool.clone(), cfg.num_layers))
+        .collect();
     for c in caches.iter_mut() {
         let mut outs = Vec::with_capacity(cfg.num_layers * 2);
         for layer in 0..cfg.num_layers {
-            let (k, v) = (synth(&[1, kvh, l as i32, hd]), synth(&[1, kvh, l as i32, hd]));
+            let (k, v) = (
+                synth(&[1, kvh, l as i32, hd]),
+                synth(&[1, kvh, l as i32, hd]),
+            );
             let (k_all, v_all) = c.update(layer, &k, &v).unwrap();
             outs.push(k_all);
             outs.push(v_all);
@@ -116,7 +120,9 @@ fn timed(mut f: impl FnMut()) -> f64 {
 fn full_step(model: &CausalLm, caches: &mut [PagedKvCache], ids: &Array) {
     let positions: Vec<i32> = caches.iter().map(|c| c.offset()).collect();
     let mut refs: Vec<&mut PagedKvCache> = caches.iter_mut().collect();
-    let logits = model.decode_logits_per_seq(ids, &mut refs, &positions).unwrap();
+    let logits = model
+        .decode_logits_per_seq(ids, &mut refs, &positions)
+        .unwrap();
     eval(std::iter::once(&logits)).unwrap();
 }
 
@@ -179,7 +185,11 @@ fn breakdown(name: &str, model: &CausalLm) {
     for &n in NS {
         println!(
             "\n  N = {n} occupancy{}",
-            if n == NS[0] { "   [L=context tokens, tok/s = N·1000/T_full]" } else { "" }
+            if n == NS[0] {
+                "   [L=context tokens, tok/s = N·1000/T_full]"
+            } else {
+                ""
+            }
         );
         println!(
             "    {:>5} | {:>8} | {:>8} | {:>8} | {:>8} | {:>8} | {:>6} | {:>8}",
@@ -192,7 +202,11 @@ fn breakdown(name: &str, model: &CausalLm) {
             // transient per-step gather it sits beside.
             let est = 2 * kv_bytes(cfg, n, l);
             if est > KV_BUDGET_BYTES {
-                println!("    {l:>5} | SKIPPED — est resident {:.1} GB > {:.0} GB budget", est as f64 / 1e9, KV_BUDGET_BYTES as f64 / 1e9);
+                println!(
+                    "    {l:>5} | SKIPPED — est resident {:.1} GB > {:.0} GB budget",
+                    est as f64 / 1e9,
+                    KV_BUDGET_BYTES as f64 / 1e9
+                );
                 continue;
             }
             // T_full on its own caches; C_gather on a fresh set at the same L; C_sdpa from shapes.
@@ -206,7 +220,11 @@ fn breakdown(name: &str, model: &CausalLm) {
             let c_gather = timed(|| gather_step(&mut gcaches, cfg, &k1, &v1));
             drop(gcaches);
 
-            let (q, k, v) = (synth(&[1, h, 1, hd]), synth(&[1, kvh, l as i32, hd]), synth(&[1, kvh, l as i32, hd]));
+            let (q, k, v) = (
+                synth(&[1, h, 1, hd]),
+                synth(&[1, kvh, l as i32, hd]),
+                synth(&[1, kvh, l as i32, hd]),
+            );
             let c_sdpa = timed(|| sdpa_step(&q, &k, &v, cfg.attn_scale(), cfg.num_layers, n));
 
             let attn = c_gather + c_sdpa;
@@ -214,7 +232,7 @@ fn breakdown(name: &str, model: &CausalLm) {
             let attn_pct = 100.0 * attn / t_full;
             let toks = n as f64 * 1000.0 / t_full;
             drop((q, k, v)); // release this cell's SDPA tensors before evicting
-            // Evict freed KV back to the OS before the next cell so resident memory cannot climb.
+                             // Evict freed KV back to the OS before the next cell so resident memory cannot climb.
             memory::clear_cache();
             println!(
                 "    {l:>5} | {t_full:>8.3} | {c_gather:>8.3} | {c_sdpa:>8.3} | {attn:>8.3} | {matmul:>8.3} | {attn_pct:>5.0}% | {toks:>8.0}  (active {:.1} GB)",
@@ -282,8 +300,15 @@ fn fused_sdpa_sweep(q: &Array, k: &Array, v: &Array, scale: f32, layers: usize) 
     let mut outs = Vec::with_capacity(layers);
     for _ in 0..layers {
         outs.push(
-            scaled_dot_product_attention(q, k, v, scale, Some(ScaledDotProductAttentionMask::Causal), None)
-                .unwrap(),
+            scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                scale,
+                Some(ScaledDotProductAttentionMask::Causal),
+                None,
+            )
+            .unwrap(),
         );
     }
     eval(outs.iter()).unwrap();
@@ -325,8 +350,13 @@ fn prefill_breakdown(name: &str, model: &CausalLm) {
     memory::set_memory_limit(MLX_MEMORY_LIMIT);
     memory::set_cache_limit(MLX_CACHE_LIMIT);
     let cfg = model.config();
-    let (h, kvh, hd, layers, scale) =
-        (cfg.num_heads, cfg.num_kv_heads, cfg.head_dim, cfg.num_layers, cfg.attn_scale());
+    let (h, kvh, hd, layers, scale) = (
+        cfg.num_heads,
+        cfg.num_kv_heads,
+        cfg.head_dim,
+        cfg.num_layers,
+        cfg.attn_scale(),
+    );
     println!(
         "\n================ {name}: {layers} layers, {h} heads / {kvh} kv (groups {}), head_dim {hd} ================",
         h / kvh
@@ -335,7 +365,16 @@ fn prefill_breakdown(name: &str, model: &CausalLm) {
     println!("S=1,8 are below the chunk gate (q_len>8) ⇒ sdpa==fused ⇒ slowdown≈1.0 = decode/short prefill untouched.");
     println!(
         "    {:>5} | {:>7} | {:>9} | {:>9} | {:>9} | {:>8} | {:>8} | {:>10} | {:>10} | {:>7}",
-        "S", "chunks", "T_after", "fused", "chunked", "ΔSDPA", "slow×", "tok/s_aft", "tok/s_bef", "regr%"
+        "S",
+        "chunks",
+        "T_after",
+        "fused",
+        "chunked",
+        "ΔSDPA",
+        "slow×",
+        "tok/s_aft",
+        "tok/s_bef",
+        "regr%"
     );
 
     let mut cache = ContiguousKvCache::new(layers);

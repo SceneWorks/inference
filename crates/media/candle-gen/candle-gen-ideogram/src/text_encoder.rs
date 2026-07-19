@@ -389,7 +389,10 @@ mod tests {
         assert_eq!(out_f32.dims(), &[1, 4, 12]);
         let a = out_f32.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         let b = out_bf16.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        assert!(a.iter().all(|x| x.is_finite()), "prompt embeds must be finite");
+        assert!(
+            a.iter().all(|x| x.is_finite()),
+            "prompt embeds must be finite"
+        );
         assert_eq!(
             a, b,
             "bf16-store prompt_embeds must be bit-identical to the f32-store forward"

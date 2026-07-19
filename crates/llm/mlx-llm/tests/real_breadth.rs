@@ -25,7 +25,11 @@ fn assert_streams_coherent(env: &str, family: &str) {
         return;
     };
     let provider = load_textllm(PROVIDER_ID, &LoadSpec::dense(&dir)).expect("load provider");
-    assert_eq!(provider.descriptor().id, PROVIDER_ID, "resolved provider id");
+    assert_eq!(
+        provider.descriptor().id,
+        PROVIDER_ID,
+        "resolved provider id"
+    );
     assert_eq!(provider.descriptor().family, family, "reported family tag");
 
     let req = TextLlmRequest {
@@ -47,7 +51,10 @@ fn assert_streams_coherent(env: &str, family: &str) {
 
     println!("[{family}] {}", out.text.replace('\n', " "));
     assert!(!out.text.trim().is_empty(), "{family}: produced no text");
-    assert_eq!(streamed, out.text, "{family}: streamed deltas must reconstruct the final text");
+    assert_eq!(
+        streamed, out.text,
+        "{family}: streamed deltas must reconstruct the final text"
+    );
     assert!(
         out.text.chars().any(|c| c.is_alphabetic()),
         "{family}: output should contain words, not just punctuation"

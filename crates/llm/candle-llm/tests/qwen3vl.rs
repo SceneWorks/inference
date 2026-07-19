@@ -91,8 +91,14 @@ fn qwen3vl_vision_grounds_on_image() {
                 "What is the dominant color of this image? Answer with one word.",
             ),
         );
-        println!("\n=== Qwen3-VL VISION ({label}) ===\n[answer] {:?}\n", out.text);
-        assert!(!content.trim().is_empty(), "{label}: must produce an answer");
+        println!(
+            "\n=== Qwen3-VL VISION ({label}) ===\n[answer] {:?}\n",
+            out.text
+        );
+        assert!(
+            !content.trim().is_empty(),
+            "{label}: must produce an answer"
+        );
         assert!(
             content.to_lowercase().contains(want),
             "{label}: greedy answer must ground on the image and name '{want}', got: {content:?}"
@@ -149,9 +155,15 @@ fn qwen3vl_video_grounds_temporal_order() {
     // Solid RED for the first half then solid BLUE for the second half. Four sampled frames at 1 fps
     // fold (temporal_patch_size=2) into **two** merged temporal patches — patch 0 = red+red (≈0.5s),
     // patch 1 = blue+blue (≈2.5s) — so the model sees two distinct timestamped vision frames in order.
-    let video = solid_video(&[[205, 35, 35], [205, 35, 35], [35, 70, 200], [35, 70, 200]], 1.0);
+    let video = solid_video(
+        &[[205, 35, 35], [205, 35, 35], [35, 70, 200], [35, 70, 200]],
+        1.0,
+    );
     let (out, content) = run(&p, &video_request(video, VIDEO_PROMPT, 48));
-    println!("\n=== Qwen3-VL VIDEO temporal-order ===\n[answer] {:?}\n", out.text);
+    println!(
+        "\n=== Qwen3-VL VIDEO temporal-order ===\n[answer] {:?}\n",
+        out.text
+    );
     assert!(
         out.usage.prompt_tokens > 0 && out.usage.generated_tokens > 0,
         "must run the video prefill"
@@ -193,7 +205,10 @@ fn qwen3vl_video_temporal_order_reversed() {
     let p = LlamaProvider::load(&LoadSpec::dense(model_dir())).expect("load Qwen3-VL VLM");
 
     // Solid BLUE for the first half, then solid GREEN for the second half.
-    let video = solid_video(&[[35, 70, 200], [35, 70, 200], [40, 180, 60], [40, 180, 60]], 1.0);
+    let video = solid_video(
+        &[[35, 70, 200], [35, 70, 200], [40, 180, 60], [40, 180, 60]],
+        1.0,
+    );
     let (out, content) = run(&p, &video_request(video, VIDEO_PROMPT, 48));
     println!(
         "\n=== Qwen3-VL VIDEO temporal-order (reversed) ===\n[answer] {:?}\n",

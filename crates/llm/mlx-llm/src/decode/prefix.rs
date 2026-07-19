@@ -161,7 +161,9 @@ pub fn generate_cached(
         return Err(crate::error::Error::Canceled); // typed pre-inference cancel
     }
     if prompt_ids.is_empty() {
-        return Err(crate::error::Error::Msg("generate_cached: empty prompt".into()));
+        return Err(crate::error::Error::Msg(
+            "generate_cached: empty prompt".into(),
+        ));
     }
 
     let rng = SplitMix64::new(config.seed.unwrap_or_else(default_seed));

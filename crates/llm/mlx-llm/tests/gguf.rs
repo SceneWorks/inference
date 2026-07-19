@@ -51,7 +51,12 @@ fn load_ref() -> Option<Ref> {
     let model = CausalLm::from_weights(&Weights::from_dir(&dir).unwrap(), "", cfg.clone()).unwrap();
     let tok = Tokenizer::from_file(format!("{dir}/tokenizer.json")).unwrap();
     let stop = eos_token_ids(std::path::Path::new(&dir));
-    Some(Ref { model, cfg, tok, stop })
+    Some(Ref {
+        model,
+        cfg,
+        tok,
+        stop,
+    })
 }
 
 fn gguf_files() -> Vec<std::path::PathBuf> {
@@ -68,7 +73,11 @@ fn gguf_files() -> Vec<std::path::PathBuf> {
 }
 
 fn encode(tok: &Tokenizer, text: &str) -> Vec<i32> {
-    tok.encode(text, true).unwrap().into_iter().map(|id| id as i32).collect()
+    tok.encode(text, true)
+        .unwrap()
+        .into_iter()
+        .map(|id| id as i32)
+        .collect()
 }
 
 /// Last-position prefill logits as host `f32`.
@@ -76,7 +85,11 @@ fn prefill_logits(model: &CausalLm, ids: &[i32]) -> Vec<f32> {
     let mut cache = model.new_cache();
     let arr = input_ids(ids);
     let logits = model.decode_logits(&arr, &mut cache, 0).unwrap();
-    logits.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>().to_vec()
+    logits
+        .as_dtype(Dtype::Float32)
+        .unwrap()
+        .as_slice::<f32>()
+        .to_vec()
 }
 
 /// Softmax of a logit vector (numerically stabilized) — the behavioral distribution the engine
@@ -116,7 +129,9 @@ fn greedy_tokens(model: &CausalLm, ids: &[i32], stop: &[i32], n: usize) -> Vec<i
         seed: Some(0),
         stop_tokens: stop.to_vec(),
     };
-    generate(model, ids, &cfg, &CancelFlag::new(), &mut |_| {}).unwrap().tokens
+    generate(model, ids, &cfg, &CancelFlag::new(), &mut |_| {})
+        .unwrap()
+        .tokens
 }
 
 fn tmp_out(label: &str) -> std::path::PathBuf {
@@ -146,7 +161,10 @@ fn gguf_dense_conversion_tracks_hf() {
     let hf_top1 = argmax(&hf_logits);
     let hf_tokens = greedy_tokens(&r.model, &ids, &r.stop, 24);
     println!("HF top-1 next-token id for {PROMPT:?} = {hf_top1}; greedy = {hf_tokens:?}");
-    println!("{:>34}  {:>7}  {:>5}  {:>9}  text", "gguf", "probcos", "top1", "prefix/24");
+    println!(
+        "{:>34}  {:>7}  {:>5}  {:>9}  text",
+        "gguf", "probcos", "top1", "prefix/24"
+    );
 
     // Collect every file's result first (so one run reports the whole matrix), then assert — a
     // failing type does not hide the others.
@@ -171,10 +189,16 @@ fn gguf_dense_conversion_tracks_hf() {
         assert_eq!(cfg.hidden_size, r.cfg.hidden_size, "{label}: hidden_size");
         assert_eq!(cfg.num_layers, r.cfg.num_layers, "{label}: num_layers");
         assert_eq!(cfg.num_heads, r.cfg.num_heads, "{label}: num_heads");
-        assert_eq!(cfg.num_kv_heads, r.cfg.num_kv_heads, "{label}: num_kv_heads");
+        assert_eq!(
+            cfg.num_kv_heads, r.cfg.num_kv_heads,
+            "{label}: num_kv_heads"
+        );
         assert_eq!(cfg.head_dim, r.cfg.head_dim, "{label}: head_dim");
         assert_eq!(cfg.vocab_size, r.cfg.vocab_size, "{label}: vocab_size");
-        assert_eq!(cfg.tie_word_embeddings, r.cfg.tie_word_embeddings, "{label}: tie");
+        assert_eq!(
+            cfg.tie_word_embeddings, r.cfg.tie_word_embeddings,
+            "{label}: tie"
+        );
         assert!(report.quantized.is_none(), "{label}: dense expected");
 
         let model = CausalLm::from_weights(&Weights::from_dir(&out).unwrap(), "", cfg).unwrap();
@@ -183,7 +207,10 @@ fn gguf_dense_conversion_tracks_hf() {
         let top1 = argmax(&logits);
         let tokens = greedy_tokens(&model, &ids, &r.stop, 24);
         let prefix = common_prefix(&tokens, &hf_tokens);
-        let text = r.tok.decode(&tokens.iter().map(|&x| x as u32).collect::<Vec<_>>(), true).unwrap();
+        let text = r
+            .tok
+            .decode(&tokens.iter().map(|&x| x as u32).collect::<Vec<_>>(), true)
+            .unwrap();
         println!(
             "{label:>34}  {probcos:>7.4}  {:>5}  {prefix:>4}/24   {}",
             top1 == hf_top1,
@@ -201,17 +228,25 @@ fn gguf_dense_conversion_tracks_hf() {
             failures.push(format!("{label}: produced no text"));
         }
         if probcos < 0.80 {
-            failures.push(format!("{label}: softmax cosine {probcos:.4} < 0.80 (sanity floor)"));
+            failures.push(format!(
+                "{label}: softmax cosine {probcos:.4} < 0.80 (sanity floor)"
+            ));
         }
         if lossless {
             if top1 != hf_top1 {
-                failures.push(format!("{label}: lossless next-token {top1} != HF {hf_top1}"));
+                failures.push(format!(
+                    "{label}: lossless next-token {top1} != HF {hf_top1}"
+                ));
             }
             if probcos < 0.999 {
-                failures.push(format!("{label}: lossless softmax cosine {probcos:.4} < 0.999"));
+                failures.push(format!(
+                    "{label}: lossless softmax cosine {probcos:.4} < 0.999"
+                ));
             }
             if prefix < 20 {
-                failures.push(format!("{label}: lossless greedy prefix {prefix}/24 — expected ≈ exact"));
+                failures.push(format!(
+                    "{label}: lossless greedy prefix {prefix}/24 — expected ≈ exact"
+                ));
             }
         }
         covered += 1;
@@ -219,7 +254,11 @@ fn gguf_dense_conversion_tracks_hf() {
     }
 
     assert!(covered > 0, "no convertible GGUF found in MLX_LLM_GGUF_DIR");
-    assert!(failures.is_empty(), "parity failures:\n  {}", failures.join("\n  "));
+    assert!(
+        failures.is_empty(),
+        "parity failures:\n  {}",
+        failures.join("\n  ")
+    );
 }
 
 /// The optional MLX requant path: convert with `--quant q8`/`q4`, and the resulting snapshot loads
@@ -250,23 +289,46 @@ fn gguf_requant_snapshot_loads_quantized() {
     // 135M model is genuinely lossy — the point of that case is the load path round-trips and runs,
     // not q4 quality. A *broken* pre-quantized load (mis-paired scales/biases) gives ~0, so the q4
     // floor still cleanly separates "works" from "broken".
-    for (tag, spec, floor) in [("q8", QuantSpec::q8(), 0.99f32), ("q4", QuantSpec::q4(), 0.6)] {
+    for (tag, spec, floor) in [
+        ("q8", QuantSpec::q8(), 0.99f32),
+        ("q4", QuantSpec::q4(), 0.6),
+    ] {
         let out = tmp_out(&format!("requant-{tag}"));
-        let report = convert_file(src, &out, ConvertOptions { quantize: Some(spec) }).unwrap();
+        let report = convert_file(
+            src,
+            &out,
+            ConvertOptions {
+                quantize: Some(spec),
+            },
+        )
+        .unwrap();
         assert_eq!(report.quantized, Some(spec));
 
         let cfg = ModelConfig::from_dir(&out).unwrap();
-        assert_eq!(cfg.quantization, Some(spec), "{tag}: config carries quantization block");
+        assert_eq!(
+            cfg.quantization,
+            Some(spec),
+            "{tag}: config carries quantization block"
+        );
 
         let model = CausalLm::from_weights(&Weights::from_dir(&out).unwrap(), "", cfg).unwrap();
         assert!(model.is_quantized(), "{tag}: model loaded as quantized");
 
         let probcos = cosine(&softmax(&prefill_logits(&model, &ids)), &hf_probs);
         let tokens = greedy_tokens(&model, &ids, &r.stop, 16);
-        let text = r.tok.decode(&tokens.iter().map(|&x| x as u32).collect::<Vec<_>>(), true).unwrap();
-        println!("requant {tag}: softmax-cosine {probcos:.4}  :: {}", text.replace('\n', " "));
+        let text = r
+            .tok
+            .decode(&tokens.iter().map(|&x| x as u32).collect::<Vec<_>>(), true)
+            .unwrap();
+        println!(
+            "requant {tag}: softmax-cosine {probcos:.4}  :: {}",
+            text.replace('\n', " ")
+        );
 
-        assert!(probcos >= floor, "{tag}: requantized softmax cosine {probcos} below {floor}");
+        assert!(
+            probcos >= floor,
+            "{tag}: requantized softmax cosine {probcos} below {floor}"
+        );
         assert!(!text.trim().is_empty(), "{tag}: produced no text");
         std::fs::remove_dir_all(&out).ok();
     }
@@ -297,7 +359,17 @@ fn gguf_dequant_matches_hf_weights() {
     // that asymmetry is harmless; load-time completeness is enforced by `from_weights`.)
     let hf_f32: std::collections::HashMap<String, Vec<f32>> = hf
         .keys()
-        .map(|k| (k.to_string(), hf.require(k).unwrap().as_dtype(Dtype::Float32).unwrap().as_slice::<f32>().to_vec()))
+        .map(|k| {
+            (
+                k.to_string(),
+                hf.require(k)
+                    .unwrap()
+                    .as_dtype(Dtype::Float32)
+                    .unwrap()
+                    .as_slice::<f32>()
+                    .to_vec(),
+            )
+        })
         .collect();
 
     println!("{:>34}  {:>8}  {:>8}  worst-tensor", "gguf", "min", "mean");
@@ -340,16 +412,25 @@ fn gguf_dequant_matches_hf_weights() {
             (0.85, 0.95)
         };
         if min.0 < min_floor {
-            failures.push(format!("{label}: worst tensor {} cosine {:.5} < {min_floor}", min.1, min.0));
+            failures.push(format!(
+                "{label}: worst tensor {} cosine {:.5} < {min_floor}",
+                min.1, min.0
+            ));
         }
         if mean < mean_floor {
-            failures.push(format!("{label}: mean tensor cosine {mean:.5} < {mean_floor}"));
+            failures.push(format!(
+                "{label}: mean tensor cosine {mean:.5} < {mean_floor}"
+            ));
         }
         covered += 1;
         std::fs::remove_dir_all(&out).ok();
     }
     assert!(covered > 0, "no convertible GGUF found");
-    assert!(failures.is_empty(), "dequant weight-parity failures:\n  {}", failures.join("\n  "));
+    assert!(
+        failures.is_empty(),
+        "dequant weight-parity failures:\n  {}",
+        failures.join("\n  ")
+    );
 }
 
 /// Human name for a GGML quant tag (the sub-4-bit IQ grid types this story added, plus the
@@ -414,7 +495,17 @@ fn gguf_iq_dequant_matches_hf_by_type() {
     let hf = Weights::from_dir(&hf_dir).unwrap();
     let hf_f32: std::collections::HashMap<String, Vec<f32>> = hf
         .keys()
-        .map(|k| (k.to_string(), hf.require(k).unwrap().as_dtype(Dtype::Float32).unwrap().as_slice::<f32>().to_vec()))
+        .map(|k| {
+            (
+                k.to_string(),
+                hf.require(k)
+                    .unwrap()
+                    .as_dtype(Dtype::Float32)
+                    .unwrap()
+                    .as_slice::<f32>()
+                    .to_vec(),
+            )
+        })
         .collect();
 
     // type -> (count, sum_cos, min_cos, worst_key)
@@ -425,7 +516,8 @@ fn gguf_iq_dequant_matches_hf_by_type() {
         let label = path.file_stem().unwrap().to_string_lossy().to_string();
         // GGUF tensor name -> its GGML type, so a converted (HF-keyed) tensor can be bucketed.
         let g = GgufFile::open(path).unwrap();
-        let mut hf_key_type: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        let mut hf_key_type: std::collections::HashMap<String, u32> =
+            std::collections::HashMap::new();
         for t in &g.tensors {
             if let Some(hf_key) = remap_key(&t.name) {
                 hf_key_type.insert(hf_key, t.ggml_type);
@@ -437,12 +529,18 @@ fn gguf_iq_dequant_matches_hf_by_type() {
             .unwrap_or_else(|e| panic!("{label}: convert failed: {e}"));
         let conv = Weights::from_dir(&out).unwrap();
         for k in conv.keys() {
-            let Some(&tag) = hf_key_type.get(k) else { continue };
-            let av = hf_f32.get(k).unwrap_or_else(|| panic!("{label}: {k} absent from HF"));
+            let Some(&tag) = hf_key_type.get(k) else {
+                continue;
+            };
+            let av = hf_f32
+                .get(k)
+                .unwrap_or_else(|| panic!("{label}: {k} absent from HF"));
             let b = conv.require(k).unwrap().as_dtype(Dtype::Float32).unwrap();
             let cos = cosine(av, b.as_slice::<f32>());
             let name = ggml_type_name(tag);
-            let e = by_type.entry(name).or_insert((0, 0.0, f32::INFINITY, String::new()));
+            let e = by_type
+                .entry(name)
+                .or_insert((0, 0.0, f32::INFINITY, String::new()));
             e.0 += 1;
             e.1 += cos;
             if cos < e.2 {
@@ -453,9 +551,15 @@ fn gguf_iq_dequant_matches_hf_by_type() {
         std::fs::remove_dir_all(&out).ok();
     }
 
-    println!("{:>9}  {:>5}  {:>8}  {:>8}  worst-tensor", "type", "n", "min", "mean");
+    println!(
+        "{:>9}  {:>5}  {:>8}  {:>8}  worst-tensor",
+        "type", "n", "min", "mean"
+    );
     for (name, (n, sum, min, worst)) in &by_type {
-        println!("{name:>9}  {n:>5}  {min:>8.5}  {:>8.5}  {worst}", sum / *n as f32);
+        println!(
+            "{name:>9}  {n:>5}  {min:>8.5}  {:>8.5}  {worst}",
+            sum / *n as f32
+        );
     }
 
     // Floors a *correct* (lossy) decode clears for each bit-width; a broken grid/sign unpack lands
@@ -471,15 +575,21 @@ fn gguf_iq_dequant_matches_hf_by_type() {
             _ => 0.90, // Q2_K..Q6_K / IQ4_* neighbours in the dynamic mix
         }
     };
-    let required = ["IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ3_XXS", "IQ3_S", "IQ1_S", "IQ1_M"];
+    let required = [
+        "IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ3_XXS", "IQ3_S", "IQ1_S", "IQ1_M",
+    ];
     let mut failures: Vec<String> = Vec::new();
     for t in required {
         match by_type.get(t) {
-            None => failures.push(format!("{t}: no tensors of this type found in the GGUF dir")),
+            None => failures.push(format!(
+                "{t}: no tensors of this type found in the GGUF dir"
+            )),
             Some((n, sum, min, worst)) => {
                 let f = floor(t);
                 if *min < f {
-                    failures.push(format!("{t}: worst tensor {worst} cosine {min:.5} < {f} (broken decode?)"));
+                    failures.push(format!(
+                        "{t}: worst tensor {worst} cosine {min:.5} < {f} (broken decode?)"
+                    ));
                 }
                 let mean = sum / *n as f32;
                 if mean < f {
@@ -488,7 +598,11 @@ fn gguf_iq_dequant_matches_hf_by_type() {
             }
         }
     }
-    assert!(failures.is_empty(), "IQ per-type dequant parity failures:\n  {}", failures.join("\n  "));
+    assert!(
+        failures.is_empty(),
+        "IQ per-type dequant parity failures:\n  {}",
+        failures.join("\n  ")
+    );
 }
 
 /// End-to-end: each IQ-quantized GGUF converts to a snapshot that loads and *runs* — the prefill
@@ -544,8 +658,14 @@ fn gguf_iq_snapshot_generates() {
         let logits = prefill_logits(&model, &ids);
         let probcos = cosine(&softmax(&logits), &hf_probs);
         let tokens = greedy_tokens(&model, &ids, &r.stop, 16);
-        let text = r.tok.decode(&tokens.iter().map(|&x| x as u32).collect::<Vec<_>>(), true).unwrap();
-        println!("{label:>34}: probcos {probcos:.4}  :: {}", text.replace('\n', " "));
+        let text = r
+            .tok
+            .decode(&tokens.iter().map(|&x| x as u32).collect::<Vec<_>>(), true)
+            .unwrap();
+        println!(
+            "{label:>34}: probcos {probcos:.4}  :: {}",
+            text.replace('\n', " ")
+        );
         // Runnability gates: finite logits (a numerically-broken decode would NaN/Inf) and non-empty
         // generation. Correctness vs HF is asserted at the weight level in the companion test.
         if !logits.iter().all(|v| v.is_finite()) {
@@ -558,5 +678,9 @@ fn gguf_iq_snapshot_generates() {
         std::fs::remove_dir_all(&out).ok();
     }
     assert!(covered > 0, "no IQ *.gguf found in MLX_LLM_IQ_GGUF_DIR");
-    assert!(failures.is_empty(), "IQ snapshot run failures:\n  {}", failures.join("\n  "));
+    assert!(
+        failures.is_empty(),
+        "IQ snapshot run failures:\n  {}",
+        failures.join("\n  ")
+    );
 }

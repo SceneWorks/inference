@@ -377,7 +377,8 @@ pub fn apply_rope(x: &Array, cos: &Array, sin: &Array, interleaved: bool) -> Res
         let (b, s, h) = (sh[0], sh[1], sh[2]);
         let pairs = x_rot.reshape(&[b, s, h, rd / 2, 2])?;
         let halves = split(&pairs, 2, 4)?; // even = [..,0], odd = [..,1]
-        let rot = concatenate_axis(&[&halves[1].negative()?, &halves[0]], 4)?.reshape(&[b, s, h, rd])?;
+        let rot =
+            concatenate_axis(&[&halves[1].negative()?, &halves[0]], 4)?.reshape(&[b, s, h, rd])?;
         add(&multiply(&x_rot, &cos)?, &multiply(&rot, &sin)?)?
     } else {
         // NeoX half-split: pairs (x[i], x[i + rd/2]); rotate_half = cat(-x2, x1).
@@ -483,7 +484,10 @@ mod tests {
         let (c, s) = rope.cos_sin(1, 3, Dtype::Float32).unwrap();
         assert_eq!(c.shape(), &[1, 1, 2]); // table width == rotary_dim
         let x = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[1, 1, 1, 4]);
-        let y = apply_rope(&x, &c, &s, false).unwrap().as_slice::<f32>().to_vec();
+        let y = apply_rope(&x, &c, &s, false)
+            .unwrap()
+            .as_slice::<f32>()
+            .to_vec();
         // Tail (indices 2,3) untouched.
         assert!((y[2] - 3.0).abs() < 1e-5 && (y[3] - 4.0).abs() < 1e-5);
     }
@@ -497,7 +501,10 @@ mod tests {
         let (c, s) = rope.cos_sin(1, 1, Dtype::Float32).unwrap();
         let (a, b) = (0.7f32, -0.3f32);
         let x = Array::from_slice(&[a, b], &[1, 1, 1, 2]);
-        let y = apply_rope(&x, &c, &s, true).unwrap().as_slice::<f32>().to_vec();
+        let y = apply_rope(&x, &c, &s, true)
+            .unwrap()
+            .as_slice::<f32>()
+            .to_vec();
         let (cp, sp) = (p.cos(), p.sin());
         assert!((y[0] - (a * cp - b * sp)).abs() < 1e-5, "{y:?}");
         assert!((y[1] - (a * sp + b * cp)).abs() < 1e-5, "{y:?}");
@@ -509,7 +516,9 @@ mod tests {
         let rope = Rope::standard(4, 10000.0);
         let (c, s) = rope.cos_sin(3, 0, Dtype::Float32).unwrap();
         let x = Array::from_slice(
-            &[1.0f32, 0.5, -0.5, 2.0, 0.3, 1.0, -1.0, 0.7, 2.0, -0.2, 0.1, 0.9],
+            &[
+                1.0f32, 0.5, -0.5, 2.0, 0.3, 1.0, -1.0, 0.7, 2.0, -0.2, 0.1, 0.9,
+            ],
             &[1, 3, 1, 4],
         );
         let y = apply_rope(&x, &c, &s, false).unwrap();
@@ -589,7 +598,8 @@ mod tests {
         let cos_h = cm.as_slice::<f32>().to_vec();
         let sin_h = sm.as_slice::<f32>().to_vec();
         let hd = QWEN_HEAD_DIM as usize;
-        #[allow(clippy::needless_range_loop)] // pos cross-indexes rows[axis][pos] and the flat table
+        #[allow(clippy::needless_range_loop)]
+        // pos cross-indexes rows[axis][pos] and the flat table
         for pos in 0..l {
             for ch in 0..hd {
                 let p = rows[axis_of[ch]][pos] as f32;
@@ -607,7 +617,11 @@ mod tests {
         let rope = Rope::standard(QWEN_HEAD_DIM, QWEN_THETA);
         let positions = [0, 1, 2];
         let err = rope
-            .mrope_cos_sin([&positions, &positions, &positions], [16, 24, 16], Dtype::Float32)
+            .mrope_cos_sin(
+                [&positions, &positions, &positions],
+                [16, 24, 16],
+                Dtype::Float32,
+            )
             .unwrap_err();
         assert!(matches!(err, Error::Msg(_)), "{err:?}");
     }
@@ -618,7 +632,11 @@ mod tests {
         let rope = Rope::partial(QWEN_HEAD_DIM, QWEN_THETA, true);
         let positions = [0, 1, 2];
         let err = rope
-            .mrope_cos_sin([&positions, &positions, &positions], QWEN_SECTIONS, Dtype::Float32)
+            .mrope_cos_sin(
+                [&positions, &positions, &positions],
+                QWEN_SECTIONS,
+                Dtype::Float32,
+            )
             .unwrap_err();
         assert!(matches!(err, Error::Unsupported(_)), "{err:?}");
     }
@@ -636,7 +654,11 @@ mod tests {
         let positions: Vec<i32> = (0..6).collect();
         let (c1, s1) = rope.cos_sin_at(&positions, Dtype::Float32).unwrap();
         let (cm, sm) = rope
-            .mrope_interleaved_cos_sin([&positions, &positions, &positions], Q36_SECTIONS, Dtype::Float32)
+            .mrope_interleaved_cos_sin(
+                [&positions, &positions, &positions],
+                Q36_SECTIONS,
+                Dtype::Float32,
+            )
             .unwrap();
         assert_eq!(cm.shape(), &[1, 6, Q36_ROT]);
         assert_eq!(cm.as_slice::<f32>(), c1.as_slice::<f32>());
@@ -647,13 +669,22 @@ mod tests {
     fn mrope_interleaved_matches_reference() {
         // A genuinely-3D case vs the reference `apply_interleaved_mrope` (oracle from /tmp/gen_mrope.py).
         let j: serde_json::Value =
-            serde_json::from_str(include_str!("../models/testdata/qwen35_mrope_oracle.json")).unwrap();
+            serde_json::from_str(include_str!("../models/testdata/qwen35_mrope_oracle.json"))
+                .unwrap();
         let m = &j["mrope"];
         let row = |k: &str| -> Vec<i32> {
-            m[k].as_array().unwrap().iter().map(|x| x.as_i64().unwrap() as i32).collect()
+            m[k].as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_i64().unwrap() as i32)
+                .collect()
         };
         let exp = |k: &str| -> Vec<f32> {
-            m[k].as_array().unwrap().iter().map(|x| x.as_f64().unwrap() as f32).collect()
+            m[k].as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_f64().unwrap() as f32)
+                .collect()
         };
         let (t, h, w) = (row("t"), row("h"), row("w"));
         let rope = Rope::partial(Q36_ROT, Q36_THETA, false);
@@ -661,9 +692,18 @@ mod tests {
             .mrope_interleaved_cos_sin([&t, &h, &w], Q36_SECTIONS, Dtype::Float32)
             .unwrap();
         let cmp = |got: &[f32], exp: &[f32]| {
-            got.iter().zip(exp).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max)
+            got.iter()
+                .zip(exp)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max)
         };
-        assert!(cmp(cos.as_slice::<f32>(), &exp("cos")) < 1e-6, "interleaved mrope cos vs reference");
-        assert!(cmp(sin.as_slice::<f32>(), &exp("sin")) < 1e-6, "interleaved mrope sin vs reference");
+        assert!(
+            cmp(cos.as_slice::<f32>(), &exp("cos")) < 1e-6,
+            "interleaved mrope cos vs reference"
+        );
+        assert!(
+            cmp(sin.as_slice::<f32>(), &exp("sin")) < 1e-6,
+            "interleaved mrope sin vs reference"
+        );
     }
 }

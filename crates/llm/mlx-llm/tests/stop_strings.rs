@@ -13,8 +13,8 @@
 //! sit mid-output — proving generation would have continued past it.
 
 use core_llm::{
-    FinishReason as CoreFinish, LoadSpec, Message, Sampling,
-    StreamEvent as CoreEvent, TextLlmRequest,
+    FinishReason as CoreFinish, LoadSpec, Message, Sampling, StreamEvent as CoreEvent,
+    TextLlmRequest,
 };
 use mlx_llm::load_textllm;
 use mlx_llm::provider::PROVIDER_ID;
@@ -30,7 +30,9 @@ fn honors_request_stop_strings_on_real_model() {
     let provider = load_textllm(PROVIDER_ID, &LoadSpec::dense(&dir)).unwrap();
 
     let req = |stop: Vec<String>| TextLlmRequest {
-        messages: vec![Message::user("List the eight planets of the solar system in order.")],
+        messages: vec![Message::user(
+            "List the eight planets of the solar system in order.",
+        )],
         sampling: Sampling::greedy(), // deterministic => the baseline is reproducible
         max_new_tokens: 48,
         seed: Some(0),
@@ -53,7 +55,10 @@ fn honors_request_stop_strings_on_real_model() {
     let end = offs[offs.len() / 3 + 6];
     let stop = baseline.text[start..end].to_string();
     let first = baseline.text.find(&stop).unwrap();
-    assert!(first > 0, "derived stop unexpectedly at the very start: {stop:?}");
+    assert!(
+        first > 0,
+        "derived stop unexpectedly at the very start: {stop:?}"
+    );
     assert!(
         first + stop.len() < baseline.text.len(),
         "derived stop must have generated text after it: {stop:?}"
@@ -81,13 +86,26 @@ fn honors_request_stop_strings_on_real_model() {
         "output must be the baseline truncated at the first stop occurrence"
     );
     // ...the stop string itself is not emitted...
-    assert!(!out.text.contains(&stop), "the stop string must not appear in the output");
+    assert!(
+        !out.text.contains(&stop),
+        "the stop string must not appear in the output"
+    );
     // ...the streamed deltas reconstruct that same trimmed text...
-    assert_eq!(streamed, out.text, "streamed deltas must reconstruct the trimmed output");
+    assert_eq!(
+        streamed, out.text,
+        "streamed deltas must reconstruct the trimmed output"
+    );
     // ...the finish reason is Stop...
-    assert_eq!(out.finish_reason, Some(CoreFinish::Stop), "finish_reason must be Stop");
+    assert_eq!(
+        out.finish_reason,
+        Some(CoreFinish::Stop),
+        "finish_reason must be Stop"
+    );
     // ...and it genuinely stopped early.
-    assert!(out.text.len() < baseline.text.len(), "stopping must shorten the output");
+    assert!(
+        out.text.len() < baseline.text.len(),
+        "stopping must shorten the output"
+    );
     assert!(
         out.usage.generated_tokens <= baseline.usage.generated_tokens,
         "an early stop cannot generate more tokens than the baseline ({} vs {})",

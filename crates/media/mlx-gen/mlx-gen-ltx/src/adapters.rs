@@ -394,22 +394,52 @@ mod tests {
         let mut w = Weights::empty();
         let t = || Array::zeros::<f32>(&[2, 2]).unwrap();
         // PEFT pair on a video attn leaf → one video target.
-        w.insert("diffusion_model.transformer_blocks.0.attn1.to_q.lora_A.weight", t());
-        w.insert("diffusion_model.transformer_blocks.0.attn1.to_q.lora_B.weight", t());
+        w.insert(
+            "diffusion_model.transformer_blocks.0.attn1.to_q.lora_A.weight",
+            t(),
+        );
+        w.insert(
+            "diffusion_model.transformer_blocks.0.attn1.to_q.lora_B.weight",
+            t(),
+        );
         // kohya + `.default` infix pair, with `to_out.0` normalization collapsing to `to_out`.
-        w.insert("diffusion_model.transformer_blocks.1.attn2.to_out.0.lora_down.default.weight", t());
-        w.insert("diffusion_model.transformer_blocks.1.attn2.to_out.0.lora_up.default.weight", t());
+        w.insert(
+            "diffusion_model.transformer_blocks.1.attn2.to_out.0.lora_down.default.weight",
+            t(),
+        );
+        w.insert(
+            "diffusion_model.transformer_blocks.1.attn2.to_out.0.lora_up.default.weight",
+            t(),
+        );
         // Audio-block pair → audio bucket.
-        w.insert("diffusion_model.transformer_blocks.0.audio_attn1.to_v.lora_A.weight", t());
-        w.insert("diffusion_model.transformer_blocks.0.audio_attn1.to_v.lora_B.weight", t());
+        w.insert(
+            "diffusion_model.transformer_blocks.0.audio_attn1.to_v.lora_A.weight",
+            t(),
+        );
+        w.insert(
+            "diffusion_model.transformer_blocks.0.audio_attn1.to_v.lora_B.weight",
+            t(),
+        );
         // Cross-modal (a2v) pair → audio bucket.
-        w.insert("diffusion_model.transformer_blocks.0.video_to_audio_attn.to_k.lora_A.weight", t());
-        w.insert("diffusion_model.transformer_blocks.0.video_to_audio_attn.to_k.lora_B.weight", t());
+        w.insert(
+            "diffusion_model.transformer_blocks.0.video_to_audio_attn.to_k.lora_A.weight",
+            t(),
+        );
+        w.insert(
+            "diffusion_model.transformer_blocks.0.video_to_audio_attn.to_k.lora_B.weight",
+            t(),
+        );
         // Orphan down (no up) and a bare `.alpha` — counted by neither bucket.
-        w.insert("diffusion_model.transformer_blocks.2.attn1.to_k.lora_A.weight", t());
+        w.insert(
+            "diffusion_model.transformer_blocks.2.attn1.to_k.lora_A.weight",
+            t(),
+        );
         w.insert("diffusion_model.transformer_blocks.0.attn1.to_q.alpha", t());
         // Non-lora key — ignored.
-        w.insert("diffusion_model.transformer_blocks.0.attn1.to_q.weight", t());
+        w.insert(
+            "diffusion_model.transformer_blocks.0.attn1.to_q.weight",
+            t(),
+        );
 
         let (video, audio) = lora_target_inventory(&w);
         assert_eq!(

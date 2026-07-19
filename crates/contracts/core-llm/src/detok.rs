@@ -133,7 +133,10 @@ mod tests {
         let s = "中".as_bytes();
         let deltas = stream(&[&s[..1], &s[1..]]);
         assert_eq!(deltas, ["中"]);
-        assert!(deltas.concat().chars().all(|c| c != char::REPLACEMENT_CHARACTER));
+        assert!(deltas
+            .concat()
+            .chars()
+            .all(|c| c != char::REPLACEMENT_CHARACTER));
     }
 
     #[test]
@@ -143,7 +146,9 @@ mod tests {
         let chunks: Vec<&[u8]> = s.chunks(1).collect();
         let deltas = stream(&chunks);
         assert_eq!(deltas.concat(), "你好世界");
-        assert!(!deltas.iter().any(|d| d.contains(char::REPLACEMENT_CHARACTER)));
+        assert!(!deltas
+            .iter()
+            .any(|d| d.contains(char::REPLACEMENT_CHARACTER)));
     }
 
     #[test]
@@ -153,7 +158,9 @@ mod tests {
         let s = "café!".as_bytes(); // 63 61 66 C3 A9 21
         let deltas = stream(&[&s[..3], &s[3..4], &s[4..5], &s[5..]]);
         assert_eq!(deltas.concat(), "café!");
-        assert!(!deltas.iter().any(|d| d.contains(char::REPLACEMENT_CHARACTER)));
+        assert!(!deltas
+            .iter()
+            .any(|d| d.contains(char::REPLACEMENT_CHARACTER)));
     }
 
     #[test]

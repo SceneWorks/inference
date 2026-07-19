@@ -61,11 +61,17 @@ fn write_snapshot() -> PathBuf {
     let mut rng = SplitMix64::new(0xBEEF);
     let mut arrays: Vec<(String, Array)> = Vec::new();
     arrays.push(("model.embed_tokens.weight".into(), randn(&[v, h], &mut rng)));
-    arrays.push(("model.norm.weight".into(), Array::ones::<f32>(&[h]).unwrap()));
+    arrays.push((
+        "model.norm.weight".into(),
+        Array::ones::<f32>(&[h]).unwrap(),
+    ));
     arrays.push(("lm_head.weight".into(), randn(&[v, h], &mut rng)));
     for i in 0..2 {
         let p = |s: &str| format!("model.layers.{i}.{s}");
-        arrays.push((p("input_layernorm.weight"), Array::ones::<f32>(&[h]).unwrap()));
+        arrays.push((
+            p("input_layernorm.weight"),
+            Array::ones::<f32>(&[h]).unwrap(),
+        ));
         arrays.push((
             p("post_attention_layernorm.weight"),
             Array::ones::<f32>(&[h]).unwrap(),
@@ -104,7 +110,10 @@ fn llama_provider_passes_core_llm_conformance() {
 #[ignore = "needs an HF/GGUF model source via MLX_LLM_PREPARE_SOURCE"]
 fn real_snapshot_preparer_passes_core_llm_conformance() {
     let source = std::env::var("MLX_LLM_PREPARE_SOURCE").expect("set MLX_LLM_PREPARE_SOURCE");
-    let out_dir = std::env::temp_dir().join(format!("mlx-llm-prepare-conformance-{}", std::process::id()));
+    let out_dir = std::env::temp_dir().join(format!(
+        "mlx-llm-prepare-conformance-{}",
+        std::process::id()
+    ));
     std::fs::remove_dir_all(&out_dir).ok();
     check_snapshot_preparer(
         &SnapshotPreparerProfile {
@@ -185,8 +194,14 @@ fn can_load_is_weightless_and_architecture_aware() {
         r#"{"architectures":["LlamaForCausalLM"],"model_type":"llama","hidden_size":8}"#,
     );
     let lspec = LoadSpec::dense(llama.to_str().unwrap().to_string());
-    assert!(mlx_llm::provider::can_load(&lspec), "text provider must claim a Llama snapshot");
-    assert!(!mlx_llm::joycaption::can_load(&lspec), "vision provider must decline a text snapshot");
+    assert!(
+        mlx_llm::provider::can_load(&lspec),
+        "text provider must claim a Llama snapshot"
+    );
+    assert!(
+        !mlx_llm::joycaption::can_load(&lspec),
+        "vision provider must decline a text snapshot"
+    );
     let _ = std::fs::remove_dir_all(&llama);
 
     // An unsupported architecture is declined (no panic, no silent default).
@@ -207,12 +222,20 @@ fn can_load_is_weightless_and_architecture_aware() {
             "vision_config":{"hidden_size":16}}"#,
     );
     let vspec = LoadSpec::dense(vlm.to_str().unwrap().to_string());
-    assert!(!mlx_llm::provider::can_load(&vspec), "text provider must decline a VLM");
-    assert!(mlx_llm::joycaption::can_load(&vspec), "vision provider must claim a VLM");
+    assert!(
+        !mlx_llm::provider::can_load(&vspec),
+        "text provider must decline a VLM"
+    );
+    assert!(
+        mlx_llm::joycaption::can_load(&vspec),
+        "vision provider must claim a VLM"
+    );
     let _ = std::fs::remove_dir_all(&vlm);
 
     // A nonexistent path is declined gracefully.
-    assert!(!mlx_llm::provider::can_load(&LoadSpec::dense("/no/such/dir")));
+    assert!(!mlx_llm::provider::can_load(&LoadSpec::dense(
+        "/no/such/dir"
+    )));
 }
 
 #[test]
@@ -243,7 +266,10 @@ fn load_for_model_unknown_architecture_is_a_typed_error() {
     match load_for_model(&spec) {
         Err(core_llm::Error::Unsupported(m)) => {
             assert!(m.contains("no registered provider can serve"), "{m}");
-            assert!(m.contains("bert"), "error should surface the model arch: {m}");
+            assert!(
+                m.contains("bert"),
+                "error should surface the model arch: {m}"
+            );
         }
         Err(e) => panic!("expected Unsupported, got error: {e}"),
         Ok(_) => panic!("expected Unsupported, got a loaded provider"),
@@ -281,7 +307,11 @@ fn load_for_model_round_trips_real_qwen3() {
     // A short greedy run is still inside the <think> block, so the answer (out.text) may be empty
     // while reasoning streams — assert it produced text on either channel.
     assert!(
-        !out.text.is_empty() || out.thinking.as_deref().is_some_and(|t| !t.trim().is_empty()),
+        !out.text.is_empty()
+            || out
+                .thinking
+                .as_deref()
+                .is_some_and(|t| !t.trim().is_empty()),
         "expected text on the answer or reasoning channel"
     );
 }

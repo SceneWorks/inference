@@ -525,7 +525,10 @@ mod tests {
         // And the f32 dequant still exactly reproduces the affine grid (bit-identical to the f32 store).
         let d = QEmbedding::dense(Embedding::new(grid, hidden)).forward(&idx)?;
         let dev_max = (p.sub(&d)?).abs()?.max_all()?.to_scalar::<f32>()?;
-        assert_eq!(dev_max, 0.0, "f32-dequant packed embed deviates from the grid");
+        assert_eq!(
+            dev_max, 0.0,
+            "f32-dequant packed embed deviates from the grid"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
         Ok(())

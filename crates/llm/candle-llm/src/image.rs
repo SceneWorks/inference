@@ -546,9 +546,9 @@ mod tests {
     #[test]
     fn preprocess_video_grid_and_temporal_layout() {
         let proc = Qwen35ImageProcessor::default(); // patch 16, merge 2, temporal 2
-        // 64x64 frames → grid_h = grid_w = 4 (64/16). With the video pixel budget (t_bar=2,
-        // 2·64·64 = 8192 ∈ [4096, max]) the resize is a no-op, so the grid is exact. Two distinct
-        // solid frames so the temporal slots are distinguishable.
+                                                    // 64x64 frames → grid_h = grid_w = 4 (64/16). With the video pixel budget (t_bar=2,
+                                                    // 2·64·64 = 8192 ∈ [4096, max]) the resize is a no-op, so the grid is exact. Two distinct
+                                                    // solid frames so the temporal slots are distinguishable.
         let frame0 = [10u8, 20, 30].repeat(64 * 64); // first frame color
         let frame1 = [200u8, 210, 220].repeat(64 * 64); // second frame color
         let frames: Vec<(&[u8], usize, usize)> = vec![(&frame0, 64, 64), (&frame1, 64, 64)];

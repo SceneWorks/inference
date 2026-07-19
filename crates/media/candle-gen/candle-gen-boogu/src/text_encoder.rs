@@ -374,7 +374,10 @@ mod tests {
 
     /// A tiny valid Qwen3-VL text-encoder weight map (2 layers, hidden 6, GQA 2/1, head_dim 4) drawn
     /// as **bf16** — modelling the hosted TE, whose weights ship bf16 on disk.
-    fn tiny_boogu_te_map() -> (std::collections::HashMap<String, Tensor>, BooguTextEncoderConfig) {
+    fn tiny_boogu_te_map() -> (
+        std::collections::HashMap<String, Tensor>,
+        BooguTextEncoderConfig,
+    ) {
         let cfg = BooguTextEncoderConfig {
             num_layers: 2,
             num_heads: 2,
@@ -397,8 +400,14 @@ mod tests {
         for i in 0..cfg.num_layers {
             let p = format!("lm.layers.{i}");
             t.insert(format!("{p}.input_layernorm.weight"), bf16(&[hidden]));
-            t.insert(format!("{p}.post_attention_layernorm.weight"), bf16(&[hidden]));
-            t.insert(format!("{p}.self_attn.q_proj.weight"), bf16(&[nh * hd, hidden]));
+            t.insert(
+                format!("{p}.post_attention_layernorm.weight"),
+                bf16(&[hidden]),
+            );
+            t.insert(
+                format!("{p}.self_attn.q_proj.weight"),
+                bf16(&[nh * hd, hidden]),
+            );
             t.insert(
                 format!("{p}.self_attn.k_proj.weight"),
                 bf16(&[nkv * hd, hidden]),
@@ -407,7 +416,10 @@ mod tests {
                 format!("{p}.self_attn.v_proj.weight"),
                 bf16(&[nkv * hd, hidden]),
             );
-            t.insert(format!("{p}.self_attn.o_proj.weight"), bf16(&[hidden, nh * hd]));
+            t.insert(
+                format!("{p}.self_attn.o_proj.weight"),
+                bf16(&[hidden, nh * hd]),
+            );
             t.insert(format!("{p}.self_attn.q_norm.weight"), bf16(&[hd]));
             t.insert(format!("{p}.self_attn.k_norm.weight"), bf16(&[hd]));
             t.insert(format!("{p}.mlp.gate_proj.weight"), bf16(&[inter, hidden]));
@@ -464,7 +476,10 @@ mod tests {
         assert_eq!(out_f32.dims(), &[1, 4, 6]);
         let a = out_f32.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         let b = out_bf16.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        assert!(a.iter().all(|x| x.is_finite()), "last_hidden must be finite");
+        assert!(
+            a.iter().all(|x| x.is_finite()),
+            "last_hidden must be finite"
+        );
         assert_eq!(
             a, b,
             "bf16-store last_hidden must be bit-identical to the f32-store forward"
@@ -494,7 +509,10 @@ mod tests {
         let (n, hidden) = (4usize, 6usize);
         let embeds = vec![(Tensor::ones((n, hidden), DType::F32, &dev).unwrap() * 0.5).unwrap()];
         let deepstack = vec![(0..3)
-            .map(|k| (Tensor::ones((n, hidden), DType::F32, &dev).unwrap() * (0.01 * (k + 1) as f64)).unwrap())
+            .map(|k| {
+                (Tensor::ones((n, hidden), DType::F32, &dev).unwrap() * (0.01 * (k + 1) as f64))
+                    .unwrap()
+            })
             .collect::<Vec<_>>()];
         let grids = [[1i32, 4, 4]];
 

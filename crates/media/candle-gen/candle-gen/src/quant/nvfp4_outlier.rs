@@ -200,7 +200,12 @@ mod tests {
         let mut seed = 0xBEEF_0001u64;
         let data: Vec<f32> = (0..rows * cols).map(|_| prng(&mut seed) * 0.3).collect();
         let s = OutlierSparsity::from_slice(&data, rows, cols, OutlierSparsity::DEFAULT_TAU);
-        assert_eq!(s.class(), OutlierClass::Benign, "benign fraction = {}", s.benign_fraction);
+        assert_eq!(
+            s.class(),
+            OutlierClass::Benign,
+            "benign fraction = {}",
+            s.benign_fraction
+        );
         assert!(s.w4a4_viable());
         assert!(s.benign_fraction > 0.995);
     }
@@ -230,7 +235,11 @@ mod tests {
         );
         assert_eq!(s.class(), OutlierClass::Sparse);
         assert!(s.w4a4_viable());
-        assert!(s.max_crush_ratio > 50.0, "crush ratio {}", s.max_crush_ratio);
+        assert!(
+            s.max_crush_ratio > 50.0,
+            "crush ratio {}",
+            s.max_crush_ratio
+        );
     }
 
     /// Dense outliers (an outlier in most blocks — a caption/cross-attn-style feature) → Dense: W4A4
@@ -248,9 +257,16 @@ mod tests {
             }
         }
         let s = OutlierSparsity::from_slice(&data, rows, cols, OutlierSparsity::DEFAULT_TAU);
-        assert!(s.benign_fraction < OutlierSparsity::DENSE_FLOOR, "bf = {}", s.benign_fraction);
+        assert!(
+            s.benign_fraction < OutlierSparsity::DENSE_FLOOR,
+            "bf = {}",
+            s.benign_fraction
+        );
         assert_eq!(s.class(), OutlierClass::Dense);
-        assert!(!s.w4a4_viable(), "dense-outlier layer must not be W4A4-viable");
+        assert!(
+            !s.w4a4_viable(),
+            "dense-outlier layer must not be W4A4-viable"
+        );
     }
 
     /// The metric runs through a `[.., cols]` tensor and agrees with the slice path.

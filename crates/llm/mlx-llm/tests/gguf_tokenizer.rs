@@ -75,10 +75,17 @@ fn gguf_bpe_tokenizer_roundtrip_matches_hf() {
         TokenizerStatus::Reconstructed(kind) => println!("reconstructed: {kind}"),
         other => panic!("expected a reconstructed tokenizer, got {other:?}"),
     }
-    assert!(out.join("tokenizer.json").exists(), "tokenizer.json not written");
-    assert!(out.join("tokenizer_config.json").exists(), "tokenizer_config.json not written");
+    assert!(
+        out.join("tokenizer.json").exists(),
+        "tokenizer.json not written"
+    );
+    assert!(
+        out.join("tokenizer_config.json").exists(),
+        "tokenizer_config.json not written"
+    );
 
-    let recon = Tokenizer::from_file(out.join("tokenizer.json")).expect("load reconstructed tokenizer");
+    let recon =
+        Tokenizer::from_file(out.join("tokenizer.json")).expect("load reconstructed tokenizer");
     let hf = Tokenizer::from_file(format!("{hf_dir}/tokenizer.json")).expect("load HF tokenizer");
 
     let mut mismatches: Vec<String> = Vec::new();
@@ -87,7 +94,9 @@ fn gguf_bpe_tokenizer_roundtrip_matches_hf() {
         let a = hf.encode(text, false).unwrap();
         let b = recon.encode(text, false).unwrap();
         if a != b {
-            mismatches.push(format!("encode mismatch on {text:?}:\n    hf   ={a:?}\n    recon={b:?}"));
+            mismatches.push(format!(
+                "encode mismatch on {text:?}:\n    hf   ={a:?}\n    recon={b:?}"
+            ));
             continue;
         }
         // Decode the ids back; the reconstructed decoder must reproduce the same surface text the HF
@@ -95,7 +104,9 @@ fn gguf_bpe_tokenizer_roundtrip_matches_hf() {
         let da = hf.decode(&a, false).unwrap();
         let db = recon.decode(&b, false).unwrap();
         if da != db {
-            mismatches.push(format!("decode mismatch on {text:?}: hf={da:?} recon={db:?}"));
+            mismatches.push(format!(
+                "decode mismatch on {text:?}: hf={da:?} recon={db:?}"
+            ));
         }
     }
     std::fs::remove_dir_all(&out).ok();
@@ -121,12 +132,18 @@ fn gguf_bpe_snapshot_runs_self_contained() {
     };
 
     let (out, status) = convert_self_contained(&gguf);
-    assert!(matches!(status, TokenizerStatus::Reconstructed(_)), "tokenizer not reconstructed");
+    assert!(
+        matches!(status, TokenizerStatus::Reconstructed(_)),
+        "tokenizer not reconstructed"
+    );
 
     // EOS id stamped into config.json so the engine resolves stop tokens from the snapshot alone.
     let eos = eos_token_ids(&out);
     let fallback = vec![128001, 128008, 128009];
-    assert_ne!(eos, fallback, "config.json did not carry an eos_token_id (got the llama3 fallback)");
+    assert_ne!(
+        eos, fallback,
+        "config.json did not carry an eos_token_id (got the llama3 fallback)"
+    );
 
     // Full self-contained load: tokenizer + config + weights all from the converted directory.
     let tok = Tokenizer::from_file(out.join("tokenizer.json")).unwrap();
@@ -134,16 +151,28 @@ fn gguf_bpe_snapshot_runs_self_contained() {
     let model = CausalLm::from_weights(&Weights::from_dir(&out).unwrap(), "", cfg).unwrap();
 
     let prompt = "The capital of France is";
-    let ids: Vec<i32> = tok.encode(prompt, false).unwrap().into_iter().map(|x| x as i32).collect();
+    let ids: Vec<i32> = tok
+        .encode(prompt, false)
+        .unwrap()
+        .into_iter()
+        .map(|x| x as i32)
+        .collect();
     let gen = GenerationConfig {
         max_new_tokens: 16,
         sampling: SamplingParams::default(),
         seed: Some(0),
         stop_tokens: eos.clone(),
     };
-    let tokens = generate(&model, &ids, &gen, &CancelFlag::new(), &mut |_| {}).unwrap().tokens;
-    let text = tok.decode(&tokens.iter().map(|&x| x as u32).collect::<Vec<_>>(), true).unwrap();
+    let tokens = generate(&model, &ids, &gen, &CancelFlag::new(), &mut |_| {})
+        .unwrap()
+        .tokens;
+    let text = tok
+        .decode(&tokens.iter().map(|&x| x as u32).collect::<Vec<_>>(), true)
+        .unwrap();
     println!("self-contained generation :: {}", text.replace('\n', " "));
     std::fs::remove_dir_all(&out).ok();
-    assert!(!text.trim().is_empty(), "self-contained snapshot produced no text");
+    assert!(
+        !text.trim().is_empty(),
+        "self-contained snapshot produced no text"
+    );
 }
