@@ -92,9 +92,7 @@ impl ChatterboxVoiceEmbedder {
                 DType::F32,
                 &device,
             )
-                .map_err(|e| {
-                    gen_core::Error::Msg(format!("{MODEL_ID}: loading {WEIGHTS_FILE}: {e}"))
-                })?
+            .map_err(|e| gen_core::Error::Msg(format!("{MODEL_ID}: loading {WEIGHTS_FILE}: {e}")))?
         };
         let built = Arc::new(
             SpeakerEncoder::new(vb, device)
