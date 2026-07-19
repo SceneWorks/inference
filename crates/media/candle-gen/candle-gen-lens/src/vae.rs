@@ -41,7 +41,7 @@ pub fn decode(
 /// matching the reference `_to_pil` quantization.
 pub fn to_uint8(image: &Tensor) -> Result<Tensor> {
     let x = image.to_dtype(DType::F32)?.clamp(-1f32, 1f32)?;
-    ((x + 1.0)? * 127.5)?.to_dtype(DType::U8)
+    candle_gen::round_rgb8(&((x + 1.0)? * 127.5)?)
 }
 
 /// Encode an RGB image `[B, 3, H, W]` (NCHW, ~`[−1, 1]`) into the packed Lens DiT latent

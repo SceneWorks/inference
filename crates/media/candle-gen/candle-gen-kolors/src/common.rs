@@ -14,7 +14,7 @@
 //! shared struct, so the IP provider (whose `generate` is `&mut self` for `set_ip_context`) can call
 //! them from inside its disjoint-field borrow region without fighting the borrow checker.
 
-use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
+use candle_gen::candle_core::{Device, IndexOp, Tensor};
 use candle_gen::gen_core::sampling::{schedule_sigmas, DiscreteModelSampling, Scheduler};
 use candle_gen::gen_core::Image;
 use candle_gen::{CandleError, LatentDecoder, Result};
@@ -99,8 +99,8 @@ pub(crate) fn decode(
 /// from the tensor, never assumed (PiD may be 4× the VAE-native size).
 pub(crate) fn to_image(img: &Tensor) -> Result<Image> {
     let img = ((img / 2.)? + 0.5)?.clamp(0f32, 1f32)?;
-    let img = (img * 255.)?
-        .to_dtype(DType::U8)?
+    let scaled = (img * 255.)?;
+    let img = candle_gen::round_rgb8(&scaled)?
         .i(0)?
         .to_device(&Device::Cpu)?;
     let (c, h, w) = img.dims3()?;

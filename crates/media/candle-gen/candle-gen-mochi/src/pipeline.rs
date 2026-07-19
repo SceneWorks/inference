@@ -234,7 +234,7 @@ pub fn to_uint8_frames(video: &Tensor) -> CResult<Tensor> {
     let half = chw.to_dtype(DType::F32)?.affine(0.5, 0.5)?; // (x + 1) / 2
     let clipped = half.clamp(0.0f32, 1.0f32)?;
     let scaled = clipped.affine(255.0, 0.0)?;
-    Ok(scaled.to_dtype(DType::U8)?)
+    Ok(candle_gen::round_rgb8(&scaled)?)
 }
 
 /// `(F, H, W, 3)` uint8 → one [`Image`] per frame.

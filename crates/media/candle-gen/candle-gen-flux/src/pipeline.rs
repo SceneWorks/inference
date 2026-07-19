@@ -954,7 +954,8 @@ impl Pipeline {
 /// Shared by the native VAE decode and the PiD super-resolving decode; the output size is read from the
 /// tensor, never assumed (PiD may be 4× the VAE-native size).
 fn to_image(decoded: &Tensor) -> Result<Image> {
-    let img = ((decoded.clamp(-1f32, 1f32)? + 1.0)? * 127.5)?.to_dtype(DType::U8)?;
+    let scaled = ((decoded.clamp(-1f32, 1f32)? + 1.0)? * 127.5)?;
+    let img = candle_gen::round_rgb8(&scaled)?;
     let img = img.i(0)?.to_device(&Device::Cpu)?;
     let (c, h, w) = img.dims3()?;
     if c != 3 {

@@ -81,9 +81,8 @@ fn seeded_normal5(
 /// `(1,3,H,W)` in [-1,1] → RGB8 [`Image`].
 fn decoded_to_image(decoded: &Tensor) -> Result<Image> {
     let (_b, _c, h, w) = decoded.dims4()?;
-    let u8s = ((decoded.clamp(-1f32, 1f32)? + 1.0)? * 127.5)?
-        .to_dtype(DType::U8)?
-        .to_device(&Device::Cpu)?;
+    let scaled = ((decoded.clamp(-1f32, 1f32)? + 1.0)? * 127.5)?;
+    let u8s = candle_gen::round_rgb8(&scaled)?.to_device(&Device::Cpu)?;
     let chw = u8s.squeeze(0)?; // (3,H,W)
     let pixels = chw.permute((1, 2, 0))?.flatten_all()?.to_vec1::<u8>()?;
     Ok(Image {

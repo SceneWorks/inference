@@ -50,6 +50,17 @@ pub use gen_core::{
 pub use candle_core;
 pub use candle_nn;
 
+/// Quantize an already-clamped/scaled `[0, 255]` float tensor to RGB8 with diffusers-compatible
+/// nearest-even rounding. Candle's native `round` uses half-away ties, while MLX/PyTorch use
+/// nearest-even; spelling the tie correction once keeps the two inference backends pixel-identical.
+pub fn round_rgb8(scaled: &candle_core::Tensor) -> candle_core::Result<candle_core::Tensor> {
+    let floor = scaled.floor()?;
+    let is_tie = scaled.sub(&floor)?.eq(0.5)?;
+    let parity = floor.sub(&floor.affine(0.5, 0.0)?.floor()?.affine(2.0, 0.0)?)?;
+    let rounded = is_tie.where_cond(&floor.add(&parity)?, &scaled.round()?)?;
+    rounded.to_dtype(candle_core::DType::U8)
+}
+
 // Shared sorted-`.safetensors` → unsafe-mmap loader (sc-8999 / F-019): the single audited home for
 // the `list a snapshot component dir, sort deterministically, error-if-empty, unsafe-mmap into a
 // VarBuilder` idiom that was hand-copied ~34 times across the provider crates. Concentrates the
@@ -298,5 +309,19 @@ mod tests {
         let candle_err = CandleError::from(bad.unwrap_err());
         let neutral: gen_core::Error = candle_err.into();
         assert!(matches!(neutral, gen_core::Error::Backend(_)));
+    }
+
+    #[test]
+    fn rgb8_policy_rounds_midpoints_to_even_before_u8_cast() {
+        // A direct f32 -> u8 cast truncates, while Candle's native round uses half-away ties. The
+        // shared seam deliberately matches MLX/PyTorch nearest-even instead.
+        let scaled = candle_core::Tensor::from_slice(
+            &[0.5f32, 1.5, 2.5, 3.5, 254.5],
+            5,
+            &candle_core::Device::Cpu,
+        )
+        .unwrap();
+        let rgb8 = round_rgb8(&scaled).unwrap().to_vec1::<u8>().unwrap();
+        assert_eq!(rgb8, [0, 2, 2, 4, 254]);
     }
 }

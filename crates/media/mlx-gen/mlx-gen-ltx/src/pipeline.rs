@@ -198,7 +198,7 @@ pub fn to_uint8_frames(video: &Array) -> Result<Array> {
         &scalar(1.0).as_dtype(dt)?,
     )?;
     let scaled = multiply(&clipped, &scalar(255.0).as_dtype(dt)?)?;
-    contiguous(&scaled.as_dtype(Dtype::Uint8)?)
+    contiguous(&mlx_rs::ops::round(&scaled, None)?.as_dtype(Dtype::Uint8)?)
 }
 
 // --- sc-6894 F-004: LTX VAE decode budgeting ------------------------------------------------------

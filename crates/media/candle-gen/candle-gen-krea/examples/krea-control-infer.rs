@@ -224,7 +224,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "DECODE_MS tile_vae_decode={tile_vae} {}",
         decode_t0.elapsed().as_millis()
     );
-    let img = ((decoded.clamp(-1f32, 1f32)? + 1.0)? * 127.5)?.to_dtype(DType::U8)?;
+    let scaled = ((decoded.clamp(-1f32, 1f32)? + 1.0)? * 127.5)?;
+    let img = candle_gen::round_rgb8(&scaled)?;
     let img = img
         .squeeze(0)?
         .to_device(&candle_gen::candle_core::Device::Cpu)?;

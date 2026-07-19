@@ -359,9 +359,8 @@ fn cuda_video_hd_tiling_smoke() {
     );
 
     // decoded is (1,3,1,H,W) in [-1,1]; bring to RGB8 the same way the pipeline does.
-    let u8s = ((decoded.clamp(-1f32, 1f32).unwrap() + 1.0).unwrap() * 127.5)
-        .unwrap()
-        .to_dtype(DType::U8)
+    let scaled = ((decoded.clamp(-1f32, 1f32).unwrap() + 1.0).unwrap() * 127.5).unwrap();
+    let u8s = candle_gen::round_rgb8(&scaled)
         .unwrap()
         .to_device(&candle_gen::candle_core::Device::Cpu)
         .unwrap();

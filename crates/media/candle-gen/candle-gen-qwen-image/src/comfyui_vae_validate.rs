@@ -49,10 +49,8 @@ fn load_snapshot(dir: &std::path::Path, device: &Device) -> QwenVae {
 
 /// `[1, 3, H, W]` decode in `[-1, 1]` → an RGB [`Image`] (the same clamp/quantize `to_image` uses).
 fn to_image(decoded: &Tensor) -> Image {
-    let img = ((decoded.clamp(-1f32, 1f32).unwrap() + 1.0).unwrap() * 127.5)
-        .unwrap()
-        .to_dtype(DType::U8)
-        .unwrap();
+    let scaled = ((decoded.clamp(-1f32, 1f32).unwrap() + 1.0).unwrap() * 127.5).unwrap();
+    let img = candle_gen::round_rgb8(&scaled).unwrap();
     let img = img.i(0).unwrap().to_device(&Device::Cpu).unwrap();
     let (_c, h, w) = img.dims3().unwrap();
     let pixels = img

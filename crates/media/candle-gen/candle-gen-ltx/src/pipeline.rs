@@ -116,9 +116,8 @@ pub fn decode_audio_track(
 
 /// Decoded video `[1, 3, T, H, W]` in `[-1, 1]` → one RGB8 [`Image`] per frame.
 pub fn frames_to_images(decoded: &Tensor) -> Result<Vec<Image>> {
-    let u8s = ((decoded.clamp(-1f32, 1f32)? + 1.0)? * 127.5)?
-        .to_dtype(DType::U8)?
-        .to_device(&Device::Cpu)?;
+    let scaled = ((decoded.clamp(-1f32, 1f32)? + 1.0)? * 127.5)?;
+    let u8s = candle_gen::round_rgb8(&scaled)?.to_device(&Device::Cpu)?;
     let (_b, c, t, h, w) = u8s.dims5()?;
     let frames = u8s.squeeze(0)?; // [3,T,H,W]
     let mut out = Vec::with_capacity(t);

@@ -273,7 +273,7 @@ fn pixels_to_u8(video_cthw: &Array) -> Result<Array> {
     let thwc = video_cthw.transpose_axes(&[1, 2, 3, 0])?; // [T,H,W,3]
     let scaled = multiply(&add(&thwc, scalar(1.0))?, scalar(127.5))?;
     let clamped = minimum(&maximum(&scaled, scalar(0.0))?, scalar(255.0))?;
-    Ok(clamped.as_dtype(Dtype::Uint8)?)
+    Ok(mlx_rs::ops::round(&clamped, None)?.as_dtype(Dtype::Uint8)?)
 }
 
 /// Run the full SCAIL-2 generation for `job`, loading each component from the snapshot `root`.

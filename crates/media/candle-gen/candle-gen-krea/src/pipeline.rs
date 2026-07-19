@@ -1554,7 +1554,8 @@ fn init_noise(height: u32, width: u32, seed: u64, device: &Device) -> Result<Ten
 /// The reference `clamp(-1,1)·0.5 + 0.5` denormalize is the `(x+1)·127.5` below; the output size is read
 /// from the tensor, never assumed (PiD may be larger than VAE-native).
 pub(crate) fn to_image(decoded: &Tensor) -> Result<Image> {
-    let img = ((decoded.clamp(-1f32, 1f32)? + 1.0)? * 127.5)?.to_dtype(DType::U8)?;
+    let scaled = ((decoded.clamp(-1f32, 1f32)? + 1.0)? * 127.5)?;
+    let img = candle_gen::round_rgb8(&scaled)?;
     let img = img.i(0)?.to_device(&Device::Cpu)?;
     let (c, h, w) = img.dims3()?;
     if c != 3 {
