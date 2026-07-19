@@ -2,6 +2,7 @@
 //! crates add them to a [`ProviderRegistryBuilder`], and platform catalogs select the families they
 //! ship. This is the Rust equivalent of an ordinary DI composition root with resolve-by-id.
 
+use crate::audio_transform::{AudioTransform, AudioTransformDescriptor, AudioTransformKind};
 use crate::caption::{Captioner, CaptionerDescriptor};
 use crate::generator::{ConditioningKind, Generator, Modality, ModelDescriptor};
 use crate::image_embed::{ImageEmbedder, ImageEmbedderDescriptor};
@@ -124,6 +125,15 @@ pub struct TransformRegistration {
     pub load: fn(&LoadSpec) -> Result<Box<dyn Transform>>,
 }
 
+/// An audio-transform provider's registration (parallel to [`TransformRegistration`]; sc-12839). The
+/// audio sibling of the (image) transform: a non-prompt audio→audio / audio→stems transform (voice
+/// conversion, stem separation, super-resolution) resolved and loaded exactly like every other kind.
+#[derive(Clone, Copy)]
+pub struct AudioTransformRegistration {
+    pub descriptor: fn() -> AudioTransformDescriptor,
+    pub load: fn(&LoadSpec) -> Result<Box<dyn AudioTransform>>,
+}
+
 /// A trainer provider's registration (parallel to [`ModelRegistration`]) — `descriptor` for
 /// introspection, `load` to construct the trainer with its (frozen) base model from a [`LoadSpec`].
 #[derive(Clone, Copy)]
@@ -170,6 +180,7 @@ pub struct VoiceEmbedderRegistration {
 pub struct ProviderRegistryBuilder {
     generators: Vec<ModelRegistration>,
     transforms: Vec<TransformRegistration>,
+    audio_transforms: Vec<AudioTransformRegistration>,
     trainers: Vec<TrainerRegistration>,
     captioners: Vec<CaptionerRegistration>,
     image_embedders: Vec<ImageEmbedderRegistration>,
@@ -195,6 +206,11 @@ impl ProviderRegistryBuilder {
 
     builder_registration_method!(register_generator, generators, ModelRegistration);
     builder_registration_method!(register_transform, transforms, TransformRegistration);
+    builder_registration_method!(
+        register_audio_transform,
+        audio_transforms,
+        AudioTransformRegistration
+    );
     builder_registration_method!(register_trainer, trainers, TrainerRegistration);
     builder_registration_method!(register_captioner, captioners, CaptionerRegistration);
     builder_registration_method!(
@@ -250,6 +266,7 @@ impl ProviderRegistryBuilder {
         }
         ensure_unique!(generators, "generator");
         ensure_unique!(transforms, "transform");
+        ensure_unique!(audio_transforms, "audio transform");
         ensure_unique!(trainers, "trainer");
         ensure_unique!(captioners, "captioner");
         ensure_unique!(image_embedders, "image embedder");
@@ -259,6 +276,7 @@ impl ProviderRegistryBuilder {
         Ok(ProviderRegistry {
             generators: self.generators.into_boxed_slice(),
             transforms: self.transforms.into_boxed_slice(),
+            audio_transforms: self.audio_transforms.into_boxed_slice(),
             trainers: self.trainers.into_boxed_slice(),
             captioners: self.captioners.into_boxed_slice(),
             image_embedders: self.image_embedders.into_boxed_slice(),
@@ -273,6 +291,7 @@ impl ProviderRegistryBuilder {
 pub struct ProviderRegistry {
     generators: Box<[ModelRegistration]>,
     transforms: Box<[TransformRegistration]>,
+    audio_transforms: Box<[AudioTransformRegistration]>,
     trainers: Box<[TrainerRegistration]>,
     captioners: Box<[CaptionerRegistration]>,
     image_embedders: Box<[ImageEmbedderRegistration]>,
@@ -345,6 +364,14 @@ impl ProviderRegistry {
         dyn Transform
     );
     explicit_registry_kind!(
+        audio_transforms,
+        load_audio_transform,
+        audio_transforms,
+        AudioTransformRegistration,
+        "audio transform",
+        dyn AudioTransform
+    );
+    explicit_registry_kind!(
         trainers,
         load_trainer,
         trainers,
@@ -406,6 +433,7 @@ impl ProviderRegistry {
         descriptor_conformance_errors_for(
             &self.generators,
             &self.transforms,
+            &self.audio_transforms,
             &self.trainers,
             &self.captioners,
             &self.image_embedders,
@@ -546,9 +574,14 @@ fn check_unique_ids(errs: &mut Vec<String>, kind: &str, ids: &[&str]) {
 /// the `gen-core-testkit` suite.
 ///
 /// Returns one message per violation (empty = conformant).
+// One `&[Registration]` slice per provider kind, so the arg count tracks the number of kinds (8 as
+// of the sc-12839 audio-transform lane) rather than any avoidable coupling — the alternative is a
+// throwaway "all registrations" struct that adds no clarity.
+#[allow(clippy::too_many_arguments)]
 fn descriptor_conformance_errors_for(
     generator_registrations: &[ModelRegistration],
     transform_registrations: &[TransformRegistration],
+    audio_transform_registrations: &[AudioTransformRegistration],
     trainer_registrations: &[TrainerRegistration],
     captioner_registrations: &[CaptionerRegistration],
     image_embedder_registrations: &[ImageEmbedderRegistration],
@@ -623,6 +656,39 @@ fn descriptor_conformance_errors_for(
     }
     let tf_ids: Vec<&str> = tf_descs.iter().map(|d| d.id).collect();
     check_unique_ids(&mut errs, "transform", &tf_ids);
+
+    // Audio transforms (sc-12839): identity, a kind/stem-count coherence check (a separator must
+    // advertise ≥ 2 stems; the single-output kinds advertise 0), and id uniqueness.
+    let atf_descs: Vec<AudioTransformDescriptor> = audio_transform_registrations
+        .iter()
+        .map(|r| (r.descriptor)())
+        .collect();
+    for d in &atf_descs {
+        let ctx = format!("audio transform '{}'", d.id);
+        check_identity(
+            &mut errs,
+            &ctx,
+            &[("id", d.id), ("family", d.family), ("backend", d.backend)],
+        );
+        let caps = &d.capabilities;
+        match caps.kind {
+            AudioTransformKind::StemSeparation if caps.stem_count < 2 => errs.push(format!(
+                "{ctx}: StemSeparation advertises stem_count {} (a separator must produce ≥ 2 stems)",
+                caps.stem_count
+            )),
+            AudioTransformKind::VoiceConversion | AudioTransformKind::SuperResolution
+                if caps.stem_count != 0 =>
+            {
+                errs.push(format!(
+                    "{ctx}: {:?} advertises stem_count {} — only StemSeparation produces stems",
+                    caps.kind, caps.stem_count
+                ))
+            }
+            _ => {}
+        }
+    }
+    let atf_ids: Vec<&str> = atf_descs.iter().map(|d| d.id).collect();
+    check_unique_ids(&mut errs, "audio transform", &atf_ids);
 
     let ie_descs: Vec<ImageEmbedderDescriptor> = image_embedder_registrations
         .iter()
@@ -700,6 +766,10 @@ fn descriptor_conformance_errors_for(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio_transform::{
+        AudioTarget, AudioTransform, AudioTransformCapabilities, AudioTransformDescriptor,
+        AudioTransformKind, AudioTransformRequest,
+    };
     use crate::caption::{
         CaptionCapabilities, CaptionOutput, CaptionRequest, Captioner, CaptionerDescriptor,
     };
@@ -1409,6 +1479,243 @@ mod tests {
         assert!(dummy_registry()
             .image_embedders()
             .any(|r| (r.descriptor)().id == "dummy_test_image_embedder"));
+    }
+
+    // ---- audio transforms (sc-12839) --------------------------------------------------------
+
+    /// A weights-free stub audio transform: `apply` returns `out_tracks` copies of the source clip
+    /// (one for the single-output kinds, one per stem for separation), retargeted to the request's
+    /// sample rate — enough to exercise register→resolve→apply for all three shapes without a tensor
+    /// backend.
+    struct DummyAudioTransform {
+        desc: AudioTransformDescriptor,
+        out_tracks: usize,
+    }
+
+    impl AudioTransform for DummyAudioTransform {
+        fn descriptor(&self) -> &AudioTransformDescriptor {
+            &self.desc
+        }
+        fn validate(&self, _req: &AudioTransformRequest) -> Result<()> {
+            Ok(())
+        }
+        fn apply(
+            &self,
+            req: &AudioTransformRequest,
+            _on_progress: &mut dyn FnMut(Progress),
+        ) -> Result<Vec<AudioTrack>> {
+            let rate = match req.target {
+                AudioTarget::Preserve => req.audio.sample_rate,
+                AudioTarget::SampleRate(r) => r,
+            };
+            Ok(vec![
+                AudioTrack {
+                    sample_rate: rate,
+                    ..req.audio.clone()
+                };
+                self.out_tracks
+            ])
+        }
+    }
+
+    fn dummy_voice_conversion_descriptor() -> AudioTransformDescriptor {
+        AudioTransformDescriptor {
+            id: "dummy_voice_conversion",
+            family: "audio",
+            backend: "candle",
+            capabilities: AudioTransformCapabilities {
+                kind: AudioTransformKind::VoiceConversion,
+                ..Default::default()
+            },
+        }
+    }
+
+    fn dummy_stem_separation_descriptor() -> AudioTransformDescriptor {
+        AudioTransformDescriptor {
+            id: "dummy_stem_separation",
+            family: "audio",
+            backend: "candle",
+            capabilities: AudioTransformCapabilities {
+                kind: AudioTransformKind::StemSeparation,
+                stem_count: 4,
+                ..Default::default()
+            },
+        }
+    }
+
+    fn dummy_super_resolution_descriptor() -> AudioTransformDescriptor {
+        AudioTransformDescriptor {
+            id: "dummy_super_resolution",
+            family: "audio",
+            backend: "candle",
+            capabilities: AudioTransformCapabilities {
+                kind: AudioTransformKind::SuperResolution,
+                is_diffusion: true,
+                supports_resample: true,
+                ..Default::default()
+            },
+        }
+    }
+
+    fn dummy_voice_conversion_load(_spec: &LoadSpec) -> Result<Box<dyn AudioTransform>> {
+        Ok(Box::new(DummyAudioTransform {
+            desc: dummy_voice_conversion_descriptor(),
+            out_tracks: 1,
+        }))
+    }
+
+    fn dummy_stem_separation_load(_spec: &LoadSpec) -> Result<Box<dyn AudioTransform>> {
+        Ok(Box::new(DummyAudioTransform {
+            desc: dummy_stem_separation_descriptor(),
+            out_tracks: 4,
+        }))
+    }
+
+    fn dummy_super_resolution_load(_spec: &LoadSpec) -> Result<Box<dyn AudioTransform>> {
+        Ok(Box::new(DummyAudioTransform {
+            desc: dummy_super_resolution_descriptor(),
+            out_tracks: 1,
+        }))
+    }
+
+    crate::register_audio_transform! {
+        const DUMMY_VOICE_CONVERSION_REGISTRATION =
+            dummy_voice_conversion_descriptor => dummy_voice_conversion_load
+    }
+    crate::register_audio_transform! {
+        const DUMMY_STEM_SEPARATION_REGISTRATION =
+            dummy_stem_separation_descriptor => dummy_stem_separation_load
+    }
+    crate::register_audio_transform! {
+        const DUMMY_SUPER_RESOLUTION_REGISTRATION =
+            dummy_super_resolution_descriptor => dummy_super_resolution_load
+    }
+
+    fn audio_transform_registry() -> ProviderRegistry {
+        ProviderRegistryBuilder::new()
+            .register_audio_transform(DUMMY_VOICE_CONVERSION_REGISTRATION)
+            .register_audio_transform(DUMMY_STEM_SEPARATION_REGISTRATION)
+            .register_audio_transform(DUMMY_SUPER_RESOLUTION_REGISTRATION)
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn audio_transform_registry_resolves_by_id() {
+        let registry = audio_transform_registry();
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let t = registry
+            .load_audio_transform("dummy_voice_conversion", &spec)
+            .expect("dummy voice conversion is registered");
+        assert_eq!(t.descriptor().id, "dummy_voice_conversion");
+    }
+
+    #[test]
+    fn unknown_audio_transform_id_errors() {
+        let registry = audio_transform_registry();
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        assert!(registry
+            .load_audio_transform("no_such_audio_transform", &spec)
+            .is_err());
+    }
+
+    #[test]
+    fn audio_transforms_appear_in_iteration() {
+        let registry = audio_transform_registry();
+        assert_eq!(registry.audio_transforms().len(), 3);
+        assert!(registry
+            .audio_transforms()
+            .any(|r| (r.descriptor)().id == "dummy_stem_separation"));
+    }
+
+    #[test]
+    fn duplicate_audio_transform_id_is_rejected() {
+        let err = ProviderRegistryBuilder::new()
+            .register_audio_transform(DUMMY_VOICE_CONVERSION_REGISTRATION)
+            .register_audio_transform(DUMMY_VOICE_CONVERSION_REGISTRATION)
+            .build()
+            .err()
+            .expect("duplicate audio transform id must fail");
+        assert_eq!(
+            err.to_string(),
+            "duplicate audio transform id 'dummy_voice_conversion' in explicit registry"
+        );
+    }
+
+    #[test]
+    fn audio_transform_descriptors_pass_conformance() {
+        assert!(audio_transform_registry()
+            .descriptor_conformance_errors()
+            .is_empty());
+    }
+
+    /// The sc-12839 acceptance path end to end, weights-free: register the three non-prompt
+    /// audio→audio shapes, then resolve + `apply` each and assert the output shape.
+    #[test]
+    fn all_three_audio_transform_shapes_resolve_and_apply() {
+        let registry = audio_transform_registry();
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let source = dummy_audio_track(1024, 16_000);
+
+        // audio→audio: voice conversion, rate-preserving, single output.
+        let vc = registry
+            .load_audio_transform("dummy_voice_conversion", &spec)
+            .unwrap();
+        let converted = vc
+            .apply(
+                &AudioTransformRequest {
+                    audio: source.clone(),
+                    ..Default::default()
+                },
+                &mut |_| {},
+            )
+            .unwrap();
+        assert_eq!(converted.len(), 1);
+        assert_eq!(converted[0].sample_rate, 16_000);
+
+        // audio→Vec<audio>: stem separation, multi output.
+        let stems = registry
+            .load_audio_transform("dummy_stem_separation", &spec)
+            .unwrap();
+        let separated = stems
+            .apply(
+                &AudioTransformRequest {
+                    audio: source.clone(),
+                    ..Default::default()
+                },
+                &mut |_| {},
+            )
+            .unwrap();
+        assert_eq!(separated.len(), 4);
+        assert_eq!(
+            stems.descriptor().capabilities.stem_count as usize,
+            separated.len()
+        );
+
+        // audio→audio: super-resolution / bandwidth extension to a higher rate, single output.
+        let sr = registry
+            .load_audio_transform("dummy_super_resolution", &spec)
+            .unwrap();
+        let restored = sr
+            .apply(
+                &AudioTransformRequest {
+                    audio: source,
+                    target: AudioTarget::SampleRate(48_000),
+                    ..Default::default()
+                },
+                &mut |_| {},
+            )
+            .unwrap();
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].sample_rate, 48_000);
+    }
+
+    fn dummy_audio_track(samples: usize, rate: u32) -> AudioTrack {
+        AudioTrack {
+            samples: vec![0.0; samples],
+            sample_rate: rate,
+            channels: 1,
+        }
     }
 
     struct DummyVoiceEmbedder {
