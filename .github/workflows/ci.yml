@@ -77,6 +77,27 @@ jobs:
       - name: Resolve the full workspace manifest graph
         run: cargo metadata --locked --no-deps --format-version 1 > /dev/null
 
+  # Whole-workspace formatting gate. Runs the pinned rustfmt across every member so drift
+  # cannot re-accumulate anywhere. This was scoped to gen-core only (in the `contracts` job)
+  # because the imported mlx-llm / candle-llm / mlx-gen / candle-gen trees had drifted from
+  # the pinned rustfmt; they were normalized in a dedicated format-only baseline commit
+  # (sc-13275), which is exactly the precondition the old `contracts` note called for. Data
+  # tables that are hand-formatted on purpose (e.g. the GGUF IQ grids) carry `#[rustfmt::skip]`
+  # so `--all` leaves them intact. Deliberately NOT gated by `changes` (like `resolve`):
+  # formatting can drift in any .rs file. `cargo fmt --all` also invokes `cargo metadata`, so
+  # this doubles as a second resolution tripwire — no compile, so it stays fast.
+  format:
+    name: workspace formatting
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup show
+          rustup component add rustfmt
+      - name: Check whole-workspace formatting
+        run: cargo fmt --all --check
+
   workspace:
     name: workspace graph invariants
     needs: changes
@@ -103,14 +124,12 @@ jobs:
       - name: Install pinned Rust toolchain
         run: |
           rustup show
-          rustup component add rustfmt clippy
+          rustup component add clippy
       - name: Cache Cargo
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      # gen-core was already rustfmt-clean before the history migration. The other
-      # imported trees need a dedicated format-only baseline commit before this can
-      # safely become `cargo fmt --all --check`.
-      - name: Format established contract baseline
-        run: cargo fmt -p sceneworks-gen-core -p sceneworks-gen-core-testkit --check
+      # Formatting is enforced whole-workspace by the always-run `format` job
+      # (`cargo fmt --all --check`) now that the imported trees are normalized (sc-13275),
+      # so the former gen-core-only `cargo fmt --check` step here is redundant.
       - name: Clippy contracts
         run: >-
           cargo clippy --locked
