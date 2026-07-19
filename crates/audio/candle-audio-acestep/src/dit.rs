@@ -291,19 +291,22 @@ impl TimestepEmbedding {
         })
     }
 
-    /// `(temb [B, dim], timestep_proj [B, 6·dim])` for a scalar timestep. The reference
-    /// `AceStepTimestepEmbedding` scales the `[0, 1]` timestep by `self.scale = 1000.0` before the
-    /// sinusoid (`t_freq = time_sinusoid(t · 1000)`), then `linear_1 → SiLU → linear_2 → SiLU`
-    /// yields `temb`, and `time_proj(temb)` yields the 6-way AdaLN projection. Missing the ×1000
-    /// scale collapses the per-step conditioning (near-constant across the 8 sigmas) and flattens
-    /// the output dynamics.
+    /// `(temb [B, dim], timestep_proj [B, 6·dim])` for a scalar timestep, matching the diffusers
+    /// v0.39.0 `AceStepTimestepEmbedding.forward` exactly:
+    ///
+    /// ```text
+    ///   t_freq = time_sinusoid(t · self.scale)        # self.scale = 1000.0
+    ///   temb   = linear_2(act1(linear_1(t_freq)))     # RAW linear_2 output — feeds the output AdaLN
+    ///   tproj  = time_proj(act2(temb))                # act2 (SiLU) is applied ONLY into time_proj
+    /// ```
+    ///
+    /// The `×1000` timestep scale is load-bearing: feeding `t ∈ [0, 1]` raw collapses the per-step
+    /// conditioning (near-constant across the 8 sigmas) and flattens the output dynamics. `temb` is
+    /// the raw `linear_2` output (no `act2`); the output-projection AdaLN consumes it unchanged.
     fn forward(&self, t: f64, device: &Device) -> CandleResult<(Tensor, Tensor)> {
         let s = sinusoidal(self.freq_dim, t * 1000.0, device)?;
-        let temb = self
-            .linear_2
-            .forward(&self.linear_1.forward(&s)?.silu()?)?
-            .silu()?; // [1, dim] (act2 applied here — temb feeds the output AdaLN)
-        let tproj = self.time_proj.forward(&temb)?; // [1, 6·dim]
+        let temb = self.linear_2.forward(&self.linear_1.forward(&s)?.silu()?)?; // [1, dim]
+        let tproj = self.time_proj.forward(&temb.silu()?)?; // [1, 6·dim] — act2 into time_proj only
         Ok((temb, tproj))
     }
 
