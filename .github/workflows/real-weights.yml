@@ -73,6 +73,7 @@ jobs:
       OPENVOICE_V2_SNAPSHOT: ${{ vars.OPENVOICE_V2_SNAPSHOT }}
       WHISPER_SNAPSHOT: ${{ vars.WHISPER_SNAPSHOT }}
       CLAP_SNAPSHOT: ${{ vars.CLAP_SNAPSHOT }}
+      MOSS_TTS_REALTIME_SNAPSHOT: ${{ vars.MOSS_TTS_REALTIME_SNAPSHOT }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: Toolchain versions
@@ -88,6 +89,7 @@ jobs:
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model openvoice-v2 --snapshot "$OPENVOICE_V2_SNAPSHOT"
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model whisper-base --snapshot "$WHISPER_SNAPSHOT"
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model clap-htsat-unfused --snapshot "$CLAP_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model moss-tts-realtime --snapshot "$MOSS_TTS_REALTIME_SNAPSHOT"
       - name: Run provider conformance
         run: |
           cargo test --locked -p candle-audio-kokoro --test conformance kokoro_conformance -- --ignored --nocapture

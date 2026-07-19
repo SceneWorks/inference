@@ -1,0 +1,37 @@
+[package]
+name = "candle-audio-moss-tts-realtime"
+version = "0.0.0"
+edition = "2021"
+description = "MOSS-TTS-Realtime-1.7B streaming-TTS provider for the SceneWorks Candle audio lane (sc-13334) — an autoregressive Qwen3-1.7B backbone plus a CSM-style local/depth transformer decoding 16 RVQ speech-codebook tokens per frame, ported natively onto the pinned candle revision. Honest partial: the AR brain emits real RVQ tokens; the external MOSS-Audio-Tokenizer codec (RVQ tokens -> 24 kHz waveform) is not yet ported, so the generator errors at the codec boundary rather than fabricate audio and is NOT registered into the shipping catalog."
+license = "Apache-2.0"
+repository = "https://github.com/SceneWorks/inference"
+keywords = ["candle", "audio", "tts", "streaming", "rvq"]
+categories = ["science"]
+
+[dependencies]
+# Shared candle audio commons (device seam, pinned-SHA hub resolution, WAV encode, AudioError
+# bridge). Re-exports `gen_core` and `candle_core`, so this crate resolves the SAME candle build +
+# gen-core rev as the catalog it will register into once the codec lands.
+candle-audio = { path = "../candle-audio" }
+# candle-nn at the workspace's pinned candle revision (Linear/RmsNorm/Embedding/VarBuilder — the
+# Qwen3 backbone and the local/depth transformer are built from these primitives).
+candle-nn = { workspace = true }
+# Snapshot-preparer contract types for the audio-lane MOSS-TTS-aware preparer probe.
+core-llm = { workspace = true }
+# The Qwen tokenizer (`tokenizer.json` in the pinned snapshot). Workspace pin — the 0.22 side of the
+# intentional tokenizers 0.21/0.22 split (check-workspace.py).
+tokenizers = { workspace = true }
+# Config parsing (config.json: language_config / local_config + top-level audio-token ids).
+serde = { version = "1", features = ["derive"] }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+# HF-cache snapshot resolution for the `#[ignore]`d real-weight conformance test.
+candle-audio = { path = "../candle-audio", features = ["testkit"] }
+
+[features]
+default = []
+# Apple Metal GPU backend — forwarded to the shared audio commons. Not in `default`.
+metal = ["candle-audio/metal"]
+# NVIDIA CUDA backend — forwarded to the shared audio commons. Not in `default`.
+cuda = ["candle-audio/cuda"]
