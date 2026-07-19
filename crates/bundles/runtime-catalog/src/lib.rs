@@ -36,8 +36,9 @@ pub type Result<T> = std::result::Result<T, RuntimeCatalogError>;
 
 /// The bundle's audio-lane declaration, as supplied by a platform bundle to
 /// [`RuntimeCatalog::try_new_with_audio`] (sc-12835): the lane's single tensor backend, its
-/// generators-only provider registry (built by the audio composition root,
-/// `candle-audio-catalog`), and the snapshot-preparer registry that prepares audio model
+/// audio provider registry — generators plus voice embedders and audio transforms (built by the
+/// audio composition root, `candle-audio-catalog`), and the snapshot-preparer registry that
+/// prepares audio model
 /// weights on that backend.
 ///
 /// The preparers ride **in the lane**, not in the bundle's main preparer registry, because the
@@ -50,7 +51,7 @@ pub struct AudioLane {
     /// The single tensor backend every provider in the lane must use — `"candle"` on all three
     /// bundles under the sc-12901 strategy.
     pub backend: &'static str,
-    /// The lane's provider registry (generators-only; validated).
+    /// The lane's provider registry (generators + voice embedders + audio transforms; validated).
     pub generators: gen_core::Result<ProviderRegistry>,
     /// The lane's snapshot-preparer registry (non-empty; every preparer on `backend`).
     pub preparers: core_llm::Result<SnapshotPreparerRegistry>,
@@ -63,9 +64,9 @@ pub struct AudioLane {
 /// Audio is the one sanctioned exception to "one tensor backend per bundle" (sc-12901,
 /// `docs/architecture/audio-backend-strategy.md`): audio generation is Candle-native on every
 /// platform, so the `mlx` macOS bundle carries its audio providers on `candle`. The exception is
-/// scoped — the audio section carries **generators only** (the existing generator contract, no new
-/// trait) plus the lane's own preparers, and every other provider kind plus the media registry
-/// remain strictly single-backend.
+/// scoped — the audio section carries **audio-shaped providers only** (generators, voice embedders,
+/// and audio transforms — the merged audio contracts, no new trait) plus the lane's own preparers,
+/// and every other provider kind plus the media registry remain strictly single-backend.
 struct AudioSection {
     backend: &'static str,
     registry: ProviderRegistry,
@@ -101,9 +102,10 @@ impl RuntimeCatalog {
     /// use. It may equal the bundle's media `backend` (the Candle bundles) or differ from it (the
     /// `mlx` macOS bundle carrying `candle` audio) — the sanctioned cross-backend seam described
     /// by [`Self::audio_backend`] and `docs/architecture/audio-backend-strategy.md`. The audio
-    /// registry is generators-only; registering any other provider kind in it fails validation,
-    /// and the lane must carry at least one snapshot preparer on the audio backend so audio model
-    /// weights are preparable on every platform (sc-12835).
+    /// registry admits only audio-shaped kinds (generators, voice embedders, audio transforms);
+    /// registering an image/text/trainer/captioner provider in it fails validation, and the lane
+    /// must carry at least one snapshot preparer on the audio backend so audio model weights are
+    /// preparable on every platform (sc-12835).
     pub fn try_new_with_audio(
         platform: &'static str,
         backend: &'static str,
@@ -193,9 +195,10 @@ impl RuntimeCatalog {
         self.audio.as_ref().map(|audio| audio.backend)
     }
 
-    /// The validated audio provider registry (generators-only), when this bundle declares an
-    /// audio lane. Audio generators use the ordinary generator contract; load by id through
-    /// this registry's `load` method.
+    /// The validated audio provider registry (generators + voice embedders + audio transforms),
+    /// when this bundle declares an audio lane. Audio generators use the ordinary generator
+    /// contract; load by id through this registry's `load` / `load_voice_embedder` /
+    /// `load_audio_transform` methods.
     pub fn audio(&self) -> Option<&ProviderRegistry> {
         self.audio.as_ref().map(|audio| &audio.registry)
     }
@@ -258,6 +261,18 @@ impl RuntimeCatalog {
                 .audio
                 .iter()
                 .flat_map(|audio| audio.registry.generators())
+                .map(|registration| (registration.descriptor)().id.to_string())
+                .collect(),
+            audio_voice_embedder_ids: self
+                .audio
+                .iter()
+                .flat_map(|audio| audio.registry.voice_embedders())
+                .map(|registration| (registration.descriptor)().id.to_string())
+                .collect(),
+            audio_transform_ids: self
+                .audio
+                .iter()
+                .flat_map(|audio| audio.registry.audio_transforms())
                 .map(|registration| (registration.descriptor)().id.to_string())
                 .collect(),
             audio_snapshot_preparer_backends: self
@@ -362,8 +377,9 @@ impl RuntimeCatalog {
     /// - every audio generator advertises [`gen_core::Modality::Audio`] (sc-12834/sc-12835) — the
     ///   lane exists for the audio modality, not as a side door for cross-backend image/video
     ///   providers (the media registry symmetrically forbids `Modality::Audio`, see `validate`);
-    /// - the audio registry is generators-only — no other provider kind may ride in through the
-    ///   audio seam;
+    /// - the audio registry admits only audio-shaped kinds — generators, voice embedders, and
+    ///   audio transforms, each on the audio backend; the image/text/trainer/captioner kinds may
+    ///   not ride in through the audio seam;
     /// - audio generator ids do not collide with media generator ids (consumers key loads by id
     ///   across both registries);
     /// - the audio registry passes the same weights-free descriptor conformance sweep as media,
@@ -410,18 +426,41 @@ impl RuntimeCatalog {
             }
         }
 
-        let non_generator_kinds = [
+        // The audio lane admits generators plus the two audio-shaped provider kinds the epic's
+        // later slices need — voice embedders (voice-cloning identity, sc-12838) and audio
+        // transforms (non-prompt audio→audio, sc-12839) — each on the audio backend. The
+        // image/text/trainer/captioner kinds remain forbidden (they belong in a media family).
+        for registration in audio.registry.voice_embedders() {
+            let descriptor = (registration.descriptor)();
+            if descriptor.backend != audio.backend {
+                errors.push(format!(
+                    "audio voice embedder '{}' uses backend '{}' in the '{}' audio lane",
+                    descriptor.id, descriptor.backend, audio.backend
+                ));
+            }
+        }
+        for registration in audio.registry.audio_transforms() {
+            let descriptor = (registration.descriptor)();
+            if descriptor.backend != audio.backend {
+                errors.push(format!(
+                    "audio transform '{}' uses backend '{}' in the '{}' audio lane",
+                    descriptor.id, descriptor.backend, audio.backend
+                ));
+            }
+        }
+
+        let forbidden_kinds = [
             ("transform", audio.registry.transforms().count()),
             ("trainer", audio.registry.trainers().count()),
             ("captioner", audio.registry.captioners().count()),
             ("image embedder", audio.registry.image_embedders().count()),
             ("text embedder", audio.registry.text_embedders().count()),
         ];
-        for (kind, count) in non_generator_kinds {
+        for (kind, count) in forbidden_kinds {
             if count != 0 {
                 errors.push(format!(
-                    "audio registry carries {count} {kind} registration(s) — the audio lane is \
-                     generators-only"
+                    "audio registry carries {count} {kind} registration(s) — the audio lane admits \
+                     only generators, voice embedders, and audio transforms"
                 ));
             }
         }
@@ -470,6 +509,15 @@ pub struct RuntimeCatalogSnapshot {
     /// Audio generator ids, in stable catalog order — each a `load` key on the audio registry.
     /// Additive field — empty when the bundle declares no audio lane.
     pub audio_generator_ids: Vec<String>,
+    /// Audio voice-embedder ids (voice-cloning identity, sc-12844), in stable catalog order —
+    /// each a `load_voice_embedder` key on the audio registry. Additive field (sc-12844) — empty
+    /// when the bundle declares no audio lane or ships no voice embedder.
+    pub audio_voice_embedder_ids: Vec<String>,
+    /// Audio transform ids (non-prompt audio→audio: voice conversion / stem separation /
+    /// super-resolution, sc-12839), in stable catalog order — each a `load_audio_transform` key on
+    /// the audio registry. Additive field (sc-12844) — empty when the bundle declares no audio lane
+    /// or ships no audio transform.
+    pub audio_transform_ids: Vec<String>,
     /// The backend of each snapshot preparer carried **in the audio lane** (all equal to
     /// `audio_backend` — `"candle"` on every platform under the sc-12901 strategy). Additive
     /// field (sc-12835) — empty when the bundle declares no audio lane.
@@ -492,6 +540,8 @@ impl RuntimeCatalogSnapshot {
             "snapshot_preparer_backends": self.snapshot_preparer_backends,
             "audio_backend": self.audio_backend,
             "audio_generator_ids": self.audio_generator_ids,
+            "audio_voice_embedder_ids": self.audio_voice_embedder_ids,
+            "audio_transform_ids": self.audio_transform_ids,
             "audio_snapshot_preparer_backends": self.audio_snapshot_preparer_backends,
         })
     }
@@ -673,6 +723,8 @@ mod tests {
         let snapshot = catalog.snapshot();
         assert_eq!(snapshot.audio_backend, None);
         assert!(snapshot.audio_generator_ids.is_empty());
+        assert!(snapshot.audio_voice_embedder_ids.is_empty());
+        assert!(snapshot.audio_transform_ids.is_empty());
         assert!(snapshot.audio_snapshot_preparer_backends.is_empty());
         assert!(snapshot.to_json()["audio_backend"].is_null());
     }
@@ -705,9 +757,10 @@ mod tests {
         ));
     }
 
-    /// The audio seam must not become a general cross-backend hole: only generators may ride it.
+    /// The audio seam must not become a general cross-backend hole: only the audio-shaped kinds
+    /// (generators, voice embedders, audio transforms) may ride it — a text embedder is rejected.
     #[test]
-    fn rejects_non_generator_providers_in_audio_lane() {
+    fn rejects_non_audio_providers_in_audio_lane() {
         fn candle_text_embedder_descriptor() -> gen_core::TextEmbedderDescriptor {
             gen_core::TextEmbedderDescriptor {
                 id: "stub-audio-text-embed",
@@ -745,7 +798,128 @@ mod tests {
         )
         .err()
         .unwrap();
-        assert!(error.to_string().contains("generators-only"));
+        assert!(error.to_string().contains(
+            "audio registry carries 1 text embedder registration(s) — the audio lane admits only \
+             generators, voice embedders, and audio transforms"
+        ));
+    }
+
+    /// A voice embedder (sc-12844) and an audio transform (sc-12839) are admitted to the audio lane
+    /// and surfaced in the snapshot beside the generators — the sc-12844 lane-surfacing decision.
+    #[test]
+    fn admits_and_surfaces_voice_embedder_and_audio_transform() {
+        fn candle_voice_embedder_descriptor() -> gen_core::VoiceEmbedderDescriptor {
+            gen_core::VoiceEmbedderDescriptor {
+                id: "stub-voice-embed",
+                family: "voice",
+                backend: "candle",
+                embedding_dim: 8,
+                mac_only: false,
+            }
+        }
+        fn never_load_voice_embedder(
+            _spec: &gen_core::LoadSpec,
+        ) -> gen_core::Result<Box<dyn gen_core::VoiceEmbedder>> {
+            Err(gen_core::Error::Msg(
+                "not used by catalog tests".to_string(),
+            ))
+        }
+        fn candle_audio_transform_descriptor() -> gen_core::AudioTransformDescriptor {
+            gen_core::AudioTransformDescriptor {
+                id: "stub-voice-convert",
+                family: "audio",
+                backend: "candle",
+                capabilities: gen_core::AudioTransformCapabilities {
+                    kind: gen_core::AudioTransformKind::VoiceConversion,
+                    ..Default::default()
+                },
+            }
+        }
+        fn never_load_audio_transform(
+            _spec: &gen_core::LoadSpec,
+        ) -> gen_core::Result<Box<dyn gen_core::AudioTransform>> {
+            Err(gen_core::Error::Msg(
+                "not used by catalog tests".to_string(),
+            ))
+        }
+
+        let media = gen_core::ProviderRegistryBuilder::new().build();
+        let audio = gen_core::ProviderRegistryBuilder::new()
+            .register_generator(candle_audio_registration())
+            .register_voice_embedder(gen_core::VoiceEmbedderRegistration {
+                descriptor: candle_voice_embedder_descriptor,
+                load: never_load_voice_embedder,
+            })
+            .register_audio_transform(gen_core::AudioTransformRegistration {
+                descriptor: candle_audio_transform_descriptor,
+                load: never_load_audio_transform,
+            })
+            .build();
+
+        let catalog = RuntimeCatalog::try_new_with_audio(
+            "test",
+            "mlx",
+            media,
+            empty_text(),
+            mlx_preparers(),
+            candle_audio_lane(audio),
+        )
+        .unwrap();
+        let snapshot = catalog.snapshot();
+        assert_eq!(snapshot.audio_generator_ids, ["stub-audio"]);
+        assert_eq!(snapshot.audio_voice_embedder_ids, ["stub-voice-embed"]);
+        assert_eq!(snapshot.audio_transform_ids, ["stub-voice-convert"]);
+        assert_eq!(
+            snapshot.to_json()["audio_voice_embedder_ids"][0],
+            "stub-voice-embed"
+        );
+        assert_eq!(
+            snapshot.to_json()["audio_transform_ids"][0],
+            "stub-voice-convert"
+        );
+    }
+
+    /// A voice embedder off the declared audio backend is rejected (single-backend lane).
+    #[test]
+    fn rejects_voice_embedder_off_the_audio_backend() {
+        fn mlx_voice_embedder_descriptor() -> gen_core::VoiceEmbedderDescriptor {
+            gen_core::VoiceEmbedderDescriptor {
+                id: "stub-voice-embed",
+                family: "voice",
+                backend: "mlx",
+                embedding_dim: 8,
+                mac_only: false,
+            }
+        }
+        fn never_load_voice_embedder(
+            _spec: &gen_core::LoadSpec,
+        ) -> gen_core::Result<Box<dyn gen_core::VoiceEmbedder>> {
+            Err(gen_core::Error::Msg(
+                "not used by catalog tests".to_string(),
+            ))
+        }
+
+        let media = gen_core::ProviderRegistryBuilder::new().build();
+        let audio = gen_core::ProviderRegistryBuilder::new()
+            .register_voice_embedder(gen_core::VoiceEmbedderRegistration {
+                descriptor: mlx_voice_embedder_descriptor,
+                load: never_load_voice_embedder,
+            })
+            .build();
+
+        let error = RuntimeCatalog::try_new_with_audio(
+            "test",
+            "mlx",
+            media,
+            empty_text(),
+            mlx_preparers(),
+            candle_audio_lane(audio),
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains(
+            "audio voice embedder 'stub-voice-embed' uses backend 'mlx' in the 'candle' audio lane"
+        ));
     }
 
     /// Consumers key loads by id across both registries, so an id shared between the media and

@@ -101,9 +101,10 @@ mod tests {
         assert_eq!(snapshot.text_llm_ids, ["candle-llama", "candle-llava"]);
         assert_eq!(snapshot.snapshot_preparer_backends, ["candle"]);
         // The audio lane is Candle-native (sc-12901) and matches this bundle's own backend. Its
-        // ordered id surface is the audio catalog's — shipped providers: kokoro_82m (sc-12836)
-        // and moss_sfx_v2 (sc-12841); later stories extend this exact assertion in catalog order.
-        // The lane carries its own composed candle preparer (sc-12835/sc-12836).
+        // ordered id surface is the audio catalog's — shipped generators kokoro_82m (sc-12836) and
+        // moss_sfx_v2 (sc-12841), plus the voice-cloning identity embedder chatterbox_ve
+        // (sc-12844); later stories extend these exact assertions in catalog order. The lane
+        // carries its own composed candle preparer (sc-12835/sc-12836).
         #[cfg(feature = "audio")]
         {
             assert_eq!(
@@ -111,12 +112,16 @@ mod tests {
                 Some(super::AUDIO_BACKEND)
             );
             assert_eq!(snapshot.audio_generator_ids, ["kokoro_82m", "moss_sfx_v2"]);
+            assert_eq!(snapshot.audio_voice_embedder_ids, ["chatterbox_ve"]);
+            assert!(snapshot.audio_transform_ids.is_empty());
             assert_eq!(snapshot.audio_snapshot_preparer_backends, ["candle"]);
         }
         #[cfg(not(feature = "audio"))]
         {
             assert_eq!(snapshot.audio_backend, None);
             assert!(snapshot.audio_generator_ids.is_empty());
+            assert!(snapshot.audio_voice_embedder_ids.is_empty());
+            assert!(snapshot.audio_transform_ids.is_empty());
         }
         #[cfg(feature = "media")]
         assert_eq!(candle_gen_catalog::BESPOKE_UTILITY_CRATES.len(), 6);

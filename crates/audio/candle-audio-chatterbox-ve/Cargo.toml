@@ -1,0 +1,34 @@
+[package]
+name = "candle-audio-chatterbox-ve"
+version = "0.0.0"
+edition = "2021"
+description = "Chatterbox voice-encoder provider for the SceneWorks Candle audio lane (sc-12844) — the first real VoiceEmbedder: Resemble AI Chatterbox's speaker encoder (GE2E-style 3-layer LSTM + projection) ported natively onto the pinned candle revision, turning a reference clip into the speaker-identity vector that conditions cloned-voice TTS via Conditioning::VoiceEmbedding."
+license = "MIT"
+repository = "https://github.com/SceneWorks/inference"
+keywords = ["candle", "voice-cloning", "speaker-encoder", "audio", "chatterbox"]
+categories = ["science"]
+
+[dependencies]
+# The shared candle audio commons (device seam, pinned-SHA hub resolution, host DSP, WAV encode,
+# `AudioError → gen_core::Error` bridge). Re-exports `gen_core` and `candle_core`, so this crate
+# resolves the SAME candle build + gen-core rev as the catalog it registers into.
+candle-audio = { path = "../candle-audio" }
+# candle-nn at the workspace's pinned candle revision (LSTM/Linear/VarBuilder). The speaker
+# encoder is a stacked LSTM + projection whose PyTorch weight layout candle-nn's LSTM reads
+# directly (gate order i,f,g,o matches torch).
+candle-nn = { workspace = true }
+
+[dev-dependencies]
+# HF-cache snapshot resolution for the `#[ignore]`d real-weight conformance test.
+candle-audio = { path = "../candle-audio", features = ["testkit"] }
+# Kokoro TTS supplies the distinct reference voices the discriminative real-weight test embeds
+# (the sanctioned "Kokoro-generated reference audio" path — no external audio fixtures). Dev-only.
+candle-audio-kokoro = { path = "../candle-audio-kokoro" }
+
+[features]
+default = []
+# Apple Metal GPU backend — forwarded to the shared audio commons. Not in `default` (the audio
+# lane ships CPU-first everywhere; see docs/architecture/audio-backend-strategy.md).
+metal = ["candle-audio/metal"]
+# NVIDIA CUDA backend — forwarded to the shared audio commons. Not in `default`.
+cuda = ["candle-audio/cuda"]

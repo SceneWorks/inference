@@ -65,6 +65,16 @@ expected_files = [
 ]
 
 [[models]]
+key = "chatterbox-ve"
+repository = "ResembleAI/chatterbox"
+revision = "5bb1f6ee58e50c3b8d408bc82a6d3740c2db6e18"
+license = "MIT"
+size_class = "small"
+profiles = ["audio-macos"]
+environment = ["CHATTERBOX_VE_SNAPSHOT"]
+expected_files = ["ve.safetensors"]
+
+[[models]]
 key = "mochi-1-preview"
 repository = "genmo/mochi-1-preview"
 revision = "14be5fcea23095ed330cb214647916a451e38b6e"

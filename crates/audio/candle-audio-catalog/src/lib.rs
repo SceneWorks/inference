@@ -8,9 +8,15 @@
 //! `candle-gen-catalog`. It never touches the media catalogs — bundle inclusion of the audio
 //! lane is a deliberate per-bundle edit through `runtime-catalog`'s `AudioLane`.
 //!
-//! The audio lane is **generators-only** (enforced by `runtime-catalog::validate_audio`):
-//! audio providers implement the ordinary [`gen_core::Generator`] contract with
-//! [`gen_core::Modality::Audio`] descriptors — no new trait, no linker discovery.
+//! The audio lane carries **generators plus the two identity-/transform-shaped audio provider
+//! kinds** the epic's later slices need — [`gen_core::VoiceEmbedder`] (voice-cloning identity,
+//! sc-12838) and [`gen_core::AudioTransform`] (non-prompt audio→audio, sc-12839) — validated by
+//! `runtime-catalog::validate_audio`. Generators still implement the ordinary
+//! [`gen_core::Generator`] contract with [`gen_core::Modality::Audio`] descriptors; the added kinds
+//! ride the same explicit ProviderRegistry, surfaced in the bundle snapshot as
+//! `audio_voice_embedder_ids` / `audio_transform_ids` beside `audio_generator_ids` (sc-12844) — no
+//! new trait beyond the merged contracts, no linker discovery. sc-12844 ships the first of these:
+//! the Chatterbox voice encoder (**chatterbox_ve**).
 //!
 //! Since sc-12836 the catalog also owns the **audio lane's snapshot-preparer composition**
 //! ([`snapshot_preparer_registry`]): one `candle` registration that recognizes audio
@@ -31,15 +37,18 @@ pub const AUDIO_BACKEND: &str = "candle";
 
 /// Complete audio provider package surface owned by the Candle audio lane, in catalog order.
 pub mod providers {
+    pub use candle_audio_chatterbox_ve;
     pub use candle_audio_kokoro;
     pub use candle_audio_moss_sfx;
 }
 
 /// Add every provider shipped by the Candle audio lane to an explicit registry builder, in
-/// stable catalog order.
+/// stable catalog order: the generators first (Kokoro TTS, MOSS SFX), then the voice-cloning
+/// identity embedder (Chatterbox `ve`, sc-12844).
 pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistryBuilder {
     let registry = candle_audio_kokoro::register_providers(registry);
-    candle_audio_moss_sfx::register_providers(registry)
+    let registry = candle_audio_moss_sfx::register_providers(registry);
+    candle_audio_chatterbox_ve::register_providers(registry)
 }
 
 /// Build the complete explicit Candle audio provider catalog.
@@ -111,16 +120,25 @@ mod tests {
             .collect();
 
         assert_eq!(generators, ["kokoro_82m", "moss_sfx_v2"]);
+        // The voice-cloning identity embedder surfaces as its own kind (sc-12844), in catalog order.
+        let voice_embedders: Vec<String> = registry
+            .voice_embedders()
+            .map(|r| (r.descriptor)().id.to_string())
+            .collect();
+        assert_eq!(voice_embedders, ["chatterbox_ve"]);
         assert_eq!(
             registry.descriptor_conformance_errors(),
             Vec::<String>::new()
         );
-        // The audio lane is generators-only; no other provider kind may ever register here.
+        // The audio lane admits generators, voice embedders, and audio transforms only — never the
+        // image/text/trainer/captioner kinds (those belong in a media family).
         assert_eq!(registry.transforms().len(), 0);
         assert_eq!(registry.trainers().len(), 0);
         assert_eq!(registry.captioners().len(), 0);
         assert_eq!(registry.image_embedders().len(), 0);
         assert_eq!(registry.text_embedders().len(), 0);
+        // No audio transform ships yet (OpenVoice/RVC conversion is a future sc-12844 slice).
+        assert_eq!(registry.audio_transforms().len(), 0);
         // Every audio generator is candle-backed and audio-modality.
         assert!(registry
             .generators()
@@ -128,6 +146,13 @@ mod tests {
         assert!(registry
             .generators()
             .all(|r| matches!((r.descriptor)().modality, super::gen_core::Modality::Audio)));
+        // Every voice embedder is candle-backed and the "voice" family.
+        assert!(registry
+            .voice_embedders()
+            .all(|r| (r.descriptor)().backend == super::AUDIO_BACKEND));
+        assert!(registry
+            .voice_embedders()
+            .all(|r| (r.descriptor)().family == "voice"));
     }
 
     /// The lane's preparer registry: exactly one `candle` registration whose probe accepts a
