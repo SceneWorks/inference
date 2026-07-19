@@ -26,8 +26,8 @@
 //! guarantees that are identical across modalities.
 
 use gen_core::{
-    AudioParams, AudioTrack, Conditioning, Error, GenerationOutput, GenerationRequest, Generator,
-    Image, Modality,
+    AudioChunk, AudioParams, AudioTrack, Conditioning, Error, GenerationOutput, GenerationRequest,
+    Generator, Image, Modality,
 };
 
 /// Cheap-request parameters for an audio conformance run — the audio analog of
@@ -359,6 +359,179 @@ pub fn check_audio_seed_determinism(
     Ok(())
 }
 
+/// **Incremental-streaming contract (sc-12846).** Drives the provider through
+/// [`Generator::generate_streaming`] and enforces the [`AudioChunk`] reassembly law plus the
+/// [`Capabilities::supports_streaming`](gen_core::Capabilities::supports_streaming) opt-in — the
+/// audio analog of the token-streaming guarantee `core_llm`'s stream events carry:
+///
+/// - the streamed call returns a well-formed [`GenerationOutput::Audio`] track (the shared
+///   `validate_track` floor);
+/// - **reassembly**: concatenating every emitted chunk's `samples` in order equals the returned
+///   track's `samples` byte-for-byte — a provider that streams chunks which do *not* reassemble to
+///   the audio fails here;
+/// - **chunk well-formedness**: each chunk's `sample_rate` / `channels` match the track, `index`
+///   runs `0..N` with no gaps, and each chunk is a whole number of frames;
+/// - **the streamed output equals the one-shot [`generate`](Generator::generate)** for the same
+///   request+seed (deterministic providers) — so the streaming path is a strict refinement of the
+///   one-shot contract, never a different rendering;
+/// - **opt-in shape**: a provider advertising
+///   [`supports_streaming`](gen_core::Capabilities::supports_streaming) must emit **≥ 2** chunks
+///   before completion **and no single chunk may carry the entire track** (each chunk is strictly
+///   shorter than the full track) — the two together are genuine incrementality: the count alone is
+///   gameable by a zero-length chunk plus one full-track chunk, and the per-chunk length bound closes
+///   that (the audio must not arrive in one block); a provider that does **not** advertise streaming
+///   must be byte-for-byte unaffected by the additive method — the default passthrough emits exactly
+///   one chunk equal to the whole track.
+///
+/// Runs for every audio provider (streaming or not), so the additive `generate_streaming` surface is
+/// proven not to perturb the eight one-shot audio families while gating the streaming families on
+/// real incrementality.
+pub fn check_audio_streaming(g: &dyn Generator, profile: &AudioProfile) -> Result<(), String> {
+    let desc = g.descriptor();
+    let id = desc.id;
+    let advertises_streaming = desc.capabilities.supports_streaming;
+    let req = audio_base_request(g, profile);
+
+    // Baseline: the one-shot output the stream must reproduce.
+    let one_shot = g
+        .generate(&req, &mut |_| {})
+        .map_err(|e| format!("streaming[{id}]: baseline one-shot generate() failed: {e}"))?;
+    let one_shot_track = match &one_shot {
+        GenerationOutput::Audio(t) => t,
+        other => {
+            return Err(format!(
+            "streaming[{id}]: a Modality::Audio generator must emit GenerationOutput::Audio from \
+                 generate(), got {}",
+            variant_name(other)
+        ))
+        }
+    };
+
+    // Drive the streaming entry point, collecting the chunks.
+    let mut chunks: Vec<AudioChunk> = Vec::new();
+    let streamed = g
+        .generate_streaming(&req, &mut |c| chunks.push(c), &mut |_| {})
+        .map_err(|e| format!("streaming[{id}]: generate_streaming() failed: {e}"))?;
+    let streamed_track = match &streamed {
+        GenerationOutput::Audio(t) => t,
+        other => {
+            return Err(format!(
+                "streaming[{id}]: generate_streaming() must return GenerationOutput::Audio, got {}",
+                variant_name(other)
+            ))
+        }
+    };
+    validate_track(id, "streaming", streamed_track)?;
+
+    if chunks.is_empty() {
+        return Err(format!(
+            "streaming[{id}]: generate_streaming() emitted no AudioChunk — even the non-streaming \
+             default passthrough must emit one terminal chunk for an audio output"
+        ));
+    }
+
+    // Chunk indices run 0..N with no gaps, and every chunk agrees with the track's format.
+    for (i, c) in chunks.iter().enumerate() {
+        if c.index != i {
+            return Err(format!(
+                "streaming[{id}]: AudioChunk index {} out of order at position {i} (chunks must be \
+                 0..N with no gaps)",
+                c.index
+            ));
+        }
+        if c.sample_rate != streamed_track.sample_rate {
+            return Err(format!(
+                "streaming[{id}]: chunk {i} sample_rate {} != track sample_rate {}",
+                c.sample_rate, streamed_track.sample_rate
+            ));
+        }
+        if c.channels != streamed_track.channels {
+            return Err(format!(
+                "streaming[{id}]: chunk {i} channels {} != track channels {}",
+                c.channels, streamed_track.channels
+            ));
+        }
+        if streamed_track.channels != 0
+            && !c
+                .samples
+                .len()
+                .is_multiple_of(streamed_track.channels as usize)
+        {
+            return Err(format!(
+                "streaming[{id}]: chunk {i} has {} samples, not a whole number of {}-channel frames",
+                c.samples.len(),
+                streamed_track.channels
+            ));
+        }
+    }
+
+    // The reassembly law: concatenated chunk PCM equals the returned track PCM, byte-for-byte.
+    let reassembled: Vec<f32> = chunks
+        .iter()
+        .flat_map(|c| c.samples.iter().copied())
+        .collect();
+    if reassembled != streamed_track.samples {
+        return Err(format!(
+            "streaming[{id}]: concatenated chunks ({} samples) do not reassemble to the returned \
+             track ({} samples) — the AudioChunk reassembly law is violated",
+            reassembled.len(),
+            streamed_track.samples.len()
+        ));
+    }
+
+    // The streamed output must equal the one-shot output (deterministic providers) — the stream is a
+    // refinement of generate(), not a distinct rendering.
+    if streamed_track.samples != one_shot_track.samples {
+        return Err(format!(
+            "streaming[{id}]: streamed audio ({} samples) differs from the one-shot generate() output \
+             ({} samples) for the same request+seed — the streaming path must reproduce generate()",
+            streamed_track.samples.len(),
+            one_shot_track.samples.len()
+        ));
+    }
+
+    if advertises_streaming {
+        // A provider that advertises streaming must be genuinely incremental: ≥ 2 chunks before
+        // completion. This is the assertion that fails if a "streaming" provider buffers the whole
+        // output and emits it as one terminal chunk.
+        if chunks.len() < 2 {
+            return Err(format!(
+                "streaming[{id}]: advertises supports_streaming but emitted {} chunk(s) — a streaming \
+                 provider must emit >= 2 chunks before completion (it appears to buffer everything and \
+                 emit one terminal chunk)",
+                chunks.len()
+            ));
+        }
+        // The chunk-count gate alone is gameable: a provider could emit a zero-length chunk plus one
+        // full-track chunk (2 chunks, reassembles, frame-aligned) while not being incremental at all.
+        // Harden it — no single chunk may hold the entire track. Since the chunks reassemble to the
+        // track, any chunk whose length equals the total forces every other chunk to be empty, i.e.
+        // the whole output arrived in one block. Every chunk must therefore be strictly shorter than
+        // the full track.
+        let total = streamed_track.samples.len();
+        if let Some(i) = chunks.iter().position(|c| c.samples.len() >= total) {
+            return Err(format!(
+                "streaming[{id}]: advertises supports_streaming but chunk {i} carries the entire track \
+                 ({} of {total} samples) — the audio arrived in a single block (an empty chunk plus one \
+                 full-track chunk games the >= 2 count), so the provider is not genuinely incremental",
+                chunks[i].samples.len()
+            ));
+        }
+    } else {
+        // The additive surface must not perturb a non-streaming provider: the default passthrough
+        // emits exactly one chunk equal to the whole track.
+        if chunks.len() != 1 {
+            return Err(format!(
+                "streaming[{id}]: does not advertise supports_streaming yet emitted {} chunks — the \
+                 additive default must pass generate() through as a single terminal chunk",
+                chunks.len()
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 /// Run the full audio-generator conformance suite against a freshly-`make`d generator. Panics with
 /// every failure aggregated — the audio twin of [`conformance`](crate::conformance).
 pub fn audio_conformance(make: impl Fn() -> Box<dyn Generator>, profile: &AudioProfile) {
@@ -366,7 +539,7 @@ pub fn audio_conformance(make: impl Fn() -> Box<dyn Generator>, profile: &AudioP
     let g: &dyn Generator = g.as_ref();
 
     type Check = fn(&dyn Generator, &AudioProfile) -> Result<(), String>;
-    let checks: [Check; 7] = [
+    let checks: [Check; 8] = [
         check_audio_validate_honesty,
         check_audio_output,
         check_audio_progress,
@@ -374,6 +547,7 @@ pub fn audio_conformance(make: impl Fn() -> Box<dyn Generator>, profile: &AudioP
         check_audio_cancellation,
         check_audio_precancellation,
         check_audio_seed_determinism,
+        check_audio_streaming,
     ];
     let failures: Vec<String> = checks
         .into_iter()

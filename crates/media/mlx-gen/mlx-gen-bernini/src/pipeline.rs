@@ -77,6 +77,7 @@ pub fn descriptor() -> ModelDescriptor {
             // is `Modality::Video`; the worker's image fit-gate does not gate on it, so advertising the
             // flag is honest discovery parity + memory hygiene, not a behavior change.)
             supports_sequential_offload: true,
+            supports_streaming: false,
             // No audio surface (sc-12834): pure image/video model.
             audio_sample_rates: vec![],
             max_audio_duration_secs: None,

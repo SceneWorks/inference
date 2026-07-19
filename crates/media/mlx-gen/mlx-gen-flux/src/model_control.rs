@@ -102,6 +102,7 @@ pub fn descriptor_dev_control() -> ModelDescriptor {
             // T5-XXL + CLIP-L text encoders drop after the prompt encode, then the DiT (with the
             // control branch) + VAE load, bounding peak to `max(T5+CLIP, DiT+control+VAE)`.
             supports_sequential_offload: true,
+            supports_streaming: false,
             // No audio surface (sc-12834): pure image/video model.
             audio_sample_rates: vec![],
             max_audio_duration_secs: None,

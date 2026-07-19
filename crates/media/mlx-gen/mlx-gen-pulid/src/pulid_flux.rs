@@ -93,6 +93,7 @@ pub fn descriptor() -> ModelDescriptor {
             requires_sigma_shift: true, // dev
             // Not wired onto the shared `Residency` seam (F-176); Sequential is a no-op fallback.
             supports_sequential_offload: false,
+            supports_streaming: false,
             // No audio surface (sc-12834): pure image/video model.
             audio_sample_rates: vec![],
             max_audio_duration_secs: None,
