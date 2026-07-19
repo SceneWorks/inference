@@ -754,8 +754,9 @@ fn estimated_wan_z16_decode_peak_gib(
 /// The safe peak-GiB budget for the z16 decode tiler — **free-aware** (sc-12734/sc-12758). The decode
 /// runs after the denoise, so it budgets against **FREE** VRAM, not `0.85×TOTAL`. Resolved in order:
 /// `WAN_VAE_BUDGET_GIB` env override (positive float — the deterministic test/worker injection point) →
-/// **free** VRAM × `WAN_Z16_VAE_BUDGET_SAFE_FRAC` (via the live `nvidia-smi memory.free` probe
-/// [`candle_gen::gpu::nvidia_smi_min_free_gib`], i.e. `total − used`) → `WAN_Z16_VAE_DEFAULT_BUDGET_GIB`.
+/// **free** VRAM × `WAN_Z16_VAE_BUDGET_SAFE_FRAC` (via the live `nvidia-smi memory.free` probe of the
+/// render's PINNED device [`candle_gen::gpu::nvidia_smi_rendered_free_gib`], i.e. `total − used` on
+/// Candle's `cuda:0`, not the min across all GPUs — sc-13298) → `WAN_Z16_VAE_DEFAULT_BUDGET_GIB`.
 pub fn wan_z16_vae_safe_budget_gib() -> f64 {
     vae_tiling::free_aware_safe_budget_gib(
         WAN_Z16_VAE_BUDGET_ENV,

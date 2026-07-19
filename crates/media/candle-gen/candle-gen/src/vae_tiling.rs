@@ -198,14 +198,20 @@ pub fn safe_budget_gib(env_var: &str, safe_frac: f64, default_gib: f64) -> f64 {
 /// Why: [`safe_budget_gib`] resolves `total × 0.85`, which IGNORES the model weights the denoise left
 /// resident + the cudarc pool. The Wan decode tiler runs *after* the denoise, so it must budget
 /// against what is genuinely free — otherwise the q8 / i2v-q4 OOMs land in the decode, on top of the
-/// resident weights. This resolver reads the live `nvidia-smi memory.free` MIN across devices
-/// ([`crate::gpu::nvidia_smi_min_free_gib`]), which is the driver's `total − used`, i.e. already
+/// resident weights. This resolver reads the live `nvidia-smi memory.free` of the **render's pinned
+/// device** ([`crate::gpu::nvidia_smi_rendered_free_gib`] — Candle's `cuda:0`, the
+/// `CUDA_VISIBLE_DEVICES` card the worker pinned), which is the driver's `total − used`, i.e. already
 /// `(total − resident)`; the returned budget is `free × safe_frac`.
+///
+/// **sc-13298:** this used to read the MIN free across ALL GPUs, which let a busy CO-TENANT card on a
+/// multi-GPU box shrink the budget of a decode pinned to an idle one (poisoning it down to a spurious
+/// over-budget reject). Reading the pinned device's free fixes that; single-GPU boxes are unchanged,
+/// and an unresolvable `CUDA_VISIBLE_DEVICES` falls back to the old all-GPU min (the conservative side).
 ///
 /// Resolved in order (mirrors [`safe_budget_gib`] so `env_var` stays the deterministic test/worker
 /// injection point):
 ///  1. the `env_var` override (a positive float — e.g. `WAN_VAE_BUDGET_GIB`);
-///  2. `free VRAM × safe_frac` via the live [`crate::gpu::nvidia_smi_min_free_gib`] probe;
+///  2. `free VRAM × safe_frac` via the live [`crate::gpu::nvidia_smi_rendered_free_gib`] probe;
 ///  3. `default_gib` when no trusted `nvidia-smi` is present.
 ///
 /// **Opt-in / blast radius:** this is a *separate* entry point; [`safe_budget_gib`] (used by the LTX
@@ -215,7 +221,7 @@ pub fn free_aware_safe_budget_gib(env_var: &str, safe_frac: f64, default_gib: f6
         env_var,
         safe_frac,
         default_gib,
-        crate::gpu::nvidia_smi_min_free_gib,
+        crate::gpu::nvidia_smi_rendered_free_gib,
     )
 }
 
@@ -228,7 +234,8 @@ pub fn free_aware_budget_gib(free_gib: f64, safe_frac: f64) -> f64 {
 
 /// Core of [`free_aware_safe_budget_gib`] with the free-VRAM probe injected, so the env-override
 /// precedence + the probe→default fallback are unit-testable without a real GPU. The live entry point
-/// passes [`crate::gpu::nvidia_smi_min_free_gib`]; tests pass a stub closure.
+/// passes [`crate::gpu::nvidia_smi_rendered_free_gib`] (the render's pinned device, sc-13298); tests
+/// pass a stub closure.
 fn resolve_free_aware_budget(
     env_var: &str,
     safe_frac: f64,

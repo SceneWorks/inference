@@ -670,10 +670,10 @@ fn estimated_wan22_decode_peak_gib(
 /// top of the resident weights + cudarc pool is exactly what drove the q8 / i2v-q4 OOMs into the
 /// decode. Resolved in order: `WAN_VAE_BUDGET_GIB` env override (positive float — the deterministic
 /// injection point for the worker/tests) → **free** VRAM × `WAN22_VAE_BUDGET_SAFE_FRAC` (via the live
-/// trusted-path `nvidia-smi memory.free` probe
-/// [`candle_gen::gpu::nvidia_smi_min_free_gib`] — `total − used`, i.e. already `(total − resident)`;
-/// an absolute System32/CUDA_PATH binary, never a bare `PATH` lookup; sc-9014 / F-030) →
-/// `WAN22_VAE_DEFAULT_BUDGET_GIB`.
+/// trusted-path `nvidia-smi memory.free` probe of the render's PINNED device
+/// [`candle_gen::gpu::nvidia_smi_rendered_free_gib`] — `total − used` on Candle's `cuda:0`, NOT the min
+/// across all GPUs, so a busy co-tenant card can't poison it (sc-13298); an absolute System32/CUDA_PATH
+/// binary, never a bare `PATH` lookup; sc-9014 / F-030) → `WAN22_VAE_DEFAULT_BUDGET_GIB`.
 ///
 /// Blast radius: this opts the Wan tiler into the free-aware sibling resolver; the LTX tiler keeps the
 /// total-based [`vae_tiling::safe_budget_gib`] unchanged.
