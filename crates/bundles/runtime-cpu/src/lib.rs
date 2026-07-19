@@ -151,8 +151,10 @@ mod tests {
                 backend: super::AUDIO_BACKEND,
                 modality: gen_core::Modality::Audio,
                 capabilities: gen_core::Capabilities {
-                    min_size: 1,
-                    max_size: 4096,
+                    // Audio has no width/height — the sweep exempts Modality::Audio (sc-13314), so
+                    // the bounds stay at the unused 0 like the real audio generators.
+                    min_size: 0,
+                    max_size: 0,
                     max_count: 1,
                     ..Default::default()
                 },

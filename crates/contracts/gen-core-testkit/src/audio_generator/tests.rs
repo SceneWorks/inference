@@ -64,14 +64,13 @@ struct StubAudioGen {
 fn stub_caps() -> Capabilities {
     Capabilities {
         max_count: 4,
-        // Nominal, unused-for-audio size bounds: the weights-free descriptor sweep
-        // (`descriptor_conformance_errors`) requires `1 <= min_size <= max_size` for EVERY generator
-        // regardless of modality (it predates Modality::Audio and does not exempt it), so a valid
-        // audio descriptor must still set non-zero bounds even though `validate_request_audio` skips
-        // the size range entirely. The oversize positive check below (width far above max_size, still
-        // accepted) is exactly what proves the audio floor ignores these.
-        min_size: 1,
-        max_size: 1024,
+        // Audio has no width/height. The weights-free descriptor sweep
+        // (`descriptor_conformance_errors`) now exempts `Modality::Audio` from the
+        // `1 <= min_size <= max_size` floor (sc-13314), so a valid audio descriptor leaves the bounds
+        // at the unused 0 — `registry_sweep_passes_for_the_registered_stub` exercises exactly that,
+        // and `validate_request_audio` skips the size range regardless.
+        min_size: 0,
+        max_size: 0,
         audio_sample_rates: vec![24_000],
         audio_voices: vec!["narrator"],
         audio_languages: vec!["en"],

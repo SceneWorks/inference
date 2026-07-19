@@ -543,9 +543,12 @@ fn check_name_list(errs: &mut Vec<String>, ctx: &str, list_name: &str, names: &[
 /// from `(registration.descriptor)()` alone, with no model load (sc-9098, F-009):
 ///
 /// - `id` / `family` / `backend` are non-empty registry identifiers,
-/// - `max_count ≥ 1` and `1 ≤ min_size ≤ max_size` (a `Default` 0 bound rejects every request with
-///   a confusing "out of range 0..=0" — the F-084 footgun, enforced here for *every* linked
-///   descriptor rather than only when a request happens to reach `validate_request`),
+/// - `max_count ≥ 1`, and `1 ≤ min_size ≤ max_size` for the visual modalities (a `Default` 0 bound
+///   rejects every request with a confusing "out of range 0..=0" — the F-084 footgun, enforced here
+///   for *every* linked visual descriptor rather than only when a request happens to reach
+///   `validate_request`); the size range is **skipped for `Modality::Audio`**, whose generators emit
+///   a track with no width/height and leave the bounds at the unused 0 (matching the size-skipping
+///   `validate_request_audio` floor, sc-12834/sc-13314),
 /// - `samplers` / `schedulers` / `supported_guidance_methods` entries are non-empty, whitespace-free
 ///   and duplicate-free (name *shape* only — resolvability is per-engine: several families advertise
 ///   native sampler names alongside the gen-core curated set),
@@ -570,16 +573,25 @@ pub fn model_descriptor_errors(d: &ModelDescriptor) -> Vec<String> {
             "{ctx}: max_count is 0 — every request would be rejected"
         ));
     }
-    if caps.min_size == 0 || caps.max_size == 0 {
-        errs.push(format!(
-            "{ctx}: min_size={} max_size={} — size bounds left at the Default 0",
-            caps.min_size, caps.max_size
-        ));
-    } else if caps.min_size > caps.max_size {
-        errs.push(format!(
-            "{ctx}: min_size {} > max_size {}",
-            caps.min_size, caps.max_size
-        ));
+    // Size bounds only mean something for the visual modalities. A `Modality::Audio` generator emits
+    // a `GenerationOutput::Audio` track with no width/height, so its `min_size`/`max_size` are unused
+    // and left at the natural `Default` 0 — exactly the fields `validate_request_audio` skips the
+    // range check for (sc-12834). Enforcing the visual `1 <= min_size <= max_size` floor on an audio
+    // descriptor would force a nominal placeholder bound purely to satisfy the sweep (the sc-13314
+    // wart), so the check is skipped for `Audio` and stays strict for `Image`/`Video`/`Both`, which
+    // genuinely carry a spatial size range.
+    if d.modality != Modality::Audio {
+        if caps.min_size == 0 || caps.max_size == 0 {
+            errs.push(format!(
+                "{ctx}: min_size={} max_size={} — size bounds left at the Default 0",
+                caps.min_size, caps.max_size
+            ));
+        } else if caps.min_size > caps.max_size {
+            errs.push(format!(
+                "{ctx}: min_size {} > max_size {}",
+                caps.min_size, caps.max_size
+            ));
+        }
     }
     check_name_list(&mut errs, &ctx, "sampler", &caps.samplers);
     check_name_list(&mut errs, &ctx, "scheduler", &caps.schedulers);
@@ -2312,6 +2324,116 @@ mod tests {
         assert!(model_descriptor_errors(&zeroed)
             .iter()
             .any(|e| e.contains("left at the Default 0")));
+    }
+
+    /// The size-bounds floor is exempt for `Modality::Audio` (sc-13314): a pure-audio generator has
+    /// no width/height, so `min_size`/`max_size` left at the unused `Default` 0 must NOT be flagged —
+    /// mirroring the size-skipping `validate_request_audio` floor. The exemption is scoped to the
+    /// size axis: every other invariant (identity, `max_count`, curated-name shape) still fires for an
+    /// audio descriptor.
+    #[test]
+    fn audio_descriptor_with_zero_size_bounds_passes_sweep() {
+        let audio = ModelDescriptor {
+            id: "zeroed_audio",
+            family: "test",
+            backend: "candle",
+            modality: Modality::Audio,
+            capabilities: Capabilities {
+                // No spatial dims — bounds stay at the natural unused 0.
+                min_size: 0,
+                max_size: 0,
+                max_count: 1,
+                audio_sample_rates: vec![24_000],
+                ..Default::default()
+            },
+        };
+        assert!(
+            model_descriptor_errors(&audio).is_empty(),
+            "an audio descriptor with unused (0) size bounds must pass the sweep: {:?}",
+            model_descriptor_errors(&audio)
+        );
+
+        // The exemption is only the size axis: a broken `max_count` on the same audio descriptor is
+        // still reported.
+        let audio_bad_count = ModelDescriptor {
+            capabilities: Capabilities {
+                max_count: 0,
+                ..audio.capabilities.clone()
+            },
+            ..audio.clone()
+        };
+        assert!(
+            model_descriptor_errors(&audio_bad_count)
+                .iter()
+                .any(|e| e.contains("max_count is 0")),
+            "the audio exemption must not relax the non-size invariants"
+        );
+    }
+
+    /// The strictness the sweep exists for is preserved for the visual modalities: an `Image`/`Video`
+    /// descriptor with invalid size bounds is STILL flagged (the audio exemption above does not weaken
+    /// the check for modalities that genuinely carry a spatial size range).
+    #[test]
+    fn visual_descriptor_with_invalid_size_bounds_still_fails_sweep() {
+        // Video, zero bounds → the Default-0 footgun still fires.
+        let video_zero = ModelDescriptor {
+            id: "video_zero",
+            family: "test",
+            backend: "mlx",
+            modality: Modality::Video,
+            capabilities: Capabilities {
+                min_size: 0,
+                max_size: 0,
+                max_count: 1,
+                ..Default::default()
+            },
+        };
+        assert!(
+            model_descriptor_errors(&video_zero)
+                .iter()
+                .any(|e| e.contains("left at the Default 0")),
+            "a Video descriptor with zero size bounds must still be rejected"
+        );
+
+        // Image, inverted bounds → the inverted-bounds message still fires.
+        let image_inverted = ModelDescriptor {
+            id: "image_inverted",
+            family: "test",
+            backend: "mlx",
+            modality: Modality::Image,
+            capabilities: Capabilities {
+                min_size: 512,
+                max_size: 256,
+                max_count: 1,
+                ..Default::default()
+            },
+        };
+        assert!(
+            model_descriptor_errors(&image_inverted)
+                .iter()
+                .any(|e| e.contains("min_size 512 > max_size 256")),
+            "an Image descriptor with inverted size bounds must still be rejected"
+        );
+
+        // `Both` (emits image or video) is a visual modality too — zero bounds still fail.
+        let both_zero = ModelDescriptor {
+            id: "both_zero",
+            family: "test",
+            backend: "mlx",
+            modality: Modality::Both,
+            capabilities: Capabilities {
+                min_size: 0,
+                max_size: 0,
+                max_count: 1,
+                ..Default::default()
+            },
+        };
+        assert!(
+            model_descriptor_errors(&both_zero)
+                .iter()
+                .any(|e| e.contains("left at the Default 0")),
+            "a Both-modality descriptor with zero size bounds must still be rejected"
+        );
     }
 
     /// Build a synthetic diffusers-style snapshot with a `bytes`-sized `model.safetensors` under each
