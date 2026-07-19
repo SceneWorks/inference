@@ -532,6 +532,104 @@ pub fn check_audio_streaming(g: &dyn Generator, profile: &AudioProfile) -> Resul
     Ok(())
 }
 
+/// Build a two-segment dialogue [`script`](gen_core::SpeechSegment) whose speaker labels are
+/// in-surface for `caps`: two advertised voices when the model has a closed voice surface (both
+/// segments fall back to the single advertised voice when only one exists), or the opaque dialogue
+/// labels `"S1"` / `"S2"` when the model advertises no voice surface (a dialogue model that maps
+/// labels itself). Kept trivially short — the check probes *rendering + gating*, not audio quality
+/// (the real per-segment voice-distinctness measurement lives in the provider's own real-weights
+/// conformance, e.g. the MOSS multi-speaker test).
+fn two_speaker_script(caps: &gen_core::Capabilities) -> Vec<gen_core::SpeechSegment> {
+    let (a, b) = match caps.audio_voices.as_slice() {
+        [] => ("S1".to_owned(), "S2".to_owned()),
+        [only] => ((*only).to_owned(), (*only).to_owned()),
+        [first, second, ..] => ((*first).to_owned(), (*second).to_owned()),
+    };
+    vec![
+        gen_core::SpeechSegment {
+            text: "Hello, how are you today?".to_owned(),
+            speaker: Some(a),
+            ..Default::default()
+        },
+        gen_core::SpeechSegment {
+            text: "I'm doing great, thanks for asking!".to_owned(),
+            speaker: Some(b),
+            ..Default::default()
+        },
+    ]
+}
+
+/// **Multi-speaker script contract (sc-12848).** A [`Generator`] that advertises
+/// [`Capabilities::supports_multi_speaker`](gen_core::Capabilities::supports_multi_speaker) must
+/// *accept and render* a valid multi-speaker [`script`](gen_core::AudioParams::script) into one
+/// well-formed [`GenerationOutput::Audio`] track, and reject a script naming more distinct speakers
+/// than any advertised [`max_speakers`](gen_core::Capabilities::max_speakers) cap; a provider that
+/// does **not** advertise multi-speaker support must reject a script as the typed
+/// [`Error::Unsupported`] (never silently read only the first segment). This is the contract-level
+/// gate every audio provider inherits — the deeper "the two speaker segments are genuinely rendered
+/// in *different* voices" assertion is a provider-specific real-weights check (it needs a real model
+/// and a voice-identity embedder), out of scope for the pure-host testkit.
+pub fn check_audio_multi_speaker(g: &dyn Generator, profile: &AudioProfile) -> Result<(), String> {
+    let desc = g.descriptor();
+    let id = desc.id;
+    let caps = &desc.capabilities;
+
+    let mut r = audio_base_request(g, profile);
+    r.audio = Some(AudioParams {
+        script: Some(two_speaker_script(caps)),
+        ..profile.audio.clone()
+    });
+
+    if caps.supports_multi_speaker {
+        // Positive: a valid 2-speaker script is accepted and renders one well-formed audio track.
+        g.validate(&r).map_err(|e| {
+            format!(
+                "multi-speaker[{id}]: advertises supports_multi_speaker but validate() rejected a \
+                 valid 2-speaker script: {e}"
+            )
+        })?;
+        let out = g.generate(&r, &mut |_| {}).map_err(|e| {
+            format!("multi-speaker[{id}]: generate() failed on a 2-speaker script: {e}")
+        })?;
+        match &out {
+            GenerationOutput::Audio(track) => validate_track(id, "multi-speaker", track)?,
+            other => {
+                return Err(format!(
+                    "multi-speaker[{id}]: a script must render GenerationOutput::Audio, got {}",
+                    variant_name(other)
+                ));
+            }
+        }
+        // Range: a script naming more than `max_speakers` distinct speakers is rejected.
+        if let Some(max) = caps.max_speakers {
+            let too_many: Vec<gen_core::SpeechSegment> = (0..=max)
+                .map(|i| gen_core::SpeechSegment {
+                    text: format!("Line from speaker {i}."),
+                    speaker: Some(format!("__testkit_spk_{i}__")),
+                    ..Default::default()
+                })
+                .collect();
+            let mut rr = audio_base_request(g, profile);
+            rr.audio = Some(AudioParams {
+                script: Some(too_many),
+                ..profile.audio.clone()
+            });
+            if g.validate(&rr).is_ok() {
+                return Err(format!(
+                    "multi-speaker[{id}]: a script naming {} distinct speakers (above \
+                     max_speakers {max}) was accepted by validate()",
+                    max + 1
+                ));
+            }
+        }
+    } else {
+        // Negative: a non-multi-speaker provider must reject a script as the typed Unsupported.
+        expect_unsupported(g, &r, id, "a multi-speaker audio.script")?;
+    }
+
+    Ok(())
+}
+
 /// Run the full audio-generator conformance suite against a freshly-`make`d generator. Panics with
 /// every failure aggregated — the audio twin of [`conformance`](crate::conformance).
 pub fn audio_conformance(make: impl Fn() -> Box<dyn Generator>, profile: &AudioProfile) {
@@ -539,7 +637,7 @@ pub fn audio_conformance(make: impl Fn() -> Box<dyn Generator>, profile: &AudioP
     let g: &dyn Generator = g.as_ref();
 
     type Check = fn(&dyn Generator, &AudioProfile) -> Result<(), String>;
-    let checks: [Check; 8] = [
+    let checks: [Check; 9] = [
         check_audio_validate_honesty,
         check_audio_output,
         check_audio_progress,
@@ -548,6 +646,7 @@ pub fn audio_conformance(make: impl Fn() -> Box<dyn Generator>, profile: &AudioP
         check_audio_precancellation,
         check_audio_seed_determinism,
         check_audio_streaming,
+        check_audio_multi_speaker,
     ];
     let failures: Vec<String> = checks
         .into_iter()

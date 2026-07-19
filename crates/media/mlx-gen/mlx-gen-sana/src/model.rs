@@ -132,6 +132,8 @@ pub fn descriptor() -> ModelDescriptor {
             // The Gemma encoder is comparable to (often ≥) the DiT, so the drop is a large win.
             supports_sequential_offload: true,
             supports_streaming: false,
+            supports_multi_speaker: false,
+            max_speakers: None,
             // No audio surface (sc-12834): pure image/video model.
             audio_sample_rates: vec![],
             max_audio_duration_secs: None,
@@ -187,6 +189,8 @@ pub fn sprint_descriptor() -> ModelDescriptor {
             // bounding peak to `max(Gemma-TE, DiT+DC-AE)`.
             supports_sequential_offload: true,
             supports_streaming: false,
+            supports_multi_speaker: false,
+            max_speakers: None,
             // No audio surface (sc-12834): pure image/video model.
             audio_sample_rates: vec![],
             max_audio_duration_secs: None,
