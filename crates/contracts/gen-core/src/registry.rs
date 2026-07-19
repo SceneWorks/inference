@@ -9,6 +9,7 @@ use crate::runtime::{LoadSpec, Quant, WeightsSource};
 use crate::text_embed::{TextEmbedder, TextEmbedderDescriptor};
 use crate::train::{Trainer, TrainerDescriptor};
 use crate::transform::{Transform, TransformDescriptor};
+use crate::voice_embed::{VoiceEmbedder, VoiceEmbedderDescriptor};
 use crate::weightsmeta::safetensors_path_bytes;
 use crate::{Error, Result};
 
@@ -153,6 +154,15 @@ pub struct TextEmbedderRegistration {
     pub load: fn(&LoadSpec) -> Result<Box<dyn TextEmbedder>>,
 }
 
+/// A voice-embedder provider's registration (parallel to [`ImageEmbedderRegistration`]; sc-12838).
+/// The audio-identity sibling of the (unregistered) face embedder: a cloned-voice speaker vector
+/// that conditions TTS via [`Conditioning::VoiceEmbedding`](crate::generator::Conditioning::VoiceEmbedding).
+#[derive(Clone, Copy)]
+pub struct VoiceEmbedderRegistration {
+    pub descriptor: fn() -> VoiceEmbedderDescriptor,
+    pub load: fn(&LoadSpec) -> Result<Box<dyn VoiceEmbedder>>,
+}
+
 /// Builder for an ordinary, explicit generative-media provider registry.
 ///
 /// Platform bundles add exactly the registrations they ship.
@@ -164,6 +174,7 @@ pub struct ProviderRegistryBuilder {
     captioners: Vec<CaptionerRegistration>,
     image_embedders: Vec<ImageEmbedderRegistration>,
     text_embedders: Vec<TextEmbedderRegistration>,
+    voice_embedders: Vec<VoiceEmbedderRegistration>,
     rejected_quants: Vec<(Quant, &'static str)>,
 }
 
@@ -195,6 +206,11 @@ impl ProviderRegistryBuilder {
         register_text_embedder,
         text_embedders,
         TextEmbedderRegistration
+    );
+    builder_registration_method!(
+        register_voice_embedder,
+        voice_embedders,
+        VoiceEmbedderRegistration
     );
 
     /// Declare that this platform's backend has **no implementation** of quant tier `quant`, so every
@@ -238,6 +254,7 @@ impl ProviderRegistryBuilder {
         ensure_unique!(captioners, "captioner");
         ensure_unique!(image_embedders, "image embedder");
         ensure_unique!(text_embedders, "text embedder");
+        ensure_unique!(voice_embedders, "voice embedder");
 
         Ok(ProviderRegistry {
             generators: self.generators.into_boxed_slice(),
@@ -246,6 +263,7 @@ impl ProviderRegistryBuilder {
             captioners: self.captioners.into_boxed_slice(),
             image_embedders: self.image_embedders.into_boxed_slice(),
             text_embedders: self.text_embedders.into_boxed_slice(),
+            voice_embedders: self.voice_embedders.into_boxed_slice(),
             rejected_quants: self.rejected_quants.into_boxed_slice(),
         })
     }
@@ -259,6 +277,7 @@ pub struct ProviderRegistry {
     captioners: Box<[CaptionerRegistration]>,
     image_embedders: Box<[ImageEmbedderRegistration]>,
     text_embedders: Box<[TextEmbedderRegistration]>,
+    voice_embedders: Box<[VoiceEmbedderRegistration]>,
     rejected_quants: Box<[(Quant, &'static str)]>,
 }
 
@@ -357,6 +376,14 @@ impl ProviderRegistry {
         "text embedder",
         dyn TextEmbedder
     );
+    explicit_registry_kind!(
+        voice_embedders,
+        load_voice_embedder,
+        voice_embedders,
+        VoiceEmbedderRegistration,
+        "voice embedder",
+        dyn VoiceEmbedder
+    );
 
     /// Return the provider-owned on-disk component footprint for generator `id`, when declared.
     ///
@@ -383,6 +410,7 @@ impl ProviderRegistry {
             &self.captioners,
             &self.image_embedders,
             &self.text_embedders,
+            &self.voice_embedders,
         )
     }
 }
@@ -512,7 +540,7 @@ fn check_unique_ids(errs: &mut Vec<String>, kind: &str, ids: &[&str]) {
 /// Weights-free descriptor-level conformance sweep over one explicit provider catalog (sc-9098,
 /// F-009): generators through [`model_descriptor_errors`], plus identity
 /// and capability-bound checks and per-kind id uniqueness for trainers, captioners, transforms and
-/// image/text embedders. No `load` is ever called, so it runs by default (no weights, no Metal) —
+/// image/text/voice embedders. No `load` is ever called, so it runs by default (no weights, no Metal) —
 /// each provider crate invokes it from a default test, giving every cataloged id at least
 /// descriptor-level coverage; behavioral conformance (progress/cancel/seed) stays weights-gated in
 /// the `gen-core-testkit` suite.
@@ -525,6 +553,7 @@ fn descriptor_conformance_errors_for(
     captioner_registrations: &[CaptionerRegistration],
     image_embedder_registrations: &[ImageEmbedderRegistration],
     text_embedder_registrations: &[TextEmbedderRegistration],
+    voice_embedder_registrations: &[VoiceEmbedderRegistration],
 ) -> Vec<String> {
     let mut errs = Vec::new();
 
@@ -644,6 +673,27 @@ fn descriptor_conformance_errors_for(
     let te_ids: Vec<&str> = te_descs.iter().map(|d| d.id).collect();
     check_unique_ids(&mut errs, "text embedder", &te_ids);
 
+    // Voice embedders (sc-12838) carry no embedding `space` (they are the audio-identity sibling of
+    // the face embedder, not a cross-encoder cosine space) — check identity, a non-zero dim, and
+    // id uniqueness only.
+    let ve_descs: Vec<VoiceEmbedderDescriptor> = voice_embedder_registrations
+        .iter()
+        .map(|r| (r.descriptor)())
+        .collect();
+    for d in &ve_descs {
+        let ctx = format!("voice embedder '{}'", d.id);
+        check_identity(
+            &mut errs,
+            &ctx,
+            &[("id", d.id), ("family", d.family), ("backend", d.backend)],
+        );
+        if d.embedding_dim == 0 {
+            errs.push(format!("{ctx}: embedding_dim is 0"));
+        }
+    }
+    let ve_ids: Vec<&str> = ve_descs.iter().map(|d| d.id).collect();
+    check_unique_ids(&mut errs, "voice embedder", &ve_ids);
+
     errs
 }
 
@@ -657,12 +707,13 @@ mod tests {
         Capabilities, GenerationOutput, GenerationRequest, Modality, ModelDescriptor,
     };
     use crate::image_embed::{ImageEmbedder, ImageEmbedderDescriptor};
-    use crate::media::Image;
+    use crate::media::{AudioTrack, Image};
     use crate::runtime::{Progress, WeightsSource};
     use crate::text_embed::{TextEmbedder, TextEmbedderDescriptor};
     use crate::train::{
         Trainer, TrainerDescriptor, TrainingOutput, TrainingProgress, TrainingRequest,
     };
+    use crate::voice_embed::{VoiceEmbedder, VoiceEmbedderDescriptor, VoiceEmbedding};
     use std::path::PathBuf;
 
     struct DummyGen {
@@ -989,6 +1040,7 @@ mod tests {
             .register_captioner(DUMMY_CAPTIONER_REGISTRATION)
             .register_text_embedder(DUMMY_TEXT_EMBEDDER_REGISTRATION)
             .register_image_embedder(DUMMY_IMAGE_EMBEDDER_REGISTRATION)
+            .register_voice_embedder(DUMMY_VOICE_EMBEDDER_REGISTRATION)
             .build()
             .unwrap()
     }
@@ -1357,6 +1409,133 @@ mod tests {
         assert!(dummy_registry()
             .image_embedders()
             .any(|r| (r.descriptor)().id == "dummy_test_image_embedder"));
+    }
+
+    struct DummyVoiceEmbedder {
+        desc: VoiceEmbedderDescriptor,
+    }
+
+    impl VoiceEmbedder for DummyVoiceEmbedder {
+        fn descriptor(&self) -> &VoiceEmbedderDescriptor {
+            &self.desc
+        }
+
+        fn embed(&self, audio: &AudioTrack) -> Result<VoiceEmbedding> {
+            Ok(vec![audio.samples.len() as f32; self.desc.embedding_dim])
+        }
+    }
+
+    fn dummy_voice_embedder_descriptor() -> VoiceEmbedderDescriptor {
+        VoiceEmbedderDescriptor {
+            id: "dummy_test_voice_embedder",
+            family: "voice",
+            backend: "candle",
+            embedding_dim: 4,
+            mac_only: false,
+        }
+    }
+
+    fn dummy_voice_embedder_load(_spec: &LoadSpec) -> Result<Box<dyn VoiceEmbedder>> {
+        Ok(Box::new(DummyVoiceEmbedder {
+            desc: dummy_voice_embedder_descriptor(),
+        }))
+    }
+
+    crate::register_voice_embedder! {
+        const DUMMY_VOICE_EMBEDDER_REGISTRATION =
+            dummy_voice_embedder_descriptor => dummy_voice_embedder_load
+    }
+
+    fn dummy_audio(samples: usize) -> AudioTrack {
+        AudioTrack {
+            samples: vec![0.0; samples],
+            sample_rate: 24_000,
+            channels: 1,
+        }
+    }
+
+    #[test]
+    fn voice_embedder_registry_resolves_by_id() {
+        let registry = dummy_registry();
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let e = registry
+            .load_voice_embedder("dummy_test_voice_embedder", &spec)
+            .expect("dummy voice embedder is registered");
+        assert_eq!(e.descriptor().id, "dummy_test_voice_embedder");
+        assert_eq!(e.embed(&dummy_audio(3)).unwrap(), vec![3.0; 4]);
+    }
+
+    #[test]
+    fn unknown_voice_embedder_id_errors() {
+        let registry = dummy_registry();
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        assert!(registry
+            .load_voice_embedder("no_such_voice_embedder", &spec)
+            .is_err());
+    }
+
+    #[test]
+    fn dummy_voice_embedder_appears_in_iteration() {
+        assert!(dummy_registry()
+            .voice_embedders()
+            .any(|r| (r.descriptor)().id == "dummy_test_voice_embedder"));
+    }
+
+    /// The sc-12838 acceptance path end to end, weights-free: resolve a registered voice embedder,
+    /// drive `embed()` over a reference clip, then feed the resulting embedding into a stub audio
+    /// [`Generator`]'s conditioning (`Conditioning::VoiceEmbedding`) and validate — a cloned voice
+    /// driving TTS, the audio mirror of a face embedding conditioning InstantID/PuLID.
+    #[test]
+    fn voice_embedding_resolves_embeds_and_conditions_a_generator() {
+        use crate::generator::{Conditioning, ConditioningKind};
+
+        let registry = dummy_registry();
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+
+        // resolve → embed
+        let embedder = registry
+            .load_voice_embedder("dummy_test_voice_embedder", &spec)
+            .expect("registered");
+        let embedding = embedder.embed(&dummy_audio(5)).unwrap();
+        assert_eq!(embedding.len(), 4);
+
+        // A stub audio generator that advertises VoiceEmbedding conditioning.
+        let tts = DummyGen {
+            desc: ModelDescriptor {
+                id: "dummy_tts",
+                family: "test",
+                backend: "mlx",
+                modality: Modality::Audio,
+                capabilities: Capabilities {
+                    max_count: 1,
+                    conditioning: vec![ConditioningKind::VoiceEmbedding],
+                    audio_sample_rates: vec![24_000],
+                    ..Default::default()
+                },
+            },
+        };
+
+        // feed the embedding into the generator's conditioning and validate (size-skipping audio floor)
+        let req = GenerationRequest {
+            conditioning: vec![Conditioning::VoiceEmbedding {
+                embedding,
+                strength: None,
+            }],
+            steps: Some(1),
+            ..Default::default()
+        };
+        tts.descriptor()
+            .capabilities
+            .validate_request_audio("dummy_tts", &req)
+            .expect("a cloned-voice embedding is accepted conditioning for the TTS generator");
+
+        // A generator that does NOT advertise it rejects the same conditioning.
+        let no_voice = Capabilities {
+            max_count: 1,
+            audio_sample_rates: vec![24_000],
+            ..Default::default()
+        };
+        assert!(no_voice.validate_request_audio("dummy_tts", &req).is_err());
     }
 
     /// The sweep (sc-9098, F-009) is clean over the explicit dummy catalog.

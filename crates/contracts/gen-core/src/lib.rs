@@ -31,6 +31,7 @@ pub mod tiling;
 pub mod tokenizer;
 pub mod train;
 pub mod transform;
+pub mod voice_embed;
 pub mod weightsmeta;
 
 pub use audio_dsp::{
@@ -56,7 +57,7 @@ pub use mempolicy::{plan_memory_adaptation, LaneLevers, Lever, MemoryPlan, Stage
 pub use registry::{
     CaptionerRegistration, ImageEmbedderRegistration, ModelRegistration, PerComponentBytes,
     ProviderRegistry, ProviderRegistryBuilder, TextEmbedderRegistration, TrainerRegistration,
-    TransformRegistration,
+    TransformRegistration, VoiceEmbedderRegistration,
 };
 pub use runtime::{
     AdapterKind, AdapterSpec, CancelFlag, IdentityWeights, LoadPhase, LoadSpec, MoeExpert,
@@ -64,6 +65,7 @@ pub use runtime::{
 };
 pub use text_embed::{TextEmbedder, TextEmbedderDescriptor};
 pub use tiling::{TilingConfig, VaeTiling};
+pub use voice_embed::{VoiceEmbedder, VoiceEmbedderDescriptor, VoiceEmbedding};
 pub use weightsmeta::{safetensors_dir_bytes, safetensors_path_bytes};
 
 // The independent LLM-serving library, re-exported at `gen_core::core_llm` (epic 7153, sc-7189). The

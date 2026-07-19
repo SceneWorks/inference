@@ -72,6 +72,18 @@ macro_rules! register_text_embedder {
     };
 }
 
+/// Define a voice-embedder registration constant for an explicit provider catalog.
+#[macro_export]
+macro_rules! register_voice_embedder {
+    ( $vis:vis const $name:ident = $desc:path => $load:path $(,)? ) => {
+        $vis const $name: $crate::registry::VoiceEmbedderRegistration =
+            $crate::registry::VoiceEmbedderRegistration {
+                descriptor: $desc,
+                load: |spec| $load(spec).map_err(::core::convert::Into::into),
+            };
+    };
+}
+
 /// Implement the standard delegation-pattern [`crate::Generator`] wrapper for provider structs.
 #[macro_export]
 macro_rules! impl_generator {

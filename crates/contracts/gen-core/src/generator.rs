@@ -8,6 +8,7 @@
 
 use crate::media::{AudioTrack, Image};
 use crate::runtime::{CancelFlag, Progress, Quant};
+use crate::voice_embed::VoiceEmbedding;
 use crate::{Error, Result};
 
 /// A prompt-conditioned media generator. `generate` is **synchronous** (long/blocking; the
@@ -445,6 +446,11 @@ impl GenerationRequest {
                 } if !s.is_finite() => {
                     return Some(("conditioning.reference_audio.strength", *s));
                 }
+                Conditioning::VoiceEmbedding {
+                    strength: Some(s), ..
+                } if !s.is_finite() => {
+                    return Some(("conditioning.voice_embedding.strength", *s));
+                }
                 _ => {}
             }
         }
@@ -556,6 +562,18 @@ pub enum Conditioning {
         audio: AudioTrack,
         strength: Option<f32>,
     },
+    /// A precomputed **voice-identity embedding** — a cloned voice driving TTS (sc-12838; the audio
+    /// analogue of how a [`FaceEmbedder`](crate::face::FaceEmbedder) identity vector conditions
+    /// InstantID / PuLID). Unlike [`Conditioning::Reference`] / [`Conditioning::ReferenceAudio`],
+    /// which carry raw media the generator re-embeds, this carries the
+    /// [`VoiceEmbedder`](crate::voice_embed::VoiceEmbedder) output directly, because the embedder is
+    /// a standalone registry provider composed separately from the TTS generator (sc-12844).
+    /// `strength` mirrors the img2img/reference strength: `None` ⇒ the model default identity
+    /// weight; it joins the same finiteness floor.
+    VoiceEmbedding {
+        embedding: VoiceEmbedding,
+        strength: Option<f32>,
+    },
     /// Multiple references with no per-image strength (Qwen-Image-Edit).
     MultiReference { images: Vec<Image> },
     /// FLUX.1-Redux references, each with its own strength.
@@ -618,6 +636,7 @@ impl Conditioning {
         match self {
             Conditioning::Reference { .. } => ConditioningKind::Reference,
             Conditioning::ReferenceAudio { .. } => ConditioningKind::ReferenceAudio,
+            Conditioning::VoiceEmbedding { .. } => ConditioningKind::VoiceEmbedding,
             Conditioning::MultiReference { .. } => ConditioningKind::MultiReference,
             Conditioning::ReduxRefs { .. } => ConditioningKind::ReduxRefs,
             Conditioning::Control { .. } => ConditioningKind::Control,
@@ -657,6 +676,8 @@ pub enum ConditioningKind {
     Reference,
     /// Voice/style reference audio ([`Conditioning::ReferenceAudio`]).
     ReferenceAudio,
+    /// A precomputed cloned-voice identity embedding ([`Conditioning::VoiceEmbedding`]).
+    VoiceEmbedding,
     MultiReference,
     ReduxRefs,
     Control,
