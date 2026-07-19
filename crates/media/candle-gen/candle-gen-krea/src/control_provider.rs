@@ -367,7 +367,9 @@ fn control_image_to_nchw(
         )));
     }
     let (rw, rh) = (width as usize, height as usize);
-    if image.pixels.len() != rw * rh * 3 {
+    if image.pixels.len()
+        != candle_gen::gen_core::imageops::checked_image_buffer_len(rw, rh, 3).unwrap_or(usize::MAX)
+    {
         return Err(CandleError::Msg(format!(
             "krea control: control pixel buffer {} != {width}x{height}x3",
             image.pixels.len()

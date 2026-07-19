@@ -777,13 +777,8 @@ impl InstantId {
             ..req.clone()
         };
         let restored = self.generate_with(&restore_req, embedding, &kps, on_progress)?;
-        let small_f = resize_lanczos_u8(
-            &restored.pixels,
-            side as usize,
-            side as usize,
-            crop_h,
-            crop_w,
-        );
+        let (restored_h, restored_w) = restored_image_dims(&restored);
+        let small_f = resize_lanczos_u8(&restored.pixels, restored_h, restored_w, crop_h, crop_w);
         let small: Vec<u8> = small_f.iter().map(|&v| v as u8).collect();
 
         // Feathered elliptical paste-back onto a copy of the base.
@@ -792,6 +787,10 @@ impl InstantId {
         restore::paste_alpha(&mut out, &small, crop_w, crop_h, ax, ay, &alpha);
         Ok(out)
     }
+}
+
+fn restored_image_dims(image: &Image) -> (usize, usize) {
+    (image.height as usize, image.width as usize)
 }
 
 /// Re-place a detected face's 5-point landmarks at a pose's head box (the vendored
@@ -829,6 +828,16 @@ fn place_face_kps(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restore_resize_uses_generated_image_dimensions() {
+        let image = Image {
+            width: 7,
+            height: 5,
+            pixels: vec![0; 7 * 5 * 3],
+        };
+        assert_eq!(restored_image_dims(&image), (5, 7));
+    }
 
     #[test]
     fn validate_kps_rejects_short_slices() {

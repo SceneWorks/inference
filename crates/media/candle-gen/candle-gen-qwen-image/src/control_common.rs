@@ -101,7 +101,9 @@ pub(crate) fn preprocess_control_image(
         )));
     }
     let (w, h) = (width as usize, height as usize);
-    if image.pixels.len() != w * h * 3 {
+    if image.pixels.len()
+        != candle_gen::gen_core::imageops::checked_image_buffer_len(w, h, 3).unwrap_or(usize::MAX)
+    {
         return Err(CandleError::Msg(format!(
             "{label}: control image buffer {} != {w}x{h}x3",
             image.pixels.len()

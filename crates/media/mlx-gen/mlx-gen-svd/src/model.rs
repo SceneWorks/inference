@@ -248,7 +248,14 @@ fn validate_reference_image(img: &Image) -> Result<()> {
             img.width, img.height
         )));
     }
-    if img.pixels.len() != img.width as usize * img.height as usize * 3 {
+    if img.pixels.len()
+        != mlx_gen::gen_core::imageops::checked_image_buffer_len(
+            img.width as usize,
+            img.height as usize,
+            3,
+        )
+        .unwrap_or(usize::MAX)
+    {
         return Err(Error::Msg(format!(
             "svd_xt: reference image pixel buffer {} != {}x{}x3 (RGB8)",
             img.pixels.len(),
@@ -265,7 +272,14 @@ fn validate_reference_image(img: &Image) -> Result<()> {
 fn image_to_unit_nhwc(img: &Image, out_h: usize, out_w: usize) -> Result<Array> {
     // usize math: `width * height * 3` in u32 wraps for large dims (e.g. 65536² → 0), which would let
     // an empty/short buffer pass and then index OOB in the resize (F-164).
-    if img.pixels.len() != img.width as usize * img.height as usize * 3 {
+    if img.pixels.len()
+        != mlx_gen::gen_core::imageops::checked_image_buffer_len(
+            img.width as usize,
+            img.height as usize,
+            3,
+        )
+        .unwrap_or(usize::MAX)
+    {
         return Err(Error::Msg("svd_xt: reference image must be RGB8".into()));
     }
     let resized = mlx_gen::image::resize_lanczos_u8(
@@ -294,7 +308,14 @@ impl Svd {
     /// CLIP `image_embeds` `[1, 1, 1024]` from the reference: diffusers `_resize_with_antialiasing`
     /// to 224 (gaussian-blur + align-corners bicubic, in `[-1,1]`) → CLIP mean/std normalize.
     fn clip_embeds(&self, img: &Image) -> Result<Array> {
-        if img.pixels.len() != img.width as usize * img.height as usize * 3 {
+        if img.pixels.len()
+            != mlx_gen::gen_core::imageops::checked_image_buffer_len(
+                img.width as usize,
+                img.height as usize,
+                3,
+            )
+            .unwrap_or(usize::MAX)
+        {
             return Err(Error::Msg("svd_xt: reference image must be RGB8".into()));
         }
         let unit = crate::preprocess::resize_with_antialiasing_unit(

@@ -79,7 +79,9 @@ pub fn preprocess_reference(
     device: &Device,
 ) -> candle_gen::Result<Tensor> {
     let (iw, ih) = (image.width as usize, image.height as usize);
-    if image.pixels.len() != iw * ih * 3 {
+    if image.pixels.len()
+        != candle_gen::gen_core::imageops::checked_image_buffer_len(iw, ih, 3).unwrap_or(usize::MAX)
+    {
         return Err(candle_gen::CandleError::Msg(format!(
             "sd3 img2img: image buffer {} != {iw}x{ih}x3",
             image.pixels.len()

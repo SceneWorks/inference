@@ -39,7 +39,9 @@ pub fn preprocess_clip_image_sized(image: &Image, size: usize) -> Result<Array> 
     const MEAN: [f32; 3] = [0.481_454_66, 0.457_827_5, 0.408_210_73];
     const STD: [f32; 3] = [0.268_629_54, 0.261_302_58, 0.275_777_11];
     let (iw, ih) = (image.width as usize, image.height as usize);
-    if image.pixels.len() != iw * ih * 3 {
+    if image.pixels.len()
+        != mlx_gen::gen_core::imageops::checked_image_buffer_len(iw, ih, 3).unwrap_or(usize::MAX)
+    {
         return Err(Error::Msg(format!(
             "ip-adapter image buffer {} != {iw}x{ih}x3",
             image.pixels.len()

@@ -85,7 +85,9 @@ fn align(value: u32) -> usize {
 /// uploading it only for [`interpolate`] to read it back into a host buffer (F-070 / sc-12517).
 fn image_to_chw_host(img: &Image, tw: usize, th: usize, mode: Interp) -> CResult<Tensor> {
     let (iw, ih) = (img.width as usize, img.height as usize);
-    if img.pixels.len() != iw * ih * 3 {
+    if img.pixels.len()
+        != candle_gen::gen_core::imageops::checked_image_buffer_len(iw, ih, 3).unwrap_or(usize::MAX)
+    {
         return Err(CandleError::Msg(format!(
             "scail2: image pixel buffer {} != {iw}x{ih}x3",
             img.pixels.len()

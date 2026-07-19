@@ -639,7 +639,9 @@ fn preprocess_image(
             "sdxl {kind} image has a zero dimension ({iw}x{ih})"
         )));
     }
-    if image.pixels.len() != iw * ih * 3 {
+    if image.pixels.len()
+        != mlx_gen::gen_core::imageops::checked_image_buffer_len(iw, ih, 3).unwrap_or(usize::MAX)
+    {
         return Err(Error::Msg(format!(
             "sdxl {kind} image pixel buffer {} != {iw}x{ih}x3",
             image.pixels.len()

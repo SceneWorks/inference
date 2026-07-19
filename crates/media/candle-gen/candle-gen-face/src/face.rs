@@ -47,7 +47,10 @@ pub fn resize_bilinear_cv2(
     const C: usize = 3;
     // Public boundary: reject an undersized source buffer with a typed error rather than
     // aborting the process on caller-supplied input (sc-9025 / F-041).
-    if src.len() < in_h * in_w * C {
+    if src.len()
+        < candle_gen::gen_core::imageops::checked_image_buffer_len(in_w, in_h, C)
+            .unwrap_or(usize::MAX)
+    {
         return Err(CandleError::Msg(format!(
             "resize_bilinear_cv2: src buffer of {} bytes too small for {in_h}×{in_w}×3",
             src.len()
@@ -125,7 +128,9 @@ pub fn resize_bilinear_cv2(
 pub fn detector_blob(img: &[u8], h: usize, w: usize, device: &Device) -> Result<(Tensor, f32)> {
     // Public boundary: reject an undersized image buffer with a typed error rather than
     // aborting the process on caller-supplied input (sc-9025 / F-041).
-    if img.len() < h * w * 3 {
+    if img.len()
+        < candle_gen::gen_core::imageops::checked_image_buffer_len(w, h, 3).unwrap_or(usize::MAX)
+    {
         return Err(CandleError::Msg(format!(
             "detector_blob: img buffer of {} bytes too small for {h}×{w}×3",
             img.len()
@@ -206,7 +211,10 @@ impl FaceAnalysis {
                 "face detect: image has a zero dimension ({h}×{w})"
             )));
         }
-        if img.len() < h * w * 3 {
+        if img.len()
+            < candle_gen::gen_core::imageops::checked_image_buffer_len(w, h, 3)
+                .unwrap_or(usize::MAX)
+        {
             return Err(CandleError::Msg(format!(
                 "face detect: img buffer of {} bytes too small for {h}×{w}×3",
                 img.len()

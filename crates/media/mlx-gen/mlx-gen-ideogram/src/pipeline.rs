@@ -116,7 +116,9 @@ fn preprocess_source_image(image: &Image, width: u32, height: u32) -> Result<Arr
             "ideogram edit: source image has a zero dimension ({iw}x{ih})"
         )));
     }
-    if image.pixels.len() != iw * ih * 3 {
+    if image.pixels.len()
+        != mlx_gen::gen_core::imageops::checked_image_buffer_len(iw, ih, 3).unwrap_or(usize::MAX)
+    {
         return Err(Error::Msg(format!(
             "ideogram edit: source pixel buffer {} != {iw}x{ih}x3",
             image.pixels.len()
@@ -146,7 +148,9 @@ fn preprocess_mask_packed(mask: &Image, width: u32, height: u32) -> Result<Array
             "ideogram edit: mask image has a zero dimension ({mw}x{mh} -> {w}x{h})"
         )));
     }
-    if mask.pixels.len() != mw * mh * 3 {
+    if mask.pixels.len()
+        != mlx_gen::gen_core::imageops::checked_image_buffer_len(mw, mh, 3).unwrap_or(usize::MAX)
+    {
         return Err(Error::Msg(format!(
             "ideogram edit: mask pixel buffer {} != {mw}x{mh}x3",
             mask.pixels.len()

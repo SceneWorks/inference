@@ -648,7 +648,8 @@ pub(crate) fn encode_reference(
 /// `common::preprocess_image` (`ResizeIfNeeded`).
 fn preprocess_init_image(img: &Image, width: u32, height: u32, device: &Device) -> Result<Tensor> {
     let (iw, ih) = (img.width as usize, img.height as usize);
-    let expected = iw * ih * 3;
+    let expected =
+        candle_gen::gen_core::imageops::checked_image_buffer_len(iw, ih, 3).unwrap_or(usize::MAX);
     if img.pixels.len() != expected {
         return Err(CandleError::Msg(format!(
             "boogu: reference pixel buffer {} bytes != {}x{}x3 ({expected})",
@@ -679,7 +680,8 @@ fn preprocess_init_image(img: &Image, width: u32, height: u32, device: &Device) 
 /// inverse of `postprocess_image`'s `x·0.5 + 0.5` denormalize.
 fn image_to_pixels(img: &Image, device: &Device) -> Result<Tensor> {
     let (h, w) = (img.height as usize, img.width as usize);
-    let expected = h * w * 3;
+    let expected =
+        candle_gen::gen_core::imageops::checked_image_buffer_len(w, h, 3).unwrap_or(usize::MAX);
     if img.pixels.len() != expected {
         return Err(CandleError::Msg(format!(
             "boogu: reference pixel buffer {} bytes != {}x{}x3 ({expected})",

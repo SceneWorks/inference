@@ -36,7 +36,9 @@ pub fn preprocess_mask(mask: &Image, width: u32, height: u32) -> Result<Array> {
             "sdxl mask image has a zero dimension ({mw}x{mh} -> {w}x{h})"
         )));
     }
-    if mask.pixels.len() != mw * mh * 3 {
+    if mask.pixels.len()
+        != mlx_gen::gen_core::imageops::checked_image_buffer_len(mw, mh, 3).unwrap_or(usize::MAX)
+    {
         return Err(Error::Msg(format!(
             "sdxl mask pixel buffer {} != {mw}x{mh}x3",
             mask.pixels.len()

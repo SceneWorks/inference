@@ -302,7 +302,14 @@ fn validate_reference_image(img: &Image) -> gen_core::Result<()> {
             img.width, img.height
         )));
     }
-    if img.pixels.len() != img.width as usize * img.height as usize * 3 {
+    if img.pixels.len()
+        != candle_gen::gen_core::imageops::checked_image_buffer_len(
+            img.width as usize,
+            img.height as usize,
+            3,
+        )
+        .unwrap_or(usize::MAX)
+    {
         return Err(gen_core::Error::Msg(format!(
             "svd_xt: reference image pixel buffer {} != {}x{}x3 (RGB8)",
             img.pixels.len(),

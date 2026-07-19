@@ -93,12 +93,25 @@ pub fn apply_replacement_mask(frame: &Image, mask: &Image, strength: f32) -> Res
             mask.width, mask.height, frame.width, frame.height
         )));
     }
-    let n = (frame.width * frame.height) as usize;
-    if frame.pixels.len() != n * 3 || mask.pixels.len() != n * 3 {
+    let (width, height) = (frame.width as usize, frame.height as usize);
+    let pixel_count = width.checked_mul(height).ok_or_else(|| {
+        Error::Msg(format!(
+            "replace_person frame dimensions {}x{} overflow the host pixel count",
+            frame.width, frame.height
+        ))
+    })?;
+    let expected = mlx_gen::gen_core::imageops::checked_image_buffer_len(width, height, 3)
+        .ok_or_else(|| {
+            Error::Msg(format!(
+                "replace_person frame dimensions {}x{} overflow the RGB8 buffer size",
+                frame.width, frame.height
+            ))
+        })?;
+    if frame.pixels.len() != expected || mask.pixels.len() != expected {
         return Err(Error::Msg("replace_person frame/mask must be RGB8".into()));
     }
-    let mut out = vec![0u8; n * 3];
-    for i in 0..n {
+    let mut out = vec![0u8; expected];
+    for i in 0..pixel_count {
         let (r, g, b) = (
             mask.pixels[i * 3] as u32,
             mask.pixels[i * 3 + 1] as u32,
@@ -1206,6 +1219,23 @@ mlx_gen::register_generators! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replacement_mask_rejects_wrapping_u32_dimensions_without_panicking() {
+        let frame = Image {
+            width: 65_536,
+            height: 65_536,
+            pixels: Vec::new(),
+        };
+        let mask = frame.clone();
+
+        let err = apply_replacement_mask(&frame, &mask, 1.0)
+            .expect_err("wrapped dimensions must return a typed error");
+        assert!(
+            err.to_string().contains("frame/mask must be RGB8"),
+            "unexpected error: {err}"
+        );
+    }
 
     /// F-050 (sc-11133): drive `StageProgressFold` over the exact event stream a curated 2nd-order
     /// solver produces — each stage's σ-derived `current` forwarded TWICE per step (predictor +

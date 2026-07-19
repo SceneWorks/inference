@@ -1243,7 +1243,9 @@ fn py_round(x: f64) -> usize {
 pub fn preprocess_i2v_image(image: &Image, width: u32, height: u32) -> Result<Array> {
     let (iw, ih) = (image.width as usize, image.height as usize);
     let (tw, th) = (width as usize, height as usize);
-    if image.pixels.len() != iw * ih * 3 {
+    if image.pixels.len()
+        != mlx_gen::gen_core::imageops::checked_image_buffer_len(iw, ih, 3).unwrap_or(usize::MAX)
+    {
         return Err(Error::Msg(format!(
             "i2v image pixel buffer {} != {iw}x{ih}x3",
             image.pixels.len()

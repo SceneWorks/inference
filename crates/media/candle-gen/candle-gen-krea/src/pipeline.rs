@@ -1380,7 +1380,14 @@ fn encode_vision(
 /// [`resize_bicubic_u8`], the same used by the vision preprocess), then `(x/255)·2 − 1`.
 fn image_to_pixels(im: &Image, target_w: u32, target_h: u32, device: &Device) -> Result<Tensor> {
     let (w, h) = (target_w as usize, target_h as usize);
-    if im.pixels.len() != (im.width * im.height * 3) as usize {
+    if im.pixels.len()
+        != candle_gen::gen_core::imageops::checked_image_buffer_len(
+            im.width as usize,
+            im.height as usize,
+            3,
+        )
+        .unwrap_or(usize::MAX)
+    {
         return Err(CandleError::Msg(format!(
             "krea edit: reference pixel buffer {} != {}x{}x3",
             im.pixels.len(),
@@ -1492,7 +1499,14 @@ fn preprocess_img2img_init(
     device: &Device,
 ) -> Result<Tensor> {
     let (w, h) = (target_w as usize, target_h as usize);
-    if im.pixels.len() != (im.width * im.height * 3) as usize {
+    if im.pixels.len()
+        != candle_gen::gen_core::imageops::checked_image_buffer_len(
+            im.width as usize,
+            im.height as usize,
+            3,
+        )
+        .unwrap_or(usize::MAX)
+    {
         return Err(CandleError::Msg(format!(
             "krea img2img: reference pixel buffer {} != {}x{}x3",
             im.pixels.len(),

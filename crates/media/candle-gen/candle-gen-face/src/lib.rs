@@ -114,7 +114,9 @@ pub fn load_with_parser(dir: &Path) -> Result<CandleFaceAnalysis> {
 /// Returns an [`Image`]'s `(height, width)`, rejecting a buffer too small for `width·height·3`.
 fn image_dims(image: &Image) -> Result<(usize, usize)> {
     let (w, h) = (image.width as usize, image.height as usize);
-    if image.pixels.len() < w * h * 3 {
+    if image.pixels.len()
+        < candle_gen::gen_core::imageops::checked_image_buffer_len(w, h, 3).unwrap_or(usize::MAX)
+    {
         return Err(CandleError::Msg(format!(
             "face: image buffer of {} bytes too small for {w}×{h}×3",
             image.pixels.len()

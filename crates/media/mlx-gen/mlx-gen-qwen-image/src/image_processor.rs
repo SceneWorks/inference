@@ -78,7 +78,9 @@ impl QwenImageProcessor {
     pub fn preprocess(&self, image: ImageInput) -> Result<ProcessedImage> {
         // The pub re-exported processor indexes `data` as `h*w*3` below; reject a mismatched buffer
         // up front (the registered edit path validates upstream, a direct caller does not) (F-020/L-A).
-        let expected = image.height * image.width * 3;
+        let expected =
+            mlx_gen::gen_core::imageops::checked_image_buffer_len(image.width, image.height, 3)
+                .unwrap_or(usize::MAX);
         if image.data.len() != expected {
             return Err(Error::Msg(format!(
                 "qwen image processor: input buffer {} bytes != {}x{}x3 ({expected})",

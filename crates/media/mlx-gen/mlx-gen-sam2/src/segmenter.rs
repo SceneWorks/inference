@@ -25,7 +25,8 @@ const SIZE: usize = 1024;
 /// SAM2 preprocessing: resize an RGB8 HWC image to 1024² (square stretch, bilinear), `/255`, then
 /// ImageNet-normalize → NCHW `[1, 3, 1024, 1024]` f32. Byte-faithful to the spike's `preprocess`.
 pub fn preprocess(rgb: &[u8], in_h: usize, in_w: usize) -> Result<Array> {
-    let expected = in_h * in_w * 3;
+    let expected =
+        mlx_gen::gen_core::imageops::checked_image_buffer_len(in_w, in_h, 3).unwrap_or(usize::MAX);
     if rgb.len() != expected {
         return Err(Error::Msg(format!(
             "sam2 preprocess: rgb must be HWC RGB8 ({expected} bytes for {in_h}x{in_w}), got {}",

@@ -56,7 +56,9 @@ pub fn resize_bilinear_cv2(
     const C: usize = 3;
     // `src` is indexed by `in_h`/`in_w`; reject a mismatched `(buf, h, w)` triple at the entry as a
     // typed error rather than panic out-of-bounds in the horizontal pass (F-020/L-A).
-    if src.len() < in_h * in_w * C {
+    if src.len()
+        < mlx_gen::gen_core::imageops::checked_image_buffer_len(in_w, in_h, C).unwrap_or(usize::MAX)
+    {
         return Err(Error::Msg(format!(
             "resize_bilinear_cv2: src buffer of {} bytes too small for {in_h}×{in_w}×3",
             src.len()
@@ -138,7 +140,9 @@ pub fn resize_bilinear_cv2(
 pub fn detector_blob(img: &[u8], h: usize, w: usize) -> Result<(Array, f32)> {
     // `img` is resized/indexed by `h`/`w`; reject a mismatched `(buf, h, w)` triple at the entry as a
     // typed error (F-020/L-A) — guards direct callers of this pub primitive.
-    if img.len() < h * w * 3 {
+    if img.len()
+        < mlx_gen::gen_core::imageops::checked_image_buffer_len(w, h, 3).unwrap_or(usize::MAX)
+    {
         return Err(Error::Msg(format!(
             "detector_blob: img buffer of {} bytes too small for {h}×{w}×3",
             img.len()
@@ -305,7 +309,9 @@ impl FaceAnalysis {
         }
         // The worker hands us a decoded buffer plus `(h, w)`; a mismatch would index out of bounds in
         // the detector primitives. Reject it with a typed error rather than crash generation (F-081).
-        if img.len() < h * w * 3 {
+        if img.len()
+            < mlx_gen::gen_core::imageops::checked_image_buffer_len(w, h, 3).unwrap_or(usize::MAX)
+        {
             return Err(Error::Msg(format!(
                 "face detect: img buffer of {} bytes too small for {h}×{w}×3",
                 img.len()

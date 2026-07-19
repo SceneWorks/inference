@@ -515,7 +515,9 @@ fn validate_reference_images(req: &GenerationRequest) -> Result<()> {
                 "qwen_image_edit: reference image has a zero dimension ({w}x{h})"
             )));
         }
-        if img.pixels.len() != w * h * 3 {
+        if img.pixels.len()
+            != mlx_gen::gen_core::imageops::checked_image_buffer_len(w, h, 3).unwrap_or(usize::MAX)
+        {
             return Err(Error::Msg(format!(
                 "qwen_image_edit: reference image pixel buffer {} != {w}x{h}x3",
                 img.pixels.len()
