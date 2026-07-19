@@ -316,7 +316,6 @@ dependencies = [
  "candle-transformers",
  "core-llm",
  "rand 0.9.5",
- "rand_distr",
  "serde_json",
  "tokenizers 0.22.2",
 ]

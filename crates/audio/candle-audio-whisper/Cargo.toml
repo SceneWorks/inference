@@ -27,9 +27,9 @@ tokenizers = { workspace = true }
 # config.json parsing (the whisper `Config` block).
 serde_json = { workspace = true }
 # Seeded sampling for temperature > 0 decoding (the reproducibility law: same request+seed ⇒ the
-# same transcript). Same crates the media/TTS providers use for seeded draws.
+# same transcript) via `rand::distr::weighted::WeightedIndex`. Same crate the media/TTS providers
+# use for seeded draws.
 rand = { workspace = true }
-rand_distr = { workspace = true }
 
 [dev-dependencies]
 # HF-cache snapshot resolution for the `#[ignore]`d real-weight conformance test.
