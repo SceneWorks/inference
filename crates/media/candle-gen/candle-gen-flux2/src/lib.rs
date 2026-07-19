@@ -802,6 +802,8 @@ fn descriptor(variant: Flux2Variant) -> ModelDescriptor {
             requires_sigma_shift: true,
             supports_sequential_offload: true,
             supports_streaming: false,
+            supports_multi_speaker: false,
+            max_speakers: None,
             // No audio surface (sc-12834): pure image/video model.
             audio_sample_rates: vec![],
             max_audio_duration_secs: None,

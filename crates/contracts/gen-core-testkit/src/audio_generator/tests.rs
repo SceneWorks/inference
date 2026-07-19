@@ -28,6 +28,14 @@ struct Behavior {
     audio_output: bool,
     /// Emits a well-formed track (vs. a zero-sample-rate/empty one).
     well_formed_track: bool,
+    /// Advertises `supports_multi_speaker` (+ a `max_speakers` cap) and accepts a valid script
+    /// (sc-12848). `false` ⇒ a single-voice stub whose descriptor leaves `supports_multi_speaker`
+    /// unset, so the shared floor rejects a script as the typed Unsupported.
+    multi_speaker: bool,
+    /// A dishonest multi-speaker stub: advertises `supports_multi_speaker` yet its `validate`
+    /// rejects a valid script (drives the multi-speaker broken-stub self-test). Only meaningful
+    /// with `multi_speaker: true`.
+    reject_valid_script: bool,
 }
 
 impl Behavior {
@@ -41,6 +49,8 @@ impl Behavior {
             deterministic: true,
             audio_output: true,
             well_formed_track: true,
+            multi_speaker: false,
+            reject_valid_script: false,
         }
     }
 }
@@ -82,8 +92,13 @@ fn stub_desc(id: &'static str) -> ModelDescriptor {
 
 impl StubAudioGen {
     fn new(id: &'static str, behavior: Behavior) -> Self {
+        let mut desc = stub_desc(id);
+        if behavior.multi_speaker {
+            desc.capabilities.supports_multi_speaker = true;
+            desc.capabilities.max_speakers = Some(4);
+        }
         Self {
-            desc: stub_desc(id),
+            desc,
             behavior,
             runs: Cell::new(0),
         }
@@ -99,13 +114,22 @@ impl Generator for StubAudioGen {
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
-        if self.behavior.honest_validate {
-            self.desc
-                .capabilities
-                .validate_request_audio(self.desc.id, req)
-        } else {
-            Ok(())
+        if !self.behavior.honest_validate {
+            return Ok(());
         }
+        // The dishonest multi-speaker stub: claims support yet refuses any script.
+        if self.behavior.reject_valid_script {
+            if let Some(a) = &req.audio {
+                if a.script.is_some() {
+                    return Err(Error::Unsupported(
+                        "stub refuses multi-speaker scripts despite advertising support".into(),
+                    ));
+                }
+            }
+        }
+        self.desc
+            .capabilities
+            .validate_request_audio(self.desc.id, req)
     }
 
     fn generate(
@@ -545,4 +569,87 @@ fn streaming_stub_empty_then_full_chunk_fails_incrementality() {
 #[should_panic(expected = "audio conformance FAILED")]
 fn conformance_panics_on_a_broken_streaming_stub() {
     audio_conformance(|| StreamingStubAudioGen::boxed(1, true), &cheap());
+}
+
+// --- Multi-speaker script contract (sc-12848) ------------------------------------------------
+
+#[test]
+fn non_multi_speaker_stub_rejects_a_script_as_unsupported() {
+    // A single-voice provider (the default stub, supports_multi_speaker == false) must reject a
+    // multi-speaker script as the typed Unsupported — it can never silently read only the first
+    // segment.
+    let g = StubAudioGen::new(STUB_ID, Behavior::good());
+    assert!(!g.descriptor().capabilities.supports_multi_speaker);
+    check_audio_multi_speaker(&g, &cheap()).unwrap();
+}
+
+#[test]
+fn multi_speaker_stub_passes_multi_speaker_check() {
+    // A provider that advertises supports_multi_speaker accepts + renders a valid 2-speaker script
+    // and rejects an over-`max_speakers` script.
+    let g = StubAudioGen::new(
+        STUB_ID,
+        Behavior {
+            multi_speaker: true,
+            ..Behavior::good()
+        },
+    );
+    assert!(g.descriptor().capabilities.supports_multi_speaker);
+    assert_eq!(g.descriptor().capabilities.max_speakers, Some(4));
+    check_audio_multi_speaker(&g, &cheap()).unwrap();
+}
+
+#[test]
+fn multi_speaker_stub_passes_full_conformance() {
+    // A multi-speaker generator must also be a well-behaved one-shot generator (the whole suite,
+    // now including the multi-speaker check).
+    audio_conformance(
+        || {
+            StubAudioGen::boxed(
+                STUB_ID,
+                Behavior {
+                    multi_speaker: true,
+                    ..Behavior::good()
+                },
+            )
+        },
+        &cheap(),
+    );
+}
+
+#[test]
+fn multi_speaker_stub_rejecting_a_valid_script_fails_the_check() {
+    // The headline multi-speaker broken-stub: advertises supports_multi_speaker but its validate
+    // refuses a valid script — the check must catch the dishonest advertisement.
+    let g = StubAudioGen::new(
+        STUB_ID,
+        Behavior {
+            multi_speaker: true,
+            reject_valid_script: true,
+            ..Behavior::good()
+        },
+    );
+    let err = check_audio_multi_speaker(&g, &cheap()).unwrap_err();
+    assert!(
+        err.contains("advertises supports_multi_speaker but validate() rejected"),
+        "got: {err}"
+    );
+}
+
+#[test]
+#[should_panic(expected = "audio conformance FAILED")]
+fn conformance_panics_on_a_dishonest_multi_speaker_stub() {
+    audio_conformance(
+        || {
+            StubAudioGen::boxed(
+                STUB_ID,
+                Behavior {
+                    multi_speaker: true,
+                    reject_valid_script: true,
+                    ..Behavior::good()
+                },
+            )
+        },
+        &cheap(),
+    );
 }

@@ -90,6 +90,8 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
             requires_sigma_shift: false,
             supports_sequential_offload: false,
             supports_streaming: false,
+            supports_multi_speaker: false,
+            max_speakers: None,
             // No audio surface (sc-12834): pure image/video model.
             audio_sample_rates: vec![],
             max_audio_duration_secs: None,

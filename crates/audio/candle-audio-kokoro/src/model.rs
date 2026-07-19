@@ -130,6 +130,8 @@ pub fn descriptor() -> ModelDescriptor {
             requires_sigma_shift: false,
             supports_sequential_offload: false,
             supports_streaming: false,
+            supports_multi_speaker: false,
+            max_speakers: None,
         },
     }
 }

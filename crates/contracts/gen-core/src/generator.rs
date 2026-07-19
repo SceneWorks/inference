@@ -293,6 +293,43 @@ pub struct AudioParams {
     pub musical_key: Option<String>,
     /// Lyrics to sing / condition on (music models). Free-form text, distinct from `prompt`.
     pub lyrics: Option<String>,
+    /// A **multi-speaker dialogue script** (sc-12848) — an ordered sequence of spoken
+    /// [`SpeechSegment`]s, each carrying its own text plus an optional speaker/voice assignment and
+    /// per-segment style. This is the long-form / conversational-TTS carrier: a narration or a
+    /// two-person dialogue is one request whose segments are rendered in their assigned voices into a
+    /// single [`AudioTrack`], rather than a single voice reading everything.
+    ///
+    /// **Additive and single-voice-preserving.** `None` (the default) is a plain single-voice
+    /// request, byte-for-byte unaffected by this field: a provider with no script support behaves
+    /// exactly as before sc-12848. A provider opts in through
+    /// [`Capabilities::supports_multi_speaker`] (and optionally advertises a
+    /// [`Capabilities::max_speakers`] cap); the shared floor rejects a script sent to a
+    /// non-multi-speaker model as the typed [`Error::Unsupported`], the same convention
+    /// [`supports_streaming`](Capabilities::supports_streaming) uses. Tensor-free, like the rest of
+    /// [`AudioParams`]. `prompt` still carries any single-voice / global text; a model that reads the
+    /// script renders it in preference to `prompt`.
+    pub script: Option<Vec<SpeechSegment>>,
+}
+
+/// One segment of a multi-speaker dialogue [`script`](AudioParams::script) (sc-12848) — the text a
+/// single speaker utters, plus which voice utters it. Tensor-free and additive: new per-segment
+/// controls arrive as further `Option` fields without breaking
+/// `SpeechSegment { text: .., ..Default::default() }` construction.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SpeechSegment {
+    /// The text this segment speaks. A segment with empty/whitespace-only text is a malformed
+    /// request each script-capable model rejects in its own `validate`.
+    pub text: String,
+    /// The speaker / voice this segment is spoken in — a dialogue label (`"S1"` / `"S2"`) or a
+    /// concrete voice id, at the model's discretion. Gated against
+    /// [`Capabilities::audio_voices`] exactly like [`AudioParams::voice`] **only when the model
+    /// advertises a closed voice surface** (a non-empty `audio_voices`); a dialogue model with
+    /// opaque speaker labels advertises an empty voice surface and maps the labels itself. `None`
+    /// ⇒ the model's default / first speaker.
+    pub speaker: Option<String>,
+    /// Optional free-form per-segment style / emotion hint (e.g. `"cheerful"`, `"whisper"`).
+    /// Advisory and not gated: each model documents what it honors and ignores the rest.
+    pub style: Option<String>,
 }
 
 impl Default for GenerationRequest {
@@ -514,6 +551,9 @@ impl GenerationRequest {
             sample_rate: _,
             musical_key: _,
             lyrics: _,
+            // The script carries no floats (text + opaque labels); named (no `..`) so a future
+            // float-bearing per-segment control fails to compile here until it is classified.
+            script: _,
             target_duration,
             bpm,
         }) = audio
@@ -947,6 +987,21 @@ pub struct Capabilities {
     /// law (chunks concatenate to the returned track) holds for streaming and non-streaming providers
     /// alike.
     pub supports_streaming: bool,
+    /// Whether this model renders a **multi-speaker dialogue script**
+    /// ([`AudioParams::script`], sc-12848) — the opt-in signal for long-form / conversational
+    /// multi-speaker TTS, mirroring [`supports_streaming`](Self::supports_streaming). `Default` is
+    /// `false`: every non-dialogue model (image/video and the single-voice TTS / SFX / music audio
+    /// families) leaves it unset, and the shared floor rejects a request carrying a
+    /// [`script`](AudioParams::script) as the typed [`Error::Unsupported`]. A provider sets it `true`
+    /// only when it genuinely assigns per-segment voices from the script's speaker labels; a consumer
+    /// reads it to know whether a segmented script will be honored or must be rejected.
+    pub supports_multi_speaker: bool,
+    /// The largest number of **distinct** speaker labels a multi-speaker
+    /// [`script`](AudioParams::script) may name (sc-12848). `None` ⇒ no advertised cap (bounded only
+    /// by the model). Consulted only when [`supports_multi_speaker`](Self::supports_multi_speaker) is
+    /// set; a script naming more than `max_speakers` distinct speakers is a range error
+    /// ([`Error::Msg`], not a capability gap). `Default` is `None`.
+    pub max_speakers: Option<u32>,
     /// On-the-fly quantization levels this engine offers (empty slice = none). Read by the worker's
     /// capability advertisement (sc-3723) instead of a hardcoded per-row flag. `Default` is `&[]`.
     pub supported_quants: &'static [Quant],
@@ -1001,7 +1056,9 @@ impl Capabilities {
     /// - the [`audio`](GenerationRequest::audio) sub-block's supplied values must sit inside the
     ///   advertised audio surface (voice / language / sample-rate membership,
     ///   `target_duration` within `(0, `[`max_audio_duration_secs`](Self::max_audio_duration_secs)`]`,
-    ///   positive `bpm` — sc-12834).
+    ///   positive `bpm` — sc-12834); and a multi-speaker [`script`](AudioParams::script) only when
+    ///   [`supports_multi_speaker`](Self::supports_multi_speaker) is set, within any advertised
+    ///   [`max_speakers`](Self::max_speakers) cap (sc-12848),
     ///
     /// Capability-gap rejections (unsupported negative_prompt / guidance / true_cfg / sampler /
     /// scheduler / guidance_method / conditioning) return the typed [`Error::Unsupported`] so a
@@ -1168,6 +1225,55 @@ impl Capabilities {
                         "{id}: unsupported audio.language {l:?} (supported: {:?})",
                         self.audio_languages
                     )));
+                }
+            }
+            // Multi-speaker dialogue script (sc-12848): a script sent to a model that does not
+            // advertise `supports_multi_speaker` is a capability gap → typed `Error::Unsupported`
+            // (the same convention `audio.voice` / streaming use), so a single-voice model can never
+            // silently read only the first segment. When supported, the script must be non-empty (an
+            // empty script is a malformed request → `Error::Msg`), stay within any advertised
+            // `max_speakers` cap (range → `Error::Msg`), and — for a model with a **closed** voice
+            // surface (a non-empty `audio_voices`) — name only advertised voices (gap →
+            // `Error::Unsupported`, exactly like `audio.voice`). A dialogue model with opaque speaker
+            // labels advertises an empty voice surface and is not per-label gated here; each model
+            // still layers per-segment text checks (empty text) in its own `validate`.
+            if let Some(script) = &audio.script {
+                if !self.supports_multi_speaker {
+                    return Err(Error::Unsupported(format!(
+                        "{id}: a multi-speaker audio.script is not supported"
+                    )));
+                }
+                if script.is_empty() {
+                    return Err(Error::Msg(format!(
+                        "{id}: audio.script is empty — a multi-speaker script must carry at least \
+                         one segment"
+                    )));
+                }
+                if let Some(max) = self.max_speakers {
+                    let mut labels: Vec<&str> =
+                        script.iter().filter_map(|s| s.speaker.as_deref()).collect();
+                    labels.sort_unstable();
+                    labels.dedup();
+                    if labels.len() as u32 > max {
+                        return Err(Error::Msg(format!(
+                            "{id}: audio.script names {} distinct speakers, above the supported \
+                             maximum {max}",
+                            labels.len()
+                        )));
+                    }
+                }
+                if !self.audio_voices.is_empty() {
+                    for seg in script {
+                        if let Some(sp) = &seg.speaker {
+                            if !self.audio_voices.contains(&sp.as_str()) {
+                                return Err(Error::Unsupported(format!(
+                                    "{id}: unsupported audio.script speaker {sp:?} (supported \
+                                     voices: {:?})",
+                                    self.audio_voices
+                                )));
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1865,6 +1971,88 @@ mod tests {
                 "msg case {i} should be a Msg range error, got {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn multi_speaker_script_gating_is_additive_and_typed() {
+        // sc-12848: a script is a capability gap on a non-multi-speaker model (the default), and
+        // gated by supports_multi_speaker / max_speakers / the closed voice surface when advertised.
+        let seg = |sp: &str| SpeechSegment {
+            text: "hello".into(),
+            speaker: Some(sp.into()),
+            ..Default::default()
+        };
+        let script_req = |caps_voices: Vec<&'static str>,
+                          ms: bool,
+                          max: Option<u32>,
+                          segs: Vec<SpeechSegment>| {
+            let c = Capabilities {
+                audio_voices: caps_voices,
+                supports_multi_speaker: ms,
+                max_speakers: max,
+                max_count: 1,
+                ..Default::default()
+            };
+            let req = GenerationRequest {
+                audio: Some(AudioParams {
+                    script: Some(segs),
+                    ..Default::default()
+                }),
+                ..audio_req()
+            };
+            c.validate_request_audio("tts", &req)
+        };
+
+        // A single-voice model with no script capability: a script is a typed Unsupported.
+        assert!(matches!(
+            script_req(vec![], false, None, vec![seg("S1"), seg("S2")]),
+            Err(Error::Unsupported(_))
+        ));
+
+        // Advertised multi-speaker, opaque labels (empty voice surface): a valid script passes.
+        assert!(script_req(vec![], true, Some(2), vec![seg("S1"), seg("S2")]).is_ok());
+
+        // An empty script is a malformed request (Msg), not a capability gap.
+        assert!(matches!(
+            script_req(vec![], true, None, vec![]),
+            Err(Error::Msg(_))
+        ));
+
+        // Over the max_speakers cap → range error (Msg).
+        assert!(matches!(
+            script_req(vec![], true, Some(2), vec![seg("S1"), seg("S2"), seg("S3")]),
+            Err(Error::Msg(_))
+        ));
+        // At the cap, distinct-count dedups repeated labels → OK.
+        assert!(script_req(vec![], true, Some(2), vec![seg("S1"), seg("S1"), seg("S2")]).is_ok());
+
+        // A closed voice surface gates script speakers exactly like `audio.voice` (typed Unsupported).
+        assert!(script_req(
+            vec!["nova", "onyx"],
+            true,
+            None,
+            vec![seg("nova"), seg("onyx")]
+        )
+        .is_ok());
+        assert!(matches!(
+            script_req(vec!["nova"], true, None, vec![seg("nova"), seg("ghost")]),
+            Err(Error::Unsupported(_))
+        ));
+
+        // The additive floor: a request with NO script behaves exactly as before (single-voice).
+        let c = Capabilities {
+            audio_voices: vec!["nova"],
+            max_count: 1,
+            ..Default::default()
+        };
+        let single = GenerationRequest {
+            audio: Some(AudioParams {
+                voice: Some("nova".into()),
+                ..Default::default()
+            }),
+            ..audio_req()
+        };
+        assert!(c.validate_request_audio("tts", &single).is_ok());
     }
 
     #[test]
