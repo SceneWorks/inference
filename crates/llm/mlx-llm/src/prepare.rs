@@ -120,7 +120,7 @@ fn validate_supported_hf_architecture(source: &Path) -> CoreResult<()> {
         ))
     })?;
     let load_spec = LoadSpec::dense(source.to_string_lossy().to_string());
-    if !crate::provider::can_load(&load_spec) {
+    if !crate::provider::can_load(&load_spec) && !crate::joycaption::can_load(&load_spec) {
         return Err(CoreError::Unsupported(format!(
             "cannot prepare '{}': architecture is not supported by mlx-llm",
             source.display()

@@ -16,14 +16,15 @@
 //! port differs numerically from the reference.
 
 use core_llm::{
-    Content, ImageRef, LoadSpec, Message, Role, Sampling, TextLlm, TextLlmRequest, Tokenizer,
+    Content, ImageRef, LoadSpec, Message, PrepareSpec, Quantize, Role, Sampling, TextLlm,
+    TextLlmRequest, Tokenizer,
 };
 
 use mlx_llm::decode::CancelFlag;
 use mlx_llm::joycaption::{build_chat_text, JoyCaptionModel, JoyCaptionProvider, STOP_TOKENS};
 use mlx_llm::primitives::sampler::SamplingParams;
-use mlx_llm::primitives::{QuantSpec, Weights};
-use mlx_llm::snapshot::write_hf_snapshot;
+use mlx_llm::primitives::Weights;
+use mlx_llm::{load_for_model, prepare_snapshot};
 
 /// Pure-greedy golden tokens for the gray-384 fixture + "Write a very short caption." (16 tokens).
 const GOLDEN: &[i32] = &[
@@ -82,12 +83,12 @@ fn prepared_q4_snapshot_runs_full_vlm() {
     let out = std::env::temp_dir().join(format!("mlx-llm-joycaption-q4-{}", std::process::id()));
     std::fs::remove_dir_all(&out).ok();
     let prepared = PreparedSnapshot(out);
-    let report = write_hf_snapshot(source, &prepared.0, Some(QuantSpec::q4()))
-        .expect("quantize-prepare of the pinned JoyCaption source must succeed");
-    assert_eq!(report.quantized, Some(QuantSpec::q4()));
+    let report = prepare_snapshot(&PrepareSpec::quantized(source, &prepared.0, Quantize::Q4))
+        .expect("registered quantize-prepare of the pinned JoyCaption source must succeed");
+    assert_eq!(report.quantized, Some(Quantize::Q4));
     assert!(
-        report.quantized_projections > 0,
-        "JoyCaption prepare must quantize text projections"
+        report.num_tensors > 0,
+        "JoyCaption prepare must report written tensors"
     );
 
     let config: serde_json::Value = serde_json::from_str(
@@ -130,42 +131,43 @@ fn prepared_q4_snapshot_runs_full_vlm() {
         );
     }
 
-    let model = JoyCaptionModel::from_dir(&prepared.0)
-        .expect("prepared JoyCaption VLM must load through the stored-quantized text path");
-    assert_eq!(model.language_config().quantization, Some(QuantSpec::q4()));
-    let tok = Tokenizer::from_file(prepared.0.join("tokenizer.json"))
-        .expect("prepared tokenizer must load");
+    let provider = load_for_model(&LoadSpec::dense(prepared.0.to_string_lossy().to_string()))
+        .expect("registered provider selection must load the prepared JoyCaption VLM");
+    assert_eq!(provider.descriptor().id, "mlx-joycaption");
+    assert!(provider.descriptor().capabilities.supports_vision);
     let (pixels, width, height) = gradient_image();
-    let features = model
-        .image_features(&pixels, width as usize, height as usize)
-        .expect("dense SigLIP tower and projector must encode the image");
-    let prompt_ids: Vec<i32> = tok
-        .encode(&build_chat_text("Write a very short caption."), false)
-        .expect("JoyCaption prompt must tokenize")
-        .into_iter()
-        .map(|id| id as i32)
-        .collect();
-    let generated = model
-        .generate(
-            &prompt_ids,
-            &features,
-            &SamplingParams {
-                temperature: 0.0,
-                top_p: 1.0,
-                top_k: 0,
-                repetition_penalty: 1.0,
-                repetition_context: 0,
-            },
-            2,
-            Some(0),
-            STOP_TOKENS,
-            &CancelFlag::new(),
-            &mut |_, _| {},
-        )
-        .expect("prepared JoyCaption VLM must generate from the real image input");
+    let request = TextLlmRequest {
+        messages: vec![Message {
+            role: Role::User,
+            content: vec![
+                Content::Image(
+                    ImageRef::new(width, height, pixels).expect("gradient image must be valid RGB"),
+                ),
+                Content::text("Write a very short caption."),
+            ],
+            thinking: None,
+            tool_calls: Vec::new(),
+        }],
+        sampling: Sampling::greedy(),
+        max_new_tokens: 2,
+        seed: Some(0),
+        ..Default::default()
+    };
+    let mut saw_done = false;
+    let generated = provider
+        .generate(&request, &mut |event| {
+            if matches!(event, core_llm::StreamEvent::Done { .. }) {
+                saw_done = true;
+            }
+        })
+        .expect("registered JoyCaption provider must generate from the real image request");
     assert!(
-        !generated.tokens.is_empty(),
+        generated.usage.generated_tokens > 0,
         "prepared JoyCaption generation stopped before producing a token"
+    );
+    assert!(
+        saw_done,
+        "public streaming contract must emit terminal Done"
     );
 }
 
