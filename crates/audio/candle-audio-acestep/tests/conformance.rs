@@ -156,6 +156,20 @@ fn acestep_music_wav_conformance() {
         .sum::<f32>()
         / frame_rms.len() as f32;
     let cv = var_frame.sqrt() / mean_frame.max(1e-9);
+
+    // Write the playable evidence + a diagnostic line BEFORE the musicality gate, so a failing
+    // run still yields a listenable WAV and the observed metrics. This only reorders the artifact
+    // write earlier — it does not weaken any assertion below.
+    let out_path = std::env::var("ACESTEP_WAV_OUT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir().join("acestep-music-sc12842.wav"));
+    candle_audio::wav::write_wav_pcm16(&out_path, &track).expect("write WAV");
+    eprintln!(
+        "acestep evidence: wrote {} ({secs:.2}s @ {} Hz stereo, RMS {rms:.4}, frame CV {cv:.3})",
+        out_path.display(),
+        track.sample_rate
+    );
+
     assert!(
         cv > 0.15,
         "frame-RMS coefficient of variation {cv:.3} — constant energy is not music (catches \
