@@ -19,19 +19,22 @@
 //!    flow-matching token→mel decoder + HiFTNet NSF/iSTFT vocoder) that renders those speech tokens
 //!    into a 24 kHz waveform in the reference voice.
 //!
-//! ## Port status (honest partial — sc-13222)
+//! ## Port status (honest partial — sc-13222, sc-13235)
 //!
-//! This slice ports the **T3 LM** (the clone's text→speech-token brain), the text front-end
+//! sc-13222 ported the **T3 LM** (the clone's text→speech-token brain), the text front-end
 //! ([`text`] — `punc_norm` + the `EnTokenizer` BPE), the full provider contract, and the
-//! conditioning mapping ([`model`]). The **S3Gen** token→waveform stack is **four large networks
-//! plus custom DSP** (see [`s3gen`]) and is **not yet ported**; the generator's `generate()`
-//! runs T3 to produce real speech tokens and then returns a typed error at the S3Gen boundary
-//! rather than fabricate audio. Consequently the generator is **not yet registered into
-//! `candle-audio-catalog`'s shipping surface** (registering a generator that cannot render audio
-//! would be a false advertisement, and would fail the gen-core generator conformance suite): that
-//! registration, the ordered-id surface extension, and the three bundle smokes are deliberately
-//! deferred to the S3Gen slice. This crate is present as a workspace member so its T3 stage builds,
-//! is unit-tested, and is exercised end-to-end on real weights by the conformance test.
+//! conditioning mapping ([`model`]). sc-13235 ports the **s3tokenizer** ([`s3tokenizer`]) — the
+//! first of S3Gen's four networks (a Whisper-v2 FSMN mel encoder + FSQ quantizer → 25 Hz speech
+//! tokens); it now fills T3's reference-conditioning prompt (empty before). The remaining **three**
+//! S3Gen networks (CAMPPlus x-vector, CosyVoice flow-matching decoder, HiFTNet vocoder — see
+//! [`s3gen`]) are **not yet ported**; the generator's `generate()` runs T3 to produce real speech
+//! tokens and then returns a typed error at the S3Gen boundary rather than fabricate audio.
+//! Consequently the generator is **not yet registered into `candle-audio-catalog`'s shipping
+//! surface** (registering a generator that cannot render audio would be a false advertisement, and
+//! would fail the gen-core generator conformance suite): that registration, the ordered-id surface
+//! extension, and the three bundle smokes are deliberately deferred to the remaining S3Gen slices.
+//! This crate is present as a workspace member so its T3 + s3tokenizer stages build, are
+//! unit-tested, and are exercised end-to-end on real weights by the conformance test.
 //!
 //! Weights resolve through the audio lane's pinned-SHA hub path (F-029): `ResembleAI/chatterbox`
 //! at the same immutable commit the [`candle_audio_chatterbox_ve`] sibling pins.
@@ -43,14 +46,16 @@ pub mod config;
 pub mod model;
 pub mod prepare;
 pub mod s3gen;
+pub mod s3tokenizer;
 pub mod t3;
 pub mod text;
 
-pub use config::{S3GenConfig, T3Config};
+pub use config::{S3GenConfig, S3TokenizerConfig, T3Config};
 pub use model::{
     descriptor, load, load_generator, resolve_pinned_snapshot, ChatterboxGenerator, HUB_REPO,
     HUB_REVISION, MODEL_ID, REGISTRATION, T3_WEIGHTS_FILE, TOKENIZER_FILE,
 };
+pub use s3tokenizer::S3Tokenizer;
 
 /// Add the Chatterbox generator to an explicit audio registry builder.
 ///
