@@ -6,6 +6,8 @@ from pathlib import Path
 
 
 WORKFLOW = Path(__file__).resolve().parents[2] / ".github" / "workflows" / "ci.yml"
+REAL_WEIGHTS_WORKFLOW = WORKFLOW.with_name("real-weights.yml")
+RESIDENCY_SCRIPT = WORKFLOW.parents[2] / "scripts" / "release" / "run-residency-ab.ps1"
 
 
 def job_if_expression(workflow: str, job: str) -> str:
@@ -55,6 +57,17 @@ def evaluate_policy(
 
 
 class CiWorkflowPolicyTests(unittest.TestCase):
+    def test_residency_ab_is_operator_run_without_ci_model_dependencies(self) -> None:
+        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        self.assertNotIn("residency-ab", workflow)
+        self.assertNotIn("QWEN_IMAGE_SNAPSHOT", workflow)
+        self.assertNotIn("FLUX_DEV_DIR", workflow)
+
+        script = RESIDENCY_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("qwen_image_probed_generate_for_offload_ab", script)
+        self.assertIn("flux_dev_probed_generate_for_offload_ab", script)
+        self.assertEqual(script.count("--features cuda"), 1)
+
     def test_windows_cuda_check_rejects_fork_prs_but_preserves_trusted_events(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
         expression = job_if_expression(workflow, "windows-cuda-check")
