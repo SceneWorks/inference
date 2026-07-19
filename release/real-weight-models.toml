@@ -75,6 +75,16 @@ environment = ["CHATTERBOX_VE_SNAPSHOT"]
 expected_files = ["ve.safetensors"]
 
 [[models]]
+key = "openvoice-v2"
+repository = "myshell-ai/OpenVoiceV2"
+revision = "f36e7edfe1684461a8343844af60babc2efbb727"
+license = "MIT"
+size_class = "small"
+profiles = ["audio-macos"]
+environment = ["OPENVOICE_V2_SNAPSHOT"]
+expected_files = ["converter/config.json", "converter/checkpoint.pth"]
+
+[[models]]
 key = "mochi-1-preview"
 repository = "genmo/mochi-1-preview"
 revision = "14be5fcea23095ed330cb214647916a451e38b6e"

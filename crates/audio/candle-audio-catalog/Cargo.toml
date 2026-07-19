@@ -11,10 +11,12 @@ repository = "https://github.com/SceneWorks/inference"
 # gen-core / candle build (the same single-resolution discipline as candle-gen-catalog).
 candle-audio = { path = "../candle-audio" }
 # Audio provider crates, in catalog order (sc-12836: Kokoro TTS; sc-12841: MOSS-SoundEffect
-# SFX/ambience; sc-12844: Chatterbox voice encoder — a VoiceEmbedder, not a generator).
+# SFX/ambience; sc-12844: Chatterbox voice encoder — a VoiceEmbedder, not a generator; sc-13223:
+# OpenVoice V2 voice conversion — the first real AudioTransform).
 candle-audio-kokoro = { path = "../candle-audio-kokoro" }
 candle-audio-moss-sfx = { path = "../candle-audio-moss-sfx" }
 candle-audio-chatterbox-ve = { path = "../candle-audio-chatterbox-ve" }
+candle-audio-openvoice = { path = "../candle-audio-openvoice" }
 # The audio lane's snapshot-preparer composition (sc-12836): the lane's single `candle`
 # registration recognizes audio snapshots and delegates everything else to candle-llm's
 # preparer unchanged. This crate is the composition owner (previously each bundle wired
@@ -31,10 +33,12 @@ metal = [
     "candle-audio-kokoro/metal",
     "candle-audio-moss-sfx/metal",
     "candle-audio-chatterbox-ve/metal",
+    "candle-audio-openvoice/metal",
 ]
 cuda = [
     "candle-audio/cuda",
     "candle-audio-kokoro/cuda",
     "candle-audio-moss-sfx/cuda",
     "candle-audio-chatterbox-ve/cuda",
+    "candle-audio-openvoice/cuda",
 ]

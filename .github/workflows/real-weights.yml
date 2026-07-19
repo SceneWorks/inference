@@ -68,6 +68,7 @@ jobs:
       KOKORO_SNAPSHOT: ${{ vars.KOKORO_SNAPSHOT }}
       MOSS_SFX_SNAPSHOT: ${{ vars.MOSS_SFX_SNAPSHOT }}
       CHATTERBOX_VE_SNAPSHOT: ${{ vars.CHATTERBOX_VE_SNAPSHOT }}
+      OPENVOICE_V2_SNAPSHOT: ${{ vars.OPENVOICE_V2_SNAPSHOT }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: Toolchain versions
@@ -78,6 +79,7 @@ jobs:
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model kokoro-82m --snapshot "$KOKORO_SNAPSHOT"
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model moss-soundeffect-v2 --snapshot "$MOSS_SFX_SNAPSHOT"
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model chatterbox-ve --snapshot "$CHATTERBOX_VE_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model openvoice-v2 --snapshot "$OPENVOICE_V2_SNAPSHOT"
       - name: Run provider conformance
         run: |
           cargo test --locked -p candle-audio-kokoro --test conformance kokoro_conformance -- --ignored --nocapture
@@ -88,6 +90,11 @@ jobs:
           # snapshot above for the distinct reference voices it embeds.
           cargo test --locked -p candle-audio-chatterbox-ve --test conformance chatterbox_ve_discriminates_speakers -- --ignored --nocapture
           cargo test --locked -p candle-audio-chatterbox-ve --test conformance chatterbox_ve_wav_conformance -- --ignored --nocapture
+          # OpenVoice V2 voice conversion (sc-13223): the sc-12839 release gate. Converts a Kokoro
+          # source clip toward a DIFFERENT Kokoro target voice; the timbre shift is measured with
+          # chatterbox_ve above.
+          cargo test --locked -p candle-audio-openvoice --test conformance openvoice_v2_converts_toward_the_target_voice -- --ignored --nocapture
+          cargo test --locked -p candle-audio-openvoice --test conformance openvoice_v2_is_deterministic -- --ignored --nocapture
       # Regression fixture (sc-12854): the validation harness's committed metric envelope +
       # PCM repeatability hash; this runner IS the fixture's canonical platform
       # (macos/aarch64), so the exact-hash check gates here.

@@ -40,15 +40,18 @@ pub mod providers {
     pub use candle_audio_chatterbox_ve;
     pub use candle_audio_kokoro;
     pub use candle_audio_moss_sfx;
+    pub use candle_audio_openvoice;
 }
 
 /// Add every provider shipped by the Candle audio lane to an explicit registry builder, in
 /// stable catalog order: the generators first (Kokoro TTS, MOSS SFX), then the voice-cloning
-/// identity embedder (Chatterbox `ve`, sc-12844).
+/// identity embedder (Chatterbox `ve`, sc-12844), then the audio transforms (OpenVoice V2 voice
+/// conversion, sc-13223 — the first real `AudioTransform`, releasing the sc-12839 gate).
 pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistryBuilder {
     let registry = candle_audio_kokoro::register_providers(registry);
     let registry = candle_audio_moss_sfx::register_providers(registry);
-    candle_audio_chatterbox_ve::register_providers(registry)
+    let registry = candle_audio_chatterbox_ve::register_providers(registry);
+    candle_audio_openvoice::register_providers(registry)
 }
 
 /// Build the complete explicit Candle audio provider catalog.
@@ -72,6 +75,7 @@ fn lane_backend() -> &'static str {
 fn lane_can_prepare(spec: &core_llm::PrepareSpec) -> bool {
     candle_audio_kokoro::prepare::can_prepare(spec)
         || candle_audio_moss_sfx::prepare::can_prepare(spec)
+        || candle_audio_openvoice::prepare::can_prepare(spec)
         || (candle_llm::prepare::REGISTRATION.can_prepare)(spec)
 }
 
@@ -80,6 +84,8 @@ fn lane_prepare(spec: &core_llm::PrepareSpec) -> core_llm::Result<core_llm::Prep
         candle_audio_kokoro::prepare::prepare(spec)
     } else if candle_audio_moss_sfx::prepare::can_prepare(spec) {
         candle_audio_moss_sfx::prepare::prepare(spec)
+    } else if candle_audio_openvoice::prepare::can_prepare(spec) {
+        candle_audio_openvoice::prepare::prepare(spec)
     } else {
         (candle_llm::prepare::REGISTRATION.prepare)(spec)
     }
@@ -126,6 +132,13 @@ mod tests {
             .map(|r| (r.descriptor)().id.to_string())
             .collect();
         assert_eq!(voice_embedders, ["chatterbox_ve"]);
+        // The audio transforms surface as their own kind (sc-13223), in catalog order — OpenVoice
+        // V2 voice conversion is the first real AudioTransform (releasing the sc-12839 gate).
+        let audio_transforms: Vec<String> = registry
+            .audio_transforms()
+            .map(|r| (r.descriptor)().id.to_string())
+            .collect();
+        assert_eq!(audio_transforms, ["openvoice_v2"]);
         assert_eq!(
             registry.descriptor_conformance_errors(),
             Vec::<String>::new()
@@ -137,8 +150,10 @@ mod tests {
         assert_eq!(registry.captioners().len(), 0);
         assert_eq!(registry.image_embedders().len(), 0);
         assert_eq!(registry.text_embedders().len(), 0);
-        // No audio transform ships yet (OpenVoice/RVC conversion is a future sc-12844 slice).
-        assert_eq!(registry.audio_transforms().len(), 0);
+        // Every audio transform is candle-backed.
+        assert!(registry
+            .audio_transforms()
+            .all(|r| (r.descriptor)().backend == super::AUDIO_BACKEND));
         // Every audio generator is candle-backed and audio-modality.
         assert!(registry
             .generators()
@@ -194,6 +209,19 @@ mod tests {
         let spec = super::core_llm::PrepareSpec::dense(&moss, moss.join("out"));
         assert!((regs[0].can_prepare)(&spec));
         let _ = std::fs::remove_dir_all(&moss);
+        // ...an OpenVoice V2 converter snapshot dir is accepted too (sc-13223)...
+        let ov = std::env::temp_dir().join("audio-catalog-openvoice-probe");
+        let _ = std::fs::remove_dir_all(&ov);
+        std::fs::create_dir_all(&ov).unwrap();
+        std::fs::write(
+            ov.join("config.json"),
+            r#"{"data":{"filter_length":1024},"model":{"gin_channels":256}}"#,
+        )
+        .unwrap();
+        std::fs::write(ov.join("checkpoint.pth"), b"stub").unwrap();
+        let spec = super::core_llm::PrepareSpec::dense(&ov, ov.join("out"));
+        assert!((regs[0].can_prepare)(&spec));
+        let _ = std::fs::remove_dir_all(&ov);
         // ...while a bare dir (neither audio- nor LLM-shaped) is not.
         let empty = std::env::temp_dir().join("audio-catalog-empty-probe");
         let _ = std::fs::remove_dir_all(&empty);

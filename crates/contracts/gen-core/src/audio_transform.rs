@@ -19,8 +19,11 @@
 //! The family covers three non-prompt audio→audio shapes, distinguished by
 //! [`AudioTransformKind`]:
 //! - **voice conversion** ([`VoiceConversion`](AudioTransformKind::VoiceConversion)) — audio→audio;
-//!   the target voice is baked into the loaded weights (like SeedVR2's fixed text embedding), so the
-//!   request carries only the source clip, no conditioning;
+//!   the target voice is either baked into the loaded weights (an RVC-style single-target model,
+//!   like SeedVR2's fixed text embedding — the request carries only the source clip) **or** supplied
+//!   per request as a tone-color reference clip via
+//!   [`AudioTransformRequest::target_reference`] (a reference-based converter, OpenVoice V2 —
+//!   sc-13223);
 //! - **stem separation** ([`StemSeparation`](AudioTransformKind::StemSeparation)) — audio→`Vec`
 //!   audio (vocals / drums / bass / other);
 //! - **super-resolution / restoration / bandwidth-extension**
@@ -59,6 +62,18 @@ pub trait AudioTransform {
 pub struct AudioTransformRequest {
     /// The source clip — the subject of the transform (there is no prompt).
     pub audio: AudioTrack,
+    /// An optional **target tone-color reference** clip (additive, sc-13223). Some voice
+    /// converters bake the target voice into the loaded weights (an RVC-style single-target
+    /// model — `None` here), but a *reference-based* converter (OpenVoice V2) needs the target
+    /// speaker supplied at request time: this clip is the "how should it sound" example whose
+    /// timbre is transferred onto [`audio`](Self::audio)'s content. It is a plain host
+    /// [`AudioTrack`] (tensor-free like every other request field); the source clip stays in
+    /// [`audio`](Self::audio). Ignored by the kinds that do not consume a reference
+    /// ([`StemSeparation`](AudioTransformKind::StemSeparation) /
+    /// [`SuperResolution`](AudioTransformKind::SuperResolution)) and by weight-baked converters;
+    /// a reference-based [`VoiceConversion`](AudioTransformKind::VoiceConversion) provider
+    /// rejects a request whose `target_reference` is `None`.
+    pub target_reference: Option<AudioTrack>,
     /// Output rate target (super-resolution / bandwidth-extension); [`AudioTarget::Preserve`] for
     /// rate-preserving kinds (voice conversion, stem separation).
     pub target: AudioTarget,
