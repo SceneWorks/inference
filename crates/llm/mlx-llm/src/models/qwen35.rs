@@ -17,6 +17,8 @@
 //! cache (full-attn layers) and the recurrent [`DeltaNetCache`] (linear layers) live side by side in
 //! a per-layer [`Qwen35Cache`]. RMSNorm weights follow the Qwen3-Next `(1 + weight)` convention.
 
+use std::cell::Cell;
+
 use mlx_rs::ops::{add, concatenate_axis, multiply, rsqrt, sigmoid, split_sections, sum_axis};
 use mlx_rs::{Array, Dtype};
 
@@ -114,15 +116,19 @@ impl Qwen35Config {
         let intermediate_size = int("intermediate_size")
             .or_else(|| int("moe_intermediate_size"))
             .unwrap_or(0);
-        let quantization = c
-            .get("quantization")
-            .or_else(|| v.get("quantization"))
-            .and_then(|q| {
-                Some(QuantSpec {
-                    group_size: q.get("group_size")?.as_i64()? as i32,
-                    bits: q.get("bits")?.as_i64()? as i32,
-                })
-            });
+        let nested_quant = parse_quantization(c.get("quantization"), "text_config.quantization")?;
+        let top_quant = if std::ptr::eq(c, v) {
+            None
+        } else {
+            parse_quantization(v.get("quantization"), "quantization")?
+        };
+        if nested_quant.is_some() && top_quant.is_some() && nested_quant != top_quant {
+            return Err(Error::Config(format!(
+                "qwen3_5 config.json has conflicting nested/top-level quantization blocks: \
+                 {nested_quant:?} != {top_quant:?}"
+            )));
+        }
+        let quantization = nested_quant.or(top_quant);
         Ok(Self {
             hidden_size,
             num_layers: req("num_hidden_layers")? as usize,
@@ -193,6 +199,40 @@ impl Qwen35Config {
         let rd = (self.head_dim as f32 * self.partial_rotary_factor).round() as i32;
         rd & !1
     }
+}
+
+fn parse_quantization(value: Option<&serde_json::Value>, label: &str) -> Result<Option<QuantSpec>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let obj = value
+        .as_object()
+        .ok_or_else(|| Error::Config(format!("{label} must be an object")))?;
+    let integer = |field: &str| -> Result<i32> {
+        let raw = obj
+            .get(field)
+            .and_then(|v| v.as_i64())
+            .ok_or_else(|| Error::Config(format!("{label}.{field} must be an integer")))?;
+        i32::try_from(raw)
+            .map_err(|_| Error::Config(format!("{label}.{field} is outside the i32 range")))
+    };
+    let spec = QuantSpec {
+        group_size: integer("group_size")?,
+        bits: integer("bits")?,
+    };
+    if !matches!(spec.bits, 4 | 8) {
+        return Err(Error::Config(format!(
+            "{label}.bits must be 4 or 8, got {}",
+            spec.bits
+        )));
+    }
+    if spec.group_size != 64 {
+        return Err(Error::Config(format!(
+            "{label}.group_size must be 64, got {}",
+            spec.group_size
+        )));
+    }
+    Ok(Some(spec))
 }
 
 /// Multiply `x` by an f32 scalar (cast to `x`'s dtype).
@@ -852,22 +892,82 @@ impl Qwen35Model {
             Ok(add(&t, &Array::from_f32(1.0).as_dtype(t.dtype())?)?)
         };
         let stored_quant = cfg.quantization;
+        if stored_quant.is_some() && quant.is_some() {
+            return Err(Error::Config(
+                "qwen3_5 cannot combine stored quantized weights with load-time quantization"
+                    .into(),
+            ));
+        }
+        let saw_stored = Cell::new(false);
         let proj_q = |key: String| -> Result<Projection> {
             let base = key.strip_suffix(".weight").unwrap_or(&key);
             let scales_key = format!("{base}.scales");
-            if w.contains(&scales_key) {
+            let biases_key = format!("{base}.biases");
+            let present = [
+                w.contains(&key),
+                w.contains(&scales_key),
+                w.contains(&biases_key),
+            ];
+            let any_packed_part = present[1] || present[2];
+            if any_packed_part || stored_quant.is_some() {
                 let spec = stored_quant.ok_or_else(|| {
                     Error::Config(format!(
-                        "snapshot stores quantized tensor `{scales_key}` but config.json has no \
+                        "snapshot stores quantized parts for `{base}` but config.json has no \
                          `quantization` block"
                     ))
                 })?;
-                Ok(Projection::from_quantized(
-                    w.require(&key)?.clone(),
-                    w.require(&scales_key)?.clone(),
-                    w.require(&format!("{base}.biases"))?.clone(),
-                    spec,
-                ))
+                if !present.iter().all(|&part| part) {
+                    let names = ["weight", "scales", "biases"];
+                    let missing = names
+                        .iter()
+                        .zip(present)
+                        .filter_map(|(name, yes)| (!yes).then_some(*name))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Err(Error::Config(format!(
+                        "stored quantized projection `{base}` is incomplete; missing {missing}"
+                    )));
+                }
+                let weight = w.require(&key)?.clone();
+                let scales = w.require(&scales_key)?.clone();
+                let biases = w.require(&biases_key)?.clone();
+                let ws = weight.shape();
+                let ss = scales.shape();
+                let bs = biases.shape();
+                if ws.len() != 2 || ss.len() != 2 || bs != ss {
+                    return Err(Error::Config(format!(
+                        "stored quantized projection `{base}` has invalid part shapes: weight \
+                         {ws:?}, scales {ss:?}, biases {bs:?}"
+                    )));
+                }
+                let input = ss[1].checked_mul(spec.group_size).ok_or_else(|| {
+                    Error::Config(format!(
+                        "stored quantized projection `{base}` input overflow"
+                    ))
+                })?;
+                let packed_cols =
+                    input
+                        .checked_mul(spec.bits)
+                        .map(|n| n / 32)
+                        .ok_or_else(|| {
+                            Error::Config(format!(
+                                "stored quantized projection `{base}` pack overflow"
+                            ))
+                        })?;
+                if ss[0] <= 0
+                    || ss[1] <= 0
+                    || ws[0] != ss[0]
+                    || ws[1] != packed_cols
+                    || input % spec.group_size != 0
+                {
+                    return Err(Error::Config(format!(
+                        "stored quantized projection `{base}` shapes do not match Q{} group {}: \
+                         weight {ws:?}, scales {ss:?}, biases {bs:?}",
+                        spec.bits, spec.group_size
+                    )));
+                }
+                saw_stored.set(true);
+                Ok(Projection::from_quantized(weight, scales, biases, spec))
             } else {
                 Projection::load(w.require(&key)?.as_dtype(COMPUTE_DTYPE)?, quant)
             }
@@ -946,7 +1046,11 @@ impl Qwen35Model {
                     let h = cfg.hidden_size;
                     let mi = moe.moe_intermediate_size;
                     let mut experts = Vec::with_capacity(moe.num_experts as usize);
-                    if w.contains(&lp("mlp.experts.0.gate_proj.scales")) {
+                    let expert0 = lp("mlp.experts.0.gate_proj");
+                    let split_stored = ["scales", "biases"]
+                        .iter()
+                        .any(|part| w.contains(&format!("{expert0}.{part}")));
+                    if stored_quant.is_some() || split_stored {
                         for e in 0..moe.num_experts {
                             experts.push(Mlp {
                                 gate: proj_q(lp(&format!("mlp.experts.{e}.gate_proj.weight")))?,
@@ -1000,7 +1104,7 @@ impl Qwen35Model {
             rope,
             eps,
             cfg,
-            quantized: quant.is_some() || stored_quant.is_some(),
+            quantized: quant.is_some() || saw_stored.get(),
         })
     }
 }

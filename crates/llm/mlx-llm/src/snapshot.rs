@@ -763,6 +763,13 @@ mod tests {
         (t, json!({ "model_type": "qwen3_5", "text_config": text }))
     }
 
+    fn qwen35_load_error(result: Result<Qwen35Model>, context: &str) -> Error {
+        match result {
+            Ok(_) => panic!("{context}"),
+            Err(error) => error,
+        }
+    }
+
     #[test]
     fn projection_predicate_selects_only_attn_mlp_projections() {
         for k in [
@@ -1000,6 +1007,141 @@ mod tests {
                 > 128 * 1024 * 1024
         );
         let _ = std::fs::remove_dir_all(out);
+    }
+
+    #[test]
+    fn qwen35_quantization_config_is_strict_and_unambiguous() {
+        let (_, wrapper) = tiny_qwen35(false);
+        for (label, block) in [
+            ("non-object", json!("q4")),
+            ("missing field", json!({ "bits": 4 })),
+            ("unsupported bits", json!({ "group_size": 64, "bits": 3 })),
+            ("unsupported group", json!({ "group_size": 32, "bits": 4 })),
+        ] {
+            let mut bad = wrapper.clone();
+            bad["text_config"]["quantization"] = block;
+            assert!(
+                Qwen35Config::from_json(&bad).is_err(),
+                "{label} quantization block must fail"
+            );
+        }
+        let mut conflict = wrapper;
+        conflict["quantization"] = json!({ "group_size": 64, "bits": 4 });
+        conflict["text_config"]["quantization"] = json!({ "group_size": 64, "bits": 8 });
+        let err = Qwen35Config::from_json(&conflict).unwrap_err().to_string();
+        assert!(err.contains("conflicting"), "{err}");
+    }
+
+    #[test]
+    fn qwen35_rejects_mislabeled_mixed_and_corrupt_stored_quantization() {
+        for moe in [false, true] {
+            let dir = unique_dir(if moe {
+                "qwen35-corrupt-moe"
+            } else {
+                "qwen35-corrupt-dense"
+            });
+            let (dense_tensors, dense_json) = tiny_qwen35(moe);
+            let dense_weights = Weights::from_map(dense_tensors.iter().cloned().collect());
+
+            let mut mislabeled_json = dense_json.clone();
+            let q4 = json!({ "group_size": 64, "bits": 4 });
+            mislabeled_json["quantization"] = q4.clone();
+            mislabeled_json["text_config"]["quantization"] = q4;
+            let mislabeled_cfg = Qwen35Config::from_json(&mislabeled_json).unwrap();
+            let err = qwen35_load_error(
+                Qwen35Model::from_weights_with(
+                    &dense_weights,
+                    "model.language_model",
+                    mislabeled_cfg,
+                    None,
+                ),
+                "mislabeled dense snapshot must fail",
+            )
+            .to_string();
+            assert!(
+                err.contains("incomplete"),
+                "dense snapshot must not be mislabeled: {err}"
+            );
+
+            write_snapshot(
+                &dir,
+                dense_tensors,
+                dense_json.clone(),
+                &SnapshotTokenizer::default(),
+                Some(QuantSpec::q4()),
+            )
+            .unwrap();
+            let stored_json: Value =
+                serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap())
+                    .unwrap();
+            let stored_cfg = Qwen35Config::from_json(&stored_json).unwrap();
+            let packed = Weights::from_dir(&dir).unwrap().into_map();
+            let base = if moe {
+                "model.language_model.layers.0.mlp.experts.0.gate_proj"
+            } else {
+                "model.language_model.layers.0.mlp.gate_proj"
+            };
+
+            let no_config = Qwen35Config::from_json(&dense_json).unwrap();
+            let err = qwen35_load_error(
+                Qwen35Model::from_weights_with(
+                    &Weights::from_map(packed.clone()),
+                    "model.language_model",
+                    no_config,
+                    None,
+                ),
+                "packed parts without config must fail",
+            )
+            .to_string();
+            assert!(err.contains("no `quantization` block"), "{err}");
+
+            let err = qwen35_load_error(
+                Qwen35Model::from_weights_with(
+                    &Weights::from_map(packed.clone()),
+                    "model.language_model",
+                    stored_cfg.clone(),
+                    Some(QuantSpec::q4()),
+                ),
+                "stored and load-time quantization must conflict",
+            )
+            .to_string();
+            assert!(err.contains("cannot combine"), "{err}");
+
+            for missing in ["scales", "biases"] {
+                let mut corrupt = packed.clone();
+                corrupt.remove(&format!("{base}.{missing}"));
+                let err = qwen35_load_error(
+                    Qwen35Model::from_weights_with(
+                        &Weights::from_map(corrupt),
+                        "model.language_model",
+                        stored_cfg.clone(),
+                        None,
+                    ),
+                    "incomplete packed projection must fail",
+                )
+                .to_string();
+                assert!(err.contains("incomplete") && err.contains(missing), "{err}");
+            }
+
+            let mut corrupt_shape = packed;
+            corrupt_shape.insert(
+                format!("{base}.scales"),
+                Array::zeros::<f32>(&[1, 1]).unwrap(),
+            );
+            let err = qwen35_load_error(
+                Qwen35Model::from_weights_with(
+                    &Weights::from_map(corrupt_shape),
+                    "model.language_model",
+                    stored_cfg,
+                    None,
+                ),
+                "invalid packed shapes must fail",
+            )
+            .to_string();
+            assert!(err.contains("invalid part shapes"), "{err}");
+
+            std::fs::remove_dir_all(&dir).ok();
+        }
     }
 
     /// Everything the llama-family loader would quantize on load but this writer leaves dense must
