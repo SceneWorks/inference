@@ -120,13 +120,15 @@ profiles = ["audio-macos"]
 environment = ["OPENVOICE_V2_SNAPSHOT"]
 expected_files = ["converter/config.json", "converter/checkpoint.pth"]
 
-# sc-12850: Whisper ASR (the first real Transcriber, audio→text). openai/whisper-base (MIT) — the
+# sc-12850: Whisper ASR (the first real Transcriber, audio→text). openai/whisper-base — the
 # 74M-param multilingual base checkpoint, chosen for a fast CPU real-weights round-trip test.
+# sc-13332: the checkpoint's HF model-card license is Apache-2.0 (distinct from the MIT license on
+# OpenAI's Whisper *source* repository); corrected here after verifying the model card.
 [[models]]
 key = "whisper-base"
 repository = "openai/whisper-base"
 revision = "e37978b90ca9030d5170a5c07aadb050351a65bb"
-license = "MIT"
+license = "Apache-2.0"
 size_class = "small"
 profiles = ["audio-macos"]
 environment = ["WHISPER_SNAPSHOT"]

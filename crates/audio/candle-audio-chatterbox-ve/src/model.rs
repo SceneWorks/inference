@@ -42,6 +42,26 @@ pub const FAMILY: &str = "voice";
 pub const HUB_REPO: &str = "ResembleAI/chatterbox";
 pub const HUB_REVISION: &str = "5bb1f6ee58e50c3b8d408bc82a6d3740c2db6e18";
 
+/// The license of the pinned Chatterbox weight checkpoint (sc-13332) — surfaced for SceneWorks'
+/// end-product licenses page. MIT (permissive), verified against the `ResembleAI/chatterbox`
+/// model card.
+pub const WEIGHT_LICENSE: candle_audio::gen_core::WeightLicense =
+    candle_audio::gen_core::WeightLicense {
+        spdx_id: "MIT",
+        name: "MIT License",
+        source_url: "https://huggingface.co/ResembleAI/chatterbox",
+        attribution: Some("Chatterbox © Resemble AI — licensed under MIT"),
+        commercial_use: true,
+        restriction: None,
+    };
+
+/// This provider's weight-license entry (keyed by [`MODEL_ID`]) for catalog aggregation.
+pub const WEIGHT_LICENSE_ENTRY: candle_audio::gen_core::WeightLicenseEntry =
+    candle_audio::gen_core::WeightLicenseEntry {
+        provider_id: MODEL_ID,
+        license: WEIGHT_LICENSE,
+    };
+
 /// The voice-encoder checkpoint (a single safetensors file inside the pinned repo).
 pub const WEIGHTS_FILE: &str = "ve.safetensors";
 

@@ -22,6 +22,7 @@ pub mod guidance;
 pub mod image_embed;
 pub mod imageops;
 pub mod json_constraint;
+pub mod license;
 mod macros;
 pub mod media;
 pub mod mempolicy;
@@ -61,6 +62,7 @@ pub use generator::{
 };
 pub use image_embed::{ImageEmbedder, ImageEmbedderDescriptor};
 pub use json_constraint::JsonState;
+pub use license::{weight_licenses_manifest_json, WeightLicense, WeightLicenseEntry};
 pub use media::{AudioChunk, AudioStem, AudioTrack, Image};
 pub use mempolicy::{plan_memory_adaptation, LaneLevers, Lever, MemoryPlan, StagePeaks};
 pub use registry::{

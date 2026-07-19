@@ -50,6 +50,26 @@ pub const MODEL_ID: &str = "kokoro_82m";
 pub const HUB_REPO: &str = "hexgrad/Kokoro-82M";
 pub const HUB_REVISION: &str = "f3ff3571791e39611d31c381e3a41a3af07b4987";
 
+/// The license of the pinned Kokoro-82M weight checkpoint (sc-13332) — surfaced for SceneWorks'
+/// end-product licenses page. Apache-2.0 (permissive), verified against the `hexgrad/Kokoro-82M`
+/// model card.
+pub const WEIGHT_LICENSE: candle_audio::gen_core::WeightLicense =
+    candle_audio::gen_core::WeightLicense {
+        spdx_id: "Apache-2.0",
+        name: "Apache License 2.0",
+        source_url: "https://huggingface.co/hexgrad/Kokoro-82M",
+        attribution: Some("Kokoro-82M © hexgrad — licensed under Apache-2.0"),
+        commercial_use: true,
+        restriction: None,
+    };
+
+/// This provider's weight-license entry (keyed by [`MODEL_ID`]) for catalog aggregation.
+pub const WEIGHT_LICENSE_ENTRY: candle_audio::gen_core::WeightLicenseEntry =
+    candle_audio::gen_core::WeightLicenseEntry {
+        provider_id: MODEL_ID,
+        license: WEIGHT_LICENSE,
+    };
+
 /// The advertised voice surface: every English voice the pinned snapshot ships (leading
 /// `a` = American English, `b` = British English — the prefix selects the G2P variant).
 /// Non-English voice packs exist upstream but are NOT advertised until their language
