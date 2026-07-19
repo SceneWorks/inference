@@ -18,6 +18,13 @@
 /// Reference-audio input rate for the s3tokenizer and the voice/speaker encoders (Hz).
 pub const S3_SR: u32 = 16_000;
 
+/// s3tokenizer mel-frame hop (samples at [`S3_SR`]): 160 → a 100 Hz mel-frame rate. Four mel
+/// frames per 25 Hz speech token (`S3_TOKEN_HOP = 640 = 4 * 160`).
+pub const S3_HOP: usize = 160;
+
+/// s3tokenizer waveform hop per speech token (`S3_TOKEN_HOP`): 640 samples at 16 kHz = 25 Hz.
+pub const S3_TOKEN_HOP: usize = 640;
+
 /// Synthesis output rate — the S3Gen mel extractor and HiFTNet vocoder rate (Hz).
 pub const S3GEN_SR: u32 = 24_000;
 
@@ -39,6 +46,85 @@ pub const DEC_COND_LEN: usize = 10 * S3GEN_SR as usize;
 
 /// The T3 conditioning prompt length in speech tokens (`speech_cond_prompt_len`).
 pub const SPEECH_COND_PROMPT_LEN: usize = 150;
+
+/// The s3tokenizer sub-network configuration (the `tokenizer.*` block of `s3gen.safetensors`) — a
+/// Whisper-v2-style FSMN mel encoder + an FSQ quantizer head → 25 Hz discrete speech tokens.
+///
+/// Transcribed from `s3tokenizer.model_v2` (`S3TokenizerV2` / `AudioEncoderV2` / `FSQCodebook`,
+/// the `speech_tokenizer_v2_25hz` model) and the Chatterbox `S3Tokenizer` mel front-end
+/// (`models/s3tokenizer/s3tokenizer.py`). Verified against the real `tokenizer.*` tensor shapes in
+/// the pinned checkpoint (`_mel_filters [128, 201]`, `conv1 [1280, 128, 3]`, `project_down [8,
+/// 1280]`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct S3TokenizerConfig {
+    // --- mel front-end (`log_mel_spectrogram`) ---
+    /// STFT window / FFT size (`n_fft = 400`); one-sided bins = `n_fft / 2 + 1 = 201`.
+    pub n_fft: usize,
+    /// STFT hop ([`S3_HOP`] = 160 samples → 100 Hz mel frames).
+    pub hop: usize,
+    /// Mel channels (`n_mels = 128`, the `_mel_filters` row count).
+    pub n_mels: usize,
+
+    // --- Whisper-v2 FSMN encoder (`AudioEncoderV2`) ---
+    /// Transformer width (`n_audio_state = 1280`).
+    pub n_state: usize,
+    /// Attention heads (`n_audio_head = 20`; `head_dim = n_state / n_head = 64`).
+    pub n_head: usize,
+    /// Encoder blocks (`n_audio_layer = 6`).
+    pub n_layer: usize,
+    /// Both conv-stem layers stride by this (`stride = 2`), so the stem downsamples the 100 Hz mel
+    /// by 4 → 25 Hz (`num_mel_frames = 4 * num_tokens`).
+    pub conv_stride: usize,
+    /// FSMN depthwise-conv memory-block kernel (`kernel_size = 31`, symmetric padding 15/15).
+    pub fsmn_kernel: usize,
+    /// RoPE base frequency for the encoder self-attention (`theta = 10000`).
+    pub rope_theta: f64,
+
+    // --- FSQ quantizer head (`FSQVectorQuantization` / `FSQCodebook`) ---
+    /// FSQ projection width (`project_down: Linear(n_state, 8)`).
+    pub fsq_dim: usize,
+    /// FSQ levels per dimension (`level = 3` → values `{0, 1, 2}`).
+    pub fsq_level: usize,
+}
+
+impl Default for S3TokenizerConfig {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+impl S3TokenizerConfig {
+    /// The shipped `speech_tokenizer_v2_25hz` configuration.
+    pub const DEFAULT: Self = Self {
+        n_fft: 400,
+        hop: S3_HOP,
+        n_mels: 128,
+        n_state: 1280,
+        n_head: 20,
+        n_layer: 6,
+        conv_stride: 2,
+        fsmn_kernel: 31,
+        rope_theta: 10_000.0,
+        fsq_dim: 8,
+        fsq_level: 3,
+    };
+
+    /// Attention head dimension (`n_state / n_head`).
+    pub const fn head_dim(&self) -> usize {
+        self.n_state / self.n_head
+    }
+
+    /// One-sided STFT bin count (`n_fft / 2 + 1`).
+    pub const fn n_bins(&self) -> usize {
+        self.n_fft / 2 + 1
+    }
+
+    /// FSQ codebook cardinality (`level ^ fsq_dim` — `3^8 = 6561`, matching [`SPEECH_VOCAB_SIZE`]).
+    pub const fn codebook_size(&self) -> usize {
+        // `level.pow(fsq_dim)` as a const fn (usize::pow is const).
+        self.fsq_level.pow(self.fsq_dim as u32)
+    }
+}
 
 /// The Llama-3 RoPE scaling block used by the T3 backbone (`rope_scaling` in
 /// `LLAMA_520M_CONFIG_DICT`) — the standard Llama-3 long-context frequency remap.
@@ -282,6 +368,27 @@ mod tests {
             S3_TOKEN_RATE as usize * TOKEN_MEL_RATIO
         );
         assert_eq!(s.mel_hop, s.samples_per_mel_frame());
+    }
+
+    #[test]
+    fn s3tokenizer_config_matches_reference_shapes() {
+        let c = S3TokenizerConfig::DEFAULT;
+        // Mel front-end: 201 one-sided bins from n_fft=400, 100 Hz mel frames from hop=160.
+        assert_eq!(c.n_bins(), 201);
+        assert_eq!(c.n_mels, 128);
+        assert_eq!(S3_SR as usize / c.hop, 100);
+        // Encoder: 1280-wide, 20 heads → 64-d, 6 blocks; two stride-2 convs downsample 100 Hz → 25 Hz.
+        assert_eq!(c.head_dim(), 64);
+        assert_eq!(c.n_head * c.head_dim(), c.n_state);
+        assert_eq!(c.conv_stride * c.conv_stride, 4);
+        assert_eq!(
+            S3_SR as usize / (c.hop * c.conv_stride * c.conv_stride),
+            S3_TOKEN_RATE as usize
+        );
+        assert_eq!(S3_TOKEN_HOP, c.hop * c.conv_stride * c.conv_stride);
+        // FSQ head: 3^8 = 6561 codes, exactly the valid S3 speech-code cardinality.
+        assert_eq!(c.codebook_size(), 6561);
+        assert_eq!(c.codebook_size(), SPEECH_VOCAB_SIZE);
     }
 
     #[test]

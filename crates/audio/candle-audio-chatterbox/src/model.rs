@@ -40,7 +40,11 @@ use candle_nn::VarBuilder;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 
-use crate::config::{GenerationDefaults, S3GenConfig, T3Config, S3GEN_SR};
+use crate::config::{
+    GenerationDefaults, S3GenConfig, T3Config, ENC_COND_LEN, S3GEN_SR, S3_SR,
+    SPEECH_COND_PROMPT_LEN,
+};
+use crate::s3tokenizer::S3Tokenizer;
 use crate::t3::{strip_special_speech_tokens, T3Cond, T3};
 use crate::text::EnTokenizer;
 
@@ -152,12 +156,15 @@ pub(crate) fn validate_request(
 pub struct ChatterboxGenerator {
     descriptor: ModelDescriptor,
     t3_config: T3Config,
-    #[allow(dead_code)] // consumed once the S3Gen stack lands (see crate::s3gen).
+    #[allow(dead_code)] // consumed once the remaining S3Gen networks land (see crate::s3gen).
     s3gen_config: S3GenConfig,
     root: std::path::PathBuf,
     t3: Mutex<Option<T3>>,
     tokenizer: Mutex<Option<EnTokenizer>>,
     embedder: Mutex<Option<Box<dyn VoiceEmbedder>>>,
+    /// The s3tokenizer (sc-13235), loaded lazily from the snapshot's `s3gen.safetensors` the first
+    /// time a `ReferenceAudio` request needs the T3 conditioning prompt tokens.
+    s3tokenizer: Mutex<Option<S3Tokenizer>>,
 }
 
 fn lock_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -215,6 +222,36 @@ impl ChatterboxGenerator {
             *guard = Some(embedder);
         }
         guard.as_ref().unwrap().embed(audio)
+    }
+
+    /// The T3 conditioning prompt speech tokens for a reference clip (sc-13235): the s3tokenizer's
+    /// 25 Hz codes over the first [`ENC_COND_LEN`] (6 s) of the clip, truncated to the T3
+    /// `speech_cond_prompt_len` (150). Lazily loads the s3tokenizer from `s3gen.safetensors`.
+    ///
+    /// This is the port of the reference's `t3_cond_prompt_tokens` derivation — the prompt the
+    /// Perceiver resampler consumes. It was empty in sc-13222 (weakening the voice conditioning);
+    /// with the s3tokenizer ported it is filled from the reference clip.
+    pub fn reference_speech_tokens(&self, audio: &AudioTrack) -> gen_core::Result<Vec<u32>> {
+        let mut guard = lock_recover(&self.s3tokenizer);
+        if guard.is_none() {
+            let tok = S3Tokenizer::from_snapshot(&self.root)
+                .map_err(|e| gen_core::Error::Msg(format!("{MODEL_ID}: load s3tokenizer: {e}")))?;
+            *guard = Some(tok);
+        }
+        // Resample to 16 kHz first, THEN cap at ENC_COND_LEN — the cap is defined in 16 kHz
+        // samples (6 s), so it must be applied post-resample, as the reference does.
+        let wav16k = crate::s3tokenizer::resample_to_16k(&audio.samples, audio.sample_rate);
+        let n = ENC_COND_LEN.min(wav16k.len());
+        let codes = guard
+            .as_ref()
+            .unwrap()
+            .encode(&wav16k[..n], S3_SR)
+            .map_err(gen_core::Error::from)?;
+        Ok(codes
+            .into_iter()
+            .take(SPEECH_COND_PROMPT_LEN)
+            .map(|c| c as u32)
+            .collect())
     }
 
     fn tokenizer(&self) -> gen_core::Result<()> {
@@ -277,11 +314,21 @@ impl ChatterboxGenerator {
         }
         let defaults = GenerationDefaults::default();
 
-        // 1. Conditioning → the T3 speaker vector (+ empty prompt tokens until s3tokenizer lands).
+        // 1. Conditioning → the T3 speaker vector, plus the s3tokenizer prompt tokens when a
+        //    reference clip is present (sc-13235). A VoiceEmbedding-only request has no clip to
+        //    tokenize, so the prompt stays empty — the reference's `cond_prompt_speech_emb is None`
+        //    branch (a bare voice vector drives T3 without the Perceiver prompt).
         let speaker_emb = self.speaker_embedding(req)?;
+        let cond_prompt_speech_tokens = match req.conditioning.iter().find_map(|c| match c {
+            Conditioning::ReferenceAudio { audio, .. } => Some(audio),
+            _ => None,
+        }) {
+            Some(audio) => self.reference_speech_tokens(audio)?,
+            None => Vec::new(),
+        };
         let cond = T3Cond {
             speaker_emb,
-            cond_prompt_speech_tokens: Vec::new(),
+            cond_prompt_speech_tokens,
             emotion_adv: defaults.exaggeration,
         };
 
@@ -405,6 +452,7 @@ pub fn load_generator(spec: &LoadSpec) -> gen_core::Result<ChatterboxGenerator> 
         t3: Mutex::new(None),
         tokenizer: Mutex::new(None),
         embedder: Mutex::new(None),
+        s3tokenizer: Mutex::new(None),
     })
 }
 
