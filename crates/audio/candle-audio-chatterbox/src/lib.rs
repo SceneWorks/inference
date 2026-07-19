@@ -33,15 +33,20 @@
 //! (output 512, 8 heads, 6+4 blocks, 25 Hz→50 Hz) + `encoder_proj(512→80)` feeding a
 //! `CausalConditionalCFM` (Euler flow-matching, 10 steps, cosine schedule, CFG 0.7) over a
 //! `ConditionalDecoder` U-Net estimator (in 320, 12 DiT mid-blocks), plus the 24 kHz prompt-mel
-//! front-end ([`mel24`]). The remaining **one** S3Gen network (the HiFTNet vocoder — see [`s3gen`])
-//! is **not yet ported**; the generator's `generate()` runs T3 to produce real speech tokens and
-//! then returns a typed error at the S3Gen boundary rather than fabricate audio.
-//! Consequently the generator is **not yet registered into `candle-audio-catalog`'s shipping
-//! surface** (registering a generator that cannot render audio would be a false advertisement, and
-//! would fail the gen-core generator conformance suite): that registration, the ordered-id surface
-//! extension, and the three bundle smokes are deliberately deferred to the remaining S3Gen slices.
-//! This crate is present as a workspace member so its T3 + s3tokenizer stages build, are
-//! unit-tested, and are exercised end-to-end on real weights by the conformance test.
+//! front-end ([`mel24`]). sc-13238 ports the **HiFTNet vocoder** ([`hift`]) — the fourth and last
+//! S3Gen network: a `ConvRNNF0Predictor`, an NSF harmonic-plus-noise source (`nb_harmonics = 8`), a
+//! weight-normed `ConvTranspose1d` upsample trunk (`[8, 5, 3]`) with MRF resblocks and per-stage
+//! source injection, and an iSTFT head (`n_fft = 16`, `hop = 4`) → a 24 kHz waveform (480
+//! samples/mel-frame). With it, **all four** S3Gen networks are now ported.
+//!
+//! What remains is the end-to-end **token→waveform integration** (tokenize → flow → vocode) and the
+//! catalog **registration** (sc-13239): the generator's `generate()` still runs T3 to produce real
+//! speech tokens and then returns a typed error at the S3Gen boundary rather than fabricate audio,
+//! and the generator is **not yet registered into `candle-audio-catalog`'s shipping surface**. That
+//! integration, the registration, the ordered-id surface extension, and the three bundle smokes are
+//! deliberately deferred to sc-13239. This crate is present as a workspace member so its stages
+//! build, are unit-tested, and are exercised on real weights by the conformance test (each network,
+//! including the vocoder, has its own real-weights gate).
 //!
 //! Weights resolve through the audio lane's pinned-SHA hub path (F-029): `ResembleAI/chatterbox`
 //! at the same immutable commit the [`candle_audio_chatterbox_ve`] sibling pins.
@@ -53,6 +58,7 @@ pub mod campplus;
 pub mod config;
 pub mod flow;
 pub mod flow_encoder;
+pub mod hift;
 pub mod mel24;
 pub mod model;
 pub mod prepare;
@@ -64,6 +70,7 @@ pub mod text;
 pub use campplus::Campplus;
 pub use config::{S3GenConfig, S3TokenizerConfig, T3Config};
 pub use flow::Flow;
+pub use hift::HiftGenerator;
 pub use mel24::Mel24Extractor;
 pub use model::{
     descriptor, load, load_generator, resolve_pinned_snapshot, ChatterboxGenerator, HUB_REPO,

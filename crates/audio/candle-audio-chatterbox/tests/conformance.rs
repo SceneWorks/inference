@@ -593,3 +593,78 @@ fn flow_synthesizes_a_sane_mel_from_speech_tokens() {
         "the flow must be deterministic for a fixed seed"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// S3Gen HiFTNet vocoder (sc-13238): the NSF/iSTFT mel→waveform generator.
+// ---------------------------------------------------------------------------------------------
+
+/// The sc-13238 DoD gate: the ported HiFTNet vocoder (`ConvRNNF0Predictor` + `SourceModuleHnNSF`
+/// NSF source + weight-normed upsample trunk + iSTFT head) turns a **real** 80-bin 24 kHz log-mel
+/// (from [`cb::Mel24Extractor`] on a Kokoro reference clip) into a **non-silent, finite** 24 kHz
+/// waveform of exactly `480 · n_mel_frames` samples, deterministically. A broken F0 predictor /
+/// NSF source / weight-norm reconstruction / upsample math / iSTFT head degenerates to a NaN,
+/// silent, or wrongly-sized waveform and fails here. (Vocoding a mel24 mel of real speech is the
+/// vocoder's job in isolation — the full token→clone WAV is sc-13239's integration.)
+#[test]
+#[ignore = "real weights: needs s3gen.safetensors + a Kokoro snapshot; run with --ignored"]
+fn hift_vocodes_a_real_mel_to_nonsilent_waveform() {
+    let dir = s3gen_snapshot();
+    let hift = cb::HiftGenerator::from_snapshot(&dir).expect("load the HiFTNet vocoder from s3gen");
+
+    // A real 24 kHz reference clip → its real 80-bin log-mel (the vocoder's input distribution).
+    let clip = kokoro_clip(
+        "The quick brown fox jumps over the lazy dog near the river bank.",
+        "af_heart",
+    );
+    let mel_ext = cb::Mel24Extractor::default();
+    let mel_nt = mel_ext
+        .mel(&clip.samples, clip.sample_rate, hift.device())
+        .expect("24 kHz log-mel of the reference"); // [n_frames, 80]
+    let (n_frames, bins) = mel_nt.dims2().expect("mel dims");
+    assert_eq!(bins, 80, "mel must have 80 bins");
+    let mel = mel_nt.transpose(0, 1).unwrap().contiguous().unwrap(); // [80, n_frames]
+
+    let seed = 20260719u64;
+    let wav = hift.decode(&mel, seed).expect("vocode the mel");
+    let samples: Vec<f32> = wav.to_vec1::<f32>().expect("waveform to host");
+
+    let n = samples.len();
+    let expected = 480 * n_frames;
+    let peak = samples.iter().fold(0f32, |m, v| m.max(v.abs()));
+    let rms = (samples.iter().map(|v| v * v).sum::<f32>() / n as f32).sqrt();
+    let sample_rate = cb::config::S3GEN_SR; // the vocoder always emits 24 kHz
+    eprintln!(
+        "hift waveform: {n} samples (= 480 × {n_frames} mel frames) @ {sample_rate} Hz; \
+         peak {peak:.4}, rms {rms:.4}"
+    );
+
+    // Length is exactly 480 samples per mel frame → 24 kHz from the 50 Hz mel.
+    assert_eq!(
+        n, expected,
+        "waveform must be 480 · n_frames = {expected} samples"
+    );
+    // Finite (no NaN/inf from the trunk, source, or iSTFT).
+    assert!(
+        samples.iter().all(|v| v.is_finite()),
+        "waveform must be finite"
+    );
+    // Non-silent: a real speech mel must vocode to audible energy well above a noise floor.
+    assert!(rms > 1e-3, "waveform is (near-)silent: rms {rms:.6}");
+    assert!(
+        peak > 1e-2,
+        "waveform peak {peak:.6} is below an audible floor"
+    );
+    // Within the audio_limit clamp.
+    assert!(
+        peak <= 0.99 + 1e-6,
+        "waveform exceeds the audio_limit clamp: {peak:.4}"
+    );
+
+    // Deterministic under a fixed seed (the reproducibility law).
+    let wav2 = hift.decode(&mel, seed).expect("re-vocode");
+    assert_eq!(
+        samples,
+        wav2.to_vec1::<f32>().unwrap(),
+        "the vocoder must be deterministic for a fixed seed"
+    );
+}
