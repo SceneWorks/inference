@@ -61,6 +61,7 @@ pub mod flow_encoder;
 pub mod hift;
 pub mod mel24;
 pub mod model;
+pub mod perth;
 pub mod prepare;
 pub mod s3gen;
 pub mod s3tokenizer;
@@ -76,6 +77,7 @@ pub use model::{
     descriptor, load, load_generator, resolve_pinned_snapshot, ChatterboxGenerator, HUB_REPO,
     HUB_REVISION, MODEL_ID, REGISTRATION, T3_WEIGHTS_FILE, TOKENIZER_FILE,
 };
+pub use perth::{snr_db, PerthWatermarker, PERTH_SR, PERTH_WEIGHTS_FILE};
 pub use s3tokenizer::S3Tokenizer;
 
 /// Add the Chatterbox generator to an explicit audio registry builder.

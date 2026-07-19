@@ -668,3 +668,120 @@ fn hift_vocodes_a_real_mel_to_nonsilent_waveform() {
         "the vocoder must be deterministic for a fixed seed"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// PerTh implicit watermarker (sc-13240): the provenance watermark Chatterbox always applies.
+// ---------------------------------------------------------------------------------------------
+
+/// Resolve the converted PerTh weights. `PERTH_SNAPSHOT` may be the `perth_implicit.safetensors`
+/// file or a dir holding it. There is no hub pin yet — the perth weights ship only inside the MIT
+/// `resemble-perth` package; convert them with `scripts/audio/convert_perth_watermarker.py` and
+/// point `PERTH_SNAPSHOT` at the result.
+fn perth_weights() -> PathBuf {
+    let raw = std::env::var("PERTH_SNAPSHOT").expect(
+        "set PERTH_SNAPSHOT to perth_implicit.safetensors (or a dir holding it); \
+         convert perth_net_250000.pth.tar with scripts/audio/convert_perth_watermarker.py",
+    );
+    let p = PathBuf::from(raw);
+    if p.is_dir() {
+        p.join(cb::PERTH_WEIGHTS_FILE)
+    } else {
+        p
+    }
+}
+
+/// A deterministic, speech-like signal at `sample_rate`: a wandering pitch with a dozen harmonics
+/// filling the ≈0–1.5 kHz watermark subband, amplitude modulation, and a little broadband dither —
+/// rich enough for the spectral watermark to embed into, without a TTS dependency.
+fn perth_test_signal(sample_rate: u32, secs: f32) -> Vec<f32> {
+    let sr = sample_rate as f32;
+    let n = (sr * secs) as usize;
+    let tau = 2.0 * std::f32::consts::PI;
+    (0..n)
+        .map(|i| {
+            let t = i as f32 / sr;
+            let pitch = 120.0 + 40.0 * (tau * 3.0 * t).sin();
+            let mut s = 0.0f32;
+            for h in 1..=12 {
+                s += (1.0 / h as f32) * (tau * pitch * h as f32 * t).sin();
+            }
+            let env = 0.6 + 0.4 * (tau * 4.0 * t).sin();
+            let dither = ((i.wrapping_mul(2_654_435_761) & 0xffff) as f32 / 65_535.0) - 0.5;
+            0.3 * s * env + 0.02 * dither
+        })
+        .collect()
+}
+
+/// The sc-13240 DoD gate: the natively-ported PerTh implicit watermarker (real weights) embeds a
+/// **recoverable** watermark that is **imperceptible**, exercised on Chatterbox's exact 24 kHz output
+/// rate (embed resamples 24→32 kHz, watermarks, and resamples back). A watermarked signal is detected
+/// with high confidence and is clearly separated from the un-watermarked signal; the watermarked
+/// signal stays perceptually close to the original (high SNR). A broken encoder/decoder weight
+/// mapping, magnitude normalization, magmask, multi-scale resample, or softmax-attention combine
+/// collapses the detection separation and fails here. This is the watermarker in isolation; wiring it
+/// into the clone Generator's `generate()` output is sc-13239.
+#[test]
+#[ignore = "real weights: needs PERTH_SNAPSHOT (converted perth_implicit.safetensors); run with --ignored"]
+fn perth_watermark_roundtrips_and_is_imperceptible() {
+    let wm = cb::PerthWatermarker::from_safetensors(&perth_weights())
+        .expect("load the converted PerTh weights");
+
+    // (1) Native 32 kHz — the watermark's true imperceptibility, isolated from any resampling. Here
+    //     the SNR is a faithful measure of the encoder residual alone (no resample roundtrip).
+    let x32 = perth_test_signal(cb::PERTH_SR, 2.0);
+    let clean32 = wm
+        .get_watermark(&x32, cb::PERTH_SR)
+        .expect("detect clean @32k");
+    let marked32 = wm.embed(&x32, cb::PERTH_SR).expect("embed @32k");
+    let conf32 = wm
+        .get_watermark(&marked32, cb::PERTH_SR)
+        .expect("detect watermarked @32k");
+    // Compare over the interior (the outer STFT frames have partial window coverage).
+    let g = 2048.min(x32.len() / 4);
+    let n32 = x32.len().min(marked32.len());
+    let snr32 = cb::snr_db(&x32[g..n32 - g], &marked32[g..n32 - g]);
+    eprintln!(
+        "perth @ 32000 Hz (native): clean={clean32:.4}  watermarked={conf32:.4}  SNR={snr32:.2} dB"
+    );
+
+    // (2) Chatterbox's exact 24 kHz output path — embed resamples 24→32 kHz, watermarks, and
+    //     resamples back. Detection must survive the resample roundtrip (the real deployment case).
+    let x24 = perth_test_signal(24_000, 2.0);
+    let clean24 = wm.get_watermark(&x24, 24_000).expect("detect clean @24k");
+    let marked24 = wm.embed(&x24, 24_000).expect("embed @24k");
+    let conf24 = wm
+        .get_watermark(&marked24, 24_000)
+        .expect("detect watermarked @24k");
+    let snr24 = cb::snr_db(&x24, &marked24);
+    eprintln!(
+        "perth @ 24000 Hz (Chatterbox path): clean={clean24:.4}  watermarked={conf24:.4}  \
+         SNR={snr24:.2} dB  ({} samples)",
+        marked24.len()
+    );
+
+    // Recoverable + clearly separated, at BOTH rates (a broken port collapses the separation).
+    assert!(conf32 > 0.5, "watermark not recovered @32k: {conf32:.4}");
+    assert!(conf24 > 0.5, "watermark not recovered @24k: {conf24:.4}");
+    assert!(
+        conf32 - clean32 > 0.25,
+        "insufficient separation @32k: clean {clean32:.4} vs watermarked {conf32:.4}"
+    );
+    assert!(
+        conf24 - clean24 > 0.25,
+        "insufficient separation @24k: clean {clean24:.4} vs watermarked {conf24:.4}"
+    );
+    // Imperceptible ("implicit"): PerTh's transparency is psychoacoustic (the watermark is confined
+    // to the masked low-frequency subband under an energy mask and trained with a psychoacoustic
+    // loss), so its raw SNR is modest by design — the reference's own test only requires SNR > 0.
+    // These floors (well above that bar, ~3–4 dB below the deterministic measured values ≈16/15 dB)
+    // catch a port that grossly corrupts the audio. The native-rate figure isolates the watermark
+    // from resample artifacts; the 24 kHz figure additionally carries the linear-resample roundtrip.
+    assert!(
+        snr32 > 12.0,
+        "watermark not imperceptible @32k: SNR {snr32:.2} dB"
+    );
+    assert!(
+        snr24 > 12.0,
+        "24 kHz watermarked signal too degraded: SNR {snr24:.2} dB"
+    );
+}
