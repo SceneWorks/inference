@@ -20,6 +20,8 @@ candle-audio-chatterbox-ve = { path = "../candle-audio-chatterbox-ve" }
 candle-audio-openvoice = { path = "../candle-audio-openvoice" }
 # sc-12850: Whisper ASR — the first real Transcriber (audio→text, the Captioner-analog kind).
 candle-audio-whisper = { path = "../candle-audio-whisper" }
+# sc-12851: LAION CLAP — the first real AudioEmbedder (semantic audio-text joint-space retrieval).
+candle-audio-clap = { path = "../candle-audio-clap" }
 # The audio lane's snapshot-preparer composition (sc-12836): the lane's single `candle`
 # registration recognizes audio snapshots and delegates everything else to candle-llm's
 # preparer unchanged. This crate is the composition owner (previously each bundle wired
@@ -39,6 +41,7 @@ metal = [
     "candle-audio-chatterbox-ve/metal",
     "candle-audio-openvoice/metal",
     "candle-audio-whisper/metal",
+    "candle-audio-clap/metal",
 ]
 cuda = [
     "candle-audio/cuda",
@@ -48,4 +51,5 @@ cuda = [
     "candle-audio-chatterbox-ve/cuda",
     "candle-audio-openvoice/cuda",
     "candle-audio-whisper/cuda",
+    "candle-audio-clap/cuda",
 ]

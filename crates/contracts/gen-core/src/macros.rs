@@ -97,6 +97,20 @@ macro_rules! register_voice_embedder {
     };
 }
 
+/// Define an audio-embedder registration constant for an explicit provider catalog (sc-12851) —
+/// the semantic audio-text (CLAP-style) sibling of
+/// [`register_image_embedder`](crate::register_image_embedder).
+#[macro_export]
+macro_rules! register_audio_embedder {
+    ( $vis:vis const $name:ident = $desc:path => $load:path $(,)? ) => {
+        $vis const $name: $crate::registry::AudioEmbedderRegistration =
+            $crate::registry::AudioEmbedderRegistration {
+                descriptor: $desc,
+                load: |spec| $load(spec).map_err(::core::convert::Into::into),
+            };
+    };
+}
+
 /// Define an audio-transform registration constant for an explicit provider catalog (sc-12839),
 /// parallel to [`register_voice_embedder`](crate::register_voice_embedder).
 #[macro_export]

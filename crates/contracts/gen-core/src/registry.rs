@@ -2,6 +2,7 @@
 //! crates add them to a [`ProviderRegistryBuilder`], and platform catalogs select the families they
 //! ship. This is the Rust equivalent of an ordinary DI composition root with resolve-by-id.
 
+use crate::audio_embed::{AudioEmbedder, AudioEmbedderDescriptor};
 use crate::audio_transform::{AudioTransform, AudioTransformDescriptor, AudioTransformKind};
 use crate::caption::{Captioner, CaptionerDescriptor};
 use crate::generator::{ConditioningKind, Generator, Modality, ModelDescriptor};
@@ -183,6 +184,15 @@ pub struct VoiceEmbedderRegistration {
     pub load: fn(&LoadSpec) -> Result<Box<dyn VoiceEmbedder>>,
 }
 
+/// An audio-embedder provider's registration (parallel to [`ImageEmbedderRegistration`]; sc-12851).
+/// The semantic audio-text (CLAP-style) sibling of the image embedder: a whole-clip vector in a
+/// joint audio-text space, for retrieval / search / auto-tagging.
+#[derive(Clone, Copy)]
+pub struct AudioEmbedderRegistration {
+    pub descriptor: fn() -> AudioEmbedderDescriptor,
+    pub load: fn(&LoadSpec) -> Result<Box<dyn AudioEmbedder>>,
+}
+
 /// Builder for an ordinary, explicit generative-media provider registry.
 ///
 /// Platform bundles add exactly the registrations they ship.
@@ -197,6 +207,7 @@ pub struct ProviderRegistryBuilder {
     image_embedders: Vec<ImageEmbedderRegistration>,
     text_embedders: Vec<TextEmbedderRegistration>,
     voice_embedders: Vec<VoiceEmbedderRegistration>,
+    audio_embedders: Vec<AudioEmbedderRegistration>,
     rejected_quants: Vec<(Quant, &'static str)>,
 }
 
@@ -239,6 +250,11 @@ impl ProviderRegistryBuilder {
         register_voice_embedder,
         voice_embedders,
         VoiceEmbedderRegistration
+    );
+    builder_registration_method!(
+        register_audio_embedder,
+        audio_embedders,
+        AudioEmbedderRegistration
     );
 
     /// Declare that this platform's backend has **no implementation** of quant tier `quant`, so every
@@ -285,6 +301,7 @@ impl ProviderRegistryBuilder {
         ensure_unique!(image_embedders, "image embedder");
         ensure_unique!(text_embedders, "text embedder");
         ensure_unique!(voice_embedders, "voice embedder");
+        ensure_unique!(audio_embedders, "audio embedder");
 
         Ok(ProviderRegistry {
             generators: self.generators.into_boxed_slice(),
@@ -296,6 +313,7 @@ impl ProviderRegistryBuilder {
             image_embedders: self.image_embedders.into_boxed_slice(),
             text_embedders: self.text_embedders.into_boxed_slice(),
             voice_embedders: self.voice_embedders.into_boxed_slice(),
+            audio_embedders: self.audio_embedders.into_boxed_slice(),
             rejected_quants: self.rejected_quants.into_boxed_slice(),
         })
     }
@@ -312,6 +330,7 @@ pub struct ProviderRegistry {
     image_embedders: Box<[ImageEmbedderRegistration]>,
     text_embedders: Box<[TextEmbedderRegistration]>,
     voice_embedders: Box<[VoiceEmbedderRegistration]>,
+    audio_embedders: Box<[AudioEmbedderRegistration]>,
     rejected_quants: Box<[(Quant, &'static str)]>,
 }
 
@@ -434,6 +453,14 @@ impl ProviderRegistry {
         "voice embedder",
         dyn VoiceEmbedder
     );
+    explicit_registry_kind!(
+        audio_embedders,
+        load_audio_embedder,
+        audio_embedders,
+        AudioEmbedderRegistration,
+        "audio embedder",
+        dyn AudioEmbedder
+    );
 
     /// Return the provider-owned on-disk component footprint for generator `id`, when declared.
     ///
@@ -463,6 +490,7 @@ impl ProviderRegistry {
             &self.image_embedders,
             &self.text_embedders,
             &self.voice_embedders,
+            &self.audio_embedders,
         )
     }
 }
@@ -598,8 +626,8 @@ fn check_unique_ids(errs: &mut Vec<String>, kind: &str, ids: &[&str]) {
 /// the `gen-core-testkit` suite.
 ///
 /// Returns one message per violation (empty = conformant).
-// One `&[Registration]` slice per provider kind, so the arg count tracks the number of kinds (9 as
-// of the sc-12850 transcriber kind) rather than any avoidable coupling — the alternative is a
+// One `&[Registration]` slice per provider kind, so the arg count tracks the number of kinds (10 as
+// of the sc-12851 audio-embedder kind) rather than any avoidable coupling — the alternative is a
 // throwaway "all registrations" struct that adds no clarity.
 #[allow(clippy::too_many_arguments)]
 fn descriptor_conformance_errors_for(
@@ -612,6 +640,7 @@ fn descriptor_conformance_errors_for(
     image_embedder_registrations: &[ImageEmbedderRegistration],
     text_embedder_registrations: &[TextEmbedderRegistration],
     voice_embedder_registrations: &[VoiceEmbedderRegistration],
+    audio_embedder_registrations: &[AudioEmbedderRegistration],
 ) -> Vec<String> {
     let mut errs = Vec::new();
 
@@ -753,6 +782,12 @@ fn descriptor_conformance_errors_for(
         .iter()
         .map(|r| (r.descriptor)())
         .collect();
+    // Audio embedders (sc-12851) carry a joint audio-text `space` exactly like image/text
+    // embedders, so they run through the same identity + non-zero-dim + non-empty-space check.
+    let ae_descs: Vec<AudioEmbedderDescriptor> = audio_embedder_registrations
+        .iter()
+        .map(|r| (r.descriptor)())
+        .collect();
     for (ctx_kind, id, family, backend, dim, space) in ie_descs
         .iter()
         .map(|d| {
@@ -768,6 +803,16 @@ fn descriptor_conformance_errors_for(
         .chain(te_descs.iter().map(|d| {
             (
                 "text embedder",
+                d.id,
+                d.family,
+                d.backend,
+                d.embedding_dim,
+                d.space,
+            )
+        }))
+        .chain(ae_descs.iter().map(|d| {
+            (
+                "audio embedder",
                 d.id,
                 d.family,
                 d.backend,
@@ -793,6 +838,8 @@ fn descriptor_conformance_errors_for(
     check_unique_ids(&mut errs, "image embedder", &ie_ids);
     let te_ids: Vec<&str> = te_descs.iter().map(|d| d.id).collect();
     check_unique_ids(&mut errs, "text embedder", &te_ids);
+    let ae_ids: Vec<&str> = ae_descs.iter().map(|d| d.id).collect();
+    check_unique_ids(&mut errs, "audio embedder", &ae_ids);
 
     // Voice embedders (sc-12838) carry no embedding `space` (they are the audio-identity sibling of
     // the face embedder, not a cross-encoder cosine space) — check identity, a non-zero dim, and
@@ -821,6 +868,7 @@ fn descriptor_conformance_errors_for(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio_embed::{AudioEmbedder, AudioEmbedderDescriptor};
     use crate::audio_transform::{
         AudioTarget, AudioTransform, AudioTransformCapabilities, AudioTransformDescriptor,
         AudioTransformKind, AudioTransformRequest,
@@ -1221,6 +1269,7 @@ mod tests {
             .register_text_embedder(DUMMY_TEXT_EMBEDDER_REGISTRATION)
             .register_image_embedder(DUMMY_IMAGE_EMBEDDER_REGISTRATION)
             .register_voice_embedder(DUMMY_VOICE_EMBEDDER_REGISTRATION)
+            .register_audio_embedder(DUMMY_AUDIO_EMBEDDER_REGISTRATION)
             .build()
             .unwrap()
     }
@@ -2020,6 +2069,130 @@ mod tests {
         assert!(dummy_registry()
             .voice_embedders()
             .any(|r| (r.descriptor)().id == "dummy_test_voice_embedder"));
+    }
+
+    // ---- audio embedders (sc-12851) ---------------------------------------------------------
+
+    /// A weights-free joint audio-text embedder: both `embed` and `embed_text` return a **one-hot**
+    /// unit vector, keyed off the audio clip's length (a proxy for its semantic "category") and off
+    /// the text's length respectively. That is deliberately enough structure to drive the DoD
+    /// cross-modal ranking test without a tensor backend: a text query lands on the one-hot index of
+    /// exactly one clip, so cosine ranks that clip first — and the test FAILS if the stub ignored the
+    /// audio (every clip identical) or if the audio/text vectors were not the same length (not joint).
+    struct DummyAudioEmbedder {
+        desc: AudioEmbedderDescriptor,
+    }
+
+    impl DummyAudioEmbedder {
+        fn one_hot(&self, index: usize) -> Vec<f32> {
+            let mut v = vec![0.0; self.desc.embedding_dim];
+            v[index % self.desc.embedding_dim] = 1.0;
+            v
+        }
+    }
+
+    impl AudioEmbedder for DummyAudioEmbedder {
+        fn descriptor(&self) -> &AudioEmbedderDescriptor {
+            &self.desc
+        }
+        fn embed(&self, audio: &AudioTrack) -> Result<Vec<f32>> {
+            Ok(self.one_hot(audio.samples.len()))
+        }
+        fn embed_text(&self, text: &str) -> Result<Vec<f32>> {
+            Ok(self.one_hot(text.len()))
+        }
+    }
+
+    fn dummy_audio_embedder_descriptor() -> AudioEmbedderDescriptor {
+        AudioEmbedderDescriptor {
+            id: "dummy_test_audio_embedder",
+            family: "audio-embed",
+            backend: "candle",
+            embedding_dim: 4,
+            space: "test-space",
+            mac_only: false,
+        }
+    }
+
+    fn dummy_audio_embedder_load(_spec: &LoadSpec) -> Result<Box<dyn AudioEmbedder>> {
+        Ok(Box::new(DummyAudioEmbedder {
+            desc: dummy_audio_embedder_descriptor(),
+        }))
+    }
+
+    crate::register_audio_embedder! {
+        const DUMMY_AUDIO_EMBEDDER_REGISTRATION =
+            dummy_audio_embedder_descriptor => dummy_audio_embedder_load
+    }
+
+    #[test]
+    fn audio_embedder_registry_resolves_by_id() {
+        let registry = dummy_registry();
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let e = registry
+            .load_audio_embedder("dummy_test_audio_embedder", &spec)
+            .expect("dummy audio embedder is registered");
+        assert_eq!(e.descriptor().id, "dummy_test_audio_embedder");
+        // audio and text embeddings share the joint dim.
+        assert_eq!(e.embed(&dummy_audio(1)).unwrap().len(), 4);
+        assert_eq!(e.embed_text("q").unwrap().len(), 4);
+    }
+
+    #[test]
+    fn unknown_audio_embedder_id_errors() {
+        let registry = dummy_registry();
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        assert!(registry
+            .load_audio_embedder("no_such_audio_embedder", &spec)
+            .is_err());
+    }
+
+    #[test]
+    fn dummy_audio_embedder_appears_in_iteration() {
+        assert!(dummy_registry()
+            .audio_embedders()
+            .any(|r| (r.descriptor)().id == "dummy_test_audio_embedder"));
+    }
+
+    /// The sc-12851 acceptance path end to end, weights-free: resolve the joint embedder, embed a
+    /// SET of audio clips spanning "categories", embed a TEXT query, and assert the semantically
+    /// matching clip ranks HIGHEST by cosine over the others — the cross-modal retrieval the DoD
+    /// pins. Designed to fail if the embedder ignored the audio (all clips equidistant) or the audio
+    /// and text vectors were not in one joint space.
+    #[test]
+    fn audio_text_query_ranks_the_matching_clip_highest() {
+        fn cosine(a: &[f32], b: &[f32]) -> f32 {
+            let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+            let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+            dot / (na * nb)
+        }
+
+        let registry = dummy_registry();
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let e = registry
+            .load_audio_embedder("dummy_test_audio_embedder", &spec)
+            .expect("registered");
+
+        // Three clips whose lengths map to distinct one-hot categories (1, 2, 3).
+        let clips = [dummy_audio(1), dummy_audio(2), dummy_audio(3)];
+        let clip_vecs: Vec<Vec<f32>> = clips.iter().map(|c| e.embed(c).unwrap()).collect();
+
+        // A 3-char query lands on category 3 → the third clip is the match.
+        let query = e.embed_text("abc").unwrap();
+        let scores: Vec<f32> = clip_vecs.iter().map(|v| cosine(&query, v)).collect();
+
+        let best = scores
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .map(|(i, _)| i)
+            .unwrap();
+        assert_eq!(
+            best, 2,
+            "the matching clip must rank first, scores={scores:?}"
+        );
+        assert!(scores[2] > scores[0] && scores[2] > scores[1], "{scores:?}");
     }
 
     /// The sc-12838 acceptance path end to end, weights-free: resolve a registered voice embedder,
