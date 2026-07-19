@@ -44,6 +44,29 @@ struct PendingLora {
     scale: f64,
 }
 
+/// Outcome of installing the bundled TurboTime LoRA as forward-time residuals.
+///
+/// Counts that previously went only to stderr are returned to the caller so applications can route
+/// them through their own observability policy. `applied` is the number of projections that received
+/// a residual; `absent_targets` and `shape_mismatched` surface recognized adapter targets that could
+/// not be installed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TurboLoraReport {
+    pub applied: usize,
+    pub absent_targets: usize,
+    pub shape_mismatched: usize,
+}
+
+impl TurboLoraReport {
+    fn from_counts(applied: usize, resolved: usize, matched: usize, shape_mismatched: usize) -> Self {
+        Self {
+            applied,
+            absent_targets: resolved - matched,
+            shape_mismatched,
+        }
+    }
+}
+
 /// Install the TurboTime LoRA at `lora_path` onto `dit` as **forward-time additive residuals** — the
 /// sole apply route, both tiers (sc-11104). Resolves every `(down, up[, alpha])` pair into unmerged
 /// factors (`a = downᵀ`, `b = upᵀ`, `scale = eff = user·(alpha/rank)`), then walks the DiT once
@@ -59,6 +82,18 @@ pub fn install_turbo_lora_additive(
     lora_path: &Path,
     scale: f32,
 ) -> Result<usize> {
+    Ok(install_turbo_lora_additive_with_report(dit, lora_path, scale)?.applied)
+}
+
+/// Install the TurboTime LoRA and return the complete structured outcome.
+///
+/// This is the report-returning form of [`install_turbo_lora_additive`]. The original function is
+/// retained as a compatibility wrapper for callers that only need the applied count.
+pub fn install_turbo_lora_additive_with_report(
+    dit: &mut Ideogram4Transformer,
+    lora_path: &Path,
+    scale: f32,
+) -> Result<TurboLoraReport> {
     if !lora_path.exists() {
         return Err(Error::Msg(format!(
             "ideogram turbo: TurboTime LoRA not found at {} (a turbo snapshot must ship it alongside transformer/)",
@@ -127,14 +162,12 @@ pub fn install_turbo_lora_additive(
             names.len()
         )));
     }
-    let absent = pending.len() - matched.len();
-    if absent > 0 || skipped > 0 {
-        eprintln!(
-            "ideogram turbo: applied {applied} additive residual(s); {absent} resolved target(s) absent \
-             from the DiT, {skipped} shape-mismatched"
-        );
-    }
-    Ok(applied)
+    Ok(TurboLoraReport::from_counts(
+        applied,
+        pending.len(),
+        matched.len(),
+        skipped,
+    ))
 }
 
 /// If `name` is a recognized "down"/"A" key whose paired "up"/"B" is also present, return
@@ -206,6 +239,18 @@ mod tests {
         );
         // The up half alone is not a "down" key.
         assert_eq!(down_pair("m.lora_up.weight", &present), None);
+    }
+
+    #[test]
+    fn report_surfaces_every_install_outcome() {
+        assert_eq!(
+            TurboLoraReport::from_counts(7, 11, 9, 2),
+            TurboLoraReport {
+                applied: 7,
+                absent_targets: 2,
+                shape_mismatched: 2,
+            }
+        );
     }
 
     /// **The additive residual equals a fold to f32 tolerance (sc-11104 guardrail).** This is the parity

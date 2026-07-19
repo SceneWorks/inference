@@ -38,6 +38,7 @@ use candle_gen::gen_core::{
     Generator, LoadSpec, Modality, ModelDescriptor, PidWeights, Progress, Quant, WeightsSource,
 };
 
+pub use adapters::TurboLoraReport;
 /// Re-export the pinned width/height stride at the crate root so SceneWorks can tie each advertised
 /// Ideogram image bucket to `candle_gen_ideogram::SIZE_MULTIPLE` (sc-12612) instead of a hand-copied
 /// literal.
