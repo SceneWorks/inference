@@ -21,13 +21,30 @@ use crate::config::{Ideogram4DitConfig, Ideogram4TextEncoderConfig};
 use crate::text_encoder::Ideogram4TextEncoder;
 use crate::transformer::Ideogram4Transformer;
 
+fn prepare_text_weights(mut w: Weights) -> Result<Weights> {
+    let packed: std::collections::HashSet<String> = w
+        .keys()
+        .filter_map(|key| key.strip_suffix(".scales").map(str::to_owned))
+        .collect();
+    w.cast_matching(mlx_rs::Dtype::Bfloat16, |key| {
+        key.starts_with("language_model.")
+            && key.ends_with(".weight")
+            && !key.contains("norm")
+            && !packed.contains(key.strip_suffix(".weight").unwrap_or(key))
+    })?;
+    w.cast_matching(mlx_rs::Dtype::Float32, |key| {
+        key.starts_with("language_model.") && key.ends_with("norm.weight")
+    })?;
+    Ok(w)
+}
+
 /// Qwen3-VL pad token id (`<|endoftext|>`). Ideogram's `_tokenize` never pads — the pipeline
 /// left-pads the packed sequence itself — so this only satisfies the shared config.
 const PAD_TOKEN_ID: i32 = 151643;
 
 /// Load the Qwen3-VL text encoder from the converted `text_encoder` component.
 pub fn load_text_encoder(root: &Path) -> Result<Ideogram4TextEncoder> {
-    let w = Weights::from_dir(root.join("text_encoder"))?;
+    let w = prepare_text_weights(Weights::from_dir(root.join("text_encoder"))?)?;
     Ideogram4TextEncoder::from_weights(
         &w,
         "language_model",

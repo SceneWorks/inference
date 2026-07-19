@@ -27,8 +27,11 @@ impl Qwen3Mlp {
     }
 
     pub fn forward(&self, x: &Array) -> Result<Array> {
-        let gated = multiply(&silu(&self.gate.forward(x)?)?, &self.up.forward(x)?)?;
-        self.down.forward(&gated)
+        let gated = multiply(
+            &silu(&self.gate.forward_upcast(x)?)?,
+            &self.up.forward_upcast(x)?,
+        )?;
+        self.down.forward_upcast(&gated)
     }
 
     pub fn quantize(&mut self, bits: i32) -> Result<()> {

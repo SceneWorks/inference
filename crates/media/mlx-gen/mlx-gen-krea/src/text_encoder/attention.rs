@@ -65,15 +65,15 @@ impl Qwen3Attention {
 
         let q = self
             .q_w
-            .forward(x)?
+            .forward_upcast(x)?
             .reshape(&[b, s, self.num_heads, self.head_dim])?;
         let k = self
             .k_w
-            .forward(x)?
+            .forward_upcast(x)?
             .reshape(&[b, s, self.num_kv_heads, self.head_dim])?;
         let v = self
             .v_w
-            .forward(x)?
+            .forward_upcast(x)?
             .reshape(&[b, s, self.num_kv_heads, self.head_dim])?;
 
         // Per-head q/k RMSNorm over the head dim (Qwen3), before RoPE.
@@ -98,7 +98,7 @@ impl Qwen3Attention {
         let o =
             o.transpose_axes(&[0, 2, 1, 3])?
                 .reshape(&[b, s, self.num_heads * self.head_dim])?;
-        self.o_w.forward(&o)
+        self.o_w.forward_upcast(&o)
     }
 }
 // F-078: the HF half-split RoPE apply + GQA `repeat_kv` were open-coded identically here and in the

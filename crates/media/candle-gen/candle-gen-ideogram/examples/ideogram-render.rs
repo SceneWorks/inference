@@ -78,7 +78,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("model={model} snapshot={snapshot} {width}x{height} steps={steps} seed={seed}");
     let spec = LoadSpec::new(WeightsSource::Dir(snapshot.into()));
+    let mut probe = candle_gen::testkit::VramProbe::start_rendered().assert_idle(2.0);
+    let load_phase = probe.phase();
     let gen = candle_gen_ideogram::provider_registry()?.load(&model, &spec)?;
+    probe.end_load(load_phase);
     println!(
         "loaded: id={} family={} backend={}",
         gen.descriptor().id,
@@ -105,6 +108,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Reseed past a residual safety placeholder (sc-6501) so the harness emits a real image — the
     // same detect-and-recover the worker's macOS Ideogram path does.
     let caption = to_caption(&prompt);
+    let gen_phase = probe.phase();
     let mut img = None;
     for attempt in 0..6u64 {
         let seed_try = seed.wrapping_add(attempt);
@@ -131,6 +135,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         img = Some(candidate);
     }
+    probe.end_gen(gen_phase);
+    let report = probe.report();
+    println!(
+        "vram baseline={:.2} GB load-peak={:.2} GB steady={:.2} GB overall-peak={:.2} GB",
+        report.baseline_gb, report.load_peak_gb, report.steady_gb, report.peak_gb
+    );
     let img = img.ok_or("no image")?;
     println!(
         "rendered {}x{} in {:.1}s",

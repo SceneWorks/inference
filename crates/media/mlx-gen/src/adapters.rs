@@ -695,6 +695,26 @@ impl AdaptableLinear {
         }
         Ok(out)
     }
+
+    /// Evaluate with dense base weights widened to the activation dtype for this operation.
+    /// Packed bases already compute from the activation dtype and are left packed. This supports
+    /// bf16-resident/f32-compute text encoders without permanently widening their weight store.
+    pub fn forward_upcast(&self, x: &Array) -> Result<Array> {
+        let mut out = match &self.base {
+            LinearBase::Dense(l) => {
+                let weight = l.weight.value.as_dtype(x.dtype())?;
+                match l.bias.value.as_ref() {
+                    Some(bias) => addmm(&bias.as_dtype(x.dtype())?, x, weight.t(), 1.0, 1.0)?,
+                    None => matmul(x, weight.t())?,
+                }
+            }
+            LinearBase::Quantized(_) => self.base.forward(x)?,
+        };
+        for adapter in &self.adapters {
+            out = add(&out, &adapter.residual(x)?)?;
+        }
+        Ok(out)
+    }
 }
 
 /// A dense Conv2d weight (mlx NHWC `[out, kH, kW, in]`) plus its optional bias, that can have a
@@ -859,6 +879,27 @@ mod tests {
     #[test]
     fn lokr_delta_stored_bf16() {
         assert_eq!(lokr_2x2().dtype(), Dtype::Bfloat16);
+    }
+
+    #[test]
+    fn forward_upcast_uses_activation_dtype_without_mutating_storage() {
+        let weight = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[2, 2])
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap();
+        let lin = AdaptableLinear::dense(weight, None);
+        let x = Array::from_slice(&[0.25f32, 0.5], &[1, 2]);
+
+        let got = lin.forward_upcast(&x).unwrap();
+        let want = Array::from_slice(&[1.25f32, 2.75], &[1, 2]);
+
+        assert_eq!(got.dtype(), Dtype::Float32);
+        assert!(all_close(&got, &want, 1e-6, 1e-6, false)
+            .unwrap()
+            .item::<bool>());
+        let LinearBase::Dense(base) = &lin.base else {
+            panic!("expected dense base");
+        };
+        assert_eq!(base.weight.value.dtype(), Dtype::Bfloat16);
     }
 
     #[test]

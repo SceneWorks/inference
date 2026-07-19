@@ -35,7 +35,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let scheduler = a.get(10).cloned().filter(|s| !s.is_empty());
 
     let spec = LoadSpec::new(WeightsSource::Dir(snapshot.into()));
+    let mut probe = candle_gen::testkit::VramProbe::start_rendered().assert_idle(2.0);
+    let load_phase = probe.phase();
     let gen = candle_gen_boogu::provider_registry()?.load(&model, &spec)?;
+    probe.end_load(load_phase);
 
     let req = GenerationRequest {
         prompt,
@@ -57,9 +60,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Progress::Loading(phase) => eprintln!("loading {phase:?}"),
     };
 
+    let gen_phase = probe.phase();
     let GenerationOutput::Images(images) = gen.generate(&req, &mut on_progress)? else {
         return Err("expected images".into());
     };
+    probe.end_gen(gen_phase);
+    let report = probe.report();
+    eprintln!(
+        "vram baseline={:.2} GB load-peak={:.2} GB steady={:.2} GB overall-peak={:.2} GB",
+        report.baseline_gb, report.load_peak_gb, report.steady_gb, report.peak_gb
+    );
     let img = images.into_iter().next().ok_or("no image")?;
 
     let buf =
