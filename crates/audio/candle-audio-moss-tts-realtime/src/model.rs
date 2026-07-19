@@ -76,6 +76,10 @@ pub const MAX_DURATION_SECS: f32 = 2400.0;
 /// Default clip length when a request does not set `audio.target_duration` (seconds).
 pub const DEFAULT_SECONDS: f32 = 10.0;
 
+/// Sampler seed used when a request carries no `seed` — keeps decoding deterministic (the gen-core
+/// reproducibility law) while still using the reference's sampling (not greedy, which collapses).
+pub const DEFAULT_SAMPLING_SEED: u64 = 13_392;
+
 /// Prompt languages advertised for the scaffold (the model card lists 20; the full set lands with
 /// registration). English + Chinese are the primary verified pair.
 pub const LANGUAGES: &[&str] = &["en", "zh"];
@@ -249,6 +253,9 @@ impl MossTtsRealtimeGenerator {
             .map_err(gen_core::Error::Msg)?;
         let budget = frame_budget(req);
         let total = budget as u32;
+        // Deterministic token sampling seeded by the request (a `None` seed maps to a fixed constant),
+        // so the gen-core reproducibility law holds and generate/generate_streaming agree.
+        let seed = req.seed.unwrap_or(DEFAULT_SAMPLING_SEED);
         let cancel = req.cancel.clone();
         let probe = move || cancel.is_cancelled();
         let mut on_frame = |step: usize| {
@@ -259,7 +266,7 @@ impl MossTtsRealtimeGenerator {
         };
         let result = pipeline
             .decoder
-            .run(frames, budget, &probe, &mut on_frame)
+            .run(frames, budget, seed, &probe, &mut on_frame)
             .map_err(|e| gen_core::Error::Msg(format!("{MODEL_ID}: AR decode: {e}")))?;
         match result {
             Some(r) => Ok(r),

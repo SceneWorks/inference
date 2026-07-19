@@ -17,8 +17,11 @@
 //!   codebook ids, each embedded and **summed** (`config.json.language_config`).
 //! - [`local`] — the 4-layer local/depth transformer (`config.json.local_config`, `rvq = 16`).
 //!   Run once per audio frame, seeded by the backbone's last hidden state, it autoregressively
-//!   emits the frame's 16 RVQ codebook tokens through 16 per-codebook LM heads. Sampling here is
-//!   deterministic greedy (the gen-core reproducibility law).
+//!   emits the frame's 16 RVQ codebook tokens through 16 per-codebook LM heads, **sampled** with the
+//!   reference pipeline ([`sampling`]: temperature / top-k / top-p + a per-codebook cross-frame
+//!   repetition penalty) from a **seeded** PRNG — greedy argmax collapses this model into a repeating
+//!   loop that decodes to silence, so the reference (and this port) sample; seeding keeps it
+//!   deterministic (the gen-core reproducibility law).
 //! - [`decode`] — the assembled AR loop (the reference `prefill` + `step`): backbone → RVQ frame →
 //!   feed the frame back as the next position's audio channels → repeat until the audio-EOS or a
 //!   frame budget. Each iteration emits one RVQ frame incrementally; cancellation is consulted every
@@ -56,6 +59,7 @@ pub mod decode;
 pub mod local;
 pub mod model;
 pub mod prepare;
+pub mod sampling;
 
 pub use model::{
     descriptor, load, load_generator, provider_registry, register_providers,

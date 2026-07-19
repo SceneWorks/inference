@@ -663,18 +663,38 @@ impl MossAudioCodec {
                 row.push(frame.get(q).copied().unwrap_or(0));
             }
         }
+        let debug = std::env::var_os("MOSS_CODEC_DEBUG").is_some();
         let mut x = self.quantizer.decode(&rows, &self.device)?; // [1, code_dim, T]
+        if debug {
+            eprintln!("[codec] after quantizer: {:?} rms={:.5}", x.dims(), rms(&x));
+        }
         for (si, stage) in self.stages.iter().enumerate() {
             if cancel() {
                 return Ok(None);
             }
             x = stage.forward(&x)?;
+            if debug {
+                eprintln!(
+                    "[codec] after stage {si} (before unpatch): {:?} rms={:.5}",
+                    x.dims(),
+                    rms(&x)
+                );
+            }
             x = patched_unpatch(&x, PATCH_SIZES[si])?;
         }
         // x is [1, 1, T*downsample_rate].
         let wav = x.i((0, 0))?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
         Ok(Some(wav))
     }
+}
+
+/// Root-mean-square of all elements (debug instrumentation only).
+fn rms(x: &Tensor) -> f32 {
+    x.sqr()
+        .and_then(|s| s.mean_all())
+        .and_then(|m| m.sqrt())
+        .and_then(|t| t.to_scalar::<f32>())
+        .unwrap_or(f32::NAN)
 }
 
 /// The `model*.safetensors` shards of a codec snapshot (single-file or sharded), sorted for a stable

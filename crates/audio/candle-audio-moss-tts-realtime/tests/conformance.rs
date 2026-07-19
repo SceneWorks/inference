@@ -3,11 +3,11 @@
 //!
 //! ## What this gates on real weights
 //!
-//! - [`moss_tts_realtime_emits_valid_rvq_frames`] — a fixed text + greedy decode → the AR loop
-//!   emits **≥ 2** real 16-codebook RVQ frames, every codebook token in `[0, 1027)`, deterministic
-//!   run-to-run, and non-degenerate (not a single collapsed id). A broken backbone / weight mapping
-//!   / RoPE / multi-embedding sum / local-transformer head wiring would produce empty, out-of-range,
-//!   or all-identical frames and fail here.
+//! - [`moss_tts_realtime_emits_valid_rvq_frames`] — a fixed text + seed → the AR loop emits **≥ 2**
+//!   real 16-codebook RVQ frames, every codebook token in `[0, 1027)`, deterministic run-to-run (the
+//!   seeded sampler), and non-degenerate (not a single collapsed id). A broken backbone / weight
+//!   mapping / RoPE / multi-embedding sum / local-transformer head wiring would produce empty,
+//!   out-of-range, or all-identical frames and fail here.
 //! - [`moss_tts_realtime_is_incremental`] — the AR loop is genuinely incremental: the time to the
 //!   **first** RVQ frame is materially less than the time to the **full** budget.
 //! - [`moss_tts_realtime_streaming_gate`] — the sc-13334 streaming acceptance gate, now released by
@@ -114,13 +114,13 @@ fn moss_tts_realtime_emits_valid_rvq_frames() {
         "codebook-0 collapsed to {distinct} distinct value(s) — the AR brain is not modeling speech"
     );
 
-    // Deterministic: greedy decode ⇒ byte-identical frames on a re-run (the reproducibility law).
+    // Deterministic: the seeded sampler ⇒ byte-identical frames on a re-run (the reproducibility law).
     let again = gen
         .rvq_frames(&request(1.2), &mut |_| {})
         .expect("re-decode");
     assert_eq!(
         *frames, again.frames,
-        "greedy AR decode must be reproducible run-to-run"
+        "seeded AR sampling must be reproducible run-to-run"
     );
 
     // Optionally dump the raw RVQ token frames (the AR-stage output the codec consumes) for
@@ -315,5 +315,55 @@ fn moss_tts_realtime_streaming_gate() {
          {full:.3?})",
         out_path.display(),
         chunks.len(),
+    );
+}
+
+/// Codec-only debug decode (no AR): loads the codec and decodes synthetic frames, printing per-stage
+/// RMS. Isolates whether a silent/near-zero waveform is a codec-decode bug (fails here on synthetic
+/// codes) vs an AR→codec mapping issue (passes here, fails the streaming gate). Set
+/// `MOSS_AUDIO_TOKENIZER_SNAPSHOT` + `MOSS_CODEC_DEBUG=1`.
+#[test]
+#[ignore = "real weights: needs the ~7.1 GB codec snapshot; run with --ignored"]
+fn codec_only_decodes_synthetic_frames() {
+    use candle_audio_moss_tts_realtime::codec::MossAudioCodec;
+    let dir = moss::resolve_pinned_codec_snapshot().expect("resolve codec snapshot");
+    let codec = MossAudioCodec::load(&dir, 16).expect("load codec decoder");
+
+    // Either the real dumped AR frames (MOSS_TTS_REALTIME_FRAMES_OUT) or 25 frames of pseudo-random
+    // in-range codes (a fixed LCG so the run is reproducible).
+    let frames: Vec<Vec<u32>> = if let Ok(path) = std::env::var("MOSS_TTS_REALTIME_FRAMES_OUT") {
+        std::fs::read_to_string(&path)
+            .expect("read frames file")
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| l.split(',').map(|s| s.trim().parse().unwrap()).collect())
+            .collect()
+    } else {
+        let mut state: u32 = 1;
+        let mut next = || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 8) % 1024
+        };
+        (0..25).map(|_| (0..16).map(|_| next()).collect()).collect()
+    };
+    let wav = codec
+        .decode_frames(&frames, &|| false)
+        .expect("decode")
+        .expect("not cancelled");
+    let n = wav.len() as f32;
+    let rms = (wav.iter().map(|s| s * s).sum::<f32>() / n).sqrt();
+    let peak = wav.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+    eprintln!(
+        "codec synthetic decode: {} samples, rms={rms:.5}, peak={peak:.5}",
+        wav.len()
+    );
+    assert_eq!(
+        wav.len(),
+        frames.len() * 1920,
+        "expected 1920 samples per frame"
+    );
+    assert!(
+        rms > 1e-4,
+        "codec produced near-silent output ({rms:.6}) from non-trivial codes — decode-path bug"
     );
 }

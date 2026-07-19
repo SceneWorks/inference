@@ -17,6 +17,7 @@ use tokenizers::Tokenizer;
 use crate::backbone::{Backbone, Frame};
 use crate::config::MossTtsRealtimeConfig;
 use crate::local::LocalTransformer;
+use crate::sampling::{Rng, SamplingParams};
 
 /// In-codebook padding id (also the multi-channel "no audio here" fill).
 pub const AUDIO_CHANNEL_PAD: u32 = 1024;
@@ -95,23 +96,27 @@ pub struct DecodeResult {
 impl Decoder {
     /// Run the AR loop over `prompt_frames` for at most `max_frames`, invoking `on_frame(step)`
     /// after each decoded frame and consulting `cancel` before each frame. Returns `Ok(None)` if
-    /// cancelled. The emitted frames exclude the terminal EOS frame.
+    /// cancelled. The emitted frames exclude the terminal EOS frame. `seed` seeds the token sampler
+    /// deterministically (same seed ⇒ same frames), so a caller reproduces the run exactly.
     pub fn run(
         &self,
         prompt_frames: Vec<Frame>,
         max_frames: usize,
+        seed: u64,
         cancel: &dyn Fn() -> bool,
         on_frame: &mut dyn FnMut(usize),
     ) -> CandleResult<Option<DecodeResult>> {
         let mut frames = prompt_frames;
         let mut out: Vec<RvqFrame> = Vec::new();
         let mut stop = StopReason::Budget;
+        let params = SamplingParams::default();
+        let mut rng = Rng::seed(seed);
         for step in 0..max_frames {
             if cancel() {
                 return Ok(None);
             }
             let hidden = self.backbone.forward_last(&frames)?;
-            let frame = self.local.decode_frame(&hidden)?;
+            let frame = self.local.decode_frame(&hidden, &out, &params, &mut rng)?;
             on_frame(step);
             if frame.first().copied() == Some(AUDIO_EOS) {
                 stop = StopReason::Eos;
@@ -207,7 +212,7 @@ mod tests {
         let no_cancel = || false;
         let mut steps_a = 0usize;
         let a = dec
-            .run(manual_prompt(rvq), 5, &no_cancel, &mut |_| steps_a += 1)
+            .run(manual_prompt(rvq), 5, 42, &no_cancel, &mut |_| steps_a += 1)
             .unwrap()
             .unwrap();
         // Ran to the frame budget (tiny tokens never hit the real EOS), emitting one frame per step.
@@ -223,7 +228,7 @@ mod tests {
         }
         // Determinism: greedy decode ⇒ byte-identical frames on a re-run.
         let b = dec
-            .run(manual_prompt(rvq), 5, &no_cancel, &mut |_| {})
+            .run(manual_prompt(rvq), 5, 42, &no_cancel, &mut |_| {})
             .unwrap()
             .unwrap();
         assert_eq!(a.frames, b.frames, "greedy AR decode is reproducible");
@@ -237,7 +242,7 @@ mod tests {
         let seen = std::cell::Cell::new(0usize);
         let cancel = || seen.get() >= 2;
         let out = dec
-            .run(manual_prompt(rvq), 100, &cancel, &mut |_| {
+            .run(manual_prompt(rvq), 100, 42, &cancel, &mut |_| {
                 seen.set(seen.get() + 1)
             })
             .unwrap();
