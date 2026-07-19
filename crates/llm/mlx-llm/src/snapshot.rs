@@ -30,6 +30,7 @@
 use std::collections::BTreeMap;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use mlx_rs::ops::split_sections;
 use mlx_rs::{Array, Dtype};
@@ -51,6 +52,29 @@ struct StagedTensor {
     shape: Vec<usize>,
     path: PathBuf,
     len: usize,
+}
+
+static STAGE_NONCE: AtomicU64 = AtomicU64::new(0);
+
+fn create_stage_dir(out_dir: &Path) -> Result<PathBuf> {
+    let name = out_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("snapshot");
+    let parent = out_dir.parent().unwrap_or_else(|| Path::new("."));
+    for _ in 0..128 {
+        let nonce = STAGE_NONCE.fetch_add(1, Ordering::Relaxed);
+        let stage = parent.join(format!(".{name}.tmp-{}-{nonce}", std::process::id()));
+        match std::fs::create_dir(&stage) {
+            Ok(()) => return Ok(stage),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err(Error::Msg(format!(
+        "could not allocate unique staging directory beside {}",
+        out_dir.display()
+    )))
 }
 
 /// Write a snapshot while retaining at most one source tensor and its transformed outputs.
@@ -82,11 +106,8 @@ pub(crate) fn write_streaming_snapshot(
                 json!({"group_size": spec.group_size, "bits": spec.bits}),
             );
     }
-    let stage = out_dir.with_extension(format!("tmp-{}", std::process::id()));
-    if stage.exists() {
-        std::fs::remove_dir_all(&stage)?;
-    }
-    std::fs::create_dir_all(&stage)?;
+    std::fs::create_dir_all(out_dir.parent().unwrap_or_else(|| Path::new(".")))?;
+    let stage = create_stage_dir(out_dir)?;
     let result = (|| {
         let mut staged = BTreeMap::new();
         let mut quantized_projections = 0;
@@ -959,6 +980,12 @@ mod tests {
             let got = &loaded[&key];
             assert_eq!(got.shape(), expected.shape());
             assert_eq!(got.dtype(), Dtype::Bfloat16);
+            let expected = expected.as_dtype(Dtype::Bfloat16).unwrap();
+            assert_eq!(
+                got.as_slice::<half::bf16>(),
+                expected.as_slice::<half::bf16>(),
+                "{key}"
+            );
         }
         let _ = std::fs::remove_dir_all(a);
         let _ = std::fs::remove_dir_all(b);
@@ -967,8 +994,12 @@ mod tests {
     #[test]
     fn streaming_writer_cleans_staging_after_error() {
         let out = unique_dir("stream-error");
-        let stage = out.with_extension(format!("tmp-{}", std::process::id()));
+        let sibling = out.with_file_name(format!(
+            ".{}-unrelated",
+            out.file_name().unwrap().to_string_lossy()
+        ));
         let _ = std::fs::remove_dir_all(&out);
+        std::fs::write(&sibling, b"keep").unwrap();
         let error = write_streaming_snapshot(
             &out,
             &["broken".into()],
@@ -979,8 +1010,135 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("injected"));
-        assert!(!stage.exists());
         assert!(!out.join("model.safetensors").exists());
+        assert_eq!(std::fs::read(&sibling).unwrap(), b"keep");
+        std::fs::remove_file(sibling).unwrap();
+    }
+
+    #[test]
+    fn streaming_writer_refuses_nonempty_output_without_touching_it() {
+        let out = unique_dir("stream-no-overwrite");
+        let _ = std::fs::remove_dir_all(&out);
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("sentinel"), b"keep").unwrap();
+        assert!(write_streaming_snapshot(
+            &out,
+            &[],
+            json!({}),
+            &SnapshotTokenizer::default(),
+            None,
+            |_| unreachable!()
+        )
+        .is_err());
+        assert_eq!(std::fs::read(out.join("sentinel")).unwrap(), b"keep");
+        std::fs::remove_dir_all(out).unwrap();
+    }
+
+    #[test]
+    fn stage_allocation_skips_collision_without_deleting_it() {
+        let out = unique_dir("stream-collision");
+        let parent = out.parent().unwrap();
+        let name = out.file_name().unwrap().to_string_lossy();
+        let nonce = STAGE_NONCE.load(Ordering::Relaxed);
+        let collision = parent.join(format!(".{name}.tmp-{}-{nonce}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&collision);
+        std::fs::create_dir(&collision).unwrap();
+        std::fs::write(collision.join("sentinel"), b"keep").unwrap();
+        let allocated = create_stage_dir(&out).unwrap();
+        assert_ne!(allocated, collision);
+        assert_eq!(std::fs::read(collision.join("sentinel")).unwrap(), b"keep");
+        std::fs::remove_dir_all(allocated).unwrap();
+        std::fs::remove_dir_all(collision).unwrap();
+    }
+
+    #[test]
+    fn concurrent_stage_allocations_are_unique() {
+        let out = unique_dir("stream-concurrent");
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let out = out.clone();
+                std::thread::spawn(move || create_stage_dir(&out).unwrap())
+            })
+            .collect();
+        let mut allocated: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        allocated.sort();
+        allocated.dedup();
+        assert_eq!(allocated.len(), 8);
+        for path in allocated {
+            std::fs::remove_dir_all(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn streaming_q4_q8_match_direct_quantization() {
+        let key = "model.layers.0.self_attn.q_proj.weight".to_string();
+        let data: Vec<f32> = (0..128)
+            .map(|i| ((i * 17 % 101) as f32 - 50.0) / 37.0)
+            .collect();
+        let dense = Array::from_slice(&data, &[2, 64]);
+        for spec in [QuantSpec::q4(), QuantSpec::q8()] {
+            let out = unique_dir(&format!("stream-q{}", spec.bits));
+            let _ = std::fs::remove_dir_all(&out);
+            write_streaming_snapshot(
+                &out,
+                std::slice::from_ref(&key),
+                json!({}),
+                &SnapshotTokenizer::default(),
+                Some(spec),
+                |_| Ok(dense.clone()),
+            )
+            .unwrap();
+            let loaded = Array::load_safetensors(out.join("model.safetensors")).unwrap();
+            assert_eq!(loaded[&key].dtype(), Dtype::Uint32);
+            assert_eq!(
+                loaded[&key].shape(),
+                &[2, if spec.bits == 4 { 8 } else { 16 }]
+            );
+            assert_eq!(
+                loaded["model.layers.0.self_attn.q_proj.scales"].shape(),
+                &[2, 1]
+            );
+            assert_eq!(
+                loaded["model.layers.0.self_attn.q_proj.biases"].shape(),
+                &[2, 1]
+            );
+            let direct = QuantizedLinear::quantize(
+                &dense.as_dtype(Dtype::Bfloat16).unwrap(),
+                spec.group_size,
+                spec.bits,
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                loaded[&key].as_slice::<u32>(),
+                direct.weight.as_slice::<u32>()
+            );
+            let reloaded = QuantizedLinear {
+                weight: loaded[&key].clone(),
+                scales: loaded["model.layers.0.self_attn.q_proj.scales"].clone(),
+                biases: loaded["model.layers.0.self_attn.q_proj.biases"].clone(),
+                group_size: spec.group_size,
+                bits: spec.bits,
+                bias: None,
+            };
+            let x = Array::from_slice(
+                &(0..64)
+                    .map(|i| ((i * 11 % 47) as f32 - 23.0) / 19.0)
+                    .collect::<Vec<_>>(),
+                &[1, 64],
+            );
+            assert_eq!(
+                reloaded.forward(&x).unwrap().as_slice::<f32>(),
+                direct.forward(&x).unwrap().as_slice::<f32>(),
+                "Q{} reloaded forward must equal load-time quantization",
+                spec.bits
+            );
+            let config: Value =
+                serde_json::from_str(&std::fs::read_to_string(out.join("config.json")).unwrap())
+                    .unwrap();
+            assert_eq!(config["quantization"]["bits"], spec.bits);
+            std::fs::remove_dir_all(out).unwrap();
+        }
     }
 
     /// Scaled synthetic RSS probe: 16 × 2048² f32 source tensors (256 MiB aggregate,

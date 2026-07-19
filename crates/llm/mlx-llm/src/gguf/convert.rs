@@ -381,6 +381,78 @@ fn reconstruct_rope_scaling(g: &GgufFile, arch: &str) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::primitives::quant::QuantizedLinear;
+
+    fn push_gguf_string(bytes: &mut Vec<u8>, value: &str) {
+        bytes.extend_from_slice(&(value.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(value.as_bytes());
+    }
+
+    fn push_u32_meta(bytes: &mut Vec<u8>, key: &str, value: u32) {
+        push_gguf_string(bytes, key);
+        bytes.extend_from_slice(&4u32.to_le_bytes());
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn llama_forward_qk(data: &[f32], shape: &[usize], n_head: usize) -> Vec<f32> {
+        let (out, in_dim) = (shape[0], shape[1]);
+        let head_dim = out / n_head;
+        let half = head_dim / 2;
+        let mut result = vec![0.0; data.len()];
+        for h in 0..n_head {
+            for k in 0..2 {
+                for j in 0..half {
+                    let dst = h * head_dim + (2 * j + k);
+                    let src = h * head_dim + (k * half + j);
+                    result[dst * in_dim..dst * in_dim + in_dim]
+                        .copy_from_slice(&data[src * in_dim..src * in_dim + in_dim]);
+                }
+            }
+        }
+        result
+    }
+
+    /// A complete, parseable GGUF with an embedding and a non-trivially Llama-permuted Q weight.
+    fn synthetic_llama_gguf(hf_q: &[f32]) -> GgufFile {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0x4655_4747u32.to_le_bytes());
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&2u64.to_le_bytes());
+        bytes.extend_from_slice(&6u64.to_le_bytes());
+
+        push_gguf_string(&mut bytes, "general.architecture");
+        bytes.extend_from_slice(&8u32.to_le_bytes());
+        push_gguf_string(&mut bytes, "llama");
+        push_u32_meta(&mut bytes, "llama.embedding_length", 64);
+        push_u32_meta(&mut bytes, "llama.block_count", 1);
+        push_u32_meta(&mut bytes, "llama.attention.head_count", 2);
+        push_u32_meta(&mut bytes, "llama.attention.head_count_kv", 2);
+        push_u32_meta(&mut bytes, "llama.feed_forward_length", 64);
+
+        // GGUF dimensions are fastest-axis first. Both tensors are plain F32 (ggml type 0).
+        push_gguf_string(&mut bytes, "token_embd.weight");
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+        bytes.extend_from_slice(&64u64.to_le_bytes());
+        bytes.extend_from_slice(&2u64.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        push_gguf_string(&mut bytes, "blk.0.attn_q.weight");
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+        bytes.extend_from_slice(&64u64.to_le_bytes());
+        bytes.extend_from_slice(&64u64.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&512u64.to_le_bytes());
+        while !bytes.len().is_multiple_of(32) {
+            bytes.push(0);
+        }
+        for i in 0..128 {
+            bytes.extend_from_slice(&(((i * 7 % 53) as f32 - 26.0) / 31.0).to_le_bytes());
+        }
+        for value in llama_forward_qk(hf_q, &[64, 64], 2) {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        GgufFile::parse(bytes).unwrap()
+    }
 
     #[test]
     fn remaps_non_layer_keys() {
@@ -423,34 +495,110 @@ mod tests {
     fn qk_permute_inverts_llama_cpp_forward() {
         // Forward (HF -> GGUF) permute per head: reshape(n_head, 2, hd/2).swapaxes(1,2).
         // For one head, hd=4: GGUF_row(2j+k) = HF_row(k*2+j).
-        fn forward(data: &[f32], shape: &[usize], n_head: usize) -> Vec<f32> {
-            let out = shape[0];
-            let in_dim = shape[1];
-            let head_dim = out / n_head;
-            let half = head_dim / 2;
-            let mut res = vec![0f32; data.len()];
-            for h in 0..n_head {
-                for k in 0..2 {
-                    for j in 0..half {
-                        let dst = h * head_dim + (2 * j + k);
-                        let src = h * head_dim + (k * half + j);
-                        res[dst * in_dim..dst * in_dim + in_dim]
-                            .copy_from_slice(&data[src * in_dim..src * in_dim + in_dim]);
-                    }
-                }
-            }
-            res
-        }
         // 2 heads, head_dim 4, in 3 — distinct per-row values so the gather is checkable.
         let (n_head, head_dim, in_dim) = (2usize, 4usize, 3usize);
         let out = n_head * head_dim;
         let hf: Vec<f32> = (0..(out * in_dim) as i32).map(|x| x as f32).collect();
         let shape = vec![out, in_dim];
-        let gguf = forward(&hf, &shape, n_head);
+        let gguf = llama_forward_qk(&hf, &shape, n_head);
         let back = permute_inverse_qk(&gguf, &shape, n_head).unwrap();
         assert_eq!(back, hf, "inverse permute must recover the HF layout");
         // And it is a non-trivial permutation (not identity).
         assert_ne!(gguf, hf);
+
+        // Feed the independently unpermuted result through the streaming sink and pin every stored
+        // BF16 value, rather than comparing two invocations of the same writer.
+        let dir =
+            std::env::temp_dir().join(format!("mlx-llm-gguf-qk-stream-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let key = "model.layers.0.self_attn.q_proj.weight".to_string();
+        crate::snapshot::write_streaming_snapshot(
+            &dir,
+            std::slice::from_ref(&key),
+            json!({}),
+            &SnapshotTokenizer::default(),
+            None,
+            |_| Ok(Array::from_slice(&back, &[out as i32, in_dim as i32])),
+        )
+        .unwrap();
+        let stored = Array::load_safetensors(dir.join("model.safetensors")).unwrap();
+        let expected: Vec<half::bf16> = hf.iter().copied().map(half::bf16::from_f32).collect();
+        assert_eq!(stored[&key].as_slice::<half::bf16>(), expected);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn full_gguf_q4_q8_conversion_reloads_at_load_time_quantization_parity() {
+        let hf_q: Vec<f32> = (0..64 * 64)
+            .map(|i| ((i * 17 % 257) as f32 - 128.0) / 73.0)
+            .collect();
+        let expected_embedding: Vec<half::bf16> = (0..128)
+            .map(|i| half::bf16::from_f32(((i * 7 % 53) as f32 - 26.0) / 31.0))
+            .collect();
+        let gguf = synthetic_llama_gguf(&hf_q);
+        let dense = Array::from_slice(&hf_q, &[64, 64])
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap();
+        let input = Array::from_slice(
+            &(0..64)
+                .map(|i| ((i * 13 % 59) as f32 - 29.0) / 23.0)
+                .collect::<Vec<_>>(),
+            &[1, 64],
+        );
+        let key = "model.layers.0.self_attn.q_proj.weight";
+        for spec in [QuantSpec::q4(), QuantSpec::q8()] {
+            let out = std::env::temp_dir().join(format!(
+                "mlx-llm-full-gguf-q{}-{}",
+                spec.bits,
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&out);
+            convert(
+                &gguf,
+                &out,
+                ConvertOptions {
+                    quantize: Some(spec),
+                },
+            )
+            .unwrap();
+            let loaded = Array::load_safetensors(out.join("model.safetensors")).unwrap();
+            let prefix = "model.layers.0.self_attn.q_proj";
+            assert_eq!(
+                loaded["model.embed_tokens.weight"].as_slice::<half::bf16>(),
+                expected_embedding
+            );
+            assert_eq!(loaded[key].dtype(), Dtype::Uint32);
+            assert_eq!(
+                loaded[key].shape(),
+                &[64, if spec.bits == 4 { 8 } else { 16 }]
+            );
+            assert_eq!(loaded[&format!("{prefix}.scales")].shape(), &[64, 1]);
+            assert_eq!(loaded[&format!("{prefix}.biases")].shape(), &[64, 1]);
+            let direct =
+                QuantizedLinear::quantize(&dense, spec.group_size, spec.bits, None).unwrap();
+            let reloaded = QuantizedLinear {
+                weight: loaded[key].clone(),
+                scales: loaded[&format!("{prefix}.scales")].clone(),
+                biases: loaded[&format!("{prefix}.biases")].clone(),
+                group_size: spec.group_size,
+                bits: spec.bits,
+                bias: None,
+            };
+            assert_eq!(
+                reloaded.weight.as_slice::<u32>(),
+                direct.weight.as_slice::<u32>()
+            );
+            assert_eq!(
+                reloaded.forward(&input).unwrap().as_slice::<f32>(),
+                direct.forward(&input).unwrap().as_slice::<f32>()
+            );
+            let config: Value =
+                serde_json::from_str(&std::fs::read_to_string(out.join("config.json")).unwrap())
+                    .unwrap();
+            assert_eq!(config["hidden_size"], 64);
+            assert_eq!(config["quantization"]["bits"], spec.bits);
+            std::fs::remove_dir_all(out).unwrap();
+        }
     }
 
     #[test]
