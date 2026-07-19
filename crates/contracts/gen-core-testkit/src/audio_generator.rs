@@ -12,14 +12,14 @@
 //! `width`/`height` range check is skipped, because those fields are unused by a pure audio model.
 //! The image [`conformance`](crate::conformance) suite builds a text+size request and asserts an
 //! *oversize* rejection at `max_size + 64` — exactly the check an audio model must NOT enforce
-//! through the size axis. This module therefore builds an audio request (prompt + an in-range size
-//! read from the descriptor's advertised bounds + [`AudioParams`]) and asserts the *audio-surface*
-//! capability gaps — an unadvertised voice / language / sample-rate, or visual-only conditioning —
-//! are the ones rejected (as typed [`Error::Unsupported`]). It deliberately makes **no** claim about
-//! how the model treats an out-of-range visual size: a conformant provider may still honor its
-//! advertised `min_size..=max_size` bounds even under `Modality::Audio` (candle-audio-kokoro does),
-//! so the harness keeps its size inside those bounds rather than probing that provider-specific
-//! choice. The modality-agnostic progress/cancellation helpers
+//! through the size axis. This module therefore builds an audio request (prompt + a nominal size +
+//! [`AudioParams`]) and asserts the *audio-surface* capability gaps — an unadvertised voice /
+//! language / sample-rate, or visual-only conditioning — are the ones rejected (as typed
+//! [`Error::Unsupported`]). It deliberately makes **no** claim about how the model treats a visual
+//! size: an audio descriptor advertises no size bounds (`min_size`/`max_size` are the unused 0 —
+//! sc-13314) and a conformant provider ignores width/height entirely, so the harness sets a nominal
+//! in-range size rather than probing the size axis. The modality-agnostic progress/cancellation
+//! helpers
 //! ([`check_progress_with`](crate::check_progress_with),
 //! [`check_cancellation_with`](crate::check_cancellation_with),
 //! [`check_precancellation_with`](crate::check_precancellation_with)) from the crate root cover the
@@ -71,13 +71,14 @@ impl AudioProfile {
     }
 }
 
-/// The in-capability audio request the positive checks synthesize from. `width`/`height` are set to
-/// the descriptor's advertised `min_size` (always `>= 1`, and `<= max_size`, per the descriptor
-/// sweep), so the request is in-range for a provider that still honors its size bounds under
-/// `Modality::Audio` (candle-audio-kokoro) while being trivially ignored by one that fully skips the
-/// size axis. The provider-specific choice of whether to range-check size at all is deliberately not
-/// probed.
+/// The in-capability audio request the positive checks synthesize from. An audio descriptor
+/// advertises no size bounds (`min_size`/`max_size` are the unused 0 — sc-13314) and a pure-audio
+/// model ignores width/height, so the harness sets a fixed nominal size rather than reading the
+/// (absent) bounds. The provider-specific choice of whether to range-check size at all is
+/// deliberately not probed.
 pub(crate) fn audio_base_request(g: &dyn Generator, profile: &AudioProfile) -> GenerationRequest {
+    // Nominal, ignored by audio models. `min_size.max(1)` keeps a sane value whether the descriptor
+    // leaves the bound at 0 (the audio convention) or an older provider still advertises a floor.
     let size = g.descriptor().capabilities.min_size.max(1);
     GenerationRequest {
         prompt: profile.prompt.clone(),

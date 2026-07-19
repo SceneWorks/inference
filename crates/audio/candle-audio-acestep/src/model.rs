@@ -118,8 +118,11 @@ pub fn descriptor() -> ModelDescriptor {
             samplers: vec![],
             schedulers: vec![],
             supported_guidance_methods: vec![],
-            min_size: 1,
-            max_size: 4096,
+            // Pure audio: no width/height. The descriptor sweep exempts Audio from the size floor
+            // (sc-13314) and `validate_request_audio` skips the range, so these stay at the natural
+            // unused 0 rather than a nominal placeholder bound.
+            min_size: 0,
+            max_size: 0,
             // One clip per request (GenerationOutput::Audio carries a single track).
             max_count: 1,
             mac_only: false,
@@ -162,18 +165,8 @@ pub(crate) fn validate_request(
         )));
     }
     let caps = &desc.capabilities;
-    // Honor the advertised (audio-unused) size bounds so validate never accepts out-of-surface.
-    if req.width < caps.min_size
-        || req.height < caps.min_size
-        || req.width > caps.max_size
-        || req.height > caps.max_size
-    {
-        return Err(gen_core::Error::Msg(format!(
-            "{id}: width/height {}x{} outside the advertised {}..={} (unused by audio, but the \
-             advertised surface is honored)",
-            req.width, req.height, caps.min_size, caps.max_size
-        )));
-    }
+    // Pure audio: width/height are unused, so the descriptor advertises no size bounds (sc-13314)
+    // and the audio floor skips the size range entirely.
     if let Some(steps) = req.steps {
         if steps > MAX_STEPS {
             return Err(gen_core::Error::Msg(format!(

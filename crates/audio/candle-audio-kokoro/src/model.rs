@@ -133,10 +133,11 @@ pub fn descriptor() -> ModelDescriptor {
             samplers: vec![],
             schedulers: vec![],
             supported_guidance_methods: vec![],
-            // Audio models skip the size floor (validate_request_audio); these bounds are the
-            // audio-lane convention for a size-less descriptor.
-            min_size: 1,
-            max_size: 4096,
+            // Pure audio: no width/height. The descriptor sweep exempts Audio from the size floor
+            // (sc-13314) and `validate_request_audio` skips the range, so these stay at the natural
+            // unused 0 rather than a nominal placeholder bound.
+            min_size: 0,
+            max_size: 0,
             // One clip per request (GenerationOutput::Audio carries a single track).
             max_count: 1,
             mac_only: false,
@@ -168,21 +169,9 @@ pub(crate) fn validate_request(
             "{id}: prompt (the script text) must not be empty"
         )));
     }
-    // The audio floor deliberately skips the size checks (width/height are unused by a pure
-    // audio model), but the descriptor still advertises bounds — honor them so validate never
-    // accepts a request outside the advertised surface (validate-honesty).
+    // Pure audio: width/height are unused, so the descriptor advertises no size bounds (sc-13314)
+    // and the audio floor skips the size range entirely.
     let caps = &desc.capabilities;
-    if req.width < caps.min_size
-        || req.height < caps.min_size
-        || req.width > caps.max_size
-        || req.height > caps.max_size
-    {
-        return Err(gen_core::Error::Msg(format!(
-            "{id}: width/height {}x{} outside the advertised {}..={} (unused by audio, but the \
-             advertised surface is honored)",
-            req.width, req.height, caps.min_size, caps.max_size
-        )));
-    }
     caps.validate_request_audio(id, req)
 }
 
