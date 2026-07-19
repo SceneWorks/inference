@@ -22,6 +22,26 @@ environment = ["MLX_LLM_QWEN3_MODEL", "CANDLE_LLM_QWEN3_MODEL"]
 expected_files = ["config.json", "tokenizer.json", "model.safetensors"]
 
 [[models]]
+# Full SigLIP2 + projector + Llama-3.1 8B JoyCaption VLM. The MLX real-weight gate prepares this
+# dense source into a Q4 text-stack snapshot while retaining the vision tower/projector dense.
+key = "joycaption-beta-one"
+repository = "fancyfeast/llama-joycaption-beta-one-hf-llava"
+revision = "ebf414ea497a020da0f82df3913e5b6cb8e9663a"
+license = "Llama 3.1 Community License"
+size_class = "very-large"
+profiles = ["llm-macos"]
+environment = ["MLX_LLM_JOYCAPTION_SNAPSHOT"]
+expected_files = [
+    "config.json",
+    "tokenizer.json",
+    "model.safetensors.index.json",
+    "model-00001-of-00004.safetensors",
+    "model-00002-of-00004.safetensors",
+    "model-00003-of-00004.safetensors",
+    "model-00004-of-00004.safetensors",
+]
+
+[[models]]
 key = "qwen-image"
 repository = "Qwen/Qwen-Image"
 revision = "75e0b4be04f60ec59a75f475837eced720f823b6"

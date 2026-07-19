@@ -22,6 +22,8 @@ use core_llm::{
 use mlx_llm::decode::CancelFlag;
 use mlx_llm::joycaption::{build_chat_text, JoyCaptionModel, JoyCaptionProvider, STOP_TOKENS};
 use mlx_llm::primitives::sampler::SamplingParams;
+use mlx_llm::primitives::{QuantSpec, Weights};
+use mlx_llm::snapshot::write_hf_snapshot;
 
 /// Pure-greedy golden tokens for the gray-384 fixture + "Write a very short caption." (16 tokens).
 const GOLDEN: &[i32] = &[
@@ -51,6 +53,120 @@ fn gradient_image() -> (Vec<u8>, u32, u32) {
         }
     }
     (px, 512, 384)
+}
+
+struct PreparedSnapshot(std::path::PathBuf);
+
+impl Drop for PreparedSnapshot {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.0).ok();
+    }
+}
+
+/// Release gate for stored-quantized VLM snapshots: prepare the pinned full JoyCaption source,
+/// prove only the Llama text projections were packed, reload the prepared directory, and execute
+/// SigLIP → projector → image splice → quantized Llama generation with an actual RGB image.
+#[test]
+#[ignore = "needs pinned MLX_LLM_JOYCAPTION_SNAPSHOT and several GiB of temporary disk"]
+fn prepared_q4_snapshot_runs_full_vlm() {
+    let source = std::env::var("MLX_LLM_JOYCAPTION_SNAPSHOT").expect(
+        "MLX_LLM_JOYCAPTION_SNAPSHOT must name the verified pinned JoyCaption source snapshot",
+    );
+    let source = std::path::Path::new(&source);
+    assert!(
+        source.is_dir(),
+        "JoyCaption source snapshot is not a directory: {}",
+        source.display()
+    );
+
+    let out = std::env::temp_dir().join(format!("mlx-llm-joycaption-q4-{}", std::process::id()));
+    std::fs::remove_dir_all(&out).ok();
+    let prepared = PreparedSnapshot(out);
+    let report = write_hf_snapshot(source, &prepared.0, Some(QuantSpec::q4()))
+        .expect("quantize-prepare of the pinned JoyCaption source must succeed");
+    assert_eq!(report.quantized, Some(QuantSpec::q4()));
+    assert!(
+        report.quantized_projections > 0,
+        "JoyCaption prepare must quantize text projections"
+    );
+
+    let config: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(prepared.0.join("config.json"))
+            .expect("prepared config.json must exist"),
+    )
+    .expect("prepared config.json must remain valid JSON");
+    assert_eq!(config["quantization"]["bits"], 4);
+    assert_eq!(config["text_config"]["quantization"]["bits"], 4);
+
+    let weights = Weights::from_dir(&prepared.0).expect("prepared weights must reload");
+    for base in [
+        "language_model.model.layers.0.self_attn.q_proj",
+        "language_model.model.layers.0.mlp.gate_proj",
+    ] {
+        assert!(
+            weights.contains(&format!("{base}.weight")),
+            "missing {base}.weight"
+        );
+        assert!(
+            weights.contains(&format!("{base}.scales")),
+            "missing {base}.scales"
+        );
+        assert!(
+            weights.contains(&format!("{base}.biases")),
+            "missing {base}.biases"
+        );
+    }
+    for base in [
+        "vision_tower.vision_model.encoder.layers.0.self_attn.q_proj",
+        "multi_modal_projector.linear_1",
+    ] {
+        assert!(
+            weights.contains(&format!("{base}.weight")),
+            "missing dense {base}.weight"
+        );
+        assert!(
+            !weights.contains(&format!("{base}.scales")),
+            "{base} must remain dense"
+        );
+    }
+
+    let model = JoyCaptionModel::from_dir(&prepared.0)
+        .expect("prepared JoyCaption VLM must load through the stored-quantized text path");
+    assert_eq!(model.language_config().quantization, Some(QuantSpec::q4()));
+    let tok = Tokenizer::from_file(prepared.0.join("tokenizer.json"))
+        .expect("prepared tokenizer must load");
+    let (pixels, width, height) = gradient_image();
+    let features = model
+        .image_features(&pixels, width as usize, height as usize)
+        .expect("dense SigLIP tower and projector must encode the image");
+    let prompt_ids: Vec<i32> = tok
+        .encode(&build_chat_text("Write a very short caption."), false)
+        .expect("JoyCaption prompt must tokenize")
+        .into_iter()
+        .map(|id| id as i32)
+        .collect();
+    let generated = model
+        .generate(
+            &prompt_ids,
+            &features,
+            &SamplingParams {
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: 0,
+                repetition_penalty: 1.0,
+                repetition_context: 0,
+            },
+            2,
+            Some(0),
+            STOP_TOKENS,
+            &CancelFlag::new(),
+            &mut |_, _| {},
+        )
+        .expect("prepared JoyCaption VLM must generate from the real image input");
+    assert!(
+        !generated.tokens.is_empty(),
+        "prepared JoyCaption generation stopped before producing a token"
+    );
 }
 
 /// Model-level parity: vision tower → projector → splice → Llama decode reproduces the reference

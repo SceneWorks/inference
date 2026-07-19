@@ -48,6 +48,41 @@ class RealWeightsWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("tokenizer/tokenizer.json", models["qwen-image"]["expected_files"])
         self.assertIn("tokenizer_2/tokenizer.json", models["flux-1-dev"]["expected_files"])
 
+    def test_joycaption_prepared_vlm_gate_is_pinned_and_wired(self):
+        llm_job = self.text.split("  mlx-llm:\n", 1)[1].split("\n  mlx-media:\n", 1)[0]
+        self.assertIn(
+            "MLX_LLM_JOYCAPTION_SNAPSHOT: ${{ vars.MLX_LLM_JOYCAPTION_SNAPSHOT }}",
+            llm_job,
+        )
+        self.assertIn(
+            "--model joycaption-beta-one --snapshot \"$MLX_LLM_JOYCAPTION_SNAPSHOT\"",
+            llm_job,
+        )
+        self.assertIn(
+            "--test joycaption prepared_q4_snapshot_runs_full_vlm -- --ignored --nocapture",
+            llm_job,
+        )
+        models = {
+            model["key"]: model
+            for model in tomllib.loads(MANIFEST.read_text(encoding="utf-8"))["models"]
+        }
+        joy = models["joycaption-beta-one"]
+        self.assertEqual(joy["revision"], "ebf414ea497a020da0f82df3913e5b6cb8e9663a")
+        self.assertEqual(joy["profiles"], ["llm-macos"])
+        self.assertEqual(joy["environment"], ["MLX_LLM_JOYCAPTION_SNAPSHOT"])
+        self.assertEqual(
+            joy["expected_files"],
+            [
+                "config.json",
+                "tokenizer.json",
+                "model.safetensors.index.json",
+                "model-00001-of-00004.safetensors",
+                "model-00002-of-00004.safetensors",
+                "model-00003-of-00004.safetensors",
+                "model-00004-of-00004.safetensors",
+            ],
+        )
+
     def test_each_model_runs_resident_and_sequential_in_separate_processes(self):
         qwen_command = "cargo test --locked -p candle-gen-qwen-image --features cuda qwen_image_probed_generate_for_offload_ab"
         flux_command = "cargo test --locked -p candle-gen-flux --features cuda flux_dev_probed_generate_for_offload_ab"
