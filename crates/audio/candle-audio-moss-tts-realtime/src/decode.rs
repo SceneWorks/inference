@@ -8,10 +8,8 @@
 //! iteration emits one RVQ frame; a consumer decodes a block of frames into a block of PCM (the
 //! streaming chunk). Cancellation is consulted at every frame so the loop stops promptly.
 //!
-//! **Codec boundary.** These frames are the input to the MOSS-Audio-Tokenizer codec (RVQ tokens →
-//! 24 kHz waveform), a separate ~7 GB model that is **not yet ported** (see [`crate`] docs).
-//! Producing audio is therefore out of reach this slice; the frames are real and in-range, and the
-//! provider errors at the codec boundary rather than fabricate a waveform.
+//! **Codec input.** These frames are the input to the MOSS-Audio-Tokenizer codec ([`crate::codec`],
+//! RVQ tokens → 24 kHz waveform); [`crate::model`] wires the two together for real streaming TTS.
 
 use candle_audio::candle_core::Result as CandleResult;
 use tokenizers::Tokenizer;

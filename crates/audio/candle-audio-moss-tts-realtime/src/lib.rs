@@ -23,30 +23,26 @@
 //!   feed the frame back as the next position's audio channels → repeat until the audio-EOS or a
 //!   frame budget. Each iteration emits one RVQ frame incrementally; cancellation is consulted every
 //!   frame.
+//! - [`codec`] — the **MOSS-Audio-Tokenizer** decoder (sc-13392): RVQ codes → 24 kHz waveform via the
+//!   RLFQ quantizer decode + the causal RoPE-transformer / `PatchedPretransform` upsampling stack.
 //! - [`chunk`] — the streaming PCM-block → `gen_core::AudioChunk` mechanism (a pure, offline-tested
-//!   helper) the streaming path will emit incrementally once the codec lands.
+//!   helper); the streaming path emits blocks incrementally as the codec decodes them.
 //!
-//! ## Port status (honest partial — sc-13334)
+//! ## Port status (complete — sc-13334 + sc-13392)
 //!
-//! sc-13334 ports the **AR brain** (backbone, local transformer, AR loop, the provider contract,
-//! the pinned-SHA hub path, and the preparer probe) and verifies, on real weights, that it emits
-//! real in-range 16-codebook RVQ speech-token frames (the `conformance` test).
+//! sc-13334 ported the **AR brain** (backbone, local transformer, AR loop, the provider contract,
+//! the pinned-SHA hub path, and the preparer probe), verified on real weights to emit real in-range
+//! 16-codebook RVQ speech-token frames. sc-13392 ports the **MOSS-Audio-Tokenizer codec**
+//! (`OpenMOSS-Team/MOSS-Audio-Tokenizer`, a ~7.1 GB RLFQ streaming codec — 32 quantizers, `rvq_dim`
+//! 512, causal RoPE transformers with `PatchedPretransform` channel→time upsampling; distinct from
+//! candle-transformers' Mimi) natively onto the pinned candle revision — the **decode path** (the TTS
+//! direction). The AR's 16 codebooks drive the codec's first 16 quantizers (the codec's documented
+//! variable-bitrate decode). [`model::MossTtsRealtimeGenerator`] now renders real 24 kHz audio through
+//! `generate` / `generate_streaming`, and the generator is **registered** into `candle-audio-catalog`.
 //!
-//! Turning those RVQ frames into a 24 kHz waveform requires the **MOSS-Audio-Tokenizer** codec
-//! (`OpenMOSS-Team/MOSS-Audio-Tokenizer`) — a **separate ~7 GB** model (a novel RLFQ streaming codec
-//! with 32 quantizers and ~44 causal-transformer layers, NOT the same as candle-transformers' Mimi)
-//! that is **not yet ported**. Consequently [`model::MossTtsRealtimeGenerator`]'s `generate` runs the AR
-//! loop to produce real frames and then returns a typed error at the codec boundary rather than
-//! fabricate audio, and this generator is **not yet registered** into `candle-audio-catalog`'s
-//! shipping surface (registering an audio generator that cannot render audio would fail the gen-core
-//! audio conformance suite and mis-advertise the lane). That registration, the ordered-id surface
-//! extension, and the three bundle smokes are deliberately deferred to the codec follow-up — the same
-//! discipline `candle-audio-chatterbox` applies while its S3Gen vocoder stack is unported. This
-//! crate is present as a workspace member so its AR stack builds, is unit-tested, and is exercised
-//! end-to-end on real weights by the conformance test.
-//!
-//! Weights resolve through the audio lane's pinned-SHA hub path (F-029):
-//! [`model::HUB_REPO`] at [`model::HUB_REVISION`].
+//! Weights resolve through the audio lane's pinned-SHA hub path (F-029): the AR at
+//! [`model::HUB_REPO`]@[`model::HUB_REVISION`] and the codec at
+//! [`model::CODEC_HUB_REPO`]@[`model::CODEC_HUB_REVISION`].
 
 pub use candle_audio;
 pub use candle_audio::gen_core;
@@ -54,6 +50,7 @@ pub use candle_audio::gen_core;
 pub mod backbone;
 pub mod blocks;
 pub mod chunk;
+pub mod codec;
 pub mod config;
 pub mod decode;
 pub mod local;
@@ -61,13 +58,13 @@ pub mod model;
 pub mod prepare;
 
 pub use model::{
-    descriptor, load, load_generator, resolve_pinned_snapshot, CODEC_HUB_REPO, CODEC_HUB_REVISION,
+    descriptor, load, load_generator, provider_registry, register_providers,
+    resolve_pinned_codec_snapshot, resolve_pinned_snapshot, CODEC_HUB_REPO, CODEC_HUB_REVISION,
     HUB_REPO, HUB_REVISION, LANGUAGES, MAX_DURATION_SECS, MODEL_ID, REGISTRATION, SAMPLE_RATE,
     WEIGHT_LICENSE, WEIGHT_LICENSE_ENTRY,
 };
 
 /// This crate's model-weight-license entries for catalog aggregation (sc-13332) — one row keyed by
 /// [`MODEL_ID`]. The audio catalog concatenates every provider's slice into the model-licenses
-/// manifest SceneWorks lists on its end-product licenses page. (Wired in with the deferred catalog
-/// registration; declared here now so the license is never lost.)
+/// manifest SceneWorks lists on its end-product licenses page (aggregated by `candle-audio-catalog`).
 pub const WEIGHT_LICENSES: &[gen_core::WeightLicenseEntry] = &[model::WEIGHT_LICENSE_ENTRY];

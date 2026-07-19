@@ -114,7 +114,12 @@ mod tests {
             );
             assert_eq!(
                 snapshot.audio_generator_ids,
-                ["kokoro_82m", "moss_sfx_v2", "acestep_v15_turbo"]
+                [
+                    "kokoro_82m",
+                    "moss_sfx_v2",
+                    "acestep_v15_turbo",
+                    "moss_tts_realtime"
+                ]
             );
             assert_eq!(snapshot.audio_voice_embedder_ids, ["chatterbox_ve"]);
             assert_eq!(snapshot.audio_transform_ids, ["openvoice_v2"]);
@@ -210,6 +215,7 @@ mod tests {
                 "kokoro_82m",
                 "moss_sfx_v2",
                 "acestep_v15_turbo",
+                "moss_tts_realtime",
                 "dummy-audio"
             ]
         );

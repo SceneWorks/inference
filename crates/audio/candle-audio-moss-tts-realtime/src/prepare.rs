@@ -6,8 +6,8 @@
 //! top-level layout the `candle-llm` HF probe recognizes, so the audio lane provides a probe +
 //! validated **passthrough** preparer (the snapshot is already loadable; there is no quantized or
 //! converted variant to materialize). A requested quantization is a typed `Unsupported`, never a
-//! silent dense fallback. Its wiring into `candle-audio-catalog` is deferred with the rest of the
-//! provider registration until the codec lands (see [`crate`] docs).
+//! silent dense fallback. It is wired into `candle-audio-catalog`'s audio-lane preparer chain
+//! alongside the provider registration (sc-13392).
 
 use std::path::Path;
 
@@ -36,7 +36,7 @@ pub fn is_moss_tts_realtime_snapshot(dir: &Path) -> bool {
 }
 
 /// [`is_moss_tts_realtime_snapshot`] over a [`PrepareSpec`] — the probe the composed audio-lane
-/// registration would consult (deferred until registration lands).
+/// registration consults in the audio-lane preparer chain.
 pub fn can_prepare(spec: &PrepareSpec) -> bool {
     is_moss_tts_realtime_snapshot(&spec.source)
 }

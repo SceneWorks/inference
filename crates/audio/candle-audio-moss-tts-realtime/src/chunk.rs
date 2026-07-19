@@ -1,7 +1,7 @@
 //! The streaming PCM-chunking mechanism (sc-13334).
 //!
 //! MOSS-TTS-Realtime is autoregressive: the AR brain emits one RVQ frame at a time, and the codec
-//! (once ported) decodes each block of frames into a block of PCM. The provider's
+//! ([`crate::codec`]) decodes each block of frames into a block of PCM. The provider's
 //! `gen_core::Generator::generate_streaming` emits one `gen_core::AudioChunk` per decoded PCM
 //! block, so a consumer starts playback well before the full track finishes. This module holds the
 //! block→chunk mechanism as a small pure helper so it is unit-testable **offline** (no weights, no
