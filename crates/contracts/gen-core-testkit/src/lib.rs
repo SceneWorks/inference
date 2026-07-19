@@ -72,8 +72,9 @@ pub use trainer::{
     check_trainer_validate, trainer_conformance, TrainerProfile,
 };
 pub use transcriber::{
-    check_transcriber_cancellation, check_transcriber_output, check_transcriber_registry,
-    check_transcriber_validate, transcriber_conformance, TranscriberProfile,
+    check_transcriber_cancellation, check_transcriber_output, check_transcriber_progress,
+    check_transcriber_registry, check_transcriber_validate, transcriber_conformance,
+    TranscriberProfile,
 };
 pub use voice_embedder::{
     check_voice_embed, check_voice_embed_rejects_short, check_voice_embedder_registry,

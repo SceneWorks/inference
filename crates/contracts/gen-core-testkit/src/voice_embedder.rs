@@ -82,6 +82,11 @@ pub fn check_voice_embed(
 /// **Degenerate-input rejection.** An empty / too-short reference clip is rejected with an `Err`
 /// rather than embedded into a meaningless vector — a speaker encoder needs enough audio to form an
 /// identity, so a conformant provider guards its input at the edge.
+///
+/// Note: this asserts only that *rejection happens* (any `Err`), not the specific error variant or
+/// message — the contract has no typed "input too short" error, and coupling the check to a
+/// message string would be brittle. The positive [`check_voice_embed`] already proves the valid
+/// clip *succeeds*, so a provider erroring on the valid clip is caught there, not masked here.
 pub fn check_voice_embed_rejects_short(
     e: &dyn VoiceEmbedder,
     profile: &VoiceEmbedderProfile,

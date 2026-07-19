@@ -22,6 +22,8 @@ struct Behavior {
     honor_cancel: bool,
     /// On cancel, returns the typed `Error::Canceled` (vs. a stringified `Error::Msg`).
     typed_cancel: bool,
+    /// Emits `Progress::Step` events during decoding.
+    emit_progress: bool,
     /// Emits well-ordered segment timestamps (vs. end-before-start garbage).
     well_ordered_segments: bool,
 }
@@ -32,6 +34,7 @@ impl Behavior {
             honest_validate: true,
             honor_cancel: true,
             typed_cancel: true,
+            emit_progress: true,
             well_ordered_segments: true,
         }
     }
@@ -102,10 +105,16 @@ impl Transcriber for StubTranscriber {
                 gen_core::Error::Msg("stub transcriber: cancelled".into())
             });
         }
-        on_progress(Progress::Step {
-            current: 1,
-            total: 1,
-        });
+        if self.behavior.emit_progress {
+            on_progress(Progress::Step {
+                current: 1,
+                total: 2,
+            });
+            on_progress(Progress::Step {
+                current: 2,
+                total: 2,
+            });
+        }
         let (start, end) = if self.behavior.well_ordered_segments {
             (0.0, 1.0)
         } else {
@@ -160,9 +169,24 @@ fn good_stub_passes_full_conformance() {
 fn good_stub_passes_every_check_individually() {
     let t = StubTranscriber::new(STUB_ID, Behavior::good());
     check_transcriber_validate(&t, &cheap()).unwrap();
+    check_transcriber_progress(&t, &cheap()).unwrap();
     check_transcriber_output(&t, &cheap()).unwrap();
     check_transcriber_cancellation(&t, &cheap()).unwrap();
     check_transcriber_registry(&registry(), &t).unwrap();
+}
+
+#[test]
+fn missing_progress_fails_progress_check() {
+    // Long-running ASR must report progress; a transcriber that emits none fails the check.
+    let t = StubTranscriber::new(
+        STUB_ID,
+        Behavior {
+            emit_progress: false,
+            ..Behavior::good()
+        },
+    );
+    let err = check_transcriber_progress(&t, &cheap()).unwrap_err();
+    assert!(err.contains("no Progress::Step events"), "got: {err}");
 }
 
 #[test]

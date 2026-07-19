@@ -13,8 +13,8 @@
 //! cancellation check, one modality over.
 
 use gen_core::{
-    Error, TranscribeOptions, TranscribeRequest, TranscribeSampling, TranscribeTask, Transcriber,
-    TranscriptOutput,
+    Error, Progress, TranscribeOptions, TranscribeRequest, TranscribeSampling, TranscribeTask,
+    Transcriber, TranscriptOutput,
 };
 
 /// Parameters for a transcriber conformance run — one in-capability audio clip the positive checks
@@ -161,6 +161,28 @@ pub fn check_transcriber_output(
     Ok(())
 }
 
+/// **Progress.** A completed transcription emits at least one `Progress::Step`, with a constant
+/// `total` and a strictly-increasing `current` in `1..=total` — enough to drive a progress bar and
+/// make cooperative cancellation observable. ASR decoding is phase/token based (not a fixed step
+/// count), so this is the same lax `check_progress_steps` monotonicity check the captioner suite
+/// uses, not the generator's exact-`1..=total` check. Long-running ASR is the canonical progress
+/// case, so a
+/// transcriber that reports no (or non-monotonic) progress fails here.
+pub fn check_transcriber_progress(
+    t: &dyn Transcriber,
+    profile: &TranscriberProfile,
+) -> Result<(), String> {
+    let id = t.descriptor().id;
+    let mut steps: Vec<(u32, u32)> = Vec::new();
+    t.transcribe(&base_request(profile), &mut |p| {
+        if let Progress::Step { current, total } = p {
+            steps.push((current, total));
+        }
+    })
+    .map_err(|e| format!("progress[{id}]: transcribe() failed on the cheap request: {e}"))?;
+    crate::check_progress_steps(id, "transcribe()", &steps)
+}
+
 /// **Pre-inference cancellation.** A transcriber handed an already-cancelled request must return the
 /// **typed** `Err(Error::Canceled)` (not a stringified `Msg`, and not an `Ok` transcript) — it must
 /// check the flag before running the encoder/decoder. Mirrors
@@ -216,8 +238,9 @@ pub fn transcriber_conformance(
     let t: &dyn Transcriber = t.as_ref();
 
     type Check = fn(&dyn Transcriber, &TranscriberProfile) -> Result<(), String>;
-    let checks: [Check; 3] = [
+    let checks: [Check; 4] = [
         check_transcriber_validate,
+        check_transcriber_progress,
         check_transcriber_output,
         check_transcriber_cancellation,
     ];
