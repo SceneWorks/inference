@@ -1,0 +1,47 @@
+[package]
+name = "candle-audio-whisper"
+version = "0.0.0"
+edition = "2021"
+description = "OpenAI Whisper (MIT) automatic-speech-recognition provider for the SceneWorks Candle audio lane (sc-12850) — the first real audio→text Transcriber: AudioTrack → log-mel → encoder → autoregressive decoder (language/task/timestamp tokens) → TranscriptOutput, reusing candle-transformers' Whisper encoder+decoder+mel at the pinned candle revision. No Python at runtime."
+license = "Apache-2.0"
+repository = "https://github.com/SceneWorks/inference"
+keywords = ["candle", "asr", "whisper", "audio", "speech"]
+categories = ["science"]
+
+[dependencies]
+# The shared candle audio commons (device seam, pinned-SHA hub resolution, `AudioError →
+# gen_core::Error` bridge). Re-exports `gen_core` and `candle_core`, so this crate resolves the SAME
+# candle build + gen-core rev as the catalog it registers into.
+candle-audio = { path = "../candle-audio" }
+# candle-nn at the workspace's pinned candle revision (VarBuilder for the safetensors checkpoint).
+candle-nn = { workspace = true }
+# The upstream Whisper implementation (encoder + decoder + log-mel front-end) at the pinned candle
+# revision — REUSED wholesale per the epic DoD rather than re-ported. This crate owns only the
+# gen-core Transcriber adapter, the pinned-SHA hub resolution, and the autoregressive decode loop.
+candle-transformers = { workspace = true }
+# Snapshot-preparer contract types for the audio lane's Whisper-aware preparer probe
+# (`SnapshotPreparerRegistration` lives in core-llm; composed by candle-audio-catalog).
+core-llm = { workspace = true }
+# Whisper's BPE tokenizer (openai/whisper-* ships tokenizer.json). The workspace pin is 0.22.
+tokenizers = { workspace = true }
+# config.json parsing (the whisper `Config` block).
+serde_json = { workspace = true }
+# Seeded sampling for temperature > 0 decoding (the reproducibility law: same request+seed ⇒ the
+# same transcript) via `rand::distr::weighted::WeightedIndex`. Same crate the media/TTS providers
+# use for seeded draws.
+rand = { workspace = true }
+
+[dev-dependencies]
+# HF-cache snapshot resolution for the `#[ignore]`d real-weight conformance test.
+candle-audio = { path = "../candle-audio", features = ["testkit"] }
+# The merged Kokoro TTS provider drives the round-trip DoD: known text → Kokoro WAV → Whisper
+# transcript → CER assertion (Kokoro TTS → Whisper ASR round-trip).
+candle-audio-kokoro = { path = "../candle-audio-kokoro" }
+
+[features]
+default = []
+# Apple Metal GPU backend — forwarded to the shared audio commons + candle-transformers. Not in
+# `default` (the audio lane ships CPU-first everywhere; see audio-backend-strategy.md).
+metal = ["candle-audio/metal", "candle-transformers/metal"]
+# NVIDIA CUDA backend — forwarded likewise. Not in `default`.
+cuda = ["candle-audio/cuda", "candle-transformers/cuda"]

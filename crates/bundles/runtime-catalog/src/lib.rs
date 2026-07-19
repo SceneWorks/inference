@@ -195,10 +195,10 @@ impl RuntimeCatalog {
         self.audio.as_ref().map(|audio| audio.backend)
     }
 
-    /// The validated audio provider registry (generators + voice embedders + audio transforms),
-    /// when this bundle declares an audio lane. Audio generators use the ordinary generator
-    /// contract; load by id through this registry's `load` / `load_voice_embedder` /
-    /// `load_audio_transform` methods.
+    /// The validated audio provider registry (generators + voice embedders + audio transforms +
+    /// transcribers), when this bundle declares an audio lane. Audio generators use the ordinary
+    /// generator contract; load by id through this registry's `load` / `load_voice_embedder` /
+    /// `load_audio_transform` / `load_transcriber` methods.
     pub fn audio(&self) -> Option<&ProviderRegistry> {
         self.audio.as_ref().map(|audio| &audio.registry)
     }
@@ -273,6 +273,12 @@ impl RuntimeCatalog {
                 .audio
                 .iter()
                 .flat_map(|audio| audio.registry.audio_transforms())
+                .map(|registration| (registration.descriptor)().id.to_string())
+                .collect(),
+            audio_transcriber_ids: self
+                .audio
+                .iter()
+                .flat_map(|audio| audio.registry.transcribers())
                 .map(|registration| (registration.descriptor)().id.to_string())
                 .collect(),
             audio_snapshot_preparer_backends: self
@@ -377,9 +383,9 @@ impl RuntimeCatalog {
     /// - every audio generator advertises [`gen_core::Modality::Audio`] (sc-12834/sc-12835) — the
     ///   lane exists for the audio modality, not as a side door for cross-backend image/video
     ///   providers (the media registry symmetrically forbids `Modality::Audio`, see `validate`);
-    /// - the audio registry admits only audio-shaped kinds — generators, voice embedders, and
-    ///   audio transforms, each on the audio backend; the image/text/trainer/captioner kinds may
-    ///   not ride in through the audio seam;
+    /// - the audio registry admits only audio-shaped kinds — generators, voice embedders,
+    ///   audio transforms, and transcribers (audio→text ASR, sc-12850), each on the audio backend;
+    ///   the image/text/trainer/captioner kinds may not ride in through the audio seam;
     /// - audio generator ids do not collide with media generator ids (consumers key loads by id
     ///   across both registries);
     /// - the audio registry passes the same weights-free descriptor conformance sweep as media,
@@ -448,6 +454,19 @@ impl RuntimeCatalog {
                 ));
             }
         }
+        // Transcribers (audio→text, the Captioner-analog kind, sc-12850) are the fourth admitted
+        // audio-shaped kind: a Transcriber consumes an AudioTrack on the candle audio backend, so it
+        // rides the lane exactly like the generators, voice embedders, and audio transforms — NOT
+        // the media registry where captioners (image→text on the media backend) surface.
+        for registration in audio.registry.transcribers() {
+            let descriptor = (registration.descriptor)();
+            if descriptor.backend != audio.backend {
+                errors.push(format!(
+                    "audio transcriber '{}' uses backend '{}' in the '{}' audio lane",
+                    descriptor.id, descriptor.backend, audio.backend
+                ));
+            }
+        }
 
         let forbidden_kinds = [
             ("transform", audio.registry.transforms().count()),
@@ -460,7 +479,7 @@ impl RuntimeCatalog {
             if count != 0 {
                 errors.push(format!(
                     "audio registry carries {count} {kind} registration(s) — the audio lane admits \
-                     only generators, voice embedders, and audio transforms"
+                     only generators, voice embedders, audio transforms, and transcribers"
                 ));
             }
         }
@@ -518,6 +537,12 @@ pub struct RuntimeCatalogSnapshot {
     /// the audio registry. Additive field (sc-12844) — empty when the bundle declares no audio lane
     /// or ships no audio transform.
     pub audio_transform_ids: Vec<String>,
+    /// Audio transcriber ids (audio→text ASR, the Captioner-analog kind, sc-12850), in stable
+    /// catalog order — each a `load_transcriber` key on the audio registry. A Transcriber rides the
+    /// audio lane (candle backend) rather than the media registry where captioners surface, so it
+    /// surfaces here beside the other audio-shaped kinds. Additive field (sc-12850) — empty when the
+    /// bundle declares no audio lane or ships no transcriber.
+    pub audio_transcriber_ids: Vec<String>,
     /// The backend of each snapshot preparer carried **in the audio lane** (all equal to
     /// `audio_backend` — `"candle"` on every platform under the sc-12901 strategy). Additive
     /// field (sc-12835) — empty when the bundle declares no audio lane.
@@ -542,6 +567,7 @@ impl RuntimeCatalogSnapshot {
             "audio_generator_ids": self.audio_generator_ids,
             "audio_voice_embedder_ids": self.audio_voice_embedder_ids,
             "audio_transform_ids": self.audio_transform_ids,
+            "audio_transcriber_ids": self.audio_transcriber_ids,
             "audio_snapshot_preparer_backends": self.audio_snapshot_preparer_backends,
         })
     }
@@ -725,6 +751,7 @@ mod tests {
         assert!(snapshot.audio_generator_ids.is_empty());
         assert!(snapshot.audio_voice_embedder_ids.is_empty());
         assert!(snapshot.audio_transform_ids.is_empty());
+        assert!(snapshot.audio_transcriber_ids.is_empty());
         assert!(snapshot.audio_snapshot_preparer_backends.is_empty());
         assert!(snapshot.to_json()["audio_backend"].is_null());
     }
@@ -800,12 +827,34 @@ mod tests {
         .unwrap();
         assert!(error.to_string().contains(
             "audio registry carries 1 text embedder registration(s) — the audio lane admits only \
-             generators, voice embedders, and audio transforms"
+             generators, voice embedders, audio transforms, and transcribers"
         ));
     }
 
-    /// A voice embedder (sc-12844) and an audio transform (sc-12839) are admitted to the audio lane
-    /// and surfaced in the snapshot beside the generators — the sc-12844 lane-surfacing decision.
+    fn candle_transcriber_descriptor() -> gen_core::TranscriberDescriptor {
+        gen_core::TranscriberDescriptor {
+            id: "stub-asr",
+            family: "asr",
+            backend: "candle",
+            capabilities: gen_core::TranscribeCapabilities {
+                supports_segment_timestamps: true,
+                max_audio_seconds: 30.0,
+                max_new_tokens: 448,
+                ..Default::default()
+            },
+        }
+    }
+    fn never_load_transcriber(
+        _spec: &gen_core::LoadSpec,
+    ) -> gen_core::Result<Box<dyn gen_core::Transcriber>> {
+        Err(gen_core::Error::Msg(
+            "not used by catalog tests".to_string(),
+        ))
+    }
+
+    /// A voice embedder (sc-12844), an audio transform (sc-12839), and a transcriber (sc-12850) are
+    /// admitted to the audio lane and surfaced in the snapshot beside the generators — the audio
+    /// Captioner-analog lane-surfacing decision.
     #[test]
     fn admits_and_surfaces_voice_embedder_and_audio_transform() {
         fn candle_voice_embedder_descriptor() -> gen_core::VoiceEmbedderDescriptor {
@@ -854,6 +903,10 @@ mod tests {
                 descriptor: candle_audio_transform_descriptor,
                 load: never_load_audio_transform,
             })
+            .register_transcriber(gen_core::TranscriberRegistration {
+                descriptor: candle_transcriber_descriptor,
+                load: never_load_transcriber,
+            })
             .build();
 
         let catalog = RuntimeCatalog::try_new_with_audio(
@@ -869,6 +922,7 @@ mod tests {
         assert_eq!(snapshot.audio_generator_ids, ["stub-audio"]);
         assert_eq!(snapshot.audio_voice_embedder_ids, ["stub-voice-embed"]);
         assert_eq!(snapshot.audio_transform_ids, ["stub-voice-convert"]);
+        assert_eq!(snapshot.audio_transcriber_ids, ["stub-asr"]);
         assert_eq!(
             snapshot.to_json()["audio_voice_embedder_ids"][0],
             "stub-voice-embed"
@@ -877,6 +931,55 @@ mod tests {
             snapshot.to_json()["audio_transform_ids"][0],
             "stub-voice-convert"
         );
+        assert_eq!(snapshot.to_json()["audio_transcriber_ids"][0], "stub-asr");
+    }
+
+    /// A transcriber off the declared audio backend is rejected (single-backend lane), exactly like
+    /// the voice-embedder and audio-transform kinds.
+    #[test]
+    fn rejects_transcriber_off_the_audio_backend() {
+        fn mlx_transcriber_descriptor() -> gen_core::TranscriberDescriptor {
+            gen_core::TranscriberDescriptor {
+                id: "stub-asr",
+                family: "asr",
+                backend: "mlx",
+                capabilities: gen_core::TranscribeCapabilities {
+                    supports_segment_timestamps: true,
+                    max_audio_seconds: 30.0,
+                    max_new_tokens: 448,
+                    ..Default::default()
+                },
+            }
+        }
+        fn never_load_transcriber(
+            _spec: &gen_core::LoadSpec,
+        ) -> gen_core::Result<Box<dyn gen_core::Transcriber>> {
+            Err(gen_core::Error::Msg(
+                "not used by catalog tests".to_string(),
+            ))
+        }
+
+        let media = gen_core::ProviderRegistryBuilder::new().build();
+        let audio = gen_core::ProviderRegistryBuilder::new()
+            .register_transcriber(gen_core::TranscriberRegistration {
+                descriptor: mlx_transcriber_descriptor,
+                load: never_load_transcriber,
+            })
+            .build();
+
+        let error = RuntimeCatalog::try_new_with_audio(
+            "test",
+            "mlx",
+            media,
+            empty_text(),
+            mlx_preparers(),
+            candle_audio_lane(audio),
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains(
+            "audio transcriber 'stub-asr' uses backend 'mlx' in the 'candle' audio lane"
+        ));
     }
 
     /// A voice embedder off the declared audio backend is rejected (single-backend lane).

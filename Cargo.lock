@@ -234,6 +234,7 @@ dependencies = [
  "candle-audio-kokoro",
  "candle-audio-moss-sfx",
  "candle-audio-openvoice",
+ "candle-audio-whisper",
  "candle-llm",
 ]
 
@@ -303,6 +304,20 @@ dependencies = [
  "candle-nn",
  "core-llm",
  "serde_json",
+]
+
+[[package]]
+name = "candle-audio-whisper"
+version = "0.0.0"
+dependencies = [
+ "candle-audio",
+ "candle-audio-kokoro",
+ "candle-nn",
+ "candle-transformers",
+ "core-llm",
+ "rand 0.9.5",
+ "serde_json",
+ "tokenizers 0.22.2",
 ]
 
 [[package]]
