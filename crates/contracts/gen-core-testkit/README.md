@@ -19,6 +19,25 @@ exactly as it does on a backend lane against a real family. Both backends run it
 provider that silently ignores `CancelFlag` or reports no progress becomes a CI failure
 instead of a field report.
 
+## Contracts covered
+
+One shared conformance suite per contract, each with an in-crate stub that self-tests it (a
+compliant stub passes; a deliberately-broken stub — one that ignores cancel, returns a
+wrong-dimension embedding, or produces the wrong stem count — fails):
+
+- **`Generator`** (image/video) — `conformance` / `Profile`;
+- **`Generator` under `Modality::Audio`** (TTS / SFX / music) — `audio_conformance` /
+  `AudioProfile` (validates through the size-skipping audio floor; asserts a well-formed
+  `AudioTrack`, audio-surface capability gaps as typed errors, cancel/progress/seed);
+- **`Trainer`** — `trainer_conformance` / `TrainerProfile`;
+- **`Captioner`** (image→text) — `captioner_conformance` / `CaptionerProfile`;
+- **`Transcriber`** (audio→text ASR) — `transcriber_conformance` / `TranscriberProfile`;
+- **`VoiceEmbedder`** (speaker identity) — `voice_embedder_conformance` / `VoiceEmbedderProfile`;
+- **`AudioTransform`** (voice conversion / stem separation / super-resolution) —
+  `audio_transform_conformance` / `AudioTransformProfile` (output cardinality by kind);
+- **`AudioEmbedder`** (CLAP-style joint audio↔text) — `audio_embedder_conformance` /
+  `AudioEmbedderProfile` (same-dim, L2-normalized, finite vectors).
+
 ## Usage
 
 Family crates dev-depend on it and run their real model through the suite:
@@ -36,6 +55,28 @@ gen_core_testkit::trainer_conformance(
 gen_core_testkit::captioner_conformance(
     || registry.load_captioner("<captioner-id>", &spec).unwrap(),
     &gen_core_testkit::CaptionerProfile::cheap(),
+);
+
+// audio contracts — a text→audio generator and the four audio-trait providers:
+gen_core_testkit::audio_conformance(
+    || registry.load("<audio-generator-id>", &spec).unwrap(),
+    &gen_core_testkit::AudioProfile::cheap(),
+);
+gen_core_testkit::transcriber_conformance(
+    || registry.load_transcriber("whisper", &spec).unwrap(),
+    &gen_core_testkit::TranscriberProfile::cheap(),
+);
+gen_core_testkit::voice_embedder_conformance(
+    || registry.load_voice_embedder("chatterbox", &spec).unwrap(),
+    &gen_core_testkit::VoiceEmbedderProfile::cheap(),
+);
+gen_core_testkit::audio_transform_conformance(
+    || registry.load_audio_transform("openvoice", &spec).unwrap(),
+    &gen_core_testkit::AudioTransformProfile::cheap(),
+);
+gen_core_testkit::audio_embedder_conformance(
+    || registry.load_audio_embedder("clap", &spec).unwrap(),
+    &gen_core_testkit::AudioEmbedderProfile::cheap(),
 );
 ```
 

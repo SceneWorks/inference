@@ -1,0 +1,345 @@
+//! The audio-generator testkit verifying itself: a configurable in-crate stub audio generator drives
+//! each conformance check, and one deliberately-broken variant per check proves the check fires
+//! (sc-12853). The stub is pure-host (no tensor library), so these run on the Linux gen-core lane.
+
+use super::*;
+use gen_core::registry::ModelRegistration;
+use gen_core::runtime::LoadSpec;
+use gen_core::{
+    AudioTrack, Capabilities, Error, GenerationOutput, GenerationRequest, Generator, Image,
+    Modality, ModelDescriptor, Progress,
+};
+use std::cell::Cell;
+
+const STUB_ID: &str = "testkit_audio_stub";
+const UNREG_ID: &str = "testkit_audio_unregistered_stub";
+
+/// Which contract guarantees the stub upholds. `good()` upholds all; each broken-stub test flips
+/// exactly one to false and asserts the matching check fails.
+#[derive(Clone, Copy)]
+struct Behavior {
+    honest_validate: bool,
+    emit_progress: bool,
+    decoding_events: u32,
+    honor_cancel: bool,
+    typed_cancel: bool,
+    deterministic: bool,
+    /// Emits `GenerationOutput::Audio` (vs. wrongly emitting an image).
+    audio_output: bool,
+    /// Emits a well-formed track (vs. a zero-sample-rate/empty one).
+    well_formed_track: bool,
+}
+
+impl Behavior {
+    fn good() -> Self {
+        Self {
+            honest_validate: true,
+            emit_progress: true,
+            decoding_events: 1,
+            honor_cancel: true,
+            typed_cancel: true,
+            deterministic: true,
+            audio_output: true,
+            well_formed_track: true,
+        }
+    }
+}
+
+struct StubAudioGen {
+    desc: ModelDescriptor,
+    behavior: Behavior,
+    runs: Cell<u32>,
+}
+
+fn stub_caps() -> Capabilities {
+    Capabilities {
+        max_count: 4,
+        // Nominal, unused-for-audio size bounds: the weights-free descriptor sweep
+        // (`descriptor_conformance_errors`) requires `1 <= min_size <= max_size` for EVERY generator
+        // regardless of modality (it predates Modality::Audio and does not exempt it), so a valid
+        // audio descriptor must still set non-zero bounds even though `validate_request_audio` skips
+        // the size range entirely. The oversize positive check below (width far above max_size, still
+        // accepted) is exactly what proves the audio floor ignores these.
+        min_size: 1,
+        max_size: 1024,
+        audio_sample_rates: vec![24_000],
+        audio_voices: vec!["narrator"],
+        audio_languages: vec!["en"],
+        max_audio_duration_secs: Some(30.0),
+        ..Default::default()
+    }
+}
+
+fn stub_desc(id: &'static str) -> ModelDescriptor {
+    ModelDescriptor {
+        id,
+        family: "testkit",
+        backend: "stub",
+        modality: Modality::Audio,
+        capabilities: stub_caps(),
+    }
+}
+
+impl StubAudioGen {
+    fn new(id: &'static str, behavior: Behavior) -> Self {
+        Self {
+            desc: stub_desc(id),
+            behavior,
+            runs: Cell::new(0),
+        }
+    }
+    fn boxed(id: &'static str, behavior: Behavior) -> Box<dyn Generator> {
+        Box::new(Self::new(id, behavior))
+    }
+}
+
+impl Generator for StubAudioGen {
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.desc
+    }
+
+    fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
+        if self.behavior.honest_validate {
+            self.desc
+                .capabilities
+                .validate_request_audio(self.desc.id, req)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationOutput> {
+        if self.behavior.honest_validate {
+            self.validate(req)?;
+        }
+        let total = req.steps.unwrap_or(2);
+        let run = self.runs.get();
+        self.runs.set(run + 1);
+        for i in 1..=total {
+            if self.behavior.honor_cancel && req.cancel.is_cancelled() {
+                return Err(if self.behavior.typed_cancel {
+                    Error::Canceled
+                } else {
+                    Error::Msg("audio generation cancelled".into())
+                });
+            }
+            if self.behavior.emit_progress {
+                on_progress(Progress::Step { current: i, total });
+            }
+        }
+        for _ in 0..self.behavior.decoding_events {
+            on_progress(Progress::Decoding);
+        }
+        // Output pixels/samples depend only on the seed (good) or drift per call (broken).
+        let fill = if self.behavior.deterministic {
+            req.seed.unwrap_or(0) as f32
+        } else {
+            run as f32
+        };
+        if !self.behavior.audio_output {
+            // A misconfigured audio model that wrongly returns an image.
+            return Ok(GenerationOutput::Images(vec![Image {
+                width: 4,
+                height: 4,
+                pixels: vec![0u8; 4 * 4 * 3],
+            }]));
+        }
+        let track = if self.behavior.well_formed_track {
+            AudioTrack {
+                samples: vec![fill; 480],
+                sample_rate: 24_000,
+                channels: 1,
+                ..Default::default()
+            }
+        } else {
+            // Zero sample rate + empty samples — the malformed-output class.
+            AudioTrack {
+                samples: Vec::new(),
+                sample_rate: 0,
+                channels: 1,
+                ..Default::default()
+            }
+        };
+        Ok(GenerationOutput::Audio(track))
+    }
+}
+
+fn stub_descriptor() -> ModelDescriptor {
+    stub_desc(STUB_ID)
+}
+fn stub_load(_spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    Ok(StubAudioGen::boxed(STUB_ID, Behavior::good()))
+}
+const STUB_REGISTRATION: ModelRegistration = ModelRegistration {
+    descriptor: stub_descriptor,
+    load: stub_load,
+    footprint: None,
+};
+
+fn registry() -> gen_core::ProviderRegistry {
+    gen_core::ProviderRegistryBuilder::new()
+        .register_generator(STUB_REGISTRATION)
+        .build()
+        .expect("stub audio registry should build")
+}
+
+fn cheap() -> AudioProfile {
+    AudioProfile::cheap()
+}
+
+#[test]
+fn good_stub_passes_full_conformance() {
+    audio_conformance(|| StubAudioGen::boxed(STUB_ID, Behavior::good()), &cheap());
+}
+
+#[test]
+fn good_stub_passes_every_check_individually() {
+    let g = StubAudioGen::new(STUB_ID, Behavior::good());
+    check_audio_validate_honesty(&g, &cheap()).unwrap();
+    check_audio_output(&g, &cheap()).unwrap();
+    check_audio_progress(&g, &cheap()).unwrap();
+    check_audio_progress_contract(&g, &cheap()).unwrap();
+    check_audio_cancellation(&g, &cheap()).unwrap();
+    check_audio_precancellation(&g, &cheap()).unwrap();
+    check_audio_seed_determinism(&g, &cheap()).unwrap();
+    crate::check_registry_roundtrip(&registry(), &g).unwrap();
+}
+
+#[test]
+fn dishonest_validate_fails_validate_check() {
+    let g = StubAudioGen::new(
+        STUB_ID,
+        Behavior {
+            honest_validate: false,
+            ..Behavior::good()
+        },
+    );
+    // A rubber-stamp validate accepts an unadvertised voice instead of the typed Unsupported.
+    let err = check_audio_validate_honesty(&g, &cheap()).unwrap_err();
+    assert!(err.contains("was accepted by validate()"), "got: {err}");
+}
+
+#[test]
+fn missing_progress_fails_progress_check() {
+    let g = StubAudioGen::new(
+        STUB_ID,
+        Behavior {
+            emit_progress: false,
+            ..Behavior::good()
+        },
+    );
+    assert!(check_audio_progress(&g, &cheap()).is_err());
+}
+
+#[test]
+fn ignoring_cancel_fails_cancellation_check() {
+    // The DoD's headline broken-stub: an audio generator that never returns Canceled.
+    let g = StubAudioGen::new(
+        STUB_ID,
+        Behavior {
+            honor_cancel: false,
+            ..Behavior::good()
+        },
+    );
+    let err = check_audio_cancellation(&g, &cheap()).unwrap_err();
+    assert!(err.contains("ran to completion"), "got: {err}");
+}
+
+#[test]
+fn stringified_cancel_fails_cancellation_check() {
+    let g = StubAudioGen::new(
+        STUB_ID,
+        Behavior {
+            typed_cancel: false,
+            ..Behavior::good()
+        },
+    );
+    let err = check_audio_cancellation(&g, &cheap()).unwrap_err();
+    assert!(err.contains("typed Err(Error::Canceled)"), "got: {err}");
+}
+
+#[test]
+fn ignoring_cancel_fails_precancellation_check() {
+    let g = StubAudioGen::new(
+        STUB_ID,
+        Behavior {
+            honor_cancel: false,
+            ..Behavior::good()
+        },
+    );
+    let err = check_audio_precancellation(&g, &cheap()).unwrap_err();
+    assert!(err.contains("returned Ok"), "got: {err}");
+}
+
+#[test]
+fn nondeterministic_fails_seed_check() {
+    let g = StubAudioGen::new(
+        STUB_ID,
+        Behavior {
+            deterministic: false,
+            ..Behavior::good()
+        },
+    );
+    assert!(check_audio_seed_determinism(&g, &cheap()).is_err());
+}
+
+#[test]
+fn wrong_output_kind_fails_output_check() {
+    let g = StubAudioGen::new(
+        STUB_ID,
+        Behavior {
+            audio_output: false,
+            ..Behavior::good()
+        },
+    );
+    let err = check_audio_output(&g, &cheap()).unwrap_err();
+    assert!(
+        err.contains("must emit GenerationOutput::Audio"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn malformed_track_fails_output_check() {
+    let g = StubAudioGen::new(
+        STUB_ID,
+        Behavior {
+            well_formed_track: false,
+            ..Behavior::good()
+        },
+    );
+    let err = check_audio_output(&g, &cheap()).unwrap_err();
+    assert!(err.contains("sample_rate is 0"), "got: {err}");
+}
+
+#[test]
+fn unregistered_id_fails_registry_check() {
+    let g = StubAudioGen::new(UNREG_ID, Behavior::good());
+    assert!(crate::check_registry_roundtrip(&registry(), &g).is_err());
+}
+
+#[test]
+fn registry_sweep_passes_for_the_registered_stub() {
+    crate::registry_conformance(&registry());
+}
+
+#[test]
+#[should_panic(expected = "audio conformance FAILED")]
+fn conformance_panics_on_a_broken_stub() {
+    audio_conformance(
+        || {
+            StubAudioGen::boxed(
+                STUB_ID,
+                Behavior {
+                    honor_cancel: false,
+                    ..Behavior::good()
+                },
+            )
+        },
+        &cheap(),
+    );
+}
