@@ -154,10 +154,14 @@ fn prepared_q4_snapshot_runs_full_vlm() {
         ..Default::default()
     };
     let mut streamed_tokens = 0u32;
+    let mut streamed_text = String::new();
     let mut done_usage = None;
     let generated = provider
         .generate(&request, &mut |event| match event {
-            core_llm::StreamEvent::Token { .. } => streamed_tokens += 1,
+            core_llm::StreamEvent::Token { text, .. } => {
+                streamed_tokens += 1;
+                streamed_text.push_str(&text);
+            }
             core_llm::StreamEvent::Done { usage, .. } => {
                 assert!(
                     done_usage.is_none(),
@@ -178,6 +182,14 @@ fn prepared_q4_snapshot_runs_full_vlm() {
     assert_eq!(
         streamed_tokens, generated.usage.generated_tokens,
         "streamed Token count must equal returned generated-token usage"
+    );
+    assert!(
+        !streamed_text.is_empty(),
+        "public streaming contract must emit non-empty caption text"
+    );
+    assert_eq!(
+        streamed_text, generated.text,
+        "concatenated Token text must equal returned generation text"
     );
     assert_eq!(
         done_usage,
