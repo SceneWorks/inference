@@ -13,9 +13,17 @@ import tempfile
 from pathlib import Path, PurePosixPath
 
 try:
-    from scripts.release.build_release import validate_tag
+    from scripts.release.build_release import (
+        MODEL_LICENSES_KIND,
+        validate_model_weight_licenses,
+        validate_tag,
+    )
 except ModuleNotFoundError:  # Direct `python scripts/release/verify_release.py` invocation.
-    from build_release import validate_tag
+    from build_release import (
+        MODEL_LICENSES_KIND,
+        validate_model_weight_licenses,
+        validate_tag,
+    )
 
 
 def sha256_file(path: Path) -> str:
@@ -60,6 +68,24 @@ def verify_sbom(bundle: Path, manifest: dict) -> None:
             raise RuntimeError(f"unknown relationship source: {relationship['spdxElementId']}")
         if relationship["relatedSpdxElement"] not in identifiers:
             raise RuntimeError(f"unknown relationship target: {relationship['relatedSpdxElement']}")
+
+
+def verify_model_licenses(bundle: Path, manifest: dict) -> None:
+    """Assert the model-weight-license manifest is present in the bundle and complete (sc-13332).
+
+    Every shipped audio provider's pinned weight-checkpoint license must be recorded so SceneWorks
+    can surface it. The registry-completeness authority is the Rust catalog ship-gate
+    (`every_shipped_provider_has_a_weight_license`); this release-level gate confirms the emitted
+    artifact is present and that each entry carries its required fields (and any non-commercial
+    entry its restriction note).
+    """
+    artifacts = [
+        artifact for artifact in manifest["artifacts"] if artifact["kind"] == MODEL_LICENSES_KIND
+    ]
+    if len(artifacts) != 1:
+        raise RuntimeError("manifest must contain exactly one model-licenses artifact")
+    document = json.loads((bundle / artifacts[0]["name"]).read_text(encoding="utf-8"))
+    validate_model_weight_licenses(document)
 
 
 def verify_workspace_manifest(manifest: dict) -> None:
@@ -147,6 +173,7 @@ def main() -> int:
         raise RuntimeError("release manifest records dirty inputs")
     verify_workspace_manifest(manifest)
     verify_sbom(bundle, manifest)
+    verify_model_licenses(bundle, manifest)
     if not args.skip_smoke:
         smoke_source_archive(bundle, manifest, args.offline)
     print("release verification: OK")

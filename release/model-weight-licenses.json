@@ -1,0 +1,69 @@
+{
+  "schema_version": 1,
+  "kind": "model-weight-licenses",
+  "providers": [
+    {
+      "provider_id": "acestep_v15_turbo",
+      "spdx_id": "MIT",
+      "license_name": "MIT License",
+      "source_url": "https://huggingface.co/ACE-Step/acestep-v15-xl-turbo-diffusers",
+      "commercial_use": true,
+      "attribution": "ACE-Step v1.5 XL Turbo © ACE-Step — licensed under MIT",
+      "restriction": "Bundled text_encoder (Qwen3-Embedding-0.6B) is redistributed under Apache-2.0."
+    },
+    {
+      "provider_id": "chatterbox_ve",
+      "spdx_id": "MIT",
+      "license_name": "MIT License",
+      "source_url": "https://huggingface.co/ResembleAI/chatterbox",
+      "commercial_use": true,
+      "attribution": "Chatterbox © Resemble AI — licensed under MIT",
+      "restriction": null
+    },
+    {
+      "provider_id": "clap_htsat_unfused",
+      "spdx_id": "Apache-2.0",
+      "license_name": "Apache License 2.0",
+      "source_url": "https://huggingface.co/laion/clap-htsat-unfused",
+      "commercial_use": true,
+      "attribution": "CLAP (HTSAT-unfused) © LAION — licensed under Apache-2.0",
+      "restriction": null
+    },
+    {
+      "provider_id": "kokoro_82m",
+      "spdx_id": "Apache-2.0",
+      "license_name": "Apache License 2.0",
+      "source_url": "https://huggingface.co/hexgrad/Kokoro-82M",
+      "commercial_use": true,
+      "attribution": "Kokoro-82M © hexgrad — licensed under Apache-2.0",
+      "restriction": null
+    },
+    {
+      "provider_id": "moss_sfx_v2",
+      "spdx_id": "Apache-2.0",
+      "license_name": "Apache License 2.0",
+      "source_url": "https://huggingface.co/OpenMOSS-Team/MOSS-SoundEffect-v2.0",
+      "commercial_use": true,
+      "attribution": "MOSS-SoundEffect-v2.0 © OpenMOSS Team — licensed under Apache-2.0",
+      "restriction": null
+    },
+    {
+      "provider_id": "openvoice_v2",
+      "spdx_id": "MIT",
+      "license_name": "MIT License",
+      "source_url": "https://huggingface.co/myshell-ai/OpenVoiceV2",
+      "commercial_use": true,
+      "attribution": "OpenVoice V2 © MyShell.ai — licensed under MIT",
+      "restriction": null
+    },
+    {
+      "provider_id": "whisper_base",
+      "spdx_id": "Apache-2.0",
+      "license_name": "Apache License 2.0",
+      "source_url": "https://huggingface.co/openai/whisper-base",
+      "commercial_use": true,
+      "attribution": "Whisper © OpenAI — licensed under Apache-2.0",
+      "restriction": null
+    }
+  ]
+}

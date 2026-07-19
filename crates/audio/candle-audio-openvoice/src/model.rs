@@ -52,6 +52,26 @@ pub const FAMILY: &str = "openvoice";
 pub const HUB_REPO: &str = "myshell-ai/OpenVoiceV2";
 pub const HUB_REVISION: &str = "f36e7edfe1684461a8343844af60babc2efbb727";
 
+/// The license of the pinned OpenVoice V2 weight checkpoint (sc-13332) — surfaced for SceneWorks'
+/// end-product licenses page. MIT (permissive), verified against the `myshell-ai/OpenVoiceV2`
+/// model card (both V1 and V2 relicensed to MIT in April 2024).
+pub const WEIGHT_LICENSE: candle_audio::gen_core::WeightLicense =
+    candle_audio::gen_core::WeightLicense {
+        spdx_id: "MIT",
+        name: "MIT License",
+        source_url: "https://huggingface.co/myshell-ai/OpenVoiceV2",
+        attribution: Some("OpenVoice V2 © MyShell.ai — licensed under MIT"),
+        commercial_use: true,
+        restriction: None,
+    };
+
+/// This provider's weight-license entry (keyed by [`MODEL_ID`]) for catalog aggregation.
+pub const WEIGHT_LICENSE_ENTRY: candle_audio::gen_core::WeightLicenseEntry =
+    candle_audio::gen_core::WeightLicenseEntry {
+        provider_id: MODEL_ID,
+        license: WEIGHT_LICENSE,
+    };
+
 /// The converter files inside the pinned repo (both live under `converter/`).
 pub const CONVERTER_CONFIG: &str = "converter/config.json";
 pub const CONVERTER_CHECKPOINT: &str = "converter/checkpoint.pth";

@@ -23,8 +23,10 @@
 //! - [`prepare`] — the audio-lane snapshot-preparation accommodation (a validated passthrough;
 //!   Whisper snapshots describe an ASR arch the LLM preparer should not own).
 //!
-//! Weights resolve through the audio lane's pinned-SHA hub path: `openai/whisper-base` (MIT) at an
-//! immutable commit, never a mutable ref. **No Python at runtime.**
+//! Weights resolve through the audio lane's pinned-SHA hub path: `openai/whisper-base`
+//! (Apache-2.0 — the checkpoint's model-card license, distinct from the MIT license on OpenAI's
+//! Whisper *source* repository) at an immutable commit, never a mutable ref. **No Python at
+//! runtime.**
 
 pub use candle_audio;
 pub use candle_audio::gen_core;
@@ -37,6 +39,12 @@ pub mod prepare;
 pub use model::{
     descriptor, load, resolve_pinned_snapshot, HUB_REPO, HUB_REVISION, MODEL_ID, REGISTRATION,
 };
+pub use model::{WEIGHT_LICENSE, WEIGHT_LICENSE_ENTRY};
+
+/// This crate's model-weight-license entries for catalog aggregation (sc-13332) — one row keyed by
+/// [`MODEL_ID`]. The audio catalog concatenates every provider's slice into the model-licenses
+/// manifest SceneWorks lists on its end-product licenses page.
+pub const WEIGHT_LICENSES: &[gen_core::WeightLicenseEntry] = &[model::WEIGHT_LICENSE_ENTRY];
 
 /// Add the Whisper transcriber to an explicit audio registry builder (catalog composition).
 pub fn register_providers(

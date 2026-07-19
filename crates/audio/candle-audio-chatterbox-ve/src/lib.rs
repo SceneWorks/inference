@@ -45,6 +45,12 @@ pub use model::{
     descriptor, load, resolve_pinned_file, ChatterboxVoiceEmbedder, HUB_REPO, HUB_REVISION,
     MODEL_ID, REGISTRATION, WEIGHTS_FILE,
 };
+pub use model::{WEIGHT_LICENSE, WEIGHT_LICENSE_ENTRY};
+
+/// This crate's model-weight-license entries for catalog aggregation (sc-13332) — one row keyed by
+/// [`MODEL_ID`]. The audio catalog concatenates every provider's slice into the model-licenses
+/// manifest SceneWorks lists on its end-product licenses page.
+pub const WEIGHT_LICENSES: &[gen_core::WeightLicenseEntry] = &[model::WEIGHT_LICENSE_ENTRY];
 
 /// Add the Chatterbox voice embedder to an explicit audio registry builder (catalog composition).
 pub fn register_providers(

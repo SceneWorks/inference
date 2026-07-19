@@ -30,6 +30,26 @@ pub const BACKEND: &str = "candle";
 pub const HUB_REPO: &str = "laion/clap-htsat-unfused";
 /// Immutable commit SHA of the pinned checkpoint (Apache-2.0).
 pub const HUB_REVISION: &str = "8fa0f1c6d0433df6e97c127f64b2a1d6c0dcda8a";
+
+/// The license of the pinned LAION CLAP weight checkpoint (sc-13332) — surfaced for SceneWorks'
+/// end-product licenses page. Apache-2.0 (permissive), verified against the
+/// `laion/clap-htsat-unfused` model card.
+pub const WEIGHT_LICENSE: candle_audio::gen_core::WeightLicense =
+    candle_audio::gen_core::WeightLicense {
+        spdx_id: "Apache-2.0",
+        name: "Apache License 2.0",
+        source_url: "https://huggingface.co/laion/clap-htsat-unfused",
+        attribution: Some("CLAP (HTSAT-unfused) © LAION — licensed under Apache-2.0"),
+        commercial_use: true,
+        restriction: None,
+    };
+
+/// This provider's weight-license entry (keyed by [`MODEL_ID`]) for catalog aggregation.
+pub const WEIGHT_LICENSE_ENTRY: candle_audio::gen_core::WeightLicenseEntry =
+    candle_audio::gen_core::WeightLicenseEntry {
+        provider_id: MODEL_ID,
+        license: WEIGHT_LICENSE,
+    };
 /// Checkpoint file (pytorch pickle; loaded via `VarBuilder::from_pth`).
 pub const WEIGHTS_FILE: &str = "pytorch_model.bin";
 /// RoBERTa BPE tokenizer.

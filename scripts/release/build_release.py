@@ -21,6 +21,59 @@ TAG_PATTERN = re.compile(r"^runtime-(\d{4})\.(\d{2})\.(\d+)(?:-rc\.(\d+))?$")
 REPOSITORY = "https://github.com/SceneWorks/inference"
 TOOL_NAME = "SceneWorks inference release builder"
 
+# The committed model-weight-license manifest (sc-13332). A separate axis from the SPDX crate SBOM:
+# one row per shipped audio provider, keyed by its registry id, recording the license of its pinned
+# Hugging Face weight checkpoint. The Rust catalog ship-gate
+# (`candle-audio-catalog::every_shipped_provider_has_a_weight_license`) keeps this file complete and
+# in sync with the provider registry; the release tooling emits it beside the SBOM so SceneWorks
+# consumes exactly one file for its end-product licenses page.
+MODEL_LICENSES_SOURCE = "release/model-weight-licenses.json"
+MODEL_LICENSES_KIND = "model-weight-licenses-json"
+REQUIRED_LICENSE_FIELDS = (
+    "provider_id",
+    "spdx_id",
+    "license_name",
+    "source_url",
+    "commercial_use",
+)
+
+
+def validate_model_weight_licenses(document: dict[str, Any]) -> list[dict[str, Any]]:
+    """Assert a model-weight-license manifest is present and complete.
+
+    Every provider entry must record its identity + SPDX id + license name + source URL +
+    commercial-use flag, ids must be unique, and a non-commercial checkpoint MUST carry a
+    restriction note (the whole point of the surface: a restricted license can never ship with its
+    terms unrecorded). Shared by the builder (emit-time) and the verifier (bundle-time).
+    """
+    if document.get("kind") != "model-weight-licenses":
+        raise RuntimeError("model-licenses manifest has the wrong kind")
+    providers = document.get("providers")
+    if not isinstance(providers, list) or not providers:
+        raise RuntimeError("model-licenses manifest lists no providers")
+    seen: set[str] = set()
+    for provider in providers:
+        for field in REQUIRED_LICENSE_FIELDS:
+            value = provider.get(field)
+            if value is None or (isinstance(value, str) and not value.strip()):
+                raise RuntimeError(
+                    f"model-licenses entry {provider.get('provider_id')!r} is missing {field!r}"
+                )
+        if not isinstance(provider["commercial_use"], bool):
+            raise RuntimeError(
+                f"model-licenses entry {provider['provider_id']!r} commercial_use must be boolean"
+            )
+        identifier = provider["provider_id"]
+        if identifier in seen:
+            raise RuntimeError(f"duplicate model-licenses provider id {identifier!r}")
+        seen.add(identifier)
+        restriction = provider.get("restriction")
+        if not provider["commercial_use"] and not (restriction or "").strip():
+            raise RuntimeError(
+                f"non-commercial model-licenses entry {identifier!r} has no restriction note"
+            )
+    return providers
+
 
 def run(*args: str, cwd: Path, binary: bool = False) -> bytes | str:
     # git and cargo emit UTF-8 on every platform; decoding with the locale encoding instead
@@ -266,13 +319,31 @@ def build_release(
     )
     write_json(sbom_path, spdx)
 
+    # Emit the model-weight-license manifest beside the SBOM (sc-13332). It is copied verbatim from
+    # the committed, catalog-validated source so the bundle carries the exact canonical bytes the
+    # Rust ship-gate guards; parse-and-validate here fails the build if it is absent or incomplete.
+    licenses_source = root / MODEL_LICENSES_SOURCE
+    if not licenses_source.is_file():
+        raise RuntimeError(f"model-weight-license manifest is absent: {MODEL_LICENSES_SOURCE}")
+    licenses_bytes = licenses_source.read_bytes()
+    validate_model_weight_licenses(json.loads(licenses_bytes.decode()))
+    model_licenses_name = f"{tag}.model-licenses.json"
+    model_licenses_path = output / model_licenses_name
+    model_licenses_path.write_bytes(licenses_bytes)
+
     artifacts = [
         {
             "name": sbom_name,
             "kind": "spdx-2.3-json",
             "sha256": sha256_file(sbom_path),
             "bytes": sbom_path.stat().st_size,
-        }
+        },
+        {
+            "name": model_licenses_name,
+            "kind": MODEL_LICENSES_KIND,
+            "sha256": sha256_file(model_licenses_path),
+            "bytes": model_licenses_path.stat().st_size,
+        },
     ]
     if not skip_archive:
         archive_name = f"{tag}.tar.gz"

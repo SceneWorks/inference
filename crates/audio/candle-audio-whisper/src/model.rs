@@ -28,9 +28,10 @@
 //!
 //! ## Checkpoint provenance
 //!
-//! `openai/whisper-base` (MIT) — the 74 M-param multilingual base checkpoint, chosen for a fast CPU
-//! real-weights test. Pinned at commit [`HUB_REVISION`] (a config.json + tokenizer.json +
-//! model.safetensors revision; 80-mel).
+//! `openai/whisper-base` (Apache-2.0 — the checkpoint's model-card license, distinct from the MIT
+//! license on OpenAI's Whisper *source* repository) — the 74 M-param multilingual base checkpoint,
+//! chosen for a fast CPU real-weights test. Pinned at commit [`HUB_REVISION`] (a config.json +
+//! tokenizer.json + model.safetensors revision; 80-mel).
 
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -54,10 +55,31 @@ pub const MODEL_ID: &str = "whisper_base";
 /// Provider family for the Whisper transcriber.
 pub const FAMILY: &str = "whisper";
 
-/// Hub pin: `openai/whisper-base` (MIT) at an immutable commit SHA (F-029) — a revision carrying
-/// config.json + tokenizer.json + model.safetensors (80-mel).
+/// Hub pin: `openai/whisper-base` (Apache-2.0) at an immutable commit SHA (F-029) — a revision
+/// carrying config.json + tokenizer.json + model.safetensors (80-mel).
 pub const HUB_REPO: &str = "openai/whisper-base";
 pub const HUB_REVISION: &str = "e37978b90ca9030d5170a5c07aadb050351a65bb";
+
+/// The license of the pinned Whisper weight checkpoint (sc-13332) — surfaced for SceneWorks'
+/// end-product licenses page. Apache-2.0 (permissive), verified against the `openai/whisper-base`
+/// model-card metadata (`license: apache-2.0`) — note this is the checkpoint's license, distinct
+/// from the MIT license on OpenAI's Whisper *source* repository.
+pub const WEIGHT_LICENSE: candle_audio::gen_core::WeightLicense =
+    candle_audio::gen_core::WeightLicense {
+        spdx_id: "Apache-2.0",
+        name: "Apache License 2.0",
+        source_url: "https://huggingface.co/openai/whisper-base",
+        attribution: Some("Whisper © OpenAI — licensed under Apache-2.0"),
+        commercial_use: true,
+        restriction: None,
+    };
+
+/// This provider's weight-license entry (keyed by [`MODEL_ID`]) for catalog aggregation.
+pub const WEIGHT_LICENSE_ENTRY: candle_audio::gen_core::WeightLicenseEntry =
+    candle_audio::gen_core::WeightLicenseEntry {
+        provider_id: MODEL_ID,
+        license: WEIGHT_LICENSE,
+    };
 
 /// The three files inside the pinned repo the provider resolves.
 pub const CONFIG_FILE: &str = "config.json";

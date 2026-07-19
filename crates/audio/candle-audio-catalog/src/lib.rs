@@ -74,6 +74,96 @@ pub fn provider_registry() -> gen_core::Result<ProviderRegistry> {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Model-weight licenses (sc-13332).
+//
+// A separate axis from the crate/source SPDX SBOM the release tooling already emits: each audio
+// provider pins its own Hugging Face weight checkpoint, whose license (Apache-2.0 / MIT / and, for
+// a model that lands later, possibly CC-BY-NC) must be surfaced so SceneWorks — a NON-COMMERCIAL
+// product — can list it on its end-product licenses page. Each provider records a
+// `gen_core::WeightLicense` as source of truth (traveling with the provider, beside its pinned
+// HUB_REPO/HUB_REVISION); this catalog aggregates every registered provider's license in catalog
+// order, and the release tooling serializes the aggregate into `release/model-weight-licenses.json`
+// beside the SPDX SBOM. The `every_shipped_provider_has_a_weight_license` ship-gate below refuses
+// any provider that reaches this catalog without a recorded, well-formed license.
+// ---------------------------------------------------------------------------------------------
+
+/// Every shipped audio provider's model-weight license, in catalog order — the aggregate the
+/// release tooling serializes into the model-licenses manifest SceneWorks consumes (one row per
+/// registered provider, keyed by its registry id).
+pub fn weight_licenses() -> Vec<gen_core::WeightLicenseEntry> {
+    let mut entries = Vec::new();
+    entries.extend_from_slice(candle_audio_kokoro::WEIGHT_LICENSES);
+    entries.extend_from_slice(candle_audio_moss_sfx::WEIGHT_LICENSES);
+    entries.extend_from_slice(candle_audio_acestep::WEIGHT_LICENSES);
+    entries.extend_from_slice(candle_audio_chatterbox_ve::WEIGHT_LICENSES);
+    entries.extend_from_slice(candle_audio_openvoice::WEIGHT_LICENSES);
+    entries.extend_from_slice(candle_audio_whisper::WEIGHT_LICENSES);
+    entries.extend_from_slice(candle_audio_clap::WEIGHT_LICENSES);
+    entries
+}
+
+/// The canonical model-licenses manifest JSON (deterministic, sorted by provider id) — the exact
+/// bytes committed at `release/model-weight-licenses.json` and emitted into the release bundle by
+/// `scripts/release/build_release.py`.
+pub fn weight_licenses_manifest_json() -> String {
+    gen_core::weight_licenses_manifest_json(&weight_licenses())
+}
+
+/// Every provider id this catalog registers, across all provider kinds (sc-13332) — the set the
+/// weight-license ship-gate cross-checks so no registered provider can escape a recorded license.
+#[cfg(test)]
+fn registered_provider_ids(registry: &ProviderRegistry) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    ids.extend(
+        registry
+            .generators()
+            .map(|r| (r.descriptor)().id.to_string()),
+    );
+    ids.extend(
+        registry
+            .transforms()
+            .map(|r| (r.descriptor)().id.to_string()),
+    );
+    ids.extend(
+        registry
+            .audio_transforms()
+            .map(|r| (r.descriptor)().id.to_string()),
+    );
+    ids.extend(registry.trainers().map(|r| (r.descriptor)().id.to_string()));
+    ids.extend(
+        registry
+            .captioners()
+            .map(|r| (r.descriptor)().id.to_string()),
+    );
+    ids.extend(
+        registry
+            .transcribers()
+            .map(|r| (r.descriptor)().id.to_string()),
+    );
+    ids.extend(
+        registry
+            .image_embedders()
+            .map(|r| (r.descriptor)().id.to_string()),
+    );
+    ids.extend(
+        registry
+            .text_embedders()
+            .map(|r| (r.descriptor)().id.to_string()),
+    );
+    ids.extend(
+        registry
+            .voice_embedders()
+            .map(|r| (r.descriptor)().id.to_string()),
+    );
+    ids.extend(
+        registry
+            .audio_embedders()
+            .map(|r| (r.descriptor)().id.to_string()),
+    );
+    ids
+}
+
+// ---------------------------------------------------------------------------------------------
 // Audio-lane snapshot preparation (sc-12836).
 //
 // The lane carries ONE preparer registration (backend-name uniqueness in the registry builder
@@ -219,6 +309,108 @@ mod tests {
         assert!(registry
             .voice_embedders()
             .all(|r| (r.descriptor)().family == "voice"));
+    }
+
+    /// The weight-license ship-gate (sc-13332): every provider this catalog registers — across
+    /// EVERY kind — has a recorded, well-formed model-weight license, and no license entry is an
+    /// orphan. Adding a provider to the catalog without wiring its `WEIGHT_LICENSES` slice fails
+    /// here, so "no provider ships without its weight license recorded" is enforced in the
+    /// composition root that decides what ships.
+    #[test]
+    fn every_shipped_provider_has_a_weight_license() {
+        use std::collections::BTreeSet;
+
+        let registry = super::provider_registry().unwrap();
+        let registered: BTreeSet<String> = super::registered_provider_ids(&registry)
+            .into_iter()
+            .collect();
+        assert!(!registered.is_empty(), "catalog registers no providers");
+
+        let entries = super::weight_licenses();
+        let licensed: BTreeSet<String> =
+            entries.iter().map(|e| e.provider_id.to_string()).collect();
+
+        // No duplicate license rows (one per provider).
+        assert_eq!(
+            entries.len(),
+            licensed.len(),
+            "duplicate provider id in weight_licenses()"
+        );
+        // Every registered provider has a license...
+        for id in &registered {
+            assert!(
+                licensed.contains(id),
+                "provider '{id}' ships without a recorded model-weight license"
+            );
+        }
+        // ...and every license row maps to a registered provider (no stale/orphan entry).
+        for id in &licensed {
+            assert!(
+                registered.contains(id),
+                "weight-license entry '{id}' has no registered provider"
+            );
+        }
+        // Every recorded license honors the restriction discipline (identity fields present; a
+        // non-commercial license carries its restriction note).
+        for entry in &entries {
+            assert!(
+                entry.license.is_well_formed(),
+                "provider '{}' has a malformed weight license (non-commercial without a \
+                 restriction note, or an empty identity field)",
+                entry.provider_id
+            );
+            assert!(
+                entry
+                    .license
+                    .source_url
+                    .starts_with("https://huggingface.co/"),
+                "provider '{}' weight-license source_url is not a Hugging Face URL",
+                entry.provider_id
+            );
+        }
+        // The seven currently-shipped audio providers, in catalog order, with their verified SPDX
+        // ids — all permissive (MIT / Apache-2.0). This pins the surface so a change is deliberate.
+        let ordered: Vec<(&str, &str, bool)> = super::weight_licenses()
+            .iter()
+            .map(|e| (e.provider_id, e.license.spdx_id, e.license.commercial_use))
+            .collect();
+        assert_eq!(
+            ordered,
+            vec![
+                ("kokoro_82m", "Apache-2.0", true),
+                ("moss_sfx_v2", "Apache-2.0", true),
+                ("acestep_v15_turbo", "MIT", true),
+                ("chatterbox_ve", "MIT", true),
+                ("openvoice_v2", "MIT", true),
+                ("whisper_base", "Apache-2.0", true),
+                ("clap_htsat_unfused", "Apache-2.0", true),
+            ]
+        );
+    }
+
+    /// The committed `release/model-weight-licenses.json` is byte-for-byte what the catalog
+    /// produces (sc-13332) — the drift gate tying the release manifest the tooling emits to the
+    /// per-provider source of truth. Regenerate with `UPDATE_WEIGHT_LICENSES=1 cargo test -p
+    /// candle-audio-catalog weight_licenses_manifest_matches_committed_file`.
+    #[test]
+    fn weight_licenses_manifest_matches_committed_file() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../release/model-weight-licenses.json");
+        let generated = super::weight_licenses_manifest_json();
+        if std::env::var_os("UPDATE_WEIGHT_LICENSES").is_some() {
+            std::fs::write(&path, &generated).unwrap();
+        }
+        let committed = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!(
+                "cannot read committed model-weight-licenses manifest at {}: {e} (regenerate with \
+                 UPDATE_WEIGHT_LICENSES=1)",
+                path.display()
+            )
+        });
+        assert_eq!(
+            committed, generated,
+            "release/model-weight-licenses.json is stale — regenerate with UPDATE_WEIGHT_LICENSES=1"
+        );
     }
 
     /// The lane's preparer registry: exactly one `candle` registration whose probe accepts a

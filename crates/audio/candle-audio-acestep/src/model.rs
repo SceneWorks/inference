@@ -54,6 +54,30 @@ pub const MODEL_ID: &str = "acestep_v15_turbo";
 pub const HUB_REPO: &str = "ACE-Step/acestep-v15-xl-turbo-diffusers";
 pub const HUB_REVISION: &str = "200ba991ae448051e14b0183157e35c2d27c9fb0";
 
+/// The license of the pinned ACE-Step v1.5 XL Turbo weight checkpoint (sc-13332) — surfaced for
+/// SceneWorks' end-product licenses page. MIT (permissive), verified against the
+/// `ACE-Step/acestep-v15-xl-turbo-diffusers` model card. The bundled `text_encoder`
+/// (Qwen3-Embedding-0.6B) is redistributed under Apache-2.0 — noted so the product surfaces the
+/// full picture even though the primary weight license governs.
+pub const WEIGHT_LICENSE: candle_audio::gen_core::WeightLicense =
+    candle_audio::gen_core::WeightLicense {
+        spdx_id: "MIT",
+        name: "MIT License",
+        source_url: "https://huggingface.co/ACE-Step/acestep-v15-xl-turbo-diffusers",
+        attribution: Some("ACE-Step v1.5 XL Turbo © ACE-Step — licensed under MIT"),
+        commercial_use: true,
+        restriction: Some(
+            "Bundled text_encoder (Qwen3-Embedding-0.6B) is redistributed under Apache-2.0.",
+        ),
+    };
+
+/// This provider's weight-license entry (keyed by [`MODEL_ID`]) for catalog aggregation.
+pub const WEIGHT_LICENSE_ENTRY: candle_audio::gen_core::WeightLicenseEntry =
+    candle_audio::gen_core::WeightLicenseEntry {
+        provider_id: MODEL_ID,
+        license: WEIGHT_LICENSE,
+    };
+
 /// Native output sample rate (Hz).
 pub const SAMPLE_RATE: u32 = 48_000;
 
