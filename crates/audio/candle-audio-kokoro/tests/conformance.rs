@@ -29,24 +29,28 @@ fn snapshot() -> WeightsSource {
     }
 }
 
-/// The backend-neutral gen-core conformance suite (validate honesty, progress + progress
-/// contract, typed mid-run and pre-generate cancellation, seed determinism) against the real
-/// provider, resolved **through the explicit registry** exactly like an image model.
+/// The shared **audio-generator** conformance suite (sc-12853): audio validate-honesty (a valid
+/// audio request accepted; unadvertised voice / language / sample-rate + visual conditioning rejected
+/// as typed errors), a well-formed `AudioTrack` output, progress + progress contract, typed mid-run
+/// and pre-generate cancellation, and seed determinism — against the real provider, resolved
+/// **through the explicit registry**. This replaces the earlier ad-hoc use of the *image* `Generator`
+/// suite (`gen_core_testkit::conformance` / `Profile`), whose oversize-rejection check is meaningless
+/// for a `Modality::Audio` model; `audio_conformance` is purpose-built for it.
 #[test]
 #[ignore = "real weights: needs a hexgrad/Kokoro-82M snapshot (KOKORO_SNAPSHOT or network); run with --ignored"]
 fn kokoro_conformance() {
     let spec = LoadSpec::new(snapshot());
-    let profile = gen_core_testkit::Profile {
+    let profile = gen_core_testkit::AudioProfile {
         prompt: "The quick brown fox jumps over the lazy dog.".to_owned(),
-        // Audio skips the size floor; keep the request inside the advertised bounds anyway.
-        width: 256,
-        height: 256,
         // Kokoro folds synthesis into a fixed 5-stage bar (pipeline::STAGES).
         steps: pipeline::STAGES,
         seed: 42,
         cancel_steps: pipeline::STAGES,
+        // Empty audio sub-block: Kokoro resolves its default voice (af_heart), so the positive
+        // request stays inside the advertised surface.
+        audio: Default::default(),
     };
-    gen_core_testkit::conformance(
+    gen_core_testkit::audio_conformance(
         || {
             candle_audio_kokoro::provider_registry()
                 .unwrap()
