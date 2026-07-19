@@ -34,22 +34,23 @@ use candle_audio::{AudioError, Result};
 /// The relative filename of the S3Gen checkpoint inside a Chatterbox snapshot.
 pub const S3GEN_WEIGHTS_FILE: &str = "s3gen.safetensors";
 
-/// Number of neural networks in the S3Gen stack still to port (flow, HiFTNet) — surfaced in the
-/// boundary error so the gap is never silent. The other two networks, the s3tokenizer (sc-13235;
-/// see [`crate::s3tokenizer`]) and the CAMPPlus x-vector (sc-13236; see [`crate::campplus`]), are
-/// ported.
-pub const S3GEN_REMAINING_NETWORKS: usize = 2;
+/// Number of neural networks in the S3Gen stack still to port (HiFTNet vocoder) — surfaced in the
+/// boundary error so the gap is never silent. The other three networks — the s3tokenizer (sc-13235;
+/// see [`crate::s3tokenizer`]), the CAMPPlus x-vector (sc-13236; see [`crate::campplus`]), and the
+/// flow-matching token→mel decoder (sc-13237; see [`crate::flow`]) — are ported.
+pub const S3GEN_REMAINING_NETWORKS: usize = 1;
 
 /// The S3Gen token→waveform decode. Not yet implemented: returns a typed error describing precisely
 /// which components remain, never fabricated audio (the honest-partial law — a fake waveform would
-/// pass a naive "non-silent" check while the clone gate must fail honestly).
+/// pass a naive "non-silent" check while the clone gate must fail honestly). The token→**mel** half
+/// (s3tokenizer + CAMPPlus + flow) is ported; only the mel→waveform HiFTNet vocoder remains.
 pub fn decode(_speech_tokens: &[u32]) -> Result<Vec<f32>> {
     Err(AudioError::Msg(format!(
-        "chatterbox: the S3Gen token\u{2192}waveform stack is not yet ported ({} networks: \
-         CosyVoice flow-matching decoder, HiFTNet vocoder). The T3 speech-token LM, the \
-         s3tokenizer (Whisper-v2 encoder + FSQ), and the CAMPPlus x-vector ARE ported and run on \
-         real weights; this stops at the remaining S3Gen boundary rather than emit fake audio. See \
-         the crate docs and sc-13222 follow-ups.",
+        "chatterbox: the S3Gen mel\u{2192}waveform stack is not yet ported ({} network: HiFTNet \
+         NSF/iSTFT vocoder). The T3 speech-token LM, the s3tokenizer (Whisper-v2 encoder + FSQ), \
+         the CAMPPlus x-vector, and the flow-matching token\u{2192}mel decoder ARE ported and run \
+         on real weights; this stops at the remaining S3Gen boundary rather than emit fake audio. \
+         See the crate docs and sc-13222 follow-ups.",
         S3GEN_REMAINING_NETWORKS
     )))
 }

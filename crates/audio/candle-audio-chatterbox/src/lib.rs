@@ -28,10 +28,14 @@
 //! tokens); it now fills T3's reference-conditioning prompt (empty before). sc-13236 ports the
 //! **CAMPPlus speaker encoder** ([`campplus`]) — the D-TDNN x-vector network (an 80-bin Kaldi-fbank
 //! → 192-d x-vector) S3Gen's flow conditions on, plus its L2-norm + `spk_embed_affine_layer`
-//! (192→80) derivation. The remaining **two** S3Gen networks (the CosyVoice flow-matching decoder
-//! and the HiFTNet vocoder — see [`s3gen`]) are **not yet ported**; the generator's `generate()`
-//! runs T3 to produce real speech tokens and then returns a typed error at the S3Gen boundary
-//! rather than fabricate audio.
+//! (192→80) derivation. sc-13237 ports the **flow-matching token→mel decoder** ([`flow`]) — the
+//! third S3Gen network: token `Embedding(6561→512)` + an [`flow_encoder::UpsampleConformerEncoder`]
+//! (output 512, 8 heads, 6+4 blocks, 25 Hz→50 Hz) + `encoder_proj(512→80)` feeding a
+//! `CausalConditionalCFM` (Euler flow-matching, 10 steps, cosine schedule, CFG 0.7) over a
+//! `ConditionalDecoder` U-Net estimator (in 320, 12 DiT mid-blocks), plus the 24 kHz prompt-mel
+//! front-end ([`mel24`]). The remaining **one** S3Gen network (the HiFTNet vocoder — see [`s3gen`])
+//! is **not yet ported**; the generator's `generate()` runs T3 to produce real speech tokens and
+//! then returns a typed error at the S3Gen boundary rather than fabricate audio.
 //! Consequently the generator is **not yet registered into `candle-audio-catalog`'s shipping
 //! surface** (registering a generator that cannot render audio would be a false advertisement, and
 //! would fail the gen-core generator conformance suite): that registration, the ordered-id surface
@@ -47,6 +51,9 @@ pub use candle_audio::gen_core;
 
 pub mod campplus;
 pub mod config;
+pub mod flow;
+pub mod flow_encoder;
+pub mod mel24;
 pub mod model;
 pub mod prepare;
 pub mod s3gen;
@@ -56,6 +63,8 @@ pub mod text;
 
 pub use campplus::Campplus;
 pub use config::{S3GenConfig, S3TokenizerConfig, T3Config};
+pub use flow::Flow;
+pub use mel24::Mel24Extractor;
 pub use model::{
     descriptor, load, load_generator, resolve_pinned_snapshot, ChatterboxGenerator, HUB_REPO,
     HUB_REVISION, MODEL_ID, REGISTRATION, T3_WEIGHTS_FILE, TOKENIZER_FILE,
