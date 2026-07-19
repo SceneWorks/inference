@@ -171,9 +171,9 @@ impl AceStepPipeline {
                     .map_err(AudioError::from)?,
             )
         };
-        // Text-to-music: no reference-audio timbre stream.
+        // Text-to-music: the condition encoder supplies its own timbre special token.
         self.condition
-            .encode(&text_hidden, lyric_embeds.as_ref(), None)
+            .encode(&text_hidden, lyric_embeds.as_ref())
             .map_err(AudioError::from)
     }
 
@@ -209,8 +209,11 @@ impl AceStepPipeline {
         let ctx_raw = self.encode_context(prompt, &params.lyrics, &params.metadata)?;
         let ctx = self.dit.embed_context(&ctx_raw)?;
 
-        // Text-to-music context latents: [src_latents(silence≈0) | chunk_mask(ones)].
-        let src_latents = Tensor::zeros((1, latent_len, acoustic), DType::F32, &self.device)?;
+        // Text-to-music context latents: [src_latents(silence) | chunk_mask(ones)].
+        let src_latents = self
+            .condition
+            .src_latents(latent_len, &self.device)
+            .map_err(AudioError::from)?;
         let chunk_mask = Tensor::ones((1, latent_len, acoustic), DType::F32, &self.device)?;
         let context_latents = Tensor::cat(
             &[&src_latents, &chunk_mask],

@@ -271,15 +271,18 @@ struct TimestepEmbedding {
     freq_dim: usize,
 }
 
+/// Sinusoidal timestep-embedding width (the pinned checkpoint's `time_embed.linear_1` input).
+const FREQ_DIM: usize = 256;
+
 impl TimestepEmbedding {
     fn new(cfg: &TransformerConfig, vb: VarBuilder) -> CandleResult<Self> {
         let d = cfg.hidden_size;
         Ok(Self {
-            linear_1: linear(d, d, vb.pp("linear_1"))?,
+            linear_1: linear(FREQ_DIM, d, vb.pp("linear_1"))?,
             linear_2: linear(d, d, vb.pp("linear_2"))?,
             time_proj: linear(d, d * 6, vb.pp("time_proj"))?,
             dim: d,
-            freq_dim: d,
+            freq_dim: FREQ_DIM,
         })
     }
 
@@ -326,7 +329,7 @@ impl DiT {
         let time_embed = TimestepEmbedding::new(cfg, vb.pp("time_embed"))?;
         let time_embed_r = TimestepEmbedding::new(cfg, vb.pp("time_embed_r"))?;
         let condition_embedder = linear(cfg.encoder_hidden_size, d, vb.pp("condition_embedder"))?;
-        let vb_b = vb.pp("blocks");
+        let vb_b = vb.pp("layers");
         let mut blocks = Vec::with_capacity(cfg.num_hidden_layers);
         for i in 0..cfg.num_hidden_layers {
             blocks.push(Block::new(cfg, cfg.is_sliding(i), vb_b.pp(i))?);

@@ -213,14 +213,16 @@ pub struct Qwen3Encoder {
 
 impl Qwen3Encoder {
     pub fn new(cfg: &TextEncoderConfig, vb: VarBuilder) -> CandleResult<Self> {
+        // The Qwen3-Embedding-0.6B safetensors store the bare `Qwen3Model` (no `model.` prefix):
+        // `embed_tokens.weight` / `layers.N.*` / `norm.weight`.
         let embed_tokens =
-            candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("model.embed_tokens"))?;
-        let vb_l = vb.pp("model.layers");
+            candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("embed_tokens"))?;
+        let vb_l = vb.pp("layers");
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for i in 0..cfg.num_hidden_layers {
             layers.push(Layer::new(cfg, vb_l.pp(i))?);
         }
-        let norm = rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("model.norm"))?;
+        let norm = rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("norm"))?;
         Ok(Self {
             embed_tokens,
             layers,

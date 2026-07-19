@@ -33,9 +33,11 @@ use crate::config::VaeConfig;
 /// The VAE safetensors file inside `vae/`.
 pub const VAE_FILE: &str = "diffusion_pytorch_model.safetensors";
 
-/// Snake activation: `x + (α + 1e-9)⁻¹ · sin²(αx)`, `α` per channel `[1, C, 1]`.
+/// SnakeBeta activation: `x + (β + 1e-9)⁻¹ · sin²(αx)`, `α`/`β` per channel `[1, C, 1]` (the
+/// Oobleck checkpoint's Snake carries both `alpha` and `beta`).
 struct Snake {
     alpha: Tensor,
+    beta: Tensor,
 }
 
 impl Snake {
@@ -43,7 +45,7 @@ impl Snake {
         let ax = x.broadcast_mul(&self.alpha)?;
         let s = ax.sin()?;
         let s2 = (&s * &s)?;
-        x + s2.broadcast_div(&(&self.alpha + 1e-9)?)
+        x + s2.broadcast_div(&(&self.beta + 1e-9)?)
     }
 }
 
@@ -112,6 +114,7 @@ impl W<'_> {
     fn snake(&self, name: &str) -> Result<Snake> {
         Ok(Snake {
             alpha: self.get(&format!("{name}.alpha"))?,
+            beta: self.get(&format!("{name}.beta"))?,
         })
     }
 
@@ -311,6 +314,7 @@ mod tests {
         let dev = Device::Cpu;
         let snake = Snake {
             alpha: Tensor::ones((1, 2, 1), DType::F32, &dev).unwrap(),
+            beta: Tensor::ones((1, 2, 1), DType::F32, &dev).unwrap(),
         };
         let x = Tensor::zeros((1, 2, 4), DType::F32, &dev).unwrap();
         assert_eq!(
