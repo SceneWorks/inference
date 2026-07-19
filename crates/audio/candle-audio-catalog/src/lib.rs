@@ -8,15 +8,20 @@
 //! `candle-gen-catalog`. It never touches the media catalogs — bundle inclusion of the audio
 //! lane is a deliberate per-bundle edit through `runtime-catalog`'s `AudioLane`.
 //!
-//! The audio lane carries **generators plus the two identity-/transform-shaped audio provider
-//! kinds** the epic's later slices need — [`gen_core::VoiceEmbedder`] (voice-cloning identity,
-//! sc-12838) and [`gen_core::AudioTransform`] (non-prompt audio→audio, sc-12839) — validated by
-//! `runtime-catalog::validate_audio`. Generators still implement the ordinary
-//! [`gen_core::Generator`] contract with [`gen_core::Modality::Audio`] descriptors; the added kinds
-//! ride the same explicit ProviderRegistry, surfaced in the bundle snapshot as
-//! `audio_voice_embedder_ids` / `audio_transform_ids` beside `audio_generator_ids` (sc-12844) — no
-//! new trait beyond the merged contracts, no linker discovery. sc-12844 ships the first of these:
-//! the Chatterbox voice encoder (**chatterbox_ve**).
+//! The audio lane carries **generators plus the audio-shaped non-generator provider kinds** the
+//! epic's slices need — [`gen_core::VoiceEmbedder`] (voice-cloning identity, sc-12838),
+//! [`gen_core::AudioTransform`] (non-prompt audio→audio, sc-12839), and [`gen_core::Transcriber`]
+//! (audio→text ASR, the Captioner-analog, sc-12850) — validated by
+//! `runtime-catalog::validate_audio`. A [`gen_core::Transcriber`] rides the audio lane (candle
+//! backend) rather than the media registry where captioners (image→text on the media backend)
+//! surface: a transcriber consumes an [`gen_core::AudioTrack`], so it is an audio-lane provider by
+//! the same rule that placed the generators, voice embedders, and audio transforms here. Generators
+//! still implement the ordinary [`gen_core::Generator`] contract with [`gen_core::Modality::Audio`]
+//! descriptors; the added kinds ride the same explicit ProviderRegistry, surfaced in the bundle
+//! snapshot as `audio_voice_embedder_ids` / `audio_transform_ids` / `audio_transcriber_ids` beside
+//! `audio_generator_ids` — no new trait beyond the merged contracts, no linker discovery. sc-12844
+//! ships the Chatterbox voice encoder (**chatterbox_ve**); sc-13223 the OpenVoice V2 transform
+//! (**openvoice_v2**); sc-12850 the Whisper transcriber (**whisper_base**).
 //!
 //! Since sc-12836 the catalog also owns the **audio lane's snapshot-preparer composition**
 //! ([`snapshot_preparer_registry`]): one `candle` registration that recognizes audio
@@ -42,18 +47,21 @@ pub mod providers {
     pub use candle_audio_kokoro;
     pub use candle_audio_moss_sfx;
     pub use candle_audio_openvoice;
+    pub use candle_audio_whisper;
 }
 
 /// Add every provider shipped by the Candle audio lane to an explicit registry builder, in
-/// stable catalog order: the generators first (Kokoro TTS, MOSS SFX), then the voice-cloning
-/// identity embedder (Chatterbox `ve`, sc-12844), then the audio transforms (OpenVoice V2 voice
-/// conversion, sc-13223 — the first real `AudioTransform`, releasing the sc-12839 gate).
+/// stable catalog order: the generators first (Kokoro TTS, MOSS SFX, ACE-Step music), then the
+/// voice-cloning identity embedder (Chatterbox `ve`, sc-12844), then the audio transforms
+/// (OpenVoice V2 voice conversion, sc-13223 — the first real `AudioTransform`), then the
+/// transcribers (Whisper ASR, sc-12850 — the first real `Transcriber`, the audio Captioner-analog).
 pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistryBuilder {
     let registry = candle_audio_kokoro::register_providers(registry);
     let registry = candle_audio_moss_sfx::register_providers(registry);
     let registry = candle_audio_acestep::register_providers(registry);
     let registry = candle_audio_chatterbox_ve::register_providers(registry);
-    candle_audio_openvoice::register_providers(registry)
+    let registry = candle_audio_openvoice::register_providers(registry);
+    candle_audio_whisper::register_providers(registry)
 }
 
 /// Build the complete explicit Candle audio provider catalog.
@@ -79,6 +87,7 @@ fn lane_can_prepare(spec: &core_llm::PrepareSpec) -> bool {
         || candle_audio_moss_sfx::prepare::can_prepare(spec)
         || candle_audio_acestep::prepare::can_prepare(spec)
         || candle_audio_openvoice::prepare::can_prepare(spec)
+        || candle_audio_whisper::prepare::can_prepare(spec)
         || (candle_llm::prepare::REGISTRATION.can_prepare)(spec)
 }
 
@@ -91,6 +100,8 @@ fn lane_prepare(spec: &core_llm::PrepareSpec) -> core_llm::Result<core_llm::Prep
         candle_audio_acestep::prepare::prepare(spec)
     } else if candle_audio_openvoice::prepare::can_prepare(spec) {
         candle_audio_openvoice::prepare::prepare(spec)
+    } else if candle_audio_whisper::prepare::can_prepare(spec) {
+        candle_audio_whisper::prepare::prepare(spec)
     } else {
         (candle_llm::prepare::REGISTRATION.prepare)(spec)
     }
@@ -130,7 +141,10 @@ mod tests {
             .map(|r| (r.descriptor)().id.to_string())
             .collect();
 
-        assert_eq!(generators, ["kokoro_82m", "moss_sfx_v2", "acestep_v15_turbo"]);
+        assert_eq!(
+            generators,
+            ["kokoro_82m", "moss_sfx_v2", "acestep_v15_turbo"]
+        );
         // The voice-cloning identity embedder surfaces as its own kind (sc-12844), in catalog order.
         let voice_embedders: Vec<String> = registry
             .voice_embedders()
@@ -144,17 +158,28 @@ mod tests {
             .map(|r| (r.descriptor)().id.to_string())
             .collect();
         assert_eq!(audio_transforms, ["openvoice_v2"]);
+        // The transcribers surface as their own kind (sc-12850), in catalog order — Whisper ASR is
+        // the first real Transcriber (the audio Captioner-analog).
+        let transcribers: Vec<String> = registry
+            .transcribers()
+            .map(|r| (r.descriptor)().id.to_string())
+            .collect();
+        assert_eq!(transcribers, ["whisper_base"]);
         assert_eq!(
             registry.descriptor_conformance_errors(),
             Vec::<String>::new()
         );
-        // The audio lane admits generators, voice embedders, and audio transforms only — never the
-        // image/text/trainer/captioner kinds (those belong in a media family).
+        // The audio lane admits generators, voice embedders, audio transforms, and transcribers
+        // only — never the image/text/trainer/captioner kinds (those belong in a media family).
         assert_eq!(registry.transforms().len(), 0);
         assert_eq!(registry.trainers().len(), 0);
         assert_eq!(registry.captioners().len(), 0);
         assert_eq!(registry.image_embedders().len(), 0);
         assert_eq!(registry.text_embedders().len(), 0);
+        // Every transcriber is candle-backed.
+        assert!(registry
+            .transcribers()
+            .all(|r| (r.descriptor)().backend == super::AUDIO_BACKEND));
         // Every audio transform is candle-backed.
         assert!(registry
             .audio_transforms()

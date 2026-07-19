@@ -31,6 +31,7 @@ pub mod text_embed;
 pub mod tiling;
 pub mod tokenizer;
 pub mod train;
+pub mod transcribe;
 pub mod transform;
 pub mod voice_embed;
 pub mod weightsmeta;
@@ -62,7 +63,7 @@ pub use mempolicy::{plan_memory_adaptation, LaneLevers, Lever, MemoryPlan, Stage
 pub use registry::{
     AudioTransformRegistration, CaptionerRegistration, ImageEmbedderRegistration,
     ModelRegistration, PerComponentBytes, ProviderRegistry, ProviderRegistryBuilder,
-    TextEmbedderRegistration, TrainerRegistration, TransformRegistration,
+    TextEmbedderRegistration, TrainerRegistration, TranscriberRegistration, TransformRegistration,
     VoiceEmbedderRegistration,
 };
 pub use runtime::{
@@ -91,6 +92,11 @@ pub use ::core_llm;
 pub use train::{
     LrSchedule, NetworkType, Trainer, TrainerDescriptor, TrainingConfig, TrainingItem,
     TrainingOutput, TrainingProgress, TrainingRequest,
+};
+pub use transcribe::{
+    TimestampGranularity, TranscribeCapabilities, TranscribeFinishReason, TranscribeOptions,
+    TranscribeRequest, TranscribeSampling, TranscribeTask, Transcriber, TranscriberDescriptor,
+    TranscriptOutput, TranscriptSegment, TranscriptWord,
 };
 pub use transform::{
     TargetSize, Transform, TransformCapabilities, TransformDescriptor, TransformRequest,

@@ -48,6 +48,19 @@ macro_rules! register_captioner {
     };
 }
 
+/// Define a transcriber registration constant for an explicit provider catalog (sc-12850) —
+/// the audio-to-text sibling of [`register_captioner`](crate::register_captioner).
+#[macro_export]
+macro_rules! register_transcriber {
+    ( $vis:vis const $name:ident = $desc:path => $load:path $(,)? ) => {
+        $vis const $name: $crate::registry::TranscriberRegistration =
+            $crate::registry::TranscriberRegistration {
+                descriptor: $desc,
+                load: |spec| $load(spec).map_err(::core::convert::Into::into),
+            };
+    };
+}
+
 /// Define an image-embedder registration constant for an explicit provider catalog.
 #[macro_export]
 macro_rules! register_image_embedder {

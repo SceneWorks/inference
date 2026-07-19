@@ -9,6 +9,7 @@ use crate::image_embed::{ImageEmbedder, ImageEmbedderDescriptor};
 use crate::runtime::{LoadSpec, Quant, WeightsSource};
 use crate::text_embed::{TextEmbedder, TextEmbedderDescriptor};
 use crate::train::{Trainer, TrainerDescriptor};
+use crate::transcribe::{Transcriber, TranscriberDescriptor};
 use crate::transform::{Transform, TransformDescriptor};
 use crate::voice_embed::{VoiceEmbedder, VoiceEmbedderDescriptor};
 use crate::weightsmeta::safetensors_path_bytes;
@@ -149,6 +150,15 @@ pub struct CaptionerRegistration {
     pub load: fn(&LoadSpec) -> Result<Box<dyn Captioner>>,
 }
 
+/// A transcriber provider's registration (parallel to [`CaptionerRegistration`]; sc-12850). The
+/// audio-to-text sibling of the captioner: an ASR provider resolved and loaded exactly like every
+/// other kind.
+#[derive(Clone, Copy)]
+pub struct TranscriberRegistration {
+    pub descriptor: fn() -> TranscriberDescriptor,
+    pub load: fn(&LoadSpec) -> Result<Box<dyn Transcriber>>,
+}
+
 /// An image-embedder provider's registration (parallel to [`ModelRegistration`]).
 #[derive(Clone, Copy)]
 pub struct ImageEmbedderRegistration {
@@ -183,6 +193,7 @@ pub struct ProviderRegistryBuilder {
     audio_transforms: Vec<AudioTransformRegistration>,
     trainers: Vec<TrainerRegistration>,
     captioners: Vec<CaptionerRegistration>,
+    transcribers: Vec<TranscriberRegistration>,
     image_embedders: Vec<ImageEmbedderRegistration>,
     text_embedders: Vec<TextEmbedderRegistration>,
     voice_embedders: Vec<VoiceEmbedderRegistration>,
@@ -213,6 +224,7 @@ impl ProviderRegistryBuilder {
     );
     builder_registration_method!(register_trainer, trainers, TrainerRegistration);
     builder_registration_method!(register_captioner, captioners, CaptionerRegistration);
+    builder_registration_method!(register_transcriber, transcribers, TranscriberRegistration);
     builder_registration_method!(
         register_image_embedder,
         image_embedders,
@@ -269,6 +281,7 @@ impl ProviderRegistryBuilder {
         ensure_unique!(audio_transforms, "audio transform");
         ensure_unique!(trainers, "trainer");
         ensure_unique!(captioners, "captioner");
+        ensure_unique!(transcribers, "transcriber");
         ensure_unique!(image_embedders, "image embedder");
         ensure_unique!(text_embedders, "text embedder");
         ensure_unique!(voice_embedders, "voice embedder");
@@ -279,6 +292,7 @@ impl ProviderRegistryBuilder {
             audio_transforms: self.audio_transforms.into_boxed_slice(),
             trainers: self.trainers.into_boxed_slice(),
             captioners: self.captioners.into_boxed_slice(),
+            transcribers: self.transcribers.into_boxed_slice(),
             image_embedders: self.image_embedders.into_boxed_slice(),
             text_embedders: self.text_embedders.into_boxed_slice(),
             voice_embedders: self.voice_embedders.into_boxed_slice(),
@@ -294,6 +308,7 @@ pub struct ProviderRegistry {
     audio_transforms: Box<[AudioTransformRegistration]>,
     trainers: Box<[TrainerRegistration]>,
     captioners: Box<[CaptionerRegistration]>,
+    transcribers: Box<[TranscriberRegistration]>,
     image_embedders: Box<[ImageEmbedderRegistration]>,
     text_embedders: Box<[TextEmbedderRegistration]>,
     voice_embedders: Box<[VoiceEmbedderRegistration]>,
@@ -388,6 +403,14 @@ impl ProviderRegistry {
         dyn Captioner
     );
     explicit_registry_kind!(
+        transcribers,
+        load_transcriber,
+        transcribers,
+        TranscriberRegistration,
+        "transcriber",
+        dyn Transcriber
+    );
+    explicit_registry_kind!(
         image_embedders,
         load_image_embedder,
         image_embedders,
@@ -436,6 +459,7 @@ impl ProviderRegistry {
             &self.audio_transforms,
             &self.trainers,
             &self.captioners,
+            &self.transcribers,
             &self.image_embedders,
             &self.text_embedders,
             &self.voice_embedders,
@@ -574,8 +598,8 @@ fn check_unique_ids(errs: &mut Vec<String>, kind: &str, ids: &[&str]) {
 /// the `gen-core-testkit` suite.
 ///
 /// Returns one message per violation (empty = conformant).
-// One `&[Registration]` slice per provider kind, so the arg count tracks the number of kinds (8 as
-// of the sc-12839 audio-transform lane) rather than any avoidable coupling — the alternative is a
+// One `&[Registration]` slice per provider kind, so the arg count tracks the number of kinds (9 as
+// of the sc-12850 transcriber kind) rather than any avoidable coupling — the alternative is a
 // throwaway "all registrations" struct that adds no clarity.
 #[allow(clippy::too_many_arguments)]
 fn descriptor_conformance_errors_for(
@@ -584,6 +608,7 @@ fn descriptor_conformance_errors_for(
     audio_transform_registrations: &[AudioTransformRegistration],
     trainer_registrations: &[TrainerRegistration],
     captioner_registrations: &[CaptionerRegistration],
+    transcriber_registrations: &[TranscriberRegistration],
     image_embedder_registrations: &[ImageEmbedderRegistration],
     text_embedder_registrations: &[TextEmbedderRegistration],
     voice_embedder_registrations: &[VoiceEmbedderRegistration],
@@ -641,6 +666,36 @@ fn descriptor_conformance_errors_for(
     }
     let cap_ids: Vec<&str> = cap_descs.iter().map(|d| d.id).collect();
     check_unique_ids(&mut errs, "captioner", &cap_ids);
+
+    // Transcribers (sc-12850): identity, capability-bound coherence (a non-zero token ceiling and a
+    // positive max clip duration — the audio twin of the captioner's max_new_tokens/image-size
+    // checks), and id uniqueness.
+    let asr_descs: Vec<TranscriberDescriptor> = transcriber_registrations
+        .iter()
+        .map(|r| (r.descriptor)())
+        .collect();
+    for d in &asr_descs {
+        let ctx = format!("transcriber '{}'", d.id);
+        check_identity(
+            &mut errs,
+            &ctx,
+            &[("id", d.id), ("family", d.family), ("backend", d.backend)],
+        );
+        let c = &d.capabilities;
+        if c.max_new_tokens == 0 {
+            errs.push(format!(
+                "{ctx}: max_new_tokens is 0 — no transcript could be produced"
+            ));
+        }
+        if !c.max_audio_seconds.is_finite() || c.max_audio_seconds <= 0.0 {
+            errs.push(format!(
+                "{ctx}: max_audio_seconds is {} — no audio could be accepted",
+                c.max_audio_seconds
+            ));
+        }
+    }
+    let asr_ids: Vec<&str> = asr_descs.iter().map(|d| d.id).collect();
+    check_unique_ids(&mut errs, "transcriber", &asr_ids);
 
     let tf_descs: Vec<TransformDescriptor> = transform_registrations
         .iter()
@@ -782,6 +837,10 @@ mod tests {
     use crate::text_embed::{TextEmbedder, TextEmbedderDescriptor};
     use crate::train::{
         Trainer, TrainerDescriptor, TrainingOutput, TrainingProgress, TrainingRequest,
+    };
+    use crate::transcribe::{
+        TranscribeCapabilities, TranscribeRequest, Transcriber, TranscriberDescriptor,
+        TranscriptOutput,
     };
     use crate::voice_embed::{VoiceEmbedder, VoiceEmbedderDescriptor, VoiceEmbedding};
     use std::path::PathBuf;
@@ -1097,6 +1156,56 @@ mod tests {
         const DUMMY_CAPTIONER_REGISTRATION = dummy_captioner_descriptor => dummy_captioner_load
     }
 
+    struct DummyTranscriber {
+        desc: TranscriberDescriptor,
+    }
+
+    impl Transcriber for DummyTranscriber {
+        fn descriptor(&self) -> &TranscriberDescriptor {
+            &self.desc
+        }
+        fn validate(&self, _req: &TranscribeRequest) -> Result<()> {
+            Ok(())
+        }
+        fn transcribe(
+            &self,
+            _req: &TranscribeRequest,
+            _on_progress: &mut dyn FnMut(Progress),
+        ) -> Result<TranscriptOutput> {
+            Ok(TranscriptOutput {
+                text: "transcript".to_owned(),
+                generated_tokens: Some(1),
+                ..Default::default()
+            })
+        }
+    }
+
+    fn dummy_transcriber_descriptor() -> TranscriberDescriptor {
+        TranscriberDescriptor {
+            id: "dummy_test_transcriber",
+            family: "test",
+            backend: "candle",
+            capabilities: TranscribeCapabilities {
+                languages: vec!["en"],
+                supports_segment_timestamps: true,
+                max_audio_seconds: 30.0,
+                max_new_tokens: 448,
+                ..Default::default()
+            },
+        }
+    }
+
+    fn dummy_transcriber_load(_spec: &LoadSpec) -> Result<Box<dyn Transcriber>> {
+        Ok(Box::new(DummyTranscriber {
+            desc: dummy_transcriber_descriptor(),
+        }))
+    }
+
+    crate::register_transcriber! {
+        const DUMMY_TRANSCRIBER_REGISTRATION =
+            dummy_transcriber_descriptor => dummy_transcriber_load
+    }
+
     fn dummy_registry() -> ProviderRegistry {
         ProviderRegistryBuilder::new()
             .register_generator(DUMMY_GENERATOR_REGISTRATION)
@@ -1108,6 +1217,7 @@ mod tests {
             .register_trainer(DUMMY_MULTI_TRAINER_A_REGISTRATION)
             .register_trainer(DUMMY_MULTI_TRAINER_B_REGISTRATION)
             .register_captioner(DUMMY_CAPTIONER_REGISTRATION)
+            .register_transcriber(DUMMY_TRANSCRIBER_REGISTRATION)
             .register_text_embedder(DUMMY_TEXT_EMBEDDER_REGISTRATION)
             .register_image_embedder(DUMMY_IMAGE_EMBEDDER_REGISTRATION)
             .register_voice_embedder(DUMMY_VOICE_EMBEDDER_REGISTRATION)
@@ -1344,6 +1454,32 @@ mod tests {
         assert!(dummy_registry()
             .captioners()
             .any(|r| (r.descriptor)().id == "dummy_test_captioner"));
+    }
+
+    #[test]
+    fn transcriber_registry_resolves_by_id() {
+        let registry = dummy_registry();
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let t = registry
+            .load_transcriber("dummy_test_transcriber", &spec)
+            .expect("dummy transcriber is registered");
+        assert_eq!(t.descriptor().id, "dummy_test_transcriber");
+    }
+
+    #[test]
+    fn unknown_transcriber_id_errors() {
+        let registry = dummy_registry();
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        assert!(registry
+            .load_transcriber("no_such_transcriber", &spec)
+            .is_err());
+    }
+
+    #[test]
+    fn dummy_transcriber_appears_in_iteration() {
+        assert!(dummy_registry()
+            .transcribers()
+            .any(|r| (r.descriptor)().id == "dummy_test_transcriber"));
     }
 
     struct DummyTextEmbedder {
