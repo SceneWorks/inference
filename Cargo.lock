@@ -215,6 +215,7 @@ version = "0.0.0"
 dependencies = [
  "candle-audio",
  "candle-audio-kokoro",
+ "candle-audio-moss-sfx",
  "candle-llm",
 ]
 
@@ -231,6 +232,21 @@ dependencies = [
  "sceneworks-gen-core-testkit",
  "serde_json",
  "zip 7.2.0",
+]
+
+[[package]]
+name = "candle-audio-moss-sfx"
+version = "0.0.0"
+dependencies = [
+ "candle-audio",
+ "candle-nn",
+ "core-llm",
+ "rand 0.9.5",
+ "rand_distr",
+ "sceneworks-gen-core-testkit",
+ "serde",
+ "serde_json",
+ "tokenizers 0.22.2",
 ]
 
 [[package]]

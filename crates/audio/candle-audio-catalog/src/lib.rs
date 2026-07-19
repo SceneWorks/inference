@@ -32,12 +32,14 @@ pub const AUDIO_BACKEND: &str = "candle";
 /// Complete audio provider package surface owned by the Candle audio lane, in catalog order.
 pub mod providers {
     pub use candle_audio_kokoro;
+    pub use candle_audio_moss_sfx;
 }
 
 /// Add every provider shipped by the Candle audio lane to an explicit registry builder, in
 /// stable catalog order.
 pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistryBuilder {
-    candle_audio_kokoro::register_providers(registry)
+    let registry = candle_audio_kokoro::register_providers(registry);
+    candle_audio_moss_sfx::register_providers(registry)
 }
 
 /// Build the complete explicit Candle audio provider catalog.
@@ -60,12 +62,15 @@ fn lane_backend() -> &'static str {
 
 fn lane_can_prepare(spec: &core_llm::PrepareSpec) -> bool {
     candle_audio_kokoro::prepare::can_prepare(spec)
+        || candle_audio_moss_sfx::prepare::can_prepare(spec)
         || (candle_llm::prepare::REGISTRATION.can_prepare)(spec)
 }
 
 fn lane_prepare(spec: &core_llm::PrepareSpec) -> core_llm::Result<core_llm::PrepareReport> {
     if candle_audio_kokoro::prepare::can_prepare(spec) {
         candle_audio_kokoro::prepare::prepare(spec)
+    } else if candle_audio_moss_sfx::prepare::can_prepare(spec) {
+        candle_audio_moss_sfx::prepare::prepare(spec)
     } else {
         (candle_llm::prepare::REGISTRATION.prepare)(spec)
     }
@@ -92,8 +97,9 @@ pub fn snapshot_preparer_registry() -> core_llm::Result<core_llm::SnapshotPrepar
 #[cfg(test)]
 mod tests {
     /// The ordered audio id surface (the audio twin of candle-gen-catalog's
-    /// `complete_catalog_has_stable_conforming_surface`). sc-12836 lands the first shipped
-    /// provider: **kokoro_82m**. Later stories extend this exact assertion, in catalog order.
+    /// `complete_catalog_has_stable_conforming_surface`). sc-12836 landed the first shipped
+    /// provider (**kokoro_82m**); sc-12841 adds the SFX/ambience diffusion provider
+    /// (**moss_sfx_v2**). Later stories extend this exact assertion, in catalog order.
     /// The generators-only / candle-backend / audio-modality sweeps are asserted here too so
     /// a provider that would fail bundle validation is caught in its own family first.
     #[test]
@@ -104,7 +110,7 @@ mod tests {
             .map(|r| (r.descriptor)().id.to_string())
             .collect();
 
-        assert_eq!(generators, ["kokoro_82m"]);
+        assert_eq!(generators, ["kokoro_82m", "moss_sfx_v2"]);
         assert_eq!(
             registry.descriptor_conformance_errors(),
             Vec::<String>::new()
@@ -146,6 +152,23 @@ mod tests {
         std::fs::write(dir.join("kokoro-v1_0.pth"), b"stub").unwrap();
         let spec = super::core_llm::PrepareSpec::dense(&dir, dir.join("out"));
         assert!((regs[0].can_prepare)(&spec));
+        // ...a MOSS-SoundEffect-shaped snapshot dir is accepted too (sc-12841)...
+        let moss = std::env::temp_dir().join("audio-catalog-moss-probe");
+        let _ = std::fs::remove_dir_all(&moss);
+        std::fs::create_dir_all(moss.join("transformer")).unwrap();
+        std::fs::write(
+            moss.join("model_index.json"),
+            r#"{"_class_name": "MossSoundEffectPipeline"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            moss.join("transformer/diffusion_pytorch_model.safetensors"),
+            b"stub",
+        )
+        .unwrap();
+        let spec = super::core_llm::PrepareSpec::dense(&moss, moss.join("out"));
+        assert!((regs[0].can_prepare)(&spec));
+        let _ = std::fs::remove_dir_all(&moss);
         // ...while a bare dir (neither audio- nor LLM-shaped) is not.
         let empty = std::env::temp_dir().join("audio-catalog-empty-probe");
         let _ = std::fs::remove_dir_all(&empty);
