@@ -49,7 +49,12 @@ fn repeat_kv(x: &Tensor, groups: usize) -> CandleResult<Tensor> {
         .contiguous()
 }
 
-fn rope_tables(head_dim: usize, len: usize, theta: f64, device: &Device) -> CandleResult<(Tensor, Tensor)> {
+fn rope_tables(
+    head_dim: usize,
+    len: usize,
+    theta: f64,
+    device: &Device,
+) -> CandleResult<(Tensor, Tensor)> {
     let half = head_dim / 2;
     let mut cos = Vec::with_capacity(len * half);
     let mut sin = Vec::with_capacity(len * half);
@@ -95,10 +100,19 @@ impl EncoderLayer {
             to_q: linear_b(hidden, cfg.num_attention_heads * d, false, sa.pp("to_q"))?,
             to_k: linear_b(hidden, cfg.num_key_value_heads * d, false, sa.pp("to_k"))?,
             to_v: linear_b(hidden, cfg.num_key_value_heads * d, false, sa.pp("to_v"))?,
-            to_out: linear_b(cfg.num_attention_heads * d, hidden, false, sa.pp("to_out.0"))?,
+            to_out: linear_b(
+                cfg.num_attention_heads * d,
+                hidden,
+                false,
+                sa.pp("to_out.0"),
+            )?,
             norm_q: rms_norm(d, cfg.rms_norm_eps, sa.pp("norm_q"))?,
             norm_k: rms_norm(d, cfg.rms_norm_eps, sa.pp("norm_k"))?,
-            post_attention_layernorm: rms_norm(hidden, cfg.rms_norm_eps, vb.pp("post_attention_layernorm"))?,
+            post_attention_layernorm: rms_norm(
+                hidden,
+                cfg.rms_norm_eps,
+                vb.pp("post_attention_layernorm"),
+            )?,
             gate_proj: linear_b(hidden, cfg.intermediate_size, false, vb.pp("mlp.gate_proj"))?,
             up_proj: linear_b(hidden, cfg.intermediate_size, false, vb.pp("mlp.up_proj"))?,
             down_proj: linear_b(cfg.intermediate_size, hidden, false, vb.pp("mlp.down_proj"))?,
@@ -113,8 +127,16 @@ impl EncoderLayer {
         let device = x.device();
         let len = x.dim(1)?;
         let h = self.input_layernorm.forward(x)?;
-        let q = self.norm_q.forward(&to_heads(&self.to_q.forward(&h)?, self.num_heads, self.head_dim)?)?;
-        let k = self.norm_k.forward(&to_heads(&self.to_k.forward(&h)?, self.num_kv_heads, self.head_dim)?)?;
+        let q = self.norm_q.forward(&to_heads(
+            &self.to_q.forward(&h)?,
+            self.num_heads,
+            self.head_dim,
+        )?)?;
+        let k = self.norm_k.forward(&to_heads(
+            &self.to_k.forward(&h)?,
+            self.num_kv_heads,
+            self.head_dim,
+        )?)?;
         let v = to_heads(&self.to_v.forward(&h)?, self.num_kv_heads, self.head_dim)?;
         let (cos, sin) = rope_tables(self.head_dim, len, self.theta, device)?;
         let q = candle_nn::rotary_emb::rope(&q.contiguous()?, &cos, &sin)?;
@@ -125,10 +147,14 @@ impl EncoderLayer {
         let scale = 1.0 / (self.head_dim as f64).sqrt();
         // Bidirectional (encoder) attention — no causal mask.
         let att = candle_nn::ops::softmax_last_dim(&(q.matmul(&k.transpose(2, 3)?)? * scale)?)?;
-        let attn = self.to_out.forward(&from_heads(&att.matmul(&v.contiguous()?)?)?)?;
+        let attn = self
+            .to_out
+            .forward(&from_heads(&att.matmul(&v.contiguous()?)?)?)?;
         let x = (x + attn)?;
         let h = self.post_attention_layernorm.forward(&x)?;
-        let ff = self.down_proj.forward(&(self.gate_proj.forward(&h)?.silu()? * self.up_proj.forward(&h)?)?)?;
+        let ff = self
+            .down_proj
+            .forward(&(self.gate_proj.forward(&h)?.silu()? * self.up_proj.forward(&h)?)?)?;
         x + ff
     }
 }
@@ -141,7 +167,13 @@ struct Encoder {
 }
 
 impl Encoder {
-    fn new(cfg: &ConditionEncoderConfig, in_dim: usize, n: usize, prefix: &str, vb: VarBuilder) -> CandleResult<Self> {
+    fn new(
+        cfg: &ConditionEncoderConfig,
+        in_dim: usize,
+        n: usize,
+        prefix: &str,
+        vb: VarBuilder,
+    ) -> CandleResult<Self> {
         let root = vb.pp(prefix);
         let embed_tokens = linear(in_dim, cfg.hidden_size, root.pp("embed_tokens"))?;
         let vb_l = root.pp("layers");
@@ -177,7 +209,7 @@ pub struct ConditionEncoder {
     text_projector: Linear,
     lyric_encoder: Encoder,
     timbre_encoder: Encoder,
-    special_token: Tensor, // [1, 1, hidden]
+    special_token: Tensor,  // [1, 1, hidden]
     silence_latent: Tensor, // [1, T0, acoustic]
     cfg: ConditionEncoderConfig,
 }
@@ -186,8 +218,20 @@ impl ConditionEncoder {
     pub fn new(cfg: &ConditionEncoderConfig, vb: VarBuilder) -> CandleResult<Self> {
         let h = cfg.hidden_size;
         let text_projector = linear_b(cfg.text_hidden_dim, h, false, vb.pp("text_projector"))?;
-        let lyric_encoder = Encoder::new(cfg, cfg.text_hidden_dim, cfg.num_lyric_encoder_hidden_layers, "lyric_encoder", vb.clone())?;
-        let timbre_encoder = Encoder::new(cfg, cfg.timbre_hidden_dim, cfg.num_timbre_encoder_hidden_layers, "timbre_encoder", vb.clone())?;
+        let lyric_encoder = Encoder::new(
+            cfg,
+            cfg.text_hidden_dim,
+            cfg.num_lyric_encoder_hidden_layers,
+            "lyric_encoder",
+            vb.clone(),
+        )?;
+        let timbre_encoder = Encoder::new(
+            cfg,
+            cfg.timbre_hidden_dim,
+            cfg.num_timbre_encoder_hidden_layers,
+            "timbre_encoder",
+            vb.clone(),
+        )?;
         let special_token = vb.get((1, 1, h), "timbre_encoder.special_token")?;
         let silence_latent = vb.get_unchecked("silence_latent")?;
         Ok(Self {
@@ -205,17 +249,26 @@ impl ConditionEncoder {
     pub fn src_latents(&self, latent_len: usize, device: &Device) -> CandleResult<Tensor> {
         let (_, t0, c) = self.silence_latent.dims3()?;
         if latent_len <= t0 {
-            self.silence_latent.narrow(1, 0, latent_len)?.to_device(device)
+            self.silence_latent
+                .narrow(1, 0, latent_len)?
+                .to_device(device)
         } else {
             let reps = latent_len.div_ceil(t0);
             let tiled = Tensor::cat(&vec![&self.silence_latent; reps], 1)?;
-            tiled.narrow(1, 0, latent_len)?.to_device(device)?.reshape((1, latent_len, c))
+            tiled
+                .narrow(1, 0, latent_len)?
+                .to_device(device)?
+                .reshape((1, latent_len, c))
         }
     }
 
     /// Build the DiT cross-attention context `[1, S, hidden]` from the prompt hidden states, the
     /// lyric token embeddings (Qwen embedding lookup), and the text-to-music timbre special token.
-    pub fn encode(&self, text_hidden: &Tensor, lyric_embeds: Option<&Tensor>) -> CandleResult<Tensor> {
+    pub fn encode(
+        &self,
+        text_hidden: &Tensor,
+        lyric_embeds: Option<&Tensor>,
+    ) -> CandleResult<Tensor> {
         let mut parts: Vec<Tensor> = Vec::new();
         parts.push(self.text_projector.forward(text_hidden)?);
         if let Some(lyric) = lyric_embeds {

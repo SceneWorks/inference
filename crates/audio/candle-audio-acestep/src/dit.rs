@@ -135,7 +135,12 @@ impl Attention {
                 cfg.attention_bias,
                 vb.pp("to_v"),
             )?,
-            to_out: linear_b(cfg.num_attention_heads * d, hidden, false, vb.pp("to_out.0"))?,
+            to_out: linear_b(
+                cfg.num_attention_heads * d,
+                hidden,
+                false,
+                vb.pp("to_out.0"),
+            )?,
             norm_q: rms_norm(d, cfg.rms_norm_eps, vb.pp("norm_q"))?,
             norm_k: rms_norm(d, cfg.rms_norm_eps, vb.pp("norm_k"))?,
             num_heads: cfg.num_attention_heads,
