@@ -30,7 +30,7 @@ The `sc-12534` sweep classified every `Uint8`/`U8` cast and float-to-`u8` host c
   `candle-gen-flux/src/pipeline.rs`, `candle-gen-flux2/src/lib.rs`,
   `candle-gen-ideogram/src/pipeline.rs`, `candle-gen-kolors/src/common.rs`,
   `candle-gen-qwen-image/src/control_common.rs`, `candle-gen-sana/src/pipeline.rs`,
-  `candle-gen-sd3/src/pipeline.rs`, both SDXL conversion paths in
+  `candle-gen-sd3/src/pipeline.rs`, `candle-gen-sensenova/src/t2i.rs`, both SDXL conversion paths in
   `candle-gen-sdxl/src/{pipeline,denoise}.rs`, and the Krea and Lens inference/training preview
   paths in `candle-gen-krea/src/{pipeline,training}.rs` and
   `candle-gen-lens/src/{lib,training,vae}.rs`.
