@@ -171,7 +171,7 @@ pub fn load_variant(spec: &LoadSpec, variant: Sd3Variant) -> Result<Box<dyn Gene
         variant,
         descriptor: variant.descriptor(),
         clip_tokenizer: loader::load_clip_tokenizer(root)?,
-        clip_pad: loader::load_clip_pad_ids(root),
+        clip_pad: loader::load_clip_pad_ids(root)?,
         t5_tokenizer: loader::load_t5_tokenizer(root)?,
         residency,
     }))

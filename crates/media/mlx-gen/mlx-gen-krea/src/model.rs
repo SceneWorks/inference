@@ -798,6 +798,27 @@ pub(crate) fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) 
         return Err(Error::Msg(format!("{id}: prompt must not be empty")));
     }
     desc.capabilities.validate_request(id, req)?;
+    let img2img_id = match id {
+        KREA_2_EDIT_ID => Some(KREA_2_RAW_ID),
+        KREA_2_TURBO_EDIT_ID => Some(KREA_2_TURBO_ID),
+        _ => None,
+    };
+    if let Some(img2img_id) = img2img_id {
+        let reference_strength = req.conditioning.iter().any(|c| {
+            matches!(
+                c,
+                Conditioning::Reference {
+                    strength: Some(_),
+                    ..
+                }
+            )
+        });
+        if req.strength.is_some() || reference_strength {
+            return Err(Error::Msg(format!(
+                "{id}: strength is not supported for edit conditioning; use {img2img_id} for img2img strength"
+            )));
+        }
+    }
     if req.steps == Some(0) {
         return Err(Error::Msg(format!("{id}: steps must be >= 1")));
     }
@@ -1314,6 +1335,26 @@ mod tests {
         r.guidance = Some(3.5);
         r.negative_prompt = Some("blurry, lowres".into());
         assert!(validate_request(&edit_descriptor(), &r).is_ok());
+    }
+
+    #[test]
+    fn edit_variants_reject_reference_and_request_strength() {
+        for (desc, img2img_id) in [
+            (edit_descriptor(), KREA_2_RAW_ID),
+            (turbo_edit_descriptor(), KREA_2_TURBO_ID),
+        ] {
+            let reference_err = validate_request(&desc, &ref_req(1, Some(0.5)))
+                .unwrap_err()
+                .to_string();
+            assert!(reference_err.contains(img2img_id), "got: {reference_err}");
+
+            let mut request_strength = ref_req(1, None);
+            request_strength.strength = Some(0.5);
+            let request_err = validate_request(&desc, &request_strength)
+                .unwrap_err()
+                .to_string();
+            assert!(request_err.contains(img2img_id), "got: {request_err}");
+        }
     }
 
     #[test]

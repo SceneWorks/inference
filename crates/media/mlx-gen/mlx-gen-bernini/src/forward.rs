@@ -22,6 +22,15 @@ use crate::guidance::{normalized_guidance, normalized_guidance_chain, MomentumBu
 use crate::rope::{apply_source_id, assign_source_ids};
 use crate::vit_guidance::{rv2v_chain, vae_txt_vit};
 
+#[cfg(test)]
+thread_local! {
+    /// Per-thread measurement seam for the F-097 regression test. Kept out of production builds so
+    /// source embedding has no instrumentation overhead.
+    static EMBED_SOURCES_CALLS: std::cell::RefCell<Vec<Vec<f64>>> = const {
+        std::cell::RefCell::new(Vec::new())
+    };
+}
+
 /// One renderer guidance mode (the renderer half of `cli.GUIDANCE_MODES`; the two `*_wapg` modes are
 /// full-Bernini ViT-planner only and out of scope here).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -122,6 +131,12 @@ impl PackedForward {
         dit: &WanTransformer,
         sources: &[(Array, f64)],
     ) -> Result<Vec<Segment>> {
+        #[cfg(test)]
+        EMBED_SOURCES_CALLS.with(|calls| {
+            calls
+                .borrow_mut()
+                .push(sources.iter().map(|(_, source_id)| *source_id).collect());
+        });
         sources
             .iter()
             .map(|(lat, sid)| {
@@ -445,8 +460,9 @@ pub struct VitGuidanceParams {
 }
 
 /// `sample_one_step` (`wan_diffusion.py` 795-1049): the full-Bernini per-step velocity over the 4
-/// prompt streams × the packed-latent variants. Each prediction is one [`PackedForward::velocity`]
-/// (≡ the reference `shared_step`) over a source subset + a chosen prompt stream:
+/// prompt streams × the packed-latent variants. Each prediction is one
+/// [`PackedForward::velocity_pre`] (≡ the reference `shared_step`) over a pre-embedded source subset
+/// + a chosen prompt stream:
 ///   - `wvae` = image ⧺ video sources; `wimgvae` = image; `wvidvae` = video; `wovae` = target only.
 ///   - `images`/`videos` are `(latent, source_id)` source lists (the target is added with id 0 inside
 ///     `velocity`).
@@ -468,18 +484,26 @@ pub fn vit_one_step(
     g: &VitGuidanceParams,
 ) -> Result<Array> {
     let wvae: Vec<(Array, f64)> = images.iter().chain(videos).cloned().collect();
-    let v =
-        |sources: &[(Array, f64)], kv: &[(Array, Array)]| pf.velocity(dit, noisy, sources, t, kv);
     let shape = noisy.shape().to_vec();
     let b = |a: &Array| -> Result<Array> { Ok(a.expand_dims(0)?) }; // [16,T,H8,W8] -> [1,16,...]
     let unb = |a: Array| -> Result<Array> { Ok(a.reshape(&shape)?) }; // back to [16,T,H8,W8]
 
     match mode {
         VitMode::VaeTxtVit | VitMode::VaeTxtVitWapg => {
-            let base = v(&[], streams.wotxt_wovit)?; // wovae · wotxt_wovit
-            let img = v(&wvae, streams.wotxt_wovit)?; // wvae  · wotxt_wovit
-            let txt = v(&wvae, streams.wtxt_wovit)?; // wvae  · wtxt_wovit
-            let vit = v(&wvae, streams.wtxt_wvit)?; // wvae  · wtxt_wvit
+            // F-097: each distinct source set is independent of the prompt stream. Embed it once
+            // per step, then reuse the exact segments for every forward that consumes that set.
+            let e_empty = pf.embed_sources(dit, &[])?;
+            let e_wvae = (!wvae.is_empty())
+                .then(|| pf.embed_sources(dit, &wvae))
+                .transpose()?;
+            let wvae_sources = e_wvae.as_deref().unwrap_or(&e_empty);
+            let v = |sources: &[Segment], kv: &[(Array, Array)]| {
+                pf.velocity_pre(dit, noisy, sources, t, kv)
+            };
+            let base = v(&e_empty, streams.wotxt_wovit)?; // wovae · wotxt_wovit
+            let img = v(wvae_sources, streams.wotxt_wovit)?; // wvae  · wotxt_wovit
+            let txt = v(wvae_sources, streams.wtxt_wovit)?; // wvae  · wtxt_wovit
+            let vit = v(wvae_sources, streams.wtxt_wvit)?; // wvae  · wtxt_wvit
             let out = vae_txt_vit(
                 &b(&base)?,
                 &b(&img)?,
@@ -493,25 +517,54 @@ pub fn vit_one_step(
             unb(out)
         }
         VitMode::Rv2vWapg | VitMode::R2vWapg => {
-            let base = v(&[], streams.wotxt_wovit)?;
+            let e_empty = pf.embed_sources(dit, &[])?;
+            // Preserve the reference's zero-weight short circuit: do not embed a source set when no
+            // enabled prediction can consume it. Empty sets reuse `e_empty`; when there are no image
+            // sources, `wvae == videos`, so both routes share the same F-097 embedding as well.
+            let needs_videos = g.omega_vid > 0.0;
+            let needs_wvae = g.omega_img > 0.0 || g.omega_txt > 0.0 || g.omega_tgt > 0.0;
+            let e_videos = (needs_videos && !videos.is_empty())
+                .then(|| pf.embed_sources(dit, videos))
+                .transpose()?;
+            let e_wvae =
+                (needs_wvae && !wvae.is_empty() && !(images.is_empty() && e_videos.is_some()))
+                    .then(|| pf.embed_sources(dit, &wvae))
+                    .transpose()?;
+            let v = |sources: &[Segment], kv: &[(Array, Array)]| {
+                pf.velocity_pre(dit, noisy, sources, t, kv)
+            };
+            let base = v(&e_empty, streams.wotxt_wovit)?;
             // `if cur_omega_X > 0` short-circuits (reuse the previous prediction, no extra forward).
             let eps_v = if g.omega_vid > 0.0 {
-                v(videos, streams.wotxt_wovit)? // wvidvae · wotxt_wovit
+                let sources = e_videos.as_deref().unwrap_or(&e_empty);
+                v(sources, streams.wotxt_wovit)? // wvidvae · wotxt_wovit
             } else {
                 base.clone()
             };
             let eps_vi = if g.omega_img > 0.0 {
-                v(&wvae, streams.wotxt_wovit)? // wvae · wotxt_wovit
+                let sources = e_wvae
+                    .as_deref()
+                    .or_else(|| images.is_empty().then_some(e_videos.as_deref()).flatten())
+                    .unwrap_or(&e_empty);
+                v(sources, streams.wotxt_wovit)? // wvae · wotxt_wovit
             } else {
                 eps_v.clone()
             };
             let eps_vti = if g.omega_txt > 0.0 {
-                v(&wvae, streams.wtxt_wovit)? // wvae · wtxt_wovit
+                let sources = e_wvae
+                    .as_deref()
+                    .or_else(|| images.is_empty().then_some(e_videos.as_deref()).flatten())
+                    .unwrap_or(&e_empty);
+                v(sources, streams.wtxt_wovit)? // wvae · wtxt_wovit
             } else {
                 eps_vi.clone()
             };
             let eps_vtic = if g.omega_tgt > 0.0 {
-                v(&wvae, streams.wtxt_wvit)? // wvae · wtxt_wvit
+                let sources = e_wvae
+                    .as_deref()
+                    .or_else(|| images.is_empty().then_some(e_videos.as_deref()).flatten())
+                    .unwrap_or(&e_empty);
+                v(sources, streams.wtxt_wvit)? // wvae · wtxt_wvit
             } else {
                 eps_vti.clone()
             };
@@ -530,8 +583,15 @@ pub fn vit_one_step(
             unb(out)
         }
         VitMode::V2vApg => {
-            let eps_uncond = v(&[], streams.wotxt_wovit)?; // wovae · wotxt_wovit
-            let eps_t = v(&wvae, streams.wtxt_wvit)?; // wvae · wtxt_wvit
+            let e_empty = pf.embed_sources(dit, &[])?;
+            let e_wvae = (!wvae.is_empty())
+                .then(|| pf.embed_sources(dit, &wvae))
+                .transpose()?;
+            let v = |sources: &[Segment], kv: &[(Array, Array)]| {
+                pf.velocity_pre(dit, noisy, sources, t, kv)
+            };
+            let eps_uncond = v(&e_empty, streams.wotxt_wovit)?; // wovae · wotxt_wovit
+            let eps_t = v(e_wvae.as_deref().unwrap_or(&e_empty), streams.wtxt_wvit)?; // wvae · wtxt_wvit
             let x0 = to_x(noisy, sigma, &eps_uncond)?;
             let xt = to_x(noisy, sigma, &eps_t)?;
             let mut buf = MomentumBuffer::new(0.0);
@@ -717,6 +777,7 @@ mod tests {
             norm_threshold: 50.0,
         };
         let t = 833.0f32;
+        EMBED_SOURCES_CALLS.with(|calls| calls.borrow_mut().clear());
         let got = vit_one_step(
             &pf,
             &dit,
@@ -730,6 +791,12 @@ mod tests {
             &g,
         )
         .unwrap();
+        let embedding_calls = EMBED_SOURCES_CALLS.with(|calls| calls.borrow().clone());
+        assert_eq!(
+            embedding_calls,
+            vec![vec![], vec![1.0]],
+            "the empty and wvae source sets must each be embedded once; wvae feeds three forwards"
+        );
 
         // Manual: the four shared_step forwards, batched, combined, unbatched.
         let base = pf.velocity(&dit, noisy, &[], t, s.wotxt_wovit).unwrap();
@@ -754,6 +821,51 @@ mod tests {
             max_abs(&got, &want),
             0.0,
             "vae_txt_vit dispatch must equal manual combine"
+        );
+
+        // With no images, `wvae` and `videos` are the same source set and feed four enabled
+        // predictions. The F-097 cache must embed that set once, not once per route or prediction.
+        let videos = [(images[0].0.clone(), 2.0)];
+        EMBED_SOURCES_CALLS.with(|calls| calls.borrow_mut().clear());
+        vit_one_step(
+            &pf,
+            &dit,
+            VitMode::Rv2vWapg,
+            noisy,
+            &[],
+            &videos,
+            t,
+            1.0,
+            &s,
+            &g,
+        )
+        .unwrap();
+        let embedding_calls = EMBED_SOURCES_CALLS.with(|calls| calls.borrow().clone());
+        assert_eq!(
+            embedding_calls,
+            vec![vec![], vec![2.0]],
+            "the shared videos/wvae set feeding four predictions must be embedded once"
+        );
+
+        EMBED_SOURCES_CALLS.with(|calls| calls.borrow_mut().clear());
+        vit_one_step(
+            &pf,
+            &dit,
+            VitMode::VaeTxtVit,
+            noisy,
+            &[],
+            &[],
+            t,
+            1.0,
+            &s,
+            &g,
+        )
+        .unwrap();
+        let embedding_calls = EMBED_SOURCES_CALLS.with(|calls| calls.borrow().clone());
+        assert_eq!(
+            embedding_calls,
+            vec![Vec::<f64>::new()],
+            "the empty wvae set must reuse the target-only embedding"
         );
     }
 

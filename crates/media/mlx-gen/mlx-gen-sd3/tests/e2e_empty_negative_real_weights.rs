@@ -164,7 +164,7 @@ fn default_empty_negative_matches_diffusers() {
     let encoders = sd3::loader::load_text_encoders(&dir).expect("load sd3 text encoders");
     let clip_tok = sd3::loader::load_clip_tokenizer(&dir).expect("load clip tokenizer");
     let t5_tok = sd3::loader::load_t5_tokenizer(&dir).expect("load t5 tokenizer");
-    let clip_pad = sd3::loader::load_clip_pad_ids(&dir);
+    let clip_pad = sd3::loader::load_clip_pad_ids(&dir).expect("load CLIP pad ids");
 
     // The uncond branch of a DEFAULT (unset) negative prompt encodes the empty string (F-004).
     let uncond = sd3::pipeline::encode_prompt(&encoders, &clip_tok, clip_pad, &t5_tok, "")

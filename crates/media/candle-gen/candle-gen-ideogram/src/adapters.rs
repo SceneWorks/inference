@@ -44,6 +44,29 @@ struct PendingLora {
     scale: f64,
 }
 
+/// Outcome of installing the bundled TurboTime LoRA as forward-time residuals.
+///
+/// Counts that previously went only to stderr are returned to the caller so applications can route
+/// them through their own observability policy. `applied` is the number of projections that received
+/// a residual; `absent_targets` and `shape_mismatched` surface recognized adapter targets that could
+/// not be installed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TurboLoraReport {
+    pub applied: usize,
+    pub absent_targets: usize,
+    pub shape_mismatched: usize,
+}
+
+impl TurboLoraReport {
+    fn from_counts(applied: usize, resolved: usize, matched: usize, shape_mismatched: usize) -> Self {
+        Self {
+            applied,
+            absent_targets: resolved - matched,
+            shape_mismatched,
+        }
+    }
+}
+
 /// Install the TurboTime LoRA at `lora_path` onto `dit` as **forward-time additive residuals** — the
 /// sole apply route, both tiers (sc-11104). Resolves every `(down, up[, alpha])` pair into unmerged
 /// factors (`a = downᵀ`, `b = upᵀ`, `scale = eff = user·(alpha/rank)`), then walks the DiT once
@@ -59,6 +82,18 @@ pub fn install_turbo_lora_additive(
     lora_path: &Path,
     scale: f32,
 ) -> Result<usize> {
+    Ok(install_turbo_lora_additive_with_report(dit, lora_path, scale)?.applied)
+}
+
+/// Install the TurboTime LoRA and return the complete structured outcome.
+///
+/// This is the report-returning form of [`install_turbo_lora_additive`]. The original function is
+/// retained as a compatibility wrapper for callers that only need the applied count.
+pub fn install_turbo_lora_additive_with_report(
+    dit: &mut Ideogram4Transformer,
+    lora_path: &Path,
+    scale: f32,
+) -> Result<TurboLoraReport> {
     if !lora_path.exists() {
         return Err(Error::Msg(format!(
             "ideogram turbo: TurboTime LoRA not found at {} (a turbo snapshot must ship it alongside transformer/)",
@@ -127,14 +162,12 @@ pub fn install_turbo_lora_additive(
             names.len()
         )));
     }
-    let absent = pending.len() - matched.len();
-    if absent > 0 || skipped > 0 {
-        eprintln!(
-            "ideogram turbo: applied {applied} additive residual(s); {absent} resolved target(s) absent \
-             from the DiT, {skipped} shape-mismatched"
-        );
-    }
-    Ok(applied)
+    Ok(TurboLoraReport::from_counts(
+        applied,
+        pending.len(),
+        matched.len(),
+        skipped,
+    ))
 }
 
 /// If `name` is a recognized "down"/"A" key whose paired "up"/"B" is also present, return
@@ -208,6 +241,18 @@ mod tests {
         assert_eq!(down_pair("m.lora_up.weight", &present), None);
     }
 
+    #[test]
+    fn report_surfaces_every_install_outcome() {
+        assert_eq!(
+            TurboLoraReport::from_counts(7, 11, 9, 2),
+            TurboLoraReport {
+                applied: 7,
+                absent_targets: 2,
+                shape_mismatched: 2,
+            }
+        );
+    }
+
     /// **The additive residual equals a fold to f32 tolerance (sc-11104 guardrail).** This is the parity
     /// that lets the turbo LoRA ride additively on both tiers instead of folding: build a q4 packed base
     /// (`AdaptLinear::from_packed`) and push the LoRA as an unmerged residual with the exact resolution
@@ -219,39 +264,21 @@ mod tests {
         use candle_gen::candle_core::{Device, Tensor};
         use candle_gen::candle_nn::{Linear, Module};
         use candle_gen::quant::{AdaptLinear, QLinear as SharedQLinear, MLX_GROUP_SIZE};
+        use candle_gen::testkit::q4_packed_with;
 
         let dev = Device::Cpu;
         let g = MLX_GROUP_SIZE;
         let (out_dim, in_dim, rank) = (64usize, 128usize, 4usize);
 
         // A group-64 Q4 pack + the exact affine grid it represents (the dense base for the fold ref).
-        let codes: Vec<u8> = (0..out_dim * in_dim)
-            .map(|i| ((i * 5 + i / 11) % 16) as u8)
-            .collect();
-        let gpr = in_dim / g;
-        let groups = out_dim * gpr;
-        let scales: Vec<f32> = (0..groups)
-            .map(|gi| 0.02 * ((gi % 5) as f32 + 1.0))
-            .collect();
-        let biases: Vec<f32> = (0..groups).map(|gi| -0.05 * (gi % 7) as f32).collect();
-        let grid: Vec<f32> = (0..out_dim * in_dim)
-            .map(|i| {
-                let (row, col) = (i / in_dim, i % in_dim);
-                let gi = row * gpr + col / g;
-                scales[gi] * codes[i] as f32 + biases[gi]
-            })
-            .collect();
-        let words: Vec<u32> = codes
-            .chunks_exact(8)
-            .map(|c| {
-                c.iter()
-                    .enumerate()
-                    .fold(0u32, |acc, (i, &q)| acc | ((q as u32 & 0xF) << (4 * i)))
-            })
-            .collect();
-        let wq = Tensor::from_vec(words, (out_dim, in_dim / 8), &dev)?;
-        let s = Tensor::from_vec(scales, (out_dim, gpr), &dev)?;
-        let b = Tensor::from_vec(biases, (out_dim, gpr), &dev)?;
+        let (wq, s, b, grid) = q4_packed_with(
+            out_dim,
+            in_dim,
+            g,
+            |i| ((i * 5 + i / 11) % 16) as u8,
+            |group| 0.02 * ((group % 5) as f32 + 1.0),
+            |group| -0.05 * (group % 7) as f32,
+        );
         let grid = Tensor::from_vec(grid, (out_dim, in_dim), &dev)?;
 
         // A LoRA: down [rank, in], up [out, rank], alpha 8 (⇒ ratio alpha/rank = 2), user scale 1.0.

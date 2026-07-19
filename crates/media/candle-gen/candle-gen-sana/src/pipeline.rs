@@ -198,6 +198,12 @@ pub struct SanaGenerateRequest<'a> {
     pub scheduler: Option<&'a str>,
 }
 
+/// Seed-independent base-SANA prompt conditioning, prepared once for a whole image batch.
+pub(crate) struct SanaConditioning {
+    cond: Tensor,
+    uncond: Option<Tensor>,
+}
+
 impl<'a> SanaGenerateRequest<'a> {
     /// A 1024px request for `prompt` with all diffusers defaults.
     pub fn new(prompt: &'a str) -> Self {
@@ -266,21 +272,41 @@ impl SanaPipeline {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
-        let steps = req.steps.unwrap_or(DEFAULT_STEPS);
         let guidance = req.guidance_scale.unwrap_or(DEFAULT_GUIDANCE);
-        let seed = req.seed.unwrap_or(0);
+        let conditioning = self.encode_conditioning(req, guidance)?;
+        self.generate_with_conditioning(req, &conditioning, device, cancel, on_progress)
+    }
 
-        // Conditioning is seed-independent — encode once. Cond = the prompt; uncond = the negative
-        // prompt (empty string when unset), used only when CFG is active. diffusers gates CFG on
-        // `do_classifier_free_guidance = guidance_scale > 1.0`.
+    /// Encode the seed-independent prompt inputs once for a whole `count` batch.
+    pub(crate) fn encode_conditioning(
+        &self,
+        req: &SanaGenerateRequest<'_>,
+        guidance: f32,
+    ) -> Result<SanaConditioning> {
         let cond = self.text_encoder.encode(req.prompt)?;
-        let cfg_on = guidance > 1.0;
-        let uncond = if cfg_on {
-            let neg = req.negative_prompt.unwrap_or("");
-            Some(self.text_encoder.encode(neg)?)
+        let uncond = if guidance > 1.0 {
+            Some(
+                self.text_encoder
+                    .encode(req.negative_prompt.unwrap_or(""))?,
+            )
         } else {
             None
         };
+        Ok(SanaConditioning { cond, uncond })
+    }
+
+    /// Run the seed-dependent sampling and decode tail with precomputed conditioning.
+    pub(crate) fn generate_with_conditioning(
+        &self,
+        req: &SanaGenerateRequest<'_>,
+        conditioning: &SanaConditioning,
+        device: &Device,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
+        let steps = req.steps.unwrap_or(DEFAULT_STEPS);
+        let guidance = req.guidance_scale.unwrap_or(DEFAULT_GUIDANCE);
+        let seed = req.seed.unwrap_or(0);
 
         // Static shift=3.0 schedule (scheduler_config.json), resolution-independent. An unset scheduler
         // keeps it byte-exact; a curated name re-shapes σ over the same mu=ln(3).
@@ -293,8 +319,8 @@ impl SanaPipeline {
             req.sampler,
             seed,
             latents,
-            &cond,
-            uncond.as_ref(),
+            &conditioning.cond,
+            conditioning.uncond.as_ref(),
             guidance,
             device,
             cancel,
@@ -515,11 +541,28 @@ impl SanaSprintPipeline {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
+        let cond = self.encode_conditioning(req.prompt)?;
+        self.generate_with_conditioning(req, &cond, device, cancel, on_progress)
+    }
+
+    /// Encode the seed-independent Sprint prompt once for a whole `count` batch.
+    pub(crate) fn encode_conditioning(&self, prompt: &str) -> Result<Tensor> {
+        self.text_encoder.encode(prompt)
+    }
+
+    /// Run the seed-dependent Sprint sampling and decode tail with precomputed conditioning.
+    pub(crate) fn generate_with_conditioning(
+        &self,
+        req: &SanaGenerateRequest<'_>,
+        cond: &Tensor,
+        device: &Device,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
         let steps = req.steps.unwrap_or(SPRINT_DEFAULT_STEPS);
         let guidance = req.guidance_scale.unwrap_or(SPRINT_DEFAULT_GUIDANCE);
         let seed = req.seed.unwrap_or(0);
 
-        let cond = self.text_encoder.encode(req.prompt)?;
         let scheduler = ScmScheduler::new(steps);
         let latents = create_noise(device, seed, req.width, req.height)?;
         let latents = denoise_sprint(
@@ -527,7 +570,7 @@ impl SanaSprintPipeline {
             &scheduler,
             seed,
             latents,
-            &cond,
+            cond,
             guidance,
             self.guidance_embeds_scale,
             device,

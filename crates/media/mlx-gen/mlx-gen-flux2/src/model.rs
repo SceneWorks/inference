@@ -1026,6 +1026,26 @@ pub(crate) fn validate_request(
                 desc.id
             )));
         }
+        let reference_strength = req.conditioning.iter().any(|c| {
+            matches!(
+                c,
+                mlx_gen::Conditioning::Reference {
+                    strength: Some(_),
+                    ..
+                }
+            )
+        });
+        if req.strength.is_some() || reference_strength {
+            let img2img_id = if desc.id == crate::config::FLUX2_DEV_EDIT_ID {
+                crate::config::FLUX2_DEV_ID
+            } else {
+                crate::config::FLUX2_KLEIN_9B_ID
+            };
+            return Err(Error::Msg(format!(
+                "{}: strength is not supported for edit conditioning; use {img2img_id} for img2img strength",
+                desc.id
+            )));
+        }
     }
     // image_guidance (reference true-CFG) is honored ONLY on the non-kv EDIT path — it needs the
     // uncached `include_ref=false` forward against a present reference. Everywhere else a set value is
@@ -1279,6 +1299,38 @@ mod tests {
         };
         model.validate(&req).unwrap();
         assert_eq!(model.collect_edit_references(&req).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn all_edit_variants_reject_reference_and_request_strength() {
+        for (variant, img2img_id) in [
+            (Flux2Variant::Klein9bEdit, FLUX2_KLEIN_9B_ID),
+            (Flux2Variant::Klein9bKvEdit, FLUX2_KLEIN_9B_ID),
+            (Flux2Variant::DevEdit, FLUX2_DEV_ID),
+        ] {
+            let model = Flux2::new_for_tests(variant);
+            let reference_strength = GenerationRequest {
+                prompt: "edit it".into(),
+                conditioning: vec![Conditioning::Reference {
+                    image: Image::default(),
+                    strength: Some(0.5),
+                }],
+                ..Default::default()
+            };
+            let reference_err = model.validate(&reference_strength).unwrap_err().to_string();
+            assert!(reference_err.contains(img2img_id), "got: {reference_err}");
+
+            let request_strength = GenerationRequest {
+                strength: Some(0.5),
+                conditioning: vec![Conditioning::Reference {
+                    image: Image::default(),
+                    strength: None,
+                }],
+                ..reference_strength
+            };
+            let request_err = model.validate(&request_strength).unwrap_err().to_string();
+            assert!(request_err.contains(img2img_id), "got: {request_err}");
+        }
     }
 
     #[test]

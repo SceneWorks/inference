@@ -25,6 +25,7 @@
 //! weight installed over the mmap) and the packed **dequant-fold** (reconstruct the dense grid, fold,
 //! install a dense override).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::safetensors::MmapedSafetensors;
@@ -51,8 +52,8 @@ pub struct Weights {
 }
 
 impl Weights {
-    /// mmap every `*.safetensors` in `dir` (sorted; later files win on name collision), reading the
-    /// component `config.json`'s `quantization.group_size` (if any) for the packed-tier path.
+    /// mmap every `*.safetensors` in `dir` (sorted), rejecting tensor names duplicated across files,
+    /// and read the component `config.json`'s `quantization.group_size` (if any) for the packed tier.
     pub fn from_dir(dir: &Path, device: &Device, dtype: DType) -> Result<Self> {
         let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
             .map_err(|e| Error::Msg(format!("ideogram: read {}: {e}", dir.display())))?
@@ -67,6 +68,7 @@ impl Weights {
                 dir.display()
             )));
         }
+        validate_unique_tensor_names(&files)?;
         // SAFETY: read-only mmap of weight files; the standard candle loading path.
         let st = unsafe { MmapedSafetensors::multi(&files)? };
         Ok(Self {
@@ -111,6 +113,27 @@ impl Weights {
     fn group_size(&self) -> usize {
         self.packed_group_size.unwrap_or(MLX_GROUP_SIZE)
     }
+}
+
+/// Validate shard keys through their mmaped safetensors headers before constructing the combined
+/// loader. A duplicate is a malformed or polluted checkpoint, never an ordering policy.
+fn validate_unique_tensor_names(files: &[PathBuf]) -> Result<()> {
+    let mut owners: HashMap<String, &Path> = HashMap::new();
+    for file in files {
+        // SAFETY: read-only mmap used only to inspect this process-owned weight file's header.
+        let shard = unsafe { MmapedSafetensors::new(file)? };
+        for (name, _) in shard.tensors() {
+            if let Some(first_file) = owners.insert(name.clone(), file.as_path()) {
+                return Err(Error::Msg(format!(
+                    "ideogram: duplicate tensor key {name:?} in {} and {}: each tensor must live in \
+                     exactly one .safetensors file",
+                    first_file.display(),
+                    file.display()
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Read `{dir}/config.json`'s `quantization.group_size` — `None` when the block is absent (the
@@ -210,44 +233,11 @@ pub fn embedding_detect(w: &Weights, base: &str) -> Result<QEmbedding> {
 mod tests {
     use super::*;
     use candle_gen::candle_core::safetensors;
+    use candle_gen::testkit::{q4_packed, tensor_cosine};
     use std::collections::HashMap;
 
     /// The Ideogram MLX tier's group size (64 — the MLX default; the converter emits no config block).
     const G: usize = 64;
-
-    /// Build an MLX group-64 Q4 packed triple for an `[out, in]` weight — `(wq u32, scales, biases,
-    /// affine grid)`. The affine grid is the exact dense weight the pack represents.
-    fn q4_packed(out_dim: usize, in_dim: usize) -> (Tensor, Tensor, Tensor, Tensor) {
-        let dev = Device::Cpu;
-        let codes: Vec<u8> = (0..out_dim * in_dim)
-            .map(|i| ((i * 7 + i / 13) % 16) as u8)
-            .collect();
-        let groups = out_dim * in_dim / G;
-        let scales: Vec<f32> = (0..groups).map(|g| 0.0625 * (g as f32 + 1.0)).collect();
-        let biases: Vec<f32> = (0..groups).map(|g| -0.5 - 0.25 * g as f32).collect();
-        let gpr = in_dim / G;
-        let grid: Vec<f32> = (0..out_dim * in_dim)
-            .map(|i| {
-                let (row, col) = (i / in_dim, i % in_dim);
-                let g = row * gpr + col / G;
-                scales[g] * codes[i] as f32 + biases[g]
-            })
-            .collect();
-        let words: Vec<u32> = codes
-            .chunks_exact(8)
-            .map(|c| {
-                c.iter()
-                    .enumerate()
-                    .fold(0u32, |acc, (i, &q)| acc | ((q as u32 & 0xF) << (4 * i)))
-            })
-            .collect();
-        (
-            Tensor::from_vec(words, (out_dim, in_dim / 8), &dev).unwrap(),
-            Tensor::from_vec(scales, (out_dim, gpr), &dev).unwrap(),
-            Tensor::from_vec(biases, (out_dim, gpr), &dev).unwrap(),
-            Tensor::from_vec(grid, (out_dim, in_dim), &dev).unwrap(),
-        )
-    }
 
     /// Write a component dir. `config`: `None` writes no `config.json` (the real ideogram tier —
     /// packed-detect must still fire off the `.scales` sibling); `Some(gs)` writes a
@@ -261,16 +251,43 @@ mod tests {
         }
     }
 
-    fn cosine(a: &Tensor, b: &Tensor) -> f64 {
-        let a = a.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        let b = b.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
-        for (x, y) in a.iter().zip(&b) {
-            dot += (*x as f64) * (*y as f64);
-            na += (*x as f64) * (*x as f64);
-            nb += (*y as f64) * (*y as f64);
-        }
-        dot / (na.sqrt() * nb.sqrt() + 1e-12)
+    #[test]
+    fn from_dir_rejects_duplicate_tensor_names_across_files() {
+        let dev = Device::Cpu;
+        let dir = std::env::temp_dir().join(format!("sc12513_duplicate_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut first = HashMap::new();
+        first.insert(
+            "layers.0.attention.qkv.weight".to_string(),
+            Tensor::new(&[1f32], &dev).unwrap(),
+        );
+        let mut second = HashMap::new();
+        second.insert(
+            "layers.0.attention.qkv.weight".to_string(),
+            Tensor::new(&[2f32], &dev).unwrap(),
+        );
+        safetensors::save(&first, dir.join("model-00001-of-00002.safetensors")).unwrap();
+        safetensors::save(&second, dir.join("model-00002-of-00002.safetensors")).unwrap();
+
+        let err = Weights::from_dir(&dir, &dev, DType::F32)
+            .err()
+            .expect("duplicate tensor names must fail before the combined mmap is built");
+        let message = err.to_string();
+        assert!(
+            message.contains("layers.0.attention.qkv.weight"),
+            "must name the colliding tensor: {message}"
+        );
+        assert!(
+            message.contains("model-00001-of-00002.safetensors"),
+            "must name the first file: {message}"
+        );
+        assert!(
+            message.contains("model-00002-of-00002.safetensors"),
+            "must name the offending file: {message}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// **Packed-detect fires on the ideogram key layout WITHOUT a config block (sc-9412).** The real
@@ -283,7 +300,8 @@ mod tests {
     fn linear_detect_fires_without_config_block_and_leaves_dense_unchanged() -> Result<()> {
         let dev = Device::Cpu;
         let (out_dim, in_dim) = (128usize, 256usize);
-        let (wq, s, b, grid) = q4_packed(out_dim, in_dim);
+        let (wq, s, b, grid) = q4_packed(out_dim, in_dim, G);
+        let grid = Tensor::from_vec(grid, (out_dim, in_dim), &dev)?;
         let dense_w = Tensor::randn(0f32, 1f32, (256usize, 256usize), &dev)?;
 
         let mut map: HashMap<String, Tensor> = HashMap::new();
@@ -311,7 +329,7 @@ mod tests {
         // The packed forward reproduces the affine grid (group-64 default + dequant-on-forward).
         let grid_lin = dense_adapt(Linear::new(grid, None));
         let x = Tensor::randn(0f32, 1f32, (4, in_dim), &dev)?;
-        let cos = cosine(&packed.forward(&x)?, &grid_lin.forward(&x)?);
+        let cos = tensor_cosine(&packed.forward(&x)?, &grid_lin.forward(&x)?);
         assert!(cos > 0.99999, "group-64 packed vs grid cosine {cos:.6}");
 
         std::fs::remove_dir_all(&dir).ok();
@@ -349,7 +367,8 @@ mod tests {
     fn packed_linear_with_dense_bias() -> Result<()> {
         let dev = Device::Cpu;
         let (out_dim, in_dim) = (128usize, 256usize);
-        let (wq, s, b, grid) = q4_packed(out_dim, in_dim);
+        let (wq, s, b, grid) = q4_packed(out_dim, in_dim, G);
+        let grid = Tensor::from_vec(grid, (out_dim, in_dim), &dev)?;
         let dbias = Tensor::randn(0f32, 1f32, (out_dim,), &dev)?;
 
         let mut map: HashMap<String, Tensor> = HashMap::new();
@@ -365,7 +384,7 @@ mod tests {
         assert!(packed.is_packed());
         let dense = dense_adapt(Linear::new(grid, Some(dbias)));
         let x = Tensor::randn(0f32, 1f32, (4, in_dim), &dev)?;
-        let cos = cosine(&packed.forward(&x)?, &dense.forward(&x)?);
+        let cos = tensor_cosine(&packed.forward(&x)?, &dense.forward(&x)?);
         assert!(
             cos > 0.99999,
             "packed+bias vs dense-grid+bias cosine {cos:.6}"

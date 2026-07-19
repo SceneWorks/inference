@@ -33,7 +33,7 @@ use core_llm::schedule::{Scheduler, SeqId, SeqSpec};
 use core_llm::FinishReason as CoreFinish;
 
 use crate::decode::stream::{default_seed, FinishReason, GenerationOutput, StreamEvent};
-use crate::decode::CancelFlag;
+use crate::decode::{record_lane_token, CancelFlag, LaneStep};
 use crate::error::{Error, Result};
 use crate::models::CausalLm;
 use crate::primitives::kv_cache::KvCache;
@@ -75,12 +75,6 @@ struct Lane {
     history: Vec<i32>,
     /// The most recently sampled token, awaiting its feed into the next decode step.
     next_token: i32,
-}
-
-/// Whether a lane keeps decoding after a token, or has retired.
-enum LaneStep {
-    Continue,
-    Done,
 }
 
 /// Generate for a batch of requests in one continuous-batched run, returning a [`GenerationOutput`]
@@ -304,38 +298,13 @@ fn apply_token(
     tok: i32,
     on_event: &mut dyn FnMut(usize, StreamEvent),
 ) -> LaneStep {
-    let ri = lane.seq.0;
-    match sched.record(lane.seq, tok) {
-        Some(CoreFinish::Stop) => {
-            on_event(
-                ri,
-                StreamEvent::Done {
-                    reason: FinishReason::StopToken,
-                    generated: sched.generated(lane.seq).len(),
-                },
-            );
-            LaneStep::Done
-        }
-        other => {
-            let step = sched.generated(lane.seq).len() - 1;
-            on_event(ri, StreamEvent::Token { id: tok, step });
-            lane.history.push(tok);
-            match other {
-                Some(CoreFinish::Length) => {
-                    on_event(
-                        ri,
-                        StreamEvent::Done {
-                            reason: FinishReason::MaxTokens,
-                            generated: sched.generated(lane.seq).len(),
-                        },
-                    );
-                    LaneStep::Done
-                }
-                _ => {
-                    lane.next_token = tok;
-                    LaneStep::Continue
-                }
-            }
-        }
-    }
+    record_lane_token(
+        sched,
+        lane.seq,
+        lane.seq.0,
+        tok,
+        &mut lane.history,
+        &mut lane.next_token,
+        on_event,
+    )
 }

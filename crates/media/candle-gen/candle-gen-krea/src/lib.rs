@@ -459,6 +459,20 @@ fn img2img_reference(req: &GenerationRequest) -> Option<(&Image, Option<f32>)> {
 /// than the cap is an error. Borrows from `req.conditioning`; the generate path clones the resolved set
 /// into the owned `&[Image]` the pipeline consumes. Pure so it is unit-testable without weights.
 fn resolve_edit_references(req: &GenerationRequest) -> gen_core::Result<Vec<&Image>> {
+    let reference_strength = req.conditioning.iter().any(|c| {
+        matches!(
+            c,
+            Conditioning::Reference {
+                strength: Some(_),
+                ..
+            }
+        )
+    });
+    if req.strength.is_some() || reference_strength {
+        return Err(gen_core::Error::Msg(format!(
+            "{KREA_2_EDIT_ID}: strength is not supported for edit conditioning; use {KREA_2_RAW_ID} for img2img strength"
+        )));
+    }
     let mut refs: Vec<&Image> = Vec::new();
     for c in &req.conditioning {
         match c {
@@ -1150,6 +1164,38 @@ mod tests {
         };
         let err = resolve_edit_references(&three).unwrap_err().to_string();
         assert!(err.contains("at most 2"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_edit_references_rejects_reference_and_request_strength() {
+        let reference_strength = GenerationRequest {
+            prompt: "make it autumn".into(),
+            conditioning: vec![Conditioning::Reference {
+                image: ref_image(2, 2),
+                strength: Some(0.5),
+            }],
+            ..Default::default()
+        };
+        let reference_err = resolve_edit_references(&reference_strength)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            reference_err.contains(KREA_2_RAW_ID),
+            "got: {reference_err}"
+        );
+
+        let request_strength = GenerationRequest {
+            strength: Some(0.5),
+            conditioning: vec![Conditioning::Reference {
+                image: ref_image(2, 2),
+                strength: None,
+            }],
+            ..reference_strength
+        };
+        let request_err = resolve_edit_references(&request_strength)
+            .unwrap_err()
+            .to_string();
+        assert!(request_err.contains(KREA_2_RAW_ID), "got: {request_err}");
     }
 
     // --- Turbo img2img (reference-guided latent-init) — sc-10134 / epic 8588 ---

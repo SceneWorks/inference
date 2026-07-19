@@ -156,24 +156,31 @@ fn clip_eos_id(tok: &Tokenizer) -> CandleResult<u32> {
         .ok_or_else(|| CandleError::Msg("sd3: CLIP tokenizer missing <|endoftext|>".into()))
 }
 
-fn resolve_clip_pad_id(dir: &Path, tok: &Tokenizer, eos_id: u32) -> u32 {
+fn resolve_clip_pad_id(dir: &Path, tok: &Tokenizer, eos_id: u32) -> CandleResult<u32> {
     // `tokenizer_config.json` -> `pad_token` (a string, e.g. "!" or "<|endoftext|>"); map to its id.
     let cfg = dir.join("tokenizer_config.json");
-    let pad_str = std::fs::read_to_string(&cfg)
-        .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-        .and_then(|v| match &v["pad_token"] {
-            // `pad_token` is either a bare string or an `AddedToken`-shaped object with `content`.
-            serde_json::Value::String(s) => Some(s.clone()),
-            serde_json::Value::Object(o) => {
-                o.get("content").and_then(|c| c.as_str().map(String::from))
-            }
-            _ => None,
-        });
-    match pad_str {
+    let config = match std::fs::read_to_string(&cfg) {
+        Ok(config) => config,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(eos_id),
+        Err(error) => {
+            return Err(CandleError::Msg(format!(
+                "sd3: read {}: {error}",
+                cfg.display()
+            )))
+        }
+    };
+    let value = serde_json::from_str::<serde_json::Value>(&config)
+        .map_err(|error| CandleError::Msg(format!("sd3: parse {}: {error}", cfg.display())))?;
+    let pad_str = match &value["pad_token"] {
+        // `pad_token` is either a bare string or an `AddedToken`-shaped object with `content`.
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Object(o) => o.get("content").and_then(|c| c.as_str().map(String::from)),
+        _ => None,
+    };
+    Ok(match pad_str {
         Some(s) => tok.get_vocab(true).get(&s).copied().unwrap_or(eos_id),
         None => eos_id,
-    }
+    })
 }
 
 /// Right-pad / hard-truncate a CLIP token row to exactly `CLIP_MAX_LEN`. SD3.5's diffusers pipeline
@@ -269,8 +276,8 @@ impl Sd3TextEncoders {
         // eos id (49407 in the canonical CLIP vocab) is the fallback for either.
         let eos_l = clip_eos_id(&tok_l)?;
         let eos_g = clip_eos_id(&tok_g)?;
-        let pad_l = resolve_clip_pad_id(&root.join("tokenizer"), &tok_l, eos_l);
-        let pad_g = resolve_clip_pad_id(&root.join("tokenizer_2"), &tok_g, eos_g);
+        let pad_l = resolve_clip_pad_id(&root.join("tokenizer"), &tok_l, eos_l)?;
+        let pad_g = resolve_clip_pad_id(&root.join("tokenizer_2"), &tok_g, eos_g)?;
         // T5 ships its own `tokenizer.json` in a stock snapshot (out of scope for sc-8500).
         let tok_t5 = Tokenizer::from_file(root.join("tokenizer_3/tokenizer.json"))
             .map_err(|e| CandleError::Msg(format!("sd3: load T5 tokenizer: {e}")))?;
@@ -580,7 +587,7 @@ mod tests {
         // bigG-style config: pad_token = "!" (a bare string) -> id 0.
         std::fs::write(dir.join("tokenizer_config.json"), r#"{"pad_token":"!"}"#).unwrap();
         assert_eq!(
-            resolve_clip_pad_id(&dir, &tok, 49407),
+            resolve_clip_pad_id(&dir, &tok, 49407).unwrap(),
             0,
             "bigG pads with ! (0)"
         );
@@ -592,7 +599,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            resolve_clip_pad_id(&dir, &tok, 49407),
+            resolve_clip_pad_id(&dir, &tok, 49407).unwrap(),
             49407,
             "L pads with eos"
         );
@@ -604,7 +611,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            resolve_clip_pad_id(&dir, &tok, 49407),
+            resolve_clip_pad_id(&dir, &tok, 49407).unwrap(),
             0,
             "object-shaped pad_token"
         );
@@ -612,9 +619,26 @@ mod tests {
         // No config file -> fall back to eos.
         std::fs::remove_file(dir.join("tokenizer_config.json")).unwrap();
         assert_eq!(
-            resolve_clip_pad_id(&dir, &tok, 49407),
+            resolve_clip_pad_id(&dir, &tok, 49407).unwrap(),
             49407,
             "missing config -> eos fallback"
+        );
+
+        std::fs::write(dir.join("tokenizer_config.json"), "{").unwrap();
+        let error = resolve_clip_pad_id(&dir, &tok, 49407).unwrap_err();
+        assert!(
+            matches!(error, CandleError::Msg(ref message) if
+                message.contains("parse") && message.contains("tokenizer_config.json")),
+            "corrupt config must return a contextual parse error, got: {error}"
+        );
+
+        std::fs::remove_file(dir.join("tokenizer_config.json")).unwrap();
+        std::fs::create_dir(dir.join("tokenizer_config.json")).unwrap();
+        let error = resolve_clip_pad_id(&dir, &tok, 49407).unwrap_err();
+        assert!(
+            matches!(error, CandleError::Msg(ref message) if
+                message.contains("read") && message.contains("tokenizer_config.json")),
+            "a present unreadable config must return a contextual read error, got: {error}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

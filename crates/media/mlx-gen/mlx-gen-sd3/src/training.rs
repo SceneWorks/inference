@@ -246,7 +246,7 @@ pub fn load_trainer_for(spec: &LoadSpec, variant: Sd3Variant) -> Result<Box<dyn 
     };
     let arch = variant.arch();
     let clip_tokenizer = loader::load_clip_tokenizer(&root)?;
-    let clip_pad = loader::load_clip_pad_ids(&root);
+    let clip_pad = loader::load_clip_pad_ids(&root)?;
     let t5_tokenizer = loader::load_t5_tokenizer(&root)?;
     let mut encoders = loader::load_text_encoders(&root)?;
     encoders.quantize(TRAINER_ENCODER_BITS)?;

@@ -125,53 +125,8 @@ mod tests {
     use super::*;
     use candle_gen::candle_core::safetensors::MmapedSafetensors;
     use candle_gen::candle_core::{DType, Device};
+    use candle_gen::testkit::{q4_packed, tensor_cosine};
     use std::collections::HashMap;
-
-    /// Test-side MLX Q4 packer: per-element 4-bit codes → MLX u32 words (LSB-first nibbles), group 64.
-    /// Returns `(wq [out, in/8] u32, scales [out, in/64], biases [out, in/64], affine grid [out, in])`
-    /// — the exact packed-parts fixture the detect loaders consume, plus the affine grid they reproduce.
-    fn q4_packed(out_dim: usize, in_dim: usize) -> (Tensor, Tensor, Tensor, Vec<f32>) {
-        let dev = Device::Cpu;
-        const G: usize = 64;
-        let codes: Vec<u8> = (0..out_dim * in_dim)
-            .map(|i| ((i * 7 + i / 13) % 16) as u8)
-            .collect();
-        let groups = out_dim * in_dim / G;
-        let scales: Vec<f32> = (0..groups).map(|g| 0.0625 * (g as f32 + 1.0)).collect();
-        let biases: Vec<f32> = (0..groups).map(|g| -0.5 - 0.25 * g as f32).collect();
-        let gpr = in_dim / G;
-        let grid: Vec<f32> = (0..out_dim * in_dim)
-            .map(|i| {
-                let (row, col) = (i / in_dim, i % in_dim);
-                let g = row * gpr + col / G;
-                scales[g] * codes[i] as f32 + biases[g]
-            })
-            .collect();
-        let words: Vec<u32> = codes
-            .chunks_exact(8)
-            .map(|c| {
-                c.iter()
-                    .enumerate()
-                    .fold(0u32, |acc, (i, &q)| acc | ((q as u32 & 0xF) << (4 * i)))
-            })
-            .collect();
-        let wq = Tensor::from_vec(words, (out_dim, in_dim / 8), &dev).unwrap();
-        let s = Tensor::from_vec(scales, (out_dim, gpr), &dev).unwrap();
-        let b = Tensor::from_vec(biases, (out_dim, gpr), &dev).unwrap();
-        (wq, s, b, grid)
-    }
-
-    fn cosine(a: &Tensor, b: &Tensor) -> f32 {
-        let a = a.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        let b = b.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
-        for (x, y) in a.iter().zip(&b) {
-            dot += (*x as f64) * (*y as f64);
-            na += (*x as f64) * (*x as f64);
-            nb += (*y as f64) * (*y as f64);
-        }
-        (dot / (na.sqrt() * nb.sqrt() + 1e-12)) as f32
-    }
 
     /// **Packed-detect fires on the Chroma DiT key layout (incl. the `attn.to_out.0` nesting and a
     /// biased projection).** Writes a safetensors mimicking the real Chroma packed layout — a
@@ -184,7 +139,7 @@ mod tests {
     fn linear_detect_fires_on_to_out_remap_and_leaves_dense_unchanged() -> Result<()> {
         let dev = Device::Cpu;
         let (out_dim, in_dim) = (64usize, 128usize);
-        let (wq, s, b, grid) = q4_packed(out_dim, in_dim);
+        let (wq, s, b, grid) = q4_packed(out_dim, in_dim, 64);
         let bias_vec: Vec<f32> = (0..out_dim).map(|i| 0.01 * i as f32).collect();
 
         let mut map: HashMap<String, Tensor> = HashMap::new();
@@ -230,7 +185,7 @@ mod tests {
             Some(Tensor::from_vec(bias_vec, (out_dim,), &dev)?),
         ));
         let x = Tensor::randn(0f32, 1f32, (4, in_dim), &dev)?;
-        let cos = cosine(&packed.forward(&x)?, &grid_lin.forward(&x)?);
+        let cos = tensor_cosine(&packed.forward(&x)?, &grid_lin.forward(&x)?);
         assert!(cos > 0.99999, "packed vs affine-grid cosine {cos:.6}");
 
         std::fs::remove_file(&tmp).ok();
@@ -296,7 +251,7 @@ mod tests {
             None,
         ));
         let x = Tensor::randn(0f32, 1f32, (3, in_dim), &dev)?;
-        let cos = cosine(&packed.forward(&x)?, &grid_lin.forward(&x)?);
+        let cos = tensor_cosine(&packed.forward(&x)?, &grid_lin.forward(&x)?);
         assert!(cos > 0.99999, "group-32 packed vs grid cosine {cos:.6}");
 
         std::fs::remove_file(&tmp).ok();

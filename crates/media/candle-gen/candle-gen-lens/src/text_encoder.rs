@@ -42,7 +42,9 @@ use candle_gen::candle_nn::{
     embedding, linear, linear_no_bias, ops::sigmoid, ops::softmax_last_dim, rms_norm, Embedding,
     Linear, Module, RmsNorm, VarBuilder,
 };
+use candle_gen::gen_core::CancelFlag;
 use candle_gen::quant as shared;
+use candle_gen::CandleError;
 
 // --- Config -----------------------------------------------------------------
 
@@ -1063,8 +1065,15 @@ impl LensReasonerModel {
     /// **Greedy** autoregressive generation (the parity path): prefill `input_ids`, then decode until
     /// the harmony `<|return|>` stop or `max_new_tokens`. Returns the **new** tokens (including the
     /// trailing stop, which [`crate::text::clean_reasoner_output`] strips) — mirroring the vendor
-    /// `out_ids[0, input_len:]`.
-    pub fn generate_greedy(&self, input_ids: &[u32], max_new_tokens: usize) -> Result<Vec<u32>> {
+    /// `out_ids[0, input_len:]`. The mandatory `cancel` flag is checked before prefill and before
+    /// every subsequent decode step.
+    pub fn generate_greedy(
+        &self,
+        input_ids: &[u32],
+        max_new_tokens: usize,
+        cancel: &CancelFlag,
+    ) -> candle_gen::Result<Vec<u32>> {
+        check_reasoner_cancel(cancel)?;
         let mut caches: Vec<KvCache> = (0..self.layers.len()).map(|_| KvCache::default()).collect();
         let l = input_ids.len();
         let prompt = Tensor::from_vec(input_ids.to_vec(), (1, l), &self.device)?;
@@ -1075,6 +1084,7 @@ impl LensReasonerModel {
         let mut position = l;
         let mut out = vec![next];
         while out.len() < max_new_tokens && next != crate::text::HARMONY_RETURN {
+            check_reasoner_cancel(cancel)?;
             let tok = Tensor::from_vec(vec![next], (1, 1), &self.device)?;
             let h = self.embed_tokens.forward(&tok)?;
             let h = self.run_layers(h, &mut caches, position, false)?;
@@ -1101,9 +1111,39 @@ impl LensReasonerModel {
     }
 }
 
+/// Return the crate's typed cancellation error before beginning another reasoner decode step.
+fn check_reasoner_cancel(cancel: &CancelFlag) -> candle_gen::Result<()> {
+    if cancel.is_cancelled() {
+        return Err(CandleError::Canceled);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pre_cancelled_reasoner_aborts_before_the_decode_cap() {
+        let cancel = CancelFlag::new();
+        cancel.cancel();
+
+        let mut decode_steps = 0;
+        let result: candle_gen::Result<()> = (|| {
+            check_reasoner_cancel(&cancel)?;
+            for _ in 0..crate::reasoner::DEFAULT_MAX_NEW_TOKENS {
+                decode_steps += 1;
+                check_reasoner_cancel(&cancel)?;
+            }
+            Ok(())
+        })();
+
+        assert!(matches!(result, Err(CandleError::Canceled)));
+        assert_eq!(
+            decode_steps, 0,
+            "pre-cancel must abort before any decode step"
+        );
+    }
 
     // Dequantize a single 16-byte block (32 values) at the given e8m0 scale.
     fn one_block(bytes: Vec<u8>, scale: u8) -> Vec<f32> {

@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::quantized::GgmlDType;
 use candle_gen::candle_core::DType;
+use candle_gen::gen_core::CancelFlag;
 use candle_gen::{CandleError, Result as CResult};
 
 use crate::text::{clean_reasoner_output, LensTokenizer};
@@ -55,13 +56,22 @@ impl LensReasoner {
 
     /// Refine one prompt via the local gpt-oss (greedy decode). `date` fills the harmony preamble's
     /// `Current date:` line. Returns the cleaned final-channel rewrite, or the original `prompt` when
-    /// the reasoner produced no usable final text (the vendor `clean_text_out or prompt`).
-    pub fn refine(&self, prompt: &str, max_new_tokens: usize, date: &str) -> CResult<String> {
+    /// the reasoner produced no usable final text (the vendor `clean_text_out or prompt`). The
+    /// mandatory `cancel` flag is polled throughout the model's autoregressive decode.
+    pub fn refine(
+        &self,
+        prompt: &str,
+        max_new_tokens: usize,
+        date: &str,
+        cancel: &CancelFlag,
+    ) -> CResult<String> {
         let input_ids = self.tokenizer.encode_reasoner(prompt, date)?;
         if input_ids.is_empty() {
             return Err(CandleError::Msg("lens reasoner: empty tokenization".into()));
         }
-        let new_tokens = self.model.generate_greedy(&input_ids, max_new_tokens)?;
+        let new_tokens = self
+            .model
+            .generate_greedy(&input_ids, max_new_tokens, cancel)?;
         let raw = self.tokenizer.decode(&new_tokens)?;
         let cleaned = clean_reasoner_output(&raw);
         Ok(if cleaned.is_empty() {

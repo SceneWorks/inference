@@ -125,22 +125,22 @@ pub fn flow_mu(variant: Variant, seq_len: usize) -> f32 {
     (m * seq_len as f64 + b) as f32
 }
 
-/// A txt2img pipeline handle: the snapshot `root`, the variant, and the compute device/dtype (bf16).
-/// Loading the heavy components is done by [`load_components`](Self::load_components) and owned/cached
-/// by the generator, mirroring the SDXL/Z-Image providers' lazy split.
+/// A FLUX pipeline handle: the snapshot `root`, the variant, and the compute device/dtype (bf16).
+/// The txt2img generator loads phase-specific values through the residency methods; reference
+/// backbones load their shared model set through [`load_components`](Self::load_components).
 #[derive(Clone)]
 pub(crate) struct Pipeline {
     variant: Variant,
     root: PathBuf,
     device: Device,
     dtype: DType,
-    /// The `LoadSpec::pid` component captured at load (epic 7840 / sc-7853), built into the cached
-    /// [`Components`] so the PiD engine loads once alongside the base model. `None` ⇒ native VAE decode.
+    /// The `LoadSpec::pid` component captured at load (epic 7840 / sc-7853). The live residency path
+    /// loads it into [`SeqHeavy`] only when the current request uses PiD. `None` ⇒ native VAE decode.
     pid_spec: Option<PidWeights>,
 }
 
-/// The loaded FLUX components, `Arc`-shared so the generator can cache them across `generate` calls
-/// and cheaply clone them out for a render. Two shapes:
+/// The loaded FLUX components, `Arc`-shared so reference backbones can retain and cheaply clone the
+/// shared model set. Two shapes:
 ///
 /// - [`Components::Stock`] — the dense **BFL**-layout black-forest-labs snapshot: the stock
 ///   `candle-transformers` CLIP / T5 / `Flux` DiT / `AutoEncoder` VAE, reading the original single-file
@@ -163,9 +163,6 @@ pub(crate) enum Components {
         /// T5 + CLIP tokenizers, loaded+parsed **once** at component load and reused across encodes
         /// (sc-8991 / F-011) instead of re-parsing per prompt/branch.
         toks: Arc<FluxTokenizers>,
-        /// Optional NVIDIA PiD super-resolving decoder (epic 7840 / sc-7853); None ⇒ native VAE decode.
-        #[allow(dead_code)]
-        pid: Option<Arc<PidEngine>>,
     },
     Packed {
         clip: Arc<PackedClipText>,
@@ -174,9 +171,6 @@ pub(crate) enum Components {
         vae: Arc<AutoEncoderKL>,
         /// T5 + CLIP tokenizers, loaded+parsed **once** at component load (sc-8991 / F-011).
         toks: Arc<FluxTokenizers>,
-        /// Optional NVIDIA PiD super-resolving decoder (epic 7840 / sc-7853); None ⇒ native VAE decode.
-        #[allow(dead_code)]
-        pid: Option<Arc<PidEngine>>,
     },
 }
 
@@ -284,10 +278,9 @@ impl Pipeline {
     /// via `LoadSpec::pid`, but only when this load will use it (F-177).
     ///
     /// [`resolve_pid_decoder`](candle_gen_pid::resolve_pid_decoder) already gates the *decode* on
-    /// `req.use_pid`, so an engine loaded for a request that did not ask for it is never read — under
-    /// `Resident` that is a harmless one-time cost amortized across every later request, but under
-    /// `Sequential` it is paid on EVERY generate and sits resident through the whole denoise, inside the
-    /// very peak that path exists to bound.
+    /// `req.use_pid`, so an engine loaded for a request that did not ask for it is never read. The
+    /// residency path therefore passes the current request's `use_pid` value and avoids loading the
+    /// engine into a heavy phase that cannot consume it.
     ///
     /// Pure, so the rule is unit-testable without weights or a GPU (krea's `pid_to_load` idiom).
     fn pid_to_load(&self, use_pid: bool) -> Option<&PidWeights> {
@@ -298,9 +291,8 @@ impl Pipeline {
     /// `LoadSpec::pid` AND this load will actually use it ([`pid_to_load`](Self::pid_to_load)); FLUX's own
     /// `flux` latent-space student. `None` ⇒ native VAE.
     ///
-    /// **`use_pid` (F-177).** The stock/packed component builds pass `true` — the resident set is cached
-    /// across requests, so the overlay must be there for whichever later request wants it. The
-    /// `Sequential` path passes `req.use_pid`, because there this load runs on EVERY generate.
+    /// **`use_pid` (F-177).** The residency path passes `req.use_pid`, because this load runs for the
+    /// current generation and an unused PiD engine would otherwise sit inside the denoise peak.
     fn load_pid(&self, use_pid: bool) -> Result<Option<Arc<PidEngine>>> {
         Ok(match self.pid_to_load(use_pid) {
             Some(spec) => Some(Arc::new(PidEngine::from_spec(
@@ -356,9 +348,6 @@ impl Pipeline {
             transformer: Arc::new(transformer),
             vae: Arc::new(vae),
             toks: Arc::new(FluxTokenizers::load(&self.root)?),
-            // Resident: cached across requests, so the overlay must be loaded for whichever later
-            // request asks for it (F-177 — only the `Sequential` path gates this).
-            pid: self.load_pid(true)?,
         })
     }
 
@@ -404,8 +393,6 @@ impl Pipeline {
             transformer: Arc::new(transformer),
             vae: Arc::new(vae),
             toks: Arc::new(FluxTokenizers::load(&self.root)?),
-            // Resident: cached across requests — see the sibling `load_stock_components` (F-177).
-            pid: self.load_pid(true)?,
         })
     }
 
@@ -621,102 +608,6 @@ impl Pipeline {
         Ok((t5_emb, clip_emb))
     }
 
-    /// Render `req` against pre-loaded `components`, emitting per-step progress and honoring
-    /// `req.cancel`. Returns one `gen_core::Image` per `req.count` (each with seed `base_seed + index`).
-    #[allow(dead_code)]
-    pub(crate) fn render(
-        &self,
-        req: &GenerationRequest,
-        components: &Components,
-        on_progress: &mut dyn FnMut(Progress),
-    ) -> Result<Vec<Image>> {
-        let steps = req
-            .steps
-            .map(|s| s as usize)
-            .unwrap_or(self.variant.default_steps() as usize);
-        let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
-        // Guidance is only consumed by the dev DiT (`guidance_embed`); schnell's DiT ignores the
-        // tensor, so 0.0 there is inert. Validation rejects a guidance request on schnell already.
-        let guidance: f64 = if self.variant.supports_guidance() {
-            req.guidance.unwrap_or(self.variant.default_guidance()) as f64
-        } else {
-            0.0
-        };
-
-        // candle's get_noise geometry: the latent is padded to `div_ceil(16)*2` per side (== /8 for a
-        // multiple-of-16 request) — i.e. the VAE's /8 latent. We enforce the /16 alignment in `validate`.
-        let lat_h = (req.height as usize).div_ceil(16) * 2;
-        let lat_w = (req.width as usize).div_ceil(16) * 2;
-
-        // Text embeddings are seed- and image-independent: encode once for the whole batch.
-        let (t5_emb, clip_emb) = self.text_embeddings(components, &req.prompt)?;
-
-        // Resolve the decode seam once for the whole batch (epic 7840 / sc-7853): a per-generation PiD
-        // decoder bound to this prompt when `req.use_pid` is set (errors if requested but not loaded),
-        // else `None` → the native FLUX VAE decode. Shared across `count` images (same prompt); the PiD
-        // engine lives in whichever `Components` arm loaded.
-        let pid_engine = match components {
-            Components::Stock { pid, .. } => pid.as_deref(),
-            Components::Packed { pid, .. } => pid.as_deref(),
-        };
-        let pid_decoder = candle_gen_pid::resolve_pid_decoder(
-            pid_engine,
-            req,
-            base_seed,
-            self.variant.model_id(),
-        )?;
-
-        candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
-            // sc-3673 parity — deterministic, launch-portable initial noise in candle's get_noise
-            // shape (1, 16, h/8, w/8): N(0,1) from a fixed-algorithm CPU RNG seeded by `seed` (shared
-            // FLUX.1 helper, sc-9003).
-            let noise = crate::flux1_load::seeded_noise(
-                seed,
-                LATENT_CHANNELS,
-                lat_h,
-                lat_w,
-                &self.device,
-                self.dtype,
-            )?;
-
-            // Pack noise + build the conditioning state (img/img_ids/txt/txt_ids/vec) exactly as the
-            // candle reference — shared by both tiers. The packed token count drives dev's
-            // resolution-dependent time-shift.
-            let state = State::new(&t5_emb, &clip_emb, &noise)?;
-            let timesteps = if self.variant.is_dev() {
-                get_schedule(steps, Some((state.img.dim(1)?, BASE_SHIFT, MAX_SHIFT)))
-            } else {
-                get_schedule(steps, None)
-            };
-
-            // Borrow just the DiT out of the cached components for the shared denoise loop.
-            let dit = match components {
-                Components::Stock { transformer, .. } => DitRef::Stock(transformer),
-                Components::Packed { transformer, .. } => DitRef::Packed(transformer),
-            };
-            let latents =
-                self.denoise(dit, &state, &timesteps, guidance, seed, req, on_progress)?;
-
-            on_progress(Progress::Decoding);
-            match components {
-                Components::Stock { vae, .. } => self.decode(
-                    vae,
-                    pid_decoder.as_ref(),
-                    &latents,
-                    req.height as usize,
-                    req.width as usize,
-                ),
-                Components::Packed { vae, .. } => self.decode_packed(
-                    vae,
-                    pid_decoder.as_ref(),
-                    &latents,
-                    req.height as usize,
-                    req.width as usize,
-                ),
-            }
-        })
-    }
-
     /// The flow-match denoise, routed through the unified curated sampler/scheduler driver (epic 7114
     /// P4, sc-7123). The `scheduler` axis (`req.scheduler`) picks where the σ steps land over FLUX's
     /// time-shift `mu` (`native` = the verbatim `get_schedule(..)` schedule); the `sampler` axis
@@ -832,10 +723,11 @@ impl Pipeline {
     }
 
     /// Tier-dispatching decode for a caller that owns its OWN [`PidDecoder`] (the reference lanes via
-    /// [`crate::ref_backbone::FluxRefBackbone`]) rather than the components-embedded PiD engine: routes
+    /// [`crate::ref_backbone::FluxRefBackbone`]) rather than residency-owned [`SeqHeavy`]: routes
     /// the denoised latents through the stock [`AutoEncoder`] or the packed [`AutoEncoderKL`] exactly as
-    /// [`render`](Self::render), but takes the decoder explicitly (PuLID / the IP-adapter build their PiD
-    /// decoder separately from the backbone). `pid = None` ⇒ the native VAE decode.
+    /// [`render_residency`](Self::render_residency), but takes the decoder explicitly (PuLID / the
+    /// IP-adapter build their PiD decoder separately from the backbone). `pid = None` ⇒ the native VAE
+    /// decode.
     pub(crate) fn decode_ref(
         &self,
         components: &Components,
@@ -879,7 +771,7 @@ impl Pipeline {
 
     /// Encode `prompt` through the sequential text encoders, delegating to the SAME shared encode path
     /// as the resident tier ([`encode_text`] / [`encode_text_packed`](Self::encode_text_packed)) so the
-    /// tokenization + conditioning tensors are byte-identical to [`render`](Self::render).
+    /// tokenization + conditioning tensors consumed by [`render_residency`](Self::render_residency).
     pub(crate) fn encode_residency(
         &self,
         tes: &SeqTextEncoders,
@@ -963,16 +855,16 @@ impl Pipeline {
     /// Sequential-residency render (epic 10765 Phase 1, sc-10769): load the text encoders → encode →
     /// DROP them → load the DiT + VAE → denoise/decode. Peak VRAM is bounded to the DiT+VAE working set
     /// instead of TE+DiT+VAE (reclaiming the ~9 GB T5-XXL on FLUX), so a card that OOMs the resident
-    /// path can still render. Output is **bit-identical** to [`render`](Self::render) — the SAME encode,
-    /// denoise, and decode code runs (`encode_seq` → [`encode_text`], the shared [`denoise`](Self::denoise)
-    /// over a [`DitRef`], and [`decode`](Self::decode)/[`decode_packed`](Self::decode_packed)); only the
-    /// load/free schedule differs.
+    /// path can still render. The live render uses the shared encode, denoise, and decode routines
+    /// (`encode_residency` → [`encode_text`], [`denoise`](Self::denoise) over a [`DitRef`], and
+    /// [`decode`](Self::decode)/[`decode_packed`](Self::decode_packed)); residency changes only the
+    /// load/free schedule.
     ///
     /// Selected by the generator when [`candle_gen::sequential_offload_enabled`]
     /// (`CANDLE_GEN_OFFLOAD=sequential`) or `LoadSpec::offload_policy` is `Sequential`.
-    /// Because it drops components, it does NOT populate the generator's `Components` cache — repeat
-    /// requests reload from the (page-cached) snapshot; that reload cost is the deliberate trade for the
-    /// lower peak, which is why it is opt-in per the fit-gate rather than the default.
+    /// Because it drops each phase after use, repeat requests reload from the (page-cached) snapshot;
+    /// that reload cost is the deliberate trade for the lower peak, which is why sequential offload is
+    /// opt-in per the fit-gate rather than the default.
     ///
     /// The shared [`candle_gen::Residency`] owner supplies these already-loaded phase values.
     pub(crate) fn load_text_residency(&self) -> Result<SeqTextEncoders> {
@@ -1004,7 +896,7 @@ impl Pipeline {
         let lat_w = (req.width as usize).div_ceil(16) * 2;
 
         let (t5_emb, clip_emb) = encoded;
-        // Resolve the decode seam once for the whole batch, exactly as `render` does.
+        // Resolve the decode seam once for the whole batch.
         let pid_decoder = candle_gen_pid::resolve_pid_decoder(
             heavy.pid.as_deref(),
             req,
@@ -1012,7 +904,7 @@ impl Pipeline {
             self.variant.model_id(),
         )?;
 
-        // Per-image denoise + decode, identical to `render`'s loop.
+        // Per-image denoise + decode.
         candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
             let noise = crate::flux1_load::seeded_noise(
                 seed,
@@ -1231,13 +1123,7 @@ mod tests {
             gemma: gen_core::WeightsSource::Dir("/gemma".into()),
         };
         let root = Path::new("/nonexistent");
-        let with = Pipeline::load(
-            Variant::Schnell,
-            root,
-            &Device::Cpu,
-            DType::F32,
-            Some(spec),
-        );
+        let with = Pipeline::load(Variant::Schnell, root, &Device::Cpu, DType::F32, Some(spec));
         let without = Pipeline::load(Variant::Schnell, root, &Device::Cpu, DType::F32, None);
 
         // Opted in at load AND wanted by this request → load it.

@@ -87,6 +87,15 @@ pub struct Components {
     /// Optional NVIDIA PiD super-resolving decoder (epic 7840 / sc-7853), loaded once when the model
     /// was loaded with `LoadSpec::pid`. `None` ⇒ the native `Flux2Vae` decode (the default path).
     pid: Option<PidEngine>,
+    turbo_lora_report: Option<crate::adapters::TurboLoraReport>,
+}
+
+impl Components {
+    /// Structured TurboTime adapter-install outcome. `None` for the quality pipeline, which has no
+    /// bundled adapter; `Some` for turbo loads.
+    pub fn turbo_lora_report(&self) -> Option<crate::adapters::TurboLoraReport> {
+        self.turbo_lora_report
+    }
 }
 
 /// Build the Ideogram tokenizer from `root/tokenizer/tokenizer.json` **once** (sc-8991 / F-011).
@@ -180,6 +189,7 @@ pub fn load_components(
         tokenizer: build_tokenizer(root)?,
         dit,
         pid: load_pid(pid_spec, device)?,
+        turbo_lora_report: None,
     })
 }
 
@@ -209,12 +219,11 @@ pub fn load_components_turbo(
     // it stays a clean disk-backed mmap the offload/eviction machinery can drop and restore cheaply, and
     // a packed q4/q8 base keeps its footprint. The residual equals a fold `(W+δ)·x` to f32 tolerance.
     let mut cond = Ideogram4Transformer::load(&cond_w, &dit)?;
-    let n = crate::adapters::install_turbo_lora_additive(
+    let adapter_report = crate::adapters::install_turbo_lora_additive_with_report(
         &mut cond,
         &root.join(TURBO_LORA_FILE),
         TURBO_LORA_SCALE,
     )?;
-    eprintln!("ideogram turbo: applied {n} TurboTime LoRA residual(s) additively");
 
     let te = Ideogram4TextEncoder::new(
         &te_cfg,
@@ -235,6 +244,7 @@ pub fn load_components_turbo(
         tokenizer: build_tokenizer(root)?,
         dit,
         pid: load_pid(pid_spec, device)?,
+        turbo_lora_report: Some(adapter_report),
     })
 }
 
