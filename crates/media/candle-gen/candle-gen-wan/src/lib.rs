@@ -50,6 +50,22 @@ pub mod vae;
 pub mod vae16;
 pub mod wan14b;
 
+/// Operational Wan video ceiling: `1 + 4 * 256` pixel frames.
+pub(crate) const MAX_WAN_FRAMES: usize = 1025;
+/// Matching temporal-conditioning budget after the z16 VAE's 4x causal compression.
+pub(crate) const MAX_WAN_CONDITIONING_LATENTS: usize = 257;
+
+pub(crate) fn combined_conditioning_latents(
+    control_frames: usize,
+    reference_images: usize,
+) -> Option<usize> {
+    let control_latents = control_frames
+        .checked_sub(1)?
+        .checked_div(4)?
+        .checked_add(1)?;
+    control_latents.checked_add(reference_images)
+}
+
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -664,6 +680,11 @@ impl Generator for WanGenerator {
                     "wan: frames must satisfy frames % 4 == 1 (got {f})"
                 )));
             }
+            if f as usize > MAX_WAN_FRAMES {
+                return Err(gen_core::Error::Msg(format!(
+                    "wan: frames {f} exceeds the maximum {MAX_WAN_FRAMES}"
+                )));
+            }
         }
         Ok(())
     }
@@ -858,6 +879,14 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
+    fn combined_conditioning_latents_is_checked() {
+        assert_eq!(super::combined_conditioning_latents(1025, 0), Some(257));
+        assert_eq!(super::combined_conditioning_latents(5, 255), Some(257));
+        assert_eq!(super::combined_conditioning_latents(5, usize::MAX), None);
+        assert_eq!(super::combined_conditioning_latents(0, 0), None);
+    }
+
+    #[test]
     fn registers_and_resolves_as_candle_video() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
         let g = crate::provider_registry()
@@ -957,6 +986,19 @@ mod tests {
             ..Default::default()
         };
         assert!(g.validate(&ok).is_ok());
+        assert!(g
+            .validate(&GenerationRequest {
+                frames: Some(1025),
+                ..ok.clone()
+            })
+            .is_ok());
+        let over = g
+            .validate(&GenerationRequest {
+                frames: Some(1029),
+                ..ok.clone()
+            })
+            .expect_err("1029 must exceed the Wan frame ceiling");
+        assert!(over.to_string().contains("maximum 1025"), "{over}");
         // Legacy `unipc` spelling stays accepted (sc-7296 alias).
         assert!(g
             .validate(&GenerationRequest {

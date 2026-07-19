@@ -1071,6 +1071,12 @@ impl Generator for Wan14bGenerator {
                     "{id}: frames must satisfy frames % 4 == 1 (got {f})"
                 )));
             }
+            if f as usize > crate::MAX_WAN_FRAMES {
+                return Err(gen_core::Error::Msg(format!(
+                    "{id}: frames {f} exceeds the maximum {}",
+                    crate::MAX_WAN_FRAMES
+                )));
+            }
         }
         if self.variant == Variant::I2v && i2v_reference(req).is_none() {
             return Err(gen_core::Error::Msg(format!(
@@ -1368,6 +1374,19 @@ mod tests {
             ..Default::default()
         };
         assert!(t2v.validate(&ok).is_ok());
+        assert!(t2v
+            .validate(&GenerationRequest {
+                frames: Some(1025),
+                ..ok.clone()
+            })
+            .is_ok());
+        let over = t2v
+            .validate(&GenerationRequest {
+                frames: Some(1029),
+                ..ok.clone()
+            })
+            .expect_err("1029 must exceed the Wan frame ceiling");
+        assert!(over.to_string().contains("maximum 1025"), "{over}");
         // Legacy `unipc` spelling stays accepted (sc-7296 alias).
         assert!(t2v
             .validate(&GenerationRequest {
@@ -1415,6 +1434,27 @@ mod tests {
             .load(MODEL_ID_I2V_14B, &spec)
             .unwrap();
         assert!(i2v.validate(&ok).is_err(), "i2v needs a reference image");
+        let reference = Conditioning::Reference {
+            image: Image {
+                width: 16,
+                height: 16,
+                pixels: vec![0; 16 * 16 * 3],
+            },
+            strength: None,
+        };
+        let i2v_at_cap = GenerationRequest {
+            conditioning: vec![reference],
+            frames: Some(1025),
+            ..ok.clone()
+        };
+        assert!(i2v.validate(&i2v_at_cap).is_ok());
+        let over = i2v
+            .validate(&GenerationRequest {
+                frames: Some(1029),
+                ..i2v_at_cap
+            })
+            .expect_err("1029 must exceed the Wan frame ceiling");
+        assert!(over.to_string().contains("maximum 1025"), "{over}");
     }
 
     #[test]
