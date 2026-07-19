@@ -94,17 +94,20 @@ pub struct DecodeResult {
 }
 
 impl Decoder {
-    /// Run the AR loop over `prompt_frames` for at most `max_frames`, invoking `on_frame(step)`
-    /// after each decoded frame and consulting `cancel` before each frame. Returns `Ok(None)` if
-    /// cancelled. The emitted frames exclude the terminal EOS frame. `seed` seeds the token sampler
-    /// deterministically (same seed ⇒ same frames), so a caller reproduces the run exactly.
+    /// Run the AR loop over `prompt_frames` for at most `max_frames`, consulting `cancel` before each
+    /// frame and invoking `on_frame(step, &frame)` for each **emitted** (non-EOS) RVQ frame — the
+    /// hook the streaming path uses to decode the codec and emit chunks block-wise *while* the loop
+    /// keeps running. Returns `Ok(None)` if cancelled. The emitted frames exclude the terminal EOS
+    /// frame. `seed` seeds the token sampler deterministically (same seed ⇒ same frames), so a caller
+    /// reproduces the run exactly. `on_frame` is fallible so a consumer (e.g. the codec decode) can
+    /// abort the AR loop; it stays the single AR driver.
     pub fn run(
         &self,
         prompt_frames: Vec<Frame>,
         max_frames: usize,
         seed: u64,
         cancel: &dyn Fn() -> bool,
-        on_frame: &mut dyn FnMut(usize),
+        on_frame: &mut dyn FnMut(usize, &[u32]) -> CandleResult<()>,
     ) -> CandleResult<Option<DecodeResult>> {
         let mut frames = prompt_frames;
         let mut out: Vec<RvqFrame> = Vec::new();
@@ -117,11 +120,13 @@ impl Decoder {
             }
             let hidden = self.backbone.forward_last(&frames)?;
             let frame = self.local.decode_frame(&hidden, &out, &params, &mut rng)?;
-            on_frame(step);
             if frame.first().copied() == Some(AUDIO_EOS) {
                 stop = StopReason::Eos;
                 break;
             }
+            // Hand the just-emitted frame to the consumer (streaming codec decode) before feeding it
+            // back — so a block of frames can be decoded and streamed as the loop advances.
+            on_frame(step, &frame)?;
             // Feed the frame back as the next position's audio channels; text channel = text pad.
             frames.push(Frame {
                 text: self.cfg.text_pad,
@@ -212,7 +217,10 @@ mod tests {
         let no_cancel = || false;
         let mut steps_a = 0usize;
         let a = dec
-            .run(manual_prompt(rvq), 5, 42, &no_cancel, &mut |_| steps_a += 1)
+            .run(manual_prompt(rvq), 5, 42, &no_cancel, &mut |_, _| {
+                steps_a += 1;
+                Ok(())
+            })
             .unwrap()
             .unwrap();
         // Ran to the frame budget (tiny tokens never hit the real EOS), emitting one frame per step.
@@ -228,7 +236,7 @@ mod tests {
         }
         // Determinism: greedy decode ⇒ byte-identical frames on a re-run.
         let b = dec
-            .run(manual_prompt(rvq), 5, 42, &no_cancel, &mut |_| {})
+            .run(manual_prompt(rvq), 5, 42, &no_cancel, &mut |_, _| Ok(()))
             .unwrap()
             .unwrap();
         assert_eq!(a.frames, b.frames, "greedy AR decode is reproducible");
@@ -242,8 +250,9 @@ mod tests {
         let seen = std::cell::Cell::new(0usize);
         let cancel = || seen.get() >= 2;
         let out = dec
-            .run(manual_prompt(rvq), 100, 42, &cancel, &mut |_| {
-                seen.set(seen.get() + 1)
+            .run(manual_prompt(rvq), 100, 42, &cancel, &mut |_, _| {
+                seen.set(seen.get() + 1);
+                Ok(())
             })
             .unwrap();
         assert!(

@@ -688,6 +688,27 @@ impl MossAudioCodec {
     }
 }
 
+impl crate::chunk::PrefixDecoder for MossAudioCodec {
+    fn sample_rate(&self) -> u32 {
+        self.config.sample_rate
+    }
+
+    fn samples_per_frame(&self) -> usize {
+        self.config.downsample_rate
+    }
+
+    /// Decode a growing RVQ-frame prefix into its full mono PCM (the causal decode the streaming
+    /// chunker relies on). Delegates to [`MossAudioCodec::decode_frames`], so a prefix decode is
+    /// byte-identical to the head of any longer decode.
+    fn decode_prefix(
+        &self,
+        frames: &[Vec<u32>],
+        cancel: &dyn Fn() -> bool,
+    ) -> CandleResult<Option<Vec<f32>>> {
+        self.decode_frames(frames, cancel)
+    }
+}
+
 /// Root-mean-square of all elements (debug instrumentation only).
 fn rms(x: &Tensor) -> f32 {
     x.sqr()

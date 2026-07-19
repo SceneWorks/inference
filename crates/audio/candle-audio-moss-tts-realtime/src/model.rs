@@ -202,11 +202,12 @@ impl Loaded {
 /// clip still yields ≥ 2 chunks (the streaming incrementality law).
 const DEFAULT_FRAMES_PER_BLOCK: usize = 8;
 
-/// The streaming block size for a clip of `total_frames`: at most [`DEFAULT_FRAMES_PER_BLOCK`], but
-/// never more than half the clip, so a `≥ 2`-frame clip always produces `≥ 2` chunks.
-fn frames_per_block(total_frames: usize) -> usize {
+/// The streaming block size for a clip of `budget_frames` (the AR frame budget): at most
+/// [`DEFAULT_FRAMES_PER_BLOCK`], but never more than half the budget, so a budget-reaching run of
+/// `≥ 2` frames always streams `≥ 2` chunks.
+fn frames_per_block(budget_frames: usize) -> usize {
     DEFAULT_FRAMES_PER_BLOCK
-        .min(total_frames.div_ceil(2))
+        .min(budget_frames.div_ceil(2))
         .max(1)
 }
 
@@ -258,11 +259,12 @@ impl MossTtsRealtimeGenerator {
         let seed = req.seed.unwrap_or(DEFAULT_SAMPLING_SEED);
         let cancel = req.cancel.clone();
         let probe = move || cancel.is_cancelled();
-        let mut on_frame = |step: usize| {
+        let mut on_frame = |step: usize, _frame: &[u32]| {
             on_progress(Progress::Step {
                 current: (step as u32) + 1,
                 total,
             });
+            Ok(())
         };
         let result = pipeline
             .decoder
@@ -289,73 +291,80 @@ impl MossTtsRealtimeGenerator {
     }
 
     /// The single deterministic synthesis path shared by [`generate`](Self::generate) and
-    /// [`generate_streaming`](Self::generate_streaming): run the AR brain to a full set of RVQ frames,
-    /// then decode the codec **incrementally** over growing frame prefixes, emitting one
-    /// [`AudioChunk`] per newly-revealed PCM block and assembling the identical full [`AudioTrack`].
+    /// [`generate_streaming`](Self::generate_streaming): drive the AR brain and, **from inside the AR
+    /// loop**, decode the codec block-wise over the growing RVQ-frame prefix — emitting one
+    /// [`AudioChunk`] per newly-revealed PCM block *while later frames are still being generated*
+    /// ([`crate::chunk::StreamingChunker`]).
     ///
     /// Because the codec decode graph is fully causal, decoding a growing prefix reproduces the
     /// earlier samples byte-for-byte — so the concatenated chunks equal the returned track exactly
     /// (the reassembly law), and the two entry points return byte-identical audio for the same
-    /// request+seed (they call this one function). The first chunk is emitted after decoding only the
-    /// first block, so first-chunk latency is strictly below the full synthesis time.
+    /// request+seed (they call this one function). The first chunk is emitted after the first block
+    /// of AR frames rather than after the whole track, so first-chunk latency is proportional to one
+    /// block of AR frames, not the full synthesis time.
+    ///
+    /// The AR itself is still full-sequence-recompute (no KV cache); that latency optimization is a
+    /// separate tracked follow-up and does not change the streaming interleaving here.
     fn synthesize(
         &self,
         req: &GenerationRequest,
         on_chunk: &mut dyn FnMut(AudioChunk),
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<AudioTrack> {
-        let result = self.rvq_frames(req, on_progress)?;
-        on_progress(Progress::Decoding);
-        let frames = result.frames;
-
+        self.validate(req)?;
+        if req.cancel.is_cancelled() {
+            return Err(gen_core::Error::Canceled);
+        }
         let pipeline = self.pipeline()?;
         let codec = self.codec(pipeline.decoder.cfg.rvq)?;
-        let sample_rate = codec.sample_rate();
-        let spf = codec.samples_per_frame();
+
+        let frames = build_prompt_frames(&pipeline.tokenizer, &pipeline.decoder.cfg, &req.prompt)
+            .map_err(gen_core::Error::Msg)?;
+        let budget = frame_budget(req);
+        let total = budget as u32;
+        // Deterministic token sampling seeded by the request (a `None` seed maps to a fixed constant),
+        // so the gen-core reproducibility law holds and generate/generate_streaming agree.
+        let seed = req.seed.unwrap_or(DEFAULT_SAMPLING_SEED);
+        // Block sizing is driven by the frame budget (known up front, before the loop): at most
+        // DEFAULT_FRAMES_PER_BLOCK and never more than half the budget, so a budget-reaching run
+        // always streams >= 2 chunks.
+        let block = frames_per_block(budget);
 
         let cancel = req.cancel.clone();
         let probe = move || cancel.is_cancelled();
 
-        let total = frames.len();
-        let total_samples = total * spf;
-        let block = frames_per_block(total);
-
-        let mut samples: Vec<f32> = Vec::with_capacity(total_samples);
-        let mut index = 0usize;
-        let mut end = block;
-        while samples.len() < total_samples {
-            let end_frames = end.min(total);
-            let wav = match codec
-                .decode_frames(&frames[..end_frames], &probe)
-                .map_err(|e| gen_core::Error::Msg(format!("{MODEL_ID}: codec decode: {e}")))?
-            {
-                Some(w) => w,
-                None => return Err(gen_core::Error::Canceled),
-            };
-            // The newly-revealed tail beyond what earlier prefixes already emitted.
-            let tail = &wav[samples.len()..];
-            if !tail.is_empty() {
-                on_chunk(AudioChunk {
-                    samples: tail.to_vec(),
-                    sample_rate,
-                    channels: 1,
-                    index,
-                });
-                samples.extend_from_slice(tail);
-                index += 1;
-            }
-            if end_frames >= total {
-                break;
-            }
-            end += block;
+        let mut chunker = crate::chunk::StreamingChunker::new(codec.as_ref(), block);
+        let mut canceled = false;
+        let run = {
+            // The AR loop hands each emitted frame here; the chunker decodes + streams block-wise.
+            let mut on_frame =
+                |step: usize, frame: &[u32]| -> candle_audio::candle_core::Result<()> {
+                    on_progress(Progress::Step {
+                        current: (step as u32) + 1,
+                        total,
+                    });
+                    if chunker.push(frame.to_vec(), &probe, on_chunk)?.is_none() {
+                        canceled = true;
+                    }
+                    Ok(())
+                };
+            pipeline
+                .decoder
+                .run(frames, budget, seed, &probe, &mut on_frame)
+                .map_err(|e| gen_core::Error::Msg(format!("{MODEL_ID}: AR decode: {e}")))?
+        };
+        if canceled || run.is_none() {
+            return Err(gen_core::Error::Canceled);
         }
-
-        Ok(AudioTrack {
-            samples,
-            sample_rate,
-            channels: 1,
-            stems: Vec::new(),
-        })
+        on_progress(Progress::Decoding);
+        // Flush any remaining frames below a full block into a final chunk and take the full track.
+        match chunker
+            .finish(&probe, on_chunk)
+            .map_err(|e| gen_core::Error::Msg(format!("{MODEL_ID}: codec decode: {e}")))?
+        {
+            Some(track) => Ok(track),
+            None => Err(gen_core::Error::Canceled),
+        }
     }
 }
 
