@@ -10,7 +10,7 @@
 //!   `Conv1d(k=3)` + ELU stack (`condnet`) then a `Linear(512 → 1)` `classifier`, returning
 //!   `|f0|` per mel frame (Hz). Despite the "RNN" in the reference name it carries no recurrent
 //!   weights — it is a pure conv stack.
-//! - **[`SourceModuleHnNSF`]** (`mel2wav.m_source.*`, 2 tensors — the `l_linear` merge) — the NSF
+//! - **`SourceModuleHnNSF`** (`mel2wav.m_source.*`, 2 tensors — the `l_linear` merge) — the NSF
 //!   harmonic-plus-noise excitation, `nb_harmonics = 8`: the F0 (nearest-upsampled to the 24 kHz
 //!   rate) drives a bank of `nb_harmonics + 1 = 9` phase-accumulated sines with random per-harmonic
 //!   phase offsets, voiced/unvoiced gating (`f0 > 10 Hz`) and additive noise, merged by
@@ -28,7 +28,7 @@
 //!
 //! The weight-normed convs are stored in the newer PyTorch parametrization format
 //! (`parametrizations.weight.original0` = `g` `[out, 1, 1]`, `original1` = `v` `[out, in, k]`); the
-//! dense weight `w = g · v / ‖v‖` is reconstructed by [`weight_norm_weight`], the same math as
+//! dense weight `w = g · v / ‖v‖` is reconstructed by `weight_norm_weight`, the same math as
 //! candle-transformers' `encodec::conv1d_weight_norm`, adapted to those key names. `ConvTranspose1d`
 //! weight-norm normalizes per **input** channel (the `weight_norm` default `dim = 0` over that
 //! tensor's `[in, out, k]` layout), which the shared reconstruction handles unchanged.
