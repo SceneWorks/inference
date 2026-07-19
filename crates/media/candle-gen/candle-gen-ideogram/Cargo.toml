@@ -31,8 +31,7 @@ metal = ["candle-gen/metal", "candle-gen-flux2/metal", "candle-gen-pid/metal"]
 cuda = ["candle-gen/cuda", "candle-gen-flux2/cuda", "candle-gen-pid/cuda"]
 
 [dev-dependencies]
+# GPU examples use the phase-aware VRAM probe without exposing test support in the shipped provider.
 candle-gen = { path = "../candle-gen", features = ["testkit"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 sceneworks-gen-core-testkit = { workspace = true }
-# GPU examples use the phase-aware VRAM probe without exposing test support in the shipped provider.
-candle-gen = { path = "../candle-gen", features = ["testkit"] }
