@@ -10,7 +10,7 @@ on:
         type: choice
         required: true
         default: all
-        options: [all, llm, media, audio]
+        options: [all, llm, media, audio, residency-ab]
 
 permissions:
   contents: read
@@ -205,3 +205,87 @@ jobs:
         run: |
           call "%VCVARS%"
           cargo test --locked -p candle-gen-z-image --features cuda --test conformance z_image_conformance -- --ignored --nocapture
+
+  candle-residency-ab:
+    name: Candle CUDA sequential-residency A/B
+    # This gate consumes two full generations per model. Keep it out of both the
+    # weekly schedule and the broad `all` profile; operators opt in explicitly.
+    if: github.event_name == 'workflow_dispatch' && inputs.profile == 'residency-ab'
+    runs-on: [self-hosted, windows, cuda, real-weights]
+    env:
+      QWEN_IMAGE_SNAPSHOT: ${{ vars.QWEN_IMAGE_SNAPSHOT }}
+      FLUX_DEV_DIR: ${{ vars.FLUX_DEV_DIR }}
+      CUDA_COMPUTE_CAP: "80"
+      CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
+      VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Select Git Bash
+        shell: cmd
+        run: |
+          if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
+          echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+        with:
+          toolchain: 1.96.0
+      - name: Materialize and verify immutable snapshots
+        shell: cmd
+        run: |
+          if not defined QWEN_IMAGE_SNAPSHOT exit /b 1
+          if not defined FLUX_DEV_DIR exit /b 1
+          python -m pip install --disable-pip-version-check --target "%RUNNER_TEMP%\huggingface-hub" "huggingface_hub==1.20.1"
+          set "PYTHONPATH=%RUNNER_TEMP%\huggingface-hub"
+          python scripts/release/ensure_model_snapshot.py --model qwen-image --snapshot "%QWEN_IMAGE_SNAPSHOT%"
+          python scripts/release/ensure_model_snapshot.py --model flux-1-dev --snapshot "%FLUX_DEV_DIR%"
+      - name: Run Qwen Image and FLUX.1-dev resident/sequential processes
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          set "AB_DIR=%RUNNER_TEMP%\residency-ab"
+          if not exist "%AB_DIR%" mkdir "%AB_DIR%"
+
+          set "CANDLE_GEN_OFFLOAD="
+          set "QWEN_OFFLOAD_MODE="
+          set "QWEN_OUT=%AB_DIR%\qwen-resident.rgb"
+          cargo test --locked -p candle-gen-qwen-image --features cuda qwen_image_probed_generate_for_offload_ab -- --ignored --nocapture > "%AB_DIR%\qwen-resident.log" 2>&1
+          set "TEST_EXIT=%ERRORLEVEL%"
+          type "%AB_DIR%\qwen-resident.log"
+          if not "%TEST_EXIT%"=="0" exit /b %TEST_EXIT%
+
+          set "QWEN_OFFLOAD_MODE=spec-sequential"
+          set "QWEN_OUT=%AB_DIR%\qwen-sequential.rgb"
+          cargo test --locked -p candle-gen-qwen-image --features cuda qwen_image_probed_generate_for_offload_ab -- --ignored --nocapture > "%AB_DIR%\qwen-sequential.log" 2>&1
+          set "TEST_EXIT=%ERRORLEVEL%"
+          type "%AB_DIR%\qwen-sequential.log"
+          if not "%TEST_EXIT%"=="0" exit /b %TEST_EXIT%
+          fc /b "%AB_DIR%\qwen-resident.rgb" "%AB_DIR%\qwen-sequential.rgb" > "%AB_DIR%\qwen-byte-compare.log"
+          if errorlevel 1 exit /b 1
+
+          set "QWEN_OFFLOAD_MODE="
+          set "FLUX_OFFLOAD_MODE="
+          set "FLUX_OUT=%AB_DIR%\flux-dev-resident.rgb"
+          cargo test --locked -p candle-gen-flux --features cuda flux_dev_probed_generate_for_offload_ab -- --ignored --nocapture > "%AB_DIR%\flux-dev-resident.log" 2>&1
+          set "TEST_EXIT=%ERRORLEVEL%"
+          type "%AB_DIR%\flux-dev-resident.log"
+          if not "%TEST_EXIT%"=="0" exit /b %TEST_EXIT%
+
+          set "FLUX_OFFLOAD_MODE=spec-sequential"
+          set "FLUX_OUT=%AB_DIR%\flux-dev-sequential.rgb"
+          cargo test --locked -p candle-gen-flux --features cuda flux_dev_probed_generate_for_offload_ab -- --ignored --nocapture > "%AB_DIR%\flux-dev-sequential.log" 2>&1
+          set "TEST_EXIT=%ERRORLEVEL%"
+          type "%AB_DIR%\flux-dev-sequential.log"
+          if not "%TEST_EXIT%"=="0" exit /b %TEST_EXIT%
+          fc /b "%AB_DIR%\flux-dev-resident.rgb" "%AB_DIR%\flux-dev-sequential.rgb" > "%AB_DIR%\flux-dev-byte-compare.log"
+          if errorlevel 1 exit /b 1
+
+          certutil -hashfile "%AB_DIR%\qwen-resident.rgb" SHA256 > "%AB_DIR%\checksums.sha256"
+          certutil -hashfile "%AB_DIR%\qwen-sequential.rgb" SHA256 >> "%AB_DIR%\checksums.sha256"
+          certutil -hashfile "%AB_DIR%\flux-dev-resident.rgb" SHA256 >> "%AB_DIR%\checksums.sha256"
+          certutil -hashfile "%AB_DIR%\flux-dev-sequential.rgb" SHA256 >> "%AB_DIR%\checksums.sha256"
+      - name: Upload A/B logs and raw RGB outputs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: candle-cuda-residency-ab-${{ github.run_id }}
+          path: ${{ runner.temp }}\residency-ab
+          if-no-files-found: error

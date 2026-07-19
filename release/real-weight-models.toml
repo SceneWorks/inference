@@ -22,6 +22,40 @@ environment = ["MLX_LLM_QWEN3_MODEL", "CANDLE_LLM_QWEN3_MODEL"]
 expected_files = ["config.json", "tokenizer.json", "model.safetensors"]
 
 [[models]]
+key = "qwen-image"
+repository = "Qwen/Qwen-Image"
+revision = "75e0b4be04f60ec59a75f475837eced720f823b6"
+license = "Apache-2.0"
+size_class = "very-large"
+profiles = ["media-cuda-residency-ab"]
+environment = ["QWEN_IMAGE_SNAPSHOT"]
+expected_files = [
+    "model_index.json",
+    "tokenizer/vocab.json",
+    "text_encoder/model.safetensors.index.json",
+    "transformer/diffusion_pytorch_model.safetensors.index.json",
+    "vae/diffusion_pytorch_model.safetensors",
+]
+
+[[models]]
+key = "flux-1-dev"
+repository = "black-forest-labs/FLUX.1-dev"
+revision = "3de623fc3c33e44ffbe2bad470d0f45bccf2eb21"
+license = "FLUX-1-dev Non-Commercial License"
+size_class = "very-large"
+profiles = ["media-cuda-residency-ab"]
+environment = ["FLUX_DEV_DIR"]
+expected_files = [
+    "model_index.json",
+    "tokenizer/vocab.json",
+    "tokenizer_2/spiece.model",
+    "text_encoder/model.safetensors",
+    "text_encoder_2/model.safetensors.index.json",
+    "transformer/diffusion_pytorch_model.safetensors.index.json",
+    "vae/diffusion_pytorch_model.safetensors",
+]
+
+[[models]]
 key = "z-image-turbo"
 repository = "Tongyi-MAI/Z-Image-Turbo"
 revision = "f332072aa78be7aecdf3ee76d5c247082da564a6"
