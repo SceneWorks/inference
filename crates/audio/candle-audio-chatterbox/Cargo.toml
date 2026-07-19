@@ -1,0 +1,57 @@
+[package]
+name = "candle-audio-chatterbox"
+version = "0.0.0"
+edition = "2021"
+description = "Chatterbox clone-TTS Generator for the SceneWorks Candle audio lane (sc-13222) — Resemble AI's zero-shot voice-cloning speech synthesizer ported natively onto the pinned candle revision: a T3 Llama-style speech-token LM (text + speaker conditioning → speech tokens) and an S3Gen CosyVoice-derived flow-matching token→mel decoder + HiFiGAN vocoder, consuming a chatterbox_ve voice embedding and/or a reference clip as the cloned-voice conditioning."
+license = "MIT"
+repository = "https://github.com/SceneWorks/inference"
+keywords = ["candle", "tts", "chatterbox", "voice-cloning", "speech"]
+categories = ["science"]
+
+[dependencies]
+# The shared candle audio commons (device seam, pinned-SHA hub resolution, STFT/mel/iSTFT DSP,
+# WAV encode, `AudioError → gen_core::Error` bridge). Re-exports `gen_core` and `candle_core`, so
+# this crate resolves the SAME candle build + gen-core rev as the catalog it registers into.
+candle-audio = { path = "../candle-audio" }
+# candle-nn at the workspace's pinned candle revision (Linear/Conv1d/ConvTranspose1d/LayerNorm/
+# RmsNorm/Embedding/VarBuilder — the T3 Llama backbone, the S3Gen flow estimator, and the HiFiGAN
+# vocoder are built from these primitives, mirroring moss-sfx's hand-rolled qwen3/DiT/DAC).
+candle-nn = { workspace = true }
+# Snapshot-preparer contract types for the audio lane's Chatterbox-aware preparer probe
+# (`SnapshotPreparerRegistration` lives in core-llm; composed by candle-audio-catalog).
+core-llm = { workspace = true }
+# The Chatterbox text tokenizer (`tokenizer.json` in the pinned repo — a HF tokenizers model).
+# Workspace pin — the 0.22 side of the intentional tokenizers 0.21/0.22 split (check-workspace.py).
+tokenizers = { workspace = true }
+# The merged Chatterbox voice encoder (sc-12844, id `chatterbox_ve`): the provider derives the
+# 256-d speaker vector from a `Conditioning::ReferenceAudio` clip through this exact embedder (the
+# faithful "derive the speaker conditioning inside the provider" path), and consumes a
+# `Conditioning::VoiceEmbedding` vector directly. Deps: candle-audio + candle-nn only.
+candle-audio-chatterbox-ve = { path = "../candle-audio-chatterbox-ve" }
+# Config parsing (t3 / s3gen hyperparameters). serde is not a [workspace.dependencies] entry
+# (siblings use serde_json only); the version matches the workspace-resolved lockfile pin.
+serde = { version = "1", features = ["derive"] }
+serde_json = { workspace = true }
+# Seeded RNG for the T3 autoregressive sampling and the S3Gen flow noise (the reproducibility law:
+# same request+seed ⇒ byte-identical samples). Same crates the media providers use.
+rand = { workspace = true }
+rand_distr = { workspace = true }
+
+[dev-dependencies]
+# HF-cache snapshot resolution for the `#[ignore]`d real-weight conformance test.
+candle-audio = { path = "../candle-audio", features = ["testkit"] }
+# The real-weight conformance test generates its reference clips with Kokoro (the sanctioned
+# Kokoro-generated reference-audio path) and measures voice similarity with the chatterbox_ve
+# embedder (already a runtime dependency above).
+candle-audio-kokoro = { path = "../candle-audio-kokoro" }
+# The backend-neutral generator conformance suite (validate-honesty, progress, typed
+# cancellation, seed determinism) the real-weight test runs against the loaded provider.
+sceneworks-gen-core-testkit = { workspace = true }
+
+[features]
+default = []
+# Apple Metal GPU backend — forwarded to the shared audio commons. Not in `default` (the audio
+# lane ships CPU-first everywhere; see docs/architecture/audio-backend-strategy.md).
+metal = ["candle-audio/metal"]
+# NVIDIA CUDA backend — forwarded to the shared audio commons. Not in `default`.
+cuda = ["candle-audio/cuda"]
