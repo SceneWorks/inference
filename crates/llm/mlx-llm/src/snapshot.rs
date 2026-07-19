@@ -24,9 +24,8 @@
 //! per-expert / shared-expert MoE MLPs, and the DeepSeek-V2 MLA low-rank projections. VLM vision
 //! towers stay dense (their loaders are dense-only, matching load-time behavior). Anything else that
 //! looks like an attention/FFN projection but is not recognized is a **loud [`Error::Unsupported`]**,
-//! never a silent dense fallback — including the Qwen3.5/3.6 hybrid linear-attention family
-//! (`linear_attn.*`), whose loader has no pre-quantized snapshot branch (prepare it dense and use
-//! load-time quantization instead).
+//! never a silent dense fallback. Qwen3.5/3.6's hybrid `linear_attn.*` projections and stacked MoE
+//! experts are covered explicitly so prepared and load-time quantization have the same surface.
 
 use std::path::{Path, PathBuf};
 
@@ -36,6 +35,7 @@ use serde_json::{json, Value};
 
 use crate::config::{Architecture, ModelConfig};
 use crate::error::{Error, Result};
+use crate::models::qwen35::Qwen35Config;
 use crate::primitives::quant::QuantizedLinear;
 use crate::primitives::QuantSpec;
 use crate::primitives::Weights;
@@ -55,7 +55,7 @@ const STORE_DTYPE: Dtype = Dtype::Bfloat16;
 /// engine's quant invariant. Packed Phi-3 / GLM-4 tensors are handled separately (split first, see
 /// [`write_snapshot`]), and keys under a VLM vision tower are excluded entirely
 /// (vision loaders are dense-only).
-pub const PROJECTION_SUFFIXES: [&str; 11] = [
+pub const PROJECTION_SUFFIXES: [&str; 14] = [
     "self_attn.q_proj.weight",
     "self_attn.k_proj.weight",
     "self_attn.v_proj.weight",
@@ -65,6 +65,10 @@ pub const PROJECTION_SUFFIXES: [&str; 11] = [
     "self_attn.q_b_proj.weight",
     "self_attn.kv_a_proj_with_mqa.weight",
     "self_attn.kv_b_proj.weight",
+    // Qwen3.5/3.6 Gated DeltaNet. in_proj_a/b intentionally stay dense.
+    "linear_attn.in_proj_qkv.weight",
+    "linear_attn.in_proj_z.weight",
+    "linear_attn.out_proj.weight",
     // Gated MLP — bare so dense, per-expert, and shared-expert keys all match.
     "gate_proj.weight",
     "up_proj.weight",
@@ -75,6 +79,8 @@ pub const PROJECTION_SUFFIXES: [&str; 11] = [
 const PACKED_QKV_SUFFIX: &str = "self_attn.qkv_proj.weight";
 /// Packed Phi-3 / GLM-4 gate‖up MLP projection, split into `gate/up_proj` before quantizing.
 const PACKED_GATE_UP_SUFFIX: &str = "mlp.gate_up_proj.weight";
+const QWEN35_EXPERT_GATE_UP_SUFFIX: &str = "mlp.experts.gate_up_proj";
+const QWEN35_EXPERT_DOWN_SUFFIX: &str = "mlp.experts.down_proj";
 
 /// Weight-key roots of VLM vision towers / projectors (JoyCaption's SigLIP + LLaVA projector,
 /// the Qwen3-VL ViT). Vision weights are never quantized at load time — their loaders are
@@ -106,6 +112,10 @@ fn is_packed_projection(key: &str) -> bool {
         && (key.ends_with(PACKED_QKV_SUFFIX) || key.ends_with(PACKED_GATE_UP_SUFFIX))
 }
 
+fn is_qwen35_stacked_expert(key: &str) -> bool {
+    key.ends_with(QWEN35_EXPERT_GATE_UP_SUFFIX) || key.ends_with(QWEN35_EXPERT_DOWN_SUFFIX)
+}
+
 /// Whether a key that stayed dense under a quantize request looks like an attention/FFN projection
 /// the writer does not know how to cover. Used as the loud-refusal net: matching keys abort the
 /// write instead of silently producing a mixed-tier snapshot. Tensors the loader deliberately keeps
@@ -124,6 +134,9 @@ fn is_unrecognized_projection(key: &str, arr: &Array) -> bool {
     if key.ends_with("norm.weight")
         || key.ends_with(".mlp.gate.weight")
         || key.ends_with("shared_expert_gate.weight")
+        || key.ends_with("linear_attn.in_proj_a.weight")
+        || key.ends_with("linear_attn.in_proj_b.weight")
+        || key.ends_with("linear_attn.conv1d.weight")
     {
         return false;
     }
@@ -177,10 +190,7 @@ pub struct SnapshotReport {
 ///
 /// A quantize request fails with [`Error::Unsupported`] — writing nothing rather than a snapshot
 /// with silent dense fallbacks — when:
-/// - the config names the Qwen3.5/3.6 hybrid linear-attention family (its loader has no
-///   pre-quantized snapshot branch; prepare dense and quantize on load instead),
-/// - the tensor set contains attention/FFN projection-like keys the writer does not recognize
-///   (e.g. `linear_attn.*`), or
+/// - the tensor set contains attention/FFN projection-like keys the writer does not recognize, or
 /// - no projection matched at all (the "quantized" snapshot would be entirely dense).
 pub fn write_snapshot(
     out_dir: &Path,
@@ -191,22 +201,16 @@ pub fn write_snapshot(
 ) -> Result<SnapshotReport> {
     let tensors: Vec<(String, Array)> = tensors.into_iter().collect();
 
-    // Quantization is only writable for families whose loader reads stored packed projections back
-    // (the llama-family pre-quantized branch). Refuse the Qwen3.5/3.6 hybrid loudly: its loader
-    // quantizes on load but has no pre-quantized snapshot branch, so a quantized snapshot would be
-    // unloadable garbage.
     let mut split_dims: Option<(i32, i32, i32)> = None; // (q_dim, kv_dim, intermediate)
+    let mut qwen35_moe: Option<(i32, i32, i32)> = None; // (experts, expert_inter, hidden)
     if quantize.is_some() {
         let arch = Architecture::from_config(&config)
             .map_err(|e| Error::Unsupported(format!("cannot quantize snapshot: {e}")))?;
         if arch == Architecture::Qwen35 {
-            return Err(Error::Unsupported(
-                "cannot quantize snapshot: the Qwen3.5/3.6 hybrid linear-attention family \
-                 (`linear_attn.*` Gated DeltaNet layers) has no pre-quantized snapshot loader \
-                 branch; prepare the snapshot dense (quantize: None) and use load-time \
-                 quantization instead"
-                    .to_string(),
-            ));
+            let cfg = Qwen35Config::from_json(&config)?;
+            qwen35_moe = cfg
+                .moe
+                .map(|moe| (moe.num_experts, moe.moe_intermediate_size, cfg.hidden_size));
         }
         // Both packed and ordinary recognized projections feed rank-2 quantization operations.
         // Validate the common invariant before dispatch so neither branch can reach MLX with an
@@ -242,6 +246,62 @@ pub fn write_snapshot(
     let mut uncovered: Vec<String> = Vec::new();
     for (key, arr) in tensors {
         match quantize {
+            Some(spec) if is_qwen35_stacked_expert(&key) => {
+                let (num_experts, inter, hidden) = qwen35_moe.ok_or_else(|| {
+                    Error::Unsupported(format!(
+                        "cannot quantize stacked Qwen3.5 expert tensor `{key}` without MoE config"
+                    ))
+                })?;
+                let expected = if key.ends_with(QWEN35_EXPERT_GATE_UP_SUFFIX) {
+                    vec![num_experts, 2 * inter, hidden]
+                } else {
+                    vec![num_experts, hidden, inter]
+                };
+                if arr.shape() != expected {
+                    return Err(Error::Config(format!(
+                        "stacked `{key}` has shape {:?}; expected {:?} from config",
+                        arr.shape(),
+                        expected
+                    )));
+                }
+                let w = arr.as_dtype(STORE_DTYPE)?;
+                let stem = key
+                    .strip_suffix(if key.ends_with(QWEN35_EXPERT_GATE_UP_SUFFIX) {
+                        QWEN35_EXPERT_GATE_UP_SUFFIX
+                    } else {
+                        QWEN35_EXPERT_DOWN_SUFFIX
+                    })
+                    .unwrap();
+                for expert in 0..num_experts {
+                    let selected = w
+                        .take_axis(Array::from_slice(&[expert], &[1]), 0)?
+                        .reshape(&expected[1..])?;
+                    if key.ends_with(QWEN35_EXPERT_GATE_UP_SUFFIX) {
+                        let parts = split_sections(&selected, &[inter], 0)?;
+                        push_quantized(
+                            &mut out,
+                            &format!("{stem}mlp.experts.{expert}.gate_proj"),
+                            &parts[0],
+                            spec,
+                        )?;
+                        push_quantized(
+                            &mut out,
+                            &format!("{stem}mlp.experts.{expert}.up_proj"),
+                            &parts[1],
+                            spec,
+                        )?;
+                        quantized_projections += 2;
+                    } else {
+                        push_quantized(
+                            &mut out,
+                            &format!("{stem}mlp.experts.{expert}.down_proj"),
+                            &selected,
+                            spec,
+                        )?;
+                        quantized_projections += 1;
+                    }
+                }
+            }
             Some(spec) if is_packed_projection(&key) => {
                 let (q_dim, kv_dim, inter) = split_dims.expect("packed key implies parsed dims");
                 let w = arr.as_dtype(STORE_DTYPE)?;
@@ -317,11 +377,12 @@ pub fn write_snapshot(
     // A `quantization` block marks the snapshot pre-quantized so the loader reads the stored
     // projections as-is (its `stored_quant` branch) rather than re-quantizing on load.
     if let Some(spec) = quantize {
+        let block = json!({ "group_size": spec.group_size, "bits": spec.bits });
         if let Value::Object(map) = &mut config {
-            map.insert(
-                "quantization".into(),
-                json!({ "group_size": spec.group_size, "bits": spec.bits }),
-            );
+            map.insert("quantization".into(), block.clone());
+            if let Some(Value::Object(text)) = map.get_mut("text_config") {
+                text.insert("quantization".into(), block);
+            }
         } else {
             return Err(Error::Config(
                 "snapshot config.json is not a JSON object".into(),
@@ -422,7 +483,7 @@ fn read_to_string_if_exists(path: &Path) -> Result<Option<String>> {
 mod tests {
     use super::*;
     use crate::config::ModelConfig;
-    use crate::models::CausalLm;
+    use crate::models::{CausalLm, Qwen35Config, Qwen35Model};
     use crate::primitives::sampler::{SplitMix64, TokenRng};
     use std::collections::HashMap;
 
@@ -476,6 +537,86 @@ mod tests {
         (t, config)
     }
 
+    fn tiny_qwen35(moe: bool) -> (Vec<(String, Array)>, Value) {
+        let (h, vocab, inter, layers) = (64i32, 8i32, 128i32, 4usize);
+        let mut rng = SplitMix64::new(if moe { 0x35A3B } else { 0x3527B });
+        let mut t = Vec::new();
+        let pfx = "model.language_model";
+        t.push((
+            format!("{pfx}.embed_tokens.weight"),
+            randn(&[vocab, h], &mut rng),
+        ));
+        t.push((format!("{pfx}.norm.weight"), randn(&[h], &mut rng)));
+        t.push(("lm_head.weight".into(), randn(&[vocab, h], &mut rng)));
+        for i in 0..layers {
+            let p = |s: &str| format!("{pfx}.layers.{i}.{s}");
+            t.push((p("input_layernorm.weight"), randn(&[h], &mut rng)));
+            t.push((p("post_attention_layernorm.weight"), randn(&[h], &mut rng)));
+            if i < 3 {
+                t.push((
+                    p("linear_attn.in_proj_qkv.weight"),
+                    randn(&[192, h], &mut rng),
+                ));
+                t.push((p("linear_attn.in_proj_z.weight"), randn(&[64, h], &mut rng)));
+                t.push((p("linear_attn.in_proj_a.weight"), randn(&[2, h], &mut rng)));
+                t.push((p("linear_attn.in_proj_b.weight"), randn(&[2, h], &mut rng)));
+                t.push((
+                    p("linear_attn.conv1d.weight"),
+                    randn(&[192, 1, 4], &mut rng),
+                ));
+                t.push((p("linear_attn.A_log"), randn(&[2], &mut rng)));
+                t.push((p("linear_attn.dt_bias"), randn(&[2], &mut rng)));
+                t.push((p("linear_attn.norm.weight"), randn(&[32], &mut rng)));
+                t.push((p("linear_attn.out_proj.weight"), randn(&[h, 64], &mut rng)));
+            } else {
+                t.push((p("self_attn.q_proj.weight"), randn(&[128, h], &mut rng)));
+                t.push((p("self_attn.k_proj.weight"), randn(&[64, h], &mut rng)));
+                t.push((p("self_attn.v_proj.weight"), randn(&[64, h], &mut rng)));
+                t.push((p("self_attn.o_proj.weight"), randn(&[h, 64], &mut rng)));
+                t.push((p("self_attn.q_norm.weight"), randn(&[32], &mut rng)));
+                t.push((p("self_attn.k_norm.weight"), randn(&[32], &mut rng)));
+            }
+            if moe {
+                t.push((p("mlp.experts.gate_up_proj"), randn(&[2, 128, h], &mut rng)));
+                t.push((p("mlp.experts.down_proj"), randn(&[2, h, 64], &mut rng)));
+                t.push((p("mlp.gate.weight"), randn(&[2, h], &mut rng)));
+                for (name, shape) in [
+                    ("gate_proj.weight", vec![64, h]),
+                    ("up_proj.weight", vec![64, h]),
+                    ("down_proj.weight", vec![h, 64]),
+                ] {
+                    t.push((
+                        p(&format!("mlp.shared_expert.{name}")),
+                        randn(&shape, &mut rng),
+                    ));
+                }
+                t.push((p("mlp.shared_expert_gate.weight"), randn(&[1, h], &mut rng)));
+            } else {
+                t.push((p("mlp.gate_proj.weight"), randn(&[inter, h], &mut rng)));
+                t.push((p("mlp.up_proj.weight"), randn(&[inter, h], &mut rng)));
+                t.push((p("mlp.down_proj.weight"), randn(&[h, inter], &mut rng)));
+            }
+        }
+        let mut text = json!({
+            "model_type": if moe { "qwen3_5_moe" } else { "qwen3_5_text" },
+            "hidden_size": h, "intermediate_size": inter, "num_hidden_layers": layers,
+            "num_attention_heads": 2, "num_key_value_heads": 2, "head_dim": 32,
+            "vocab_size": vocab, "rms_norm_eps": 1e-6, "full_attention_interval": 4,
+            "linear_num_value_heads": 2, "linear_num_key_heads": 2,
+            "linear_key_head_dim": 32, "linear_value_head_dim": 32,
+            "linear_conv_kernel_dim": 4, "partial_rotary_factor": 0.5,
+            "tie_word_embeddings": false
+        });
+        if moe {
+            let obj = text.as_object_mut().unwrap();
+            obj.insert("num_experts".into(), json!(2));
+            obj.insert("num_experts_per_tok".into(), json!(1));
+            obj.insert("moe_intermediate_size".into(), json!(64));
+            obj.insert("shared_expert_intermediate_size".into(), json!(64));
+        }
+        (t, json!({ "model_type": "qwen3_5", "text_config": text }))
+    }
+
     #[test]
     fn projection_predicate_selects_only_attn_mlp_projections() {
         for k in [
@@ -506,13 +647,132 @@ mod tests {
             "model.layers.0.self_attn.q_a_layernorm.weight", // MLA norms stay dense
             "model.layers.0.mlp.gate.weight",         // MoE router stays dense
             "model.layers.0.mlp.shared_expert_gate.weight", // Qwen2-MoE gate stays dense
-            "model.layers.0.linear_attn.out_proj.weight", // Qwen3.6 hybrid: refused, not quantized
             "model.layers.0.mlp.gate_up_proj.weight", // packed: split before quantizing
             // VLM vision towers stay dense (their loaders are dense-only)
             "vision_tower.vision_model.encoder.layers.0.self_attn.q_proj.weight",
             "model.visual.blocks.0.attn.proj.weight",
         ] {
             assert!(!is_projection(k), "{k} should NOT be a projection");
+        }
+        for k in [
+            "model.layers.0.linear_attn.in_proj_qkv.weight",
+            "model.layers.0.linear_attn.in_proj_z.weight",
+            "model.layers.0.linear_attn.out_proj.weight",
+        ] {
+            assert!(is_projection(k), "{k} should be a Qwen3.5 projection");
+        }
+    }
+
+    #[test]
+    fn qwen35_dense_and_moe_q4_q8_round_trip_match_load_time_quantization() {
+        for moe in [false, true] {
+            for spec in [QuantSpec::q4(), QuantSpec::q8()] {
+                let dir = unique_dir(&format!(
+                    "qwen35-{}-q{}",
+                    if moe { "moe" } else { "dense" },
+                    spec.bits
+                ));
+                let (tensors, config) = tiny_qwen35(moe);
+                let dense_weights = Weights::from_map(tensors.iter().cloned().collect());
+                let dense_cfg = Qwen35Config::from_json(&config).unwrap();
+                let load_time = Qwen35Model::from_weights_with(
+                    &dense_weights,
+                    "model.language_model",
+                    dense_cfg,
+                    Some(spec),
+                )
+                .unwrap();
+
+                let report = write_snapshot(
+                    &dir,
+                    tensors,
+                    config,
+                    &SnapshotTokenizer::default(),
+                    Some(spec),
+                )
+                .unwrap();
+                assert_eq!(report.quantized_projections, if moe { 49 } else { 25 });
+
+                let stored_weights = Weights::from_dir(&dir).unwrap();
+                let stored_json: Value = serde_json::from_str(
+                    &std::fs::read_to_string(dir.join("config.json")).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(stored_json["quantization"]["bits"], spec.bits);
+                assert_eq!(
+                    stored_json["text_config"]["quantization"]["bits"],
+                    spec.bits
+                );
+                let stored_cfg = Qwen35Config::from_json(&stored_json).unwrap();
+                assert_eq!(stored_cfg.quantization, Some(spec));
+                let stored = Qwen35Model::from_weights_with(
+                    &stored_weights,
+                    "model.language_model",
+                    stored_cfg,
+                    None,
+                )
+                .unwrap();
+                assert!(stored.is_quantized());
+
+                for base in [
+                    "model.language_model.layers.0.linear_attn.in_proj_qkv",
+                    "model.language_model.layers.0.linear_attn.in_proj_z",
+                    "model.language_model.layers.0.linear_attn.out_proj",
+                    "model.language_model.layers.3.self_attn.q_proj",
+                    "model.language_model.layers.3.self_attn.k_proj",
+                    "model.language_model.layers.3.self_attn.v_proj",
+                    "model.language_model.layers.3.self_attn.o_proj",
+                ] {
+                    assert!(stored_weights.contains(&format!("{base}.scales")), "{base}");
+                }
+                for dense in [
+                    "model.language_model.layers.0.linear_attn.in_proj_a.scales",
+                    "model.language_model.layers.0.linear_attn.in_proj_b.scales",
+                    "model.language_model.layers.0.linear_attn.conv1d.scales",
+                    "model.language_model.layers.0.linear_attn.norm.scales",
+                ] {
+                    assert!(!stored_weights.contains(dense), "{dense} must stay dense");
+                }
+                if moe {
+                    assert!(!stored_weights
+                        .contains("model.language_model.layers.0.mlp.experts.gate_up_proj"));
+                    for base in [
+                        "model.language_model.layers.0.mlp.experts.0.gate_proj",
+                        "model.language_model.layers.0.mlp.experts.0.up_proj",
+                        "model.language_model.layers.0.mlp.experts.0.down_proj",
+                        "model.language_model.layers.0.mlp.shared_expert.gate_proj",
+                    ] {
+                        assert!(stored_weights.contains(&format!("{base}.scales")), "{base}");
+                    }
+                    assert!(
+                        !stored_weights.contains("model.language_model.layers.0.mlp.gate.scales")
+                    );
+                    assert!(!stored_weights
+                        .contains("model.language_model.layers.0.mlp.shared_expert_gate.scales"));
+                } else {
+                    assert!(stored_weights
+                        .contains("model.language_model.layers.0.mlp.gate_proj.scales"));
+                }
+
+                let ids = Array::from_slice(&[1i32, 2], &[1, 2]);
+                let expected = load_time
+                    .forward(&ids, &mut load_time.new_cache(), 0)
+                    .unwrap();
+                let actual = stored.forward(&ids, &mut stored.new_cache(), 0).unwrap();
+                expected.eval().unwrap();
+                actual.eval().unwrap();
+                let expected = expected.as_dtype(Dtype::Float32).unwrap();
+                let actual = actual.as_dtype(Dtype::Float32).unwrap();
+                let max_abs = expected
+                    .as_slice::<f32>()
+                    .iter()
+                    .zip(actual.as_slice::<f32>())
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                assert!(max_abs <= 1e-5, "stored/load-time parity max_abs={max_abs}");
+
+                std::fs::remove_dir_all(&dir).ok();
+            }
         }
     }
 
@@ -524,11 +784,8 @@ mod tests {
         let v = Array::zeros::<f32>(&[64]).unwrap(); // 1-D vector
         let stacked = Array::zeros::<f32>(&[4, 128, 64]).unwrap(); // stacked experts
         for (k, a) in [
-            ("model.layers.0.linear_attn.in_proj_qkv.weight", &m),
-            ("model.layers.0.linear_attn.out_proj.weight", &m),
-            ("model.layers.0.mlp.experts.gate_up_proj", &stacked), // Qwen3.5-MoE stacked
-            ("model.layers.0.self_attn.w_qkv.weight", &m),         // unknown layout
-            ("model.layers.0.mlp.experts.w1.weight", &stacked),    // future stacked-expert layout
+            ("model.layers.0.self_attn.w_qkv.weight", &m), // unknown layout
+            ("model.layers.0.mlp.experts.w1.weight", &stacked), // future stacked-expert layout
         ] {
             assert!(is_unrecognized_projection(k, a), "{k} must be refused");
         }
@@ -883,35 +1140,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// The Qwen3.5/3.6 hybrid linear-attention family is refused loudly (its loader has no
-    /// pre-quantized snapshot branch), and nothing is written.
-    #[test]
-    fn quantize_refuses_qwen35_hybrid() {
-        let dir = unique_dir("refuse-qwen35");
-        std::fs::remove_dir_all(&dir).ok();
-        let t = vec![(
-            "model.embed_tokens.weight".to_string(),
-            Array::zeros::<f32>(&[4, 64]).unwrap(),
-        )];
-        let config = json!({ "model_type": "qwen3_5" });
-        match write_snapshot(
-            &dir,
-            t,
-            config,
-            &SnapshotTokenizer::default(),
-            Some(QuantSpec::q4()),
-        ) {
-            Err(Error::Unsupported(msg)) => {
-                assert!(
-                    msg.contains("linear-attention"),
-                    "message names the family: {msg}"
-                );
-            }
-            other => panic!("expected Unsupported, got {other:?}"),
-        }
-        assert!(!dir.exists(), "a refused quantize must write nothing");
-    }
-
     /// Projection-like keys the writer does not cover abort the write (loud refusal, never a silent
     /// mixed-tier snapshot). Dense writes of the same set still pass through fine.
     #[test]
@@ -925,7 +1153,7 @@ mod tests {
                     randn(&[64, 64], &mut SplitMix64::new(2)),
                 ),
                 (
-                    "model.layers.0.linear_attn.in_proj_qkv.weight".to_string(),
+                    "model.layers.0.linear_attn.unknown_proj.weight".to_string(),
                     randn(&[128, 64], &mut SplitMix64::new(3)),
                 ),
             ]
@@ -940,7 +1168,7 @@ mod tests {
         ) {
             Err(Error::Unsupported(msg)) => {
                 assert!(
-                    msg.contains("model.layers.0.linear_attn.in_proj_qkv.weight"),
+                    msg.contains("model.layers.0.linear_attn.unknown_proj.weight"),
                     "message lists the uncovered key: {msg}"
                 );
             }

@@ -83,6 +83,9 @@ pub struct Qwen35Config {
     /// `rotary_dim/2`); `None` ⇒ the even split from [`Qwen35Config::mrope_section_resolved`]. Drives
     /// the per-channel axis assignment for image (3-D) positions; irrelevant to the text path.
     pub mrope_section: Option<[i32; 3]>,
+    /// Stored Q4/Q8 projection format, read from either the decoder's nested `text_config` or the
+    /// top-level snapshot config. `None` means dense weights (which may still be quantized on load).
+    pub quantization: Option<QuantSpec>,
 }
 
 impl Qwen35Config {
@@ -111,6 +114,15 @@ impl Qwen35Config {
         let intermediate_size = int("intermediate_size")
             .or_else(|| int("moe_intermediate_size"))
             .unwrap_or(0);
+        let quantization = c
+            .get("quantization")
+            .or_else(|| v.get("quantization"))
+            .and_then(|q| {
+                Some(QuantSpec {
+                    group_size: q.get("group_size")?.as_i64()? as i32,
+                    bits: q.get("bits")?.as_i64()? as i32,
+                })
+            });
         Ok(Self {
             hidden_size,
             num_layers: req("num_hidden_layers")? as usize,
@@ -150,6 +162,7 @@ impl Qwen35Config {
                     let g = |i: usize| a[i].as_i64().unwrap_or(0) as i32;
                     [g(0), g(1), g(2)]
                 }),
+            quantization,
         })
     }
 
@@ -838,8 +851,26 @@ impl Qwen35Model {
             let t = req(key)?;
             Ok(add(&t, &Array::from_f32(1.0).as_dtype(t.dtype())?)?)
         };
+        let stored_quant = cfg.quantization;
         let proj_q = |key: String| -> Result<Projection> {
-            Projection::load(w.require(&key)?.as_dtype(COMPUTE_DTYPE)?, quant)
+            let base = key.strip_suffix(".weight").unwrap_or(&key);
+            let scales_key = format!("{base}.scales");
+            if w.contains(&scales_key) {
+                let spec = stored_quant.ok_or_else(|| {
+                    Error::Config(format!(
+                        "snapshot stores quantized tensor `{scales_key}` but config.json has no \
+                         `quantization` block"
+                    ))
+                })?;
+                Ok(Projection::from_quantized(
+                    w.require(&key)?.clone(),
+                    w.require(&scales_key)?.clone(),
+                    w.require(&format!("{base}.biases"))?.clone(),
+                    spec,
+                ))
+            } else {
+                Projection::load(w.require(&key)?.as_dtype(COMPUTE_DTYPE)?, quant)
+            }
         };
         let proj_dense = |key: String| -> Result<Projection> {
             Projection::load(w.require(&key)?.as_dtype(COMPUTE_DTYPE)?, None)
@@ -914,19 +945,29 @@ impl Qwen35Model {
                 Some(moe) => {
                     let h = cfg.hidden_size;
                     let mi = moe.moe_intermediate_size;
-                    let gate_up = req(lp("mlp.experts.gate_up_proj"))?;
-                    let down = req(lp("mlp.experts.down_proj"))?;
                     let mut experts = Vec::with_capacity(moe.num_experts as usize);
-                    for e in 0..moe.num_experts {
-                        let sel = Array::from_slice(&[e], &[1]);
-                        let gu = gate_up.take_axis(&sel, 0)?.reshape(&[2 * mi, h])?;
-                        let parts = split_sections(&gu, &[mi], 0)?; // [gate_w, up_w]
-                        let dn = down.take_axis(&sel, 0)?.reshape(&[h, mi])?;
-                        experts.push(Mlp {
-                            gate: Projection::load(parts[0].clone(), quant)?,
-                            up: Projection::load(parts[1].clone(), quant)?,
-                            down: Projection::load(dn, quant)?,
-                        });
+                    if w.contains(&lp("mlp.experts.0.gate_proj.scales")) {
+                        for e in 0..moe.num_experts {
+                            experts.push(Mlp {
+                                gate: proj_q(lp(&format!("mlp.experts.{e}.gate_proj.weight")))?,
+                                up: proj_q(lp(&format!("mlp.experts.{e}.up_proj.weight")))?,
+                                down: proj_q(lp(&format!("mlp.experts.{e}.down_proj.weight")))?,
+                            });
+                        }
+                    } else {
+                        let gate_up = req(lp("mlp.experts.gate_up_proj"))?;
+                        let down = req(lp("mlp.experts.down_proj"))?;
+                        for e in 0..moe.num_experts {
+                            let sel = Array::from_slice(&[e], &[1]);
+                            let gu = gate_up.take_axis(&sel, 0)?.reshape(&[2 * mi, h])?;
+                            let parts = split_sections(&gu, &[mi], 0)?; // [gate_w, up_w]
+                            let dn = down.take_axis(&sel, 0)?.reshape(&[h, mi])?;
+                            experts.push(Mlp {
+                                gate: Projection::load(parts[0].clone(), quant)?,
+                                up: Projection::load(parts[1].clone(), quant)?,
+                                down: Projection::load(dn, quant)?,
+                            });
+                        }
                     }
                     Ffn::Moe(MoeFfn {
                         router: req(lp("mlp.gate.weight"))?,
@@ -959,7 +1000,7 @@ impl Qwen35Model {
             rope,
             eps,
             cfg,
-            quantized: quant.is_some(),
+            quantized: quant.is_some() || stored_quant.is_some(),
         })
     }
 }
