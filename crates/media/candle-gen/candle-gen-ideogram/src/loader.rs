@@ -25,6 +25,7 @@
 //! weight installed over the mmap) and the packed **dequant-fold** (reconstruct the dense grid, fold,
 //! install a dense override).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::safetensors::MmapedSafetensors;
@@ -51,8 +52,8 @@ pub struct Weights {
 }
 
 impl Weights {
-    /// mmap every `*.safetensors` in `dir` (sorted; later files win on name collision), reading the
-    /// component `config.json`'s `quantization.group_size` (if any) for the packed-tier path.
+    /// mmap every `*.safetensors` in `dir` (sorted), rejecting tensor names duplicated across files,
+    /// and read the component `config.json`'s `quantization.group_size` (if any) for the packed tier.
     pub fn from_dir(dir: &Path, device: &Device, dtype: DType) -> Result<Self> {
         let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
             .map_err(|e| Error::Msg(format!("ideogram: read {}: {e}", dir.display())))?
@@ -67,6 +68,7 @@ impl Weights {
                 dir.display()
             )));
         }
+        validate_unique_tensor_names(&files)?;
         // SAFETY: read-only mmap of weight files; the standard candle loading path.
         let st = unsafe { MmapedSafetensors::multi(&files)? };
         Ok(Self {
@@ -111,6 +113,27 @@ impl Weights {
     fn group_size(&self) -> usize {
         self.packed_group_size.unwrap_or(MLX_GROUP_SIZE)
     }
+}
+
+/// Validate shard keys through their mmaped safetensors headers before constructing the combined
+/// loader. A duplicate is a malformed or polluted checkpoint, never an ordering policy.
+fn validate_unique_tensor_names(files: &[PathBuf]) -> Result<()> {
+    let mut owners: HashMap<String, &Path> = HashMap::new();
+    for file in files {
+        // SAFETY: read-only mmap used only to inspect this process-owned weight file's header.
+        let shard = unsafe { MmapedSafetensors::new(file)? };
+        for (name, _) in shard.tensors() {
+            if let Some(first_file) = owners.insert(name.clone(), file.as_path()) {
+                return Err(Error::Msg(format!(
+                    "ideogram: duplicate tensor key {name:?} in {} and {}: each tensor must live in \
+                     exactly one .safetensors file",
+                    first_file.display(),
+                    file.display()
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Read `{dir}/config.json`'s `quantization.group_size` — `None` when the block is absent (the
@@ -259,6 +282,45 @@ mod tests {
             let cfg = serde_json::json!({ "quantization": { "bits": 4, "group_size": gs } });
             std::fs::write(dir.join("config.json"), cfg.to_string()).unwrap();
         }
+    }
+
+    #[test]
+    fn from_dir_rejects_duplicate_tensor_names_across_files() {
+        let dev = Device::Cpu;
+        let dir = std::env::temp_dir().join(format!("sc12513_duplicate_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut first = HashMap::new();
+        first.insert(
+            "layers.0.attention.qkv.weight".to_string(),
+            Tensor::new(&[1f32], &dev).unwrap(),
+        );
+        let mut second = HashMap::new();
+        second.insert(
+            "layers.0.attention.qkv.weight".to_string(),
+            Tensor::new(&[2f32], &dev).unwrap(),
+        );
+        safetensors::save(&first, dir.join("model-00001-of-00002.safetensors")).unwrap();
+        safetensors::save(&second, dir.join("model-00002-of-00002.safetensors")).unwrap();
+
+        let err = Weights::from_dir(&dir, &dev, DType::F32)
+            .err()
+            .expect("duplicate tensor names must fail before the combined mmap is built");
+        let message = err.to_string();
+        assert!(
+            message.contains("layers.0.attention.qkv.weight"),
+            "must name the colliding tensor: {message}"
+        );
+        assert!(
+            message.contains("model-00001-of-00002.safetensors"),
+            "must name the first file: {message}"
+        );
+        assert!(
+            message.contains("model-00002-of-00002.safetensors"),
+            "must name the offending file: {message}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     fn cosine(a: &Tensor, b: &Tensor) -> f64 {
