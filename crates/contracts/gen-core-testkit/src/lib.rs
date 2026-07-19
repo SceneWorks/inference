@@ -1,8 +1,14 @@
 //! # gen-core-testkit
 //!
-//! A **contract conformance suite** for gen-core providers — [`gen_core::Generator`] (this module),
-//! [`gen_core::Trainer`](crate::trainer), and [`gen_core::Captioner`](crate::captioner). Given any
-//! boxed provider — an MLX family from `mlx-gen` or a future candle-gen provider — it exercises the
+//! A **contract conformance suite** for gen-core providers — the image/video/pure-audio
+//! [`gen_core::Generator`] (this module), [`gen_core::Trainer`](crate::trainer),
+//! [`gen_core::Captioner`](crate::captioner), and the audio-contract family (sc-12853):
+//! [`gen_core::Generator`] under [`Modality::Audio`](gen_core::Modality::Audio)
+//! ([`crate::audio_generator`]), [`gen_core::VoiceEmbedder`](crate::voice_embedder),
+//! [`gen_core::AudioTransform`](crate::audio_transform),
+//! [`gen_core::Transcriber`](crate::transcriber), and
+//! [`gen_core::AudioEmbedder`](crate::audio_embedder). Given any boxed provider — an MLX family from
+//! `mlx-gen`, a candle-gen provider, or a `crates/audio` candle provider — it exercises the
 //! behavioral guarantees the contract *promises but cannot express in the type system*: typed
 //! cancellation, progress monotonicity, seed determinism, and capability honesty. Both backends run
 //! it in CI, so a provider that silently ignores `CancelFlag` or reports no progress (the sc-4380
@@ -35,9 +41,28 @@
 //! The individual `check_*` functions are public so a provider's own tests can target one guarantee
 //! at a time; the `*_conformance` entry points run them all and panic with the aggregated failures.
 
+pub mod audio_embedder;
+pub mod audio_generator;
+pub mod audio_transform;
 pub mod captioner;
 pub mod trainer;
+pub mod transcriber;
+pub mod voice_embedder;
 
+pub use audio_embedder::{
+    audio_embedder_conformance, check_audio_embed_joint, check_audio_embedder_registry,
+    AudioEmbedderProfile,
+};
+pub use audio_generator::{
+    audio_conformance, check_audio_cancellation, check_audio_output, check_audio_precancellation,
+    check_audio_progress, check_audio_progress_contract, check_audio_seed_determinism,
+    check_audio_validate_honesty, AudioProfile,
+};
+pub use audio_transform::{
+    audio_transform_conformance, check_audio_transform_cardinality,
+    check_audio_transform_coherence, check_audio_transform_registry,
+    check_audio_transform_validate, AudioTransformProfile,
+};
 pub use captioner::{
     captioner_conformance, check_captioner_cancellation, check_captioner_progress,
     check_captioner_registry, check_captioner_validate, CaptionerProfile,
@@ -45,6 +70,14 @@ pub use captioner::{
 pub use trainer::{
     check_trainer_cancellation, check_trainer_progress, check_trainer_registry,
     check_trainer_validate, trainer_conformance, TrainerProfile,
+};
+pub use transcriber::{
+    check_transcriber_cancellation, check_transcriber_output, check_transcriber_registry,
+    check_transcriber_validate, transcriber_conformance, TranscriberProfile,
+};
+pub use voice_embedder::{
+    check_voice_embed, check_voice_embed_rejects_short, check_voice_embedder_registry,
+    voice_embedder_conformance, VoiceEmbedderProfile,
 };
 
 use gen_core::{
@@ -144,8 +177,9 @@ fn base_request(profile: &Profile) -> GenerationRequest {
 }
 
 /// The raw output pixels, flattened across images/frames — the unit the seed-determinism check
-/// compares byte-for-byte.
-fn output_bytes(out: &GenerationOutput) -> Vec<u8> {
+/// compares byte-for-byte. `pub(crate)` so the audio-generator harness ([`crate::audio_generator`])
+/// reuses the same byte extraction for its own seed-determinism check over `GenerationOutput::Audio`.
+pub(crate) fn output_bytes(out: &GenerationOutput) -> Vec<u8> {
     match out {
         GenerationOutput::Images(imgs) => {
             imgs.iter().flat_map(|i| i.pixels.iter().copied()).collect()
