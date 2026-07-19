@@ -1,0 +1,40 @@
+[package]
+name = "candle-audio-clap"
+version = "0.0.0"
+edition = "2021"
+description = "LAION CLAP (Apache-2.0) semantic audio-text embedding provider for the SceneWorks Candle audio lane (sc-12851) — the first real AudioEmbedder: AudioTrack → slaney log-mel → ported HTSAT (Swin) audio tower → projection, and text → RoBERTa text tower → projection, both L2-normalized into one joint CLIP-style space for cross-modal retrieval. Ports the HTSAT + RoBERTa towers on candle-nn at the pinned candle revision from laion/clap-htsat-unfused. No Python at runtime."
+license = "Apache-2.0"
+repository = "https://github.com/SceneWorks/inference"
+keywords = ["candle", "clap", "audio", "embedding", "retrieval"]
+categories = ["science"]
+
+[dependencies]
+# The shared candle audio commons (device seam, pinned-SHA hub resolution, STFT/Hann front-end,
+# `AudioError → gen_core::Error` bridge). Re-exports `gen_core` and `candle_core`, so this crate
+# resolves the SAME candle build + gen-core rev as the catalog it registers into.
+candle-audio = { path = "../candle-audio" }
+# candle-nn at the workspace's pinned candle revision — Linear/Conv2d/LayerNorm/Embedding building
+# blocks for the ported HTSAT + RoBERTa towers, and `VarBuilder::from_pth` for the checkpoint.
+candle-nn = { workspace = true }
+# Snapshot-preparer contract types for the audio lane's CLAP-aware preparer probe
+# (`SnapshotPreparerRegistration` lives in core-llm; composed by candle-audio-catalog).
+core-llm = { workspace = true }
+# CLAP's RoBERTa BPE tokenizer (laion/clap-* ships tokenizer.json). The workspace pin is 0.22.
+tokenizers = { workspace = true }
+# config.json parsing (not strictly required — the architecture is pinned in `config.rs` — but the
+# preparer probe reads `model_type` to recognize a CLAP snapshot).
+serde_json = { workspace = true }
+
+[dev-dependencies]
+# HF-cache snapshot resolution for the `#[ignore]`d real-weight conformance test.
+candle-audio = { path = "../candle-audio", features = ["testkit"] }
+# The merged Kokoro TTS provider generates a real speech clip for the cross-modal ranking test.
+candle-audio-kokoro = { path = "../candle-audio-kokoro" }
+
+[features]
+default = []
+# Apple Metal GPU backend — forwarded to the shared audio commons + candle-nn. Not in `default`
+# (the audio lane ships CPU-first everywhere; see audio-backend-strategy.md).
+metal = ["candle-audio/metal", "candle-nn/metal"]
+# NVIDIA CUDA backend — forwarded likewise. Not in `default`.
+cuda = ["candle-audio/cuda", "candle-nn/cuda"]

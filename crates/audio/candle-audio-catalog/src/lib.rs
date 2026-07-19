@@ -44,6 +44,7 @@ pub const AUDIO_BACKEND: &str = "candle";
 pub mod providers {
     pub use candle_audio_acestep;
     pub use candle_audio_chatterbox_ve;
+    pub use candle_audio_clap;
     pub use candle_audio_kokoro;
     pub use candle_audio_moss_sfx;
     pub use candle_audio_openvoice;
@@ -54,14 +55,17 @@ pub mod providers {
 /// stable catalog order: the generators first (Kokoro TTS, MOSS SFX, ACE-Step music), then the
 /// voice-cloning identity embedder (Chatterbox `ve`, sc-12844), then the audio transforms
 /// (OpenVoice V2 voice conversion, sc-13223 — the first real `AudioTransform`), then the
-/// transcribers (Whisper ASR, sc-12850 — the first real `Transcriber`, the audio Captioner-analog).
+/// transcribers (Whisper ASR, sc-12850 — the first real `Transcriber`, the audio Captioner-analog),
+/// then the audio embedders (LAION CLAP, sc-12851 — the first real `AudioEmbedder`, semantic
+/// audio-text joint-space retrieval).
 pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistryBuilder {
     let registry = candle_audio_kokoro::register_providers(registry);
     let registry = candle_audio_moss_sfx::register_providers(registry);
     let registry = candle_audio_acestep::register_providers(registry);
     let registry = candle_audio_chatterbox_ve::register_providers(registry);
     let registry = candle_audio_openvoice::register_providers(registry);
-    candle_audio_whisper::register_providers(registry)
+    let registry = candle_audio_whisper::register_providers(registry);
+    candle_audio_clap::register_providers(registry)
 }
 
 /// Build the complete explicit Candle audio provider catalog.
@@ -88,6 +92,7 @@ fn lane_can_prepare(spec: &core_llm::PrepareSpec) -> bool {
         || candle_audio_acestep::prepare::can_prepare(spec)
         || candle_audio_openvoice::prepare::can_prepare(spec)
         || candle_audio_whisper::prepare::can_prepare(spec)
+        || candle_audio_clap::prepare::can_prepare(spec)
         || (candle_llm::prepare::REGISTRATION.can_prepare)(spec)
 }
 
@@ -102,6 +107,8 @@ fn lane_prepare(spec: &core_llm::PrepareSpec) -> core_llm::Result<core_llm::Prep
         candle_audio_openvoice::prepare::prepare(spec)
     } else if candle_audio_whisper::prepare::can_prepare(spec) {
         candle_audio_whisper::prepare::prepare(spec)
+    } else if candle_audio_clap::prepare::can_prepare(spec) {
+        candle_audio_clap::prepare::prepare(spec)
     } else {
         (candle_llm::prepare::REGISTRATION.prepare)(spec)
     }
@@ -165,12 +172,19 @@ mod tests {
             .map(|r| (r.descriptor)().id.to_string())
             .collect();
         assert_eq!(transcribers, ["whisper_base"]);
+        // The audio embedders surface as their own kind (sc-12851), in catalog order — LAION CLAP is
+        // the first real AudioEmbedder (semantic audio-text joint-space retrieval).
+        let audio_embedders: Vec<String> = registry
+            .audio_embedders()
+            .map(|r| (r.descriptor)().id.to_string())
+            .collect();
+        assert_eq!(audio_embedders, ["clap_htsat_unfused"]);
         assert_eq!(
             registry.descriptor_conformance_errors(),
             Vec::<String>::new()
         );
-        // The audio lane admits generators, voice embedders, audio transforms, and transcribers
-        // only — never the image/text/trainer/captioner kinds (those belong in a media family).
+        // The audio lane admits generators, voice embedders, audio transforms, transcribers, and
+        // audio embedders only — never the image/text/trainer/captioner kinds (media families).
         assert_eq!(registry.transforms().len(), 0);
         assert_eq!(registry.trainers().len(), 0);
         assert_eq!(registry.captioners().len(), 0);
@@ -184,6 +198,13 @@ mod tests {
         assert!(registry
             .audio_transforms()
             .all(|r| (r.descriptor)().backend == super::AUDIO_BACKEND));
+        // Every audio embedder is candle-backed and the "audio-embed" family.
+        assert!(registry
+            .audio_embedders()
+            .all(|r| (r.descriptor)().backend == super::AUDIO_BACKEND));
+        assert!(registry
+            .audio_embedders()
+            .all(|r| (r.descriptor)().family == "audio-embed"));
         // Every audio generator is candle-backed and audio-modality.
         assert!(registry
             .generators()
@@ -269,6 +290,15 @@ mod tests {
         let spec = super::core_llm::PrepareSpec::dense(&ov, ov.join("out"));
         assert!((regs[0].can_prepare)(&spec));
         let _ = std::fs::remove_dir_all(&ov);
+        // ...a CLAP snapshot dir is accepted too (sc-12851)...
+        let clap = std::env::temp_dir().join("audio-catalog-clap-probe");
+        let _ = std::fs::remove_dir_all(&clap);
+        std::fs::create_dir_all(&clap).unwrap();
+        std::fs::write(clap.join("config.json"), r#"{"model_type": "clap"}"#).unwrap();
+        std::fs::write(clap.join("pytorch_model.bin"), b"stub").unwrap();
+        let spec = super::core_llm::PrepareSpec::dense(&clap, clap.join("out"));
+        assert!((regs[0].can_prepare)(&spec));
+        let _ = std::fs::remove_dir_all(&clap);
         // ...while a bare dir (neither audio- nor LLM-shaped) is not.
         let empty = std::env::temp_dir().join("audio-catalog-empty-probe");
         let _ = std::fs::remove_dir_all(&empty);

@@ -119,6 +119,7 @@ mod tests {
             assert_eq!(snapshot.audio_voice_embedder_ids, ["chatterbox_ve"]);
             assert_eq!(snapshot.audio_transform_ids, ["openvoice_v2"]);
             assert_eq!(snapshot.audio_transcriber_ids, ["whisper_base"]);
+            assert_eq!(snapshot.audio_embedder_ids, ["clap_htsat_unfused"]);
             assert_eq!(snapshot.audio_snapshot_preparer_backends, ["candle"]);
         }
         #[cfg(not(feature = "audio"))]
@@ -128,6 +129,7 @@ mod tests {
             assert!(snapshot.audio_voice_embedder_ids.is_empty());
             assert!(snapshot.audio_transform_ids.is_empty());
             assert!(snapshot.audio_transcriber_ids.is_empty());
+            assert!(snapshot.audio_embedder_ids.is_empty());
         }
         #[cfg(feature = "media")]
         assert_eq!(mlx_gen_catalog::BESPOKE_UTILITY_CRATES.len(), 6);
