@@ -23,12 +23,10 @@
 //! f32); APG runs f32. `backend = "candle"`, `mac_only = false`. Q4/Q8 is a **packed tier** (the two
 //! experts load through the sc-10025 packed-detect seam), streamed one expert at a time.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use candle_gen::candle_core::{DType, Device, Tensor};
-use candle_gen::candle_nn::VarBuilder;
-use candle_gen::gen_core::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use candle_gen::gen_core::{
     self, Capabilities, Conditioning, ConditioningKind, GenerationOutput, GenerationRequest,
     Generator, LoadSpec, Modality, ModelDescriptor, Progress, Quant, WeightsSource,
@@ -36,15 +34,13 @@ use candle_gen::gen_core::{
 use candle_gen::{CandleError, Result as CResult};
 
 use candle_gen_wan::config::{
-    TextEncoderConfig, TransformerConfig, Vae16Config, DEFAULT_FRAMES_14B, NEGATIVE_FALLBACK,
+    TextEncoderConfig, TransformerConfig, DEFAULT_FRAMES_14B, NEGATIVE_FALLBACK,
     NUM_TRAIN_TIMESTEPS, VAE16_STRIDE_SPATIAL, VAE16_STRIDE_TEMPORAL,
 };
 use candle_gen_wan::pipeline::{create_noise, frames_to_images};
 use candle_gen_wan::scheduler::{flow_sigmas, FlowScheduler, Sampler};
-use candle_gen_wan::text_encoder::Umt5Encoder;
-use candle_gen_wan::transformer::WanTransformer;
-use candle_gen_wan::vae16::WanVae16;
 
+use crate::components::RendererComponents;
 use crate::config::{
     check_mode_conditioning, resolve_mode, validate_bernini_geometry, BerniniKnobs, Defaults,
 };
@@ -53,9 +49,7 @@ use crate::guidance::MomentumBuffer;
 use crate::preprocess::{encode_image, encode_videoclip};
 
 /// The experts run bf16 (the diffusers weights load as bf16, matching the 5B/14B regime); UMT5 + VAE f32.
-const DIT_DTYPE: DType = DType::BF16;
 const ENC_DTYPE: DType = DType::F32;
-const VAE_DTYPE: DType = DType::F32;
 /// The A14B DiT emits 16-channel latents (z16 VAE).
 const Z_DIM: usize = 16;
 
@@ -111,18 +105,6 @@ pub fn descriptor() -> ModelDescriptor {
     }
 }
 
-/// The heavy resident components, loaded lazily on first generate and cached.
-struct Components {
-    te: Umt5Encoder,
-    /// `transformer/` — the **high-noise** expert (timestep ≥ boundary).
-    high: WanTransformer,
-    /// `transformer_2/` — the **low-noise** expert (timestep < boundary).
-    low: WanTransformer,
-    vae: WanVae16,
-    /// UMT5 tokenizer, parsed **once** at component load and reused across the pos/neg encodes.
-    tok: TextTokenizer,
-}
-
 /// A loaded Bernini renderer: resolved Bernini knobs + the snapshot dir, with the heavy components
 /// (UMT5, the two experts, the z16 VAE) loaded lazily on the first `generate` and cached.
 pub struct BerniniRenderer {
@@ -130,52 +112,25 @@ pub struct BerniniRenderer {
     knobs: BerniniKnobs,
     root: PathBuf,
     device: Device,
-    components: Mutex<Option<Arc<Components>>>,
+    components: Mutex<Option<Arc<RendererComponents>>>,
 }
 
 impl BerniniRenderer {
-    fn component_vb(&self, sub: &str, dtype: DType) -> CResult<VarBuilder<'static>> {
-        candle_gen::component_vb(&self.root, sub, dtype, &self.device, "bernini_renderer")
-    }
-
-    fn load_components(&self) -> CResult<Components> {
-        let te = Umt5Encoder::new(
-            &TextEncoderConfig::umt5_xxl(),
-            self.component_vb("text_encoder", ENC_DTYPE)?,
-        )?;
-        let dit_cfg = TransformerConfig::t2v_14b();
-        // Sequential/streaming load: build (and, for a packed tier, dequant-detect) one expert's
-        // VarBuilder at a time so only one expert's staging is resident at a time (mirrors wan14b).
-        // transformer/ = high-noise, transformer_2/ = low-noise (diffusers WanPipeline convention).
-        let high = WanTransformer::new(&dit_cfg, self.component_vb("transformer", DIT_DTYPE)?)?;
-        let low = WanTransformer::new(&dit_cfg, self.component_vb("transformer_2", DIT_DTYPE)?)?;
-        // Build the VAE **with its encoder**: the packed source-id conditioning modes (i2i/v2v/r2v,
-        // sc-11004) VAE-encode the Reference/MultiReference/VideoClip media into z16 source latents. The
-        // text-only render (t2v/t2v_apg) only uses the decoder, but the encoder is resident either way
-        // (one component build, cached; mirrors wan14b I2V).
-        let vae = WanVae16::new_with_encoder(
-            &Vae16Config::wan21(),
-            self.component_vb("vae", VAE_DTYPE)?,
-        )?;
-        let tok = build_tokenizer(&self.root)?;
-        Ok(Components {
-            te,
-            high,
-            low,
-            vae,
-            tok,
+    fn components(&self) -> CResult<Arc<RendererComponents>> {
+        candle_gen::cached(&self.components, || {
+            Ok(Arc::new(RendererComponents::load(
+                &self.root,
+                &self.device,
+                MODEL_ID,
+            )?))
         })
-    }
-
-    fn components(&self) -> CResult<Arc<Components>> {
-        candle_gen::cached(&self.components, || Ok(Arc::new(self.load_components()?)))
     }
 
     /// Tokenize + UMT5-encode `prompt` → `[1, 512, 4096]` (f32), zero-padded/truncated to `max_length`
     /// (the DiT cross-attends over the 512-padded context — the Wan training convention, sc-3697). The
     /// empty-prompt guard (sc-7078) emits one pad token so a 0-length sequence never reaches the CUDA
     /// embedding gather. Replicates `candle_gen_wan`'s crate-private `umt5_encode_padded`.
-    fn encode(&self, comps: &Components, prompt: &str) -> CResult<Tensor> {
+    fn encode(&self, comps: &RendererComponents, prompt: &str) -> CResult<Tensor> {
         let te_cfg = TextEncoderConfig::umt5_xxl();
         let out = comps
             .tok
@@ -204,7 +159,7 @@ impl BerniniRenderer {
     fn render(
         &self,
         req: &GenerationRequest,
-        comps: &Components,
+        comps: &RendererComponents,
         on_progress: &mut dyn FnMut(Progress),
     ) -> CResult<GenerationOutput> {
         let frames = req.frames.unwrap_or(DEFAULT_FRAMES_14B).max(1);
@@ -383,7 +338,7 @@ impl BerniniRenderer {
 
 /// Which dual-expert transformer a denoise step routes through: **high-noise** at/above the boundary
 /// timestep (`transformer/`), **low-noise** below (`transformer_2/`) — the diffusers WanPipeline
-/// convention mirrored by [`Components`].
+/// convention used by the shared renderer components.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Expert {
     High,
@@ -408,22 +363,6 @@ fn select_expert(t: f64, boundary_ts: f64, switched: &mut bool, omega: &mut f32)
         }
         Expert::Low
     }
-}
-
-/// Build the Bernini renderer UMT5 tokenizer from `root/tokenizer/tokenizer.json` **once** (reused
-/// across the pos/neg encodes). Byte-identical [`TokenizerConfig`] to `candle_gen_wan`'s Wan loader.
-fn build_tokenizer(root: &Path) -> CResult<TextTokenizer> {
-    let te_cfg = TextEncoderConfig::umt5_xxl();
-    TextTokenizer::from_file(
-        root.join("tokenizer/tokenizer.json"),
-        TokenizerConfig {
-            max_length: te_cfg.max_length,
-            pad_token_id: te_cfg.pad_token_id,
-            chat_template: ChatTemplate::None,
-            pad_to_max_length: false,
-        },
-    )
-    .map_err(|e| CandleError::Msg(format!("bernini_renderer: load tokenizer: {e}")))
 }
 
 /// Load the Bernini renderer from a converted snapshot directory (`text_encoder/`, `transformer/`,
