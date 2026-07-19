@@ -166,3 +166,22 @@ expected_files = [
     "transformer/diffusion_pytorch_model.bf16-00003-of-00003.safetensors",
     "vae/diffusion_pytorch_model.bf16.safetensors",
 ]
+
+[[models]]
+# MOSS-TTS-Realtime-1.7B AR brain (sc-13334): the Qwen3-1.7B backbone + CSM-style local/depth
+# transformer emitting real 16-codebook RVQ speech-token frames. The MOSS-Audio-Tokenizer codec
+# (RVQ -> 24 kHz waveform) is a separate ~7 GB model, not yet ported; this snapshot is the AR
+# stack only (config.json + model.safetensors + tokenizer).
+key = "moss-tts-realtime"
+repository = "OpenMOSS-Team/MOSS-TTS-Realtime"
+revision = "6acbc7f161a0db71c291f2d0aaa9eee59334cab2"
+license = "Apache-2.0"
+size_class = "large"
+profiles = ["audio-macos"]
+environment = ["MOSS_TTS_REALTIME_SNAPSHOT"]
+expected_files = [
+    "config.json",
+    "model.safetensors",
+    "tokenizer.json",
+    "tokenizer_config.json",
+]
