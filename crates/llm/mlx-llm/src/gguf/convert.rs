@@ -33,7 +33,7 @@ use crate::error::{Error, Result};
 use crate::gguf::reader::GgufFile;
 use crate::gguf::tokenizer::{self, TokenizerOutcome};
 use crate::primitives::QuantSpec;
-use crate::snapshot::{write_snapshot, SnapshotTokenizer};
+use crate::snapshot::{write_streaming_snapshot, SnapshotTokenizer};
 
 /// Compute/storage dtype for dense tensors — bf16, the engine's load dtype, so a dense conversion
 /// reloads with no extra rounding.
@@ -124,8 +124,10 @@ pub fn convert(
     // HF half-split layout (`rope_type=NEOX`) and so is not permuted.
     let permute_qk = arch == "llama";
 
-    // --- remap + dequantize every tensor to dense f32 (with its torch-order shape) ---
-    let mut dense: HashMap<String, (Vec<f32>, Vec<usize>)> = HashMap::new();
+    // First pass retains shape metadata only. Payloads are dequantized one at a time by the
+    // streaming writer, never accumulated into a model-sized f32 map.
+    let mut shapes: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut sources: HashMap<String, &crate::gguf::reader::TensorInfo> = HashMap::new();
     let mut unmapped: Vec<String> = Vec::new();
     for info in &g.tensors {
         let Some(hf_key) = remap_key(&info.name) else {
@@ -134,14 +136,8 @@ pub fn convert(
             }
             continue;
         };
-        let raw = g.tensor_data(info)?;
-        let mut data = super::dequant::dequantize(info.ggml_type, raw, info.num_elements())?;
-        if permute_qk && hf_key.ends_with("self_attn.q_proj.weight") {
-            data = permute_inverse_qk(&data, &info.shape, num_heads)?;
-        } else if permute_qk && hf_key.ends_with("self_attn.k_proj.weight") {
-            data = permute_inverse_qk(&data, &info.shape, num_kv_heads)?;
-        }
-        dense.insert(hf_key, (data, info.shape.clone()));
+        shapes.insert(hf_key.clone(), info.shape.clone());
+        sources.insert(hf_key, info);
     }
     if !unmapped.is_empty() {
         return Err(Error::Unsupported(format!(
@@ -152,16 +148,7 @@ pub fn convert(
     }
 
     // --- reconstruct config.json from GGUF metadata (the writer adds any `quantization` block) ---
-    let config = reconstruct_config(g, &arch, model_type, hf_arch, &dense)?;
-
-    // --- dense tensor set (bf16), remapped to the transformer key layout; the shared writer does
-    // any projection requant ---
-    let mut tensors: Vec<(String, Array)> = Vec::with_capacity(dense.len());
-    for (key, (data, shape)) in &dense {
-        let shape_i32: Vec<i32> = shape.iter().map(|&d| d as i32).collect();
-        let arr = Array::from_slice(data, &shape_i32).as_dtype(STORE_DTYPE)?;
-        tensors.push((key.clone(), arr));
-    }
+    let config = reconstruct_config(g, &arch, model_type, hf_arch, &shapes)?;
 
     // --- reconstruct tokenizer.json / tokenizer_config.json from the GGUF tokenizer metadata ---
     let (snapshot_tokenizer, tokenizer) = match tokenizer::reconstruct(g)? {
@@ -180,7 +167,30 @@ pub fn convert(
     };
 
     // --- write the snapshot through the shared writer (requant + config + safetensors + tokenizer) ---
-    let report = write_snapshot(out_dir, tensors, config, &snapshot_tokenizer, opts.quantize)?;
+    let mut keys: Vec<_> = sources.keys().cloned().collect();
+    keys.sort();
+    let report = write_streaming_snapshot(
+        out_dir,
+        &keys,
+        config,
+        &snapshot_tokenizer,
+        opts.quantize,
+        |key| {
+            let info = sources[key];
+            let mut data = super::dequant::dequantize(
+                info.ggml_type,
+                g.tensor_data(info)?,
+                info.num_elements(),
+            )?;
+            if permute_qk && key.ends_with("self_attn.q_proj.weight") {
+                data = permute_inverse_qk(&data, &info.shape, num_heads)?;
+            } else if permute_qk && key.ends_with("self_attn.k_proj.weight") {
+                data = permute_inverse_qk(&data, &info.shape, num_kv_heads)?;
+            }
+            let shape: Vec<i32> = info.shape.iter().map(|&d| d as i32).collect();
+            Ok(Array::from_slice(&data, &shape).as_dtype(STORE_DTYPE)?)
+        },
+    )?;
 
     Ok(ConvertReport {
         architecture: arch,
@@ -280,7 +290,7 @@ fn reconstruct_config(
     arch: &str,
     model_type: &str,
     hf_arch: &str,
-    dense: &HashMap<String, (Vec<f32>, Vec<usize>)>,
+    shapes: &HashMap<String, Vec<usize>>,
 ) -> Result<Value> {
     let key = |suffix: &str| format!("{arch}.{suffix}");
     let req_u64 = |suffix: &str| -> Result<u64> {
@@ -306,13 +316,13 @@ fn reconstruct_config(
     let context = g.meta_u64(&key("context_length")).unwrap_or(0) as i64;
 
     // vocab from the embedding rows (torch [vocab, hidden]) — the most reliable source.
-    let vocab = dense
+    let vocab = shapes
         .get("model.embed_tokens.weight")
-        .map(|(_, shape)| shape[0] as i64)
+        .map(|shape| shape[0] as i64)
         .ok_or_else(|| Error::Config("gguf: no token embedding tensor".into()))?;
 
     // lm_head tied iff the GGUF has no separate output projection.
-    let tied = !dense.contains_key("lm_head.weight");
+    let tied = !shapes.contains_key("lm_head.weight");
 
     let mut cfg = Map::new();
     cfg.insert("architectures".into(), json!([hf_arch]));

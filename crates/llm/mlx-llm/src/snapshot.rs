@@ -27,6 +27,8 @@
 //! never a silent dense fallback. Qwen3.5/3.6's hybrid `linear_attn.*` projections and stacked MoE
 //! experts are covered explicitly so prepared and load-time quantization have the same surface.
 
+use std::collections::BTreeMap;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use mlx_rs::ops::split_sections;
@@ -43,6 +45,150 @@ use crate::primitives::Weights;
 /// The engine's bf16 compute/storage dtype. Projection weights are cast to it before requant so a
 /// quantized snapshot matches the loader's compute path (and the GGUF converter's behavior).
 const STORE_DTYPE: Dtype = Dtype::Bfloat16;
+
+struct StagedTensor {
+    dtype: &'static str,
+    shape: Vec<usize>,
+    path: PathBuf,
+    len: usize,
+}
+
+/// Write a snapshot while retaining at most one source tensor and its transformed outputs.
+/// Tensor payloads are spooled to disk, then assembled in canonical `(dtype, name)` order.
+pub(crate) fn write_streaming_snapshot(
+    out_dir: &Path,
+    keys: &[String],
+    mut config: Value,
+    tokenizer: &SnapshotTokenizer,
+    quantize: Option<QuantSpec>,
+    mut load: impl FnMut(&str) -> Result<Array>,
+) -> Result<SnapshotReport> {
+    if out_dir.exists() {
+        if out_dir.is_dir() && std::fs::read_dir(out_dir)?.next().is_none() {
+            std::fs::remove_dir(out_dir)?;
+        } else {
+            return Err(Error::Msg(format!(
+                "snapshot output already exists and is not empty: {}",
+                out_dir.display()
+            )));
+        }
+    }
+    if let Some(spec) = quantize {
+        config
+            .as_object_mut()
+            .ok_or_else(|| Error::Config("snapshot config.json is not a JSON object".into()))?
+            .insert(
+                "quantization".into(),
+                json!({"group_size": spec.group_size, "bits": spec.bits}),
+            );
+    }
+    let stage = out_dir.with_extension(format!("tmp-{}", std::process::id()));
+    if stage.exists() {
+        std::fs::remove_dir_all(&stage)?;
+    }
+    std::fs::create_dir_all(&stage)?;
+    let result = (|| {
+        let mut staged = BTreeMap::new();
+        let mut quantized_projections = 0;
+        for (index, key) in keys.iter().enumerate() {
+            let arr = load(key)?.as_dtype(STORE_DTYPE)?;
+            let outputs = if let Some(spec) = quantize.filter(|_| is_projection(key)) {
+                let base = key.strip_suffix(".weight").unwrap();
+                let q = QuantizedLinear::quantize(&arr, spec.group_size, spec.bits, None)?;
+                quantized_projections += 1;
+                vec![
+                    (format!("{base}.weight"), q.weight),
+                    (format!("{base}.scales"), q.scales),
+                    (format!("{base}.biases"), q.biases),
+                ]
+            } else {
+                vec![(key.clone(), arr)]
+            };
+            for (part, (name, value)) in outputs.into_iter().enumerate() {
+                let (dtype, bytes) = array_payload(&value)?;
+                let path = stage.join(format!("tensor-{index}-{part}"));
+                std::fs::write(&path, &bytes)?;
+                staged.insert(
+                    name,
+                    StagedTensor {
+                        dtype,
+                        shape: value.shape().iter().map(|&d| d as usize).collect(),
+                        path,
+                        len: bytes.len(),
+                    },
+                );
+            }
+        }
+        if quantize.is_some() && quantized_projections == 0 {
+            return Err(Error::Unsupported(
+                "cannot quantize snapshot: no attention/MLP projection weights matched".into(),
+            ));
+        }
+        let mut order: Vec<_> = staged.iter().collect();
+        order.sort_by(|(an, a), (bn, b)| b.dtype.cmp(a.dtype).then(an.cmp(bn)));
+        let mut offset = 0usize;
+        let mut header = serde_json::Map::new();
+        for (name, tensor) in &order {
+            header.insert((*name).clone(), json!({"dtype": tensor.dtype, "shape": tensor.shape, "data_offsets": [offset, offset + tensor.len]}));
+            offset += tensor.len;
+        }
+        let mut header_bytes = serde_json::to_vec(&Value::Object(header))
+            .map_err(|e| Error::Msg(format!("serialize safetensors header: {e}")))?;
+        header_bytes.resize(header_bytes.len().div_ceil(8) * 8, b' ');
+        let model = stage.join("model.safetensors");
+        let mut writer = BufWriter::new(std::fs::File::create(&model)?);
+        writer.write_all(&(header_bytes.len() as u64).to_le_bytes())?;
+        writer.write_all(&header_bytes)?;
+        for (_, tensor) in order {
+            std::io::copy(&mut std::fs::File::open(&tensor.path)?, &mut writer)?;
+        }
+        writer.flush()?;
+        write_json_string(&stage.join("config.json"), &config)?;
+        if let Some(t) = &tokenizer.tokenizer_json {
+            std::fs::write(stage.join("tokenizer.json"), t)?;
+        }
+        if let Some(t) = &tokenizer.tokenizer_config_json {
+            std::fs::write(stage.join("tokenizer_config.json"), t)?;
+        }
+        for tensor in staged.values() {
+            std::fs::remove_file(&tensor.path)?;
+        }
+        std::fs::rename(&stage, out_dir)?;
+        Ok(SnapshotReport {
+            num_tensors: staged.len(),
+            quantized: quantize,
+            quantized_projections,
+            out_dir: out_dir.to_path_buf(),
+        })
+    })();
+    let _ = std::fs::remove_dir_all(&stage);
+    result
+}
+
+fn array_payload(array: &Array) -> Result<(&'static str, Vec<u8>)> {
+    use half::bf16;
+    match array.dtype() {
+        Dtype::Bfloat16 => Ok((
+            "BF16",
+            array
+                .as_slice::<bf16>()
+                .iter()
+                .flat_map(|v| v.to_bits().to_le_bytes())
+                .collect(),
+        )),
+        Dtype::Uint32 => Ok((
+            "U32",
+            array
+                .as_slice::<u32>()
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect(),
+        )),
+        other => Err(Error::Unsupported(format!(
+            "streaming safetensors dtype {other:?}"
+        ))),
+    }
+}
 
 /// The attention/MLP projection weight suffixes quantization targets, mirroring the set the
 /// llama-family loader quantizes on load ([`crate::models::CausalLm::from_weights_with`]): split
@@ -774,6 +920,86 @@ mod tests {
                 std::fs::remove_dir_all(&dir).ok();
             }
         }
+    }
+
+    #[test]
+    fn streaming_writer_is_semantically_equivalent_and_canonical() {
+        let (tensors, config) = tiny_model();
+        let keys: Vec<_> = tensors.iter().map(|(k, _)| k.clone()).collect();
+        let source: HashMap<_, _> = tensors.into_iter().collect();
+        let a = unique_dir("stream-a");
+        let b = unique_dir("stream-b");
+        let _ = std::fs::remove_dir_all(&a);
+        let _ = std::fs::remove_dir_all(&b);
+        for out in [&a, &b] {
+            write_streaming_snapshot(
+                out,
+                &keys,
+                config.clone(),
+                &SnapshotTokenizer::default(),
+                None,
+                |key| Ok(source[key].clone()),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            std::fs::read(a.join("model.safetensors")).unwrap(),
+            std::fs::read(b.join("model.safetensors")).unwrap()
+        );
+        let loaded = Array::load_safetensors(a.join("model.safetensors")).unwrap();
+        assert_eq!(loaded.len(), source.len());
+        for (key, expected) in source {
+            let got = &loaded[&key];
+            assert_eq!(got.shape(), expected.shape());
+            assert_eq!(got.dtype(), Dtype::Bfloat16);
+        }
+        let _ = std::fs::remove_dir_all(a);
+        let _ = std::fs::remove_dir_all(b);
+    }
+
+    #[test]
+    fn streaming_writer_cleans_staging_after_error() {
+        let out = unique_dir("stream-error");
+        let stage = out.with_extension(format!("tmp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&out);
+        let error = write_streaming_snapshot(
+            &out,
+            &["broken".into()],
+            json!({}),
+            &SnapshotTokenizer::default(),
+            None,
+            |_| Err(Error::Msg("injected".into())),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("injected"));
+        assert!(!stage.exists());
+        assert!(!out.join("model.safetensors").exists());
+    }
+
+    /// Scaled synthetic RSS probe: 16 × 2048² f32 source tensors (256 MiB aggregate,
+    /// 128 MiB bf16 output). Run under `/usr/bin/time -l`; the writer must not retain the aggregate.
+    #[test]
+    #[ignore = "manual peak-RSS measurement harness"]
+    fn streaming_writer_scaled_rss_probe() {
+        let keys: Vec<_> = (0..16).map(|i| format!("probe.tensor.{i:02}")).collect();
+        let out = unique_dir("stream-rss");
+        let _ = std::fs::remove_dir_all(&out);
+        write_streaming_snapshot(
+            &out,
+            &keys,
+            json!({}),
+            &SnapshotTokenizer::default(),
+            None,
+            |_| Ok(Array::zeros::<f32>(&[2048, 2048]).unwrap()),
+        )
+        .unwrap();
+        assert!(
+            std::fs::metadata(out.join("model.safetensors"))
+                .unwrap()
+                .len()
+                > 128 * 1024 * 1024
+        );
+        let _ = std::fs::remove_dir_all(out);
     }
 
     /// Everything the llama-family loader would quantize on load but this writer leaves dense must
