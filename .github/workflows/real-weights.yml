@@ -70,6 +70,7 @@ jobs:
       ACESTEP_SNAPSHOT: ${{ vars.ACESTEP_SNAPSHOT }}
       CHATTERBOX_VE_SNAPSHOT: ${{ vars.CHATTERBOX_VE_SNAPSHOT }}
       CHATTERBOX_SNAPSHOT: ${{ vars.CHATTERBOX_SNAPSHOT }}
+      PERTH_SNAPSHOT: ${{ vars.PERTH_SNAPSHOT }}
       OPENVOICE_V2_SNAPSHOT: ${{ vars.OPENVOICE_V2_SNAPSHOT }}
       WHISPER_SNAPSHOT: ${{ vars.WHISPER_SNAPSHOT }}
       CLAP_SNAPSHOT: ${{ vars.CLAP_SNAPSHOT }}
@@ -90,6 +91,23 @@ jobs:
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model whisper-base --snapshot "$WHISPER_SNAPSHOT"
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model clap-htsat-unfused --snapshot "$CLAP_SNAPSHOT"
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model moss-tts-realtime --snapshot "$MOSS_TTS_REALTIME_SNAPSHOT"
+      - name: Materialize the PerTh watermarker weights (MIT resemble-perth -> safetensors)
+        run: |
+          # PerTh (sc-13240) ships only inside the MIT resemble-perth pip package (not on the HF
+          # hub), so it is materialized by converting the bundled checkpoint to safetensors with the
+          # repo's torch-free converter, into the persistent $PERTH_SNAPSHOT cache. Pinned version.
+          if [ ! -f "$PERTH_SNAPSHOT/perth_implicit.safetensors" ]; then
+            mkdir -p "$PERTH_SNAPSHOT" "$RUNNER_TEMP/perth-src"
+            python3 -m pip download --disable-pip-version-check --no-deps --dest "$RUNNER_TEMP/perth-src" "resemble-perth==1.0.1"
+            python3 - "$RUNNER_TEMP/perth-src" <<'PY'
+          import glob, sys, zipfile
+          for whl in glob.glob(f"{sys.argv[1]}/*.whl"):
+              zipfile.ZipFile(whl).extractall(sys.argv[1])
+          PY
+            python3 scripts/audio/convert_perth_watermarker.py \
+              "$RUNNER_TEMP/perth-src/perth/perth_net/pretrained/implicit/perth_net_250000.pth.tar" \
+              "$PERTH_SNAPSHOT/perth_implicit.safetensors"
+          fi
       - name: Run provider conformance
         run: |
           cargo test --locked -p candle-audio-kokoro --test conformance kokoro_conformance -- --ignored --nocapture
@@ -122,6 +140,11 @@ jobs:
           # finite, non-degenerate range) from real conditioning (s3tokenizer tokens + CAMPPlus 80-d spk +
           # 24 kHz prompt mel) and are deterministic. Needs the full CHATTERBOX_SNAPSHOT (s3gen.safetensors).
           cargo test --locked -p candle-audio-chatterbox --test conformance flow_synthesizes_a_sane_mel_from_speech_tokens -- --ignored --nocapture
+          # PerTh provenance watermarker (sc-13240): the natively-ported implicit watermarker on real
+          # (MIT resemble-perth) weights embeds a RECOVERABLE (≈100% detection, clean≈0) and
+          # IMPERCEPTIBLE (psychoacoustically masked; SNR ≈16 dB) watermark, at both the model's native
+          # 32 kHz rate and Chatterbox's 24 kHz output path. Not yet wired into generate() (sc-13239).
+          cargo test --locked -p candle-audio-chatterbox --test conformance perth_watermark_roundtrips_and_is_imperceptible -- --ignored --nocapture
           # Whisper ASR (sc-12850): the first real Transcriber (audio→text, the Captioner-analog).
           # Kokoro TTS → Whisper ASR round-trip — known text synthesized by kokoro_82m (snapshot
           # above) transcribes back within a small CER, with monotonic segment timestamps.
