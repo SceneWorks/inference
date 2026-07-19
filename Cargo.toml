@@ -6,6 +6,7 @@ members = [
     "crates/audio/candle-audio-chatterbox-ve",
     "crates/audio/candle-audio-kokoro",
     "crates/audio/candle-audio-moss-sfx",
+    "crates/audio/candle-audio-openvoice",
     "crates/contracts/core-llm",
     "crates/contracts/core-llm/core-llm-testkit",
     "crates/contracts/gen-core",

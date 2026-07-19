@@ -217,6 +217,7 @@ dependencies = [
  "candle-audio-chatterbox-ve",
  "candle-audio-kokoro",
  "candle-audio-moss-sfx",
+ "candle-audio-openvoice",
  "candle-llm",
 ]
 
@@ -257,6 +258,18 @@ dependencies = [
  "serde",
  "serde_json",
  "tokenizers 0.22.2",
+]
+
+[[package]]
+name = "candle-audio-openvoice"
+version = "0.0.0"
+dependencies = [
+ "candle-audio",
+ "candle-audio-chatterbox-ve",
+ "candle-audio-kokoro",
+ "candle-nn",
+ "core-llm",
+ "serde_json",
 ]
 
 [[package]]

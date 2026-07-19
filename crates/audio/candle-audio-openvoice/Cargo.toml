@@ -1,0 +1,42 @@
+[package]
+name = "candle-audio-openvoice"
+version = "0.0.0"
+edition = "2021"
+description = "OpenVoice V2 tone-color voice-conversion provider for the SceneWorks Candle audio lane (sc-13223) — the first real AudioTransform (VoiceConversion): MyShell OpenVoice V2's flow-based VITS converter + reference tone-color encoder ported natively onto the pinned candle revision, transferring a target speaker's timbre onto a source clip's content, target supplied per request via AudioTransformRequest::target_reference."
+license = "MIT"
+repository = "https://github.com/SceneWorks/inference"
+keywords = ["candle", "voice-conversion", "openvoice", "vits", "audio"]
+categories = ["science"]
+
+[dependencies]
+# The shared candle audio commons (device seam, pinned-SHA hub resolution, host DSP, WAV encode,
+# `AudioError → gen_core::Error` bridge). Re-exports `gen_core` and `candle_core`, so this crate
+# resolves the SAME candle build + gen-core rev as the catalog it registers into.
+candle-audio = { path = "../candle-audio" }
+# candle-nn at the workspace's pinned candle revision (Conv1d/Conv2d/ConvTranspose1d/GRU/Linear/
+# VarBuilder). Every OpenVoice V2 submodule maps directly onto candle-nn primitives whose PyTorch
+# weight layout they read unchanged (Conv weight-norm resolved at load; GRU gate order r,z,n
+# matches torch).
+candle-nn = { workspace = true }
+# core-llm for the snapshot-preparer accommodation (the audio lane carries the candle preparer;
+# OpenVoice's converter/checkpoint.pth + converter/config.json layout needs its own probe).
+core-llm = { path = "../../contracts/core-llm" }
+# config.json validation (architecture-drift guard) + the preparer probe.
+serde_json = { workspace = true }
+
+[dev-dependencies]
+# HF-cache snapshot resolution for the `#[ignore]`d real-weight conformance test.
+candle-audio = { path = "../candle-audio", features = ["testkit"] }
+# Kokoro TTS supplies the distinct source + target reference voices the discriminative real-weight
+# test converts between (the sanctioned "Kokoro-generated reference audio" path — no external audio
+# fixtures). Chatterbox VE measures the timbre shift (speaker-embedding cosine). Dev-only.
+candle-audio-kokoro = { path = "../candle-audio-kokoro" }
+candle-audio-chatterbox-ve = { path = "../candle-audio-chatterbox-ve" }
+
+[features]
+default = []
+# Apple Metal GPU backend — forwarded to the shared audio commons. Not in `default` (the audio
+# lane ships CPU-first everywhere; see docs/architecture/audio-backend-strategy.md).
+metal = ["candle-audio/metal"]
+# NVIDIA CUDA backend — forwarded to the shared audio commons. Not in `default`.
+cuda = ["candle-audio/cuda"]
