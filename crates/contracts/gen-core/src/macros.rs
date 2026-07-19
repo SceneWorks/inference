@@ -84,6 +84,19 @@ macro_rules! register_voice_embedder {
     };
 }
 
+/// Define an audio-transform registration constant for an explicit provider catalog (sc-12839),
+/// parallel to [`register_voice_embedder`](crate::register_voice_embedder).
+#[macro_export]
+macro_rules! register_audio_transform {
+    ( $vis:vis const $name:ident = $desc:path => $load:path $(,)? ) => {
+        $vis const $name: $crate::registry::AudioTransformRegistration =
+            $crate::registry::AudioTransformRegistration {
+                descriptor: $desc,
+                load: |spec| $load(spec).map_err(::core::convert::Into::into),
+            };
+    };
+}
+
 /// Implement the standard delegation-pattern [`crate::Generator`] wrapper for provider structs.
 #[macro_export]
 macro_rules! impl_generator {
