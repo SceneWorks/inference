@@ -46,6 +46,8 @@ fn det_area(d: &Detection) -> f32 {
 /// Faithful fixed-point bilinear: half-pixel source coords `(d+0.5)·scale − 0.5`, weights quantized
 /// to `INTER_RESIZE_COEF_BITS = 11`, two integer passes, `>>22` with rounding (the "interpolation is
 /// a family, match the variant" discipline — cv2's resize fixed-point, distinct from PIL/warpAffine).
+/// The explicit dimensions must be non-zero. `src` may be larger than `in_h·in_w·3`; only that
+/// prefix is read, preserving the raw-slice API's original `len >= need` contract.
 pub fn resize_bilinear_cv2(
     src: &[u8],
     in_h: usize,
@@ -54,6 +56,11 @@ pub fn resize_bilinear_cv2(
     out_w: usize,
 ) -> Result<Vec<u8>> {
     const C: usize = 3;
+    if in_h == 0 || in_w == 0 || out_h == 0 || out_w == 0 {
+        return Err(Error::Msg(format!(
+            "resize_bilinear_cv2: zero dimension — {in_w}×{in_h} → {out_w}×{out_h} (all edges must be > 0)"
+        )));
+    }
     // `src` is indexed by `in_h`/`in_w`; reject a mismatched `(buf, h, w)` triple at the entry as a
     // typed error rather than panic out-of-bounds in the horizontal pass (F-020/L-A).
     if src.len()
@@ -136,8 +143,14 @@ pub fn resize_bilinear_cv2(
 
 /// Build the SCRFD detector blob from an RGB `u8` image: insightface-faithful resize-to-fit 640
 /// (aspect-preserving) → top-left pad to 640² → `(rgb − 127.5) / 128`. Returns the NHWC
-/// `[1,640,640,3]` f32 blob and `det_scale` (= `new_h / h`).
+/// `[1,640,640,3]` f32 blob and `det_scale` (= `new_h / h`). Dimensions must be non-zero; an
+/// oversized raw slice is accepted and only its `h·w·3` prefix is read.
 pub fn detector_blob(img: &[u8], h: usize, w: usize) -> Result<(Array, f32)> {
+    if h == 0 || w == 0 {
+        return Err(Error::Msg(format!(
+            "detector_blob: image has a zero dimension ({h}×{w})"
+        )));
+    }
     // `img` is resized/indexed by `h`/`w`; reject a mismatched `(buf, h, w)` triple at the entry as a
     // typed error (F-020/L-A) — guards direct callers of this pub primitive.
     if img.len()
@@ -414,6 +427,34 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("too small for 4×4×3"), "got: {err}");
+    }
+
+    #[test]
+    fn resize_rejects_every_zero_edge() {
+        for (in_h, in_w, out_h, out_w) in [(0, 2, 4, 4), (2, 0, 4, 4), (2, 2, 0, 4), (2, 2, 4, 0)] {
+            let err = resize_bilinear_cv2(&[0; 12], in_h, in_w, out_h, out_w)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("zero dimension"), "{err}");
+        }
+    }
+
+    #[test]
+    fn resize_accepts_oversized_raw_slice_and_ignores_suffix() {
+        let exact: Vec<u8> = (0..4 * 3 * 3).map(|i| (i * 29 % 256) as u8).collect();
+        let mut oversized = exact.clone();
+        oversized.extend_from_slice(&[255; 11]);
+        let expected = resize_bilinear_cv2(&exact, 4, 3, 7, 5).unwrap();
+        let actual = resize_bilinear_cv2(&oversized, 4, 3, 7, 5).unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn detector_blob_rejects_zero_edges_before_mlx_work() {
+        for (h, w) in [(0, 0), (0, 2), (3, 0)] {
+            let err = detector_blob(&[], h, w).unwrap_err().to_string();
+            assert!(err.contains("zero dimension"), "{h}×{w}: {err}");
+        }
     }
 
     /// A correctly-sized buffer resizes to the requested `out_h × out_w × 3`.

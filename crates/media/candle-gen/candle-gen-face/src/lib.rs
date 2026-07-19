@@ -111,15 +111,23 @@ pub fn load_with_parser(dir: &Path) -> Result<CandleFaceAnalysis> {
     load_with_parser_on(dir, &device)
 }
 
-/// Returns an [`Image`]'s `(height, width)`, rejecting a buffer too small for `width·height·3`.
+/// Returns an [`Image`]'s `(height, width)`, enforcing the backend-neutral image contract: both
+/// dimensions are non-zero and the RGB buffer is exactly `width·height·3` bytes. This is stricter
+/// than the raw-slice helpers in [`face`], which intentionally accept a larger backing slice and read
+/// only the prefix described by their explicit dimensions.
 fn image_dims(image: &Image) -> Result<(usize, usize)> {
     let (w, h) = (image.width as usize, image.height as usize);
-    if image.pixels.len()
-        < candle_gen::gen_core::imageops::checked_image_buffer_len(w, h, 3).unwrap_or(usize::MAX)
-    {
+    if w == 0 || h == 0 {
         return Err(CandleError::Msg(format!(
-            "face: image buffer of {} bytes too small for {w}×{h}×3",
-            image.pixels.len()
+            "face: image has a zero dimension ({w}×{h})"
+        )));
+    }
+    let expected = candle_gen::gen_core::imageops::checked_image_buffer_len(w, h, 3)
+        .ok_or_else(|| CandleError::Msg(format!("face: RGB buffer size overflows for {w}×{h}")))?;
+    if image.pixels.len() != expected {
+        return Err(CandleError::Msg(format!(
+            "face: image buffer must contain exactly {expected} bytes for {w}×{h}×3, got {}",
+            image.pixels.len(),
         )));
     }
     Ok((h, w))
@@ -180,5 +188,47 @@ impl FaceEmbedder for CandleFaceAnalysis {
             w,
             largest,
         )?))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn image(width: u32, height: u32, len: usize) -> Image {
+        Image {
+            width,
+            height,
+            pixels: vec![0; len],
+        }
+    }
+
+    #[test]
+    fn image_dims_accepts_exact_nonzero_rgb_buffer() {
+        assert_eq!(image_dims(&image(3, 2, 18)).unwrap(), (2, 3));
+    }
+
+    #[test]
+    fn image_dims_rejects_short_and_extra_buffers() {
+        for len in [17, 19] {
+            let err = image_dims(&image(3, 2, len)).unwrap_err().to_string();
+            assert!(err.contains("exactly 18 bytes"), "len {len}: {err}");
+        }
+    }
+
+    #[test]
+    fn image_dims_rejects_zero_edges_before_buffer_validation() {
+        for (w, h) in [(0, 0), (0, 2), (3, 0)] {
+            let err = image_dims(&image(w, h, 0)).unwrap_err().to_string();
+            assert!(err.contains("zero dimension"), "{w}×{h}: {err}");
+        }
+    }
+
+    #[test]
+    fn image_dims_rejects_overflowing_rgb_size() {
+        let err = image_dims(&image(u32::MAX, u32::MAX, 0))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("overflows"), "{err}");
     }
 }
