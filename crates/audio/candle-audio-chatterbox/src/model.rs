@@ -98,6 +98,7 @@ pub fn descriptor() -> ModelDescriptor {
             supports_kv_cache: true,
             requires_sigma_shift: false,
             supports_sequential_offload: false,
+            supports_streaming: false,
         },
     }
 }

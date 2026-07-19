@@ -698,6 +698,7 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
             // The Lens schedule computes its own empirical-μ shift internally (not a loader hint).
             requires_sigma_shift: false,
             supports_sequential_offload: false,
+            supports_streaming: false,
             // No audio surface (sc-12834): pure image/video model.
             audio_sample_rates: vec![],
             max_audio_duration_secs: None,

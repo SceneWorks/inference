@@ -235,6 +235,7 @@ impl Sd3Variant {
                 // encoded, materialized, then dropped before the MMDiT + VAE load — bounding peak to
                 // `max(triple-TE, MMDiT+VAE)`. T5-XXL alone is the biggest TE-drop in the family.
                 supports_sequential_offload: true,
+                supports_streaming: false,
                 // No audio surface (sc-12834): pure image/video model.
                 audio_sample_rates: vec![],
                 max_audio_duration_secs: None,

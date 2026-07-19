@@ -120,6 +120,7 @@ impl FluxVariant {
                 // drops the T5-XXL + CLIP-L text encoders after the prompt encode so peak unified
                 // memory is bounded to `max(T5+CLIP, DiT+VAE)` instead of their sum.
                 supports_sequential_offload: true,
+                supports_streaming: false,
                 // No audio surface (sc-12834): pure image/video model.
                 audio_sample_rates: vec![],
                 max_audio_duration_secs: None,

@@ -6,8 +6,8 @@ use super::*;
 use gen_core::registry::ModelRegistration;
 use gen_core::runtime::LoadSpec;
 use gen_core::{
-    AudioTrack, Capabilities, Error, GenerationOutput, GenerationRequest, Generator, Image,
-    Modality, ModelDescriptor, Progress,
+    AudioChunk, AudioTrack, Capabilities, Error, GenerationOutput, GenerationRequest, Generator,
+    Image, Modality, ModelDescriptor, Progress,
 };
 use std::cell::Cell;
 
@@ -168,6 +168,120 @@ impl Generator for StubAudioGen {
     }
 }
 
+const STREAM_ID: &str = "testkit_audio_streaming_stub";
+const STREAM_TOTAL_SAMPLES: usize = 480;
+
+/// A **streaming** audio stub (sc-12846): advertises `supports_streaming` and overrides
+/// [`Generator::generate_streaming`] to emit the deterministic one-shot track as `chunks` contiguous
+/// [`AudioChunk`]s. The knobs drive the streaming broken-stub self-tests:
+/// `chunks` controls incrementality (1 = "buffers everything, emits one terminal chunk") and
+/// `reassemble` controls whether the emitted chunks concatenate back to the track.
+struct StreamingStubAudioGen {
+    desc: ModelDescriptor,
+    chunks: u32,
+    reassemble: bool,
+    honor_cancel: bool,
+    runs: Cell<u32>,
+}
+
+fn streaming_stub_desc() -> ModelDescriptor {
+    let mut desc = stub_desc(STREAM_ID);
+    desc.capabilities.supports_streaming = true;
+    desc
+}
+
+impl StreamingStubAudioGen {
+    fn new(chunks: u32, reassemble: bool) -> Self {
+        Self {
+            desc: streaming_stub_desc(),
+            chunks,
+            reassemble,
+            honor_cancel: true,
+            runs: Cell::new(0),
+        }
+    }
+    fn boxed(chunks: u32, reassemble: bool) -> Box<dyn Generator> {
+        Box::new(Self::new(chunks, reassemble))
+    }
+    /// The deterministic one-shot track: `STREAM_TOTAL_SAMPLES` samples filled from the seed.
+    fn track(&self, req: &GenerationRequest) -> AudioTrack {
+        let fill = req.seed.unwrap_or(0) as f32;
+        AudioTrack {
+            samples: vec![fill; STREAM_TOTAL_SAMPLES],
+            sample_rate: 24_000,
+            channels: 1,
+            ..Default::default()
+        }
+    }
+}
+
+impl Generator for StreamingStubAudioGen {
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.desc
+    }
+
+    fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
+        self.desc
+            .capabilities
+            .validate_request_audio(self.desc.id, req)
+    }
+
+    fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationOutput> {
+        self.validate(req)?;
+        self.runs.set(self.runs.get() + 1);
+        let total = req.steps.unwrap_or(2);
+        for i in 1..=total {
+            if self.honor_cancel && req.cancel.is_cancelled() {
+                return Err(Error::Canceled);
+            }
+            on_progress(Progress::Step { current: i, total });
+        }
+        on_progress(Progress::Decoding);
+        Ok(GenerationOutput::Audio(self.track(req)))
+    }
+
+    fn generate_streaming(
+        &self,
+        req: &GenerationRequest,
+        on_chunk: &mut dyn FnMut(AudioChunk),
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationOutput> {
+        // The streaming path IS the primary path; generate() is its aggregate. Compute the full
+        // deterministic track, then partition it into `chunks` contiguous slices emitted as the
+        // audio becomes "available".
+        let out = self.generate(req, on_progress)?;
+        let GenerationOutput::Audio(track) = &out else {
+            return Ok(out);
+        };
+        let n = self.chunks.max(1) as usize;
+        let len = track.samples.len();
+        let base = len / n;
+        let mut start = 0usize;
+        for idx in 0..n {
+            // Last slice absorbs the remainder so the partition is exact.
+            let end = if idx == n - 1 { len } else { start + base };
+            let mut samples = track.samples[start..end].to_vec();
+            // The broken variant tampers with the first chunk so the concatenation no longer equals
+            // the track — exercising the reassembly-law assertion.
+            if !self.reassemble && idx == 0 && !samples.is_empty() {
+                samples[0] += 1.0;
+            }
+            on_chunk(AudioChunk {
+                samples,
+                sample_rate: track.sample_rate,
+                channels: track.channels,
+                index: idx,
+            });
+            start = end;
+        }
+        Ok(out)
+    }
+}
+
 fn stub_descriptor() -> ModelDescriptor {
     stub_desc(STUB_ID)
 }
@@ -206,6 +320,8 @@ fn good_stub_passes_every_check_individually() {
     check_audio_cancellation(&g, &cheap()).unwrap();
     check_audio_precancellation(&g, &cheap()).unwrap();
     check_audio_seed_determinism(&g, &cheap()).unwrap();
+    // The non-streaming stub exercises the additive default `generate_streaming` (one terminal chunk).
+    check_audio_streaming(&g, &cheap()).unwrap();
     crate::check_registry_roundtrip(&registry(), &g).unwrap();
 }
 
@@ -342,4 +458,52 @@ fn conformance_panics_on_a_broken_stub() {
         },
         &cheap(),
     );
+}
+
+// --- Streaming (sc-12846) --------------------------------------------------------------------
+
+#[test]
+fn non_streaming_stub_passes_streaming_check_via_default_impl() {
+    // A provider that does NOT advertise supports_streaming rides the additive default
+    // `generate_streaming`, which emits exactly one terminal chunk equal to the whole track.
+    let g = StubAudioGen::new(STUB_ID, Behavior::good());
+    assert!(!g.descriptor().capabilities.supports_streaming);
+    check_audio_streaming(&g, &cheap()).unwrap();
+}
+
+#[test]
+fn streaming_stub_passes_streaming_check() {
+    // A genuinely-incremental streaming provider: 4 chunks that reassemble to the one-shot track.
+    let g = StreamingStubAudioGen::new(4, true);
+    assert!(g.descriptor().capabilities.supports_streaming);
+    check_audio_streaming(&g, &cheap()).unwrap();
+}
+
+#[test]
+fn streaming_stub_passes_full_conformance() {
+    // A streaming generator must also be a well-behaved one-shot generator (progress, cancel,
+    // determinism, output well-formedness) — the whole suite, including the streaming check.
+    audio_conformance(|| StreamingStubAudioGen::boxed(4, true), &cheap());
+}
+
+#[test]
+fn streaming_stub_emitting_everything_at_end_fails_incrementality() {
+    // The headline broken-stub: advertises streaming but buffers everything into ONE terminal chunk.
+    let g = StreamingStubAudioGen::new(1, true);
+    let err = check_audio_streaming(&g, &cheap()).unwrap_err();
+    assert!(err.contains("must emit >= 2 chunks"), "got: {err}");
+}
+
+#[test]
+fn streaming_stub_with_nonreassembling_chunks_fails_reassembly() {
+    // Chunks that do not concatenate back to the returned track violate the reassembly law.
+    let g = StreamingStubAudioGen::new(4, false);
+    let err = check_audio_streaming(&g, &cheap()).unwrap_err();
+    assert!(err.contains("reassembly law is violated"), "got: {err}");
+}
+
+#[test]
+#[should_panic(expected = "audio conformance FAILED")]
+fn conformance_panics_on_a_broken_streaming_stub() {
+    audio_conformance(|| StreamingStubAudioGen::boxed(1, true), &cheap());
 }

@@ -6,7 +6,7 @@
 //! [`ModelDescriptor`] property plus a [`GenerationOutput`] variant — *not* a per-modality
 //! trait split (which breaks on multi-modal models).
 
-use crate::media::{AudioTrack, Image};
+use crate::media::{AudioChunk, AudioTrack, Image};
 use crate::runtime::{CancelFlag, Progress, Quant};
 use crate::voice_embed::VoiceEmbedding;
 use crate::{Error, Result};
@@ -28,6 +28,57 @@ pub trait Generator {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput>;
+
+    /// **Incremental / low-latency audio synthesis** (sc-12846) — the streaming counterpart of
+    /// [`generate`](Self::generate), the audio analog of `core_llm`'s token-streaming
+    /// [`TextLlm::generate`](crate::core_llm::TextLlm::generate). A realtime/streaming provider
+    /// (`Modality::Audio` with [`Capabilities::supports_streaming`]) emits an [`AudioChunk`] through
+    /// `on_chunk` as each block of PCM becomes available — so a consumer can start playback well
+    /// before the full track finishes — and returns the **same** [`GenerationOutput`] as
+    /// [`generate`](Self::generate) for the identical request. `on_progress` carries the usual
+    /// step/decode [`Progress`] alongside the audio chunks, and cancellation rides
+    /// [`GenerationRequest::cancel`] exactly as in [`generate`](Self::generate) (a mid-stream cancel
+    /// must stop promptly, returning the typed [`Error::Canceled`]).
+    ///
+    /// ## Why a separate entry point (and not a `Progress` payload)
+    ///
+    /// [`Progress`] is `Copy + Eq` and is matched exhaustively across the workspace; widening it to
+    /// carry a `Vec<f32>` of PCM would strip those derives and ripple a breaking change through every
+    /// consumer. A dedicated method with a **default implementation** keeps the streaming surface
+    /// strictly *additive* and *tensor-free*: every existing [`Generator`] — image, video, and the
+    /// one-shot audio families — inherits the default unchanged and is byte-for-byte unaffected.
+    ///
+    /// ## The default implementation (one-shot as "collect all chunks", inverted)
+    ///
+    /// The default runs the one-shot [`generate`](Self::generate) and, when it produced audio, emits
+    /// the whole track as a single terminal [`AudioChunk`] (`index 0`). This satisfies the
+    /// [`AudioChunk`] reassembly law trivially (one chunk == the whole track) and means **every**
+    /// provider — streaming or not — can be driven through this entry point. A model whose
+    /// [`Capabilities::supports_streaming`] is `false` (the default) is not expected to be incremental
+    /// here; the flag is the opt-in signal a consumer reads to know whether it will get genuine
+    /// low-latency chunks or one terminal chunk.
+    ///
+    /// A streaming provider **overrides** this to emit chunks incrementally, and drives its own
+    /// one-shot [`generate`](Self::generate) by collecting all chunks into the returned
+    /// [`GenerationOutput::Audio`] — the streaming path is the primary implementation, `generate` its
+    /// aggregate, so the two never diverge.
+    fn generate_streaming(
+        &self,
+        req: &GenerationRequest,
+        on_chunk: &mut dyn FnMut(AudioChunk),
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<GenerationOutput> {
+        let out = self.generate(req, on_progress)?;
+        if let GenerationOutput::Audio(track) = &out {
+            on_chunk(AudioChunk {
+                samples: track.samples.clone(),
+                sample_rate: track.sample_rate,
+                channels: track.channels,
+                index: 0,
+            });
+        }
+        Ok(out)
+    }
 }
 
 /// What a [`Generator`] produced. The `Video` variant's `audio` is `Some` for LTX (always
@@ -885,6 +936,17 @@ pub struct Capabilities {
     /// admitting [`ConditioningKind::AudioEdit`] in [`conditioning`](Self::conditioning) it names
     /// exactly the editable surface.
     pub audio_edit_modes: Vec<AudioEditMode>,
+    /// Whether this model synthesizes audio **incrementally** through
+    /// [`Generator::generate_streaming`] (sc-12846) — the opt-in signal for the realtime/streaming
+    /// TTS path. `Default` is `false`: a non-streaming generator (every image/video model and the
+    /// one-shot audio families) leaves it unset and its `generate_streaming` uses the default
+    /// passthrough (a single terminal [`AudioChunk`]). A provider sets it
+    /// `true` only when it genuinely emits multiple chunks before completion, so a consumer can read
+    /// it to decide whether to drive the low-latency path and expect first-audio well before the full
+    /// track. Advisory to the *shape* of the stream, not to correctness: the [`AudioChunk`] reassembly
+    /// law (chunks concatenate to the returned track) holds for streaming and non-streaming providers
+    /// alike.
+    pub supports_streaming: bool,
     /// On-the-fly quantization levels this engine offers (empty slice = none). Read by the worker's
     /// capability advertisement (sc-3723) instead of a hardcoded per-row flag. `Default` is `&[]`.
     pub supported_quants: &'static [Quant],

@@ -56,7 +56,7 @@ pub use audio_embedder::{
 pub use audio_generator::{
     audio_conformance, check_audio_cancellation, check_audio_output, check_audio_precancellation,
     check_audio_progress, check_audio_progress_contract, check_audio_seed_determinism,
-    check_audio_validate_honesty, AudioProfile,
+    check_audio_streaming, check_audio_validate_honesty, AudioProfile,
 };
 pub use audio_transform::{
     audio_transform_conformance, check_audio_transform_cardinality,

@@ -555,6 +555,7 @@ pub fn descriptor() -> ModelDescriptor {
             // Resident-warm mode to toggle. The one thing NOT split is the two experts, which the
             // MoE-by-timestep denoise loop holds co-resident (see the BLOCKERS note in the PR).
             supports_sequential_offload: true,
+            supports_streaming: false,
             // No audio surface (sc-12834): pure image/video model.
             audio_sample_rates: vec![],
             max_audio_duration_secs: None,

@@ -135,6 +135,7 @@ pub fn descriptor() -> ModelDescriptor {
             // wired-memory pressure) through denoise + decode. Advertised so the worker's fit-gate can
             // tell "bounds footprint here" from a no-op fallback.
             supports_sequential_offload: true,
+            supports_streaming: false,
             // No audio surface (sc-12834): pure image/video model.
             audio_sample_rates: vec![],
             max_audio_duration_secs: None,
@@ -723,6 +724,7 @@ pub fn descriptor_t2v_14b() -> ModelDescriptor {
             // off-GPU during denoise, dropping the unified-memory peak to ~one expert. Advertised so
             // the worker's fit-gate can tell "bounds peak here" from a no-op fallback.
             supports_sequential_offload: true,
+            supports_streaming: false,
             // No audio surface (sc-12834): pure image/video model.
             audio_sample_rates: vec![],
             max_audio_duration_secs: None,
@@ -1618,6 +1620,7 @@ pub fn descriptor_i2v_14b() -> ModelDescriptor {
             // off-GPU during denoise, dropping the unified-memory peak to ~one expert. Advertised so
             // the worker's fit-gate can tell "bounds peak here" from a no-op fallback.
             supports_sequential_offload: true,
+            supports_streaming: false,
             // No audio surface (sc-12834): pure image/video model.
             audio_sample_rates: vec![],
             max_audio_duration_secs: None,

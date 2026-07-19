@@ -34,6 +34,42 @@ pub struct AudioTrack {
     pub stems: Vec<AudioStem>,
 }
 
+/// One incremental slice of interleaved PCM streamed by a realtime/streaming audio
+/// [`Generator`](crate::generator::Generator) during
+/// [`generate_streaming`](crate::generator::Generator::generate_streaming) (sc-12846) — the
+/// low-latency counterpart of the one-shot [`AudioTrack`]. A streaming provider emits an
+/// `AudioChunk` as each block of audio becomes available (e.g. per block of decoded RVQ/codec
+/// frames for an autoregressive TTS model), so a consumer can begin playback long before the full
+/// track finishes rendering.
+///
+/// **The reassembly law:** concatenating the [`samples`](Self::samples) of every chunk in `index`
+/// order yields exactly the [`AudioTrack::samples`] of the
+/// [`GenerationOutput::Audio`](crate::generator::GenerationOutput::Audio) the same
+/// streamed call returns (and, for a deterministic provider, of the one-shot
+/// [`generate`](crate::generator::Generator::generate) for the same request+seed). Every chunk
+/// shares the track's `sample_rate` / `channels`. This is the invariant the
+/// `gen-core-testkit` streaming conformance check enforces, so a provider that buffers the whole
+/// output and emits it as one terminal chunk (defeating the point of streaming) or whose chunks do
+/// not reassemble to the track is a CI failure rather than a field report.
+///
+/// Tensor-free, like every media type here.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AudioChunk {
+    /// Interleaved PCM for **this** increment only (not cumulative). Concatenating every chunk's
+    /// samples in `index` order reconstructs the full track (see the type-level reassembly law).
+    pub samples: Vec<f32>,
+    /// Sample rate (Hz) — identical across every chunk of a stream and equal to the final
+    /// [`AudioTrack::sample_rate`].
+    pub sample_rate: u32,
+    /// Channel count — identical across every chunk and equal to the final
+    /// [`AudioTrack::channels`]. `samples.len()` is a whole number of frames (a multiple of
+    /// `channels`).
+    pub channels: u16,
+    /// 0-based position of this chunk within the stream. The first chunk is `0` and the index
+    /// increments by one per chunk, with no gaps.
+    pub index: usize,
+}
+
 /// One named, source-separated stem accompanying an [`AudioTrack`] mix (sc-12842) — e.g.
 /// `"vocals"`, `"drums"`, `"bass"`, `"other"`. Additive and tensor-free; only present when the
 /// producing model genuinely separates stems.

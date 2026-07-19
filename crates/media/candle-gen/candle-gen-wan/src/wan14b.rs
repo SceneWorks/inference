@@ -1149,6 +1149,7 @@ fn descriptor_for(variant: Variant) -> ModelDescriptor {
             // resident (never both), dropping the pre-decode peak on a 24 GB card. Advertised so the
             // worker's fit-gate can tell "bounds peak here" from a no-op fallback.
             supports_sequential_offload: true,
+            supports_streaming: false,
             // No audio surface (sc-12834): pure image/video model.
             audio_sample_rates: vec![],
             max_audio_duration_secs: None,
