@@ -324,7 +324,13 @@ jobs:
   windows-cuda-check:
     name: Candle CUDA compile check (Windows)
     needs: changes
-    if: needs.changes.outputs.windows_cuda == 'true'
+    # This persistent runner may execute repository build scripts, so a public-fork PR must never
+    # reach it. Pushes, manual dispatches, and PRs whose head belongs to this repository remain
+    # eligible; hosted jobs continue to validate fork PRs.
+    if: >-
+      needs.changes.outputs.windows_cuda == 'true' &&
+      (github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: [self-hosted, windows, cuda]
     env:
       CUDA_COMPUTE_CAP: "80"
