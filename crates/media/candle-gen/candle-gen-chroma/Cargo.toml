@@ -39,6 +39,7 @@ metal = ["candle-gen/metal", "candle-transformers/metal", "candle-gen-pid/metal"
 cuda = ["candle-gen/cuda", "candle-transformers/cuda", "candle-gen-pid/cuda"]
 
 [dev-dependencies]
+candle-gen = { path = "../candle-gen", features = ["testkit"] }
 # `examples/chroma-txt2img.rs` smoke driver only — encode the produced `gen_core::Image` (RGB8) to
 # PNG so a real GPU run can be eyeballed. Not a library dependency (the worker owns asset writes).
 image = { version = "0.25", default-features = false, features = ["png"] }

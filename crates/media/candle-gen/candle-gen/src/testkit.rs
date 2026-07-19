@@ -24,6 +24,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::candle_core::{Device, Tensor};
 use crate::gen_core::Image;
 
 // ---------------------------------------------------------------------------------------------------
@@ -132,6 +133,116 @@ pub fn cosine_dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
 
+/// Cosine similarity for Candle tensors, accumulated in `f64` to keep quantization fixture
+/// comparisons stable. The tensors are flattened and converted from `f32` on the CPU.
+pub fn tensor_cosine(a: &Tensor, b: &Tensor) -> f64 {
+    let a = a.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    let b = b.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
+    for (x, y) in a.iter().zip(&b) {
+        dot += (*x as f64) * (*y as f64);
+        na += (*x as f64) * (*x as f64);
+        nb += (*y as f64) * (*y as f64);
+    }
+    dot / (na.sqrt() * nb.sqrt() + 1e-12)
+}
+
+/// Build the canonical MLX Q4 test fixture used by the sibling Candle providers.
+pub fn q4_packed(
+    out_dim: usize,
+    in_dim: usize,
+    group_size: usize,
+) -> (Tensor, Tensor, Tensor, Vec<f32>) {
+    q4_packed_with(
+        out_dim,
+        in_dim,
+        group_size,
+        |i| ((i * 7 + i / 13) % 16) as u8,
+        |group| 0.0625 * (group as f32 + 1.0),
+        |group| -0.5 - 0.25 * group as f32,
+    )
+}
+
+/// Build an MLX Q4 packed triple and its exact affine grid while allowing a test to retain its
+/// fixture-specific code, scale, and bias patterns.
+pub fn q4_packed_with<C, S, B>(
+    out_dim: usize,
+    in_dim: usize,
+    group_size: usize,
+    code: C,
+    scale: S,
+    bias: B,
+) -> (Tensor, Tensor, Tensor, Vec<f32>)
+where
+    C: Fn(usize) -> u8,
+    S: Fn(usize) -> f32,
+    B: Fn(usize) -> f32,
+{
+    assert_eq!(in_dim % group_size, 0);
+    assert_eq!(in_dim % 8, 0);
+    let codes: Vec<u8> = (0..out_dim * in_dim).map(code).collect();
+    assert!(
+        codes.iter().all(|&code| code <= 0xF),
+        "Q4 fixture codes must fit in a nibble"
+    );
+    let groups_per_row = in_dim / group_size;
+    let groups = out_dim * groups_per_row;
+    let scales: Vec<f32> = (0..groups).map(scale).collect();
+    let biases: Vec<f32> = (0..groups).map(bias).collect();
+    let grid = (0..out_dim * in_dim)
+        .map(|i| {
+            let group = (i / in_dim) * groups_per_row + (i % in_dim) / group_size;
+            scales[group] * codes[i] as f32 + biases[group]
+        })
+        .collect();
+    let words = codes
+        .chunks_exact(8)
+        .map(|codes| {
+            codes.iter().enumerate().fold(0u32, |word, (i, &code)| {
+                word | ((code as u32 & 0xF) << (4 * i))
+            })
+        })
+        .collect::<Vec<_>>();
+    let dev = Device::Cpu;
+    (
+        Tensor::from_vec(words, (out_dim, in_dim / 8), &dev).unwrap(),
+        Tensor::from_vec(scales, (out_dim, groups_per_row), &dev).unwrap(),
+        Tensor::from_vec(biases, (out_dim, groups_per_row), &dev).unwrap(),
+        grid,
+    )
+}
+
+#[cfg(test)]
+mod quant_fixture_tests {
+    use super::q4_packed_with;
+
+    #[test]
+    fn q4_packed_with_keeps_packed_codes_and_affine_grid_in_sync() {
+        let (weight, scales, biases, grid) =
+            q4_packed_with(1, 8, 8, |i| i as u8, |_| 2.0, |_| -1.0);
+
+        assert_eq!(
+            weight.flatten_all().unwrap().to_vec1::<u32>().unwrap(),
+            [0x7654_3210]
+        );
+        assert_eq!(
+            scales.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            [2.0]
+        );
+        assert_eq!(
+            biases.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            [-1.0]
+        );
+        assert_eq!(grid, [-1.0, 1.0, 3.0, 5.0, 7.0, 9.0, 11.0, 13.0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "Q4 fixture codes must fit in a nibble")]
+    fn q4_packed_with_rejects_codes_above_four_bits() {
+        let _ = q4_packed_with(1, 8, 8, |_| 0x10, |_| 1.0, |_| 0.0);
+    }
+}
+
 // ---------------------------------------------------------------------------------------------------
 // HF Hub cache resolution (F-071 / sc-9057 — honour $HF_HOME, not just the Unix ~/.cache default)
 // ---------------------------------------------------------------------------------------------------
@@ -199,7 +310,7 @@ pub use gpu_peak::{probe_gpu, used_mib, PeakSampler};
 pub use vram_probe::{VramProbe, VramReport};
 
 #[cfg(feature = "cuda")]
-pub use cuda_mempool::{reset_cuda_mempool_high_water, cuda_mempool_used_high_bytes};
+pub use cuda_mempool::{cuda_mempool_used_high_bytes, reset_cuda_mempool_high_water};
 
 /// Driver memory-pool `USED_MEM_HIGH` probe — the ACCURATE concurrent-live VRAM peak (sc-12818).
 ///
@@ -256,8 +367,11 @@ mod cuda_mempool {
         };
         let mut zero: u64 = 0;
         unsafe {
-            sys::cuMemPoolSetAttribute(pool, USED_MEM_HIGH, (&mut zero as *mut u64).cast::<c_void>())
-                == sys::CUresult::CUDA_SUCCESS
+            sys::cuMemPoolSetAttribute(
+                pool,
+                USED_MEM_HIGH,
+                (&mut zero as *mut u64).cast::<c_void>(),
+            ) == sys::CUresult::CUDA_SUCCESS
         }
     }
 
@@ -267,8 +381,11 @@ mod cuda_mempool {
         let pool = default_pool(ordinal)?;
         let mut bytes: u64 = 0;
         let ok = unsafe {
-            sys::cuMemPoolGetAttribute(pool, USED_MEM_HIGH, (&mut bytes as *mut u64).cast::<c_void>())
-                == sys::CUresult::CUDA_SUCCESS
+            sys::cuMemPoolGetAttribute(
+                pool,
+                USED_MEM_HIGH,
+                (&mut bytes as *mut u64).cast::<c_void>(),
+            ) == sys::CUresult::CUDA_SUCCESS
         };
         ok.then_some(bytes)
     }

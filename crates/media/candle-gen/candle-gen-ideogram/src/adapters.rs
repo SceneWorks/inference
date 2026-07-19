@@ -264,39 +264,21 @@ mod tests {
         use candle_gen::candle_core::{Device, Tensor};
         use candle_gen::candle_nn::{Linear, Module};
         use candle_gen::quant::{AdaptLinear, QLinear as SharedQLinear, MLX_GROUP_SIZE};
+        use candle_gen::testkit::q4_packed_with;
 
         let dev = Device::Cpu;
         let g = MLX_GROUP_SIZE;
         let (out_dim, in_dim, rank) = (64usize, 128usize, 4usize);
 
         // A group-64 Q4 pack + the exact affine grid it represents (the dense base for the fold ref).
-        let codes: Vec<u8> = (0..out_dim * in_dim)
-            .map(|i| ((i * 5 + i / 11) % 16) as u8)
-            .collect();
-        let gpr = in_dim / g;
-        let groups = out_dim * gpr;
-        let scales: Vec<f32> = (0..groups)
-            .map(|gi| 0.02 * ((gi % 5) as f32 + 1.0))
-            .collect();
-        let biases: Vec<f32> = (0..groups).map(|gi| -0.05 * (gi % 7) as f32).collect();
-        let grid: Vec<f32> = (0..out_dim * in_dim)
-            .map(|i| {
-                let (row, col) = (i / in_dim, i % in_dim);
-                let gi = row * gpr + col / g;
-                scales[gi] * codes[i] as f32 + biases[gi]
-            })
-            .collect();
-        let words: Vec<u32> = codes
-            .chunks_exact(8)
-            .map(|c| {
-                c.iter()
-                    .enumerate()
-                    .fold(0u32, |acc, (i, &q)| acc | ((q as u32 & 0xF) << (4 * i)))
-            })
-            .collect();
-        let wq = Tensor::from_vec(words, (out_dim, in_dim / 8), &dev)?;
-        let s = Tensor::from_vec(scales, (out_dim, gpr), &dev)?;
-        let b = Tensor::from_vec(biases, (out_dim, gpr), &dev)?;
+        let (wq, s, b, grid) = q4_packed_with(
+            out_dim,
+            in_dim,
+            g,
+            |i| ((i * 5 + i / 11) % 16) as u8,
+            |group| 0.02 * ((group % 5) as f32 + 1.0),
+            |group| -0.05 * (group % 7) as f32,
+        );
         let grid = Tensor::from_vec(grid, (out_dim, in_dim), &dev)?;
 
         // A LoRA: down [rank, in], up [out, rank], alpha 8 (⇒ ratio alpha/rank = 2), user scale 1.0.
