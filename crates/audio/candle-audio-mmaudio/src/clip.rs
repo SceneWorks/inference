@@ -427,6 +427,294 @@ pub fn tokenize(rows: &[Vec<u32>], device: &Device) -> CResult<Tensor> {
     Tensor::from_vec(flat, (b, CONTEXT_LENGTH), device)
 }
 
+// ---- string -> BPE token ids (open_clip `SimpleTokenizer`) ------------------------------------
+//
+// Reproduces open_clip's `SimpleTokenizer` (the generic CLIP BPE, `bpe_simple_vocab_16e6`) as used
+// for the DFN5B / ViT-H-14 model — the string->id front end for [`DfnClipEncoder::encode_text`].
+// Faithfulness is byte-match-verified against `open_clip.get_tokenizer('ViT-H-14-378-quickgelu')`
+// (see `tests/clip_conformance.rs`).
+
+use std::collections::HashMap;
+use std::sync::OnceLock;
+
+/// The pinned CLIP BPE merge table, vendored verbatim from the pinned DFN5B repo's `merges.txt`
+/// (`apple/DFN5B-CLIP-ViT-H-14-384` @ [`CLIP_HUB_REVISION`]). This is the same merge list as
+/// open_clip's bundled `bpe_simple_vocab_16e6.txt.gz`; the encoder rebuilt from it reproduces the
+/// repo's `vocab.json` exactly (all 49408 ids) — asserted in tests.
+const CLIP_BPE_MERGES: &str = include_str!("dfn5b_clip_merges.txt");
+
+/// Merges open_clip keeps: `merges[1 : 49152-256-2+1]` → `49152 - 256 - 2 = 48894`.
+const NUM_BPE_MERGES: usize = 48894;
+
+/// open_clip `bytes_to_unicode()`: a reversible byte↔printable-unicode map. Built in open_clip's
+/// exact *insertion order* (printable byte ranges first, then the remaining bytes mapped to `256+n`)
+/// — that order defines the base-vocab ids, so it must be preserved, not sorted.
+fn byte_to_unicode() -> Vec<(u8, char)> {
+    let mut bytes: Vec<u32> = Vec::with_capacity(256);
+    for range in [0x21u32..=0x7e, 0xa1..=0xac, 0xae..=0xff] {
+        bytes.extend(range);
+    }
+    let mut codes: Vec<u32> = bytes.clone();
+    let mut n = 0u32;
+    for b in 0..256u32 {
+        if !bytes.contains(&b) {
+            bytes.push(b);
+            codes.push(256 + n);
+            n += 1;
+        }
+    }
+    bytes
+        .into_iter()
+        .zip(codes)
+        .map(|(b, c)| (b as u8, char::from_u32(c).expect("bytes_to_unicode scalar")))
+        .collect()
+}
+
+/// The assembled CLIP byte-level BPE tokenizer: byte encoder, vocab, merge ranks, and the
+/// pre-tokenization pattern. Built once (via [`clip_bpe`]) from the vendored merges.
+struct ClipBpe {
+    /// byte value → its printable-unicode char (open_clip `byte_encoder`).
+    byte_encoder: [char; 256],
+    /// vocab token string → id (open_clip `encoder`).
+    encoder: HashMap<String, u32>,
+    /// ordered merge pair → rank (lower = merged earlier; open_clip `bpe_ranks`).
+    ranks: HashMap<(String, String), usize>,
+    /// open_clip `self.pat` pre-tokenization regex (special tokens, contractions, letters, single
+    /// digit, other non-space run). `(?i)` mirrors open_clip's `re.IGNORECASE`.
+    pat: regex::Regex,
+}
+
+/// The process-wide CLIP tokenizer, built on first use from the vendored merge table.
+fn clip_bpe() -> &'static ClipBpe {
+    static BPE: OnceLock<ClipBpe> = OnceLock::new();
+    BPE.get_or_init(ClipBpe::build)
+}
+
+impl ClipBpe {
+    fn build() -> Self {
+        let b2u = byte_to_unicode();
+        let mut byte_encoder = ['\0'; 256];
+        for &(b, c) in &b2u {
+            byte_encoder[b as usize] = c;
+        }
+
+        // merges[1 : 49152-256-2+1] — skip the `#version` header line, take 48894 pairs.
+        let merges: Vec<(String, String)> = CLIP_BPE_MERGES
+            .lines()
+            .skip(1)
+            .filter(|l| !l.trim().is_empty())
+            .take(NUM_BPE_MERGES)
+            .map(|line| {
+                let mut it = line.split_whitespace();
+                let first = it.next().expect("merge first symbol").to_string();
+                let second = it.next().expect("merge second symbol").to_string();
+                (first, second)
+            })
+            .collect();
+        assert_eq!(
+            merges.len(),
+            NUM_BPE_MERGES,
+            "vendored CLIP merge table is truncated"
+        );
+
+        // vocab = base byte chars ++ base+'</w>' ++ joined merges ++ [SOT, EOT] (open_clip order).
+        let mut vocab: Vec<String> = Vec::with_capacity(2 * b2u.len() + merges.len() + 2);
+        for &(_, c) in &b2u {
+            vocab.push(c.to_string());
+        }
+        for &(_, c) in &b2u {
+            vocab.push(format!("{c}</w>"));
+        }
+        for (a, b) in &merges {
+            vocab.push(format!("{a}{b}"));
+        }
+        vocab.push("<start_of_text>".to_string());
+        vocab.push("<end_of_text>".to_string());
+        let encoder: HashMap<String, u32> = vocab
+            .into_iter()
+            .enumerate()
+            .map(|(i, s)| (s, i as u32))
+            .collect();
+
+        let ranks: HashMap<(String, String), usize> = merges
+            .into_iter()
+            .enumerate()
+            .map(|(i, pair)| (pair, i))
+            .collect();
+
+        let pat = regex::Regex::new(
+            r"(?i)<start_of_text>|<end_of_text>|'s|'t|'re|'ve|'m|'ll|'d|\p{L}+|\p{N}|[^\s\p{L}\p{N}]+",
+        )
+        .expect("static CLIP pre-tokenization pattern compiles");
+
+        Self {
+            byte_encoder,
+            encoder,
+            ranks,
+            pat,
+        }
+    }
+
+    /// open_clip `SimpleTokenizer.bpe`: greedily merge the lowest-ranked adjacent pair until no
+    /// ranked pair remains. `token` is the byte-encoded piece; returns the final symbol sequence.
+    fn bpe(&self, token: &str) -> Vec<String> {
+        let chars: Vec<char> = token.chars().collect();
+        if chars.is_empty() {
+            return Vec::new();
+        }
+        // word = [c0, c1, ..., c_{n-2}, (c_{n-1} + "</w>")]
+        let last = chars.len() - 1;
+        let mut word: Vec<String> = chars
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                if i == last {
+                    format!("{c}</w>")
+                } else {
+                    c.to_string()
+                }
+            })
+            .collect();
+
+        while word.len() > 1 {
+            // lowest-rank adjacent pair (ranks are unique, so no tie-break is needed).
+            let mut best: Option<(usize, usize)> = None; // (rank, index)
+            for i in 0..word.len() - 1 {
+                if let Some(&r) = self.ranks.get(&(word[i].clone(), word[i + 1].clone())) {
+                    if best.is_none_or(|(br, _)| r < br) {
+                        best = Some((r, i));
+                    }
+                }
+            }
+            let Some((_, idx)) = best else { break };
+            let (first, second) = (word[idx].clone(), word[idx + 1].clone());
+
+            // merge every non-overlapping occurrence of (first, second).
+            let mut merged: Vec<String> = Vec::with_capacity(word.len());
+            let mut i = 0;
+            while i < word.len() {
+                if word[i] == first && i + 1 < word.len() && word[i + 1] == second {
+                    merged.push(format!("{first}{second}"));
+                    i += 2;
+                } else {
+                    merged.push(word[i].clone());
+                    i += 1;
+                }
+            }
+            word = merged;
+        }
+        word
+    }
+
+    /// open_clip `SimpleTokenizer.encode`: clean → pre-tokenize → byte-level encode each piece →
+    /// BPE → map symbols to ids. Returns the raw content ids (no SOT/EOT).
+    fn encode(&self, text: &str) -> Vec<u32> {
+        let cleaned = clip_clean(text);
+        let mut ids: Vec<u32> = Vec::new();
+        for m in self.pat.find_iter(&cleaned) {
+            // byte-level: UTF-8 bytes of the piece → byte_encoder chars.
+            let mut piece = String::new();
+            for &b in m.as_str().as_bytes() {
+                piece.push(self.byte_encoder[b as usize]);
+            }
+            for sym in self.bpe(&piece) {
+                if let Some(&id) = self.encoder.get(&sym) {
+                    ids.push(id);
+                }
+            }
+        }
+        ids
+    }
+}
+
+/// open_clip `_clean_lower` = `whitespace_clean(basic_clean(text)).lower()`.
+///
+/// `basic_clean` is `ftfy.fix_text` + `html.unescape` (applied twice) + strip; `whitespace_clean`
+/// collapses every run of unicode whitespace to a single space and trims. This reproduces the
+/// html-unescape (numeric + the core named entities) + whitespace-collapse + lowercase steps. It does
+/// **not** run ftfy's mojibake repair: ftfy is a no-op on well-formed UTF-8 (verified: the final
+/// cleaned text is byte-identical with and without ftfy across the conformance prompt set), so for
+/// the already-decoded text a request carries the output matches open_clip byte-for-byte. The full
+/// HTML5 named-entity set is likewise not reproduced (only `amp/lt/gt/quot/apos/nbsp` + numeric).
+fn clip_clean(text: &str) -> String {
+    // basic_clean: html.unescape twice (ftfy is identity on well-formed text — see doc above).
+    let unescaped = html_unescape(&html_unescape(text));
+    // whitespace_clean: `" ".join(text.split())` — collapse unicode-whitespace runs, trim.
+    let collapsed = unescaped.split_whitespace().collect::<Vec<_>>().join(" ");
+    collapsed.to_lowercase()
+}
+
+/// Minimal, faithful `html.unescape`: decodes `&#NN;` / `&#xHH;` numeric references and the core
+/// named entities. Non-entity `&` and unknown names pass through unchanged (as Python's does for
+/// text with no matching entity). open_clip applies this twice; [`clip_clean`] does the same.
+fn html_unescape(text: &str) -> String {
+    if !text.contains('&') {
+        return text.to_string();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '&' {
+            // look for a closing ';' within a bounded window
+            let end = (i + 12).min(chars.len());
+            if let Some(semi) = (i + 1..end).find(|&j| chars[j] == ';') {
+                let name: String = chars[i + 1..semi].iter().collect();
+                if let Some(rep) = decode_html_entity(&name) {
+                    out.push_str(&rep);
+                    i = semi + 1;
+                    continue;
+                }
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
+/// Decode a single HTML entity body (the text between `&` and `;`). Returns `None` for unknown
+/// names so the original text is preserved verbatim.
+fn decode_html_entity(name: &str) -> Option<String> {
+    if let Some(num) = name.strip_prefix('#') {
+        let cp = match num.strip_prefix(['x', 'X']) {
+            Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+            None => num.parse::<u32>().ok()?,
+        };
+        return char::from_u32(cp).map(|c| c.to_string());
+    }
+    let c = match name {
+        "amp" => '&',
+        "lt" => '<',
+        "gt" => '>',
+        "quot" => '"',
+        "apos" => '\'',
+        "nbsp" => '\u{a0}',
+        _ => return None,
+    };
+    Some(c.to_string())
+}
+
+/// Tokenize a raw prompt string into an open_clip 77-wide CLIP token-id row, reproducing open_clip's
+/// `SimpleTokenizer` for the DFN5B / ViT-H-14 model: lowercase + whitespace/html cleanup, byte-level
+/// BPE with the pinned merge ranks, wrapped `[SOT …ids… EOT]`, truncated so EOT survives, padded
+/// with [`PAD_TOKEN`] (`0`) to [`CONTEXT_LENGTH`].
+///
+/// This is the string→id front end for [`DfnClipEncoder::encode_text`]: the shipping MMAudio
+/// assembly (sc-12843) calls it to turn a request's text prompt into the `(1, 77)` id row the text
+/// tower consumes (build the tensor with [`tokenize`] from `&[tokenize_str(text).to_vec()]`).
+///
+/// Byte-identical to `open_clip.get_tokenizer('ViT-H-14-378-quickgelu')(text)` — validated on a
+/// varied prompt set (empty, punctuation, digits, contractions, accents, CJK, emoji, html entities,
+/// >77-token truncation) in `tests/clip_conformance.rs`.
+pub fn tokenize_str(text: &str) -> [u32; CONTEXT_LENGTH] {
+    let ids = clip_bpe().encode(text);
+    let row = wrap_tokens(&ids);
+    let mut out = [PAD_TOKEN; CONTEXT_LENGTH];
+    out.copy_from_slice(&row);
+    out
+}
+
 // ---- preprocessing ---------------------------------------------------------------------------
 
 /// Preprocess RGB frames into the visual tower's input tensor `(N, 3, 384, 384)`.
@@ -634,6 +922,76 @@ mod tests {
         assert_eq!(m[1][0], 0.0);
         assert_eq!(m[0][1], f32::MIN, "j>i masked");
         assert_eq!(m[2][1], 0.0);
+    }
+
+    #[test]
+    fn byte_to_unicode_is_a_256_bijection() {
+        let b2u = byte_to_unicode();
+        assert_eq!(b2u.len(), 256, "one mapping per byte");
+        let bytes: std::collections::HashSet<u8> = b2u.iter().map(|&(b, _)| b).collect();
+        let chars: std::collections::HashSet<char> = b2u.iter().map(|&(_, c)| c).collect();
+        assert_eq!(bytes.len(), 256, "all bytes distinct");
+        assert_eq!(chars.len(), 256, "all chars distinct");
+    }
+
+    #[test]
+    fn clip_bpe_rebuilds_the_full_vocab_and_specials() {
+        let bpe = clip_bpe();
+        assert_eq!(
+            bpe.encoder.len(),
+            VOCAB_SIZE,
+            "rebuilt encoder is the full 49408-token vocab"
+        );
+        assert_eq!(bpe.ranks.len(), NUM_BPE_MERGES, "48894 merge ranks");
+        assert_eq!(
+            bpe.encoder.get("<start_of_text>").copied(),
+            Some(SOT_TOKEN),
+            "SOT id"
+        );
+        assert_eq!(
+            bpe.encoder.get("<end_of_text>").copied(),
+            Some(EOT_TOKEN),
+            "EOT id"
+        );
+    }
+
+    #[test]
+    fn tokenize_str_wraps_pads_and_matches_known_ids() {
+        // "dog barking" -> open_clip ids [SOT, 1929, 32676, EOT, 0...] (see fixture).
+        let row = tokenize_str("dog barking");
+        assert_eq!(row.len(), CONTEXT_LENGTH);
+        assert_eq!(&row[..4], &[SOT_TOKEN, 1929, 32676, EOT_TOKEN]);
+        assert!(row[4..].iter().all(|&t| t == PAD_TOKEN), "0-padded tail");
+
+        // Empty prompt -> just [SOT, EOT, 0...].
+        let empty = tokenize_str("");
+        assert_eq!(&empty[..2], &[SOT_TOKEN, EOT_TOKEN]);
+        assert!(empty[2..].iter().all(|&t| t == PAD_TOKEN));
+    }
+
+    #[test]
+    fn tokenize_str_truncates_keeping_eot() {
+        // A prompt far longer than 77 tokens must fill the row and keep EOT in the last slot.
+        let long = "dog ".repeat(200);
+        let row = tokenize_str(&long);
+        assert_eq!(row[0], SOT_TOKEN);
+        assert_eq!(
+            row[CONTEXT_LENGTH - 1],
+            EOT_TOKEN,
+            "EOT survives truncation"
+        );
+        assert!(row.iter().all(|&t| t != PAD_TOKEN), "row is full (no pad)");
+    }
+
+    #[test]
+    fn clip_clean_html_unescape_and_whitespace() {
+        // html.unescape (amp/lt/gt + numeric) then whitespace-collapse + lowercase.
+        assert_eq!(clip_clean("Cats &amp; Dogs"), "cats & dogs");
+        assert_eq!(clip_clean("a &lt;b&gt; c"), "a <b> c");
+        assert_eq!(clip_clean("100&#37; DONE"), "100% done");
+        assert_eq!(clip_clean("  a\t b \n c  "), "a b c");
+        // a bare, non-entity ampersand is preserved verbatim.
+        assert_eq!(clip_clean("rock & roll"), "rock & roll");
     }
 
     #[test]
