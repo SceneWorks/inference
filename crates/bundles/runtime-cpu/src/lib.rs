@@ -103,7 +103,7 @@ mod tests {
         // The audio lane is Candle-native (sc-12901) and matches this bundle's own backend. Its
         // ordered id surface is the audio catalog's — shipped generators kokoro_82m (sc-12836),
         // moss_sfx_v2 (sc-12841), acestep_v15_turbo (sc-12842), moss_tts_realtime (sc-13392),
-        // chatterbox_tts (sc-13239), mmaudio_small_16k (video->audio Foley, sc-12843) + mmaudio_large_44k (44.1 kHz, sc-13441), plus the
+        // chatterbox_tts (sc-13239), mmaudio_small_16k (video->audio Foley, sc-12843) + mmaudio_large_44k (44.1 kHz, sc-13441) + moss_ttsd_v05 (multi-speaker dialogue TTS, sc-13518), plus the
         // voice-cloning identity embedder chatterbox_ve (sc-12844); later stories extend these exact
         // assertions in catalog order. The lane carries its own composed candle preparer
         // (sc-12835/sc-12836).
@@ -122,7 +122,8 @@ mod tests {
                     "moss_tts_realtime",
                     "chatterbox_tts",
                     "mmaudio_small_16k",
-                    "mmaudio_large_44k"
+                    "mmaudio_large_44k",
+                    "moss_ttsd_v05"
                 ]
             );
             assert_eq!(snapshot.audio_voice_embedder_ids, ["chatterbox_ve"]);
@@ -219,6 +220,7 @@ mod tests {
                 "chatterbox_tts",
                 "mmaudio_small_16k",
                 "mmaudio_large_44k",
+                "moss_ttsd_v05",
                 "dummy-audio"
             ]
         );

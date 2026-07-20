@@ -75,6 +75,7 @@ jobs:
       CLAP_SNAPSHOT: ${{ vars.CLAP_SNAPSHOT }}
       MOSS_TTS_REALTIME_SNAPSHOT: ${{ vars.MOSS_TTS_REALTIME_SNAPSHOT }}
       MOSS_TTSD_SNAPSHOT: ${{ vars.MOSS_TTSD_SNAPSHOT }}
+      MOSS_XY_TOKENIZER_SNAPSHOT: ${{ vars.MOSS_XY_TOKENIZER_SNAPSHOT }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: Toolchain versions
@@ -92,6 +93,7 @@ jobs:
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model clap-htsat-unfused --snapshot "$CLAP_SNAPSHOT"
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model moss-tts-realtime --snapshot "$MOSS_TTS_REALTIME_SNAPSHOT"
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model moss-ttsd-v05 --snapshot "$MOSS_TTSD_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model xy-tokenizer-ttsd --snapshot "$MOSS_XY_TOKENIZER_SNAPSHOT"
       - name: Run provider conformance
         run: |
           cargo test --locked -p candle-audio-kokoro --test conformance kokoro_conformance -- --ignored --nocapture
@@ -165,13 +167,17 @@ jobs:
           # matching clip highest by cosine — the cross-modal ranking DoD — plus embedding determinism.
           cargo test --locked -p candle-audio-clap --test conformance cross_modal_query_ranks_matching_clip_highest -- --ignored --nocapture
           cargo test --locked -p candle-audio-clap --test conformance embedding_is_deterministic -- --ignored --nocapture
-          # MOSS-TTSD-v0.5 AR brain (sc-13360): honest partial. The Qwen3 backbone + 8-channel
-          # delay-pattern loop emits real, in-range, deterministic RVQ speech-codebook frames on real
-          # weights; a 2-speaker [S1]/[S2] script shapes the token stream vs a single-voice control;
-          # generate() errors at the (not-yet-ported) XY_Tokenizer codec boundary. Unregistered.
+          # MOSS-TTSD-v0.5 multi-speaker dialogue TTS (sc-13360 AR brain + sc-13518 XY_Tokenizer
+          # codec). The Qwen3 backbone + 8-channel delay-pattern loop emits real, deterministic RVQ
+          # frames; a 2-speaker [S1]/[S2] script shapes the token stream vs a single-voice control;
+          # and the ported XY_Tokenizer codec renders those frames into one 24 kHz AudioTrack whose two
+          # speakers are acoustically distinct (measured via chatterbox_ve — cross-segment cosine below
+          # same-segment self-similarity), with a single-voice control and byte-identical re-synth. The
+          # non-English gate (task 12906) checks a Chinese prompt renders distinct real audio.
           cargo test --locked -p candle-audio-moss-tts --test conformance moss_ttsd_emits_valid_delay_pattern_rvq_frames -- --ignored --nocapture
           cargo test --locked -p candle-audio-moss-tts --test conformance moss_ttsd_two_speaker_script_shapes_the_token_stream -- --ignored --nocapture
-          cargo test --locked -p candle-audio-moss-tts --test conformance moss_ttsd_generate_errors_at_the_codec_boundary -- --ignored --nocapture
+          cargo test --locked -p candle-audio-moss-tts --test conformance moss_ttsd_renders_multi_speaker_audio -- --ignored --nocapture
+          cargo test --locked -p candle-audio-moss-tts --test conformance moss_ttsd_renders_non_english -- --ignored --nocapture
       # Regression fixture (sc-12854): the validation harness's committed metric envelope +
       # PCM repeatability hash; this runner IS the fixture's canonical platform
       # (macos/aarch64), so the exact-hash check gates here.
