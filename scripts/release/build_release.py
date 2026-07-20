@@ -41,17 +41,23 @@ REQUIRED_LICENSE_FIELDS = (
 def validate_model_weight_licenses(document: dict[str, Any]) -> list[dict[str, Any]]:
     """Assert a model-weight-license manifest is present and complete.
 
-    Every provider entry must record its identity + SPDX id + license name + source URL +
-    commercial-use flag, ids must be unique, and a non-commercial checkpoint MUST carry a
-    restriction note (the whole point of the surface: a restricted license can never ship with its
-    terms unrecorded). Shared by the builder (emit-time) and the verifier (bundle-time).
+    Every row must record its identity + SPDX id + license name + source URL + commercial-use flag,
+    and a non-commercial checkpoint MUST carry a restriction note (the whole point of the surface: a
+    restricted license can never ship with its terms unrecorded).
+
+    A single-checkpoint provider contributes one row (``component`` null). A multi-checkpoint
+    provider (e.g. MMAudio) contributes a composite/effective-restriction row (``component`` null)
+    plus one per-checkpoint attribution row (``component`` set), so rows are keyed by the
+    ``(provider_id, component)`` pair rather than ``provider_id`` alone (sc-13493) — the same
+    ``provider_id`` may recur, but each ``(provider_id, component)`` pair is unique. Shared by the
+    builder (emit-time) and the verifier (bundle-time).
     """
     if document.get("kind") != "model-weight-licenses":
         raise RuntimeError("model-licenses manifest has the wrong kind")
     providers = document.get("providers")
     if not isinstance(providers, list) or not providers:
         raise RuntimeError("model-licenses manifest lists no providers")
-    seen: set[str] = set()
+    seen: set[tuple[str, str | None]] = set()
     for provider in providers:
         for field in REQUIRED_LICENSE_FIELDS:
             value = provider.get(field)
@@ -64,13 +70,24 @@ def validate_model_weight_licenses(document: dict[str, Any]) -> list[dict[str, A
                 f"model-licenses entry {provider['provider_id']!r} commercial_use must be boolean"
             )
         identifier = provider["provider_id"]
-        if identifier in seen:
-            raise RuntimeError(f"duplicate model-licenses provider id {identifier!r}")
-        seen.add(identifier)
+        component = provider.get("component")
+        if component is not None and not (
+            isinstance(component, str) and component.strip()
+        ):
+            raise RuntimeError(
+                f"model-licenses entry {identifier!r} has a non-string/empty component discriminator"
+            )
+        key = (identifier, component)
+        if key in seen:
+            raise RuntimeError(
+                f"duplicate model-licenses row (provider_id={identifier!r}, component={component!r})"
+            )
+        seen.add(key)
         restriction = provider.get("restriction")
         if not provider["commercial_use"] and not (restriction or "").strip():
             raise RuntimeError(
-                f"non-commercial model-licenses entry {identifier!r} has no restriction note"
+                f"non-commercial model-licenses entry (provider_id={identifier!r}, "
+                f"component={component!r}) has no restriction note"
             )
     return providers
 

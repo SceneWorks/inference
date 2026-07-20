@@ -109,6 +109,9 @@ pub const WEIGHT_LICENSE: gen_core::WeightLicense = gen_core::WeightLicense {
 /// `candle-audio-catalog` aggregates into the model-licenses manifest.
 pub const WEIGHT_LICENSE_ENTRY: gen_core::WeightLicenseEntry = gen_core::WeightLicenseEntry {
     provider_id: MODEL_ID,
+    // The composite / effective-restriction row (component == None); the per-checkpoint
+    // attribution rows live in `crate::SHIPPED_WEIGHT_LICENSES` beside it (sc-13493).
+    component: None,
     license: WEIGHT_LICENSE,
 };
 

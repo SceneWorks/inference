@@ -1,9 +1,10 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "kind": "model-weight-licenses",
   "providers": [
     {
       "provider_id": "acestep_v15_turbo",
+      "component": null,
       "spdx_id": "MIT",
       "license_name": "MIT License",
       "source_url": "https://huggingface.co/ACE-Step/acestep-v15-xl-turbo-diffusers",
@@ -13,6 +14,7 @@
     },
     {
       "provider_id": "chatterbox_tts",
+      "component": null,
       "spdx_id": "MIT",
       "license_name": "MIT License",
       "source_url": "https://huggingface.co/ResembleAI/chatterbox",
@@ -22,6 +24,7 @@
     },
     {
       "provider_id": "chatterbox_ve",
+      "component": null,
       "spdx_id": "MIT",
       "license_name": "MIT License",
       "source_url": "https://huggingface.co/ResembleAI/chatterbox",
@@ -31,6 +34,7 @@
     },
     {
       "provider_id": "clap_htsat_unfused",
+      "component": null,
       "spdx_id": "Apache-2.0",
       "license_name": "Apache License 2.0",
       "source_url": "https://huggingface.co/laion/clap-htsat-unfused",
@@ -40,6 +44,7 @@
     },
     {
       "provider_id": "kokoro_82m",
+      "component": null,
       "spdx_id": "Apache-2.0",
       "license_name": "Apache License 2.0",
       "source_url": "https://huggingface.co/hexgrad/Kokoro-82M",
@@ -49,6 +54,7 @@
     },
     {
       "provider_id": "mmaudio_large_44k",
+      "component": null,
       "spdx_id": "LicenseRef-MMAudio-large-44k-composite",
       "license_name": "MMAudio large_44k_v2 composite (Apple ML Research + CC-BY-NC-4.0 + MIT)",
       "source_url": "https://huggingface.co/hkchengrex/MMAudio",
@@ -57,7 +63,58 @@
       "restriction": "Research / non-commercial only — the intersection of five component licenses. The strictest, the Apple ML Research Model License on the DFN5B-CLIP conditioner, limits use to scientific research and academic development and excludes any commercial product or service; the MMAudio large_44k_v2 MM-DiT / 44k mel-VAE add CC-BY-NC-4.0 (non-commercial); the Synchformer encoder and NVIDIA BigVGAN v2 vocoder are MIT (permissive). See candle-audio-mmaudio::WEIGHT_LICENSES_44K for each checkpoint's full terms. A legal read is warranted before any commercial use."
     },
     {
+      "provider_id": "mmaudio_large_44k",
+      "component": "dfn5b_clip_vit_h14_384",
+      "spdx_id": "LicenseRef-Apple-MLR",
+      "license_name": "Apple Machine Learning Research Model License Agreement",
+      "source_url": "https://huggingface.co/apple/DFN5B-CLIP-ViT-H-14-384",
+      "commercial_use": false,
+      "attribution": "DFN5B-CLIP ViT-H/14-384 © Apple Inc. — Apple Machine Learning Research Model License Agreement (research / non-commercial use only)",
+      "restriction": "Apple ML Research Model License: research and academic use only; 'Research Purposes' excludes any commercial exploitation, product development, or use in a commercial product or service. Trained on the DFN-5B image-text dataset. A legal read is warranted before any commercial use."
+    },
+    {
+      "provider_id": "mmaudio_large_44k",
+      "component": "mmaudio_mmdit_large_44k_v2",
+      "spdx_id": "CC-BY-NC-4.0",
+      "license_name": "Creative Commons Attribution-NonCommercial 4.0 International",
+      "source_url": "https://huggingface.co/hkchengrex/MMAudio",
+      "commercial_use": false,
+      "attribution": "MMAudio large_44k_v2 network (mmaudio_large_44k_v2.pth) © 2024 Ho Kei Cheng et al. (arXiv:2412.15322); weights distributed via hkchengrex/MMAudio under CC-BY-NC 4.0",
+      "restriction": "CC-BY-NC 4.0: non-commercial use only. The MMAudio code is MIT, but the released model weights are NonCommercial; a commercial use needs a separate license from the authors. Trained on VGGSound (research-oriented terms)."
+    },
+    {
+      "provider_id": "mmaudio_large_44k",
+      "component": "mmaudio_vae_44k",
+      "spdx_id": "CC-BY-NC-4.0",
+      "license_name": "Creative Commons Attribution-NonCommercial 4.0 International",
+      "source_url": "https://huggingface.co/hkchengrex/MMAudio",
+      "commercial_use": false,
+      "attribution": "MMAudio 44k mel-VAE (v1-44.pth) © Sony Research Inc. — released under CC-BY-NC-4.0; VAE architecture from Make-An-Audio 2 (ByteDance, MIT); EDM2 magnitude-preserving primitives © NVIDIA (CC-BY-NC-SA-4.0)",
+      "restriction": "Non-commercial only: MMAudio releases all ext_weights checkpoints under CC-BY-NC-4.0 (see the MMAudio README). Additionally the pretrained models were trained on AudioSet/VGGSound/Freesound/AudioCaps/WavCaps, whose dataset terms a downstream user must honor; MMAudio states it does not guarantee suitability for commercial use."
+    },
+    {
+      "provider_id": "mmaudio_large_44k",
+      "component": "nvidia_bigvgan_v2_44khz_128band_512x",
+      "spdx_id": "MIT",
+      "license_name": "MIT License",
+      "source_url": "https://huggingface.co/nvidia/bigvgan_v2_44khz_128band_512x",
+      "commercial_use": true,
+      "attribution": "NVIDIA BigVGAN v2 (bigvgan_v2_44khz_128band_512x, bigvgan_generator.pt) © 2024 NVIDIA CORPORATION — MIT License (model card license: mit); BigVGAN code adapted from HiFi-GAN (jik876, MIT).",
+      "restriction": "Code + weights are MIT (permissive). BigVGAN v2 was trained by NVIDIA on large-scale diverse audio (speech in multiple languages, environmental sounds, instruments); those upstream training-data terms are NVIDIA's to honor, and a downstream commercial use of the weights warrants a legal read even though the MIT grant itself is unrestricted."
+    },
+    {
+      "provider_id": "mmaudio_large_44k",
+      "component": "synchformer_vfeat",
+      "spdx_id": "MIT",
+      "license_name": "MIT License",
+      "source_url": "https://github.com/v-iashin/Synchformer",
+      "commercial_use": true,
+      "attribution": "Synchformer © 2024 Vladimir Iashin — MIT License; checkpoint distributed via MMAudio (hkchengrex/MMAudio) ext_weights",
+      "restriction": "Code is MIT. Released weights were trained on VGGSound/AudioSet/LRS3; those datasets carry their own (YouTube/BBC-sourced, research-oriented) terms — a legal read is warranted before any commercial redistribution of the weights."
+    },
+    {
       "provider_id": "mmaudio_small_16k",
+      "component": null,
       "spdx_id": "LicenseRef-MMAudio-small-16k-composite",
       "license_name": "MMAudio small_16k composite (Apple ML Research + CC-BY-NC-4.0 + MIT)",
       "source_url": "https://huggingface.co/hkchengrex/MMAudio",
@@ -66,7 +123,58 @@
       "restriction": "Research / non-commercial only — the intersection of five component licenses. The strictest, the Apple ML Research Model License on the DFN5B-CLIP conditioner, limits use to scientific research and academic development and excludes any commercial product or service; the MMAudio MM-DiT / mel-VAE / BigVGAN checkpoints add CC-BY-NC-4.0 (non-commercial); the Synchformer encoder is MIT. See candle-audio-mmaudio::WEIGHT_LICENSES for each checkpoint's full terms. A legal read is warranted before any commercial use."
     },
     {
+      "provider_id": "mmaudio_small_16k",
+      "component": "dfn5b_clip_vit_h14_384",
+      "spdx_id": "LicenseRef-Apple-MLR",
+      "license_name": "Apple Machine Learning Research Model License Agreement",
+      "source_url": "https://huggingface.co/apple/DFN5B-CLIP-ViT-H-14-384",
+      "commercial_use": false,
+      "attribution": "DFN5B-CLIP ViT-H/14-384 © Apple Inc. — Apple Machine Learning Research Model License Agreement (research / non-commercial use only)",
+      "restriction": "Apple ML Research Model License: research and academic use only; 'Research Purposes' excludes any commercial exploitation, product development, or use in a commercial product or service. Trained on the DFN-5B image-text dataset. A legal read is warranted before any commercial use."
+    },
+    {
+      "provider_id": "mmaudio_small_16k",
+      "component": "mmaudio_bigvgan_16k",
+      "spdx_id": "CC-BY-NC-4.0",
+      "license_name": "Creative Commons Attribution-NonCommercial 4.0 International",
+      "source_url": "https://huggingface.co/hkchengrex/MMAudio",
+      "commercial_use": false,
+      "attribution": "MMAudio 16k BigVGAN (best_netG.pt) © Sony Research Inc. — released under CC-BY-NC-4.0; 16k BigVGAN pretrained model from Make-An-Audio 2 (ByteDance, MIT); BigVGAN code © NVIDIA (MIT), adapted from HiFi-GAN (MIT)",
+      "restriction": "Non-commercial only: MMAudio releases all ext_weights checkpoints under CC-BY-NC-4.0 (see the MMAudio README). Additionally the pretrained models were trained on AudioSet/VGGSound/Freesound/AudioCaps/WavCaps, whose dataset terms a downstream user must honor; MMAudio states it does not guarantee suitability for commercial use."
+    },
+    {
+      "provider_id": "mmaudio_small_16k",
+      "component": "mmaudio_mmdit_small_16k",
+      "spdx_id": "CC-BY-NC-4.0",
+      "license_name": "Creative Commons Attribution-NonCommercial 4.0 International",
+      "source_url": "https://github.com/hkchengrex/MMAudio",
+      "commercial_use": false,
+      "attribution": "MMAudio © 2024 Ho Kei Cheng et al. (arXiv:2412.15322); weights distributed via hkchengrex/MMAudio under CC-BY-NC 4.0",
+      "restriction": "CC-BY-NC 4.0: non-commercial use only. The MMAudio code is MIT, but the released model weights are NonCommercial; a commercial use needs a separate license from the authors. Trained on VGGSound (research-oriented terms)."
+    },
+    {
+      "provider_id": "mmaudio_small_16k",
+      "component": "mmaudio_vae_16k",
+      "spdx_id": "CC-BY-NC-4.0",
+      "license_name": "Creative Commons Attribution-NonCommercial 4.0 International",
+      "source_url": "https://huggingface.co/hkchengrex/MMAudio",
+      "commercial_use": false,
+      "attribution": "MMAudio 16k mel-VAE (v1-16.pth) © Sony Research Inc. — released under CC-BY-NC-4.0; VAE architecture from Make-An-Audio 2 (ByteDance, MIT); EDM2 magnitude-preserving primitives © NVIDIA (CC-BY-NC-SA-4.0)",
+      "restriction": "Non-commercial only: MMAudio releases all ext_weights checkpoints under CC-BY-NC-4.0 (see the MMAudio README). Additionally the pretrained models were trained on AudioSet/VGGSound/Freesound/AudioCaps/WavCaps, whose dataset terms a downstream user must honor; MMAudio states it does not guarantee suitability for commercial use."
+    },
+    {
+      "provider_id": "mmaudio_small_16k",
+      "component": "synchformer_vfeat",
+      "spdx_id": "MIT",
+      "license_name": "MIT License",
+      "source_url": "https://github.com/v-iashin/Synchformer",
+      "commercial_use": true,
+      "attribution": "Synchformer © 2024 Vladimir Iashin — MIT License; checkpoint distributed via MMAudio (hkchengrex/MMAudio) ext_weights",
+      "restriction": "Code is MIT. Released weights were trained on VGGSound/AudioSet/LRS3; those datasets carry their own (YouTube/BBC-sourced, research-oriented) terms — a legal read is warranted before any commercial redistribution of the weights."
+    },
+    {
       "provider_id": "moss_sfx_v2",
+      "component": null,
       "spdx_id": "Apache-2.0",
       "license_name": "Apache License 2.0",
       "source_url": "https://huggingface.co/OpenMOSS-Team/MOSS-SoundEffect-v2.0",
@@ -76,6 +184,7 @@
     },
     {
       "provider_id": "moss_tts_realtime",
+      "component": null,
       "spdx_id": "Apache-2.0",
       "license_name": "Apache License 2.0",
       "source_url": "https://huggingface.co/OpenMOSS-Team/MOSS-TTS-Realtime",
@@ -85,6 +194,7 @@
     },
     {
       "provider_id": "moss_ttsd_v05",
+      "component": null,
       "spdx_id": "Apache-2.0",
       "license_name": "Apache License 2.0",
       "source_url": "https://huggingface.co/OpenMOSS-Team/MOSS-TTSD-v0.5",
@@ -94,6 +204,7 @@
     },
     {
       "provider_id": "openvoice_v2",
+      "component": null,
       "spdx_id": "MIT",
       "license_name": "MIT License",
       "source_url": "https://huggingface.co/myshell-ai/OpenVoiceV2",
@@ -103,6 +214,7 @@
     },
     {
       "provider_id": "whisper_base",
+      "component": null,
       "spdx_id": "Apache-2.0",
       "license_name": "Apache License 2.0",
       "source_url": "https://huggingface.co/openai/whisper-base",

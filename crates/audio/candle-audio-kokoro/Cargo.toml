@@ -32,6 +32,12 @@ rand_distr = { workspace = true }
 # pinned candle pickle reader does not expose (it reads state-dict zips only), so the raw
 # little-endian f32 storage entry is read directly. Same zip version candle-core itself uses.
 zip = { version = "7.2", default-features = false }
+# CMU Pronouncing Dictionary parser (MIT/Apache-2.0) for the G2P out-of-vocabulary fallback tier
+# (sc-13038): misaki lexicon → cmudict → letter spell-out. This crate ships ONLY the ARPAbet
+# parser + typed `Symbol` enum — the dictionary DATA is vendored under `resources/cmudict.dict`
+# (BSD-2-Clause, CMU; see `resources/LICENSE-CMUDICT`) and embedded via `include_str!`. Default
+# features only (no `serde`/`serialization` — the dict is parsed once from the embedded text).
+cmudict-fast = { version = "0.8.0", default-features = false }
 
 [dev-dependencies]
 # HF-cache snapshot resolution for the `#[ignore]`d real-weight conformance test.
