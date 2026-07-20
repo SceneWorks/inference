@@ -12,6 +12,15 @@
       "restriction": "Bundled text_encoder (Qwen3-Embedding-0.6B) is redistributed under Apache-2.0."
     },
     {
+      "provider_id": "chatterbox_tts",
+      "spdx_id": "MIT",
+      "license_name": "MIT License",
+      "source_url": "https://huggingface.co/ResembleAI/chatterbox",
+      "commercial_use": true,
+      "attribution": "Chatterbox © Resemble AI — licensed under MIT",
+      "restriction": null
+    },
+    {
       "provider_id": "chatterbox_ve",
       "spdx_id": "MIT",
       "license_name": "MIT License",

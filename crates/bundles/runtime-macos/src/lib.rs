@@ -102,10 +102,12 @@ mod tests {
         assert_eq!(snapshot.snapshot_preparer_backends, ["mlx"]);
         // The audio lane is declared Candle-native on this mlx bundle (sc-12901) — the
         // sanctioned cross-backend seam. Its ordered id surface is the audio catalog's —
-        // shipped generators kokoro_82m (sc-12836), moss_sfx_v2 (sc-12841), acestep_v15_turbo (sc-12842), plus the voice-cloning
-        // identity embedder chatterbox_ve (sc-12844); later stories extend in catalog order. The
-        // lane carries the composed candle preparer (sc-12835/sc-12836) while the main preparer
-        // registry stays mlx-only.
+        // shipped generators kokoro_82m (sc-12836), moss_sfx_v2 (sc-12841), acestep_v15_turbo
+        // (sc-12842), moss_tts_realtime (sc-13392), chatterbox_tts (sc-13239), plus the
+        // voice-cloning identity embedder
+        // chatterbox_ve (sc-12844); later stories extend in catalog order. The lane carries the
+        // composed candle preparer (sc-12835/sc-12836) while the main preparer registry stays
+        // mlx-only.
         #[cfg(feature = "audio")]
         {
             assert_eq!(
@@ -118,7 +120,8 @@ mod tests {
                     "kokoro_82m",
                     "moss_sfx_v2",
                     "acestep_v15_turbo",
-                    "moss_tts_realtime"
+                    "moss_tts_realtime",
+                    "chatterbox_tts"
                 ]
             );
             assert_eq!(snapshot.audio_voice_embedder_ids, ["chatterbox_ve"]);
@@ -216,6 +219,7 @@ mod tests {
                 "moss_sfx_v2",
                 "acestep_v15_turbo",
                 "moss_tts_realtime",
+                "chatterbox_tts",
                 "dummy-audio"
             ]
         );

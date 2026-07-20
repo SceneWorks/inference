@@ -39,14 +39,12 @@
 //! source injection, and an iSTFT head (`n_fft = 16`, `hop = 4`) → a 24 kHz waveform (480
 //! samples/mel-frame). With it, **all four** S3Gen networks are now ported.
 //!
-//! What remains is the end-to-end **token→waveform integration** (tokenize → flow → vocode) and the
-//! catalog **registration** (sc-13239): the generator's `generate()` still runs T3 to produce real
-//! speech tokens and then returns a typed error at the S3Gen boundary rather than fabricate audio,
-//! and the generator is **not yet registered into `candle-audio-catalog`'s shipping surface**. That
-//! integration, the registration, the ordered-id surface extension, and the three bundle smokes are
-//! deliberately deferred to sc-13239. This crate is present as a workspace member so its stages
-//! build, are unit-tested, and are exercised on real weights by the conformance test (each network,
-//! including the vocoder, has its own real-weights gate).
+//! sc-13239 lands the end-to-end **token→waveform integration** ([`s3gen::S3Gen`]: tokenize → flow
+//! → vocode → PerTh watermark) so `generate()` renders a real 24 kHz cloned-voice WAV, and the
+//! catalog **registration** — `chatterbox_tts` is added to `candle-audio-catalog`'s ordered
+//! generator surface and the three bundle smokes. The sc-12838 clone-WAV DoD (a cloned WAV whose
+//! `chatterbox_ve` embedding is closer to the reference than to a different-voice control) is gated
+//! on real weights by the crate's conformance test.
 //!
 //! Weights resolve through the audio lane's pinned-SHA hub path (F-029): `ResembleAI/chatterbox`
 //! at the same immutable commit the [`candle_audio_chatterbox_ve`] sibling pins.
@@ -75,16 +73,24 @@ pub use hift::HiftGenerator;
 pub use mel24::Mel24Extractor;
 pub use model::{
     descriptor, load, load_generator, resolve_pinned_snapshot, ChatterboxGenerator, HUB_REPO,
-    HUB_REVISION, MODEL_ID, REGISTRATION, T3_WEIGHTS_FILE, TOKENIZER_FILE,
+    HUB_REVISION, MODEL_ID, REGISTRATION, T3_WEIGHTS_FILE, TOKENIZER_FILE, WEIGHT_LICENSE,
+    WEIGHT_LICENSE_ENTRY,
 };
-pub use perth::{snr_db, PerthWatermarker, PERTH_SR, PERTH_WEIGHTS_FILE};
+pub use perth::{
+    resolve_perth_weights, snr_db, PerthWatermarker, PERTH_SR, PERTH_WEIGHTS_FILE,
+    RESEMBLE_PERTH_VERSION,
+};
+pub use s3gen::S3Gen;
 pub use s3tokenizer::S3Tokenizer;
 
-/// Add the Chatterbox generator to an explicit audio registry builder.
-///
-/// NOTE: `candle-audio-catalog` does **not** call this yet — see the crate-level "Port status" note.
-/// It exists so this crate's own [`provider_registry`] can validate the descriptor, and so the
-/// catalog wiring is a one-line add once the S3Gen stack lands.
+/// Every model-weight license this crate ships (sc-13332) — the `chatterbox_tts` generator's pinned
+/// `ResembleAI/chatterbox` (MIT) checkpoint. `candle-audio-catalog` aggregates this into the
+/// release-tooling weight-license manifest.
+pub const WEIGHT_LICENSES: &[gen_core::WeightLicenseEntry] = &[model::WEIGHT_LICENSE_ENTRY];
+
+/// Add the Chatterbox clone-TTS generator (`chatterbox_tts`) to an explicit audio registry builder.
+/// `candle-audio-catalog` calls this in stable catalog order (sc-13239); this crate's own
+/// [`provider_registry`] also uses it for descriptor introspection / conformance.
 pub fn register_providers(
     registry: gen_core::ProviderRegistryBuilder,
 ) -> gen_core::ProviderRegistryBuilder {

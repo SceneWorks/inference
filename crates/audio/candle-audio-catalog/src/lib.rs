@@ -43,6 +43,7 @@ pub const AUDIO_BACKEND: &str = "candle";
 /// Complete audio provider package surface owned by the Candle audio lane, in catalog order.
 pub mod providers {
     pub use candle_audio_acestep;
+    pub use candle_audio_chatterbox;
     pub use candle_audio_chatterbox_ve;
     pub use candle_audio_clap;
     pub use candle_audio_kokoro;
@@ -54,8 +55,8 @@ pub mod providers {
 
 /// Add every provider shipped by the Candle audio lane to an explicit registry builder, in
 /// stable catalog order: the generators first (Kokoro TTS, MOSS SFX, ACE-Step music, MOSS-TTS-Realtime
-/// streaming TTS — sc-13392), then the voice-cloning identity embedder (Chatterbox `ve`, sc-12844),
-/// then the audio transforms
+/// streaming TTS — sc-13392, Chatterbox clone-TTS — sc-13239), then the voice-cloning identity
+/// embedder (Chatterbox `ve`, sc-12844), then the audio transforms
 /// (OpenVoice V2 voice conversion, sc-13223 — the first real `AudioTransform`), then the
 /// transcribers (Whisper ASR, sc-12850 — the first real `Transcriber`, the audio Captioner-analog),
 /// then the audio embedders (LAION CLAP, sc-12851 — the first real `AudioEmbedder`, semantic
@@ -65,6 +66,7 @@ pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistry
     let registry = candle_audio_moss_sfx::register_providers(registry);
     let registry = candle_audio_acestep::register_providers(registry);
     let registry = candle_audio_moss_tts_realtime::register_providers(registry);
+    let registry = candle_audio_chatterbox::register_providers(registry);
     let registry = candle_audio_chatterbox_ve::register_providers(registry);
     let registry = candle_audio_openvoice::register_providers(registry);
     let registry = candle_audio_whisper::register_providers(registry);
@@ -99,6 +101,7 @@ pub fn weight_licenses() -> Vec<gen_core::WeightLicenseEntry> {
     entries.extend_from_slice(candle_audio_moss_sfx::WEIGHT_LICENSES);
     entries.extend_from_slice(candle_audio_acestep::WEIGHT_LICENSES);
     entries.extend_from_slice(candle_audio_moss_tts_realtime::WEIGHT_LICENSES);
+    entries.extend_from_slice(candle_audio_chatterbox::WEIGHT_LICENSES);
     entries.extend_from_slice(candle_audio_chatterbox_ve::WEIGHT_LICENSES);
     entries.extend_from_slice(candle_audio_openvoice::WEIGHT_LICENSES);
     entries.extend_from_slice(candle_audio_whisper::WEIGHT_LICENSES);
@@ -185,6 +188,7 @@ fn lane_can_prepare(spec: &core_llm::PrepareSpec) -> bool {
         || candle_audio_moss_sfx::prepare::can_prepare(spec)
         || candle_audio_acestep::prepare::can_prepare(spec)
         || candle_audio_moss_tts_realtime::prepare::can_prepare(spec)
+        || candle_audio_chatterbox::prepare::can_prepare(spec)
         || candle_audio_openvoice::prepare::can_prepare(spec)
         || candle_audio_whisper::prepare::can_prepare(spec)
         || candle_audio_clap::prepare::can_prepare(spec)
@@ -200,6 +204,8 @@ fn lane_prepare(spec: &core_llm::PrepareSpec) -> core_llm::Result<core_llm::Prep
         candle_audio_acestep::prepare::prepare(spec)
     } else if candle_audio_moss_tts_realtime::prepare::can_prepare(spec) {
         candle_audio_moss_tts_realtime::prepare::prepare(spec)
+    } else if candle_audio_chatterbox::prepare::can_prepare(spec) {
+        candle_audio_chatterbox::prepare::prepare(spec)
     } else if candle_audio_openvoice::prepare::can_prepare(spec) {
         candle_audio_openvoice::prepare::prepare(spec)
     } else if candle_audio_whisper::prepare::can_prepare(spec) {
@@ -251,7 +257,8 @@ mod tests {
                 "kokoro_82m",
                 "moss_sfx_v2",
                 "acestep_v15_turbo",
-                "moss_tts_realtime"
+                "moss_tts_realtime",
+                "chatterbox_tts"
             ]
         );
         // The voice-cloning identity embedder surfaces as its own kind (sc-12844), in catalog order.
@@ -380,7 +387,7 @@ mod tests {
                 entry.provider_id
             );
         }
-        // The eight currently-shipped audio providers, in catalog order, with their verified SPDX
+        // The nine currently-shipped audio providers, in catalog order, with their verified SPDX
         // ids — all permissive (MIT / Apache-2.0). This pins the surface so a change is deliberate.
         let ordered: Vec<(&str, &str, bool)> = super::weight_licenses()
             .iter()
@@ -393,6 +400,7 @@ mod tests {
                 ("moss_sfx_v2", "Apache-2.0", true),
                 ("acestep_v15_turbo", "MIT", true),
                 ("moss_tts_realtime", "Apache-2.0", true),
+                ("chatterbox_tts", "MIT", true),
                 ("chatterbox_ve", "MIT", true),
                 ("openvoice_v2", "MIT", true),
                 ("whisper_base", "Apache-2.0", true),
@@ -504,6 +512,16 @@ mod tests {
         let spec = super::core_llm::PrepareSpec::dense(&clap, clap.join("out"));
         assert!((regs[0].can_prepare)(&spec));
         let _ = std::fs::remove_dir_all(&clap);
+        // ...a Chatterbox clone-TTS snapshot dir is accepted too (sc-13239: t3 + s3gen + tokenizer)...
+        let cb = std::env::temp_dir().join("audio-catalog-chatterbox-probe");
+        let _ = std::fs::remove_dir_all(&cb);
+        std::fs::create_dir_all(&cb).unwrap();
+        std::fs::write(cb.join("t3_cfg.safetensors"), b"stub").unwrap();
+        std::fs::write(cb.join("s3gen.safetensors"), b"stub").unwrap();
+        std::fs::write(cb.join("tokenizer.json"), r#"{"model":{"type":"BPE"}}"#).unwrap();
+        let spec = super::core_llm::PrepareSpec::dense(&cb, cb.join("out"));
+        assert!((regs[0].can_prepare)(&spec));
+        let _ = std::fs::remove_dir_all(&cb);
         // ...while a bare dir (neither audio- nor LLM-shaped) is not.
         let empty = std::env::temp_dir().join("audio-catalog-empty-probe");
         let _ = std::fs::remove_dir_all(&empty);
