@@ -234,6 +234,7 @@ dependencies = [
  "candle-audio-chatterbox-ve",
  "candle-audio-clap",
  "candle-audio-kokoro",
+ "candle-audio-mmaudio",
  "candle-audio-moss-sfx",
  "candle-audio-moss-tts-realtime",
  "candle-audio-openvoice",
@@ -301,7 +302,10 @@ dependencies = [
  "candle-audio",
  "candle-nn",
  "image",
+ "rand 0.9.5",
+ "rand_distr",
  "regex",
+ "sceneworks-gen-core-testkit",
 ]
 
 [[package]]
