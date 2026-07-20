@@ -72,6 +72,31 @@ enum Inner<Text, Heavy> {
     Sequential(Box<SeqLoaders<Text, Heavy>>),
 }
 
+/// A heavy render bundle whose denoise-only component (the DiT) can be **shed** after the denoise
+/// phase, leaving a lighter decode bundle (the VAE + any decoder overlay) for a memory-bounded tiled
+/// decode (sc-13571, GitHub #1658). Under `Sequential`, freeing the multi-GB DiT *before* the VAE
+/// decode drops the decode-phase peak below the DiT+decode-transient sum on a small Mac (the z-image
+/// 1024² decode transient alone is ~14 GiB); under `Resident` nothing is shed (the whole bundle stays
+/// warm across jobs) and the same decode view is borrowed from it. Providers whose heavy bundle is a
+/// DiT + a light decode bundle implement this to opt into [`Residency::run_staged`].
+pub trait StagedHeavy {
+    /// The owned light (decode-only) bundle that survives the DiT drop — held by the `Sequential`
+    /// staged run between the shed and the decode.
+    type Light;
+    /// A borrowed decode view, produced from the owned [`Light`](Self::Light) (`Sequential`, post-shed)
+    /// or from the still-warm `&Self` (`Resident`), so the decode body is written once for both.
+    type DecodeView<'a>
+    where
+        Self: 'a,
+        Self::Light: 'a;
+    /// Consume the heavy bundle, dropping the DiT and returning the light bundle (`Sequential`).
+    fn shed_dit(self) -> Self::Light;
+    /// Borrow the decode view from the still-held heavy bundle (`Resident`).
+    fn decode_view(&self) -> Self::DecodeView<'_>;
+    /// Borrow the decode view from the owned light bundle (`Sequential`, after [`shed_dit`](Self::shed_dit)).
+    fn light_view(light: &Self::Light) -> Self::DecodeView<'_>;
+}
+
 /// The shared component-residency strategy for a provider (epic 10834; see the module docs).
 ///
 /// `Text` is the phase-A component dropped first under `Sequential` (a text or vision-language
@@ -235,6 +260,75 @@ impl<Text, Heavy> Residency<Text, Heavy> {
     }
 }
 
+impl<Text, Heavy: StagedHeavy> Residency<Text, Heavy> {
+    /// Like [`run`](Self::run), but frees the DiT-bearing heavy bundle **before** the decode phase
+    /// under `Sequential` (sc-13571, GitHub #1658) — bounding the decode-phase peak to the light (VAE)
+    /// bundle plus the tiled-decode transient, rather than that sum PLUS the still-resident DiT
+    /// (~3.2 GiB for z-image q4). The phases:
+    ///
+    /// 1. `encode` the prompt from the phase-A text component (freed after, under `Sequential`),
+    /// 2. `denoise` from `&Heavy` into intermediate latents `Mid`,
+    /// 3. under `Sequential` only: `materialize_mid` (force MLX to evaluate the latents while the DiT is
+    ///    still alive — MLX is lazy, so an un-evaluated `Mid` keeps the DiT referenced through the graph
+    ///    and the shed would free nothing), then [`shed_dit`](StagedHeavy::shed_dit) + `clear_cache()`,
+    /// 4. `decode` the latents through the light decode view.
+    ///
+    /// Under `Resident` nothing is shed (the bundle stays warm across jobs): step 3 is skipped and
+    /// `decode` runs against the still-held bundle's [`decode_view`](StagedHeavy::decode_view). The
+    /// `clear_cache()` discipline mirrors [`run`](Self::run): `Sequential` clears on every exit (via the
+    /// RAII guards, so a mid-render `?` early return still flushes), `Resident` never does.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_staged<E, Mid, Out>(
+        &self,
+        cancel: &CancelFlag,
+        use_pid: bool,
+        on_progress: &mut dyn FnMut(Progress),
+        encode: impl FnOnce(&Text) -> Result<E>,
+        materialize_enc: impl FnOnce(&E) -> Result<()>,
+        denoise: impl FnOnce(&Heavy, E, &mut dyn FnMut(Progress)) -> Result<Mid>,
+        materialize_mid: impl FnOnce(&Mid) -> Result<()>,
+        decode: impl FnOnce(Heavy::DecodeView<'_>, Mid, &mut dyn FnMut(Progress)) -> Result<Out>,
+    ) -> Result<Out> {
+        check_cancel(cancel)?;
+        match &self.inner {
+            Inner::Resident(pair) => {
+                let enc = encode(&pair.text)?;
+                check_cancel(cancel)?;
+                let mid = denoise(&pair.heavy, enc, on_progress)?;
+                decode(pair.heavy.decode_view(), mid, on_progress)
+            }
+            Inner::Sequential(loaders) => {
+                // ── Phase A: load the encoder, encode, materialize, then FREE it + clear_cache().
+                let enc = {
+                    let _text_cleanup = ClearCacheGuard;
+                    on_progress(Progress::Loading(LoadPhase::TextEncoder));
+                    let text = (loaders.load_text)()?;
+                    let enc = encode(&text)?;
+                    materialize_enc(&enc)?;
+                    enc
+                };
+                check_cancel(cancel)?;
+                // ── Phase B: load the heavy bundle, denoise, materialize the latents so the DiT is no
+                // longer referenced through the lazy graph, then SHED the DiT + clear_cache() so the
+                // decode peak excludes it.
+                on_progress(Progress::Loading(LoadPhase::Renderer));
+                let heavy = (loaders.load_heavy)(use_pid)?;
+                check_cancel(cancel)?;
+                let mid = denoise(&heavy, enc, on_progress)?;
+                materialize_mid(&mid)?;
+                // Guard declared BEFORE `light` so at scope end `light` (the VAE) drops FIRST, then the
+                // flush fires — the same guard-before-value ordering Phase A/B use.
+                let _light_cleanup = ClearCacheGuard;
+                let light = heavy.shed_dit(); // drops the DiT
+                note_clear_cache();
+                mlx_rs::memory::clear_cache(); // free the DiT's GPU buffers NOW, before the decode
+                                               // ── Phase C: decode from the light (VAE) bundle.
+                decode(Heavy::light_view(&light), mid, on_progress)
+            }
+        }
+    }
+}
+
 /// Map a tripped [`CancelFlag`] to the typed [`Error::Canceled`] (which bridges 1:1 to
 /// `gen_core::Error::Canceled`; never laundered through `Error::backend`).
 fn check_cancel(cancel: &CancelFlag) -> Result<()> {
@@ -337,6 +431,38 @@ mod tests {
         }
     }
 
+    /// The fake light (decode-only) bundle that survives the DiT drop — records its own drop so a test
+    /// can assert the decode runs against it (sc-13571).
+    struct FakeLight {
+        log: Log,
+    }
+    impl Drop for FakeLight {
+        fn drop(&mut self) {
+            record(&self.log, "drop_light");
+        }
+    }
+    /// A borrowed decode view over the shared log — produced from either the warm heavy (`Resident`) or
+    /// the shed light (`Sequential`), so the decode closure records identically for both.
+    struct FakeDecodeView<'a> {
+        log: &'a Log,
+    }
+    impl StagedHeavy for FakeHeavy {
+        type Light = FakeLight;
+        type DecodeView<'a> = FakeDecodeView<'a>;
+        fn shed_dit(self) -> FakeLight {
+            // `self` (the DiT-bearing heavy) drops here → records `drop_heavy_*`, the DiT freed.
+            FakeLight {
+                log: self.log.clone(),
+            }
+        }
+        fn decode_view(&self) -> FakeDecodeView<'_> {
+            FakeDecodeView { log: &self.log }
+        }
+        fn light_view(light: &FakeLight) -> FakeDecodeView<'_> {
+            FakeDecodeView { log: &light.log }
+        }
+    }
+
     fn clear_cache_calls() -> usize {
         CLEAR_CACHE_CALLS.with(|c| c.get())
     }
@@ -370,6 +496,107 @@ mod tests {
                 })
             },
         )
+    }
+
+    #[test]
+    fn run_staged_sequential_sheds_the_dit_before_the_decode() {
+        // sc-13571 / GitHub #1658: the DiT (heavy bundle) must be dropped + clear_cache'd AFTER denoise
+        // and BEFORE the decode, so the decode-phase peak excludes it.
+        let log: Log = new_log();
+        let res = seq_residency(&log);
+        reset_clear_cache_calls();
+        let l = log.clone();
+        res.run_staged(
+            &CancelFlag::new(),
+            false,
+            &mut ignore_progress,
+            |_text| {
+                record(&l, "encode");
+                Ok(())
+            },
+            |()| {
+                record(&l, "materialize_enc");
+                Ok(())
+            },
+            |_heavy, (), _op| {
+                record(&l, "denoise");
+                Ok(())
+            },
+            |()| {
+                record(&l, "materialize_mid");
+                Ok(())
+            },
+            |view: FakeDecodeView, (), _op| {
+                record(view.log, "decode");
+                Ok(())
+            },
+        )
+        .unwrap();
+        let ev = events(&log);
+        assert_eq!(
+            ev,
+            [
+                "load_text",
+                "encode",
+                "materialize_enc",
+                "drop_text",
+                "load_heavy_nopid",
+                "denoise",
+                "materialize_mid",
+                "drop_heavy_nopid", // the DiT is shed …
+                "decode",           // … BEFORE the decode runs
+                "drop_light",
+            ],
+            "staged Sequential order"
+        );
+        // clear_cache fires for the text drop, the DiT shed, and the light drop.
+        assert_eq!(clear_cache_calls(), 3);
+    }
+
+    #[test]
+    fn run_staged_resident_keeps_the_dit_warm_and_never_clears() {
+        // Under `Resident` nothing is shed (the bundle stays warm across jobs) and no materialize /
+        // clear_cache runs — the decode borrows the still-held bundle's `decode_view`.
+        let log: Log = new_log();
+        let res = Residency::resident(
+            FakeText { log: log.clone() },
+            FakeHeavy {
+                log: log.clone(),
+                with_pid: true,
+            },
+        );
+        reset_clear_cache_calls();
+        let l = log.clone();
+        res.run_staged(
+            &CancelFlag::new(),
+            false,
+            &mut ignore_progress,
+            |_text| {
+                record(&l, "encode");
+                Ok(())
+            },
+            |()| {
+                record(&l, "materialize_enc");
+                Ok(())
+            },
+            |_heavy, (), _op| {
+                record(&l, "denoise");
+                Ok(())
+            },
+            |()| {
+                record(&l, "materialize_mid");
+                Ok(())
+            },
+            |view: FakeDecodeView, (), _op| {
+                record(view.log, "decode");
+                Ok(())
+            },
+        )
+        .unwrap();
+        // No materialize, no shed, no drops during the run; the heavy is still held (drops only when
+        // `res` does, after this snapshot).
+        assert_eq!(events(&log), ["encode", "denoise", "decode"]);
+        assert_eq!(clear_cache_calls(), 0);
     }
 
     #[test]

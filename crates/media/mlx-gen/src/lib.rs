@@ -97,7 +97,7 @@ pub use registry::{
     CaptionerRegistration, ModelRegistration, PerComponentBytes, ProviderRegistry,
     ProviderRegistryBuilder, TrainerRegistration, TransformRegistration,
 };
-pub use residency::Residency;
+pub use residency::{Residency, StagedHeavy};
 pub use runtime::{
     AdapterKind, AdapterSpec, CancelFlag, IdentityWeights, LoadPhase, LoadSpec, MoeExpert,
     OffloadPolicy, PidWeights, Precision, Progress, Quant, WeightsSource,
