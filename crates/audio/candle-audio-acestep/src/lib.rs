@@ -57,20 +57,31 @@ pub mod prepare;
 pub mod qwen;
 pub mod scheduler;
 pub mod text;
+pub mod tokenizer;
 pub mod vae;
 
 pub use model::{
-    descriptor, load, resolve_pinned_snapshot, CHANNELS, HUB_REPO, HUB_REVISION, LANGUAGES,
-    MAX_DURATION_SECS, MODEL_ID, REGISTRATION, SAMPLE_RATE,
+    descriptor, load, resolve_cover_modules, resolve_pinned_snapshot, CHANNELS, HUB_REPO,
+    HUB_REVISION, LANGUAGES, MAX_DURATION_SECS, MODEL_ID, REGISTRATION, SAMPLE_RATE,
 };
-pub use pipeline::AceStepPipeline;
+pub use pipeline::{AceStepPipeline, CoverModules};
 
-pub use model::{WEIGHT_LICENSE, WEIGHT_LICENSE_ENTRY};
+pub use model::{
+    AUDIO_TOKENIZER_WEIGHT_LICENSE, AUDIO_TOKEN_DETOKENIZER_WEIGHT_LICENSE, SFT_HUB_REPO,
+    SFT_HUB_REVISION, WEIGHT_LICENSE, WEIGHT_LICENSE_ENTRY,
+};
 
-/// This crate's model-weight-license entries for catalog aggregation (sc-13332) — one row keyed by
-/// [`MODEL_ID`]. The audio catalog concatenates every provider's slice into the model-licenses
-/// manifest SceneWorks lists on its end-product licenses page.
-pub const WEIGHT_LICENSES: &[gen_core::WeightLicenseEntry] = &[model::WEIGHT_LICENSE_ENTRY];
+/// This crate's model-weight-license entries for catalog aggregation (sc-13332, extended sc-13251).
+/// The ACE-Step provider is assembled from multiple MIT checkpoints, so it contributes the composite
+/// (effective-restriction) row keyed by [`MODEL_ID`] PLUS one per-checkpoint attribution row for
+/// each cover-only sft FSQ module (`audio_tokenizer`, `audio_token_detokenizer`). The audio catalog
+/// concatenates every provider's slice into the model-licenses manifest SceneWorks lists on its
+/// end-product licenses page.
+pub const WEIGHT_LICENSES: &[gen_core::WeightLicenseEntry] = &[
+    model::WEIGHT_LICENSE_ENTRY,
+    model::WEIGHT_LICENSE_ENTRY_AUDIO_TOKENIZER,
+    model::WEIGHT_LICENSE_ENTRY_AUDIO_TOKEN_DETOKENIZER,
+];
 
 /// Add the ACE-Step generator to an explicit audio registry builder (catalog composition).
 pub fn register_providers(
