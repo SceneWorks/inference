@@ -17,15 +17,15 @@
 //!   SwiGLU feed-forwards with the SD3 `2/3`-then-round-to-256 hidden rule → 1280.) The sync stream
 //!   gets a per-frame `sync_pos_emb` added over its 8-frame segments, then is **nearest-exact
 //!   upsampled** 192→250 to the audio-latent frame rate.
-//! - **N₁ = 4 multimodal joint blocks** ([`JointBlock`]): latent+clip+text run their own pre-norm +
+//! - **N₁ = 4 multimodal joint blocks** (`JointBlock`): latent+clip+text run their own pre-norm +
 //!   adaLN + QKV, the three streams' Q/K/V are **concatenated along the token axis** and attended
 //!   **jointly** (SD3 MM-DiT), then split back and each stream's post-attention residual/FFN is
 //!   applied. The **last** joint block is `pre_only` for the non-audio streams: they still supply
 //!   keys/values into the joint attention but are then **dropped**.
-//! - **N₂ = 8 audio-only blocks** ([`SingleBlock`], `MMDitSingleBlock` in the reference): the latent
+//! - **N₂ = 8 audio-only blocks** (`SingleBlock`, `MMDitSingleBlock` in the reference): the latent
 //!   stream alone, self-attention + ConvMLP, frame-aligned adaLN.
 //! - **Threefold conditioning injection.** (1) **Global adaLN** from the Fourier-timestep embedding
-//!   ([`TimestepEmbedder`]) plus avg-pooled projected clip+text features drives the clip/text blocks
+//!   (`TimestepEmbedder`) plus avg-pooled projected clip+text features drives the clip/text blocks
 //!   and the final layer. (2) **Frame-aligned adaLN**: `extended_c = global_c + sync_f` is a
 //!   *token-level* `(B, 250, D)` modulation (broadcast global + per-frame sync) driving the latent
 //!   stream and every audio-only block. (3) **Aligned RoPE**: the latent stream uses RoPE built at
@@ -1174,7 +1174,14 @@ mod tests {
     fn weight_license_is_noncommercial_cc_by_nc() {
         assert!(WEIGHT_LICENSE.is_well_formed());
         assert_eq!(WEIGHT_LICENSE.spdx_id, "CC-BY-NC-4.0");
-        assert!(!WEIGHT_LICENSE.commercial_use);
+        // Non-commercial: read through the shared helper (and a runtime binding so this stays a
+        // runtime assertion, not a const-folded one).
+        assert!(
+            !WEIGHT_LICENSE.is_permissive(),
+            "CC-BY-NC is not permissive"
+        );
+        let commercial_use = WEIGHT_LICENSE.commercial_use;
+        assert!(!commercial_use, "CC-BY-NC-4.0 forbids commercial use");
         assert!(WEIGHT_LICENSE.restriction.is_some());
         assert_eq!(WEIGHT_LICENSE_ENTRY.provider_id, MODEL_ID);
     }
