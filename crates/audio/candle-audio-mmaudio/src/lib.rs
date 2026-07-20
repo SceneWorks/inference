@@ -81,12 +81,15 @@ pub use candle_audio::gen_core;
 pub use candle_audio::{AudioError, Result};
 
 pub mod agg;
+pub mod bigvgan;
 pub mod blocks;
 pub mod clip;
 pub mod config;
 pub mod model;
+pub mod output;
 pub mod preprocess;
 pub mod sync;
+pub mod vae;
 
 pub use clip::DfnClipEncoder;
 pub use model::{
@@ -95,8 +98,17 @@ pub use model::{
 };
 pub use sync::SynchformerVisualEncoder;
 
+pub use bigvgan::BigVganVocoder;
+pub use output::{AudioDecoder16k, BIGVGAN_MODEL_ID, VAE_MODEL_ID};
+pub use vae::MelVaeDecoder;
+
 /// This crate's model-weight-license entries for catalog aggregation (sc-13332) — one row per ported
-/// encoder (Synchformer visual `vfeat`, sc-13438; DFN5B-CLIP ViT-H/14, sc-13437). Surfaced now so
-/// the later shipping MMAudio generator can fold them into the audio-catalog model-licenses manifest.
-pub const WEIGHT_LICENSES: &[gen_core::WeightLicenseEntry] =
-    &[model::WEIGHT_LICENSE_ENTRY, clip::WEIGHT_LICENSE_ENTRY];
+/// component: the Synchformer visual encoder (sc-13438), the DFN5B-CLIP ViT-H/14 encoder (sc-13437),
+/// and the 16k output path's mel-VAE + BigVGAN (sc-13440). Surfaced now so the later shipping MMAudio
+/// generator can fold them into the audio-catalog model-licenses manifest.
+pub const WEIGHT_LICENSES: &[gen_core::WeightLicenseEntry] = &[
+    model::WEIGHT_LICENSE_ENTRY,
+    clip::WEIGHT_LICENSE_ENTRY,
+    output::VAE_WEIGHT_LICENSE_ENTRY,
+    output::BIGVGAN_WEIGHT_LICENSE_ENTRY,
+];
