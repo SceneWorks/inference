@@ -229,6 +229,25 @@ expected_files = [
 ]
 
 [[models]]
+# MOSS-TTSD-v0.5 AR brain (sc-13360): the smallest single-shard dialogue checkpoint (Qwen3 backbone,
+# 2048 hidden / 28 layers) emitting real 8-channel delay-pattern RVQ speech-codebook frames. Honest
+# partial — the AR brain is verified at the token level (candle-audio-moss-tts, unregistered); the
+# OpenMOSS XY_Tokenizer codec (RVQ -> 24 kHz waveform) is a split-off follow-up.
+key = "moss-ttsd-v05"
+repository = "OpenMOSS-Team/MOSS-TTSD-v0.5"
+revision = "8527b9136b6afefe2252ae597cecea2e80e7ebeb"
+license = "Apache-2.0"
+size_class = "large"
+profiles = ["audio-macos"]
+environment = ["MOSS_TTSD_SNAPSHOT"]
+expected_files = [
+    "config.json",
+    "model.safetensors",
+    "tokenizer.json",
+    "tokenizer_config.json",
+]
+
+[[models]]
 # MOSS-TTS-Realtime-1.7B AR brain (sc-13334): the Qwen3-1.7B backbone + CSM-style local/depth
 # transformer emitting real 16-codebook RVQ speech-token frames. Paired with the MOSS-Audio-Tokenizer
 # codec below (RVQ -> 24 kHz waveform); this snapshot is the AR stack (config.json +

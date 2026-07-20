@@ -1,0 +1,39 @@
+[package]
+name = "candle-audio-moss-tts"
+version = "0.0.0"
+edition = "2021"
+description = "MOSS-TTSD multi-speaker dialogue-TTS provider for the SceneWorks Candle audio lane (sc-13360) — an autoregressive Qwen3 backbone (MOSS-TTSD-v0.5, the smallest single-shard dialogue checkpoint) that emits 8-channel delay-pattern RVQ speech-codebook frames per position, ported natively onto the pinned candle revision. Honest partial: the AR brain emits real, in-range, deterministic delay-pattern RVQ tokens on real weights; the external OpenMOSS XY_Tokenizer codec (RVQ codes -> 24 kHz waveform) is a separate from-scratch port not yet landed, so generate() errors at the codec boundary rather than fabricate audio and the provider is NOT registered into the shipping catalog."
+license = "Apache-2.0"
+repository = "https://github.com/SceneWorks/inference"
+keywords = ["candle", "audio", "tts", "dialogue", "rvq"]
+categories = ["science"]
+
+[dependencies]
+# Shared candle audio commons (device seam, pinned-SHA hub resolution, WAV encode, AudioError
+# bridge). Re-exports `gen_core` and `candle_core`, so this crate resolves the SAME candle build +
+# gen-core rev as the catalog it will register into once the codec lands.
+candle-audio = { path = "../candle-audio" }
+# candle-nn at the workspace's pinned candle revision (Linear/RmsNorm/Embedding/VarBuilder — the
+# Qwen3 backbone is built from these primitives).
+candle-nn = { workspace = true }
+# Snapshot-preparer contract types for the audio-lane MOSS-TTSD-aware preparer probe.
+core-llm = { workspace = true }
+# The Qwen tokenizer (`tokenizer.json` in the pinned snapshot). Workspace pin — the 0.22 side of the
+# intentional tokenizers 0.21/0.22 split (check-workspace.py).
+tokenizers = { workspace = true }
+# Config parsing (config.json: the flat MOSS-TTSD config — Qwen3 backbone dims + channel/speech ids).
+serde = { version = "1", features = ["derive"] }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+# HF-cache snapshot resolution for the `#[ignore]`d real-weight conformance test.
+candle-audio = { path = "../candle-audio", features = ["testkit"] }
+# The backend-neutral audio-generator conformance suite (multi-speaker gate, seed determinism).
+sceneworks-gen-core-testkit = { workspace = true }
+
+[features]
+default = []
+# Apple Metal GPU backend — forwarded to the shared audio commons. Not in `default`.
+metal = ["candle-audio/metal"]
+# NVIDIA CUDA backend — forwarded to the shared audio commons. Not in `default`.
+cuda = ["candle-audio/cuda"]

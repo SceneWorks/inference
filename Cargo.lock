@@ -324,6 +324,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "candle-audio-moss-tts"
+version = "0.0.0"
+dependencies = [
+ "candle-audio",
+ "candle-nn",
+ "core-llm",
+ "sceneworks-gen-core-testkit",
+ "serde",
+ "serde_json",
+ "tokenizers 0.22.2",
+]
+
+[[package]]
 name = "candle-audio-moss-tts-realtime"
 version = "0.0.0"
 dependencies = [
