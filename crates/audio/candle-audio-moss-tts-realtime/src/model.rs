@@ -303,8 +303,10 @@ impl MossTtsRealtimeGenerator {
     /// of AR frames rather than after the whole track, so first-chunk latency is proportional to one
     /// block of AR frames, not the full synthesis time.
     ///
-    /// The AR itself is still full-sequence-recompute (no KV cache); that latency optimization is a
-    /// separate tracked follow-up and does not change the streaming interleaving here.
+    /// The AR backbone runs a KV cache (sc-13417): the prompt is prefilled once and each emitted
+    /// frame is a single-token step, so per-frame cost is O(1) amortized rather than O(seq). This is
+    /// a pure latency optimization — the cached hidden states are byte-identical to the old
+    /// full-recompute path, so the emitted frames and the streaming interleaving here are unchanged.
     fn synthesize(
         &self,
         req: &GenerationRequest,

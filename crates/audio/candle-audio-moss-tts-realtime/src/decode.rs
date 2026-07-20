@@ -109,29 +109,43 @@ impl Decoder {
         cancel: &dyn Fn() -> bool,
         on_frame: &mut dyn FnMut(usize, &[u32]) -> CandleResult<()>,
     ) -> CandleResult<Option<DecodeResult>> {
-        let mut frames = prompt_frames;
         let mut out: Vec<RvqFrame> = Vec::new();
         let mut stop = StopReason::Budget;
         let params = SamplingParams::default();
         let mut rng = Rng::seed(seed);
+        // KV-cache AR (sc-13417): prefill the prompt once, then feed each emitted frame back as a
+        // single-token step, so per-frame backbone cost is O(1) amortized instead of O(seq). The
+        // cache produces byte-identical hidden states to the old full-recompute path (proven in
+        // `backbone::tests::kv_cache_is_byte_identical_to_full_recompute`), so the sampled frames —
+        // and the reproducibility/streaming determinism gates — are unchanged.
+        let mut cache = self.backbone.new_cache();
+        let mut prefilled = false;
         for step in 0..max_frames {
             if cancel() {
                 return Ok(None);
             }
-            let hidden = self.backbone.forward_last(&frames)?;
+            // Advance the backbone by exactly the positions the recompute path would have: the whole
+            // prompt on the first iteration, then one fed-back frame per iteration thereafter.
+            let hidden = if !prefilled {
+                prefilled = true;
+                self.backbone.prefill(&prompt_frames, &mut cache)?
+            } else {
+                // The previous iteration's emitted frame, fed back with the text channel = text pad.
+                let prev = out.last().expect("a prior frame was emitted");
+                let fed = Frame {
+                    text: self.cfg.text_pad,
+                    audio: prev.clone(),
+                };
+                self.backbone.step(&fed, &mut cache)?
+            };
             let frame = self.local.decode_frame(&hidden, &out, &params, &mut rng)?;
             if frame.first().copied() == Some(AUDIO_EOS) {
                 stop = StopReason::Eos;
                 break;
             }
-            // Hand the just-emitted frame to the consumer (streaming codec decode) before feeding it
-            // back — so a block of frames can be decoded and streamed as the loop advances.
+            // Hand the just-emitted frame to the consumer (streaming codec decode) before the next
+            // iteration feeds it back — so a block of frames can be decoded and streamed as we advance.
             on_frame(step, &frame)?;
-            // Feed the frame back as the next position's audio channels; text channel = text pad.
-            frames.push(Frame {
-                text: self.cfg.text_pad,
-                audio: frame.clone(),
-            });
             out.push(frame);
         }
         Ok(Some(DecodeResult { frames: out, stop }))
