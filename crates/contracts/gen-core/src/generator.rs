@@ -740,8 +740,9 @@ pub enum Conditioning {
     Reference { image: Image, strength: Option<f32> },
     /// A reference **audio** clip — voice cloning / style reference for audio models
     /// (sc-12834; the audio analogue of [`Conditioning::Reference`]). `strength` mirrors the
-    /// per-reference img2img strength: `None` ⇒ the model default. Video→audio conditioning
-    /// later reuses [`Conditioning::VideoClip`] — this variant is audio-in only.
+    /// per-reference img2img strength: `None` ⇒ the model default. Video→audio (Foley)
+    /// conditioning uses the dedicated [`Conditioning::VideoSync`] variant (sc-13436), not this
+    /// one — this variant is audio-in only.
     ReferenceAudio {
         audio: AudioTrack,
         strength: Option<f32>,
@@ -837,6 +838,32 @@ pub enum Conditioning {
         /// so it is carried for the worker contract / WanVACE parity rather than changing the mask math.
         mode: ReplacementMode,
     },
+    /// A **video clip whose RGB frames drive a video→audio (Foley) generator** (sc-13436) — the
+    /// visual condition an MMAudio-style model reads to synthesize a synchronized soundtrack for a
+    /// silent clip.
+    ///
+    /// This is a **distinct variant**, deliberately *not* an overload of the two existing video
+    /// mechanisms, exactly as [`Conditioning::AudioEdit`] is kept distinct from
+    /// [`Conditioning::ReferenceAudio`]:
+    ///
+    /// - It is **not** [`Conditioning::VideoClip`]. That variant is the LTX in-context *latent-append*
+    ///   path — the clip is VAE-encoded and appended as extra denoise tokens at a specific `frame_idx`
+    ///   with a `strength` denoise mask (extend_clip / video_bridge). `VideoSync` carries no
+    ///   `frame_idx` and no `strength`: the frames are not spliced into a video latent, they are the
+    ///   whole-clip visual condition an audio decoder attends to. Reusing `VideoClip` would force a
+    ///   Foley model to invent a meaningless frame index and pin it against the video denoise contract.
+    /// - It is **not** [`Conditioning::ControlClip`]. That is the masked replace_person edit (`frames`
+    ///   **+** a per-frame binary `mask` + `masking_strength` + `start_frame`), a fundamentally
+    ///   different shape carrying a mask this variant has no notion of.
+    ///
+    /// The clip is just its ordered RGB `frames`. The frame **rate** is *not* carried here — it rides
+    /// the existing request-level [`GenerationRequest::fps`], exactly as the LTX
+    /// (`mlx-gen-ltx`) and Wan-VACE (`candle-gen-wan`) video paths already read `req.fps`; duplicating
+    /// it on the variant would create a second source of truth the two could disagree on. A model opts
+    /// in by advertising [`ConditioningKind::VideoSync`] in
+    /// [`Capabilities::conditioning`]; the shared floor rejects the variant on a non-advertising model
+    /// as the typed [`Error::Unsupported`] (F-008) and an empty `frames` as [`Error::Msg`].
+    VideoSync { frames: Vec<Image> },
 }
 
 impl Conditioning {
@@ -856,6 +883,7 @@ impl Conditioning {
             Conditioning::Keyframe { .. } => ConditioningKind::Keyframe,
             Conditioning::VideoClip { .. } => ConditioningKind::VideoClip,
             Conditioning::ControlClip { .. } => ConditioningKind::ControlClip,
+            Conditioning::VideoSync { .. } => ConditioningKind::VideoSync,
         }
     }
 }
@@ -902,6 +930,8 @@ pub enum ConditioningKind {
     VideoClip,
     /// replace_person ([`Conditioning::ControlClip`]).
     ControlClip,
+    /// video→audio (Foley) sync ([`Conditioning::VideoSync`]).
+    VideoSync,
 }
 
 /// What kind of media a model emits.
@@ -1370,6 +1400,22 @@ impl Capabilities {
                             )));
                         }
                     }
+                }
+            }
+        }
+        // Video→audio (Foley) sync conditioning (sc-13436): once the `VideoSync` kind is admitted by
+        // the allowlist above (the un-admitted case is already the typed `Error::Unsupported`, F-008),
+        // the clip must actually carry frames — an empty `frames` leaves the audio decoder nothing to
+        // condition on, a malformed request → `Error::Msg`. The frame rate rides `req.fps`, so there
+        // is nothing further to gate on the variant here; per-model frame-count / resolution bounds are
+        // layered by the provider's own `validate`.
+        for c in &req.conditioning {
+            if let Conditioning::VideoSync { frames } = c {
+                if frames.is_empty() {
+                    return Err(Error::Msg(format!(
+                        "{id}: VideoSync conditioning carries no frames — a video→audio clip must \
+                         have at least one frame"
+                    )));
                 }
             }
         }
@@ -2449,5 +2495,83 @@ mod tests {
                 ),
             )
             .is_ok());
+    }
+
+    // ---- Video→audio (Foley) sync conditioning (sc-13436) ----------------------------------
+
+    /// A video→audio (Foley) capability surface: a `Modality::Audio` model that admits the
+    /// `VideoSync` kind and advertises a duration cap. No visual size bounds (audio floor).
+    fn foley_caps() -> Capabilities {
+        Capabilities {
+            conditioning: vec![ConditioningKind::VideoSync],
+            max_audio_duration_secs: Some(30.0),
+            max_count: 1,
+            ..Default::default()
+        }
+    }
+
+    /// A video→audio request: a silent clip's frames plus a prompt, size left at the unused 0x0 and
+    /// the frame rate on `fps` (never on the variant).
+    fn foley_req(frame_count: usize) -> GenerationRequest {
+        GenerationRequest {
+            prompt: "footsteps on gravel".into(),
+            width: 0,
+            height: 0,
+            fps: Some(24),
+            conditioning: vec![Conditioning::VideoSync {
+                frames: (0..frame_count).map(|_| img(8, 8)).collect(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn video_sync_maps_to_its_own_kind() {
+        // The variant is distinct from the LTX clip kinds — its discriminant is VideoSync, not
+        // VideoClip / ControlClip.
+        let req = foley_req(3);
+        assert_eq!(req.conditioning[0].kind(), ConditioningKind::VideoSync);
+        // It is not collected by the LTX in-context clip / control accessors (a Foley clip is not an
+        // extend_clip / replace_person input).
+        assert!(req.video_clips().is_empty());
+        assert!(req.control_clip().is_none());
+        assert!(req.keyframes().is_empty());
+    }
+
+    #[test]
+    fn video_sync_accepted_when_advertised() {
+        let c = foley_caps();
+        assert!(c.validate_request_audio("foley", &foley_req(4)).is_ok());
+    }
+
+    #[test]
+    fn video_sync_unsupported_on_a_non_advertising_model() {
+        // F-008: a model whose `conditioning` does not list `VideoSync` rejects it as the typed
+        // Error::Unsupported (a capability gap), not a stringified Msg.
+        let c = Capabilities {
+            conditioning: vec![ConditioningKind::ReferenceAudio],
+            max_count: 1,
+            ..Default::default()
+        };
+        let err = c.validate_request_audio("tts", &foley_req(2)).unwrap_err();
+        assert!(
+            matches!(err, Error::Unsupported(_)),
+            "un-advertised VideoSync → typed Unsupported, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn video_sync_empty_frames_is_a_msg_range_error() {
+        // An empty clip is a malformed request (nothing to condition on) → Error::Msg, even on a model
+        // that admits the kind.
+        let c = foley_caps();
+        let err = c
+            .validate_request_audio("foley", &foley_req(0))
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Msg(_)),
+            "empty VideoSync frames → Msg, got {err:?}"
+        );
+        assert!(err.to_string().contains("carries no frames"));
     }
 }

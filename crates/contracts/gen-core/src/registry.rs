@@ -552,10 +552,12 @@ fn check_name_list(errs: &mut Vec<String>, ctx: &str, list_name: &str, names: &[
 /// - `samplers` / `schedulers` / `supported_guidance_methods` entries are non-empty, whitespace-free
 ///   and duplicate-free (name *shape* only — resolvability is per-engine: several families advertise
 ///   native sampler names alongside the gen-core curated set),
-/// - `conditioning` is duplicate-free, and the video-clip kinds
+/// - `conditioning` is duplicate-free, and the video-frame kinds
 ///   ([`Keyframe`](ConditioningKind::Keyframe) / [`VideoClip`](ConditioningKind::VideoClip) /
-///   [`ControlClip`](ConditioningKind::ControlClip)) are only advertised by `Video`/`Both`-modality
-///   models — an `Image` model cannot consume a clip.
+///   [`ControlClip`](ConditioningKind::ControlClip) / [`VideoSync`](ConditioningKind::VideoSync)) are
+///   not advertised by `Image`-modality models — an `Image` model cannot consume video frames (the LTX
+///   clip kinds ride `Video`/`Both`; the `VideoSync` Foley condition rides a `Modality::Audio`
+///   video→audio model, sc-13436).
 ///
 /// Returns one message per violation (empty = conformant). Public so a provider's own tests can
 /// target a single descriptor; [`ProviderRegistry::descriptor_conformance_errors`] sweeps a catalog.
@@ -610,6 +612,7 @@ pub fn model_descriptor_errors(d: &ModelDescriptor) -> Vec<String> {
             ConditioningKind::Keyframe
                 | ConditioningKind::VideoClip
                 | ConditioningKind::ControlClip
+                | ConditioningKind::VideoSync
         );
         if is_video_kind && d.modality == Modality::Image {
             errs.push(format!(
