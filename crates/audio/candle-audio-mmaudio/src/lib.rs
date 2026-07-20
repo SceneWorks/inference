@@ -3,11 +3,13 @@
 //! Shared **MMAudio** video→audio provider crate for the SceneWorks Candle audio lane
 //! (epic sc-12833, `docs/architecture/audio-backend-strategy.md`). This slice (**sc-13438**)
 //! establishes the crate and ports MMAudio's **Synchformer synchronization encoder** — the
-//! frame-aligned visual conditioner — natively onto the workspace's pinned candle revision. Later
-//! MMAudio slices add the CLIP feature extractor, the flow-matching DiT, the VAE/vocoder, and the
-//! generator that registers into `candle-audio-catalog`. Nothing is registered here (a
-//! model-internal encoder), mirroring how `candle-audio-moss-tts-realtime` stayed unregistered
-//! until its codec landed.
+//! frame-aligned visual conditioner — natively onto the workspace's pinned candle revision.
+//! **sc-13437** adds the [`clip`] module: MMAudio's semantic conditioner, the **DFN5B-CLIP
+//! ViT-H/14-384** open_clip encoder (visual → 1024-d per-frame features; 77-token text tower →
+//! per-token last-hidden-state), parity-verified against `open_clip`. Later MMAudio slices add the
+//! flow-matching DiT, the VAE/vocoder, and the generator that registers into
+//! `candle-audio-catalog`. Nothing is registered here (model-internal encoders), mirroring how
+//! `candle-audio-moss-tts-realtime` stayed unregistered until its codec landed.
 //!
 //! ## What Synchformer is, and what MMAudio actually uses
 //!
@@ -80,18 +82,21 @@ pub use candle_audio::{AudioError, Result};
 
 pub mod agg;
 pub mod blocks;
+pub mod clip;
 pub mod config;
 pub mod model;
 pub mod preprocess;
 pub mod sync;
 
+pub use clip::DfnClipEncoder;
 pub use model::{
     load, load_from_pth, resolve_pinned_weights, HUB_REPO, HUB_REVISION, MODEL_ID, WEIGHTS_PATH,
     WEIGHT_LICENSE, WEIGHT_LICENSE_ENTRY,
 };
 pub use sync::SynchformerVisualEncoder;
 
-/// This crate's model-weight-license entries for catalog aggregation (sc-13332) — one row keyed by
-/// [`MODEL_ID`]. Surfaced now so the later shipping MMAudio generator can fold it into the
-/// audio-catalog model-licenses manifest.
-pub const WEIGHT_LICENSES: &[gen_core::WeightLicenseEntry] = &[model::WEIGHT_LICENSE_ENTRY];
+/// This crate's model-weight-license entries for catalog aggregation (sc-13332) — one row per ported
+/// encoder (Synchformer visual `vfeat`, sc-13438; DFN5B-CLIP ViT-H/14, sc-13437). Surfaced now so
+/// the later shipping MMAudio generator can fold them into the audio-catalog model-licenses manifest.
+pub const WEIGHT_LICENSES: &[gen_core::WeightLicenseEntry] =
+    &[model::WEIGHT_LICENSE_ENTRY, clip::WEIGHT_LICENSE_ENTRY];

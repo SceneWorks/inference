@@ -279,3 +279,21 @@ size_class = "large"
 profiles = ["audio-macos"]
 environment = ["SYNCHFORMER_SNAPSHOT"]
 expected_files = ["ext_weights/synchformer_state_dict.pth"]
+
+[[models]]
+# DFN5B-CLIP ViT-H/14-384 (sc-13437, epic sc-12833): the CLIP model MMAudio conditions on — Apple's
+# open_clip ViT-H/14 quickgelu DFN5B variant, ported natively in candle-audio-mmaudio::clip. Visual
+# tower -> 1024-d per-frame features (encode_image, normalize=True); 77-token text tower ->
+# per-token (77,1024) last-hidden-state (MMAudio's patched encode_text). ~3.9 GB open_clip pickle.
+# Weights are Apple Machine Learning Research Model License (research / non-commercial only). Gated
+# by the crate's `--test clip_conformance` real-weight tests (1024-d shape, finite, unit-norm,
+# deterministic, discriminative) + an open_clip numerical-parity test (cos>0.999). Parity validated
+# locally at cos=1.000000 (image) / 1.000000 (text) — see PR sc-13437.
+key = "dfn5b-clip-vit-h14-384"
+repository = "apple/DFN5B-CLIP-ViT-H-14-384"
+revision = "01b771ed0d1395ca5ffdd279897d665ebe00dfd2"
+license = "Apple Machine Learning Research Model License"
+size_class = "very-large"
+profiles = ["audio-macos"]
+environment = ["DFN_CLIP_SNAPSHOT"]
+expected_files = ["open_clip_pytorch_model.bin"]
