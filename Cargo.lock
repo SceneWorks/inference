@@ -301,6 +301,7 @@ dependencies = [
  "candle-audio",
  "candle-nn",
  "image",
+ "regex",
 ]
 
 [[package]]

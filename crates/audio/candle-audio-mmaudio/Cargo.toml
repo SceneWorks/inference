@@ -19,6 +19,12 @@ candle-nn = { workspace = true }
 # RGB frame preprocessing (shorter-edge resize -> 224 + center crop) faithful to Synchformer's own
 # torchvision transform. Same version the media lane pins.
 image = { workspace = true }
+# Unicode-property regex for the CLIP `SimpleTokenizer` pre-tokenization pattern (`\p{L}+`, `\p{N}`,
+# `[^\s\p{L}\p{N}]+`). open_clip's tokenizer uses the Python `regex` module for these general-category
+# classes; the Rust `regex` crate matches its `\p{L}`/`\p{N}`/`\s` semantics and leftmost-first
+# alternation exactly, so the string->BPE tokenizer reproduces open_clip byte-for-byte. Same use and
+# pin as `mlx-gen-sdxl`'s CLIP tokenizer.
+regex = "1"
 
 [dev-dependencies]
 # HF-cache snapshot resolution for the `#[ignore]`d real-weight conformance test.

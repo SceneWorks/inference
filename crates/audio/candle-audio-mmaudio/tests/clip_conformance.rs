@@ -29,6 +29,54 @@ use candle_audio_mmaudio::candle_audio::candle_core::{Device, Tensor};
 use candle_audio_mmaudio::clip;
 use image::{Rgb, RgbImage};
 
+/// Byte-match reference for [`clip::tokenize_str`] against
+/// `open_clip.get_tokenizer('ViT-H-14-378-quickgelu')`. Each line is `<hex(prompt utf-8)>\t<77
+/// space-separated ids>`, produced by the sc-13473 fixture generator (see the PR). This gate needs
+/// **no weights** and runs by default — the definitive faithfulness check for the string→BPE path.
+const TOKENIZER_REFERENCE: &str = include_str!("fixtures/clip_tokenizer_reference.txt");
+
+fn hex_decode(s: &str) -> Vec<u8> {
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex byte"))
+        .collect()
+}
+
+#[test]
+fn tokenize_str_byte_matches_open_clip_reference() {
+    let mut checked = 0usize;
+    for (lineno, line) in TOKENIZER_REFERENCE.lines().enumerate() {
+        if line.is_empty() {
+            continue;
+        }
+        let (hexp, ids_str) = line.split_once('\t').expect("record is <hex>\\t<ids>");
+        let prompt = String::from_utf8(hex_decode(hexp)).expect("prompt utf-8");
+        let expected: Vec<u32> = ids_str
+            .split_whitespace()
+            .map(|t| t.parse().expect("id"))
+            .collect();
+        assert_eq!(
+            expected.len(),
+            clip::CONTEXT_LENGTH,
+            "record {lineno} width"
+        );
+
+        let got = clip::tokenize_str(&prompt);
+        assert_eq!(
+            got.as_slice(),
+            expected.as_slice(),
+            "record {lineno}: tokenize_str diverges from open_clip for prompt {prompt:?}\n \
+             got:      {got:?}\n expected: {expected:?}",
+        );
+        checked += 1;
+    }
+    assert!(
+        checked >= 12,
+        "expected the full prompt set, checked {checked}"
+    );
+    eprintln!("tokenize_str byte-match: {checked} prompts identical to open_clip");
+}
+
 fn load_encoder() -> clip::DfnClipEncoder {
     let dev = Device::Cpu;
     if let Ok(p) = std::env::var("DFN_CLIP_SNAPSHOT") {
@@ -156,6 +204,33 @@ fn dfn_clip_text_shape_finite_deterministic() {
     let cos = cosine(&v[d..2 * d], &v[per_prompt + d..per_prompt + 2 * d]);
     eprintln!("dfn-clip text: shape=(2,77,1024) cos(prompt0_t1,prompt1_t1)={cos:.4}");
     assert!(cos < 0.9999, "different prompts must differ");
+}
+
+#[test]
+#[ignore = "downloads ~3.9GB open_clip_pytorch_model.bin; run explicitly with --ignored"]
+fn tokenize_str_to_encode_text_end_to_end() {
+    // The production call path the MMAudio assembly uses: raw prompt string -> tokenize_str -> the
+    // (B, 77) id tensor -> encode_text -> (B, 77, 1024) per-token features. `tokenize_str` byte-match
+    // (offline gate) plus the sc-13437 encode_text parity gate together prove this equals open_clip;
+    // this test exercises the wiring end to end on real weights.
+    let enc = load_encoder();
+    let rows = vec![
+        clip::tokenize_str("a dog barking loudly").to_vec(),
+        clip::tokenize_str("ocean waves crashing on rocks").to_vec(),
+    ];
+    let ids = clip::tokenize(&rows, enc.device()).expect("tokenize");
+    let feats = enc.encode_text(&ids).expect("encode_text");
+    assert_eq!(
+        feats.dims(),
+        &[2, clip::CONTEXT_LENGTH, clip::EMBED_DIM],
+        "(B, 77, 1024)"
+    );
+    let v: Vec<f32> = feats.flatten_all().unwrap().to_vec1().unwrap();
+    assert!(v.iter().all(|x| x.is_finite()), "all finite");
+    let d = clip::EMBED_DIM;
+    let s: f32 = v[0..d].iter().map(|x| x * x).sum();
+    assert!((s.sqrt() - 1.0).abs() < 1e-3, "per-token unit-norm");
+    eprintln!("tokenize_str -> encode_text end-to-end: shape=(2,77,1024) ok");
 }
 
 #[test]
