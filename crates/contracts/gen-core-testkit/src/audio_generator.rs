@@ -26,8 +26,8 @@
 //! guarantees that are identical across modalities.
 
 use gen_core::{
-    AudioChunk, AudioParams, AudioTrack, Conditioning, Error, GenerationOutput, GenerationRequest,
-    Generator, Image, Modality,
+    AudioChunk, AudioParams, AudioTrack, Conditioning, ConditioningKind, Error, GenerationOutput,
+    GenerationRequest, Generator, Image, Modality,
 };
 
 /// Cheap-request parameters for an audio conformance run — the audio analog of
@@ -631,6 +631,154 @@ pub fn check_audio_multi_speaker(g: &dyn Generator, profile: &AudioProfile) -> R
     Ok(())
 }
 
+/// The video→audio (Foley) clip the [`check_video_to_audio`] gate conditions on: a short run of small
+/// RGB frames with distinct per-frame, non-uniform content (a gradient seeded by `variant`), so a
+/// conformant model's soundtrack genuinely depends on the pixels. Kept tiny — the check probes the
+/// *contract* (a synchronized track is produced, reproducibly, and actually reads the frames), not
+/// synchronization fidelity (a real MMAudio-style provider proves that in its own real-weights
+/// conformance).
+const VIDEO_SYNC_FRAMES: usize = 8;
+const VIDEO_SYNC_FPS: u32 = 8;
+
+fn foley_clip(variant: u8) -> Vec<Image> {
+    const W: u32 = 16;
+    const H: u32 = 16;
+    (0..VIDEO_SYNC_FRAMES)
+        .map(|f| {
+            let mut pixels = vec![0u8; (W * H * 3) as usize];
+            for (i, p) in pixels.iter_mut().enumerate() {
+                // Vary by pixel position, frame index, and the clip variant so frames are distinct
+                // and non-uniform, and two variants differ in every pixel neighborhood.
+                *p = ((i as u32 + f as u32 * 37 + variant as u32 * 101) % 251) as u8;
+            }
+            Image {
+                width: W,
+                height: H,
+                pixels,
+            }
+        })
+        .collect()
+}
+
+/// The in-capability video→audio request: the profile's prompt + seed, a nominal (ignored) size, the
+/// frame rate on [`GenerationRequest::fps`] (never on the variant), and the clip as a single
+/// [`Conditioning::VideoSync`].
+fn foley_request(
+    g: &dyn Generator,
+    profile: &AudioProfile,
+    frames: Vec<Image>,
+) -> GenerationRequest {
+    let mut r = audio_base_request(g, profile);
+    r.fps = Some(VIDEO_SYNC_FPS);
+    r.conditioning = vec![Conditioning::VideoSync { frames }];
+    r
+}
+
+/// **Video→audio (Foley) contract (sc-13436).** A [`Generator`] that advertises
+/// [`ConditioningKind::VideoSync`] in its
+/// [`Capabilities::conditioning`](gen_core::Capabilities::conditioning) must *accept and render* a
+/// silent clip's frames ([`Conditioning::VideoSync`]) into **one**
+/// well-formed [`GenerationOutput::Audio`] track that is:
+///
+/// - **non-empty and non-silent** — at least one audible sample; a provider that ignores the frames
+///   and emits silence (or an empty track) fails here (the headline dishonest-provider gate);
+/// - **plausibly the clip's length** — the track duration sits within a generous band of
+///   `frames / fps` (the frame rate rides [`GenerationRequest::fps`], the story's fps-from-req.fps
+///   decision), tolerating codec-frame padding while catching a wildly-wrong or empty length;
+/// - **byte-identical on re-synth with the same clip + seed** — the reproducibility law, the
+///   video→audio twin of [`check_audio_seed_determinism`]; and
+/// - **frame-dependent** — a *visually different* clip (same seed) must change the audio, so a
+///   provider that advertises `VideoSync` yet ignores the pixels and renders seed-only audio is
+///   caught (the visual-condition analog of "a different seed changes the output").
+///
+/// A provider that does **not** advertise `VideoSync` must reject a Foley clip as the typed
+/// [`Error::Unsupported`] (F-008) — it can never silently drop the frames and emit unconditioned
+/// audio. Runs for every audio provider (the non-advertising branch proves the additive variant does
+/// not perturb the existing single-modality families), so it is a member of [`audio_conformance`].
+pub fn check_video_to_audio(g: &dyn Generator, profile: &AudioProfile) -> Result<(), String> {
+    let desc = g.descriptor();
+    let id = desc.id;
+    let advertises = desc.capabilities.accepts(ConditioningKind::VideoSync);
+
+    let frames = foley_clip(0);
+    let expected_secs = frames.len() as f32 / VIDEO_SYNC_FPS as f32;
+    let req = foley_request(g, profile, frames);
+
+    if !advertises {
+        // A model that does not advertise VideoSync must reject a Foley clip as the typed
+        // Unsupported — never silently emit unconditioned audio.
+        return expect_unsupported(g, &req, id, "a VideoSync (video→audio) clip");
+    }
+
+    // Positive: validate accepts, and generate renders one well-formed audio track.
+    g.validate(&req).map_err(|e| {
+        format!(
+            "video-to-audio[{id}]: advertises VideoSync but validate() rejected a valid Foley clip: \
+             {e}"
+        )
+    })?;
+    let out = g
+        .generate(&req, &mut |_| {})
+        .map_err(|e| format!("video-to-audio[{id}]: generate() failed on a VideoSync clip: {e}"))?;
+    let track = match &out {
+        GenerationOutput::Audio(t) => t,
+        other => {
+            return Err(format!(
+                "video-to-audio[{id}]: a VideoSync clip must render GenerationOutput::Audio, got {}",
+                variant_name(other)
+            ));
+        }
+    };
+    validate_track(id, "video-to-audio", track)?;
+
+    // Non-silent: at least one sample above a tiny epsilon. An all-zero (or empty) track means the
+    // model produced no soundtrack for the clip — the primary dishonest-provider catch.
+    if !track.samples.iter().any(|s| s.abs() > 1e-6) {
+        return Err(format!(
+            "video-to-audio[{id}]: the rendered track is silent (all samples ~0) — a video→audio \
+             model must synthesize an audible soundtrack for the clip, not silence"
+        ));
+    }
+
+    // Plausible duration: within a generous band of the clip length (frames / fps). Catches an
+    // empty or grossly-wrong-length track while tolerating codec-frame padding on real models.
+    let secs =
+        track.samples.len() as f32 / track.channels.max(1) as f32 / track.sample_rate.max(1) as f32;
+    if !(secs.is_finite() && secs >= expected_secs * 0.25 && secs <= expected_secs * 4.0) {
+        return Err(format!(
+            "video-to-audio[{id}]: rendered track is {secs:.3}s but the {VIDEO_SYNC_FRAMES}-frame \
+             clip at {VIDEO_SYNC_FPS} fps is ~{expected_secs:.3}s — the soundtrack length is \
+             implausible for the clip"
+        ));
+    }
+
+    // Reproducibility law: the same clip + seed re-synthesizes byte-identical PCM.
+    let out2 = g
+        .generate(&req, &mut |_| {})
+        .map_err(|e| format!("video-to-audio[{id}]: second generate() failed: {e}"))?;
+    if crate::output_bytes(&out) != crate::output_bytes(&out2) {
+        return Err(format!(
+            "video-to-audio[{id}]: the same clip + seed produced different audio on re-synth — the \
+             reproducibility law is violated"
+        ));
+    }
+
+    // Frame-dependence: a visually different clip (same seed) must change the output — the assertion
+    // that catches a provider advertising VideoSync while ignoring the frames (seed-only audio).
+    let other_req = foley_request(g, profile, foley_clip(128));
+    let other = g.generate(&other_req, &mut |_| {}).map_err(|e| {
+        format!("video-to-audio[{id}]: generate() on a second (different) clip failed: {e}")
+    })?;
+    if crate::output_bytes(&other) == crate::output_bytes(&out) {
+        return Err(format!(
+            "video-to-audio[{id}]: two visually-different clips (same seed) produced byte-identical \
+             audio — the provider appears to ignore the VideoSync frames"
+        ));
+    }
+
+    Ok(())
+}
+
 /// Run the full audio-generator conformance suite against a freshly-`make`d generator. Panics with
 /// every failure aggregated — the audio twin of [`conformance`](crate::conformance).
 pub fn audio_conformance(make: impl Fn() -> Box<dyn Generator>, profile: &AudioProfile) {
@@ -638,7 +786,7 @@ pub fn audio_conformance(make: impl Fn() -> Box<dyn Generator>, profile: &AudioP
     let g: &dyn Generator = g.as_ref();
 
     type Check = fn(&dyn Generator, &AudioProfile) -> Result<(), String>;
-    let checks: [Check; 9] = [
+    let checks: [Check; 10] = [
         check_audio_validate_honesty,
         check_audio_output,
         check_audio_progress,
@@ -648,6 +796,7 @@ pub fn audio_conformance(make: impl Fn() -> Box<dyn Generator>, profile: &AudioP
         check_audio_seed_determinism,
         check_audio_streaming,
         check_audio_multi_speaker,
+        check_video_to_audio,
     ];
     let failures: Vec<String> = checks
         .into_iter()

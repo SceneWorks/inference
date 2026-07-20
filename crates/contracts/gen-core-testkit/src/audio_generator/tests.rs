@@ -6,8 +6,8 @@ use super::*;
 use gen_core::registry::ModelRegistration;
 use gen_core::runtime::LoadSpec;
 use gen_core::{
-    AudioChunk, AudioTrack, Capabilities, Error, GenerationOutput, GenerationRequest, Generator,
-    Image, Modality, ModelDescriptor, Progress,
+    AudioChunk, AudioTrack, Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput,
+    GenerationRequest, Generator, Image, Modality, ModelDescriptor, Progress,
 };
 use std::cell::Cell;
 
@@ -651,4 +651,172 @@ fn conformance_panics_on_a_dishonest_multi_speaker_stub() {
         },
         &cheap(),
     );
+}
+
+// --- Video→audio (Foley) sync contract (sc-13436) --------------------------------------------
+
+const VIDEO_SYNC_ID: &str = "testkit_audio_video_sync_stub";
+
+/// A **video→audio (Foley) stub** (sc-13436): a `Modality::Audio` generator that advertises the
+/// `VideoSync` conditioning kind and renders a non-silent track whose fill derives from the clip's
+/// frame pixels + the seed, with a length matching the clip (`frames / fps`). The knobs drive the
+/// broken-stub self-tests: `silent` emits an all-zero track (ignores the frames, emits silence) and
+/// `ignore_frames` renders from the seed alone (advertises VideoSync but never reads the pixels).
+struct VideoSyncStubAudioGen {
+    desc: ModelDescriptor,
+    silent: bool,
+    ignore_frames: bool,
+    runs: Cell<u32>,
+}
+
+fn video_sync_stub_desc() -> ModelDescriptor {
+    let mut desc = stub_desc(VIDEO_SYNC_ID);
+    // A Foley model opts in by advertising VideoSync (in addition to any audio surface it carries).
+    desc.capabilities.conditioning = vec![ConditioningKind::VideoSync];
+    desc
+}
+
+impl VideoSyncStubAudioGen {
+    fn new(silent: bool, ignore_frames: bool) -> Self {
+        Self {
+            desc: video_sync_stub_desc(),
+            silent,
+            ignore_frames,
+            runs: Cell::new(0),
+        }
+    }
+    fn boxed(silent: bool, ignore_frames: bool) -> Box<dyn Generator> {
+        Box::new(Self::new(silent, ignore_frames))
+    }
+
+    /// The deterministic soundtrack: `frames / fps` seconds at 24 kHz mono, DC-filled from a value
+    /// derived from the seed and (unless `ignore_frames`) the clip's pixels.
+    fn track(&self, req: &GenerationRequest) -> AudioTrack {
+        let n_frames = req
+            .conditioning
+            .iter()
+            .find_map(|c| match c {
+                Conditioning::VideoSync { frames } => Some(frames.len()),
+                _ => None,
+            })
+            .unwrap_or(0);
+        let fps = req.fps.unwrap_or(8).max(1);
+        let sample_rate = 24_000u32;
+        let n_samples =
+            (((n_frames as f32 / fps as f32) * sample_rate as f32).round() as usize).max(1);
+
+        let fill = if self.silent {
+            0.0
+        } else {
+            let mut acc = req.seed.unwrap_or(0);
+            if !self.ignore_frames {
+                for c in &req.conditioning {
+                    if let Conditioning::VideoSync { frames } = c {
+                        for f in frames {
+                            for &p in &f.pixels {
+                                acc = acc.wrapping_mul(31).wrapping_add(p as u64);
+                            }
+                        }
+                    }
+                }
+            }
+            // A distinct, non-zero, finite DC level.
+            (acc % 1_000_003) as f32 * 1e-3 + 1.0
+        };
+
+        AudioTrack {
+            samples: vec![fill; n_samples],
+            sample_rate,
+            channels: 1,
+            ..Default::default()
+        }
+    }
+}
+
+impl Generator for VideoSyncStubAudioGen {
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.desc
+    }
+
+    fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
+        self.desc
+            .capabilities
+            .validate_request_audio(self.desc.id, req)
+    }
+
+    fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationOutput> {
+        self.validate(req)?;
+        self.runs.set(self.runs.get() + 1);
+        let total = req.steps.unwrap_or(2);
+        for i in 1..=total {
+            if req.cancel.is_cancelled() {
+                return Err(Error::Canceled);
+            }
+            on_progress(Progress::Step { current: i, total });
+        }
+        on_progress(Progress::Decoding);
+        Ok(GenerationOutput::Audio(self.track(req)))
+    }
+}
+
+#[test]
+fn non_video_sync_stub_rejects_a_clip_as_unsupported() {
+    // A model that does not advertise VideoSync (the default audio stub) must reject a Foley clip as
+    // the typed Unsupported — it can never silently ignore the frames and emit unconditioned audio.
+    let g = StubAudioGen::new(STUB_ID, Behavior::good());
+    assert!(!g
+        .descriptor()
+        .capabilities
+        .accepts(ConditioningKind::VideoSync));
+    check_video_to_audio(&g, &cheap()).unwrap();
+}
+
+#[test]
+fn video_sync_stub_passes_video_to_audio_check() {
+    // The honest Foley stub: advertises VideoSync and renders a non-silent, clip-length,
+    // reproducible, frame-dependent soundtrack.
+    let g = VideoSyncStubAudioGen::new(false, false);
+    assert!(g
+        .descriptor()
+        .capabilities
+        .accepts(ConditioningKind::VideoSync));
+    check_video_to_audio(&g, &cheap()).unwrap();
+}
+
+#[test]
+fn video_sync_stub_passes_full_conformance() {
+    // A Foley generator must also be a well-behaved one-shot audio generator (progress, cancel,
+    // determinism, output well-formedness) — the whole suite, including the video→audio check.
+    audio_conformance(|| VideoSyncStubAudioGen::boxed(false, false), &cheap());
+}
+
+#[test]
+fn silent_video_sync_stub_fails_the_check() {
+    // The headline dishonest stub: advertises VideoSync but renders silence (ignores the frames).
+    let g = VideoSyncStubAudioGen::new(true, false);
+    let err = check_video_to_audio(&g, &cheap()).unwrap_err();
+    assert!(err.contains("is silent"), "got: {err}");
+}
+
+#[test]
+fn frame_ignoring_video_sync_stub_fails_the_check() {
+    // A subtler dishonest stub: non-silent and reproducible, but its audio derives from the seed
+    // alone — two different clips render byte-identical audio. The frame-dependence assertion catches
+    // it.
+    let g = VideoSyncStubAudioGen::new(false, true);
+    let err = check_video_to_audio(&g, &cheap()).unwrap_err();
+    assert!(
+        err.contains("appears to ignore the VideoSync frames"),
+        "got: {err}"
+    );
+}
+
+#[test]
+#[should_panic(expected = "audio conformance FAILED")]
+fn conformance_panics_on_a_silent_video_sync_stub() {
+    audio_conformance(|| VideoSyncStubAudioGen::boxed(true, false), &cheap());
 }
