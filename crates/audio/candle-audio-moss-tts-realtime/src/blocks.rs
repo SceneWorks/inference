@@ -3,10 +3,19 @@
 //! Both the MOSS-TTS-Realtime backbone (`config.json.language_config`) and the local/depth
 //! transformer (`config.json.local_config`) are Qwen3 decoder stacks with identical block math —
 //! GQA with per-head q/k RMSNorm, half-split (NeoX) RoPE at `rope_theta`, and a SiLU gated MLP.
-//! This module factors that block out so the two stacks share one verified implementation. The
-//! forward here is a **stateless full-sequence** attention (no KV cache): the AR decode recomputes
-//! the growing prefix each frame (see [`crate::decode`]). This is correct and simple; a KV-cache
-//! optimization is tracked as a follow-up (it does not change the emitted tokens, only latency).
+//! This module factors that block out so the two stacks share one verified implementation.
+//!
+//! Two attention forms share the same weights and math:
+//! - [`Layer::forward`] — the **stateless full-sequence** attention: every position is recomputed
+//!   from scratch. The local/depth transformer ([`crate::local`]) uses this (its depth axis is
+//!   short and re-embedded each frame).
+//! - [`Layer::forward_cached`] — the **KV-cache** attention (sc-13417): keys/values for prior
+//!   positions are read from a per-layer [`LayerKv`] slot and only the new position(s) are computed,
+//!   turning the backbone AR step from O(seq) to O(1) amortized. Prefill runs the whole prompt with
+//!   a causal mask (empty cache); each subsequent single-token step appends one position and attends
+//!   maskless over the cache. This is a **pure latency optimization**: the cached path is
+//!   byte-identical to the stateless recompute (same projections/norms/RoPE per position, same
+//!   per-`(query, key)` dot products), proven by [`crate::backbone`]'s parity test.
 
 use candle_audio::candle_core::{DType, Device, Result as CandleResult, Tensor};
 use candle_nn::{linear_b, rms_norm, Linear, Module, RmsNorm, VarBuilder};
@@ -120,6 +129,110 @@ impl Attention {
         ))?;
         self.o_proj.forward(&out)
     }
+
+    /// KV-cache attention: identical math to [`Attention::forward`], but the keys/values of the
+    /// positions preceding `x` are read from `slot` instead of being recomputed. `x` is this step's
+    /// row(s) `[b, l, hidden]`; the trailing `new_positions` of them are genuinely new sequence
+    /// positions to append to the cache (prefill: `new_positions == l`, `mask` = causal; step:
+    /// `new_positions == 1`, `mask` = `None`). `cos`/`sin` must be the RoPE tables for **`x`'s
+    /// absolute positions**, so a step at position `p` is roped exactly as position `p` in the full
+    /// sequence.
+    ///
+    /// **The M=1 gemv trap (sc-13417).** Candle's CPU matmul takes a distinct gemv path when the
+    /// left operand has a single row (`M == 1`) whose accumulation order — and therefore rounding —
+    /// differs from the M ≥ 2 gemm path by ~1e-7; the recompute reference always runs the whole
+    /// sequence (`M == prompt_len ≥ 2`). To stay **byte-identical** rather than merely close, a
+    /// single-token step is driven with `l == 2` **duplicate** rows (see [`Backbone::run_cached`]):
+    /// every matmul then takes the gemm path, which is bit-for-bit invariant to the row count, so the
+    /// real (last) row equals the recompute's last row exactly. Only the last `new_positions` row is
+    /// appended to the cache; the duplicate scratch row is dropped (matmul/softmax rows are
+    /// independent, so it never perturbs the real row). With those inputs matched, `q·kᵀ`, softmax
+    /// and `att·v` are per-`(query, key)` reductions whose ordering is independent of the row count.
+    ///
+    /// [`Backbone::run_cached`]: crate::backbone::Backbone
+    fn forward_cached(
+        &self,
+        x: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        mask: Option<&Tensor>,
+        slot: &mut LayerKv,
+        new_positions: usize,
+    ) -> CandleResult<Tensor> {
+        let (b, l, _) = x.dims3()?;
+        let q = self
+            .q_proj
+            .forward(x)?
+            .reshape((b, l, self.num_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let k = self
+            .k_proj
+            .forward(x)?
+            .reshape((b, l, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let v = self
+            .v_proj
+            .forward(x)?
+            .reshape((b, l, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?;
+
+        // Per-head q/k RMSNorm then half-split RoPE at x's absolute positions — the HF Qwen3 order.
+        let q = self.q_norm.forward(&q.contiguous()?)?;
+        let k = self.k_norm.forward(&k.contiguous()?)?;
+        let q = candle_nn::rotary_emb::rope(&q.contiguous()?, cos, sin)?;
+        let k = candle_nn::rotary_emb::rope(&k.contiguous()?, cos, sin)?;
+
+        // Append only the trailing `new_positions` (already-RoPE'd) keys + raw values to the cache —
+        // for a duplicated single-token step that is the last row; the leading scratch row(s) are not
+        // real positions. Then attend over the full grown sequence. `k`/`v` here are the
+        // pre-GQA-expansion [b, kv_heads, seq, head_dim] tensors.
+        let k_new = k.narrow(2, l - new_positions, new_positions)?;
+        let v_new = v.narrow(2, l - new_positions, new_positions)?;
+        let (k, v) = slot.append(&k_new, &v_new)?;
+
+        // GQA: expand kv heads to the query-head count.
+        let groups = self.num_heads / self.num_kv_heads;
+        let k = repeat_kv(&k, groups)?;
+        let v = repeat_kv(&v, groups)?;
+
+        let scale = 1.0 / (self.head_dim as f64).sqrt();
+        let mut att = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
+        if let Some(m) = mask {
+            att = att.broadcast_add(m)?;
+        }
+        let att = candle_nn::ops::softmax_last_dim(&att)?;
+        let out = att.matmul(&v.contiguous()?)?.transpose(1, 2)?.reshape((
+            b,
+            l,
+            self.num_heads * self.head_dim,
+        ))?;
+        self.o_proj.forward(&out)
+    }
+}
+
+/// One decoder layer's KV-cache slot: the already-RoPE'd keys and raw values for every position seen
+/// so far, laid out `[batch, kv_heads, seq, head_dim]` (the sequence axis grows each step). Empty
+/// until the first append. Mirrors `candle-llm`'s `ContiguousKvCache` idiom —
+/// keys stored post-RoPE, values raw, growing-concat along the sequence axis.
+#[derive(Debug, Clone, Default)]
+pub struct LayerKv {
+    kv: Option<(Tensor, Tensor)>,
+}
+
+impl LayerKv {
+    /// Append `keys`/`values` (each `[batch, kv_heads, step, head_dim]`) to this layer's cache and
+    /// return the full cached `(keys, values)` to attend over, with the sequence axis grown.
+    fn append(&mut self, keys: &Tensor, values: &Tensor) -> CandleResult<(Tensor, Tensor)> {
+        let merged = match self.kv.take() {
+            Some((pk, pv)) => (
+                Tensor::cat(&[&pk, keys], 2)?,
+                Tensor::cat(&[&pv, values], 2)?,
+            ),
+            None => (keys.clone(), values.clone()),
+        };
+        self.kv = Some((merged.0.clone(), merged.1.clone()));
+        Ok(merged)
+    }
 }
 
 fn repeat_kv(x: &Tensor, groups: usize) -> CandleResult<Tensor> {
@@ -208,6 +321,34 @@ impl Layer {
             .forward(&self.post_attention_layernorm.forward(&x)?)?;
         x + h
     }
+
+    /// KV-cache decoder layer: same pre-norm attention + pre-norm MLP residual math as
+    /// [`Layer::forward`], but the attention reads prior keys/values from `slot` (the cache-bearing
+    /// attention) instead of recomputing the prefix. Byte-identical to [`Layer::forward`] over the
+    /// same positions.
+    pub fn forward_cached(
+        &self,
+        x: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        mask: Option<&Tensor>,
+        slot: &mut LayerKv,
+        new_positions: usize,
+    ) -> CandleResult<Tensor> {
+        let h = self.attn.forward_cached(
+            &self.input_layernorm.forward(x)?,
+            cos,
+            sin,
+            mask,
+            slot,
+            new_positions,
+        )?;
+        let x = (x + h)?;
+        let h = self
+            .mlp
+            .forward(&self.post_attention_layernorm.forward(&x)?)?;
+        x + h
+    }
 }
 
 /// Half-split (NeoX) cos/sin tables for positions `0..len` at `rope_theta` — `[len, head_dim/2]`,
@@ -218,10 +359,27 @@ pub fn rope_tables(
     head_dim: usize,
     rope_theta: f64,
 ) -> CandleResult<(Tensor, Tensor)> {
+    rope_tables_at(device, 0, len, head_dim, rope_theta)
+}
+
+/// Half-split (NeoX) cos/sin tables for the absolute positions `start..start+len` at `rope_theta` —
+/// `[len, head_dim/2]`. The KV-cache decode ([`Layer::forward_cached`]) uses this to RoPE a
+/// single-token step at its true absolute position (`start = cache offset`, `len = 1`) so the cached
+/// path is byte-identical to roping that same position inside the full sequence
+/// ([`rope_tables`] is exactly `rope_tables_at(.., 0, ..)`). The per-position angle
+/// `pos * theta^(-2i/head_dim)` depends only on `pos`, so a row generated alone matches its row in
+/// the full table bit-for-bit.
+pub fn rope_tables_at(
+    device: &Device,
+    start: usize,
+    len: usize,
+    head_dim: usize,
+    rope_theta: f64,
+) -> CandleResult<(Tensor, Tensor)> {
     let half = head_dim / 2;
     let mut cos = Vec::with_capacity(len * half);
     let mut sin = Vec::with_capacity(len * half);
-    for pos in 0..len {
+    for pos in start..start + len {
         for i in 0..half {
             let inv = 1.0 / rope_theta.powf(2.0 * i as f64 / head_dim as f64);
             let angle = pos as f64 * inv;
