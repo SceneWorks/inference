@@ -140,6 +140,11 @@ jobs:
           # responsively, and fills T3's reference conditioning prompt (previously orphaned — sc-13394).
           cargo test --locked -p candle-audio-chatterbox --test conformance s3tokenizer_encodes_a_reference_at_25hz -- --ignored --nocapture
           cargo test --locked -p candle-audio-chatterbox --test conformance chatterbox_reference_audio_fills_the_t3_prompt_tokens -- --ignored --nocapture
+          # s3tokenizer long-audio (>30s) sliding-window segmentation + merge_tokenized_segments
+          # (sc-13380): 30 s windows hopped by 26 s (4 s overlap), each tokenized independently and
+          # stitched so the overlap is counted once — a real >30 s clip tokenizes at 25 Hz across the
+          # seams and matches single-pass tokens over the non-boundary interior (continuity).
+          cargo test --locked -p candle-audio-chatterbox --test conformance s3tokenizer_windows_audio_longer_than_30s -- --ignored --nocapture
           # CAMPPlus speaker encoder (sc-13236): the D-TDNN x-vector network derives DISCRIMINATIVE
           # 192-d / 80-d flow speaker embeddings on real speaker_encoder.* weights (previously
           # orphaned — sc-13394).
