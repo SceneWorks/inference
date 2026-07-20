@@ -295,6 +295,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "candle-audio-mmaudio"
+version = "0.0.0"
+dependencies = [
+ "candle-audio",
+ "candle-nn",
+ "image",
+]
+
+[[package]]
 name = "candle-audio-moss-sfx"
 version = "0.0.0"
 dependencies = [

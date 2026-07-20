@@ -8,6 +8,7 @@ members = [
     "crates/audio/candle-audio-chatterbox-ve",
     "crates/audio/candle-audio-clap",
     "crates/audio/candle-audio-kokoro",
+    "crates/audio/candle-audio-mmaudio",
     "crates/audio/candle-audio-moss-sfx",
     "crates/audio/candle-audio-moss-tts-realtime",
     "crates/audio/candle-audio-openvoice",

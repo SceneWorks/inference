@@ -264,3 +264,18 @@ expected_files = [
     "model-00001-of-00002.safetensors",
     "model-00002-of-00002.safetensors",
 ]
+
+[[models]]
+# Synchformer visual encoder (sc-13438, epic sc-12833): MMAudio's frame-aligned video->audio
+# conditioning encoder (the MotionFormer divided space-time ViT `vfeat_extractor`, ported natively
+# in candle-audio-mmaudio::sync). ~907 MB single-file pickle; the MIT-licensed Synchformer weights
+# are distributed via MMAudio's HF model repo under ext_weights/. Gated by the crate's
+# `--test conformance` real-weight test (768-d shape, finite, deterministic, frame-varying).
+key = "synchformer"
+repository = "hkchengrex/MMAudio"
+revision = "eb13a1a98fdbec91753775c57b074ccdfc60587c"
+license = "MIT"
+size_class = "large"
+profiles = ["audio-macos"]
+environment = ["SYNCHFORMER_SNAPSHOT"]
+expected_files = ["ext_weights/synchformer_state_dict.pth"]

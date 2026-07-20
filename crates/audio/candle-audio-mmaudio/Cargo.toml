@@ -1,0 +1,32 @@
+[package]
+name = "candle-audio-mmaudio"
+version = "0.0.0"
+edition = "2021"
+description = "MMAudio video->audio conditioning encoders for the SceneWorks Candle audio lane (epic sc-12833). This slice (sc-13438) establishes the shared MMAudio provider crate and ports the Synchformer synchronization encoder natively onto the pinned candle revision: RGB video frames (224 center-crop) -> 768-d segment-level sync features MMAudio uses for frame-aligned conditioning. Model-internal encoder: UNREGISTERED (no shipping generator this slice; later MMAudio slices add the feature-extractor / flow-matching DiT / VAE and the generator that registers into candle-audio-catalog)."
+license = "Apache-2.0"
+repository = "https://github.com/SceneWorks/inference"
+keywords = ["candle", "audio", "video-to-audio", "synchformer", "mmaudio"]
+categories = ["science"]
+
+[dependencies]
+# Shared candle audio commons (device seam, pinned-SHA hub resolution, AudioError bridge). Re-exports
+# `gen_core` and `candle_core`, so this crate resolves the SAME candle build + gen-core rev as the
+# catalog it will register into once the full MMAudio generator lands.
+candle-audio = { path = "../candle-audio" }
+# candle-nn at the workspace's pinned candle revision (Linear/LayerNorm/Conv/VarBuilder — the
+# Synchformer visual feature extractor + sync transformer are built from these primitives).
+candle-nn = { workspace = true }
+# RGB frame preprocessing (shorter-edge resize -> 224 + center crop) faithful to Synchformer's own
+# torchvision transform. Same version the media lane pins.
+image = { workspace = true }
+
+[dev-dependencies]
+# HF-cache snapshot resolution for the `#[ignore]`d real-weight conformance test.
+candle-audio = { path = "../candle-audio", features = ["testkit"] }
+
+[features]
+default = []
+# Apple Metal GPU backend — forwarded to the shared audio commons. Not in `default`.
+metal = ["candle-audio/metal"]
+# NVIDIA CUDA backend — forwarded to the shared audio commons. Not in `default`.
+cuda = ["candle-audio/cuda"]
