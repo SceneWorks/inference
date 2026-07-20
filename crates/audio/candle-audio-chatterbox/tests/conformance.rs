@@ -793,21 +793,15 @@ fn hift_vocodes_a_real_mel_to_nonsilent_waveform() {
 // PerTh implicit watermarker (sc-13240): the provenance watermark Chatterbox always applies.
 // ---------------------------------------------------------------------------------------------
 
-/// Resolve the converted PerTh weights. `PERTH_SNAPSHOT` may be the `perth_implicit.safetensors`
-/// file or a dir holding it. There is no hub pin yet — the perth weights ship only inside the MIT
-/// `resemble-perth` package; convert them with `scripts/audio/convert_perth_watermarker.py` and
-/// point `PERTH_SNAPSHOT` at the result.
+/// Resolve the converted PerTh weights the same way the provider does (sc-13443): a `PERTH_SNAPSHOT`
+/// override first (the offline/CI escape hatch — a `perth_implicit.safetensors` file or a dir holding
+/// it), else the pinned-SHA hub fetch from `SceneWorks/perth-implicit`. With no `PERTH_SNAPSHOT` set
+/// this exercises the real hub resolution path.
 fn perth_weights() -> PathBuf {
-    let raw = std::env::var("PERTH_SNAPSHOT").expect(
-        "set PERTH_SNAPSHOT to perth_implicit.safetensors (or a dir holding it); \
-         convert perth_net_250000.pth.tar with scripts/audio/convert_perth_watermarker.py",
-    );
-    let p = PathBuf::from(raw);
-    if p.is_dir() {
-        p.join(cb::PERTH_WEIGHTS_FILE)
-    } else {
-        p
-    }
+    cb::resolve_perth_weights().expect(
+        "resolve the PerTh weights — set PERTH_SNAPSHOT to override, else fetch from \
+         SceneWorks/perth-implicit needs network access",
+    )
 }
 
 /// A deterministic, speech-like signal at `sample_rate`: a wandering pitch with a dozen harmonics
@@ -841,7 +835,7 @@ fn perth_test_signal(sample_rate: u32, secs: f32) -> Vec<f32> {
 /// collapses the detection separation and fails here. This is the watermarker in isolation; wiring it
 /// into the clone Generator's `generate()` output is sc-13239.
 #[test]
-#[ignore = "real weights: needs PERTH_SNAPSHOT (converted perth_implicit.safetensors); run with --ignored"]
+#[ignore = "real weights: resolves perth_implicit.safetensors from SceneWorks/perth-implicit (or PERTH_SNAPSHOT); run with --ignored"]
 fn perth_watermark_roundtrips_and_is_imperceptible() {
     let wm = cb::PerthWatermarker::from_safetensors(&perth_weights())
         .expect("load the converted PerTh weights");
@@ -938,9 +932,10 @@ fn reference_request(prompt: &str, reference: AudioTrack, seed: u64) -> Generati
 /// the always-applied PerTh provenance watermark.
 ///
 /// Needs the FULL `CHATTERBOX_SNAPSHOT` (`s3gen.safetensors`), a Kokoro snapshot (reference/control
-/// voices), the ve embedder, and `PERTH_SNAPSHOT` (converted `perth_implicit.safetensors`).
+/// voices), and the ve embedder; the PerTh watermarker weights resolve from `SceneWorks/perth-implicit`
+/// (or a `PERTH_SNAPSHOT` override).
 #[test]
-#[ignore = "real weights: needs the full chatterbox snapshot (s3gen.safetensors) + Kokoro + ve + PERTH_SNAPSHOT; run with --ignored"]
+#[ignore = "real weights: needs the full chatterbox snapshot (s3gen.safetensors) + Kokoro + ve (PerTh resolves from SceneWorks/perth-implicit, or PERTH_SNAPSHOT); run with --ignored"]
 fn chatterbox_clones_a_reference_voice_end_to_end() {
     use candle_audio_chatterbox::campplus::cosine_similarity;
 
@@ -1031,8 +1026,10 @@ fn chatterbox_clones_a_reference_voice_end_to_end() {
         "voice similarity: cos(out, reference af_heart) = {cos_ref:.4}; \
          cos(out, control am_michael) = {cos_ctrl:.4}; margin = {margin:.4}"
     );
+    // Floor hardened 0.02 → 0.15 (sc-13443): comfortably below the observed +0.318 margin, well
+    // above a voice-agnostic ≈0, so it catches partial-regression drift without going flaky.
     assert!(
-        margin > 0.02,
+        margin > 0.15,
         "clone is not voice-similar to the reference: cos_ref {cos_ref:.4} vs cos_ctrl \
          {cos_ctrl:.4} (margin {margin:.4}) — the clone IGNORED the reference voice"
     );
