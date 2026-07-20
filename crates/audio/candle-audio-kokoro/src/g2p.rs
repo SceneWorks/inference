@@ -10,9 +10,20 @@
 //!   (`fˈɑːks → fˈɑks`, `ˌo‍ʊvɚɹ → ˌOvəɹ`);
 //! - GB: length marks are kept (`GB_VOCAB` has `ː`); flap/glottal (`ɾ`, `ʔ`) become `t`.
 //!
-//! Punctuation: misaki-rs maps punctuation tokens to a bare space; Kokoro's vocab carries
-//! punctuation as prosody-bearing tokens (a `.` is a pause), so this wrapper re-assembles the
-//! phoneme string from the token stream and restores single-char punctuation the model knows.
+//! Punctuation: misaki-rs blanks punctuation tokens (it emits `Some(" ")` for `.,;:` but
+//! `Some("")` for `—`); Kokoro's vocab carries punctuation as prosody-bearing tokens (a `.`
+//! is a pause, `—` id 9 a longer one), so this wrapper re-assembles the phoneme string from
+//! the token stream and restores any single-char punctuation whose phoneme came back blank —
+//! matching *both* blank forms, or the em-dash pause is silently dropped.
+//!
+//! Dashes: an intra-word compound hyphen (`text-to-speech`, `well-known`) should read as one
+//! seamless phrase, while a standalone/interruption dash (`wait -- what`) is a pause. ASCII
+//! `-` and en-dash `–` are absent from Kokoro's vocab, so a raw hyphen only ever degrades to
+//! a token boundary; `normalize_dashes` promotes the *punctuation* dashes to `—` (a real
+//! pause) and leaves compound hyphens to flow. Finally runs of whitespace collapse to a
+//! single space: the vocab's space (id 16) is itself a pause token, so a hyphen that degrades
+//! to a bare space would otherwise stack dead air (`text-to-speech` → three spaces around
+//! `to`).
 //!
 //! ## Out-of-vocabulary tier (sc-13038)
 //!
@@ -103,32 +114,37 @@ impl KokoroG2p {
 
     /// Phonemize `text` into Kokoro's phoneme alphabet.
     pub fn phonemize(&self, text: &str) -> Result<String> {
+        let normalized = normalize_dashes(text);
         let (_, tokens) = self
             .engine
-            .g2p(text)
+            .g2p(&normalized)
             .map_err(|e| AudioError::Msg(format!("kokoro g2p: {e}")))?;
-        // Re-assemble from tokens (reference KPipeline join), restoring punctuation misaki-rs
-        // flattened to spaces and upgrading any letter-spelled OOV word to its cmudict form.
+        // Re-assemble from tokens (reference KPipeline join): upgrade any letter-spelled OOV
+        // word to its cmudict form, and restore the punctuation misaki-rs blanks out. misaki
+        // returns `Some(" ")` for `.,;:` but `Some("")` for `—`, so treat *any* blank phoneme
+        // on a single punctuation char as "restore it" — matching only `Some(" ")` would
+        // silently drop the em-dash pause token.
         let mut joined = String::new();
         for tk in &tokens {
+            let is_blank_punct = tk.text.chars().count() == 1
+                && tk.text.chars().all(|c| KOKORO_PUNCT.contains(c))
+                && tk.phonemes.as_deref().is_none_or(|p| p.trim().is_empty());
             let ps = if let Some(oov) = self.cmudict_override(tk) {
                 oov
+            } else if is_blank_punct {
+                tk.text.clone()
             } else {
-                match tk.phonemes.as_deref() {
-                    Some(" ") | None
-                        if tk.text.chars().count() == 1
-                            && tk.text.chars().all(|c| KOKORO_PUNCT.contains(c)) =>
-                    {
-                        tk.text.clone()
-                    }
-                    Some(ps) => ps.to_string(),
-                    None => String::new(),
-                }
+                tk.phonemes.clone().unwrap_or_default()
             };
             joined.push_str(&ps);
             joined.push_str(&tk.whitespace);
         }
-        Ok(post_process(joined.trim(), self.variant))
+        // Collapse whitespace runs so token boundaries are single spaces (see module docs:
+        // each extra space is a pause token — dead air).
+        Ok(post_process(
+            &collapse_whitespace(joined.trim()),
+            self.variant,
+        ))
     }
 
     /// The CMU-dict OOV tier for one token: `Some(raw misaki IPA)` when `tk` is a word misaki
@@ -242,6 +258,36 @@ fn push_symbol(sym: &Symbol, out: &mut String) {
     out.push_str(ipa);
 }
 
+/// Promote dashes used as *punctuation* to the em-dash Kokoro carries as a pause token
+/// (id 9), while leaving intra-word compound hyphens (`text-to-speech`, `well-known`) alone
+/// so they read as one seamless phrase. ASCII `-` and en-dash `–` are outside the vocab, so a
+/// dash only becomes an audible pause once mapped to `—`; an untouched compound hyphen
+/// instead degrades to a plain token boundary and flows.
+fn normalize_dashes(text: &str) -> String {
+    let mut s = text.replace('\u{2013}', "\u{2014}"); // en-dash → em-dash
+    s = s.replace("--", "\u{2014}"); // ASCII double-hyphen → em-dash
+    s = s.replace(" - ", " \u{2014} "); // spaced interruption dash → em-dash
+    s
+}
+
+/// Collapse runs of whitespace to a single space (reference single-space token join).
+fn collapse_whitespace(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_space = false;
+    for c in s.chars() {
+        if c.is_whitespace() {
+            if !prev_space {
+                out.push(' ');
+            }
+            prev_space = true;
+        } else {
+            out.push(c);
+            prev_space = false;
+        }
+    }
+    out
+}
+
 /// Map raw misaki-rs IPA onto the US/GB alphabets Kokoro was trained with (module docs).
 fn post_process(phonemes: &str, variant: EnglishVariant) -> String {
     const ZWJ: char = '\u{200d}';
@@ -345,6 +391,55 @@ mod tests {
         // Whatever the fallback produced, it is a non-panicking string; unknown chars are
         // dropped later at id mapping.
         assert!(!ps.is_empty());
+    }
+
+    #[test]
+    fn normalize_dashes_promotes_only_punctuation_dashes() {
+        // Intra-word compound hyphen is left for misaki to split into a seamless boundary.
+        assert_eq!(normalize_dashes("text-to-speech"), "text-to-speech");
+        assert_eq!(normalize_dashes("well-known"), "well-known");
+        // Standalone / doubled / en-dash forms become the em-dash pause token.
+        assert_eq!(normalize_dashes("wait -- what"), "wait \u{2014} what");
+        assert_eq!(normalize_dashes("5 - 10"), "5 \u{2014} 10");
+        assert_eq!(normalize_dashes("a\u{2013}b"), "a\u{2014}b");
+    }
+
+    #[test]
+    fn collapse_whitespace_squashes_runs() {
+        assert_eq!(collapse_whitespace("a   b  c"), "a b c");
+        assert_eq!(collapse_whitespace("a\tb\nc"), "a b c");
+        assert_eq!(collapse_whitespace("solo"), "solo");
+    }
+
+    #[test]
+    fn compound_hyphen_reads_seamlessly_like_spaces() {
+        // The reported artifact: `text-to-speech` used to stack three spaces (dead air) around
+        // `to`. It must now phonemize identically to the plain-spaced phrase, with no pause
+        // token and no doubled space.
+        let g2p = KokoroG2p::new(EnglishVariant::American);
+        let hyphen = g2p.phonemize("text-to-speech").unwrap();
+        let spaced = g2p.phonemize("text to speech").unwrap();
+        assert_eq!(hyphen, spaced, "hyphen and spaced forms must match");
+        assert!(!hyphen.contains('\u{2014}'), "no em-dash pause: {hyphen:?}");
+        assert!(!hyphen.contains("  "), "no doubled space: {hyphen:?}");
+    }
+
+    #[test]
+    fn interruption_and_typed_em_dashes_become_pause_tokens() {
+        let g2p = KokoroG2p::new(EnglishVariant::American);
+        // A doubled ASCII dash used as an interruption becomes the `—` pause token.
+        assert!(
+            g2p.phonemize("wait -- what").unwrap().contains('\u{2014}'),
+            "double-hyphen must map to em-dash pause"
+        );
+        // A literal em-dash was previously dropped by the `Some(\" \")`-only guard; it must
+        // now survive as the pause token.
+        assert!(
+            g2p.phonemize("stop \u{2014} now")
+                .unwrap()
+                .contains('\u{2014}'),
+            "typed em-dash must be restored, not dropped"
+        );
     }
 
     // ------------------------------------------------------------------------------------------
