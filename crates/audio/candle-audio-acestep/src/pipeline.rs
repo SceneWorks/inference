@@ -10,8 +10,9 @@
 //! backend (the gen-core seed law). Cross-framework noise parity with torch's Philox is not a goal.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
-use candle_audio::candle_core::{DType, Device, Tensor};
+use candle_audio::candle_core::{DType, Device, Tensor, D};
 use candle_audio::{AudioError, Result};
 use candle_nn::VarBuilder;
 use rand::rngs::StdRng;
@@ -25,7 +26,44 @@ use crate::dit::DiT;
 use crate::qwen::Qwen3Encoder;
 use crate::scheduler::{FlowMatchSchedule, DEFAULT_SHIFT};
 use crate::text::{build_prompt, tokenize_lyrics, tokenize_prompt, Metadata};
+use crate::tokenizer::{AudioTokenDetokenizer, AudioTokenizer, TokenizerConfig};
 use crate::vae::{OobleckDecoder, OobleckEncoder, VAE_FILE};
+
+/// The cover-only FSQ modules (sc-13251): the ACE-Step `audio_tokenizer` (25 Hz → 5 Hz FSQ) and
+/// `audio_token_detokenizer` (5 Hz → 25 Hz acoustic conditioning). These do NOT ship in the pinned
+/// turbo checkpoint; the Cover path pins them from `acestep-v15-xl-sft-diffusers` (same MIT org,
+/// shared 64-ch/25 Hz latent space) and loads them lazily on the first Cover request.
+pub struct CoverModules {
+    pub tokenizer: AudioTokenizer,
+    pub detokenizer: AudioTokenDetokenizer,
+    pool_window_size: usize,
+}
+
+impl CoverModules {
+    /// Load the FSQ tokenizer + detokenizer from their component `config.json` + safetensors.
+    pub fn load(
+        tok_weights: &Path,
+        tok_config: &Path,
+        det_weights: &Path,
+        det_config: &Path,
+        device: &Device,
+    ) -> Result<Self> {
+        let tcfg = TokenizerConfig::from_json(tok_config)?;
+        let dcfg = TokenizerConfig::from_json(det_config)?;
+        let pool_window_size = tcfg.pool_window_size;
+        let tokenizer = AudioTokenizer::load(tok_weights, &tcfg, device)?;
+        let detokenizer = AudioTokenDetokenizer::load(det_weights, &dcfg, device)?;
+        Ok(Self {
+            tokenizer,
+            detokenizer,
+            pool_window_size,
+        })
+    }
+
+    pub fn pool_window_size(&self) -> usize {
+        self.pool_window_size
+    }
+}
 
 /// Sampling knobs of one synthesis request (defaults are the reference turbo call defaults).
 #[derive(Debug, Clone)]
@@ -47,6 +85,13 @@ pub struct SynthesisParams {
 pub const DEFAULT_SECONDS: f32 = 60.0;
 pub const DEFAULT_STEPS: usize = 8;
 
+/// Solver steps for the **Cover** restyle (sc-13251). Cover runs through the non-distilled sft DiT,
+/// which — unlike the guidance-distilled 8-step turbo DiT — needs a real multi-step trajectory to
+/// converge; 24 matches the reference's cover-task sampling regime (guidance 1) and is the floor at
+/// which the sft cover produces coherent, source-faithful audio on CPU. The request's `steps` (a
+/// turbo-tuned value, typ. 8) is overridden for Cover so the sft DiT is never under-sampled.
+pub const COVER_SFT_STEPS: usize = 24;
+
 /// Pipeline-level progress events, mapped by the provider onto `gen_core::Progress`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PipelineProgress {
@@ -54,9 +99,10 @@ pub enum PipelineProgress {
     Decoding,
 }
 
-/// Which ACE-Step audio-to-audio task a prompted edit drives (sc-12847). The gen-core
-/// [`AudioEditMode`](candle_audio::gen_core::AudioEditMode) maps onto this at the provider boundary;
-/// `Cover` is intentionally absent (the pinned diffusers checkpoint ships no audio quantizer).
+/// Which ACE-Step region-edit task a prompted edit drives (sc-12847). The gen-core
+/// [`AudioEditMode`](candle_audio::gen_core::AudioEditMode) maps onto this at the provider boundary
+/// for the region tasks; `Cover` is a whole-clip restyle handled by the separate
+/// [`AceStepPipeline::cover`] path (sc-13251), not one of these masked-window tasks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EditTask {
     /// Regenerate a bounded window fresh — the window is silence-seeded so the model fills it anew,
@@ -96,6 +142,15 @@ pub struct AceStepPipeline {
     vae: OobleckDecoder,
     vae_encoder: OobleckEncoder,
     device: Device,
+    /// Lazily-loaded cover FSQ modules (sc-13251), pinned from the sft checkpoint on first use.
+    cover: Mutex<Option<Arc<CoverModules>>>,
+    /// Lazily-loaded **sft** DiT for the Cover restyle (sc-13251). Cover runs through the reference's
+    /// non-distilled sft transformer (guidance=1, more steps) — which preserves the source's melodic
+    /// content far better than the guidance-distilled 8-step turbo DiT — while Inpaint/Repaint/Extend
+    /// and text-to-music keep using the turbo [`dit`](Self::dit) untouched. Same architecture as turbo
+    /// (identical `TransformerConfig` bar the `is_turbo` flag), so it reuses this pipeline's turbo
+    /// text-encoder / condition-encoder / VAE / FSQ; only the transformer weights differ.
+    cover_dit: Mutex<Option<Arc<DiT>>>,
 }
 
 /// Resolve the safetensors shard paths for a component whose files are `{stem}.safetensors` (single
@@ -175,7 +230,51 @@ impl AceStepPipeline {
             vae,
             vae_encoder,
             device: device.clone(),
+            cover: Mutex::new(None),
+            cover_dit: Mutex::new(None),
         })
+    }
+
+    /// The lazily-loaded cover FSQ modules (sc-13251), built from the pinned sft `audio_tokenizer` /
+    /// `audio_token_detokenizer` component files on the first Cover request and cached thereafter.
+    pub fn cover_modules(
+        &self,
+        tok_weights: &Path,
+        tok_config: &Path,
+        det_weights: &Path,
+        det_config: &Path,
+    ) -> Result<Arc<CoverModules>> {
+        let mut guard = self.cover.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(c) = guard.as_ref() {
+            return Ok(c.clone());
+        }
+        let built = Arc::new(CoverModules::load(
+            tok_weights,
+            tok_config,
+            det_weights,
+            det_config,
+            &self.device,
+        )?);
+        *guard = Some(built.clone());
+        Ok(built)
+    }
+
+    /// The lazily-loaded **sft** cover DiT (sc-13251), built from the pinned sft `transformer` shards
+    /// on the first Cover request and cached thereafter. The sft transformer is the ACE-Step reference
+    /// checkpoint's ACTUAL cover model — non-distilled, so it preserves the source's melodic content
+    /// where the guidance-distilled turbo DiT does not. Its architecture is identical to turbo's (the
+    /// two `transformer/config.json` differ only in the metadata flags `is_turbo` / `model_version`,
+    /// which the DiT code never reads), so it is built from this pipeline's turbo `TransformerConfig`.
+    pub fn cover_dit(&self, dit_shards: &[PathBuf]) -> Result<Arc<DiT>> {
+        let mut guard = self.cover_dit.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(d) = guard.as_ref() {
+            return Ok(d.clone());
+        }
+        let dit = DiT::new(&self.config.transformer, mmap_vb(dit_shards, &self.device)?)
+            .map_err(|e| AudioError::Msg(format!("build acestep sft cover DiT: {e}")))?;
+        let built = Arc::new(dit);
+        *guard = Some(built.clone());
+        Ok(built)
     }
 
     /// Latent frames for a requested duration (`ceil(seconds · latents_per_second)`).
@@ -258,6 +357,7 @@ impl AceStepPipeline {
 
         let latents = self
             .denoise(
+                &self.dit,
                 &context_latents,
                 &ctx,
                 latent_len,
@@ -286,8 +386,10 @@ impl AceStepPipeline {
     /// on cancellation (checked before generate, at every step, and between DiT blocks). Both the
     /// text-to-music path and the edit path share this — the only difference between them is how
     /// `context_latents` is built.
+    #[allow(clippy::too_many_arguments)]
     fn denoise(
         &self,
+        dit: &DiT,
         context_latents: &Tensor,
         ctx: &Tensor,
         latent_len: usize,
@@ -307,10 +409,7 @@ impl AceStepPipeline {
                 return Ok(None);
             }
             let t = schedule.timestep(k);
-            let v = match self
-                .dit
-                .forward(&latents, context_latents, t, ctx, cancel)?
-            {
+            let v = match dit.forward(&latents, context_latents, t, ctx, cancel)? {
                 Some(v) => v,
                 None => return Ok(None),
             };
@@ -418,9 +517,10 @@ impl AceStepPipeline {
         let ctx_raw = self.encode_context(prompt, &params.base.lyrics, &params.base.metadata)?;
         let ctx = self.dit.embed_context(&ctx_raw)?;
 
-        // 6. Denoise + decode.
+        // 6. Denoise + decode (turbo DiT — Inpaint/Repaint/Extend keep the fast distilled path).
         let latents = self
             .denoise(
+                &self.dit,
                 &context_latents,
                 &ctx,
                 target_len,
@@ -449,6 +549,125 @@ impl AceStepPipeline {
         Ok(stitch(
             source, src_ch, &generated, gen_ch, out_frames, f0, f1, xfade,
         ))
+    }
+
+    /// Prompted-audio **Cover** (sc-13251): restyle a whole source clip from a NEW prompt while
+    /// preserving its musical structure — the ACE-Step `cover` task. Faithful to the diffusers
+    /// v0.39.0 `prepare_src_latents(task_type="cover")` recipe:
+    ///
+    /// ```text
+    ///   src_lat      = vae.encode(source)                          # [1, L@25Hz, 64] (mean)
+    ///   quantized, _ = audio_tokenizer.tokenize(src_lat, silence)  # [1, L/5@5Hz, hidden]
+    ///   src_latents  = audio_token_detokenizer(quantized)[:, :L]   # [1, L@25Hz, 64]
+    ///   chunk_mask   = ones                                        # generate the WHOLE clip
+    ///   context      = [src_latents | chunk_mask]                  # DiT conditioning
+    /// ```
+    ///
+    /// The FSQ round-trip is a lossy structural bottleneck (levels `[8,8,8,5,5,5]`, 25 Hz → 5 Hz →
+    /// 25 Hz): it discards fine timbre but keeps the source's melodic/tonal content, and the new
+    /// prompt supplies the new timbre through the DiT cross-attention context. The restyle denoise
+    /// runs on the **non-distilled sft cover DiT** (`cover_dit`) — the ACE-Step reference's ACTUAL
+    /// cover model — at guidance 1 over [`COVER_SFT_STEPS`] steps (the distilled 8-step turbo DiT
+    /// does not preserve the source's melodic content per-source; sc-13251). It reuses this pipeline's
+    /// turbo text-encoder / condition-encoder / VAE / FSQ (identical architecture), so
+    /// Inpaint/Repaint/Extend + text-to-music keep the turbo DiT untouched. Unlike repaint there is no
+    /// waveform stitch: the whole clip is regenerated (restyled), cropped to the source duration.
+    #[allow(clippy::too_many_arguments)]
+    pub fn cover(
+        &self,
+        prompt: &str,
+        source: &[f32],
+        source_channels: usize,
+        params: &SynthesisParams,
+        cover: &CoverModules,
+        cover_dit: &DiT,
+        on_progress: &mut dyn FnMut(PipelineProgress),
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<Vec<f32>> {
+        if cancel() {
+            return Err(AudioError::Canceled);
+        }
+        let hop = self.config.vae.hop_length();
+        let out_channels = self.vae.audio_channels();
+        let acoustic = self.config.transformer.audio_acoustic_hidden_dim;
+        let src_ch = source_channels.max(1);
+        let src_frames = source.len() / src_ch;
+        if src_frames == 0 {
+            return Err(AudioError::Msg("acestep cover: empty source audio".into()));
+        }
+
+        // 1. Source waveform → planar → VAE latents [1, L, acoustic] (deterministic mean).
+        let planar = self.source_to_planar(source, src_ch, out_channels, hop)?;
+        let src_lat = self
+            .vae_encoder
+            .encode(&planar, cancel)?
+            .ok_or(AudioError::Canceled)?;
+        let latent_length = src_lat.dim(1)?;
+        if cancel() {
+            return Err(AudioError::Canceled);
+        }
+
+        // 2. FSQ round-trip: tokenize (25 Hz → 5 Hz) → detokenize (5 Hz → 25 Hz), cropped to L.
+        let silence = self
+            .condition
+            .src_latents(cover.pool_window_size().max(1), &self.device)
+            .map_err(AudioError::from)?;
+        let quantized = cover.tokenizer.tokenize(&src_lat, &silence)?;
+        let detok = cover.detokenizer.forward(&quantized)?; // [1, num_patches*pw, acoustic]
+        let detok_len = detok.dim(1)?;
+        let src_latents = if detok_len >= latent_length {
+            detok.narrow(1, 0, latent_length)?
+        } else {
+            // The detokenizer emits ceil(L/pw)*pw ≥ L frames, so this pad is defensive only.
+            let pad = self
+                .condition
+                .src_latents(latent_length - detok_len, &self.device)
+                .map_err(AudioError::from)?;
+            Tensor::cat(&[&detok, &pad], 1)?
+        };
+        if cancel() {
+            return Err(AudioError::Canceled);
+        }
+
+        // 3. chunk_mask = ones (regenerate the whole clip); context = [src_latents | mask].
+        let chunk_mask = Tensor::ones((1, latent_length, acoustic), DType::F32, &self.device)?;
+        let context_latents = Tensor::cat(&[&src_latents, &chunk_mask], D::Minus1)?;
+
+        // 4. Condition context from the NEW prompt (special-token timbre, like text-to-music). The
+        //    context is embedded by the sft cover DiT (its `condition_embedder` weights differ from
+        //    turbo's), then consumed by that same DiT below.
+        let ctx_raw = self.encode_context(prompt, &params.lyrics, &params.metadata)?;
+        let ctx = cover_dit.embed_context(&ctx_raw)?;
+
+        // 5. Denoise through the non-distilled sft cover DiT (guidance 1, multi-step — the reference's
+        //    actual cover model, which preserves the source's melodic content the distilled 8-step
+        //    turbo DiT cannot). The turbo-tuned request `steps` is overridden to the sft cover regime.
+        let cover_params = SynthesisParams {
+            steps: COVER_SFT_STEPS,
+            ..params.clone()
+        };
+        let latents = self
+            .denoise(
+                cover_dit,
+                &context_latents,
+                &ctx,
+                latent_length,
+                &cover_params,
+                on_progress,
+                cancel,
+            )?
+            .ok_or(AudioError::Canceled)?;
+        on_progress(PipelineProgress::Decoding);
+        let (mut generated, gen_ch) = self
+            .decode_to_interleaved(&latents, cancel)?
+            .ok_or(AudioError::Canceled)?;
+        peak_normalize(&mut generated);
+
+        // 6. Crop to the source duration (whole clip restyled — no stitch).
+        let gen_frames = generated.len() / gen_ch;
+        let out_frames = src_frames.min(gen_frames);
+        generated.truncate(out_frames * gen_ch);
+        Ok(generated)
     }
 
     /// Source interleaved PCM → planar `[1, out_channels, N_pad]`, padded up to a whole hop so the
