@@ -48,8 +48,16 @@ sceneworks-gen-core-testkit = { workspace = true }
 
 [features]
 default = []
-# Apple Metal GPU backend — forwarded to the shared audio commons. Not in `default` (the audio
-# lane ships CPU-first everywhere; see docs/architecture/audio-backend-strategy.md).
-metal = ["candle-audio/metal"]
-# NVIDIA CUDA backend — forwarded to the shared audio commons. Not in `default`.
-cuda = ["candle-audio/cuda"]
+# Apple Metal GPU backend — forwarded to the shared audio commons AND to candle-nn. The
+# `candle-nn/metal` forward is load-bearing: candle-nn's fused normalization/attention ops
+# (rms-norm, softmax, …) carry their Metal kernels behind candle-nn's own `metal` feature, so
+# omitting it compiles candle-nn WITHOUT them and the first such op bails at runtime with
+# "no metal implementation for …" (measured on this lane, sc-13039). Mirrors candle-audio-clap /
+# candle-gen / candle-llm. Not in `default` (the audio lane ships CPU-first everywhere; see
+# docs/architecture/audio-backend-strategy.md). NOTE: candle-nn has no Metal `layer-norm` kernel
+# at the pinned candle rev, so providers using a biased `candle_nn::LayerNorm` (e.g. Kokoro's
+# AlBERT) still cannot run on Metal here regardless of this forward — CPU-only on Mac today.
+metal = ["candle-audio/metal", "candle-nn/metal"]
+# NVIDIA CUDA backend — forwarded to the shared audio commons AND candle-nn (its CUDA kernels,
+# same rationale as `metal`). Not in `default`.
+cuda = ["candle-audio/cuda", "candle-nn/cuda"]

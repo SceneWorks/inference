@@ -41,6 +41,6 @@ candle-audio-whisper = { path = "../candle-audio-whisper" }
 default = []
 # Apple Metal GPU backend — forwarded to the shared audio commons. Not in `default` (the audio
 # lane ships CPU-first everywhere; see docs/architecture/audio-backend-strategy.md).
-metal = ["candle-audio/metal"]
+metal = ["candle-audio/metal", "candle-nn/metal"]
 # NVIDIA CUDA backend — forwarded to the shared audio commons. Not in `default`.
-cuda = ["candle-audio/cuda"]
+cuda = ["candle-audio/cuda", "candle-nn/cuda"]
