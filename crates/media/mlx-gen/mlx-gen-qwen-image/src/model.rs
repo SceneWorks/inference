@@ -44,6 +44,7 @@ pub const SIZE_MULTIPLE: u32 = 16;
 /// the `lightning` sampler (sc-2909); an unset sampler is the production flow-match path.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        required_components: &[],
         id: MODEL_ID,
         family: "qwen-image",
         backend: "mlx",

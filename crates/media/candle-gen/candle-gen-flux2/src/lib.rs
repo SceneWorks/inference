@@ -768,6 +768,7 @@ impl Generator for Flux2Generator {
 /// Both: txt2img only (edit/Reference deferred to epic 6564 story 4), no LoRA, no on-the-fly quant.
 fn descriptor(variant: Flux2Variant) -> ModelDescriptor {
     ModelDescriptor {
+        required_components: &[],
         id: variant.id(),
         family: "flux2",
         backend: "candle",

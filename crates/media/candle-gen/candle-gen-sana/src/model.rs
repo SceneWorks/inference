@@ -136,6 +136,7 @@ impl SanaGenerator {
 /// LoRA, or quantization is wired on the candle base path. Backend `"candle"`, `mac_only = false`.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        required_components: &[],
         id: MODEL_ID,
         family: "sana",
         backend: "candle",
@@ -189,6 +190,7 @@ pub fn descriptor() -> ModelDescriptor {
 /// the `"default"` engine sentinel.
 pub fn sprint_descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        required_components: &[],
         id: SPRINT_MODEL_ID,
         family: "sana",
         backend: "candle",

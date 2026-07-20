@@ -341,6 +341,7 @@ impl Generator for KreaGenerator {
 /// `Conditioning::Reference` — but no control conditioning on the Turbo checkpoint.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        required_components: &[],
         id: KREA_2_TURBO_ID,
         family: "krea_2",
         backend: "candle",

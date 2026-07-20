@@ -88,6 +88,7 @@ pub(crate) const DEFAULT_FPS: u32 = 30;
 /// `spec.quantize` (honouring one only when it matches the tier dir's manifest, [`tier`]).
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        required_components: &[],
         id: MODEL_ID,
         family: "mochi",
         backend: "candle",

@@ -82,6 +82,7 @@ const MAX_COUNT: u32 = 8;
 /// init latent. ControlNet conditioning is a separate, later variant.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        required_components: &[],
         id: MODEL_ID,
         family: "sana",
         backend: "mlx",
@@ -154,6 +155,7 @@ pub fn descriptor() -> ModelDescriptor {
 /// is a dedicated few-step loop, so the curated epic-7114 sampler/scheduler menu is NOT advertised.
 pub fn sprint_descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        required_components: &[],
         id: SPRINT_MODEL_ID,
         family: "sana",
         backend: "mlx",

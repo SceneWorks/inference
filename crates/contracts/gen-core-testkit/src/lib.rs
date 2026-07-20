@@ -625,6 +625,80 @@ pub fn registry_conformance(registry: &gen_core::ProviderRegistry) {
     }
 }
 
+/// **Named-component load gate (sc-13658).** A model that declares
+/// [`required_components`](gen_core::ModelDescriptor::required_components) must convert a missing or
+/// unrecognized [`LoadSpec::components`](gen_core::LoadSpec::components) entry into a **load-time**
+/// error — not a mid-render fetch (the perth class this seam exists to kill) and not a first-`generate`
+/// failure. Given the provider's fallible `load` closure, a `base_spec` that stages every required
+/// component (so `load` clears the gate), and the model's declared `required` ids, this asserts:
+///
+/// 1. **Missing required component → load error.** Removing any one required id from
+///    `base_spec.components` makes `load` return `Err`, and the error names the missing id (so the
+///    failure is provably the component gate — [`gen_core::require_component`] — not an unrelated
+///    load error).
+/// 2. **Unknown component key → load error.** Adding a component key the model does not declare makes
+///    `load` return `Err` (the [`gen_core::reject_unknown_components`] typed-`Unsupported` guard).
+///
+/// It drives the provider's real `load`, so it exercises the actual validators rather than a mock —
+/// a provider that forgets to call `require_component` (silently proceeding to a mid-render fetch) or
+/// `reject_unknown_components` (silently ignoring a stray key) fails here. Only meaningful for a model
+/// with a non-empty `required_components`; returns `Ok(())` when the gate holds.
+pub fn check_component_load_gate(
+    load: impl Fn(&gen_core::LoadSpec) -> gen_core::Result<Box<dyn Generator>>,
+    base_spec: &gen_core::LoadSpec,
+    required: &[&str],
+) -> Result<(), String> {
+    if required.is_empty() {
+        return Err(
+            "component-load-gate: `required` is empty — this check only applies to a model that \
+             declares required_components"
+                .to_string(),
+        );
+    }
+
+    // 1. Each required component, removed in turn, must make load() fail — and fail *because of* that
+    //    component (its id must appear in the error), not for some unrelated reason.
+    for &missing in required {
+        let mut spec = base_spec.clone();
+        spec.components.remove(missing);
+        match load(&spec) {
+            Ok(_) => {
+                return Err(format!(
+                    "component-load-gate: load() succeeded with the required component '{missing}' \
+                     missing — a declared required component must be a load-time error (call \
+                     gen_core::require_component in load(), before any weight read or generate)"
+                ));
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if !msg.contains(missing) {
+                    return Err(format!(
+                        "component-load-gate: load() failed with '{missing}' missing, but the error \
+                         did not name the component ({msg:?}) — the failure must be the missing \
+                         component gate, not an unrelated load error"
+                    ));
+                }
+            }
+        }
+    }
+
+    // 2. A component key the model does not declare must be rejected at load.
+    let bogus = "__testkit_unknown_component__";
+    let mut spec = base_spec.clone();
+    spec.components.insert(
+        bogus.to_owned(),
+        gen_core::WeightsSource::File(std::path::PathBuf::from("/dev/null")),
+    );
+    match load(&spec) {
+        Ok(_) => Err(format!(
+            "component-load-gate: load() accepted an unrecognized component key '{bogus}' — an \
+             unknown component key must be rejected at load (call \
+             gen_core::reject_unknown_components in load())"
+        )),
+        Err(_) => Ok(()),
+    }
+}
+
 /// Run the full conformance suite against a freshly-`make`d generator. Panics with every failure
 /// aggregated (one bullet per failed guarantee) — the test-helper idiom, like a fat `assert`.
 ///

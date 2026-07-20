@@ -208,6 +208,60 @@ pub fn require_control<'a>(
     })
 }
 
+/// **Require a named model component at load** (epic 13657) — the [`LoadSpec::components`] analogue of
+/// [`require_control`], for use at the top of a provider's `load(spec)`.
+///
+/// Returns the [`WeightsSource`] the caller staged under component `id` in
+/// [`LoadSpec::components`], or a caller-actionable [`Error::Msg`] that names `model_id`, the
+/// human-readable `label`, and the exact builder call to fix it. This is what converts a model's
+/// "fetch a missing sub-weight mid-render" habit (e.g. perth's watermark weights) into a **load-time**
+/// contract error: a provider declares the id in
+/// [`ModelDescriptor::required_components`](crate::generator::ModelDescriptor::required_components) and
+/// reads it here before doing any work, so an unprovisioned component fails fast at `load`, not at the
+/// first `generate`.
+///
+/// `label` is the model's own description of the component (e.g. `"Perth watermarker"`), woven into
+/// the message like `control_weights_label` is for [`require_control`].
+pub fn require_component<'a>(
+    spec: &'a LoadSpec,
+    id: &str,
+    model_id: &str,
+    label: &str,
+) -> Result<&'a WeightsSource> {
+    spec.components.get(id).ok_or_else(|| {
+        Error::Msg(format!(
+            "{model_id} requires the {label} component '{id}' — stage it in LoadSpec::components \
+             (e.g. with_component(\"{id}\", WeightsSource::File(...)))"
+        ))
+    })
+}
+
+/// **Reject unrecognized component keys** (epic 13657) — the [`LoadSpec::components`] guard that
+/// mirrors the hand-written per-slot `Error::Unsupported` guards a provider writes for the typed slots
+/// it does not support (e.g. chatterbox rejecting `control`/`ip_adapter`).
+///
+/// A provider calls this at the top of `load(spec)` with the set of component ids it actually reads —
+/// normally its
+/// [`ModelDescriptor::required_components`](crate::generator::ModelDescriptor::required_components).
+/// Any key present in [`LoadSpec::components`] but **not** in `known` is a caller mistake (a typo, or a
+/// component meant for a different model), returned as the typed [`Error::Unsupported`] so the worker /
+/// backend gating distinguishes it from a malformed request — the same convention the typed-slot
+/// guards use. The first unknown key (iteration is over the `BTreeMap`, so deterministically the
+/// lexicographically-smallest) is reported. An empty `components` map, or one whose every key is
+/// `known`, is `Ok(())`.
+pub fn reject_unknown_components(spec: &LoadSpec, known: &[&str], model_id: &str) -> Result<()> {
+    for key in spec.components.keys() {
+        if !known.contains(&key.as_str()) {
+            return Err(Error::Unsupported(format!(
+                "{model_id} does not recognize the component key '{key}' \
+                 (known components: {known:?}) — check LoadSpec::components for a typo or a \
+                 component staged for the wrong model"
+            )));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,6 +318,7 @@ mod tests {
     fn stub(accepted: AcceptedControlKinds) -> Stub {
         Stub {
             descriptor: ModelDescriptor {
+                required_components: &[],
                 id: "stub_control",
                 family: "stub",
                 backend: "mlx",
@@ -316,6 +371,66 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("Fun-Controlnet-Union"), "got: {err}");
+    }
+
+    /// Conformance check 2 (sc-13658): a required component MISSING from `LoadSpec::components` is a
+    /// **load-time** contract error, and the error is caller-actionable (names the model, the id, and
+    /// the `with_component` builder to call). A present component resolves to its staged source.
+    #[test]
+    fn require_component_present_and_missing() {
+        // Present → returns the staged source.
+        let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from("/snap"))).with_component(
+            "perth",
+            WeightsSource::File(PathBuf::from("/perth.safetensors")),
+        );
+        let src = require_component(&spec, "perth", "chatterbox_tts", "Perth watermarker").unwrap();
+        assert!(matches!(src, WeightsSource::File(p) if p == Path::new("/perth.safetensors")));
+
+        // Missing → a load-time Msg naming the model, the id, and the builder to fix it.
+        let bare = LoadSpec::new(WeightsSource::Dir(PathBuf::from("/snap")));
+        let err =
+            require_component(&bare, "perth", "chatterbox_tts", "Perth watermarker").unwrap_err();
+        assert!(
+            matches!(err, Error::Msg(_)),
+            "missing component is a request-shape error: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("chatterbox_tts"), "names the model: {msg}");
+        assert!(msg.contains("'perth'"), "names the id: {msg}");
+        assert!(msg.contains("with_component"), "names the builder: {msg}");
+    }
+
+    /// Conformance check 3 (sc-13658): a component key the model does not recognize is rejected as the
+    /// typed [`Error::Unsupported`] (mirroring the hand-written per-slot guards), while an empty map or
+    /// one whose every key is known passes.
+    #[test]
+    fn reject_unknown_components_rejects_unknown_key() {
+        let known = ["perth", "voice_embedding"];
+
+        // Empty map → Ok.
+        let empty = LoadSpec::new(WeightsSource::Dir(PathBuf::from("/snap")));
+        reject_unknown_components(&empty, &known, "chatterbox_tts").unwrap();
+
+        // All keys known → Ok.
+        let ok = empty
+            .clone()
+            .with_component("perth", WeightsSource::File(PathBuf::from("/p")))
+            .with_component("voice_embedding", WeightsSource::File(PathBuf::from("/v")));
+        reject_unknown_components(&ok, &known, "chatterbox_tts").unwrap();
+
+        // An unknown key → typed Unsupported naming the offending key.
+        let bad = ok
+            .clone()
+            .with_component("mystery", WeightsSource::File(PathBuf::from("/m")));
+        let err = reject_unknown_components(&bad, &known, "chatterbox_tts").unwrap_err();
+        assert!(
+            matches!(err, Error::Unsupported(_)),
+            "an unrecognized component key is a capability gap → Unsupported, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("mystery"),
+            "names the offending key: {err}"
+        );
     }
 
     #[test]

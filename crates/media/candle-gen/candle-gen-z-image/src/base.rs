@@ -169,6 +169,7 @@ impl Generator for ZImageBaseGenerator {
 /// `mac_only = false`.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        required_components: &[],
         id: MODEL_ID,
         family: "z-image",
         backend: "candle",

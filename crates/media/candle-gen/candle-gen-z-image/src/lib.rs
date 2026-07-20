@@ -307,6 +307,7 @@ impl Generator for ZImageGenerator {
 /// `mlx-gen-z-image`: `backend = "candle"` and `mac_only = false`.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        required_components: &[],
         id: MODEL_ID,
         family: "z-image",
         // The tensor backend whose provider crate registered this engine (sc-3723). MLX sets "mlx".

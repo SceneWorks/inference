@@ -54,6 +54,7 @@ pub const MODEL_ID: &str = "scail2_14b";
 /// `backend = "candle"`, `mac_only = false` (the off-Mac CUDA lane).
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        required_components: &[],
         id: MODEL_ID,
         family: "scail2",
         backend: "candle",

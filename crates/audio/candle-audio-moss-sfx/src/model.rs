@@ -95,6 +95,7 @@ pub const LANGUAGES: &[&str] = &["en", "zh"];
 /// MOSS-SoundEffect's identity + capabilities — constructible without weights.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        required_components: &[],
         id: MODEL_ID,
         family: "moss_soundeffect",
         backend: "candle",

@@ -138,6 +138,7 @@ impl Generator for Ideogram4Generator {
 /// and mask inpaint via a `Mask` (white = repaint) alongside the `Reference`.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        required_components: &[],
         id: MODEL_ID,
         family: "ideogram",
         backend: "candle",

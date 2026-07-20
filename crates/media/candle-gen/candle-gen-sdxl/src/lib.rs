@@ -395,6 +395,7 @@ impl Generator for SdxlGenerator {
 /// `mac_only = false`.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        required_components: &[],
         id: MODEL_ID,
         family: "sdxl",
         // The tensor backend whose provider crate registered this engine (sc-3723). MLX sets "mlx".

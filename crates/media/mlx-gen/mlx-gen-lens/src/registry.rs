@@ -63,6 +63,7 @@ const BASE_DEFAULTS: Defaults = Defaults {
 /// quant (gpt-oss MoE experts sc-3172 + DiT linears sc-3175).
 fn descriptor_for(id: &'static str) -> ModelDescriptor {
     ModelDescriptor {
+        required_components: &[],
         id,
         family: "lens",
         backend: "mlx",
@@ -775,6 +776,7 @@ mod tests {
                 identity: None,
                 text_encoder: None,
                 offload_policy: Default::default(),
+                components: Default::default(),
             };
             let err = match crate::provider_registry().unwrap().load(id, &spec) {
                 Ok(_) => panic!("bogus weights dir must fail to load"),
@@ -801,6 +803,7 @@ mod tests {
             identity: None,
             text_encoder: None,
             offload_policy: Default::default(),
+            components: Default::default(),
         };
         // A ControlNet overlay is rejected (not part of the Lens port) — the message names it, before
         // any weights load.

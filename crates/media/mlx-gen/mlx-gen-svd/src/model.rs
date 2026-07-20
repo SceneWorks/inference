@@ -68,6 +68,7 @@ const MAX_STEPS: u32 = 200;
 /// Stable identity + advertised capabilities for SVD-XT (image→video, no audio).
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        required_components: &[],
         id: MODEL_ID,
         family: "svd",
         backend: "mlx",

@@ -39,6 +39,7 @@ pub const MODEL_ID: &str = "bernini_renderer";
 /// source-id rotary + token-packed conditioning + APG guidance; t2v/t2i/i2i/v2v/r2v/rv2v).
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        required_components: &[],
         id: MODEL_ID,
         family: "bernini",
         backend: "mlx",

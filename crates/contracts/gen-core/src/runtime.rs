@@ -2,12 +2,18 @@
 //! [`Transform`](crate::transform::Transform): where weights come from, quantization +
 //! precision knobs, adapter specs, cooperative cancellation, and progress events.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-/// Where a model's weights come from. (An HF-hub fetch variant is a planned additive
-/// extension — see sc-2340; today's loaders read local safetensors.)
+/// Where a model's weights come from — **always a local, already-provisioned path**. There is
+/// deliberately **no** hub-fetch variant: inference never self-fetches weights and has no knowledge
+/// of any download cache (epic 13657). A consumer resolves and stages every path — the base
+/// `weights`, each typed overlay (control / ip_adapter / …), and every [`LoadSpec::components`]
+/// entry — before calling `load`, and a missing component is a load-time contract error
+/// ([`crate::control::require_component`]), never a mid-render fetch. (The previously-reserved
+/// sc-2340 hub-fetch direction is permanently rejected.)
 #[derive(Clone, Debug)]
 pub enum WeightsSource {
     /// A directory of (possibly sharded) `.safetensors`.
@@ -156,6 +162,41 @@ pub struct LoadSpec {
     /// ignores it and stays `Resident`; [`Capabilities::supports_sequential_offload`](crate::generator::Capabilities::supports_sequential_offload)
     /// advertises which engines honor it (sc-11126). Backend-neutral.
     pub offload_policy: OffloadPolicy,
+    /// **Named, caller-provisioned model components** (epic 13657) — the generic, additive home for
+    /// the extra weight artifacts a model needs beyond its base `weights` and the typed overlays
+    /// above, keyed by a stable component id. The complement of
+    /// [`ModelDescriptor::required_components`](crate::generator::ModelDescriptor::required_components):
+    /// the descriptor *advertises* which ids a model requires (weights-free, so a consumer knows what
+    /// to stage), and this map *carries* the resolved local path for each. A provider reads each id at
+    /// load time via [`require_component`](crate::control::require_component); a required id absent
+    /// here is a **load-time** contract error, not a mid-render fetch (the whole point of the seam —
+    /// it converts e.g. perth's mid-render watermark-weight fetch into a load contract error), and an
+    /// unrecognized id is rejected via
+    /// [`reject_unknown_components`](crate::control::reject_unknown_components). Default empty; set
+    /// with [`with_component`](Self::with_component), mirroring [`with_control`](Self::with_control).
+    ///
+    /// This is deliberately a `BTreeMap<String, WeightsSource>` (not a typed slot per component and
+    /// not a new [`WeightsSource`] hub-fetch variant — both alternatives were rejected in the sc-13591
+    /// research): components are model-specific and open-ended, so a generic keyed map lets a new
+    /// model declare new ids without a contract edit, while the descriptor's `required_components`
+    /// keeps the set discoverable and conformance-checked.
+    ///
+    /// ## Provider → component-id registry (the reserved ids downstream stories consume)
+    ///
+    /// This map is the registry of record for component ids. The provisional set (epic 13657):
+    ///
+    /// | Model | Component ids |
+    /// |-------|---------------|
+    /// | chatterbox (TTS) | `perth`, `voice_embedding` |
+    /// | MOSS tts / tts-realtime | `codec` |
+    /// | SDXL | `tokenizer_clip_l`, `tokenizer_clip_bigg`, `vae_fp16_fix` |
+    /// | mmaudio | `clip`, `synchformer`, `dit`, `vae`, `vocoder` |
+    ///
+    /// Reserved for later stories (not populated here): sensenova `distill_lora`, LTX `text_encoder`
+    /// (sc-13664). Ids are lowercase `snake_case` registry identifiers (same shape as a descriptor
+    /// `id`); a model's declared ids are validated non-empty and unique by the descriptor conformance
+    /// sweep ([`model_descriptor_errors`](crate::registry::model_descriptor_errors)).
+    pub components: BTreeMap<String, WeightsSource>,
 }
 
 /// Where the optional PiD decoder's weights come from (epic 7840). A PiD decoder is tied to a
@@ -203,6 +244,7 @@ impl LoadSpec {
             identity: None,
             text_encoder: None,
             offload_policy: OffloadPolicy::Resident,
+            components: BTreeMap::new(),
         }
     }
 
@@ -224,6 +266,16 @@ impl LoadSpec {
     /// Builder-style control-branch overlay (the ControlNet checkpoint over the base `weights`).
     pub fn with_control(mut self, control: WeightsSource) -> Self {
         self.control = Some(control);
+        self
+    }
+
+    /// Builder-style named component (epic 13657) — stage the caller-provisioned local path for the
+    /// component `id` into [`components`](Self::components). Mirrors [`with_control`](Self::with_control);
+    /// the id is the stable key a provider reads at load via
+    /// [`require_component`](crate::control::require_component). Re-inserting the same id replaces the
+    /// prior path (last write wins). See [`components`](Self::components) for the id registry.
+    pub fn with_component(mut self, id: impl Into<String>, src: WeightsSource) -> Self {
+        self.components.insert(id.into(), src);
         self
     }
 

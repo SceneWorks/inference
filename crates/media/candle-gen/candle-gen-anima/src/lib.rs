@@ -74,6 +74,7 @@ const RES_MAX: u32 = 1536;
 fn descriptor_for(variant: Variant) -> ModelDescriptor {
     let cfg_capable = variant.uses_cfg();
     ModelDescriptor {
+        required_components: &[],
         id: variant.id(),
         family: "anima",
         backend: "candle",

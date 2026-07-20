@@ -959,6 +959,22 @@ pub struct ModelDescriptor {
     pub backend: &'static str,
     pub modality: Modality,
     pub capabilities: Capabilities,
+    /// **Named model components this engine requires** at load (epic 13657) — a weights-free
+    /// advertisement of the extra artifacts a consumer must provision, beyond the base `weights` and
+    /// the typed [`LoadSpec`](crate::LoadSpec) overlays, before calling `load`. The complement of
+    /// [`LoadSpec::components`](crate::LoadSpec::components): the model declares its required ids here
+    /// so SceneWorks knows what to stage (and the load fails fast if it doesn't — see
+    /// [`require_component`](crate::control::require_component)), and the caller supplies each id's
+    /// resolved local path in the load spec's `components` map.
+    ///
+    /// `Default` / the shipped value for every image/video provider and every single-file audio model
+    /// is `&[]` — no extra components; the field is strictly additive. Each id is a lowercase
+    /// `snake_case` registry identifier; the descriptor conformance sweep
+    /// ([`model_descriptor_errors`](crate::registry::model_descriptor_errors)) requires the declared
+    /// ids to be non-empty and unique. The concrete ids per model are the registry documented on
+    /// [`LoadSpec::components`](crate::LoadSpec::components) (e.g. chatterbox `["perth",
+    /// "voice_embedding"]`).
+    pub required_components: &'static [&'static str],
 }
 
 /// What a model supports — drives `validate()` and consumer UI. `Default` is "supports

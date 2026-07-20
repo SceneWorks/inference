@@ -47,6 +47,7 @@ pub const SIZE_MULTIPLE: u32 = 8;
 /// `discrete` scheduler alias is retained.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        required_components: &[],
         id: MODEL_ID,
         family: "kolors",
         // The tensor backend whose provider crate registered this engine (sc-3723). MLX sets "mlx".

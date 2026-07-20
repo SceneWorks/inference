@@ -399,6 +399,7 @@ impl Generator for WanVaceGenerator {
 /// universal VACE form the worker builds per mode) + optional `Reference` images. LoRA / quant deferred.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        required_components: &[],
         id: MODEL_ID_VACE,
         family: "wan",
         backend: "candle",

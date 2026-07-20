@@ -55,6 +55,7 @@ pub const MODEL_ID: &str = "qwen_image_control";
 /// conditioning. LoRA/LoKr (character identity) is on the base transformer.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        required_components: &[],
         id: MODEL_ID,
         family: "qwen-image",
         backend: "mlx",

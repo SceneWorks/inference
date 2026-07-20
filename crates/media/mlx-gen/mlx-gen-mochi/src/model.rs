@@ -56,6 +56,7 @@ const DEFAULT_FPS: u32 = 30;
 /// Stable identity + advertised capabilities for Mochi 1 (text-to-video, true CFG, no audio).
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        required_components: &[],
         id: MODEL_ID,
         family: "mochi",
         backend: "mlx",
