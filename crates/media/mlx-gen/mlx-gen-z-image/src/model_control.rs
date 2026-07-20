@@ -21,14 +21,14 @@ use mlx_gen::{
     require_control, resolve_flow_schedule, AcceptedControlKinds, Capabilities, ConditioningKind,
     ControlBranch, Error, FlowMatchEuler, GenerationOutput, GenerationRequest, Generator, LoadSpec,
     Modality, ModelDescriptor, OffloadPolicy, Precision, Progress, Quant, Residency, Result,
-    WeightsSource,
+    StagedHeavy, WeightsSource,
 };
 use mlx_rs::Dtype;
 use std::path::Path;
 
 use crate::control_transformer::ZImageControlTransformer;
 use crate::loader;
-use crate::model::{validate_request, DEFAULT_STEPS, SCHEDULE_SHIFT};
+use crate::model::{validate_request, ZImageDecodeView, DEFAULT_STEPS, SCHEDULE_SHIFT};
 use crate::pipeline::{
     self, denoise_control_with_progress, encode_control_context, encode_init_latents,
     init_time_step,
@@ -106,18 +106,31 @@ pub(crate) struct ZImageControlHeavyOwned {
     pub(crate) vae: Vae,
 }
 
-/// A borrow of the heavy control components, so the denoise/decode body runs identically whether they
-/// are held resident or were just loaded by the `Sequential` path.
-pub(crate) struct ZImageControlHeavy<'a> {
-    pub(crate) transformer: &'a ZImageControlTransformer,
-    pub(crate) vae: &'a Vae,
+/// The light (decode-only) control bundle that survives the DiT drop under `Sequential` staged decode
+/// (sc-13571): just the VAE (the control path has no PiD overlay). [`StagedHeavy::shed_dit`] drops the
+/// control DiT so the tiled VAE decode peak excludes it.
+pub(crate) struct ZImageControlLight {
+    pub(crate) vae: Vae,
 }
 
-impl ZImageControlHeavyOwned {
-    pub(crate) fn as_ref(&self) -> ZImageControlHeavy<'_> {
-        ZImageControlHeavy {
-            transformer: &self.transformer,
+impl StagedHeavy for ZImageControlHeavyOwned {
+    type Light = ZImageControlLight;
+    // Reuse the base decode view; the control path never has a PiD decoder, so `pid` is always `None`.
+    type DecodeView<'a> = ZImageDecodeView<'a>;
+    fn shed_dit(self) -> ZImageControlLight {
+        // `self.transformer` (the control DiT) drops here; the VAE moves into the light bundle.
+        ZImageControlLight { vae: self.vae }
+    }
+    fn decode_view(&self) -> ZImageDecodeView<'_> {
+        ZImageDecodeView {
             vae: &self.vae,
+            pid: None,
+        }
+    }
+    fn light_view(light: &ZImageControlLight) -> ZImageDecodeView<'_> {
+        ZImageDecodeView {
+            vae: &light.vae,
+            pid: None,
         }
     }
 }
@@ -336,7 +349,9 @@ impl ZImageTurboControl {
         // cancel checks, and the error-safe cache flush — identically to the base `z_image_turbo`. The
         // control variant is guidance-distilled (no CFG / negative prompt), so the encode phase is a
         // single cond `cap`.
-        let images = self.residency.run(
+        // sc-13571 / GitHub #1658: DiT-dropping staged decode (see `crate::model` for the turbo path).
+        let tiling = pipeline::decode_tiling(req, self.residency.is_sequential());
+        let images = self.residency.run_staged(
             &req.cancel,
             // No PiD overlay on the control path (sc-7846 is base-turbo-only); the heavy loader ignores
             // this flag, so `false` avoids loading a student that would never be used.
@@ -363,10 +378,8 @@ impl ZImageTurboControl {
             // is lazy, so an un-evaluated `cap` keeps the encoder referenced through the graph and the
             // drop would free nothing.
             |cap| Ok(mlx_rs::transforms::eval([cap])?),
-            // ── Phase B: denoise/decode from the heavy bundle. Runs identically for both residencies.
-            |heavy_owned, cap, on_progress| {
-                let heavy = heavy_owned.as_ref();
-
+            // ── Phase B (denoise): heavy bundle + cap → evaluated latents.
+            |heavy: &ZImageControlHeavyOwned, cap, on_progress| {
                 // Static shift=3.0 schedule (shared with the base turbo, sc-2536) — build once. An
                 // unset `req.scheduler` keeps it byte-exact (epic 7114 N1); a curated name re-shapes σ
                 // over the shift.
@@ -381,29 +394,20 @@ impl ZImageTurboControl {
                 // The 33ch control context is constant across steps + the batch — build once. It stays
                 // **f32** (the fork feeds it f32, which promotes the whole control branch to f32).
                 let control_context =
-                    encode_control_context(heavy.vae, control_image, req.width, req.height)?;
+                    encode_control_context(&heavy.vae, control_image, req.width, req.height)?;
 
-                // VAE-encode the init image once too: like control_context, the clean img2img latents
-                // depend only on the init image + dims, not the per-image seed, so they're constant
-                // across the batch (F-034). Only the noise (and its blend) vary per image.
+                // VAE-encode the init image once too (img2img), constant across the batch (F-034).
                 let clean = if is_img2img {
                     let (image, _) = reference.expect("is_img2img implies a reference");
                     Some(encode_init_latents(
-                        heavy.vae, image, req.width, req.height,
+                        &heavy.vae, image, req.width, req.height,
                     )?)
                 } else {
                     None
                 };
 
-                // Per-image batch render shared with the base variant (F-035); the control branch's
-                // only difference is the `denoise_control_with_progress` step threading the f32 control
-                // context + scale (the mixed-precision dtype flow, sc-2720, is preserved in the closure).
                 let sampler_name = req.sampler.as_deref();
-                // The Fun-ControlNet variant is outside the PiD decode scope of sc-7846; pass `None` so
-                // it keeps the native VAE decode unchanged.
-                let images = pipeline::render_batch(
-                    heavy.vae,
-                    None,
+                let latents = pipeline::denoise_batch(
                     &scheduler,
                     clean.as_ref(),
                     start_step,
@@ -412,7 +416,7 @@ impl ZImageTurboControl {
                     on_progress,
                     |latents, seed, op| {
                         denoise_control_with_progress(
-                            heavy.transformer,
+                            &heavy.transformer,
                             &scheduler,
                             sampler_name,
                             seed,
@@ -425,6 +429,21 @@ impl ZImageTurboControl {
                             op,
                         )
                     },
+                )?;
+                Ok(latents)
+            },
+            // Materialize the latents so the control DiT is no longer held via the lazy graph, then shed.
+            |latents| Ok(mlx_rs::transforms::eval(latents.iter())?),
+            // ── Phase C (decode): light (VAE) view + latents → images (no PiD on control). Tiled under
+            // `Sequential`.
+            |view, latents, on_progress| {
+                let images = pipeline::decode_batch(
+                    view.vae,
+                    None,
+                    tiling.as_ref(),
+                    latents,
+                    &req.cancel,
+                    on_progress,
                 )?;
                 Ok(GenerationOutput::Images(images))
             },
