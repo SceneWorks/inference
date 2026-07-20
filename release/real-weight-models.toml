@@ -230,9 +230,9 @@ expected_files = [
 
 [[models]]
 # MOSS-TTSD-v0.5 AR brain (sc-13360): the smallest single-shard dialogue checkpoint (Qwen3 backbone,
-# 2048 hidden / 28 layers) emitting real 8-channel delay-pattern RVQ speech-codebook frames. Honest
-# partial — the AR brain is verified at the token level (candle-audio-moss-tts, unregistered); the
-# OpenMOSS XY_Tokenizer codec (RVQ -> 24 kHz waveform) is a split-off follow-up.
+# 2048 hidden / 28 layers) emitting real 8-channel delay-pattern RVQ speech-codebook frames. Paired
+# with the OpenMOSS XY_Tokenizer codec below (sc-13518); together they render a real 24 kHz
+# multi-speaker AudioTrack (candle-audio-moss-tts, registered).
 key = "moss-ttsd-v05"
 repository = "OpenMOSS-Team/MOSS-TTSD-v0.5"
 revision = "8527b9136b6afefe2252ae597cecea2e80e7ebeb"
@@ -245,6 +245,22 @@ expected_files = [
     "model.safetensors",
     "tokenizer.json",
     "tokenizer_config.json",
+]
+
+[[models]]
+# OpenMOSS XY_Tokenizer codec (sc-13518): the ~2.1 GB dual-channel (semantic + acoustic) codec that
+# decodes MOSS-TTSD's 8-codebook delay-pattern RVQ frames into a 24 kHz waveform. A single raw-pickle
+# `xy_tokenizer.ckpt` (no HF config/safetensors layout); the decode path is ported natively in
+# candle-audio-moss-tts::codec (torch-parity cosine 0.99999994). Paired with the AR snapshot above.
+key = "xy-tokenizer-ttsd"
+repository = "OpenMOSS-Team/XY_Tokenizer_TTSD_V0"
+revision = "c83433728e698ed0698e88cb5096bc221fb8f8c5"
+license = "Apache-2.0"
+size_class = "large"
+profiles = ["audio-macos"]
+environment = ["MOSS_XY_TOKENIZER_SNAPSHOT"]
+expected_files = [
+    "xy_tokenizer.ckpt",
 ]
 
 [[models]]

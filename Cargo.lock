@@ -236,6 +236,7 @@ dependencies = [
  "candle-audio-kokoro",
  "candle-audio-mmaudio",
  "candle-audio-moss-sfx",
+ "candle-audio-moss-tts",
  "candle-audio-moss-tts-realtime",
  "candle-audio-openvoice",
  "candle-audio-whisper",
@@ -328,6 +329,7 @@ name = "candle-audio-moss-tts"
 version = "0.0.0"
 dependencies = [
  "candle-audio",
+ "candle-audio-chatterbox-ve",
  "candle-nn",
  "core-llm",
  "sceneworks-gen-core-testkit",

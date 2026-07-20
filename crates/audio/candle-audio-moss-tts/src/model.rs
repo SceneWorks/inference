@@ -11,18 +11,19 @@
 //! on the real MOSS-TTSD-v0.5 weights (verified by the real-weights conformance test). The RVQ codec
 //! — OpenMOSS's **XY_Tokenizer** (`OpenMOSS-Team/XY_Tokenizer_TTSD_V0`, a 2.1 GB raw-pickle codec
 //! whose architecture lives only in the OpenMOSS reference code, *not* candle's Mimi/SNAC/DAC) — is a
-//! large separate port and is **not yet landed**. So [`generate`](MossTtsdGenerator::generate)
-//! returns a typed error at the codec boundary rather than fabricate audio, and this generator is
-//! **NOT registered** into `candle-audio-catalog`. [`MossTtsdGenerator::rvq_frames`] exposes the AR
-//! token stream the codec will consume.
+//! large separate port. Since sc-13518 it is **landed**: [`crate::codec::XyTokenizerCodec`] decodes
+//! the AR's delay-pattern frames into a 24 kHz waveform, so
+//! [`generate`](MossTtsdGenerator::generate) renders a real [`gen_core::AudioTrack`] and this
+//! generator is **registered** into `candle-audio-catalog`. [`MossTtsdGenerator::rvq_frames`] still
+//! exposes the AR token stream the codec consumes (for the AR-stage conformance test).
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use candle_audio::candle_core::DType;
 use candle_audio::gen_core::{
-    self, Capabilities, GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality,
-    ModelDescriptor, Progress, SpeechSegment, WeightsSource,
+    self, AudioTrack, Capabilities, GenerationOutput, GenerationRequest, Generator, LoadSpec,
+    Modality, ModelDescriptor, Progress, SpeechSegment, WeightsSource,
 };
 use candle_audio::hub::{hf_get_pinned, pinned_snapshot_dir};
 use candle_audio::Result as AudioResult;
@@ -30,6 +31,7 @@ use candle_nn::VarBuilder;
 use tokenizers::Tokenizer;
 
 use crate::backbone::Backbone;
+use crate::codec::XyTokenizerCodec;
 use crate::config::MossTtsdConfig;
 use crate::decode::{build_prompt_grid, DecodeResult, Decoder, DEFAULT_SYSTEM_PROMPT};
 
@@ -44,11 +46,13 @@ pub const HUB_REPO: &str = "OpenMOSS-Team/MOSS-TTSD-v0.5";
 pub const HUB_REVISION: &str = "8527b9136b6afefe2252ae597cecea2e80e7ebeb";
 
 /// The XY_Tokenizer codec repo — the separate ~2.1 GB RVQ codec that decodes the AR's 8-codebook
-/// frames into a 24 kHz waveform. A raw-pickle checkpoint whose architecture lives only in the
-/// OpenMOSS reference code (not an HF-standard safetensors layout); porting its decoder is the split
-/// off follow-up. Pinned here so the follow-up inherits an immutable-SHA source.
+/// frames into a 24 kHz waveform (ported in [`crate::codec`]). A single raw-pickle `xy_tokenizer.ckpt`
+/// (no HF-standard safetensors layout); its decode-side tensors load through candle's pickle reader.
 pub const CODEC_HUB_REPO: &str = "OpenMOSS-Team/XY_Tokenizer_TTSD_V0";
 pub const CODEC_HUB_REVISION: &str = "c83433728e698ed0698e88cb5096bc221fb8f8c5";
+
+/// The single-file XY_Tokenizer checkpoint inside the codec repo (a `torch.load` pickle).
+pub const CODEC_CHECKPOINT_FILE: &str = "xy_tokenizer.ckpt";
 
 /// The license of the pinned MOSS-TTSD-v0.5 weight checkpoint (Apache-2.0, permissive) — surfaced for
 /// SceneWorks' end-product licenses page. Verified against the `OpenMOSS-Team/MOSS-TTSD-v0.5` card.
@@ -70,10 +74,10 @@ pub const WEIGHT_LICENSE_ENTRY: gen_core::WeightLicenseEntry = gen_core::WeightL
 /// Native output sample rate of the XY_Tokenizer codec (Hz).
 pub const SAMPLE_RATE: u32 = 24_000;
 
-/// Approximate AR position (audio-frame) rate — the reference XY_Tokenizer token rate
-/// (`input_sample_rate` 16 kHz / `encoder_downsample_rate` 320 = 50 Hz). Used only to size the AR
-/// position budget; the exact duration↔frame mapping is codec-gated (the codec is not yet ported).
-pub const FRAME_RATE_HZ: f32 = 50.0;
+/// AR audio-frame rate: XY_Tokenizer runs at 12.5 Hz (24 kHz / the codec's 1920 `decoder_upsample_
+/// rate`), so one AR delay-pattern frame becomes [`crate::codec::SAMPLES_PER_FRAME`] waveform
+/// samples. Drives the duration↔frame budget and the emitted track's length.
+pub const FRAME_RATE_HZ: f32 = 12.5;
 
 /// Longest clip advertised.
 pub const MAX_DURATION_SECS: f32 = 300.0;
@@ -244,6 +248,7 @@ pub struct MossTtsdGenerator {
     descriptor: ModelDescriptor,
     root: PathBuf,
     loaded: Mutex<Option<Arc<Loaded>>>,
+    codec: Mutex<Option<Arc<XyTokenizerCodec>>>,
 }
 
 fn lock_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -260,6 +265,20 @@ impl MossTtsdGenerator {
             return Ok(p.clone());
         }
         let built = Arc::new(Loaded::from_snapshot(&self.root)?);
+        *guard = Some(built.clone());
+        Ok(built)
+    }
+
+    /// Load (once, lazily) the XY_Tokenizer codec decoder. The codec is a separate pinned raw-pickle
+    /// checkpoint resolved through the audio lane's hub path (or the `MOSS_XY_TOKENIZER_SNAPSHOT`
+    /// override); see [`resolve_pinned_codec_checkpoint`].
+    fn codec(&self) -> gen_core::Result<Arc<XyTokenizerCodec>> {
+        let mut guard = lock_recover(&self.codec);
+        if let Some(c) = guard.as_ref() {
+            return Ok(c.clone());
+        }
+        let ckpt = resolve_pinned_codec_checkpoint().map_err(gen_core::Error::from)?;
+        let built = Arc::new(XyTokenizerCodec::load(&ckpt).map_err(gen_core::Error::from)?);
         *guard = Some(built.clone());
         Ok(built)
     }
@@ -302,18 +321,30 @@ impl MossTtsdGenerator {
         }
     }
 
-    /// The honest-partial codec boundary: MOSS-TTSD's XY_Tokenizer codec (RVQ codes → 24 kHz PCM) is
-    /// not yet ported, so audio cannot be rendered. Returns a typed `Unsupported` error rather than
-    /// fabricate a waveform. (The AR brain that would feed the codec is real and verified — see
-    /// [`rvq_frames`](Self::rvq_frames).)
-    fn codec_boundary_error(&self) -> gen_core::Error {
-        gen_core::Error::Unsupported(format!(
-            "{MODEL_ID}: the OpenMOSS XY_Tokenizer codec ({}@{}) that decodes the AR RVQ frames into \
-             a 24 kHz waveform is not yet ported — the AR brain emits real, verified delay-pattern \
-             RVQ tokens (see rvq_frames), but audio rendering is a split-off follow-up. This \
-             provider is not registered into the shipping catalog.",
-            CODEC_HUB_REPO, CODEC_HUB_REVISION
-        ))
+    /// The full deterministic synthesis path: run the AR brain to delay-pattern RVQ frames, then
+    /// decode them through the XY_Tokenizer codec ([`crate::codec`]) into one 24 kHz [`AudioTrack`].
+    /// Progress spans the AR loop; a final [`Progress::Decoding`] marks the codec pass. Cancellation
+    /// is honored in the AR loop and re-checked around the codec decode.
+    fn synthesize(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<AudioTrack> {
+        let result = self.rvq_frames(req, on_progress)?;
+        let codec = self.codec()?;
+        on_progress(Progress::Decoding);
+        let cancel = req.cancel.clone();
+        let probe = move || cancel.is_cancelled();
+        let samples = codec
+            .decode_frames(&result.frames, &probe)
+            .map_err(|e| gen_core::Error::Msg(format!("{MODEL_ID}: XY_Tokenizer decode: {e}")))?
+            .ok_or(gen_core::Error::Canceled)?;
+        Ok(AudioTrack {
+            samples,
+            sample_rate: crate::codec::SAMPLE_RATE,
+            channels: 1,
+            stems: Vec::new(),
+        })
     }
 }
 
@@ -329,15 +360,10 @@ impl Generator for MossTtsdGenerator {
     fn generate(
         &self,
         req: &GenerationRequest,
-        _on_progress: &mut dyn FnMut(Progress),
+        on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
-        // Validate the (possibly multi-speaker) request so callers get the real acceptance surface,
-        // then stop at the codec boundary — never fabricate audio.
-        self.validate(req)?;
-        if req.cancel.is_cancelled() {
-            return Err(gen_core::Error::Canceled);
-        }
-        Err(self.codec_boundary_error())
+        let track = self.synthesize(req, on_progress)?;
+        Ok(GenerationOutput::Audio(track))
     }
 }
 
@@ -373,6 +399,7 @@ pub fn load_generator(spec: &LoadSpec) -> gen_core::Result<MossTtsdGenerator> {
         descriptor: descriptor(),
         root,
         loaded: Mutex::new(None),
+        codec: Mutex::new(None),
     })
 }
 
@@ -381,10 +408,46 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     Ok(Box::new(load_generator(spec)?))
 }
 
+// Explicit registration constant for `moss_ttsd_v05` (sc-13518): the XY_Tokenizer codec is ported,
+// so this generator renders real 24 kHz multi-speaker audio and `candle-audio-catalog` registers it.
+candle_audio::register_generators! {
+    pub const REGISTRATION = descriptor => load
+}
+
+/// Add the MOSS-TTSD multi-speaker dialogue-TTS generator to an explicit audio registry builder
+/// (catalog composition), mirroring the sibling audio provider crates.
+pub fn register_providers(
+    registry: gen_core::ProviderRegistryBuilder,
+) -> gen_core::ProviderRegistryBuilder {
+    registry.register_generator(REGISTRATION)
+}
+
+/// Build this crate's own explicit provider catalog (its single-generator surface).
+pub fn provider_registry() -> gen_core::Result<gen_core::ProviderRegistry> {
+    register_providers(gen_core::ProviderRegistryBuilder::new()).build()
+}
+
+/// Materialize the pinned XY_Tokenizer codec checkpoint (`xy_tokenizer.ckpt`) at
+/// [`CODEC_HUB_REVISION`] through the audio lane's F-029 hub path, returning the `.ckpt` file path.
+/// `MOSS_XY_TOKENIZER_SNAPSHOT` overrides with a local snapshot **dir** (the real-weights CI
+/// convention — the file is joined) or a direct `.ckpt` file path (air-gapped runs).
+pub fn resolve_pinned_codec_checkpoint() -> AudioResult<PathBuf> {
+    if let Ok(p) = std::env::var("MOSS_XY_TOKENIZER_SNAPSHOT") {
+        let path = PathBuf::from(p);
+        return Ok(if path.is_dir() {
+            path.join(CODEC_CHECKPOINT_FILE)
+        } else {
+            path
+        });
+    }
+    hf_get_pinned(CODEC_HUB_REPO, CODEC_HUB_REVISION, CODEC_CHECKPOINT_FILE)
+}
+
 /// Materialize the pinned MOSS-TTSD-v0.5 AR snapshot through the audio lane's F-029 hub path:
 /// `config.json` (the snapshot-dir probe), the single-file `model.safetensors`, and the Qwen
-/// tokenizer — all at [`HUB_REVISION`]. Returns the AR snapshot dir. (The XY_Tokenizer codec snapshot
-/// is resolved separately by the follow-up that ports the codec; [`CODEC_HUB_REPO`] pins its source.)
+/// tokenizer — all at [`HUB_REVISION`]. Also warms the pinned XY_Tokenizer codec checkpoint (see
+/// [`resolve_pinned_codec_checkpoint`]) so a single call fetches both models the provider needs to
+/// render audio. Returns the AR snapshot dir.
 pub fn resolve_pinned_snapshot() -> AudioResult<WeightsSource> {
     let dir = pinned_snapshot_dir(HUB_REPO, HUB_REVISION, "config.json")?;
     for file in [
@@ -394,6 +457,8 @@ pub fn resolve_pinned_snapshot() -> AudioResult<WeightsSource> {
     ] {
         hf_get_pinned(HUB_REPO, HUB_REVISION, file)?;
     }
+    // Also warm the codec checkpoint — the provider needs both to render a waveform.
+    let _ = resolve_pinned_codec_checkpoint()?;
     Ok(dir)
 }
 
@@ -522,19 +587,21 @@ mod tests {
     }
 
     #[test]
-    fn generate_errors_at_the_codec_boundary_without_fabricating_audio() {
-        // No weights needed: generate() validates then errors at the codec boundary.
-        let dir = std::env::temp_dir().join("moss-ttsd-codec-boundary");
+    fn generate_without_weights_errors_cleanly() {
+        // generate() now renders real audio (the XY_Tokenizer codec is ported, sc-13518). With no
+        // weights on disk it must surface a typed error while loading the AR snapshot — never panic,
+        // never fabricate audio.
+        let dir = std::env::temp_dir().join("moss-ttsd-no-weights");
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let g = load_generator(&LoadSpec::new(WeightsSource::Dir(dir))).unwrap();
         let req = audio_req(AudioParams {
             sample_rate: Some(24_000),
             ..Default::default()
         });
-        let err = g.generate(&req, &mut |_| {}).unwrap_err();
         assert!(
-            matches!(err, gen_core::Error::Unsupported(_)),
-            "the codec boundary is a typed Unsupported error, got {err:?}"
+            g.generate(&req, &mut |_| {}).is_err(),
+            "generate() must error (not panic) when the AR weights are missing"
         );
     }
 

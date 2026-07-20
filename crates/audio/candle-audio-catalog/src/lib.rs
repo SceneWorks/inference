@@ -49,6 +49,7 @@ pub mod providers {
     pub use candle_audio_kokoro;
     pub use candle_audio_mmaudio;
     pub use candle_audio_moss_sfx;
+    pub use candle_audio_moss_tts;
     pub use candle_audio_moss_tts_realtime;
     pub use candle_audio_openvoice;
     pub use candle_audio_whisper;
@@ -70,6 +71,7 @@ pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistry
     let registry = candle_audio_moss_tts_realtime::register_providers(registry);
     let registry = candle_audio_chatterbox::register_providers(registry);
     let registry = candle_audio_mmaudio::register_providers(registry);
+    let registry = candle_audio_moss_tts::register_providers(registry);
     let registry = candle_audio_chatterbox_ve::register_providers(registry);
     let registry = candle_audio_openvoice::register_providers(registry);
     let registry = candle_audio_whisper::register_providers(registry);
@@ -109,6 +111,7 @@ pub fn weight_licenses() -> Vec<gen_core::WeightLicenseEntry> {
     // the catalog keys ONE composite license row per registered provider (the ship-gate's 1:1 rule),
     // so it folds in the crate's SHIPPED_WEIGHT_LICENSES (the composite), not the per-component list.
     entries.extend_from_slice(candle_audio_mmaudio::SHIPPED_WEIGHT_LICENSES);
+    entries.extend_from_slice(candle_audio_moss_tts::WEIGHT_LICENSES);
     entries.extend_from_slice(candle_audio_chatterbox_ve::WEIGHT_LICENSES);
     entries.extend_from_slice(candle_audio_openvoice::WEIGHT_LICENSES);
     entries.extend_from_slice(candle_audio_whisper::WEIGHT_LICENSES);
@@ -195,6 +198,7 @@ fn lane_can_prepare(spec: &core_llm::PrepareSpec) -> bool {
         || candle_audio_moss_sfx::prepare::can_prepare(spec)
         || candle_audio_acestep::prepare::can_prepare(spec)
         || candle_audio_moss_tts_realtime::prepare::can_prepare(spec)
+        || candle_audio_moss_tts::prepare::can_prepare(spec)
         || candle_audio_chatterbox::prepare::can_prepare(spec)
         || candle_audio_openvoice::prepare::can_prepare(spec)
         || candle_audio_whisper::prepare::can_prepare(spec)
@@ -211,6 +215,8 @@ fn lane_prepare(spec: &core_llm::PrepareSpec) -> core_llm::Result<core_llm::Prep
         candle_audio_acestep::prepare::prepare(spec)
     } else if candle_audio_moss_tts_realtime::prepare::can_prepare(spec) {
         candle_audio_moss_tts_realtime::prepare::prepare(spec)
+    } else if candle_audio_moss_tts::prepare::can_prepare(spec) {
+        candle_audio_moss_tts::prepare::prepare(spec)
     } else if candle_audio_chatterbox::prepare::can_prepare(spec) {
         candle_audio_chatterbox::prepare::prepare(spec)
     } else if candle_audio_openvoice::prepare::can_prepare(spec) {
@@ -267,7 +273,8 @@ mod tests {
                 "moss_tts_realtime",
                 "chatterbox_tts",
                 "mmaudio_small_16k",
-                "mmaudio_large_44k"
+                "mmaudio_large_44k",
+                "moss_ttsd_v05"
             ]
         );
         // The voice-cloning identity embedder surfaces as its own kind (sc-12844), in catalog order.
@@ -396,7 +403,7 @@ mod tests {
                 entry.provider_id
             );
         }
-        // The eleven currently-shipped audio providers, in catalog order, with their verified SPDX
+        // The twelve currently-shipped audio providers, in catalog order, with their verified SPDX
         // ids. All permissive (MIT / Apache-2.0) EXCEPT the two MMAudio Foley providers: each
         // assembles five checkpoints whose strictest term (Apple ML Research on the DFN5B-CLIP
         // conditioner) is research/non-commercial, surfaced as one composite non-commercial row —
@@ -425,6 +432,7 @@ mod tests {
                     "LicenseRef-MMAudio-large-44k-composite",
                     false
                 ),
+                ("moss_ttsd_v05", "Apache-2.0", true),
                 ("chatterbox_ve", "MIT", true),
                 ("openvoice_v2", "MIT", true),
                 ("whisper_base", "Apache-2.0", true),
@@ -546,6 +554,20 @@ mod tests {
         let spec = super::core_llm::PrepareSpec::dense(&cb, cb.join("out"));
         assert!((regs[0].can_prepare)(&spec));
         let _ = std::fs::remove_dir_all(&cb);
+        // ...a MOSS-TTSD dialogue snapshot dir is accepted too (sc-13518: config.json naming
+        // MossTTSDForCausalLM + model.safetensors)...
+        let mt = std::env::temp_dir().join("audio-catalog-moss-ttsd-probe");
+        let _ = std::fs::remove_dir_all(&mt);
+        std::fs::create_dir_all(&mt).unwrap();
+        std::fs::write(mt.join("model.safetensors"), b"stub").unwrap();
+        std::fs::write(
+            mt.join("config.json"),
+            r#"{"architectures": ["MossTTSDForCausalLM"]}"#,
+        )
+        .unwrap();
+        let spec = super::core_llm::PrepareSpec::dense(&mt, mt.join("out"));
+        assert!((regs[0].can_prepare)(&spec));
+        let _ = std::fs::remove_dir_all(&mt);
         // ...while a bare dir (neither audio- nor LLM-shaped) is not.
         let empty = std::env::temp_dir().join("audio-catalog-empty-probe");
         let _ = std::fs::remove_dir_all(&empty);

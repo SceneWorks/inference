@@ -84,6 +84,15 @@
       "restriction": null
     },
     {
+      "provider_id": "moss_ttsd_v05",
+      "spdx_id": "Apache-2.0",
+      "license_name": "Apache License 2.0",
+      "source_url": "https://huggingface.co/OpenMOSS-Team/MOSS-TTSD-v0.5",
+      "commercial_use": true,
+      "attribution": "MOSS-TTSD-v0.5 © OpenMOSS Team — licensed under Apache-2.0",
+      "restriction": null
+    },
+    {
       "provider_id": "openvoice_v2",
       "spdx_id": "MIT",
       "license_name": "MIT License",
