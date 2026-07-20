@@ -74,13 +74,14 @@ pub use model::{
 /// This crate's model-weight-license entries for catalog aggregation (sc-13332, extended sc-13251).
 /// The ACE-Step provider is assembled from multiple MIT checkpoints, so it contributes the composite
 /// (effective-restriction) row keyed by [`MODEL_ID`] PLUS one per-checkpoint attribution row for
-/// each cover-only sft FSQ module (`audio_tokenizer`, `audio_token_detokenizer`). The audio catalog
-/// concatenates every provider's slice into the model-licenses manifest SceneWorks lists on its
-/// end-product licenses page.
+/// each cover-only sft component: the two FSQ modules (`audio_tokenizer`, `audio_token_detokenizer`)
+/// and the non-distilled cover DiT (`transformer`). The audio catalog concatenates every provider's
+/// slice into the model-licenses manifest SceneWorks lists on its end-product licenses page.
 pub const WEIGHT_LICENSES: &[gen_core::WeightLicenseEntry] = &[
     model::WEIGHT_LICENSE_ENTRY,
     model::WEIGHT_LICENSE_ENTRY_AUDIO_TOKENIZER,
     model::WEIGHT_LICENSE_ENTRY_AUDIO_TOKEN_DETOKENIZER,
+    model::WEIGHT_LICENSE_ENTRY_SFT_TRANSFORMER,
 ];
 
 /// Add the ACE-Step generator to an explicit audio registry builder (catalog composition).

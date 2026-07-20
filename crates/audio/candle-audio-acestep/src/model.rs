@@ -28,7 +28,7 @@
 //! Determinism: same request + seed ⇒ byte-identical samples. Output is a single stereo mix
 //! (`stems` empty — ACE-Step 1.5 text-to-music renders a mixdown, not separated stems).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use candle_audio::gen_core::{
@@ -81,11 +81,13 @@ pub const WEIGHT_LICENSE_ENTRY: candle_audio::gen_core::WeightLicenseEntry =
         license: WEIGHT_LICENSE,
     };
 
-/// Hub pin for the Cover-only FSQ modules (sc-13251): `ACE-Step/acestep-v15-xl-sft-diffusers` at an
+/// Hub pin for the Cover checkpoint (sc-13251): `ACE-Step/acestep-v15-xl-sft-diffusers` at an
 /// immutable commit SHA (MIT). The pinned turbo checkpoint ships no `audio_tokenizer` /
 /// `audio_token_detokenizer`; this sibling checkpoint (same org, same 64-ch/25 Hz acoustic latent
-/// space) does. Only those two small component dirs are pulled — the Cover restyle reuses the
-/// already-loaded turbo DiT / condition encoder / VAE (the reference's `is_turbo` cover path).
+/// space) does. The Cover restyle pulls the two FSQ component dirs AND the non-distilled
+/// `transformer` (~7.8 GB) — the reference's actual cover DiT — reusing the already-loaded turbo
+/// text-encoder / condition-encoder / VAE. Everything else (Inpaint/Repaint/Extend, text-to-music)
+/// stays on the turbo DiT.
 pub const SFT_HUB_REPO: &str = "ACE-Step/acestep-v15-xl-sft-diffusers";
 pub const SFT_HUB_REVISION: &str = "4bf7b60a63b27144f539f980927eeb89f5f912b0";
 
@@ -130,6 +132,27 @@ pub const WEIGHT_LICENSE_ENTRY_AUDIO_TOKEN_DETOKENIZER: candle_audio::gen_core::
         provider_id: MODEL_ID,
         component: Some("audio_token_detokenizer"),
         license: AUDIO_TOKEN_DETOKENIZER_WEIGHT_LICENSE,
+    };
+
+/// License of the sft `transformer` — the non-distilled reference cover DiT (sc-13251) — MIT.
+pub const SFT_TRANSFORMER_WEIGHT_LICENSE: candle_audio::gen_core::WeightLicense =
+    candle_audio::gen_core::WeightLicense {
+        spdx_id: "MIT",
+        name: "MIT License",
+        source_url: "https://huggingface.co/ACE-Step/acestep-v15-xl-sft-diffusers",
+        attribution: Some(
+            "ACE-Step v1.5 XL SFT transformer (cover DiT) © ACE-Step — licensed under MIT",
+        ),
+        commercial_use: true,
+        restriction: None,
+    };
+
+/// Per-checkpoint attribution row for the sft `transformer` cover DiT (component of [`MODEL_ID`]).
+pub const WEIGHT_LICENSE_ENTRY_SFT_TRANSFORMER: candle_audio::gen_core::WeightLicenseEntry =
+    candle_audio::gen_core::WeightLicenseEntry {
+        provider_id: MODEL_ID,
+        component: Some("transformer"),
+        license: SFT_TRANSFORMER_WEIGHT_LICENSE,
     };
 
 /// Native output sample rate (Hz).
@@ -186,10 +209,11 @@ pub fn descriptor() -> ModelDescriptor {
             audio_voices: vec![],
             audio_languages: LANGUAGES.to_vec(),
             // The edit modes the provider supports. Inpaint / Repaint / Extend ride ACE-Step's
-            // `repaint` task (region regenerate + seamless stitch, sc-12847). Cover (sc-13251) is
-            // the whole-clip restyle: it pulls the FSQ `audio_tokenizer` / `audio_token_detokenizer`
-            // from the sibling sft checkpoint (the turbo snapshot ships neither) and restyles the
-            // source through the same turbo DiT from a new prompt.
+            // `repaint` task (region regenerate + seamless stitch, sc-12847) on the turbo DiT. Cover
+            // (sc-13251) is the whole-clip restyle: it pulls the FSQ `audio_tokenizer` /
+            // `audio_token_detokenizer` AND the non-distilled `transformer` (the reference's actual
+            // cover DiT) from the sibling sft checkpoint, then restyles the source from a new prompt —
+            // the sft DiT preserves the source's melodic content the distilled turbo DiT does not.
             audio_edit_modes: vec![
                 AudioEditMode::Inpaint,
                 AudioEditMode::Repaint,
@@ -432,12 +456,16 @@ impl Generator for AceStepGenerator {
             let source_channels = edit.audio.channels as usize;
             match edit.mode {
                 AudioEditMode::Cover => {
-                    // Cover pulls the pinned sft FSQ modules (lazily loaded + cached) and restyles
-                    // the whole clip through the turbo DiT from the new prompt.
+                    // Cover pulls the pinned sft FSQ modules AND the non-distilled sft cover DiT
+                    // (both lazily loaded + cached) and restyles the whole clip from the new prompt.
                     let (tok_w, tok_c, det_w, det_c) =
                         resolve_cover_modules().map_err(gen_core::Error::from)?;
                     let cover = pipeline
                         .cover_modules(&tok_w, &tok_c, &det_w, &det_c)
+                        .map_err(gen_core::Error::from)?;
+                    let dit_shards = resolve_cover_dit().map_err(gen_core::Error::from)?;
+                    let cover_dit = pipeline
+                        .cover_dit(&dit_shards)
                         .map_err(gen_core::Error::from)?;
                     pipeline
                         .cover(
@@ -446,6 +474,7 @@ impl Generator for AceStepGenerator {
                             source_channels,
                             &params,
                             &cover,
+                            &cover_dit,
                             &mut progress,
                             &probe,
                         )
@@ -559,15 +588,9 @@ pub fn resolve_cover_modules() -> AudioResult<(PathBuf, PathBuf, PathBuf, PathBu
     Ok((tok_weights, tok_config, det_weights, det_config))
 }
 
-/// The transformer safetensors shard filenames listed in
-/// `transformer/diffusion_pytorch_model.safetensors.index.json`.
-fn dit_shards(repo: &str, revision: &str) -> AudioResult<Vec<String>> {
-    let index_path = hf_get_pinned(
-        repo,
-        revision,
-        "transformer/diffusion_pytorch_model.safetensors.index.json",
-    )?;
-    let text = std::fs::read_to_string(&index_path)
+/// Distinct, sorted shard filenames listed in a `*.safetensors.index.json` `weight_map`.
+fn shard_names_from_index(index_path: &Path) -> AudioResult<Vec<String>> {
+    let text = std::fs::read_to_string(index_path)
         .map_err(|e| AudioError::Msg(format!("read {}: {e}", index_path.display())))?;
     let v: serde_json::Value = serde_json::from_str(&text)
         .map_err(|e| AudioError::Msg(format!("parse {}: {e}", index_path.display())))?;
@@ -584,10 +607,45 @@ fn dit_shards(repo: &str, revision: &str) -> AudioResult<Vec<String>> {
     shards.dedup();
     if shards.is_empty() {
         return Err(AudioError::Msg(format!(
-            "{repo}: transformer index lists no shards"
+            "{}: index lists no shards",
+            index_path.display()
         )));
     }
     Ok(shards)
+}
+
+/// The transformer safetensors shard filenames listed in
+/// `transformer/diffusion_pytorch_model.safetensors.index.json`.
+fn dit_shards(repo: &str, revision: &str) -> AudioResult<Vec<String>> {
+    let index_path = hf_get_pinned(
+        repo,
+        revision,
+        "transformer/diffusion_pytorch_model.safetensors.index.json",
+    )?;
+    shard_names_from_index(&index_path)
+}
+
+/// Resolve the pinned **sft** cover DiT transformer shards (sc-13251) — the non-distilled reference
+/// cover model, ~7.8 GB — returning the safetensors shard paths for lazy loading on the first Cover
+/// request. `ACESTEP_SFT_SNAPSHOT` overrides the F-029 hub path with a local sft snapshot dir.
+pub fn resolve_cover_dit() -> AudioResult<Vec<PathBuf>> {
+    if let Ok(dir) = std::env::var("ACESTEP_SFT_SNAPSHOT") {
+        let root = PathBuf::from(dir).join("transformer");
+        let index = root.join("diffusion_pytorch_model.safetensors.index.json");
+        return Ok(shard_names_from_index(&index)?
+            .into_iter()
+            .map(|s| root.join(s))
+            .collect());
+    }
+    let mut out = Vec::new();
+    for shard in dit_shards(SFT_HUB_REPO, SFT_HUB_REVISION)? {
+        out.push(hf_get_pinned(
+            SFT_HUB_REPO,
+            SFT_HUB_REVISION,
+            &format!("transformer/{shard}"),
+        )?);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

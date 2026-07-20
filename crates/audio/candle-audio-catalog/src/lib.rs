@@ -459,8 +459,9 @@ mod tests {
                 ("kokoro_82m", None, "Apache-2.0", true),
                 ("moss_sfx_v2", None, "Apache-2.0", true),
                 // ACE-Step is multi-checkpoint since sc-13251: the turbo primary (composite/effective
-                // MIT row) plus the two cover-only sft FSQ modules (audio_tokenizer /
-                // audio_token_detokenizer), all MIT. Composite (None) first, in WEIGHT_LICENSES order.
+                // MIT row) plus the cover-only sft components — the two FSQ modules (audio_tokenizer /
+                // audio_token_detokenizer) and the non-distilled cover DiT (transformer) — all MIT.
+                // Composite (None) first, then components in WEIGHT_LICENSES order.
                 ("acestep_v15_turbo", None, "MIT", true),
                 ("acestep_v15_turbo", Some("audio_tokenizer"), "MIT", true),
                 (
@@ -469,6 +470,7 @@ mod tests {
                     "MIT",
                     true,
                 ),
+                ("acestep_v15_turbo", Some("transformer"), "MIT", true),
                 ("moss_tts_realtime", None, "Apache-2.0", true),
                 ("chatterbox_tts", None, "MIT", true),
                 // -- mmaudio_small_16k: composite + 5 per-checkpoint rows --

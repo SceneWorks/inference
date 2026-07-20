@@ -676,30 +676,32 @@ fn chroma_corr(a: &[f64; 12], b: &[f64; 12]) -> f64 {
 /// key (a pitch-shifted source's cover is no less chroma-similar to the original than its own cover —
 /// the cover re-anchors the key). The gate has two halves, both of which must hold:
 ///
-/// - **CONTENT PRESERVED (positive, discriminating SEMANTIC gate)** — the feature is the timbre-
-///   invariant **chroma** (pitch-class) profile: a note and its harmonics map onto the same pitch
-///   classes regardless of instrument, so chroma captures the melodic/tonal content the cover keeps
-///   while being blind to the timbre it changes. With two genre-contrasting sources A and B and their
-///   covers under ONE shared `cover(prompt, seed, steps)`, the **matched** similarity (a source ↔ its
-///   OWN cover) materially beats the **mismatched** one (a source ↔ the OTHER source's cover). The two
-///   covers differ only in which source conditioned them, so a materially higher matched score proves
-///   the cover carries THIS source's tonal character, not the prompt alone. A generic, source-agnostic
-///   cover — or a broken-conditioning one (e.g. the known-bad VAE-encode run) — would make the two
-///   covers ≈ identical ⇒ matched ≈ mismatched ⇒ margin ≈ 0, so this gate FAILS on exactly the case
-///   the earlier divergence-only gate let through. (Chroma is the two-source **distribution/character**
-///   comparison, NOT an absolute-key comparison — a pitch-shifted control gives ≈ 0 because the cover
-///   re-anchors key, which is why an absolute-key gate would be wrong for Option A. LAION CLAP was also
-///   evaluated as the semantic feature but discriminated far less consistently across source pairs than
-///   chroma — matching the task's own note that a timbre-driven embedder may separate worse than a
-///   harmonic feature — so chroma is the gate.)
+/// - **CONTENT PRESERVED (positive, discriminating, NON-MASKING SEMANTIC gate)** — the feature is the
+///   timbre-invariant **chroma** (pitch-class) profile: a pitch and its harmonics map onto the same
+///   pitch classes regardless of instrument, so chroma captures the melodic/tonal content the cover
+///   keeps while being blind to the timbre it changes. With two chroma-distinct sources A and B and
+///   their covers under ONE shared `cover(prompt, seed, steps)`, the gate asserts, PER DIRECTION and
+///   independently (never on a mean that could hide a weak leg): each source's own cover PRESERVES its
+///   chroma (matched ↑ over a floor) AND is source-SPECIFIC (matched − mismatched, i.e. source ↔ its
+///   OWN cover minus source ↔ the OTHER source's cover, over a floor). Cover runs on the non-distilled
+///   **sft DiT** (see [`AceStepPipeline::cover`]); the distilled 8-step turbo DiT could not clear this
+///   per-direction for the weaker leg (sc-13251). Per-direction is load-bearing — the mean alone would
+///   let one leg sit at the noise floor while the other carries it, letting a source-agnostic cover of
+///   the weak source slip through; a fully source-agnostic / broken-conditioning cover (e.g. the
+///   known-bad VAE-encode run) makes the two covers ≈ identical ⇒ every margin ≈ 0, failing the gate.
+///   (Chroma is a two-source **distribution/character** comparison, NOT an absolute-key one — a
+///   pitch-shifted control gives ≈ 0 because the cover re-anchors key. LAION CLAP was also evaluated
+///   but discriminated far less consistently across source pairs, so chroma is the gate. The FSQ codec
+///   preserves DISTINCTIVE content; a generic bright clip is compressed to generic codes and loses its
+///   per-source specificity — so the sources are chosen distinctive + tonal, e.g. the sitar.)
 /// - **TIMBRE CHANGED (restyle proven)** — the octave-band timbre fingerprint moved from the source
 ///   (band-L1) AND the waveform diverged (rel-L2 up, correlation down). Fails if cover returned the
 ///   source unchanged or ignored the new prompt.
 ///
 /// Plus: 48 kHz stereo, finite, non-silent, same duration as the source, deterministic (seed law).
 ///
-/// The four WAVs are written for human listening (`ACESTEP_COVER_*_WAV` override the paths). Kept
-/// short (few seconds, turbo 8 steps) — ACE-Step CPU generation is slow.
+/// The four WAVs are written for human listening (`ACESTEP_COVER_*_WAV` override the paths). Sources
+/// are generated on the fast turbo DiT; only the two covers run on the slower non-distilled sft DiT.
 #[test]
 #[ignore = "real weights: needs an ACE-Step snapshot (ACESTEP_SNAPSHOT / ACESTEP_SFT_SNAPSHOT or network); run with --ignored"]
 fn acestep_cover_wav_conformance() {
@@ -714,18 +716,25 @@ fn acestep_cover_wav_conformance() {
     // The cover request's noise seed — SHARED by both covers so the only difference between them is
     // the source that conditions them.
     const COVER_SEED: u64 = 42;
-    // Two genre-contrasting sources (different prompts AND seeds) so their chroma profiles differ (a
-    // precondition the test asserts). Both are tonal/vivid but opposite in genre/instrumentation, so
-    // each cover carries a distinct, discriminable source character.
+    // Two chroma-DISTINCT sources (different prompts AND seeds) whose content the FSQ codec KEEPS, so
+    // the non-distilled sft cover DiT preserves each per-direction. The FSQ (~80 bit/s at 5 Hz)
+    // preserves a source's melodic content only when that content is DISTINCTIVE (a generic bright
+    // clip is compressed to generic codes and its per-source specificity is lost — measured across
+    // sources, sc-13251); and the two-source margin needs the sources chroma-DISTINCT. A = a solo
+    // sitar raga: distinctive TIMBRE (so its content survives the codec — matched ≈ 0.79) AND tonal
+    // on a specific scale (so its chroma is distinct from B — the rare combination that clears BOTH
+    // legs). B = dark dissonant industrial electronic (distinctive too — matched ≈ 0.67). The
+    // distilled 8-step turbo DiT could not clear the per-direction floor for the weaker leg on ANY
+    // pair; the sft DiT does (verified sitar/industrial AND steel-drum/industrial, sc-13251).
     const SRC_A_SEED: u64 = 42;
     const SRC_B_SEED: u64 = 7;
     let src_a_prompt =
-        "upbeat cheerful acoustic folk, bright lively fingerpicked steel-string guitar, major key";
+        "a hypnotic solo sitar raga with a resonant drone, distinctive twanging strings, meditative Indian classical";
     let src_b_prompt =
         "dark aggressive industrial electronic, heavy distorted bass, ominous grinding machine drones";
-    // A timbre-DISTINCT cover prompt (brass — a spectrally very different envelope ⇒ octave-band
-    // timbre moves hard) shared by both covers, so the new timbre cancels in the matched-vs-mismatched
-    // comparison and only the source's carried-over tonal character remains to discriminate.
+    // A brass cover shared by both covers — spectrally distinct from both sources (octave-band timbre
+    // moves hard). The shared new timbre cancels in the matched-vs-mismatched comparison, leaving each
+    // source's carried-over tonal character.
     let cover_prompt = "a brass ensemble of trumpets and trombones";
 
     let audio = |secs: Option<f32>| AudioParams {
@@ -807,6 +816,12 @@ fn acestep_cover_wav_conformance() {
     let mismatched_a = chroma_corr(&chr_sa, &chr_cb);
     let matched_b = chroma_corr(&chr_sb, &chr_cb);
     let mismatched_b = chroma_corr(&chr_sb, &chr_ca);
+    // PER-DIRECTION margins — EACH source's own cover must independently beat the mismatched control.
+    // Gating on the mean alone lets one direction sit at the noise floor while the other compensates,
+    // which would let a source-agnostic cover of the weak source slip through; the per-direction floor
+    // closes that.
+    let margin_a = matched_a - mismatched_a;
+    let margin_b = matched_b - mismatched_b;
     let chroma_matched = 0.5 * (matched_a + matched_b);
     let chroma_mismatched = 0.5 * (mismatched_a + mismatched_b);
     let chroma_margin = chroma_matched - chroma_mismatched;
@@ -852,8 +867,8 @@ fn acestep_cover_wav_conformance() {
          source A {} | source B {} | cover A {} | cover B (mismatched) {}\n  \
          dur {dur_cov:.2}s | cover-A rms {rms_a:.4} cover-B rms {rms_b:.4} | \
          timbre band-L1(srcA→coverA) {timbre_div:.4} | vs source A: rel-L2 {wav_l2:.4} corr {wav_corr:.4}\n  \
-         chroma-corr: matched(A↔coverA) {matched_a:.4} mismatched(A↔coverB) {mismatched_a:.4} | \
-         matched(B↔coverB) {matched_b:.4} mismatched(B↔coverA) {mismatched_b:.4}\n  \
+         chroma-corr A: matched {matched_a:.4} mismatched {mismatched_a:.4} = margin {margin_a:+.4} | \
+         chroma-corr B: matched {matched_b:.4} mismatched {mismatched_b:.4} = margin {margin_b:+.4}\n  \
          matched-mean {chroma_matched:.4} - mismatched-mean {chroma_mismatched:.4} = MARGIN \
          {chroma_margin:+.4} | srcA↔srcB chroma {src_ab_chroma:.4}",
         src_a_path.display(),
@@ -894,18 +909,46 @@ fn acestep_cover_wav_conformance() {
          control cannot discriminate; pick more contrasting source prompts/seeds"
     );
 
-    // (c) CONTENT PRESERVED — the positive, discriminating SEMANTIC gate. Each cover's chroma is
-    //     closer to ITS OWN source than to the other source's cover: matched-mean beats mismatched-mean
-    //     by a real margin, proving the cover carries THIS source's tonal/melodic character (not just
-    //     the shared prompt). A source-agnostic or broken-conditioning cover makes the two covers ≈
-    //     identical ⇒ margin ≈ 0. Thresholds carry ~2x headroom over the measured real-weights values
-    //     (see the story comment / PR for the numbers).
-    const CHROMA_MATCHED_FLOOR: f64 = 0.15;
+    // (c) CONTENT PRESERVED — the positive, discriminating, NON-MASKING SEMANTIC gate on the
+    //     non-distilled sft cover DiT. Each cover's chroma is closer to ITS OWN source than to the
+    //     other source's cover, proving the cover carries THIS source's tonal/melodic character (not
+    //     just the shared prompt). A source-agnostic or broken-conditioning cover makes the two
+    //     covers ≈ identical ⇒ every margin ≈ 0. FOUR conjuncts, all required, chosen so NO single
+    //     source's result can be masked by the other's:
+    //       - EACH per-direction MATCHED chroma-corr (source ↔ its OWN cover) clears a floor — so each
+    //         source's content is GENUINELY preserved (a high margin is not enough on its own: a cover
+    //         that barely resembles its source can still out-score an even-more-unrelated other cover);
+    //       - EACH per-direction MARGIN (matched − mismatched) clears a floor — source-SPECIFIC
+    //         preservation, in both directions independently;
+    //       - the aggregate margin clears its own (larger) floor.
+    //     The distilled 8-step turbo DiT could NOT clear these per-direction (its weak leg sat at the
+    //     noise floor, sc-13251); the sft DiT does — for sources whose content the FSQ codec keeps
+    //     (distinctive + tonal, e.g. the sitar), verified over ≥2 chroma-distinct pairs. Floors sit
+    //     below the measured values with headroom (numbers in the story comment / PR).
+    const CHROMA_PER_DIR_MATCHED_FLOOR: f64 = 0.40;
+    const CHROMA_PER_DIR_FLOOR: f64 = 0.03;
     const CHROMA_MARGIN: f64 = 0.05;
     assert!(
-        chroma_matched > CHROMA_MATCHED_FLOOR,
-        "cover does not carry the source's tonal content (chroma matched-mean {chroma_matched:.4} ≤ \
-         floor {CHROMA_MATCHED_FLOOR}) — content not preserved"
+        matched_a > CHROMA_PER_DIR_MATCHED_FLOOR,
+        "source A's own cover does not preserve source A's tonal content (matched {matched_a:.4} ≤ \
+         floor {CHROMA_PER_DIR_MATCHED_FLOOR}) — content not preserved for this source"
+    );
+    assert!(
+        matched_b > CHROMA_PER_DIR_MATCHED_FLOOR,
+        "source B's own cover does not preserve source B's tonal content (matched {matched_b:.4} ≤ \
+         floor {CHROMA_PER_DIR_MATCHED_FLOOR}) — content not preserved for this source"
+    );
+    assert!(
+        margin_a > CHROMA_PER_DIR_FLOOR,
+        "source A's cover is not conditioned on source A: matched {matched_a:.4} does not beat \
+         mismatched {mismatched_a:.4} by > {CHROMA_PER_DIR_FLOOR} (margin {margin_a:+.4}) — this \
+         direction is at the noise floor and would let a source-agnostic cover of A slip through"
+    );
+    assert!(
+        margin_b > CHROMA_PER_DIR_FLOOR,
+        "source B's cover is not conditioned on source B: matched {matched_b:.4} does not beat \
+         mismatched {mismatched_b:.4} by > {CHROMA_PER_DIR_FLOOR} (margin {margin_b:+.4}) — this \
+         direction is at the noise floor and would let a source-agnostic cover of B slip through"
     );
     assert!(
         chroma_margin > CHROMA_MARGIN,
@@ -915,10 +958,12 @@ fn acestep_cover_wav_conformance() {
     );
 
     println!(
-        "acestep_cover_wav_conformance: dur {dur_cov:.2}s | timbre band-L1 {timbre_div:.4} | \
-         chroma semantic matched {chroma_matched:.4} > mismatched {chroma_mismatched:.4} \
-         (margin {chroma_margin:+.4}, floor {CHROMA_MATCHED_FLOOR}, min-margin {CHROMA_MARGIN}, \
-         srcA↔srcB {src_ab_chroma:.4}) | wrote {} + {} + {} + {}",
+        "acestep_cover_wav_conformance (sft DiT): dur {dur_cov:.2}s | timbre band-L1 {timbre_div:.4} | \
+         per-direction matched A {matched_a:.4} B {matched_b:.4} (floor {CHROMA_PER_DIR_MATCHED_FLOOR}) | \
+         per-direction margins A {margin_a:+.4} B {margin_b:+.4} (floor {CHROMA_PER_DIR_FLOOR}) | \
+         aggregate matched {chroma_matched:.4} > mismatched {chroma_mismatched:.4} \
+         (margin {chroma_margin:+.4}, min-margin {CHROMA_MARGIN}, srcA↔srcB {src_ab_chroma:.4}) | \
+         wrote {} + {} + {} + {}",
         src_a_path.display(),
         src_b_path.display(),
         cov_a_path.display(),
