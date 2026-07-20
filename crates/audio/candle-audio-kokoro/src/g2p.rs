@@ -19,7 +19,7 @@
 //! Dashes: an intra-word compound hyphen (`text-to-speech`, `well-known`) should read as one
 //! seamless phrase, while a standalone/interruption dash (`wait -- what`) is a pause. ASCII
 //! `-` and en-dash `–` are absent from Kokoro's vocab, so a raw hyphen only ever degrades to
-//! a token boundary; [`normalize_dashes`] promotes the *punctuation* dashes to `—` (a real
+//! a token boundary; `normalize_dashes` promotes the *punctuation* dashes to `—` (a real
 //! pause) and leaves compound hyphens to flow. Finally runs of whitespace collapse to a
 //! single space: the vocab's space (id 16) is itself a pause token, so a hyphen that degrades
 //! to a bare space would otherwise stack dead air (`text-to-speech` → three spaces around
