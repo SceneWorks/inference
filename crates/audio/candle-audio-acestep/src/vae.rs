@@ -35,6 +35,14 @@ pub const VAE_FILE: &str = "diffusion_pytorch_model.safetensors";
 
 /// SnakeBeta activation: `x + (β + 1e-9)⁻¹ · sin²(αx)`, `α`/`β` per channel `[1, C, 1]` (the
 /// Oobleck checkpoint's Snake carries both `alpha` and `beta`).
+///
+/// The diffusers `Snake1d` is instantiated with **`logscale=True`** (the default), so the stored
+/// `alpha`/`beta` are LOG-domain parameters — the activation exponentiates them (`α = exp(alpha)`,
+/// `β = exp(beta)`) before use. The `exp` is load-bearing for both the decoder and (added
+/// sc-12847) the encoder: without it the VAE round-trip is inaccurate (sc-13251 — the pure
+/// `decode(encode(x))` was anti-correlated with the source), which the earlier heuristic music/edit
+/// conformance tests could not catch (repaint preserves the untouched span by waveform stitching,
+/// not by VAE fidelity).
 struct Snake {
     alpha: Tensor,
     beta: Tensor,
@@ -42,10 +50,12 @@ struct Snake {
 
 impl Snake {
     fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
-        let ax = x.broadcast_mul(&self.alpha)?;
+        let alpha = self.alpha.exp()?;
+        let beta = self.beta.exp()?;
+        let ax = x.broadcast_mul(&alpha)?;
         let s = ax.sin()?;
         let s2 = (&s * &s)?;
-        x + s2.broadcast_div(&(&self.beta + 1e-9)?)
+        x + s2.broadcast_div(&(&beta + 1e-9)?)
     }
 }
 
