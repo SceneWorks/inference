@@ -124,6 +124,10 @@ pub const WEIGHT_LICENSE: gen_core::WeightLicense = gen_core::WeightLicense {
 /// provider). The five per-component entries live in [`crate::WEIGHT_LICENSES`].
 pub const WEIGHT_LICENSE_ENTRY: gen_core::WeightLicenseEntry = gen_core::WeightLicenseEntry {
     provider_id: MODEL_ID,
+    // The composite / effective-restriction row (component == None) — the at-a-glance
+    // "can we use this provider" signal. The per-checkpoint attribution rows live in
+    // `crate::SHIPPED_WEIGHT_LICENSES` beside it (sc-13493).
+    component: None,
     license: WEIGHT_LICENSE,
 };
 

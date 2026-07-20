@@ -98,8 +98,10 @@ pub fn provider_registry() -> gen_core::Result<ProviderRegistry> {
 // ---------------------------------------------------------------------------------------------
 
 /// Every shipped audio provider's model-weight license, in catalog order — the aggregate the
-/// release tooling serializes into the model-licenses manifest SceneWorks consumes (one row per
-/// registered provider, keyed by its registry id).
+/// release tooling serializes into the model-licenses manifest SceneWorks consumes. Single-checkpoint
+/// providers contribute one row (keyed by their registry id, `component == None`); a multi-checkpoint
+/// provider (MMAudio) contributes one composite/effective-restriction row PLUS one per-checkpoint
+/// component row (sc-13493), all keyed by the `(provider_id, component)` pair.
 pub fn weight_licenses() -> Vec<gen_core::WeightLicenseEntry> {
     let mut entries = Vec::new();
     entries.extend_from_slice(candle_audio_kokoro::WEIGHT_LICENSES);
@@ -107,9 +109,11 @@ pub fn weight_licenses() -> Vec<gen_core::WeightLicenseEntry> {
     entries.extend_from_slice(candle_audio_acestep::WEIGHT_LICENSES);
     entries.extend_from_slice(candle_audio_moss_tts_realtime::WEIGHT_LICENSES);
     entries.extend_from_slice(candle_audio_chatterbox::WEIGHT_LICENSES);
-    // MMAudio ships as one registered provider (mmaudio_small_16k) assembled from five checkpoints;
-    // the catalog keys ONE composite license row per registered provider (the ship-gate's 1:1 rule),
-    // so it folds in the crate's SHIPPED_WEIGHT_LICENSES (the composite), not the per-component list.
+    // MMAudio ships two registered providers (mmaudio_small_16k, mmaudio_large_44k), each assembled
+    // from five checkpoints under their own upstream licenses. Since sc-13493 the catalog folds in
+    // ALL of SHIPPED_WEIGHT_LICENSES: for each provider a composite / effective-restriction row
+    // (component == None) PLUS one per-checkpoint attribution row (component == Some(name)) — the
+    // manifest carries both the CC-BY-* per-upstream attribution and the at-a-glance restriction.
     entries.extend_from_slice(candle_audio_mmaudio::SHIPPED_WEIGHT_LICENSES);
     entries.extend_from_slice(candle_audio_moss_tts::WEIGHT_LICENSES);
     entries.extend_from_slice(candle_audio_chatterbox_ve::WEIGHT_LICENSES);
@@ -346,11 +350,14 @@ mod tests {
             .all(|r| (r.descriptor)().family == "voice"));
     }
 
-    /// The weight-license ship-gate (sc-13332): every provider this catalog registers — across
-    /// EVERY kind — has a recorded, well-formed model-weight license, and no license entry is an
-    /// orphan. Adding a provider to the catalog without wiring its `WEIGHT_LICENSES` slice fails
-    /// here, so "no provider ships without its weight license recorded" is enforced in the
-    /// composition root that decides what ships.
+    /// The weight-license ship-gate (sc-13332, extended sc-13493): every provider this catalog
+    /// registers — across EVERY kind — has **at least one** recorded, well-formed model-weight
+    /// license row, and no license row is an orphan. A single-checkpoint provider contributes one
+    /// row; a multi-checkpoint provider (MMAudio) contributes a composite/effective-restriction row
+    /// plus one per-checkpoint attribution row, keyed by the `(provider_id, component)` pair. Adding
+    /// a provider to the catalog without wiring its license rows fails here, so "no provider ships
+    /// without its weight license recorded" is enforced in the composition root that decides what
+    /// ships.
     #[test]
     fn every_shipped_provider_has_a_weight_license() {
         use std::collections::BTreeSet;
@@ -362,16 +369,22 @@ mod tests {
         assert!(!registered.is_empty(), "catalog registers no providers");
 
         let entries = super::weight_licenses();
+        // The set of provider ids that carry at least one license row.
         let licensed: BTreeSet<String> =
             entries.iter().map(|e| e.provider_id.to_string()).collect();
-
-        // No duplicate license rows (one per provider).
+        // The full row key is (provider_id, component): a provider may map to MULTIPLE rows
+        // (sc-13493) — one composite + N per-checkpoint — but each (provider_id, component) is unique.
+        let keys: BTreeSet<(String, Option<String>)> = entries
+            .iter()
+            .map(|e| (e.provider_id.to_string(), e.component.map(str::to_string)))
+            .collect();
         assert_eq!(
             entries.len(),
-            licensed.len(),
-            "duplicate provider id in weight_licenses()"
+            keys.len(),
+            "duplicate (provider_id, component) row in weight_licenses()"
         );
-        // Every registered provider has a license...
+
+        // Every registered provider has AT LEAST ONE license row...
         for id in &registered {
             assert!(
                 licensed.contains(id),
@@ -385,58 +398,138 @@ mod tests {
                 "weight-license entry '{id}' has no registered provider"
             );
         }
+        // Every registered provider carries exactly one composite / effective-restriction row
+        // (component == None) — the at-a-glance "can we use this provider" signal.
+        for id in &registered {
+            let composites = entries
+                .iter()
+                .filter(|e| e.provider_id == id && e.component.is_none())
+                .count();
+            assert_eq!(
+                composites, 1,
+                "provider '{id}' must have exactly one composite (component == None) row"
+            );
+        }
         // Every recorded license honors the restriction discipline (identity fields present; a
         // non-commercial license carries its restriction note).
         for entry in &entries {
             assert!(
                 entry.license.is_well_formed(),
-                "provider '{}' has a malformed weight license (non-commercial without a \
-                 restriction note, or an empty identity field)",
-                entry.provider_id
+                "provider '{}' (component {:?}) has a malformed weight license (non-commercial \
+                 without a restriction note, or an empty identity field)",
+                entry.provider_id,
+                entry.component,
             );
+            // Source URL points at a real upstream: the pinned Hugging Face checkpoint for the
+            // provider/checkpoint, or the upstream GitHub repo for a component whose license lives
+            // with its code (e.g. Synchformer MIT, MMAudio MM-DiT MIT code).
             assert!(
                 entry
                     .license
                     .source_url
-                    .starts_with("https://huggingface.co/"),
-                "provider '{}' weight-license source_url is not a Hugging Face URL",
-                entry.provider_id
+                    .starts_with("https://huggingface.co/")
+                    || entry.license.source_url.starts_with("https://github.com/"),
+                "provider '{}' (component {:?}) weight-license source_url is not a Hugging Face or \
+                 GitHub URL",
+                entry.provider_id,
+                entry.component,
             );
         }
-        // The twelve currently-shipped audio providers, in catalog order, with their verified SPDX
-        // ids. All permissive (MIT / Apache-2.0) EXCEPT the two MMAudio Foley providers: each
-        // assembles five checkpoints whose strictest term (Apple ML Research on the DFN5B-CLIP
-        // conditioner) is research/non-commercial, surfaced as one composite non-commercial row —
-        // admissible for the non-commercial product with the restriction recorded (sc-12843 for the
-        // 16k, sc-13441 for the 44.1 kHz; sc-13332 framework). This pins the surface so a change is
-        // deliberate.
-        let ordered: Vec<(&str, &str, bool)> = super::weight_licenses()
+        // The full shipped surface, in catalog order, keyed by (provider_id, component) with the
+        // verified SPDX id + commercial-use flag. All single-checkpoint providers are permissive
+        // (MIT / Apache-2.0). The two MMAudio Foley providers each surface a research/non-commercial
+        // composite row (Apple ML Research on DFN5B-CLIP is the strictest) PLUS their five
+        // per-checkpoint attribution rows: Synchformer (MIT), DFN5B-CLIP (Apple ML Research), the
+        // MM-DiT + mel-VAE + BigVGAN checkpoints (CC-BY-NC-4.0), and — for the 44k path — NVIDIA
+        // BigVGAN v2 (MIT). This pins the surface so a change is deliberate (sc-13493).
+        let ordered: Vec<(&str, Option<&str>, &str, bool)> = super::weight_licenses()
             .iter()
-            .map(|e| (e.provider_id, e.license.spdx_id, e.license.commercial_use))
+            .map(|e| {
+                (
+                    e.provider_id,
+                    e.component,
+                    e.license.spdx_id,
+                    e.license.commercial_use,
+                )
+            })
             .collect();
         assert_eq!(
             ordered,
             vec![
-                ("kokoro_82m", "Apache-2.0", true),
-                ("moss_sfx_v2", "Apache-2.0", true),
-                ("acestep_v15_turbo", "MIT", true),
-                ("moss_tts_realtime", "Apache-2.0", true),
-                ("chatterbox_tts", "MIT", true),
+                ("kokoro_82m", None, "Apache-2.0", true),
+                ("moss_sfx_v2", None, "Apache-2.0", true),
+                ("acestep_v15_turbo", None, "MIT", true),
+                ("moss_tts_realtime", None, "Apache-2.0", true),
+                ("chatterbox_tts", None, "MIT", true),
+                // -- mmaudio_small_16k: composite + 5 per-checkpoint rows --
                 (
                     "mmaudio_small_16k",
+                    None,
                     "LicenseRef-MMAudio-small-16k-composite",
+                    false
+                ),
+                ("mmaudio_small_16k", Some("synchformer_vfeat"), "MIT", true),
+                (
+                    "mmaudio_small_16k",
+                    Some("dfn5b_clip_vit_h14_384"),
+                    "LicenseRef-Apple-MLR",
+                    false
+                ),
+                (
+                    "mmaudio_small_16k",
+                    Some("mmaudio_mmdit_small_16k"),
+                    "CC-BY-NC-4.0",
+                    false
+                ),
+                (
+                    "mmaudio_small_16k",
+                    Some("mmaudio_vae_16k"),
+                    "CC-BY-NC-4.0",
+                    false
+                ),
+                (
+                    "mmaudio_small_16k",
+                    Some("mmaudio_bigvgan_16k"),
+                    "CC-BY-NC-4.0",
+                    false
+                ),
+                // -- mmaudio_large_44k: composite + 5 per-checkpoint rows --
+                (
+                    "mmaudio_large_44k",
+                    None,
+                    "LicenseRef-MMAudio-large-44k-composite",
+                    false
+                ),
+                ("mmaudio_large_44k", Some("synchformer_vfeat"), "MIT", true),
+                (
+                    "mmaudio_large_44k",
+                    Some("dfn5b_clip_vit_h14_384"),
+                    "LicenseRef-Apple-MLR",
                     false
                 ),
                 (
                     "mmaudio_large_44k",
-                    "LicenseRef-MMAudio-large-44k-composite",
+                    Some("mmaudio_mmdit_large_44k_v2"),
+                    "CC-BY-NC-4.0",
                     false
                 ),
-                ("moss_ttsd_v05", "Apache-2.0", true),
-                ("chatterbox_ve", "MIT", true),
-                ("openvoice_v2", "MIT", true),
-                ("whisper_base", "Apache-2.0", true),
-                ("clap_htsat_unfused", "Apache-2.0", true),
+                (
+                    "mmaudio_large_44k",
+                    Some("mmaudio_vae_44k"),
+                    "CC-BY-NC-4.0",
+                    false
+                ),
+                (
+                    "mmaudio_large_44k",
+                    Some("nvidia_bigvgan_v2_44khz_128band_512x"),
+                    "MIT",
+                    true
+                ),
+                ("moss_ttsd_v05", None, "Apache-2.0", true),
+                ("chatterbox_ve", None, "MIT", true),
+                ("openvoice_v2", None, "MIT", true),
+                ("whisper_base", None, "Apache-2.0", true),
+                ("clap_htsat_unfused", None, "Apache-2.0", true),
             ]
         );
     }

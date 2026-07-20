@@ -92,6 +92,44 @@ class ReleaseTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             validate_model_weight_licenses(manifest)
 
+    def test_model_licenses_accepts_multi_component_provider(self) -> None:
+        # A multi-checkpoint provider contributes a composite row (component null) plus per-checkpoint
+        # attribution rows sharing the provider id, keyed by (provider_id, component) (sc-13493).
+        manifest = self._permissive_manifest()
+        manifest["providers"] = [
+            {
+                "provider_id": "mmaudio_small_16k",
+                "component": None,
+                "spdx_id": "LicenseRef-MMAudio-small-16k-composite",
+                "license_name": "MMAudio small_16k composite",
+                "source_url": "https://huggingface.co/hkchengrex/MMAudio",
+                "commercial_use": False,
+                "attribution": "MMAudio assembles five checkpoints",
+                "restriction": "Research / non-commercial only.",
+            },
+            {
+                "provider_id": "mmaudio_small_16k",
+                "component": "synchformer_vfeat",
+                "spdx_id": "MIT",
+                "license_name": "MIT License",
+                "source_url": "https://github.com/v-iashin/Synchformer",
+                "commercial_use": True,
+                "attribution": "Synchformer © 2024 Vladimir Iashin — MIT",
+                "restriction": None,
+            },
+        ]
+        providers = validate_model_weight_licenses(manifest)
+        self.assertEqual(len(providers), 2)
+
+    def test_model_licenses_rejects_duplicate_provider_component_pair(self) -> None:
+        manifest = self._permissive_manifest()
+        row = copy.deepcopy(manifest["providers"][0])
+        row["component"] = "dup"
+        manifest["providers"].append(copy.deepcopy(row))
+        manifest["providers"].append(copy.deepcopy(row))
+        with self.assertRaises(RuntimeError):
+            validate_model_weight_licenses(manifest)
+
     def test_model_licenses_requires_restriction_for_non_commercial(self) -> None:
         manifest = self._permissive_manifest()
         manifest["providers"][0]["commercial_use"] = False

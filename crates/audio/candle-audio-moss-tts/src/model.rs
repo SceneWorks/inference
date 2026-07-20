@@ -68,6 +68,7 @@ pub const WEIGHT_LICENSE: gen_core::WeightLicense = gen_core::WeightLicense {
 /// This provider's weight-license entry (keyed by [`MODEL_ID`]) for catalog aggregation.
 pub const WEIGHT_LICENSE_ENTRY: gen_core::WeightLicenseEntry = gen_core::WeightLicenseEntry {
     provider_id: MODEL_ID,
+    component: None,
     license: WEIGHT_LICENSE,
 };
 
