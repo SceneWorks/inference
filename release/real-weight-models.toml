@@ -327,3 +327,23 @@ size_class = "very-large"
 profiles = ["audio-macos"]
 environment = ["DFN_CLIP_SNAPSHOT"]
 expected_files = ["open_clip_pytorch_model.bin"]
+
+[[models]]
+# MMAudio MM-DiT flow-matching generator, small_16k (sc-13439, epic sc-12833): MMAudio's
+# multimodal SD3-derived flow-matching transformer (N1=4 joint blocks + N2=8 audio-only blocks,
+# threefold adaLN + aligned RoPE conditioning) + the Euler-25 / CFG-4.5 sampler, ported natively in
+# candle-audio-mmaudio::mmdit. Consumes CLIP (clip) + Synchformer (sync) + text features -> (B,250,20)
+# audio latents the 16k VAE decodes. This is the NETWORK checkpoint only (~629 MB), NOT the 20 GB
+# training checkpoint. Weights are CC-BY-NC 4.0 (non-commercial). Model-internal generator:
+# UNREGISTERED (the shipping generator->VAE->waveform assembly + registration is sc-12843). Gated by
+# the crate's `--test mmdit_conformance` real-weight tests ((1,250,20) flow + full CFG-25 sample,
+# finite, deterministic) + a PyTorch numerical-parity test (predict_flow + full-sample cos>0.999).
+# Parity validated locally — see PR sc-13439.
+key = "mmaudio-small-16k"
+repository = "hkchengrex/MMAudio"
+revision = "eb13a1a98fdbec91753775c57b074ccdfc60587c"
+license = "CC-BY-NC-4.0"
+size_class = "large"
+profiles = ["audio-macos"]
+environment = ["MMAUDIO_DIT_SNAPSHOT"]
+expected_files = ["weights/mmaudio_small_16k.pth"]

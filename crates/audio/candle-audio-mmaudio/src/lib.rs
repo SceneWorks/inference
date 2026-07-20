@@ -85,6 +85,7 @@ pub mod bigvgan;
 pub mod blocks;
 pub mod clip;
 pub mod config;
+pub mod mmdit;
 pub mod model;
 pub mod output;
 pub mod preprocess;
@@ -92,6 +93,7 @@ pub mod sync;
 pub mod vae;
 
 pub use clip::DfnClipEncoder;
+pub use mmdit::{Conditions, Config as MmDitConfig, MmAudioDit};
 pub use model::{
     load, load_from_pth, resolve_pinned_weights, HUB_REPO, HUB_REVISION, MODEL_ID, WEIGHTS_PATH,
     WEIGHT_LICENSE, WEIGHT_LICENSE_ENTRY,
@@ -104,11 +106,13 @@ pub use vae::MelVaeDecoder;
 
 /// This crate's model-weight-license entries for catalog aggregation (sc-13332) — one row per ported
 /// component: the Synchformer visual encoder (sc-13438), the DFN5B-CLIP ViT-H/14 encoder (sc-13437),
-/// and the 16k output path's mel-VAE + BigVGAN (sc-13440). Surfaced now so the later shipping MMAudio
-/// generator can fold them into the audio-catalog model-licenses manifest.
+/// the MM-DiT flow-matching generator `mmaudio_small_16k` (sc-13439), and the 16k output path's
+/// mel-VAE + BigVGAN (sc-13440). Surfaced now so the later shipping MMAudio generator (sc-12843) can
+/// fold them into the audio-catalog model-licenses manifest.
 pub const WEIGHT_LICENSES: &[gen_core::WeightLicenseEntry] = &[
     model::WEIGHT_LICENSE_ENTRY,
     clip::WEIGHT_LICENSE_ENTRY,
+    mmdit::WEIGHT_LICENSE_ENTRY,
     output::VAE_WEIGHT_LICENSE_ENTRY,
     output::BIGVGAN_WEIGHT_LICENSE_ENTRY,
 ];
