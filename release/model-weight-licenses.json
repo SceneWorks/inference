@@ -48,6 +48,15 @@
       "restriction": null
     },
     {
+      "provider_id": "mmaudio_large_44k",
+      "spdx_id": "LicenseRef-MMAudio-large-44k-composite",
+      "license_name": "MMAudio large_44k_v2 composite (Apple ML Research + CC-BY-NC-4.0 + MIT)",
+      "source_url": "https://huggingface.co/hkchengrex/MMAudio",
+      "commercial_use": false,
+      "attribution": "MMAudio video→audio 44.1 kHz (mmaudio_large_44k) assembles five checkpoints: the large_44k_v2 MM-DiT network + 44k mel-VAE (© Sony Research Inc. / MMAudio — CC-BY-NC-4.0), the DFN5B-CLIP ViT-H/14-384 conditioner (© Apple Inc. — Apple ML Research Model License, research-only), the Synchformer visual encoder (© 2024 Vladimir Iashin — MIT), and the NVIDIA BigVGAN v2 44 kHz vocoder (© 2024 NVIDIA CORPORATION — MIT).",
+      "restriction": "Research / non-commercial only — the intersection of five component licenses. The strictest, the Apple ML Research Model License on the DFN5B-CLIP conditioner, limits use to scientific research and academic development and excludes any commercial product or service; the MMAudio large_44k_v2 MM-DiT / 44k mel-VAE add CC-BY-NC-4.0 (non-commercial); the Synchformer encoder and NVIDIA BigVGAN v2 vocoder are MIT (permissive). See candle-audio-mmaudio::WEIGHT_LICENSES_44K for each checkpoint's full terms. A legal read is warranted before any commercial use."
+    },
+    {
       "provider_id": "mmaudio_small_16k",
       "spdx_id": "LicenseRef-MMAudio-small-16k-composite",
       "license_name": "MMAudio small_16k composite (Apple ML Research + CC-BY-NC-4.0 + MIT)",

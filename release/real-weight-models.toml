@@ -347,3 +347,48 @@ size_class = "large"
 profiles = ["audio-macos"]
 environment = ["MMAUDIO_DIT_SNAPSHOT"]
 expected_files = ["weights/mmaudio_small_16k.pth"]
+
+[[models]]
+# MMAudio MM-DiT flow-matching generator, large_44k_v2 (sc-13441, epic sc-12833): MMAudio's 1.03B
+# 44.1 kHz quality-ceiling network (14 heads / hidden 896, depth 21 = 7 joint + 14 fused, v2=True),
+# ported natively in candle-audio-mmaudio::mmdit (Config::large_44k_v2). Consumes CLIP + Synchformer +
+# text -> (B,345,40) audio latents the 44k VAE decodes. NETWORK checkpoint only (~4.12 GB). Weights
+# are CC-BY-NC 4.0 (non-commercial). Registered as the shipping `mmaudio_large_44k` provider (sc-13441).
+key = "mmaudio-large-44k-v2"
+repository = "hkchengrex/MMAudio"
+revision = "eb13a1a98fdbec91753775c57b074ccdfc60587c"
+license = "CC-BY-NC-4.0"
+size_class = "very-large"
+profiles = ["audio-macos"]
+environment = ["MMAUDIO_DIT_44K_SNAPSHOT"]
+expected_files = ["weights/mmaudio_large_44k_v2.pth"]
+
+[[models]]
+# MMAudio 44k mel-VAE decoder (sc-13441, epic sc-12833): the 128-band / 40-d-latent Make-An-Audio-2 +
+# EDM2 magnitude-preserving mel-VAE (vae.py::VAE_44k), ported natively in candle-audio-mmaudio::vae
+# (Config::vae_44k). The 44k output path's first stage: latent (40-d) -> 128-band log-mel. ~1.22 GB
+# single-file pickle distributed via MMAudio's HF model repo under ext_weights/. CC-BY-NC-4.0.
+key = "mmaudio-vae-44k"
+repository = "hkchengrex/MMAudio"
+revision = "eb13a1a98fdbec91753775c57b074ccdfc60587c"
+license = "CC-BY-NC-4.0"
+size_class = "large"
+profiles = ["audio-macos"]
+environment = ["MMAUDIO_VAE_44K_SNAPSHOT"]
+expected_files = ["ext_weights/v1-44.pth"]
+
+[[models]]
+# NVIDIA BigVGAN v2 44 kHz vocoder (sc-13441, epic sc-12833): nvidia/bigvgan_v2_44khz_128band_512x —
+# 128-band mel, n_fft 2048, hop 512, snakebeta anti-aliased, use_tanh_at_final=false /
+# use_bias_at_final=false — ported natively in candle-audio-mmaudio::bigvgan
+# (Config::bigvgan_v2_44khz_128band_512x). The 44k output path's second stage: 128-band mel -> 44.1 kHz
+# waveform (512x upsample). ~489 MB single-file pickle. A SEPARATE HF repo from hkchengrex/MMAudio.
+# Weights + code are MIT (© 2024 NVIDIA CORPORATION; model-card license: mit).
+key = "nvidia-bigvgan-v2-44khz-128band-512x"
+repository = "nvidia/bigvgan_v2_44khz_128band_512x"
+revision = "95a9d1dcb12906c03edd938d77b9333d6ded7dfb"
+license = "MIT"
+size_class = "large"
+profiles = ["audio-macos"]
+environment = ["MMAUDIO_BIGVGAN_V2_SNAPSHOT"]
+expected_files = ["bigvgan_generator.pt"]

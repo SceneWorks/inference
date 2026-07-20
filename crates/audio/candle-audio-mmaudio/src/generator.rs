@@ -48,8 +48,8 @@ use crate::output::{AudioDecoder16k, SAMPLE_RATE as OUT_SAMPLE_RATE};
 use crate::sync::SynchformerVisualEncoder;
 use crate::{mmdit, model, output, preprocess};
 
-/// Registry id (the SceneWorks worker routes `payload.model` to this exact id). The 44 kHz sibling
-/// (`mmaudio_small_44k`) is the sc-13441 follow-up.
+/// Registry id (the SceneWorks worker routes `payload.model` to this exact id). The 44.1 kHz
+/// quality-ceiling sibling is [`crate::generator_44k`]'s `mmaudio_large_44k` (sc-13441).
 pub const MODEL_ID: &str = "mmaudio_small_16k";
 
 /// Provider family.
@@ -71,8 +71,8 @@ pub const DEFAULT_DURATION_SECS: f32 = 8.0;
 pub const MIN_DURATION_SECS: f32 = 0.68;
 
 /// CLIP / Synchformer sampling rates (frames per second) — the reference `_CLIP_FPS` / `_SYNC_FPS`.
-const CLIP_FPS: f32 = 8.0;
-const SYNC_FPS: f32 = 25.0;
+pub(crate) const CLIP_FPS: f32 = 8.0;
+pub(crate) const SYNC_FPS: f32 = 25.0;
 
 /// Default Euler flow-matching steps and CFG strength (reference defaults).
 pub const DEFAULT_STEPS: u32 = mmdit::NUM_STEPS as u32;
@@ -170,7 +170,7 @@ pub fn descriptor() -> ModelDescriptor {
 
 /// The single `VideoSync` clip carried by a request, or `None` — factored out so `validate`/`generate`
 /// agree on the extraction. More than one `VideoSync` is rejected (the model conditions on one clip).
-fn video_sync_frames(req: &GenerationRequest) -> gen_core::Result<Option<&[Image]>> {
+pub(crate) fn video_sync_frames(req: &GenerationRequest) -> gen_core::Result<Option<&[Image]>> {
     let mut found: Option<&[Image]> = None;
     for c in &req.conditioning {
         if let Conditioning::VideoSync { frames } = c {
@@ -252,7 +252,7 @@ pub(crate) fn validate_request(
 
 /// The effective render duration: `min(target ?? default, clip_length, trained 8 s window)` — the
 /// port of `demo.py`'s `duration = min(--duration, video_length)` capped by the trained latent window.
-fn effective_duration(req: &GenerationRequest, clip_secs: f32) -> f32 {
+pub(crate) fn effective_duration(req: &GenerationRequest, clip_secs: f32) -> f32 {
     let cap = req
         .audio
         .as_ref()
@@ -281,7 +281,7 @@ pub(crate) fn seq_lengths(duration: f32) -> (usize, usize, usize) {
 
 /// Nearest-frame temporal resample of `frames` (captured at `src_fps`) to `count` frames at `dst_fps`,
 /// sampling the first `count / dst_fps` seconds — the analogue of the reference's per-fps video decode.
-fn resample_frames(
+pub(crate) fn resample_frames(
     frames: &[Image],
     src_fps: f32,
     dst_fps: f32,
@@ -490,7 +490,7 @@ impl MmAudioPipeline {
 }
 
 /// One CFG-combined flow at scalar timestep `t` (reference `ode_wrapper`): `cfg·v(cond) + (1−cfg)·v(empty)`.
-fn cfg_flow(
+pub(crate) fn cfg_flow(
     dit: &mmdit::MmAudioDit,
     latent: &Tensor,
     t: f64,
@@ -511,7 +511,7 @@ fn cfg_flow(
 /// A `seed`-seeded standard-Gaussian prior `(1, latent_seq_len, latent_dim)` — deterministic
 /// run-to-run (the reproducibility law). Not byte-identical to torch's RNG; the parity harness injects
 /// torch's dumped prior for the tight comparison.
-fn seeded_prior(
+pub(crate) fn seeded_prior(
     seed: u64,
     latent_seq_len: usize,
     latent_dim: usize,
@@ -523,7 +523,7 @@ fn seeded_prior(
     Tensor::from_vec(data, (1, latent_seq_len, latent_dim), dev)
 }
 
-fn check_seq(t: &Tensor, batch: usize, seq: usize, name: &str) -> AudioResult<()> {
+pub(crate) fn check_seq(t: &Tensor, batch: usize, seq: usize, name: &str) -> AudioResult<()> {
     let d = t.dims();
     if d.first() != Some(&batch) || d.get(1) != Some(&seq) {
         return Err(AudioError::Msg(format!(
@@ -534,7 +534,7 @@ fn check_seq(t: &Tensor, batch: usize, seq: usize, name: &str) -> AudioResult<()
 }
 
 /// Recover a poisoned mutex (a prior panic mid-synthesis) — the audio twin of `candle_gen::lock_recover`.
-fn lock_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+pub(crate) fn lock_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     match m.lock() {
         Ok(g) => g,
         Err(poisoned) => poisoned.into_inner(),

@@ -56,8 +56,9 @@ pub mod providers {
 
 /// Add every provider shipped by the Candle audio lane to an explicit registry builder, in
 /// stable catalog order: the generators first (Kokoro TTS, MOSS SFX, ACE-Step music, MOSS-TTS-Realtime
-/// streaming TTS — sc-13392, Chatterbox clone-TTS — sc-13239, MMAudio video→audio Foley — sc-12843),
-/// then the voice-cloning identity embedder (Chatterbox `ve`, sc-12844), then the audio transforms
+/// streaming TTS — sc-13392, Chatterbox clone-TTS — sc-13239, MMAudio video→audio Foley 16k — sc-12843
+/// and 44.1 kHz — sc-13441), then the voice-cloning identity embedder (Chatterbox `ve`, sc-12844),
+/// then the audio transforms
 /// (OpenVoice V2 voice conversion, sc-13223 — the first real `AudioTransform`), then the
 /// transcribers (Whisper ASR, sc-12850 — the first real `Transcriber`, the audio Captioner-analog),
 /// then the audio embedders (LAION CLAP, sc-12851 — the first real `AudioEmbedder`, semantic
@@ -265,7 +266,8 @@ mod tests {
                 "acestep_v15_turbo",
                 "moss_tts_realtime",
                 "chatterbox_tts",
-                "mmaudio_small_16k"
+                "mmaudio_small_16k",
+                "mmaudio_large_44k"
             ]
         );
         // The voice-cloning identity embedder surfaces as its own kind (sc-12844), in catalog order.
@@ -394,12 +396,13 @@ mod tests {
                 entry.provider_id
             );
         }
-        // The ten currently-shipped audio providers, in catalog order, with their verified SPDX
-        // ids. All permissive (MIT / Apache-2.0) EXCEPT MMAudio (sc-12843): its Foley pipeline
+        // The eleven currently-shipped audio providers, in catalog order, with their verified SPDX
+        // ids. All permissive (MIT / Apache-2.0) EXCEPT the two MMAudio Foley providers: each
         // assembles five checkpoints whose strictest term (Apple ML Research on the DFN5B-CLIP
         // conditioner) is research/non-commercial, surfaced as one composite non-commercial row —
-        // admissible for the non-commercial product with the restriction recorded (sc-13332). This
-        // pins the surface so a change is deliberate.
+        // admissible for the non-commercial product with the restriction recorded (sc-12843 for the
+        // 16k, sc-13441 for the 44.1 kHz; sc-13332 framework). This pins the surface so a change is
+        // deliberate.
         let ordered: Vec<(&str, &str, bool)> = super::weight_licenses()
             .iter()
             .map(|e| (e.provider_id, e.license.spdx_id, e.license.commercial_use))
@@ -415,6 +418,11 @@ mod tests {
                 (
                     "mmaudio_small_16k",
                     "LicenseRef-MMAudio-small-16k-composite",
+                    false
+                ),
+                (
+                    "mmaudio_large_44k",
+                    "LicenseRef-MMAudio-large-44k-composite",
                     false
                 ),
                 ("chatterbox_ve", "MIT", true),
