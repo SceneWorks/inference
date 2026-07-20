@@ -50,10 +50,73 @@ pub const UPSAMPLE_KERNEL_SIZES: [usize; 6] = [8, 8, 4, 4, 4, 4];
 pub const RESBLOCK_KERNEL_SIZES: [usize; 3] = [3, 7, 11];
 /// Resblock dilations (`resblock_dilation_sizes`), one triple per kernel.
 pub const RESBLOCK_DILATIONS: [[usize; 3]; 3] = [[1, 3, 5], [1, 3, 5], [1, 3, 5]];
-/// Total upsampling factor (∏ `UPSAMPLE_RATES`) — samples produced per mel frame.
+/// Total upsampling factor (∏ `UPSAMPLE_RATES`) — samples produced per mel frame (16k path).
 pub const HOP: usize = 256;
 
 const SNAKE_NO_DIV_BY_ZERO: f64 = 1e-9;
+
+/// BigVGAN generator hyperparameters (`bigvgan_vocoder.yml` for the 16k Make-An-Audio-2 vocoder;
+/// the NVIDIA `config.json` for BigVGAN v2). Both variants share the topology (6 transposed-conv
+/// upsample stages, 3 `AMPBlock1` resblocks per stage, snakebeta anti-aliased activations) and the
+/// same checkpoint key layout — including the loaded 12-tap kaiser-sinc anti-aliasing filters — and
+/// differ only in the numeric config below.
+#[derive(Clone, Copy, Debug)]
+pub struct Config {
+    /// Input mel bands (`num_mels`): 80 (16k) / 128 (BigVGAN v2 44k).
+    pub num_mels: usize,
+    /// First conv width (`upsample_initial_channel`): 1536 for both variants.
+    pub upsample_initial_channel: usize,
+    /// Transposed-conv upsample strides (`upsample_rates`); ∏ = the mel hop (256 / 512).
+    pub upsample_rates: [usize; 6],
+    /// Transposed-conv kernel sizes (`upsample_kernel_sizes`).
+    pub upsample_kernel_sizes: [usize; 6],
+    /// Resblock conv kernel sizes (`resblock_kernel_sizes`).
+    pub resblock_kernel_sizes: [usize; 3],
+    /// Resblock dilations (`resblock_dilation_sizes`), one triple per kernel.
+    pub resblock_dilations: [[usize; 3]; 3],
+    /// Whether `conv_post` carries a bias (`use_bias_at_final`): true (16k) / false (BigVGAN v2).
+    pub use_bias_at_final: bool,
+    /// Final activation: `tanh` when true (`use_tanh_at_final`, 16k), else `clamp(-1, 1)` (v2).
+    pub use_tanh_at_final: bool,
+}
+
+impl Config {
+    /// The Make-An-Audio-2 **16 kHz** BigVGAN (`bigvgan_vocoder.yml`): hop 256, 80-band, `tanh` +
+    /// bias at final.
+    pub fn bigvgan_16k() -> Self {
+        Self {
+            num_mels: NUM_MELS,
+            upsample_initial_channel: UPSAMPLE_INITIAL_CHANNEL,
+            upsample_rates: UPSAMPLE_RATES,
+            upsample_kernel_sizes: UPSAMPLE_KERNEL_SIZES,
+            resblock_kernel_sizes: RESBLOCK_KERNEL_SIZES,
+            resblock_dilations: RESBLOCK_DILATIONS,
+            use_bias_at_final: true,
+            use_tanh_at_final: true,
+        }
+    }
+
+    /// NVIDIA **BigVGAN v2** `bigvgan_v2_44khz_128band_512x` (sc-13441): hop 512, 128-band,
+    /// `upsample_rates=[8,4,2,2,2,2]` / `upsample_kernel_sizes=[16,8,4,4,4,4]`, and — per the NVIDIA
+    /// `config.json` — **no** bias at final and **clamp** (not tanh) at final.
+    pub fn bigvgan_v2_44khz_128band_512x() -> Self {
+        Self {
+            num_mels: 128,
+            upsample_initial_channel: 1536,
+            upsample_rates: [8, 4, 2, 2, 2, 2],
+            upsample_kernel_sizes: [16, 8, 4, 4, 4, 4],
+            resblock_kernel_sizes: [3, 7, 11],
+            resblock_dilations: [[1, 3, 5], [1, 3, 5], [1, 3, 5]],
+            use_bias_at_final: false,
+            use_tanh_at_final: false,
+        }
+    }
+
+    /// Total upsampling factor (∏ `upsample_rates`) — samples produced per mel frame (256 / 512).
+    pub fn hop(&self) -> usize {
+        self.upsample_rates.iter().product()
+    }
+}
 
 /// HiFi-GAN `get_padding(kernel_size, dilation)` = `(k·d - d) / 2`.
 fn get_padding(kernel_size: usize, dilation: usize) -> usize {
@@ -67,10 +130,11 @@ fn weight_norm_reconstruct(g: &Tensor, v: &Tensor) -> CResult<Tensor> {
     v.broadcast_mul(g)?.broadcast_div(&norm)
 }
 
-/// A `weight_norm`-parametrized `Conv1d` (bias included), reconstructed at load.
+/// A `weight_norm`-parametrized `Conv1d`, reconstructed at load. Bias is optional — BigVGAN v2's
+/// `conv_post` has `use_bias_at_final=false`, so its checkpoint carries no `bias` key.
 struct Conv1d {
-    weight: Tensor, // (out, in, k)
-    bias: Tensor,   // (out,)
+    weight: Tensor,       // (out, in, k)
+    bias: Option<Tensor>, // (out,)
     padding: usize,
     stride: usize,
     dilation: usize,
@@ -86,10 +150,28 @@ impl Conv1d {
         dilation: usize,
         padding: usize,
     ) -> CResult<Self> {
+        Self::load_opt_bias(vb, out, inc, k, stride, dilation, padding, true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn load_opt_bias(
+        vb: VarBuilder,
+        out: usize,
+        inc: usize,
+        k: usize,
+        stride: usize,
+        dilation: usize,
+        padding: usize,
+        bias: bool,
+    ) -> CResult<Self> {
         let g = vb.get((out, 1, 1), "weight_g")?;
         let v = vb.get((out, inc, k), "weight_v")?;
         let weight = weight_norm_reconstruct(&g, &v)?;
-        let bias = vb.get(out, "bias")?;
+        let bias = if bias {
+            Some(vb.get(out, "bias")?)
+        } else {
+            None
+        };
         Ok(Self {
             weight,
             bias,
@@ -101,7 +183,10 @@ impl Conv1d {
 
     fn forward(&self, x: &Tensor) -> CResult<Tensor> {
         let y = x.conv1d(&self.weight, self.padding, self.stride, self.dilation, 1)?;
-        y.broadcast_add(&self.bias.reshape((1, self.bias.dim(0)?, 1))?)
+        match &self.bias {
+            Some(b) => y.broadcast_add(&b.reshape((1, b.dim(0)?, 1))?),
+            None => Ok(y),
+        }
     }
 }
 
@@ -280,7 +365,9 @@ impl AmpBlock1 {
     }
 }
 
-/// The assembled 16k BigVGAN vocoder (`BigVGANVocoder`): mel `(B, 80, T)` → waveform `(B, 1, 256·T)`.
+/// The assembled BigVGAN vocoder (`BigVGANVocoder`): mel `(B, num_mels, T)` → waveform
+/// `(B, 1, hop·T)`. Both the 16k Make-An-Audio-2 vocoder and the NVIDIA BigVGAN v2 44k vocoder are
+/// this one struct, [`Config`]-parameterized.
 pub struct BigVganVocoder {
     conv_pre: Conv1d,
     ups: Vec<ConvTranspose1d>,
@@ -288,19 +375,25 @@ pub struct BigVganVocoder {
     activation_post: Activation1d,
     conv_post: Conv1d,
     num_kernels: usize,
+    use_tanh_at_final: bool,
 }
 
 impl BigVganVocoder {
-    /// Load from a `VarBuilder` rooted at the generator sub-tree (keys `conv_pre.*`, `ups.*`,
-    /// `resblocks.*`, `activation_post.*`, `conv_post.*`).
+    /// Load the 16k Make-An-Audio-2 vocoder from a `VarBuilder` rooted at the generator sub-tree
+    /// (keys `conv_pre.*`, `ups.*`, `resblocks.*`, `activation_post.*`, `conv_post.*`).
     pub fn load(vb: VarBuilder) -> CResult<Self> {
-        let num_upsamples = UPSAMPLE_RATES.len();
-        let num_kernels = RESBLOCK_KERNEL_SIZES.len();
+        Self::load_with_config(vb, Config::bigvgan_16k())
+    }
+
+    /// Load with an explicit [`Config`] (16k or NVIDIA BigVGAN v2 44k, sc-13441).
+    pub fn load_with_config(vb: VarBuilder, cfg: Config) -> CResult<Self> {
+        let num_upsamples = cfg.upsample_rates.len();
+        let num_kernels = cfg.resblock_kernel_sizes.len();
 
         let conv_pre = Conv1d::load(
             vb.pp("conv_pre"),
-            UPSAMPLE_INITIAL_CHANNEL,
-            NUM_MELS,
+            cfg.upsample_initial_channel,
+            cfg.num_mels,
             7,
             1,
             1,
@@ -308,13 +401,14 @@ impl BigVganVocoder {
         )?;
 
         let mut ups = Vec::with_capacity(num_upsamples);
-        for (i, (&u, &k)) in UPSAMPLE_RATES
+        for (i, (&u, &k)) in cfg
+            .upsample_rates
             .iter()
-            .zip(UPSAMPLE_KERNEL_SIZES.iter())
+            .zip(cfg.upsample_kernel_sizes.iter())
             .enumerate()
         {
-            let inc = UPSAMPLE_INITIAL_CHANNEL >> i;
-            let out = UPSAMPLE_INITIAL_CHANNEL >> (i + 1);
+            let inc = cfg.upsample_initial_channel >> i;
+            let out = cfg.upsample_initial_channel >> (i + 1);
             ups.push(ConvTranspose1d::load(
                 vb.pp("ups").pp(i).pp(0),
                 inc,
@@ -326,10 +420,11 @@ impl BigVganVocoder {
 
         let mut resblocks = Vec::with_capacity(num_upsamples * num_kernels);
         for i in 0..num_upsamples {
-            let ch = UPSAMPLE_INITIAL_CHANNEL >> (i + 1);
-            for (j, (&k, &d)) in RESBLOCK_KERNEL_SIZES
+            let ch = cfg.upsample_initial_channel >> (i + 1);
+            for (j, (&k, &d)) in cfg
+                .resblock_kernel_sizes
                 .iter()
-                .zip(RESBLOCK_DILATIONS.iter())
+                .zip(cfg.resblock_dilations.iter())
                 .enumerate()
             {
                 resblocks.push(AmpBlock1::load(
@@ -341,9 +436,18 @@ impl BigVganVocoder {
             }
         }
 
-        let ch_last = UPSAMPLE_INITIAL_CHANNEL >> num_upsamples;
+        let ch_last = cfg.upsample_initial_channel >> num_upsamples;
         let activation_post = Activation1d::load(vb.pp("activation_post"), ch_last)?;
-        let conv_post = Conv1d::load(vb.pp("conv_post"), 1, ch_last, 7, 1, 1, 3)?;
+        let conv_post = Conv1d::load_opt_bias(
+            vb.pp("conv_post"),
+            1,
+            ch_last,
+            7,
+            1,
+            1,
+            3,
+            cfg.use_bias_at_final,
+        )?;
 
         Ok(Self {
             conv_pre,
@@ -352,10 +456,11 @@ impl BigVganVocoder {
             activation_post,
             conv_post,
             num_kernels,
+            use_tanh_at_final: cfg.use_tanh_at_final,
         })
     }
 
-    /// Vocode a mel spectrogram `(B, 80, T)` → waveform `(B, 1, 256·T)` in `[-1, 1]`.
+    /// Vocode a mel spectrogram `(B, num_mels, T)` → waveform `(B, 1, hop·T)` in `[-1, 1]`.
     pub fn forward(&self, mel: &Tensor) -> CResult<Tensor> {
         let mut x = self.conv_pre.forward(mel)?;
         for (i, up) in self.ups.iter().enumerate() {
@@ -372,7 +477,12 @@ impl BigVganVocoder {
         }
         x = self.activation_post.forward(&x)?;
         x = self.conv_post.forward(&x)?;
-        x.tanh()
+        // Final: tanh (16k) or clamp to [-1, 1] (BigVGAN v2's use_tanh_at_final=false).
+        if self.use_tanh_at_final {
+            x.tanh()
+        } else {
+            x.clamp(-1.0, 1.0)
+        }
     }
 }
 
@@ -394,6 +504,21 @@ mod tests {
         assert_eq!(get_padding(3, 5), 5);
         assert_eq!(get_padding(7, 1), 3);
         assert_eq!(get_padding(11, 1), 5);
+    }
+
+    #[test]
+    fn bigvgan_configs_match_reference() {
+        let c16 = Config::bigvgan_16k();
+        assert_eq!(c16.hop(), 256, "16k hop = ∏[4,4,2,2,2,2]");
+        assert_eq!(c16.num_mels, 80);
+        assert!(c16.use_bias_at_final && c16.use_tanh_at_final);
+        // NVIDIA BigVGAN v2 44k: hop 512, 128-band, no-bias + clamp at final.
+        let v2 = Config::bigvgan_v2_44khz_128band_512x();
+        assert_eq!(v2.hop(), 512, "44k hop = ∏[8,4,2,2,2,2]");
+        assert_eq!(v2.num_mels, 128);
+        assert_eq!(v2.upsample_kernel_sizes, [16, 8, 4, 4, 4, 4]);
+        assert!(!v2.use_bias_at_final, "config.json use_bias_at_final=false");
+        assert!(!v2.use_tanh_at_final, "config.json use_tanh_at_final=false");
     }
 
     #[test]

@@ -41,6 +41,50 @@ pub const EMBED_DIM: usize = 20;
 pub const DATA_DIM: usize = 80;
 /// Backbone width (`VAE_16k.hidden_dim`).
 pub const HIDDEN_DIM: usize = 384;
+
+/// Latent channels the 44k VAE decodes from (`VAE_44k.embed_dim`). The **confirmed** 44k latent
+/// channel count — the reference `vae.py::VAE_44k` sets `embed_dim=40` (the 16k VAE is 20-d), and
+/// the large_44k_v2 DiT's `latent_dim=40` matches. Recorded here since it was an open unknown at
+/// scoping (sc-13441).
+pub const EMBED_DIM_44K: usize = 40;
+/// Mel bands the 44k decoder emits (`VAE_44k.data_dim` = 128 — the 44k mel is 128-band, vs 80 @ 16k).
+pub const DATA_DIM_44K: usize = 128;
+/// Backbone width (`VAE_44k.hidden_dim`).
+pub const HIDDEN_DIM_44K: usize = 512;
+
+/// The parameterized latent mel-VAE decoder configuration (`vae.py::get_my_vae`). Both the 16k and
+/// 44k VAEs share the same `Decoder1D` topology (`ch_mult=(1,2,4)`, `num_res_blocks=2`,
+/// `attn_layers=[3]`, `down_layers=[0]` → one ×2 upsample) and differ only in these three dims.
+#[derive(Clone, Copy, Debug)]
+pub struct Config {
+    /// Latent channels (`embed_dim`): 20 (16k) / 40 (44k).
+    pub embed_dim: usize,
+    /// Mel bands the decoder emits (`data_dim`): 80 (16k) / 128 (44k).
+    pub data_dim: usize,
+    /// Backbone width (`hidden_dim`): 384 (16k) / 512 (44k).
+    pub hidden_dim: usize,
+}
+
+impl Config {
+    /// The 16 kHz mel-VAE (`VAE_16k`): 20-d latent → 80-band log-mel, hidden 384.
+    pub fn vae_16k() -> Self {
+        Self {
+            embed_dim: EMBED_DIM,
+            data_dim: DATA_DIM,
+            hidden_dim: HIDDEN_DIM,
+        }
+    }
+
+    /// The 44.1 kHz mel-VAE (`VAE_44k`): 40-d latent → 128-band log-mel, hidden 512 (sc-13441).
+    pub fn vae_44k() -> Self {
+        Self {
+            embed_dim: EMBED_DIM_44K,
+            data_dim: DATA_DIM_44K,
+            hidden_dim: HIDDEN_DIM_44K,
+        }
+    }
+}
+
 /// Channel multipliers per resolution level (`ch_mult`).
 pub const CH_MULT: [usize; 3] = [1, 2, 4];
 /// Residual blocks per level in the encoder; the decoder uses `+1`.
@@ -281,10 +325,10 @@ struct Decoder1d {
 }
 
 impl Decoder1d {
-    fn load(vb: VarBuilder, learnable_gain: f32) -> CResult<Self> {
+    fn load(vb: VarBuilder, cfg: Config, learnable_gain: f32) -> CResult<Self> {
         let num_layers = CH_MULT.len();
-        let block_in0 = HIDDEN_DIM * CH_MULT[num_layers - 1];
-        let conv_in = MpConv1d::load(vb.pp("conv_in"), block_in0, EMBED_DIM, 3, 1.0)?;
+        let block_in0 = cfg.hidden_dim * CH_MULT[num_layers - 1];
+        let conv_in = MpConv1d::load(vb.pp("conv_in"), block_in0, cfg.embed_dim, 3, 1.0)?;
         let mid = vb.pp("mid");
         let mid_block_1 = ResnetBlock1d::load(mid.pp("block_1"), block_in0, block_in0, true)?;
         let mid_attn_1 = AttnBlock1d::load(mid.pp("attn_1"), block_in0)?;
@@ -301,7 +345,7 @@ impl Decoder1d {
         let mut per_level: Vec<UpLevel> = Vec::with_capacity(num_layers);
         for i_level in (0..num_layers).rev() {
             let level_vb = up.pp(i_level);
-            let block_out = HIDDEN_DIM * CH_MULT[i_level];
+            let block_out = cfg.hidden_dim * CH_MULT[i_level];
             let mut blocks = Vec::with_capacity(NUM_RES_BLOCKS + 1);
             let mut attn = Vec::new();
             for i_block in 0..(NUM_RES_BLOCKS + 1) {
@@ -336,7 +380,7 @@ impl Decoder1d {
 
         let conv_out = MpConv1d::load(
             vb.pp("conv_out"),
-            DATA_DIM,
+            cfg.data_dim,
             block_in,
             3,
             (learnable_gain + 1.0) as f64,
@@ -392,16 +436,25 @@ impl MelVaeDecoder {
     /// released 16k checkpoint carries slightly different (training-updated) values, so unnormalize
     /// must use the checkpoint's `(1, 80, 1)` buffers to match the reference bit-for-bit.
     pub fn load(vb: VarBuilder) -> CResult<Self> {
+        Self::load_with_config(vb, Config::vae_16k())
+    }
+
+    /// Load a mel-VAE decoder with an explicit [`Config`] (16k or 44k, sc-13441). Identical topology;
+    /// only `embed_dim`/`data_dim`/`hidden_dim` differ. `data_mean`/`data_std` are read from the
+    /// checkpoint at the config's `data_dim`.
+    pub fn load_with_config(vb: VarBuilder, cfg: Config) -> CResult<Self> {
         // learnable_gain is a scalar Parameter under `decoder.learnable_gain`.
         let learnable_gain = vb
             .get((), "decoder.learnable_gain")?
             .to_dtype(DType::F32)?
             .to_scalar::<f32>()?;
-        let decoder = Decoder1d::load(vb.pp("decoder"), learnable_gain)?;
+        let decoder = Decoder1d::load(vb.pp("decoder"), cfg, learnable_gain)?;
         let data_mean = vb
-            .get((1, DATA_DIM, 1), "data_mean")?
+            .get((1, cfg.data_dim, 1), "data_mean")?
             .to_dtype(DType::F32)?;
-        let data_std = vb.get((1, DATA_DIM, 1), "data_std")?.to_dtype(DType::F32)?;
+        let data_std = vb
+            .get((1, cfg.data_dim, 1), "data_std")?
+            .to_dtype(DType::F32)?;
         Ok(Self {
             decoder,
             data_mean,
@@ -487,6 +540,18 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn vae_configs_match_reference() {
+        let k16 = Config::vae_16k();
+        assert_eq!((k16.embed_dim, k16.data_dim, k16.hidden_dim), (20, 80, 384));
+        let k44 = Config::vae_44k();
+        // The confirmed 44k latent channel count (open unknown at scoping): embed_dim=40, 128-band mel.
+        assert_eq!(
+            (k44.embed_dim, k44.data_dim, k44.hidden_dim),
+            (40, 128, 512)
+        );
     }
 
     #[test]

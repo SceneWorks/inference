@@ -6,10 +6,14 @@
 //! frame-aligned visual conditioner — natively onto the workspace's pinned candle revision.
 //! **sc-13437** adds the [`clip`] module: MMAudio's semantic conditioner, the **DFN5B-CLIP
 //! ViT-H/14-384** open_clip encoder (visual → 1024-d per-frame features; 77-token text tower →
-//! per-token last-hidden-state), parity-verified against `open_clip`. Later MMAudio slices add the
-//! flow-matching DiT, the VAE/vocoder, and the generator that registers into
-//! `candle-audio-catalog`. Nothing is registered here (model-internal encoders), mirroring how
-//! `candle-audio-moss-tts-realtime` stayed unregistered until its codec landed.
+//! per-token last-hidden-state), parity-verified against `open_clip`. Later slices add the
+//! flow-matching [`mmdit`] DiT (sc-13439), the [`vae`]/[`bigvgan`] output path (sc-13440), and the
+//! shipping [`generator`] that registers **`mmaudio_small_16k`** into `candle-audio-catalog`
+//! (sc-12843). **sc-13441** adds the 44.1 kHz quality-ceiling path: the `large_44k_v2` MM-DiT preset
+//! ([`mmdit::Config::large_44k_v2`], 1.03B), the 44k mel-VAE ([`vae::Config::vae_44k`], 40-d latent /
+//! 128-band mel) + the external **NVIDIA BigVGAN v2** vocoder
+//! ([`bigvgan::Config::bigvgan_v2_44khz_128band_512x`]), and the sibling [`generator_44k`] that
+//! registers **`mmaudio_large_44k`**.
 //!
 //! ## What Synchformer is, and what MMAudio actually uses
 //!
@@ -86,6 +90,7 @@ pub mod blocks;
 pub mod clip;
 pub mod config;
 pub mod generator;
+pub mod generator_44k;
 pub mod mmdit;
 pub mod model;
 pub mod output;
@@ -113,12 +118,23 @@ pub use generator::{
     MODEL_ID as GENERATOR_ID, REGISTRATION, SAMPLE_RATE as GENERATOR_SAMPLE_RATE,
 };
 
-/// Add the shipping MMAudio video→audio generator (`mmaudio_small_16k`) to an explicit audio registry
-/// builder (catalog composition, sc-12843).
+pub use generator_44k::{
+    resolve_pinned_snapshot as resolve_pinned_snapshot_44k, MmAudio44kPipeline,
+    MmAudioLarge44kGenerator, MODEL_ID as GENERATOR_ID_44K, REGISTRATION as REGISTRATION_44K,
+    SAMPLE_RATE as GENERATOR_SAMPLE_RATE_44K,
+};
+
+pub use output::AudioDecoder44k;
+
+/// Add the shipping MMAudio video→audio generators to an explicit audio registry builder (catalog
+/// composition): the 16 kHz `mmaudio_small_16k` (sc-12843) then the 44.1 kHz quality-ceiling sibling
+/// `mmaudio_large_44k` (sc-13441), in that stable order.
 pub fn register_providers(
     registry: gen_core::ProviderRegistryBuilder,
 ) -> gen_core::ProviderRegistryBuilder {
-    registry.register_generator(generator::REGISTRATION)
+    registry
+        .register_generator(generator::REGISTRATION)
+        .register_generator(generator_44k::REGISTRATION)
 }
 
 /// Build the complete explicit MMAudio provider catalog (this crate's own surface).
@@ -141,10 +157,26 @@ pub const WEIGHT_LICENSES: &[gen_core::WeightLicenseEntry] = &[
     output::BIGVGAN_WEIGHT_LICENSE_ENTRY,
 ];
 
+/// The **per-component** model-weight-license entries for the 44.1 kHz path (sc-13441) — one row per
+/// ported checkpoint the `mmaudio_large_44k` provider assembles: the shared Synchformer (MIT) +
+/// DFN5B-CLIP (Apple ML Research) conditioners, the large_44k_v2 MM-DiT (CC-BY-NC-4.0), the 44k
+/// mel-VAE (CC-BY-NC-4.0), and — the new external dependency this slice adds — the **NVIDIA BigVGAN
+/// v2** 44 kHz vocoder (MIT, its own distinct entry). The catalog aggregates the single composite
+/// [`SHIPPED_WEIGHT_LICENSES`] row for the registered provider instead.
+pub const WEIGHT_LICENSES_44K: &[gen_core::WeightLicenseEntry] = &[
+    model::WEIGHT_LICENSE_ENTRY,
+    clip::WEIGHT_LICENSE_ENTRY,
+    mmdit::WEIGHT_LICENSE_ENTRY_44K,
+    output::VAE_WEIGHT_LICENSE_ENTRY_44K,
+    output::BIGVGAN_V2_WEIGHT_LICENSE_ENTRY,
+];
+
 /// The **catalog-facing** weight-license surface: exactly one composite row keyed by the shipping
 /// provider id `mmaudio_small_16k` (sc-12843). `candle-audio-catalog::weight_licenses()` folds this
 /// into the model-licenses manifest — one entry per registered provider, as its ship-gate requires.
 /// The composite carries the *intersection* (strictest) of the five component licenses
 /// ([`WEIGHT_LICENSES`]); see [`generator::WEIGHT_LICENSE`] for the rationale.
-pub const SHIPPED_WEIGHT_LICENSES: &[gen_core::WeightLicenseEntry] =
-    &[generator::WEIGHT_LICENSE_ENTRY];
+pub const SHIPPED_WEIGHT_LICENSES: &[gen_core::WeightLicenseEntry] = &[
+    generator::WEIGHT_LICENSE_ENTRY,
+    generator_44k::WEIGHT_LICENSE_ENTRY,
+];
