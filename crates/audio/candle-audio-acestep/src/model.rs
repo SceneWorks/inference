@@ -71,65 +71,12 @@ pub const WEIGHT_LICENSE: candle_audio::gen_core::WeightLicense =
         ),
     };
 
-/// This provider's **composite** weight-license entry (keyed by [`MODEL_ID`], `component == None`)
-/// for catalog aggregation — the at-a-glance effective license. All ACE-Step checkpoints (turbo
-/// primary + the sft cover FSQ modules) are MIT, so the composite is MIT.
+/// This provider's weight-license entry (keyed by [`MODEL_ID`]) for catalog aggregation.
 pub const WEIGHT_LICENSE_ENTRY: candle_audio::gen_core::WeightLicenseEntry =
     candle_audio::gen_core::WeightLicenseEntry {
         provider_id: MODEL_ID,
         component: None,
         license: WEIGHT_LICENSE,
-    };
-
-/// Hub pin for the Cover-only FSQ modules (sc-13251): `ACE-Step/acestep-v15-xl-sft-diffusers` at an
-/// immutable commit SHA (MIT). The pinned turbo checkpoint ships no `audio_tokenizer` /
-/// `audio_token_detokenizer`; this sibling checkpoint (same org, same 64-ch/25 Hz acoustic latent
-/// space) does. Only those two small component dirs are pulled — the Cover restyle reuses the
-/// already-loaded turbo DiT / condition encoder / VAE (the reference's `is_turbo` cover path).
-pub const SFT_HUB_REPO: &str = "ACE-Step/acestep-v15-xl-sft-diffusers";
-pub const SFT_HUB_REVISION: &str = "4bf7b60a63b27144f539f980927eeb89f5f912b0";
-
-/// License of the sft `audio_tokenizer` (FSQ) cover-conditioning checkpoint — MIT, verified against
-/// the `acestep-v15-xl-sft-diffusers` model card.
-pub const AUDIO_TOKENIZER_WEIGHT_LICENSE: candle_audio::gen_core::WeightLicense =
-    candle_audio::gen_core::WeightLicense {
-        spdx_id: "MIT",
-        name: "MIT License",
-        source_url: "https://huggingface.co/ACE-Step/acestep-v15-xl-sft-diffusers",
-        attribution: Some(
-            "ACE-Step v1.5 XL SFT audio_tokenizer (FSQ) © ACE-Step — licensed under MIT",
-        ),
-        commercial_use: true,
-        restriction: None,
-    };
-
-/// License of the sft `audio_token_detokenizer` cover-conditioning checkpoint — MIT.
-pub const AUDIO_TOKEN_DETOKENIZER_WEIGHT_LICENSE: candle_audio::gen_core::WeightLicense =
-    candle_audio::gen_core::WeightLicense {
-        spdx_id: "MIT",
-        name: "MIT License",
-        source_url: "https://huggingface.co/ACE-Step/acestep-v15-xl-sft-diffusers",
-        attribution: Some(
-            "ACE-Step v1.5 XL SFT audio_token_detokenizer © ACE-Step — licensed under MIT",
-        ),
-        commercial_use: true,
-        restriction: None,
-    };
-
-/// Per-checkpoint attribution row for the sft `audio_tokenizer` (component of [`MODEL_ID`]).
-pub const WEIGHT_LICENSE_ENTRY_AUDIO_TOKENIZER: candle_audio::gen_core::WeightLicenseEntry =
-    candle_audio::gen_core::WeightLicenseEntry {
-        provider_id: MODEL_ID,
-        component: Some("audio_tokenizer"),
-        license: AUDIO_TOKENIZER_WEIGHT_LICENSE,
-    };
-
-/// Per-checkpoint attribution row for the sft `audio_token_detokenizer` (component of [`MODEL_ID`]).
-pub const WEIGHT_LICENSE_ENTRY_AUDIO_TOKEN_DETOKENIZER: candle_audio::gen_core::WeightLicenseEntry =
-    candle_audio::gen_core::WeightLicenseEntry {
-        provider_id: MODEL_ID,
-        component: Some("audio_token_detokenizer"),
-        license: AUDIO_TOKEN_DETOKENIZER_WEIGHT_LICENSE,
     };
 
 /// Native output sample rate (Hz).
@@ -185,16 +132,21 @@ pub fn descriptor() -> ModelDescriptor {
             // No voice/speaker surface — music, not TTS.
             audio_voices: vec![],
             audio_languages: LANGUAGES.to_vec(),
-            // The edit modes the provider supports. Inpaint / Repaint / Extend ride ACE-Step's
-            // `repaint` task (region regenerate + seamless stitch, sc-12847). Cover (sc-13251) is
-            // the whole-clip restyle: it pulls the FSQ `audio_tokenizer` / `audio_token_detokenizer`
-            // from the sibling sft checkpoint (the turbo snapshot ships neither) and restyles the
-            // source through the same turbo DiT from a new prompt.
+            // The edit modes advertised. Inpaint / Repaint / Extend ride ACE-Step's `repaint` task
+            // (region regenerate + seamless stitch, sc-12847). Cover (the whole-clip `cover` task) is
+            // deliberately NOT advertised — a Cover request is a typed Unsupported at the contract
+            // floor. sc-13251 implemented the reference FSQ recipe (audio_tokenizer/detokenizer from
+            // the sibling sft checkpoint) end-to-end and PROVED on real weights that it does not
+            // satisfy Cover's defining property, "preserves musical structure": a discriminating
+            // source↔cover onset/beat-alignment gate failed on every tractable path — turbo AND the
+            // reference's non-distilled sft DiT, across 8–50 steps and classifier-free guidance —
+            // because the FSQ src_latents are an ~80 bit/s semantic codec that does not carry the
+            // source's onset ordering. Re-advertising Cover needs a structure-preserving conditioning,
+            // not the FSQ bottleneck (see sc-13251); do not re-attempt the FSQ recipe.
             audio_edit_modes: vec![
                 AudioEditMode::Inpaint,
                 AudioEditMode::Repaint,
                 AudioEditMode::Extend,
-                AudioEditMode::Cover,
             ],
             supported_quants: &[],
             supports_kv_cache: false,
@@ -305,9 +257,8 @@ pub(crate) fn validate_request(
                     }
                 }
             }
-            // Cover (sc-13251) is a whole-clip restyle: no region is required (the source-empty
-            // and native-rate checks above already gate it); the FSQ round-trip + turbo-DiT restyle
-            // run over the entire clip.
+            // Cover is not in the advertised `audio_edit_modes`, so the floor below rejects it as a
+            // typed Unsupported; no clip-specific check needed here.
             AudioEditMode::Cover => {}
         }
     }
@@ -424,62 +375,47 @@ impl Generator for AceStepGenerator {
             PipelineProgress::Decoding => on_progress(Progress::Decoding),
         };
 
-        // Prompted source-audio editing: a request carrying an `AudioEdit` conditioning dispatches
-        // to the edit path — the mask-conditioned region tasks (Inpaint/Repaint/Extend, sc-12847)
-        // or the whole-clip Cover restyle (sc-13251); otherwise this is plain text-to-music.
+        // Prompted source-audio editing (sc-12847): a request carrying an `AudioEdit` conditioning
+        // dispatches to the mask-conditioned edit path (regenerate the region + seamless stitch);
+        // otherwise this is plain text-to-music synthesis.
         let samples = if let Some(edit) = req.audio_edit() {
+            let task = match edit.mode {
+                AudioEditMode::Inpaint => EditTask::Inpaint,
+                AudioEditMode::Repaint => EditTask::Repaint,
+                AudioEditMode::Extend => EditTask::Extend,
+                // Defensive: `validate` already rejects Cover (unadvertised — sc-13251 proved the
+                // reference FSQ cover recipe does not preserve the source's musical structure), so
+                // the pipeline is never reached with it.
+                AudioEditMode::Cover => {
+                    return Err(gen_core::Error::Unsupported(format!(
+                        "{}: cover editing is not available (the reference FSQ recipe does not \
+                         preserve the source's musical structure — see sc-13251)",
+                        self.descriptor.id
+                    )));
+                }
+            };
+            let (region_start_secs, region_end_secs) = edit
+                .region
+                .map(|r| (r.start_secs, r.end_secs))
+                .unwrap_or((0.0, None));
             let source = edit.audio.samples.clone();
             let source_channels = edit.audio.channels as usize;
-            match edit.mode {
-                AudioEditMode::Cover => {
-                    // Cover pulls the pinned sft FSQ modules (lazily loaded + cached) and restyles
-                    // the whole clip through the turbo DiT from the new prompt.
-                    let (tok_w, tok_c, det_w, det_c) =
-                        resolve_cover_modules().map_err(gen_core::Error::from)?;
-                    let cover = pipeline
-                        .cover_modules(&tok_w, &tok_c, &det_w, &det_c)
-                        .map_err(gen_core::Error::from)?;
-                    pipeline
-                        .cover(
-                            &req.prompt,
-                            &source,
-                            source_channels,
-                            &params,
-                            &cover,
-                            &mut progress,
-                            &probe,
-                        )
-                        .map_err(gen_core::Error::from)?
-                }
-                region_mode => {
-                    let task = match region_mode {
-                        AudioEditMode::Inpaint => EditTask::Inpaint,
-                        AudioEditMode::Repaint => EditTask::Repaint,
-                        AudioEditMode::Extend => EditTask::Extend,
-                        AudioEditMode::Cover => unreachable!("cover handled above"),
-                    };
-                    let (region_start_secs, region_end_secs) = edit
-                        .region
-                        .map(|r| (r.start_secs, r.end_secs))
-                        .unwrap_or((0.0, None));
-                    let eparams = EditParams {
-                        task,
-                        region_start_secs,
-                        region_end_secs,
-                        base: params,
-                    };
-                    pipeline
-                        .edit(
-                            &req.prompt,
-                            &source,
-                            source_channels,
-                            &eparams,
-                            &mut progress,
-                            &probe,
-                        )
-                        .map_err(gen_core::Error::from)?
-                }
-            }
+            let eparams = EditParams {
+                task,
+                region_start_secs,
+                region_end_secs,
+                base: params,
+            };
+            pipeline
+                .edit(
+                    &req.prompt,
+                    &source,
+                    source_channels,
+                    &eparams,
+                    &mut progress,
+                    &probe,
+                )
+                .map_err(gen_core::Error::from)?
         } else {
             pipeline
                 .synthesize(&req.prompt, &params, &mut progress, &probe)
@@ -529,34 +465,6 @@ pub fn resolve_pinned_snapshot() -> AudioResult<WeightsSource> {
         hf_get_pinned(HUB_REPO, HUB_REVISION, &format!("transformer/{shard}"))?;
     }
     Ok(dir)
-}
-
-/// Relative paths of the Cover FSQ component files inside the sft snapshot.
-const COVER_TOKENIZER_CONFIG: &str = "audio_tokenizer/config.json";
-const COVER_TOKENIZER_WEIGHTS: &str = "audio_tokenizer/diffusion_pytorch_model.safetensors";
-const COVER_DETOKENIZER_CONFIG: &str = "audio_token_detokenizer/config.json";
-const COVER_DETOKENIZER_WEIGHTS: &str =
-    "audio_token_detokenizer/diffusion_pytorch_model.safetensors";
-
-/// Resolve the pinned Cover FSQ modules (sc-13251) — the sft `audio_tokenizer` +
-/// `audio_token_detokenizer` component files — through the F-029 hub path, returning
-/// `(tok_weights, tok_config, det_weights, det_config)`. Set `ACESTEP_SFT_SNAPSHOT` to a local sft
-/// snapshot dir to bypass the download (used by the real-weights cover test).
-pub fn resolve_cover_modules() -> AudioResult<(PathBuf, PathBuf, PathBuf, PathBuf)> {
-    if let Ok(dir) = std::env::var("ACESTEP_SFT_SNAPSHOT") {
-        let d = PathBuf::from(dir);
-        return Ok((
-            d.join(COVER_TOKENIZER_WEIGHTS),
-            d.join(COVER_TOKENIZER_CONFIG),
-            d.join(COVER_DETOKENIZER_WEIGHTS),
-            d.join(COVER_DETOKENIZER_CONFIG),
-        ));
-    }
-    let tok_config = hf_get_pinned(SFT_HUB_REPO, SFT_HUB_REVISION, COVER_TOKENIZER_CONFIG)?;
-    let tok_weights = hf_get_pinned(SFT_HUB_REPO, SFT_HUB_REVISION, COVER_TOKENIZER_WEIGHTS)?;
-    let det_config = hf_get_pinned(SFT_HUB_REPO, SFT_HUB_REVISION, COVER_DETOKENIZER_CONFIG)?;
-    let det_weights = hf_get_pinned(SFT_HUB_REPO, SFT_HUB_REVISION, COVER_DETOKENIZER_WEIGHTS)?;
-    Ok((tok_weights, tok_config, det_weights, det_config))
 }
 
 /// The transformer safetensors shard filenames listed in
@@ -691,14 +599,14 @@ mod tests {
                 .contains(&gen_core::ConditioningKind::AudioEdit),
             "advertises the AudioEdit conditioning kind"
         );
-        // All supported modes, in order; Cover (sc-13251) is now advertised (FSQ round-trip).
+        // Exactly the advertised modes, in order; Cover is absent (sc-13251: the FSQ cover recipe
+        // does not preserve the source's musical structure).
         assert_eq!(
             d.capabilities.audio_edit_modes,
             vec![
                 AudioEditMode::Inpaint,
                 AudioEditMode::Repaint,
-                AudioEditMode::Extend,
-                AudioEditMode::Cover,
+                AudioEditMode::Extend
             ]
         );
     }
@@ -741,17 +649,9 @@ mod tests {
             )
         )
         .is_ok());
-        // Cover (sc-13251) is advertised and needs no region — a well-formed source clip validates.
-        assert!(validate_request(&d, &edit_req(AudioEditMode::Cover, None)).is_ok());
-        // Cover still enforces the native sample rate on the source clip.
-        let mut wrong_rate_cover = edit_req(AudioEditMode::Cover, None);
-        if let gen_core::Conditioning::AudioEdit { audio, .. } =
-            &mut wrong_rate_cover.conditioning[0]
-        {
-            audio.sample_rate = 44_100;
-        }
+        // Cover is unadvertised on the pinned checkpoint → typed Unsupported.
         assert!(matches!(
-            validate_request(&d, &wrong_rate_cover).unwrap_err(),
+            validate_request(&d, &edit_req(AudioEditMode::Cover, None)).unwrap_err(),
             gen_core::Error::Unsupported(_)
         ));
         // A region past the clip is rejected.

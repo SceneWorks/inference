@@ -13,26 +13,6 @@
       "restriction": "Bundled text_encoder (Qwen3-Embedding-0.6B) is redistributed under Apache-2.0."
     },
     {
-      "provider_id": "acestep_v15_turbo",
-      "component": "audio_token_detokenizer",
-      "spdx_id": "MIT",
-      "license_name": "MIT License",
-      "source_url": "https://huggingface.co/ACE-Step/acestep-v15-xl-sft-diffusers",
-      "commercial_use": true,
-      "attribution": "ACE-Step v1.5 XL SFT audio_token_detokenizer © ACE-Step — licensed under MIT",
-      "restriction": null
-    },
-    {
-      "provider_id": "acestep_v15_turbo",
-      "component": "audio_tokenizer",
-      "spdx_id": "MIT",
-      "license_name": "MIT License",
-      "source_url": "https://huggingface.co/ACE-Step/acestep-v15-xl-sft-diffusers",
-      "commercial_use": true,
-      "attribution": "ACE-Step v1.5 XL SFT audio_tokenizer (FSQ) © ACE-Step — licensed under MIT",
-      "restriction": null
-    },
-    {
       "provider_id": "chatterbox_tts",
       "component": null,
       "spdx_id": "MIT",
