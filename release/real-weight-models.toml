@@ -279,3 +279,34 @@ size_class = "large"
 profiles = ["audio-macos"]
 environment = ["SYNCHFORMER_SNAPSHOT"]
 expected_files = ["ext_weights/synchformer_state_dict.pth"]
+
+[[models]]
+# MMAudio 16k mel-VAE decoder (sc-13440, epic sc-12833): the EDM2 magnitude-preserving +
+# Make-An-Audio-2 mel-VAE, ported natively in candle-audio-mmaudio::vae. The 16k output path's
+# first stage: latent (20-d) -> 80-band log-mel. ~687 MB single-file pickle distributed via
+# MMAudio's HF model repo under ext_weights/. Released under CC-BY-NC-4.0 (MMAudio checkpoint
+# license). Gated by the crate's `--test conformance_output` real-weight test (latent->mel->16kHz
+# waveform: shape, finite, in [-1,1], deterministic; torch numerical parity cosine>0.9999).
+key = "mmaudio-vae-16k"
+repository = "hkchengrex/MMAudio"
+revision = "eb13a1a98fdbec91753775c57b074ccdfc60587c"
+license = "CC-BY-NC-4.0"
+size_class = "large"
+profiles = ["audio-macos"]
+environment = ["MMAUDIO_VAE_SNAPSHOT"]
+expected_files = ["ext_weights/v1-16.pth"]
+
+[[models]]
+# MMAudio 16k BigVGAN vocoder (sc-13440, epic sc-12833): the Make-An-Audio-2 16k BigVGAN (anti-
+# aliased snakebeta conv vocoder), ported natively in candle-audio-mmaudio::bigvgan. The 16k output
+# path's second stage: 80-band mel -> 16 kHz waveform. ~449 MB single-file pickle distributed via
+# MMAudio's HF model repo under ext_weights/. Released under CC-BY-NC-4.0 (MMAudio checkpoint
+# license). Gated by the same `--test conformance_output` real-weight test as the VAE.
+key = "mmaudio-bigvgan-16k"
+repository = "hkchengrex/MMAudio"
+revision = "eb13a1a98fdbec91753775c57b074ccdfc60587c"
+license = "CC-BY-NC-4.0"
+size_class = "large"
+profiles = ["audio-macos"]
+environment = ["MMAUDIO_BIGVGAN_SNAPSHOT"]
+expected_files = ["ext_weights/best_netG.pt"]
