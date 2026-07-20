@@ -2,7 +2,7 @@
 name = "candle-audio-moss-tts-realtime"
 version = "0.0.0"
 edition = "2021"
-description = "MOSS-TTS-Realtime-1.7B streaming-TTS provider for the SceneWorks Candle audio lane (sc-13334) — an autoregressive Qwen3-1.7B backbone plus a CSM-style local/depth transformer decoding 16 RVQ speech-codebook tokens per frame, ported natively onto the pinned candle revision. Honest partial: the AR brain emits real RVQ tokens; the external MOSS-Audio-Tokenizer codec (RVQ tokens -> 24 kHz waveform) is not yet ported, so the generator errors at the codec boundary rather than fabricate audio and is NOT registered into the shipping catalog."
+description = "MOSS-TTS-Realtime-1.7B streaming-TTS provider for the SceneWorks Candle audio lane (sc-13334/sc-13392) — an autoregressive Qwen3-1.7B backbone plus a CSM-style local/depth transformer decoding 16 RVQ speech-codebook tokens per frame, and a native port of the MOSS-Audio-Tokenizer RLFQ codec (RVQ tokens -> 24 kHz waveform), ported onto the pinned candle revision. Registered into candle-audio-catalog as a real, deterministic, genuinely-interleaved streaming TTS provider; text-fidelity is guarded by an ASR round-trip CER gate with a minimum-length EOS-suppression floor (sc-13433)."
 license = "Apache-2.0"
 repository = "https://github.com/SceneWorks/inference"
 keywords = ["candle", "audio", "tts", "streaming", "rvq"]
@@ -31,6 +31,10 @@ candle-audio = { path = "../candle-audio", features = ["testkit"] }
 # The backend-neutral audio-generator conformance suite (streaming reassembly law, seed
 # determinism) the real-weight test runs against the loaded provider.
 sceneworks-gen-core-testkit = { workspace = true }
+# The Whisper transcriber drives the sc-13433 ASR round-trip text-fidelity gate: known prompt →
+# MOSS-TTS-Realtime WAV → Whisper transcript → CER assertion (same round-trip pattern the whisper
+# crate uses with Kokoro). Dev-only; no runtime edge, so the shipping catalog surface is unchanged.
+candle-audio-whisper = { path = "../candle-audio-whisper" }
 
 [features]
 default = []

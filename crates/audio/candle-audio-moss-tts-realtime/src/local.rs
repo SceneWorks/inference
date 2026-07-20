@@ -113,6 +113,7 @@ impl LocalTransformer {
         history: &[Vec<u32>],
         params: &SamplingParams,
         rng: &mut Rng,
+        suppress_eos: bool,
     ) -> CandleResult<Vec<u32>> {
         // Depth position 0 embedding = the backbone hidden state.
         let mut depth_embeds = backbone_last_hidden.clone(); // [1, 1, H]
@@ -121,6 +122,15 @@ impl LocalTransformer {
             let hidden = self.hidden_last(&depth_embeds)?; // [1, H]
             let logits = self.heads[i].forward(&hidden)?; // [1, audio_vocab]
             let mut row: Vec<f32> = logits.reshape((logits.elem_count(),))?.to_vec1::<f32>()?;
+            // Minimum-length control (sc-13433): the audio-EOS marker lives on codebook 0. Before the
+            // frame floor is reached, mask it to -inf so a spurious early stop cannot truncate the
+            // utterance to a fragment (the dominant text-fidelity failure — a full-sentence prompt
+            // collapsing to a sub-second clip). After the floor the model stops normally.
+            if i == 0 && suppress_eos {
+                if let Some(slot) = row.get_mut(crate::decode::AUDIO_EOS as usize) {
+                    *slot = f32::NEG_INFINITY;
+                }
+            }
             // Codebook i's tokens from previous frames (the repetition-penalty history).
             let hist_i: Vec<u32> = history.iter().filter_map(|f| f.get(i).copied()).collect();
             let token = sample(&mut row, &hist_i, params, rng);

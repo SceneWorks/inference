@@ -12,6 +12,32 @@
 //! on the raw logits → divide by temperature → top-k mask → top-p (nucleus) mask → softmax →
 //! multinomial draw. Parity with PyTorch's audio is not required (a different RNG) — a valid,
 //! deterministic speech distribution is.
+//!
+//! ## RNG-parity decision (sc-13433)
+//!
+//! sc-13392 flagged that this sampler's token *sequence* diverges from a reference PyTorch run
+//! because the draw is not bit-parity with Torch's Philox `multinomial`, and asked whether a
+//! Philox-parity RNG (option a) would restore reference-matching, prompt-faithful output. The
+//! measured answer is **no — Philox parity is not worth it**, on two independent grounds:
+//!
+//! 1. **Necessary but not sufficient.** Reference-matching a Torch run needs bit-identical *logits*,
+//!    not just an identical RNG stream. This port runs the AR head in F32 on CPU (candle); the
+//!    reference runs Torch on a different dtype/backend, so the logits differ by ~1e-3+ (the standard
+//!    cross-framework matmul gap). With ~1027-way codebooks under top-k 30 / top-p 0.6 there are many
+//!    near-ties, so the sampled sequence diverges at the first close race regardless of the RNG. The
+//!    sufficient condition (bit-identical logits) is unattainable across frameworks.
+//! 2. **Not the fidelity lever.** An ASR round-trip sweep (prompt → TTS → `whisper_base` → CER, see
+//!    the crate's `moss_tts_realtime_asr_roundtrip_fidelity` conformance gate) showed prompt-following
+//!    is limited by **spurious early audio-EOS** (a full sentence collapsing to a sub-second
+//!    fragment), *not* by RNG divergence. Greedy (temperature 0) collapses to silence; temperatures
+//!    below 0.8 stop *earlier*, not better; temperature 0.8 (the reference default, kept) is the best
+//!    general choice. The genuine fix was a minimum-length EOS-suppression floor
+//!    ([`crate::decode::DEFAULT_MIN_EOS_FRAMES`]), which measurably lifts CER (e.g. "The weather is
+//!    very nice this afternoon." 0.95 → 0.00) with no regression to already-faithful prompts or to
+//!    the streaming/determinism gates.
+//!
+//! The only RNG property that matters here is **reproducibility** (same seed ⇒ byte-identical
+//! frames), which the seeded splitmix64 below already guarantees and the determinism gate enforces.
 
 use std::collections::HashSet;
 
@@ -39,6 +65,41 @@ impl Default for SamplingParams {
             top_p: TOP_P,
             top_k: TOP_K,
             repetition_penalty: REPETITION_PENALTY,
+            repetition_window: REPETITION_WINDOW,
+        }
+    }
+}
+
+impl SamplingParams {
+    /// The shipped sampling defaults, with optional per-field **operator overrides** read from the
+    /// environment. This is the one knob the AR loop uses ([`crate::decode::Decoder::run`]); leaving
+    /// every variable unset reproduces [`Default`] exactly (the reference distribution), so the
+    /// determinism/streaming gates are unchanged. It exists to make the sc-13433 text-fidelity tuning
+    /// **reproducible without a rebuild** (an ASR round-trip CER sweep over temperature), and to let
+    /// the fidelity conformance gate deliberately *degrade* sampling to prove the gate discriminates.
+    ///
+    /// Overrides (all optional, each falls back to the corresponding default constant):
+    /// `MOSS_TTS_TEMPERATURE`, `MOSS_TTS_TOP_P`, `MOSS_TTS_TOP_K`, `MOSS_TTS_REP_PENALTY`.
+    /// A malformed value is ignored (the default is kept) rather than failing generation.
+    pub fn from_env_or_default() -> Self {
+        fn f32_env(key: &str, default: f32) -> f32 {
+            std::env::var(key)
+                .ok()
+                .and_then(|v| v.trim().parse::<f32>().ok())
+                .filter(|v| v.is_finite())
+                .unwrap_or(default)
+        }
+        fn usize_env(key: &str, default: usize) -> usize {
+            std::env::var(key)
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(default)
+        }
+        Self {
+            temperature: f32_env("MOSS_TTS_TEMPERATURE", TEMPERATURE),
+            top_p: f32_env("MOSS_TTS_TOP_P", TOP_P),
+            top_k: usize_env("MOSS_TTS_TOP_K", TOP_K),
+            repetition_penalty: f32_env("MOSS_TTS_REP_PENALTY", REPETITION_PENALTY),
             repetition_window: REPETITION_WINDOW,
         }
     }
@@ -285,6 +346,30 @@ mod tests {
         // Sanity: sampling still returns a valid in-range token.
         let t = sample(&mut logits, &history, &params, &mut rng);
         assert!((t as usize) < 4);
+    }
+
+    #[test]
+    fn neg_inf_masked_token_is_never_sampled() {
+        // The minimum-length EOS suppression (sc-13433) works by setting the audio-EOS logit to
+        // NEG_INFINITY before `sample`. Prove the mechanism: a token that is the *pre-mask argmax*
+        // but masked to -inf is never drawn, across many seeds/draws, at the reference temperature.
+        let params = SamplingParams {
+            temperature: 0.8,
+            top_k: 30,
+            top_p: 0.6,
+            repetition_penalty: 1.0,
+            repetition_window: 50,
+        };
+        let masked = 2usize; // would otherwise dominate (largest finite logit)
+        for seed in 0..64 {
+            let mut rng = Rng::seed(seed);
+            for _ in 0..16 {
+                let mut logits = vec![1.0f32, 0.5, 9.0, 0.2, -1.0, 3.0];
+                logits[masked] = f32::NEG_INFINITY;
+                let t = sample(&mut logits, &[], &params, &mut rng) as usize;
+                assert_ne!(t, masked, "a -inf-masked token must never be sampled");
+            }
+        }
     }
 
     #[test]

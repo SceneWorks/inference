@@ -64,6 +64,22 @@ pub fn build_prompt_frames(
     Ok(frames)
 }
 
+/// Default minimum audio frames before an audio-EOS may terminate the AR loop (sc-13433). At
+/// 12.5 fps this is ~1.28 s — long enough that a spurious frame-0/single-frame EOS cannot collapse a
+/// real sentence into a fragment, but short enough that a genuinely brief utterance still stops well
+/// inside a normal budget. Overridable via `MOSS_TTS_MIN_FRAMES` (0 disables suppression) for the
+/// sc-13433 fidelity sweep; the loop additionally caps the floor at half the frame budget.
+pub const DEFAULT_MIN_EOS_FRAMES: usize = 16;
+
+/// Resolve the minimum-length EOS-suppression floor: `MOSS_TTS_MIN_FRAMES` if set (0 disables), else
+/// [`DEFAULT_MIN_EOS_FRAMES`].
+fn min_eos_frames() -> usize {
+    std::env::var("MOSS_TTS_MIN_FRAMES")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_MIN_EOS_FRAMES)
+}
+
 /// The reference TTS system prompt (`MossTTSRealtimeProcessor` default).
 pub const TTS_SYSTEM_PROMPT: &str = "<|im_start|>system\n\
 You are a highly expressive text-to-speech (TTS) engine developed by Mosi Intelligence. \n\
@@ -111,7 +127,15 @@ impl Decoder {
     ) -> CandleResult<Option<DecodeResult>> {
         let mut out: Vec<RvqFrame> = Vec::new();
         let mut stop = StopReason::Budget;
-        let params = SamplingParams::default();
+        // The reference sampling distribution (temp 0.8 / top-k 30 / top-p 0.6 / rep-penalty 1.1),
+        // with optional operator overrides from the environment (unset ⇒ exactly the defaults, so the
+        // determinism/streaming gates are unchanged). The override drives the sc-13433 CER-vs-temp
+        // sweep without a rebuild; see `SamplingParams::from_env_or_default`.
+        let params = SamplingParams::from_env_or_default();
+        // Minimum-length EOS suppression (sc-13433): audio-EOS on codebook 0 is masked for the first
+        // `min_frames` steps so a spurious early stop cannot truncate the utterance. `min_frames` is
+        // capped at half the budget so a genuinely short clip still terminates well inside it.
+        let min_frames = min_eos_frames().min(max_frames / 2);
         let mut rng = Rng::seed(seed);
         // KV-cache AR (sc-13417): prefill the prompt once, then feed each emitted frame back as a
         // single-token step, so per-frame backbone cost is O(1) amortized instead of O(seq). The
@@ -138,7 +162,10 @@ impl Decoder {
                 };
                 self.backbone.step(&fed, &mut cache)?
             };
-            let frame = self.local.decode_frame(&hidden, &out, &params, &mut rng)?;
+            let suppress_eos = out.len() < min_frames;
+            let frame = self
+                .local
+                .decode_frame(&hidden, &out, &params, &mut rng, suppress_eos)?;
             if frame.first().copied() == Some(AUDIO_EOS) {
                 stop = StopReason::Eos;
                 break;
