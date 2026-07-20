@@ -49,14 +49,16 @@ sceneworks-gen-core-testkit = { workspace = true }
 [features]
 default = []
 # Apple Metal GPU backend — forwarded to the shared audio commons AND to candle-nn. The
-# `candle-nn/metal` forward is load-bearing: candle-nn's fused normalization/attention ops
-# (rms-norm, softmax, …) carry their Metal kernels behind candle-nn's own `metal` feature, so
-# omitting it compiles candle-nn WITHOUT them and the first such op bails at runtime with
-# "no metal implementation for …" (measured on this lane, sc-13039). Mirrors candle-audio-clap /
-# candle-gen / candle-llm. Not in `default` (the audio lane ships CPU-first everywhere; see
-# docs/architecture/audio-backend-strategy.md). NOTE: candle-nn has no Metal `layer-norm` kernel
-# at the pinned candle rev, so providers using a biased `candle_nn::LayerNorm` (e.g. Kokoro's
-# AlBERT) still cannot run on Metal here regardless of this forward — CPU-only on Mac today.
+# `candle-nn/metal` forward is load-bearing: candle-nn's fused ops (rms-norm, layer-norm, softmax,
+# …) carry their Metal kernels behind candle-nn's own `metal` feature, so omitting it compiles
+# candle-nn WITHOUT them and the first such op bails at runtime with "no metal implementation for
+# …" (measured on this lane, sc-13039). Mirrors candle-audio-clap / candle-gen / candle-llm. Not
+# in `default` (the audio lane ships CPU-first everywhere; see
+# docs/architecture/audio-backend-strategy.md). NOTE: with this forward Kokoro's candle-nn ops
+# (incl. its biased AlBERT `candle_nn::LayerNorm`) DO run on Metal; its Mac blocker is instead the
+# iSTFT-Net vocoder's `upsample_nearest1d`, which candle-CORE's Metal backend leaves unimplemented
+# (hard bail in metal_backend) — so Kokoro stays CPU-only on Mac at the pinned candle rev until
+# that candle-core gap is closed (sc-13691).
 metal = ["candle-audio/metal", "candle-nn/metal"]
 # NVIDIA CUDA backend — forwarded to the shared audio commons AND candle-nn (its CUDA kernels,
 # same rationale as `metal`). Not in `default`.
