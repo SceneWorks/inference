@@ -47,6 +47,7 @@ pub mod providers {
     pub use candle_audio_chatterbox_ve;
     pub use candle_audio_clap;
     pub use candle_audio_kokoro;
+    pub use candle_audio_mmaudio;
     pub use candle_audio_moss_sfx;
     pub use candle_audio_moss_tts_realtime;
     pub use candle_audio_openvoice;
@@ -55,8 +56,8 @@ pub mod providers {
 
 /// Add every provider shipped by the Candle audio lane to an explicit registry builder, in
 /// stable catalog order: the generators first (Kokoro TTS, MOSS SFX, ACE-Step music, MOSS-TTS-Realtime
-/// streaming TTS — sc-13392, Chatterbox clone-TTS — sc-13239), then the voice-cloning identity
-/// embedder (Chatterbox `ve`, sc-12844), then the audio transforms
+/// streaming TTS — sc-13392, Chatterbox clone-TTS — sc-13239, MMAudio video→audio Foley — sc-12843),
+/// then the voice-cloning identity embedder (Chatterbox `ve`, sc-12844), then the audio transforms
 /// (OpenVoice V2 voice conversion, sc-13223 — the first real `AudioTransform`), then the
 /// transcribers (Whisper ASR, sc-12850 — the first real `Transcriber`, the audio Captioner-analog),
 /// then the audio embedders (LAION CLAP, sc-12851 — the first real `AudioEmbedder`, semantic
@@ -67,6 +68,7 @@ pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistry
     let registry = candle_audio_acestep::register_providers(registry);
     let registry = candle_audio_moss_tts_realtime::register_providers(registry);
     let registry = candle_audio_chatterbox::register_providers(registry);
+    let registry = candle_audio_mmaudio::register_providers(registry);
     let registry = candle_audio_chatterbox_ve::register_providers(registry);
     let registry = candle_audio_openvoice::register_providers(registry);
     let registry = candle_audio_whisper::register_providers(registry);
@@ -102,6 +104,10 @@ pub fn weight_licenses() -> Vec<gen_core::WeightLicenseEntry> {
     entries.extend_from_slice(candle_audio_acestep::WEIGHT_LICENSES);
     entries.extend_from_slice(candle_audio_moss_tts_realtime::WEIGHT_LICENSES);
     entries.extend_from_slice(candle_audio_chatterbox::WEIGHT_LICENSES);
+    // MMAudio ships as one registered provider (mmaudio_small_16k) assembled from five checkpoints;
+    // the catalog keys ONE composite license row per registered provider (the ship-gate's 1:1 rule),
+    // so it folds in the crate's SHIPPED_WEIGHT_LICENSES (the composite), not the per-component list.
+    entries.extend_from_slice(candle_audio_mmaudio::SHIPPED_WEIGHT_LICENSES);
     entries.extend_from_slice(candle_audio_chatterbox_ve::WEIGHT_LICENSES);
     entries.extend_from_slice(candle_audio_openvoice::WEIGHT_LICENSES);
     entries.extend_from_slice(candle_audio_whisper::WEIGHT_LICENSES);
@@ -258,7 +264,8 @@ mod tests {
                 "moss_sfx_v2",
                 "acestep_v15_turbo",
                 "moss_tts_realtime",
-                "chatterbox_tts"
+                "chatterbox_tts",
+                "mmaudio_small_16k"
             ]
         );
         // The voice-cloning identity embedder surfaces as its own kind (sc-12844), in catalog order.
@@ -387,8 +394,12 @@ mod tests {
                 entry.provider_id
             );
         }
-        // The nine currently-shipped audio providers, in catalog order, with their verified SPDX
-        // ids — all permissive (MIT / Apache-2.0). This pins the surface so a change is deliberate.
+        // The ten currently-shipped audio providers, in catalog order, with their verified SPDX
+        // ids. All permissive (MIT / Apache-2.0) EXCEPT MMAudio (sc-12843): its Foley pipeline
+        // assembles five checkpoints whose strictest term (Apple ML Research on the DFN5B-CLIP
+        // conditioner) is research/non-commercial, surfaced as one composite non-commercial row —
+        // admissible for the non-commercial product with the restriction recorded (sc-13332). This
+        // pins the surface so a change is deliberate.
         let ordered: Vec<(&str, &str, bool)> = super::weight_licenses()
             .iter()
             .map(|e| (e.provider_id, e.license.spdx_id, e.license.commercial_use))
@@ -401,6 +412,11 @@ mod tests {
                 ("acestep_v15_turbo", "MIT", true),
                 ("moss_tts_realtime", "Apache-2.0", true),
                 ("chatterbox_tts", "MIT", true),
+                (
+                    "mmaudio_small_16k",
+                    "LicenseRef-MMAudio-small-16k-composite",
+                    false
+                ),
                 ("chatterbox_ve", "MIT", true),
                 ("openvoice_v2", "MIT", true),
                 ("whisper_base", "Apache-2.0", true),

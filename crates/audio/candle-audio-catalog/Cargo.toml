@@ -29,6 +29,10 @@ candle-audio-openvoice = { path = "../candle-audio-openvoice" }
 candle-audio-whisper = { path = "../candle-audio-whisper" }
 # sc-12851: LAION CLAP — the first real AudioEmbedder (semantic audio-text joint-space retrieval).
 candle-audio-clap = { path = "../candle-audio-clap" }
+# sc-12843: MMAudio (mmaudio_small_16k) — the audio lane's first video→audio (Foley) Generator:
+# a silent clip's RGB frames (VideoSync conditioning) + optional prompt → a synchronized 16 kHz
+# soundtrack (DFN5B-CLIP + Synchformer conditioners → MM-DiT flow-matching → mel-VAE + BigVGAN).
+candle-audio-mmaudio = { path = "../candle-audio-mmaudio" }
 # The audio lane's snapshot-preparer composition (sc-12836): the lane's single `candle`
 # registration recognizes audio snapshots and delegates everything else to candle-llm's
 # preparer unchanged. This crate is the composition owner (previously each bundle wired
@@ -51,6 +55,7 @@ metal = [
     "candle-audio-openvoice/metal",
     "candle-audio-whisper/metal",
     "candle-audio-clap/metal",
+    "candle-audio-mmaudio/metal",
 ]
 cuda = [
     "candle-audio/cuda",
@@ -63,4 +68,5 @@ cuda = [
     "candle-audio-openvoice/cuda",
     "candle-audio-whisper/cuda",
     "candle-audio-clap/cuda",
+    "candle-audio-mmaudio/cuda",
 ]

@@ -85,6 +85,7 @@ pub mod bigvgan;
 pub mod blocks;
 pub mod clip;
 pub mod config;
+pub mod generator;
 pub mod mmdit;
 pub mod model;
 pub mod output;
@@ -104,11 +105,34 @@ pub use bigvgan::BigVganVocoder;
 pub use output::{AudioDecoder16k, BIGVGAN_MODEL_ID, VAE_MODEL_ID};
 pub use vae::MelVaeDecoder;
 
-/// This crate's model-weight-license entries for catalog aggregation (sc-13332) — one row per ported
-/// component: the Synchformer visual encoder (sc-13438), the DFN5B-CLIP ViT-H/14 encoder (sc-13437),
+// NB: `generator::load` is intentionally NOT re-exported at the crate root — the crate already
+// re-exports `model::load` (the Synchformer loader). Reach the shipping generator's loader via
+// `candle_audio_mmaudio::generator::load` (the registration constant carries it for the catalog).
+pub use generator::{
+    resolve_pinned_snapshot, MmAudioGenerator, MmAudioPipeline, MAX_DURATION_SECS,
+    MODEL_ID as GENERATOR_ID, REGISTRATION, SAMPLE_RATE as GENERATOR_SAMPLE_RATE,
+};
+
+/// Add the shipping MMAudio video→audio generator (`mmaudio_small_16k`) to an explicit audio registry
+/// builder (catalog composition, sc-12843).
+pub fn register_providers(
+    registry: gen_core::ProviderRegistryBuilder,
+) -> gen_core::ProviderRegistryBuilder {
+    registry.register_generator(generator::REGISTRATION)
+}
+
+/// Build the complete explicit MMAudio provider catalog (this crate's own surface).
+pub fn provider_registry() -> gen_core::Result<gen_core::ProviderRegistry> {
+    register_providers(gen_core::ProviderRegistryBuilder::new()).build()
+}
+
+/// This crate's **per-component** model-weight-license entries (sc-13332) — one row per ported
+/// checkpoint: the Synchformer visual encoder (sc-13438), the DFN5B-CLIP ViT-H/14 encoder (sc-13437),
 /// the MM-DiT flow-matching generator `mmaudio_small_16k` (sc-13439), and the 16k output path's
-/// mel-VAE + BigVGAN (sc-13440). Surfaced now so the later shipping MMAudio generator (sc-12843) can
-/// fold them into the audio-catalog model-licenses manifest.
+/// mel-VAE + BigVGAN (sc-13440). This is the detailed provenance record (each checkpoint's own SPDX /
+/// attribution / restriction). The **catalog** aggregates the single composite
+/// [`SHIPPED_WEIGHT_LICENSES`] entry instead (its ship-gate keys one license row per *registered*
+/// provider id, and only `mmaudio_small_16k` registers).
 pub const WEIGHT_LICENSES: &[gen_core::WeightLicenseEntry] = &[
     model::WEIGHT_LICENSE_ENTRY,
     clip::WEIGHT_LICENSE_ENTRY,
@@ -116,3 +140,11 @@ pub const WEIGHT_LICENSES: &[gen_core::WeightLicenseEntry] = &[
     output::VAE_WEIGHT_LICENSE_ENTRY,
     output::BIGVGAN_WEIGHT_LICENSE_ENTRY,
 ];
+
+/// The **catalog-facing** weight-license surface: exactly one composite row keyed by the shipping
+/// provider id `mmaudio_small_16k` (sc-12843). `candle-audio-catalog::weight_licenses()` folds this
+/// into the model-licenses manifest — one entry per registered provider, as its ship-gate requires.
+/// The composite carries the *intersection* (strictest) of the five component licenses
+/// ([`WEIGHT_LICENSES`]); see [`generator::WEIGHT_LICENSE`] for the rationale.
+pub const SHIPPED_WEIGHT_LICENSES: &[gen_core::WeightLicenseEntry] =
+    &[generator::WEIGHT_LICENSE_ENTRY];

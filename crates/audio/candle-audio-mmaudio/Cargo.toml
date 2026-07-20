@@ -25,10 +25,17 @@ image = { workspace = true }
 # alternation exactly, so the string->BPE tokenizer reproduces open_clip byte-for-byte. Same use and
 # pin as `mlx-gen-sdxl`'s CLIP tokenizer.
 regex = "1"
+# Seeded RNG for the flow-matching prior noise (the reproducibility law: same request + seed ⇒
+# byte-identical samples). Same crates the media / MOSS-SFX providers use for seeded noise draws.
+rand = { workspace = true }
+rand_distr = { workspace = true }
 
 [dev-dependencies]
 # HF-cache snapshot resolution for the `#[ignore]`d real-weight conformance test.
 candle-audio = { path = "../candle-audio", features = ["testkit"] }
+# The backend-neutral generator conformance suite (validate-honesty, progress, typed cancellation,
+# seed determinism, video→audio Foley) the real-weight test runs against the loaded provider.
+sceneworks-gen-core-testkit = { workspace = true }
 
 [features]
 default = []

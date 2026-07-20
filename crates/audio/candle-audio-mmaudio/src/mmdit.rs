@@ -896,6 +896,54 @@ impl MmAudioDit {
         })
     }
 
+    /// Re-derive every sequence-length-dependent tensor for a new output duration — the port of the
+    /// reference `MMAudio.update_seq_lengths` (`networks.py`), which `demo.py` calls after
+    /// `seq_cfg.duration = duration` so a clip shorter (or longer, ≤ the trained 8 s window) than the
+    /// 250-latent default is generated at its own length. Rebuilds the latent/clip RoPE tables (the
+    /// clip rescale tracks the new `latent/clip` ratio) and the nearest-exact `sync → latent` upsample
+    /// indices, and updates the cached [`Config`] sequence lengths that
+    /// [`preprocess_conditions`](Self::preprocess_conditions) / [`predict_flow`](Self::predict_flow)
+    /// assert against. The weights themselves are sequence-length-independent, so nothing else moves.
+    pub fn update_seq_lengths(
+        &mut self,
+        latent_seq_len: usize,
+        clip_seq_len: usize,
+        sync_seq_len: usize,
+    ) -> CResult<()> {
+        let hd = self.cfg.head_dim();
+        self.cfg.latent_seq_len = latent_seq_len;
+        self.cfg.clip_seq_len = clip_seq_len;
+        self.cfg.sync_seq_len = sync_seq_len;
+        self.latent_rope = Rope::new(latent_seq_len, hd, 1.0, &self.device)?;
+        self.clip_rope = Rope::new(clip_seq_len, hd, self.cfg.clip_rope_scaling(), &self.device)?;
+        self.sync_up_idx = nearest_exact_indices(sync_seq_len, latent_seq_len, &self.device)?;
+        Ok(())
+    }
+
+    /// The empty (CFG-negative) conditions built from a caller-supplied **negative text** feature —
+    /// the port of the reference `get_empty_conditions(bs, negative_text_features=…)`. This is the
+    /// path `demo.py`/`generate` actually take: the negative branch's text is `encode_text(negative)`
+    /// (the default `negative=""` is still a real CLIP encoding), while the visual streams use the
+    /// learned `empty_clip_feat`/`empty_sync_feat`. Distinct from [`empty_conditions`](Self::empty_conditions),
+    /// whose text is the learned `empty_string_feat` (used only when no negative text is supplied).
+    pub fn empty_conditions_with_text(
+        &self,
+        bs: usize,
+        neg_text_f: &Tensor,
+    ) -> CResult<Conditions> {
+        let clip = self
+            .empty_clip_feat
+            .reshape((1, 1, self.cfg.clip_dim))?
+            .broadcast_as((bs, self.cfg.clip_seq_len, self.cfg.clip_dim))?
+            .contiguous()?;
+        let sync = self
+            .empty_sync_feat
+            .reshape((1, 1, self.cfg.sync_dim))?
+            .broadcast_as((bs, self.cfg.sync_seq_len, self.cfg.sync_dim))?
+            .contiguous()?;
+        self.preprocess_conditions(&clip, &sync, neg_text_f)
+    }
+
     /// The empty (CFG-negative) conditions from the learnable empty features, expanded to `bs`.
     pub fn empty_conditions(&self, bs: usize) -> CResult<Conditions> {
         let clip = self
