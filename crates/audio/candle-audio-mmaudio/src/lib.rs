@@ -84,11 +84,13 @@ pub mod agg;
 pub mod blocks;
 pub mod clip;
 pub mod config;
+pub mod mmdit;
 pub mod model;
 pub mod preprocess;
 pub mod sync;
 
 pub use clip::DfnClipEncoder;
+pub use mmdit::{Conditions, Config as MmDitConfig, MmAudioDit};
 pub use model::{
     load, load_from_pth, resolve_pinned_weights, HUB_REPO, HUB_REVISION, MODEL_ID, WEIGHTS_PATH,
     WEIGHT_LICENSE, WEIGHT_LICENSE_ENTRY,
@@ -96,7 +98,11 @@ pub use model::{
 pub use sync::SynchformerVisualEncoder;
 
 /// This crate's model-weight-license entries for catalog aggregation (sc-13332) — one row per ported
-/// encoder (Synchformer visual `vfeat`, sc-13438; DFN5B-CLIP ViT-H/14, sc-13437). Surfaced now so
-/// the later shipping MMAudio generator can fold them into the audio-catalog model-licenses manifest.
-pub const WEIGHT_LICENSES: &[gen_core::WeightLicenseEntry] =
-    &[model::WEIGHT_LICENSE_ENTRY, clip::WEIGHT_LICENSE_ENTRY];
+/// component (Synchformer visual `vfeat`, sc-13438; DFN5B-CLIP ViT-H/14, sc-13437; the MM-DiT
+/// flow-matching generator `mmaudio_small_16k`, sc-13439). Surfaced now so the later shipping
+/// MMAudio generator (sc-12843) can fold them into the audio-catalog model-licenses manifest.
+pub const WEIGHT_LICENSES: &[gen_core::WeightLicenseEntry] = &[
+    model::WEIGHT_LICENSE_ENTRY,
+    clip::WEIGHT_LICENSE_ENTRY,
+    mmdit::WEIGHT_LICENSE_ENTRY,
+];
