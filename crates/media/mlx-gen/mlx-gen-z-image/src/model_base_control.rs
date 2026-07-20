@@ -194,7 +194,9 @@ impl ZImageControl {
         // → load the control DiT/VAE → denoise/decode → free the heavy bundle) is driven by the shared
         // [`Residency::run`] seam (sc-11124). Base-control delta vs the Turbo control variant: real CFG
         // (a negative-prompt uncond branch) and no bf16 cap cast.
-        let images = self.residency.run(
+        // sc-13571 / GitHub #1658: DiT-dropping staged decode (see `crate::model` for the turbo path).
+        let tiling = pipeline::decode_tiling(req, self.residency.is_sequential());
+        let images = self.residency.run_staged(
             &req.cancel,
             // No PiD overlay on the control path (sc-7846 is base-turbo-only); the heavy loader ignores
             // this flag.
@@ -226,10 +228,8 @@ impl ZImageControl {
                 }
                 Ok(())
             },
-            // ── Phase B: denoise/decode from the heavy bundle. Runs identically for both residencies.
-            |heavy_owned, (cap, neg_cap), on_progress| {
-                let heavy = heavy_owned.as_ref();
-
+            // ── Phase B (denoise): heavy bundle + (cap, neg_cap) → evaluated latents.
+            |heavy: &ZImageControlHeavyOwned, (cap, neg_cap), on_progress| {
                 // Static shift=6.0 schedule (the base model's scheduler_config.json) — build once. An
                 // unset `req.scheduler` keeps it byte-exact (epic 7114 N1); a curated name re-shapes σ
                 // over shift=6.0.
@@ -245,30 +245,22 @@ impl ZImageControl {
                 // build once. It stays **f32** (the fork feeds it f32, promoting the control branch to
                 // f32).
                 let control_context =
-                    encode_control_context(heavy.vae, control_image, req.width, req.height)?;
+                    encode_control_context(&heavy.vae, control_image, req.width, req.height)?;
 
                 // VAE-encode the init image once too (constant across the batch — only the noise
                 // varies, F-034).
                 let clean = if is_img2img {
                     let (image, _) = reference.expect("is_img2img implies a reference");
                     Some(encode_init_latents(
-                        heavy.vae, image, req.width, req.height,
+                        &heavy.vae, image, req.width, req.height,
                     )?)
                 } else {
                     None
                 };
 
-                // Per-image batch render shared with the base/turbo variants (F-035); the control+CFG
-                // branch's only difference is the `denoise_control_cfg_with_progress` step threading the
-                // f32 control context + scale through both the cond and uncond forward of the CFG
-                // combine.
                 let sampler_name = req.sampler.as_deref();
                 let neg_cap_ref = neg_cap.as_ref();
-                // The Fun-ControlNet variant is outside the PiD decode scope (sc-7846); pass `None` so
-                // it keeps the native VAE decode unchanged.
-                let images = pipeline::render_batch(
-                    heavy.vae,
-                    None,
+                let latents = pipeline::denoise_batch(
                     &scheduler,
                     clean.as_ref(),
                     start_step,
@@ -277,7 +269,7 @@ impl ZImageControl {
                     on_progress,
                     |latents, seed, op| {
                         denoise_control_cfg_with_progress(
-                            heavy.transformer,
+                            &heavy.transformer,
                             &scheduler,
                             sampler_name,
                             seed,
@@ -292,6 +284,21 @@ impl ZImageControl {
                             op,
                         )
                     },
+                )?;
+                Ok(latents)
+            },
+            // Materialize the latents so the control DiT is no longer held via the lazy graph, then shed.
+            |latents| Ok(mlx_rs::transforms::eval(latents.iter())?),
+            // ── Phase C (decode): light (VAE) view + latents → images (no PiD on control). Tiled under
+            // `Sequential`.
+            |view, latents, on_progress| {
+                let images = pipeline::decode_batch(
+                    view.vae,
+                    None,
+                    tiling.as_ref(),
+                    latents,
+                    &req.cancel,
+                    on_progress,
                 )?;
                 Ok(GenerationOutput::Images(images))
             },

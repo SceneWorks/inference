@@ -181,7 +181,9 @@ impl ZImage {
         };
         let is_img2img = start_step > 0;
 
-        let images = self.residency.run(
+        // sc-13571 / GitHub #1658: DiT-dropping staged decode (see `crate::model` for the turbo path).
+        let tiling = pipeline::decode_tiling(req, self.residency.is_sequential());
+        let images = self.residency.run_staged(
             &req.cancel,
             req.use_pid,
             on_progress,
@@ -212,10 +214,8 @@ impl ZImage {
                 }
                 Ok(())
             },
-            // ── Phase B: denoise/decode from the heavy bundle. Runs identically for both residencies.
-            |heavy_owned, (cap, neg_cap), on_progress| {
-                let heavy = heavy_owned.as_ref();
-
+            // ── Phase B (denoise): heavy bundle + (cap, neg_cap) → (evaluated latents, PiD decoder).
+            |heavy: &ZImageHeavyOwned, (cap, neg_cap), on_progress| {
                 // Static shift=6.0 schedule (the base model's scheduler_config.json) — build once. An
                 // unset `req.scheduler` keeps it byte-exact (epic 7114 N1); a curated name re-shapes σ
                 // over `shift=6.0`.
@@ -238,7 +238,7 @@ impl ZImage {
                 let (capture_sigma, keep) =
                     flow_capture_for_request(req, &resolved_sigmas, start_step);
                 let pid_decoder = resolve_pid_decoder_at_sigma(
-                    heavy.pid,
+                    heavy.pid.as_ref(),
                     req,
                     base_seed,
                     MODEL_ID,
@@ -251,7 +251,7 @@ impl ZImage {
                 let clean = if is_img2img {
                     let (image, _) = reference.expect("is_img2img implies a reference");
                     Some(encode_init_latents(
-                        heavy.vae, image, req.width, req.height,
+                        &heavy.vae, image, req.width, req.height,
                     )?)
                 } else {
                     None
@@ -259,9 +259,7 @@ impl ZImage {
 
                 let sampler_name = req.sampler.as_deref();
                 let neg_cap_ref = neg_cap.as_ref();
-                let images = pipeline::render_batch(
-                    heavy.vae,
-                    pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder),
+                let latents = pipeline::denoise_batch(
                     &scheduler,
                     clean.as_ref(),
                     start_step,
@@ -270,7 +268,7 @@ impl ZImage {
                     on_progress,
                     |latents, seed, op| {
                         denoise_cfg_with_progress(
-                            heavy.transformer,
+                            &heavy.transformer,
                             &scheduler,
                             sampler_name,
                             seed,
@@ -283,6 +281,20 @@ impl ZImage {
                             op,
                         )
                     },
+                )?;
+                Ok((latents, pid_decoder))
+            },
+            // Materialize the latents so the DiT is no longer held via the lazy graph, then it is shed.
+            |mid| Ok(mlx_rs::transforms::eval(mid.0.iter())?),
+            // ── Phase C (decode): light (VAE) view + latents → images. Tiled under `Sequential`.
+            |view, (latents, pid_decoder), on_progress| {
+                let images = pipeline::decode_batch(
+                    view.vae,
+                    pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder),
+                    tiling.as_ref(),
+                    latents,
+                    &req.cancel,
+                    on_progress,
                 )?;
                 Ok(GenerationOutput::Images(images))
             },

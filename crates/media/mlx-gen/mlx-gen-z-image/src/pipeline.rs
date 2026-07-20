@@ -3,13 +3,15 @@
 //! init-latent encoding, and the denoise loops ([`denoise_with_progress`] /
 //! [`denoise_control_with_progress`]) that compose these with the transformer
 //! ([`crate::transformer`]), scheduler ([`mlx_gen::FlowMatchEuler`]) and VAE ([`crate::vae`]). The
-//! two generators ([`crate::model`] / [`crate::model_control`]) drive them through the shared
-//! `render_batch`.
+//! four generators drive them through the staged `denoise_batch` → `decode_batch` split (sc-13571):
+//! [`mlx_gen::Residency::run_staged`] frees the DiT between the two phases so the tiled decode fits a
+//! small Mac.
 
 use mlx_gen::array::host_i32;
 // The img2img leaves (start-step / init-image preprocess / noise-interp blend) are shared in core;
 // re-export so the crate's public surface (`mlx_gen_z_image::…`) and internal callers are unchanged.
 pub use mlx_gen::img2img::{add_noise_by_interpolation, init_time_step, preprocess_init_image};
+use mlx_gen::tiling::TilingConfig;
 use mlx_gen::tokenizer::{TextTokenizer, TokenizerOutput};
 use mlx_gen::{
     run_flow_sampler, CancelFlag, Conditioning, Error, FlowMatchEuler, GenerationRequest, Image,
@@ -478,16 +480,22 @@ pub(crate) fn resolve_reference<'a>(
     Ok(reference)
 }
 
-/// The shared per-image batch render the two Z-Image generators only differed in the denoise call for
-/// (F-035): for each of `req.count` images, build the seeded bf16 noise (blended with the pre-encoded
-/// `clean` latents for img2img), run `denoise`, then VAE-decode to an RGB8 [`Image`]. The base vs
-/// control branch is the `denoise` closure; the seed convention, the `sigma`-blend, the process-global
-/// compile-glue enable, and the decode tail are identical and live here. Bit-identical to the prior
-/// inline loops.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn render_batch(
-    vae: &Vae,
-    pid_decoder: Option<&dyn LatentDecoder>,
+/// The decode-time tiling policy for a request (sc-13571, GitHub #1658). `is_sequential` is the
+/// fit-gate's memory-constrained-Mac signal (`OffloadPolicy::Sequential`): under it the VAE decode is
+/// tiled to bound its ~14 GiB 1024² transient; a large-memory `Resident` machine decodes EXACTLY
+/// (untiled, `None`), except for a very large output that would spike past even a big Mac. 512 px is the
+/// parity sweet spot for this GroupNorm VAE — visually seam-free at 1024²/1280², where smaller tiles
+/// would drift the per-tile norm statistics.
+pub(crate) fn decode_tiling(req: &GenerationRequest, is_sequential: bool) -> Option<TilingConfig> {
+    (is_sequential || req.width.max(req.height) > 2048).then(|| TilingConfig::spatial_only(512, 64))
+}
+
+/// Phase 1 of the staged render (sc-13571): the per-image denoise count loop → `Vec` of **evaluated**
+/// latents `[16,1,H/8,W/8]`. Each image's latents are `eval`ed before the next so (a) the DiT graph is
+/// cut — letting the caller shed the DiT before decode via [`mlx_gen::StagedHeavy`] — and (b) the batch
+/// working set stays one image, not all `count`. The seeded bf16 noise + img2img `clean`-blend are
+/// unchanged from the old single-pass loop (PARITY-BF16 sc-2609; F-032 defensive `sigma` get).
+pub(crate) fn denoise_batch(
     scheduler: &FlowMatchEuler,
     clean: Option<&Array>,
     start_step: usize,
@@ -495,26 +503,17 @@ pub(crate) fn render_batch(
     req: &GenerationRequest,
     on_progress: &mut dyn FnMut(Progress),
     mut denoise: impl FnMut(Array, u64, &mut dyn FnMut(Progress)) -> Result<Array>,
-) -> Result<Vec<Image>> {
-    // sc-2963 (rollout of sc-2957): run the DiT's fusable elementwise glue through `mx.compile` —
-    // bit-exact and a per-step win. sc-4036/F-036: enable it ONCE for the whole render via an RAII
-    // guard (was redundantly re-set every image) that restores the prior process-global on return,
-    // so code after `generate` (e.g. the eager reference-parity gates) doesn't inherit it left on.
+) -> Result<Vec<Array>> {
+    // sc-2963/F-036: enable the fusable-elementwise `mx.compile` glue ONCE for the whole denoise batch.
     let _compile_glue = crate::CompileGlueGuard::enable();
-    let mut images = Vec::with_capacity(req.count as usize);
+    let mut latents = Vec::with_capacity(req.count as usize);
     for i in 0..req.count {
-        // Distinct seed per image in a batch (the fork's `seed + i`). PARITY-BF16 (sc-2609): the noise
-        // is bf16 to match the fork's seed→image mapping (f32 is a *different*, higher-precision
-        // realization, not just sharper).
         let seed = base_seed.wrapping_add(i as u64);
         let noise = create_noise(seed, req.width, req.height)?.as_dtype(Dtype::Bfloat16)?;
-        let latents = match clean {
-            // img2img: blend the pre-encoded clean latents with the noise at `sigma = sigmas[start]`.
-            // `.get` defensively: a degenerate schedule (e.g. steps == 0, rejected upstream by
-            // `validate_request`) must surface as a typed error, not an out-of-bounds Vec panic (F-032).
+        let init = match clean {
             Some(clean) => {
                 let sigma = scheduler.sigmas.get(start_step).ok_or_else(|| {
-                    mlx_gen::Error::Msg(format!(
+                    Error::Msg(format!(
                         "img2img start step {start_step} out of range for {}-element schedule",
                         scheduler.sigmas.len()
                     ))
@@ -523,18 +522,37 @@ pub(crate) fn render_batch(
             }
             None => noise,
         };
-        let latents = denoise(latents, seed, on_progress)?;
+        let out = denoise(init, seed, on_progress)?;
+        // Materialize so the DiT is no longer referenced through MLX's lazy graph (the caller's shed
+        // would otherwise free nothing).
+        mlx_rs::transforms::eval([&out])?;
+        latents.push(out);
+    }
+    Ok(latents)
+}
 
+/// Phase 2 of the staged render (sc-13571): decode each evaluated latent → RGB8 [`Image`]. Uses the
+/// memory-bounded [`Vae::decode_tiled`] when `tiling` is `Some` (small-Mac / large-image), else the
+/// exact single-pass [`Vae::decode`]; a PiD super-res decoder, when present, takes precedence (its own
+/// decode, untiled). `[16,1,H,W] → [1,16,H,W]`; the native VAE + PiD both accept the 4-D latent directly.
+pub(crate) fn decode_batch(
+    vae: &Vae,
+    pid_decoder: Option<&dyn LatentDecoder>,
+    tiling: Option<&TilingConfig>,
+    latents: Vec<Array>,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Vec<Image>> {
+    let mut images = Vec::with_capacity(latents.len());
+    for latent in latents {
         on_progress(Progress::Decoding);
-        // [16,1,H,W] -> [1,16,H,W]; route the unpacked 4-D latent through the selected decoder. The
-        // native VAE accepts the 4-D latent directly (it re-adds the singleton frame axis on output),
-        // so this is byte-identical to the prior `[1,16,1,H,W]` reshape — the 5-D→4-D squeeze inside
-        // `Vae::decode` was a no-op view. PiD requires 4-D. `pid_decoder` is `Some` only when the
-        // request set `use_pid` and a PiD overlay was loaded (epic 7840, sc-7846); else the native VAE.
-        let unpacked = unpack_latents(&latents)?;
-        let decoder: &dyn LatentDecoder = pid_decoder.unwrap_or(vae);
-        let decoded = decoder.decode(&unpacked)?.as_dtype(Dtype::Float32)?;
-        images.push(decoded_to_image(&decoded)?);
+        let unpacked = unpack_latents(&latent)?;
+        let decoded = match (pid_decoder, tiling) {
+            (Some(pid), _) => pid.decode(&unpacked)?,
+            (None, Some(cfg)) => vae.decode_tiled(&unpacked, cfg, Some(cancel))?,
+            (None, None) => vae.decode(&unpacked)?,
+        };
+        images.push(decoded_to_image(&decoded.as_dtype(Dtype::Float32)?)?);
     }
     Ok(images)
 }

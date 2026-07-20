@@ -12,9 +12,9 @@ use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, default_seed, resolve_flow_schedule,
     Capabilities, ConditioningKind, Error, FlowMatchEuler, GenerationOutput, GenerationRequest,
     Generator, LatentDecoder, LoadSpec, Modality, ModelDescriptor, OffloadPolicy, Precision,
-    Progress, Quant, Residency, Result, WeightsSource,
+    Progress, Quant, Residency, Result, StagedHeavy, WeightsSource,
 };
-use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidEngine};
+use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidDecoder, PidEngine};
 use mlx_rs::Dtype;
 use std::path::Path;
 
@@ -132,20 +132,44 @@ pub(crate) struct ZImageHeavyOwned {
     pub(crate) pid: Option<PidEngine>,
 }
 
-/// A borrow of the heavy render-phase components, so the denoise/decode body runs identically
-/// whether they are held resident or were just loaded by the `Sequential` path (candle's `DitRef`).
-pub(crate) struct ZImageHeavy<'a> {
-    pub(crate) transformer: &'a ZImageTransformer,
+/// The light (decode-only) z-image bundle that survives the DiT drop under `Sequential` staged decode
+/// (sc-13571, GitHub #1658): the VAE plus the optional PiD overlay. [`StagedHeavy::shed_dit`] drops the
+/// multi-GB DiT and moves these here, so the tiled VAE decode peak excludes the transformer.
+pub(crate) struct ZImageLight {
+    pub(crate) vae: Vae,
+    pub(crate) pid: Option<PidEngine>,
+}
+
+/// A borrowed decode view (VAE + optional PiD) — from the owned [`ZImageLight`] under `Sequential`
+/// (post-shed), or from the still-warm [`ZImageHeavyOwned`] under `Resident` — so the decode body is
+/// written once for both policies.
+pub(crate) struct ZImageDecodeView<'a> {
     pub(crate) vae: &'a Vae,
+    #[allow(dead_code)]
+    // carried for symmetry; the staged path mints its PiD decoder in the denoise phase
     pub(crate) pid: Option<&'a PidEngine>,
 }
 
-impl ZImageHeavyOwned {
-    pub(crate) fn as_ref(&self) -> ZImageHeavy<'_> {
-        ZImageHeavy {
-            transformer: &self.transformer,
+impl StagedHeavy for ZImageHeavyOwned {
+    type Light = ZImageLight;
+    type DecodeView<'a> = ZImageDecodeView<'a>;
+    fn shed_dit(self) -> ZImageLight {
+        // `self.transformer` (the DiT) drops here; the VAE + PiD move into the light bundle.
+        ZImageLight {
+            vae: self.vae,
+            pid: self.pid,
+        }
+    }
+    fn decode_view(&self) -> ZImageDecodeView<'_> {
+        ZImageDecodeView {
             vae: &self.vae,
             pid: self.pid.as_ref(),
+        }
+    }
+    fn light_view(light: &ZImageLight) -> ZImageDecodeView<'_> {
+        ZImageDecodeView {
+            vae: &light.vae,
+            pid: light.pid.as_ref(),
         }
     }
 }
@@ -363,7 +387,12 @@ impl ZImageTurbo {
         };
         let is_img2img = start_step > 0;
 
-        let images = self.residency.run(
+        // sc-13571 / GitHub #1658: the DiT-dropping staged decode. Under `Sequential` (the small-Mac
+        // fit-gate signal) `run_staged` frees the DiT after denoise and before the (tiled) VAE decode,
+        // so the decode peak excludes the ~3.2 GiB DiT; under `Resident` nothing is shed. `tiling` bounds
+        // the decode transient on the same small-Mac signal ([`pipeline::decode_tiling`]).
+        let tiling = pipeline::decode_tiling(req, self.residency.is_sequential());
+        let images = self.residency.run_staged(
             &req.cancel,
             req.use_pid,
             on_progress,
@@ -380,19 +409,15 @@ impl ZImageTurbo {
                     Ok(cap.as_dtype(Dtype::Bfloat16)?)
                 }
             },
-            // Materialize the final `cap` while the encoder is still alive (Sequential only) — MLX is
-            // lazy, so an un-evaluated `cap` keeps the encoder referenced through the graph and the
-            // drop would free nothing. The bf16 cast is applied above so this barrier materializes the
-            // post-cast `cap`, not the pre-cast f32 graph.
+            // Materialize `cap` while the encoder is still alive (Sequential only) — MLX is lazy, so an
+            // un-evaluated `cap` keeps the encoder referenced through the graph and the drop frees nothing.
             |cap| Ok(mlx_rs::transforms::eval([cap])?),
-            // ── Phase B: denoise/decode from the heavy bundle. Runs identically for both residencies.
-            |heavy_owned, cap, on_progress| {
-                let heavy = heavy_owned.as_ref();
-
+            // ── Phase B (denoise): heavy bundle + cap → (evaluated latents, minted PiD decoder). The
+            // PiD decoder is minted here (owned, no borrow of `heavy.pid`) so it survives the shed.
+            |heavy: &ZImageHeavyOwned, cap, on_progress| {
                 // Static shift=3.0 schedule (the model's scheduler_config.json), resolution- and
-                // seed-independent. See SCHEDULE_SHIFT. An unset `req.scheduler` keeps this native
-                // schedule byte-exact (epic 7114 N1); a curated name re-shapes the σ schedule over the
-                // same `shift=3.0` (`mu = ln(3)`).
+                // seed-independent. An unset `req.scheduler` keeps this native schedule byte-exact
+                // (epic 7114 N1); a curated name re-shapes the σ schedule over the same `shift=3.0`.
                 let native = FlowMatchEuler::for_static_shift(steps, SCHEDULE_SHIFT);
                 let resolved_sigmas = resolve_flow_schedule(
                     req.scheduler.as_deref(),
@@ -401,19 +426,13 @@ impl ZImageTurbo {
                     &native.sigmas,
                 );
                 // PiD decode overlay (sc-7846) + `from_ldm` early-stop (sc-8048): mint a decoder when
-                // `use_pid` is set AND a PiD overlay was loaded, else `None` → the native VAE. Errors
-                // loudly if `use_pid` was requested without a loaded overlay (no silent VAE fallback).
-                // Z-Image is flow-match (`vp_frame=false`), so the schedule σ *is* the degrade σ: when
-                // `pid_capture_sigma` asks for an early exit, `flow_capture_for_request` folds the σ
-                // ceiling + schedule into `(capture_sigma, keep)` — mint the decoder at `capture_sigma`
-                // and build the scheduler over the *truncated* `resolved_sigmas[..keep]` so the denoise
-                // stops at the achieved-σ step (the img2img blend still reads `sigmas[start_step]`,
-                // valid since `keep > start_step`). The clean path yields `(0.0, len())` → full
-                // schedule, σ=0, byte-identical. `start_step` is the img2img noise-blend offset.
+                // `use_pid` is set AND an overlay was loaded, else `None` → the native VAE. The
+                // `(capture_sigma, keep)` fold truncates the denoise to the achieved-σ step; the clean
+                // path yields `(0.0, len())` → full schedule, byte-identical.
                 let (capture_sigma, keep) =
                     flow_capture_for_request(req, &resolved_sigmas, start_step);
                 let pid_decoder = resolve_pid_decoder_at_sigma(
-                    heavy.pid,
+                    heavy.pid.as_ref(),
                     req,
                     base_seed,
                     MODEL_ID,
@@ -421,24 +440,18 @@ impl ZImageTurbo {
                 )?;
                 let scheduler = FlowMatchEuler::from_sigmas(resolved_sigmas[..keep].to_vec())?;
 
-                // VAE-encode the init image once: the clean latents depend only on the init image +
-                // target dims, not the per-image seed, so they're constant across the count loop
-                // (F-034). Only the noise (and its blend) vary per image.
+                // VAE-encode the init image once (img2img): constant across the count loop (F-034).
                 let clean = if is_img2img {
                     let (image, _) = reference.expect("is_img2img implies a reference");
                     Some(encode_init_latents(
-                        heavy.vae, image, req.width, req.height,
+                        &heavy.vae, image, req.width, req.height,
                     )?)
                 } else {
                     None
                 };
 
-                // Per-image batch render shared with the control variant (F-035); the base branch's
-                // only difference is the plain `denoise_with_progress` step.
                 let sampler_name = req.sampler.as_deref();
-                let images = pipeline::render_batch(
-                    heavy.vae,
-                    pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder),
+                let latents = pipeline::denoise_batch(
                     &scheduler,
                     clean.as_ref(),
                     start_step,
@@ -447,7 +460,7 @@ impl ZImageTurbo {
                     on_progress,
                     |latents, seed, op| {
                         denoise_with_progress(
-                            heavy.transformer,
+                            &heavy.transformer,
                             &scheduler,
                             sampler_name,
                             seed,
@@ -458,6 +471,22 @@ impl ZImageTurbo {
                             op,
                         )
                     },
+                )?;
+                Ok((latents, pid_decoder))
+            },
+            // Materialize the latents so the DiT is no longer held via the lazy graph, then it is shed.
+            |(latents, _pid): &(Vec<_>, Option<PidDecoder>)| {
+                Ok(mlx_rs::transforms::eval(latents.iter())?)
+            },
+            // ── Phase C (decode): light (VAE) view + latents → images. Tiled under `Sequential`.
+            |view, (latents, pid_decoder), on_progress| {
+                let images = pipeline::decode_batch(
+                    view.vae,
+                    pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder),
+                    tiling.as_ref(),
+                    latents,
+                    &req.cancel,
+                    on_progress,
                 )?;
                 Ok(GenerationOutput::Images(images))
             },
