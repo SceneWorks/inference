@@ -1,6 +1,7 @@
 //! RGB-frame preprocessing faithful to Synchformer's own transform (MMAudio runtime path).
 //!
-//! Steps, per frame: resize the shorter edge to [`config::IMG_SIZE`] (bilinear), center-crop to
+//! Steps, per frame: resize the shorter edge to [`config::IMG_SIZE`] (CatmullRom, an approximation
+//! of the reference's torchvision bicubic — see `resize_center_crop`), center-crop to
 //! `IMG_SIZE × IMG_SIZE`, scale to `[0,1]`, then normalize with mean/std = 0.5 → `[-1, 1]`
 //! (`DATA.MEAN` / `DATA.STD`, **not** ImageNet stats). Frames are then windowed into overlapping
 //! 16-frame segments (`sync_step_size = 8`, 50% overlap) and stacked into the encoder's input
@@ -15,7 +16,12 @@ use image::RgbImage;
 use crate::config;
 use crate::{AudioError, Result};
 
-/// Resize a frame's shorter edge to `IMG_SIZE` (bilinear), then center-crop `IMG_SIZE × IMG_SIZE`.
+/// Resize a frame's shorter edge to `IMG_SIZE`, then center-crop `IMG_SIZE × IMG_SIZE`.
+///
+/// The reference sync transform (`eval_utils.py`: `v2.Resize(224, interpolation=BICUBIC)`) uses
+/// torchvision bicubic. The `image` crate has no bicubic filter, so we use `CatmullRom`, its
+/// closest analogue. This **approximates** the reference — it does not bit-match torchvision's
+/// a=-0.75 bicubic kernel — so conditioning features on non-224 input can differ slightly.
 fn resize_center_crop(frame: &RgbImage) -> RgbImage {
     let (w, h) = frame.dimensions();
     let target = config::IMG_SIZE as u32;
@@ -31,8 +37,13 @@ fn resize_center_crop(frame: &RgbImage) -> RgbImage {
             target,
         )
     };
-    let resized =
-        image::imageops::resize(frame, nw.max(target), nh.max(target), FilterType::Triangle);
+    // CatmullRom approximates the reference's torchvision bicubic (see fn doc).
+    let resized = image::imageops::resize(
+        frame,
+        nw.max(target),
+        nh.max(target),
+        FilterType::CatmullRom,
+    );
     // Center crop.
     let (rw, rh) = resized.dimensions();
     let x0 = (rw - target) / 2;

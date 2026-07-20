@@ -61,7 +61,8 @@
 //!
 //! ## Preprocessing
 //!
-//! [`preprocess`]: shorter-edge → 224 (bilinear), center-crop 224², scale to `[0,1]`, normalize
+//! [`preprocess`]: shorter-edge → 224 (CatmullRom, approximating the reference's torchvision
+//! bicubic — not a bit-exact match), center-crop 224², scale to `[0,1]`, normalize
 //! mean/std = 0.5 → `[-1, 1]` (`DATA.MEAN`/`STD`, **not** ImageNet stats), then window into
 //! overlapping 16-frame segments.
 //!
