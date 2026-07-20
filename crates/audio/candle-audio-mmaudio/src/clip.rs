@@ -802,6 +802,7 @@ pub const WEIGHT_LICENSE: candle_audio::gen_core::WeightLicense =
 pub const WEIGHT_LICENSE_ENTRY: candle_audio::gen_core::WeightLicenseEntry =
     candle_audio::gen_core::WeightLicenseEntry {
         provider_id: MODEL_ID,
+        component: None,
         license: WEIGHT_LICENSE,
     };
 

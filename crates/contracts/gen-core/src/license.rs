@@ -74,33 +74,62 @@ impl WeightLicense {
     }
 }
 
-/// A `(provider_id, WeightLicense)` pairing — the aggregated unit a catalog surfaces and the
-/// release tooling serializes into the model-licenses manifest. `provider_id` is the same stable
+/// A `(provider_id, component, WeightLicense)` pairing — the aggregated unit a catalog surfaces and
+/// the release tooling serializes into the model-licenses manifest. `provider_id` is the same stable
 /// registry id the provider's descriptor advertises (e.g. `"kokoro_82m"`).
+///
+/// ## One provider, one *or more* rows (sc-13493)
+///
+/// A single-checkpoint provider contributes exactly one row with [`component`](Self::component) =
+/// `None` — its license is both the attribution AND the effective restriction. A provider assembled
+/// from **multiple** checkpoints (e.g. MMAudio's video→audio Foley, which pulls a CLIP conditioner,
+/// a sync encoder, a DiT, a VAE and a vocoder — each under its own upstream license) contributes:
+///
+/// * one **composite** row (`component == None`) whose [`WeightLicense::restriction`] is the *effective*
+///   (strictest-terms) restriction — the at-a-glance "can we use this provider" signal, and
+/// * one **component** row per checkpoint (`component == Some(name)`) carrying that checkpoint's own
+///   SPDX id, source URL and attribution — the per-upstream attribution obligation CC-BY-* imposes.
+///
+/// Rows are therefore keyed by the `(provider_id, component)` pair, not by `provider_id` alone. A
+/// consumer that only wants the effective restriction reads the `component == None` row per provider;
+/// a consumer building an attributions page reads every row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WeightLicenseEntry {
     /// The registry id of the provider these weights belong to (matches the provider descriptor's
     /// `id`).
     pub provider_id: &'static str,
-    /// The license of that provider's pinned weight checkpoint.
+    /// The checkpoint/component discriminator within a multi-checkpoint provider. `None` for a
+    /// single-checkpoint provider's sole row, and for a multi-checkpoint provider's **composite**
+    /// (effective-restriction) row; `Some(name)` for each per-checkpoint attribution row. The
+    /// `(provider_id, component)` pair is the manifest's unique key.
+    pub component: Option<&'static str>,
+    /// The license of that provider's pinned weight checkpoint (or, for a composite row, the
+    /// effective/strictest-terms license across the provider's checkpoints).
     pub license: WeightLicense,
 }
 
 /// Serialize weight-license entries into the canonical **model-licenses manifest** JSON — the file
 /// the release tooling emits beside the SPDX SBOM and SceneWorks aggregates for its licenses page.
 ///
-/// The output is deterministic: providers are sorted by `provider_id`, so the committed manifest
-/// and the catalog-generated value compare byte-for-byte (the drift ship-gate) regardless of the
-/// order providers were registered in. A trailing newline is included so the file matches
-/// `write_json`'s convention in the release tooling.
+/// The output is deterministic: rows are sorted by the `(provider_id, component)` key (a provider's
+/// composite `component == None` row sorts first, ahead of its `Some(_)` component rows), so the
+/// committed manifest and the catalog-generated value compare byte-for-byte (the drift ship-gate)
+/// regardless of the order providers were registered in. Every row carries a `component` field
+/// (`null` for a single-checkpoint or composite row). A trailing newline is included so the file
+/// matches `write_json`'s convention in the release tooling.
 pub fn weight_licenses_manifest_json(entries: &[WeightLicenseEntry]) -> String {
     let mut sorted: Vec<&WeightLicenseEntry> = entries.iter().collect();
-    sorted.sort_by(|a, b| a.provider_id.cmp(b.provider_id));
+    sorted.sort_by(|a, b| {
+        a.provider_id
+            .cmp(b.provider_id)
+            .then_with(|| a.component.cmp(&b.component))
+    });
     let providers: Vec<serde_json::Value> = sorted
         .iter()
         .map(|entry| {
             serde_json::json!({
                 "provider_id": entry.provider_id,
+                "component": entry.component,
                 "spdx_id": entry.license.spdx_id,
                 "license_name": entry.license.name,
                 "source_url": entry.license.source_url,
@@ -111,7 +140,7 @@ pub fn weight_licenses_manifest_json(entries: &[WeightLicenseEntry]) -> String {
         })
         .collect();
     let document = serde_json::json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "kind": "model-weight-licenses",
         "providers": providers,
     });
@@ -168,10 +197,12 @@ mod tests {
         let entries = [
             WeightLicenseEntry {
                 provider_id: "zeta",
+                component: None,
                 license: APACHE,
             },
             WeightLicenseEntry {
                 provider_id: "alpha",
+                component: None,
                 license: APACHE,
             },
         ];
@@ -180,10 +211,12 @@ mod tests {
         let reversed = [
             WeightLicenseEntry {
                 provider_id: "alpha",
+                component: None,
                 license: APACHE,
             },
             WeightLicenseEntry {
                 provider_id: "zeta",
+                component: None,
                 license: APACHE,
             },
         ];
@@ -194,10 +227,62 @@ mod tests {
         assert!(json.ends_with("}\n"));
         // Parses back and carries the schema envelope.
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["schema_version"], 2);
         assert_eq!(value["kind"], "model-weight-licenses");
         assert_eq!(value["providers"].as_array().unwrap().len(), 2);
+        // Every row carries a `component` field; a single-checkpoint row's is null.
+        assert!(value["providers"][0]["component"].is_null());
         // A `None` optional serializes as JSON null (surfaced, not omitted).
         assert!(value["providers"][0]["restriction"].is_null());
+    }
+
+    #[test]
+    fn multi_component_provider_emits_ordered_rows_with_composite_first() {
+        // A provider assembled from two checkpoints: one composite (effective restriction) row and
+        // two per-checkpoint attribution rows, all sharing the provider id (sc-13493).
+        let composite = WeightLicense {
+            spdx_id: "LicenseRef-Foo-composite",
+            name: "Foo composite",
+            source_url: "https://huggingface.co/example/foo",
+            attribution: Some("Foo assembles two checkpoints"),
+            commercial_use: false,
+            restriction: Some("Research / non-commercial only — strictest of two components."),
+        };
+        let component_b = WeightLicense {
+            spdx_id: "MIT",
+            name: "MIT License",
+            source_url: "https://github.com/example/b",
+            attribution: Some("Component B © Example — MIT"),
+            commercial_use: true,
+            restriction: None,
+        };
+        let entries = [
+            WeightLicenseEntry {
+                provider_id: "foo",
+                component: Some("b_checkpoint"),
+                license: component_b,
+            },
+            WeightLicenseEntry {
+                provider_id: "foo",
+                component: None,
+                license: composite,
+            },
+            WeightLicenseEntry {
+                provider_id: "foo",
+                component: Some("a_checkpoint"),
+                license: APACHE,
+            },
+        ];
+        let value: serde_json::Value =
+            serde_json::from_str(&weight_licenses_manifest_json(&entries)).unwrap();
+        let rows = value["providers"].as_array().unwrap();
+        assert_eq!(rows.len(), 3);
+        // Composite (component == null) sorts first, then components alphabetically.
+        assert!(rows[0]["component"].is_null());
+        assert_eq!(rows[0]["spdx_id"], "LicenseRef-Foo-composite");
+        assert_eq!(rows[1]["component"], "a_checkpoint");
+        assert_eq!(rows[2]["component"], "b_checkpoint");
+        // All three share the provider id.
+        assert!(rows.iter().all(|r| r["provider_id"] == "foo"));
     }
 }

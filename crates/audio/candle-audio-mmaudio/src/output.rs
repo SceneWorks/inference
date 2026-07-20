@@ -146,12 +146,14 @@ pub const BIGVGAN_WEIGHT_LICENSE: WeightLicense = WeightLicense {
 /// Weight-license entry for the 16k mel-VAE (keyed by [`VAE_MODEL_ID`]).
 pub const VAE_WEIGHT_LICENSE_ENTRY: WeightLicenseEntry = WeightLicenseEntry {
     provider_id: VAE_MODEL_ID,
+    component: None,
     license: VAE_WEIGHT_LICENSE,
 };
 
 /// Weight-license entry for the 16k BigVGAN (keyed by [`BIGVGAN_MODEL_ID`]).
 pub const BIGVGAN_WEIGHT_LICENSE_ENTRY: WeightLicenseEntry = WeightLicenseEntry {
     provider_id: BIGVGAN_MODEL_ID,
+    component: None,
     license: BIGVGAN_WEIGHT_LICENSE,
 };
 
@@ -205,12 +207,14 @@ pub const BIGVGAN_V2_WEIGHT_LICENSE: WeightLicense = WeightLicense {
 /// Weight-license entry for the 44k mel-VAE (keyed by [`VAE_MODEL_ID_44K`]).
 pub const VAE_WEIGHT_LICENSE_ENTRY_44K: WeightLicenseEntry = WeightLicenseEntry {
     provider_id: VAE_MODEL_ID_44K,
+    component: None,
     license: VAE_WEIGHT_LICENSE_44K,
 };
 
 /// Weight-license entry for the NVIDIA BigVGAN v2 44k vocoder (keyed by [`BIGVGAN_V2_MODEL_ID`]).
 pub const BIGVGAN_V2_WEIGHT_LICENSE_ENTRY: WeightLicenseEntry = WeightLicenseEntry {
     provider_id: BIGVGAN_V2_MODEL_ID,
+    component: None,
     license: BIGVGAN_V2_WEIGHT_LICENSE,
 };
 
