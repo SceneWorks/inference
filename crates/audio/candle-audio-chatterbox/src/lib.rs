@@ -77,8 +77,8 @@ pub use model::{
     WEIGHT_LICENSE_ENTRY,
 };
 pub use perth::{
-    resolve_perth_weights, snr_db, PerthWatermarker, PERTH_SR, PERTH_WEIGHTS_FILE,
-    RESEMBLE_PERTH_VERSION,
+    resolve_perth_weights, snr_db, PerthWatermarker, PERTH_HUB_REPO, PERTH_HUB_REVISION, PERTH_SR,
+    PERTH_WEIGHTS_FILE,
 };
 pub use s3gen::S3Gen;
 pub use s3tokenizer::S3Tokenizer;

@@ -34,19 +34,23 @@
 //! `crate::s3tokenizer::resample_to_16k`), which the watermark's design tolerates (it is trained to
 //! survive an STFT/iSTFT cycle and resampling).
 //!
-//! ## Wiring status (sc-13240 → sc-13239)
+//! ## Wiring status (sc-13240 → sc-13239 → sc-13443)
 //!
 //! sc-13240 delivered the tested watermarker module + the recorded provenance; sc-13239 wires it
 //! into [`crate::model`]'s `generate()` output path so every rendered clone is watermarked at 24 kHz
-//! before it leaves the provider (the reference behavior — no disable flag). Because the PerTh
-//! checkpoint is **not on the Hugging Face hub** (it ships only inside the MIT `resemble-perth` pip
-//! package), [`resolve_perth_weights`] materializes `perth_implicit.safetensors` at runtime —
-//! honoring a pre-materialized `PERTH_SNAPSHOT`, else a per-user cache, else `pip download` +
-//! the repo's torch-free converter — the same path the real-weights CI uses.
+//! before it leaves the provider (the reference behavior — no disable flag). sc-13443 hosts the
+//! converted `perth_implicit.safetensors` on the Hugging Face hub (`SceneWorks/perth-implicit`, MIT)
+//! so [`resolve_perth_weights`] resolves it the same pinned-SHA way every other audio checkpoint
+//! does — [`candle_audio::hub::hf_get_pinned`] at [`PERTH_HUB_REVISION`] — with a `PERTH_SNAPSHOT`
+//! env override kept first as the offline/CI escape hatch. This removed the previous runtime
+//! `pip download resemble-perth` + torch-free-converter shell-out (and its subprocess-exec surface);
+//! `scripts/audio/convert_perth_watermarker.py` remains in the repo as the reproducibility record
+//! that produced the hosted checkpoint.
 
 use std::path::{Path, PathBuf};
 
 use candle_audio::candle_core::{DType, Device, Result as CandleResult, Tensor};
+use candle_audio::hub::hf_get_pinned;
 use candle_audio::{dsp, AudioError, Result};
 use candle_nn::{Conv1d, Conv1dConfig, Module, VarBuilder};
 
@@ -54,18 +58,17 @@ use candle_nn::{Conv1d, Conv1dConfig, Module, VarBuilder};
 /// this rate for analysis and back for [`PerthWatermarker::embed`].
 pub const PERTH_SR: u32 = 32_000;
 
-/// The converted checkpoint filename inside a snapshot dir (the encoder + decoder conv tensors of
+/// The converted checkpoint filename inside the hub repo (the encoder + decoder conv tensors of
 /// `perth_net_250000.pth.tar`; see `scripts/audio/convert_perth_watermarker.py`).
 pub const PERTH_WEIGHTS_FILE: &str = "perth_implicit.safetensors";
 
-/// The pinned `resemble-perth` package version the watermarker weights are materialized from.
-pub const RESEMBLE_PERTH_VERSION: &str = "1.0.1";
-
-/// The repo's torch-free converter (`scripts/audio/convert_perth_watermarker.py`), embedded at
-/// compile time. Embedding it keeps the checked-in script the single source of truth (no drift) while
-/// making the conversion available at runtime even in a shipped binary with no repo checkout.
-const PERTH_CONVERTER_PY: &str =
-    include_str!("../../../../scripts/audio/convert_perth_watermarker.py");
+/// Hub pin: `SceneWorks/perth-implicit` at an immutable commit (F-029; MIT weights — commercial use
+/// OK). SceneWorks hosts the converted `perth_implicit.safetensors` so a clone resolves its
+/// provenance watermarker weights the same pinned-SHA way every other audio checkpoint does (no
+/// runtime pip/network shell-out). The upstream `resemble-perth` package is MIT; the hosted file is
+/// its `perth_net_250000.pth.tar` run through `scripts/audio/convert_perth_watermarker.py`.
+pub const PERTH_HUB_REPO: &str = "SceneWorks/perth-implicit";
+pub const PERTH_HUB_REVISION: &str = "80b60f9caead09b8d3b512bda0b24038f28c08ec";
 
 /// STFT size (`hparams.n_fft`) — a power of two, so the shared radix-2 [`dsp::stft`] applies.
 const N_FFT: usize = 2048;
@@ -444,17 +447,11 @@ pub fn snr_db(reference: &[f32], modified: &[f32]) -> f32 {
 }
 
 // =================================================================================================
-// Runtime weight resolution (sc-13239): materialize perth_implicit.safetensors off the HF hub.
+// Runtime weight resolution (sc-13239 → sc-13443): resolve perth_implicit.safetensors off the HF hub.
 // =================================================================================================
 
-/// The Python interpreter to shell out to for materialization (`PYTHON` overrides; default
-/// `python3`).
-fn python_exe() -> String {
-    std::env::var("PYTHON").unwrap_or_else(|_| "python3".to_string())
-}
-
 /// `PERTH_SNAPSHOT` as a resolved `perth_implicit.safetensors` file, if it points at an existing one
-/// (a file directly, or a dir holding it).
+/// (a file directly, or a dir holding it). The offline/CI override kept ahead of the hub fetch.
 fn perth_from_env() -> Option<PathBuf> {
     let p = PathBuf::from(std::env::var("PERTH_SNAPSHOT").ok()?);
     let file = if p.is_dir() {
@@ -465,40 +462,13 @@ fn perth_from_env() -> Option<PathBuf> {
     file.is_file().then_some(file)
 }
 
-/// The persistent per-user cache dir for the converted PerTh weights — beside the HF cache the audio
-/// lane already uses (`$HF_HUB_CACHE` → `$HF_HOME/hub` → `~/.cache/huggingface/hub`).
-fn perth_cache_dir() -> PathBuf {
-    let root = if let Ok(c) = std::env::var("HF_HUB_CACHE") {
-        PathBuf::from(c)
-    } else if let Ok(h) = std::env::var("HF_HOME") {
-        PathBuf::from(h).join("hub")
-    } else {
-        let home = std::env::var("HOME")
-            .or_else(|_| std::env::var("USERPROFILE"))
-            .unwrap_or_default();
-        PathBuf::from(home)
-            .join(".cache")
-            .join("huggingface")
-            .join("hub")
-    };
-    root.join(format!("resemble-perth-{RESEMBLE_PERTH_VERSION}"))
-}
-
-/// The cached `perth_implicit.safetensors` path (whether or not it exists yet).
-pub fn perth_cache_file() -> PathBuf {
-    perth_cache_dir().join(PERTH_WEIGHTS_FILE)
-}
-
-/// Resolve the converted PerTh weights (`perth_implicit.safetensors`), materializing them if absent.
+/// Resolve the converted PerTh weights (`perth_implicit.safetensors`). Resolution order:
 ///
-/// The PerTh checkpoint is **not on the Hugging Face hub** — it ships only inside the MIT
-/// `resemble-perth` pip package — so there is no `hf_get_pinned` path for it. Resolution order:
-///
-/// 1. `PERTH_SNAPSHOT` (a file, or a dir holding `perth_implicit.safetensors`) — the pre-materialized
-///    cache the real-weights CI populates.
-/// 2. The persistent per-user cache ([`perth_cache_file`]).
-/// 3. Materialize into that cache via [`materialize_perth_weights`] (`pip download
-///    resemble-perth==1.0.1` + the embedded torch-free converter).
+/// 1. `PERTH_SNAPSHOT` (a file, or a dir holding `perth_implicit.safetensors`) — the offline/CI
+///    escape hatch, kept first.
+/// 2. The pinned-SHA hub fetch [`hf_get_pinned`]`(`[`PERTH_HUB_REPO`]`,` [`PERTH_HUB_REVISION`]`,`
+///    [`PERTH_WEIGHTS_FILE`]`)`, resolving into the ordinary HF cache — exactly how every other audio
+///    checkpoint (chatterbox/whisper/…) resolves (F-029; no runtime pip/network shell-out).
 ///
 /// The clone ALWAYS watermarks (the reference behavior — no disable flag): if the weights truly
 /// cannot be obtained this returns a typed error rather than silently skipping the watermark.
@@ -506,98 +476,7 @@ pub fn resolve_perth_weights() -> Result<PathBuf> {
     if let Some(p) = perth_from_env() {
         return Ok(p);
     }
-    let cached = perth_cache_file();
-    if cached.is_file() {
-        return Ok(cached);
-    }
-    materialize_perth_weights(&cached)?;
-    Ok(cached)
-}
-
-/// Materialize `perth_implicit.safetensors` at `dst` by `pip download resemble-perth==1.0.1`
-/// (no-deps) + the embedded torch-free converter — the exact steps the real-weights CI runs, folded
-/// into the runtime so a clone can obtain its provenance weights without a manual conversion. Shells
-/// out to a stdlib-only Python 3 (no ML deps); errors are typed and name the failing step.
-pub fn materialize_perth_weights(dst: &Path) -> Result<()> {
-    use std::process::Command;
-    let py = python_exe();
-    let work = dst
-        .parent()
-        .map(|p| p.join(".perth-materialize"))
-        .unwrap_or_else(|| PathBuf::from(".perth-materialize"));
-    std::fs::create_dir_all(&work)
-        .map_err(|e| AudioError::Msg(format!("perth: create {}: {e}", work.display())))?;
-
-    // 1. Download the MIT resemble-perth wheel (no deps) into the scratch dir.
-    run_step(
-        Command::new(&py)
-            .args([
-                "-m",
-                "pip",
-                "download",
-                "--disable-pip-version-check",
-                "--no-deps",
-                "--dest",
-            ])
-            .arg(&work)
-            .arg(format!("resemble-perth=={RESEMBLE_PERTH_VERSION}")),
-        "pip download resemble-perth (needs network + pip)",
-    )?;
-
-    // 2. Extract the wheel(s) (they are zips) with the stdlib.
-    run_step(
-        Command::new(&py)
-            .arg("-c")
-            .arg(
-                "import glob,sys,zipfile\n\
-                 [zipfile.ZipFile(w).extractall(sys.argv[1]) for w in glob.glob(sys.argv[1]+'/*.whl')]",
-            )
-            .arg(&work),
-        "extract the resemble-perth wheel",
-    )?;
-
-    // 3. Convert the bundled checkpoint to safetensors with the embedded torch-free converter.
-    let conv = work.join("convert_perth_watermarker.py");
-    std::fs::write(&conv, PERTH_CONVERTER_PY)
-        .map_err(|e| AudioError::Msg(format!("perth: write converter: {e}")))?;
-    let ckpt = work
-        .join("perth")
-        .join("perth_net")
-        .join("pretrained")
-        .join("implicit")
-        .join("perth_net_250000.pth.tar");
-    if let Some(parent) = dst.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| AudioError::Msg(format!("perth: create {}: {e}", parent.display())))?;
-    }
-    run_step(
-        Command::new(&py).arg(&conv).arg(&ckpt).arg(dst),
-        "convert perth_net_250000.pth.tar → perth_implicit.safetensors",
-    )?;
-    if !dst.is_file() {
-        return Err(AudioError::Msg(format!(
-            "perth: conversion reported success but {} is missing",
-            dst.display()
-        )));
-    }
-    Ok(())
-}
-
-/// Run one materialization subprocess, mapping a spawn failure or non-zero exit to a typed error
-/// naming the step (e.g. Python missing, no network).
-fn run_step(cmd: &mut std::process::Command, what: &str) -> Result<()> {
-    let out = cmd
-        .output()
-        .map_err(|e| AudioError::Msg(format!("perth: {what}: cannot run Python ({e})")))?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        return Err(AudioError::Msg(format!(
-            "perth: {what} failed ({}): {}",
-            out.status,
-            stderr.trim()
-        )));
-    }
-    Ok(())
+    hf_get_pinned(PERTH_HUB_REPO, PERTH_HUB_REVISION, PERTH_WEIGHTS_FILE)
 }
 
 #[cfg(test)]
