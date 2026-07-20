@@ -15,6 +15,13 @@
 //!   ((a) ≥ 2 PCM chunks before completion; (b) concat(chunks) == one-shot `generate()`
 //!   byte-identical; (c) valid 24 kHz mono track), plus (c) full audio non-silent / speech-shaped
 //!   and (d) first-chunk latency < full-generation latency, and it writes a playable demo WAV.
+//! - [`moss_tts_realtime_asr_roundtrip_fidelity`] — the sc-13433 **text-fidelity** gate: a curated
+//!   fixed prompt set is synthesized at the shipped sampling default and transcribed back with
+//!   `whisper_base`; each transcript must match its prompt within a character-error-rate bound (and
+//!   the mean CER within a tighter one). This is the ASR round-trip regression gate for
+//!   prompt-following — a model that regressed to silence / an unrelated utterance (the pre-sc-13433
+//!   spurious early-EOS failure) blows past the CER bound. It also asserts the metric discriminates
+//!   (an unrelated reference does *not* pass the same bound).
 //!
 //! `#[ignore]`d and snapshot-gated like every audio family's real-weight tests:
 //! ```text
@@ -24,14 +31,16 @@
 //! `model.safetensors`, `tokenizer.json`) and `MOSS_AUDIO_TOKENIZER_SNAPSHOT` to the codec snapshot
 //! dir (`config.json` + `model*.safetensors`), or leave unset to resolve the pinned snapshots via
 //! the hub (~4.66 GB AR + ~7.1 GB codec). The demo WAV path is `MOSS_TTS_REALTIME_WAV_OUT` (default
-//! temp dir).
+//! temp dir). The fidelity gate additionally uses `whisper_base` (`WHISPER_SNAPSHOT`, or the pinned
+//! ~150 MB snapshot resolved via the hub).
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use candle_audio_moss_tts_realtime as moss;
 use candle_audio_moss_tts_realtime::gen_core::{
-    AudioChunk, AudioParams, GenerationOutput, GenerationRequest, LoadSpec, WeightsSource,
+    AudioChunk, AudioParams, GenerationOutput, GenerationRequest, Generator, LoadSpec,
+    WeightsSource,
 };
 
 /// Resolve a MOSS-TTS-Realtime snapshot dir. `MOSS_TTS_REALTIME_SNAPSHOT` overrides; otherwise the
@@ -365,5 +374,179 @@ fn codec_only_decodes_synthetic_frames() {
     assert!(
         rms > 1e-4,
         "codec produced near-silent output ({rms:.6}) from non-trivial codes — decode-path bug"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// sc-13433 — ASR round-trip text-fidelity gate (prompt → MOSS-TTS-Realtime → whisper_base → CER).
+// ---------------------------------------------------------------------------------------------
+
+/// Curated fixed prompt set the shipped sampling default renders faithfully (measured, sc-13433).
+/// `THE_WEATHER` is the load-bearing regression guard: without the minimum-length EOS-suppression
+/// floor ([`moss::decode`]'s `DEFAULT_MIN_EOS_FRAMES`) it collapses to a spurious frame-0 EOS
+/// (~0.08 s, CER ≈ 0.95); with the floor it renders the full sentence (CER ≈ 0.00). The others are
+/// floor-independent good cases (their natural length already exceeds the floor). A future
+/// regression to silence / an unrelated utterance drives every prompt's CER past the bound.
+const FIDELITY_PROMPTS: &[&str] = &[
+    "The quick brown fox jumps over the lazy dog.",
+    "The train arrives at nine in the morning.",
+    "The weather is very nice this afternoon.",
+    "Please remember to buy milk and bread today.",
+];
+
+/// An utterance no FIDELITY_PROMPT transcribes to — used to prove the CER bound discriminates
+/// (a faithful transcript must NOT match this within the same bound).
+const UNRELATED_DECOY: &str = "the stock market fell sharply on tuesday afternoon";
+
+/// Per-prompt CER ceiling. Measured faithful transcripts sit at 0.00–0.14 (whisper's `nine`→`9` and
+/// `please`→`the peas` account for the non-zero ones); silence / unrelated-utterance regressions
+/// measure ≥ 0.72. 0.35 sits in that wide gap with margin on both sides.
+const MAX_PROMPT_CER: f32 = 0.35;
+/// Mean-CER ceiling across the set (tighter than the per-prompt bound — the set as a whole must be
+/// faithful, not merely each prompt individually under the loose per-prompt cap).
+const MAX_MEAN_CER: f32 = 0.20;
+
+/// Normalize transcript/reference text for CER: lowercase, strip punctuation, collapse whitespace.
+fn normalize(s: &str) -> String {
+    let cleaned: String = s
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+        .collect();
+    cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Character error rate = Levenshtein(reference, hypothesis) / reference.len() (the same metric the
+/// `candle-audio-whisper` Kokoro round-trip uses).
+fn character_error_rate(reference: &str, hypothesis: &str) -> f32 {
+    let r: Vec<char> = reference.chars().collect();
+    let h: Vec<char> = hypothesis.chars().collect();
+    if r.is_empty() {
+        return if h.is_empty() { 0.0 } else { 1.0 };
+    }
+    let mut prev: Vec<usize> = (0..=h.len()).collect();
+    let mut curr = vec![0usize; h.len() + 1];
+    for (i, &rc) in r.iter().enumerate() {
+        curr[0] = i + 1;
+        for (j, &hc) in h.iter().enumerate() {
+            let cost = usize::from(rc != hc);
+            curr[j + 1] = (prev[j] + cost).min(prev[j + 1] + 1).min(curr[j] + 1);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[h.len()] as f32 / r.len() as f32
+}
+
+/// A fidelity request: a generous target duration so audio-EOS terminates the sentence naturally
+/// (short budgets truncate the utterance — a measurement artifact, not a fidelity failure).
+fn fidelity_request(prompt: &str) -> GenerationRequest {
+    GenerationRequest {
+        prompt: prompt.to_string(),
+        audio: Some(AudioParams {
+            target_duration: Some(8.0),
+            language: Some("en".to_string()),
+            sample_rate: Some(24_000),
+            ..Default::default()
+        }),
+        seed: Some(20260719),
+        ..Default::default()
+    }
+}
+
+/// The sc-13433 text-fidelity regression gate. Synthesizes the curated prompt set at the **shipped
+/// sampling default** (reference temperature 0.8 + the minimum-length EOS-suppression floor — no env
+/// overrides), transcribes each clip with `whisper_base`, and asserts prompt-following within a CER
+/// bound. Guards against the pre-sc-13433 failure mode (a full sentence collapsing to a sub-second
+/// spurious-EOS fragment / silence) and against any future regression to unrelated speech.
+#[test]
+#[ignore = "real weights: needs the MOSS-TTS-Realtime AR + codec + whisper_base snapshots; run with --ignored --nocapture"]
+fn moss_tts_realtime_asr_roundtrip_fidelity() {
+    use candle_audio_whisper::gen_core::{
+        AudioTrack as WAudioTrack, LoadSpec as WLoadSpec, TimestampGranularity, TranscribeOptions,
+        TranscribeRequest, TranscribeTask, WeightsSource as WWeightsSource,
+    };
+
+    // The registered generator at the shipped sampling default (`generate` drives the shared
+    // synthesis path). `load()` resolves the pinned AR snapshot (or MOSS_TTS_REALTIME_SNAPSHOT).
+    let generator = load();
+
+    // whisper_base transcriber (pinned ~150 MB snapshot or WHISPER_SNAPSHOT).
+    let wspec = WLoadSpec::new(match std::env::var("WHISPER_SNAPSHOT") {
+        Ok(dir) => WWeightsSource::Dir(PathBuf::from(dir)),
+        Err(_) => candle_audio_whisper::resolve_pinned_snapshot()
+            .expect("resolve the pinned openai/whisper-base snapshot (network or warm HF cache)"),
+    });
+    let transcriber = candle_audio_whisper::provider_registry()
+        .expect("whisper registry")
+        .load_transcriber(candle_audio_whisper::MODEL_ID, &wspec)
+        .expect("whisper_base loads through the explicit registry");
+
+    let mut cers: Vec<f32> = Vec::new();
+    let mut first_transcript = String::new();
+    for prompt in FIDELITY_PROMPTS {
+        let track = match generator
+            .generate(&fidelity_request(prompt), &mut |_| {})
+            .expect("moss_tts_realtime generate")
+        {
+            GenerationOutput::Audio(t) => t,
+            other => panic!("expected GenerationOutput::Audio, got {other:?}"),
+        };
+        assert!(!track.samples.is_empty(), "empty audio for {prompt:?}");
+
+        let treq = TranscribeRequest {
+            audio: WAudioTrack {
+                samples: track.samples.clone(),
+                sample_rate: track.sample_rate,
+                channels: track.channels,
+                ..Default::default()
+            },
+            options: TranscribeOptions {
+                language: Some("en".into()),
+                task: TranscribeTask::Transcribe,
+                timestamps: TimestampGranularity::None,
+            },
+            ..Default::default()
+        };
+        let out = transcriber
+            .transcribe(&treq, &mut |_| {})
+            .expect("whisper transcribe");
+        let hyp = normalize(&out.text);
+        let refn = normalize(prompt);
+        let cer = character_error_rate(&refn, &hyp);
+        let secs = track.samples.len() as f32 / track.sample_rate as f32;
+        println!("fidelity: prompt={refn:?} transcript={hyp:?} CER={cer:.3} ({secs:.2}s audio)");
+        assert!(
+            !hyp.trim().is_empty(),
+            "empty transcript for {prompt:?} — the model produced nothing intelligible"
+        );
+        assert!(
+            cer <= MAX_PROMPT_CER,
+            "CER {cer:.3} > {MAX_PROMPT_CER} for {prompt:?}: transcript {hyp:?} does not follow the \
+             prompt (a spurious early-EOS fragment / silence / unrelated utterance fails here)"
+        );
+        if first_transcript.is_empty() {
+            first_transcript = hyp;
+        }
+        cers.push(cer);
+    }
+
+    let mean = cers.iter().sum::<f32>() / cers.len() as f32;
+    println!(
+        "fidelity: mean CER {mean:.3} over {} prompts (per-prompt cap {MAX_PROMPT_CER}, mean cap {MAX_MEAN_CER})",
+        cers.len()
+    );
+    assert!(
+        mean <= MAX_MEAN_CER,
+        "mean CER {mean:.3} > {MAX_MEAN_CER} — the prompt set as a whole is not being followed"
+    );
+
+    // Discrimination: the same (passing) transcript must NOT match an unrelated reference within the
+    // bound — proof the CER threshold distinguishes right-words from wrong-words, so a model that
+    // regressed to an unrelated utterance could not slip through.
+    let decoy_cer = character_error_rate(&normalize(UNRELATED_DECOY), &first_transcript);
+    assert!(
+        decoy_cer > MAX_PROMPT_CER,
+        "discrimination failed: a faithful transcript {first_transcript:?} scored CER {decoy_cer:.3} \
+         against the unrelated decoy — the bound {MAX_PROMPT_CER} is too loose to be meaningful"
     );
 }

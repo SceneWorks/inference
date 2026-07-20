@@ -343,6 +343,7 @@ name = "candle-audio-moss-tts-realtime"
 version = "0.0.0"
 dependencies = [
  "candle-audio",
+ "candle-audio-whisper",
  "candle-nn",
  "core-llm",
  "sceneworks-gen-core-testkit",
