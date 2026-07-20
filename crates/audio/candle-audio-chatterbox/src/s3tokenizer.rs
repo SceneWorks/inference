@@ -41,6 +41,13 @@
 //!   no-ops and are omitted.
 //! - **FSQ**: `project_down` (1280→8), `tanh`, `· 0.9990000128746033`, round-half-to-even, `+1`
 //!   (→ levels `{0,1,2}`), then the base-3 code `Σ level_i · 3^i` (`i = 0..8`) → `[0, 6560]`.
+//! - **Long audio (>30 s)**: the encoder's context is 30 s (3000 mel frames at 100 Hz). Clips whose
+//!   mel exceeds that are tokenized with the upstream sliding window (`S3TokenizerV2.quantize` →
+//!   `_quantize_mixed_batch`): 30 s windows hopped by 26 s (a 4 s overlap), each window tokenized
+//!   independently, then stitched by `merge_tokenized_segments` — which keeps each window's middle
+//!   and drops half the overlap (`(4 / 2) · 25 = 50` tokens) from each interior boundary, so the
+//!   4 s shared region is counted exactly once (no duplication, no gap). The ≤30 s path is the
+//!   single-pass encode above, byte-for-byte unchanged.
 //!
 //! [`rope`]: candle_nn::rotary_emb::rope
 
@@ -54,7 +61,7 @@ use candle_nn::{
     Linear, Module, VarBuilder,
 };
 
-use crate::config::{S3TokenizerConfig, S3_SR};
+use crate::config::{S3TokenizerConfig, S3_HOP, S3_SR, S3_TOKEN_RATE};
 use crate::s3gen::S3GEN_WEIGHTS_FILE;
 
 // ---------------------------------------------------------------------------------------------
@@ -114,6 +121,72 @@ fn fsq_levels_from_code(cfg: &S3TokenizerConfig, mut code: i64) -> Vec<i64> {
             d
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------------------------------
+// Long-audio sliding-window segmentation + merge (upstream `S3TokenizerV2._quantize_mixed_batch`
+// + `merge_tokenized_segments`). Pure frame/token math — no candle, fully unit-testable.
+//
+// The encoder was trained on ≤30 s of audio, so clips whose mel exceeds MAX_MEL_FRAMES are
+// tokenized in overlapping 30 s windows and stitched. All parameters are the reference's:
+// `sample_rate = 16000`, `hop_length = 160`, `window_size = 30`, `overlap = 4`.
+// ---------------------------------------------------------------------------------------------
+
+/// Long-audio window span in seconds (upstream `window_size`).
+const WINDOW_SECS: usize = 30;
+/// Adjacent-window overlap in seconds (upstream `overlap`).
+const OVERLAP_SECS: usize = 4;
+/// Mel frames per encoder window: `30 s · 16000 / 160 = 3000`. This is also the >30 s dispatch
+/// threshold — the reference tokenizes single-pass when `mel_len <= max_frames` and windows when
+/// `mel_len > max_frames` (`max_frames = 3000`).
+const MAX_MEL_FRAMES: usize = WINDOW_SECS * S3_SR as usize / S3_HOP; // 3000
+/// Mel frames a window advances between hops: `frames_per_window − frames_per_overlap`
+/// (`3000 − 400 = 2600`), a 4 s overlap between neighbours.
+const FRAMES_PER_STRIDE: usize = MAX_MEL_FRAMES - (OVERLAP_SECS * S3_SR as usize / S3_HOP); // 2600
+
+/// The upstream sliding-window plan over a mel of `t_mel` frames: `(start, seg_len)` per window,
+/// exactly the reference loop (`start = 0; while start < t_mel { end = min(start+3000, t_mel);
+/// … ; start += 2600 }`). The final window is the short remainder (the reference right-pads it to
+/// `frames_per_window` and trims the codes back to its true length; since the native encoder masks
+/// padding rather than materializing it, encoding the raw remainder slice yields the same tokens).
+fn window_plan(t_mel: usize) -> Vec<(usize, usize)> {
+    let mut plan = Vec::new();
+    let mut start = 0;
+    while start < t_mel {
+        let end = (start + MAX_MEL_FRAMES).min(t_mel);
+        plan.push((start, end - start));
+        start += FRAMES_PER_STRIDE;
+    }
+    plan
+}
+
+/// Stitch per-window token streams into one continuous stream, dropping the duplicated overlap —
+/// the reference `merge_tokenized_segments(tokenized_segments, overlap, token_rate)`. Each interior
+/// window shares `overlap_secs` s with each neighbour; the merge keeps the middle and drops
+/// `(overlap_secs / 2) · token_rate` tokens (half the overlap) from each interior boundary, so the
+/// shared region is counted exactly once. The first window keeps its head, the last keeps its tail.
+fn merge_tokenized_segments(
+    segments: &[Vec<i64>],
+    overlap_secs: usize,
+    token_rate: usize,
+) -> Vec<i64> {
+    let overlap_tokens = (overlap_secs / 2) * token_rate;
+    let n = segments.len();
+    let mut merged = Vec::new();
+    for (i, tokens) in segments.iter().enumerate() {
+        // `l = 0 if i == 0 else overlap_tokens`; `r = -overlap_tokens if i != last else len`.
+        let l = if i == 0 { 0 } else { overlap_tokens };
+        let r = if i + 1 == n {
+            tokens.len()
+        } else {
+            tokens.len().saturating_sub(overlap_tokens)
+        };
+        // Clamp `l` up to `r` so a window shorter than the overlap contributes nothing (matching
+        // Python's empty slice when the start index passes the stop), never a panic.
+        let l = l.min(r);
+        merged.extend_from_slice(&tokens[l..r]);
+    }
+    merged
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -226,11 +299,42 @@ impl S3Tokenizer {
     /// Encode a reference waveform (resampled to 16 kHz if needed) into 25 Hz speech token ids in
     /// `[0, 6560]`. This is the public inference entry the T3 conditioning path and (later) S3Gen
     /// call.
+    ///
+    /// Audio whose mel fits the encoder's 30 s context (`MAX_MEL_FRAMES`) is tokenized single-pass
+    /// (the common Chatterbox case: a ≤6 s T3 prompt / ≤10 s S3Gen mel ref). Longer clips are
+    /// tokenized with the upstream sliding window (`encode_long_audio`) — the ≤30 s branch is
+    /// byte-for-byte the original single-pass encode.
     pub fn encode(&self, samples: &[f32], sample_rate: u32) -> Result<Vec<i64>> {
         let wav = resample_to_16k(samples, sample_rate);
         let mel = self.log_mel_spectrogram(&wav)?; // [1, n_mels, T_mel]
+        let t_mel = mel.dim(2)?;
+        if t_mel > MAX_MEL_FRAMES {
+            return self.encode_long_audio(&mel, t_mel);
+        }
         let hidden = self.encoder.forward(&mel)?; // [1, T_tok, n_state]
         self.fsq_encode(&hidden)
+    }
+
+    /// The upstream long-audio (>30 s) path: tokenize each overlapping [`window_plan`] window
+    /// independently through the same encoder + FSQ head, then stitch the per-window streams with
+    /// [`merge_tokenized_segments`] into one continuous 25 Hz stream. Faithful to
+    /// `S3TokenizerV2._quantize_mixed_batch`: each window restarts the encoder's positions (the
+    /// reference batches the segments, so each carries its own position 0), and the final short
+    /// remainder is encoded directly rather than zero-padded-then-trimmed (the native encoder masks
+    /// padding, so the two are equivalent — see [`window_plan`]).
+    fn encode_long_audio(&self, mel: &Tensor, t_mel: usize) -> Result<Vec<i64>> {
+        let mut segments: Vec<Vec<i64>> = Vec::new();
+        for (start, seg_len) in window_plan(t_mel) {
+            // `[1, n_mels, seg_len]`; `contiguous` so the conv stem sees a packed window.
+            let window = mel.narrow(2, start, seg_len)?.contiguous()?;
+            let hidden = self.encoder.forward(&window)?; // [1, T_tok, n_state]
+            segments.push(self.fsq_encode(&hidden)?);
+        }
+        Ok(merge_tokenized_segments(
+            &segments,
+            OVERLAP_SECS,
+            S3_TOKEN_RATE as usize,
+        ))
     }
 
     /// `log_mel_spectrogram` → a `[1, n_mels, T_mel]` tensor. Faithful to Chatterbox's
@@ -664,5 +768,128 @@ mod tests {
             codes.iter().all(|&t| (0..6561).contains(&t)),
             "every token in [0, 6560]"
         );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Long-audio (>30 s) sliding-window segmentation + merge (upstream parity, pure math).
+    // ---------------------------------------------------------------------------------------
+
+    /// The two-stride-2 conv stem downsample of `l` mel frames → tokens (`floor((l−1)/2)+1` twice),
+    /// used to predict per-window token counts without weights.
+    fn downsample_len(l: usize) -> usize {
+        let c1 = (l - 1) / 2 + 1;
+        (c1 - 1) / 2 + 1
+    }
+
+    #[test]
+    fn window_constants_match_the_reference() {
+        // 30 s · 16000 / 160 = 3000 mel frames; 4 s overlap = 400 frames; stride = 2600.
+        assert_eq!(MAX_MEL_FRAMES, 3000);
+        assert_eq!(FRAMES_PER_STRIDE, 2600);
+        assert_eq!(WINDOW_SECS, 30);
+        assert_eq!(OVERLAP_SECS, 4);
+        // A full 3000-frame window is exactly 750 tokens (25 Hz over 30 s), and the merge drops
+        // `(4/2)·25 = 50` tokens (2 s) from each interior boundary.
+        assert_eq!(downsample_len(MAX_MEL_FRAMES), 750);
+        assert_eq!((OVERLAP_SECS / 2) * S3_TOKEN_RATE as usize, 50);
+    }
+
+    #[test]
+    fn window_plan_matches_upstream_sliding_window() {
+        // Just over one window → two windows: a full 3000, then the 601-frame remainder.
+        assert_eq!(window_plan(3601), vec![(0, 3000), (2600, 1001)]);
+        // 36 s (3600 frames) → 3000 + 1000, a clean two-window split.
+        assert_eq!(window_plan(3600), vec![(0, 3000), (2600, 1000)]);
+        // 80 s (8000 frames) → starts 0, 2600, 5200, 7800; last is the short remainder.
+        assert_eq!(
+            window_plan(8000),
+            vec![(0, 3000), (2600, 3000), (5200, 2800), (7800, 200)]
+        );
+        // Every window starts on a stride multiple, no window exceeds the encoder context, and the
+        // union of windows covers the whole mel (the last window ends exactly at `t_mel`).
+        for &t_mel in &[3001usize, 4500, 6000, 12345] {
+            let plan = window_plan(t_mel);
+            assert!(plan.len() >= 2, "a >30 s clip must split into ≥2 windows");
+            for (k, &(start, seg_len)) in plan.iter().enumerate() {
+                assert_eq!(start, k * FRAMES_PER_STRIDE, "window {k} start");
+                assert!((1..=MAX_MEL_FRAMES).contains(&seg_len), "window {k} span");
+            }
+            let (last_start, last_len) = *plan.last().unwrap();
+            assert_eq!(last_start + last_len, t_mel, "windows must cover to t_mel");
+        }
+    }
+
+    #[test]
+    fn merge_drops_half_the_overlap_at_each_interior_boundary() {
+        // Three 750-token windows whose values encode (window, index) so we can trace provenance.
+        let seg = |w: i64| (0..750).map(|i| w * 1000 + i).collect::<Vec<i64>>();
+        let segments = vec![seg(0), seg(1), seg(2)];
+        let merged = merge_tokenized_segments(&segments, OVERLAP_SECS, S3_TOKEN_RATE as usize);
+
+        // First keeps [0,700), middles keep [50,700), last keeps [50,750): 700 + 650 + 700 = 2050.
+        assert_eq!(merged.len(), 700 + 650 + 700);
+        // The seam is continuous with no duplication or gap: window 0's last kept token is its
+        // index 699, and window 1's first kept token is its index 50 — adjacent in the stream.
+        assert_eq!(merged[699], seg(0)[699]);
+        assert_eq!(merged[700], seg(1)[50]);
+        // window 1's last kept token (index 699) then window 2's first kept token (index 50).
+        assert_eq!(merged[700 + 649], seg(1)[699]);
+        assert_eq!(merged[700 + 650], seg(2)[50]);
+        // No token value appears twice (the overlap was de-duplicated, not double-counted).
+        let mut sorted = merged.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), merged.len(), "overlap tokens were duplicated");
+    }
+
+    #[test]
+    fn merge_single_segment_is_the_identity() {
+        // A lone window (the ≤30 s case never reaches the merge, but the merge must still be a
+        // no-op for one segment: nothing to de-duplicate).
+        let only = (0..123).collect::<Vec<i64>>();
+        let merged = merge_tokenized_segments(
+            std::slice::from_ref(&only),
+            OVERLAP_SECS,
+            S3_TOKEN_RATE as usize,
+        );
+        assert_eq!(merged, only);
+    }
+
+    #[test]
+    fn merge_handles_a_window_shorter_than_the_overlap() {
+        // A degenerate tiny final window (< overlap_tokens) contributes nothing rather than
+        // panicking — Python's `tokens[50:]` on a 30-element list is empty, and so is ours.
+        let segments = vec![
+            (0..750).collect::<Vec<i64>>(),
+            (0..30).collect::<Vec<i64>>(),
+        ];
+        let merged = merge_tokenized_segments(&segments, OVERLAP_SECS, S3_TOKEN_RATE as usize);
+        assert_eq!(
+            merged.len(),
+            700,
+            "first window's head only; tiny tail dropped"
+        );
+    }
+
+    #[test]
+    fn windowed_token_count_tracks_the_25hz_rate() {
+        // For a clean two-window clip the stitched length equals the single-pass token count
+        // (duration · 25 Hz) exactly — no gap, no duplication.
+        for &t_mel in &[3600usize, 4000, 4500, 5000, 5600] {
+            let plan = window_plan(t_mel);
+            let segments: Vec<Vec<i64>> = plan
+                .iter()
+                .map(|&(_, seg_len)| vec![0i64; downsample_len(seg_len)])
+                .collect();
+            let merged = merge_tokenized_segments(&segments, OVERLAP_SECS, S3_TOKEN_RATE as usize);
+            // Duration (s) = t_mel / 100 (100 Hz mel); expected tokens = round(dur · 25) = t_mel/4.
+            let dur = t_mel as f32 / 100.0;
+            let expected = (dur * S3_TOKEN_RATE as f32).round() as i64;
+            assert!(
+                (merged.len() as i64 - expected).abs() <= 1,
+                "t_mel {t_mel}: stitched {} tokens not ≈ {expected} (dur {dur:.2}s · 25 Hz)",
+                merged.len()
+            );
+        }
     }
 }

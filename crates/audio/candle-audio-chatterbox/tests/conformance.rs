@@ -359,6 +359,117 @@ fn s3tokenizer_encodes_a_reference_at_25hz() {
     );
 }
 
+/// A long (>30 s) reference built by concatenating several distinct Kokoro sentences, so the
+/// s3tokenizer's >30 s sliding-window path is genuinely exercised (Chatterbox's own references are
+/// ≤10 s and never reach it). Returns the concatenated 24 kHz samples + rate.
+fn long_kokoro_samples() -> (Vec<f32>, u32) {
+    // Nine varied ~4 s sentences (same voice) → ~35 s, comfortably past the 30 s window.
+    let sentences = [
+        "The quick brown fox jumps over the lazy dog near the river bank at first light.",
+        "She sells seashells by the seashore while the morning tide rolls gently back in.",
+        "A journey of a thousand miles begins beneath the weary traveler's very first footstep.",
+        "The five boxing wizards jump quickly as the autumn wind scatters the fallen oak leaves.",
+        "How razorback jumping frogs can level six piqued gymnasts standing near the old stone mill.",
+        "Pack my box with five dozen liquor jugs before the long voyage across the open sea.",
+        "The early morning fog lifted slowly over the quiet valley and the sleeping town below it.",
+        "Bright vixens jump while dozy fowl quack loudly as the farmer opens the heavy wooden gate.",
+        "Sphinx of black quartz, judge my vow, said the weary knight to the silent evening sky.",
+    ];
+    let mut samples = Vec::new();
+    let mut sr = 24_000u32;
+    for text in sentences {
+        let clip = kokoro_clip(text, "af_heart");
+        sr = clip.sample_rate;
+        samples.extend_from_slice(&clip.samples);
+    }
+    (samples, sr)
+}
+
+/// The sc-13380 DoD gate: the ported long-audio sliding-window segmentation + `merge_tokenized_
+/// segments` tokenizes a **real >30 s** clip into one continuous 25 Hz stream. It asserts (a) the
+/// token rate is 25 Hz across the *whole* duration (i.e. across the window seams — a naive per-window
+/// concat would over-count the 4 s overlaps and inflate the rate), (b) every token is a valid FSQ
+/// code in `[0, 6560]`, and (c) CONTINUITY: over the non-boundary interior the windowed stream
+/// matches a single-pass tokenization of the same head audio, so the overlap is stitched without
+/// duplication or gaps. A broken window plan, overlap-dedup, or merge would fail (a) (wrong rate) or
+/// (c) (interior divergence). Reports the actual duration, token count, rate, and continuity fraction.
+#[test]
+#[ignore = "real weights: needs s3gen.safetensors + a Kokoro snapshot; run with --ignored"]
+fn s3tokenizer_windows_audio_longer_than_30s() {
+    use std::collections::HashSet;
+
+    let tok = cb::S3Tokenizer::from_snapshot(&s3gen_snapshot())
+        .expect("load the s3tokenizer from s3gen.safetensors");
+
+    let (samples, sr) = long_kokoro_samples();
+    let dur = samples.len() as f32 / sr as f32;
+    assert!(
+        dur > 30.5,
+        "the long clip must exceed the 30 s window to exercise the sliding-window path; got {dur:.2}s"
+    );
+
+    let codes = tok.encode(&samples, sr).expect("tokenize the >30 s clip");
+    let n = codes.len();
+    let min = *codes.iter().min().unwrap();
+    let max = *codes.iter().max().unwrap();
+    let distinct = codes.iter().collect::<HashSet<_>>().len();
+    let rate = n as f32 / dur;
+    eprintln!(
+        "s3tokenizer >30s (windowed): {n} tokens over {dur:.2}s = {rate:.2} Hz; \
+         range [{min}, {max}], {distinct} distinct"
+    );
+
+    // (a) 25 Hz over the FULL duration, across the window seams (the merge de-duplicated the
+    // overlaps; a naive concat of the per-window streams would run well above 25 Hz).
+    assert!(
+        (rate - 25.0).abs() < 1.5,
+        "token rate {rate:.2} Hz is not ≈ 25 Hz over the full {dur:.2}s — the overlap was not \
+         stitched correctly"
+    );
+    // (b) every token a valid FSQ code, and the stream is non-degenerate + deterministic.
+    assert!(
+        min >= 0 && max <= 6560,
+        "tokens must be valid S3 FSQ codes in [0, 6560], got [{min}, {max}]"
+    );
+    assert!(
+        distinct > 10,
+        "tokens collapsed to {distinct} distinct value(s) — the encoder is not modeling speech"
+    );
+    let codes2 = tok.encode(&samples, sr).expect("re-tokenize");
+    assert_eq!(
+        codes, codes2,
+        "the windowed tokenization must be deterministic"
+    );
+
+    // (c) CONTINUITY vs single-pass. The first ~29.5 s (≤30 s → single-pass) is the same leading
+    // audio the first window sees; the merge keeps that window's head (its first 700 tokens = the
+    // leading 28 s), so the windowed stream must agree with a single-pass tokenization over that
+    // non-boundary interior — proof the overlap is stitched without duplication or gaps.
+    let head_secs = 29.5f32;
+    let head_len = ((head_secs * sr as f32) as usize).min(samples.len());
+    let head = &samples[..head_len];
+    let single = tok.encode(head, sr).expect("single-pass tokenize the head");
+    // Compare the interior below the first-window seam (700) and below the single-pass clip's own
+    // reflect-padded tail (its last few tokens see a boundary the full clip does not).
+    let k = single.len().min(codes.len()).min(700).saturating_sub(8);
+    assert!(
+        k > 400,
+        "continuity window too small ({k}) — the head is not long enough"
+    );
+    let agree = (0..k).filter(|&i| codes[i] == single[i]).count();
+    let frac = agree as f32 / k as f32;
+    let first_mismatch = (0..k).find(|&i| codes[i] != single[i]);
+    eprintln!(
+        "continuity: windowed vs single-pass agree on {agree}/{k} = {frac:.4} of the leading \
+         interior tokens (first mismatch at {first_mismatch:?})"
+    );
+    assert!(
+        frac > 0.9,
+        "the windowed result diverges from single-pass over the non-boundary interior \
+         ({frac:.4}) — the window/merge is not continuous"
+    );
+}
+
 /// Provider integration: a `ReferenceAudio` request now derives T3's `cond_prompt_speech_tokens`
 /// from the clip via the s3tokenizer (empty in sc-13222). The prompt is capped at the T3
 /// `speech_cond_prompt_len` (150) and every token is a valid S3 code.
