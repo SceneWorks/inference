@@ -30,10 +30,10 @@ fn main() -> Result<()> {
     let snapshot = arg(&args, "--snapshot")
         .or_else(|| std::env::var("LTX_SNAPSHOT").ok())
         .ok_or("pass --snapshot <dir> (or set LTX_SNAPSHOT)")?;
-    // The Gemma encoder is a separate snapshot; the provider reads LTX_GEMMA_DIR.
-    if let Some(g) = arg(&args, "--gemma") {
-        std::env::set_var("LTX_GEMMA_DIR", g);
-    }
+    // sc-13749: the Gemma encoder is a separate snapshot threaded through `LoadSpec::text_encoder` — the
+    // provider no longer reads any env var. `--gemma` (or the `LTX_GEMMA_DIR` convenience env) supplies
+    // the path; when absent the provider falls back to the snapshot's co-located `text_encoder/`.
+    let gemma = arg(&args, "--gemma").or_else(|| std::env::var("LTX_GEMMA_DIR").ok());
     let prompt = arg(&args, "--prompt").unwrap_or_else(|| {
         "a fluffy cat walking across a sunny garden, gentle camera pan, cinematic, highly detailed"
             .into()
@@ -56,7 +56,10 @@ fn main() -> Result<()> {
          [smoke] prompt={prompt:?}"
     );
 
-    let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(&snapshot)));
+    let mut spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(&snapshot)));
+    if let Some(g) = &gemma {
+        spec.text_encoder = Some(WeightsSource::Dir(PathBuf::from(g)));
+    }
     let gen = candle_gen_ltx::provider_registry()?.load("ltx_2_3_distilled", &spec)?;
     println!(
         "[smoke] resolved engine id={} backend={} modality={:?}",

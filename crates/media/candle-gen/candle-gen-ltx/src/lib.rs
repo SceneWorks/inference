@@ -23,8 +23,10 @@
 //!
 //! **Weights:** `spec.weights` points at an LTX-2.3 snapshot dir (the
 //! `ltx-2.3-22b-distilled.safetensors` single-file checkpoint bundling DiT + VAE + projection +
-//! connector). The Gemma-3-12B encoder + its `tokenizer.json` live in a separate snapshot, located via
-//! the `LTX_GEMMA_DIR` env var (falling back to `<root>/text_encoder`).
+//! connector). The Gemma-3-12B encoder + its `tokenizer.json` live in a separate snapshot, provisioned
+//! by the caller through the **`LoadSpec::text_encoder`** slot (or co-located at `<root>/text_encoder`).
+//! As of sc-13749 there is no environment side-channel or HF-cache scan — an absent encoder is a
+//! load-time, actionable error naming the slot (epic 13657; the candle sibling of sc-13664).
 
 pub mod audio_vae;
 pub mod config;
@@ -98,7 +100,7 @@ struct Pipeline {
     vocoder_cfg: VocoderConfig,
     root: PathBuf,
     device: Device,
-    /// Gemma-encoder override from `LoadSpec::text_encoder` (sc-8827); see [`Pipeline::gemma_dir`].
+    /// Gemma-encoder path from `LoadSpec::text_encoder` (sc-8827); see [`Pipeline::gemma_dir`].
     gemma_override: Option<PathBuf>,
 }
 
@@ -127,8 +129,8 @@ impl Pipeline {
         ltx_checkpoint_in(&self.root)
     }
 
-    /// The Gemma-3-12B encoder snapshot dir. A `LoadSpec::text_encoder` override (sc-8827) wins; then
-    /// `$LTX_GEMMA_DIR`; then `<root>/text_encoder`.
+    /// The Gemma-3-12B encoder snapshot dir. A `LoadSpec::text_encoder` path (sc-8827) wins; else the
+    /// co-located `<root>/text_encoder` (sc-13749 — no environment / HF-cache scan any more).
     fn gemma_dir(&self) -> CResult<PathBuf> {
         gemma_dir_for(&self.root, self.gemma_override.as_deref())
     }
@@ -347,8 +349,8 @@ pub struct LtxGenerator {
     descriptor: ModelDescriptor,
     root: PathBuf,
     device: Device,
-    /// Optional Gemma-encoder snapshot dir from `LoadSpec::text_encoder` (sc-8827); overrides the
-    /// `$LTX_GEMMA_DIR` env var / `<root>/text_encoder` fallback in [`Pipeline::gemma_dir`].
+    /// Optional Gemma-encoder snapshot dir from `LoadSpec::text_encoder` (sc-8827); wins over the
+    /// co-located `<root>/text_encoder` fallback in [`Pipeline::gemma_dir`] (sc-13749 — no env / cache).
     gemma_override: Option<PathBuf>,
     components: Mutex<Option<Components>>,
 }
@@ -539,13 +541,16 @@ fn ltx_checkpoint_in(root: &Path) -> CResult<PathBuf> {
         .expect("cands non-empty"))
 }
 
-/// The Gemma-3-12B encoder snapshot dir for a `root` + optional `LoadSpec::text_encoder` override
-/// (sc-8827): the override wins; then `$LTX_GEMMA_DIR`; then `<root>/text_encoder`.
+/// The Gemma-3-12B encoder snapshot dir for a `root` + the `LoadSpec::text_encoder` path (sc-8827):
+/// the caller-supplied path wins; else the co-located `<root>/text_encoder`. Both are **passed-in**
+/// paths (the override rides the spec; `root` is `LoadSpec::weights`) — as of sc-13749 there is no
+/// environment side-channel and no HF-cache scan (epic 13657, the candle sibling of sc-13664): an
+/// absent encoder is a load-time, actionable error naming the slot.
 ///
 /// Shared by [`Pipeline::gemma_dir`] and [`component_footprint`] so the gate sizes the encoder the load
 /// will actually read. Note this is the DENSE path's precedence; the packed tier resolves its Gemma via
-/// [`tier::TierPaths::detect`] (override, else the tier's sibling `gemma/`) and does not consult
-/// `$LTX_GEMMA_DIR` — [`component_footprint`] mirrors that split rather than assuming one rule.
+/// [`tier::TierPaths::detect`] (the spec path, else the tier's sibling `gemma/`) — also passed-in paths
+/// only. [`component_footprint`] mirrors that split rather than assuming one rule.
 fn gemma_dir_for(root: &Path, gemma_override: Option<&Path>) -> CResult<PathBuf> {
     if let Some(p) = gemma_override {
         if !p.is_dir() {
@@ -556,18 +561,16 @@ fn gemma_dir_for(root: &Path, gemma_override: Option<&Path>) -> CResult<PathBuf>
         }
         return Ok(p.to_path_buf());
     }
-    if let Ok(p) = std::env::var("LTX_GEMMA_DIR") {
-        return Ok(PathBuf::from(p));
+    let colocated = root.join("text_encoder");
+    if colocated.is_dir() {
+        return Ok(colocated);
     }
-    let fallback = root.join("text_encoder");
-    if fallback.is_dir() {
-        return Ok(fallback);
-    }
-    Err(CandleError::Msg(
-        "ltx: set LTX_GEMMA_DIR to a google/gemma-3-12b-it snapshot (or place it at \
-         <root>/text_encoder)"
-            .into(),
-    ))
+    Err(CandleError::Msg(format!(
+        "ltx requires the Gemma-3-12B text encoder — set LoadSpec::text_encoder to a \
+         google/gemma-3-12b-it snapshot dir (or co-locate it at <root>/text_encoder, i.e. {}). It is \
+         no longer auto-discovered from an environment variable or the HF cache.",
+        colocated.display()
+    )))
 }
 
 /// The snapshot root a `spec` loads from — a `Dir` as-is, a `File`'s parent (LTX is the one video
@@ -603,16 +606,15 @@ fn spec_root(spec: &LoadSpec) -> PathBuf {
 /// A component that cannot be resolved contributes `0` rather than erroring: the footprint is a pre-load
 /// ADMISSION signal, and reporting no signal (⇒ the caller admits) is safer than refusing a job over an
 /// unreadable path. `load_components` reports the real error moments later. In particular a dense
-/// snapshot with no resolvable checkpoint, or a Gemma dir that is absent (the `$LTX_GEMMA_DIR` env is
-/// read here, but a bare unset env with no `<root>/text_encoder` is not an error at gate time), simply
-/// reads 0.
+/// snapshot with no resolvable checkpoint, or an absent Gemma dir (no `LoadSpec::text_encoder` and no
+/// `<root>/text_encoder` — not an error at gate time), simply reads 0.
 pub(crate) fn component_footprint(spec: &LoadSpec) -> gen_core::Result<PerComponentBytes> {
     let root = spec_root(spec);
     let gemma_override = spec.text_encoder.as_ref().map(|src| match src {
         WeightsSource::Dir(p) | WeightsSource::File(p) => p.clone(),
     });
-    // The tier path resolves Gemma through `TierPaths` (override, else the sibling `gemma/`); the dense
-    // path through `gemma_dir_for` (override, env, `<root>/text_encoder`). Follow whichever applies.
+    // The tier path resolves Gemma through `TierPaths` (spec path, else the sibling `gemma/`); the dense
+    // path through `gemma_dir_for` (spec path, else `<root>/text_encoder`). Follow whichever applies.
     if let Some(paths) = tier::TierPaths::detect(&root, gemma_override.as_deref()) {
         let tier_file = |name: &str| gen_core::safetensors_path_bytes(paths.tier_dir.join(name));
         return Ok(PerComponentBytes {
@@ -634,8 +636,9 @@ pub(crate) fn component_footprint(spec: &LoadSpec) -> gen_core::Result<PerCompon
 }
 
 /// Construct a lazy candle LTX-2.3 generator. `spec.weights` is an LTX-2.3 snapshot dir (the
-/// `ltx-2.3-22b-distilled.safetensors` checkpoint); the Gemma encoder is located via `LTX_GEMMA_DIR`.
-/// Adapters / quantization / conditioning are rejected (not wired).
+/// `ltx-2.3-22b-distilled.safetensors` checkpoint); the Gemma encoder is provisioned by the caller via
+/// the `LoadSpec::text_encoder` slot (or co-located at `<root>/text_encoder`) — no env / HF-cache scan
+/// (sc-13749). Adapters / quantization / conditioning are rejected (not wired).
 pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     let root = match &spec.weights {
         WeightsSource::Dir(p) => p.clone(),
@@ -644,6 +647,10 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
             .map(|d| d.to_path_buf())
             .unwrap_or_else(|| p.clone()),
     };
+    // Named-component contract (sc-13658/sc-13749): candle LTX-2.3 recognizes NO `LoadSpec::components`
+    // keys — its Gemma TE rides the typed `text_encoder` slot, and it has no uncensored/amoral enhancer
+    // variant (the mlx-only `uncensored_enhancer`). Reject any component key up front as `Unsupported`.
+    gen_core::reject_unknown_components(spec, &[], MODEL_ID)?;
     if !spec.adapters.is_empty() {
         return Err(gen_core::Error::Unsupported(
             "candle ltx does not support LoRA/LoKr yet".into(),
@@ -659,9 +666,8 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
             "candle ltx does not support image / I2V conditioning yet (txt2video only)".into(),
         ));
     }
-    // sc-8827: the Gemma encoder location may ride the spec (`LoadSpec::text_encoder`) so the caller
-    // does not have to mutate the process-global `$LTX_GEMMA_DIR`; `None` keeps the env / `<root>`
-    // fallback in `gemma_dir`.
+    // sc-8827/sc-13749: the Gemma encoder location rides the spec (`LoadSpec::text_encoder`); `None`
+    // falls back to the co-located `<root>/text_encoder` in `gemma_dir` (no env / HF-cache scan).
     let gemma_override = spec.text_encoder.as_ref().map(|src| match src {
         WeightsSource::Dir(p) | WeightsSource::File(p) => p.clone(),
     });
@@ -724,12 +730,11 @@ mod tests {
     }
 
     #[test]
-    fn gemma_dir_prefers_spec_text_encoder_over_env() {
-        // sc-8827: a `LoadSpec::text_encoder` override drives the Gemma-encoder location, so the
-        // worker does not have to mutate the process-global `$LTX_GEMMA_DIR`. An existing dir is
-        // returned as-is (ahead of any env value); a nonexistent override errors with the spec-side
-        // message. Uses a unique env value that is NOT a real dir so a fallthrough would differ.
-        let real = std::env::temp_dir().join("ltx_gemma_spec_ok");
+    fn gemma_dir_uses_spec_text_encoder_and_ignores_env() {
+        // sc-8827/sc-13749: `LoadSpec::text_encoder` drives the Gemma-encoder location. An existing dir
+        // is returned as-is; a nonexistent override errors with the spec-side message. The
+        // `$LTX_GEMMA_DIR` env side-channel was DELETED — this also pins that it is no longer consulted.
+        let real = std::env::temp_dir().join(format!("ltx_gemma_spec_ok_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&real);
         let pipe = Pipeline::load(
             Path::new("/nonexistent/root"),
@@ -737,8 +742,8 @@ mod tests {
             Some(real.clone()),
         );
         assert_eq!(pipe.gemma_dir().unwrap(), real);
-        std::fs::remove_dir_all(&real).ok();
 
+        // A nonexistent override errors with the spec-side (not env) message.
         let bad = Pipeline::load(
             Path::new("/nonexistent/root"),
             &Device::Cpu,
@@ -746,6 +751,65 @@ mod tests {
         );
         let err = bad.gemma_dir().unwrap_err().to_string();
         assert!(err.contains("LoadSpec text_encoder"), "got: {err}");
+
+        // Negative env guard (sc-13749): even with `$LTX_GEMMA_DIR` pointing at a REAL dir, a spec with
+        // no text_encoder and no co-located `<root>/text_encoder` must ERROR — the env is never read.
+        // (Tests run single-threaded here, `RUST_TEST_THREADS=1`, so mutating the process env is safe.)
+        std::env::set_var("LTX_GEMMA_DIR", &real);
+        let no_te = Pipeline::load(Path::new("/nonexistent/root"), &Device::Cpu, None);
+        let err = no_te.gemma_dir().unwrap_err().to_string();
+        assert!(
+            err.contains("LoadSpec::text_encoder"),
+            "env must be ignored, got: {err}"
+        );
+        assert!(
+            !err.contains("LTX_GEMMA_DIR"),
+            "error must not name the removed env var: {err}"
+        );
+        std::env::remove_var("LTX_GEMMA_DIR");
+        std::fs::remove_dir_all(&real).ok();
+    }
+
+    /// sc-13749 load gate: with no `LoadSpec::text_encoder` AND no co-located `<root>/text_encoder`, the
+    /// Gemma encoder is absent → a load-time actionable error **naming the slot** (not a silent env /
+    /// HF-cache fallback). A co-located `<root>/text_encoder` is still honored: it is a passed-in path
+    /// (the weights root is `LoadSpec::weights`), the candle sibling of the tier's `gemma/` convention.
+    #[test]
+    fn gemma_dir_requires_slot_or_colocated() {
+        // Absent everywhere → actionable error naming the slot, never the removed env var.
+        let none = Pipeline::load(Path::new("/nonexistent/root"), &Device::Cpu, None);
+        let err = none.gemma_dir().unwrap_err().to_string();
+        assert!(err.contains("LoadSpec::text_encoder"), "got: {err}");
+        assert!(
+            !err.contains("LTX_GEMMA_DIR"),
+            "must not name the removed env var: {err}"
+        );
+
+        // A co-located `<root>/text_encoder` (a passed-in path via the weights root) is honored.
+        let root = std::env::temp_dir().join(format!("ltx_gemma_colocated_{}", std::process::id()));
+        let te = root.join("text_encoder");
+        std::fs::create_dir_all(&te).unwrap();
+        let pipe = Pipeline::load(&root, &Device::Cpu, None);
+        assert_eq!(pipe.gemma_dir().unwrap(), te);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// sc-13749 load gate: candle LTX-2.3 recognizes NO `LoadSpec::components` keys — its Gemma TE rides
+    /// the typed `text_encoder` slot and there is no uncensored/amoral enhancer variant (that is
+    /// mlx-only). Any component key is rejected at load with a typed `Unsupported` error; a
+    /// no-component spec still loads (lazy — weight resolution is deferred to the first generate).
+    #[test]
+    fn load_rejects_unknown_component() {
+        let bogus = LoadSpec::new(WeightsSource::Dir("/nonexistent".into())).with_component(
+            "uncensored_enhancer",
+            WeightsSource::Dir("/nope/amoral".into()),
+        );
+        assert!(matches!(
+            crate::load(&bogus).err().expect("err"),
+            gen_core::Error::Unsupported(_)
+        ));
+        let ok = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        assert!(crate::load(&ok).is_ok());
     }
 
     #[test]
@@ -1065,17 +1129,16 @@ mod tests {
     /// ADMISSION signal, so "no signal" (⇒ the caller admits) beats refusing a job over an unreadable
     /// path. `load_components` surfaces the real error moments later.
     ///
-    /// Asserts only the weights-root slots. `text_encoder` is deliberately NOT asserted: `gemma_dir_for`
-    /// consults `$LTX_GEMMA_DIR` when there is no override, so on a machine that has it set (a real LTX
-    /// box) this would legitimately read non-zero. Pinning it would make the test pass or fail on the
-    /// runner's environment rather than on the code.
+    /// sc-13749: all three slots are pinned to 0. `text_encoder` can now be asserted deterministically —
+    /// `gemma_dir_for` no longer consults any environment side-channel (deleted), so with no override and
+    /// no `<root>/text_encoder` it resolves to nothing regardless of the runner's environment.
     #[test]
     fn component_footprint_reports_no_signal_rather_than_failing() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent-ltx-snapshot".into()));
         let fp = component_footprint(&spec).expect("a missing snapshot is not a footprint error");
         assert_eq!(
-            (fp.dit, fp.vae),
-            (0, 0),
+            (fp.text_encoder, fp.dit, fp.vae),
+            (0, 0, 0),
             "an unreadable snapshot must read as no signal, not an error"
         );
     }
