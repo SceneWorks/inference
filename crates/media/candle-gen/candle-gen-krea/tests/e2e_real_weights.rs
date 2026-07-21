@@ -19,7 +19,7 @@ use candle_gen::gen_core::{
     AdapterKind, AdapterSpec, GenerationOutput, GenerationRequest, Image, LoadSpec, WeightsSource,
 };
 use candle_gen_krea::loader::Weights;
-use candle_gen_krea::{merge_adapters, merge_into_weights, Krea2Config};
+use candle_gen_krea::{fold_diff_patch, merge_adapters, merge_into_weights, Krea2Config};
 
 const PROMPT: &str =
     "A medium-shot photograph of a red fox sitting in a snowy forest at golden hour.";
@@ -359,6 +359,103 @@ fn adapter_merges_every_attention_target() {
     assert_eq!(n, cfg.num_layers * 4, "112-target surface (28 blocks × 4)");
 }
 
+/// The community ComfyUI "filter-bypass" diff-patch (a single
+/// `diffusion_model.txtfusion.projector.diff`) — set `KREA_BYPASS_FILE` to its `.safetensors`.
+fn bypass_file() -> Option<PathBuf> {
+    std::env::var("KREA_BYPASS_FILE").ok().map(PathBuf::from)
+}
+
+/// Mean absolute value of a tensor (`E[|t|]`) as an f32 — the projector-delta magnitude probe.
+fn tensor_mean_abs(t: &Tensor) -> f32 {
+    t.abs()
+        .unwrap()
+        .mean_all()
+        .unwrap()
+        .to_scalar::<f32>()
+        .unwrap()
+}
+
+/// `fold_diff_patch` against the **real** Turbo DiT key set (sc-13726): the community filter-bypass —
+/// one `diffusion_model.txtfusion.projector.diff` `[1,12]` — must fold into the dense `text_fusion.
+/// projector` (`W += δ`) that the low-rank/additive surface deliberately excludes. Reads only that
+/// `[1,12]` projector, so it is GPU-free and cheap (no 24 GB resident). This is the exact key path that
+/// produced the user's "no adapter target modules matched": a merged count of 1 is the fix.
+#[test]
+#[ignore = "needs the real Krea 2 Turbo snapshot (KREA_TURBO_DIR) + the bypass file (KREA_BYPASS_FILE)"]
+fn fold_diff_patch_merges_projector_bypass_dense() {
+    let (Some(root), Some(bypass)) = (snapshot(), bypass_file()) else {
+        eprintln!("skipping: set KREA_TURBO_DIR and KREA_BYPASS_FILE");
+        return;
+    };
+    let mut w = Weights::from_dir(&root.join("transformer"), &Device::Cpu, DType::BF16)
+        .expect("mmap transformer/");
+    let before = w
+        .get_f32("text_fusion.projector.weight")
+        .expect("projector present in the real DiT");
+
+    let report = fold_diff_patch(&mut w, &[AdapterSpec::new(bypass, 1.0, AdapterKind::Lora)])
+        .expect("fold the projector diff-patch");
+    let after = w
+        .get_f32("text_fusion.projector.weight")
+        .expect("merged projector");
+
+    let delta = tensor_mean_abs(&(after - &before).unwrap());
+    eprintln!(
+        "[krea bypass dense] merged={} skipped={} projector |Δ|={delta:.5}",
+        report.merged, report.skipped_keys
+    );
+    assert_eq!(
+        report.merged, 1,
+        "the projector diff must fold (was 'no target matched')"
+    );
+    assert_eq!(
+        report.skipped_keys, 0,
+        "the [1,12] delta matches the [1,12] projector"
+    );
+    assert!(
+        delta > 0.0,
+        "the projector weight must change after folding a nonzero delta"
+    );
+}
+
+/// Same fold on the **native-keyed INT8-ConvRot** Turbo checkpoint (`KREA_TURBO_CONVROT` → the single
+/// `krea2_turbo_int8_convrot.safetensors`): proves `get_cpu_merge_base` resolves the diffusers
+/// `text_fusion.projector.weight` to the stored native `txtfusion.projector.weight` before folding, so
+/// the bypass works on the packed community tier too — not only the diffusers-keyed dense snapshot.
+#[test]
+#[ignore = "needs the real ConvRot checkpoint (KREA_TURBO_CONVROT) + the bypass file (KREA_BYPASS_FILE)"]
+fn fold_diff_patch_merges_projector_bypass_convrot() {
+    let (Ok(convrot), Some(bypass)) = (std::env::var("KREA_TURBO_CONVROT"), bypass_file()) else {
+        eprintln!("skipping: set KREA_TURBO_CONVROT and KREA_BYPASS_FILE");
+        return;
+    };
+    let mut w = Weights::from_convrot_file(Path::new(&convrot), &Device::Cpu, DType::BF16)
+        .expect("open the ConvRot checkpoint");
+    let before = w
+        .get_f32("text_fusion.projector.weight")
+        .expect("projector resolves to its native key");
+
+    let report = fold_diff_patch(&mut w, &[AdapterSpec::new(bypass, 1.0, AdapterKind::Lora)])
+        .expect("fold the projector diff-patch on ConvRot");
+    let after = w
+        .get_f32("text_fusion.projector.weight")
+        .expect("merged projector");
+
+    let delta = tensor_mean_abs(&(after - &before).unwrap());
+    eprintln!(
+        "[krea bypass convrot] merged={} skipped={} projector |Δ|={delta:.5}",
+        report.merged, report.skipped_keys
+    );
+    assert_eq!(
+        report.merged, 1,
+        "the projector diff must fold on the native-keyed ConvRot tier"
+    );
+    assert!(
+        delta > 0.0,
+        "the projector weight must change after folding"
+    );
+}
+
 /// Render `req` against `krea_2_turbo` with `adapters` merged, returning the single image.
 fn render_with(root: &Path, width: u32, height: u32, adapters: Vec<AdapterSpec>) -> Image {
     let spec = LoadSpec::new(WeightsSource::Dir(root.to_path_buf())).with_adapters(adapters);
@@ -440,6 +537,58 @@ fn turbo_engine_applies_lora_adapter() {
         "adapted render must be a coherent image (std={std:.1} distinct={distinct} adjΔ={adj:.1})"
     );
     assert!(diff > 0, "a non-zero-scale adapter must change the render");
+}
+
+/// sc-13726 end-to-end on the real GPU: the community "filter-bypass" — a **diff-only** file carrying
+/// one `diffusion_model.txtfusion.projector.diff` — loads through the full `krea_2_turbo` pipeline
+/// (`fold_diff_patch` folds the projector, `install_additive` tolerates the zero low-rank match via
+/// `pre_applied`) and visibly changes the render vs the un-bypassed base, both images coherent. This is
+/// the exact file that produced "no adapter target modules matched"; a coherent, *different* image is
+/// the fix proven end-to-end (not just at the merge).
+#[test]
+#[ignore = "needs the real Turbo snapshot (KREA_TURBO_DIR) + bypass file (KREA_BYPASS_FILE); --features cuda"]
+fn turbo_engine_applies_projector_bypass() {
+    let (Some(root), Some(bypass)) = (snapshot(), bypass_file()) else {
+        eprintln!("skipping: set KREA_TURBO_DIR and KREA_BYPASS_FILE");
+        return;
+    };
+    let base = render_with(&root, 1024, 1024, vec![]);
+    let bypassed = render_with(
+        &root,
+        1024,
+        1024,
+        vec![AdapterSpec::new(bypass, 1.0, AdapterKind::Lora)],
+    );
+
+    assert_eq!(
+        (bypassed.width, bypassed.height),
+        (1024, 1024),
+        "output dims"
+    );
+    let (std, distinct, adj) = image_stats(&bypassed.pixels, bypassed.width);
+    let changed = base
+        .pixels
+        .iter()
+        .zip(&bypassed.pixels)
+        .filter(|(a, b)| a != b)
+        .count();
+    let mad = mean_abs_diff(&base, &bypassed);
+    eprintln!(
+        "[krea bypass render] std={std:.1} distinct={distinct} adjΔ={adj:.1} coherent={} \
+         changed_px={changed}/{} meanΔ={mad:.3}",
+        is_coherent(&bypassed),
+        bypassed.pixels.len()
+    );
+    save(&base, "fox_base_1024");
+    save(&bypassed, "fox_bypass_s1_1024");
+    assert!(
+        is_coherent(&bypassed),
+        "bypassed render must be coherent (std={std:.1} distinct={distinct} adjΔ={adj:.1})"
+    );
+    assert!(
+        changed > 0,
+        "the projector diff-patch must change the render — a diff-only file, folded not silently dropped"
+    );
 }
 
 // ── sc-8776 ai-toolkit LoKr sniff + widened-surface merge ─────────────────────────────────────────

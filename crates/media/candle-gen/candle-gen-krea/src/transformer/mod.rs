@@ -473,8 +473,9 @@ impl crate::adapters::AdditiveDit for Krea2Transformer {
         "expected bare/PEFT `<path>.lora_A/B.weight` (LoRA) or `<module>.lokr_w1/w2` (LoKr) over the DiT \
          attention (to_q|to_k|to_v|to_gate|to_out.0) + SwiGLU FFN (ff.gate|ff.up|ff.down) across the \
          single-stream transformer_blocks and text_fusion blocks, plus the front-end \
-         (img_in|time_embed.linear_1/2|txt_in.linear_1/2|final_layer.linear) projections. Conv-layer / \
-         text-encoder adapters are out of surface"
+         (img_in|time_embed.linear_1/2|txt_in.linear_1/2|final_layer.linear) projections; or a ComfyUI/\
+         lightx2v `<module>.diff`/`.diff_b` diff-patch (full-weight/bias delta, incl. the \
+         text_fusion.projector 12→1 collapse). Conv-layer / text-encoder adapters are out of surface"
     }
 }
 

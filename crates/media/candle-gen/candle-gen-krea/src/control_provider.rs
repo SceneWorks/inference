@@ -241,11 +241,15 @@ fn load_control_heavy(
     device: &Device,
 ) -> Result<Krea2ControlHeavy> {
     let cfg = Krea2Config::from_snapshot(root)?;
-    let dit_w = Weights::from_dir(&root.join("transformer"), device, DType::BF16)?;
+    let mut dit_w = Weights::from_dir(&root.join("transformer"), device, DType::BF16)?;
+    // Diff-patch (`.diff`/`.diff_b`) deltas fold into the dense baseline weights before the DiT builds
+    // (the projector filter-bypass is outside the additive residual surface); low-rank user adapters
+    // then ride as residuals. The pose control branch is never adapted either way.
+    let diff = crate::adapters::fold_diff_patch(&mut dit_w, adapters)?;
     let mut dit = KreaTrainDit::load_inference(&dit_w, &cfg)?;
     drop(dit_w);
     if !adapters.is_empty() {
-        crate::adapters::install_additive(&mut dit, adapters)?;
+        crate::adapters::install_additive(&mut dit, adapters, diff.merged)?;
     }
 
     let mut branch = match branch_quant {

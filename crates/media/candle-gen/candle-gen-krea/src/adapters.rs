@@ -47,8 +47,8 @@ use candle_gen::train::lora::{
 // this crate previously hand-copied. Only the Krea-specific key→module resolution (ai-toolkit native
 // rename + the bespoke file-meta-or-lycoris LoKr grouping) stays local below.
 use candle_gen::train::merge::{
-    build_kohya_table, merge_into, no_target_matched, read_adapter, read_scalar, AdapterFile,
-    LoraTriple, Role,
+    build_kohya_table, merge_diff_patch_file, merge_into, no_target_matched, read_adapter,
+    read_scalar, AdapterFile, LoraTriple, Role,
 };
 // Re-exported so `candle_gen_krea::MergeReport` (the crate's public surface) keeps resolving.
 pub use candle_gen::train::merge::MergeReport;
@@ -391,8 +391,10 @@ pub fn merge_adapters(
             "expected bare/PEFT `<path>.lora_A/B.weight` (LoRA) or `<module>.lokr_w1/w2` (LoKr — \
              declared networkType=lokr OR sniffed by key) over the DiT attention (to_q|to_k|to_v|\
              to_gate|to_out.0) and SwiGLU FFN (ff.gate|ff.up|ff.down) projections across the \
-             single-stream transformer_blocks and text_fusion blocks. Conv-layer / text-encoder \
-             adapters are out of surface",
+             single-stream transformer_blocks and text_fusion blocks. A ComfyUI/lightx2v \
+             `<module>.diff`/`.diff_b` diff-patch (e.g. the text_fusion.projector filter-bypass) folds \
+             via `fold_diff_patch`, not this low-rank pass. Conv-layer / text-encoder adapters are out \
+             of surface",
             specs.len(),
         ));
     }
@@ -465,6 +467,70 @@ pub fn merge_into_weights(
     // untargeted keys are identical to the mmap, so dropping them is a pure memory win.
     let base_ids: HashMap<String, _> = map.iter().map(|(k, t)| (k.clone(), t.id())).collect();
     let report = merge_adapters(&mut map, specs)?;
+    map.retain(|k, t| base_ids.get(k).is_none_or(|&id| t.id() != id));
+    w.set_overlay(map);
+    Ok(report)
+}
+
+/// Resolve a diff-patch stem (a `.diff`/`.diff_b` key with its suffix removed) to the base DiT dotted
+/// module path — the same optional PEFT-prefix strip + ai-toolkit native rename [`classify_lora_key`]
+/// applies to a low-rank key, so `diffusion_model.txtfusion.projector` resolves to
+/// `text_fusion.projector` exactly as its `.weight` base key is stored.
+fn resolve_diff_stem(stem: &str) -> String {
+    normalize_native_krea_path(strip_peft_prefix(stem))
+}
+
+/// Fold any ComfyUI/lightx2v **diff-patch** (`.diff` weight / `.diff_b` bias) full-rank deltas the
+/// `specs` carry into the DiT's dense baseline weights, installed as `w`'s overlay so the subsequent
+/// `Krea2Transformer::load` reads the patched weight. Runs on **both** tiers, complementing
+/// [`install_additive`]: a diff-patch target — the 12→1 `text_fusion.projector` collapse (the community
+/// "filter-bypass" lever) or a front-end projection — is dense regardless of quant, so a full-weight
+/// delta folds cheaply (`W += scale·δ`, `b += scale·δ_b`) while the forward-additive residual surface
+/// (which *excludes* the projector) carries the low-rank keys. The two are disjoint by key suffix.
+///
+/// Returns the [`MergeReport`]; the caller sums its `merged` with [`install_additive`]'s applied count
+/// for the zero-match guard, so a diff-patch-only file does not read as "matched nothing". A no-op
+/// (empty report, no overlay installed) for specs carrying no `.diff`/`.diff_b`.
+pub fn fold_diff_patch(w: &mut Weights, specs: &[AdapterSpec]) -> Result<MergeReport> {
+    if specs.is_empty() {
+        return Ok(MergeReport::default());
+    }
+    let files: Vec<AdapterFile> = specs
+        .iter()
+        .map(|spec| read_adapter(&spec.path))
+        .collect::<Result<_>>()?;
+
+    // Targeted preload (no fixed surface list): resolve each `.diff`/`.diff_b` stem to its base key and
+    // pull the dense weight from `w` when present. `get_cpu_merge_base` is packed-aware, but every
+    // diff-patch target is dense on every tier, so this is the plain CPU weight.
+    let mut map: HashMap<String, Tensor> = HashMap::new();
+    for af in &files {
+        for key in af.tensors.keys() {
+            let base_key = if let Some(stem) = key.strip_suffix(".diff_b") {
+                format!("{}.bias", resolve_diff_stem(stem))
+            } else if let Some(stem) = key.strip_suffix(".diff") {
+                format!("{}.weight", resolve_diff_stem(stem))
+            } else {
+                continue;
+            };
+            if !map.contains_key(&base_key) && w.contains(&base_key) {
+                map.insert(base_key.clone(), w.get_cpu_merge_base(&base_key)?);
+            }
+        }
+    }
+    if map.is_empty() {
+        return Ok(MergeReport::default());
+    }
+
+    // Snapshot the preloaded base identities so only projections a delta actually folded into enter the
+    // overlay (a `merge_into` on a matched key installs a fresh `TensorId`) — untargeted preloads (e.g.
+    // a speculatively pulled `.bias` a shape-skipped module never wrote) drop out, the same compose rule
+    // [`merge_into_weights`] uses.
+    let base_ids: HashMap<String, _> = map.iter().map(|(k, t)| (k.clone(), t.id())).collect();
+    let mut report = MergeReport::default();
+    for (spec, af) in specs.iter().zip(&files) {
+        merge_diff_patch_file(&mut map, af, spec.scale, resolve_diff_stem, &mut report)?;
+    }
     map.retain(|k, t| base_ids.get(k).is_none_or(|&id| t.id() != id));
     w.set_overlay(map);
     Ok(report)
@@ -694,9 +760,15 @@ pub trait AdditiveDit {
 /// via the structured Kronecker vec-trick). A LoKr with no allocation-free structured form (a tucker/CP
 /// `lokr_t2`, or a base that does not factor as a·b × c·d) is rejected. Like [`merge_adapters`], a
 /// non-empty spec set that matches **no** target errors (never renders unadapted).
+///
+/// `pre_applied` is the count of targets already folded by [`fold_diff_patch`] (the diff-patch pass the
+/// caller runs first, into the dense baseline weights the additive surface excludes). It only relaxes
+/// the zero-match guard: a diff-patch-only file whose delta already folded (`pre_applied > 0`) resolves
+/// zero low-rank residuals here, and must not read as "matched nothing".
 pub fn install_additive<D: AdditiveDit + ?Sized>(
     dit: &mut D,
     specs: &[AdapterSpec],
+    pre_applied: usize,
 ) -> Result<AdditiveReport> {
     let mut report = AdditiveReport::default();
 
@@ -807,7 +879,7 @@ pub fn install_additive<D: AdditiveDit + ?Sized>(
             report.skipped_targets.push(path.clone());
         }
     }
-    if !specs.is_empty() && report.applied == 0 {
+    if !specs.is_empty() && report.applied == 0 && pre_applied == 0 {
         return Err(no_target_matched(
             "krea",
             dit.adapter_surface_hint(),
@@ -1425,6 +1497,270 @@ mod tests {
         std::fs::remove_file(&adapter_file).ok();
     }
 
+    /// The community Krea "filter-bypass": a single ComfyUI diff-patch tensor
+    /// `diffusion_model.txtfusion.projector.diff` folds `W += scale·δ` into the 12→1
+    /// `text_fusion.projector` collapse — the dense baseline target the low-rank surface deliberately
+    /// excludes. [`fold_diff_patch`] installs the merged projector into the overlay; untargeted
+    /// projections stay untouched.
+    #[test]
+    fn fold_diff_patch_folds_projector_diff() {
+        let dev = Device::Cpu;
+        let pid = std::process::id();
+        let base_file = std::env::temp_dir().join(format!("krea_diff_base_{pid}.safetensors"));
+        let adapter_file = std::env::temp_dir().join(format!("krea_diff_proj_{pid}.safetensors"));
+
+        // The projector weight `[1, num_text_layers] = [1, 12]`, plus an untargeted attention weight.
+        let base_w = Tensor::randn(0f32, 1f32, (1, 12), &dev)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let base = HashMap::from([
+            ("text_fusion.projector.weight".to_string(), base_w.clone()),
+            (
+                "transformer_blocks.0.attn.to_q.weight".to_string(),
+                Tensor::zeros((4, 4), DType::BF16, &dev).unwrap(),
+            ),
+        ]);
+        save_tensors(&base, &base_file).unwrap();
+
+        // The ai-toolkit/ComfyUI native key: `diffusion_model.` prefix + `txtfusion.projector` container.
+        let delta = Tensor::randn(0f32, 1f32, (1, 12), &dev).unwrap();
+        save_tensors(
+            &HashMap::from([(
+                "diffusion_model.txtfusion.projector.diff".to_string(),
+                delta.clone(),
+            )]),
+            &adapter_file,
+        )
+        .unwrap();
+
+        let mut w = Weights::from_file(&base_file, &dev, DType::BF16).unwrap();
+        let report = fold_diff_patch(
+            &mut w,
+            &[AdapterSpec::new(
+                adapter_file.clone(),
+                0.5,
+                AdapterKind::Lora,
+            )],
+        )
+        .unwrap();
+
+        assert_eq!(report.merged, 1, "the projector diff must fold");
+        assert_eq!(report.skipped_keys, 0);
+
+        let merged = w.get_f32("text_fusion.projector.weight").unwrap();
+        let expected = (base_w.to_dtype(DType::F32).unwrap()
+            + delta
+                .to_dtype(DType::F32)
+                .unwrap()
+                .affine(0.5, 0.0)
+                .unwrap())
+        .unwrap();
+        assert!(
+            max_abs(&(merged - expected).unwrap()) < 1e-4,
+            "projector = base + 0.5·δ"
+        );
+        // The untargeted attention projection stays at its (zero) base.
+        assert_eq!(
+            max_abs(&w.get_f32("transformer_blocks.0.attn.to_q.weight").unwrap()),
+            0.0
+        );
+
+        std::fs::remove_file(&base_file).ok();
+        std::fs::remove_file(&adapter_file).ok();
+    }
+
+    /// A `.diff_b` bias delta folds into `{module}.bias` alongside the `.diff` weight delta — the bias
+    /// channel low-rank adapters cannot express. Both fold at `scale`, counted as two merges.
+    #[test]
+    fn fold_diff_patch_applies_weight_and_bias_delta() {
+        let dev = Device::Cpu;
+        let pid = std::process::id();
+        let base_file = std::env::temp_dir().join(format!("krea_diffb_base_{pid}.safetensors"));
+        let adapter_file = std::env::temp_dir().join(format!("krea_diffb_adapt_{pid}.safetensors"));
+
+        let base = HashMap::from([
+            (
+                "mod0.weight".to_string(),
+                Tensor::zeros((4, 4), DType::F32, &dev).unwrap(),
+            ),
+            (
+                "mod0.bias".to_string(),
+                Tensor::zeros((4,), DType::F32, &dev).unwrap(),
+            ),
+        ]);
+        save_tensors(&base, &base_file).unwrap();
+
+        let dw = Tensor::randn(0f32, 1f32, (4, 4), &dev).unwrap();
+        let db = Tensor::randn(0f32, 1f32, (4,), &dev).unwrap();
+        save_tensors(
+            &HashMap::from([
+                ("diffusion_model.mod0.diff".to_string(), dw.clone()),
+                ("diffusion_model.mod0.diff_b".to_string(), db.clone()),
+            ]),
+            &adapter_file,
+        )
+        .unwrap();
+
+        let mut w = Weights::from_file(&base_file, &dev, DType::F32).unwrap();
+        let report = fold_diff_patch(
+            &mut w,
+            &[AdapterSpec::new(
+                adapter_file.clone(),
+                1.0,
+                AdapterKind::Lora,
+            )],
+        )
+        .unwrap();
+
+        assert_eq!(report.merged, 2, "weight + bias delta both fold");
+        assert!(max_abs(&(w.get_f32("mod0.weight").unwrap() - dw).unwrap()) < 1e-5);
+        assert!(max_abs(&(w.get_f32("mod0.bias").unwrap() - db).unwrap()) < 1e-5);
+
+        std::fs::remove_file(&base_file).ok();
+        std::fs::remove_file(&adapter_file).ok();
+    }
+
+    /// Module-coupled shape-aware skip: a `.diff` whose shape ≠ the base weight is skipped as a whole
+    /// module — its coupled `.diff_b` dropped too, never a half-patch — and surfaced, never merged.
+    #[test]
+    fn fold_diff_patch_shape_mismatch_skips_whole_module() {
+        let dev = Device::Cpu;
+        let pid = std::process::id();
+        let base_file = std::env::temp_dir().join(format!("krea_diffmm_base_{pid}.safetensors"));
+        let adapter_file =
+            std::env::temp_dir().join(format!("krea_diffmm_adapt_{pid}.safetensors"));
+
+        let base = HashMap::from([
+            (
+                "mod0.weight".to_string(),
+                Tensor::zeros((4, 4), DType::F32, &dev).unwrap(),
+            ),
+            (
+                "mod0.bias".to_string(),
+                Tensor::zeros((4,), DType::F32, &dev).unwrap(),
+            ),
+        ]);
+        save_tensors(&base, &base_file).unwrap();
+
+        // A `[2,2]` weight delta cannot fold into the `[4,4]` base; its coupled bias must drop with it.
+        save_tensors(
+            &HashMap::from([
+                (
+                    "diffusion_model.mod0.diff".to_string(),
+                    Tensor::randn(0f32, 1f32, (2, 2), &dev).unwrap(),
+                ),
+                (
+                    "diffusion_model.mod0.diff_b".to_string(),
+                    Tensor::randn(0f32, 1f32, (4,), &dev).unwrap(),
+                ),
+            ]),
+            &adapter_file,
+        )
+        .unwrap();
+
+        let mut w = Weights::from_file(&base_file, &dev, DType::F32).unwrap();
+        let report = fold_diff_patch(
+            &mut w,
+            &[AdapterSpec::new(
+                adapter_file.clone(),
+                1.0,
+                AdapterKind::Lora,
+            )],
+        )
+        .unwrap();
+
+        assert_eq!(report.merged, 0, "shape-mismatched module folds nothing");
+        assert_eq!(
+            report.skipped_keys, 2,
+            "weight + coupled bias both surfaced as skipped"
+        );
+        assert_eq!(
+            max_abs(&w.get_f32("mod0.weight").unwrap()),
+            0.0,
+            "base untouched"
+        );
+        assert_eq!(
+            max_abs(&w.get_f32("mod0.bias").unwrap()),
+            0.0,
+            "bias untouched"
+        );
+
+        std::fs::remove_file(&base_file).ok();
+        std::fs::remove_file(&adapter_file).ok();
+    }
+
+    /// A diff-patch-**only** file resolves zero low-rank residuals in [`install_additive`], so the
+    /// zero-match guard must defer to `pre_applied` (the count [`fold_diff_patch`] already folded):
+    /// tolerated when the diff pre-folded (`pre_applied > 0`), a genuine no-match otherwise.
+    #[test]
+    fn install_additive_tolerates_diff_only_when_prefolded() {
+        use candle_gen::candle_nn::Linear;
+        use candle_gen::quant::AdaptLinear;
+
+        let dev = Device::Cpu;
+        let dir = std::env::temp_dir().join("krea_diff_only");
+        std::fs::create_dir_all(&dir).unwrap();
+        let adapter_file = dir.join("diff_only.safetensors");
+        save_tensors(
+            &HashMap::from([(
+                "diffusion_model.txtfusion.projector.diff".to_string(),
+                Tensor::randn(0f32, 1f32, (1, 12), &dev).unwrap(),
+            )]),
+            &adapter_file,
+        )
+        .unwrap();
+
+        struct MockDit {
+            device: Device,
+            img_in: AdaptLinear,
+        }
+        impl AdditiveDit for MockDit {
+            fn visit_additive(
+                &mut self,
+                f: &mut dyn FnMut(&str, &mut dyn AdditiveProj) -> Result<()>,
+            ) -> Result<()> {
+                f("img_in", &mut self.img_in)
+            }
+            fn adapter_device(&self) -> Device {
+                self.device.clone()
+            }
+            fn adapter_surface_hint(&self) -> &'static str {
+                "mock"
+            }
+        }
+        let mk = || MockDit {
+            device: dev.clone(),
+            img_in: AdaptLinear::from_dense(
+                Linear::new(Tensor::zeros((4, 4), DType::F32, &dev).unwrap(), None),
+                4,
+                4,
+            ),
+        };
+        let specs = [AdapterSpec::new(
+            adapter_file.clone(),
+            1.0,
+            AdapterKind::Lora,
+        )];
+
+        // pre_applied = 1 (the projector diff already folded) ⇒ the zero additive match is tolerated.
+        let mut dit = mk();
+        let report = install_additive(&mut dit, &specs, 1).unwrap();
+        assert_eq!(
+            report.applied, 0,
+            "no low-rank residual lives in a diff-only file"
+        );
+
+        // pre_applied = 0 (nothing pre-folded) ⇒ the same file is a genuine no-match, surfaced loudly.
+        let mut dit0 = mk();
+        assert!(
+            install_additive(&mut dit0, &specs, 0).is_err(),
+            "a diff-only file with nothing pre-folded must error, never render unadapted"
+        );
+
+        std::fs::remove_file(&adapter_file).ok();
+    }
+
     /// AC: a scale-0 adapter merge is byte-exact with the base (`δ·0 = 0`), so the overlaid weight
     /// equals the original — a LoRA at strength 0 is a no-op render.
     #[test]
@@ -1824,6 +2160,7 @@ mod tests {
         let report = install_additive(
             &mut dit,
             &[AdapterSpec::new(adapter_file, 1.0, AdapterKind::Lora)],
+            0,
         )
         .unwrap();
         assert_eq!(

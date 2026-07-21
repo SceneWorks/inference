@@ -45,21 +45,22 @@
 //! **nothing** is a hard error (the worker should fall back rather than render an unadapted video).
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
 
 use candle_gen::candle_core::{DType, Tensor};
 use candle_gen::gen_core::weightsmeta as wmeta;
 use candle_gen::gen_core::{AdapterKind, AdapterSpec};
 use candle_gen::train::lora::{reconstruct_lokr_delta, reconstruct_lora_delta, LoraAdapterMeta};
 // The shared adapter-merge skeleton (sc-8998 / F-018): the format-parsing + merge-report + third-party
-// LyCORIS engine this crate previously hand-copied. Only the SCAIL-2-specific key→module resolution
-// (bare/prefixed dotted paths, no kohya table) + the bespoke lightx2v diff-patch merge stay local below.
+// LyCORIS engine + the ComfyUI/lightx2v diff-patch fold this crate previously hand-copied. Only the
+// SCAIL-2-specific key→module resolution (bare/prefixed dotted paths, no kohya table) stays local below.
 use candle_gen::train::merge::{
-    merge_into, merge_one_thirdparty, no_target_matched, parse_loha_thirdparty,
-    parse_lokr_thirdparty, read_adapter, read_scalar, AdapterFile, LoraTriple, Role,
+    merge_diff_patch_file, merge_into, merge_one_thirdparty, no_target_matched,
+    parse_loha_thirdparty, parse_lokr_thirdparty, read_adapter, read_scalar, AdapterFile,
+    LoraTriple, Role,
 };
-// Re-exported so `candle_gen_scail2::MergeReport` (the crate's public surface) keeps resolving.
-pub use candle_gen::train::merge::MergeReport;
+// Re-exported so `candle_gen_scail2::{MergeReport, has_diff_patch_keys}` (the crate's public surface,
+// the worker's lightning-routing probe) keep resolving after the hoist.
+pub use candle_gen::train::merge::{has_diff_patch_keys, MergeReport};
 use candle_gen::{CandleError, Result};
 
 /// LoKr per-module factor suffixes, longest-first so `.lokr_w1_a` wins over `.lokr_w1`.
@@ -162,136 +163,6 @@ fn merge_lora_file(
         merge_into(base, &base_key, &delta, report)?;
     }
     Ok(())
-}
-
-// ---- lightx2v lightning diff-patch ----------------------------------------------------------------
-//
-// The few-step distill LoRA carries full-rank `.diff` (weight delta) and `.diff_b` (bias delta) tensors
-// alongside the low-rank pairs — the ComfyUI "diff patch" mechanism — reaching the qk-RMSNorms, the
-// affine `norm3`/`img_emb.proj.{0,4}` LayerNorms, the `head.head`, and every projection bias, none of
-// which a low-rank pair targets. Merge `W += scale·diff`, `b += scale·diff_b` at the key level.
-
-/// One module's diff-patch deltas (full-rank weight + bias), grouped by dotted module stem.
-#[derive(Default)]
-struct DiffPatch {
-    diff: Option<Tensor>,   // weight delta, base-shaped
-    diff_b: Option<Tensor>, // bias delta, base-shaped
-}
-
-/// Merge a file's diff-patch tensors into `base` at `scale`. **Module-coupled shape-aware skip:** if a
-/// module's `.diff` (weight) does not match the base weight shape — the vanilla-Wan in_dim-36
-/// `patch_embedding` vs SCAIL-2's in_dim-20 — the whole module is skipped, *including* its coupled
-/// `.diff_b`, so the input stem is never half-patched. A no-op for a file without `.diff`/`.diff_b`.
-fn merge_diff_patch_file(
-    base: &mut HashMap<String, Tensor>,
-    af: &AdapterFile,
-    scale: f32,
-    report: &mut MergeReport,
-) -> Result<()> {
-    let mut groups: BTreeMap<String, DiffPatch> = BTreeMap::new();
-    for (key, t) in &af.tensors {
-        if let Some(stem) = key.strip_suffix(".diff_b") {
-            groups
-                .entry(strip_lora_prefix(stem).to_string())
-                .or_default()
-                .diff_b = Some(t.clone());
-        } else if let Some(stem) = key.strip_suffix(".diff") {
-            groups
-                .entry(strip_lora_prefix(stem).to_string())
-                .or_default()
-                .diff = Some(t.clone());
-        }
-    }
-
-    for (path, g) in groups {
-        // Apply at `scale`; the delta is reconstructed in f32 inside `merge_into`.
-        let scaled = |t: &Tensor| -> Result<Tensor> {
-            Ok(t.to_dtype(DType::F32)?.affine(scale as f64, 0.0)?)
-        };
-        match &g.diff {
-            Some(diff) => {
-                let wkey = format!("{path}.weight");
-                let base_ok = base.get(&wkey).is_some_and(|w| w.dims() == diff.dims());
-                if !base_ok {
-                    // Cross-architecture (or out-of-surface) weight delta: skip the whole module,
-                    // dropping its coupled bias delta too (loud, not a half-patch).
-                    report.skipped_keys += 1;
-                    if g.diff_b.is_some() {
-                        report.skipped_keys += 1;
-                    }
-                    continue;
-                }
-                merge_into(base, &wkey, &scaled(diff)?, report)?;
-                if let Some(db) = &g.diff_b {
-                    merge_into(base, &format!("{path}.bias"), &scaled(db)?, report)?;
-                }
-            }
-            None => {
-                // Bias-only diff-patch (no weight delta on this module).
-                if let Some(db) = &g.diff_b {
-                    merge_into(base, &format!("{path}.bias"), &scaled(db)?, report)?;
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-/// `true` if any tensor key in the `.safetensors` at `path` is a diff-patch delta (`.diff`/`.diff_b`)
-/// — the structural marker of a lightx2v "lightning" file (the worker reads this to apply the
-/// step-distill recipe).
-///
-/// Reads **only** the safetensors header — the 8-byte little-endian header length followed by exactly
-/// that many JSON bytes — never the (potentially hundreds-of-MB) tensor data. The tensor names live
-/// entirely in that JSON header, so classifying a bundle costs one small read on the worker's routing
-/// path. A read / parse error propagates (the caller decides the fallback).
-pub fn has_diff_patch_keys(path: &Path) -> Result<bool> {
-    read_safetensors_header_keys(path)?
-        .into_iter()
-        .try_fold(false, |acc, name| {
-            Ok(acc || name.ends_with(".diff") || name.ends_with(".diff_b"))
-        })
-}
-
-/// Read only the safetensors header of `path` and return its tensor names (the JSON object keys, minus
-/// the reserved `__metadata__` entry). Never touches the tensor data bytes: reads the 8-byte
-/// little-endian header length, then exactly that many JSON bytes, then deserializes just that slice.
-/// Malformed / truncated files surface as a clean `Err` (no panic), consistent with the crate's error
-/// style.
-fn read_safetensors_header_keys(path: &Path) -> Result<Vec<String>> {
-    use std::io::Read;
-
-    // Cap mirrors safetensors' own `MAX_HEADER_SIZE` (100 MB) so a corrupt length can't request a
-    // multi-GB allocation.
-    const MAX_HEADER_SIZE: u64 = 100_000_000;
-
-    let mut file = std::fs::File::open(path)
-        .map_err(|e| CandleError::Msg(format!("open adapter {}: {e}", path.display())))?;
-
-    let mut len_buf = [0u8; 8];
-    file.read_exact(&mut len_buf).map_err(|e| {
-        CandleError::Msg(format!(
-            "read adapter header length {}: {e}",
-            path.display()
-        ))
-    })?;
-    let header_len = u64::from_le_bytes(len_buf);
-    if header_len > MAX_HEADER_SIZE {
-        return Err(CandleError::Msg(format!(
-            "adapter {} header length {header_len} exceeds max {MAX_HEADER_SIZE}",
-            path.display()
-        )));
-    }
-
-    let mut header = vec![0u8; header_len as usize];
-    file.read_exact(&mut header)
-        .map_err(|e| CandleError::Msg(format!("read adapter header {}: {e}", path.display())))?;
-
-    // The header is a JSON object mapping tensor name -> {dtype, shape, offsets}, plus an optional
-    // reserved `__metadata__` string map. We only need the key set.
-    let obj: BTreeMap<String, serde_json::Value> = serde_json::from_slice(&header)
-        .map_err(|e| CandleError::Msg(format!("parse adapter header {}: {e}", path.display())))?;
-    Ok(obj.into_keys().filter(|k| k != "__metadata__").collect())
 }
 
 /// Merge one (PEFT-stamped) LoKr file into `base` at `scale`: `rank`/`alpha` from file metadata
@@ -424,8 +295,16 @@ pub fn merge_adapters(
             }
         }
         // lightx2v lightning hybrid: full-rank `.diff`/`.diff_b` deltas alongside the low-rank pairs.
-        // A no-op for a file without diff-patch keys (the DPO / general LoRA case).
-        merge_diff_patch_file(map, &af, spec.scale, &mut report)?;
+        // A no-op for a file without diff-patch keys (the DPO / general LoRA case). SCAIL-2 resolves a
+        // diff-patch stem the same way its low-rank `classify_*` does: strip the optional
+        // `transformer.`/`diffusion_model.` namespace, leaving the bare dotted base path.
+        merge_diff_patch_file(
+            map,
+            &af,
+            spec.scale,
+            |s| strip_lora_prefix(s).to_string(),
+            &mut report,
+        )?;
     }
     if report.merged == 0 {
         return Err(no_target_matched(
@@ -571,7 +450,14 @@ mod tests {
             meta: HashMap::new(),
         };
         let mut report = MergeReport::default();
-        merge_diff_patch_file(&mut map, &af, 1.0, &mut report).unwrap();
+        merge_diff_patch_file(
+            &mut map,
+            &af,
+            1.0,
+            |s| strip_lora_prefix(s).to_string(),
+            &mut report,
+        )
+        .unwrap();
         // self_attn.q weight + bias merged (2); patch_embedding weight + coupled bias skipped (2).
         assert_eq!(report.merged, 2);
         assert_eq!(report.skipped_keys, 2);
@@ -623,7 +509,14 @@ mod tests {
         };
         let mut report = MergeReport::default();
         merge_lora_file(&mut map, &af, 1.0, &mut report).unwrap();
-        merge_diff_patch_file(&mut map, &af, 1.0, &mut report).unwrap();
+        merge_diff_patch_file(
+            &mut map,
+            &af,
+            1.0,
+            |s| strip_lora_prefix(s).to_string(),
+            &mut report,
+        )
+        .unwrap();
         // ffn.0 (lora) + self_attn.q.bias (diff_b) + norm_q.weight (diff) = 3 merged, 0 skipped.
         assert_eq!(report.merged, 3);
         assert_eq!(report.skipped_keys, 0);
@@ -702,127 +595,6 @@ mod tests {
         let mut map = base_map();
         let report = merge_adapters(&mut map, &[]).unwrap();
         assert_eq!(report, MergeReport::default());
-    }
-
-    /// Write a `.safetensors`-format file whose JSON header declares `names` (each a tiny F32 scalar)
-    /// but whose data section is **deliberately omitted** (only the leading header bytes are written).
-    /// A correct header-only reader classifies such a file successfully; a whole-file reader (or one
-    /// that validates the data buffer) would fail — so the crafted truncation is the assertion that
-    /// [`has_diff_patch_keys`] never touches the tensor data.
-    fn write_header_only_safetensors(path: &Path, names: &[&str]) {
-        use std::io::Write;
-
-        // Each tensor is a 4-byte F32 scalar laid out back-to-back; the header carries only the offsets.
-        let mut header = serde_json::Map::new();
-        for (i, name) in names.iter().enumerate() {
-            let start = i * 4;
-            let end = start + 4;
-            header.insert(
-                (*name).to_string(),
-                serde_json::json!({
-                    "dtype": "F32",
-                    "shape": [1],
-                    "data_offsets": [start, end],
-                }),
-            );
-        }
-        let header_bytes = serde_json::to_vec(&serde_json::Value::Object(header)).unwrap();
-
-        let mut f = std::fs::File::create(path).unwrap();
-        f.write_all(&(header_bytes.len() as u64).to_le_bytes())
-            .unwrap();
-        f.write_all(&header_bytes).unwrap();
-        // NB: no tensor-data bytes are written — the file is truncated right after the header.
-    }
-
-    /// A file carrying a `.diff` (and `.diff_b`) key is flagged as a lightning diff-patch, and one
-    /// without is not — reading only the header (the file is truncated after it, so any whole-file /
-    /// data-validating read would error instead).
-    #[test]
-    fn has_diff_patch_keys_reads_only_header() {
-        let dir = std::env::temp_dir().join(format!("scail2_diffpatch_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-
-        let lightning = dir.join("lightning.safetensors");
-        write_header_only_safetensors(
-            &lightning,
-            &[
-                "diffusion_model.blocks.0.self_attn.q.diff",
-                "diffusion_model.blocks.0.self_attn.q.diff_b",
-                "diffusion_model.blocks.0.ffn.0.lora_down.weight",
-            ],
-        );
-        assert!(
-            has_diff_patch_keys(&lightning).unwrap(),
-            "diff-patch keys present must classify true"
-        );
-
-        let plain = dir.join("plain_lora.safetensors");
-        write_header_only_safetensors(
-            &plain,
-            &[
-                "blocks.0.self_attn.q.lora_down.weight",
-                "blocks.0.self_attn.q.lora_up.weight",
-                "blocks.0.self_attn.q.alpha",
-            ],
-        );
-        assert!(
-            !has_diff_patch_keys(&plain).unwrap(),
-            "no diff-patch keys must classify false"
-        );
-
-        // The reserved `__metadata__` entry is not a tensor and must never be mistaken for a key.
-        let with_meta = dir.join("with_meta.safetensors");
-        {
-            use std::io::Write;
-            let header = serde_json::json!({
-                "__metadata__": { "format": "pt" },
-                "blocks.0.self_attn.q.lora_down.weight": {
-                    "dtype": "F32", "shape": [1], "data_offsets": [0, 4],
-                },
-            });
-            let hb = serde_json::to_vec(&header).unwrap();
-            let mut f = std::fs::File::create(&with_meta).unwrap();
-            f.write_all(&(hb.len() as u64).to_le_bytes()).unwrap();
-            f.write_all(&hb).unwrap();
-        }
-        assert_eq!(
-            read_safetensors_header_keys(&with_meta).unwrap(),
-            vec!["blocks.0.self_attn.q.lora_down.weight".to_string()],
-            "__metadata__ must be filtered out of the tensor-name set"
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Malformed / truncated headers surface as a clean `Err`, not a panic: a file shorter than the
-    /// 8-byte length prefix, and a length prefix that promises more header bytes than exist.
-    #[test]
-    fn has_diff_patch_keys_malformed_is_err_not_panic() {
-        use std::io::Write;
-        let dir = std::env::temp_dir().join(format!("scail2_diffpatch_bad_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-
-        // (a) Fewer than 8 bytes total — cannot even read the header length.
-        let too_short = dir.join("short.safetensors");
-        std::fs::File::create(&too_short)
-            .unwrap()
-            .write_all(&[0u8, 1, 2])
-            .unwrap();
-        assert!(has_diff_patch_keys(&too_short).is_err());
-
-        // (b) Header length claims 4096 bytes but the file has none after the prefix.
-        let truncated = dir.join("truncated.safetensors");
-        std::fs::File::create(&truncated)
-            .unwrap()
-            .write_all(&4096u64.to_le_bytes())
-            .unwrap();
-        assert!(has_diff_patch_keys(&truncated).is_err());
-
-        // (c) A non-existent path.
-        assert!(has_diff_patch_keys(&dir.join("nope.safetensors")).is_err());
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A non-empty LoRA file that matches no DiT module merges nothing (the loud-error precondition).

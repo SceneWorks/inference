@@ -324,10 +324,15 @@ impl Weights {
     /// The resulting merged weight is installed in the overlay, so [`linear_detect`] then loads it
     /// dense (the packed base stays packed for untargeted projections).
     pub(crate) fn get_cpu_merge_base(&self, weight_key: &str) -> Result<Tensor> {
-        if let Some(base) = weight_key.strip_suffix(".weight") {
+        // Resolve the diffusers key to its on-disk name — identity except on a native-keyed INT8-ConvRot
+        // checkpoint (sc-9300), where a dense baseline weight a diff-patch folds into (e.g.
+        // `text_fusion.projector` → `txtfusion.projector.weight`) would otherwise 404. On the MLX-packed
+        // path resolution is a no-op (that tier is diffusers-keyed), so this is behavior-preserving there.
+        let key = self.resolve(weight_key);
+        if let Some(base) = key.strip_suffix(".weight") {
             let scales_key = format!("{base}.scales");
             if let (Some(cfg), true) = (self.packed, self.st.get(&scales_key).is_ok()) {
-                let wq = self.st.load(weight_key, &Device::Cpu)?;
+                let wq = self.st.load(&key, &Device::Cpu)?;
                 let scales = self
                     .st
                     .load(&scales_key, &Device::Cpu)?
@@ -339,7 +344,7 @@ impl Weights {
                 return dequant_packed_base(&wq, &scales, &biases, cfg.group_size as usize);
             }
         }
-        self.get_cpu(weight_key)
+        self.get_cpu(&key)
     }
 
     /// The on-device base weight for a **dense/composable** projection ([`linear`]) at the component
