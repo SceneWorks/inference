@@ -14,7 +14,8 @@
 //!
 //! `#[ignore]`d (needs a real GPU + the cached packed tier). On the Windows/Blackwell box (v143 vcvars
 //! with CUDA on PATH), point at the **q4 tier subdir** (the packed snapshot nests `gemma/`, `q4/`,
-//! `q8/`; the gemma sibling is auto-resolved, or override with `LTX_GEMMA_DIR`):
+//! `q8/`; the gemma sibling is auto-resolved, or override via `LoadSpec::text_encoder` — sc-13749
+//! deleted the `$LTX_GEMMA_DIR` env, which the tier path never read):
 //!
 //! ```text
 //! set LTX_PACKED_Q4=D:\.cache\huggingface\hub\models--SceneWorks--ltx-2.3-mlx\snapshots\<hash>\q4

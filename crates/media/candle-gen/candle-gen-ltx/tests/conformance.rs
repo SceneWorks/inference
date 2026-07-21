@@ -3,7 +3,10 @@
 //! Runs the backend-neutral [`gen_core_testkit`] suite — validate-honesty, progress monotonicity,
 //! typed cancellation, seed-determinism — against the real candle generator.
 //! Drives a real `generate`, so it needs the CUDA backend + a local LTX-2.3 snapshot + a Gemma-3-12B
-//! encoder snapshot (`LTX_GEMMA_DIR`) and is `#[ignore]`d by default:
+//! encoder snapshot and is `#[ignore]`d by default. As of sc-13749 the provider no longer reads a
+//! `$LTX_GEMMA_DIR` env var; this harness threads the encoder path through `LoadSpec::text_encoder`,
+//! reading it from the **test-only** convenience env `LTX_GEMMA_DIR` (else the snapshot's co-located
+//! `text_encoder/`):
 //!
 //! ```text
 //! set LTX_SNAPSHOT=C:\Users\…\models--Lightricks--LTX-2.3\snapshots\<hash>
@@ -46,7 +49,13 @@ impl Generator for TinyClip {
 #[ignore = "needs LTX_SNAPSHOT + LTX_GEMMA_DIR + a CUDA GPU"]
 fn ltx_conformance() {
     let snap = std::env::var("LTX_SNAPSHOT").expect("set LTX_SNAPSHOT to an LTX-2.3 snapshot dir");
-    let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(snap)));
+    let mut spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(&snap)));
+    // sc-13749: the provider reads the Gemma-3-12B encoder ONLY from `LoadSpec::text_encoder` (or the
+    // snapshot's co-located `text_encoder/`) — no `$LTX_GEMMA_DIR` env side-channel. Thread the encoder
+    // path in explicitly; `LTX_GEMMA_DIR` is now a test-only convenience read, not a provider env.
+    if let Ok(gemma) = std::env::var("LTX_GEMMA_DIR") {
+        spec.text_encoder = Some(WeightsSource::Dir(PathBuf::from(gemma)));
+    }
 
     // 256² / 9 frames keeps the suite affordable. Verifies contract behavior, not quality. The
     // distilled sigma schedule is fixed (8 steps), so `steps` is informational here.

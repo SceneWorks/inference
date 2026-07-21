@@ -74,8 +74,9 @@ impl TierPaths {
     /// `quantize_config.json` (the MLX split-tier marker). Returns `None` for the dense single-bundle
     /// layout so `crate::Pipeline` keeps the legacy path unchanged.
     ///
-    /// `gemma_override` (from `LoadSpec::text_encoder` / `$LTX_GEMMA_DIR`) wins for the Gemma dir; else
-    /// the tier's sibling `gemma/` (one level up from the `q4/` subdir) is used.
+    /// `gemma_override` (from `LoadSpec::text_encoder`) wins for the Gemma dir; else the tier's sibling
+    /// `gemma/` (one level up from the `q4/` subdir) is used. Both are passed-in paths — sc-13749 deleted
+    /// the dense path's environment side-channel, which the tier path never consulted anyway.
     pub fn detect(dir: &Path, gemma_override: Option<&Path>) -> Option<Self> {
         let marker = dir.join("transformer.safetensors");
         let cfg = dir.join("quantize_config.json");
