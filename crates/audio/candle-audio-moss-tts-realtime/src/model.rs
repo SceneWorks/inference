@@ -1,6 +1,8 @@
 //! `MossTtsRealtimeGenerator` — the [`gen_core::Generator`] for **MOSS-TTS-Realtime-1.7B** on the
 //! candle audio lane (sc-13334 + sc-13392), plus its [`descriptor`]/[`load`] entry points, the
-//! pinned-SHA hub paths (AR + codec), and the model-weight license.
+//! pinned-SHA AR hub path, the MOSS-Audio-Tokenizer codec pin (staged as the passed-in
+//! [`CODEC_COMPONENT_ID`] component, never self-fetched — epic 13657, sc-13662), and the
+//! model-weight license.
 //!
 //! ## Full streaming TTS (sc-13392)
 //!
@@ -42,9 +44,20 @@ pub const HUB_REPO: &str = "OpenMOSS-Team/MOSS-TTS-Realtime";
 pub const HUB_REVISION: &str = "6acbc7f161a0db71c291f2d0aaa9eee59334cab2";
 
 /// The MOSS-Audio-Tokenizer codec repo — the separate ~7.1 GB model that decodes RVQ frames into a
-/// 24 kHz waveform (ported in [`crate::codec`], resolved by [`resolve_pinned_codec_snapshot`]).
+/// 24 kHz waveform (ported in [`crate::codec`]).
+///
+/// **The codec is a passed-in component, not a self-fetch (epic 13657, sc-13662).** These pin
+/// constants record *which* snapshot the consumer must stage under the [`CODEC_COMPONENT_ID`]
+/// component of [`gen_core::LoadSpec::components`]; this crate never fetches it. Provisioning the pin
+/// (fetch + snapshot assembly) is the consumer's job (SceneWorks, epic 13678).
 pub const CODEC_HUB_REPO: &str = "OpenMOSS-Team/MOSS-Audio-Tokenizer";
 pub const CODEC_HUB_REVISION: &str = "3cd226ba2947efa357ef453bcad111b6eafba782";
+
+/// The [`ModelDescriptor::required_components`] id under which the caller stages the
+/// MOSS-Audio-Tokenizer codec **snapshot directory** in [`gen_core::LoadSpec::components`]
+/// (sc-13662). Validated at load via [`gen_core::require_component`]; the codec is then built lazily
+/// from the staged directory.
+pub const CODEC_COMPONENT_ID: &str = "codec";
 
 /// The license of the pinned MOSS-TTS-Realtime weight checkpoint (sc-13332) — surfaced for
 /// SceneWorks' end-product licenses page. Apache-2.0 (permissive), verified against the
@@ -90,7 +103,7 @@ pub const LANGUAGES: &[&str] = &["en", "zh"];
 /// a time (the codec decodes a block of frames into a streamed PCM chunk).
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
-        required_components: &[],
+        required_components: &[CODEC_COMPONENT_ID],
         id: MODEL_ID,
         family: "moss_tts_realtime",
         backend: "candle",
@@ -217,6 +230,10 @@ fn frames_per_block(budget_frames: usize) -> usize {
 pub struct MossTtsRealtimeGenerator {
     descriptor: ModelDescriptor,
     root: PathBuf,
+    /// The MOSS-Audio-Tokenizer codec snapshot directory, resolved at load from the passed-in
+    /// [`CODEC_COMPONENT_ID`] component (sc-13662). The codec is built lazily from it on first
+    /// synthesize; never a hub fetch.
+    codec_dir: PathBuf,
     loaded: Mutex<Option<Arc<Loaded>>>,
     codec: Mutex<Option<Arc<MossAudioCodec>>>,
 }
@@ -278,16 +295,17 @@ impl MossTtsRealtimeGenerator {
         }
     }
 
-    /// Load (once, lazily) the MOSS-Audio-Tokenizer codec decoder for `rvq` codebooks. The codec is
-    /// a separate pinned snapshot resolved through the audio lane's hub path (or the
-    /// `MOSS_AUDIO_TOKENIZER_SNAPSHOT` override); see [`resolve_pinned_codec_snapshot`].
+    /// Load (once, lazily) the MOSS-Audio-Tokenizer codec decoder for `rvq` codebooks from the
+    /// snapshot directory the caller staged as the [`CODEC_COMPONENT_ID`] component at load
+    /// (sc-13662) — never a hub fetch. The presence of the component was already validated in
+    /// [`load_generator`]; here we build it from the stored directory on first synthesize.
     fn codec(&self, rvq: usize) -> gen_core::Result<Arc<MossAudioCodec>> {
         let mut guard = lock_recover(&self.codec);
         if let Some(c) = guard.as_ref() {
             return Ok(c.clone());
         }
-        let dir = resolve_pinned_codec_snapshot().map_err(gen_core::Error::from)?;
-        let built = Arc::new(MossAudioCodec::load(&dir, rvq).map_err(gen_core::Error::from)?);
+        let built =
+            Arc::new(MossAudioCodec::load(&self.codec_dir, rvq).map_err(gen_core::Error::from)?);
         *guard = Some(built.clone());
         Ok(built)
     }
@@ -431,9 +449,31 @@ pub fn load_generator(spec: &LoadSpec) -> gen_core::Result<MossTtsRealtimeGenera
             "{MODEL_ID} does not support control/IP-adapter overlays"
         )));
     }
+    // The MOSS-Audio-Tokenizer codec is a passed-in component (epic 13657, sc-13662): validate it at
+    // LOAD — an unknown component key is a typed-`Unsupported` caller mistake, and a missing `codec`
+    // is a caller-actionable load error — so an unprovisioned codec fails here, never as a mid-render
+    // hub fetch. The snapshot directory is stored; the codec is built lazily from it in synthesize.
+    gen_core::reject_unknown_components(spec, &[CODEC_COMPONENT_ID], MODEL_ID)?;
+    let codec_dir = match gen_core::require_component(
+        spec,
+        CODEC_COMPONENT_ID,
+        MODEL_ID,
+        "MOSS-Audio-Tokenizer codec",
+    )? {
+        // The codec is a sharded snapshot (config.json + model*.safetensors), so it needs a directory.
+        WeightsSource::Dir(p) => p.clone(),
+        WeightsSource::File(p) => {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{MODEL_ID} codec component expects a snapshot directory (config.json + \
+                 model*.safetensors), not a single file: {}",
+                p.display()
+            )));
+        }
+    };
     Ok(MossTtsRealtimeGenerator {
         descriptor: descriptor(),
         root,
+        codec_dir,
         loaded: Mutex::new(None),
         codec: Mutex::new(None),
     })
@@ -463,18 +503,14 @@ pub fn provider_registry() -> gen_core::Result<gen_core::ProviderRegistry> {
     register_providers(gen_core::ProviderRegistryBuilder::new()).build()
 }
 
-/// The codec snapshot's sharded weight files (the 2-shard `model*.safetensors` + its index).
-const CODEC_WEIGHT_FILES: &[&str] = &[
-    "model.safetensors.index.json",
-    "model-00001-of-00002.safetensors",
-    "model-00002-of-00002.safetensors",
-];
-
-/// Materialize the pinned MOSS-TTS-Realtime AR snapshot through the audio lane's F-029 hub path:
+/// Materialize the pinned MOSS-TTS-Realtime **AR** snapshot through the audio lane's F-029 hub path:
 /// `config.json` (the snapshot-dir probe), the single-file `model.safetensors`, and the Qwen
-/// tokenizer — all at [`HUB_REVISION`]. Also materializes the pinned MOSS-Audio-Tokenizer codec
-/// snapshot (see [`resolve_pinned_codec_snapshot`]) so a single call warms both models the provider
-/// needs to render audio. Returns the AR snapshot dir.
+/// tokenizer — all at [`HUB_REVISION`]. Returns the AR snapshot dir.
+///
+/// This resolves the AR brain only (the model's own `spec.weights`). The MOSS-Audio-Tokenizer codec
+/// is a passed-in component (sc-13662): the consumer stages it under [`CODEC_COMPONENT_ID`]; this
+/// crate never fetches it (epic 13657). The pin the consumer must provision is
+/// [`CODEC_HUB_REPO`]@[`CODEC_HUB_REVISION`].
 pub fn resolve_pinned_snapshot() -> AudioResult<WeightsSource> {
     let dir = pinned_snapshot_dir(HUB_REPO, HUB_REVISION, "config.json")?;
     for file in [
@@ -484,29 +520,7 @@ pub fn resolve_pinned_snapshot() -> AudioResult<WeightsSource> {
     ] {
         hf_get_pinned(HUB_REPO, HUB_REVISION, file)?;
     }
-    // Also warm the codec snapshot — the provider needs both to render a waveform.
-    let _ = resolve_pinned_codec_snapshot()?;
     Ok(dir)
-}
-
-/// Materialize the pinned MOSS-Audio-Tokenizer codec snapshot (`config.json` + the sharded
-/// `model*.safetensors` + its index) at [`CODEC_HUB_REVISION`] through the audio lane's F-029 hub
-/// path, returning its snapshot directory. `MOSS_AUDIO_TOKENIZER_SNAPSHOT` overrides with a local
-/// dir (for the real-weight test / air-gapped runs).
-pub fn resolve_pinned_codec_snapshot() -> AudioResult<PathBuf> {
-    if let Ok(dir) = std::env::var("MOSS_AUDIO_TOKENIZER_SNAPSHOT") {
-        return Ok(PathBuf::from(dir));
-    }
-    let dir = pinned_snapshot_dir(CODEC_HUB_REPO, CODEC_HUB_REVISION, "config.json")?;
-    for file in CODEC_WEIGHT_FILES {
-        hf_get_pinned(CODEC_HUB_REPO, CODEC_HUB_REVISION, file)?;
-    }
-    match dir {
-        WeightsSource::Dir(p) => Ok(p),
-        other => Err(candle_audio::AudioError::Msg(format!(
-            "{MODEL_ID}: expected a codec snapshot dir, got {other:?}"
-        ))),
-    }
 }
 
 #[cfg(test)]
@@ -520,6 +534,16 @@ mod tests {
             audio: Some(audio),
             ..Default::default()
         }
+    }
+
+    /// A `LoadSpec` with the required `codec` component staged as a directory (a placeholder path —
+    /// the codec is built lazily, so `load` never touches it). Every load in these weightless tests
+    /// goes through here so the sc-13662 component gate is satisfied.
+    fn spec_with_codec(dir: PathBuf) -> LoadSpec {
+        LoadSpec::new(WeightsSource::Dir(dir)).with_component(
+            CODEC_COMPONENT_ID,
+            WeightsSource::Dir(PathBuf::from("/nonexistent/moss-audio-tokenizer")),
+        )
     }
 
     #[test]
@@ -626,16 +650,33 @@ mod tests {
         let dir = std::env::temp_dir();
         let spec = LoadSpec::new(WeightsSource::File(dir.join("x.safetensors")));
         assert!(load(&spec).is_err());
-        let mut spec = LoadSpec::new(WeightsSource::Dir(dir.clone()));
+        let mut spec = spec_with_codec(dir.clone());
         spec.quantize = Some(gen_core::Quant::Q4);
         assert!(matches!(load(&spec), Err(gen_core::Error::Unsupported(_))));
+    }
+
+    /// Weights-free proof of the sc-13662 load-time codec gate: a fully-provisioned spec loads, but
+    /// removing the required `codec` component (or adding an unknown one) fails at LOAD — the codec is
+    /// never fetched mid-render (epic 13657). Driven through the real `load` by the shared testkit.
+    #[test]
+    fn missing_codec_component_fails_at_load() {
+        let dir = std::env::temp_dir().join("moss-tts-rt-load-gate");
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = spec_with_codec(dir);
+        // The fully-provisioned spec loads (the codec is lazy — no directory read yet).
+        assert!(
+            load(&base).is_ok(),
+            "a spec staging the required codec component must load"
+        );
+        gen_core_testkit::check_component_load_gate(load, &base, &[CODEC_COMPONENT_ID])
+            .expect("missing / unknown codec component must be a load-time error");
     }
 
     #[test]
     fn pre_tripped_cancel_returns_typed_canceled_before_any_heavy_work() {
         let dir = std::env::temp_dir().join("moss-tts-rt-missing-snapshot");
         std::fs::create_dir_all(&dir).unwrap();
-        let g = load_generator(&LoadSpec::new(WeightsSource::Dir(dir))).unwrap();
+        let g = load_generator(&spec_with_codec(dir)).unwrap();
         let flag = CancelFlag::new();
         flag.cancel();
         let req = GenerationRequest {

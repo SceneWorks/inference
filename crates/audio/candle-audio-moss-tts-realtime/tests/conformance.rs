@@ -28,10 +28,12 @@
 //! cargo test --locked -p candle-audio-moss-tts-realtime --test conformance -- --ignored --nocapture
 //! ```
 //! Set `MOSS_TTS_REALTIME_SNAPSHOT` to the AR snapshot dir (holding `config.json`,
-//! `model.safetensors`, `tokenizer.json`) and `MOSS_AUDIO_TOKENIZER_SNAPSHOT` to the codec snapshot
-//! dir (`config.json` + `model*.safetensors`), or leave unset to resolve the pinned snapshots via
-//! the hub (~4.66 GB AR + ~7.1 GB codec). The demo WAV path is `MOSS_TTS_REALTIME_WAV_OUT` (default
-//! temp dir). The fidelity gate additionally uses `whisper_base` (`WHISPER_SNAPSHOT`, or the pinned
+//! `model.safetensors`, `tokenizer.json`), or leave unset to resolve the pinned AR snapshot via the
+//! hub (~4.66 GB). The MOSS-Audio-Tokenizer codec (~7.1 GB) is a passed-in component (sc-13662, epic
+//! 13657): it is **required** from `MOSS_AUDIO_TOKENIZER_SNAPSHOT` (the codec snapshot dir,
+//! `config.json` + `model*.safetensors`) — the provider no longer self-fetches it, so this must
+//! point at a materialized snapshot. The demo WAV path is `MOSS_TTS_REALTIME_WAV_OUT` (default temp
+//! dir). The fidelity gate additionally uses `whisper_base` (`WHISPER_SNAPSHOT`, or the pinned
 //! ~150 MB snapshot resolved via the hub).
 
 use std::path::PathBuf;
@@ -57,9 +59,29 @@ fn snapshot() -> PathBuf {
     }
 }
 
+/// The MOSS-Audio-Tokenizer codec snapshot directory, staged as the passed-in `codec` component
+/// (sc-13662, epic 13657). Resolved from `MOSS_AUDIO_TOKENIZER_SNAPSHOT`. Required: the provider no
+/// longer self-fetches the codec, so the real-weight harness must point at a materialized snapshot.
+fn codec_dir() -> PathBuf {
+    PathBuf::from(std::env::var("MOSS_AUDIO_TOKENIZER_SNAPSHOT").expect(
+        "set MOSS_AUDIO_TOKENIZER_SNAPSHOT to the MOSS-Audio-Tokenizer codec snapshot dir (the codec \
+         is now a passed-in component, sc-13662)",
+    ))
+}
+
+/// The codec staged as a `codec` component source (a snapshot directory).
+fn codec_component() -> WeightsSource {
+    WeightsSource::Dir(codec_dir())
+}
+
+/// A `LoadSpec` for the AR snapshot with the required `codec` component staged (sc-13662).
+fn spec() -> LoadSpec {
+    LoadSpec::new(WeightsSource::Dir(snapshot()))
+        .with_component(moss::CODEC_COMPONENT_ID, codec_component())
+}
+
 fn load() -> moss::model::MossTtsRealtimeGenerator {
-    let spec = LoadSpec::new(WeightsSource::Dir(snapshot()));
-    moss::load_generator(&spec).expect("load the MOSS-TTS-Realtime generator")
+    moss::load_generator(&spec()).expect("load the MOSS-TTS-Realtime generator")
 }
 
 /// A fixed, short TTS request (a small frame budget keeps the CPU AR run tractable).
@@ -194,7 +216,7 @@ fn moss_tts_realtime_is_incremental() {
 fn moss_tts_realtime_streaming_gate() {
     // ~1.6 s at 12.5 fps ≈ 20 frames — enough for several stream chunks while staying CPU-tractable.
     let seconds = 1.6f32;
-    let spec = LoadSpec::new(WeightsSource::Dir(snapshot()));
+    let spec = spec();
     let registry = moss::provider_registry().expect("build the moss_tts_realtime registry");
     let generator = registry
         .load(moss::MODEL_ID, &spec)
@@ -335,7 +357,7 @@ fn moss_tts_realtime_streaming_gate() {
 #[ignore = "real weights: needs the ~7.1 GB codec snapshot; run with --ignored"]
 fn codec_only_decodes_synthetic_frames() {
     use candle_audio_moss_tts_realtime::codec::MossAudioCodec;
-    let dir = moss::resolve_pinned_codec_snapshot().expect("resolve codec snapshot");
+    let dir = codec_dir();
     let codec = MossAudioCodec::load(&dir, 16).expect("load codec decoder");
 
     // Either the real dumped AR frames (MOSS_TTS_REALTIME_FRAMES_OUT) or 25 frames of pseudo-random

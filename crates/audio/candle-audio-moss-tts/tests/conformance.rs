@@ -26,9 +26,11 @@
 //! ```
 //! Set `MOSS_TTSD_SNAPSHOT` to the AR snapshot dir (`config.json`, `model.safetensors`,
 //! `tokenizer.json`), or leave unset to resolve the pinned snapshot via the hub (~4.1 GB). The
-//! XY_Tokenizer codec (~2.1 GB) resolves via the hub or `MOSS_XY_TOKENIZER_SNAPSHOT`; the
-//! `chatterbox_ve` weights via the hub or `CHATTERBOX_VE_SNAPSHOT`. Optionally dump the raw frames
-//! with `MOSS_TTSD_FRAMES_OUT` and a demo WAV with `MOSS_TTSD_WAV_OUT`.
+//! XY_Tokenizer codec (~2.1 GB) is a passed-in component (sc-13662, epic 13657): it is **required**
+//! from `MOSS_XY_TOKENIZER_SNAPSHOT` (a snapshot dir holding `xy_tokenizer.ckpt`, or a direct
+//! `.ckpt` file) — the provider no longer self-fetches it, so this must point at a materialized
+//! checkpoint. The `chatterbox_ve` weights resolve via the hub or `CHATTERBOX_VE_SNAPSHOT`.
+//! Optionally dump the raw frames with `MOSS_TTSD_FRAMES_OUT` and a demo WAV with `MOSS_TTSD_WAV_OUT`.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -52,8 +54,34 @@ fn snapshot() -> PathBuf {
     }
 }
 
+/// The XY_Tokenizer codec, staged as the passed-in `codec` component (sc-13662, epic 13657).
+/// Resolved from `MOSS_XY_TOKENIZER_SNAPSHOT` — a snapshot dir holding `xy_tokenizer.ckpt`, or a
+/// direct `.ckpt` file. Required: the provider no longer self-fetches the codec, so the real-weight
+/// harness must point at a materialized checkpoint.
+fn codec_component() -> WeightsSource {
+    let p = PathBuf::from(std::env::var("MOSS_XY_TOKENIZER_SNAPSHOT").expect(
+        "set MOSS_XY_TOKENIZER_SNAPSHOT to the XY_Tokenizer codec snapshot dir or xy_tokenizer.ckpt \
+         file (the codec is now a passed-in component, sc-13662)",
+    ));
+    if p.is_dir() {
+        WeightsSource::Dir(p)
+    } else {
+        WeightsSource::File(p)
+    }
+}
+
+/// The resolved XY_Tokenizer `.ckpt` file path (a dir joins the checkpoint filename; a file is used
+/// verbatim) — for the codec-only parity harness that loads the codec directly.
+fn codec_checkpoint() -> PathBuf {
+    match codec_component() {
+        WeightsSource::Dir(p) => p.join(moss::CODEC_CHECKPOINT_FILE),
+        WeightsSource::File(p) => p,
+    }
+}
+
 fn load() -> moss::model::MossTtsdGenerator {
-    let spec = LoadSpec::new(WeightsSource::Dir(snapshot()));
+    let spec = LoadSpec::new(WeightsSource::Dir(snapshot()))
+        .with_component(moss::CODEC_COMPONENT_ID, codec_component());
     moss::load_generator(&spec).expect("load the MOSS-TTSD generator")
 }
 
@@ -400,7 +428,7 @@ fn codec_decode_frames_from_file() {
         })
         .collect();
     eprintln!("decoding {} frames through the candle codec", frames.len());
-    let ckpt = moss::resolve_pinned_codec_checkpoint().expect("resolve XY_Tokenizer checkpoint");
+    let ckpt = codec_checkpoint();
     let codec = moss::codec::XyTokenizerCodec::load(&ckpt).expect("load codec");
     let wav = codec
         .decode_frames(&frames, &|| false)
