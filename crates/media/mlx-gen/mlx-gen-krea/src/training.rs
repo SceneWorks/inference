@@ -1155,20 +1155,27 @@ mod real_weight_repro {
     use super::*;
     use std::path::PathBuf;
 
-    /// The base `krea/Krea-2-Raw` snapshot (the `KREA_RAW_DIR` override, else the newest HF-cache
-    /// snapshot with a `transformer/` tree).
+    /// The base `krea/Krea-2-Raw` snapshot root from the required `KREA_RAW_DIR` env var. sc-13668:
+    /// there is no implicit default — the source snapshot path must be passed in explicitly.
     fn snapshot() -> Option<PathBuf> {
-        if let Ok(p) = std::env::var("KREA_RAW_DIR") {
-            return Some(PathBuf::from(p));
+        std::env::var("KREA_RAW_DIR").ok().map(PathBuf::from)
+    }
+
+    #[test]
+    fn source_root_requires_explicit_env_no_default() {
+        let key = "KREA_RAW_DIR";
+        let saved = std::env::var(key).ok();
+        std::env::remove_var(key);
+        assert!(
+            snapshot().is_none(),
+            "the source snapshot root must come from {key}: sc-13668 removed the implicit default"
+        );
+        std::env::set_var(key, "/sentinel/krea");
+        assert_eq!(snapshot(), Some(PathBuf::from("/sentinel/krea")));
+        match saved {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
         }
-        let home = std::env::var("HOME").ok()?;
-        let snaps =
-            PathBuf::from(home).join(".cache/huggingface/hub/models--krea--Krea-2-Raw/snapshots");
-        std::fs::read_dir(&snaps)
-            .ok()?
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .find(|p| p.is_dir() && p.join("transformer").is_dir())
     }
 
     /// Per-block LOCAL LoRA target paths (mirrors `train_impl`), for driving the checkpointed path.
@@ -1205,7 +1212,7 @@ mod real_weight_repro {
     #[test]
     #[ignore = "needs real krea/Krea-2-Raw weights; run as its own process"]
     fn default_targets_resolve_to_block_attention() {
-        let root = snapshot().expect("krea/Krea-2-Raw snapshot (HF cache or KREA_RAW_DIR)");
+        let root = snapshot().expect("set KREA_RAW_DIR to the krea/Krea-2-Raw snapshot root");
         let dit = load_transformer(&root).unwrap();
         let cfg = TrainingConfig::default();
         let paths = resolve_target_paths(&dit, &cfg);
@@ -1223,7 +1230,7 @@ mod real_weight_repro {
     #[test]
     #[ignore = "needs real krea/Krea-2-Raw weights; run as its own process"]
     fn checkpointed_grads_match_dense() {
-        let root = snapshot().expect("krea/Krea-2-Raw snapshot (HF cache or KREA_RAW_DIR)");
+        let root = snapshot().expect("set KREA_RAW_DIR to the krea/Krea-2-Raw snapshot root");
         let mut dit = load_transformer(&root).unwrap();
         dit.cast_weights(Dtype::Float32).unwrap(); // f32 → clean parity, no bf16 noise
         let cfg = TrainingConfig {

@@ -983,21 +983,29 @@ mod first_step_repro {
     use mlx_rs::memory::{clear_cache, get_active_memory, get_peak_memory, reset_peak_memory};
     use std::path::PathBuf;
 
-    /// The base Lens snapshot (the `LENS_SNAPSHOT` override, else the newest HF-cache snapshot
-    /// with a `transformer/` tree). The cache lookup targets `SceneWorks/Lens` — the flat-diffusers
-    /// training-base rehost (sc-8797); Microsoft pulled the original `microsoft/Lens` repo.
+    /// The base Lens snapshot root from the required `LENS_SNAPSHOT` env var. sc-13668: there is no
+    /// implicit default — the source snapshot path must be passed in explicitly. The base is the
+    /// `SceneWorks/Lens` flat-diffusers training rehost (sc-8797); Microsoft pulled the original
+    /// `microsoft/Lens` repo.
     fn snapshot() -> Option<PathBuf> {
-        if let Ok(p) = std::env::var("LENS_SNAPSHOT") {
-            return Some(PathBuf::from(p));
+        std::env::var("LENS_SNAPSHOT").ok().map(PathBuf::from)
+    }
+
+    #[test]
+    fn source_root_requires_explicit_env_no_default() {
+        let key = "LENS_SNAPSHOT";
+        let saved = std::env::var(key).ok();
+        std::env::remove_var(key);
+        assert!(
+            snapshot().is_none(),
+            "the source snapshot root must come from {key}: sc-13668 removed the implicit default"
+        );
+        std::env::set_var(key, "/sentinel/lens");
+        assert_eq!(snapshot(), Some(PathBuf::from("/sentinel/lens")));
+        match saved {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
         }
-        let home = std::env::var("HOME").ok()?;
-        let snaps =
-            PathBuf::from(home).join(".cache/huggingface/hub/models--SceneWorks--Lens/snapshots");
-        std::fs::read_dir(&snaps)
-            .ok()?
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .find(|p| p.is_dir() && p.join("transformer").is_dir())
     }
 
     fn gb(bytes: usize) -> f64 {
@@ -1007,7 +1015,7 @@ mod first_step_repro {
     /// Load just the Lens DiT at `dtype` (the only component whose activations drive the first-step
     /// working set; the encoder is freed before the train loop and the VAE is idle).
     fn build_dit(dtype: Dtype) -> LensTransformer {
-        let root = snapshot().expect("SceneWorks/Lens snapshot (HF cache or LENS_SNAPSHOT)");
+        let root = snapshot().expect("set LENS_SNAPSHOT to the SceneWorks/Lens snapshot root");
         let w = Weights::from_dir(root.join("transformer")).unwrap();
         LensTransformer::from_weights(&w, &LensDitConfig::lens(), dtype).unwrap()
     }

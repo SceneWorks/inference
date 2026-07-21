@@ -373,20 +373,27 @@ mod first_step_repro {
 
     use crate::pipeline::encode_init_latents;
 
-    /// Resolve an SDXL diffusers snapshot (env `SDXL_SNAPSHOT`, else the HF cache).
+    /// Resolve the SDXL diffusers snapshot root from the required `SDXL_SNAPSHOT` env var. sc-13668:
+    /// there is no implicit default — the source snapshot path must be passed in explicitly.
     fn snapshot() -> Option<PathBuf> {
-        if let Ok(p) = std::env::var("SDXL_SNAPSHOT") {
-            return Some(PathBuf::from(p));
-        }
-        let home = std::env::var("HOME").ok()?;
-        let snaps = PathBuf::from(home).join(
-            ".cache/huggingface/hub/models--stabilityai--stable-diffusion-xl-base-1.0/snapshots",
+        std::env::var("SDXL_SNAPSHOT").ok().map(PathBuf::from)
+    }
+
+    #[test]
+    fn source_root_requires_explicit_env_no_default() {
+        let key = "SDXL_SNAPSHOT";
+        let saved = std::env::var(key).ok();
+        std::env::remove_var(key);
+        assert!(
+            snapshot().is_none(),
+            "the source snapshot root must come from {key}: sc-13668 removed the implicit default"
         );
-        std::fs::read_dir(&snaps)
-            .ok()?
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .find(|p| p.is_dir() && p.join("unet").is_dir())
+        std::env::set_var(key, "/sentinel/sdxl");
+        assert_eq!(snapshot(), Some(PathBuf::from("/sentinel/sdxl")));
+        match saved {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
     }
 
     /// A solid-colour `edge`×`edge` RGB source image (latent magnitude is irrelevant; the graph
@@ -472,7 +479,8 @@ mod first_step_repro {
     }
 
     fn build_trainer_and_adapter() -> (SdxlTrainer, TrainAdapter, LoraParams, Array, Array) {
-        let root = snapshot().expect("SDXL snapshot (HF cache or SDXL_SNAPSHOT)");
+        let root = snapshot()
+            .expect("set SDXL_SNAPSHOT to the stable-diffusion-xl-base-1.0 snapshot root");
         let mut trainer = SdxlTrainer {
             descriptor: trainer_descriptor(),
             vae: crate::loader::load_vae(&root).unwrap(),
