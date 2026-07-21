@@ -28,11 +28,11 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use candle_gen::gen_core::runtime::CancelFlag;
-use candle_gen::gen_core::{Image, Progress, WeightsSource};
+use candle_gen::gen_core::{Image, LoadSpec, Progress, WeightsSource};
 use candle_gen::testkit::{cosine, env_path, read_ppm, write_ppm};
 use candle_gen::CandleError;
 
-use crate::model::{InstantId, InstantIdPaths, InstantIdRequest};
+use crate::model::{InstantId, InstantIdPaths, InstantIdRequest, SdxlComponents};
 use crate::openpose::BodyPoint;
 
 /// An optional env path.
@@ -102,15 +102,29 @@ fn real_weight_instantid() {
     let out_dir = env_path("IID_OUT");
     std::fs::create_dir_all(&out_dir).unwrap();
 
+    // epic 13657 (sc-13739): the SDXL tokenizers + fp16-fix VAE are passed-in components, staged on a
+    // LoadSpec via `with_component` (the env-pointed local dirs) and gated by `SdxlComponents::from_spec`
+    // — a test-side explicit-path stage, never a production env read.
+    let sdxl_spec = LoadSpec::new(WeightsSource::Dir(env_path("IID_SDXL_BASE")))
+        .with_component(
+            "tokenizer_clip_l",
+            WeightsSource::Dir(env_path("IID_TOKENIZER_CLIP_L")),
+        )
+        .with_component(
+            "tokenizer_clip_bigg",
+            WeightsSource::Dir(env_path("IID_TOKENIZER_CLIP_BIGG")),
+        )
+        .with_component(
+            "vae_fp16_fix",
+            WeightsSource::Dir(env_path("IID_VAE_FP16_FIX")),
+        );
     let paths = InstantIdPaths {
         sdxl_base: env_path("IID_SDXL_BASE"),
         identitynet: WeightsSource::Dir(env_path("IID_IDENTITYNET")),
         ip_adapter: env_path("IID_IP_ADAPTER"),
         adapters: Vec::new(),
-        // epic 13657 / sc-13663: the SDXL tokenizers + fp16-fix VAE are now passed-in components.
-        tokenizer_clip_l: WeightsSource::Dir(env_path("IID_TOKENIZER_CLIP_L")),
-        tokenizer_clip_bigg: WeightsSource::Dir(env_path("IID_TOKENIZER_CLIP_BIGG")),
-        vae_fp16_fix: WeightsSource::Dir(env_path("IID_VAE_FP16_FIX")),
+        sdxl: SdxlComponents::from_spec(&sdxl_spec)
+            .expect("stage SDXL components (IID_TOKENIZER_CLIP_L / _BIGG, IID_VAE_FP16_FIX)"),
     };
 
     eprintln!("loading InstantId (RealVisXL + IdentityNet + IP-Adapter + VAE) ...");

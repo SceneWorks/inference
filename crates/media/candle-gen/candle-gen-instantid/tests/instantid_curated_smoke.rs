@@ -27,9 +27,11 @@
 
 use std::path::Path;
 
-use candle_gen::gen_core::{Image, WeightsSource};
+use candle_gen::gen_core::{Image, LoadSpec, WeightsSource};
 use candle_gen::testkit::{cosine, env_path, read_ppm};
-use candle_gen_instantid::{letterbox, InstantId, InstantIdPaths, InstantIdRequest};
+use candle_gen_instantid::{
+    letterbox, InstantId, InstantIdPaths, InstantIdRequest, SdxlComponents,
+};
 
 fn env_usize(key: &str, default: usize) -> usize {
     std::env::var(key)
@@ -57,15 +59,28 @@ fn curated_samplers_preserve_identity() {
     let size = env_usize("IID_SIZE", 768) as u32;
     let steps = env_usize("IID_STEPS", 20);
 
+    // epic 13657 (sc-13739): SDXL tokenizers + fp16-fix VAE are passed-in components, staged on a
+    // LoadSpec via `with_component` (env-pointed local dirs) and gated by `SdxlComponents::from_spec`.
+    let sdxl_spec = LoadSpec::new(WeightsSource::Dir(env_path("IID_SDXL_BASE")))
+        .with_component(
+            "tokenizer_clip_l",
+            WeightsSource::Dir(env_path("IID_TOKENIZER_CLIP_L")),
+        )
+        .with_component(
+            "tokenizer_clip_bigg",
+            WeightsSource::Dir(env_path("IID_TOKENIZER_CLIP_BIGG")),
+        )
+        .with_component(
+            "vae_fp16_fix",
+            WeightsSource::Dir(env_path("IID_VAE_FP16_FIX")),
+        );
     let paths = InstantIdPaths {
         sdxl_base: env_path("IID_SDXL_BASE"),
         identitynet: WeightsSource::Dir(env_path("IID_IDENTITYNET")),
         ip_adapter: env_path("IID_IP_ADAPTER"),
         adapters: Vec::new(),
-        // epic 13657 / sc-13663: SDXL tokenizers + fp16-fix VAE are passed-in components.
-        tokenizer_clip_l: WeightsSource::Dir(env_path("IID_TOKENIZER_CLIP_L")),
-        tokenizer_clip_bigg: WeightsSource::Dir(env_path("IID_TOKENIZER_CLIP_BIGG")),
-        vae_fp16_fix: WeightsSource::Dir(env_path("IID_VAE_FP16_FIX")),
+        sdxl: SdxlComponents::from_spec(&sdxl_spec)
+            .expect("stage SDXL components (IID_TOKENIZER_CLIP_L / _BIGG, IID_VAE_FP16_FIX)"),
     };
     let mut model = InstantId::load(&paths)
         .expect("load InstantID")
