@@ -46,9 +46,8 @@ fn model_root() -> Option<PathBuf> {
             return Some(root);
         }
     }
-    let home = std::env::var("HOME").ok()?;
-    let snapshots = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--SceneWorks--mochi-1-mlx/snapshots");
+    let home = std::env::var("MLX_GEN_MODELS_ROOT").ok()?;
+    let snapshots = PathBuf::from(home).join("models--SceneWorks--mochi-1-mlx/snapshots");
     std::fs::read_dir(&snapshots)
         .ok()?
         .filter_map(|e| e.ok())

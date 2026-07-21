@@ -25,7 +25,7 @@
 //!
 //! Run:
 //! ```text
-//! Z16_VAE=~/.cache/huggingface/hub/models--SceneWorks--wan2.2-t2v-a14b-mlx/snapshots/<h>/bf16/vae.safetensors \
+//! Z16_VAE=/path/to/models--SceneWorks--wan2.2-t2v-a14b-mlx/snapshots/<h>/bf16/vae.safetensors \
 //!   cargo test -p mlx-gen-wan --test vae16_write_bound_real -- --ignored --nocapture
 //! ```
 //! (With `Z16_VAE` unset it auto-discovers the bf16 snapshot under the HF cache, else skips.)
@@ -41,9 +41,8 @@ fn discover_vae() -> Option<PathBuf> {
     if let Some(p) = std::env::var_os("Z16_VAE") {
         return Some(PathBuf::from(p));
     }
-    let home = std::env::var_os("HOME")?;
-    let base = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--SceneWorks--wan2.2-t2v-a14b-mlx/snapshots");
+    let base = PathBuf::from(std::env::var_os("MLX_GEN_MODELS_ROOT")?)
+        .join("models--SceneWorks--wan2.2-t2v-a14b-mlx/snapshots");
     let snap = std::fs::read_dir(&base).ok()?.flatten().next()?.path();
     let p = snap.join("bf16/vae.safetensors");
     p.exists().then_some(p)

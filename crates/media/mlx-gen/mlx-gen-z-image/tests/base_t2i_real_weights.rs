@@ -16,17 +16,8 @@ use std::path::PathBuf;
 /// Resolve the **base** `Tongyi-MAI/Z-Image` snapshot: the `BASE_ZIMAGE_SNAPSHOT` override if set, else
 /// the first snapshot under the HF hub cache. `None` when neither is present (skip rather than fail).
 fn base_snapshot() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("BASE_ZIMAGE_SNAPSHOT") {
-        return Some(PathBuf::from(p));
-    }
-    let home = std::env::var("HOME").ok()?;
-    let snaps =
-        PathBuf::from(home).join(".cache/huggingface/hub/models--Tongyi-MAI--Z-Image/snapshots");
-    std::fs::read_dir(&snaps)
-        .ok()?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir())
+    let p = std::env::var("BASE_ZIMAGE_SNAPSHOT").ok()?;
+    Some(PathBuf::from(p))
 }
 
 /// Render `req` through the public base generator and assert the image is the requested size and is

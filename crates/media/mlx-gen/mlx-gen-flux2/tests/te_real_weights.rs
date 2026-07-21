@@ -22,18 +22,8 @@ use mlx_rs::Dtype;
 const PROMPT: &str = "a red fox resting in fresh snow under soft winter light";
 
 fn snapshot() -> PathBuf {
-    if let Ok(p) = std::env::var("MLX_GEN_FLUX2_SNAPSHOT") {
-        return PathBuf::from(p);
-    }
-    let home = std::env::var("HOME").expect("HOME");
-    let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--black-forest-labs--FLUX.2-klein-9b/snapshots");
-    std::fs::read_dir(&snaps)
-        .expect("snapshot dir")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir())
-        .expect("a snapshot under models--black-forest-labs--FLUX.2-klein-9b/snapshots")
+    let p = std::env::var("MLX_GEN_FLUX2_SNAPSHOT").unwrap_or_else(|_| panic!("set MLX_GEN_FLUX2_SNAPSHOT to the required snapshot dir; inference never self-fetches or derives a cache location (epic 13657)"));
+    PathBuf::from(p)
 }
 
 /// The f32 fork golden (`FLUX2_TE_F32=1`) — the correctness reference (same precision as the Rust

@@ -33,7 +33,7 @@
 //!
 //! Run (one test at a time):
 //! ```text
-//! MOCHI_SNAPSHOT=~/.cache/huggingface/hub/models--genmo--mochi-1-preview/snapshots/<sha> \
+//! MOCHI_SNAPSHOT=/path/to/models--genmo--mochi-1-preview/snapshots/<sha> \
 //!   cargo test -p mlx-gen-mochi --release --test decode_memory_real_weights \
 //!   -- --ignored --nocapture --exact decode_peak_is_flat_in_clip_length
 //! ```
@@ -85,8 +85,7 @@ fn snapshot_dir() -> std::path::PathBuf {
 /// Auto-discover a Mochi snapshot whose `vae/` dir holds the AsymmVAE weights: the genmo
 /// `mochi-1-preview` cache first, then the `SceneWorks/mochi-1-mlx` mirror.
 fn discover_snapshot() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    let hub = PathBuf::from(home).join(".cache/huggingface/hub");
+    let hub = PathBuf::from(std::env::var_os("MLX_GEN_MODELS_ROOT")?);
     for repo in [
         "models--genmo--mochi-1-preview",
         "models--SceneWorks--mochi-1-mlx",

@@ -182,7 +182,7 @@ fn character_error_rate(reference: &str, hypothesis: &str) -> f32 {
 /// The sc-12839 release gate: the real converter shifts a source clip's timbre toward a target
 /// voice while preserving its content/duration.
 #[test]
-#[ignore = "real weights: needs OpenVoiceV2 converter + Kokoro + chatterbox_ve snapshots (or network); run with --ignored"]
+#[ignore = "real weights: needs OpenVoiceV2 converter + Kokoro + chatterbox_ve snapshots; run with --ignored"]
 fn openvoice_v2_converts_toward_the_target_voice() {
     let converter = load_converter();
 
@@ -298,7 +298,7 @@ fn openvoice_v2_converts_toward_the_target_voice() {
 
 /// Determinism: same request + seed ⇒ byte-identical converted samples.
 #[test]
-#[ignore = "real weights: needs OpenVoiceV2 converter + Kokoro snapshots (or network); run with --ignored"]
+#[ignore = "real weights: needs OpenVoiceV2 converter + Kokoro snapshots; run with --ignored"]
 fn openvoice_v2_is_deterministic() {
     let converter = load_converter();
     let source = kokoro_clip("A short deterministic check of the converter.", "af_heart");

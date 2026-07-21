@@ -13,8 +13,8 @@
 //! Needs BOTH snapshots (`KREA_TURBO_DIR` may be the Q8 turnkey `…/krea-2-turbo-mlx/snapshots/<rev>/q8`):
 //!
 //! ```sh
-//! KREA_RAW_DIR=~/.cache/huggingface/hub/models--krea--Krea-2-Raw/snapshots/<rev> \
-//! KREA_TURBO_DIR=~/.cache/huggingface/hub/models--krea--Krea-2-Turbo/snapshots/<rev> \
+//! KREA_RAW_DIR=/path/to/models--krea--Krea-2-Raw/snapshots/<rev> \
+//! KREA_TURBO_DIR=/path/to/models--krea--Krea-2-Turbo/snapshots/<rev> \
 //!   cargo test -p mlx-gen-krea --release --test apply_real_weights -- --ignored --nocapture
 //! ```
 
@@ -34,11 +34,8 @@ fn snapshot(env: &str, repo_dir: &str) -> Option<PathBuf> {
     if let Ok(p) = std::env::var(env) {
         return Some(PathBuf::from(p));
     }
-    let home = std::env::var("HOME").ok()?;
-    let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub")
-        .join(repo_dir)
-        .join("snapshots");
+    let home = std::env::var("MLX_GEN_MODELS_ROOT").ok()?;
+    let snaps = PathBuf::from(home).join(repo_dir).join("snapshots");
     std::fs::read_dir(&snaps)
         .ok()?
         .filter_map(|e| e.ok())

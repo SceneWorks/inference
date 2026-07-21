@@ -26,18 +26,8 @@ use std::path::PathBuf;
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 
 fn snapshot() -> PathBuf {
-    if let Ok(p) = std::env::var("QWEN_IMAGE_SNAPSHOT") {
-        return PathBuf::from(p);
-    }
-    let home = std::env::var("HOME").unwrap();
-    let snaps =
-        PathBuf::from(home).join(".cache/huggingface/hub/models--Qwen--Qwen-Image/snapshots");
-    std::fs::read_dir(&snaps)
-        .expect("HF cache snapshots dir")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir())
-        .expect("a snapshot dir")
+    let p = std::env::var("QWEN_IMAGE_SNAPSHOT").unwrap_or_else(|_| panic!("set QWEN_IMAGE_SNAPSHOT to the required snapshot dir; inference never self-fetches or derives a cache location (epic 13657)"));
+    PathBuf::from(p)
 }
 
 fn env_u32(key: &str, default: u32) -> u32 {
@@ -158,11 +148,8 @@ fn sequential_repeat_job_stays_bounded() {
 /// Resolve a SceneWorks q8 re-host tier in the HF cache: the first snapshot dir, then its `q8/` tier
 /// subdir if present (the turnkeys nest tiers), else the snapshot root (a flat component layout).
 fn tier_snapshot(repo: &str) -> PathBuf {
-    let home = std::env::var("HOME").unwrap();
-    let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub")
-        .join(repo)
-        .join("snapshots");
+    let home = std::env::var("MLX_GEN_MODELS_ROOT").expect("set MLX_GEN_MODELS_ROOT to the explicit models root (holds models--*/snapshots); inference never self-fetches or derives a cache location (epic 13657)");
+    let snaps = PathBuf::from(home).join(repo).join("snapshots");
     let snap = std::fs::read_dir(&snaps)
         .unwrap_or_else(|_| panic!("HF cache snapshots dir for {repo}"))
         .filter_map(|e| e.ok())

@@ -76,8 +76,8 @@ fn qwenimage_loads_and_runs() {
 fn gemma_path() -> String {
     std::env::var("PID_GEMMA_SAFETENSORS").unwrap_or_else(|_| {
         format!(
-            "{}/.cache/huggingface/hub/models--Efficient-Large-Model--gemma-2-2b-it/snapshots",
-            std::env::var("HOME").unwrap()
+            "{}/models--Efficient-Large-Model--gemma-2-2b-it/snapshots",
+            std::env::var("MLX_GEN_MODELS_ROOT").expect("set MLX_GEN_MODELS_ROOT to the explicit models root (holds models--*/snapshots); inference never self-fetches or derives a cache location (epic 13657)")
         )
     })
 }

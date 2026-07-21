@@ -2,7 +2,7 @@
 //! `numz/SeedVR2_comfyUI` checkpoint dir (exercising the native converter + load path on real
 //! weights), then: (a) the bundled neg-embed matches the reference; (b) the full model path matches
 //! the golden `decoded`; (c) `generate` runs end-to-end on an image and returns the right size.
-//! Needs the HF cache + e2e golden; skips otherwise.
+//! Needs the models root (`MLX_GEN_MODELS_ROOT`) + e2e golden; skips otherwise.
 
 use mlx_gen::weights::Weights;
 use mlx_gen::Image;
@@ -20,8 +20,8 @@ fn golden_dir() -> std::path::PathBuf {
 }
 
 fn raw_dir() -> Option<std::path::PathBuf> {
-    let base = std::path::Path::new(&std::env::var("HOME").unwrap())
-        .join(".cache/huggingface/hub/models--numz--SeedVR2_comfyUI/snapshots");
+    let base = std::path::Path::new(&std::env::var("MLX_GEN_MODELS_ROOT").ok()?)
+        .join("models--numz--SeedVR2_comfyUI/snapshots");
     let snap = std::fs::read_dir(&base).ok()?.flatten().next()?.path();
     snap.join("seedvr2_ema_3b_fp16.safetensors")
         .exists()

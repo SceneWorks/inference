@@ -28,8 +28,8 @@ const GOLDEN_Q8: &str = concat!(
 );
 
 fn newest_snapshot(repo_dir: &str) -> std::path::PathBuf {
-    let base = std::path::PathBuf::from(std::env::var("HOME").unwrap())
-        .join(format!(".cache/huggingface/hub/{repo_dir}/snapshots"));
+    let base = std::path::PathBuf::from(std::env::var("MLX_GEN_MODELS_ROOT").expect("set MLX_GEN_MODELS_ROOT to the explicit models root (holds models--*/snapshots); inference never self-fetches or derives a cache location (epic 13657)"))
+        .join(format!("{repo_dir}/snapshots"));
     std::fs::read_dir(&base)
         .unwrap_or_else(|_| panic!("snapshot dir {}", base.display()))
         .filter_map(|e| e.ok())

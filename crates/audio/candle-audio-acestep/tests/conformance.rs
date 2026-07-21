@@ -34,7 +34,7 @@ fn snapshot() -> WeightsSource {
 /// mid-run and pre-generate cancellation, seed determinism) against the real provider, resolved
 /// through the explicit registry.
 #[test]
-#[ignore = "real weights: needs an ACE-Step snapshot (ACESTEP_SNAPSHOT or network); run with --ignored"]
+#[ignore = "real weights: needs an ACE-Step snapshot (ACESTEP_SNAPSHOT); run with --ignored"]
 fn acestep_conformance() {
     let spec = LoadSpec::new(snapshot());
     let profile = gen_core_testkit::Profile {
@@ -70,7 +70,7 @@ fn acestep_conformance() {
 ///   periodic peak in a musical tempo band (catches arrhythmic drones/noise);
 /// - **byte-identical re-synthesis** — the seed law.
 #[test]
-#[ignore = "real weights: needs an ACE-Step snapshot (ACESTEP_SNAPSHOT or network); run with --ignored"]
+#[ignore = "real weights: needs an ACE-Step snapshot (ACESTEP_SNAPSHOT); run with --ignored"]
 fn acestep_music_wav_conformance() {
     let spec = LoadSpec::new(snapshot());
     let registry = candle_audio_acestep::provider_registry().unwrap();
@@ -368,7 +368,7 @@ fn corr(a: &[f32], b: &[f32]) -> f32 {
 /// The source + edited WAVs are written for human listening (`ACESTEP_EDIT_SOURCE_WAV` /
 /// `ACESTEP_EDIT_RESULT_WAV` override the paths).
 #[test]
-#[ignore = "real weights: needs an ACE-Step snapshot (ACESTEP_SNAPSHOT or network); run with --ignored"]
+#[ignore = "real weights: needs an ACE-Step snapshot (ACESTEP_SNAPSHOT); run with --ignored"]
 fn acestep_edit_repaint_wav_conformance() {
     let spec = LoadSpec::new(snapshot());
     let registry = candle_audio_acestep::provider_registry().unwrap();
@@ -703,7 +703,7 @@ fn chroma_corr(a: &[f64; 12], b: &[f64; 12]) -> f64 {
 /// The four WAVs are written for human listening (`ACESTEP_COVER_*_WAV` override the paths). Sources
 /// are generated on the fast turbo DiT; only the two covers run on the slower non-distilled sft DiT.
 #[test]
-#[ignore = "real weights: needs an ACE-Step snapshot (ACESTEP_SNAPSHOT / ACESTEP_SFT_SNAPSHOT or network); run with --ignored"]
+#[ignore = "real weights: needs an ACE-Step snapshot (ACESTEP_SNAPSHOT / ACESTEP_SFT_SNAPSHOT); run with --ignored"]
 fn acestep_cover_wav_conformance() {
     let spec = LoadSpec::new(snapshot());
     let registry = candle_audio_acestep::provider_registry().unwrap();

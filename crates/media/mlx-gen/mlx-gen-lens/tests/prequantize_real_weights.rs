@@ -23,17 +23,8 @@ use std::path::PathBuf;
 
 /// Resolve the source snapshot: `SC8763_SRC`, else the first cached Lens-Turbo snapshot.
 fn lens_snapshot() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("SC8763_SRC") {
-        return Some(PathBuf::from(p));
-    }
-    let home = std::env::var("HOME").ok()?;
-    let snaps =
-        PathBuf::from(home).join(".cache/huggingface/hub/models--microsoft--Lens-Turbo/snapshots");
-    std::fs::read_dir(&snaps)
-        .ok()?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir())
+    let p = std::env::var("SC8763_SRC").ok()?;
+    Some(PathBuf::from(p))
 }
 
 fn model_id() -> String {

@@ -211,7 +211,7 @@ fn rejects_wrong_buffer_size() {
 /// `depth-anything/Depth-Anything-V2-Small-hf` snapshot dir (containing `model.safetensors`).
 ///
 /// ```bash
-/// DEPTH_ANYTHING_V2_DIR=$HOME/.cache/huggingface/hub/models--depth-anything--Depth-Anything-V2-Small-hf/snapshots/<rev> \
+/// DEPTH_ANYTHING_V2_DIR=/path/to/models--depth-anything--Depth-Anything-V2-Small-hf/snapshots/<rev> \
 ///   cargo test -p mlx-gen-depth --test depth_shapes -- --ignored real_weight_smoke
 /// ```
 #[test]

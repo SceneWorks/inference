@@ -16,19 +16,8 @@ use mlx_gen::weights::Weights;
 use mlx_gen_kolors::chatglm3::{ChatGlmConfig, ChatGlmModel};
 
 fn te_dir() -> std::path::PathBuf {
-    if let Ok(d) = std::env::var("KOLORS_TE_DIR") {
-        return d.into();
-    }
-    let base = std::path::PathBuf::from(std::env::var("HOME").unwrap())
-        .join(".cache/huggingface/hub/models--Kwai-Kolors--Kolors-diffusers/snapshots");
-    let snap = std::fs::read_dir(&base)
-        .unwrap_or_else(|_| panic!("snapshot dir {}", base.display()))
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.is_dir())
-        .max()
-        .expect("a snapshot");
-    snap.join("text_encoder")
+    let d = std::env::var("KOLORS_TE_DIR").unwrap_or_else(|_| panic!("set KOLORS_TE_DIR to the required snapshot dir; inference never self-fetches or derives a cache location (epic 13657)"));
+    d.into()
 }
 
 const GOLDEN: &str = concat!(

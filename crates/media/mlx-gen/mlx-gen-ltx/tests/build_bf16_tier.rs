@@ -8,7 +8,7 @@
 //! `ensure_ltx_upscaler_cached` fetches exactly that), matching the hosted q4/q8 `upsampler.safetensors`.
 //!
 //! Run:
-//!   LTX_BF16_SRC=~/.cache/huggingface/.../ltx-2.3-22b-distilled-1.1.safetensors \
+//!   LTX_BF16_SRC=/path/to/.../ltx-2.3-22b-distilled-1.1.safetensors \
 //!   LTX_BF16_UPSCALER_DIR=~/ltx-bf16-staging/upscaler \
 //!   LTX_BF16_OUT=~/ltx-bf16-staging/out/bf16 \
 //!   cargo test -p mlx-gen-ltx --test build_bf16_tier -- --ignored --nocapture

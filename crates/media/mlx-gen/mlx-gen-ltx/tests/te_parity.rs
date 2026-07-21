@@ -21,18 +21,8 @@ const GOLDEN: &str = concat!(
 );
 
 fn gemma_dir() -> std::path::PathBuf {
-    if let Ok(d) = std::env::var("LTX_GEMMA_DIR") {
-        return d.into();
-    }
-    let base = std::path::PathBuf::from(std::env::var("HOME").unwrap())
-        .join(".cache/huggingface/hub/models--mlx-community--gemma-3-12b-it-bf16/snapshots");
-    std::fs::read_dir(&base)
-        .expect("gemma snapshot dir")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.is_dir())
-        .max()
-        .expect("a gemma snapshot")
+    let d = std::env::var("LTX_GEMMA_DIR").unwrap_or_else(|_| panic!("set LTX_GEMMA_DIR to the required snapshot dir; inference never self-fetches or derives a cache location (epic 13657)"));
+    d.into()
 }
 
 fn base_dir() -> std::path::PathBuf {

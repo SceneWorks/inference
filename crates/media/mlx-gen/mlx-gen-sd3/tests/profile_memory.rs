@@ -31,8 +31,8 @@
 //! cargo test -p mlx-gen-sd3 --release --test profile_memory --no-run
 //! # 2) Resolve the binary and run it DIRECTLY under /usr/bin/time -l.
 //! BIN=$(ls -t target/release/deps/profile_memory-* | grep -v '\.d$' | head -1)
-//! SD3_LARGE_SNAPSHOT=~/.cache/huggingface/hub/models--stabilityai--stable-diffusion-3.5-large/snapshots/<rev> \
-//! SD3_TURBO_SNAPSHOT=~/.cache/huggingface/hub/models--stabilityai--stable-diffusion-3.5-large-turbo/snapshots/<rev> \
+//! SD3_LARGE_SNAPSHOT=/path/to/models--stabilityai--stable-diffusion-3.5-large/snapshots/<rev> \
+//! SD3_TURBO_SNAPSHOT=/path/to/models--stabilityai--stable-diffusion-3.5-large-turbo/snapshots/<rev> \
 //! SD3_PROFILE_VARIANT=large SD3_PROFILE_QUANT=q8 \
 //!   /usr/bin/time -l "$BIN" profile_memory_single --ignored --nocapture
 //! ```
@@ -105,11 +105,8 @@ fn snapshot(v: Variant) -> PathBuf {
     if let Ok(p) = std::env::var(v.env_snapshot()) {
         return PathBuf::from(p);
     }
-    let home = std::env::var("HOME").expect("HOME");
-    let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub")
-        .join(v.hub_dir())
-        .join("snapshots");
+    let home = std::env::var("MLX_GEN_MODELS_ROOT").expect("set MLX_GEN_MODELS_ROOT to the explicit models root (holds models--*/snapshots); inference never self-fetches or derives a cache location (epic 13657)");
+    let snaps = PathBuf::from(home).join(v.hub_dir()).join("snapshots");
     std::fs::read_dir(&snaps)
         .unwrap_or_else(|_| panic!("set {} or populate {snaps:?}", v.env_snapshot()))
         .filter_map(|e| e.ok())

@@ -2,7 +2,7 @@
 //! `numz/SeedVR2_comfyUI` checkpoint must reproduce the mflux-converted MLX weights key-for-key,
 //! value-for-value. The dumped `vae_f32`/`dit_f32` goldens ARE the mflux-converted weights (cast to
 //! f32); the converter output (fp16, cast to f32) must match them exactly (rename + conv transpose
-//! are lossless). Needs the HF cache + the goldens; skips otherwise.
+//! are lossless). Needs the models root (`MLX_GEN_MODELS_ROOT`) + the goldens; skips otherwise.
 
 use mlx_gen::weights::Weights;
 use mlx_gen_seedvr2::convert::{convert_dit, convert_vae};
@@ -17,10 +17,10 @@ fn golden_dir() -> std::path::PathBuf {
         })
 }
 
-/// Locate a file inside the HF snapshot for `numz/SeedVR2_comfyUI`.
+/// Locate a file inside the `numz/SeedVR2_comfyUI` snapshot under `MLX_GEN_MODELS_ROOT`.
 fn raw_checkpoint(name: &str) -> Option<std::path::PathBuf> {
-    let base = std::path::Path::new(&std::env::var("HOME").unwrap())
-        .join(".cache/huggingface/hub/models--numz--SeedVR2_comfyUI/snapshots");
+    let base = std::path::Path::new(&std::env::var("MLX_GEN_MODELS_ROOT").ok()?)
+        .join("models--numz--SeedVR2_comfyUI/snapshots");
     let snap = std::fs::read_dir(&base).ok()?.flatten().next()?.path();
     let p = snap.join(name);
     p.exists().then_some(p)

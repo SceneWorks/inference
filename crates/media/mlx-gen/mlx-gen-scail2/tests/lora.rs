@@ -25,7 +25,7 @@
 //! Run on macOS against the assembled snapshot:
 //! ```text
 //! SCAIL2_SNAPSHOT_DIR=~/.cache/scail2-mlx-convert \
-//! SCAIL2_DIFF_PATCH_LORA="$HOME/.cache/huggingface/hub/models--lightx2v--Wan2.1-I2V-14B-480P-StepDistill-CfgDistill-Lightx2v/snapshots/*/loras/Wan21_I2V_14B_lightx2v_cfg_step_distill_lora_rank64.safetensors" \
+//! SCAIL2_DIFF_PATCH_LORA="/path/to/models--lightx2v--Wan2.1-I2V-14B-480P-StepDistill-CfgDistill-Lightx2v/snapshots/*/loras/Wan21_I2V_14B_lightx2v_cfg_step_distill_lora_rank64.safetensors" \
 //!   cargo test -p mlx-gen-scail2 --test lora -- --ignored --nocapture
 //! # full lightning e2e: SCAIL2_LORA=<same file> SCAIL2_LORA_QUANT=bf16 … lora_apply_smoke
 //! ```

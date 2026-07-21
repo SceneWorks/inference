@@ -24,25 +24,8 @@ use mlx_gen_flux2::{
 /// The dev snapshot to load from: the pre-quantized Q4 snapshot if present (fast, ~13 GB packed
 /// Mistral tower), else the stock HF dev snapshot (dense bf16).
 fn snapshot() -> PathBuf {
-    if let Ok(p) = std::env::var("MLX_GEN_FLUX2_DEV_PREQUANT") {
-        return PathBuf::from(p);
-    }
-    let tmp = std::env::temp_dir().join("mlx_gen_flux2_dev_prequant_q4");
-    if tmp.join("text_encoder").is_dir() {
-        return tmp;
-    }
-    if let Ok(p) = std::env::var("MLX_GEN_FLUX2_DEV_SNAPSHOT") {
-        return PathBuf::from(p);
-    }
-    let home = std::env::var("HOME").expect("HOME");
-    let base = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--black-forest-labs--FLUX.2-dev/snapshots");
-    std::fs::read_dir(&base)
-        .expect("a dev snapshot (set MLX_GEN_FLUX2_DEV_PREQUANT or MLX_GEN_FLUX2_DEV_SNAPSHOT)")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir())
-        .expect("a snapshot under models--black-forest-labs--FLUX.2-dev/snapshots")
+    let p = std::env::var("MLX_GEN_FLUX2_DEV_PREQUANT").unwrap_or_else(|_| panic!("set MLX_GEN_FLUX2_DEV_PREQUANT to the required snapshot dir; inference never self-fetches or derives a cache location (epic 13657)"));
+    PathBuf::from(p)
 }
 
 fn synthetic_image() -> Image {

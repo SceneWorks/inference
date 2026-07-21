@@ -6,7 +6,7 @@
 //! and seed determinism — the same guarantees a candle provider will be held to (sc-7580). `#[ignore]`
 //! because it needs the real `krea/Krea-2-Turbo` weights; run on the macos-mlx lane / a dev box:
 //! ```sh
-//! KREA_TURBO_DIR=~/.cache/huggingface/hub/models--krea--Krea-2-Turbo/snapshots/<rev> \
+//! KREA_TURBO_DIR=/path/to/models--krea--Krea-2-Turbo/snapshots/<rev> \
 //!   cargo test -p mlx-gen-krea --release --test conformance -- --ignored --nocapture
 //! ```
 
@@ -18,20 +18,8 @@ use mlx_gen::{LoadSpec, WeightsSource};
 /// The `krea/Krea-2-Turbo` snapshot: `KREA_TURBO_DIR` if set, else the first snapshot under the HF hub
 /// cache. Panics with a clear message when absent (the `#[ignore]` gate needs real weights to run).
 fn snapshot() -> PathBuf {
-    if let Ok(p) = std::env::var("KREA_TURBO_DIR") {
-        return PathBuf::from(p);
-    }
-    let home = std::env::var("HOME").expect("HOME");
-    let snaps =
-        PathBuf::from(home).join(".cache/huggingface/hub/models--krea--Krea-2-Turbo/snapshots");
-    std::fs::read_dir(&snaps)
-        .ok()
-        .and_then(|rd| {
-            rd.filter_map(|e| e.ok())
-                .map(|e| e.path())
-                .find(|p| p.is_dir())
-        })
-        .expect("set KREA_TURBO_DIR or populate the HF hub cache for krea/Krea-2-Turbo")
+    let p = std::env::var("KREA_TURBO_DIR").unwrap_or_else(|_| panic!("set KREA_TURBO_DIR to the required snapshot dir; inference never self-fetches or derives a cache location (epic 13657)"));
+    PathBuf::from(p)
 }
 
 #[test]

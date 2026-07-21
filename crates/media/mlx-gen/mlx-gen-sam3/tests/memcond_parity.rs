@@ -10,7 +10,7 @@
 //! attention itself is separately gated by `memattn_parity`.
 //!
 //! Run:
-//!   SAM3_WEIGHTS=$HOME/.cache/huggingface/hub/models--facebook--sam3/snapshots/<rev>/model.safetensors \
+//!   SAM3_WEIGHTS=/path/to/models--facebook--sam3/snapshots/<rev>/model.safetensors \
 //!   SAM3_MEMCOND_FIXTURE=scripts/spikes/sam3_oracle/memcond_fixture.safetensors \
 //!     cargo test -p mlx-gen-sam3 --release --test memcond_parity -- --ignored --nocapture
 

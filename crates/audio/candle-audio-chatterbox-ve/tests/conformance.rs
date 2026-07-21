@@ -89,7 +89,7 @@ fn assert_valid_embedding(e: &[f32]) {
 /// discriminative speaker vectors — same-speaker clips are cosine-closer than a different-speaker
 /// control by a clear margin. A vector that ignored the reference audio would fail this.
 #[test]
-#[ignore = "real weights: needs ve.safetensors + a Kokoro snapshot (CHATTERBOX_VE_SNAPSHOT/KOKORO_SNAPSHOT or network); run with --ignored"]
+#[ignore = "real weights: needs ve.safetensors + a Kokoro snapshot (CHATTERBOX_VE_SNAPSHOT/KOKORO_SNAPSHOT); run with --ignored"]
 fn chatterbox_ve_discriminates_speakers() {
     let embedder = load_embedder();
 

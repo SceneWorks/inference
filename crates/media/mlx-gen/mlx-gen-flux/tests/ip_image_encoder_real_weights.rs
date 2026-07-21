@@ -37,9 +37,8 @@ fn clip_vit_l_weights() -> Weights {
         };
         return Weights::from_file(file).unwrap();
     }
-    let home = std::env::var("HOME").unwrap();
-    let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--openai--clip-vit-large-patch14/snapshots");
+    let home = std::env::var("MLX_GEN_MODELS_ROOT").expect("set MLX_GEN_MODELS_ROOT to the explicit models root (holds models--*/snapshots); inference never self-fetches or derives a cache location (epic 13657)");
+    let snaps = PathBuf::from(home).join("models--openai--clip-vit-large-patch14/snapshots");
     let dir = std::fs::read_dir(&snaps)
         .expect("HF cache snapshots dir for openai/clip-vit-large-patch14")
         .filter_map(|e| e.ok())

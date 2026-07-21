@@ -47,6 +47,9 @@ jobs:
     runs-on: [self-hosted, macOS, ARM64, real-weights]
     env:
       ZIMAGE_SNAPSHOT: ${{ vars.ZIMAGE_SNAPSHOT }}
+      # Explicit operator-provided models root for the mlx-gen real-weight resolvers that resolve a
+      # repo-keyed snapshot (sc-13755); inference never self-fetches or derives a cache location.
+      MLX_GEN_MODELS_ROOT: ${{ vars.MLX_GEN_MODELS_ROOT }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: Toolchain versions
@@ -227,6 +230,9 @@ jobs:
     runs-on: [self-hosted, windows, cuda, real-weights]
     env:
       Z_IMAGE_SNAPSHOT: ${{ vars.Z_IMAGE_SNAPSHOT }}
+      # Explicit operator-provided models root for the candle-gen real-weight resolvers that resolve
+      # a repo-keyed snapshot (sc-13755); inference never self-fetches or derives a cache location.
+      CANDLE_GEN_MODELS_ROOT: ${{ vars.CANDLE_GEN_MODELS_ROOT }}
       CUDA_COMPUTE_CAP: "80"
       CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
       VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"

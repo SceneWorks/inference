@@ -26,17 +26,8 @@ use mlx_gen_lens::dit::{LensDitConfig, LensTransformer};
 /// were rehosted to `SceneWorks/Lens` (sc-8797) — the old `microsoft/Lens` cache path is stale (the
 /// `src/training.rs` snapshot() already points at the rehost; this is the matching test-side fix).
 fn snapshot() -> PathBuf {
-    if let Ok(p) = std::env::var("LENS_SNAPSHOT") {
-        return PathBuf::from(p);
-    }
-    let base = PathBuf::from(std::env::var("HOME").unwrap())
-        .join(".cache/huggingface/hub/models--SceneWorks--Lens/snapshots");
-    std::fs::read_dir(&base)
-        .unwrap_or_else(|_| panic!("Lens snapshot dir {} (set LENS_SNAPSHOT)", base.display()))
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir() && p.join("transformer").is_dir())
-        .expect("a microsoft/Lens snapshot with a transformer/ tree")
+    let p = std::env::var("LENS_SNAPSHOT").unwrap_or_else(|_| panic!("set LENS_SNAPSHOT to the required snapshot dir; inference never self-fetches or derives a cache location (epic 13657)"));
+    PathBuf::from(p)
 }
 
 /// Two solid-colour swatch PNGs + captions in `dir`.

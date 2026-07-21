@@ -35,9 +35,8 @@ use mlx_gen_anima::loader::AnimaComponents;
 
 /// Glob the Anima base snapshot's `split_files/` dir (DiT checkpoints + VAE + TE).
 pub fn split_files() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    let base = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--circlestone-labs--Anima/snapshots");
+    let home = std::env::var("MLX_GEN_MODELS_ROOT").ok()?;
+    let base = PathBuf::from(home).join("models--circlestone-labs--Anima/snapshots");
     std::fs::read_dir(&base)
         .ok()?
         .filter_map(|e| e.ok())
@@ -49,9 +48,8 @@ pub fn split_files() -> Option<PathBuf> {
 
 /// Glob the official-LoRAs snapshot dir.
 pub fn lora_dir() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    let base = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--circlestone-labs--Anima-Official-LoRAs/snapshots");
+    let home = std::env::var("MLX_GEN_MODELS_ROOT").ok()?;
+    let base = PathBuf::from(home).join("models--circlestone-labs--Anima-Official-LoRAs/snapshots");
     std::fs::read_dir(&base)
         .ok()?
         .filter_map(|e| e.ok())

@@ -50,10 +50,9 @@ fn control_source(g: &Weights) -> WeightsSource {
             return WeightsSource::File(pb);
         }
     }
-    let home = std::env::var("HOME").unwrap();
-    let snaps = PathBuf::from(home).join(
-        ".cache/huggingface/hub/models--alibaba-pai--Z-Image-Turbo-Fun-Controlnet-Union-2.1/snapshots",
-    );
+    let home = std::env::var("MLX_GEN_MODELS_ROOT").expect("set MLX_GEN_MODELS_ROOT to the explicit models root (holds models--*/snapshots); inference never self-fetches or derives a cache location (epic 13657)");
+    let snaps = PathBuf::from(home)
+        .join("models--alibaba-pai--Z-Image-Turbo-Fun-Controlnet-Union-2.1/snapshots");
     let file = std::fs::read_dir(&snaps)
         .expect("control HF cache snapshots dir")
         .filter_map(|e| e.ok())

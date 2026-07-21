@@ -30,27 +30,16 @@ use std::path::PathBuf;
 
 /// The canonical MLX overlay file inside the alibaba-pai repo (sc-8350: the repo ships two overlays —
 /// the `-2602` variant is the one the MLX engine loads, so it is the one we pack).
+#[allow(dead_code)] // retained as provenance; TODO(sc-13685)
 const OVERLAY_FILE: &str = "Qwen-Image-2512-Fun-Controlnet-Union-2602.safetensors";
 /// Codebase-default group size (== `crate::quant::GROUP_SIZE`).
 const GROUP_SIZE: i32 = 64;
 
-/// Resolve the 2512-Fun `-2602` overlay: `SC9517_CONTROL` if set, else the HF-cache copy.
+/// Resolve the 2512-Fun `-2602` overlay from the required `SC9517_CONTROL`; `None` when unset so the
+/// `#[ignore]`d test skips (inference never self-fetches or derives a cache location, epic 13657).
 fn control_overlay() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("SC9517_CONTROL") {
-        return Some(PathBuf::from(p));
-    }
-    let home = std::env::var("HOME").ok()?;
-    let snaps = PathBuf::from(home).join(
-        ".cache/huggingface/hub/\
-         models--alibaba-pai--Qwen-Image-2512-Fun-Controlnet-Union/snapshots",
-    );
-    let snap = std::fs::read_dir(&snaps)
-        .ok()?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir())?;
-    let f = snap.join(OVERLAY_FILE);
-    f.is_file().then_some(f)
+    let p = std::env::var("SC9517_CONTROL").ok()?;
+    Some(PathBuf::from(p))
 }
 
 fn bits_env() -> i32 {

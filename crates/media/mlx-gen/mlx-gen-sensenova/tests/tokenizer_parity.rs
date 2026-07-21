@@ -38,18 +38,8 @@ fn neo1_template_matches_reference_strings() {
 }
 
 fn snapshot() -> PathBuf {
-    if let Ok(p) = std::env::var("SENSENOVA_U1_SNAPSHOT") {
-        return PathBuf::from(p);
-    }
-    let home = std::env::var("HOME").unwrap();
-    let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--sensenova--SenseNova-U1-8B-MoT/snapshots");
-    std::fs::read_dir(&snaps)
-        .expect("HF cache snapshots dir (set SENSENOVA_U1_SNAPSHOT)")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir())
-        .expect("a snapshot dir")
+    let p = std::env::var("SENSENOVA_U1_SNAPSHOT").unwrap_or_else(|_| panic!("set SENSENOVA_U1_SNAPSHOT to the required snapshot dir; inference never self-fetches or derives a cache location (epic 13657)"));
+    PathBuf::from(p)
 }
 
 #[test]

@@ -27,13 +27,8 @@ use mlx_gen::{
 };
 use std::path::PathBuf;
 
-fn home() -> PathBuf {
-    PathBuf::from(std::env::var("HOME").unwrap())
-}
-
 fn hf_snapshot(model: &str) -> PathBuf {
-    let snaps = home()
-        .join(".cache/huggingface/hub")
+    let snaps = std::path::PathBuf::from(std::env::var("MLX_GEN_MODELS_ROOT").expect("set MLX_GEN_MODELS_ROOT to the explicit models root (holds models--*/snapshots); inference never self-fetches or derives a cache location (epic 13657)"))
         .join(model)
         .join("snapshots");
     std::fs::read_dir(&snaps)

@@ -8,7 +8,7 @@
 //! latents — we measure cost/scaling, not parity.
 //!
 //! ```text
-//! Z16_VAE=~/.cache/huggingface/hub/models--SceneWorks--wan2.2-t2v-a14b-mlx/snapshots/<h>/vae.safetensors \
+//! Z16_VAE=/path/to/models--SceneWorks--wan2.2-t2v-a14b-mlx/snapshots/<h>/vae.safetensors \
 //! Z16_W=768 Z16_H=768 Z16_FRAMES=16 \
 //!   cargo test -p mlx-gen-wan --test vae16_decode_sweep --release -- --ignored --nocapture
 //! # add Z16_TILE_PX=384 [Z16_OVERLAP_PX=64 Z16_TILE_FRAMES=.. Z16_OVERLAP_FRAMES=..] for a tiled run

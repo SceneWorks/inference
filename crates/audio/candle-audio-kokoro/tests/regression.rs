@@ -54,7 +54,7 @@ fn field<'a>(v: &'a serde_json::Value, path: &[&str]) -> &'a serde_json::Value {
 }
 
 #[test]
-#[ignore = "real weights: needs a hexgrad/Kokoro-82M snapshot (KOKORO_SNAPSHOT or network); run with --ignored"]
+#[ignore = "real weights: needs a hexgrad/Kokoro-82M snapshot (KOKORO_SNAPSHOT); run with --ignored"]
 fn kokoro_regression_fixture() {
     let fx: serde_json::Value = serde_json::from_str(FIXTURE).expect("fixture JSON parses");
     assert_eq!(

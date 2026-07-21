@@ -19,24 +19,13 @@ use std::path::PathBuf;
 use mlx_gen::{Conditioning, GenerationOutput, GenerationRequest, Image, LoadSpec, WeightsSource};
 
 fn flux_schnell_snapshot() -> PathBuf {
-    if let Ok(p) = std::env::var("MLX_GEN_FLUX_SNAPSHOT") {
-        return PathBuf::from(p);
-    }
-    let home = std::env::var("HOME").unwrap();
-    let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--black-forest-labs--FLUX.1-schnell/snapshots");
-    std::fs::read_dir(&snaps)
-        .expect("FLUX.1-schnell HF snapshot (or set MLX_GEN_FLUX_SNAPSHOT)")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir() && p.join("transformer").is_dir())
-        .expect("a complete FLUX.1-schnell snapshot dir")
+    let p = std::env::var("MLX_GEN_FLUX_SNAPSHOT").unwrap_or_else(|_| panic!("set MLX_GEN_FLUX_SNAPSHOT to the required snapshot dir; inference never self-fetches or derives a cache location (epic 13657)"));
+    PathBuf::from(p)
 }
 
 fn hf_file(repo: &str, file: &str) -> PathBuf {
-    let home = std::env::var("HOME").unwrap();
-    let snaps =
-        PathBuf::from(home).join(format!(".cache/huggingface/hub/models--{repo}/snapshots"));
+    let home = std::env::var("MLX_GEN_MODELS_ROOT").expect("set MLX_GEN_MODELS_ROOT to the explicit models root (holds models--*/snapshots); inference never self-fetches or derives a cache location (epic 13657)");
+    let snaps = PathBuf::from(home).join(format!("models--{repo}/snapshots"));
     let dir = std::fs::read_dir(&snaps)
         .unwrap_or_else(|_| panic!("HF cache snapshots dir for {repo}"))
         .filter_map(|e| e.ok())
@@ -136,18 +125,8 @@ fn flux_ip_scale_zero_equals_txt2img() {
 }
 
 fn flux_dev_snapshot() -> PathBuf {
-    if let Ok(p) = std::env::var("MLX_GEN_FLUX_DEV_SNAPSHOT") {
-        return PathBuf::from(p);
-    }
-    let home = std::env::var("HOME").unwrap();
-    let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--black-forest-labs--FLUX.1-dev/snapshots");
-    std::fs::read_dir(&snaps)
-        .expect("FLUX.1-dev HF snapshot (or set MLX_GEN_FLUX_DEV_SNAPSHOT)")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir() && p.join("transformer").is_dir())
-        .expect("a complete FLUX.1-dev snapshot dir")
+    let p = std::env::var("MLX_GEN_FLUX_DEV_SNAPSHOT").unwrap_or_else(|_| panic!("set MLX_GEN_FLUX_DEV_SNAPSHOT to the required snapshot dir; inference never self-fetches or derives a cache location (epic 13657)"));
+    PathBuf::from(p)
 }
 
 /// sc-3624 A/B helper: render MLX FLUX + XLabs IP-Adapter conditioned on a reference PNG, saving the

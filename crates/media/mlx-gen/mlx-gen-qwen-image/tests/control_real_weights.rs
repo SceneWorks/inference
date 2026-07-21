@@ -47,63 +47,15 @@ const CONTROL_IN_DIM: i32 = 132;
 
 /// Base `Qwen/Qwen-Image-2512` snapshot dir (env override, else the HF cache).
 fn snapshot() -> PathBuf {
-    if let Ok(p) = std::env::var("QWEN_IMAGE_SNAPSHOT") {
-        return PathBuf::from(p);
-    }
-    let home = std::env::var("HOME").unwrap();
-    // Prefer the 2512 base (the sc-8271 default); fall back to the legacy Qwen-Image snapshot dir.
-    for repo in ["models--Qwen--Qwen-Image-2512", "models--Qwen--Qwen-Image"] {
-        let snaps = PathBuf::from(&home)
-            .join(".cache/huggingface/hub")
-            .join(repo)
-            .join("snapshots");
-        if let Ok(rd) = std::fs::read_dir(&snaps) {
-            if let Some(p) = rd
-                .filter_map(|e| e.ok())
-                .map(|e| e.path())
-                .find(|p| p.is_dir())
-            {
-                return p;
-            }
-        }
-    }
-    panic!("no Qwen-Image base snapshot in the HF cache (set QWEN_IMAGE_SNAPSHOT)");
+    let p = std::env::var("QWEN_IMAGE_SNAPSHOT").unwrap_or_else(|_| panic!("set QWEN_IMAGE_SNAPSHOT to the required snapshot dir; inference never self-fetches or derives a cache location (epic 13657)"));
+    PathBuf::from(p)
 }
 
 /// alibaba-pai `Qwen-Image-2512-Fun-Controlnet-Union` checkpoint (env `QWEN_CONTROL_WEIGHTS`, else
 /// the HF cache — the `Qwen-Image-2512-Fun-Controlnet-Union-2602.safetensors`).
 fn control_source() -> WeightsSource {
-    if let Ok(p) = std::env::var("QWEN_CONTROL_WEIGHTS") {
-        return WeightsSource::File(PathBuf::from(p));
-    }
-    let home = std::env::var("HOME").unwrap();
-    let snaps = PathBuf::from(home).join(
-        ".cache/huggingface/hub/models--alibaba-pai--Qwen-Image-2512-Fun-Controlnet-Union/snapshots",
-    );
-    let file = std::fs::read_dir(&snaps)
-        .expect("control HF cache snapshots dir")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.is_dir())
-        .flat_map(|d| {
-            std::fs::read_dir(d)
-                .unwrap()
-                .filter_map(|e| e.ok())
-                .map(|e| e.path())
-        })
-        // Prefer the -2602 distilled checkpoint when present, else any control .safetensors.
-        .filter(|p| p.extension().map(|x| x == "safetensors").unwrap_or(false))
-        .min_by_key(|p| {
-            // -2602 sorts first (a 0 key); otherwise 1.
-            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if name.contains("2602") {
-                0
-            } else {
-                1
-            }
-        })
-        .expect("a control .safetensors");
-    WeightsSource::File(file)
+    let p = std::env::var("QWEN_CONTROL_WEIGHTS").unwrap_or_else(|_| panic!("set QWEN_CONTROL_WEIGHTS to the required snapshot dir; inference never self-fetches or derives a cache location (epic 13657)"));
+    WeightsSource::File(PathBuf::from(p))
 }
 
 fn randn(shape: &[i32], seed: u64) -> Array {

@@ -32,33 +32,13 @@ const GOLDEN: &str = concat!(
 );
 
 fn kolors_snapshot() -> PathBuf {
-    if let Ok(p) = std::env::var("KOLORS_SNAPSHOT") {
-        return PathBuf::from(p);
-    }
-    let home = std::env::var("HOME").unwrap();
-    let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--Kwai-Kolors--Kolors-diffusers/snapshots");
-    std::fs::read_dir(&snaps)
-        .expect("HF cache snapshots dir")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir())
-        .expect("a snapshot dir")
+    let p = std::env::var("KOLORS_SNAPSHOT").unwrap_or_else(|_| panic!("set KOLORS_SNAPSHOT to the required snapshot dir; inference never self-fetches or derives a cache location (epic 13657)"));
+    PathBuf::from(p)
 }
 
 fn ip_snapshot() -> PathBuf {
-    if let Ok(p) = std::env::var("KOLORS_IP_ADAPTER") {
-        return PathBuf::from(p);
-    }
-    let home = std::env::var("HOME").unwrap();
-    let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--Kwai-Kolors--Kolors-IP-Adapter-Plus/snapshots");
-    std::fs::read_dir(&snaps)
-        .expect("IP-Adapter snapshots dir")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir())
-        .expect("a snapshot dir")
+    let p = std::env::var("KOLORS_IP_ADAPTER").unwrap_or_else(|_| panic!("set KOLORS_IP_ADAPTER to the required snapshot dir; inference never self-fetches or derives a cache location (epic 13657)"));
+    PathBuf::from(p)
 }
 
 fn rel(a: &Array, b: &Array) -> (f32, f32) {

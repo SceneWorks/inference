@@ -19,17 +19,8 @@ use std::path::PathBuf;
 
 /// Resolve the Z-Image-**Turbo** snapshot: `SC8670_SRC` if set, else the first HF-cache snapshot.
 fn turbo_snapshot() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("SC8670_SRC") {
-        return Some(PathBuf::from(p));
-    }
-    let home = std::env::var("HOME").ok()?;
-    let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--Tongyi-MAI--Z-Image-Turbo/snapshots");
-    std::fs::read_dir(&snaps)
-        .ok()?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir())
+    let p = std::env::var("SC8670_SRC").ok()?;
+    Some(PathBuf::from(p))
 }
 
 #[test]

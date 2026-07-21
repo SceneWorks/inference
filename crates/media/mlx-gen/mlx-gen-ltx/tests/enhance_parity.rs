@@ -36,17 +36,8 @@ fn enhancement_is_off_by_default() {
 
 /// Resolve the gemma-3-12b-it-bf16 snapshot: `$LTX_GEMMA_DIR` wins, else the newest HF-cache snapshot.
 fn gemma_dir() -> Option<PathBuf> {
-    if let Ok(d) = std::env::var("LTX_GEMMA_DIR") {
-        return Some(d.into());
-    }
-    let home = std::env::var("HOME").ok()?;
-    let base = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--mlx-community--gemma-3-12b-it-bf16/snapshots");
-    std::fs::read_dir(&base)
-        .ok()?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.is_dir())
-        .max_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok())
+    let d = std::env::var("LTX_GEMMA_DIR").ok()?;
+    Some(d.into())
 }
 
 fn run_smoke(dir: &PathBuf, sampler: SampleParams) -> String {

@@ -26,9 +26,8 @@ use mlx_rs::ops::{abs, subtract};
 use mlx_rs::{Array, Dtype};
 
 fn hf_snapshot(repo: &str, file: &str) -> PathBuf {
-    let home = std::env::var("HOME").unwrap();
-    let snaps =
-        PathBuf::from(home).join(format!(".cache/huggingface/hub/models--{repo}/snapshots"));
+    let home = std::env::var("MLX_GEN_MODELS_ROOT").expect("set MLX_GEN_MODELS_ROOT to the explicit models root (holds models--*/snapshots); inference never self-fetches or derives a cache location (epic 13657)");
+    let snaps = PathBuf::from(home).join(format!("models--{repo}/snapshots"));
     let dir = std::fs::read_dir(&snaps)
         .unwrap_or_else(|_| panic!("HF cache snapshots dir for {repo}"))
         .filter_map(|e| e.ok())

@@ -20,9 +20,8 @@ use mlx_gen_bernini::convert::assemble_bernini_snapshot;
 const MODEL_ID: &str = "bernini";
 
 fn hf_snapshot(repo: &str) -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
+    let home = std::env::var("MLX_GEN_MODELS_ROOT").ok()?;
     let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub")
         .join(format!("models--{}", repo.replace('/', "--")))
         .join("snapshots");
     std::fs::read_dir(snaps)

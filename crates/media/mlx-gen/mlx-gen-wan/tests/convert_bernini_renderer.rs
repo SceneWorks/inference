@@ -18,9 +18,8 @@ use mlx_rs::{random, Dtype};
 
 /// The newest snapshot dir of an HF-cached repo, or `None` if it is not cached.
 fn hf_snapshot(repo: &str) -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
+    let home = std::env::var("MLX_GEN_MODELS_ROOT").ok()?;
     let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub")
         .join(format!("models--{}", repo.replace('/', "--")))
         .join("snapshots");
     std::fs::read_dir(snaps)

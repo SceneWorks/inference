@@ -25,17 +25,8 @@ use mlx_gen_flux2::transformer::set_compile_glue;
 use mlx_rs::{random, Array};
 
 fn snapshot() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("MLX_GEN_FLUX2_SNAPSHOT") {
-        return Some(PathBuf::from(p));
-    }
-    let home = std::env::var("HOME").ok()?;
-    let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--black-forest-labs--FLUX.2-klein-9b/snapshots");
-    std::fs::read_dir(&snaps)
-        .ok()?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir())
+    let p = std::env::var("MLX_GEN_FLUX2_SNAPSHOT").ok()?;
+    Some(PathBuf::from(p))
 }
 
 fn env_u32(var: &str, default: u32) -> u32 {

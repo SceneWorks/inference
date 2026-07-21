@@ -24,20 +24,7 @@ fn env_path(name: &str) -> Option<PathBuf> {
 }
 
 fn krea_snapshot() -> PathBuf {
-    if let Some(p) = env_path("KREA_TURBO_DIR") {
-        return p;
-    }
-    let home = std::env::var("HOME").unwrap();
-    let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--SceneWorks--krea-2-turbo-mlx/snapshots");
-    let snap = std::fs::read_dir(&snaps)
-        .expect("krea turnkey HF cache snapshots dir")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir())
-        .expect("a krea-2-turbo-mlx snapshot dir");
-    // The published turnkey carries one `from_snapshot`-loadable root per quant under `q{bits}`.
-    snap.join("q8")
+    env_path("KREA_TURBO_DIR").unwrap_or_else(|| panic!("set KREA_TURBO_DIR to the required snapshot dir; inference never self-fetches or derives a cache location (epic 13657)"))
 }
 
 fn pid_checkpoint() -> PathBuf {
@@ -50,18 +37,7 @@ fn pid_checkpoint() -> PathBuf {
 }
 
 fn gemma_dir() -> PathBuf {
-    if let Some(p) = env_path("PID_GEMMA_DIR") {
-        return p;
-    }
-    let home = std::env::var("HOME").unwrap();
-    let base = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--Efficient-Large-Model--gemma-2-2b-it/snapshots");
-    std::fs::read_dir(&base)
-        .expect("gemma HF cache snapshots dir")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir())
-        .expect("a gemma-2-2b-it snapshot dir")
+    env_path("PID_GEMMA_DIR").unwrap_or_else(|| panic!("set PID_GEMMA_DIR to the required snapshot dir; inference never self-fetches or derives a cache location (epic 13657)"))
 }
 
 fn stats(img: &Image) -> (u8, u8, f64) {

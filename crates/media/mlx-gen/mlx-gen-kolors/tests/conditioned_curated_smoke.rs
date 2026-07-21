@@ -39,8 +39,8 @@ fn snap_env(env: &str, repo: &str) -> Option<PathBuf> {
     if let Ok(p) = std::env::var(env) {
         return Some(PathBuf::from(p));
     }
-    let home = std::env::var("HOME").ok()?;
-    let base = PathBuf::from(home).join(format!(".cache/huggingface/hub/{repo}/snapshots"));
+    let home = std::env::var("MLX_GEN_MODELS_ROOT").ok()?;
+    let base = PathBuf::from(home).join(format!("{repo}/snapshots"));
     std::fs::read_dir(&base)
         .ok()?
         .filter_map(|e| e.ok())

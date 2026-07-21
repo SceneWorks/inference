@@ -10,8 +10,8 @@ use mlx_gen_seedvr2::pipeline::Seedvr2Pipeline;
 use mlx_rs::{Array, Dtype};
 
 fn raw_dir() -> Option<std::path::PathBuf> {
-    let base = std::path::Path::new(&std::env::var("HOME").unwrap())
-        .join(".cache/huggingface/hub/models--numz--SeedVR2_comfyUI/snapshots");
+    let base = std::path::Path::new(&std::env::var("MLX_GEN_MODELS_ROOT").ok()?)
+        .join("models--numz--SeedVR2_comfyUI/snapshots");
     let snap = std::fs::read_dir(&base).ok()?.flatten().next()?.path();
     snap.join("seedvr2_ema_3b_fp16.safetensors")
         .exists()

@@ -47,11 +47,8 @@ fn snapshot(variant: FluxVariant) -> Option<PathBuf> {
         FluxVariant::Dev => "models--black-forest-labs--FLUX.1-dev",
         FluxVariant::Schnell => "models--black-forest-labs--FLUX.1-schnell",
     };
-    let home = std::env::var("HOME").ok()?;
-    let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub")
-        .join(repo)
-        .join("snapshots");
+    let home = std::env::var("MLX_GEN_MODELS_ROOT").ok()?;
+    let snaps = PathBuf::from(home).join(repo).join("snapshots");
     std::fs::read_dir(&snaps)
         .ok()?
         .filter_map(|e| e.ok())

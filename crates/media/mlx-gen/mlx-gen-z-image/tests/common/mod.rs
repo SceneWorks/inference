@@ -12,17 +12,8 @@ use mlx_rs::{Array, Dtype};
 /// first snapshot under the HF hub cache. Returns `None` if neither is present — for tests/benches
 /// that skip rather than panic when real weights are absent.
 pub fn snapshot_opt() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("ZIMAGE_SNAPSHOT") {
-        return Some(PathBuf::from(p));
-    }
-    let home = std::env::var("HOME").ok()?;
-    let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--Tongyi-MAI--Z-Image-Turbo/snapshots");
-    std::fs::read_dir(&snaps)
-        .ok()?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir())
+    let p = std::env::var("ZIMAGE_SNAPSHOT").ok()?;
+    Some(PathBuf::from(p))
 }
 
 /// [`snapshot_opt`] but panicking with a clear message when no snapshot is found — for the

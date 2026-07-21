@@ -4,7 +4,7 @@
 //! a real 2-frame `Sam3VideoModel` PCS run).
 //!
 //! Run:
-//!   SAM3_WEIGHTS=$HOME/.cache/huggingface/hub/models--facebook--sam3/snapshots/<rev>/model.safetensors \
+//!   SAM3_WEIGHTS=/path/to/models--facebook--sam3/snapshots/<rev>/model.safetensors \
 //!   SAM3_MEMATTN_FIXTURE=scripts/spikes/sam3_oracle/memattn_fixture.safetensors \
 //!     cargo test -p mlx-gen-sam3 --release --test memattn_parity -- --ignored --nocapture
 

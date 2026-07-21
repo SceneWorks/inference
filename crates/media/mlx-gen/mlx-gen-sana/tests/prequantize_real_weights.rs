@@ -8,7 +8,7 @@
 //!     --test pipeline_contract -- --ignored --nocapture real_weight_1024_e2e
 //!
 //! Build:
-//!   SANA_SRC=~/.cache/huggingface/hub/models--SceneWorks--Sana_1600M_1024px_mlx/snapshots/<hash> \
+//!   SANA_SRC=/path/to/models--SceneWorks--Sana_1600M_1024px_mlx/snapshots/<hash> \
 //!   SANA_OUT=~/sana-staging/1600m/q4 SANA_BITS=4 \
 //!   cargo test -p mlx-gen-sana --release --test prequantize_real_weights \
 //!     -- --ignored --nocapture build_tier

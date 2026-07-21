@@ -6,7 +6,7 @@
 //!
 //! `#[ignore]` — needs the real snapshot (~16 B params; bf16 ≈ 32 GB resident, or `KREA_QUANT=q8`):
 //! ```sh
-//! KREA_TURBO_DIR=~/.cache/huggingface/hub/models--krea--Krea-2-Turbo/snapshots/<rev> \
+//! KREA_TURBO_DIR=/path/to/models--krea--Krea-2-Turbo/snapshots/<rev> \
 //!   cargo test -p mlx-gen-krea --release --test e2e_real_weights -- --ignored --nocapture
 //! ```
 

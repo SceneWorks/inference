@@ -3,7 +3,7 @@
 //! the torch oracle (`scripts/spikes/sam3_oracle/dump_video_fixture.py`, full `Sam3VideoModel` run).
 //!
 //! Run:
-//!   SAM3_WEIGHTS=$HOME/.cache/huggingface/hub/models--facebook--sam3/snapshots/<rev>/model.safetensors \
+//!   SAM3_WEIGHTS=/path/to/models--facebook--sam3/snapshots/<rev>/model.safetensors \
 //!   SAM3_VIDEO_FIXTURE=$PWD/scripts/spikes/sam3_oracle/video_fixture.safetensors \
 //!     cargo test -p mlx-gen-sam3 --release --test video_parity -- --ignored --nocapture
 

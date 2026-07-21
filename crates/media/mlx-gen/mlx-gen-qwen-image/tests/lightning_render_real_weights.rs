@@ -28,24 +28,13 @@ const SEED: u64 = 42;
 const PROMPT: &str = "a fox sitting in a forest, photorealistic";
 
 fn snapshot() -> PathBuf {
-    if let Ok(p) = std::env::var("QWEN_IMAGE_SNAPSHOT") {
-        return PathBuf::from(p);
-    }
-    let home = std::env::var("HOME").unwrap();
-    let snaps =
-        PathBuf::from(home).join(".cache/huggingface/hub/models--Qwen--Qwen-Image/snapshots");
-    std::fs::read_dir(&snaps)
-        .expect("HF cache snapshots dir")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir())
-        .expect("a snapshot dir")
+    let p = std::env::var("QWEN_IMAGE_SNAPSHOT").unwrap_or_else(|_| panic!("set QWEN_IMAGE_SNAPSHOT to the required snapshot dir; inference never self-fetches or derives a cache location (epic 13657)"));
+    PathBuf::from(p)
 }
 
 fn lightning_lora() -> PathBuf {
-    let home = std::env::var("HOME").unwrap();
-    let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--lightx2v--Qwen-Image-Lightning/snapshots");
+    let home = std::env::var("MLX_GEN_MODELS_ROOT").expect("set MLX_GEN_MODELS_ROOT to the explicit models root (holds models--*/snapshots); inference never self-fetches or derives a cache location (epic 13657)");
+    let snaps = PathBuf::from(home).join("models--lightx2v--Qwen-Image-Lightning/snapshots");
     std::fs::read_dir(&snaps)
         .expect("download lightx2v/Qwen-Image-Lightning")
         .filter_map(|e| e.ok())
@@ -166,24 +155,14 @@ fn lightning_render_is_coherent() {
 }
 
 fn edit_snapshot() -> PathBuf {
-    if let Ok(p) = std::env::var("QWEN_IMAGE_EDIT_SNAPSHOT") {
-        return PathBuf::from(p);
-    }
-    let home = std::env::var("HOME").unwrap();
-    let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--Qwen--Qwen-Image-Edit-2511/snapshots");
-    std::fs::read_dir(&snaps)
-        .expect("HF cache Qwen-Image-Edit-2511 snapshots dir")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir())
-        .expect("a snapshot dir")
+    let p = std::env::var("QWEN_IMAGE_EDIT_SNAPSHOT").unwrap_or_else(|_| panic!("set QWEN_IMAGE_EDIT_SNAPSHOT to the required snapshot dir; inference never self-fetches or derives a cache location (epic 13657)"));
+    PathBuf::from(p)
 }
 
 fn edit_lightning_lora() -> PathBuf {
-    let home = std::env::var("HOME").unwrap();
-    let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--lightx2v--Qwen-Image-Edit-2511-Lightning/snapshots");
+    let home = std::env::var("MLX_GEN_MODELS_ROOT").expect("set MLX_GEN_MODELS_ROOT to the explicit models root (holds models--*/snapshots); inference never self-fetches or derives a cache location (epic 13657)");
+    let snaps =
+        PathBuf::from(home).join("models--lightx2v--Qwen-Image-Edit-2511-Lightning/snapshots");
     std::fs::read_dir(&snaps)
         .expect("download lightx2v/Qwen-Image-Edit-2511-Lightning")
         .filter_map(|e| e.ok())
@@ -196,9 +175,9 @@ fn edit_lightning_lora() -> PathBuf {
 }
 
 fn edit_lightning_lora_4step() -> PathBuf {
-    let home = std::env::var("HOME").unwrap();
-    let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--lightx2v--Qwen-Image-Edit-2511-Lightning/snapshots");
+    let home = std::env::var("MLX_GEN_MODELS_ROOT").expect("set MLX_GEN_MODELS_ROOT to the explicit models root (holds models--*/snapshots); inference never self-fetches or derives a cache location (epic 13657)");
+    let snaps =
+        PathBuf::from(home).join("models--lightx2v--Qwen-Image-Edit-2511-Lightning/snapshots");
     std::fs::read_dir(&snaps)
         .expect("download lightx2v/Qwen-Image-Edit-2511-Lightning")
         .filter_map(|e| e.ok())

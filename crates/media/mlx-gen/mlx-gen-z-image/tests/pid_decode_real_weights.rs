@@ -27,11 +27,8 @@ fn env_path(name: &str) -> Option<PathBuf> {
 }
 
 fn first_snapshot_dir(repo: &str, what: &str) -> PathBuf {
-    let home = std::env::var("HOME").unwrap();
-    let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub")
-        .join(repo)
-        .join("snapshots");
+    let home = std::env::var("MLX_GEN_MODELS_ROOT").expect("set MLX_GEN_MODELS_ROOT to the explicit models root (holds models--*/snapshots); inference never self-fetches or derives a cache location (epic 13657)");
+    let snaps = PathBuf::from(home).join(repo).join("snapshots");
     std::fs::read_dir(&snaps)
         .unwrap_or_else(|_| panic!("{what} HF cache snapshots dir: {}", snaps.display()))
         .filter_map(|e| e.ok())

@@ -26,15 +26,8 @@ use mlx_rs::Dtype;
 
 /// Resolve the snapshot dir (the one holding `transformer/`): `WANVACE_DIR`, else the HF cache.
 fn snapshot_dir() -> Option<PathBuf> {
-    if let Ok(d) = std::env::var("WANVACE_DIR") {
-        return Some(PathBuf::from(d));
-    }
-    let base = PathBuf::from(std::env::var("HOME").ok()?)
-        .join(".cache/huggingface/hub/models--Wan-AI--Wan2.1-VACE-1.3B-diffusers/snapshots");
-    std::fs::read_dir(&base)
-        .ok()?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .find(|p| p.join("transformer").is_dir())
+    let d = std::env::var("WANVACE_DIR").ok()?;
+    Some(PathBuf::from(d))
 }
 
 fn diff(got: &[f32], exp: &[f32]) -> (f32, f64) {

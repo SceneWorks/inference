@@ -7,7 +7,7 @@
 //! dirs (not duplicated per tier), and [`mlx_gen_mochi::load`] resolves them from the parent.
 //!
 //! Run (writes to a scratch dir OUTSIDE the repo):
-//!   MOCHI_SNAPSHOT=~/.cache/huggingface/hub/models--genmo--mochi-1-preview/snapshots/<rev> \
+//!   MOCHI_SNAPSHOT=/path/to/models--genmo--mochi-1-preview/snapshots/<rev> \
 //!   MOCHI_TIERS_OUT=~/mochi-tiers \
 //!   cargo test -p mlx-gen-mochi --test build_tiers -- --ignored --nocapture
 

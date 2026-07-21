@@ -13,7 +13,7 @@
 //! eyeballed over the saved PNGs. Asserts each is 4× native and coherent.
 //!
 //! ```sh
-//! KREA_TURBO_DIR=~/.cache/huggingface/hub/models--SceneWorks--krea-2-turbo-mlx/snapshots/<rev>/q8 \
+//! KREA_TURBO_DIR=/path/to/models--SceneWorks--krea-2-turbo-mlx/snapshots/<rev>/q8 \
 //!   PID_QWEN_SAFETENSORS=tools/golden/pid/qwenimage_2kto4k.safetensors \
 //!   cargo test -p mlx-gen-krea --release --test pid_img2img_early_stop_real_weights \
 //!     -- --ignored --nocapture
@@ -35,19 +35,7 @@ fn env_path(name: &str) -> Option<PathBuf> {
 }
 
 fn krea_snapshot() -> PathBuf {
-    if let Some(p) = env_path("KREA_TURBO_DIR") {
-        return p;
-    }
-    let home = std::env::var("HOME").unwrap();
-    let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--SceneWorks--krea-2-turbo-mlx/snapshots");
-    let rev = std::fs::read_dir(&snaps)
-        .expect("krea turnkey HF cache snapshots dir")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.join("q8").join("transformer").is_dir())
-        .expect("a krea-2-turbo-mlx snapshot dir with a q8 turnkey");
-    rev.join("q8")
+    env_path("KREA_TURBO_DIR").unwrap_or_else(|| panic!("set KREA_TURBO_DIR to the required snapshot dir; inference never self-fetches or derives a cache location (epic 13657)"))
 }
 
 fn pid_checkpoint() -> PathBuf {
@@ -60,18 +48,7 @@ fn pid_checkpoint() -> PathBuf {
 }
 
 fn gemma_dir() -> PathBuf {
-    if let Some(p) = env_path("PID_GEMMA_DIR") {
-        return p;
-    }
-    let home = std::env::var("HOME").unwrap();
-    let base = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--Efficient-Large-Model--gemma-2-2b-it/snapshots");
-    std::fs::read_dir(&base)
-        .expect("gemma HF cache snapshots dir")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir())
-        .expect("a gemma-2-2b-it snapshot dir")
+    env_path("PID_GEMMA_DIR").unwrap_or_else(|| panic!("set PID_GEMMA_DIR to the required snapshot dir; inference never self-fetches or derives a cache location (epic 13657)"))
 }
 
 /// (std, distinct-level-count, mean horizontal-adjacent-|Δ|) — coherent = broad histogram + spatial

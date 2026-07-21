@@ -32,9 +32,8 @@ use common::snapshot;
 
 /// The newest snapshot file for an HF repo whose basename matches `file` (the LoRA `.safetensors`).
 fn cache_file(repo: &str, file: &str) -> PathBuf {
-    let home = std::env::var("HOME").unwrap();
+    let home = std::env::var("MLX_GEN_MODELS_ROOT").expect("set MLX_GEN_MODELS_ROOT to the explicit models root (holds models--*/snapshots); inference never self-fetches or derives a cache location (epic 13657)");
     let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub")
         .join(format!("models--{}", repo.replace('/', "--")))
         .join("snapshots");
     let dir = std::fs::read_dir(&snaps)

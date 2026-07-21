@@ -47,19 +47,8 @@ use mlx_gen_sdxl::{
 use common::snapshot;
 
 fn lora_path() -> PathBuf {
-    if let Ok(p) = std::env::var("SDXL_LORA") {
-        return PathBuf::from(p);
-    }
-    let home = std::env::var("HOME").unwrap();
-    let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--latent-consistency--lcm-lora-sdxl/snapshots");
-    let dir = std::fs::read_dir(&snaps)
-        .expect("LCM-LoRA HF cache")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir())
-        .expect("a snapshot dir");
-    dir.join("pytorch_lora_weights.safetensors")
+    let p = std::env::var("SDXL_LORA").unwrap_or_else(|_| panic!("set SDXL_LORA to the required snapshot dir; inference never self-fetches or derives a cache location (epic 13657)"));
+    PathBuf::from(p)
 }
 
 fn lora_spec(scale: f32) -> AdapterSpec {

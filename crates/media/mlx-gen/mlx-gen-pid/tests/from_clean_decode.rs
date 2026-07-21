@@ -42,10 +42,8 @@ fn env_or(name: &str, default: String) -> String {
 
 fn gemma_snapshot() -> String {
     env_or("PID_GEMMA_DIR", {
-        let home = std::env::var("HOME").unwrap();
-        let base = format!(
-            "{home}/.cache/huggingface/hub/models--Efficient-Large-Model--gemma-2-2b-it/snapshots"
-        );
+        let home = std::env::var("MLX_GEN_MODELS_ROOT").expect("set MLX_GEN_MODELS_ROOT to the explicit models root (holds models--*/snapshots); inference never self-fetches or derives a cache location (epic 13657)");
+        let base = format!("{home}/models--Efficient-Large-Model--gemma-2-2b-it/snapshots");
         std::fs::read_dir(&base)
             .unwrap()
             .filter_map(|e| e.ok())

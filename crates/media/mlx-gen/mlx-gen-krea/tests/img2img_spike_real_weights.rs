@@ -11,7 +11,7 @@
 //! crossover is the slider working. Coherence must hold across the usable middle of the range.
 //!
 //! ```sh
-//! KREA_TURBO_DIR=~/.cache/huggingface/hub/models--SceneWorks--krea-2-turbo-mlx/snapshots/<rev>/q8 \
+//! KREA_TURBO_DIR=/path/to/models--SceneWorks--krea-2-turbo-mlx/snapshots/<rev>/q8 \
 //!   cargo test -p mlx-gen-krea --release --test img2img_spike_real_weights -- --ignored --nocapture
 //! ```
 //! (With no env, auto-resolves the newest cached `SceneWorks/krea-2-turbo-mlx` q8 turnkey.) PNGs +
@@ -46,18 +46,8 @@ const STEPS: usize = 8;
 
 /// Resolve the Q8 turnkey subdir (`KREA_TURBO_DIR` override, else the newest cached snapshot's `q8/`).
 fn snapshot() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("KREA_TURBO_DIR") {
-        return Some(PathBuf::from(p));
-    }
-    let home = std::env::var("HOME").ok()?;
-    let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--SceneWorks--krea-2-turbo-mlx/snapshots");
-    let rev = std::fs::read_dir(&snaps)
-        .ok()?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.join("q8").join("transformer").is_dir())?;
-    Some(rev.join("q8"))
+    let p = std::env::var("KREA_TURBO_DIR").ok()?;
+    Some(PathBuf::from(p))
 }
 
 /// (std, distinct-level-count, mean horizontal-adjacent-|Δ|). Coherent = broad histogram + spatial

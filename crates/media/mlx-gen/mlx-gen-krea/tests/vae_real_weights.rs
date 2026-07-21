@@ -5,7 +5,7 @@
 //!
 //! `#[ignore]` — needs the real snapshot + the golden (`tools/dump_krea_vae_golden.py`):
 //! ```sh
-//! KREA_TURBO_DIR=~/.cache/huggingface/hub/models--krea--Krea-2-Turbo/snapshots/<rev> \
+//! KREA_TURBO_DIR=/path/to/models--krea--Krea-2-Turbo/snapshots/<rev> \
 //!   cargo test -p mlx-gen-krea --release --test vae_real_weights -- --ignored --nocapture
 //! ```
 

@@ -24,8 +24,8 @@ fn snap(env: &str, repo: &str) -> PathBuf {
     if let Ok(p) = std::env::var(env) {
         return PathBuf::from(p);
     }
-    let home = std::env::var("HOME").unwrap();
-    let base = PathBuf::from(home).join(format!(".cache/huggingface/hub/{repo}/snapshots"));
+    let home = std::env::var("MLX_GEN_MODELS_ROOT").expect("set MLX_GEN_MODELS_ROOT to the explicit models root (holds models--*/snapshots); inference never self-fetches or derives a cache location (epic 13657)");
+    let base = PathBuf::from(home).join(format!("{repo}/snapshots"));
     std::fs::read_dir(&base)
         .unwrap_or_else(|_| panic!("snapshots dir for {repo}"))
         .filter_map(|e| e.ok())

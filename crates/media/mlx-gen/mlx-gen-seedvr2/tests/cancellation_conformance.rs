@@ -7,7 +7,7 @@
 //! further steps. The image-upscale path carries a `Conditioning::Reference` low-res input image.
 //!
 //! Snapshot-gated (skips when absent), matching the crate's `registry_e2e.rs` convention: it needs
-//! the raw `numz/SeedVR2_comfyUI` checkpoint dir (the 3B fp16 DiT) in the HF cache.
+//! the raw `numz/SeedVR2_comfyUI` checkpoint dir (the 3B fp16 DiT) under `MLX_GEN_MODELS_ROOT`.
 
 use std::path::PathBuf;
 
@@ -15,10 +15,10 @@ use mlx_gen::{Conditioning, GenerationRequest, Image, LoadSpec, WeightsSource};
 use mlx_gen_seedvr2::registry::MODEL_ID;
 
 /// The raw `numz/SeedVR2_comfyUI` checkpoint snapshot dir (mirrors `registry_e2e.rs::raw_dir`):
-/// returns `None` (→ skip) when the 3B checkpoint is not in the HF cache.
+/// returns `None` (→ skip) when the 3B checkpoint is not under `MLX_GEN_MODELS_ROOT`.
 fn raw_dir() -> Option<PathBuf> {
-    let base = PathBuf::from(std::env::var("HOME").ok()?)
-        .join(".cache/huggingface/hub/models--numz--SeedVR2_comfyUI/snapshots");
+    let base = PathBuf::from(std::env::var("MLX_GEN_MODELS_ROOT").ok()?)
+        .join("models--numz--SeedVR2_comfyUI/snapshots");
     let snap = std::fs::read_dir(&base).ok()?.flatten().next()?.path();
     snap.join("seedvr2_ema_3b_fp16.safetensors")
         .exists()

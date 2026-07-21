@@ -55,18 +55,8 @@ const SEED: u64 = 7;
 /// Resolve the SD3.5-Large snapshot dir: `SD3_LARGE_SNAPSHOT` override, else the first snapshot in the
 /// HF hub cache (mirrors `e2e_real_weights::snapshot`).
 fn snapshot() -> PathBuf {
-    if let Ok(p) = std::env::var("SD3_LARGE_SNAPSHOT") {
-        return PathBuf::from(p);
-    }
-    let home = std::env::var("HOME").expect("HOME");
-    let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--stabilityai--stable-diffusion-3.5-large/snapshots");
-    std::fs::read_dir(&snaps)
-        .unwrap_or_else(|_| panic!("no SD3.5-Large snapshots under {snaps:?}"))
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir())
-        .expect("set SD3_LARGE_SNAPSHOT or populate the HF hub cache")
+    let p = std::env::var("SD3_LARGE_SNAPSHOT").unwrap_or_else(|_| panic!("set SD3_LARGE_SNAPSHOT to the required snapshot dir; inference never self-fetches or derives a cache location (epic 13657)"));
+    PathBuf::from(p)
 }
 
 /// The diffusers empty-negative reference golden path (env override for a non-default location).

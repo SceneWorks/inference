@@ -45,13 +45,8 @@ const BRANCH_BLOCKS: usize = 7;
 /// The emulated device budget: a 32 GB Mac's ~24 GiB usable unified memory — the story's target point.
 const EMULATED_SAFE_GIB: f64 = 24.0;
 
-fn home() -> PathBuf {
-    PathBuf::from(std::env::var("HOME").unwrap())
-}
-
 fn hf_snapshot(model: &str) -> PathBuf {
-    let snaps = home()
-        .join(".cache/huggingface/hub")
+    let snaps = std::path::PathBuf::from(std::env::var("MLX_GEN_MODELS_ROOT").expect("set MLX_GEN_MODELS_ROOT to the explicit models root (holds models--*/snapshots); inference never self-fetches or derives a cache location (epic 13657)"))
         .join(model)
         .join("snapshots");
     std::fs::read_dir(&snaps)

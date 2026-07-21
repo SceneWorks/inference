@@ -26,37 +26,15 @@ const BITS: i32 = 4;
 const GROUP_SIZE: i32 = 64;
 
 fn snapshot() -> PathBuf {
-    if let Ok(p) = std::env::var("MLX_GEN_FLUX2_DEV_SNAPSHOT") {
-        return PathBuf::from(p);
-    }
-    let home = std::env::var("HOME").expect("HOME");
-    let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--black-forest-labs--FLUX.2-dev/snapshots");
-    std::fs::read_dir(&snaps)
-        .expect("snapshot dir")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir())
-        .expect("a snapshot dir under models--black-forest-labs--FLUX.2-dev/snapshots")
+    let p = std::env::var("MLX_GEN_FLUX2_DEV_SNAPSHOT").unwrap_or_else(|_| panic!("set MLX_GEN_FLUX2_DEV_SNAPSHOT to the required snapshot dir; inference never self-fetches or derives a cache location (epic 13657)"));
+    PathBuf::from(p)
 }
 
 /// The Fun-Controlnet-Union checkpoint (`-2602`, the CFG-distilled recommended one). Override with
 /// `MLX_GEN_FLUX2_CONTROL_CHECKPOINT` to point at the non-distilled file.
 fn control_checkpoint() -> PathBuf {
-    if let Ok(p) = std::env::var("MLX_GEN_FLUX2_CONTROL_CHECKPOINT") {
-        return PathBuf::from(p);
-    }
-    let home = std::env::var("HOME").expect("HOME");
-    let snaps = PathBuf::from(home).join(
-        ".cache/huggingface/hub/models--alibaba-pai--FLUX.2-dev-Fun-Controlnet-Union/snapshots",
-    );
-    let snap = std::fs::read_dir(&snaps)
-        .expect("control snapshot dir")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir())
-        .expect("a snapshot dir under models--alibaba-pai--FLUX.2-dev-Fun-Controlnet-Union");
-    snap.join("FLUX.2-dev-Fun-Controlnet-Union-2602.safetensors")
+    let p = std::env::var("MLX_GEN_FLUX2_CONTROL_CHECKPOINT").unwrap_or_else(|_| panic!("set MLX_GEN_FLUX2_CONTROL_CHECKPOINT to the required snapshot dir; inference never self-fetches or derives a cache location (epic 13657)"));
+    PathBuf::from(p)
 }
 
 /// Assemble a complete pre-quantized Q4 dev snapshot (shared TMPDIR with `dev_e2e_real_weights`):

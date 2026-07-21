@@ -27,18 +27,8 @@ fn golden_vae() -> PathBuf {
 }
 
 fn source_pth() -> PathBuf {
-    if let Ok(p) = std::env::var("WAN_VAE_PTH") {
-        return PathBuf::from(p);
-    }
-    let home = std::env::var("HOME").unwrap();
-    let snapshots =
-        PathBuf::from(home).join(".cache/huggingface/hub/models--Wan-AI--Wan2.2-TI2V-5B/snapshots");
-    std::fs::read_dir(&snapshots)
-        .unwrap_or_else(|_| panic!("no HF snapshots at {}", snapshots.display()))
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .find(|p| p.join("Wan2.2_VAE.pth").is_file())
-        .unwrap_or_else(|| panic!("Wan2.2_VAE.pth not found under {}", snapshots.display()))
-        .join("Wan2.2_VAE.pth")
+    let p = std::env::var("WAN_VAE_PTH").unwrap_or_else(|_| panic!("set WAN_VAE_PTH to the required snapshot dir; inference never self-fetches or derives a cache location (epic 13657)"));
+    PathBuf::from(p)
 }
 
 #[test]

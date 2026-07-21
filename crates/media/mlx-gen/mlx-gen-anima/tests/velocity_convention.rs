@@ -30,9 +30,8 @@ use mlx_gen_anima::Variant;
 /// Glob the Anima snapshot's `split_files/` dir from the HF cache (no hardcoded sha). Mirrors
 /// `tests/real_weights.rs`.
 fn split_files() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    let base = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--circlestone-labs--Anima/snapshots");
+    let home = std::env::var("MLX_GEN_MODELS_ROOT").ok()?;
+    let base = PathBuf::from(home).join("models--circlestone-labs--Anima/snapshots");
     std::fs::read_dir(&base)
         .ok()?
         .filter_map(|e| e.ok())

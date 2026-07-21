@@ -34,14 +34,9 @@ use std::path::PathBuf;
 
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 
-fn home() -> PathBuf {
-    PathBuf::from(std::env::var("HOME").unwrap())
-}
-
 /// First snapshot dir under an HF-cache `models--…` entry.
 fn hf_snapshot(model: &str) -> PathBuf {
-    let snaps = home()
-        .join(".cache/huggingface/hub")
+    let snaps = std::path::PathBuf::from(std::env::var("MLX_GEN_MODELS_ROOT").expect("set MLX_GEN_MODELS_ROOT to the explicit models root (holds models--*/snapshots); inference never self-fetches or derives a cache location (epic 13657)"))
         .join(model)
         .join("snapshots");
     std::fs::read_dir(&snaps)
