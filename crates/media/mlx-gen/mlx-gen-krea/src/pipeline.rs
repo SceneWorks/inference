@@ -26,7 +26,7 @@
 use mlx_rs::ops::{add, multiply, subtract};
 use mlx_rs::{random, Array, Dtype};
 
-use mlx_gen::adapters::loader::apply_adapters_strict;
+use mlx_gen::adapters::loader::apply_adapters_strict_with_diff_patch;
 use mlx_gen::array::scalar;
 use mlx_gen::image::{decoded_to_image, validate_multiple_of};
 use mlx_gen::img2img::{add_noise_by_interpolation, init_time_step, preprocess_init_image};
@@ -218,14 +218,20 @@ impl KreaHeavy {
     }
 
     /// Install Raw-trained LoRA/LoKr adapters onto the single-stream DiT (sc-7911). The shared
-    /// [`apply_adapters_strict`] seam parses PEFT/diffusers/kohya/LoKr files, folds alpha/rank, and
-    /// pushes a residual onto each matched `AdaptableLinear` — erroring (never silently dropping) on an
-    /// adapter target that matches no module. The `Krea2Transformer` adapter host routes the trained
-    /// `transformer_blocks.{i}.attn.{to_q,to_k,to_v,to_out.0}` paths (+ `text_fusion` + globals); the
-    /// residual stacks over the (possibly already-quantized) base, so it composes with the Q8/Q4
-    /// turnkey. Multiple + mixed LoRA/LoKr adapters stack by construction.
+    /// [`apply_adapters_strict_with_diff_patch`] seam parses PEFT/diffusers/kohya/LoKr files, folds
+    /// alpha/rank, and pushes a residual onto each matched `AdaptableLinear` — erroring (never silently
+    /// dropping) on an adapter target that matches no module. The `Krea2Transformer` adapter host routes
+    /// the trained `transformer_blocks.{i}.attn.{to_q,to_k,to_v,to_out.0}` paths (+ `text_fusion` +
+    /// globals); the residual stacks over the (possibly already-quantized) base, so it composes with the
+    /// Q8/Q4 turnkey. Multiple + mixed LoRA/LoKr adapters stack by construction.
+    ///
+    /// It **also** folds a ComfyUI/lightx2v `<module>.diff`/`.diff_b` **diff-patch** (a full-weight/bias
+    /// delta, e.g. the community `text_fusion.projector` filter-bypass) into the matched dense base
+    /// weights first (sc-13825, MLX parity for candle sc-13726) — disjoint by key suffix from the
+    /// low-rank residual pass, and dense on every tier (the projector is never quantized), so the fold
+    /// survives the subsequent `quantize`.
     pub fn apply_adapters(&mut self, specs: &[AdapterSpec]) -> Result<()> {
-        apply_adapters_strict(&mut self.dit, specs, "krea_2")?;
+        apply_adapters_strict_with_diff_patch(&mut self.dit, specs, "krea_2")?;
         Ok(())
     }
 

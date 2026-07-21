@@ -12,7 +12,9 @@
 //! coverage. Uses the committed tiny `dit_golden` fixture (runs on a fresh clone, no weights/Metal beyond
 //! the default suite).
 
+use mlx_gen::adapters::loader::apply_adapters_strict_with_diff_patch;
 use mlx_gen::adapters::{AdaptableHost, Adapter};
+use mlx_gen::runtime::{AdapterKind, AdapterSpec};
 use mlx_gen::weights::Weights;
 use mlx_gen_krea::{Krea2Config, Krea2Transformer};
 use mlx_rs::ops::{abs, max, subtract};
@@ -168,4 +170,71 @@ fn additive_lora_on_frontend_drives_forward() {
         delta > 1e-3,
         "front-end LoRA did not move the velocity (max_abs_diff {delta:e}) — additive residual is inert"
     );
+}
+
+/// sc-13825 (MLX parity for candle sc-13726) — a community Krea "filter-bypass" ships one ComfyUI
+/// diff-patch tensor `diffusion_model.txtfusion.projector.diff` (`[1, num_text_layers]`), a full-weight
+/// delta on the 12→1 `text_fusion.projector` collapse, not a LoRA/LoKr. It must fold `W += scale·δ` into
+/// the projector's **dense** base (the projector is never quantized) through the same prefix-strip +
+/// `txtfusion`→`text_fusion` alias the low-rank path uses — proving the diff-patch resolves and shape-
+/// matches on the REAL `Krea2Transformer` host (not just a mock), and no longer trips "no target
+/// modules matched". Runs on the committed tiny `dit_golden` fixture (fresh clone, no weights/Metal).
+#[test]
+fn projector_diff_patch_folds_into_dense_base() {
+    let w = load();
+    let mut dit = dit(&w);
+
+    // The projector is the 12→1 (here 3→1) collapse: a dense `[1, num_text_layers]` base.
+    let base = dit
+        .adaptable_mut(&["text_fusion", "projector"])
+        .expect("projector must route")
+        .dense_weight()
+        .expect("projector base is dense on every tier")
+        .0
+        .clone();
+    assert_eq!(base.shape(), &[1, 3], "projector base [1, num_text_layers]");
+
+    // The ComfyUI native key (`diffusion_model.` + the `txtfusion` container alias).
+    let delta = Array::from_slice(&[0.5f32, -0.5, 1.0], &[1, 3]);
+    let path = std::env::temp_dir().join("krea_projector_diff_patch.safetensors");
+    Array::save_safetensors(
+        vec![("diffusion_model.txtfusion.projector.diff", &delta)],
+        None,
+        &path,
+    )
+    .unwrap();
+
+    let report = apply_adapters_strict_with_diff_patch(
+        &mut dit,
+        &[AdapterSpec::new(path.clone(), 1.0, AdapterKind::Lora)],
+        "krea_2",
+    )
+    .expect("the projector diff-patch must fold, not error with 'no target modules matched'");
+    assert_eq!(report.applied, 1, "exactly the projector diff folded");
+
+    // The dense base is now W + δ (F32 fixture → exact).
+    let merged = dit
+        .adaptable_mut(&["text_fusion", "projector"])
+        .unwrap()
+        .dense_weight()
+        .unwrap()
+        .0
+        .clone();
+    let got_delta = subtract(
+        merged.as_dtype(Dtype::Float32).unwrap(),
+        base.as_dtype(Dtype::Float32).unwrap(),
+    )
+    .unwrap();
+    let err = max(
+        abs(subtract(got_delta, delta.as_dtype(Dtype::Float32).unwrap()).unwrap()).unwrap(),
+        false,
+    )
+    .unwrap()
+    .item::<f32>();
+    assert!(
+        err < 1e-5,
+        "projector base must equal W + δ (max_abs err {err:e})"
+    );
+
+    std::fs::remove_file(&path).ok();
 }

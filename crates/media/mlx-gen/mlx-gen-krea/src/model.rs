@@ -107,7 +107,8 @@ pub fn descriptor() -> ModelDescriptor {
             // Raw descriptor clears this (no Raw img2img entrypoint yet).
             conditioning: vec![ConditioningKind::Reference],
             // LoRA/LoKr trained on the undistilled Raw DiT (sc-7577) apply at Turbo inference via the
-            // shared `apply_adapters_strict` seam onto the `Krea2Transformer` adapter host (sc-7911).
+            // shared `apply_adapters_strict_with_diff_patch` seam onto the `Krea2Transformer` adapter
+            // host (sc-7911; the seam also folds a ComfyUI `.diff`/`.diff_b` diff-patch, sc-13825).
             // Family-match cross-apply, no base-model gating (the Lens / Z-Image precedent).
             supports_lora: true,
             supports_lokr: true,
