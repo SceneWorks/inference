@@ -34,13 +34,12 @@ use candle_audio_kokoro::gen_core::{
 
 const FIXTURE: &str = include_str!("fixtures/kokoro_82m_regression.json");
 
-/// Resolve the snapshot: `KOKORO_SNAPSHOT` env (a snapshot dir) or the pinned hub path.
+/// Resolve the snapshot from the required `KOKORO_SNAPSHOT` env (a passed-in `hexgrad/Kokoro-82M`
+/// snapshot dir). Inference never self-fetches or derives a cache location (epic 13657).
 fn snapshot() -> WeightsSource {
-    match std::env::var("KOKORO_SNAPSHOT") {
-        Ok(dir) => WeightsSource::Dir(PathBuf::from(dir)),
-        Err(_) => candle_audio_kokoro::resolve_pinned_snapshot()
-            .expect("resolve the pinned hexgrad/Kokoro-82M snapshot (network or warm HF cache)"),
-    }
+    WeightsSource::Dir(PathBuf::from(std::env::var("KOKORO_SNAPSHOT").expect(
+        "set KOKORO_SNAPSHOT to a hexgrad/Kokoro-82M snapshot dir (config.json + kokoro-v1_0.pth + voices/)",
+    )))
 }
 
 /// Pull a required field out of the fixture JSON, with a path-labeled panic on schema drift.

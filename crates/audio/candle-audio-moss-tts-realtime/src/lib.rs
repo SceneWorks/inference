@@ -65,10 +65,9 @@ pub mod prepare;
 pub mod sampling;
 
 pub use model::{
-    descriptor, load, load_generator, provider_registry, register_providers,
-    resolve_pinned_snapshot, CODEC_COMPONENT_ID, CODEC_HUB_REPO, CODEC_HUB_REVISION, HUB_REPO,
-    HUB_REVISION, LANGUAGES, MAX_DURATION_SECS, MODEL_ID, REGISTRATION, SAMPLE_RATE,
-    WEIGHT_LICENSE, WEIGHT_LICENSE_ENTRY,
+    descriptor, load, load_generator, provider_registry, register_providers, CODEC_COMPONENT_ID,
+    CODEC_HUB_REPO, CODEC_HUB_REVISION, HUB_REPO, HUB_REVISION, LANGUAGES, MAX_DURATION_SECS,
+    MODEL_ID, REGISTRATION, SAMPLE_RATE, WEIGHT_LICENSE, WEIGHT_LICENSE_ENTRY,
 };
 
 /// This crate's model-weight-license entries for catalog aggregation (sc-13332) — one row keyed by

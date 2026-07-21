@@ -8,10 +8,10 @@
 //! variant to materialize). A requested quantization is a typed `Unsupported`, never a silent dense
 //! fallback.
 //!
-//! NOTE: this preparer is **not** wired into `candle-audio-catalog` yet — the MOSS-TTSD provider is
-//! honest-partial (the XY_Tokenizer codec is not ported), so it is not registered into the shipping
-//! catalog. The probe/passthrough is exercised by this crate's own unit tests and is ready to wire in
-//! when the codec lands and the provider ships.
+//! This preparer is wired into `candle-audio-catalog` (its `can_prepare` sits on the audio-lane
+//! preparer chain), and the MOSS-TTSD provider is registered there: the XY_Tokenizer codec was
+//! ported (sc-13518) and is staged as the passed-in `codec` component (sc-13662). The
+//! probe/passthrough is additionally exercised by this crate's own unit tests.
 
 use std::path::Path;
 

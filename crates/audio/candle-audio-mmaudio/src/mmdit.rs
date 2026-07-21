@@ -54,7 +54,6 @@ use std::path::{Path, PathBuf};
 
 use candle_audio::candle_core::{DType, Device, Result as CResult, Tensor, D};
 use candle_audio::gen_core::WeightsSource;
-use candle_audio::hub::hf_get_pinned;
 use candle_audio::{AudioError, Result};
 use candle_nn::ops::{silu, softmax_last_dim};
 use candle_nn::{
@@ -1212,24 +1211,6 @@ pub const WEIGHT_LICENSE_ENTRY: candle_audio::gen_core::WeightLicenseEntry =
         license: WEIGHT_LICENSE,
     };
 
-/// Resolve the pinned small_16k network checkpoint through the audio lane's F-029 hub path.
-pub fn resolve_pinned_weights() -> Result<WeightsSource> {
-    Ok(WeightsSource::File(hf_get_pinned(
-        HUB_REPO,
-        HUB_REVISION,
-        WEIGHTS_PATH,
-    )?))
-}
-
-/// Resolve the pinned large_44k_v2 network checkpoint through the audio lane's F-029 hub path (sc-13441).
-pub fn resolve_pinned_weights_large_44k_v2() -> Result<WeightsSource> {
-    Ok(WeightsSource::File(hf_get_pinned(
-        HUB_REPO,
-        HUB_REVISION,
-        WEIGHTS_PATH_44K,
-    )?))
-}
-
 /// Load a generator with an explicit [`Config`] from a `.pth` network state dict.
 ///
 /// The `.pth` is the network state dict. The reference deletes the non-persistent
@@ -1250,7 +1231,7 @@ pub fn load_config_from_pth(cfg: Config, weights: &Path, device: &Device) -> Res
 pub fn load_from_pth(weights: &Path, device: &Device) -> Result<MmAudioDit> {
     if !weights.exists() {
         return Err(AudioError::Msg(format!(
-            "{MODEL_ID}: weights file {} not found (resolve_pinned_weights materializes {WEIGHTS_PATH})",
+            "{MODEL_ID}: weights file {} not found (pass {WEIGHTS_PATH} in via the LoadSpec)",
             weights.display()
         )));
     }
@@ -1261,7 +1242,7 @@ pub fn load_from_pth(weights: &Path, device: &Device) -> Result<MmAudioDit> {
 pub fn load_large_44k_v2_from_pth(weights: &Path, device: &Device) -> Result<MmAudioDit> {
     if !weights.exists() {
         return Err(AudioError::Msg(format!(
-            "{MODEL_ID_44K}: weights file {} not found (resolve_pinned_weights_large_44k_v2 materializes {WEIGHTS_PATH_44K})",
+            "{MODEL_ID_44K}: weights file {} not found (pass {WEIGHTS_PATH_44K} in via the LoadSpec)",
             weights.display()
         )));
     }

@@ -40,16 +40,10 @@ use mlx_llm::primitives::sampler::SamplingParams;
 use mlx_llm::primitives::Weights;
 use mlx_llm::provider::{eos_token_ids, PROVIDER_ID};
 
-/// Resolve the cached Qwen3-VL-8B-Instruct snapshot (rev 0c351dd0). `QWEN3VL_SNAPSHOT` overrides.
+/// Resolve a staged Qwen3-VL-8B-Instruct snapshot from the explicit passed-in `QWEN3VL_SNAPSHOT` env
+/// path. Inference never self-fetches or derives a cache location (epic 13657). `None` ⇒ self-skip.
 fn snapshot_dir() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("QWEN3VL_SNAPSHOT") {
-        let path = PathBuf::from(path);
-        return path.exists().then_some(path);
-    }
-    let home = std::env::var("HOME").ok()?;
-    let path = PathBuf::from(home).join(
-        ".cache/huggingface/hub/models--Qwen--Qwen3-VL-8B-Instruct/snapshots/0c351dd01ed87e9c1b53cbc748cba10e6187ff3b",
-    );
+    let path = PathBuf::from(std::env::var("QWEN3VL_SNAPSHOT").ok()?);
     path.exists().then_some(path)
 }
 

@@ -26,59 +26,21 @@ use candle_gen_flux2::config::Flux2Config;
 use candle_gen_flux2::convert_and_assemble;
 use candle_gen_flux2::transformer::Flux2Transformer;
 
-/// Base FLUX.2-klein-9B diffusers snapshot (env `CANDLE_FLUX2_SNAPSHOT` or the HF cache).
-///
-/// F-069/F-071 (sc-9055/sc-9057): the HF-cache roots come from the shared
-/// [`candle_gen::testkit::hf_cache_roots`] so this honours `$HF_HUB_CACHE` / `$HF_HOME` (not just the
-/// Unix `$HOME/.cache` default). The base-specific `transformer/` predicate is kept.
+/// Base FLUX.2-klein-9B diffusers snapshot from the required `CANDLE_FLUX2_SNAPSHOT` env (a passed-in
+/// snapshot dir). Inference never self-fetches or derives a cache location (epic 13657).
 fn base_snapshot() -> PathBuf {
-    if let Ok(p) = std::env::var("CANDLE_FLUX2_SNAPSHOT") {
-        return PathBuf::from(p);
-    }
-    for snaps in candle_gen::testkit::hf_cache_roots()
-        .into_iter()
-        .map(|r| r.join("models--black-forest-labs--FLUX.2-klein-9B/snapshots"))
-    {
-        let Ok(revs) = std::fs::read_dir(&snaps) else {
-            continue;
-        };
-        if let Some(dir) = revs
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .find(|p| p.is_dir() && p.join("transformer").is_dir())
-        {
-            return dir;
-        }
-    }
-    panic!("no base FLUX.2-klein-9B snapshot with transformer/ under any HF cache root")
+    PathBuf::from(std::env::var("CANDLE_FLUX2_SNAPSHOT").expect(
+        "set CANDLE_FLUX2_SNAPSHOT to a black-forest-labs/FLUX.2-klein-9B diffusers snapshot dir (holding transformer/)",
+    ))
 }
 
-/// wikeeyang true_v2 single-file transformer, bf16 (env `CANDLE_FLUX2_TRUE_V2_FILE` or the HF cache).
-/// This is the exact file the SceneWorks manifest's `convertSourceFile` targets.
-///
-/// F-069/F-071: HF-cache roots via the shared [`candle_gen::testkit::hf_cache_roots`] (honours
-/// `$HF_HUB_CACHE` / `$HF_HOME`). The specific `*-bf16.safetensors` filename predicate is kept.
+/// wikeeyang true_v2 single-file transformer (bf16) from the required `CANDLE_FLUX2_TRUE_V2_FILE`
+/// env — the exact file the SceneWorks manifest's `convertSourceFile` targets. Inference never
+/// self-fetches or derives a cache location (epic 13657).
 fn true_v2_bf16_file() -> PathBuf {
-    if let Ok(p) = std::env::var("CANDLE_FLUX2_TRUE_V2_FILE") {
-        return PathBuf::from(p);
-    }
-    for snaps in candle_gen::testkit::hf_cache_roots()
-        .into_iter()
-        .map(|r| r.join("models--wikeeyang--Flux2-Klein-9B-True-V2/snapshots"))
-    {
-        let Ok(revs) = std::fs::read_dir(&snaps) else {
-            continue;
-        };
-        for snap in revs.filter_map(|e| e.ok()).map(|e| e.path()) {
-            let file = snap.join("Flux2-Klein-9B-True-v2-bf16.safetensors");
-            if file.is_file() {
-                return file;
-            }
-        }
-    }
-    panic!(
-        "missing wikeeyang true_v2 Flux2-Klein-9B-True-v2-bf16.safetensors under any HF cache root"
-    )
+    PathBuf::from(std::env::var("CANDLE_FLUX2_TRUE_V2_FILE").expect(
+        "set CANDLE_FLUX2_TRUE_V2_FILE to the wikeeyang Flux2-Klein-9B-True-v2-bf16.safetensors file",
+    ))
 }
 
 #[test]

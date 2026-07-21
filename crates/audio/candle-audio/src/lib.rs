@@ -14,10 +14,6 @@
 //! discovery. This crate is the single audited home for the machinery every candle
 //! audio provider needs (the sibling of `candle-gen` for the media families):
 //!
-//! - [`hub`] — pinned-revision hf-hub weight resolution into [`gen_core::WeightsSource`],
-//!   the F-029 supply-chain discipline (never the mutable `main` revision) applied to
-//!   audio model files, so audio providers ride the same `LoadSpec` snapshot flow as
-//!   every other provider family.
 //! - [`dsp`] — Hann windowing, forward STFT, and the inverse-STFT overlap-add
 //!   reconstruction an iSTFT-Net-style vocoder head needs (Kokoro / StyleTTS2,
 //!   sc-12836).
@@ -50,15 +46,8 @@ use thiserror::Error;
 
 pub mod dsp;
 pub mod harness;
-pub mod hub;
 pub mod mel;
 pub mod wav;
-
-// Test-support helpers (HF-cache snapshot resolution). Feature-gated so it never compiles
-// into a production build — provider crates enable `candle-audio/testkit` under
-// `[dev-dependencies]`, mirroring `candle-gen`'s testkit seam (sc-9055 / F-069).
-#[cfg(feature = "testkit")]
-pub mod testkit;
 
 /// The candle-backed audio-crate error. gen-core cannot name candle types, so device/tensor
 /// failures arrive boxed in [`gen_core::Error::Backend`] via the [`From`] bridge below —

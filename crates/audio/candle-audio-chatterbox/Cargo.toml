@@ -38,8 +38,6 @@ rand = { workspace = true }
 rand_distr = { workspace = true }
 
 [dev-dependencies]
-# HF-cache snapshot resolution for the `#[ignore]`d real-weight conformance test.
-candle-audio = { path = "../candle-audio", features = ["testkit"] }
 # The real-weight conformance test generates its reference clips with Kokoro (the sanctioned
 # Kokoro-generated reference-audio path) and measures voice similarity with the chatterbox_ve
 # embedder (already a runtime dependency above).

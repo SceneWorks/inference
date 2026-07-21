@@ -24,11 +24,9 @@ candle-gen-pid = { path = "../candle-gen-pid" }
 rand = { workspace = true }
 
 [dev-dependencies]
-# The txt2img example fetches the WHOLE SANA HF repo snapshot (model-download convention — every
-# sibling, not a pinned allow-list) into the HF cache before loading.
-hf-hub = { workspace = true }
-# Shared test-support helpers (PPM IO / cosine / HF-cache resolution / GPU peak-VRAM probe) behind
-# candle-gen's `testkit` feature (mirrors candle-gen-pid / candle-gen-krea test IO).
+# Shared test-support helpers (PPM IO / cosine / GPU peak-VRAM probe) behind candle-gen's `testkit`
+# feature (mirrors candle-gen-pid / candle-gen-krea test IO). The txt2img examples take an explicit
+# pre-downloaded snapshot dir (--snapshot / SANA_SNAPSHOT); inference never self-fetches (epic 13657).
 candle-gen = { path = "../candle-gen", features = ["testkit"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 

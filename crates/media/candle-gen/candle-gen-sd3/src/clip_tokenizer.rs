@@ -192,10 +192,9 @@ mod tests {
     //    CLIP-L, `laion/CLIP-ViT-bigG-14-laion2B-39B-b160k` for bigG) ship all three files together —
     //    these are the portable source of truth, mirroring `candle-gen-clip`'s F-069/F-071 resolver use.
     //
-    // All resolution routes through the shared `candle_gen::testkit::hf_snapshot_dir` HF-cache resolver
-    // (`$HF_HUB_CACHE` → `$HF_HOME/hub` → `<home>/.cache/huggingface/hub`), so the tests run on ANY
-    // machine with the weights cached. `SD35_LARGE_PATH`/`SD35_MEDIUM_PATH` (the crate's existing C6
-    // snapshot-root overrides) take precedence for the synthesis source when set.
+    // All resolution is from explicit passed-in env paths — inference never self-fetches or derives a
+    // cache location (epic 13657). `SD35_LARGE_PATH`/`SD35_MEDIUM_PATH` supply the SD3.5 synthesis
+    // sources; `CLIP_VIT_L14_SNAPSHOT`/`CLIP_BIGG14_SNAPSHOT` supply the canonical CLIP references.
 
     /// SD3.5 snapshot roots from the C6 env overrides, if set (a full diffusers snapshot dir).
     fn sd35_env_snapshot_roots() -> Vec<PathBuf> {
@@ -212,17 +211,9 @@ mod tests {
     fn synthesis_source_dirs() -> Vec<PathBuf> {
         let mut dirs: Vec<PathBuf> = Vec::new();
 
-        // SD3.5 diffusers snapshots: two CLIP tokenizer subdirs each (vocab+merges, no tokenizer.json).
-        let mut sd35_roots = sd35_env_snapshot_roots();
-        for repo in [
-            "stabilityai/stable-diffusion-3.5-large",
-            "stabilityai/stable-diffusion-3.5-medium",
-        ] {
-            if let Some(snap) = candle_gen::testkit::hf_snapshot_dir(repo) {
-                sd35_roots.push(snap);
-            }
-        }
-        for root in sd35_roots {
+        // SD3.5 diffusers snapshots (from SD35_LARGE_PATH / SD35_MEDIUM_PATH): two CLIP tokenizer
+        // subdirs each (vocab+merges, no tokenizer.json).
+        for root in sd35_env_snapshot_roots() {
             dirs.push(root.join("tokenizer"));
             dirs.push(root.join("tokenizer_2"));
         }
@@ -233,15 +224,16 @@ mod tests {
     }
 
     /// Dirs shipping a real canonical CLIP `tokenizer.json` (alongside `vocab.json`+`merges.txt`) to
-    /// assert synthesized-vs-canonical parity against. Only the canonical CLIP repos qualify.
+    /// assert synthesized-vs-canonical parity against, from explicit passed-in env paths
+    /// (`CLIP_VIT_L14_SNAPSHOT` = `openai/clip-vit-large-patch14`, `CLIP_BIGG14_SNAPSHOT` =
+    /// `laion/CLIP-ViT-bigG-14-laion2B-39B-b160k`). Inference never self-fetches (epic 13657).
     fn canonical_reference_dirs() -> Vec<PathBuf> {
-        [
-            "openai/clip-vit-large-patch14",
-            "laion/CLIP-ViT-bigG-14-laion2B-39B-b160k",
-        ]
-        .into_iter()
-        .filter_map(candle_gen::testkit::hf_snapshot_dir)
-        .collect()
+        ["CLIP_VIT_L14_SNAPSHOT", "CLIP_BIGG14_SNAPSHOT"]
+            .into_iter()
+            .filter_map(|k| std::env::var(k).ok())
+            .filter(|p| !p.is_empty())
+            .map(PathBuf::from)
+            .collect()
     }
 
     const PROMPTS: &[&str] = &[
@@ -320,10 +312,9 @@ mod tests {
         // real failure — NOT a silent vacuous pass (the old bug: it `eprintln!`'d and returned green).
         assert!(
             exercised > 0,
-            "no canonical CLIP tokenizer.json found — checked the HF cache \
-             ($HF_HUB_CACHE / $HF_HOME/hub / <home>/.cache/huggingface/hub) for \
-             openai/clip-vit-large-patch14 and laion/CLIP-ViT-bigG-14-laion2B-39B-b160k; \
-             cache a canonical CLIP snapshot before running this `--ignored` test"
+            "no canonical CLIP tokenizer.json found — set CLIP_VIT_L14_SNAPSHOT (openai/clip-vit-large-patch14) \
+             and/or CLIP_BIGG14_SNAPSHOT (laion/CLIP-ViT-bigG-14-laion2B-39B-b160k) to a staged snapshot dir \
+             before running this `--ignored` test"
         );
         eprintln!("parity: synthesized == canonical over {exercised} CLIP tokenizer dir(s)");
     }

@@ -26,8 +26,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { workspace = true }
 
 [dev-dependencies]
-# HF-cache snapshot resolution + the WAV writer for the `#[ignore]`d real-weight conformance test.
-candle-audio = { path = "../candle-audio", features = ["testkit"] }
 # The backend-neutral audio-generator conformance suite (multi-speaker gate, seed determinism).
 sceneworks-gen-core-testkit = { workspace = true }
 # The Chatterbox voice encoder — the acoustic multi-speaker DoD measures cross-segment vs

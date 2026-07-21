@@ -47,19 +47,14 @@ fn fixed_latent(dev: &Device) -> Tensor {
 }
 
 fn resolve_source(env: &str) -> WeightsSource {
-    if let Ok(p) = std::env::var(env) {
-        let path = std::path::PathBuf::from(&p);
-        return if path.is_dir() {
-            WeightsSource::Dir(path)
-        } else {
-            WeightsSource::File(path)
-        };
-    }
-    match env {
-        "MMAUDIO_VAE_44K_SNAPSHOT" => {
-            mm::output::resolve_pinned_vae_44k().expect("resolve pinned v1-44.pth")
-        }
-        _ => mm::output::resolve_pinned_bigvgan_v2().expect("resolve pinned bigvgan_generator.pt"),
+    // Required env path — inference never self-fetches or derives a cache location (epic 13657).
+    let p = std::env::var(env)
+        .unwrap_or_else(|_| panic!("set {env} to the weights file or its snapshot dir"));
+    let path = std::path::PathBuf::from(&p);
+    if path.is_dir() {
+        WeightsSource::Dir(path)
+    } else {
+        WeightsSource::File(path)
     }
 }
 

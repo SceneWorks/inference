@@ -358,16 +358,15 @@ mod tests {
     use candle_core::Device;
     use std::collections::HashMap;
 
-    /// Resolve the cached `openai/clip-vit-large-patch14` snapshot dir from the HF Hub cache.
-    ///
-    /// F-071 (sc-9057) + F-069 (sc-9055): the earlier resolution hard-coded `$HOME/.cache/huggingface`,
-    /// a Unix assumption — on the Windows-primary dev box `HOME` is often unset and the cache lives at
-    /// `D:\.cache\huggingface` (`HF_HOME`). This now routes onto the single shared resolver
-    /// [`candle_gen::testkit::require_hf_snapshot_dir`], which honours `$HF_HUB_CACHE`, then
-    /// `$HF_HOME/hub`, then the user-home `.cache/huggingface/hub` default (`USERPROFILE` on Windows,
-    /// `HOME` elsewhere), returning the first `snapshots/<rev>/` subdir that exists.
+    /// Resolve the `openai/clip-vit-large-patch14` snapshot dir from the required
+    /// `CLIP_VIT_L14_SNAPSHOT` env (a passed-in snapshot dir). Inference never self-fetches or derives
+    /// a cache location (epic 13657); the real-weight harness points this at a materialized snapshot.
     fn clip_snapshot_dir() -> PathBuf {
-        candle_gen::testkit::require_hf_snapshot_dir("openai/clip-vit-large-patch14")
+        PathBuf::from(
+            std::env::var("CLIP_VIT_L14_SNAPSHOT").expect(
+                "set CLIP_VIT_L14_SNAPSHOT to an openai/clip-vit-large-patch14 snapshot dir",
+            ),
+        )
     }
 
     #[test]

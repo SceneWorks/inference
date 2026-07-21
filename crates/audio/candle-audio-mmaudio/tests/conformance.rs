@@ -27,21 +27,20 @@ use candle_audio_mmaudio as sf;
 use candle_audio_mmaudio::candle_audio::candle_core::Device;
 use image::{Rgb, RgbImage};
 
-/// Resolve the encoder: `SYNCHFORMER_SNAPSHOT` override or the pinned hub file.
+/// Resolve the encoder from the required `SYNCHFORMER_SNAPSHOT` env path — inference never
+/// self-fetches or derives a cache location (epic 13657).
 fn load_encoder() -> sf::SynchformerVisualEncoder {
     let dev = Device::Cpu;
-    if let Ok(p) = std::env::var("SYNCHFORMER_SNAPSHOT") {
-        let path = std::path::PathBuf::from(&p);
-        return if path.is_dir() {
-            sf::load(&sf::gen_core::WeightsSource::Dir(path), &dev)
-                .expect("load synchformer from SYNCHFORMER_SNAPSHOT dir")
-        } else {
-            sf::load_from_pth(&path, &dev).expect("load synchformer from SYNCHFORMER_SNAPSHOT file")
-        };
+    let p = std::env::var("SYNCHFORMER_SNAPSHOT").expect(
+        "set SYNCHFORMER_SNAPSHOT to a synchformer_state_dict.pth file or its snapshot dir",
+    );
+    let path = std::path::PathBuf::from(&p);
+    if path.is_dir() {
+        sf::load(&sf::gen_core::WeightsSource::Dir(path), &dev)
+            .expect("load synchformer from SYNCHFORMER_SNAPSHOT dir")
+    } else {
+        sf::load_from_pth(&path, &dev).expect("load synchformer from SYNCHFORMER_SNAPSHOT file")
     }
-    let src = sf::resolve_pinned_weights()
-        .expect("resolve the pinned synchformer_state_dict.pth (network or warm HF cache)");
-    sf::load(&src, &dev).expect("load the synchformer visual encoder")
 }
 
 /// A synthetic RGB frame: a moving gradient whose phase depends on `t` (frame index) and `clip`.

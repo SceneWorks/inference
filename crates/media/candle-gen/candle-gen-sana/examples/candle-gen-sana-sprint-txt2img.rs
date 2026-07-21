@@ -10,17 +10,15 @@
 //! Sprint is CFG-free (the guidance scale is an EMBEDDED scalar, not classifier-free) and few-step:
 //! default 2 steps, guidance 4.5; try `--steps 1` and `--steps 4`.
 //!
-//! Weights: `--repo <hf_id>` downloads the WHOLE Hugging Face repo snapshot (the model-download
-//! convention — every sibling, not a pinned allow-list) into the HF cache and loads from there, OR
-//! `--snapshot <dir>` loads a pre-downloaded snapshot. `--repo` defaults to the public
-//! `Efficient-Large-Model/Sana_Sprint_1.6B_1024px_diffusers`.
+//! Weights: point `--snapshot <dir>` (or the `SANA_SPRINT_SNAPSHOT` env var) at a pre-downloaded
+//! `Efficient-Large-Model/Sana_Sprint_1.6B_1024px_diffusers` snapshot directory. Inference never
+//! self-fetches or derives an HF-cache location (epic 13657); stage the snapshot out-of-band.
 //!
 //! Build/run on the Windows/Blackwell box (MSVC 14.44 vcvars, CUDA_COMPUTE_CAP=120):
 //!
 //! ```text
-//! set HF_HUB_CACHE=E:\huggingface\hub
 //! cargo run --release --example candle-gen-sana-sprint-txt2img --features cuda -- \
-//!   --repo Efficient-Large-Model/Sana_Sprint_1.6B_1024px_diffusers \
+//!   --snapshot E:\snapshots\Sana_Sprint_1.6B_1024px_diffusers \
 //!   --prompt "a red panda on a mossy log in a misty forest, cinematic lighting" \
 //!   --width 1024 --height 1024 --steps 2 --guidance 4.5 --seed 42 --out sana_sprint.png
 //! ```
@@ -39,34 +37,6 @@ fn arg(args: &[String], key: &str) -> Option<String> {
         .and_then(|i| args.get(i + 1).cloned())
 }
 
-/// Download the WHOLE Hugging Face repo snapshot (every sibling file — the model-download convention,
-/// not a pinned allow-list) into the HF cache and return the snapshot directory. Files already present
-/// in the cache are not re-fetched.
-fn download_whole_repo(repo_id: &str) -> Result<PathBuf> {
-    use hf_hub::api::sync::ApiBuilder;
-
-    println!("[sana-sprint] downloading whole HF repo {repo_id} (cached files are reused)…");
-    let api = ApiBuilder::new().build()?;
-    let repo = api.model(repo_id.to_string());
-    let info = repo.info()?;
-    let mut snapshot_root: Option<PathBuf> = None;
-    for sib in &info.siblings {
-        let local = repo.get(&sib.rfilename)?;
-        if sib.rfilename == "model_index.json" {
-            snapshot_root = local.parent().map(|p| p.to_path_buf());
-        }
-    }
-    let root = snapshot_root
-        .or_else(|| {
-            repo.get(&info.siblings.first()?.rfilename)
-                .ok()
-                .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-        })
-        .ok_or("could not resolve the downloaded snapshot directory")?;
-    println!("[sana-sprint] snapshot at {}", root.display());
-    Ok(root)
-}
-
 fn tensor_stats(pixels: &[u8]) -> (u8, u8, f64) {
     let (mut lo, mut hi, mut sum) = (u8::MAX, u8::MIN, 0f64);
     for &p in pixels {
@@ -80,15 +50,13 @@ fn tensor_stats(pixels: &[u8]) -> (u8, u8, f64) {
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
-    let snapshot = match arg(&args, "--snapshot") {
-        Some(dir) => PathBuf::from(dir),
-        None => {
-            let repo = arg(&args, "--repo").unwrap_or_else(|| {
-                "Efficient-Large-Model/Sana_Sprint_1.6B_1024px_diffusers".into()
-            });
-            download_whole_repo(&repo)?
-        }
-    };
+    // Weights: --snapshot <dir> or the SANA_SPRINT_SNAPSHOT env — an explicit pre-downloaded snapshot
+    // dir. Inference never self-fetches or derives an HF-cache location (epic 13657).
+    let snapshot = PathBuf::from(
+        arg(&args, "--snapshot")
+            .or_else(|| std::env::var("SANA_SPRINT_SNAPSHOT").ok())
+            .ok_or("pass --snapshot <dir> or set SANA_SPRINT_SNAPSHOT to an Efficient-Large-Model/Sana_Sprint_1.6B_1024px_diffusers snapshot dir")?,
+    );
 
     let prompt = arg(&args, "--prompt").unwrap_or_else(|| {
         "a red panda on a mossy log in a misty forest, cinematic lighting, highly detailed".into()

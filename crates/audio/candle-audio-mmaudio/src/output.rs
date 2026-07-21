@@ -19,7 +19,6 @@ use std::path::{Path, PathBuf};
 
 use candle_audio::candle_core::{DType, Device, Result as CResult, Tensor};
 use candle_audio::gen_core::{WeightLicense, WeightLicenseEntry, WeightsSource};
-use candle_audio::hub::hf_get_pinned;
 use candle_audio::{AudioError, Result};
 use candle_nn::VarBuilder;
 
@@ -218,44 +217,6 @@ pub const BIGVGAN_V2_WEIGHT_LICENSE_ENTRY: WeightLicenseEntry = WeightLicenseEnt
     license: BIGVGAN_V2_WEIGHT_LICENSE,
 };
 
-// ---- Pinned resolution --------------------------------------------------------------------------
-
-/// Resolve the pinned 16k mel-VAE checkpoint through the audio lane's F-029 hub path.
-pub fn resolve_pinned_vae() -> Result<WeightsSource> {
-    Ok(WeightsSource::File(hf_get_pinned(
-        HUB_REPO,
-        HUB_REVISION,
-        VAE_WEIGHTS_PATH,
-    )?))
-}
-
-/// Resolve the pinned 16k BigVGAN checkpoint through the audio lane's F-029 hub path.
-pub fn resolve_pinned_bigvgan() -> Result<WeightsSource> {
-    Ok(WeightsSource::File(hf_get_pinned(
-        HUB_REPO,
-        HUB_REVISION,
-        BIGVGAN_WEIGHTS_PATH,
-    )?))
-}
-
-/// Resolve the pinned 44k mel-VAE checkpoint (`v1-44.pth`) through the audio lane's F-029 hub path.
-pub fn resolve_pinned_vae_44k() -> Result<WeightsSource> {
-    Ok(WeightsSource::File(hf_get_pinned(
-        HUB_REPO,
-        HUB_REVISION,
-        VAE_WEIGHTS_PATH_44K,
-    )?))
-}
-
-/// Resolve the pinned NVIDIA BigVGAN v2 44k checkpoint through the audio lane's F-029 hub path.
-pub fn resolve_pinned_bigvgan_v2() -> Result<WeightsSource> {
-    Ok(WeightsSource::File(hf_get_pinned(
-        BIGVGAN_V2_HUB_REPO,
-        BIGVGAN_V2_HUB_REVISION,
-        BIGVGAN_V2_WEIGHTS_PATH,
-    )?))
-}
-
 fn source_to_path(source: &WeightsSource, filename: &str, nested: &str) -> PathBuf {
     match source {
         WeightsSource::File(p) => p.clone(),
@@ -274,7 +235,7 @@ fn source_to_path(source: &WeightsSource, filename: &str, nested: &str) -> PathB
 pub fn load_vae_from_pth(weights: &Path, device: &Device) -> Result<MelVaeDecoder> {
     if !weights.exists() {
         return Err(AudioError::Msg(format!(
-            "{VAE_MODEL_ID}: weights file {} not found (resolve_pinned_vae materializes {VAE_WEIGHTS_PATH})",
+            "{VAE_MODEL_ID}: weights file {} not found (pass {VAE_WEIGHTS_PATH} in via the LoadSpec)",
             weights.display()
         )));
     }
@@ -287,7 +248,7 @@ pub fn load_vae_from_pth(weights: &Path, device: &Device) -> Result<MelVaeDecode
 pub fn load_bigvgan_from_pth(weights: &Path, device: &Device) -> Result<BigVganVocoder> {
     if !weights.exists() {
         return Err(AudioError::Msg(format!(
-            "{BIGVGAN_MODEL_ID}: weights file {} not found (resolve_pinned_bigvgan materializes {BIGVGAN_WEIGHTS_PATH})",
+            "{BIGVGAN_MODEL_ID}: weights file {} not found (pass {BIGVGAN_WEIGHTS_PATH} in via the LoadSpec)",
             weights.display()
         )));
     }
@@ -313,7 +274,7 @@ pub fn load_bigvgan(source: &WeightsSource, device: &Device) -> Result<BigVganVo
 pub fn load_vae_44k_from_pth(weights: &Path, device: &Device) -> Result<MelVaeDecoder> {
     if !weights.exists() {
         return Err(AudioError::Msg(format!(
-            "{VAE_MODEL_ID_44K}: weights file {} not found (resolve_pinned_vae_44k materializes {VAE_WEIGHTS_PATH_44K})",
+            "{VAE_MODEL_ID_44K}: weights file {} not found (pass {VAE_WEIGHTS_PATH_44K} in via the LoadSpec)",
             weights.display()
         )));
     }
@@ -327,7 +288,7 @@ pub fn load_vae_44k_from_pth(weights: &Path, device: &Device) -> Result<MelVaeDe
 pub fn load_bigvgan_v2_from_pth(weights: &Path, device: &Device) -> Result<BigVganVocoder> {
     if !weights.exists() {
         return Err(AudioError::Msg(format!(
-            "{BIGVGAN_V2_MODEL_ID}: weights file {} not found (resolve_pinned_bigvgan_v2 materializes {BIGVGAN_V2_WEIGHTS_PATH})",
+            "{BIGVGAN_V2_MODEL_ID}: weights file {} not found (pass {BIGVGAN_V2_WEIGHTS_PATH} in via the LoadSpec)",
             weights.display()
         )));
     }

@@ -40,8 +40,6 @@ zip = { version = "7.2", default-features = false }
 cmudict-fast = { version = "0.8.0", default-features = false }
 
 [dev-dependencies]
-# HF-cache snapshot resolution for the `#[ignore]`d real-weight conformance test.
-candle-audio = { path = "../candle-audio", features = ["testkit"] }
 # The backend-neutral generator conformance suite (validate-honesty, progress, typed
 # cancellation, seed determinism) the real-weight test runs against the loaded provider.
 sceneworks-gen-core-testkit = { workspace = true }

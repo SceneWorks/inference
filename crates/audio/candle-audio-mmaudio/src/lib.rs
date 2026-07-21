@@ -101,8 +101,8 @@ pub mod vae;
 pub use clip::DfnClipEncoder;
 pub use mmdit::{Conditions, Config as MmDitConfig, MmAudioDit};
 pub use model::{
-    load, load_from_pth, resolve_pinned_weights, HUB_REPO, HUB_REVISION, MODEL_ID, WEIGHTS_PATH,
-    WEIGHT_LICENSE, WEIGHT_LICENSE_ENTRY,
+    load, load_from_pth, HUB_REPO, HUB_REVISION, MODEL_ID, WEIGHTS_PATH, WEIGHT_LICENSE,
+    WEIGHT_LICENSE_ENTRY,
 };
 pub use sync::SynchformerVisualEncoder;
 

@@ -40,18 +40,12 @@ use candle_audio_moss_tts::gen_core::{
     AudioParams, AudioTrack, GenerationRequest, Generator, LoadSpec, SpeechSegment, WeightsSource,
 };
 
-/// Resolve a MOSS-TTSD snapshot dir. `MOSS_TTSD_SNAPSHOT` overrides; otherwise the pinned snapshot is
-/// fetched via the hub.
+/// Resolve a MOSS-TTSD snapshot dir from the required `MOSS_TTSD_SNAPSHOT` env (a passed-in AR
+/// snapshot dir). Inference never self-fetches or derives a cache location (epic 13657).
 fn snapshot() -> PathBuf {
-    if let Ok(dir) = std::env::var("MOSS_TTSD_SNAPSHOT") {
-        return PathBuf::from(dir);
-    }
-    match moss::resolve_pinned_snapshot()
-        .expect("resolve the pinned MOSS-TTSD-v0.5 snapshot (network or warm HF cache)")
-    {
-        WeightsSource::Dir(p) => p,
-        other => panic!("expected a snapshot dir, got {other:?}"),
-    }
+    PathBuf::from(std::env::var("MOSS_TTSD_SNAPSHOT").expect(
+        "set MOSS_TTSD_SNAPSHOT to a MOSS-TTSD-v0.5 AR snapshot dir (config.json + model.safetensors + tokenizer)",
+    ))
 }
 
 /// The XY_Tokenizer codec, staged as the passed-in `codec` component (sc-13662, epic 13657).
@@ -226,13 +220,12 @@ fn moss_ttsd_two_speaker_script_shapes_the_token_stream() {
 /// The `chatterbox_ve` 256-d speaker embedding of a waveform slice (any sample rate; the encoder
 /// resamples internally). Built once per call — the DoD only embeds a handful of segments.
 fn ve_embed(samples: &[f32]) -> Vec<f32> {
-    let spec = LoadSpec::new(match std::env::var("CHATTERBOX_VE_SNAPSHOT") {
-        Ok(dir) => {
-            WeightsSource::File(PathBuf::from(dir).join(candle_audio_chatterbox_ve::WEIGHTS_FILE))
-        }
-        Err(_) => candle_audio_chatterbox_ve::resolve_pinned_file()
-            .expect("resolve the pinned chatterbox_ve weights"),
-    });
+    let spec = LoadSpec::new(WeightsSource::File(
+        PathBuf::from(std::env::var("CHATTERBOX_VE_SNAPSHOT").expect(
+            "set CHATTERBOX_VE_SNAPSHOT to a ResembleAI/chatterbox snapshot dir holding ve.safetensors",
+        ))
+        .join(candle_audio_chatterbox_ve::WEIGHTS_FILE),
+    ));
     let embedder = candle_audio_chatterbox_ve::load(&spec).expect("load chatterbox_ve");
     let track = AudioTrack {
         samples: samples.to_vec(),

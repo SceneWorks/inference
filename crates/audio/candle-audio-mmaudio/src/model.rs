@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 
 use candle_audio::candle_core::{DType, Device};
 use candle_audio::gen_core::WeightsSource;
-use candle_audio::hub::hf_get_pinned;
 use candle_audio::{AudioError, Result};
 use candle_nn::VarBuilder;
 
@@ -57,16 +56,6 @@ pub const WEIGHT_LICENSE_ENTRY: candle_audio::gen_core::WeightLicenseEntry =
         license: WEIGHT_LICENSE,
     };
 
-/// Resolve the pinned Synchformer checkpoint file through the audio lane's F-029 hub path.
-/// Returns a [`WeightsSource::File`] pointing at the resolved `synchformer_state_dict.pth`.
-pub fn resolve_pinned_weights() -> Result<WeightsSource> {
-    Ok(WeightsSource::File(hf_get_pinned(
-        HUB_REPO,
-        HUB_REVISION,
-        WEIGHTS_PATH,
-    )?))
-}
-
 /// Load the Synchformer visual encoder from a `synchformer_state_dict.pth` file path.
 ///
 /// The `.pth` holds the full Synchformer state dict (visual + audio branches + the AV sync
@@ -75,7 +64,7 @@ pub fn resolve_pinned_weights() -> Result<WeightsSource> {
 pub fn load_from_pth(weights: &Path, device: &Device) -> Result<SynchformerVisualEncoder> {
     if !weights.exists() {
         return Err(AudioError::Msg(format!(
-            "{MODEL_ID}: weights file {} not found (resolve_pinned_weights materializes {WEIGHTS_PATH})",
+            "{MODEL_ID}: weights file {} not found (pass {WEIGHTS_PATH} in via the LoadSpec)",
             weights.display()
         )));
     }

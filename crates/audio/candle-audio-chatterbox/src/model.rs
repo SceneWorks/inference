@@ -38,8 +38,6 @@ use candle_audio::gen_core::{
     ConditioningKind, GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality,
     ModelDescriptor, Progress, VoiceEmbedder, WeightsSource,
 };
-use candle_audio::hub::{hf_get_pinned, pinned_snapshot_dir};
-use candle_audio::Result as AudioResult;
 use candle_nn::VarBuilder;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
@@ -329,7 +327,7 @@ impl ChatterboxGenerator {
             let path = self.t3_path();
             if !path.is_file() {
                 return Err(gen_core::Error::Msg(format!(
-                    "{MODEL_ID}: T3 weights {} missing (resolve_pinned_snapshot materializes {T3_WEIGHTS_FILE})",
+                    "{MODEL_ID}: T3 weights {} missing (the passed-in snapshot must supply {T3_WEIGHTS_FILE})",
                     path.display()
                 )));
             }
@@ -611,16 +609,6 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
 // the S3Gen stack landing).
 candle_audio::register_generators! {
     pub const REGISTRATION = descriptor => load
-}
-
-/// Materialize the pinned Chatterbox snapshot through the audio lane's F-029 hub path: the T3
-/// checkpoint, the S3Gen checkpoint, and the tokenizer, all at [`HUB_REVISION`]. Returns the
-/// snapshot dir as a [`WeightsSource::Dir`].
-pub fn resolve_pinned_snapshot() -> AudioResult<WeightsSource> {
-    let dir = pinned_snapshot_dir(HUB_REPO, HUB_REVISION, T3_WEIGHTS_FILE)?;
-    hf_get_pinned(HUB_REPO, HUB_REVISION, TOKENIZER_FILE)?;
-    hf_get_pinned(HUB_REPO, HUB_REVISION, crate::s3gen::S3GEN_WEIGHTS_FILE)?;
-    Ok(dir)
 }
 
 #[cfg(test)]

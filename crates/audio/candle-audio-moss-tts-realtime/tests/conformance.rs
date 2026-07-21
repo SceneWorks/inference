@@ -45,18 +45,12 @@ use candle_audio_moss_tts_realtime::gen_core::{
     WeightsSource,
 };
 
-/// Resolve a MOSS-TTS-Realtime snapshot dir. `MOSS_TTS_REALTIME_SNAPSHOT` overrides; otherwise the
-/// pinned snapshot is fetched via the hub.
+/// Resolve a MOSS-TTS-Realtime snapshot dir from the required `MOSS_TTS_REALTIME_SNAPSHOT` env (a
+/// passed-in AR snapshot dir). Inference never self-fetches or derives a cache location (epic 13657).
 fn snapshot() -> PathBuf {
-    if let Ok(dir) = std::env::var("MOSS_TTS_REALTIME_SNAPSHOT") {
-        return PathBuf::from(dir);
-    }
-    match moss::resolve_pinned_snapshot()
-        .expect("resolve the pinned MOSS-TTS-Realtime snapshot (network or warm HF cache)")
-    {
-        WeightsSource::Dir(p) => p,
-        other => panic!("expected a snapshot dir, got {other:?}"),
-    }
+    PathBuf::from(std::env::var("MOSS_TTS_REALTIME_SNAPSHOT").expect(
+        "set MOSS_TTS_REALTIME_SNAPSHOT to a MOSS-TTS-Realtime AR snapshot dir (config.json + model.safetensors + tokenizer)",
+    ))
 }
 
 /// The MOSS-Audio-Tokenizer codec snapshot directory, staged as the passed-in `codec` component
@@ -493,11 +487,10 @@ fn moss_tts_realtime_asr_roundtrip_fidelity() {
     let generator = load();
 
     // whisper_base transcriber (pinned ~150 MB snapshot or WHISPER_SNAPSHOT).
-    let wspec = WLoadSpec::new(match std::env::var("WHISPER_SNAPSHOT") {
-        Ok(dir) => WWeightsSource::Dir(PathBuf::from(dir)),
-        Err(_) => candle_audio_whisper::resolve_pinned_snapshot()
-            .expect("resolve the pinned openai/whisper-base snapshot (network or warm HF cache)"),
-    });
+    let wspec = WLoadSpec::new(WWeightsSource::Dir(PathBuf::from(
+        std::env::var("WHISPER_SNAPSHOT")
+            .expect("set WHISPER_SNAPSHOT to an openai/whisper-base snapshot dir"),
+    )));
     let transcriber = candle_audio_whisper::provider_registry()
         .expect("whisper registry")
         .load_transcriber(candle_audio_whisper::MODEL_ID, &wspec)

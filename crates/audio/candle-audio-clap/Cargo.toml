@@ -26,8 +26,6 @@ tokenizers = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
-# HF-cache snapshot resolution for the `#[ignore]`d real-weight conformance test.
-candle-audio = { path = "../candle-audio", features = ["testkit"] }
 # The merged Kokoro TTS provider generates a real speech clip for the cross-modal ranking test.
 candle-audio-kokoro = { path = "../candle-audio-kokoro" }
 

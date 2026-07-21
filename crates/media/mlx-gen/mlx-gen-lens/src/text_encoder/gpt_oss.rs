@@ -1311,21 +1311,12 @@ mod moe_grouped_tests {
         }
     }
 
-    /// Resolve the cached SceneWorks Lens-Turbo **q4** text-encoder safetensors (the real Q4-packed
-    /// gpt-oss MoE), or `$LENS_TURBO_TE` if set. Real-weight, licensed → the test is `#[ignore]`d.
+    /// Resolve the SceneWorks Lens-Turbo **q4** text-encoder safetensors (the real Q4-packed gpt-oss
+    /// MoE) from the explicit passed-in `$LENS_TURBO_TE` env path. Inference never self-fetches or
+    /// derives a cache location (epic 13657). Real-weight, licensed → the test is `#[ignore]`d.
     fn lens_turbo_te_path() -> Option<std::path::PathBuf> {
-        if let Ok(p) = std::env::var("LENS_TURBO_TE") {
-            return Some(p.into());
-        }
-        let base = std::path::PathBuf::from(std::env::var("HOME").ok()?)
-            .join(".cache/huggingface/hub/models--SceneWorks--lens-turbo-mlx/snapshots");
-        let snap = std::fs::read_dir(&base)
-            .ok()?
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .find(|p| p.is_dir())?;
-        let f = snap.join("q4/text_encoder/model.safetensors");
-        f.exists().then_some(f)
+        let p = std::path::PathBuf::from(std::env::var("LENS_TURBO_TE").ok()?);
+        p.exists().then_some(p)
     }
 
     /// sc-9500 real-weight gate (same-backend). On the **real Q4-packed** Lens-Turbo experts, the new

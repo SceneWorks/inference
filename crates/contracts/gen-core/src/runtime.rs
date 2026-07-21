@@ -148,15 +148,15 @@ pub struct LoadSpec {
     /// face-ID provider needs on top of its diffusion backbone. `None` for a plain base model. A
     /// face-ID provider that reads this slot **requires** it: the caller drives every identity path
     /// through the spec (backend-neutral — just paths), and an absent slot (or an absent sub-field) is a
-    /// **load-time** error, never a fetch from an env var or the on-disk HF cache (epic 13657, sc-13664 —
-    /// the PuLID-FLUX loader dropped its historical `PULID_*` env / `~/.cache/huggingface` fallbacks).
+    /// **load-time** error, never a fetch from an env var or a derived on-disk cache (epic 13657, sc-13664 —
+    /// the PuLID-FLUX loader dropped its historical `PULID_*` env / HF-cache-derived fallbacks).
     pub identity: Option<IdentityWeights>,
     /// Auxiliary **external text-encoder** snapshot directory (sc-8827) — a separate TE snapshot a
     /// provider loads alongside its main checkpoint, e.g. LTX-2.3's Gemma-3-12B encoder (which is not
     /// bundled in the checkpoint dir). A provider that reads this slot **requires** it: the caller
     /// drives the TE location through the spec (backend-neutral — just a path), and an absent slot is a
-    /// **load-time** error, never a process-global env var or an on-disk HF-cache scan (epic 13657,
-    /// sc-13664 — LTX-2.3 dropped its historical `$LTX_GEMMA_DIR` / `~/.cache/huggingface` fallbacks).
+    /// **load-time** error, never a process-global env var or a derived on-disk cache scan (epic 13657,
+    /// sc-13664 — LTX-2.3 dropped its historical `$LTX_GEMMA_DIR` / HF-cache-derived fallbacks).
     pub text_encoder: Option<WeightsSource>,
     /// Component-residency strategy (epic 10765, sc-10821). [`OffloadPolicy::Resident`] (default) keeps
     /// every component resident for the whole generation; [`OffloadPolicy::Sequential`] asks a supporting
@@ -229,8 +229,8 @@ pub struct PidWeights {
 ///
 /// Each field is `Option` only so the struct can be built incrementally / defaulted; a provider that
 /// reads a field **requires** it — the caller supplies every path through this struct, and an absent
-/// field is a **load-time** error (epic 13657, sc-13664). There is no env-var or HF-cache fallback:
-/// the old "optional field ⇒ provider `PULID_*` env / `~/.cache/huggingface` default" convention was
+/// field is a **load-time** error (epic 13657, sc-13664). There is no env-var or cache fallback:
+/// the old "optional field ⇒ provider `PULID_*` env / HF-cache-derived default" convention was
 /// deleted, so a `None` a provider needs fails fast at load rather than silently scanning the disk.
 #[derive(Clone, Debug, Default)]
 pub struct IdentityWeights {

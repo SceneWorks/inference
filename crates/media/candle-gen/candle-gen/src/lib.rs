@@ -170,11 +170,12 @@ pub use residency::{
     OFFLOAD_ENV,
 };
 
-// Shared test-support helpers (sc-9055 / F-069): the PPM read/write, cosine, env-path, GPU peak-VRAM,
-// and HF-Hub-cache resolution helpers that had been hand-copied — and had drifted — across ~16
-// `#[cfg(test)]` validation modules in the provider crates. Also folds the F-071/sc-9057 `$HF_HOME`
-// cache-resolution harmonization. Gated behind the `testkit` feature so this test-only surface never
-// compiles into a production build; provider crates enable it as a dev-dependency feature.
+// Shared test-support helpers (sc-9055 / F-069): the PPM read/write, cosine, env-path, and GPU
+// peak-VRAM helpers that had been hand-copied — and had drifted — across ~16 `#[cfg(test)]`
+// validation modules in the provider crates. Weight snapshots are not resolved here: inference never
+// self-fetches or derives a cache location (epic 13657); real-weight tests take explicit passed-in
+// env paths. Gated behind the `testkit` feature so this test-only surface never compiles into a
+// production build; provider crates enable it as a dev-dependency feature.
 #[cfg(feature = "testkit")]
 pub mod testkit;
 

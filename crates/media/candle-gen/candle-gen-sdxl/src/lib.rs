@@ -251,14 +251,14 @@ pub struct SdxlGenerator {
     pid_spec: Option<PidWeights>,
     /// The three caller-staged SDXL components (epic 13657, sc-13663): the CLIP-L/bigG tokenizers +
     /// the fp16-fix VAE, validated at [`load`] and threaded into the lazy tokenizer/UNet+VAE build in
-    /// place of the deleted `hf_get` self-fetch.
+    /// place of the deleted render-path self-fetch.
     component_paths: SdxlComponents,
     /// Cached UNet+VAE + the flash-attn flag they were built with. `Mutex` because `Generator` is
     /// shared and `generate` takes `&self`; the lock is held only to read/populate the cache (a
     /// cheap `Arc` clone or a one-time load), never across the denoise.
     components: Mutex<Option<(bool, Components)>>,
     /// Cached dual CLIP tokenizers, loaded+parsed once and reused across `generate` calls (sc-8991 /
-    /// F-011) rather than re-reading `tokenizer.json` from the hf-hub cache on every text encode. Shared
+    /// F-011) rather than re-reading `tokenizer.json` from the staged component on every text encode. Shared
     /// behind an `Arc` (model-agnostic); `lock_recover` mirrors the components-cache poison recovery.
     tokenizers: Mutex<Option<Arc<pipeline::SdxlTokenizers>>>,
 }
@@ -289,7 +289,7 @@ impl SdxlGenerator {
     }
 
     /// Get the cached dual CLIP tokenizers, loading (and caching) them on a miss (sc-8991 / F-011). The
-    /// tokenizers are model-agnostic (fixed hf-hub repos) so a single pair serves every request; parsing
+    /// tokenizers are model-agnostic (fixed upstream repos) so a single pair serves every request; parsing
     /// them once here removes the tens-of-ms `tokenizer.json` re-parse the per-encode load did. The
     /// shared [`candle_gen::cached`] read-through recovers a poisoned lock internally (the F-031 idiom).
     fn tokenizers(&self) -> gen_core::Result<Arc<pipeline::SdxlTokenizers>> {
@@ -404,7 +404,7 @@ impl Generator for SdxlGenerator {
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
         // epic 13657 (sc-13663): SDXL requires three caller-staged components — the two model-agnostic
-        // CLIP tokenizers + the fp16-fix VAE — that used to be self-fetched from pinned `hf-hub` repos
+        // CLIP tokenizers + the fp16-fix VAE — that used to be self-fetched from pinned upstream repos
         // on the render path. Advertised so SceneWorks stages them, and `load` fails fast if it doesn't.
         required_components: pipeline::REQUIRED_COMPONENTS,
         id: MODEL_ID,
@@ -624,7 +624,7 @@ mod tests {
             candle_gen::menu_with_aliases(candle_gen::curated_scheduler_names(), &["discrete"])
         );
         // epic 13657 (sc-13663): SDXL advertises its three passed-in components (the CLIP tokenizers +
-        // the fp16-fix VAE) that used to be self-fetched from pinned `hf-hub` repos on the render path.
+        // the fp16-fix VAE) that used to be self-fetched from pinned upstream repos on the render path.
         assert_eq!(
             d.required_components,
             &["tokenizer_clip_l", "tokenizer_clip_bigg", "vae_fp16_fix"]

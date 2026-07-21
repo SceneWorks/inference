@@ -24,23 +24,22 @@ use std::path::PathBuf;
 
 use candle_audio_clap::gen_core::{AudioTrack, LoadSpec, WeightsSource};
 
-/// Resolve the CLAP snapshot: `CLAP_SNAPSHOT` env (a snapshot dir) or the pinned hub path.
+/// Resolve the CLAP snapshot from the required `CLAP_SNAPSHOT` env (a passed-in
+/// `laion/clap-htsat-unfused` snapshot dir). Inference never self-fetches or derives a cache
+/// location (epic 13657).
 fn clap_snapshot() -> WeightsSource {
-    match std::env::var("CLAP_SNAPSHOT") {
-        Ok(dir) => WeightsSource::Dir(PathBuf::from(dir)),
-        Err(_) => candle_audio_clap::resolve_pinned_snapshot().expect(
-            "resolve the pinned laion/clap-htsat-unfused snapshot (network or warm HF cache)",
-        ),
-    }
+    WeightsSource::Dir(PathBuf::from(std::env::var("CLAP_SNAPSHOT").expect(
+        "set CLAP_SNAPSHOT to a laion/clap-htsat-unfused snapshot dir (config.json + tokenizer.json + pytorch_model.bin)",
+    )))
 }
 
-/// Resolve the Kokoro snapshot: `KOKORO_SNAPSHOT` env (a snapshot dir) or the pinned hub path.
+/// Resolve the Kokoro snapshot from the required `KOKORO_SNAPSHOT` env (a passed-in
+/// `hexgrad/Kokoro-82M` snapshot dir).
 fn kokoro_snapshot() -> WeightsSource {
-    match std::env::var("KOKORO_SNAPSHOT") {
-        Ok(dir) => WeightsSource::Dir(PathBuf::from(dir)),
-        Err(_) => candle_audio_kokoro::resolve_pinned_snapshot()
-            .expect("resolve the pinned hexgrad/Kokoro-82M snapshot (network or warm HF cache)"),
-    }
+    WeightsSource::Dir(PathBuf::from(
+        std::env::var("KOKORO_SNAPSHOT")
+            .expect("set KOKORO_SNAPSHOT to a hexgrad/Kokoro-82M snapshot dir"),
+    ))
 }
 
 /// Synthesize `text` to a speech AudioTrack with the merged Kokoro provider (`kokoro_82m`).

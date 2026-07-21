@@ -526,7 +526,7 @@ pub struct SdxlTrainer {
     device: Device,
     /// The three caller-staged SDXL components (epic 13657, sc-13663): the CLIP-L/bigG tokenizers +
     /// the fp16-fix VAE, validated at [`load_trainer`] and consumed in [`train`](Trainer::train) in
-    /// place of the deleted `hf_get` self-fetch. The trainer takes the same components through its
+    /// place of the deleted render-path self-fetch. The trainer takes the same components through its
     /// spec as the registered generator.
     component_paths: SdxlComponents,
 }

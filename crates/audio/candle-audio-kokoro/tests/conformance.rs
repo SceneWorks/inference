@@ -20,13 +20,13 @@ use candle_audio_kokoro::gen_core::{
 };
 use candle_audio_kokoro::{candle_audio, pipeline};
 
-/// Resolve the snapshot: `KOKORO_SNAPSHOT` env (a snapshot dir) or the pinned hub path.
+/// Resolve the snapshot from the required `KOKORO_SNAPSHOT` env (a passed-in `hexgrad/Kokoro-82M`
+/// snapshot dir). Inference never self-fetches or derives a cache location (epic 13657); the
+/// real-weights harness points this at a pre-materialized snapshot.
 fn snapshot() -> WeightsSource {
-    match std::env::var("KOKORO_SNAPSHOT") {
-        Ok(dir) => WeightsSource::Dir(PathBuf::from(dir)),
-        Err(_) => candle_audio_kokoro::resolve_pinned_snapshot()
-            .expect("resolve the pinned hexgrad/Kokoro-82M snapshot (network or warm HF cache)"),
-    }
+    WeightsSource::Dir(PathBuf::from(std::env::var("KOKORO_SNAPSHOT").expect(
+        "set KOKORO_SNAPSHOT to a hexgrad/Kokoro-82M snapshot dir (config.json + kokoro-v1_0.pth + voices/)",
+    )))
 }
 
 /// The shared **audio-generator** conformance suite (sc-12853): audio validate-honesty (a valid

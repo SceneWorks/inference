@@ -15,9 +15,9 @@
 //! | `MMAUDIO_CLIP_SNAPSHOT`    | `apple/DFN5B-CLIP-ViT-H-14-384` | `clip` |
 //! | `MMAUDIO_BIGVGAN_SNAPSHOT` | `nvidia/bigvgan_v2_44khz_128band_512x` | 44k `vocoder` |
 //!
-//! When an env var is unset the component falls back to the crate's per-component pinned hub
-//! resolver (the F-029 cache path) so a warm HF cache still drives the real-weight run with no
-//! configuration. These are TEST-only side channels; production `load()` takes explicit components.
+//! Each env var is **required**: inference never self-fetches or derives a cache location
+//! (epic 13657), so the real-weight harness must point every component at a pre-materialized
+//! snapshot. These are TEST-only side channels; production `load()` takes explicit components.
 #![allow(dead_code)]
 
 use candle_audio_mmaudio as mm;
@@ -30,56 +30,45 @@ pub const CLIP_SNAPSHOT_ENV: &str = "MMAUDIO_CLIP_SNAPSHOT";
 /// `nvidia/bigvgan_v2_44khz_128band_512x` repo snapshot dir (44k vocoder).
 pub const BIGVGAN_SNAPSHOT_ENV: &str = "MMAUDIO_BIGVGAN_SNAPSHOT";
 
-/// If `env` names a directory, join `rel` (the in-repo relative checkpoint path) onto it and return
-/// a [`WeightsSource::File`]; otherwise `None` (the caller falls back to the pinned hub resolver).
-fn from_env_repo(env: &str, rel: &str) -> Option<WeightsSource> {
-    let dir = std::env::var(env).ok()?;
-    Some(WeightsSource::File(std::path::PathBuf::from(dir).join(rel)))
+/// Read the **required** repo-snapshot dir from `env`, join `rel` (the in-repo relative checkpoint
+/// path) onto it, and return a [`WeightsSource::File`]. Panics with an actionable message when unset
+/// — inference never self-fetches or derives a cache location (epic 13657).
+fn from_env_repo(env: &str, rel: &str) -> WeightsSource {
+    let dir = std::env::var(env)
+        .unwrap_or_else(|_| panic!("set {env} to the repo snapshot dir supplying {rel}"));
+    WeightsSource::File(std::path::PathBuf::from(dir).join(rel))
 }
 
 pub fn clip_source() -> WeightsSource {
     from_env_repo(CLIP_SNAPSHOT_ENV, mm::clip::CLIP_WEIGHTS_PATH)
-        .unwrap_or_else(|| mm::clip::resolve_pinned_weights().expect("resolve pinned DFN5B-CLIP"))
 }
 
 pub fn synchformer_source() -> WeightsSource {
     from_env_repo(MMAUDIO_SNAPSHOT_ENV, mm::model::WEIGHTS_PATH)
-        .unwrap_or_else(|| mm::model::resolve_pinned_weights().expect("resolve pinned Synchformer"))
 }
 
 pub fn dit_16k_source() -> WeightsSource {
     from_env_repo(MMAUDIO_SNAPSHOT_ENV, mm::mmdit::WEIGHTS_PATH)
-        .unwrap_or_else(|| mm::mmdit::resolve_pinned_weights().expect("resolve pinned 16k MM-DiT"))
 }
 
 pub fn vae_16k_source() -> WeightsSource {
     from_env_repo(MMAUDIO_SNAPSHOT_ENV, mm::output::VAE_WEIGHTS_PATH)
-        .unwrap_or_else(|| mm::output::resolve_pinned_vae().expect("resolve pinned 16k mel-VAE"))
 }
 
 pub fn vocoder_16k_source() -> WeightsSource {
-    from_env_repo(MMAUDIO_SNAPSHOT_ENV, mm::output::BIGVGAN_WEIGHTS_PATH).unwrap_or_else(|| {
-        mm::output::resolve_pinned_bigvgan().expect("resolve pinned 16k BigVGAN")
-    })
+    from_env_repo(MMAUDIO_SNAPSHOT_ENV, mm::output::BIGVGAN_WEIGHTS_PATH)
 }
 
 pub fn dit_44k_source() -> WeightsSource {
-    from_env_repo(MMAUDIO_SNAPSHOT_ENV, mm::mmdit::WEIGHTS_PATH_44K).unwrap_or_else(|| {
-        mm::mmdit::resolve_pinned_weights_large_44k_v2()
-            .expect("resolve pinned large_44k_v2 MM-DiT")
-    })
+    from_env_repo(MMAUDIO_SNAPSHOT_ENV, mm::mmdit::WEIGHTS_PATH_44K)
 }
 
 pub fn vae_44k_source() -> WeightsSource {
-    from_env_repo(MMAUDIO_SNAPSHOT_ENV, mm::output::VAE_WEIGHTS_PATH_44K).unwrap_or_else(|| {
-        mm::output::resolve_pinned_vae_44k().expect("resolve pinned 44k mel-VAE")
-    })
+    from_env_repo(MMAUDIO_SNAPSHOT_ENV, mm::output::VAE_WEIGHTS_PATH_44K)
 }
 
 pub fn vocoder_44k_source() -> WeightsSource {
-    from_env_repo(BIGVGAN_SNAPSHOT_ENV, mm::output::BIGVGAN_V2_WEIGHTS_PATH).unwrap_or_else(|| {
-        mm::output::resolve_pinned_bigvgan_v2().expect("resolve pinned NVIDIA BigVGAN v2")
-    })
+    from_env_repo(BIGVGAN_SNAPSHOT_ENV, mm::output::BIGVGAN_V2_WEIGHTS_PATH)
 }
 
 /// A placeholder base `weights` for the spec. mmaudio consumes only the five named components and

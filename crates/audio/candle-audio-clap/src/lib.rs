@@ -21,11 +21,11 @@
 //!   with relative-position bias, shifted-window masks, and patch merging → mean pool,
 //! - [`text`] — the RoBERTa text tower + `[CLS]` tanh pooler,
 //! - [`model`] — the [`gen_core::AudioEmbedder`] adapter registered under **`clap_htsat_unfused`**
-//!   (both towers → `ClapProjectionLayer` → L2-normalized joint vector), plus its pinned-SHA hub
-//!   resolution ([`model::resolve_pinned_snapshot`], F-029),
+//!   (both towers → `ClapProjectionLayer` → L2-normalized joint vector); weights are passed in on
+//!   the `gen_core::LoadSpec` (staged locally, never self-fetched, epic 13657),
 //! - [`prepare`] — the audio-lane snapshot-preparation accommodation (a validated passthrough).
 //!
-//! Weights resolve through the audio lane's pinned-SHA hub path: `laion/clap-htsat-unfused`
+//! Weights are supplied as an explicit passed-in snapshot: `laion/clap-htsat-unfused`
 //! (Apache-2.0) at an immutable commit, never a mutable ref. **No Python at runtime.**
 
 pub use candle_audio;
@@ -38,9 +38,7 @@ pub mod model;
 pub mod prepare;
 pub mod text;
 
-pub use model::{
-    descriptor, load, resolve_pinned_snapshot, HUB_REPO, HUB_REVISION, MODEL_ID, REGISTRATION,
-};
+pub use model::{descriptor, load, HUB_REPO, HUB_REVISION, MODEL_ID, REGISTRATION};
 pub use model::{WEIGHT_LICENSE, WEIGHT_LICENSE_ENTRY};
 
 /// This crate's model-weight-license entries for catalog aggregation (sc-13332) — one row keyed by
