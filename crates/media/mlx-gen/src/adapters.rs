@@ -573,6 +573,32 @@ impl AdaptableLinear {
         }
     }
 
+    /// Merge a precomputed bias delta into the dense base **bias** (`b += δ`) — the bias-channel
+    /// analog of [`merge_dense_delta`](Self::merge_dense_delta), for a ComfyUI/lightx2v `.diff_b`
+    /// diff-patch (a full bias delta a low-rank adapter cannot express). `delta` is cast to the base
+    /// bias's dtype before the add. Errors on a quantized base (merge before quantization) or a base
+    /// with **no** bias — the caller (the diff-patch fold) treats the no-bias case as a surfaced skip,
+    /// never inventing a bias the reference module doesn't have.
+    pub fn merge_dense_bias_delta(&mut self, delta: &Array) -> Result<()> {
+        match &mut self.base {
+            LinearBase::Dense(l) => match l.bias.value.as_ref() {
+                Some(b) => {
+                    let merged = add(b, &delta.as_dtype(b.dtype())?)?;
+                    l.bias = Param::new(Some(merged));
+                    Ok(())
+                }
+                None => Err(
+                    "merge_dense_bias_delta: base linear has no bias; a `.diff_b` cannot fold into a bias-free module"
+                        .into(),
+                ),
+            },
+            LinearBase::Quantized(_) => Err(
+                "merge_dense_bias_delta: base is quantized; a diff-patch must be merged before quantization"
+                    .into(),
+            ),
+        }
+    }
+
     /// Cast the dense base weight (and bias) to `dtype` in place — the training-time compute-dtype
     /// switch (sc-4887: bf16 mixed-precision training over an f32-on-disk checkpoint). Quantized
     /// bases are left untouched (their compute dtype is fixed by the packed format). Destructive for

@@ -1771,6 +1771,162 @@ pub fn apply_adapter_specs_autoprefix(
     Ok(combined)
 }
 
+// ---- ComfyUI / lightx2v diff-patch (full-weight/bias deltas), fold-after-build (sc-13825) --------
+//
+// The ComfyUI "diff patch" mechanism (`comfy/lora.py`): a `‹weight-key›.diff` is a **full-rank weight
+// delta** applied `W += strength·diff`, and `‹weight-key›.diff_b` its **bias delta** `b += strength·
+// diff_b`. It is the degenerate, already-materialized case of the same additive fold a LoRA/LoKr does,
+// with δ handed over raw instead of rebuilt from `B·A` / Kronecker factors, plus a bias channel
+// low-rank adapters cannot express. The community Krea "filter-bypass" ships one such tensor,
+// `diffusion_model.txtfusion.projector.diff` (`[1, num_text_layers]`), a delta on the 12→1
+// `text_fusion.projector` collapse (MLX parity for candle sc-13726).
+//
+// **Fold-after-build (the MLX seam).** Unlike candle — which folds into the raw weight map before the
+// DiT builds — every Krea MLX lane (Resident/Sequential, pose control, the monolithic `KreaPipeline`)
+// receives its adapter specs *after* the DiT is constructed, so this folds into the built host's dense
+// `AdaptableLinear` bases via [`AdaptableLinear::merge_dense_delta`] / `merge_dense_bias_delta`,
+// resolving each stem through the same [`strip_common_lora_prefix`] + host alias
+// (`txtfusion`→`text_fusion`, sc-8185) the low-rank pass uses. A `.diff` target must be **dense**: the
+// projector (and the other dense front-end projections) stays dense on every tier
+// (`TextFusionTransformer::quantize` skips it), so the real bypass folds cleanly on dense, Q4, and Q8.
+// A (theoretical) `.diff` aimed at a *quantized* front-end module is surfaced-and-skipped rather than
+// unpacked — candle's before-build fold can unpack a packed base, this after-build fold deliberately
+// cannot, and says so loudly instead of half-applying.
+//
+// **Module-coupled shape-aware skip.** A `.diff` whose shape ≠ the base weight (a cross-architecture or
+// out-of-surface delta) is skipped as a whole module — its coupled `.diff_b` dropped with it, never a
+// half-patch — and surfaced, mirroring ComfyUI's own warn-and-skip and the SCAIL2 diff-patch contract.
+
+/// One module's diff-patch deltas: a full-rank weight delta and/or a bias delta.
+#[derive(Default)]
+struct DiffParts {
+    diff: Option<Array>,   // weight delta, base-shaped
+    diff_b: Option<Array>, // bias delta, base-shaped
+}
+
+/// What a diff-patch fold did: the number of weight/bias deltas folded, and the targets deliberately
+/// skipped (shape-incompatible / quantized / no base bias — coupled parts dropped, never half-applied)
+/// or resolved to no module. Surfaced loudly by the caller; a file that folded **nothing** is caught by
+/// the combined zero-match guard, not here.
+#[derive(Debug, Default)]
+pub struct DiffPatchReport {
+    /// Count of weight + bias deltas folded into a dense base.
+    pub folded: usize,
+    /// Targets whose weight/bias delta could not fold (shape mismatch, quantized base, or a `.diff_b`
+    /// with no base bias) — coupled deltas dropped together, never half-applied.
+    pub skipped: Vec<String>,
+    /// Diff-patch stems that resolved to no adaptable module on the host.
+    pub unmatched: Vec<String>,
+}
+
+/// `true` if any tensor key in `w` is a diff-patch delta (`.diff` / `.diff_b`) — the structural marker
+/// of a ComfyUI/lightx2v diff-patch file, which the forward-time residual loader cannot consume.
+pub fn has_diff_patch_keys(w: &Weights) -> bool {
+    w.keys()
+        .any(|k| k.ends_with(".diff") || k.ends_with(".diff_b"))
+}
+
+/// Fold every ComfyUI/lightx2v **diff-patch** (`.diff` weight / `.diff_b` bias) delta the `specs` carry
+/// into `host`'s matched **dense** `AdaptableLinear` bases at each spec's `scale`: `‹stem›.diff` →
+/// `W += scale·δ`, `‹stem›.diff_b` → `b += scale·δ_b`. Each stem resolves through the same
+/// `strip_common_lora_prefix` + host module alias the low-rank pass uses, so
+/// `diffusion_model.txtfusion.projector` reaches `text_fusion.projector`. Non-diff keys (`lora_*` /
+/// `lokr_*`) are ignored here — they ride the disjoint forward-time residual pass. A no-op for specs
+/// carrying no `.diff`/`.diff_b`. See the module note above for the fold-after-build + coupled-skip
+/// contract.
+pub fn fold_diff_patch_adapters(
+    host: &mut impl AdaptableHost,
+    specs: &[AdapterSpec],
+) -> Result<DiffPatchReport> {
+    let mut report = DiffPatchReport::default();
+    for spec in specs {
+        let w = Weights::from_file(&spec.path)?;
+        // Group each module's `.diff`/`.diff_b` by its resolved (prefix-stripped) dotted stem.
+        let mut groups: BTreeMap<String, DiffParts> = BTreeMap::new();
+        for key in w.keys().map(str::to_string).collect::<Vec<_>>() {
+            if let Some(stem) = key.strip_suffix(".diff_b") {
+                groups
+                    .entry(strip_common_lora_prefix(stem).to_string())
+                    .or_default()
+                    .diff_b = Some(w.require(&key)?.clone());
+            } else if let Some(stem) = key.strip_suffix(".diff") {
+                groups
+                    .entry(strip_common_lora_prefix(stem).to_string())
+                    .or_default()
+                    .diff = Some(w.require(&key)?.clone());
+            }
+        }
+        for (stem, parts) in groups {
+            fold_one_diff_module(host, &stem, &parts, spec.scale, &mut report)?;
+        }
+    }
+    Ok(report)
+}
+
+/// Scale a delta by `scale` in f32 (the fold math runs in f32; `merge_dense_delta`/`_bias_delta` cast
+/// back to the base dtype on write).
+fn scaled_f32(delta: &Array, scale: f32) -> Result<Array> {
+    Ok(delta
+        .as_dtype(Dtype::Float32)?
+        .multiply(crate::array::scalar(scale))?)
+}
+
+/// Fold one module's `.diff`/`.diff_b` into the host's dense base at that dotted stem. A weight-delta
+/// shape ≠ the base, a quantized base, or an unresolved path skips the **whole** module (its coupled
+/// bias dropped too — never a half-patch) and records it; a bias with no base bias is surfaced but does
+/// not undo the weight fold.
+fn fold_one_diff_module(
+    host: &mut impl AdaptableHost,
+    stem: &str,
+    parts: &DiffParts,
+    scale: f32,
+    report: &mut DiffPatchReport,
+) -> Result<()> {
+    let segs: Vec<&str> = stem.split('.').collect();
+    let Some(lin) = host.adaptable_mut(&segs) else {
+        report.unmatched.push(stem.to_string());
+        return Ok(());
+    };
+    // A dense delta cannot fold into a packed base (this after-build fold does not unpack). The Krea
+    // diff-patch targets are dense on every tier, so this only trips on an out-of-surface delta.
+    if lin.is_quantized() {
+        report.skipped.push(stem.to_string());
+        if parts.diff_b.is_some() {
+            report.skipped.push(format!("{stem}.bias"));
+        }
+        return Ok(());
+    }
+
+    if let Some(diff) = &parts.diff {
+        if diff.shape() != lin.base_shape().as_slice() {
+            // Cross-architecture / out-of-surface weight delta: skip the whole module, dropping its
+            // coupled bias delta with it (surfaced, never a half-patch).
+            report.skipped.push(stem.to_string());
+            if parts.diff_b.is_some() {
+                report.skipped.push(format!("{stem}.bias"));
+            }
+            return Ok(());
+        }
+        lin.merge_dense_delta(&scaled_f32(diff, scale)?)?;
+        report.folded += 1;
+    }
+
+    // Bias delta (`.diff_b`): fold onto `{stem}.bias` when the base carries a shape-matching bias.
+    if let Some(diff_b) = &parts.diff_b {
+        let bias_ok = lin
+            .dense_weight()
+            .and_then(|(_, b)| b)
+            .is_some_and(|b| b.shape() == diff_b.shape());
+        if bias_ok {
+            lin.merge_dense_bias_delta(&scaled_f32(diff_b, scale)?)?;
+            report.folded += 1;
+        } else {
+            report.skipped.push(format!("{stem}.bias"));
+        }
+    }
+    Ok(())
+}
+
 /// Provider-facing load-time adapter install: [`apply_adapter_specs_autoprefix`] plus a strict
 /// no-silent-drop policy — errors if a non-empty spec list matched nothing, or if any adapter
 /// target resolved to no module. `model` names the model in the error (e.g. `"z_image_turbo"`).
@@ -1781,12 +1937,59 @@ pub fn apply_adapters_strict(
     specs: &[AdapterSpec],
     model: &str,
 ) -> Result<ApplyReport> {
+    apply_adapters_strict_inner(host, specs, model, 0)
+}
+
+/// Diff-patch-aware strict install (sc-13825, MLX parity for candle sc-13726): fold any ComfyUI
+/// `.diff`/`.diff_b` **diff-patch** deltas into the host's dense bases first ([`fold_diff_patch_adapters`]),
+/// then run the ordinary low-rank residual pass, relaxing the zero-match guard by the count folded. The
+/// two passes are disjoint by key suffix, so a mixed lightning file (both `.diff` and `lora_*`) has its
+/// weight/bias deltas folded AND its low-rank factors stacked as residuals. Skipped / unmatched
+/// diff-patch targets are surfaced (stderr); a file that folds nothing **and** matches no low-rank
+/// target still errors via the combined guard. Krea's filter-bypass entry.
+pub fn apply_adapters_strict_with_diff_patch(
+    host: &mut impl AdaptableHost,
+    specs: &[AdapterSpec],
+    model: &str,
+) -> Result<ApplyReport> {
+    let dp = fold_diff_patch_adapters(host, specs)?;
+    if !dp.skipped.is_empty() {
+        eprintln!(
+            "{model} adapters: {} diff-patch target(s) skipped (shape-incompatible / quantized base / \
+             no base bias — coupled parts dropped, never half-applied): {:?}",
+            dp.skipped.len(),
+            dp.skipped
+        );
+    }
+    if !dp.unmatched.is_empty() {
+        eprintln!(
+            "{model} adapters: {} diff-patch target(s) matched no module, skipped: {:?}",
+            dp.unmatched.len(),
+            dp.unmatched
+        );
+    }
+    let mut report = apply_adapters_strict_inner(host, specs, model, dp.folded)?;
+    // The folded diff-patch deltas count toward the total install, so the returned report is truthful.
+    report.applied += dp.folded;
+    Ok(report)
+}
+
+/// Core of [`apply_adapters_strict`]: `pre_applied` is the count already folded by a prior diff-patch
+/// pass (0 for the plain path). It only relaxes the zero-match guard — a diff-patch-only file whose
+/// delta already folded resolves zero low-rank residuals here, and must not read as "matched nothing".
+fn apply_adapters_strict_inner(
+    host: &mut impl AdaptableHost,
+    specs: &[AdapterSpec],
+    model: &str,
+    pre_applied: usize,
+) -> Result<ApplyReport> {
     let report = apply_adapter_specs_autoprefix(host, specs)?;
-    if !specs.is_empty() && report.applied == 0 {
+    if !specs.is_empty() && report.applied == 0 && pre_applied == 0 {
         return Err(format!(
             "{model} adapters: no target modules matched across {} adapter file(s) — check the \
              format/prefix (expected diffusers/peft LoRA, kohya `lora_unet_` LoRA, BFL/ComfyUI \
-             fused→split LoRA — for a host with a BFL surface — or LoKr keys)",
+             fused→split LoRA — for a host with a BFL surface — LoKr keys, or a ComfyUI/lightx2v \
+             `<module>.diff`/`.diff_b` diff-patch)",
             specs.len()
         )
         .into());
@@ -4571,6 +4774,215 @@ mod tests {
         assert!(
             err.to_string().contains("alpha conflict"),
             "expected a named alpha-conflict error, got: {err}"
+        );
+    }
+
+    // ---- ComfyUI/lightx2v diff-patch fold (sc-13825, MLX parity for candle sc-13726) -------------
+
+    /// A host with one biased dense `AdaptableLinear` at the Krea projector path, carrying the
+    /// `txtfusion`→`text_fusion` alias the real DiT uses — so a `diffusion_model.txtfusion.projector.*`
+    /// diff-patch key resolves after [`strip_common_lora_prefix`], exactly as on the DiT.
+    struct DiffHost {
+        lin: AdaptableLinear,
+    }
+    impl AdaptableHost for DiffHost {
+        fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+            match path {
+                ["text_fusion" | "txtfusion", "projector"] => Some(&mut self.lin),
+                _ => None,
+            }
+        }
+        fn adaptable_paths(&self) -> Vec<String> {
+            vec!["text_fusion.projector".to_string()]
+        }
+    }
+
+    fn save_one(name: &str, entries: Vec<(&str, &Array)>) -> PathBuf {
+        let path = tmp(name);
+        Array::save_safetensors(entries, None, &path).unwrap();
+        path
+    }
+
+    #[test]
+    fn has_diff_patch_keys_detects_diff_and_diff_b() {
+        let dp = save_one(
+            "dp_detect.safetensors",
+            vec![(
+                "diffusion_model.txtfusion.projector.diff",
+                &Array::from_slice(&[0.1f32; 3], &[1, 3]),
+            )],
+        );
+        assert!(has_diff_patch_keys(&Weights::from_file(&dp).unwrap()));
+
+        // A plain low-rank file carries no `.diff`/`.diff_b` → not a diff-patch file.
+        let plain = save_one(
+            "dp_plain.safetensors",
+            vec![
+                (
+                    "diffusion_model.txtfusion.projector.lora_down.weight",
+                    &Array::from_slice(&[0.1f32; 3], &[1, 3]),
+                ),
+                (
+                    "diffusion_model.txtfusion.projector.lora_up.weight",
+                    &Array::from_slice(&[0.1f32; 1], &[1, 1]),
+                ),
+            ],
+        );
+        assert!(!has_diff_patch_keys(&Weights::from_file(&plain).unwrap()));
+    }
+
+    /// The community filter-bypass: a single `diffusion_model.txtfusion.projector.diff` folds
+    /// `W += scale·δ` into the dense projector base, resolving through the prefix-strip + `txtfusion`
+    /// alias. Untargeted state stays put.
+    #[test]
+    fn fold_diff_patch_folds_projector_weight_delta() {
+        let base_w = Array::from_slice(&[1.0f32, 2.0, 3.0], &[1, 3]);
+        let delta = Array::from_slice(&[10.0f32, 20.0, 30.0], &[1, 3]);
+        let dp = save_one(
+            "dp_proj.safetensors",
+            vec![("diffusion_model.txtfusion.projector.diff", &delta)],
+        );
+
+        let mut host = DiffHost {
+            lin: AdaptableLinear::dense(base_w, None),
+        };
+        let report =
+            fold_diff_patch_adapters(&mut host, &[AdapterSpec::new(dp, 0.5, AdapterKind::Lora)])
+                .unwrap();
+        assert_eq!(report.folded, 1, "the projector diff must fold");
+        assert!(report.skipped.is_empty());
+        assert!(report.unmatched.is_empty());
+
+        // W + 0.5·δ = [1+5, 2+10, 3+15].
+        let (w, _) = host.lin.dense_weight().unwrap();
+        let want = Array::from_slice(&[6.0f32, 12.0, 18.0], &[1, 3]);
+        assert!(all_close(w, &want, 1e-5, 1e-5, false)
+            .unwrap()
+            .item::<bool>());
+    }
+
+    /// A `.diff_b` bias delta folds into the base bias alongside the `.diff` weight delta — the channel
+    /// low-rank adapters cannot express. Both fold at `scale`, counted as two.
+    #[test]
+    fn fold_diff_patch_folds_weight_and_bias_delta() {
+        let dw = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[2, 2]);
+        let db = Array::from_slice(&[5.0f32, 6.0], &[2]);
+        let dp = save_one(
+            "dp_wb.safetensors",
+            vec![
+                ("diffusion_model.txtfusion.projector.diff", &dw),
+                ("diffusion_model.txtfusion.projector.diff_b", &db),
+            ],
+        );
+        let mut host = DiffHost {
+            lin: AdaptableLinear::dense(
+                Array::from_slice(&[0.0f32; 4], &[2, 2]),
+                Some(Array::from_slice(&[0.0f32; 2], &[2])),
+            ),
+        };
+        let report =
+            fold_diff_patch_adapters(&mut host, &[AdapterSpec::new(dp, 1.0, AdapterKind::Lora)])
+                .unwrap();
+        assert_eq!(report.folded, 2, "weight + bias delta both fold");
+
+        let (w, b) = host.lin.dense_weight().unwrap();
+        assert!(all_close(w, &dw, 1e-5, 1e-5, false).unwrap().item::<bool>());
+        assert!(all_close(b.unwrap(), &db, 1e-5, 1e-5, false)
+            .unwrap()
+            .item::<bool>());
+    }
+
+    /// Module-coupled shape-aware skip: a `.diff` whose shape ≠ the base is skipped as a whole module —
+    /// its coupled `.diff_b` dropped too, never a half-patch — surfaced, never folded; base untouched.
+    #[test]
+    fn fold_diff_patch_shape_mismatch_skips_whole_module() {
+        let base_w = Array::from_slice(&[0.0f32; 4], &[2, 2]);
+        let base_b = Array::from_slice(&[0.0f32; 2], &[2]);
+        let dp = save_one(
+            "dp_mm.safetensors",
+            vec![
+                // [3,3] cannot fold into the [2,2] base; its coupled [2] bias must drop with it.
+                (
+                    "diffusion_model.txtfusion.projector.diff",
+                    &Array::from_slice(&[1.0f32; 9], &[3, 3]),
+                ),
+                (
+                    "diffusion_model.txtfusion.projector.diff_b",
+                    &Array::from_slice(&[9.0f32; 2], &[2]),
+                ),
+            ],
+        );
+        let mut host = DiffHost {
+            lin: AdaptableLinear::dense(base_w.clone(), Some(base_b.clone())),
+        };
+        let report =
+            fold_diff_patch_adapters(&mut host, &[AdapterSpec::new(dp, 1.0, AdapterKind::Lora)])
+                .unwrap();
+        assert_eq!(report.folded, 0, "shape-mismatched module folds nothing");
+        assert_eq!(
+            report.skipped.len(),
+            2,
+            "weight + coupled bias both surfaced as skipped"
+        );
+
+        let (w, b) = host.lin.dense_weight().unwrap();
+        assert!(
+            array_eq(w, &base_w, false).unwrap().item::<bool>(),
+            "weight untouched"
+        );
+        assert!(
+            array_eq(b.unwrap(), &base_b, false).unwrap().item::<bool>(),
+            "bias untouched"
+        );
+    }
+
+    /// The strict diff-patch entry tolerates a **diff-only** file (the low-rank pass matches nothing,
+    /// but the fold pre-applied it — so no "matched nothing" error), and still errors when a diff-patch
+    /// file resolves to no module at all (folds nothing AND matches no low-rank target).
+    #[test]
+    fn strict_with_diff_patch_tolerates_diff_only_and_errors_on_all_unmatched() {
+        // (a) diff-only, targets the projector → folds; applied counts the fold.
+        let ok = save_one(
+            "dp_only.safetensors",
+            vec![(
+                "diffusion_model.txtfusion.projector.diff",
+                &Array::from_slice(&[1.0f32; 3], &[1, 3]),
+            )],
+        );
+        let mut host = DiffHost {
+            lin: AdaptableLinear::dense(Array::from_slice(&[0.0f32; 3], &[1, 3]), None),
+        };
+        let report = apply_adapters_strict_with_diff_patch(
+            &mut host,
+            &[AdapterSpec::new(ok, 1.0, AdapterKind::Lora)],
+            "krea_2",
+        )
+        .unwrap();
+        assert_eq!(
+            report.applied, 1,
+            "the folded diff-patch counts toward applied"
+        );
+
+        // (b) diff-patch stem resolves to no module → folds nothing, no low-rank target → error.
+        let bad = save_one(
+            "dp_bad.safetensors",
+            vec![(
+                "diffusion_model.blocks.99.unknown.diff",
+                &Array::from_slice(&[0.1f32; 3], &[1, 3]),
+            )],
+        );
+        let mut host2 = DiffHost {
+            lin: AdaptableLinear::dense(Array::from_slice(&[0.0f32; 3], &[1, 3]), None),
+        };
+        let err = apply_adapters_strict_with_diff_patch(
+            &mut host2,
+            &[AdapterSpec::new(bad, 1.0, AdapterKind::Lora)],
+            "krea_2",
+        )
+        .expect_err("an all-unmatched diff-patch file must still error");
+        assert!(
+            err.to_string().contains("no target modules matched"),
+            "expected the no-match error, got: {err}"
         );
     }
 }
