@@ -34,9 +34,8 @@ use mlx_gen_anima::training::load_trainer_base;
 
 /// Glob the Anima base snapshot's `split_files/` dir (DiT + VAE + TE); `None` if absent (test skips).
 fn split_files() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    let base = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--circlestone-labs--Anima/snapshots");
+    let home = std::env::var("MLX_GEN_MODELS_ROOT").ok()?;
+    let base = PathBuf::from(home).join("models--circlestone-labs--Anima/snapshots");
     std::fs::read_dir(&base)
         .ok()?
         .filter_map(|e| e.ok())

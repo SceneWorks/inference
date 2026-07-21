@@ -26,19 +26,8 @@ fn battery() -> Vec<String> {
 }
 
 fn tokenizer_dir() -> std::path::PathBuf {
-    if let Ok(d) = std::env::var("KOLORS_TOKENIZER_DIR") {
-        return d.into();
-    }
-    let base = std::path::PathBuf::from(std::env::var("HOME").unwrap())
-        .join(".cache/huggingface/hub/models--Kwai-Kolors--Kolors-diffusers/snapshots");
-    std::fs::read_dir(&base)
-        .unwrap_or_else(|_| panic!("snapshot dir {}", base.display()))
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.is_dir())
-        .max()
-        .expect("a snapshot")
-        .join("tokenizer")
+    let d = std::env::var("KOLORS_TOKENIZER_DIR").unwrap_or_else(|_| panic!("set KOLORS_TOKENIZER_DIR to the required snapshot dir; inference never self-fetches or derives a cache location (epic 13657)"));
+    d.into()
 }
 
 const GOLDEN: &str = concat!(

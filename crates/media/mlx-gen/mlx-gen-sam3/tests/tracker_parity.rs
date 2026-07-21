@@ -3,7 +3,7 @@
 //! (`scripts/spikes/sam3_oracle/dump_tracker_fixture.py`).
 //!
 //! Run:
-//!   SAM3_WEIGHTS=$HOME/.cache/huggingface/hub/models--facebook--sam3/snapshots/<rev>/model.safetensors \
+//!   SAM3_WEIGHTS=/path/to/models--facebook--sam3/snapshots/<rev>/model.safetensors \
 //!   SAM3_TRACKER_FIXTURE=scripts/spikes/sam3_oracle/tracker_fixture.safetensors \
 //!     cargo test -p mlx-gen-sam3 --release --test tracker_parity -- --ignored --nocapture
 

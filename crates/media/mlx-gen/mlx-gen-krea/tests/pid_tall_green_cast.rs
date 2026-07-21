@@ -19,7 +19,7 @@ use mlx_gen::{GenerationOutput, GenerationRequest, Image, LoadSpec, WeightsSourc
 use mlx_gen_krea::load;
 
 fn cache_root() -> PathBuf {
-    PathBuf::from(std::env::var("HOME").unwrap()).join(".cache/huggingface/hub")
+    PathBuf::from(std::env::var("MLX_GEN_MODELS_ROOT").expect("set MLX_GEN_MODELS_ROOT to the explicit models root (holds models--*/snapshots); inference never self-fetches or derives a cache location (epic 13657)"))
 }
 
 /// First (only) snapshot dir under a `models--…` cache entry.

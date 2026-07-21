@@ -27,22 +27,8 @@ fn golden_dir() -> PathBuf {
 }
 
 fn checkpoint_dir() -> PathBuf {
-    if let Ok(d) = std::env::var("WAN_5B_CKPT") {
-        return PathBuf::from(d);
-    }
-    let home = std::env::var("HOME").unwrap();
-    let snapshots =
-        PathBuf::from(home).join(".cache/huggingface/hub/models--Wan-AI--Wan2.2-TI2V-5B/snapshots");
-    std::fs::read_dir(&snapshots)
-        .unwrap_or_else(|_| panic!("no HF snapshots at {}", snapshots.display()))
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .find(|p| p.join("models_t5_umt5-xxl-enc-bf16.pth").is_file())
-        .unwrap_or_else(|| {
-            panic!(
-                "native TI2V-5B checkpoint not found under {}",
-                snapshots.display()
-            )
-        })
+    let d = std::env::var("WAN_5B_CKPT").unwrap_or_else(|_| panic!("set WAN_5B_CKPT to the required snapshot dir; inference never self-fetches or derives a cache location (epic 13657)"));
+    PathBuf::from(d)
 }
 
 fn assert_component_parity(golden: &std::path::Path, produced: &std::path::Path, name: &str) {

@@ -19,8 +19,8 @@ use mlx_gen_seedvr2::registry::MODEL_ID;
 /// The raw `numz/SeedVR2_comfyUI` checkpoint snapshot dir (mirrors `cancellation_conformance.rs`):
 /// returns `None` (→ skip) when the 3B checkpoint is not in the HF cache.
 fn raw_dir() -> Option<PathBuf> {
-    let base = PathBuf::from(std::env::var("HOME").ok()?)
-        .join(".cache/huggingface/hub/models--numz--SeedVR2_comfyUI/snapshots");
+    let base = PathBuf::from(std::env::var("MLX_GEN_MODELS_ROOT").ok()?)
+        .join("models--numz--SeedVR2_comfyUI/snapshots");
     let snap = std::fs::read_dir(&base).ok()?.flatten().next()?.path();
     snap.join("seedvr2_ema_3b_fp16.safetensors")
         .exists()

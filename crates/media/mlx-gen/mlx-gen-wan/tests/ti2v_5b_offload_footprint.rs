@@ -42,7 +42,7 @@
 //! tier, while the sc-12831 active-peak floor applies only to the quantized tiers).
 //!
 //! ```text
-//! WAN_TI2V_5B_MODEL_DIR=~/.cache/huggingface/hub/models--SceneWorks--wan2.2-ti2v-5b-mlx/snapshots/<hash>/q4 \
+//! WAN_TI2V_5B_MODEL_DIR=/path/to/models--SceneWorks--wan2.2-ti2v-5b-mlx/snapshots/<hash>/q4 \
 //!   cargo test -p mlx-gen-wan --test ti2v_5b_offload_footprint -- --ignored --nocapture
 //! ```
 

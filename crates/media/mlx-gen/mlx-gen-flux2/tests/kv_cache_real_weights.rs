@@ -28,18 +28,8 @@ use mlx_gen::{Conditioning, GenerationOutput, GenerationRequest, LoadSpec, Quant
 const PROMPT: &str = "make it look like a cold winter morning";
 
 fn kv_snapshot() -> PathBuf {
-    if let Ok(p) = std::env::var("MLX_GEN_FLUX2_KV_SNAPSHOT") {
-        return PathBuf::from(p);
-    }
-    let home = std::env::var("HOME").expect("HOME");
-    let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--black-forest-labs--FLUX.2-klein-9b-kv/snapshots");
-    std::fs::read_dir(&snaps)
-        .expect("the FLUX.2-klein-9b-kv snapshot dir (set MLX_GEN_FLUX2_KV_SNAPSHOT)")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir())
-        .expect("a -kv snapshot dir")
+    let p = std::env::var("MLX_GEN_FLUX2_KV_SNAPSHOT").unwrap_or_else(|_| panic!("set MLX_GEN_FLUX2_KV_SNAPSHOT to the required snapshot dir; inference never self-fetches or derives a cache location (epic 13657)"));
+    PathBuf::from(p)
 }
 
 fn res() -> u32 {

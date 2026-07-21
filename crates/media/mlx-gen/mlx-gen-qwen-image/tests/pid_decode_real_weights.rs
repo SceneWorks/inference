@@ -25,18 +25,7 @@ fn env_path(name: &str) -> Option<PathBuf> {
 }
 
 fn qwen_snapshot() -> PathBuf {
-    if let Some(p) = env_path("QWEN_IMAGE_SNAPSHOT") {
-        return p;
-    }
-    let home = std::env::var("HOME").unwrap();
-    let snaps =
-        PathBuf::from(home).join(".cache/huggingface/hub/models--Qwen--Qwen-Image/snapshots");
-    std::fs::read_dir(&snaps)
-        .expect("HF cache snapshots dir")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir())
-        .expect("a Qwen-Image snapshot dir")
+    env_path("QWEN_IMAGE_SNAPSHOT").unwrap_or_else(|| panic!("set QWEN_IMAGE_SNAPSHOT to the required snapshot dir; inference never self-fetches or derives a cache location (epic 13657)"))
 }
 
 fn pid_checkpoint() -> PathBuf {
@@ -49,18 +38,7 @@ fn pid_checkpoint() -> PathBuf {
 }
 
 fn gemma_dir() -> PathBuf {
-    if let Some(p) = env_path("PID_GEMMA_DIR") {
-        return p;
-    }
-    let home = std::env::var("HOME").unwrap();
-    let base = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--Efficient-Large-Model--gemma-2-2b-it/snapshots");
-    std::fs::read_dir(&base)
-        .expect("gemma HF cache snapshots dir")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir())
-        .expect("a gemma-2-2b-it snapshot dir")
+    env_path("PID_GEMMA_DIR").unwrap_or_else(|| panic!("set PID_GEMMA_DIR to the required snapshot dir; inference never self-fetches or derives a cache location (epic 13657)"))
 }
 
 fn quant_from_env() -> Option<Quant> {

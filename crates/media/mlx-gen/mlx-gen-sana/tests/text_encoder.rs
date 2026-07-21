@@ -84,9 +84,9 @@ fn sana_chi_prompt_is_pid_chi_with_single_quotes() {
 
 fn gemma_snapshot() -> String {
     std::env::var("PID_GEMMA_DIR").unwrap_or_else(|_| {
-        let home = std::env::var("HOME").unwrap();
+        let home = std::env::var("MLX_GEN_MODELS_ROOT").expect("set MLX_GEN_MODELS_ROOT to the explicit models root (holds models--*/snapshots); inference never self-fetches or derives a cache location (epic 13657)");
         let base = format!(
-            "{home}/.cache/huggingface/hub/models--Efficient-Large-Model--gemma-2-2b-it/snapshots"
+            "{home}/models--Efficient-Large-Model--gemma-2-2b-it/snapshots"
         );
         let snap = std::fs::read_dir(&base)
             .unwrap()

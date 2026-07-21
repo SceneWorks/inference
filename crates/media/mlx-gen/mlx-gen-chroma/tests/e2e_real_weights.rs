@@ -22,12 +22,7 @@ const H: u32 = 256;
 const STEPS: u32 = 4;
 
 fn hf_snapshot(repo: &str) -> PathBuf {
-    let cache = std::env::var("HF_HUB_CACHE")
-        .map(PathBuf::from)
-        .or_else(|_| std::env::var("HF_HOME").map(|h| PathBuf::from(h).join("hub")))
-        .unwrap_or_else(|_| {
-            PathBuf::from(std::env::var("HOME").unwrap()).join(".cache/huggingface/hub")
-        });
+    let cache = std::path::PathBuf::from(std::env::var("MLX_GEN_MODELS_ROOT").expect("set MLX_GEN_MODELS_ROOT to the explicit models root (holds models--*/snapshots); inference never self-fetches or derives a cache location (epic 13657)"));
     let snaps = cache.join(format!("models--lodestones--{repo}/snapshots"));
     std::fs::read_dir(&snaps)
         .unwrap_or_else(|_| panic!("snapshot not found under {}", snaps.display()))

@@ -29,24 +29,8 @@ fn eros_golden_dir() -> PathBuf {
 
 /// The eros single-file source (`LTX_EROS_SRC` or the HF cache snapshot).
 fn eros_source_file() -> PathBuf {
-    if let Ok(p) = std::env::var("LTX_EROS_SRC") {
-        return PathBuf::from(p);
-    }
-    let home = std::env::var("HOME").unwrap();
-    let snapshots = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--TenStrip--LTX2.3-10Eros/snapshots");
-    // pick the first snapshot dir containing the bf16 file
-    let snap = std::fs::read_dir(&snapshots)
-        .unwrap_or_else(|_| panic!("no HF snapshots at {}", snapshots.display()))
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .find(|p| p.join("10Eros_v1_bf16.safetensors").is_file())
-        .unwrap_or_else(|| {
-            panic!(
-                "10Eros_v1_bf16.safetensors not found under {}",
-                snapshots.display()
-            )
-        });
-    snap.join("10Eros_v1_bf16.safetensors")
+    let p = std::env::var("LTX_EROS_SRC").unwrap_or_else(|_| panic!("set LTX_EROS_SRC to the required snapshot dir; inference never self-fetches or derives a cache location (epic 13657)"));
+    PathBuf::from(p)
 }
 
 /// Assert produced `<dir>/<name>.safetensors` reproduces the golden byte-for-byte.
@@ -205,23 +189,8 @@ fn eros_upscaler_roundtrip_matches_golden() {
 
 /// The base `Lightricks/LTX-2.3` distilled checkpoint (`LTX_BASE_SRC` or the HF cache).
 fn base_source_file() -> PathBuf {
-    if let Ok(p) = std::env::var("LTX_BASE_SRC") {
-        return PathBuf::from(p);
-    }
-    let home = std::env::var("HOME").unwrap();
-    let snapshots =
-        PathBuf::from(home).join(".cache/huggingface/hub/models--Lightricks--LTX-2.3/snapshots");
-    std::fs::read_dir(&snapshots)
-        .unwrap_or_else(|_| panic!("no HF snapshots at {}", snapshots.display()))
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .find(|p| p.join("ltx-2.3-22b-distilled.safetensors").is_file())
-        .unwrap_or_else(|| {
-            panic!(
-                "ltx-2.3-22b-distilled.safetensors not found under {}",
-                snapshots.display()
-            )
-        })
-        .join("ltx-2.3-22b-distilled.safetensors")
+    let p = std::env::var("LTX_BASE_SRC").unwrap_or_else(|_| panic!("set LTX_BASE_SRC to the required snapshot dir; inference never self-fetches or derives a cache location (epic 13657)"));
+    PathBuf::from(p)
 }
 
 /// Convert the base distilled checkpoint at `bits` and assert the six core components + configs match

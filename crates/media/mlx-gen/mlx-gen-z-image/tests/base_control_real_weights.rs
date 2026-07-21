@@ -23,51 +23,16 @@ use std::path::PathBuf;
 /// Resolve the **base** `Tongyi-MAI/Z-Image` snapshot: the `BASE_ZIMAGE_SNAPSHOT` override if set, else
 /// the first snapshot under the HF hub cache. `None` when neither is present (skip rather than fail).
 fn base_snapshot() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("BASE_ZIMAGE_SNAPSHOT") {
-        return Some(PathBuf::from(p));
-    }
-    let home = std::env::var("HOME").ok()?;
-    let snaps =
-        PathBuf::from(home).join(".cache/huggingface/hub/models--Tongyi-MAI--Z-Image/snapshots");
-    std::fs::read_dir(&snaps)
-        .ok()?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir())
+    let p = std::env::var("BASE_ZIMAGE_SNAPSHOT").ok()?;
+    Some(PathBuf::from(p))
 }
 
 /// Resolve the **base** Fun-Controlnet-Union checkpoint: the `BASE_CONTROL_WEIGHTS` override if set,
 /// else the `Z-Image-Fun-Controlnet-Union-2.1.safetensors` (the full Union ckpt, not the `-lite`) under
 /// the `alibaba-pai/Z-Image-Fun-Controlnet-Union-2.1` HF cache. `None` when absent (skip).
 fn base_control_source() -> Option<WeightsSource> {
-    if let Ok(p) = std::env::var("BASE_CONTROL_WEIGHTS") {
-        return Some(WeightsSource::File(PathBuf::from(p)));
-    }
-    let home = std::env::var("HOME").ok()?;
-    let snaps = PathBuf::from(home).join(
-        ".cache/huggingface/hub/models--alibaba-pai--Z-Image-Fun-Controlnet-Union-2.1/snapshots",
-    );
-    let file = std::fs::read_dir(&snaps)
-        .ok()?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.is_dir())
-        .flat_map(|d| {
-            std::fs::read_dir(d)
-                .into_iter()
-                .flatten()
-                .filter_map(|e| e.ok())
-                .map(|e| e.path())
-        })
-        // Prefer the full Union ckpt; explicitly skip the `-lite` and the Tile variants.
-        .filter(|p| p.extension().map(|x| x == "safetensors").unwrap_or(false))
-        .find(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .map(|n| n.contains("Union") && !n.contains("lite"))
-                .unwrap_or(false)
-        })?;
-    Some(WeightsSource::File(file))
+    let p = std::env::var("BASE_CONTROL_WEIGHTS").ok()?;
+    Some(WeightsSource::File(PathBuf::from(p)))
 }
 
 /// A synthetic high-contrast structural control image: an off-center filled rectangle on a black field.

@@ -37,7 +37,7 @@ fn snapshot() -> WeightsSource {
 /// suite (`gen_core_testkit::conformance` / `Profile`), whose oversize-rejection check is meaningless
 /// for a `Modality::Audio` model; `audio_conformance` is purpose-built for it.
 #[test]
-#[ignore = "real weights: needs a hexgrad/Kokoro-82M snapshot (KOKORO_SNAPSHOT or network); run with --ignored"]
+#[ignore = "real weights: needs a hexgrad/Kokoro-82M snapshot (KOKORO_SNAPSHOT); run with --ignored"]
 fn kokoro_conformance() {
     let spec = LoadSpec::new(snapshot());
     let profile = gen_core_testkit::AudioProfile {
@@ -64,7 +64,7 @@ fn kokoro_conformance() {
 /// The real-WAV DoD: fixed script + seed + voice → non-empty, 24 kHz, mono, finite,
 /// NON-SILENT speech-shaped audio of plausible duration, written to disk as a playable WAV.
 #[test]
-#[ignore = "real weights: needs a hexgrad/Kokoro-82M snapshot (KOKORO_SNAPSHOT or network); run with --ignored"]
+#[ignore = "real weights: needs a hexgrad/Kokoro-82M snapshot (KOKORO_SNAPSHOT); run with --ignored"]
 fn kokoro_wav_conformance() {
     let spec = LoadSpec::new(snapshot());
     let registry = candle_audio_kokoro::provider_registry().unwrap();

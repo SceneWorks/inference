@@ -33,19 +33,16 @@ fn env_or_hf(key: &str, repo: &str, rel: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| hf_snapshot(repo, rel))
 }
 
-/// Resolve `rel` inside a snapshot of the HF-cache repo `repo`, derived from `$HF_HOME` (or
-/// `$HOME/.cache/huggingface`) rather than a baked-in personal path. Best-effort: if the repo isn't
+/// Resolve `rel` inside a snapshot of `repo` under the required `MLX_GEN_MODELS_ROOT` models root
+/// (inference never self-fetches or derives a cache location, epic 13657). Best-effort: if the repo isn't
 /// cached the constructed path simply won't exist and the caller's load errors clearly. HF keeps one
 /// snapshot dir per revision; a fresh pull has exactly one, so any dir is the right one for a smoke.
 fn hf_snapshot(repo: &str, rel: &str) -> String {
-    let snapshots = std::env::var_os("HF_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".cache/huggingface")
-        })
-        .join("hub")
-        .join(repo)
-        .join("snapshots");
+    let snapshots = PathBuf::from(std::env::var_os("MLX_GEN_MODELS_ROOT").expect(
+        "set MLX_GEN_MODELS_ROOT to the explicit models root (holds models--*/snapshots);          inference never self-fetches or derives a cache location (epic 13657)",
+    ))
+    .join(repo)
+    .join("snapshots");
     let snap = std::fs::read_dir(&snapshots)
         .ok()
         .and_then(|rd| {

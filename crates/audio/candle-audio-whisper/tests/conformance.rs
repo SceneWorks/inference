@@ -110,7 +110,7 @@ fn character_error_rate(reference: &str, hypothesis: &str) -> f32 {
 /// audio-ignoring output) fails the CER bound; a broken timestamp parse fails the monotonicity
 /// check.
 #[test]
-#[ignore = "real weights: needs openai/whisper-base + hexgrad/Kokoro-82M snapshots (env or network); run with --ignored"]
+#[ignore = "real weights: needs openai/whisper-base + hexgrad/Kokoro-82M snapshots (from the required env snapshots); run with --ignored"]
 fn whisper_transcribes_kokoro_roundtrip_within_cer() {
     // 1) Kokoro TTS: KNOWN text → a real speech WAV (24 kHz mono).
     let track = synthesize_with_kokoro(KNOWN_TEXT);
@@ -182,7 +182,7 @@ fn whisper_transcribes_kokoro_roundtrip_within_cer() {
 
 /// Determinism: greedy (temperature 0) transcription of the same clip is byte-identical text.
 #[test]
-#[ignore = "real weights: needs openai/whisper-base + hexgrad/Kokoro-82M snapshots (env or network); run with --ignored"]
+#[ignore = "real weights: needs openai/whisper-base + hexgrad/Kokoro-82M snapshots (from the required env snapshots); run with --ignored"]
 fn whisper_greedy_transcription_is_deterministic() {
     let track = synthesize_with_kokoro(KNOWN_TEXT);
     let spec = LoadSpec::new(whisper_snapshot());

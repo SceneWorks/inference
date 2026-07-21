@@ -53,21 +53,8 @@ const STEPS: usize = 2;
 const GUIDANCE: f32 = 4.0;
 
 fn edit_snapshot() -> PathBuf {
-    if let Ok(p) = std::env::var("QWEN_IMAGE_EDIT_SNAPSHOT") {
-        return PathBuf::from(p);
-    }
-    let home = std::env::var("HOME").unwrap();
-    // sc-2782: 2509 is superseded by 2511 (same architecture — 60 layers, in_channels 64; 2511's
-    // extra `zero_cond_t` config flag is unread by both the fork and this port). Override with
-    // QWEN_IMAGE_EDIT_SNAPSHOT to pin a different snapshot.
-    let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--Qwen--Qwen-Image-Edit-2511/snapshots");
-    std::fs::read_dir(&snaps)
-        .expect("HF cache snapshots dir")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir())
-        .expect("a snapshot dir")
+    let p = std::env::var("QWEN_IMAGE_EDIT_SNAPSHOT").unwrap_or_else(|_| panic!("set QWEN_IMAGE_EDIT_SNAPSHOT to the required snapshot dir; inference never self-fetches or derives a cache location (epic 13657)"));
+    PathBuf::from(p)
 }
 
 fn rel_errors(a: &Array, b: &Array) -> (f32, f32) {

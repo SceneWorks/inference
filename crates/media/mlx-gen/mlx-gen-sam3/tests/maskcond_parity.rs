@@ -5,7 +5,7 @@
 //! captured by wrapping `_use_mask_as_output` on the first call of a real 2-frame `Sam3VideoModel` run).
 //!
 //! Run:
-//!   SAM3_WEIGHTS=$HOME/.cache/huggingface/hub/models--facebook--sam3/snapshots/<rev>/model.safetensors \
+//!   SAM3_WEIGHTS=/path/to/models--facebook--sam3/snapshots/<rev>/model.safetensors \
 //!   SAM3_MASKCOND_FIXTURE=$PWD/scripts/spikes/sam3_oracle/maskcond_fixture.safetensors \
 //!     cargo test -p mlx-gen-sam3 --release --test maskcond_parity -- --ignored --nocapture
 

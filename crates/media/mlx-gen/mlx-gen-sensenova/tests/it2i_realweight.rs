@@ -15,16 +15,10 @@ use mlx_gen_sensenova::{
 };
 use mlx_rs::Array;
 
-const DEFAULT_SNAPSHOT: &str = concat!(
-    env!("HOME"),
-    "/.cache/huggingface/hub/models--sensenova--SenseNova-U1-8B-MoT/snapshots/\
-     bfa9b436503cb8aed4f2bc60e3236710cc77468d"
-);
-
 fn snapshot_dir() -> PathBuf {
-    std::env::var("SENSENOVA_SNAPSHOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(DEFAULT_SNAPSHOT))
+    PathBuf::from(std::env::var("SENSENOVA_SNAPSHOT").expect(
+        "set SENSENOVA_SNAPSHOT to the SenseNova-U1-8B-MoT snapshot dir; inference never self-fetches or derives a cache location (epic 13657)",
+    ))
 }
 
 fn fixture() -> PathBuf {

@@ -81,8 +81,8 @@ fn tiled_vs_whole_decode() {
     let ckpt = env_or(
         "PID_QWEN_SAFETENSORS",
         format!(
-            "{}/.cache/huggingface/hub/models--SceneWorks--pid-qwenimage/snapshots",
-            std::env::var("HOME").unwrap()
+            "{}/models--SceneWorks--pid-qwenimage/snapshots",
+            std::env::var("MLX_GEN_MODELS_ROOT").expect("set MLX_GEN_MODELS_ROOT to the explicit models root (holds models--*/snapshots); inference never self-fetches or derives a cache location (epic 13657)")
         ),
     );
     let tile: i32 = env_or("PID_AB_TILE", "2048".into()).parse().unwrap();

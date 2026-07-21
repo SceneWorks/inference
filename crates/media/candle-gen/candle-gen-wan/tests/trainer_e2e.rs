@@ -41,20 +41,8 @@ use candle_gen::gen_core::{
 
 /// The Wan A14B (T2V) base snapshot dir — `WAN_T2V_14B_SNAPSHOT` or the first HF-cache snapshot.
 fn snapshot() -> PathBuf {
-    if let Ok(p) = std::env::var("WAN_T2V_14B_SNAPSHOT") {
-        return PathBuf::from(p);
-    }
-    let home = std::env::var("USERPROFILE")
-        .or_else(|_| std::env::var("HOME"))
-        .expect("USERPROFILE/HOME");
-    let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--Wan-AI--Wan2.2-T2V-A14B-Diffusers/snapshots");
-    std::fs::read_dir(&snaps)
-        .expect("HF cache snapshots dir (set WAN_T2V_14B_SNAPSHOT to override)")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir())
-        .expect("a snapshot dir")
+    let p = std::env::var("WAN_T2V_14B_SNAPSHOT").unwrap_or_else(|_| panic!("set WAN_T2V_14B_SNAPSHOT to the required snapshot dir; inference never self-fetches or derives a cache location (epic 13657)"));
+    PathBuf::from(p)
 }
 
 /// Two solid-colour swatch PNGs + captions in `dir`.

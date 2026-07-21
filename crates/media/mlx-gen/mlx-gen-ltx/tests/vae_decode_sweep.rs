@@ -7,7 +7,7 @@
 //! Synthetic (random) latents — we measure cost/scaling, not parity.
 //!
 //! ```text
-//! LTX_VAE_DIR=~/.cache/huggingface/hub/models--SceneWorks--ltx-2.3-mlx/snapshots/<h>/q8 \
+//! LTX_VAE_DIR=/path/to/models--SceneWorks--ltx-2.3-mlx/snapshots/<h>/q8 \
 //! LTX_W=768 LTX_H=768 LTX_FRAMES=25 \
 //!   cargo test -p mlx-gen-ltx --test vae_decode_sweep --release -- --ignored --nocapture
 //! # add LTX_TILE_PX=256 [LTX_OVERLAP_PX=32 LTX_TILE_FRAMES=.. LTX_OVERLAP_FRAMES=..] for a tiled run
@@ -166,21 +166,8 @@ fn ltx_vae_decode_sweep() {
 /// Discover the LTX VAE decoder dir (`vae_decoder.safetensors`): `LTX_VAE_DIR` first, else the `q4`
 /// tier of the cached `SceneWorks/ltx-2.3-mlx` snapshot.
 fn discover_ltx_vae() -> Option<PathBuf> {
-    if let Some(p) = env_path("LTX_VAE_DIR") {
-        return Some(p);
-    }
-    let home = std::env::var_os("HOME")?;
-    let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--SceneWorks--ltx-2.3-mlx/snapshots");
-    for entry in std::fs::read_dir(&snaps).ok()?.flatten() {
-        for tier in ["bf16", "q8", "q4"] {
-            let d = entry.path().join(tier);
-            if d.join("vae_decoder.safetensors").exists() {
-                return Some(d);
-            }
-        }
-    }
-    None
+    let p = env_path("LTX_VAE_DIR")?;
+    Some(p)
 }
 
 /// **sc-12748 — THE PAYOFF (mode 2): a tiled LTX decode whose ASSEMBLED output crosses `i32::MAX`

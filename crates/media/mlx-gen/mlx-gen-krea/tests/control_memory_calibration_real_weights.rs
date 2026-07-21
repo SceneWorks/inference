@@ -74,14 +74,9 @@ const BRANCH_BLOCKS: usize = 7;
 /// re-fit (sc-11847) lands every tested point in ~[1.03×, 1.16×], so 1.3× also guards against drift.
 const MAX_OVERPREDICT: f64 = 1.3;
 
-fn home() -> PathBuf {
-    PathBuf::from(std::env::var("HOME").unwrap())
-}
-
 /// First snapshot dir under an HF-cache `models--…` entry.
 fn hf_snapshot(model: &str) -> PathBuf {
-    let snaps = home()
-        .join(".cache/huggingface/hub")
+    let snaps = std::path::PathBuf::from(std::env::var("MLX_GEN_MODELS_ROOT").expect("set MLX_GEN_MODELS_ROOT to the explicit models root (holds models--*/snapshots); inference never self-fetches or derives a cache location (epic 13657)"))
         .join(model)
         .join("snapshots");
     std::fs::read_dir(&snaps)

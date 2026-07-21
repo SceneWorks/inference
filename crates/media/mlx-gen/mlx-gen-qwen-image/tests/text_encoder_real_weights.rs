@@ -19,18 +19,8 @@ const GOLDEN: &str = concat!(
 
 /// Locate the Qwen-Image snapshot dir (env override, else the HF cache).
 fn snapshot() -> PathBuf {
-    if let Ok(p) = std::env::var("QWEN_IMAGE_SNAPSHOT") {
-        return PathBuf::from(p);
-    }
-    let home = std::env::var("HOME").unwrap();
-    let snaps =
-        PathBuf::from(home).join(".cache/huggingface/hub/models--Qwen--Qwen-Image/snapshots");
-    std::fs::read_dir(&snaps)
-        .expect("HF cache snapshots dir")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir())
-        .expect("a snapshot dir")
+    let p = std::env::var("QWEN_IMAGE_SNAPSHOT").unwrap_or_else(|_| panic!("set QWEN_IMAGE_SNAPSHOT to the required snapshot dir; inference never self-fetches or derives a cache location (epic 13657)"));
+    PathBuf::from(p)
 }
 
 fn rel_errors(a: &Array, b: &Array) -> (f32, f32) {

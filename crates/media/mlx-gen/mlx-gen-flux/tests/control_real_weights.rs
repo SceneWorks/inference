@@ -35,38 +35,16 @@ use mlx_gen::{
 
 /// Resolve the FLUX.1-dev snapshot dir: `FLUX1_DEV_SNAPSHOT`, else the newest HF-cache snapshot.
 fn snapshot() -> PathBuf {
-    if let Ok(p) = std::env::var("FLUX1_DEV_SNAPSHOT") {
-        return PathBuf::from(p);
-    }
-    let home = std::env::var("HOME").expect("HOME");
-    let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--black-forest-labs--FLUX.1-dev/snapshots");
-    std::fs::read_dir(&snaps)
-        .expect("snapshot dir under models--black-forest-labs--FLUX.1-dev/snapshots")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir())
-        .expect("a snapshot dir under models--black-forest-labs--FLUX.1-dev/snapshots")
+    let p = std::env::var("FLUX1_DEV_SNAPSHOT").unwrap_or_else(|_| panic!("set FLUX1_DEV_SNAPSHOT to the required snapshot dir; inference never self-fetches or derives a cache location (epic 13657)"));
+    PathBuf::from(p)
 }
 
 /// The Shakker `FLUX.1-dev-ControlNet-Union-Pro-2.0` checkpoint. Override with
 /// `FLUX1_CONTROL_CHECKPOINT`; else the `diffusion_pytorch_model.safetensors` in the newest HF-cache
 /// snapshot.
 fn control_checkpoint() -> WeightsSource {
-    if let Ok(p) = std::env::var("FLUX1_CONTROL_CHECKPOINT") {
-        return WeightsSource::File(PathBuf::from(p));
-    }
-    let home = std::env::var("HOME").expect("HOME");
-    let snaps = PathBuf::from(home).join(
-        ".cache/huggingface/hub/models--Shakker-Labs--FLUX.1-dev-ControlNet-Union-Pro-2.0/snapshots",
-    );
-    let snap = std::fs::read_dir(&snaps)
-        .expect("control snapshot dir")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir())
-        .expect("a snapshot dir under models--Shakker-Labs--FLUX.1-dev-ControlNet-Union-Pro-2.0");
-    WeightsSource::File(snap.join("diffusion_pytorch_model.safetensors"))
+    let p = std::env::var("FLUX1_CONTROL_CHECKPOINT").unwrap_or_else(|_| panic!("set FLUX1_CONTROL_CHECKPOINT to the required snapshot dir; inference never self-fetches or derives a cache location (epic 13657)"));
+    WeightsSource::File(PathBuf::from(p))
 }
 
 /// A deterministic synthetic *pose* control image (a stick-figure-ish set of bright bars on a dark

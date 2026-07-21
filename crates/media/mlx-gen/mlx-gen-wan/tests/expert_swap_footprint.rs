@@ -21,8 +21,8 @@
 //! run fastest; the win scales with the tier's per-expert size (bf16 ≈ 27 GB, q8 ≈ 14 GB, q4 ≈ 8 GB).
 //!
 //! ```text
-//! WAN_A14B_MODEL_DIR=~/.cache/huggingface/hub/models--SceneWorks--wan2.2-t2v-a14b-mlx/snapshots/<hash>/q8 \
-//! WAN_I2V_MODEL_DIR=~/.cache/huggingface/hub/models--SceneWorks--wan2.2-i2v-a14b-mlx/snapshots/<hash>/q4 \
+//! WAN_A14B_MODEL_DIR=/path/to/models--SceneWorks--wan2.2-t2v-a14b-mlx/snapshots/<hash>/q8 \
+//! WAN_I2V_MODEL_DIR=/path/to/models--SceneWorks--wan2.2-i2v-a14b-mlx/snapshots/<hash>/q4 \
 //!   cargo test -p mlx-gen-wan --test expert_swap_footprint -- --ignored --nocapture
 //! ```
 

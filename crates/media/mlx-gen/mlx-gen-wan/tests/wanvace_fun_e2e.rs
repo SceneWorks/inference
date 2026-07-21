@@ -37,8 +37,7 @@ fn home() -> PathBuf {
 
 /// The one snapshot dir under a HF-cache repo's `snapshots/<hash>/`.
 fn hf_snapshot(repo_dir: &str) -> Option<PathBuf> {
-    let base = home()
-        .join(".cache/huggingface/hub")
+    let base = std::path::PathBuf::from(std::env::var("MLX_GEN_MODELS_ROOT").expect("set MLX_GEN_MODELS_ROOT to the explicit models root (holds models--*/snapshots); inference never self-fetches or derives a cache location (epic 13657)"))
         .join(repo_dir)
         .join("snapshots");
     std::fs::read_dir(&base)

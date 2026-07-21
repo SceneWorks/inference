@@ -30,18 +30,8 @@ const PROMPT: &str = "a red fox in fresh snow";
 const MERGE_PATCH: i32 = 28;
 
 fn snapshot() -> PathBuf {
-    if let Ok(p) = std::env::var("MLX_GEN_FLUX2_DEV_SNAPSHOT") {
-        return PathBuf::from(p);
-    }
-    let home = std::env::var("HOME").expect("HOME");
-    let base = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--black-forest-labs--FLUX.2-dev/snapshots");
-    std::fs::read_dir(&base)
-        .expect("snapshot dir")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir())
-        .expect("a snapshot under models--black-forest-labs--FLUX.2-dev/snapshots")
+    let p = std::env::var("MLX_GEN_FLUX2_DEV_SNAPSHOT").unwrap_or_else(|_| panic!("set MLX_GEN_FLUX2_DEV_SNAPSHOT to the required snapshot dir; inference never self-fetches or derives a cache location (epic 13657)"));
+    PathBuf::from(p)
 }
 
 fn golden_ids(w: &Weights, key: &str) -> Vec<i32> {

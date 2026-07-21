@@ -1,16 +1,13 @@
 //! ArcFace identity cosine between two images (epic 10871 P4.2 identity-preservation scoring).
 //! Detects the largest face in each image (SCRFD), aligns + embeds it (glintr100/iresnet100),
 //! L2-normalizes, and prints the cosine similarity — the same detect→align→embed stack the
-//! InstantID/likeness path uses. Weights default to the cached `instantid-mlx` bundle.
+//! InstantID/likeness path uses. Point `FACE_SCRFD`/`FACE_ARCFACE` at the required detector +
+//! embedder safetensors (inference never self-fetches or derives a cache location, epic 13657).
 //!
 //! Run: `cargo run --release --example face_cosine -p mlx-gen-face -- <imgA> <imgB>`
 
 use mlx_gen::weights::Weights;
 use mlx_gen_face::FaceAnalysis;
-
-fn env_or(key: &str, default: &str) -> String {
-    std::env::var(key).unwrap_or_else(|_| default.to_string())
-}
 
 fn load_rgb(path: &str) -> (Vec<u8>, usize, usize) {
     let img = image::open(path)
@@ -35,14 +32,10 @@ fn main() {
         .get(2)
         .expect("usage: face_cosine <imgA> <imgB>")
         .clone();
-    let scrfd_path = env_or(
-        "FACE_SCRFD",
-        "/Users/michael/.cache/huggingface/hub/models--SceneWorks--instantid-mlx/snapshots/bca0cacf8e5e04529bb2b326a521361b02be84fd/scrfd_10g.safetensors",
-    );
-    let arcface_path = env_or(
-        "FACE_ARCFACE",
-        "/Users/michael/.cache/huggingface/hub/models--SceneWorks--instantid-mlx/snapshots/bca0cacf8e5e04529bb2b326a521361b02be84fd/arcface_iresnet100.safetensors",
-    );
+    let scrfd_path = std::env::var("FACE_SCRFD")
+        .expect("set FACE_SCRFD to the scrfd_10g.safetensors path (epic 13657)");
+    let arcface_path = std::env::var("FACE_ARCFACE")
+        .expect("set FACE_ARCFACE to the arcface_iresnet100.safetensors path (epic 13657)");
 
     let scrfd_w = Weights::from_file(&scrfd_path).expect("scrfd weights");
     let arcface_w = Weights::from_file(&arcface_path).expect("arcface weights");

@@ -15,32 +15,13 @@ use std::path::PathBuf;
 /// The `KOLORS_SNAPSHOT` override, else the newest HF-cache snapshot dir; **panics** if neither
 /// exists. The form used by the parity/real-weight tests that unconditionally need weights.
 pub fn snapshot() -> PathBuf {
-    if let Ok(p) = std::env::var("KOLORS_SNAPSHOT") {
-        return PathBuf::from(p);
-    }
-    let home = std::env::var("HOME").unwrap();
-    let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--Kwai-Kolors--Kolors-diffusers/snapshots");
-    std::fs::read_dir(&snaps)
-        .expect("HF cache snapshots dir")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir())
-        .expect("a snapshot dir")
+    let p = std::env::var("KOLORS_SNAPSHOT").unwrap_or_else(|_| panic!("set KOLORS_SNAPSHOT to the required snapshot dir; inference never self-fetches or derives a cache location (epic 13657)"));
+    PathBuf::from(p)
 }
 
 /// The `KOLORS_SNAPSHOT` override, else the newest HF-cache snapshot dir, or `None` if unavailable —
 /// the graceful `skip:` form used by the smoke tests that self-skip when weights are absent.
 pub fn snapshot_opt() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("KOLORS_SNAPSHOT") {
-        return Some(PathBuf::from(p));
-    }
-    let home = std::env::var("HOME").ok()?;
-    let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--Kwai-Kolors--Kolors-diffusers/snapshots");
-    std::fs::read_dir(&snaps)
-        .ok()?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir())
+    let p = std::env::var("KOLORS_SNAPSHOT").ok()?;
+    Some(PathBuf::from(p))
 }

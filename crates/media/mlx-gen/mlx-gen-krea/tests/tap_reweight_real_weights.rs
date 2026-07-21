@@ -9,7 +9,7 @@
 //!
 //! `#[ignore]` — needs the real Krea 2 Turbo snapshot (bf16 ≈ 32 GB resident, or `KREA_QUANT=q8`):
 //! ```sh
-//! KREA_TURBO_DIR=~/.cache/huggingface/hub/models--SceneWorks--krea-2-turbo-mlx/snapshots/<rev>/bf16 \
+//! KREA_TURBO_DIR=/path/to/models--SceneWorks--krea-2-turbo-mlx/snapshots/<rev>/bf16 \
 //!   cargo test -p mlx-gen-krea --release --test tap_reweight_real_weights -- --ignored --nocapture
 //! ```
 

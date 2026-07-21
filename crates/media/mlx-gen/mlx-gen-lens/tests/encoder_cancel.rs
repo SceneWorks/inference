@@ -26,8 +26,8 @@ use mlx_gen_lens::config::GptOssConfig;
 use mlx_gen_lens::text_encoder::encoder::LensTextEncoder;
 
 fn text_encoder_dir() -> std::path::PathBuf {
-    let base = std::path::PathBuf::from(std::env::var("HOME").unwrap())
-        .join(".cache/huggingface/hub/models--microsoft--Lens-Turbo/snapshots");
+    let base = std::path::PathBuf::from(std::env::var("MLX_GEN_MODELS_ROOT").expect("set MLX_GEN_MODELS_ROOT to the explicit models root (holds models--*/snapshots); inference never self-fetches or derives a cache location (epic 13657)"))
+        .join("models--microsoft--Lens-Turbo/snapshots");
     let snap = std::fs::read_dir(&base)
         .unwrap_or_else(|_| panic!("snapshot dir {}", base.display()))
         .filter_map(|e| e.ok())

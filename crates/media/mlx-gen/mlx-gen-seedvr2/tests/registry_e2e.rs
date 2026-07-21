@@ -20,8 +20,8 @@ fn golden_dir() -> std::path::PathBuf {
 }
 
 fn raw_dir() -> Option<std::path::PathBuf> {
-    let base = std::path::Path::new(&std::env::var("HOME").unwrap())
-        .join(".cache/huggingface/hub/models--numz--SeedVR2_comfyUI/snapshots");
+    let base = std::path::Path::new(&std::env::var("MLX_GEN_MODELS_ROOT").expect("set MLX_GEN_MODELS_ROOT to the explicit models root (holds models--*/snapshots); inference never self-fetches or derives a cache location (epic 13657)"))
+        .join("models--numz--SeedVR2_comfyUI/snapshots");
     let snap = std::fs::read_dir(&base).ok()?.flatten().next()?.path();
     snap.join("seedvr2_ema_3b_fp16.safetensors")
         .exists()

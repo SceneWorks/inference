@@ -18,24 +18,13 @@ use mlx_gen_sdxl::{load_ip_kv_pairs, load_unet_dtype, text_time_ids};
 use mlx_rs::{Array, Dtype};
 
 fn sdxl_snapshot() -> PathBuf {
-    if let Ok(p) = std::env::var("SDXL_SNAPSHOT") {
-        return PathBuf::from(p);
-    }
-    let home = std::env::var("HOME").unwrap();
-    let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--stabilityai--stable-diffusion-xl-base-1.0/snapshots");
-    std::fs::read_dir(&snaps)
-        .expect("HF cache snapshots dir")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir())
-        .expect("a snapshot dir")
+    let p = std::env::var("SDXL_SNAPSHOT").unwrap_or_else(|_| panic!("set SDXL_SNAPSHOT to the required snapshot dir; inference never self-fetches or derives a cache location (epic 13657)"));
+    PathBuf::from(p)
 }
 
 fn ip_weights() -> Weights {
-    let home = std::env::var("HOME").unwrap();
-    let snaps =
-        PathBuf::from(home).join(".cache/huggingface/hub/models--h94--IP-Adapter/snapshots");
+    let home = std::env::var("MLX_GEN_MODELS_ROOT").expect("set MLX_GEN_MODELS_ROOT to the explicit models root (holds models--*/snapshots); inference never self-fetches or derives a cache location (epic 13657)");
+    let snaps = PathBuf::from(home).join("models--h94--IP-Adapter/snapshots");
     let dir = std::fs::read_dir(&snaps)
         .expect("HF cache snapshots dir for h94/IP-Adapter")
         .filter_map(|e| e.ok())
@@ -104,9 +93,8 @@ fn ip_decoupled_attn_remap_and_scale_zero() {
 }
 
 fn h94_snapshot() -> PathBuf {
-    let home = std::env::var("HOME").unwrap();
-    let snaps =
-        PathBuf::from(home).join(".cache/huggingface/hub/models--h94--IP-Adapter/snapshots");
+    let home = std::env::var("MLX_GEN_MODELS_ROOT").expect("set MLX_GEN_MODELS_ROOT to the explicit models root (holds models--*/snapshots); inference never self-fetches or derives a cache location (epic 13657)");
+    let snaps = PathBuf::from(home).join("models--h94--IP-Adapter/snapshots");
     std::fs::read_dir(&snaps)
         .expect("HF cache snapshots dir for h94/IP-Adapter")
         .filter_map(|e| e.ok())

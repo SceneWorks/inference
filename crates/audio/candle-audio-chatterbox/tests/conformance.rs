@@ -875,7 +875,7 @@ fn perth_test_signal(sample_rate: u32, secs: f32) -> Vec<f32> {
 /// collapses the detection separation and fails here. This is the watermarker in isolation; wiring it
 /// into the clone Generator's `generate()` output is sc-13239.
 #[test]
-#[ignore = "real weights: perth_implicit.safetensors from CHATTERBOX_PERTH_SNAPSHOT (or the SceneWorks/perth-implicit hub pin); run with --ignored"]
+#[ignore = "real weights: perth_implicit.safetensors from CHATTERBOX_PERTH_SNAPSHOT; run with --ignored"]
 fn perth_watermark_roundtrips_and_is_imperceptible() {
     let wm = cb::PerthWatermarker::from_safetensors(&perth_weights_file())
         .expect("load the converted PerTh weights");
@@ -973,9 +973,9 @@ fn reference_request(prompt: &str, reference: AudioTrack, seed: u64) -> Generati
 ///
 /// Needs the FULL `CHATTERBOX_SNAPSHOT` (`s3gen.safetensors`), a Kokoro snapshot (reference/control
 /// voices), and the `voice_embedding` + `perth` components staged via [`staged_spec`]
-/// (`CHATTERBOX_VE_SNAPSHOT` / `CHATTERBOX_PERTH_SNAPSHOT`, each hub-fallback when unset).
+/// (`CHATTERBOX_VE_SNAPSHOT` / `CHATTERBOX_PERTH_SNAPSHOT`, each a required snapshot dir).
 #[test]
-#[ignore = "real weights: needs the full chatterbox snapshot (s3gen.safetensors) + Kokoro + the ve/perth components (CHATTERBOX_VE_SNAPSHOT/CHATTERBOX_PERTH_SNAPSHOT, hub-fallback); run with --ignored"]
+#[ignore = "real weights: needs the full chatterbox snapshot (s3gen.safetensors) + Kokoro + the ve/perth components (CHATTERBOX_VE_SNAPSHOT/CHATTERBOX_PERTH_SNAPSHOT); run with --ignored"]
 fn chatterbox_clones_a_reference_voice_end_to_end() {
     use candle_audio_chatterbox::campplus::cosine_similarity;
 

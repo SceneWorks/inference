@@ -8,11 +8,6 @@ use candle_gen::gen_core::{
     GenerationOutput, GenerationRequest, LoadSpec, Progress, WeightsSource,
 };
 
-fn me(c: &[&str]) -> Option<String> {
-    c.iter()
-        .find(|p| std::path::Path::new(p).exists())
-        .map(|p| p.to_string())
-}
 fn mean(px: &[u8]) -> f64 {
     if px.is_empty() {
         0.0
@@ -24,9 +19,9 @@ fn mean(px: &[u8]) -> f64 {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let a: Vec<String> = std::env::args().collect();
     let model = a.get(1).cloned().unwrap_or_else(|| "z_image_turbo".into());
-    let base = a.get(2).cloned().or_else(|| me(&["D:/.cache/huggingface/hub/models--Tongyi-MAI--Z-Image-Turbo/snapshots/f332072aa78be7aecdf3ee76d5c247082da564a6"])).ok_or("base snapshot not found")?;
-    let pid = a.get(3).cloned().or_else(|| me(&["D:/.cache/huggingface/hub/models--SceneWorks--pid-flux/snapshots/52d9474830ad05ea8dc55edb59a21cb14d1a4615/pid_flux_2kto4k.safetensors"])).ok_or("pid-flux not found")?;
-    let gemma = a.get(4).cloned().or_else(|| me(&["D:/.cache/huggingface/hub/models--google--gemma-2-2b-it/snapshots/299a8560bedf22ed1c72a8a11e7dce4a7f9f51f8"])).ok_or("gemma not found")?;
+    let base = a.get(2).cloned().ok_or("base snapshot not found")?;
+    let pid = a.get(3).cloned().ok_or("pid-flux not found")?;
+    let gemma = a.get(4).cloned().ok_or("gemma not found")?;
     let w: u32 = a.get(5).and_then(|s| s.parse().ok()).unwrap_or(512);
     let h: u32 = a.get(6).and_then(|s| s.parse().ok()).unwrap_or(512);
     let seed: u64 = a.get(7).and_then(|s| s.parse().ok()).unwrap_or(7);

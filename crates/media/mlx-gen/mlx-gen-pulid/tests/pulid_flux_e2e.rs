@@ -33,23 +33,13 @@ fn golden(name: &str) -> Weights {
 }
 
 fn flux_snapshot() -> PathBuf {
-    if let Ok(p) = std::env::var("MLX_GEN_FLUX_SNAPSHOT") {
-        return PathBuf::from(p);
-    }
-    let home = std::env::var("HOME").unwrap();
-    let base =
-        format!("{home}/.cache/huggingface/hub/models--black-forest-labs--FLUX.1-dev/snapshots");
-    std::fs::read_dir(&base)
-        .unwrap_or_else(|e| panic!("no FLUX.1-dev cache ({base}): {e}; set MLX_GEN_FLUX_SNAPSHOT"))
-        .flatten()
-        .map(|d| d.path())
-        .find(|p| p.join("transformer").is_dir())
-        .expect("no FLUX.1-dev snapshot with transformer/")
+    let p = std::env::var("MLX_GEN_FLUX_SNAPSHOT").unwrap_or_else(|_| panic!("set MLX_GEN_FLUX_SNAPSHOT to the required snapshot dir; inference never self-fetches or derives a cache location (epic 13657)"));
+    PathBuf::from(p)
 }
 
 fn pulid_weights() -> Weights {
-    let home = std::env::var("HOME").unwrap();
-    let base = format!("{home}/.cache/huggingface/hub/models--guozinan--PuLID/snapshots");
+    let home = std::env::var("MLX_GEN_MODELS_ROOT").expect("set MLX_GEN_MODELS_ROOT to the explicit models root (holds models--*/snapshots); inference never self-fetches or derives a cache location (epic 13657)");
+    let base = format!("{home}/models--guozinan--PuLID/snapshots");
     let path = std::fs::read_dir(&base)
         .unwrap_or_else(|e| panic!("no PuLID cache ({base}): {e}"))
         .flatten()

@@ -7,20 +7,12 @@
 //! cargo run -p candle-gen-krea --example krea-pid-ab --features cuda --release -- \
 //!   <base_snapshot_dir> <pid_qwenimage.safetensors> <gemma-2-2b-it_dir> "<prompt>" [W] [H] [seed]
 //! ```
-//! With no args it resolves the three weight locations from the local HF cache
-//! (`D:/.cache/huggingface`). Krea reuses the Qwen-Image VAE, so its PiD latent space is `qwenimage`.
+//! The three weight locations are required positional args (inference never self-fetches or derives
+//! a cache location, epic 13657). Krea reuses the Qwen-Image VAE, so its PiD latent space is `qwenimage`.
 
 use candle_gen::gen_core::{
     GenerationOutput, GenerationRequest, LoadSpec, Progress, WeightsSource,
 };
-
-/// First existing path from a set of candidates (the HF-cache snapshot layout varies by machine).
-fn first_existing(cands: &[&str]) -> Option<String> {
-    cands
-        .iter()
-        .find(|p| std::path::Path::new(p).exists())
-        .map(|p| p.to_string())
-}
 
 fn mean_u8(pixels: &[u8]) -> f64 {
     if pixels.is_empty() {
@@ -32,15 +24,18 @@ fn mean_u8(pixels: &[u8]) -> f64 {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let a: Vec<String> = std::env::args().collect();
 
-    let base = a.get(1).cloned().or_else(|| first_existing(&[
-        "D:/.cache/huggingface/hub/models--krea--Krea-2-Turbo/snapshots/1161245028ef398cd0a951101b2bbf486464f841",
-    ])).ok_or("base Krea snapshot dir not found (pass as arg 1)")?;
-    let pid_ckpt = a.get(2).cloned().or_else(|| first_existing(&[
-        "D:/.cache/huggingface/hub/models--SceneWorks--pid-qwenimage/snapshots/39d7b0a9003a3fc934d36d8b5658b2d8ea9c1231/pid_qwenimage_2kto4k.safetensors",
-    ])).ok_or("pid_qwenimage safetensors not found (pass as arg 2)")?;
-    let gemma = a.get(3).cloned().or_else(|| first_existing(&[
-        "D:/.cache/huggingface/hub/models--google--gemma-2-2b-it/snapshots/299a8560bedf22ed1c72a8a11e7dce4a7f9f51f8",
-    ])).ok_or("gemma-2-2b-it snapshot dir not found (pass as arg 3)")?;
+    let base = a
+        .get(1)
+        .cloned()
+        .ok_or("base Krea snapshot dir not found (pass as arg 1)")?;
+    let pid_ckpt = a
+        .get(2)
+        .cloned()
+        .ok_or("pid_qwenimage safetensors not found (pass as arg 2)")?;
+    let gemma = a
+        .get(3)
+        .cloned()
+        .ok_or("gemma-2-2b-it snapshot dir not found (pass as arg 3)")?;
 
     let prompt = a.get(4).cloned().unwrap_or_else(|| {
         "a red fox sitting in a snowy pine forest at dawn, sharp fur detail".into()

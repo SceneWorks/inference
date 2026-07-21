@@ -14,11 +14,7 @@ use mlx_gen_svd::MODEL_ID;
 
 /// The cached SVD checkpoint snapshot dir (mirrors `tests/registration.rs`).
 fn svd_snapshot_dir() -> PathBuf {
-    let cache = std::env::var("HF_HUB_CACHE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            PathBuf::from(std::env::var("HOME").unwrap()).join(".cache/huggingface/hub")
-        });
+    let cache = std::path::PathBuf::from(std::env::var("MLX_GEN_MODELS_ROOT").expect("set MLX_GEN_MODELS_ROOT to the explicit models root (holds models--*/snapshots); inference never self-fetches or derives a cache location (epic 13657)"));
     let snaps = cache
         .join("models--stabilityai--stable-video-diffusion-img2vid-xt")
         .join("snapshots");

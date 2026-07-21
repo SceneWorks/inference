@@ -3,7 +3,7 @@
 //! the torch oracle (`scripts/spikes/sam3_oracle/dump_memory_fixture.py`).
 //!
 //! Run:
-//!   SAM3_WEIGHTS=$HOME/.cache/huggingface/hub/models--facebook--sam3/snapshots/<rev>/model.safetensors \
+//!   SAM3_WEIGHTS=/path/to/models--facebook--sam3/snapshots/<rev>/model.safetensors \
 //!   SAM3_MEMORY_FIXTURE=scripts/spikes/sam3_oracle/memory_fixture.safetensors \
 //!     cargo test -p mlx-gen-sam3 --release --test memory_parity -- --ignored --nocapture
 

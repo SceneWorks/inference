@@ -25,20 +25,8 @@ fn env_u32(key: &str, default: u32) -> u32 {
 
 /// Resolve the Anima `split_files/` dir from `ANIMA_SNAPSHOT`, else the HF hub cache (no hardcoded sha).
 fn split_files() -> PathBuf {
-    if let Ok(p) = std::env::var("ANIMA_SNAPSHOT") {
-        return PathBuf::from(p);
-    }
-    let home = std::env::var("HOME").expect("HOME");
-    let base = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--circlestone-labs--Anima/snapshots");
-    std::fs::read_dir(&base)
-        .unwrap_or_else(|_| panic!("no Anima snapshots under {base:?}"))
-        .filter_map(|e| e.ok())
-        .find_map(|e| {
-            let p = e.path().join("split_files");
-            p.join("diffusion_models").is_dir().then_some(p)
-        })
-        .expect("set ANIMA_SNAPSHOT or populate the HF hub cache")
+    let p = std::env::var("ANIMA_SNAPSHOT").unwrap_or_else(|_| panic!("set ANIMA_SNAPSHOT to the required snapshot dir; inference never self-fetches or derives a cache location (epic 13657)"));
+    PathBuf::from(p)
 }
 
 fn probe_request() -> GenerationRequest {

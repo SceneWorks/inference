@@ -21,11 +21,7 @@ const GOLDEN: &str = concat!(
 );
 
 fn snapshot() -> std::path::PathBuf {
-    let cache = std::env::var("HF_HUB_CACHE")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            std::path::PathBuf::from(std::env::var("HOME").unwrap()).join(".cache/huggingface/hub")
-        });
+    let cache = std::path::PathBuf::from(std::env::var("MLX_GEN_MODELS_ROOT").expect("set MLX_GEN_MODELS_ROOT to the explicit models root (holds models--*/snapshots); inference never self-fetches or derives a cache location (epic 13657)"));
     let snaps = cache
         .join("models--stabilityai--stable-video-diffusion-img2vid-xt")
         .join("snapshots");

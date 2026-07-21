@@ -21,42 +21,15 @@ use mlx_rs::Dtype;
 
 /// Base FLUX.2-klein-9b diffusers snapshot (env `MLX_GEN_FLUX2_SNAPSHOT` or the HF cache).
 fn base_snapshot() -> PathBuf {
-    if let Ok(p) = std::env::var("MLX_GEN_FLUX2_SNAPSHOT") {
-        return PathBuf::from(p);
-    }
-    let home = std::env::var("HOME").expect("HOME");
-    let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--black-forest-labs--FLUX.2-klein-9b/snapshots");
-    std::fs::read_dir(&snaps)
-        .expect("base snapshot dir")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir())
-        .expect("a base snapshot dir")
+    let p = std::env::var("MLX_GEN_FLUX2_SNAPSHOT").unwrap_or_else(|_| panic!("set MLX_GEN_FLUX2_SNAPSHOT to the required snapshot dir; inference never self-fetches or derives a cache location (epic 13657)"));
+    PathBuf::from(p)
 }
 
 /// wikeeyang true_v2 single-file transformer, bf16 (env `MLX_GEN_FLUX2_TRUE_V2_FILE` or the HF
 /// cache). This is the exact file the SceneWorks manifest's `convertSourceFile` targets.
 fn true_v2_bf16_file() -> PathBuf {
-    if let Ok(p) = std::env::var("MLX_GEN_FLUX2_TRUE_V2_FILE") {
-        return PathBuf::from(p);
-    }
-    let home = std::env::var("HOME").expect("HOME");
-    let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--wikeeyang--Flux2-Klein-9B-True-V2/snapshots");
-    let snap = std::fs::read_dir(&snaps)
-        .expect("true_v2 snapshot dir")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir())
-        .expect("a true_v2 snapshot dir");
-    let file = snap.join("Flux2-Klein-9B-True-v2-bf16.safetensors");
-    assert!(
-        file.is_file(),
-        "missing bf16 single file: {}",
-        file.display()
-    );
-    file
+    let p = std::env::var("MLX_GEN_FLUX2_TRUE_V2_FILE").unwrap_or_else(|_| panic!("set MLX_GEN_FLUX2_TRUE_V2_FILE to the required snapshot dir; inference never self-fetches or derives a cache location (epic 13657)"));
+    PathBuf::from(p)
 }
 
 #[test]

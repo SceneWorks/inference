@@ -33,19 +33,10 @@
 use mlx_gen::{GenerationOutput, GenerationRequest, LoadSpec, WeightsSource};
 use std::path::PathBuf;
 
-const DEFAULT_SNAPSHOT: &str = concat!(
-    env!("HOME"),
-    "/.cache/huggingface/hub/models--sensenova--SenseNova-U1-8B-MoT/snapshots/\
-     bfa9b436503cb8aed4f2bc60e3236710cc77468d"
-);
-
-/// Resolve the source snapshot: `SC8771_SRC`, else the cached SenseNova-U1-8B-MoT snapshot.
+/// Resolve the source snapshot from the required `SC8771_SRC` (inference never self-fetches or
+/// derives a cache location, epic 13657); `None` when unset so the `#[ignore]`d test skips.
 fn sensenova_snapshot() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("SC8771_SRC") {
-        return Some(PathBuf::from(p));
-    }
-    let p = PathBuf::from(DEFAULT_SNAPSHOT);
-    p.is_dir().then_some(p)
+    std::env::var("SC8771_SRC").ok().map(PathBuf::from)
 }
 
 fn model_id() -> String {

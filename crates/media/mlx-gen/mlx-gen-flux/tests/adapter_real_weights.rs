@@ -24,18 +24,8 @@ use mlx_gen::{
 use mlx_gen_flux::{apply_flux_adapters, FluxVariant};
 
 fn snapshot() -> PathBuf {
-    if let Ok(p) = std::env::var("MLX_GEN_FLUX_DEV_SNAPSHOT") {
-        return PathBuf::from(p);
-    }
-    let home = std::env::var("HOME").expect("HOME");
-    let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--black-forest-labs--FLUX.1-dev/snapshots");
-    std::fs::read_dir(&snaps)
-        .expect("FLUX.1-dev snapshot dir")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir())
-        .expect("a snapshot dir")
+    let p = std::env::var("MLX_GEN_FLUX_DEV_SNAPSHOT").unwrap_or_else(|_| panic!("set MLX_GEN_FLUX_DEV_SNAPSHOT to the required snapshot dir; inference never self-fetches or derives a cache location (epic 13657)"));
+    PathBuf::from(p)
 }
 
 fn golden_dir() -> PathBuf {

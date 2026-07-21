@@ -34,7 +34,7 @@ fn snapshot() -> WeightsSource {
 /// contract, typed mid-run and pre-generate cancellation, seed determinism) against the real
 /// provider, resolved **through the explicit registry** exactly like an image model.
 #[test]
-#[ignore = "real weights: needs a MOSS-SoundEffect-v2.0 snapshot (MOSS_SFX_SNAPSHOT or network); run with --ignored"]
+#[ignore = "real weights: needs a MOSS-SoundEffect-v2.0 snapshot (MOSS_SFX_SNAPSHOT); run with --ignored"]
 fn moss_sfx_conformance() {
     let spec = LoadSpec::new(snapshot());
     let profile = gen_core_testkit::Profile {
@@ -76,7 +76,7 @@ fn moss_sfx_conformance() {
 /// - **byte-identical re-synthesis** — the seed law (the companion alternate-seed
 ///   byte-difference check runs in `moss_sfx_conformance`'s gen-core suite).
 #[test]
-#[ignore = "real weights: needs a MOSS-SoundEffect-v2.0 snapshot (MOSS_SFX_SNAPSHOT or network); run with --ignored"]
+#[ignore = "real weights: needs a MOSS-SoundEffect-v2.0 snapshot (MOSS_SFX_SNAPSHOT); run with --ignored"]
 fn moss_sfx_wav_conformance() {
     let spec = LoadSpec::new(snapshot());
     let registry = candle_audio_moss_sfx::provider_registry().unwrap();

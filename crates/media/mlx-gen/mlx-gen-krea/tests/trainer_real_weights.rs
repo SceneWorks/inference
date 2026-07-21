@@ -17,17 +17,8 @@ use mlx_gen_krea::load_trainer;
 /// Resolve the `krea/Krea-2-Raw` snapshot (the `KREA_RAW_DIR` override, else the newest HF-cache
 /// snapshot with a `transformer/` tree).
 fn raw_snapshot() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("KREA_RAW_DIR") {
-        return Some(PathBuf::from(p));
-    }
-    let home = std::env::var("HOME").ok()?;
-    let snaps =
-        PathBuf::from(home).join(".cache/huggingface/hub/models--krea--Krea-2-Raw/snapshots");
-    std::fs::read_dir(&snaps)
-        .ok()?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir() && p.join("transformer").is_dir())
+    let p = std::env::var("KREA_RAW_DIR").ok()?;
+    Some(PathBuf::from(p))
 }
 
 /// Write a synthetic 320×256 RGB PNG (a deterministic gradient — content is irrelevant; the trainer

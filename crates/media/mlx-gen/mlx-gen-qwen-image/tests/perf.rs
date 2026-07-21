@@ -28,11 +28,8 @@ fn snapshot(env: &str, repo: &str) -> Option<PathBuf> {
     if let Ok(p) = std::env::var(env) {
         return Some(PathBuf::from(p));
     }
-    let home = std::env::var("HOME").ok()?;
-    let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub")
-        .join(repo)
-        .join("snapshots");
+    let home = std::env::var("MLX_GEN_MODELS_ROOT").ok()?;
+    let snaps = PathBuf::from(home).join(repo).join("snapshots");
     std::fs::read_dir(&snaps)
         .ok()?
         .filter_map(|e| e.ok())

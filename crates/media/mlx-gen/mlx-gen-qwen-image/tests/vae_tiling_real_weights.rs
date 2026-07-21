@@ -17,8 +17,8 @@ fn base_dir() -> PathBuf {
     std::env::var("KREA_CONTROL_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
-            let snaps = PathBuf::from(std::env::var("HOME").unwrap())
-                .join(".cache/huggingface/hub/models--SceneWorks--krea-2-turbo-mlx/snapshots");
+            let snaps = PathBuf::from(std::env::var("MLX_GEN_MODELS_ROOT").expect("set MLX_GEN_MODELS_ROOT to the explicit models root (holds models--*/snapshots); inference never self-fetches or derives a cache location (epic 13657)"))
+                .join("models--SceneWorks--krea-2-turbo-mlx/snapshots");
             std::fs::read_dir(&snaps)
                 .unwrap()
                 .filter_map(|e| e.ok())

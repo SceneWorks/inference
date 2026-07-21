@@ -41,9 +41,8 @@ use candle_gen_anima::AnimaComponents;
 
 /// Glob the Anima snapshot's `split_files/` dir from the HF cache (no hardcoded sha).
 fn split_files() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    let base = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--circlestone-labs--Anima/snapshots");
+    let home = std::env::var("CANDLE_GEN_MODELS_ROOT").ok()?;
+    let base = PathBuf::from(home).join("models--circlestone-labs--Anima/snapshots");
     std::fs::read_dir(&base)
         .ok()?
         .filter_map(|e| e.ok())
@@ -383,9 +382,8 @@ use std::collections::HashMap;
 
 /// Glob one Anima-Official-LoRAs file from the HF cache (no hardcoded sha).
 fn lora_file(name: &str) -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    let base = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--circlestone-labs--Anima-Official-LoRAs/snapshots");
+    let home = std::env::var("CANDLE_GEN_MODELS_ROOT").ok()?;
+    let base = PathBuf::from(home).join("models--circlestone-labs--Anima-Official-LoRAs/snapshots");
     std::fs::read_dir(&base)
         .ok()?
         .filter_map(|e| e.ok())

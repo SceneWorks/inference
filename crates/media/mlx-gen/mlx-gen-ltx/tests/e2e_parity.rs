@@ -91,17 +91,8 @@ fn base_q4_dir() -> std::path::PathBuf {
 }
 
 fn gemma_dir() -> std::path::PathBuf {
-    if let Ok(d) = std::env::var("LTX_GEMMA_DIR") {
-        return d.into();
-    }
-    let home = std::env::var("HOME").unwrap();
-    let base = std::path::PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--mlx-community--gemma-3-12b-it-bf16/snapshots");
-    std::fs::read_dir(&base)
-        .expect("gemma snapshot dir")
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .find(|p| p.is_dir())
-        .expect("a gemma snapshot")
+    let d = std::env::var("LTX_GEMMA_DIR").unwrap_or_else(|_| panic!("set LTX_GEMMA_DIR to the required snapshot dir; inference never self-fetches or derives a cache location (epic 13657)"));
+    d.into()
 }
 
 fn f32(x: &Array) -> Array {

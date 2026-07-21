@@ -31,27 +31,8 @@ use common::snapshot_opt as snapshot;
 /// The Fun-Controlnet-Union checkpoint: env `CONTROL_WEIGHTS`, else the first `.safetensors` in the
 /// HF cache. `None` ⇒ the control test skips.
 fn control_source() -> Option<WeightsSource> {
-    if let Ok(p) = std::env::var("CONTROL_WEIGHTS") {
-        return Some(WeightsSource::File(PathBuf::from(p)));
-    }
-    let home = std::env::var("HOME").ok()?;
-    let snaps = PathBuf::from(home).join(
-        ".cache/huggingface/hub/models--alibaba-pai--Z-Image-Turbo-Fun-Controlnet-Union-2.1/snapshots",
-    );
-    let file = std::fs::read_dir(&snaps)
-        .ok()?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.is_dir())
-        .flat_map(|d| {
-            std::fs::read_dir(d)
-                .into_iter()
-                .flatten()
-                .filter_map(|e| e.ok())
-                .map(|e| e.path())
-        })
-        .find(|p| p.extension().map(|x| x == "safetensors").unwrap_or(false))?;
-    Some(WeightsSource::File(file))
+    let p = std::env::var("CONTROL_WEIGHTS").ok()?;
+    Some(WeightsSource::File(PathBuf::from(p)))
 }
 
 fn env_i32(var: &str, default: i32) -> i32 {

@@ -36,8 +36,8 @@ use mlx_gen_wan::MODEL_ID_VACE;
 
 /// The VACE `transformer/` dir in the local HF cache (the one snapshot under `snapshots/<hash>/`).
 fn cached_vace_transformer() -> Option<PathBuf> {
-    let base = PathBuf::from(std::env::var("HOME").ok()?)
-        .join(".cache/huggingface/hub/models--Wan-AI--Wan2.1-VACE-1.3B-diffusers/snapshots");
+    let base = PathBuf::from(std::env::var("MLX_GEN_MODELS_ROOT").ok()?)
+        .join("models--Wan-AI--Wan2.1-VACE-1.3B-diffusers/snapshots");
     std::fs::read_dir(&base)
         .ok()?
         .filter_map(|e| e.ok().map(|e| e.path().join("transformer")))

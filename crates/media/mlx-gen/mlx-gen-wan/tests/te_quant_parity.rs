@@ -15,7 +15,7 @@
 //! (its `t5_encoder.safetensors` + `tokenizer.json` — the bf16 TE is identical across tiers):
 //!
 //! ```text
-//! WAN_TI2V_5B_MODEL_DIR=~/.cache/huggingface/hub/models--SceneWorks--wan2.2-ti2v-5b-mlx/snapshots/<h>/q4 \
+//! WAN_TI2V_5B_MODEL_DIR=/path/to/models--SceneWorks--wan2.2-ti2v-5b-mlx/snapshots/<h>/q4 \
 //!   cargo test -p mlx-gen-wan --test te_quant_parity -- --ignored --nocapture
 //! ```
 

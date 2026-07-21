@@ -52,11 +52,7 @@ fn load_rejects_single_file() {
 #[test]
 #[ignore = "needs the SVD checkpoint in the HF cache (loads the full f32 model)"]
 fn svd_provider_generates_video() {
-    let cache = std::env::var("HF_HUB_CACHE")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            std::path::PathBuf::from(std::env::var("HOME").unwrap()).join(".cache/huggingface/hub")
-        });
+    let cache = std::path::PathBuf::from(std::env::var("MLX_GEN_MODELS_ROOT").expect("set MLX_GEN_MODELS_ROOT to the explicit models root (holds models--*/snapshots); inference never self-fetches or derives a cache location (epic 13657)"));
     let snaps = cache
         .join("models--stabilityai--stable-video-diffusion-img2vid-xt")
         .join("snapshots");
@@ -120,11 +116,7 @@ fn svd_provider_generates_video() {
 /// Locate the cached SVD checkpoint snapshot dir (shared by the real-weight tests).
 #[cfg(test)]
 fn svd_snapshot_dir() -> std::path::PathBuf {
-    let cache = std::env::var("HF_HUB_CACHE")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            std::path::PathBuf::from(std::env::var("HOME").unwrap()).join(".cache/huggingface/hub")
-        });
+    let cache = std::path::PathBuf::from(std::env::var("MLX_GEN_MODELS_ROOT").expect("set MLX_GEN_MODELS_ROOT to the explicit models root (holds models--*/snapshots); inference never self-fetches or derives a cache location (epic 13657)"));
     let snaps = cache
         .join("models--stabilityai--stable-video-diffusion-img2vid-xt")
         .join("snapshots");
