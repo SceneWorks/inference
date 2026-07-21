@@ -42,6 +42,21 @@ use candle_gen::gen_core::{
     NetworkType, TrainingConfig, TrainingItem, TrainingProgress, TrainingRequest, WeightsSource,
 };
 
+/// An SDXL LoadSpec with the three passed-in components (epic 13657 / sc-13663) staged from explicit,
+/// env-pointed local dirs (no hub fetch): the CLIP-L/bigG tokenizer dirs + the fp16-fix VAE dir. The
+/// trainer + generator both gate on these at load. Real-weight, so `#[ignore]`d.
+fn sdxl_load_spec() -> LoadSpec {
+    let dir = |k: &str| {
+        WeightsSource::Dir(PathBuf::from(
+            std::env::var(k).unwrap_or_else(|_| panic!("set {k} to the component's local dir")),
+        ))
+    };
+    LoadSpec::new(WeightsSource::Dir(snapshot()))
+        .with_component("tokenizer_clip_l", dir("SDXL_TOKENIZER_CLIP_L_DIR"))
+        .with_component("tokenizer_clip_bigg", dir("SDXL_TOKENIZER_CLIP_BIGG_DIR"))
+        .with_component("vae_fp16_fix", dir("SDXL_VAE_FP16_FIX_DIR"))
+}
+
 /// The SDXL base snapshot dir — `SDXL_SNAPSHOT` or the first HF-cache snapshot.
 fn snapshot() -> PathBuf {
     if let Ok(p) = std::env::var("SDXL_SNAPSHOT") {
@@ -113,7 +128,7 @@ fn run(tmp: &Path, file_name: &str, network_type: NetworkType, steps: u32, gc: b
 
     let mut trainer = candle_gen_sdxl::provider_registry()
         .unwrap()
-        .load_trainer("sdxl", &LoadSpec::new(WeightsSource::Dir(snapshot())))
+        .load_trainer("sdxl", &sdxl_load_spec())
         .expect("sdxl candle trainer should be registered");
 
     let req = TrainingRequest {
@@ -346,7 +361,7 @@ fn sdxl_trainer_emits_preview_samples() {
     assert_eq!(candle_gen_sdxl::MODEL_ID, "sdxl");
     let mut trainer = candle_gen_sdxl::provider_registry()
         .unwrap()
-        .load_trainer("sdxl", &LoadSpec::new(WeightsSource::Dir(snapshot())))
+        .load_trainer("sdxl", &sdxl_load_spec())
         .expect("sdxl candle trainer should be registered");
 
     // 4 steps, render a preview every 2 steps over 2 prompts → 2 cadences × 2 prompts = 4 Sample events.
@@ -415,7 +430,7 @@ fn sdxl_trainer_emits_preview_samples() {
 /// correctly-sized image. Exercises the full merge→build→denoise→decode path on the GPU — if the
 /// merge matched no target it would error inside `generate`, so a finite render proves the merge ran.
 fn render_finite_with_adapter(adapter_path: &Path, kind: AdapterKind) {
-    let spec = LoadSpec::new(WeightsSource::Dir(snapshot())).with_adapters(vec![AdapterSpec::new(
+    let spec = sdxl_load_spec().with_adapters(vec![AdapterSpec::new(
         adapter_path.to_path_buf(),
         1.0,
         kind,

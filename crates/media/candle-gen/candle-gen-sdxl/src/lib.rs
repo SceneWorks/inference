@@ -173,7 +173,7 @@ use candle_gen::gen_core::{
     Modality, ModelDescriptor, PidWeights, Progress, Quant, WeightsSource,
 };
 
-use pipeline::{Components, Pipeline};
+use pipeline::{Components, Pipeline, SdxlComponents};
 
 /// Registry id — matches the SceneWorks worker's `payload.model` (`MODEL_TABLE["sdxl"]`). The
 /// worker maps both `sdxl` and `realvisxl` onto engine id `"sdxl"`, so — exactly like
@@ -249,6 +249,10 @@ pub struct SdxlGenerator {
     /// The `LoadSpec::pid` component captured at load (epic 7840 / sc-7853), threaded into the lazy
     /// component build so the PiD engine loads once alongside the UNet/VAE. `None` when not opted in.
     pid_spec: Option<PidWeights>,
+    /// The three caller-staged SDXL components (epic 13657, sc-13663): the CLIP-L/bigG tokenizers +
+    /// the fp16-fix VAE, validated at [`load`] and threaded into the lazy tokenizer/UNet+VAE build in
+    /// place of the deleted `hf_get` self-fetch.
+    component_paths: SdxlComponents,
     /// Cached UNet+VAE + the flash-attn flag they were built with. `Mutex` because `Generator` is
     /// shared and `generate` takes `&self`; the lock is held only to read/populate the cache (a
     /// cheap `Arc` clone or a one-time load), never across the denoise.
@@ -290,7 +294,10 @@ impl SdxlGenerator {
     /// shared [`candle_gen::cached`] read-through recovers a poisoned lock internally (the F-031 idiom).
     fn tokenizers(&self) -> gen_core::Result<Arc<pipeline::SdxlTokenizers>> {
         candle_gen::cached(&self.tokenizers, || {
-            Ok(Arc::new(pipeline::SdxlTokenizers::load()?))
+            Ok(Arc::new(pipeline::SdxlTokenizers::load(
+                &self.component_paths.tokenizer_clip_l,
+                &self.component_paths.tokenizer_clip_bigg,
+            )?))
         })
     }
 }
@@ -364,6 +371,7 @@ impl Generator for SdxlGenerator {
             req.height,
             &self.adapters,
             self.pid_spec.clone(),
+            self.component_paths.vae_fp16_fix.clone(),
         )?;
         // Encode text FIRST (loads + frees CLIP) so the cold-call ordering — CLIP gone before the
         // UNet/VAE are resident — is preserved (sc-4987); only then acquire the cached UNet/VAE
@@ -395,7 +403,10 @@ impl Generator for SdxlGenerator {
 /// `mac_only = false`.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
-        required_components: &[],
+        // epic 13657 (sc-13663): SDXL requires three caller-staged components — the two model-agnostic
+        // CLIP tokenizers + the fp16-fix VAE — that used to be self-fetched from pinned `hf-hub` repos
+        // on the render path. Advertised so SceneWorks stages them, and `load` fails fast if it doesn't.
+        required_components: pipeline::REQUIRED_COMPONENTS,
         id: MODEL_ID,
         family: "sdxl",
         // The tensor backend whose provider crate registered this engine (sc-3723). MLX sets "mlx".
@@ -480,6 +491,11 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
             ));
         }
     };
+    // epic 13657 (sc-13663) load gate: resolve + validate the three passed-in components
+    // (`tokenizer_clip_l` / `tokenizer_clip_bigg` / `vae_fp16_fix`) before any work — a missing one is
+    // a caller-actionable load-time error, and an unrecognized key is rejected. `load` stays lazy (the
+    // component paths are read at the first `generate`), but the contract is checked up front here.
+    let component_paths = SdxlComponents::from_spec(spec, MODEL_ID)?;
     // SDXL is fp16 (the production reference dtype) regardless of the CPU-default dtype; the device
     // is the backend selected at compile time (CUDA on Windows, Metal/CPU on Mac).
     let device = candle_gen::default_device()?;
@@ -489,6 +505,7 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         device,
         dtype: DType::F16,
         adapters: spec.adapters.clone(),
+        component_paths,
         // PiD is an optional aux decoder (epic 7840 / sc-7853): capture the load-spec component (if
         // any) so the lazy component build loads the engine once. Unlike adapters, it is not rejected
         // — `None` simply keeps the byte-exact native-VAE path.
@@ -542,12 +559,31 @@ mod tests {
     use super::*;
     use candle_gen::gen_core::{Conditioning, ConditioningKind, Image, LoadSpec, WeightsSource};
 
+    /// A lazy-loadable SDXL spec: the given `weights` plus the three staged components (epic 13657,
+    /// sc-13663) the load gate now requires. The component paths are never read until `generate`, so
+    /// nonexistent placeholders are fine for the lazy-resolution + validate tests here.
+    fn sdxl_spec(weights: WeightsSource) -> LoadSpec {
+        LoadSpec::new(weights)
+            .with_component(
+                "tokenizer_clip_l",
+                WeightsSource::File("/nonexistent/clip_l/tokenizer.json".into()),
+            )
+            .with_component(
+                "tokenizer_clip_bigg",
+                WeightsSource::File("/nonexistent/clip_bigg/tokenizer.json".into()),
+            )
+            .with_component(
+                "vae_fp16_fix",
+                WeightsSource::File("/nonexistent/vae.safetensors".into()),
+            )
+    }
+
     /// The seam under test: resolving `"sdxl"` through the family registry returns this candle
     /// generator. `load` is
     /// lazy, so a nonexistent weights dir still resolves (no file I/O until `generate`).
     #[test]
     fn sdxl_registers_and_resolves_as_candle() {
-        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let spec = sdxl_spec(WeightsSource::Dir("/nonexistent".into()));
         let g = crate::provider_registry()
             .unwrap()
             .load("sdxl", &spec)
@@ -587,6 +623,23 @@ mod tests {
             d.capabilities.schedulers,
             candle_gen::menu_with_aliases(candle_gen::curated_scheduler_names(), &["discrete"])
         );
+        // epic 13657 (sc-13663): SDXL advertises its three passed-in components (the CLIP tokenizers +
+        // the fp16-fix VAE) that used to be self-fetched from pinned `hf-hub` repos on the render path.
+        assert_eq!(
+            d.required_components,
+            &["tokenizer_clip_l", "tokenizer_clip_bigg", "vae_fp16_fix"]
+        );
+    }
+
+    /// epic 13657 (sc-13663): the load gate. Every declared `required_components` id, removed in turn,
+    /// makes `load` fail with a caller-actionable error that names the missing id (not a mid-render
+    /// fetch), and an unrecognized component key is rejected at load. Weights-free — the testkit drives
+    /// the real `load`, which stays lazy, so the placeholder component/weights paths are never read.
+    #[test]
+    fn missing_or_unknown_component_fails_at_load() {
+        let base = sdxl_spec(WeightsSource::Dir("/nonexistent".into()));
+        gen_core_testkit::check_component_load_gate(load, &base, descriptor().required_components)
+            .expect("SDXL load must gate on every declared required component");
     }
 
     /// sc-3677 parity: the worker maps BOTH `sdxl` and `realvisxl` onto this single descriptor, so
@@ -645,7 +698,7 @@ mod tests {
     /// served). Uses the lazy generator so no weights are needed.
     #[test]
     fn validate_accepts_txt2img_and_rejects_unsupported() {
-        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let spec = sdxl_spec(WeightsSource::Dir("/nonexistent".into()));
         let g = crate::provider_registry()
             .unwrap()
             .load("sdxl", &spec)
@@ -718,7 +771,7 @@ mod tests {
     /// only passes a named sampler that is in `descriptor().samplers`. GPU-free (lazy generator).
     #[test]
     fn validate_accepts_lightning_sampler() {
-        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let spec = sdxl_spec(WeightsSource::Dir("/nonexistent".into()));
         let g = crate::provider_registry()
             .unwrap()
             .load("sdxl", &spec)
@@ -797,9 +850,12 @@ mod tests {
     #[test]
     fn load_accepts_lora_adapters() {
         use candle_gen::gen_core::{AdapterKind, AdapterSpec};
-        let spec = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_adapters(vec![
-            AdapterSpec::new("/lora.safetensors".into(), 1.0, AdapterKind::Lora),
-        ]);
+        let spec =
+            sdxl_spec(WeightsSource::Dir("/snap".into())).with_adapters(vec![AdapterSpec::new(
+                "/lora.safetensors".into(),
+                1.0,
+                AdapterKind::Lora,
+            )]);
         let g = load(&spec).expect("load accepts adapters (lazy; merge defers to generate)");
         assert!(g.descriptor().capabilities.supports_lora);
         assert!(g.descriptor().capabilities.supports_lokr);

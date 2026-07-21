@@ -20,7 +20,10 @@
 //! ```
 //!
 //! The snapshot must be the diffusers multi-component tree (`unet/`, `text_encoder/`,
-//! `text_encoder_2/`); the model-agnostic CLIP tokenizers + fp16-VAE-fix resolve from the HF cache.
+//! `text_encoder_2/`); the model-agnostic CLIP tokenizers + fp16-VAE-fix are **passed-in** components
+//! (epic 13657 / sc-13663) — point each at a local dir via `--tokenizer-clip-l` /
+//! `--tokenizer-clip-bigg` / `--vae-fp16-fix`, or the env vars `SDXL_TOKENIZER_CLIP_L_DIR` /
+//! `SDXL_TOKENIZER_CLIP_BIGG_DIR` / `SDXL_VAE_FP16_FIX_DIR`.
 
 use std::path::PathBuf;
 
@@ -111,7 +114,27 @@ fn main() -> Result<()> {
     // `--lora <file> [--lora-scale s]` folds a trained kohya/PEFT LoRA into the UNet at load. On a
     // packed (q4/q8) snapshot this exercises the sc-9528 packed-adapter fold (dequant→fold→keep-dense);
     // on a dense bf16 snapshot it is the sc-5165 dense merge. `--lora-kind lokr` for a LoKr file.
-    let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(&snapshot)));
+    // epic 13657 / sc-13663: the three model-agnostic components are passed in (never self-fetched).
+    // `--tokenizer-clip-l <dir>` (else $SDXL_TOKENIZER_CLIP_L_DIR), likewise bigG + the fp16-fix VAE.
+    let component = |flag: &str, env: &str| -> Result<WeightsSource> {
+        let dir = arg(&args, flag)
+            .or_else(|| std::env::var(env).ok())
+            .ok_or_else(|| format!("pass {flag} <dir> (or set {env}) for the SDXL component"))?;
+        Ok(WeightsSource::Dir(PathBuf::from(dir)))
+    };
+    let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(&snapshot)))
+        .with_component(
+            "tokenizer_clip_l",
+            component("--tokenizer-clip-l", "SDXL_TOKENIZER_CLIP_L_DIR")?,
+        )
+        .with_component(
+            "tokenizer_clip_bigg",
+            component("--tokenizer-clip-bigg", "SDXL_TOKENIZER_CLIP_BIGG_DIR")?,
+        )
+        .with_component(
+            "vae_fp16_fix",
+            component("--vae-fp16-fix", "SDXL_VAE_FP16_FIX_DIR")?,
+        );
     let spec = match arg(&args, "--lora") {
         Some(lora) => {
             let scale: f32 = arg(&args, "--lora-scale")

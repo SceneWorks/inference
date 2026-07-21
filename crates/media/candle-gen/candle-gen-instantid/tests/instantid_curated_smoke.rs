@@ -62,6 +62,10 @@ fn curated_samplers_preserve_identity() {
         identitynet: WeightsSource::Dir(env_path("IID_IDENTITYNET")),
         ip_adapter: env_path("IID_IP_ADAPTER"),
         adapters: Vec::new(),
+        // epic 13657 / sc-13663: SDXL tokenizers + fp16-fix VAE are passed-in components.
+        tokenizer_clip_l: WeightsSource::Dir(env_path("IID_TOKENIZER_CLIP_L")),
+        tokenizer_clip_bigg: WeightsSource::Dir(env_path("IID_TOKENIZER_CLIP_BIGG")),
+        vae_fp16_fix: WeightsSource::Dir(env_path("IID_VAE_FP16_FIX")),
     };
     let mut model = InstantId::load(&paths)
         .expect("load InstantID")

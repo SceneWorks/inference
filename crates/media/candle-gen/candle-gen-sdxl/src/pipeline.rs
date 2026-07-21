@@ -29,9 +29,10 @@
 //!   cancellation is `req.cancel` → typed [`gen_core::Error::Canceled`], and each image is returned as a
 //!   `gen_core::Image` (RGB8) — the worker owns asset writes (no candle-specific worker code).
 //! - **Weights come from `spec.weights` (the SDXL snapshot dir)**, not a hardcoded HF repo: UNet +
-//!   both text encoders load from the snapshot's component subdirs. The two **model-agnostic** inputs
-//!   — the fp16-VAE-fix and the CLIP-L/bigG `tokenizer.json`s — still resolve via `hf-hub` (cached),
-//!   exactly as the spike.
+//!   both text encoders load from the snapshot's component subdirs. The three **model-agnostic**
+//!   inputs — the fp16-VAE-fix and the CLIP-L/bigG `tokenizer.json`s — are **passed in** as
+//!   [`LoadSpec::components`](gen_core::LoadSpec::components) (`vae_fp16_fix` / `tokenizer_clip_l` /
+//!   `tokenizer_clip_bigg`, epic 13657 / sc-13663), never self-fetched.
 //!
 //! - **Component caching (sc-5037)**: the seed/prompt/resolution-independent [`Components`] (UNet +
 //!   VAE) are loaded once and **cached on the generator** across `generate` calls (keyed by the
@@ -63,7 +64,9 @@ use candle_gen::gen_core::sampling::{
     Scheduler,
 };
 use candle_gen::gen_core::tiling::{TilingConfig, VaeTiling};
-use candle_gen::gen_core::{self, AdapterSpec, GenerationRequest, Image, PidWeights, Progress};
+use candle_gen::gen_core::{
+    self, AdapterSpec, GenerationRequest, Image, LoadSpec, PidWeights, Progress, WeightsSource,
+};
 // Shared per-image batch seed (`base + index`) — one home in `candle-gen` (sc-9043 / F-059).
 use candle_gen::{CandleError, LatentDecoder, Result};
 use candle_gen_pid::{PidDecoder, PidEngine};
@@ -158,41 +161,96 @@ fn lightning_policy(num_steps: usize) -> Result<LightningPolicy> {
     Ok(LightningPolicy::new(&sched, SDXL_TRAIN_STEPS, num_steps))
 }
 
-/// The fp16-stable SDXL VAE (the base VAE NaNs in f16). Model-agnostic across every SDXL checkpoint,
-/// so it is fetched by repo id rather than read from the per-model snapshot.
-pub(crate) const VAE_FIX_REPO: &str = "madebyollin/sdxl-vae-fp16-fix";
+/// The diffusers filename the fp16-stable SDXL VAE (`madebyollin/sdxl-vae-fp16-fix`) ships under — the
+/// base SDXL VAE NaNs in f16, so this model-agnostic replacement is provisioned by the consumer as the
+/// `vae_fp16_fix` component (epic 13657, sc-13663). Used to resolve a component staged as a directory
+/// (`WeightsSource::Dir`) to its weight file; a component staged as a `File` is used verbatim.
 pub(crate) const VAE_FIX_FILE: &str = "diffusion_pytorch_model.safetensors";
 
-/// Immutable commit SHAs pinning the three runtime `hf-hub` downloads on the SDXL render path
-/// (sc-9013 / F-029). Every `hf_get` resolves against one of these — never the mutable `main`
-/// default — so a compromised or force-pushed upstream cannot silently swap the fp16-fix VAE weights
-/// or the CLIP tokenizations out from under a cold-cache generation. The trio is model-agnostic (they
-/// do not vary per SDXL checkpoint), so a single pin per repo covers every request. Bump these
-/// deliberately (and re-validate) if an upstream fix is ever needed. SHAs captured 2026-07-02:
-/// - `madebyollin/sdxl-vae-fp16-fix`
-/// - `openai/clip-vit-large-patch14`
-/// - `laion/CLIP-ViT-bigG-14-laion2B-39B-b160k`
-const HUB_PINS: &[(&str, &str)] = &[
-    (VAE_FIX_REPO, "207b116dae70ace3637169f1ddd2434b91b3a8cd"),
-    (
-        "openai/clip-vit-large-patch14",
-        "32bd64288804d66eefd0ccbe215aa642df71cc41",
-    ),
-    (
-        "laion/CLIP-ViT-bigG-14-laion2B-39B-b160k",
-        "743c27bd53dfe508a0ade0f50698f99b39d03bec",
-    ),
+/// The SDXL lane's three **passed-in** model components (epic 13657, sc-13658 contract): the two
+/// model-agnostic CLIP tokenizers and the fp16-stable VAE. Inference NEVER self-fetches these — before
+/// sc-13663 they were downloaded on the render path from three pinned `hf-hub` repos
+/// (`openai/clip-vit-large-patch14`, `laion/CLIP-ViT-bigG-14-laion2B-39B-b160k`,
+/// `madebyollin/sdxl-vae-fp16-fix`); now the consumer stages each as a local
+/// [`LoadSpec::components`](gen_core::LoadSpec::components) entry (or, for the bespoke edit/IP/InstantID
+/// providers, a `*Paths` field) under these registered ids, and a missing one is a load-time contract
+/// error ([`gen_core::require_component`]) — not a mid-render fetch.
+pub(crate) const COMPONENT_TOKENIZER_CLIP_L: &str = "tokenizer_clip_l";
+pub(crate) const COMPONENT_TOKENIZER_CLIP_BIGG: &str = "tokenizer_clip_bigg";
+pub(crate) const COMPONENT_VAE_FP16_FIX: &str = "vae_fp16_fix";
+
+/// The SDXL lane's required component ids, in the descriptor-advertised order — the single source of
+/// truth for [`crate::descriptor`]'s `required_components` and the [`SdxlComponents::from_spec`] load
+/// gate. Registered on [`LoadSpec::components`](gen_core::LoadSpec::components).
+pub(crate) const REQUIRED_COMPONENTS: &[&str] = &[
+    COMPONENT_TOKENIZER_CLIP_L,
+    COMPONENT_TOKENIZER_CLIP_BIGG,
+    COMPONENT_VAE_FP16_FIX,
 ];
 
-/// The pinned immutable revision for a runtime hub `repo`, or an error if the repo is not in
-/// [`HUB_PINS`] — an unpinned runtime download on the render path is a supply-chain risk (F-029), so
-/// `hf_get` refuses to resolve one rather than silently falling back to the mutable `main` revision.
-fn hub_revision(repo: &str) -> Result<&'static str> {
-    HUB_PINS
-        .iter()
-        .find(|(id, _)| *id == repo)
-        .map(|(_, rev)| *rev)
-        .ok_or_else(|| CandleError::Msg(format!("no pinned hub revision for repo {repo:?}")))
+/// The caller-staged sources for the three SDXL components, resolved + validated once at load and
+/// threaded to every consumption site (the txt2img tokenizers/VAE, and — for the LoadSpec-driven
+/// generator + trainer — the whole render/train path) in place of the deleted `hf_get`. Each is the
+/// raw [`WeightsSource`] the caller staged; the concrete weight file is resolved at the point of use
+/// via [`resolve_tokenizer_file`] / [`resolve_vae_file`] (so a `Dir` or a direct `File` both work).
+#[derive(Clone, Debug)]
+pub(crate) struct SdxlComponents {
+    pub(crate) tokenizer_clip_l: WeightsSource,
+    pub(crate) tokenizer_clip_bigg: WeightsSource,
+    pub(crate) vae_fp16_fix: WeightsSource,
+}
+
+impl SdxlComponents {
+    /// Resolve + validate the three components from a [`LoadSpec`] at load time — the sc-13658 contract
+    /// gate for the SDXL lane. Rejects any component key the model does not declare
+    /// ([`gen_core::reject_unknown_components`], typed `Unsupported`), then requires each of the three
+    /// ([`gen_core::require_component`]), producing a caller-actionable load-time error naming the
+    /// model, the missing id, and the `with_component` builder — never a mid-render fetch. Used by the
+    /// registered generator ([`crate::load`]) and trainer ([`crate::load_trainer`]) loads; the bespoke
+    /// edit/IP/InstantID providers carry the same sources on their `*Paths` structs instead.
+    pub(crate) fn from_spec(spec: &LoadSpec, model_id: &str) -> gen_core::Result<Self> {
+        gen_core::reject_unknown_components(spec, REQUIRED_COMPONENTS, model_id)?;
+        let tokenizer_clip_l = gen_core::require_component(
+            spec,
+            COMPONENT_TOKENIZER_CLIP_L,
+            model_id,
+            "CLIP-L tokenizer",
+        )?
+        .clone();
+        let tokenizer_clip_bigg = gen_core::require_component(
+            spec,
+            COMPONENT_TOKENIZER_CLIP_BIGG,
+            model_id,
+            "CLIP-bigG tokenizer",
+        )?
+        .clone();
+        let vae_fp16_fix =
+            gen_core::require_component(spec, COMPONENT_VAE_FP16_FIX, model_id, "fp16-fix VAE")?
+                .clone();
+        Ok(Self {
+            tokenizer_clip_l,
+            tokenizer_clip_bigg,
+            vae_fp16_fix,
+        })
+    }
+}
+
+/// Resolve a tokenizer component [`WeightsSource`] to its `tokenizer.json` file: a `File` is used
+/// verbatim; a `Dir` joins the diffusers `tokenizer.json` name (the CLIP tokenizer snapshot layout).
+pub(crate) fn resolve_tokenizer_file(src: &WeightsSource) -> PathBuf {
+    match src {
+        WeightsSource::File(f) => f.clone(),
+        WeightsSource::Dir(d) => d.join("tokenizer.json"),
+    }
+}
+
+/// Resolve the VAE component [`WeightsSource`] to its `.safetensors` weight file: a `File` is used
+/// verbatim; a `Dir` joins the fp16-fix VAE's diffusers filename ([`VAE_FIX_FILE`]).
+pub(crate) fn resolve_vae_file(src: &WeightsSource) -> PathBuf {
+    match src {
+        WeightsSource::File(f) => f.clone(),
+        WeightsSource::Dir(d) => d.join(VAE_FIX_FILE),
+    }
 }
 
 /// The SDXL VAE's tiling geometry (sc-4987): the decoder upsamples latents ×8 spatially, and an image
@@ -261,46 +319,37 @@ impl Clip {
 
 /// The two SDXL CLIP tokenizers (CLIP-L + CLIP-bigG), loaded+parsed **once** and cached on the
 /// generator, reused across every `text_embeddings` call (sc-8991 / F-011) instead of re-reading the
-/// `tokenizer.json` files from the hf-hub cache and re-parsing them on each encode. Model-agnostic (the
-/// repos are fixed by [`Clip::sources`]), so a single pair serves every SDXL snapshot the generator
-/// renders. These carry no VRAM, so caching them does not affect the sc-4987 CLIP-weight peak lever.
+/// `tokenizer.json` files and re-parsing them on each encode. Model-agnostic (the caller-staged
+/// `tokenizer_clip_l` / `tokenizer_clip_bigg` components, sc-13663), so a single pair serves every SDXL
+/// snapshot the generator renders. These carry no VRAM, so caching them does not affect the sc-4987
+/// CLIP-weight peak lever.
 pub(crate) struct SdxlTokenizers {
     tok_l: Tokenizer,
     tok_g: Tokenizer,
 }
 
 impl SdxlTokenizers {
-    /// Load both CLIP tokenizers from their (pinned, hf-hub-cached) repos. Call once per generator.
-    pub(crate) fn load() -> Result<Self> {
-        let (tok_l_repo, _) = Clip::L.sources();
-        let (tok_g_repo, _) = Clip::BigG.sources();
-        let tok_l = Tokenizer::from_file(hf_get(tok_l_repo, "tokenizer.json")?)
-            .map_err(|e| CandleError::Msg(format!("load tokenizer {tok_l_repo}: {e}")))?;
-        let tok_g = Tokenizer::from_file(hf_get(tok_g_repo, "tokenizer.json")?)
-            .map_err(|e| CandleError::Msg(format!("load tokenizer {tok_g_repo}: {e}")))?;
+    /// Load both CLIP tokenizers from the caller-staged [`WeightsSource`] components (epic 13657,
+    /// sc-13663) — the `tokenizer_clip_l` / `tokenizer_clip_bigg` ids resolved by the load gate. No
+    /// `hf-hub` self-fetch: the paths are provisioned by the consumer and resolved via
+    /// [`resolve_tokenizer_file`]. Call once per generator.
+    pub(crate) fn load(tok_l: &WeightsSource, tok_g: &WeightsSource) -> Result<Self> {
+        let tok_l_file = resolve_tokenizer_file(tok_l);
+        let tok_g_file = resolve_tokenizer_file(tok_g);
+        let tok_l = Tokenizer::from_file(&tok_l_file).map_err(|e| {
+            CandleError::Msg(format!(
+                "sdxl: load CLIP-L tokenizer from {}: {e}",
+                tok_l_file.display()
+            ))
+        })?;
+        let tok_g = Tokenizer::from_file(&tok_g_file).map_err(|e| {
+            CandleError::Msg(format!(
+                "sdxl: load CLIP-bigG tokenizer from {}: {e}",
+                tok_g_file.display()
+            ))
+        })?;
         Ok(Self { tok_l, tok_g })
     }
-}
-
-/// Resolve a file from a (cached) HF repo — used only for the model-agnostic tokenizers + fp16-VAE-fix.
-///
-/// sc-9013 / F-029: the download is pinned to an immutable commit SHA ([`hub_revision`]) rather than
-/// the hub's mutable `main` default, so an upstream force-push / compromise cannot silently alter the
-/// weights or tokenization at request time. A repo with no pin is rejected up front.
-pub(crate) fn hf_get(repo: &str, path: &str) -> Result<PathBuf> {
-    use hf_hub::api::sync::Api;
-    use hf_hub::{Repo, RepoType};
-    let revision = hub_revision(repo)?;
-    Api::new()
-        .and_then(|api| {
-            api.repo(Repo::with_revision(
-                repo.to_string(),
-                RepoType::Model,
-                revision.to_string(),
-            ))
-            .get(path)
-        })
-        .map_err(|e| CandleError::Msg(format!("hf-hub fetch {repo}/{path}@{revision}: {e}")))
 }
 
 /// A txt2img pipeline handle. sc-4987 made loading **staged**: this carries only the
@@ -320,6 +369,9 @@ pub(crate) struct Pipeline {
     /// The `LoadSpec::pid` component captured at load (epic 7840 / sc-7853), built into the cached
     /// [`Components`] so the PiD engine loads once alongside the UNet/VAE. `None` ⇒ native VAE decode.
     pid_spec: Option<PidWeights>,
+    /// The caller-staged `vae_fp16_fix` component (epic 13657, sc-13663) — the fp16-stable VAE weight
+    /// source, resolved in [`load_components`](Self::load_components) in place of the deleted `hf_get`.
+    vae_fix: WeightsSource,
 }
 
 /// The seed- and prompt-independent heavy components (UNet + f16 VAE), `Arc`-shared so they can be
@@ -406,6 +458,7 @@ impl Pipeline {
     /// Build the (light) pipeline handle for the SDXL snapshot `root` at the given device/dtype (f16)
     /// and request dims. This does **no** weight I/O — the config's only request-dependent fields are
     /// the latent dims; the heavy components load lazily in [`generate`].
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn load(
         root: &Path,
         device: &Device,
@@ -414,6 +467,7 @@ impl Pipeline {
         height: u32,
         adapters: &[AdapterSpec],
         pid_spec: Option<PidWeights>,
+        vae_fix: WeightsSource,
     ) -> Result<Self> {
         // The config's only request-dependent fields are the latent dims; the component configs
         // (clip/clip2/unet/autoencoder) are fixed for SDXL.
@@ -425,6 +479,7 @@ impl Pipeline {
             dtype,
             adapters: adapters.to_vec(),
             pid_spec,
+            vae_fix,
         })
     }
 
@@ -469,9 +524,10 @@ impl Pipeline {
                 .as_ref()
                 .ok_or_else(|| CandleError::Msg("sdxl config missing clip2".into()))?,
         };
-        // The tokenizer is now loaded+parsed ONCE on the generator (sc-8991 / F-011) and passed in,
-        // rather than re-read from `hf_get(tok_repo, ...)` per encode. The CLIP *weights* still load and
-        // drop inside this function (the sc-4987 peak-VRAM lever); only the tiny tokenizer is cached.
+        // The tokenizer is now loaded+parsed ONCE on the generator (sc-8991 / F-011) from the
+        // caller-staged component (sc-13663) and passed in, rather than re-read per encode. The CLIP
+        // *weights* still load and drop inside this function (the sc-4987 peak-VRAM lever); only the
+        // tiny tokenizer is cached.
         //
         // sc-9527 (sc-9089j follow-up to sc-9416): the MLX SDXL tiers ALSO pack the dual CLIP text
         // encoders (a `quantization` block in `text_encoder{,_2}/config.json` + `.scales`-packed Linears
@@ -542,8 +598,9 @@ impl Pipeline {
 
     /// Load the heavy [`Components`] (UNet + f16 VAE) for the given flash-attn setting. The UNet reads
     /// from the snapshot (fused flash-attention when built `--features flash-attn` AND `use_flash_attn`
-    /// — sc-3674); the f16-stable VAE (`madebyollin/sdxl-vae-fp16-fix`) resolves via `hf-hub`. The
-    /// generator owns the caching of the result across calls (sc-5037); this is the cache-miss loader.
+    /// — sc-3674); the f16-stable VAE (`madebyollin/sdxl-vae-fp16-fix`) resolves from the caller-staged
+    /// `vae_fp16_fix` component (sc-13663). The generator owns the caching of the result across calls
+    /// (sc-5037); this is the cache-miss loader.
     pub(crate) fn load_components(&self, use_flash_attn: bool) -> Result<Components> {
         // sc-9416: a **packed** MLX tier (`SceneWorks/sdxl-base-mlx` q4/q8) ships its UNet under the
         // non-`.fp16` filename with a `quantization` block in `unet/config.json` and `.scales`-packed
@@ -595,11 +652,9 @@ impl Pipeline {
                 }
             }
         };
-        let vae = self.config.build_vae(
-            hf_get(VAE_FIX_REPO, VAE_FIX_FILE)?,
-            &self.device,
-            self.dtype,
-        )?;
+        let vae =
+            self.config
+                .build_vae(resolve_vae_file(&self.vae_fix), &self.device, self.dtype)?;
         // Load the optional PiD super-resolving decoder once (epic 7840 / sc-7853) when the caller
         // opted in via `LoadSpec::pid`; SDXL's own `sdxl` latent-space student. `None` ⇒ native VAE.
         let pid = match self.pid_spec.as_ref() {
@@ -1206,6 +1261,7 @@ mod tests {
             dtype: DType::F32,
             adapters: vec![],
             pid_spec: None,
+            vae_fix: WeightsSource::File("/nonexistent/vae.safetensors".into()),
         };
         let got = pipe.detect_packed_unet().unwrap();
         assert!(got.is_some(), "a quantization block ⇒ packed tier");
@@ -1261,6 +1317,7 @@ mod tests {
             dtype: DType::F32,
             adapters: vec![],
             pid_spec: None,
+            vae_fix: WeightsSource::File("/nonexistent/vae.safetensors".into()),
         };
         assert!(
             pipe.detect_packed_unet().is_err(),
@@ -1320,32 +1377,60 @@ mod tests {
         assert!((VAE_SCALE - 0.13025).abs() < f64::EPSILON);
     }
 
-    /// sc-9013 / F-029: every runtime `hf-hub` download on the SDXL render path must be pinned to an
-    /// immutable commit SHA — never the mutable `main` default. Assert each of the three render-path
-    /// repos (the fp16-fix VAE + both CLIP tokenizers) has a pin that is a 40-char lowercase hex SHA
-    /// (not `"main"`/a branch), and that `hub_revision` resolves each; an unpinned repo is rejected.
+    /// epic 13657 / sc-13663: the three render-path artifacts (the fp16-fix VAE + both CLIP
+    /// tokenizers) are NOT self-fetched — they are passed-in `LoadSpec::components` resolved by the
+    /// load gate. Assert the registered ids + their order match the sc-13658 registry, and that a
+    /// staged source resolves to a concrete weight file for both `Dir` (join the diffusers filename)
+    /// and `File` (verbatim) stagings. GPU-free.
     #[test]
-    fn render_path_hub_downloads_are_pinned_to_immutable_shas() {
-        let render_repos = [VAE_FIX_REPO, Clip::L.sources().0, Clip::BigG.sources().0];
-        for repo in render_repos {
-            let rev = hub_revision(repo).expect("render-path repo must be pinned");
-            assert_ne!(
-                rev, "main",
-                "{repo} is pinned to the mutable default revision"
+    fn components_resolve_from_staged_sources() {
+        assert_eq!(
+            REQUIRED_COMPONENTS,
+            ["tokenizer_clip_l", "tokenizer_clip_bigg", "vae_fp16_fix"],
+        );
+
+        // A `Dir` staging joins the well-known diffusers filename for each artifact.
+        assert_eq!(
+            resolve_tokenizer_file(&WeightsSource::Dir("/models/clip_l".into())),
+            std::path::Path::new("/models/clip_l/tokenizer.json"),
+        );
+        assert_eq!(
+            resolve_vae_file(&WeightsSource::Dir("/models/vae".into())),
+            std::path::Path::new("/models/vae").join(VAE_FIX_FILE),
+        );
+
+        // A `File` staging is used verbatim.
+        assert_eq!(
+            resolve_tokenizer_file(&WeightsSource::File("/t/tokenizer.json".into())),
+            std::path::Path::new("/t/tokenizer.json"),
+        );
+        assert_eq!(
+            resolve_vae_file(&WeightsSource::File("/v/vae.safetensors".into())),
+            std::path::Path::new("/v/vae.safetensors"),
+        );
+
+        // The load gate resolves each staged source, rejecting an unknown key and a missing one.
+        let spec = LoadSpec::new(WeightsSource::Dir("/snap".into()))
+            .with_component("tokenizer_clip_l", WeightsSource::Dir("/clip_l".into()))
+            .with_component(
+                "tokenizer_clip_bigg",
+                WeightsSource::Dir("/clip_bigg".into()),
+            )
+            .with_component(
+                "vae_fp16_fix",
+                WeightsSource::File("/vae.safetensors".into()),
             );
-            assert_eq!(
-                rev.len(),
-                40,
-                "{repo} pin is not a 40-char commit SHA: {rev:?}"
-            );
-            assert!(
-                rev.chars()
-                    .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
-                "{repo} pin is not a lowercase hex SHA: {rev:?}"
-            );
-        }
-        // An unknown repo must be refused, not silently resolved against `main`.
-        assert!(hub_revision("some/unpinned-repo").is_err());
+        let comps = SdxlComponents::from_spec(&spec, crate::MODEL_ID).unwrap();
+        assert!(matches!(comps.vae_fp16_fix, WeightsSource::File(_)));
+
+        // Missing the VAE component → a load-time Msg naming the id + the builder.
+        let mut bad = spec.clone();
+        bad.components.remove("vae_fp16_fix");
+        let err = SdxlComponents::from_spec(&bad, crate::MODEL_ID)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("vae_fp16_fix"), "names the id: {err}");
+        assert!(err.contains("with_component"), "names the builder: {err}");
     }
 
     /// sc-6128: the Lightning policy is diffusers `EulerDiscreteScheduler(timestep_spacing="trailing",

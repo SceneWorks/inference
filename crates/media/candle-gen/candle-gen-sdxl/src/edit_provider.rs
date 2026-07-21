@@ -29,7 +29,7 @@ use std::path::PathBuf;
 use candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::imageops::{resize_lanczos_u8, resize_nearest_u8};
 use candle_gen::gen_core::runtime::CancelFlag;
-use candle_gen::gen_core::{Image, Progress};
+use candle_gen::gen_core::{Image, Progress, WeightsSource};
 // Shared ancestral-step RNG salt (`seed + STEP_RNG_SALT`) — one home in `candle-gen` (sc-9043 / F-059).
 // `LatentDecoder` is the decode seam the optional PiD student implements (epic 7840, sc-8044).
 use candle_gen::gen_core::PidWeights;
@@ -76,11 +76,19 @@ fn reject_zero_steps(steps: usize) -> Result<()> {
     Ok(())
 }
 
-/// Paths to the SDXL edit checkpoints — just the SDXL base snapshot (the f16-fix VAE is resolved via
-/// `hf-hub`, exactly as the txt2img / IP-Adapter paths). No IP-Adapter / ControlNet / face checkpoints.
+/// Paths to the SDXL edit checkpoints — the SDXL base snapshot plus the three caller-staged
+/// model-agnostic components (epic 13657, sc-13663): the CLIP-L/bigG tokenizers + the f16-fix VAE
+/// (passed in, never self-fetched, exactly as the txt2img / IP-Adapter paths). No IP-Adapter /
+/// ControlNet / face checkpoints.
 pub struct SdxlEditPaths {
     /// SDXL base snapshot dir (`unet/`, `text_encoder{,_2}/`, …).
     pub sdxl_base: PathBuf,
+    /// The CLIP-L tokenizer component (`tokenizer_clip_l`) — a `tokenizer.json` file or its dir.
+    pub tokenizer_clip_l: WeightsSource,
+    /// The CLIP-bigG tokenizer component (`tokenizer_clip_bigg`) — a `tokenizer.json` file or its dir.
+    pub tokenizer_clip_bigg: WeightsSource,
+    /// The fp16-stable VAE component (`vae_fp16_fix`) — the `.safetensors` file or its dir.
+    pub vae_fp16_fix: WeightsSource,
 }
 
 /// One SDXL edit request.
@@ -147,10 +155,16 @@ impl SdxlEdit {
     pub fn load(paths: &SdxlEditPaths) -> Result<Self> {
         let device = candle_gen::default_device()?;
         let root = paths.sdxl_base.as_path();
-        let conditioner = SdxlConditioner::load(root, &device, DTYPE)?;
+        let conditioner = SdxlConditioner::load(
+            root,
+            &device,
+            DTYPE,
+            &paths.tokenizer_clip_l,
+            &paths.tokenizer_clip_bigg,
+        )?;
         let unet = load_instantid_unet(root, &device, DTYPE)?;
-        let vae = load_sdxl_vae(&device, DTYPE)?;
-        let vae_encoder = load_sdxl_vae_encoder(&device, DTYPE)?;
+        let vae = load_sdxl_vae(&paths.vae_fp16_fix, &device, DTYPE)?;
+        let vae_encoder = load_sdxl_vae_encoder(&paths.vae_fp16_fix, &device, DTYPE)?;
         Ok(Self {
             conditioner,
             unet,
@@ -441,6 +455,31 @@ mod tests {
         assert!(err.to_string().contains("steps must be >= 1"), "{err}");
         assert!(reject_zero_steps(1).is_ok());
         assert!(reject_zero_steps(30).is_ok());
+    }
+
+    /// epic 13657 (sc-13663): the edit provider reads the fp16-fix VAE + CLIP tokenizers from its
+    /// passed-in `SdxlEditPaths` components — it never self-fetches. A missing (nonexistent)
+    /// `tokenizer_clip_l` component makes construction fail at the tokenizer load with an actionable
+    /// error naming the offending path, before any snapshot weights are touched. Weights-free (no real
+    /// SDXL snapshot; the tokenizer load is the first component I/O).
+    #[test]
+    fn load_fails_on_missing_tokenizer_component() {
+        let paths = SdxlEditPaths {
+            sdxl_base: "/nonexistent/sdxl".into(),
+            tokenizer_clip_l: WeightsSource::File("/nonexistent/clip_l/tokenizer.json".into()),
+            tokenizer_clip_bigg: WeightsSource::File(
+                "/nonexistent/clip_bigg/tokenizer.json".into(),
+            ),
+            vae_fp16_fix: WeightsSource::File("/nonexistent/vae.safetensors".into()),
+        };
+        let err = SdxlEdit::load(&paths)
+            .err()
+            .expect("a missing tokenizer component must fail construction")
+            .to_string();
+        assert!(
+            err.contains("CLIP-L tokenizer") && err.contains("tokenizer.json"),
+            "the error must name the missing tokenizer component path: {err}"
+        );
     }
 
     /// The request defaults match the SDXL edit production knobs (1024², 30 steps, strength 0.8).

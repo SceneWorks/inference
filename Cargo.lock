@@ -801,7 +801,6 @@ dependencies = [
  "candle-gen-pid",
  "candle-nn",
  "candle-transformers",
- "hf-hub",
  "image",
  "rand 0.9.5",
  "rand_distr",
