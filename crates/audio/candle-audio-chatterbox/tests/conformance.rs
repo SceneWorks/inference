@@ -32,8 +32,22 @@
 //! ```
 //! Set `CHATTERBOX_SNAPSHOT` to a `ResembleAI/chatterbox` snapshot dir (holding the
 //! `t3_cfg.safetensors` and `tokenizer.json` files) or leave unset to resolve the pinned files via
-//! the hub. `KOKORO_SNAPSHOT` and `CHATTERBOX_VE_SNAPSHOT` supply the reference clips and the voice
-//! embedder as elsewhere.
+//! the hub. `KOKORO_SNAPSHOT` supplies the reference clips as elsewhere.
+//!
+//! ## Passed-in component snapshots (sc-13660)
+//!
+//! The provider no longer self-fetches its `perth` and `voice_embedding` co-requisites — they are
+//! staged as `LoadSpec` components from explicit local paths. These `#[ignore]`d real-weight tests
+//! read those paths from env vars (a dir holding the file, or the file itself), each falling back to
+//! the pinned-SHA hub fetch when unset (mirroring the base-snapshot helpers above), and stage them
+//! via [`staged_spec`]:
+//!
+//! - `CHATTERBOX_VE_SNAPSHOT` → the `voice_embedding` component (`ve.safetensors`).
+//! - `CHATTERBOX_PERTH_SNAPSHOT` → the `perth` component (`perth_implicit.safetensors`).
+//!
+//! `real-weights.yml` / the SceneWorks smoke harness set these to pre-materialized dirs.
+//! [`chatterbox_gates_required_components_at_load`] is a **weights-free** (non-`#[ignore]`d) proof
+//! that a missing/unknown component fails at LOAD.
 
 use std::path::PathBuf;
 
@@ -62,8 +76,88 @@ fn chatterbox_snapshot() -> PathBuf {
     }
 }
 
+/// The `voice_embedding` component: the `ve.safetensors` file from `CHATTERBOX_VE_SNAPSHOT` (a dir
+/// holding it, or the file itself). Falls back to the pinned-SHA hub fetch when unset — never the
+/// `resolve_pinned_*` production helper (sc-13660).
+fn ve_weights_file() -> PathBuf {
+    match std::env::var("CHATTERBOX_VE_SNAPSHOT") {
+        Ok(p) => {
+            let p = PathBuf::from(p);
+            if p.is_dir() {
+                p.join(candle_audio_chatterbox_ve::WEIGHTS_FILE)
+            } else {
+                p
+            }
+        }
+        Err(_) => candle_audio::hub::hf_get_pinned(
+            candle_audio_chatterbox_ve::HUB_REPO,
+            candle_audio_chatterbox_ve::HUB_REVISION,
+            candle_audio_chatterbox_ve::WEIGHTS_FILE,
+        )
+        .expect("fetch the pinned ve.safetensors (network or warm HF cache)"),
+    }
+}
+
+/// The `perth` component: the `perth_implicit.safetensors` file from `CHATTERBOX_PERTH_SNAPSHOT` (a
+/// dir holding it, or the file itself). Falls back to the pinned-SHA hub fetch of the
+/// `SceneWorks/perth-implicit` pin when unset — the provider itself no longer self-fetches (sc-13660);
+/// the test stages the passed-in path as the `perth` component.
+fn perth_weights_file() -> PathBuf {
+    match std::env::var("CHATTERBOX_PERTH_SNAPSHOT") {
+        Ok(p) => {
+            let p = PathBuf::from(p);
+            if p.is_dir() {
+                p.join(cb::PERTH_WEIGHTS_FILE)
+            } else {
+                p
+            }
+        }
+        Err(_) => candle_audio::hub::hf_get_pinned(
+            cb::PERTH_HUB_REPO,
+            cb::PERTH_HUB_REVISION,
+            cb::PERTH_WEIGHTS_FILE,
+        )
+        .expect("fetch the pinned perth_implicit.safetensors (network or warm HF cache)"),
+    }
+}
+
+/// A load spec over a chatterbox snapshot `dir` with BOTH required components staged from their
+/// env-pointed local paths — the "passed-in components" the provider consumes now that `perth` and
+/// `voice_embedding` are no longer self-fetched (sc-13660).
+fn staged_spec(dir: PathBuf) -> LoadSpec {
+    LoadSpec::new(WeightsSource::Dir(dir))
+        .with_component(
+            cb::COMPONENT_PERTH,
+            WeightsSource::File(perth_weights_file()),
+        )
+        .with_component(
+            cb::COMPONENT_VOICE_EMBEDDING,
+            WeightsSource::File(ve_weights_file()),
+        )
+}
+
+/// **Weights-free load-gate conformance (sc-13660 / sc-13658).** The provider declares
+/// `required_components = ["perth", "voice_embedding"]`, so a MISSING required component — or an
+/// unrecognized component key — must be a LOAD-time error, not a mid-render fetch or a first-`generate`
+/// failure. The gen-core testkit drives the real `cb::load` with placeholder component paths (never
+/// read), so this needs no weights and no network and runs as an ordinary (non-`#[ignore]`d) test.
+#[test]
+fn chatterbox_gates_required_components_at_load() {
+    let base = LoadSpec::new(WeightsSource::Dir(std::env::temp_dir()))
+        .with_component(
+            cb::COMPONENT_PERTH,
+            WeightsSource::File(PathBuf::from("unused-perth.safetensors")),
+        )
+        .with_component(
+            cb::COMPONENT_VOICE_EMBEDDING,
+            WeightsSource::File(PathBuf::from("unused-ve.safetensors")),
+        );
+    gen_core_testkit::check_component_load_gate(cb::load, &base, cb::REQUIRED_COMPONENTS)
+        .expect("chatterbox must gate its required components at load");
+}
+
 fn load_generator() -> cb::ChatterboxGenerator {
-    let spec = LoadSpec::new(WeightsSource::Dir(chatterbox_snapshot()));
+    let spec = staged_spec(chatterbox_snapshot());
     cb::load_generator(&spec).expect("load the chatterbox generator")
 }
 
@@ -95,15 +189,10 @@ fn kokoro_clip(text: &str, voice: &str) -> AudioTrack {
     }
 }
 
-/// The 256-d `chatterbox_ve` embedding of a reference clip.
+/// The 256-d `chatterbox_ve` embedding of a reference clip, from the same env-pointed `ve.safetensors`
+/// the `voice_embedding` component uses (sc-13660: no `resolve_pinned_*`).
 fn voice_embedding(clip: &AudioTrack) -> Vec<f32> {
-    let spec = LoadSpec::new(match std::env::var("CHATTERBOX_VE_SNAPSHOT") {
-        Ok(dir) => {
-            WeightsSource::File(PathBuf::from(dir).join(candle_audio_chatterbox_ve::WEIGHTS_FILE))
-        }
-        Err(_) => candle_audio_chatterbox_ve::resolve_pinned_file()
-            .expect("resolve the pinned ve.safetensors (network or warm HF cache)"),
-    });
+    let spec = LoadSpec::new(WeightsSource::File(ve_weights_file()));
     let embedder = candle_audio_chatterbox_ve::load(&spec).expect("load chatterbox_ve");
     embedder.embed(clip).expect("embed reference")
 }
@@ -476,7 +565,7 @@ fn s3tokenizer_windows_audio_longer_than_30s() {
 #[test]
 #[ignore = "real weights: needs s3gen.safetensors + a Kokoro snapshot; run with --ignored"]
 fn chatterbox_reference_audio_fills_the_t3_prompt_tokens() {
-    let spec = LoadSpec::new(WeightsSource::Dir(s3gen_snapshot()));
+    let spec = staged_spec(s3gen_snapshot());
     let gen = cb::load_generator(&spec).expect("load the chatterbox generator");
 
     // A ≥ 6 s reference so the prompt fills to the full speech_cond_prompt_len.
@@ -793,17 +882,6 @@ fn hift_vocodes_a_real_mel_to_nonsilent_waveform() {
 // PerTh implicit watermarker (sc-13240): the provenance watermark Chatterbox always applies.
 // ---------------------------------------------------------------------------------------------
 
-/// Resolve the converted PerTh weights the same way the provider does (sc-13443): a `PERTH_SNAPSHOT`
-/// override first (the offline/CI escape hatch — a `perth_implicit.safetensors` file or a dir holding
-/// it), else the pinned-SHA hub fetch from `SceneWorks/perth-implicit`. With no `PERTH_SNAPSHOT` set
-/// this exercises the real hub resolution path.
-fn perth_weights() -> PathBuf {
-    cb::resolve_perth_weights().expect(
-        "resolve the PerTh weights — set PERTH_SNAPSHOT to override, else fetch from \
-         SceneWorks/perth-implicit needs network access",
-    )
-}
-
 /// A deterministic, speech-like signal at `sample_rate`: a wandering pitch with a dozen harmonics
 /// filling the ≈0–1.5 kHz watermark subband, amplitude modulation, and a little broadband dither —
 /// rich enough for the spectral watermark to embed into, without a TTS dependency.
@@ -835,9 +913,9 @@ fn perth_test_signal(sample_rate: u32, secs: f32) -> Vec<f32> {
 /// collapses the detection separation and fails here. This is the watermarker in isolation; wiring it
 /// into the clone Generator's `generate()` output is sc-13239.
 #[test]
-#[ignore = "real weights: resolves perth_implicit.safetensors from SceneWorks/perth-implicit (or PERTH_SNAPSHOT); run with --ignored"]
+#[ignore = "real weights: perth_implicit.safetensors from CHATTERBOX_PERTH_SNAPSHOT (or the SceneWorks/perth-implicit hub pin); run with --ignored"]
 fn perth_watermark_roundtrips_and_is_imperceptible() {
-    let wm = cb::PerthWatermarker::from_safetensors(&perth_weights())
+    let wm = cb::PerthWatermarker::from_safetensors(&perth_weights_file())
         .expect("load the converted PerTh weights");
 
     // (1) Native 32 kHz — the watermark's true imperceptibility, isolated from any resampling. Here
@@ -932,14 +1010,14 @@ fn reference_request(prompt: &str, reference: AudioTrack, seed: u64) -> Generati
 /// the always-applied PerTh provenance watermark.
 ///
 /// Needs the FULL `CHATTERBOX_SNAPSHOT` (`s3gen.safetensors`), a Kokoro snapshot (reference/control
-/// voices), and the ve embedder; the PerTh watermarker weights resolve from `SceneWorks/perth-implicit`
-/// (or a `PERTH_SNAPSHOT` override).
+/// voices), and the `voice_embedding` + `perth` components staged via [`staged_spec`]
+/// (`CHATTERBOX_VE_SNAPSHOT` / `CHATTERBOX_PERTH_SNAPSHOT`, each hub-fallback when unset).
 #[test]
-#[ignore = "real weights: needs the full chatterbox snapshot (s3gen.safetensors) + Kokoro + ve (PerTh resolves from SceneWorks/perth-implicit, or PERTH_SNAPSHOT); run with --ignored"]
+#[ignore = "real weights: needs the full chatterbox snapshot (s3gen.safetensors) + Kokoro + the ve/perth components (CHATTERBOX_VE_SNAPSHOT/CHATTERBOX_PERTH_SNAPSHOT, hub-fallback); run with --ignored"]
 fn chatterbox_clones_a_reference_voice_end_to_end() {
     use candle_audio_chatterbox::campplus::cosine_similarity;
 
-    let spec = LoadSpec::new(WeightsSource::Dir(s3gen_snapshot()));
+    let spec = staged_spec(s3gen_snapshot());
     let gen = cb::load(&spec).expect("load the chatterbox generator");
 
     // The reference voice (af_heart) and a DIFFERENT control voice (am_michael) — distinct Kokoro
@@ -1035,10 +1113,8 @@ fn chatterbox_clones_a_reference_voice_end_to_end() {
     );
 
     // Provenance watermark: always applied, detected with high confidence.
-    let wm = cb::PerthWatermarker::from_safetensors(
-        &cb::resolve_perth_weights().expect("resolve PerTh weights"),
-    )
-    .expect("load PerTh watermarker");
+    let wm = cb::PerthWatermarker::from_safetensors(&perth_weights_file())
+        .expect("load PerTh watermarker");
     let conf = wm
         .get_watermark(&out.samples, out.sample_rate)
         .expect("detect the watermark");

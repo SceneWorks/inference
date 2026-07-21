@@ -72,13 +72,12 @@ pub use flow::Flow;
 pub use hift::HiftGenerator;
 pub use mel24::Mel24Extractor;
 pub use model::{
-    descriptor, load, load_generator, resolve_pinned_snapshot, ChatterboxGenerator, HUB_REPO,
-    HUB_REVISION, MODEL_ID, REGISTRATION, T3_WEIGHTS_FILE, TOKENIZER_FILE, WEIGHT_LICENSE,
-    WEIGHT_LICENSE_ENTRY,
+    descriptor, load, load_generator, resolve_pinned_snapshot, ChatterboxGenerator,
+    COMPONENT_PERTH, COMPONENT_VOICE_EMBEDDING, HUB_REPO, HUB_REVISION, MODEL_ID, REGISTRATION,
+    REQUIRED_COMPONENTS, T3_WEIGHTS_FILE, TOKENIZER_FILE, WEIGHT_LICENSE, WEIGHT_LICENSE_ENTRY,
 };
 pub use perth::{
-    resolve_perth_weights, snr_db, PerthWatermarker, PERTH_HUB_REPO, PERTH_HUB_REVISION, PERTH_SR,
-    PERTH_WEIGHTS_FILE,
+    snr_db, PerthWatermarker, PERTH_HUB_REPO, PERTH_HUB_REVISION, PERTH_SR, PERTH_WEIGHTS_FILE,
 };
 pub use s3gen::S3Gen;
 pub use s3tokenizer::S3Tokenizer;
