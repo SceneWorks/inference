@@ -24,13 +24,26 @@ use candle_audio_chatterbox_ve::gen_core::{
     WeightsSource,
 };
 
-/// Resolve the `ve.safetensors` weights: `CHATTERBOX_VE_SNAPSHOT` (a snapshot dir holding
-/// `ve.safetensors`) or the pinned single-file hub path.
+/// Resolve the `ve.safetensors` weights from the explicit `CHATTERBOX_VE_SNAPSHOT` env path (a
+/// snapshot dir holding `ve.safetensors`, or the file itself) — the "passed-in path" the provider
+/// consumes. Falls back to the pinned-SHA hub fetch when unset, mirroring this file's other snapshot
+/// helpers, but never the `resolve_pinned_*` production helper (sc-13660).
 fn ve_weights() -> WeightsSource {
     match std::env::var("CHATTERBOX_VE_SNAPSHOT") {
-        Ok(dir) => WeightsSource::File(PathBuf::from(dir).join(ve::WEIGHTS_FILE)),
-        Err(_) => ve::resolve_pinned_file().expect(
-            "resolve the pinned ResembleAI/chatterbox ve.safetensors (network or warm HF cache)",
+        Ok(p) => {
+            let p = PathBuf::from(p);
+            let file = if p.is_dir() {
+                p.join(ve::WEIGHTS_FILE)
+            } else {
+                p
+            };
+            WeightsSource::File(file)
+        }
+        Err(_) => WeightsSource::File(
+            candle_audio::hub::hf_get_pinned(ve::HUB_REPO, ve::HUB_REVISION, ve::WEIGHTS_FILE)
+                .expect(
+                "fetch the pinned ResembleAI/chatterbox ve.safetensors (network or warm HF cache)",
+            ),
         ),
     }
 }

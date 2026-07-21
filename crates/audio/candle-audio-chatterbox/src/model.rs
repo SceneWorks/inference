@@ -34,9 +34,9 @@ use std::sync::Mutex;
 
 use candle_audio::candle_core::DType;
 use candle_audio::gen_core::{
-    self, AudioTrack, Capabilities, Conditioning, ConditioningKind, GenerationOutput,
-    GenerationRequest, Generator, LoadSpec, Modality, ModelDescriptor, Progress, VoiceEmbedder,
-    WeightsSource,
+    self, reject_unknown_components, require_component, AudioTrack, Capabilities, Conditioning,
+    ConditioningKind, GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality,
+    ModelDescriptor, Progress, VoiceEmbedder, WeightsSource,
 };
 use candle_audio::hub::{hf_get_pinned, pinned_snapshot_dir};
 use candle_audio::Result as AudioResult;
@@ -92,10 +92,24 @@ pub const LANGUAGES: &[&str] = &["en", "en-us"];
 /// Longest clip advertised (seconds).
 pub const MAX_DURATION_SECS: f32 = 30.0;
 
+/// Component id (epic 13657) for the PerTh provenance watermarker weights
+/// (`perth_implicit.safetensors`). The caller stages the resolved local path under this key in
+/// [`LoadSpec::components`]; the generator no longer self-fetches it — `watermark()`
+/// consumes the staged path lazily.
+pub const COMPONENT_PERTH: &str = "perth";
+/// Component id (epic 13657) for the `chatterbox_ve` voice-encoder weights (`ve.safetensors`). The
+/// caller stages the resolved local path under this key in [`LoadSpec::components`]; the generator no
+/// longer re-downloads it at render — `embed_reference()` consumes the staged
+/// path lazily for `ReferenceAudio` conditioning.
+pub const COMPONENT_VOICE_EMBEDDING: &str = "voice_embedding";
+/// The named components a caller MUST stage in [`LoadSpec::components`] before [`load`] — validated
+/// fail-fast at load via [`gen_core::require_component`], the descriptor advertising the same set.
+pub const REQUIRED_COMPONENTS: &[&str] = &[COMPONENT_PERTH, COMPONENT_VOICE_EMBEDDING];
+
 /// Chatterbox clone-TTS identity + capabilities — constructible without weights.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
-        required_components: &[],
+        required_components: REQUIRED_COMPONENTS,
         id: MODEL_ID,
         family: "chatterbox",
         backend: "candle",
@@ -177,6 +191,12 @@ pub struct ChatterboxGenerator {
     descriptor: ModelDescriptor,
     t3_config: T3Config,
     root: std::path::PathBuf,
+    /// The caller-staged [`COMPONENT_PERTH`] weights (`perth_implicit.safetensors`), validated present
+    /// at load (fail-fast) and consumed lazily by `watermark()` — no hub self-fetch (epic 13657).
+    perth_weights: WeightsSource,
+    /// The caller-staged [`COMPONENT_VOICE_EMBEDDING`] weights (`ve.safetensors`), validated present at
+    /// load and consumed lazily by `embed_reference()` — no render-time re-download (epic 13657).
+    voice_embedding_weights: WeightsSource,
     t3: Mutex<Option<T3>>,
     tokenizer: Mutex<Option<EnTokenizer>>,
     embedder: Mutex<Option<Box<dyn VoiceEmbedder>>>,
@@ -186,8 +206,8 @@ pub struct ChatterboxGenerator {
     /// The assembled S3Gen token→waveform stack (sc-13239), loaded lazily from `s3gen.safetensors`
     /// the first time `generate()` renders a clone.
     s3gen: Mutex<Option<S3Gen>>,
-    /// The PerTh provenance watermarker (sc-13240/sc-13239), loaded lazily; its weights are
-    /// resolved off-hub via [`crate::perth::resolve_perth_weights`].
+    /// The PerTh provenance watermarker (sc-13240/sc-13239), loaded lazily from the staged
+    /// `perth_weights` component path.
     perth: Mutex<Option<PerthWatermarker>>,
 }
 
@@ -195,6 +215,17 @@ fn lock_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     match m.lock() {
         Ok(g) => g,
         Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// The `perth_implicit.safetensors` file from the staged [`COMPONENT_PERTH`] source: a
+/// [`WeightsSource::File`] used directly, or `<dir>/perth_implicit.safetensors` for a
+/// [`WeightsSource::Dir`]. ([`PerthWatermarker::from_safetensors`] itself turns a missing file into a
+/// typed error.)
+fn perth_component_file(src: &WeightsSource) -> std::path::PathBuf {
+    match src {
+        WeightsSource::File(p) => p.clone(),
+        WeightsSource::Dir(d) => d.join(crate::perth::PERTH_WEIGHTS_FILE),
     }
 }
 
@@ -239,10 +270,11 @@ impl ChatterboxGenerator {
     fn embed_reference(&self, audio: &AudioTrack) -> gen_core::Result<Vec<f32>> {
         let mut guard = lock_recover(&self.embedder);
         if guard.is_none() {
-            let weights = candle_audio_chatterbox_ve::resolve_pinned_file().map_err(|e| {
-                gen_core::Error::Msg(format!("{MODEL_ID}: resolve chatterbox_ve weights: {e}"))
-            })?;
-            let embedder = candle_audio_chatterbox_ve::load(&LoadSpec::new(weights))?;
+            // Consume the caller-staged `voice_embedding` component path (validated present at load);
+            // the chatterbox_ve `load` contract is unchanged — it still takes a `File` in `spec.weights`.
+            let embedder = candle_audio_chatterbox_ve::load(&LoadSpec::new(
+                self.voice_embedding_weights.clone(),
+            ))?;
             *guard = Some(embedder);
         }
         guard.as_ref().unwrap().embed(audio)
@@ -333,17 +365,13 @@ impl ChatterboxGenerator {
     }
 
     /// Apply the PerTh provenance watermark to a rendered 24 kHz clone (sc-13239). The watermarker is
-    /// loaded lazily; its weights are resolved off-hub via [`crate::perth::resolve_perth_weights`].
-    /// The clone ALWAYS watermarks (the reference behavior — no disable flag), so a failure to obtain
-    /// the weights is a typed error rather than a silently un-watermarked clone.
+    /// loaded lazily from the caller-staged [`COMPONENT_PERTH`] path (validated present at load — no
+    /// hub self-fetch). The clone ALWAYS watermarks (the reference behavior — no disable flag), so a
+    /// failure to load the staged weights is a typed error rather than a silently un-watermarked clone.
     fn watermark(&self, samples: &[f32]) -> gen_core::Result<Vec<f32>> {
         let mut guard = lock_recover(&self.perth);
         if guard.is_none() {
-            let weights = crate::perth::resolve_perth_weights().map_err(|e| {
-                gen_core::Error::Msg(format!(
-                    "{MODEL_ID}: resolve PerTh watermarker weights: {e}"
-                ))
-            })?;
+            let weights = perth_component_file(&self.perth_weights);
             let wm = PerthWatermarker::from_safetensors(&weights).map_err(|e| {
                 gen_core::Error::Msg(format!("{MODEL_ID}: load PerTh watermarker: {e}"))
             })?;
@@ -541,10 +569,30 @@ pub fn load_generator(spec: &LoadSpec) -> gen_core::Result<ChatterboxGenerator> 
             "{MODEL_ID} does not support control/IP-adapter overlays"
         )));
     }
+    // Named-component gate (epic 13657): reject any component key this model does not read, then
+    // require BOTH co-requisites present — fail-fast at load with an actionable error, never a
+    // mid-render hub fetch. The generator stores the staged paths and consumes them lazily.
+    reject_unknown_components(spec, REQUIRED_COMPONENTS, MODEL_ID)?;
+    let perth_weights = require_component(
+        spec,
+        COMPONENT_PERTH,
+        MODEL_ID,
+        "PerTh provenance watermarker",
+    )?
+    .clone();
+    let voice_embedding_weights = require_component(
+        spec,
+        COMPONENT_VOICE_EMBEDDING,
+        MODEL_ID,
+        "chatterbox_ve voice encoder",
+    )?
+    .clone();
     Ok(ChatterboxGenerator {
         descriptor: descriptor(),
         t3_config: T3Config::LLAMA_520M,
         root,
+        perth_weights,
+        voice_embedding_weights,
         t3: Mutex::new(None),
         tokenizer: Mutex::new(None),
         embedder: Mutex::new(None),
@@ -647,11 +695,71 @@ mod tests {
         assert!(matches!(load(&spec), Err(gen_core::Error::Unsupported(_))));
     }
 
+    /// A minimal spec that clears the load-time component gate with placeholder (never-read) paths —
+    /// the components are validated present at load but only touched lazily during a render.
+    fn spec_with_stub_components(dir: std::path::PathBuf) -> LoadSpec {
+        LoadSpec::new(WeightsSource::Dir(dir))
+            .with_component(
+                COMPONENT_PERTH,
+                WeightsSource::File(std::path::PathBuf::from("unused-perth.safetensors")),
+            )
+            .with_component(
+                COMPONENT_VOICE_EMBEDDING,
+                WeightsSource::File(std::path::PathBuf::from("unused-ve.safetensors")),
+            )
+    }
+
+    /// `Box<dyn Generator>` is not `Debug`, so `Result::unwrap_err` is unavailable — take the error
+    /// out by matching (a passing load is a test failure here).
+    fn load_err(spec: &LoadSpec) -> gen_core::Error {
+        match load(spec) {
+            Ok(_) => panic!("expected a load-time error, but load succeeded"),
+            Err(e) => e,
+        }
+    }
+
+    #[test]
+    fn load_requires_both_components_fail_fast() {
+        let dir = std::env::temp_dir();
+        // Missing BOTH co-requisites → a load-time Msg error naming a missing component + the
+        // actionable `with_component` fix (never a mid-render fetch).
+        let err = load_err(&LoadSpec::new(WeightsSource::Dir(dir.clone())));
+        assert!(matches!(err, gen_core::Error::Msg(_)));
+        let msg = err.to_string();
+        assert!(
+            msg.contains(COMPONENT_PERTH),
+            "error must name the missing component: {msg}"
+        );
+        assert!(
+            msg.contains("with_component"),
+            "error must be actionable: {msg}"
+        );
+
+        // Staging only `perth` → still fails at load, now naming the missing `voice_embedding`.
+        let only_perth = LoadSpec::new(WeightsSource::Dir(dir.clone())).with_component(
+            COMPONENT_PERTH,
+            WeightsSource::File(dir.join("perth.safetensors")),
+        );
+        assert!(load_err(&only_perth)
+            .to_string()
+            .contains(COMPONENT_VOICE_EMBEDDING));
+
+        // Both staged → load succeeds; the staged paths are not touched until a render.
+        assert!(load(&spec_with_stub_components(dir.clone())).is_ok());
+
+        // An unrecognized component key → typed `Unsupported`.
+        let bogus = spec_with_stub_components(dir).with_component(
+            "not_a_chatterbox_component",
+            WeightsSource::File(std::path::PathBuf::from("x")),
+        );
+        assert!(matches!(load(&bogus), Err(gen_core::Error::Unsupported(_))));
+    }
+
     #[test]
     fn pre_tripped_cancel_returns_typed_canceled_before_any_heavy_work() {
         let dir = std::env::temp_dir().join("chatterbox-missing-snapshot");
         std::fs::create_dir_all(&dir).unwrap();
-        let g = load(&LoadSpec::new(WeightsSource::Dir(dir))).unwrap();
+        let g = load(&spec_with_stub_components(dir)).unwrap();
         let flag = CancelFlag::new();
         flag.cancel();
         let mut req = req_with(vec![ve_vec()]);

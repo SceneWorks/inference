@@ -34,23 +34,25 @@
 //! `crate::s3tokenizer::resample_to_16k`), which the watermark's design tolerates (it is trained to
 //! survive an STFT/iSTFT cycle and resampling).
 //!
-//! ## Wiring status (sc-13240 → sc-13239 → sc-13443)
+//! ## Wiring status (sc-13240 → sc-13239 → sc-13443 → sc-13660)
 //!
 //! sc-13240 delivered the tested watermarker module + the recorded provenance; sc-13239 wires it
 //! into [`crate::model`]'s `generate()` output path so every rendered clone is watermarked at 24 kHz
-//! before it leaves the provider (the reference behavior — no disable flag). sc-13443 hosts the
-//! converted `perth_implicit.safetensors` on the Hugging Face hub (`SceneWorks/perth-implicit`, MIT)
-//! so [`resolve_perth_weights`] resolves it the same pinned-SHA way every other audio checkpoint
-//! does — [`candle_audio::hub::hf_get_pinned`] at [`PERTH_HUB_REVISION`] — with a `PERTH_SNAPSHOT`
-//! env override kept first as the offline/CI escape hatch. This removed the previous runtime
-//! `pip download resemble-perth` + torch-free-converter shell-out (and its subprocess-exec surface);
-//! `scripts/audio/convert_perth_watermarker.py` remains in the repo as the reproducibility record
-//! that produced the hosted checkpoint.
+//! before it leaves the provider (the reference behavior — no disable flag). sc-13443 hosted the
+//! converted `perth_implicit.safetensors` on the Hugging Face hub (`SceneWorks/perth-implicit`, MIT).
+//! **sc-13660 removed this crate's runtime hub self-fetch** (`resolve_perth_weights` + the
+//! `PERTH_SNAPSHOT` env override) entirely: the caller now stages the resolved
+//! `perth_implicit.safetensors` path as the required [`crate::model::COMPONENT_PERTH`] component in
+//! [`gen_core::LoadSpec::components`](candle_audio::gen_core::LoadSpec::components), validated
+//! fail-fast at load, and [`PerthWatermarker::from_safetensors`] loads it lazily — no network at
+//! render. [`PERTH_HUB_REPO`]/[`PERTH_HUB_REVISION`] remain as the provenance record of where that
+//! checkpoint is hosted (what a consumer stages from). The earlier runtime `pip download
+//! resemble-perth` shell-out was already gone; `scripts/audio/convert_perth_watermarker.py` remains
+//! as the reproducibility record that produced the hosted checkpoint.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use candle_audio::candle_core::{DType, Device, Result as CandleResult, Tensor};
-use candle_audio::hub::hf_get_pinned;
 use candle_audio::{dsp, AudioError, Result};
 use candle_nn::{Conv1d, Conv1dConfig, Module, VarBuilder};
 
@@ -62,11 +64,13 @@ pub const PERTH_SR: u32 = 32_000;
 /// `perth_net_250000.pth.tar`; see `scripts/audio/convert_perth_watermarker.py`).
 pub const PERTH_WEIGHTS_FILE: &str = "perth_implicit.safetensors";
 
-/// Hub pin: `SceneWorks/perth-implicit` at an immutable commit (F-029; MIT weights — commercial use
-/// OK). SceneWorks hosts the converted `perth_implicit.safetensors` so a clone resolves its
-/// provenance watermarker weights the same pinned-SHA way every other audio checkpoint does (no
-/// runtime pip/network shell-out). The upstream `resemble-perth` package is MIT; the hosted file is
-/// its `perth_net_250000.pth.tar` run through `scripts/audio/convert_perth_watermarker.py`.
+/// Provenance record (F-029; MIT weights — commercial use OK): SceneWorks hosts the converted
+/// `perth_implicit.safetensors` at `SceneWorks/perth-implicit` on this immutable commit. As of
+/// sc-13660 the clone no longer self-fetches from here — the caller stages the resolved local path as
+/// the [`crate::model::COMPONENT_PERTH`] component — but this pin remains the documented source a
+/// consumer materializes the checkpoint from. The upstream `resemble-perth` package is MIT; the
+/// hosted file is its `perth_net_250000.pth.tar` run through
+/// `scripts/audio/convert_perth_watermarker.py`.
 pub const PERTH_HUB_REPO: &str = "SceneWorks/perth-implicit";
 pub const PERTH_HUB_REVISION: &str = "80b60f9caead09b8d3b512bda0b24038f28c08ec";
 
@@ -446,39 +450,6 @@ pub fn snr_db(reference: &[f32], modified: &[f32]) -> f32 {
     (10.0 * (ps / pn).log10()) as f32
 }
 
-// =================================================================================================
-// Runtime weight resolution (sc-13239 → sc-13443): resolve perth_implicit.safetensors off the HF hub.
-// =================================================================================================
-
-/// `PERTH_SNAPSHOT` as a resolved `perth_implicit.safetensors` file, if it points at an existing one
-/// (a file directly, or a dir holding it). The offline/CI override kept ahead of the hub fetch.
-fn perth_from_env() -> Option<PathBuf> {
-    let p = PathBuf::from(std::env::var("PERTH_SNAPSHOT").ok()?);
-    let file = if p.is_dir() {
-        p.join(PERTH_WEIGHTS_FILE)
-    } else {
-        p
-    };
-    file.is_file().then_some(file)
-}
-
-/// Resolve the converted PerTh weights (`perth_implicit.safetensors`). Resolution order:
-///
-/// 1. `PERTH_SNAPSHOT` (a file, or a dir holding `perth_implicit.safetensors`) — the offline/CI
-///    escape hatch, kept first.
-/// 2. The pinned-SHA hub fetch [`hf_get_pinned`]`(`[`PERTH_HUB_REPO`]`,` [`PERTH_HUB_REVISION`]`,`
-///    [`PERTH_WEIGHTS_FILE`]`)`, resolving into the ordinary HF cache — exactly how every other audio
-///    checkpoint (chatterbox/whisper/…) resolves (F-029; no runtime pip/network shell-out).
-///
-/// The clone ALWAYS watermarks (the reference behavior — no disable flag): if the weights truly
-/// cannot be obtained this returns a typed error rather than silently skipping the watermark.
-pub fn resolve_perth_weights() -> Result<PathBuf> {
-    if let Some(p) = perth_from_env() {
-        return Ok(p);
-    }
-    hf_get_pinned(PERTH_HUB_REPO, PERTH_HUB_REVISION, PERTH_WEIGHTS_FILE)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -616,27 +587,5 @@ mod tests {
     fn snr_of_identical_signals_is_infinite() {
         let x = vec![0.1, -0.2, 0.3];
         assert!(snr_db(&x, &x).is_infinite());
-    }
-
-    /// `resolve_perth_weights` honors a pre-materialized `PERTH_SNAPSHOT` without touching the
-    /// network — the fast path the real-weights CI and the snapshot-prepare flow rely on. Accepts
-    /// both a direct file and a dir holding `perth_implicit.safetensors`.
-    #[test]
-    fn resolve_perth_weights_honors_a_pre_materialized_snapshot() {
-        let dir = std::env::temp_dir().join("chatterbox-perth-resolve");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join(PERTH_WEIGHTS_FILE);
-        std::fs::write(&file, b"stub").unwrap();
-
-        // A dir holding the file resolves to the file.
-        std::env::set_var("PERTH_SNAPSHOT", &dir);
-        assert_eq!(resolve_perth_weights().unwrap(), file);
-        // The file directly resolves to itself.
-        std::env::set_var("PERTH_SNAPSHOT", &file);
-        assert_eq!(resolve_perth_weights().unwrap(), file);
-
-        std::env::remove_var("PERTH_SNAPSHOT");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }
