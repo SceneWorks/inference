@@ -62,8 +62,8 @@ pub mod tokenizer;
 pub mod vae;
 
 pub use model::{
-    descriptor, load, resolve_cover_modules, CHANNELS, HUB_REPO, HUB_REVISION, LANGUAGES,
-    MAX_DURATION_SECS, MODEL_ID, REGISTRATION, SAMPLE_RATE,
+    cover_module_paths, descriptor, load, CHANNELS, COVER_COMPONENT_ID, HUB_REPO, HUB_REVISION,
+    LANGUAGES, MAX_DURATION_SECS, MODEL_ID, REGISTRATION, SAMPLE_RATE,
 };
 pub use pipeline::{AceStepPipeline, CoverModules};
 

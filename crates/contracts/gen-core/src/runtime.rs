@@ -196,13 +196,17 @@ pub struct LoadSpec {
     /// | mmaudio | `clip`, `synchformer`, `dit`, `vae`, `vocoder` |
     /// | sensenova (fast) | `distill_lora` |
     /// | LTX-2.3 | `uncensored_enhancer` |
+    /// | acestep (Cover) | `sft_cover` |
     ///
     /// sc-13664 wired sensenova's `distill_lora` (the 8-step distill LoRA for `sensenova_u1_8b_fast`,
     /// with a co-located-in-snapshot fallback; **not** a universally-`required_components` id, because a
     /// pre-merged turnkey tier bakes the merge in and needs no LoRA) and LTX-2.3's optional
     /// `uncensored_enhancer` (the amoral 4-bit Gemma enhancer, read on demand when a request sets
-    /// `use_uncensored_enhancer`). LTX-2.3's *main* Gemma text encoder rides the typed
-    /// [`text_encoder`](Self::text_encoder) slot (now required), not this map. Ids are lowercase
+    /// `use_uncensored_enhancer`). acestep's `sft_cover` follows the same on-demand shape: the ~7.8 GB
+    /// sft Cover snapshot dir, read only for a `Cover` audio-edit request, so it is likewise **not** a
+    /// `required_components` id — text2music and the region edit modes load without it. LTX-2.3's
+    /// *main* Gemma text encoder rides the typed [`text_encoder`](Self::text_encoder) slot (now
+    /// required), not this map. Ids are lowercase
     /// `snake_case` registry identifiers (same shape as a descriptor `id`); a model's declared
     /// `required_components` ids are validated non-empty and unique by the descriptor conformance sweep
     /// ([`model_descriptor_errors`](crate::registry::model_descriptor_errors)).

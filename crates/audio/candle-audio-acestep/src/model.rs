@@ -90,6 +90,15 @@ pub const WEIGHT_LICENSE_ENTRY: candle_audio::gen_core::WeightLicenseEntry =
 pub const SFT_HUB_REPO: &str = "ACE-Step/acestep-v15-xl-sft-diffusers";
 pub const SFT_HUB_REVISION: &str = "4bf7b60a63b27144f539f980927eeb89f5f912b0";
 
+/// The [`LoadSpec::components`] id under which the caller stages the sft Cover snapshot dir (epic
+/// 13657/13678). **Optional / on-demand**, deliberately NOT a
+/// [`ModelDescriptor::required_components`] id: only a Cover request needs it, so text2music and the
+/// region edit modes (Inpaint/Repaint/Extend) load and run without it — mirroring LTX's optional
+/// `uncensored_enhancer`. When provisioned it is a [`WeightsSource::Dir`] pointing at an
+/// `ACE-Step/acestep-v15-xl-sft-diffusers` snapshot (`audio_tokenizer/`, `audio_token_detokenizer/`,
+/// `transformer/`); a Cover request without it errors actionably at generate and never self-fetches.
+pub const COVER_COMPONENT_ID: &str = "sft_cover";
+
 /// License of the sft `audio_tokenizer` (FSQ) cover-conditioning checkpoint — MIT, verified against
 /// the `acestep-v15-xl-sft-diffusers` model card.
 pub const AUDIO_TOKENIZER_WEIGHT_LICENSE: candle_audio::gen_core::WeightLicense =
@@ -174,6 +183,10 @@ pub const LANGUAGES: &[&str] = &["en", "zh", "ja", "ko", "fr", "de", "es", "it",
 /// ACE-Step's identity + capabilities — constructible without weights.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        // Cover's ~7.8 GB sft snapshot is an OPTIONAL, on-demand component ([`COVER_COMPONENT_ID`] =
+        // `sft_cover`, read only for a Cover request), NOT a hard requirement — text2music + the
+        // region edit modes load without it — so it is deliberately absent here (mirrors LTX's
+        // optional `uncensored_enhancer`).
         required_components: &[],
         id: MODEL_ID,
         family: "acestep",
@@ -343,6 +356,10 @@ pub(crate) fn validate_request(
 pub struct AceStepGenerator {
     descriptor: ModelDescriptor,
     root: PathBuf,
+    /// The optional sft Cover snapshot dir (the [`COVER_COMPONENT_ID`] component), staged by the caller
+    /// in [`LoadSpec::components`] when Cover is provisioned. `None` ⇒ text2music + the region edit
+    /// modes still load and run; a Cover request then errors actionably (epic 13657 — no self-fetch).
+    sft_cover_root: Option<PathBuf>,
     pipeline: Mutex<Option<Arc<AceStepPipeline>>>,
 }
 
@@ -356,6 +373,22 @@ impl AceStepGenerator {
         let built = Arc::new(AceStepPipeline::from_snapshot(&self.root, &device)?);
         *guard = Some(built.clone());
         Ok(built)
+    }
+
+    /// The staged sft Cover snapshot dir (the [`COVER_COMPONENT_ID`] component), or a caller-actionable
+    /// error naming the exact `with_component` call. This is the [`LoadSpec::components`] analogue of
+    /// the removed `ACESTEP_SFT_SNAPSHOT` production env read: the Cover snapshot now flows through the
+    /// component seam (epic 13657), so production code holds no env-var side channel.
+    fn cover_snapshot_root(&self) -> gen_core::Result<&Path> {
+        self.sft_cover_root.as_deref().ok_or_else(|| {
+            gen_core::Error::Msg(format!(
+                "{MODEL_ID} Cover needs the sft cover checkpoint staged as the '{COVER_COMPONENT_ID}' \
+                 component — provision an ACE-Step/acestep-v15-xl-sft-diffusers snapshot \
+                 (audio_tokenizer/, audio_token_detokenizer/, transformer/) and pass it in \
+                 LoadSpec::components (with_component(\"{COVER_COMPONENT_ID}\", WeightsSource::Dir(...))); \
+                 inference does not self-fetch it"
+            ))
+        })
     }
 }
 
@@ -393,9 +426,27 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
             "{MODEL_ID} does not support control/IP-adapter overlays"
         )));
     }
+    // Cover's ~7.8 GB sft snapshot is an OPTIONAL, on-demand component (epic 13657/13678): only a
+    // Cover request needs it, so it is deliberately NOT a `required_components` id — text2music and
+    // the region edit modes load and run without it (mirroring LTX's optional `uncensored_enhancer`).
+    // When provisioned it arrives as the `sft_cover` Dir component; a Cover request without it errors
+    // at generate rather than self-fetching. Reject any other stray component key as a caller mistake.
+    gen_core::reject_unknown_components(spec, &[COVER_COMPONENT_ID], MODEL_ID)?;
+    let sft_cover_root = match spec.components.get(COVER_COMPONENT_ID) {
+        Some(WeightsSource::Dir(p)) => Some(p.clone()),
+        Some(WeightsSource::File(p)) => {
+            return Err(gen_core::Error::Msg(format!(
+                "{MODEL_ID} component '{COVER_COMPONENT_ID}' must be the sft snapshot directory \
+                 (audio_tokenizer/ + audio_token_detokenizer/ + transformer/), not the file {}",
+                p.display()
+            )));
+        }
+        None => None,
+    };
     Ok(Box::new(AceStepGenerator {
         descriptor: descriptor(),
         root,
+        sft_cover_root,
         pipeline: Mutex::new(None),
     }))
 }
@@ -417,6 +468,14 @@ impl Generator for AceStepGenerator {
         self.validate(req)?;
         if req.cancel.is_cancelled() {
             return Err(gen_core::Error::Canceled);
+        }
+        // Fail fast on an unprovisioned Cover (epic 13657): a Cover request needs its sft snapshot
+        // staged as the `sft_cover` component; error here — before the (heavy) base-pipeline load —
+        // rather than after it, and never self-fetch.
+        if let Some(edit) = req.audio_edit() {
+            if edit.mode == AudioEditMode::Cover {
+                self.cover_snapshot_root()?;
+            }
         }
         let audio = req.audio.clone().unwrap_or_default();
         let params = SynthesisParams {
@@ -456,14 +515,16 @@ impl Generator for AceStepGenerator {
             let source_channels = edit.audio.channels as usize;
             match edit.mode {
                 AudioEditMode::Cover => {
-                    // Cover pulls the pinned sft FSQ modules AND the non-distilled sft cover DiT
-                    // (both lazily loaded + cached) and restyles the whole clip from the new prompt.
-                    let (tok_w, tok_c, det_w, det_c) =
-                        resolve_cover_modules().map_err(gen_core::Error::from)?;
+                    // Cover pulls the staged sft FSQ modules AND the non-distilled sft cover DiT (both
+                    // lazily loaded + cached) from the caller-provisioned `sft_cover` component dir and
+                    // restyles the whole clip from the new prompt. The component's presence was already
+                    // checked above (fail-fast), so this resolves the path it staged.
+                    let sft_root = self.cover_snapshot_root()?;
+                    let (tok_w, tok_c, det_w, det_c) = cover_module_paths(sft_root);
                     let cover = pipeline
                         .cover_modules(&tok_w, &tok_c, &det_w, &det_c)
                         .map_err(gen_core::Error::from)?;
-                    let dit_shards = resolve_cover_dit().map_err(gen_core::Error::from)?;
+                    let dit_shards = cover_dit_shards(sft_root).map_err(gen_core::Error::from)?;
                     let cover_dit = pipeline
                         .cover_dit(&dit_shards)
                         .map_err(gen_core::Error::from)?;
@@ -539,33 +600,18 @@ const COVER_DETOKENIZER_CONFIG: &str = "audio_token_detokenizer/config.json";
 const COVER_DETOKENIZER_WEIGHTS: &str =
     "audio_token_detokenizer/diffusion_pytorch_model.safetensors";
 
-/// Resolve the Cover FSQ modules (sc-13251) — the sft `audio_tokenizer` +
-/// `audio_token_detokenizer` component files — from the **required** `ACESTEP_SFT_SNAPSHOT` local
-/// snapshot dir, returning `(tok_weights, tok_config, det_weights, det_config)`. Inference never
-/// self-fetches or derives an HF-cache location (epic 13657): the Cover restyle needs the sft
-/// checkpoint staged locally and pointed at by `ACESTEP_SFT_SNAPSHOT`.
-pub fn resolve_cover_modules() -> AudioResult<(PathBuf, PathBuf, PathBuf, PathBuf)> {
-    let d = PathBuf::from(sft_snapshot_dir()?);
-    Ok((
-        d.join(COVER_TOKENIZER_WEIGHTS),
-        d.join(COVER_TOKENIZER_CONFIG),
-        d.join(COVER_DETOKENIZER_WEIGHTS),
-        d.join(COVER_DETOKENIZER_CONFIG),
-    ))
-}
-
-/// The **required** local sft snapshot dir for the Cover restyle (`ACESTEP_SFT_SNAPSHOT`). Inference
-/// never self-fetches (epic 13657); a Cover request without this staged errors here rather than
-/// downloading.
-fn sft_snapshot_dir() -> AudioResult<String> {
-    std::env::var("ACESTEP_SFT_SNAPSHOT").map_err(|_| {
-        AudioError::Msg(
-            "ACE-Step Cover needs the sft cover checkpoint staged locally — set ACESTEP_SFT_SNAPSHOT \
-             to an ACE-Step/acestep-v15-xl-sft-diffusers snapshot dir (audio_tokenizer/, \
-             audio_token_detokenizer/, transformer/); inference does not self-fetch it"
-                .to_string(),
-        )
-    })
+/// Paths of the Cover FSQ module files (sc-13251) inside a staged sft snapshot `root` — the sft
+/// `audio_tokenizer` + `audio_token_detokenizer` component files, returned as
+/// `(tok_weights, tok_config, det_weights, det_config)`. Pure path joins: `root` is the
+/// caller-provisioned [`COVER_COMPONENT_ID`] component dir (epic 13657); inference never self-fetches
+/// it or derives an HF-cache location.
+pub fn cover_module_paths(root: &Path) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+    (
+        root.join(COVER_TOKENIZER_WEIGHTS),
+        root.join(COVER_TOKENIZER_CONFIG),
+        root.join(COVER_DETOKENIZER_WEIGHTS),
+        root.join(COVER_DETOKENIZER_CONFIG),
+    )
 }
 
 /// Distinct, sorted shard filenames listed in a `*.safetensors.index.json` `weight_map`.
@@ -594,16 +640,16 @@ fn shard_names_from_index(index_path: &Path) -> AudioResult<Vec<String>> {
     Ok(shards)
 }
 
-/// Resolve the **sft** cover DiT transformer shards (sc-13251) — the non-distilled reference cover
-/// model, ~7.8 GB — from the **required** `ACESTEP_SFT_SNAPSHOT` local snapshot dir, returning the
-/// safetensors shard paths for lazy loading on the first Cover request. Inference never self-fetches
-/// or derives an HF-cache location (epic 13657).
-pub fn resolve_cover_dit() -> AudioResult<Vec<PathBuf>> {
-    let root = PathBuf::from(sft_snapshot_dir()?).join("transformer");
-    let index = root.join("diffusion_pytorch_model.safetensors.index.json");
+/// The **sft** cover DiT transformer shard paths (sc-13251) — the non-distilled reference cover model,
+/// ~7.8 GB — under a staged sft snapshot `root`, returned for lazy loading on the first Cover request.
+/// `root` is the caller-provisioned [`COVER_COMPONENT_ID`] component dir (epic 13657); inference never
+/// self-fetches it or derives an HF-cache location.
+pub fn cover_dit_shards(root: &Path) -> AudioResult<Vec<PathBuf>> {
+    let dir = root.join("transformer");
+    let index = dir.join("diffusion_pytorch_model.safetensors.index.json");
     Ok(shard_names_from_index(&index)?
         .into_iter()
-        .map(|s| root.join(s))
+        .map(|s| dir.join(s))
         .collect())
 }
 
@@ -848,5 +894,53 @@ mod tests {
         };
         let err = g.generate(&req, &mut |_| {}).unwrap_err();
         assert!(matches!(err, gen_core::Error::Canceled));
+    }
+
+    #[test]
+    fn load_captures_the_optional_sft_cover_component() {
+        let dir = std::env::temp_dir();
+        // No component ⇒ loads fine (text2music / region-edit path); the Cover snapshot stays absent.
+        assert!(load(&LoadSpec::new(WeightsSource::Dir(dir.clone()))).is_ok());
+        // A staged `sft_cover` Dir is accepted (path captured, no I/O at load).
+        let staged = LoadSpec::new(WeightsSource::Dir(dir.clone()))
+            .with_component(COVER_COMPONENT_ID, WeightsSource::Dir(dir.clone()));
+        assert!(load(&staged).is_ok());
+        // An unrecognized component key is a typed Unsupported (caller mistake), not silently ignored.
+        let unknown = LoadSpec::new(WeightsSource::Dir(dir.clone()))
+            .with_component("not_a_real_component", WeightsSource::Dir(dir.clone()));
+        assert!(matches!(
+            load(&unknown),
+            Err(gen_core::Error::Unsupported(_))
+        ));
+        // `sft_cover` must be a directory (the snapshot), not a single file.
+        let as_file = LoadSpec::new(WeightsSource::Dir(dir.clone())).with_component(
+            COVER_COMPONENT_ID,
+            WeightsSource::File(dir.join("x.safetensors")),
+        );
+        assert!(matches!(load(&as_file), Err(gen_core::Error::Msg(_))));
+    }
+
+    #[test]
+    fn cover_request_without_the_sft_component_errors_before_any_weight_load() {
+        // A Cover request on a generator with no `sft_cover` staged fails fast with an actionable
+        // message (naming the component) — before the base pipeline is built, and never self-fetches.
+        // `root` is an empty temp dir with no real weights, so reaching the base load would panic/err;
+        // the fail-fast guard means we never get there.
+        let dir = std::env::temp_dir().join("acestep-cover-no-component");
+        std::fs::create_dir_all(&dir).unwrap();
+        let g = load(&LoadSpec::new(WeightsSource::Dir(dir))).unwrap();
+        let err = g
+            .generate(&edit_req(AudioEditMode::Cover, None), &mut |_| {})
+            .unwrap_err();
+        match err {
+            gen_core::Error::Msg(m) => {
+                assert!(m.contains(COVER_COMPONENT_ID), "names the component: {m}");
+                assert!(
+                    m.contains("does not self-fetch"),
+                    "states no self-fetch: {m}"
+                );
+            }
+            other => panic!("expected an actionable Msg naming the component, got {other:?}"),
+        }
     }
 }
