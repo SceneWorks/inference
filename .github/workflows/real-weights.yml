@@ -70,6 +70,7 @@ jobs:
       ACESTEP_SNAPSHOT: ${{ vars.ACESTEP_SNAPSHOT }}
       CHATTERBOX_VE_SNAPSHOT: ${{ vars.CHATTERBOX_VE_SNAPSHOT }}
       CHATTERBOX_SNAPSHOT: ${{ vars.CHATTERBOX_SNAPSHOT }}
+      CHATTERBOX_PERTH_SNAPSHOT: ${{ vars.CHATTERBOX_PERTH_SNAPSHOT }}
       OPENVOICE_V2_SNAPSHOT: ${{ vars.OPENVOICE_V2_SNAPSHOT }}
       WHISPER_SNAPSHOT: ${{ vars.WHISPER_SNAPSHOT }}
       CLAP_SNAPSHOT: ${{ vars.CLAP_SNAPSHOT }}
@@ -88,6 +89,7 @@ jobs:
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model acestep-v15-turbo --snapshot "$ACESTEP_SNAPSHOT"
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model chatterbox-ve --snapshot "$CHATTERBOX_VE_SNAPSHOT"
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model chatterbox --snapshot "$CHATTERBOX_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model chatterbox-perth --snapshot "$CHATTERBOX_PERTH_SNAPSHOT"
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model openvoice-v2 --snapshot "$OPENVOICE_V2_SNAPSHOT"
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model whisper-base --snapshot "$WHISPER_SNAPSHOT"
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model clap-htsat-unfused --snapshot "$CLAP_SNAPSHOT"

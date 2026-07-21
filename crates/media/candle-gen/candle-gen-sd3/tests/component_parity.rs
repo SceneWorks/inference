@@ -41,14 +41,14 @@
 //!     each component to the reference with **cosine** + **max-abs-diff** against the documented
 //!     tolerances baked into that variant's reference manifest.
 //!
-//! ## Gating & weight resolution (F-069)
+//! ## Gating & weight resolution (epic 13657)
 //! Each variant's real-weight test is `#[ignore]`d (it needs the multi-GB SD3.5 snapshot + the
-//! generated reference) and resolves the snapshot via the shared `candle_gen::testkit` HF-cache
-//! resolver (`$HF_HUB_CACHE` → `$HF_HOME/hub` → `<home>/.cache/huggingface/hub`), so it never silently
-//! no-ops on a missing cache — it panics with an actionable message. Run them explicitly:
+//! generated reference) and resolves the snapshot from an explicit passed-in env path
+//! (`<TAG>_SNAPSHOT`, e.g. `SD35_LARGE_SNAPSHOT`) — inference never self-fetches or derives a cache
+//! location. It panics with an actionable message when unset. Run them explicitly:
 //!
 //! ```text
-//! export HF_HOME=D:/.cache/huggingface
+//! export SD35_LARGE_SNAPSHOT=/snapshots/stable-diffusion-3.5-large
 //! # (once, per variant) generate the reference in the parity venv:
 //! python candle-gen-sd3/tests/parity/gen_reference.py \
 //!     --model stabilityai/stable-diffusion-3.5-medium --tag sd35_medium \
@@ -92,7 +92,7 @@
 use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::{DType, Device, Tensor};
-use candle_gen::testkit::{cosine, require_hf_snapshot_dir};
+use candle_gen::testkit::cosine;
 use candle_gen_sd3::conditioning::{aggregate, EncoderOutputs, Sd3TextEncoders};
 use candle_gen_sd3::config::Sd3Config;
 use candle_gen_sd3::transformer::Sd3Transformer;
@@ -168,6 +168,16 @@ fn reference_dir() -> PathBuf {
         .join("tests")
         .join("parity")
         .join("reference")
+}
+
+/// Resolve the SD3.5 snapshot dir for a variant from the required `<TAG>_SNAPSHOT` env (e.g.
+/// `SD35_LARGE_SNAPSHOT`) — a passed-in snapshot dir. Inference never self-fetches or derives a cache
+/// location (epic 13657).
+fn snapshot_dir(tag: &str) -> PathBuf {
+    let env = format!("{}_SNAPSHOT", tag.to_uppercase());
+    PathBuf::from(std::env::var(&env).unwrap_or_else(|_| {
+        panic!("set {env} to a staged {tag} SD3.5 snapshot dir (inference does not self-fetch, epic 13657)")
+    }))
 }
 
 /// Load a variant's reference `.safetensors` (all f32) into a name→Tensor map on CPU.
@@ -276,7 +286,7 @@ fn load_dit(root: &Path, cfg: &Sd3Config) -> (Sd3Transformer, Device, DType) {
 /// asserts every component passes its documented tolerance.
 fn run_parity(variant: &Variant) {
     let Variant { tag, repo, config } = variant;
-    let root = require_hf_snapshot_dir(repo);
+    let root = snapshot_dir(tag);
     let refs = load_reference(tag);
     let cfg = config();
 
@@ -456,7 +466,7 @@ fn run_parity(variant: &Variant) {
 /// reference). The DiT half is skipped unless `$SD35_PARITY_CUDA=1` (needs the GPU build of the 8B
 /// MMDiT). Requires the `sc9581-ab` feature (the `encode_with_pad_g` hook). Run:
 /// ```text
-/// export HF_HOME=D:/.cache/huggingface
+/// export SD35_LARGE_SNAPSHOT=/snapshots/stable-diffusion-3.5-large
 /// cargo test -p candle-gen-sd3 --features sc9581-ab,cuda --test component_parity \
 ///     sd35_bigg_pad_token_ab -- --ignored --nocapture
 /// ```
@@ -467,7 +477,7 @@ fn sd35_bigg_pad_token_ab() {
     // The pad fix was found on SD3.5-large; run the A/B against that variant's snapshot + reference.
     let variant = &VARIANTS[0];
     let tag = variant.tag;
-    let root = require_hf_snapshot_dir(variant.repo);
+    let root = snapshot_dir(variant.tag);
     let refs = load_reference(tag);
     let cfg = (variant.config)();
     let cpu = Device::Cpu;

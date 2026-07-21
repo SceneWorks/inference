@@ -18,9 +18,10 @@ Obtain the source checkpoint from the MIT resemble-perth package, e.g.:
     # or: git clone https://github.com/resemble-ai/perth /tmp/perth
     python3 scripts/audio/convert_perth_watermarker.py \
         /tmp/perth/src/perth/perth_net/pretrained/implicit/perth_net_250000.pth.tar \
-        "$PERTH_SNAPSHOT/perth_implicit.safetensors"
+        "$CHATTERBOX_PERTH_SNAPSHOT/perth_implicit.safetensors"
 
-`$PERTH_SNAPSHOT` is the dir the real-weight conformance test (`--ignored`) resolves the weights from.
+`$CHATTERBOX_PERTH_SNAPSHOT` is the dir the real-weight conformance test (`--ignored`) resolves the
+weights from (the `perth` component is a passed-in path — inference never self-fetches, epic 13657).
 """
 
 from __future__ import annotations

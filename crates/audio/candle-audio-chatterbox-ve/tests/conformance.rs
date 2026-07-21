@@ -24,28 +24,19 @@ use candle_audio_chatterbox_ve::gen_core::{
     WeightsSource,
 };
 
-/// Resolve the `ve.safetensors` weights from the explicit `CHATTERBOX_VE_SNAPSHOT` env path (a
+/// Resolve the `ve.safetensors` weights from the required `CHATTERBOX_VE_SNAPSHOT` env path (a
 /// snapshot dir holding `ve.safetensors`, or the file itself) — the "passed-in path" the provider
-/// consumes. Falls back to the pinned-SHA hub fetch when unset, mirroring this file's other snapshot
-/// helpers, but never the `resolve_pinned_*` production helper (sc-13660).
+/// consumes. Inference never self-fetches or derives a cache location (epic 13657).
 fn ve_weights() -> WeightsSource {
-    match std::env::var("CHATTERBOX_VE_SNAPSHOT") {
-        Ok(p) => {
-            let p = PathBuf::from(p);
-            let file = if p.is_dir() {
-                p.join(ve::WEIGHTS_FILE)
-            } else {
-                p
-            };
-            WeightsSource::File(file)
-        }
-        Err(_) => WeightsSource::File(
-            candle_audio::hub::hf_get_pinned(ve::HUB_REPO, ve::HUB_REVISION, ve::WEIGHTS_FILE)
-                .expect(
-                "fetch the pinned ResembleAI/chatterbox ve.safetensors (network or warm HF cache)",
-            ),
-        ),
-    }
+    let p = PathBuf::from(std::env::var("CHATTERBOX_VE_SNAPSHOT").expect(
+        "set CHATTERBOX_VE_SNAPSHOT to a ResembleAI/chatterbox snapshot dir holding ve.safetensors (or the file itself)",
+    ));
+    let file = if p.is_dir() {
+        p.join(ve::WEIGHTS_FILE)
+    } else {
+        p
+    };
+    WeightsSource::File(file)
 }
 
 /// The embedder, resolved **through the explicit registry** by id (exactly like a media model).
@@ -59,11 +50,10 @@ fn load_embedder() -> Box<dyn VoiceEmbedder> {
 
 /// Synthesize a reference clip with Kokoro (24 kHz mono).
 fn kokoro_clip(text: &str, voice: &str) -> AudioTrack {
-    let spec = LoadSpec::new(match std::env::var("KOKORO_SNAPSHOT") {
-        Ok(dir) => WeightsSource::Dir(PathBuf::from(dir)),
-        Err(_) => candle_audio_kokoro::resolve_pinned_snapshot()
-            .expect("resolve the pinned hexgrad/Kokoro-82M snapshot (network or warm HF cache)"),
-    });
+    let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(
+        std::env::var("KOKORO_SNAPSHOT")
+            .expect("set KOKORO_SNAPSHOT to a hexgrad/Kokoro-82M snapshot dir"),
+    )));
     let gen = candle_audio_kokoro::load(&spec).expect("load kokoro");
     let req = GenerationRequest {
         prompt: text.to_string(),

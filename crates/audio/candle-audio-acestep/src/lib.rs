@@ -23,10 +23,11 @@
 //!   adapter registered under **`acestep_v15_turbo`**,
 //! - [`prepare`] — the audio-lane snapshot-preparation accommodation (validated passthrough).
 //!
-//! Weights resolve through the audio lane's pinned-SHA hub path
-//! ([`model::resolve_pinned_snapshot`]): `ACE-Step/acestep-v15-xl-turbo-diffusers` at an immutable
-//! commit, never a mutable ref. ACE-Step ships **its own** Oobleck VAE (`vae/`), so the
-//! Stability-licensed DiffRhythm VAE is not pulled.
+//! Weights are supplied as an explicit passed-in snapshot on the [`gen_core::LoadSpec`]:
+//! `ACE-Step/acestep-v15-xl-turbo-diffusers` staged locally, never self-fetched (epic 13657). The
+//! [`model::HUB_REPO`]@[`model::HUB_REVISION`] pin is retained as the provenance record of that
+//! checkpoint. ACE-Step ships **its own** Oobleck VAE (`vae/`), so the Stability-licensed DiffRhythm
+//! VAE is not pulled.
 //!
 //! ## Stems
 //!
@@ -61,8 +62,8 @@ pub mod tokenizer;
 pub mod vae;
 
 pub use model::{
-    descriptor, load, resolve_cover_modules, resolve_pinned_snapshot, CHANNELS, HUB_REPO,
-    HUB_REVISION, LANGUAGES, MAX_DURATION_SECS, MODEL_ID, REGISTRATION, SAMPLE_RATE,
+    descriptor, load, resolve_cover_modules, CHANNELS, HUB_REPO, HUB_REVISION, LANGUAGES,
+    MAX_DURATION_SECS, MODEL_ID, REGISTRATION, SAMPLE_RATE,
 };
 pub use pipeline::{AceStepPipeline, CoverModules};
 

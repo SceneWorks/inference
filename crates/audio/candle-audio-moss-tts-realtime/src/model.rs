@@ -23,8 +23,6 @@ use candle_audio::gen_core::{
     self, AudioChunk, AudioTrack, Capabilities, GenerationOutput, GenerationRequest, Generator,
     LoadSpec, Modality, ModelDescriptor, Progress, WeightsSource,
 };
-use candle_audio::hub::{hf_get_pinned, pinned_snapshot_dir};
-use candle_audio::Result as AudioResult;
 use candle_nn::VarBuilder;
 use tokenizers::Tokenizer;
 
@@ -178,7 +176,7 @@ impl Loaded {
         let weights = root.join(crate::prepare::MODEL_WEIGHTS);
         if !weights.is_file() {
             return Err(gen_core::Error::Msg(format!(
-                "{MODEL_ID}: weights {} missing (resolve_pinned_snapshot materializes {})",
+                "{MODEL_ID}: weights {} missing (the passed-in snapshot must supply {})",
                 weights.display(),
                 crate::prepare::MODEL_WEIGHTS
             )));
@@ -501,26 +499,6 @@ pub fn register_providers(
 /// Build this crate's own explicit provider catalog (its single-generator surface).
 pub fn provider_registry() -> gen_core::Result<gen_core::ProviderRegistry> {
     register_providers(gen_core::ProviderRegistryBuilder::new()).build()
-}
-
-/// Materialize the pinned MOSS-TTS-Realtime **AR** snapshot through the audio lane's F-029 hub path:
-/// `config.json` (the snapshot-dir probe), the single-file `model.safetensors`, and the Qwen
-/// tokenizer — all at [`HUB_REVISION`]. Returns the AR snapshot dir.
-///
-/// This resolves the AR brain only (the model's own `spec.weights`). The MOSS-Audio-Tokenizer codec
-/// is a passed-in component (sc-13662): the consumer stages it under [`CODEC_COMPONENT_ID`]; this
-/// crate never fetches it (epic 13657). The pin the consumer must provision is
-/// [`CODEC_HUB_REPO`]@[`CODEC_HUB_REVISION`].
-pub fn resolve_pinned_snapshot() -> AudioResult<WeightsSource> {
-    let dir = pinned_snapshot_dir(HUB_REPO, HUB_REVISION, "config.json")?;
-    for file in [
-        crate::prepare::MODEL_WEIGHTS,
-        "tokenizer.json",
-        "tokenizer_config.json",
-    ] {
-        hf_get_pinned(HUB_REPO, HUB_REVISION, file)?;
-    }
-    Ok(dir)
 }
 
 #[cfg(test)]

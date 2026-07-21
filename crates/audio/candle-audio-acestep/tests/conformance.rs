@@ -21,13 +21,13 @@ use candle_audio_acestep::gen_core::{
     LoadSpec, Progress, TimeRegion, WeightsSource,
 };
 
-/// Resolve the snapshot: `ACESTEP_SNAPSHOT` env (a snapshot dir) or the pinned hub path.
+/// Resolve the snapshot from the required `ACESTEP_SNAPSHOT` env (a passed-in
+/// `ACE-Step/acestep-v15-xl-turbo-diffusers` snapshot dir). Inference never self-fetches or derives
+/// a cache location (epic 13657).
 fn snapshot() -> WeightsSource {
-    match std::env::var("ACESTEP_SNAPSHOT") {
-        Ok(dir) => WeightsSource::Dir(PathBuf::from(dir)),
-        Err(_) => candle_audio_acestep::resolve_pinned_snapshot()
-            .expect("resolve the pinned ACE-Step/acestep-v15-xl-turbo-diffusers snapshot"),
-    }
+    WeightsSource::Dir(PathBuf::from(std::env::var("ACESTEP_SNAPSHOT").expect(
+        "set ACESTEP_SNAPSHOT to an ACE-Step/acestep-v15-xl-turbo-diffusers snapshot dir",
+    )))
 }
 
 /// The backend-neutral gen-core conformance suite (validate honesty, progress contract, typed

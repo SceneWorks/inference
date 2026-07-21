@@ -57,67 +57,41 @@ use candle_audio_chatterbox::gen_core::{
     WeightsSource,
 };
 
-/// Resolve a Chatterbox snapshot dir holding at least `t3_cfg.safetensors` + `tokenizer.json`.
-/// `CHATTERBOX_SNAPSHOT` overrides; otherwise the pinned T3 + tokenizer files are fetched via the
-/// hub (the S3Gen checkpoint is intentionally NOT required — this slice only loads T3).
+/// Resolve a Chatterbox snapshot dir holding at least `t3_cfg.safetensors` + `tokenizer.json`, from
+/// the required `CHATTERBOX_SNAPSHOT` env (a passed-in `ResembleAI/chatterbox` snapshot dir).
+/// Inference never self-fetches or derives a cache location (epic 13657).
 fn chatterbox_snapshot() -> PathBuf {
-    if let Ok(dir) = std::env::var("CHATTERBOX_SNAPSHOT") {
-        return PathBuf::from(dir);
-    }
-    // Fetch just the T3 files (avoids the ~1 GB S3Gen download the full resolver would pull).
-    use candle_audio::hub::{hf_get_pinned, pinned_snapshot_dir};
-    let dir = pinned_snapshot_dir(cb::HUB_REPO, cb::HUB_REVISION, cb::T3_WEIGHTS_FILE)
-        .expect("resolve the pinned chatterbox t3_cfg.safetensors (network or warm HF cache)");
-    hf_get_pinned(cb::HUB_REPO, cb::HUB_REVISION, cb::TOKENIZER_FILE)
-        .expect("resolve the pinned chatterbox tokenizer.json");
-    match dir {
-        WeightsSource::Dir(p) => p,
-        other => panic!("expected a snapshot dir, got {other:?}"),
-    }
+    PathBuf::from(std::env::var("CHATTERBOX_SNAPSHOT").expect(
+        "set CHATTERBOX_SNAPSHOT to a ResembleAI/chatterbox snapshot dir (t3_cfg.safetensors + tokenizer.json)",
+    ))
 }
 
-/// The `voice_embedding` component: the `ve.safetensors` file from `CHATTERBOX_VE_SNAPSHOT` (a dir
-/// holding it, or the file itself). Falls back to the pinned-SHA hub fetch when unset — never the
-/// `resolve_pinned_*` production helper (sc-13660).
+/// The `voice_embedding` component: the `ve.safetensors` file from the required
+/// `CHATTERBOX_VE_SNAPSHOT` env (a dir holding it, or the file itself). Inference never self-fetches
+/// or derives a cache location (epic 13657).
 fn ve_weights_file() -> PathBuf {
-    match std::env::var("CHATTERBOX_VE_SNAPSHOT") {
-        Ok(p) => {
-            let p = PathBuf::from(p);
-            if p.is_dir() {
-                p.join(candle_audio_chatterbox_ve::WEIGHTS_FILE)
-            } else {
-                p
-            }
-        }
-        Err(_) => candle_audio::hub::hf_get_pinned(
-            candle_audio_chatterbox_ve::HUB_REPO,
-            candle_audio_chatterbox_ve::HUB_REVISION,
-            candle_audio_chatterbox_ve::WEIGHTS_FILE,
-        )
-        .expect("fetch the pinned ve.safetensors (network or warm HF cache)"),
+    let p = PathBuf::from(std::env::var("CHATTERBOX_VE_SNAPSHOT").expect(
+        "set CHATTERBOX_VE_SNAPSHOT to a ResembleAI/chatterbox snapshot dir holding ve.safetensors (or the file itself)",
+    ));
+    if p.is_dir() {
+        p.join(candle_audio_chatterbox_ve::WEIGHTS_FILE)
+    } else {
+        p
     }
 }
 
-/// The `perth` component: the `perth_implicit.safetensors` file from `CHATTERBOX_PERTH_SNAPSHOT` (a
-/// dir holding it, or the file itself). Falls back to the pinned-SHA hub fetch of the
-/// `SceneWorks/perth-implicit` pin when unset — the provider itself no longer self-fetches (sc-13660);
-/// the test stages the passed-in path as the `perth` component.
+/// The `perth` component: the `perth_implicit.safetensors` file from the required
+/// `CHATTERBOX_PERTH_SNAPSHOT` env (a dir holding it, or the file itself). The provider itself no
+/// longer self-fetches (sc-13660); the test stages the passed-in path as the `perth` component.
+/// Inference never self-fetches or derives a cache location (epic 13657).
 fn perth_weights_file() -> PathBuf {
-    match std::env::var("CHATTERBOX_PERTH_SNAPSHOT") {
-        Ok(p) => {
-            let p = PathBuf::from(p);
-            if p.is_dir() {
-                p.join(cb::PERTH_WEIGHTS_FILE)
-            } else {
-                p
-            }
-        }
-        Err(_) => candle_audio::hub::hf_get_pinned(
-            cb::PERTH_HUB_REPO,
-            cb::PERTH_HUB_REVISION,
-            cb::PERTH_WEIGHTS_FILE,
-        )
-        .expect("fetch the pinned perth_implicit.safetensors (network or warm HF cache)"),
+    let p = PathBuf::from(std::env::var("CHATTERBOX_PERTH_SNAPSHOT").expect(
+        "set CHATTERBOX_PERTH_SNAPSHOT to a SceneWorks/perth-implicit snapshot dir holding perth_implicit.safetensors (or the file itself)",
+    ));
+    if p.is_dir() {
+        p.join(cb::PERTH_WEIGHTS_FILE)
+    } else {
+        p
     }
 }
 
@@ -163,11 +137,10 @@ fn load_generator() -> cb::ChatterboxGenerator {
 
 /// A reference clip synthesized with Kokoro (24 kHz mono) — the sanctioned reference-audio path.
 fn kokoro_clip(text: &str, voice: &str) -> AudioTrack {
-    let spec = LoadSpec::new(match std::env::var("KOKORO_SNAPSHOT") {
-        Ok(dir) => WeightsSource::Dir(PathBuf::from(dir)),
-        Err(_) => candle_audio_kokoro::resolve_pinned_snapshot()
-            .expect("resolve the pinned hexgrad/Kokoro-82M snapshot (network or warm HF cache)"),
-    });
+    let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(
+        std::env::var("KOKORO_SNAPSHOT")
+            .expect("set KOKORO_SNAPSHOT to a hexgrad/Kokoro-82M snapshot dir"),
+    )));
     let gen = candle_audio_kokoro::load(&spec).expect("load kokoro");
     let req = GenerationRequest {
         prompt: text.to_string(),
@@ -349,31 +322,20 @@ fn chatterbox_generate_requires_reference_audio_for_a_full_clone() {
 // s3tokenizer (sc-13235): the Whisper-v2 FSMN encoder + FSQ head → 25 Hz speech tokens.
 // ---------------------------------------------------------------------------------------------
 
-/// Resolve a snapshot dir holding `s3gen.safetensors` (the s3tokenizer weights). `CHATTERBOX_SNAPSHOT`
-/// overrides (and must contain the S3Gen checkpoint); otherwise the pinned `s3gen.safetensors`
-/// (~1 GB) is fetched via the hub.
+/// Resolve a snapshot dir holding `s3gen.safetensors` (the s3tokenizer weights) from the required
+/// `CHATTERBOX_SNAPSHOT` env (a passed-in `ResembleAI/chatterbox` snapshot dir that must contain the
+/// S3Gen checkpoint). Inference never self-fetches or derives a cache location (epic 13657).
 fn s3gen_snapshot() -> PathBuf {
-    if let Ok(dir) = std::env::var("CHATTERBOX_SNAPSHOT") {
-        let p = PathBuf::from(dir);
-        assert!(
-            p.join(cb::s3gen::S3GEN_WEIGHTS_FILE).is_file(),
-            "CHATTERBOX_SNAPSHOT {} must contain {} for the s3tokenizer gate",
-            p.display(),
-            cb::s3gen::S3GEN_WEIGHTS_FILE
-        );
-        return p;
-    }
-    use candle_audio::hub::pinned_snapshot_dir;
-    match pinned_snapshot_dir(
-        cb::HUB_REPO,
-        cb::HUB_REVISION,
-        cb::s3gen::S3GEN_WEIGHTS_FILE,
-    )
-    .expect("resolve the pinned chatterbox s3gen.safetensors (network or warm HF cache)")
-    {
-        WeightsSource::Dir(p) => p,
-        other => panic!("expected a snapshot dir, got {other:?}"),
-    }
+    let p = PathBuf::from(std::env::var("CHATTERBOX_SNAPSHOT").expect(
+        "set CHATTERBOX_SNAPSHOT to a ResembleAI/chatterbox snapshot dir containing s3gen.safetensors",
+    ));
+    assert!(
+        p.join(cb::s3gen::S3GEN_WEIGHTS_FILE).is_file(),
+        "CHATTERBOX_SNAPSHOT {} must contain {} for the s3tokenizer gate",
+        p.display(),
+        cb::s3gen::S3GEN_WEIGHTS_FILE
+    );
+    p
 }
 
 /// The DoD gate: the ported s3tokenizer tokenizes a real Kokoro reference clip into a plausible

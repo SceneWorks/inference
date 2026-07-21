@@ -14,8 +14,11 @@ use candle_audio::wav::write_wav_pcm16;
 use candle_audio_chatterbox_ve as ve;
 
 fn kokoro_clip(text: &str, voice: &str) -> candle_audio::gen_core::AudioTrack {
-    let spec =
-        LoadSpec::new(candle_audio_kokoro::resolve_pinned_snapshot().expect("kokoro snapshot"));
+    use candle_audio::gen_core::WeightsSource;
+    let spec = LoadSpec::new(WeightsSource::Dir(std::path::PathBuf::from(
+        std::env::var("KOKORO_SNAPSHOT")
+            .expect("set KOKORO_SNAPSHOT to a hexgrad/Kokoro-82M snapshot dir"),
+    )));
     let gen = candle_audio_kokoro::load(&spec).expect("load kokoro");
     let req = GenerationRequest {
         prompt: text.to_string(),
@@ -65,7 +68,12 @@ fn main() {
     .expect("write control wav");
 
     // Embed all three with the real Chatterbox voice encoder.
-    let vespec = LoadSpec::new(ve::resolve_pinned_file().expect("resolve ve weights"));
+    let vespec = LoadSpec::new(candle_audio::gen_core::WeightsSource::File(
+        std::path::PathBuf::from(std::env::var("CHATTERBOX_VE_SNAPSHOT").expect(
+            "set CHATTERBOX_VE_SNAPSHOT to a ResembleAI/chatterbox snapshot dir holding ve.safetensors",
+        ))
+        .join(ve::WEIGHTS_FILE),
+    ));
     let embedder = ve::load(&vespec).expect("load chatterbox_ve");
     let ea1 = embedder.embed(&a1).expect("embed a1");
     let ea2 = embedder.embed(&a2).expect("embed a2");

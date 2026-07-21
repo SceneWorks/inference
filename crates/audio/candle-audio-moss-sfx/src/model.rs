@@ -16,8 +16,8 @@
 //!   vae/vae_128d_48k.pth                              → the continuous DAC VAE
 //! ```
 //!
-//! [`resolve_pinned_snapshot`] materializes exactly that layout through the audio lane's
-//! pinned-SHA hub path (`candle_audio::hub`, F-029 — never a mutable ref).
+//! A `LoadSpec` points at exactly that layout: the snapshot is staged locally and passed in, never
+//! self-fetched (epic 13657). The `HUB_REPO`@`HUB_REVISION` pin records its provenance.
 //!
 //! ## Request mapping
 //!
@@ -37,8 +37,6 @@ use candle_audio::gen_core::{
     self, AudioTrack, Capabilities, GenerationOutput, GenerationRequest, Generator, LoadSpec,
     Modality, ModelDescriptor, Progress, WeightsSource,
 };
-use candle_audio::hub::{hf_get_pinned, pinned_snapshot_dir};
-use candle_audio::{AudioError, Result as AudioResult};
 
 use crate::pipeline::{
     MossSfxPipeline, SynthesisParams, DEFAULT_CFG_SCALE, DEFAULT_SECONDS, DEFAULT_STEPS,
@@ -320,56 +318,6 @@ impl Generator for MossSfxGenerator {
 // Explicit catalog registration for `moss_sfx_v2` (composed by `candle-audio-catalog`).
 candle_audio::register_generators! {
     pub const REGISTRATION = descriptor => load
-}
-
-/// Materialize the pinned MOSS-SoundEffect snapshot through the audio lane's F-029 hub path:
-/// `model_index.json` (the snapshot-dir probe), the component configs, the DiT + text-encoder
-/// safetensors (shards enumerated from the index), the tokenizer, and the VAE checkpoint — all
-/// at [`HUB_REVISION`], landing in the ordinary HF cache. Returns the snapshot dir as a
-/// [`WeightsSource::Dir`] ready for a [`LoadSpec`].
-pub fn resolve_pinned_snapshot() -> AudioResult<WeightsSource> {
-    let dir = pinned_snapshot_dir(HUB_REPO, HUB_REVISION, "model_index.json")?;
-    for file in [
-        "scheduler/scheduler_config.json",
-        "transformer/config.json",
-        "transformer/diffusion_pytorch_model.safetensors",
-        "text_encoder/config.json",
-        "tokenizer/tokenizer.json",
-        &format!("vae/{}", crate::vae::VAE_FILE),
-    ] {
-        hf_get_pinned(HUB_REPO, HUB_REVISION, file)?;
-    }
-    // Text-encoder shards, enumerated from the index so a re-sharded upstream layout cannot
-    // silently skip a file.
-    let index_path = hf_get_pinned(
-        HUB_REPO,
-        HUB_REVISION,
-        "text_encoder/model.safetensors.index.json",
-    )?;
-    let text = std::fs::read_to_string(&index_path)
-        .map_err(|e| AudioError::Msg(format!("read {}: {e}", index_path.display())))?;
-    let v: serde_json::Value = serde_json::from_str(&text)
-        .map_err(|e| AudioError::Msg(format!("parse {}: {e}", index_path.display())))?;
-    let mut shards: Vec<String> = v
-        .get("weight_map")
-        .and_then(|m| m.as_object())
-        .map(|m| {
-            m.values()
-                .filter_map(|s| s.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
-    shards.sort();
-    shards.dedup();
-    if shards.is_empty() {
-        return Err(AudioError::Msg(format!(
-            "{HUB_REPO}: text_encoder/model.safetensors.index.json lists no shards"
-        )));
-    }
-    for shard in shards {
-        hf_get_pinned(HUB_REPO, HUB_REVISION, &format!("text_encoder/{shard}"))?;
-    }
-    Ok(dir)
 }
 
 #[cfg(test)]

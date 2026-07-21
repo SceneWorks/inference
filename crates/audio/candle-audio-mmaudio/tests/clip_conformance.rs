@@ -79,18 +79,16 @@ fn tokenize_str_byte_matches_open_clip_reference() {
 
 fn load_encoder() -> clip::DfnClipEncoder {
     let dev = Device::Cpu;
-    if let Ok(p) = std::env::var("DFN_CLIP_SNAPSHOT") {
-        let path = std::path::PathBuf::from(&p);
-        return if path.is_dir() {
-            clip::load(&m::gen_core::WeightsSource::Dir(path), &dev)
-                .expect("load DFN5B-CLIP from DFN_CLIP_SNAPSHOT dir")
-        } else {
-            clip::load_from_pth(&path, &dev).expect("load DFN5B-CLIP from DFN_CLIP_SNAPSHOT file")
-        };
+    // Required env path — inference never self-fetches or derives a cache location (epic 13657).
+    let p = std::env::var("DFN_CLIP_SNAPSHOT")
+        .expect("set DFN_CLIP_SNAPSHOT to an open_clip_pytorch_model.bin file or its snapshot dir");
+    let path = std::path::PathBuf::from(&p);
+    if path.is_dir() {
+        clip::load(&m::gen_core::WeightsSource::Dir(path), &dev)
+            .expect("load DFN5B-CLIP from DFN_CLIP_SNAPSHOT dir")
+    } else {
+        clip::load_from_pth(&path, &dev).expect("load DFN5B-CLIP from DFN_CLIP_SNAPSHOT file")
     }
-    let src = clip::resolve_pinned_weights()
-        .expect("resolve the pinned open_clip_pytorch_model.bin (network or warm HF cache)");
-    clip::load(&src, &dev).expect("load the DFN5B-CLIP encoder")
 }
 
 /// A deterministic synthetic 384² RGB frame whose content depends on `seed`.

@@ -33,19 +33,17 @@ use candle_audio_mmaudio::mmdit;
 
 fn load_net() -> mmdit::MmAudioDit {
     let dev = Device::Cpu;
-    if let Ok(p) = std::env::var("MMAUDIO_DIT_SNAPSHOT") {
-        let path = std::path::PathBuf::from(&p);
-        return if path.is_dir() {
-            mmdit::load(&m::gen_core::WeightsSource::Dir(path), &dev)
-                .expect("load mmaudio small_16k from MMAUDIO_DIT_SNAPSHOT dir")
-        } else {
-            mmdit::load_from_pth(&path, &dev)
-                .expect("load mmaudio small_16k from MMAUDIO_DIT_SNAPSHOT file")
-        };
+    // Required env path — inference never self-fetches or derives a cache location (epic 13657).
+    let p = std::env::var("MMAUDIO_DIT_SNAPSHOT")
+        .expect("set MMAUDIO_DIT_SNAPSHOT to a mmaudio_small_16k.pth file or its snapshot dir");
+    let path = std::path::PathBuf::from(&p);
+    if path.is_dir() {
+        mmdit::load(&m::gen_core::WeightsSource::Dir(path), &dev)
+            .expect("load mmaudio small_16k from MMAUDIO_DIT_SNAPSHOT dir")
+    } else {
+        mmdit::load_from_pth(&path, &dev)
+            .expect("load mmaudio small_16k from MMAUDIO_DIT_SNAPSHOT file")
     }
-    let src = mmdit::resolve_pinned_weights()
-        .expect("resolve the pinned mmaudio_small_16k.pth (network or warm HF cache)");
-    mmdit::load(&src, &dev).expect("load the MMAudio MM-DiT generator")
 }
 
 /// A deterministic pseudo-random tensor (a fixed LCG) of the given shape — no rng crate needed.

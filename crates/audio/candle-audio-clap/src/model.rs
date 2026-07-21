@@ -8,7 +8,6 @@ use std::sync::Mutex;
 use candle_audio::candle_core::{DType, Device, Tensor};
 use candle_audio::gen_core::runtime::{LoadSpec, WeightsSource};
 use candle_audio::gen_core::{self, AudioEmbedder, AudioEmbedderDescriptor};
-use candle_audio::hub::hf_get_pinned;
 use candle_audio::{AudioError, Result as AudioResult};
 use candle_nn::{linear, Linear, Module, VarBuilder};
 use tokenizers::Tokenizer;
@@ -256,15 +255,4 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn AudioEmbedder>> {
 
 candle_audio::gen_core::register_audio_embedder! {
     pub const REGISTRATION = descriptor => load
-}
-
-/// Resolve the pinned-SHA CLAP snapshot over the HF cache/network, returning its directory.
-pub fn resolve_pinned_snapshot() -> AudioResult<WeightsSource> {
-    let cfg = hf_get_pinned(HUB_REPO, HUB_REVISION, CONFIG_FILE)?;
-    hf_get_pinned(HUB_REPO, HUB_REVISION, TOKENIZER_FILE)?;
-    hf_get_pinned(HUB_REPO, HUB_REVISION, WEIGHTS_FILE)?;
-    let dir = cfg
-        .parent()
-        .ok_or_else(|| AudioError::Msg("pinned snapshot has no parent dir".into()))?;
-    Ok(WeightsSource::Dir(dir.to_path_buf()))
 }

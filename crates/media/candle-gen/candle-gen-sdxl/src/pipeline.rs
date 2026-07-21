@@ -169,7 +169,7 @@ pub(crate) const VAE_FIX_FILE: &str = "diffusion_pytorch_model.safetensors";
 
 /// The SDXL lane's three **passed-in** model components (epic 13657, sc-13658 contract): the two
 /// model-agnostic CLIP tokenizers and the fp16-stable VAE. Inference NEVER self-fetches these — before
-/// sc-13663 they were downloaded on the render path from three pinned `hf-hub` repos
+/// sc-13663 they were downloaded on the render path from three pinned upstream repos
 /// (`openai/clip-vit-large-patch14`, `laion/CLIP-ViT-bigG-14-laion2B-39B-b160k`,
 /// `madebyollin/sdxl-vae-fp16-fix`); now the consumer stages each as a local
 /// [`LoadSpec::components`](gen_core::LoadSpec::components) entry (or, for the bespoke edit/IP/InstantID
@@ -190,7 +190,7 @@ pub(crate) const REQUIRED_COMPONENTS: &[&str] = &[
 
 /// The caller-staged sources for the three SDXL components, resolved + validated once at load and
 /// threaded to every consumption site (the txt2img tokenizers/VAE, and — for the LoadSpec-driven
-/// generator + trainer — the whole render/train path) in place of the deleted `hf_get`. Each is the
+/// generator + trainer — the whole render/train path) in place of the deleted render-path self-fetch. Each is the
 /// raw [`WeightsSource`] the caller staged; the concrete weight file is resolved at the point of use
 /// via [`resolve_tokenizer_file`] / [`resolve_vae_file`] (so a `Dir` or a direct `File` both work).
 #[derive(Clone, Debug)]
@@ -331,7 +331,7 @@ pub(crate) struct SdxlTokenizers {
 impl SdxlTokenizers {
     /// Load both CLIP tokenizers from the caller-staged [`WeightsSource`] components (epic 13657,
     /// sc-13663) — the `tokenizer_clip_l` / `tokenizer_clip_bigg` ids resolved by the load gate. No
-    /// `hf-hub` self-fetch: the paths are provisioned by the consumer and resolved via
+    /// render-path self-fetch: the paths are provisioned by the consumer and resolved via
     /// [`resolve_tokenizer_file`]. Call once per generator.
     pub(crate) fn load(tok_l: &WeightsSource, tok_g: &WeightsSource) -> Result<Self> {
         let tok_l_file = resolve_tokenizer_file(tok_l);
@@ -370,7 +370,7 @@ pub(crate) struct Pipeline {
     /// [`Components`] so the PiD engine loads once alongside the UNet/VAE. `None` ⇒ native VAE decode.
     pid_spec: Option<PidWeights>,
     /// The caller-staged `vae_fp16_fix` component (epic 13657, sc-13663) — the fp16-stable VAE weight
-    /// source, resolved in [`load_components`](Self::load_components) in place of the deleted `hf_get`.
+    /// source, resolved in [`load_components`](Self::load_components) in place of the deleted render-path self-fetch.
     vae_fix: WeightsSource,
 }
 

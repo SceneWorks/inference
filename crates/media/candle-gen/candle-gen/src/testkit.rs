@@ -1,19 +1,20 @@
 //! Shared test-support helpers (sc-9055 / F-069) — the single home for the PPM read/write, cosine,
-//! env-path, GPU peak-VRAM, and HF-Hub-cache resolution helpers that had been hand-copied into ~16
-//! `#[cfg(test)]` validation modules across the provider crates.
+//! env-path, and GPU peak-VRAM helpers that had been hand-copied into ~16 `#[cfg(test)]` validation
+//! modules across the provider crates.
 //!
 //! Why one home: the copies had already **drifted** — two PPM header tokenizers (one comment-tolerant,
-//! one not), an f32- vs f64-accumulating cosine, and (F-071 / sc-9057) HF-cache resolvers that variously
-//! did or did not honour `$HF_HOME`. A comment-bearing PPM passed some harnesses and failed others, and a
-//! methodology fix had to be mirrored by hand. Concentrating them here makes the behaviour canonical.
+//! one not) and an f32- vs f64-accumulating cosine. A comment-bearing PPM passed some harnesses and
+//! failed others, and a methodology fix had to be mirrored by hand. Concentrating them here makes the
+//! behaviour canonical.
+//!
+//! Weight snapshots are **not** resolved here: inference never self-fetches or derives an HF-cache
+//! location (epic 13657); real-weight tests take explicit passed-in env paths.
 //!
 //! Behaviour is preserved for every caller:
 //! * [`read_ppm`] is the **comment-tolerant** tokenizer (a strict superset — the non-tolerant callers only
 //!   ever read comment-free `P6` files written by [`write_ppm`], for which the two agree byte-for-byte).
 //! * [`cosine`] is the full normalized cosine (`0.0` when either input is the zero vector); [`cosine_dot`]
 //!   is the bare dot product for callers whose inputs are already L2-normalized (SDXL/Kolors/FLUX IP).
-//! * [`hf_snapshot_dir`] resolves the HF Hub cache in the canonical order `$HF_HUB_CACHE` → `$HF_HOME/hub`
-//!   → `<home>/.cache/huggingface/hub` (`USERPROFILE` on Windows, then `HOME`), matching the sc-9057 fix.
 //!
 //! Gated behind the crate `testkit` feature so this test-only surface (and its `std::process` /
 //! `nvidia-smi` dependency) never compiles into a production build. Provider crates enable it as a
@@ -241,65 +242,6 @@ mod quant_fixture_tests {
     fn q4_packed_with_rejects_codes_above_four_bits() {
         let _ = q4_packed_with(1, 8, 8, |_| 0x10, |_| 1.0, |_| 0.0);
     }
-}
-
-// ---------------------------------------------------------------------------------------------------
-// HF Hub cache resolution (F-071 / sc-9057 — honour $HF_HOME, not just the Unix ~/.cache default)
-// ---------------------------------------------------------------------------------------------------
-
-/// The candidate HF Hub cache roots, in resolution order: `$HF_HUB_CACHE`, then `$HF_HOME/hub`, then the
-/// user-home `.cache/huggingface/hub` default (`USERPROFILE` on Windows, then `HOME`).
-///
-/// The Windows-primary dev box keeps the cache at `D:\.cache\huggingface` via `HF_HOME`, where `HOME` is
-/// usually unset — resolvers that only consulted `$HOME/.cache/huggingface` silently missed it (F-071).
-pub fn hf_cache_roots() -> Vec<PathBuf> {
-    let mut roots: Vec<PathBuf> = Vec::new();
-    if let Ok(c) = std::env::var("HF_HUB_CACHE") {
-        roots.push(PathBuf::from(c));
-    }
-    if let Ok(h) = std::env::var("HF_HOME") {
-        roots.push(PathBuf::from(h).join("hub"));
-    }
-    for home_var in ["USERPROFILE", "HOME"] {
-        if let Ok(home) = std::env::var(home_var) {
-            roots.push(PathBuf::from(home).join(".cache/huggingface/hub"));
-        }
-    }
-    roots
-}
-
-/// Resolve the first existing `snapshots/<rev>/` directory for an HF repo under the [`hf_cache_roots`],
-/// or `None` if the repo isn't cached anywhere. `repo` is the `owner/name` form (e.g.
-/// `"openai/clip-vit-large-patch14"`) — it is normalized to the `models--owner--name` cache dir.
-pub fn hf_snapshot_dir(repo: &str) -> Option<PathBuf> {
-    let repo_dir = format!("models--{}", repo.replace('/', "--"));
-    for snapshots in hf_cache_roots()
-        .into_iter()
-        .map(|r| r.join(&repo_dir).join("snapshots"))
-    {
-        let Ok(revs) = std::fs::read_dir(&snapshots) else {
-            continue;
-        };
-        if let Some(dir) = revs
-            .filter_map(std::result::Result::ok)
-            .map(|e| e.path())
-            .find(|p| p.is_dir())
-        {
-            return dir.into();
-        }
-    }
-    None
-}
-
-/// [`hf_snapshot_dir`] that panics with an actionable message if the repo isn't cached — for tests that
-/// require the weights present.
-pub fn require_hf_snapshot_dir(repo: &str) -> PathBuf {
-    hf_snapshot_dir(repo).unwrap_or_else(|| {
-        panic!(
-            "{repo} snapshot not cached under any HF cache root \
-             (HF_HUB_CACHE / HF_HOME/hub / <home>/.cache/huggingface/hub)"
-        )
-    })
 }
 
 // ---------------------------------------------------------------------------------------------------

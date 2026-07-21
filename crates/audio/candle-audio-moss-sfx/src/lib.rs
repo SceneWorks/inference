@@ -29,9 +29,9 @@
 //!   passthrough; a diffusers-style snapshot has no top-level config/tokenizer for the LLM
 //!   preparer to probe).
 //!
-//! Weights resolve through the audio lane's pinned-SHA hub path
-//! ([`model::resolve_pinned_snapshot`], F-029): `OpenMOSS-Team/MOSS-SoundEffect-v2.0` at an
-//! immutable commit, never a mutable ref.
+//! Weights are supplied as an explicit passed-in snapshot on the `gen_core::LoadSpec`:
+//! `OpenMOSS-Team/MOSS-SoundEffect-v2.0`, staged locally and never self-fetched (epic 13657). The
+//! `HUB_REPO`@`HUB_REVISION` pin is retained as the provenance record of that checkpoint.
 
 pub use candle_audio;
 pub use candle_audio::gen_core;
@@ -47,8 +47,8 @@ pub mod text;
 pub mod vae;
 
 pub use model::{
-    descriptor, load, resolve_pinned_snapshot, HUB_REPO, HUB_REVISION, LANGUAGES,
-    MAX_DURATION_SECS, MODEL_ID, REGISTRATION, SAMPLE_RATE,
+    descriptor, load, HUB_REPO, HUB_REVISION, LANGUAGES, MAX_DURATION_SECS, MODEL_ID, REGISTRATION,
+    SAMPLE_RATE,
 };
 pub use pipeline::MossSfxPipeline;
 

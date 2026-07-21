@@ -109,13 +109,14 @@ fn sana_selection_index_matches_reference() {
     assert_eq!(sel, expect, "selection index must match the SANA reference");
 }
 
-/// Resolve the gemma-2-2b-it snapshot dir: explicit `PID_GEMMA_DIR`, else the un-gated
-/// `SceneWorks/gemma-2-2b-it` HF-cache mirror.
+/// Resolve the gemma-2-2b-it snapshot dir from the required `PID_GEMMA_DIR` env (a passed-in
+/// `SceneWorks/gemma-2-2b-it` snapshot dir). Inference never self-fetches or derives a cache
+/// location (epic 13657).
 fn gemma_snapshot() -> std::path::PathBuf {
-    if let Ok(dir) = std::env::var("PID_GEMMA_DIR") {
-        return std::path::PathBuf::from(dir);
-    }
-    candle_gen::testkit::require_hf_snapshot_dir("SceneWorks/gemma-2-2b-it")
+    std::path::PathBuf::from(
+        std::env::var("PID_GEMMA_DIR")
+            .expect("set PID_GEMMA_DIR to a SceneWorks/gemma-2-2b-it snapshot dir"),
+    )
 }
 
 #[test]

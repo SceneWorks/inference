@@ -2,7 +2,7 @@
 name = "candle-audio"
 version = "0.0.0"
 edition = "2021"
-description = "Shared candle audio commons for SceneWorks audio-generation providers — device seam, pinned hf-hub weight resolution, STFT/mel/iSTFT DSP, and WAV encoding over the gen-core audio contract."
+description = "Shared candle audio commons for SceneWorks audio-generation providers — device seam, STFT/mel/iSTFT DSP, and WAV encoding over the gen-core audio contract. Weights are passed in explicitly via LoadSpec; the lane never self-fetches (epic 13657)."
 license = "Apache-2.0"
 repository = "https://github.com/SceneWorks/inference"
 keywords = ["candle", "audio", "tts", "inference"]
@@ -20,11 +20,7 @@ sceneworks-gen-core = { workspace = true }
 candle-core = { workspace = true }
 # Error plumbing for the engine surface (mirrors candle-gen's CandleError seam).
 thiserror = { workspace = true }
-# Pinned-revision runtime weight fetch (F-029 discipline — see `hub`). Same workspace pin the
-# candle-gen-sdxl tokenizer fetch uses.
-hf-hub = { workspace = true }
 # Repeatability hash over generated PCM bytes for the validation harness (`harness`, sc-12854).
-# Already resolved in the workspace graph (hf-hub's rustls stack) — no new crate.
 sha2 = { workspace = true }
 
 # Peak-RSS process metric for the validation harness (`harness`, sc-12854):
@@ -36,9 +32,13 @@ libc = { workspace = true }
 # Default works with NO extra features: candle-core defaults to the CPU backend (builds anywhere),
 # and the walking-skeleton audio models synthesize in real time on CPU (audio-backend-strategy.md).
 default = []
-# Test-support helpers (HF-cache snapshot resolution, mirroring candle-gen's testkit / the sc-9057
-# F-071 `$HF_HOME` fix). Test-only — provider crates enable it under `[dev-dependencies]` so it
-# never compiles into a production build.
+# Test-support seam for the candle audio provider crates — provider crates enable it under
+# `[dev-dependencies]` (mirroring candle-gen's testkit) so it never compiles into a production
+# build. CI compiles it explicitly via `--features candle-audio/testkit` (ci.yml) so the module
+# is exercised even while no in-tree target dev-depends on it yet (the sc-11990 cfg-hole guard).
+# The HF-cache snapshot scanners this feature once carried were removed under epic 13657 (inference
+# never self-fetches or derives an HF-cache location); the seam is retained for future shared,
+# cache-free audio test helpers.
 testkit = []
 # Apple Metal GPU backend — a per-model implementation option on runtime-macos (the audio lane
 # ships Candle-CPU there today; see audio-backend-strategy.md). NOT in `default`.

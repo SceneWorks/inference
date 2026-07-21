@@ -1052,10 +1052,11 @@ mod tests {
     /// sc-4986 — retire the "does a lightx2v Lightning LoRA actually load through mlx-gen?" risk by
     /// running the **real** distill-LoRA file's keys through the genuine [`normalize_wan_key`] and
     /// asserting every module resolves to a valid Wan DiT target (`blocks.N.{self,cross}_attn.{q,k,v,o}`
-    /// or `blocks.N.ffn.{fc1,fc2}`). `#[ignore]` — needs the downloaded LoRA:
+    /// or `blocks.N.ffn.{fc1,fc2}`). `#[ignore]` — point `WAN_LIGHTNING_LORA` at a staged lightx2v
+    /// Wan2.2 Lightning LoRA `.safetensors` (an explicit passed-in path; inference never self-fetches,
+    /// epic 13657):
     /// ```text
-    /// WAN_LIGHTNING_LORA="$HOME/.cache/huggingface/hub/models--lightx2v--Wan2.2-Lightning/snapshots/\
-    /// 18bccf8884ec0a078eed79785eb4ef13ea16ce1e/Wan2.2-T2V-A14B-4steps-lora-rank64-Seko-V1.1/\
+    /// WAN_LIGHTNING_LORA="/snapshots/Wan2.2-Lightning/Wan2.2-T2V-A14B-4steps-lora-rank64-Seko-V1.1/\
     /// high_noise_model.safetensors" \
     ///   cargo test -p mlx-gen-wan lightning_lora_keys_normalize -- --ignored --nocapture
     /// ```

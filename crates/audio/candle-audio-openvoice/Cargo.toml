@@ -25,8 +25,6 @@ core-llm = { path = "../../contracts/core-llm" }
 serde_json = { workspace = true }
 
 [dev-dependencies]
-# HF-cache snapshot resolution for the `#[ignore]`d real-weight conformance test.
-candle-audio = { path = "../candle-audio", features = ["testkit"] }
 # Kokoro TTS supplies the distinct source + target reference voices the discriminative real-weight
 # test converts between (the sanctioned "Kokoro-generated reference audio" path — no external audio
 # fixtures). Chatterbox VE measures the timbre shift (speaker-embedding cosine). Whisper ASR

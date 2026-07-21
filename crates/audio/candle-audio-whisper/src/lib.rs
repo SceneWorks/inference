@@ -18,8 +18,8 @@
 //! - [`decode`] — the autoregressive decode policy (the `<|sot|>`+language+task+timestamp prompt,
 //!   greedy-or-temperature sampling honoring the request knobs, suppressed-token mask, cooperative
 //!   cancellation, and the timestamp-token → [`gen_core::TranscriptSegment`] parse),
-//! - [`model`] — the [`gen_core::Transcriber`] adapter registered under **`whisper_base`** plus its
-//!   pinned-SHA hub resolution ([`model::resolve_pinned_snapshot`], F-029),
+//! - [`model`] — the [`gen_core::Transcriber`] adapter registered under **`whisper_base`**; weights
+//!   are passed in on the `gen_core::LoadSpec` (staged locally, never self-fetched, epic 13657),
 //! - [`prepare`] — the audio-lane snapshot-preparation accommodation (a validated passthrough;
 //!   Whisper snapshots describe an ASR arch the LLM preparer should not own).
 //!
@@ -36,9 +36,7 @@ pub mod mel;
 pub mod model;
 pub mod prepare;
 
-pub use model::{
-    descriptor, load, resolve_pinned_snapshot, HUB_REPO, HUB_REVISION, MODEL_ID, REGISTRATION,
-};
+pub use model::{descriptor, load, HUB_REPO, HUB_REVISION, MODEL_ID, REGISTRATION};
 pub use model::{WEIGHT_LICENSE, WEIGHT_LICENSE_ENTRY};
 
 /// This crate's model-weight-license entries for catalog aggregation (sc-13332) — one row keyed by

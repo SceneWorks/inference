@@ -4,9 +4,8 @@
 //!
 //! ## What MMAudio actually consumes (verified against `features_utils.py`)
 //!
-//! MMAudio builds this model with
-//! `open_clip.create_model_from_pretrained('hf-hub:apple/DFN5B-CLIP-ViT-H-14-384')` and conditions on
-//! two features:
+//! MMAudio builds this model from the open_clip `apple/DFN5B-CLIP-ViT-H-14-384` checkpoint (upstream
+//! `create_model_from_pretrained`) and conditions on two features:
 //!
 //! - **Visual** ([`DfnClipEncoder::encode_image`]): the *standard* open_clip
 //!   `encode_image(x, normalize=True)` — RGB frames resized to **384×384**, normalized with the
@@ -754,7 +753,6 @@ pub fn frames_to_clip_input(frames: &[image::RgbImage], device: &Device) -> CRes
 use std::path::{Path, PathBuf};
 
 use candle_audio::gen_core::WeightsSource;
-use candle_audio::hub::hf_get_pinned;
 use candle_audio::{AudioError, Result};
 
 /// Stable identity of this encoder (weight-license key). Not a shipping provider id — this crate
@@ -765,7 +763,7 @@ pub const MODEL_ID: &str = "dfn5b_clip_vit_h14_384";
 pub const CLIP_HUB_REPO: &str = "apple/DFN5B-CLIP-ViT-H-14-384";
 pub const CLIP_HUB_REVISION: &str = "01b771ed0d1395ca5ffdd279897d665ebe00dfd2";
 /// The open_clip-format state dict (fused `in_proj`, `visual.*`/root text tower) MMAudio loads via
-/// `create_model_from_pretrained('hf-hub:...')`. (The repo also ships an HF-`CLIPModel` `pytorch_model.bin`;
+/// `create_model_from_pretrained`. (The repo also ships an HF-`CLIPModel` `pytorch_model.bin`;
 /// we deliberately load the open_clip one to match what MMAudio uses.)
 pub const CLIP_WEIGHTS_PATH: &str = "open_clip_pytorch_model.bin";
 
@@ -806,20 +804,11 @@ pub const WEIGHT_LICENSE_ENTRY: candle_audio::gen_core::WeightLicenseEntry =
         license: WEIGHT_LICENSE,
     };
 
-/// Resolve the pinned `open_clip_pytorch_model.bin` through the audio lane's F-029 hub path.
-pub fn resolve_pinned_weights() -> Result<WeightsSource> {
-    Ok(WeightsSource::File(hf_get_pinned(
-        CLIP_HUB_REPO,
-        CLIP_HUB_REVISION,
-        CLIP_WEIGHTS_PATH,
-    )?))
-}
-
 /// Load the encoder from an `open_clip_pytorch_model.bin` file path.
 pub fn load_from_pth(weights: &Path, device: &Device) -> Result<DfnClipEncoder> {
     if !weights.exists() {
         return Err(AudioError::Msg(format!(
-            "{MODEL_ID}: weights file {} not found (resolve_pinned_weights materializes {CLIP_WEIGHTS_PATH})",
+            "{MODEL_ID}: weights file {} not found (pass {CLIP_WEIGHTS_PATH} in via the LoadSpec)",
             weights.display()
         )));
     }

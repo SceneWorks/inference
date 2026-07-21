@@ -714,10 +714,10 @@ mod tests {
         );
     }
 
-    /// Locate the cached `Qwen/Qwen3-VL-8B-Instruct` snapshot (rev 0c351dd0) for the real
-    /// chat-template oracle. `MLX_LLM_QWEN3VL_MODEL` / `QWEN3VL_SNAPSHOT` override; otherwise the
-    /// default HF cache path. `None` ⇒ the gated test self-skips cleanly (the snapshot is present in
-    /// CI for sc-8077).
+    /// Locate a staged `Qwen/Qwen3-VL-8B-Instruct` snapshot for the real chat-template oracle from an
+    /// explicit passed-in env path (`MLX_LLM_QWEN3VL_MODEL` / `QWEN3VL_SNAPSHOT`). Inference never
+    /// self-fetches or derives a cache location (epic 13657). `None` ⇒ the gated test self-skips
+    /// cleanly (CI sets the var for sc-8077).
     #[cfg(test)]
     fn qwen3vl_snapshot_dir() -> Option<std::path::PathBuf> {
         for var in ["MLX_LLM_QWEN3VL_MODEL", "QWEN3VL_SNAPSHOT"] {
@@ -728,11 +728,7 @@ mod tests {
                 }
             }
         }
-        let home = std::env::var("HOME").ok()?;
-        let path = std::path::PathBuf::from(home).join(
-            ".cache/huggingface/hub/models--Qwen--Qwen3-VL-8B-Instruct/snapshots/0c351dd01ed87e9c1b53cbc748cba10e6187ff3b",
-        );
-        path.exists().then_some(path)
+        None
     }
 
     #[test]

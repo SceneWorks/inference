@@ -13,8 +13,8 @@
 //!   voices/<voice>.pt    → per-voice style-vector packs (resolved lazily per request)
 //! ```
 //!
-//! [`resolve_pinned_snapshot`] materializes exactly that layout through the audio lane's
-//! pinned-SHA hub path (`candle_audio::hub`, F-029 — never the mutable `main` revision).
+//! A `LoadSpec` points at exactly that layout: the snapshot is staged locally and passed in, never
+//! self-fetched (epic 13657). The `HUB_REPO`@`HUB_REVISION` pin records its provenance.
 //!
 //! ## Request mapping
 //!
@@ -35,7 +35,6 @@ use candle_audio::gen_core::{
     self, AudioTrack, Capabilities, GenerationOutput, GenerationRequest, Generator, LoadSpec,
     Modality, ModelDescriptor, Progress, WeightsSource,
 };
-use candle_audio::hub::{hf_get_pinned, pinned_snapshot_dir};
 use candle_audio::{AudioError, Result as AudioResult};
 
 use crate::decoder::SAMPLE_RATE;
@@ -209,8 +208,8 @@ impl KokoroGenerator {
         let path = self.root.join("voices").join(format!("{voice}.pt"));
         if !path.is_file() {
             return Err(gen_core::Error::Msg(format!(
-                "{MODEL_ID}: voice pack {} missing from the snapshot (resolve_pinned_snapshot \
-                 materializes every advertised voice)",
+                "{MODEL_ID}: voice pack {} missing from the snapshot (the passed-in snapshot must \
+                 contain every advertised voice)",
                 path.display()
             )));
         }
@@ -382,19 +381,6 @@ impl Generator for KokoroGenerator {
 // Explicit catalog registration for `kokoro_82m` (composed by `candle-audio-catalog`).
 candle_audio::register_generators! {
     pub const REGISTRATION = descriptor => load
-}
-
-/// Materialize the pinned Kokoro snapshot through the audio lane's F-029 hub path:
-/// `config.json` (the snapshot-dir probe), the checkpoint, and every advertised voice pack —
-/// all at [`HUB_REVISION`], landing in the ordinary HF cache. Returns the snapshot dir as a
-/// [`WeightsSource::Dir`] ready for a [`LoadSpec`].
-pub fn resolve_pinned_snapshot() -> AudioResult<WeightsSource> {
-    let dir = pinned_snapshot_dir(HUB_REPO, HUB_REVISION, "config.json")?;
-    hf_get_pinned(HUB_REPO, HUB_REVISION, crate::pipeline::CHECKPOINT_FILE)?;
-    for voice in VOICES {
-        hf_get_pinned(HUB_REPO, HUB_REVISION, &format!("voices/{voice}.pt"))?;
-    }
-    Ok(dir)
 }
 
 /// Rough upper bound on synthesized seconds for a token count (`max_dur` frames per token) —

@@ -24,10 +24,10 @@
 //!   STFT, Slaney mel), self-contained host `f32` DSP,
 //! - [`encoder`] — the candle LSTM + projection speaker encoder over `ve.safetensors`,
 //! - [`model`] — the [`gen_core::VoiceEmbedder`] adapter registered under **`chatterbox_ve`**, its
-//!   `descriptor`/`load` entry points, and the F-029 pinned-SHA hub resolution
-//!   ([`model::resolve_pinned_file`]).
+//!   `descriptor`/`load` entry points; weights are passed in on the `gen_core::LoadSpec` (staged
+//!   locally, never self-fetched, epic 13657).
 //!
-//! Weights resolve through the audio lane's pinned-SHA hub path (F-029): `ResembleAI/chatterbox`
+//! Weights are supplied as an explicit passed-in file: `ResembleAI/chatterbox` `ve.safetensors`
 //! at an immutable commit, never a mutable ref. The single 5.7 MB `ve.safetensors` file needs no
 //! bespoke snapshot preparer (unlike Kokoro's pickle / MOSS's diffusers layouts): it is loaded
 //! directly as a `WeightsSource::File`.
@@ -42,8 +42,8 @@ pub mod model;
 
 pub use encoder::{cosine_similarity, l2_normalize};
 pub use model::{
-    descriptor, load, resolve_pinned_file, ChatterboxVoiceEmbedder, HUB_REPO, HUB_REVISION,
-    MODEL_ID, REGISTRATION, WEIGHTS_FILE,
+    descriptor, load, ChatterboxVoiceEmbedder, HUB_REPO, HUB_REVISION, MODEL_ID, REGISTRATION,
+    WEIGHTS_FILE,
 };
 pub use model::{WEIGHT_LICENSE, WEIGHT_LICENSE_ENTRY};
 

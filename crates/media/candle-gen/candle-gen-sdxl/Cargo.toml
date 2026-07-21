@@ -28,8 +28,8 @@ candle-nn = { workspace = true }
 # upstream so the copy can be re-diffed on a candle re-pin). Already in the tree via candle-transformers.
 tracing = "0.1"
 # CLIP tokenizers. The tokenizer/VAE artifacts themselves are passed-in `LoadSpec::components`
-# (epic 13657 / sc-13663) — resolved+staged by the consumer, never self-fetched — so this crate no
-# longer depends on `hf-hub` (the deleted `hf_get`/`HUB_PINS` render-path download seam).
+# (epic 13657 / sc-13663) — resolved+staged by the consumer, never self-fetched — so this crate takes
+# no runtime weight-download dependency.
 tokenizers = { workspace = true }
 # Deterministic CPU-seeded initial noise (sc-3673).
 rand = { workspace = true }

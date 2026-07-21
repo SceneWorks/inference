@@ -27,22 +27,22 @@ use candle_audio_whisper::gen_core::{
 /// The known script the round-trip drives through Kokoro → Whisper.
 const KNOWN_TEXT: &str = "the quick brown fox jumps over the lazy dog";
 
-/// Resolve the Whisper snapshot: `WHISPER_SNAPSHOT` env (a snapshot dir) or the pinned hub path.
+/// Resolve the Whisper snapshot from the required `WHISPER_SNAPSHOT` env (a passed-in
+/// `openai/whisper-base` snapshot dir). Inference never self-fetches or derives a cache location
+/// (epic 13657).
 fn whisper_snapshot() -> WeightsSource {
-    match std::env::var("WHISPER_SNAPSHOT") {
-        Ok(dir) => WeightsSource::Dir(PathBuf::from(dir)),
-        Err(_) => candle_audio_whisper::resolve_pinned_snapshot()
-            .expect("resolve the pinned openai/whisper-base snapshot (network or warm HF cache)"),
-    }
+    WeightsSource::Dir(PathBuf::from(std::env::var("WHISPER_SNAPSHOT").expect(
+        "set WHISPER_SNAPSHOT to an openai/whisper-base snapshot dir (config.json + tokenizer.json + model.safetensors)",
+    )))
 }
 
-/// Resolve the Kokoro snapshot: `KOKORO_SNAPSHOT` env (a snapshot dir) or the pinned hub path.
+/// Resolve the Kokoro snapshot from the required `KOKORO_SNAPSHOT` env (a passed-in
+/// `hexgrad/Kokoro-82M` snapshot dir).
 fn kokoro_snapshot() -> WeightsSource {
-    match std::env::var("KOKORO_SNAPSHOT") {
-        Ok(dir) => WeightsSource::Dir(PathBuf::from(dir)),
-        Err(_) => candle_audio_kokoro::resolve_pinned_snapshot()
-            .expect("resolve the pinned hexgrad/Kokoro-82M snapshot (network or warm HF cache)"),
-    }
+    WeightsSource::Dir(PathBuf::from(
+        std::env::var("KOKORO_SNAPSHOT")
+            .expect("set KOKORO_SNAPSHOT to a hexgrad/Kokoro-82M snapshot dir"),
+    ))
 }
 
 /// Synthesize `text` to an AudioTrack with the merged Kokoro provider (`kokoro_82m`).

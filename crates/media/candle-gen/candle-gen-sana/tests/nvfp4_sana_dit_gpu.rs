@@ -29,7 +29,8 @@
 //! 0` on real `sm_120`) is asserted here in gates 1–3.
 //!
 //! Weights: the whole `Efficient-Large-Model/Sana_1600M_1024px_diffusers` HF snapshot (transformer +
-//! text_encoder + tokenizer + vae). Resolved from `SC11045_SANA_SNAPSHOT`, else the HF cache.
+//! text_encoder + tokenizer + vae). Passed in via `SC11045_SANA_SNAPSHOT` — inference never
+//! self-fetches or derives a cache location (epic 13657); unset ⇒ the test SKIPs.
 //!
 //! Run (exclusive GPU, `--release`; `-j 1` avoids lld OOM):
 //! ```text
@@ -57,6 +58,10 @@ use candle_gen_sana::{
 };
 
 /// The HF repo the validation runs against.
+// retained as provenance; TODO(sc-13685/epic-13678) — the HF-cache snapshot fallback that read this
+// pin was removed under epic 13657 (inference never self-fetches; the snapshot is passed in via
+// SC11045_SANA_SNAPSHOT), leaving the pin as the provenance record of the parity target.
+#[allow(dead_code)]
 const SANA_REPO: &str = "Efficient-Large-Model/Sana_1600M_1024px_diffusers";
 /// A concrete, detail-rich prompt — a degenerate/empty prompt would not exercise the caption path the
 /// outlier class lives on.
@@ -70,24 +75,19 @@ const STEPS: usize = 20;
 /// 1024px → a 32×32 DC-AE latent → 1024 DiT tokens (the real serving shape).
 const EDGE: u32 = 1024;
 
-/// The Sana snapshot root: `SC11045_SANA_SNAPSHOT`, else the HF cache. `None` → the test SKIPs.
+/// The Sana snapshot root from the `SC11045_SANA_SNAPSHOT` env (a passed-in snapshot dir). Unset or
+/// non-dir → the test SKIPs. Inference never self-fetches or derives a cache location (epic 13657).
 fn snapshot_root() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("SC11045_SANA_SNAPSHOT") {
-        let p = PathBuf::from(p);
-        if p.is_dir() {
-            return Some(p);
-        }
-        eprintln!("[sc-11045] SC11045_SANA_SNAPSHOT={p:?} is not a directory; skipping");
+    let Ok(p) = std::env::var("SC11045_SANA_SNAPSHOT") else {
+        eprintln!("[sc-11045] SC11045_SANA_SNAPSHOT unset; skipping");
         return None;
-    }
-    match candle_gen::testkit::hf_snapshot_dir(SANA_REPO) {
-        Some(p) => Some(p),
-        None => {
-            eprintln!(
-                "[sc-11045] {SANA_REPO} not in the HF cache and SC11045_SANA_SNAPSHOT unset; skipping"
-            );
-            None
-        }
+    };
+    let p = PathBuf::from(p);
+    if p.is_dir() {
+        Some(p)
+    } else {
+        eprintln!("[sc-11045] SC11045_SANA_SNAPSHOT={p:?} is not a directory; skipping");
+        None
     }
 }
 

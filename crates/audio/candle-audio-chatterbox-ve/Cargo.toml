@@ -19,8 +19,6 @@ candle-audio = { path = "../candle-audio" }
 candle-nn = { workspace = true }
 
 [dev-dependencies]
-# HF-cache snapshot resolution for the `#[ignore]`d real-weight conformance test.
-candle-audio = { path = "../candle-audio", features = ["testkit"] }
 # Kokoro TTS supplies the distinct reference voices the discriminative real-weight test embeds
 # (the sanctioned "Kokoro-generated reference audio" path — no external audio fixtures). Dev-only.
 candle-audio-kokoro = { path = "../candle-audio-kokoro" }

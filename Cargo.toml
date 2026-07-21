@@ -61,11 +61,9 @@ serde_json = "1"
 safetensors = "0.4"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
-hf-hub = { version = "0.4", default-features = false, features = ["ureq", "rustls-tls"] }
 rand = "0.9"
 rand_distr = "0.5"
-# Audio validation harness (sc-12854): repeatability hash over PCM bytes. Already in the
-# resolved graph transitively (hf-hub's rustls stack), so this adds no new crate.
+# Audio validation harness (sc-12854): repeatability hash over PCM bytes.
 sha2 = "0.10"
 # Audio validation harness (sc-12854): `getrusage(RUSAGE_SELF)` peak-RSS on macOS/Linux.
 # Already in the resolved graph transitively.

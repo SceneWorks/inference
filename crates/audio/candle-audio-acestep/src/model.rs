@@ -35,7 +35,6 @@ use candle_audio::gen_core::{
     self, AudioEditMode, AudioTrack, Capabilities, ConditioningKind, GenerationOutput,
     GenerationRequest, Generator, LoadSpec, Modality, ModelDescriptor, Progress, WeightsSource,
 };
-use candle_audio::hub::{hf_get_pinned, pinned_snapshot_dir};
 use candle_audio::{AudioError, Result as AudioResult};
 
 use crate::pipeline::{
@@ -533,34 +532,6 @@ candle_audio::register_generators! {
     pub const REGISTRATION = descriptor => load
 }
 
-/// Materialize the pinned ACE-Step snapshot through the audio lane's F-029 hub path: the
-/// component configs, the sharded DiT safetensors (enumerated from its index), the
-/// condition-encoder / text-encoder / VAE weights, the tokenizer, and the silence latent — all at
-/// [`HUB_REVISION`]. Returns the snapshot dir as a [`WeightsSource::Dir`] ready for a [`LoadSpec`].
-pub fn resolve_pinned_snapshot() -> AudioResult<WeightsSource> {
-    let dir = pinned_snapshot_dir(HUB_REPO, HUB_REVISION, "model_index.json")?;
-    for file in [
-        "scheduler/scheduler_config.json",
-        "transformer/config.json",
-        "condition_encoder/config.json",
-        "condition_encoder/diffusion_pytorch_model.safetensors",
-        "text_encoder/config.json",
-        "text_encoder/model.safetensors",
-        "tokenizer/tokenizer.json",
-        "vae/config.json",
-        "vae/diffusion_pytorch_model.safetensors",
-        "silence_latent.pt",
-    ] {
-        hf_get_pinned(HUB_REPO, HUB_REVISION, file)?;
-    }
-    // DiT shards, enumerated from the index so a re-sharded upstream layout cannot silently skip a
-    // file.
-    for shard in dit_shards(HUB_REPO, HUB_REVISION)? {
-        hf_get_pinned(HUB_REPO, HUB_REVISION, &format!("transformer/{shard}"))?;
-    }
-    Ok(dir)
-}
-
 /// Relative paths of the Cover FSQ component files inside the sft snapshot.
 const COVER_TOKENIZER_CONFIG: &str = "audio_tokenizer/config.json";
 const COVER_TOKENIZER_WEIGHTS: &str = "audio_tokenizer/diffusion_pytorch_model.safetensors";
@@ -568,25 +539,33 @@ const COVER_DETOKENIZER_CONFIG: &str = "audio_token_detokenizer/config.json";
 const COVER_DETOKENIZER_WEIGHTS: &str =
     "audio_token_detokenizer/diffusion_pytorch_model.safetensors";
 
-/// Resolve the pinned Cover FSQ modules (sc-13251) — the sft `audio_tokenizer` +
-/// `audio_token_detokenizer` component files — through the F-029 hub path, returning
-/// `(tok_weights, tok_config, det_weights, det_config)`. Set `ACESTEP_SFT_SNAPSHOT` to a local sft
-/// snapshot dir to bypass the download (used by the real-weights cover test).
+/// Resolve the Cover FSQ modules (sc-13251) — the sft `audio_tokenizer` +
+/// `audio_token_detokenizer` component files — from the **required** `ACESTEP_SFT_SNAPSHOT` local
+/// snapshot dir, returning `(tok_weights, tok_config, det_weights, det_config)`. Inference never
+/// self-fetches or derives an HF-cache location (epic 13657): the Cover restyle needs the sft
+/// checkpoint staged locally and pointed at by `ACESTEP_SFT_SNAPSHOT`.
 pub fn resolve_cover_modules() -> AudioResult<(PathBuf, PathBuf, PathBuf, PathBuf)> {
-    if let Ok(dir) = std::env::var("ACESTEP_SFT_SNAPSHOT") {
-        let d = PathBuf::from(dir);
-        return Ok((
-            d.join(COVER_TOKENIZER_WEIGHTS),
-            d.join(COVER_TOKENIZER_CONFIG),
-            d.join(COVER_DETOKENIZER_WEIGHTS),
-            d.join(COVER_DETOKENIZER_CONFIG),
-        ));
-    }
-    let tok_config = hf_get_pinned(SFT_HUB_REPO, SFT_HUB_REVISION, COVER_TOKENIZER_CONFIG)?;
-    let tok_weights = hf_get_pinned(SFT_HUB_REPO, SFT_HUB_REVISION, COVER_TOKENIZER_WEIGHTS)?;
-    let det_config = hf_get_pinned(SFT_HUB_REPO, SFT_HUB_REVISION, COVER_DETOKENIZER_CONFIG)?;
-    let det_weights = hf_get_pinned(SFT_HUB_REPO, SFT_HUB_REVISION, COVER_DETOKENIZER_WEIGHTS)?;
-    Ok((tok_weights, tok_config, det_weights, det_config))
+    let d = PathBuf::from(sft_snapshot_dir()?);
+    Ok((
+        d.join(COVER_TOKENIZER_WEIGHTS),
+        d.join(COVER_TOKENIZER_CONFIG),
+        d.join(COVER_DETOKENIZER_WEIGHTS),
+        d.join(COVER_DETOKENIZER_CONFIG),
+    ))
+}
+
+/// The **required** local sft snapshot dir for the Cover restyle (`ACESTEP_SFT_SNAPSHOT`). Inference
+/// never self-fetches (epic 13657); a Cover request without this staged errors here rather than
+/// downloading.
+fn sft_snapshot_dir() -> AudioResult<String> {
+    std::env::var("ACESTEP_SFT_SNAPSHOT").map_err(|_| {
+        AudioError::Msg(
+            "ACE-Step Cover needs the sft cover checkpoint staged locally — set ACESTEP_SFT_SNAPSHOT \
+             to an ACE-Step/acestep-v15-xl-sft-diffusers snapshot dir (audio_tokenizer/, \
+             audio_token_detokenizer/, transformer/); inference does not self-fetch it"
+                .to_string(),
+        )
+    })
 }
 
 /// Distinct, sorted shard filenames listed in a `*.safetensors.index.json` `weight_map`.
@@ -615,38 +594,17 @@ fn shard_names_from_index(index_path: &Path) -> AudioResult<Vec<String>> {
     Ok(shards)
 }
 
-/// The transformer safetensors shard filenames listed in
-/// `transformer/diffusion_pytorch_model.safetensors.index.json`.
-fn dit_shards(repo: &str, revision: &str) -> AudioResult<Vec<String>> {
-    let index_path = hf_get_pinned(
-        repo,
-        revision,
-        "transformer/diffusion_pytorch_model.safetensors.index.json",
-    )?;
-    shard_names_from_index(&index_path)
-}
-
-/// Resolve the pinned **sft** cover DiT transformer shards (sc-13251) — the non-distilled reference
-/// cover model, ~7.8 GB — returning the safetensors shard paths for lazy loading on the first Cover
-/// request. `ACESTEP_SFT_SNAPSHOT` overrides the F-029 hub path with a local sft snapshot dir.
+/// Resolve the **sft** cover DiT transformer shards (sc-13251) — the non-distilled reference cover
+/// model, ~7.8 GB — from the **required** `ACESTEP_SFT_SNAPSHOT` local snapshot dir, returning the
+/// safetensors shard paths for lazy loading on the first Cover request. Inference never self-fetches
+/// or derives an HF-cache location (epic 13657).
 pub fn resolve_cover_dit() -> AudioResult<Vec<PathBuf>> {
-    if let Ok(dir) = std::env::var("ACESTEP_SFT_SNAPSHOT") {
-        let root = PathBuf::from(dir).join("transformer");
-        let index = root.join("diffusion_pytorch_model.safetensors.index.json");
-        return Ok(shard_names_from_index(&index)?
-            .into_iter()
-            .map(|s| root.join(s))
-            .collect());
-    }
-    let mut out = Vec::new();
-    for shard in dit_shards(SFT_HUB_REPO, SFT_HUB_REVISION)? {
-        out.push(hf_get_pinned(
-            SFT_HUB_REPO,
-            SFT_HUB_REVISION,
-            &format!("transformer/{shard}"),
-        )?);
-    }
-    Ok(out)
+    let root = PathBuf::from(sft_snapshot_dir()?).join("transformer");
+    let index = root.join("diffusion_pytorch_model.safetensors.index.json");
+    Ok(shard_names_from_index(&index)?
+        .into_iter()
+        .map(|s| root.join(s))
+        .collect())
 }
 
 #[cfg(test)]

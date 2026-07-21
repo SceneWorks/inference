@@ -8,11 +8,6 @@ use candle_gen::gen_core::{
     GenerationOutput, GenerationRequest, LoadSpec, Progress, WeightsSource,
 };
 
-fn me(c: &[&str]) -> Option<String> {
-    c.iter()
-        .find(|p| std::path::Path::new(p).exists())
-        .map(|p| p.to_string())
-}
 fn mean(px: &[u8]) -> f64 {
     if px.is_empty() {
         0.0
@@ -24,9 +19,19 @@ fn mean(px: &[u8]) -> f64 {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let a: Vec<String> = std::env::args().collect();
     let model = a.get(1).cloned().unwrap_or_else(|| "sdxl".into());
-    let base = a.get(2).cloned().or_else(|| me(&["D:/.cache/huggingface/hub/models--stabilityai--stable-diffusion-xl-base-1.0/snapshots/462165984030d82259a11f4367a4eed129e94a7b"])).ok_or("base snapshot not found")?;
-    let pid = a.get(3).cloned().or_else(|| me(&["D:/.cache/huggingface/hub/models--SceneWorks--pid-sdxl/snapshots/70b494831561dc2c181f04a7f057260b8785419a/pid_sdxl_2kto4k.safetensors"])).ok_or("pid-sdxl not found")?;
-    let gemma = a.get(4).cloned().or_else(|| me(&["D:/.cache/huggingface/hub/models--google--gemma-2-2b-it/snapshots/299a8560bedf22ed1c72a8a11e7dce4a7f9f51f8"])).ok_or("gemma not found")?;
+    // Explicit passed-in local paths (positional arg, else env var) — inference never self-fetches or
+    // derives an HF-cache location (epic 13657).
+    let base = a.get(2).cloned().or_else(|| std::env::var("SDXL_BASE_SNAPSHOT").ok())
+        .ok_or("pass the base snapshot as arg 2 or set SDXL_BASE_SNAPSHOT to a stabilityai/stable-diffusion-xl-base-1.0 snapshot dir")?;
+    let pid = a
+        .get(3)
+        .cloned()
+        .or_else(|| std::env::var("PID_SDXL_FILE").ok())
+        .ok_or(
+            "pass the pid-sdxl file as arg 3 or set PID_SDXL_FILE to pid_sdxl_2kto4k.safetensors",
+        )?;
+    let gemma = a.get(4).cloned().or_else(|| std::env::var("PID_GEMMA_DIR").ok())
+        .ok_or("pass the gemma dir as arg 4 or set PID_GEMMA_DIR to a google/gemma-2-2b-it snapshot dir")?;
     let w: u32 = a.get(5).and_then(|s| s.parse().ok()).unwrap_or(512);
     let h: u32 = a.get(6).and_then(|s| s.parse().ok()).unwrap_or(512);
     let seed: u64 = a.get(7).and_then(|s| s.parse().ok()).unwrap_or(7);

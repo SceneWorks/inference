@@ -7,8 +7,8 @@
 //! ## Weights
 //!
 //! [`load`] expects a single-file `WeightsSource::File` pointing at Chatterbox's `ve.safetensors`
-//! (≈5.7 MB). [`resolve_pinned_file`] materializes it through the audio lane's pinned-SHA hub
-//! path (`candle_audio::hub`, F-029 — never the mutable `main` revision).
+//! (≈5.7 MB), supplied as an explicit passed-in path on the `LoadSpec` (staged locally, never
+//! self-fetched, epic 13657). The `HUB_REPO`@`HUB_REVISION` pin records its provenance.
 //!
 //! ## Request mapping
 //!
@@ -24,8 +24,6 @@ use candle_audio::gen_core::{
     self, AudioTrack, LoadSpec, VoiceEmbedder, VoiceEmbedderDescriptor, VoiceEmbedding,
     WeightsSource,
 };
-use candle_audio::hub::hf_get_pinned;
-use candle_audio::Result as AudioResult;
 use candle_nn::VarBuilder;
 
 use crate::config;
@@ -99,8 +97,8 @@ impl ChatterboxVoiceEmbedder {
         }
         if !self.weights.is_file() {
             return Err(gen_core::Error::Msg(format!(
-                "{MODEL_ID}: voice-encoder weights {} missing (resolve_pinned_file materializes \
-                 {WEIGHTS_FILE})",
+                "{MODEL_ID}: voice-encoder weights {} missing (pass the {WEIGHTS_FILE} path in via \
+                 the LoadSpec)",
                 self.weights.display()
             )));
         }
@@ -210,13 +208,6 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn VoiceEmbedder>> {
 // Explicit catalog registration for `chatterbox_ve` (composed by `candle-audio-catalog`).
 pub const REGISTRATION: gen_core::VoiceEmbedderRegistration =
     gen_core::VoiceEmbedderRegistration { descriptor, load };
-
-/// Materialize the pinned `ve.safetensors` through the audio lane's F-029 hub path, landing in
-/// the ordinary HF cache. Returns it as a [`WeightsSource::File`] ready for a [`LoadSpec`].
-pub fn resolve_pinned_file() -> AudioResult<WeightsSource> {
-    let path = hf_get_pinned(HUB_REPO, HUB_REVISION, WEIGHTS_FILE)?;
-    Ok(WeightsSource::File(path))
-}
 
 #[cfg(test)]
 mod tests {

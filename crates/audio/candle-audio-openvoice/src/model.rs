@@ -12,9 +12,8 @@
 //!   checkpoint.pth    → converter/checkpoint.pth (the SynthesizerTrn state dict; see crate::weights)
 //! ```
 //!
-//! [`resolve_pinned_snapshot`] materializes exactly that layout through the audio lane's pinned-SHA
-//! hub path (`candle_audio::hub`, F-029 — never the mutable `main` revision), landing the `converter/`
-//! directory in the HF cache and returning it as the snapshot root.
+//! A `LoadSpec` points at exactly that `converter/` layout: it is staged locally and passed in,
+//! never self-fetched (epic 13657). The `HUB_REPO`@`HUB_REVISION` pin records its provenance.
 //!
 //! ## Request mapping
 //!
@@ -36,8 +35,6 @@ use candle_audio::gen_core::{
     AudioTransformDescriptor, AudioTransformKind, AudioTransformRequest, LoadSpec, Progress,
     WeightsSource,
 };
-use candle_audio::hub::hf_get_pinned;
-use candle_audio::{AudioError, Result as AudioResult};
 
 use crate::config;
 use crate::pipeline::{OpenVoicePipeline, CHECKPOINT_FILE, CONFIG_FILE};
@@ -291,21 +288,6 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn AudioTransform>> {
 // Explicit catalog registration for `openvoice_v2` (composed by `candle-audio-catalog`).
 candle_audio::gen_core::register_audio_transform! {
     pub const REGISTRATION = descriptor => load
-}
-
-/// Materialize the pinned OpenVoice V2 converter snapshot through the audio lane's F-029 hub path:
-/// `converter/config.json` + `converter/checkpoint.pth` at [`HUB_REVISION`], landing in the HF
-/// cache. Returns the `converter/` directory as a [`WeightsSource::Dir`] ready for a [`LoadSpec`].
-pub fn resolve_pinned_snapshot() -> AudioResult<WeightsSource> {
-    let cfg = hf_get_pinned(HUB_REPO, HUB_REVISION, CONVERTER_CONFIG)?;
-    hf_get_pinned(HUB_REPO, HUB_REVISION, CONVERTER_CHECKPOINT)?;
-    let dir = cfg.parent().ok_or_else(|| {
-        AudioError::Msg(format!(
-            "openvoice_v2: resolved {CONVERTER_CONFIG} path {} has no parent directory",
-            cfg.display()
-        ))
-    })?;
-    Ok(WeightsSource::Dir(dir.to_path_buf()))
 }
 
 #[cfg(test)]

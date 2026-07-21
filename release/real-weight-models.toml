@@ -171,6 +171,19 @@ profiles = ["audio-macos"]
 environment = ["CHATTERBOX_SNAPSHOT"]
 expected_files = ["t3_cfg.safetensors", "s3gen.safetensors", "tokenizer.json"]
 
+# The Chatterbox PerTh watermark component (sc-13240 / sc-13660): the `perth` co-requisite is a
+# passed-in `LoadSpec` component staged from CHATTERBOX_PERTH_SNAPSHOT — the provider never
+# self-fetches it (epic 13657, sc-13665). SceneWorks-owned mirror of the MIT resemble-perth weights.
+[[models]]
+key = "chatterbox-perth"
+repository = "SceneWorks/perth-implicit"
+revision = "80b60f9caead09b8d3b512bda0b24038f28c08ec"
+license = "MIT"
+size_class = "small"
+profiles = ["audio-macos"]
+environment = ["CHATTERBOX_PERTH_SNAPSHOT"]
+expected_files = ["perth_implicit.safetensors"]
+
 [[models]]
 key = "openvoice-v2"
 repository = "myshell-ai/OpenVoiceV2"

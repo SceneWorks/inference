@@ -28,9 +28,9 @@
 //! - [`prepare`] — the audio-lane snapshot-preparation accommodation (a validated
 //!   passthrough; Kokoro snapshots carry no tokenizer.json for the LLM preparer to demand).
 //!
-//! Weights resolve through the audio lane's pinned-SHA hub path
-//! ([`model::resolve_pinned_snapshot`], F-029): `hexgrad/Kokoro-82M` at an immutable commit,
-//! never a mutable ref.
+//! Weights are supplied as an explicit passed-in snapshot on the `gen_core::LoadSpec`:
+//! `hexgrad/Kokoro-82M`, staged locally and never self-fetched (epic 13657). The
+//! `HUB_REPO`@`HUB_REVISION` pin is retained as the provenance record of that checkpoint.
 
 pub use candle_audio;
 pub use candle_audio::gen_core;
@@ -50,8 +50,8 @@ pub mod weights;
 pub use config::KokoroConfig;
 pub use g2p::{EnglishVariant, KokoroG2p};
 pub use model::{
-    descriptor, load, resolve_pinned_snapshot, DEFAULT_VOICE, HUB_REPO, HUB_REVISION, LANGUAGES,
-    MODEL_ID, REGISTRATION, VOICES,
+    descriptor, load, DEFAULT_VOICE, HUB_REPO, HUB_REVISION, LANGUAGES, MODEL_ID, REGISTRATION,
+    VOICES,
 };
 pub use pipeline::KokoroPipeline;
 

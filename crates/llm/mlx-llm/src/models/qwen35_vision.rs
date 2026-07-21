@@ -952,14 +952,9 @@ mod tests {
     }
 
     fn qwen3vl_snapshot_dir() -> Option<PathBuf> {
-        if let Ok(path) = std::env::var("QWEN3VL_SNAPSHOT") {
-            let path = PathBuf::from(path);
-            return path.exists().then_some(path);
-        }
-        let home = std::env::var("HOME").ok()?;
-        let path = PathBuf::from(home).join(
-            ".cache/huggingface/hub/models--Qwen--Qwen3-VL-8B-Instruct/snapshots/0c351dd01ed87e9c1b53cbc748cba10e6187ff3b",
-        );
+        // Explicit passed-in env path — inference never self-fetches or derives a cache location
+        // (epic 13657). `None` ⇒ the gated test self-skips.
+        let path = PathBuf::from(std::env::var("QWEN3VL_SNAPSHOT").ok()?);
         path.exists().then_some(path)
     }
 

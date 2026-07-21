@@ -20,8 +20,21 @@
 
 use candle_audio_mmaudio::candle_audio;
 use candle_audio_mmaudio::candle_audio::candle_core::{safetensors, Tensor};
-use candle_audio_mmaudio::output::{resolve_pinned_bigvgan_v2, resolve_pinned_vae_44k};
+use candle_audio_mmaudio::candle_audio::gen_core::WeightsSource;
 use candle_audio_mmaudio::AudioDecoder44k;
+
+/// Resolve a component from the required `env` path — inference never self-fetches or derives a
+/// cache location (epic 13657).
+fn env_source(env: &str) -> WeightsSource {
+    let p = std::env::var(env)
+        .unwrap_or_else(|_| panic!("set {env} to the weights file or snapshot dir"));
+    let path = std::path::PathBuf::from(&p);
+    if path.is_dir() {
+        WeightsSource::Dir(path)
+    } else {
+        WeightsSource::File(path)
+    }
+}
 
 fn cosine(a: &[f32], b: &[f32]) -> f64 {
     let n = a.len().min(b.len());
@@ -70,9 +83,9 @@ fn decoder_44k_matches_reference_mel_and_waveform() {
         ref_wave.len()
     );
 
-    // Load the real pinned 44k decoder: MMAudio v1-44 mel-VAE + NVIDIA BigVGAN v2.
-    let vae_src = resolve_pinned_vae_44k().expect("resolve pinned v1-44 VAE");
-    let bigvgan_src = resolve_pinned_bigvgan_v2().expect("resolve pinned NVIDIA BigVGAN v2");
+    // Load the real 44k decoder from env-pointed paths: MMAudio v1-44 mel-VAE + NVIDIA BigVGAN v2.
+    let vae_src = env_source("MMAUDIO_VAE_44K_SNAPSHOT");
+    let bigvgan_src = env_source("MMAUDIO_BIGVGAN_V2_SNAPSHOT");
     let decoder = AudioDecoder44k::load(&vae_src, &bigvgan_src, &device).expect("load 44k decoder");
 
     // Stage 1 — the v1-44 mel-VAE: decode_latent(z) vs ref_mel.

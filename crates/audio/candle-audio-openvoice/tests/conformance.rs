@@ -59,20 +59,16 @@ const SOURCE_TEXT: &str = "The quick brown fox jumps over the lazy dog near the 
 /// snapshot root — a `converter/` subdir is picked up automatically — or the `converter/` dir
 /// itself) or the pinned hub snapshot.
 fn openvoice_snapshot() -> WeightsSource {
-    match std::env::var("OPENVOICE_V2_SNAPSHOT") {
-        Ok(dir) => {
-            let root = PathBuf::from(dir);
-            let converter = root.join("converter");
-            let loadable = if converter.join("checkpoint.pth").is_file() {
-                converter
-            } else {
-                root
-            };
-            WeightsSource::Dir(loadable)
-        }
-        Err(_) => ov::resolve_pinned_snapshot()
-            .expect("resolve the pinned myshell-ai/OpenVoiceV2 converter snapshot (network or warm HF cache)"),
-    }
+    let root = PathBuf::from(std::env::var("OPENVOICE_V2_SNAPSHOT").expect(
+        "set OPENVOICE_V2_SNAPSHOT to a myshell-ai/OpenVoiceV2 snapshot (repo root or converter/ dir, holding config.json + checkpoint.pth)",
+    ));
+    let converter = root.join("converter");
+    let loadable = if converter.join("checkpoint.pth").is_file() {
+        converter
+    } else {
+        root
+    };
+    WeightsSource::Dir(loadable)
 }
 
 /// The converter, resolved **through the explicit registry** by id (exactly like a media model).
@@ -86,11 +82,10 @@ fn load_converter() -> Box<dyn candle_audio_openvoice::gen_core::AudioTransform>
 
 /// Synthesize a clip with Kokoro (24 kHz mono).
 fn kokoro_clip(text: &str, voice: &str) -> AudioTrack {
-    let spec = LoadSpec::new(match std::env::var("KOKORO_SNAPSHOT") {
-        Ok(dir) => WeightsSource::Dir(PathBuf::from(dir)),
-        Err(_) => candle_audio_kokoro::resolve_pinned_snapshot()
-            .expect("resolve the pinned hexgrad/Kokoro-82M snapshot (network or warm HF cache)"),
-    });
+    let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(
+        std::env::var("KOKORO_SNAPSHOT")
+            .expect("set KOKORO_SNAPSHOT to a hexgrad/Kokoro-82M snapshot dir"),
+    )));
     let gen = candle_audio_kokoro::load(&spec).expect("load kokoro");
     let req = GenerationRequest {
         prompt: text.to_string(),
@@ -110,12 +105,12 @@ fn kokoro_clip(text: &str, voice: &str) -> AudioTrack {
 
 /// Load the Chatterbox voice embedder that measures the timbre shift.
 fn load_embedder() -> Box<dyn VoiceEmbedder> {
-    let weights = match std::env::var("CHATTERBOX_VE_SNAPSHOT") {
-        Ok(dir) => WeightsSource::File(PathBuf::from(dir).join(ve::WEIGHTS_FILE)),
-        Err(_) => ve::resolve_pinned_file().expect(
-            "resolve the pinned ResembleAI/chatterbox ve.safetensors (network or warm HF cache)",
-        ),
-    };
+    let weights = WeightsSource::File(
+        PathBuf::from(std::env::var("CHATTERBOX_VE_SNAPSHOT").expect(
+            "set CHATTERBOX_VE_SNAPSHOT to a ResembleAI/chatterbox snapshot dir holding ve.safetensors",
+        ))
+        .join(ve::WEIGHTS_FILE),
+    );
     ve::provider_registry()
         .unwrap()
         .load_voice_embedder(ve::MODEL_ID, &LoadSpec::new(weights))
@@ -129,11 +124,10 @@ fn duration_secs(t: &AudioTrack) -> f32 {
 /// Transcribe a clip with the merged `whisper_base` provider (English, greedy) and return the raw
 /// transcript text. Loaded through the explicit Whisper registry, load-by-id (sc-12850).
 fn transcribe(track: &AudioTrack) -> String {
-    let weights = match std::env::var("WHISPER_SNAPSHOT") {
-        Ok(dir) => WeightsSource::Dir(PathBuf::from(dir)),
-        Err(_) => candle_audio_whisper::resolve_pinned_snapshot()
-            .expect("resolve the pinned openai/whisper-base snapshot (network or warm HF cache)"),
-    };
+    let weights = WeightsSource::Dir(PathBuf::from(
+        std::env::var("WHISPER_SNAPSHOT")
+            .expect("set WHISPER_SNAPSHOT to an openai/whisper-base snapshot dir"),
+    ));
     let transcriber = candle_audio_whisper::provider_registry()
         .unwrap()
         .load_transcriber(candle_audio_whisper::MODEL_ID, &LoadSpec::new(weights))

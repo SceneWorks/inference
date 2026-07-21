@@ -22,9 +22,8 @@
 //!   model.safetensors   → the encoder+decoder weights (model.encoder.* / model.decoder.*)
 //! ```
 //!
-//! [`resolve_pinned_snapshot`] materializes exactly that layout through the audio lane's pinned-SHA
-//! hub path (`candle_audio::hub`, F-029 — never the mutable `main` revision) and returns the
-//! snapshot directory ready for a [`LoadSpec`].
+//! A `LoadSpec` points at exactly that snapshot directory: it is staged locally and passed in,
+//! never self-fetched (epic 13657). The `HUB_REPO`@`HUB_REVISION` pin records its provenance.
 //!
 //! ## Checkpoint provenance
 //!
@@ -41,7 +40,6 @@ use candle_audio::gen_core::{
     self, LoadSpec, Progress, TimestampGranularity, TranscribeCapabilities, TranscribeRequest,
     TranscribeTask, Transcriber, TranscriberDescriptor, TranscriptOutput, WeightsSource,
 };
-use candle_audio::hub::hf_get_pinned;
 use candle_audio::{AudioError, Result as AudioResult};
 use candle_transformers::models::whisper::{model::Whisper, Config, DTYPE};
 use tokenizers::Tokenizer;
@@ -327,22 +325,6 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Transcriber>> {
 // Explicit catalog registration for `whisper_base` (composed by `candle-audio-catalog`).
 candle_audio::gen_core::register_transcriber! {
     pub const REGISTRATION = descriptor => load
-}
-
-/// Materialize the pinned `openai/whisper-base` snapshot through the audio lane's F-029 hub path:
-/// config.json + tokenizer.json + model.safetensors at [`HUB_REVISION`], landing in the HF cache.
-/// Returns the snapshot directory as a [`WeightsSource::Dir`] ready for a [`LoadSpec`].
-pub fn resolve_pinned_snapshot() -> AudioResult<WeightsSource> {
-    let cfg = hf_get_pinned(HUB_REPO, HUB_REVISION, CONFIG_FILE)?;
-    hf_get_pinned(HUB_REPO, HUB_REVISION, TOKENIZER_FILE)?;
-    hf_get_pinned(HUB_REPO, HUB_REVISION, WEIGHTS_FILE)?;
-    let dir = cfg.parent().ok_or_else(|| {
-        AudioError::Msg(format!(
-            "{MODEL_ID}: resolved {CONFIG_FILE} path {} has no parent directory",
-            cfg.display()
-        ))
-    })?;
-    Ok(WeightsSource::Dir(dir.to_path_buf()))
 }
 
 #[cfg(test)]
