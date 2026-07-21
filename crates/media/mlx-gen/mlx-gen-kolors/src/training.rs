@@ -347,18 +347,27 @@ mod first_step_repro {
     use mlx_rs::transforms::eval;
     use std::path::PathBuf;
 
+    /// The Kolors-diffusers snapshot root from the required `KOLORS_SNAPSHOT` env var. sc-13668:
+    /// there is no implicit default — the source snapshot path must be passed in explicitly.
     fn snapshot() -> Option<PathBuf> {
-        if let Ok(p) = std::env::var("KOLORS_SNAPSHOT") {
-            return Some(PathBuf::from(p));
+        std::env::var("KOLORS_SNAPSHOT").ok().map(PathBuf::from)
+    }
+
+    #[test]
+    fn source_root_requires_explicit_env_no_default() {
+        let key = "KOLORS_SNAPSHOT";
+        let saved = std::env::var(key).ok();
+        std::env::remove_var(key);
+        assert!(
+            snapshot().is_none(),
+            "the source snapshot root must come from {key}: sc-13668 removed the implicit default"
+        );
+        std::env::set_var(key, "/sentinel/kolors");
+        assert_eq!(snapshot(), Some(PathBuf::from("/sentinel/kolors")));
+        match saved {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
         }
-        let home = std::env::var("HOME").ok()?;
-        let snaps = PathBuf::from(home)
-            .join(".cache/huggingface/hub/models--Kwai-Kolors--Kolors-diffusers/snapshots");
-        std::fs::read_dir(&snaps)
-            .ok()?
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .find(|p| p.is_dir() && p.join("unet").is_dir())
     }
 
     fn swatch(edge: u32) -> Image {
@@ -378,7 +387,7 @@ mod first_step_repro {
     }
 
     fn build() -> (KolorsTrainer, TrainAdapter, LoraParams, Array, Array) {
-        let root = snapshot().expect("Kolors snapshot (HF cache or KOLORS_SNAPSHOT)");
+        let root = snapshot().expect("set KOLORS_SNAPSHOT to the Kolors-diffusers snapshot root");
         let dtype = Dtype::Float32;
         let te_w = Weights::from_dir(root.join("text_encoder")).unwrap();
         // The harness loads the encoder at **f32** (production loads bf16) so the bf16-cast gate

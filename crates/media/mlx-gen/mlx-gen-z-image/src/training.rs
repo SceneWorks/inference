@@ -885,18 +885,27 @@ mod first_step_repro {
     };
     use std::path::PathBuf;
 
+    /// The Z-Image-Turbo snapshot root from the required `ZIMAGE_SNAPSHOT` env var. sc-13668: there
+    /// is no implicit default — the source snapshot path must be passed in explicitly.
     fn snapshot() -> Option<PathBuf> {
-        if let Ok(p) = std::env::var("ZIMAGE_SNAPSHOT") {
-            return Some(PathBuf::from(p));
+        std::env::var("ZIMAGE_SNAPSHOT").ok().map(PathBuf::from)
+    }
+
+    #[test]
+    fn source_root_requires_explicit_env_no_default() {
+        let key = "ZIMAGE_SNAPSHOT";
+        let saved = std::env::var(key).ok();
+        std::env::remove_var(key);
+        assert!(
+            snapshot().is_none(),
+            "the source snapshot root must come from {key}: sc-13668 removed the implicit default"
+        );
+        std::env::set_var(key, "/sentinel/zimage");
+        assert_eq!(snapshot(), Some(PathBuf::from("/sentinel/zimage")));
+        match saved {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
         }
-        let home = std::env::var("HOME").ok()?;
-        let snaps = PathBuf::from(home)
-            .join(".cache/huggingface/hub/models--Tongyi-MAI--Z-Image-Turbo/snapshots");
-        std::fs::read_dir(&snaps)
-            .ok()?
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .find(|p| p.is_dir())
     }
 
     /// A solid-colour `edge`×`edge` RGB source image (the latent magnitude is irrelevant; the graph
@@ -1000,7 +1009,7 @@ mod first_step_repro {
     }
 
     fn build_trainer_and_adapter() -> (ZImageTurboTrainer, TrainAdapter, LoraParams, Array) {
-        let root = snapshot().expect("Z-Image-Turbo snapshot (HF cache or ZIMAGE_SNAPSHOT)");
+        let root = snapshot().expect("set ZIMAGE_SNAPSHOT to the Z-Image-Turbo snapshot root");
         let mut trainer = ZImageTurboTrainer {
             descriptor: trainer_descriptor(),
             tokenizer: crate::loader::load_tokenizer(&root).unwrap(),

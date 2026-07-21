@@ -1299,38 +1299,47 @@ mod real_weight_repro {
     use super::*;
     use std::path::PathBuf;
 
-    /// The `stabilityai/stable-diffusion-3.5-large` snapshot (the `SD3_LARGE_DIR` override, else the
-    /// newest HF-cache snapshot with a `transformer/` tree).
+    /// The `stabilityai/stable-diffusion-3.5-large` snapshot root from the required `SD3_LARGE_DIR`
+    /// env var. sc-13668: there is no implicit default — the source snapshot path must be passed in
+    /// explicitly.
     fn snapshot() -> Option<PathBuf> {
-        if let Ok(p) = std::env::var("SD3_LARGE_DIR") {
-            return Some(PathBuf::from(p));
-        }
-        let home = std::env::var("HOME").ok()?;
-        let snaps = PathBuf::from(home).join(
-            ".cache/huggingface/hub/models--stabilityai--stable-diffusion-3.5-large/snapshots",
-        );
-        std::fs::read_dir(&snaps)
-            .ok()?
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .find(|p| p.is_dir() && p.join("transformer").is_dir())
+        std::env::var("SD3_LARGE_DIR").ok().map(PathBuf::from)
     }
 
-    /// The `stabilityai/stable-diffusion-3.5-medium` snapshot (the `SD3_MEDIUM_DIR` override, else the
-    /// newest HF-cache snapshot with a `transformer/` tree). T4 (sc-7885).
+    /// The `stabilityai/stable-diffusion-3.5-medium` snapshot root from the required `SD3_MEDIUM_DIR`
+    /// env var. sc-13668: there is no implicit default — the source snapshot path must be passed in
+    /// explicitly. T4 (sc-7885).
     fn medium_snapshot() -> Option<PathBuf> {
-        if let Ok(p) = std::env::var("SD3_MEDIUM_DIR") {
-            return Some(PathBuf::from(p));
+        std::env::var("SD3_MEDIUM_DIR").ok().map(PathBuf::from)
+    }
+
+    #[test]
+    fn source_roots_require_explicit_env_no_default() {
+        for (key, sentinel, resolver) in [
+            (
+                "SD3_LARGE_DIR",
+                "/sentinel/sd3-large",
+                snapshot as fn() -> Option<PathBuf>,
+            ),
+            (
+                "SD3_MEDIUM_DIR",
+                "/sentinel/sd3-medium",
+                medium_snapshot as fn() -> Option<PathBuf>,
+            ),
+        ] {
+            let saved = std::env::var(key).ok();
+            std::env::remove_var(key);
+            assert!(
+                resolver().is_none(),
+                "the source snapshot root must come from {key}: sc-13668 removed the implicit default"
+            );
+            std::env::set_var(key, sentinel);
+            assert_eq!(resolver(), Some(PathBuf::from(sentinel)));
+            match saved {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
         }
-        let home = std::env::var("HOME").ok()?;
-        let snaps = PathBuf::from(home).join(
-            ".cache/huggingface/hub/models--stabilityai--stable-diffusion-3.5-medium/snapshots",
-        );
-        std::fs::read_dir(&snaps)
-            .ok()?
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .find(|p| p.is_dir() && p.join("transformer").is_dir())
     }
 
     /// The real MMDiT's default target surface resolves to the joint-block attention only: 38 blocks ×
@@ -1339,7 +1348,8 @@ mod real_weight_repro {
     #[test]
     #[ignore = "needs real stabilityai/stable-diffusion-3.5-large weights; run as its own process"]
     fn default_targets_resolve_to_joint_block_attention() {
-        let root = snapshot().expect("sd3.5-large snapshot (HF cache or SD3_LARGE_DIR)");
+        let root =
+            snapshot().expect("set SD3_LARGE_DIR to the stable-diffusion-3.5-large snapshot root");
         let dit = loader::load_transformer(&root, &Sd3Variant::Large.arch()).unwrap();
         let cfg = TrainingConfig::default();
         let paths = resolve_target_paths(&dit, &cfg);
@@ -1361,7 +1371,8 @@ mod real_weight_repro {
     #[test]
     #[ignore = "needs real stabilityai/stable-diffusion-3.5-medium weights; run as its own process"]
     fn medium_default_targets_include_attn2_on_dual_blocks() {
-        let root = medium_snapshot().expect("sd3.5-medium snapshot (HF cache or SD3_MEDIUM_DIR)");
+        let root = medium_snapshot()
+            .expect("set SD3_MEDIUM_DIR to the stable-diffusion-3.5-medium snapshot root");
         let dit = loader::load_transformer(&root, &Sd3Variant::Medium.arch()).unwrap();
         assert_eq!(dit.num_blocks(), 24, "Medium has 24 joint blocks");
         let cfg = TrainingConfig::default();
@@ -1403,7 +1414,8 @@ mod real_weight_repro {
     #[test]
     #[ignore = "needs real stabilityai/stable-diffusion-3.5-large weights; run as its own process"]
     fn checkpointed_grads_match_dense() {
-        let root = snapshot().expect("sd3.5-large snapshot (HF cache or SD3_LARGE_DIR)");
+        let root =
+            snapshot().expect("set SD3_LARGE_DIR to the stable-diffusion-3.5-large snapshot root");
         let mut dit = loader::load_transformer(&root, &Sd3Variant::Large.arch()).unwrap();
         dit.cast_weights(Dtype::Float32).unwrap();
         let cfg = TrainingConfig {
@@ -1503,7 +1515,8 @@ mod real_weight_repro {
         use mlx_gen::runtime::{AdapterKind, AdapterSpec, LoadSpec, WeightsSource};
         use mlx_gen::{GenerationOutput, GenerationRequest, NetworkType, TrainingItem};
 
-        let root = snapshot().expect("sd3.5-large snapshot (HF cache or SD3_LARGE_DIR)");
+        let root =
+            snapshot().expect("set SD3_LARGE_DIR to the stable-diffusion-3.5-large snapshot root");
         let tmp = std::env::temp_dir().join(format!("sd3_t2_smoke_{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
 
@@ -1651,7 +1664,8 @@ mod real_weight_repro {
         use mlx_gen::runtime::{AdapterKind, AdapterSpec, LoadSpec, WeightsSource};
         use mlx_gen::{GenerationOutput, GenerationRequest, NetworkType, TrainingItem};
 
-        let root = medium_snapshot().expect("sd3.5-medium snapshot (HF cache or SD3_MEDIUM_DIR)");
+        let root = medium_snapshot()
+            .expect("set SD3_MEDIUM_DIR to the stable-diffusion-3.5-medium snapshot root");
         let tmp = std::env::temp_dir().join(format!("sd3_t4_medium_smoke_{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
 

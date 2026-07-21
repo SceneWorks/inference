@@ -1924,17 +1924,32 @@ mod tests {
 
     // -------- real-weights measurement + validation (sc-10576), #[ignore]d + snapshot-gated --------
 
+    /// Resolve the Anima `split_files/` dir from the required `ANIMA_SNAPSHOT` env var. sc-13668:
+    /// there is no implicit default — the source snapshot path must be passed in explicitly.
     fn anima_split() -> Option<std::path::PathBuf> {
-        let home = std::env::var("HOME").ok()?;
-        let base = std::path::PathBuf::from(home)
-            .join(".cache/huggingface/hub/models--circlestone-labs--Anima/snapshots");
-        std::fs::read_dir(&base)
-            .ok()?
-            .filter_map(|e| e.ok())
-            .find_map(|e| {
-                let p = e.path().join("split_files");
-                p.join("diffusion_models").is_dir().then_some(p)
-            })
+        std::env::var("ANIMA_SNAPSHOT")
+            .ok()
+            .map(std::path::PathBuf::from)
+    }
+
+    #[test]
+    fn source_root_requires_explicit_env_no_default() {
+        let key = "ANIMA_SNAPSHOT";
+        let saved = std::env::var(key).ok();
+        std::env::remove_var(key);
+        assert!(
+            anima_split().is_none(),
+            "the source split_files/ dir must come from {key}: sc-13668 removed the implicit default"
+        );
+        std::env::set_var(key, "/sentinel/anima/split_files");
+        assert_eq!(
+            anima_split(),
+            Some(std::path::PathBuf::from("/sentinel/anima/split_files"))
+        );
+        match saved {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
     }
 
     /// Load the real DiT + conditioner (+ keep the VAE resident like the train loop); drop the Qwen3
@@ -2036,10 +2051,7 @@ mod tests {
     #[test]
     #[ignore = "needs the circlestone-labs/Anima snapshot; measures GPU peak (sc-10576 calibration)"]
     fn first_step_dense_peak_sweep() {
-        let Some(split) = anima_split() else {
-            eprintln!("skip: no Anima snapshot");
-            return;
-        };
+        let split = anima_split().expect("set ANIMA_SNAPSHOT to the Anima split_files/ dir");
         let (mut dit, mut cond, _vae) = load_real_dit_cond(&split);
         eprintln!("[sc-10576] dense first-step peak sweep (bf16, rank16, SDPA-seg ckpt ON):");
         for edge in [512, 768, 1024] {
@@ -2058,10 +2070,7 @@ mod tests {
     #[test]
     #[ignore = "needs the circlestone-labs/Anima snapshot; SLOW (2B DiT steps at 1024²/1536²)"]
     fn first_step_1536_checkpointed_vs_dense() {
-        let Some(split) = anima_split() else {
-            eprintln!("skip: no Anima snapshot");
-            return;
-        };
+        let split = anima_split().expect("set ANIMA_SNAPSHOT to the Anima split_files/ dir");
         let (mut dit, mut cond, _vae) = load_real_dit_cond(&split);
         let budget = get_memory_limit() as f64 / (1024.0 * 1024.0 * 1024.0);
 
