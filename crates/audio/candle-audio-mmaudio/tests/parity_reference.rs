@@ -19,6 +19,8 @@
 //!   cargo test --locked -p candle-audio-mmaudio --test parity_reference -- --ignored --nocapture
 //! ```
 
+mod common;
+
 use candle_audio_mmaudio::candle_audio;
 use candle_audio_mmaudio::candle_audio::candle_core::{safetensors, Tensor};
 use candle_audio_mmaudio::MmAudioPipeline;
@@ -71,14 +73,17 @@ fn assembly_matches_reference_waveform() {
         ref_wave.len()
     );
 
-    // Resolve + load the real pinned weights (network + VAE + BigVGAN; the CLIP/sync encoders load
-    // too but are unused here — we inject the reference's features).
-    let snap = candle_audio_mmaudio::resolve_pinned_snapshot().expect("resolve pinned snapshot");
-    let dir = match snap {
-        candle_audio::gen_core::WeightsSource::Dir(d) => d,
-        candle_audio::gen_core::WeightsSource::File(f) => f,
-    };
-    let pipeline = MmAudioPipeline::from_snapshot(&dir, &device).expect("load pipeline");
+    // Resolve + load the real pinned weights from the five named components (network + VAE + BigVGAN;
+    // the CLIP/sync encoders load too but are unused here — we inject the reference's features).
+    let pipeline = MmAudioPipeline::from_components(
+        &common::clip_source(),
+        &common::synchformer_source(),
+        &common::dit_16k_source(),
+        &common::vae_16k_source(),
+        &common::vocoder_16k_source(),
+        &device,
+    )
+    .expect("load pipeline");
 
     let wave = pipeline
         .synthesize_from_features(

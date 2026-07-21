@@ -2,9 +2,10 @@
 //! pinned weights → registry load-by-id (`mmaudio_small_16k`) → a synchronized, non-silent,
 //! deterministic, frame-dependent 16 kHz soundtrack.
 //!
-//! Both tests are `#[ignore]`d and resolve the five pinned checkpoints through the audio lane's F-029
-//! hub path (`resolve_pinned_snapshot`, ~6 GB across `hkchengrex/MMAudio` +
-//! `apple/DFN5B-CLIP-ViT-H-14-384` into the ordinary HF cache on first run).
+//! Both tests are `#[ignore]`d and stage the five pinned checkpoints as named `LoadSpec` components
+//! (sc-13666) resolved from env-pointed per-repo snapshot paths, falling back to the audio lane's
+//! F-029 hub path (~6 GB across `hkchengrex/MMAudio` + `apple/DFN5B-CLIP-ViT-H-14-384` into the
+//! ordinary HF cache on first run) — see [`common`] for the env vars.
 //!
 //! ```text
 //! cargo test --locked -p candle-audio-mmaudio --test conformance_video_to_audio -- --ignored --nocapture
@@ -15,25 +16,21 @@
 //! `raw_frames_8fps` `(T,H,W,3)` u8 tensor (the reference dump carries one) to drive it from a REAL
 //! clip; otherwise it uses deterministic synthetic motion.
 
+mod common;
+
 use std::path::PathBuf;
 
 use candle_audio_mmaudio::candle_audio;
 use candle_audio_mmaudio::candle_audio::candle_core::{safetensors, IndexOp};
 use candle_audio_mmaudio::gen_core::{
-    AudioParams, Conditioning, GenerationOutput, GenerationRequest, Image, LoadSpec,
+    AudioParams, Conditioning, GenerationOutput, GenerationRequest, Image,
 };
 use gen_core_testkit::AudioProfile;
-
-fn spec() -> LoadSpec {
-    let src = candle_audio_mmaudio::resolve_pinned_snapshot()
-        .expect("resolve the pinned MMAudio + DFN5B-CLIP snapshot (network or warm HF cache)");
-    LoadSpec::new(src)
-}
 
 fn load_provider() -> Box<dyn candle_audio_mmaudio::gen_core::Generator> {
     candle_audio_mmaudio::provider_registry()
         .unwrap()
-        .load(candle_audio_mmaudio::GENERATOR_ID, &spec())
+        .load(candle_audio_mmaudio::GENERATOR_ID, &common::spec_16k())
         .expect("mmaudio_small_16k loads through the explicit registry")
 }
 

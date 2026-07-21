@@ -14,6 +14,8 @@
 //!   cargo test --locked -p candle-audio-mmaudio --test parity_reference_44k -- --ignored --nocapture
 //! ```
 
+mod common;
+
 use candle_audio_mmaudio::candle_audio;
 use candle_audio_mmaudio::candle_audio::candle_core::{safetensors, Tensor};
 use candle_audio_mmaudio::MmAudio44kPipeline;
@@ -66,13 +68,15 @@ fn assembly_44k_matches_reference_waveform() {
         ref_wave.len()
     );
 
-    let snap =
-        candle_audio_mmaudio::resolve_pinned_snapshot_44k().expect("resolve pinned 44k snapshot");
-    let dir = match snap {
-        candle_audio::gen_core::WeightsSource::Dir(d) => d,
-        candle_audio::gen_core::WeightsSource::File(f) => f,
-    };
-    let pipeline = MmAudio44kPipeline::from_snapshot(&dir, &device).expect("load 44k pipeline");
+    let pipeline = MmAudio44kPipeline::from_components(
+        &common::clip_source(),
+        &common::synchformer_source(),
+        &common::dit_44k_source(),
+        &common::vae_44k_source(),
+        &common::vocoder_44k_source(),
+        &device,
+    )
+    .expect("load 44k pipeline");
 
     let wave = pipeline
         .synthesize_from_features(

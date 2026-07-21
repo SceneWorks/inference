@@ -2,35 +2,32 @@
 //! (sc-13441): real pinned weights → registry load-by-id (`mmaudio_large_44k`) → a synchronized,
 //! non-silent, deterministic, frame-dependent **44.1 kHz** soundtrack.
 //!
-//! Both tests are `#[ignore]`d and resolve the five pinned checkpoints across three repos through the
-//! audio lane's F-029 hub path (`resolve_pinned_snapshot_44k`, ~9.5 GB across `hkchengrex/MMAudio`,
-//! `apple/DFN5B-CLIP-ViT-H-14-384`, and `nvidia/bigvgan_v2_44khz_128band_512x`). The full 44k pipeline
-//! (the 1.03B large_44k_v2 MM-DiT plus CLIP ViT-H, Synchformer, the 44k VAE, and NVIDIA BigVGAN v2) is
-//! heavy — see the crate PR notes for the memory envelope.
+//! Both tests are `#[ignore]`d and stage the five pinned checkpoints across three repos as named
+//! `LoadSpec` components (sc-13666), resolved from env-pointed per-repo snapshot paths, falling back
+//! to the audio lane's F-029 hub path (~9.5 GB across `hkchengrex/MMAudio`,
+//! `apple/DFN5B-CLIP-ViT-H-14-384`, and `nvidia/bigvgan_v2_44khz_128band_512x`) — see [`common`] for
+//! the env vars. The full 44k pipeline (the 1.03B large_44k_v2 MM-DiT plus CLIP ViT-H, Synchformer,
+//! the 44k VAE, and NVIDIA BigVGAN v2) is heavy — see the crate PR notes for the memory envelope.
 //!
 //! ```text
 //! cargo test --locked -p candle-audio-mmaudio --test conformance_video_to_audio_44k -- --ignored --nocapture
 //! ```
+
+mod common;
 
 use std::path::PathBuf;
 
 use candle_audio_mmaudio::candle_audio;
 use candle_audio_mmaudio::candle_audio::candle_core::{safetensors, IndexOp};
 use candle_audio_mmaudio::gen_core::{
-    AudioParams, Conditioning, GenerationOutput, GenerationRequest, Image, LoadSpec,
+    AudioParams, Conditioning, GenerationOutput, GenerationRequest, Image,
 };
 use gen_core_testkit::AudioProfile;
-
-fn spec() -> LoadSpec {
-    let src = candle_audio_mmaudio::resolve_pinned_snapshot_44k()
-        .expect("resolve the pinned MMAudio 44k + DFN5B-CLIP + NVIDIA BigVGAN v2 snapshot");
-    LoadSpec::new(src)
-}
 
 fn load_provider() -> Box<dyn candle_audio_mmaudio::gen_core::Generator> {
     candle_audio_mmaudio::provider_registry()
         .unwrap()
-        .load(candle_audio_mmaudio::GENERATOR_ID_44K, &spec())
+        .load(candle_audio_mmaudio::GENERATOR_ID_44K, &common::spec_44k())
         .expect("mmaudio_large_44k loads through the explicit registry")
 }
 
