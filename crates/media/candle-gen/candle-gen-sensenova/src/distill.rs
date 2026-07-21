@@ -19,6 +19,13 @@ use candle_gen::candle_nn::{Linear, VarBuilder};
 use candle_gen::gen_core::WeightsSource;
 use candle_gen::{CandleError, Result};
 
+/// Marker file dropped into a **pre-merged** `sensenova_u1_8b_fast` turnkey tier (sc-8775): its
+/// presence tells [`crate::load_fast`] the 8-step distill LoRA is already baked into the on-disk
+/// weights, so the loader must NOT resolve or merge it again. Absent ⇒ the legacy path (a dense base
+/// snapshot + the distill LoRA merged at load). The JSON body is provenance only; the loader keys off
+/// existence. Mirrors `mlx-gen-sensenova`'s `DISTILL_MERGED_MARKER`.
+pub const DISTILL_MERGED_MARKER: &str = "distill_merged.json";
+
 /// The distill LoRA file name (the `--include` argument the reference docs download).
 pub const DISTILL_LORA_FILE: &str = "SenseNova-U1-8B-MoT-LoRA-8step-V1.0.safetensors";
 /// The HF Hub repo the distill LoRA ships in (for the not-found error hint).

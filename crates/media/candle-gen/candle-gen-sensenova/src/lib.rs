@@ -44,7 +44,7 @@ use candle_gen::gen_core::{
 };
 use candle_gen::{CandleError, Result};
 
-use distill::{resolve_distill_lora, DistillLora, DISTILL_LORA_FILE};
+use distill::{resolve_distill_lora, DistillLora, DISTILL_LORA_FILE, DISTILL_MERGED_MARKER};
 
 // The understanding surface (VQA + Document-Studio interleave) is driven by the worker **directly**
 // off the concrete `T2iModel` (its text / text+image output the neutral `Generator` contract can't
@@ -165,7 +165,10 @@ pub struct SenseNovaGenerator {
     fast: bool,
     /// The distill LoRA path resolved from the caller-supplied `distill_lora` component / co-located
     /// snapshot file at load (sc-13664), so the merge in [`Self::components`] reads a passed-in path
-    /// with no env / HF-cache derivation. `Some` only for the `fast` variant; `None` for the base id.
+    /// with no env / HF-cache derivation. `Some` for the `fast` variant UNLESS the pre-merged
+    /// `distill_merged.json` marker ([`DISTILL_MERGED_MARKER`]) is present — a turnkey tier bakes the
+    /// merge into its on-disk weights (sc-8775/sc-13787), so resolve+merge is skipped and the dense
+    /// weights load as-is; `None` for the base id and for a pre-merged fast tier.
     distill_lora: Option<PathBuf>,
     components: Mutex<Option<Components>>,
 }
@@ -176,18 +179,14 @@ impl SenseNovaGenerator {
             let cfg = NeoChatConfig::from_dir(&self.root)?;
             let vb = f32_vb(&self.root, &self.device)?;
             let mut model = T2iModel::from_weights(&vb, &cfg)?;
-            if self.fast {
-                // Merge the 8-step distill LoRA into the dense generation path. Assert full coverage —
-                // `7 · layers` gen-path projections + the 2 FM-head Linears — so a stale/mismatched LoRA
-                // fails loudly rather than silently merging a subset. The path was resolved (and
-                // existence-checked) from the caller-supplied `distill_lora` component / co-located
-                // snapshot file at `load` (sc-13664) — fail-fast there, not here at first generate.
-                let lora_path = self.distill_lora.as_ref().ok_or_else(|| {
-                    CandleError::Msg(
-                        "sensenova_u1_8b_fast: internal error — distill LoRA path unresolved at load"
-                            .into(),
-                    )
-                })?;
+            // Merge the 8-step distill LoRA into the dense generation path — ONLY when the fast loader
+            // resolved one at `load` (sc-13664/sc-13787). A **pre-merged** turnkey tier ships the
+            // `distill_merged.json` marker and no LoRA, so `self.distill_lora` is `None`; its merge is
+            // already baked into the on-disk weights — skip and load the dense weights as-is (the base
+            // id is likewise `None`). When there IS a LoRA, assert full coverage — `7 · layers` gen-path
+            // projections + the 2 FM-head Linears — so a stale/mismatched LoRA fails loudly rather than
+            // silently merging a subset. (Mirrors `mlx-gen-sensenova`'s marker-guarded merge.)
+            if let Some(lora_path) = &self.distill_lora {
                 let lora = DistillLora::from_file(lora_path)?;
                 let applied = model.merge_distill_lora(&lora)?;
                 let expected = cfg.llm.num_hidden_layers * 7 + 2;
@@ -383,9 +382,11 @@ fn load_inner(spec: &LoadSpec, fast: bool) -> gen_core::Result<Box<dyn Generator
     reject_unknown_components(spec, known, id)?;
     // Resolve (and existence-check) the fast variant's distill LoRA at load — from the caller-supplied
     // `distill_lora` component, else the co-located snapshot file — so a missing LoRA fails fast here,
-    // not at first generate (sc-13664: no env side-channel, no HF-cache scan). The base id needs no
-    // LoRA.
-    let distill_lora = if fast {
+    // not at first generate (sc-13664: no env side-channel, no HF-cache scan). A **pre-merged** turnkey
+    // tier (`DISTILL_MERGED_MARKER` present, sc-8775/sc-13787) bakes the merge into its on-disk weights
+    // and ships no LoRA, so it is exempt — resolve+merge is skipped and the dense weights load as-is
+    // (mirrors `mlx-gen-sensenova`'s `load_inner`). The base id needs no LoRA.
+    let distill_lora = if fast && !root.join(DISTILL_MERGED_MARKER).exists() {
         Some(resolve_distill_lora(
             spec.components.get("distill_lora"),
             &root,
@@ -641,6 +642,32 @@ mod tests {
         assert!(!err.contains("SENSENOVA_DISTILL_LORA"), "got: {err}");
         // The base id needs no LoRA — it loads lazily against the same missing path.
         assert!(load(&spec).is_ok(), "base load stays lazy");
+    }
+
+    /// sc-13787 (epic 13678): the **inverse** of [`fast_load_requires_distill_lora_path`]. When a fast
+    /// tier ships the pre-merged `distill_merged.json` marker (a turnkey snapshot bakes the 8-step
+    /// distill merge into its on-disk weights, sc-8775), the loader must SKIP resolving the distill
+    /// LoRA — so a fast load succeeds with the marker present and NO LoRA staged (no `distill_lora`
+    /// component, no co-located file), where the marker-less load above fails. Mirrors
+    /// `mlx-gen-sensenova`'s marker-guarded load. Weights-free: load is lazy, so this exercises only the
+    /// resolve-skip, no backbone I/O.
+    #[test]
+    fn fast_load_skips_distill_lora_when_premerged_marker_present() {
+        let dir =
+            std::env::temp_dir().join(format!("sc13787_premerged_marker_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create tempdir");
+        // The marker keys off existence only; an empty file is enough. No LoRA file, no component.
+        std::fs::write(dir.join(DISTILL_MERGED_MARKER), b"").expect("write marker");
+
+        let spec = LoadSpec::new(WeightsSource::Dir(dir.clone()));
+        let loaded = load_fast(&spec);
+        // Clean up before asserting so a failing assert doesn't leak the tempdir.
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            loaded.is_ok(),
+            "pre-merged fast tier (marker present, no LoRA) must load, got: {:?}",
+            loaded.err()
+        );
     }
 
     /// sc-13664: a staged-but-nonexistent `distill_lora` component errors at load, naming the
