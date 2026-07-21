@@ -46,7 +46,9 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use candle_gen::candle_core::{DType, Tensor};
+#[cfg(test)]
+use candle_gen::candle_core::DType;
+use candle_gen::candle_core::Tensor;
 use candle_gen::gen_core::weightsmeta as wmeta;
 use candle_gen::gen_core::{AdapterKind, AdapterSpec};
 use candle_gen::train::lora::{reconstruct_lokr_delta, reconstruct_lora_delta, LoraAdapterMeta};
