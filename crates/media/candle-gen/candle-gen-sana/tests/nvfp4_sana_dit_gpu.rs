@@ -29,7 +29,8 @@
 //! 0` on real `sm_120`) is asserted here in gates 1–3.
 //!
 //! Weights: the whole `Efficient-Large-Model/Sana_1600M_1024px_diffusers` HF snapshot (transformer +
-//! text_encoder + tokenizer + vae). Resolved from `SC11045_SANA_SNAPSHOT`, else the HF cache.
+//! text_encoder + tokenizer + vae). Passed in via `SC11045_SANA_SNAPSHOT` — inference never
+//! self-fetches or derives a cache location (epic 13657); unset ⇒ the test SKIPs.
 //!
 //! Run (exclusive GPU, `--release`; `-j 1` avoids lld OOM):
 //! ```text
@@ -57,6 +58,10 @@ use candle_gen_sana::{
 };
 
 /// The HF repo the validation runs against.
+// retained as provenance; TODO(sc-13685/epic-13678) — the HF-cache snapshot fallback that read this
+// pin was removed under epic 13657 (inference never self-fetches; the snapshot is passed in via
+// SC11045_SANA_SNAPSHOT), leaving the pin as the provenance record of the parity target.
+#[allow(dead_code)]
 const SANA_REPO: &str = "Efficient-Large-Model/Sana_1600M_1024px_diffusers";
 /// A concrete, detail-rich prompt — a degenerate/empty prompt would not exercise the caption path the
 /// outlier class lives on.

@@ -49,6 +49,16 @@ pub mod harness;
 pub mod mel;
 pub mod wav;
 
+// Test-support helpers shared across the candle audio provider crates. Feature-gated so it never
+// compiles into a production build — provider crates enable `candle-audio/testkit` under
+// `[dev-dependencies]`, mirroring `candle-gen`'s testkit seam. CI compiles it explicitly with
+// `--features candle-audio/testkit` (ci.yml) so the module never sits behind an unexercised cfg
+// (the sc-11990 cfg-hole guard). The HF-cache snapshot scanners this module once held were removed
+// under epic 13657 — inference never self-fetches or derives an HF-cache location; tests take a
+// passed-in snapshot dir via env instead.
+#[cfg(feature = "testkit")]
+pub mod testkit;
+
 /// The candle-backed audio-crate error. gen-core cannot name candle types, so device/tensor
 /// failures arrive boxed in [`gen_core::Error::Backend`] via the [`From`] bridge below —
 /// the same seam `candle-gen`'s `CandleError` provides for the media families (legal under
