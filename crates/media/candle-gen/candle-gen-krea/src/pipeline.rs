@@ -374,19 +374,25 @@ pub(crate) fn load_heavy(
     use_pid: bool,
 ) -> Result<KreaHeavy> {
     let cfg = Krea2Config::from_snapshot(root)?;
-    let dit_w = Weights::from_dir(&root.join("transformer"), device, DIT_DTYPE)?;
+    let mut dit_w = Weights::from_dir(&root.join("transformer"), device, DIT_DTYPE)?;
     crate::convert::validate_transformer(&dit_w, &cfg)?;
-    // Adapters ride as **forward-time additive residuals** on the DiT's projections — on BOTH the packed
-    // and the dense tier (sc-11105, additive-everywhere for epic 10765). The base weight is never mutated:
-    // instead of reconstructing each adapted projection's dense weight (packed tier) or folding `W += δ`
-    // into the mmap (dense tier) — either of which pins an un-evictable in-memory copy — `install_additive`
-    // keeps the base an unmutated mmap/packed base and pushes the LoRA/LoKr delta as an unmerged residual,
-    // so the offload/eviction path can drop-and-restore it cheaply. It equals the old fold to f32 tolerance
-    // (~1 ULP). A non-empty spec that matches no target is a hard error (the worker then falls back rather
-    // than silently rendering unadapted).
+    // ComfyUI/lightx2v **diff-patch** (`.diff`/`.diff_b`) full-weight deltas fold into the dense baseline
+    // weights (the 12→1 `text_fusion.projector` filter-bypass, front-end projections) BEFORE the DiT
+    // builds — these targets are dense on every tier and sit *outside* the additive residual surface
+    // (`install_additive` excludes the projector), so the two passes are disjoint by key suffix.
+    let diff = crate::adapters::fold_diff_patch(&mut dit_w, adapters)?;
+    // The low-rank keys ride as **forward-time additive residuals** on the DiT's projections — on BOTH the
+    // packed and the dense tier (sc-11105, additive-everywhere for epic 10765). The base weight is never
+    // mutated: instead of reconstructing each adapted projection's dense weight (packed tier) or folding
+    // `W += δ` into the mmap (dense tier) — either of which pins an un-evictable in-memory copy —
+    // `install_additive` keeps the base an unmutated mmap/packed base and pushes the LoRA/LoKr delta as an
+    // unmerged residual, so the offload/eviction path can drop-and-restore it cheaply. It equals the old
+    // fold to f32 tolerance (~1 ULP). A non-empty spec that matches no target (across the diff fold AND
+    // the residual install) is a hard error (the worker then falls back rather than silently rendering
+    // unadapted).
     let mut dit = Krea2Transformer::load(&dit_w, &cfg)?;
     if !adapters.is_empty() {
-        crate::adapters::install_additive(&mut dit, adapters)?;
+        crate::adapters::install_additive(&mut dit, adapters, diff.merged)?;
     }
 
     let vae = load_vae(root, device)?;

@@ -72,7 +72,8 @@ pub mod control_provider;
 mod testfix;
 
 pub use adapters::{
-    install_additive, merge_adapters, merge_into_weights, AdditiveReport, MergeReport,
+    fold_diff_patch, install_additive, merge_adapters, merge_into_weights, AdditiveReport,
+    MergeReport,
 };
 pub use config::Krea2Config;
 pub use control_provider::{
