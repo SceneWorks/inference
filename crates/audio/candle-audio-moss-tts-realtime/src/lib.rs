@@ -43,8 +43,11 @@
 //! variable-bitrate decode). [`model::MossTtsRealtimeGenerator`] now renders real 24 kHz audio through
 //! `generate` / `generate_streaming`, and the generator is **registered** into `candle-audio-catalog`.
 //!
-//! Weights resolve through the audio lane's pinned-SHA hub path (F-029): the AR at
-//! [`model::HUB_REPO`]@[`model::HUB_REVISION`] and the codec at
+//! The **AR** stack (the model's own `spec.weights`) resolves through the audio lane's pinned-SHA
+//! hub path (F-029) at [`model::HUB_REPO`]@[`model::HUB_REVISION`]. The **MOSS-Audio-Tokenizer
+//! codec** is a passed-in component (epic 13657, sc-13662): the caller stages its snapshot directory
+//! under [`model::CODEC_COMPONENT_ID`] in [`gen_core::LoadSpec::components`] and it is validated at
+//! load, never self-fetched; the pin the consumer must provision is
 //! [`model::CODEC_HUB_REPO`]@[`model::CODEC_HUB_REVISION`].
 
 pub use candle_audio;
@@ -63,8 +66,8 @@ pub mod sampling;
 
 pub use model::{
     descriptor, load, load_generator, provider_registry, register_providers,
-    resolve_pinned_codec_snapshot, resolve_pinned_snapshot, CODEC_HUB_REPO, CODEC_HUB_REVISION,
-    HUB_REPO, HUB_REVISION, LANGUAGES, MAX_DURATION_SECS, MODEL_ID, REGISTRATION, SAMPLE_RATE,
+    resolve_pinned_snapshot, CODEC_COMPONENT_ID, CODEC_HUB_REPO, CODEC_HUB_REVISION, HUB_REPO,
+    HUB_REVISION, LANGUAGES, MAX_DURATION_SECS, MODEL_ID, REGISTRATION, SAMPLE_RATE,
     WEIGHT_LICENSE, WEIGHT_LICENSE_ENTRY,
 };
 

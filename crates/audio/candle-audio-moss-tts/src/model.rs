@@ -1,6 +1,7 @@
 //! `MossTtsdGenerator` — the [`gen_core::Generator`] for **MOSS-TTSD** (multi-speaker dialogue TTS)
 //! on the candle audio lane (sc-13360), plus its [`descriptor`]/[`load`] entry points, the pinned-SHA
-//! hub paths (AR checkpoint + XY_Tokenizer codec), and the model-weight license.
+//! AR hub path, the XY_Tokenizer codec pin (staged as the passed-in [`CODEC_COMPONENT_ID`] component,
+//! never self-fetched — epic 13657, sc-13662), and the model-weight license.
 //!
 //! ## Honest partial (AR brain landed; XY_Tokenizer codec split off)
 //!
@@ -48,11 +49,23 @@ pub const HUB_REVISION: &str = "8527b9136b6afefe2252ae597cecea2e80e7ebeb";
 /// The XY_Tokenizer codec repo — the separate ~2.1 GB RVQ codec that decodes the AR's 8-codebook
 /// frames into a 24 kHz waveform (ported in [`crate::codec`]). A single raw-pickle `xy_tokenizer.ckpt`
 /// (no HF-standard safetensors layout); its decode-side tensors load through candle's pickle reader.
+///
+/// **The codec is a passed-in component, not a self-fetch (epic 13657, sc-13662).** These pin
+/// constants record *which* checkpoint the consumer must stage under the [`CODEC_COMPONENT_ID`]
+/// component of [`gen_core::LoadSpec::components`]; this crate never fetches it. Provisioning the pin
+/// (fetch + snapshot assembly) is the consumer's job (SceneWorks, epic 13678).
 pub const CODEC_HUB_REPO: &str = "OpenMOSS-Team/XY_Tokenizer_TTSD_V0";
 pub const CODEC_HUB_REVISION: &str = "c83433728e698ed0698e88cb5096bc221fb8f8c5";
 
-/// The single-file XY_Tokenizer checkpoint inside the codec repo (a `torch.load` pickle).
+/// The single-file XY_Tokenizer checkpoint inside the codec repo (a `torch.load` pickle). When the
+/// [`CODEC_COMPONENT_ID`] component is staged as a [`WeightsSource::Dir`], this is the file joined
+/// onto it; a [`WeightsSource::File`] component is used verbatim.
 pub const CODEC_CHECKPOINT_FILE: &str = "xy_tokenizer.ckpt";
+
+/// The [`ModelDescriptor::required_components`] id under which the caller stages the XY_Tokenizer
+/// codec in [`gen_core::LoadSpec::components`] (sc-13662). Validated at load via
+/// [`gen_core::require_component`]; the codec is then built lazily from the staged path.
+pub const CODEC_COMPONENT_ID: &str = "codec";
 
 /// The license of the pinned MOSS-TTSD-v0.5 weight checkpoint (Apache-2.0, permissive) — surfaced for
 /// SceneWorks' end-product licenses page. Verified against the `OpenMOSS-Team/MOSS-TTSD-v0.5` card.
@@ -104,7 +117,7 @@ pub const LANGUAGES: &[&str] = &[
 /// at the token level), with `max_speakers = 2`.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
-        required_components: &[],
+        required_components: &[CODEC_COMPONENT_ID],
         id: MODEL_ID,
         family: "moss_ttsd",
         backend: "candle",
@@ -249,6 +262,10 @@ impl Loaded {
 pub struct MossTtsdGenerator {
     descriptor: ModelDescriptor,
     root: PathBuf,
+    /// The XY_Tokenizer codec checkpoint path, resolved at load from the passed-in
+    /// [`CODEC_COMPONENT_ID`] component (sc-13662). The codec is built lazily from it on first
+    /// synthesize; never a hub fetch.
+    codec_ckpt: PathBuf,
     loaded: Mutex<Option<Arc<Loaded>>>,
     codec: Mutex<Option<Arc<XyTokenizerCodec>>>,
 }
@@ -271,16 +288,17 @@ impl MossTtsdGenerator {
         Ok(built)
     }
 
-    /// Load (once, lazily) the XY_Tokenizer codec decoder. The codec is a separate pinned raw-pickle
-    /// checkpoint resolved through the audio lane's hub path (or the `MOSS_XY_TOKENIZER_SNAPSHOT`
-    /// override); see [`resolve_pinned_codec_checkpoint`].
+    /// Load (once, lazily) the XY_Tokenizer codec decoder from the checkpoint path the caller staged
+    /// as the [`CODEC_COMPONENT_ID`] component at load (sc-13662) — never a hub fetch. The presence of
+    /// the component was already validated in [`load_generator`]; here we build it from the stored
+    /// path on first synthesize.
     fn codec(&self) -> gen_core::Result<Arc<XyTokenizerCodec>> {
         let mut guard = lock_recover(&self.codec);
         if let Some(c) = guard.as_ref() {
             return Ok(c.clone());
         }
-        let ckpt = resolve_pinned_codec_checkpoint().map_err(gen_core::Error::from)?;
-        let built = Arc::new(XyTokenizerCodec::load(&ckpt).map_err(gen_core::Error::from)?);
+        let built =
+            Arc::new(XyTokenizerCodec::load(&self.codec_ckpt).map_err(gen_core::Error::from)?);
         *guard = Some(built.clone());
         Ok(built)
     }
@@ -397,9 +415,26 @@ pub fn load_generator(spec: &LoadSpec) -> gen_core::Result<MossTtsdGenerator> {
             "{MODEL_ID} does not support control/IP-adapter overlays"
         )));
     }
+    // The XY_Tokenizer codec is a passed-in component (epic 13657, sc-13662): validate it at LOAD —
+    // an unknown component key is a typed-`Unsupported` caller mistake, and a missing `codec` is a
+    // caller-actionable load error — so an unprovisioned codec fails here, never as a mid-render
+    // hub fetch. The checkpoint path is resolved from the staged source and stored; the codec is
+    // built lazily from it in the synthesize path.
+    gen_core::reject_unknown_components(spec, &[CODEC_COMPONENT_ID], MODEL_ID)?;
+    let codec_ckpt = match gen_core::require_component(
+        spec,
+        CODEC_COMPONENT_ID,
+        MODEL_ID,
+        "XY_Tokenizer codec",
+    )? {
+        // A snapshot dir carries the single-file checkpoint; a File source is the checkpoint itself.
+        WeightsSource::Dir(p) => p.join(CODEC_CHECKPOINT_FILE),
+        WeightsSource::File(p) => p.clone(),
+    };
     Ok(MossTtsdGenerator {
         descriptor: descriptor(),
         root,
+        codec_ckpt,
         loaded: Mutex::new(None),
         codec: Mutex::new(None),
     })
@@ -429,27 +464,14 @@ pub fn provider_registry() -> gen_core::Result<gen_core::ProviderRegistry> {
     register_providers(gen_core::ProviderRegistryBuilder::new()).build()
 }
 
-/// Materialize the pinned XY_Tokenizer codec checkpoint (`xy_tokenizer.ckpt`) at
-/// [`CODEC_HUB_REVISION`] through the audio lane's F-029 hub path, returning the `.ckpt` file path.
-/// `MOSS_XY_TOKENIZER_SNAPSHOT` overrides with a local snapshot **dir** (the real-weights CI
-/// convention — the file is joined) or a direct `.ckpt` file path (air-gapped runs).
-pub fn resolve_pinned_codec_checkpoint() -> AudioResult<PathBuf> {
-    if let Ok(p) = std::env::var("MOSS_XY_TOKENIZER_SNAPSHOT") {
-        let path = PathBuf::from(p);
-        return Ok(if path.is_dir() {
-            path.join(CODEC_CHECKPOINT_FILE)
-        } else {
-            path
-        });
-    }
-    hf_get_pinned(CODEC_HUB_REPO, CODEC_HUB_REVISION, CODEC_CHECKPOINT_FILE)
-}
-
-/// Materialize the pinned MOSS-TTSD-v0.5 AR snapshot through the audio lane's F-029 hub path:
+/// Materialize the pinned MOSS-TTSD-v0.5 **AR** snapshot through the audio lane's F-029 hub path:
 /// `config.json` (the snapshot-dir probe), the single-file `model.safetensors`, and the Qwen
-/// tokenizer — all at [`HUB_REVISION`]. Also warms the pinned XY_Tokenizer codec checkpoint (see
-/// [`resolve_pinned_codec_checkpoint`]) so a single call fetches both models the provider needs to
-/// render audio. Returns the AR snapshot dir.
+/// tokenizer — all at [`HUB_REVISION`]. Returns the AR snapshot dir.
+///
+/// This resolves the AR brain only (the model's own `spec.weights`). The XY_Tokenizer codec is a
+/// passed-in component (sc-13662): the consumer stages it under [`CODEC_COMPONENT_ID`]; this crate
+/// never fetches it (epic 13657). The pin the consumer must provision is
+/// [`CODEC_HUB_REPO`]@[`CODEC_HUB_REVISION`].
 pub fn resolve_pinned_snapshot() -> AudioResult<WeightsSource> {
     let dir = pinned_snapshot_dir(HUB_REPO, HUB_REVISION, "config.json")?;
     for file in [
@@ -459,8 +481,6 @@ pub fn resolve_pinned_snapshot() -> AudioResult<WeightsSource> {
     ] {
         hf_get_pinned(HUB_REPO, HUB_REVISION, file)?;
     }
-    // Also warm the codec checkpoint — the provider needs both to render a waveform.
-    let _ = resolve_pinned_codec_checkpoint()?;
     Ok(dir)
 }
 
@@ -475,6 +495,16 @@ mod tests {
             audio: Some(audio),
             ..Default::default()
         }
+    }
+
+    /// A `LoadSpec` with the required `codec` component staged (a placeholder path — the codec is
+    /// built lazily, so `load` never touches it). Every load in these weightless tests goes through
+    /// here so the sc-13662 component gate is satisfied.
+    fn spec_with_codec(dir: PathBuf) -> LoadSpec {
+        LoadSpec::new(WeightsSource::Dir(dir)).with_component(
+            CODEC_COMPONENT_ID,
+            WeightsSource::File(PathBuf::from("/nonexistent/xy_tokenizer.ckpt")),
+        )
     }
 
     #[test]
@@ -596,7 +626,7 @@ mod tests {
         let dir = std::env::temp_dir().join("moss-ttsd-no-weights");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let g = load_generator(&LoadSpec::new(WeightsSource::Dir(dir))).unwrap();
+        let g = load_generator(&spec_with_codec(dir)).unwrap();
         let req = audio_req(AudioParams {
             sample_rate: Some(24_000),
             ..Default::default()
@@ -611,7 +641,7 @@ mod tests {
     fn pre_tripped_cancel_returns_typed_canceled() {
         let dir = std::env::temp_dir().join("moss-ttsd-cancel");
         std::fs::create_dir_all(&dir).unwrap();
-        let g = load_generator(&LoadSpec::new(WeightsSource::Dir(dir))).unwrap();
+        let g = load_generator(&spec_with_codec(dir)).unwrap();
         let flag = CancelFlag::new();
         flag.cancel();
         let req = GenerationRequest {
@@ -629,9 +659,26 @@ mod tests {
         let dir = std::env::temp_dir();
         let spec = LoadSpec::new(WeightsSource::File(dir.join("x.safetensors")));
         assert!(load(&spec).is_err());
-        let mut spec = LoadSpec::new(WeightsSource::Dir(dir.clone()));
+        let mut spec = spec_with_codec(dir.clone());
         spec.quantize = Some(gen_core::Quant::Q4);
         assert!(matches!(load(&spec), Err(gen_core::Error::Unsupported(_))));
+    }
+
+    /// Weights-free proof of the sc-13662 load-time codec gate: a fully-provisioned spec loads, but
+    /// removing the required `codec` component (or adding an unknown one) fails at LOAD — the codec is
+    /// never fetched mid-render (epic 13657). Driven through the real `load` by the shared testkit.
+    #[test]
+    fn missing_codec_component_fails_at_load() {
+        let dir = std::env::temp_dir().join("moss-ttsd-load-gate");
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = spec_with_codec(dir);
+        // The fully-provisioned spec loads (the codec is lazy — no path read yet).
+        assert!(
+            load(&base).is_ok(),
+            "a spec staging the required codec component must load"
+        );
+        gen_core_testkit::check_component_load_gate(load, &base, &[CODEC_COMPONENT_ID])
+            .expect("missing / unknown codec component must be a load-time error");
     }
 
     #[test]

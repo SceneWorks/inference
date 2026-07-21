@@ -36,8 +36,11 @@
 //! generator is **registered** into `candle-audio-catalog`. [`model::MossTtsdGenerator::rvq_frames`]
 //! still exposes the AR token stream (for the AR-stage conformance test).
 //!
-//! Weights resolve through the audio lane's pinned-SHA hub path (F-029): the AR checkpoint at
-//! [`model::HUB_REPO`]@[`model::HUB_REVISION`]; the codec checkpoint at
+//! The **AR checkpoint** (the model's own `spec.weights`) resolves through the audio lane's
+//! pinned-SHA hub path (F-029) at [`model::HUB_REPO`]@[`model::HUB_REVISION`]. The **XY_Tokenizer
+//! codec** is a passed-in component (epic 13657, sc-13662): the caller stages it under
+//! [`model::CODEC_COMPONENT_ID`] in [`gen_core::LoadSpec::components`] and it is validated at load,
+//! never self-fetched; the pin the consumer must provision is
 //! [`model::CODEC_HUB_REPO`]@[`model::CODEC_HUB_REVISION`].
 
 pub use candle_audio;
@@ -54,9 +57,9 @@ pub mod sampling;
 
 pub use model::{
     descriptor, load, load_generator, provider_registry, register_providers,
-    resolve_pinned_codec_checkpoint, resolve_pinned_snapshot, CODEC_HUB_REPO, CODEC_HUB_REVISION,
-    HUB_REPO, HUB_REVISION, LANGUAGES, MAX_DURATION_SECS, MAX_SPEAKERS, MODEL_ID, REGISTRATION,
-    SAMPLE_RATE, WEIGHT_LICENSE, WEIGHT_LICENSE_ENTRY,
+    resolve_pinned_snapshot, CODEC_CHECKPOINT_FILE, CODEC_COMPONENT_ID, CODEC_HUB_REPO,
+    CODEC_HUB_REVISION, HUB_REPO, HUB_REVISION, LANGUAGES, MAX_DURATION_SECS, MAX_SPEAKERS,
+    MODEL_ID, REGISTRATION, SAMPLE_RATE, WEIGHT_LICENSE, WEIGHT_LICENSE_ENTRY,
 };
 
 /// This crate's model-weight-license entries — one row keyed by [`MODEL_ID`]. The audio catalog
