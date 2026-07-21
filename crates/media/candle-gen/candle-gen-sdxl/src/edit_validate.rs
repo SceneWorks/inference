@@ -14,7 +14,10 @@
 //!
 //! Run (after deploying weights into the HF cache / a local dir):
 //! ```text
-//! set EDIT_SDXL_BASE=...\RealVisXL_V5.0   # diffusers tree (unet/, text_encoder{,_2}/, vae omitted — f16-fix VAE via hf-hub)
+//! set EDIT_SDXL_BASE=...\RealVisXL_V5.0   # diffusers tree (unet/, text_encoder{,_2}/, vae omitted)
+//! set SDXL_TOKENIZER_CLIP_L_DIR=...       # CLIP-L tokenizer dir (tokenizer.json) — passed-in component
+//! set SDXL_TOKENIZER_CLIP_BIGG_DIR=...    # CLIP-bigG tokenizer dir (tokenizer.json)
+//! set SDXL_VAE_FP16_FIX_DIR=...           # madebyollin/sdxl-vae-fp16-fix dir (diffusion_pytorch_model.safetensors)
 //! set EDIT_SRC=...\src.ppm                # a source image (P6 PPM)
 //! set EDIT_OUT=...\out                    # output dir
 //! cargo test -p candle-gen-sdxl --features cuda --release edit_validate::real_weight -- --ignored --nocapture
@@ -24,7 +27,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use candle_gen::gen_core::runtime::CancelFlag;
-use candle_gen::gen_core::{Image, Progress};
+use candle_gen::gen_core::{Image, Progress, WeightsSource};
 use candle_gen::testkit::{env_path, read_ppm, write_ppm};
 
 use crate::edit_provider::{SdxlEdit, SdxlEditPaths, SdxlEditRequest};
@@ -75,6 +78,11 @@ fn real_weight_edit() {
 
     let paths = SdxlEditPaths {
         sdxl_base: env_path("EDIT_SDXL_BASE"),
+        // epic 13657 / sc-13663: the tokenizers + fp16-fix VAE are passed-in components (env-pointed
+        // local dirs), never self-fetched. Point each at the CLIP tokenizer / VAE snapshot dir.
+        tokenizer_clip_l: WeightsSource::Dir(env_path("SDXL_TOKENIZER_CLIP_L_DIR")),
+        tokenizer_clip_bigg: WeightsSource::Dir(env_path("SDXL_TOKENIZER_CLIP_BIGG_DIR")),
+        vae_fp16_fix: WeightsSource::Dir(env_path("SDXL_VAE_FP16_FIX_DIR")),
     };
     let source = read_ppm(&env_path("EDIT_SRC"));
     println!(

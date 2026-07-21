@@ -133,6 +133,15 @@ pub struct InstantIdPaths {
     /// IdentityNet + face IP-Adapter. Empty (the common case) is a no-op. Distinct from
     /// [`ip_adapter`](Self::ip_adapter), which is the InstantID identity IP-Adapter.
     pub adapters: Vec<AdapterSpec>,
+    /// The CLIP-L tokenizer component (`tokenizer_clip_l`, epic 13657 / sc-13663). InstantID reuses
+    /// `candle_gen_sdxl::SdxlConditioner`, whose tokenizers are now **passed in** (never self-fetched);
+    /// the consumer stages this (a `tokenizer.json` file or its dir).
+    pub tokenizer_clip_l: WeightsSource,
+    /// The CLIP-bigG tokenizer component (`tokenizer_clip_bigg`) — a `tokenizer.json` file or its dir.
+    pub tokenizer_clip_bigg: WeightsSource,
+    /// The fp16-stable VAE component (`vae_fp16_fix`) — the `.safetensors` file or its dir. Reused by
+    /// `candle_gen_sdxl::load_sdxl_vae`, now passed in rather than self-fetched.
+    pub vae_fp16_fix: WeightsSource,
 }
 
 /// One InstantID generation request.
@@ -221,7 +230,13 @@ impl InstantId {
         let device = candle_gen::default_device()?;
         let root = paths.sdxl_base.as_path();
 
-        let conditioner = SdxlConditioner::load(root, &device, DTYPE)?;
+        let conditioner = SdxlConditioner::load(
+            root,
+            &device,
+            DTYPE,
+            &paths.tokenizer_clip_l,
+            &paths.tokenizer_clip_bigg,
+        )?;
         // User LoRA/LoKr (sc-6038) folds into the dense UNet weights before the IP-Adapter K/V pairs
         // install below — SDXL-family LoRAs apply to the InstantID RealVisXL backbone just like the
         // registry SDXL path. Empty is the mmap fast path.
@@ -245,7 +260,7 @@ impl InstantId {
         let pairs = load_ip_kv_pairs(&ipa)?;
         unet.install_ip_adapter(pairs)?;
 
-        let vae = load_sdxl_vae(&device, DTYPE)?;
+        let vae = load_sdxl_vae(&paths.vae_fp16_fix, &device, DTYPE)?;
         Ok(Self {
             conditioner,
             unet,

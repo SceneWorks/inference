@@ -22,6 +22,7 @@ use std::path::Path;
 use candle_core::{DType, Device, IndexOp, Tensor, D};
 use tokenizers::Tokenizer;
 
+use candle_gen::gen_core::WeightsSource;
 use candle_gen::quant::QLinear;
 use candle_gen::{CandleError, Result};
 
@@ -29,7 +30,7 @@ use candle_gen::{CandleError, Result};
 // `stable_diffusion::clip` — a dense snapshot loads exactly as before, a packed MLX tier loads its
 // dual CLIP straight from the packed parts.
 use crate::clip::{self, ClipTextTransformer};
-use crate::pipeline::{hf_get, snapshot_file, Clip};
+use crate::pipeline::{resolve_tokenizer_file, snapshot_file, Clip};
 
 /// Pad/truncate-check a token id list to exactly `max_len`: error if longer (parity with the txt2img
 /// path's hard reject — a silently truncated prompt drops conditioning), else right-pad with `pad_id`.
@@ -135,20 +136,35 @@ fn load_clip_tower(
 
 impl SdxlConditioner {
     /// Load both CLIP encoders from the SDXL snapshot (`text_encoder/` = CLIP-L, `text_encoder_2/` =
-    /// bigG), the bigG `text_projection`, and the two model-agnostic tokenizers (cached via `hf-hub`,
-    /// exactly as the txt2img path). `dtype` is the compute dtype (f16 for production). Both encoders
-    /// and the projection head packed-detect through the vendored tower (sc-9527), so a packed MLX tier
-    /// loads its dual CLIP straight from the packed parts; a dense snapshot is byte-identical.
-    pub fn load(root: &Path, device: &Device, dtype: DType) -> Result<Self> {
+    /// bigG), the bigG `text_projection`, and the two model-agnostic tokenizers from the caller-staged
+    /// `tokenizer_clip_l` / `tokenizer_clip_bigg` components (epic 13657, sc-13663 — passed in, never
+    /// self-fetched). `dtype` is the compute dtype (f16 for production). Both encoders and the
+    /// projection head packed-detect through the vendored tower (sc-9527), so a packed MLX tier loads
+    /// its dual CLIP straight from the packed parts; a dense snapshot is byte-identical.
+    pub fn load(
+        root: &Path,
+        device: &Device,
+        dtype: DType,
+        tokenizer_clip_l: &WeightsSource,
+        tokenizer_clip_bigg: &WeightsSource,
+    ) -> Result<Self> {
         let cfg_l = clip::Config::sdxl();
         let cfg_g = clip::Config::sdxl2();
-        let (tok_l_repo, _l_sub) = Clip::L.sources();
-        let (tok_g_repo, _g_sub) = Clip::BigG.sources();
 
-        let tok_l = Tokenizer::from_file(hf_get(tok_l_repo, "tokenizer.json")?)
-            .map_err(|e| CandleError::Msg(format!("load tokenizer {tok_l_repo}: {e}")))?;
-        let tok_g = Tokenizer::from_file(hf_get(tok_g_repo, "tokenizer.json")?)
-            .map_err(|e| CandleError::Msg(format!("load tokenizer {tok_g_repo}: {e}")))?;
+        let tok_l_file = resolve_tokenizer_file(tokenizer_clip_l);
+        let tok_g_file = resolve_tokenizer_file(tokenizer_clip_bigg);
+        let tok_l = Tokenizer::from_file(&tok_l_file).map_err(|e| {
+            CandleError::Msg(format!(
+                "sdxl: load CLIP-L tokenizer from {}: {e}",
+                tok_l_file.display()
+            ))
+        })?;
+        let tok_g = Tokenizer::from_file(&tok_g_file).map_err(|e| {
+            CandleError::Msg(format!(
+                "sdxl: load CLIP-bigG tokenizer from {}: {e}",
+                tok_g_file.display()
+            ))
+        })?;
 
         // sc-9527: build each encoder through the vendored, packed-detecting tower. On a packed MLX
         // tier the weights live under `text_encoder{,_2}/model.safetensors` (with `.scales` siblings);

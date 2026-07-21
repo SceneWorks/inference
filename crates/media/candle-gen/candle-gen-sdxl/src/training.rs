@@ -74,7 +74,8 @@ use candle_transformers::models::stable_diffusion::vae::AutoEncoderKL;
 use crate::denoise::decode_image;
 use crate::loaders::load_sdxl_vae;
 use crate::pipeline::{
-    hf_get, sdxl_alpha_schedule, snapshot_file, Clip, VAE_FIX_FILE, VAE_FIX_REPO, VAE_SCALE,
+    resolve_tokenizer_file, resolve_vae_file, sdxl_alpha_schedule, snapshot_file, Clip,
+    SdxlComponents, VAE_SCALE,
 };
 use crate::unet::{sdxl_unet_config, UNet2DConditionModel, VaeMomentsEncoder};
 use crate::MODEL_ID;
@@ -114,20 +115,37 @@ struct DualClip {
 
 impl DualClip {
     /// Load CLIP-L (`text_encoder/`) + CLIP-bigG (`text_encoder_2/`) from the snapshot and their
-    /// tokenizers from HF — the same sources the inference [`crate::pipeline`] uses, at f32.
-    fn load(root: &Path, device: &Device) -> Result<Self> {
+    /// tokenizers from the caller-staged `tokenizer_clip_l` / `tokenizer_clip_bigg` components (epic
+    /// 13657, sc-13663 — passed in, never self-fetched) — the same sources the inference
+    /// [`crate::pipeline`] uses, at f32.
+    fn load(
+        root: &Path,
+        device: &Device,
+        tokenizer_clip_l: &WeightsSource,
+        tokenizer_clip_bigg: &WeightsSource,
+    ) -> Result<Self> {
         let cfg = StableDiffusionConfig::sdxl(None, None, None);
         let l_cfg = &cfg.clip;
         let g_cfg = cfg
             .clip2
             .as_ref()
             .ok_or_else(|| CandleError::Msg("sdxl config missing clip2".into()))?;
-        let (l_tok_repo, l_weights) = Clip::L.sources();
-        let (g_tok_repo, g_weights) = Clip::BigG.sources();
-        let tok_l = Tokenizer::from_file(hf_get(l_tok_repo, "tokenizer.json")?)
-            .map_err(|e| CandleError::Msg(format!("load tokenizer {l_tok_repo}: {e}")))?;
-        let tok_g = Tokenizer::from_file(hf_get(g_tok_repo, "tokenizer.json")?)
-            .map_err(|e| CandleError::Msg(format!("load tokenizer {g_tok_repo}: {e}")))?;
+        let (_l_tok_repo, l_weights) = Clip::L.sources();
+        let (_g_tok_repo, g_weights) = Clip::BigG.sources();
+        let l_tok_file = resolve_tokenizer_file(tokenizer_clip_l);
+        let g_tok_file = resolve_tokenizer_file(tokenizer_clip_bigg);
+        let tok_l = Tokenizer::from_file(&l_tok_file).map_err(|e| {
+            CandleError::Msg(format!(
+                "sdxl: load CLIP-L tokenizer from {}: {e}",
+                l_tok_file.display()
+            ))
+        })?;
+        let tok_g = Tokenizer::from_file(&g_tok_file).map_err(|e| {
+            CandleError::Msg(format!(
+                "sdxl: load CLIP-bigG tokenizer from {}: {e}",
+                g_tok_file.display()
+            ))
+        })?;
         let l = stable_diffusion::build_clip_transformer(
             l_cfg,
             snapshot_file(root, l_weights)?,
@@ -506,6 +524,11 @@ pub struct SdxlTrainer {
     descriptor: TrainerDescriptor,
     root: PathBuf,
     device: Device,
+    /// The three caller-staged SDXL components (epic 13657, sc-13663): the CLIP-L/bigG tokenizers +
+    /// the fp16-fix VAE, validated at [`load_trainer`] and consumed in [`train`](Trainer::train) in
+    /// place of the deleted `hf_get` self-fetch. The trainer takes the same components through its
+    /// spec as the registered generator.
+    component_paths: SdxlComponents,
 }
 
 /// Construct the (lazy) candle SDXL trainer from a [`LoadSpec`] whose `weights` is the SDXL snapshot
@@ -519,10 +542,15 @@ pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
                 .into(),
         )),
     };
+    // epic 13657 (sc-13663) load gate: the trainer consumes the SAME three passed-in components as the
+    // registered generator through its spec. Validate them up front (a missing one is a caller-
+    // actionable load-time error; an unknown key is rejected); the paths are read lazily at `train`.
+    let component_paths = SdxlComponents::from_spec(spec, MODEL_ID)?;
     Ok(Box::new(SdxlTrainer {
         descriptor: trainer_descriptor(),
         root,
         device: candle_gen::default_device()?,
+        component_paths,
     }))
 }
 
@@ -586,13 +614,18 @@ impl SdxlTrainer {
         on_progress(TrainingProgress::LoadingModel);
         let vae = {
             let vb = candle_gen::mmap_var_builder(
-                &[hf_get(VAE_FIX_REPO, VAE_FIX_FILE)?],
+                &[resolve_vae_file(&self.component_paths.vae_fp16_fix)],
                 DType::F32,
                 device,
             )?;
             VaeMomentsEncoder::new(vb, VAE_SCALE)?
         };
-        let clip = DualClip::load(&self.root, device)?;
+        let clip = DualClip::load(
+            &self.root,
+            device,
+            &self.component_paths.tokenizer_clip_l,
+            &self.component_paths.tokenizer_clip_bigg,
+        )?;
 
         let total = req.items.len() as u32;
         let mut cache: Vec<(Tensor, Tensor)> = Vec::with_capacity(req.items.len());
@@ -627,7 +660,8 @@ impl SdxlTrainer {
                     conds.push(Tensor::cat(&[uncond.clone(), cond], 0)?.to_dtype(compute_dtype)?);
                     prompts.push(prompt.clone());
                 }
-                let vae_decoder = load_sdxl_vae(device, compute_dtype)?;
+                let vae_decoder =
+                    load_sdxl_vae(&self.component_paths.vae_fp16_fix, device, compute_dtype)?;
                 Some(SamplePreview {
                     conds,
                     prompts,
@@ -832,6 +866,25 @@ mod tests {
     use crate::unet::{BlockConfig, UNet2DConditionModelConfig};
     use candle_core::{DType, Device};
     use candle_nn::{VarBuilder, VarMap};
+
+    /// A lazy-loadable trainer spec: the given `weights` plus the three staged components (epic 13657,
+    /// sc-13663) the trainer load gate now requires. Placeholder component paths are never read until
+    /// `train`, so they are fine for the lazy-resolution + validate tests here.
+    fn trainer_spec(weights: WeightsSource) -> LoadSpec {
+        LoadSpec::new(weights)
+            .with_component(
+                "tokenizer_clip_l",
+                WeightsSource::File("/nonexistent/clip_l/tokenizer.json".into()),
+            )
+            .with_component(
+                "tokenizer_clip_bigg",
+                WeightsSource::File("/nonexistent/clip_bigg/tokenizer.json".into()),
+            )
+            .with_component(
+                "vae_fp16_fix",
+                WeightsSource::File("/nonexistent/vae.safetensors".into()),
+            )
+    }
 
     /// A tiny SDXL-shaped UNet (one cross-attn down block + one basic block + cross-attn mid/up) that
     /// exercises the LoRA seam + the block-segment checkpointing cheaply on CPU, with random weights.
@@ -1048,7 +1101,7 @@ mod tests {
     /// SDXL trainer; `load_trainer` is lazy, so a nonexistent weights dir still resolves.
     #[test]
     fn trainer_registers_and_resolves_as_candle() {
-        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let spec = trainer_spec(WeightsSource::Dir("/nonexistent".into()));
         let t = crate::provider_registry()
             .unwrap()
             .load_trainer("sdxl", &spec)
@@ -1059,11 +1112,44 @@ mod tests {
         assert!(t.descriptor().supports_lokr);
     }
 
+    /// epic 13657 (sc-13663): the trainer takes the SAME three components as the registered generator
+    /// through its spec, and its load gate rejects a missing or unknown one up front — a caller-
+    /// actionable load-time error, not a mid-train fetch. Weights-free (the paths are never read here).
+    #[test]
+    fn trainer_load_gates_on_components() {
+        // All three staged ⇒ resolves.
+        let ok = trainer_spec(WeightsSource::Dir("/nonexistent".into()));
+        assert!(load_trainer(&ok).is_ok());
+
+        // Each required id removed in turn ⇒ a load error naming the missing id.
+        for id in ["tokenizer_clip_l", "tokenizer_clip_bigg", "vae_fp16_fix"] {
+            let mut spec = trainer_spec(WeightsSource::Dir("/nonexistent".into()));
+            spec.components.remove(id);
+            let err = load_trainer(&spec)
+                .err()
+                .unwrap_or_else(|| panic!("missing '{id}' must be a load error"))
+                .to_string();
+            assert!(
+                err.contains(id),
+                "the error must name the missing id '{id}': {err}"
+            );
+        }
+
+        // An unrecognized component key ⇒ a load error (the reject-unknown guard).
+        let mut bad = trainer_spec(WeightsSource::Dir("/nonexistent".into()));
+        bad.components
+            .insert("mystery".to_string(), WeightsSource::File("/m".into()));
+        assert!(
+            load_trainer(&bad).is_err(),
+            "an unknown component key must be rejected at trainer load"
+        );
+    }
+
     /// `validate` rejects an empty dataset, zero rank, and an unsupported optimizer before any load.
     #[test]
     fn validate_rejects_bad_requests() {
         use candle_gen::gen_core::runtime::CancelFlag;
-        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let spec = trainer_spec(WeightsSource::Dir("/nonexistent".into()));
         let t = crate::provider_registry()
             .unwrap()
             .load_trainer("sdxl", &spec)

@@ -15,6 +15,9 @@
 //! set IP_SDXL_BASE=...\RealVisXL_V5.0           # diffusers tree (unet/, text_encoder{,_2}/, …)
 //! set IP_BUNDLE=...\ip-adapter-plus_sdxl_vit-h.safetensors
 //! set IP_IMAGE_ENCODER=...\image_encoder        # dir with model.safetensors (or the file)
+//! set SDXL_TOKENIZER_CLIP_L_DIR=...             # CLIP-L tokenizer dir (tokenizer.json) — passed-in component
+//! set SDXL_TOKENIZER_CLIP_BIGG_DIR=...          # CLIP-bigG tokenizer dir (tokenizer.json)
+//! set SDXL_VAE_FP16_FIX_DIR=...                 # madebyollin/sdxl-vae-fp16-fix dir (diffusion_pytorch_model.safetensors)
 //! set IP_REF=...\ref.ppm                        # a reference image (P6 PPM)
 //! set IP_OUT=...\out                            # output dir
 //! cargo test -p candle-gen-sdxl --features cuda --release ip_validate::real_weight -- --ignored --nocapture
@@ -27,7 +30,7 @@ use std::sync::Arc;
 use candle_core::DType;
 
 use candle_gen::gen_core::runtime::CancelFlag;
-use candle_gen::gen_core::{Image, Progress};
+use candle_gen::gen_core::{Image, Progress, WeightsSource};
 // The sdxl-local `cosine` is a BARE dot product (inputs are already L2-normalized by
 // `ClipMetric::feature`), so map it to the shared `cosine_dot` — NOT `cosine`, which would
 // re-normalize and change the metric.
@@ -96,6 +99,10 @@ fn real_weight_ip_adapter() {
         sdxl_base: env_path("IP_SDXL_BASE"),
         ip_adapter: env_path("IP_BUNDLE"),
         image_encoder: image_encoder.clone(),
+        // epic 13657 / sc-13663: tokenizers + fp16-fix VAE are passed-in components (env-pointed dirs).
+        tokenizer_clip_l: WeightsSource::Dir(env_path("SDXL_TOKENIZER_CLIP_L_DIR")),
+        tokenizer_clip_bigg: WeightsSource::Dir(env_path("SDXL_TOKENIZER_CLIP_BIGG_DIR")),
+        vae_fp16_fix: WeightsSource::Dir(env_path("SDXL_VAE_FP16_FIX_DIR")),
     };
     let reference = read_ppm(&env_path("IP_REF"));
     println!(

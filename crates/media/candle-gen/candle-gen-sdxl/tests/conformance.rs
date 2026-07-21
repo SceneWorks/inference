@@ -47,12 +47,26 @@ use candle_gen::gen_core::{
 };
 use gen_core_testkit::{conformance, Profile};
 
+/// Stage the three passed-in SDXL components (epic 13657 / sc-13663) onto a spec from explicit,
+/// env-pointed local dirs (no hub fetch): the CLIP-L/bigG tokenizer dirs (`tokenizer.json`) and the
+/// fp16-fix VAE dir (`diffusion_pytorch_model.safetensors`). Real-weight, so `#[ignore]`d.
+fn with_sdxl_components(spec: LoadSpec) -> LoadSpec {
+    let dir = |k: &str| {
+        WeightsSource::Dir(PathBuf::from(
+            std::env::var(k).unwrap_or_else(|_| panic!("set {k} to the component's local dir")),
+        ))
+    };
+    spec.with_component("tokenizer_clip_l", dir("SDXL_TOKENIZER_CLIP_L_DIR"))
+        .with_component("tokenizer_clip_bigg", dir("SDXL_TOKENIZER_CLIP_BIGG_DIR"))
+        .with_component("vae_fp16_fix", dir("SDXL_VAE_FP16_FIX_DIR"))
+}
+
 #[test]
 #[ignore = "needs SDXL_SNAPSHOT (a diffusers snapshot dir) + a CUDA GPU; run with --features cuda --ignored"]
 fn sdxl_conformance() {
     let snap = std::env::var("SDXL_SNAPSHOT")
         .expect("set SDXL_SNAPSHOT to a stabilityai/stable-diffusion-xl-base-1.0 snapshot dir");
-    let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(snap)));
+    let spec = with_sdxl_components(LoadSpec::new(WeightsSource::Dir(PathBuf::from(snap))));
 
     // 512² (≥ the descriptor's min_size 512) at a small step count keeps the suite's ~4 generate()
     // calls cheap — it verifies contract behavior, not image quality. `steps` must equal what the
@@ -86,7 +100,7 @@ fn sdxl_conformance() {
 fn realvisxl_conformance() {
     let snap = std::env::var("REALVISXL_SNAPSHOT")
         .expect("set REALVISXL_SNAPSHOT to an SG161222/RealVisXL_V5.0 snapshot dir");
-    let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(snap)));
+    let spec = with_sdxl_components(LoadSpec::new(WeightsSource::Dir(PathBuf::from(snap))));
 
     // Same cheap 512²/4-step profile as sdxl_conformance — this verifies contract parity, not image
     // quality; the human-eyeball check is the txt2img example pointed at a RealVisXL snapshot.
@@ -121,7 +135,7 @@ fn realvisxl_lightning_render() {
         "set REALVISXL_LIGHTNING_SNAPSHOT to a distilled RealVisXL Lightning / SDXL-Lightning \
          diffusers snapshot dir",
     );
-    let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(snap)));
+    let spec = with_sdxl_components(LoadSpec::new(WeightsSource::Dir(PathBuf::from(snap))));
     let gen = candle_gen_sdxl::load(&spec).unwrap();
 
     let req = GenerationRequest {

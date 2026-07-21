@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::sampling::{schedule_sigmas, DiscreteModelSampling, Scheduler, Solver};
-use candle_gen::gen_core::{Image, Progress};
+use candle_gen::gen_core::{Image, Progress, WeightsSource};
 // Shared ancestral-step RNG salt (`seed + STEP_RNG_SALT`) — one home in `candle-gen` (sc-9043 / F-059).
 // `LatentDecoder` is the decode seam the optional PiD student implements (epic 7840, sc-8044).
 use candle_gen::gen_core::PidWeights;
@@ -62,6 +62,13 @@ pub struct IpAdapterSdxlPaths {
     /// The CLIP ViT-H/14 image encoder — a dir (`model(.fp16).safetensors`) or the file directly
     /// (`h94/IP-Adapter` `models/image_encoder`).
     pub image_encoder: PathBuf,
+    /// The CLIP-L tokenizer component (`tokenizer_clip_l`, epic 13657 / sc-13663) — passed in, never
+    /// self-fetched. A `tokenizer.json` file or its dir.
+    pub tokenizer_clip_l: WeightsSource,
+    /// The CLIP-bigG tokenizer component (`tokenizer_clip_bigg`) — a `tokenizer.json` file or its dir.
+    pub tokenizer_clip_bigg: WeightsSource,
+    /// The fp16-stable VAE component (`vae_fp16_fix`) — the `.safetensors` file or its dir.
+    pub vae_fp16_fix: WeightsSource,
 }
 
 /// One SDXL IP-Adapter generation request.
@@ -166,7 +173,13 @@ impl IpAdapterSdxl {
         let device = candle_gen::default_device()?;
         let root = paths.sdxl_base.as_path();
 
-        let conditioner = SdxlConditioner::load(root, &device, DTYPE)?;
+        let conditioner = SdxlConditioner::load(
+            root,
+            &device,
+            DTYPE,
+            &paths.tokenizer_clip_l,
+            &paths.tokenizer_clip_bigg,
+        )?;
         let mut unet = load_instantid_unet(root, &device, DTYPE)?;
 
         // IP-Adapter-Plus bundle: the Resampler (`image_proj.*`) + the decoupled K/V pairs
@@ -193,7 +206,7 @@ impl IpAdapterSdxl {
         let encoder = ClipVisionEncoder::from_weights(&enc_w, &enc_cfg)?;
         let ip_encoder = IpImageEncoder::new(encoder, resampler, enc_cfg.image_size);
 
-        let vae = load_sdxl_vae(&device, DTYPE)?;
+        let vae = load_sdxl_vae(&paths.vae_fp16_fix, &device, DTYPE)?;
         Ok(Self {
             conditioner,
             unet,

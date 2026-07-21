@@ -33,10 +33,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let prompt = "a red fox sitting in a snowy pine forest at dawn, sharp fur detail".to_string();
 
     eprintln!("model {model}\nbase  {base}\npid   {pid}\ngemma {gemma}");
-    let spec = LoadSpec::new(WeightsSource::Dir(base.into())).with_pid(
-        WeightsSource::File(pid.into()),
-        WeightsSource::Dir(gemma.into()),
-    );
+    // epic 13657 / sc-13663: the CLIP tokenizers + fp16-fix VAE are passed-in components (env-pointed
+    // local dirs: SDXL_TOKENIZER_CLIP_L_DIR / SDXL_TOKENIZER_CLIP_BIGG_DIR / SDXL_VAE_FP16_FIX_DIR).
+    let component = |env: &str| -> Result<WeightsSource, Box<dyn std::error::Error>> {
+        let dir =
+            std::env::var(env).map_err(|_| format!("set {env} to the SDXL component's dir"))?;
+        Ok(WeightsSource::Dir(dir.into()))
+    };
+    let spec = LoadSpec::new(WeightsSource::Dir(base.into()))
+        .with_pid(
+            WeightsSource::File(pid.into()),
+            WeightsSource::Dir(gemma.into()),
+        )
+        .with_component("tokenizer_clip_l", component("SDXL_TOKENIZER_CLIP_L_DIR")?)
+        .with_component(
+            "tokenizer_clip_bigg",
+            component("SDXL_TOKENIZER_CLIP_BIGG_DIR")?,
+        )
+        .with_component("vae_fp16_fix", component("SDXL_VAE_FP16_FIX_DIR")?);
     let gen = candle_gen_sdxl::provider_registry()?.load(&model, &spec)?;
     let mut op = |p: Progress| match p {
         Progress::Step { current, total } => eprintln!("  step {current}/{total}"),

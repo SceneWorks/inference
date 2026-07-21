@@ -18,7 +18,7 @@ use candle_transformers::models::stable_diffusion::StableDiffusionConfig;
 use candle_gen::gen_core::{AdapterSpec, WeightsSource};
 use candle_gen::{CandleError, Result};
 
-use crate::pipeline::{hf_get, snapshot_file, VAE_FIX_FILE, VAE_FIX_REPO, VAE_SCALE};
+use crate::pipeline::{resolve_vae_file, snapshot_file, VAE_SCALE};
 use crate::unet::{
     sdxl_unet_config, ControlNet, ControlNetConfig, UNet2DConditionModel, VaeMomentsEncoder,
 };
@@ -129,11 +129,16 @@ pub fn load_instantid_unet_with_adapters(
     }
 }
 
-/// Load the f16-stable SDXL VAE (`madebyollin/sdxl-vae-fp16-fix`, resolved via `hf-hub` exactly as the
-/// txt2img path) at `dtype`. Resolution-agnostic — `build_vae` reads only the autoencoder sub-config.
-pub fn load_sdxl_vae(device: &Device, dtype: DType) -> Result<AutoEncoderKL> {
+/// Load the f16-stable SDXL VAE (`madebyollin/sdxl-vae-fp16-fix`) from the caller-staged `vae_fp16_fix`
+/// component (epic 13657, sc-13663 — passed in, never self-fetched) at `dtype`. Resolution-agnostic —
+/// `build_vae` reads only the autoencoder sub-config.
+pub fn load_sdxl_vae(
+    vae_fp16_fix: &WeightsSource,
+    device: &Device,
+    dtype: DType,
+) -> Result<AutoEncoderKL> {
     let config = StableDiffusionConfig::sdxl(None, None, None);
-    Ok(config.build_vae(hf_get(VAE_FIX_REPO, VAE_FIX_FILE)?, device, dtype)?)
+    Ok(config.build_vae(resolve_vae_file(vae_fp16_fix), device, dtype)?)
 }
 
 /// Load the **deterministic VAE moments-encoder** for the SDXL edit path (sc-6037) — the encode
@@ -142,8 +147,12 @@ pub fn load_sdxl_vae(device: &Device, dtype: DType) -> Result<AutoEncoderKL> {
 /// device-RNG `sample` (non-portable; the very thing sc-3673 banned), so `VaeMomentsEncoder`
 /// (vendored for the trainer, sc-5165) is reused to take the clean latent **mean** × `VAE_SCALE`
 /// (0.13025) — the launch-portable img2img/inpaint init latent (no sampling, no device RNG).
-pub fn load_sdxl_vae_encoder(device: &Device, dtype: DType) -> Result<VaeMomentsEncoder> {
-    let vae_file = hf_get(VAE_FIX_REPO, VAE_FIX_FILE)?;
+pub fn load_sdxl_vae_encoder(
+    vae_fp16_fix: &WeightsSource,
+    device: &Device,
+    dtype: DType,
+) -> Result<VaeMomentsEncoder> {
+    let vae_file = resolve_vae_file(vae_fp16_fix);
     let vs = candle_gen::mmap_var_builder(&[vae_file], dtype, device)?;
     Ok(VaeMomentsEncoder::new(vs, VAE_SCALE)?)
 }
