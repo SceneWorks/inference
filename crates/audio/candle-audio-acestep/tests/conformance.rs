@@ -30,6 +30,16 @@ fn snapshot() -> WeightsSource {
     )))
 }
 
+/// Resolve the **sft Cover** snapshot from the required `ACESTEP_SFT_SNAPSHOT` env (a passed-in
+/// `ACE-Step/acestep-v15-xl-sft-diffusers` snapshot dir), staged into `LoadSpec::components` under
+/// [`candle_audio_acestep::COVER_COMPONENT_ID`]. Production reads the Cover snapshot from the seam,
+/// not the env — the env var is the test's passed-in path (epic 13657); only the Cover test needs it.
+fn sft_snapshot() -> WeightsSource {
+    WeightsSource::Dir(PathBuf::from(std::env::var("ACESTEP_SFT_SNAPSHOT").expect(
+        "set ACESTEP_SFT_SNAPSHOT to an ACE-Step/acestep-v15-xl-sft-diffusers snapshot dir",
+    )))
+}
+
 /// The backend-neutral gen-core conformance suite (validate honesty, progress contract, typed
 /// mid-run and pre-generate cancellation, seed determinism) against the real provider, resolved
 /// through the explicit registry.
@@ -705,7 +715,11 @@ fn chroma_corr(a: &[f64; 12], b: &[f64; 12]) -> f64 {
 #[test]
 #[ignore = "real weights: needs an ACE-Step snapshot (ACESTEP_SNAPSHOT / ACESTEP_SFT_SNAPSHOT); run with --ignored"]
 fn acestep_cover_wav_conformance() {
-    let spec = LoadSpec::new(snapshot());
+    // Cover pulls the sft snapshot through the component seam (epic 13657): the test stages the
+    // passed-in `ACESTEP_SFT_SNAPSHOT` path as the `sft_cover` component — production reads it from
+    // `LoadSpec::components`, never from the env.
+    let spec = LoadSpec::new(snapshot())
+        .with_component(candle_audio_acestep::COVER_COMPONENT_ID, sft_snapshot());
     let registry = candle_audio_acestep::provider_registry().unwrap();
     let generator = registry
         .load(candle_audio_acestep::MODEL_ID, &spec)
