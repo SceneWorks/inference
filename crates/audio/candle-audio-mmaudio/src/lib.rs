@@ -114,14 +114,13 @@ pub use vae::MelVaeDecoder;
 // re-exports `model::load` (the Synchformer loader). Reach the shipping generator's loader via
 // `candle_audio_mmaudio::generator::load` (the registration constant carries it for the catalog).
 pub use generator::{
-    resolve_pinned_snapshot, MmAudioGenerator, MmAudioPipeline, MAX_DURATION_SECS,
-    MODEL_ID as GENERATOR_ID, REGISTRATION, SAMPLE_RATE as GENERATOR_SAMPLE_RATE,
+    MmAudioGenerator, MmAudioPipeline, MAX_DURATION_SECS, MODEL_ID as GENERATOR_ID, REGISTRATION,
+    SAMPLE_RATE as GENERATOR_SAMPLE_RATE,
 };
 
 pub use generator_44k::{
-    resolve_pinned_snapshot as resolve_pinned_snapshot_44k, MmAudio44kPipeline,
-    MmAudioLarge44kGenerator, MODEL_ID as GENERATOR_ID_44K, REGISTRATION as REGISTRATION_44K,
-    SAMPLE_RATE as GENERATOR_SAMPLE_RATE_44K,
+    MmAudio44kPipeline, MmAudioLarge44kGenerator, MODEL_ID as GENERATOR_ID_44K,
+    REGISTRATION as REGISTRATION_44K, SAMPLE_RATE as GENERATOR_SAMPLE_RATE_44K,
 };
 
 pub use output::AudioDecoder44k;

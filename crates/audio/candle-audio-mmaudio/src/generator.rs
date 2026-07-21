@@ -28,16 +28,14 @@
 //! window is rejected by the shared audio floor; a clip too short for one Synchformer segment
 //! (< 0.64 s) is a typed [`gen_core::Error::Msg`].
 
-use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use candle_audio::candle_core::{Device, Result as CResult, Tensor};
 use candle_audio::gen_core::{
-    self, AudioTrack, Capabilities, Conditioning, ConditioningKind, GenerationOutput,
-    GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, Progress,
-    WeightsSource,
+    self, reject_unknown_components, require_component, AudioTrack, Capabilities, Conditioning,
+    ConditioningKind, GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality,
+    ModelDescriptor, Progress, WeightsSource,
 };
-use candle_audio::hub::hf_get_pinned;
 use candle_audio::{AudioError, Result as AudioResult};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
@@ -46,7 +44,7 @@ use rand_distr::{Distribution, StandardNormal};
 use crate::clip::{self, DfnClipEncoder};
 use crate::output::{AudioDecoder16k, SAMPLE_RATE as OUT_SAMPLE_RATE};
 use crate::sync::SynchformerVisualEncoder;
-use crate::{mmdit, model, output, preprocess};
+use crate::{mmdit, model, preprocess};
 
 /// Registry id (the SceneWorks worker routes `payload.model` to this exact id). The 44.1 kHz
 /// quality-ceiling sibling is [`crate::generator_44k`]'s `mmaudio_large_44k` (sc-13441).
@@ -131,10 +129,18 @@ pub const WEIGHT_LICENSE_ENTRY: gen_core::WeightLicenseEntry = gen_core::WeightL
     license: WEIGHT_LICENSE,
 };
 
+/// The five named model components (epic 13657) `mmaudio_small_16k` requires, provisioned by the
+/// caller in [`LoadSpec::components`] and read at [`load`] via [`require_component`]. The composite
+/// assembles five checkpoints across two repos: `clip` (the DFN5B-CLIP ViT-H/14 conditioner, from
+/// `apple/DFN5B-CLIP-ViT-H-14-384`) and `synchformer` / `dit` / `vae` / `vocoder` (the Synchformer
+/// visual encoder, the small_16k MM-DiT, the 16k mel-VAE, and the 16k BigVGAN vocoder, all from
+/// `hkchengrex/MMAudio`). Advertised weights-free on the descriptor so a consumer knows what to stage.
+pub const REQUIRED_COMPONENTS: &[&str] = &["clip", "synchformer", "dit", "vae", "vocoder"];
+
 /// MMAudio's identity + capabilities — constructible without weights.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
-        required_components: &[],
+        required_components: REQUIRED_COMPONENTS,
         id: MODEL_ID,
         family: FAMILY,
         backend: "candle",
@@ -324,21 +330,24 @@ pub enum PipelineProgress {
     Decoding,
 }
 
-/// Canonical filenames the assembled snapshot dir carries (see [`resolve_pinned_snapshot`]).
-const CLIP_FILE: &str = "open_clip_pytorch_model.bin";
-const SYNC_FILE: &str = "synchformer_state_dict.pth";
-const DIT_FILE: &str = "mmaudio_small_16k.pth";
-const VAE_FILE: &str = "v1-16.pth";
-const BIGVGAN_FILE: &str = "best_netG.pt";
-
 impl MmAudioPipeline {
-    /// Load all five components from an assembled snapshot directory (canonical filenames).
-    pub fn from_snapshot(dir: &Path, device: &Device) -> AudioResult<Self> {
-        let clip = clip::load_from_pth(&dir.join(CLIP_FILE), device)?;
-        let sync = model::load_from_pth(&dir.join(SYNC_FILE), device)?;
-        let dit = mmdit::load_from_pth(&dir.join(DIT_FILE), device)?;
-        let decoder =
-            AudioDecoder16k::load_from_paths(&dir.join(VAE_FILE), &dir.join(BIGVGAN_FILE), device)?;
+    /// Load all five components from their individually-provisioned [`WeightsSource`]s (epic 13657) —
+    /// `clip` / `synchformer` / `dit` / `vae` / `vocoder`, staged by the caller in
+    /// [`LoadSpec::components`] and validated at [`load`]. Each component struct already loads from a
+    /// single checkpoint file (or a per-repo snapshot dir it probes); there is no assembled snapshot
+    /// directory anymore (sc-13666).
+    pub fn from_components(
+        clip_src: &WeightsSource,
+        sync_src: &WeightsSource,
+        dit_src: &WeightsSource,
+        vae_src: &WeightsSource,
+        vocoder_src: &WeightsSource,
+        device: &Device,
+    ) -> AudioResult<Self> {
+        let clip = clip::load(clip_src, device)?;
+        let sync = model::load(sync_src, device)?;
+        let dit = mmdit::load(dit_src, device)?;
+        let decoder = AudioDecoder16k::load(vae_src, vocoder_src, device)?;
         Ok(Self {
             clip,
             sync,
@@ -546,12 +555,23 @@ pub(crate) fn lock_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     }
 }
 
+/// The five caller-provisioned component sources resolved at [`load`] (epic 13657), held so the heavy
+/// pipeline can be built lazily on first `generate`. Each is a [`LoadSpec::components`] entry validated
+/// by [`require_component`] before this struct is constructed.
+struct ComponentSources {
+    clip: WeightsSource,
+    sync: WeightsSource,
+    dit: WeightsSource,
+    vae: WeightsSource,
+    vocoder: WeightsSource,
+}
+
 /// A loaded (lazy) MMAudio generator. The heavy pipeline (CLIP ViT-H + Synchformer + MM-DiT + VAE +
 /// BigVGAN, several GB resident in f32) is built on first use and cached; `load` does no file I/O
 /// beyond argument checks (the sibling providers' lazy-load discipline).
 pub struct MmAudioGenerator {
     descriptor: ModelDescriptor,
-    root: PathBuf,
+    components: ComponentSources,
     pipeline: Mutex<Option<Arc<MmAudioPipeline>>>,
 }
 
@@ -562,25 +582,31 @@ impl MmAudioGenerator {
             return Ok(p.clone());
         }
         let device = candle_audio::default_device()?;
-        let built = Arc::new(MmAudioPipeline::from_snapshot(&self.root, &device)?);
+        let c = &self.components;
+        let built = Arc::new(MmAudioPipeline::from_components(
+            &c.clip, &c.sync, &c.dit, &c.vae, &c.vocoder, &device,
+        )?);
         *guard = Some(built.clone());
         Ok(built)
     }
 }
 
-/// Construct the (lazy) generator from a [`LoadSpec`]. `spec.weights` must be an assembled snapshot
-/// directory ([`resolve_pinned_snapshot`] materializes it); quantization / adapters / control overlays
-/// are rejected — refusing is more honest than silently dropping.
+/// Construct the (lazy) generator from a [`LoadSpec`]. The five checkpoints are provisioned as named
+/// [`LoadSpec::components`] — `clip` / `synchformer` / `dit` / `vae` / `vocoder`
+/// ([`REQUIRED_COMPONENTS`]) — each required at load via [`require_component`], so a missing component
+/// is a **load-time** contract error rather than a mid-render surprise (epic 13657, sc-13666). There
+/// is no assembled snapshot directory: `spec.weights` is unused (mmaudio is a pure assembly of the
+/// five named components). Unrecognized component keys, quantization, adapters, and control /
+/// IP-adapter overlays are rejected — refusing is more honest than silently dropping.
 pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
-    let root = match &spec.weights {
-        WeightsSource::Dir(p) => p.clone(),
-        WeightsSource::File(_) => {
-            return Err(gen_core::Error::Msg(format!(
-                "{MODEL_ID} expects an assembled snapshot directory ({CLIP_FILE} + {SYNC_FILE} + \
-                 {DIT_FILE} + {VAE_FILE} + {BIGVGAN_FILE}), not a single file"
-            )));
-        }
-    };
+    reject_unknown_components(spec, REQUIRED_COMPONENTS, MODEL_ID)?;
+    let clip =
+        require_component(spec, "clip", MODEL_ID, "DFN5B-CLIP ViT-H/14 conditioner")?.clone();
+    let sync =
+        require_component(spec, "synchformer", MODEL_ID, "Synchformer visual encoder")?.clone();
+    let dit = require_component(spec, "dit", MODEL_ID, "small_16k MM-DiT network")?.clone();
+    let vae = require_component(spec, "vae", MODEL_ID, "16k mel-VAE decoder")?.clone();
+    let vocoder = require_component(spec, "vocoder", MODEL_ID, "16k BigVGAN vocoder")?.clone();
     if spec.quantize.is_some() {
         return Err(gen_core::Error::Unsupported(format!(
             "{MODEL_ID} does not support on-the-fly quantization"
@@ -598,7 +624,13 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     }
     Ok(Box::new(MmAudioGenerator {
         descriptor: descriptor(),
-        root,
+        components: ComponentSources {
+            clip,
+            sync,
+            dit,
+            vae,
+            vocoder,
+        },
         pipeline: Mutex::new(None),
     }))
 }
@@ -677,92 +709,6 @@ candle_audio::register_generators! {
     pub const REGISTRATION = descriptor => load
 }
 
-/// Materialize the pinned MMAudio snapshot — all five component checkpoints across the two pinned
-/// repos (the MM-DiT network + Synchformer + 16k mel-VAE + 16k BigVGAN from `hkchengrex/MMAudio`, and
-/// the DFN5B-CLIP encoder from `apple/DFN5B-CLIP-ViT-H-14-384`) — through the audio lane's F-029 hub
-/// path, then assemble them (by hard link, symlink, or copy fallback) into ONE directory with the
-/// canonical filenames [`from_snapshot`](MmAudioPipeline::from_snapshot) reads. Returns that dir as a
-/// [`WeightsSource::Dir`] ready for a [`LoadSpec`].
-pub fn resolve_pinned_snapshot() -> AudioResult<WeightsSource> {
-    let clip_src = hf_get_pinned(
-        clip::CLIP_HUB_REPO,
-        clip::CLIP_HUB_REVISION,
-        clip::CLIP_WEIGHTS_PATH,
-    )?;
-    let sync_src = hf_get_pinned(model::HUB_REPO, model::HUB_REVISION, model::WEIGHTS_PATH)?;
-    let dit_src = hf_get_pinned(mmdit::HUB_REPO, mmdit::HUB_REVISION, mmdit::WEIGHTS_PATH)?;
-    let vae_src = hf_get_pinned(
-        output::HUB_REPO,
-        output::HUB_REVISION,
-        output::VAE_WEIGHTS_PATH,
-    )?;
-    let bigvgan_src = hf_get_pinned(
-        output::HUB_REPO,
-        output::HUB_REVISION,
-        output::BIGVGAN_WEIGHTS_PATH,
-    )?;
-
-    let dir = assembled_snapshot_dir()?;
-    link_into(&clip_src, &dir.join(CLIP_FILE))?;
-    link_into(&sync_src, &dir.join(SYNC_FILE))?;
-    link_into(&dit_src, &dir.join(DIT_FILE))?;
-    link_into(&vae_src, &dir.join(VAE_FILE))?;
-    link_into(&bigvgan_src, &dir.join(BIGVGAN_FILE))?;
-    Ok(WeightsSource::Dir(dir))
-}
-
-/// The stable assembled-snapshot directory, under the HF cache root so the hard links stay on one
-/// filesystem (a fresh, deterministic path keyed by the pinned revision so a re-pin lands elsewhere).
-fn assembled_snapshot_dir() -> AudioResult<PathBuf> {
-    let base = std::env::var_os("HF_HOME")
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache").join("huggingface"))
-        })
-        .unwrap_or_else(std::env::temp_dir);
-    let dir = base
-        .join("sceneworks-assembled")
-        .join(format!("{MODEL_ID}-{}", &mmdit::HUB_REVISION[..12]));
-    std::fs::create_dir_all(&dir).map_err(|e| {
-        AudioError::Msg(format!(
-            "create assembled snapshot dir {}: {e}",
-            dir.display()
-        ))
-    })?;
-    Ok(dir)
-}
-
-/// Link `src` to `dst` (removing any stale `dst`): hard link first (same-filesystem, zero copy), then
-/// symlink, then a full copy — so the assembled dir works whether or not the cache shares a filesystem.
-///
-/// `src` is a Hugging Face snapshot entry, which is itself a **symlink** into `../blobs/…`. We
-/// [`canonicalize`](std::fs::canonicalize) it to the real blob first: hard/soft linking the snapshot
-/// symlink verbatim would copy its *relative* `../../../blobs/…` target, which breaks at the assembled
-/// dir's different depth (the bug this guards against). The resolved blob is an absolute regular file,
-/// so the hard link (or an absolute symlink fallback) always resolves.
-fn link_into(src: &Path, dst: &Path) -> AudioResult<()> {
-    // Resolve the HF snapshot symlink to the real blob path (absolute regular file).
-    let real = std::fs::canonicalize(src)
-        .map_err(|e| AudioError::Msg(format!("canonicalize {}: {e}", src.display())))?;
-    // Remove any prior entry (use symlink_metadata so a *broken* symlink from an older run — which
-    // `Path::exists` reports as absent — is still cleared).
-    if std::fs::symlink_metadata(dst).is_ok() {
-        let _ = std::fs::remove_file(dst);
-    }
-    if std::fs::hard_link(&real, dst).is_ok() {
-        return Ok(());
-    }
-    #[cfg(unix)]
-    {
-        if std::os::unix::fs::symlink(&real, dst).is_ok() {
-            return Ok(());
-        }
-    }
-    std::fs::copy(&real, dst)
-        .map(|_| ())
-        .map_err(|e| AudioError::Msg(format!("assemble {}: {e}", dst.display())))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -813,6 +759,12 @@ mod tests {
         assert!(!d.capabilities.supports_multi_speaker);
         assert_eq!(d.capabilities.max_count, 1);
         assert!(d.capabilities.audio_voices.is_empty());
+        // The five named components (epic 13657, sc-13666) the caller must provision — pins the input
+        // contract so a change to the component surface is deliberate (CONTRIBUTING.md).
+        assert_eq!(
+            d.required_components,
+            ["clip", "synchformer", "dit", "vae", "vocoder"]
+        );
     }
 
     #[test]
@@ -891,21 +843,49 @@ mod tests {
         assert!((effective_duration(&r, 100.0) - 8.0).abs() < 1e-6);
     }
 
+    /// A weights-free [`LoadSpec`] that stages every required component (placeholder paths — `load`
+    /// is lazy and reads no file, so the pipeline is not built here). `weights` is an ignored
+    /// placeholder (mmaudio is a pure assembly of the five named components).
+    fn staged_spec() -> LoadSpec {
+        let dir = std::env::temp_dir().join("mmaudio-16k-staged");
+        LoadSpec::new(WeightsSource::Dir(dir))
+            .with_component("clip", WeightsSource::File("/nonexistent/clip.bin".into()))
+            .with_component(
+                "synchformer",
+                WeightsSource::File("/nonexistent/sync.pth".into()),
+            )
+            .with_component("dit", WeightsSource::File("/nonexistent/dit.pth".into()))
+            .with_component("vae", WeightsSource::File("/nonexistent/vae.pth".into()))
+            .with_component(
+                "vocoder",
+                WeightsSource::File("/nonexistent/vocoder.pt".into()),
+            )
+    }
+
     #[test]
-    fn load_rejects_unsupported_spec_shapes() {
-        let dir = std::env::temp_dir();
-        let spec = LoadSpec::new(WeightsSource::File(dir.join("x.pth")));
-        assert!(load(&spec).is_err());
-        let mut spec = LoadSpec::new(WeightsSource::Dir(dir.clone()));
+    fn load_requires_every_component_and_rejects_unsupported_spec_shapes() {
+        // Bare spec (no components) → load fails at the first missing component gate.
+        let bare = LoadSpec::new(WeightsSource::Dir(std::env::temp_dir()));
+        let err = match load(&bare) {
+            Err(e) => e,
+            Ok(_) => panic!("bare spec (no components) must fail at load"),
+        };
+        assert!(err.to_string().contains("clip"), "got: {err}");
+
+        // Every required component staged → load succeeds (lazy; no weight read).
+        assert!(load(&staged_spec()).is_ok());
+
+        // Quantization is still rejected as Unsupported even with components staged.
+        let mut spec = staged_spec();
         spec.quantize = Some(gen_core::Quant::Q4);
         assert!(matches!(load(&spec), Err(gen_core::Error::Unsupported(_))));
     }
 
     #[test]
     fn pre_tripped_cancel_returns_typed_canceled_before_any_heavy_work() {
-        let dir = std::env::temp_dir().join("mmaudio-missing-snapshot");
-        std::fs::create_dir_all(&dir).unwrap();
-        let g = load(&LoadSpec::new(WeightsSource::Dir(dir))).unwrap();
+        // Components point at nonexistent files, but a pre-tripped cancel must return `Canceled`
+        // before the lazy pipeline build ever touches them.
+        let g = load(&staged_spec()).unwrap();
         let flag = CancelFlag::new();
         flag.cancel();
         let mut req = foley_req(foley_frames(8, 16, 16, 0), 8);
@@ -915,10 +895,10 @@ mod tests {
     }
 
     #[test]
-    fn generate_on_a_missing_snapshot_fails_cleanly() {
-        let dir = std::env::temp_dir().join("mmaudio-missing-snapshot");
-        std::fs::create_dir_all(&dir).unwrap();
-        let g = load(&LoadSpec::new(WeightsSource::Dir(dir))).unwrap();
+    fn generate_on_missing_component_weights_fails_cleanly() {
+        // Components staged but their files do not exist → the lazy pipeline build fails with a
+        // non-`Canceled` error (not a mid-render surprise).
+        let g = load(&staged_spec()).unwrap();
         let req = foley_req(foley_frames(8, 16, 16, 0), 8);
         let err = g.generate(&req, &mut |_| {}).unwrap_err();
         assert!(!matches!(err, gen_core::Error::Canceled));

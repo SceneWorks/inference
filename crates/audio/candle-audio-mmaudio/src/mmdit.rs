@@ -1285,6 +1285,23 @@ pub fn load(source: &WeightsSource, device: &Device) -> Result<MmAudioDit> {
     load_from_pth(&path, device)
 }
 
+/// Load the large_44k_v2 generator from a [`WeightsSource`] (a `File` path to the `.pth`, or a `Dir`
+/// containing it under `weights/` or at its root) — the 44k twin of [`load`] (sc-13666).
+pub fn load_large_44k_v2(source: &WeightsSource, device: &Device) -> Result<MmAudioDit> {
+    let path: PathBuf = match source {
+        WeightsSource::File(p) => p.clone(),
+        WeightsSource::Dir(d) => {
+            let nested = d.join(WEIGHTS_PATH_44K);
+            if nested.exists() {
+                nested
+            } else {
+                d.join("mmaudio_large_44k_v2.pth")
+            }
+        }
+    };
+    load_large_44k_v2_from_pth(&path, device)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
