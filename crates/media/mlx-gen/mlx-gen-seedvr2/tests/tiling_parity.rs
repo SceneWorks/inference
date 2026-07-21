@@ -10,7 +10,7 @@ use mlx_gen_seedvr2::pipeline::Seedvr2Pipeline;
 use mlx_rs::{Array, Dtype};
 
 fn raw_dir() -> Option<std::path::PathBuf> {
-    let base = std::path::Path::new(&std::env::var("MLX_GEN_MODELS_ROOT").expect("set MLX_GEN_MODELS_ROOT to the explicit models root (holds models--*/snapshots); inference never self-fetches or derives a cache location (epic 13657)"))
+    let base = std::path::Path::new(&std::env::var("MLX_GEN_MODELS_ROOT").ok()?)
         .join("models--numz--SeedVR2_comfyUI/snapshots");
     let snap = std::fs::read_dir(&base).ok()?.flatten().next()?.path();
     snap.join("seedvr2_ema_3b_fp16.safetensors")

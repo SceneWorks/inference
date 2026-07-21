@@ -8,8 +8,8 @@
 //! `Decoding` — the class the pre-fix `Step{1,1}`-per-image / no-per-tile-progress code violated.
 //!
 //! Snapshot-gated (skips when absent), matching the crate's `registry_e2e.rs` / cancellation
-//! conventions: it needs the raw `numz/SeedVR2_comfyUI` checkpoint dir (the 3B fp16 DiT) in the HF
-//! cache.
+//! conventions: it needs the raw `numz/SeedVR2_comfyUI` checkpoint dir (the 3B fp16 DiT) under
+//! `MLX_GEN_MODELS_ROOT`.
 
 use std::path::PathBuf;
 
@@ -17,7 +17,7 @@ use mlx_gen::{Conditioning, GenerationRequest, Image, LoadSpec, WeightsSource};
 use mlx_gen_seedvr2::registry::MODEL_ID;
 
 /// The raw `numz/SeedVR2_comfyUI` checkpoint snapshot dir (mirrors `cancellation_conformance.rs`):
-/// returns `None` (→ skip) when the 3B checkpoint is not in the HF cache.
+/// returns `None` (→ skip) when the 3B checkpoint is not under `MLX_GEN_MODELS_ROOT`.
 fn raw_dir() -> Option<PathBuf> {
     let base = PathBuf::from(std::env::var("MLX_GEN_MODELS_ROOT").ok()?)
         .join("models--numz--SeedVR2_comfyUI/snapshots");
@@ -37,7 +37,7 @@ fn lr_image(w: u32, h: u32) -> Image {
 }
 
 #[test]
-#[ignore = "needs real SeedVR2 3B checkpoint (numz/SeedVR2_comfyUI in HF cache); macos-mlx / dev box only"]
+#[ignore = "needs real SeedVR2 3B checkpoint (numz/SeedVR2_comfyUI under MLX_GEN_MODELS_ROOT); macos-mlx / dev box only"]
 fn seedvr2_image_batch_satisfies_progress_contract() {
     let Some(snap) = raw_dir() else {
         eprintln!("SKIP: raw SeedVR2 3B checkpoint absent");

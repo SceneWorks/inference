@@ -9,7 +9,7 @@
 //! (b) **Orchestration:** a small synthetic clip through the full [`generate_video`] (chunked, with a
 //! `chunk_override` that forces a 2-chunk overlap blend) returns the right frame count + size.
 //!
-//! Both need the HF cache (and (a) the video golden); they skip otherwise.
+//! Both need the models root (`MLX_GEN_MODELS_ROOT`) (and (a) the video golden); they skip otherwise.
 
 use mlx_gen::weights::Weights;
 use mlx_gen::Image;
@@ -27,7 +27,7 @@ fn golden_dir() -> std::path::PathBuf {
 }
 
 fn raw_dir() -> Option<std::path::PathBuf> {
-    let base = std::path::Path::new(&std::env::var("MLX_GEN_MODELS_ROOT").expect("set MLX_GEN_MODELS_ROOT to the explicit models root (holds models--*/snapshots); inference never self-fetches or derives a cache location (epic 13657)"))
+    let base = std::path::Path::new(&std::env::var("MLX_GEN_MODELS_ROOT").ok()?)
         .join("models--numz--SeedVR2_comfyUI/snapshots");
     let snap = std::fs::read_dir(&base).ok()?.flatten().next()?.path();
     snap.join("seedvr2_ema_3b_fp16.safetensors")
