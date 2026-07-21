@@ -81,6 +81,7 @@ fn stub_caps() -> Capabilities {
 
 fn stub_desc(id: &'static str) -> ModelDescriptor {
     ModelDescriptor {
+        required_components: &[],
         id,
         family: "testkit",
         backend: "stub",

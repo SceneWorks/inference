@@ -64,6 +64,7 @@ pub const SIZE_MULTIPLE: u32 = 8;
 /// [`crate::model::Kolors::apply_lora`], the inference complement to the Kolors trainer sc-4568).
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        required_components: &[],
         id: MODEL_ID,
         family: "kolors",
         backend: "mlx",
@@ -886,6 +887,7 @@ mod tests {
             identity: None,
             text_encoder: None,
             offload_policy: Default::default(),
+            components: Default::default(),
         };
         let err = match crate::provider_registry().unwrap().load("kolors", &spec) {
             Ok(_) => panic!("bogus weights dir must fail to load"),

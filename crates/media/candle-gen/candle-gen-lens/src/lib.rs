@@ -667,6 +667,7 @@ impl Generator for LensGenerator {
 /// the merge).
 fn descriptor_for(id: &'static str) -> ModelDescriptor {
     ModelDescriptor {
+        required_components: &[],
         id,
         family: "lens",
         backend: "candle",

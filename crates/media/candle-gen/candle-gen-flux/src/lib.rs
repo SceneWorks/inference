@@ -254,6 +254,7 @@ impl Generator for FluxGenerator {
 /// `"candle"` and `mac_only` is `false` (the two backend-correct deviations from `mlx-gen-flux`).
 fn descriptor_for(variant: Variant) -> ModelDescriptor {
     ModelDescriptor {
+        required_components: &[],
         id: variant.model_id(),
         family: "flux",
         backend: "candle",

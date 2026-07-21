@@ -54,6 +54,7 @@ pub const MODEL_ID: &str = "qwen_image_edit";
 /// VAE-encoded and folded into the transformer's dual-latent sequence (sc-2529).
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        required_components: &[],
         id: MODEL_ID,
         family: "qwen-image",
         backend: "mlx",

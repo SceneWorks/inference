@@ -51,7 +51,10 @@ pub use caption::{
     CaptionCapabilities, CaptionFinishReason, CaptionOptions, CaptionOutput, CaptionRequest,
     CaptionSampling, Captioner, CaptionerDescriptor,
 };
-pub use control::{require_base_dir, require_control, AcceptedControlKinds, ControlBranch};
+pub use control::{
+    reject_unknown_components, require_base_dir, require_component, require_control,
+    AcceptedControlKinds, ControlBranch,
+};
 pub use error::{Error, Result};
 pub use face::{DetectedFace, FaceEmbedder, FaceEmbedderDescriptor};
 pub use generator::{

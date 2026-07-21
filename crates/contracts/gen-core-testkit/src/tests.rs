@@ -73,6 +73,7 @@ fn stub_caps() -> Capabilities {
 
 fn stub_desc(id: &'static str) -> ModelDescriptor {
     ModelDescriptor {
+        required_components: &[],
         id,
         family: "testkit",
         backend: "stub",
@@ -375,6 +376,71 @@ fn progress_with_checks_request_supplied_runs() {
     check_progress_with(&g, &req, None).unwrap();
     let err = check_progress_with(&g, &req, Some(5)).unwrap_err();
     assert!(err.contains("expected resolved step count"), "got: {err}");
+}
+
+// -------------------------------------------------------------------------------------------------
+// Named-component load gate (sc-13658) — the `check_component_load_gate` helper exercised against a
+// stub loader wired to the *real* gen-core validators (not a mock).
+// -------------------------------------------------------------------------------------------------
+
+/// The component ids the component-gate stub declares (mirrors chatterbox's provisional set).
+const GATE_REQUIRED: &[&str] = &["perth", "voice_embedding"];
+
+/// A base spec that stages every required component — the positive input the gate removes from /
+/// adds to. Paths are placeholders: the stub loader validates components without reading weights.
+fn gate_base_spec() -> LoadSpec {
+    LoadSpec::new(gen_core::WeightsSource::Dir(std::path::PathBuf::from(
+        "/snap",
+    )))
+    .with_component(
+        "perth",
+        gen_core::WeightsSource::File(std::path::PathBuf::from("/perth.safetensors")),
+    )
+    .with_component(
+        "voice_embedding",
+        gen_core::WeightsSource::File(std::path::PathBuf::from("/voice.safetensors")),
+    )
+}
+
+/// A **correct** loader: it wires both real validators before building the generator, so a missing
+/// required component or an unknown key becomes a load-time error.
+fn gate_good_load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    gen_core::reject_unknown_components(spec, GATE_REQUIRED, STUB_ID)?;
+    for id in GATE_REQUIRED {
+        gen_core::require_component(spec, id, STUB_ID, "stub component")?;
+    }
+    Ok(Stub::boxed(STUB_ID, Behavior::good()))
+}
+
+#[test]
+fn component_load_gate_passes_for_a_correctly_gated_loader() {
+    check_component_load_gate(gate_good_load, &gate_base_spec(), GATE_REQUIRED).unwrap();
+}
+
+#[test]
+fn component_load_gate_flags_a_loader_that_skips_require_component() {
+    // A loader that never calls require_component silently proceeds (the perth mid-render-fetch
+    // class) — the gate must catch that a missing required component was accepted.
+    fn ungated(_spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+        Ok(Stub::boxed(STUB_ID, Behavior::good()))
+    }
+    let err = check_component_load_gate(ungated, &gate_base_spec(), GATE_REQUIRED).unwrap_err();
+    assert!(err.contains("must be a load-time error"), "got: {err}");
+}
+
+#[test]
+fn component_load_gate_flags_a_loader_that_skips_unknown_key_rejection() {
+    // A loader that requires its components but never rejects unknown keys silently ignores a stray
+    // component — the gate must catch the accepted unknown key.
+    fn no_unknown_guard(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+        for id in GATE_REQUIRED {
+            gen_core::require_component(spec, id, STUB_ID, "stub component")?;
+        }
+        Ok(Stub::boxed(STUB_ID, Behavior::good()))
+    }
+    let err =
+        check_component_load_gate(no_unknown_guard, &gate_base_spec(), GATE_REQUIRED).unwrap_err();
+    assert!(err.contains("unrecognized component key"), "got: {err}");
 }
 
 #[test]

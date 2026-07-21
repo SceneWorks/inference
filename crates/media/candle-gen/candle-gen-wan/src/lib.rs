@@ -721,6 +721,7 @@ impl Generator for WanGenerator {
 /// (sc-10025) — pre-quantized snapshots the packed-detect loaders read directly (no on-the-fly quant).
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        required_components: &[],
         id: MODEL_ID,
         family: "wan",
         backend: "candle",

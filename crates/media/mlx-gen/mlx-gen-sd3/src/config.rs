@@ -189,6 +189,7 @@ impl Sd3Variant {
 
     pub fn descriptor(self) -> ModelDescriptor {
         ModelDescriptor {
+            required_components: &[],
             id: self.id(),
             family: "sd3",
             backend: "mlx",

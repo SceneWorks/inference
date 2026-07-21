@@ -73,6 +73,7 @@ const DEFAULT_TURBO_SIGMA: f32 = 0.001;
 /// single `Reference` opts into img2img latent-init (sc-10191, shared with Turbo via clone).
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        required_components: &[],
         id: BOOGU_IMAGE_ID,
         family: "boogu",
         backend: "mlx",

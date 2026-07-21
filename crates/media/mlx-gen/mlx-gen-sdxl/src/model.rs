@@ -129,6 +129,7 @@ pub const PID_BACKBONE: &str = "sdxl";
 /// [[false-green-gates-mask-descope]]).
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        required_components: &[],
         id: MODEL_ID,
         family: "sdxl",
         backend: "mlx",

@@ -46,6 +46,7 @@ use crate::{loader, CONTROL_IN_DIM};
 /// init seed). Mac-only, like every FLUX.2 variant.
 pub fn descriptor_dev_control() -> ModelDescriptor {
     ModelDescriptor {
+        required_components: &[],
         id: FLUX2_DEV_CONTROL_ID,
         family: "flux2",
         backend: "mlx",

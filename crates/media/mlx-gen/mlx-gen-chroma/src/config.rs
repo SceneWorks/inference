@@ -92,6 +92,7 @@ impl ChromaVariant {
 
     pub fn descriptor(self) -> ModelDescriptor {
         ModelDescriptor {
+            required_components: &[],
             id: self.id(),
             family: "chroma",
             backend: "mlx",

@@ -258,6 +258,7 @@ fn vace_decode_tail(
 /// Stable identity + advertised capabilities for `wan_vace`.
 pub fn descriptor_vace() -> ModelDescriptor {
     ModelDescriptor {
+        required_components: &[],
         id: MODEL_ID_VACE,
         family: "wan",
         backend: "mlx",
@@ -552,6 +553,7 @@ pub const MODEL_ID_VACE_FUN: &str = "wan2_2_vace_fun_14b";
 /// a masked `ControlClip` + optional `Reference` images, CFG, Q4/Q8, LoRA/LoKr).
 pub fn descriptor_vace_fun() -> ModelDescriptor {
     let mut descriptor = ModelDescriptor {
+        required_components: &[],
         id: MODEL_ID_VACE_FUN,
         ..descriptor_vace()
     };

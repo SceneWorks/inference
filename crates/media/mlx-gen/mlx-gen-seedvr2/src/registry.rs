@@ -47,6 +47,7 @@ fn variant(id: &str) -> (&'static str, DitConfig) {
 
 fn descriptor_for(id: &'static str) -> ModelDescriptor {
     ModelDescriptor {
+        required_components: &[],
         id,
         family: "seedvr2",
         backend: "mlx",
@@ -352,6 +353,7 @@ mod tests {
                 identity: None,
                 text_encoder: None,
                 offload_policy: Default::default(),
+                components: Default::default(),
             };
             let err = match crate::provider_registry().unwrap().load(id, &spec) {
                 Ok(_) => panic!("bogus weights dir must fail to load"),

@@ -288,6 +288,7 @@ fn resolve_edit_references(req: &GenerationRequest) -> gen_core::Result<Vec<&Ima
 /// (`descriptor_edit`); Turbo inherits this img2img surface via `descriptor()`.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        required_components: &[],
         id: BOOGU_IMAGE_ID,
         family: "boogu",
         backend: "candle",

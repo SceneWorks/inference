@@ -444,6 +444,7 @@ impl Generator for LtxGenerator {
 /// streams); I2V / upsampler / LoRA / quant remain deferred.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        required_components: &[],
         id: MODEL_ID,
         family: "ltx",
         backend: "candle",

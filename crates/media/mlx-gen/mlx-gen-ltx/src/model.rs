@@ -217,6 +217,7 @@ const IMAGE_FRAME_IDX: i32 = 0;
 /// + a synchronized audio track).
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        required_components: &[],
         id: MODEL_ID,
         family: "ltx",
         backend: "mlx",

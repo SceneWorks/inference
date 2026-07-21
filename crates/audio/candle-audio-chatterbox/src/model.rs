@@ -95,6 +95,7 @@ pub const MAX_DURATION_SECS: f32 = 30.0;
 /// Chatterbox clone-TTS identity + capabilities — constructible without weights.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        required_components: &[],
         id: MODEL_ID,
         family: "chatterbox",
         backend: "candle",

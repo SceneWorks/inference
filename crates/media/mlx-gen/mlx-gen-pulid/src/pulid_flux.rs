@@ -49,6 +49,7 @@ const ARCFACE_DIM: i32 = 512;
 
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        required_components: &[],
         id: "pulid_flux",
         family: "pulid",
         backend: "mlx",

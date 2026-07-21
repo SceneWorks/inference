@@ -620,6 +620,13 @@ pub fn model_descriptor_errors(d: &ModelDescriptor) -> Vec<String> {
             ));
         }
     }
+    // Required components (sc-13658): the weights-free advertisement of the named model components a
+    // consumer must provision (see `ModelDescriptor::required_components`). Each declared id must be a
+    // non-empty, whitespace-free registry token, and the set must be duplicate-free — a blank or
+    // repeated id would be an unstageable / ambiguous `LoadSpec::components` key. `&[]` (the shipped
+    // value for every image/video provider and every single-file audio model) is trivially
+    // conformant.
+    check_name_list(&mut errs, &ctx, "required_component", d.required_components);
     errs
 }
 
@@ -944,6 +951,7 @@ mod tests {
 
     fn dummy_descriptor() -> ModelDescriptor {
         ModelDescriptor {
+            required_components: &[],
             id: "dummy_test_model",
             family: "test",
             backend: "mlx",
@@ -983,6 +991,7 @@ mod tests {
 
     fn dummy_delegated_descriptor() -> ModelDescriptor {
         ModelDescriptor {
+            required_components: &[],
             id: "dummy_delegated_test_model",
             family: "test",
             backend: "mlx",
@@ -1008,6 +1017,7 @@ mod tests {
     // read as ZERO — so the provider-owned split is what finds it.
     fn dummy_footprint_descriptor() -> ModelDescriptor {
         ModelDescriptor {
+            required_components: &[],
             id: "dummy_footprint_model",
             family: "test",
             backend: "mlx",
@@ -1083,6 +1093,7 @@ mod tests {
     // Multi-provider fixtures verify that independently named constants compose into one catalog.
     fn dummy_multi_gen_a_descriptor() -> ModelDescriptor {
         ModelDescriptor {
+            required_components: &[],
             id: "dummy_multi_gen_a",
             family: "test",
             backend: "mlx",
@@ -1093,6 +1104,7 @@ mod tests {
 
     fn dummy_multi_gen_b_descriptor() -> ModelDescriptor {
         ModelDescriptor {
+            required_components: &[],
             id: "dummy_multi_gen_b",
             family: "test",
             backend: "mlx",
@@ -2233,6 +2245,7 @@ mod tests {
         // A stub audio generator that advertises VoiceEmbedding conditioning.
         let tts = DummyGen {
             desc: ModelDescriptor {
+                required_components: &[],
                 id: "dummy_tts",
                 family: "test",
                 backend: "mlx",
@@ -2288,6 +2301,8 @@ mod tests {
         assert!(model_descriptor_errors(&dummy_descriptor()).is_empty());
 
         let broken = ModelDescriptor {
+            // Blank + duplicate required-component ids (sc-13658) — unstageable / ambiguous keys.
+            required_components: &["", "voice_embedding", "voice_embedding"],
             id: "Bad Id", // uppercase + whitespace
             family: "",   // empty
             backend: "mlx",
@@ -2315,9 +2330,17 @@ mod tests {
         assert!(has("sampler[2] \"bad name\""), "{errs:?}");
         assert!(has("duplicate conditioning kind Reference"), "{errs:?}");
         assert!(has("video conditioning VideoClip"), "{errs:?}");
+        // The required-component id list is validated like the curated name lists: a blank id and a
+        // duplicate id are both flagged (sc-13658).
+        assert!(has("required_component[0] \"\""), "{errs:?}");
+        assert!(
+            has("duplicate required_component entry \"voice_embedding\""),
+            "{errs:?}"
+        );
 
         // All-zero bounds report the Default-0 message (F-084), not the inverted-bounds one.
         let zeroed = ModelDescriptor {
+            required_components: &[],
             id: "zeroed",
             family: "test",
             backend: "mlx",
@@ -2337,6 +2360,7 @@ mod tests {
     #[test]
     fn audio_descriptor_with_zero_size_bounds_passes_sweep() {
         let audio = ModelDescriptor {
+            required_components: &[],
             id: "zeroed_audio",
             family: "test",
             backend: "candle",
@@ -2359,6 +2383,7 @@ mod tests {
         // The exemption is only the size axis: a broken `max_count` on the same audio descriptor is
         // still reported.
         let audio_bad_count = ModelDescriptor {
+            required_components: &[],
             capabilities: Capabilities {
                 max_count: 0,
                 ..audio.capabilities.clone()
@@ -2380,6 +2405,7 @@ mod tests {
     fn visual_descriptor_with_invalid_size_bounds_still_fails_sweep() {
         // Video, zero bounds → the Default-0 footgun still fires.
         let video_zero = ModelDescriptor {
+            required_components: &[],
             id: "video_zero",
             family: "test",
             backend: "mlx",
@@ -2400,6 +2426,7 @@ mod tests {
 
         // Image, inverted bounds → the inverted-bounds message still fires.
         let image_inverted = ModelDescriptor {
+            required_components: &[],
             id: "image_inverted",
             family: "test",
             backend: "mlx",
@@ -2420,6 +2447,7 @@ mod tests {
 
         // `Both` (emits image or video) is a visual modality too — zero bounds still fail.
         let both_zero = ModelDescriptor {
+            required_components: &[],
             id: "both_zero",
             family: "test",
             backend: "mlx",

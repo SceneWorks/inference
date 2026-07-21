@@ -87,6 +87,7 @@ fn spec(base: PathBuf, control: Option<PathBuf>) -> LoadSpec {
         identity: None,
         text_encoder: None,
         offload_policy: Default::default(),
+        components: Default::default(),
     }
 }
 

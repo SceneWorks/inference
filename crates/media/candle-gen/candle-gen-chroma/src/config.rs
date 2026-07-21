@@ -84,6 +84,7 @@ impl ChromaVariant {
     /// job until candle wires them), so they are not advertised and are rejected at load.
     pub fn descriptor(self) -> ModelDescriptor {
         ModelDescriptor {
+            required_components: &[],
             id: self.id(),
             family: "chroma",
             backend: "candle",

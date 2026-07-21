@@ -70,6 +70,7 @@ pub fn descriptor_fast() -> ModelDescriptor {
 
 fn descriptor_for(id: &'static str) -> ModelDescriptor {
     ModelDescriptor {
+        required_components: &[],
         id,
         family: "sensenova-u1",
         backend: "mlx",

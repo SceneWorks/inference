@@ -67,6 +67,7 @@ pub const MODEL_ID: &str = "bernini_renderer";
 /// (pre-quantized; the loaders read the `.scales` siblings).
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        required_components: &[],
         id: MODEL_ID,
         family: "bernini",
         backend: "candle",

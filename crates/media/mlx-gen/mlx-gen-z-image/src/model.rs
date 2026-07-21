@@ -61,6 +61,7 @@ pub const PID_BACKBONE: &str = "zimage-turbo";
 /// scheduler port.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        required_components: &[],
         id: MODEL_ID,
         family: "z-image",
         backend: "mlx",

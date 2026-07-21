@@ -663,6 +663,7 @@ mod tests {
 
     fn candle_audio_descriptor() -> gen_core::ModelDescriptor {
         gen_core::ModelDescriptor {
+            required_components: &[],
             id: "stub-audio",
             family: "test-audio",
             backend: "candle",
@@ -673,6 +674,7 @@ mod tests {
 
     fn mlx_audio_descriptor() -> gen_core::ModelDescriptor {
         gen_core::ModelDescriptor {
+            required_components: &[],
             id: "stub-audio",
             family: "test-audio",
             backend: "mlx",
@@ -1090,6 +1092,7 @@ mod tests {
     fn rejects_audio_generator_id_colliding_with_media() {
         fn mlx_media_descriptor() -> gen_core::ModelDescriptor {
             gen_core::ModelDescriptor {
+                required_components: &[],
                 id: "stub-audio", // deliberately the same id as the audio stub
                 family: "test-media",
                 backend: "mlx",
@@ -1151,6 +1154,7 @@ mod tests {
     fn rejects_non_audio_modality_in_audio_lane() {
         fn candle_image_descriptor() -> gen_core::ModelDescriptor {
             gen_core::ModelDescriptor {
+                required_components: &[],
                 id: "stub-audio",
                 family: "test-audio",
                 backend: "candle",
@@ -1189,6 +1193,7 @@ mod tests {
     fn rejects_audio_modality_in_media_registry() {
         fn mlx_media_audio_descriptor() -> gen_core::ModelDescriptor {
             gen_core::ModelDescriptor {
+                required_components: &[],
                 id: "smuggled-audio",
                 family: "test-audio",
                 backend: "mlx",
@@ -1218,6 +1223,7 @@ mod tests {
     fn audio_conformance_errors_carry_the_audio_prefix() {
         fn malformed_audio_descriptor() -> gen_core::ModelDescriptor {
             gen_core::ModelDescriptor {
+                required_components: &[],
                 id: "stub-audio",
                 family: "test-audio",
                 backend: "candle",

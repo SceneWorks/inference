@@ -65,6 +65,7 @@ const DEFAULT_CONTROL_SCALE: f32 = 0.7;
 /// `resolve_control`, not capability introspection.
 pub fn descriptor_dev_control() -> ModelDescriptor {
     ModelDescriptor {
+        required_components: &[],
         id: FLUX1_DEV_CONTROL_ID,
         family: "flux",
         backend: "mlx",

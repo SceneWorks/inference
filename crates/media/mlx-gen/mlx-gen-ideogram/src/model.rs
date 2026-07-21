@@ -42,6 +42,7 @@ const MAX_ASPECT: u32 = 6;
 /// introspection / capability advertisement).
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        required_components: &[],
         id: MODEL_ID,
         family: "ideogram",
         backend: "mlx",
