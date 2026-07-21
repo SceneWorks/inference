@@ -24,7 +24,8 @@ use candle_gen::gen_core::sampling::{
     schedule_sigmas, AlphaSchedule, DiscreteModelSampling, Scheduler, Solver,
 };
 use candle_gen::gen_core::{
-    AdapterSpec, DetectedFace, FaceEmbedder, Image, PidWeights, Progress, WeightsSource,
+    reject_unknown_components, require_component, AdapterSpec, DetectedFace, FaceEmbedder, Image,
+    LoadSpec, PidWeights, Progress, WeightsSource,
 };
 // Shared ancestral-step RNG salt (`seed + STEP_RNG_SALT`) — one home in `candle-gen` (sc-9043 / F-059).
 // `LatentDecoder` is the decode seam the optional PiD student implements (epic 7840, sc-8373).
@@ -120,6 +121,84 @@ fn check_embedding(embedding: &[f32]) -> Result<()> {
     Ok(())
 }
 
+/// The InstantID model id, woven into the component-gate error messages. There is no registered
+/// [`gen_core::ModelDescriptor`](candle_gen::gen_core::ModelDescriptor) for InstantID — it is a bespoke
+/// utility crate (`candle_gen_catalog::BESPOKE_UTILITY_CRATES`) driven directly through
+/// [`InstantId::load`] + the `generate*` entry points, not a registry `Generator` — so
+/// [`REQUIRED_COMPONENTS`] is its component *advertisement* (the bespoke-crate analogue of a
+/// descriptor's `required_components`).
+pub const MODEL_ID: &str = "instantid";
+
+/// The `tokenizer_clip_l` component id — the CLIP-L tokenizer InstantID's reused
+/// [`candle_gen_sdxl::SdxlConditioner`] needs.
+pub const COMPONENT_TOKENIZER_CLIP_L: &str = "tokenizer_clip_l";
+/// The `tokenizer_clip_bigg` component id — the CLIP-bigG tokenizer.
+pub const COMPONENT_TOKENIZER_CLIP_BIGG: &str = "tokenizer_clip_bigg";
+/// The `vae_fp16_fix` component id — the fp16-stable VAE (`madebyollin/sdxl-vae-fp16-fix`).
+pub const COMPONENT_VAE_FP16_FIX: &str = "vae_fp16_fix";
+
+/// InstantID's **required, caller-staged** SDXL components (epic 13657, sc-13739), in advertised order
+/// — the two model-agnostic CLIP tokenizers + the fp16-stable VAE, the **verbatim** ids the registered
+/// SDXL generator advertises (`candle_gen_sdxl::descriptor().required_components`). InstantID reuses
+/// `candle-gen-sdxl`'s shared conditioner/VAE, which never self-fetch these; the consumer stages each on
+/// [`gen_core::LoadSpec::components`](candle_gen::gen_core::LoadSpec::components) (via `with_component`)
+/// and [`SdxlComponents::from_spec`] gates them at load. This const is the single source of truth
+/// SceneWorks reads to provision them descriptor-driven — the bespoke-crate analogue of
+/// [`gen_core::ModelDescriptor::required_components`](candle_gen::gen_core::ModelDescriptor::required_components).
+pub const REQUIRED_COMPONENTS: &[&str] = &[
+    COMPONENT_TOKENIZER_CLIP_L,
+    COMPONENT_TOKENIZER_CLIP_BIGG,
+    COMPONENT_VAE_FP16_FIX,
+];
+
+/// The three SDXL component sources InstantID needs (the CLIP tokenizers + the fp16-fix VAE), resolved
+/// **and validated** from a [`gen_core::LoadSpec`](candle_gen::gen_core::LoadSpec) at load via
+/// [`SdxlComponents::from_spec`]. Fields are private: `from_spec` is the ONLY constructor, so an
+/// [`InstantIdPaths`] can never carry an unvalidated (or self-fetched) component set. Each is the raw
+/// [`WeightsSource`] the caller staged; the concrete weight file is resolved by the shared
+/// `candle_gen_sdxl` loaders ([`candle_gen_sdxl::SdxlConditioner::load`] /
+/// [`candle_gen_sdxl::load_sdxl_vae`]) at the point of use, so a `Dir` or a direct `File` both work.
+#[derive(Clone, Debug)]
+pub struct SdxlComponents {
+    tokenizer_clip_l: WeightsSource,
+    tokenizer_clip_bigg: WeightsSource,
+    vae_fp16_fix: WeightsSource,
+}
+
+impl SdxlComponents {
+    /// Resolve + validate the three SDXL components from a [`LoadSpec`] at load time (epic 13657,
+    /// sc-13739) — the same gate `candle_gen_sdxl::load` runs, via the shared gen-core validators.
+    /// Rejects any component key InstantID does not declare ([`reject_unknown_components`], typed
+    /// `Unsupported`), then requires each of the three ([`require_component`]), producing a
+    /// caller-actionable load-time error naming the model, the missing id, and the `with_component`
+    /// builder — never a mid-render fetch. Weights-free: it reads the component *keys*, not the staged
+    /// paths.
+    pub fn from_spec(spec: &LoadSpec) -> candle_gen::gen_core::Result<Self> {
+        reject_unknown_components(spec, REQUIRED_COMPONENTS, MODEL_ID)?;
+        let tokenizer_clip_l = require_component(
+            spec,
+            COMPONENT_TOKENIZER_CLIP_L,
+            MODEL_ID,
+            "CLIP-L tokenizer",
+        )?
+        .clone();
+        let tokenizer_clip_bigg = require_component(
+            spec,
+            COMPONENT_TOKENIZER_CLIP_BIGG,
+            MODEL_ID,
+            "CLIP-bigG tokenizer",
+        )?
+        .clone();
+        let vae_fp16_fix =
+            require_component(spec, COMPONENT_VAE_FP16_FIX, MODEL_ID, "fp16-fix VAE")?.clone();
+        Ok(Self {
+            tokenizer_clip_l,
+            tokenizer_clip_bigg,
+            vae_fp16_fix,
+        })
+    }
+}
+
 /// Paths to the InstantID checkpoints.
 pub struct InstantIdPaths {
     /// SDXL base snapshot dir (`unet/`, `text_encoder{,_2}/`, …).
@@ -133,15 +212,11 @@ pub struct InstantIdPaths {
     /// IdentityNet + face IP-Adapter. Empty (the common case) is a no-op. Distinct from
     /// [`ip_adapter`](Self::ip_adapter), which is the InstantID identity IP-Adapter.
     pub adapters: Vec<AdapterSpec>,
-    /// The CLIP-L tokenizer component (`tokenizer_clip_l`, epic 13657 / sc-13663). InstantID reuses
-    /// `candle_gen_sdxl::SdxlConditioner`, whose tokenizers are now **passed in** (never self-fetched);
-    /// the consumer stages this (a `tokenizer.json` file or its dir).
-    pub tokenizer_clip_l: WeightsSource,
-    /// The CLIP-bigG tokenizer component (`tokenizer_clip_bigg`) — a `tokenizer.json` file or its dir.
-    pub tokenizer_clip_bigg: WeightsSource,
-    /// The fp16-stable VAE component (`vae_fp16_fix`) — the `.safetensors` file or its dir. Reused by
-    /// `candle_gen_sdxl::load_sdxl_vae`, now passed in rather than self-fetched.
-    pub vae_fp16_fix: WeightsSource,
+    /// The three passed-in SDXL components (epic 13657, sc-13739) — the CLIP tokenizers + the fp16-fix
+    /// VAE InstantID reuses via [`candle_gen_sdxl`]. Built (and gated) with [`SdxlComponents::from_spec`]
+    /// from a caller-staged [`LoadSpec::components`](candle_gen::gen_core::LoadSpec::components), so a
+    /// missing or unknown component is a load-time contract error — never a mid-render self-fetch.
+    pub sdxl: SdxlComponents,
 }
 
 /// One InstantID generation request.
@@ -226,6 +301,11 @@ impl InstantId {
     /// Load the SDXL backbone + dual-CLIP conditioner + IdentityNet + face Resampler, installing the
     /// decoupled-cross-attn K/V pairs into the UNet. The face-analysis stack attaches separately via
     /// [`with_face`](Self::with_face).
+    ///
+    /// The three passed-in SDXL components ([`InstantIdPaths::sdxl`]) were resolved + validated at
+    /// [`SdxlComponents::from_spec`] when the caller assembled `paths` — a missing or unknown component
+    /// is a load-time contract error there (epic 13657, sc-13739), so this reads them verbatim and never
+    /// self-fetches the tokenizers or VAE.
     pub fn load(paths: &InstantIdPaths) -> Result<Self> {
         let device = candle_gen::default_device()?;
         let root = paths.sdxl_base.as_path();
@@ -234,8 +314,8 @@ impl InstantId {
             root,
             &device,
             DTYPE,
-            &paths.tokenizer_clip_l,
-            &paths.tokenizer_clip_bigg,
+            &paths.sdxl.tokenizer_clip_l,
+            &paths.sdxl.tokenizer_clip_bigg,
         )?;
         // User LoRA/LoKr (sc-6038) folds into the dense UNet weights before the IP-Adapter K/V pairs
         // install below — SDXL-family LoRAs apply to the InstantID RealVisXL backbone just like the
@@ -260,7 +340,7 @@ impl InstantId {
         let pairs = load_ip_kv_pairs(&ipa)?;
         unet.install_ip_adapter(pairs)?;
 
-        let vae = load_sdxl_vae(&paths.vae_fp16_fix, &device, DTYPE)?;
+        let vae = load_sdxl_vae(&paths.sdxl.vae_fp16_fix, &device, DTYPE)?;
         Ok(Self {
             conditioner,
             unet,
@@ -1015,5 +1095,86 @@ mod tests {
         assert!((placed[1].0 - 25.0).abs() < 1e-3 && (placed[1].1 - 25.0).abs() < 1e-3);
         // The corner (30,30) is at norm (+0.5,+0.5) → 75.
         assert!((placed[2].0 - 75.0).abs() < 1e-3 && (placed[2].1 - 75.0).abs() < 1e-3);
+    }
+
+    /// A LoadSpec staging all three declared SDXL components under nonexistent placeholder paths — the
+    /// gate only reads the component *keys*, so the paths are never touched (weights-free).
+    fn staged_sdxl_spec() -> LoadSpec {
+        LoadSpec::new(WeightsSource::Dir("/nonexistent/sdxl".into()))
+            .with_component(
+                COMPONENT_TOKENIZER_CLIP_L,
+                WeightsSource::File("/nonexistent/clip_l/tokenizer.json".into()),
+            )
+            .with_component(
+                COMPONENT_TOKENIZER_CLIP_BIGG,
+                WeightsSource::File("/nonexistent/clip_bigg/tokenizer.json".into()),
+            )
+            .with_component(
+                COMPONENT_VAE_FP16_FIX,
+                WeightsSource::File("/nonexistent/vae.safetensors".into()),
+            )
+    }
+
+    /// InstantID reuses candle-gen-sdxl's shared conditioner/VAE, so its advertised component ids MUST
+    /// stay **verbatim**-equal to the SDXL generator's — a drift would stage the wrong keys and the gate
+    /// would reject a correctly-provisioned load (sc-13739).
+    #[test]
+    fn required_components_match_sdxl_verbatim() {
+        assert_eq!(
+            REQUIRED_COMPONENTS,
+            &["tokenizer_clip_l", "tokenizer_clip_bigg", "vae_fp16_fix"]
+        );
+        assert_eq!(
+            REQUIRED_COMPONENTS,
+            candle_gen_sdxl::descriptor().required_components,
+            "InstantID's SDXL component ids drifted from candle-gen-sdxl's descriptor"
+        );
+    }
+
+    /// epic 13657 (sc-13739): the SDXL-component **load gate**. `SdxlComponents::from_spec` resolves the
+    /// three declared components from a `LoadSpec`, and a missing OR unknown component is a
+    /// caller-actionable **load-time** error (never a mid-render fetch). Weights-free — `from_spec` reads
+    /// only the component keys, so the nonexistent placeholder paths are never opened. This is the
+    /// bespoke-crate analogue of the testkit `check_component_load_gate` the registered SDXL generator
+    /// uses (InstantID has no registry `Generator`/`load(&LoadSpec)`, so the gate is asserted directly).
+    #[test]
+    fn sdxl_components_gate_missing_and_unknown_at_load() {
+        // Fully staged → the gate clears.
+        assert!(
+            SdxlComponents::from_spec(&staged_sdxl_spec()).is_ok(),
+            "a fully-staged spec must clear the gate"
+        );
+
+        // Each required component, removed in turn, fails — and the error NAMES the missing id (so the
+        // failure is provably the component gate) and points at the `with_component` builder fix.
+        for &missing in REQUIRED_COMPONENTS {
+            let mut spec = staged_sdxl_spec();
+            spec.components.remove(missing);
+            let err = SdxlComponents::from_spec(&spec)
+                .expect_err(&format!("missing '{missing}' must fail at load"))
+                .to_string();
+            assert!(
+                err.contains(missing),
+                "error must name the missing component '{missing}': {err}"
+            );
+            assert!(
+                err.contains("with_component"),
+                "error must name the builder fix for '{missing}': {err}"
+            );
+        }
+
+        // A component key InstantID does not declare is rejected at load (reject_unknown_components).
+        let mut spec = staged_sdxl_spec();
+        spec.components.insert(
+            "bogus_component".to_owned(),
+            WeightsSource::File("/dev/null".into()),
+        );
+        let err = SdxlComponents::from_spec(&spec)
+            .expect_err("an unknown component key must fail at load")
+            .to_string();
+        assert!(
+            err.contains("bogus_component"),
+            "error must name the unknown component key: {err}"
+        );
     }
 }

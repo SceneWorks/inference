@@ -36,8 +36,9 @@ mod validate;
 
 pub use kps::{draw_kps, letterbox, view_angle_kps, ANGLE_SET_ORDER, VIEW_ANGLE_KPS};
 pub use model::{
-    InstantId, InstantIdPaths, InstantIdRequest, DEFAULT_CONTROLNET_SCALE, DEFAULT_IP_SCALE,
-    DEFAULT_OPENPOSE_SCALE, FACE_RESTORE_PROMPT,
+    InstantId, InstantIdPaths, InstantIdRequest, SdxlComponents, COMPONENT_TOKENIZER_CLIP_BIGG,
+    COMPONENT_TOKENIZER_CLIP_L, COMPONENT_VAE_FP16_FIX, DEFAULT_CONTROLNET_SCALE, DEFAULT_IP_SCALE,
+    DEFAULT_OPENPOSE_SCALE, FACE_RESTORE_PROMPT, MODEL_ID, REQUIRED_COMPONENTS,
 };
 pub use openpose::{
     draw_bodypose, face_box_from_keypoints, normalize_keypoints, square_fit, BodyPoint,
