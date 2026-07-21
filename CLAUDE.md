@@ -62,6 +62,17 @@ cargo deny --locked check advisories bans licenses sources   # supply-chain poli
 from the resolved graph, and that the intentional `tokenizers` 0.21/0.22 split is preserved. If you
 add or remove a crate, update `EXPECTED_MEMBER_COUNT`.
 
+It also enforces the **epic-13657 self-fetch boundary**: no network/HTTP client
+(`hf-hub`, `reqwest`, `ureq`, `curl`, `git2`, `hyper`, …) may resolve in the graph, and no Rust of
+any member — src, tests, examples, testkits — may reference an HF download cache (`HF_HOME`,
+`HF_HUB_CACHE`, `.cache/huggingface`, `hf_hub`, `Api::new`) or re-introduce a deleted production
+env side channel (`PERTH_SNAPSHOT`, `MOSS_XY_TOKENIZER_SNAPSHOT`, `LTX_GEMMA_DIR`, …). Inference
+**receives every model component as a caller-provisioned local path** (`WeightsSource::Dir`/`File`);
+fetching and cache placement are the consumer's job, and user-supplied models at arbitrary paths
+must load. `deny.toml` bans the same network clients for defense in depth. Explicit passed-in-path
+test env vars (`MLX_LLM_TEST_MODEL`, per-crate `*_SNAPSHOT`/`*_SNAPSHOT_DIR`) stay allowed — the
+lint targets cache-location *derivation*, not passed-in paths.
+
 ## Architecture — explicit composition (the core invariant)
 
 Read `docs/architecture/inference-rearchitecture.md` before changing composition. Dependency

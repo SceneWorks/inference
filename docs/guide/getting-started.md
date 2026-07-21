@@ -228,8 +228,13 @@ instead of the whole platform.
 ## 9. Where weights come from
 
 Loaders read local `.safetensors` (`WeightsSource::Dir` for a sharded directory,
-`WeightsSource::File` for a single file); an HF-hub fetch variant is a planned additive
-extension. The revisions used for real-weight release validation are pinned in
+`WeightsSource::File` for a single file). Inference never self-fetches weights and never derives a
+download-cache location: the consumer resolves, fetches, and stages every path before calling
+`load`, so a user-supplied model at an arbitrary path works and a missing component is a load-time
+error rather than a mid-render fetch. There is deliberately no hub-fetch `WeightsSource` variant
+(the sc-2340 direction is permanently rejected; see
+[the architecture invariants](../architecture/inference-rearchitecture.md#invariants-for-future-changes)).
+The revisions used for real-weight release validation are pinned in
 [`release/real-weight-models.toml`](../../release/real-weight-models.toml). Descriptor
 introspection and the conformance sweep are entirely weights-free — you can enumerate and
 validate the whole catalog in CI without any model present.

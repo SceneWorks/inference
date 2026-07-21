@@ -308,7 +308,21 @@ Future inference work should preserve these rules:
 - differences between MLX and Candle catalogs are allowed when they represent
   real implementation differences and are pinned explicitly in tests;
 - backend-scoped convenience loaders must derive their registry from explicit
-  registration functions and must not introduce hidden mutable or linker state.
+  registration functions and must not introduce hidden mutable or linker state;
+- inference never self-fetches weights and never derives a download-cache
+  location. Every model component — base weights, typed overlays, and each
+  `LoadSpec` component — is a caller-provisioned local path (`WeightsSource::Dir`
+  or `File`); resolving, fetching, and cache placement are the consumer's job, so
+  a user-supplied model at an arbitrary path must load and a missing component is
+  a load-time contract error, never a mid-render fetch. The
+  [`WeightsSource`](../../crates/contracts/gen-core/src/runtime.rs) enum carries no
+  hub-fetch variant (the sc-2340 direction is permanently rejected). This is
+  enforced by `scripts/check-workspace.py`: no network/HTTP client
+  (`hf-hub`, `reqwest`, `ureq`, `curl`, `git2`, `hyper`, …) may resolve in the
+  graph, and no workspace Rust — src, tests, examples, testkits — may reference an
+  HF cache (`HF_HOME`, `HF_HUB_CACHE`, `.cache/huggingface`, `hf_hub`, `Api::new`)
+  or re-introduce a deleted production env side channel. `deny.toml` bans the same
+  clients for defense in depth.
 
 ## Validation and outcome
 

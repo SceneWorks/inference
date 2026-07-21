@@ -49,7 +49,22 @@ allow = ["WTFPL"]
 multiple-versions = "warn"
 wildcards = "allow"
 highlight = "all"
-deny = []
+# Defense in depth for the epic-13657 self-fetch boundary (the primary enforcement is
+# scripts/check-workspace.py, which bans these from the resolved graph and is unit-tested).
+# Inference receives every model component as a caller-provisioned local path and never fetches
+# weights or derives a download-cache location, so no network/HTTP client belongs in the graph.
+# All nine are confirmed absent on the clean tree; extend this list, never trim it.
+deny = [
+    { crate = "hf-hub" },
+    { crate = "reqwest" },
+    { crate = "ureq" },
+    { crate = "curl" },
+    { crate = "curl-sys" },
+    { crate = "git2" },
+    { crate = "isahc" },
+    { crate = "attohttpc" },
+    { crate = "hyper" },
+]
 skip = []
 skip-tree = []
 
