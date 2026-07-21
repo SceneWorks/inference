@@ -145,15 +145,18 @@ pub struct LoadSpec {
     pub pid: Option<PidWeights>,
     /// Auxiliary **identity-conditioning** sub-model weights (PuLID / InstantID family, sc-8827) — the
     /// EVA-CLIP tower, the identity encoder checkpoint, and the native face-analysis weight dir that a
-    /// face-ID provider needs on top of its diffusion backbone. `None` for a plain base model; the
-    /// PuLID-FLUX loader reads it, falling back to its historical `PULID_*` env vars only when unset,
-    /// so a caller can drive the load entirely through the spec (backend-neutral — just paths).
+    /// face-ID provider needs on top of its diffusion backbone. `None` for a plain base model. A
+    /// face-ID provider that reads this slot **requires** it: the caller drives every identity path
+    /// through the spec (backend-neutral — just paths), and an absent slot (or an absent sub-field) is a
+    /// **load-time** error, never a fetch from an env var or the on-disk HF cache (epic 13657, sc-13664 —
+    /// the PuLID-FLUX loader dropped its historical `PULID_*` env / `~/.cache/huggingface` fallbacks).
     pub identity: Option<IdentityWeights>,
     /// Auxiliary **external text-encoder** snapshot directory (sc-8827) — a separate TE snapshot a
     /// provider loads alongside its main checkpoint, e.g. LTX-2.3's Gemma-3-12B encoder (which is not
-    /// bundled in the checkpoint dir). `None` → the provider's historical env-var / `<root>` fallback
-    /// (`LTX_GEMMA_DIR`, else `<root>/text_encoder`). Backend-neutral (just a path), so a caller can
-    /// drive the TE location through the spec instead of a process-global env var.
+    /// bundled in the checkpoint dir). A provider that reads this slot **requires** it: the caller
+    /// drives the TE location through the spec (backend-neutral — just a path), and an absent slot is a
+    /// **load-time** error, never a process-global env var or an on-disk HF-cache scan (epic 13657,
+    /// sc-13664 — LTX-2.3 dropped its historical `$LTX_GEMMA_DIR` / `~/.cache/huggingface` fallbacks).
     pub text_encoder: Option<WeightsSource>,
     /// Component-residency strategy (epic 10765, sc-10821). [`OffloadPolicy::Resident`] (default) keeps
     /// every component resident for the whole generation; [`OffloadPolicy::Sequential`] asks a supporting
@@ -191,11 +194,18 @@ pub struct LoadSpec {
     /// | MOSS tts / tts-realtime | `codec` |
     /// | SDXL | `tokenizer_clip_l`, `tokenizer_clip_bigg`, `vae_fp16_fix` |
     /// | mmaudio | `clip`, `synchformer`, `dit`, `vae`, `vocoder` |
+    /// | sensenova (fast) | `distill_lora` |
+    /// | LTX-2.3 | `uncensored_enhancer` |
     ///
-    /// Reserved for later stories (not populated here): sensenova `distill_lora`, LTX `text_encoder`
-    /// (sc-13664). Ids are lowercase `snake_case` registry identifiers (same shape as a descriptor
-    /// `id`); a model's declared ids are validated non-empty and unique by the descriptor conformance
-    /// sweep ([`model_descriptor_errors`](crate::registry::model_descriptor_errors)).
+    /// sc-13664 wired sensenova's `distill_lora` (the 8-step distill LoRA for `sensenova_u1_8b_fast`,
+    /// with a co-located-in-snapshot fallback; **not** a universally-`required_components` id, because a
+    /// pre-merged turnkey tier bakes the merge in and needs no LoRA) and LTX-2.3's optional
+    /// `uncensored_enhancer` (the amoral 4-bit Gemma enhancer, read on demand when a request sets
+    /// `use_uncensored_enhancer`). LTX-2.3's *main* Gemma text encoder rides the typed
+    /// [`text_encoder`](Self::text_encoder) slot (now required), not this map. Ids are lowercase
+    /// `snake_case` registry identifiers (same shape as a descriptor `id`); a model's declared
+    /// `required_components` ids are validated non-empty and unique by the descriptor conformance sweep
+    /// ([`model_descriptor_errors`](crate::registry::model_descriptor_errors)).
     pub components: BTreeMap<String, WeightsSource>,
 }
 
@@ -215,17 +225,24 @@ pub struct PidWeights {
 
 /// The identity-conditioning sub-model weights a face-ID provider (PuLID / InstantID family) needs on
 /// top of its diffusion backbone (F-114). Backend-neutral paths; the tensor load lives in the provider
-/// crate. Every field is optional so a caller can override just the pieces it has and let the provider
-/// fall back to its env-var defaults (`PULID_*`) for the rest.
+/// crate.
+///
+/// Each field is `Option` only so the struct can be built incrementally / defaulted; a provider that
+/// reads a field **requires** it — the caller supplies every path through this struct, and an absent
+/// field is a **load-time** error (epic 13657, sc-13664). There is no env-var or HF-cache fallback:
+/// the old "optional field ⇒ provider `PULID_*` env / `~/.cache/huggingface` default" convention was
+/// deleted, so a `None` a provider needs fails fast at load rather than silently scanning the disk.
 #[derive(Clone, Debug, Default)]
 pub struct IdentityWeights {
     /// The identity-encoder checkpoint — a single `.safetensors` (PuLID's
-    /// `pulid_flux_v0.9.1.safetensors`). `None` → the provider's env-var / HF-cache fallback.
+    /// `pulid_flux_v0.9.1.safetensors`). Required by the PuLID-FLUX loader (`None` ⇒ load-time error).
     pub encoder: Option<WeightsSource>,
-    /// The converted EVA-CLIP vision tower — a single `.safetensors`. `None` → env-var fallback.
+    /// The converted EVA-CLIP vision tower — a single `.safetensors`. Required by the PuLID-FLUX loader
+    /// (`None` ⇒ load-time error).
     pub eva: Option<WeightsSource>,
     /// The native face-analysis weight **directory** ([`WeightsSource::Dir`]) — must contain
-    /// `scrfd_10g` / `arcface_iresnet100` / `bisenet_parsing` safetensors. `None` → env-var fallback.
+    /// `scrfd_10g` / `arcface_iresnet100` / `bisenet_parsing` safetensors. Required by the PuLID-FLUX
+    /// loader (`None` ⇒ load-time error).
     pub face_dir: Option<WeightsSource>,
 }
 
