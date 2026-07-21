@@ -143,16 +143,18 @@ pub fn prequantize_turnkey(src_root: &Path, dst_root: &Path, bits: i32) -> Resul
 /// weights). Every tier gets the [`DISTILL_MERGED_MARKER`] so [`crate::model::load_fast`] skips the
 /// load-time merge, plus the same config/tokenizer/license assets as the base converter.
 ///
-/// The distill LoRA is resolved by [`resolve_distill_lora`] (env override / co-located in `src_root` /
-/// HF cache). Full coverage (`7 · num_hidden_layers + 2`) is asserted, so a stale/mismatched LoRA
-/// fails loudly rather than merging a subset.
+/// The distill LoRA is resolved by [`resolve_distill_lora`] co-located in `src_root` (this offline
+/// converter has no [`LoadSpec`](mlx_gen::gen_core::LoadSpec), so it passes `None` for the component —
+/// the LoRA must sit beside the source snapshot; no env / HF-cache fallback, sc-13664). Full coverage
+/// (`7 · num_hidden_layers + 2`) is asserted, so a stale/mismatched LoRA fails loudly rather than
+/// merging a subset.
 pub fn prequantize_fast_turnkey(src_root: &Path, dst_root: &Path, bits: i32) -> Result<()> {
     std::fs::create_dir_all(dst_root)?;
 
     // Merge the distill LoRA into the flat dense map (before any quantize), asserting full coverage
     // against the config — the same `7·layers + 2` the loader's `load_fast` asserts at merge time.
     let cfg = NeoChatConfig::from_dir(src_root)?;
-    let lora_path = resolve_distill_lora(src_root)?;
+    let lora_path = resolve_distill_lora(None, src_root)?;
     let lora = Weights::from_file(&lora_path)?;
     let mut map = load_dir_map(src_root)?;
     let applied = merge_distill_into_map(&mut map, &lora)?;

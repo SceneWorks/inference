@@ -26,7 +26,7 @@ use mlx_gen::weights::Weights;
 use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, gen_core, CancelFlag, Capabilities,
     Conditioning, ConditioningKind, Error, GenerationOutput, GenerationRequest, Generator,
-    IdentityWeights, LoadSpec, Modality, ModelDescriptor, Progress, Quant, Result, WeightsSource,
+    LoadSpec, Modality, ModelDescriptor, Progress, Quant, Result, WeightsSource,
 };
 use mlx_gen_face::FaceAnalysis;
 use mlx_gen_flux::config::FluxVariant;
@@ -364,22 +364,10 @@ impl PulidFlux {
 
 // ---- registration -------------------------------------------------------------------------------
 
-/// Resolve a required file path from an env var, erroring with the var name if unset/missing.
-fn env_path(var: &str) -> Result<PathBuf> {
-    let p = std::env::var(var)
-        .map_err(|_| Error::Msg(format!("pulid_flux: set {var} to the weights path")))?;
-    let p = PathBuf::from(p);
-    if !p.exists() {
-        return Err(Error::Msg(format!(
-            "pulid_flux: {var} path does not exist: {}",
-            p.display()
-        )));
-    }
-    Ok(p)
-}
-
-/// Extract the `PathBuf` from a spec-supplied [`WeightsSource`] override, validating existence with a
-/// clear message (F-114). Accepts either `File` or `Dir` — the caller knows which it expects.
+/// Extract the `PathBuf` from a spec-supplied identity [`WeightsSource`], validating existence with a
+/// clear, slot-named message (F-114 / sc-13664). Accepts either `File` or `Dir` — the caller knows
+/// which it expects. This is the ONLY identity-path resolver: every path is caller-supplied via
+/// `LoadSpec::identity`, with no env / HF-cache fallback.
 fn spec_path(src: &WeightsSource, what: &str) -> Result<PathBuf> {
     let p = match src {
         WeightsSource::File(p) | WeightsSource::Dir(p) => p.clone(),
@@ -393,50 +381,6 @@ fn spec_path(src: &WeightsSource, what: &str) -> Result<PathBuf> {
     Ok(p)
 }
 
-/// Resolve an identity sub-model path: prefer the `LoadSpec::identity` override (F-114), else fall
-/// back to the historical `PULID_*` env var (its HF-cache-glob resolver, for `encoder`, is handled by
-/// [`resolve_pulid_weights`] separately).
-fn resolve_identity_path(
-    override_src: Option<&WeightsSource>,
-    var: &str,
-    what: &str,
-) -> Result<PathBuf> {
-    match override_src {
-        Some(src) => spec_path(src, what),
-        None => env_path(var),
-    }
-}
-
-/// Locate `pulid_flux_v0.9.1.safetensors` — the `LoadSpec::identity.encoder` override (F-114), else
-/// `PULID_FLUX_WEIGHTS`, else the HF cache.
-fn resolve_pulid_weights(override_src: Option<&WeightsSource>) -> Result<PathBuf> {
-    // Prefer an explicit spec override; then the env var; then the HF-cache glob.
-    if let Some(src) = override_src {
-        return spec_path(src, "encoder");
-    }
-    // Route the override through `env_path` so a typo'd path errors with the var name up front,
-    // matching the sibling weight-path helpers (F-093), instead of a bare later I/O error.
-    if std::env::var_os("PULID_FLUX_WEIGHTS").is_some() {
-        return env_path("PULID_FLUX_WEIGHTS");
-    }
-    let home = std::env::var("HOME").unwrap_or_default();
-    let glob = format!("{home}/.cache/huggingface/hub/models--guozinan--PuLID/snapshots");
-    let snaps = std::fs::read_dir(&glob).map_err(|e| {
-        Error::Msg(format!(
-            "pulid_flux: no PuLID cache ({glob}): {e}; set PULID_FLUX_WEIGHTS"
-        ))
-    })?;
-    for s in snaps.flatten() {
-        let cand = s.path().join("pulid_flux_v0.9.1.safetensors");
-        if cand.exists() {
-            return Ok(cand);
-        }
-    }
-    Err(Error::Msg(
-        "pulid_flux: pulid_flux_v0.9.1.safetensors not found; set PULID_FLUX_WEIGHTS".into(),
-    ))
-}
-
 /// Load EVA weights (f32) from a converted safetensors (tools/convert_eva_clip.py output). Keys are
 /// bare mlx-names (no prefix).
 fn load_eva(path: &Path) -> Result<EvaVisionTransformer> {
@@ -445,21 +389,49 @@ fn load_eva(path: &Path) -> Result<EvaVisionTransformer> {
     EvaVisionTransformer::from_weights(&w, "", EvaConfig::default())
 }
 
-/// Registered loader for the `pulid_flux` target. Weight sources (each identity sub-model prefers the
-/// structured `LoadSpec::identity` override, falling back to its historical env var — F-114):
+/// Registered loader for the `pulid_flux` target. Every identity sub-model path is **required** and
+/// comes from `LoadSpec::identity` (sc-13664 — no `PULID_*` env vars, no on-disk HF-cache scan; an
+/// absent slot or sub-field is a load-time, actionable error). Weight sources:
 ///   * FLUX.1-dev snapshot dir — `spec.weights` (Dir).
-///   * identity encoder — `spec.identity.encoder`, else `PULID_FLUX_WEIGHTS` (else HF cache).
-///   * EVA tower — `spec.identity.eva`, else `PULID_EVA_WEIGHTS` (converted EVA02-CLIP-L-14-336).
-///   * face dir — `spec.identity.face_dir`, else `PULID_FACE_WEIGHTS_DIR` (scrfd_10g /
-///     arcface_iresnet100 / bisenet_parsing).
+///   * identity encoder — `spec.identity.encoder` (`pulid_flux_v0.9.1.safetensors`).
+///   * EVA tower — `spec.identity.eva` (converted EVA02-CLIP-L-14-336).
+///   * face dir — `spec.identity.face_dir` (scrfd_10g / arcface_iresnet100 / bisenet_parsing).
 pub fn load_pulid_flux(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
-    // F-114: the identity sub-model paths ride the spec when present; env vars are the fallback.
-    let id = spec.identity.clone().unwrap_or_default();
-    let IdentityWeights {
-        encoder,
-        eva,
-        face_dir,
-    } = id;
+    // sc-13664: require the identity slot and each sub-field, and resolve (existence-check) every path
+    // BEFORE the FLUX backbone load — so a missing identity slot/field fails fast at load with a
+    // slot-named error, never a mid-load `PULID_*` env / HF-cache fetch.
+    let identity = spec.identity.as_ref().ok_or_else(|| {
+        Error::Msg(
+            "pulid_flux requires the identity weights — set LoadSpec::identity with encoder / eva / \
+             face_dir (WeightsSource paths); there is no PULID_* env or HF-cache fallback"
+                .into(),
+        )
+    })?;
+    let encoder = identity.encoder.as_ref().ok_or_else(|| {
+        Error::Msg(
+            "pulid_flux requires the identity encoder — set LoadSpec::identity.encoder to the \
+             pulid_flux_v0.9.1.safetensors path"
+                .into(),
+        )
+    })?;
+    let eva_src = identity.eva.as_ref().ok_or_else(|| {
+        Error::Msg(
+            "pulid_flux requires the identity EVA tower — set LoadSpec::identity.eva to the \
+             converted EVA02-CLIP-L-14-336 .safetensors path"
+                .into(),
+        )
+    })?;
+    let face_src = identity.face_dir.as_ref().ok_or_else(|| {
+        Error::Msg(
+            "pulid_flux requires the identity face-analysis dir — set LoadSpec::identity.face_dir to \
+             the scrfd_10g / arcface_iresnet100 / bisenet_parsing weights dir"
+                .into(),
+        )
+    })?;
+    let encoder_path = spec_path(encoder, "encoder")?;
+    let eva_path = spec_path(eva_src, "eva")?;
+    let face_dir = spec_path(face_src, "face_dir")?;
+
     // FLUX.1-dev backbone (its loader validates the snapshot dir). Q8/Q4 (sc-3076) composes for free:
     // `spec.quantize` flows through `load_flux1`, quantizing ONLY the FLUX backbone linears. The PuLID
     // conditioning (EVA tower, IDFormer, the 20 CA modules) stays f32 — it runs once per image, not
@@ -468,18 +440,13 @@ pub fn load_pulid_flux(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     let flux = load_flux1(FluxVariant::Dev, spec)?;
 
     // PuLID encoder + CA weights, cast f32 (conditioning path).
-    let mut pulid = Weights::from_file(resolve_pulid_weights(encoder.as_ref())?)?;
+    let mut pulid = Weights::from_file(encoder_path)?;
     pulid.cast_all(Dtype::Float32)?;
 
     // EVA-CLIP tower (f32).
-    let eva = load_eva(&resolve_identity_path(
-        eva.as_ref(),
-        "PULID_EVA_WEIGHTS",
-        "eva",
-    )?)?;
+    let eva = load_eva(&eva_path)?;
 
     // Native face stack.
-    let face_dir = resolve_identity_path(face_dir.as_ref(), "PULID_FACE_WEIGHTS_DIR", "face_dir")?;
     let face = FaceAnalysis::load(
         &Weights::from_file(face_dir.join("scrfd_10g.safetensors"))?,
         &Weights::from_file(face_dir.join("arcface_iresnet100.safetensors"))?,
@@ -502,28 +469,68 @@ mlx_gen::register_generators! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mlx_gen::IdentityWeights;
 
-    #[test]
-    fn pulid_weights_override_validates_existence() {
-        // F-093: a set-but-nonexistent PULID_FLUX_WEIGHTS errors up front with the var name (routed
-        // through env_path), not a bare later I/O error. (RUST_TEST_THREADS=1 makes the env mutation
-        // safe — see .cargo/config.toml.)
-        std::env::set_var(
-            "PULID_FLUX_WEIGHTS",
-            "/nonexistent/pulid_flux_v0.9.1.safetensors",
-        );
-        let err = resolve_pulid_weights(None).unwrap_err().to_string();
-        std::env::remove_var("PULID_FLUX_WEIGHTS");
-        assert!(err.contains("PULID_FLUX_WEIGHTS"), "got: {err}");
-        assert!(err.contains("does not exist"), "got: {err}");
+    /// The load error string, matched (not `unwrap_err` — `Box<dyn Generator>` isn't `Debug`).
+    fn load_err(spec: &LoadSpec) -> String {
+        match load_pulid_flux(spec) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected load_pulid_flux to error"),
+        }
     }
 
+    /// sc-13664: the identity slot is **required** — an absent `LoadSpec::identity`, or an absent
+    /// `encoder` / `eva` / `face_dir` sub-field, is a **load-time** actionable error naming the slot,
+    /// resolved before any FLUX backbone I/O. No `PULID_*` env / HF-cache fallback.
     #[test]
-    fn pulid_identity_spec_override_takes_precedence() {
-        // F-114: a `LoadSpec::identity.encoder` override is preferred over the env var, and a
-        // nonexistent override path errors with the spec-side message (not the env var name).
+    fn load_requires_identity_slot_and_every_subfield() {
+        // No identity slot at all — the actionable error names the slot (and confirms, for a migrating
+        // caller, that the historical `PULID_*` env fallback is gone).
+        let err = load_err(&LoadSpec::new(WeightsSource::Dir(
+            "/nonexistent/flux".into(),
+        )));
+        assert!(err.contains("requires the identity weights"), "got: {err}");
+        assert!(
+            !err.contains("PULID_FLUX_WEIGHTS"),
+            "the message must not resurrect the deleted env var as usable: {err}"
+        );
+
+        // Identity present but each sub-field missing in turn → named error for the missing one.
+        let base = |id: IdentityWeights| LoadSpec {
+            identity: Some(id),
+            ..LoadSpec::new(WeightsSource::Dir("/nonexistent/flux".into()))
+        };
+        let file = |p: &str| Some(WeightsSource::File(p.into()));
+        let dir = |p: &str| Some(WeightsSource::Dir(p.into()));
+
+        let no_encoder = base(IdentityWeights {
+            encoder: None,
+            eva: file("/x/eva.safetensors"),
+            face_dir: dir("/x/face"),
+        });
+        assert!(load_err(&no_encoder).contains("requires the identity encoder"));
+
+        let no_eva = base(IdentityWeights {
+            encoder: file("/x/pulid.safetensors"),
+            eva: None,
+            face_dir: dir("/x/face"),
+        });
+        assert!(load_err(&no_eva).contains("requires the identity EVA tower"));
+
+        let no_face = base(IdentityWeights {
+            encoder: file("/x/pulid.safetensors"),
+            eva: file("/x/eva.safetensors"),
+            face_dir: None,
+        });
+        assert!(load_err(&no_face).contains("requires the identity face-analysis dir"));
+    }
+
+    /// sc-13664: a set-but-nonexistent identity path errors up front with the spec-side message (the
+    /// `spec_path` existence check), naming the sub-field — not a bare later I/O error, no env var name.
+    #[test]
+    fn identity_encoder_nonexistent_path_errors_with_spec_message() {
         let src = WeightsSource::File("/nonexistent/spec_pulid.safetensors".into());
-        let err = resolve_pulid_weights(Some(&src)).unwrap_err().to_string();
+        let err = spec_path(&src, "encoder").unwrap_err().to_string();
         assert!(err.contains("LoadSpec identity encoder"), "got: {err}");
         assert!(err.contains("does not exist"), "got: {err}");
     }

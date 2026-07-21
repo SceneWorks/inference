@@ -142,10 +142,10 @@ pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
 ///
 /// `te_override` is `LoadSpec::text_encoder` — the bundled Gemma-3 dir the self-contained LTX install
 /// ships beside the tier weights (sc-8827/sc-9989). Threaded into [`resolve_gemma_dir`] exactly as the
-/// inference path does (`model.rs`): spec-override > `$LTX_GEMMA_DIR` > HF-cache snapshot. `None` keeps
-/// the legacy env/HF-cache fallback (the concrete-loader tests pass `None`).
+/// inference path does (`model.rs`), which as of sc-13664 **requires** the slot: `None` is a load-time
+/// error (no env / HF-cache fallback), so the trainer must be handed an explicit TE dir.
 fn load_trainer_from_dir(root: &Path, te_override: Option<&WeightsSource>) -> Result<LtxTrainer> {
-    // Resolve (and validate) the Gemma-3 TE location up front — a bad `LoadSpec::text_encoder`
+    // Resolve (and validate) the Gemma-3 TE location up front — an absent/bad `LoadSpec::text_encoder`
     // override fails fast here, ahead of the split-weight load, and keeps the wiring unit-testable
     // without the ~24 GB base snapshot (sc-9989). Only the path is resolved here; the heavy
     // `Weights::from_dir` load stays below with the rest of the component loads.
@@ -910,6 +910,17 @@ mod first_step_repro {
             .join("Library/Application Support/SceneWorks/data/models/mlx/ltx_2_3_base_q8")
     }
 
+    /// The Gemma-3 TE dir passed as the (now-required) `LoadSpec::text_encoder` override. sc-13664
+    /// deleted the production `$LTX_GEMMA_DIR` / HF-cache fallback, so this real-weight harness supplies
+    /// the path explicitly: `LTX_GEMMA_DIR` is a **test-only** convenience env var, else the base
+    /// snapshot's sibling `gemma/` dir (the layout the self-contained LTX install ships).
+    fn gemma_override() -> WeightsSource {
+        if let Ok(d) = std::env::var("LTX_GEMMA_DIR") {
+            return WeightsSource::Dir(PathBuf::from(d));
+        }
+        WeightsSource::Dir(snapshot().join("gemma"))
+    }
+
     /// A solid-colour `edge`×`edge` RGB source (the latent magnitude is irrelevant; the graph size —
     /// driven by resolution — is the variable under test).
     fn swatch(edge: u32) -> Image {
@@ -940,7 +951,8 @@ mod first_step_repro {
         Array,
         Vec<Vec<BlockLoraRef>>,
     ) {
-        let mut trainer = load_trainer_from_dir(&snapshot(), None)
+        let te = gemma_override();
+        let mut trainer = load_trainer_from_dir(&snapshot(), Some(&te))
             .expect("LTX-2.3 base snapshot (SceneWorks cache or $LTX_BASE_DIR) + Gemma TE");
         let suffixes: Vec<String> = DEFAULT_TARGET_SUFFIXES
             .iter()

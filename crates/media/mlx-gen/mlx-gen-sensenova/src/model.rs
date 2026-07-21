@@ -26,6 +26,7 @@
 use mlx_rs::ops::divide;
 use mlx_rs::Array;
 
+use mlx_gen::gen_core::reject_unknown_components;
 use mlx_gen::image::{decoded_to_image, resize_bicubic_u8};
 use mlx_gen::{
     default_seed, gen_core, Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput,
@@ -155,8 +156,9 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 /// Construct the 8-step distilled [`SenseNova`] (`sensenova_u1_8b_fast`, sc-3192), plus the distilled
 /// generation defaults. Two tier shapes load here:
 /// - a **dense base snapshot** (no [`DISTILL_MERGED_MARKER`]): the distill LoRA is resolved by
-///   [`resolve_distill_lora`] (env override / co-located / HF cache) and merged into the dense
-///   generation path **before** any quantization — the original sc-3192 path; and
+///   [`resolve_distill_lora`] from the caller-supplied `distill_lora` component (else the co-located
+///   snapshot file — no env / HF-cache fallback, sc-13664) and merged into the dense generation path
+///   **before** any quantization — the original sc-3192 path; and
 /// - a **pre-merged turnkey** (sc-8775: the packed q4/q8 or dense bf16 fast tiers built by
 ///   [`crate::convert::prequantize_fast_turnkey`], marked with [`DISTILL_MERGED_MARKER`]): the merge
 ///   is already baked into the on-disk weights, so the loader skips it (a packed tier cannot re-merge
@@ -187,6 +189,25 @@ fn load_inner(spec: &LoadSpec, fast: bool) -> Result<Box<dyn Generator>> {
             )))
         }
     };
+    // Named-component contract (sc-13658/sc-13664): the fast variant reads the `distill_lora`
+    // component; the base id reads none. Reject any unrecognized component key up front.
+    let known: &[&str] = if fast { &["distill_lora"] } else { &[] };
+    reject_unknown_components(spec, known, id)?;
+    // Resolve (and existence-check) the distill LoRA path for a dense-base fast tier *before* the heavy
+    // config/weights I/O, so a missing LoRA fails fast at load with an actionable, `distill_lora`-named
+    // error (sc-13664: from the caller-supplied component or the co-located snapshot file — never an
+    // env side-channel or the HF cache). A **pre-merged** turnkey tier (`DISTILL_MERGED_MARKER`
+    // present, sc-8775) bakes the merge in and needs no LoRA, so it is exempt — which is exactly why the
+    // fast descriptor does NOT declare `required_components: &["distill_lora"]` (that would be a false
+    // universal requirement that broke the pre-merged tier).
+    let distill_lora_path = if fast && !root.join(DISTILL_MERGED_MARKER).exists() {
+        Some(resolve_distill_lora(
+            spec.components.get("distill_lora"),
+            root,
+        )?)
+    } else {
+        None
+    };
     let cfg = NeoChatConfig::from_dir(root)?;
     let weights = load_raw(root)?;
     // F-137: diff the checkpoint against the canonical key set before building modules (the loader
@@ -205,8 +226,7 @@ fn load_inner(spec: &LoadSpec, fast: bool) -> Result<Box<dyn Generator>> {
     // a stale/mismatched LoRA fails loudly rather than silently merging a subset. (Pointing the fast
     // id at a *packed base* tier — no marker — stays a loud `merge_dense_delta` "base is quantized"
     // error, never a silent double-merge or half-load.)
-    if fast && !root.join(DISTILL_MERGED_MARKER).exists() {
-        let lora_path = resolve_distill_lora(root)?;
+    if let Some(lora_path) = distill_lora_path {
         let lora = Weights::from_file(&lora_path)?;
         let applied = model.merge_distill_lora(&lora)?;
         let expected = cfg.llm.num_hidden_layers * 7 + 2;
@@ -480,6 +500,50 @@ mod tests {
         assert!(load(&spec).is_err());
         // The fast loader rejects a single file the same way (before touching the LoRA).
         assert!(load_fast(&spec).is_err());
+    }
+
+    /// sc-13664: the fast loader resolves its distill LoRA from caller-supplied paths only (the
+    /// `distill_lora` component, else the co-located snapshot file) — no `$SENSENOVA_DISTILL_LORA`, no
+    /// HF-cache scan. A dense-base fast load with neither staged fails **at load** (fail-fast, before
+    /// the config/weights I/O) with an actionable error naming the component. Weights-free:
+    /// `/nonexistent` has no marker and no co-located LoRA.
+    #[test]
+    fn fast_load_requires_distill_lora_path() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let err = load_fast(&spec).err().expect("err").to_string();
+        assert!(err.contains("distill_lora"), "got: {err}");
+        assert!(!err.contains("SENSENOVA_DISTILL_LORA"), "got: {err}");
+    }
+
+    /// sc-13664: a staged-but-nonexistent `distill_lora` component errors at load naming the component
+    /// (not a bare later I/O error); a `Dir` staged where a `.safetensors` file is required is rejected.
+    #[test]
+    fn fast_load_validates_distill_lora_component() {
+        let missing = LoadSpec::new(WeightsSource::Dir("/nonexistent".into())).with_component(
+            "distill_lora",
+            WeightsSource::File("/nope/lora.safetensors".into()),
+        );
+        let err = load_fast(&missing).err().expect("err").to_string();
+        assert!(err.contains("distill_lora"), "got: {err}");
+        assert!(err.contains("does not exist"), "got: {err}");
+
+        let as_dir = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()))
+            .with_component("distill_lora", WeightsSource::Dir("/some/dir".into()));
+        let err = load_fast(&as_dir).err().expect("err").to_string();
+        assert!(err.contains("distill_lora"), "got: {err}");
+    }
+
+    /// sc-13658/sc-13664: an unrecognized component key is rejected at load (typed `Unsupported`).
+    #[test]
+    fn fast_load_rejects_unknown_component() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into())).with_component(
+            "bogus_component",
+            WeightsSource::File("/x.safetensors".into()),
+        );
+        assert!(matches!(
+            load_fast(&spec).err().expect("err"),
+            Error::Unsupported(_)
+        ));
     }
 
     #[test]

@@ -13,7 +13,10 @@
 //!
 //! Requires the local checkpoint + distill LoRA + dumped golden; none are in CI. Run:
 //!   cargo test -p mlx-gen-sensenova --test fast_realweight -- --ignored --nocapture
-//! Override the snapshot with `SENSENOVA_SNAPSHOT` and the LoRA with `SENSENOVA_DISTILL_LORA`.
+//! Override the snapshot with `SENSENOVA_SNAPSHOT`; point `SENSENOVA_DISTILL_LORA` at the LoRA file.
+//! sc-13664 deleted the production env / HF-cache scan, so `SENSENOVA_DISTILL_LORA` is now a
+//! **test-only** convenience: this harness reads it and passes the explicit path to
+//! `resolve_distill_lora` as the `distill_lora` component (else the LoRA co-located in the snapshot).
 
 use std::path::PathBuf;
 
@@ -76,8 +79,14 @@ fn fast_realweight_matches_reference() {
     let tokenizer = load_tokenizer(&snap).expect("tokenizer");
     let mut model = T2iModel::from_weights(&weights, &cfg).expect("build T2iModel");
 
-    // Merge the distill LoRA, asserting full coverage (7 gen-path linears/layer + 2 fm_head).
-    let lora_path = mlx_gen_sensenova::resolve_distill_lora(&snap).expect("resolve distill LoRA");
+    // Merge the distill LoRA, asserting full coverage (7 gen-path linears/layer + 2 fm_head). sc-13664:
+    // the LoRA path comes from the explicit test env var (as the `distill_lora` component) or the
+    // co-located snapshot file — no production env / HF-cache scan.
+    let lora_component = std::env::var("SENSENOVA_DISTILL_LORA")
+        .ok()
+        .map(|p| WeightsSource::File(p.into()));
+    let lora_path = mlx_gen_sensenova::resolve_distill_lora(lora_component.as_ref(), &snap)
+        .expect("resolve distill LoRA");
     let lora = mlx_gen::weights::Weights::from_file(&lora_path).expect("load distill LoRA");
     let applied = model.merge_distill_lora(&lora).expect("merge");
     let expected = cfg.llm.num_hidden_layers * 7 + 2;

@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::{Linear, VarBuilder};
+use candle_gen::gen_core::WeightsSource;
 use candle_gen::{CandleError, Result};
 
 /// The distill LoRA file name (the `--include` argument the reference docs download).
@@ -95,68 +96,46 @@ fn scalar_f32(a: &Tensor) -> Result<f32> {
         .ok_or_else(|| CandleError::Msg("distill LoRA: empty alpha scalar".into()))
 }
 
-/// Resolve the distill LoRA `.safetensors` for the `fast` variant. Resolution order:
-/// 1. `$SENSENOVA_DISTILL_LORA` (explicit override / CI),
-/// 2. co-located in the base snapshot `root`,
-/// 3. the standard HF Hub cache (`$HF_HUB_CACHE`, `$HF_HOME/hub`, or the user-home `.cache`).
+/// Resolve the distill LoRA `.safetensors` for the `fast` variant from caller-supplied paths only
+/// (epic 13657, sc-13664 — no env side-channel, no HF-cache scan). Resolution order:
+/// 1. the `distill_lora` [`LoadSpec::components`](candle_gen::gen_core::LoadSpec::components) entry
+///    (`component`), when the caller staged one — a single `.safetensors` [`WeightsSource::File`];
+/// 2. otherwise co-located in the base snapshot `root` (`<root>/{DISTILL_LORA_FILE}`) — a passed-in
+///    snapshot asset.
 ///
-/// Errors with a download hint if none resolve — the fast variant never silently falls back to the
-/// un-merged base.
-pub fn resolve_distill_lora(root: &Path) -> Result<PathBuf> {
-    if let Ok(p) = std::env::var("SENSENOVA_DISTILL_LORA") {
-        let p = PathBuf::from(p);
-        if p.exists() {
-            return Ok(p);
+/// Both are paths the caller provisioned; nothing is derived from an env side-channel or the on-disk
+/// HF cache. Errors (naming the `distill_lora` component) if neither resolves — the fast variant never
+/// silently falls back to the un-merged base. `component` is `spec.components.get("distill_lora")`;
+/// pass `None` for the offline converter (co-located only).
+pub fn resolve_distill_lora(component: Option<&WeightsSource>, root: &Path) -> Result<PathBuf> {
+    if let Some(src) = component {
+        let p = match src {
+            WeightsSource::File(p) => p.clone(),
+            WeightsSource::Dir(p) => {
+                return Err(CandleError::Msg(format!(
+                    "sensenova_u1_8b_fast: the 'distill_lora' component must be the \
+                     {DISTILL_LORA_FILE} .safetensors file, not a directory: {}",
+                    p.display()
+                )))
+            }
+        };
+        if !p.exists() {
+            return Err(CandleError::Msg(format!(
+                "sensenova_u1_8b_fast: the 'distill_lora' component path does not exist: {}",
+                p.display()
+            )));
         }
-        return Err(CandleError::Msg(format!(
-            "SENSENOVA_DISTILL_LORA={} does not exist",
-            p.display()
-        )));
+        return Ok(p);
     }
     let co_located = root.join(DISTILL_LORA_FILE);
     if co_located.exists() {
         return Ok(co_located);
     }
-    if let Some(p) = hf_cache_distill_lora() {
-        return Ok(p);
-    }
     Err(CandleError::Msg(format!(
-        "sensenova_u1_8b_fast: distill LoRA `{DISTILL_LORA_FILE}` not found. Download it \
-         (`huggingface-cli download {DISTILL_LORA_REPO} --include {DISTILL_LORA_FILE}`) or set \
-         SENSENOVA_DISTILL_LORA to its path."
+        "sensenova_u1_8b_fast: distill LoRA `{DISTILL_LORA_FILE}` not found — stage the \
+         'distill_lora' component in LoadSpec::components (with_component(\"distill_lora\", \
+         WeightsSource::File(...))) or co-locate the file in the snapshot dir {}. Download it with \
+         `huggingface-cli download {DISTILL_LORA_REPO} --include {DISTILL_LORA_FILE}`.",
+        root.display()
     )))
-}
-
-/// Locate `DISTILL_LORA_FILE` under the HF Hub cache for [`DISTILL_LORA_REPO`], scanning each
-/// `snapshots/<rev>/` directory. Honours `$HF_HUB_CACHE` and `$HF_HOME` before the user-home
-/// `.cache` default (`USERPROFILE` on Windows, `HOME` elsewhere).
-fn hf_cache_distill_lora() -> Option<PathBuf> {
-    let repo_dir = format!("models--{}", DISTILL_LORA_REPO.replace('/', "--"));
-    let mut roots: Vec<PathBuf> = Vec::new();
-    if let Ok(c) = std::env::var("HF_HUB_CACHE") {
-        roots.push(PathBuf::from(c));
-    }
-    if let Ok(h) = std::env::var("HF_HOME") {
-        roots.push(PathBuf::from(h).join("hub"));
-    }
-    for home_var in ["USERPROFILE", "HOME"] {
-        if let Ok(home) = std::env::var(home_var) {
-            roots.push(PathBuf::from(home).join(".cache/huggingface/hub"));
-        }
-    }
-    for snapshots in roots
-        .into_iter()
-        .map(|r| r.join(&repo_dir).join("snapshots"))
-    {
-        let Ok(revs) = std::fs::read_dir(&snapshots) else {
-            continue;
-        };
-        for rev in revs.filter_map(|e| e.ok()) {
-            let cand = rev.path().join(DISTILL_LORA_FILE);
-            if cand.exists() {
-                return Some(cand);
-            }
-        }
-    }
-    None
 }

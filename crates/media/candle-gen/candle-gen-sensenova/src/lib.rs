@@ -39,8 +39,8 @@ use std::sync::{Arc, Mutex};
 use candle_gen::candle_core::{DType, Device};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::{
-    self, Capabilities, GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality,
-    ModelDescriptor, Progress, WeightsSource,
+    self, reject_unknown_components, Capabilities, GenerationOutput, GenerationRequest, Generator,
+    LoadSpec, Modality, ModelDescriptor, Progress, WeightsSource,
 };
 use candle_gen::{CandleError, Result};
 
@@ -152,15 +152,21 @@ struct Components {
     cfg: Arc<NeoChatConfig>,
 }
 
-/// A loaded candle SenseNova-U1 generator. Loading is **lazy**: `load` does no file I/O (registry
-/// introspection against a missing path still resolves), and the heavy unified model is built on the
-/// first [`generate`](Generator::generate) call and then cached.
+/// A loaded candle SenseNova-U1 generator. Loading is **lazy**: `load` does no backbone file I/O
+/// (registry introspection against a missing path still resolves), and the heavy unified model is
+/// built on the first [`generate`](Generator::generate) call and then cached. The one exception is the
+/// `fast` variant, which resolves + existence-checks its distill LoRA at `load` (sc-13664) so a
+/// missing/unprovisioned LoRA fails fast at load rather than at first generate.
 pub struct SenseNovaGenerator {
     descriptor: ModelDescriptor,
     root: PathBuf,
     device: Device,
     /// The 8-step distilled variant — merges the distill LoRA at build + applies distilled defaults.
     fast: bool,
+    /// The distill LoRA path resolved from the caller-supplied `distill_lora` component / co-located
+    /// snapshot file at load (sc-13664), so the merge in [`Self::components`] reads a passed-in path
+    /// with no env / HF-cache derivation. `Some` only for the `fast` variant; `None` for the base id.
+    distill_lora: Option<PathBuf>,
     components: Mutex<Option<Components>>,
 }
 
@@ -173,9 +179,16 @@ impl SenseNovaGenerator {
             if self.fast {
                 // Merge the 8-step distill LoRA into the dense generation path. Assert full coverage —
                 // `7 · layers` gen-path projections + the 2 FM-head Linears — so a stale/mismatched LoRA
-                // fails loudly rather than silently merging a subset.
-                let lora_path = resolve_distill_lora(&self.root)?;
-                let lora = DistillLora::from_file(&lora_path)?;
+                // fails loudly rather than silently merging a subset. The path was resolved (and
+                // existence-checked) from the caller-supplied `distill_lora` component / co-located
+                // snapshot file at `load` (sc-13664) — fail-fast there, not here at first generate.
+                let lora_path = self.distill_lora.as_ref().ok_or_else(|| {
+                    CandleError::Msg(
+                        "sensenova_u1_8b_fast: internal error — distill LoRA path unresolved at load"
+                            .into(),
+                    )
+                })?;
+                let lora = DistillLora::from_file(lora_path)?;
                 let applied = model.merge_distill_lora(&lora)?;
                 let expected = cfg.llm.num_hidden_layers * 7 + 2;
                 if applied != expected {
@@ -364,12 +377,29 @@ fn load_inner(spec: &LoadSpec, fast: bool) -> gen_core::Result<Box<dyn Generator
             "{id}: control / IP-adapter overlays are not supported (txt2img only)"
         )));
     }
+    // Named-component contract (sc-13658/sc-13664): the fast variant reads the `distill_lora`
+    // component; the base id reads none. Reject any unrecognized component key up front.
+    let known: &[&str] = if fast { &["distill_lora"] } else { &[] };
+    reject_unknown_components(spec, known, id)?;
+    // Resolve (and existence-check) the fast variant's distill LoRA at load — from the caller-supplied
+    // `distill_lora` component, else the co-located snapshot file — so a missing LoRA fails fast here,
+    // not at first generate (sc-13664: no env side-channel, no HF-cache scan). The base id needs no
+    // LoRA.
+    let distill_lora = if fast {
+        Some(resolve_distill_lora(
+            spec.components.get("distill_lora"),
+            &root,
+        )?)
+    } else {
+        None
+    };
     let device = candle_gen::default_device()?;
     Ok(Box::new(SenseNovaGenerator {
         descriptor: descriptor_for(id),
         root,
         device,
         fast,
+        distill_lora,
         components: Mutex::new(None),
     }))
 }
@@ -545,6 +575,7 @@ mod tests {
             root: "/nonexistent".into(),
             device: candle_gen::default_device().unwrap(),
             fast: false,
+            distill_lora: None,
             components: Mutex::new(None),
         };
         let req = GenerationRequest {
@@ -596,5 +627,50 @@ mod tests {
         let single = LoadSpec::new(WeightsSource::File("/x.safetensors".into()));
         let err = load(&single).err().expect("err").to_string();
         assert!(err.contains("snapshot directory"), "got: {err}");
+    }
+
+    /// sc-13664: the fast variant resolves its distill LoRA from caller-supplied paths only (the
+    /// `distill_lora` component, else the co-located snapshot file) — no `$SENSENOVA_DISTILL_LORA`, no
+    /// HF-cache scan. A fast load with neither staged fails **at load** (fail-fast) with an actionable
+    /// error naming the component. Weights-free: `/nonexistent` has no co-located LoRA.
+    #[test]
+    fn fast_load_requires_distill_lora_path() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let err = load_fast(&spec).err().expect("err").to_string();
+        assert!(err.contains("distill_lora"), "got: {err}");
+        assert!(!err.contains("SENSENOVA_DISTILL_LORA"), "got: {err}");
+        // The base id needs no LoRA — it loads lazily against the same missing path.
+        assert!(load(&spec).is_ok(), "base load stays lazy");
+    }
+
+    /// sc-13664: a staged-but-nonexistent `distill_lora` component errors at load, naming the
+    /// component (not a bare later I/O error), and a `Dir` staged where a file is required is rejected.
+    #[test]
+    fn fast_load_validates_distill_lora_component() {
+        let missing = LoadSpec::new(WeightsSource::Dir("/nonexistent".into())).with_component(
+            "distill_lora",
+            WeightsSource::File("/nope/lora.safetensors".into()),
+        );
+        let err = load_fast(&missing).err().expect("err").to_string();
+        assert!(err.contains("distill_lora"), "got: {err}");
+        assert!(err.contains("does not exist"), "got: {err}");
+
+        let as_dir = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()))
+            .with_component("distill_lora", WeightsSource::Dir("/some/dir".into()));
+        let err = load_fast(&as_dir).err().expect("err").to_string();
+        assert!(err.contains("distill_lora"), "got: {err}");
+    }
+
+    /// sc-13658/sc-13664: an unrecognized component key is rejected at load (typed `Unsupported`).
+    #[test]
+    fn fast_load_rejects_unknown_component() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into())).with_component(
+            "bogus_component",
+            WeightsSource::File("/x.safetensors".into()),
+        );
+        assert!(matches!(
+            load_fast(&spec).err().expect("err"),
+            gen_core::Error::Unsupported(_)
+        ));
     }
 }

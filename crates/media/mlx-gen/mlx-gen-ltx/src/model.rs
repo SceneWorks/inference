@@ -16,8 +16,10 @@
 //! matching how MP4 video muxing already lives outside the crate (the Wan sibling).
 //!
 //! The Gemma text-encoder weights are a **separate** snapshot (the base model dir holds only the
-//! `connector`/transformer/vae); `resolve_gemma_dir` locates them via `$LTX_GEMMA_DIR` or the HF
-//! cache (`mlx-community/gemma-3-12b-it-bf16`).
+//! `connector`/transformer/vae); `resolve_gemma_dir` reads it from the **required**
+//! `LoadSpec::text_encoder` slot (`mlx-community/gemma-3-12b-it-bf16`). As of sc-13664 there is no
+//! env side-channel or on-disk HF-cache fallback — the caller provisions the path, and an absent slot
+//! is a load-time error.
 //!
 //! **Quantization (sc-2686).** The transformer ships **selectively quantized** (attn/ff Linears
 //! packed U32 + `scales`); the **bits/group ride on the checkpoint's `split_model.json`** —
@@ -47,6 +49,7 @@ use std::path::PathBuf;
 
 use mlx_rs::{random, Array, Dtype};
 
+use mlx_gen::gen_core::reject_unknown_components;
 use mlx_gen::runtime::AdapterSpec;
 use mlx_gen::weights::{to_dtype, Weights};
 use mlx_gen::{
@@ -294,6 +297,12 @@ pub struct Ltx {
     adapters: Vec<AdapterSpec>,
     gemma_dir: PathBuf,
     gemma_quant: Option<GemmaQuant>,
+    /// The optional **uncensored** 4-bit Gemma enhancer snapshot dir (the amoral
+    /// `TheCluster/amoral-gemma-3-12B-v2-mlx-4bit`, sc-2845), staged by the caller in the
+    /// `uncensored_enhancer` [`LoadSpec::components`] entry (sc-13664). `None` unless the caller
+    /// provisioned it; a request that sets `use_uncensored_enhancer` without it staged is a
+    /// generate-time actionable error (no `$LTX_UNCENSORED_GEMMA_DIR` / HF-cache scan any more).
+    uncensored_enhancer: Option<PathBuf>,
     // The small components (each ≪ the TE / DiT) stay resident — the AvDiT is the denoise peak and the
     // Gemma drop is the win (sc-10976). Staging these too would add parity risk for ~no memory gain.
     upsampler: LatentUpsampler,
@@ -306,39 +315,53 @@ pub struct Ltx {
     stat_dt: Dtype,
 }
 
-/// Locate the Gemma-3-12B text-encoder snapshot. A `LoadSpec::text_encoder` override (sc-8827) wins;
-/// then `$LTX_GEMMA_DIR`; otherwise the newest `mlx-community/gemma-3-12b-it-bf16` snapshot in the HF
-/// cache. `pub(crate)` so the trainer (sc-3047) resolves the TE snapshot exactly as inference does
-/// (it passes `None`, keeping the env/HF-cache path).
+/// Locate the Gemma-3-12B text-encoder snapshot from the **required** `LoadSpec::text_encoder` slot
+/// (sc-8827; required as of sc-13664). The caller provisions the TE path through the spec — there is no
+/// env side-channel and no on-disk HF-cache scan any more (epic 13657): an absent slot is a load-time,
+/// actionable error, and a set-but-nonexistent path errors up front. `pub(crate)` so the trainer
+/// (sc-3047) resolves the TE snapshot exactly as inference does (it too must be handed a
+/// `LoadSpec::text_encoder`).
 pub(crate) fn resolve_gemma_dir(
     override_src: Option<&WeightsSource>,
 ) -> Result<std::path::PathBuf> {
-    if let Some(WeightsSource::Dir(p) | WeightsSource::File(p)) = override_src {
-        if !p.exists() {
-            return Err(Error::Msg(format!(
-                "ltx_2_3: LoadSpec text_encoder path does not exist: {}",
-                p.display()
-            )));
-        }
-        return Ok(p.clone());
+    let Some(WeightsSource::Dir(p) | WeightsSource::File(p)) = override_src else {
+        return Err(Error::Msg(
+            "ltx_2_3 requires the Gemma-3-12B text encoder — set LoadSpec::text_encoder to the \
+             gemma-3-12b-it snapshot dir (e.g. LoadSpec { text_encoder: \
+             Some(WeightsSource::Dir(...)), .. }). It is no longer auto-discovered from an \
+             environment variable or the HF cache."
+                .into(),
+        ));
+    };
+    if !p.exists() {
+        return Err(Error::Msg(format!(
+            "ltx_2_3: LoadSpec text_encoder path does not exist: {}",
+            p.display()
+        )));
     }
-    if let Ok(d) = std::env::var("LTX_GEMMA_DIR") {
-        return Ok(d.into());
+    Ok(p.clone())
+}
+
+/// Resolve the optional **uncensored** 4-bit Gemma enhancer snapshot dir (sc-2845
+/// `--use-uncensored-enhancer`, reference `TheCluster/amoral-gemma-3-12B-v2-mlx-4bit`) from the
+/// caller-staged `uncensored_enhancer` [`LoadSpec::components`] entry (sc-13664 — no
+/// `$LTX_UNCENSORED_GEMMA_DIR`, no HF-cache scan). `None` when the caller did not provision it (the
+/// feature is opt-in per request); a set-but-nonexistent path errors up front at load. A standalone
+/// mlx_lm checkpoint (`model.` key prefix).
+fn resolve_uncensored_enhancer(
+    component: Option<&WeightsSource>,
+) -> Result<Option<std::path::PathBuf>> {
+    let Some(src) = component else {
+        return Ok(None);
+    };
+    let (WeightsSource::Dir(p) | WeightsSource::File(p)) = src;
+    if !p.exists() {
+        return Err(Error::Msg(format!(
+            "ltx_2_3: the 'uncensored_enhancer' component path does not exist: {}",
+            p.display()
+        )));
     }
-    let home = std::env::var("HOME").map_err(|_| Error::Msg("ltx_2_3: HOME unset".into()))?;
-    let base = std::path::PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--mlx-community--gemma-3-12b-it-bf16/snapshots");
-    let newest = std::fs::read_dir(&base)
-        .map_err(|_| {
-            Error::Msg(format!(
-                "ltx_2_3: gemma snapshot not found at {} (set $LTX_GEMMA_DIR)",
-                base.display()
-            ))
-        })?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.is_dir())
-        .max_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
-    newest.ok_or_else(|| Error::Msg("ltx_2_3: no gemma snapshot in the HF cache".into()))
+    Ok(Some(p.clone()))
 }
 
 /// Read the Gemma snapshot's `config.json` top-level `quantization` block — the reference TE-quant
@@ -375,33 +398,6 @@ pub(crate) fn resolve_gemma_quant(gemma_dir: &std::path::Path) -> Result<Option<
     }
 }
 
-/// Locate the **uncensored** 4-bit Gemma enhancer snapshot (sc-2845 `--use-uncensored-enhancer`,
-/// reference `TheCluster/amoral-gemma-3-12B-v2-mlx-4bit`). `$LTX_UNCENSORED_GEMMA_DIR` wins; otherwise
-/// the newest matching snapshot in the HF cache. A standalone mlx_lm checkpoint (`model.` key prefix).
-fn resolve_uncensored_dir() -> Result<std::path::PathBuf> {
-    if let Ok(d) = std::env::var("LTX_UNCENSORED_GEMMA_DIR") {
-        return Ok(d.into());
-    }
-    let home = std::env::var("HOME").map_err(|_| Error::Msg("ltx_2_3: HOME unset".into()))?;
-    let base = std::path::PathBuf::from(home).join(
-        ".cache/huggingface/hub/models--TheCluster--amoral-gemma-3-12B-v2-mlx-4bit/snapshots",
-    );
-    let newest = std::fs::read_dir(&base)
-        .map_err(|_| {
-            Error::Msg(format!(
-                "ltx_2_3: uncensored enhancer snapshot not found at {} — set \
-                 $LTX_UNCENSORED_GEMMA_DIR or download TheCluster/amoral-gemma-3-12B-v2-mlx-4bit",
-                base.display()
-            ))
-        })?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.is_dir())
-        .max_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
-    newest.ok_or_else(|| {
-        Error::Msg("ltx_2_3: no uncensored enhancer snapshot in the HF cache".into())
-    })
-}
-
 /// Load the model from a split-weight snapshot directory (the `ltx_2_3_base*` tree). Reads
 /// `embedded_config.json`, locates the Gemma TE separately, and assembles every component.
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
@@ -413,6 +409,12 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
                     .into(),
             )),
         };
+    // Named-component contract (sc-13658/sc-13664): LTX-2.3 reads only the optional `uncensored_enhancer`
+    // component; its main Gemma TE rides the typed `text_encoder` slot, not this map. Reject any
+    // unrecognized component key up front, then stage the (existence-checked) enhancer path if provided.
+    reject_unknown_components(spec, &["uncensored_enhancer"], MODEL_ID)?;
+    let uncensored_enhancer =
+        resolve_uncensored_enhancer(spec.components.get("uncensored_enhancer"))?;
     // Quantization geometry rides on the checkpoint's `split_model.json` (sc-2686): the transformer is
     // shipped selectively quantized (Q4 for `base_q4`, Q8 for `base_q8`), bits/group from the
     // manifest — never hardcoded. The per-Linear `.scales` predicate (in `transformer.rs`) then picks
@@ -514,6 +516,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         adapters: spec.adapters.clone(),
         gemma_dir,
         gemma_quant,
+        uncensored_enhancer,
         upsampler,
         vae,
         audio_decoder,
@@ -1022,7 +1025,7 @@ impl Ltx {
             seed: req.seed.unwrap_or(enhance::DEFAULT_SEED),
         };
         if req.use_uncensored_enhancer {
-            let (model, tokenizer) = Self::load_uncensored_enhancer()?;
+            let (model, tokenizer) = self.load_uncensored_enhancer()?;
             let system = if is_i2v {
                 enhance::I2V_SYSTEM_PROMPT
             } else {
@@ -1052,14 +1055,24 @@ impl Ltx {
 
     /// Load the separate uncensored 4-bit Gemma enhancer + its tokenizer on demand (the reference
     /// `enhance_with_model` loads it per call). A standalone mlx_lm checkpoint → `model.` key prefix;
-    /// its `config.json` `quantization` block drives the 4-bit dequant.
-    fn load_uncensored_enhancer() -> Result<(GemmaModel, LtxTokenizer)> {
-        let dir = resolve_uncensored_dir()?;
-        let w = Weights::from_dir(&dir)?;
-        let quant = resolve_gemma_quant(&dir)?;
+    /// its `config.json` `quantization` block drives the 4-bit dequant. The snapshot dir was staged by
+    /// the caller in the `uncensored_enhancer` component at load (sc-13664); a request that asks for the
+    /// uncensored enhancer without it provisioned is an actionable error here (no env / HF-cache scan).
+    fn load_uncensored_enhancer(&self) -> Result<(GemmaModel, LtxTokenizer)> {
+        let dir = self.uncensored_enhancer.as_ref().ok_or_else(|| {
+            Error::Msg(
+                "ltx_2_3: use_uncensored_enhancer was requested but no 'uncensored_enhancer' \
+                 component was staged in LoadSpec::components — provision the amoral 4-bit Gemma \
+                 snapshot dir (TheCluster/amoral-gemma-3-12B-v2-mlx-4bit) via \
+                 with_component(\"uncensored_enhancer\", WeightsSource::Dir(...))"
+                    .into(),
+            )
+        })?;
+        let w = Weights::from_dir(dir)?;
+        let quant = resolve_gemma_quant(dir)?;
         let model =
             GemmaModel::from_weights_with_prefix(&w, GemmaConfig::gemma_3_12b(), quant, "model.")?;
-        let tokenizer = LtxTokenizer::from_dir(&dir)?;
+        let tokenizer = LtxTokenizer::from_dir(dir)?;
         Ok((model, tokenizer))
     }
 }
@@ -1308,12 +1321,43 @@ mod tests {
 
     #[test]
     fn resolve_gemma_dir_rejects_nonexistent_spec_override() {
-        // sc-8827: a `LoadSpec::text_encoder` override is preferred over the env var / HF-cache scan,
-        // and a nonexistent override path errors with the spec-side message up front (not the env var
-        // name), so the worker can drive the TE location through the spec instead of `$LTX_GEMMA_DIR`.
+        // sc-8827/sc-13664: the `LoadSpec::text_encoder` slot is the only TE source, and a nonexistent
+        // override path errors with the spec-side message up front — the worker drives the TE location
+        // through the spec (no `$LTX_GEMMA_DIR` / HF-cache scan any more).
         let src = WeightsSource::Dir("/nonexistent/ltx_gemma".into());
         let err = resolve_gemma_dir(Some(&src)).unwrap_err().to_string();
         assert!(err.contains("LoadSpec text_encoder"), "got: {err}");
+        assert!(err.contains("does not exist"), "got: {err}");
+    }
+
+    /// sc-13664: `LoadSpec::text_encoder` is now **required** — an absent slot is a load-time,
+    /// actionable error naming the slot (not a silent `$LTX_GEMMA_DIR` / HF-cache fallback).
+    #[test]
+    fn resolve_gemma_dir_requires_text_encoder_slot() {
+        let err = resolve_gemma_dir(None).unwrap_err().to_string();
+        assert!(err.contains("LoadSpec::text_encoder"), "got: {err}");
+        assert!(!err.contains("LTX_GEMMA_DIR"), "got: {err}");
+    }
+
+    /// sc-13664: LTX's only recognized component is `uncensored_enhancer`; an unknown component key is
+    /// rejected at load (typed `Unsupported`), and the enhancer path is validated up front when staged.
+    #[test]
+    fn load_rejects_unknown_component_and_validates_enhancer() {
+        let bogus = LoadSpec::new(WeightsSource::Dir("/nonexistent".into())).with_component(
+            "bogus_component",
+            WeightsSource::File("/x.safetensors".into()),
+        );
+        assert!(matches!(
+            load(&bogus).err().expect("err"),
+            Error::Unsupported(_)
+        ));
+        // A staged-but-nonexistent uncensored_enhancer errors up front, naming the component.
+        let missing = LoadSpec::new(WeightsSource::Dir("/nonexistent".into())).with_component(
+            "uncensored_enhancer",
+            WeightsSource::Dir("/nope/amoral".into()),
+        );
+        let err = load(&missing).err().expect("err").to_string();
+        assert!(err.contains("uncensored_enhancer"), "got: {err}");
         assert!(err.contains("does not exist"), "got: {err}");
     }
 

@@ -29,7 +29,8 @@ impl LtxTokenizer {
         let path = gemma_dir.join("tokenizer.json");
         if !path.exists() {
             return Err(Error::Msg(format!(
-                "ltx tokenizer: {} not found (set LTX_GEMMA_DIR to a gemma-3-12b-it snapshot)",
+                "ltx tokenizer: {} not found — point LoadSpec::text_encoder at a gemma-3-12b-it \
+                 snapshot dir containing tokenizer.json",
                 path.display()
             )));
         }
