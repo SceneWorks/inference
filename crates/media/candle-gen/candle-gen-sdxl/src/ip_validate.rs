@@ -10,11 +10,16 @@
 //! reference-cosine is meaningfully higher — i.e. the IP path actually pulls the output toward the
 //! reference. Plus the cancel contract (pre + mid-denoise). Outputs are written as PPM for eyeballing.
 //!
-//! Run (after deploying weights into the HF cache / a local dir):
+//! Run (after deploying weights into a local dir):
 //! ```text
 //! set IP_SDXL_BASE=...\RealVisXL_V5.0           # diffusers tree (unet/, text_encoder{,_2}/, …)
-//! set IP_BUNDLE=...\ip-adapter-plus_sdxl_vit-h.safetensors
-//! set IP_IMAGE_ENCODER=...\image_encoder        # dir with model.safetensors (or the file)
+//! rem  The IP-Adapter bundle + ViT-H image encoder come from one pinned h94/IP-Adapter snapshot
+//! rem  (`ip-adapter-plus-sdxl-vit-h` @ 018e402774aeeddd60609b4ecdb7e298259dc729 in
+//! rem  release/real-weight-models.toml — materialize with ensure_model_snapshot.py; sc-13963):
+//! set IP_ADAPTER_SNAPSHOT=...\ip-adapter        # h94/IP-Adapter repo snapshot dir
+//! rem  … or override either component explicitly (an explicit var wins over the snapshot dir):
+//! rem  set IP_BUNDLE=...\ip-adapter-plus_sdxl_vit-h.safetensors
+//! rem  set IP_IMAGE_ENCODER=...\image_encoder   # dir with model.safetensors (or the file)
 //! set SDXL_TOKENIZER_CLIP_L_DIR=...             # CLIP-L tokenizer dir (tokenizer.json) — passed-in component
 //! set SDXL_TOKENIZER_CLIP_BIGG_DIR=...          # CLIP-bigG tokenizer dir (tokenizer.json)
 //! set SDXL_VAE_FP16_FIX_DIR=...                 # madebyollin/sdxl-vae-fp16-fix dir (diffusion_pytorch_model.safetensors)
@@ -23,7 +28,7 @@
 //! cargo test -p candle-gen-sdxl --features cuda --release ip_validate::real_weight -- --ignored --nocapture
 //! ```
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -40,6 +45,65 @@ use crate::ip_adapter::preprocess_clip_image_sized;
 use crate::ip_provider::{IpAdapterSdxl, IpAdapterSdxlPaths, IpAdapterSdxlRequest};
 use crate::vision_encoder::{ClipVisionEncoder, VisionConfig};
 use crate::weights::Weights;
+
+/// In-repo relative path of the IP-Adapter-Plus SDXL ViT-H bundle inside an `h94/IP-Adapter`
+/// snapshot (`ip-adapter-plus-sdxl-vit-h` in `release/real-weight-models.toml`; sc-13963).
+const IP_BUNDLE_REL: &str = "sdxl_models/ip-adapter-plus_sdxl_vit-h.safetensors";
+/// In-repo relative path of the CLIP ViT-H image-encoder dir inside an `h94/IP-Adapter` snapshot.
+const IP_IMAGE_ENCODER_REL: &str = "models/image_encoder";
+
+/// Resolve one IP-Adapter component path (sc-13963): an explicit per-component override wins;
+/// otherwise it is derived from the pinned `IP_ADAPTER_SNAPSHOT` repo-snapshot dir by joining `rel`
+/// — the same explicit-path-or-snapshot-dir bridge the mmaudio harness uses (`tests/common/mod.rs`).
+/// Returns `None` only when neither is set (the env wrapper turns that into an actionable panic).
+fn resolve_ip_component(
+    explicit: Option<String>,
+    snapshot: Option<String>,
+    rel: &str,
+) -> Option<PathBuf> {
+    explicit
+        .map(PathBuf::from)
+        .or_else(|| snapshot.map(|s| PathBuf::from(s).join(rel)))
+}
+
+/// Env wrapper over [`resolve_ip_component`]: `explicit_var` (a full path) wins, else
+/// `IP_ADAPTER_SNAPSHOT` (the `h94/IP-Adapter` repo snapshot dir) joined with `rel`.
+fn ip_component(explicit_var: &str, rel: &str) -> PathBuf {
+    resolve_ip_component(
+        std::env::var(explicit_var).ok(),
+        std::env::var("IP_ADAPTER_SNAPSHOT").ok(),
+        rel,
+    )
+    .unwrap_or_else(|| {
+        panic!("set {explicit_var} (a path) or IP_ADAPTER_SNAPSHOT (an h94/IP-Adapter repo snapshot dir)")
+    })
+}
+
+/// The snapshot-dir bridge derives the two IP-Adapter component paths, and an explicit per-component
+/// override always wins — a pure-logic guard (no env / no GPU) for the sc-13963 wiring.
+#[test]
+fn ip_adapter_snapshot_derives_component_paths() {
+    // Explicit per-component override wins, even when a snapshot is also set.
+    assert_eq!(
+        resolve_ip_component(
+            Some("/x/bundle.safetensors".into()),
+            Some("/snap".into()),
+            IP_BUNDLE_REL,
+        ),
+        Some(PathBuf::from("/x/bundle.safetensors")),
+    );
+    // Else: the pinned snapshot dir joined with the in-repo relative path.
+    assert_eq!(
+        resolve_ip_component(None, Some("/snap".into()), IP_BUNDLE_REL),
+        Some(PathBuf::from("/snap").join(IP_BUNDLE_REL)),
+    );
+    assert_eq!(
+        resolve_ip_component(None, Some("/snap".into()), IP_IMAGE_ENCODER_REL),
+        Some(PathBuf::from("/snap").join("models/image_encoder")),
+    );
+    // Neither set → None (the env wrapper turns this into an actionable panic).
+    assert_eq!(resolve_ip_component(None, None, IP_BUNDLE_REL), None);
+}
 
 /// A standalone CLIP ViT-H feature extractor for the cosine metric (independent of the model's private
 /// encoder): preprocess → penultimate → mean-pool over tokens → L2-normalize. Returns a 1280-vec.
@@ -93,11 +157,13 @@ impl ClipMetric {
 fn real_weight_ip_adapter() {
     let out_dir = env_path("IP_OUT");
     std::fs::create_dir_all(&out_dir).ok();
-    let image_encoder = env_path("IP_IMAGE_ENCODER");
+    // The bundle + image encoder resolve from one pinned IP_ADAPTER_SNAPSHOT repo dir, or from an
+    // explicit IP_BUNDLE / IP_IMAGE_ENCODER override (sc-13963).
+    let image_encoder = ip_component("IP_IMAGE_ENCODER", IP_IMAGE_ENCODER_REL);
 
     let paths = IpAdapterSdxlPaths {
         sdxl_base: env_path("IP_SDXL_BASE"),
-        ip_adapter: env_path("IP_BUNDLE"),
+        ip_adapter: ip_component("IP_BUNDLE", IP_BUNDLE_REL),
         image_encoder: image_encoder.clone(),
         // epic 13657 / sc-13663: tokenizers + fp16-fix VAE are passed-in components (env-pointed dirs).
         tokenizer_clip_l: WeightsSource::Dir(env_path("SDXL_TOKENIZER_CLIP_L_DIR")),
