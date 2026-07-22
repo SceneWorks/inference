@@ -57,6 +57,10 @@ impl Behavior {
 struct Stub {
     desc: ModelDescriptor,
     behavior: Behavior,
+    /// When set, the honest `validate` runs the **size-skipping** floor
+    /// (`Capabilities::validate_request_skip_size`) instead of the full `validate_request` — the
+    /// audio-lane / auto-size stance where `width`/`height` are not range-checked (sc-13705).
+    skip_size: bool,
     /// Per-instance call counter — the nondeterministic variant fills pixels from this.
     runs: Cell<u32>,
 }
@@ -66,6 +70,19 @@ fn stub_caps() -> Capabilities {
         conditioning: vec![ConditioningKind::Reference],
         min_size: 64,
         max_size: 512,
+        max_count: 4,
+        ..Default::default()
+    }
+}
+
+/// Capabilities for an **audio-lane** stub (sc-13705): `Modality::Audio` providers advertise no size
+/// bound (`min_size`/`max_size` are the unused 0 — sc-13314) and validate through the size-skipping
+/// floor, so `width`/`height` are not part of their contract.
+fn audio_stub_caps() -> Capabilities {
+    Capabilities {
+        conditioning: vec![ConditioningKind::Reference],
+        min_size: 0,
+        max_size: 0,
         max_count: 4,
         ..Default::default()
     }
@@ -82,17 +99,58 @@ fn stub_desc(id: &'static str) -> ModelDescriptor {
     }
 }
 
+fn audio_stub_desc(id: &'static str) -> ModelDescriptor {
+    ModelDescriptor {
+        required_components: &[],
+        id,
+        family: "testkit",
+        backend: "stub",
+        modality: Modality::Audio,
+        capabilities: audio_stub_caps(),
+    }
+}
+
 impl Stub {
     fn new(id: &'static str, behavior: Behavior) -> Self {
         Self {
             desc: stub_desc(id),
             behavior,
+            skip_size: false,
             runs: Cell::new(0),
         }
     }
 
     fn boxed(id: &'static str, behavior: Behavior) -> Box<dyn Generator> {
         Box::new(Self::new(id, behavior))
+    }
+
+    /// An **audio-lane** stub (sc-13705): `Modality::Audio`, no size bound (`max_size` 0), validating
+    /// through the size-skipping floor — the shape whose 64×64 (== `max_size` 0 + 64) request the
+    /// generic oversize probe must NOT flag, because `width`/`height` are meaningless for audio.
+    fn audio(id: &'static str, behavior: Behavior) -> Self {
+        Self {
+            desc: audio_stub_desc(id),
+            behavior,
+            skip_size: true,
+            runs: Cell::new(0),
+        }
+    }
+
+    fn boxed_audio(id: &'static str, behavior: Behavior) -> Box<dyn Generator> {
+        Box::new(Self::audio(id, behavior))
+    }
+
+    /// An **image** stub that (wrongly) validates through the size-skipping floor while still
+    /// advertising a real `max_size`. Used to prove the generic oversize probe STILL fires for
+    /// size-relevant (non-audio) providers after the audio exemption (sc-13705) — the max_size check
+    /// must not be weakened for images.
+    fn image_skipping_size(id: &'static str, behavior: Behavior) -> Self {
+        Self {
+            desc: stub_desc(id),
+            behavior,
+            skip_size: true,
+            runs: Cell::new(0),
+        }
     }
 }
 
@@ -102,10 +160,15 @@ impl Generator for Stub {
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
-        if self.behavior.honest_validate {
-            self.desc.capabilities.validate_request(self.desc.id, req)
+        if !self.behavior.honest_validate {
+            return Ok(());
+        }
+        let caps = &self.desc.capabilities;
+        if self.skip_size {
+            // The audio-lane / auto-size floor: every shared check except the width/height range.
+            caps.validate_request_skip_size(self.desc.id, req)
         } else {
-            Ok(())
+            caps.validate_request(self.desc.id, req)
         }
     }
 
@@ -237,6 +300,32 @@ fn dishonest_validate_fails_validate_check() {
         },
     );
     assert!(check_validate_honesty(&g, &cheap()).is_err());
+}
+
+#[test]
+fn audio_provider_size_exemption_passes_validate_honesty() {
+    // sc-13705: an audio-lane provider (Modality::Audio) validates through the size-skipping floor
+    // and advertises no size bound (max_size 0 — sc-13314), because width/height are meaningless for
+    // audio. The generic image-shaped honesty check must therefore NOT probe a max_size+64 (== 64x64)
+    // oversize rejection for it: the provider legitimately accepts that request. Before the fix this
+    // failed with "a 64x64 request (above max_size 0) was accepted by validate()" — the exact
+    // false-inconsistency between the audio size exemption and the shared testkit.
+    let g = Stub::audio(STUB_ID, Behavior::good());
+    check_validate_honesty(&g, &cheap()).unwrap();
+    // And the whole generic suite runs green for an audio-lane provider.
+    conformance(|| Stub::boxed_audio(STUB_ID, Behavior::good()), &cheap());
+}
+
+#[test]
+fn image_provider_oversize_probe_still_fires_after_audio_exemption() {
+    // The audio exemption is keyed on Modality::Audio ONLY: a size-relevant (image/video) provider
+    // that skips its size range check must STILL fail the oversize probe, so the max_size assertion
+    // stays meaningful for image providers (the sc-13705 fix must not delete/weaken it). This stub is
+    // Modality::Image with a real max_size (512) but validates via the size-skipping floor, so a
+    // 576x576 (max_size+64) request slips through its validate() — the check must catch that.
+    let g = Stub::image_skipping_size(STUB_ID, Behavior::good());
+    let err = check_validate_honesty(&g, &cheap()).unwrap_err();
+    assert!(err.contains("above max_size"), "got: {err}");
 }
 
 #[test]
