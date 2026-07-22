@@ -3,7 +3,7 @@
 //! A **contract conformance suite** for gen-core providers — the image/video/pure-audio
 //! [`gen_core::Generator`] (this module), [`gen_core::Trainer`](crate::trainer),
 //! [`gen_core::Captioner`](crate::captioner), and the audio-contract family (sc-12853):
-//! [`gen_core::Generator`] under [`Modality::Audio`](gen_core::Modality::Audio)
+//! [`gen_core::Generator`] under [`Modality::Audio`]
 //! ([`crate::audio_generator`]), [`gen_core::VoiceEmbedder`](crate::voice_embedder),
 //! [`gen_core::AudioTransform`](crate::audio_transform),
 //! [`gen_core::Transcriber`](crate::transcriber), and
