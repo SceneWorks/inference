@@ -26,6 +26,7 @@
 //! - Conformer layer norms use eps **1e-12** (wenet), the embed/after LayerNorms eps **1e-5**.
 
 use candle_audio::candle_core::{Device, Result as CandleResult, Tensor};
+use candle_audio::ops::nearest_upsample1d;
 use candle_nn::ops::softmax_last_dim;
 use candle_nn::{
     conv1d, layer_norm, linear, linear_no_bias, Conv1d, Conv1dConfig, LayerNorm, Linear, Module,
@@ -273,8 +274,10 @@ impl UpLayer {
 
     /// `[B, C, T]` → `[B, C, 2T]`.
     fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
-        let t = x.dim(2)?;
-        let up = x.upsample_nearest1d(t * UP_STRIDE)?; // [B, C, 2T]
+        // Nearest ×UP_STRIDE upsample. candle's CUDA/Metal backends don't implement
+        // `upsample_nearest1d` (sc-13886 / sc-13691), so route through the backend-agnostic,
+        // bit-identical shared helper instead.
+        let up = nearest_upsample1d(x, UP_STRIDE)?; // [B, C, 2T]
         let up = up.pad_with_zeros(2, UP_STRIDE * 2, 0)?; // left-pad 4 -> [B, C, 2T+4]
         self.conv.forward(&up) // k=5 -> [B, C, 2T]
     }
