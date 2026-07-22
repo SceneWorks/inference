@@ -461,3 +461,83 @@ expected_files = [
     "models/image_encoder/config.json",
     "models/image_encoder/model.safetensors",
 ]
+
+[[models]]
+# SDXL base 1.0 (sc-13965): the stabilityai/stable-diffusion-xl-base-1.0 diffusers tree the
+# candle-gen-sdxl `sdxl_conformance` (txt2img) + `trainer_e2e` real-weight harnesses load (UNet +
+# dual CLIP text encoders, fp16 component filenames). The tokenizers + VAE are supplied as separate
+# passed-in components (below); this is the UNet/text-encoder base. Point `SDXL_SNAPSHOT` at the
+# snapshot dir. CreativeML Open RAIL++-M (commercial use permitted, with the RAIL use restrictions).
+key = "sdxl-base-1.0"
+repository = "stabilityai/stable-diffusion-xl-base-1.0"
+revision = "462165984030d82259a11f4367a4eed129e94a7b"
+license = "CreativeML Open RAIL++-M"
+size_class = "very-large"
+profiles = ["media-cuda"]
+environment = ["SDXL_SNAPSHOT"]
+expected_files = [
+    "model_index.json",
+    "unet/diffusion_pytorch_model.fp16.safetensors",
+    "text_encoder/model.fp16.safetensors",
+    "text_encoder_2/model.fp16.safetensors",
+]
+
+[[models]]
+# SDXL passed-in tokenizer: CLIP-L (sc-13663 / epic 13657). The candle-gen-sdxl harnesses take the
+# CLIP-L tokenizer as an explicit env-pointed component (`SDXL_TOKENIZER_CLIP_L_DIR`) rather than
+# self-fetching — only `tokenizer.json` is read. MIT.
+key = "clip-vit-large-patch14"
+repository = "openai/clip-vit-large-patch14"
+revision = "32bd64288804d66eefd0ccbe215aa642df71cc41"
+license = "MIT"
+size_class = "medium"
+profiles = ["media-cuda"]
+environment = ["SDXL_TOKENIZER_CLIP_L_DIR"]
+expected_files = ["tokenizer.json"]
+
+[[models]]
+# SDXL passed-in tokenizer: CLIP-bigG (sc-13663 / epic 13657). The candle-gen-sdxl harnesses take the
+# CLIP-bigG tokenizer as an explicit env-pointed component (`SDXL_TOKENIZER_CLIP_BIGG_DIR`) — only
+# `tokenizer.json` is read (the ~10 GB open_clip weights in this repo are unused by the tokenizer
+# path, but the whole repo is materialized per the house whole-snapshot convention). MIT.
+key = "clip-vit-bigg-14-laion2b"
+repository = "laion/CLIP-ViT-bigG-14-laion2B-39B-b160k"
+revision = "743c27bd53dfe508a0ade0f50698f99b39d03bec"
+license = "MIT"
+size_class = "large"
+profiles = ["media-cuda"]
+environment = ["SDXL_TOKENIZER_CLIP_BIGG_DIR"]
+expected_files = ["tokenizer.json"]
+
+[[models]]
+# SDXL passed-in VAE: madebyollin/sdxl-vae-fp16-fix (sc-13663 / epic 13657). The fp16-safe SDXL VAE
+# the candle-gen-sdxl harnesses load as an explicit env-pointed component (`SDXL_VAE_FP16_FIX_DIR`);
+# the diffusers-correct 0.13025 un-scale matches the fp16 path (see tests/conformance.rs). MIT.
+key = "sdxl-vae-fp16-fix"
+repository = "madebyollin/sdxl-vae-fp16-fix"
+revision = "207b116dae70ace3637169f1ddd2434b91b3a8cd"
+license = "MIT"
+size_class = "small"
+profiles = ["media-cuda"]
+environment = ["SDXL_VAE_FP16_FIX_DIR"]
+expected_files = ["diffusion_pytorch_model.safetensors"]
+
+[[models]]
+# RealVisXL V5.0 (sc-13965): the SG161222/RealVisXL_V5.0 diffusers tree (SDXL architecture + the same
+# fp16 component filenames) used as the base for the candle-gen-sdxl `edit_validate::real_weight_edit`
+# (img2img / inpaint) and `ip_validate::real_weight_ip_adapter` harnesses — the edit/IP harnesses read
+# it via `EDIT_SDXL_BASE` / `IP_SDXL_BASE`; the (not-scheduled) `realvisxl_conformance` reads the same
+# dir via `REALVISXL_SNAPSHOT`. CreativeML Open RAIL++-M (openrail++ model-card license).
+key = "realvisxl-v5"
+repository = "SG161222/RealVisXL_V5.0"
+revision = "ac93e0dda1f6d448cae19bbfab8c5e720a5e48bc"
+license = "CreativeML Open RAIL++-M"
+size_class = "very-large"
+profiles = ["media-cuda"]
+environment = ["REALVISXL_SNAPSHOT", "EDIT_SDXL_BASE", "IP_SDXL_BASE"]
+expected_files = [
+    "model_index.json",
+    "unet/diffusion_pytorch_model.fp16.safetensors",
+    "text_encoder/model.fp16.safetensors",
+    "text_encoder_2/model.fp16.safetensors",
+]
