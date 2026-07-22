@@ -11,10 +11,10 @@
 use mlx_gen::img2img::init_time_step;
 use mlx_gen::media::Image;
 use mlx_gen::{
-    curated_sampler_names, curated_scheduler_names, default_seed, Capabilities, Conditioning,
-    ConditioningKind, Error, GenerationOutput, GenerationRequest, Generator, LatentDecoder,
-    LoadSpec, Modality, ModelDescriptor, Precision, Progress, Quant, Residency, Result,
-    WeightsSource,
+    curated_sampler_names, curated_scheduler_names, default_seed, AdapterSpec, Capabilities,
+    Conditioning, ConditioningKind, Error, GenerationOutput, GenerationRequest, Generator,
+    LatentDecoder, LoadSpec, Modality, ModelDescriptor, Precision, Progress, Quant, Residency,
+    Result, WeightsSource,
 };
 use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidEngine};
 use mlx_gen_qwen_image::pipeline::PID_BACKBONE;
@@ -22,6 +22,7 @@ use mlx_gen_qwen_image::pipeline::PID_BACKBONE;
 use mlx_rs::Array;
 use std::path::Path;
 
+use crate::multiphase::{self, ResolvedPhase};
 use crate::pipeline::{
     base_schedule, maybe_apply_style_gain, turbo_schedule, EditPlan, Img2ImgPlan, KreaHeavy,
     KreaText, T2iPlan, TurboOptions,
@@ -220,6 +221,21 @@ pub struct Krea {
     /// [`Residency`] seam owns the eval/drop/clear discipline, the stage-boundary cancel checks, and
     /// the error-safe cache flush.
     residency: Residency<KreaText, KreaHeavyOwned>,
+    /// The LoRA/LoKr adapters this model was loaded with (`LoadSpec::adapters`), retained so the
+    /// multi-phase render (epic 13879, sc-13884) can install each phase's named subset on that phase's
+    /// job-local DiT clone. A phase references these by index (bounds-checked against `adapters.len()`),
+    /// with an optional per-phase weight override. Empty ⇒ a base (adapter-free) model, so only
+    /// base-only phases are valid. The adapters are ALSO baked into the resident DiT at load (unchanged
+    /// single-phase behavior); the multi-phase path clears + re-installs the phase subset on its clone,
+    /// so the phase's adapter set is authoritative regardless of what was baked.
+    adapters: Vec<AdapterSpec>,
+    /// `true` if any load-time adapter is a ComfyUI/lightx2v **diff-patch** (`.diff`/`.diff_b`), detected
+    /// from the adapter file headers at load (sc-13884). A diff-patch delta folds IRREVERSIBLY into the
+    /// dense base at load (`W += δ`); every job-local DiT clone inherits that mutated base, and
+    /// `clear_adapters` (which only drops low-rank residual stacks) cannot undo it — so a "base-only"
+    /// phase would silently carry the diff-patch. Multi-phase is therefore rejected loudly on such a
+    /// model (low-rank LoRA/LoKr — including the turbo LoRA — toggle cleanly and are unaffected).
+    has_diff_patch: bool,
 }
 
 /// The heavy render-phase components (the single-stream DiT + VAE, via [`KreaHeavy`], plus the optional
@@ -305,7 +321,22 @@ fn load_variant(spec: &LoadSpec, descriptor: ModelDescriptor) -> Result<Box<dyn 
     Ok(Box::new(Krea {
         descriptor,
         residency,
+        adapters: spec.adapters.clone(),
+        has_diff_patch: adapters_have_diff_patch(&spec.adapters),
     }))
+}
+
+/// Detect whether any load-time adapter is a ComfyUI/lightx2v **diff-patch** (`.diff`/`.diff_b`), read
+/// from each adapter file's safetensors HEADER only (no tensor load) — the sc-13884 multi-phase guard's
+/// input. Best-effort: a header we cannot read yields `false` here, but the same file is read for real
+/// by the load-time [`KreaHeavy::apply_adapters`], which surfaces the genuine error loudly — so an
+/// unreadable file never silently slips a diff-patch through into a wrong multi-phase render.
+fn adapters_have_diff_patch(specs: &[AdapterSpec]) -> bool {
+    specs.iter().any(|spec| {
+        mlx_gen::gen_core::weightsmeta::CheckpointMeta::from_file(&spec.path)
+            .map(|meta| mlx_gen::adapters::loader::has_diff_patch_key_names(meta.keys()))
+            .unwrap_or(false)
+    })
 }
 
 /// The policy→[`Residency`] dispatch every Krea variant shares (sc-11101; routed through the single
@@ -434,7 +465,11 @@ fn load_krea_heavy(
 }
 
 mlx_gen::impl_generator!(Krea {
-    validate: |s, req| validate_request(&s.descriptor, req),
+    validate: |s, req| {
+        validate_request(&s.descriptor, req)?;
+        // The load-time diff-patch guard needs `s` (the free `validate_request` can't see it).
+        ensure_multiphase_allowed_for(s.descriptor.id, s.has_diff_patch, req)
+    },
     generate: generate_impl,
 });
 
@@ -514,6 +549,9 @@ impl Krea {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         validate_request(&self.descriptor, req)?;
+        // Loud-reject a multi-phase request on a diff-patch model (sc-13884): its baked `.diff` delta
+        // can't be toggled off per phase, so it would silently corrupt "base-only" phases.
+        ensure_multiphase_allowed_for(self.descriptor.id, self.has_diff_patch, req)?;
         let base_seed = req.seed.unwrap_or_else(default_seed);
         // Variant read back off the descriptor id: Raw = full-CFG undistilled (52-step, dynamic-mu);
         // Turbo = CFG-free distilled (8-step, fixed mu). One `Krea` struct, two render paths. The edit
@@ -585,6 +623,40 @@ impl Krea {
         };
         let negative = req.negative_prompt.clone().unwrap_or_default();
 
+        // Multi-phase denoise (epic 13879, sc-13884): resolve the phase list ONCE up-front so both the
+        // text-encode phase (whether the unconditional context is needed) and the render phase drive
+        // from the same plan. `validate_phases` has already gated this to the Raw t2i variant (no
+        // reference/PiD, non-empty, ≥1-step); here we resolve the contiguous schedule slices, per-phase
+        // guidance, and per-phase adapter sets (indices bounds-checked against `self.adapters`). `None`
+        // ⇒ the ordinary single-phase render below.
+        let mp_resolved: Option<Vec<ResolvedPhase>> = match req.phases.as_deref() {
+            Some(list) if !list.is_empty() => {
+                let default_guidance = req.guidance.unwrap_or(DEFAULT_RAW_GUIDANCE);
+                Some(multiphase::resolve_phases(
+                    list,
+                    default_guidance,
+                    self.adapters.len(),
+                    self.descriptor.id,
+                )?)
+            }
+            _ => None,
+        };
+        // The multi-phase schedule is ONE global Raw schedule for the TOTAL step budget (the sum of the
+        // phases' steps); every phase runs a contiguous slice of it — the crux that keeps the sigma
+        // trajectory continuous across boundaries (no per-phase recompute / reset).
+        let mp_sigmas = mp_resolved.as_ref().map(|resolved| {
+            let total = resolved.last().map(|p| p.slice.end).unwrap_or(0);
+            base_schedule(total, req.width, req.height, req.scheduler.as_deref())
+        });
+        // The text encode builds the unconditional context iff ANY phase runs CFG (guidance > 0). A
+        // single positive value suffices for `encode_contexts`' neg-gate (it consults `guidance` only as
+        // `guidance > 0`, never in the combine — the per-phase guidance drives the actual CFG combine).
+        let encode_guidance = match &mp_resolved {
+            Some(resolved) if multiphase::any_phase_uses_cfg(resolved) => 1.0,
+            Some(_) => 0.0,
+            None => guidance,
+        };
+
         // Phase A: prompt → context(s) (sc-11101; sc-11125). Under `Sequential` the shared seam loads
         // the Qwen3-VL-4B text phase, encodes, materializes, then DROPS it + `clear_cache()` so its
         // ~4 GB frees before the DiT/VAE load below — the peak-bounding win. Under `Resident` it borrows
@@ -599,7 +671,7 @@ impl Krea {
                     req,
                     is_raw,
                     is_edit,
-                    guidance,
+                    encode_guidance,
                     &negative,
                     &edit_sources,
                 )
@@ -629,6 +701,44 @@ impl Krea {
                     capture_sigma,
                 )?;
                 let decoder = pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder);
+
+                // Multi-phase render (epic 13879, sc-13884): drive the resolved phases over the ONE
+                // global schedule — per-phase guidance selecting the true-CFG (two-forward) or CFG-off
+                // (single-forward) body, AND per-phase adapters toggled on that phase's own job-local
+                // DiT clone — sharing the latent + sigma trajectory across every boundary. The per-phase
+                // plans (clone + adapters + prep) are built ONCE here (`prep_neg` present per phase iff
+                // that phase uses CFG, backed by the `encode_guidance` neg-context gate) and reused
+                // across the count loop (one image per seed). Returns before the single-phase dispatch.
+                if let (Some(resolved), Some(full)) = (mp_resolved.as_ref(), mp_sigmas.as_ref()) {
+                    let plans = heavy.heavy.prepare_multiphase(
+                        resolved,
+                        &self.adapters,
+                        &ctx.pos,
+                        ctx.neg.as_ref(),
+                        req.width,
+                        req.height,
+                    )?;
+                    let mut images = Vec::with_capacity(req.count as usize);
+                    for n in 0..req.count {
+                        let opts = TurboOptions {
+                            width: req.width,
+                            height: req.height,
+                            steps: full.len().saturating_sub(1),
+                            seed: base_seed.wrapping_add(n as u64),
+                            sampler: req.sampler.clone(),
+                            scheduler: req.scheduler.clone(),
+                        };
+                        images.push(heavy.heavy.render_multiphase(
+                            &plans,
+                            full,
+                            &opts,
+                            decoder,
+                            &req.cancel,
+                            on_progress,
+                        )?);
+                    }
+                    return Ok(GenerationOutput::Images(images));
+                }
 
                 // Hoist the count-invariant work OUT of the per-image loop (F-073): the reference/pose
                 // VAE encodes and the step-invariant text-fusion + host-RoPE prep depend only on the
@@ -810,6 +920,77 @@ pub(crate) fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) 
         return Err(Error::Msg(format!(
             "{id}: {}x{} must be a multiple of {RES_MULTIPLE}",
             req.width, req.height
+        )));
+    }
+    validate_phases(id, req)?;
+    Ok(())
+}
+
+/// Multi-phase request validation (epic 13879, sc-13884). Multi-phase is the **Raw t2i** variant only:
+/// an ordered phase list run from pure noise over ONE global schedule, each phase a contiguous step
+/// slice with its own guidance (per-phase CFG on/off) AND its own adapter set (per-phase LoRA/LoKr
+/// toggling — the "N steps Raw + M steps Raw+turbo-LoRA" workflow). Rejects, loudly:
+/// - phases on any non-Raw variant (Turbo is CFG-free single-phase; edit/control are out of scope);
+/// - phases combined with reference/edit conditioning or the PiD decoder (t2i-from-noise only in v1);
+/// - an empty phase list or a 0-step phase (a malformed trajectory).
+///
+/// Per-phase **adapter index bounds** (against the model's loaded adapter set) are checked at
+/// `generate` time by [`crate::multiphase::resolve_phases`] (the count isn't on the descriptor). A
+/// no-op when `req.phases` is `None` (the ordinary single-phase render).
+fn validate_phases(id: &str, req: &GenerationRequest) -> Result<()> {
+    let Some(phases) = req.phases.as_ref() else {
+        return Ok(());
+    };
+    if id != KREA_2_RAW_ID {
+        return Err(Error::Msg(format!(
+            "{id}: multi-phase denoise (phases) is supported on {KREA_2_RAW_ID} only"
+        )));
+    }
+    if phases.is_empty() {
+        return Err(Error::Msg(format!(
+            "{id}: phases must contain at least one phase"
+        )));
+    }
+    if !req.conditioning.is_empty() {
+        return Err(Error::Msg(format!(
+            "{id}: multi-phase denoise renders from pure noise — reference/edit conditioning is not \
+             supported (sc-13884 v1)"
+        )));
+    }
+    if req.use_pid {
+        return Err(Error::Msg(format!(
+            "{id}: multi-phase denoise does not support the PiD decoder yet (sc-13884 follow-on)"
+        )));
+    }
+    for (i, ph) in phases.iter().enumerate() {
+        if ph.steps == 0 {
+            return Err(Error::Msg(format!(
+                "{id}: phase {i} must run at least one step"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Reject a multi-phase (`phases`) request on a model loaded with a **diff-patch** adapter (sc-13884).
+/// The per-phase adapter toggle clears + re-installs low-rank residuals on a job-local DiT clone, but a
+/// `.diff`/`.diff_b` diff-patch delta folds irreversibly into the dense base at load (`W += δ`) — every
+/// clone inherits it and `clear_adapters` cannot undo it, so a "base-only" phase would silently carry
+/// the diff-patch (a wrong render, no error). Turn that silent-wrong into a loud reject. Low-rank
+/// LoRA/LoKr adapters — including the epic's rank-64 turbo LoRA — toggle cleanly and are allowed.
+/// Factored as a free fn (id + the load-time flag) so the reject is unit-testable without a loaded
+/// model. A no-op when `req.phases` is `None` or the model has no diff-patch adapter.
+fn ensure_multiphase_allowed_for(
+    id: &str,
+    has_diff_patch: bool,
+    req: &GenerationRequest,
+) -> Result<()> {
+    if req.phases.is_some() && has_diff_patch {
+        return Err(Error::Msg(format!(
+            "{id}: multi-phase denoise is not supported on a model loaded with a diff-patch \
+             (.diff/.diff_b) adapter — a diff-patch folds irreversibly into the base weights at load \
+             and cannot be toggled off for a base-only phase; load a low-rank LoRA/LoKr adapter for \
+             multi-phase"
         )));
     }
     Ok(())
@@ -1503,5 +1684,133 @@ mod tests {
         std::fs::write(root.join("transformer/config.json"), "{").unwrap();
         assert!(effective_base_quant_bits(&q8, &root, KREA_2_TURBO_ID).is_err());
         std::fs::remove_dir_all(root).ok();
+    }
+
+    // ── Multi-phase request validation (epic 13879, sc-13884) ────────────────────────────────────
+
+    fn phase(steps: u32, guidance: Option<f32>) -> mlx_gen::GenerationPhase {
+        mlx_gen::GenerationPhase {
+            steps,
+            guidance,
+            adapters: vec![],
+        }
+    }
+
+    fn phase_req(phases: Vec<mlx_gen::GenerationPhase>) -> GenerationRequest {
+        GenerationRequest {
+            phases: Some(phases),
+            ..req(1024, 1024)
+        }
+    }
+
+    /// The canonical Raw multi-phase split (CFG-on then CFG-off, base-only) validates on `krea_2_raw`.
+    #[test]
+    fn multiphase_base_only_guidance_split_validates_on_raw() {
+        let r = phase_req(vec![phase(20, Some(3.5)), phase(8, Some(0.0))]);
+        assert!(validate_request(&raw_descriptor(), &r).is_ok());
+    }
+
+    /// Multi-phase is Raw-only in v1: Turbo/edit reject it (Turbo is CFG-free single-phase).
+    #[test]
+    fn multiphase_rejected_on_non_raw_variants() {
+        let r = phase_req(vec![phase(8, None)]);
+        for desc in [descriptor(), turbo_edit_descriptor(), edit_descriptor()] {
+            let err = validate_request(&desc, &r).unwrap_err().to_string();
+            assert!(
+                err.contains("supported on krea_2_raw"),
+                "{}: {err}",
+                desc.id
+            );
+        }
+    }
+
+    /// An empty phase list and a 0-step phase are malformed trajectories.
+    #[test]
+    fn multiphase_rejects_empty_list_and_zero_step_phase() {
+        let empty = validate_request(&raw_descriptor(), &phase_req(vec![]))
+            .unwrap_err()
+            .to_string();
+        assert!(empty.contains("at least one phase"), "{empty}");
+        let zero = validate_request(
+            &raw_descriptor(),
+            &phase_req(vec![phase(4, None), phase(0, None)]),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            zero.contains("phase 1 must run at least one step"),
+            "{zero}"
+        );
+    }
+
+    /// Per-phase adapters are WIRED (sc-13884): the flagship "N steps Raw (CFG on) + M steps
+    /// Raw+turbo-LoRA (CFG off)" request VALIDATES (no longer rejected). The adapter-index bounds check
+    /// runs at `generate` time (`resolve_phases`), not here — see the multiphase resolver tests.
+    #[test]
+    fn multiphase_accepts_per_phase_adapters() {
+        let with_adapter = mlx_gen::GenerationPhase {
+            steps: 8,
+            guidance: Some(0.0),
+            adapters: vec![mlx_gen::PhaseAdapter {
+                adapter: 0,
+                weight: Some(1.0),
+            }],
+        };
+        assert!(validate_request(
+            &raw_descriptor(),
+            &phase_req(vec![phase(20, Some(3.5)), with_adapter])
+        )
+        .is_ok());
+    }
+
+    /// sc-13884 diff-patch guard: a multi-phase request on a model that had a `.diff`/`.diff_b`
+    /// diff-patch folded at load is REJECTED loudly (the baked delta can't be toggled off per phase);
+    /// a multi-phase request on a low-rank-only model (the epic's turbo-LoRA case) is ACCEPTED; and a
+    /// single-phase request on a diff-patch model is unaffected.
+    #[test]
+    fn multiphase_rejected_on_diff_patch_model_but_allowed_low_rank() {
+        let mp = phase_req(vec![phase(20, Some(3.5)), phase(8, Some(0.0))]);
+
+        // diff-patch folded at load → multi-phase rejected with the diff-patch error.
+        let err = ensure_multiphase_allowed_for(KREA_2_RAW_ID, true, &mp)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("diff-patch"), "{err}");
+        assert!(err.contains(".diff/.diff_b"), "{err}");
+
+        // Low-rank-only model (no diff-patch) → the same multi-phase request is allowed.
+        assert!(ensure_multiphase_allowed_for(KREA_2_RAW_ID, false, &mp).is_ok());
+
+        // A single-phase request on a diff-patch model is unaffected (the guard is phases-only).
+        assert!(ensure_multiphase_allowed_for(KREA_2_RAW_ID, true, &req(1024, 1024)).is_ok());
+    }
+
+    /// Multi-phase renders from pure noise — reference/edit conditioning and the PiD decoder are
+    /// rejected (t2i-from-noise only in v1).
+    #[test]
+    fn multiphase_rejects_reference_and_pid() {
+        let mut with_ref = phase_req(vec![phase(8, None)]);
+        with_ref.conditioning = vec![Conditioning::Reference {
+            image: tiny_image(),
+            strength: None,
+        }];
+        assert!(validate_request(&raw_descriptor(), &with_ref)
+            .unwrap_err()
+            .to_string()
+            .contains("renders from pure noise"));
+
+        let mut with_pid = phase_req(vec![phase(8, None)]);
+        with_pid.use_pid = true;
+        assert!(validate_request(&raw_descriptor(), &with_pid)
+            .unwrap_err()
+            .to_string()
+            .contains("PiD decoder"));
+    }
+
+    /// `phases: None` is the ordinary single-phase render — validation is unchanged.
+    #[test]
+    fn single_phase_request_is_unaffected() {
+        assert!(validate_request(&raw_descriptor(), &req(1024, 1024)).is_ok());
+        assert_eq!(req(1024, 1024).phases, None);
     }
 }

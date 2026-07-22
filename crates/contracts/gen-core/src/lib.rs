@@ -59,9 +59,9 @@ pub use error::{Error, Result};
 pub use face::{DetectedFace, FaceEmbedder, FaceEmbedderDescriptor};
 pub use generator::{
     default_seed, AudioEditMode, AudioEditRef, AudioParams, Capabilities, Conditioning,
-    ConditioningKind, ControlClipRef, ControlKind, GenerationOutput, GenerationRequest, Generator,
-    KeyframeRef, Modality, ModelDescriptor, ReplacementMode, SpeechSegment, TimeRegion,
-    VideoClipRef,
+    ConditioningKind, ControlClipRef, ControlKind, GenerationOutput, GenerationPhase,
+    GenerationRequest, Generator, KeyframeRef, Modality, ModelDescriptor, PhaseAdapter,
+    ReplacementMode, SpeechSegment, TimeRegion, VideoClipRef,
 };
 pub use image_embed::{ImageEmbedder, ImageEmbedderDescriptor};
 pub use json_constraint::JsonState;

@@ -260,6 +260,22 @@ pub struct GenerationRequest {
     /// the [`Capabilities`] audio surface. See [`AudioParams`].
     pub audio: Option<AudioParams>,
 
+    // --- Multi-phase denoise (epic 13879, sc-13884; consumed by Krea MLX today) ---
+    /// An ordered list of denoise **phases** run within ONE trajectory over ONE coherent global
+    /// sigma schedule (sc-13884). Each [`GenerationPhase`] owns a contiguous slice of the shared
+    /// schedule (its [`steps`](GenerationPhase::steps)) plus its own guidance and active adapter
+    /// stack, so a request can e.g. run *N* steps of Raw with true-CFG on, then *M* steps of
+    /// Raw+turbo-LoRA with CFG off, all sharing the latent and sigma trajectory across the boundary
+    /// (no per-phase schedule reset). The total step budget is the **sum** of the phases' steps —
+    /// the flat [`steps`](Self::steps) is ignored when `phases` is present.
+    ///
+    /// **Additive and single-phase-preserving.** `None` (the default) is the ordinary single-phase
+    /// render, byte-for-byte unaffected: a model with no multi-phase support behaves exactly as
+    /// before sc-13884, and a model that reads `phases` falls back to its single-phase path when this
+    /// is `None`. Only the Krea MLX family reads it today; other models ignore it. Per-phase
+    /// *scheduler* selection is a deliberate follow-on — every phase shares the one global schedule.
+    pub phases: Option<Vec<GenerationPhase>>,
+
     // --- Control ---
     pub cancel: CancelFlag,
 }
@@ -332,6 +348,53 @@ pub struct SpeechSegment {
     pub style: Option<String>,
 }
 
+/// One phase of a [multi-phase denoise](GenerationRequest::phases) (epic 13879, sc-13884): a
+/// contiguous slice of the ONE shared global sigma schedule, run with this phase's own guidance and
+/// active adapter stack. The latent flows continuously from the previous phase — a phase does **not**
+/// restart the schedule, it resumes at the sigma the prior phase reached (that shared boundary is the
+/// whole point: one coherent trajectory, no seam/reset artifact).
+///
+/// Tensor-free and additive, like the rest of the request: new per-phase controls (e.g. a per-phase
+/// scheduler, the deliberate follow-on) arrive as further `Option` fields without breaking
+/// `GenerationPhase { steps, ..Default::default() }` construction.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct GenerationPhase {
+    /// The number of contiguous denoise steps this phase runs, as a slice of the shared global
+    /// schedule. The sum of every phase's `steps` is the request's total step budget (the flat
+    /// [`GenerationRequest::steps`] is ignored when `phases` is present). A phase with `steps == 0`
+    /// is a malformed request each multi-phase model rejects in its own `validate`.
+    pub steps: u32,
+    /// This phase's guidance. `Some(g)` with `g > 0` runs the true classifier-free-guidance path
+    /// (two model forwards per step: conditional + unconditional, combined by the model's CFG rule);
+    /// `Some(0.0)` runs the single-forward CFG-off path. `None` inherits the request/model default
+    /// guidance. This is what lets the "N steps CFG-on, then M steps CFG-off" split vary freely. Joins
+    /// the request finiteness floor.
+    pub guidance: Option<f32>,
+    /// The adapters active during this phase, referencing the load-time adapter stack
+    /// ([`crate::LoadSpec::adapters`], in load order) by index. An **empty** vector means this phase
+    /// runs the bare base model (no adapters) — the common phase-1 case of the Raw→Raw+turbo-LoRA
+    /// workflow. A phase that names an adapter index out of range of the loaded stack is a malformed
+    /// request the model rejects in its own `validate`.
+    pub adapters: Vec<PhaseAdapter>,
+}
+
+/// One adapter activated by a [`GenerationPhase`] (sc-13884): which load-time adapter it enables and,
+/// optionally, at what per-phase weight. The adapters are provisioned ONCE at model-load time (via
+/// [`crate::LoadSpec::adapters`]); a phase selects which of them are active and at what weight — so a
+/// two-phase job can run base-only, then base+adapter, without reloading the model.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PhaseAdapter {
+    /// Index into the load-time adapter stack ([`crate::LoadSpec::adapters`], in the order the loader
+    /// received them) this phase activates. Referencing by index keeps the request contract
+    /// tensor-neutral and free of load paths — the consumer that provisioned the adapters knows their
+    /// order. An out-of-range index is rejected when the model resolves the phase list at generate.
+    pub adapter: usize,
+    /// Per-phase weight override for this adapter. `None` uses the adapter's load-time
+    /// [`scale`](crate::AdapterSpec::scale); `Some(w)` scales its contribution to `w` for this phase
+    /// only (e.g. ramping a turbo LoRA in over the later phases). Joins the request finiteness floor.
+    pub weight: Option<f32>,
+}
+
 impl Default for GenerationRequest {
     fn default() -> Self {
         Self {
@@ -374,6 +437,7 @@ impl Default for GenerationRequest {
             use_pid: false,
             pid_capture_sigma: None,
             audio: None,
+            phases: None,
             cancel: CancelFlag::default(),
         }
     }
@@ -499,6 +563,10 @@ impl GenerationRequest {
             cancel: _,
             // The audio sub-block carries its own floats — destructured below the flat knobs.
             audio,
+            // The multi-phase list carries per-phase floats (guidance + adapter weights), checked
+            // below the flat knobs (sc-13884). Named (no `..`) so a future float-bearing per-phase
+            // control fails to compile here until it is classified into the floor.
+            phases,
             // Every `Option<f32>` knob the floor owns.
             guidance,
             true_cfg,
@@ -616,6 +684,25 @@ impl GenerationRequest {
                     return Some(("conditioning.voice_embedding.strength", *s));
                 }
                 _ => {}
+            }
+        }
+        // Multi-phase denoise floats (sc-13884): each phase's guidance and each phase-adapter weight
+        // flow into the same guidance / adapter-scale math as the flat knobs, so a NaN/Inf must be
+        // rejected here too rather than silently poisoning the phase's forward.
+        if let Some(phases) = phases {
+            for ph in phases {
+                if let Some(g) = ph.guidance {
+                    if !g.is_finite() {
+                        return Some(("phases.guidance", g));
+                    }
+                }
+                for pa in &ph.adapters {
+                    if let Some(w) = pa.weight {
+                        if !w.is_finite() {
+                            return Some(("phases.adapter.weight", w));
+                        }
+                    }
+                }
             }
         }
         None
@@ -2589,5 +2676,98 @@ mod tests {
             "empty VideoSync frames → Msg, got {err:?}"
         );
         assert!(err.to_string().contains("carries no frames"));
+    }
+
+    /// sc-13884: the default request carries no phases (single-phase, byte-for-byte the pre-13884
+    /// behavior), and a `phases: Some([...])` request round-trips its typed phase list through a clone.
+    #[test]
+    fn phases_default_none_and_round_trip() {
+        // Default = single-phase, unaffected.
+        assert_eq!(GenerationRequest::default().phases, None);
+
+        // A two-phase Raw→Raw+turbo-LoRA split: phase 1 = 20 steps, CFG on, base-only; phase 2 = 8
+        // steps, CFG off, turbo LoRA (load-time adapter 0) at weight 0.8.
+        let phases = vec![
+            GenerationPhase {
+                steps: 20,
+                guidance: Some(3.5),
+                adapters: vec![],
+            },
+            GenerationPhase {
+                steps: 8,
+                guidance: Some(0.0),
+                adapters: vec![PhaseAdapter {
+                    adapter: 0,
+                    weight: Some(0.8),
+                }],
+            },
+        ];
+        let req = GenerationRequest {
+            prompt: "a phased render".into(),
+            phases: Some(phases.clone()),
+            ..Default::default()
+        };
+        // The typed phases survive a clone unchanged (no serde in this contract — Clone is the
+        // transport the worker uses to hand a request across the thread boundary).
+        assert_eq!(req.clone().phases, Some(phases));
+        // The flat steps knob is left at its default None — the total budget is the phases' sum.
+        assert_eq!(req.steps, None);
+    }
+
+    /// sc-13884: a NaN/Inf on a phase guidance OR a phase-adapter weight is caught by the shared
+    /// finiteness floor, exactly like the flat float knobs (a NaN in the phase forward would silently
+    /// poison the guidance / adapter-scale math otherwise).
+    #[test]
+    fn phase_floats_join_the_finiteness_floor() {
+        let bad_guidance = GenerationRequest {
+            phases: Some(vec![GenerationPhase {
+                steps: 4,
+                guidance: Some(f32::NAN),
+                adapters: vec![],
+            }]),
+            ..Default::default()
+        };
+        assert_eq!(
+            bad_guidance.first_nonfinite_float().map(|(f, _)| f),
+            Some("phases.guidance")
+        );
+        assert!(bad_guidance.ensure_finite_floats().is_err());
+
+        let bad_weight = GenerationRequest {
+            phases: Some(vec![GenerationPhase {
+                steps: 4,
+                guidance: Some(0.0),
+                adapters: vec![PhaseAdapter {
+                    adapter: 0,
+                    weight: Some(f32::INFINITY),
+                }],
+            }]),
+            ..Default::default()
+        };
+        assert_eq!(
+            bad_weight.first_nonfinite_float().map(|(f, _)| f),
+            Some("phases.adapter.weight")
+        );
+
+        // A finite two-phase request passes the floor untouched.
+        let ok = GenerationRequest {
+            phases: Some(vec![
+                GenerationPhase {
+                    steps: 4,
+                    guidance: Some(3.5),
+                    adapters: vec![],
+                },
+                GenerationPhase {
+                    steps: 4,
+                    guidance: None,
+                    adapters: vec![PhaseAdapter {
+                        adapter: 1,
+                        weight: None,
+                    }],
+                },
+            ]),
+            ..Default::default()
+        };
+        assert_eq!(ok.first_nonfinite_float(), None);
     }
 }

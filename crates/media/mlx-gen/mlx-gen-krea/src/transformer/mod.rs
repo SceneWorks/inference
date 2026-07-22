@@ -38,6 +38,15 @@ use mlx_gen::train::lora::LoraParams;
 use rope::RopeTables;
 
 /// The Krea 2 single-stream DiT.
+///
+/// `Clone` is a **shallow, refcounted** copy: MLX `Array`s are handles into shared device buffers,
+/// so cloning duplicates only the thin module/adapter-stack structs while the (large) weight tensors
+/// stay shared. This is what makes a **job-local DiT clone** cheap enough for the multi-phase render
+/// (epic 13879, sc-13884) to toggle its adapter stacks per phase (`clear_adapters` + a low-rank
+/// re-apply) without touching the shared resident DiT — the base weights are never mutated (adapters
+/// are forward-time residuals), so concurrent generates on the resident model are unaffected. The
+/// training path already relies on this shallow block clone (`SingleStreamBlock::clone` per step).
+#[derive(Clone)]
 pub struct Krea2Transformer {
     cfg: Krea2Config,
     dtype: Dtype,
@@ -571,6 +580,35 @@ impl Krea2Transformer {
             b.quantize(bits)?;
         }
         Ok(())
+    }
+
+    /// Clear **every** adapter stack on the DiT — the global projections, the single-stream blocks, and
+    /// the text-fusion aggregator — back to the bare frozen base (epic 13879, sc-13884). The forward-time
+    /// counterpart to a `set_adapters(vec![])` per module, used by the multi-phase driver to reset before
+    /// re-installing a phase's adapters (a base-only phase is exactly this reset with nothing re-applied).
+    /// Leaves the base weights (dense or packed) untouched — only the low-rank residual stacks are
+    /// dropped, so it is the exact inverse of a low-rank `apply_adapters_strict` install (a `.diff`
+    /// diff-patch, which mutates the dense base, is NOT installed on the multi-phase swap path, so this
+    /// stays a faithful reset there).
+    pub fn clear_adapters(&mut self) {
+        // The global projections are reachable via `adaptable_mut` but excluded from `adaptable_paths`
+        // (they are not part of the default training surface), so clear them explicitly.
+        self.img_in.set_adapters(Vec::new());
+        self.time_embed_l1.set_adapters(Vec::new());
+        self.time_embed_l2.set_adapters(Vec::new());
+        self.time_mod_proj.set_adapters(Vec::new());
+        self.txt_in_l1.set_adapters(Vec::new());
+        self.txt_in_l2.set_adapters(Vec::new());
+        self.final_linear.set_adapters(Vec::new());
+        // The per-block + text-fusion targets, via the enumerated adapter paths (each resolves through
+        // `adaptable_mut`, per the `AdaptableHost` contract). `adaptable_paths` borrows `&self` and
+        // returns owned strings, so the subsequent `&mut self` resolves are unencumbered.
+        for path in self.adaptable_paths() {
+            let parts: Vec<&str> = path.split('.').collect();
+            if let Some(linear) = self.adaptable_mut(&parts) {
+                linear.set_adapters(Vec::new());
+            }
+        }
     }
 }
 

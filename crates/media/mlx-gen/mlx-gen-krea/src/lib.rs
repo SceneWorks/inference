@@ -53,6 +53,7 @@ pub mod loader;
 pub mod memory;
 pub mod model;
 pub mod model_control;
+pub mod multiphase;
 pub mod pipeline;
 mod quant;
 pub mod schedule;
@@ -71,7 +72,12 @@ pub use model::{
     KREA_2_TURBO_ID, RES_MULTIPLE,
 };
 pub use model_control::{KreaTurboControl, KREA_2_TURBO_CONTROL_ID};
-pub use pipeline::{KreaHeavy, KreaPipeline, KreaText, TurboOptions};
+pub use multiphase::{
+    any_phase_uses_cfg, phase_spec_subset, phase_uses_cfg, resolve_phase_adapters,
+    resolve_phase_slices, resolve_phases, total_phase_steps, PhaseSlice, ResolvedPhase,
+    ResolvedPhaseAdapter,
+};
+pub use pipeline::{KreaHeavy, KreaPipeline, KreaText, MultiPhasePlan, TurboOptions};
 pub use schedule::{krea_sigmas, turbo_sigmas, TURBO_MU, TURBO_STEPS};
 pub use text_encoder::{KreaTeConfig, KreaTextEncoder, KreaTokenizer};
 pub use training::{load_trainer, KreaRawTrainer, KREA_2_RAW_TRAINER_ID};

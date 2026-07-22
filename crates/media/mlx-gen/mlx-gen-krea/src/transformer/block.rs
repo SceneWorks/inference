@@ -294,6 +294,7 @@ impl AdaptableHost for SwiGlu {
 
 // ── Un-modulated text-fusion block (reference `TextFusionBlock`) ─────────────────────────────
 /// `x = x + attn(prenorm(x)); x = x + mlp(postnorm(x))`. No modulation, no RoPE.
+#[derive(Clone)]
 pub struct TextFusionBlock {
     prenorm: RmsScale,
     postnorm: RmsScale,
@@ -472,6 +473,7 @@ impl AdaptableHost for SingleStreamBlock {
 /// Aggregates the `num_layers` stacked Qwen3-VL hidden states into one conditioning stream:
 /// `layerwise_blocks` attend across the layer axis (per token) → `projector` collapses `num_layers→1`
 /// → `refiner_blocks` attend across the token axis.
+#[derive(Clone)]
 pub struct TextFusionTransformer {
     layerwise: Vec<TextFusionBlock>,
     projector: AdaptableLinear, // Linear(num_layers → 1), no bias

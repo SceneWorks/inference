@@ -1819,11 +1819,21 @@ pub struct DiffPatchReport {
     pub unmatched: Vec<String>,
 }
 
+/// `true` if any of `keys` is a diff-patch delta name (`.diff` / `.diff_b`) — the structural marker of
+/// a ComfyUI/lightx2v diff-patch file, which the forward-time residual loader cannot consume. The
+/// header-only twin of [`has_diff_patch_keys`] (which needs a fully-loaded [`Weights`]): a caller with
+/// just the safetensors key list (e.g. from a [`gen_core::weightsmeta::CheckpointMeta`]) can detect a
+/// diff-patch adapter WITHOUT loading its tensors — used by the Krea multi-phase guard (sc-13884) to
+/// reject a diff-patch adapter, whose delta folds irreversibly into the dense base and so cannot be
+/// toggled off per phase.
+pub fn has_diff_patch_key_names<'a>(mut keys: impl Iterator<Item = &'a str>) -> bool {
+    keys.any(|k| k.ends_with(".diff") || k.ends_with(".diff_b"))
+}
+
 /// `true` if any tensor key in `w` is a diff-patch delta (`.diff` / `.diff_b`) — the structural marker
 /// of a ComfyUI/lightx2v diff-patch file, which the forward-time residual loader cannot consume.
 pub fn has_diff_patch_keys(w: &Weights) -> bool {
-    w.keys()
-        .any(|k| k.ends_with(".diff") || k.ends_with(".diff_b"))
+    has_diff_patch_key_names(w.keys())
 }
 
 /// Fold every ComfyUI/lightx2v **diff-patch** (`.diff` weight / `.diff_b` bias) delta the `specs` carry
@@ -4829,6 +4839,24 @@ mod tests {
             ],
         );
         assert!(!has_diff_patch_keys(&Weights::from_file(&plain).unwrap()));
+
+        // The header-only twin (sc-13884 multi-phase guard) makes the SAME diff-patch-vs-low-rank
+        // distinction from just the key names — no tensor load: a `.diff`/`.diff_b` marks a diff-patch
+        // (rejected from multi-phase), a low-rank `lora_*` file does not (the toggleable turbo-LoRA case).
+        assert!(has_diff_patch_key_names(
+            ["diffusion_model.txtfusion.projector.diff"].into_iter()
+        ));
+        assert!(has_diff_patch_key_names(
+            ["some.module.diff_b", "other.lora_down.weight"].into_iter()
+        ));
+        assert!(!has_diff_patch_key_names(
+            [
+                "blk.0.attn.to_q.lora_down.weight",
+                "blk.0.attn.to_q.lora_up.weight"
+            ]
+            .into_iter()
+        ));
+        assert!(!has_diff_patch_key_names(std::iter::empty()));
     }
 
     /// The community filter-bypass: a single `diffusion_model.txtfusion.projector.diff` folds
