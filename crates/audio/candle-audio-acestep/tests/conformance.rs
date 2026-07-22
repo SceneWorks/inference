@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use candle_audio_acestep::candle_audio;
 use candle_audio_acestep::gen_core::{
     AudioEditMode, AudioParams, AudioTrack, Conditioning, GenerationOutput, GenerationRequest,
-    LoadSpec, Progress, TimeRegion, WeightsSource,
+    Generator, LoadSpec, Progress, TimeRegion, WeightsSource,
 };
 
 /// Resolve the snapshot from the required `ACESTEP_SNAPSHOT` env (a passed-in
@@ -567,6 +567,20 @@ fn acestep_edit_repaint_wav_conformance() {
 
 // ================================ Prompted audio COVER (sc-13251) ================================
 
+// The shipped cover-gate source/cover prompts + source seeds, hoisted to module consts so the
+// sc-13714 seed-stability sweep (`acestep_cover_chroma_seed_stability`) exercises the *same*
+// distinctive+tonal sitar / dark-electronic industrial pair as `acestep_cover_wav_conformance` —
+// the two tests cannot silently drift apart. A = a solo sitar raga (distinctive twang whose content
+// survives the ~80 bit/s FSQ codec, tonal on a specific scale); B = dark industrial electronic
+// (distinctive too, chroma-distinct from A). The brass cover is spectrally distinct from BOTH, so
+// its shared new timbre cancels in the matched-vs-mismatched comparison.
+const COVER_SRC_A_PROMPT: &str = "a hypnotic solo sitar raga with a resonant drone, distinctive twanging strings, meditative Indian classical";
+const COVER_SRC_B_PROMPT: &str =
+    "dark aggressive industrial electronic, heavy distorted bass, ominous grinding machine drones";
+const COVER_PROMPT: &str = "a brass ensemble of trumpets and trombones";
+const COVER_SRC_A_SEED: u64 = 42;
+const COVER_SRC_B_SEED: u64 = 7;
+
 /// Normalized 7-octave-band long-term power distribution (fraction of total energy per band) — a
 /// coarse timbre fingerprint. Two clips with different timbre have different band distributions.
 fn octave_band_dist(mono: &[f32]) -> Vec<f64> {
@@ -740,16 +754,14 @@ fn acestep_cover_wav_conformance() {
     // legs). B = dark dissonant industrial electronic (distinctive too — matched ≈ 0.67). The
     // distilled 8-step turbo DiT could not clear the per-direction floor for the weaker leg on ANY
     // pair; the sft DiT does (verified sitar/industrial AND steel-drum/industrial, sc-13251).
-    const SRC_A_SEED: u64 = 42;
-    const SRC_B_SEED: u64 = 7;
-    let src_a_prompt =
-        "a hypnotic solo sitar raga with a resonant drone, distinctive twanging strings, meditative Indian classical";
-    let src_b_prompt =
-        "dark aggressive industrial electronic, heavy distorted bass, ominous grinding machine drones";
+    const SRC_A_SEED: u64 = COVER_SRC_A_SEED;
+    const SRC_B_SEED: u64 = COVER_SRC_B_SEED;
+    let src_a_prompt = COVER_SRC_A_PROMPT;
+    let src_b_prompt = COVER_SRC_B_PROMPT;
     // A brass cover shared by both covers — spectrally distinct from both sources (octave-band timbre
     // moves hard). The shared new timbre cancels in the matched-vs-mismatched comparison, leaving each
     // source's carried-over tonal character.
-    let cover_prompt = "a brass ensemble of trumpets and trombones";
+    let cover_prompt = COVER_PROMPT;
 
     let audio = |secs: Option<f32>| AudioParams {
         target_duration: secs,
@@ -995,5 +1007,488 @@ fn acestep_cover_wav_conformance() {
     assert_eq!(
         cover_a.samples, cover_a2.samples,
         "seeded cover must be deterministic"
+    );
+}
+
+// ==================== Cover chroma-gate hardening (sc-13714) ====================
+//
+// Follow-up to sc-13251 (PR #168). The shipped per-direction chroma gate in
+// `acestep_cover_wav_conformance` is genuinely non-vacuous — it passes on the sft-DiT cover with
+// matched > 0.40 AND per-direction margin > 0.03 in BOTH directions — but sc-13251 noted two soft
+// spots worth hardening: (1) the winning margins are THIN (the weak leg's margin is only ~+0.0426,
+// just ~0.01 above the 0.03 floor), and (2) the validation set was small + hand-curated (the two dev
+// pairs sitar/industrial and steel-drum/industrial share the `industrial` anchor ⇒ only ~3 distinct
+// sources). This block
+// adds the two hardening items. Neither is a blocker — the shipped gate already meets its bar; this
+// is test-robustness evidence. Both new tests are `#[ignore]`d + snapshot-gated exactly like the
+// shipped cover test, so PR CI stays weights-free.
+//
+// SEED-STABILITY EVIDENCE (`acestep_cover_chroma_seed_stability`, measured on CUDA / GPU1, sm_120,
+// sft DiT for covers + turbo DiT for sources). The cover sampler's ONLY stochastic knob is the
+// cover-request noise seed (the sources are deterministic conditioning), so this is the axis that
+// matters for "do the margins hold across seeds?". Generation is byte-deterministic per seed (the
+// seed law), so these numbers reproduce exactly; the spread across seeds is genuine seed sensitivity.
+// Sweeping the shared cover noise seed over [42, 7, 123, 2024, 777, 31337] for the shipped
+// sitar(A)/industrial(B) pair (matched > 0.40 floor, per-direction margin > 0.03 floor):
+//
+//   seed    A matched  A margin  |  B matched  B margin      (srcA<->srcB chroma = 0.3566 all seeds)
+//     42     0.7907    +0.1195   |   0.6745    +0.0426
+//      7     0.7935    +0.1114   |   0.6662    +0.0392
+//    123     0.8157    +0.1447   |   0.6101    +0.0416
+//   2024     0.7875    +0.1135   |   0.6904    +0.0087   <- weak leg B dips BELOW the 0.03 margin floor
+//    777     0.8204    +0.1381   |   0.6875    +0.0581
+//  31337     0.7928    +0.1358   |   0.7011    +0.0640
+//   ----     ------    ------        ------    ------
+//    min     0.7875    +0.1114   |   0.6101    +0.0087       B margin: mean +0.0424, canonical(42) +0.0426
+//
+// FINDING: the content floor (matched > 0.40) and the source-specific ordering (margin > 0) hold in
+// BOTH directions at EVERY seed; the strong leg A clears the 0.03 margin floor every seed with ~3.7x
+// headroom. The thin weak leg B clears 0.03 ON AVERAGE (+0.0424) and at the shipped canonical seed 42
+// (+0.0426), but is seed-SENSITIVE and dips to +0.0087 at seed 2024 — it stays correctly ordered
+// (matched > mismatched) but not comfortably above 0.03. This QUANTIFIES the sc-13251 thinness rather
+// than papering over it. The test asserts exactly this (per-seed matched>0.40 + ordering>0 + strong
+// leg>0.03; weak-leg mean>0.03 + canonical-seed>0.03) and deliberately does NOT force a per-seed
+// weak-leg 0.03 pass — cherry-picking seeds to fake robustness is what the story forbids.
+//
+// INDEPENDENT 3rd PAIR (`acestep_cover_chroma_independent_pair_constraint`): OUTCOME =
+// attempted-but-documented-constraint (the story's explicitly-sanctioned fallback). A genuine,
+// matrix-informed search over 8 candidate sources (see the sc-13714 PR for the pairwise source-chroma
+// matrix) drove FOUR fully-independent pairs (no sitar/industrial/steel-drum anchor) through the SAME
+// per-direction bar, spanning the full source-separation range:
+//
+//   pair (C / D)              srcC<->srcD   margin C   margin D    why it misses the bar
+//   banjo / pipe-organ          0.8459      -0.0162    +0.0958     sources too tonally SIMILAR
+//   koto / death-metal          0.2366      +0.1013    -0.0063     dark source's chroma too FLAT (not source-specific)
+//   koto / gamelan              0.4930      +0.0248    -0.0337     two tonal covers too alike (representative pair)
+//   koto / dubstep             -0.0420      -0.0791    -0.1864     near-orthogonal -> shared cover prompt swamps FSQ signal
+//   ---- reference ----
+//   sitar / industrial          0.3566      +0.1195    +0.0426     the shipped gate: a NARROW sweet spot
+//
+// NO independent pair cleared per-direction margin > 0.03 in BOTH directions. The shipped
+// sitar/industrial pair sits in a narrow sweet spot — a distinctive peaky-tonal source vs a dark
+// source whose chroma is distinctive-but-not-flat, separated by ≈ 0.36 — that an arbitrary
+// independent pair does not hit. This is exactly the constraint the story anticipated: the ~80 bit/s
+// FSQ semantic codec's ceiling makes an arbitrary independent pair marginal. It is a property of the
+// codec (accepted under the Option-A/Option-2 product decision), NOT a defect, so the gate threshold
+// is NOT weakened and no flaky pass is forced. The `_constraint` harness records this reproducibly on
+// the koto/gamelan representative, asserting only the invariants that robustly hold (real, restyled,
+// source-distinct covers) and PRINTING the margin shortfall.
+//
+
+/// The four per-direction chroma correlations of one cover pair, plus the source↔source chroma
+/// (the discrimination precondition). `matched_*` = source ↔ its OWN cover; `mismatched_*` =
+/// source ↔ the OTHER source's cover (same shared cover prompt+seed+steps).
+struct ChromaLegs {
+    matched_a: f64,
+    mismatched_a: f64,
+    matched_b: f64,
+    mismatched_b: f64,
+    src_ab: f64,
+}
+
+impl ChromaLegs {
+    fn margin_a(&self) -> f64 {
+        self.matched_a - self.mismatched_a
+    }
+    fn margin_b(&self) -> f64 {
+        self.matched_b - self.mismatched_b
+    }
+}
+
+/// Load the ACE-Step generator with the sft cover checkpoint staged as the `COVER_COMPONENT_ID`
+/// component — the same load the shipped cover test does (epic 13657: the sft snapshot flows through
+/// the component seam, the env var is only the test's passed-in path).
+fn load_cover_generator() -> Box<dyn Generator> {
+    let spec = LoadSpec::new(snapshot())
+        .with_component(candle_audio_acestep::COVER_COMPONENT_ID, sft_snapshot());
+    candle_audio_acestep::provider_registry()
+        .unwrap()
+        .load(candle_audio_acestep::MODEL_ID, &spec)
+        .expect("acestep_v15_turbo loads through the explicit registry")
+}
+
+/// Synthesize one source clip via ordinary text-to-music (turbo DiT), fixed seed ⇒ reproducible.
+fn cover_source(
+    generator: &dyn Generator,
+    prompt: &str,
+    seed: u64,
+    steps: u32,
+    secs: f32,
+) -> AudioTrack {
+    let req = GenerationRequest {
+        prompt: prompt.into(),
+        seed: Some(seed),
+        steps: Some(steps),
+        audio: Some(AudioParams {
+            target_duration: Some(secs),
+            sample_rate: Some(48_000),
+            language: Some("en".into()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    match generator
+        .generate(&req, &mut |_| {})
+        .expect("source generate")
+    {
+        GenerationOutput::Audio(t) => t,
+        other => panic!("expected audio, got {other:?}"),
+    }
+}
+
+/// Cover both sources under ONE shared `cover(prompt, seed, steps)` (sft DiT) and compute the four
+/// per-direction chroma correlations. This is the exact chroma computation the shipped gate does,
+/// factored out so the seed sweep and the independent-pair test both drive the identical measurement.
+fn cover_chroma_legs(
+    generator: &dyn Generator,
+    source_a: &AudioTrack,
+    source_b: &AudioTrack,
+    cover_prompt: &str,
+    cover_seed: u64,
+    steps: u32,
+) -> ChromaLegs {
+    let cover_of = |src: &AudioTrack| GenerationRequest {
+        prompt: cover_prompt.into(),
+        seed: Some(cover_seed),
+        steps: Some(steps),
+        audio: Some(AudioParams {
+            sample_rate: Some(48_000),
+            language: Some("en".into()),
+            ..Default::default()
+        }),
+        conditioning: vec![Conditioning::AudioEdit {
+            audio: src.clone(),
+            mode: AudioEditMode::Cover,
+            region: None,
+            strength: None,
+        }],
+        ..Default::default()
+    };
+    let gen = |req: &GenerationRequest| -> AudioTrack {
+        match generator
+            .generate(req, &mut |_| {})
+            .expect("cover generate")
+        {
+            GenerationOutput::Audio(t) => t,
+            other => panic!("expected audio, got {other:?}"),
+        }
+    };
+    let cover_a = gen(&cover_of(source_a));
+    let cover_b = gen(&cover_of(source_b));
+    let (sa, sb) = (mono(source_a), mono(source_b));
+    let (ca, cb) = (mono(&cover_a), mono(&cover_b));
+    let (chr_sa, chr_sb) = (chroma(&sa), chroma(&sb));
+    let (chr_ca, chr_cb) = (chroma(&ca), chroma(&cb));
+    ChromaLegs {
+        matched_a: chroma_corr(&chr_sa, &chr_ca),
+        mismatched_a: chroma_corr(&chr_sa, &chr_cb),
+        matched_b: chroma_corr(&chr_sb, &chr_cb),
+        mismatched_b: chroma_corr(&chr_sb, &chr_ca),
+        src_ab: chroma_corr(&chr_sa, &chr_sb),
+    }
+}
+
+// The chroma gate's two floors, shared with the shipped `acestep_cover_wav_conformance` bar.
+const CHROMA_PER_DIR_MATCHED_FLOOR: f64 = 0.40;
+const CHROMA_PER_DIR_MARGIN_FLOOR: f64 = 0.03;
+
+/// sc-13714 (2): SEED STABILITY. Fix the shipped sitar(A)/industrial(B) source pair and sweep the
+/// cover sampler's noise seed — the sole stochastic knob — over [42, 7, 123, 2024, 777, 31337],
+/// recording the per-direction chroma matched/mismatched/margin at every seed. Because generation is
+/// byte-deterministic per seed (the seed law), these numbers reproduce exactly; the spread across
+/// seeds is genuine seed sensitivity. The finding (see the assertions and the sc-13714 evidence block):
+/// the content floor (matched > 0.40) and the source-specific ordering (margin > 0) hold in BOTH
+/// directions at every seed, and the strong leg (A) clears the 0.03 margin floor with wide headroom
+/// every seed — but the thin weak leg (B) is seed-SENSITIVE: it clears 0.03 on average and at the
+/// canonical seed 42, yet dips to ≈ +0.009 at seed 2024. So the gate's weak-leg margin is real and
+/// correctly-ordered across seeds, but not comfortably robust at 0.03 — the sc-13251 thinness, now
+/// quantified. The test asserts exactly what holds and does NOT force a per-seed 0.03 pass.
+#[test]
+#[ignore = "real weights: needs ACE-Step snapshots (ACESTEP_SNAPSHOT / ACESTEP_SFT_SNAPSHOT); run with --ignored"]
+fn acestep_cover_chroma_seed_stability() {
+    let generator = load_cover_generator();
+
+    const TARGET_SECS: f32 = 6.0;
+    const STEPS: u32 = 8;
+    // The cover noise-seed sweep. Sources are generated ONCE (deterministic conditioning); only the
+    // shared cover noise seed varies, isolating the cover sampler's stochastic sensitivity.
+    const COVER_SEEDS: [u64; 6] = [42, 7, 123, 2024, 777, 31337];
+
+    let source_a = cover_source(
+        generator.as_ref(),
+        COVER_SRC_A_PROMPT,
+        COVER_SRC_A_SEED,
+        STEPS,
+        TARGET_SECS,
+    );
+    let source_b = cover_source(
+        generator.as_ref(),
+        COVER_SRC_B_PROMPT,
+        COVER_SRC_B_SEED,
+        STEPS,
+        TARGET_SECS,
+    );
+
+    // Collect every seed's legs FIRST so the full table prints even when an assertion later fails.
+    let rows: Vec<(u64, ChromaLegs)> = COVER_SEEDS
+        .iter()
+        .map(|&seed| {
+            (
+                seed,
+                cover_chroma_legs(
+                    generator.as_ref(),
+                    &source_a,
+                    &source_b,
+                    COVER_PROMPT,
+                    seed,
+                    STEPS,
+                ),
+            )
+        })
+        .collect();
+
+    eprintln!(
+        "acestep_cover_chroma_seed_stability (sc-13714) — sitar(A)/industrial(B), sft cover DiT:"
+    );
+    eprintln!(
+        "  floors: matched > {CHROMA_PER_DIR_MATCHED_FLOOR}, per-direction margin > {CHROMA_PER_DIR_MARGIN_FLOOR}"
+    );
+    for (seed, l) in &rows {
+        eprintln!(
+            "  seed {seed:>6}: A matched {:.4} mismatched {:.4} margin {:+.4} | B matched {:.4} mismatched {:.4} margin {:+.4} | srcA<->srcB {:.4}",
+            l.matched_a,
+            l.mismatched_a,
+            l.margin_a(),
+            l.matched_b,
+            l.mismatched_b,
+            l.margin_b(),
+            l.src_ab,
+        );
+    }
+    let min_margin_a = rows
+        .iter()
+        .map(|(_, l)| l.margin_a())
+        .fold(f64::INFINITY, f64::min);
+    let min_margin_b = rows
+        .iter()
+        .map(|(_, l)| l.margin_b())
+        .fold(f64::INFINITY, f64::min);
+    let min_matched_a = rows
+        .iter()
+        .map(|(_, l)| l.matched_a)
+        .fold(f64::INFINITY, f64::min);
+    let min_matched_b = rows
+        .iter()
+        .map(|(_, l)| l.matched_b)
+        .fold(f64::INFINITY, f64::min);
+    eprintln!(
+        "  worst-case over the sweep: matched min A {min_matched_a:.4} B {min_matched_b:.4} | margin min A {min_margin_a:+.4} B {min_margin_b:+.4}"
+    );
+
+    let mean_margin_b = rows.iter().map(|(_, l)| l.margin_b()).sum::<f64>() / rows.len() as f64;
+    let canonical_margin_b = rows
+        .iter()
+        .find(|(seed, _)| *seed == 42)
+        .map(|(_, l)| l.margin_b())
+        .expect("seed 42 is in the sweep (the shipped gate's cover seed)");
+    eprintln!(
+        "  weak-leg (B) margin: mean {mean_margin_b:+.4}, canonical-seed-42 {canonical_margin_b:+.4} (floor {CHROMA_PER_DIR_MARGIN_FLOOR})"
+    );
+
+    // What the sweep establishes (generation is byte-deterministic per seed — the seed law — so these
+    // numbers reproduce exactly; the variation below is genuine seed sensitivity, not run noise):
+    //
+    //  (i)   the CONTENT-PRESERVATION floor (matched > 0.40) holds for BOTH directions at EVERY seed;
+    //  (ii)  the source-specific ORDERING (matched > mismatched ⇒ margin > 0) never inverts — every
+    //        seed keeps each cover closer to its OWN source than to the other's, in both directions;
+    //  (iii) the strong leg (A, sitar) clears the shipped 0.03 margin floor at EVERY seed with wide
+    //        headroom (min ≈ +0.11, ~3.7×);
+    //  (iv)  the thin weak leg (B, industrial) clears the 0.03 floor ON AVERAGE over the sweep and at
+    //        the shipped canonical seed 42 — but it is seed-SENSITIVE and dips below 0.03 at some
+    //        seeds (min ≈ +0.009). This is the sc-13251 thinness, now quantified: the gate's weak-leg
+    //        margin is real (correctly ordered every seed) but not comfortably seed-robust at 0.03.
+    //
+    // We assert (i)–(iv) exactly, and deliberately do NOT assert per-seed weak-leg > 0.03 (it is false
+    // for at least one seed) — forcing that would require cherry-picking seeds, which the story forbids.
+    for (seed, l) in &rows {
+        assert!(
+            l.matched_a > CHROMA_PER_DIR_MATCHED_FLOOR
+                && l.matched_b > CHROMA_PER_DIR_MATCHED_FLOOR,
+            "seed {seed}: a direction's matched chroma fell to/below the content floor \
+             (A {:.4}, B {:.4}, floor {CHROMA_PER_DIR_MATCHED_FLOOR}) — content not preserved",
+            l.matched_a,
+            l.matched_b,
+        );
+        assert!(
+            l.margin_a() > 0.0 && l.margin_b() > 0.0,
+            "seed {seed}: source-specific ordering inverted (margin A {:+.4}, B {:+.4}) — a cover is \
+             closer to the OTHER source than to its own",
+            l.margin_a(),
+            l.margin_b(),
+        );
+        assert!(
+            l.margin_a() > CHROMA_PER_DIR_MARGIN_FLOOR,
+            "seed {seed}: the strong leg A dropped below the 0.03 floor (margin {:+.4}) — unexpected \
+             regression of the robust direction",
+            l.margin_a(),
+        );
+    }
+    assert!(
+        mean_margin_b > CHROMA_PER_DIR_MARGIN_FLOOR,
+        "weak leg B mean margin over the sweep {mean_margin_b:+.4} does not clear the 0.03 floor — \
+         the gate's thin direction has regressed across seeds"
+    );
+    assert!(
+        canonical_margin_b > CHROMA_PER_DIR_MARGIN_FLOOR,
+        "the shipped gate's canonical cover seed 42 weak-leg margin {canonical_margin_b:+.4} does not \
+         clear the 0.03 floor — the shipped gate itself would fail"
+    );
+}
+
+// A representative fully-independent pair (sc-13714 (1)) — shares NO anchor with sitar / industrial /
+// steel-drum: C = solo Japanese koto (plucked zither, pentatonic), D = Indonesian gamelan (tuned
+// metallic percussion, pelog). Two distinctive tonal instruments in different tuning systems, source
+// chroma-corr 0.4930. This is the pair the `_constraint` harness records; see the sc-13714 evidence
+// block above for why NO independent pair (this one included) clears the shipped per-direction bar.
+// Seeds are the candidate-matrix seeds, so the sources reproduce that measurement.
+const COVER_IND_SRC_C_PROMPT: &str =
+    "a delicate solo Japanese koto, plucked zither strings, distinctive traditional pentatonic melody";
+const COVER_IND_SRC_D_PROMPT: &str =
+    "a bright shimmering Indonesian gamelan ensemble, interlocking metallic tuned gongs and metallophones, distinctive pelog scale";
+const COVER_IND_SRC_C_SEED: u64 = 5;
+const COVER_IND_SRC_D_SEED: u64 = 3;
+
+/// sc-13714 (1): the DOCUMENTED-CONSTRAINT harness for the fully-independent 3rd pair. sc-13714
+/// asked for an independent pair (no `industrial`/`sitar`/`steel-drum` anchor) that clears the SAME
+/// non-vacuous per-direction bar as the shipped gate. After a genuine, matrix-informed search (four
+/// pairs spanning the full source-chroma-separation range — see the sc-13714 evidence block above),
+/// NO fully-independent pair cleared the per-direction margin > 0.03 in BOTH directions: the shipped
+/// sitar/industrial pair sits in a narrow sweet spot (a distinctive peaky-tonal source vs a dark
+/// source whose chroma is distinctive-but-not-flat, separation ≈ 0.36) that an arbitrary independent
+/// pair does not hit. This is the story's explicitly-sanctioned outcome — the constraint is the
+/// ~80 bit/s FSQ semantic codec's ceiling, not a defect, so the gate is NOT weakened and no flaky
+/// pass is forced.
+///
+/// This harness RECORDS that finding reproducibly on a representative independent pair (koto/gamelan,
+/// two distinctive tonal instruments in different tuning systems). It asserts only the invariants that
+/// robustly HOLD — the covers are real, restyled, and the two sources are chroma-distinct — and PRINTS
+/// the per-direction margins so the shortfall is evidenced from code, not merely claimed. It does NOT
+/// assert the per-direction margin bar (which this independent pair does not meet); the shipped
+/// `acestep_cover_wav_conformance` remains the gate. Sources are generated deterministically from code
+/// (fixed seeds), so the evidence is reproducible, not an opaque committed blob.
+#[test]
+#[ignore = "real weights: needs ACE-Step snapshots (ACESTEP_SNAPSHOT / ACESTEP_SFT_SNAPSHOT); run with --ignored"]
+fn acestep_cover_chroma_independent_pair_constraint() {
+    let generator = load_cover_generator();
+
+    const TARGET_SECS: f32 = 6.0;
+    const STEPS: u32 = 8;
+    const COVER_SEED: u64 = 42;
+
+    let source_c = cover_source(
+        generator.as_ref(),
+        COVER_IND_SRC_C_PROMPT,
+        COVER_IND_SRC_C_SEED,
+        STEPS,
+        TARGET_SECS,
+    );
+    let source_d = cover_source(
+        generator.as_ref(),
+        COVER_IND_SRC_D_PROMPT,
+        COVER_IND_SRC_D_SEED,
+        STEPS,
+        TARGET_SECS,
+    );
+
+    let legs = cover_chroma_legs(
+        generator.as_ref(),
+        &source_c,
+        &source_d,
+        COVER_PROMPT,
+        COVER_SEED,
+        STEPS,
+    );
+    let agg_matched = 0.5 * (legs.matched_a + legs.matched_b);
+    let agg_mismatched = 0.5 * (legs.mismatched_a + legs.mismatched_b);
+    let agg_margin = agg_matched - agg_mismatched;
+
+    // Restyle proof on C -> its cover: regenerate cover C once for the waveform/timbre comparison.
+    let cover_c = match generator
+        .generate(
+            &GenerationRequest {
+                prompt: COVER_PROMPT.into(),
+                seed: Some(COVER_SEED),
+                steps: Some(STEPS),
+                audio: Some(AudioParams {
+                    sample_rate: Some(48_000),
+                    language: Some("en".into()),
+                    ..Default::default()
+                }),
+                conditioning: vec![Conditioning::AudioEdit {
+                    audio: source_c.clone(),
+                    mode: AudioEditMode::Cover,
+                    region: None,
+                    strength: None,
+                }],
+                ..Default::default()
+            },
+            &mut |_| {},
+        )
+        .expect("cover C generate")
+    {
+        GenerationOutput::Audio(t) => t,
+        other => panic!("expected audio, got {other:?}"),
+    };
+    let (sc, cc) = (mono(&source_c), mono(&cover_c));
+    let timbre_div = band_l1(&octave_band_dist(&sc), &octave_band_dist(&cc));
+    let n = sc.len().min(cc.len());
+    let wav_l2 = rel_l2(&sc[..n], &cc[..n]);
+    let wav_corr = corr(&sc[..n], &cc[..n]);
+    let rms_c = rms(&cc);
+
+    // Does this independent pair clear the shipped per-direction margin bar in BOTH directions?
+    let clears_bar = legs.margin_a() > CHROMA_PER_DIR_MARGIN_FLOOR
+        && legs.margin_b() > CHROMA_PER_DIR_MARGIN_FLOOR;
+    eprintln!(
+        "acestep_cover_chroma_independent_pair_constraint (sc-13714) — koto(C)/gamelan(D), sft cover DiT:\n  \
+         per-direction matched C {:.4} D {:.4} (floor {CHROMA_PER_DIR_MATCHED_FLOOR}) | margins C {:+.4} D {:+.4} (floor {CHROMA_PER_DIR_MARGIN_FLOOR})\n  \
+         aggregate matched {agg_matched:.4} - mismatched {agg_mismatched:.4} = margin {agg_margin:+.4} | srcC<->srcD chroma {:.4}\n  \
+         restyle C->coverC: timbre band-L1 {timbre_div:.4} | rel-L2 {wav_l2:.4} corr {wav_corr:.4} | cover-C rms {rms_c:.4}\n  \
+         => clears per-direction 0.03 bar in BOTH directions? {clears_bar} (RECORDED CONSTRAINT: an \
+         arbitrary independent pair does NOT — the shipped gate remains the sitar/industrial pair)",
+        legs.matched_a,
+        legs.matched_b,
+        legs.margin_a(),
+        legs.margin_b(),
+        legs.src_ab,
+    );
+
+    // Assert ONLY the invariants that robustly hold — this harness records a constraint, it is not a
+    // gate. (1) The pipeline produced a real, non-silent, genuinely restyled cover of an independent
+    // source (mirrors the shipped gate's timbre-change half): proves the failure to clear the margin
+    // bar is a SEMANTIC/FSQ-ceiling limit, not a broken cover. (2) The two independent sources are
+    // chroma-distinct, so the mismatched control is a meaningful one. We do NOT assert the
+    // per-direction margin bar — it is not met for any independent pair, by design of this finding.
+    assert!(
+        rms_c > 0.01,
+        "cover C is silent (rms {rms_c:.5}) — pipeline broken, not a codec limit"
+    );
+    assert!(
+        wav_l2 > 0.3,
+        "cover C waveform barely differs from source C (rel-L2 {wav_l2:.4}) — not a restyle"
+    );
+    assert!(
+        wav_corr < 0.9,
+        "cover C still highly correlated with source C (corr {wav_corr:.4})"
+    );
+    assert!(
+        timbre_div > 0.05,
+        "cover C timbre barely moved from source C (band-L1 {timbre_div:.4})"
+    );
+    assert!(
+        legs.src_ab < 0.85,
+        "independent sources C and D too tonally similar (chroma-corr {:.4}) — the mismatched control \
+         would be vacuous",
+        legs.src_ab,
     );
 }
