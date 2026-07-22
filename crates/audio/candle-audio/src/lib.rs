@@ -131,14 +131,37 @@ pub type Result<T> = std::result::Result<T, AudioError>;
 /// `default_device`. The audio lane ships CPU-first everywhere (the walking-skeleton models
 /// synthesize in real time on CPU — audio-backend-strategy.md); GPU device selection is a
 /// per-model implementation option behind the platform bundle's feature choice.
+///
+/// **Every call returns the same device instance.** On Metal this is load-bearing:
+/// `candle_core::Device::new_metal(0)` builds a *fresh, non-equal* `MetalDevice` each call, and
+/// candle compares Metal devices by instance identity — so a provider that resolves the device
+/// more than once (e.g. one that loads its sub-models from separate files) would land tensors on
+/// non-equal devices and cross-device ops like `conv1d` would `bail!` with a spurious "device
+/// mismatch" (sc-13922). `Device::Cpu` never hits this (all `Cpu` compare equal); the Metal device
+/// is therefore process-cached so the instance is shared regardless of how many times callers ask.
 pub fn default_device() -> Result<candle_core::Device> {
     #[cfg(feature = "cuda")]
     let dev = candle_core::Device::new_cuda(0)?;
     #[cfg(all(feature = "metal", not(feature = "cuda")))]
-    let dev = candle_core::Device::new_metal(0)?;
+    let dev = metal_device()?;
     #[cfg(not(any(feature = "cuda", feature = "metal")))]
     let dev = candle_core::Device::Cpu;
     Ok(dev)
+}
+
+/// The one process-wide Metal device (see [`default_device`] for why instance identity matters).
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+fn metal_device() -> Result<candle_core::Device> {
+    use std::sync::OnceLock;
+    static METAL: OnceLock<candle_core::Device> = OnceLock::new();
+    if let Some(dev) = METAL.get() {
+        return Ok(dev.clone());
+    }
+    let dev = candle_core::Device::new_metal(0)?;
+    // If another thread raced us to construct one, keep whichever landed first — either is a valid
+    // single shared instance; the point is that all callers converge on the same one.
+    let _ = METAL.set(dev);
+    Ok(METAL.get().expect("metal device just set").clone())
 }
 
 #[cfg(test)]
@@ -152,6 +175,28 @@ mod tests {
         let dev = default_device().expect("default device constructs");
         let t = candle_core::Tensor::zeros((2, 2), candle_core::DType::F32, &dev).expect("alloc");
         assert_eq!(t.dims(), &[2, 2]);
+    }
+
+    #[test]
+    fn default_device_is_a_single_shared_instance() {
+        // Two resolutions of the default device must be the SAME instance. candle compares Metal
+        // devices by identity, so tensors built from two separate `new_metal(0)` calls fail
+        // cross-device ops like the add below — exactly what broke the chatterbox full clone
+        // (`device mismatch in conv1d`, sc-13922). Trivially true on CPU; the load-bearing gate is
+        // a `--features metal` run, where the old per-call construction returned non-equal devices.
+        let a = default_device().expect("device a");
+        let b = default_device().expect("device b");
+        assert!(
+            a.same_device(&b),
+            "default_device() must hand out one shared instance"
+        );
+        let ta = candle_core::Tensor::zeros((2, 2), candle_core::DType::F32, &a).expect("alloc a");
+        let tb = candle_core::Tensor::ones((2, 2), candle_core::DType::F32, &b).expect("alloc b");
+        // The op-level device check (the one `conv1d` enforced) must accept both operands.
+        let sum = ta
+            .add(&tb)
+            .expect("cross-resolution add must stay on one device");
+        assert_eq!(sum.dims(), &[2, 2]);
     }
 
     #[test]
