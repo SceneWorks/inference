@@ -17,6 +17,9 @@
 //! - [`dsp`] — Hann windowing, forward STFT, and the inverse-STFT overlap-add
 //!   reconstruction an iSTFT-Net-style vocoder head needs (Kokoro / StyleTTS2,
 //!   sc-12836).
+//! - [`ops`] — tensor ops the providers share but candle's GPU backends leave
+//!   unimplemented, expressed in backend-portable primitives (nearest ×k upsample,
+//!   sc-13886 / sc-13691).
 //! - [`mel`] — HTK mel filterbank construction and application for mel-spectrogram
 //!   front-ends (reference-audio conditioning, model preprocessing parity).
 //! - [`wav`] — 16-bit PCM WAV encoding of a [`gen_core::AudioTrack`], the audio
@@ -47,6 +50,7 @@ use thiserror::Error;
 pub mod dsp;
 pub mod harness;
 pub mod mel;
+pub mod ops;
 pub mod wav;
 
 // Test-support helpers shared across the candle audio provider crates. Feature-gated so it never

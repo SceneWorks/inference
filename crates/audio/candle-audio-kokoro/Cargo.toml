@@ -53,10 +53,11 @@ default = []
 # …" (measured on this lane, sc-13039). Mirrors candle-audio-clap / candle-gen / candle-llm. Not
 # in `default` (the audio lane ships CPU-first everywhere; see
 # docs/architecture/audio-backend-strategy.md). NOTE: with this forward Kokoro's candle-nn ops
-# (incl. its biased AlBERT `candle_nn::LayerNorm`) DO run on Metal; its Mac blocker is instead the
-# iSTFT-Net vocoder's `upsample_nearest1d`, which candle-CORE's Metal backend leaves unimplemented
-# (hard bail in metal_backend) — so Kokoro stays CPU-only on Mac at the pinned candle rev until
-# that candle-core gap is closed (sc-13691).
+# (incl. its biased AlBERT `candle_nn::LayerNorm`) DO run on Metal. The iSTFT-Net vocoder used to be
+# blocked by candle-CORE's unimplemented `upsample_nearest1d` (a hard bail in metal_backend); that
+# dependency is now removed — the ×2 time upsample routes through the backend-agnostic, bit-identical
+# `candle_audio::ops::nearest_upsample1d` (sc-13886 CUDA / sc-13691 Metal). End-to-end Metal
+# validation of Kokoro on this candle rev is tracked by sc-13691 (must be verified on the Mac).
 metal = ["candle-audio/metal", "candle-nn/metal"]
 # NVIDIA CUDA backend — forwarded to the shared audio commons AND candle-nn (its CUDA kernels,
 # same rationale as `metal`). Not in `default`.
