@@ -252,12 +252,12 @@ jobs:
         run: |
           python -m pip install --disable-pip-version-check --target "%RUNNER_TEMP%\huggingface-hub" "huggingface_hub==1.20.1"
           set "PYTHONPATH=%RUNNER_TEMP%\huggingface-hub"
-          python scripts/release/ensure_model_snapshot.py --model z-image-turbo --snapshot "%Z_IMAGE_SNAPSHOT%"
+          python scripts/release/ensure_model_snapshot.py --model z-image-turbo --snapshot "%Z_IMAGE_SNAPSHOT%" || exit /b 1
       - name: Run provider conformance
         shell: cmd
         run: |
           call "%VCVARS%"
-          cargo test --locked -p candle-gen-z-image --features cuda --test conformance z_image_conformance -- --ignored --nocapture
+          cargo test --locked -p candle-gen-z-image --features cuda --test conformance z_image_conformance -- --ignored --nocapture || exit /b 1
 
   candle-sdxl:
     name: Candle SDXL real weights (CUDA)
