@@ -3,7 +3,7 @@
 //! A **contract conformance suite** for gen-core providers — the image/video/pure-audio
 //! [`gen_core::Generator`] (this module), [`gen_core::Trainer`](crate::trainer),
 //! [`gen_core::Captioner`](crate::captioner), and the audio-contract family (sc-12853):
-//! [`gen_core::Generator`] under [`Modality::Audio`](gen_core::Modality::Audio)
+//! [`gen_core::Generator`] under [`Modality::Audio`]
 //! ([`crate::audio_generator`]), [`gen_core::VoiceEmbedder`](crate::voice_embedder),
 //! [`gen_core::AudioTransform`](crate::audio_transform),
 //! [`gen_core::Transcriber`](crate::transcriber), and
@@ -83,7 +83,7 @@ pub use voice_embedder::{
 
 use gen_core::{
     Capabilities, Conditioning, Error, GenerationOutput, GenerationRequest, Generator, Image,
-    Progress,
+    Modality, Progress,
 };
 
 /// The lax `Progress::Step` monotonicity contract used by the captioner conformance checks (6942;
@@ -248,16 +248,27 @@ pub fn check_validate_honesty(g: &dyn Generator, profile: &Profile) -> Result<()
         }
     }
 
-    // Negative: a size above max_size must be rejected.
-    if let Some(big) = caps.max_size.checked_add(64) {
-        let mut r = base_request(profile);
-        r.width = big;
-        r.height = big;
-        if g.validate(&r).is_ok() {
-            return Err(format!(
-                "validate-honesty[{id}]: a {big}x{big} request (above max_size {}) was accepted by validate()",
-                caps.max_size
-            ));
+    // Negative: a size above max_size must be rejected — but only for providers whose contract
+    // includes a size axis. Audio-lane providers (Modality::Audio) legitimately do NOT range-check
+    // width/height: those fields are meaningless for audio, so a conformant audio model validates
+    // through the size-skipping floor (Capabilities::validate_request_audio) and advertises no size
+    // bound (min_size/max_size are the unused 0 — sc-13314). Probing max_size+64 (== 64x64 when
+    // max_size is 0) would misfire against that exemption — the provider correctly accepts it
+    // (sc-13705). The oversize check stays fully enforced for image/video providers, which always
+    // advertise a real max_size; an audio provider's own surface honesty is covered by the
+    // purpose-built audio_conformance suite (crate::audio_generator). This is the one entry point an
+    // audio family may share with the image suite (moss-sfx, acestep), so the exemption lives here.
+    if desc.modality != Modality::Audio {
+        if let Some(big) = caps.max_size.checked_add(64) {
+            let mut r = base_request(profile);
+            r.width = big;
+            r.height = big;
+            if g.validate(&r).is_ok() {
+                return Err(format!(
+                    "validate-honesty[{id}]: a {big}x{big} request (above max_size {}) was accepted by validate()",
+                    caps.max_size
+                ));
+            }
         }
     }
 
