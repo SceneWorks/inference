@@ -324,9 +324,10 @@ repository = "hkchengrex/MMAudio"
 revision = "eb13a1a98fdbec91753775c57b074ccdfc60587c"
 license = "MIT"
 size_class = "large"
-profiles = ["audio-macos"]
+profiles = ["audio-cuda"]
 environment = ["SYNCHFORMER_SNAPSHOT"]
 expected_files = ["ext_weights/synchformer_state_dict.pth"]
+download_files = ["ext_weights/synchformer_state_dict.pth"]
 
 [[models]]
 # MMAudio 16k mel-VAE decoder (sc-13440, epic sc-12833): the EDM2 magnitude-preserving +
@@ -340,9 +341,10 @@ repository = "hkchengrex/MMAudio"
 revision = "eb13a1a98fdbec91753775c57b074ccdfc60587c"
 license = "CC-BY-NC-4.0"
 size_class = "large"
-profiles = ["audio-macos"]
+profiles = ["audio-cuda"]
 environment = ["MMAUDIO_VAE_SNAPSHOT"]
 expected_files = ["ext_weights/v1-16.pth"]
+download_files = ["ext_weights/v1-16.pth"]
 
 [[models]]
 # MMAudio 16k BigVGAN vocoder (sc-13440, epic sc-12833): the Make-An-Audio-2 16k BigVGAN (anti-
@@ -355,9 +357,10 @@ repository = "hkchengrex/MMAudio"
 revision = "eb13a1a98fdbec91753775c57b074ccdfc60587c"
 license = "CC-BY-NC-4.0"
 size_class = "large"
-profiles = ["audio-macos"]
+profiles = ["audio-cuda"]
 environment = ["MMAUDIO_BIGVGAN_SNAPSHOT"]
 expected_files = ["ext_weights/best_netG.pt"]
+download_files = ["ext_weights/best_netG.pt"]
 [[models]]
 # DFN5B-CLIP ViT-H/14-384 (sc-13437, epic sc-12833): the CLIP model MMAudio conditions on — Apple's
 # open_clip ViT-H/14 quickgelu DFN5B variant, ported natively in candle-audio-mmaudio::clip. Visual
@@ -372,9 +375,10 @@ repository = "apple/DFN5B-CLIP-ViT-H-14-384"
 revision = "01b771ed0d1395ca5ffdd279897d665ebe00dfd2"
 license = "Apple Machine Learning Research Model License"
 size_class = "very-large"
-profiles = ["audio-macos"]
+profiles = ["audio-cuda"]
 environment = ["DFN_CLIP_SNAPSHOT"]
 expected_files = ["open_clip_pytorch_model.bin"]
+download_files = ["open_clip_pytorch_model.bin"]
 
 [[models]]
 # MMAudio MM-DiT flow-matching generator, small_16k (sc-13439, epic sc-12833): MMAudio's
@@ -392,9 +396,10 @@ repository = "hkchengrex/MMAudio"
 revision = "eb13a1a98fdbec91753775c57b074ccdfc60587c"
 license = "CC-BY-NC-4.0"
 size_class = "large"
-profiles = ["audio-macos"]
+profiles = ["audio-cuda"]
 environment = ["MMAUDIO_DIT_SNAPSHOT"]
 expected_files = ["weights/mmaudio_small_16k.pth"]
+download_files = ["weights/mmaudio_small_16k.pth"]
 
 [[models]]
 # MMAudio MM-DiT flow-matching generator, large_44k_v2 (sc-13441, epic sc-12833): MMAudio's 1.03B
@@ -407,9 +412,10 @@ repository = "hkchengrex/MMAudio"
 revision = "eb13a1a98fdbec91753775c57b074ccdfc60587c"
 license = "CC-BY-NC-4.0"
 size_class = "very-large"
-profiles = ["audio-macos"]
+profiles = ["audio-cuda"]
 environment = ["MMAUDIO_DIT_44K_SNAPSHOT"]
 expected_files = ["weights/mmaudio_large_44k_v2.pth"]
+download_files = ["weights/mmaudio_large_44k_v2.pth"]
 
 [[models]]
 # MMAudio 44k mel-VAE decoder (sc-13441, epic sc-12833): the 128-band / 40-d-latent Make-An-Audio-2 +
@@ -421,9 +427,10 @@ repository = "hkchengrex/MMAudio"
 revision = "eb13a1a98fdbec91753775c57b074ccdfc60587c"
 license = "CC-BY-NC-4.0"
 size_class = "large"
-profiles = ["audio-macos"]
+profiles = ["audio-cuda"]
 environment = ["MMAUDIO_VAE_44K_SNAPSHOT"]
 expected_files = ["ext_weights/v1-44.pth"]
+download_files = ["ext_weights/v1-44.pth"]
 
 [[models]]
 # NVIDIA BigVGAN v2 44 kHz vocoder (sc-13441, epic sc-12833): nvidia/bigvgan_v2_44khz_128band_512x —
@@ -437,9 +444,10 @@ repository = "nvidia/bigvgan_v2_44khz_128band_512x"
 revision = "95a9d1dcb12906c03edd938d77b9333d6ded7dfb"
 license = "MIT"
 size_class = "large"
-profiles = ["audio-macos"]
+profiles = ["audio-cuda"]
 environment = ["MMAUDIO_BIGVGAN_V2_SNAPSHOT"]
 expected_files = ["bigvgan_generator.pt"]
+download_files = ["bigvgan_generator.pt"]
 
 [[models]]
 # SDXL IP-Adapter-Plus ViT-H (sc-13963): the `ip-adapter-plus_sdxl_vit-h` weight bundle + the CLIP

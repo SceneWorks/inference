@@ -323,10 +323,57 @@ jobs:
           cargo test --locked -p candle-gen-sdxl --features cuda --release --lib ip_validate::real_weight_ip_adapter -- --ignored --nocapture || exit /b 1
           cargo test --locked -p candle-gen-sdxl --features cuda --release --test trainer_e2e sdxl_trainer_lora_trains_reloads_and_renders -- --ignored --nocapture || exit /b 1
 
-  # HELD (sc-13965): a candle-mmaudio CUDA job running candle-audio-mmaudio's
-  # `conformance_video_to_audio` (16k) + `conformance_video_to_audio_44k` real-weight cells is
-  # deferred pending a product/licensing decision — the MMAudio DiT/VAE are CC-BY-NC-4.0 and
-  # DFN5B-CLIP is under the Apple ML Research License (non-commercial/research), so they are not
-  # auto-run in scheduled CI without an explicit call. The render code is already proven (sc-13796);
-  # staging maps onto existing catalog keys via MMAUDIO_MMAUDIO_SNAPSHOT (hkchengrex/MMAudio) /
-  # MMAUDIO_CLIP_SNAPSHOT (apple/DFN5B) / MMAUDIO_BIGVGAN_SNAPSHOT (nvidia/bigvgan).
+  candle-mmaudio:
+    name: Candle mmaudio real weights (CUDA)
+    # mmaudio video->audio runs under the `audio` profile (on the CUDA runner — candle is CUDA/CPU).
+    # The MMAudio DiT/VAE (CC-BY-NC-4.0) + DFN5B-CLIP (Apple ML Research License) are research/non-
+    # commercial; SceneWorks is non-commercial and surfaces these licenses to the user (epic-12833
+    # decision), so running them in the regression guard is in-policy.
+    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio'
+    runs-on: [self-hosted, windows, cuda, real-weights]
+    env:
+      # Three per-repo snapshot dirs the video->audio harness resolves the 5 components from
+      # (tests/common/mod.rs): hkchengrex/MMAudio (synchformer + dit 16k/44k + vae 16k/44k + 16k
+      # vocoder), apple/DFN5B-CLIP (clip), nvidia/bigvgan (44k vocoder).
+      MMAUDIO_MMAUDIO_SNAPSHOT: ${{ vars.MMAUDIO_MMAUDIO_SNAPSHOT }}
+      MMAUDIO_CLIP_SNAPSHOT: ${{ vars.MMAUDIO_CLIP_SNAPSHOT }}
+      MMAUDIO_BIGVGAN_SNAPSHOT: ${{ vars.MMAUDIO_BIGVGAN_SNAPSHOT }}
+      MMAUDIO_WAV_OUT: ${{ runner.temp }}\mmaudio_foley_16k.wav
+      MMAUDIO_WAV_OUT_44K: ${{ runner.temp }}\mmaudio_foley_44k.wav
+      # 80 on the Ampere runner; set 120 on a Blackwell runner (matches the other CUDA jobs here).
+      CUDA_COMPUTE_CAP: "80"
+      CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
+      VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Select Git Bash
+        shell: cmd
+        run: |
+          if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
+          echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+        with:
+          toolchain: 1.96.0
+          components: rustfmt, clippy
+      - name: Materialize and verify immutable snapshots
+        shell: cmd
+        run: |
+          python -m pip install --disable-pip-version-check --target "%RUNNER_TEMP%\huggingface-hub" "huggingface_hub==1.20.1"
+          set "PYTHONPATH=%RUNNER_TEMP%\huggingface-hub"
+          rem hkchengrex/MMAudio is a 54 GB repo (~46 GB of training checkpoints + weight variants the
+          rem inference stack never loads); each catalog key carries a `download_files` allow-list so
+          rem only the pinned checkpoint is fetched (~8 GB across the six components into one dir).
+          python scripts/release/ensure_model_snapshot.py --model synchformer --snapshot "%MMAUDIO_MMAUDIO_SNAPSHOT%" || exit /b 1
+          python scripts/release/ensure_model_snapshot.py --model mmaudio-small-16k --snapshot "%MMAUDIO_MMAUDIO_SNAPSHOT%" || exit /b 1
+          python scripts/release/ensure_model_snapshot.py --model mmaudio-large-44k-v2 --snapshot "%MMAUDIO_MMAUDIO_SNAPSHOT%" || exit /b 1
+          python scripts/release/ensure_model_snapshot.py --model mmaudio-vae-16k --snapshot "%MMAUDIO_MMAUDIO_SNAPSHOT%" || exit /b 1
+          python scripts/release/ensure_model_snapshot.py --model mmaudio-vae-44k --snapshot "%MMAUDIO_MMAUDIO_SNAPSHOT%" || exit /b 1
+          python scripts/release/ensure_model_snapshot.py --model mmaudio-bigvgan-16k --snapshot "%MMAUDIO_MMAUDIO_SNAPSHOT%" || exit /b 1
+          python scripts/release/ensure_model_snapshot.py --model dfn5b-clip-vit-h14-384 --snapshot "%MMAUDIO_CLIP_SNAPSHOT%" || exit /b 1
+          python scripts/release/ensure_model_snapshot.py --model nvidia-bigvgan-v2-44khz-128band-512x --snapshot "%MMAUDIO_BIGVGAN_SNAPSHOT%" || exit /b 1
+      - name: Run mmaudio real-weight renders
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          cargo test --locked -p candle-audio-mmaudio --features cuda --release --test conformance_video_to_audio -- --ignored --nocapture || exit /b 1
+          cargo test --locked -p candle-audio-mmaudio --features cuda --release --test conformance_video_to_audio_44k -- --ignored --nocapture || exit /b 1

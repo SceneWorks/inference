@@ -101,6 +101,40 @@ class ModelSnapshotTests(unittest.TestCase):
                 ],
             )
 
+    def test_ensure_limits_download_to_download_files_allow_list(self) -> None:
+        model = {**MODEL, "download_files": ["config.json", "weights/model.safetensors"]}
+        with tempfile.TemporaryDirectory() as temporary:
+            snapshot = Path(temporary) / "materialized"
+            calls = []
+
+            def download(**kwargs) -> None:
+                calls.append(kwargs)
+                self.make_snapshot(Path(temporary), "materialized")
+
+            self.assertTrue(ensure_snapshot(model, snapshot, download))
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(
+                calls[0]["allow_patterns"],
+                ["config.json", "weights/model.safetensors"],
+            )
+            # The base kwargs are unchanged by the allow-list.
+            self.assertEqual(calls[0]["repo_id"], model["repository"])
+            self.assertEqual(calls[0]["revision"], model["revision"])
+            self.assertIs(calls[0]["token"], False)
+
+    def test_ensure_omits_allow_patterns_without_download_files(self) -> None:
+        # The default (no `download_files`) must NOT pass `allow_patterns` — the whole repo is fetched.
+        with tempfile.TemporaryDirectory() as temporary:
+            snapshot = Path(temporary) / "materialized"
+            calls = []
+
+            def download(**kwargs) -> None:
+                calls.append(kwargs)
+                self.make_snapshot(Path(temporary), "materialized")
+
+            self.assertTrue(ensure_snapshot(MODEL, snapshot, download))
+            self.assertNotIn("allow_patterns", calls[0])
+
     def test_ensure_repairs_an_incomplete_matching_revision(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             snapshot = Path(temporary) / MODEL["revision"]
