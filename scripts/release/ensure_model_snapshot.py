@@ -38,12 +38,22 @@ def ensure_snapshot(model: dict, snapshot: Path, download: Download) -> bool:
         f"materializing {model['repository']}@{model['revision']} in {snapshot.resolve()}",
         flush=True,
     )
-    download(
-        repo_id=model["repository"],
-        revision=model["revision"],
-        local_dir=str(snapshot),
-        token=False,
-    )
+    download_kwargs = {
+        "repo_id": model["repository"],
+        "revision": model["revision"],
+        "local_dir": str(snapshot),
+        "token": False,
+    }
+    # Optional per-model download allow-list. When set, materialize ONLY these repo-relative paths
+    # (snapshot_download `allow_patterns`) instead of the whole repo — for repos whose pinned
+    # checkpoints are a small fraction of a large repo (e.g. `hkchengrex/MMAudio` ships ~46 GB of
+    # training checkpoints + weight variants the inference stack never loads). Absent ⇒ whole-repo
+    # download, the default for every other model. `verify_snapshot` still enforces `expected_files`,
+    # so an under-fetch (a needed file left off the list) fails loudly right after download.
+    allow_patterns = model.get("download_files")
+    if allow_patterns:
+        download_kwargs["allow_patterns"] = list(allow_patterns)
+    download(**download_kwargs)
     (snapshot / MARKER).write_text(model["revision"] + "\n", encoding="utf-8")
     try:
         verify_snapshot(model, snapshot)
