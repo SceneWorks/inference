@@ -338,6 +338,13 @@ jobs:
       MMAUDIO_MMAUDIO_SNAPSHOT: ${{ vars.MMAUDIO_MMAUDIO_SNAPSHOT }}
       MMAUDIO_CLIP_SNAPSHOT: ${{ vars.MMAUDIO_CLIP_SNAPSHOT }}
       MMAUDIO_BIGVGAN_SNAPSHOT: ${{ vars.MMAUDIO_BIGVGAN_SNAPSHOT }}
+      # Standalone encoder conformance (sc-13474): the Synchformer + DFN5B-CLIP encoder tests read
+      # their OWN env vars. Point them at the SAME snapshots the video->audio provider tests already
+      # materialize above (no extra materialize step needed): synchformer resolves under
+      # <MMAUDIO_MMAUDIO_SNAPSHOT>/ext_weights/synchformer_state_dict.pth (model.rs::load), and the CLIP
+      # tower at <MMAUDIO_CLIP_SNAPSHOT>/open_clip_pytorch_model.bin (clip.rs::load).
+      SYNCHFORMER_SNAPSHOT: ${{ vars.MMAUDIO_MMAUDIO_SNAPSHOT }}
+      DFN_CLIP_SNAPSHOT: ${{ vars.MMAUDIO_CLIP_SNAPSHOT }}
       MMAUDIO_WAV_OUT: ${{ runner.temp }}\mmaudio_foley_16k.wav
       MMAUDIO_WAV_OUT_44K: ${{ runner.temp }}\mmaudio_foley_44k.wav
       # 80 on the Ampere runner; set 120 on a Blackwell runner (matches the other CUDA jobs here).
@@ -375,5 +382,9 @@ jobs:
         shell: cmd
         run: |
           call "%VCVARS%"
+          rem Standalone encoder conformance (sc-13474): the Synchformer sync encoder and the DFN5B-CLIP
+          rem visual+text tower — the two component encoders the video->audio pipeline below composes.
+          cargo test --locked -p candle-audio-mmaudio --features cuda --release --test conformance -- --ignored --nocapture || exit /b 1
+          cargo test --locked -p candle-audio-mmaudio --features cuda --release --test clip_conformance -- --ignored --nocapture || exit /b 1
           cargo test --locked -p candle-audio-mmaudio --features cuda --release --test conformance_video_to_audio -- --ignored --nocapture || exit /b 1
           cargo test --locked -p candle-audio-mmaudio --features cuda --release --test conformance_video_to_audio_44k -- --ignored --nocapture || exit /b 1
