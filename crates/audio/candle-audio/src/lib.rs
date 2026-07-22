@@ -132,16 +132,18 @@ pub type Result<T> = std::result::Result<T, AudioError>;
 /// synthesize in real time on CPU — audio-backend-strategy.md); GPU device selection is a
 /// per-model implementation option behind the platform bundle's feature choice.
 ///
-/// **Every call returns the same device instance.** On Metal this is load-bearing:
-/// `candle_core::Device::new_metal(0)` builds a *fresh, non-equal* `MetalDevice` each call, and
-/// candle compares Metal devices by instance identity — so a provider that resolves the device
-/// more than once (e.g. one that loads its sub-models from separate files) would land tensors on
-/// non-equal devices and cross-device ops like `conv1d` would `bail!` with a spurious "device
-/// mismatch" (sc-13922). `Device::Cpu` never hits this (all `Cpu` compare equal); the Metal device
-/// is therefore process-cached so the instance is shared regardless of how many times callers ask.
+/// **Every call returns the same device instance.** On both GPU backends this is load-bearing:
+/// `candle_core::Device::new_metal(0)` / `new_cuda(0)` each build a *fresh, non-equal* device
+/// (their `DeviceId` comes from a global counter, and candle's `same_device` compares by that
+/// per-instance id — see candle-core `metal_backend`/`cuda_backend`). So a provider that resolves
+/// the device more than once (e.g. one that loads its sub-models from separate files) would land
+/// tensors on non-equal devices, and cross-device ops like `conv1d` would `bail!` with a spurious
+/// "device mismatch" (sc-13922 on Metal; the identical CUDA twin behind sc-13886). `Device::Cpu`
+/// never hits this (all `Cpu` compare equal). Both GPU devices are therefore process-cached so the
+/// instance is shared regardless of how many times callers ask.
 pub fn default_device() -> Result<candle_core::Device> {
     #[cfg(feature = "cuda")]
-    let dev = candle_core::Device::new_cuda(0)?;
+    let dev = cuda_device()?;
     #[cfg(all(feature = "metal", not(feature = "cuda")))]
     let dev = metal_device()?;
     #[cfg(not(any(feature = "cuda", feature = "metal")))]
@@ -162,6 +164,23 @@ fn metal_device() -> Result<candle_core::Device> {
     // single shared instance; the point is that all callers converge on the same one.
     let _ = METAL.set(dev);
     Ok(METAL.get().expect("metal device just set").clone())
+}
+
+/// The one process-wide CUDA device (see [`default_device`] for why instance identity matters).
+/// Mirror of [`metal_device`]: candle's CUDA `DeviceId` is a per-construction global counter and
+/// `same_device` compares by it, so repeat `new_cuda(0)` calls are non-equal exactly like Metal.
+#[cfg(feature = "cuda")]
+fn cuda_device() -> Result<candle_core::Device> {
+    use std::sync::OnceLock;
+    static CUDA: OnceLock<candle_core::Device> = OnceLock::new();
+    if let Some(dev) = CUDA.get() {
+        return Ok(dev.clone());
+    }
+    let dev = candle_core::Device::new_cuda(0)?;
+    // If another thread raced us to construct one, keep whichever landed first — either is a valid
+    // single shared instance; the point is that all callers converge on the same one.
+    let _ = CUDA.set(dev);
+    Ok(CUDA.get().expect("cuda device just set").clone())
 }
 
 #[cfg(test)]
