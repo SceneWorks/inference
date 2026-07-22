@@ -440,3 +440,24 @@ size_class = "large"
 profiles = ["audio-macos"]
 environment = ["MMAUDIO_BIGVGAN_V2_SNAPSHOT"]
 expected_files = ["bigvgan_generator.pt"]
+
+[[models]]
+# SDXL IP-Adapter-Plus ViT-H (sc-13963): the `ip-adapter-plus_sdxl_vit-h` weight bundle + the CLIP
+# ViT-H image encoder the candle-gen-sdxl IP-Adapter real-weight harness (`ip_validate`) conditions
+# on. Pins the previously-unpinned h94/IP-Adapter download surfaced by the sc-13796 real-weight
+# render run (fetched from main; recorded here at the resolved revision). Materialize with
+# `ensure_model_snapshot.py --model ip-adapter-plus-sdxl-vit-h`, then point `IP_ADAPTER_SNAPSHOT` at
+# the snapshot dir — the harness derives IP_BUNDLE + IP_IMAGE_ENCODER from it (either can still be
+# overridden explicitly). Apache-2.0 (h94/IP-Adapter model-card license).
+key = "ip-adapter-plus-sdxl-vit-h"
+repository = "h94/IP-Adapter"
+revision = "018e402774aeeddd60609b4ecdb7e298259dc729"
+license = "Apache-2.0"
+size_class = "large"
+profiles = ["media-cuda"]
+environment = ["IP_ADAPTER_SNAPSHOT"]
+expected_files = [
+    "sdxl_models/ip-adapter-plus_sdxl_vit-h.safetensors",
+    "models/image_encoder/config.json",
+    "models/image_encoder/model.safetensors",
+]
