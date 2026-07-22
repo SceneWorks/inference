@@ -19,6 +19,7 @@
 //! tensors by [`crate::weights`].
 
 use candle_audio::candle_core::{Device, IndexOp, Tensor};
+use candle_audio::ops::nearest_upsample1d;
 use candle_audio::Result;
 use candle_nn::{
     conv1d, conv1d_no_bias, conv_transpose1d, linear, lstm, ops, Conv1d, Conv1dConfig,
@@ -237,8 +238,10 @@ impl AdainResBlk1d {
 
     fn shortcut(&self, x: &Tensor) -> Result<Tensor> {
         let x = if self.pool.is_some() {
-            let t = x.dim(2)?;
-            x.upsample_nearest1d(t * 2)?
+            // Nearest ×2 time upsample. candle's CUDA/Metal backends don't implement
+            // `upsample_nearest1d` (sc-13886 / sc-13691), so route through the backend-agnostic,
+            // bit-identical shared helper instead.
+            nearest_upsample1d(x, 2)?
         } else {
             x.clone()
         };
