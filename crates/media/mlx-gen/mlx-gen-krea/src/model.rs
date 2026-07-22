@@ -229,6 +229,13 @@ pub struct Krea {
     /// single-phase behavior); the multi-phase path clears + re-installs the phase subset on its clone,
     /// so the phase's adapter set is authoritative regardless of what was baked.
     adapters: Vec<AdapterSpec>,
+    /// `true` if any load-time adapter is a ComfyUI/lightx2v **diff-patch** (`.diff`/`.diff_b`), detected
+    /// from the adapter file headers at load (sc-13884). A diff-patch delta folds IRREVERSIBLY into the
+    /// dense base at load (`W += δ`); every job-local DiT clone inherits that mutated base, and
+    /// `clear_adapters` (which only drops low-rank residual stacks) cannot undo it — so a "base-only"
+    /// phase would silently carry the diff-patch. Multi-phase is therefore rejected loudly on such a
+    /// model (low-rank LoRA/LoKr — including the turbo LoRA — toggle cleanly and are unaffected).
+    has_diff_patch: bool,
 }
 
 /// The heavy render-phase components (the single-stream DiT + VAE, via [`KreaHeavy`], plus the optional
@@ -315,7 +322,21 @@ fn load_variant(spec: &LoadSpec, descriptor: ModelDescriptor) -> Result<Box<dyn 
         descriptor,
         residency,
         adapters: spec.adapters.clone(),
+        has_diff_patch: adapters_have_diff_patch(&spec.adapters),
     }))
+}
+
+/// Detect whether any load-time adapter is a ComfyUI/lightx2v **diff-patch** (`.diff`/`.diff_b`), read
+/// from each adapter file's safetensors HEADER only (no tensor load) — the sc-13884 multi-phase guard's
+/// input. Best-effort: a header we cannot read yields `false` here, but the same file is read for real
+/// by the load-time [`KreaHeavy::apply_adapters`], which surfaces the genuine error loudly — so an
+/// unreadable file never silently slips a diff-patch through into a wrong multi-phase render.
+fn adapters_have_diff_patch(specs: &[AdapterSpec]) -> bool {
+    specs.iter().any(|spec| {
+        mlx_gen::gen_core::weightsmeta::CheckpointMeta::from_file(&spec.path)
+            .map(|meta| mlx_gen::adapters::loader::has_diff_patch_key_names(meta.keys()))
+            .unwrap_or(false)
+    })
 }
 
 /// The policy→[`Residency`] dispatch every Krea variant shares (sc-11101; routed through the single
@@ -444,7 +465,11 @@ fn load_krea_heavy(
 }
 
 mlx_gen::impl_generator!(Krea {
-    validate: |s, req| validate_request(&s.descriptor, req),
+    validate: |s, req| {
+        validate_request(&s.descriptor, req)?;
+        // The load-time diff-patch guard needs `s` (the free `validate_request` can't see it).
+        ensure_multiphase_allowed_for(s.descriptor.id, s.has_diff_patch, req)
+    },
     generate: generate_impl,
 });
 
@@ -524,6 +549,9 @@ impl Krea {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         validate_request(&self.descriptor, req)?;
+        // Loud-reject a multi-phase request on a diff-patch model (sc-13884): its baked `.diff` delta
+        // can't be toggled off per phase, so it would silently corrupt "base-only" phases.
+        ensure_multiphase_allowed_for(self.descriptor.id, self.has_diff_patch, req)?;
         let base_seed = req.seed.unwrap_or_else(default_seed);
         // Variant read back off the descriptor id: Raw = full-CFG undistilled (52-step, dynamic-mu);
         // Turbo = CFG-free distilled (8-step, fixed mu). One `Krea` struct, two render paths. The edit
@@ -940,6 +968,30 @@ fn validate_phases(id: &str, req: &GenerationRequest) -> Result<()> {
                 "{id}: phase {i} must run at least one step"
             )));
         }
+    }
+    Ok(())
+}
+
+/// Reject a multi-phase (`phases`) request on a model loaded with a **diff-patch** adapter (sc-13884).
+/// The per-phase adapter toggle clears + re-installs low-rank residuals on a job-local DiT clone, but a
+/// `.diff`/`.diff_b` diff-patch delta folds irreversibly into the dense base at load (`W += δ`) — every
+/// clone inherits it and `clear_adapters` cannot undo it, so a "base-only" phase would silently carry
+/// the diff-patch (a wrong render, no error). Turn that silent-wrong into a loud reject. Low-rank
+/// LoRA/LoKr adapters — including the epic's rank-64 turbo LoRA — toggle cleanly and are allowed.
+/// Factored as a free fn (id + the load-time flag) so the reject is unit-testable without a loaded
+/// model. A no-op when `req.phases` is `None` or the model has no diff-patch adapter.
+fn ensure_multiphase_allowed_for(
+    id: &str,
+    has_diff_patch: bool,
+    req: &GenerationRequest,
+) -> Result<()> {
+    if req.phases.is_some() && has_diff_patch {
+        return Err(Error::Msg(format!(
+            "{id}: multi-phase denoise is not supported on a model loaded with a diff-patch \
+             (.diff/.diff_b) adapter — a diff-patch folds irreversibly into the base weights at load \
+             and cannot be toggled off for a base-only phase; load a low-rank LoRA/LoKr adapter for \
+             multi-phase"
+        )));
     }
     Ok(())
 }
@@ -1709,6 +1761,28 @@ mod tests {
             &phase_req(vec![phase(20, Some(3.5)), with_adapter])
         )
         .is_ok());
+    }
+
+    /// sc-13884 diff-patch guard: a multi-phase request on a model that had a `.diff`/`.diff_b`
+    /// diff-patch folded at load is REJECTED loudly (the baked delta can't be toggled off per phase);
+    /// a multi-phase request on a low-rank-only model (the epic's turbo-LoRA case) is ACCEPTED; and a
+    /// single-phase request on a diff-patch model is unaffected.
+    #[test]
+    fn multiphase_rejected_on_diff_patch_model_but_allowed_low_rank() {
+        let mp = phase_req(vec![phase(20, Some(3.5)), phase(8, Some(0.0))]);
+
+        // diff-patch folded at load → multi-phase rejected with the diff-patch error.
+        let err = ensure_multiphase_allowed_for(KREA_2_RAW_ID, true, &mp)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("diff-patch"), "{err}");
+        assert!(err.contains(".diff/.diff_b"), "{err}");
+
+        // Low-rank-only model (no diff-patch) → the same multi-phase request is allowed.
+        assert!(ensure_multiphase_allowed_for(KREA_2_RAW_ID, false, &mp).is_ok());
+
+        // A single-phase request on a diff-patch model is unaffected (the guard is phases-only).
+        assert!(ensure_multiphase_allowed_for(KREA_2_RAW_ID, true, &req(1024, 1024)).is_ok());
     }
 
     /// Multi-phase renders from pure noise — reference/edit conditioning and the PiD decoder are
