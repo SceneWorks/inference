@@ -379,14 +379,15 @@ pub struct GenerationPhase {
 }
 
 /// One adapter activated by a [`GenerationPhase`] (sc-13884): which load-time adapter it enables and,
-/// optionally, at what per-phase weight. The referenced adapter is loaded ONCE at model-load time
-/// (via [`crate::LoadSpec::adapters`]); a phase only toggles/rescales it, never re-loads weights.
+/// optionally, at what per-phase weight. The adapters are provisioned ONCE at model-load time (via
+/// [`crate::LoadSpec::adapters`]); a phase selects which of them are active and at what weight — so a
+/// two-phase job can run base-only, then base+adapter, without reloading the model.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PhaseAdapter {
     /// Index into the load-time adapter stack ([`crate::LoadSpec::adapters`], in the order the loader
     /// received them) this phase activates. Referencing by index keeps the request contract
     /// tensor-neutral and free of load paths — the consumer that provisioned the adapters knows their
-    /// order. Out-of-range is rejected by the model's `validate`.
+    /// order. An out-of-range index is rejected when the model resolves the phase list at generate.
     pub adapter: usize,
     /// Per-phase weight override for this adapter. `None` uses the adapter's load-time
     /// [`scale`](crate::AdapterSpec::scale); `Some(w)` scales its contribution to `w` for this phase

@@ -38,6 +38,15 @@ use mlx_gen::train::lora::LoraParams;
 use rope::RopeTables;
 
 /// The Krea 2 single-stream DiT.
+///
+/// `Clone` is a **shallow, refcounted** copy: MLX `Array`s are handles into shared device buffers,
+/// so cloning duplicates only the thin module/adapter-stack structs while the (large) weight tensors
+/// stay shared. This is what makes a **job-local DiT clone** cheap enough for the multi-phase render
+/// (epic 13879, sc-13884) to toggle its adapter stacks per phase (`clear_adapters` + a low-rank
+/// re-apply) without touching the shared resident DiT — the base weights are never mutated (adapters
+/// are forward-time residuals), so concurrent generates on the resident model are unaffected. The
+/// training path already relies on this shallow block clone (`SingleStreamBlock::clone` per step).
+#[derive(Clone)]
 pub struct Krea2Transformer {
     cfg: Krea2Config,
     dtype: Dtype,

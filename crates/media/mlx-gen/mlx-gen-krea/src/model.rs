@@ -11,10 +11,10 @@
 use mlx_gen::img2img::init_time_step;
 use mlx_gen::media::Image;
 use mlx_gen::{
-    curated_sampler_names, curated_scheduler_names, default_seed, Capabilities, Conditioning,
-    ConditioningKind, Error, GenerationOutput, GenerationRequest, Generator, LatentDecoder,
-    LoadSpec, Modality, ModelDescriptor, Precision, Progress, Quant, Residency, Result,
-    WeightsSource,
+    curated_sampler_names, curated_scheduler_names, default_seed, AdapterSpec, Capabilities,
+    Conditioning, ConditioningKind, Error, GenerationOutput, GenerationRequest, Generator,
+    LatentDecoder, LoadSpec, Modality, ModelDescriptor, Precision, Progress, Quant, Residency,
+    Result, WeightsSource,
 };
 use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidEngine};
 use mlx_gen_qwen_image::pipeline::PID_BACKBONE;
@@ -221,13 +221,14 @@ pub struct Krea {
     /// [`Residency`] seam owns the eval/drop/clear discipline, the stage-boundary cancel checks, and
     /// the error-safe cache flush.
     residency: Residency<KreaText, KreaHeavyOwned>,
-    /// How many LoRA/LoKr adapters this model was loaded with (`LoadSpec::adapters` count), retained
-    /// for multi-phase (sc-13884) request resolution: a phase's [`crate::multiphase::PhaseSlice`]-level
-    /// adapter references are bounds-checked against it, and it gates the v1 wired multi-phase scope
-    /// (per-phase guidance + step split over an adapter-free base — a model loaded WITH adapters can't
-    /// yet toggle them per phase in the shared `&self` generate path; the follow-on). The baked
-    /// adapters themselves live inside the DiT (`KreaHeavy`); this is just the count.
-    loaded_adapter_count: usize,
+    /// The LoRA/LoKr adapters this model was loaded with (`LoadSpec::adapters`), retained so the
+    /// multi-phase render (epic 13879, sc-13884) can install each phase's named subset on that phase's
+    /// job-local DiT clone. A phase references these by index (bounds-checked against `adapters.len()`),
+    /// with an optional per-phase weight override. Empty ⇒ a base (adapter-free) model, so only
+    /// base-only phases are valid. The adapters are ALSO baked into the resident DiT at load (unchanged
+    /// single-phase behavior); the multi-phase path clears + re-installs the phase subset on its clone,
+    /// so the phase's adapter set is authoritative regardless of what was baked.
+    adapters: Vec<AdapterSpec>,
 }
 
 /// The heavy render-phase components (the single-stream DiT + VAE, via [`KreaHeavy`], plus the optional
@@ -313,7 +314,7 @@ fn load_variant(spec: &LoadSpec, descriptor: ModelDescriptor) -> Result<Box<dyn 
     Ok(Box::new(Krea {
         descriptor,
         residency,
-        loaded_adapter_count: spec.adapters.len(),
+        adapters: spec.adapters.clone(),
     }))
 }
 
@@ -596,28 +597,19 @@ impl Krea {
 
         // Multi-phase denoise (epic 13879, sc-13884): resolve the phase list ONCE up-front so both the
         // text-encode phase (whether the unconditional context is needed) and the render phase drive
-        // from the same plan. `validate_phases` has already gated this to the Raw t2i variant, base-only
-        // phases, and no reference/PiD; here we resolve the contiguous schedule slices + per-phase
-        // guidance, and reject the (follow-on) case of a model loaded WITH adapters — which the shared
-        // `&self` generate path can't toggle per phase. `None` ⇒ the ordinary single-phase render below.
+        // from the same plan. `validate_phases` has already gated this to the Raw t2i variant (no
+        // reference/PiD, non-empty, ≥1-step); here we resolve the contiguous schedule slices, per-phase
+        // guidance, and per-phase adapter sets (indices bounds-checked against `self.adapters`). `None`
+        // ⇒ the ordinary single-phase render below.
         let mp_resolved: Option<Vec<ResolvedPhase>> = match req.phases.as_deref() {
             Some(list) if !list.is_empty() => {
                 let default_guidance = req.guidance.unwrap_or(DEFAULT_RAW_GUIDANCE);
-                let resolved = multiphase::resolve_phases(
+                Some(multiphase::resolve_phases(
                     list,
                     default_guidance,
-                    self.loaded_adapter_count,
+                    self.adapters.len(),
                     self.descriptor.id,
-                )?;
-                if self.loaded_adapter_count > 0 {
-                    return Err(Error::Msg(format!(
-                        "{}: multi-phase denoise over a model loaded with {} adapter(s) is the \
-                         sc-13884 follow-on (per-phase adapter toggling needs a job-local DiT); load \
-                         without adapters for v1 multi-phase (per-phase guidance + step split)",
-                        self.descriptor.id, self.loaded_adapter_count
-                    )));
-                }
-                Some(resolved)
+                )?)
             }
             _ => None,
         };
@@ -683,13 +675,16 @@ impl Krea {
                 let decoder = pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder);
 
                 // Multi-phase render (epic 13879, sc-13884): drive the resolved phases over the ONE
-                // global schedule, per-phase guidance selecting the true-CFG (two-forward) or CFG-off
-                // (single-forward) body, sharing the latent + sigma trajectory across every boundary.
-                // Reuses the hoisted `T2iPlan` (prep_neg present iff any phase uses CFG, via the
-                // `encode_guidance` gate) and the count loop (one image per seed). Returns before the
-                // single-phase dispatch below.
+                // global schedule — per-phase guidance selecting the true-CFG (two-forward) or CFG-off
+                // (single-forward) body, AND per-phase adapters toggled on that phase's own job-local
+                // DiT clone — sharing the latent + sigma trajectory across every boundary. The per-phase
+                // plans (clone + adapters + prep) are built ONCE here (`prep_neg` present per phase iff
+                // that phase uses CFG, backed by the `encode_guidance` neg-context gate) and reused
+                // across the count loop (one image per seed). Returns before the single-phase dispatch.
                 if let (Some(resolved), Some(full)) = (mp_resolved.as_ref(), mp_sigmas.as_ref()) {
-                    let plan = heavy.heavy.prepare_t2i(
+                    let plans = heavy.heavy.prepare_multiphase(
+                        resolved,
+                        &self.adapters,
                         &ctx.pos,
                         ctx.neg.as_ref(),
                         req.width,
@@ -705,9 +700,8 @@ impl Krea {
                             sampler: req.sampler.clone(),
                             scheduler: req.scheduler.clone(),
                         };
-                        images.push(heavy.heavy.render_multiphase_from(
-                            &plan,
-                            resolved,
+                        images.push(heavy.heavy.render_multiphase(
+                            &plans,
                             full,
                             &opts,
                             decoder,
@@ -904,17 +898,17 @@ pub(crate) fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) 
     Ok(())
 }
 
-/// Multi-phase request validation (epic 13879, sc-13884). The v1 wired scope is the **Raw t2i**
-/// variant only: an ordered phase list run from pure noise over ONE global schedule, each phase a
-/// contiguous step slice with its own guidance (per-phase CFG on/off). Rejects, loudly:
+/// Multi-phase request validation (epic 13879, sc-13884). Multi-phase is the **Raw t2i** variant only:
+/// an ordered phase list run from pure noise over ONE global schedule, each phase a contiguous step
+/// slice with its own guidance (per-phase CFG on/off) AND its own adapter set (per-phase LoRA/LoKr
+/// toggling — the "N steps Raw + M steps Raw+turbo-LoRA" workflow). Rejects, loudly:
 /// - phases on any non-Raw variant (Turbo is CFG-free single-phase; edit/control are out of scope);
 /// - phases combined with reference/edit conditioning or the PiD decoder (t2i-from-noise only in v1);
-/// - an empty phase list or a 0-step phase (a malformed trajectory);
-/// - **per-phase adapters** — the in-place `set_adapters` swap between phases needs a job-local `&mut`
-///   DiT (the shared `Generator::generate(&self)` path can't safely mutate a `Resident` DiT), so it is
-///   the sc-13884 follow-on. v1 wires per-phase guidance + step split over the (adapter-free) base.
+/// - an empty phase list or a 0-step phase (a malformed trajectory).
 ///
-/// A no-op when `req.phases` is `None` (the ordinary single-phase render).
+/// Per-phase **adapter index bounds** (against the model's loaded adapter set) are checked at
+/// `generate` time by [`crate::multiphase::resolve_phases`] (the count isn't on the descriptor). A
+/// no-op when `req.phases` is `None` (the ordinary single-phase render).
 fn validate_phases(id: &str, req: &GenerationRequest) -> Result<()> {
     let Some(phases) = req.phases.as_ref() else {
         return Ok(());
@@ -944,13 +938,6 @@ fn validate_phases(id: &str, req: &GenerationRequest) -> Result<()> {
         if ph.steps == 0 {
             return Err(Error::Msg(format!(
                 "{id}: phase {i} must run at least one step"
-            )));
-        }
-        if !ph.adapters.is_empty() {
-            return Err(Error::Msg(format!(
-                "{id}: per-phase adapters are not yet wired into the shared generate path (sc-13884 \
-                 follow-on); v1 multi-phase supports per-phase guidance + step split over the base \
-                 (adapter-free) model — use base-only phases"
             )));
         }
     }
@@ -1704,9 +1691,11 @@ mod tests {
         );
     }
 
-    /// Per-phase adapters are the sc-13884 follow-on — a phase naming an adapter is rejected loudly.
+    /// Per-phase adapters are WIRED (sc-13884): the flagship "N steps Raw (CFG on) + M steps
+    /// Raw+turbo-LoRA (CFG off)" request VALIDATES (no longer rejected). The adapter-index bounds check
+    /// runs at `generate` time (`resolve_phases`), not here — see the multiphase resolver tests.
     #[test]
-    fn multiphase_rejects_per_phase_adapters() {
+    fn multiphase_accepts_per_phase_adapters() {
         let with_adapter = mlx_gen::GenerationPhase {
             steps: 8,
             guidance: Some(0.0),
@@ -1715,16 +1704,11 @@ mod tests {
                 weight: Some(1.0),
             }],
         };
-        let err = validate_request(
+        assert!(validate_request(
             &raw_descriptor(),
-            &phase_req(vec![phase(20, Some(3.5)), with_adapter]),
+            &phase_req(vec![phase(20, Some(3.5)), with_adapter])
         )
-        .unwrap_err()
-        .to_string();
-        assert!(
-            err.contains("per-phase adapters are not yet wired"),
-            "{err}"
-        );
+        .is_ok());
     }
 
     /// Multi-phase renders from pure noise — reference/edit conditioning and the PiD decoder are

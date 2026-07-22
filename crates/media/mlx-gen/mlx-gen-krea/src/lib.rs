@@ -73,10 +73,11 @@ pub use model::{
 };
 pub use model_control::{KreaTurboControl, KREA_2_TURBO_CONTROL_ID};
 pub use multiphase::{
-    any_phase_uses_cfg, phase_uses_cfg, resolve_phase_adapters, resolve_phase_slices,
-    resolve_phases, total_phase_steps, PhaseSlice, ResolvedPhase, ResolvedPhaseAdapter,
+    any_phase_uses_cfg, phase_spec_subset, phase_uses_cfg, resolve_phase_adapters,
+    resolve_phase_slices, resolve_phases, total_phase_steps, PhaseSlice, ResolvedPhase,
+    ResolvedPhaseAdapter,
 };
-pub use pipeline::{KreaHeavy, KreaPipeline, KreaText, TurboOptions};
+pub use pipeline::{KreaHeavy, KreaPipeline, KreaText, MultiPhasePlan, TurboOptions};
 pub use schedule::{krea_sigmas, turbo_sigmas, TURBO_MU, TURBO_STEPS};
 pub use text_encoder::{KreaTeConfig, KreaTextEncoder, KreaTokenizer};
 pub use training::{load_trainer, KreaRawTrainer, KREA_2_RAW_TRAINER_ID};

@@ -27,7 +27,7 @@
 //! resolved plan and drives `run_flow_sampler` over each slice from the running latent, selecting the
 //! two-forward (CFG) or single-forward body per phase — the only GPU-bound part.
 
-use mlx_gen::{Error, GenerationPhase, Result};
+use mlx_gen::{AdapterSpec, Error, GenerationPhase, Result};
 
 /// A contiguous slice of the ONE shared global sigma schedule owned by one phase — an **inclusive**
 /// index range `[start, end]` into a schedule of length `total_steps + 1`. Running the flow sampler
@@ -188,10 +188,34 @@ pub fn resolve_phases(
     Ok(resolved)
 }
 
+/// The concrete [`AdapterSpec`] subset a phase installs on its job-local DiT (epic 13879, sc-13884):
+/// for each of the phase's resolved adapters, the corresponding load-time [`AdapterSpec`] with its
+/// per-phase weight override folded into [`AdapterSpec::scale`] (`None` ⇒ the load-time scale). An
+/// **empty** result is a base-only phase (the DiT clone is cleared and nothing re-installed).
+///
+/// This is the driver's per-phase adapter *selection* — the "which adapters, at what scale, this phase"
+/// decision — factored out of [`crate::pipeline::KreaHeavy::prepare_multiphase`] so it is unit-testable
+/// without a loaded DiT. **Precondition:** the phase's adapter indices were resolved against `all_specs`
+/// (same length / order), so every `index` is in range — [`resolve_phase_adapters`] guarantees this.
+pub fn phase_spec_subset(phase: &ResolvedPhase, all_specs: &[AdapterSpec]) -> Vec<AdapterSpec> {
+    phase
+        .adapters
+        .iter()
+        .map(|a| {
+            let mut spec = all_specs[a.index].clone();
+            if let Some(w) = a.weight {
+                spec.scale = w;
+            }
+            spec
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mlx_gen::PhaseAdapter;
+    use mlx_gen::{AdapterKind, PhaseAdapter};
+    use std::path::PathBuf;
 
     fn phase(steps: u32, guidance: Option<f32>, adapters: Vec<PhaseAdapter>) -> GenerationPhase {
         GenerationPhase {
@@ -409,5 +433,81 @@ mod tests {
             }]
         );
         assert!(any_phase_uses_cfg(&resolved));
+    }
+
+    /// The driver's per-phase adapter *selection*: a base-only phase installs NO specs; a phase installs
+    /// exactly its named load-time specs, with a per-phase weight override replacing the load-time scale
+    /// (and `None` keeping it). This is the "right adapter stack per phase" decision the multi-phase
+    /// render (`prepare_multiphase`) uses — exercised here without a loaded DiT.
+    #[test]
+    fn phase_spec_subset_selects_and_reweights() {
+        // Two load-time adapters (as if from `LoadSpec::adapters`): #0 the turbo LoRA @0.9, #1 a LoKr @1.0.
+        let all = vec![
+            AdapterSpec::new(
+                PathBuf::from("/turbo_lora.safetensors"),
+                0.9,
+                AdapterKind::Lora,
+            ),
+            AdapterSpec::new(PathBuf::from("/style.safetensors"), 1.0, AdapterKind::Lokr),
+        ];
+        // Resolve a Raw→Raw+turboLoRA split: phase 0 base-only; phase 1 turbo LoRA (#0) @ weight 0.7.
+        let resolved = resolve_phases(
+            &[
+                phase(20, Some(3.5), vec![]),
+                phase(
+                    8,
+                    Some(0.0),
+                    vec![PhaseAdapter {
+                        adapter: 0,
+                        weight: Some(0.7),
+                    }],
+                ),
+            ],
+            3.5,
+            all.len(),
+            "krea_2_raw",
+        )
+        .unwrap();
+
+        // Phase 0 (base-only) → no specs installed.
+        assert!(phase_spec_subset(&resolved[0], &all).is_empty());
+
+        // Phase 1 → exactly load-time adapter #0, its scale overridden to the phase weight 0.7.
+        let sub = phase_spec_subset(&resolved[1], &all);
+        assert_eq!(sub.len(), 1);
+        assert_eq!(sub[0].path, PathBuf::from("/turbo_lora.safetensors"));
+        assert_eq!(sub[0].kind, AdapterKind::Lora);
+        assert_eq!(
+            sub[0].scale, 0.7,
+            "per-phase weight replaces the load-time scale"
+        );
+
+        // A `None` weight keeps the load-time scale, and multiple adapters resolve in order.
+        let both = resolve_phases(
+            &[phase(
+                8,
+                Some(0.0),
+                vec![
+                    PhaseAdapter {
+                        adapter: 1,
+                        weight: None,
+                    },
+                    PhaseAdapter {
+                        adapter: 0,
+                        weight: Some(0.5),
+                    },
+                ],
+            )],
+            3.5,
+            all.len(),
+            "krea_2_raw",
+        )
+        .unwrap();
+        let sub = phase_spec_subset(&both[0], &all);
+        assert_eq!(sub.len(), 2);
+        assert_eq!(sub[0].scale, 1.0, "None keeps the load-time scale");
+        assert_eq!(sub[0].kind, AdapterKind::Lokr);
+        assert_eq!(sub[1].scale, 0.5);
+        assert_eq!(sub[1].kind, AdapterKind::Lora);
     }
 }
