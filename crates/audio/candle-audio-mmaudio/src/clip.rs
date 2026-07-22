@@ -359,11 +359,7 @@ impl DfnClipEncoder {
     /// `encode_image(x, normalize=True)`.
     pub fn encode_image(&self, pixels: &Tensor) -> CResult<Tensor> {
         let hs = self.visual.hidden_states(pixels)?; // (B, 730, width)
-
-        // `.contiguous()`: the CLS-token slice is a strided view (its row stride is the full 730*width
-        // token stride), which candle's CUDA `matmul` rejects as a non-contiguous lhs (sc-13888). It is
-        // a no-op on already-contiguous tensors and bit-identical across CPU/Metal/CUDA.
-        let pooled = hs.i((.., 0, ..))?.contiguous()?; // CLS token, (B, width)
+        let pooled = cls_pool(&hs)?; // CLS token, (B, width) — contiguous for the visual.proj matmul
         let projected = pooled.matmul(&self.visual.proj)?; // (B, 1024)
         l2_normalize(&projected)
     }
@@ -396,6 +392,18 @@ impl DfnClipEncoder {
         let x = self.text.ln_final.forward(&x)?;
         l2_normalize(&x)
     }
+}
+
+/// CLS-pool the ViT hidden states `(B, L, width)` → the CLS token `(B, width)`.
+///
+/// The `.contiguous()` is load-bearing: the CLS-token slice `hs[:, 0, :]` is a strided view (its row
+/// stride is the full `L·width` token span), and candle's CUDA `matmul` rejects a non-contiguous
+/// **lhs** — which is exactly how [`DfnClipEncoder::encode_image`] then uses this tensor against the
+/// `visual.proj` weight (sc-13888). It is a no-op on already-contiguous tensors and bit-identical
+/// across CPU/Metal/CUDA. `is_contiguous()` is a device-independent layout property, so the returned
+/// tensor's contiguity is regression-tested on the default CPU lane (see `tests::cls_pool_*`).
+fn cls_pool(hs: &Tensor) -> CResult<Tensor> {
+    hs.i((.., 0, ..))?.contiguous()
 }
 
 /// L2-normalize along the last dim (open_clip `F.normalize(x, dim=-1)`).
@@ -858,6 +866,33 @@ mod tests {
             Err(e) => e,
         };
         assert!(err.to_string().contains("not found"));
+    }
+
+    /// sc-13932 (guards the sc-13888 fix): [`cls_pool`] must return a **contiguous** tensor — it is
+    /// the lhs of the `visual.proj` matmul in [`DfnClipEncoder::encode_image`], and candle's CUDA
+    /// `matmul` rejects a non-contiguous lhs. `is_contiguous()` is a device-independent layout
+    /// property, so this runs on the default CPU lane (no ViT forward / weights needed) and flips
+    /// **RED** if the `.contiguous()` is dropped from `cls_pool`.
+    #[test]
+    fn cls_pool_is_contiguous_for_proj_matmul() {
+        let dev = Device::Cpu;
+        // A contiguous `(B, L, width)` parent; its CLS slice `hs[:, 0, :]` is therefore strided
+        // (row stride = L*width != width), which is precisely the operand candle's CUDA matmul rejects.
+        let hs = Tensor::zeros((2, NUM_POSITIONS, VISION_WIDTH), DType::F32, &dev).unwrap();
+        assert!(
+            !hs.i((.., 0, ..)).unwrap().is_contiguous(),
+            "precondition: the raw CLS slice must be strided (else the test proves nothing)"
+        );
+        let pooled = cls_pool(&hs).unwrap();
+        assert_eq!(
+            pooled.dims(),
+            &[2, VISION_WIDTH],
+            "CLS-pooled to (B, width)"
+        );
+        assert!(
+            pooled.is_contiguous(),
+            "sc-13888/sc-13932: cls_pool must return a contiguous tensor (the visual.proj matmul lhs)"
+        );
     }
 
     #[test]
