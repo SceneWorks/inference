@@ -665,7 +665,7 @@ impl KreaHeavy {
     /// **Multi-phase Raw render from a hoisted plan** (epic 13879, sc-13884) — drive an ordered list of
     /// [`ResolvedPhase`]s within ONE denoise trajectory over ONE coherent global schedule, then decode
     /// once. The `full` schedule is built ONCE for the TOTAL step budget (the sum of the phases' steps);
-    /// each phase runs [`Self::denoise_phase_from`] over its contiguous slice `full[start..=end]` from
+    /// each phase runs `denoise_phase_from` over its contiguous slice `full[start..=end]` from
     /// the running latent, so the latent and sigma flow continuously across every boundary (the crux —
     /// no per-phase schedule and hence no seam/reset). Per-phase guidance selects the true-CFG
     /// (two-forward) or CFG-off (single-forward) body; `plan.prep_neg` is present iff **any** phase uses
@@ -674,7 +674,7 @@ impl KreaHeavy {
     /// **Adapter scope (v1, sc-13884 Phase A).** The phases' resolved adapter sets
     /// ([`ResolvedPhase::adapters`]) are validated + carried, but this `&self` render runs them over the
     /// DiT's already-installed (load-time) adapter stack — it does not swap adapters *between* phases,
-    /// which requires the in-place `&mut` [`Krea2Transformer::set_phase_adapters`] seam and a job-local
+    /// which requires the in-place `&mut` [`Self::set_phase_adapters`] seam and a job-local
     /// (non-shared) DiT. The caller (`crate::model`) therefore only routes phase lists whose adapter
     /// state is uniform across phases here; per-phase adapter *toggling* is the follow-on integration
     /// (see the module + `set_phase_adapters` docs). Per-phase **guidance + step split** over the shared
