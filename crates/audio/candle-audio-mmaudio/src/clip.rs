@@ -359,7 +359,11 @@ impl DfnClipEncoder {
     /// `encode_image(x, normalize=True)`.
     pub fn encode_image(&self, pixels: &Tensor) -> CResult<Tensor> {
         let hs = self.visual.hidden_states(pixels)?; // (B, 730, width)
-        let pooled = hs.i((.., 0, ..))?; // CLS token, (B, width)
+
+        // `.contiguous()`: the CLS-token slice is a strided view (its row stride is the full 730*width
+        // token stride), which candle's CUDA `matmul` rejects as a non-contiguous lhs (sc-13888). It is
+        // a no-op on already-contiguous tensors and bit-identical across CPU/Metal/CUDA.
+        let pooled = hs.i((.., 0, ..))?.contiguous()?; // CLS token, (B, width)
         let projected = pooled.matmul(&self.visual.proj)?; // (B, 1024)
         l2_normalize(&projected)
     }

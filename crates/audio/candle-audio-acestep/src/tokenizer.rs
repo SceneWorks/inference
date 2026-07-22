@@ -283,7 +283,10 @@ impl AttentionPooler {
             x = l.forward(&x)?;
         }
         let x = self.norm.forward(&x)?;
-        x.narrow(1, 0, 1)?.squeeze(1) // the query token: [num_patches, hidden]
+        // `.contiguous()`: `narrow`+`squeeze` yields a strided view (row stride = full window+1 span),
+        // which candle's CUDA `matmul` rejects as a non-contiguous lhs in the FSQ `project_in`
+        // (sc-13888). No-op on already-contiguous tensors; bit-identical across CPU/Metal/CUDA.
+        x.narrow(1, 0, 1)?.squeeze(1)?.contiguous() // the query token: [num_patches, hidden]
     }
 }
 
@@ -586,5 +589,34 @@ mod tests {
                 levels[d]
             );
         }
+    }
+
+    /// sc-13888 regression: the pooler's query token is the **lhs** of the FSQ `project_in` matmul
+    /// (`ResidualFsq::forward`). `narrow`+`squeeze` yields a strided view, which candle's CUDA
+    /// `matmul` rejects as a non-contiguous lhs. `AttentionPooler::forward` must return it
+    /// contiguous. Contiguity is a device-independent layout property, so this guards the fix on the
+    /// default CPU test lane — it goes RED if the trailing `.contiguous()` in `forward` is removed.
+    /// Weight VALUES are irrelevant to a layout assertion, so a zero-initialized `VarMap` suffices.
+    #[test]
+    fn pooler_query_token_is_contiguous_for_fsq_matmul() {
+        use candle_nn::VarMap;
+        let dev = Device::Cpu;
+        let cfg = cfg();
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &dev);
+        let pooler = AttentionPooler::new(&cfg, vb.pp("attention_pooler")).expect("build pooler");
+        // The pooler input is the post-projection windows batch: [num_patches, pool_window, hidden].
+        let windows =
+            Tensor::zeros((3, cfg.pool_window_size, cfg.hidden_size), DType::F32, &dev).unwrap();
+        let q = pooler.forward(&windows).expect("pooler forward");
+        assert_eq!(
+            q.dims(),
+            &[3, cfg.hidden_size],
+            "query token is [num_patches, hidden]"
+        );
+        assert!(
+            q.is_contiguous(),
+            "sc-13888: the pooler query token must be contiguous (it is the FSQ project_in matmul lhs)"
+        );
     }
 }
