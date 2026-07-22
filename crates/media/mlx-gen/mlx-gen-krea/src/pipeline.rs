@@ -45,6 +45,7 @@ use std::path::PathBuf;
 
 use crate::control::Krea2ControlBranch;
 use crate::loader::{load_text_encoder, load_transformer, load_vision_tower};
+use crate::multiphase::ResolvedPhase;
 use crate::schedule::{dynamic_mu, krea_sigmas, turbo_sigmas, TURBO_MU};
 use crate::text_encoder::{
     encode_grounded_from_vision, run_vision, GroundedVision, KreaTextEncoder, KreaTokenizer,
@@ -607,6 +608,129 @@ impl KreaHeavy {
 
         on_progress(Progress::Decoding);
         self.decode_latents(&lat, decoder)
+    }
+
+    /// **Denoise ONE phase** of a multi-phase trajectory (epic 13879, sc-13884) — the reusable
+    /// primitive: run the rectified-flow Euler sampler over a **contiguous sub-slice** of the ONE
+    /// shared global sigma schedule, starting from the RUNNING `latent` (the prior phase's output, or
+    /// the initial noise for phase 0), and return the resulting latent — **no decode**. This is exactly
+    /// the [`Self::render_base_from`] denoise body factored out of its schedule-build/decode, so a phase
+    /// is just "resume the schedule from here for this window". Per-phase `guidance > 0` runs the
+    /// true-CFG two-forward path (`plan.prep_neg` must be present — it is, whenever any phase uses CFG);
+    /// `guidance == 0` collapses to a single conditional forward, identical to the Raw path's own CFG
+    /// branch. `sub_sigmas` is `full[phase.start..=phase.end]`; because the phases share boundary
+    /// indices, `sub_sigmas[0]` is the sigma the prior phase reached — the latent and trajectory
+    /// continue seamlessly, never resetting.
+    #[allow(clippy::too_many_arguments)]
+    fn denoise_phase_from(
+        &self,
+        plan: &T2iPlan,
+        guidance: f32,
+        sub_sigmas: &[f32],
+        sampler: Option<&str>,
+        latent: Array,
+        seed: u64,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Array> {
+        run_flow_sampler(
+            sampler,
+            TimestepConvention::Sigma,
+            sub_sigmas,
+            latent,
+            seed,
+            cancel,
+            on_progress,
+            |x, timestep| {
+                let t = Array::from_slice(&[timestep], &[1]);
+                let cond = self.dit.forward_prepared(x, &t, &plan.prep_pos)?;
+                let v = if guidance > 0.0 {
+                    let neg = plan.prep_neg.as_ref().ok_or_else(|| {
+                        mlx_gen::Error::Msg(
+                            "krea_2 multi-phase: a CFG phase (guidance > 0) requires the \
+                             unconditional prep, but the plan was built without one"
+                                .into(),
+                        )
+                    })?;
+                    let uncond = self.dit.forward_prepared(x, &t, neg)?;
+                    krea_cfg_combine(&cond, &uncond, guidance)?
+                } else {
+                    cond
+                };
+                Ok(v.as_dtype(Dtype::Float32)?)
+            },
+        )
+    }
+
+    /// **Multi-phase Raw render from a hoisted plan** (epic 13879, sc-13884) — drive an ordered list of
+    /// [`ResolvedPhase`]s within ONE denoise trajectory over ONE coherent global schedule, then decode
+    /// once. The `full` schedule is built ONCE for the TOTAL step budget (the sum of the phases' steps);
+    /// each phase runs [`Self::denoise_phase_from`] over its contiguous slice `full[start..=end]` from
+    /// the running latent, so the latent and sigma flow continuously across every boundary (the crux —
+    /// no per-phase schedule and hence no seam/reset). Per-phase guidance selects the true-CFG
+    /// (two-forward) or CFG-off (single-forward) body; `plan.prep_neg` is present iff **any** phase uses
+    /// CFG (the caller builds the plan that way).
+    ///
+    /// **Adapter scope (v1, sc-13884 Phase A).** The phases' resolved adapter sets
+    /// ([`ResolvedPhase::adapters`]) are validated + carried, but this `&self` render runs them over the
+    /// DiT's already-installed (load-time) adapter stack — it does not swap adapters *between* phases,
+    /// which requires the in-place `&mut` [`Krea2Transformer::set_phase_adapters`] seam and a job-local
+    /// (non-shared) DiT. The caller (`crate::model`) therefore only routes phase lists whose adapter
+    /// state is uniform across phases here; per-phase adapter *toggling* is the follow-on integration
+    /// (see the module + `set_phase_adapters` docs). Per-phase **guidance + step split** over the shared
+    /// schedule is fully wired.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_multiphase_from(
+        &self,
+        plan: &T2iPlan,
+        phases: &[ResolvedPhase],
+        full: &[f32],
+        opts: &TurboOptions,
+        decoder: Option<&dyn LatentDecoder>,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
+        // Phase 0 starts from the initial noise at full[0]; each subsequent phase resumes from the
+        // prior phase's output latent at the SHARED boundary sigma.
+        let mut latent = init_noise(opts.height, opts.width, opts.seed)?;
+        for phase in phases {
+            let end = phase.slice.end.min(full.len().saturating_sub(1));
+            let start = phase.slice.start.min(end);
+            let sub = &full[start..=end];
+            latent = self.denoise_phase_from(
+                plan,
+                phase.guidance,
+                sub,
+                opts.sampler.as_deref(),
+                latent,
+                opts.seed,
+                cancel,
+                on_progress,
+            )?;
+        }
+        on_progress(Progress::Decoding);
+        self.decode_latents(&latent, decoder)
+    }
+
+    /// **In-place per-phase adapter swap** (epic 13879, sc-13884) — set the DiT's active adapter stack
+    /// to `specs` (with the per-phase weight already folded into each [`AdapterSpec::scale`]) via the
+    /// runtime [`mlx_gen::adapters::AdaptableLinear::set_adapters`] seam, WITHOUT reloading weights: it
+    /// first clears every adaptable module's stack (back to the bare frozen base), then re-installs the
+    /// phase's low-rank residuals through the shared strict loader. An **empty** `specs` leaves the DiT
+    /// base-only (the phase-1 case of the Raw→Raw+turbo-LoRA workflow). Uses the low-rank strict path
+    /// (not the diff-patch variant) because a `.diff` fold mutates the dense base irreversibly and must
+    /// not be re-applied per phase.
+    ///
+    /// This is the `&mut` counterpart the multi-phase driver needs to *toggle* adapters across phase
+    /// boundaries. It is real, reusable machinery (the trainer-style in-place `set_adapters` pattern);
+    /// wiring it into the `&self` `Generator::generate` path requires a job-local (non-shared) DiT so a
+    /// concurrent generate on a `Resident` model can't race the swap — the sc-13884 follow-on.
+    pub fn set_phase_adapters(&mut self, specs: &[AdapterSpec]) -> Result<()> {
+        self.dit.clear_adapters();
+        if !specs.is_empty() {
+            mlx_gen::adapters::loader::apply_adapters_strict(&mut self.dit, specs, "krea_2")?;
+        }
+        Ok(())
     }
 
     /// **img2img latent-init Raw true-CFG render** (`krea_2_raw`, epic 8588 slice A / sc-10224) — the
