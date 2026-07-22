@@ -258,3 +258,75 @@ jobs:
         run: |
           call "%VCVARS%"
           cargo test --locked -p candle-gen-z-image --features cuda --test conformance z_image_conformance -- --ignored --nocapture
+
+  candle-sdxl:
+    name: Candle SDXL real weights (CUDA)
+    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'media'
+    runs-on: [self-hosted, windows, cuda, real-weights]
+    env:
+      # SDXL base (UNet + dual CLIP text encoders) + the three passed-in components (epic 13657 /
+      # sc-13663): the CLIP-L / CLIP-bigG tokenizer dirs and the fp16-fix VAE dir. inference never
+      # self-fetches — each is an explicit env-pointed snapshot dir (materialized below).
+      SDXL_SNAPSHOT: ${{ vars.SDXL_SNAPSHOT }}
+      SDXL_TOKENIZER_CLIP_L_DIR: ${{ vars.SDXL_TOKENIZER_CLIP_L_DIR }}
+      SDXL_TOKENIZER_CLIP_BIGG_DIR: ${{ vars.SDXL_TOKENIZER_CLIP_BIGG_DIR }}
+      SDXL_VAE_FP16_FIX_DIR: ${{ vars.SDXL_VAE_FP16_FIX_DIR }}
+      # RealVisXL_V5.0 is the edit/IP base; the harnesses read the same dir via EDIT_SDXL_BASE /
+      # IP_SDXL_BASE (REALVISXL_SNAPSHOT is also set for parity with the manifest env metadata).
+      REALVISXL_SNAPSHOT: ${{ vars.REALVISXL_SNAPSHOT }}
+      EDIT_SDXL_BASE: ${{ vars.REALVISXL_SNAPSHOT }}
+      IP_SDXL_BASE: ${{ vars.REALVISXL_SNAPSHOT }}
+      # h94/IP-Adapter snapshot dir; ip_validate derives IP_BUNDLE + IP_IMAGE_ENCODER from it (sc-13963).
+      IP_ADAPTER_SNAPSHOT: ${{ vars.IP_ADAPTER_SNAPSHOT }}
+      # Synthetic P6-PPM source/reference images (staged below) + output dirs for the edit/IP harnesses.
+      EDIT_SRC: ${{ runner.temp }}\sdxl-edit-src.ppm
+      EDIT_OUT: ${{ runner.temp }}\sdxl-edit-out
+      IP_REF: ${{ runner.temp }}\sdxl-ip-ref.ppm
+      IP_OUT: ${{ runner.temp }}\sdxl-ip-out
+      # 80 on the Ampere runner; set 120 on a Blackwell runner (matches the other CUDA jobs here).
+      CUDA_COMPUTE_CAP: "80"
+      CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
+      VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Select Git Bash
+        shell: cmd
+        run: |
+          if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
+          echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+        with:
+          toolchain: 1.96.0
+          components: rustfmt, clippy
+      - name: Materialize and verify immutable snapshots
+        shell: cmd
+        run: |
+          python -m pip install --disable-pip-version-check --target "%RUNNER_TEMP%\huggingface-hub" "huggingface_hub==1.20.1"
+          set "PYTHONPATH=%RUNNER_TEMP%\huggingface-hub"
+          python scripts/release/ensure_model_snapshot.py --model sdxl-base-1.0 --snapshot "%SDXL_SNAPSHOT%" || exit /b 1
+          python scripts/release/ensure_model_snapshot.py --model clip-vit-large-patch14 --snapshot "%SDXL_TOKENIZER_CLIP_L_DIR%" || exit /b 1
+          python scripts/release/ensure_model_snapshot.py --model clip-vit-bigg-14-laion2b --snapshot "%SDXL_TOKENIZER_CLIP_BIGG_DIR%" || exit /b 1
+          python scripts/release/ensure_model_snapshot.py --model sdxl-vae-fp16-fix --snapshot "%SDXL_VAE_FP16_FIX_DIR%" || exit /b 1
+          python scripts/release/ensure_model_snapshot.py --model realvisxl-v5 --snapshot "%REALVISXL_SNAPSHOT%" || exit /b 1
+          python scripts/release/ensure_model_snapshot.py --model ip-adapter-plus-sdxl-vit-h --snapshot "%IP_ADAPTER_SNAPSHOT%" || exit /b 1
+      - name: Stage synthetic source images
+        shell: cmd
+        run: |
+          python scripts/ci/make_test_image.py "%EDIT_SRC%" 768 768 || exit /b 1
+          python scripts/ci/make_test_image.py "%IP_REF%" 768 768 || exit /b 1
+      - name: Run SDXL real-weight renders
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          cargo test --locked -p candle-gen-sdxl --features cuda --release --test conformance sdxl_conformance -- --ignored --nocapture || exit /b 1
+          cargo test --locked -p candle-gen-sdxl --features cuda --release --lib edit_validate::real_weight_edit -- --ignored --nocapture || exit /b 1
+          cargo test --locked -p candle-gen-sdxl --features cuda --release --lib ip_validate::real_weight_ip_adapter -- --ignored --nocapture || exit /b 1
+          cargo test --locked -p candle-gen-sdxl --features cuda --release --test trainer_e2e sdxl_trainer_lora_trains_reloads_and_renders -- --ignored --nocapture || exit /b 1
+
+  # HELD (sc-13965): a candle-mmaudio CUDA job running candle-audio-mmaudio's
+  # `conformance_video_to_audio` (16k) + `conformance_video_to_audio_44k` real-weight cells is
+  # deferred pending a product/licensing decision — the MMAudio DiT/VAE are CC-BY-NC-4.0 and
+  # DFN5B-CLIP is under the Apple ML Research License (non-commercial/research), so they are not
+  # auto-run in scheduled CI without an explicit call. The render code is already proven (sc-13796);
+  # staging maps onto existing catalog keys via MMAUDIO_MMAUDIO_SNAPSHOT (hkchengrex/MMAudio) /
+  # MMAUDIO_CLIP_SNAPSHOT (apple/DFN5B) / MMAUDIO_BIGVGAN_SNAPSHOT (nvidia/bigvgan).
