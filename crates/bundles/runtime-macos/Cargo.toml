@@ -27,3 +27,12 @@ media = ["dep:mlx-gen-catalog"]
 # additive feature — NOT folded into `media` — so an LLM-only product (ChatWorks) can compose
 # text + TTS via `--no-default-features --features audio` without the mlx media provider graph.
 audio = ["dep:candle-audio-catalog"]
+# Run the Candle audio lane on Metal (sc-13698; unblocks the SceneWorks sc-13501 consumer). Additive
+# over `audio`: forwards `candle-audio-catalog/metal` so the DIFFUSION audio providers (moss-sfx,
+# acestep) use the Metal GPU (~38x steady, sc-13039 PR #170). The nearest-upsample-vocoder providers
+# (Kokoro, Chatterbox) are auto-routed to CPU inside the lane
+# (candle-audio::default_device_metal_incompatible) because candle-core's Metal backend lacks
+# upsample_nearest1d (sc-13691) — so turning this on stays correct instead of crashing them. Metal is
+# macOS-only, so only this bundle exposes it; runtime-cuda already forwards the audio catalog's cuda
+# feature and runtime-cpu has no GPU lane.
+audio-metal = ["audio", "candle-audio-catalog/metal"]

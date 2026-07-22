@@ -503,7 +503,7 @@ impl Flow {
                 path.display()
             )));
         }
-        let device = candle_audio::default_device()?;
+        let device = candle_audio::default_device_metal_incompatible()?;
         // SAFETY: mmap of a provider-resolved, pinned-SHA safetensors file — the shared idiom.
         let vb = unsafe {
             VarBuilder::from_mmaped_safetensors(std::slice::from_ref(&path), DType::F32, &device)?

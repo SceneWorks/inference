@@ -151,6 +151,28 @@ pub fn default_device() -> Result<candle_core::Device> {
     Ok(dev)
 }
 
+/// Compute device for providers whose vocoder uses a candle-core op the **Metal** backend lacks —
+/// nearest-neighbour 1-D upsampling (`upsample_nearest1d`), used by Kokoro's iSTFTNet decoder and
+/// Chatterbox's HiFT / flow vocoder. On a `metal` build those providers would hard-bail at runtime
+/// (`Metal upsample_nearest1d not implemented`, sc-13691), so they resolve to **CPU** even when the
+/// audio lane's Metal feature is on; on CUDA and CPU they use [`default_device`] unchanged (identical
+/// behaviour — this only diverges under `metal`).
+///
+/// This is the sc-13698 per-provider device override: it lets the diffusion audio lane (moss-sfx,
+/// acestep — ~38x on Metal, sc-13039) run on the Metal GPU while the nearest-upsample-vocoder
+/// providers stay correct on CPU. A consumer turns audio Metal on via the bundle's `audio-metal`
+/// feature (e.g. runtime-macos → `candle-audio-catalog/metal`); the routing here is what keeps
+/// Kokoro / Chatterbox from crashing under it. Fold this back into a blanket [`default_device`] once
+/// candle-core implements Metal `upsample_nearest1d` (sc-13691).
+pub fn default_device_metal_incompatible() -> Result<candle_core::Device> {
+    // candle-core's Metal backend lacks upsample_nearest1d (sc-13691); pin these providers to CPU.
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    let dev = candle_core::Device::Cpu;
+    #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
+    let dev = default_device()?;
+    Ok(dev)
+}
+
 /// The one process-wide Metal device (see [`default_device`] for why instance identity matters).
 #[cfg(all(feature = "metal", not(feature = "cuda")))]
 fn metal_device() -> Result<candle_core::Device> {
@@ -216,6 +238,25 @@ mod tests {
             .add(&tb)
             .expect("cross-resolution add must stay on one device");
         assert_eq!(sum.dims(), &[2, 2]);
+    }
+
+    #[test]
+    fn metal_incompatible_providers_avoid_metal() {
+        // Kokoro + Chatterbox (nearest-upsample vocoders) must NOT land on Metal — candle-core's
+        // Metal backend lacks upsample_nearest1d (sc-13691), so they'd hard-bail. The sc-13698
+        // override pins them to CPU on a `metal` build while leaving CUDA/CPU on the default device.
+        let dev = default_device_metal_incompatible().expect("metal-incompatible device resolves");
+        #[cfg(all(feature = "metal", not(feature = "cuda")))]
+        assert!(
+            dev.is_cpu(),
+            "metal-incompatible providers must resolve to CPU on a metal build (sc-13691/sc-13698)"
+        );
+        #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
+        {
+            // On CUDA/CPU builds it is exactly the default device — no behaviour change.
+            let def = default_device().expect("default device");
+            assert!(dev.same_device(&def));
+        }
     }
 
     #[test]
