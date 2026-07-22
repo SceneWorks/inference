@@ -151,16 +151,33 @@ fn kokoro_regression_fixture() {
     let fx_hash = field(&fx, &["repeatability", "pcm_sha256"])
         .as_str()
         .expect("pcm_sha256");
-    if std::env::consts::OS == fx_os && std::env::consts::ARCH == fx_arch {
+    // The exact PCM hash is a **CPU** determinism gate: candle's Metal/CUDA kernels are not
+    // bit-identical to CPU, so the committed hash applies only to a CPU build on the canonical
+    // platform. On a GPU build (this crate compiled `--features metal` / `--features cuda`) the
+    // exact hash cannot match — so we skip it and let the **metric envelope** (asserted for every
+    // run above: duration/LUFS/dBTP/clipping/rate/channels) plus intra-process repeatability be the
+    // Metal/CUDA drift gate (sc-13928). Frame-shape on GPU is separately gated by
+    // `tests/conformance.rs` (frame-RMS CV + voiced periodicity). Without this cfg scope a
+    // `--features metal` run on macos/aarch64 would spuriously fail against the CPU hash.
+    let cpu_build = cfg!(not(any(feature = "metal", feature = "cuda")));
+    if cpu_build && std::env::consts::OS == fx_os && std::env::consts::ARCH == fx_arch {
         assert_eq!(
             hash, fx_hash,
             "PCM repeatability hash drifted from the committed fixture on the canonical \
              platform ({fx_os}/{fx_arch}) — the seeded output changed"
         );
     } else {
+        let backend = if cfg!(feature = "cuda") {
+            "cuda"
+        } else if cfg!(feature = "metal") {
+            "metal"
+        } else {
+            "cpu"
+        };
         println!(
-            "note: platform {}/{} != fixture canonical {fx_os}/{fx_arch}; exact-hash check \
-             skipped (observed hash {hash})",
+            "note: exact-hash check skipped (backend={backend}, platform {}/{} vs fixture \
+             canonical cpu {fx_os}/{fx_arch}); metric envelope + intra-process repeatability gate \
+             this run — observed hash {hash}",
             std::env::consts::OS,
             std::env::consts::ARCH,
         );
