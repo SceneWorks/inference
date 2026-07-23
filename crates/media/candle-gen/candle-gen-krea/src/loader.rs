@@ -52,9 +52,25 @@ pub struct Weights {
     /// The component's `quantization` manifest, `Some` for a packed q4/q8 tier (carries the group size
     /// the packed shapes can't disambiguate), `None` for a dense bf16 tier.
     packed: Option<PackedConfig>,
-    /// True for a community **INT8-ConvRot** checkpoint (sc-9300): the file is native-mmdit-keyed, so
-    /// every diffusers-key lookup is translated to its native counterpart ([`convrot_diffusers_to_native`])
-    /// at read time, and quantized projections carry a `{native_base}.weight_scale` + int8 `.weight`.
+    /// True for **any native-mmdit-keyed** checkpoint (sc-9300 INT8-ConvRot *and* sc-14022 dense-bf16
+    /// single file): the file stores the *reference* tensor names, so every diffusers-key lookup is
+    /// translated to its native counterpart ([`convrot_diffusers_to_native`], optionally under a
+    /// [`native_prefix`](Weights::native_prefix)) at read time in [`resolve`](Weights::resolve). This is
+    /// the **key-remap** concern only — it is deliberately independent of the ConvRot int8/rotation legs
+    /// ([`convrot`](Weights::convrot)) so a plain dense-bf16 native file (e.g. the community
+    /// `kreamania_variant5` merge) reads through the remap as ordinary dense bf16 with **no** inverse
+    /// rotation or int8 dequant (which would corrupt it — sc-14022).
+    native_keys: bool,
+    /// A namespace every native key sits under, detected at load ([`detect_native_prefix`]). Empty for the
+    /// ComfyUI INT8-ConvRot export (its keys are bare `blocks.N.…`); `"model.diffusion_model."` for the
+    /// community dense single file, whose DiT is namespaced under that prefix. Prepended to the remapped
+    /// native key in [`resolve`](Weights::resolve). Only consulted when [`native_keys`](Weights::native_keys).
+    native_prefix: String,
+    /// True **only** for a community **INT8-ConvRot** checkpoint (sc-9300): its quantized projections carry
+    /// a `{native_base}.weight_scale` + int8 `.weight` whose stored weight is the *rotated* `W·R`, so
+    /// [`linear_detect`] engages the int8 IGEMM + the online group-256 Hadamard **rotation** legs
+    /// ([`crate::quant::ConvRotInt8`]). Split out from [`native_keys`](Weights::native_keys) (sc-14022): a
+    /// dense-bf16 native file is `native_keys: true, convrot: false` — remap ON, rotation/int8 OFF.
     convrot: bool,
     /// **One** cuBLASLt handle shared by every INT8-ConvRot projection loaded from this weight set
     /// (sc-12301) — see [`Weights::int8_context`]. `OnceLock` because [`linear_detect`] takes `&Weights`
@@ -82,13 +98,16 @@ impl Weights {
             dtype,
             overlay: HashMap::new(),
             packed: read_packed_config(dir)?,
+            native_keys: false,
+            native_prefix: String::new(),
             convrot: false,
             int8: OnceLock::new(),
         })
     }
 
     /// mmap a single `.safetensors` file (used by the committed parity fixtures). Dense-only (no
-    /// packed config), so the packed path is never taken for a single-file fixture.
+    /// packed config), so the packed path is never taken for a single-file fixture. Diffusers-keyed —
+    /// for a **native-mmdit-keyed** dense single file use [`from_native_file`](Self::from_native_file).
     pub fn from_file(path: &Path, device: &Device, dtype: DType) -> Result<Self> {
         // SAFETY: read-only mmap of a weight file; the standard candle loading path.
         let st = unsafe { MmapedSafetensors::new(path)? };
@@ -98,6 +117,8 @@ impl Weights {
             dtype,
             overlay: HashMap::new(),
             packed: None,
+            native_keys: false,
+            native_prefix: String::new(),
             convrot: false,
             int8: OnceLock::new(),
         })
@@ -111,13 +132,44 @@ impl Weights {
     pub fn from_convrot_file(path: &Path, device: &Device, dtype: DType) -> Result<Self> {
         // SAFETY: read-only mmap of a weight file; the standard candle loading path.
         let st = unsafe { MmapedSafetensors::new(path)? };
+        let native_prefix = detect_native_prefix(&st);
         Ok(Self {
             st,
             device: device.clone(),
             dtype,
             overlay: HashMap::new(),
             packed: None,
+            native_keys: true,
+            native_prefix,
             convrot: true,
+            int8: OnceLock::new(),
+        })
+    }
+
+    /// mmap a **single-file dense-bf16 native-mmdit-keyed checkpoint** (sc-14022) — a ComfyUI-exported
+    /// community merge (e.g. `kreamania_variant5.safetensors`, a distilled-Turbo dense merge) whose DiT is
+    /// stored under the *reference* tensor names, typically namespaced beneath `model.diffusion_model.`.
+    ///
+    /// `native_keys` is set so every diffusers-key lookup is translated to its native key
+    /// ([`convrot_diffusers_to_native`], under the auto-detected namespace prefix) at
+    /// read time — the DiT reads as **ordinary dense bf16** through the remap. `convrot` is **false**: no
+    /// int8 dequant and, crucially, **no inverse Hadamard rotation** — a dense native file is `W`, not the
+    /// ConvRot `W·R`, so applying the rotation legs (as [`from_convrot_file`](Self::from_convrot_file)
+    /// does) would corrupt it. This is the whole point of splitting the two concerns: the remap serves the
+    /// dense file, the rotation stays exclusive to the INT8-ConvRot file.
+    pub fn from_native_file(path: &Path, device: &Device, dtype: DType) -> Result<Self> {
+        // SAFETY: read-only mmap of a weight file; the standard candle loading path.
+        let st = unsafe { MmapedSafetensors::new(path)? };
+        let native_prefix = detect_native_prefix(&st);
+        Ok(Self {
+            st,
+            device: device.clone(),
+            dtype,
+            overlay: HashMap::new(),
+            packed: None,
+            native_keys: true,
+            native_prefix,
+            convrot: false,
             int8: OnceLock::new(),
         })
     }
@@ -161,18 +213,37 @@ impl Weights {
         Ok(self.int8.get_or_init(|| ctx))
     }
 
-    /// Whether this is an INT8-ConvRot checkpoint (native-mmdit-keyed, sc-9300).
+    /// Whether this checkpoint applies the **int8 + online-rotation** legs, i.e. it is a genuine
+    /// **INT8-ConvRot** export (sc-9300). This is the narrow ConvRot flag (sc-14022): it is **false** for
+    /// a dense-bf16 native single file, which is native-keyed but never rotated/int8. Gate the int8
+    /// `linear_detect` arm on this, NOT on [`uses_native_keys`](Self::uses_native_keys).
     pub fn is_convrot(&self) -> bool {
         self.convrot
     }
 
-    /// Resolve a **diffusers** key to the actual on-disk key: the native-mmdit key for a ConvRot
-    /// checkpoint (sc-9300), else the key unchanged. A ConvRot key with no native counterpart resolves
-    /// to itself, so the subsequent mmap load errors on the genuinely-missing tensor (as it would for a
-    /// truncated dense download) rather than silently succeeding.
+    /// Whether this checkpoint is **native-mmdit-keyed** — its tensors are stored under the reference
+    /// names, so `resolve` remaps every diffusers-key lookup to its native counterpart
+    /// (sc-14022). True for BOTH the INT8-ConvRot export ([`from_convrot_file`](Self::from_convrot_file))
+    /// and the dense-bf16 single file ([`from_native_file`](Self::from_native_file)). Distinct from
+    /// [`is_convrot`](Self::is_convrot) (the int8/rotation legs). Coverage/shape validation
+    /// ([`crate::convert`]) branches on this so a native file is validated by resolving each expected
+    /// diffusers key to a present native tensor rather than a literal key diff.
+    pub fn uses_native_keys(&self) -> bool {
+        self.native_keys
+    }
+
+    /// Resolve a **diffusers** key to the actual on-disk key: for a native-mmdit-keyed checkpoint
+    /// (sc-9300 ConvRot or sc-14022 dense) the native key ([`convrot_diffusers_to_native`]) under the
+    /// detected [`native_prefix`](Self::native_prefix); else the key unchanged. A native key with no
+    /// diffusers counterpart resolves to itself, so the subsequent mmap load errors on the
+    /// genuinely-missing tensor (as it would for a truncated dense download) rather than silently
+    /// succeeding.
     fn resolve(&self, name: &str) -> String {
-        if self.convrot {
-            convrot_diffusers_to_native(name).unwrap_or_else(|| name.to_string())
+        if self.native_keys {
+            match convrot_diffusers_to_native(name) {
+                Some(native) => format!("{}{native}", self.native_prefix),
+                None => name.to_string(),
+            }
         } else {
             name.to_string()
         }
@@ -477,6 +548,21 @@ pub fn convrot_diffusers_to_native(key: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Detect the namespace prefix every native DiT tensor sits under (sc-14022). The community dense single
+/// file (`kreamania_variant5`) namespaces its whole DiT beneath `model.diffusion_model.`, whereas the
+/// ComfyUI INT8-ConvRot export stores bare `blocks.N.…` keys. [`Weights::resolve`] prepends whatever this
+/// returns to the remapped native key, so one native loader serves both layouts. Empty string ⇒ no prefix
+/// (the ConvRot export, and the reason [`from_convrot_file`](Weights::from_convrot_file) is behavior-
+/// preserving: it detects an empty prefix and remaps exactly as before).
+fn detect_native_prefix(st: &MmapedSafetensors) -> String {
+    const PREFIX: &str = "model.diffusion_model.";
+    if st.tensors().iter().any(|(k, _)| k.starts_with(PREFIX)) {
+        PREFIX.to_string()
+    } else {
+        String::new()
+    }
 }
 
 /// Read `{dir}/config.json`'s `quantization` block: `Ok(Some(cfg))` for a packed tier, `Ok(None)` for
@@ -1312,6 +1398,122 @@ mod tests {
             "plain tier stays dense"
         );
         std::fs::remove_dir_all(&dir).ok();
+        Ok(())
+    }
+
+    // ── dense-bf16 native single file (sc-14022) ────────────────────────────────────────────────────
+
+    /// Build a tiny **dense-bf16 native-mmdit-keyed** single file the way the community merge stores it —
+    /// under the `model.diffusion_model.` namespace prefix, no `.weight_scale`/`.comfy_quant` siblings and
+    /// no int8 codes. One attn projection (`blocks.0.attn.wq`) + a norm (`blocks.0.prenorm.scale`).
+    /// Returns the on-disk `wq` weight (the parity reference a faithful dense load must reproduce verbatim).
+    fn dense_native_file(out_dim: usize, in_dim: usize) -> (HashMap<String, Tensor>, Tensor) {
+        let dev = Device::Cpu;
+        let wq = Tensor::randn(0f32, 1f32, (out_dim, in_dim), &dev).unwrap();
+        let mut map = HashMap::new();
+        map.insert(
+            "model.diffusion_model.blocks.0.attn.wq.weight".into(),
+            wq.clone(),
+        );
+        map.insert(
+            "model.diffusion_model.blocks.0.prenorm.scale".into(),
+            Tensor::randn(0f32, 1f32, (out_dim,), &dev).unwrap(),
+        );
+        (map, wq)
+    }
+
+    /// **The dense-bf16 native path loads through the remap with NO rotation and NO int8 — the corruption
+    /// path is closed (sc-14022).** `from_native_file` sets `native_keys` (so the `model.diffusion_model.`
+    /// prefixed native keys resolve from diffusers lookups) but leaves `convrot` OFF, so `linear_detect`
+    /// stays on the plain **Dense** arm and the loaded weight is byte-for-byte the on-disk dense weight —
+    /// NOT an inverse-rotated `W·Rᵀ`. The contrast: `from_convrot_file` reports rotation ON.
+    #[test]
+    fn from_native_file_loads_dense_without_rotation() -> Result<()> {
+        let dev = Device::Cpu;
+        let (out_dim, in_dim) = (64usize, 128usize);
+        let (map, ref_wq) = dense_native_file(out_dim, in_dim);
+        let path = std::env::temp_dir()
+            .join(format!("sc14022_native_dense_{}", std::process::id()))
+            .join("kreamania_variant5.safetensors");
+        write_single_file(&path, map);
+
+        let w = Weights::from_native_file(&path, &dev, DType::F32)?;
+        // native_keys ON (remap), convrot/rotation OFF — the whole point of the split.
+        assert!(
+            w.uses_native_keys(),
+            "from_native_file ⇒ native-key remap ON"
+        );
+        assert!(
+            !w.is_convrot(),
+            "from_native_file must leave the int8/rotation legs OFF (else it corrupts dense weights)"
+        );
+
+        // The diffusers key resolves through the remap AND the detected `model.diffusion_model.` prefix,
+        // and the value is the on-disk dense weight unchanged (no rotation, no dequant).
+        let got = w.get("transformer_blocks.0.attn.to_q.weight")?;
+        let dev_max = (got.sub(&ref_wq)?).abs()?.max_all()?.to_scalar::<f32>()?;
+        assert_eq!(
+            dev_max, 0.0,
+            "dense native weight must load verbatim (no inverse rotation applied)"
+        );
+
+        // `linear_detect` takes the plain Dense arm — not convrot_int8, not packed.
+        let lin = linear_detect(&w, "transformer_blocks.0.attn.to_q", false)?;
+        assert!(
+            !lin.is_convrot_int8() && !lin.is_packed(),
+            "a dense native projection must detect Dense — no rotation, no int8"
+        );
+        // And its forward equals the un-rotated dense linear (the reconstruction a rotation would break).
+        let x = Tensor::randn(0f32, 1f32, (4, in_dim), &dev)?;
+        let want = Linear::new(ref_wq, None).forward(&x)?;
+        let dev_max = (lin.forward(&x)?.sub(&want)?)
+            .abs()?
+            .max_all()?
+            .to_scalar::<f32>()?;
+        assert_eq!(
+            dev_max, 0.0,
+            "dense native forward must equal X·Wᵀ verbatim"
+        );
+
+        // The norm resolves through the diffusers key `norm1.weight` → prefixed `…blocks.0.prenorm.scale`.
+        let normw = w.get("transformer_blocks.0.norm1.weight")?;
+        assert_eq!(normw.dims(), &[out_dim]);
+
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        Ok(())
+    }
+
+    /// **The int8/rotation flag is the discriminator (sc-14022).** On the SAME logical projection, a
+    /// `from_convrot_file` (int8 `W·R`) reports `is_convrot()` — rotation applies — while a
+    /// `from_native_file` (dense `W`) does not. Both are `uses_native_keys()` (both native-mmdit-keyed);
+    /// the split is exactly `native_keys` (shared) vs `convrot` (int8/rotation, ConvRot only).
+    #[test]
+    fn native_keys_and_rotation_are_independent_flags() -> Result<()> {
+        let dev = Device::Cpu;
+        let (out_dim, in_dim) = (64usize, 128usize);
+
+        // Dense native file (prefixed): native_keys ON, rotation OFF.
+        let (dmap, _wq) = dense_native_file(out_dim, in_dim);
+        let dpath = std::env::temp_dir()
+            .join(format!("sc14022_flags_dense_{}", std::process::id()))
+            .join("dense.safetensors");
+        write_single_file(&dpath, dmap);
+        let dense = Weights::from_native_file(&dpath, &dev, DType::F32)?;
+        assert!(dense.uses_native_keys());
+        assert!(!dense.is_convrot(), "dense native ⇒ rotation OFF");
+
+        // INT8-ConvRot file (bare native keys): native_keys ON, rotation ON.
+        let (cmap, _ref) = convrot_int8_weight(out_dim, in_dim);
+        let cpath = std::env::temp_dir()
+            .join(format!("sc14022_flags_convrot_{}", std::process::id()))
+            .join("convrot.safetensors");
+        write_single_file(&cpath, cmap);
+        let convrot = Weights::from_convrot_file(&cpath, &dev, DType::F32)?;
+        assert!(convrot.uses_native_keys());
+        assert!(convrot.is_convrot(), "INT8-ConvRot ⇒ rotation ON");
+
+        std::fs::remove_dir_all(dpath.parent().unwrap()).ok();
+        std::fs::remove_dir_all(cpath.parent().unwrap()).ok();
         Ok(())
     }
 }

@@ -101,14 +101,16 @@ pub fn expected_transformer_keys(cfg: &Krea2Config) -> Vec<String> {
 /// Validate a loaded transformer against `cfg`: exact key coverage (no missing, no extra) and the
 /// shapes of the dimension-bearing entry points.
 ///
-/// **INT8-ConvRot (sc-9300):** a ConvRot checkpoint is native-mmdit-keyed, so the exact diffusers
-/// key-set diff would spuriously report every key missing + every native key extra. Instead validate
-/// that each expected diffusers key **resolves** to a present native tensor (via the loader's
-/// diffusers→native remap, which `w.contains` applies), then run the same shape checks (which also
-/// resolve). This proves the ConvRot file covers the full `Krea2Transformer2DModel` surface without
-/// asserting a 1:1 native key match.
+/// **Native-mmdit-keyed (sc-9300 ConvRot / sc-14022 dense):** a native-keyed checkpoint stores the
+/// reference names, so the exact diffusers key-set diff would spuriously report every key missing +
+/// every native key extra. Instead validate that each expected diffusers key **resolves** to a present
+/// native tensor (via the loader's diffusers→native remap, which `w.contains` applies), then run the
+/// same shape checks (which also resolve). This proves the file covers the full
+/// `Krea2Transformer2DModel` surface without asserting a 1:1 native key match. (The dense single-file
+/// path additionally rejects unmapped/foreign on-disk tensors — see
+/// [`validate_native_transformer`].)
 pub fn validate_transformer(w: &Weights, cfg: &Krea2Config) -> Result<()> {
-    if w.is_convrot() {
+    if w.uses_native_keys() {
         let missing: Vec<String> = expected_transformer_keys(cfg)
             .into_iter()
             .filter(|k| !w.contains(k))
@@ -121,7 +123,7 @@ pub fn validate_transformer(w: &Weights, cfg: &Krea2Config) -> Result<()> {
                 .collect::<Vec<_>>()
                 .join(", ");
             return Err(candle_gen::candle_core::Error::Msg(format!(
-                "krea INT8-ConvRot: {} expected key(s) do not resolve to a native tensor [{head}]",
+                "krea native-keyed DiT: {} expected key(s) do not resolve to a native tensor [{head}]",
                 missing.len(),
             )));
         }
@@ -159,8 +161,58 @@ pub fn validate_transformer(w: &Weights, cfg: &Krea2Config) -> Result<()> {
     validate_shapes(w, cfg)
 }
 
+/// Validate a **dense-bf16 native-keyed single file** (sc-14022) — the candle sibling of the MLX
+/// `remap_native_dit_to_diffusers` + `validate_transformer` fail-closed pair. Stricter than the ConvRot
+/// branch of [`validate_transformer`]: the dense single file is DiT-only with **exactly** the published
+/// tensor count and no quant siblings, so it must be a *bijection* onto the module tree — every expected
+/// diffusers key resolves to a present native tensor (no missing) AND the file carries no unmapped /
+/// foreign / duplicate on-disk tensor (no extra).
+///
+/// Fails closed (typed error) — never a silent gap:
+/// 1. **coverage** — any expected diffusers key that does not resolve to a present native tensor (a
+///    truncated download, wrong family, or a bad prefix) is reported by name; then
+/// 2. **no foreign/extra** — the on-disk tensor count must equal the expected count. With the remap
+///    pinned injective (`loader::tests::convrot_remap_pins_the_key_map` + the sc-14022 coverage test)
+///    and full coverage from step 1, count-equality ⇒ a bijection, so any tensor the remap cannot place
+///    (a foreign key, or a duplicate) makes the count differ and is rejected; then
+/// 3. the shared `validate_shapes` (resolving, flat-`scale_shift_table` aware).
+///
+/// The ConvRot file is validated by [`validate_transformer`]'s coverage-only native branch instead — it
+/// legitimately carries extra `.weight_scale`/`.comfy_quant` siblings, so it is NOT a bijection.
+pub fn validate_native_transformer(w: &Weights, cfg: &Krea2Config) -> Result<()> {
+    let expected = expected_transformer_keys(cfg);
+    // (1) Coverage: every expected diffusers key must resolve (via the native remap) to a present tensor.
+    let missing: Vec<&String> = expected.iter().filter(|k| !w.contains(k)).collect();
+    if !missing.is_empty() {
+        let head = missing
+            .iter()
+            .take(8)
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(candle_gen::candle_core::Error::Msg(format!(
+            "krea native single-file: {} expected DiT key(s) do not resolve to a native tensor \
+             (truncated download, wrong family, or unexpected namespace) [{head}]",
+            missing.len(),
+        )));
+    }
+    // (2) No foreign/extra: a dense DiT-only file has exactly `expected.len()` tensors. Coverage (1) put
+    // that many *distinct* expected keys onto present tensors through the injective remap, so any surplus
+    // on-disk tensor is one the remap cannot place — reject it rather than load a set with a stray weight.
+    let on_disk = w.keys().len();
+    if on_disk != expected.len() {
+        return Err(candle_gen::candle_core::Error::Msg(format!(
+            "krea native single-file: {on_disk} on-disk DiT tensor(s), expected exactly {} — the file \
+             carries an unmapped/foreign or duplicate tensor (dense bf16 single-file DiT must be a \
+             bijection onto the module tree)",
+            expected.len(),
+        )));
+    }
+    validate_shapes(w, cfg)
+}
+
 /// Shape checks on the dimension-bearing entry points (Linear weight = `[out, in]`). Shared by the
-/// dense/packed path and the INT8-ConvRot path (`check_shape` resolves the diffusers key to the native
+/// dense/packed path and the native-keyed path (`check_shape` resolves the diffusers key to the native
 /// key and skips a quantized weight whose on-disk shape differs — packed u32 codes or int8 codes).
 fn validate_shapes(w: &Weights, cfg: &Krea2Config) -> Result<()> {
     let h = cfg.hidden_size;
@@ -225,17 +277,18 @@ fn check_shape(w: &Weights, key: &str, expected: &[usize]) -> Result<()> {
             return Ok(());
         }
     }
-    // ConvRot's per-block `scale_shift_table` is stored 1-D (`mod.lin` `[6·h]`) rather than `[6, h]`;
-    // the DiT reshapes it identically row-major, so the flat form is correct. `w.shape` resolves to
-    // the native key, so compare against the flattened `[6·h]` under ConvRot.
-    if w.is_convrot() && key.ends_with(".scale_shift_table") {
+    // A native-keyed file's per-block `scale_shift_table` is stored 1-D (`mod.lin` `[6·h]`) rather than
+    // `[6, h]` (both the ConvRot export and the dense single file); the DiT reshapes it identically
+    // row-major, so the flat form is correct. `w.shape` resolves to the native key, so compare against
+    // the flattened `[6·h]` for a native-keyed checkpoint.
+    if w.uses_native_keys() && key.ends_with(".scale_shift_table") {
         if let Some(shape) = w.shape(key) {
             let flat: usize = expected.iter().product();
             if shape == expected || shape == [flat] {
                 return Ok(());
             }
             return Err(candle_gen::candle_core::Error::Msg(format!(
-                "krea INT8-ConvRot: {key} shape {shape:?}, expected {expected:?} or [{flat}]"
+                "krea native-keyed DiT: {key} shape {shape:?}, expected {expected:?} or [{flat}]"
             )));
         }
     }
@@ -253,6 +306,11 @@ fn check_shape(w: &Weights, key: &str, expected: &[usize]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle_gen::candle_core::{safetensors, DType, Device, Tensor};
+    use std::collections::HashMap;
+    use std::path::Path;
+
+    use crate::loader::{convrot_diffusers_to_native, Weights};
 
     #[test]
     fn expected_key_count_matches_published_turbo() {
@@ -263,5 +321,114 @@ mod tests {
         // 17 top-level + 49 text_fusion (2×12 layerwise + 1 projector + 2×12 refiner) + 364 blocks
         // (28×13) = 430, matching the published safetensors index exactly.
         assert_eq!(keys.len(), 430);
+    }
+
+    /// The real native-mmdit key set captured from `kreamania_variant5.safetensors` (430 tensors,
+    /// prefixed `model.diffusion_model.`) — the committed fixture; the 26 GB weights file is NOT committed.
+    fn variant5_native_keys() -> Vec<String> {
+        let raw = include_str!("../tests/fixtures/variant5_native_keys.txt");
+        raw.lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Write a native-mmdit-keyed single file of 1-element f32 stubs (key coverage/count is what the
+    /// validation reads; values/shapes are irrelevant until the shape check, which these tests reach only
+    /// on the happy path they deliberately avoid). Mirrors the MLX `stub()` fixture approach.
+    fn write_native_stub_file(path: &Path, keys: &[String]) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let dev = Device::Cpu;
+        let mut map: HashMap<String, Tensor> = HashMap::new();
+        for k in keys {
+            map.insert(k.clone(), Tensor::from_vec(vec![0f32], (1,), &dev).unwrap());
+        }
+        safetensors::save(&map, path).unwrap();
+    }
+
+    /// **The candle diffusers→native remap covers EXACTLY the real variant5 native key set (sc-14022).**
+    /// Every one of the 430 expected diffusers keys maps (no `None`), and the set of native keys it
+    /// produces equals the variant5 header's native keys (prefix stripped) — a bijection over the real
+    /// dense single-file header, the candle mirror of mlx-gen-krea's
+    /// `remap_covers_every_variant5_key_and_matches_expected_module_keys`.
+    #[test]
+    fn native_remap_covers_every_variant5_key() {
+        let mapped: BTreeSet<String> = expected_transformer_keys(&Krea2Config::turbo())
+            .iter()
+            .map(|k| {
+                convrot_diffusers_to_native(k)
+                    .unwrap_or_else(|| panic!("expected diffusers key has no native mapping: {k}"))
+            })
+            .collect();
+
+        let fixture: BTreeSet<String> = variant5_native_keys()
+            .iter()
+            .map(|k| {
+                k.strip_prefix("model.diffusion_model.")
+                    .unwrap_or_else(|| panic!("fixture key lacks the DiT prefix: {k}"))
+                    .to_string()
+            })
+            .collect();
+
+        let missing: Vec<&String> = fixture.difference(&mapped).collect();
+        let extra: Vec<&String> = mapped.difference(&fixture).collect();
+        assert!(
+            missing.is_empty() && extra.is_empty(),
+            "candle remap ≠ variant5 native keys: uncovered {missing:?}, stray {extra:?}"
+        );
+    }
+
+    /// **Fail-closed on a missing required key (sc-14022).** A native single file missing one DiT tensor
+    /// (`first.weight` → `img_in.weight`) is rejected by `validate_native_transformer`'s coverage half,
+    /// naming the key that does not resolve — never a silent gap.
+    #[test]
+    fn validate_native_missing_key_fails_closed() -> Result<()> {
+        let dev = Device::Cpu;
+        let keys: Vec<String> = variant5_native_keys()
+            .into_iter()
+            .filter(|k| k != "model.diffusion_model.first.weight")
+            .collect();
+        let path = std::env::temp_dir()
+            .join(format!("sc14022_missing_{}", std::process::id()))
+            .join("variant5.safetensors");
+        write_native_stub_file(&path, &keys);
+
+        let w = Weights::from_native_file(&path, &dev, DType::F32)?;
+        let err = crate::convert::validate_native_transformer(&w, &Krea2Config::turbo())
+            .expect_err("a missing DiT tensor must fail closed")
+            .to_string();
+        assert!(
+            err.contains("do not resolve") && err.contains("img_in.weight"),
+            "error must name the unresolved key: {err}"
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        Ok(())
+    }
+
+    /// **Fail-closed on an unmapped/foreign key (sc-14022).** A native single file carrying the full 430
+    /// plus one foreign tensor is rejected: coverage passes, but the on-disk count exceeds the expected
+    /// count, so the bijection check rejects the surplus (the candle analogue of the MLX remap's
+    /// `unmapped_key_fails_closed`). No stray weight loads silently.
+    #[test]
+    fn validate_native_foreign_key_fails_closed() -> Result<()> {
+        let dev = Device::Cpu;
+        let mut keys = variant5_native_keys();
+        keys.push("model.diffusion_model.blocks.0.attn.bogus".to_string());
+        let path = std::env::temp_dir()
+            .join(format!("sc14022_foreign_{}", std::process::id()))
+            .join("variant5.safetensors");
+        write_native_stub_file(&path, &keys);
+
+        let w = Weights::from_native_file(&path, &dev, DType::F32)?;
+        let err = crate::convert::validate_native_transformer(&w, &Krea2Config::turbo())
+            .expect_err("an unmapped/foreign tensor must fail closed")
+            .to_string();
+        assert!(
+            err.contains("unmapped/foreign") || err.contains("bijection"),
+            "error must flag the foreign tensor: {err}"
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        Ok(())
     }
 }
