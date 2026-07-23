@@ -529,6 +529,17 @@ impl AdaptLinear {
         self.adapters.push(Adapter::LokrStructured { factors });
     }
 
+    /// Drop **every** attached forward-time residual, reverting the projection to its bare base — so the
+    /// next [`Self::forward`] is byte-identical to the un-adapted base (`is_adapted()` returns `false`).
+    /// The base weight is never touched (it was never mutated by a residual), so clearing is a cheap,
+    /// exact toggle-off. The candle twin of mlx-gen's `AdaptableLinear::clear_adapters`: it is the
+    /// per-phase adapter *toggle* a multi-phase render runs on its **job-local** DiT between phases —
+    /// clear the prior phase's residuals, then push the next phase's subset — without ever mutating the
+    /// shared resident base tensors (which stay Arc-shared and read-only across concurrent generates).
+    pub fn clear_adapters(&mut self) {
+        self.adapters.clear();
+    }
+
     /// Fold a **dense** base to an MLX-packed base in place (Q4/Q8), preserving any attached residuals —
     /// or an **idempotent no-op** on an already-packed base. The shared-core twin of
     /// [`super::QLinear::quantize`] for a consumer whose DiT quantizes AFTER any dense adapter fold
@@ -840,6 +851,70 @@ mod tests {
         assert_eq!(
             zero_dev, 0.0,
             "scale-0 residual must be an exact no-op on packed"
+        );
+    }
+
+    /// `clear_adapters` reverts an adapted projection to its **bare base** — the per-phase toggle-off a
+    /// multi-phase render runs on its job-local DiT between phases. After clearing, the forward is
+    /// **byte-identical** to the un-adapted base, and a re-push installs a fresh residual — proving a
+    /// phase's adapter set is authoritative regardless of what the prior phase installed, and that the
+    /// base weight is never disturbed by the toggle.
+    #[test]
+    fn clear_adapters_reverts_to_bare_base_and_repush_reinstalls() {
+        let dev = Device::Cpu;
+        let (out_dim, in_dim, rank) = (48usize, 64usize, 4usize);
+        let w = Tensor::randn(0f32, 1f32, (out_dim, in_dim), &dev).unwrap();
+        let a = (Tensor::randn(0f32, 1f32, (in_dim, rank), &dev).unwrap() * 0.1).unwrap();
+        let b = (Tensor::randn(0f32, 1f32, (rank, out_dim), &dev).unwrap() * 0.1).unwrap();
+        let x = Tensor::randn(0f32, 1f32, (3usize, in_dim), &dev).unwrap();
+
+        // The bare-base reference (same weight, no residual).
+        let base = AdaptLinear::from_dense(Linear::new(w.clone(), None), in_dim, out_dim);
+        let base_y = base.forward(&x).unwrap();
+
+        let mut lin = AdaptLinear::from_dense(Linear::new(w, None), in_dim, out_dim);
+        lin.push_lora(a.clone(), b.clone(), 0.7);
+        assert!(lin.is_adapted());
+        let adapted_shift = (lin.forward(&x).unwrap() - &base_y)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(adapted_shift > 1e-4, "the residual must shift the forward");
+
+        // Toggle off: clear ⇒ byte-identical to the bare base (an exact 0 deviation, not a tolerance).
+        lin.clear_adapters();
+        assert!(!lin.is_adapted(), "clear must drop every residual");
+        let cleared_dev = (lin.forward(&x).unwrap() - &base_y)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert_eq!(
+            cleared_dev, 0.0,
+            "after clear the forward must equal the bare base exactly"
+        );
+
+        // Re-push a fresh (different-scale) residual — the phase's set is authoritative after a clear.
+        lin.push_lora(a, b, 0.3);
+        assert!(lin.is_adapted());
+        let repush_shift = (lin.forward(&x).unwrap() - &base_y)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(
+            repush_shift > 1e-4 && (repush_shift - adapted_shift).abs() > 1e-6,
+            "re-push installs a fresh residual at the new scale"
         );
     }
 

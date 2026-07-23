@@ -171,6 +171,14 @@ pub(crate) struct ResidencyHeavy {
     vae_encoder: QwenVaeEncoder,
 }
 
+impl ResidencyHeavy {
+    /// The Qwen-Image VAE, for the multi-phase decode (epic 13879, sc-13887) — which decodes through the
+    /// native VAE only (PiD is rejected on the multi-phase path).
+    pub(crate) fn vae(&self) -> &QwenVae {
+        &self.heavy.vae
+    }
+}
+
 pub(crate) fn load_residency_heavy(
     root: &Path,
     device: &Device,
@@ -273,6 +281,19 @@ pub(crate) fn render_residency(
 pub struct Components {
     pub(crate) text: KreaText,
     pub(crate) heavy: KreaHeavy,
+}
+
+impl Components {
+    /// The text phase, for the multi-phase context encode (epic 13879, sc-13887) on the `Resident` path
+    /// (the `Sequential` path encodes from its own loaded text phase before the DiT materializes).
+    pub(crate) fn text(&self) -> &KreaText {
+        &self.text
+    }
+
+    /// The Qwen-Image VAE, for the multi-phase decode (native VAE only; PiD is rejected on that path).
+    pub(crate) fn vae(&self) -> &QwenVae {
+        &self.heavy.vae
+    }
 }
 
 /// Load all Turbo components from a Krea 2 snapshot (`tokenizer/ text_encoder/ transformer/ vae/`).
@@ -935,6 +956,150 @@ fn render_base_from_contexts(
             Some(pid) => pid.decode(&lat)?,
             None => comps.vae.decode(&lat)?.to_dtype(DType::F32)?,
         };
+        to_image(&decoded)
+    })
+}
+
+// ---- Multi-phase Raw denoise (epic 13879, sc-13887) ----------------------------------------------
+//
+// The candle mirror of mlx-gen-krea's sc-13884 multi-phase render. One Krea render runs an ordered list
+// of phases within ONE denoise trajectory over ONE coherent global Raw sigma schedule: each phase owns a
+// contiguous slice of that shared schedule, its own guidance (true-CFG on/off), and its own active
+// adapter subset — the "N steps Raw (CFG on) then M steps Raw+turbo-LoRA (CFG off)" workflow. The host
+// decomposition (slices / guidance / adapter resolution + bounds) lives in [`crate::multiphase`]; this is
+// the GPU driver. See [`crate::multiphase`]'s module docs for the adapter-seam difference vs. MLX.
+
+/// Encode the multi-phase contexts from one text phase: the positive (conditional) context always, plus
+/// the unconditional (negative) context iff ANY phase uses CFG (`need_neg`) — the single-encode seam both
+/// residency modes share. A phase with `guidance == 0` never consults the negative, so it is encoded
+/// once for the whole trajectory only when at least one phase needs it (matching
+/// [`encode_base_contexts`]'s CFG gate). An absent/empty negative prompt defaults to `""`.
+pub(crate) fn encode_multiphase_contexts(
+    text: &KreaText,
+    req: &GenerationRequest,
+    need_neg: bool,
+) -> Result<(Tensor, Option<Tensor>)> {
+    let context = encode_prompt_context(text, req)?;
+    let neg = if need_neg {
+        let negative = req.negative_prompt.as_deref().unwrap_or_default();
+        Some(encode_negative_context(text, negative)?)
+    } else {
+        None
+    };
+    Ok((context, neg))
+}
+
+/// Load a **bare, re-adaptable** job-local Krea DiT from the snapshot's `transformer/` — no load-time
+/// adapters, no diff-patch fold, no PiD (the DiT part of [`load_heavy`] only). This is the job-local base
+/// the multi-phase driver re-adapts between phases ([`Krea2Transformer::clear_adapters`] +
+/// [`crate::adapters::install_additive`] of the phase subset). It is owned by the render call and never
+/// the shared resident, so re-adapting it between phases can never race a concurrent generate — the
+/// concurrency-safety invariant. (Because candle's `Krea2Transformer` is not a cheap `Clone` like MLX's,
+/// this is ONE extra transient DiT per multi-phase job rather than a per-phase refcounted clone; see the
+/// PR notes / follow-up for the base-sharing-clone optimization.)
+fn load_dit_base(root: &Path, device: &Device) -> Result<Krea2Transformer> {
+    let cfg = Krea2Config::from_snapshot(root)?;
+    let dit_w = Weights::from_dir(&root.join("transformer"), device, DIT_DTYPE)?;
+    crate::convert::validate_transformer(&dit_w, &cfg)?;
+    Ok(Krea2Transformer::load(&dit_w, &cfg)?)
+}
+
+/// **Multi-phase Raw render** (epic 13879, sc-13887) — drive the resolved per-phase plan over ONE global
+/// Raw schedule, then decode once. The `sigmas` schedule is built ONCE for the TOTAL step budget (the sum
+/// of the phases' steps); each phase runs a contiguous slice `sigmas[start..=end]` from the RUNNING latent
+/// (the prior phase's output, or the initial noise for phase 0) — so the latent and sigma trajectory flow
+/// continuously across every boundary (the crux: no per-phase schedule, hence no seam/reset), while the
+/// ACTIVE ADAPTERS and GUIDANCE change per phase.
+///
+/// **Per-phase adapter toggling, concurrency-safe.** A single **job-local** base DiT ([`load_dit_base`])
+/// is re-adapted in place between phases: [`Krea2Transformer::clear_adapters`] drops the prior phase's
+/// forward-time residuals, then [`crate::adapters::install_additive`] pushes the current phase's subset
+/// (empty ⇒ bare base). The shared resident DiT is NEVER touched, so this races no concurrent generate —
+/// the candle realization of MLX's per-phase-clone intent (candle's DiT is not a cheap `Clone`, so it
+/// re-adapts one job-local DiT instead of cloning the resident per phase).
+///
+/// **Per-phase guidance.** `guidance > 0` runs the true-CFG two-forward path (cond + uncond combined by
+/// the reference `krea_cfg_combine`); `guidance == 0` collapses to a single conditional forward. The
+/// caller encodes `neg_context` iff any phase uses CFG — a CFG phase with no negative context is a loud
+/// error (never a silent wrong render).
+///
+/// Multi-phase renders from pure noise and never routes the PiD decoder (rejected up front by
+/// `validate_phases`), so decode is always the native Qwen-VAE. `req.count` images, one per seed.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn render_multiphase(
+    vae: &QwenVae,
+    root: &Path,
+    device: &Device,
+    resolved: &[crate::multiphase::ResolvedPhase],
+    all_specs: &[AdapterSpec],
+    context: &Tensor,
+    neg_context: Option<&Tensor>,
+    req: &GenerationRequest,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Vec<Image>> {
+    // ONE global Raw schedule for the TOTAL step budget (sum of the phases' steps) — the crux that keeps
+    // the sigma trajectory continuous across boundaries (no per-phase recompute / reset).
+    let total = resolved.last().map(|p| p.slice.end).unwrap_or(0);
+    let sigmas = base_schedule(total, req.width, req.height, req.scheduler.as_deref());
+    let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
+
+    // The job-local base DiT the phases re-adapt (never the shared resident) — built ONCE per request and
+    // reused across the seed loop. Pre-resolve each phase's adapter spec subset (host-cheap; the adapter
+    // files are read at install time inside the loop).
+    let mut dit = load_dit_base(root, device)?;
+    let phase_specs: Vec<Vec<AdapterSpec>> = resolved
+        .iter()
+        .map(|p| crate::multiphase::phase_spec_subset(p, all_specs))
+        .collect();
+
+    candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
+        // Phase 0 starts from the initial noise at sigmas[0]; each subsequent phase resumes from the prior
+        // phase's output latent at the SHARED boundary sigma.
+        let mut latent = init_noise(req.height, req.width, seed, device)?;
+        for (phase, specs) in resolved.iter().zip(&phase_specs) {
+            // Re-adapt the job-local DiT to THIS phase's adapter set: clear the prior phase's residuals,
+            // then install the current subset (empty ⇒ bare base). Authoritative regardless of what the
+            // prior phase installed.
+            dit.clear_adapters()?;
+            if !specs.is_empty() {
+                crate::adapters::install_additive(&mut dit, specs, 0)?;
+            }
+            let end = phase.slice.end.min(sigmas.len().saturating_sub(1));
+            let start = phase.slice.start.min(end);
+            let sub = &sigmas[start..=end];
+            let guidance = phase.guidance;
+            latent = candle_gen::run_flow_sampler(
+                req.sampler.as_deref(),
+                TimestepConvention::Sigma,
+                sub,
+                latent,
+                seed,
+                &req.cancel,
+                on_progress,
+                |x, timestep| -> Result<Tensor> {
+                    let t = Tensor::from_vec(vec![timestep], (1,), device)?;
+                    let cond = dit.forward(x, &t, context)?;
+                    // Per-phase CFG: two forwards combined by the reference `krea_cfg_combine` when
+                    // guidance > 0; else the bare conditional velocity (single forward).
+                    let v = if guidance > 0.0 {
+                        let nc = neg_context.ok_or_else(|| {
+                            CandleError::Msg(
+                                "krea_2 multi-phase: a CFG phase (guidance > 0) requires the \
+                                 unconditional context, but none was encoded"
+                                    .into(),
+                            )
+                        })?;
+                        let uncond = dit.forward(x, &t, nc)?;
+                        krea_cfg_combine(&cond, &uncond, guidance)?
+                    } else {
+                        cond
+                    };
+                    Ok(v.to_dtype(DType::F32)?)
+                },
+            )?;
+        }
+        on_progress(Progress::Decoding);
+        let decoded = vae.decode(&latent)?.to_dtype(DType::F32)?;
         to_image(&decoded)
     })
 }
