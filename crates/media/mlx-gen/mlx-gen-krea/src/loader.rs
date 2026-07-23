@@ -79,8 +79,9 @@ pub fn load_transformer(root: impl AsRef<Path>) -> Result<Krea2Transformer> {
 ///
 /// The app detector only has the safetensors header. Here, before any dequantization, every I8
 /// projection must carry a real U8 JSON descriptor with `format=int8_tensorwise`, `per_row=true`, and
-/// no `convrot` field, plus an F32 `[out]` or `[out,1]` scale. The consumed companions are removed so
-/// the existing strict native-key remap still sees exactly the dense DiT surface.
+/// no `convrot` field, plus an F32 `[out]` or `[out,1]` scale (or scalar when `out == 1`). The consumed
+/// companions are removed so the existing strict native-key remap still sees exactly the dense DiT
+/// surface.
 fn dequant_plain_int8_tensorwise(mut native: Weights) -> Result<Weights> {
     let int8_weights: Vec<String> = native
         .keys()
@@ -173,9 +174,11 @@ fn dequant_plain_int8_tensorwise(mut native: Weights) -> Result<Weights> {
                 scale.dtype()
             )));
         }
-        if scale.shape() != [rows] && scale.shape() != [rows, 1] {
+        let scalar_single_row = rows == 1 && scale.shape().is_empty();
+        if !scalar_single_row && scale.shape() != [rows] && scale.shape() != [rows, 1] {
             return Err(Error::Msg(format!(
-                "krea plain int8: `{scale_key}` must be [{rows}] or [{rows},1], got {:?}",
+                "krea plain int8: `{scale_key}` must be [{rows}] or [{rows},1]{}; got {:?}",
+                if rows == 1 { " or scalar" } else { "" },
                 scale.shape()
             )));
         }
@@ -187,10 +190,10 @@ fn dequant_plain_int8_tensorwise(mut native: Weights) -> Result<Weights> {
         let scale = native
             .remove(&scale_key)
             .ok_or_else(|| Error::MissingTensor(scale_key.clone()))?;
-        let scale = if scale.shape().len() == 1 {
-            scale.reshape(&[rows, 1])?
-        } else {
-            scale
+        let scale = match scale.shape() {
+            [] if rows == 1 => scale.reshape(&[1, 1])?,
+            [_] => scale.reshape(&[rows, 1])?,
+            _ => scale,
         };
         let dense = multiply(&codes, &scale)?.as_dtype(Dtype::Bfloat16)?;
         // MLX is lazy: materialize projection-by-projection so the dense model does not retain a
@@ -234,10 +237,19 @@ mod tests {
     use mlx_rs::Array;
 
     fn plain_int8_weights(descriptor: &str, scale: Array) -> Weights {
+        plain_int8_weights_with_shape(descriptor, &[1_i8, -2, 3, -4, 5, -6], &[2, 3], scale)
+    }
+
+    fn plain_int8_weights_with_shape(
+        descriptor: &str,
+        codes: &[i8],
+        shape: &[i32],
+        scale: Array,
+    ) -> Weights {
         let mut weights = Weights::empty();
         weights.insert(
             "model.diffusion_model.blocks.0.attn.wq.weight",
-            Array::from_slice(&[1_i8, -2, 3, -4, 5, -6], &[2, 3]),
+            Array::from_slice(codes, shape),
         );
         weights.insert("model.diffusion_model.blocks.0.attn.wq.weight_scale", scale);
         weights.insert(
@@ -269,6 +281,23 @@ mod tests {
     }
 
     #[test]
+    fn plain_int8_accepts_scalar_scale_for_single_row() {
+        let weights = plain_int8_weights_with_shape(
+            r#"{"format":"int8_tensorwise","per_row":true}"#,
+            &[1_i8, -2, 3],
+            &[1, 3],
+            Array::from_slice(&[0.5_f32], &[]),
+        );
+        let dequant = dequant_plain_int8_tensorwise(weights).unwrap();
+        let got = dequant
+            .require("model.diffusion_model.blocks.0.attn.wq.weight")
+            .unwrap()
+            .as_dtype(Dtype::Float32)
+            .unwrap();
+        assert_eq!(got.as_slice::<f32>(), &[0.5, -1.0, 1.5]);
+    }
+
+    #[test]
     fn plain_int8_rejects_convrot_or_wrong_descriptor() {
         for (descriptor, expected) in [
             (
@@ -291,16 +320,21 @@ mod tests {
 
     #[test]
     fn plain_int8_rejects_non_per_row_scale_shape() {
-        let error = match dequant_plain_int8_tensorwise(plain_int8_weights(
-            r#"{"format":"int8_tensorwise","per_row":true}"#,
+        for scale in [
             Array::from_slice(&[0.5_f32], &[1]),
-        )) {
-            Ok(_) => panic!("wrong scale shape must fail"),
-            Err(error) => error.to_string(),
-        };
-        assert!(
-            error.contains("weight_scale") && error.contains("[2]"),
-            "{error}"
-        );
+            Array::from_slice(&[0.5_f32], &[]),
+        ] {
+            let error = match dequant_plain_int8_tensorwise(plain_int8_weights(
+                r#"{"format":"int8_tensorwise","per_row":true}"#,
+                scale,
+            )) {
+                Ok(_) => panic!("wrong scale shape must fail"),
+                Err(error) => error.to_string(),
+            };
+            assert!(
+                error.contains("weight_scale") && error.contains("[2]"),
+                "{error}"
+            );
+        }
     }
 }

@@ -168,8 +168,8 @@ impl Weights {
     /// read time — the DiT reads as **ordinary dense bf16** through the remap. `convrot` is **false**: no
     /// `convrot` is **false** for both forms. For int8, every real `.comfy_quant` descriptor must say
     /// `format=int8_tensorwise`, `per_row=true`, and omit `convrot`; every code tensor must be I8 and
-    /// have an F32 `[out]` or `[out,1]` scale. The constructor validates that data before any
-    /// dequantization. A present `convrot` field is rejected here and belongs to
+    /// have an F32 `[out]` or `[out,1]` scale (or scalar when `out == 1`). The constructor validates
+    /// that data before any dequantization. A present `convrot` field is rejected here and belongs to
     /// [`from_convrot_file`](Self::from_convrot_file), preventing the old group-size-256 fallback from
     /// silently rotating a plain file.
     pub fn from_native_file(path: &Path, device: &Device, dtype: DType) -> Result<Self> {
@@ -403,6 +403,7 @@ impl Weights {
             .load(&format!("{base}.weight_scale"), &self.device)?
             .to_dtype(DType::F32)?;
         let scale = match scale.dims() {
+            [] if rows == 1 => scale.reshape((1, 1))?,
             [_] => scale.reshape((rows, 1))?,
             [_, 1] => scale,
             dims => {
@@ -619,9 +620,11 @@ fn validate_plain_int8_tensorwise(st: &MmapedSafetensors) -> Result<bool> {
                 scale.dtype()
             )));
         }
-        if scale.shape() != [*rows] && scale.shape() != [*rows, 1] {
+        let scalar_single_row = *rows == 1 && scale.shape().is_empty();
+        if !scalar_single_row && scale.shape() != [*rows] && scale.shape() != [*rows, 1] {
             return Err(candle_gen::candle_core::Error::Msg(format!(
-                "krea plain int8: `{scale_key}` must be [{rows}] or [{rows},1], got {:?}",
+                "krea plain int8: `{scale_key}` must be [{rows}] or [{rows},1]{}; got {:?}",
+                if *rows == 1 { " or scalar" } else { "" },
                 scale.shape()
             )));
         }
@@ -1660,14 +1663,31 @@ mod tests {
         scale_shape: Vec<usize>,
         scales: &[f32],
     ) {
-        let codes = [
-            1_u8,
-            (-2_i8) as u8,
-            3_u8,
-            (-4_i8) as u8,
-            5_u8,
-            (-6_i8) as u8,
-        ];
+        write_plain_int8_native_file_with_shape(
+            path,
+            descriptor,
+            vec![2, 3],
+            &[
+                1_u8,
+                (-2_i8) as u8,
+                3_u8,
+                (-4_i8) as u8,
+                5_u8,
+                (-6_i8) as u8,
+            ],
+            scale_shape,
+            scales,
+        );
+    }
+
+    fn write_plain_int8_native_file_with_shape(
+        path: &Path,
+        descriptor: &str,
+        weight_shape: Vec<usize>,
+        codes: &[u8],
+        scale_shape: Vec<usize>,
+        scales: &[f32],
+    ) {
         let scale_bytes: Vec<u8> = scales
             .iter()
             .flat_map(|value| value.to_le_bytes())
@@ -1676,7 +1696,7 @@ mod tests {
         let mut tensors = std::collections::BTreeMap::new();
         tensors.insert(
             "model.diffusion_model.blocks.0.attn.wq.weight",
-            ::safetensors::tensor::TensorView::new(::safetensors::Dtype::I8, vec![2, 3], &codes)
+            ::safetensors::tensor::TensorView::new(::safetensors::Dtype::I8, weight_shape, codes)
                 .unwrap(),
         );
         tensors.insert(
@@ -1737,6 +1757,28 @@ mod tests {
     }
 
     #[test]
+    fn plain_int8_native_file_accepts_scalar_scale_for_single_row() -> Result<()> {
+        let path = std::env::temp_dir()
+            .join(format!("sc14023_plain_int8_scalar_{}", std::process::id()))
+            .join("kreamania_variant4.safetensors");
+        write_plain_int8_native_file_with_shape(
+            &path,
+            r#"{"format":"int8_tensorwise","per_row":true}"#,
+            vec![1, 3],
+            &[1_u8, (-2_i8) as u8, 3_u8],
+            vec![],
+            &[0.5],
+        );
+
+        let weights = Weights::from_native_file(&path, &Device::Cpu, DType::F32)?;
+        let got = weights.get("transformer_blocks.0.attn.to_q.weight")?;
+        assert_eq!(got.flatten_all()?.to_vec1::<f32>()?, vec![0.5, -1.0, 1.5]);
+
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        Ok(())
+    }
+
+    #[test]
     fn plain_int8_native_file_rejects_convrot_or_wrong_descriptor() {
         let cases = [
             (
@@ -1788,27 +1830,30 @@ mod tests {
 
     #[test]
     fn plain_int8_native_file_rejects_non_per_row_scale_shape() {
-        let path = std::env::temp_dir()
-            .join(format!(
-                "sc14023_plain_int8_bad_scale_{}",
-                std::process::id()
-            ))
-            .join("bad.safetensors");
-        write_plain_int8_native_file(
-            &path,
-            r#"{"format":"int8_tensorwise","per_row":true}"#,
-            vec![1],
-            &[0.5],
-        );
-        let error = match Weights::from_native_file(&path, &Device::Cpu, DType::F32) {
-            Ok(_) => panic!("wrong scale shape must fail"),
-            Err(error) => error.to_string(),
-        };
-        assert!(
-            error.contains("weight_scale") && error.contains("[2]"),
-            "{error}"
-        );
-        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        for (index, scale_shape) in [vec![1], vec![]].into_iter().enumerate() {
+            let path = std::env::temp_dir()
+                .join(format!(
+                    "sc14023_plain_int8_bad_scale_{}_{}",
+                    std::process::id(),
+                    index
+                ))
+                .join("bad.safetensors");
+            write_plain_int8_native_file(
+                &path,
+                r#"{"format":"int8_tensorwise","per_row":true}"#,
+                scale_shape,
+                &[0.5],
+            );
+            let error = match Weights::from_native_file(&path, &Device::Cpu, DType::F32) {
+                Ok(_) => panic!("wrong scale shape must fail"),
+                Err(error) => error.to_string(),
+            };
+            assert!(
+                error.contains("weight_scale") && error.contains("[2]"),
+                "{error}"
+            );
+            std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        }
     }
 
     /// **The dense-bf16 native path loads through the remap with NO rotation and NO int8 — the corruption
