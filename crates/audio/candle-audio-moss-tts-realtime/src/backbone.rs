@@ -11,7 +11,9 @@
 use candle_audio::candle_core::{Device, IndexOp, Result as CandleResult, Tensor};
 use candle_nn::{Embedding, Module, RmsNorm, VarBuilder};
 
-use crate::blocks::{causal_mask, rope_tables, rope_tables_at, BlockConfig, Layer, LayerKv};
+use crate::blocks::{
+    causal_mask, prefix_causal_mask, rope_tables, rope_tables_at, BlockConfig, Layer, LayerKv,
+};
 use crate::config::LanguageConfig;
 
 /// One backbone input position: the text-channel id and the `rvq` audio-codebook ids.
@@ -198,9 +200,17 @@ impl Backbone {
                 self.head_dim,
                 self.rope_theta,
             )?;
-            // Prefill: the T mutually-visible new positions need a causal mask (T ≥ 2 in practice).
+            // Prefill: the T mutually-visible new positions need a mask that is causal within the new
+            // block AND lets them attend over any prior cached turns (offset > 0 on a warm multi-turn
+            // cache; offset == 0 for turn 0, where this is exactly the plain causal mask). T ≥ 2 in
+            // practice (T == 1 is the step path above).
             let mask = if t > 1 {
-                Some(causal_mask(&self.device, t, h.dtype())?)
+                Some(prefix_causal_mask(
+                    &self.device,
+                    cache.offset,
+                    t,
+                    h.dtype(),
+                )?)
             } else {
                 None
             };
@@ -356,6 +366,84 @@ mod tests {
                 &format!("step {i} hidden must match forward_last over the full prefix"),
             );
             assert_eq!(cache.offset(), all.len());
+        }
+    }
+
+    /// **Warm-cache multi-turn prefill** (sc-14151): a SECOND `prefill` onto an already-warm cache
+    /// (offset > 0) — the turn-N prefill of the conversation engine — attends over the prior turns and
+    /// matches the stateless recompute over the full concatenated sequence. This exercises the
+    /// `prefix_causal_mask` (a `[t, offset+t]` mask, not the fresh-cache `[t, t]`); a wrong mask
+    /// (masking the prior turns, or mis-aligning) diverges by orders of magnitude beyond fp rounding.
+    #[test]
+    fn warm_cache_second_prefill_matches_full_recompute() {
+        const TOL: f32 = 1e-4;
+        let assert_close = |a: &Tensor, b: &Tensor, ctx: &str| {
+            let av = a.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            let bv = b.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            assert_eq!(av.len(), bv.len(), "{ctx}: length mismatch");
+            let max = av
+                .iter()
+                .zip(&bv)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0_f32, f32::max);
+            assert!(max < TOL, "{ctx}: max abs diff {max} exceeds {TOL}");
+        };
+        let cfg = tiny_cfg();
+        let bb = tiny_backbone(&cfg);
+
+        // Turn 0: a 4-position prompt + 3 fed-back frames (the assistant's generated audio).
+        let turn0_prompt: Vec<Frame> = (0..4)
+            .map(|k| frame(&cfg, k as u32 + 3, k as u32 + 1))
+            .collect();
+        let turn0_fed: Vec<Frame> = (0..3)
+            .map(|k| frame(&cfg, cfg.text_pad, (k as u32 + 10) * 7))
+            .collect();
+        // Turn 1: a 3-position prompt (a warm prefill onto the cache) + 2 fed-back frames.
+        let turn1_prompt: Vec<Frame> = (0..3)
+            .map(|k| frame(&cfg, k as u32 + 5, k as u32 + 20))
+            .collect();
+        let turn1_fed: Vec<Frame> = (0..2)
+            .map(|k| frame(&cfg, cfg.text_pad, (k as u32 + 40) * 3))
+            .collect();
+
+        let mut all: Vec<Frame> = Vec::new();
+        let mut cache = bb.new_cache();
+
+        // Turn 0 prefill (fresh cache, offset 0).
+        all.extend(turn0_prompt.clone());
+        let c = bb.prefill(&turn0_prompt, &mut cache).unwrap();
+        assert_close(&c, &bb.forward_last(&all).unwrap(), "turn0 prefill");
+        for (i, f) in turn0_fed.iter().enumerate() {
+            all.push(f.clone());
+            let c = bb.step(f, &mut cache).unwrap();
+            assert_close(
+                &c,
+                &bb.forward_last(&all).unwrap(),
+                &format!("turn0 step {i}"),
+            );
+        }
+
+        // Turn 1 prefill onto the WARM cache (offset > 0) — the multi-turn continuation.
+        assert!(
+            cache.offset() > 0,
+            "cache is warm before the second prefill"
+        );
+        all.extend(turn1_prompt.clone());
+        let c = bb.prefill(&turn1_prompt, &mut cache).unwrap();
+        assert_close(
+            &c,
+            &bb.forward_last(&all).unwrap(),
+            "turn1 warm prefill must attend over turn 0 (prefix_causal_mask)",
+        );
+        assert_eq!(cache.offset(), all.len());
+        for (i, f) in turn1_fed.iter().enumerate() {
+            all.push(f.clone());
+            let c = bb.step(f, &mut cache).unwrap();
+            assert_close(
+                &c,
+                &bb.forward_last(&all).unwrap(),
+                &format!("turn1 step {i}"),
+            );
         }
     }
 }

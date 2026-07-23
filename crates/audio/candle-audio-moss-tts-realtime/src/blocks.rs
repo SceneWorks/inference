@@ -395,8 +395,37 @@ pub fn rope_tables_at(
 
 /// A `[1, 1, len, len]` additive causal mask (`0` on/below the diagonal, `-inf` above).
 pub fn causal_mask(device: &Device, len: usize, dtype: DType) -> CandleResult<Tensor> {
-    let data: Vec<f32> = (0..len)
-        .flat_map(|i| (0..len).map(move |j| if j <= i { 0.0 } else { f32::NEG_INFINITY }))
+    prefix_causal_mask(device, 0, len, dtype)
+}
+
+/// The attention mask for prefilling `t` new positions onto a cache that already holds `offset`
+/// prior positions (multi-turn warm-cache prefill, sc-14151) — shape `[1, 1, t, offset + t]`.
+///
+/// Row `i` (the new position at absolute index `offset + i`) may attend to: **every** prior cached
+/// position (columns `0..offset`, all visible), and the new positions `offset..=offset + i` (causal
+/// among the new block); positions `> offset + i` are masked with `-inf`. This is the reference's
+/// `torch.cat([cached_mask, new_prefill_mask], dim=-1)` over the retained KV — so turn *N* attends
+/// over turns `1..N-1` while staying causal within its own block. With `offset == 0` it is exactly
+/// [`causal_mask`], so the single-turn / turn-0 prefill is byte-identical to before.
+pub fn prefix_causal_mask(
+    device: &Device,
+    offset: usize,
+    t: usize,
+    dtype: DType,
+) -> CandleResult<Tensor> {
+    let cols = offset + t;
+    let data: Vec<f32> = (0..t)
+        .flat_map(|i| {
+            (0..cols).map(move |j| {
+                // Prior cached columns (j < offset) are always visible; among the new block a query
+                // at absolute `offset + i` sees keys at absolute `j <= offset + i`.
+                if j <= offset + i {
+                    0.0
+                } else {
+                    f32::NEG_INFINITY
+                }
+            })
+        })
         .collect();
-    Tensor::from_vec(data, (1, 1, len, len), device)?.to_dtype(dtype)
+    Tensor::from_vec(data, (1, 1, t, cols), device)?.to_dtype(dtype)
 }
