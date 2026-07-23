@@ -110,7 +110,9 @@ pub fn descriptor() -> ModelDescriptor {
             supports_negative_prompt: false,
             supports_guidance: false,
             supports_true_cfg: false,
-            conditioning: Vec::new(),
+            // Voice cloning (sc-14149): a reference clip is supplied as `Conditioning::ReferenceAudio`
+            // and encoded into the timbre prompt. Absent it, the model uses its default voice.
+            conditioning: vec![gen_core::ConditioningKind::ReferenceAudio],
             supports_lora: false,
             supports_lokr: false,
             samplers: vec![],
@@ -243,6 +245,19 @@ fn lock_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     }
 }
 
+/// Downmix an interleaved [`AudioTrack`] to mono for codec analysis (the voice-clone reference input).
+fn mono_samples(track: &AudioTrack) -> Vec<f32> {
+    let ch = (track.channels as usize).max(1);
+    if ch == 1 {
+        return track.samples.clone();
+    }
+    track
+        .samples
+        .chunks(ch)
+        .map(|frame| frame.iter().sum::<f32>() / ch as f32)
+        .collect()
+}
+
 impl MossTtsRealtimeGenerator {
     fn pipeline(&self) -> gen_core::Result<Arc<Loaded>> {
         let mut guard = lock_recover(&self.loaded);
@@ -252,6 +267,35 @@ impl MossTtsRealtimeGenerator {
         let built = Arc::new(Loaded::from_snapshot(&self.root)?);
         *guard = Some(built.clone());
         Ok(built)
+    }
+
+    /// Encode the request's optional [`gen_core::Conditioning::ReferenceAudio`] clip into RVQ prompt
+    /// frames for voice cloning (sc-14149), or `None` when no reference clip is supplied (the default
+    /// voice). The reference waveform is downmixed to mono and run through the codec's analysis
+    /// encoder ([`crate::codec::MossAudioCodec::encode`]); the codes become the timbre prompt in
+    /// [`build_prompt_frames`].
+    fn reference_codes(&self, req: &GenerationRequest) -> gen_core::Result<Option<Vec<Vec<u32>>>> {
+        let Some(track) = req.conditioning.iter().find_map(|c| match c {
+            gen_core::Conditioning::ReferenceAudio { audio, .. } => Some(audio),
+            _ => None,
+        }) else {
+            return Ok(None);
+        };
+        let rvq = self.pipeline()?.decoder.cfg.rvq;
+        let codec = self.codec(rvq)?;
+        let codes = codec
+            .encode(&mono_samples(track), track.sample_rate)
+            .map_err(|e| {
+                gen_core::Error::Msg(format!("{MODEL_ID}: encode reference audio: {e}"))
+            })?;
+        if codes.is_empty() {
+            return Err(gen_core::Error::Msg(format!(
+                "{MODEL_ID}: reference audio too short to clone (needs ≥ {} samples at {} Hz)",
+                codec.samples_per_frame(),
+                codec.sample_rate(),
+            )));
+        }
+        Ok(Some(codes))
     }
 
     /// Run the AR brain on real weights and return the emitted RVQ frames (each `rvq` codebook
@@ -267,8 +311,14 @@ impl MossTtsRealtimeGenerator {
             return Err(gen_core::Error::Canceled);
         }
         let pipeline = self.pipeline()?;
-        let plan = build_prompt_frames(&pipeline.tokenizer, &pipeline.decoder.cfg, &req.prompt)
-            .map_err(gen_core::Error::Msg)?;
+        let reference = self.reference_codes(req)?;
+        let plan = build_prompt_frames(
+            &pipeline.tokenizer,
+            &pipeline.decoder.cfg,
+            &req.prompt,
+            reference.as_deref(),
+        )
+        .map_err(gen_core::Error::Msg)?;
         let budget = frame_budget(req);
         let total = budget as u32;
         // Deterministic token sampling seeded by the request (a `None` seed maps to a fixed constant),
@@ -345,8 +395,14 @@ impl MossTtsRealtimeGenerator {
         let pipeline = self.pipeline()?;
         let codec = self.codec(pipeline.decoder.cfg.rvq)?;
 
-        let plan = build_prompt_frames(&pipeline.tokenizer, &pipeline.decoder.cfg, &req.prompt)
-            .map_err(gen_core::Error::Msg)?;
+        let reference = self.reference_codes(req)?;
+        let plan = build_prompt_frames(
+            &pipeline.tokenizer,
+            &pipeline.decoder.cfg,
+            &req.prompt,
+            reference.as_deref(),
+        )
+        .map_err(gen_core::Error::Msg)?;
         let budget = frame_budget(req);
         let total = budget as u32;
         // Deterministic token sampling seeded by the request (a `None` seed maps to a fixed constant),

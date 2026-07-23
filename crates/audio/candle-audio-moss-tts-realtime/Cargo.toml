@@ -33,6 +33,10 @@ sceneworks-gen-core-testkit = { workspace = true }
 # MOSS-TTS-Realtime WAV → Whisper transcript → CER assertion (same round-trip pattern the whisper
 # crate uses with Kokoro). Dev-only; no runtime edge, so the shipping catalog surface is unchanged.
 candle-audio-whisper = { path = "../candle-audio-whisper" }
+# The shipped Chatterbox CAMPPlus x-vector speaker encoder drives the sc-14149 voice-clone
+# speaker-identity gate (the cloned output resembles the reference speaker more than the default
+# voice). Dev-only + env-gated (CHATTERBOX_SNAPSHOT), so the shipping surface is unchanged.
+candle-audio-chatterbox = { path = "../candle-audio-chatterbox" }
 
 [features]
 default = []

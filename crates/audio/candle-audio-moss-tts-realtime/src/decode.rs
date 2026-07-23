@@ -42,6 +42,17 @@ pub const DELAY_TOKENS_LEN: usize = 12;
 /// the assistant response, not wrapped in a `<|im_start|>user\n…<|im_end|>` turn (sc-13570).
 const ASSISTANT_OPEN: &str = "<|im_start|>assistant\n";
 
+/// The reference voice-clone `context` block (`MossTTSRealtimeProcessor.make_voice_clone_prompt`),
+/// split around the `<|audio_pad|>` run that carries the reference-speaker timbre. `T_audio`
+/// [`AUDIO_PAD_STR`] tokens are emitted between the prefix and suffix, one per reference-audio frame;
+/// the encoded reference codes ride the audio channels of those positions (sc-14149).
+const VOICE_CLONE_PREFIX: &str =
+    "<|im_start|>context\nThe assistant section should be synthesized using the following voice timbre:";
+const VOICE_CLONE_SUFFIX: &str = "<|im_end|>\n";
+/// The `<|audio_pad|>` marker (`reference_audio_pad`, 151654) whose positions carry the reference
+/// timbre codes on the audio channels.
+const AUDIO_PAD_STR: &str = "<|audio_pad|>";
+
 /// The prefill prompt frames plus the text tokens to stream during generation — the two halves of the
 /// reference delay-pattern conditioning (sc-13570).
 pub struct PromptPlan {
@@ -63,6 +74,13 @@ pub struct PromptPlan {
 /// - Every audio channel is `AUDIO_CHANNEL_PAD`, except codebook 0 of the **last prefilled text**
 ///   position, which is `AUDIO_BOS` to kick off audio generation aligned with the text stream.
 ///
+/// **Voice cloning (sc-14149):** when `reference_audio` (the encoded reference clip, `[T_audio][rvq]`
+/// codebook rows) is supplied, a `context` timbre block is inserted into the system prompt —
+/// `<|im_start|>context\n…voice timbre:{<|audio_pad|>×T_audio}<|im_end|>\n` — and the reference codes
+/// are threaded onto the audio channels of exactly those `<|audio_pad|>` (`reference_audio_pad`)
+/// positions, in order (the reference `MossTTSRealtimeProcessor.make_ensemble`). The rest is
+/// unchanged, so the cloned voice conditions the same delay-pattern text generation.
+///
 /// The system prompt, assistant opener, and text are tokenized **separately** and concatenated (the
 /// reference tokenizes `make_ensemble` and the text independently); this tokenizer adds no special
 /// tokens, so a separate encode equals a slice of the joint encode.
@@ -70,6 +88,7 @@ pub fn build_prompt_frames(
     tokenizer: &Tokenizer,
     cfg: &MossTtsRealtimeConfig,
     text: &str,
+    reference_audio: Option<&[Vec<u32>]>,
 ) -> Result<PromptPlan, String> {
     let encode = |s: &str, what: &str| {
         tokenizer
@@ -77,7 +96,15 @@ pub fn build_prompt_frames(
             .map(|e| e.get_ids().to_vec())
             .map_err(|e| format!("tokenize {what}: {e}"))
     };
-    let system = encode(TTS_SYSTEM_PROMPT, "system prompt")?;
+    // The system prompt, plus the voice-clone timbre `context` block when a reference clip is given.
+    let system_text = match reference_audio {
+        Some(codes) if !codes.is_empty() => format!(
+            "{TTS_SYSTEM_PROMPT}{VOICE_CLONE_PREFIX}{pads}{VOICE_CLONE_SUFFIX}",
+            pads = AUDIO_PAD_STR.repeat(codes.len()),
+        ),
+        _ => TTS_SYSTEM_PROMPT.to_string(),
+    };
+    let system = encode(&system_text, "system prompt")?;
     let assistant = encode(ASSISTANT_OPEN, "assistant open")?;
     let text_ids = encode(text, "prompt text")?;
     if text_ids.is_empty() {
@@ -87,14 +114,42 @@ pub fn build_prompt_frames(
         text: id,
         audio: vec![AUDIO_CHANNEL_PAD; cfg.rvq],
     };
-    // system + assistant-open, then the first DELAY_TOKENS_LEN text tokens (all in the prefill).
     let prefill_text = text_ids.len().min(DELAY_TOKENS_LEN);
-    let mut prefill: Vec<Frame> = system
-        .iter()
-        .chain(&assistant)
-        .chain(&text_ids[..prefill_text])
-        .map(|&id| pad_frame(id))
-        .collect();
+    // System frames, with the reference-audio codes threaded onto the `<|audio_pad|>` positions'
+    // audio channels (make_ensemble fills `[audio_pad_start..=audio_pad_end, 1:] = prompt_audio_tokens`).
+    let mut prefill: Vec<Frame> = Vec::with_capacity(system.len() + assistant.len() + prefill_text);
+    let mut audio_idx = 0usize;
+    for &id in &system {
+        let mut frame = pad_frame(id);
+        if id == cfg.reference_audio_pad {
+            let codes = reference_audio.expect("audio_pad emitted only for a reference clip");
+            let row = codes.get(audio_idx).ok_or_else(|| {
+                format!("voice-clone: audio_pad position {audio_idx} exceeds the reference frames")
+            })?;
+            if row.len() != cfg.rvq {
+                return Err(format!(
+                    "voice-clone: reference frame {audio_idx} has {} codes, expected {}",
+                    row.len(),
+                    cfg.rvq
+                ));
+            }
+            frame.audio = row.clone();
+            audio_idx += 1;
+        }
+        prefill.push(frame);
+    }
+    if let Some(codes) = reference_audio {
+        if audio_idx != codes.len() {
+            return Err(format!(
+                "voice-clone: {} reference frames but {audio_idx} <|audio_pad|> positions",
+                codes.len()
+            ));
+        }
+    }
+    // assistant-open, then the first DELAY_TOKENS_LEN text tokens (all in the prefill).
+    for &id in assistant.iter().chain(&text_ids[..prefill_text]) {
+        prefill.push(pad_frame(id));
+    }
     // AUDIO_BOS on codebook 0 of the last prefilled text position (prefill_text ≥ 1 here).
     prefill
         .last_mut()
@@ -468,5 +523,82 @@ mod tests {
             with_stream.frames, again.frames,
             "seeded AR decode over a streamed prompt is reproducible"
         );
+    }
+
+    /// A minimal WordLevel tokenizer where `<|audio_pad|>` is an added special token with id 7 (= the
+    /// tiny config's `reference_audio_pad`) and every other chunk falls back to `<unk>` (0) — enough
+    /// to exercise the voice-clone prompt construction without real weights. Built from JSON to
+    /// sidestep the builder's ahash-typed vocab.
+    fn voice_clone_tokenizer() -> Tokenizer {
+        let json = r#"{
+          "version": "1.0", "truncation": null, "padding": null,
+          "added_tokens": [
+            {"id": 7, "content": "<|audio_pad|>", "single_word": false, "lstrip": false,
+             "rstrip": false, "normalized": false, "special": true}
+          ],
+          "normalizer": null, "pre_tokenizer": null, "post_processor": null, "decoder": null,
+          "model": {"type": "WordLevel",
+            "vocab": {"<unk>": 0, "f1": 1, "f2": 2, "f3": 3, "f4": 4, "f5": 5, "f6": 6},
+            "unk_token": "<unk>"}
+        }"#;
+        json.parse()
+            .expect("build the synthetic voice-clone tokenizer")
+    }
+
+    #[test]
+    fn voice_clone_threads_reference_codes_onto_audio_pad_positions() {
+        let cfg = tiny_cfg(); // reference_audio_pad = 7, rvq = 4
+        let tk = voice_clone_tokenizer();
+        // 3 reference frames, `rvq` (4) codes each — distinct so ordering is checkable.
+        let refc: Vec<Vec<u32>> = vec![vec![1, 2, 3, 4], vec![5, 6, 7, 0], vec![2, 4, 6, 1]];
+        let plan = build_prompt_frames(&tk, &cfg, "hello", Some(&refc)).unwrap();
+
+        // Exactly one audio_pad position per reference frame, carrying its codes IN ORDER.
+        let pads: Vec<&Frame> = plan
+            .prefill
+            .iter()
+            .filter(|f| f.text == cfg.reference_audio_pad)
+            .collect();
+        assert_eq!(
+            pads.len(),
+            refc.len(),
+            "one audio_pad position per reference frame"
+        );
+        for (frame, row) in pads.iter().zip(&refc) {
+            assert_eq!(
+                &frame.audio, row,
+                "reference codes threaded in order onto the audio channels"
+            );
+        }
+        // Non-audio_pad frames keep the pad fill (except the BOS frame's codebook 0).
+        for f in &plan.prefill {
+            if f.text != cfg.reference_audio_pad && f.audio[0] != AUDIO_BOS {
+                assert!(
+                    f.audio.iter().all(|&c| c == AUDIO_CHANNEL_PAD),
+                    "non-reference positions stay padded"
+                );
+            }
+        }
+        // AUDIO_BOS lands on the LAST prefill position, which is a TEXT token — never an audio_pad.
+        let last = plan.prefill.last().unwrap();
+        assert_eq!(
+            last.audio[0], AUDIO_BOS,
+            "BOS on the last prefilled position"
+        );
+        assert_ne!(
+            last.text, cfg.reference_audio_pad,
+            "BOS is on the last text token, not a reference-audio position"
+        );
+
+        // No reference clip ⇒ no audio_pad positions (the default-voice path is unchanged).
+        let plain = build_prompt_frames(&tk, &cfg, "hello", None).unwrap();
+        assert!(plain
+            .prefill
+            .iter()
+            .all(|f| f.text != cfg.reference_audio_pad));
+
+        // A reference frame with the wrong code count is a typed error, not silent corruption.
+        let bad: Vec<Vec<u32>> = vec![vec![1, 2]]; // 2 codes, cfg.rvq == 4
+        assert!(build_prompt_frames(&tk, &cfg, "hello", Some(&bad)).is_err());
     }
 }
