@@ -733,6 +733,172 @@ fn moss_audio_codec_encode_roundtrip_and_reference() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// sc-14181 — chunked/streaming encode for long reference clips. The first analysis stage runs at
+// ~100 fps, so a single-shot encode materializes a `[1, H, T, T]` attention that is quadratic in the
+// clip length (a 60 s clip → T ≈ 6000 → multi-GB per layer). The streaming path bounds that to
+// `[1, H, chunk, chunk + context]` per layer. This gate asserts the two paths emit **identical
+// codes** on a real ≥ 30 s clip, and that the streaming path's peak RSS sits well below single-shot's.
+// ---------------------------------------------------------------------------------------------
+
+/// Current resident-set size of this process, in bytes, via `ps -o rss=` (KiB on both macOS and
+/// Linux). Unlike `getrusage`'s `ru_maxrss` — a monotonic high-water mark the 7 GB codec load already
+/// pins far above any encode transient — this reads the *instantaneous* RSS, so a sampler can catch
+/// the transient attention spike. `0` if the probe fails (the memory assertion then no-ops).
+fn current_rss_bytes() -> u64 {
+    std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .map(|kib| kib * 1024)
+        .unwrap_or(0)
+}
+
+/// Run `f` while a background thread samples [`current_rss_bytes`] every few ms, and return
+/// `(result, peak_rss_during_f)`. Used to measure each encode path's transient memory spike.
+fn with_peak_rss<T>(f: impl FnOnce() -> T) -> (T, u64) {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Arc;
+    let stop = Arc::new(AtomicBool::new(false));
+    let peak = Arc::new(AtomicU64::new(0));
+    let (s, p) = (Arc::clone(&stop), Arc::clone(&peak));
+    let sampler = std::thread::spawn(move || {
+        while !s.load(Ordering::Relaxed) {
+            p.fetch_max(current_rss_bytes(), Ordering::Relaxed);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    });
+    let out = f();
+    peak.fetch_max(current_rss_bytes(), Ordering::Relaxed);
+    stop.store(true, Ordering::Relaxed);
+    sampler.join().expect("rss sampler thread");
+    (out, peak.load(Ordering::Relaxed))
+}
+
+/// Total number of differing codes between two `frames[T][nq]` grids (plus any length gap), for the
+/// single-shot-vs-chunked equality gate.
+fn count_code_mismatches(a: &[Vec<u32>], b: &[Vec<u32>]) -> usize {
+    let mut diff = 0usize;
+    for (fa, fb) in a.iter().zip(b.iter()) {
+        let n = fa.len().max(fb.len());
+        for q in 0..n {
+            if fa.get(q) != fb.get(q) {
+                diff += 1;
+            }
+        }
+    }
+    diff + a.len().abs_diff(b.len()) * 16
+}
+
+/// The sc-14181 DoD gate: on a real ≥ 30 s clip the chunked/streaming encode is **byte-identical** to
+/// the single-shot encode (code for code, at two chunk durations), and its peak memory is bounded well
+/// below the single-shot quadratic attention. Deterministic on the CPU default build (no metal/cuda
+/// feature) — see the `codec::tests::chunked_stage_matches_single_shot` unit gate for the stage-level
+/// equivalence proof this end-to-end test complements.
+#[test]
+#[ignore = "real weights: needs the ~7.1 GB MOSS-Audio-Tokenizer codec snapshot; run with --ignored --nocapture"]
+fn moss_audio_codec_chunked_encode_matches_single_shot() {
+    use candle_audio_moss_tts_realtime::codec::MossAudioCodec;
+    let codec = MossAudioCodec::load(&codec_dir(), 16).expect("load codec");
+
+    // A realistic ~32 s codec-manifold clip: decode a fixed pseudo-random 400-frame RVQ pattern
+    // (12.5 fps → 400 frames = 32.0 s @ 24 kHz). Decoding is cheap (the decoder runs at 12.5 fps); the
+    // encoder is where T explodes (its first stage runs at 100 fps → T ≈ 3200 for this clip).
+    let n_frames = 400usize;
+    let mut state: u32 = 0x0012_3455;
+    let mut next = || {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        (state >> 8) % 1024
+    };
+    let pattern: Vec<Vec<u32>> = (0..n_frames)
+        .map(|_| (0..16).map(|_| next()).collect())
+        .collect();
+    let clip = codec
+        .decode_frames(&pattern, &|| false)
+        .expect("decode long clip")
+        .expect("not cancelled");
+    let secs = clip.len() as f32 / moss::codec::SAMPLE_RATE as f32;
+    assert!(
+        secs >= 30.0,
+        "clip must be ≥ 30 s to exercise the bound (got {secs:.1}s)"
+    );
+
+    // Warm the lazy encoder half (mmap + build) on a short slice so the memory probe below measures
+    // the analysis attention, not the one-time weight fault-in.
+    let warm_len = 48_000.min(clip.len());
+    let _ = codec
+        .encode_chunked(&clip[..warm_len], moss::codec::SAMPLE_RATE, 10.0)
+        .expect("warm encoder half");
+
+    // Sample the instantaneous RSS spike each path adds above its immediately-preceding resting RSS,
+    // so the transient attention allocation is isolated from the (huge, already-resident) model.
+    let rest_chunk = current_rss_bytes();
+    let (chunked_small, peak_chunk) = with_peak_rss(|| {
+        codec
+            .encode_chunked(&clip, moss::codec::SAMPLE_RATE, 1.5)
+            .expect("chunked encode (1.5 s window)")
+    });
+    let rest_single = current_rss_bytes();
+    let (single, peak_single) = with_peak_rss(|| {
+        codec
+            .encode_single_shot(&clip, moss::codec::SAMPLE_RATE)
+            .expect("single-shot encode")
+    });
+    let chunked_big = codec
+        .encode_chunked(&clip, moss::codec::SAMPLE_RATE, 10.0)
+        .expect("chunked encode (10 s window)");
+
+    // (1) Identity — the DoD's primary bar: chunked matches single-shot exactly, at both windows.
+    assert_eq!(
+        single.len(),
+        chunked_small.len(),
+        "frame count: single-shot vs chunked(1.5 s)"
+    );
+    assert_eq!(
+        single.len(),
+        chunked_big.len(),
+        "frame count: single-shot vs chunked(10 s)"
+    );
+    let miss_small = count_code_mismatches(&single, &chunked_small);
+    let miss_big = count_code_mismatches(&single, &chunked_big);
+    let total_codes = single.len() * 16;
+    println!(
+        "sc-14181 chunked encode: {} frames ({secs:.1}s, {total_codes} codes); mismatches vs \
+         single-shot — chunked(1.5s)={miss_small}, chunked(10s)={miss_big}",
+        single.len()
+    );
+    assert_eq!(
+        miss_small, 0,
+        "chunked(1.5 s) must reproduce single-shot codes exactly ({miss_small}/{total_codes} differ)"
+    );
+    assert_eq!(
+        miss_big, 0,
+        "chunked(10 s) must reproduce single-shot codes exactly ({miss_big}/{total_codes} differ)"
+    );
+
+    // (2) Memory bound: single-shot's quadratic first-stage attention spikes materially above the
+    // bounded streaming path. For this clip the first stage is ~[1,20,3200,3200] f32 ≈ 780 MB/layer
+    // single-shot vs the chunked ~[1,20,~150,~1150] ≈ 55 MB — a several-hundred-MB gap.
+    let chunk_spike = peak_chunk.saturating_sub(rest_chunk);
+    let single_spike = peak_single.saturating_sub(rest_single);
+    println!(
+        "sc-14181 transient RSS spike above resting: chunked(1.5s) +{:.0} MB, single-shot +{:.0} MB",
+        chunk_spike as f64 / 1e6,
+        single_spike as f64 / 1e6,
+    );
+    if peak_chunk > 0 && peak_single > 0 {
+        assert!(
+            single_spike > chunk_spike + 200_000_000,
+            "single-shot's transient RSS spike (+{} MB) should exceed the chunked path's (+{} MB) by \
+             >200 MB — the streaming path is not bounding the first-stage attention",
+            single_spike / 1_000_000,
+            chunk_spike / 1_000_000,
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // sc-14149 — voice cloning: generate the same text with the default voice and with a reference
 // clip; both must be intelligible (ASR CER) and the cloned output must DIFFER from the default
 // (the reference timbre conditioning takes effect). `MOSS_VOICECLONE_REF` = a 24 kHz f32-LE mono

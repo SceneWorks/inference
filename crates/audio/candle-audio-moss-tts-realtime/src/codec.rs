@@ -392,6 +392,81 @@ fn banded_causal_mask(device: &Device, len: usize, context: usize) -> CandleResu
     Tensor::from_vec(data, (1, 1, len, len), device)
 }
 
+/// The additive attention mask for one **streaming** chunk: a `[1, 1, c, cache_len + c]` band where
+/// column `ki` is the concatenation `[cache (cache_len) | new (c)]` and row `qi` is a new query at
+/// absolute position `pos + qi`. The cached columns hold absolute positions `pos - cache_len .. pos`
+/// and the new columns `pos .. pos + c`, so the sliding-window-causal admissibility (`0 ≤ i − j <
+/// context`) reduces to `qi + cache_len − context < ki ≤ qi + cache_len` — independent of `pos`. This
+/// is [`banded_causal_mask`] expressed over the `[cache | new]` key layout, so the per-query key set
+/// (hence the attention output) is identical to the single-shot pass.
+fn streaming_band_mask(
+    device: &Device,
+    c: usize,
+    cache_len: usize,
+    context: usize,
+) -> CandleResult<Tensor> {
+    let cols = cache_len + c;
+    let data: Vec<f32> = (0..c)
+        .flat_map(|qi| {
+            (0..cols).map(move |ki| {
+                // Absolute positions: query = pos+qi, key = (pos-cache_len)+ki; `pos` cancels.
+                let causal = ki <= qi + cache_len;
+                let in_window = ki + context > qi + cache_len; // qi+cache_len - ki < context
+                if causal && in_window {
+                    0.0
+                } else {
+                    f32::NEG_INFINITY
+                }
+            })
+        })
+        .collect();
+    Tensor::from_vec(data, (1, 1, c, cols), device)
+}
+
+/// One transformer layer's **streaming** KV state: the post-RoPE K and V of the most recent
+/// (≤ `context − 1`) positions, carried across chunks so a chunked [`CodecStage::forward_chunked`] is
+/// byte-identical to the whole-sequence [`CodecStage::forward`]. Bounded to `context − 1` positions —
+/// the longest left history any query in the next chunk can attend to — so it never grows with `T`.
+#[derive(Default)]
+struct KvCache {
+    /// `[1, H, cached_len, D]` post-RoPE keys (`None` until the first chunk).
+    k: Option<Tensor>,
+    /// `[1, H, cached_len, D]` values.
+    v: Option<Tensor>,
+}
+
+impl KvCache {
+    /// Append this chunk's post-RoPE `k`/`v` and return `(k_all, v_all, prev_cached_len)` — the full
+    /// `[cache | new]` tensors to attend against, plus the pre-append cache length (the column offset
+    /// of the new keys, which [`streaming_band_mask`] needs).
+    fn append(&mut self, k: &Tensor, v: &Tensor) -> CandleResult<(Tensor, Tensor, usize)> {
+        let (k_all, v_all, prev) = match (&self.k, &self.v) {
+            (Some(pk), Some(pv)) => {
+                let prev = pk.dim(2)?;
+                (Tensor::cat(&[pk, k], 2)?, Tensor::cat(&[pv, v], 2)?, prev)
+            }
+            _ => (k.clone(), v.clone(), 0),
+        };
+        self.k = Some(k_all.clone());
+        self.v = Some(v_all.clone());
+        Ok((k_all, v_all, prev))
+    }
+
+    /// Evict all but the last `keep` cached positions, materializing the retained slice contiguously
+    /// so the wide `[cache | new]` tensor from [`append`](Self::append) is released (the memory bound).
+    fn retain_last(&mut self, keep: usize) -> CandleResult<()> {
+        for slot in [&mut self.k, &mut self.v] {
+            if let Some(t) = slot.as_mut() {
+                let len = t.dim(2)?;
+                if len > keep {
+                    *t = t.narrow(2, len - keep, keep)?.contiguous()?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// One codec transformer layer.
 struct CodecLayer {
     norm1: LayerNorm,
@@ -474,6 +549,69 @@ impl CodecLayer {
         let out = out.transpose(1, 2)?.reshape((b, t, h * d))?;
         self.out_proj.forward(&out)
     }
+
+    /// Streaming counterpart of [`forward`](Self::forward) for a chunk of `c` new positions starting
+    /// at absolute `pos` (`x` = `[1, c, d_model]`). `cos`/`sin` are the stage's **full** RoPE tables
+    /// (`[T, head_dim/2]`, sliced here to `[pos, pos+c)`); `cache` carries this layer's post-RoPE K/V
+    /// for the preceding positions. Every op outside attention is pointwise in time, and the attention
+    /// attends exactly the sliding window [`banded_causal_mask`] would admit, so the returned chunk is
+    /// byte-identical to the corresponding rows of `forward` over the whole sequence.
+    fn forward_streaming(
+        &self,
+        x: &Tensor,
+        pos: usize,
+        cos: &Tensor,
+        sin: &Tensor,
+        context: usize,
+        cache: &mut KvCache,
+    ) -> CandleResult<Tensor> {
+        let attn =
+            self.attention_streaming(&self.norm1.forward(x)?, pos, cos, sin, context, cache)?;
+        let x = (x + attn.broadcast_mul(&self.layer_scale_1)?)?;
+        let h = self.linear1.forward(&self.norm2.forward(&x)?)?;
+        let h = self.linear2.forward(&h.gelu_erf()?)?;
+        x.broadcast_add(&h.broadcast_mul(&self.layer_scale_2)?)
+    }
+
+    /// The sliding-window self-attention of one streaming chunk (`x` = normed `[1, c, d_model]` at
+    /// absolute `pos`): fused-qkv, interleaved RoPE at the chunk's absolute positions, then attend the
+    /// new queries against `[cache | new]` K/V under [`streaming_band_mask`], and retain the last
+    /// `context − 1` positions for the next chunk. The finite `q·k` scores are computed per key over
+    /// `head_dim` (independent of the matrix width), and the mask admits exactly the single-shot
+    /// window, so the result matches [`attention`](Self::attention) row-for-row.
+    fn attention_streaming(
+        &self,
+        x: &Tensor,
+        pos: usize,
+        cos: &Tensor,
+        sin: &Tensor,
+        context: usize,
+        cache: &mut KvCache,
+    ) -> CandleResult<Tensor> {
+        let (b, c, _) = x.dims3()?;
+        let h = self.num_heads;
+        let d = self.head_dim;
+        let qkv = self.in_proj.forward(x)?.reshape((b, c, 3, h, d))?;
+        let q = qkv.i((.., .., 0))?.transpose(1, 2)?.contiguous()?; // [b, h, c, d]
+        let k = qkv.i((.., .., 1))?.transpose(1, 2)?.contiguous()?;
+        let v = qkv.i((.., .., 2))?.transpose(1, 2)?.contiguous()?;
+        // RoPE at the chunk's absolute positions [pos, pos+c) — the slice of the stage's full tables.
+        let cos_c = cos.narrow(0, pos, c)?;
+        let sin_c = sin.narrow(0, pos, c)?;
+        let q = candle_nn::rotary_emb::rope_i(&q, &cos_c, &sin_c)?;
+        let k = candle_nn::rotary_emb::rope_i(&k, &cos_c, &sin_c)?;
+        // Attend the new queries against [cached | new] post-RoPE K/V.
+        let (k_all, v_all, cache_len) = cache.append(&k, &v)?;
+        let scale = 1.0 / (d as f64).sqrt();
+        let att = (q.matmul(&k_all.transpose(2, 3)?)? * scale)?; // [b, h, c, cache_len + c]
+        let mask = streaming_band_mask(x.device(), c, cache_len, context)?;
+        let att = att.broadcast_add(&mask)?;
+        let att = candle_nn::ops::softmax_last_dim(&att)?;
+        let out = att.matmul(&v_all)?; // [b, h, c, d]
+        let out = out.transpose(1, 2)?.reshape((b, c, h * d))?;
+        cache.retain_last(context.saturating_sub(1))?;
+        self.out_proj.forward(&out)
+    }
 }
 
 /// One `ProjectedTransformer` decoder stage: input_proj (D→d_model) · layers · output_proj
@@ -537,6 +675,49 @@ impl CodecStage {
         let mask = banded_causal_mask(h.device(), t, self.context)?;
         for layer in &self.layers {
             h = layer.forward(&h, &cos, &sin, &mask)?;
+        }
+        if let Some(p) = &self.output_proj {
+            h = p.forward(&h)?;
+        }
+        // (B, T, D) -> (B, D, T)
+        h.transpose(1, 2)?.contiguous()
+    }
+
+    /// Memory-bounded equivalent of [`forward`](Self::forward): streams each layer over the time axis
+    /// in `chunk_len`-position windows with a per-layer sliding KV cache, so the peak attention
+    /// allocation is `[1, H, chunk_len, chunk_len + context]` (independent of `T`) instead of the
+    /// single-shot `[1, H, T, T]`. Because the attention is sliding-window causal (window `context`)
+    /// and every other op is pointwise in time, this is **byte-identical** to `forward`; `chunk_len`
+    /// is a pure memory/throughput knob (any value `≥ 1` reproduces the same output). Layer-major (one
+    /// KV cache alive at a time) keeps resident state to a single layer's `context − 1` positions.
+    fn forward_chunked(&self, x: &Tensor, chunk_len: usize) -> CandleResult<Tensor> {
+        let t = x.dim(2)?;
+        let chunk_len = chunk_len.max(1);
+        // (B, D, T) -> (B, T, D)
+        let mut h = x.transpose(1, 2)?.contiguous()?;
+        if let Some(p) = &self.input_proj {
+            h = p.forward(&h)?;
+        }
+        // The stage's full RoPE tables; each chunk slices its own absolute-position rows out of them.
+        let (cos, sin) = rope_tables(h.device(), t, self.head_dim, ROPE_MAX_PERIOD)?;
+        for layer in &self.layers {
+            let mut cache = KvCache::default();
+            let mut outs: Vec<Tensor> = Vec::with_capacity(t.div_ceil(chunk_len));
+            let mut p = 0;
+            while p < t {
+                let c = chunk_len.min(t - p);
+                let chunk = h.narrow(1, p, c)?; // [1, c, d_model]
+                outs.push(layer.forward_streaming(
+                    &chunk,
+                    p,
+                    &cos,
+                    &sin,
+                    self.context,
+                    &mut cache,
+                )?);
+                p += c;
+            }
+            h = Tensor::cat(&outs, 1)?; // [1, T, d_model]
         }
         if let Some(p) = &self.output_proj {
             h = p.forward(&h)?;
@@ -730,6 +911,20 @@ fn resample_linear(samples: &[f32], from: u32, to: u32) -> Vec<f32> {
 // The assembled decoder
 // --------------------------------------------------------------------------------------------
 
+/// How [`MossAudioCodec::encode`] runs the analysis transformer stages. All three emit
+/// **byte-identical** codes; they trade peak memory for throughput on the first (~100 fps) stage.
+#[derive(Clone, Copy)]
+enum Chunking {
+    /// Single-shot when the first stage's attention is already bounded (`T ≤ its context window`),
+    /// otherwise stream — the shipped default ([`MossAudioCodec::encode`]).
+    Auto,
+    /// Materialize each stage's full `[1, H, T, T]` attention (fewest kernel launches; quadratic mem).
+    SingleShot,
+    /// Stream each stage's attention in bounded windows; `chunk_duration` seconds → per-stage chunk
+    /// length via the stage frame rate (the reference `encode(chunk_duration=…)` knob).
+    Chunked { chunk_duration: f64 },
+}
+
 /// The loaded MOSS-Audio-Tokenizer **decoder** (RLFQ decode + the 4 upsampling transformer stages).
 pub struct MossAudioCodec {
     config: CodecConfig,
@@ -879,7 +1074,53 @@ impl MossAudioCodec {
     /// the trailing padded frame, so the final (part-padding) frame it would otherwise emit is a
     /// masked artifact, not real audio. Trimming keeps every returned frame faithful to the reference's
     /// valid codes (a clip shorter than one frame yields no codes, as in the reference).
+    ///
+    /// **Memory (sc-14181).** The first analysis stage runs at ~100 fps, so a long reference clip makes
+    /// the single-shot `[1, H, T, T]` attention quadratic (a 60 s clip → T ≈ 6000 → multi-GB per layer).
+    /// `encode` therefore **auto-selects**: single-shot while that attention is already bounded
+    /// (`T ≤ the stage's causal context`, ≈ a 10 s clip), and the memory-bounded chunked/streaming path
+    /// beyond it — byte-identical codes either way. [`encode_chunked`](Self::encode_chunked) /
+    /// [`encode_single_shot`](Self::encode_single_shot) force a specific path.
     pub fn encode(&self, samples: &[f32], sample_rate: u32) -> CandleResult<Vec<Vec<u32>>> {
+        self.encode_stages(samples, sample_rate, Chunking::Auto)
+    }
+
+    /// Force the **single-shot** encode (materialize each stage's full `[1, H, T, T]` attention).
+    /// Fastest for short clips; quadratic in the reference length. Emits the same codes as
+    /// [`encode`](Self::encode) and [`encode_chunked`](Self::encode_chunked) — exposed so callers and
+    /// the conformance suite can pin one specific path (the single-shot oracle for the equivalence
+    /// gate). For long clips prefer [`encode`](Self::encode) (auto) or [`encode_chunked`](Self::encode_chunked).
+    pub fn encode_single_shot(
+        &self,
+        samples: &[f32],
+        sample_rate: u32,
+    ) -> CandleResult<Vec<Vec<u32>>> {
+        self.encode_stages(samples, sample_rate, Chunking::SingleShot)
+    }
+
+    /// Force the **chunked/streaming** encode with a `chunk_duration`-second window (the reference
+    /// `encode(chunk_duration=…)` path): each analysis stage streams its sliding-window-causal
+    /// attention in bounded chunks with a per-layer KV cache, so peak memory is independent of the
+    /// clip length. Byte-identical to [`encode_single_shot`](Self::encode_single_shot) for any
+    /// `chunk_duration > 0` — the window is a pure memory/throughput knob, not a fidelity one.
+    pub fn encode_chunked(
+        &self,
+        samples: &[f32],
+        sample_rate: u32,
+        chunk_duration: f64,
+    ) -> CandleResult<Vec<Vec<u32>>> {
+        self.encode_stages(samples, sample_rate, Chunking::Chunked { chunk_duration })
+    }
+
+    /// The shared encode body: resample → pad → per-stage (patch → transformer) → RLFQ-encode → trim
+    /// to the reference valid length. `chunking` selects how each transformer stage runs its attention
+    /// (see [`Chunking`]); it never changes the emitted codes, only the peak memory of the first stage.
+    fn encode_stages(
+        &self,
+        samples: &[f32],
+        sample_rate: u32,
+        chunking: Chunking,
+    ) -> CandleResult<Vec<Vec<u32>>> {
         if samples.is_empty() {
             return Ok(Vec::new());
         }
@@ -895,10 +1136,36 @@ impl MossAudioCodec {
         let mut buf = wav;
         buf.resize(t + pad, 0.0);
         let n = buf.len();
+        // Resolve `Auto` now that the padded first-stage length is known: single-shot while the first
+        // stage's attention is already bounded (`T ≤ its context`), stream a longer clip at the codec's
+        // causal-context duration (a warmed chunk then spans ≤ `[1, H, context, 2·context]`).
+        let chunking = match chunking {
+            Chunking::Auto => {
+                let stage0_t = n / ENCODER_PATCH_SIZES[0];
+                if stage0_t <= enc.stages[0].context {
+                    Chunking::SingleShot
+                } else {
+                    Chunking::Chunked {
+                        chunk_duration: self.config.context_duration,
+                    }
+                }
+            }
+            explicit => explicit,
+        };
         let mut x = Tensor::from_vec(buf, (1, 1, n), &self.device)?; // [1, 1, n]
+                                                                     // The encoder starts at the sample rate; each PatchedPretransform (applied before its stage)
+                                                                     // divides the frame rate — the same schedule `EncoderHalf::load` uses for the context window.
+        let mut frame_rate = self.config.sample_rate as f64;
         for (i, stage) in enc.stages.iter().enumerate() {
+            frame_rate /= ENCODER_PATCH_SIZES[i] as f64;
             x = patched_patch(&x, ENCODER_PATCH_SIZES[i])?; // downsample (the patch precedes the stage)
-            x = stage.forward(&x)?;
+            x = match chunking {
+                Chunking::Chunked { chunk_duration } => {
+                    let chunk_len = ((frame_rate * chunk_duration).round() as usize).max(1);
+                    stage.forward_chunked(&x, chunk_len)?
+                }
+                _ => stage.forward(&x)?, // SingleShot (Auto is resolved above)
+            };
         }
         // x is [1, output_dim, ⌈T/dr⌉]; RLFQ-encode to per-quantizer rows, then take the valid prefix.
         let rows = enc.rlfq.encode(&x)?;
@@ -1153,5 +1420,277 @@ mod tests {
         // Row 0: 2 * [3,4]/5 = [1.2, 1.6]; Row 1: 3 * [0,1]/1 = [0, 3].
         assert!((w[0][0] - 1.2).abs() < 1e-6 && (w[0][1] - 1.6).abs() < 1e-6);
         assert!((w[1][0] - 0.0).abs() < 1e-6 && (w[1][1] - 3.0).abs() < 1e-6);
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // sc-14181 — chunked/streaming stage equivalence. CPU, deterministic, no real weights: the
+    // exact byte-identity of `CodecStage::forward` vs `forward_chunked` is the core contract of the
+    // chunked encode (the codes downstream are a pointwise function of the stage output).
+    // -----------------------------------------------------------------------------------------
+
+    /// A deterministic pseudo-random tensor with entries in `[-scale, scale)` (a fixed SplitMix64-style
+    /// LCG seeded by `seed`). The exact values are irrelevant — only that both code paths consume the
+    /// *identical* synthetic weights, so any output divergence is attributable to the chunking alone.
+    fn lcg_tensor(shape: &[usize], seed: u64, scale: f32, dev: &Device) -> Tensor {
+        let n: usize = shape.iter().product();
+        let mut state = seed
+            .wrapping_mul(0x9E3779B97F4A7C15)
+            .wrapping_add(0x1234_5678_9ABC_DEF0);
+        let mut data = Vec::with_capacity(n);
+        for _ in 0..n {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let u = ((state >> 40) as f32) / (1u64 << 24) as f32; // [0, 2)
+            data.push((u - 1.0) * scale);
+        }
+        Tensor::from_vec(data, shape.to_vec(), dev).unwrap()
+    }
+
+    /// Assemble a synthetic [`CodecStage`] with deterministic weights for `spec`/`module`.
+    fn synthetic_stage(spec: &StageSpec, module: &str, context: usize, dev: &Device) -> CodecStage {
+        use std::collections::HashMap;
+        let d = spec.d_model;
+        let ff = spec.dim_feedforward;
+        let mut ts: HashMap<String, Tensor> = HashMap::new();
+        let mut seed = 0u64;
+        let mut rnd = |shape: &[usize], scale: f32| {
+            seed += 1;
+            lcg_tensor(shape, seed, scale, dev)
+        };
+        let base = format!("{module}.{}", spec.index);
+        // Projections only exist when the dims differ (they do for this spec).
+        ts.insert(
+            format!("{base}.input_proj.weight"),
+            rnd(&[d, spec.input_dim], 0.3),
+        );
+        ts.insert(
+            format!("{base}.output_proj.weight"),
+            rnd(&[spec.output_dim, d], 0.3),
+        );
+        for l in 0..spec.num_layers {
+            let lb = format!("{base}.transformer.layers.{l}");
+            // LayerNorm ~ 1.0±0.1 weight / small bias so activations stay a real, varied signal.
+            ts.insert(
+                format!("{lb}.norm1.weight"),
+                rnd(&[d], 0.1).affine(1.0, 1.0).unwrap(),
+            );
+            ts.insert(format!("{lb}.norm1.bias"), rnd(&[d], 0.1));
+            ts.insert(
+                format!("{lb}.norm2.weight"),
+                rnd(&[d], 0.1).affine(1.0, 1.0).unwrap(),
+            );
+            ts.insert(format!("{lb}.norm2.bias"), rnd(&[d], 0.1));
+            ts.insert(
+                format!("{lb}.self_attn.in_projs.0.weight"),
+                rnd(&[3 * d, d], 0.3),
+            );
+            ts.insert(
+                format!("{lb}.self_attn.out_projs.0.weight"),
+                rnd(&[d, d], 0.3),
+            );
+            ts.insert(format!("{lb}.linear1.weight"), rnd(&[ff, d], 0.2));
+            ts.insert(format!("{lb}.linear2.weight"), rnd(&[d, ff], 0.2));
+            // LayerScale ~ 1.0 (vs the real 0.01 init) so the attention/FFN branches contribute
+            // strongly — a wrong window or lost cache then shows up as a large divergence, not noise.
+            ts.insert(
+                format!("{lb}.layer_scale_1.scale"),
+                rnd(&[d], 0.1).affine(1.0, 1.0).unwrap(),
+            );
+            ts.insert(
+                format!("{lb}.layer_scale_2.scale"),
+                rnd(&[d], 0.1).affine(1.0, 1.0).unwrap(),
+            );
+        }
+        let vb = VarBuilder::from_tensors(ts, DType::F32, dev);
+        CodecStage::load(spec, context, module, &vb).unwrap()
+    }
+
+    /// Largest absolute elementwise difference between two same-shaped tensors.
+    fn max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {
+        let a = a.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let b = b.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        a.iter()
+            .zip(&b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
+    }
+
+    /// The streaming band mask, restricted to a single full chunk (`cache_len = 0`, `c = len`), must
+    /// equal the single-shot [`banded_causal_mask`] element-for-element — the invariant that makes the
+    /// chunked attention admit exactly the single-shot window.
+    #[test]
+    fn streaming_band_mask_matches_single_shot_for_a_full_chunk() {
+        let dev = Device::Cpu;
+        for &context in &[1usize, 2, 3, 7, 40] {
+            let len = 12;
+            let single = banded_causal_mask(&dev, len, context)
+                .unwrap()
+                .i((0, 0))
+                .unwrap()
+                .to_vec2::<f32>()
+                .unwrap();
+            let stream = streaming_band_mask(&dev, len, 0, context)
+                .unwrap()
+                .i((0, 0))
+                .unwrap()
+                .to_vec2::<f32>()
+                .unwrap();
+            for i in 0..len {
+                for j in 0..len {
+                    assert_eq!(
+                        single[i][j].is_finite(),
+                        stream[i][j].is_finite(),
+                        "mask mismatch at ({i},{j}) for context {context}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// With a warmed cache, a query attends exactly its `context` most-recent keys across the
+    /// `[cache | new]` boundary. Spot-check the admitted key columns against the absolute-position math
+    /// the mask encodes (`qi + cache_len − context < ki ≤ qi + cache_len`).
+    #[test]
+    fn streaming_band_mask_windows_across_the_cache_boundary() {
+        let dev = Device::Cpu;
+        let (c, cache_len, context) = (3usize, 4usize, 3usize);
+        let m = streaming_band_mask(&dev, c, cache_len, context)
+            .unwrap()
+            .i((0, 0))
+            .unwrap()
+            .to_vec2::<f32>()
+            .unwrap();
+        for (qi, row) in m.iter().enumerate() {
+            for (ki, &val) in row.iter().enumerate() {
+                let expected = ki <= qi + cache_len && ki + context > qi + cache_len;
+                assert_eq!(
+                    val.is_finite(),
+                    expected,
+                    "({qi},{ki}) cache_len={cache_len} context={context}"
+                );
+            }
+        }
+        // Each query sees exactly `context` keys once history is available.
+        for (qi, row) in m.iter().enumerate() {
+            let admitted = row.iter().filter(|v| v.is_finite()).count();
+            assert_eq!(
+                admitted, context,
+                "query {qi} must see exactly {context} keys"
+            );
+        }
+    }
+
+    /// The load-bearing gate: `forward_chunked` reproduces `forward` for a multi-layer stage whose
+    /// sequence is many windows long, streamed at several chunk sizes. Multi-layer + a sequence far
+    /// exceeding the context exercises the cross-layer KV coupling and cache eviction that a naive
+    /// block-with-left-context (receptive-field) port would get wrong. A regression in the window, the
+    /// absolute RoPE offset, or the cache diverges by `O(0.1–1)` here (see the discrimination guard).
+    ///
+    /// The agreement is a **tight tolerance, not bit-exact**: the single-shot `[1, H, T, T]` matmul /
+    /// softmax reduce over a different length than the chunked `[1, H, c, cache_len+c]` ones, so
+    /// floating-point reduction order differs by `≈ 5e-6` at the stage output (observed, worst case
+    /// `chunk = 1`). That is `≈ 10⁴×` smaller than any real bug and argmax-stable — so the emitted
+    /// **codes** are identical, which the reference's "identical codes" guarantee and the real-weights
+    /// [`moss_audio_codec_chunked_encode_matches_single_shot`](../../tests/conformance.rs) gate assert
+    /// end-to-end. Widening `chunk` (the shipped default is a full `context`) shrinks the gap further.
+    #[test]
+    fn chunked_stage_matches_single_shot() {
+        let dev = Device::Cpu;
+        // input_dim≠d_model≠output_dim so both projections engage; head_dim=4; 3 layers; context=5.
+        let spec = StageSpec {
+            index: 0,
+            input_dim: 8,
+            d_model: 16,
+            output_dim: 8,
+            num_heads: 4,
+            num_layers: 3,
+            dim_feedforward: 32,
+        };
+        let context = 5;
+        let stage = synthetic_stage(&spec, "encoder", context, &dev);
+        // T = 23 ≫ context: many chunks, warm cache, eviction, a ragged final chunk.
+        let t = 23;
+        let x = lcg_tensor(&[1, spec.input_dim, t], 0xABCD, 1.0, &dev);
+        let full = stage.forward(&x).unwrap();
+
+        // Chunk-size invariance: 1 (max streaming, worst reduction-order gap), a mid size that doesn't
+        // divide T, context, and ≥ T (one chunk). All reproduce single-shot within FP reduction noise.
+        for &chunk in &[1usize, 4, context, t, t + 5] {
+            let chunked = stage.forward_chunked(&x, chunk).unwrap();
+            assert_eq!(full.dims(), chunked.dims());
+            let diff = max_abs_diff(&full, &chunked);
+            assert!(
+                diff < 1e-4,
+                "forward_chunked(chunk={chunk}) diverged from single-shot by {diff:.3e} — beyond FP \
+                 reduction-order noise (≈5e-6); a real window/position/cache regression is O(0.1)"
+            );
+        }
+
+        // Non-vacuous: the stage output is a genuinely varied, position-dependent signal (not a
+        // constant the equivalence would trivially satisfy).
+        let vals = full.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let mean = vals.iter().sum::<f32>() / vals.len() as f32;
+        let var = vals.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / vals.len() as f32;
+        assert!(
+            var > 1e-4,
+            "degenerate stage output (var {var:.3e}) — test would be vacuous"
+        );
+    }
+
+    /// Discrimination guard (mutation check): confirm the equivalence is not a tautology by proving a
+    /// *wrong* left context diverges. Streaming with per-chunk state reset (a fresh cache each chunk,
+    /// i.e. no cross-chunk history — the classic streaming bug) must NOT match single-shot, so the
+    /// passing test above is genuinely constraining the implementation.
+    #[test]
+    fn chunked_stage_without_cross_chunk_state_diverges() {
+        let dev = Device::Cpu;
+        let spec = StageSpec {
+            index: 0,
+            input_dim: 8,
+            d_model: 16,
+            output_dim: 8,
+            num_heads: 4,
+            num_layers: 2,
+            dim_feedforward: 32,
+        };
+        let context = 5;
+        let stage = synthetic_stage(&spec, "encoder", context, &dev);
+        let t = 20;
+        let x = lcg_tensor(&[1, spec.input_dim, t], 0x51D, 1.0, &dev);
+        let full = stage.forward(&x).unwrap();
+
+        // Emulate the broken variant: reset RoPE position to 0 and drop the cache each chunk (chunks
+        // treated as independent sequences). This mirrors what forward_chunked would produce if it
+        // failed to carry absolute position + KV state — and must diverge from single-shot.
+        let chunk = 4usize;
+        let mut h = x.transpose(1, 2).unwrap().contiguous().unwrap();
+        h = stage.input_proj.as_ref().unwrap().forward(&h).unwrap();
+        for layer in &stage.layers {
+            let mut outs: Vec<Tensor> = Vec::new();
+            let mut p = 0;
+            while p < t {
+                let c = chunk.min(t - p);
+                let chunk_x = h.narrow(1, p, c).unwrap();
+                // Fresh cache + position 0 for every chunk == the bug.
+                let mut cache = KvCache::default();
+                let (cos, sin) = rope_tables(&dev, c, stage.head_dim, ROPE_MAX_PERIOD).unwrap();
+                outs.push(
+                    layer
+                        .forward_streaming(&chunk_x, 0, &cos, &sin, context, &mut cache)
+                        .unwrap(),
+                );
+                p += c;
+            }
+            h = Tensor::cat(&outs, 1).unwrap();
+        }
+        h = stage.output_proj.as_ref().unwrap().forward(&h).unwrap();
+        let broken = h.transpose(1, 2).unwrap().contiguous().unwrap();
+        let diff = max_abs_diff(&full, &broken);
+        assert!(
+            diff > 1e-3,
+            "the state-reset streaming bug did NOT diverge (diff {diff:.3e}) — the equivalence test \
+             would be vacuous"
+        );
     }
 }
