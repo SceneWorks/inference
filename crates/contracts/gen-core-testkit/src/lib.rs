@@ -54,9 +54,10 @@ pub use audio_embedder::{
     AudioEmbedderProfile,
 };
 pub use audio_generator::{
-    audio_conformance, check_audio_cancellation, check_audio_output, check_audio_precancellation,
-    check_audio_progress, check_audio_progress_contract, check_audio_seed_determinism,
-    check_audio_streaming, check_audio_validate_honesty, check_video_to_audio, AudioProfile,
+    audio_conformance, check_audio_cancellation, check_audio_multi_speaker, check_audio_output,
+    check_audio_precancellation, check_audio_progress, check_audio_progress_contract,
+    check_audio_seed_determinism, check_audio_streaming, check_audio_validate_honesty,
+    check_multi_turn, check_video_to_audio, AudioProfile,
 };
 pub use audio_transform::{
     audio_transform_conformance, check_audio_transform_cardinality,

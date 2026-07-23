@@ -26,8 +26,8 @@
 //! guarantees that are identical across modalities.
 
 use gen_core::{
-    AudioChunk, AudioParams, AudioTrack, Conditioning, ConditioningKind, Error, GenerationOutput,
-    GenerationRequest, Generator, Image, Modality,
+    AudioChunk, AudioParams, AudioTrack, Conditioning, ConditioningKind, ConversationRole,
+    ConversationTurn, Error, GenerationOutput, GenerationRequest, Generator, Image, Modality,
 };
 
 /// Cheap-request parameters for an audio conformance run — the audio analog of
@@ -779,6 +779,304 @@ pub fn check_video_to_audio(g: &dyn Generator, profile: &AudioProfile) -> Result
     Ok(())
 }
 
+// --- Multi-turn conversational contract (sc-14150) -----------------------------------------------
+
+/// A short, non-silent, frame-aligned mono **context clip** for a conversation turn — the user's
+/// speech (or a resumed prior assistant turn). `variant` seeds its content so two context turns
+/// differ, and `sr` matches the model's advertised rate (the provider resamples regardless).
+///
+/// Sized at ~0.2 s (4800 samples @ 24 kHz) so it spans **several codec frames**: a real codec-based
+/// provider (e.g. MOSS-TTS-Realtime, 1920 samples/frame) can encode it to ≥ 1 RVQ frame and be driven
+/// through this check, not only the pure-host stub. A sub-frame clip would be rejected by such a
+/// provider's encoder, making `check_multi_turn` un-runnable against a real conversational model.
+fn context_clip(sr: u32, variant: u8) -> AudioTrack {
+    let n = 4800usize;
+    let samples = (0..n)
+        .map(|i| (((i as u32 + variant as u32 * 17) % 97) as f32) / 97.0 - 0.5)
+        .collect();
+    AudioTrack {
+        samples,
+        sample_rate: sr,
+        channels: 1,
+        ..Default::default()
+    }
+}
+
+/// The model's advertised sample rate (first entry), or a nominal 24 kHz when it advertises none.
+fn conversation_sr(caps: &gen_core::Capabilities) -> u32 {
+    caps.audio_sample_rates.first().copied().unwrap_or(24_000)
+}
+
+fn user_turn(text: &str, sr: u32, variant: u8) -> ConversationTurn {
+    ConversationTurn {
+        role: ConversationRole::User,
+        text: text.to_owned(),
+        audio: Some(context_clip(sr, variant)),
+    }
+}
+
+fn assistant_synth(text: &str) -> ConversationTurn {
+    ConversationTurn {
+        role: ConversationRole::Assistant,
+        text: text.to_owned(),
+        audio: None,
+    }
+}
+
+/// A two-round user↔assistant conversation: two synthesized assistant replies, each conditioned on
+/// the turns before it (including the first *generated* reply). Exercises cross-turn conditioning
+/// over both a provided (user) context turn and a prior generated (assistant) turn.
+fn two_round_conversation(sr: u32) -> Vec<ConversationTurn> {
+    vec![
+        user_turn("Hi, can you help me plan a short trip?", sr, 1),
+        assistant_synth("Of course — where would you like to go?"),
+        user_turn("Somewhere sunny near the coast.", sr, 2),
+        assistant_synth("Then a small Mediterranean beach town would be perfect."),
+    ]
+}
+
+/// Path **A**: render a whole conversation in one stateless [`Generator::generate`] call carrying the
+/// turns as a [`Conditioning::ConversationHistory`]. Returns the emitted [`AudioTrack`] (the
+/// assistant turns concatenated).
+fn render_via_history(
+    g: &dyn Generator,
+    profile: &AudioProfile,
+    turns: Vec<ConversationTurn>,
+) -> Result<AudioTrack, String> {
+    let id = g.descriptor().id;
+    let mut r = audio_base_request(g, profile);
+    r.conditioning = vec![Conditioning::ConversationHistory { turns }];
+    let out = g
+        .generate(&r, &mut |_| {})
+        .map_err(|e| format!("multi-turn[{id}]: history-in-request generate() failed: {e}"))?;
+    match out {
+        GenerationOutput::Audio(t) => Ok(t),
+        other => Err(format!(
+            "multi-turn[{id}]: a ConversationHistory request must render GenerationOutput::Audio, \
+             got {}",
+            variant_name(&other)
+        )),
+    }
+}
+
+/// Path **B**: drive a conversation through a stateful [`gen_core::ConversationSession`], one turn per
+/// [`gen_core::ConversationSession::step`]. Returns `(concatenated synthesized audio, the per-synthesis-turn
+/// tracks)`, and validates each synthesized turn's well-formedness plus the [`AudioChunk`] reassembly
+/// law on its streamed chunks.
+fn render_via_session(
+    g: &dyn Generator,
+    profile: &AudioProfile,
+    turns: &[ConversationTurn],
+) -> Result<(AudioTrack, Vec<AudioTrack>), String> {
+    let id = g.descriptor().id;
+    let req = audio_base_request(g, profile);
+    let mut session = g
+        .open_conversation(&req)
+        .map_err(|e| format!("multi-turn[{id}]: open_conversation() failed: {e}"))?;
+
+    let mut synth: Vec<AudioTrack> = Vec::new();
+    let mut sr = 0u32;
+    let mut channels = 0u16;
+    for (i, turn) in turns.iter().enumerate() {
+        let mut chunks: Vec<AudioChunk> = Vec::new();
+        let track = session
+            .step(turn, &mut |c| chunks.push(c), &mut |_| {})
+            .map_err(|e| format!("multi-turn[{id}]: session.step({i}) failed: {e}"))?;
+        // A synthesis turn (assistant, no audio) produces the reply; a context turn is folded in and
+        // echoes its provided audio. Only the synthesized replies form the assistant's output.
+        if turn.audio.is_none() {
+            validate_track(id, "multi-turn", &track)?;
+            sr = track.sample_rate;
+            channels = track.channels;
+            // The streamed chunks of a synthesized turn must reassemble to that turn's track.
+            let reassembled: Vec<f32> = chunks
+                .iter()
+                .flat_map(|c| c.samples.iter().copied())
+                .collect();
+            if !chunks.is_empty() && reassembled != track.samples {
+                return Err(format!(
+                    "multi-turn[{id}]: session.step({i}) chunks ({} samples) do not reassemble to \
+                     the turn's track ({} samples) — the AudioChunk reassembly law is violated",
+                    reassembled.len(),
+                    track.samples.len()
+                ));
+            }
+            synth.push(track);
+        }
+    }
+    session
+        .finish()
+        .map_err(|e| format!("multi-turn[{id}]: session.finish() failed: {e}"))?;
+
+    if synth.is_empty() {
+        return Err(format!(
+            "multi-turn[{id}]: the conversation had no synthesized assistant turn"
+        ));
+    }
+    let samples: Vec<f32> = synth
+        .iter()
+        .flat_map(|t| t.samples.iter().copied())
+        .collect();
+    let concat = AudioTrack {
+        samples,
+        sample_rate: sr,
+        channels,
+        ..Default::default()
+    };
+    Ok((concat, synth))
+}
+
+/// **Multi-turn conversational contract (sc-14150).** A context-aware conversational TTS model
+/// synthesizes turn *N* conditioned on the prior turns, exposed two selectable ways:
+/// **(A)** the stateless [`Conditioning::ConversationHistory`] carrier consumed by
+/// [`Generator::generate`], and **(B)** the stateful [`gen_core::ConversationSession`] opened by
+/// [`Generator::open_conversation`] whose warm cache is kept hot across [`step`](gen_core::ConversationSession::step)s.
+/// This gate enforces, per whichever path(s) a provider advertises
+/// ([`Capabilities::supports_conversation_history`](gen_core::Capabilities::supports_conversation_history)
+/// / [`supports_conversation_session`](gen_core::Capabilities::supports_conversation_session)):
+///
+/// - **well-formed, non-silent** synthesized audio for every assistant turn;
+/// - **conditioned on the prior turns** — the same assistant turn rendered *with* a prior context
+///   turn must differ from the same turn rendered alone (a provider that ignores the conversation and
+///   renders each turn context-free is caught — the multi-turn analog of "a different clip changes
+///   the audio");
+/// - **per-conversation determinism** — the same conversation + seed re-renders byte-identical;
+/// - **the A≡B equivalence law** (when the provider advertises **both**): the whole conversation
+///   rendered in one stateless `generate()` (path A) is **byte-identical** to the same conversation
+///   driven one-turn-per-`step` through a session (path B) — the session is a warm-cache optimization
+///   of the batch render, not a distinct computation (the multi-turn twin of the
+///   `generate`≡`generate_streaming` streaming law);
+/// - **honest gating** — a provider advertising only one path must reject the other as the typed
+///   [`Error::Unsupported`], and a provider advertising **neither** must reject both (so the additive
+///   contract cannot silently perturb the single-turn audio families).
+///
+/// Runs for every audio provider (the neither-advertised branch proves the additive surface does not
+/// perturb the existing families), so it is a member of [`audio_conformance`].
+pub fn check_multi_turn(g: &dyn Generator, profile: &AudioProfile) -> Result<(), String> {
+    let desc = g.descriptor();
+    let id = desc.id;
+    let caps = &desc.capabilities;
+    let hist = caps.supports_conversation_history;
+    let sess = caps.supports_conversation_session;
+    let sr = conversation_sr(caps);
+
+    // Neither path advertised: the additive surface must not perturb a single-turn provider — a
+    // ConversationHistory request is rejected as the typed Unsupported, and open_conversation returns
+    // it too. (When a path IS advertised, the honest-gating checks below cover the other direction.)
+    if !hist && !sess {
+        let mut r = audio_base_request(g, profile);
+        r.conditioning = vec![Conditioning::ConversationHistory {
+            turns: two_round_conversation(sr),
+        }];
+        expect_unsupported(g, &r, id, "a multi-turn ConversationHistory")?;
+        return expect_open_conversation_unsupported(g, &audio_base_request(g, profile), id);
+    }
+
+    // Conditioned-on-prior discriminator, over whichever path is advertised: the same assistant reply
+    // rendered WITH a prior context turn must differ from it rendered ALONE. A provider that ignores
+    // the conversation (renders each turn context-free) produces byte-identical audio here and fails.
+    let synth_text = "Then a small Mediterranean beach town would be perfect.";
+    let with_ctx = vec![
+        user_turn("Somewhere sunny near the coast.", sr, 7),
+        assistant_synth(synth_text),
+    ];
+    let bare = vec![assistant_synth(synth_text)];
+    let (rendered_with, rendered_bare) = if hist {
+        (
+            render_via_history(g, profile, with_ctx)?,
+            render_via_history(g, profile, bare)?,
+        )
+    } else {
+        (
+            render_via_session(g, profile, &with_ctx)?.0,
+            render_via_session(g, profile, &bare)?.0,
+        )
+    };
+    validate_track(id, "multi-turn", &rendered_with)?;
+    validate_track(id, "multi-turn", &rendered_bare)?;
+    if !rendered_with.samples.iter().any(|s| s.abs() > 1e-6) {
+        return Err(format!(
+            "multi-turn[{id}]: the synthesized assistant turn is silent (all samples ~0) — a \
+             conversational model must speak the assistant reply, not silence"
+        ));
+    }
+    if rendered_with.samples == rendered_bare.samples {
+        return Err(format!(
+            "multi-turn[{id}]: an assistant turn rendered WITH a prior context turn is byte-identical \
+             to the same turn rendered ALONE — the provider appears to ignore the conversation \
+             history (turn N is not conditioned on the prior turns)"
+        ));
+    }
+
+    // The A≡B equivalence law + per-conversation determinism, over the two-round conversation.
+    let conversation = two_round_conversation(sr);
+    if hist {
+        let a1 = render_via_history(g, profile, conversation.clone())?;
+        validate_track(id, "multi-turn", &a1)?;
+        let a2 = render_via_history(g, profile, conversation.clone())?;
+        if a1.samples != a2.samples {
+            return Err(format!(
+                "multi-turn[{id}]: the same conversation + seed produced different audio on \
+                 re-render (path A) — the per-conversation determinism law is violated"
+            ));
+        }
+        if sess {
+            let (b, _) = render_via_session(g, profile, &conversation)?;
+            if a1.samples != b.samples {
+                return Err(format!(
+                    "multi-turn[{id}]: the stateless history render (path A, {} samples) differs from \
+                     the stateful session render (path B, {} samples) for the same conversation+seed \
+                     — the session must be a warm-cache optimization of generate(), byte-identical \
+                     (the A≡B equivalence law)",
+                    a1.samples.len(),
+                    b.samples.len()
+                ));
+            }
+        } else {
+            // Advertises only path A: the session path must be rejected as the typed Unsupported.
+            expect_open_conversation_unsupported(g, &audio_base_request(g, profile), id)?;
+        }
+    } else {
+        // Advertises only path B: exercise it, prove determinism, and reject path A as Unsupported.
+        let (b1, _) = render_via_session(g, profile, &conversation)?;
+        validate_track(id, "multi-turn", &b1)?;
+        let (b2, _) = render_via_session(g, profile, &conversation)?;
+        if b1.samples != b2.samples {
+            return Err(format!(
+                "multi-turn[{id}]: the same conversation + seed produced different audio on \
+                 re-render (path B) — the per-conversation determinism law is violated"
+            ));
+        }
+        let mut r = audio_base_request(g, profile);
+        r.conditioning = vec![Conditioning::ConversationHistory {
+            turns: conversation,
+        }];
+        expect_unsupported(g, &r, id, "a multi-turn ConversationHistory")?;
+    }
+
+    Ok(())
+}
+
+/// Assert [`Generator::open_conversation`] returns the typed [`Error::Unsupported`] for a provider
+/// that does not advertise the stateful session path.
+fn expect_open_conversation_unsupported(
+    g: &dyn Generator,
+    req: &GenerationRequest,
+    id: &str,
+) -> Result<(), String> {
+    match g.open_conversation(req) {
+        Ok(_) => Err(format!(
+            "multi-turn[{id}]: open_conversation() returned a session although the provider does not \
+             advertise supports_conversation_session — an unadvertised session path must be rejected"
+        )),
+        Err(Error::Unsupported(_)) => Ok(()),
+        Err(other) => Err(format!(
+            "multi-turn[{id}]: open_conversation() on a non-session provider must be the typed \
+             Err(Error::Unsupported), got {other:?}"
+        )),
+    }
+}
+
 /// Run the full audio-generator conformance suite against a freshly-`make`d generator. Panics with
 /// every failure aggregated — the audio twin of [`conformance`](crate::conformance).
 pub fn audio_conformance(make: impl Fn() -> Box<dyn Generator>, profile: &AudioProfile) {
@@ -786,7 +1084,7 @@ pub fn audio_conformance(make: impl Fn() -> Box<dyn Generator>, profile: &AudioP
     let g: &dyn Generator = g.as_ref();
 
     type Check = fn(&dyn Generator, &AudioProfile) -> Result<(), String>;
-    let checks: [Check; 10] = [
+    let checks: [Check; 11] = [
         check_audio_validate_honesty,
         check_audio_output,
         check_audio_progress,
@@ -797,6 +1095,7 @@ pub fn audio_conformance(make: impl Fn() -> Box<dyn Generator>, profile: &AudioP
         check_audio_streaming,
         check_audio_multi_speaker,
         check_video_to_audio,
+        check_multi_turn,
     ];
     let failures: Vec<String> = checks
         .into_iter()

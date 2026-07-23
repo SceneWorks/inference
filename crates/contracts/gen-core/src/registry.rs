@@ -620,6 +620,21 @@ pub fn model_descriptor_errors(d: &ModelDescriptor) -> Vec<String> {
             ));
         }
     }
+    // Multi-turn path-A consistency (sc-14150): `supports_conversation_history` is the opt-in flag,
+    // but the request carrier is a `Conditioning::ConversationHistory` gated by the conditioning
+    // allowlist — so a descriptor that sets the flag without also advertising the kind would set the
+    // shared floor's keyed check to pass while the allowlist still rejects every conversation (the
+    // "flag on, kind missing" footgun). Cross-check them here so a provider cannot half-wire path A.
+    if caps.supports_conversation_history
+        && !caps
+            .conditioning
+            .contains(&ConditioningKind::ConversationHistory)
+    {
+        errs.push(format!(
+            "{ctx}: supports_conversation_history is set but ConditioningKind::ConversationHistory \
+             is not in `conditioning` — path-A requests would be rejected by the allowlist"
+        ));
+    }
     // Required components (sc-13658): the weights-free advertisement of the named model components a
     // consumer must provision (see `ModelDescriptor::required_components`). Each declared id must be a
     // non-empty, whitespace-free registry token, and the set must be duplicate-free — a blank or
@@ -2350,6 +2365,42 @@ mod tests {
         assert!(model_descriptor_errors(&zeroed)
             .iter()
             .any(|e| e.contains("left at the Default 0")));
+    }
+
+    /// The multi-turn path-A cross-check (sc-14150): `supports_conversation_history` without the
+    /// matching `ConditioningKind::ConversationHistory` in `conditioning` is flagged (the "flag on,
+    /// kind missing" footgun where every path-A request would be rejected by the allowlist), and a
+    /// descriptor that wires both is conformant.
+    #[test]
+    fn model_descriptor_errors_flags_conversation_history_flag_without_kind() {
+        let half_wired = ModelDescriptor {
+            required_components: &[],
+            id: "convo",
+            family: "test",
+            backend: "candle",
+            modality: Modality::Audio,
+            capabilities: Capabilities {
+                max_count: 1,
+                supports_conversation_history: true,
+                // ConditioningKind::ConversationHistory deliberately NOT advertised.
+                ..Default::default()
+            },
+        };
+        assert!(model_descriptor_errors(&half_wired)
+            .iter()
+            .any(|e| e.contains("supports_conversation_history is set but")));
+
+        // Wiring both the flag and the kind is conformant.
+        let wired = ModelDescriptor {
+            capabilities: Capabilities {
+                max_count: 1,
+                supports_conversation_history: true,
+                conditioning: vec![ConditioningKind::ConversationHistory],
+                ..Default::default()
+            },
+            ..half_wired
+        };
+        assert!(model_descriptor_errors(&wired).is_empty());
     }
 
     /// The size-bounds floor is exempt for `Modality::Audio` (sc-13314): a pure-audio generator has
