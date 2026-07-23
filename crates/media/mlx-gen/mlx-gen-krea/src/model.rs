@@ -310,6 +310,46 @@ pub fn load_turbo_edit(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     load_variant(spec, turbo_edit_descriptor())
 }
 
+/// Build a Krea generator from a **community single-file** DiT checkpoint (epic 14015, sc-14017 S0b) —
+/// the out-of-registry entrypoint the SceneWorks worker (S0c) calls, mirroring candle z-image's
+/// `load_from_comfyui_components`. `dit_file` is a ComfyUI-exported dense bf16 Krea 2 DiT with
+/// native-mmdit keys under `model.diffusion_model.` (e.g. `kreamania_variant5.safetensors`, DiT-only);
+/// `base_snapshot_dir` is a **resident turnkey** snapshot dir (`transformer/ text_encoder/ vae/
+/// tokenizer/`) supplying the shared text-encoder, VAE, tokenizer, and the DiT architecture config the
+/// single file omits.
+///
+/// The DiT is read from the single file, key-remapped native→diffusers, coverage/shape-validated, and
+/// assembled ([`crate::loader::load_transformer_from_native_file`] — fail-closed on any unmapped on-disk
+/// key or missing module weight); the text-encoder / VAE / tokenizer load from `base_snapshot_dir` exactly
+/// as [`load`] does from a full snapshot. The result is a warm-`Resident` generator that renders through
+/// the same pipeline as a snapshot load. `descriptor` selects the surface (Turbo `descriptor()` is the
+/// natural default — variant5 is a distilled-Turbo dense merge).
+///
+/// Scope (S0b): dense bf16 only; no worker/routing wiring (S0c/S0d), no int8 single-file (variant4), no
+/// load-time adapters (the community merge already baked its LoRAs into the dense weights). `Sequential`
+/// offload is not yet threaded (the single-file DiT has no snapshot dir to re-load from) — a follow-on.
+pub fn load_from_native_dit_file(
+    dit_file: impl AsRef<Path>,
+    base_snapshot_dir: impl AsRef<Path>,
+    descriptor: ModelDescriptor,
+) -> Result<Box<dyn Generator>> {
+    let base = base_snapshot_dir.as_ref();
+    // Architecture config from the resident turnkey (the single file ships no config.json); the
+    // community merge shares the published Krea 2 architecture exactly.
+    let cfg = crate::config::Krea2Config::from_snapshot(base)?;
+    let dit = crate::loader::load_transformer_from_native_file(dit_file.as_ref(), &cfg)?;
+    let vae = crate::vae::load_vae(base)?;
+    let heavy = KreaHeavy::from_parts(dit, vae);
+    let text = KreaText::from_snapshot(base)?;
+    let residency = Residency::resident(text, KreaHeavyOwned { heavy, pid: None });
+    Ok(Box::new(Krea {
+        descriptor,
+        residency,
+        adapters: Vec::new(),
+        has_diff_patch: false,
+    }))
+}
+
 /// Shared loader behind [`load`] / [`load_raw`] / [`load_edit`]: build the residency from a snapshot
 /// dir. `Resident` (default) assembles every component now and holds it warm; `Sequential` keeps only
 /// the [`LoadSpec`] and re-loads per generate in phase order (encode → drop the text phase →
