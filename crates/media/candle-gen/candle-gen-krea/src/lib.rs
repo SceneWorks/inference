@@ -879,24 +879,24 @@ pub fn load_edit(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
 
 /// Build a Krea 2 generator from a **community single-file DiT checkpoint** (sc-14022, epic 14015 S0b) —
 /// the candle sibling of `mlx-gen-krea::load_from_native_dit_file`, and the candle out-of-registry pattern
-/// z-image's `load_from_comfyui_components` established. `dit_file` is a ComfyUI-exported **dense bf16**
-/// Krea 2 DiT stored under native-mmdit keys (typically namespaced beneath `model.diffusion_model.`, e.g.
-/// `kreamania_variant5.safetensors`, DiT-only); `base_snapshot_dir` is a **resident turnkey** snapshot
+/// z-image's `load_from_comfyui_components` established. `dit_file` is a ComfyUI-exported dense-bf16 or
+/// descriptor-validated plain-int8 Krea 2 DiT stored under native-mmdit keys (typically namespaced
+/// beneath `model.diffusion_model.`, e.g. `kreamania_variant5`/`variant4`); `base_snapshot_dir` is a
+/// **resident turnkey** snapshot
 /// (`transformer/ text_encoder/ vae/ tokenizer/`) supplying the shared Qwen3-VL text-encoder, Qwen-Image
 /// VAE, tokenizer, and the DiT architecture config the single file omits.
 ///
 /// The DiT is read from the single file and, through [`loader::Weights::from_native_file`], remapped
-/// native→diffusers as **ordinary dense bf16** — `native_keys` ON, `convrot` (int8 + Hadamard rotation)
-/// **OFF**, so the dense weights are never corrupted by an inverse rotation that was never applied. It is
+/// native→diffusers with `convrot` **OFF**. Dense weights pass through; plain int8 reconstructs
+/// `W = codes.i8 * weight_scale` per row. Neither is corrupted by a rotation that was never applied. It is
 /// coverage/bijection + shape validated ([`convert::validate_native_transformer`], fail-closed on any
 /// unmapped/missing/foreign key) before assembly; the TE / VAE / tokenizer load from `base_snapshot_dir`
 /// exactly as [`load`] does. The result is a warm-`Resident` generator that renders through the same
 /// pipeline as a snapshot load. `descriptor` selects the surface — Turbo [`descriptor()`] is the natural
 /// default (variant5 is a distilled-Turbo dense merge).
 ///
-/// **Scope (S0b, dense bf16):** no SceneWorks candle-worker routing (the S0c analogue — a follow-on), no
-/// int8 single file (variant4 — sc-14023), no load-time adapters (the community merge already baked its
-/// LoRAs into the dense weights). `Sequential` offload is not threaded — the single-file DiT has no
+/// No load-time adapters (the community merge already baked its LoRAs into the weights). `Sequential`
+/// offload is not threaded — the single-file DiT has no
 /// snapshot dir to re-load from — so the generator is always `Resident`, mirroring the MLX entrypoint.
 pub fn load_from_native_dit_file(
     dit_file: impl AsRef<std::path::Path>,
@@ -906,7 +906,7 @@ pub fn load_from_native_dit_file(
     let root = base_snapshot_dir.as_ref().to_path_buf();
     let device = candle_gen::default_device()?;
     // Architecture config + TE/VAE/tokenizer come from the resident turnkey; only the DiT weights come
-    // from the single file (read dense bf16 through the native→diffusers remap, fail-closed validated).
+    // from the single file (dense or descriptor-validated plain int8 through the native remap).
     let components = pipeline::load_components_native(&root, dit_file.as_ref(), &device)?;
     let residency = candle_gen::Residency::resident(
         KreaTextPhase::Resident,

@@ -72,6 +72,14 @@ pub struct Weights {
     /// ([`crate::quant::ConvRotInt8`]). Split out from [`native_keys`](Weights::native_keys) (sc-14022): a
     /// dense-bf16 native file is `native_keys: true, convrot: false` — remap ON, rotation/int8 OFF.
     convrot: bool,
+    /// True only for a native-keyed, non-rotated ComfyUI
+    /// `{"format":"int8_tensorwise","per_row":true}` checkpoint (sc-14023).
+    ///
+    /// Unlike [`convrot`](Weights::convrot), these codes store the canonical `W`, not `W·R`.
+    /// Reads therefore dequantize each projection as `codes.i8 * weight_scale` and never rotate
+    /// either the weight or the activation. [`from_native_file`](Self::from_native_file) sets this
+    /// only after validating every descriptor and per-row scale from the safetensors data section.
+    plain_int8: bool,
     /// **One** cuBLASLt handle shared by every INT8-ConvRot projection loaded from this weight set
     /// (sc-12301) — see [`Weights::int8_context`]. `OnceLock` because [`linear_detect`] takes `&Weights`
     /// and the handle must be built at most once for the whole trunk, on first int8 projection.
@@ -101,6 +109,7 @@ impl Weights {
             native_keys: false,
             native_prefix: String::new(),
             convrot: false,
+            plain_int8: false,
             int8: OnceLock::new(),
         })
     }
@@ -120,6 +129,7 @@ impl Weights {
             native_keys: false,
             native_prefix: String::new(),
             convrot: false,
+            plain_int8: false,
             int8: OnceLock::new(),
         })
     }
@@ -132,6 +142,7 @@ impl Weights {
     pub fn from_convrot_file(path: &Path, device: &Device, dtype: DType) -> Result<Self> {
         // SAFETY: read-only mmap of a weight file; the standard candle loading path.
         let st = unsafe { MmapedSafetensors::new(path)? };
+        validate_convrot_descriptors(&st)?;
         let native_prefix = detect_native_prefix(&st);
         Ok(Self {
             st,
@@ -142,25 +153,30 @@ impl Weights {
             native_keys: true,
             native_prefix,
             convrot: true,
+            plain_int8: false,
             int8: OnceLock::new(),
         })
     }
 
-    /// mmap a **single-file dense-bf16 native-mmdit-keyed checkpoint** (sc-14022) — a ComfyUI-exported
-    /// community merge (e.g. `kreamania_variant5.safetensors`, a distilled-Turbo dense merge) whose DiT is
-    /// stored under the *reference* tensor names, typically namespaced beneath `model.diffusion_model.`.
+    /// mmap a **single-file native-mmdit-keyed checkpoint** (sc-14022/sc-14023) — either a dense-bf16
+    /// community merge (for example `kreamania_variant5.safetensors`) or the non-rotated
+    /// int8-per-row variant (`kreamania_variant4.safetensors`). The DiT is stored under the reference
+    /// tensor names, typically namespaced beneath `model.diffusion_model.`.
     ///
     /// `native_keys` is set so every diffusers-key lookup is translated to its native key
     /// ([`convrot_diffusers_to_native`], under the auto-detected namespace prefix) at
     /// read time — the DiT reads as **ordinary dense bf16** through the remap. `convrot` is **false**: no
-    /// int8 dequant and, crucially, **no inverse Hadamard rotation** — a dense native file is `W`, not the
-    /// ConvRot `W·R`, so applying the rotation legs (as [`from_convrot_file`](Self::from_convrot_file)
-    /// does) would corrupt it. This is the whole point of splitting the two concerns: the remap serves the
-    /// dense file, the rotation stays exclusive to the INT8-ConvRot file.
+    /// `convrot` is **false** for both forms. For int8, every real `.comfy_quant` descriptor must say
+    /// `format=int8_tensorwise`, `per_row=true`, and omit `convrot`; every code tensor must be I8 and
+    /// have an F32 `[out]` or `[out,1]` scale. The constructor validates that data before any
+    /// dequantization. A present `convrot` field is rejected here and belongs to
+    /// [`from_convrot_file`](Self::from_convrot_file), preventing the old group-size-256 fallback from
+    /// silently rotating a plain file.
     pub fn from_native_file(path: &Path, device: &Device, dtype: DType) -> Result<Self> {
         // SAFETY: read-only mmap of a weight file; the standard candle loading path.
         let st = unsafe { MmapedSafetensors::new(path)? };
         let native_prefix = detect_native_prefix(&st);
+        let plain_int8 = validate_plain_int8_tensorwise(&st)?;
         Ok(Self {
             st,
             device: device.clone(),
@@ -170,6 +186,7 @@ impl Weights {
             native_keys: true,
             native_prefix,
             convrot: false,
+            plain_int8,
             int8: OnceLock::new(),
         })
     }
@@ -221,6 +238,12 @@ impl Weights {
         self.convrot
     }
 
+    /// Whether this native checkpoint uses the descriptor-validated, non-rotated int8-per-row
+    /// convention added in sc-14023.
+    pub fn is_plain_int8(&self) -> bool {
+        self.plain_int8
+    }
+
     /// Whether this checkpoint is **native-mmdit-keyed** — its tensors are stored under the reference
     /// names, so `resolve` remaps every diffusers-key lookup to its native counterpart
     /// (sc-14022). True for BOTH the INT8-ConvRot export ([`from_convrot_file`](Self::from_convrot_file))
@@ -255,6 +278,16 @@ impl Weights {
         if let Some(t) = self.overlay.get(name) {
             return t.to_device(&self.device)?.to_dtype(self.dtype);
         }
+        if self.plain_int8 {
+            let resolved = self.resolve(name);
+            if self
+                .st
+                .get(&resolved)
+                .is_ok_and(|view| view.dtype() == ::safetensors::Dtype::I8)
+            {
+                return self.dequant_plain_int8(&resolved, self.dtype);
+            }
+        }
         self.st
             .load(&self.resolve(name), &self.device)?
             .to_dtype(self.dtype)
@@ -279,6 +312,16 @@ impl Weights {
     pub fn get_f32(&self, name: &str) -> Result<Tensor> {
         if let Some(t) = self.overlay.get(name) {
             return t.to_device(&self.device)?.to_dtype(DType::F32);
+        }
+        if self.plain_int8 {
+            let resolved = self.resolve(name);
+            if self
+                .st
+                .get(&resolved)
+                .is_ok_and(|view| view.dtype() == ::safetensors::Dtype::I8)
+            {
+                return self.dequant_plain_int8(&resolved, DType::F32);
+            }
         }
         self.st
             .load(&self.resolve(name), &self.device)?
@@ -337,6 +380,38 @@ impl Weights {
             // Test / any-int fixture: load whatever integer dtype it is, then widen to I64.
             _ => self.st.load(&native, &Device::Cpu)?.to_dtype(DType::I64),
         }
+    }
+
+    /// Dequantize one already-validated plain-int8 projection as
+    /// `W[out, in] = codes.i8[out, in] * weight_scale[out]`, with no Hadamard rotation.
+    fn dequant_plain_int8(&self, native_weight: &str, dtype: DType) -> Result<Tensor> {
+        let view = self.st.get(native_weight)?;
+        let shape = view.shape().to_vec();
+        let rows = shape[0];
+        let codes: Vec<i64> = view.data().iter().map(|&byte| byte as i8 as i64).collect();
+        let codes = Tensor::from_vec(codes, shape, &Device::Cpu)?
+            .to_device(&self.device)?
+            .to_dtype(DType::F32)?;
+
+        let base = native_weight.strip_suffix(".weight").ok_or_else(|| {
+            candle_gen::candle_core::Error::Msg(format!(
+                "krea plain int8: I8 tensor `{native_weight}` is not a `.weight`"
+            ))
+        })?;
+        let scale = self
+            .st
+            .load(&format!("{base}.weight_scale"), &self.device)?
+            .to_dtype(DType::F32)?;
+        let scale = match scale.dims() {
+            [_] => scale.reshape((rows, 1))?,
+            [_, 1] => scale,
+            dims => {
+                return Err(candle_gen::candle_core::Error::Msg(format!(
+                    "krea plain int8: `{base}.weight_scale` has invalid shape {dims:?}"
+                )));
+            }
+        };
+        codes.broadcast_mul(&scale)?.to_dtype(dtype)
     }
 
     /// Read the ConvRot `convrot_groupsize` (the regular-Hadamard order `R` was folded at) from a
@@ -451,6 +526,163 @@ impl Weights {
         }
         self.get(weight_key)
     }
+}
+
+/// Validate the real data-section contract for a non-rotated ComfyUI int8-tensorwise checkpoint.
+///
+/// The app-side detector can only see header dtypes and key names. That is enough to put a file in
+/// the int8-per-row bucket, but not enough to prove that its U8 descriptor actually says
+/// `int8_tensorwise`, that `per_row` is true, or that the scale is one F32 value per output row.
+/// Perform those checks here, before any projection is dequantized. A `convrot` field at all selects
+/// the distinct rotated convention and is rejected from this constructor rather than falling back to
+/// the old implicit group-size-256 ConvRot path.
+fn validate_plain_int8_tensorwise(st: &MmapedSafetensors) -> Result<bool> {
+    let tensors = st.tensors();
+    let int8_weights: Vec<String> = tensors
+        .iter()
+        .filter(|(_, view)| view.dtype() == ::safetensors::Dtype::I8)
+        .map(|(name, _)| name.clone())
+        .collect();
+    let descriptors: Vec<String> = tensors
+        .iter()
+        .filter(|(name, _)| name.ends_with(".comfy_quant"))
+        .map(|(name, _)| name.clone())
+        .collect();
+
+    if int8_weights.is_empty() {
+        if descriptors.is_empty() {
+            return Ok(false);
+        }
+        return Err(candle_gen::candle_core::Error::Msg(format!(
+            "krea plain int8: found {} `.comfy_quant` descriptor(s) but no I8 weight tensors",
+            descriptors.len()
+        )));
+    }
+
+    for weight_key in &int8_weights {
+        let Some(base) = weight_key.strip_suffix(".weight") else {
+            return Err(candle_gen::candle_core::Error::Msg(format!(
+                "krea plain int8: I8 tensor `{weight_key}` is not a projection `.weight`"
+            )));
+        };
+        let weight = st.get(weight_key)?;
+        let [rows, _cols] = weight.shape() else {
+            return Err(candle_gen::candle_core::Error::Msg(format!(
+                "krea plain int8: `{weight_key}` must be rank-2 [out,in], got {:?}",
+                weight.shape()
+            )));
+        };
+
+        let descriptor_key = format!("{base}.comfy_quant");
+        let descriptor = st.get(&descriptor_key).map_err(|_| {
+            candle_gen::candle_core::Error::Msg(format!(
+                "krea plain int8: `{weight_key}` is missing `{descriptor_key}`"
+            ))
+        })?;
+        if descriptor.dtype() != ::safetensors::Dtype::U8 || descriptor.shape().len() != 1 {
+            return Err(candle_gen::candle_core::Error::Msg(format!(
+                "krea plain int8: `{descriptor_key}` must be a rank-1 U8 JSON blob"
+            )));
+        }
+        let json: serde_json::Value =
+            serde_json::from_slice(descriptor.data()).map_err(|error| {
+                candle_gen::candle_core::Error::Msg(format!(
+                    "krea plain int8: `{descriptor_key}` is not valid JSON: {error}"
+                ))
+            })?;
+        if json.get("format").and_then(serde_json::Value::as_str) != Some("int8_tensorwise") {
+            return Err(candle_gen::candle_core::Error::Msg(format!(
+                "krea plain int8: `{descriptor_key}` must declare format `int8_tensorwise`"
+            )));
+        }
+        if json.get("per_row").and_then(serde_json::Value::as_bool) != Some(true) {
+            return Err(candle_gen::candle_core::Error::Msg(format!(
+                "krea plain int8: `{descriptor_key}` must declare `per_row: true`"
+            )));
+        }
+        if json.get("convrot").is_some() {
+            return Err(candle_gen::candle_core::Error::Msg(format!(
+                "krea plain int8: `{descriptor_key}` contains `convrot`; route rotated checkpoints \
+                 through the ConvRot loader"
+            )));
+        }
+
+        let scale_key = format!("{base}.weight_scale");
+        let scale = st.get(&scale_key).map_err(|_| {
+            candle_gen::candle_core::Error::Msg(format!(
+                "krea plain int8: `{weight_key}` is missing `{scale_key}`"
+            ))
+        })?;
+        if scale.dtype() != ::safetensors::Dtype::F32 {
+            return Err(candle_gen::candle_core::Error::Msg(format!(
+                "krea plain int8: `{scale_key}` must be F32, got {:?}",
+                scale.dtype()
+            )));
+        }
+        if scale.shape() != [*rows] && scale.shape() != [*rows, 1] {
+            return Err(candle_gen::candle_core::Error::Msg(format!(
+                "krea plain int8: `{scale_key}` must be [{rows}] or [{rows},1], got {:?}",
+                scale.shape()
+            )));
+        }
+    }
+
+    for descriptor_key in descriptors {
+        let base = descriptor_key
+            .strip_suffix(".comfy_quant")
+            .expect("filtered suffix");
+        let weight_key = format!("{base}.weight");
+        if !matches!(
+            st.get(&weight_key),
+            Ok(view) if view.dtype() == ::safetensors::Dtype::I8
+        ) {
+            return Err(candle_gen::candle_core::Error::Msg(format!(
+                "krea plain int8: `{descriptor_key}` does not describe an I8 `{weight_key}`"
+            )));
+        }
+    }
+
+    Ok(true)
+}
+
+/// Validate the other side of the descriptor gate: the existing ConvRot constructor may only accept
+/// descriptors that explicitly opt into `convrot: true`. This closes the historical fallback where a
+/// plain int8 file handed to the rotated entrypoint could inherit group size 256 and silently corrupt
+/// its weights.
+fn validate_convrot_descriptors(st: &MmapedSafetensors) -> Result<()> {
+    let descriptors: Vec<(String, ::safetensors::tensor::TensorView<'_>)> = st
+        .tensors()
+        .into_iter()
+        .filter(|(name, _)| name.ends_with(".comfy_quant"))
+        .collect();
+    if descriptors.is_empty() {
+        return Err(candle_gen::candle_core::Error::Msg(
+            "krea convrot: checkpoint has no `.comfy_quant` descriptor with `convrot: true`"
+                .to_owned(),
+        ));
+    }
+    for (descriptor_key, descriptor) in descriptors {
+        if descriptor.dtype() != ::safetensors::Dtype::U8 || descriptor.shape().len() != 1 {
+            return Err(candle_gen::candle_core::Error::Msg(format!(
+                "krea convrot: `{descriptor_key}` must be a rank-1 U8 JSON blob"
+            )));
+        }
+        let json: serde_json::Value =
+            serde_json::from_slice(descriptor.data()).map_err(|error| {
+                candle_gen::candle_core::Error::Msg(format!(
+                    "krea convrot: `{descriptor_key}` is not valid JSON: {error}"
+                ))
+            })?;
+        if json.get("format").and_then(serde_json::Value::as_str) != Some("int8_tensorwise")
+            || json.get("convrot").and_then(serde_json::Value::as_bool) != Some(true)
+        {
+            return Err(candle_gen::candle_core::Error::Msg(format!(
+                "krea convrot: `{descriptor_key}` must declare `format: int8_tensorwise` and \
+                 `convrot: true`"
+            )));
+        }
+    }
+    Ok(())
 }
 
 // ===================================================================================================
@@ -1420,6 +1652,163 @@ mod tests {
             Tensor::randn(0f32, 1f32, (out_dim,), &dev).unwrap(),
         );
         (map, wq)
+    }
+
+    fn write_plain_int8_native_file(
+        path: &Path,
+        descriptor: &str,
+        scale_shape: Vec<usize>,
+        scales: &[f32],
+    ) {
+        let codes = [
+            1_u8,
+            (-2_i8) as u8,
+            3_u8,
+            (-4_i8) as u8,
+            5_u8,
+            (-6_i8) as u8,
+        ];
+        let scale_bytes: Vec<u8> = scales
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        let descriptor_bytes = descriptor.as_bytes();
+        let mut tensors = std::collections::BTreeMap::new();
+        tensors.insert(
+            "model.diffusion_model.blocks.0.attn.wq.weight",
+            ::safetensors::tensor::TensorView::new(::safetensors::Dtype::I8, vec![2, 3], &codes)
+                .unwrap(),
+        );
+        tensors.insert(
+            "model.diffusion_model.blocks.0.attn.wq.weight_scale",
+            ::safetensors::tensor::TensorView::new(
+                ::safetensors::Dtype::F32,
+                scale_shape,
+                &scale_bytes,
+            )
+            .unwrap(),
+        );
+        tensors.insert(
+            "model.diffusion_model.blocks.0.attn.wq.comfy_quant",
+            ::safetensors::tensor::TensorView::new(
+                ::safetensors::Dtype::U8,
+                vec![descriptor_bytes.len()],
+                descriptor_bytes,
+            )
+            .unwrap(),
+        );
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        ::safetensors::serialize_to_file(tensors, None, path).unwrap();
+    }
+
+    /// sc-14023: the non-rotated descriptor arm reconstructs exactly `codes * row_scale` through the
+    /// shared native-key remap. The expected values deliberately are not rotation-invariant, so any
+    /// accidental ConvRot/Hadamard leg changes the result.
+    #[test]
+    fn plain_int8_native_file_dequants_per_row_without_rotation() -> Result<()> {
+        let dev = Device::Cpu;
+        let path = std::env::temp_dir()
+            .join(format!("sc14023_plain_int8_{}", std::process::id()))
+            .join("kreamania_variant4.safetensors");
+        write_plain_int8_native_file(
+            &path,
+            r#"{"format":"int8_tensorwise","per_row":true}"#,
+            vec![2, 1],
+            &[0.5, 2.0],
+        );
+
+        let w = Weights::from_native_file(&path, &dev, DType::F32)?;
+        assert!(w.uses_native_keys());
+        assert!(w.is_plain_int8());
+        assert!(!w.is_convrot(), "plain int8 must never enable rotation");
+        let got = w.get("transformer_blocks.0.attn.to_q.weight")?;
+        assert_eq!(
+            got.flatten_all()?.to_vec1::<f32>()?,
+            vec![0.5, -1.0, 1.5, -8.0, 10.0, -12.0]
+        );
+        let lin = linear_detect(&w, "transformer_blocks.0.attn.to_q", false)?;
+        assert!(
+            !lin.is_convrot_int8() && !lin.is_packed(),
+            "plain int8 dequantizes to a dense, non-rotated projection"
+        );
+
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn plain_int8_native_file_rejects_convrot_or_wrong_descriptor() {
+        let cases = [
+            (
+                r#"{"format":"int8_tensorwise","per_row":true,"convrot":true}"#,
+                "convrot",
+            ),
+            (r#"{"format":"mxfp4","per_row":true}"#, "int8_tensorwise"),
+            (r#"{"format":"int8_tensorwise","per_row":false}"#, "per_row"),
+        ];
+        for (index, (descriptor, expected)) in cases.into_iter().enumerate() {
+            let path = std::env::temp_dir()
+                .join(format!(
+                    "sc14023_plain_int8_bad_desc_{}_{}",
+                    std::process::id(),
+                    index
+                ))
+                .join("bad.safetensors");
+            write_plain_int8_native_file(&path, descriptor, vec![2], &[0.5, 2.0]);
+            let error = match Weights::from_native_file(&path, &Device::Cpu, DType::F32) {
+                Ok(_) => panic!("invalid descriptor must fail"),
+                Err(error) => error.to_string(),
+            };
+            assert!(error.contains(expected), "{error}");
+            std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        }
+    }
+
+    #[test]
+    fn convrot_constructor_rejects_plain_int8_descriptor() {
+        let path = std::env::temp_dir()
+            .join(format!(
+                "sc14023_plain_int8_wrong_route_{}",
+                std::process::id()
+            ))
+            .join("plain.safetensors");
+        write_plain_int8_native_file(
+            &path,
+            r#"{"format":"int8_tensorwise","per_row":true}"#,
+            vec![2],
+            &[0.5, 2.0],
+        );
+        let error = match Weights::from_convrot_file(&path, &Device::Cpu, DType::F32) {
+            Ok(_) => panic!("plain descriptor must not enter ConvRot"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("convrot: true"), "{error}");
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn plain_int8_native_file_rejects_non_per_row_scale_shape() {
+        let path = std::env::temp_dir()
+            .join(format!(
+                "sc14023_plain_int8_bad_scale_{}",
+                std::process::id()
+            ))
+            .join("bad.safetensors");
+        write_plain_int8_native_file(
+            &path,
+            r#"{"format":"int8_tensorwise","per_row":true}"#,
+            vec![1],
+            &[0.5],
+        );
+        let error = match Weights::from_native_file(&path, &Device::Cpu, DType::F32) {
+            Ok(_) => panic!("wrong scale shape must fail"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("weight_scale") && error.contains("[2]"),
+            "{error}"
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
     /// **The dense-bf16 native path loads through the remap with NO rotation and NO int8 — the corruption
