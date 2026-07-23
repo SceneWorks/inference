@@ -224,6 +224,15 @@ impl KreaHeavy {
         })
     }
 
+    /// Assemble the heavy phase from a pre-built DiT + VAE — the seam for the community single-file load
+    /// (epic 14015, sc-14017 S0b), where the DiT comes from a native-keyed single file
+    /// ([`crate::loader::load_transformer_from_native_file`]) while the VAE is sourced from the resident
+    /// base snapshot. Byte-identical to [`from_snapshot`](Self::from_snapshot) once the two components
+    /// exist; it only relaxes *where each half is loaded from*.
+    pub(crate) fn from_parts(dit: Krea2Transformer, vae: QwenVae) -> Self {
+        Self { dit, vae }
+    }
+
     /// Quantize the DiT Linears in place (group-wise affine Q4/Q8); the VAE stays dense (the published
     /// `vae/` is f32), matching the converter's quant-target set. A no-op on an already-packed snapshot
     /// (`AdaptableLinear::quantize` skips quantized bases).

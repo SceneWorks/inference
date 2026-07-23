@@ -54,6 +54,7 @@ pub mod memory;
 pub mod model;
 pub mod model_control;
 pub mod multiphase;
+pub mod native_remap;
 pub mod pipeline;
 mod quant;
 pub mod schedule;
@@ -64,12 +65,12 @@ pub mod vae;
 
 pub use config::Krea2Config;
 pub use control::Krea2ControlBranch;
-pub use loader::{load_text_encoder, load_transformer};
+pub use loader::{load_text_encoder, load_transformer, load_transformer_from_native_file};
 pub use memory::{plan_control_adaptation, ControlLaneInputs};
 pub use model::{
-    descriptor, edit_descriptor, load, load_edit, load_raw, load_turbo_edit, raw_descriptor,
-    turbo_edit_descriptor, Krea, KREA_2_EDIT_ID, KREA_2_RAW_ID, KREA_2_TURBO_EDIT_ID,
-    KREA_2_TURBO_ID, RES_MULTIPLE,
+    descriptor, edit_descriptor, load, load_edit, load_from_native_dit_file, load_raw,
+    load_turbo_edit, raw_descriptor, turbo_edit_descriptor, Krea, KREA_2_EDIT_ID, KREA_2_RAW_ID,
+    KREA_2_TURBO_EDIT_ID, KREA_2_TURBO_ID, RES_MULTIPLE,
 };
 pub use model_control::{KreaTurboControl, KREA_2_TURBO_CONTROL_ID};
 pub use multiphase::{
@@ -77,6 +78,7 @@ pub use multiphase::{
     resolve_phase_slices, resolve_phases, total_phase_steps, PhaseSlice, ResolvedPhase,
     ResolvedPhaseAdapter,
 };
+pub use native_remap::{native_dit_key_to_diffusers, remap_native_dit_to_diffusers};
 pub use pipeline::{KreaHeavy, KreaPipeline, KreaText, MultiPhasePlan, TurboOptions};
 pub use schedule::{krea_sigmas, turbo_sigmas, TURBO_MU, TURBO_STEPS};
 pub use text_encoder::{KreaTeConfig, KreaTextEncoder, KreaTokenizer};

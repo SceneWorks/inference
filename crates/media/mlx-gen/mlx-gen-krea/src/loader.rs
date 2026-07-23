@@ -72,3 +72,34 @@ pub fn load_transformer(root: impl AsRef<Path>) -> Result<Krea2Transformer> {
     crate::convert::validate_transformer(&w, &cfg)?;
     Krea2Transformer::from_weights(&w, &cfg)
 }
+
+/// Load the single-stream DiT from a **community single-file** checkpoint (epic 14015, sc-14017 S0b) —
+/// a ComfyUI-exported dense bf16 Krea 2 DiT with native-mmdit keys under `model.diffusion_model.` (e.g.
+/// `kreamania_variant5.safetensors`). Distinct from [`load_transformer`], which reads the published
+/// diffusers-keyed `transformer/` snapshot dir:
+///
+/// 1. read the single file as one dense bf16 tensor set ([`Weights::from_file`] — values/dtypes verbatim,
+/// 2. rename every native key to its diffusers counterpart
+///    ([`crate::native_remap::remap_native_dit_to_diffusers`]), which **fails closed** on any on-disk key
+///    it cannot map (a foreign/unexpected tensor) or a non-injective collision,
+/// 3. run the same architecture coverage + shape validation as the snapshot path
+///    ([`crate::convert::validate_transformer`]), which **fails closed** on any missing module weight or
+///    wrong shape, then
+/// 4. assemble the transformer through the unchanged
+///    [`Krea2Transformer::from_weights`].
+///
+/// `cfg` is the Krea 2 architecture — from the **resident base snapshot** (the single file ships no
+/// `config.json`); the community merge shares the published architecture exactly. Dense bf16 only: the
+/// int8/quantized single-file (variant4) is a separate follow-on.
+pub fn load_transformer_from_native_file(
+    dit_file: impl AsRef<Path>,
+    cfg: &Krea2Config,
+) -> Result<Krea2Transformer> {
+    let native = Weights::from_file(dit_file.as_ref())?;
+    let mut remapped = crate::native_remap::remap_native_dit_to_diffusers(native)?;
+    // Reshape any flat per-block modulation table (`[6·hidden]`) to the diffusers 2-D `[6, hidden]` so
+    // the set is shape-identical to a snapshot load and `validate_transformer`'s shape check passes.
+    crate::native_remap::normalize_modulation_tables(&mut remapped)?;
+    crate::convert::validate_transformer(&remapped, cfg)?;
+    Krea2Transformer::from_weights(&remapped, cfg)
+}
