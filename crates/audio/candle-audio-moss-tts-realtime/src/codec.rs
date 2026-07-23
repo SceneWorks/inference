@@ -1,12 +1,16 @@
-//! The **MOSS-Audio-Tokenizer** codec decoder (sc-13392) — RVQ speech codes → 24 kHz waveform.
+//! The **MOSS-Audio-Tokenizer** codec (sc-13392 decode + sc-14148 encode) — RVQ speech codes ↔
+//! 24 kHz waveform.
 //!
 //! MOSS-TTS-Realtime's AR brain ([`crate::decode`]) only emits discrete RVQ codes; turning those
 //! into a waveform is the job of a **separate** ~7.1 GB model, `OpenMOSS-Team/MOSS-Audio-Tokenizer`
 //! (Apache-2.0), a novel **RLFQ streaming codec** (config `quantizer_type=rlfq`, 32 quantizers,
 //! codebook 1024, `codebook_dim=8`, `rvq_dim=512`). It is a Moshi/Mimi-scale, **CNN-free** codec:
 //! its decoder is a stack of causal RoPE transformers interleaved with `PatchedPretransform`
-//! channel→time upsamplers. This module ports the **decode path only** (the TTS direction) natively
-//! onto the pinned candle revision, faithful to the reference `modeling_moss_audio_tokenizer.py`.
+//! channel→time upsamplers, and its encoder the analysis mirror (time→channel downsamplers +
+//! transformers → residual-LFQ quantize). This module ports **both directions** natively onto the
+//! pinned candle revision, faithful to the reference `modeling_moss_audio_tokenizer.py`: the decode
+//! path (sc-13392, the TTS direction) and the encode path (sc-14148, waveform → codes for voice
+//! cloning). The encoder half loads lazily, so a pure-TTS decode never faults its weight pages.
 //!
 //! ## The decode graph (`_decode_frame`)
 //!
@@ -484,8 +488,11 @@ struct CodecStage {
 }
 
 impl CodecStage {
-    fn load(spec: &StageSpec, context: usize, vb: &VarBuilder) -> CandleResult<Self> {
-        let vb_s = vb.pp(format!("decoder.{}", spec.index));
+    /// Load a `ProjectedTransformer` stage from `{module}.{index}` — `module` is `"decoder"` (the
+    /// upsampling synthesis stack) or `"encoder"` (the downsampling analysis stack). Both share the
+    /// identical layer architecture; only the weight namespace and the per-stage dims differ.
+    fn load(spec: &StageSpec, context: usize, module: &str, vb: &VarBuilder) -> CandleResult<Self> {
+        let vb_s = vb.pp(format!("{module}.{}", spec.index));
         let input_proj = if spec.d_model != spec.input_dim {
             Some(Linear::new(
                 vb_s.pp("input_proj")
@@ -556,6 +563,170 @@ fn patched_unpatch(x: &Tensor, patch: usize) -> CandleResult<Tensor> {
 }
 
 // --------------------------------------------------------------------------------------------
+// The encoder (waveform → RVQ codes) — sc-14148
+// --------------------------------------------------------------------------------------------
+
+/// `PatchedPretransform.encode`: `[b, d, l] → [b, d·patch, l/patch]` (time→channels downsample by
+/// `patch`) — the inverse of [`patched_unpatch`], mirroring the reference
+/// `MossAudioTokenizerPatchedPretransform.encode`.
+fn patched_patch(x: &Tensor, patch: usize) -> CandleResult<Tensor> {
+    let (b, d, l) = x.dims3()?;
+    if l % patch != 0 {
+        candle_audio::candle_core::bail!(
+            "PatchedPretransform.encode: time {l} not divisible by patch {patch}"
+        );
+    }
+    // reshape(b, d, l/patch, patch).permute(0, 1, 3, 2).reshape(b, d*patch, l/patch)
+    x.reshape((b, d, l / patch, patch))?
+        .permute((0, 1, 3, 2))?
+        .contiguous()?
+        .reshape((b, d * patch, l / patch))
+}
+
+/// The four **encoder** Transformer stages (`encoder.{1,3,5,7}`) — the analysis mirror of the decoder
+/// [`STAGES`], read from `config.encoder_kwargs`. Each is preceded by an [`ENCODER_PATCH_SIZES`]
+/// downsampler; ∏ of the patch sizes = [`DOWNSAMPLE_RATE`] (24 kHz waveform → 12.5 fps code frames).
+#[rustfmt::skip]
+const ENCODER_STAGES: [StageSpec; 4] = [
+    StageSpec { index: 1, input_dim: 240,  d_model: 768,  output_dim: 384, num_heads: 12, num_layers: 12, dim_feedforward: 3072 },
+    StageSpec { index: 3, input_dim: 768,  d_model: 768,  output_dim: 384, num_heads: 12, num_layers: 12, dim_feedforward: 3072 },
+    StageSpec { index: 5, input_dim: 768,  d_model: 768,  output_dim: 640, num_heads: 12, num_layers: 12, dim_feedforward: 3072 },
+    StageSpec { index: 7, input_dim: 1280, d_model: 1280, output_dim: 768, num_heads: 20, num_layers: 32, dim_feedforward: 5120 },
+];
+
+/// Patch sizes of `encoder.{0,2,4,6}` — the downsamplers applied **before** each encoder Transformer
+/// stage (∏ = [`DOWNSAMPLE_RATE`]).
+const ENCODER_PATCH_SIZES: [usize; 4] = [240, 2, 2, 2];
+
+/// L2-normalize each row of a `[n, d]` matrix (the reference `F.normalize`, default eps 1e-12).
+fn l2_normalize_rows(x: &Tensor) -> CandleResult<Tensor> {
+    let norm = x.sqr()?.sum_keepdim(1)?.sqrt()?;
+    x.broadcast_div(&norm.clamp(1e-12f32, f32::INFINITY)?)
+}
+
+/// The **encode** side of the Residual-LFQ quantizer: the shared `input_proj` (output_dim → rvq_dim),
+/// per-quantizer `in_proj` (rvq_dim → codebook_dim) + `codebook` + `out_proj` (codebook_dim → rvq_dim).
+/// Emits `nq` codebook-index rows (the reference `MossAudioTokenizerResidualLFQ.forward` inference
+/// path: an L2-normalized argmin over each residual, then subtract the RAW selected codebook vector).
+struct RlfqEncoder {
+    input_proj: Conv1d,
+    codebooks: Vec<Tensor>,
+    in_projs: Vec<Conv1d>,
+    out_projs: Vec<Conv1d>,
+    nq: usize,
+}
+
+impl RlfqEncoder {
+    fn load(cfg: &CodecConfig, nq: usize, vb: &VarBuilder) -> CandleResult<Self> {
+        let vb_q = vb.pp("quantizer");
+        // `input_proj` lifts the encoder output into the residual working dim (output_dim → rvq_dim);
+        // the reference's quantizer `input_dim` == its `output_dim` (== CODE_DIM, config-validated), so
+        // `output_dim` is the correct in-channel count and equals `ENCODER_STAGES`'s last output.
+        let input_proj = wn_conv1d(cfg.rvq_dim, cfg.output_dim, &vb_q.pp("input_proj"))?;
+        let vb_qs = vb_q.pp("quantizers");
+        let mut codebooks = Vec::with_capacity(nq);
+        let mut in_projs = Vec::with_capacity(nq);
+        let mut out_projs = Vec::with_capacity(nq);
+        for i in 0..nq {
+            let vb_i = vb_qs.pp(i);
+            codebooks.push(
+                vb_i.pp("codebook")
+                    .get((cfg.codebook_size, cfg.codebook_dim), "weight")?,
+            );
+            in_projs.push(wn_conv1d(
+                cfg.codebook_dim,
+                cfg.rvq_dim,
+                &vb_i.pp("in_proj"),
+            )?);
+            out_projs.push(wn_conv1d(
+                cfg.rvq_dim,
+                cfg.codebook_dim,
+                &vb_i.pp("out_proj"),
+            )?);
+        }
+        Ok(Self {
+            input_proj,
+            codebooks,
+            in_projs,
+            out_projs,
+            nq,
+        })
+    }
+
+    /// Encode `e` `[1, output_dim, T]` (the encoder's last hidden state) → `nq` code rows `[nq][T]`.
+    fn encode(&self, e: &Tensor) -> CandleResult<Vec<Vec<u32>>> {
+        let mut residual = self.input_proj.forward(e)?; // [1, rvq_dim, T]
+        let mut codes: Vec<Vec<u32>> = Vec::with_capacity(self.nq);
+        for i in 0..self.nq {
+            // Nearest code by argmin ‖e − c‖² over L2-normalized vectors, which equals argmax cosine:
+            // the ‖e‖² (per-position) and ‖c‖² (== 1 per normalized code) terms are constant across
+            // codes, so they do not move the argmin — identical to the reference `(-dist).max(1)`.
+            let z_e = self.in_projs[i].forward(&residual)?; // [1, codebook_dim, T]
+            let enc = z_e.i(0)?.t()?.contiguous()?; // [T, codebook_dim]
+            let enc_n = l2_normalize_rows(&enc)?; // [T, codebook_dim] rows
+            let cb_n = l2_normalize_rows(&self.codebooks[i])?; // [codebook_size, dim] rows
+            let sim = enc_n.matmul(&cb_n.t()?)?; // [T, codebook_size]
+            let idx = sim.argmax(1)?; // [T]
+            let ids: Vec<u32> = idx.to_dtype(DType::U32)?.to_vec1::<u32>()?;
+            // Subtract the RAW (un-normalized) selected codebook vector's out_proj from the residual.
+            let looked = self.codebooks[i].index_select(&idx, 0)?; // [T, codebook_dim]
+            let z_q = self.out_projs[i].forward(&looked.t()?.unsqueeze(0)?.contiguous()?)?; // [1, rvq_dim, T]
+            residual = (residual - z_q)?;
+            codes.push(ids);
+        }
+        Ok(codes)
+    }
+}
+
+/// The loaded **encoder** half (analysis stages + the RLFQ encode) — built lazily on first
+/// [`MossAudioCodec::encode`] so a pure-decode (TTS) load never faults the encoder's weight pages.
+struct EncoderHalf {
+    stages: Vec<CodecStage>,
+    rlfq: RlfqEncoder,
+}
+
+impl EncoderHalf {
+    fn load(cfg: &CodecConfig, nq: usize, vb: &VarBuilder) -> CandleResult<Self> {
+        // Per-stage sliding-window context: the encoder starts at the sample rate and each
+        // preceding PatchedPretransform divides the frame rate (the reverse of the decoder), matching
+        // the reference `int(current_frame_rate * ctx_dur)` with `frame_rate /= downsample_ratio`.
+        let mut frame_rate = cfg.sample_rate as f64;
+        let mut stages = Vec::with_capacity(ENCODER_STAGES.len());
+        for (si, spec) in ENCODER_STAGES.iter().enumerate() {
+            frame_rate /= ENCODER_PATCH_SIZES[si] as f64; // the patch precedes this stage
+            let context = ((frame_rate * cfg.context_duration).floor() as usize).max(1);
+            stages.push(CodecStage::load(spec, context, "encoder", vb)?);
+        }
+        Ok(Self {
+            stages,
+            rlfq: RlfqEncoder::load(cfg, nq, vb)?,
+        })
+    }
+}
+
+/// Minimal linear-interpolation resample to the codec's native rate. Reference-audio preprocessing is
+/// provider-owned (candle-audio's `wav` module notes the input path resamples here, not in the codec);
+/// exact-rate inputs bypass it. A higher-fidelity resampler can be swapped in without touching callers.
+fn resample_linear(samples: &[f32], from: u32, to: u32) -> Vec<f32> {
+    if from == to || samples.is_empty() {
+        return samples.to_vec();
+    }
+    let ratio = to as f64 / from as f64;
+    let out_len = ((samples.len() as f64) * ratio).round().max(1.0) as usize;
+    let last = samples.len() - 1;
+    (0..out_len)
+        .map(|i| {
+            let src = i as f64 / ratio;
+            let j = src.floor() as usize;
+            let frac = (src - j as f64) as f32;
+            let a = samples[j.min(last)];
+            let b = samples[(j + 1).min(last)];
+            a + (b - a) * frac
+        })
+        .collect()
+}
+
+// --------------------------------------------------------------------------------------------
 // The assembled decoder
 // --------------------------------------------------------------------------------------------
 
@@ -567,6 +738,12 @@ pub struct MossAudioCodec {
     /// The used quantizer count == the AR side's RVQ codebook count.
     num_code_quantizers: usize,
     device: Device,
+    /// The snapshot's safetensors shards, retained so the encoder half can be mmapped lazily on the
+    /// first [`encode`](Self::encode) without re-resolving the snapshot (voice cloning, sc-14149).
+    shards: Vec<std::path::PathBuf>,
+    /// The encoder half (analysis stages + RLFQ encode), built lazily on first `encode` — a pure
+    /// decode (TTS) load never touches the encoder's weight pages.
+    encoder: std::sync::OnceLock<EncoderHalf>,
 }
 
 impl MossAudioCodec {
@@ -590,12 +767,13 @@ impl MossAudioCodec {
                 |e| AudioError::Msg(format!("codec: mmap safetensors in {}: {e}", dir.display())),
             )?
         };
-        Self::from_var_builder(config, num_code_quantizers, vb, device)
+        Self::from_var_builder(config, num_code_quantizers, shards, vb, device)
     }
 
     fn from_var_builder(
         config: CodecConfig,
         num_code_quantizers: usize,
+        shards: Vec<std::path::PathBuf>,
         vb: VarBuilder,
         device: Device,
     ) -> Result<Self> {
@@ -609,7 +787,7 @@ impl MossAudioCodec {
             let context = (frame_rate * config.context_duration).floor() as usize;
             let context = context.max(1);
             stages.push(
-                CodecStage::load(spec, context, &vb)
+                CodecStage::load(spec, context, "decoder", &vb)
                     .map_err(|e| AudioError::Msg(format!("codec: load stage {si}: {e}")))?,
             );
             frame_rate *= PATCH_SIZES[si] as f64;
@@ -620,6 +798,8 @@ impl MossAudioCodec {
             stages,
             num_code_quantizers,
             device,
+            shards,
+            encoder: std::sync::OnceLock::new(),
         })
     }
 
@@ -685,6 +865,62 @@ impl MossAudioCodec {
         // x is [1, 1, T*downsample_rate].
         let wav = x.i((0, 0))?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
         Ok(Some(wav))
+    }
+
+    /// Encode a mono waveform into the codec's `num_code_quantizers` RVQ codes per frame — the
+    /// analysis direction (waveform → tokens) for voice cloning (sc-14149). `samples` at
+    /// `sample_rate` are resampled to the codec's native rate, right-padded to a multiple of
+    /// `downsample_rate`, run through the encoder analysis stages, then residual-LFQ quantized.
+    /// Returns `frames[f][q]` (the same layout [`decode_frames`](Self::decode_frames) consumes), so an
+    /// encode→decode round-trip reconstructs the input.
+    ///
+    /// The output is trimmed to the **valid** frame count `⌊samples / downsample_rate⌋` (at the native
+    /// rate) — the reference reports exactly this as `audio_codes_lengths` and masks the residual over
+    /// the trailing padded frame, so the final (part-padding) frame it would otherwise emit is a
+    /// masked artifact, not real audio. Trimming keeps every returned frame faithful to the reference's
+    /// valid codes (a clip shorter than one frame yields no codes, as in the reference).
+    pub fn encode(&self, samples: &[f32], sample_rate: u32) -> CandleResult<Vec<Vec<u32>>> {
+        if samples.is_empty() {
+            return Ok(Vec::new());
+        }
+        let wav = resample_linear(samples, sample_rate, self.config.sample_rate);
+        let dr = self.config.downsample_rate;
+        let valid_frames = wav.len() / dr; // ⌊T / downsample_rate⌋ — the reference valid length
+        if valid_frames == 0 {
+            return Ok(Vec::new());
+        }
+        let enc = self.encoder_half()?;
+        let t = wav.len();
+        let pad = (dr - t % dr) % dr;
+        let mut buf = wav;
+        buf.resize(t + pad, 0.0);
+        let n = buf.len();
+        let mut x = Tensor::from_vec(buf, (1, 1, n), &self.device)?; // [1, 1, n]
+        for (i, stage) in enc.stages.iter().enumerate() {
+            x = patched_patch(&x, ENCODER_PATCH_SIZES[i])?; // downsample (the patch precedes the stage)
+            x = stage.forward(&x)?;
+        }
+        // x is [1, output_dim, ⌈T/dr⌉]; RLFQ-encode to per-quantizer rows, then take the valid prefix.
+        let rows = enc.rlfq.encode(&x)?;
+        // Transpose [nq][T] → frames [T][nq] (the decode_frames layout), trimmed to the valid length.
+        let frames = (0..valid_frames)
+            .map(|f| rows.iter().map(|r| r[f]).collect())
+            .collect();
+        Ok(frames)
+    }
+
+    /// Get-or-build the encoder half, mmapping the retained shards on first use. Thread-safe and
+    /// idempotent (a lost init race just discards the redundant build).
+    fn encoder_half(&self) -> CandleResult<&EncoderHalf> {
+        if let Some(e) = self.encoder.get() {
+            return Ok(e);
+        }
+        // SAFETY: same idiom as `load` — mmap of the provider-resolved, pinned safetensors as F32.
+        let vb = unsafe {
+            candle_nn::VarBuilder::from_mmaped_safetensors(&self.shards, DType::F32, &self.device)?
+        };
+        let built = EncoderHalf::load(&self.config, self.num_code_quantizers, &vb)?;
+        Ok(self.encoder.get_or_init(|| built))
     }
 }
 
@@ -807,6 +1043,66 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn patched_patch_inverts_unpatch() {
+        let dev = Device::Cpu;
+        // The encode-direction patch `[1, d, l] → [1, d·h, l/h]` is the exact inverse of the decode
+        // `patched_unpatch`, so `unpatch(patch(x)) == x` (the reshape/permute pair cancels).
+        let x = Tensor::from_vec(
+            (0..24).map(|i| i as f32).collect::<Vec<_>>(),
+            (1, 2, 12),
+            &dev,
+        )
+        .unwrap();
+        let down = patched_patch(&x, 3).unwrap();
+        assert_eq!(down.dims(), &[1, 6, 4], "time→channels downsample by 3");
+        let back = patched_unpatch(&down, 3).unwrap();
+        assert_eq!(back.dims(), x.dims());
+        assert_eq!(
+            back.i((0,)).unwrap().to_vec2::<f32>().unwrap(),
+            x.i((0,)).unwrap().to_vec2::<f32>().unwrap(),
+            "unpatch ∘ patch is the identity"
+        );
+        // A time length not divisible by the patch is a typed error, not a silent reshape.
+        assert!(patched_patch(&x, 5).is_err());
+    }
+
+    #[test]
+    fn l2_normalize_rows_gives_unit_norm_and_survives_zero() {
+        let dev = Device::Cpu;
+        // [3,4] → /5 = [0.6,0.8]; [0,0] → stays [0,0] (eps clamp, no NaN); [1,0] already unit.
+        let x = Tensor::from_vec(vec![3.0f32, 4.0, 0.0, 0.0, 1.0, 0.0], (3, 2), &dev).unwrap();
+        let n = l2_normalize_rows(&x).unwrap().to_vec2::<f32>().unwrap();
+        assert!((n[0][0] - 0.6).abs() < 1e-5 && (n[0][1] - 0.8).abs() < 1e-5);
+        assert!(n[1].iter().all(|v| v.is_finite()) && n[1] == vec![0.0, 0.0]);
+        assert!((n[2][0] - 1.0).abs() < 1e-5 && n[2][1].abs() < 1e-5);
+    }
+
+    #[test]
+    fn resample_linear_identity_ratio_and_edges() {
+        let x = vec![0.0f32, 1.0, 2.0, 3.0];
+        assert_eq!(
+            resample_linear(&x, 24_000, 24_000),
+            x,
+            "identity at native rate"
+        );
+        assert_eq!(resample_linear(&x, 24_000, 48_000).len(), 8, "2× upsample");
+        assert_eq!(
+            resample_linear(&x, 48_000, 24_000).len(),
+            2,
+            "2× downsample"
+        );
+        assert!(
+            resample_linear(&[], 48_000, 24_000).is_empty(),
+            "empty stays empty"
+        );
+        assert_eq!(
+            resample_linear(&[5.0], 48_000, 24_000),
+            vec![5.0],
+            "single sample never panics"
+        );
     }
 
     #[test]
