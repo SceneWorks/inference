@@ -27,14 +27,14 @@
 //! ```text
 //! cargo test --locked -p candle-audio-moss-tts-realtime --test conformance -- --ignored --nocapture
 //! ```
-//! Set `MOSS_TTS_REALTIME_SNAPSHOT` to the AR snapshot dir (holding `config.json`,
-//! `model.safetensors`, `tokenizer.json`), or leave unset to resolve the pinned AR snapshot via the
-//! hub (~4.66 GB). The MOSS-Audio-Tokenizer codec (~7.1 GB) is a passed-in component (sc-13662, epic
-//! 13657): it is **required** from `MOSS_AUDIO_TOKENIZER_SNAPSHOT` (the codec snapshot dir,
-//! `config.json` + `model*.safetensors`) — the provider no longer self-fetches it, so this must
-//! point at a materialized snapshot. The demo WAV path is `MOSS_TTS_REALTIME_WAV_OUT` (default temp
-//! dir). The fidelity gate additionally uses `whisper_base` (`WHISPER_SNAPSHOT`, or the pinned
-//! ~150 MB snapshot resolved via the hub).
+//! Set `MOSS_TTS_REALTIME_SNAPSHOT` to the AR snapshot dir (~4.66 GB, holding `config.json`,
+//! `model.safetensors`, `tokenizer.json`) — **required**, a passed-in path: inference never
+//! self-fetches or derives a cache location (epic 13657). The MOSS-Audio-Tokenizer codec (~7.1 GB) is
+//! likewise a passed-in component (sc-13662): it is **required** from `MOSS_AUDIO_TOKENIZER_SNAPSHOT`
+//! (the codec snapshot dir, `config.json` + `model*.safetensors`) — the provider never self-fetches
+//! it, so this must point at a materialized snapshot. The demo WAV path is `MOSS_TTS_REALTIME_WAV_OUT`
+//! (default temp dir). The fidelity gate additionally uses `whisper_base` — **required** from
+//! `WHISPER_SNAPSHOT` (the ~150 MB snapshot dir), also a passed-in path, never a hub fetch.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -575,5 +575,159 @@ fn moss_tts_realtime_asr_roundtrip_fidelity() {
         decoy_cer > MAX_PROMPT_CER,
         "discrimination failed: a faithful transcript {first_transcript:?} scored CER {decoy_cer:.3} \
          against the unrelated decoy — the bound {MAX_PROMPT_CER} is too loose to be meaningful"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// sc-14148 — the MOSS-Audio-Tokenizer ENCODER (waveform → RVQ codes), the analysis direction that
+// voice cloning (sc-14149) needs. Two gates: a self-contained encode→decode round-trip, and — when
+// the reference outputs are provisioned — a strong codebook-0 cross-check against the reference
+// PyTorch `codec.encode` on a byte-identical clip.
+// ---------------------------------------------------------------------------------------------
+
+fn pearson(a: &[f32], b: &[f32]) -> f32 {
+    let n = a.len().min(b.len());
+    if n == 0 {
+        return 0.0;
+    }
+    let (a, b) = (&a[..n], &b[..n]);
+    let ma = a.iter().sum::<f32>() / n as f32;
+    let mb = b.iter().sum::<f32>() / n as f32;
+    let mut num = 0.0f32;
+    let (mut da, mut db) = (0.0f32, 0.0f32);
+    for i in 0..n {
+        let (x, y) = (a[i] - ma, b[i] - mb);
+        num += x * y;
+        da += x * x;
+        db += y * y;
+    }
+    if da <= 0.0 || db <= 0.0 {
+        return 0.0;
+    }
+    num / (da.sqrt() * db.sqrt())
+}
+
+fn read_f32le(path: &str) -> Vec<f32> {
+    let bytes = std::fs::read(path).expect("read clip.f32");
+    bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
+/// Read a codes CSV (`frames[T][nq]`, one comma-separated row per frame).
+fn read_codes_csv(path: &str) -> Vec<Vec<u32>> {
+    std::fs::read_to_string(path)
+        .expect("read codes csv")
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| l.split(',').map(|s| s.trim().parse().unwrap()).collect())
+        .collect()
+}
+
+#[test]
+#[ignore = "real weights: needs the ~7.1 GB MOSS-Audio-Tokenizer codec snapshot; run with --ignored --nocapture"]
+fn moss_audio_codec_encode_roundtrip_and_reference() {
+    use candle_audio_moss_tts_realtime::codec::MossAudioCodec;
+    let codec = MossAudioCodec::load(&codec_dir(), 16).expect("load codec");
+
+    // Strong cross-check (when provisioned): the port's encode codebook-0 must match the reference
+    // PyTorch `codec.encode` on a byte-identical clip. `MOSS_CODEC_CLIP` = raw f32-LE mono samples at
+    // 24 kHz; `MOSS_CODEC_REF_CODES` = the reference codes CSV (`frames[T][16]`).
+    if let (Ok(clip_p), Ok(ref_p)) = (
+        std::env::var("MOSS_CODEC_CLIP"),
+        std::env::var("MOSS_CODEC_REF_CODES"),
+    ) {
+        let clip = read_f32le(&clip_p);
+        let port = codec.encode(&clip, 24_000).expect("encode reference clip");
+        let refc = read_codes_csv(&ref_p);
+        let n = port.len().min(refc.len());
+        assert!(n > 0, "no frames to compare");
+        let (mut cb0, mut allm, mut tot) = (0usize, 0usize, 0usize);
+        for f in 0..n {
+            if port[f][0] == refc[f][0] {
+                cb0 += 1;
+            }
+            for q in 0..16 {
+                tot += 1;
+                if port[f].get(q) == refc[f].get(q) {
+                    allm += 1;
+                }
+            }
+        }
+        let cb0_rate = cb0 as f32 / n as f32;
+        let all_rate = allm as f32 / tot as f32;
+        println!(
+            "codec ref cross-check: port {} vs ref {} frames (cmp {n}); cb0 agree {cb0_rate:.3}, \
+             all-cb agree {all_rate:.3}",
+            port.len(),
+            refc.len()
+        );
+        assert_eq!(
+            port.len(),
+            refc.len(),
+            "frame count must match the reference"
+        );
+        // The port matches the reference codec.encode exactly (measured 1.000 across all 16
+        // codebooks); the bounds sit just under that to allow only cross-platform argmax tie noise, so
+        // a real regression on codebook-0 OR any higher quantizer fails here.
+        assert!(
+            cb0_rate >= 0.99,
+            "port encode codebook-0 must match the reference encoder (agree {cb0_rate:.3})"
+        );
+        assert!(
+            all_rate >= 0.98,
+            "port encode must match the reference across all 16 codebooks (agree {all_rate:.3})"
+        );
+    } else {
+        println!(
+            "codec ref cross-check SKIPPED (set MOSS_CODEC_CLIP + MOSS_CODEC_REF_CODES to enable)"
+        );
+    }
+
+    // Self-contained round-trip: a real codec waveform (decode a fixed pseudo-random 40-frame pattern)
+    // → encode → decode must reconstruct it — the encoder emits decodable, faithful codes.
+    let mut state: u32 = 1;
+    let mut next = || {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        (state >> 8) % 1024
+    };
+    let frames0: Vec<Vec<u32>> = (0..40).map(|_| (0..16).map(|_| next()).collect()).collect();
+    let w0 = codec
+        .decode_frames(&frames0, &|| false)
+        .unwrap()
+        .expect("decode w0");
+    let codes1 = codec.encode(&w0, 24_000).expect("encode w0");
+    assert_eq!(
+        codes1.len(),
+        frames0.len(),
+        "encode preserves the frame count (1 frame per {} samples)",
+        moss::codec::DOWNSAMPLE_RATE,
+    );
+    assert!(
+        codes1.iter().all(|f| f.len() == 16),
+        "16 codebook codes per frame"
+    );
+    assert!(
+        codes1.iter().flatten().all(|&c| c < 1024),
+        "codes in the codebook range [0, 1024)"
+    );
+    let w1 = codec
+        .decode_frames(&codes1, &|| false)
+        .unwrap()
+        .expect("decode w1");
+    let corr = pearson(&w0, &w1);
+    let rms1 = (w1.iter().map(|s| s * s).sum::<f32>() / w1.len().max(1) as f32).sqrt();
+    println!(
+        "codec round-trip: {} frames, corr(w0,w1)={corr:.3}, rms_out={rms1:.4}",
+        codes1.len()
+    );
+    assert!(
+        rms1 > 1e-3,
+        "encode→decode round-trip is silent (rms {rms1:.5})"
+    );
+    assert!(
+        corr > 0.3,
+        "encode→decode must reconstruct the codec waveform (corr {corr:.3})"
     );
 }
