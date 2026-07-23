@@ -161,25 +161,32 @@ pub fn validate_transformer(w: &Weights, cfg: &Krea2Config) -> Result<()> {
     validate_shapes(w, cfg)
 }
 
-/// Validate a **dense-bf16 native-keyed single file** (sc-14022) — the candle sibling of the MLX
-/// `remap_native_dit_to_diffusers` + `validate_transformer` fail-closed pair. Stricter than the ConvRot
-/// branch of [`validate_transformer`]: the dense single file is DiT-only with **exactly** the published
-/// tensor count and no quant siblings, so it must be a *bijection* onto the module tree — every expected
-/// diffusers key resolves to a present native tensor (no missing) AND the file carries no unmapped /
-/// foreign / duplicate on-disk tensor (no extra).
+/// Validate a **dense-bf16 or plain-int8 native-keyed single file** (sc-14022/sc-14023) — the candle
+/// sibling of the MLX `remap_native_dit_to_diffusers` + `validate_transformer` fail-closed pair.
+/// Stricter than the ConvRot branch of [`validate_transformer`]: every model tensor must form a
+/// bijection onto the module tree. A descriptor-validated plain-int8 projection additionally carries
+/// exactly its `.weight_scale` and `.comfy_quant` companions; those are the only allowed surplus.
 ///
 /// Fails closed (typed error) — never a silent gap:
 /// 1. **coverage** — any expected diffusers key that does not resolve to a present native tensor (a
 ///    truncated download, wrong family, or a bad prefix) is reported by name; then
-/// 2. **no foreign/extra** — the on-disk tensor count must equal the expected count. With the remap
-///    pinned injective (`loader::tests::convrot_remap_pins_the_key_map` + the sc-14022 coverage test)
-///    and full coverage from step 1, count-equality ⇒ a bijection, so any tensor the remap cannot place
-///    (a foreign key, or a duplicate) makes the count differ and is rejected; then
+/// 2. **no foreign/extra** — the on-disk tensor count must equal the expected model count plus two
+///    companions per validated plain-int8 projection. With the remap pinned injective
+///    (`loader::tests::convrot_remap_pins_the_key_map` + the sc-14022 coverage test) and full coverage
+///    from step 1, count-equality proves there is no foreign or duplicate tensor; then
 /// 3. the shared `validate_shapes` (resolving, flat-`scale_shift_table` aware).
 ///
 /// The ConvRot file is validated by [`validate_transformer`]'s coverage-only native branch instead — it
 /// legitimately carries extra `.weight_scale`/`.comfy_quant` siblings, so it is NOT a bijection.
 pub fn validate_native_transformer(w: &Weights, cfg: &Krea2Config) -> Result<()> {
+    validate_native_key_surface(w, cfg)?;
+    validate_shapes(w, cfg)
+}
+
+/// Validate coverage and the exact allowed on-disk key surface independently of tensor dimensions.
+/// Kept separate so a tiny, real safetensors fixture can prove the plain-int8 companion accounting
+/// without allocating the multi-gigabyte tensors required by Krea's representative shape checks.
+fn validate_native_key_surface(w: &Weights, cfg: &Krea2Config) -> Result<()> {
     let expected = expected_transformer_keys(cfg);
     // (1) Coverage: every expected diffusers key must resolve (via the native remap) to a present tensor.
     let missing: Vec<&String> = expected.iter().filter(|k| !w.contains(k)).collect();
@@ -196,19 +203,35 @@ pub fn validate_native_transformer(w: &Weights, cfg: &Krea2Config) -> Result<()>
             missing.len(),
         )));
     }
-    // (2) No foreign/extra: a dense DiT-only file has exactly `expected.len()` tensors. Coverage (1) put
-    // that many *distinct* expected keys onto present tensors through the injective remap, so any surplus
-    // on-disk tensor is one the remap cannot place — reject it rather than load a set with a stray weight.
-    let on_disk = w.keys().len();
-    if on_disk != expected.len() {
+    // (2) No foreign/extra: dense has exactly one on-disk tensor per expected model tensor. Plain int8
+    // has exactly two already-validated companions for each I8 projection. `from_native_file` proves
+    // descriptor contents, I8 rank, scale dtype/shape, and the 1:1 descriptor-to-I8 relationship before
+    // constructing `Weights`, so descriptor count is the authoritative quantized projection count here.
+    let keys = w.keys();
+    let plain_int8_projections = if w.is_plain_int8() {
+        keys.iter()
+            .filter(|key| key.ends_with(".comfy_quant"))
+            .count()
+    } else {
+        0
+    };
+    let expected_on_disk = expected.len() + plain_int8_projections * 2;
+    let on_disk = keys.len();
+    if on_disk != expected_on_disk {
+        let quant_note = if w.is_plain_int8() {
+            format!(
+                " plus two companions for each of {plain_int8_projections} validated plain-int8 projection(s)"
+            )
+        } else {
+            String::new()
+        };
         return Err(candle_gen::candle_core::Error::Msg(format!(
-            "krea native single-file: {on_disk} on-disk DiT tensor(s), expected exactly {} — the file \
-             carries an unmapped/foreign or duplicate tensor (dense bf16 single-file DiT must be a \
-             bijection onto the module tree)",
-            expected.len(),
+            "krea native single-file: {on_disk} on-disk DiT tensor(s), expected exactly {} model \
+             tensor(s){quant_note} — the file carries an unmapped/foreign or duplicate tensor",
+            expected.len()
         )));
     }
-    validate_shapes(w, cfg)
+    Ok(())
 }
 
 /// Shape checks on the dimension-bearing entry points (Linear weight = `[out, in]`). Shared by the
@@ -307,6 +330,7 @@ fn check_shape(w: &Weights, key: &str, expected: &[usize]) -> Result<()> {
 mod tests {
     use super::*;
     use candle_gen::candle_core::{safetensors, DType, Device, Tensor};
+    use serde_json::{json, Map, Value};
     use std::collections::HashMap;
     use std::path::Path;
 
@@ -345,6 +369,71 @@ mod tests {
             map.insert(k.clone(), Tensor::from_vec(vec![0f32], (1,), &dev).unwrap());
         }
         safetensors::save(&map, path).unwrap();
+    }
+
+    /// Write a tiny but structurally real native safetensors file with one I8 projection and its
+    /// sc-14023 companions. The remaining model tensors are f32 scalar stubs: key-surface validation
+    /// reads their actual headers while deliberately avoiding Krea-sized allocations.
+    fn write_plain_int8_native_stub_file(path: &Path, keys: &[String], foreign: bool) {
+        const I8_WEIGHT: &str = "model.diffusion_model.blocks.0.attn.wq.weight";
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        let mut entries: Vec<(String, &'static str, Vec<usize>, Vec<u8>)> = keys
+            .iter()
+            .map(|key| {
+                if key == I8_WEIGHT {
+                    (key.clone(), "I8", vec![2, 3], vec![1, 254, 3, 252, 5, 250])
+                } else {
+                    (key.clone(), "F32", vec![1], 0f32.to_le_bytes().to_vec())
+                }
+            })
+            .collect();
+        let base = I8_WEIGHT.strip_suffix(".weight").unwrap();
+        entries.push((
+            format!("{base}.weight_scale"),
+            "F32",
+            vec![2],
+            [0.5f32.to_le_bytes(), 2.0f32.to_le_bytes()].concat(),
+        ));
+        let descriptor = br#"{"format":"int8_tensorwise","per_row":true}"#.to_vec();
+        entries.push((
+            format!("{base}.comfy_quant"),
+            "U8",
+            vec![descriptor.len()],
+            descriptor,
+        ));
+        if foreign {
+            entries.push((
+                "model.diffusion_model.blocks.0.attn.bogus".to_string(),
+                "F32",
+                vec![1],
+                0f32.to_le_bytes().to_vec(),
+            ));
+        }
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut header = Map::new();
+        let mut payload = Vec::new();
+        for (name, dtype, shape, data) in entries {
+            let start = payload.len();
+            payload.extend_from_slice(&data);
+            header.insert(
+                name,
+                json!({
+                    "dtype": dtype,
+                    "shape": shape,
+                    "data_offsets": [start, payload.len()]
+                }),
+            );
+        }
+        let mut header_bytes = serde_json::to_vec(&Value::Object(header)).unwrap();
+        while !header_bytes.len().is_multiple_of(8) {
+            header_bytes.push(b' ');
+        }
+        let mut file = (header_bytes.len() as u64).to_le_bytes().to_vec();
+        file.extend_from_slice(&header_bytes);
+        file.extend_from_slice(&payload);
+        std::fs::write(path, file).unwrap();
     }
 
     /// **The candle diffusers→native remap covers EXACTLY the real variant5 native key set (sc-14022).**
@@ -429,6 +518,38 @@ mod tests {
             "error must flag the foreign tensor: {err}"
         );
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        Ok(())
+    }
+
+    /// The native validator admits the exact two descriptor-validated companions of a plain-I8 model
+    /// tensor, while retaining the same fail-closed behavior for every other surplus key.
+    #[test]
+    fn validate_native_plain_int8_companions_are_exactly_accounted() -> Result<()> {
+        let dev = Device::Cpu;
+        let keys = variant5_native_keys();
+        let root = std::env::temp_dir().join(format!(
+            "sc14023_plain_int8_native_surface_{}",
+            std::process::id()
+        ));
+        let valid_path = root.join("variant4.safetensors");
+        write_plain_int8_native_stub_file(&valid_path, &keys, false);
+
+        let valid = Weights::from_native_file(&valid_path, &dev, DType::F32)?;
+        assert!(valid.is_plain_int8());
+        validate_native_key_surface(&valid, &Krea2Config::turbo())?;
+
+        let foreign_path = root.join("variant4_foreign.safetensors");
+        write_plain_int8_native_stub_file(&foreign_path, &keys, true);
+        let foreign = Weights::from_native_file(&foreign_path, &dev, DType::F32)?;
+        let err = validate_native_key_surface(&foreign, &Krea2Config::turbo())
+            .expect_err("a non-companion surplus tensor must still fail closed")
+            .to_string();
+        assert!(
+            err.contains("unmapped/foreign"),
+            "error must flag the foreign tensor: {err}"
+        );
+
+        std::fs::remove_dir_all(root).ok();
         Ok(())
     }
 }

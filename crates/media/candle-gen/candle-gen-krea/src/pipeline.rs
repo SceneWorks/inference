@@ -497,15 +497,15 @@ pub(crate) fn load_heavy_convrot(
     })
 }
 
-/// Load Turbo components with the DiT taken from a **community dense-bf16 native single file** (sc-14022,
+/// Load Turbo components with the DiT taken from a **community native single file** (sc-14022/sc-14023,
 /// epic 14015) instead of the snapshot's `transformer/` dir — the candle sibling of mlx-gen-krea's
 /// `load_from_native_dit_file`. The tokenizer / Qwen3-VL TE / Qwen-Image VAE + the DiT architecture
 /// config all come from the resident `root` turnkey snapshot (the community merge ships DiT weights
 /// only, under native-mmdit keys); `native_dit` is the ComfyUI-exported `.safetensors` (e.g.
-/// `kreamania_variant5.safetensors`).
+/// `kreamania_variant5.safetensors` for dense bf16 or `kreamania_variant4.safetensors` for plain int8).
 ///
-/// Unlike [`load_components_convrot`], the DiT reads as **ordinary dense bf16 through the native→diffusers
-/// remap** — no int8, no Hadamard rotation, no sm_89 floor — so it runs on any candle backend. Fail-closed
+/// Unlike [`load_components_convrot`], the DiT never uses Hadamard rotation or the sm_89 ConvRot floor.
+/// Plain int8 is descriptor-validated and dequantized per row; dense bf16 passes through. Fail-closed
 /// coverage/bijection + shape validation ([`crate::convert::validate_native_transformer`]) runs before the
 /// transformer assembles.
 pub fn load_components_native(
@@ -518,8 +518,8 @@ pub fn load_components_native(
     Ok(Components { text, heavy })
 }
 
-/// The heavy half of a dense native single-file load (sc-14022): the dense bf16 DiT (from `native_dit`,
-/// read through the native→diffusers remap) + the Qwen-Image VAE (from `root`). No adapters/PiD (the
+/// The heavy half of a native single-file load: the dense or dequantized DiT (from `native_dit`, read
+/// through the native→diffusers remap) + the Qwen-Image VAE (from `root`). No adapters/PiD (the
 /// out-of-registry single-file entrypoint bakes any LoRAs into the merge and does not thread overlays —
 /// mirroring the MLX S0b scope); those stay a follow-on with the worker wiring (S0c).
 pub(crate) fn load_heavy_native(
@@ -528,8 +528,8 @@ pub(crate) fn load_heavy_native(
     device: &Device,
 ) -> Result<KreaHeavy> {
     let cfg = Krea2Config::from_snapshot(root)?;
-    // `from_native_file`: native_keys ON (remap), convrot OFF (no int8, no rotation — a dense file is `W`,
-    // not the ConvRot `W·R`, so rotating it would corrupt it, sc-14022).
+    // `from_native_file`: native_keys ON, ConvRot OFF. Dense stores W directly; plain int8 reconstructs
+    // W = codes * row_scale. Neither stores ConvRot's W·R, so neither may rotate.
     let dit_w = Weights::from_native_file(native_dit, device, DIT_DTYPE)?;
     crate::convert::validate_native_transformer(&dit_w, &cfg)?;
     let dit = Krea2Transformer::load(&dit_w, &cfg)?;

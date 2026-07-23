@@ -325,8 +325,8 @@ pub fn load_turbo_edit(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 /// the same pipeline as a snapshot load. `descriptor` selects the surface (Turbo `descriptor()` is the
 /// natural default — variant5 is a distilled-Turbo dense merge).
 ///
-/// Scope (S0b): dense bf16 only; no worker/routing wiring (S0c/S0d), no int8 single-file (variant4), no
-/// load-time adapters (the community merge already baked its LoRAs into the dense weights). `Sequential`
+/// Supports dense bf16 and descriptor-validated, non-rotated int8-per-row single files. No load-time
+/// adapters (the community merge already baked its LoRAs into the weights). `Sequential`
 /// offload is not yet threaded (the single-file DiT has no snapshot dir to re-load from) — a follow-on.
 pub fn load_from_native_dit_file(
     dit_file: impl AsRef<Path>,
