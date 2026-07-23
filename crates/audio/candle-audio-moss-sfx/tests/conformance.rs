@@ -30,24 +30,31 @@ fn snapshot() -> WeightsSource {
     )))
 }
 
-/// The backend-neutral gen-core conformance suite (validate honesty, progress + progress
-/// contract, typed mid-run and pre-generate cancellation, seed determinism) against the real
-/// provider, resolved **through the explicit registry** exactly like an image model.
+/// The shared **audio-generator** conformance suite (sc-12853): audio validate-honesty (a valid
+/// audio request accepted; an unadvertised voice / language / sample-rate, visual-only
+/// conditioning, a multi-speaker script, and a video→audio clip all rejected as typed errors), a
+/// well-formed `AudioTrack` output, progress + progress contract, typed mid-run and pre-generate
+/// cancellation, incremental-streaming reassembly, and seed determinism — against the real
+/// provider, resolved **through the explicit registry**. This migrates MOSS-SoundEffect off the
+/// image `Generator` suite (`gen_core_testkit::conformance` / `Profile`), whose oversize-rejection
+/// probe is meaningless for a `Modality::Audio` model, onto the purpose-built `audio_conformance`
+/// (sc-13999 — coverage parity with kokoro). SFX advertises no voice / streaming / multi-speaker /
+/// video-sync surface, so the harness exercises those as the typed `Unsupported` capability gaps.
 #[test]
 #[ignore = "real weights: needs a MOSS-SoundEffect-v2.0 snapshot (MOSS_SFX_SNAPSHOT); run with --ignored"]
 fn moss_sfx_conformance() {
     let spec = LoadSpec::new(snapshot());
-    let profile = gen_core_testkit::Profile {
+    let profile = gen_core_testkit::AudioProfile {
         prompt: "a single water drop echoing in a cave".to_owned(),
-        // Audio skips the size floor; keep the request inside the advertised bounds anyway.
-        width: 256,
-        height: 256,
         // Each request resolves to exactly its requested solver step count.
         steps: 2,
         seed: 42,
         cancel_steps: 6,
+        // Empty audio sub-block: MOSS-SoundEffect resolves its native rate/duration, so the
+        // positive request stays inside the advertised surface.
+        audio: Default::default(),
     };
-    gen_core_testkit::conformance(
+    gen_core_testkit::audio_conformance(
         || {
             candle_audio_moss_sfx::provider_registry()
                 .unwrap()
