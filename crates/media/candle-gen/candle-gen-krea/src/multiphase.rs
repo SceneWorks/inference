@@ -15,15 +15,18 @@
 //! index phase *i+1*'s slice begins — the shared boundary sigma — so resuming phase *i+1* from phase
 //! *i*'s output latent at that same sigma is a seamless continuation, never a reset. Computing an
 //! independent schedule per phase would restart sigma at each boundary and cause a seam/reset artifact;
-//! [`resolve_phase_slices`] is the guard that this never happens (its contiguity + shared-boundary
-//! contract is pinned by the unit tests).
+//! [`resolve_phase_slices`](crate::multiphase::resolve_phase_slices) is the guard that this never
+//! happens (its contiguity + shared-boundary contract is pinned by the unit tests).
 //!
 //! # What this module owns (host math) vs. what the driver owns (GPU)
 //!
 //! This module is pure host arithmetic + validation — no tensors, no device — so it is fully unit
-//! testable without weights: schedule slicing ([`resolve_phase_slices`]), per-phase guidance/CFG-branch
-//! selection ([`phase_uses_cfg`] / [`any_phase_uses_cfg`]), per-phase adapter-set resolution
-//! ([`resolve_phase_adapters`]), and the whole-request resolution + validation ([`resolve_phases`]).
+//! testable without weights: schedule slicing
+//! ([`resolve_phase_slices`](crate::multiphase::resolve_phase_slices)), per-phase guidance/CFG-branch
+//! selection ([`phase_uses_cfg`](crate::multiphase::phase_uses_cfg) /
+//! [`any_phase_uses_cfg`](crate::multiphase::any_phase_uses_cfg)), per-phase adapter-set resolution
+//! ([`resolve_phase_adapters`](crate::multiphase::resolve_phase_adapters)), and the whole-request
+//! resolution + validation ([`resolve_phases`](crate::multiphase::resolve_phases)).
 //! The [`crate::pipeline`] render driver consumes the resolved plan and drives `run_flow_sampler` over
 //! each slice from the running latent through a **job-local** DiT re-adapted per phase, selecting the
 //! two-forward (CFG) or single-forward body per phase — the only GPU-bound part.
