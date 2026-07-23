@@ -844,35 +844,34 @@ fn moss_tts_realtime_voice_clone() {
          effect (corr {corr:.3})"
     );
 
-    // Speaker identity (the sc-14149 DoD): the cloned output must carry the REFERENCE speaker's
-    // timbre — its CAMPPlus x-vector resembles the reference more than the default voice does.
-    // Gated on the cached Chatterbox snapshot (its S3Gen checkpoint holds the speaker encoder).
-    if let Ok(cb) = std::env::var("CHATTERBOX_SNAPSHOT") {
-        let campplus = candle_audio_chatterbox::Campplus::from_snapshot(std::path::Path::new(&cb))
-            .expect("load CAMPPlus speaker encoder from the Chatterbox snapshot");
-        let embed = |s: &[f32]| campplus.embed(s, 24_000).expect("x-vector embed");
-        let cos = |a: &[f32], b: &[f32]| {
-            let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
-            let na = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-            let nb = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-            dot / (na * nb).max(1e-9)
-        };
-        let (e_ref, e_clone, e_def) = (
-            embed(&ref_clip),
-            embed(&clone.samples),
-            embed(&default.samples),
-        );
-        let (sim_clone, sim_def) = (cos(&e_clone, &e_ref), cos(&e_def, &e_ref));
-        println!(
-            "voice-clone speaker sim (CAMPPlus x-vector cosine): clone↔ref {sim_clone:.3}, \
-             default↔ref {sim_def:.3}"
-        );
-        assert!(
-            sim_clone > sim_def + 0.05,
-            "cloned output must resemble the reference speaker MORE than the default voice \
-             (clone↔ref {sim_clone:.3} vs default↔ref {sim_def:.3})"
-        );
-    } else {
-        println!("voice-clone speaker-similarity SKIPPED (set CHATTERBOX_SNAPSHOT to enable)");
-    }
+    // Speaker identity (the sc-14149 DoD, **required** — the assertion that proves the clone carries
+    // the reference speaker, so it is not skippable): the cloned output's CAMPPlus x-vector must
+    // resemble the reference more than the default voice does. `CHATTERBOX_SNAPSHOT` = the Chatterbox
+    // snapshot dir (its S3Gen checkpoint holds the CAMPPlus speaker encoder).
+    let cb = std::env::var("CHATTERBOX_SNAPSHOT")
+        .expect("set CHATTERBOX_SNAPSHOT to a Chatterbox snapshot dir (CAMPPlus speaker encoder)");
+    let campplus = candle_audio_chatterbox::Campplus::from_snapshot(std::path::Path::new(&cb))
+        .expect("load CAMPPlus speaker encoder from the Chatterbox snapshot");
+    let embed = |s: &[f32]| campplus.embed(s, 24_000).expect("x-vector embed");
+    let cos = |a: &[f32], b: &[f32]| {
+        let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+        let na = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let nb = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+        dot / (na * nb).max(1e-9)
+    };
+    let (e_ref, e_clone, e_def) = (
+        embed(&ref_clip),
+        embed(&clone.samples),
+        embed(&default.samples),
+    );
+    let (sim_clone, sim_def) = (cos(&e_clone, &e_ref), cos(&e_def, &e_ref));
+    println!(
+        "voice-clone speaker sim (CAMPPlus x-vector cosine): clone↔ref {sim_clone:.3}, \
+         default↔ref {sim_def:.3}"
+    );
+    assert!(
+        sim_clone > sim_def + 0.05,
+        "cloned output must resemble the reference speaker MORE than the default voice \
+         (clone↔ref {sim_clone:.3} vs default↔ref {sim_def:.3})"
+    );
 }

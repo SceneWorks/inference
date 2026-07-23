@@ -524,4 +524,81 @@ mod tests {
             "seeded AR decode over a streamed prompt is reproducible"
         );
     }
+
+    /// A minimal WordLevel tokenizer where `<|audio_pad|>` is an added special token with id 7 (= the
+    /// tiny config's `reference_audio_pad`) and every other chunk falls back to `<unk>` (0) — enough
+    /// to exercise the voice-clone prompt construction without real weights. Built from JSON to
+    /// sidestep the builder's ahash-typed vocab.
+    fn voice_clone_tokenizer() -> Tokenizer {
+        let json = r#"{
+          "version": "1.0", "truncation": null, "padding": null,
+          "added_tokens": [
+            {"id": 7, "content": "<|audio_pad|>", "single_word": false, "lstrip": false,
+             "rstrip": false, "normalized": false, "special": true}
+          ],
+          "normalizer": null, "pre_tokenizer": null, "post_processor": null, "decoder": null,
+          "model": {"type": "WordLevel",
+            "vocab": {"<unk>": 0, "f1": 1, "f2": 2, "f3": 3, "f4": 4, "f5": 5, "f6": 6},
+            "unk_token": "<unk>"}
+        }"#;
+        json.parse()
+            .expect("build the synthetic voice-clone tokenizer")
+    }
+
+    #[test]
+    fn voice_clone_threads_reference_codes_onto_audio_pad_positions() {
+        let cfg = tiny_cfg(); // reference_audio_pad = 7, rvq = 4
+        let tk = voice_clone_tokenizer();
+        // 3 reference frames, `rvq` (4) codes each — distinct so ordering is checkable.
+        let refc: Vec<Vec<u32>> = vec![vec![1, 2, 3, 4], vec![5, 6, 7, 0], vec![2, 4, 6, 1]];
+        let plan = build_prompt_frames(&tk, &cfg, "hello", Some(&refc)).unwrap();
+
+        // Exactly one audio_pad position per reference frame, carrying its codes IN ORDER.
+        let pads: Vec<&Frame> = plan
+            .prefill
+            .iter()
+            .filter(|f| f.text == cfg.reference_audio_pad)
+            .collect();
+        assert_eq!(
+            pads.len(),
+            refc.len(),
+            "one audio_pad position per reference frame"
+        );
+        for (frame, row) in pads.iter().zip(&refc) {
+            assert_eq!(
+                &frame.audio, row,
+                "reference codes threaded in order onto the audio channels"
+            );
+        }
+        // Non-audio_pad frames keep the pad fill (except the BOS frame's codebook 0).
+        for f in &plan.prefill {
+            if f.text != cfg.reference_audio_pad && f.audio[0] != AUDIO_BOS {
+                assert!(
+                    f.audio.iter().all(|&c| c == AUDIO_CHANNEL_PAD),
+                    "non-reference positions stay padded"
+                );
+            }
+        }
+        // AUDIO_BOS lands on the LAST prefill position, which is a TEXT token — never an audio_pad.
+        let last = plan.prefill.last().unwrap();
+        assert_eq!(
+            last.audio[0], AUDIO_BOS,
+            "BOS on the last prefilled position"
+        );
+        assert_ne!(
+            last.text, cfg.reference_audio_pad,
+            "BOS is on the last text token, not a reference-audio position"
+        );
+
+        // No reference clip ⇒ no audio_pad positions (the default-voice path is unchanged).
+        let plain = build_prompt_frames(&tk, &cfg, "hello", None).unwrap();
+        assert!(plain
+            .prefill
+            .iter()
+            .all(|f| f.text != cfg.reference_audio_pad));
+
+        // A reference frame with the wrong code count is a typed error, not silent corruption.
+        let bad: Vec<Vec<u32>> = vec![vec![1, 2]]; // 2 codes, cfg.rvq == 4
+        assert!(build_prompt_frames(&tk, &cfg, "hello", Some(&bad)).is_err());
+    }
 }
