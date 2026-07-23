@@ -194,7 +194,7 @@ impl KokoroGenerator {
         if let Some(p) = guard.as_ref() {
             return Ok(p.clone());
         }
-        let device = candle_audio::default_device()?;
+        let device = candle_audio::default_device_metal_incompatible()?;
         let built = Arc::new(KokoroPipeline::from_snapshot(&self.root, &device)?);
         *guard = Some(built.clone());
         Ok(built)
