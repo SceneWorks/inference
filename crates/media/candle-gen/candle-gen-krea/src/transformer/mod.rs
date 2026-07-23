@@ -603,6 +603,55 @@ mod tests {
         );
     }
 
+    /// sc-14163 (candle parity, real-transformer coverage): the inference [`Krea2Transformer`]'s
+    /// additive-adapter surface — [`AdditiveDit::visit_additive`], the surface `install_additive` pushes
+    /// residuals onto and `clear_adapters` resets — must include ALL SEVEN front-end/global projections,
+    /// crucially `time_mod_proj`. Its native `tproj.1` turbo-LoRA target carries an essential low-rank
+    /// residual; MLX already routes it via `adaptable_mut`, and this PR added it to candle's surface.
+    /// Built on a REAL dense-tier DiT (not the string normalizer, not a hand-rolled `MockDit`): on a dense
+    /// tier every front-end `QLinear` yields an adapter-capable `AdaptLinear`, so all seven are visited.
+    /// **Discriminating:** a future edit that re-drops `time_mod_proj` from `visit_additive` fails here —
+    /// the exact false-green this test exists to prevent.
+    #[test]
+    fn additive_surface_includes_all_seven_global_projections() {
+        use crate::adapters::AdditiveDit;
+
+        let (mut dit, _cfg, path) = crate::testfix::tiny_transformer();
+
+        let mut visited: Vec<String> = Vec::new();
+        dit.visit_additive(&mut |p, _proj| {
+            visited.push(p.to_string());
+            Ok(())
+        })
+        .unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        // All seven front-end/global projections must be on the surface. `time_mod_proj` is the leaf this
+        // PR added (sc-14163); dropping it again would fail this assertion.
+        for leaf in [
+            "img_in",
+            "time_embed.linear_1",
+            "time_embed.linear_2",
+            "time_mod_proj",
+            "txt_in.linear_1",
+            "txt_in.linear_2",
+            "final_layer.linear",
+        ] {
+            assert!(
+                visited.iter().any(|p| p == leaf),
+                "additive surface missing front-end leaf `{leaf}` — visited: {visited:?}"
+            );
+        }
+        // Sanity that the walk actually yielded the block targets too (so the front-end match is not a
+        // walk that produced nothing): one representative block-0 attention target suffices.
+        assert!(
+            visited
+                .iter()
+                .any(|p| p == "transformer_blocks.0.attn.to_q"),
+            "additive surface missing the block attention targets — visited: {visited:?}"
+        );
+    }
+
     // sc-11201 / F-089: the RoPE cache must hold both true-CFG geometries at once so alternating
     // cond/uncond forwards don't thrash it (rebuild every step). We exercise the bounded cache
     // directly (it is model-independent) rather than standing up a full DiT.
