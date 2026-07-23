@@ -40,22 +40,31 @@ fn sft_snapshot() -> WeightsSource {
     )))
 }
 
-/// The backend-neutral gen-core conformance suite (validate honesty, progress contract, typed
-/// mid-run and pre-generate cancellation, seed determinism) against the real provider, resolved
-/// through the explicit registry.
+/// The shared **audio-generator** conformance suite (sc-12853): audio validate-honesty (a valid
+/// audio request accepted; an unadvertised voice / language / sample-rate, visual-only Reference
+/// conditioning, a multi-speaker script, and a video→audio clip all rejected as typed errors), a
+/// well-formed `AudioTrack` output, progress + progress contract, typed mid-run and pre-generate
+/// cancellation, incremental-streaming reassembly, and seed determinism — against the real
+/// provider, resolved through the explicit registry. This migrates ACE-Step off the image
+/// `Generator` suite (`gen_core_testkit::conformance` / `Profile`), whose oversize-rejection probe
+/// is meaningless for a `Modality::Audio` model, onto the purpose-built `audio_conformance`
+/// (sc-13999 — coverage parity with kokoro). ACE-Step advertises only `AudioEdit` conditioning
+/// (not `Reference` / `VideoSync`) and no voice / streaming / multi-speaker surface, so the harness
+/// exercises those as the typed `Unsupported` capability gaps.
 #[test]
 #[ignore = "real weights: needs an ACE-Step snapshot (ACESTEP_SNAPSHOT); run with --ignored"]
 fn acestep_conformance() {
     let spec = LoadSpec::new(snapshot());
-    let profile = gen_core_testkit::Profile {
+    let profile = gen_core_testkit::AudioProfile {
         prompt: "gentle ambient piano with soft pads".to_owned(),
-        width: 256,
-        height: 256,
         steps: 2,
         seed: 42,
         cancel_steps: 6,
+        // Empty audio sub-block: ACE-Step resolves its native rate/duration, so the positive
+        // request stays inside the advertised surface.
+        audio: Default::default(),
     };
-    gen_core_testkit::conformance(
+    gen_core_testkit::audio_conformance(
         || {
             candle_audio_acestep::provider_registry()
                 .unwrap()
