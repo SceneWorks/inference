@@ -29,50 +29,97 @@ pub const AUDIO_EOS: u32 = 1026;
 /// One decoded audio frame: `rvq` RVQ codebook token ids (length `config.rvq`).
 pub type RvqFrame = Vec<u32>;
 
-/// Build the multi-channel prompt frames for a single-turn TTS request. Column 0 (text) carries the
-/// system prompt + the user turn + the assistant open; every audio channel is `AUDIO_CHANNEL_PAD`,
-/// except codebook 0 of the final position which is `AUDIO_BOS` to kick off audio generation —
-/// mirroring `MossTTSRealtimeInference.prefill`.
+/// The reference text→audio delay (`MossTTSRealtimeProcessor.delay_tokens_len`, `prefill_max_text`):
+/// audio generation begins after the first `DELAY_TOKENS_LEN` text tokens are prefilled, and the
+/// remaining text tokens are streamed one per audio frame during the AR loop. So audio frame *t* is
+/// conditioned on the text up to ~*t+12* — the hierarchical streaming-text design the model was
+/// trained on, not a chat completion over the whole text at once (sc-13570).
+pub const DELAY_TOKENS_LEN: usize = 12;
+
+/// The reference assistant-turn opener placed immediately after the system prompt — with **no user
+/// turn** between them. `MossTTSRealtimeInference`'s `make_ensemble` builds `system prompt +
+/// "<|im_start|>assistant\n"`; the text tokens are then appended (prefill) / streamed (AR loop) into
+/// the assistant response, not wrapped in a `<|im_start|>user\n…<|im_end|>` turn (sc-13570).
+const ASSISTANT_OPEN: &str = "<|im_start|>assistant\n";
+
+/// The prefill prompt frames plus the text tokens to stream during generation — the two halves of the
+/// reference delay-pattern conditioning (sc-13570).
+pub struct PromptPlan {
+    /// The multi-channel prefill frames: `system prompt + "<|im_start|>assistant\n"` followed by the
+    /// first [`DELAY_TOKENS_LEN`] text tokens, with `AUDIO_BOS` on codebook 0 of the **last** text
+    /// position (the reference `seg[cur_len - 1, 1] = bos`).
+    pub prefill: Vec<Frame>,
+    /// The remaining text tokens (positions `DELAY_TOKENS_LEN..`), fed one per audio frame on the text
+    /// channel during the AR loop; once exhausted the loop feeds `text_pad` (the reference
+    /// `_next_text_tokens`). Empty for a prompt of `≤ DELAY_TOKENS_LEN` tokens.
+    pub streamed_text: Vec<u32>,
+}
+
+/// Build the reference multi-channel conditioning for a single-turn TTS request (sc-13570), faithful
+/// to `MossTTSRealtimeInference._generate_from_ids` and its `_build_prefill_batch` /
+/// `_next_text_tokens` streaming helpers:
+/// - Channel 0 (text): the system prompt, then `<|im_start|>assistant\n` (**no** user turn), then the
+///   text tokens — the first [`DELAY_TOKENS_LEN`] in the prefill and the rest streamed one per frame.
+/// - Every audio channel is `AUDIO_CHANNEL_PAD`, except codebook 0 of the **last prefilled text**
+///   position, which is `AUDIO_BOS` to kick off audio generation aligned with the text stream.
+///
+/// The system prompt, assistant opener, and text are tokenized **separately** and concatenated (the
+/// reference tokenizes `make_ensemble` and the text independently); this tokenizer adds no special
+/// tokens, so a separate encode equals a slice of the joint encode.
 pub fn build_prompt_frames(
     tokenizer: &Tokenizer,
     cfg: &MossTtsRealtimeConfig,
     text: &str,
-) -> Result<Vec<Frame>, String> {
-    let prompt = format!(
-        "{system}<|im_start|>user\n{text}<|im_end|>\n<|im_start|>assistant\n",
-        system = TTS_SYSTEM_PROMPT,
-        text = text,
-    );
-    let encoding = tokenizer
-        .encode(prompt, false)
-        .map_err(|e| format!("tokenize prompt: {e}"))?;
-    let ids = encoding.get_ids();
-    if ids.is_empty() {
+) -> Result<PromptPlan, String> {
+    let encode = |s: &str, what: &str| {
+        tokenizer
+            .encode(s, false)
+            .map(|e| e.get_ids().to_vec())
+            .map_err(|e| format!("tokenize {what}: {e}"))
+    };
+    let system = encode(TTS_SYSTEM_PROMPT, "system prompt")?;
+    let assistant = encode(ASSISTANT_OPEN, "assistant open")?;
+    let text_ids = encode(text, "prompt text")?;
+    if text_ids.is_empty() {
         return Err("empty prompt after tokenization".into());
     }
-    let mut frames: Vec<Frame> = ids
+    let pad_frame = |id: u32| Frame {
+        text: id,
+        audio: vec![AUDIO_CHANNEL_PAD; cfg.rvq],
+    };
+    // system + assistant-open, then the first DELAY_TOKENS_LEN text tokens (all in the prefill).
+    let prefill_text = text_ids.len().min(DELAY_TOKENS_LEN);
+    let mut prefill: Vec<Frame> = system
         .iter()
-        .map(|&id| Frame {
-            text: id,
-            audio: vec![AUDIO_CHANNEL_PAD; cfg.rvq],
-        })
+        .chain(&assistant)
+        .chain(&text_ids[..prefill_text])
+        .map(|&id| pad_frame(id))
         .collect();
-    // Kick off audio: codebook 0 of the final prompt position is the audio BOS.
-    if let Some(last) = frames.last_mut() {
-        last.audio[0] = AUDIO_BOS;
-    }
-    Ok(frames)
+    // AUDIO_BOS on codebook 0 of the last prefilled text position (prefill_text ≥ 1 here).
+    prefill
+        .last_mut()
+        .expect("prefill has ≥ 1 text token")
+        .audio[0] = AUDIO_BOS;
+    Ok(PromptPlan {
+        prefill,
+        streamed_text: text_ids[prefill_text..].to_vec(),
+    })
 }
 
-/// Default minimum audio frames before an audio-EOS may terminate the AR loop (sc-13433). At
-/// 12.5 fps this is ~1.28 s — long enough that a spurious frame-0/single-frame EOS cannot collapse a
-/// real sentence into a fragment, but short enough that a genuinely brief utterance still stops well
-/// inside a normal budget. Overridable via `MOSS_TTS_MIN_FRAMES` (0 disables suppression) for the
-/// sc-13433 fidelity sweep; the loop additionally caps the floor at half the frame budget.
-pub const DEFAULT_MIN_EOS_FRAMES: usize = 16;
+/// Default minimum audio frames before an audio-EOS may terminate the AR loop. **Off (0) by default**
+/// — the reference (`MossTTSRealtimeInference`) applies *no* minimum-length floor; it stops at the
+/// first codebook-0 EOS. sc-13433 added a 16-frame floor as a band-aid for spurious early EOS, but
+/// that was a symptom of the wrong prompt conditioning: the port fed the whole text as a chat turn
+/// and then generated audio against `text_pad`, driving certain phrasings to an immediate EOS
+/// (silence/babble, sc-13570). With the reference delay-pattern conditioning restored
+/// ([`build_prompt_frames`]) the model reaches its natural EOS on its own, so the floor is no longer
+/// the fidelity lever and forcing frames past a real EOS only manufactures silence. The
+/// `MOSS_TTS_MIN_FRAMES` env override is retained for experiments/sweeps (the loop caps any floor at
+/// half the frame budget so a genuinely short clip still terminates).
+pub const DEFAULT_MIN_EOS_FRAMES: usize = 0;
 
-/// Resolve the minimum-length EOS-suppression floor: `MOSS_TTS_MIN_FRAMES` if set (0 disables), else
-/// [`DEFAULT_MIN_EOS_FRAMES`].
+/// Resolve the minimum-length EOS-suppression floor: `MOSS_TTS_MIN_FRAMES` if set, else
+/// [`DEFAULT_MIN_EOS_FRAMES`] (0 ⇒ disabled, reference parity).
 fn min_eos_frames() -> usize {
     std::env::var("MOSS_TTS_MIN_FRAMES")
         .ok()
@@ -117,9 +164,16 @@ impl Decoder {
     /// frame. `seed` seeds the token sampler deterministically (same seed ⇒ same frames), so a caller
     /// reproduces the run exactly. `on_frame` is fallible so a consumer (e.g. the codec decode) can
     /// abort the AR loop; it stays the single AR driver.
+    ///
+    /// `streamed_text` is the reference delay-pattern text stream ([`PromptPlan::streamed_text`], the
+    /// tokens beyond the prefill): the *k*-th generation step (the *k*-th fed-back frame, 1-indexed)
+    /// carries `streamed_text[k - 1]` on the text channel, and once the stream is exhausted the loop
+    /// feeds `text_pad` (mirroring `MossTTSRealtimeInference._next_text_tokens`). Pass `&[]` for a
+    /// prompt that fits entirely in the prefill (`≤ DELAY_TOKENS_LEN` tokens).
     pub fn run(
         &self,
         prompt_frames: Vec<Frame>,
+        streamed_text: &[u32],
         max_frames: usize,
         seed: u64,
         cancel: &dyn Fn() -> bool,
@@ -132,9 +186,10 @@ impl Decoder {
         // determinism/streaming gates are unchanged). The override drives the sc-13433 CER-vs-temp
         // sweep without a rebuild; see `SamplingParams::from_env_or_default`.
         let params = SamplingParams::from_env_or_default();
-        // Minimum-length EOS suppression (sc-13433): audio-EOS on codebook 0 is masked for the first
-        // `min_frames` steps so a spurious early stop cannot truncate the utterance. `min_frames` is
-        // capped at half the budget so a genuinely short clip still terminates well inside it.
+        // Optional minimum-length EOS suppression (off by default — reference parity, sc-13570): when
+        // `MOSS_TTS_MIN_FRAMES` is set, audio-EOS on codebook 0 is masked for the first `min_frames`
+        // steps (capped at half the budget). The reference applies no floor; correct delay-pattern
+        // conditioning ([`build_prompt_frames`]) — not this floor — is what keeps prompts faithful.
         let min_frames = min_eos_frames().min(max_frames / 2);
         let mut rng = Rng::seed(seed);
         // KV-cache AR (sc-13417): prefill the prompt once, then feed each emitted frame back as a
@@ -154,10 +209,15 @@ impl Decoder {
                 prefilled = true;
                 self.backbone.prefill(&prompt_frames, &mut cache)?
             } else {
-                // The previous iteration's emitted frame, fed back with the text channel = text pad.
+                // The previous iteration's emitted frame, fed back with the text channel carrying the
+                // next streamed text token (delay-pattern), or text_pad once the text is exhausted.
                 let prev = out.last().expect("a prior frame was emitted");
+                let text = streamed_text
+                    .get(step - 1)
+                    .copied()
+                    .unwrap_or(self.cfg.text_pad);
                 let fed = Frame {
-                    text: self.cfg.text_pad,
+                    text,
                     audio: prev.clone(),
                 };
                 self.backbone.step(&fed, &mut cache)?
@@ -240,6 +300,55 @@ mod tests {
         }
     }
 
+    /// Like [`tiny_decoder`] but with a **dominant, per-token-distinct text embedding**
+    /// (`embed_tokens.0`): each text id maps to a large, well-separated direction (a ±3 bit-code), so
+    /// the text channel drives the backbone sum and the sampled frames are demonstrably sensitive to
+    /// *which* text token is fed. The default `tiny_decoder`'s tiny uniform weights are numerically
+    /// too flat for the discrete 8-token sampler to resolve the text channel, which would mask the
+    /// streaming feed under test.
+    fn text_sensitive_decoder() -> Decoder {
+        let cfg = tiny_cfg();
+        let hidden = cfg.language_config.hidden_size;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &Device::Cpu);
+        let backbone = crate::backbone::Backbone::new(
+            &cfg.language_config,
+            cfg.rvq,
+            cfg.audio_vocab_size,
+            vb.clone(),
+        )
+        .unwrap();
+        let local = crate::local::LocalTransformer::new(&cfg.local_config, vb.clone()).unwrap();
+        for (i, (name, var)) in varmap.data().lock().unwrap().iter().enumerate() {
+            let t = var.as_tensor();
+            let n = t.shape().elem_count();
+            let vals: Vec<f32> = if name == "embed_tokens.0.weight" {
+                // Row `id`, col `j`: a ±3 bit-code of `id` — distinct direction per text token.
+                (0..n)
+                    .map(|k| {
+                        let (id, j) = (k / hidden, k % hidden);
+                        if (id >> (j % 5)) & 1 == 1 {
+                            3.0
+                        } else {
+                            -3.0
+                        }
+                    })
+                    .collect()
+            } else {
+                (0..n)
+                    .map(|j| (((i * 31 + j * 17) % 13) as f64 * 0.03 - 0.18) as f32)
+                    .collect()
+            };
+            var.set(&Tensor::from_vec(vals, t.shape(), &Device::Cpu).unwrap())
+                .unwrap();
+        }
+        Decoder {
+            backbone,
+            local,
+            cfg,
+        }
+    }
+
     fn manual_prompt(rvq: usize) -> Vec<Frame> {
         // Small in-range ids (avoid the real BOS/EOS constants, which exceed the tiny audio vocab).
         (0..3)
@@ -258,7 +367,7 @@ mod tests {
         let no_cancel = || false;
         let mut steps_a = 0usize;
         let a = dec
-            .run(manual_prompt(rvq), 5, 42, &no_cancel, &mut |_, _| {
+            .run(manual_prompt(rvq), &[], 5, 42, &no_cancel, &mut |_, _| {
                 steps_a += 1;
                 Ok(())
             })
@@ -277,7 +386,9 @@ mod tests {
         }
         // Determinism: greedy decode ⇒ byte-identical frames on a re-run.
         let b = dec
-            .run(manual_prompt(rvq), 5, 42, &no_cancel, &mut |_, _| Ok(()))
+            .run(manual_prompt(rvq), &[], 5, 42, &no_cancel, &mut |_, _| {
+                Ok(())
+            })
             .unwrap()
             .unwrap();
         assert_eq!(a.frames, b.frames, "greedy AR decode is reproducible");
@@ -291,7 +402,7 @@ mod tests {
         let seen = std::cell::Cell::new(0usize);
         let cancel = || seen.get() >= 2;
         let out = dec
-            .run(manual_prompt(rvq), 100, 42, &cancel, &mut |_, _| {
+            .run(manual_prompt(rvq), &[], 100, 42, &cancel, &mut |_, _| {
                 seen.set(seen.get() + 1);
                 Ok(())
             })
@@ -303,6 +414,59 @@ mod tests {
         assert!(
             seen.get() <= 3,
             "cancel is honored within a frame, not after the 100-frame budget"
+        );
+    }
+
+    /// The streamed text tokens (the delay-pattern beyond the prefill, sc-13570) must actually be
+    /// **consumed** on the text channel during the AR loop — not silently ignored. This is the cheap
+    /// mutation-discriminator for the streaming path: reverting `run` to feed `text_pad` every step
+    /// (the pre-sc-13570 bug) makes the two runs identical and turns this test RED. Real weights are
+    /// not needed — different text conditioning changes the summed multi-channel embedding, hence the
+    /// backbone hidden state, hence the sampled frames.
+    #[test]
+    fn streamed_text_is_consumed_by_the_ar_loop() {
+        let dec = text_sensitive_decoder();
+        let rvq = dec.cfg.rvq;
+        let no_cancel = || false;
+        // Non-pad text ids (text vocab is 32; text_pad is 6, avoided) fed one per generation step.
+        let streamed: [u32; 4] = [4, 5, 7, 8];
+        let with_stream = dec
+            .run(
+                manual_prompt(rvq),
+                &streamed,
+                5,
+                42,
+                &no_cancel,
+                &mut |_, _| Ok(()),
+            )
+            .unwrap()
+            .unwrap();
+        // Empty stream ⇒ every step feeds `text_pad` (the old, buggy behavior).
+        let all_pad = dec
+            .run(manual_prompt(rvq), &[], 5, 42, &no_cancel, &mut |_, _| {
+                Ok(())
+            })
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            with_stream.frames, all_pad.frames,
+            "streamed text must change the frames — a text_pad-only loop ignores the prompt tail"
+        );
+        // Same stream + seed ⇒ byte-identical frames (the streaming path is reproducible too).
+        let again = dec
+            .run(
+                manual_prompt(rvq),
+                &streamed,
+                5,
+                42,
+                &no_cancel,
+                &mut |_, _| Ok(()),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            with_stream.frames, again.frames,
+            "seeded AR decode over a streamed prompt is reproducible"
         );
     }
 }

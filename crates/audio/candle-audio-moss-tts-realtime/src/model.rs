@@ -267,7 +267,7 @@ impl MossTtsRealtimeGenerator {
             return Err(gen_core::Error::Canceled);
         }
         let pipeline = self.pipeline()?;
-        let frames = build_prompt_frames(&pipeline.tokenizer, &pipeline.decoder.cfg, &req.prompt)
+        let plan = build_prompt_frames(&pipeline.tokenizer, &pipeline.decoder.cfg, &req.prompt)
             .map_err(gen_core::Error::Msg)?;
         let budget = frame_budget(req);
         let total = budget as u32;
@@ -285,7 +285,14 @@ impl MossTtsRealtimeGenerator {
         };
         let result = pipeline
             .decoder
-            .run(frames, budget, seed, &probe, &mut on_frame)
+            .run(
+                plan.prefill,
+                &plan.streamed_text,
+                budget,
+                seed,
+                &probe,
+                &mut on_frame,
+            )
             .map_err(|e| gen_core::Error::Msg(format!("{MODEL_ID}: AR decode: {e}")))?;
         match result {
             Some(r) => Ok(r),
@@ -338,7 +345,7 @@ impl MossTtsRealtimeGenerator {
         let pipeline = self.pipeline()?;
         let codec = self.codec(pipeline.decoder.cfg.rvq)?;
 
-        let frames = build_prompt_frames(&pipeline.tokenizer, &pipeline.decoder.cfg, &req.prompt)
+        let plan = build_prompt_frames(&pipeline.tokenizer, &pipeline.decoder.cfg, &req.prompt)
             .map_err(gen_core::Error::Msg)?;
         let budget = frame_budget(req);
         let total = budget as u32;
@@ -370,7 +377,14 @@ impl MossTtsRealtimeGenerator {
                 };
             pipeline
                 .decoder
-                .run(frames, budget, seed, &probe, &mut on_frame)
+                .run(
+                    plan.prefill,
+                    &plan.streamed_text,
+                    budget,
+                    seed,
+                    &probe,
+                    &mut on_frame,
+                )
                 .map_err(|e| gen_core::Error::Msg(format!("{MODEL_ID}: AR decode: {e}")))?
         };
         if canceled || run.is_none() {

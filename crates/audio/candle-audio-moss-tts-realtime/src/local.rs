@@ -122,10 +122,12 @@ impl LocalTransformer {
             let hidden = self.hidden_last(&depth_embeds)?; // [1, H]
             let logits = self.heads[i].forward(&hidden)?; // [1, audio_vocab]
             let mut row: Vec<f32> = logits.reshape((logits.elem_count(),))?.to_vec1::<f32>()?;
-            // Minimum-length control (sc-13433): the audio-EOS marker lives on codebook 0. Before the
-            // frame floor is reached, mask it to -inf so a spurious early stop cannot truncate the
-            // utterance to a fragment (the dominant text-fidelity failure — a full-sentence prompt
-            // collapsing to a sub-second clip). After the floor the model stops normally.
+            // Optional minimum-length control (off by default — reference parity, sc-13570): the
+            // audio-EOS marker lives on codebook 0. When the caller requests suppression (only when
+            // `MOSS_TTS_MIN_FRAMES` is set) it is masked to -inf before the floor. sc-13433 added this
+            // to paper over spurious early EOS, but that was a symptom of the wrong conditioning; with
+            // the reference delay-pattern restored ([`crate::decode::build_prompt_frames`]) `suppress_eos`
+            // is normally false and the model reaches its natural EOS on its own.
             if i == 0 && suppress_eos {
                 if let Some(slot) = row.get_mut(crate::decode::AUDIO_EOS as usize) {
                     *slot = f32::NEG_INFINITY;

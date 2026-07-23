@@ -397,17 +397,27 @@ fn codec_only_decodes_synthetic_frames() {
 // sc-13433 — ASR round-trip text-fidelity gate (prompt → MOSS-TTS-Realtime → whisper_base → CER).
 // ---------------------------------------------------------------------------------------------
 
-/// Curated fixed prompt set the shipped sampling default renders faithfully (measured, sc-13433).
-/// `THE_WEATHER` is the load-bearing regression guard: without the minimum-length EOS-suppression
-/// floor ([`moss::decode`]'s `DEFAULT_MIN_EOS_FRAMES`) it collapses to a spurious frame-0 EOS
-/// (~0.08 s, CER ≈ 0.95); with the floor it renders the full sentence (CER ≈ 0.00). The others are
-/// floor-independent good cases (their natural length already exceeds the floor). A future
-/// regression to silence / an unrelated utterance drives every prompt's CER past the bound.
+/// Curated fixed prompt set the shipped sampling default renders faithfully (measured on real
+/// weights). The last three are the **sc-13570 regression guard**: under the old chat-completion
+/// prompt (a fabricated `<|im_start|>user…` turn + `text_pad`-only generation) they collapsed to
+/// silence / babble / an unrelated word ("bye"); with the reference delay-pattern conditioning
+/// restored ([`moss::decode::build_prompt_frames`]) they render the full sentence at CER ≈ 0.00 with
+/// **no** minimum-length floor. `The weather…` was the sc-13433 floor's showcase; it now renders
+/// faithfully from conditioning alone (CER ≈ 0.00, floor off). A future regression to silence / an
+/// unrelated utterance — from either a conditioning or a codec break — drives every prompt's CER
+/// past the bound.
 const FIDELITY_PROMPTS: &[&str] = &[
     "The quick brown fox jumps over the lazy dog.",
     "The train arrives at nine in the morning.",
     "The weather is very nice this afternoon.",
     "Please remember to buy milk and bread today.",
+    // sc-13570 — previously silent/babble under the old conditioning, now CER ≈ 0.00.
+    "Hello, this is a streaming text to speech test.",
+    "I would like a cup of coffee please.",
+    "Thank you very much for your help.",
+    // sc-13570 — a > DELAY_TOKENS_LEN (18-token) prompt: exercises the delay-pattern *streaming*
+    // path (text tokens fed one-per-frame during the AR loop), which the short prompts above do not.
+    "Welcome to the world of streaming text to speech, where every sentence flows naturally and clearly.",
 ];
 
 /// An utterance no FIDELITY_PROMPT transcribes to — used to prove the CER bound discriminates
@@ -469,11 +479,13 @@ fn fidelity_request(prompt: &str) -> GenerationRequest {
     }
 }
 
-/// The sc-13433 text-fidelity regression gate. Synthesizes the curated prompt set at the **shipped
-/// sampling default** (reference temperature 0.8 + the minimum-length EOS-suppression floor — no env
-/// overrides), transcribes each clip with `whisper_base`, and asserts prompt-following within a CER
-/// bound. Guards against the pre-sc-13433 failure mode (a full sentence collapsing to a sub-second
-/// spurious-EOS fragment / silence) and against any future regression to unrelated speech.
+/// The text-fidelity regression gate (sc-13433, extended by sc-13570). Synthesizes the curated
+/// prompt set at the **shipped sampling default** (reference temperature 0.8, reference delay-pattern
+/// conditioning, no min-length floor — no env overrides), transcribes each clip with `whisper_base`,
+/// and asserts prompt-following within a CER bound. Guards against the pre-sc-13433 failure mode (a
+/// full sentence collapsing to a sub-second spurious-EOS fragment / silence), the sc-13570 failure
+/// mode (prompt-specific silence/babble from the old chat-completion conditioning — the last three
+/// prompts), and any future regression to unrelated speech.
 #[test]
 #[ignore = "real weights: needs the MOSS-TTS-Realtime AR + codec + whisper_base snapshots; run with --ignored --nocapture"]
 fn moss_tts_realtime_asr_roundtrip_fidelity() {
