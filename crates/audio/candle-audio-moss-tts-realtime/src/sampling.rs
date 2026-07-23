@@ -30,11 +30,13 @@
 //!    the crate's `moss_tts_realtime_asr_roundtrip_fidelity` conformance gate) showed prompt-following
 //!    is limited by **spurious early audio-EOS** (a full sentence collapsing to a sub-second
 //!    fragment), *not* by RNG divergence. Greedy (temperature 0) collapses to silence; temperatures
-//!    below 0.8 stop *earlier*, not better; temperature 0.8 (the reference default, kept) is the best
-//!    general choice. The genuine fix was a minimum-length EOS-suppression floor
-//!    ([`crate::decode::DEFAULT_MIN_EOS_FRAMES`]), which measurably lifts CER (e.g. "The weather is
-//!    very nice this afternoon." 0.95 → 0.00) with no regression to already-faithful prompts or to
-//!    the streaming/determinism gates.
+//!    below 0.8 stop *earlier*, not better; temperature 0.8 (the reference default) is kept. sc-13433
+//!    first mitigated the early-EOS symptom with a minimum-length floor, but sc-13570 traced the root
+//!    cause to the port's prompt conditioning (a fabricated chat turn + `text_pad`-only generation)
+//!    and restored the reference delay-pattern ([`crate::decode::build_prompt_frames`]); with correct
+//!    conditioning the model reaches its natural EOS on its own, so the floor is off by default
+//!    ([`crate::decode::DEFAULT_MIN_EOS_FRAMES`] = 0) and prompts that used to collapse (e.g. "The
+//!    weather is very nice this afternoon." 0.95 → 0.00) now render from conditioning alone.
 //!
 //! The only RNG property that matters here is **reproducibility** (same seed ⇒ byte-identical
 //! frames), which the seeded splitmix64 below already guarantees and the determinism gate enforces.

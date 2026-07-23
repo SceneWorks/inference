@@ -2,7 +2,7 @@
 name = "candle-audio-moss-tts-realtime"
 version = "0.0.0"
 edition = "2021"
-description = "MOSS-TTS-Realtime-1.7B streaming-TTS provider for the SceneWorks Candle audio lane (sc-13334/sc-13392) — an autoregressive Qwen3-1.7B backbone plus a CSM-style local/depth transformer decoding 16 RVQ speech-codebook tokens per frame, and a native port of the MOSS-Audio-Tokenizer RLFQ codec (RVQ tokens -> 24 kHz waveform), ported onto the pinned candle revision. Registered into candle-audio-catalog as a real, deterministic, genuinely-interleaved streaming TTS provider; text-fidelity is guarded by an ASR round-trip CER gate with a minimum-length EOS-suppression floor (sc-13433)."
+description = "MOSS-TTS-Realtime-1.7B streaming-TTS provider for the SceneWorks Candle audio lane (sc-13334/sc-13392) — an autoregressive Qwen3-1.7B backbone plus a CSM-style local/depth transformer decoding 16 RVQ speech-codebook tokens per frame, and a native port of the MOSS-Audio-Tokenizer RLFQ codec (RVQ tokens -> 24 kHz waveform), ported onto the pinned candle revision. Registered into candle-audio-catalog as a real, deterministic, genuinely-interleaved streaming TTS provider; text-fidelity comes from the reference delay-pattern text conditioning (sc-13570) and is guarded by an ASR round-trip CER gate (sc-13433)."
 license = "Apache-2.0"
 repository = "https://github.com/SceneWorks/inference"
 keywords = ["candle", "audio", "tts", "streaming", "rvq"]
