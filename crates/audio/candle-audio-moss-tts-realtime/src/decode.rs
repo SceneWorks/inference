@@ -360,8 +360,9 @@ impl Decoder {
 
     /// Warm `cache` with a **provided** (already-known) assistant turn's audio (sc-14151): prefill
     /// `prefill_block`, then feed each of `known_frames` back through the backbone via the same
-    /// single-token [`step`](Backbone::step) path (same delay-pattern text) [`generate_turn`] uses —
-    /// but **without** sampling. This lets the stateless path (A) resume a conversation whose earlier
+    /// single-token [`step`](Backbone::step) path (same delay-pattern text)
+    /// [`generate_turn`](Self::generate_turn) uses — but **without** sampling. This lets the stateless
+    /// path (A) resume a conversation whose earlier
     /// assistant turns were *provided* (as PCM in the request history) rather than generated in this
     /// call. Returns `Ok(None)` on cancel. Generated turns need no replay — their RVQ frames stay in
     /// the warm cache directly.
