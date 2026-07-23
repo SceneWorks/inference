@@ -264,6 +264,38 @@ impl Krea2Transformer {
         Ok(())
     }
 
+    /// Drop **every** forward-time additive LoRA/LoKr residual from every adaptable projection, reverting
+    /// the DiT to its bare base — the per-phase adapter toggle-off a multi-phase render (epic 13879,
+    /// sc-13887) runs on its **job-local** DiT between phases. It clears exactly the surface
+    /// [`crate::adapters::install_additive`] pushes onto (the [`AdditiveDit`](crate::adapters::AdditiveDit)
+    /// surface): the per-block attention + SwiGLU projections plus the `text_fusion` blocks (via the inner
+    /// [`Self::visit_adaptable_mut`]) AND the front-end + final leaves (`img_in` / `time_embed.linear_1/2`
+    /// / `txt_in.linear_1/2` / `final_layer.linear`, dense-tier only via `as_adapt_mut`). After clearing,
+    /// the forward is byte-identical to the un-adapted base; a subsequent `install_additive` of the next
+    /// phase's subset makes that phase's adapter set authoritative regardless of what the prior phase (or
+    /// the load-time bake) installed. The base weight tensors are never touched, so this is a cheap, exact
+    /// toggle that a concurrency-safe multi-phase driver runs only on a job-local DiT — never the shared
+    /// resident. The candle twin of mlx-gen-krea's `Krea2Transformer::clear_adapters`.
+    pub fn clear_adapters(&mut self) -> candle_gen::Result<()> {
+        self.visit_adaptable_mut(&mut |_, a| {
+            a.clear_adapters();
+            Ok(())
+        })?;
+        for proj in [
+            &mut self.img_in,
+            &mut self.time_embed_l1,
+            &mut self.time_embed_l2,
+            &mut self.txt_in_l1,
+            &mut self.txt_in_l2,
+            &mut self.final_linear,
+        ] {
+            if let Some(a) = proj.as_adapt_mut() {
+                a.clear_adapters();
+            }
+        }
+        Ok(())
+    }
+
     /// Build (or reuse) the joint RoPE `(cos, sin)` table for this render's fixed geometry (sc-8992).
     /// Recomputed only when `(cap_len, ht, wt, n_refs)` changes; otherwise the Arc-backed handles are
     /// cloned. `n_refs == 0` builds the plain t2i `[text, image]` table (byte-identical to building it

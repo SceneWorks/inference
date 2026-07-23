@@ -480,6 +480,29 @@ fn resolve_diff_stem(stem: &str) -> String {
     normalize_native_krea_path(strip_peft_prefix(stem))
 }
 
+/// Whether any of `specs` is a ComfyUI/lightx2v **diff-patch** (carries a `.diff`/`.diff_b` key) — the
+/// input to the multi-phase diff-patch guard (epic 13879, sc-13887). A diff-patch delta folds
+/// IRREVERSIBLY into the dense base at load ([`fold_diff_patch`], `W += δ`); every job-local DiT the
+/// multi-phase render loads from that snapshot inherits the mutated base, and
+/// [`crate::transformer::Krea2Transformer::clear_adapters`] (which only drops low-rank forward-time
+/// residuals) cannot undo it — so a "base-only" phase would silently carry the diff-patch. Multi-phase
+/// is therefore rejected loudly on such a model. Read from each adapter file's tensor keys.
+/// **Best-effort:** a file we cannot read yields `false` here, but the same file is read for real by the
+/// load-time [`fold_diff_patch`] / [`install_additive`], which surfaces the genuine error loudly — so an
+/// unreadable file never silently slips a diff-patch through into a wrong multi-phase render (mirrors
+/// mlx-gen-krea's `adapters_have_diff_patch`).
+pub fn any_diff_patch(specs: &[AdapterSpec]) -> bool {
+    specs.iter().any(|spec| {
+        read_adapter(&spec.path)
+            .map(|af| {
+                af.tensors
+                    .keys()
+                    .any(|k| k.ends_with(".diff") || k.ends_with(".diff_b"))
+            })
+            .unwrap_or(false)
+    })
+}
+
 /// Fold any ComfyUI/lightx2v **diff-patch** (`.diff` weight / `.diff_b` bias) full-rank deltas the
 /// `specs` carry into the DiT's dense baseline weights, installed as `w`'s overlay so the subsequent
 /// `Krea2Transformer::load` reads the patched weight. Runs on **both** tiers, complementing
