@@ -731,3 +731,148 @@ fn moss_audio_codec_encode_roundtrip_and_reference() {
         "encode→decode must reconstruct the codec waveform (corr {corr:.3})"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// sc-14149 — voice cloning: generate the same text with the default voice and with a reference
+// clip; both must be intelligible (ASR CER) and the cloned output must DIFFER from the default
+// (the reference timbre conditioning takes effect). `MOSS_VOICECLONE_REF` = a 24 kHz f32-LE mono
+// reference clip. The speaker-identity (x-vector similarity) gate lands with the CAMPPlus harness.
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+#[ignore = "real weights: MOSS-TTS-Realtime AR + codec + whisper_base; run with --ignored --nocapture"]
+fn moss_tts_realtime_voice_clone() {
+    use candle_audio_whisper::gen_core::{
+        AudioTrack as WAudioTrack, LoadSpec as WLoadSpec, TimestampGranularity, TranscribeOptions,
+        TranscribeRequest, TranscribeTask, WeightsSource as WWeightsSource,
+    };
+    use moss::gen_core::{AudioTrack, Conditioning};
+
+    let generator = load();
+    let wspec = WLoadSpec::new(WWeightsSource::Dir(PathBuf::from(
+        std::env::var("WHISPER_SNAPSHOT")
+            .expect("set WHISPER_SNAPSHOT to an openai/whisper-base dir"),
+    )));
+    let transcriber = candle_audio_whisper::provider_registry()
+        .expect("whisper registry")
+        .load_transcriber(candle_audio_whisper::MODEL_ID, &wspec)
+        .expect("whisper_base loads");
+    let ref_clip = read_f32le(
+        &std::env::var("MOSS_VOICECLONE_REF")
+            .expect("set MOSS_VOICECLONE_REF to a 24 kHz f32-LE mono reference clip"),
+    );
+
+    let text = "The quick brown fox jumps over the lazy dog.";
+    let req = |conditioning: Vec<Conditioning>| GenerationRequest {
+        prompt: text.to_string(),
+        audio: Some(AudioParams {
+            target_duration: Some(6.0),
+            language: Some("en".to_string()),
+            sample_rate: Some(24_000),
+            ..Default::default()
+        }),
+        seed: Some(20_260_719),
+        conditioning,
+        ..Default::default()
+    };
+    let synth = |conditioning| match generator
+        .generate(&req(conditioning), &mut |_| {})
+        .expect("generate")
+    {
+        GenerationOutput::Audio(t) => t,
+        other => panic!("expected Audio, got {other:?}"),
+    };
+    let transcribe = |track: &AudioTrack| {
+        let treq = TranscribeRequest {
+            audio: WAudioTrack {
+                samples: track.samples.clone(),
+                sample_rate: track.sample_rate,
+                channels: track.channels,
+                ..Default::default()
+            },
+            options: TranscribeOptions {
+                language: Some("en".into()),
+                task: TranscribeTask::Transcribe,
+                timestamps: TimestampGranularity::None,
+            },
+            ..Default::default()
+        };
+        normalize(
+            &transcriber
+                .transcribe(&treq, &mut |_| {})
+                .expect("transcribe")
+                .text,
+        )
+    };
+
+    let default = synth(vec![]);
+    let clone = synth(vec![Conditioning::ReferenceAudio {
+        audio: AudioTrack {
+            samples: ref_clip.clone(),
+            sample_rate: 24_000,
+            channels: 1,
+            ..Default::default()
+        },
+        strength: None,
+    }]);
+
+    let (hyp_d, hyp_c) = (transcribe(&default), transcribe(&clone));
+    let (cer_d, cer_c) = (
+        character_error_rate(&normalize(text), &hyp_d),
+        character_error_rate(&normalize(text), &hyp_c),
+    );
+    let corr = pearson(&clone.samples, &default.samples);
+    println!(
+        "voice-clone: default CER {cer_d:.3} ({:.2}s) {hyp_d:?}; clone CER {cer_c:.3} ({:.2}s) \
+         {hyp_c:?}; clone-vs-default corr {corr:.3}",
+        default.samples.len() as f32 / 24_000.0,
+        clone.samples.len() as f32 / 24_000.0,
+    );
+    // Both intelligible — cloning must not break speech.
+    assert!(
+        cer_d <= MAX_PROMPT_CER,
+        "default voice not intelligible (CER {cer_d:.3})"
+    );
+    assert!(
+        cer_c <= MAX_PROMPT_CER,
+        "cloned voice not intelligible (CER {cer_c:.3})"
+    );
+    // The reference timbre conditioning must change the output (a no-op would give corr ≈ 1.0).
+    assert!(
+        corr < 0.9,
+        "cloned output must differ from the default voice — the reference conditioning took no \
+         effect (corr {corr:.3})"
+    );
+
+    // Speaker identity (the sc-14149 DoD): the cloned output must carry the REFERENCE speaker's
+    // timbre — its CAMPPlus x-vector resembles the reference more than the default voice does.
+    // Gated on the cached Chatterbox snapshot (its S3Gen checkpoint holds the speaker encoder).
+    if let Ok(cb) = std::env::var("CHATTERBOX_SNAPSHOT") {
+        let campplus = candle_audio_chatterbox::Campplus::from_snapshot(std::path::Path::new(&cb))
+            .expect("load CAMPPlus speaker encoder from the Chatterbox snapshot");
+        let embed = |s: &[f32]| campplus.embed(s, 24_000).expect("x-vector embed");
+        let cos = |a: &[f32], b: &[f32]| {
+            let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+            let na = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let nb = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+            dot / (na * nb).max(1e-9)
+        };
+        let (e_ref, e_clone, e_def) = (
+            embed(&ref_clip),
+            embed(&clone.samples),
+            embed(&default.samples),
+        );
+        let (sim_clone, sim_def) = (cos(&e_clone, &e_ref), cos(&e_def, &e_ref));
+        println!(
+            "voice-clone speaker sim (CAMPPlus x-vector cosine): clone↔ref {sim_clone:.3}, \
+             default↔ref {sim_def:.3}"
+        );
+        assert!(
+            sim_clone > sim_def + 0.05,
+            "cloned output must resemble the reference speaker MORE than the default voice \
+             (clone↔ref {sim_clone:.3} vs default↔ref {sim_def:.3})"
+        );
+    } else {
+        println!("voice-clone speaker-similarity SKIPPED (set CHATTERBOX_SNAPSHOT to enable)");
+    }
+}
