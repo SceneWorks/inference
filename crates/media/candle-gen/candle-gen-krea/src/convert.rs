@@ -552,4 +552,14 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
         Ok(())
     }
+
+    #[test]
+    #[ignore = "requires a local KREAMANIA_VARIANT4 checkpoint"]
+    fn validate_real_variant4_checkpoint() -> Result<()> {
+        let path = std::env::var("KREAMANIA_VARIANT4")
+            .expect("set KREAMANIA_VARIANT4 to kreamania_variant4.safetensors");
+        let weights = Weights::from_native_file(Path::new(&path), &Device::Cpu, DType::F32)?;
+        assert!(weights.is_plain_int8());
+        validate_native_transformer(&weights, &Krea2Config::turbo())
+    }
 }
