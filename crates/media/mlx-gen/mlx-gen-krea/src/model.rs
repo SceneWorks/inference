@@ -323,31 +323,63 @@ pub fn load_turbo_edit(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 /// key or missing module weight); the text-encoder / VAE / tokenizer load from `base_snapshot_dir` exactly
 /// as [`load`] does from a full snapshot. The result is a warm-`Resident` generator that renders through
 /// the same pipeline as a snapshot load. `descriptor` selects the surface (Turbo `descriptor()` is the
-/// natural default — variant5 is a distilled-Turbo dense merge).
+/// natural default — variant5 is a distilled-Turbo dense merge; `edit_descriptor()` for the edit lane).
 ///
-/// Supports dense bf16 and descriptor-validated, non-rotated int8-per-row single files. No load-time
-/// adapters (the community merge already baked its LoRAs into the weights). `Sequential`
+/// `adapters` are Raw-trained LoRA/LoKr adapters (`LoadSpec::adapters`) installed onto the single-file DiT
+/// via [`KreaHeavy::apply_adapters`] BEFORE the residency is finalized — the same load→apply order the
+/// snapshot path uses (`load_krea_heavy`) — so the community edit lane's `krea2_identity_edit` adapter
+/// (sc-14119) rides this entrypoint exactly as it does a snapshot edit load. Application is fail-closed (a
+/// typed error on any adapter target that matches no module, never a silent drop). The t2i/img2img callers
+/// pass `&[]`, whose dense-bf16 native-key load is byte-identical to before this parameter existed.
+///
+/// Supports dense bf16 and descriptor-validated, non-rotated int8-per-row single files. `Sequential`
 /// offload is not yet threaded (the single-file DiT has no snapshot dir to re-load from) — a follow-on.
 pub fn load_from_native_dit_file(
     dit_file: impl AsRef<Path>,
     base_snapshot_dir: impl AsRef<Path>,
+    adapters: &[AdapterSpec],
     descriptor: ModelDescriptor,
 ) -> Result<Box<dyn Generator>> {
+    Ok(Box::new(build_native_krea(
+        dit_file,
+        base_snapshot_dir,
+        adapters,
+        descriptor,
+    )?))
+}
+
+/// The concrete-[`Krea`] assembly behind [`load_from_native_dit_file`] (which boxes the result). Returning
+/// the concrete type lets the real-weight harness assert the installed `adapters` / `has_diff_patch`
+/// fields — a `Box<dyn Generator>` could not be inspected. See [`load_from_native_dit_file`] for the full
+/// contract; this carries the adapter-fold ordering.
+pub(crate) fn build_native_krea(
+    dit_file: impl AsRef<Path>,
+    base_snapshot_dir: impl AsRef<Path>,
+    adapters: &[AdapterSpec],
+    descriptor: ModelDescriptor,
+) -> Result<Krea> {
     let base = base_snapshot_dir.as_ref();
     // Architecture config from the resident turnkey (the single file ships no config.json); the
     // community merge shares the published Krea 2 architecture exactly.
     let cfg = crate::config::Krea2Config::from_snapshot(base)?;
     let dit = crate::loader::load_transformer_from_native_file(dit_file.as_ref(), &cfg)?;
     let vae = crate::vae::load_vae(base)?;
-    let heavy = KreaHeavy::from_parts(dit, vae);
+    let mut heavy = KreaHeavy::from_parts(dit, vae);
+    // Install any Raw-trained LoRA/LoKr adapters onto the single-file DiT BEFORE residency is finalized,
+    // mirroring the snapshot path's load→apply order (`load_krea_heavy`). The shared seam errors (never
+    // silently drops) on an adapter target that matches no module, so a bad adapter fails the load loudly.
+    // An empty slice leaves the dense-bf16 native load byte-identical to the pre-adapter behavior.
+    if !adapters.is_empty() {
+        heavy.apply_adapters(adapters)?;
+    }
     let text = KreaText::from_snapshot(base)?;
     let residency = Residency::resident(text, KreaHeavyOwned { heavy, pid: None });
-    Ok(Box::new(Krea {
+    Ok(Krea {
         descriptor,
         residency,
-        adapters: Vec::new(),
-        has_diff_patch: false,
-    }))
+        adapters: adapters.to_vec(),
+        has_diff_patch: adapters_have_diff_patch(adapters),
+    })
 }
 
 /// Shared loader behind [`load`] / [`load_raw`] / [`load_edit`]: build the residency from a snapshot
@@ -1403,6 +1435,90 @@ mod tests {
             !e.to_lowercase().contains("not yet supported")
                 && !e.to_lowercase().contains("not supported"),
             "adapters must be accepted, got: {e}"
+        );
+    }
+
+    #[test]
+    fn native_load_empty_adapters_preserves_load() {
+        // sc-14119: an empty adapter slice keeps the native single-file load behaving as it always has —
+        // it still runs the turnkey config read first (and, with a bogus base dir, fails there), so the
+        // new parameter is inert for the t2i/img2img callers that pass `&[]`.
+        let e = load_from_native_dit_file(
+            "/nonexistent-krea/dit.safetensors",
+            "/nonexistent-krea",
+            &[],
+            descriptor(),
+        )
+        .err()
+        .expect("missing base snapshot → err")
+        .to_string();
+        assert!(
+            e.contains("config.json") || e.contains("read"),
+            "expected the missing-base config-read error, got: {e}"
+        );
+    }
+
+    #[test]
+    fn native_load_accepts_adapters_without_early_rejection() {
+        // sc-14119: a non-empty adapter slice is threaded through the native loader (parity with the
+        // snapshot `load` path) and must NOT be rejected at the door. With a bogus base the load still
+        // fails first at the turnkey config read — the adapter fold (`KreaHeavy::apply_adapters`) is
+        // weights-gated and exercised in the #[ignore] real-weight harness below.
+        let adapters = vec![AdapterSpec::new(
+            std::path::PathBuf::from("/nonexistent-krea/krea2_identity_edit.safetensors"),
+            1.0,
+            AdapterKind::Lora,
+        )];
+        let e = load_from_native_dit_file(
+            "/nonexistent-krea/dit.safetensors",
+            "/nonexistent-krea",
+            &adapters,
+            edit_descriptor(),
+        )
+        .err()
+        .expect("missing base snapshot → err")
+        .to_string();
+        assert!(
+            !e.to_lowercase().contains("not yet supported")
+                && !e.to_lowercase().contains("not supported"),
+            "adapters must be accepted by the native loader, got: {e}"
+        );
+        assert!(
+            e.contains("config.json") || e.contains("read"),
+            "expected the missing-base config-read error, got: {e}"
+        );
+    }
+
+    /// Real-weight harness for the native single-file + adapter fold (sc-14119): the discriminating check
+    /// the GPU-free tests can't run (the fold needs a real DiT/base). Set `KREA_NATIVE_DIT` to a ComfyUI
+    /// single-file Krea 2 DiT, `KREA_TURBO_DIR` to a resident turnkey snapshot root, and
+    /// `KREA_EDIT_ADAPTER` to a `krea2_identity_edit` LoRA. Asserts the passed adapter is folded onto the
+    /// returned generator (`apply_adapters` invoked) and the `adapters` / `has_diff_patch` fields reflect
+    /// it, rather than the old hardcoded empty/false.
+    #[test]
+    #[ignore = "needs real weights: set KREA_NATIVE_DIT, KREA_TURBO_DIR, KREA_EDIT_ADAPTER"]
+    fn native_load_folds_edit_adapter() {
+        let dit = std::env::var("KREA_NATIVE_DIT").expect("set KREA_NATIVE_DIT");
+        let base = std::env::var("KREA_TURBO_DIR").expect("set KREA_TURBO_DIR");
+        let adapter = std::env::var("KREA_EDIT_ADAPTER").expect("set KREA_EDIT_ADAPTER");
+        let adapters = vec![AdapterSpec::new(
+            std::path::PathBuf::from(adapter),
+            1.0,
+            AdapterKind::Lora,
+        )];
+        let krea = build_native_krea(&dit, &base, &adapters, edit_descriptor())
+            .expect("native single-file load + adapter fold");
+        // `apply_adapters` ran (a target mismatch would have errored above) and the field is populated
+        // from the passed adapters — not the hardcoded empty vec the entrypoint used before sc-14119.
+        assert_eq!(
+            krea.adapters.len(),
+            1,
+            "the passed adapter must be retained"
+        );
+        assert_eq!(
+            krea.has_diff_patch,
+            adapters_have_diff_patch(&adapters),
+            "has_diff_patch must be computed from the passed adapters, not hardcoded"
         );
     }
 
