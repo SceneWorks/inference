@@ -250,9 +250,10 @@ impl Krea2Transformer {
     /// `crate::adapters::merge_surface_keys`). The additive installer
     /// ([`crate::adapters::install_additive`]) pushes a resolved LoRA/LoKr residual onto each matched
     /// projection so a user adapter applies on a packed q4/q8 tier with the base kept packed (sc-11105).
-    /// This inner walk covers the per-block attention + FFN; the front-end (`img_in`/`txt_in`/`time_*`/
-    /// `final_layer.linear`) leaves are added on top by the [`crate::adapters::AdditiveDit`] impl below
-    /// (sc-11720 wide surface), so they are NOT visited here. `text_fusion.projector` stays out of surface.
+    /// This inner walk covers the per-block attention + FFN; the front-end (`img_in`/`txt_in.linear_{1,2}`/
+    /// `time_embed.linear_{1,2}`/`time_mod_proj`/`final_layer.linear`) leaves are added on top by the
+    /// [`crate::adapters::AdditiveDit`] impl below (sc-11720 wide surface; `time_mod_proj` added sc-14163),
+    /// so they are NOT visited here. `text_fusion.projector` stays out of surface.
     pub fn visit_adaptable_mut(
         &mut self,
         f: &mut dyn FnMut(&str, &mut candle_gen::quant::AdaptLinear) -> candle_gen::Result<()>,
@@ -270,7 +271,8 @@ impl Krea2Transformer {
     /// [`crate::adapters::install_additive`] pushes onto (the [`AdditiveDit`](crate::adapters::AdditiveDit)
     /// surface): the per-block attention + SwiGLU projections plus the `text_fusion` blocks (via the inner
     /// [`Self::visit_adaptable_mut`]) AND the front-end + final leaves (`img_in` / `time_embed.linear_1/2`
-    /// / `txt_in.linear_1/2` / `final_layer.linear`, dense-tier only via `as_adapt_mut`). After clearing,
+    /// / `time_mod_proj` / `txt_in.linear_1/2` / `final_layer.linear`, dense-tier only via `as_adapt_mut`).
+    /// After clearing,
     /// the forward is byte-identical to the un-adapted base; a subsequent `install_additive` of the next
     /// phase's subset makes that phase's adapter set authoritative regardless of what the prior phase (or
     /// the load-time bake) installed. The base weight tensors are never touched, so this is a cheap, exact
@@ -285,6 +287,7 @@ impl Krea2Transformer {
             &mut self.img_in,
             &mut self.time_embed_l1,
             &mut self.time_embed_l2,
+            &mut self.time_mod_proj,
             &mut self.txt_in_l1,
             &mut self.txt_in_l2,
             &mut self.final_linear,
@@ -486,6 +489,7 @@ impl crate::adapters::AdditiveDit for Krea2Transformer {
             ("img_in", &mut self.img_in),
             ("time_embed.linear_1", &mut self.time_embed_l1),
             ("time_embed.linear_2", &mut self.time_embed_l2),
+            ("time_mod_proj", &mut self.time_mod_proj),
             ("txt_in.linear_1", &mut self.txt_in_l1),
             ("txt_in.linear_2", &mut self.txt_in_l2),
             ("final_layer.linear", &mut self.final_linear),
@@ -505,7 +509,8 @@ impl crate::adapters::AdditiveDit for Krea2Transformer {
         "expected bare/PEFT `<path>.lora_A/B.weight` (LoRA) or `<module>.lokr_w1/w2` (LoKr) over the DiT \
          attention (to_q|to_k|to_v|to_gate|to_out.0) + SwiGLU FFN (ff.gate|ff.up|ff.down) across the \
          single-stream transformer_blocks and text_fusion blocks, plus the front-end \
-         (img_in|time_embed.linear_1/2|txt_in.linear_1/2|final_layer.linear) projections; or a ComfyUI/\
+         (img_in|time_embed.linear_1/2|time_mod_proj|txt_in.linear_1/2|final_layer.linear) projections; \
+         or a ComfyUI/\
          lightx2v `<module>.diff`/`.diff_b` diff-patch (full-weight/bias delta, incl. the \
          text_fusion.projector 12→1 collapse). Conv-layer / text-encoder adapters are out of surface"
     }
@@ -595,6 +600,55 @@ mod tests {
         assert!(
             v[4..].iter().all(|&x| x.abs() < 1e-6),
             "sin half = 0 at t=0"
+        );
+    }
+
+    /// sc-14163 (candle parity, real-transformer coverage): the inference [`Krea2Transformer`]'s
+    /// additive-adapter surface — [`AdditiveDit::visit_additive`], the surface `install_additive` pushes
+    /// residuals onto and `clear_adapters` resets — must include ALL SEVEN front-end/global projections,
+    /// crucially `time_mod_proj`. Its native `tproj.1` turbo-LoRA target carries an essential low-rank
+    /// residual; MLX already routes it via `adaptable_mut`, and this PR added it to candle's surface.
+    /// Built on a REAL dense-tier DiT (not the string normalizer, not a hand-rolled `MockDit`): on a dense
+    /// tier every front-end `QLinear` yields an adapter-capable `AdaptLinear`, so all seven are visited.
+    /// **Discriminating:** a future edit that re-drops `time_mod_proj` from `visit_additive` fails here —
+    /// the exact false-green this test exists to prevent.
+    #[test]
+    fn additive_surface_includes_all_seven_global_projections() {
+        use crate::adapters::AdditiveDit;
+
+        let (mut dit, _cfg, path) = crate::testfix::tiny_transformer();
+
+        let mut visited: Vec<String> = Vec::new();
+        dit.visit_additive(&mut |p, _proj| {
+            visited.push(p.to_string());
+            Ok(())
+        })
+        .unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        // All seven front-end/global projections must be on the surface. `time_mod_proj` is the leaf this
+        // PR added (sc-14163); dropping it again would fail this assertion.
+        for leaf in [
+            "img_in",
+            "time_embed.linear_1",
+            "time_embed.linear_2",
+            "time_mod_proj",
+            "txt_in.linear_1",
+            "txt_in.linear_2",
+            "final_layer.linear",
+        ] {
+            assert!(
+                visited.iter().any(|p| p == leaf),
+                "additive surface missing front-end leaf `{leaf}` — visited: {visited:?}"
+            );
+        }
+        // Sanity that the walk actually yielded the block targets too (so the front-end match is not a
+        // walk that produced nothing): one representative block-0 attention target suffices.
+        assert!(
+            visited
+                .iter()
+                .any(|p| p == "transformer_blocks.0.attn.to_q"),
+            "additive surface missing the block attention targets — visited: {visited:?}"
         );
     }
 

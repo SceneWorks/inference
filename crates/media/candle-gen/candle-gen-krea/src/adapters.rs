@@ -96,9 +96,32 @@ fn strip_peft_prefix(key: &str) -> &str {
 /// use (sc-8185). ai-toolkit keys its LoRAs to the **raw checkpoint layout** — `blocks`/`txtfusion`
 /// containers, `attn.{wq,wk,wv,wo,gate}`, an `mlp` FFN — whereas SceneWorks' converter/trainer (and the
 /// base DiT tensor keys this merge folds into) use `transformer_blocks`/`text_fusion`,
-/// `attn.{to_q,to_k,to_v,to_out.0,to_gate}`, `ff`. A path already in diffusers form is returned
-/// unchanged (none of the replacements match it), so this is a no-op for our own LoRAs.
+/// `attn.{to_q,to_k,to_v,to_out.0,to_gate}`, `ff`. It also renames the seven **global/head/embed**
+/// projections the turbo LoRA (epic 13879) keys in native dialect — `first`, `tmlp.{0,2}`, `tproj.1`,
+/// `txtmlp.{1,3}`, `last.linear` — to `img_in`, `time_embed.linear_{1,2}`, `time_mod_proj`,
+/// `txt_in.linear_{1,2}`, `final_layer.linear` (sc-14163; previously only the block dialect was aliased,
+/// so those seven targets resolved to nothing and their essential low-rank + `.diff_b` deltas were lost).
+/// A path already in diffusers form is returned unchanged (none of the rewrites match it), so this is a
+/// no-op for our own LoRAs. The correspondence mirrors mlx-gen-krea's `native_remap` map (module-path
+/// level) and the MLX host's `adaptable_mut` aliases — keep the two in lockstep.
 fn normalize_native_krea_path(path: &str) -> String {
+    // Global/head/embed projections are whole-path (top-level, no block index) native names, matched
+    // exactly before the container/leaf rewrites below. None of them start with `blocks.`/`txtfusion.`
+    // or contain `.attn.`/`.mlp.`, so the fall-through rewrites would leave them unchanged anyway; this
+    // explicit map is what actually routes them to their diffusers counterpart.
+    if let Some(diffusers) = match path {
+        "first" => Some("img_in"),
+        "tmlp.0" => Some("time_embed.linear_1"),
+        "tmlp.2" => Some("time_embed.linear_2"),
+        "tproj.1" => Some("time_mod_proj"),
+        "txtmlp.1" => Some("txt_in.linear_1"),
+        "txtmlp.3" => Some("txt_in.linear_2"),
+        "last.linear" => Some("final_layer.linear"),
+        _ => None,
+    } {
+        return diffusers.to_string();
+    }
+
     // Container (leading segment): native `blocks`/`txtfusion` → diffusers `transformer_blocks`/
     // `text_fusion`. `transformer_blocks.`/`text_fusion.` don't start with `blocks.`/`txtfusion.`, so
     // an already-diffusers path is untouched.
@@ -1040,6 +1063,57 @@ mod tests {
             normalize_native_krea_path("text_fusion.refiner_blocks.1.ff.gate"),
             "text_fusion.refiner_blocks.1.ff.gate"
         );
+    }
+
+    /// sc-14163: ostris **ai-toolkit** also keys the turbo LoRA's seven GLOBAL/head/embed projections in
+    /// the native checkpoint layout — `first`, `tmlp.{0,2}`, `tproj.1`, `txtmlp.{1,3}`, `last.linear`.
+    /// Those must normalize to the same diffusers module paths the base DiT keys use, so both a low-rank
+    /// LoRA key and a `.diff`/`.diff_b` diff-patch stem resolve (before this fix they passed through
+    /// unchanged, matched no base key, and were silently dropped). The normalizer must stay a no-op on the
+    /// already-diffusers global names (our own LoRAs). Parity with mlx-gen-krea's `adaptable_mut` aliases.
+    #[test]
+    fn classify_lora_normalizes_native_global_projections() {
+        // The base map has no global-projection keys, so `classify_lora_key`'s peft/bare branch resolves
+        // the module path purely through `normalize_native_krea_path` (independent of the kohya table).
+        let table = build_kohya_table(&base_map(), &[2]);
+        let cases = [
+            ("first", "img_in"),
+            ("tmlp.0", "time_embed.linear_1"),
+            ("tmlp.2", "time_embed.linear_2"),
+            ("tproj.1", "time_mod_proj"),
+            ("txtmlp.1", "txt_in.linear_1"),
+            ("txtmlp.3", "txt_in.linear_2"),
+            ("last.linear", "final_layer.linear"),
+        ];
+        for (native, want) in cases {
+            assert_eq!(
+                normalize_native_krea_path(native),
+                want,
+                "native global {native} must normalize to {want}"
+            );
+            // The same rename drives the low-rank LoRA classifier (`.lora_A.weight` stripped first).
+            let (p, _) = classify_lora_key(&format!("{native}.lora_A.weight"), &table).unwrap();
+            assert_eq!(
+                p, want,
+                "native LoRA key {native}.lora_A must resolve to {want}"
+            );
+            // …and the diff-patch stem resolver (`.diff`/`.diff_b` stripped first).
+            assert_eq!(resolve_diff_stem(native), want);
+        }
+        // No-op on the already-diffusers global names (our converter/trainer output).
+        for diffusers in [
+            "img_in",
+            "time_embed.linear_1",
+            "time_mod_proj",
+            "txt_in.linear_2",
+            "final_layer.linear",
+        ] {
+            assert_eq!(
+                normalize_native_krea_path(diffusers),
+                diffusers,
+                "diffusers global {diffusers} must pass through unchanged"
+            );
+        }
     }
 
     /// Bare-dotted LoRA merges into `W += (alpha/rank)·scale·B·A`; base+delta is exact in f32.

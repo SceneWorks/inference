@@ -13,6 +13,7 @@ use rand::rngs::StdRng;
 use crate::config::Krea2Config;
 use crate::loader::Weights;
 use crate::train_dit::KreaTrainDit;
+use crate::transformer::Krea2Transformer;
 
 /// The smallest valid Krea DiT config: 1 single-stream block, 1 layerwise + 1 refiner text block,
 /// head_dim 16 (= sum [4,6,6]), hidden 32, GQA 2/1.
@@ -243,6 +244,25 @@ fn serialize_and_load(t: &HashMap<String, Tensor>, c: &Krea2Config) -> (KreaTrai
 /// Returns `(dit, cfg, temp_path)` — the caller drops the file when done. Unseeded weights.
 pub(crate) fn tiny_dit() -> (KreaTrainDit, Krea2Config, PathBuf) {
     tiny_dit_layers(1)
+}
+
+/// Serialize a tiny Krea transformer to a temp `.safetensors` and load it as the txt2img inference
+/// [`Krea2Transformer`] (vs [`tiny_dit`]'s trainable [`KreaTrainDit`]). Returns `(dit, cfg, temp_path)`
+/// — the caller drops the file when done. Unseeded weights, **dense F32 tier** so every projection —
+/// including the front-end globals like `time_mod_proj` — is an adapter-capable `AdaptLinear` (its
+/// `QLinear::as_adapt_mut` returns `Some`), which is what the additive-surface coverage test asserts.
+pub(crate) fn tiny_transformer() -> (Krea2Transformer, Krea2Config, PathBuf) {
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let (t, c) = build_tiny_map(&mut |s| rnd(s), 1);
+    let path = std::env::temp_dir().join(format!(
+        "krea_tiny_xf_{}_{}.safetensors",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    ));
+    candle_gen::candle_core::safetensors::save(&t, &path).unwrap();
+    let w = Weights::from_file(&path, &Device::Cpu, DType::F32).unwrap();
+    let dit = Krea2Transformer::load(&w, &c).unwrap();
+    (dit, c, path)
 }
 
 /// [`tiny_dit`] with a configurable single-stream depth (the control-branch inject-offset tests

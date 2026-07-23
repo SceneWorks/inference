@@ -672,6 +672,11 @@ pub struct EditPrep {
 /// `final_layer.linear`). Adapter files address modules by their diffusers (trained-file) path; this
 /// routes those paths to the module tree. The default training target set is the single-stream block
 /// attention (`to_q`/`to_k`/`to_v`/`to_out.0`).
+///
+/// Both dialects resolve: the diffusers names our converter/trainer emit AND the native-mmdit names
+/// ai-toolkit (ostris) keys its LoRAs to — `blocks`/`txtfusion`/`wq`…/`mlp` for the block stack
+/// (sc-8185) and `first`/`tmlp.{0,2}`/`tproj.1`/`txtmlp.{1,3}`/`last.linear` for the global projections
+/// (sc-14163). The turbo LoRA (epic 13879) targets the globals in the native dialect.
 impl AdaptableHost for Krea2Transformer {
     fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
         match path {
@@ -683,13 +688,22 @@ impl AdaptableHost for Krea2Transformer {
                 .adaptable_mut(rest),
             // `text_fusion` (diffusers) ≡ `txtfusion` (native ai-toolkit) (sc-8185).
             ["text_fusion" | "txtfusion", rest @ ..] => self.text_fusion.adaptable_mut(rest),
-            ["img_in"] => Some(&mut self.img_in),
-            ["txt_in", "linear_1"] => Some(&mut self.txt_in_l1),
-            ["txt_in", "linear_2"] => Some(&mut self.txt_in_l2),
-            ["time_embed", "linear_1"] => Some(&mut self.time_embed_l1),
-            ["time_embed", "linear_2"] => Some(&mut self.time_embed_l2),
-            ["time_mod_proj"] => Some(&mut self.time_mod_proj),
-            ["final_layer", "linear"] => Some(&mut self.final_linear),
+            // The global/head/embed projections carry BOTH the diffusers names our converter/trainer
+            // emit AND the native-mmdit names ai-toolkit (ostris) keys its LoRAs to — the
+            // global-projection twin of the block/txtfusion aliases above (sc-14163, previously only
+            // the block dialect was aliased). The native↔diffusers correspondence is this crate's own
+            // `native_remap` map at the module-path level (i.e. minus the `.weight`/`.bias` leaf):
+            // `first`→`img_in`, `tmlp.{0,2}`→`time_embed.linear_{1,2}`, `tproj.1`→`time_mod_proj`,
+            // `txtmlp.{1,3}`→`txt_in.linear_{1,2}`, `last.linear`→`final_layer.linear`. The epic-13879
+            // turbo LoRA targets these 7 in the native dialect (carrying both low-rank + `.diff_b`
+            // deltas); without the aliases the strict apply cannot resolve them and fails the LoRA load.
+            ["img_in"] | ["first"] => Some(&mut self.img_in),
+            ["txt_in", "linear_1"] | ["txtmlp", "1"] => Some(&mut self.txt_in_l1),
+            ["txt_in", "linear_2"] | ["txtmlp", "3"] => Some(&mut self.txt_in_l2),
+            ["time_embed", "linear_1"] | ["tmlp", "0"] => Some(&mut self.time_embed_l1),
+            ["time_embed", "linear_2"] | ["tmlp", "2"] => Some(&mut self.time_embed_l2),
+            ["time_mod_proj"] | ["tproj", "1"] => Some(&mut self.time_mod_proj),
+            ["final_layer", "linear"] | ["last", "linear"] => Some(&mut self.final_linear),
             _ => None,
         }
     }
@@ -766,4 +780,117 @@ fn unpatchify(tokens: &Array, ht: i32, wt: i32, p: i32, c: i32) -> Result<Array>
     let x = tokens.reshape(&[b, ht, wt, c, p, p])?; // b, ht, wt, c, ph, pw
     let x = x.transpose_axes(&[0, 3, 1, 4, 2, 5])?; // b, c, ht, ph, wt, pw
     Ok(x.reshape(&[b, c, ht * p, wt * p])?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A dense `[out, in]` weight (+ its `[out]` bias) at `base` — values are irrelevant (these tests
+    /// route by shape, never forward), so each global projection gets a distinct `out` we can match on.
+    fn put_lin(w: &mut Weights, base: &str, out: i32, in_: i32) {
+        w.insert(
+            format!("{base}.weight"),
+            Array::from_slice(&vec![0f32; (out * in_) as usize], &[out, in_]),
+        );
+        w.insert(
+            format!("{base}.bias"),
+            Array::from_slice(&vec![0f32; out as usize], &[out]),
+        );
+    }
+
+    /// A minimal `Krea2Transformer` (zero single-stream + text-fusion blocks) whose seven global/head/
+    /// embed projections have DISTINCT output dims, so `AdaptableLinear::base_shape()[0]` identifies
+    /// exactly which projection a target path resolved to (the sc-8185 block-alias test's precedent,
+    /// lifted to the transformer level).
+    fn tiny_transformer() -> Krea2Transformer {
+        let mut cfg = Krea2Config::turbo();
+        cfg.num_attention_heads = 2;
+        cfg.attention_head_dim = 4;
+        cfg.axes_dims_rope = [1, 1, 2];
+        cfg.hidden_size = 8;
+        cfg.num_kv_heads = 1;
+        cfg.num_layers = 0;
+        cfg.num_layerwise_text_blocks = 0;
+        cfg.num_refiner_text_blocks = 0;
+        cfg.text_num_attention_heads = 2;
+        cfg.text_hidden_dim = 8;
+        cfg.timestep_embed_dim = 4;
+        cfg.in_channels = 8;
+
+        let mut w = Weights::empty();
+        // Distinct out dims 101..=107, one per global projection.
+        put_lin(&mut w, "img_in", 101, 8);
+        put_lin(&mut w, "time_embed.linear_1", 102, 8);
+        put_lin(&mut w, "time_embed.linear_2", 103, 8);
+        put_lin(&mut w, "time_mod_proj", 104, 8);
+        put_lin(&mut w, "txt_in.linear_1", 105, 8);
+        put_lin(&mut w, "txt_in.linear_2", 106, 8);
+        put_lin(&mut w, "final_layer.linear", 107, 8);
+        // Norms + the text-fusion projector (no bias) + the final modulation table (reshapes to
+        // `[1, 2, hidden]` = 16 elements) — the remaining fields `from_weights` requires.
+        w.insert("txt_in.norm.weight", Array::from_slice(&[0f32; 8], &[8]));
+        w.insert(
+            "final_layer.norm.weight",
+            Array::from_slice(&[0f32; 8], &[8]),
+        );
+        w.insert(
+            "text_fusion.projector.weight",
+            Array::from_slice(&[0f32; 12], &[1, 12]),
+        );
+        w.insert(
+            "final_layer.scale_shift_table",
+            Array::from_slice(&[0f32; 16], &[2, 8]),
+        );
+
+        Krea2Transformer::from_weights(&w, &cfg).unwrap()
+    }
+
+    /// sc-14163: the seven native-mmdit (ai-toolkit / ostris) GLOBAL-projection target paths the turbo
+    /// LoRA (epic 13879) keys — `first`, `tmlp.0`/`tmlp.2`, `tproj.1`, `txtmlp.1`/`txtmlp.3`,
+    /// `last.linear` — must now RESOLVE via `adaptable_mut` (they returned `None` before this fix, so the
+    /// strict apply failed the whole LoRA), AND each must route to the SAME projection as its diffusers
+    /// counterpart. Distinct output dims (101..=107) prove correct routing, not just a non-`None` match.
+    #[test]
+    fn adaptable_mut_resolves_native_global_projection_aliases() {
+        // (diffusers path, native path, the projection's distinct out dim).
+        let cases: [(&[&str], &[&str], i32); 7] = [
+            (&["img_in"], &["first"], 101),
+            (&["time_embed", "linear_1"], &["tmlp", "0"], 102),
+            (&["time_embed", "linear_2"], &["tmlp", "2"], 103),
+            (&["time_mod_proj"], &["tproj", "1"], 104),
+            (&["txt_in", "linear_1"], &["txtmlp", "1"], 105),
+            (&["txt_in", "linear_2"], &["txtmlp", "3"], 106),
+            (&["final_layer", "linear"], &["last", "linear"], 107),
+        ];
+        for (diffusers, native, out) in cases {
+            let mut t = tiny_transformer();
+            // The diffusers name routes to the expected projection.
+            assert_eq!(
+                t.adaptable_mut(diffusers)
+                    .unwrap_or_else(|| panic!("diffusers path {diffusers:?} must resolve"))
+                    .base_shape()[0],
+                out,
+                "diffusers {diffusers:?} routed to the wrong projection"
+            );
+            // The native alias resolves (it did NOT before sc-14163) and routes to the SAME projection.
+            assert_eq!(
+                t.adaptable_mut(native)
+                    .unwrap_or_else(|| panic!("native path {native:?} must resolve (sc-14163)"))
+                    .base_shape()[0],
+                out,
+                "native {native:?} must route to the same projection as {diffusers:?}"
+            );
+        }
+    }
+
+    /// A native path that is NOT one of the aliased global projections still resolves to nothing — the
+    /// aliases are exact, not a blanket accept (guards against a future over-broad match arm).
+    #[test]
+    fn adaptable_mut_rejects_unknown_native_global_path() {
+        let mut t = tiny_transformer();
+        assert!(t.adaptable_mut(&["tmlp", "1"]).is_none()); // `tmlp.1` is a GELU, not a Linear
+        assert!(t.adaptable_mut(&["last", "norm"]).is_none()); // the final RMSNorm is not adaptable
+        assert!(t.adaptable_mut(&["nope"]).is_none());
+    }
 }
