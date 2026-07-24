@@ -145,9 +145,16 @@ surface and `tools/golden/README.md` for the golden manifest.
 
 ### Device notes (this is not a CUDA-only oracle)
 
-* **CPU (`MAGE_DEVICE=cpu`) is the blessed path on macOS** and is what the committed goldens
-  were dumped with. ~7 min for the 256²/4-step txt2img stack on an M-series host (the reference
-  runs bf16 end to end; `load_from_repo` hard-casts and offers no dtype knob).
+* **CPU (`MAGE_DEVICE=cpu`) is the blessed path on macOS** and is what the goldens in
+  `tools/golden/` were dumped with (the reference runs bf16 end to end; `load_from_repo`
+  hard-casts and offers no dtype knob). Budget, at the 256²/4-step defaults on an M-series host:
+  `noise`/`vae` are seconds, `te` ~15 s, the gen stack (`te` + `e2e` + `dit` + `dit_block`)
+  ~8 min, and `edit` ~25 min. Edit is the slow one for two reasons — its packed image stream is
+  twice as long (target + reference) and its content gate is a *multimodal* `.generate()`. Note
+  the harness pre-screens before calling the pipeline (which screens again internally), so the
+  moderation pass runs twice per stage. That is deliberate: it turns a screening failure into a
+  loud error instead of a blank-white refusal-image golden that every parity test would happily
+  match.
 * **MPS runs the VAE and the text encoder fine but NOT the DiT.** `torch 2.13.0` MPS
   mis-handles `Tensor.repeat_interleave(repeats=<int32 tensor>)`, which the adaLN modulation
   broadcast uses (`models/modules/mage_layers.py:566`, fed by the int32 `cu_seqlens` the

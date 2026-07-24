@@ -169,8 +169,10 @@ the identical formula at `steps=4`.**
   (`:48-49`). The scheduler applies the static shift `σ' = 6σ / (1 + 5σ)` and appends a terminal
   `0`.
 - `_get_scheduler` (`pipeline.py:53-61`) prefers the repo's own scheduler — loaded from
-  `scheduler/scheduler_config.json` at `pipeline.py:760-761`, which is byte-identical across all
-  six published repos (`shift: 6.0`) — and re-times it with the same `linspace`.
+  `scheduler/scheduler_config.json` at `pipeline.py:760-761` — and re-times it with the same
+  `linspace`. That config is byte-identical (**same SHA-256**) across the four repos checked
+  here — Mage-Flow (RL), Base, Edit, Turbo — as is `transformer/config.json`; Edit-Base and
+  Edit-Turbo were not cached locally and are unverified.
 - The denoise step is plain Euler: `img = scheduler.step(pred, t, img)` (`pipeline.py:343`),
   i.e. `x += (σ_next − σ_cur)·v`.
 - **τ_ca / τ_dm are Decoupled-DMD *distillation-loss* hyperparameters, not inference state.**
