@@ -317,14 +317,17 @@ fn decode_rejects_a_malformed_latent() {
     assert!(vae.decode(&wrong_rank).is_err(), "wrong rank");
 }
 
-/// **The non-square gate.** Every other decode here is square, and a square decode cannot tell
-/// `[b, hl, wl, ...]` from `[b, wl, hl, ...]` — a transposed height/width is invisible.
+/// **The non-square + asymmetric-padding gate.** Two distinct faults hide behind square inputs:
 ///
-/// The fixture's second latent is `6 × 10`, which the 4×4 attention tiling pads to `8 × 12`:
-/// **both axes, by different amounts**. That combination (non-square *and* asymmetric padding) is
-/// exactly what the production geometries miss — 1024² and 2048 divide evenly by 32 and pad
-/// neither axis. The epic's native-resolution range admits aspects up to 4:1, so this is a
-/// supported case, not a curiosity.
+/// 1. a transposed height/width — `[b, hl, wl, ...]` read as `[b, wl, hl, ...]`;
+/// 2. a swapped `pad_h`/`pad_w` in the `AttnBlock` tiling.
+///
+/// The fixture's second latent is `6 × 9`, which the 4×4 tiling pads to `8 × 12` — `pad_h = 2`
+/// but `pad_w = 3`. Both faults fail here. **Non-squareness alone is not enough for (2):** the
+/// first version of this test used `6 × 10`, which pads `(2, 2)`, and a `pad_h`/`pad_w` swap
+/// passed it — as it passed every real-weights geometry too, since 256² and 768×1280 pad `(16,16)`
+/// and 1024²/2048/512×2048 pad nothing. `768x1152` is the only real-weights geometry that catches
+/// it. The epic's native-resolution range admits aspects up to 4:1, so this is supported surface.
 #[test]
 fn non_square_decode_matches_the_torch_reference() {
     let w = fixture();

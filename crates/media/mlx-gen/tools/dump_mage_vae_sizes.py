@@ -21,7 +21,7 @@ one code path. Gitignored, like every other golden.
 
 Run (from `crates/media/mlx-gen`):
 
-    MAGE_VAE_SIZES=256,1024,2048,512x2048,768x1280 PYTHONPATH=_vendor \\
+    MAGE_VAE_SIZES=256,1024,2048,512x2048,768x1280,768x1152 PYTHONPATH=_vendor \\
       python3 tools/dump_mage_vae_sizes.py
 
 Entries are `<square>` or `<height>x<width>`.
@@ -62,10 +62,16 @@ def _parse_sizes(spec: str) -> list[tuple[int, int]]:
 
 
 # Non-square entries are not optional extras: every square geometry hides a transposed h/w, and
-# the epic's native-resolution range explicitly includes 4:1 aspects. `512x2048` is that extreme;
-# `768x1280` gives a latent of 48x80, where the CoD decoder's 32-tile attention pads BOTH axes by
-# DIFFERENT amounts (48->64, 80->96) -- a case no square geometry reaches.
-SIZES = _parse_sizes(os.environ.get("MAGE_VAE_SIZES", "256,1024,2048,512x2048,768x1280"))
+# the epic's native-resolution range explicitly includes 4:1 aspects. `512x2048` is that extreme.
+#
+# `768x1152` is the ASYMMETRIC-PADDING case and the only one here: latent 48x72, which the CoD
+# decoder's 32-tile attention pads by 16 on h but 24 on w. Every other geometry pads its two axes
+# EQUALLY -- 256^2 and 768x1280 both by (16,16), and 1024^2 / 2048 / 512x2048 not at all -- so a
+# pad_h/pad_w swap survives all of them. Do not drop 768x1152 without replacing it with another
+# geometry whose two pads differ.
+SIZES = _parse_sizes(
+    os.environ.get("MAGE_VAE_SIZES", "256,1024,2048,512x2048,768x1280,768x1152")
+)
 SEED = int(os.environ.get("MAGE_SEED", "42"))
 REF_IMAGE = os.environ.get(
     "MAGE_EDIT_REF", os.path.join(VENDOR, "mage_flow", "assets", "dog.jpg")

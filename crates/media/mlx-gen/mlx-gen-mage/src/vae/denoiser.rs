@@ -21,8 +21,10 @@
 //! `y_embedder_x` is a `Conv2d(384 → 32·16²)` whose 8192 output channels are read back as
 //! `(feature, position)` — **feature-major** (`mage_vae.py:503-504`: `flatten(2)` then
 //! `reshape(b, -1, 256, L)`). `dec_net.cond_embed` is a `Linear(384 → 16²·32)` whose 8192 outputs
-//! are read back as `(position, feature)` — **position-major** (`:239`). Both are pinned by
-//! `tests/vae_layout.rs`.
+//! are read back as `(position, feature)` — **position-major** (`:239`). Swapping either is caught
+//! by `tests/vae_decode_fixture.rs::tiny_decode_matches_the_torch_reference` — verified by
+//! mutation, not assumed: reading the `y_embedder_x` output position-major instead moves the
+//! tiny decode by max_abs **0.176** against a 2e-3 bound.
 
 use mlx_rs::ops::{add, concatenate_axis, multiply, split, zeros_dtype};
 use mlx_rs::{Array, Dtype};
@@ -126,7 +128,10 @@ impl NerfEmbedder {
 
 /// The fixed `fetch_pos` DCT table (`mage_vae.py:190-202`), `[1, P², max_freqs²]`.
 ///
-/// Two easy-to-miss details, both pinned by `tests/vae_layout.rs`:
+/// Two easy-to-miss details, both pinned against the reference by
+/// `tests/vae_decode_fixture.rs::dct_position_table_matches_the_torch_reference` (at the tiny
+/// *and* the published `patch = 16` geometry), with
+/// `an_integer_frequency_ramp_would_not_match` proving the check discriminates:
 ///
 /// 1. `freqs = linspace(0, max_freqs, max_freqs)` is **8 points spanning 0…8 inclusive**, i.e. a
 ///    step of `8/7` — *not* `arange(8)`. A `0..7` integer ramp is the natural misreading and
@@ -347,10 +352,18 @@ impl DConvDenoiser {
         let s = s.reshape(&[b * length, hidden])?;
 
         // --- per-pixel stream ---------------------------------------------------------------
-        // `unfold(noise, 16, stride 16)` (`mage_vae.py:502`). On the decode path the noise is
-        // identically zero, so this is the zero block of the concatenation below; it is built
-        // explicitly so the channel budget (3 of 35) stays visible.
-        let unfolded = zeros_dtype(&[b * length, p2, in_ch], dtype)?;
+        // `unfold(noise, patch, stride=patch)` (`mage_vae.py:502`) — the exact inverse of the fold
+        // at the end of this function, since kernel == stride means no overlap accumulation.
+        //
+        // `decode` always passes zero noise, so this block is identically zero in production. It
+        // is computed for real rather than substituted with `zeros` anyway: this is a `pub fn`
+        // taking `noise_nhwc`, and silently ignoring the argument would give any future caller
+        // (an encode round-trip, or a multi-step use of the denoiser) a half-wrong answer with
+        // nothing to notice.
+        let unfolded = noise_nhwc
+            .reshape(&[b, hl, patch, wl, patch, in_ch])?
+            .transpose_axes(&[0, 1, 3, 2, 4, 5])?
+            .reshape(&[b * length, p2, in_ch])?;
 
         // FEATURE-major: `[B, h, w, 32·P²]` -> `[B, h, w, 32, P²]` -> `[B·L, P², 32]`
         // (`mage_vae.py:503-504`).

@@ -22,9 +22,10 @@ The tiny shape is deliberately *not* a scaled-down copy of the published one:
   crop back off — the published 1024²/2048² geometries divide evenly and never exercise it, while
   256² does, so the fixture keeps that path covered without weights.
 * `patch = 4` keeps the unfold/fold layout small enough to reason about by hand.
-* a second **non-square** `6 x 10` latent pads to `8 x 12` — both axes by *different* amounts.
-  Without it the suite could not distinguish `[b, hl, wl, ...]` from `[b, wl, hl, ...]`, and the
-  epic's native-resolution range admits aspects up to 4:1.
+* a second **non-square** `6 x 9` latent pads to `8 x 12` — `pad_h = 2` but `pad_w = 3`, i.e. the
+  two axes by *genuinely different* amounts. Both halves matter: non-square alone distinguishes
+  `[b, hl, wl, ...]` from `[b, wl, hl, ...]`, and unequal pads distinguish `pad_h` from `pad_w`.
+  A non-square latent with equal pads (`6 x 10` -> `(2, 2)`) does neither.
 * `max_freqs` stays 8 because `_DConvDenoiser.__init__` hard-codes it (`mage_vae.py:475`); the
   production `patch = 16` table is dumped alongside so the real geometry is pinned too.
 """
@@ -53,10 +54,12 @@ NUM_COND_BLOCKS = 2
 NUM_BLOCKS = 3  # dec_net res blocks = NUM_BLOCKS - NUM_COND_BLOCKS = 1
 ATTN_TILE = 4
 LATENT_HW = 6  # 6 % 4 != 0 -> replicate padding in AttnBlock
-# A second, NON-SQUARE latent: 6x10 pads to 8x12, i.e. both axes padded by DIFFERENT amounts.
-# Every square geometry hides a transposed h/w, so without this the default test suite could not
-# tell `[b, hl, wl, ...]` from `[b, wl, hl, ...]`.
-LATENT_NS = (6, 10)
+# A second, NON-SQUARE latent. 6x9 against ATTN_TILE=4 pads to 8x12, i.e. pad_h=2 but pad_w=3 --
+# the two axes padded by GENUINELY DIFFERENT amounts. That combination is what distinguishes
+# `[b, hl, wl, ...]` from `[b, wl, hl, ...]` AND `pad_h` from `pad_w`; a merely non-square latent
+# whose pads happen to be equal (6x10 -> (2,2), the first attempt here) does neither, and a
+# pad_h/pad_w swap passes it.
+LATENT_NS = (6, 9)
 SEED = 20260724
 
 
