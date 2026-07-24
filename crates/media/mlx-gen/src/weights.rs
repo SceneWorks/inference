@@ -10,12 +10,21 @@ use crate::{Error, Result};
 
 /// A loaded set of named tensors (dotted keys, e.g. `"layers.0.attention.to_q.weight"`)
 /// plus the file's string metadata (e.g. a LoKr adapter's `networkType` / `alpha` / `rank`).
+#[derive(Clone)]
 pub struct Weights {
     tensors: HashMap<String, Array>,
     metadata: HashMap<String, String>,
 }
 
 impl Weights {
+    /// Build weights from an already materialized tensor map.
+    pub fn from_map(tensors: HashMap<String, Array>) -> Self {
+        Self {
+            tensors,
+            metadata: HashMap::new(),
+        }
+    }
+
     /// An empty weights container — for building small in-memory fixtures (e.g. checkpoint-remap unit
     /// tests that assert `remap_*_keys` produces the aliased names without a real snapshot).
     pub fn empty() -> Self {

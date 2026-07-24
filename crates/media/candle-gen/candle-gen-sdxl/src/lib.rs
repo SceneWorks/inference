@@ -104,6 +104,7 @@ pub use conditioning::SdxlConditioner;
 // SDXL component loaders for InstantID (sc-5491) — the vendored UNet (+ add_embedding), the fp16-fix
 // VAE, and a diffusers ControlNet, built from an SDXL snapshot. The candle twins of mlx-gen-sdxl's
 // load_unet_dtype/load_vae/load_controlnet.
+pub mod ldm;
 pub mod loaders;
 pub use loaders::{
     load_instantid_unet, load_instantid_unet_with_adapters, load_sdxl_controlnet, load_sdxl_vae,
@@ -164,7 +165,7 @@ pub use unet::{ControlNet, ControlNetConfig, ControlResiduals};
 mod training;
 pub use training::{load_trainer, trainer_descriptor, SdxlTrainer};
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use candle_gen::candle_core::{DType, Device};
@@ -261,6 +262,7 @@ pub struct SdxlGenerator {
     /// F-011) rather than re-reading `tokenizer.json` from the staged component on every text encode. Shared
     /// behind an `Arc` (model-agnostic); `lock_recover` mirrors the components-cache poison recovery.
     tokenizers: Mutex<Option<Arc<pipeline::SdxlTokenizers>>>,
+    ldm: Option<Arc<ldm::LdmComponents>>,
 }
 
 impl SdxlGenerator {
@@ -372,6 +374,7 @@ impl Generator for SdxlGenerator {
             &self.adapters,
             self.pid_spec.clone(),
             self.component_paths.vae_fp16_fix.clone(),
+            self.ldm.clone(),
         )?;
         // Encode text FIRST (loads + frees CLIP) so the cold-call ordering — CLIP gone before the
         // UNet/VAE are resident — is preserved (sc-4987); only then acquire the cached UNet/VAE
@@ -483,21 +486,22 @@ pub fn descriptor() -> ModelDescriptor {
 /// PEFT/kohya LoKr are supported; an adapter that matches no UNet target errors at that first
 /// `generate` rather than rendering an unadapted image silently.
 pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
-    let root = match &spec.weights {
-        WeightsSource::Dir(p) => p.clone(),
-        WeightsSource::File(_) => {
-            return Err(gen_core::Error::Msg(
-                "sdxl expects a snapshot directory (text_encoder/ text_encoder_2/ unet/ …), not a \
-                 single .safetensors file"
-                    .into(),
-            ));
-        }
+    // Validate the model-agnostic staged components before opening a potentially multi-gigabyte
+    // fused checkpoint.
+    let component_paths = SdxlComponents::from_spec(spec, MODEL_ID)?;
+    let (root, ldm) = match &spec.weights {
+        WeightsSource::Dir(p) => (p.clone(), None),
+        WeightsSource::File(file) => (
+            file.parent()
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf(),
+            Some(Arc::new(ldm::split_ldm_checkpoint(file)?)),
+        ),
     };
     // epic 13657 (sc-13663) load gate: resolve + validate the three passed-in components
     // (`tokenizer_clip_l` / `tokenizer_clip_bigg` / `vae_fp16_fix`) before any work — a missing one is
     // a caller-actionable load-time error, and an unrecognized key is rejected. `load` stays lazy (the
     // component paths are read at the first `generate`), but the contract is checked up front here.
-    let component_paths = SdxlComponents::from_spec(spec, MODEL_ID)?;
     // SDXL is fp16 (the production reference dtype) regardless of the CPU-default dtype; the device
     // is the backend selected at compile time (CUDA on Windows, Metal/CPU on Mac).
     let device = candle_gen::default_device()?;
@@ -514,6 +518,7 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         pid_spec: spec.pid.clone(),
         components: Mutex::new(None),
         tokenizers: Mutex::new(None),
+        ldm,
     }))
 }
 
@@ -864,9 +869,12 @@ mod tests {
     }
 
     #[test]
-    fn load_rejects_single_file_source() {
-        let spec = LoadSpec::new(WeightsSource::File("/tmp/sdxl.safetensors".into()));
+    fn load_reports_missing_single_file_source() {
+        let spec = sdxl_spec(WeightsSource::File("/tmp/sdxl.safetensors".into()));
         let err = load(&spec).err().expect("expected an error").to_string();
-        assert!(err.contains("snapshot directory"), "got: {err}");
+        assert!(
+            err.contains("No such file") || err.contains("not found"),
+            "got: {err}"
+        );
     }
 }

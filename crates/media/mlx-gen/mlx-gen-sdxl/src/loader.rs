@@ -83,6 +83,42 @@ fn load_clip_dtype(
     ClipTextEncoder::from_weights(&w, "text_model", cfg)
 }
 
+pub(crate) fn load_clip_from_weights(
+    mut weights: Weights,
+    cfg: &ClipTextConfig,
+    dtype: Dtype,
+) -> Result<ClipTextEncoder> {
+    weights.cast_all(dtype)?;
+    ClipTextEncoder::from_weights(&weights, "text_model", cfg)
+}
+
+pub(crate) fn load_text_encoder_1_from_weights(
+    weights: Weights,
+    dtype: Dtype,
+) -> Result<ClipTextEncoder> {
+    load_clip_from_weights(weights, &ClipTextConfig::sdxl_te1(), dtype)
+}
+
+pub(crate) fn load_text_encoder_2_from_weights(
+    weights: Weights,
+    dtype: Dtype,
+) -> Result<ClipTextEncoder> {
+    load_clip_from_weights(weights, &ClipTextConfig::sdxl_te2(), dtype)
+}
+
+pub(crate) fn load_unet_from_weights(
+    mut weights: Weights,
+    dtype: Dtype,
+) -> Result<UNet2DConditionModel> {
+    weights.cast_all(dtype)?;
+    UNet2DConditionModel::from_weights(&weights, &UNetConfig::sdxl_base())
+}
+
+pub(crate) fn load_vae_from_weights(mut weights: Weights) -> Result<Autoencoder> {
+    weights.cast_all(Dtype::Float32)?;
+    Autoencoder::from_weights(&weights, &VaeConfig::sdxl_base())
+}
+
 /// Load CLIP-L (`text_encoder`) — the 768-wide encoder, no projection — at `dtype`.
 pub fn load_text_encoder_1_dtype(root: &Path, dtype: Dtype) -> Result<ClipTextEncoder> {
     load_clip_dtype(root, "text_encoder", &ClipTextConfig::sdxl_te1(), dtype)

@@ -372,6 +372,7 @@ pub(crate) struct Pipeline {
     /// The caller-staged `vae_fp16_fix` component (epic 13657, sc-13663) — the fp16-stable VAE weight
     /// source, resolved in [`load_components`](Self::load_components) in place of the deleted render-path self-fetch.
     vae_fix: WeightsSource,
+    ldm: Option<Arc<crate::ldm::LdmComponents>>,
 }
 
 /// The seed- and prompt-independent heavy components (UNet + f16 VAE), `Arc`-shared so they can be
@@ -468,6 +469,7 @@ impl Pipeline {
         adapters: &[AdapterSpec],
         pid_spec: Option<PidWeights>,
         vae_fix: WeightsSource,
+        ldm: Option<Arc<crate::ldm::LdmComponents>>,
     ) -> Result<Self> {
         // The config's only request-dependent fields are the latent dims; the component configs
         // (clip/clip2/unet/autoencoder) are fixed for SDXL.
@@ -480,6 +482,7 @@ impl Pipeline {
             adapters: adapters.to_vec(),
             pid_spec,
             vae_fix,
+            ldm,
         })
     }
 
@@ -536,28 +539,42 @@ impl Pipeline {
         // packed — every Linear (attn q/k/v/out_proj, MLP fc1/fc2) loads straight from the packed parts —
         // and the stock dense builder otherwise (byte-identical, pinned by the vendored-vs-stock parity
         // test). The `group_size` is threaded from the component config (sc-9410).
-        let text_model: CandleModule = match detect_packed_clip(&self.root, &which)? {
-            Some((packed_file, group_size)) => {
-                let vs = candle_gen::mmap_var_builder(&[packed_file], self.dtype, &self.device)?;
-                let tower = crate::clip::ClipTextTransformer::new_gs(
-                    vs,
-                    &which.vendored_config(),
-                    group_size,
-                )?;
-                CandleModule::Vendored(tower)
-            }
-            None => {
-                // sc-3674: load CLIP at the compute dtype (f16), not the spike's F32. The fp16
-                // safetensors load directly, the forward runs f16 (diffusers loads CLIP fp16 too), and it
-                // halves the text-encoder VRAM (CLIP-bigG ~2.8→1.4 GiB) with no visible quality change.
-                // The embeddings are cast to `dtype` below.
-                let stock = stable_diffusion::build_clip_transformer(
-                    clip_cfg,
-                    snapshot_file(&self.root, weights_sub)?,
-                    &self.device,
-                    self.dtype,
-                )?;
-                CandleModule::Stock(stock)
+        let ldm_map = self.ldm.as_ref().map(|components| match which {
+            Clip::L => &components.clip_l,
+            Clip::BigG => &components.clip_bigg,
+        });
+        let text_model: CandleModule = if let Some(map) = ldm_map {
+            let vb = VarBuilder::from_tensors(map.clone(), self.dtype, &self.device);
+            CandleModule::Vendored(crate::clip::ClipTextTransformer::new_gs(
+                vb,
+                &which.vendored_config(),
+                candle_gen::quant::MLX_GROUP_SIZE,
+            )?)
+        } else {
+            match detect_packed_clip(&self.root, &which)? {
+                Some((packed_file, group_size)) => {
+                    let vs =
+                        candle_gen::mmap_var_builder(&[packed_file], self.dtype, &self.device)?;
+                    let tower = crate::clip::ClipTextTransformer::new_gs(
+                        vs,
+                        &which.vendored_config(),
+                        group_size,
+                    )?;
+                    CandleModule::Vendored(tower)
+                }
+                None => {
+                    // sc-3674: load CLIP at the compute dtype (f16), not the spike's F32. The fp16
+                    // safetensors load directly, the forward runs f16 (diffusers loads CLIP fp16 too), and it
+                    // halves the text-encoder VRAM (CLIP-bigG ~2.8→1.4 GiB) with no visible quality change.
+                    // The embeddings are cast to `dtype` below.
+                    let stock = stable_diffusion::build_clip_transformer(
+                        clip_cfg,
+                        snapshot_file(&self.root, weights_sub)?,
+                        &self.device,
+                        self.dtype,
+                    )?;
+                    CandleModule::Stock(stock)
+                }
             }
         };
 
@@ -606,49 +623,76 @@ impl Pipeline {
         // non-`.fp16` filename with a `quantization` block in `unet/config.json` and `.scales`-packed
         // Linear weights. Detect it and load the vendored packed-detecting UNet straight from the packed
         // parts (no dense staging); every dense snapshot keeps the stock build below, unchanged.
-        let unet = match self.detect_packed_unet()? {
-            Some((packed_file, group_size)) => {
-                // sc-11103: a packed tier WITH a distill LoRA/LoKr applies it **additively** — the packed
-                // Linears take a forward-time residual (base kept packed) and any conv LoRA folds into the
-                // dense convs (`load_packed_unet_with_adapters`), so the q4/q8 footprint survives instead
-                // of dequant-folding the FF (the retired sc-9528 path).
-                let vendored = if self.adapters.is_empty() {
-                    self.load_packed_unet(&packed_file, group_size)?
-                } else {
-                    self.load_packed_unet_with_adapters(&packed_file, group_size)?
-                };
-                SdxlUnet::Vendored(Arc::new(vendored))
+        let unet = if let Some(ldm) = &self.ldm {
+            let mut raw = ldm.unet.clone();
+            let table = crate::adapters::build_sdxl_kohya_table(&raw);
+            let vs = VarBuilder::from_tensors(raw.clone(), self.dtype, &self.device);
+            let mut vendored = VendoredUNet::new(vs, 4, 4, false, sdxl_unet_config())?;
+            if !self.adapters.is_empty() {
+                let linear = crate::adapters::install_additive(
+                    &mut vendored,
+                    &self.adapters,
+                    &table,
+                    &self.device,
+                )?;
+                let conv = crate::adapters::install_additive_conv(
+                    &mut vendored,
+                    &self.adapters,
+                    &table,
+                    &self.device,
+                )?;
+                crate::adapters::guard_additive_matched(
+                    self.adapters.len(),
+                    linear.applied + conv.applied,
+                )?;
             }
-            None => {
-                let unet_file =
-                    snapshot_file(&self.root, "unet/diffusion_pytorch_model.fp16.safetensors")?;
-                if use_flash_attn && self.adapters.is_empty() {
-                    // **Unadapted + flash only.** The fused flash-attn kernel never materializes the full
-                    // `[B·H, S, S]` scores tensor, so it does not hit the i32-overflow (sc-11154 / F-081)
-                    // and needs no additive seam; keep the stock candle UNet so the fused kernel is used
-                    // (byte-identical to pre-sc-5165). An ADAPTED render falls through to the vendored
-                    // additive path below (sc-11682): the vendored flash path is a stub, and an additive
-                    // residual over a pristine (evictable) mmap base is worth more for an adapted render
-                    // than the fused kernel — so the old stock fold path is retired and adapted renders
-                    // always take the i32-overflow-safe vendored math path.
-                    let unet =
-                        self.config
-                            .build_unet(unet_file, &self.device, 4, true, self.dtype)?;
-                    SdxlUnet::Stock(Arc::new(unet))
-                } else {
-                    // Math-path attention (the default — no `flash-attn` feature — AND every adapted
-                    // render): the stock candle UNet materializes a full `[B·H, S, S]` scores tensor that
-                    // overflows i32 at ≥ ~1664² (2048²: `2·10·16384² ≈ 5.4e9 > i32::MAX`) and silently
-                    // corrupts on CUDA (sc-11154 / F-081). Route through the vendored UNet, whose math
-                    // attention is the i32-overflow-safe `sdpa_budgeted_flat` (bit-identical to the stock
-                    // forward per `vendored_unet_matches_stock_forward`); an adapter rides additively over
-                    // the mmap base (sc-11682), never folded.
+            raw.clear();
+            SdxlUnet::Vendored(Arc::new(vendored))
+        } else {
+            match self.detect_packed_unet()? {
+                Some((packed_file, group_size)) => {
+                    // sc-11103: a packed tier WITH a distill LoRA/LoKr applies it **additively** — the packed
+                    // Linears take a forward-time residual (base kept packed) and any conv LoRA folds into the
+                    // dense convs (`load_packed_unet_with_adapters`), so the q4/q8 footprint survives instead
+                    // of dequant-folding the FF (the retired sc-9528 path).
                     let vendored = if self.adapters.is_empty() {
-                        self.load_dense_vendored_unet(&unet_file)?
+                        self.load_packed_unet(&packed_file, group_size)?
                     } else {
-                        self.load_dense_vendored_unet_with_adapters(&unet_file)?
+                        self.load_packed_unet_with_adapters(&packed_file, group_size)?
                     };
                     SdxlUnet::Vendored(Arc::new(vendored))
+                }
+                None => {
+                    let unet_file =
+                        snapshot_file(&self.root, "unet/diffusion_pytorch_model.fp16.safetensors")?;
+                    if use_flash_attn && self.adapters.is_empty() {
+                        // **Unadapted + flash only.** The fused flash-attn kernel never materializes the full
+                        // `[B·H, S, S]` scores tensor, so it does not hit the i32-overflow (sc-11154 / F-081)
+                        // and needs no additive seam; keep the stock candle UNet so the fused kernel is used
+                        // (byte-identical to pre-sc-5165). An ADAPTED render falls through to the vendored
+                        // additive path below (sc-11682): the vendored flash path is a stub, and an additive
+                        // residual over a pristine (evictable) mmap base is worth more for an adapted render
+                        // than the fused kernel — so the old stock fold path is retired and adapted renders
+                        // always take the i32-overflow-safe vendored math path.
+                        let unet =
+                            self.config
+                                .build_unet(unet_file, &self.device, 4, true, self.dtype)?;
+                        SdxlUnet::Stock(Arc::new(unet))
+                    } else {
+                        // Math-path attention (the default — no `flash-attn` feature — AND every adapted
+                        // render): the stock candle UNet materializes a full `[B·H, S, S]` scores tensor that
+                        // overflows i32 at ≥ ~1664² (2048²: `2·10·16384² ≈ 5.4e9 > i32::MAX`) and silently
+                        // corrupts on CUDA (sc-11154 / F-081). Route through the vendored UNet, whose math
+                        // attention is the i32-overflow-safe `sdpa_budgeted_flat` (bit-identical to the stock
+                        // forward per `vendored_unet_matches_stock_forward`); an adapter rides additively over
+                        // the mmap base (sc-11682), never folded.
+                        let vendored = if self.adapters.is_empty() {
+                            self.load_dense_vendored_unet(&unet_file)?
+                        } else {
+                            self.load_dense_vendored_unet_with_adapters(&unet_file)?
+                        };
+                        SdxlUnet::Vendored(Arc::new(vendored))
+                    }
                 }
             }
         };
@@ -1262,6 +1306,7 @@ mod tests {
             adapters: vec![],
             pid_spec: None,
             vae_fix: WeightsSource::File("/nonexistent/vae.safetensors".into()),
+            ldm: None,
         };
         let got = pipe.detect_packed_unet().unwrap();
         assert!(got.is_some(), "a quantization block ⇒ packed tier");
@@ -1318,6 +1363,7 @@ mod tests {
             adapters: vec![],
             pid_spec: None,
             vae_fix: WeightsSource::File("/nonexistent/vae.safetensors".into()),
+            ldm: None,
         };
         assert!(
             pipe.detect_packed_unet().is_err(),

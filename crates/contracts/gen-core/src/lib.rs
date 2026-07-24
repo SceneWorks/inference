@@ -29,6 +29,7 @@ pub mod mempolicy;
 pub mod registry;
 pub mod runtime;
 pub mod sampling;
+pub mod sdxl_ldm;
 pub mod text_embed;
 pub mod tiling;
 pub mod tokenizer;
