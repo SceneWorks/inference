@@ -90,7 +90,7 @@ pub use config::{MageFlowConfig, QwenVlTextConfig, FAMILY};
 pub use model::{descriptor_for, MageVariant, MODEL_IDS};
 // sc-14038 (text encoder) re-exports here:
 
-// sc-14039 (Mage-VAE) re-exports here:
+pub use vae::{MageVae, VaePart};
 
 // sc-14040 (NR-MMDiT) re-exports here:
 
