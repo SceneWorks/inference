@@ -100,7 +100,9 @@ pub use timestep_embedder::MageTimestepEmbedder;
 pub use transformer::{Linear, MageTransformer};
 pub use transformer_block::MageTransformerBlock;
 
-// sc-14104 (Gaussian-Shading noise) re-exports here:
+pub use latent::{
+    decode_bits, encode_noise, invert_to_noise, resolve_gs_key, GsKey, WatermarkReport,
+}; // sc-14104 (Gaussian-Shading noise)
 
 // sc-14041 (pipeline + the loaded model) re-exports here:
 
