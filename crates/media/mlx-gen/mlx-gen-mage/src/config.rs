@@ -117,8 +117,9 @@ pub const DEPTH_SINGLE_BLOCKS: usize = 0;
 /// (`mage_layers.py:521` default, applied at `:534`, `:546`, `:554`, `:556`).
 pub const NORM_EPS: f32 = 1e-6;
 
-/// Joint-attention concatenation order — `[text, image]`, `causal=False` (`mage_layers.py:424`,
-/// `:490`). Rotary embeddings are applied to the **image** q/k only (`:421-422`), matching the
+/// Joint-attention concatenation order — `[text, image]`, expressed as scatter offsets
+/// (`mage_layers.py:456-457`) consumed by the scatter at `:470-475`, not a `cat`; `causal=False`
+/// (`:490`). Rotary embeddings are applied to the **image** q/k only (`:421-422`), matching the
 /// published [`APPLY_TEXT_ROTARY_EMB`].
 pub const TEXT_STREAM_FIRST: bool = true;
 
