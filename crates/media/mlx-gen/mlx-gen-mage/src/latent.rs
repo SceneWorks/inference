@@ -463,15 +463,24 @@ mod torch_rng {
 // Cephes special functions
 // =================================================================================================
 
-/// Double-precision `ndtri` (inverse normal CDF) and `erf`/`erfc`, ported from the Cephes Math
+/// Double-precision `ndtri` (inverse normal CDF) and `erf`/`erfc`, **ported** from the Cephes Math
 /// Library — the same source PyTorch vendors for `torch.special.ndtri`
 /// (`aten/src/ATen/native/Math.h::calc_ndtri`), and the same one CPython's `math.erfc` agrees with
-/// to ~1e-16. Ported rather than approximated because the watermark's *value* depends on `ndtri`
-/// pointwise; `tests/gaussian_shading_parity.rs` pins both against reference grids captured from
-/// torch and CPython.
+/// to ~1e-16. Ported rather than reimplemented because `encode_noise` derives every latent entry
+/// through `ndtri`, so the watermark's *values* depend on this exact approximation: an independent
+/// implementation would be bit-different and would not match the parity golden. The unit tests
+/// below pin both against reference grids captured from torch float64 and CPython.
 ///
-/// > Derived from the Cephes Math Library (Release 2.8), Copyright 1984–2000 Stephen L. Moshier,
-/// > redistributed under the 3-clause BSD terms carried by PyTorch's vendored copy.
+/// # Attribution — third-party source that SHIPS
+///
+/// > Cephes Math Library Release 2.8. Copyright 1984, 1987, 1988, 1992, 2000 by Stephen L. Moshier.
+/// > Redistributed under the 3-Clause BSD terms carried by PyTorch's vendored copy — see the note
+/// > `[3-Clause BSD License for the Cephes Math Library]` in `aten/src/ATen/native/Math.h`.
+///
+/// Unlike `crates/media/mlx-gen/_vendor/` (Python, dev-only, never shipped), this **is** production
+/// Rust and does travel in binary bundles, which BSD-3 clause 2 makes a distribution obligation.
+/// The canonical record is the "Ported third-party source" section of `crates/media/mlx-gen/NOTICE`;
+/// this comment is the in-source duplicate. **Do not delete either without the other.**
 mod cephes {
     /// `polevl(x, A, len(A) − 1)` — Horner over every coefficient.
     fn polevl(x: f64, coeffs: &[f64]) -> f64 {
@@ -1079,7 +1088,7 @@ mod tests {
     #[test]
     fn torch_uniform_stream_is_bit_exact() {
         #[rustfmt::skip]
-        const CASES: [(i64, [f64; 8]); 4] = [
+        const CASES: [(i64, [f64; 8]); 5] = [
             (42, [
                 0.058_154_485_961_429_69, 0.062_910_167_424_577_56, 0.123_586_072_774_409_03,
                 0.052_580_164_361_077_04, 0.526_171_896_854_761_8, 0.476_784_753_787_479_64,
@@ -1100,6 +1109,13 @@ mod tests {
                 0.057_976_206_743_579_62, 0.064_231_526_648_305_67, 0.926_094_780_492_096_1,
                 0.911_943_764_871_210_5, 0.075_837_683_337_990_57,
             ]),
+            // The masked form of seed −42; see `the_seed_is_masked_to_31_bits_like_the_reference`,
+            // which closes the chain from the caller's seed to this stream.
+            (2_147_483_606, [
+                0.523_223_406_858_217_1, 0.841_656_030_067_571_4, 0.290_171_702_504_080_64,
+                0.514_378_865_349_973_6, 0.763_043_830_002_111_4, 0.252_860_389_919_254_5,
+                0.046_423_927_777_907_936, 0.364_753_652_217_439_4,
+            ]),
         ];
         for (seed, want) in CASES {
             let mut gen = torch_rng::Mt19937::new((seed as u64 & 0x7FFF_FFFF) as u32);
@@ -1110,6 +1126,28 @@ mod tests {
                 "torch uniform stream diverged at seed {seed}"
             );
         }
+    }
+
+    /// `mage_latent.py:83` seeds the generator with `int(seed) & 0x7FFFFFFF`, so seeds at or above
+    /// 2³¹ alias down and the reference's documented `seeds=-1` "random" sentinel becomes
+    /// 2 147 483 647. Every seed pinned in the stream table above is ≤ 0x7FFFFFFF, where the mask is
+    /// the identity — so the mask itself is only tested here, by the aliasing it must produce.
+    /// SceneWorks routinely passes seeds ≥ 2³¹, and dropping the mask breaks the first two cases
+    /// (a bare `as u32` truncation leaves 2³¹ and −1 as distinct 32-bit values).
+    #[test]
+    fn the_seed_is_masked_to_31_bits_like_the_reference() {
+        let key = GsKey::default();
+        let at = |seed: i64| encode_noise_host((4, 4, 4), &key, seed).unwrap();
+        assert_eq!(at(2_147_483_648), at(0), "2^31 must alias to 0");
+        assert_eq!(at(-1), at(2_147_483_647), "the `seeds=-1` sentinel");
+        assert_eq!(
+            at(-42),
+            at(2_147_483_606),
+            "negative seeds fold two's-complement"
+        );
+        assert_eq!(at(4_294_967_338), at(42), "2^32 + 42");
+        // The stream for 2 147 483 606 is pinned above, so seed −42 is nailed end to end.
+        assert_ne!(at(0), at(1));
     }
 
     /// `np.random.default_rng(key).integers(...)` — the pad, then the index map, from one stream.

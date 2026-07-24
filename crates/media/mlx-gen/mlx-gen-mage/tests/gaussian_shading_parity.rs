@@ -182,6 +182,53 @@ fn encode_noise_lifts_to_mlx_at_both_pipeline_dtypes() {
     );
 }
 
+/// The `clamp(1e-6, 1 − 1e-6)` on the inverse-normal-CDF argument (`mage_latent.py:86`) is
+/// **reachable in production and unreachable in the golden** — the same trap class as the
+/// `TXT_MAX_LENGTH` gap recorded on sc-14037: a golden whose inputs are too small to exercise a
+/// guard. Measured against the real torch reference at seed 42:
+///
+/// | geometry | latent entries | entries that clamp |
+/// |---|---|---|
+/// | 256² (the golden) | 32 768 | **0** — min argument 3.75e-5, 37× clear of the bound |
+/// | 1024² (the epic default) | 524 288 | **2** (high side) |
+/// | 2048² (the native-res cap) | 2 097 152 | **5** (2 low, 3 high) |
+///
+/// So the committed golden structurally cannot catch a clamp regression at the resolutions we
+/// actually target, and without this test both widening the bound to `1e-5` and deleting the clamp
+/// outright pass the whole suite. Each pinned entry below is a value the reference produces *only*
+/// with the `1e-6` bound in place.
+#[test]
+fn the_argument_clamp_binds_at_production_resolutions() {
+    let key = GsKey::default();
+
+    // Low side, cheaply: at the golden's own 256² geometry, seed 20 drives one argument to
+    // 2.2530e-9. Clamped it is Φ⁻¹(1e-6) = −4.753424; unclamped it would be −5.864458, and under a
+    // 1e-5 bound −4.264891.
+    let low = encode_noise_host(GOLDEN_SHAPE, &key, 20).unwrap();
+    assert_eq!(low[5_833] as f32, -4.753_424, "low clamp at 256², seed 20");
+
+    // High side at the epic's default 1024². Two entries with *different* arguments
+    // (1 − 2.238e-7 and 1 − 8.835e-7) collapse to the same Φ⁻¹(1 − 1e-6) — that coincidence IS the
+    // clamp's signature. Unclamped they would be 5.047527 and 4.778405.
+    let high = encode_noise_host((128, 64, 64), &key, GOLDEN_SEED).unwrap();
+    assert_eq!(high[252_919] as f32, 4.753_424, "high clamp #1 at 1024²");
+    assert_eq!(high[500_143] as f32, 4.753_424, "high clamp #2 at 1024²");
+    assert_eq!(
+        high[252_919], high[500_143],
+        "both pinned to the same bound"
+    );
+
+    // Ordinary entries of the same tensor, so this also pins the 524 288-length draw sequence
+    // rather than only the two exceptional values.
+    assert_eq!(high[262_144] as f32, 0.323_487_46);
+    assert_eq!(high[524_287] as f32, -1.639_861_7);
+
+    // ...and the golden's own geometry never reaches the bound, which is exactly why it is blind
+    // here: a clamped entry is |4.753424|, and the golden's extrema are 4.147059 / −3.959779.
+    let golden = encode_noise_host(GOLDEN_SHAPE, &key, GOLDEN_SEED).unwrap();
+    assert!(golden.iter().all(|v| v.abs() < 4.75));
+}
+
 // =================================================================================================
 // (b) detection: `invert_to_noise` + `decode_bits`
 // =================================================================================================
@@ -251,19 +298,25 @@ fn the_watermark_survives_a_flow_ode_round_trip() {
         .reshape(&[1, tokens, c])
         .unwrap();
 
-    // v(x, σ) = κ·x + drift. Deterministic, elementwise, and large enough that the clean latent is
-    // dominated by the drift rather than by ε — otherwise the "no inversion" control below would
-    // trivially detect through the linearity.
+    // v(x, σ) = κ·σ·x + drift·(0.5 + σ). Deterministic and elementwise, but **σ-dependent on both
+    // terms** — that is deliberate and load-bearing. A velocity that ignored σ would make the
+    // integrator blind to its own two most error-prone details: traversing the ladder in the wrong
+    // direction, and perturbing Δσ, would both cancel out and the whole suite would still pass.
+    // The drift also dominates ε, so the "no inversion" control below is not trivially detecting
+    // through the linearity.
     const KAPPA: f32 = 1.0;
     let drift_host: Vec<f32> = (0..n)
         .map(|i| 3.0 * ((i as f32) * 0.7).sin() + 1.5 * ((i as f32) * 0.13).cos())
         .collect();
-    let drift = Array::from_slice(&drift_host, &[1, tokens, c])
-        .as_dtype(Dtype::Bfloat16)
-        .unwrap();
-    let velocity = |x: &Array, _sigma: f32| -> Result<Array> {
-        let kappa = Array::from_slice(&[KAPPA], &[1]).as_dtype(Dtype::Bfloat16)?;
-        Ok(x.multiply(&kappa)?.add(&drift)?)
+    let drift = Array::from_slice(&drift_host, &[1, tokens, c]);
+    let velocity = |x: &Array, sigma: f32| -> Result<Array> {
+        let a = Array::from_slice(&[KAPPA * sigma], &[1]);
+        let b = Array::from_slice(&[0.5 + sigma], &[1]);
+        // Computed in float32 and returned at bfloat16, like a real model forward.
+        Ok(x.as_dtype(Dtype::Float32)?
+            .multiply(&a)?
+            .add(drift.multiply(&b)?)?
+            .as_dtype(Dtype::Bfloat16)?)
     };
 
     let sigmas = sigma_ladder(30);
@@ -304,6 +357,26 @@ fn the_watermark_survives_a_flow_ode_round_trip() {
     assert!(
         max_abs > 1e-3,
         "the synthetic flow must leave a real inversion residual, got max_abs {max_abs}"
+    );
+
+    // Pin the recovered TENSOR, not only the decode statistics. The decode is a sign vote with
+    // enormous redundancy, so it survives large perturbations of the integrator: without these
+    // equalities, reversing the ladder or rounding Δσ to bfloat16 before the multiply (the ~0.4%
+    // per-step error fixed in 041e208f) both leave every statistical assertion above satisfied.
+    // These values come from this implementation, so they are a change-detector rather than a
+    // parity oracle — the parity oracle for the integrator itself is sc-14041, with the real model.
+    // Every value is bfloat16-exact, so they are not sensitive to float accumulation order.
+    #[rustfmt::skip]
+    const RECOVERED: [(usize, f32); 8] = [
+        (0, -1.921_875), (1, 0.011_840_82), (2, 0.192_382_81), (777, -1.281_25),
+        (4_095, -0.065_917_97), (6_000, 0.890_625), (8_190, 0.906_25), (8_191, 1.968_75),
+    ];
+    for (i, want) in RECOVERED {
+        assert_eq!(rec_f32[i], want, "recovered noise entry {i}");
+    }
+    assert!(
+        (max_abs - 0.222_656_25).abs() < 1e-6,
+        "inversion residual moved: {max_abs}"
     );
 
     let report = decode_bits(&recovered, &key).unwrap();
@@ -386,6 +459,60 @@ fn detection_rejects_unwatermarked_noise_and_the_wrong_key() {
     assert!(right.present);
 }
 
+/// numpy's `argmax` returns the **first** maximum, so a message bit with no votes — or with tied
+/// votes — resolves to 0, never 1. `decode_bits` implements that as `v[1] > v[0]`; the
+/// natural-looking `>=` is a *different decoder*, and every other test in this file tolerates it
+/// because they run at redundancies where no bit goes unvoted.
+///
+/// At n = 256 the redundancy is one vote per bit on average and **91 of the 256 bits go unvoted**,
+/// where the two rules disagree on all 91 (measured against the vendored `decode_bits`). Pinning
+/// `msg_hat` exactly here is what turns the tie rule from a comment into a tested decision.
+#[test]
+fn the_tie_rule_follows_numpys_first_maximum() {
+    let key = GsKey::default();
+    let host: Vec<f32> = encode_noise_host((4, 8, 8), &key, GOLDEN_SEED)
+        .unwrap()
+        .iter()
+        .map(|&v| v as f32)
+        .collect();
+    let report = decode_bits_host(&host, &key).unwrap();
+    assert_eq!(report.n, 256);
+    // Every *sign* matches — the latent is pristine. The message is nevertheless only partly
+    // recoverable, because recovery needs coverage, not accuracy.
+    assert_eq!(report.raw_acc, 1.0);
+    assert!(
+        (report.msg_acc - 206.0 / 256.0).abs() < 1e-12,
+        "msg_acc {} (the vendored decoder reports 206/256 here)",
+        report.msg_acc
+    );
+    assert_ne!(report.msg_hat, report.msg);
+
+    // `mage_flow.models.modules.mage_latent.decode_bits(...)["msg_hat"]`, packed LSB-first per byte.
+    #[rustfmt::skip]
+    const MSG_HAT: [u8; 32] = [
+        0x9c, 0xb0, 0x82, 0x11, 0x90, 0x18, 0x60, 0xd1, 0x34, 0x01, 0x90, 0x43, 0xe4, 0x78, 0x2c,
+        0x7c, 0x01, 0x42, 0xe1, 0xb6, 0xb0, 0x29, 0x48, 0x67, 0x22, 0x24, 0x00, 0xb2, 0x00, 0x15,
+        0x00, 0xee,
+    ];
+    let want: Vec<u8> = (0..GS_MESSAGE_BITS)
+        .map(|i| (MSG_HAT[i / 8] >> (i % 8)) & 1)
+        .collect();
+    assert_eq!(
+        report.msg_hat, want,
+        "tie rule: unvoted bits must resolve to 0"
+    );
+
+    // With real redundancy the payload does come back exactly, so this is a coverage property of
+    // the size, not a defect of the decoder.
+    let big: Vec<f32> = encode_noise_host((128, 16, 16), &key, GOLDEN_SEED)
+        .unwrap()
+        .iter()
+        .map(|&v| v as f32)
+        .collect();
+    let big_report = decode_bits_host(&big, &key).unwrap();
+    assert_eq!(big_report.msg_hat, big_report.msg);
+}
+
 #[test]
 fn invert_to_noise_rejects_malformed_inputs() {
     let sigmas = sigma_ladder(4);
@@ -414,21 +541,72 @@ fn invert_to_noise_rejects_malformed_inputs() {
 /// (`mage_latent.py:13-15`). Porting that would trip the epic-13657 guardrail in
 /// `scripts/check-workspace.py`, which forbids production env side channels and path derivation in
 /// this repository — so the key arrives through [`mlx_gen_mage::latent::resolve_gs_key`] instead.
-/// This is the file that would have grown the side channel, so the ban is asserted, not assumed.
+/// This is the file that would have grown the side channel, so the ban is asserted, not assumed —
+/// and it is the *only* thing standing there: `check-workspace.py`'s `DELETED_ENV_SIDE_CHANNELS`
+/// list does not know about `MAGEFLOW_GS_KEY`, since the variable was never in this repository.
+///
+/// Needle-based, so it is a tripwire rather than a proof: it catches the realistic regression
+/// (someone reaching for the reference's `expanduser` + env pattern) and any filesystem or process
+/// -environment access at all, but a hardcoded literal path would still slip through. Widening it
+/// further would start false-positiving on the prose above, which names both side channels
+/// deliberately.
 #[test]
 fn the_watermark_module_reads_no_env_var_and_derives_no_path() {
     let src = include_str!("../src/latent.rs");
     for needle in [
+        // process environment
         concat!("env", "::", "var"),
         concat!("std::", "env"),
+        concat!("var", "_os"),
+        concat!("get", "env"),
+        // home / config directory derivation
         concat!("home_", "dir"),
         concat!("dirs", "::"),
+        concat!("expand", "user"),
+        // filesystem access of any kind
+        concat!("std::", "fs"),
+        concat!("Path", "Buf"),
+        concat!("Path", "::new"),
+        concat!("File", "::open"),
+        concat!("include_", "str!"),
     ] {
         assert!(
             !src.contains(needle),
             "src/latent.rs must not contain `{needle}` — epic-13657 self-fetch boundary"
         );
     }
+}
+
+/// The Cephes `ndtri`/`erf`/`erfc` port carries Moshier's coefficient tables verbatim and **ships**
+/// in binary bundles, which BSD-3 clause 2 makes a distribution obligation. Nothing in CI enforces
+/// `NOTICE` — `cargo deny check licenses` only inspects Cargo dependencies, and no workflow or
+/// script references the file — so this test is the enforcement point.
+///
+/// It also guards the wording: the crate NOTICE used to state flatly that *no* source code is
+/// copied into the shipped Rust crates, which this port made false.
+#[test]
+fn the_cephes_port_is_attributed_in_the_crate_notice() {
+    let notice = include_str!("../../NOTICE");
+    for needle in [
+        "Ported third-party source (IN the shipped Rust crates)",
+        "Cephes Math Library Release 2.8",
+        "Stephen L. Moshier",
+        "BSD 3-Clause",
+        "mlx-gen-mage/src/latent.rs",
+        "DOES ship in binary bundles",
+    ] {
+        assert!(
+            notice.contains(needle),
+            "crates/media/mlx-gen/NOTICE must record `{needle}` for the Cephes port"
+        );
+    }
+    // The blanket "nothing is copied" claim must stay qualified.
+    let blanket =
+        "No source code from the\nprojects listed below is copied into the shipped Rust crates";
+    assert!(
+        !notice.contains(blanket) || notice.contains("The one exception"),
+        "the NOTICE's no-source-copied claim must name the Cephes exception"
+    );
 }
 
 // =================================================================================================

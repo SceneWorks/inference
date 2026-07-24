@@ -10,14 +10,43 @@ projects listed below is copied into the shipped Rust crates; they are
 gratefully acknowledged as the architectural lineage, references, and parity
 baselines it was developed against:
 
+(The one exception — a numerical routine deliberately ported rather than
+reimplemented — is recorded under "Ported third-party source" below.)
+
   * Apple MLX               https://github.com/ml-explore/mlx           (MIT)
   * mlx-rs                  https://crates.io/crates/mlx-rs             (Apache-2.0 OR MIT)
   * mflux (Filip Strand)    https://github.com/filipstrand/mflux        (MIT)
   * Apple mlx-examples      https://github.com/ml-explore/mlx-examples  (MIT)
   * Hugging Face Diffusers  https://github.com/huggingface/diffusers    (Apache-2.0)
 
-Vendored third-party source
----------------------------
+Ported third-party source (IN the shipped Rust crates)
+-----------------------------------------------------
+
+  * Cephes Math Library Release 2.8          (BSD 3-Clause)
+    Copyright 1984, 1987, 1988, 1992, 2000 by Stephen L. Moshier.
+
+    `mlx-gen-mage/src/latent.rs` (module `latent::cephes`) contains a Rust port
+    of the Cephes double-precision `ndtri` (inverse normal CDF) and `erf`/`erfc`
+    routines, including their coefficient tables verbatim. This is production
+    code and DOES ship in binary bundles.
+
+    Grant relied upon: PyTorch redistributes these routines under the
+    "3-Clause BSD License for the Cephes Math Library" (see
+    `aten/src/ATen/native/Math.h`, note `[3-Clause BSD License for the Cephes
+    Math Library]`); this port follows `calc_ndtri` from that file and the
+    matching Cephes `ndtr.c` for `erf`/`erfc`.
+
+    Why ported and not reimplemented: `mage_latent.encode_noise` derives every
+    latent entry through `torch.special.ndtri`, so the watermark's *values*
+    depend on this exact approximation. An independent implementation would be
+    bit-different and the ported result would not match the parity golden.
+
+    BSD 3-Clause requires this notice to accompany binary redistributions;
+    it is reproduced here for that purpose, and the same attribution is
+    repeated at the module in source.
+
+Vendored third-party source (NOT shipped)
+-----------------------------------------
 
 One frozen third-party reference implementation IS redistributed with this
 crate, under `_vendor/`. It is a dev-only parity oracle: it is Python, it is
