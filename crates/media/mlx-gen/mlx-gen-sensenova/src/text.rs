@@ -94,7 +94,7 @@ pub fn build_neo1_query(prompt: &str, system_message: &str) -> String {
 /// ([`ChatTemplate::None`]).
 ///
 /// Prefers `<root>/tokenizer.json`, and falls back to a **sibling tier's** copy when this tier ships
-/// none (sc-14432 — [`resolve_tokenizer_path`]). The base `SceneWorks/sensenova-u1-8b-mlx` re-host
+/// none (sc-14432 — `resolve_tokenizer_path`). The base `SceneWorks/sensenova-u1-8b-mlx` re-host
 /// shipped `tokenizer.json` ONLY in `q8/`, so its `q4/`/`bf16/` tiers reported "complete" (the
 /// `<tier>/*` download glob resolved fine) yet failed to load. Borrowing a sibling's is byte-correct —
 /// the tokenizer is model-wide, identical across quant tiers.
