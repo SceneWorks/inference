@@ -17,9 +17,9 @@ carries no licensed data. Same pattern as `mlx-gen-z-image`'s `dump_zblock_small
 Two packings are dumped, because they exercise different code:
 
 * `gen`  — the fused-CFG generation pack: two attention segments, one `img_shapes` entry each.
-* `edit` — the edit pack: ONE attention segment carrying TWO `img_shapes` entries
-           (`[target, ref]`, `pipeline.py:517-519`), which is the only configuration where the
-           msrope **frame axis** changes the attention scores rather than cancelling.
+* `edit` — the edit pack (`pipeline.py:517-519`): ONE attention segment carrying FOUR
+           `img_shapes` entries (`[target, ref×3]`), which is the only configuration where the
+           msrope **frame axis** changes the attention scores by more than a rounding step.
 
 Run from the reference venv (see `_vendor/VENDORED.md`):
 
