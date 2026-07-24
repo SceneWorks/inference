@@ -245,7 +245,10 @@ fn check_decode(
     let latent = g.require(key_latent).unwrap().clone();
     let want = g.require(key_expected).unwrap();
 
+    mlx_rs::memory::reset_peak_memory();
     let got = v.decode(&latent).unwrap();
+    mlx_rs::transforms::eval([&got]).unwrap();
+    let peak = mlx_rs::memory::get_peak_memory() as f64 / 1e9;
     assert_eq!(got.shape(), want.shape(), "{size} {key_expected} geometry");
     maybe_dump_ppm(&format!("{key_expected}_{size}_{}", dt.label()), &got);
 
@@ -253,7 +256,7 @@ fn check_decode(
     let (tol_mx, tol_mn) = dt.tolerance();
     println!(
         "  {size} [{}] {key_expected}: max_abs {mx:.6} (< {tol_mx})  mean_abs {mn:.6} (< {tol_mn})  \
-         frac>10x_mean {:.3e}",
+         frac>10x_mean {:.3e}  peak {peak:.2} GB",
         dt.label(),
         frac_above(&got, want, 10.0 * mn)
     );
@@ -329,7 +332,21 @@ fn no_large_decode_corruption() {
     let v = vae(true);
     let latent = g.require("enc_latent").unwrap().clone();
     let want = g.require("dec_from_latent").unwrap();
+
+    // Report MLX's own peak allocation across the decode. `ps`-style RSS does not see Metal's
+    // unified buffers, so this is the figure sc-14046's fit gate / memory coefficients want. The
+    // dominant intermediate is the per-pixel stream: [B·L, P², in+hidden_x+max_freqs²] — at 2048
+    // that is 16384 × 256 × 99 f32 ≈ 1.66 GB, which is why it is worth having a number for.
+    mlx_rs::memory::reset_peak_memory();
+    let before = mlx_rs::memory::get_active_memory();
     let got = v.decode(&latent).unwrap();
+    mlx_rs::transforms::eval([&got]).unwrap();
+    let peak = mlx_rs::memory::get_peak_memory();
+    println!(
+        "{size} decode: peak {:.2} GB (model resident {:.2} GB)",
+        peak as f64 / 1e9,
+        before as f64 / 1e9
+    );
 
     let report = corruption_report(&got, want);
     report.print(size);
