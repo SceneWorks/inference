@@ -2102,6 +2102,7 @@ dependencies = [
  "mlx-gen-krea",
  "mlx-gen-lens",
  "mlx-gen-ltx",
+ "mlx-gen-mage",
  "mlx-gen-mochi",
  "mlx-gen-pid",
  "mlx-gen-pulid",
@@ -2261,6 +2262,16 @@ dependencies = [
  "mlx-gen",
  "pmetal-mlx-rs",
  "serde_json",
+]
+
+[[package]]
+name = "mlx-gen-mage"
+version = "0.0.0"
+dependencies = [
+ "mlx-gen",
+ "pmetal-mlx-rs",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]
