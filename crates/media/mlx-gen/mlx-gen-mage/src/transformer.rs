@@ -19,3 +19,10 @@
 //!
 //! The output is the flow-matching **velocity**; the sampler ([`crate::pipeline`]) applies
 //! `x += (σ_next − σ_cur) · v`.
+//!
+//! ## Weight loading
+//!
+//! There is no shared `loader.rs` (see the decision note in `lib.rs`): `load_transformer` belongs
+//! in **this file**, beside the module it constructs, so the concurrent text-encoder and VAE ports
+//! never touch a file this story owns. The transformer is a single
+//! `transformer/diffusion_pytorch_model.safetensors`, bf16, loaded non-strict (`pipeline.py:748`).

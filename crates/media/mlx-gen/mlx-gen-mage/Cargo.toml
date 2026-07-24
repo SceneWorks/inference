@@ -8,18 +8,29 @@ repository = "https://github.com/michaeltrefry/mlx-gen"
 keywords = ["mlx", "apple-silicon", "image", "mage-flow", "inference"]
 categories = ["science"]
 
+# PARALLEL-EXECUTION NOTE (sc-14037): every dependency the text-encoder (sc-14038), Mage-VAE
+# (sc-14039) and NR-MMDiT (sc-14040) ports need is declared here up front, so those three never
+# contend over this manifest. **sc-14104 is the one exception** — see the `sha2` note below: it
+# still needs a seeded RNG this workspace does not yet carry, so it will edit this file. If two of
+# these stories are in flight at once, sc-14104 owns the manifest.
 [dependencies]
 mlx-gen = { path = ".." }
 # Must match the core crate's MLX binding exactly (shared `Array` type). See root Cargo.toml.
-# Declared by the scaffold (sc-14037) rather than by each porting story so the text-encoder
-# (sc-14038), VAE (sc-14039) and DiT (sc-14040) ports — which land in parallel — never contend
-# over this manifest.
 mlx-rs = { workspace = true }
 # `transformer/config.json` / `vae/config.json` / `scheduler/scheduler_config.json` parsing
 # (matches the sdxl/wan/ltx/flux2/lens provider convention: `serde_json::Value`, no derive).
 serde_json = { workspace = true }
-
-[dev-dependencies]
-# Byte tripwire for the committed config fixtures: they must stay identical to the published
-# `microsoft/Mage-Flow*` files the constants in `config.rs` are transcribed from (sc-14037).
+# PRODUCTION dependency, not dev-only: the Gaussian-Shading watermark (sc-14104) expands its
+# payload to a 256-bit message with SHA-256 (`_vendor/mage_flow/models/modules/mage_latent.py:59-60`)
+# and hashes non-numeric keys the same way (`:26`). Also used by the test suite as the byte tripwire
+# on the committed config fixtures.
 sha2 = { workspace = true }
+
+# NOTE for sc-14104 — the ONE dependency this scaffold could not pre-declare. Bit-exact watermark
+# parity needs two RNG streams the reference mixes: `np.random.default_rng(key)` (PCG64 + numpy
+# SeedSequence) for the XOR pad and message-index map (`mage_latent.py:68-71`), and a seeded
+# `torch.Generator` (MT19937) for the per-entry uniforms (`:76-91`). Neither is in this workspace's
+# graph, and no crate here reproduces numpy's SeedSequence or torch's uniform draw out of the box.
+# Deliberately NOT guessed at here: picking the wrong crate would look like coverage while
+# silently producing a different noise tensor. sc-14104 chooses it, justifies it against the
+# golden, and adds it below.

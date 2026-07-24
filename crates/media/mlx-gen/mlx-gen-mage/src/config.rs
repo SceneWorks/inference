@@ -7,9 +7,12 @@
 //! file.
 //!
 //! Every value below is transcribed from the published `microsoft/Mage-Flow*` component configs
-//! (all six repos ship **byte-identical** `transformer/config.json`, `vae/config.json` and
-//! `scheduler/scheduler_config.json` — see `tests/config_conformance.rs`, which pins their SHA-256)
-//! or from the vendored reference at `crates/media/mlx-gen/_vendor/mage_flow/`, cited `file:line`.
+//! (all six repos ship **byte-identical** `transformer/config.json`, `vae/config.json`,
+//! `scheduler/scheduler_config.json` and `text_encoder/config.json`) or from the vendored reference
+//! at `crates/media/mlx-gen/_vendor/mage_flow/`, cited `file:line`. **Nothing here is checked
+//! against itself:** `tests/config_conformance.rs` pins all four fixtures by SHA-256 and pins every
+//! constant with no config home — the whole timestep-embedder block, the joint-attention order, the
+//! VL long-edge cap, the native-resolution bounds — against the vendored source.
 //!
 //! ## The config-strip trap
 //!
@@ -108,29 +111,85 @@ pub const GUIDANCE_EMBED: bool = false;
 /// joint self-attention with modality-specific norms/projections).
 pub const DEPTH_SINGLE_BLOCKS: usize = 0;
 
-/// `eps` for every `LayerNorm(elementwise_affine=False)` / `RMSNorm` in the DiT
-/// (`mage_flow.py:74`, `:90`; `mage_layers.py`).
+/// `eps` for every `LayerNorm(elementwise_affine=False)` / `RMSNorm` in the DiT: `txt_norm`
+/// (`mage_flow.py:74`), `norm_out` (`:90`, which **overrides** `AdaLayerNormContinuous`'s own
+/// `1e-5` default at `mage_layers.py:693`), and the block's four non-affine LayerNorms
+/// (`mage_layers.py:521` default, applied at `:534`, `:546`, `:554`, `:556`).
 pub const NORM_EPS: f32 = 1e-6;
 
 /// Joint-attention concatenation order — `[text, image]`, `causal=False` (`mage_layers.py:424`,
 /// `:490`). Rotary embeddings are applied to the **image** q/k only (`:421-422`), matching the
-/// published `apply_text_rotary_emb: false`.
+/// published [`APPLY_TEXT_ROTARY_EMB`].
 pub const TEXT_STREAM_FIRST: bool = true;
 
+// --- Architecture selectors -----------------------------------------------------------------
+//
+// These SELECT the architecture, and the reference hardcodes every one of them: `MageFlow.__init__`
+// builds `MageFlowEmbedRope` / `MageFlowTimestepProjEmbeddings` / `MageFlowTransformerBlock`
+// unconditionally (`mage_flow.py:72`, `:77`, `:79-88`) and never branches on the published key.
+// They are the *more* consequential half of the strip-set: a checkpoint declaring
+// `rope_type: "3d_rope"` or `apply_text_rotary_emb: true` would be run by a naive port as if it had
+// said the opposite — silently, with no shape mismatch to catch it. Verified — never read — by
+// [`MageFlowConfig::from_transformer_config_json`]; see [`pinned_config_keys`].
+
+/// The rotary scheme: 3-axis multimodal RoPE. Selects [`crate::rope_embedder`].
+pub const ROPE_TYPE: &str = "msrope";
+
+/// The timestep-conditioning scheme. Selects [`crate::timestep_embedder`].
+pub const TIME_TYPE: &str = "qwen_proj";
+
+/// Every block is dual-stream; see [`DEPTH_SINGLE_BLOCKS`].
+pub const DOUBLE_BLOCK_TYPE: &str = "double_stream";
+
+/// **The text stream is never rotated.** Load-bearing on the attention port
+/// ([`crate::attention`]): msrope reaches the image q/k only (`mage_layers.py:421-422`).
+pub const APPLY_TEXT_ROTARY_EMB: bool = false;
+
+/// No pooled-vector conditioning input. The DiT has no `vec_in` projection at all — it zeroes the
+/// pooled text vector outright (`mage_flow.py:116`), so a non-zero width here would describe a
+/// model this port cannot represent.
+pub const VEC_IN_DIM: i32 = 0;
+
+/// …and correspondingly no pooled-vector *kind* (`"vec_type": null`).
+pub const VEC_TYPE: Option<&str> = None;
+
+/// The published schedule declaration — the literal reason `mlx-gen-z-image` is this crate's
+/// structural template. Consumed by [`STATIC_SHIFT`] / [`USE_DYNAMIC_SHIFTING`], not by a branch.
+pub const SCHEDULE_MODE: &str = "z-image";
+
+/// `use_time_shift` — false; the shift is the static ladder, never a per-sample time shift.
+pub const USE_TIME_SHIFT: bool = false;
+
+/// Native-resolution sequence packing is always on (`pipeline.py:745`, defaulted `True`).
+pub const PACKING: bool = true;
+
+// --- Timestep embedder ----------------------------------------------------------------------
+
 /// Sinusoidal timestep-embedding width feeding `TimestepEmbedding(→ hidden_size)`
-/// (`mage_layers.py:89-96`).
+/// (`mage_layers.py:93-94`).
 pub const FREQUENCY_EMBEDDING_SIZE: i32 = 256;
 
-/// `Timesteps(..., scale=1000, ...)`: the DiT is fed the scheduler **sigma ∈ [0, 1]** directly
-/// (`pipeline.py:189`), scaled by this inside the embedder — not a 0..1000 timestep index.
+/// `Timesteps(..., scale=1000, ...)` (`mage_layers.py:93`): the DiT is fed the scheduler
+/// **sigma ∈ [0, 1]** directly (`pipeline.py:189`), scaled by this inside the embedder — not a
+/// 0..1000 timestep index.
 pub const TIMESTEP_SCALE: f32 = 1000.0;
 
-/// `Timesteps(..., max_period=10000, flip_sin_to_cos=True, downscale_freq_shift=0)`.
+/// `get_timestep_embedding(..., max_period=10000)` (`mage_layers.py:30`), with
+/// `flip_sin_to_cos=True` / `downscale_freq_shift=0` (`mage_layers.py:93`).
 pub const TIMESTEP_MAX_PERIOD: f32 = 10_000.0;
 
-/// The sinusoidal frequency table is **deliberately rounded to bf16** before use
-/// (`mage_layers.py:45`) — the model was trained with that rounding, so an f32 table is a
-/// divergence, not an improvement.
+/// `flip_sin_to_cos=True` (`mage_layers.py:93`): the concatenated `[sin, cos]` halves are swapped
+/// to `[cos, sin]` (`mage_layers.py:56-58`).
+pub const TIMESTEP_FLIP_SIN_TO_COS: bool = true;
+
+/// `downscale_freq_shift=0` (`mage_layers.py:93`): the exponent denominator is `half_dim - 0`.
+pub const TIMESTEP_DOWNSCALE_FREQ_SHIFT: f32 = 0.0;
+
+/// The sinusoidal frequency table is **deliberately rounded to the timestep dtype (bf16)** before
+/// the outer product — `emb = torch.exp(exponent).to(timesteps.dtype)` (`mage_layers.py:45`). The
+/// reference keeps its own copy of this function rather than diffusers' precisely because of that
+/// downcast (`mage_layers.py:32-36`): the model was trained with the rounding, so an f32 table is
+/// a divergence, not an improvement.
 pub const TIMESTEP_FREQS_BF16: bool = true;
 
 // ---------------------------------------------------------------------------------------------
@@ -235,13 +294,36 @@ impl QwenVlTextConfig {
     }
 }
 
-/// `rms_norm_eps` of the Qwen3-VL LM.
+/// `rms_norm_eps` of the Qwen3-VL LM (`text_encoder/config.json → text_config`).
 pub const TE_RMS_NORM_EPS: f32 = 1e-6;
-/// `rope_theta` of the Qwen3-VL LM.
+/// `rope_theta` of the Qwen3-VL LM — five **million**, not five hundred thousand.
 pub const TE_ROPE_THETA: f64 = 5_000_000.0;
 /// `hidden_act` of the Qwen3-VL LM: SwiGLU with a SiLU gate. (The **DiT** does not share this —
 /// see [`FFN_ACTIVATION`].)
 pub const TE_HIDDEN_ACT: &str = "silu";
+
+/// Tokenizer truncation budget **before** the system-prompt drop, read from the published
+/// `transformer/config.json` `"txt_max_length"` (`pipeline.py:745`) and handed to the encoder as
+/// `tokenizer_max_length` (`mage_flow.py:256` → `text_encoder.py:430`, `:439`).
+///
+/// **The effective per-prompt token cap is `TXT_MAX_LENGTH + drop_idx`**, not this value:
+/// `pipeline.py:225` computes `max_len = txt_enc.tokenizer_max_length + drop_idx` and `:226-228`
+/// truncates the *templated* prompt there — so **2082 tokens for generation** and **2112 for
+/// editing**, leaving 2048 conditioning tokens either way once the template prefix is dropped.
+/// Use [`max_prompt_tokens`] rather than re-deriving it.
+///
+/// Two traps this constant exists to defuse, neither of which any parity golden can catch (they
+/// all use short prompts): the reference's `ModelConfig` dataclass default is a misleading
+/// **4096** (`mage_flow.py:31`) that `load_from_repo` always overrides with the published 2048,
+/// and the `+ drop_idx` term is applied one call away from where the budget is defined.
+pub const TXT_MAX_LENGTH: usize = 2048;
+
+/// The effective truncation length for a **templated** prompt: [`TXT_MAX_LENGTH`] plus the
+/// system-prompt tokens that will be dropped afterwards (`pipeline.py:225`). 2082 for generation
+/// ([`DROP_IDX_GEN`]), 2112 for editing ([`DROP_IDX_EDIT`]).
+pub const fn max_prompt_tokens(drop_idx: usize) -> usize {
+    TXT_MAX_LENGTH + drop_idx
+}
 
 /// System-prompt tokens dropped from the front of the encoded sequence for the **generation**
 /// template (`utils.py:55`, `PROMPT_TEMPLATE["mage-flow"].start_idx`).
@@ -273,32 +355,23 @@ pub const VL_COND_LONG_EDGE: u32 = 384;
 // Gaussian-Shading watermark (sc-14104)
 // ---------------------------------------------------------------------------------------------
 
-/// Default Gaussian-Shading key (`mage_latent.py:19`). The reference also honours a
-/// `MAGEFLOW_GS_KEY` env var and a `~/.mageflow/gs_key` keyfile; **neither is ported** — this
-/// repository derives no paths and reads no production env side channels (`check-workspace.py`
-/// epic-13657 guardrail), so sc-14104 must surface the key through `LoadSpec`/the request instead.
+/// Default Gaussian-Shading key (`mage_latent.py:16`). The reference also honours a
+/// `MAGEFLOW_GS_KEY` env var and a `~/.mageflow/gs_key` keyfile (`mage_latent.py:13-15`);
+/// **neither is ported** — this repository derives no paths and reads no production env side
+/// channels (`check-workspace.py` epic-13657 guardrail), so sc-14104 must surface the key through
+/// `LoadSpec`/the request instead.
 pub const GS_DEFAULT_KEY: u64 = 20_260_720;
 
-/// Watermark payload (`mage_latent.py:10`), SHA-256-expanded to [`GS_MESSAGE_BITS`].
+/// Watermark payload (`mage_latent.py:10`), SHA-256-expanded to [`GS_MESSAGE_BITS`]
+/// (`mage_latent.py:55-65`).
 pub const GS_PAYLOAD: &str = "MageFlow";
 
-/// Watermark message length in bits (`mage_latent.py:20`).
+/// Watermark message length in bits (`mage_latent.py:19`).
 pub const GS_MESSAGE_BITS: usize = 256;
 
 // ---------------------------------------------------------------------------------------------
 // Config reader
 // ---------------------------------------------------------------------------------------------
-
-/// The published-but-code-hardcoded keys this crate verifies rather than reads, as
-/// `(json key, expected literal)` pairs rendered for the mismatch message.
-const IGNORED_BUT_PINNED: &[&str] = &[
-    "theta",
-    "mlp_ratio",
-    "static_shift",
-    "depth_single_blocks",
-    "qkv_bias",
-    "guidance_embed",
-];
 
 impl MageFlowConfig {
     /// The production config shipped by all six `microsoft/Mage-Flow*` repos.
@@ -324,10 +397,10 @@ impl MageFlowConfig {
     /// Read the nine consumed fields out of a `transformer/config.json` body.
     ///
     /// Fields are **required**, never defaulted: a silently-defaulted `depth` or `axes_dim` would
-    /// produce a plausible-looking model with the wrong geometry. In addition, the
-    /// published-but-ignored keys in `IGNORED_BUT_PINNED` are *verified* against this module's
-    /// constants — the reference hardcodes them in code, so a checkpoint that disagrees would be
-    /// silently misinterpreted rather than rejected.
+    /// produce a plausible-looking model with the wrong geometry. In addition, every key in
+    /// [`pinned_config_keys`] is *verified* against this module's constants — the reference
+    /// hardcodes those in code, so a checkpoint that disagrees would be silently misinterpreted
+    /// rather than rejected.
     pub fn from_transformer_config_json(json: &str) -> Result<Self> {
         let v: serde_json::Value = serde_json::from_str(json).map_err(|e| {
             Error::Msg(format!(
@@ -438,64 +511,113 @@ fn req_axes_dim(v: &serde_json::Value) -> Result<Vec<i32>> {
         .collect()
 }
 
+/// The expected shape+value of one pinned key. `Num` covers both JSON integers and floats (the
+/// published file spells `theta` as `10000` but `mlp_ratio` as `4.0`).
+#[derive(Debug, Clone, Copy)]
+enum Pinned {
+    Num(f64),
+    Bool(bool),
+    Str(&'static str),
+    Null,
+}
+
+impl Pinned {
+    /// `Ok(())` when `found` matches. A **present but wrong-typed** value is a mismatch, not a
+    /// skip — `"rope_type": 3` must not slip through a `as_str()` that quietly returns `None`.
+    fn matches(self, found: &serde_json::Value) -> bool {
+        match self {
+            Self::Num(want) => found.as_f64() == Some(want),
+            Self::Bool(want) => found.as_bool() == Some(want),
+            Self::Str(want) => found.as_str() == Some(want),
+            Self::Null => found.is_null(),
+        }
+    }
+
+    fn describe(self) -> String {
+        match self {
+            Self::Num(want) => want.to_string(),
+            Self::Bool(want) => want.to_string(),
+            Self::Str(want) => format!("{want:?}"),
+            Self::Null => "null".to_string(),
+        }
+    }
+}
+
+/// The single table driving both the runtime guard ([`verify_hardcoded`]) and the public
+/// [`pinned_config_keys`] list, so the advertised and enforced sets cannot drift apart.
+const PINNED_EXPECTATIONS: &[(&str, Pinned)] = &[
+    // --- scalars / shapes ---
+    ("theta", Pinned::Num(ROPE_THETA as f64)),
+    ("mlp_ratio", Pinned::Num(MLP_RATIO as f64)),
+    ("static_shift", Pinned::Num(STATIC_SHIFT as f64)),
+    (
+        "depth_single_blocks",
+        Pinned::Num(DEPTH_SINGLE_BLOCKS as f64),
+    ),
+    ("qkv_bias", Pinned::Bool(QKV_BIAS)),
+    ("guidance_embed", Pinned::Bool(GUIDANCE_EMBED)),
+    ("txt_max_length", Pinned::Num(TXT_MAX_LENGTH as f64)),
+    // --- architecture selectors ---
+    ("rope_type", Pinned::Str(ROPE_TYPE)),
+    ("time_type", Pinned::Str(TIME_TYPE)),
+    ("double_block_type", Pinned::Str(DOUBLE_BLOCK_TYPE)),
+    ("apply_text_rotary_emb", Pinned::Bool(APPLY_TEXT_ROTARY_EMB)),
+    ("vec_in_dim", Pinned::Num(VEC_IN_DIM as f64)),
+    (
+        "vec_type",
+        match VEC_TYPE {
+            Some(kind) => Pinned::Str(kind),
+            None => Pinned::Null,
+        },
+    ),
+    ("schedule_mode", Pinned::Str(SCHEDULE_MODE)),
+    ("use_time_shift", Pinned::Bool(USE_TIME_SHIFT)),
+    ("packing", Pinned::Bool(PACKING)),
+];
+
+/// Every `transformer/config.json` key this crate **verifies rather than reads**.
+///
+/// This is the reference's own `_meta` strip-set (`pipeline.py:731-735`) minus
+/// [`INFORMATIONAL_META_KEYS`] — and `config_conformance.rs` asserts exactly that equality against
+/// the vendored source, so the coverage cannot silently shrink. Everything in the set selects
+/// behaviour the reference hardcodes in Python while ignoring the published value, so a checkpoint
+/// declaring something different would be run as though it had said the opposite: no error, no
+/// shape mismatch, just wrong output.
+///
+/// The scalar/shape half (`theta`, `mlp_ratio`, `static_shift`, `depth_single_blocks`, `qkv_bias`,
+/// `guidance_embed`, `txt_max_length`) is the obvious one. The **architecture-selector** half
+/// (`rope_type`, `time_type`, `double_block_type`, `apply_text_rotary_emb`, `vec_in_dim`,
+/// `vec_type`, `schedule_mode`, `use_time_shift`, `packing`) is the consequential one: a drifting
+/// selector describes a genuinely *different* model rather than a retuned one. `rope_type` picks
+/// the whole [`crate::rope_embedder`] scheme, and `apply_text_rotary_emb` is what makes
+/// [`crate::attention`] correct in leaving the text stream unrotated.
+pub fn pinned_config_keys() -> Vec<&'static str> {
+    PINNED_EXPECTATIONS.iter().map(|(key, _)| *key).collect()
+}
+
+/// The three `_meta` entries deliberately **not** pinned, because nothing in the reference reads
+/// them (grep-confirmed over the whole vendored package):
+///
+/// - `_class_name` — diffusers bookkeeping;
+/// - `param_dtype` — provenance; the loader casts to bf16 unconditionally (`pipeline.py:751-755`);
+/// - `max_sequence_length` — a duplicate of `txt_max_length` that no code path consumes.
+pub const INFORMATIONAL_META_KEYS: &[&str] = &["_class_name", "param_dtype", "max_sequence_length"];
+
 /// Reject a checkpoint whose published values for the code-hardcoded keys disagree with this
 /// crate's constants. Absent keys are fine (they are not part of the consumed surface); a
 /// *present and different* value is a real divergence the reference would silently ignore.
 fn verify_hardcoded(v: &serde_json::Value) -> Result<()> {
-    let mismatch = |key: &str, got: String, want: String| {
-        Error::Msg(format!(
-            "mage_flow: transformer/config.json '{key}' is {got}, but this port hardcodes {want} \
-             (the reference hardcodes it in code and ignores the config value, so a differing \
-             checkpoint would be silently misinterpreted); expected pinned keys: {IGNORED_BUT_PINNED:?}"
-        ))
-    };
-    if let Some(theta) = v.get("theta").and_then(serde_json::Value::as_f64) {
-        if theta as f32 != ROPE_THETA {
-            return Err(mismatch("theta", theta.to_string(), ROPE_THETA.to_string()));
-        }
-    }
-    if let Some(ratio) = v.get("mlp_ratio").and_then(serde_json::Value::as_f64) {
-        if ratio as f32 != MLP_RATIO {
-            return Err(mismatch(
-                "mlp_ratio",
-                ratio.to_string(),
-                MLP_RATIO.to_string(),
-            ));
-        }
-    }
-    if let Some(shift) = v.get("static_shift").and_then(serde_json::Value::as_f64) {
-        if shift as f32 != STATIC_SHIFT {
-            return Err(mismatch(
-                "static_shift",
-                shift.to_string(),
-                STATIC_SHIFT.to_string(),
-            ));
-        }
-    }
-    if let Some(n) = v
-        .get("depth_single_blocks")
-        .and_then(serde_json::Value::as_i64)
-    {
-        if n as usize != DEPTH_SINGLE_BLOCKS {
-            return Err(mismatch(
-                "depth_single_blocks",
-                n.to_string(),
-                DEPTH_SINGLE_BLOCKS.to_string(),
-            ));
-        }
-    }
-    if let Some(b) = v.get("qkv_bias").and_then(serde_json::Value::as_bool) {
-        if b != QKV_BIAS {
-            return Err(mismatch("qkv_bias", b.to_string(), QKV_BIAS.to_string()));
-        }
-    }
-    if let Some(b) = v.get("guidance_embed").and_then(serde_json::Value::as_bool) {
-        if b != GUIDANCE_EMBED {
-            return Err(mismatch(
-                "guidance_embed",
-                b.to_string(),
-                GUIDANCE_EMBED.to_string(),
-            ));
+    for (key, want) in PINNED_EXPECTATIONS {
+        let Some(found) = v.get(*key) else { continue };
+        if !want.matches(found) {
+            return Err(Error::Msg(format!(
+                "mage_flow: transformer/config.json '{key}' is {found}, but this port hardcodes \
+                 {} (the reference hardcodes it in code and ignores the config value, so a \
+                 differing checkpoint would be run as though it had said the opposite — silently, \
+                 with no shape mismatch to catch it); pinned keys: {:?}",
+                want.describe(),
+                pinned_config_keys()
+            )));
         }
     }
     Ok(())

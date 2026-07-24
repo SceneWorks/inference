@@ -46,3 +46,19 @@
 //! Thirty-six bf16 decoder layers accumulate real cross-backend drift (the same reference on MPS
 //! instead of CPU moves the tensor by mean_rel ≈ 2.7e-2), so the parity gate against
 //! `mage_flow_te_golden.safetensors` must be a tolerance, never an equality.
+//!
+//! ## Prompt length
+//!
+//! Truncate the **templated** prompt at [`max_prompt_tokens`](crate::config::max_prompt_tokens)
+//! (`drop_idx`), i.e. 2082 gen / 2112 edit — [`TXT_MAX_LENGTH`](crate::config::TXT_MAX_LENGTH)
+//! **plus** the tokens that are about to be dropped (`pipeline.py:225-228`). Do not read the
+//! reference's `ModelConfig` dataclass default (4096, `mage_flow.py:31`) — `load_from_repo`
+//! overrides it with the published 2048 (`pipeline.py:745`) — and do not forget the `+ drop_idx`
+//! term. Every boundary golden uses a short prompt, so **neither mistake shows up in a parity
+//! test**; that is why the value is a constant here rather than a transcription.
+//!
+//! ## Weight loading
+//!
+//! There is no shared `loader.rs` (see the decision note in `lib.rs`): put `load`/`load_tokenizer`
+//! for this component **inside this directory**, so the concurrent VAE and DiT ports never touch
+//! a file this story owns.

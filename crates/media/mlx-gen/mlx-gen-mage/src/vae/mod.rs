@@ -33,3 +33,9 @@
 //!    `load_from_repo` never overrides it, so the edit path *samples* the posterior, seeded off the
 //!    global RNG (`pipeline.py:499`). The golden therefore gates the moments (`enc_mean` /
 //!    `enc_logvar`) and the port applies its own RNG. Watermark detection uses the mean.
+//!
+//! ## Weight loading
+//!
+//! There is no shared `loader.rs` (see the decision note in `lib.rs`): put this component's `load`
+//! **inside this directory**, so the concurrent text-encoder and DiT ports never touch a file this
+//! story owns.

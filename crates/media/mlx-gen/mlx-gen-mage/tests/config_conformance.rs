@@ -3,10 +3,16 @@
 //! **vendored frozen reference** — never against itself.
 //!
 //! Fixtures under `tests/fixtures/` are verbatim copies of
-//! `microsoft/Mage-Flow @ 9f46d09d`'s `transformer/config.json`, `vae/config.json` and
-//! `scheduler/scheduler_config.json`. All six Mage-Flow repositories ship these three files
-//! byte-identically (independently hashed across `Mage-Flow`, `-Base`, `-Turbo`, `-Edit`,
-//! `-Edit-Base`, `-Edit-Turbo`), so pinning one copy pins the family.
+//! `microsoft/Mage-Flow @ 9f46d09d`'s `transformer/config.json`, `vae/config.json`,
+//! `scheduler/scheduler_config.json` and `text_encoder/config.json` — **all four** component
+//! configs, so no component is held to a weaker standard than the others. All six Mage-Flow
+//! repositories ship them byte-identically (independently hashed across `Mage-Flow`, `-Base`,
+//! `-Turbo`, `-Edit`, `-Edit-Base`, `-Edit-Turbo`), so pinning one copy pins the family.
+//!
+//! Constants with no home in any published config (the timestep-embedder block, the joint-attention
+//! order, the VL long-edge cap, the native-resolution bounds) are pinned against the **vendored
+//! frozen reference** via [`vendored`] instead. The claim in the first paragraph is meant literally
+//! and was mutation-tested: flipping any covered constant fails at least one test here.
 
 use mlx_gen_mage::config::{self, MageFlowConfig, QwenVlTextConfig};
 use sha2::{Digest, Sha256};
@@ -14,6 +20,7 @@ use sha2::{Digest, Sha256};
 const TRANSFORMER_CONFIG: &str = include_str!("fixtures/transformer_config.json");
 const VAE_CONFIG: &str = include_str!("fixtures/vae_config.json");
 const SCHEDULER_CONFIG: &str = include_str!("fixtures/scheduler_config.json");
+const TEXT_ENCODER_CONFIG: &str = include_str!("fixtures/text_encoder_config.json");
 
 fn sha256(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
@@ -43,6 +50,11 @@ fn fixtures_are_the_published_config_bytes() {
         sha256(SCHEDULER_CONFIG.as_bytes()),
         "438fd8bcf254740e5d3f3e9800bbd9c571e342ab87885388d1505b7531c69c02",
         "scheduler/scheduler_config.json fixture drifted from the published bytes"
+    );
+    assert_eq!(
+        sha256(TEXT_ENCODER_CONFIG.as_bytes()),
+        "edac7703329133edfc53e46ac0081835144c99d7eebf28b71c732694d435224d",
+        "text_encoder/config.json fixture drifted from the published bytes"
     );
 }
 
@@ -152,14 +164,34 @@ fn inconsistent_axes_dim_is_rejected() {
 /// this must fail loudly instead.
 #[test]
 fn drifting_code_hardcoded_keys_are_rejected() {
-    let cases: [(&str, serde_json::Value); 6] = [
+    // One plausible drift per pinned key. The **architecture selectors** are the consequential
+    // half: each of these describes a genuinely different model that the reference — and a naive
+    // port — would run as though it had said the opposite, with no shape mismatch to catch it.
+    let cases: [(&str, serde_json::Value); 16] = [
+        // scalars / shapes
         ("theta", serde_json::json!(5000)),
         ("mlp_ratio", serde_json::json!(2.0)),
         ("static_shift", serde_json::json!(3.0)),
         ("depth_single_blocks", serde_json::json!(2)),
         ("qkv_bias", serde_json::json!(false)),
         ("guidance_embed", serde_json::json!(true)),
+        ("txt_max_length", serde_json::json!(4096)),
+        // architecture selectors
+        ("rope_type", serde_json::json!("3d_rope")),
+        ("time_type", serde_json::json!("flux_proj")),
+        ("double_block_type", serde_json::json!("single_stream")),
+        ("apply_text_rotary_emb", serde_json::json!(true)),
+        ("vec_in_dim", serde_json::json!(768)),
+        ("vec_type", serde_json::json!("pooled_clip")),
+        ("schedule_mode", serde_json::json!("flux")),
+        ("use_time_shift", serde_json::json!(true)),
+        ("packing", serde_json::json!(false)),
     ];
+    assert_eq!(
+        cases.len(),
+        config::pinned_config_keys().len(),
+        "every pinned key needs a drift case"
+    );
     for (key, value) in cases {
         let mut v: serde_json::Value = serde_json::from_str(TRANSFORMER_CONFIG).unwrap();
         v.as_object_mut().unwrap().insert(key.to_string(), value);
@@ -169,9 +201,88 @@ fn drifting_code_hardcoded_keys_are_rejected() {
             .to_string();
         assert!(err.contains(key), "error for drifting '{key}' was: {err}");
     }
-    // …and the *published* values for those same keys pass, so the check discriminates rather
-    // than rejecting everything.
+
+    // A present-but-wrong-TYPED value is a mismatch too, not a skip: an `as_str()` that quietly
+    // returns `None` would let `"rope_type": 3` through.
+    for (key, value) in [
+        ("rope_type", serde_json::json!(3)),
+        ("qkv_bias", serde_json::json!("true")),
+        ("theta", serde_json::json!("10000")),
+        ("vec_type", serde_json::json!("msrope")),
+    ] {
+        let mut v: serde_json::Value = serde_json::from_str(TRANSFORMER_CONFIG).unwrap();
+        v.as_object_mut().unwrap().insert(key.to_string(), value);
+        assert!(
+            MageFlowConfig::from_transformer_config_json(&v.to_string()).is_err(),
+            "a wrong-typed '{key}' must be rejected, not skipped"
+        );
+    }
+
+    // …and the *published* values for every one of those keys pass, so the check discriminates
+    // rather than rejecting everything.
     MageFlowConfig::from_transformer_config_json(TRANSFORMER_CONFIG).unwrap();
+}
+
+/// **The coverage guard.** The pinned set must equal the reference's own `_meta` strip-set minus
+/// the three entries nothing reads — parsed out of the vendored `pipeline.py`, so the guard cannot
+/// silently shrink back to the scalar-only subset it started as.
+#[test]
+fn pinned_keys_cover_the_references_whole_strip_set() {
+    let pipeline = vendored("pipeline.py");
+    let body = pipeline
+        .split("_meta = {")
+        .nth(1)
+        .and_then(|s| s.split('}').next())
+        .expect("the `_meta` strip-set moved in the vendored pipeline.py");
+    let mut meta: Vec<&str> = body
+        .split('"')
+        .enumerate()
+        // Quoted pieces sit at odd indices of a split on `"`.
+        .filter_map(|(i, piece)| (i % 2 == 1).then_some(piece))
+        .collect();
+    meta.sort_unstable();
+    meta.dedup();
+    assert_eq!(meta.len(), 19, "the strip-set changed size: {meta:?}");
+
+    let mut expected: Vec<&str> = meta
+        .iter()
+        .copied()
+        .filter(|k| !config::INFORMATIONAL_META_KEYS.contains(k))
+        .collect();
+    expected.sort_unstable();
+
+    let mut pinned = config::pinned_config_keys();
+    pinned.sort_unstable();
+
+    assert_eq!(
+        pinned,
+        expected,
+        "pinned_config_keys() must cover the reference's entire `_meta` strip-set except \
+         {:?} — an uncovered selector is one the port would silently misinterpret",
+        config::INFORMATIONAL_META_KEYS
+    );
+    // The exclusions are real members of the set, not typos that quietly exclude nothing.
+    for key in config::INFORMATIONAL_META_KEYS {
+        assert!(meta.contains(key), "{key} is not in the reference `_meta`");
+    }
+    // And none of the nine CONSUMED fields ended up pinned instead of read.
+    for consumed in [
+        "in_channels",
+        "out_channels",
+        "context_in_dim",
+        "hidden_size",
+        "num_heads",
+        "depth",
+        "axes_dim",
+        "checkpoint",
+        "patch_size",
+    ] {
+        assert!(
+            !pinned.contains(&consumed),
+            "{consumed} must be READ, not pinned"
+        );
+        assert!(!meta.contains(&consumed), "{consumed} must not be stripped");
+    }
 }
 
 /// The constants this crate hardcodes must match what the published file actually says.
@@ -193,14 +304,28 @@ fn hardcoded_constants_match_the_published_json() {
         t["guidance_embed"].as_bool().unwrap(),
         config::GUIDANCE_EMBED
     );
-    // The declarations that identify this DiT as a reparameterised Z-Image S3-DiT, and the two
-    // flags the RoPE port depends on.
-    assert_eq!(t["rope_type"], "msrope");
-    assert_eq!(t["time_type"], "qwen_proj");
-    assert_eq!(t["double_block_type"], "double_stream");
-    assert_eq!(t["schedule_mode"], "z-image");
-    assert_eq!(t["apply_text_rotary_emb"], false);
-    assert_eq!(t["use_time_shift"], false);
+    // The architecture selectors — read from the file into the constants, not restated. These
+    // identify the DiT as a reparameterised Z-Image S3-DiT and carry the two flags the RoPE and
+    // attention ports depend on.
+    assert_eq!(t["rope_type"].as_str().unwrap(), config::ROPE_TYPE);
+    assert_eq!(t["time_type"].as_str().unwrap(), config::TIME_TYPE);
+    assert_eq!(
+        t["double_block_type"].as_str().unwrap(),
+        config::DOUBLE_BLOCK_TYPE
+    );
+    assert_eq!(t["schedule_mode"].as_str().unwrap(), config::SCHEDULE_MODE);
+    assert_eq!(
+        t["apply_text_rotary_emb"].as_bool().unwrap(),
+        config::APPLY_TEXT_ROTARY_EMB
+    );
+    assert_eq!(
+        t["use_time_shift"].as_bool().unwrap(),
+        config::USE_TIME_SHIFT
+    );
+    assert_eq!(t["packing"].as_bool().unwrap(), config::PACKING);
+    assert_eq!(t["vec_in_dim"].as_i64().unwrap() as i32, config::VEC_IN_DIM);
+    assert_eq!(t["vec_type"].as_str(), config::VEC_TYPE);
+    assert!(t["vec_type"].is_null());
 
     let vae: serde_json::Value = serde_json::from_str(VAE_CONFIG).unwrap();
     assert_eq!(
@@ -315,7 +440,7 @@ fn prompt_templates_and_drop_indices_match_the_vendored_reference() {
 fn watermark_constants_match_the_vendored_reference() {
     let latent = vendored("models/modules/mage_latent.py");
     assert!(
-        latent.contains(&format!("DEFAULT_GS_KEY = {}", config::GS_DEFAULT_KEY)),
+        latent.contains(&format!("DEFAULT_GS_KEY = {}\n", config::GS_DEFAULT_KEY)),
         "GS_DEFAULT_KEY {} not found in mage_latent.py",
         config::GS_DEFAULT_KEY
     );
@@ -325,7 +450,7 @@ fn watermark_constants_match_the_vendored_reference() {
         config::GS_PAYLOAD
     );
     assert!(
-        latent.contains(&format!("_MSG_BITS = {}", config::GS_MESSAGE_BITS)),
+        latent.contains(&format!("_MSG_BITS = {}\n", config::GS_MESSAGE_BITS)),
         "GS_MESSAGE_BITS {} not found in mage_latent.py",
         config::GS_MESSAGE_BITS
     );
@@ -371,24 +496,231 @@ fn rope_and_ffn_corrections_are_pinned_to_the_reference() {
 // Text-encoder constants — pinned against the published `text_encoder/config.json` values.
 // -------------------------------------------------------------------------------------------
 
+/// Every `QwenVlTextConfig` field and every TE scalar read out of the **byte-pinned published
+/// file**, not retyped literals. Previously this block was the one component config held to a
+/// weaker standard than the other three.
 #[test]
 fn text_encoder_config_is_the_published_qwen3_vl_lm() {
+    let root: serde_json::Value = serde_json::from_str(TEXT_ENCODER_CONFIG).unwrap();
+    let text = &root["text_config"];
     let te = QwenVlTextConfig::mage_flow();
-    assert_eq!(te.hidden_size, 2560);
-    assert_eq!(te.num_layers, 36);
-    assert_eq!(te.num_attention_heads, 32);
-    assert_eq!(te.num_key_value_heads, 8);
-    assert_eq!(te.intermediate_size, 9728);
-    assert_eq!(te.vocab_size, 151_936);
-    assert_eq!(te.mrope_section, [24, 20, 20]);
-    assert!(!te.attention_bias);
-    assert!(te.tie_word_embeddings);
+
+    assert_eq!(text["hidden_size"].as_i64().unwrap() as i32, te.hidden_size);
+    assert_eq!(
+        text["num_hidden_layers"].as_u64().unwrap() as usize,
+        te.num_layers
+    );
+    assert_eq!(
+        text["num_attention_heads"].as_i64().unwrap() as i32,
+        te.num_attention_heads
+    );
+    assert_eq!(
+        text["num_key_value_heads"].as_i64().unwrap() as i32,
+        te.num_key_value_heads
+    );
+    assert_eq!(text["head_dim"].as_i64().unwrap() as i32, te.head_dim);
+    assert_eq!(
+        text["intermediate_size"].as_i64().unwrap() as i32,
+        te.intermediate_size
+    );
+    assert_eq!(text["vocab_size"].as_i64().unwrap() as i32, te.vocab_size);
+    assert_eq!(
+        text["rope_scaling"]["mrope_section"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n.as_i64().unwrap() as i32)
+            .collect::<Vec<_>>(),
+        te.mrope_section.to_vec()
+    );
+    assert_eq!(text["attention_bias"].as_bool().unwrap(), te.attention_bias);
+    assert_eq!(
+        text["tie_word_embeddings"].as_bool().unwrap(),
+        te.tie_word_embeddings
+    );
+
+    // The three free-standing TE scalars, from the same file.
+    assert_eq!(
+        text["rms_norm_eps"].as_f64().unwrap() as f32,
+        config::TE_RMS_NORM_EPS
+    );
+    assert_eq!(text["rope_theta"].as_f64().unwrap(), config::TE_ROPE_THETA);
+    assert_eq!(text["hidden_act"].as_str().unwrap(), config::TE_HIDDEN_ACT);
+    // …and the interleaved-M-RoPE flag the section split is meaningless without.
+    assert_eq!(text["rope_scaling"]["mrope_interleaved"], true);
+
     // head_dim is DECOUPLED from hidden_size / num_heads (32 × 128 = 4096 ≠ 2560) — the single
     // most likely thing for a port to derive instead of read.
     assert_eq!(te.head_dim, 128);
     assert_ne!(te.head_dim, te.hidden_size / te.num_attention_heads);
     // The DiT's text-conditioning width is the LM's hidden size.
     assert_eq!(MageFlowConfig::mage_flow().context_in_dim, te.hidden_size);
+    // The vision tower (sc-14048) is deliberately not modelled yet, but the file must still be the
+    // Qwen3-VL one those constants came from.
+    assert_eq!(root["architectures"][0], "Qwen3VLForConditionalGeneration");
+    assert_eq!(root["vision_config"]["out_hidden_size"], 2560);
+}
+
+/// [`config::TXT_MAX_LENGTH`] and the `+ drop_idx` term. The budget is published, the term is not,
+/// and every parity golden uses a short prompt — so nothing else would catch either mistake.
+#[test]
+fn prompt_truncation_budget_matches_the_published_config_and_the_reference() {
+    let t: serde_json::Value = serde_json::from_str(TRANSFORMER_CONFIG).unwrap();
+    assert_eq!(
+        t["txt_max_length"].as_u64().unwrap() as usize,
+        config::TXT_MAX_LENGTH,
+        "TXT_MAX_LENGTH must be the published budget, not the reference dataclass default (4096)"
+    );
+    // The misleading default really is 4096 and really is overridden — assert both halves, so the
+    // doc comment warning about it cannot rot.
+    let dit = vendored("models/mage_flow.py");
+    assert!(dit.contains("txt_max_length: int = Field(default=4096)"));
+    let pipeline = vendored("pipeline.py");
+    assert!(pipeline.contains(&format!(
+        "txt_max_length=tcfg.get(\"txt_max_length\", {})",
+        config::TXT_MAX_LENGTH
+    )));
+
+    // The `+ drop_idx` term (`pipeline.py:225`).
+    assert!(
+        pipeline.contains("max_len = model.txt_enc.tokenizer_max_length + drop_idx"),
+        "the `+ drop_idx` truncation term moved; re-verify max_prompt_tokens"
+    );
+    assert_eq!(
+        config::max_prompt_tokens(config::DROP_IDX_GEN),
+        config::TXT_MAX_LENGTH + 34
+    );
+    assert_eq!(
+        config::max_prompt_tokens(config::DROP_IDX_EDIT),
+        config::TXT_MAX_LENGTH + 64
+    );
+    assert_eq!(config::max_prompt_tokens(config::DROP_IDX_GEN), 2082);
+    assert_eq!(config::max_prompt_tokens(config::DROP_IDX_EDIT), 2112);
+    // Both budgets leave exactly TXT_MAX_LENGTH conditioning tokens after the drop.
+    assert_ne!(
+        config::max_prompt_tokens(config::DROP_IDX_GEN),
+        config::max_prompt_tokens(config::DROP_IDX_EDIT)
+    );
+}
+
+/// The timestep-embedder block, pinned against `mage_layers.py`. sc-14040 consumes these five
+/// values verbatim and no published config carries any of them.
+#[test]
+fn timestep_embedder_constants_are_pinned_to_the_reference() {
+    let layers = vendored("models/modules/mage_layers.py");
+
+    // One construction line carries four of the five (`mage_layers.py:93`).
+    let ctor = format!(
+        "Timesteps(num_channels={}, flip_sin_to_cos={}, downscale_freq_shift={}, scale={})",
+        config::FREQUENCY_EMBEDDING_SIZE,
+        if config::TIMESTEP_FLIP_SIN_TO_COS {
+            "True"
+        } else {
+            "False"
+        },
+        config::TIMESTEP_DOWNSCALE_FREQ_SHIFT as i64,
+        config::TIMESTEP_SCALE as i64,
+    );
+    assert!(
+        layers.contains(&ctor),
+        "timestep projection changed; expected to find `{ctor}`"
+    );
+    // The projection width must match what `TimestepEmbedding` consumes (`mage_layers.py:94`).
+    assert!(layers.contains(&format!(
+        "TimestepEmbedding(in_channels={}, time_embed_dim=embedding_dim)",
+        config::FREQUENCY_EMBEDDING_SIZE
+    )));
+    // `max_period` is the signature default of `get_timestep_embedding` (`mage_layers.py:30`) —
+    // never overridden at the call site, which is exactly why it is easy to mis-transcribe.
+    // NOTE the trailing comma: without it, `10000 -> 1000` still matches as a PREFIX and the check
+    // silently passes. (Mutation testing caught exactly that.)
+    assert!(
+        layers.contains(&format!(
+            "max_period: int = {},",
+            config::TIMESTEP_MAX_PERIOD as i64
+        )),
+        "max_period moved; expected {}",
+        config::TIMESTEP_MAX_PERIOD as i64
+    );
+    // The deliberate bf16 downcast of the frequency table (`mage_layers.py:45`).
+    assert_eq!(
+        config::TIMESTEP_FREQS_BF16,
+        layers.contains("emb = torch.exp(exponent).to(timesteps.dtype)"),
+        "TIMESTEP_FREQS_BF16 must track the reference's dtype downcast"
+    );
+}
+
+/// The remaining DiT scalars/flags with no published-config home.
+#[test]
+fn dit_norm_and_attention_order_are_pinned_to_the_reference() {
+    let dit = vendored("models/mage_flow.py");
+    let layers = vendored("models/modules/mage_layers.py");
+
+    // NORM_EPS at both DiT sites, and as the block default. Rendered from the constant, so a
+    // mutation to 1e-5 stops matching the reference text.
+    let eps = format!("{:e}", config::NORM_EPS);
+    assert!(
+        dit.contains(&format!("RMSNorm(params.context_in_dim, eps={eps})")),
+        "txt_norm eps moved; expected eps={eps}"
+    );
+    assert!(
+        dit.contains(&format!("elementwise_affine=False, eps={eps})")),
+        "norm_out eps moved; expected eps={eps}"
+    );
+    assert!(
+        layers.contains(&format!("eps: float = {eps},")),
+        "the transformer block's eps default moved; expected {eps}"
+    );
+
+    // Joint-attention order: [text, image]. The reference expresses it as scatter offsets, not a
+    // `cat` — text lands at each sample's start, image is offset by that sample's text length
+    // (`mage_layers.py:466-467`). Assert the *code*, not the commented-out `cat` above it.
+    assert_eq!(
+        config::TEXT_STREAM_FIRST,
+        layers.contains("img_dest_indices = joint_cu_lens[img_sample_ids] + txt_lens[img_sample_ids] + img_intra_pos"),
+        "TEXT_STREAM_FIRST must track the reference's joint-attention scatter offsets"
+    );
+    assert!(
+        layers.contains("txt_dest_indices = joint_cu_lens[txt_sample_ids] + txt_intra_pos"),
+        "the text stream must start at each sample's offset with no image shift"
+    );
+}
+
+/// The edit-path VL conditioning cap — a keyword-argument default, invisible to every config file.
+#[test]
+fn vl_cond_long_edge_is_pinned_to_the_reference() {
+    let pipeline = vendored("pipeline.py");
+    assert!(
+        pipeline.contains(&format!("vl_cond_long_edge={},", config::VL_COND_LONG_EDGE)),
+        "the VL long-edge cap moved; expected {}",
+        config::VL_COND_LONG_EDGE
+    );
+    assert!(pipeline.contains("_resize_long_edge(p, vl_cond_long_edge)"));
+}
+
+/// The native-resolution envelope, pinned against the reference's own README rather than the epic.
+#[test]
+fn native_resolution_bounds_are_pinned_to_the_reference() {
+    let readme = vendored("README.md");
+    assert!(
+        readme.contains(&format!(
+            "generates from **{} to {}** on any aspect ratio",
+            config::MIN_SIZE,
+            config::MAX_SIZE
+        )),
+        "the documented native-resolution range moved; expected {}-{}",
+        config::MIN_SIZE,
+        config::MAX_SIZE
+    );
+    let pipeline = vendored("pipeline.py");
+    assert!(
+        pipeline.contains(&format!(
+            "def _make_divisible_by_{}(size: int) -> int:",
+            config::SIZE_MULTIPLE
+        )),
+        "the geometry stride moved; expected a multiple of {}",
+        config::SIZE_MULTIPLE
+    );
 }
 
 #[test]

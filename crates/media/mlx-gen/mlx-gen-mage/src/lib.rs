@@ -42,6 +42,18 @@
 //!
 //! [`mlx-gen-catalog`]: https://docs.rs/mlx-gen-catalog
 
+// ---------------------------------------------------------------------------------------------
+// DECISION (sc-14037): there is deliberately **no `loader.rs`**.
+//
+// The sibling convention (`mlx-gen-z-image/src/loader.rs`) puts `load_transformer` /
+// `load_text_encoder` / `load_vae` in one shared file. That is a three-way collision here, because
+// sc-14038, sc-14039 and sc-14040 land concurrently and would each create the same file *and* each
+// add the same `pub mod loader;` line. **Each component's weight loading lives inside the module
+// that owns it** — `text_encoder::load`, `vae::load`, `transformer::load` — so a story touches only
+// its own files. sc-14041, which assembles them, may add a thin `loader.rs` that re-exports the
+// three (restoring the sibling's public shape) once all three exist; it must not move the bodies.
+// ---------------------------------------------------------------------------------------------
+
 pub mod config;
 pub mod model;
 
@@ -66,8 +78,21 @@ pub mod latent;
 // --- Rectified-flow sampler + native-resolution packing (sc-14041) ---------------------------
 pub mod pipeline;
 
+// ---------------------------------------------------------------------------------------------
+// Re-export surface.
+//
+// PARALLEL-EXECUTION CONTRACT (sc-14037): the four P1 ports land concurrently, so each owns ONE
+// pre-seeded line below. **Replace your own placeholder in place — do not append, reorder, or
+// touch a neighbouring line** and the four diffs stay in separate hunks. `lib.rs` already declares
+// every module above, so no story needs to add a `mod` line either.
+// ---------------------------------------------------------------------------------------------
 pub use config::{MageFlowConfig, QwenVlTextConfig, FAMILY};
 pub use model::{descriptor_for, MageVariant, MODEL_IDS};
+// sc-14038 (text encoder) re-exports here:
+// sc-14039 (Mage-VAE) re-exports here:
+// sc-14040 (NR-MMDiT) re-exports here:
+// sc-14104 (Gaussian-Shading noise) re-exports here:
+// sc-14041 (pipeline + the loaded model) re-exports here:
 
 // Later phases add their own modules rather than growing these: `quant` (Q4/Q8 tiers, sc-14046),
 // `convert` (offline pre-quantisation, sc-14046), `adapters` (LoRA/LoKr routing, sc-14057) and
