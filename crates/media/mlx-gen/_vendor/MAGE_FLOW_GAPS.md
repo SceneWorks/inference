@@ -145,7 +145,11 @@ predicts. Two consequences the port must not get wrong:
    Pick one deliberately and pin it in the parity test — the reference default is `True`.
 
 `mage_flow_dit_block_golden.safetensors::block_in.image_rotary_emb_{re,im}` carries the doubled
-table, and `tools/verify_mage_flow_golden.py` asserts this exact split.
+table, and `tools/verify_mage_flow_golden.py` pins it two ways: it **recomputes the whole table
+in numpy** from `img_shapes` + `theta=10000` + `axes_dim=[16,56,56]` (a pure function — no
+weights) and asserts equality against the golden, and it asserts the frame slots of segment *j*
+equal `e^{i·j·10000^(−2k/16)}` — so segment 0 is exact identity `(1, 0)` and the duplicated
+uncond segment is frame **1**, with the h/w slots bit-identical across the duplication.
 
 **Effective capacity** (the practical stand-in for `axes_lens`): 4096 indices per axis, so the
 frame index must stay `< 4096`, and a spatial axis of latent length `L` needs `L//2 ≤ 4096` and

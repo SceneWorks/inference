@@ -42,9 +42,14 @@ Everything vendored is **byte-for-byte upstream** — no local patches. Verify w
 
 ```sh
 git -C /path/to/Mage checkout df7f84d9f8fc991d189d929f03cff623b430a4a2
-diff -r --exclude=assets --exclude=__pycache__ \
+diff -r --exclude=assets --exclude=__pycache__ --exclude=LICENSE \
   /path/to/Mage/mage_flow crates/media/mlx-gen/_vendor/mage_flow
 ```
+
+(`LICENSE` is excluded because it lives at the upstream **repo root**, not inside `mage_flow/`;
+it was copied in beside the code it licenses, so it is the one file that exists only here. The
+`assets` exclude covers the 20 unvendored README images. With those three excludes the diff is
+empty — anything else it prints is a local patch and a bug.)
 
 The harness deliberately does **not** edit the vendored source to run off CUDA. It rebinds
 `mage_flow.pipeline.ModelConfig` to a subclass whose `attn_type` defaults to `sdpa`

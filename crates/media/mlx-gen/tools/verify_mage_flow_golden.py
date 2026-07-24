@@ -4,24 +4,51 @@ Run after `dump_mage_flow_golden.py`. This does **not** re-run the reference; it
 the dumped bundle hangs together, which catches the failure mode a parity golden is worst at
 surfacing: a golden that is internally wrong but that every downstream test happily "matches".
 
-Each check is a *cross-file* invariant that only holds if the boundary it pins was captured
-correctly, so it doubles as executable documentation of the epic's GAP answers:
+Structure and metadata alone cannot do that — a bundle whose *payload* tensors were replaced by
+shape-matched, moment-matched noise satisfies every shape/dtype/range assertion. So the checks
+below are split in two:
 
-* the denoise really starts from the **Gaussian-Shading** latent, not `randn` (GAP: watermark);
-* the TE conditioning really is `hidden_full[drop_idx:]` with drop 34 / 64 (GAP 1);
-* `enc_latent` really is the posterior **mean** (GAP 2's deterministic branch);
-* the msrope table really is complex with unit modulus, and was not silently truncated to its
-  real part on the way into the file (GAP 3);
-* the edit image stream really is `[noisy_target, ref…]` with the target first (GAP 5).
+* **structural** invariants (shapes, ranges, drop indices, schedule ladder), and
+* **payload** invariants that recompute or cross-derive a tensor's actual numbers and would fail
+  if it were replaced by noise, rescaled, or captured at the wrong point. These are weightless —
+  they use only closed-form math (the msrope table, the Euler step, a reshape) or a *second,
+  independently captured* tensor from another golden file.
+
+The payload invariants, and the epic GAP answer each one pins:
+
+* `traj_step1 == traj_step0 + Δσ·(unc + cfg·(cond − unc))` — the DiT velocity AND the CFG
+  combine AND the Euler step, closed over the `dit` + `e2e` goldens (GAP 4: the schedule);
+* the msrope table recomputed in numpy from `img_shapes` + `theta=10000` +
+  `axes_dim=[16,56,56]` — GAP 3, including the confirmed `batch_cfg` **frame index 1** for the
+  duplicated uncond half;
+* `dit_in.txt == concat(gen_txt, neg_txt)`, bit-exact — GAP 1: the conditioning the DiT actually
+  consumed IS the dumped final-post-RMSNorm TE output;
+* the per-token RMS envelope of `*_hidden_full` — GAP 1 again, scale-anchored, because the
+  penultimate layer and the final *pre*-norm state are orders of magnitude larger;
+* `dec_from_latent` reconstructs `pixels` and `enc_mean`'s channels track that image — GAP 2:
+  the VAE payload is a real encode/decode;
+* `seq_step0`'s ref segment correlates with the `vae` golden's `enc_mean` — GAP 5: the ref
+  segment really is the VAE encoding of the same image;
+* `final_tokens` <-> `final_latent` reshape identity, plus channels tracking `image_u8` — the
+  sampler output really produced the decoded image;
+* cond/uncond halves of `dit_out` / `block_out.1` stay near-collinear and the block outputs are
+  heavy-tailed — the DiT and block payloads are real activations, not Gaussian noise.
 
     python tools/verify_mage_flow_golden.py
+    python tools/verify_mage_flow_golden.py --self-test   # prove the above DISCRIMINATE
 
-Exits non-zero on the first failed invariant. Needs only `numpy` + `safetensors` — no torch, no
-weights, no reference checkout.
+`--self-test` corrupts a scratch copy of the bundle one tensor at a time — moment-matched, with
+any structural invariant it would otherwise trip deliberately repaired — and asserts this script
+rejects every one. A checker that has never been shown to fail is not evidence of anything.
+
+Exits non-zero if any invariant fails, if an expected golden is **missing** (pass
+`--allow-missing` to downgrade that to a skip), or if nothing was checked at all. Needs only
+`numpy` + `safetensors` — no torch, no weights, no reference checkout.
 """
 
 from __future__ import annotations
 
+import argparse
 import sys
 from pathlib import Path
 
@@ -31,6 +58,17 @@ from safetensors.numpy import load_file
 from _paths import fixture
 
 GOLDEN = Path(fixture("tools/golden"))
+
+# Every stage `dump_mage_flow_golden.py --stage all` writes. Absence is a FAILURE by default:
+# the goldens are gitignored, so "no files" is the state of a fresh clone, and a checker that
+# reports green there reports green exactly when it verified nothing.
+_STEMS = ("noise", "vae", "te", "dit", "dit_block", "e2e", "edit")
+
+# `MageFlowEmbedRope(theta=10000, axes_dim=params.axes_dim, scale_rope=True)`
+# (`_vendor/mage_flow/models/mage_flow.py:72`); axes_dim = [16, 56, 56] sums to the 128-wide
+# attention head dim, so the per-token table is 64 complex entries: 8 frame + 28 h + 28 w.
+ROPE_THETA = 10000
+ROPE_AXES_DIM = (16, 56, 56)
 
 _FAILURES: list[str] = []
 _CHECKS = 0
@@ -45,10 +83,17 @@ def _check(name: str, ok: bool, detail: str = "") -> None:
         _FAILURES.append(name)
 
 
-def _load(stem: str) -> dict[str, np.ndarray] | None:
+def _load(stem: str, allow_missing: bool) -> dict[str, np.ndarray] | None:
     path = GOLDEN / f"mage_flow_{stem}_golden.safetensors"
     if not path.is_file():
-        print(f"  [skip] {stem}: {path.name} not present")
+        if allow_missing:
+            print(f"  [skip] {stem}: {path.name} not present (--allow-missing)")
+            return None
+        _check(
+            f"{stem} golden is present",
+            False,
+            f"{path} missing — run `python tools/dump_mage_flow_golden.py --stage {stem}`",
+        )
         return None
     return load_file(str(path))
 
@@ -75,257 +120,831 @@ def _tokens_of(latent: np.ndarray) -> np.ndarray:
     return latent[0].reshape(latent.shape[1], -1).T
 
 
-def main() -> int:
-    noise = _load("noise")
-    vae = _load("vae")
-    te = _load("te")
-    dit = _load("dit")
-    block = _load("dit_block")
-    e2e = _load("e2e")
-    edit = _load("edit")
+# ------------------------------------------------------------------ payload discriminators
 
-    print("noise:")
-    if noise is not None:
-        _check(
-            "watermark is detectable in gs_noise",
-            float(noise["detect_msg_acc"][0]) == 1.0 and float(noise["detect_raw_acc"][0]) > 0.99,
-            f"msg_acc={float(noise['detect_msg_acc'][0]):.4f} raw_acc={float(noise['detect_raw_acc'][0]):.4f}",
+
+def _corr(a: np.ndarray, b: np.ndarray) -> float:
+    """Pearson correlation over the flattened tensors — 0 for independent noise, ~1 for a match.
+
+    The workhorse for "is this tensor still the thing it was captured as, or shape-matched
+    noise": every use below pairs a tensor with an *independently captured* one it must track.
+    """
+    x = np.asarray(a, dtype=np.float64).ravel() - float(np.mean(a, dtype=np.float64))
+    y = np.asarray(b, dtype=np.float64).ravel() - float(np.mean(b, dtype=np.float64))
+    denom = float(np.sqrt((x * x).sum() * (y * y).sum()))
+    return float((x * y).sum() / denom) if denom > 0 else 0.0
+
+
+def _tv_ratio(x: np.ndarray) -> float:
+    """Mean |neighbour difference| over the last two (spatial) axes, in units of the std.
+
+    Scale-free, so it survives any rescale of the tensor. White noise sits at ~1.13 (2−√2·…, the
+    Gaussian mean absolute difference); anything with spatial structure — a decoded image, a VAE
+    latent — sits far below it.
+    """
+    a = np.asarray(x, dtype=np.float64)
+    std = float(a.std())
+    if std == 0.0:
+        return 0.0
+    tv = float(np.abs(np.diff(a, axis=-1)).mean() + np.abs(np.diff(a, axis=-2)).mean()) / 2.0
+    return tv / std
+
+
+def _kurtosis(x: np.ndarray) -> float:
+    """Non-excess kurtosis. Exactly 3 for a Gaussian; transformer activations are far heavier."""
+    a = np.asarray(x, dtype=np.float64)
+    var = float(a.var())
+    return float(((a - a.mean()) ** 4).mean() / var**2) if var > 0 else 0.0
+
+
+def _block_luma(image: np.ndarray, gh: int, gw: int) -> np.ndarray:
+    """`[H, W, 3]` u8 or `[1, 3, H, W]` float -> the `[gh, gw]` block-mean luminance map."""
+    a = np.asarray(image, dtype=np.float64)
+    plane = a.mean(axis=-1) if a.ndim == 3 else a[0].mean(axis=0)
+    h, w = plane.shape
+    return plane.reshape(gh, h // gh, gw, w // gw).mean(axis=(1, 3))
+
+
+def _latent_image_channels(latent: np.ndarray, image: np.ndarray, threshold: float = 0.5) -> int:
+    """How many of the latent's channels track the image's block-mean luminance.
+
+    A `[1, C, gh, gw]` latent that really encodes `image` has a double-digit count here; an
+    independent random tensor of the same shape has **zero** (its best channel peaks at ~0.2).
+    """
+    luma = _block_luma(image, latent.shape[2], latent.shape[3])
+    return sum(1 for ch in latent[0] if abs(_corr(ch, luma)) > threshold)
+
+
+def _rope_axis(index: np.ndarray, dim: int) -> np.ndarray:
+    """`MageFlowEmbedRope.rope_params` — `e^{i·index·theta^(−2k/dim)}`, `dim//2` entries."""
+    inv = 1.0 / np.power(float(ROPE_THETA), np.arange(0, dim, 2, dtype=np.float64) / dim)
+    return np.exp(1j * np.outer(index.astype(np.float64), inv))
+
+
+def _msrope_table(shapes: np.ndarray) -> np.ndarray:
+    """Recompute the packed msrope table `[sum(f·h·w), 64]` from the segment `(frame, h, w)` list.
+
+    A pure function of `img_shapes` + `theta` + `axes_dim` — no weights — so the golden's table
+    can be checked against first principles rather than merely inspected for unit modulus.
+
+    Mirrors `MageFlowEmbedRope._compute_video_freqs` (`mage_layers.py:187-209`) with
+    `scale_rope=True`: the **frame** frequencies are indexed by the segment's position `idx` in
+    the list, NOT by the row's frame count, and h/w are centered (`neg[-(n-n//2):] ++ pos[:n//2]`).
+    That `idx` is what makes the `batch_cfg` duplicate rotate at frame 1 — see `_build_pack_ctx`'s
+    `d_img_shapes = [img_shapes[0] + img_shapes[0]]` (`pipeline.py:161`).
+    """
+    pos_index = np.arange(4096)
+    neg_index = np.arange(4096)[::-1] * -1 - 1
+    pos = [_rope_axis(pos_index, d) for d in ROPE_AXES_DIM]
+    neg = [_rope_axis(neg_index, d) for d in ROPE_AXES_DIM]
+
+    segments = []
+    for idx, row in enumerate(shapes):
+        frame, height, width = (int(v) for v in row)
+        f_freqs = np.broadcast_to(
+            pos[0][idx : idx + frame].reshape(frame, 1, 1, -1),
+            (frame, height, width, ROPE_AXES_DIM[0] // 2),
         )
-        # The whole point of the tensor: it must NOT be the plain randn the reference discards.
-        _check(
-            "gs_noise differs from the discarded plain randn",
-            _max_abs(noise["gs_noise"], noise["plain_randn"]) > 0.1,
-            f"max_abs={_max_abs(noise['gs_noise'], noise['plain_randn']):.4f}",
+        h_freqs = np.concatenate(
+            [neg[1][-(height - height // 2) :], pos[1][: height // 2]], axis=0
         )
-        if _require(noise, "gs_noise_bf16"):
+        h_freqs = np.broadcast_to(
+            h_freqs.reshape(1, height, 1, -1), (frame, height, width, ROPE_AXES_DIM[1] // 2)
+        )
+        w_freqs = np.concatenate([neg[2][-(width - width // 2) :], pos[2][: width // 2]], axis=0)
+        w_freqs = np.broadcast_to(
+            w_freqs.reshape(1, 1, width, -1), (frame, height, width, ROPE_AXES_DIM[2] // 2)
+        )
+        segments.append(
+            np.concatenate([f_freqs, h_freqs, w_freqs], axis=-1).reshape(frame * height * width, -1)
+        )
+    return np.concatenate(segments, axis=0)
+
+
+# ------------------------------------------------------------------------------ stages
+
+
+def check_noise(noise: dict[str, np.ndarray]) -> None:
+    _check(
+        "watermark is detectable in gs_noise",
+        float(noise["detect_msg_acc"][0]) == 1.0 and float(noise["detect_raw_acc"][0]) > 0.99,
+        f"msg_acc={float(noise['detect_msg_acc'][0]):.4f} raw_acc={float(noise['detect_raw_acc'][0]):.4f}",
+    )
+    # The whole point of the tensor: it must NOT be the plain randn the reference discards.
+    _check(
+        "gs_noise differs from the discarded plain randn",
+        _max_abs(noise["gs_noise"], noise["plain_randn"]) > 0.1,
+        f"max_abs={_max_abs(noise['gs_noise'], noise['plain_randn']):.4f}",
+    )
+    if _require(noise, "gs_noise_bf16"):
+        _check(
+            "gs_noise_bf16 is gs_noise at bf16 precision",
+            0.0 < _max_abs(noise["gs_noise"], noise["gs_noise_bf16"]) < 0.05,
+            f"max_abs={_max_abs(noise['gs_noise'], noise['gs_noise_bf16']):.6f}",
+        )
+
+
+def check_vae(vae: dict[str, np.ndarray], edit: dict[str, np.ndarray] | None) -> None:
+    _check(
+        "enc_latent is the posterior MEAN (sample_posterior=False branch)",
+        _max_abs(vae["enc_latent"], vae["enc_mean"]) == 0.0,
+    )
+    _check(
+        "enc_logvar is clamped to [-20, 10]",
+        float(vae["enc_logvar"].min()) >= -20.0 and float(vae["enc_logvar"].max()) <= 10.0,
+        f"[{vae['enc_logvar'].min():.3f}, {vae['enc_logvar'].max():.3f}]",
+    )
+    _check(
+        "decode output is in [-1, 1] (pre-clamp reference range)",
+        float(np.abs(vae["dec_from_latent"]).max()) < 1.5,
+        f"max_abs={float(np.abs(vae['dec_from_latent']).max()):.4f}",
+    )
+    _check(
+        "the two decodes differ (synthetic latent is not the encoded one)",
+        _max_abs(vae["dec_from_latent"], vae["dec_from_synth"]) > 0.1,
+    )
+
+    # --- payload: the decode really is a RECONSTRUCTION of the encoded image ---------------
+    # encode(x) -> decode round-trips a Mage-VAE at ~0.998 correlation. Shape-matched noise
+    # (or a decode of the wrong latent — `dec_from_synth` scores 0.03) cannot reach this.
+    recon = _corr(vae["dec_from_latent"], vae["pixels"])
+    _check(
+        "dec_from_latent RECONSTRUCTS pixels (encode->decode round-trip)",
+        recon > 0.95,
+        f"corr={recon:.4f} (dec_from_synth vs pixels: {_corr(vae['dec_from_synth'], vae['pixels']):.4f})",
+    )
+    for key in ("dec_from_latent", "dec_from_synth"):
+        tv = _tv_ratio(vae[key])
+        _check(
+            f"{key} is a smooth image, not white noise (TV/std)",
+            tv < 0.6,
+            f"TV/std={tv:.4f} (white noise ~1.13)",
+        )
+    # --- payload: the posterior mean really encodes the input image ------------------------
+    tracked = _latent_image_channels(vae["enc_mean"], vae["pixels"])
+    _check(
+        "enc_mean channels track the input image's luminance (it is an ENCODING, not noise)",
+        tracked >= 4,
+        f"{tracked}/128 channels |corr|>0.5 vs the 16x block-mean luma (random: 0)",
+    )
+    if edit is not None and "seq_step0" in edit and "target_tokens" in edit:
+        # Independent corroboration from a SEPARATE run: the edit pipeline VAE-encodes the same
+        # reference image at the same resolution (posterior SAMPLE, so ~equal, not identical).
+        n_tgt = int(edit["target_tokens"][0])
+        ref_seg = edit["seq_step0"][0, n_tgt : 2 * n_tgt]
+        if ref_seg.shape == _tokens_of(vae["enc_mean"]).shape:
+            agree = _corr(ref_seg, _tokens_of(vae["enc_mean"]))
             _check(
-                "gs_noise_bf16 is gs_noise at bf16 precision",
-                0.0 < _max_abs(noise["gs_noise"], noise["gs_noise_bf16"]) < 0.05,
-                f"max_abs={_max_abs(noise['gs_noise'], noise['gs_noise_bf16']):.6f}",
+                "the edit golden's ref segment is the SAME VAE encoding as enc_mean",
+                agree > 0.9,
+                f"corr={agree:.4f} (edit samples the posterior, hence not bit-equal)",
             )
 
-    print("vae:")
-    if vae is not None:
+
+def check_te(te: dict[str, np.ndarray], dit: dict[str, np.ndarray] | None) -> None:
+    drop = int(te["gen_drop_idx"][0])
+    gen_len = int(te["gen_txt_len"][0])
+    _check(
+        f"gen_txt == gen_hidden_full[{drop}:{drop + gen_len}] (drop_idx {drop})",
+        _max_abs(te["gen_txt"], te["gen_hidden_full"][drop : drop + gen_len]) == 0.0,
+    )
+    _check(
+        "gen drop_idx is 34",
+        drop == 34,
+        f"drop_idx={drop}, {te['gen_hidden_full'].shape[0]} packed tokens -> {gen_len} conditioning tokens",
+    )
+    edrop = int(te["edit_drop_idx"][0])
+    elen = int(te["edit_txt_len"][0])
+    _check(
+        f"edit_txt == edit_hidden_full[{edrop}:{edrop + elen}] (drop_idx {edrop})",
+        _max_abs(te["edit_txt"], te["edit_hidden_full"][edrop : edrop + elen]) == 0.0,
+    )
+    _check("edit drop_idx is 64", edrop == 64, f"drop_idx={edrop} -> {elen} conditioning tokens")
+    _check(
+        "conditioning width is the Qwen3-VL LM hidden size (2560)",
+        te["gen_txt"].shape[-1] == 2560 and te["edit_txt"].shape[-1] == 2560,
+    )
+    # A different template + a different image path must not produce the same vector.
+    _check(
+        "gen and edit conditioning are distinct",
+        _max_abs(te["gen_vec"], te["edit_vec"]) > 1e-3,
+    )
+
+    # --- GAP 1, pinned end to end ----------------------------------------------------------
+    # The slice relation above only says `gen_txt` is *a* window of `gen_hidden_full`; it says
+    # nothing about WHICH hidden state was captured, so it survives any rescale applied to both.
+    # This does not: `dit_in.txt` is the conditioning the transformer actually consumed, hooked
+    # out of the e2e run, and under batch_cfg it is `cat(pos, neg)` (`_build_pack_ctx`'s `d_txt`).
+    # It must be the dumped TE output BIT-FOR-BIT — which is only true if the TE golden captured
+    # the final post-RMSNorm hidden state the pipeline feeds forward.
+    if dit is not None and "dit_in.txt" in dit and _require(te, "neg_txt"):
+        packed = np.concatenate([te["gen_txt"], te["neg_txt"]], axis=0)
+        consumed = dit["dit_in.txt"][0]
         _check(
-            "enc_latent is the posterior MEAN (sample_posterior=False branch)",
-            _max_abs(vae["enc_latent"], vae["enc_mean"]) == 0.0,
+            "GAP 1: dit_in.txt IS cat(gen_txt, neg_txt) bit-for-bit (final post-RMSNorm state)",
+            consumed.shape == packed.shape and _max_abs(consumed, packed) == 0.0,
+            f"dit_in.txt={tuple(consumed.shape)} vs packed={tuple(packed.shape)}"
+            + (
+                f", max_abs={_max_abs(consumed, packed):.4f}"
+                if consumed.shape == packed.shape
+                else ""
+            ),
+        )
+    # `vec` is the MEAN of the post-drop tokens (`text_encoder.py:565`) — a second, independent
+    # tie between the pooled vector and the token tensor (bf16 accumulation, hence not exact).
+    for prefix, tokens in (("gen", "gen_txt"), ("neg", "neg_txt"), ("edit", "edit_txt")):
+        if f"{prefix}_vec" in te and tokens in te:
+            delta = _max_abs(te[f"{prefix}_vec"][0], te[tokens].astype(np.float64).mean(axis=0))
+            _check(
+                f"{prefix}_vec is the MEAN of {tokens} (bf16 accumulation)",
+                delta < 1.0,
+                f"max_abs={delta:.4f}",
+            )
+    # Scale anchor for the same GAP: an RMSNorm output has a checkpoint-fixed per-token scale
+    # (`rms(y_t) ≈ rms(norm.weight)`, because the input is normalized to rms 1 first) and a
+    # tightly concentrated one. The residual stream feeding that norm does not: the reference
+    # probe measured max_abs 10433 at the penultimate layer and 4225 at the final PRE-norm state,
+    # against 113 here. This rejects a wrong-layer capture even if it were uniformly rescaled to
+    # keep the slice relation intact.
+    medians = {}
+    for prefix in ("gen", "edit"):
+        key = f"{prefix}_hidden_full"
+        if key not in te:
+            continue
+        rms = np.sqrt((te[key].astype(np.float64) ** 2).mean(axis=-1))
+        p05, p50, p95 = (float(np.percentile(rms, p)) for p in (5, 50, 95))
+        medians[prefix] = p50
+        _check(
+            f"{key} has the post-RMSNorm per-token scale (median RMS in [2, 6])",
+            2.0 <= p50 <= 6.0,
+            f"median={p50:.4f} (p5={p05:.4f}, p95={p95:.4f})",
         )
         _check(
-            "enc_logvar is clamped to [-20, 10]",
-            float(vae["enc_logvar"].min()) >= -20.0 and float(vae["enc_logvar"].max()) <= 10.0,
-            f"[{vae['enc_logvar'].min():.3f}, {vae['enc_logvar'].max():.3f}]",
+            f"{key} per-token RMS is CONCENTRATED (normalized state, not a residual stream)",
+            p95 / p50 < 1.6 and p05 / p50 > 0.5,
+            f"p95/p50={p95 / p50:.3f}, p5/p50={p05 / p50:.3f}",
         )
+    if len(medians) == 2:
+        spread = abs(medians["gen"] - medians["edit"]) / max(medians.values())
         _check(
-            "decode output is in [-1, 1] (pre-clamp reference range)",
-            float(np.abs(vae["dec_from_latent"]).max()) < 1.5,
-            f"max_abs={float(np.abs(vae['dec_from_latent']).max()):.4f}",
-        )
-        _check(
-            "the two decodes differ (synthetic latent is not the encoded one)",
-            _max_abs(vae["dec_from_latent"], vae["dec_from_synth"]) > 0.1,
+            "gen and edit hidden states share one norm scale (same final RMSNorm weight)",
+            spread < 0.25,
+            f"medians {medians['gen']:.4f} vs {medians['edit']:.4f} ({spread:.1%} apart)",
         )
 
-    print("te:")
-    if te is not None:
-        drop = int(te["gen_drop_idx"][0])
-        gen_len = int(te["gen_txt_len"][0])
+
+def check_dit(dit: dict[str, np.ndarray], e2e: dict[str, np.ndarray] | None) -> None:
+    _check(
+        "dit_in.img carries the packed latent at 128 channels",
+        dit["dit_in.img"].shape[-1] == 128,
+        f"shape={tuple(dit['dit_in.img'].shape)}",
+    )
+    _check(
+        "dit_in.txt is the 2560-wide conditioning",
+        dit["dit_in.txt"].shape[-1] == 2560,
+        f"shape={tuple(dit['dit_in.txt'].shape)}",
+    )
+    _check(
+        "dit_out matches dit_in.img in shape (velocity, pre-CFG)",
+        dit["dit_out"].shape == dit["dit_in.img"].shape,
+    )
+    # batch_cfg packs [cond, uncond] into one varlen forward -> two segments, and the two
+    # halves must DIFFER (identical halves would mean the negative branch never applied).
+    img = dit["dit_in.img"]
+    half = img.shape[1] // 2
+    _check(
+        "batch_cfg duplicated the image stream (cond half == uncond half on input)",
+        _max_abs(img[:, :half], img[:, half:]) == 0.0,
+    )
+    _check(
+        "…but the velocities differ (the negative branch actually conditions)",
+        _max_abs(dit["dit_out"][:, :half], dit["dit_out"][:, half:]) > 1e-4,
+        f"max_abs={_max_abs(dit['dit_out'][:, :half], dit['dit_out'][:, half:]):.5f}",
+    )
+    # …while still being nearly COLLINEAR: same latent, same timestep, only the text differs.
+    # Independent noise in either half would score ~0 here.
+    align = _corr(dit["dit_out"][0, :half], dit["dit_out"][0, half:])
+    _check(
+        "cond and uncond velocities are near-collinear (one latent, two prompts)",
+        align > 0.9,
+        f"corr={align:.4f}",
+    )
+    if "img_shapes" in dit:
         _check(
-            f"gen_txt == gen_hidden_full[{drop}:{drop + gen_len}] (drop_idx {drop})",
-            _max_abs(te["gen_txt"], te["gen_hidden_full"][drop : drop + gen_len]) == 0.0,
-        )
-        _check(
-            "gen drop_idx is 34",
-            drop == 34,
-            f"drop_idx={drop}, {te['gen_hidden_full'].shape[0]} packed tokens -> {gen_len} conditioning tokens",
-        )
-        edrop = int(te["edit_drop_idx"][0])
-        elen = int(te["edit_txt_len"][0])
-        _check(
-            f"edit_txt == edit_hidden_full[{edrop}:{edrop + elen}] (drop_idx {edrop})",
-            _max_abs(te["edit_txt"], te["edit_hidden_full"][edrop : edrop + elen]) == 0.0,
-        )
-        _check("edit drop_idx is 64", edrop == 64, f"drop_idx={edrop} -> {elen} conditioning tokens")
-        _check(
-            "conditioning width is the Qwen3-VL LM hidden size (2560)",
-            te["gen_txt"].shape[-1] == 2560 and te["edit_txt"].shape[-1] == 2560,
-        )
-        # A different template + a different image path must not produce the same vector.
-        _check(
-            "gen and edit conditioning are distinct",
-            _max_abs(te["gen_vec"], te["edit_vec"]) > 1e-3,
+            "img_shapes is one (frame, h, w) row per packed segment",
+            dit["img_shapes"].ndim == 2 and dit["img_shapes"].shape[1] == 3,
+            f"{dit['img_shapes'].tolist()}",
         )
 
-    print("dit:")
+    # --- payload: the Euler identity -------------------------------------------------------
+    # `_velocity` combines the two halves as `unc + cfg*(cond - unc)` and the flow-match Euler
+    # scheduler advances `x <- x + (σ_{i+1} - σ_i)·v`. Recomputing that from the *dit* golden's
+    # velocity and the *e2e* golden's trajectory closes the loop over three files with no
+    # weights, and is the check that a randomized `dit_out` (or `traj_step*`) cannot survive.
+    if e2e is None or not {"traj_step0", "traj_step1", "cfg"} <= set(e2e):
+        return
+    steps = int(e2e["geometry"][2]) if "geometry" in e2e else 4
+    sig_key = f"sigmas_{steps}"
+    if sig_key not in e2e:
+        return
+    sigmas = e2e[sig_key].astype(np.float64)
+    traj0, traj1 = e2e["traj_step0"], e2e["traj_step1"]
+    n = traj0.shape[1] // 2
+    if dit["dit_out"].shape[1] != traj0.shape[1]:
+        return
+    x0 = traj0[0, :n].astype(np.float64)
+    x1 = traj1[0, :n].astype(np.float64)
+    cond = dit["dit_out"][0, :n].astype(np.float64)
+    unc = dit["dit_out"][0, n:].astype(np.float64)
+    cfg = float(e2e["cfg"][0])
+    d_sigma = float(sigmas[1] - sigmas[0])
+
+    def residual(velocity: np.ndarray) -> float:
+        return float(np.abs(x1 - (x0 + d_sigma * velocity)).max())
+
+    combined = residual(unc + cfg * (cond - unc))
+    wrong = {
+        "cond-only": residual(cond),
+        "uncond-only": residual(unc),
+        "swapped": residual(cond + cfg * (unc - cond)),
+        "no-step": float(np.abs(x1 - x0).max()),
+    }
+    # The reference runs bf16, so the step leaves a rounding residual (~0.009 on a std-0.95
+    # tensor); every wrong combination is an order of magnitude worse (0.17 - 0.39).
+    _check(
+        f"EULER: traj_step1 == traj_step0 + (σ1-σ0)·(unc + {cfg:g}·(cond-unc))",
+        combined < 0.05,
+        f"max_abs={combined:.5f} (bf16 step residual; x1 std={float(x1.std()):.3f})",
+    )
+    _check(
+        "…and that combination is the ONLY one that fits (the check discriminates)",
+        all(v > 5.0 * max(combined, 1e-9) for v in wrong.values()),
+        ", ".join(f"{k}={v:.4f}" for k, v in wrong.items()),
+    )
+
+
+def check_dit_block(block: dict[str, np.ndarray], dit: dict[str, np.ndarray] | None) -> None:
+    rope_re = block.get("block_in.image_rotary_emb_re")
+    rope_im = block.get("block_in.image_rotary_emb_im")
+    _check(
+        "msrope table survived as COMPLEX (real + imag), not truncated to its real part",
+        rope_re is not None and rope_im is not None,
+    )
+    if rope_re is not None and rope_im is not None:
+        modulus = np.sqrt(rope_re.astype(np.float64) ** 2 + rope_im.astype(np.float64) ** 2)
+        _check(
+            "msrope entries have unit modulus (they are e^{i·theta})",
+            float(np.abs(modulus - 1.0).max()) < 1e-5,
+            f"max||z|-1|={float(np.abs(modulus - 1.0).max()):.2e}",
+        )
+        _check(
+            "msrope half-width is head_dim/2 = 64",
+            rope_re.shape[-1] == 64,
+            f"shape={tuple(rope_re.shape)}",
+        )
+        _check(
+            "the imaginary part is non-trivial (would be all-zero if wrongly cast)",
+            float(np.abs(rope_im).max()) > 0.1,
+        )
+        _check_msrope_payload(block, dit, rope_re, rope_im)
+
+    _check(
+        "block output shapes match its inputs (txt, img)",
+        block["block_out.0"].shape == block["block_in.encoder_hidden_states"].shape
+        and block["block_out.1"].shape == block["block_in.hidden_states"].shape,
+    )
+    _check(
+        "the block actually transformed the image stream",
+        _max_abs(block["block_out.1"], block["block_in.hidden_states"]) > 1e-3,
+    )
+    # --- payload: the outputs are real activations -----------------------------------------
+    # The two image-stream halves start identical and see the same timestep embedding, so the
+    # block output halves stay near-collinear; independent noise scores ~0.
+    out_img = block["block_out.1"]
+    in_img = block["block_in.hidden_states"]
+    n = out_img.shape[1] // 2
+    if n > 0 and _max_abs(in_img[:, :n], in_img[:, n:]) == 0.0:
+        align = _corr(out_img[0, :n], out_img[0, n:])
+        _check(
+            "block_out.1 cond/uncond halves are near-collinear (same input, different text)",
+            align > 0.9,
+            f"corr={align:.4f}",
+        )
+    # NR-MMDiT activations are massively heavy-tailed (outlier features); Gaussian noise is 3.0
+    # by construction, so this rejects a moment-matched randomization of either stream.
+    for key in ("block_out.0", "block_out.1"):
+        kurt = _kurtosis(block[key])
+        _check(
+            f"{key} is a heavy-tailed activation tensor, not Gaussian noise",
+            kurt > 10.0,
+            f"kurtosis={kurt:.1f} (Gaussian = 3.0)",
+        )
+
+
+def _check_msrope_payload(
+    block: dict[str, np.ndarray],
+    dit: dict[str, np.ndarray] | None,
+    rope_re: np.ndarray,
+    rope_im: np.ndarray,
+) -> None:
+    """Recompute the whole msrope table in numpy and pin the batch_cfg frame index.
+
+    Weightless: `img_shapes` + `theta=10000` + `axes_dim=[16,56,56]` determine every entry.
+    """
+    geometry = block.get("geometry")
+    cu = block.get("block_in.img_cu_lens")
+    if geometry is None or cu is None:
+        return
+    gh, gw = int(geometry[0]) // 16, int(geometry[1]) // 16
+    seg_lens = np.diff(cu.astype(np.int64)).tolist()
+    if not seg_lens or any(length != gh * gw for length in seg_lens):
+        _check(
+            "packed image segments are one gh*gw latent grid each",
+            False,
+            f"cu_lens={cu.tolist()} vs gh*gw={gh * gw}",
+        )
+        return
+    shapes = np.array([[1, gh, gw]] * len(seg_lens), dtype=np.int32)
+    if dit is not None and "img_shapes" in dit:
+        _check(
+            "block img_cu_lens agrees with the DiT golden's img_shapes",
+            dit["img_shapes"].shape == shapes.shape
+            and np.array_equal(dit["img_shapes"].astype(np.int64), shapes.astype(np.int64)),
+            f"dit={dit['img_shapes'].tolist()} vs derived={shapes.tolist()}",
+        )
+
+    table = _msrope_table(shapes)
+    if table.shape != rope_re.shape:
+        _check(
+            "msrope table recomputes to the golden's shape",
+            False,
+            f"recomputed {table.shape} vs golden {rope_re.shape}",
+        )
+        return
+    delta = max(_max_abs(table.real, rope_re), _max_abs(table.imag, rope_im))
+    _check(
+        "msrope table RECOMPUTES from img_shapes + theta 10000 + axes_dim [16,56,56]",
+        delta < 1e-5,
+        f"max_abs={delta:.2e} (f32 rounding)",
+    )
+
+    # The CONFIRMED batch_cfg finding, stated as its own assertion: the frame frequencies come
+    # from each segment's *position* in `d_img_shapes`, so segment j is rotated at frame index j.
+    # Segment 0 is therefore exact identity and the duplicated uncond segment is rotated at 1.
+    frame_dim = ROPE_AXES_DIM[0]
+    n_frame = frame_dim // 2
+    inv = 1.0 / np.power(float(ROPE_THETA), np.arange(0, frame_dim, 2, dtype=np.float64) / frame_dim)
+    ok, detail = True, []
+    for idx, start in enumerate(np.cumsum([0, *seg_lens[:-1]])):
+        rows = slice(int(start), int(start) + seg_lens[idx])
+        want_re, want_im = np.cos(idx * inv), np.sin(idx * inv)
+        d = max(
+            float(np.abs(rope_re[rows, :n_frame] - want_re).max()),
+            float(np.abs(rope_im[rows, :n_frame] - want_im).max()),
+        )
+        ok = ok and d < 1e-5
+        detail.append(f"seg{idx}@frame{idx}: {d:.1e}")
+    _check(
+        "batch_cfg rotates segment j at msrope FRAME INDEX j (cond=identity, uncond dup=frame 1)",
+        ok and len(seg_lens) >= 2,
+        ", ".join(detail),
+    )
+    _check(
+        "…segment 0's frame slots are EXACTLY identity (1, 0)",
+        float(np.abs(rope_re[: seg_lens[0], :n_frame] - 1.0).max()) == 0.0
+        and float(np.abs(rope_im[: seg_lens[0], :n_frame]).max()) == 0.0,
+    )
+    # h/w are identical across the duplicated segments — only the frame slots move.
+    if len(seg_lens) >= 2 and seg_lens[0] == seg_lens[1]:
+        n0 = seg_lens[0]
+        spatial = max(
+            _max_abs(rope_re[:n0, n_frame:], rope_re[n0 : 2 * n0, n_frame:]),
+            _max_abs(rope_im[:n0, n_frame:], rope_im[n0 : 2 * n0, n_frame:]),
+        )
+        _check(
+            "…and the h/w slots are untouched by the duplication",
+            spatial == 0.0,
+            f"h/w max_abs={spatial:.4f}",
+        )
+
+
+def check_e2e(
+    e2e: dict[str, np.ndarray], noise: dict[str, np.ndarray] | None, dit: dict[str, np.ndarray] | None
+) -> None:
+    sig4 = e2e["sigmas_4"]
+    _check(
+        "the 4-step schedule is the static-shift 6·s/(1+5·s) ladder + terminal 0",
+        np.allclose(sig4, [1.0, 0.94736844, 0.85714287, 0.66666669, 0.0], atol=1e-6),
+        f"{[round(float(v), 6) for v in sig4]}",
+    )
+    _check("sigmas end at 0", float(sig4[-1]) == 0.0)
+    _check(
+        "sigmas are strictly decreasing",
+        bool(np.all(np.diff(sig4.astype(np.float64)) < 0)),
+    )
+    if noise is not None and "traj_step0" in e2e and "gs_noise_bf16" in noise:
+        traj = e2e["traj_step0"]
+        half = traj.shape[1] // 2
+        start = traj[0, :half]
+        _check(
+            "the denoise STARTS from the Gaussian-Shading latent (not plain randn)",
+            _max_abs(start, _tokens_of(noise["gs_noise_bf16"])) == 0.0,
+            f"vs plain randn: max_abs={_max_abs(start, _tokens_of(noise['plain_randn'])):.4f}",
+        )
+    if "traj_step0" in e2e and "traj_step1" in e2e:
+        _check(
+            "step 1 differs from step 0 (the sampler advanced)",
+            _max_abs(e2e["traj_step0"], e2e["traj_step1"]) > 1e-3,
+        )
+    _check(
+        "the decoded image is not a blank refusal placeholder",
+        int(e2e["image_u8"].min()) < 250 and float(e2e["image_u8"].std()) > 5.0,
+        f"min={int(e2e['image_u8'].min())} std={float(e2e['image_u8'].std()):.1f}",
+    )
     if dit is not None:
         _check(
-            "dit_in.img carries the packed latent at 128 channels",
-            dit["dit_in.img"].shape[-1] == 128,
-            f"shape={tuple(dit['dit_in.img'].shape)}",
+            "the DiT golden was captured at e2e step 0 (same latent)",
+            _max_abs(dit["dit_in.img"], e2e["traj_step0"]) == 0.0,
         )
-        _check(
-            "dit_in.txt is the 2560-wide conditioning",
-            dit["dit_in.txt"].shape[-1] == 2560,
-            f"shape={tuple(dit['dit_in.txt'].shape)}",
-        )
-        _check(
-            "dit_out matches dit_in.img in shape (velocity, pre-CFG)",
-            dit["dit_out"].shape == dit["dit_in.img"].shape,
-        )
-        # batch_cfg packs [cond, uncond] into one varlen forward -> two segments, and the two
-        # halves must DIFFER (identical halves would mean the negative branch never applied).
-        img = dit["dit_in.img"]
-        half = img.shape[1] // 2
-        _check(
-            "batch_cfg duplicated the image stream (cond half == uncond half on input)",
-            _max_abs(img[:, :half], img[:, half:]) == 0.0,
-        )
-        _check(
-            "…but the velocities differ (the negative branch actually conditions)",
-            _max_abs(dit["dit_out"][:, :half], dit["dit_out"][:, half:]) > 1e-4,
-            f"max_abs={_max_abs(dit['dit_out'][:, :half], dit['dit_out'][:, half:]):.5f}",
-        )
-        if "img_shapes" in dit:
-            _check(
-                "img_shapes is one (frame, h, w) row per packed segment",
-                dit["img_shapes"].ndim == 2 and dit["img_shapes"].shape[1] == 3,
-                f"{dit['img_shapes'].tolist()}",
-            )
+    check_final_latent("e2e", e2e)
 
-    print("dit_block:")
-    if block is not None:
-        rope_re = block.get("block_in.image_rotary_emb_re")
-        rope_im = block.get("block_in.image_rotary_emb_im")
+
+def check_final_latent(stage: str, bundle: dict[str, np.ndarray]) -> None:
+    """`final_tokens` <-> `final_latent` reshape identity + "this latent made that image"."""
+    if not {"final_tokens", "final_latent", "geometry", "image_u8"} <= set(bundle):
+        return
+    tokens, latent = bundle["final_tokens"], bundle["final_latent"]
+    gh, gw = int(bundle["geometry"][0]) // 16, int(bundle["geometry"][1]) // 16
+    rebuilt = np.ascontiguousarray(tokens.reshape(1, gh, gw, -1).transpose(0, 3, 1, 2))
+    _check(
+        f"{stage}: final_latent is final_tokens reshaped `(h w) c -> c h w` (bit-exact)",
+        rebuilt.shape == latent.shape and _max_abs(rebuilt, latent) == 0.0,
+        f"tokens={tuple(tokens.shape)} -> {tuple(rebuilt.shape)} vs {tuple(latent.shape)}",
+    )
+    tracked = _latent_image_channels(latent, bundle["image_u8"])
+    _check(
+        f"{stage}: final_latent is the latent that DECODED to image_u8",
+        tracked >= 4,
+        f"{tracked}/{latent.shape[1]} channels |corr|>0.5 vs the 16x block-mean luma (random: 0)",
+    )
+    tv = _tv_ratio(latent)
+    _check(
+        f"{stage}: final_latent has image-like spatial structure, not white noise",
+        tv < 0.9,
+        f"TV/std={tv:.4f} (white noise ~1.13)",
+    )
+
+
+def check_edit(edit: dict[str, np.ndarray], noise: dict[str, np.ndarray] | None) -> None:
+    if "seq_step0" not in edit:
+        return
+    seq = edit["seq_step0"]
+    n_tgt = int(edit["target_tokens"][0])
+    half = seq.shape[1] // 2
+    _check(
+        "the edit stream is [target, ref] per sample (2 segments of equal length)",
+        half == 2 * n_tgt,
+        f"per-branch tokens={half}, target tokens={n_tgt}",
+    )
+    if noise is not None and "gs_noise_bf16" in noise and half == 2 * n_tgt:
+        target_slice = seq[0, :n_tgt]
+        ref_slice = seq[0, n_tgt : 2 * n_tgt]
         _check(
-            "msrope table survived as COMPLEX (real + imag), not truncated to its real part",
-            rope_re is not None and rope_im is not None,
-        )
-        if rope_re is not None and rope_im is not None:
-            modulus = np.sqrt(rope_re.astype(np.float64) ** 2 + rope_im.astype(np.float64) ** 2)
-            _check(
-                "msrope entries have unit modulus (they are e^{i·theta})",
-                float(np.abs(modulus - 1.0).max()) < 1e-5,
-                f"max|,|z|-1,|={float(np.abs(modulus - 1.0).max()):.2e}",
-            )
-            _check(
-                "msrope half-width is head_dim/2 = 64",
-                rope_re.shape[-1] == 64,
-                f"shape={tuple(rope_re.shape)}",
-            )
-            _check(
-                "the imaginary part is non-trivial (would be all-zero if wrongly cast)",
-                float(np.abs(rope_im).max()) > 0.1,
-            )
-            # batch_cfg concatenates the SEGMENT LIST (`d_img_shapes = img_shapes[0] * 2`), and
-            # the frame index comes from each segment's enumerate position — so the duplicated
-            # (uncond) half is rotated at frame 1, not 0. The difference must live ENTIRELY in
-            # the frame slots (axes_dim[0]//2 = 8 complex entries); h/w must be untouched.
-            n = rope_re.shape[0] // 2
-            frame_slots, spatial_slots = slice(0, 8), slice(8, None)
-            frame_delta = max(
-                _max_abs(rope_re[:n, frame_slots], rope_re[n:, frame_slots]),
-                _max_abs(rope_im[:n, frame_slots], rope_im[n:, frame_slots]),
-            )
-            spatial_delta = max(
-                _max_abs(rope_re[:n, spatial_slots], rope_re[n:, spatial_slots]),
-                _max_abs(rope_im[:n, spatial_slots], rope_im[n:, spatial_slots]),
-            )
-            _check(
-                "batch_cfg rotates the uncond half at a DIFFERENT frame index (frame slots only)",
-                frame_delta > 0.1 and spatial_delta == 0.0,
-                f"frame max_abs={frame_delta:.4f}, h/w max_abs={spatial_delta:.4f}",
-            )
-        _check(
-            "block output shapes match its inputs (txt, img)",
-            block["block_out.0"].shape == block["block_in.encoder_hidden_states"].shape
-            and block["block_out.1"].shape == block["block_in.hidden_states"].shape,
+            "segment 0 is the NOISY TARGET (== the Gaussian-Shading latent) — target is FIRST",
+            _max_abs(target_slice, _tokens_of(noise["gs_noise_bf16"])) == 0.0,
         )
         _check(
-            "the block actually transformed the image stream",
-            _max_abs(block["block_out.1"], block["block_in.hidden_states"]) > 1e-3,
+            "segment 1 is a DIFFERENT tensor (the clean reference latent)",
+            _max_abs(ref_slice, _tokens_of(noise["gs_noise_bf16"])) > 0.1,
+            f"max_abs={_max_abs(ref_slice, _tokens_of(noise['gs_noise_bf16'])):.4f}",
+        )
+    if "seq_step1" in edit and half == 2 * n_tgt:
+        _check(
+            "refs stay CLEAN across steps while the target moves",
+            _max_abs(edit["seq_step0"][0, n_tgt : 2 * n_tgt], edit["seq_step1"][0, n_tgt : 2 * n_tgt]) == 0.0
+            and _max_abs(edit["seq_step0"][0, :n_tgt], edit["seq_step1"][0, :n_tgt]) > 1e-3,
+        )
+    if "img_shapes" in edit and "geometry" in edit:
+        # GAP 5, asserted rather than merely printed. The rows are per-segment (frame COUNT,
+        # h, w) — the msrope FRAME INDEX is the row's position, so under batch_cfg the segment
+        # order is [target, ref…] then the duplicate, i.e. frames 0..1 then 2..3.
+        shapes = edit["img_shapes"]
+        gh, gw = int(edit["geometry"][0]) // 16, int(edit["geometry"][1]) // 16
+        n_refs = half // n_tgt - 1 if n_tgt else 0
+        n_rows = 2 * (1 + n_refs)
+        expect = np.array([[1, gh, gw]] * n_rows, dtype=np.int64)
+        _check(
+            f"img_shapes is [target, ref x{n_refs}] doubled by batch_cfg — "
+            f"{n_rows} rows of (1, {gh}, {gw})",
+            shapes.shape == expect.shape and np.array_equal(shapes.astype(np.int64), expect),
+            f"img_shapes={shapes.tolist()}",
+        )
+        _check(
+            "…so the msrope frame INDEX runs 0..n-1 over that list (target 0, ref_j j)",
+            shapes.shape[0] == n_rows and n_refs >= 1,
+            f"frame indices={list(range(shapes.shape[0]))}",
+        )
+    _check(
+        "the edited image is not a blank refusal placeholder",
+        int(edit["image_u8"].min()) < 250 and float(edit["image_u8"].std()) > 5.0,
+        f"min={int(edit['image_u8'].min())} std={float(edit['image_u8'].std()):.1f}",
+    )
+    check_final_latent("edit", edit)
+
+
+# --------------------------------------------------------------------------------- self-test
+#
+# A checker that cannot be shown to REJECT a wrong bundle is worth nothing: 39 structural
+# invariants used to pass against goldens whose payload tensors had been swapped for noise. So
+# the discrimination claim is executable — `--self-test` corrupts a scratch copy one tensor at a
+# time and asserts this script rejects every one. Same pattern as
+# `candle-gen/scripts/check-gen-core-skew.sh --self-test`.
+#
+# Every mutation is moment-matched (identical shape, dtype, mean and std) and, where a structural
+# invariant would otherwise trivially catch it, deliberately repaired to keep that invariant
+# intact — `enc_latent` is kept equal to `enc_mean`, `final_latent` is re-derived from the
+# corrupted `final_tokens` so the reshape identity still holds, the corrupted decode is clipped
+# back into [-1, 1], the randomized msrope keeps unit modulus and matched spatial halves, and the
+# rescaled TE keeps its `*_txt == *_hidden_full[drop:]` slice relation.
+
+
+def _moment_matched(rng: np.random.Generator, a: np.ndarray) -> np.ndarray:
+    x = rng.standard_normal(a.shape)
+    x = (x - x.mean()) / x.std()
+    return (x * float(a.std()) + float(a.mean())).astype(a.dtype)
+
+
+def _mutations(rng: np.random.Generator) -> dict[str, tuple[str, object]]:
+    def block_out(t):
+        for key in ("block_out.0", "block_out.1"):
+            t[key] = _moment_matched(rng, t[key])
+
+    def dit_out(t):
+        t["dit_out"] = _moment_matched(rng, t["dit_out"])
+
+    def dec(t):
+        t["dec_from_latent"] = np.clip(_moment_matched(rng, t["dec_from_latent"]), -1.0, 1.0)
+
+    def enc(t):
+        z = _moment_matched(rng, t["enc_mean"])
+        t["enc_mean"], t["enc_latent"] = z, z.copy()
+
+    def final(t):
+        tokens = _moment_matched(rng, t["final_tokens"])
+        gh, gw = int(t["geometry"][0]) // 16, int(t["geometry"][1]) // 16
+        t["final_tokens"] = tokens
+        t["final_latent"] = np.ascontiguousarray(
+            tokens.reshape(1, gh, gw, -1).transpose(0, 3, 1, 2)
         )
 
-    print("e2e:")
-    if e2e is not None:
-        sig4 = e2e["sigmas_4"]
-        _check(
-            "the 4-step schedule is the static-shift 6·s/(1+5·s) ladder + terminal 0",
-            np.allclose(sig4, [1.0, 0.94736844, 0.85714287, 0.66666669, 0.0], atol=1e-6),
-            f"{[round(float(v), 6) for v in sig4]}",
-        )
-        _check("sigmas end at 0", float(sig4[-1]) == 0.0)
-        _check(
-            "sigmas are strictly decreasing",
-            bool(np.all(np.diff(sig4.astype(np.float64)) < 0)),
-        )
-        if noise is not None and "traj_step0" in e2e and "gs_noise_bf16" in noise:
-            traj = e2e["traj_step0"]
-            half = traj.shape[1] // 2
-            start = traj[0, :half]
-            _check(
-                "the denoise STARTS from the Gaussian-Shading latent (not plain randn)",
-                _max_abs(start, _tokens_of(noise["gs_noise_bf16"])) == 0.0,
-                f"vs plain randn: max_abs={_max_abs(start, _tokens_of(noise['plain_randn'])):.4f}",
-            )
-        if "traj_step0" in e2e and "traj_step1" in e2e:
-            _check(
-                "step 1 differs from step 0 (the sampler advanced)",
-                _max_abs(e2e["traj_step0"], e2e["traj_step1"]) > 1e-3,
-            )
-        _check(
-            "the decoded image is not a blank refusal placeholder",
-            int(e2e["image_u8"].min()) < 250 and float(e2e["image_u8"].std()) > 5.0,
-            f"min={int(e2e['image_u8'].min())} std={float(e2e['image_u8'].std()):.1f}",
-        )
-        if dit is not None:
-            _check(
-                "the DiT golden was captured at e2e step 0 (same latent)",
-                _max_abs(dit["dit_in.img"], e2e["traj_step0"]) == 0.0,
-            )
+    def msrope(t):
+        n = t["block_in.image_rotary_emb_re"].shape[0] // 2
+        width = t["block_in.image_rotary_emb_re"].shape[1]
+        cond = rng.uniform(-np.pi, np.pi, size=(n, width))
+        cond[:, :8] = 0.0  # frame slots left at identity in the cond half
+        unc = cond.copy()  # spatial slots MATCHED across the halves
+        unc[:, :8] = rng.uniform(0.05, 0.5, size=(n, 8))
+        angles = np.concatenate([cond, unc])
+        t["block_in.image_rotary_emb_re"] = np.cos(angles).astype(np.float32)
+        t["block_in.image_rotary_emb_im"] = np.sin(angles).astype(np.float32)
 
-    print("edit:")
-    if edit is not None and "seq_step0" in edit:
-        seq = edit["seq_step0"]
-        n_tgt = int(edit["target_tokens"][0])
-        half = seq.shape[1] // 2
-        _check(
-            "the edit stream is [target, ref] per sample (2 segments of equal length)",
-            half == 2 * n_tgt,
-            f"per-branch tokens={half}, target tokens={n_tgt}",
+    def rescale_te(factor: float):
+        keys = ("gen_hidden_full", "gen_txt", "gen_vec", "neg_txt", "neg_vec",
+                "edit_hidden_full", "edit_txt", "edit_vec")
+
+        def apply(t):
+            for key in keys:
+                t[key] = (t[key].astype(np.float64) * factor).astype(np.float32)
+
+        return apply
+
+    return {
+        "block_out.{0,1} -> noise": ("dit_block", block_out),
+        "dit_out -> noise": ("dit", dit_out),
+        "dec_from_latent -> noise": ("vae", dec),
+        "enc_mean + enc_latent -> noise": ("vae", enc),
+        "final_latent + final_tokens -> noise": ("e2e", final),
+        "msrope angles -> random (unit modulus kept)": ("dit_block", msrope),
+        "TE captured at a wrong layer (x3.7)": ("te", rescale_te(3.7)),
+        "TE captured at a wrong layer (x1.3)": ("te", rescale_te(1.3)),
+    }
+
+
+def _self_test() -> int:
+    import shutil
+    import subprocess
+    import tempfile
+
+    from safetensors.numpy import save_file
+
+    missing = [s for s in _STEMS if not (GOLDEN / f"mage_flow_{s}_golden.safetensors").is_file()]
+    if missing:
+        print(f"--self-test needs the full bundle; missing {missing} under {GOLDEN}")
+        return 1
+
+    def verdict(directory: Path) -> tuple[int, str]:
+        proc = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve()), "--golden", str(directory)],
+            capture_output=True,
+            text=True,
         )
-        if noise is not None and "gs_noise_bf16" in noise and half == 2 * n_tgt:
-            target_slice = seq[0, :n_tgt]
-            ref_slice = seq[0, n_tgt : 2 * n_tgt]
-            _check(
-                "segment 0 is the NOISY TARGET (== the Gaussian-Shading latent) — target is FIRST",
-                _max_abs(target_slice, _tokens_of(noise["gs_noise_bf16"])) == 0.0,
-            )
-            _check(
-                "segment 1 is a DIFFERENT tensor (the clean reference latent)",
-                _max_abs(ref_slice, _tokens_of(noise["gs_noise_bf16"])) > 0.1,
-                f"max_abs={_max_abs(ref_slice, _tokens_of(noise['gs_noise_bf16'])):.4f}",
-            )
-        if "seq_step1" in edit and half == 2 * n_tgt:
-            _check(
-                "refs stay CLEAN across steps while the target moves",
-                _max_abs(edit["seq_step0"][0, n_tgt : 2 * n_tgt], edit["seq_step1"][0, n_tgt : 2 * n_tgt]) == 0.0
-                and _max_abs(edit["seq_step0"][0, :n_tgt], edit["seq_step1"][0, :n_tgt]) > 1e-3,
-            )
-        if "img_shapes" in edit:
-            frames = edit["img_shapes"][:, 0].tolist()
-            _check(
-                "msrope frame indices are 1 per segment (target then refs)",
-                len(frames) >= 2,
-                f"img_shapes={edit['img_shapes'].tolist()}",
-            )
-        _check(
-            "the edited image is not a blank refusal placeholder",
-            int(edit["image_u8"].min()) < 250 and float(edit["image_u8"].std()) > 5.0,
-            f"min={int(edit['image_u8'].min())} std={float(edit['image_u8'].std()):.1f}",
+        tail = next(
+            (ln for ln in proc.stdout.splitlines() if ln.startswith(("FAILED ", "all "))), ""
         )
+        return proc.returncode, tail
+
+    rng = np.random.default_rng(20260724)
+    rows: list[tuple[str, bool, str]] = []
+    with tempfile.TemporaryDirectory() as tmp:
+        scratch = Path(tmp) / "bundle"
+
+        def reset() -> None:
+            shutil.rmtree(scratch, ignore_errors=True)
+            scratch.mkdir(parents=True)
+            for f in GOLDEN.glob("mage_flow_*.safetensors"):
+                shutil.copy2(f, scratch / f.name)
+
+        reset()
+        code, tail = verdict(scratch)
+        rows.append(("pristine copy (must PASS)", code == 0, tail))
+
+        for name, (stem, mutate) in _mutations(rng).items():
+            reset()
+            path = scratch / f"mage_flow_{stem}_golden.safetensors"
+            tensors = load_file(str(path))
+            mutate(tensors)
+            save_file(tensors, str(path))
+            code, tail = verdict(scratch)
+            rows.append((name, code != 0, tail))
+
+        empty = Path(tmp) / "empty"
+        empty.mkdir()
+        rows.append(("empty directory (must FAIL)", verdict(empty)[0] != 0, ""))
+
+    width = max(len(name) for name, _, _ in rows)
+    for name, ok, tail in rows:
+        print(f"  [{'ok  ' if ok else 'FAIL'}] {name:{width}s}  {tail}")
+    bad = sum(1 for _, ok, _ in rows if not ok)
+    print()
+    if bad:
+        print(f"SELF-TEST FAILED: {bad}/{len(rows)} cases were not discriminated")
+        return 1
+    print(f"self-test: all {len(rows) - 1} corruptions rejected, the pristine bundle accepted")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    global GOLDEN
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--golden",
+        default=None,
+        help="directory holding the mage_flow_*_golden.safetensors bundle (default tools/golden)",
+    )
+    parser.add_argument(
+        "--allow-missing",
+        action="store_true",
+        help="skip absent stages instead of failing (the goldens are gitignored)",
+    )
+    parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help="prove the invariants discriminate: corrupt a scratch copy and expect rejection",
+    )
+    args = parser.parse_args(argv)
+    if args.self_test:
+        if args.golden:
+            GOLDEN = Path(args.golden).expanduser()
+        print(f"self-test against {GOLDEN}")
+        return _self_test()
+    if args.golden:
+        GOLDEN = Path(args.golden).expanduser()
+    print(f"golden dir: {GOLDEN}")
+
+    bundles = {stem: _load(stem, args.allow_missing) for stem in _STEMS}
+    noise, vae, te = bundles["noise"], bundles["vae"], bundles["te"]
+    dit, block, e2e, edit = bundles["dit"], bundles["dit_block"], bundles["e2e"], bundles["edit"]
+
+    for label, bundle, run in (
+        ("noise", noise, lambda b: check_noise(b)),
+        ("vae", vae, lambda b: check_vae(b, edit)),
+        ("te", te, lambda b: check_te(b, dit)),
+        ("dit", dit, lambda b: check_dit(b, e2e)),
+        ("dit_block", block, lambda b: check_dit_block(b, dit)),
+        ("e2e", e2e, lambda b: check_e2e(b, noise, dit)),
+        ("edit", edit, lambda b: check_edit(b, noise)),
+    ):
+        if bundle is None:
+            continue
+        print(f"{label}:")
+        run(bundle)
 
     print()
     if _FAILURES:
         print(f"FAILED {len(_FAILURES)}/{_CHECKS}: " + ", ".join(_FAILURES))
+        return 1
+    if _CHECKS == 0:
+        print(f"NOTHING VERIFIED: no goldens found under {GOLDEN}. Run dump_mage_flow_golden.py.")
         return 1
     print(f"all {_CHECKS} golden invariants hold")
     return 0
