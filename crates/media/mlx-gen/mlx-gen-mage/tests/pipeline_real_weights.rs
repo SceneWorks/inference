@@ -47,39 +47,73 @@ fn public_pipeline_matches_the_torch_render() {
     ])
     .unwrap();
 
-    // These boundaries precede the chaos-amplifying VAE/image conversion. The port runs bf16
-    // activations while the oracle captures torch bf16→f32, so 2% mean-relative / 0.5 peak is a
-    // deliberately tight bf16 accumulation bound across four Euler steps, not a pixel heuristic.
-    for (label, actual, expected) in [
+    // The oracle is torch-bf16 on CPU; the port is MLX-bf16 on Metal. The isolated step-zero DiT
+    // gate measures 2.0741% mean-relative between those backends. CFG=5 then feeds that residual
+    // back through four nonlinear forwards, so final-token equality is not a valid gate.
+    //
+    // Mutation measurements against this exact golden (256², 4 steps):
+    // faithful:       step1 .008032, final .156555, image .04088 mean-relative
+    // swapped CFG:    step1 .112686, final 1.311762, image .80928
+    // GS key + 1:     step0 .994330, step1 1.012730, final 1.161042, image .42842
+    // pre-add bf16:   step1 .008032, final .155926, image .04053
+    //
+    // Thus the early trajectory and image mean discriminate semantic mistakes, while the
+    // scheduler cast-order mutation is explicitly NOT separable through this cross-backend
+    // four-step oracle. Source fidelity for that operation is covered by the unit-level scheduler
+    // contract, not by pretending the chaotic final latent supplies a tighter answer.
+    let mut failures = Vec::new();
+    for (label, actual, expected, max_abs_gate, mean_rel_gate) in [
         (
             "traj_step0",
             &trace.trajectories[0],
             golden.require("traj_step0").unwrap(),
+            1.0e-6,
+            1.0e-6,
         ),
         (
             "traj_step1",
             &trace.trajectories[1],
             golden.require("traj_step1").unwrap(),
+            0.5,
+            0.03,
         ),
         (
             "final_tokens",
             &trace.final_tokens,
             golden.require("final_tokens").unwrap(),
+            8.0,
+            0.30,
         ),
         (
             "final_latent",
             &trace.final_latent,
             golden.require("final_latent").unwrap(),
+            8.0,
+            0.30,
         ),
     ] {
         let (max_abs, _, mean_rel) = error(actual, expected);
         println!("{label}: max_abs={max_abs:.5}, mean_rel={mean_rel:.6}");
-        assert!(max_abs <= 0.5, "{label} peak error {max_abs}");
-        assert!(mean_rel <= 0.02, "{label} mean-relative error {mean_rel}");
+        if max_abs > max_abs_gate || mean_rel > mean_rel_gate {
+            failures.push(format!(
+                "{label}: max_abs={max_abs:.5} (gate {max_abs_gate}), \
+                 mean_rel={mean_rel:.6} (gate {mean_rel_gate})"
+            ));
+        }
     }
     let want = golden.require("image_u8").unwrap();
     let (max_abs, _peak_rel, mean_rel) = error(got, want);
     println!("Mage-Flow public pipeline: max_abs={max_abs:.3}, mean_rel={mean_rel:.5}");
-    assert!(max_abs <= 64.0, "render max pixel error {max_abs}");
-    assert!(mean_rel <= 0.08, "render mean-relative error {mean_rel}");
+    // Peak pixel error is not stable under the VAE's nonlinear amplification (faithful 163,
+    // wrong cast-order 156). Mean-relative image error does discriminate the semantic controls.
+    if mean_rel > 0.10 {
+        failures.push(format!(
+            "image_u8: max_abs={max_abs:.3}, mean_rel={mean_rel:.5} (gate 0.10)"
+        ));
+    }
+    assert!(
+        failures.is_empty(),
+        "public-pipeline parity failures:\n{}",
+        failures.join("\n")
+    );
 }

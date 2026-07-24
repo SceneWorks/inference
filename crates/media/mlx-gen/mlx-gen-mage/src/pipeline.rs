@@ -274,6 +274,19 @@ pub fn cfg_velocity(cond: &Array, unc: &Array, cfg: f32, renormalize: bool) -> R
         .as_dtype(cond.dtype())?)
 }
 
+/// One deterministic Diffusers `FlowMatchEulerDiscreteScheduler.step`.
+fn flow_euler_step(sample: &Array, model_output: &Array, delta: f32) -> Result<Array> {
+    let model_dtype = model_output.dtype();
+    Ok(sample
+        .as_dtype(Dtype::Float32)?
+        .add(
+            &model_output
+                .as_dtype(Dtype::Float32)?
+                .multiply(Array::from_slice(&[delta], &[1]))?,
+        )?
+        .as_dtype(model_dtype)?)
+}
+
 /// Run Mage's rectified-flow Euler loop over already-packed text and image streams.
 ///
 /// At `cfg > 1`, conditional and unconditional branches are packed into one transformer
@@ -351,15 +364,10 @@ fn denoise_capture(
             );
             transformer.forward(&img, cond_txt, &sigma, &cond_ctx)?
         };
-        let delta = Array::from_slice(&[pair[1] - pair[0]], &[1]);
         // Diffusers' FlowMatchEulerDiscreteScheduler upcasts the sample, performs the complete
         // Euler addition in f32, then casts the result back to model_output.dtype. Casting the
         // scaled velocity before the add introduces an extra bf16 rounding at every step.
-        let model_dtype = velocity.dtype();
-        img = img
-            .as_dtype(Dtype::Float32)?
-            .add(&velocity.as_dtype(Dtype::Float32)?.multiply(&delta)?)?
-            .as_dtype(model_dtype)?;
+        img = flow_euler_step(&img, &velocity, pair[1] - pair[0])?;
         mlx_rs::transforms::eval([&img])?;
     }
     Ok(img)
@@ -439,6 +447,38 @@ mod tests {
                 .dtype(),
             Dtype::Bfloat16,
             "Torch scalar CFG arithmetic preserves the model-output dtype"
+        );
+    }
+
+    #[test]
+    fn euler_add_rounds_only_after_the_f32_add() {
+        let sample = Array::from_slice(&[1.390625f32], &[1])
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap();
+        let velocity = Array::from_slice(&[1.859375f32], &[1])
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap();
+        let delta = -0.05263156f32;
+        let got = flow_euler_step(&sample, &velocity, delta).unwrap();
+        let pre_add_rounded = sample
+            .add(
+                &velocity
+                    .as_dtype(Dtype::Float32)
+                    .unwrap()
+                    .multiply(Array::from_slice(&[delta], &[1]))
+                    .unwrap()
+                    .as_dtype(Dtype::Bfloat16)
+                    .unwrap(),
+            )
+            .unwrap();
+        mlx_rs::transforms::eval([&got, &pre_add_rounded]).unwrap();
+        let got_f32 = got.as_dtype(Dtype::Float32).unwrap();
+        let wrong_f32 = pre_add_rounded.as_dtype(Dtype::Float32).unwrap();
+        mlx_rs::transforms::eval([&got_f32, &wrong_f32]).unwrap();
+        assert_ne!(
+            got_f32.as_slice::<f32>(),
+            wrong_f32.as_slice::<f32>(),
+            "fixture must discriminate Diffusers' post-add cast from pre-add rounding"
         );
     }
 
