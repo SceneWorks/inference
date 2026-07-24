@@ -1,0 +1,6 @@
+{
+  "_class_name": "MageVAE",
+  "latent_channels": 128,
+  "downsample_factor": 16,
+  "sample_posterior": false
+}
