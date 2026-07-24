@@ -4,13 +4,31 @@
 //!
 //! ## Duration and the denoise window
 //!
-//! The reference always denoises a fixed window of `max_inference_seconds` (30 s) latents and
-//! crops the decoded waveform to the requested `seconds`; the same call exposes
-//! `max_inference_seconds` as a per-call override. This port sets that window to
-//! `ceil(seconds)` (clamped to the model's 30 s cap) — the exact computation the reference
-//! performs when handed `max_inference_seconds=ceil(seconds)` — so a 4-second clip costs a
-//! 4-second denoise, not a 30-second one. The duration conditioning itself is textual (the
-//! `" duration: {seconds:.1}s"` prompt suffix), unchanged from the reference.
+//! The reference **always** denoises a fixed window of `max_inference_seconds` (30 s) latents and
+//! crops the decoded waveform to the requested `seconds`:
+//!
+//! ```text
+//!   full_seconds     = int(max_inference_seconds or self.max_inference_seconds)   # → 30
+//!   num_samples_full = sample_rate * full_seconds                                 # denoised
+//!   audio            = audio[:, :, :int(sample_rate * seconds)]                   # cropped
+//! ```
+//!
+//! `max_inference_seconds` is a per-call *override* that defaults to `None`, so the shipped
+//! default window is the model's full 30 s regardless of the requested duration. The duration
+//! conditioning is purely textual (the `" duration: {seconds:.1}s"` prompt suffix).
+//!
+//! This port previously shortened the window to `ceil(seconds)` so a 4-second clip cost a
+//! 4-second denoise. That is **not** the reference default, and it is not a safe optimization:
+//! the DiT is trained on the full-length latent sequence, so a short window puts it far out of
+//! distribution. The velocity field it then predicts is wrong, CFG multiplies that error by
+//! `cfg_scale` (`v = v_neg + s·(v_pos − v_neg)`, so 4.0 triples the unconditional term's
+//! contribution), and an accurate solve converges onto a degenerate solution that the VAE decodes
+//! to a −74 dBFS residual floor. A *coarse* solve accidentally stepped over the degeneracy, which
+//! is why the 30-step conformance test passed while the shipped default of 100 steps produced
+//! silence. Measured, 3 s request: crest 11.2 dB at a 3 s window vs 26.7 dB at the full window.
+//!
+//! The window is therefore always the model's `max_inference_seconds`. This costs a full-length
+//! denoise for every clip — the price the reference pays for correctness.
 //!
 //! ## Determinism
 //!
@@ -193,11 +211,17 @@ impl MossSfxPipeline {
         )?)
     }
 
-    /// The denoise window in whole seconds for a requested duration (see module docs).
-    pub fn window_seconds(&self, seconds: f32) -> u32 {
-        (seconds.ceil() as u32)
-            .max(1)
-            .min(self.config.index.max_inference_seconds)
+    /// The denoise window in whole seconds (see module docs).
+    ///
+    /// Always the model's full `max_inference_seconds`, matching the reference's
+    /// `full_seconds = int(max_inference_seconds or self.max_inference_seconds)` — the requested
+    /// duration selects only the *crop*, never the denoise length. Shortening the window to the
+    /// requested duration takes the DiT out of distribution and collapses the solve; see the
+    /// module docs. `seconds` is accepted so callers keep a single entry point and so a future
+    /// explicit per-call `max_inference_seconds` override (the reference's own knob) has an
+    /// obvious home, but it deliberately does not shorten the window.
+    pub fn window_seconds(&self, _seconds: f32) -> u32 {
+        self.config.index.max_inference_seconds.max(1)
     }
 
     /// Synthesize one clip. `on_progress` receives [`PipelineProgress::Step`] after each
