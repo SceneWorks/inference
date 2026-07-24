@@ -1272,7 +1272,7 @@ pub fn load_from_comfyui_experts_with_offload(
     i2v: bool,
     offload_policy: OffloadPolicy,
 ) -> gen_core::Result<Box<dyn Generator>> {
-    Ok(Box::new(build_comfyui_generator(
+    let generator = build_comfyui_generator(
         high_file.into(),
         low_file.into(),
         te_file,
@@ -1280,7 +1280,28 @@ pub fn load_from_comfyui_experts_with_offload(
         snapshot_dir.into(),
         i2v,
         offload_policy,
-    )?))
+    )?;
+    #[cfg(test)]
+    COMFYUI_TEST_OFFLOAD.store(
+        match generator.offload {
+            OffloadPolicy::Resident => 1,
+            OffloadPolicy::Sequential => 2,
+        },
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    Ok(Box::new(generator))
+}
+
+#[cfg(test)]
+static COMFYUI_TEST_OFFLOAD: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+#[cfg(test)]
+fn last_public_comfyui_offload_for_test() -> Option<OffloadPolicy> {
+    match COMFYUI_TEST_OFFLOAD.load(std::sync::atomic::Ordering::SeqCst) {
+        1 => Some(OffloadPolicy::Resident),
+        2 => Some(OffloadPolicy::Sequential),
+        _ => None,
+    }
 }
 
 fn build_comfyui_generator(
@@ -1643,28 +1664,39 @@ mod tests {
     }
 
     #[test]
-    fn comfyui_load_honors_explicit_sequential_and_legacy_default_is_resident() {
-        let build = |policy| {
-            build_comfyui_generator(
-                "/comfy/high.safetensors".into(),
-                "/comfy/low.safetensors".into(),
+    fn comfyui_public_load_honors_explicit_policy_and_env_override() {
+        let call = |policy| {
+            load_from_comfyui_experts_with_offload(
+                "/comfy/high.safetensors",
+                "/comfy/low.safetensors",
                 None,
                 None,
-                "/snapshot".into(),
+                "/snapshot",
                 false,
                 policy,
             )
-            .unwrap()
+            .unwrap();
+            last_public_comfyui_offload_for_test().unwrap()
         };
+        let _env = candle_gen::testkit::EnvVarGuard::set(candle_gen::OFFLOAD_ENV, None);
         assert_eq!(
-            build(OffloadPolicy::Sequential).offload,
+            call(OffloadPolicy::Sequential),
             OffloadPolicy::Sequential,
-            "the external production seam must carry explicit Sequential into Wan14bGenerator"
+            "the public external production seam must carry explicit Sequential into Wan14bGenerator"
         );
         assert_eq!(
-            build(OffloadPolicy::Resident).offload,
+            call(OffloadPolicy::Resident),
             OffloadPolicy::Resident,
             "the compatibility loader's historical default remains resident"
+        );
+
+        drop(_env);
+        let _env =
+            candle_gen::testkit::EnvVarGuard::set(candle_gen::OFFLOAD_ENV, Some("sequential"));
+        assert_eq!(
+            call(OffloadPolicy::Resident),
+            OffloadPolicy::Sequential,
+            "the documented process-wide override still upgrades the public Resident request"
         );
     }
 

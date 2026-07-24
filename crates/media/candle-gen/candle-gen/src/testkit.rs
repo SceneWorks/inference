@@ -24,6 +24,7 @@
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
 
 use crate::candle_core::{Device, Tensor};
 use crate::gen_core::Image;
@@ -43,6 +44,40 @@ pub fn env_path(key: &str) -> PathBuf {
 /// An optional env-var path — `None` when unset (for tests that skip gracefully rather than panic).
 pub fn env_path_opt(key: &str) -> Option<PathBuf> {
     std::env::var(key).ok().map(PathBuf::from)
+}
+
+static PROCESS_ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+/// Serialize and restore one process-global environment variable for deterministic tests.
+pub struct EnvVarGuard {
+    _lock: MutexGuard<'static, ()>,
+    key: &'static str,
+    prior: Option<String>,
+}
+
+impl EnvVarGuard {
+    pub fn set(key: &'static str, value: Option<&str>) -> Self {
+        let lock = PROCESS_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let prior = std::env::var(key).ok();
+        match value {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
+        Self {
+            _lock: lock,
+            key,
+            prior,
+        }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        match self.prior.take() {
+            Some(value) => std::env::set_var(self.key, value),
+            None => std::env::remove_var(self.key),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------------------
