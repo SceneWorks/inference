@@ -94,7 +94,9 @@ pub use model::{descriptor_for, MageVariant, MODEL_IDS};
 
 // sc-14040 (NR-MMDiT) re-exports here:
 
-// sc-14104 (Gaussian-Shading noise) re-exports here:
+pub use latent::{
+    decode_bits, encode_noise, invert_to_noise, resolve_gs_key, GsKey, WatermarkReport,
+}; // sc-14104 (Gaussian-Shading noise)
 
 // sc-14041 (pipeline + the loaded model) re-exports here:
 

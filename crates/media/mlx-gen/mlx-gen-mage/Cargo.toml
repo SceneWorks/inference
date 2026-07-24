@@ -10,9 +10,8 @@ categories = ["science"]
 
 # PARALLEL-EXECUTION NOTE (sc-14037): every dependency the text-encoder (sc-14038), Mage-VAE
 # (sc-14039) and NR-MMDiT (sc-14040) ports need is declared here up front, so those three never
-# contend over this manifest. **sc-14104 is the one exception** — see the `sha2` note below: it
-# still needs a seeded RNG this workspace does not yet carry, so it will edit this file. If two of
-# these stories are in flight at once, sc-14104 owns the manifest.
+# contend over this manifest. sc-14104 owned this file for the watermark RNG question — see the
+# RESOLVED note at the bottom; it added nothing.
 [dependencies]
 mlx-gen = { path = ".." }
 # Must match the core crate's MLX binding exactly (shared `Array` type). See root Cargo.toml.
@@ -26,11 +25,13 @@ serde_json = { workspace = true }
 # on the committed config fixtures.
 sha2 = { workspace = true }
 
-# NOTE for sc-14104 — the ONE dependency this scaffold could not pre-declare. Bit-exact watermark
-# parity needs two RNG streams the reference mixes: `np.random.default_rng(key)` (PCG64 + numpy
-# SeedSequence) for the XOR pad and message-index map (`mage_latent.py:68-71`), and a seeded
-# `torch.Generator` (MT19937) for the per-entry uniforms (`:76-91`). Neither is in this workspace's
-# graph, and no crate here reproduces numpy's SeedSequence or torch's uniform draw out of the box.
-# Deliberately NOT guessed at here: picking the wrong crate would look like coverage while
-# silently producing a different noise tensor. sc-14104 chooses it, justifies it against the
-# golden, and adds it below.
+# RESOLVED (sc-14104) — **no new dependency.** The scaffold left this open because bit-exact
+# watermark parity needs two RNG streams the reference mixes: `np.random.default_rng(key)`
+# (numpy `SeedSequence` → PCG64 XSL-RR → Lemire bounded ints) for the XOR pad and message-index map
+# (`mage_latent.py:68-74`), and a seeded `torch.Generator` (CPU MT19937 → `random64()` → 53-bit
+# uniform) for the per-entry uniforms (`:83-84`). No crate in this graph reproduces either stream,
+# and adopting one on its README would look like coverage while silently producing a different noise
+# tensor. Both algorithms are short and fully specified, and the parity golden is a bit-exact
+# oracle, so `src/latent.rs` implements them directly and pins them against draws captured from the
+# pinned numpy 2.4.3 / torch 2.13.0 environment — result: 0/32768 mismatches against `gs_noise` and
+# `gs_noise_bf16`. The dependency graph is unchanged.
