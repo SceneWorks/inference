@@ -47,9 +47,18 @@ jobs:
     runs-on: [self-hosted, macOS, ARM64, real-weights]
     env:
       ZIMAGE_SNAPSHOT: ${{ vars.ZIMAGE_SNAPSHOT }}
+      MAGE_SNAPSHOT: ${{ vars.MAGE_SNAPSHOT }}
       # Explicit operator-provided models root for the mlx-gen real-weight resolvers that resolve a
       # repo-keyed snapshot (sc-13755); inference never self-fetches or derives a cache location.
       MLX_GEN_MODELS_ROOT: ${{ vars.MLX_GEN_MODELS_ROOT }}
+      # Explicit operator-provided path to the Mage-Flow TE boundary golden (sc-14038). The goldens
+      # under `crates/media/mlx-gen/tools/golden/` are gitignored by documented convention — they
+      # take the licensed multi-GB weights plus torch to produce — so the parity oracle cannot ship
+      # in the repo. Same posture as MLX_GEN_MODELS_ROOT above: an operator-provided path, never a
+      # location this repo derives. Produce it once per runner with
+      # `MAGE_DEVICE=cpu python3 crates/media/mlx-gen/tools/dump_mage_flow_golden.py --stage te`
+      # (MPS dumps are silently corrupt — sc-14250).
+      MAGE_FLOW_TE_GOLDEN: ${{ vars.MAGE_FLOW_TE_GOLDEN }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: Toolchain versions
@@ -58,10 +67,20 @@ jobs:
         run: |
           python3 -m pip install --disable-pip-version-check --target "$RUNNER_TEMP/huggingface-hub" "huggingface_hub==1.20.1"
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model z-image-turbo --snapshot "$ZIMAGE_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model mage-flow --snapshot "$MAGE_SNAPSHOT"
       - name: Run provider conformance
         run: >-
           cargo test --locked -p mlx-gen-z-image --test conformance
           z_image_turbo_satisfies_gen_core_contract -- --ignored --nocapture
+      # sc-14038 DoD gate — the ONLY automatic run of the Qwen3-VL text-encoder parity suite. It
+      # needs both the 8.875 GB `text_encoder/` component and the CPU-dumped boundary golden,
+      # neither of which the PR lanes have. It also carries the self-invalidating assertion that
+      # reports if the bf16 noise floor ever moves far enough to gate the QK-norm epsilon
+      # numerically (today it cannot, so `verify_text_config` guards that instead).
+      - name: Run Mage-Flow text-encoder parity
+        run: >-
+          cargo test --locked --release -p mlx-gen-mage --test te_parity_real_weights
+          -- --ignored --nocapture
 
   candle-audio:
     name: Candle audio real weights

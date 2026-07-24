@@ -88,7 +88,7 @@ pub mod pipeline;
 // ---------------------------------------------------------------------------------------------
 pub use config::{MageFlowConfig, QwenVlTextConfig, FAMILY};
 pub use model::{descriptor_for, MageVariant, MODEL_IDS};
-// sc-14038 (text encoder) re-exports here:
+pub use text_encoder::{Conditioning, MageTextEncoder, PromptKind, Qwen3VlTextEncoder};
 
 pub use vae::{MageVae, VaePart};
 

@@ -1,7 +1,17 @@
 # Mage-Flow test fixtures
 
-Two kinds live here: the published **component configs** (below), and one **numeric parity
-fixture** produced by running the vendored reference itself.
+Three kinds live here, all committed and all consumed by tests that run in the **default**
+`cargo test` — no licensed weights, no gitignored goldens:
+
+| fixture | gates | story |
+| --- | --- | --- |
+| `mage_flow_small.safetensors` | the NR-MMDiT's numeric parity against the vendored reference | sc-14040 |
+| `te_micro_golden.safetensors` | the Qwen3-VL text encoder's forward arithmetic against `transformers` | sc-14038 |
+| `*_config.json` (×4) | every constant in `mlx_gen_mage::config`, against the published files | sc-14037 |
+
+The two numeric fixtures exist for the same reason: the real-weights boundary goldens are bf16
+and their noise floor is *larger* than several real porting mistakes, so they cannot discriminate
+them at any tolerance. Each section below records its own measured floor and separation.
 
 ## `mage_flow_small.safetensors` — NR-MMDiT parity (sc-14040)
 
@@ -67,3 +77,29 @@ manifest row (`release/model-weight-licenses.json`) lands with the catalog surfa
 `cargo test -p mlx-gen-mage --test config_conformance`. A SHA-256 mismatch means the published
 config changed — treat every constant transcribed from it as suspect and re-read
 `_vendor/MAGE_FLOW_GAPS.md` before touching `src/config.rs`.
+
+## `te_micro_golden.safetensors` — the text encoder's arithmetic oracle (sc-14038)
+
+A **32 KB** dump of a real `transformers.Qwen3VLTextModel` — the same class the vendored reference
+patches — instantiated at toy dimensions (hidden 16, 3 layers, 4 q / 2 kv heads, `head_dim` 8,
+FFN 12, vocab 24) with seeded random weights, in f32, eager attention. It carries the LM state dict
+under `lm.*` plus `io.input_ids` and `io.last_hidden_state`.
+
+Unlike the boundary goldens in `crates/media/mlx-gen/tools/golden/` — real 4.1B weights, multi-GB,
+gitignored, `#[ignore]`d consumers — this one is **committed and runs in the default `cargo test`
+lane**, because it needs no model weights. That is the point: every other weights-free test in
+`text_encoder_forward.rs` pins *topology* (shapes, layer counts, packing isolation, causality), and
+none of them would catch a regression in GQA `repeat_kv` grouping, QK-RMSNorm placement, the SwiGLU
+gate/up order or `o_proj`. This fixture gates the **arithmetic** of the whole composition against
+upstream, and `the_micro_oracle_rejects_composition_swaps` proves it discriminates by swapping
+same-shaped tensor pairs (measured 20–26× the tolerance).
+
+The toy dimensions deliberately preserve every production *structure*: a real GQA group size,
+`head_dim` decoupled from `hidden / heads`, all three interleaved-M-RoPE sections populated, and
+`intermediate != hidden`. Norm scales carry a wide (0.5) spread so a `q_norm`/`k_norm` swap is a
+real signal rather than a near-no-op.
+
+**Regenerating:** `python3 crates/media/mlx-gen/tools/dump_mage_te_micro_golden.py` (needs torch +
+transformers, no weights). Deterministic — re-running reproduces the file byte-for-byte. Regenerate
+only when the upstream `Qwen3VLTextModel` arithmetic legitimately changes, and say so on the story:
+silently re-blessing this file would convert a real regression into a passing test.
