@@ -1,9 +1,49 @@
-# Mage-Flow fixtures
+# Mage-Flow test fixtures
 
-Two kinds live here: the **published component configs** (immediately below) and one small
-**arithmetic golden** (last section).
+Three kinds live here, all committed and all consumed by tests that run in the **default**
+`cargo test` — no licensed weights, no gitignored goldens:
 
-## Component config fixtures
+| fixture | gates | story |
+| --- | --- | --- |
+| `mage_flow_small.safetensors` | the NR-MMDiT's numeric parity against the vendored reference | sc-14040 |
+| `te_micro_golden.safetensors` | the Qwen3-VL text encoder's forward arithmetic against `transformers` | sc-14038 |
+| `*_config.json` (×4) | every constant in `mlx_gen_mage::config`, against the published files | sc-14037 |
+
+The two numeric fixtures exist for the same reason: the real-weights boundary goldens are bf16
+and their noise floor is *larger* than several real porting mistakes, so they cannot discriminate
+them at any tolerance. Each section below records its own measured floor and separation.
+
+## `mage_flow_small.safetensors` — NR-MMDiT parity (sc-14040)
+
+A complete 2-block `MageFlow` NR-MMDiT at dim 24 with `torch.manual_seed(0)` random weights, in
+**f32**, plus its inputs, its output, and its first block's inputs/outputs — all captured from the
+vendored reference (`_vendor/mage_flow/`). Regenerate with
+
+```sh
+<ref-venv>/bin/python crates/media/mlx-gen/tools/dump_mage_flow_small.py
+```
+
+Consumed by `tests/mage_flow_small.rs`, which runs in the **default** `cargo test` — no licensed
+weights, no gitignored goldens.
+
+It exists because the real-weights goldens cannot do this job. Those are bf16, and the published
+checkpoint's block-0 modulation gates reach ~1e8, so twelve bf16 blocks amplify rounding to a
+**2e-2 mean-relative floor** (the port's own f32-vs-bf16 spread is 2.8e-2). Real porting mistakes
+are smaller than that floor at the output — substituting the `mlx-gen-z-image` sibling's SwiGLU
+gate for `gelu-approximate` moves `dit_out` by only ~1.7e-2 — so the real-weights gate cannot
+discriminate them at any tolerance. In f32 at tiny dims the floor is 2.4e-3 and the same mutation
+lands 30× outside it.
+
+Two packings are captured, because they exercise different code: `gen` (fused-CFG generation — two
+attention segments, one `img_shapes` entry each) and `edit` (`[target, ref×3]` in **one** attention
+segment carrying **four** `img_shapes` entries, `pipeline.py:517-519`). The second is the only
+configuration in which the msrope **frame axis** changes the attention scores by more than a
+rounding step, so it is where the frame index is gated at the output level.
+
+Random weights, no licensed data: MIT reference code, nothing derived from the published
+checkpoints.
+
+## Component configs
 
 Verbatim, unmodified copies of **all four** component configs published by
 **`microsoft/Mage-Flow`** (revision `9f46d09dce8a6211a5aaf157cc99754ac402a2fc`), committed so

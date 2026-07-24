@@ -139,7 +139,17 @@ predicts. Two consequences the port must not get wrong:
 
 1. **`pipeline.py:136-140`'s claim that batch_cfg is "numerically identical to two separate
    forwards" is true for attention isolation (`cu_seqlens`) but NOT for RoPE.** `batch_cfg=True`
-   and `batch_cfg=False` produce different images.
+   and `batch_cfg=False` produce different velocities — but the difference is **precision-scale,
+   not semantic**, and this line originally overstated it as "different images". Measured on the
+   real checkpoint at f32 (sc-14040): the conditional half is bit-identical, the unconditional
+   branch moves by mean-relative **2.1e-3** and the cfg=5 guided velocity by **6.2e-3** — real
+   algebra, four orders above the f32 floor, but 14–47× *under* the model's own bf16 spread on the
+   same quantities (3.0e-2 / 1.0e-1). Cond and uncond are isolated attention windows, so image↔image
+   attention is invariant under the constant frame offset (RoPE is relative); the leak is
+   image↔**text**, the text stream never being rotated. Consequence: a frame-0 port renders
+   indistinguishably **on generation** and is structurally wrong **on edit**, where one attention
+   window spans several `img_shapes` entries. Point 2 below is unchanged and remains the operational
+   guidance.
 2. A port that implements the fused CFG path must replicate the frame-index shift, or run the
    two branches separately and accept that it is matching the `batch_cfg=False` trajectory.
    Pick one deliberately and pin it in the parity test — the reference default is `True`.

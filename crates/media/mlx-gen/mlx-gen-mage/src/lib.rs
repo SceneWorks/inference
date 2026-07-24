@@ -90,11 +90,19 @@ pub use config::{MageFlowConfig, QwenVlTextConfig, FAMILY};
 pub use model::{descriptor_for, MageVariant, MODEL_IDS};
 pub use text_encoder::{Conditioning, MageTextEncoder, PromptKind, Qwen3VlTextEncoder};
 
-// sc-14039 (Mage-VAE) re-exports here:
+pub use vae::{MageVae, VaePart};
 
-// sc-14040 (NR-MMDiT) re-exports here:
+pub use attention::{DualStream, MageJointAttention};
+pub use feed_forward::MageFeedForward;
+pub use final_layer::MageFinalLayer;
+pub use rope_embedder::{ImgShape, MsRope, PackContext, PackLayout, RopeTable};
+pub use timestep_embedder::MageTimestepEmbedder;
+pub use transformer::{Linear, MageTransformer};
+pub use transformer_block::MageTransformerBlock;
 
-// sc-14104 (Gaussian-Shading noise) re-exports here:
+pub use latent::{
+    decode_bits, encode_noise, invert_to_noise, resolve_gs_key, GsKey, WatermarkReport,
+}; // sc-14104 (Gaussian-Shading noise)
 
 // sc-14041 (pipeline + the loaded model) re-exports here:
 
