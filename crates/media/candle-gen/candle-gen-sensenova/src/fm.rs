@@ -13,10 +13,15 @@ use candle_gen::Result;
 use crate::distill::DistillLora;
 
 /// Load a biased Linear from `{prefix}.weight` + `{prefix}.bias` (both present for the FM/timestep
-/// modules). Shapeless via `get_unchecked` (the f32 VarBuilder fixes the dtype).
+/// modules), shapelessly and **at f32** regardless of the backbone's store dtype.
+///
+/// These stay f32 on purpose (sc-14249): the FM head plus the two timestep MLPs are ~35 M parameters
+/// against the backbone's ~16.2 B — roughly 0.2% of the checkpoint — and the tier packer leaves them
+/// dense in every tier, so there is nothing to gain by storing them narrow and a dtype boundary to
+/// get wrong if we did. `get_f32` widens the bf16 on-disk weight exactly.
 pub(crate) fn load_linear_biased(vb: &VarBuilder, prefix: &str) -> Result<Linear> {
-    let w = vb.get_unchecked(&format!("{prefix}.weight"))?;
-    let b = vb.get_unchecked(&format!("{prefix}.bias"))?;
+    let w = crate::quant::get_f32(vb, &format!("{prefix}.weight"))?;
+    let b = crate::quant::get_f32(vb, &format!("{prefix}.bias"))?;
     Ok(Linear::new(w, Some(b)))
 }
 
@@ -45,11 +50,11 @@ impl FmHead {
     /// and `{prefix}.2`). Returns the number merged (≤ 2; absent targets are skipped).
     pub fn merge_distill_lora(&mut self, lora: &DistillLora, prefix: &str) -> Result<usize> {
         let mut n = 0;
-        if let Some(m) = lora.merge_linear(&self.l0, &format!("{prefix}.0"))? {
+        if let Some(m) = lora.merge_dense(&self.l0, &format!("{prefix}.0"))? {
             self.l0 = m;
             n += 1;
         }
-        if let Some(m) = lora.merge_linear(&self.l2, &format!("{prefix}.2"))? {
+        if let Some(m) = lora.merge_dense(&self.l2, &format!("{prefix}.2"))? {
             self.l2 = m;
             n += 1;
         }

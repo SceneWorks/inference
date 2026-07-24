@@ -20,12 +20,14 @@
 //! The non-cached `forward_und`, on-the-fly quantization, and the AdaptableLinear seam the mlx
 //! provider carries are dropped — this slice is dense f32, T2I only.
 
-use candle_gen::candle_core::{Device, Result as CResult, Tensor};
-use candle_gen::candle_nn::{ops, Linear, Module, VarBuilder};
+use candle_gen::candle_core::{DType, Device, Result as CResult, Tensor};
+use candle_gen::candle_nn::{ops, VarBuilder};
+use candle_gen::quant::QLinear;
 use candle_gen::Result;
 
 use crate::config::NeoChatConfig;
 use crate::distill::DistillLora;
+use crate::quant::{detect_linear, get_f32};
 
 /// Disallowed-attention fill for the additive mask (a large finite negative, matching the candle
 /// Kolors slice — avoids `-inf` propagation through the softmax kernel).
@@ -74,21 +76,19 @@ impl KvCache {
     }
 }
 
-/// Load a bias-less Linear from `{prefix}.weight` (shapeless via `get_unchecked`).
-fn load_linear_no_bias(vb: &VarBuilder, prefix: &str) -> Result<Linear> {
-    Ok(Linear::new(
-        vb.get_unchecked(&format!("{prefix}.weight"))?,
-        None,
-    ))
+/// Load a bias-less projection from `{prefix}` through the crate's store seam (sc-14249): packed
+/// straight from the MLX triple on a q4/q8 tier, else dense at the VarBuilder's store dtype.
+fn load_linear_no_bias(vb: &VarBuilder, prefix: &str) -> Result<QLinear> {
+    detect_linear(vb, prefix, false)
 }
 
-/// The per-path attention weights. The projections are bias-less Linears; the QK-norms are dense
-/// `[head_dim/2]` weight vectors.
+/// The per-path attention weights. The projections are bias-less [`QLinear`]s (dense-bf16 or packed,
+/// per tier — sc-14249); the QK-norms are dense `[head_dim/2]` f32 weight vectors.
 struct AttnPath {
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
-    o_proj: Linear,
+    q_proj: QLinear,
+    k_proj: QLinear,
+    v_proj: QLinear,
+    o_proj: QLinear,
     q_norm: Tensor,
     k_norm: Tensor,
     q_norm_hw: Tensor,
@@ -103,10 +103,10 @@ impl AttnPath {
             k_proj: load_linear_no_bias(vb, &format!("{attn_prefix}.k_proj{s}"))?,
             v_proj: load_linear_no_bias(vb, &format!("{attn_prefix}.v_proj{s}"))?,
             o_proj: load_linear_no_bias(vb, &format!("{attn_prefix}.o_proj{s}"))?,
-            q_norm: vb.get_unchecked(&format!("{attn_prefix}.q_norm{s}.weight"))?,
-            k_norm: vb.get_unchecked(&format!("{attn_prefix}.k_norm{s}.weight"))?,
-            q_norm_hw: vb.get_unchecked(&format!("{attn_prefix}.q_norm_hw{s}.weight"))?,
-            k_norm_hw: vb.get_unchecked(&format!("{attn_prefix}.k_norm_hw{s}.weight"))?,
+            q_norm: get_f32(vb, &format!("{attn_prefix}.q_norm{s}.weight"))?,
+            k_norm: get_f32(vb, &format!("{attn_prefix}.k_norm{s}.weight"))?,
+            q_norm_hw: get_f32(vb, &format!("{attn_prefix}.q_norm_hw{s}.weight"))?,
+            k_norm_hw: get_f32(vb, &format!("{attn_prefix}.k_norm_hw{s}.weight"))?,
         })
     }
 
@@ -134,9 +134,9 @@ impl AttnPath {
 }
 
 struct Mlp {
-    gate: Linear,
-    up: Linear,
-    down: Linear,
+    gate: QLinear,
+    up: QLinear,
+    down: QLinear,
 }
 
 impl Mlp {
@@ -148,9 +148,13 @@ impl Mlp {
         })
     }
 
+    /// `forward_upcast`, not `forward`: under a bf16 store the weight is widened to the f32
+    /// activation per op, so the matmul stays f32 (sc-14249 Lever A). Inert — an `Arc` clone, byte
+    /// identical to `forward` — when the store is already f32, and the packed arms delegate to
+    /// `forward` unchanged (they already dequantize to the activation dtype).
     fn forward(&self, x: &Tensor) -> CResult<Tensor> {
-        let gated = (ops::silu(&self.gate.forward(x)?)? * self.up.forward(x)?)?;
-        self.down.forward(&gated)
+        let gated = (ops::silu(&self.gate.forward_upcast(x)?)? * self.up.forward_upcast(x)?)?;
+        self.down.forward_upcast(&gated)
     }
 
     /// Merge the distill LoRA into the SwiGLU's three linears. Returns the number merged (≤ 3).
@@ -185,11 +189,13 @@ impl Layer {
     fn from_weights(vb: &VarBuilder, prefix: &str) -> Result<Self> {
         let attn = format!("{prefix}.self_attn");
         Ok(Self {
-            input_ln: vb.get_unchecked(&format!("{prefix}.input_layernorm.weight"))?,
-            input_ln_gen: vb.get_unchecked(&format!("{prefix}.input_layernorm_mot_gen.weight"))?,
-            post_ln: vb.get_unchecked(&format!("{prefix}.post_attention_layernorm.weight"))?,
-            post_ln_gen: vb
-                .get_unchecked(&format!("{prefix}.post_attention_layernorm_mot_gen.weight"))?,
+            input_ln: get_f32(vb, &format!("{prefix}.input_layernorm.weight"))?,
+            input_ln_gen: get_f32(vb, &format!("{prefix}.input_layernorm_mot_gen.weight"))?,
+            post_ln: get_f32(vb, &format!("{prefix}.post_attention_layernorm.weight"))?,
+            post_ln_gen: get_f32(
+                vb,
+                &format!("{prefix}.post_attention_layernorm_mot_gen.weight"),
+            )?,
             attn_und: AttnPath::from_weights(vb, &attn, "")?,
             attn_gen: AttnPath::from_weights(vb, &attn, "_mot_gen")?,
             mlp_und: Mlp::from_weights(vb, &format!("{prefix}.mlp"))?,
@@ -264,10 +270,15 @@ fn repeat_kv_bhsd(x: &Tensor, groups: usize) -> CResult<Tensor> {
 /// the `lm_head`. The T2I path needs no logits; the understanding path (VQA / interleave) projects
 /// the final-normed hidden states through [`lm_head`](Qwen3Backbone::lm_head) to decode text.
 pub struct Qwen3Backbone {
+    /// The token-embedding table, kept at the **store** dtype (bf16 on a bf16 checkpoint) — at
+    /// `[151936, 4096]` it is 1.24 GB bf16 / 2.5 GB f32, so widening the whole table to gather a
+    /// handful of rows would give back a real slice of the sc-14249 win. [`Self::embed`] widens the
+    /// gathered rows instead, which is the same arithmetic at a rounding-free cost.
     embed_tokens: Tensor,
     /// Output projection to vocab logits. The 8B-MoT ships an untied `lm_head`; a tied config reuses
-    /// `embed_tokens`. Stored as a bias-less `Linear` (`hidden @ W.T → [.., vocab]`).
-    lm_head: Linear,
+    /// `embed_tokens`. Stored as a bias-less [`QLinear`] (`hidden @ W.T → [.., vocab]`); dense in
+    /// every shipped tier (the packer leaves it, `lm_head`, and the norms full-precision).
+    lm_head: QLinear,
     layers: Vec<Layer>,
     norm: Tensor,
     norm_gen: Tensor,
@@ -303,9 +314,13 @@ impl Qwen3Backbone {
             .collect::<Result<Vec<_>>>()?;
         let embed_tokens = vb.get_unchecked(&format!("{model}.embed_tokens.weight"))?;
         // The 8B-MoT ships an untied `lm_head` (`{prefix}.lm_head.weight`); a tied config reuses the
-        // token-embedding matrix (`hidden @ embed_tokens.T`). Either way it is a bias-less Linear.
+        // token-embedding matrix (`hidden @ embed_tokens.T`). Either way it is a bias-less
+        // projection. The tied arm wraps the store-dtype table directly — `forward_upcast` widens it
+        // per call exactly as the untied arm's dense weight, so the two stay equivalent.
         let lm_head = if cfg.tie_word_embeddings {
-            Linear::new(embed_tokens.clone(), None)
+            QLinear::from_dense(candle_gen::quant::DenseLinear::Linear(
+                candle_gen::candle_nn::Linear::new(embed_tokens.clone(), None),
+            ))
         } else {
             load_linear_no_bias(vb, &format!("{prefix}.lm_head"))?
         };
@@ -313,8 +328,8 @@ impl Qwen3Backbone {
             embed_tokens,
             lm_head,
             layers,
-            norm: vb.get_unchecked(&format!("{model}.norm.weight"))?,
-            norm_gen: vb.get_unchecked(&format!("{model}.norm_mot_gen.weight"))?,
+            norm: get_f32(vb, &format!("{model}.norm.weight"))?,
+            norm_gen: get_f32(vb, &format!("{model}.norm_mot_gen.weight"))?,
             num_heads: cfg.llm.num_attention_heads,
             num_kv_heads: cfg.llm.num_key_value_heads,
             head_dim: cfg.llm.head_dim(),
@@ -330,7 +345,14 @@ impl Qwen3Backbone {
         let s = ids.len();
         let idx: Vec<u32> = ids.iter().map(|&i| i as u32).collect();
         let idx = Tensor::from_vec(idx, (s,), &self.device)?;
-        let g = self.embed_tokens.index_select(&idx, 0)?; // [s, hidden]
+        // Gather at the store dtype, THEN widen the `[s, hidden]` rows — under a bf16 store this is
+        // the whole embedding path's dtype boundary, and it is exact (bf16 → f32 widening loses
+        // nothing). Widening the table first would allocate the full 2.5 GB f32 copy for the same
+        // numbers. A no-op `Arc` clone when the store is already f32.
+        let g = self
+            .embed_tokens
+            .index_select(&idx, 0)?
+            .to_dtype(DType::F32)?; // [s, hidden]
         let h = self.embed_tokens.dim(1)?;
         g.reshape((1, s, h))
     }
@@ -339,7 +361,7 @@ impl Qwen3Backbone {
     /// (`hidden @ lm_head.T`). The understanding path slices the kept hidden row before calling this
     /// so the projection materializes a `[.., 1, vocab]` row, not the whole prefix.
     pub fn lm_head(&self, hidden: &Tensor) -> CResult<Tensor> {
-        self.lm_head.forward(hidden)
+        self.lm_head.forward_upcast(hidden)
     }
 
     /// Merge the 8-step distill LoRA into every layer's **generation-path** attention projections +
@@ -465,9 +487,11 @@ impl Qwen3Backbone {
         let hd = self.head_dim;
 
         // q/k: project + reshape + temporal/spatial norm + tri-axis RoPE, then to [B,H,S,D].
+        // Every projection here is `forward_upcast` (sc-14249): bf16-stored weight widened to the
+        // f32 activation per op, so the attention math is unchanged at half the resident weight.
         let q = self
             .qk_rope(
-                &a.q_proj.forward(x)?,
+                &a.q_proj.forward_upcast(x)?,
                 b,
                 s,
                 self.num_heads,
@@ -479,7 +503,7 @@ impl Qwen3Backbone {
             .contiguous()?;
         let k = self
             .qk_rope(
-                &a.k_proj.forward(x)?,
+                &a.k_proj.forward_upcast(x)?,
                 b,
                 s,
                 self.num_kv_heads,
@@ -491,7 +515,7 @@ impl Qwen3Backbone {
             .contiguous()?;
         let v = a
             .v_proj
-            .forward(x)?
+            .forward_upcast(x)?
             .reshape((b, s, self.num_kv_heads, hd))?
             .transpose(1, 2)?
             .contiguous()?;
@@ -526,7 +550,7 @@ impl Qwen3Backbone {
             .transpose(1, 2)?
             .contiguous()?
             .reshape((b, s, self.num_heads * hd))?;
-        a.o_proj.forward(&out)
+        a.o_proj.forward_upcast(&out)
     }
 
     /// Project→reshape→(temporal/spatial split)→norm halves→rope(t,h,w)→concat. `proj` is the

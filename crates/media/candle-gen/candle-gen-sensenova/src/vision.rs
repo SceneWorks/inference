@@ -34,13 +34,17 @@ impl NeoVisionEmbedder {
     /// `"fm_modules.vision_model_mot_gen.embeddings"` (generation path).
     pub fn from_weights(vb: &VarBuilder, cfg: &NeoChatConfig, prefix: &str) -> Result<Self> {
         let factor = (1.0 / cfg.vision.downsample_ratio).round() as usize;
+        // All four load at **f32** regardless of the backbone's store dtype (sc-14249): the two conv
+        // kernels are ~17.6 M parameters (~0.1% of the checkpoint) and stay dense in every shipped
+        // tier, and the interleaved 2D RoPE below builds its tables in f32 — so widening here keeps
+        // the whole vision path at one dtype instead of adding a boundary for no footprint gain.
         // patch_embedding: torch Conv2d weight [embed, ch, ps, ps] -> flat [embed, ch·ps·ps].
-        let patch_w = vb.get_unchecked(&format!("{prefix}.patch_embedding.weight"))?;
+        let patch_w = crate::quant::get_f32(vb, &format!("{prefix}.patch_embedding.weight"))?;
         let (embed_dim, ch, ps, _) = patch_w.dims4()?;
         let patch_w = patch_w.reshape((embed_dim, ch * ps * ps))?;
-        let patch_b = vb.get_unchecked(&format!("{prefix}.patch_embedding.bias"))?;
-        let dense_w = vb.get_unchecked(&format!("{prefix}.dense_embedding.weight"))?; // [llm, embed, f, f]
-        let dense_b = vb.get_unchecked(&format!("{prefix}.dense_embedding.bias"))?; // [llm]
+        let patch_b = crate::quant::get_f32(vb, &format!("{prefix}.patch_embedding.bias"))?;
+        let dense_w = crate::quant::get_f32(vb, &format!("{prefix}.dense_embedding.weight"))?; // [llm, embed, f, f]
+        let dense_b = crate::quant::get_f32(vb, &format!("{prefix}.dense_embedding.bias"))?; // [llm]
         Ok(Self {
             patch: Linear::new(patch_w, Some(patch_b)),
             dense_w,
