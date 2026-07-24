@@ -22,11 +22,22 @@
 //! shift bit-for-bit — the parity goldens were dumped through the fused path, and
 //! `tools/verify_mage_flow_golden.py` asserts it there.
 //!
-//! It shifts the **table**; it does not change the **render**. See [`PackLayout::fused_cfg`] for
-//! the argument (RoPE is relative, and the duplication offsets every shape in the second copy
-//! equally) and `tests/dit_real_weights.rs` for the measurement. That corrects the inference drawn
-//! in the sc-14036 write-up; the reference's docstring at `pipeline.py:136-140` is right about the
-//! output even though the tables differ.
+//! **The fused path is *not* numerically identical to two separate forwards** — the reference's own
+//! docstring at `pipeline.py:136-140` is false as written. The difference is real algebra, not
+//! rounding: at f32, with no precision confound, the conditional half is bit-identical (exactly
+//! 0.0) while the **unconditional** branch moves by mean-relative **2.1e-3** and the cfg=5 guided
+//! velocity by **6.2e-3**. It is, however, **precision-scale rather than semantic**: the same
+//! quantities carry a bf16-vs-f32 spread of 3.0e-2 and 1.0e-1, so the shift sits 14–47× under the
+//! model's own rounding. A frame-0 port would therefore render indistinguishably **on generation**,
+//! and would be **structurally wrong on edit**, where one attention window spans several shapes
+//! with genuinely different frame indices.
+//!
+//! This supersedes two earlier readings: the sc-14036 write-up's ("`batch_cfg=True/False` render
+//! differently" — overstated) and this port's own first correction ("it shifts the table, not the
+//! render" — wrong; it shifts both, just not by enough to matter on generation). See
+//! [`PackLayout::fused_cfg`] for the mechanism and
+//! `the_fused_cfg_frame_shift_is_precision_scale_not_semantic` in `tests/dit_real_weights.rs`,
+//! which re-measures every number above and fails if any of them moves.
 //!
 //! ## Table-free equivalence
 //!
@@ -186,17 +197,37 @@ impl PackLayout {
     /// `_compute_video_freqs` rotates it at frame **1** rather than 0 (`mage_layers.py:171`,
     /// `:192`). That shift is real in the table and is reproduced here bit-for-bit.
     ///
-    /// It is, however, **inert in the output**, and the port does not depend on which way that
-    /// goes: RoPE encodes *relative* position, `q'ᵢ·k'ⱼ = qᵢᵀR(pⱼ − pᵢ)kⱼ`, and the duplication
-    /// offsets every shape in the second copy by the same amount — so within each attention
-    /// segment the frame differences, and therefore the attention scores, are unchanged. The
-    /// reference's docstring at `pipeline.py:136-140` ("numerically identical to two separate
-    /// forwards") is right about the render even though the tables differ; measured on the real
-    /// checkpoint the two rotations move `dit_out` by mean-relative 1.1e-2, *below* the model's own
-    /// bf16 sensitivity of 2.8e-2. See `tests/dit_real_weights.rs` for the measurement.
+    /// It also changes the **output** — the fused path is *not* "numerically identical to two
+    /// separate forwards" as the reference's docstring at `pipeline.py:136-140` claims. But the
+    /// difference is **precision-scale, not semantic**, and the mechanism is worth stating exactly,
+    /// because two earlier write-ups got it wrong in opposite directions.
     ///
-    /// The frame axis is not decorative — it is load-bearing exactly where a single attention
-    /// segment spans several shapes, i.e. the edit path's `[target, ref₁, …]`.
+    /// Cond and uncond are **isolated attention windows**: `joint_cu_lens` is built per sample with
+    /// `batch_size = 2·na` (`mage_layers.py:430-441`) and the kernel loops one window at a time
+    /// (`_attn_backend.py:192-208`). Inside a window, image↔image attention *is* invariant under
+    /// the shift — RoPE encodes relative position, `q'ᵢ·k'ⱼ = qᵢᵀR(pⱼ − pᵢ)kⱼ`, and the duplication
+    /// offsets every shape in the second copy by the same amount. What is **not** invariant is
+    /// image↔**text** attention, because the text stream is never rotated, so the absolute rotation
+    /// survives there.
+    ///
+    /// Measured at f32, where no rounding confounds it: the conditional half is bit-identical
+    /// (exactly 0.0 — its shapes keep frame index 0 either way), the **unconditional** branch moves
+    /// by mean-relative **2.1e-3**, and the cfg=5 guided velocity by **6.2e-3**. Those are four
+    /// orders above the f32 floor: a real algebraic difference. Against the model's own
+    /// bf16-vs-f32 spread on the same quantities — 3.0e-2 and 1.0e-1 — the shift is 14–47× under,
+    /// which is why a frame-0 port renders indistinguishably **on generation**.
+    ///
+    /// Two cautions for anyone re-deriving these numbers. A whole-pack metric is **exactly 2×
+    /// diluted**, because half the tokens are the bit-identical conditional branch (the same
+    /// comparison reads 1.1e-2 over the pack and 2.1e-2 on the branch that actually moves).
+    /// And measuring the shift *at bf16* mostly measures bf16: it reads 2.1e-2 against a 3.0e-2
+    /// spread, a 1.4× margin that says far less than the f32 measurement does.
+    ///
+    /// The frame axis is not decorative, and "indistinguishable on generation" is not
+    /// "unimportant": it is load-bearing exactly where a single attention window spans several
+    /// shapes, i.e. the edit path's `[target, ref₁, …]`, where a frame-0 port is structurally
+    /// wrong. `tests/dit_real_weights.rs` re-measures all of the above and
+    /// `tests/mage_flow_small.rs` gates the edit case.
     pub fn fused_cfg(&self, neg_txt_lens: &[i32]) -> Result<Self> {
         if neg_txt_lens.len() != self.txt_lens.len() {
             return Err(Error::Msg(format!(
@@ -651,8 +682,9 @@ mod tests {
     }
 
     /// Fused CFG offsets every shape in the second copy by the SAME amount, so the frame
-    /// differences inside each attention window are unchanged — which is why the shift is inert in
-    /// exact arithmetic even though the table moves.
+    /// differences inside each attention window are unchanged — which is why image↔image attention
+    /// does not see the shift at all, leaving only the image↔text leak that makes it a
+    /// precision-scale rather than a semantic difference.
     #[test]
     fn fused_cfg_offsets_the_second_copy_uniformly() {
         let target = ImgShape::latent(2, 2);

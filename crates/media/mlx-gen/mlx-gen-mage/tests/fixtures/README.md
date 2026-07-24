@@ -27,8 +27,8 @@ lands 30× outside it.
 Two packings are captured, because they exercise different code: `gen` (fused-CFG generation — two
 attention segments, one `img_shapes` entry each) and `edit` (`[target, ref×3]` in **one** attention
 segment carrying **four** `img_shapes` entries, `pipeline.py:517-519`). The second is the only
-configuration in which the msrope **frame axis** changes the attention scores instead of cancelling
-out, so it is where the frame index is gated at the output level.
+configuration in which the msrope **frame axis** changes the attention scores by more than a
+rounding step, so it is where the frame index is gated at the output level.
 
 Random weights, no licensed data: MIT reference code, nothing derived from the published
 checkpoints.

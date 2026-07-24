@@ -91,6 +91,31 @@ pub fn error(got: &Array, want: &Array) -> (f32, f32, f32) {
     (max_abs, max_abs / peak, mean_diff / mean_abs)
 }
 
+/// `max|x|` over a tensor — the denominator behind the peak-relative metric, and the anchor for
+/// the bf16 ULP arithmetic the block-parity gate states its result in.
+pub fn peak_abs(x: &Array) -> f32 {
+    let n = x.shape().iter().product::<i32>();
+    x.as_dtype(Dtype::Float32)
+        .unwrap()
+        .reshape(&[n])
+        .unwrap()
+        .as_slice::<f32>()
+        .iter()
+        .fold(0f32, |m, &v| m.max(v.abs()))
+}
+
+/// The bf16 unit-in-last-place at `value`: bf16 carries **8** significand bits (1 implicit + 7
+/// stored), so a value in `[2ᵉ, 2ᵉ⁺¹)` is representable to `2ᵉ⁻⁷`.
+///
+/// Exists so "the block agrees to within one bf16 rounding step" is an executable assertion rather
+/// than exponent arithmetic done by hand in a comment — which is exactly how the first revision of
+/// that comment got it wrong by 2×.
+pub fn bf16_ulp_at(value: f32) -> f32 {
+    const SIGNIFICAND_BITS: i32 = 8;
+    assert!(value > 0.0, "ULP is only defined for a positive magnitude");
+    ((value.log2().floor() as i32 - (SIGNIFICAND_BITS - 1)) as f32).exp2()
+}
+
 /// Read an integer golden tensor (`*_cu_seqlens`, `img_shapes`) as `i32`.
 pub fn ints(w: &Weights, key: &str) -> Vec<i32> {
     let t = w.require(key).unwrap_or_else(|e| panic!("{key}: {e}"));

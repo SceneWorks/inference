@@ -91,3 +91,58 @@ impl MageFinalLayer {
         self.proj_out.forward(&modulated)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rope_embedder::{ImgShape, MsRope, PackLayout};
+
+    /// The head chunks `(scale, shift)` — **scale first** (`mage_layers.py:715`, `:720`) — the
+    /// opposite of the block's `(shift, scale, gate)` (`:561`).
+    ///
+    /// The end-to-end f32 fixture does catch a swap (`tests/mage_flow_small.rs` fails at max_rel
+    /// 1.008 with the halves exchanged), but a whole-model failure does not *name* the mistake.
+    /// This pins it directly, with hand-computable numbers.
+    #[test]
+    fn the_head_chunks_scale_first_then_shift() {
+        let dim = 2;
+        let mut w = Weights::empty();
+        // silu(0) = 0, so `emb` is exactly the bias: [scale | shift] = [1, 1 | 10, 20].
+        w.insert(
+            "n.linear.weight",
+            Array::from_slice(&[0.0f32; 8], &[2 * dim, dim]),
+        );
+        w.insert(
+            "n.linear.bias",
+            Array::from_slice(&[1.0f32, 1.0, 10.0, 20.0], &[2 * dim]),
+        );
+        // proj_out = identity, so the output IS the modulated stream.
+        w.insert(
+            "p.weight",
+            Array::from_slice(&[1.0f32, 0.0, 0.0, 1.0], &[dim, dim]),
+        );
+        w.insert("p.bias", Array::from_slice(&[0.0f32, 0.0], &[dim]));
+        let head = MageFinalLayer::from_weights(&w, "n", "p").unwrap();
+
+        let layout = PackLayout::generation(vec![ImgShape::latent(1, 2)], vec![1]).unwrap();
+        let rope = MsRope::new(&[16, 56, 56], 10_000.0, true, 4096).unwrap();
+        let ctx = PackContext::new(layout, &rope).unwrap();
+
+        // LayerNorm over dim 2 maps any (a, b) with a != b to (-1, 1).
+        let img = Array::from_slice(&[0.0f32, 4.0, -3.0, 5.0], &[1, 2, dim]);
+        let temb = Array::from_slice(&[0.0f32, 0.0], &[1, dim]);
+        let out = head.forward(&img, &temb, &ctx).unwrap();
+
+        // scale-first ⇒ (1 + 1)·(∓1) + (10, 20) = (8, 22) per token.
+        // shift-first would give (1 + 10)·(-1) + 1 = -10 and (1 + 20)·1 + 1 = 22 — the second
+        // component collides, which is why the first is the one that discriminates.
+        let got = out.as_slice::<f32>();
+        for (i, want) in [8.0f32, 22.0, 8.0, 22.0].into_iter().enumerate() {
+            assert!(
+                (got[i] - want).abs() < 1e-4,
+                "component {i}: got {}, want {want} — scale and shift look swapped",
+                got[i]
+            );
+        }
+    }
+}

@@ -15,8 +15,8 @@
 //! two mutations that matter most (the sibling's SwiGLU activation; rotating the fused-CFG uncond
 //! branch at msrope frame 0) both land *inside* the bf16 noise floor. That is measured and
 //! asserted here rather than papered over, and both are caught in
-//! `tests/mage_flow_small.rs` / `tests/msrope_golden.rs`, which have floors two to five orders of
-//! magnitude tighter. What this file *does* discriminate on real weights is the deliberate bf16
+//! `tests/mage_flow_small.rs` (f32 floor 2.4e-3, ~10× tighter) and `tests/msrope_golden.rs`
+//! (table floor 6e-8, five orders tighter). What this file *does* discriminate on real weights is the deliberate bf16
 //! rounding of the timestep frequency table: 1.1e-4 with it, 1.7e-2 without, against a 1e-3 gate.
 //!
 //! ## Why a tolerance and not equality
@@ -28,8 +28,11 @@
 //! per-block gap compounds roughly with the square root of the depth. Equality is not achievable
 //! and is not the trained model's own reproducibility either — the reference's CPU and MPS runs of
 //! the *same* stack disagree by ~2.7e-2 mean-relative (sc-14036 GAP 1). The gates below are stated
-//! against the **measured** error with a small safety factor, and each carries a counter-probe
-//! showing a real mistake lands orders of magnitude outside it.
+//! against the **measured** error with a small safety factor. The counter-probes that show a real
+//! mistake landing outside a gate live in the two files named above, for the reason given there;
+//! what this file contributes instead is the *evidence* that its own residual is precision
+//! (`the_stack_residual_is_bf16_rounding_not_an_algorithmic_gap`) and an executable statement of
+//! its limits (`the_real_weights_gate_cannot_separate_these_two_mistakes_and_says_so`).
 //!
 //! Run (`MAGE_SNAPSHOT` is a **passed-in path** to a `microsoft/Mage-Flow` snapshot — this
 //! repository derives no cache location of its own):
@@ -40,7 +43,10 @@
 
 mod common;
 
-use common::{error, ints, require_golden, require_transformer_dir, BLOCK_GOLDEN, STACK_GOLDEN};
+use common::{
+    bf16_ulp_at, error, ints, peak_abs, require_golden, require_transformer_dir, BLOCK_GOLDEN,
+    STACK_GOLDEN,
+};
 
 use mlx_rs::ops::concatenate_axis;
 use mlx_rs::{Array, Dtype};
@@ -64,9 +70,15 @@ const FRONT_END_MAX_REL: f32 = 2.0e-3;
 const FRONT_END_MEAN_REL: f32 = 1.0e-3;
 
 /// One block, bf16 on Metal vs bf16 on CPU. **Measured** on the 512-token fused-CFG pack:
-/// image stream `max_rel` 6.6e-3 / `mean_rel` 2.4e-3, text stream 1.2e-3 / 2.0e-3. That is about
-/// half a bf16 ULP per element — `block_out.0` peaks at 4.4e8, where a half-ULP is 5.2e5, which is
-/// exactly the measured `max_abs`. The gate is ~2.3× the measurement.
+/// image stream `max_rel` 6.6e-3 / `mean_rel` 2.4e-3, text stream 1.2e-3 / 2.0e-3. The gate is
+/// ~2.3× the measurement.
+///
+/// The measured `max_abs` of 5.2429e5 = 2¹⁹ is **within one bf16 rounding step of the largest
+/// element**. bf16 carries 8 significand bits, so the ULP at a value in `[2ᵉ, 2ᵉ⁺¹)` is `2ᵉ⁻⁷`:
+/// `block_out.1` peaks at 7.917e7 ∈ [2²⁶, 2²⁷), where the ULP is 2¹⁹ = 5.243e5 — the error is
+/// exactly **one** ULP there; `block_out.0` peaks at 4.383e8 ∈ [2²⁸, 2²⁹), where the ULP is 2²¹ =
+/// 2.097e6 — the error is a **quarter** ULP. (An earlier revision of this comment called it a half
+/// ULP at the 4.4e8 peak, which is off by 2× in the wrong direction; the real result is tighter.)
 ///
 /// `max_rel` is peak-relative (`max|Δ| / peak|ref|`), the honest denominator for an activation
 /// tensor whose entries span eight orders of magnitude.
@@ -133,7 +145,11 @@ fn one_block_matches_the_torch_golden() {
         "block txt: max_abs {txt_abs:.4e} max_rel {txt_rel:.4e} mean_rel {txt_mean:.4e}\n\
          block img: max_abs {img_abs:.4e} max_rel {img_rel:.4e} mean_rel {img_mean:.4e}"
     );
-    for (name, (_, rel, mean)) in [("txt", block_err_txt), ("img", block_err_img)] {
+    let golden = require_golden(BLOCK_GOLDEN);
+    for (name, (abs, rel, mean), key) in [
+        ("txt", block_err_txt, "block_out.0"),
+        ("img", block_err_img, "block_out.1"),
+    ] {
         assert!(
             rel < BLOCK_MAX_REL,
             "block {name} stream max_rel {rel} exceeds {BLOCK_MAX_REL}"
@@ -141,6 +157,16 @@ fn one_block_matches_the_torch_golden() {
         assert!(
             mean < BLOCK_MEAN_REL,
             "block {name} stream mean_rel {mean} exceeds {BLOCK_MEAN_REL}"
+        );
+        // The ULP claim in BLOCK_MAX_REL's docs, made executable: the largest disagreement is
+        // within ONE bf16 rounding step at that tensor's own peak magnitude. Hand exponent
+        // arithmetic got this wrong by 2x once already.
+        let peak = peak_abs(golden.require(key).unwrap());
+        let ulp = bf16_ulp_at(peak);
+        println!("block {name}: peak {peak:.4e} bf16 ULP there {ulp:.4e} vs max_abs {abs:.4e} ({:.2} ULP)", abs / ulp);
+        assert!(
+            abs <= ulp,
+            "block {name} max_abs {abs} exceeds one bf16 ULP ({ulp}) at its {peak} peak"
         );
     }
 }
@@ -321,12 +347,15 @@ fn an_f32_timestep_frequency_table_moves_further_from_the_reference() {
 /// * **SwiGLU's SiLU gate** moves `dit_out` by ~2e-2 — the same order as the bf16 floor. It is
 ///   caught in `tests/mage_flow_small.rs`, which runs the vendored reference itself at f32 where
 ///   the floor is 2.4e-3: the mutation lands 30× above it.
-/// * **Rotating the uncond branch at frame 0** is *mathematically* inert on a generation pack:
-///   RoPE encodes relative position, and the fused-CFG duplication offsets every shape in the
-///   second copy by the same amount, so image↔image attention is unchanged. It leaks only through
-///   image↔text attention (text is never rotated). It is caught at the **table** level — bit-level,
-///   `tests/msrope_golden.rs` — and at the output level only on an edit-shaped pack, where one
-///   attention window spans several shapes (`tests/mage_flow_small.rs`).
+/// * **Rotating the uncond branch at frame 0** is a *real* difference on a generation pack, but a
+///   small one: image↔image attention is unchanged (RoPE is relative and the duplication offsets
+///   every shape in the second copy equally), so only image↔text attention leaks, and the text
+///   stream is never rotated. At f32 that leak is 2.1e-3 on the unconditional branch against a
+///   1.0e-1 bf16 spread on the guided velocity — see
+///   `the_fused_cfg_frame_shift_is_precision_scale_not_semantic`, which measures it without the
+///   rounding confound. It is caught at the **table** level (bit-level, `tests/msrope_golden.rs`)
+///   and at the output level on an edit-shaped pack, where one attention window spans several
+///   shapes (`tests/mage_flow_small.rs`).
 ///
 /// Keeping this as an executable assertion rather than a comment means the classification cannot
 /// rot: if a future change makes either mutation visible here, this test fails and says so.
@@ -364,6 +393,99 @@ fn the_real_weights_gate_cannot_separate_these_two_mistakes_and_says_so() {
              the module docs, which currently state this gate cannot see it."
         );
     }
+}
+
+/// **The fused-CFG msrope frame shift, measured properly** — the number that settles whether
+/// `batch_cfg` is a semantic or a precision-scale difference.
+///
+/// Three write-ups have now disagreed about this, so the measurement is made executable rather
+/// than argued:
+///
+/// * sc-14036 said the fused path renders differently. Overstated.
+/// * this port's first correction said the shift was inert in the output and the reference's
+///   docstring at `pipeline.py:136-140` was right. **Also wrong** — the shift *is* a real
+///   algebraic difference.
+/// * what is true: it is real, and it is an order of magnitude below the model's own bf16 spread.
+///
+/// Two things make the measurement non-obvious. First, the conditional half is bit-identical by
+/// construction (its shapes keep frame index 0 either way), so a whole-pack metric **halves** the
+/// number — this test reports the unconditional branch separately. Second, measuring the shift at
+/// bf16 measures mostly bf16 rounding; measuring it at **f32** isolates the algebra, and *that*
+/// is the figure to compare against the bf16 spread.
+///
+/// Cond and uncond are isolated attention windows — `joint_cu_lens` is built per sample with
+/// `batch_size = 2·na` (`mage_layers.py:430-441`) and the kernel loops per window
+/// (`_attn_backend.py:192-208`) — so image↔image attention inside a window is invariant under a
+/// constant frame offset (RoPE is relative). The leak is image↔**text** attention, because the
+/// text stream is never rotated.
+#[test]
+#[ignore = "needs MAGE_SNAPSHOT + tools/golden/mage_flow_dit_golden.safetensors; ~16 GB f32 weights"]
+fn the_fused_cfg_frame_shift_is_precision_scale_not_semantic() {
+    let golden = require_golden(STACK_GOLDEN);
+    let cfg = golden.require("cfg").unwrap().as_slice::<f32>()[0];
+
+    let shifted = |dt| run_stack_raw(FfnActivation::GeluApproximate, RopeChoice::Reference, dt);
+    let flat = |dt| {
+        run_stack_raw(
+            FfnActivation::GeluApproximate,
+            RopeChoice::EveryBranchFrameZero,
+            dt,
+        )
+    };
+
+    // --- f32: the shift's true algebraic size, with no rounding confound -----------------------
+    let (f32_shifted, f32_flat) = (shifted(Dtype::Float32), flat(Dtype::Float32));
+    let (cond_a, unc_a) = cfg_halves(&f32_shifted);
+    let (cond_b, unc_b) = cfg_halves(&f32_flat);
+    let (cond_abs, _, cond_mean) = error(&cond_b, &cond_a);
+    let (_, _, unc_mean_f32) = error(&unc_b, &unc_a);
+    let (_, _, guided_mean_f32) = error(&guided(&f32_flat, cfg), &guided(&f32_shifted, cfg));
+
+    // --- bf16: the same shift, plus the model's own rounding spread ----------------------------
+    let (bf_shifted, bf_flat) = (shifted(Dtype::Bfloat16), flat(Dtype::Bfloat16));
+    let (_, unc_bf) = cfg_halves(&bf_shifted);
+    let (_, unc_bf_flat) = cfg_halves(&bf_flat);
+    let (_, _, unc_mean_bf16) = error(&unc_bf_flat, &unc_bf);
+    let (_, _, whole_pack_bf16) = error(&bf_flat, &bf_shifted);
+    // The precision yardstick: the same quantity's bf16-vs-f32 spread.
+    let (_, _, spread_unc) = error(&unc_bf, &unc_a);
+    let (_, _, spread_guided) = error(
+        &guided(&bf_shifted, cfg),
+        &guided(&f32_shifted, cfg).as_dtype(Dtype::Bfloat16).unwrap(),
+    );
+
+    println!(
+        "f32  cond half   : max_abs {cond_abs:.4e} mean_rel {cond_mean:.4e}  (must be ~0)\n\
+         f32  uncond half : mean_rel {unc_mean_f32:.4e}\n\
+         f32  guided (cfg {cfg}) : mean_rel {guided_mean_f32:.4e}\n\
+         bf16 uncond half : mean_rel {unc_mean_bf16:.4e}   [whole pack, diluted 2x: \
+         {whole_pack_bf16:.4e}]\n\
+         bf16-vs-f32 spread: uncond {spread_unc:.4e}  guided {spread_guided:.4e}"
+    );
+
+    // 1. The conditional branch does not move: its shapes keep frame index 0 either way. This is
+    //    what makes a whole-pack metric exactly 2x diluted.
+    assert!(
+        cond_mean < 1.0e-6,
+        "the conditional half must be unaffected by the duplicate's frame index (got {cond_mean})"
+    );
+    // 2. The shift IS a real algebraic difference — orders above the f32 floor. Asserting this
+    //    stops the "it is inert" reading from coming back.
+    assert!(
+        unc_mean_f32 > 1.0e-4,
+        "at f32 the frame shift moves the unconditional branch by {unc_mean_f32}, which would make \
+         it numerically inert — the reference's 'numerically identical to two separate forwards' \
+         docstring would then be true, contradicting the measurement this test records"
+    );
+    // 3. ...and it is an order of magnitude below the model's own bf16 sensitivity, which is why
+    //    a frame-0 port renders indistinguishably ON GENERATION (it is still structurally wrong on
+    //    edit, where one window spans several shapes — gated in tests/mage_flow_small.rs).
+    assert!(
+        guided_mean_f32 * 10.0 < spread_guided,
+        "the frame shift ({guided_mean_f32}) is no longer an order of magnitude under the bf16 \
+         spread ({spread_guided}) on the guided velocity — it has become semantic, and every doc \
+         in this crate saying otherwise needs revisiting"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -429,10 +551,22 @@ enum RopeChoice {
 
 fn run_stack(activation: FfnActivation, rope_choice: RopeChoice) -> Err3 {
     let golden = require_golden(STACK_GOLDEN);
+    let out = run_stack_raw(activation, rope_choice, Dtype::Bfloat16);
+    error(&out, golden.require("dit_out").unwrap())
+}
+
+/// [`run_stack`] but returning the velocity itself, at a chosen weight/activation dtype — the seam
+/// the fused-CFG measurement needs, since it compares runs against each other rather than against
+/// the golden.
+fn run_stack_raw(activation: FfnActivation, rope_choice: RopeChoice, dtype: Dtype) -> Array {
+    let golden = require_golden(STACK_GOLDEN);
     let layout = stack_layout(&golden);
 
     let mut model = transformer();
     model.set_ffn_activation(activation);
+    if dtype != Dtype::Bfloat16 {
+        model.cast_weights(dtype).unwrap();
+    }
 
     let ctx = match rope_choice {
         RopeChoice::Reference => model.pack_context(layout).unwrap(),
@@ -453,20 +587,37 @@ fn run_stack(activation: FfnActivation, rope_choice: RopeChoice) -> Err3 {
         }
     };
 
-    let bf16 = |key: &str| {
-        golden
-            .require(key)
-            .unwrap()
-            .as_dtype(Dtype::Bfloat16)
-            .unwrap()
-    };
-    let out = model
+    let cast = |key: &str| golden.require(key).unwrap().as_dtype(dtype).unwrap();
+    model
         .forward(
-            &bf16("dit_in.img"),
-            &bf16("dit_in.txt"),
-            &bf16("dit_in.timesteps"),
+            &cast("dit_in.img"),
+            &cast("dit_in.txt"),
+            &cast("dit_in.timesteps"),
             &ctx,
         )
-        .unwrap();
-    error(&out, golden.require("dit_out").unwrap())
+        .unwrap()
+}
+
+/// Split a fused-CFG velocity `[1, 2·L, C]` into its conditional and unconditional halves.
+fn cfg_halves(velocity: &Array) -> (Array, Array) {
+    let tokens = velocity.shape()[1];
+    assert_eq!(tokens % 2, 0, "a fused-CFG pack has two equal image halves");
+    let half = tokens / 2;
+    let idx =
+        |from: i32, to: i32| Array::from_slice(&(from..to).collect::<Vec<i32>>(), &[to - from]);
+    (
+        velocity.take_axis(idx(0, half), 1).unwrap(),
+        velocity.take_axis(idx(half, tokens), 1).unwrap(),
+    )
+}
+
+/// The guided velocity the sampler actually steps with: `unc + cfg·(cond − unc)`
+/// (`pipeline.py:230`). The frame shift only reaches an image through this combination, so it is
+/// the quantity worth measuring.
+fn guided(velocity: &Array, cfg: f32) -> Array {
+    use mlx_rs::ops::{add, multiply, subtract};
+    let (cond, unc) = cfg_halves(velocity);
+    let scale = mlx_gen::array::scalar(cfg).as_dtype(cond.dtype()).unwrap();
+    let delta = subtract(&cond, &unc).unwrap();
+    add(&unc, multiply(scale, delta).unwrap()).unwrap()
 }

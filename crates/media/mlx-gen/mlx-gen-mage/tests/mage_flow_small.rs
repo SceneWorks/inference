@@ -11,17 +11,24 @@
 //! `gelu-approximate` moves `dit_out` by only ~1.7e-2), so the real-weights gate cannot
 //! discriminate them however the tolerance is drawn.
 //!
-//! This fixture removes the floor rather than arguing about it. `tools/dump_mage_flow_small.py`
+//! This fixture lowers the floor rather than arguing about it. `tools/dump_mage_flow_small.py`
 //! runs the **vendored reference itself** — a 2-block `MageFlow` at dim 24 with seeded random
-//! weights, in f32 — and dumps its state dict, inputs and outputs. In f32 the port agrees with the
-//! reference to ~1e-6, so every mutation below misses by four to six orders of magnitude.
+//! weights, in f32 — and dumps its state dict, inputs and outputs.
+//!
+//! **The f32 floor here is 2.4e-3, not ~1e-6.** MLX runs f32 matmul in reduced precision on Metal
+//! (a single `img_in` Linear already sits at 6.5e-4), so the whole-model agreement is 2.4e-3 —
+//! see [`F32_MAX_REL`]. That is ~10× tighter than the real-weights bf16 floor, which is enough:
+//! the mutations below land **3–30×** above it rather than the four-to-six orders an earlier draft
+//! of this comment claimed. The ~6e-8 figure that claim came from belongs to the msrope **table**
+//! ([`ROPE_TABLE_MAX_ABS`]), which is pure trig with no matmul in it — and is exactly why the
+//! rotary conventions are gated there instead of here.
 //!
 //! Two packings are covered because they exercise different code:
 //!
 //! * `gen` — the fused-CFG generation pack: two attention segments, one `img_shapes` entry each.
-//! * `edit` — the edit pack (`pipeline.py:517-519`): ONE attention segment carrying TWO
-//!   `img_shapes` entries, which is the only configuration where the msrope **frame axis** changes
-//!   the attention scores instead of cancelling out.
+//! * `edit` — the edit pack (`pipeline.py:517-519`): ONE attention segment carrying FOUR
+//!   `img_shapes` entries (`[target, ref×3]`), which is the only configuration where the msrope
+//!   **frame axis** changes the attention scores by more than a rounding step.
 
 use mlx_rs::ops::concatenate_axis;
 use mlx_rs::{Array, Dtype};
@@ -239,8 +246,8 @@ fn small_block_matches_the_reference() {
 /// instrument for absolute rotation: image↔image attention only sees relative positions, so a
 /// convention that shifts every coordinate in a window by a constant — the fused-CFG frame index,
 /// the `scale_rope` centring offset — cancels there and survives only through image↔text attention
-/// (text is never rotated). Those leak into the output at ~1e-3, under the numerical floor. Here
-/// they are caught outright.
+/// (text is never rotated). Those leak into the output at ~1e-3 — real, but under this file's
+/// numerical floor. Here they are caught outright.
 #[test]
 fn small_msrope_matches_the_reference_table() {
     let w = fixture();
@@ -344,10 +351,12 @@ fn the_parity_gate_rejects_real_porting_mistakes() {
             note: "on a one-shape-per-window pack the shift is a CONSTANT offset inside every \
                    window, so it cancels in image-image attention (RoPE is relative) and leaks \
                    only through image-text attention, text being unrotated. Guarded by \
-                   the_msrope_table_gate_rejects_both_wrong_conventions. This is also why the \
-                   sc-14036 inference that batch_cfg changes the render is wrong: the TABLE \
-                   differs, the render does not (measured 1.1e-2 mean-relative on the real \
-                   checkpoint, under its own 2.8e-2 bf16 sensitivity)",
+                   the_msrope_table_gate_rejects_both_wrong_conventions. The leak is REAL, not \
+                   zero: on real weights at f32 it moves the unconditional branch by 2.1e-3 and \
+                   the cfg=5 guided velocity by 6.2e-3, against a 1.0e-1 bf16 spread \
+                   (dit_real_weights.rs). So batch_cfg is a precision-scale difference, not the \
+                   semantic one sc-14036 inferred and not the nothing an earlier revision of this \
+                   note claimed",
         },
         Mutation {
             case: "gen",
