@@ -273,10 +273,16 @@ MAGE_DEVICE=cpu /tmp/mageflow-ref-venv/bin/python tools/dump_mage_flow_golden.py
 ```
 
 Weights: `microsoft/Mage-Flow` (gen) and `microsoft/Mage-Flow-Edit` (edit) from the HF cache, or
-`$MAGE_SNAPSHOT` / `$MAGE_EDIT_SNAPSHOT`. **`MAGE_DEVICE=cpu` is the blessed path on macOS** —
-MPS runs the VAE/TE but torch 2.13.0 mis-handles the DiT's `repeat_interleave` with int32
-repeats (it fails loudly, not silently); CUDA hosts should use the default `MAGE_ATTN=flash2`
-with `flash-attn==2.8.3`. ~7 min for the 256²/4-step gen stack on an M-series CPU.
+`$MAGE_SNAPSHOT` / `$MAGE_EDIT_SNAPSHOT`. **`MAGE_DEVICE=cpu` is mandatory on macOS, and the
+default is auto-select, which picks MPS** — always pass it. An MPS dump is *silently* corrupt:
+`neg_txt` comes out with the last 3 of its 6 rows zero-filled while the `gen_hidden_full` tail it
+must equal is intact (max_abs 61.4342, reproducible across three runs; the live torch tensors
+agree in-process, so the zero-fill is in the MPS→CPU copy). Nothing raises —
+`verify_mage_flow_golden.py` is what catches it. Do not treat the DiT's separate *loud* MPS
+failure (`repeat_interleave` with int32 repeats) as a guard: it only fires when the pack has ≥2
+segments, so at `cfg <= 1` an MPS run completes the whole stack and writes real images. CUDA
+hosts should use the default `MAGE_ATTN=flash2` with `flash-attn==2.8.3`. ~7 min for the
+256²/4-step gen stack on an M-series CPU.
 
 | golden | dump script stage | consumed by (P1–P4) | notes |
 |---|---|---|---|
@@ -321,6 +327,18 @@ Missing goldens are a **failure**, not a skip (they are gitignored, so "absent" 
 fresh clone and a checker that greens there greens when it verified nothing); pass
 `--allow-missing` to check a partial bundle deliberately, and `--golden DIR` to point it
 elsewhere.
+
+**Turbo / `cfg <= 1` bundles are supported.** Every CFG-dependent invariant is gated on the real
+branch count, because at Turbo's documented default of cfg 1.0 the reference never builds the
+negative branch (`pipeline.py:326`, `:535`): the image stream is not duplicated, `img_shapes` is
+not concatenated, `dit_in.txt` is the positive conditioning alone, and `_velocity` returns the
+raw transformer output. A checker written as if the stream were always doubled would reject a
+*correct* Turbo golden outright — and at cfg exactly 1.0 the combine `unc + 1·(cond−unc)` equals
+`cond`, so its "only this combination fits" assertion would be false by construction. The CFG-off
+path therefore falls back to the single-branch Euler identity `traj_step1 == traj_step0 +
+(σ1−σ0)·dit_out`, scored against a dropped step, a sigma off-by-one, a sign flip and a missing
+Δσ — a real check, not a skip. Verified end to end against a cfg=1.0 / 4-step CPU bundle: 71/71
+invariants hold, and `--self-test --golden <that bundle>` rejects all 9 corruptions.
 
 The discrimination claim is itself executable — a checker that has never been shown to fail is
 not evidence of anything:

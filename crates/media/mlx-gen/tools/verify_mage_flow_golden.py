@@ -34,6 +34,15 @@ The payload invariants, and the epic GAP answer each one pins:
 * cond/uncond halves of `dit_out` / `block_out.1` stay near-collinear and the block outputs are
   heavy-tailed — the DiT and block payloads are real activations, not Gaussian noise.
 
+Every CFG-dependent invariant is gated on the branch count, NOT written as if the stream were
+always doubled. Turbo's documented default is **cfg 1.0**, where the reference never builds the
+negative branch (`pipeline.py:326`, `:535`) — the stream is not duplicated, `img_shapes` is not
+concatenated and `_velocity` returns the raw transformer output. Assuming otherwise would reject
+a correct Turbo golden wholesale, and at cfg exactly 1.0 the combine `unc + 1·(cond−unc)` is
+algebraically `cond`, so the discrimination assertion would be self-defeating. The CFG-off path
+falls back to the single-branch Euler identity — a real check, not a skip — scored against a
+dropped step, a sigma off-by-one, a sign flip and a missing Δσ.
+
     python tools/verify_mage_flow_golden.py
     python tools/verify_mage_flow_golden.py --self-test   # prove the above DISCRIMINATE
 
@@ -118,6 +127,25 @@ def _max_abs(a: np.ndarray, b: np.ndarray) -> float:
 def _tokens_of(latent: np.ndarray) -> np.ndarray:
     """`[1, C, gh, gw]` -> `[gh*gw, C]`, the reference's `rearrange(x, "b c h w -> b (h w) c")`."""
     return latent[0].reshape(latent.shape[1], -1).T
+
+
+def _cfg_branches(bundle: dict[str, np.ndarray]) -> int:
+    """How many CFG branches the reference fused into the packed stream: 2 with CFG, else 1.
+
+    `use_neg = cfg > 1.0 and any(neg_prompts…)` (`pipeline.py:326`) and `if cfg > 1.0:`
+    (`:535`) — at or below cfg 1 the negative branch is never built, so the image stream is NOT
+    duplicated, `img_shapes` is not concatenated, and `_velocity` returns the raw transformer
+    output with no combine. **Turbo's documented default is cfg 1.0**, so every doubling
+    assumption here has to be conditional or a correct Turbo golden gets rejected wholesale.
+    Each caller asserts the structural consequence too, so this scalar cannot lie unchallenged.
+    """
+    return 2 if float(bundle["cfg"][0]) > 1.0 else 1
+
+
+def _packed_segments(bundle: dict[str, np.ndarray], cu_key: str) -> int | None:
+    """Segment count from a varlen `cu_seqlens` array (`len - 1`), or None if absent."""
+    cu = bundle.get(cu_key)
+    return int(len(cu) - 1) if cu is not None else None
 
 
 # ------------------------------------------------------------------ payload discriminators
@@ -320,6 +348,21 @@ def check_te(te: dict[str, np.ndarray], dit: dict[str, np.ndarray] | None) -> No
         _max_abs(te["edit_txt"], te["edit_hidden_full"][edrop : edrop + elen]) == 0.0,
     )
     _check("edit drop_idx is 64", edrop == 64, f"drop_idx={edrop} -> {elen} conditioning tokens")
+    # The NEGATIVE prompt shares `gen_hidden_full`: `_encode_texts_packed` packs [pos, neg] into
+    # ONE varlen forward, so the negative's post-drop slice is the tail of the same tensor. Worth
+    # asserting separately — the positive slice sits at a fixed offset and can look right while
+    # the tail is wrong (that is exactly how an MPS-dumped bundle fails; see tools/golden/README).
+    if _require(te, "neg_txt", "neg_txt_len"):
+        neg_len = int(te["neg_txt_len"][0])
+        pos_seq = te["gen_hidden_full"].shape[0] - (drop + neg_len)
+        tail = te["gen_hidden_full"][pos_seq + drop :]
+        _check(
+            f"neg_txt == gen_hidden_full[{pos_seq + drop}:] (the packed negative's post-drop tail)",
+            tail.shape == te["neg_txt"].shape and _max_abs(te["neg_txt"], tail) == 0.0,
+            f"max_abs={_max_abs(te['neg_txt'], tail):.4f}"
+            if tail.shape == te["neg_txt"].shape
+            else f"shape {tuple(tail.shape)} vs {tuple(te['neg_txt'].shape)}",
+        )
     _check(
         "conditioning width is the Qwen3-VL LM hidden size (2560)",
         te["gen_txt"].shape[-1] == 2560 and te["edit_txt"].shape[-1] == 2560,
@@ -337,11 +380,18 @@ def check_te(te: dict[str, np.ndarray], dit: dict[str, np.ndarray] | None) -> No
     # out of the e2e run, and under batch_cfg it is `cat(pos, neg)` (`_build_pack_ctx`'s `d_txt`).
     # It must be the dumped TE output BIT-FOR-BIT — which is only true if the TE golden captured
     # the final post-RMSNorm hidden state the pipeline feeds forward.
+    # With CFG off the negative prompt is never encoded, so the DiT consumes the positive
+    # conditioning alone — same bit-exact tie, one fewer segment.
     if dit is not None and "dit_in.txt" in dit and _require(te, "neg_txt"):
-        packed = np.concatenate([te["gen_txt"], te["neg_txt"]], axis=0)
+        packed = (
+            np.concatenate([te["gen_txt"], te["neg_txt"]], axis=0)
+            if _cfg_branches(dit) == 2
+            else te["gen_txt"]
+        )
+        streams = "cat(gen_txt, neg_txt)" if _cfg_branches(dit) == 2 else "gen_txt (cfg <= 1)"
         consumed = dit["dit_in.txt"][0]
         _check(
-            "GAP 1: dit_in.txt IS cat(gen_txt, neg_txt) bit-for-bit (final post-RMSNorm state)",
+            f"GAP 1: dit_in.txt IS {streams} bit-for-bit (final post-RMSNorm state)",
             consumed.shape == packed.shape and _max_abs(consumed, packed) == 0.0,
             f"dit_in.txt={tuple(consumed.shape)} vs packed={tuple(packed.shape)}"
             + (
@@ -408,31 +458,52 @@ def check_dit(dit: dict[str, np.ndarray], e2e: dict[str, np.ndarray] | None) -> 
         "dit_out matches dit_in.img in shape (velocity, pre-CFG)",
         dit["dit_out"].shape == dit["dit_in.img"].shape,
     )
-    # batch_cfg packs [cond, uncond] into one varlen forward -> two segments, and the two
-    # halves must DIFFER (identical halves would mean the negative branch never applied).
+    branches = _cfg_branches(dit)
+    segments = _packed_segments(dit, "dit_in.img_cu_seqlens")
+    # The negative branch only EXISTS above cfg 1 (`use_neg = cfg > 1.0 and …`,
+    # `pipeline.py:326`), so the packed stream is doubled iff CFG is on. Turbo's documented
+    # default is cfg 1.0, so the un-doubled shape is a supported configuration, not a corruption.
+    _check(
+        "the stream is fused with a negative branch IFF cfg > 1 (pipeline.py:326)",
+        segments is None or segments == branches,
+        f"cfg={float(dit['cfg'][0]):g} -> {branches} branch(es), packed segments={segments}",
+    )
     img = dit["dit_in.img"]
-    half = img.shape[1] // 2
-    _check(
-        "batch_cfg duplicated the image stream (cond half == uncond half on input)",
-        _max_abs(img[:, :half], img[:, half:]) == 0.0,
-    )
-    _check(
-        "…but the velocities differ (the negative branch actually conditions)",
-        _max_abs(dit["dit_out"][:, :half], dit["dit_out"][:, half:]) > 1e-4,
-        f"max_abs={_max_abs(dit['dit_out'][:, :half], dit['dit_out'][:, half:]):.5f}",
-    )
-    # …while still being nearly COLLINEAR: same latent, same timestep, only the text differs.
-    # Independent noise in either half would score ~0 here.
-    align = _corr(dit["dit_out"][0, :half], dit["dit_out"][0, half:])
-    _check(
-        "cond and uncond velocities are near-collinear (one latent, two prompts)",
-        align > 0.9,
-        f"corr={align:.4f}",
-    )
+    half = img.shape[1] // branches
+    if branches == 2:
+        # batch_cfg packs [cond, uncond] into one varlen forward, and the two halves must DIFFER
+        # on output (identical halves would mean the negative branch never applied).
+        _check(
+            "batch_cfg duplicated the image stream (cond half == uncond half on input)",
+            _max_abs(img[:, :half], img[:, half:]) == 0.0,
+        )
+        _check(
+            "…but the velocities differ (the negative branch actually conditions)",
+            _max_abs(dit["dit_out"][:, :half], dit["dit_out"][:, half:]) > 1e-4,
+            f"max_abs={_max_abs(dit['dit_out'][:, :half], dit['dit_out'][:, half:]):.5f}",
+        )
+        # …while still being nearly COLLINEAR: same latent, same timestep, only the text differs.
+        # Independent noise in either half would score ~0 here.
+        align = _corr(dit["dit_out"][0, :half], dit["dit_out"][0, half:])
+        _check(
+            "cond and uncond velocities are near-collinear (one latent, two prompts)",
+            align > 0.9,
+            f"corr={align:.4f}",
+        )
+    else:
+        # CFG off: one segment, so there is nothing to compare halves against. Assert the shape
+        # consequence instead of quietly dropping three checks.
+        _check(
+            "CFG off: the image stream is ONE undoubled latent grid",
+            img.shape[1] == half and (segments in (None, 1)),
+            f"{img.shape[1]} tokens, {segments} segment(s)",
+        )
     if "img_shapes" in dit:
         _check(
             "img_shapes is one (frame, h, w) row per packed segment",
-            dit["img_shapes"].ndim == 2 and dit["img_shapes"].shape[1] == 3,
+            dit["img_shapes"].ndim == 2
+            and dit["img_shapes"].shape[1] == 3
+            and dit["img_shapes"].shape[0] == branches,
             f"{dit['img_shapes'].tolist()}",
         )
 
@@ -449,35 +520,54 @@ def check_dit(dit: dict[str, np.ndarray], e2e: dict[str, np.ndarray] | None) -> 
         return
     sigmas = e2e[sig_key].astype(np.float64)
     traj0, traj1 = e2e["traj_step0"], e2e["traj_step1"]
-    n = traj0.shape[1] // 2
     if dit["dit_out"].shape[1] != traj0.shape[1]:
         return
+    n = traj0.shape[1] // branches
     x0 = traj0[0, :n].astype(np.float64)
     x1 = traj1[0, :n].astype(np.float64)
-    cond = dit["dit_out"][0, :n].astype(np.float64)
-    unc = dit["dit_out"][0, n:].astype(np.float64)
     cfg = float(e2e["cfg"][0])
     d_sigma = float(sigmas[1] - sigmas[0])
 
     def residual(velocity: np.ndarray) -> float:
         return float(np.abs(x1 - (x0 + d_sigma * velocity)).max())
 
-    combined = residual(unc + cfg * (cond - unc))
-    wrong = {
-        "cond-only": residual(cond),
-        "uncond-only": residual(unc),
-        "swapped": residual(cond + cfg * (unc - cond)),
-        "no-step": float(np.abs(x1 - x0).max()),
-    }
+    if branches == 2:
+        cond = dit["dit_out"][0, :n].astype(np.float64)
+        unc = dit["dit_out"][0, n:].astype(np.float64)
+        applied = unc + cfg * (cond - unc)
+        label = f"(unc + {cfg:g}·(cond-unc))"
+        # At cfg == 1 these degenerate onto the right answer algebraically, which is exactly why
+        # the whole block is gated on `branches`.
+        wrong = {
+            "cond-only": residual(cond),
+            "uncond-only": residual(unc),
+            "swapped": residual(cond + cfg * (unc - cond)),
+            "no-step": float(np.abs(x1 - x0).max()),
+        }
+    else:
+        # CFG off: the velocity IS the transformer output, ungated. Same Euler step, and the
+        # alternatives are the real port bugs available on this path — a dropped step, an
+        # off-by-one into the sigma ladder, a sign error, and forgetting the Δσ scaling.
+        applied = dit["dit_out"][0, :n].astype(np.float64)
+        label = "dit_out (no CFG combine — cfg <= 1)"
+        wrong = {
+            "no-step": float(np.abs(x1 - x0).max()),
+            "sigma off-by-one": float(
+                np.abs(x1 - (x0 + float(sigmas[2] - sigmas[1]) * applied)).max()
+            ),
+            "sign-flipped": residual(-applied),
+            "unscaled (Δσ dropped)": float(np.abs(x1 - (x0 + applied)).max()),
+        }
+    combined = residual(applied)
     # The reference runs bf16, so the step leaves a rounding residual (~0.009 on a std-0.95
-    # tensor); every wrong combination is an order of magnitude worse (0.17 - 0.39).
+    # tensor); every wrong alternative is an order of magnitude worse.
     _check(
-        f"EULER: traj_step1 == traj_step0 + (σ1-σ0)·(unc + {cfg:g}·(cond-unc))",
+        f"EULER: traj_step1 == traj_step0 + (σ1-σ0)·{label}",
         combined < 0.05,
         f"max_abs={combined:.5f} (bf16 step residual; x1 std={float(x1.std()):.3f})",
     )
     _check(
-        "…and that combination is the ONLY one that fits (the check discriminates)",
+        "…and that is the ONLY velocity that fits (the check discriminates)",
         all(v > 5.0 * max(combined, 1e-9) for v in wrong.values()),
         ", ".join(f"{k}={v:.4f}" for k, v in wrong.items()),
     )
@@ -518,12 +608,25 @@ def check_dit_block(block: dict[str, np.ndarray], dit: dict[str, np.ndarray] | N
         _max_abs(block["block_out.1"], block["block_in.hidden_states"]) > 1e-3,
     )
     # --- payload: the outputs are real activations -----------------------------------------
-    # The two image-stream halves start identical and see the same timestep embedding, so the
-    # block output halves stay near-collinear; independent noise scores ~0.
     out_img = block["block_out.1"]
     in_img = block["block_in.hidden_states"]
-    n = out_img.shape[1] // 2
-    if n > 0 and _max_abs(in_img[:, :n], in_img[:, n:]) == 0.0:
+    branches = _cfg_branches(block)
+    n = out_img.shape[1] // branches
+    # The image tokens are a raster of the latent grid, so a real activation map varies smoothly
+    # across neighbours; moment-matched noise sits at the Gaussian ~1.13. Works at ANY branch
+    # count, so the CFG-off path keeps a payload discriminator on this tensor.
+    if "geometry" in block:
+        gh, gw = int(block["geometry"][0]) // 16, int(block["geometry"][1]) // 16
+        if n == gh * gw:
+            tv = _tv_ratio(out_img[0, :n].reshape(gh, gw, -1).transpose(2, 0, 1))
+            _check(
+                "block_out.1 varies smoothly across the latent grid (a real activation map)",
+                tv < 0.7,
+                f"TV/std={tv:.4f} (white noise ~1.13)",
+            )
+    # With CFG on, the two image-stream halves start identical and see the same timestep
+    # embedding, so the output halves stay near-collinear; independent noise scores ~0.
+    if branches == 2 and n > 0 and _max_abs(in_img[:, :n], in_img[:, n:]) == 0.0:
         align = _corr(out_img[0, :n], out_img[0, n:])
         _check(
             "block_out.1 cond/uncond halves are near-collinear (same input, different text)",
@@ -565,6 +668,12 @@ def _check_msrope_payload(
         )
         return
     shapes = np.array([[1, gh, gw]] * len(seg_lens), dtype=np.int32)
+    _check(
+        "the packed segment count matches the CFG branch count",
+        len(seg_lens) == _cfg_branches(block),
+        f"cfg={float(block['cfg'][0]):g} -> {_cfg_branches(block)} branch(es), "
+        f"{len(seg_lens)} segment(s)",
+    )
     if dit is not None and "img_shapes" in dit:
         _check(
             "block img_cu_lens agrees with the DiT golden's img_shapes",
@@ -590,7 +699,9 @@ def _check_msrope_payload(
 
     # The CONFIRMED batch_cfg finding, stated as its own assertion: the frame frequencies come
     # from each segment's *position* in `d_img_shapes`, so segment j is rotated at frame index j.
-    # Segment 0 is therefore exact identity and the duplicated uncond segment is rotated at 1.
+    # Segment 0 is therefore exact identity and, WHEN CFG IS ON, the duplicated uncond segment is
+    # rotated at 1. With CFG off there is one segment and the same rule still has content: the
+    # sole segment must be exact identity, which is asserted below either way.
     frame_dim = ROPE_AXES_DIM[0]
     n_frame = frame_dim // 2
     inv = 1.0 / np.power(float(ROPE_THETA), np.arange(0, frame_dim, 2, dtype=np.float64) / frame_dim)
@@ -605,8 +716,9 @@ def _check_msrope_payload(
         ok = ok and d < 1e-5
         detail.append(f"seg{idx}@frame{idx}: {d:.1e}")
     _check(
-        "batch_cfg rotates segment j at msrope FRAME INDEX j (cond=identity, uncond dup=frame 1)",
-        ok and len(seg_lens) >= 2,
+        "msrope rotates segment j at FRAME INDEX j"
+        + (" (cond=identity, uncond dup=frame 1)" if len(seg_lens) >= 2 else " (CFG off: 1 segment)"),
+        ok,
         ", ".join(detail),
     )
     _check(
@@ -642,14 +754,22 @@ def check_e2e(
         "sigmas are strictly decreasing",
         bool(np.all(np.diff(sig4.astype(np.float64)) < 0)),
     )
+    branches = _cfg_branches(e2e)
     if noise is not None and "traj_step0" in e2e and "gs_noise_bf16" in noise:
         traj = e2e["traj_step0"]
-        half = traj.shape[1] // 2
-        start = traj[0, :half]
+        gs = _tokens_of(noise["gs_noise_bf16"])
+        _check(
+            "the trajectory carries one latent per CFG branch",
+            traj.shape[1] == branches * gs.shape[0],
+            f"{traj.shape[1]} tokens = {branches} x {gs.shape[0]}",
+        )
+        start = traj[0, : traj.shape[1] // branches]
         _check(
             "the denoise STARTS from the Gaussian-Shading latent (not plain randn)",
-            _max_abs(start, _tokens_of(noise["gs_noise_bf16"])) == 0.0,
-            f"vs plain randn: max_abs={_max_abs(start, _tokens_of(noise['plain_randn'])):.4f}",
+            start.shape == gs.shape and _max_abs(start, gs) == 0.0,
+            f"vs plain randn: max_abs={_max_abs(start, _tokens_of(noise['plain_randn'])):.4f}"
+            if start.shape == gs.shape
+            else f"shape {tuple(start.shape)} vs {tuple(gs.shape)}",
         )
     if "traj_step0" in e2e and "traj_step1" in e2e:
         _check(
@@ -700,12 +820,20 @@ def check_edit(edit: dict[str, np.ndarray], noise: dict[str, np.ndarray] | None)
         return
     seq = edit["seq_step0"]
     n_tgt = int(edit["target_tokens"][0])
-    half = seq.shape[1] // 2
+    branches = _cfg_branches(edit)
+    half = seq.shape[1] // branches
+    # `generate_edits` only builds the negative branch above cfg 1 (`pipeline.py:535`), so with
+    # CFG off the stream is [target, ref…] once rather than twice.
     _check(
-        "the edit stream is [target, ref] per sample (2 segments of equal length)",
-        half == 2 * n_tgt,
-        f"per-branch tokens={half}, target tokens={n_tgt}",
+        f"the edit stream is [target, ref] per sample, x{branches} CFG branch(es)",
+        half == 2 * n_tgt and seq.shape[1] == branches * half,
+        f"per-branch tokens={half}, target tokens={n_tgt}, cfg={float(edit['cfg'][0]):g}",
     )
+    if branches == 2:
+        _check(
+            "batch_cfg duplicated the edit stream exactly (cond half == uncond half)",
+            _max_abs(seq[:, :half], seq[:, half:]) == 0.0,
+        )
     if noise is not None and "gs_noise_bf16" in noise and half == 2 * n_tgt:
         target_slice = seq[0, :n_tgt]
         ref_slice = seq[0, n_tgt : 2 * n_tgt]
@@ -727,14 +855,16 @@ def check_edit(edit: dict[str, np.ndarray], noise: dict[str, np.ndarray] | None)
     if "img_shapes" in edit and "geometry" in edit:
         # GAP 5, asserted rather than merely printed. The rows are per-segment (frame COUNT,
         # h, w) — the msrope FRAME INDEX is the row's position, so under batch_cfg the segment
-        # order is [target, ref…] then the duplicate, i.e. frames 0..1 then 2..3.
+        # order is [target, ref…] then the duplicate, i.e. frames 0..1 then 2..3. With CFG off
+        # there is no duplicate and the list is just [target, ref…] at frames 0..n_refs.
         shapes = edit["img_shapes"]
         gh, gw = int(edit["geometry"][0]) // 16, int(edit["geometry"][1]) // 16
         n_refs = half // n_tgt - 1 if n_tgt else 0
-        n_rows = 2 * (1 + n_refs)
+        n_rows = branches * (1 + n_refs)
         expect = np.array([[1, gh, gw]] * n_rows, dtype=np.int64)
+        doubled = " doubled by batch_cfg" if branches == 2 else " (cfg <= 1, undoubled)"
         _check(
-            f"img_shapes is [target, ref x{n_refs}] doubled by batch_cfg — "
+            f"img_shapes is [target, ref x{n_refs}]{doubled} — "
             f"{n_rows} rows of (1, {gh}, {gw})",
             shapes.shape == expect.shape and np.array_equal(shapes.astype(np.int64), expect),
             f"img_shapes={shapes.tolist()}",

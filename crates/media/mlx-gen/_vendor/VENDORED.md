@@ -160,12 +160,22 @@ surface and `tools/golden/README.md` for the golden manifest.
   moderation pass runs twice per stage. That is deliberate: it turns a screening failure into a
   loud error instead of a blank-white refusal-image golden that every parity test would happily
   match.
-* **MPS runs the VAE and the text encoder fine but NOT the DiT.** `torch 2.13.0` MPS
-  mis-handles `Tensor.repeat_interleave(repeats=<int32 tensor>)`, which the adaLN modulation
-  broadcast uses (`models/modules/mage_layers.py:566`, fed by the int32 `cu_seqlens` the
-  reference builds in `pipeline._lens_to_cu`). It fails loudly (`Invalid buffer size: 6528 GiB`),
-  not silently. This is a torch/MPS bug, not a reference bug — do not "fix" it by editing the
-  vendored source.
+* **Never dump goldens on MPS — it corrupts them SILENTLY.** Measured under sc-14036: a
+  `--stage te` dump on MPS writes a `neg_txt` whose last 3 of its 6 rows are **all zeros**,
+  while the hooked `gen_hidden_full` tail it must equal is fully populated (max_abs 61.4342,
+  reproducible across three runs). The same comparison made *in process* on the live torch
+  tensors agrees at 0.0, so the zero-fill appears in the `_f32` MPS→CPU copy, not in the
+  reference. Nothing raises. `MAGE_DEVICE=cpu` is the blessed path, and
+  `verify_mage_flow_golden.py` now hard-fails an MPS-dumped bundle on exactly this invariant.
+* **`torch 2.13.0` MPS also mis-handles `Tensor.repeat_interleave(repeats=<int32 tensor>)`**,
+  which the adaLN modulation broadcast uses (`models/modules/mage_layers.py:566`, fed by the
+  int32 `cu_seqlens` the reference builds in `pipeline._lens_to_cu`). That one fails loudly
+  (`Invalid buffer size: 6528 GiB`) — but only when the pack carries more than one segment, so
+  it does **not** fire at `cfg <= 1`, where the negative branch is never built: an MPS
+  `--stage all` at cfg 1.0 runs the whole DiT stack to completion and writes real images. Do not
+  read "the DiT crashes on MPS" as a safety net — it is configuration-dependent, while the text
+  encoder corruption above is silent in every configuration. These are torch/MPS bugs, not
+  reference bugs — do not "fix" them by editing the vendored source.
 * **CUDA** should use `MAGE_ATTN=flash2` (the default there) with `flash-attn==2.8.3` installed,
   which is the exact configuration upstream ships.
 
