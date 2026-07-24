@@ -358,8 +358,8 @@ impl Pipeline {
     /// Load the three heavy components from an in-place ComfyUI install (sc-10668): the DiT and VAE are
     /// key-remapped in memory ([`crate::comfyui`]) then built via `VarBuilder::from_tensors`; the Qwen3
     /// text encoder loads verbatim from its ComfyUI file (standard HF layout); the
-    /// tokenizer comes from our shipped snapshot. Dense bf16 only — the fp8/scaled-fp8/GGUF quant slices
-    /// (sc-10670/10671/10672/10680/10681) add a dequant step ahead of the same key remaps.
+    /// tokenizer comes from our shipped snapshot. Dense bf16, plain fp8, and
+    /// scalar-companion scaled-fp8 normalize ahead of the same key remaps.
     fn load_comfyui_components(
         &self,
         sources: &crate::comfyui::ComfyuiSources,
@@ -367,27 +367,69 @@ impl Pipeline {
     ) -> Result<Components> {
         use candle_gen::candle_core::safetensors;
 
+        let mut combined = match &sources.weights {
+            crate::comfyui::ComfyuiWeights::Separate {
+                transformer_file: _,
+                text_encoder_file: _,
+                vae_file: _,
+            } => None,
+            crate::comfyui::ComfyuiWeights::Combined(file) => Some(
+                crate::comfyui::split_combined_checkpoint(safetensors::load(file, &Device::Cpu)?)?,
+            ),
+        };
+
         // DiT: ComfyUI-native keys → diffusers/candle keys (fused-qkv split + renames), then build.
-        let dit_map = safetensors::load(&sources.transformer_file, &Device::Cpu)?;
+        let dit_map = match (&sources.weights, combined.as_mut()) {
+            (
+                crate::comfyui::ComfyuiWeights::Separate {
+                    transformer_file, ..
+                },
+                None,
+            ) => safetensors::load(transformer_file, &Device::Cpu)?,
+            (crate::comfyui::ComfyuiWeights::Combined(_), Some(maps)) => {
+                std::mem::take(&mut maps.transformer)
+            }
+            _ => unreachable!("ComfyUI source variant and combined maps stay aligned"),
+        };
+        let dit_map =
+            crate::comfyui::normalize_fp8_map(dit_map, self.dtype, "z-image transformer")?;
         let dit_map = crate::comfyui::remap_dit_comfyui_to_diffusers(dit_map)?;
         let mut dit_cfg = DitConfig::z_image_turbo();
         dit_cfg.set_use_accelerated_attn(use_accelerated_attn);
         let dit_vb = VarBuilder::from_tensors(dit_map, self.dtype, &self.device);
         let transformer = DiT::Dense(Box::new(ZImageTransformer2DModel::new(&dit_cfg, dit_vb)?));
 
-        // Text encoder: standard HF Qwen3 — loaded verbatim (only a bf16 cast via mmap).
-        let te_vb = candle_gen::mmap_var_builder(
-            std::slice::from_ref(&sources.text_encoder_file),
-            self.dtype,
-            &self.device,
-        )?;
+        // Text encoder: standard HF Qwen3 — loaded verbatim and normalized to the compute dtype.
+        let te_map = match (&sources.weights, combined.as_mut()) {
+            (
+                crate::comfyui::ComfyuiWeights::Separate {
+                    text_encoder_file, ..
+                },
+                None,
+            ) => safetensors::load(text_encoder_file, &Device::Cpu)?,
+            (crate::comfyui::ComfyuiWeights::Combined(_), Some(maps)) => {
+                std::mem::take(&mut maps.text_encoder)
+            }
+            _ => unreachable!("ComfyUI source variant and combined maps stay aligned"),
+        };
+        let te_map = crate::comfyui::normalize_fp8_map(te_map, self.dtype, "z-image text encoder")?;
+        let te_vb = VarBuilder::from_tensors(te_map, self.dtype, &self.device);
         let text_encoder = TextEnc::Dense(Box::new(ZImageTextEncoder::new(
             &TextEncoderConfig::z_image(),
             te_vb,
         )?));
 
         // VAE: BFL/ldm keys → diffusers keys (incl. the up-block reversal + 1×1-conv→Linear squeeze).
-        let vae_map = safetensors::load(&sources.vae_file, &Device::Cpu)?;
+        let vae_map = match (&sources.weights, combined.as_mut()) {
+            (crate::comfyui::ComfyuiWeights::Separate { vae_file, .. }, None) => {
+                safetensors::load(vae_file, &Device::Cpu)?
+            }
+            (crate::comfyui::ComfyuiWeights::Combined(_), Some(maps)) => {
+                std::mem::take(&mut maps.vae)
+            }
+            _ => unreachable!("ComfyUI source variant and combined maps stay aligned"),
+        };
+        let vae_map = crate::comfyui::normalize_fp8_map(vae_map, self.dtype, "z-image VAE")?;
         let vae_map = crate::comfyui::remap_vae_ldm_to_diffusers(vae_map)?;
         let vae_vb = VarBuilder::from_tensors(vae_map, self.dtype, &self.device);
         let vae = AutoEncoderKL::new(&VaeConfig::z_image(), vae_vb)?;

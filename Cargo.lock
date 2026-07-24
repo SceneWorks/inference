@@ -2032,8 +2032,10 @@ dependencies = [
 name = "mlx-gen"
 version = "0.0.0"
 dependencies = [
+ "memmap2",
  "pmetal-mlx-rs",
  "pmetal-mlx-sys",
+ "safetensors 0.4.5",
  "sceneworks-gen-core",
  "serde_json",
  "thiserror 2.0.18",

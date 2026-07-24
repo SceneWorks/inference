@@ -121,3 +121,7 @@ tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 # snapshot's config.json `"quantization"` marker; the per-crate converters already used serde_json,
 # now the shared core copy does.
 serde_json = { workspace = true }
+# Match mlx-rs' safetensors ABI so the opt-in loader can inspect raw E4M3
+# byte views before converting them into MLX's supported bf16 storage dtype.
+safetensors-fp8 = { package = "safetensors", version = "0.4" }
+memmap2 = "0.9"

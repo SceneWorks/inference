@@ -196,6 +196,62 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     }))
 }
 
+fn build_comfyui_generator(
+    components: crate::comfyui::ComponentWeights,
+    tokenizer_root: &Path,
+) -> Result<Box<dyn Generator>> {
+    let text = loader::load_text_encoder_from_weights(crate::comfyui::normalize_fp8(
+        components.text_encoder,
+        "z-image text encoder",
+    )?)?;
+    let transformer = loader::load_transformer_from_weights(crate::comfyui::remap_dit(
+        crate::comfyui::normalize_fp8(components.transformer, "z-image transformer")?,
+    )?)?;
+    let vae = loader::load_vae_from_weights(crate::comfyui::remap_vae(
+        crate::comfyui::normalize_fp8(components.vae, "z-image VAE")?,
+    )?)?;
+    Ok(Box::new(ZImageTurbo {
+        descriptor: descriptor(),
+        tokenizer: loader::load_tokenizer(tokenizer_root)?,
+        residency: Residency::resident(
+            text,
+            ZImageHeavyOwned {
+                transformer,
+                vae,
+                pid: None,
+            },
+        ),
+    }))
+}
+
+/// Load three in-place ComfyUI Z-Image component files on MLX.
+pub fn load_from_comfyui_components(
+    transformer_file: impl AsRef<Path>,
+    text_encoder_file: impl AsRef<Path>,
+    vae_file: impl AsRef<Path>,
+    tokenizer_root: impl AsRef<Path>,
+) -> Result<Box<dyn Generator>> {
+    build_comfyui_generator(
+        crate::comfyui::ComponentWeights {
+            transformer: mlx_gen::weights::Weights::from_file_with_fp8(transformer_file)?,
+            text_encoder: mlx_gen::weights::Weights::from_file_with_fp8(text_encoder_file)?,
+            vae: mlx_gen::weights::Weights::from_file_with_fp8(vae_file)?,
+        },
+        tokenizer_root.as_ref(),
+    )
+}
+
+/// Load one fused community Z-Image checkpoint on MLX.
+pub fn load_from_comfyui_checkpoint(
+    checkpoint_file: impl AsRef<Path>,
+    tokenizer_root: impl AsRef<Path>,
+) -> Result<Box<dyn Generator>> {
+    build_comfyui_generator(
+        crate::comfyui::split_combined_checkpoint(checkpoint_file.as_ref())?,
+        tokenizer_root.as_ref(),
+    )
+}
+
 /// Build the tokenizer + [`Residency`] seam for a non-control Z-Image generator from a [`LoadSpec`],
 /// honoring [`LoadSpec::offload_policy`] (epic 10834 Phase 1, sc-10839; hoisted to the shared seam in
 /// sc-11125). `Resident` (default) builds every heavy component now via [`build_residency`] and holds
