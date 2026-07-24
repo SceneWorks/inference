@@ -85,8 +85,10 @@
 //! Editing adds the Qwen3-VL vision tower **around** this LM; nothing here is restructured. The
 //! three hooks it needs are already public — [`Qwen3VlTextEncoder::embed`] (splice merged image
 //! features over the `<|image_pad|>` run), [`Qwen3VlTextEncoder::layers`] +
-//! [`Qwen3VlDecoderLayer::forward`] (drive the stack and inject the deepstack features at
-//! `deepstack_visual_indexes` = `[5, 11, 17]`), and [`Qwen3VlTextEncoder::final_norm`] — plus
+//! [`Qwen3VlDecoderLayer::forward`] (drive the stack and inject the deepstack features into **LM
+//! layers `0..deepstack.len()`**, additively, **only over the `<|image_pad|>` run** — *not* at
+//! `deepstack_visual_indexes`, which are vision-tower **extraction** indices; see the detailed note
+//! in [`encoder`]), and [`Qwen3VlTextEncoder::final_norm`] — plus
 //! [`MageTextEncoder::encode_packed_ids`], which takes caller-built ids so the placeholder run can
 //! be expanded to the merged-token count, and [`MRopePositions`], which already carries three
 //! independent axes. The tower itself need not be written from scratch: `mlx_gen_boogu::VisionTower`

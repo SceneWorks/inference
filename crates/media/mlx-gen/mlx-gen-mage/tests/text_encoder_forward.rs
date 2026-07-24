@@ -306,6 +306,147 @@ fn position_affects_the_encoded_state() {
     );
 }
 
+// ── Arithmetic oracle ────────────────────────────────────────────────────────────────────────
+//
+// Everything above pins *topology*: shapes, layer counts, isolation, causality, which tensors are
+// required. None of it carries a numeric oracle for the attention composition, so a regression in
+// GQA `repeat_kv` grouping, QK-norm placement, the SwiGLU gate/up order or `o_proj` would stay
+// green. The committed 32 KB fixture below closes that: it is a real
+// `transformers.Qwen3VLTextModel` — the same class the vendored reference patches — instantiated at
+// toy dimensions with seeded weights and dumped by `tools/dump_mage_te_micro_golden.py`. It needs
+// no model weights and no `#[ignore]`, so the default `cargo test` lane gates arithmetic.
+
+const MICRO: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/te_micro_golden.safetensors"
+);
+
+/// Scale-free agreement: `max|Δ| / max|golden|`. Both sides are f32, so the only spread is Metal
+/// vs torch-CPU kernel arithmetic — measured **1.22e-3**, i.e. exactly the ~1e-3 relative precision
+/// MLX's Metal matmul is documented to carry. The gate is ~8× that, and the composition mutations
+/// below sit 20–26× above it. A *relative* metric is used deliberately: an absolute bound would
+/// have to be re-tuned whenever the fixture's activation scale changes, and a bound that tracks the
+/// fixture is a bound nobody re-derives.
+const MICRO_TOL: f32 = 1e-2;
+
+/// The toy config the fixture was dumped with. Deliberately keeps every production *structure*:
+/// GQA with a real group size (4 q / 2 kv), `head_dim` decoupled from `hidden / heads`
+/// (4 × 8 = 32 ≠ 16, mirroring production's 32 × 128 ≠ 2560), all three M-RoPE sections populated,
+/// and `intermediate != hidden` so a gate/up/down mix-up cannot cancel.
+fn micro_cfg() -> QwenVlTextConfig {
+    QwenVlTextConfig {
+        hidden_size: 16,
+        num_layers: 3,
+        num_attention_heads: 4,
+        num_key_value_heads: 2,
+        head_dim: 8,
+        intermediate_size: 12,
+        vocab_size: 24,
+        mrope_section: [2, 1, 1],
+        attention_bias: false,
+        tie_word_embeddings: true,
+    }
+}
+
+fn micro_weights() -> Weights {
+    Weights::from_file(MICRO).expect("committed micro golden")
+}
+
+/// Rebuild the weight map so a test can swap two tensors and re-load.
+fn micro_map(w: &Weights) -> HashMap<String, Array> {
+    w.keys()
+        .map(|k| (k.to_string(), w.get(k).expect("listed key").clone()))
+        .collect()
+}
+
+/// `max|got − want| / max|want|`.
+fn micro_rel(got: &Array, want: &Array) -> f32 {
+    let peak = want
+        .as_slice::<f32>()
+        .iter()
+        .map(|v| v.abs())
+        .fold(0f32, f32::max);
+    max_abs(got, want) / peak
+}
+
+fn micro_run(w: &Weights) -> Array {
+    let te = Qwen3VlTextEncoder::from_weights(w, PREFIX, &micro_cfg(), EPS, THETA).unwrap();
+    let ids: Vec<i32> = w
+        .require("io.input_ids")
+        .unwrap()
+        .as_dtype(mlx_rs::Dtype::Int32)
+        .unwrap()
+        .as_slice::<i32>()
+        .to_vec();
+    te.forward_segment(&ids)
+        .unwrap()
+        .as_dtype(mlx_rs::Dtype::Float32)
+        .unwrap()
+}
+
+/// **The arithmetic gate.** The whole composition — embedding, GQA + `repeat_kv`, QK-RMSNorm before
+/// RoPE, interleaved M-RoPE, causal SDPA, `o_proj`, SwiGLU, both residuals and the final RMSNorm —
+/// must reproduce `transformers.Qwen3VLTextModel` element-for-element.
+#[test]
+fn micro_forward_matches_the_torch_oracle() {
+    let w = micro_weights();
+    let want = w.require("io.last_hidden_state").unwrap();
+    let got = micro_run(&w);
+    assert_eq!(got.shape(), want.shape());
+    let d = micro_rel(&got, want);
+    println!(
+        "micro oracle rel = {d:e}  (max_abs {:e})",
+        max_abs(&got, want)
+    );
+    assert!(
+        d < MICRO_TOL,
+        "the forward diverges from transformers.Qwen3VLTextModel by rel {d:e} (> {MICRO_TOL:e})"
+    );
+}
+
+/// …and the gate genuinely discriminates. Both mutations are pure weight permutations between
+/// same-shaped tensors — no shape error, no missing key — and each emulates a composition bug this
+/// suite could not otherwise catch:
+///
+/// * `gate_proj` ↔ `up_proj` — the SwiGLU order. `down(silu(gate)·up)` and `down(silu(up)·gate)`
+///   differ only because `silu` is non-linear, so a port that swapped them would be entirely
+///   shape-correct and silently wrong.
+/// * `q_norm` ↔ `k_norm` — the per-head QK-RMSNorm assignment.
+#[test]
+fn the_micro_oracle_rejects_composition_swaps() {
+    let w = micro_weights();
+    let want = w.require("io.last_hidden_state").unwrap();
+    assert!(micro_rel(&micro_run(&w), want) < MICRO_TOL, "baseline");
+
+    for (a, b, label) in [
+        (
+            "lm.layers.0.mlp.gate_proj.weight",
+            "lm.layers.0.mlp.up_proj.weight",
+            "SwiGLU gate/up swapped",
+        ),
+        (
+            "lm.layers.0.self_attn.q_norm.weight",
+            "lm.layers.0.self_attn.k_norm.weight",
+            "QK-RMSNorm q/k swapped",
+        ),
+    ] {
+        let mut map = micro_map(&w);
+        let (ta, tb) = (map[a].clone(), map[b].clone());
+        assert_eq!(ta.shape(), tb.shape(), "{label}: not a shape-valid swap");
+        map.insert(a.to_string(), tb);
+        map.insert(b.to_string(), ta);
+        let moved = micro_rel(&micro_run(&Weights::from_map(map)), want);
+        println!(
+            "  {label:<26} rel {moved:e}  ({:.0}x the gate)",
+            moved / MICRO_TOL
+        );
+        assert!(
+            moved > MICRO_TOL,
+            "{label} still matches the torch oracle ({moved:e}) — the gate does not discriminate"
+        );
+    }
+}
+
 /// A malformed or empty pack is an error, never a silently shorter conditioning.
 #[test]
 fn degenerate_inputs_are_rejected() {

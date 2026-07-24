@@ -42,10 +42,27 @@
 //! 1. [`embed`](Qwen3VlTextEncoder::embed) returns the token embeddings **before** any layer runs,
 //!    so the merged image features can be spliced over the `<|image_pad|>` run;
 //! 2. [`layers`](Qwen3VlTextEncoder::layers) plus [`Qwen3VlDecoderLayer::forward`] let that path
-//!    drive the stack itself and additively inject the deepstack features at layers
-//!    `deepstack_visual_indexes` — the one thing [`Qwen3VlTextEncoder::forward_embeds`] cannot express;
+//!    drive the stack itself and inject the Qwen3-VL **deepstack** features — the one thing
+//!    [`Qwen3VlTextEncoder::forward_embeds`] cannot express. Inject into **LM layers
+//!    `0..deepstack.len()`** (i.e. 0/1/2), **additively**, and **only over the `<|image_pad|>`
+//!    token run**;
 //! 3. [`final_norm`](Qwen3VlTextEncoder::final_norm) closes it, and
 //!    [`MRopePositions`] already carries three independent axes.
+//!
+//! **`deepstack_visual_indexes` (`[5, 11, 17]`) is NOT an LM layer list — do not inject there.**
+//! Those are the **vision-tower block indices the features are EXTRACTED from**, read inside
+//! `Qwen3VLVisionModel` (`transformers/models/qwen3_vl/modeling_qwen3_vl.py:590`), and the field
+//! lives in `vision_config`, not `text_config`. The LM side consumes
+//! `deepstack_visual_embeds[layer_idx] for layer_idx in range(len(deepstack_visual_embeds))`
+//! (`:862-866` — identically in the vendored patch at
+//! `_vendor/mage_flow/models/modules/text_encoder.py:282-288`) and applies it via
+//! `_deepstack_process` (`:876-882`), which adds **only at `visual_pos_masks`**. The class
+//! docstring is explicit: DeepStack "integrates visual features into the **early** hidden states"
+//! (`:759`). Injecting at 5/11/17, or over all tokens instead of the image run, produces silently
+//! wrong edit conditioning — no shape error, no missing key, and there is no edit-path golden until
+//! e2e. `mlx-gen-boogu/src/text_encoder/encoder.rs:9,134` and
+//! `mlx-gen-krea/src/text_encoder/encoder.rs:155-156,248-249` already do it correctly and are the
+//! executable references.
 //!
 //! (Note that the reference's *own* edit path still feeds flat per-segment positions — see the
 //! [`super::rope`] module docs — so the 3-axis freedom is available but not currently exercised.)

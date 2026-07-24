@@ -43,6 +43,12 @@ pub const LM_PREFIX: &str = "model.language_model";
 /// Qwen2 pad token id, `<|endoftext|>` (`text_encoder/tokenizer_config.json`).
 const PAD_TOKEN_ID: i32 = 151_643;
 
+/// The only `rope_scaling.rope_type` this port implements. `"default"` selects the plain
+/// `1/θ^(2i/head_dim)` inverse-frequency table with `attention_scaling == 1.0`; every other
+/// `ROPE_INIT_FUNCTIONS` entry (`"yarn"`, `"linear"`, `"dynamic"`, `"longrope"`, …) rewrites those
+/// on identical weights.
+const ROPE_TYPE_DEFAULT: &str = "default";
+
 /// Group size for group-wise-affine Q4/Q8 packing. Every quantizable projection in this LM has an
 /// input dim divisible by 64 (2560 hidden, 4096 q, 1024 kv, 9728 FFN), so one group size covers the
 /// whole encoder — the codebase default, matching the `mlx-gen-krea` / `mlx-gen-z-image` Qwen3
@@ -104,8 +110,9 @@ pub fn load(root: impl AsRef<Path>) -> Result<MageTextEncoder> {
 /// then fail deep inside `Weights::require` with an opaque key error — or worse, load a variant
 /// with the same key names and a different `head_dim` and produce silently wrong conditioning.
 /// Every field this port depends on is checked, including the ones with no weight-shape
-/// consequence (`mrope_section`, `attention_bias`, `hidden_act`, `rms_norm_eps`, `rope_theta`,
-/// `tie_word_embeddings`), which are exactly the ones a shape mismatch would *not* catch.
+/// consequence (`rope_scaling.rope_type`, `rope_scaling.mrope_interleaved`, `mrope_section`,
+/// `attention_bias`, `hidden_act`, `rms_norm_eps`, `rope_theta`, `tie_word_embeddings`), which are
+/// exactly the ones a shape mismatch would *not* catch.
 pub fn verify_text_config(json: &str) -> Result<QwenVlTextConfig> {
     let v: serde_json::Value = serde_json::from_str(json).map_err(|e| {
         Error::Msg(format!(
@@ -170,11 +177,23 @@ pub fn verify_text_config(json: &str) -> Result<QwenVlTextConfig> {
         ));
     }
 
-    // `rope_scaling` selects the rotary scheme; `mrope_interleaved: false` would be a different
-    // frequency layout on identical weights — no shape check could see it.
+    // `rope_scaling` selects the rotary scheme; every entry here changes the frequency table on
+    // otherwise identical weights, with no shape consequence at all.
     let scaling = tc.get("rope_scaling").ok_or_else(|| {
         Error::Msg("mage_flow text encoder: text_config has no 'rope_scaling'".into())
     })?;
+    // `rope_type` picks the `ROPE_INIT_FUNCTIONS` entry that builds `inv_freq` **and** the
+    // `attention_scaling` factor. A non-`"default"` value (`"yarn"`, `"linear"`, `"longrope"`, …)
+    // rescales every rotation angle while loading perfectly cleanly — the same silent class as
+    // `mrope_interleaved`, and worth extra care because this guard is the only control behind the
+    // QK-norm epsilon the parity golden provably cannot separate.
+    if scaling.get("rope_type").and_then(serde_json::Value::as_str) != Some(ROPE_TYPE_DEFAULT) {
+        return Err(mismatch(
+            "rope_scaling.rope_type",
+            ROPE_TYPE_DEFAULT,
+            scaling.get("rope_type"),
+        ));
+    }
     if scaling
         .get("mrope_interleaved")
         .and_then(serde_json::Value::as_bool)
@@ -257,7 +276,7 @@ mod tests {
     /// silently accepted one would be the whole point of the function failing to fire.
     #[test]
     fn every_verified_key_rejects_a_drifting_value() {
-        let cases: [(&[&str], serde_json::Value); 13] = [
+        let cases: [(&[&str], serde_json::Value); 14] = [
             (&["hidden_size"], 4096.into()),
             (&["num_hidden_layers"], 48.into()),
             (&["num_attention_heads"], 40.into()),
@@ -271,6 +290,7 @@ mod tests {
             (&["rms_norm_eps"], 1e-5.into()),
             (&["rope_theta"], 1_000_000.into()),
             (&["rope_scaling", "mrope_interleaved"], false.into()),
+            (&["rope_scaling", "rope_type"], "yarn".into()),
         ];
         for (path, value) in cases {
             let mutated = mutate(path, value.clone());
@@ -305,6 +325,45 @@ mod tests {
         v["tie_word_embeddings"] = false.into();
         verify_text_config(&v.to_string())
             .expect("the top-level copy is not the one this port depends on");
+    }
+
+    /// The exact counter-example review used: a YaRN-scaled `rope_scaling` block. It changes every
+    /// rotation angle and the `attention_scaling` factor with **zero** shape consequence, so
+    /// without this guard it loaded cleanly and only failed later — as a confusing
+    /// "no .safetensors files" error from `Weights::from_dir` rather than a config mismatch.
+    #[test]
+    fn a_yarn_scaled_rope_config_is_rejected() {
+        let mut v: serde_json::Value = serde_json::from_str(PUBLISHED).unwrap();
+        v["text_config"]["rope_scaling"] = serde_json::json!({
+            "rope_type": "yarn",
+            "factor": 4.0,
+            "mrope_interleaved": true,
+            "mrope_section": [24, 20, 20],
+        });
+        let err = match verify_text_config(&v.to_string()) {
+            Err(e) => e,
+            Ok(_) => panic!("a YaRN-scaled rope_scaling block was accepted"),
+        };
+        assert!(
+            format!("{err}").contains("rope_type"),
+            "the error must name rope_type: {err}"
+        );
+
+        // …and `rope_type` is checked on its own, not merely as part of a whole-block swap.
+        assert!(
+            verify_text_config(&mutate(&["rope_scaling", "rope_type"], "linear".into())).is_err()
+        );
+        assert!(
+            verify_text_config(&mutate(&["rope_scaling", "rope_type"], "longrope".into())).is_err()
+        );
+        // A missing or wrong-typed `rope_type` is a mismatch, not a skip.
+        let mut absent: serde_json::Value = serde_json::from_str(PUBLISHED).unwrap();
+        absent["text_config"]["rope_scaling"]
+            .as_object_mut()
+            .unwrap()
+            .remove("rope_type");
+        assert!(verify_text_config(&absent.to_string()).is_err());
+        assert!(verify_text_config(&mutate(&["rope_scaling", "rope_type"], 0.into())).is_err());
     }
 
     /// A key that is present but wrong-typed is a mismatch, not a skip — `"head_dim": "128"` must

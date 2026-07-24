@@ -5,7 +5,7 @@
 //! gitignored (`crates/media/mlx-gen/tools/golden/README.md`):
 //!
 //! ```sh
-//! MAGE_FLOW_SNAPSHOT=/path/to/models--microsoft--Mage-Flow/snapshots/<rev> \
+//! MAGE_SNAPSHOT=/path/to/models--microsoft--Mage-Flow/snapshots/<rev> \
 //! MAGE_FLOW_TE_GOLDEN=/path/to/tools/golden/mage_flow_te_golden.safetensors \
 //!   cargo test -p mlx-gen-mage --release --test te_parity_real_weights -- --ignored --nocapture
 //! ```
@@ -92,8 +92,8 @@ const MEAN_REL_TOL: f32 = 3.5e-2;
 
 fn snapshot() -> PathBuf {
     PathBuf::from(
-        std::env::var("MAGE_FLOW_SNAPSHOT")
-            .expect("set MAGE_FLOW_SNAPSHOT to a microsoft/Mage-Flow* snapshot root"),
+        std::env::var("MAGE_SNAPSHOT")
+            .expect("set MAGE_SNAPSHOT to a microsoft/Mage-Flow* snapshot root"),
     )
 }
 
@@ -211,7 +211,7 @@ fn packed_hidden(lm: &Qwen3VlTextEncoder, pos: &[i32], neg: &[i32]) -> Array {
 /// transcription slip in the system prefix would shift `drop_idx` and corrupt every conditioning
 /// tensor while still producing a plausible-looking result.
 #[test]
-#[ignore = "needs MAGE_FLOW_SNAPSHOT + the gitignored TE golden"]
+#[ignore = "needs MAGE_SNAPSHOT + the gitignored TE golden"]
 fn tokenizer_reproduces_the_reference_input_ids() {
     let g = golden();
     let te = MageTextEncoder::new(
@@ -246,7 +246,7 @@ fn tokenizer_reproduces_the_reference_input_ids() {
 /// pre-drop `gen_hidden_full` (which pins the layer + final norm) and the post-drop `gen_txt` /
 /// `neg_txt` (which pin `drop_idx` and per-segment isolation).
 #[test]
-#[ignore = "needs MAGE_FLOW_SNAPSHOT + the gitignored TE golden"]
+#[ignore = "needs MAGE_SNAPSHOT + the gitignored TE golden"]
 fn conditioning_matches_the_torch_golden() {
     let g = golden();
     let te = load();
@@ -301,7 +301,7 @@ fn conditioning_matches_the_torch_golden() {
 ///   final RMSNorm;
 /// * wrong `drop_idx` — keeping the system prompt (`drop_idx = 0`) instead of dropping 34.
 #[test]
-#[ignore = "needs MAGE_FLOW_SNAPSHOT + the gitignored TE golden"]
+#[ignore = "needs MAGE_SNAPSHOT + the gitignored TE golden"]
 fn discrimination_wrong_layer_and_wrong_drop_idx_both_fail() {
     let g = golden();
     let te = load();
@@ -422,7 +422,7 @@ fn discrimination_wrong_layer_and_wrong_drop_idx_both_fail() {
 /// **config conformance guard**, which this test also exercises so the compensating control cannot
 /// silently disappear.
 #[test]
-#[ignore = "needs MAGE_FLOW_SNAPSHOT + the gitignored TE golden"]
+#[ignore = "needs MAGE_SNAPSHOT + the gitignored TE golden"]
 fn subtly_wrong_hyperparameters_are_caught_by_the_gate_or_by_the_config_guard() {
     let g = golden();
     let want_full = f32_of(&g, "gen_hidden_full");
@@ -503,7 +503,7 @@ fn subtly_wrong_hyperparameters_are_caught_by_the_gate_or_by_the_config_guard() 
 /// The reference reaches these ids through `AutoProcessor`, which expands the single
 /// `<|image_pad|>` placeholder to one token per merged patch — `prod(grid) / spatial_merge²`.
 #[test]
-#[ignore = "needs MAGE_FLOW_SNAPSHOT + the gitignored TE golden"]
+#[ignore = "needs MAGE_SNAPSHOT + the gitignored TE golden"]
 fn edit_template_reproduces_the_reference_edit_input_ids() {
     let g = golden();
     let tok = text_encoder::load_tokenizer(snapshot()).expect("tokenizer.json");
