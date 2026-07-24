@@ -340,6 +340,131 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     }))
 }
 
+/// Load a fused SDXL LDM/A1111 checkpoint in memory. The fused file supplies both text encoders,
+/// UNet, and VAE; only the model-agnostic tokenizer assets come from `tokenizer_root`.
+pub fn load_from_ldm_file(spec: &LoadSpec, tokenizer_root: &Path) -> Result<Box<dyn Generator>> {
+    let file = match &spec.weights {
+        WeightsSource::File(path) => path,
+        WeightsSource::Dir(_) => {
+            return Err(Error::Msg(
+                "sdxl LDM loader expects a fused .safetensors file".into(),
+            ))
+        }
+    };
+    if spec.precision != Precision::Bf16 {
+        return Err(Error::Msg(
+            "sdxl: precision override is not wired; the dense path runs fp16".into(),
+        ));
+    }
+    let residency = match spec.offload_policy {
+        OffloadPolicy::Resident => {
+            let components = crate::ldm::split_ldm_checkpoint(file)?;
+            let text = build_ldm_text(&components, spec.quantize)?;
+            let heavy = build_ldm_heavy(spec, components, true)?;
+            Residency::resident(text, heavy)
+        }
+        OffloadPolicy::Sequential => {
+            let text_file = file.clone();
+            let heavy_file = file.clone();
+            let text_quant = spec.quantize;
+            let heavy_spec = spec.clone();
+            Residency::sequential(
+                move || {
+                    let components = crate::ldm::split_ldm_checkpoint(&text_file)?;
+                    build_ldm_text(&components, text_quant)
+                },
+                move |load_pid| {
+                    let components = crate::ldm::split_ldm_checkpoint(&heavy_file)?;
+                    build_ldm_heavy(&heavy_spec, components, load_pid)
+                },
+            )
+        }
+    };
+    let cfg = DiffusionConfig::sdxl_base();
+    let alpha_schedule =
+        AlphaSchedule::scaled_linear(cfg.num_train_steps, cfg.beta_start, cfg.beta_end);
+    Ok(Box::new(Sdxl {
+        descriptor: descriptor(),
+        tokenizer: loader::load_tokenizer(tokenizer_root)?,
+        sampler: EulerSampler::new_with_dtype(&cfg, true, DTYPE)?,
+        alpha_schedule,
+        control_count: spec.control.is_some() as usize + spec.extra_controls.len(),
+        residency,
+    }))
+}
+
+fn build_ldm_text(
+    components: &crate::ldm::LdmComponents,
+    quantize: Option<Quant>,
+) -> Result<(ClipTextEncoder, ClipTextEncoder)> {
+    let mut te1 = loader::load_text_encoder_1_from_weights(components.clip_l.clone(), DTYPE)?;
+    let mut te2 = loader::load_text_encoder_2_from_weights(components.clip_bigg.clone(), DTYPE)?;
+    if let Some(quant) = quantize {
+        te1.quantize(quant.bits())?;
+        te2.quantize(quant.bits())?;
+    }
+    Ok((te1, te2))
+}
+
+fn build_ldm_heavy(
+    spec: &LoadSpec,
+    components: crate::ldm::LdmComponents,
+    load_pid: bool,
+) -> Result<SdxlHeavyOwned> {
+    let mut unet = loader::load_unet_from_weights(components.unet, DTYPE)?;
+    let vae = loader::load_vae_from_weights(components.vae)?;
+    if !spec.adapters.is_empty() {
+        let coverage = if std::env::var_os("SDXL_LORA_VENDORED").is_some() {
+            crate::adapters::LoraCoverage::Vendored
+        } else {
+            crate::adapters::LoraCoverage::Complete
+        };
+        crate::adapters::apply_sdxl_adapters_with(&mut unet, &spec.adapters, coverage)?;
+    }
+    let mut controls = Vec::new();
+    if let Some(source) = &spec.control {
+        controls.push(loader::load_controlnet(source, DTYPE)?);
+    }
+    for source in &spec.extra_controls {
+        controls.push(loader::load_controlnet(source, DTYPE)?);
+    }
+    let ip_adapter = match &spec.ip_adapter {
+        Some(WeightsSource::Dir(path)) => {
+            let (encoder, pairs) = loader::load_ip_adapter(path, DTYPE)?;
+            unet.install_ip_adapter(pairs)?;
+            Some(encoder)
+        }
+        Some(WeightsSource::File(_)) => {
+            return Err(Error::Msg(
+                "sdxl ip_adapter expects an h94/IP-Adapter snapshot directory".into(),
+            ))
+        }
+        None => None,
+    };
+    if let Some(quant) = spec.quantize {
+        let bits = quant.bits();
+        unet.quantize(bits)?;
+        for control in &mut controls {
+            control.quantize(bits)?;
+        }
+    }
+    let pid = if load_pid {
+        spec.pid
+            .as_ref()
+            .map(|weights| PidEngine::from_spec(weights, PID_BACKBONE))
+            .transpose()?
+    } else {
+        None
+    };
+    Ok(SdxlHeavyOwned {
+        unet,
+        controls,
+        ip_adapter,
+        vae,
+        pid,
+    })
+}
+
 /// The policy→[`Residency`] dispatch, routed through the single [`Residency::from_policy`] seam
 /// (sc-10839; hoisted to the shared seam in sc-11126, F-180) so the `match offload_policy` lives in
 /// exactly one place. `Resident` eager-loads the dual CLIP text encoders + heavy bundle now (the heavy
@@ -1522,4 +1647,39 @@ mod tests {
             "expected an eager-load failure, not the up-front guard: {msg}"
         );
     }
+}
+#[test]
+#[ignore = "real fused SDXL checkpoint + Metal; set SDXL_LDM_CHECKPOINT and SDXL_TOKENIZER_ROOT"]
+fn fused_ldm_real_weight_render_is_nonconstant() {
+    let checkpoint = std::env::var_os("SDXL_LDM_CHECKPOINT")
+        .map(std::path::PathBuf::from)
+        .expect("set SDXL_LDM_CHECKPOINT");
+    let tokenizer_root = std::env::var_os("SDXL_TOKENIZER_ROOT")
+        .map(std::path::PathBuf::from)
+        .expect("set SDXL_TOKENIZER_ROOT");
+    let spec = LoadSpec::new(WeightsSource::File(checkpoint));
+    let generator = load_from_ldm_file(&spec, &tokenizer_root).expect("load fused SDXL");
+    let output = generator
+        .generate(
+            &GenerationRequest {
+                prompt: "a red fox in a snowy forest, cinematic photograph".into(),
+                negative_prompt: Some("blurry, low quality".into()),
+                width: 512,
+                height: 512,
+                steps: Some(2),
+                guidance: Some(5.0),
+                seed: Some(14024),
+                ..Default::default()
+            },
+            &mut |_| {},
+        )
+        .expect("render fused SDXL");
+    let GenerationOutput::Images(images) = output else {
+        panic!("SDXL returned non-image output");
+    };
+    let image = images.first().expect("one image");
+    assert_eq!((image.width, image.height), (512, 512));
+    let min = *image.pixels.iter().min().expect("pixels");
+    let max = *image.pixels.iter().max().expect("pixels");
+    assert!(max.saturating_sub(min) > 32, "render is nearly constant");
 }
