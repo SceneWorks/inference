@@ -25,7 +25,7 @@ use crate::config::SnapshotConfig;
 use crate::dit::DiT;
 use crate::qwen::Qwen3Encoder;
 use crate::scheduler::{FlowMatchSchedule, DEFAULT_SHIFT};
-use crate::text::{build_prompt, tokenize_lyrics, tokenize_prompt, Metadata};
+use crate::text::{build_lyrics, build_prompt, tokenize_lyrics, tokenize_prompt, Metadata};
 use crate::tokenizer::{AudioTokenDetokenizer, AudioTokenizer, TokenizerConfig};
 use crate::vae::{OobleckDecoder, OobleckEncoder, VAE_FILE};
 
@@ -282,8 +282,18 @@ impl AceStepPipeline {
         (seconds as f64 * self.config.vae.latents_per_second()).ceil() as usize
     }
 
-    fn encode_context(&self, prompt: &str, lyrics: &str, meta: &Metadata) -> Result<Tensor> {
-        let full_prompt = build_prompt(prompt, meta);
+    /// Build the cross-attention context from the prompt + lyric streams.
+    ///
+    /// `seconds` is the requested duration: it rides the prompt's `# Metas` block, so it must be
+    /// threaded in rather than defaulted (see [`build_prompt`]).
+    fn encode_context(
+        &self,
+        prompt: &str,
+        lyrics: &str,
+        meta: &Metadata,
+        seconds: f32,
+    ) -> Result<Tensor> {
+        let full_prompt = build_prompt(prompt, meta, seconds);
         let prompt_ids = tokenize_prompt(&self.tokenizer, &full_prompt)?;
         let text_hidden = if prompt_ids.is_empty() {
             Tensor::zeros(
@@ -296,7 +306,12 @@ impl AceStepPipeline {
                 .encode(&prompt_ids)
                 .map_err(AudioError::from)?
         };
-        let lyric_ids = tokenize_lyrics(&self.tokenizer, lyrics)?;
+        // The lyric stream is ALWAYS encoded — the reference formats it through a template that is
+        // non-empty even for an instrumental request (`# Languages … # Lyric <|endoftext|>`), so
+        // the condition encoder always receives those rows. Dropping them when the user supplies no
+        // lyrics removed real conditioning (and the vocal-language signal) from the packed context.
+        let full_lyrics = build_lyrics(lyrics, meta.vocal_language.as_deref());
+        let lyric_ids = tokenize_lyrics(&self.tokenizer, &full_lyrics)?;
         let lyric_embeds = if lyric_ids.is_empty() {
             None
         } else {
@@ -306,9 +321,11 @@ impl AceStepPipeline {
                     .map_err(AudioError::from)?,
             )
         };
-        // Text-to-music: the condition encoder supplies its own timbre special token.
+        // Text-to-music timbre: the reference's `timbre_fix_frame` — a fixed 30 s slice of the
+        // encoded silence latent, independent of the requested duration.
+        let timbre_frames = (30.0 * self.config.vae.latents_per_second()).ceil() as usize;
         self.condition
-            .encode(&text_hidden, lyric_embeds.as_ref())
+            .encode(&text_hidden, lyric_embeds.as_ref(), timbre_frames)
             .map_err(AudioError::from)
     }
 
@@ -341,7 +358,8 @@ impl AceStepPipeline {
             return Err(AudioError::Canceled);
         }
 
-        let ctx_raw = self.encode_context(prompt, &params.lyrics, &params.metadata)?;
+        let ctx_raw =
+            self.encode_context(prompt, &params.lyrics, &params.metadata, params.seconds)?;
         let ctx = self.dit.embed_context(&ctx_raw)?;
 
         // Text-to-music context latents: [src_latents(silence) | chunk_mask(ones)].
@@ -514,7 +532,12 @@ impl AceStepPipeline {
             Tensor::cat(&[&src_full, &mask], candle_audio::candle_core::D::Minus1)?;
 
         // 5. Condition context (prompt + lyrics + metadata) — identical to text-to-music.
-        let ctx_raw = self.encode_context(prompt, &params.base.lyrics, &params.base.metadata)?;
+        let ctx_raw = self.encode_context(
+            prompt,
+            &params.base.lyrics,
+            &params.base.metadata,
+            params.base.seconds,
+        )?;
         let ctx = self.dit.embed_context(&ctx_raw)?;
 
         // 6. Denoise + decode (turbo DiT — Inpaint/Repaint/Extend keep the fast distilled path).
@@ -636,7 +659,8 @@ impl AceStepPipeline {
         // 4. Condition context from the NEW prompt (special-token timbre, like text-to-music). The
         //    context is embedded by the sft cover DiT (its `condition_embedder` weights differ from
         //    turbo's), then consumed by that same DiT below.
-        let ctx_raw = self.encode_context(prompt, &params.lyrics, &params.metadata)?;
+        let ctx_raw =
+            self.encode_context(prompt, &params.lyrics, &params.metadata, params.seconds)?;
         let ctx = cover_dit.embed_context(&ctx_raw)?;
 
         // 5. Denoise through the non-distilled sft cover DiT (guidance 1, multi-step — the reference's

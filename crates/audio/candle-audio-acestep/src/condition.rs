@@ -11,14 +11,16 @@
 //!                                 GQA 16/8 head_dim 128, RoPE, SwiGLU MLP, RMSNorms)
 //!   lyric_encoder.norm         RMSNorm
 //!   timbre_encoder.embed_tokens Linear(64 → 2048, bias)   ← real timbre latents (audio-to-audio)
-//!   timbre_encoder.special_token [1, 1, 2048]             ← the text-to-music (no reference) timbre
+//!   timbre_encoder.special_token [1, 1, 2048]             ← present in the checkpoint but UNUSED
+//!                                                          (the reference's forward never reads it)
 //!   timbre_encoder.layers.N     4× bidirectional block
 //!   timbre_encoder.norm         RMSNorm
 //!   silence_latent            [1, 15000, 64]               ← tiled/cropped to the src latents
 //! ```
 //!
 //! The fused context is `cat([text_proj(prompt), lyric_encoder(lyrics), timbre_encoder(timbre)])`
-//! along the sequence. For pure text-to-music the timbre stream is the learned `special_token`
+//! along the sequence, in the reference's pack order [lyric | timbre | text]. For pure
+//! text-to-music the timbre stream is a fixed 30 s slice of the encoded `silence_latent`
 //! (no reference audio); an absent lyric stream (instrumental) is simply omitted.
 
 use candle_audio::candle_core::{Device, Result as CandleResult, Tensor};
@@ -209,7 +211,6 @@ pub struct ConditionEncoder {
     text_projector: Linear,
     lyric_encoder: Encoder,
     timbre_encoder: Encoder,
-    special_token: Tensor,  // [1, 1, hidden]
     silence_latent: Tensor, // [1, T0, acoustic]
     cfg: ConditionEncoderConfig,
 }
@@ -232,13 +233,11 @@ impl ConditionEncoder {
             "timbre_encoder",
             vb.clone(),
         )?;
-        let special_token = vb.get((1, 1, h), "timbre_encoder.special_token")?;
         let silence_latent = vb.get_unchecked("silence_latent")?;
         Ok(Self {
             text_projector,
             lyric_encoder,
             timbre_encoder,
-            special_token,
             silence_latent,
             cfg: cfg.clone(),
         })
@@ -264,19 +263,38 @@ impl ConditionEncoder {
 
     /// Build the DiT cross-attention context `[1, S, hidden]` from the prompt hidden states, the
     /// lyric token embeddings (Qwen embedding lookup), and the text-to-music timbre special token.
+    ///
+    /// Stream order is the reference's `_pack_sequences` order — **lyric, then timbre, then
+    /// text** — not text-first. Cross-attention itself is permutation-invariant over the context
+    /// (permuting K and V rows identically permutes the softmax weights identically, and no
+    /// positional encoding is applied to this sequence), so this ordering is not load-bearing for
+    /// the maths; it is matched so the packed context is bit-comparable against the reference and
+    /// so any future change that *does* become order-sensitive — a context RoPE, a positional
+    /// bias, or attention-mask packing — starts from the correct layout.
+    /// `timbre_frames` is the reference's `timbre_fix_frame = ceil(30 · latents_per_second)` — the
+    /// fixed 30 s slice of silence latents the timbre encoder consumes when there is no reference
+    /// audio. The caller derives it from the VAE config.
     pub fn encode(
         &self,
         text_hidden: &Tensor,
         lyric_embeds: Option<&Tensor>,
+        timbre_frames: usize,
     ) -> CandleResult<Tensor> {
         let mut parts: Vec<Tensor> = Vec::new();
-        parts.push(self.text_projector.forward(text_hidden)?);
         if let Some(lyric) = lyric_embeds {
             parts.push(self.lyric_encoder.forward(lyric, true)?);
         }
-        // Text-to-music timbre: the learned special token (already hidden-width), through the
-        // timbre encoder stack.
-        parts.push(self.timbre_encoder.forward(&self.special_token, false)?);
+        // Text-to-music timbre. The reference does NOT feed the learned `special_token` here — its
+        // `AceStepTimbreEncoder::forward` never reads that parameter. It projects a fixed 30 s slice
+        // of the VAE-encoded `silence_latent` through `embed_tokens`, runs the encoder stack, and
+        // CLS-pools row 0. Feeding a bare 1-row token instead puts the timbre encoder far out of
+        // distribution; the reference's own source notes that an OOD timbre input "produces
+        // drone-like audio (observed on all text2music outputs)", which is exactly the broadband
+        // drone this port emitted over every generated track.
+        let timbre_in = self.src_latents(timbre_frames, text_hidden.device())?;
+        let timbre = self.timbre_encoder.forward(&timbre_in, true)?;
+        parts.push(timbre.narrow(1, 0, 1)?); // CLS-like pooling: first position.
+        parts.push(self.text_projector.forward(text_hidden)?);
         let refs: Vec<&Tensor> = parts.iter().collect();
         Tensor::cat(&refs, 1)
     }
