@@ -17,12 +17,358 @@
 //! `transformer/config.json` fields the reference reads and pins the rest as constants — see that
 //! module's "config-strip trap" note before adding a field here.
 //!
-//! The output is the flow-matching **velocity**; the sampler ([`crate::pipeline`]) applies
-//! `x += (σ_next − σ_cur) · v`.
+//! The output is the flow-matching **velocity**; the sampler ([`crate::pipeline`], sc-14041)
+//! applies `x += (σ_next − σ_cur) · v`.
+//!
+//! ## Precision
+//!
+//! The reference casts the whole transformer to bf16 after load (`pipeline.py:753`) and runs the
+//! denoise loop with **no autocast** — so bf16 weights *and* bf16 activations are the trained
+//! configuration, and [`MageTransformer::load`] keeps the checkpoint dtype rather than upcasting.
+//! The three places the reference deliberately leaves bf16 are reproduced where they live: the
+//! msrope rotation runs in f32 and casts back (`mage_layers.py:18-21`), the sinusoidal timestep
+//! table is f32 with a **bf16-rounded** frequency vector (`:42-46`), and the norms accumulate in
+//! f32 internally. [`MageTransformer::cast_weights`] exists for the parity suite, which uses an
+//! f32 run as a control on how much of the residual gap is bf16 rounding.
 //!
 //! ## Weight loading
 //!
-//! There is no shared `loader.rs` (see the decision note in `lib.rs`): `load_transformer` belongs
-//! in **this file**, beside the module it constructs, so the concurrent text-encoder and VAE ports
-//! never touch a file this story owns. The transformer is a single
-//! `transformer/diffusion_pytorch_model.safetensors`, bf16, loaded non-strict (`pipeline.py:748`).
+//! There is no shared `loader.rs` (see the decision note in `lib.rs`): loading belongs in **this
+//! file**, beside the module it constructs, so the concurrent text-encoder and VAE ports never
+//! touch a file this story owns. The transformer is a single
+//! `transformer/diffusion_pytorch_model.safetensors`, bf16, loaded non-strict (`pipeline.py:748`)
+//! — [`MageTransformer::from_weights`] therefore ignores unexpected keys but still **requires**
+//! every key it consumes, so a partially-remapped checkpoint fails loudly instead of silently
+//! running with randomly-initialised layers the way `strict=False` does in torch.
+
+use std::path::Path;
+
+use mlx_rs::fast::rms_norm;
+use mlx_rs::{Array, Dtype};
+
+use mlx_gen::weights::Weights;
+use mlx_gen::{nn, Error, Result};
+
+use crate::attention::DualStream;
+use crate::config::{MageFlowConfig, NORM_EPS};
+use crate::feed_forward::FfnActivation;
+use crate::final_layer::MageFinalLayer;
+use crate::rope_embedder::{MsRope, PackContext, PackLayout};
+use crate::timestep_embedder::MageTimestepEmbedder;
+use crate::transformer_block::MageTransformerBlock;
+
+/// The safetensors file the reference loads the DiT from (`pipeline.py:748`).
+pub const TRANSFORMER_WEIGHTS_FILE: &str = "diffusion_pytorch_model.safetensors";
+
+/// The config the reference reads its nine consumed fields out of (`pipeline.py:724`).
+pub const TRANSFORMER_CONFIG_FILE: &str = "config.json";
+
+/// A PyTorch `nn.Linear` — a `[out, in]` weight plus a bias.
+///
+/// Every Linear in this DiT carries a bias, so the bias is not optional: `qkv_bias: true`, the
+/// diffusers defaults `added_proj_bias`/`out_bias`/`sample_proj_bias`/`bias` are all `True`, and
+/// `proj_out` passes `bias=True` explicitly (`mage_flow.py:91`). A checkpoint missing one is a
+/// load error, not a silently-zeroed bias.
+///
+/// This lives in `transformer.rs` rather than a shared `loader.rs` because this file owns weight
+/// loading for the DiT (see the module note above and the `lib.rs` decision record).
+#[derive(Debug, Clone)]
+pub struct Linear {
+    weight: Array,
+    bias: Array,
+}
+
+impl Linear {
+    pub fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
+        Ok(Self {
+            weight: w.require(&format!("{prefix}.weight"))?.clone(),
+            bias: w.require(&format!("{prefix}.bias"))?.clone(),
+        })
+    }
+
+    pub fn out_features(&self) -> i32 {
+        self.weight.shape()[0]
+    }
+
+    pub fn in_features(&self) -> i32 {
+        self.weight.shape()[1]
+    }
+
+    pub fn dtype(&self) -> Dtype {
+        self.weight.dtype()
+    }
+
+    pub fn cast_weights(&mut self, dtype: Dtype) -> Result<()> {
+        if self.weight.dtype() != dtype {
+            self.weight = self.weight.as_dtype(dtype)?;
+        }
+        if self.bias.dtype() != dtype {
+            self.bias = self.bias.as_dtype(dtype)?;
+        }
+        Ok(())
+    }
+
+    /// `y = x · Wᵀ + b`, as the fused `addmm` MLX's own `nn.Linear` uses — a separate
+    /// `matmul` + `add` double-rounds the bias in bf16, which compounds over 12 blocks.
+    pub fn forward(&self, x: &Array) -> Result<Array> {
+        nn::linear(x, &self.weight, &self.bias)
+    }
+}
+
+/// The 4B NR-MMDiT: `img_in` / `txt_norm` / `txt_in` / timestep embedder → `depth` dual-stream
+/// blocks → `norm_out` / `proj_out`.
+#[derive(Debug, Clone)]
+pub struct MageTransformer {
+    cfg: MageFlowConfig,
+    rope: MsRope,
+    img_in: Linear,
+    txt_norm: Array,
+    txt_in: Linear,
+    time_embed: MageTimestepEmbedder,
+    blocks: Vec<MageTransformerBlock>,
+    final_layer: MageFinalLayer,
+}
+
+impl MageTransformer {
+    /// Load from a caller-provisioned `transformer/` directory: `config.json` for the nine consumed
+    /// fields, `diffusion_pytorch_model.safetensors` for the weights.
+    ///
+    /// The path is passed in, never derived — this repository's models arrive as
+    /// caller-provisioned local paths (the epic-13657 boundary enforced by `check-workspace.py`).
+    pub fn load(transformer_dir: impl AsRef<Path>) -> Result<Self> {
+        let dir = transformer_dir.as_ref();
+        let json = std::fs::read_to_string(dir.join(TRANSFORMER_CONFIG_FILE))?;
+        let cfg = MageFlowConfig::from_transformer_config_json(&json)?;
+        let weights = Weights::from_file(dir.join(TRANSFORMER_WEIGHTS_FILE))?;
+        Self::from_weights(&weights, cfg)
+    }
+
+    /// Build from an already-loaded checkpoint. Keys follow the published diffusers layout
+    /// (`img_in`, `txt_norm`, `txt_in`, `time_text_embed.timestep_embedder.linear_{1,2}`,
+    /// `transformer_blocks.{i}.*`, `norm_out.linear`, `proj_out`) — no remapping is needed.
+    pub fn from_weights(w: &Weights, cfg: MageFlowConfig) -> Result<Self> {
+        cfg.validate()?;
+        let rope = MsRope::from_config(&cfg)?;
+        let img_in = Linear::from_weights(w, "img_in")?;
+        let txt_in = Linear::from_weights(w, "txt_in")?;
+        let time_embed = MageTimestepEmbedder::from_weights(w, "time_text_embed")?;
+        let blocks = (0..cfg.depth)
+            .map(|i| {
+                MageTransformerBlock::from_weights(w, &format!("transformer_blocks.{i}"), &cfg)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let model = Self {
+            rope,
+            img_in,
+            txt_norm: w.require("txt_norm.weight")?.clone(),
+            txt_in,
+            time_embed,
+            blocks,
+            final_layer: MageFinalLayer::from_weights(w, "norm_out", "proj_out")?,
+            cfg,
+        };
+        model.check_geometry()?;
+        Ok(model)
+    }
+
+    /// The loaded tensors must actually have the geometry the config claims. `strict=False` in the
+    /// reference means a renamed or reshaped tensor is silently skipped; here the shapes are
+    /// cross-checked so a mismatched checkpoint is a load error rather than a wrong image.
+    fn check_geometry(&self) -> Result<()> {
+        let expect = |what: &str, got: (i32, i32), want: (i32, i32)| -> Result<()> {
+            if got != want {
+                return Err(Error::Msg(format!(
+                    "mage_flow: {what} is {got:?} but the config implies {want:?}"
+                )));
+            }
+            Ok(())
+        };
+        let dim = self.cfg.hidden_size;
+        expect(
+            "img_in",
+            (self.img_in.out_features(), self.img_in.in_features()),
+            (dim, self.cfg.in_channels),
+        )?;
+        expect(
+            "txt_in",
+            (self.txt_in.out_features(), self.txt_in.in_features()),
+            (dim, self.cfg.context_in_dim),
+        )?;
+        if self.txt_norm.shape() != [self.cfg.context_in_dim] {
+            return Err(Error::Msg(format!(
+                "mage_flow: txt_norm is {:?} but context_in_dim is {}",
+                self.txt_norm.shape(),
+                self.cfg.context_in_dim
+            )));
+        }
+        expect(
+            "time_text_embed",
+            (self.time_embed.out_dim(), dim),
+            (dim, dim),
+        )?;
+        let out_channels = self.cfg.patch_size * self.cfg.patch_size * self.cfg.out_channels;
+        expect(
+            "proj_out",
+            (self.final_layer.out_channels(), dim),
+            (out_channels, dim),
+        )?;
+        Ok(())
+    }
+
+    pub fn config(&self) -> &MageFlowConfig {
+        &self.cfg
+    }
+
+    pub fn rope(&self) -> &MsRope {
+        &self.rope
+    }
+
+    pub fn blocks(&self) -> &[MageTransformerBlock] {
+        &self.blocks
+    }
+
+    pub fn timestep_embedder(&self) -> &MageTimestepEmbedder {
+        &self.time_embed
+    }
+
+    pub fn final_layer(&self) -> &MageFinalLayer {
+        &self.final_layer
+    }
+
+    /// The dtype the weights are held at — bf16 straight off the published checkpoint.
+    pub fn dtype(&self) -> Dtype {
+        self.img_in.dtype()
+    }
+
+    /// Swap every block's FFN activation — **a parity-suite divergence knob**; see
+    /// [`crate::feed_forward::MageFeedForward::set_activation`]. Production never calls it.
+    pub fn set_ffn_activation(&mut self, activation: FfnActivation) {
+        for block in &mut self.blocks {
+            block.set_ffn_activation(activation);
+        }
+    }
+
+    /// Cast every weight (see the module's precision note). Production keeps the checkpoint's bf16.
+    pub fn cast_weights(&mut self, dtype: Dtype) -> Result<()> {
+        self.img_in.cast_weights(dtype)?;
+        self.txt_in.cast_weights(dtype)?;
+        if self.txt_norm.dtype() != dtype {
+            self.txt_norm = self.txt_norm.as_dtype(dtype)?;
+        }
+        self.time_embed.cast_weights(dtype)?;
+        for block in &mut self.blocks {
+            block.cast_weights(dtype)?;
+        }
+        self.final_layer.cast_weights(dtype)
+    }
+
+    /// Build the per-forward pack context (msrope table + segment indices) for a layout.
+    pub fn pack_context(&self, layout: PackLayout) -> Result<PackContext> {
+        PackContext::new(layout, &self.rope)
+    }
+
+    /// One denoiser evaluation.
+    ///
+    /// - `img`: `[1, img_tokens, in_channels]` — raw VAE latents, **no scale or shift**
+    ///   ([`crate::config::LATENT_SCALE_SHIFT`] is `None`).
+    /// - `txt`: `[1, txt_tokens, context_in_dim]` — the final post-RMSNorm Qwen3-VL hidden states
+    ///   with the template prefix already dropped.
+    /// - `sigma`: `[segments]` — the scheduler sigma in `[0, 1]`, one entry per packed segment.
+    /// - returns `[1, img_tokens, out_channels]`: the flow-matching velocity.
+    pub fn forward(
+        &self,
+        img: &Array,
+        txt: &Array,
+        sigma: &Array,
+        ctx: &PackContext,
+    ) -> Result<Array> {
+        let (mut stream, temb) = self.embed(img, txt, sigma, ctx)?;
+        for block in &self.blocks {
+            stream = block.forward(&stream, &temb, ctx)?;
+            // Bound the lazy graph: without this MLX holds all 12 blocks' intermediates until the
+            // first read, which is the peak-memory shape a 2048² pack cannot afford.
+            mlx_rs::transforms::eval([&stream.img, &stream.txt])?;
+        }
+        // Only the image stream reaches the head; the text stream is dropped (`mage_flow.py:146`).
+        self.final_layer.forward(&stream.img, &temb, ctx)
+    }
+
+    /// The pre-block half of [`MageTransformer::forward`]: `img_in`, `txt_norm → txt_in`, and the
+    /// timestep conditioning (`mage_flow.py:107-118`), returning the two streams a block consumes
+    /// plus `temb`.
+    ///
+    /// Split out because it is exactly what the one-block golden captures (`block_in.*`), so the
+    /// parity suite can gate the input projections and the timestep embedder on their own instead
+    /// of only seeing them through 12 blocks of compounding.
+    pub fn embed(
+        &self,
+        img: &Array,
+        txt: &Array,
+        sigma: &Array,
+        ctx: &PackContext,
+    ) -> Result<(DualStream, Array)> {
+        let tokens = ctx.layout().img_tokens();
+        let txt_tokens = ctx.layout().txt_tokens();
+        if img.shape() != [1, tokens, self.cfg.in_channels] {
+            return Err(Error::Msg(format!(
+                "mage_flow: img must be [1, {tokens}, {}], got {:?}",
+                self.cfg.in_channels,
+                img.shape()
+            )));
+        }
+        if txt.shape() != [1, txt_tokens, self.cfg.context_in_dim] {
+            return Err(Error::Msg(format!(
+                "mage_flow: txt must be [1, {txt_tokens}, {}], got {:?}",
+                self.cfg.context_in_dim,
+                txt.shape()
+            )));
+        }
+        if sigma.ndim() != 1 || sigma.shape()[0] != ctx.segments() as i32 {
+            return Err(Error::Msg(format!(
+                "mage_flow: sigma must be [{}] (one per packed segment), got {:?}",
+                ctx.segments(),
+                sigma.shape()
+            )));
+        }
+
+        let dtype = self.dtype();
+        let img = self.img_in.forward(&img.as_dtype(dtype)?)?;
+        let txt = rms_norm(&txt.as_dtype(dtype)?, &self.txt_norm, NORM_EPS)?;
+        // `timesteps.to(img.dtype)` (`mage_flow.py:112`) — sigma rounds to the model dtype BEFORE
+        // the sinusoid, which is what the embedder's f32 arithmetic then consumes.
+        let temb = self.time_embed.forward(&sigma.as_dtype(dtype)?)?;
+        let txt = self.txt_in.forward(&txt)?;
+        // `temb = temb + txt_vec` where `txt_vec` is an all-zero `[B, dim]` of the same dtype
+        // (`mage_flow.py:116-118`) — an exact no-op, so the pooled text vector is not ported at all.
+        Ok((DualStream { txt, img }, temb))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn linear_requires_its_bias() {
+        let mut w = Weights::empty();
+        w.insert("p.weight", Array::from_slice(&[1.0f32, 2.0], &[1, 2]));
+        assert!(Linear::from_weights(&w, "p").is_err());
+        w.insert("p.bias", Array::from_slice(&[0.5f32], &[1]));
+        let lin = Linear::from_weights(&w, "p").unwrap();
+        assert_eq!(lin.in_features(), 2);
+        assert_eq!(lin.out_features(), 1);
+        let x = Array::from_slice(&[1.0f32, 1.0], &[1, 2]);
+        assert_eq!(lin.forward(&x).unwrap().as_slice::<f32>(), &[3.5]);
+    }
+
+    #[test]
+    fn missing_transformer_keys_are_a_load_error_not_a_silent_skip() {
+        // torch's `strict=False` would leave these randomly initialised; the port refuses.
+        let err = MageTransformer::from_weights(&Weights::empty(), MageFlowConfig::mage_flow())
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::MissingTensor(ref key) if key.starts_with("img_in")),
+            "expected a missing-tensor error naming img_in, got {err:?}"
+        );
+    }
+}

@@ -92,7 +92,13 @@ pub use model::{descriptor_for, MageVariant, MODEL_IDS};
 
 pub use vae::{MageVae, VaePart};
 
-// sc-14040 (NR-MMDiT) re-exports here:
+pub use attention::{DualStream, MageJointAttention};
+pub use feed_forward::MageFeedForward;
+pub use final_layer::MageFinalLayer;
+pub use rope_embedder::{ImgShape, MsRope, PackContext, PackLayout, RopeTable};
+pub use timestep_embedder::MageTimestepEmbedder;
+pub use transformer::{Linear, MageTransformer};
+pub use transformer_block::MageTransformerBlock;
 
 // sc-14104 (Gaussian-Shading noise) re-exports here:
 
