@@ -1249,26 +1249,67 @@ pub fn load_from_comfyui_experts(
     snapshot_dir: impl Into<PathBuf>,
     i2v: bool,
 ) -> gen_core::Result<Box<dyn Generator>> {
+    load_from_comfyui_experts_with_offload(
+        high_file,
+        low_file,
+        te_file,
+        vae_file,
+        snapshot_dir,
+        i2v,
+        OffloadPolicy::Resident,
+    )
+}
+
+/// Explicit-residency sibling of [`load_from_comfyui_experts`]. External loaders do not carry a
+/// [`LoadSpec`], so callers whose admission numbers assume sequential expert swapping must pass that
+/// policy at this production seam rather than setting an unused spec upstream.
+pub fn load_from_comfyui_experts_with_offload(
+    high_file: impl Into<PathBuf>,
+    low_file: impl Into<PathBuf>,
+    te_file: Option<PathBuf>,
+    vae_file: Option<PathBuf>,
+    snapshot_dir: impl Into<PathBuf>,
+    i2v: bool,
+    offload_policy: OffloadPolicy,
+) -> gen_core::Result<Box<dyn Generator>> {
+    Ok(Box::new(build_comfyui_generator(
+        high_file.into(),
+        low_file.into(),
+        te_file,
+        vae_file,
+        snapshot_dir.into(),
+        i2v,
+        offload_policy,
+    )?))
+}
+
+fn build_comfyui_generator(
+    high_file: PathBuf,
+    low_file: PathBuf,
+    te_file: Option<PathBuf>,
+    vae_file: Option<PathBuf>,
+    snapshot_dir: PathBuf,
+    i2v: bool,
+    offload_policy: OffloadPolicy,
+) -> gen_core::Result<Wan14bGenerator> {
     let variant = if i2v { Variant::I2v } else { Variant::T2v };
     let device = candle_gen::default_device()?;
-    // The ComfyUI lane carries no `LoadSpec`, so the residency policy comes purely from the family-wide
-    // `CANDLE_GEN_OFFLOAD=sequential` A/B override (default resident) — sc-12733.
-    let offload = effective_offload_policy(OffloadPolicy::Resident);
-    Ok(Box::new(Wan14bGenerator {
+    let offload = effective_offload_policy(offload_policy);
+    Ok(Wan14bGenerator {
         descriptor: descriptor_for(variant),
         variant,
-        root: snapshot_dir.into(),
+        root: snapshot_dir,
         device,
         adapters: Vec::new(),
         comfyui: Some(std::sync::Arc::new(crate::comfyui::ComfyuiExperts {
-            high_file: high_file.into(),
-            low_file: low_file.into(),
+            high_file,
+            low_file,
             te_file,
             vae_file,
         })),
         offload,
         components: Mutex::new(None),
-    }))
+    })
 }
 
 /// Construct a lazy candle Wan2.2 T2V-A14B generator. `spec.weights` must be a [`WeightsSource::Dir`]
@@ -1599,6 +1640,32 @@ mod tests {
         )
         .unwrap();
         assert_eq!(sequential.offload, OffloadPolicy::Sequential);
+    }
+
+    #[test]
+    fn comfyui_load_honors_explicit_sequential_and_legacy_default_is_resident() {
+        let build = |policy| {
+            build_comfyui_generator(
+                "/comfy/high.safetensors".into(),
+                "/comfy/low.safetensors".into(),
+                None,
+                None,
+                "/snapshot".into(),
+                false,
+                policy,
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            build(OffloadPolicy::Sequential).offload,
+            OffloadPolicy::Sequential,
+            "the external production seam must carry explicit Sequential into Wan14bGenerator"
+        );
+        assert_eq!(
+            build(OffloadPolicy::Resident).offload,
+            OffloadPolicy::Resident,
+            "the compatibility loader's historical default remains resident"
+        );
     }
 
     /// Parity guard for the residency change (sc-12733): the precomputed boundary-crossing index `k`
