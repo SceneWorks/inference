@@ -1,5 +1,5 @@
 //! The six Mage-Flow variants, their [`ModelDescriptor`]s, and the explicit registration
-//! constants — plus the scaffold's deliberately-failing [`load`].
+//! constants and the registered RL [`Generator`] implementation.
 //!
 //! ## The variant matrix
 //!
@@ -18,28 +18,21 @@
 //! | `mage_flow_edit_base` | `microsoft/Mage-Flow-Edit-Base` | edit | 30 | 5.0 |
 //! | `mage_flow_edit_turbo` | `microsoft/Mage-Flow-Edit-Turbo` | edit | 4 | 1.0 (off) |
 //!
-//! Registering each variant under its own id (rather than one id plus a switch) keeps the variant
-//! part of the worker's model cache key, matching the `z_image`/`z_image_turbo` and
-//! `sensenova_u1_8b`/`_fast` precedent.
+//! Each variant has its own future id (rather than one id plus a switch), keeping the variant part
+//! of the worker's model cache key. sc-14041 registers only the completed RL id.
 //!
-//! ## Why this is not in the shipped catalog yet
-//!
-//! [`load`] cannot produce an image until the four P1 ports land, so [`REGISTRATIONS`] is
-//! **published but not wired into [`mlx_gen_catalog::provider_registry`]**. Catalog inclusion is a
-//! deliberate edit in this workspace (`CLAUDE.md`: *"a provider crate existing in the repo does not
-//! mean it ships"*), and advertising six descriptors whose `load` hard-errors would put six broken
-//! entries in front of users. The catalog carries the crate as a compiled member and names it in
-//! `mlx_gen_catalog::PENDING_REGISTRATION_CRATES`; sc-14041 flips the registration on once the
-//! pipeline renders, and sc-14047 owns the manifest/classifier/schema surface that goes with it.
+//! The RL id is composed into the shipped platform catalog. The other descriptors remain available
+//! for their owning stories, but are not registered until their variant-specific paths are complete.
 //!
 //! [`mlx_gen_catalog::provider_registry`]: https://docs.rs/mlx-gen-catalog
 
 use mlx_gen::{
-    Capabilities, ConditioningKind, Error, Generator, LoadSpec, Modality, ModelDescriptor, Quant,
-    Result,
+    Capabilities, ConditioningKind, Error, GenerationOutput, GenerationRequest, Generator, Image,
+    LoadSpec, Modality, ModelDescriptor, Precision, Progress, Quant, Result, WeightsSource,
 };
 
 use crate::config::{FAMILY, MAX_SIZE, MIN_SIZE, SIZE_MULTIPLE};
+use crate::{resolve_gs_key, MageFlowPipeline};
 
 /// Which published checkpoint a registered id serves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -178,19 +171,107 @@ pub fn descriptor_for(variant: MageVariant) -> ModelDescriptor {
 
 /// Construct a Mage-Flow generator from a [`LoadSpec`].
 ///
-/// **Scaffold (sc-14037): this always fails.** Returning a typed
-/// [`Error::Unsupported`] is deliberate — a half-built pipeline that
-/// renders noise would be worse than a loud, greppable refusal. The body is replaced by sc-14041
-/// once the text encoder (sc-14038), VAE (sc-14039), DiT (sc-14040) and watermarked noise
-/// (sc-14104) exist.
-pub fn load(variant: MageVariant, _spec: &LoadSpec) -> Result<Box<dyn Generator>> {
-    Err(Error::Unsupported(format!(
-        "{}: the mlx-gen-mage provider is a scaffold (sc-14037) — the Qwen3-VL text encoder \
-         (sc-14038), Mage-VAE (sc-14039), NR-MMDiT (sc-14040) and Gaussian-Shading noise \
-         (sc-14104) are not ported yet, so no {} weights can be loaded",
-        variant.id(),
-        variant.upstream_repo()
-    )))
+pub fn load(variant: MageVariant, spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+    if variant != MageVariant::Rl {
+        return Err(Error::Unsupported(format!(
+            "{}: only the Mage-Flow RL checkpoint is enabled in sc-14041",
+            variant.id()
+        )));
+    }
+    if spec.precision != Precision::Bf16 || spec.quantize.is_some() || !spec.adapters.is_empty() {
+        return Err(Error::Unsupported(
+            "mage_flow: sc-14041 supports the dense bf16 RL checkpoint without adapters".into(),
+        ));
+    }
+    let root = match &spec.weights {
+        WeightsSource::Dir(root) => root,
+        WeightsSource::File(_) => {
+            return Err(Error::Msg(
+                "mage_flow expects a diffusers snapshot directory".into(),
+            ))
+        }
+    };
+    Ok(Box::new(MageFlow {
+        descriptor: descriptor_for(variant),
+        pipeline: MageFlowPipeline::load(root)?,
+    }))
+}
+
+pub struct MageFlow {
+    descriptor: ModelDescriptor,
+    pipeline: MageFlowPipeline,
+}
+
+impl Generator for MageFlow {
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.descriptor
+    }
+
+    fn validate(&self, req: &GenerationRequest) -> mlx_gen::gen_core::Result<()> {
+        validate_generation_request(&self.descriptor, req)
+    }
+
+    fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<GenerationOutput> {
+        self.validate(req)?;
+        if req.cancel.is_cancelled() {
+            return Err(mlx_gen::gen_core::Error::Canceled);
+        }
+        let steps = req.steps.unwrap_or(MageVariant::Rl.default_steps());
+        let cfg = req.guidance.unwrap_or(MageVariant::Rl.default_cfg());
+        let seed = req.seed.unwrap_or(0) as i64;
+        let key = resolve_gs_key(None)?;
+        let pixels = self
+            .pipeline
+            .generate_trace(
+                &req.prompt,
+                req.negative_prompt.as_deref().unwrap_or(" "),
+                req.height,
+                req.width,
+                steps as usize,
+                cfg,
+                seed,
+                &key,
+                false,
+                on_progress,
+            )?
+            .image_u8;
+        mlx_rs::transforms::eval([&pixels]).map_err(Error::from)?;
+        let bytes = pixels
+            .try_as_slice::<u8>()
+            .map_err(|e| Error::Msg(format!("mage_flow: RGB8 output is not host-readable: {e}")))?
+            .to_vec();
+        Ok(GenerationOutput::Images(vec![Image {
+            width: req.width,
+            height: req.height,
+            pixels: bytes,
+        }]))
+    }
+}
+
+fn validate_generation_request(
+    descriptor: &ModelDescriptor,
+    req: &GenerationRequest,
+) -> mlx_gen::gen_core::Result<()> {
+    descriptor
+        .capabilities
+        .validate_request(descriptor.id, req)?;
+    if !req.width.is_multiple_of(REQUIRED_SIZE_MULTIPLE)
+        || !req.height.is_multiple_of(REQUIRED_SIZE_MULTIPLE)
+    {
+        return Err(mlx_gen::gen_core::Error::Msg(format!(
+            "mage_flow dimensions must be divisible by {REQUIRED_SIZE_MULTIPLE}"
+        )));
+    }
+    if req.count != 1 {
+        return Err(mlx_gen::gen_core::Error::Msg(
+            "mage_flow sc-14041 generates exactly one image".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Every side of a Mage-Flow request must be a multiple of this (the VAE's 16× downsample;
@@ -216,7 +297,7 @@ macro_rules! mage_registrations {
         )+
 
         /// The explicit registration constants, in variant order — the surface a catalog crate
-        /// composes. See the module docs for why the shipped MLX catalog does not consume this yet.
+        /// composes.
         pub const REGISTRATIONS: &[mlx_gen::registry::ModelRegistration] = &[ $($registration),+ ];
     };
 }
@@ -304,18 +385,51 @@ mod tests {
     }
 
     #[test]
-    fn scaffold_load_fails_typed_and_names_the_blocking_stories() {
+    fn non_rl_variants_remain_explicitly_disabled() {
         let spec = LoadSpec::new(mlx_gen::WeightsSource::Dir("/nonexistent".into()));
+        let err = load(MageVariant::Base, &spec)
+            .err()
+            .expect("non-RL variant must remain disabled");
+        assert!(matches!(err, Error::Unsupported(_)));
+    }
+
+    #[test]
+    fn rl_load_enters_the_real_snapshot_loader() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent-mage-flow".into()));
         let err = load(MageVariant::Rl, &spec)
             .err()
-            .expect("scaffold must not load");
+            .expect("missing snapshot must fail");
         assert!(
-            matches!(err, Error::Unsupported(_)),
-            "must bridge to gen_core::Error::Unsupported, not a generic Msg: {err}"
+            !matches!(err, Error::Unsupported(_)),
+            "RL must not regress to the scaffold refusal: {err}"
         );
-        let text = err.to_string();
-        for needle in ["sc-14037", "sc-14038", "sc-14039", "sc-14040", "sc-14104"] {
-            assert!(text.contains(needle), "{needle} missing from: {text}");
+    }
+
+    #[test]
+    fn rl_platform_defaults_and_size_buckets_validate() {
+        assert_eq!(MageVariant::Rl.default_steps(), 20);
+        assert_eq!(MageVariant::Rl.default_cfg(), 5.0);
+        let descriptor = descriptor_for(MageVariant::Rl);
+        for &(width, height) in &[(512, 512), (1024, 1024), (2048, 2048), (512, 2048)] {
+            let req = GenerationRequest {
+                prompt: "test".into(),
+                width,
+                height,
+                ..Default::default()
+            };
+            validate_generation_request(&descriptor, &req).unwrap();
+        }
+        for &(width, height) in &[(496, 512), (512, 2064), (513, 512)] {
+            let req = GenerationRequest {
+                prompt: "test".into(),
+                width,
+                height,
+                ..Default::default()
+            };
+            assert!(
+                validate_generation_request(&descriptor, &req).is_err(),
+                "{width}x{height} must be rejected"
+            );
         }
     }
 }

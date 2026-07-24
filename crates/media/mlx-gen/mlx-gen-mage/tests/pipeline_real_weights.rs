@@ -23,16 +23,62 @@ fn public_pipeline_matches_the_torch_render() {
     let key = GsKey::from_u64(golden.require("gs_key").unwrap().as_slice::<i64>()[0] as u64);
 
     let pipeline = MageFlowPipeline::load(root).unwrap();
-    let got = pipeline
-        .generate(PROMPT, " ", height, width, steps, cfg, seed, &key, false)
-        .unwrap()
-        .transpose_axes(&[0, 2, 3, 1])
-        .unwrap()
-        .reshape(&[height as i32, width as i32, 3])
+    let trace = pipeline
+        .generate_trace(
+            PROMPT,
+            " ",
+            height,
+            width,
+            steps,
+            cfg,
+            seed,
+            &key,
+            false,
+            &mut |_| {},
+        )
         .unwrap();
-    mlx_rs::transforms::eval([&got]).unwrap();
+    let got = &trace.image_u8;
+    mlx_rs::transforms::eval([
+        got,
+        &trace.final_tokens,
+        &trace.final_latent,
+        &trace.trajectories[0],
+        &trace.trajectories[1],
+    ])
+    .unwrap();
+
+    // These boundaries precede the chaos-amplifying VAE/image conversion. The port runs bf16
+    // activations while the oracle captures torch bf16→f32, so 2% mean-relative / 0.5 peak is a
+    // deliberately tight bf16 accumulation bound across four Euler steps, not a pixel heuristic.
+    for (label, actual, expected) in [
+        (
+            "traj_step0",
+            &trace.trajectories[0],
+            golden.require("traj_step0").unwrap(),
+        ),
+        (
+            "traj_step1",
+            &trace.trajectories[1],
+            golden.require("traj_step1").unwrap(),
+        ),
+        (
+            "final_tokens",
+            &trace.final_tokens,
+            golden.require("final_tokens").unwrap(),
+        ),
+        (
+            "final_latent",
+            &trace.final_latent,
+            golden.require("final_latent").unwrap(),
+        ),
+    ] {
+        let (max_abs, _, mean_rel) = error(actual, expected);
+        println!("{label}: max_abs={max_abs:.5}, mean_rel={mean_rel:.6}");
+        assert!(max_abs <= 0.5, "{label} peak error {max_abs}");
+        assert!(mean_rel <= 0.02, "{label} mean-relative error {mean_rel}");
+    }
     let want = golden.require("image_u8").unwrap();
-    let (max_abs, _peak_rel, mean_rel) = error(&got, want);
+    let (max_abs, _peak_rel, mean_rel) = error(got, want);
     println!("Mage-Flow public pipeline: max_abs={max_abs:.3}, mean_rel={mean_rel:.5}");
     assert!(max_abs <= 64.0, "render max pixel error {max_abs}");
     assert!(mean_rel <= 0.08, "render mean-relative error {mean_rel}");

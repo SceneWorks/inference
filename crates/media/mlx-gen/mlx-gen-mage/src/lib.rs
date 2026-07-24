@@ -5,13 +5,11 @@
 //! 16×-downsampled latents), a 12-block **NR-MMDiT** rectified-flow denoiser, and a **Qwen3-VL-4B**
 //! text encoder.
 //!
-//! ## Status — scaffold (sc-14037)
+//! ## Status
 //!
-//! This crate is **structure only**. [`config`] carries the real, verified shapes; every model
-//! module below is an empty, documented seam, and [`model::load`] returns
-//! [`mlx_gen::Error::Unsupported`] rather than a half-working model. The crate is therefore
-//! deliberately **not** registered in [`mlx-gen-catalog`]'s shipped provider registry yet — see
-//! [`model`] for the registration constants and the story that flips them on.
+//! The RL checkpoint is a complete registered text-to-image provider through the normal
+//! [`mlx_gen::Generator`] surface. Base, Turbo, and Edit checkpoints remain explicitly disabled
+//! until their owning stories land.
 //!
 //! ## Reuse lineage
 //!
@@ -114,16 +112,10 @@ pub use pipeline::{mage_flow_sigmas, MageFlowPipeline, STATIC_SHIFT};
 
 /// Add every Mage-Flow MLX provider to an explicit media registry builder.
 ///
-/// **Not yet called by [`mlx_gen_catalog`](https://docs.rs/mlx-gen-catalog)** — see
-/// [`model::REGISTRATIONS`] for why, and which story turns it on.
 pub fn register_providers(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
-    model::REGISTRATIONS
-        .iter()
-        .fold(registry, |registry, registration| {
-            registry.register_generator(*registration)
-        })
+    registry.register_generator(model::REGISTRATION)
 }
 
 /// Build the explicit Mage-Flow MLX provider catalog (this crate only).
@@ -142,17 +134,7 @@ mod explicit_registry_tests {
             .generators()
             .map(|registration| (registration.descriptor)().id.to_string())
             .collect();
-        assert_eq!(
-            generators,
-            [
-                "mage_flow",
-                "mage_flow_base",
-                "mage_flow_turbo",
-                "mage_flow_edit",
-                "mage_flow_edit_base",
-                "mage_flow_edit_turbo",
-            ]
-        );
+        assert_eq!(generators, ["mage_flow"]);
         // The scaffold ships no trainer (sc-14055/sc-14056) and no captioner/embedder surface.
         assert_eq!(registry.trainers().count(), 0);
         assert_eq!(

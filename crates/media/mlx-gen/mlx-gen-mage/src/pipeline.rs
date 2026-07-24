@@ -33,7 +33,7 @@
 //! (76 invariants at cfg > 1, 71 at cfg ≤ 1, with `--self-test`), live in
 //! `crates/media/mlx-gen/tools/`.
 
-use mlx_gen::{Error, Result};
+use mlx_gen::{Error, Progress, Result};
 use mlx_rs::ops::{concatenate_axis, maximum, minimum};
 use mlx_rs::{Array, Dtype};
 
@@ -53,6 +53,15 @@ pub struct MageFlowPipeline {
     pub text_encoder: MageTextEncoder,
     pub transformer: MageTransformer,
     pub vae: MageVae,
+}
+
+/// Observable boundary tensors retained by the real-weight parity gate.
+pub struct GenerationTrace {
+    pub final_tokens: Array,
+    pub final_latent: Array,
+    pub trajectories: Vec<Array>,
+    /// Exact reference byte conversion, HWC `Uint8`.
+    pub image_u8: Array,
 }
 
 impl MageFlowPipeline {
@@ -84,6 +93,37 @@ impl MageFlowPipeline {
         gs_key: &GsKey,
         renormalize: bool,
     ) -> Result<Array> {
+        Ok(self
+            .generate_trace(
+                prompt,
+                negative_prompt,
+                height,
+                width,
+                steps,
+                cfg,
+                seed,
+                gs_key,
+                renormalize,
+                &mut |_| {},
+            )?
+            .image_u8)
+    }
+
+    /// Generate while retaining parity boundaries and reporting normal platform progress.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_trace(
+        &self,
+        prompt: &str,
+        negative_prompt: &str,
+        height: u32,
+        width: u32,
+        steps: usize,
+        cfg: f32,
+        seed: i64,
+        gs_key: &GsKey,
+        renormalize: bool,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<GenerationTrace> {
         let texts = if cfg > 1.0 {
             vec![prompt, negative_prompt]
         } else {
@@ -109,7 +149,8 @@ impl MageFlowPipeline {
         let layout = generation_layout(&[(gh, gw)], vec![conditioning.seq_lens[0] as i32])?;
         let tokens = initial_tokens(height, width, seed, gs_key, Dtype::Bfloat16)?;
         let sigmas = mage_flow_sigmas(steps)?;
-        let out = denoise(
+        let mut trajectories = Vec::with_capacity(2);
+        let out = denoise_capture(
             &self.transformer,
             tokens,
             &cond,
@@ -118,8 +159,25 @@ impl MageFlowPipeline {
             cfg,
             renormalize,
             &sigmas,
+            &mut |step, latent| {
+                if step < 2 {
+                    trajectories.push(latent.clone());
+                }
+                on_progress(Progress::Step {
+                    current: step as u32 + 1,
+                    total: steps as u32,
+                });
+            },
         )?;
-        decode(&self.vae, &out, gh, gw)
+        let final_latent = unpack_tokens(&out, gh, gw)?;
+        on_progress(Progress::Decoding);
+        let image_u8 = decode(&self.vae, &out, gh, gw)?;
+        Ok(GenerationTrace {
+            final_tokens: out,
+            final_latent,
+            trajectories,
+            image_u8,
+        })
     }
 }
 
@@ -220,6 +278,30 @@ pub fn cfg_velocity(cond: &Array, unc: &Array, cfg: f32, renormalize: bool) -> R
 #[allow(clippy::too_many_arguments)]
 pub fn denoise(
     transformer: &MageTransformer,
+    img: Array,
+    cond_txt: &Array,
+    cond_layout: PackLayout,
+    negative: Option<(&Array, Vec<i32>)>,
+    cfg: f32,
+    renormalize: bool,
+    sigmas: &[f32],
+) -> Result<Array> {
+    denoise_capture(
+        transformer,
+        img,
+        cond_txt,
+        cond_layout,
+        negative,
+        cfg,
+        renormalize,
+        sigmas,
+        &mut |_, _| {},
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn denoise_capture(
+    transformer: &MageTransformer,
     mut img: Array,
     cond_txt: &Array,
     cond_layout: PackLayout,
@@ -227,6 +309,7 @@ pub fn denoise(
     cfg: f32,
     renormalize: bool,
     sigmas: &[f32],
+    on_step: &mut dyn FnMut(usize, &Array),
 ) -> Result<Array> {
     if sigmas.len() < 2 {
         return Err(Error::Msg(
@@ -240,12 +323,13 @@ pub fn denoise(
         ));
     }
     let cond_ctx = transformer.pack_context(cond_layout.clone())?;
-    for pair in sigmas.windows(2) {
+    for (step, pair) in sigmas.windows(2).enumerate() {
         let velocity = if use_cfg {
             let (neg_txt, neg_lens) = negative.as_ref().unwrap();
             let fused_layout = cond_layout.fused_cfg(neg_lens)?;
             let fused_ctx = transformer.pack_context(fused_layout)?;
             let fused_img = concatenate_axis(&[&img, &img], 1)?;
+            on_step(step, &fused_img);
             let fused_txt = concatenate_axis(&[cond_txt, neg_txt], 1)?;
             let sigma = Array::from_slice(
                 &vec![pair[0]; fused_ctx.segments()],
@@ -256,6 +340,7 @@ pub fn denoise(
             let parts = out.split_axis(&[n], 1)?;
             cfg_velocity(&parts[0], &parts[1], cfg, renormalize)?
         } else {
+            on_step(step, &img);
             let sigma = Array::from_slice(
                 &vec![pair[0]; cond_ctx.segments()],
                 &[cond_ctx.segments() as i32],
@@ -279,9 +364,17 @@ pub fn decode(vae: &MageVae, tokens: &Array, gh: i32, gw: i32) -> Result<Array> 
     let pixels = vae.decode(&unpack_tokens(tokens, gh, gw)?)?;
     let pixels = maximum(&pixels, Array::from_slice(&[-1.0f32], &[1]))?;
     let pixels = minimum(&pixels, Array::from_slice(&[1.0f32], &[1]))?;
-    Ok(pixels
+    let scaled = pixels
         .add(Array::from_slice(&[1.0f32], &[1]))?
-        .multiply(Array::from_slice(&[127.5f32], &[1]))?)
+        .multiply(Array::from_slice(&[127.5f32], &[1]))?;
+    Ok(mlx_rs::ops::round(&scaled, None)?
+        .as_dtype(Dtype::Uint8)?
+        .transpose_axes(&[0, 2, 3, 1])?
+        .reshape(&[
+            gh * VAE_DOWNSAMPLE_FACTOR as i32,
+            gw * VAE_DOWNSAMPLE_FACTOR as i32,
+            3,
+        ])?)
 }
 
 /// Generation layout for a list of latent grids and encoded prompt lengths.
