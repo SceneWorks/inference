@@ -262,17 +262,47 @@ fn attention_is_causal_within_a_segment() {
     );
 }
 
-/// The M-RoPE positions really reach the forward: encoding the same token twice at different
-/// positions must give different states. Without this, a port that dropped RoPE entirely would
-/// still pass the causality and isolation checks.
+/// The M-RoPE positions really reach the forward: running the **same embeddings** under two
+/// different position layouts must give different states. A port that built `cos`/`sin` and then
+/// dropped them would pass the causality and isolation checks unchanged.
+///
+/// Comparing two position layouts is the only formulation that actually tests this. The obvious
+/// alternative — encode one repeated token and compare row 0 with row 1 — is a **false green**:
+/// RoPE rotates q and k but never `v`, so with identical tokens every position's attention output
+/// is `Σᵢ wᵢ·v` = `v` regardless of the weights, and the rows are mathematically identical. Such a
+/// test measures float rounding, which is exactly what it did — it passed on one machine and was
+/// bit-identical (and so failed) on another.
 #[test]
 fn position_affects_the_encoded_state() {
-    let te = encoder(&tiny());
-    let out = te.forward_segment(&[5, 5, 5, 5]).unwrap();
-    let rows = out.split_axis(&[1, 2], 0).unwrap();
+    let cfg = tiny();
+    let te = encoder(&cfg);
+    let ids: Vec<i32> = vec![3, 7, 1, 12];
+    let n = ids.len() as i32;
+    let hidden = te.embed(&Array::from_slice(&ids, &[1, n])).unwrap();
+
+    let sequential = MRopePositions::text(ids.len());
+    // Same order, different spacing — every pairwise relative distance changes.
+    let stretched = MRopePositions {
+        t: vec![0, 2, 4, 6],
+        h: vec![0, 2, 4, 6],
+        w: vec![0, 2, 4, 6],
+    };
+
+    let a = te.forward_embeds(&hidden, &sequential).unwrap();
+    let b = te.forward_embeds(&hidden, &stretched).unwrap();
+    let moved = max_abs(&a, &b);
+    println!("stretching the M-RoPE positions moved the state by {moved:e}");
     assert!(
-        max_abs(&rows[0], &rows[1]) > 1e-4,
-        "the same token at positions 0 and 1 encoded identically — RoPE is not applied"
+        moved > 1e-3,
+        "changing the M-RoPE positions did not change the encoded state ({moved:e}) — the \
+         rotary embedding is not reaching attention"
+    );
+
+    // …and the positions are what changed it: the same layout twice is bit-identical.
+    assert_eq!(
+        max_abs(&a, &te.forward_embeds(&hidden, &sequential).unwrap()),
+        0.0,
+        "the forward is not deterministic, so the comparison above proves nothing"
     );
 }
 
