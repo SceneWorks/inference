@@ -913,10 +913,18 @@ where
                 img.shape()
             )));
         }
-        let scale = Array::from_slice(&[d_sigma], &[1]).as_dtype(vel.dtype())?;
-        img = img
-            .subtract(vel.multiply(&scale)?)?
+        // The step scalar stays float32 through the multiply and is only then rounded back to
+        // bfloat16, mirroring torch: a Python float against a bfloat16 tensor is lifted to the
+        // op-math type, never narrowed to bfloat16 first. Rounding Δσ itself would put ~0.4% error
+        // on every step of the ladder.
+        let scale = Array::from_slice(&[d_sigma], &[1]);
+        let term = vel
+            .as_dtype(Dtype::Float32)?
+            .multiply(&scale)?
             .as_dtype(Dtype::Bfloat16)?;
+        img = img.subtract(term)?.as_dtype(Dtype::Bfloat16)?;
+        // Force the step so a 30-step inversion does not accumulate one lazy graph.
+        mlx_rs::transforms::eval([&img])?;
     }
 
     // `unpack(img.float(), height, width)` (`pipeline.py:629` → `utils.py:36-43`).
