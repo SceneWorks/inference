@@ -47,9 +47,21 @@ use mlx_gen_mage::vae::{
     self, MageVae, VaePart, DECODER_PREFIX, ENCODER_PREFIX, SKIPPED_DECODER_SUBTREES,
 };
 
-/// The geometries this suite gates. 256² also exercises the `AttnBlock`'s replicate padding (a
-/// 16×16 latent pads to one 32×32 tile); 1024² and 2048 divide evenly and do not.
-const GEOMETRIES: &[i32] = &[256, 1024, 2048];
+/// The geometries this suite gates, as the golden-file suffix.
+///
+/// Not all square, deliberately — **every square geometry hides a transposed h/w**, and the epic's
+/// native-resolution range explicitly admits aspects up to 4:1:
+///
+/// * `256` — a 16×16 latent, which pads to one 32×32 `AttnBlock` tile, so this is the
+///   replicate-padding case. 1024² and 2048 divide evenly and never reach it.
+/// * `1024`, `2048` — the production sizes; 2048 is the DoD's large-decode gate.
+/// * `512x2048` — the 4:1 extreme.
+/// * `768x1280` — a 48×80 latent, where the attention tiling pads **both axes by different
+///   amounts** (48→64, 80→96). No square geometry produces that.
+const GEOMETRIES: &[&str] = &["256", "1024", "2048", "512x2048", "768x1280"];
+
+/// The geometry the DoD names for the large-decode corruption check.
+const LARGE_GEOMETRY: &str = "2048";
 
 /// Which reference dtype a golden bundle was dumped in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,7 +118,7 @@ fn snapshot() -> PathBuf {
 }
 
 /// Every golden bundle available for `size`, newest-oracle first.
-fn load_goldens(size: i32) -> Vec<(RefDtype, Weights)> {
+fn load_goldens(size: &str) -> Vec<(RefDtype, Weights)> {
     let dir = golden_dir();
     let mut candidates = vec![
         (
@@ -118,7 +130,7 @@ fn load_goldens(size: i32) -> Vec<(RefDtype, Weights)> {
             dir.join(format!("mage_flow_vae_golden_{size}.safetensors")),
         ),
     ];
-    if size == 256 {
+    if size == "256" {
         // The sc-14036 bundle predates the per-geometry naming.
         candidates.push((RefDtype::Bf16, dir.join("mage_flow_vae_golden.safetensors")));
     }
@@ -137,7 +149,7 @@ fn load_goldens(size: i32) -> Vec<(RefDtype, Weights)> {
 }
 
 /// The tightest available oracle for `size` — f32 when dumped, else bf16.
-fn best_golden(size: i32) -> Option<(RefDtype, Weights)> {
+fn best_golden(size: &str) -> Option<(RefDtype, Weights)> {
     load_goldens(size).into_iter().next()
 }
 
@@ -223,7 +235,7 @@ fn maybe_dump_ppm(name: &str, decoded: &Array) {
 }
 
 fn check_decode(
-    size: i32,
+    size: &str,
     dt: RefDtype,
     g: &Weights,
     key_latent: &str,
@@ -234,13 +246,13 @@ fn check_decode(
     let want = g.require(key_expected).unwrap();
 
     let got = v.decode(&latent).unwrap();
-    assert_eq!(got.shape(), want.shape(), "{size}² {key_expected} geometry");
+    assert_eq!(got.shape(), want.shape(), "{size} {key_expected} geometry");
     maybe_dump_ppm(&format!("{key_expected}_{size}_{}", dt.label()), &got);
 
     let (mx, mn) = (max_abs(&got, want), mean_abs(&got, want));
     let (tol_mx, tol_mn) = dt.tolerance();
     println!(
-        "  {size}² [{}] {key_expected}: max_abs {mx:.6} (< {tol_mx})  mean_abs {mn:.6} (< {tol_mn})  \
+        "  {size} [{}] {key_expected}: max_abs {mx:.6} (< {tol_mx})  mean_abs {mn:.6} (< {tol_mn})  \
          frac>10x_mean {:.3e}",
         dt.label(),
         frac_above(&got, want, 10.0 * mn)
@@ -272,10 +284,10 @@ fn decode_matches_the_torch_golden_at_every_geometry() {
     for &size in GEOMETRIES {
         let bundles = load_goldens(size);
         if bundles.is_empty() {
-            println!("{size}²: no golden, skipped");
+            println!("{size}: no golden, skipped");
             continue;
         }
-        println!("{size}²:");
+        println!("{size}:");
         for (dt, g) in &bundles {
             check_decode(size, *dt, g, "synth_latent", "dec_from_synth", &v);
             check_decode(size, *dt, g, "enc_latent", "dec_from_latent", &v);
@@ -305,7 +317,7 @@ fn decode_matches_the_torch_golden_at_every_geometry() {
 #[test]
 #[ignore = "needs real Mage-Flow vae/ weights + the 2048 golden"]
 fn no_large_decode_corruption() {
-    let size = 2048;
+    let size = LARGE_GEOMETRY;
     let Some((dt, g)) = best_golden(size) else {
         panic!(
             "no {size} golden in {} — dump it with the command in this file's module docs; \
@@ -313,7 +325,7 @@ fn no_large_decode_corruption() {
             golden_dir().display()
         );
     };
-    println!("{size}² oracle: {}", dt.label());
+    println!("{size} oracle: {}", dt.label());
     let v = vae(true);
     let latent = g.require("enc_latent").unwrap().clone();
     let want = g.require("dec_from_latent").unwrap();
@@ -336,8 +348,8 @@ struct CorruptionReport {
 }
 
 impl CorruptionReport {
-    fn print(&self, size: i32) {
-        println!("{size}² overall mean_abs {:.6}", self.overall);
+    fn print(&self, size: &str) {
+        println!("{size} overall mean_abs {:.6}", self.overall);
         println!("  worst quadrant mean_abs {:.6}", self.worst_quadrant);
         for (label, s, i) in &self.seams {
             println!("  {label}: seam {s:.6} vs interior {i:.6}");
@@ -373,9 +385,9 @@ impl CorruptionReport {
         Ok(())
     }
 
-    fn assert_clean(&self, size: i32) {
+    fn assert_clean(&self, size: &str) {
         if let Err(why) = self.verdict() {
-            panic!("{size}² large-decode corruption: {why}");
+            panic!("{size} large-decode corruption: {why}");
         }
     }
 }
@@ -446,7 +458,7 @@ fn corruption_report(got: &Array, want: &Array) -> CorruptionReport {
 #[test]
 #[ignore = "needs the 2048 golden"]
 fn corruption_probes_reject_a_seeded_defect() {
-    let size = 2048;
+    let size = LARGE_GEOMETRY;
     let Some((_, g)) = best_golden(size) else {
         panic!("need the {size} golden");
     };
@@ -510,7 +522,7 @@ fn corruption_probes_reject_a_seeded_defect() {
 #[test]
 #[ignore = "needs real Mage-Flow vae/ weights"]
 fn adaln_folding_is_identical_on_real_weights() {
-    let Some((_, g)) = best_golden(256) else {
+    let Some((_, g)) = best_golden("256") else {
         panic!("need a 256² golden for a latent to decode");
     };
     let latent = g.require("synth_latent").unwrap().clone();
@@ -533,7 +545,7 @@ fn adaln_folding_is_identical_on_real_weights() {
 #[test]
 #[ignore = "needs real Mage-Flow vae/ weights"]
 fn decode_is_deterministic_and_batch_invariant() {
-    let Some((_, g)) = best_golden(256) else {
+    let Some((_, g)) = best_golden("256") else {
         panic!("need a 256² golden for a latent to decode");
     };
     let latent = g.require("synth_latent").unwrap().clone();

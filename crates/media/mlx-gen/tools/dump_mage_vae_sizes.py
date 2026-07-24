@@ -21,8 +21,10 @@ one code path. Gitignored, like every other golden.
 
 Run (from `crates/media/mlx-gen`):
 
-    MAGE_VAE_SIZES=256,1024,2048 PYTHONPATH=_vendor \\
+    MAGE_VAE_SIZES=256,1024,2048,512x2048,768x1280 PYTHONPATH=_vendor \\
       python3 tools/dump_mage_vae_sizes.py
+
+Entries are `<square>` or `<height>x<width>`.
 
 `MAGE_DEVICE` defaults to **cpu** here rather than auto-selecting: MPS dumps are silently corrupt
 (sc-14250), and for a weights-light stage there is no reason to risk it.
@@ -44,7 +46,26 @@ GOLDEN = os.path.join(HERE, "golden")
 VENDOR = os.path.normpath(os.path.join(HERE, "..", "_vendor"))
 
 DEVICE = os.environ.get("MAGE_DEVICE", "cpu")
-SIZES = [int(s) for s in os.environ.get("MAGE_VAE_SIZES", "256,1024,2048").split(",")]
+def _parse_sizes(spec: str) -> list[tuple[int, int]]:
+    """`"256,768x1280"` -> `[(256, 256), (768, 1280)]` (height x width)."""
+    out = []
+    for item in spec.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "x" in item:
+            h, w = item.split("x", 1)
+            out.append((int(h), int(w)))
+        else:
+            out.append((int(item), int(item)))
+    return out
+
+
+# Non-square entries are not optional extras: every square geometry hides a transposed h/w, and
+# the epic's native-resolution range explicitly includes 4:1 aspects. `512x2048` is that extreme;
+# `768x1280` gives a latent of 48x80, where the CoD decoder's 32-tile attention pads BOTH axes by
+# DIFFERENT amounts (48->64, 80->96) -- a case no square geometry reaches.
+SIZES = _parse_sizes(os.environ.get("MAGE_VAE_SIZES", "256,1024,2048,512x2048,768x1280"))
 SEED = int(os.environ.get("MAGE_SEED", "42"))
 REF_IMAGE = os.environ.get(
     "MAGE_EDIT_REF", os.path.join(VENDOR, "mage_flow", "assets", "dog.jpg")
@@ -86,11 +107,12 @@ def main() -> int:
     os.makedirs(GOLDEN, exist_ok=True)
 
     pil = Image.open(REF_IMAGE).convert("RGB")
-    for size in SIZES:
-        if size % 16:
-            raise SystemExit(f"size {size} is not a multiple of 16")
+    for height, width in SIZES:
+        if height % 16 or width % 16:
+            raise SystemExit(f"size {height}x{width} is not a multiple of 16")
+        size = f"{height}" if height == width else f"{height}x{width}"
         t0 = time.time()
-        pixels = _preprocess_ref_image(pil, size, size, DEVICE)
+        pixels = _preprocess_ref_image(pil, height, width, DEVICE)
         u8 = ((pixels.detach().float().cpu().clamp(-1, 1) + 1.0) * 127.5).round().to(torch.uint8)
         x = pixels.unsqueeze(0).to(DEVICE, torch.float32)
 
@@ -103,7 +125,7 @@ def main() -> int:
             # decoder, so a broken encoder cannot mask a broken decoder.
             gen = torch.Generator(device="cpu").manual_seed(SEED + 1)
             synth = torch.randn(
-                (1, MageVAE.latent_channels, size // 16, size // 16),
+                (1, MageVAE.latent_channels, height // 16, width // 16),
                 generator=gen,
                 dtype=torch.float32,
             ).to(DEVICE, torch.float32)
@@ -119,7 +141,7 @@ def main() -> int:
             "dec_from_latent": f32(decoded),
             "synth_latent": f32(synth),
             "dec_from_synth": f32(decoded_synth),
-            "geometry": np.array([size, size], dtype=np.int32),
+            "geometry": np.array([height, width], dtype=np.int32),
             "seed": np.array([SEED], dtype=np.int64),
         }
         out = os.path.join(GOLDEN, f"mage_flow_vae_f32_{size}.safetensors")
@@ -136,7 +158,7 @@ def main() -> int:
         )
         dt = time.time() - t0
         print(
-            f"{size}²: wrote {os.path.basename(out)} in {dt:.1f}s  "
+            f"{height}x{width}: wrote {os.path.basename(out)} in {dt:.1f}s  "
             f"decode range [{decoded.min():.4f}, {decoded.max():.4f}]"
         )
     return 0

@@ -22,6 +22,9 @@ The tiny shape is deliberately *not* a scaled-down copy of the published one:
   crop back off — the published 1024²/2048² geometries divide evenly and never exercise it, while
   256² does, so the fixture keeps that path covered without weights.
 * `patch = 4` keeps the unfold/fold layout small enough to reason about by hand.
+* a second **non-square** `6 x 10` latent pads to `8 x 12` — both axes by *different* amounts.
+  Without it the suite could not distinguish `[b, hl, wl, ...]` from `[b, wl, hl, ...]`, and the
+  epic's native-resolution range admits aspects up to 4:1.
 * `max_freqs` stays 8 because `_DConvDenoiser.__init__` hard-codes it (`mage_vae.py:475`); the
   production `patch = 16` table is dumped alongside so the real geometry is pinned too.
 """
@@ -50,6 +53,10 @@ NUM_COND_BLOCKS = 2
 NUM_BLOCKS = 3  # dec_net res blocks = NUM_BLOCKS - NUM_COND_BLOCKS = 1
 ATTN_TILE = 4
 LATENT_HW = 6  # 6 % 4 != 0 -> replicate padding in AttnBlock
+# A second, NON-SQUARE latent: 6x10 pads to 8x12, i.e. both axes padded by DIFFERENT amounts.
+# Every square geometry hides a transposed h/w, so without this the default test suite could not
+# tell `[b, hl, wl, ...]` from `[b, wl, hl, ...]`.
+LATENT_NS = (6, 10)
 SEED = 20260724
 
 
@@ -93,6 +100,7 @@ def main() -> int:
     latent = torch.randn(
         (1, BOTTLENECK, LATENT_HW, LATENT_HW), generator=gen, dtype=torch.float32
     )
+    latent_ns = torch.randn((1, BOTTLENECK, *LATENT_NS), generator=gen, dtype=torch.float32)
 
     with torch.no_grad():
         # `MageVAE.decode` verbatim (`mage_vae.py:625-633`).
@@ -108,6 +116,16 @@ def main() -> int:
         adaln = torch.stack(
             [blk.adaLN_modulation(c_t0)[0] for blk in denoiser.blocks], dim=0
         )
+        # The non-square decode, through the same `MageVAE.decode` steps.
+        cond_ns = denoiser.y_embedder.decoder(latent_ns)
+        decoded_ns = denoiser.forward(
+            torch.zeros(
+                1, IN_CHANNELS, LATENT_NS[0] * PATCH, LATENT_NS[1] * PATCH, dtype=torch.float32
+            ),
+            t,
+            cond_ns,
+        )
+
         dct_tiny = denoiser.x_embedder.fetch_pos(PATCH, torch.device("cpu"), torch.float32)
         dct_published = denoiser.x_embedder.fetch_pos(16, torch.device("cpu"), torch.float32)
 
@@ -118,6 +136,9 @@ def main() -> int:
         tensors[f"pipeline.{name}"] = p.detach().cpu().numpy().astype(np.float32)
 
     tensors["fixture.latent"] = latent.numpy().astype(np.float32)
+    tensors["fixture.latent_ns"] = latent_ns.numpy().astype(np.float32)
+    tensors["fixture.cond_ns"] = cond_ns.numpy().astype(np.float32)
+    tensors["fixture.decoded_ns"] = decoded_ns.numpy().astype(np.float32)
     tensors["fixture.cond"] = cond.numpy().astype(np.float32)
     tensors["fixture.decoded"] = decoded.numpy().astype(np.float32)
     tensors["fixture.t_embed_zero"] = c_t0.numpy().astype(np.float32)
@@ -136,6 +157,8 @@ def main() -> int:
             8,  # max_freqs, hard-coded at mage_vae.py:475
             ATTN_TILE,
             LATENT_HW,
+            LATENT_NS[0],
+            LATENT_NS[1],
         ],
         dtype=np.int32,
     )
@@ -154,6 +177,7 @@ def main() -> int:
     print(f"wrote {os.path.normpath(OUT)} ({len(tensors)} tensors)")
     print(f"  decoded: {tuple(decoded.shape)} "
           f"min={decoded.min():.4f} max={decoded.max():.4f} std={decoded.std():.4f}")
+    print(f"  decoded_ns: {tuple(decoded_ns.shape)} std={decoded_ns.std():.4f}")
     return 0
 
 

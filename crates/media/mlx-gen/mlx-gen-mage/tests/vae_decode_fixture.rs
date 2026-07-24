@@ -33,7 +33,7 @@ fn fixture_shape(w: &Weights) -> (MageVaeShape, i32) {
         .as_dtype(Dtype::Int32)
         .unwrap();
     let v: Vec<i32> = raw.as_slice::<i32>().to_vec();
-    assert_eq!(v.len(), 10, "fixture.shape layout changed");
+    assert_eq!(v.len(), 12, "fixture.shape layout changed");
     (
         MageVaeShape {
             patch: v[0],
@@ -315,4 +315,70 @@ fn decode_rejects_a_malformed_latent() {
 
     let wrong_rank = mlx_rs::ops::zeros_dtype(&[shape.bottleneck, 4, 4], Dtype::Float32).unwrap();
     assert!(vae.decode(&wrong_rank).is_err(), "wrong rank");
+}
+
+/// **The non-square gate.** Every other decode here is square, and a square decode cannot tell
+/// `[b, hl, wl, ...]` from `[b, wl, hl, ...]` — a transposed height/width is invisible.
+///
+/// The fixture's second latent is `6 × 10`, which the 4×4 attention tiling pads to `8 × 12`:
+/// **both axes, by different amounts**. That combination (non-square *and* asymmetric padding) is
+/// exactly what the production geometries miss — 1024² and 2048 divide evenly by 32 and pad
+/// neither axis. The epic's native-resolution range admits aspects up to 4:1, so this is a
+/// supported case, not a curiosity.
+#[test]
+fn non_square_decode_matches_the_torch_reference() {
+    let w = fixture();
+    let (shape, _) = fixture_shape(&w);
+    let vae = build(&w, shape, true);
+
+    let latent = w.require("fixture.latent_ns").unwrap().clone();
+    let sh = latent.shape();
+    assert_ne!(sh[2], sh[3], "the non-square fixture latent is square");
+
+    let got = vae.decode(&latent).unwrap();
+    let want = w.require("fixture.decoded_ns").unwrap();
+    assert_eq!(got.shape(), want.shape(), "non-square decoded geometry");
+    assert_eq!(
+        got.shape(),
+        &[
+            1,
+            shape.in_channels,
+            sh[2] * shape.patch,
+            sh[3] * shape.patch
+        ],
+        "decode must scale height and width independently"
+    );
+
+    let err = max_abs(&got, want);
+    assert!(err < 2e-3, "non-square decode max_abs {err}");
+}
+
+/// The CoD decoder alone on the non-square latent, so an asymmetric-padding fault in `AttnBlock`
+/// localises there rather than surfacing only as a wrong image.
+#[test]
+fn non_square_cod_decoder_matches_the_torch_reference() {
+    let w = fixture();
+    let (shape, _) = fixture_shape(&w);
+    let cod = mlx_gen_mage::vae::cod_decoder::CodDecoder::from_weights(
+        &w,
+        "pipeline.y_embedder.decoder",
+        shape.attn_tile,
+    )
+    .unwrap();
+
+    let latent = w
+        .require("fixture.latent_ns")
+        .unwrap()
+        .transpose_axes(&[0, 2, 3, 1])
+        .unwrap();
+    let got = cod
+        .forward(&latent)
+        .unwrap()
+        .transpose_axes(&[0, 3, 1, 2])
+        .unwrap();
+    let want = w.require("fixture.cond_ns").unwrap();
+
+    assert_eq!(got.shape(), want.shape(), "non-square cond geometry");
+    let err = max_abs(&got, want);
+    assert!(err < 5e-4, "non-square CoD decoder max_abs {err}");
 }
