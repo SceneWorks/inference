@@ -578,12 +578,17 @@ fn the_watermark_module_reads_no_env_var_and_derives_no_path() {
 }
 
 /// The Cephes `ndtri`/`erf`/`erfc` port carries Moshier's coefficient tables verbatim and **ships**
-/// in binary bundles, which BSD-3 clause 2 makes a distribution obligation. Nothing in CI enforces
-/// `NOTICE` — `cargo deny check licenses` only inspects Cargo dependencies, and no workflow or
-/// script references the file — so this test is the enforcement point.
+/// in binary bundles. BSD-3 clauses 1 and 2 require the copyright notice, **the list of conditions
+/// and the disclaimer** to travel with source and binary redistributions alike — the copyright line
+/// alone is not compliance. Nothing in CI enforces any of that: `cargo deny check licenses` only
+/// inspects Cargo *dependencies*, and no workflow or script references `NOTICE` at all. So this
+/// test is the enforcement point, and it covers both halves — the attribution record in `NOTICE`
+/// and the full grant in `LICENSE-CEPHES`, the same standalone-file pattern
+/// `candle-audio-kokoro/resources/LICENSE-CMUDICT` already uses.
 ///
-/// It also guards the wording: the crate NOTICE used to state flatly that *no* source code is
-/// copied into the shipped Rust crates, which this port made false.
+/// It also guards two claims that were each false at a point in this story's history: the crate
+/// NOTICE stating flatly that *no* source code is copied into the shipped Rust crates, and this
+/// entry claiming the licence was "reproduced here" when only the copyright line was.
 #[test]
 fn the_cephes_port_is_attributed_in_the_crate_notice() {
     let notice = include_str!("../../NOTICE");
@@ -594,6 +599,8 @@ fn the_cephes_port_is_attributed_in_the_crate_notice() {
         "BSD 3-Clause",
         "mlx-gen-mage/src/latent.rs",
         "DOES ship in binary bundles",
+        // The attribution record must point at the file that carries the actual grant.
+        "LICENSE-CEPHES",
     ] {
         assert!(
             notice.contains(needle),
@@ -607,6 +614,25 @@ fn the_cephes_port_is_attributed_in_the_crate_notice() {
         !notice.contains(blanket) || notice.contains("The one exception"),
         "the NOTICE's no-source-copied claim must name the Cephes exception"
     );
+
+    // The list of conditions AND the disclaimer, verbatim. One needle per distinct BSD-3 element,
+    // so deleting any single clause or the AS-IS paragraph fails here on its own.
+    let license = include_str!("../../LICENSE-CEPHES");
+    for needle in [
+        "Copyright (c) 2018, Steven Moshier",
+        "Redistribution and use in source and binary forms, with or without",
+        "Redistributions of source code must retain the above copyright",
+        "Redistributions in binary form must reproduce the above copyright",
+        "names of its contributors may be used to endorse or promote products",
+        "THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS \"AS IS\" AND",
+        "WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE",
+        "EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.",
+    ] {
+        assert!(
+            license.contains(needle),
+            "crates/media/mlx-gen/LICENSE-CEPHES must reproduce `{needle}` verbatim"
+        );
+    }
 }
 
 // =================================================================================================

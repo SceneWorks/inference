@@ -478,9 +478,16 @@ mod torch_rng {
 /// > `[3-Clause BSD License for the Cephes Math Library]` in `aten/src/ATen/native/Math.h`.
 ///
 /// Unlike `crates/media/mlx-gen/_vendor/` (Python, dev-only, never shipped), this **is** production
-/// Rust and does travel in binary bundles, which BSD-3 clause 2 makes a distribution obligation.
-/// The canonical record is the "Ported third-party source" section of `crates/media/mlx-gen/NOTICE`;
-/// this comment is the in-source duplicate. **Do not delete either without the other.**
+/// Rust and does travel in binary bundles, which BSD-3 clauses 1 and 2 make a distribution
+/// obligation — for the copyright notice, the list of conditions **and** the disclaimer, not the
+/// copyright line alone. Three artifacts carry that between them:
+///
+/// * `crates/media/mlx-gen/LICENSE-CEPHES` — the full grant, verbatim. This is the file that must
+///   travel with any source or binary redistribution.
+/// * `crates/media/mlx-gen/NOTICE`, section "Ported third-party source" — the attribution record.
+/// * This comment — the in-source pointer.
+///
+/// **Do not delete any of the three without the others.**
 mod cephes {
     /// `polevl(x, A, len(A) − 1)` — Horner over every coefficient.
     fn polevl(x: f64, coeffs: &[f64]) -> f64 {
