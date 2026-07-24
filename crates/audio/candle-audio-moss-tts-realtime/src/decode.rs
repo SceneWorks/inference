@@ -14,7 +14,7 @@
 use candle_audio::candle_core::Result as CandleResult;
 use tokenizers::Tokenizer;
 
-use crate::backbone::{Backbone, Frame};
+use crate::backbone::{Backbone, BackboneCache, Frame};
 use crate::config::MossTtsRealtimeConfig;
 use crate::local::LocalTransformer;
 use crate::sampling::{Rng, SamplingParams};
@@ -90,13 +90,42 @@ pub fn build_prompt_frames(
     text: &str,
     reference_audio: Option<&[Vec<u32>]>,
 ) -> Result<PromptPlan, String> {
-    let encode = |s: &str, what: &str| {
-        tokenizer
-            .encode(s, false)
-            .map(|e| e.get_ids().to_vec())
-            .map_err(|e| format!("tokenize {what}: {e}"))
-    };
-    // The system prompt, plus the voice-clone timbre `context` block when a reference clip is given.
+    // System (+ optional voice-clone timbre), then the assistant opener + the delay-pattern text —
+    // the single-turn layout is exactly "system frames" ++ "assistant response prefill".
+    let mut prefill = system_frames(tokenizer, cfg, reference_audio)?;
+    let streamed_text =
+        assistant_prefill_frames(tokenizer, cfg, ASSISTANT_OPEN, text, &mut prefill)?;
+    Ok(PromptPlan {
+        prefill,
+        streamed_text,
+    })
+}
+
+/// A multi-channel prefill frame: one text-channel id, every audio channel the pad fill.
+pub(crate) fn pad_frame(cfg: &MossTtsRealtimeConfig, id: u32) -> Frame {
+    Frame {
+        text: id,
+        audio: vec![AUDIO_CHANNEL_PAD; cfg.rvq],
+    }
+}
+
+fn encode_ids(tokenizer: &Tokenizer, s: &str, what: &str) -> Result<Vec<u32>, String> {
+    tokenizer
+        .encode(s, false)
+        .map(|e| e.get_ids().to_vec())
+        .map_err(|e| format!("tokenize {what}: {e}"))
+}
+
+/// The reference `make_ensemble` system block (sc-13570/sc-14149): the TTS system prompt, plus the
+/// voice-clone `context` timbre block when `reference_audio` (the encoded reference clip,
+/// `[T_audio][rvq]`) is supplied — with the reference codes threaded onto the audio channels of the
+/// `<|audio_pad|>` (`reference_audio_pad`) positions, in order. Emitted once at the start of a
+/// conversation; the cloned voice then conditions every turn (held constant across the conversation).
+pub(crate) fn system_frames(
+    tokenizer: &Tokenizer,
+    cfg: &MossTtsRealtimeConfig,
+    reference_audio: Option<&[Vec<u32>]>,
+) -> Result<Vec<Frame>, String> {
     let system_text = match reference_audio {
         Some(codes) if !codes.is_empty() => format!(
             "{TTS_SYSTEM_PROMPT}{VOICE_CLONE_PREFIX}{pads}{VOICE_CLONE_SUFFIX}",
@@ -104,23 +133,11 @@ pub fn build_prompt_frames(
         ),
         _ => TTS_SYSTEM_PROMPT.to_string(),
     };
-    let system = encode(&system_text, "system prompt")?;
-    let assistant = encode(ASSISTANT_OPEN, "assistant open")?;
-    let text_ids = encode(text, "prompt text")?;
-    if text_ids.is_empty() {
-        return Err("empty prompt after tokenization".into());
-    }
-    let pad_frame = |id: u32| Frame {
-        text: id,
-        audio: vec![AUDIO_CHANNEL_PAD; cfg.rvq],
-    };
-    let prefill_text = text_ids.len().min(DELAY_TOKENS_LEN);
-    // System frames, with the reference-audio codes threaded onto the `<|audio_pad|>` positions'
-    // audio channels (make_ensemble fills `[audio_pad_start..=audio_pad_end, 1:] = prompt_audio_tokens`).
-    let mut prefill: Vec<Frame> = Vec::with_capacity(system.len() + assistant.len() + prefill_text);
+    let system = encode_ids(tokenizer, &system_text, "system prompt")?;
+    let mut frames: Vec<Frame> = Vec::with_capacity(system.len());
     let mut audio_idx = 0usize;
     for &id in &system {
-        let mut frame = pad_frame(id);
+        let mut frame = pad_frame(cfg, id);
         if id == cfg.reference_audio_pad {
             let codes = reference_audio.expect("audio_pad emitted only for a reference clip");
             let row = codes.get(audio_idx).ok_or_else(|| {
@@ -136,7 +153,7 @@ pub fn build_prompt_frames(
             frame.audio = row.clone();
             audio_idx += 1;
         }
-        prefill.push(frame);
+        frames.push(frame);
     }
     if let Some(codes) = reference_audio {
         if audio_idx != codes.len() {
@@ -146,19 +163,34 @@ pub fn build_prompt_frames(
             ));
         }
     }
-    // assistant-open, then the first DELAY_TOKENS_LEN text tokens (all in the prefill).
-    for &id in assistant.iter().chain(&text_ids[..prefill_text]) {
-        prefill.push(pad_frame(id));
+    Ok(frames)
+}
+
+/// Append an **assistant response prefill** to `frames`: the `opener` (the section transition, e.g.
+/// `"<|im_start|>assistant\n"` after the system, or `"<|im_end|>\n<|im_start|>assistant\n"` after a
+/// prior turn) followed by the first [`DELAY_TOKENS_LEN`] tokens of `text`, with `AUDIO_BOS` on
+/// codebook 0 of the **last prefilled text** position (the delay-pattern kickoff). Returns the
+/// remaining text tokens (positions `DELAY_TOKENS_LEN..`) to stream one-per-frame during generation.
+pub(crate) fn assistant_prefill_frames(
+    tokenizer: &Tokenizer,
+    cfg: &MossTtsRealtimeConfig,
+    opener: &str,
+    text: &str,
+    frames: &mut Vec<Frame>,
+) -> Result<Vec<u32>, String> {
+    let opener_ids = encode_ids(tokenizer, opener, "assistant opener")?;
+    let text_ids = encode_ids(tokenizer, text, "assistant text")?;
+    if text_ids.is_empty() {
+        return Err("empty assistant text after tokenization".into());
     }
-    // AUDIO_BOS on codebook 0 of the last prefilled text position (prefill_text ≥ 1 here).
-    prefill
-        .last_mut()
-        .expect("prefill has ≥ 1 text token")
-        .audio[0] = AUDIO_BOS;
-    Ok(PromptPlan {
-        prefill,
-        streamed_text: text_ids[prefill_text..].to_vec(),
-    })
+    let prefill_text = text_ids.len().min(DELAY_TOKENS_LEN);
+    for &id in opener_ids.iter().chain(&text_ids[..prefill_text]) {
+        frames.push(pad_frame(cfg, id));
+    }
+    // AUDIO_BOS on codebook 0 of the last prefilled text position (prefill_text ≥ 1 here). The opener
+    // is non-empty, so the last frame is always a text token, never a bare opener token.
+    frames.last_mut().expect("prefill has ≥ 1 text token").audio[0] = AUDIO_BOS;
+    Ok(text_ids[prefill_text..].to_vec())
 }
 
 /// Default minimum audio frames before an audio-EOS may terminate the AR loop. **Off (0) by default**
@@ -234,6 +266,43 @@ impl Decoder {
         cancel: &dyn Fn() -> bool,
         on_frame: &mut dyn FnMut(usize, &[u32]) -> CandleResult<()>,
     ) -> CandleResult<Option<DecodeResult>> {
+        // Single-turn: a fresh cache, one prefill, then AR generation. Delegates to the shared
+        // per-turn core so single-turn and multi-turn generation are the identical computation.
+        let mut cache = self.backbone.new_cache();
+        self.generate_turn(
+            &mut cache,
+            &prompt_frames,
+            streamed_text,
+            max_frames,
+            seed,
+            cancel,
+            on_frame,
+        )
+    }
+
+    /// The **shared per-turn conditioning core** (sc-14151): prefill `prefill_block` onto `cache`
+    /// (fresh for turn 0, warm for later turns — the prefill attends over the prior turns via the
+    /// backbone's `prefix_causal_mask`), then AR-generate up to `max_frames` audio frames, feeding
+    /// each emitted frame back with the delay-pattern `streamed_text` on the text channel. Emits every
+    /// non-EOS frame through `on_frame`; the emitted frames stay in `cache` as context for later turns.
+    ///
+    /// This is the single computation both multi-turn shapes run: the stateless path (A) drives it
+    /// per turn on a cache it rebuilds within one `generate` call, and the stateful session (B) drives
+    /// it per `step` on a cache kept warm across turns — so for the same conversation + per-turn seed
+    /// the two are byte-identical (the A≡B equivalence law). `seed` is the per-turn seed (derive it
+    /// deterministically from the base seed + turn index so a turn is independent of the sampling in
+    /// prior turns). Returns `Ok(None)` on cancel; the emitted frames exclude the terminal EOS frame.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_turn(
+        &self,
+        cache: &mut BackboneCache,
+        prefill_block: &[Frame],
+        streamed_text: &[u32],
+        max_frames: usize,
+        seed: u64,
+        cancel: &dyn Fn() -> bool,
+        on_frame: &mut dyn FnMut(usize, &[u32]) -> CandleResult<()>,
+    ) -> CandleResult<Option<DecodeResult>> {
         let mut out: Vec<RvqFrame> = Vec::new();
         let mut stop = StopReason::Budget;
         // The reference sampling distribution (temp 0.8 / top-k 30 / top-p 0.6 / rep-penalty 1.1),
@@ -247,22 +316,18 @@ impl Decoder {
         // conditioning ([`build_prompt_frames`]) — not this floor — is what keeps prompts faithful.
         let min_frames = min_eos_frames().min(max_frames / 2);
         let mut rng = Rng::seed(seed);
-        // KV-cache AR (sc-13417): prefill the prompt once, then feed each emitted frame back as a
-        // single-token step, so per-frame backbone cost is O(1) amortized instead of O(seq). The
-        // cache produces byte-identical hidden states to the old full-recompute path (proven in
-        // `backbone::tests::kv_cache_is_byte_identical_to_full_recompute`), so the sampled frames —
-        // and the reproducibility/streaming determinism gates — are unchanged.
-        let mut cache = self.backbone.new_cache();
+        // KV-cache AR (sc-13417): prefill the block once (onto the passed cache), then feed each
+        // emitted frame back as a single-token step, so per-frame backbone cost is O(1) amortized.
         let mut prefilled = false;
         for step in 0..max_frames {
             if cancel() {
                 return Ok(None);
             }
             // Advance the backbone by exactly the positions the recompute path would have: the whole
-            // prompt on the first iteration, then one fed-back frame per iteration thereafter.
+            // prefill block on the first iteration, then one fed-back frame per iteration thereafter.
             let hidden = if !prefilled {
                 prefilled = true;
-                self.backbone.prefill(&prompt_frames, &mut cache)?
+                self.backbone.prefill(prefill_block, cache)?
             } else {
                 // The previous iteration's emitted frame, fed back with the text channel carrying the
                 // next streamed text token (delay-pattern), or text_pad once the text is exhausted.
@@ -275,7 +340,7 @@ impl Decoder {
                     text,
                     audio: prev.clone(),
                 };
-                self.backbone.step(&fed, &mut cache)?
+                self.backbone.step(&fed, cache)?
             };
             let suppress_eos = out.len() < min_frames;
             let frame = self
@@ -291,6 +356,52 @@ impl Decoder {
             out.push(frame);
         }
         Ok(Some(DecodeResult { frames: out, stop }))
+    }
+
+    /// Warm `cache` with a **provided** (already-known) assistant turn's audio (sc-14151): prefill
+    /// `prefill_block`, then feed each of `known_frames` back through the backbone via the same
+    /// single-token [`step`](Backbone::step) path (same delay-pattern text)
+    /// [`generate_turn`](Self::generate_turn) uses — but **without** sampling. This lets the stateless
+    /// path (A) resume a conversation whose earlier
+    /// assistant turns were *provided* (as PCM in the request history) rather than generated in this
+    /// call. Returns `Ok(None)` on cancel. Generated turns need no replay — their RVQ frames stay in
+    /// the warm cache directly.
+    ///
+    /// **This is a best-effort resume, NOT a byte-identical reconstruction of a live session's cache.**
+    /// The provided PCM is re-encoded to RVQ upstream ([`crate::model`]'s `prepare_turn`) and the codec
+    /// `encode∘decode` is lossy, so the replayed codes are not the exact codes a live session sampled —
+    /// the reconstructed KV therefore differs. It also feeds **all** `known_frames`, matching a turn
+    /// that terminated at audio-EOS (the common case, where `generate_turn` fed every emitted frame);
+    /// a turn that instead hit the frame *budget* left its final sampled frame unfed, so replaying such
+    /// a turn advances the cache one position further than the original generation did. Resume is
+    /// consequently an approximate continuation, distinct from the exact A≡B equivalence the
+    /// generate-only conversation upholds. (Generated turns — the DoD path — are never replayed.)
+    pub fn replay_turn(
+        &self,
+        cache: &mut BackboneCache,
+        prefill_block: &[Frame],
+        streamed_text: &[u32],
+        known_frames: &[RvqFrame],
+        cancel: &dyn Fn() -> bool,
+    ) -> CandleResult<Option<()>> {
+        if cancel() {
+            return Ok(None);
+        }
+        // Prefill the turn's conditioning block (its hidden state is discarded — we are not sampling,
+        // only warming the cache), then step through the known frames just as generation would.
+        self.backbone.prefill(prefill_block, cache)?;
+        for (i, frame) in known_frames.iter().enumerate() {
+            if cancel() {
+                return Ok(None);
+            }
+            let text = streamed_text.get(i).copied().unwrap_or(self.cfg.text_pad);
+            let fed = Frame {
+                text,
+                audio: frame.clone(),
+            };
+            self.backbone.step(&fed, cache)?;
+        }
+        Ok(Some(()))
     }
 }
 

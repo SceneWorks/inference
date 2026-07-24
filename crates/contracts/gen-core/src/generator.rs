@@ -79,6 +79,92 @@ pub trait Generator {
         }
         Ok(out)
     }
+
+    /// **Open a stateful multi-turn conversational session** (sc-14150) — the stateful counterpart
+    /// (path **B**) of the stateless [`Conditioning::ConversationHistory`] carrier (path **A**). A
+    /// context-aware conversational TTS model (e.g. MOSS-TTS-Realtime, a voice-agent foundation model)
+    /// synthesizes turn *N* conditioned on turns *1..N-1*. The stateless path rebuilds the whole
+    /// conversation prefix on every [`generate`](Self::generate) call; a session instead keeps the
+    /// model's live cross-turn state (the warm KV cache) **hot across `step`s**, so a turn does not
+    /// recompute the prefix — the low-latency real-time voice-agent path, where an upstream LLM feeds
+    /// assistant turns incrementally.
+    ///
+    /// ## Why a session opens from the loaded generator (and not a weight-reloading registration kind)
+    ///
+    /// The session shares this **already-loaded** model's weights through `&self` — it is *not* a
+    /// second registry kind whose `load` would re-read the checkpoint (doubling residency and fighting
+    /// the single-backend-per-bundle invariant). Discovery is the additive
+    /// [`Capabilities::supports_conversation_session`] flag on the already-registered descriptor,
+    /// exactly as [`Capabilities::supports_streaming`] advertises the streaming path. This mirrors how
+    /// [`generate_streaming`](Self::generate_streaming) is an **additive, default-implemented** method
+    /// on this same trait: every existing [`Generator`] inherits the default below and is byte-for-byte
+    /// unaffected.
+    ///
+    /// `req` carries the conversation-level constants read once at open — the seed base, the audio
+    /// sub-block (target sample rate / language), and any [`Conditioning::ReferenceAudio`] voice-clone
+    /// clip that is held constant across the whole conversation. Per-turn text + audio arrive through
+    /// [`ConversationSession::step`]. The default returns the typed [`Error::Unsupported`]; a provider
+    /// advertising [`Capabilities::supports_conversation_session`] overrides it.
+    fn open_conversation(
+        &self,
+        req: &GenerationRequest,
+    ) -> Result<Box<dyn ConversationSession + '_>> {
+        let _ = req;
+        Err(Error::Unsupported(format!(
+            "{}: stateful conversational sessions are not supported",
+            self.descriptor().id
+        )))
+    }
+}
+
+/// A **stateful multi-turn conversational TTS session** (sc-14150, path **B**) — opened from a loaded
+/// [`Generator`] via [`Generator::open_conversation`], it holds the model's live cross-turn state (the
+/// warm KV cache) so each [`step`](Self::step) synthesizes the next turn conditioned on every prior
+/// turn **without** recomputing the conversation prefix. This is the low-latency real-time voice-agent
+/// path; the stateless [`Conditioning::ConversationHistory`] carrier (path **A**) is the equivalent
+/// batch render.
+///
+/// **The A≡B equivalence law:** for the same conversation + seed, driving the turns one-per-`step`
+/// through a session must emit **byte-identical** audio to rendering the same conversation in one
+/// stateless [`generate`](Generator::generate) call carrying the whole
+/// [`Conditioning::ConversationHistory`] — the session is a warm-cache *optimization* of the batch
+/// path, not a different computation (the multi-turn analogue of the
+/// `generate`≡`generate_streaming` law the streaming testkit enforces). The `gen-core-testkit`
+/// `check_multi_turn` conformance check enforces this, so a session that drifts from the batch path
+/// is a CI failure rather than a field report.
+///
+/// The trait is object-safe and tensor-free: turns cross the boundary as [`ConversationTurn`] (PCM
+/// [`AudioTrack`], never model tokens). A session borrows the loaded model (`+ '_` on the boxed
+/// handle) and is dropped to release its state; [`finish`](Self::finish) is an explicit,
+/// idempotent close for symmetry with the reference `open → step → finish` handshake.
+pub trait ConversationSession {
+    /// Advance the conversation by one `turn`, returning that turn's audio.
+    ///
+    /// - A **synthesis** turn ([`ConversationRole::Assistant`] with `audio: None`) is generated
+    ///   conditioned on every prior turn folded into this session, and its generated audio is
+    ///   retained as context for later turns; the returned [`AudioTrack`] is the synthesized speech,
+    ///   streamed incrementally through `on_chunk` (the [`AudioChunk`] reassembly law holds, as in
+    ///   [`generate_streaming`](Generator::generate_streaming)).
+    /// - A **context** turn (any turn carrying `audio: Some`) is folded into the session as prior
+    ///   context (the user's speech, or a previously-generated assistant turn resumed from another
+    ///   session); no synthesis happens and the provided track is returned unchanged (echoed).
+    ///
+    /// `on_progress` carries the usual step/decode [`Progress`]; cancellation rides
+    /// [`GenerationRequest::cancel`] on the request passed to [`Generator::open_conversation`],
+    /// returning the typed [`Error::Canceled`] on a mid-turn cancel.
+    fn step(
+        &mut self,
+        turn: &ConversationTurn,
+        on_chunk: &mut dyn FnMut(AudioChunk),
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<AudioTrack>;
+
+    /// Explicitly close the session, releasing any held state. Idempotent; the default is a no-op
+    /// (state is also released on drop). A provider overrides this only if closing can surface an
+    /// error worth propagating.
+    fn finish(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// What a [`Generator`] produced. The `Video` variant's `audio` is `Some` for LTX (always
@@ -346,6 +432,60 @@ pub struct SpeechSegment {
     /// Optional free-form per-segment style / emotion hint (e.g. `"cheerful"`, `"whisper"`).
     /// Advisory and not gated: each model documents what it honors and ignores the rest.
     pub style: Option<String>,
+}
+
+/// Who speaks a [`ConversationTurn`] in a multi-turn conversation (sc-14150). The distinction is
+/// semantic to a voice-agent TTS model: a [`User`](Self::User) turn is *provided* context (the
+/// user's speech), an [`Assistant`](Self::Assistant) turn is the model's synthesized reply — and only
+/// an assistant turn is generated (a turn with `audio: None`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConversationRole {
+    /// A user turn — provided context (the user's speech + its transcript). Always carries `audio`.
+    User,
+    /// An assistant turn — the model's spoken reply. `audio: None` marks it as the turn to
+    /// **synthesize**; `audio: Some` is a previously-generated assistant turn resumed as context.
+    Assistant,
+}
+
+/// One turn of a multi-turn conversation (sc-14150) — the unit both the stateless
+/// [`Conditioning::ConversationHistory`] carrier (path **A**) and the stateful
+/// [`ConversationSession`] (path **B**) consume. Tensor-free: audio crosses as a PCM
+/// [`AudioTrack`], never model tokens — the provider encodes it to its own codec representation.
+///
+/// A turn carries a [`role`](Self::role), the turn's `text`, and its [`audio`](Self::audio):
+/// - `audio: Some(track)` ⇒ a **context** turn (the user's speech, or a prior assistant turn
+///   resumed from elsewhere); the model conditions on it.
+/// - `audio: None` ⇒ a **synthesis** turn — the assistant reply to generate (`role` must be
+///   [`ConversationRole::Assistant`]); the model synthesizes `text` in the conversation's voice,
+///   conditioned on all prior turns.
+///
+/// Additive and single-turn-preserving, like the rest of the request surface: a provider with no
+/// multi-turn support is byte-for-byte unaffected (it advertises neither
+/// [`Capabilities::supports_conversation_history`] nor
+/// [`Capabilities::supports_conversation_session`], and the shared floor rejects a conversation as
+/// the typed [`Error::Unsupported`]). New per-turn controls arrive as further `Option` fields
+/// without breaking `ConversationTurn { role, text, ..Default::default() }` construction.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConversationTurn {
+    /// Who speaks this turn.
+    pub role: ConversationRole,
+    /// The turn's text — the user's transcript (context turn) or the assistant text to speak
+    /// (synthesis turn). A turn with empty/whitespace-only text is a malformed request each
+    /// multi-turn model rejects in its own `validate`.
+    pub text: String,
+    /// The turn's PCM audio: `Some` for a context turn, `None` for the assistant reply to
+    /// synthesize. See the type docs.
+    pub audio: Option<AudioTrack>,
+}
+
+impl Default for ConversationTurn {
+    fn default() -> Self {
+        Self {
+            role: ConversationRole::Assistant,
+            text: String::new(),
+            audio: None,
+        }
+    }
 }
 
 /// One phase of a [multi-phase denoise](GenerationRequest::phases) (epic 13879, sc-13884): a
@@ -951,6 +1091,24 @@ pub enum Conditioning {
     /// [`Capabilities::conditioning`]; the shared floor rejects the variant on a non-advertising model
     /// as the typed [`Error::Unsupported`] (F-008) and an empty `frames` as [`Error::Msg`].
     VideoSync { frames: Vec<Image> },
+    /// A **multi-turn conversation history** driving context-aware conversational TTS (sc-14150,
+    /// path **A**) — an ordered list of [`ConversationTurn`]s a voice-agent model reads to synthesize
+    /// the trailing assistant reply conditioned on every prior turn (their text **and** audio). This
+    /// is the *stateless* carrier: the whole conversation rides in the request, so the model rebuilds
+    /// the conversation prefix on each [`Generator::generate`] call (batch conversational render). Its
+    /// stateful counterpart is the warm-cache [`ConversationSession`] (path **B**), which
+    /// [`Generator::open_conversation`] opens — the same per-turn computation kept hot across turns.
+    ///
+    /// This is a **distinct variant**, deliberately not an overload of the single-request multi-speaker
+    /// [`AudioParams::script`] (sc-12848): a script is one utterance rendered in assigned voices into a
+    /// single track with **no** cross-utterance conditioning, whereas a conversation is a sequence of
+    /// turns where turn *N* is *conditioned on* turns *1..N-1* (their generated audio carried forward).
+    /// Tensor-free: each turn's audio is a PCM [`AudioTrack`], the provider encodes it. A model opts in
+    /// through [`Capabilities::supports_conversation_history`] **and** by advertising
+    /// [`ConditioningKind::ConversationHistory`] in [`Capabilities::conditioning`]; the shared floor
+    /// rejects a conversation on a non-advertising model as the typed [`Error::Unsupported`] (F-008)
+    /// and an empty `turns` as [`Error::Msg`].
+    ConversationHistory { turns: Vec<ConversationTurn> },
 }
 
 impl Conditioning {
@@ -971,6 +1129,7 @@ impl Conditioning {
             Conditioning::VideoClip { .. } => ConditioningKind::VideoClip,
             Conditioning::ControlClip { .. } => ConditioningKind::ControlClip,
             Conditioning::VideoSync { .. } => ConditioningKind::VideoSync,
+            Conditioning::ConversationHistory { .. } => ConditioningKind::ConversationHistory,
         }
     }
 }
@@ -1019,6 +1178,8 @@ pub enum ConditioningKind {
     ControlClip,
     /// video→audio (Foley) sync ([`Conditioning::VideoSync`]).
     VideoSync,
+    /// multi-turn conversation history ([`Conditioning::ConversationHistory`]).
+    ConversationHistory,
 }
 
 /// What kind of media a model emits.
@@ -1135,6 +1296,29 @@ pub struct Capabilities {
     /// set; a script naming more than `max_speakers` distinct speakers is a range error
     /// ([`Error::Msg`], not a capability gap). `Default` is `None`.
     pub max_speakers: Option<u32>,
+    /// Whether this model renders a **stateless multi-turn conversation history**
+    /// ([`Conditioning::ConversationHistory`], sc-14150, path **A**) — the opt-in signal for
+    /// context-aware conversational TTS carried entirely in the request, mirroring
+    /// [`supports_multi_speaker`](Self::supports_multi_speaker) /
+    /// [`supports_streaming`](Self::supports_streaming). `Default` is `false`: every non-conversational
+    /// model leaves it unset and the shared floor rejects a request carrying a
+    /// [`Conditioning::ConversationHistory`] as the typed [`Error::Unsupported`]. A provider that sets
+    /// it `true` also advertises [`ConditioningKind::ConversationHistory`] in
+    /// [`conditioning`](Self::conditioning) (the two are cross-checked by the descriptor conformance
+    /// sweep). A consumer reads it to know whether a conversation will be honored or must be rejected.
+    pub supports_conversation_history: bool,
+    /// Whether this model can open a **stateful multi-turn conversational session**
+    /// ([`Generator::open_conversation`] → [`ConversationSession`], sc-14150, path **B**) — the opt-in
+    /// signal for the warm-KV real-time voice-agent path, mirroring
+    /// [`supports_streaming`](Self::supports_streaming). `Default` is `false`: every model without
+    /// cross-turn state leaves it unset, and [`Generator::open_conversation`]'s default returns the
+    /// typed [`Error::Unsupported`]. A provider sets it `true` only when it genuinely keeps the model's
+    /// live cross-turn state hot across `step`s (so a turn does not recompute the prefix). The session
+    /// path must satisfy the A≡B equivalence law against the stateless
+    /// [`supports_conversation_history`](Self::supports_conversation_history) render for the same
+    /// conversation+seed; the `gen-core-testkit` `check_multi_turn` check enforces it. A model may
+    /// advertise either path independently.
+    pub supports_conversation_session: bool,
     /// On-the-fly quantization levels this engine offers (empty slice = none). Read by the worker's
     /// capability advertisement (sc-3723) instead of a hardcoded per-row flag. `Default` is `&[]`.
     pub supported_quants: &'static [Quant],
@@ -1518,6 +1702,56 @@ impl Capabilities {
                     return Err(Error::Msg(format!(
                         "{id}: VideoSync conditioning carries no frames — a video→audio clip must \
                          have at least one frame"
+                    )));
+                }
+            }
+        }
+        // Multi-turn conversation history (sc-14150, path A): a conversation sent to a model that
+        // does not advertise `supports_conversation_history` is a capability gap → typed
+        // `Error::Unsupported` (the same convention `supports_multi_speaker` / streaming use), so a
+        // single-turn model can never silently render only the last turn. The allowlist above already
+        // rejects the kind when it is not admitted; this keyed check gives the specific message and is
+        // authoritative when a descriptor advertises the kind but leaves the flag unset. When
+        // supported the conversation must be well-formed: non-empty, every turn carries non-blank
+        // text, a `User` turn must carry its audio (it is provided context, never synthesized), and
+        // there must be at least one assistant turn to synthesize (`audio: None`) — all malformed
+        // requests → `Error::Msg`. Per-model turn-ordering / count bounds are layered by the
+        // provider's own `validate`.
+        for c in &req.conditioning {
+            if let Conditioning::ConversationHistory { turns } = c {
+                if !self.supports_conversation_history {
+                    return Err(Error::Unsupported(format!(
+                        "{id}: a multi-turn conversation history is not supported"
+                    )));
+                }
+                if turns.is_empty() {
+                    return Err(Error::Msg(format!(
+                        "{id}: conversation history is empty — a conversation must carry at least \
+                         one turn"
+                    )));
+                }
+                let mut has_synthesis = false;
+                for (i, turn) in turns.iter().enumerate() {
+                    if turn.text.trim().is_empty() {
+                        return Err(Error::Msg(format!(
+                            "{id}: conversation turn {i} has empty text"
+                        )));
+                    }
+                    match (turn.role, turn.audio.is_none()) {
+                        (ConversationRole::User, true) => {
+                            return Err(Error::Msg(format!(
+                                "{id}: conversation turn {i} is a User turn with no audio — a user \
+                                 turn is provided context and must carry its audio"
+                            )));
+                        }
+                        (ConversationRole::Assistant, true) => has_synthesis = true,
+                        _ => {}
+                    }
+                }
+                if !has_synthesis {
+                    return Err(Error::Msg(format!(
+                        "{id}: conversation history has no assistant turn to synthesize (a turn with \
+                         audio: None)"
                     )));
                 }
             }
@@ -2202,6 +2436,115 @@ mod tests {
             ..audio_req()
         };
         assert!(c.validate_request_audio("tts", &single).is_ok());
+    }
+
+    #[test]
+    fn conversation_history_gating_is_additive_and_typed() {
+        // sc-14150: a ConversationHistory is a capability gap on a non-conversational model, gated by
+        // supports_conversation_history (+ the conditioning allowlist); when supported the shape must
+        // be well-formed; a request with no conversation is byte-for-byte unaffected.
+        let user = |t: &str| ConversationTurn {
+            role: ConversationRole::User,
+            text: t.into(),
+            audio: Some(track()),
+        };
+        let asst = |t: &str, audio: Option<AudioTrack>| ConversationTurn {
+            role: ConversationRole::Assistant,
+            text: t.into(),
+            audio,
+        };
+        // A bare audio request (no voice/language sub-block, so only the conversation is exercised).
+        let conv_req = |caps: Capabilities, turns: Vec<ConversationTurn>| {
+            let req = GenerationRequest {
+                prompt: "read this aloud".into(),
+                width: 0,
+                height: 0,
+                conditioning: vec![Conditioning::ConversationHistory { turns }],
+                ..Default::default()
+            };
+            caps.validate_request_audio("tts", &req)
+        };
+        let conv_caps = || Capabilities {
+            conditioning: vec![ConditioningKind::ConversationHistory],
+            supports_conversation_history: true,
+            max_count: 1,
+            ..Default::default()
+        };
+
+        // A non-conversational model (neither the flag nor the kind): a conversation is a typed gap.
+        let plain = Capabilities {
+            max_count: 1,
+            ..Default::default()
+        };
+        assert!(matches!(
+            conv_req(plain, vec![user("hi"), asst("hello", None)]),
+            Err(Error::Unsupported(_))
+        ));
+
+        // Advertised: a well-formed conversation (context user turn + an assistant reply to
+        // synthesize) passes.
+        assert!(conv_req(conv_caps(), vec![user("hi"), asst("hello", None)]).is_ok());
+
+        // Empty conversation → malformed (Msg), not a capability gap.
+        assert!(matches!(conv_req(conv_caps(), vec![]), Err(Error::Msg(_))));
+
+        // A blank-text turn → Msg.
+        assert!(matches!(
+            conv_req(conv_caps(), vec![user("   "), asst("hi", None)]),
+            Err(Error::Msg(_))
+        ));
+
+        // A User turn with no audio (provided context must carry its audio) → Msg.
+        assert!(matches!(
+            conv_req(
+                conv_caps(),
+                vec![
+                    ConversationTurn {
+                        role: ConversationRole::User,
+                        text: "hi".into(),
+                        audio: None,
+                    },
+                    asst("hello", None),
+                ]
+            ),
+            Err(Error::Msg(_))
+        ));
+
+        // No assistant turn to synthesize (every turn already carries audio) → Msg.
+        assert!(matches!(
+            conv_req(
+                conv_caps(),
+                vec![user("hi"), asst("was said", Some(track()))]
+            ),
+            Err(Error::Msg(_))
+        ));
+
+        // Keyed gate is authoritative: a descriptor listing the kind but leaving the flag unset
+        // (inconsistent — the registry conformance sweep also flags it) still rejects a conversation
+        // as the typed Unsupported.
+        let flag_off = Capabilities {
+            conditioning: vec![ConditioningKind::ConversationHistory],
+            supports_conversation_history: false,
+            max_count: 1,
+            ..Default::default()
+        };
+        assert!(matches!(
+            conv_req(flag_off, vec![user("hi"), asst("hello", None)]),
+            Err(Error::Unsupported(_))
+        ));
+
+        // Additive: a plain request with no conversation validates exactly as before.
+        let bare = GenerationRequest {
+            prompt: "hi".into(),
+            width: 0,
+            height: 0,
+            ..Default::default()
+        };
+        let plain2 = Capabilities {
+            max_count: 1,
+            ..Default::default()
+        };
+        assert!(plain2.validate_request_audio("tts", &bare).is_ok());
     }
 
     #[test]

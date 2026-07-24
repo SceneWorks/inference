@@ -153,6 +153,8 @@ pub fn descriptor() -> ModelDescriptor {
             supports_sequential_offload: false,
             supports_streaming: false,
             supports_multi_speaker: false,
+            supports_conversation_history: false,
+            supports_conversation_session: false,
             max_speakers: None,
         },
     }

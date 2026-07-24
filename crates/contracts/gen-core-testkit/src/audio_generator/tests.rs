@@ -375,6 +375,9 @@ fn good_stub_passes_every_check_individually() {
     check_audio_seed_determinism(&g, &cheap()).unwrap();
     // The non-streaming stub exercises the additive default `generate_streaming` (one terminal chunk).
     check_audio_streaming(&g, &cheap()).unwrap();
+    // The single-turn stub advertises neither multi-turn path, so it must reject both a
+    // ConversationHistory request and open_conversation (the additive surface does not perturb it).
+    check_multi_turn(&g, &cheap()).unwrap();
     crate::check_registry_roundtrip(&registry(), &g).unwrap();
 }
 
@@ -820,4 +823,349 @@ fn frame_ignoring_video_sync_stub_fails_the_check() {
 #[should_panic(expected = "audio conformance FAILED")]
 fn conformance_panics_on_a_silent_video_sync_stub() {
     audio_conformance(|| VideoSyncStubAudioGen::boxed(true, false), &cheap());
+}
+
+// --- Multi-turn conversational contract (sc-14150) --------------------------------------------
+
+use gen_core::{ConversationRole, ConversationSession, ConversationTurn};
+
+const MT_ID: &str = "testkit_audio_multi_turn_stub";
+const MT_SAMPLE_RATE: u32 = 24_000;
+
+/// Which multi-turn paths the stub advertises + which contract it (honestly or dishonestly) upholds.
+#[derive(Clone, Copy)]
+struct MtBehavior {
+    /// Advertise `supports_conversation_history` (path A) + the `ConversationHistory` kind.
+    history: bool,
+    /// Advertise `supports_conversation_session` (path B).
+    session: bool,
+    /// Broken: synthesize each turn context-free (ignore the prior turns) — fails conditioned-on-prior.
+    ignore_history: bool,
+    /// Broken: the session (path B) perturbs its output so it diverges from the batch render (path A)
+    /// — fails the A≡B equivalence law.
+    session_diverges: bool,
+}
+
+impl MtBehavior {
+    fn both() -> Self {
+        Self {
+            history: true,
+            session: true,
+            ignore_history: false,
+            session_diverges: false,
+        }
+    }
+}
+
+/// FNV-1a-style fold, so the running conversation digest depends on every prior turn's role, text,
+/// and audio (context or generated) — the "turn N is conditioned on turns 1..N-1" content.
+fn mt_fold(acc: &mut u64, bytes: &[u8]) {
+    for &b in bytes {
+        *acc ^= b as u64;
+        *acc = acc.wrapping_mul(0x0000_0100_0000_01B3);
+    }
+}
+
+/// The synthesized reply for a turn: a DC-filled 480-sample mono track whose level derives from the
+/// running context digest `ctx` (the prior turns), this turn's `text`, and the `seed` — so a later
+/// turn genuinely depends on the earlier ones.
+fn mt_synth(ctx: u64, text: &str, seed: u64) -> AudioTrack {
+    let mut d = ctx;
+    mt_fold(&mut d, text.as_bytes());
+    mt_fold(&mut d, &seed.to_le_bytes());
+    let fill = (d % 1_000_003) as f32 * 1e-3 + 1.0;
+    AudioTrack {
+        samples: vec![fill; 480],
+        sample_rate: MT_SAMPLE_RATE,
+        channels: 1,
+        ..Default::default()
+    }
+}
+
+/// The single per-turn core shared by path A (`generate`) and path B (session `step`): fold this
+/// turn's role+text into `ctx`, then either fold a context turn's audio (returns `None`) or
+/// synthesize an assistant reply conditioned on `ctx`, fold the reply into `ctx`, and return it. A
+/// and B calling this identically is what makes the A≡B render byte-identical.
+fn mt_process(
+    ctx: &mut u64,
+    turn: &ConversationTurn,
+    seed: u64,
+    ignore_history: bool,
+) -> Option<AudioTrack> {
+    mt_fold(
+        ctx,
+        &[match turn.role {
+            ConversationRole::User => 1,
+            ConversationRole::Assistant => 2,
+        }],
+    );
+    mt_fold(ctx, turn.text.as_bytes());
+    match &turn.audio {
+        Some(track) => {
+            for &s in &track.samples {
+                mt_fold(ctx, &s.to_le_bytes());
+            }
+            None
+        }
+        None => {
+            // The honest stub conditions on the running digest; the broken `ignore_history` stub
+            // synthesizes from a fixed base (each turn context-free).
+            let cond = if ignore_history { 0 } else { *ctx };
+            let reply = mt_synth(cond, &turn.text, seed);
+            for &s in &reply.samples {
+                mt_fold(ctx, &s.to_le_bytes());
+            }
+            Some(reply)
+        }
+    }
+}
+
+struct MultiTurnStubAudioGen {
+    desc: ModelDescriptor,
+    behavior: MtBehavior,
+}
+
+fn mt_desc(behavior: MtBehavior) -> ModelDescriptor {
+    let mut desc = stub_desc(MT_ID);
+    if behavior.history {
+        desc.capabilities.conditioning = vec![ConditioningKind::ConversationHistory];
+        desc.capabilities.supports_conversation_history = true;
+    }
+    desc.capabilities.supports_conversation_session = behavior.session;
+    desc
+}
+
+impl MultiTurnStubAudioGen {
+    fn new(behavior: MtBehavior) -> Self {
+        Self {
+            desc: mt_desc(behavior),
+            behavior,
+        }
+    }
+    fn boxed(behavior: MtBehavior) -> Box<dyn Generator> {
+        Box::new(Self::new(behavior))
+    }
+}
+
+impl Generator for MultiTurnStubAudioGen {
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.desc
+    }
+
+    fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
+        self.desc
+            .capabilities
+            .validate_request_audio(self.desc.id, req)
+    }
+
+    fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationOutput> {
+        self.validate(req)?;
+        let seed = req.seed.unwrap_or(0);
+        // Emit step progress and honor cancellation, so a conversational generator is also a
+        // well-behaved one-shot audio generator (the shared progress/cancel conformance).
+        let total = req.steps.unwrap_or(2);
+        for i in 1..=total {
+            if req.cancel.is_cancelled() {
+                return Err(Error::Canceled);
+            }
+            on_progress(Progress::Step { current: i, total });
+        }
+        on_progress(Progress::Decoding);
+        // Path A: render the whole conversation, keeping the digest warm across turns (never
+        // round-tripping generated audio) and concatenating the assistant replies.
+        if let Some(Conditioning::ConversationHistory { turns }) = req
+            .conditioning
+            .iter()
+            .find(|c| matches!(c, Conditioning::ConversationHistory { .. }))
+        {
+            let mut ctx = seed;
+            let mut samples = Vec::new();
+            for turn in turns {
+                if let Some(reply) = mt_process(&mut ctx, turn, seed, self.behavior.ignore_history)
+                {
+                    samples.extend(reply.samples);
+                }
+            }
+            return Ok(GenerationOutput::Audio(AudioTrack {
+                samples,
+                sample_rate: MT_SAMPLE_RATE,
+                channels: 1,
+                ..Default::default()
+            }));
+        }
+        // Single-shot: a deterministic seed-filled track, so this stub is also a well-behaved
+        // one-shot audio generator (it passes the rest of the suite).
+        Ok(GenerationOutput::Audio(AudioTrack {
+            samples: vec![seed as f32; 480],
+            sample_rate: MT_SAMPLE_RATE,
+            channels: 1,
+            ..Default::default()
+        }))
+    }
+
+    fn open_conversation(
+        &self,
+        req: &GenerationRequest,
+    ) -> gen_core::Result<Box<dyn ConversationSession + '_>> {
+        if !self.behavior.session {
+            return Err(Error::Unsupported(format!(
+                "{}: stateful conversational sessions are not supported",
+                self.desc.id
+            )));
+        }
+        Ok(Box::new(MtSession {
+            ctx: req.seed.unwrap_or(0),
+            seed: req.seed.unwrap_or(0),
+            behavior: self.behavior,
+        }))
+    }
+}
+
+/// Path B: the stateful session. It keeps the running digest warm across `step`s — the exact same
+/// per-turn `mt_process` path A runs, so the two are byte-identical (unless `session_diverges`).
+struct MtSession {
+    ctx: u64,
+    seed: u64,
+    behavior: MtBehavior,
+}
+
+impl ConversationSession for MtSession {
+    fn step(
+        &mut self,
+        turn: &ConversationTurn,
+        on_chunk: &mut dyn FnMut(AudioChunk),
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<AudioTrack> {
+        on_progress(Progress::Decoding);
+        match mt_process(&mut self.ctx, turn, self.seed, self.behavior.ignore_history) {
+            Some(mut reply) => {
+                // Broken variant: perturb the session output so path B diverges from path A.
+                if self.behavior.session_diverges {
+                    reply.samples[0] += 1.0;
+                }
+                // Stream the reply as two contiguous chunks (exercises the per-turn reassembly law).
+                let mid = reply.samples.len() / 2;
+                on_chunk(AudioChunk {
+                    samples: reply.samples[..mid].to_vec(),
+                    sample_rate: reply.sample_rate,
+                    channels: reply.channels,
+                    index: 0,
+                });
+                on_chunk(AudioChunk {
+                    samples: reply.samples[mid..].to_vec(),
+                    sample_rate: reply.sample_rate,
+                    channels: reply.channels,
+                    index: 1,
+                });
+                Ok(reply)
+            }
+            // A context turn is folded into the session and echoes its provided audio.
+            None => Ok(turn.audio.clone().unwrap_or_default()),
+        }
+    }
+}
+
+#[test]
+fn good_multi_turn_stub_passes_the_check() {
+    // Honest stub advertising BOTH paths: A≡B byte-identical, conditioned-on-prior, deterministic.
+    let g = MultiTurnStubAudioGen::new(MtBehavior::both());
+    check_multi_turn(&g, &cheap()).unwrap();
+}
+
+#[test]
+fn good_multi_turn_stub_passes_full_conformance() {
+    // A conversational generator must also be a well-behaved one-shot audio generator.
+    audio_conformance(
+        || MultiTurnStubAudioGen::boxed(MtBehavior::both()),
+        &cheap(),
+    );
+}
+
+#[test]
+fn history_only_multi_turn_stub_passes_the_check() {
+    // Advertises only path A: path A works, and open_conversation is rejected as typed Unsupported.
+    let g = MultiTurnStubAudioGen::new(MtBehavior {
+        session: false,
+        ..MtBehavior::both()
+    });
+    check_multi_turn(&g, &cheap()).unwrap();
+}
+
+#[test]
+fn session_only_multi_turn_stub_passes_the_check() {
+    // Advertises only path B: path B works, and a ConversationHistory request is rejected as
+    // Unsupported (path A gated by the conditioning allowlist).
+    let g = MultiTurnStubAudioGen::new(MtBehavior {
+        history: false,
+        ..MtBehavior::both()
+    });
+    check_multi_turn(&g, &cheap()).unwrap();
+}
+
+#[test]
+fn history_ignoring_multi_turn_stub_fails_conditioned_on_prior() {
+    // The headline dishonest stub: renders each turn context-free, so a turn WITH prior context is
+    // byte-identical to it rendered ALONE.
+    let g = MultiTurnStubAudioGen::new(MtBehavior {
+        ignore_history: true,
+        ..MtBehavior::both()
+    });
+    let err = check_multi_turn(&g, &cheap()).unwrap_err();
+    assert!(
+        err.contains("ignore the conversation history"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn session_diverging_multi_turn_stub_fails_a_equiv_b() {
+    // A subtler dishonest stub: honest per-path, but the session render diverges from the batch
+    // render — the A≡B equivalence law catches it.
+    let g = MultiTurnStubAudioGen::new(MtBehavior {
+        session_diverges: true,
+        ..MtBehavior::both()
+    });
+    let err = check_multi_turn(&g, &cheap()).unwrap_err();
+    assert!(err.contains("A≡B equivalence law"), "got: {err}");
+}
+
+#[test]
+fn single_turn_stub_rejects_conversation_and_session() {
+    // The default (neither-path) stub must reject a ConversationHistory request AND open_conversation
+    // as the typed Unsupported — the additive contract does not perturb single-turn providers.
+    let g = StubAudioGen::new(STUB_ID, Behavior::good());
+    check_multi_turn(&g, &cheap()).unwrap();
+    let req = GenerationRequest {
+        conditioning: vec![Conditioning::ConversationHistory {
+            turns: vec![ConversationTurn {
+                role: ConversationRole::Assistant,
+                text: "hi".into(),
+                audio: None,
+            }],
+        }],
+        ..Default::default()
+    };
+    assert!(matches!(g.validate(&req), Err(Error::Unsupported(_))));
+    assert!(matches!(
+        g.open_conversation(&req),
+        Err(Error::Unsupported(_))
+    ));
+}
+
+#[test]
+#[should_panic(expected = "audio conformance FAILED")]
+fn conformance_panics_on_a_history_ignoring_multi_turn_stub() {
+    audio_conformance(
+        || {
+            MultiTurnStubAudioGen::boxed(MtBehavior {
+                ignore_history: true,
+                ..MtBehavior::both()
+            })
+        },
+        &cheap(),
+    );
 }

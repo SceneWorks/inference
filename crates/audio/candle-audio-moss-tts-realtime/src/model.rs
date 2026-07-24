@@ -20,8 +20,9 @@ use std::sync::{Arc, Mutex};
 
 use candle_audio::candle_core::DType;
 use candle_audio::gen_core::{
-    self, AudioChunk, AudioTrack, Capabilities, GenerationOutput, GenerationRequest, Generator,
-    LoadSpec, Modality, ModelDescriptor, Progress, WeightsSource,
+    self, AudioChunk, AudioTrack, CancelFlag, Capabilities, ConversationSession, ConversationTurn,
+    GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality, ModelDescriptor, Progress,
+    WeightsSource,
 };
 use candle_nn::VarBuilder;
 use tokenizers::Tokenizer;
@@ -29,6 +30,7 @@ use tokenizers::Tokenizer;
 use crate::backbone::Backbone;
 use crate::codec::MossAudioCodec;
 use crate::config::MossTtsRealtimeConfig;
+use crate::conversation::{self, ConvState, PreparedTurn, Role};
 use crate::decode::{build_prompt_frames, Decoder};
 use crate::local::LocalTransformer;
 
@@ -112,7 +114,12 @@ pub fn descriptor() -> ModelDescriptor {
             supports_true_cfg: false,
             // Voice cloning (sc-14149): a reference clip is supplied as `Conditioning::ReferenceAudio`
             // and encoded into the timbre prompt. Absent it, the model uses its default voice.
-            conditioning: vec![gen_core::ConditioningKind::ReferenceAudio],
+            // Multi-turn (sc-14151): a `Conditioning::ConversationHistory` drives the stateless path A
+            // — the whole conversation rides in one `generate`.
+            conditioning: vec![
+                gen_core::ConditioningKind::ReferenceAudio,
+                gen_core::ConditioningKind::ConversationHistory,
+            ],
             supports_lora: false,
             supports_lokr: false,
             samplers: vec![],
@@ -133,6 +140,10 @@ pub fn descriptor() -> ModelDescriptor {
             supports_sequential_offload: false,
             supports_streaming: true,
             supports_multi_speaker: false,
+            // Multi-turn conversational continuation (sc-14151), both selectable shapes: the stateless
+            // history-in-request path (A) and the stateful warm-KV session (B).
+            supports_conversation_history: true,
+            supports_conversation_session: true,
             max_speakers: None,
         },
     }
@@ -144,7 +155,13 @@ pub(crate) fn validate_request(
     req: &GenerationRequest,
 ) -> gen_core::Result<()> {
     let id = desc.id;
-    if req.prompt.trim().is_empty() {
+    // A multi-turn conversation (sc-14151) carries its text in the turns, so `prompt` may be empty;
+    // a single-turn request must supply the text to speak in `prompt`.
+    let has_conversation = req
+        .conditioning
+        .iter()
+        .any(|c| matches!(c, gen_core::Conditioning::ConversationHistory { .. }));
+    if !has_conversation && req.prompt.trim().is_empty() {
         return Err(gen_core::Error::Msg(format!(
             "{id}: prompt (the text to speak) must not be empty"
         )));
@@ -258,6 +275,68 @@ fn mono_samples(track: &AudioTrack) -> Vec<f32> {
         .collect()
 }
 
+/// Prepare one contract [`ConversationTurn`] for the engine (sc-14151): map its role and encode its
+/// PCM audio (if any) to RVQ frames through the codec (a user turn's speech, or a resumed assistant
+/// turn). A synthesis turn (assistant, no audio) prepares with `audio_codes: None`.
+fn prepare_turn(
+    codec: &MossAudioCodec,
+    turn: &ConversationTurn,
+    index: usize,
+) -> gen_core::Result<PreparedTurn> {
+    let role = match turn.role {
+        gen_core::ConversationRole::User => Role::User,
+        gen_core::ConversationRole::Assistant => Role::Assistant,
+    };
+    let audio_codes = match &turn.audio {
+        Some(track) => {
+            let codes = codec
+                .encode(&mono_samples(track), track.sample_rate)
+                .map_err(|e| {
+                    gen_core::Error::Msg(format!(
+                        "{MODEL_ID}: encode conversation turn {index} audio: {e}"
+                    ))
+                })?;
+            if codes.is_empty() {
+                return Err(gen_core::Error::Msg(format!(
+                    "{MODEL_ID}: conversation turn {index} audio too short to encode (needs ≥ {} \
+                     samples at {} Hz)",
+                    codec.samples_per_frame(),
+                    codec.sample_rate(),
+                )));
+            }
+            Some(codes)
+        }
+        None => None,
+    };
+    Ok(PreparedTurn {
+        role,
+        text: turn.text.clone(),
+        audio_codes,
+    })
+}
+
+/// Emit `pcm` as one or more contiguous [`AudioChunk`]s of at most `block_samples` samples each,
+/// advancing the running `chunk_index`. Concatenating every emitted chunk reproduces `pcm` exactly
+/// (the reassembly law); a whole turn is streamed as it is decoded.
+fn emit_pcm_as_chunks(
+    pcm: &[f32],
+    sample_rate: u32,
+    block_samples: usize,
+    chunk_index: &mut usize,
+    on_chunk: &mut dyn FnMut(AudioChunk),
+) {
+    let block = block_samples.max(1);
+    for slice in pcm.chunks(block) {
+        on_chunk(AudioChunk {
+            samples: slice.to_vec(),
+            sample_rate,
+            channels: 1,
+            index: *chunk_index,
+        });
+        *chunk_index += 1;
+    }
+}
+
 impl MossTtsRealtimeGenerator {
     fn pipeline(&self) -> gen_core::Result<Arc<Loaded>> {
         let mut guard = lock_recover(&self.loaded);
@@ -296,6 +375,117 @@ impl MossTtsRealtimeGenerator {
             )));
         }
         Ok(Some(codes))
+    }
+
+    /// Extract and prepare the request's [`gen_core::Conditioning::ConversationHistory`] turns
+    /// (sc-14151, path A/B): map each contract turn and encode its provided audio to RVQ. Returns
+    /// `None` for a single-turn request (no conversation), so the caller falls back to the single-turn
+    /// synthesis path.
+    fn conversation_turns(
+        &self,
+        req: &GenerationRequest,
+    ) -> gen_core::Result<Option<Vec<PreparedTurn>>> {
+        let Some(turns) = req.conditioning.iter().find_map(|c| match c {
+            gen_core::Conditioning::ConversationHistory { turns } => Some(turns),
+            _ => None,
+        }) else {
+            return Ok(None);
+        };
+        let rvq = self.pipeline()?.decoder.cfg.rvq;
+        let codec = self.codec(rvq)?;
+        let mut prepared = Vec::with_capacity(turns.len());
+        for (i, turn) in turns.iter().enumerate() {
+            prepared.push(prepare_turn(codec.as_ref(), turn, i)?);
+        }
+        Ok(Some(prepared))
+    }
+
+    /// **Path A** (stateless history-in-request): render a whole conversation into one track — the
+    /// assistant replies concatenated — over a fresh warm-across-turns cache
+    /// ([`conversation::render_conversation`]), decoding each synthesized turn's RVQ frames through the
+    /// codec and streaming them as chunks. The voice-clone timbre (`Conditioning::ReferenceAudio`) is
+    /// held constant across the whole conversation. `generate` discards the chunk sink; the returned
+    /// track is byte-identical to the concatenated stream and to the stateful session render (A≡B).
+    fn synthesize_conversation(
+        &self,
+        req: &GenerationRequest,
+        turns: &[PreparedTurn],
+        on_chunk: &mut dyn FnMut(AudioChunk),
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<AudioTrack> {
+        let pipeline = self.pipeline()?;
+        let codec = self.codec(pipeline.decoder.cfg.rvq)?;
+        let voice_clone = self.reference_codes(req)?;
+        let base_seed = req.seed.unwrap_or(DEFAULT_SAMPLING_SEED);
+        let budget = frame_budget(req);
+        let synth_turns = turns
+            .iter()
+            .filter(|t| t.role == Role::Assistant && t.audio_codes.is_none())
+            .count();
+        let total = (synth_turns.max(1) * budget) as u32;
+
+        let cancel = req.cancel.clone();
+        let probe = move || cancel.is_cancelled();
+
+        let rendered = {
+            let mut frame_count = 0u32;
+            let mut on_frame =
+                |_step: usize, _frame: &[u32]| -> candle_audio::candle_core::Result<()> {
+                    frame_count = (frame_count + 1).min(total);
+                    on_progress(Progress::Step {
+                        current: frame_count,
+                        total,
+                    });
+                    Ok(())
+                };
+            conversation::render_conversation(
+                &pipeline.decoder,
+                &pipeline.tokenizer,
+                &pipeline.decoder.cfg,
+                voice_clone.as_deref(),
+                turns,
+                base_seed,
+                budget,
+                &probe,
+                &mut on_frame,
+            )
+            .map_err(gen_core::Error::Msg)?
+        };
+        let Some(rendered) = rendered else {
+            return Err(gen_core::Error::Canceled);
+        };
+        on_progress(Progress::Decoding);
+
+        // Decode each synthesized turn's frames independently (they are separate utterances), stream
+        // them as chunks, and concatenate into the assistant's side of the conversation. The decode is
+        // per *turn* (not per block as the single-turn `StreamingChunker` path is): first-chunk latency
+        // is one whole turn, not one block — the multi-turn session trades intra-turn streaming for the
+        // per-turn independence that keeps A (batch) and B (session) byte-identical.
+        let block_samples = DEFAULT_FRAMES_PER_BLOCK * codec.samples_per_frame();
+        let mut all: Vec<f32> = Vec::new();
+        let mut chunk_index = 0usize;
+        for frames in &rendered.turns {
+            if frames.is_empty() {
+                continue;
+            }
+            let pcm = codec
+                .decode_frames(frames, &probe)
+                .map_err(|e| gen_core::Error::Msg(format!("{MODEL_ID}: codec decode: {e}")))?
+                .ok_or(gen_core::Error::Canceled)?;
+            emit_pcm_as_chunks(&pcm, SAMPLE_RATE, block_samples, &mut chunk_index, on_chunk);
+            all.extend_from_slice(&pcm);
+        }
+        if all.is_empty() {
+            return Err(gen_core::Error::Msg(format!(
+                "{MODEL_ID}: conversation produced no assistant audio"
+            )));
+        }
+        Ok(AudioTrack {
+            samples: all,
+            sample_rate: SAMPLE_RATE,
+            channels: 1,
+            ..Default::default()
+        })
     }
 
     /// Run the AR brain on real weights and return the emitted RVQ frames (each `rvq` codebook
@@ -392,6 +582,10 @@ impl MossTtsRealtimeGenerator {
         if req.cancel.is_cancelled() {
             return Err(gen_core::Error::Canceled);
         }
+        // Multi-turn (sc-14151): a ConversationHistory request renders the whole conversation (path A).
+        if let Some(turns) = self.conversation_turns(req)? {
+            return self.synthesize_conversation(req, turns.as_slice(), on_chunk, on_progress);
+        }
         let pipeline = self.pipeline()?;
         let codec = self.codec(pipeline.decoder.cfg.rvq)?;
 
@@ -486,6 +680,146 @@ impl Generator for MossTtsRealtimeGenerator {
     ) -> gen_core::Result<GenerationOutput> {
         let track = self.synthesize(req, on_chunk, on_progress)?;
         Ok(GenerationOutput::Audio(track))
+    }
+
+    /// **Path B** (stateful session, sc-14151): open a conversational session that keeps the backbone
+    /// KV cache warm across turns. `req` carries the conversation-level constants read once — the
+    /// voice-clone timbre (`Conditioning::ReferenceAudio`, held constant across the conversation), the
+    /// base seed, and the per-turn frame budget; per-turn text + audio arrive through
+    /// [`ConversationSession::step`]. The session drives the identical [`conversation::advance_turn`]
+    /// core as the stateless conversation render (`synthesize_conversation`), so the two render
+    /// byte-identical audio.
+    fn open_conversation(
+        &self,
+        req: &GenerationRequest,
+    ) -> gen_core::Result<Box<dyn ConversationSession + '_>> {
+        // The audio-surface floor (voice-clone conditioning, sample rate, …) — but NOT the single-turn
+        // prompt requirement: a session's text arrives per turn, so `req.prompt` may be empty.
+        self.descriptor
+            .capabilities
+            .validate_request_audio(MODEL_ID, req)?;
+        let pipeline = self.pipeline()?;
+        let codec = self.codec(pipeline.decoder.cfg.rvq)?;
+        let voice_clone = self.reference_codes(req)?;
+        let base_seed = req.seed.unwrap_or(DEFAULT_SAMPLING_SEED);
+        let budget = frame_budget(req);
+        let state = ConvState::new(&pipeline.decoder);
+        Ok(Box::new(MossConversationSession {
+            loaded: pipeline,
+            codec,
+            voice_clone,
+            base_seed,
+            budget,
+            state,
+            cancel: req.cancel.clone(),
+            turn_index: 0,
+        }))
+    }
+}
+
+/// The stateful [`ConversationSession`] (sc-14151, path B) — it owns the loaded model + codec and
+/// holds the warm cache across [`step`](ConversationSession::step)s, driving the shared
+/// [`conversation::advance_turn`] core one turn at a time. Byte-identical to the batch render
+/// ([`MossTtsRealtimeGenerator::synthesize_conversation`]) for the same conversation + seed.
+struct MossConversationSession {
+    loaded: Arc<Loaded>,
+    codec: Arc<MossAudioCodec>,
+    voice_clone: Option<Vec<Vec<u32>>>,
+    base_seed: u64,
+    budget: usize,
+    state: ConvState,
+    cancel: CancelFlag,
+    turn_index: usize,
+}
+
+impl ConversationSession for MossConversationSession {
+    fn step(
+        &mut self,
+        turn: &ConversationTurn,
+        on_chunk: &mut dyn FnMut(AudioChunk),
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<AudioTrack> {
+        if self.cancel.is_cancelled() {
+            return Err(gen_core::Error::Canceled);
+        }
+        // A synthesis turn (assistant, no audio) is generated + decoded; any other turn is folded into
+        // the warm cache as context and echoes its provided PCM unchanged (re-decoding the re-encoded
+        // codes would not reproduce it — encode∘decode is not identity).
+        let is_synth =
+            matches!(turn.role, gen_core::ConversationRole::Assistant) && turn.audio.is_none();
+        let prepared = prepare_turn(self.codec.as_ref(), turn, self.turn_index)?;
+        self.turn_index += 1;
+
+        let budget = self.budget;
+        let base_seed = self.base_seed;
+        let cancel = self.cancel.clone();
+        let probe = move || cancel.is_cancelled();
+        let total = budget as u32;
+
+        let frames = {
+            // Disjoint field borrows: the decoder/tokenizer/voice-clone (shared) and the cache state
+            // (mutable) come from different fields, so this is a legal simultaneous borrow of `self`.
+            let decoder = &self.loaded.decoder;
+            let tokenizer = &self.loaded.tokenizer;
+            let cfg = &self.loaded.decoder.cfg;
+            let voice_clone = self.voice_clone.as_deref();
+            let state = &mut self.state;
+            let mut frame_count = 0u32;
+            let mut on_frame =
+                |_step: usize, _frame: &[u32]| -> candle_audio::candle_core::Result<()> {
+                    frame_count = (frame_count + 1).min(total);
+                    on_progress(Progress::Step {
+                        current: frame_count,
+                        total,
+                    });
+                    Ok(())
+                };
+            conversation::advance_turn(
+                decoder,
+                tokenizer,
+                cfg,
+                voice_clone,
+                state,
+                &prepared,
+                base_seed,
+                budget,
+                &probe,
+                &mut on_frame,
+            )
+            .map_err(gen_core::Error::Msg)?
+        };
+        let Some(frames) = frames else {
+            return Err(gen_core::Error::Canceled);
+        };
+        on_progress(Progress::Decoding);
+
+        // A context turn: it is now in the warm cache; return its provided audio unchanged.
+        if !is_synth {
+            return Ok(turn.audio.clone().unwrap_or_default());
+        }
+        // A synthesized reply: decode its RVQ frames to PCM and stream them as chunks.
+        if frames.is_empty() {
+            return Ok(AudioTrack {
+                samples: Vec::new(),
+                sample_rate: SAMPLE_RATE,
+                channels: 1,
+                ..Default::default()
+            });
+        }
+        let block_samples = DEFAULT_FRAMES_PER_BLOCK * self.codec.samples_per_frame();
+        let pcm = self
+            .codec
+            .decode_frames(&frames, &probe)
+            .map_err(|e| gen_core::Error::Msg(format!("{MODEL_ID}: codec decode: {e}")))?
+            .ok_or(gen_core::Error::Canceled)?;
+        let mut chunk_index = 0usize;
+        emit_pcm_as_chunks(&pcm, SAMPLE_RATE, block_samples, &mut chunk_index, on_chunk);
+        Ok(AudioTrack {
+            samples: pcm,
+            sample_rate: SAMPLE_RATE,
+            channels: 1,
+            ..Default::default()
+        })
     }
 }
 

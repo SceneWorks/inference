@@ -1041,3 +1041,526 @@ fn moss_tts_realtime_voice_clone() {
          (clone↔ref {sim_clone:.3} vs default↔ref {sim_def:.3})"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// sc-14151 — multi-turn conversational continuation, the model's headline capability: turn N's speech
+// conditioned on the prior turns, through BOTH the stateless history-in-request path (A,
+// `generate` + `Conditioning::ConversationHistory`) and the stateful warm-KV session (B,
+// `open_conversation` + `step`). The DoD gate on real weights.
+// ---------------------------------------------------------------------------------------------
+
+/// CAMPPlus x-vector cosine, loaded from the Chatterbox snapshot (its S3Gen checkpoint holds the
+/// speaker encoder) — the same speaker-similarity metric the voice-clone gate uses.
+fn campplus_cos(cb_snapshot: &str) -> impl Fn(&[f32], &[f32]) -> f32 {
+    let campplus =
+        candle_audio_chatterbox::Campplus::from_snapshot(std::path::Path::new(cb_snapshot))
+            .expect("load CAMPPlus speaker encoder from the Chatterbox snapshot");
+    move |a: &[f32], b: &[f32]| {
+        let ea = campplus.embed(a, 24_000).expect("x-vector embed a");
+        let eb = campplus.embed(b, 24_000).expect("x-vector embed b");
+        let dot: f32 = ea.iter().zip(&eb).map(|(x, y)| x * y).sum();
+        let na = ea.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let nb = eb.iter().map(|x| x * x).sum::<f32>().sqrt();
+        dot / (na * nb).max(1e-9)
+    }
+}
+
+/// The DoD gate for multi-turn conversational continuation (sc-14151). A short scripted conversation
+/// renders end-to-end through BOTH shapes and must satisfy:
+///
+/// - **A≡B byte-identical** — the whole conversation rendered in one stateless `generate` (path A)
+///   equals the concatenation of the per-turn stateful `session.step`s (path B), sample-for-sample —
+///   the session is a warm-cache optimization of the batch render, not a different computation.
+/// - **each turn intelligible** — every synthesized reply transcribes back to its text within the CER
+///   bound (a later turn that collapsed to silence/babble fails here).
+/// - **conditioned on the prior turns** — the *same* target turn at the *same* seed, rendered after
+///   *different* prior context, produces *different* audio (a provider that ignores the conversation
+///   history renders it identically); and the assistant turns are the **same speaker** across the
+///   conversation (CAMPPlus x-vector cosine above a bound — voice/prosody continuity).
+/// - **deterministic** — the same conversation + seed re-renders byte-identical.
+#[test]
+#[ignore = "real weights: MOSS-TTS-Realtime AR + codec + whisper_base + Chatterbox CAMPPlus; run with --ignored --nocapture"]
+fn moss_tts_realtime_multi_turn_conversation() {
+    use candle_audio_whisper::gen_core::{
+        AudioTrack as WAudioTrack, LoadSpec as WLoadSpec, TimestampGranularity, TranscribeOptions,
+        TranscribeRequest, TranscribeTask, WeightsSource as WWeightsSource,
+    };
+    use moss::gen_core::{AudioTrack, Conditioning, ConversationRole, ConversationTurn};
+
+    let generator = load();
+    let wspec = WLoadSpec::new(WWeightsSource::Dir(PathBuf::from(
+        std::env::var("WHISPER_SNAPSHOT")
+            .expect("set WHISPER_SNAPSHOT to an openai/whisper-base dir"),
+    )));
+    let transcriber = candle_audio_whisper::provider_registry()
+        .expect("whisper registry")
+        .load_transcriber(candle_audio_whisper::MODEL_ID, &wspec)
+        .expect("whisper_base loads");
+    let transcribe = |track: &AudioTrack| {
+        let treq = TranscribeRequest {
+            audio: WAudioTrack {
+                samples: track.samples.clone(),
+                sample_rate: track.sample_rate,
+                channels: track.channels,
+                ..Default::default()
+            },
+            options: TranscribeOptions {
+                language: Some("en".into()),
+                task: TranscribeTask::Transcribe,
+                timestamps: TimestampGranularity::None,
+            },
+            ..Default::default()
+        };
+        normalize(
+            &transcriber
+                .transcribe(&treq, &mut |_| {})
+                .expect("transcribe")
+                .text,
+        )
+    };
+
+    let asst = |t: &str| ConversationTurn {
+        role: ConversationRole::Assistant,
+        text: t.to_string(),
+        audio: None,
+    };
+    // A conversation-level request (seed + audio params); the text rides in the turns.
+    let conv_audio = || {
+        Some(AudioParams {
+            target_duration: Some(8.0),
+            language: Some("en".to_string()),
+            sample_rate: Some(24_000),
+            ..Default::default()
+        })
+    };
+    let conv_req = |turns: Vec<ConversationTurn>| GenerationRequest {
+        prompt: String::new(),
+        audio: conv_audio(),
+        seed: Some(20_260_719),
+        conditioning: vec![Conditioning::ConversationHistory { turns }],
+        ..Default::default()
+    };
+    let open_req = || GenerationRequest {
+        prompt: String::new(),
+        audio: conv_audio(),
+        seed: Some(20_260_719),
+        ..Default::default()
+    };
+
+    let t0 = "The weather is very nice this afternoon.";
+    let t1 = "The train arrives at nine in the morning.";
+
+    // --- Path A: render the whole conversation in one generate (assistant replies concatenated). ---
+    let track_a = match generator
+        .generate(&conv_req(vec![asst(t0), asst(t1)]), &mut |_| {})
+        .expect("path A: generate the conversation")
+    {
+        GenerationOutput::Audio(t) => t,
+        other => panic!("expected Audio, got {other:?}"),
+    };
+
+    // --- Path B: a stateful session, one step per turn. ---
+    let mut session = generator
+        .open_conversation(&open_req())
+        .expect("path B: open the conversational session");
+    let b0 = match_audio(
+        session.step(&asst(t0), &mut |_| {}, &mut |_| {}),
+        "path B: step turn 0",
+    );
+    let b1 = match_audio(
+        session.step(&asst(t1), &mut |_| {}, &mut |_| {}),
+        "path B: step turn 1",
+    );
+    session.finish().expect("path B: finish session");
+    let b_concat: Vec<f32> = b0.samples.iter().chain(&b1.samples).copied().collect();
+
+    println!(
+        "multi-turn: path A {} samples ({:.2}s); path B turns {} + {} = {} samples",
+        track_a.samples.len(),
+        track_a.samples.len() as f32 / 24_000.0,
+        b0.samples.len(),
+        b1.samples.len(),
+        b_concat.len(),
+    );
+
+    // === The A≡B equivalence law: byte-identical. ===
+    assert_eq!(
+        track_a.samples, b_concat,
+        "A≡B: the stateless batch render must equal the concatenated stateful session steps, \
+         sample-for-sample (the session is a warm-cache optimization of generate, not a different \
+         computation)"
+    );
+
+    // === Each turn intelligible (per-turn ASR CER, using the session's per-turn tracks). ===
+    for (text, track) in [(t0, &b0), (t1, &b1)] {
+        assert!(!track.samples.is_empty(), "empty audio for turn {text:?}");
+        let cer = character_error_rate(&normalize(text), &transcribe(track));
+        println!(
+            "multi-turn: turn {text:?} CER {cer:.3} ({:.2}s)",
+            track.samples.len() as f32 / 24_000.0
+        );
+        assert!(
+            cer <= MAX_PROMPT_CER,
+            "turn {text:?} is not intelligible (CER {cer:.3}) — a later turn that collapsed to \
+             silence/babble fails here"
+        );
+    }
+
+    // === Conditioned on the prior turns: the SAME target turn at the SAME seed (ordinal 1 in both),
+    // rendered after DIFFERENT prior context, must differ. Same-seed isolates the effect to the
+    // conversation history — a provider that ignores it renders the two byte-identical (corr 1.0).
+    // NOTE: two different prior turns also shift the target block's absolute cache offset, so this
+    // gate confirms the target *depends on* the conversation but does not by itself isolate
+    // attention-over-prior-content from position shift; the load-bearing proof that a warm prefill
+    // genuinely attends over the prior turns' KV is the weightless
+    // `backbone::tests::warm_cache_second_prefill_matches_full_recompute` mask-equivalence test. ===
+    let render_target_after = |ctx: &str| -> AudioTrack {
+        let mut s = generator
+            .open_conversation(&open_req())
+            .expect("open session for the discriminator");
+        match_audio(
+            s.step(&asst(ctx), &mut |_| {}, &mut |_| {}),
+            "discriminator: context turn",
+        );
+        match_audio(
+            s.step(&asst(t1), &mut |_| {}, &mut |_| {}),
+            "discriminator: target turn",
+        )
+    };
+    let after_weather = render_target_after("Let me tell you about the local weather forecast.");
+    let after_schedule = render_target_after("Here is today's train and bus schedule.");
+    let ctx_corr = pearson(&after_weather.samples, &after_schedule.samples);
+    println!("multi-turn: same-turn-different-context corr {ctx_corr:.3}");
+    assert!(
+        ctx_corr < 0.99,
+        "the target turn must depend on the prior turn — the same turn at the same seed after two \
+         different contexts produced near-identical audio (corr {ctx_corr:.3}), so the provider \
+         appears to ignore the conversation history"
+    );
+
+    // === Determinism: the same conversation + seed re-renders byte-identical. ===
+    let track_a2 = match generator
+        .generate(&conv_req(vec![asst(t0), asst(t1)]), &mut |_| {})
+        .expect("path A re-render")
+    {
+        GenerationOutput::Audio(t) => t,
+        other => panic!("expected Audio, got {other:?}"),
+    };
+    assert_eq!(
+        track_a.samples, track_a2.samples,
+        "the same conversation + seed must re-render byte-identical (per-conversation determinism)"
+    );
+
+    // === Cross-turn speaker continuity (CAMPPlus x-vector): the assistant is the same speaker across
+    // turns. Required — the DoD's voice/prosody-continuity proof. ===
+    let cb = std::env::var("CHATTERBOX_SNAPSHOT")
+        .expect("set CHATTERBOX_SNAPSHOT to a Chatterbox snapshot dir (CAMPPlus speaker encoder)");
+    let cos = campplus_cos(&cb);
+    let cross_turn_sim = cos(&b0.samples, &b1.samples);
+    // A conversational voice-agent's turns are the same synthesized speaker; distinct speakers score
+    // well below this in the CAMPPlus space (the voice-clone gate's default↔ref sat ~0.79 for a
+    // *matched* speaker, and cross-speaker pairs sit far lower).
+    println!("multi-turn: cross-turn speaker similarity (CAMPPlus) {cross_turn_sim:.3}");
+    assert!(
+        cross_turn_sim > 0.5,
+        "the assistant's turns must be the same speaker across the conversation (cross-turn CAMPPlus \
+         cosine {cross_turn_sim:.3}) — a later turn drifting to a different voice fails here"
+    );
+}
+
+/// Unwrap a `session.step` result to its `AudioTrack`, panicking with `ctx` on error.
+fn match_audio(
+    r: candle_audio_moss_tts_realtime::gen_core::Result<
+        candle_audio_moss_tts_realtime::gen_core::AudioTrack,
+    >,
+    ctx: &str,
+) -> candle_audio_moss_tts_realtime::gen_core::AudioTrack {
+    r.unwrap_or_else(|e| panic!("{ctx}: {e}"))
+}
+
+/// Load `whisper_base` and return a transcribe closure (shared by the multi-turn real-weight tests).
+fn whisper_transcriber() -> impl Fn(&candle_audio_moss_tts_realtime::gen_core::AudioTrack) -> String
+{
+    use candle_audio_whisper::gen_core::{
+        AudioTrack as WAudioTrack, LoadSpec as WLoadSpec, TimestampGranularity, TranscribeOptions,
+        TranscribeRequest, TranscribeTask, WeightsSource as WWeightsSource,
+    };
+    let wspec = WLoadSpec::new(WWeightsSource::Dir(PathBuf::from(
+        std::env::var("WHISPER_SNAPSHOT")
+            .expect("set WHISPER_SNAPSHOT to an openai/whisper-base dir"),
+    )));
+    let transcriber = candle_audio_whisper::provider_registry()
+        .expect("whisper registry")
+        .load_transcriber(candle_audio_whisper::MODEL_ID, &wspec)
+        .expect("whisper_base loads");
+    move |track: &candle_audio_moss_tts_realtime::gen_core::AudioTrack| {
+        let treq = TranscribeRequest {
+            audio: WAudioTrack {
+                samples: track.samples.clone(),
+                sample_rate: track.sample_rate,
+                channels: track.channels,
+                ..Default::default()
+            },
+            options: TranscribeOptions {
+                language: Some("en".into()),
+                task: TranscribeTask::Transcribe,
+                timestamps: TimestampGranularity::None,
+            },
+            ..Default::default()
+        };
+        normalize(
+            &transcriber
+                .transcribe(&treq, &mut |_| {})
+                .expect("transcribe")
+                .text,
+        )
+    }
+}
+
+/// The audio sub-block shared by the multi-turn conversation requests (8 s/turn, en, 24 kHz).
+fn conv_audio() -> Option<AudioParams> {
+    Some(AudioParams {
+        target_duration: Some(8.0),
+        language: Some("en".to_string()),
+        sample_rate: Some(24_000),
+        ..Default::default()
+    })
+}
+
+/// sc-14151 (M1) — the **user↔assistant** conversation shape (the reference voice-agent case): an
+/// assistant turn is synthesized conditioned on a preceding **user** turn (the reference
+/// `make_user_prompt` block — the user's own speech delay-aligned on the audio channels). This
+/// exercises `conversation::user_body_frames` end-to-end on real weights (the assistant-chaining DoD
+/// test does not feed a user turn). The user speech is bootstrapped from the model itself, so the test
+/// is self-contained (no external clip). Asserts: A≡B for the round; the assistant reply is
+/// intelligible; and the reply is conditioned on the user turn (a different user turn changes it).
+#[test]
+#[ignore = "real weights: MOSS-TTS-Realtime AR + codec + whisper_base; run with --ignored --nocapture"]
+fn moss_tts_realtime_multi_turn_user_context() {
+    use moss::gen_core::{AudioTrack, Conditioning, ConversationRole, ConversationTurn};
+
+    let generator = load();
+    let transcribe = whisper_transcriber();
+
+    // Bootstrap real "user" speech from the model (self-contained — the user turn needs real audio).
+    let user_speech = |text: &str| -> AudioTrack {
+        match generator
+            .generate(&fidelity_request(text), &mut |_| {})
+            .expect("bootstrap user audio")
+        {
+            GenerationOutput::Audio(t) => t,
+            other => panic!("expected Audio, got {other:?}"),
+        }
+    };
+    let user_turn = |text: &str, audio: AudioTrack| ConversationTurn {
+        role: ConversationRole::User,
+        text: text.to_string(),
+        audio: Some(audio),
+    };
+    let asst = |text: &str| ConversationTurn {
+        role: ConversationRole::Assistant,
+        text: text.to_string(),
+        audio: None,
+    };
+    let conv_req = |turns: Vec<ConversationTurn>| GenerationRequest {
+        prompt: String::new(),
+        audio: conv_audio(),
+        seed: Some(20_260_719),
+        conditioning: vec![Conditioning::ConversationHistory { turns }],
+        ..Default::default()
+    };
+    let open_req = || GenerationRequest {
+        prompt: String::new(),
+        audio: conv_audio(),
+        seed: Some(20_260_719),
+        ..Default::default()
+    };
+
+    let uc = "What time does the museum open on weekends?";
+    let reply = "The museum opens at ten on Saturdays and Sundays.";
+    let u_audio = user_speech(uc);
+
+    // Path A: [user, assistant] → the assistant reply is the only synthesized turn, so path A's output
+    // equals that single reply.
+    let a_reply = match generator
+        .generate(
+            &conv_req(vec![user_turn(uc, u_audio.clone()), asst(reply)]),
+            &mut |_| {},
+        )
+        .expect("path A: user→assistant round")
+    {
+        GenerationOutput::Audio(t) => t,
+        other => panic!("expected Audio, got {other:?}"),
+    };
+    // Path B: fold the user turn into the session, then synthesize the reply.
+    let mut session = generator
+        .open_conversation(&open_req())
+        .expect("open session");
+    let _user_echo = match_audio(
+        session.step(&user_turn(uc, u_audio.clone()), &mut |_| {}, &mut |_| {}),
+        "path B: user turn",
+    );
+    let b_reply = match_audio(
+        session.step(&asst(reply), &mut |_| {}, &mut |_| {}),
+        "path B: assistant reply",
+    );
+    assert_eq!(
+        a_reply.samples, b_reply.samples,
+        "A≡B for a user→assistant round (the batch render equals the session's reply)"
+    );
+
+    let cer = character_error_rate(&normalize(reply), &transcribe(&b_reply));
+    println!(
+        "multi-turn user-context: reply CER {cer:.3} ({:.2}s)",
+        b_reply.samples.len() as f32 / 24_000.0
+    );
+    assert!(
+        cer <= MAX_PROMPT_CER,
+        "the assistant reply after a user turn is not intelligible (CER {cer:.3}) — the \
+         make_user_prompt user-body conditioning is broken"
+    );
+
+    // Conditioned on the user turn: the SAME reply after a DIFFERENT user turn (its own bootstrapped
+    // speech) must differ — the reply depends on what the user said (their text AND audio).
+    let uc2 = "Where can I find a good vegetarian restaurant nearby?";
+    let u2_audio = user_speech(uc2);
+    let a_reply2 = match generator
+        .generate(
+            &conv_req(vec![user_turn(uc2, u2_audio), asst(reply)]),
+            &mut |_| {},
+        )
+        .expect("path A: different user turn")
+    {
+        GenerationOutput::Audio(t) => t,
+        other => panic!("expected Audio, got {other:?}"),
+    };
+    let corr = pearson(&a_reply.samples, &a_reply2.samples);
+    println!("multi-turn user-context: same-reply-different-user corr {corr:.3}");
+    assert!(
+        corr < 0.99,
+        "the assistant reply must depend on the user turn — the same reply after two different user \
+         turns produced near-identical audio (corr {corr:.3}), so the user turn is ignored"
+    );
+}
+
+/// sc-14151 (M2) — voice cloning **composed with a multi-turn conversation**: the cloned timbre is
+/// prefilled once and must be held constant across every turn. Asserts: A≡B still holds when a
+/// `ReferenceAudio` clip conditions the whole conversation; both turns are intelligible; and — the
+/// DoD's "held constant across the whole conversation" — the cloned output of **every** turn carries
+/// the reference speaker more than the default (no-clone) voice does (so the clone threads into the
+/// later turn, not only turn 0), and the turns are mutually the same speaker.
+#[test]
+#[ignore = "real weights: MOSS-TTS-Realtime AR + codec + whisper_base + Chatterbox CAMPPlus + MOSS_VOICECLONE_REF; run with --ignored --nocapture"]
+fn moss_tts_realtime_multi_turn_voice_clone() {
+    use moss::gen_core::{AudioTrack, Conditioning, ConversationRole, ConversationTurn};
+
+    let generator = load();
+    let transcribe = whisper_transcriber();
+    let ref_clip = read_f32le(
+        &std::env::var("MOSS_VOICECLONE_REF")
+            .expect("set MOSS_VOICECLONE_REF to a 24 kHz f32-LE mono reference clip"),
+    );
+    let ref_track = AudioTrack {
+        samples: ref_clip.clone(),
+        sample_rate: 24_000,
+        channels: 1,
+        ..Default::default()
+    };
+    let clone_cond = Conditioning::ReferenceAudio {
+        audio: ref_track,
+        strength: None,
+    };
+
+    let asst = |text: &str| ConversationTurn {
+        role: ConversationRole::Assistant,
+        text: text.to_string(),
+        audio: None,
+    };
+    let t0 = "The weather is very nice this afternoon.";
+    let t1 = "The train arrives at nine in the morning.";
+    // Extra conditioning (the voice clone) rides alongside the ConversationHistory.
+    let req = |extra: Vec<Conditioning>| {
+        let mut conditioning = vec![Conditioning::ConversationHistory {
+            turns: vec![asst(t0), asst(t1)],
+        }];
+        conditioning.extend(extra);
+        GenerationRequest {
+            prompt: String::new(),
+            audio: conv_audio(),
+            seed: Some(20_260_719),
+            conditioning,
+            ..Default::default()
+        }
+    };
+    let open_req = |extra: Vec<Conditioning>| GenerationRequest {
+        prompt: String::new(),
+        audio: conv_audio(),
+        seed: Some(20_260_719),
+        conditioning: extra,
+        ..Default::default()
+    };
+    let step2 = |extra: Vec<Conditioning>| -> (AudioTrack, AudioTrack) {
+        let mut s = generator
+            .open_conversation(&open_req(extra))
+            .expect("open session");
+        let a = match_audio(s.step(&asst(t0), &mut |_| {}, &mut |_| {}), "turn 0");
+        let b = match_audio(s.step(&asst(t1), &mut |_| {}, &mut |_| {}), "turn 1");
+        (a, b)
+    };
+
+    // Path A cloned conversation vs path B cloned session — A≡B must still hold WITH the clone.
+    let a_clone = match generator
+        .generate(&req(vec![clone_cond.clone()]), &mut |_| {})
+        .expect("path A: cloned conversation")
+    {
+        GenerationOutput::Audio(t) => t,
+        other => panic!("expected Audio, got {other:?}"),
+    };
+    let (c0, c1) = step2(vec![clone_cond.clone()]);
+    let b_concat: Vec<f32> = c0.samples.iter().chain(&c1.samples).copied().collect();
+    assert_eq!(
+        a_clone.samples, b_concat,
+        "A≡B must compose with voice cloning (cloned batch render == cloned session steps)"
+    );
+
+    // Both cloned turns intelligible.
+    for (text, track) in [(t0, &c0), (t1, &c1)] {
+        let cer = character_error_rate(&normalize(text), &transcribe(track));
+        println!("multi-turn voice-clone: cloned turn {text:?} CER {cer:.3}");
+        assert!(
+            cer <= MAX_PROMPT_CER,
+            "cloned turn {text:?} not intelligible (CER {cer:.3})"
+        );
+    }
+
+    // Default (no clone) per-turn, for the speaker-identity comparison.
+    let (d0, d1) = step2(vec![]);
+
+    let cb = std::env::var("CHATTERBOX_SNAPSHOT")
+        .expect("set CHATTERBOX_SNAPSHOT to a Chatterbox snapshot dir (CAMPPlus speaker encoder)");
+    let cos = campplus_cos(&cb);
+    // The clone must carry the reference speaker in EVERY turn — the DoD's "held constant across the
+    // whole conversation". Each cloned turn resembles the reference MORE than the default voice does.
+    let (sim_c0, sim_d0) = (cos(&c0.samples, &ref_clip), cos(&d0.samples, &ref_clip));
+    let (sim_c1, sim_d1) = (cos(&c1.samples, &ref_clip), cos(&d1.samples, &ref_clip));
+    let sim_cross = cos(&c0.samples, &c1.samples);
+    println!(
+        "multi-turn voice-clone speaker sim (CAMPPlus): turn0 clone↔ref {sim_c0:.3} vs default↔ref \
+         {sim_d0:.3}; turn1 clone↔ref {sim_c1:.3} vs default↔ref {sim_d1:.3}; cross-turn clone \
+         {sim_cross:.3}"
+    );
+    assert!(
+        sim_c0 > sim_d0 + 0.05,
+        "turn 0 must carry the reference speaker (clone↔ref {sim_c0:.3} vs default↔ref {sim_d0:.3})"
+    );
+    assert!(
+        sim_c1 > sim_d1 + 0.05,
+        "turn 1 must ALSO carry the reference speaker — the cloned voice must be held constant across \
+         the whole conversation, not just the first turn (clone↔ref {sim_c1:.3} vs default↔ref \
+         {sim_d1:.3})"
+    );
+    assert!(
+        sim_cross > 0.5,
+        "the cloned turns must be the same speaker as each other (cross-turn {sim_cross:.3})"
+    );
+}
