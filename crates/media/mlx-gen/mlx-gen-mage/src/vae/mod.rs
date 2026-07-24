@@ -1,14 +1,17 @@
 //! Mage-VAE — the one-step 128-channel / 16× codec — **owned by sc-14039**.
 //!
-//! Port of `_vendor/mage_flow/models/modules/mage_vae.py`. Add submodules under this directory
-//! (encoder / decoder / shared blocks); nothing outside it needs to change, which keeps this story
-//! parallel with the text-encoder and DiT ports.
+//! Port of `_vendor/mage_flow/models/modules/mage_vae.py`.
 //!
 //! ## Shape
 //!
-//! [`LATENT_CHANNELS`] 128, and [`VAE_DOWNSAMPLE_FACTOR`] 16 — fully convolutional, no
-//! global attention. State-dict prefixes: `student.dconv_encoder.*` for the encoder,
-//! `dconv_denoiser` / `y_embedder.decoder` for the decoder.
+//! [`LATENT_CHANNELS`] 128, and [`VAE_DOWNSAMPLE_FACTOR`] 16 — fully convolutional. The CoD
+//! decoder does carry attention, but it is **local** (independent 32×32 latent tiles), not global.
+//!
+//! State-dict prefixes: [`ENCODER_PREFIX`] `student.dconv_encoder.*` (342 tensors) and
+//! [`DECODER_PREFIX`] `pipeline.*` (497), verified against the published checkpoint by
+//! `tests/vae_decode_real_weights.rs`. (The scaffold originally recorded the decoder prefix as
+//! `dconv_denoiser`, taken from the epic description; the shipped weights use `pipeline`, and the
+//! denoiser's own submodules sit directly beneath it.)
 //!
 //! ## Encode is a single forward at t = 0
 //!
