@@ -58,7 +58,9 @@ pub const DEFAULT_CONTROL_SCALE: f32 = 0.6;
 pub const DEFAULT_N_CONTROL_BLOCKS: usize = 7;
 
 /// Overlay meta tensor (`[1]` f32) carrying the trained `inject_offset` (candle `META_INJECT_OFFSET`).
-const META_INJECT_OFFSET: &str = "meta.inject_offset";
+/// `pub(crate)` so the MLX control trainer ([`crate::control_train`]) writes it into the saved overlay
+/// under the SAME key this loader reads — the round-trip that lets a trained overlay load unchanged.
+pub(crate) const META_INJECT_OFFSET: &str = "meta.inject_offset";
 
 /// One control-branch block: a copy of a base single-stream block plus its zero-init output projection.
 struct ControlBlock {
@@ -131,6 +133,19 @@ impl Krea2ControlBranch {
     /// Number of copied branch blocks (`N`).
     pub fn num_blocks(&self) -> usize {
         self.blocks.len()
+    }
+
+    /// Toggle SDPA-segment gradient checkpointing on every branch block (sc-10177, training only —
+    /// the twin of [`Krea2Transformer::set_sdpa_checkpoint`](crate::transformer::Krea2Transformer::set_sdpa_checkpoint)
+    /// for the frozen main stack). When on, each branch block's fused SDPA runs inside an
+    /// `mlx::checkpoint` so its backward recomputes the attention instead of retaining the `[heads, s, s]`
+    /// probability matrix — bounding the branch's contribution to the first-step working set.
+    /// Numerically identical; the control trainer flips it on when reconstructing the branch from its
+    /// param map each step, inference never calls it (the branch loads with SDPA-checkpoint off).
+    pub(crate) fn set_sdpa_checkpoint(&mut self, on: bool) {
+        for cb in &mut self.blocks {
+            cb.block.set_sdpa_checkpoint(on);
+        }
     }
 
     /// The injection offset read from the overlay.
@@ -254,6 +269,13 @@ impl Krea2ControlBranch {
         let cap = multiply(&rms(main_img)?, scalar(tau))?;
         // min(1, cap / max(rn, ε)) — ε avoids a 0/0 at step 0 (res == 0 → factor 1, res stays 0).
         let factor = minimum(scalar(1.0), &divide(&cap, &maximum(&rn, scalar(1e-20))?)?)?;
+        // Treat the clamp factor as a CONSTANT w.r.t. autograd (candle's detached factor, control.rs:
+        // "stop-grad, like adaptive gradient clipping"): during control-branch training the gradient
+        // must flow through the scaled residual, NOT through the clamp magnitude — otherwise the branch
+        // is rewarded for shrinking its own RMS to lift the factor rather than for steering the image.
+        // `stop_gradient` is the identity on values (a forward no-op), so every inference path is
+        // bit-identical; it only detaches the branch (`res == 0` at step 0 still passes through as 0).
+        let factor = mlx_rs::stop_gradient(&factor)?;
         Ok(multiply(res, &factor)?)
     }
 }

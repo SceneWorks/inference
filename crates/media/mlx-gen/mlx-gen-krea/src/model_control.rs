@@ -14,8 +14,8 @@
 use mlx_gen::gen_core;
 use mlx_gen::{
     require_base_dir, require_control, AcceptedControlKinds, ConditioningKind, ControlBranch,
-    Error, GenerationOutput, GenerationRequest, Generator, LoadSpec, ModelDescriptor, Precision,
-    Progress, Quant, Residency, Result,
+    ControlKind, Error, GenerationOutput, GenerationRequest, Generator, LoadSpec, ModelDescriptor,
+    Precision, Progress, Quant, Residency, Result, WeightsSource,
 };
 
 use mlx_gen::default_seed;
@@ -55,10 +55,16 @@ pub fn descriptor() -> ModelDescriptor {
     d
 }
 
-/// A loaded Krea 2 Turbo pose-control generator: the cached descriptor + a component-residency strategy
-/// (the base Turbo text phase + DiT/VAE + the pose control branch).
+/// A loaded Krea 2 Turbo control generator: the cached descriptor + the loaded overlay's control kind
+/// (read from its sidecar, so the lane advertises what it can actually route) + a component-residency
+/// strategy (the base Turbo text phase + DiT/VAE + the control branch).
 pub struct KreaTurboControl {
     descriptor: ModelDescriptor,
+    /// The control kind the LOADED overlay carries — read from its `.json` sidecar at [`load`] and
+    /// surfaced through [`ControlBranch::accepted_control_kinds`], so a depth overlay advertises Depth
+    /// and a pose overlay advertises Pose (the branch/injection seam is modality-agnostic; only the
+    /// overlay differs). Absent/unrecognized sidecar → `Pose` (back-compat with the S0 overlays).
+    control_kind: ControlKind,
     /// Component-residency strategy (epic 10834 Phase 1, sc-11101; hoisted to the shared seam in
     /// sc-11125), selected from [`LoadSpec::offload_policy`]. `Resident` (default) holds the text phase +
     /// DiT + VAE + branch warm; `Sequential` holds only the per-phase loader closures and re-loads per
@@ -122,10 +128,47 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     // Fail fast — validate the whole spec up front for BOTH residencies (mirrors the pre-sc-11101 load
     // order): dense bf16, a base snapshot dir, the required control overlay, and no quant override.
     validate_control_spec(spec)?;
+    let control_kind = resolve_control_kind(spec)?;
     Ok(Box::new(KreaTurboControl {
         descriptor: descriptor(),
+        control_kind,
         residency: build_control_residency(spec)?,
     }))
+}
+
+/// Map a control-overlay sidecar `kind` string to the [`ControlKind`] the inference lane advertises.
+/// Both trainers write `"{control_type}_control_branch"` (candle + mlx identical); an unrecognized or
+/// absent kind defaults to `Pose` — the S0 pose overlays predate depth and any legacy checkpoint stays
+/// pose-routed.
+fn kind_from_sidecar_kind(kind: &str) -> ControlKind {
+    match kind {
+        "pose_control_branch" => ControlKind::Pose,
+        "depth_control_branch" => ControlKind::Depth,
+        "canny_control_branch" => ControlKind::Canny,
+        _ => ControlKind::Pose,
+    }
+}
+
+/// Resolve the loaded overlay's control kind from its `.json` sidecar (alongside `spec.control`), so the
+/// lane advertises what it can ACTUALLY route — a depth overlay → Depth, a pose overlay → Pose — rather
+/// than a static claim (a pose overlay advertising Depth would be a lie the router acts on). Reads only
+/// the small sidecar (no weights), so it is valid under both residencies at load time. A sharded-`Dir`
+/// overlay (no sidecar convention) or an absent/unreadable/parseless sidecar → `Pose` (back-compat).
+fn resolve_control_kind(spec: &LoadSpec) -> Result<ControlKind> {
+    let control = require_control(spec, KREA_2_TURBO_CONTROL_ID, "Krea 2 control overlay")?;
+    let sidecar = match control {
+        WeightsSource::File(p) => p.with_extension("json"),
+        WeightsSource::Dir(_) => return Ok(ControlKind::Pose),
+    };
+    let Ok(text) = std::fs::read_to_string(&sidecar) else {
+        return Ok(ControlKind::Pose);
+    };
+    let kind = serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|v| v.get("kind").and_then(|k| k.as_str()).map(str::to_string));
+    Ok(kind
+        .map(|k| kind_from_sidecar_kind(&k))
+        .unwrap_or(ControlKind::Pose))
 }
 
 /// The up-front spec validation shared by [`load`] and [`build_control_residency`] (fail-fast for BOTH
@@ -252,15 +295,19 @@ fn tier_from_bits(bits: Option<i32>) -> Option<Quant> {
     }
 }
 
-/// The pose branch is pose-only (`Only([Pose])`) and defaults an unset `control_scale` to the S0 mid
-/// value (0.6). All the resolve/validate-present boilerplate comes from the shared trait (sc-8241).
+/// The lane advertises the LOADED overlay's control kind (`Only([self.control_kind])`, resolved from the
+/// overlay sidecar — Pose or Depth) and defaults an unset `control_scale` to the S0 mid value (0.6). The
+/// branch + residual-injection seam is modality-agnostic (pose and depth flow through the same
+/// VAE-encoded control path); only the trained overlay differs, so a depth overlay routes Depth and a
+/// pose overlay routes Pose off the SAME code. All the resolve/validate-present boilerplate comes from
+/// the shared trait (sc-8241).
 impl ControlBranch for KreaTurboControl {
     fn model_id(&self) -> &'static str {
         KREA_2_TURBO_CONTROL_ID
     }
 
     fn accepted_control_kinds(&self) -> AcceptedControlKinds {
-        AcceptedControlKinds::Only(vec![mlx_gen::ControlKind::Pose])
+        AcceptedControlKinds::Only(vec![self.control_kind.clone()])
     }
 
     fn default_control_scale(&self) -> f32 {
@@ -515,23 +562,69 @@ mod tests {
     }
 
     #[test]
-    fn accepts_pose_rejects_other_control_kinds() {
-        // A pose-only branch: the trait's resolve_control admits Pose and rejects Canny/Depth. Exercised
-        // through the descriptor's accepted_control_kinds via a lightweight stub-free check on the enum.
-        let accepted = AcceptedControlKinds::Only(vec![ControlKind::Pose]);
-        assert!(accepted.accepts(&ControlKind::Pose));
-        assert!(!accepted.accepts(&ControlKind::Canny));
-        assert!(!accepted.accepts(&ControlKind::Depth));
-        // Sanity: the trait wiring builds the same Conditioning::Control the worker feeds.
+    fn sidecar_kind_maps_to_the_advertised_control_kind() {
+        // The lane advertises the LOADED overlay's kind (read from its sidecar), not a static Pose:
+        // depth→Depth, pose→Pose, canny→Canny, unknown/absent→Pose (back-compat with the S0 overlays).
+        assert_eq!(
+            kind_from_sidecar_kind("pose_control_branch"),
+            ControlKind::Pose
+        );
+        assert_eq!(
+            kind_from_sidecar_kind("depth_control_branch"),
+            ControlKind::Depth
+        );
+        assert_eq!(
+            kind_from_sidecar_kind("canny_control_branch"),
+            ControlKind::Canny
+        );
+        assert_eq!(kind_from_sidecar_kind("mystery"), ControlKind::Pose);
+
+        // A depth-advertised lane routes Depth and rejects Pose; a pose lane the reverse (the shared
+        // trait's AcceptedControlKinds::accepts is exact) — the routing consequence of the resolved kind.
+        let depth = AcceptedControlKinds::Only(vec![ControlKind::Depth]);
+        assert!(depth.accepts(&ControlKind::Depth) && !depth.accepts(&ControlKind::Pose));
+        let pose = AcceptedControlKinds::Only(vec![ControlKind::Pose]);
+        assert!(pose.accepts(&ControlKind::Pose) && !pose.accepts(&ControlKind::Depth));
+
+        // Sanity: the trait wiring builds the same Conditioning::Control the worker feeds — now Depth-capable.
         let _ = Conditioning::Control {
             image: mlx_gen::media::Image {
                 width: 8,
                 height: 8,
                 pixels: vec![0u8; 8 * 8 * 3],
             },
-            kind: ControlKind::Pose,
+            kind: ControlKind::Depth,
             scale: Some(0.6),
         };
+    }
+
+    #[test]
+    fn resolve_control_kind_reads_the_overlay_sidecar() {
+        // A depth sidecar next to a (never-read) overlay file → Depth; the resolver reads ONLY the .json,
+        // so the overlay `.safetensors` need not exist. This is the exact widen the worker's depth route
+        // depends on: a depth overlay makes the lane advertise Depth without touching pose-only code.
+        let dir = std::env::temp_dir().join(format!("krea-ctrl-kind-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("depth_control.json"),
+            r#"{"kind":"depth_control_branch","n_blocks":7,"baseModel":"krea_2_turbo"}"#,
+        )
+        .unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent-krea".into()))
+            .with_control(WeightsSource::File(dir.join("depth_control.safetensors")));
+        assert_eq!(resolve_control_kind(&spec).unwrap(), ControlKind::Depth);
+
+        // No sidecar → Pose (back-compat, no error — the S0 overlays and any legacy checkpoint).
+        let spec_bare = LoadSpec::new(WeightsSource::Dir("/nonexistent-krea".into()))
+            .with_control(WeightsSource::File(dir.join("no_sidecar.safetensors")));
+        assert_eq!(resolve_control_kind(&spec_bare).unwrap(), ControlKind::Pose);
+
+        // A sharded-`Dir` overlay (no sidecar convention) → Pose.
+        let spec_dir = LoadSpec::new(WeightsSource::Dir("/nonexistent-krea".into()))
+            .with_control(WeightsSource::Dir(dir.clone()));
+        assert_eq!(resolve_control_kind(&spec_dir).unwrap(), ControlKind::Pose);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ── F-180 (sc-11126): weight-free, default-run proof that Krea-Control's dispatch HONORS

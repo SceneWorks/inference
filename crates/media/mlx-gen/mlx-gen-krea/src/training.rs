@@ -124,7 +124,7 @@ const LOSS_TYPES: [&str; 4] = ["mse", "l2", "mae", "l1"];
 /// `(x_t, target)` for a single sample at flow-match `t`: `x_t = (1−t)·x0 + t·noise`,
 /// `target = noise − x0` (the velocity the **raw** Krea DiT output is regressed onto; the DiT timestep
 /// is `t` itself, fed by the caller — see the module docs for the sign vs Z-Image).
-fn build_batch(x0: &Array, noise: &Array, t: f32) -> Result<(Array, Array)> {
+pub(crate) fn build_batch(x0: &Array, noise: &Array, t: f32) -> Result<(Array, Array)> {
     let one_minus = Array::from_slice(&[1.0 - t], &[1]);
     let s = Array::from_slice(&[t], &[1]);
     let x_t = add(&multiply(x0, &one_minus)?, &multiply(noise, &s)?)?;
@@ -764,7 +764,7 @@ fn resolve_target_paths(transformer: &Krea2Transformer, cfg: &TrainingConfig) ->
 }
 
 /// Decode an image file (PNG/JPEG) into the core RGB8 [`Image`].
-fn decode_image(path: &Path) -> Result<Image> {
+pub(crate) fn decode_image(path: &Path) -> Result<Image> {
     let dynimg = image::open(path)
         .map_err(|e| Error::Msg(format!("decode image {}: {e}", path.display())))?;
     let rgb = dynimg.to_rgb8();
@@ -781,7 +781,7 @@ fn decode_image(path: &Path) -> Result<Image> {
 /// [`QwenVae::encode`] (per-channel-normalized 16-ch latent, `[1,16,1,edge/8,edge/8]`) → drop the
 /// singleton temporal axis. The encode already applies the per-channel `latents_mean`/`latents_std`
 /// normalization (the DiT operates in that normalized space; `decode` de-normalizes).
-fn encode_latents(vae: &QwenVae, image: &Image, edge: u32) -> Result<Array> {
+pub(crate) fn encode_latents(vae: &QwenVae, image: &Image, edge: u32) -> Result<Array> {
     let pre = preprocess_init_image(image, edge, edge)?; // [1, 3, edge, edge] in [-1, 1]
     let lat = vae.encode(&pre)?; // [1, 16, 1, edge/8, edge/8]
     Ok(lat.squeeze_axes(&[2])?) // [1, 16, edge/8, edge/8]
@@ -789,7 +789,7 @@ fn encode_latents(vae: &QwenVae, image: &Image, edge: u32) -> Result<Array> {
 
 /// Encode a caption into the DiT's `text_fusion` context `[1, n_tok, 12, 2560]` — the Qwen3-VL-4B
 /// condition encoder's stacked 12 select-layers (sc-7569), the same path Turbo inference uses.
-fn encode_caption(
+pub(crate) fn encode_caption(
     tokenizer: &KreaTokenizer,
     encoder: &KreaTextEncoder,
     caption: &str,
@@ -802,7 +802,7 @@ fn encode_caption(
 /// faithful port of the SceneWorks `sample_training_timestep` (identical to the Lens / Z-Image
 /// trainers): `sigmoid(randn)` by default, `uniform` for linear, `(uniform + sigmoid(randn))/2` for
 /// weighted; bias `high` → `√t`, `low` → `t²`. Deterministic in `seed`.
-fn sample_sigma(timestep_type: &str, timestep_bias: &str, seed: u64) -> Result<f32> {
+pub(crate) fn sample_sigma(timestep_type: &str, timestep_bias: &str, seed: u64) -> Result<f32> {
     let k1 = random::key(seed)?;
     let sigmoid = |x: f32| 1.0 / (1.0 + (-x).exp());
     let ttype = timestep_type.trim().to_ascii_lowercase().replace('-', "_");

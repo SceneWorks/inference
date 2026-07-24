@@ -48,6 +48,7 @@
 
 pub mod config;
 pub mod control;
+pub mod control_train;
 pub mod convert;
 pub mod loader;
 pub mod memory;
@@ -65,6 +66,7 @@ pub mod vae;
 
 pub use config::Krea2Config;
 pub use control::Krea2ControlBranch;
+pub use control_train::{load_control_trainer, KreaControlTrainer, KREA_2_CONTROL_ID};
 pub use loader::{load_text_encoder, load_transformer, load_transformer_from_native_file};
 pub use memory::{plan_control_adaptation, ControlLaneInputs};
 pub use model::{
@@ -97,6 +99,7 @@ pub fn register_providers(
         .register_generator(model::TURBO_EDIT_REGISTRATION)
         .register_generator(model_control::CONTROL_REGISTRATION)
         .register_trainer(training::TRAINER_REGISTRATION)
+        .register_trainer(control_train::CONTROL_TRAINER_REGISTRATION)
 }
 
 /// Build the complete explicit MLX Krea provider catalog.
@@ -128,7 +131,7 @@ mod explicit_registry_tests {
                 "krea_2_turbo_control",
             ]
         );
-        assert_eq!(explicit_trainers, ["krea_2_raw"]);
+        assert_eq!(explicit_trainers, ["krea_2_raw", "krea_2_control"]);
     }
 }
 

@@ -213,6 +213,7 @@ mod tests {
                 "anima_turbo",
                 "kolors",
                 "krea_2_raw",
+                "krea_2_control",
                 "lens",
                 "ltx_2_3",
                 "sd3_5_large",
