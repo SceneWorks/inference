@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::{Linear, VarBuilder};
 use candle_gen::gen_core::WeightsSource;
+use candle_gen::quant::{DenseLinear, QLinear};
 use candle_gen::{CandleError, Result};
 
 /// Marker file dropped into a **pre-merged** `sensenova_u1_8b_fast` turnkey tier (sc-8775): its
@@ -76,14 +77,53 @@ impl DistillLora {
         Ok(Some(delta))
     }
 
-    /// Merge this LoRA's delta for `target` into `lin` (a bias-less or biased Linear), returning the
-    /// merged Linear, or `None` if the LoRA carries no such target. `W += Δ`; the bias is untouched.
-    pub fn merge_linear(&self, lin: &Linear, target: &str) -> Result<Option<Linear>> {
+    /// Merge this LoRA's delta for `target` into `lin`, returning the merged projection, or `None`
+    /// if the LoRA carries no such target. `W += Δ`; the bias is untouched.
+    ///
+    /// **Dense only, deliberately (sc-14249).** A packed q4/q8 projection has no dense `W` to add
+    /// into — folding one would mean dequantize → add → re-quantize, i.e. materializing the very
+    /// dense 32 GB weight the packed tier exists to avoid, and re-rounding every row. It is also
+    /// unreachable: the shipped `*-fast-mlx` **packed** tiers all carry the
+    /// [`DISTILL_MERGED_MARKER`], so [`crate::load_fast`] skips resolve+merge entirely and the merge
+    /// only ever runs on a legacy dense base snapshot. This errors loudly rather than silently
+    /// dropping the 8-step distill (which would render the fast id at base-model step counts —
+    /// wrong, and invisible), so a future packed fast tier shipped WITHOUT the marker is caught at
+    /// load with an actionable message instead of degrading a render.
+    ///
+    /// The delta is computed and widened on CPU, then moved to the base weight's device and cast to
+    /// its store dtype — so a bf16-stored projection merges into bf16 (matching the merged tier the
+    /// packer produces) rather than silently promoting the whole weight to f32.
+    pub fn merge_linear(&self, lin: &QLinear, target: &str) -> Result<Option<QLinear>> {
+        let QLinear::Dense(DenseLinear::Linear(dense)) = lin else {
+            // Only reject once we know this LoRA actually carries the target — a packed tier that
+            // the LoRA does not touch is simply `None`, exactly as a dense one would be.
+            if self.delta(target)?.is_none() {
+                return Ok(None);
+            }
+            return Err(CandleError::Msg(format!(
+                "sensenova: cannot merge the 8-step distill LoRA into the PACKED projection \
+                 '{target}' — a packed q4/q8 tier must ship pre-merged (drop a \
+                 `{DISTILL_MERGED_MARKER}` marker in the tier dir, as the shipped *-fast-mlx tiers \
+                 do). Refusing rather than dropping the distill silently."
+            )));
+        };
+        Ok(self
+            .merge_dense(dense, target)?
+            .map(|m| QLinear::from_dense(DenseLinear::Linear(m))))
+    }
+
+    /// [`Self::merge_linear`] for a plain dense [`Linear`] — the FM head, which the tier packer
+    /// leaves dense in every tier so it never needs the packed arm.
+    ///
+    /// The delta is computed and widened on CPU, then moved to the base weight's device and cast to
+    /// its store dtype, so a bf16-stored projection merges into bf16 (matching the merged tier the
+    /// packer produces) rather than silently promoting the whole weight to f32.
+    pub fn merge_dense(&self, lin: &Linear, target: &str) -> Result<Option<Linear>> {
         match self.delta(target)? {
             Some(delta) => {
-                // delta is computed on CPU; move it to the base weight's device before adding.
-                let delta = delta.to_device(lin.weight().device())?;
-                let merged = (lin.weight() + delta)?;
+                let w = lin.weight();
+                let delta = delta.to_device(w.device())?.to_dtype(w.dtype())?;
+                let merged = (w + delta)?;
                 Ok(Some(Linear::new(merged, lin.bias().cloned())))
             }
             None => Ok(None),

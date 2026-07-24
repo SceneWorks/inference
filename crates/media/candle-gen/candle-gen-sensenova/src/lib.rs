@@ -14,8 +14,16 @@
 //! Two registered ids share the loader: **`sensenova_u1_8b`** (50 NFE, CFG 4.0) and
 //! **`sensenova_u1_8b_fast`** (8 NFE, CFG 1.0 — its loader merges the 8-step distill LoRA into the
 //! dense generation path). Both advertise **only** the wired T2I surface through the `Generator`
-//! contract — image-edit / Character Studio (it2i), user LoRAs, and quantization are NOT advertised
-//! and are rejected rather than silently dropped. `backend` is `"candle"` and `mac_only` is `false`.
+//! contract — image-edit / Character Studio (it2i) and user LoRAs are NOT advertised and are rejected
+//! rather than silently dropped. `backend` is `"candle"` and `mac_only` is `false`.
+//!
+//! **Tiers (sc-14249, epic 9083).** The crate consumes the SceneWorks turnkey's `bf16/`, `q8/` and
+//! `q4/` tiers directly, through one seam (`quant::detect_linear`): a projection whose
+//! `.scales` sibling is present builds packed from the MLX triple, otherwise it loads dense at the
+//! checkpoint's own store dtype and widens to f32 per op. So the tier is chosen by the DIRECTORY the
+//! caller resolved and `Quant` is a tier label, not a request to quantize anything here. This
+//! replaced a hard `DType::F32` mmap that widened the bf16 checkpoint for no extra precision — a
+//! measured 70.5 GB peak on sm_120 for a 32.7 GiB checkpoint.
 //!
 //! **Understanding surface (VQA + interleave, sc-5501):** SenseNova-U1's text / text+image modes
 //! ([`T2iModel::vqa`], [`T2iModel::interleave_gen`]) output what the neutral
@@ -27,6 +35,7 @@
 mod config;
 mod distill;
 mod fm;
+mod quant;
 mod qwen3;
 mod runtime;
 mod t2i;
@@ -40,7 +49,7 @@ use candle_gen::candle_core::{DType, Device};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::{
     self, reject_unknown_components, Capabilities, GenerationOutput, GenerationRequest, Generator,
-    LoadSpec, Modality, ModelDescriptor, Progress, WeightsSource,
+    LoadSpec, Modality, ModelDescriptor, Progress, Quant, WeightsSource,
 };
 use candle_gen::{CandleError, Result};
 
@@ -88,8 +97,8 @@ pub fn descriptor_fast() -> ModelDescriptor {
 }
 
 /// SenseNova-U1's identity + the surface this candle slice wires: classifier-free guidance over the
-/// prompt, **txt2img only**. it2i/edit (Reference), true-CFG image guidance, VQA, interleave, user
-/// LoRA, and quantization (all wired in the mlx provider) are NOT advertised — they stay the Python
+/// prompt, **txt2img only**, over the q4/q8/bf16 turnkey tiers (sc-14249). it2i/edit (Reference),
+/// true-CFG image guidance, VQA, interleave and user LoRA are NOT advertised — they stay the Python
 /// fallback's job until candle wires them, so the descriptor never promises a path `generate` can't
 /// serve. Two backend-correct deviations from `mlx-gen-sensenova`: `backend = "candle"` and
 /// `mac_only = false`.
@@ -122,8 +131,11 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
             max_size: 2048,
             max_count: 8,
             mac_only: false,
-            // No on-the-fly quantization wired in the candle slice (dense f32).
-            supported_quants: &[],
+            // The SceneWorks turnkey's pre-quantized q4/q8 tiers load natively (sc-14249): every
+            // backbone projection packed-detects its MLX triple, so a Q4/Q8 here is a turnkey tier
+            // SELECT (which subdir the caller resolved), not an on-the-fly quantize. bf16 resolves
+            // to `None` and loads dense. Same contract as flux1/qwen/kolors.
+            supported_quants: &[Quant::Q4, Quant::Q8],
             // The backbone uses a KV cache for the AR prefix + denoise.
             supports_kv_cache: true,
             // Flow-match schedule uses a timestep shift (mapped from scheduler_shift).
@@ -179,7 +191,7 @@ impl SenseNovaGenerator {
     fn components(&self) -> Result<Components> {
         candle_gen::cached(&self.components, || {
             let cfg = NeoChatConfig::from_dir(&self.root)?;
-            let vb = f32_vb(&self.root, &self.device)?;
+            let vb = backbone_vb(&self.root, &self.device)?;
             let mut model = T2iModel::from_weights(&vb, &cfg)?;
             // Merge the 8-step distill LoRA into the dense generation path — ONLY when the fast loader
             // resolved one at `load` (sc-13664/sc-13787). A **pre-merged** turnkey tier ships the
@@ -305,9 +317,9 @@ impl Generator for SenseNovaGenerator {
     }
 }
 
-/// mmap an f32 [`VarBuilder`] over the SenseNova-U1 checkpoint shards (the flat `*.safetensors` under
-/// `root`, excluding the optional co-located distill LoRA).
-fn f32_vb(root: &Path, device: &Device) -> Result<VarBuilder<'static>> {
+/// The SenseNova-U1 checkpoint shards under `root` — the flat `*.safetensors`, excluding the optional
+/// co-located distill LoRA (and any AppleDouble sidecar).
+fn backbone_files(root: &Path) -> Result<Vec<PathBuf>> {
     let mut files: Vec<PathBuf> = std::fs::read_dir(root)
         .map_err(|e| CandleError::Msg(format!("sensenova: read {}: {e}", root.display())))?
         .filter_map(|e| e.ok().map(|e| e.path()))
@@ -322,9 +334,45 @@ fn f32_vb(root: &Path, device: &Device) -> Result<VarBuilder<'static>> {
             root.display()
         )));
     }
+    Ok(files)
+}
+
+/// mmap a [`VarBuilder`] over the SenseNova-U1 checkpoint at its **on-disk store dtype** (sc-14249).
+///
+/// This used to be `f32_vb`, pinned to [`DType::F32`]. The shipped checkpoint is bf16 (`config.json`
+/// `llm_config.torch_dtype: "bfloat16"`, 32.7 GiB on disk), so that pin *widened* every weight for no
+/// extra precision — a measured **70.5 GB** peak on sm_120. The store now follows the checkpoint
+/// (`quant::store_dtype_for`: bf16 stays bf16, anything else keeps loading f32 — never widen, never
+/// truncate), and each projection widens to f32 per op via `QLinear::forward_upcast`, so **every
+/// matmul is still f32** and the arithmetic is unchanged. The dense leaves the model multiplies
+/// directly (norms, conv kernels, FM/timestep Linears) are read at f32 through `quant::get_f32`.
+///
+/// The probe reads the FIRST shard's header rather than trusting `config.json`: the config's
+/// `torch_dtype` describes the upstream release, not necessarily what a given tier's packer emitted,
+/// and getting this wrong in the truncating direction would silently round every weight.
+fn backbone_vb(root: &Path, device: &Device) -> Result<VarBuilder<'static>> {
+    let files = backbone_files(root)?;
+    let dtype = crate::quant::store_dtype_for(checkpoint_dtype(&files));
     // Shared audited unsafe-mmap surface (sc-8999 / F-019). The distill-LoRA exclusion filter above
     // is a genuine per-site variation, so the read_dir/sort stays local; only the mmap is shared.
-    candle_gen::mmap_var_builder(&files, DType::F32, device)
+    candle_gen::mmap_var_builder(&files, dtype, device)
+}
+
+/// The dtype the checkpoint stores its weights in, probed from one small always-dense tensor.
+///
+/// Reads the final backbone RMSNorm (`language_model.model.norm.weight`, `[4096]`): it is present and
+/// **dense** in every tier — the packer quantizes only the 588 layer projections — so it reports the
+/// tier's real store dtype on a packed q4/q8 tier just as it does on `bf16/`, without being fooled by
+/// the `U32` code tensors sitting next to it. Anything unreadable falls back to `F32`, the
+/// pre-sc-14249 behavior. Mirrors `candle-gen-ideogram`'s `te_store_dtype` (sc-12828).
+fn checkpoint_dtype(files: &[PathBuf]) -> DType {
+    const PROBE_KEY: &str = "language_model.model.norm.weight";
+    // SAFETY: read-only mmap of weight files; the standard candle loading path.
+    unsafe { candle_gen::candle_core::safetensors::MmapedSafetensors::multi(files) }
+        .ok()
+        .and_then(|st| st.load(PROBE_KEY, &Device::Cpu).ok())
+        .map(|t| t.dtype())
+        .unwrap_or(DType::F32)
 }
 
 /// Build the dense f32 understanding model ([`T2iModel`]) + tokenizer for a SenseNova-U1-8B-MoT
@@ -335,7 +383,7 @@ fn f32_vb(root: &Path, device: &Device) -> Result<VarBuilder<'static>> {
 pub fn load_understanding(root: &Path) -> Result<(T2iModel, SenseNovaTokenizer)> {
     let cfg = NeoChatConfig::from_dir(root)?;
     let device = candle_gen::default_device()?;
-    let vb = f32_vb(root, &device)?;
+    let vb = backbone_vb(root, &device)?;
     let model = T2iModel::from_weights(&vb, &cfg)?;
     let tokenizer = SenseNovaTokenizer::from_dir(root)?;
     Ok((model, tokenizer))
@@ -368,11 +416,13 @@ fn load_inner(spec: &LoadSpec, fast: bool) -> gen_core::Result<Box<dyn Generator
             "{id}: user-supplied adapters are not supported (supports_lora=false)"
         )));
     }
-    if spec.quantize.is_some() {
-        return Err(gen_core::Error::Unsupported(format!(
-            "{id}: on-the-fly Q4/Q8 quantization is not wired in the candle slice yet (dense f32 only)"
-        )));
-    }
+    // NOTE (sc-14249): there is deliberately no `spec.quantize` reject here any more, and `quantize`
+    // is deliberately never READ either. The SceneWorks turnkey ships pre-quantized `q4/`/`q8/`
+    // tiers, and `quant::detect_linear` picks the precision from the WEIGHTS on disk (a `.scales`
+    // sibling), so the tier is selected by the DIRECTORY the caller resolved — exactly as it is for
+    // flux1/qwen/kolors. An accepted `Q4`/`Q8` is therefore a no-op on an already-packed tier rather
+    // than an on-the-fly quantize, which is why the descriptor can honestly advertise both without
+    // this crate owning a quantizer. A `bf16/` tier still loads dense at the checkpoint's own dtype.
     if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
         return Err(gen_core::Error::Unsupported(format!(
             "{id}: control / IP-adapter overlays are not supported (txt2img only)"
@@ -482,7 +532,10 @@ mod tests {
         assert!(d.capabilities.conditioning.is_empty());
         assert!(!d.capabilities.supports_lora);
         assert!(!d.capabilities.supports_lokr);
-        assert!(d.capabilities.supported_quants.is_empty());
+        // sc-14249: the turnkey's pre-quantized q4/q8 tiers load natively (packed-detect per
+        // projection), so both tiers ARE advertised — a Q4/Q8 here selects which tier subdir the
+        // caller resolved, it does not ask this crate to quantize anything.
+        assert_eq!(d.capabilities.supported_quants, &[Quant::Q4, Quant::Q8]);
         assert!(d.capabilities.supports_kv_cache);
         assert!(d.capabilities.requires_sigma_shift);
         // The fast variant shares the capability surface; only id + defaults differ.
@@ -490,6 +543,10 @@ mod tests {
         assert_eq!(f.id, MODEL_ID_FAST);
         assert_eq!(f.family, d.family);
         assert_eq!(f.capabilities.max_size, d.capabilities.max_size);
+        assert_eq!(
+            f.capabilities.supported_quants,
+            d.capabilities.supported_quants
+        );
     }
 
     #[test]
@@ -621,11 +678,13 @@ mod tests {
             gen_core::Error::Unsupported(_)
         ));
 
-        let quant = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_quant(Quant::Q8);
-        assert!(matches!(
-            load(&quant).err().expect("err"),
-            gen_core::Error::Unsupported(_)
-        ));
+        // sc-14249: a tier `Quant` is ACCEPTED now (it was `Unsupported` while the loader was dense-f32
+        // only). Both tiers load lazily against the resolved dir — the precision comes from the
+        // weights there, so nothing about the spec can fail at this point.
+        for q in [Quant::Q4, Quant::Q8] {
+            let quant = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_quant(q);
+            assert!(load(&quant).is_ok(), "{q:?} tier select must be accepted");
+        }
 
         let single = LoadSpec::new(WeightsSource::File("/x.safetensors".into()));
         let err = load(&single).err().expect("err").to_string();
