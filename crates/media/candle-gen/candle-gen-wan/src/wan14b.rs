@@ -1249,26 +1249,82 @@ pub fn load_from_comfyui_experts(
     snapshot_dir: impl Into<PathBuf>,
     i2v: bool,
 ) -> gen_core::Result<Box<dyn Generator>> {
+    load_from_comfyui_experts_with_offload(
+        high_file,
+        low_file,
+        te_file,
+        vae_file,
+        snapshot_dir,
+        i2v,
+        OffloadPolicy::Resident,
+    )
+}
+
+/// Explicit-residency sibling of [`load_from_comfyui_experts`]. External loaders do not carry a
+/// [`LoadSpec`], so callers whose admission numbers assume sequential expert swapping must pass that
+/// policy at this production seam rather than setting an unused spec upstream.
+pub fn load_from_comfyui_experts_with_offload(
+    high_file: impl Into<PathBuf>,
+    low_file: impl Into<PathBuf>,
+    te_file: Option<PathBuf>,
+    vae_file: Option<PathBuf>,
+    snapshot_dir: impl Into<PathBuf>,
+    i2v: bool,
+    offload_policy: OffloadPolicy,
+) -> gen_core::Result<Box<dyn Generator>> {
+    let generator = build_comfyui_generator(
+        high_file.into(),
+        low_file.into(),
+        te_file,
+        vae_file,
+        snapshot_dir.into(),
+        i2v,
+        offload_policy,
+    )?;
+    #[cfg(test)]
+    COMFYUI_TEST_OFFLOAD.set(Some(generator.offload));
+    Ok(Box::new(generator))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Call-thread-correlated: concurrent loaders cannot overwrite this caller's observation.
+    static COMFYUI_TEST_OFFLOAD: std::cell::Cell<Option<OffloadPolicy>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn last_public_comfyui_offload_for_test() -> Option<OffloadPolicy> {
+    COMFYUI_TEST_OFFLOAD.get()
+}
+
+fn build_comfyui_generator(
+    high_file: PathBuf,
+    low_file: PathBuf,
+    te_file: Option<PathBuf>,
+    vae_file: Option<PathBuf>,
+    snapshot_dir: PathBuf,
+    i2v: bool,
+    offload_policy: OffloadPolicy,
+) -> gen_core::Result<Wan14bGenerator> {
     let variant = if i2v { Variant::I2v } else { Variant::T2v };
     let device = candle_gen::default_device()?;
-    // The ComfyUI lane carries no `LoadSpec`, so the residency policy comes purely from the family-wide
-    // `CANDLE_GEN_OFFLOAD=sequential` A/B override (default resident) — sc-12733.
-    let offload = effective_offload_policy(OffloadPolicy::Resident);
-    Ok(Box::new(Wan14bGenerator {
+    let offload = effective_offload_policy(offload_policy);
+    Ok(Wan14bGenerator {
         descriptor: descriptor_for(variant),
         variant,
-        root: snapshot_dir.into(),
+        root: snapshot_dir,
         device,
         adapters: Vec::new(),
         comfyui: Some(std::sync::Arc::new(crate::comfyui::ComfyuiExperts {
-            high_file: high_file.into(),
-            low_file: low_file.into(),
+            high_file,
+            low_file,
             te_file,
             vae_file,
         })),
         offload,
         components: Mutex::new(None),
-    }))
+    })
 }
 
 /// Construct a lazy candle Wan2.2 T2V-A14B generator. `spec.weights` must be a [`WeightsSource::Dir`]
@@ -1599,6 +1655,43 @@ mod tests {
         )
         .unwrap();
         assert_eq!(sequential.offload, OffloadPolicy::Sequential);
+    }
+
+    #[test]
+    fn comfyui_public_load_honors_explicit_policy_and_env_override() {
+        let call = |policy| {
+            load_from_comfyui_experts_with_offload(
+                "/comfy/high.safetensors",
+                "/comfy/low.safetensors",
+                None,
+                None,
+                "/snapshot",
+                false,
+                policy,
+            )
+            .unwrap();
+            last_public_comfyui_offload_for_test().unwrap()
+        };
+        let _env = candle_gen::testkit::EnvVarGuard::set(candle_gen::OFFLOAD_ENV, None);
+        assert_eq!(
+            call(OffloadPolicy::Sequential),
+            OffloadPolicy::Sequential,
+            "the public external production seam must carry explicit Sequential into Wan14bGenerator"
+        );
+        assert_eq!(
+            call(OffloadPolicy::Resident),
+            OffloadPolicy::Resident,
+            "the compatibility loader's historical default remains resident"
+        );
+
+        drop(_env);
+        let _env =
+            candle_gen::testkit::EnvVarGuard::set(candle_gen::OFFLOAD_ENV, Some("sequential"));
+        assert_eq!(
+            call(OffloadPolicy::Resident),
+            OffloadPolicy::Sequential,
+            "the documented process-wide override still upgrades the public Resident request"
+        );
     }
 
     /// Parity guard for the residency change (sc-12733): the precomputed boundary-crossing index `k`
