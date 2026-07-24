@@ -41,6 +41,7 @@ use std::path::{Path, PathBuf};
 use mlx_rs::ops::{abs, max, mean, subtract};
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::image::decoded_to_image;
 use mlx_gen::weights::Weights;
 use mlx_gen_mage::vae::{
     self, MageVae, VaePart, DECODER_PREFIX, ENCODER_PREFIX, SKIPPED_DECODER_SUBTREES,
@@ -207,6 +208,20 @@ fn frac_above(a: &Array, b: &Array, thresh: f32) -> f32 {
 /// swapped 8192-channel ordering, zero instead of replicate padding, a mis-ordered adaLN chunk)
 /// moves the output by O(0.1–1), two to three orders above this bound — the weights-free suite in
 /// `vae_decode_fixture.rs` demonstrates that separation directly, at f32 on both sides.
+/// Write a decode to `$MAGE_VAE_DUMP_DIR` as a binary PPM, for eyeballing a decode when a parity
+/// number looks odd. No-op unless the variable is set; PPM so the test needs no image encoder.
+fn maybe_dump_ppm(name: &str, decoded: &Array) {
+    let Ok(dir) = std::env::var("MAGE_VAE_DUMP_DIR") else {
+        return;
+    };
+    let img = decoded_to_image(&decoded.as_dtype(Dtype::Float32).unwrap()).unwrap();
+    let mut out = format!("P6\n{} {}\n255\n", img.width, img.height).into_bytes();
+    out.extend_from_slice(&img.pixels);
+    let path = PathBuf::from(dir).join(format!("{name}.ppm"));
+    std::fs::write(&path, out).unwrap();
+    println!("    wrote {}", path.display());
+}
+
 fn check_decode(
     size: i32,
     dt: RefDtype,
@@ -220,6 +235,7 @@ fn check_decode(
 
     let got = v.decode(&latent).unwrap();
     assert_eq!(got.shape(), want.shape(), "{size}² {key_expected} geometry");
+    maybe_dump_ppm(&format!("{key_expected}_{size}_{}", dt.label()), &got);
 
     let (mx, mn) = (max_abs(&got, want), mean_abs(&got, want));
     let (tol_mx, tol_mn) = dt.tolerance();
