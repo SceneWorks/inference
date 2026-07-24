@@ -43,7 +43,16 @@ target
 
 # Vendored third-party reference source (read-only, dev-only) — e.g. the SenseNova-U1 reference
 # checkout used to port the model. Cloned on demand, never committed. See epic 3180.
-/_vendor/
+#
+# EXCEPTION (sc-14036): the Mage-Flow reference IS committed. Vendoring a parity golden is a
+# license decision, and microsoft/Mage is MIT — redistribution is permitted with its notice,
+# which travels in _vendor/mage_flow/LICENSE. It is preserved in-tree because epic 14034's
+# entire P1-P4 parity surface depends on it and freshly released research drops get pulled
+# (the Lens precedent). Provenance + pins: _vendor/VENDORED.md.
+/_vendor/*
+!/_vendor/VENDORED.md
+!/_vendor/MAGE_FLOW_GAPS.md
+!/_vendor/mage_flow/
 
 # Real-weight distill MERGE check fixture (weight-level, regenerable; large bf16 tensors)
 /mlx-gen-sensenova/tests/fixtures/distill_realweight_merge.safetensors

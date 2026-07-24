@@ -254,6 +254,109 @@ diffusers `ChromaPipeline` reference.
 | `chroma_e2e.safetensors` (`_hd`/`_base`/`_flash`) | `dump_chroma_e2e_golden.py {hd,base,flash}` | `tests/e2e_real_weights.rs` | full e2e parity for all three variants. |
 | _(tokenizer build, no golden)_ | `build_chroma_t5_tokenizer.py` | — | materializes the T5 `tokenizer.json` into the snapshot `tokenizer/` dir. |
 
+### Mage-Flow (`mlx-gen-mage` / `candle-gen-mage`, sc-14036 / epic 14034)
+
+Unlike every other family here, the Mage-Flow reference is **vendored in-tree** at
+`../../_vendor/mage_flow/` (microsoft/Mage, MIT — see `../../_vendor/VENDORED.md` for the pinned
+upstream commit, the exact env pins, and the license rationale), so the oracle survives a
+model-card/repo pull. One staged harness
+(`dump_mage_flow_golden.py --stage {noise,vae,te,dit_block,dit,e2e,edit,all}`) loads the
+pipeline once per repo at a fixed prompt/seed/geometry; the `dit_block` and `dit` goldens are
+hook-captured during the `e2e` denoise. The reference runs **bf16** end to end (hard-coded in
+`load_from_repo`); tensors are stored upcast to f32.
+
+Build the pinned venv per `../../_vendor/VENDORED.md`, then:
+
+```sh
+cd crates/media/mlx-gen
+MAGE_DEVICE=cpu /tmp/mageflow-ref-venv/bin/python tools/dump_mage_flow_golden.py --stage all
+```
+
+Weights: `microsoft/Mage-Flow` (gen) and `microsoft/Mage-Flow-Edit` (edit) from the HF cache, or
+`$MAGE_SNAPSHOT` / `$MAGE_EDIT_SNAPSHOT`. **`MAGE_DEVICE=cpu` is mandatory on macOS, and the
+default is auto-select, which picks MPS** — always pass it. An MPS dump is *silently* corrupt:
+`neg_txt` comes out with the last 3 of its 6 rows zero-filled while the `gen_hidden_full` tail it
+must equal is intact (max_abs 61.4342, reproducible across three runs; the live torch tensors
+agree in-process, so the zero-fill is in the MPS→CPU copy). Nothing raises —
+`verify_mage_flow_golden.py` is what catches it. Do not treat the DiT's separate *loud* MPS
+failure (`repeat_interleave` with int32 repeats) as a guard: it only fires when the pack has ≥2
+segments, so at `cfg <= 1` an MPS run completes the whole stack and writes real images. CUDA
+hosts should use the default `MAGE_ATTN=flash2` with `flash-attn==2.8.3`. ~7 min for the
+256²/4-step gen stack on an M-series CPU.
+
+| golden | dump script stage | consumed by (P1–P4) | notes |
+|---|---|---|---|
+| `mage_flow_noise_golden.safetensors` | `--stage noise` | Gaussian-Shading noise parity | **Weight-free** — runs anywhere. The initial latent is `mage_latent.encode_noise` (payload `"MageFlow"`, 256 bits, key 20260720), NOT `randn`: the reference computes a plain seeded `randn` and throws it away. Dumps `gs_noise` **and** `plain_randn` so the port asserts a match against one and a mismatch against the other, plus `gs_noise_bf16` (what the pipeline actually feeds the denoise loop — compare the e2e `traj_step0` against *this* one, not the f32 tensor) and the key-schedule internals (`msg_bits`/`pad_tiny`/`pos_tiny`) for bisection. Small + fast — candidate to promote into `tests/fixtures/`. |
+| `mage_flow_vae_golden.safetensors` | `--stage vae` | Mage-VAE encode/decode parity | Needs only `vae/` (~0.5 GB). Encode is a single forward at t=0 with zero `z_t`; dumps `enc_mean` + `enc_logvar` (the pipeline's edit path samples the posterior off the global RNG, which no port reproduces — gate the moments) and `enc_latent` (the deterministic mean branch). Decode is dumped twice: from the real encoded latent and from a seeded synthetic one, so a broken encoder can't mask a broken decoder. |
+| `mage_flow_te_golden.safetensors` | `--stage te` | Qwen3-VL conditioning parity | Both templates in one file. `gen_*` = `mage-flow` (drop_idx 34), `edit_*` = `mage-flow-edit` (drop_idx 64, with `pixel_values`/`image_grid_thw` through the VL vision tower). `*_hidden_full` is the **pre-drop** hidden state (final 36th layer, **after** the final RMSNorm — not the penultimate layer) and `*_txt` the post-drop slice, so "wrong layer" and "wrong drop_idx" are distinguishable failures. |
+| `mage_flow_dit_block_golden.safetensors` | `--stage dit_block` | one NR-MMDiT dual-stream block | Hook-captured on `transformer_blocks[0]` at e2e step 0 — real post-embed inputs (`block_in.*`) + outputs (`block_out.*`), so no patchify/RoPE/time-embed wiring is hand-replicated. The msrope table is **complex**, split into `block_in.image_rotary_emb_re`/`_im` (an `f32` cast would silently drop the imaginary half). It also pins a trap: under `batch_cfg` the duplicated uncond half is rotated at msrope **frame index 1**, not 0, so the fused CFG path is *not* numerically identical to two separate forwards — see `../../_vendor/MAGE_FLOW_GAPS.md` (GAP 3). |
+| `mage_flow_dit_golden.safetensors` | `--stage dit` | full 12-block stack | Hook-captured on the whole `transformer` at step 0: raw `img`/`txt`/`timesteps`/`img_cu_seqlens`/`txt_cu_seqlens` + `img_shapes` in, **pre-CFG** velocity out (the CFG combine happens downstream in `_velocity`). `img_shapes` is the msrope coordinate table. |
+| `mage_flow_e2e_golden.safetensors` (+ `.png`) | `--stage e2e` | txt2img e2e | Final tokens + `final_latent` (captured by wrapping `_decode_one`, which is otherwise the only place the final latent is observable) + decoded `image_u8`, plus `traj_step0/1` (the batch-CFG-doubled latent entering steps 0 and 1 — `traj_step0`'s first half must equal the `noise` golden's `gs_noise`). Also carries the `sigmas_4`/`sigmas_30` schedules: **Turbo is the same static-shift formula at N=4**, there is no separate distilled timestep table. |
+| `mage_flow_edit_golden.safetensors` (+ `.png`) | `--stage edit` | instruction-edit e2e | Needs the **Edit** repo. `seq_step0` is the literal assembled image stream — `[noisy_target, ref_1, …]`, target FIRST, refs clean and re-concatenated every step, doubled by `batch_cfg` — and `img_shapes` is one `(frame_count, h, w)` row per segment, in the order `[target, ref_1, …]` then the `batch_cfg` duplicate. The msrope **frame index** is the row's *position* in that list (target 0, ref_j j), not the `frame_count` column, which is always 1. |
+
+After dumping, run the companion checker — it needs only numpy + safetensors (no torch, no
+weights, no reference checkout):
+
+```sh
+python tools/verify_mage_flow_golden.py
+```
+
+It asserts two kinds of invariant. **Structural** ones cover shapes, ranges, drop indices and
+the schedule ladder. **Payload** ones recompute or cross-derive the actual numbers, so they fail
+if a tensor is replaced by shape- and moment-matched noise, rescaled, or captured at the wrong
+point — the failure a golden is worst at surfacing, because every downstream parity test would
+then happily "match" the wrong thing:
+
+- `traj_step1 == traj_step0 + (σ1−σ0)·(unc + cfg·(cond−unc))` — the DiT velocity, the CFG
+  combine and the Euler step, closed over three files; the check also proves it discriminates by
+  re-scoring the cond-only / uncond-only / swapped / no-step combinations;
+- the msrope table **recomputed in numpy** from `img_shapes` + `theta=10000` +
+  `axes_dim=[16,56,56]`, which also pins the batch_cfg frame-index shift (segment *j* rotates at
+  frame *j*: cond is exact identity, the duplicated uncond half is frame 1);
+- `dit_in.txt == cat(gen_txt, neg_txt)` **bit-for-bit** — the conditioning the transformer
+  actually consumed is the dumped TE output, which is what pins GAP 1 (final post-RMSNorm, not
+  penultimate); backed by a per-token RMS envelope that a rescaled wrong-layer capture fails;
+- `dec_from_latent` reconstructs `pixels` (encode→decode round-trip), `enc_mean`'s channels track
+  the input image, and the `edit` golden's ref segment correlates with that same `enc_mean`;
+- `final_tokens` ↔ `final_latent` reshape identity, plus "this latent is the one that decoded to
+  `image_u8`";
+- cond/uncond halves of `dit_out` and `block_out.1` stay near-collinear, and both block outputs
+  are heavy-tailed activations rather than Gaussian noise.
+
+Missing goldens are a **failure**, not a skip (they are gitignored, so "absent" is the state of a
+fresh clone and a checker that greens there greens when it verified nothing); pass
+`--allow-missing` to check a partial bundle deliberately, and `--golden DIR` to point it
+elsewhere.
+
+**Turbo / `cfg <= 1` bundles are supported.** Every CFG-dependent invariant is gated on the real
+branch count, because at Turbo's documented default of cfg 1.0 the reference never builds the
+negative branch (`pipeline.py:326`, `:535`): the image stream is not duplicated, `img_shapes` is
+not concatenated, `dit_in.txt` is the positive conditioning alone, and `_velocity` returns the
+raw transformer output. A checker written as if the stream were always doubled would reject a
+*correct* Turbo golden outright — and at cfg exactly 1.0 the combine `unc + 1·(cond−unc)` equals
+`cond`, so its "only this combination fits" assertion would be false by construction. The CFG-off
+path therefore falls back to the single-branch Euler identity `traj_step1 == traj_step0 +
+(σ1−σ0)·dit_out`, scored against a dropped step, a sigma off-by-one, a sign flip and a missing
+Δσ — a real check, not a skip. Verified end to end against a cfg=1.0 / 4-step CPU bundle: 71/71
+invariants hold, and `--self-test --golden <that bundle>` rejects all 9 corruptions.
+
+The discrimination claim is itself executable — a checker that has never been shown to fail is
+not evidence of anything:
+
+```sh
+python tools/verify_mage_flow_golden.py --self-test
+```
+
+It corrupts a scratch copy one tensor at a time (moment-matched, and with any structural
+invariant the mutation would otherwise trip deliberately repaired: `enc_latent` stays equal to
+`enc_mean`, `final_latent` is re-derived from the corrupted `final_tokens`, the randomized msrope
+keeps unit modulus and matched spatial halves, the rescaled TE keeps its slice relation) and
+asserts every one is rejected while the pristine bundle passes.
+
+The six epic-14034 GAP answers these goldens pin (TE layer index, latent scale/shift,
+`axes_lens`/msrope coords, Turbo timesteps, edit ordering, training timestep distribution) are
+written up with `file:line` citations in `../../_vendor/MAGE_FLOW_GAPS.md`.
+
 ### Weight-independent
 
 | golden | dump script | consumed by | notes |
@@ -274,14 +377,21 @@ baseline produced," not a hard cross-machine contract. Only the goldens present 
 generated are listed.
 
 > **Coverage caveat (F-153):** the committed `CHECKSUMS.txt` was last blessed against the
-> Z-Image / Qwen / FLUX.2 / SDXL families and does **not** yet list the LTX, Wan-VACE, SVD,
-> SenseNova, or Chroma goldens documented in the manifest above. It can only be regenerated on a
-> machine that actually holds the (gitignored, weights-dependent) goldens. **Re-bless from the full
-> directory** so every family is covered, rather than hand-editing a subset:
+> Z-Image / Qwen / FLUX.2 / SDXL families, plus the seven Mage-Flow goldens appended under
+> sc-14036. It still does **not** list the LTX, Wan-VACE, SVD, SenseNova or Chroma goldens
+> documented in the manifest above. It can only be regenerated on a machine that actually holds
+> the (gitignored, weights-dependent) goldens. **Re-bless from the full directory** so every
+> family is covered, rather than hand-editing a subset:
 >
 > ```sh
 > cd tools/golden && shasum -a 256 *.safetensors > CHECKSUMS.txt   # after a full re-dump
 > ```
 >
 > Until that next full re-dump, the `shasum -c` tripwire silently passes for any family it doesn't
-> list — so the manifest above is the source of truth for *what should exist*.
+> list — so the manifest above is the source of truth for *what should exist*. The byte tripwire
+> is also single-purpose: it fires on *any* change, including a legitimate re-dump, and says
+> nothing about whether the bytes it pins are correct. For Mage-Flow that second question is
+> answered by `tools/verify_mage_flow_golden.py`, which recomputes the payload (the msrope table,
+> the Euler step, the reshape) and cross-derives the rest between files — so it survives a
+> legitimate re-dump while still rejecting a bundle whose tensors were replaced by shape- and
+> moment-matched noise, rescaled, or captured at the wrong boundary.
