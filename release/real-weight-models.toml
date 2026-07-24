@@ -549,3 +549,55 @@ expected_files = [
     "text_encoder/model.fp16.safetensors",
     "text_encoder_2/model.fp16.safetensors",
 ]
+
+[[models]]
+# Mage-Flow (RL) 4B text-to-image (sc-14036 / epic 14034): the gen repo the vendored parity
+# oracle runs (`crates/media/mlx-gen/_vendor/mage_flow`, driven by
+# `tools/dump_mage_flow_golden.py`) to emit the `mage_flow_{noise,vae,te,dit_block,dit,e2e}`
+# boundary goldens. The consuming crates + `#[ignore]`d parity tests land in P1-P4
+# (sc-14037..sc-14053). Pinned at the current head; the preceding revision
+# 9f46d09dce8a6211a5aaf157cc99754ac402a2fc differs only in repo metadata (identical weight
+# blobs). MIT (microsoft/Mage).
+key = "mage-flow"
+repository = "microsoft/Mage-Flow"
+revision = "faca09c18c1c19458e7fbc3f7bce6f7a7d4d01a9"
+license = "MIT"
+size_class = "very-large"
+profiles = ["media-macos", "media-cuda"]
+environment = ["MAGE_SNAPSHOT"]
+expected_files = [
+    "model_index.json",
+    "scheduler/scheduler_config.json",
+    "transformer/config.json",
+    "transformer/diffusion_pytorch_model.safetensors",
+    "vae/config.json",
+    "vae/diffusion_pytorch_model.safetensors",
+    "text_encoder/config.json",
+    "text_encoder/tokenizer.json",
+    "text_encoder/model.safetensors.index.json",
+]
+
+[[models]]
+# Mage-Flow-Edit 4B instruction editing (sc-14036 / epic 14034): the edit-variant repo the same
+# oracle runs for the `mage_flow_edit` golden — the transformer config is byte-identical to the
+# gen repo, so only the weights and the input-sequence assembly differ. Pinned at the current
+# head; the preceding revision 84e093f312661cf6ac6eb450286ead882349ca95 differs only in repo
+# metadata (identical weight blobs). MIT (microsoft/Mage).
+key = "mage-flow-edit"
+repository = "microsoft/Mage-Flow-Edit"
+revision = "b01d524f86498b7dabcc4b3572c6d264d786a16e"
+license = "MIT"
+size_class = "very-large"
+profiles = ["media-macos", "media-cuda"]
+environment = ["MAGE_EDIT_SNAPSHOT"]
+expected_files = [
+    "model_index.json",
+    "scheduler/scheduler_config.json",
+    "transformer/config.json",
+    "transformer/diffusion_pytorch_model.safetensors",
+    "vae/config.json",
+    "vae/diffusion_pytorch_model.safetensors",
+    "text_encoder/config.json",
+    "text_encoder/tokenizer.json",
+    "text_encoder/model.safetensors.index.json",
+]

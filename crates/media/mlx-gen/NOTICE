@@ -5,16 +5,30 @@ This product is licensed under the Apache License, Version 2.0. A copy of the
 license is provided in the LICENSE file.
 
 mlx-gen is an independent, from-scratch Rust reimplementation of on-device MLX
-inference for generative image and video models. It does not include source
-code copied from the projects listed below, but gratefully acknowledges them as
-the architectural lineage, references, and parity baselines it was developed
-against:
+inference for generative image and video models. No source code from the
+projects listed below is copied into the shipped Rust crates; they are
+gratefully acknowledged as the architectural lineage, references, and parity
+baselines it was developed against:
 
   * Apple MLX               https://github.com/ml-explore/mlx           (MIT)
   * mlx-rs                  https://crates.io/crates/mlx-rs             (Apache-2.0 OR MIT)
   * mflux (Filip Strand)    https://github.com/filipstrand/mflux        (MIT)
   * Apple mlx-examples      https://github.com/ml-explore/mlx-examples  (MIT)
   * Hugging Face Diffusers  https://github.com/huggingface/diffusers    (Apache-2.0)
+
+Vendored third-party source
+---------------------------
+
+One frozen third-party reference implementation IS redistributed with this
+crate, under `_vendor/`. It is a dev-only parity oracle: it is Python, it is
+never imported by any Rust crate, and it is not part of any shipped bundle.
+
+  * Mage-Flow reference     https://github.com/microsoft/Mage           (MIT)
+    `_vendor/mage_flow/` — verbatim copy of the `mage_flow/` package at commit
+    df7f84d9f8fc991d189d929f03cff623b430a4a2, redistributed under the MIT
+    license reproduced at `_vendor/mage_flow/LICENSE`.
+    Copyright (c) 2026 Microsoft. See `_vendor/VENDORED.md` for provenance,
+    the pinned reference environment, and what was excluded.
 
 Model weights are not distributed with mlx-gen and remain subject to the
 licenses of their respective providers.
