@@ -3,7 +3,7 @@
 //! SceneWorks lets a user point at an existing ComfyUI `models/` tree and generate
 //! from the weights in place — no copy, no re-download (Phase 1 did this for LoRAs).
 //! Phase 2 does it for **base** models. A ComfyUI Z-Image install ships the three
-//! components as *separate* single files with ComfyUI-native tensor names:
+//! components as separate files or a fused checkpoint with component prefixes:
 //!
 //! * `unet/z_image_turbo_bf16.safetensors` — the DiT, 453 tensors, ComfyUI-native
 //!   keys (fused `attention.qkv`, `q_norm`/`k_norm`, `attention.out`).
@@ -14,12 +14,13 @@
 //!   which the diffusers-format `AutoEncoderKL` the pipeline uses does **not**
 //!   accept.
 //!
+//! Dense bf16, plain E4M3 fp8, and scalar-companion scaled-fp8 tensors normalize
+//! to the pipeline compute dtype before these key transforms.
+//!
 //! This module is the two key-schema remaps that make the DiT and VAE loadable via
 //! `VarBuilder::from_tensors` (the same in-memory tensor path
 //! [`crate::pipeline::Pipeline::transformer_vb_with_adapters`] already uses for
-//! LoRA merge). It is the shared seam the later per-quant slices (fp8 / scaled-fp8 /
-//! GGUF) extend — they add a dequant step *before* these key transforms; the key
-//! transforms themselves are quant-agnostic.
+//! LoRA merge). The key transforms themselves are quant-agnostic.
 //!
 //! Header-only classification (which file is which family/component) is done
 //! upstream by SceneWorks (`sceneworks-core::base_weights`, sc-10662); this module
@@ -28,7 +29,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use candle_gen::candle_core::Tensor;
+use candle_gen::candle_core::{DType, Tensor};
 use candle_gen::{CandleError, Result};
 
 /// The four external inputs for an in-place ComfyUI Z-Image load (sc-10668): the
@@ -42,14 +43,132 @@ use candle_gen::{CandleError, Result};
 /// verbatim.
 #[derive(Clone, Debug)]
 pub(crate) struct ComfyuiSources {
-    /// ComfyUI DiT (`unet/z_image_turbo_bf16.safetensors`), ComfyUI-native keys.
-    pub transformer_file: PathBuf,
-    /// ComfyUI Qwen3 text encoder (`text_encoders/qwen_3_4b.safetensors`), HF keys.
-    pub text_encoder_file: PathBuf,
-    /// ComfyUI VAE (`vae/ae.safetensors`), BFL/ldm keys.
-    pub vae_file: PathBuf,
+    pub weights: ComfyuiWeights,
     /// Directory containing `tokenizer/tokenizer.json` (our shipped Z-Image snapshot).
     pub tokenizer_dir: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum ComfyuiWeights {
+    Separate {
+        transformer_file: PathBuf,
+        text_encoder_file: PathBuf,
+        vae_file: PathBuf,
+    },
+    Combined(PathBuf),
+}
+
+pub(crate) struct ComponentMaps {
+    pub transformer: HashMap<String, Tensor>,
+    pub text_encoder: HashMap<String, Tensor>,
+    pub vae: HashMap<String, Tensor>,
+}
+
+/// Split a fused community checkpoint into the three Z-Image component maps.
+///
+/// Both diffusers-style component prefixes and the common LDM/ComfyUI fused
+/// prefixes are accepted. Unprefixed tensors are intentionally rejected: in a
+/// fused file their ownership is ambiguous and guessing can silently assemble a
+/// model from the wrong family.
+pub(crate) fn split_combined_checkpoint(src: HashMap<String, Tensor>) -> Result<ComponentMaps> {
+    let mut transformer = HashMap::new();
+    let mut text_encoder = HashMap::new();
+    let mut vae = HashMap::new();
+    for (key, tensor) in src {
+        let target = if let Some(rest) = key
+            .strip_prefix("model.diffusion_model.")
+            .or_else(|| key.strip_prefix("transformer."))
+        {
+            Some((rest, &mut transformer))
+        } else if let Some(rest) = key
+            .strip_prefix("conditioner.embedders.0.transformer.")
+            .or_else(|| key.strip_prefix("text_encoders.qwen3_4b.transformer."))
+            .or_else(|| key.strip_prefix("text_encoder."))
+        {
+            Some((rest, &mut text_encoder))
+        } else {
+            key.strip_prefix("first_stage_model.")
+                .or_else(|| key.strip_prefix("vae."))
+                .map(|rest| (rest, &mut vae))
+        };
+        if let Some((key, map)) = target {
+            map.insert(key.to_owned(), tensor);
+        }
+    }
+    for (name, map) in [
+        ("transformer", &transformer),
+        ("text encoder", &text_encoder),
+        ("VAE", &vae),
+    ] {
+        if map.is_empty() {
+            return Err(CandleError::Msg(format!(
+                "z-image combined checkpoint is missing the {name} component"
+            )));
+        }
+    }
+    Ok(ComponentMaps {
+        transformer,
+        text_encoder,
+        vae,
+    })
+}
+
+/// Normalize dense, plain-fp8, and companion-scaled-fp8 tensors to the
+/// requested compute dtype. Supported scale spellings are ComfyUI
+/// `.scale_weight` and inline `.weight_scale`; activation-scale companions are
+/// consumed but never applied.
+pub(crate) fn normalize_fp8_map(
+    mut src: HashMap<String, Tensor>,
+    dtype: DType,
+    what: &str,
+) -> Result<HashMap<String, Tensor>> {
+    let keys: Vec<String> = src.keys().cloned().collect();
+    let mut out = HashMap::with_capacity(src.len());
+    for key in keys {
+        if key == "scaled_fp8"
+            || key.ends_with(".scale_weight")
+            || key.ends_with(".weight_scale")
+            || key.ends_with(".scale_input")
+            || key.ends_with(".input_scale")
+        {
+            continue;
+        }
+        let tensor = src
+            .remove(&key)
+            .ok_or_else(|| CandleError::Msg(format!("{what}: missing tensor {key:?}")))?;
+        if tensor.dtype().is_int() {
+            out.insert(key, tensor);
+            continue;
+        }
+        let scale = if tensor.dtype() == DType::F8E4M3 {
+            let base = key.strip_suffix(".weight").unwrap_or(&key);
+            src.get(&format!("{base}.scale_weight"))
+                .or_else(|| src.get(&format!("{base}.weight_scale")))
+        } else {
+            None
+        };
+        let value = match scale {
+            Some(scale) => {
+                let values = scale
+                    .to_dtype(DType::F32)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?;
+                if values.len() != 1 {
+                    return Err(CandleError::Msg(format!(
+                        "{what}: scale companion for {key:?} must contain one scalar, got {} values",
+                        values.len()
+                    )));
+                }
+                tensor
+                    .to_dtype(DType::F32)?
+                    .affine(values[0] as f64, 0.0)?
+                    .to_dtype(dtype)?
+            }
+            None => tensor.to_dtype(dtype)?,
+        };
+        out.insert(key, value);
+    }
+    Ok(out)
 }
 
 /// Z-Image DiT hidden size (`Config::z_image_turbo().dim`). The fused attention
@@ -396,6 +515,76 @@ mod tests {
         let mut src = HashMap::new();
         src.insert("layers.0.attention.qkv.weight".into(), w(&[100, 100]));
         assert!(remap_dit_comfyui_to_diffusers(src).is_err());
+    }
+
+    #[test]
+    fn combined_checkpoint_splits_both_prefix_families() {
+        let mut src = HashMap::new();
+        src.insert("model.diffusion_model.layers.0.weight".into(), w(&[2, 2]));
+        src.insert(
+            "text_encoders.qwen3_4b.transformer.model.embed_tokens.weight".into(),
+            w(&[2, 2]),
+        );
+        src.insert(
+            "first_stage_model.decoder.conv_in.weight".into(),
+            w(&[2, 2]),
+        );
+        let maps = split_combined_checkpoint(src).unwrap();
+        assert!(maps.transformer.contains_key("layers.0.weight"));
+        assert!(maps.text_encoder.contains_key("model.embed_tokens.weight"));
+        assert!(maps.vae.contains_key("decoder.conv_in.weight"));
+    }
+
+    #[test]
+    fn fp8_normalization_applies_scalar_scale_and_drops_companions() {
+        let mut src = HashMap::new();
+        src.insert(
+            "layers.0.weight".into(),
+            Tensor::full(2f32, (2, 2), &Device::Cpu)
+                .unwrap()
+                .to_dtype(DType::F8E4M3)
+                .unwrap(),
+        );
+        src.insert(
+            "layers.0.scale_weight".into(),
+            Tensor::new(3f32, &Device::Cpu).unwrap(),
+        );
+        src.insert(
+            "layers.0.scale_input".into(),
+            Tensor::new(0.5f32, &Device::Cpu).unwrap(),
+        );
+        let out = normalize_fp8_map(src, DType::BF16, "test").unwrap();
+        assert_eq!(out.len(), 1);
+        let values = out["layers.0.weight"]
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert!(values.iter().all(|&value| value == 6.0));
+
+        let mut src = HashMap::new();
+        src.insert(
+            "cap_pad_token".into(),
+            Tensor::full(2f32, (2, 2), &Device::Cpu)
+                .unwrap()
+                .to_dtype(DType::F8E4M3)
+                .unwrap(),
+        );
+        src.insert(
+            "cap_pad_token.scale_weight".into(),
+            Tensor::new(3f32, &Device::Cpu).unwrap(),
+        );
+        let out = normalize_fp8_map(src, DType::BF16, "test").unwrap();
+        let values = out["cap_pad_token"]
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert!(values.iter().all(|&value| value == 6.0));
     }
 
     // --- VAE ------------------------------------------------------------------

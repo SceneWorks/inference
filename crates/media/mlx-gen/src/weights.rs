@@ -40,6 +40,92 @@ impl Weights {
         Ok(Self { tensors, metadata })
     }
 
+    /// Load a safetensors file while decoding `F8_E4M3` payloads to bf16.
+    ///
+    /// MLX has no fp8 storage dtype, but does expose byte-accurate E4M3
+    /// conversion. The regular loader therefore rejects fp8 files before a
+    /// provider can normalize them; this opt-in loader preserves the ordinary
+    /// path for all other dtypes and converts only fp8 tensor views.
+    pub fn from_file_with_fp8(path: impl AsRef<Path>) -> Result<Self> {
+        let file = std::fs::File::open(path.as_ref())?;
+        // SAFETY: the mapping is read-only and remains alive until every borrowed
+        // TensorView has been copied into MLX-owned array storage below.
+        let bytes = unsafe { memmap2::MmapOptions::new().map(&file)? };
+        let safe = safetensors_fp8::SafeTensors::deserialize(&bytes).map_err(|error| {
+            Error::from(format!("loading {}: {error}", path.as_ref().display()))
+        })?;
+        let mut tensors = HashMap::new();
+        for (name, view) in safe.tensors() {
+            let shape: Vec<i32> = view
+                .shape()
+                .iter()
+                .map(|&dim| {
+                    i32::try_from(dim).map_err(|_| {
+                        Error::Msg(format!(
+                            "loading {}: tensor {name:?} dimension {dim} exceeds MLX i32 shape range",
+                            path.as_ref().display()
+                        ))
+                    })
+                })
+                .collect::<Result<_>>()?;
+            let value = if view.dtype() == safetensors_fp8::Dtype::F8_E4M3 {
+                let elements = shape.iter().try_fold(1i32, |count, &dim| {
+                    count.checked_mul(dim).ok_or_else(|| {
+                        Error::Msg(format!(
+                            "loading {}: fp8 tensor {name:?} element count exceeds MLX's i32 \
+                             Array::from_slice range",
+                            path.as_ref().display()
+                        ))
+                    })
+                })?;
+                if elements as usize != view.data().len() {
+                    return Err(Error::Msg(format!(
+                        "loading {}: fp8 tensor {name:?} shape describes {elements} elements but \
+                         stores {} bytes",
+                        path.as_ref().display(),
+                        view.data().len()
+                    )));
+                }
+                Array::from_slice(view.data(), &shape).from_fp8(Dtype::Bfloat16)?
+            } else {
+                let dtype = match view.dtype() {
+                    safetensors_fp8::Dtype::BOOL => Dtype::Bool,
+                    safetensors_fp8::Dtype::U8 => Dtype::Uint8,
+                    safetensors_fp8::Dtype::U16 => Dtype::Uint16,
+                    safetensors_fp8::Dtype::U32 => Dtype::Uint32,
+                    safetensors_fp8::Dtype::U64 => Dtype::Uint64,
+                    safetensors_fp8::Dtype::I8 => Dtype::Int8,
+                    safetensors_fp8::Dtype::I16 => Dtype::Int16,
+                    safetensors_fp8::Dtype::I32 => Dtype::Int32,
+                    safetensors_fp8::Dtype::I64 => Dtype::Int64,
+                    safetensors_fp8::Dtype::F16 => Dtype::Float16,
+                    safetensors_fp8::Dtype::BF16 => Dtype::Bfloat16,
+                    safetensors_fp8::Dtype::F32 => Dtype::Float32,
+                    safetensors_fp8::Dtype::F64 => Dtype::Float64,
+                    other => {
+                        return Err(Error::Msg(format!(
+                            "loading {}: unsupported tensor dtype {other:?}",
+                            path.as_ref().display()
+                        )))
+                    }
+                };
+                // MLX copies the TensorView bytes into its own array storage.
+                unsafe {
+                    Array::from_raw_data(
+                        view.data().as_ptr().cast::<std::ffi::c_void>(),
+                        &shape,
+                        dtype,
+                    )
+                }
+            };
+            tensors.insert(name.to_owned(), value);
+        }
+        Ok(Self {
+            tensors,
+            metadata: HashMap::new(),
+        })
+    }
+
     /// Load and merge every `.safetensors` file under `dir` (sharded checkpoints). Keys
     /// across shards are disjoint, so a plain merge reconstructs the full tensor set
     /// without parsing the index — no torch, no shard map needed.

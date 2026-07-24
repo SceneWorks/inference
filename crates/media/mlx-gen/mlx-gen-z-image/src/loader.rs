@@ -46,6 +46,10 @@ pub fn load_tokenizer(root: &Path) -> Result<TextTokenizer> {
 /// `model.` (the encoder's own modules); no other remap is needed.
 pub fn load_text_encoder(root: &Path) -> Result<TextEncoder> {
     let w = Weights::from_dir(root.join("text_encoder"))?;
+    load_text_encoder_from_weights(w)
+}
+
+pub(crate) fn load_text_encoder_from_weights(w: Weights) -> Result<TextEncoder> {
     TextEncoder::from_weights(&w, "model", &ZTextEncoderConfig::z_image())
 }
 
@@ -58,7 +62,10 @@ pub fn load_text_encoder(root: &Path) -> Result<TextEncoder> {
 /// to bf16 is the quantize path (`AdaptableLinear::quantize`, tagged PARITY-BF16) to byte-match the
 /// fork's Q8/Q4 golden; that too is a flip-to-f32 candidate once parity stops being the goal.
 pub fn load_transformer(root: &Path) -> Result<ZImageTransformer> {
-    let mut w = Weights::from_dir(root.join("transformer"))?;
+    load_transformer_from_weights(Weights::from_dir(root.join("transformer"))?)
+}
+
+pub(crate) fn load_transformer_from_weights(mut w: Weights) -> Result<ZImageTransformer> {
     remap_transformer_keys(&mut w);
     ZImageTransformer::from_weights(&w, "", ZImageTransformerConfig::turbo())
 }
@@ -82,7 +89,10 @@ pub fn load_control_transformer(
 /// Load the full VAE (decoder + encoder), remapping both diffusers trees to the internal naming
 /// and transposing conv weights to NHWC. The encoder powers img2img (`Conditioning::Reference`).
 pub fn load_vae(root: &Path) -> Result<Vae> {
-    let mut w = Weights::from_dir(root.join("vae"))?;
+    load_vae_from_weights(Weights::from_dir(root.join("vae"))?)
+}
+
+pub(crate) fn load_vae_from_weights(mut w: Weights) -> Result<Vae> {
     remap_vae_decoder(&mut w)?;
     remap_vae_encoder(&mut w)?;
     Vae::from_weights(&w, "", &VaeDecoderConfig::default_z_image())?.with_encoder(
