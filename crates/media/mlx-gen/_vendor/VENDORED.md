@@ -161,12 +161,16 @@ surface and `tools/golden/README.md` for the golden manifest.
   loud error instead of a blank-white refusal-image golden that every parity test would happily
   match.
 * **Never dump goldens on MPS — it corrupts them SILENTLY.** Measured under sc-14036: a
-  `--stage te` dump on MPS writes a `neg_txt` whose last 3 of its 6 rows are **all zeros**,
-  while the hooked `gen_hidden_full` tail it must equal is fully populated (max_abs 61.4342,
-  reproducible across three runs). The same comparison made *in process* on the live torch
-  tensors agrees at 0.0, so the zero-fill appears in the `_f32` MPS→CPU copy, not in the
-  reference. Nothing raises. `MAGE_DEVICE=cpu` is the blessed path, and
-  `verify_mage_flow_golden.py` now hard-fails an MPS-dumped bundle on exactly this invariant.
+  `--stage te` dump on MPS writes a **corrupted** `neg_txt` — the packed negative's post-drop
+  tail — while the hooked `gen_hidden_full` tail it must equal is fully populated. The
+  magnitude is stable (max_abs 61.4342, reproducible across three runs; `neg_vec` off by
+  21.0056); the *signature* is not — the bad tail has been observed both zero-filled and as
+  non-zero garbage, so do not treat "all-zero rows" as the thing to look for. The same
+  comparison made *in process* on the live torch tensors agrees at 0.0, so the corruption
+  appears in the `_f32` MPS→CPU copy, not in the reference. Nothing raises. `MAGE_DEVICE=cpu`
+  is the blessed path, and `verify_mage_flow_golden.py` now hard-fails an MPS-dumped bundle on
+  exactly this equality invariant (`neg_txt == gen_hidden_full` tail), however the tail is
+  garbled.
 * **`torch 2.13.0` MPS also mis-handles `Tensor.repeat_interleave(repeats=<int32 tensor>)`**,
   which the adaLN modulation broadcast uses (`models/modules/mage_layers.py:566`, fed by the
   int32 `cu_seqlens` the reference builds in `pipeline._lens_to_cu`). That one fails loudly

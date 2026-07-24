@@ -275,9 +275,11 @@ MAGE_DEVICE=cpu /tmp/mageflow-ref-venv/bin/python tools/dump_mage_flow_golden.py
 Weights: `microsoft/Mage-Flow` (gen) and `microsoft/Mage-Flow-Edit` (edit) from the HF cache, or
 `$MAGE_SNAPSHOT` / `$MAGE_EDIT_SNAPSHOT`. **`MAGE_DEVICE=cpu` is mandatory on macOS, and the
 default is auto-select, which picks MPS** — always pass it. An MPS dump is *silently* corrupt:
-`neg_txt` comes out with the last 3 of its 6 rows zero-filled while the `gen_hidden_full` tail it
-must equal is intact (max_abs 61.4342, reproducible across three runs; the live torch tensors
-agree in-process, so the zero-fill is in the MPS→CPU copy). Nothing raises —
+`neg_txt` — the packed negative's post-drop tail — comes out corrupted while the
+`gen_hidden_full` tail it must equal is intact. The magnitude is stable (max_abs 61.4342,
+reproducible across three runs); the *signature* is not — the bad tail has been observed both
+zero-filled and as non-zero garbage, so do not bisect by looking for all-zero rows. The live
+torch tensors agree in-process, so the corruption is in the MPS→CPU copy. Nothing raises —
 `verify_mage_flow_golden.py` is what catches it. Do not treat the DiT's separate *loud* MPS
 failure (`repeat_interleave` with int32 repeats) as a guard: it only fires when the pack has ≥2
 segments, so at `cfg <= 1` an MPS run completes the whole stack and writes real images. CUDA
