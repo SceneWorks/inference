@@ -23,6 +23,7 @@
 
 #![allow(dead_code)]
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
@@ -52,13 +53,13 @@ static PROCESS_ENV_MUTEX: Mutex<()> = Mutex::new(());
 pub struct EnvVarGuard {
     _lock: MutexGuard<'static, ()>,
     key: &'static str,
-    prior: Option<String>,
+    prior: Option<OsString>,
 }
 
 impl EnvVarGuard {
     pub fn set(key: &'static str, value: Option<&str>) -> Self {
         let lock = PROCESS_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        let prior = std::env::var(key).ok();
+        let prior = std::env::var_os(key);
         match value {
             Some(value) => std::env::set_var(key, value),
             None => std::env::remove_var(key),
@@ -68,6 +69,26 @@ impl EnvVarGuard {
             key,
             prior,
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod env_tests {
+    use super::*;
+
+    #[test]
+    fn env_guard_restores_non_utf8_value_exactly() {
+        use std::os::unix::ffi::OsStringExt;
+
+        const KEY: &str = "CANDLE_GEN_TESTKIT_NON_UTF8";
+        let original = OsString::from_vec(vec![b'x', 0xff, b'y']);
+        std::env::set_var(KEY, &original);
+        {
+            let _guard = EnvVarGuard::set(KEY, None);
+            assert!(std::env::var_os(KEY).is_none());
+        }
+        assert_eq!(std::env::var_os(KEY), Some(original));
+        std::env::remove_var(KEY);
     }
 }
 

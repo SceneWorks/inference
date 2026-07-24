@@ -1282,26 +1282,20 @@ pub fn load_from_comfyui_experts_with_offload(
         offload_policy,
     )?;
     #[cfg(test)]
-    COMFYUI_TEST_OFFLOAD.store(
-        match generator.offload {
-            OffloadPolicy::Resident => 1,
-            OffloadPolicy::Sequential => 2,
-        },
-        std::sync::atomic::Ordering::SeqCst,
-    );
+    COMFYUI_TEST_OFFLOAD.set(Some(generator.offload));
     Ok(Box::new(generator))
 }
 
 #[cfg(test)]
-static COMFYUI_TEST_OFFLOAD: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+thread_local! {
+    /// Call-thread-correlated: concurrent loaders cannot overwrite this caller's observation.
+    static COMFYUI_TEST_OFFLOAD: std::cell::Cell<Option<OffloadPolicy>> =
+        const { std::cell::Cell::new(None) };
+}
 
 #[cfg(test)]
 fn last_public_comfyui_offload_for_test() -> Option<OffloadPolicy> {
-    match COMFYUI_TEST_OFFLOAD.load(std::sync::atomic::Ordering::SeqCst) {
-        1 => Some(OffloadPolicy::Resident),
-        2 => Some(OffloadPolicy::Sequential),
-        _ => None,
-    }
+    COMFYUI_TEST_OFFLOAD.get()
 }
 
 fn build_comfyui_generator(
