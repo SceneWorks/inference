@@ -27,6 +27,7 @@ use mlx_gen_mage::latent::{
     pad_and_pos, GsKey,
 };
 use mlx_rs::{Array, Dtype};
+use sha2::{Digest, Sha256};
 
 /// The golden's fixed configuration (`tools/dump_mage_flow_golden.py:102,116-121`).
 const GOLDEN_SEED: i64 = 42;
@@ -615,11 +616,30 @@ fn the_cephes_port_is_attributed_in_the_crate_notice() {
         "the NOTICE's no-source-copied claim must name the Cephes exception"
     );
 
-    // The list of conditions AND the disclaimer, verbatim. One needle per distinct BSD-3 element,
-    // so deleting any single clause or the AS-IS paragraph fails here on its own.
+    // ------------------------------------------------------------------------------------------
+    // The list of conditions AND the disclaimer, verbatim.
+    //
+    // **Every needle is matched against the grant body alone — the slice BELOW the separator —
+    // never against the whole file.** `LICENSE-CEPHES` opens with this repository's own
+    // explanatory prose, which quotes the licence, so a whole-file `contains` is not a licence
+    // check: it can be satisfied by our own commentary while the reproduced grant is gutted. That
+    // exact failure has now bitten twice in this story (a NOTICE needle matching its own
+    // cross-reference, then `Copyright (c) 2018, Steven Moshier` matching the header at
+    // `LICENSE-CEPHES:18`), so this splits structurally rather than hardening one needle at a time.
+    // ------------------------------------------------------------------------------------------
+    const SEPARATOR: &str =
+        "\n----------------------------------------------------------------------------\n";
     let license = include_str!("../../LICENSE-CEPHES");
+    let (preamble, grant) = license
+        .split_once(SEPARATOR)
+        .expect("LICENSE-CEPHES must separate the provenance header from the verbatim grant");
+    let grant = grant.trim();
+
+    // One needle per distinct BSD-3 element, so deleting any single clause, the copyright line or
+    // the AS-IS paragraph fails here on its own with a message naming what went missing.
     for needle in [
         "Copyright (c) 2018, Steven Moshier",
+        "All rights reserved.",
         "Redistribution and use in source and binary forms, with or without",
         "Redistributions of source code must retain the above copyright",
         "Redistributions in binary form must reproduce the above copyright",
@@ -629,10 +649,26 @@ fn the_cephes_port_is_attributed_in_the_crate_notice() {
         "EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.",
     ] {
         assert!(
-            license.contains(needle),
-            "crates/media/mlx-gen/LICENSE-CEPHES must reproduce `{needle}` verbatim"
+            grant.contains(needle),
+            "LICENSE-CEPHES's verbatim grant (below the separator) must reproduce `{needle}`"
         );
     }
+
+    // Belt and braces: the grant body is byte-pinned, so "verbatim" is enforced rather than
+    // sampled — reordering the clauses, altering a word, or reflowing the text all fail even
+    // though every needle above would still match. Confirmed character-identical to the grant
+    // PyTorch relies on for these routines (`aten/src/ATen/native/Math.h`, note `[3-Clause BSD
+    // License for the Cephes Math Library]`), comment markers stripped.
+    assert_eq!(grant.len(), 1439, "grant body length");
+    assert_eq!(
+        format!("{:x}", Sha256::digest(grant.as_bytes())),
+        "2cc97c632c223d45b25292c4286a6d8c017e67d2e3527aee6d469a8aa6531104",
+        "LICENSE-CEPHES's grant body is no longer byte-identical to the upstream text"
+    );
+    // And the split has to be real: a degenerate separator that left the grant empty, or a header
+    // that swallowed the licence, would otherwise satisfy everything above vacuously.
+    assert!(preamble.contains("Cephes Math Library"));
+    assert!(!preamble.contains("THIS SOFTWARE IS PROVIDED"));
 }
 
 // =================================================================================================
