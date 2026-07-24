@@ -160,9 +160,9 @@ pub fn descriptor_for(variant: MageVariant) -> ModelDescriptor {
             supported_quants: &[] as &[Quant],
             min_size: MIN_SIZE,
             max_size: MAX_SIZE,
-            // The reference packs a list of prompts into a single forward; 8 matches the platform's
-            // other image families. Revisit with the fit gate + memory calibration (sc-14046).
-            max_count: 8,
+            // The walking skeleton exposes one output per request. Packed multi-image generation
+            // remains disabled until its memory behavior is calibrated in sc-14046.
+            max_count: 1,
             mac_only: true,
             ..Default::default()
         },

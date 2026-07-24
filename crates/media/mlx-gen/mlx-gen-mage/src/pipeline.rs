@@ -12,8 +12,7 @@
 //! - **Packing.** Latents flatten to a variable-length token sequence (`patch_size == 1`) and are
 //!   packed under a fixed budget with per-sample cumulative offsets (`cu_seqlens`) instead of
 //!   block-diagonal masks. Sides must be multiples of
-//!   [`SIZE_MULTIPLE`](crate::config::SIZE_MULTIPLE); the native range is
-//!   [`MIN_SIZE`](crate::config::MIN_SIZE)–[`MAX_SIZE`](crate::config::MAX_SIZE) per side.
+//!   [`SIZE_MULTIPLE`]; the native range is [`MIN_SIZE`]–[`MAX_SIZE`] per side.
 //! - **CFG.** `use_neg = cfg > 1.0` (`:326`, `:535`): at cfg ≤ 1 the reference builds **no**
 //!   unconditional branch at all — one segment, one `cu_seqlens` pair, positive conditioning only.
 //!   Both Turbo variants default there, so the CFG-off path is a first-class case, not an edge one.
@@ -69,7 +68,7 @@ impl MageFlowPipeline {
     pub fn load(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref();
         Ok(Self {
-            text_encoder: crate::text_encoder::load(root.join("text_encoder"))?,
+            text_encoder: crate::text_encoder::load(root)?,
             transformer: MageTransformer::load(root.join("transformer"))?,
             vae: crate::vae::load(
                 root.join("vae"),
@@ -255,10 +254,13 @@ pub fn cfg_velocity(cond: &Array, unc: &Array, cfg: f32, renormalize: bool) -> R
     if cond.shape() != unc.shape() {
         return Err(Error::Msg("mage_flow: CFG velocity shapes differ".into()));
     }
-    let scale = Array::from_slice(&[cfg], &[1]);
+    // Torch keeps tensor/scalar CFG arithmetic at the velocity tensor's dtype. An f32 MLX
+    // scalar would promote the guided velocity, causing the scheduler to retain f32 latents
+    // after its documented cast back to `model_output.dtype`.
+    let scale = Array::from_slice(&[cfg], &[1]).as_dtype(cond.dtype())?;
     let guided = unc.add(&cond.subtract(unc)?.multiply(&scale)?)?;
     if !renormalize {
-        return Ok(guided);
+        return guided.as_dtype(cond.dtype()).map_err(Into::into);
     }
     // Per-token L2 norm over channels, matching torch.norm(..., dim=-1, keepdim=True).
     let cond_norm = cond.multiply(cond)?.sum_axis(-1, true)?.sqrt()?;
@@ -267,7 +269,9 @@ pub fn cfg_velocity(cond: &Array, unc: &Array, cfg: f32, renormalize: bool) -> R
         .sum_axis(-1, true)?
         .sqrt()?
         .add(Array::from_slice(&[1e-6f32], &[1]))?;
-    Ok(guided.multiply(&cond_norm.divide(&guided_norm)?)?)
+    Ok(guided
+        .multiply(&cond_norm.divide(&guided_norm)?)?
+        .as_dtype(cond.dtype())?)
 }
 
 /// Run Mage's rectified-flow Euler loop over already-packed text and image streams.
@@ -348,12 +352,14 @@ fn denoise_capture(
             transformer.forward(&img, cond_txt, &sigma, &cond_ctx)?
         };
         let delta = Array::from_slice(&[pair[1] - pair[0]], &[1]);
-        img = img.add(
-            &velocity
-                .as_dtype(Dtype::Float32)?
-                .multiply(&delta)?
-                .as_dtype(img.dtype())?,
-        )?;
+        // Diffusers' FlowMatchEulerDiscreteScheduler upcasts the sample, performs the complete
+        // Euler addition in f32, then casts the result back to model_output.dtype. Casting the
+        // scaled velocity before the add introduces an extra bf16 rounding at every step.
+        let model_dtype = velocity.dtype();
+        img = img
+            .as_dtype(Dtype::Float32)?
+            .add(&velocity.as_dtype(Dtype::Float32)?.multiply(&delta)?)?
+            .as_dtype(model_dtype)?;
         mlx_rs::transforms::eval([&img])?;
     }
     Ok(img)
@@ -367,7 +373,7 @@ pub fn decode(vae: &MageVae, tokens: &Array, gh: i32, gw: i32) -> Result<Array> 
     let scaled = pixels
         .add(Array::from_slice(&[1.0f32], &[1]))?
         .multiply(Array::from_slice(&[127.5f32], &[1]))?;
-    Ok(mlx_rs::ops::round(&scaled, None)?
+    Ok(scaled
         .as_dtype(Dtype::Uint8)?
         .transpose_axes(&[0, 2, 3, 1])?
         .reshape(&[
@@ -390,11 +396,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn rgb8_conversion_truncates_like_torch_byte() {
+        let pixels = Array::from_slice(&[-1.0f32, -0.5, 0.0, 0.5, 1.0], &[1, 1, 1, 5]);
+        let scaled = pixels
+            .add(Array::from_slice(&[1.0f32], &[1]))
+            .unwrap()
+            .multiply(Array::from_slice(&[127.5f32], &[1]))
+            .unwrap()
+            .as_dtype(Dtype::Uint8)
+            .unwrap();
+        mlx_rs::transforms::eval([&scaled]).unwrap();
+        assert_eq!(scaled.as_slice::<u8>(), &[0, 63, 127, 191, 255]);
+    }
+
+    #[test]
     fn exact_twenty_step_static_shift_schedule() {
         let s = mage_flow_sigmas(20).unwrap();
         assert_eq!(s.len(), 21);
         assert_eq!(s[0], 1.0);
-        assert!((s[1] - 0.9907834).abs() < 1e-6);
+        assert!((s[1] - 0.99130434).abs() < 1e-6);
         assert!((s[19] - 0.24).abs() < 1e-6);
         assert_eq!(s[20], 0.0);
         assert!(s.windows(2).all(|w| w[0] > w[1]));
@@ -410,6 +430,16 @@ mod tests {
         let norm =
             (normed.as_slice::<f32>()[0].powi(2) + normed.as_slice::<f32>()[1].powi(2)).sqrt();
         assert!((norm - 5.0).abs() < 1e-5);
+
+        let cond_bf16 = cond.as_dtype(Dtype::Bfloat16).unwrap();
+        let unc_bf16 = unc.as_dtype(Dtype::Bfloat16).unwrap();
+        assert_eq!(
+            cfg_velocity(&cond_bf16, &unc_bf16, 5.0, false)
+                .unwrap()
+                .dtype(),
+            Dtype::Bfloat16,
+            "Torch scalar CFG arithmetic preserves the model-output dtype"
+        );
     }
 
     #[test]
