@@ -18,7 +18,7 @@
 //! rather than silently dropped. `backend` is `"candle"` and `mac_only` is `false`.
 //!
 //! **Tiers (sc-14249, epic 9083).** The crate consumes the SceneWorks turnkey's `bf16/`, `q8/` and
-//! `q4/` tiers directly, through one seam ([`crate::quant::detect_linear`]): a projection whose
+//! `q4/` tiers directly, through one seam (`quant::detect_linear`): a projection whose
 //! `.scales` sibling is present builds packed from the MLX triple, otherwise it loads dense at the
 //! checkpoint's own store dtype and widens to f32 per op. So the tier is chosen by the DIRECTORY the
 //! caller resolved and `Quant` is a tier label, not a request to quantize anything here. This

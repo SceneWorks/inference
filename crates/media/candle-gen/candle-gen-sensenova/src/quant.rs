@@ -305,7 +305,10 @@ mod tests {
         // A small real projection: [out = 1024, in = 4096] on the 8B-MoT.
         let base = "language_model.model.layers.0.self_attn.k_proj";
         if !vb.contains_tensor(&format!("{base}.scales")) {
-            println!("[repack-guard] {} is DENSE — nothing to check", dir.display());
+            println!(
+                "[repack-guard] {} is DENSE — nothing to check",
+                dir.display()
+            );
             return;
         }
 
@@ -335,7 +338,11 @@ mod tests {
         let codes_u32 = wq.flatten_all().unwrap().to_vec1::<u32>().unwrap();
         let s = scales.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         let b = biases.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        let mask: u32 = if bits >= 32 { u32::MAX } else { (1u32 << bits) - 1 };
+        let mask: u32 = if bits >= 32 {
+            u32::MAX
+        } else {
+            (1u32 << bits) - 1
+        };
         let mut grid = vec![0f32; out_dim * in_dim];
         for r in 0..out_dim {
             for c in 0..in_dim {

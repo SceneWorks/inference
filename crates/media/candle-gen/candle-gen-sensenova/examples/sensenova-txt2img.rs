@@ -39,8 +39,8 @@ fn main() -> Result<()> {
             "pass --snapshot <dir> (or set SENSENOVA_SNAPSHOT) pointing at a SenseNova-U1-8B-MoT \
              snapshot, or at one q4/q8/bf16 tier of the SceneWorks turnkey",
         )?;
-    let prompt = arg(&args, "--prompt")
-        .unwrap_or_else(|| "a fox reading a book by candlelight".to_string());
+    let prompt =
+        arg(&args, "--prompt").unwrap_or_else(|| "a fox reading a book by candlelight".to_string());
     let seed: u64 = arg(&args, "--seed")
         .and_then(|s| s.parse().ok())
         .unwrap_or(42);
