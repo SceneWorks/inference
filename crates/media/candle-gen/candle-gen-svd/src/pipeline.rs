@@ -1,13 +1,14 @@
 //! SVD image-to-video pipeline — the `StableVideoDiffusionPipeline` orchestration over the
 //! components: a frame-wise CFG denoise loop (EDM v-prediction Euler, image-latent channel-concat)
 //! with `guidance_scale = linspace(min, max, num_frames)`; chunked temporal VAE decode → frames.
-//! candle port of `mlx-gen-svd`'s `pipeline.rs`. Latents are `[1, F, 4, h, w]` (B=1; CFG doubles to
-//! B=2 inside the step). Deterministic CPU-seeded noise (sc-3673 convention, matching candle-gen-wan).
+//! candle port of `mlx-gen-svd`'s `pipeline.rs`. Latents are `[1, F, 4, h, w]`; guided denoise runs
+//! the unconditioned and conditioned branches as sequential B=1 forwards to cap the activation peak.
+//! Deterministic CPU-seeded noise (sc-3673 convention, matching candle-gen-wan).
 
 use candle_gen::candle_core::{Device, Tensor};
 use candle_gen::gen_core::sampling::EdmModelSampling;
 use candle_gen::gen_core::{CancelFlag, Image, Progress};
-use candle_gen::{CandleError, Result as CResult};
+use candle_gen::{check_cancel, CandleError, Result as CResult};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 
@@ -106,6 +107,34 @@ fn guidance_schedule(
     Ok(Tensor::from_vec(vals, (1, f, 1, 1, 1), device)?)
 }
 
+/// Run one guided prediction as two cancel-responsive batch-1 forwards, then apply the standard
+/// frame-wise CFG blend. Keeping this as a tested seam prevents a future refactor from quietly
+/// rebuilding the batch-2 activation graph that OOMed the canonical 32 GB workload.
+#[allow(clippy::too_many_arguments)]
+fn sequential_cfg_prediction(
+    x_in: &Tensor,
+    image_latents: &Tensor,
+    image_embeds: &Tensor,
+    zeros_l: &Tensor,
+    zeros_e: &Tensor,
+    guidance: &Tensor,
+    cancel: &CancelFlag,
+    mut forward: impl FnMut(&Tensor, &Tensor) -> CResult<Tensor>,
+) -> CResult<Tensor> {
+    check_cancel(cancel)?;
+    let uncond_inp = Tensor::cat(&[x_in, zeros_l], 2)?;
+    let uncond = forward(&uncond_inp, zeros_e)?;
+    drop(uncond_inp);
+
+    check_cancel(cancel)?;
+    let cond_inp = Tensor::cat(&[x_in, image_latents], 2)?;
+    let cond = forward(&cond_inp, image_embeds)?;
+    drop(cond_inp);
+
+    // noise_pred = uncond + guidance · (cond − uncond), frame-wise.
+    Ok(uncond.add(&guidance.broadcast_mul(&(cond - &uncond)?)?)?)
+}
+
 /// The frame-wise CFG v-prediction denoise — routed through the unified curated sampler framework
 /// (epic 7114 P4, sc-7125). SVD is EDM **v-prediction** over a native Karras σ schedule, so this drives
 /// any curated solver (default `euler` = the byte-faithful N1 native path — `euler` over the EDM
@@ -114,16 +143,16 @@ fn guidance_schedule(
 /// the sampler axis but NO scheduler axis: the native Karras EDM schedule is kept verbatim.
 ///
 /// The [`EdmModelSampling`] supplies the `1/√(σ²+1)` input scaling + the v→x0 recombine, so the
-/// `predict` closure only does what's model-specific: the CFG batch, the image-latent **channel
-/// concat**, the UNet forward, and the **per-frame** guidance ramp (re-applied each eval, so multi-eval
-/// solvers stay correct). Inputs are the **conditional** rows (`[1, …]`); the uncond CFG branch zeros
-/// `image_embeds`/`image_latents` (the diffusers SVD uncond). Latents are the init noise scaled by
-/// `init_noise_sigma`. Returns the final `[1, F, 4, h, w]` latents.
+/// `predict` closure only does what's model-specific: sequential uncond/cond batch-1 forwards, the
+/// image-latent **channel concat**, and the **per-frame** guidance ramp (re-applied each eval, so
+/// multi-eval solvers stay correct). The uncond CFG branch zeros `image_embeds`/`image_latents` (the
+/// diffusers SVD uncond). This preserves the batch-2 CFG algebra at a lower activation peak in
+/// exchange for serial branch latency. Latents are the init noise scaled by `init_noise_sigma`.
+/// Returns the final `[1, F, 4, h, w]` latents.
 ///
 /// When guidance is disabled (`max_g <= 1.0`, the diffusers `do_classifier_free_guidance` gate) the
 /// uncond half is neither built nor forwarded: the loop runs a single batch-1 cond-only UNet forward,
-/// since the per-frame blend collapses to the conditional (sc-8993 F-013). Guided output (`max_g >
-/// 1.0`) is untouched.
+/// since the per-frame blend collapses to the conditional (sc-8993 F-013).
 #[allow(clippy::too_many_arguments)]
 pub fn denoise(
     unet: &SvdUnet,
@@ -152,16 +181,14 @@ pub fn denoise(
     // (sc-8993 F-013; the parent story scoped only lens/sd3/wan14b). Defaults (max 3.0) keep CFG on.
     let cfg_active = max_g > 1.0;
 
-    // CFG conditioning batches (constant across steps): row 0 = uncond (zeros), row 1 = cond. Built
-    // only when guidance is active — otherwise the cond-only single-batch path below is taken.
-    let cfg_batches = if cfg_active {
+    // CFG's constant uncond inputs and guidance ramp. Keep uncond and cond as separate batch-1
+    // forwards: retaining one batch-2 activation graph OOMs the canonical 25-frame workload on a
+    // physical 32 GB card even after the component-residency boundaries are made sequential.
+    let cfg_inputs = if cfg_active {
         let zeros_e = image_embeds.zeros_like()?;
-        let embeds2 = Tensor::cat(&[&zeros_e, image_embeds], 0)?; // [2, ctx, 1024]
         let zeros_l = image_latents.zeros_like()?;
-        let img_lat2 = Tensor::cat(&[&zeros_l, image_latents], 0)?; // [2, F, 4, h, w]
-        let atid2 = Tensor::cat(&[added_time_ids, added_time_ids], 0)?; // [2, 3]
         let guidance = guidance_schedule(num_frames, min_g, max_g, &device)?;
-        Some((embeds2, img_lat2, atid2, guidance))
+        Some((zeros_e, zeros_l, guidance))
     } else {
         None
     };
@@ -177,17 +204,17 @@ pub fn denoise(
         |x_in, t| -> CResult<Tensor> {
             // `x_in` is already the `1/√(σ²+1)`-scaled latent (`scale_model_input`) the driver applied
             // via `EdmModelSampling::input_scale`; `t` is the continuous EDM timestep `0.25·ln σ`.
-            match &cfg_batches {
-                Some((embeds2, img_lat2, atid2, guidance)) => {
-                    let lat2 = Tensor::cat(&[x_in, x_in], 0)?; // [2, F, 4, h, w]
-                    let inp = Tensor::cat(&[&lat2, img_lat2], 2)?; // [2, F, 8, h, w] (channel concat)
-                    let pred = unet.forward(&inp, t, embeds2, atid2, num_frames)?; // [2, F, 4, h, w]
-                    let uncond = pred.narrow(0, 0, 1)?;
-                    let cond = pred.narrow(0, 1, 1)?;
-                    // noise_pred = uncond + guidance · (cond − uncond), frame-wise (the raw v the EDM
-                    // contract recombines into x0).
-                    Ok(uncond.add(&guidance.broadcast_mul(&(cond - &uncond)?)?)?)
-                }
+            match &cfg_inputs {
+                Some((zeros_e, zeros_l, guidance)) => sequential_cfg_prediction(
+                    x_in,
+                    image_latents,
+                    image_embeds,
+                    zeros_l,
+                    zeros_e,
+                    guidance,
+                    cancel,
+                    |inp, embeds| Ok(unet.forward(inp, t, embeds, added_time_ids, num_frames)?),
+                ),
                 // Guidance disabled (max ≤ 1.0): single-batch cond-only forward. The CFG blend at
                 // scale 1.0 is exactly `cond`, so this returns the same velocity the 2-batch path
                 // would — at half the UNet compute.
@@ -364,6 +391,126 @@ mod tests {
         assert!(
             diff < 1e-5,
             "guidance-1.0 CFG blend must equal cond; max |diff| = {diff}"
+        );
+    }
+
+    /// The memory-saving CFG seam must retain the prior batch-2 algebra, issue two batch-1/channel-8
+    /// forwards in uncond → cond order, and honor cancellation before starting the second expensive
+    /// branch. This is deliberately injectable so the ordering regression runs hermetically on CPU.
+    #[test]
+    fn sequential_cfg_matches_batched_reference_and_cancels_between_branches() {
+        let dev = Device::Cpu;
+        let num_frames = 2;
+        let x_values = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let x_in = Tensor::from_vec(x_values.clone(), (1, num_frames, 4, 1, 1), &dev).unwrap();
+        let image_values = vec![11.0f32, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0, 18.0];
+        let image_latents =
+            Tensor::from_vec(image_values.clone(), (1, num_frames, 4, 1, 1), &dev).unwrap();
+        let zeros_l = image_latents.zeros_like().unwrap();
+        let image_embeds =
+            Tensor::ones((1, 1, 2), candle_gen::candle_core::DType::F32, &dev).unwrap();
+        let zeros_e = image_embeds.zeros_like().unwrap();
+        let guidance = guidance_schedule(num_frames, 1.0, 3.0, &dev).unwrap();
+        let uncond_pred = Tensor::from_vec(
+            vec![0.0f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
+            (1, num_frames, 4, 1, 1),
+            &dev,
+        )
+        .unwrap();
+        let cond_pred = Tensor::from_vec(
+            vec![8.0f32, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0],
+            (1, num_frames, 4, 1, 1),
+            &dev,
+        )
+        .unwrap();
+
+        let calls = Cell::new(0usize);
+        let sequential = sequential_cfg_prediction(
+            &x_in,
+            &image_latents,
+            &image_embeds,
+            &zeros_l,
+            &zeros_e,
+            &guidance,
+            &CancelFlag::new(),
+            |inp, embeds| {
+                assert_eq!(inp.dims5().unwrap(), (1, num_frames, 8, 1, 1));
+                assert_eq!(embeds.dims3().unwrap(), (1, 1, 2));
+                let call = calls.get();
+                calls.set(call + 1);
+                assert_eq!(
+                    inp.narrow(2, 0, 4)?.flatten_all()?.to_vec1::<f32>()?,
+                    x_values,
+                    "the first four channels must remain the scaled noise latent"
+                );
+                let routed_image = inp.narrow(2, 4, 4)?.flatten_all()?.to_vec1::<f32>()?;
+                match call {
+                    0 => {
+                        assert_eq!(
+                            routed_image,
+                            vec![0.0; image_values.len()],
+                            "uncond must receive zero image latents in channels 4..8"
+                        );
+                        assert_eq!(embeds.sum_all()?.to_scalar::<f32>()?, 0.0);
+                        Ok(uncond_pred.clone())
+                    }
+                    1 => {
+                        assert_eq!(
+                            routed_image, image_values,
+                            "cond must receive source-image latents in channels 4..8"
+                        );
+                        assert_eq!(embeds.sum_all()?.to_scalar::<f32>()?, 2.0);
+                        Ok(cond_pred.clone())
+                    }
+                    _ => panic!("CFG must issue exactly two forwards"),
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(calls.get(), 2);
+
+        // Reconstruct the old batch-2 result and prove the sequential seam returns the same blend.
+        let batched = Tensor::cat(&[&uncond_pred, &cond_pred], 0).unwrap();
+        let uncond_ref = batched.narrow(0, 0, 1).unwrap();
+        let cond_ref = batched.narrow(0, 1, 1).unwrap();
+        let expected = uncond_ref
+            .add(
+                &guidance
+                    .broadcast_mul(&(&cond_ref - &uncond_ref).unwrap())
+                    .unwrap(),
+            )
+            .unwrap();
+        let diff = (&sequential - &expected)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert_eq!(diff, 0.0, "sequential CFG must match the batch-2 algebra");
+
+        let cancel = CancelFlag::new();
+        let canceled_calls = Cell::new(0usize);
+        let canceled = sequential_cfg_prediction(
+            &x_in,
+            &image_latents,
+            &image_embeds,
+            &zeros_l,
+            &zeros_e,
+            &guidance,
+            &cancel,
+            |_inp, _embeds| {
+                canceled_calls.set(canceled_calls.get() + 1);
+                cancel.cancel();
+                Ok(uncond_pred.clone())
+            },
+        );
+        assert!(matches!(canceled, Err(CandleError::Canceled)));
+        assert_eq!(
+            canceled_calls.get(),
+            1,
+            "cancellation after uncond must prevent the cond forward"
         );
     }
 
