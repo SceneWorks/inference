@@ -57,16 +57,19 @@ jobs:
       MAGE_REQUIRE_GOLDENS: "1"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-      # setup-python otherwise inherits this self-hosted runner's unwritable /Users/runner cache.
-      - name: Prepare writable Python tool cache
-        run: mkdir -p "$RUNNER_TEMP/python-toolcache"
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      # actions/setup-python's Darwin package hard-codes /Users/runner during installation, which is
+      # not writable on this self-hosted runner. uv installs the exact interpreter wholly in temp.
+      - name: Install pinned reference Python
         env:
-          AGENT_TOOLSDIRECTORY: ${{ runner.temp }}/python-toolcache
-        with:
-          python-version: "3.12.10"
-          cache: pip
-          cache-dependency-path: crates/media/mlx-gen/_vendor/mage_flow/requirements-oracles.txt
+          UV_CACHE_DIR: ${{ runner.temp }}/uv-cache
+          UV_PYTHON_BIN_DIR: ${{ runner.temp }}/python-bin
+          UV_PYTHON_INSTALL_DIR: ${{ runner.temp }}/python-install
+        run: |
+          command -v uv >/dev/null
+          uv python install 3.12.10
+          python_path="$(uv python find 3.12.10)"
+          dirname "$python_path" >> "$GITHUB_PATH"
+          "$python_path" --version
       - name: Configure runner-local Mage oracle path
         run: echo "MAGE_GOLDEN_DIR=$RUNNER_TEMP/mage-flow-oracles" >> "$GITHUB_ENV"
       - name: Toolchain versions

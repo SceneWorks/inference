@@ -94,8 +94,8 @@ REFERENCE_PACKAGES = {
     "transformers": "5.5.0",
     "typing_extensions": "4.15.0",
 }
-# Keep this aligned with real-weights.yml. 3.12.10 is the newest exact 3.12 release with an
-# actions/python-versions Darwin ARM64 artifact for the self-hosted macOS oracle runner.
+# Keep this aligned with real-weights.yml. The self-hosted macOS oracle runner installs this exact
+# standalone interpreter in runner temp via uv, avoiding system Python and global tool caches.
 REFERENCE_PYTHON = (3, 12, 10)
 
 

@@ -68,8 +68,18 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("scripts/release/provision_mage_oracles.py", workflow)
         self.assertIn("requirements-oracles.txt", workflow)
         self.assertIn("--require-hashes", workflow)
-        self.assertIn('python-version: "3.12.10"', workflow)
-        self.assertNotIn('python-version: "3.12.11"', workflow)
+        self.assertIn("uv python install 3.12.10", workflow)
+        self.assertIn('python_path="$(uv python find 3.12.10)"', workflow)
+        self.assertIn(
+            "UV_CACHE_DIR: ${{ runner.temp }}/uv-cache",
+            workflow,
+        )
+        self.assertIn(
+            "UV_PYTHON_INSTALL_DIR: ${{ runner.temp }}/python-install",
+            workflow,
+        )
+        self.assertNotIn("uses: actions/setup-python", workflow)
+        self.assertNotIn("3.12.11", workflow)
         self.assertIn("Run Mage-Flow text-encoder parity", workflow)
         self.assertIn("Run Mage-VAE all-geometry parity", workflow)
         self.assertIn("Regenerate Candle Mage 1024² Torch acceptance oracles", workflow)
