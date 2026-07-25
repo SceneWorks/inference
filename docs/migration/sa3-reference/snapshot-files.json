@@ -1,0 +1,381 @@
+{
+  "schemaVersion": 1,
+  "snapshots": {
+    "medium": {
+      "files": {
+        "LICENSE.md": {
+          "bytes": 11852,
+          "sha256": "d6f6b1a4dce5c852bd6d7d9482d002baf0ccdb71e662250b73be9eec8764ee8d"
+        },
+        "LICENSE_GEMMA.md": {
+          "bytes": 10541,
+          "sha256": "e77acc0d3163bb7534675045c584b4d04b387b529239fc4b3647da0a01ba4745"
+        },
+        "NOTICE": {
+          "bytes": 97,
+          "sha256": "66f856d7da72797f528fca46b7c80634ab481f917bfe020960e123d84b19f75f"
+        },
+        "model.safetensors": {
+          "bytes": 9222116660,
+          "sha256": "48d9c65e290e7bcd5194e0633bfc2424a59ee9683f5c2d58762d997b7d8ce0b5"
+        },
+        "model_config.json": {
+          "bytes": 10360,
+          "sha256": "4f8846649df59167e1792d134acb6fc2bb7105227c5455300bad6cb107e20c88"
+        },
+        "t5gemma-b-b-ul2/config.json": {
+          "bytes": 2540,
+          "sha256": "575334409716886ac2952f5a275ed92868deef8a0ea560258d9970a431c6fb3a"
+        },
+        "t5gemma-b-b-ul2/generation_config.json": {
+          "bytes": 156,
+          "sha256": "1068b94599a94ceea097dd3936819f108c2e70806d7c6cc5ec425610af347625"
+        },
+        "t5gemma-b-b-ul2/model.safetensors": {
+          "bytes": 1183022944,
+          "sha256": "9b05ea5a4f211d023832f706fb2c0e83e4fc721b6da35ab69ceb0b55eb7800d3"
+        },
+        "t5gemma-b-b-ul2/special_tokens_map.json": {
+          "bytes": 636,
+          "sha256": "baec30ea10906f16adb8c18af7a34023002c1746542612b8b41c9f09e1351351"
+        },
+        "t5gemma-b-b-ul2/tokenizer.json": {
+          "bytes": 34362429,
+          "sha256": "7794135caa3ea73918949c902a781cc61dab674a4b59c17d85931c77c1114cbd"
+        },
+        "t5gemma-b-b-ul2/tokenizer.model": {
+          "bytes": 4241003,
+          "sha256": "61a7b147390c64585d6c3543dd6fc636906c9af3865a5548f27f31aee1d4c8e2"
+        },
+        "t5gemma-b-b-ul2/tokenizer_config.json": {
+          "bytes": 46437,
+          "sha256": "9546baec0dfefec0e29873edea9488ecde153f846e18c06ea48cb44587bf408f"
+        }
+      },
+      "repository": "stabilityai/stable-audio-3-medium",
+      "revision": "27b5a21b791b1b033d193a9e1e3ce78493f102f9"
+    },
+    "medium-base": {
+      "files": {
+        "LICENSE.md": {
+          "bytes": 11852,
+          "sha256": "d6f6b1a4dce5c852bd6d7d9482d002baf0ccdb71e662250b73be9eec8764ee8d"
+        },
+        "LICENSE_GEMMA.md": {
+          "bytes": 10541,
+          "sha256": "e77acc0d3163bb7534675045c584b4d04b387b529239fc4b3647da0a01ba4745"
+        },
+        "NOTICE": {
+          "bytes": 97,
+          "sha256": "66f856d7da72797f528fca46b7c80634ab481f917bfe020960e123d84b19f75f"
+        },
+        "model.safetensors": {
+          "bytes": 9222116660,
+          "sha256": "c443fcc4d491475064cd0ff3eb92459b1e5f5060e86d96d016f048e528e24195"
+        },
+        "model_config.json": {
+          "bytes": 7842,
+          "sha256": "27e2a299f0bda6ff742d3387398f929299575642f2c6a4d4c4f94830928fd0d5"
+        },
+        "t5gemma-b-b-ul2/config.json": {
+          "bytes": 2540,
+          "sha256": "575334409716886ac2952f5a275ed92868deef8a0ea560258d9970a431c6fb3a"
+        },
+        "t5gemma-b-b-ul2/generation_config.json": {
+          "bytes": 156,
+          "sha256": "1068b94599a94ceea097dd3936819f108c2e70806d7c6cc5ec425610af347625"
+        },
+        "t5gemma-b-b-ul2/model.safetensors": {
+          "bytes": 1183022944,
+          "sha256": "9b05ea5a4f211d023832f706fb2c0e83e4fc721b6da35ab69ceb0b55eb7800d3"
+        },
+        "t5gemma-b-b-ul2/special_tokens_map.json": {
+          "bytes": 636,
+          "sha256": "baec30ea10906f16adb8c18af7a34023002c1746542612b8b41c9f09e1351351"
+        },
+        "t5gemma-b-b-ul2/tokenizer.json": {
+          "bytes": 34362429,
+          "sha256": "7794135caa3ea73918949c902a781cc61dab674a4b59c17d85931c77c1114cbd"
+        },
+        "t5gemma-b-b-ul2/tokenizer.model": {
+          "bytes": 4241003,
+          "sha256": "61a7b147390c64585d6c3543dd6fc636906c9af3865a5548f27f31aee1d4c8e2"
+        },
+        "t5gemma-b-b-ul2/tokenizer_config.json": {
+          "bytes": 46437,
+          "sha256": "9546baec0dfefec0e29873edea9488ecde153f846e18c06ea48cb44587bf408f"
+        }
+      },
+      "repository": "stabilityai/stable-audio-3-medium-base",
+      "revision": "b32993f73c3bdc3864043a72d8032606bba737c8"
+    },
+    "same-l": {
+      "files": {
+        "LICENSE.md": {
+          "bytes": 11852,
+          "sha256": "d6f6b1a4dce5c852bd6d7d9482d002baf0ccdb71e662250b73be9eec8764ee8d"
+        },
+        "LICENSE_GEMMA.md": {
+          "bytes": 10541,
+          "sha256": "e77acc0d3163bb7534675045c584b4d04b387b529239fc4b3647da0a01ba4745"
+        },
+        "NOTICE": {
+          "bytes": 97,
+          "sha256": "66f856d7da72797f528fca46b7c80634ab481f917bfe020960e123d84b19f75f"
+        },
+        "model.safetensors": {
+          "bytes": 3408566892,
+          "sha256": "8cf93d5345c559307fc429bde896f594516fd6a1a23014c2f6055f78d8e13378"
+        },
+        "model_config.json": {
+          "bytes": 5915,
+          "sha256": "9ca55d03d868b8f6769cd7d678430a6b70c328db24350601903a92001bd4f9f1"
+        }
+      },
+      "repository": "stabilityai/SAME-L",
+      "revision": "41acf79dd242877d6499a1108ca5dba5d5eecfc5"
+    },
+    "same-s": {
+      "files": {
+        "LICENSE.md": {
+          "bytes": 11852,
+          "sha256": "d6f6b1a4dce5c852bd6d7d9482d002baf0ccdb71e662250b73be9eec8764ee8d"
+        },
+        "LICENSE_GEMMA.md": {
+          "bytes": 10541,
+          "sha256": "e77acc0d3163bb7534675045c584b4d04b387b529239fc4b3647da0a01ba4745"
+        },
+        "NOTICE": {
+          "bytes": 97,
+          "sha256": "66f856d7da72797f528fca46b7c80634ab481f917bfe020960e123d84b19f75f"
+        },
+        "model.safetensors": {
+          "bytes": 433007588,
+          "sha256": "c19698ce3a0b462acb967ee495e9eb7945221f236968c50206cce8cf22b3d305"
+        },
+        "model_config.json": {
+          "bytes": 2040,
+          "sha256": "c329dd0a6f61d0b3ea4f23930059a6c00437005692fed4310924eb286253303a"
+        }
+      },
+      "repository": "stabilityai/SAME-S",
+      "revision": "fbeb3dcf53a326e5682f38e22e7f740202d44232"
+    },
+    "small-music": {
+      "files": {
+        "LICENSE.md": {
+          "bytes": 11852,
+          "sha256": "d6f6b1a4dce5c852bd6d7d9482d002baf0ccdb71e662250b73be9eec8764ee8d"
+        },
+        "LICENSE_GEMMA.md": {
+          "bytes": 10541,
+          "sha256": "e77acc0d3163bb7534675045c584b4d04b387b529239fc4b3647da0a01ba4745"
+        },
+        "NOTICE": {
+          "bytes": 97,
+          "sha256": "66f856d7da72797f528fca46b7c80634ab481f917bfe020960e123d84b19f75f"
+        },
+        "model.safetensors": {
+          "bytes": 2270384940,
+          "sha256": "da85866b11b01d0694d990785f6abbd79c8064df1b0e6f8aea52935e0ef84b64"
+        },
+        "model_config.json": {
+          "bytes": 10341,
+          "sha256": "100776f25af5aa83f70e0c6b384de6690cb4e5ad01c24f7cfbb6524d18765f06"
+        },
+        "t5gemma-b-b-ul2/config.json": {
+          "bytes": 2540,
+          "sha256": "575334409716886ac2952f5a275ed92868deef8a0ea560258d9970a431c6fb3a"
+        },
+        "t5gemma-b-b-ul2/generation_config.json": {
+          "bytes": 156,
+          "sha256": "1068b94599a94ceea097dd3936819f108c2e70806d7c6cc5ec425610af347625"
+        },
+        "t5gemma-b-b-ul2/model.safetensors": {
+          "bytes": 1183022944,
+          "sha256": "9b05ea5a4f211d023832f706fb2c0e83e4fc721b6da35ab69ceb0b55eb7800d3"
+        },
+        "t5gemma-b-b-ul2/special_tokens_map.json": {
+          "bytes": 636,
+          "sha256": "baec30ea10906f16adb8c18af7a34023002c1746542612b8b41c9f09e1351351"
+        },
+        "t5gemma-b-b-ul2/tokenizer.json": {
+          "bytes": 34362429,
+          "sha256": "7794135caa3ea73918949c902a781cc61dab674a4b59c17d85931c77c1114cbd"
+        },
+        "t5gemma-b-b-ul2/tokenizer.model": {
+          "bytes": 4241003,
+          "sha256": "61a7b147390c64585d6c3543dd6fc636906c9af3865a5548f27f31aee1d4c8e2"
+        },
+        "t5gemma-b-b-ul2/tokenizer_config.json": {
+          "bytes": 46437,
+          "sha256": "9546baec0dfefec0e29873edea9488ecde153f846e18c06ea48cb44587bf408f"
+        }
+      },
+      "repository": "stabilityai/stable-audio-3-small-music",
+      "revision": "0fef1392cd842149a2b6d445e181c97608faac06"
+    },
+    "small-music-base": {
+      "files": {
+        "LICENSE.md": {
+          "bytes": 11852,
+          "sha256": "d6f6b1a4dce5c852bd6d7d9482d002baf0ccdb71e662250b73be9eec8764ee8d"
+        },
+        "LICENSE_GEMMA.md": {
+          "bytes": 10541,
+          "sha256": "e77acc0d3163bb7534675045c584b4d04b387b529239fc4b3647da0a01ba4745"
+        },
+        "NOTICE": {
+          "bytes": 97,
+          "sha256": "66f856d7da72797f528fca46b7c80634ab481f917bfe020960e123d84b19f75f"
+        },
+        "model.safetensors": {
+          "bytes": 2270384940,
+          "sha256": "79691fac2a08a99a229b98963f8377ddc78c16f5c63f7e3a022375c311093ab4"
+        },
+        "model_config.json": {
+          "bytes": 8452,
+          "sha256": "e97f53a0882a99b0307cf7d87d63423f75925b5def5efc180d29740899c62486"
+        },
+        "t5gemma-b-b-ul2/config.json": {
+          "bytes": 2540,
+          "sha256": "575334409716886ac2952f5a275ed92868deef8a0ea560258d9970a431c6fb3a"
+        },
+        "t5gemma-b-b-ul2/generation_config.json": {
+          "bytes": 156,
+          "sha256": "1068b94599a94ceea097dd3936819f108c2e70806d7c6cc5ec425610af347625"
+        },
+        "t5gemma-b-b-ul2/model.safetensors": {
+          "bytes": 1183022944,
+          "sha256": "9b05ea5a4f211d023832f706fb2c0e83e4fc721b6da35ab69ceb0b55eb7800d3"
+        },
+        "t5gemma-b-b-ul2/special_tokens_map.json": {
+          "bytes": 636,
+          "sha256": "baec30ea10906f16adb8c18af7a34023002c1746542612b8b41c9f09e1351351"
+        },
+        "t5gemma-b-b-ul2/tokenizer.json": {
+          "bytes": 34362429,
+          "sha256": "7794135caa3ea73918949c902a781cc61dab674a4b59c17d85931c77c1114cbd"
+        },
+        "t5gemma-b-b-ul2/tokenizer.model": {
+          "bytes": 4241003,
+          "sha256": "61a7b147390c64585d6c3543dd6fc636906c9af3865a5548f27f31aee1d4c8e2"
+        },
+        "t5gemma-b-b-ul2/tokenizer_config.json": {
+          "bytes": 46437,
+          "sha256": "9546baec0dfefec0e29873edea9488ecde153f846e18c06ea48cb44587bf408f"
+        }
+      },
+      "repository": "stabilityai/stable-audio-3-small-music-base",
+      "revision": "eab5ceee5ad9c1ed38800aff30a8e49d1161c539"
+    },
+    "small-sfx": {
+      "files": {
+        "LICENSE.md": {
+          "bytes": 11852,
+          "sha256": "d6f6b1a4dce5c852bd6d7d9482d002baf0ccdb71e662250b73be9eec8764ee8d"
+        },
+        "LICENSE_GEMMA.md": {
+          "bytes": 10541,
+          "sha256": "e77acc0d3163bb7534675045c584b4d04b387b529239fc4b3647da0a01ba4745"
+        },
+        "NOTICE": {
+          "bytes": 97,
+          "sha256": "66f856d7da72797f528fca46b7c80634ab481f917bfe020960e123d84b19f75f"
+        },
+        "model.safetensors": {
+          "bytes": 2270384940,
+          "sha256": "ed9cf1b6172f1a8c2921a9560c21109ff3239524563ced9dce6dcdef41e2f515"
+        },
+        "model_config.json": {
+          "bytes": 10454,
+          "sha256": "a8aa5d45ae3d6524d3cd4e85e0d6e7d8d401267e7c6f28214bca8aae7b77bdeb"
+        },
+        "t5gemma-b-b-ul2/config.json": {
+          "bytes": 2540,
+          "sha256": "575334409716886ac2952f5a275ed92868deef8a0ea560258d9970a431c6fb3a"
+        },
+        "t5gemma-b-b-ul2/generation_config.json": {
+          "bytes": 156,
+          "sha256": "1068b94599a94ceea097dd3936819f108c2e70806d7c6cc5ec425610af347625"
+        },
+        "t5gemma-b-b-ul2/model.safetensors": {
+          "bytes": 1183022944,
+          "sha256": "9b05ea5a4f211d023832f706fb2c0e83e4fc721b6da35ab69ceb0b55eb7800d3"
+        },
+        "t5gemma-b-b-ul2/special_tokens_map.json": {
+          "bytes": 636,
+          "sha256": "baec30ea10906f16adb8c18af7a34023002c1746542612b8b41c9f09e1351351"
+        },
+        "t5gemma-b-b-ul2/tokenizer.json": {
+          "bytes": 34362429,
+          "sha256": "7794135caa3ea73918949c902a781cc61dab674a4b59c17d85931c77c1114cbd"
+        },
+        "t5gemma-b-b-ul2/tokenizer.model": {
+          "bytes": 4241003,
+          "sha256": "61a7b147390c64585d6c3543dd6fc636906c9af3865a5548f27f31aee1d4c8e2"
+        },
+        "t5gemma-b-b-ul2/tokenizer_config.json": {
+          "bytes": 46437,
+          "sha256": "9546baec0dfefec0e29873edea9488ecde153f846e18c06ea48cb44587bf408f"
+        }
+      },
+      "repository": "stabilityai/stable-audio-3-small-sfx",
+      "revision": "ae12755283df9d62ca39a9b050a39a0b607b8c20"
+    },
+    "small-sfx-base": {
+      "files": {
+        "LICENSE.md": {
+          "bytes": 11852,
+          "sha256": "d6f6b1a4dce5c852bd6d7d9482d002baf0ccdb71e662250b73be9eec8764ee8d"
+        },
+        "LICENSE_GEMMA.md": {
+          "bytes": 10541,
+          "sha256": "e77acc0d3163bb7534675045c584b4d04b387b529239fc4b3647da0a01ba4745"
+        },
+        "NOTICE": {
+          "bytes": 97,
+          "sha256": "66f856d7da72797f528fca46b7c80634ab481f917bfe020960e123d84b19f75f"
+        },
+        "model.safetensors": {
+          "bytes": 2270384940,
+          "sha256": "0c7cddb22cd7bf5e8169c6731a9eb7690c27ef5b53e8a4f9b4b2aaf8afcdaea2"
+        },
+        "model_config.json": {
+          "bytes": 8476,
+          "sha256": "cecfbca43fa8ece5d1d128fba74a39594ea954b2b128048534f72665c6721165"
+        },
+        "t5gemma-b-b-ul2/config.json": {
+          "bytes": 2540,
+          "sha256": "575334409716886ac2952f5a275ed92868deef8a0ea560258d9970a431c6fb3a"
+        },
+        "t5gemma-b-b-ul2/generation_config.json": {
+          "bytes": 156,
+          "sha256": "1068b94599a94ceea097dd3936819f108c2e70806d7c6cc5ec425610af347625"
+        },
+        "t5gemma-b-b-ul2/model.safetensors": {
+          "bytes": 1183022944,
+          "sha256": "9b05ea5a4f211d023832f706fb2c0e83e4fc721b6da35ab69ceb0b55eb7800d3"
+        },
+        "t5gemma-b-b-ul2/special_tokens_map.json": {
+          "bytes": 636,
+          "sha256": "baec30ea10906f16adb8c18af7a34023002c1746542612b8b41c9f09e1351351"
+        },
+        "t5gemma-b-b-ul2/tokenizer.json": {
+          "bytes": 34362429,
+          "sha256": "7794135caa3ea73918949c902a781cc61dab674a4b59c17d85931c77c1114cbd"
+        },
+        "t5gemma-b-b-ul2/tokenizer.model": {
+          "bytes": 4241003,
+          "sha256": "61a7b147390c64585d6c3543dd6fc636906c9af3865a5548f27f31aee1d4c8e2"
+        },
+        "t5gemma-b-b-ul2/tokenizer_config.json": {
+          "bytes": 46437,
+          "sha256": "9546baec0dfefec0e29873edea9488ecde153f846e18c06ea48cb44587bf408f"
+        }
+      },
+      "repository": "stabilityai/stable-audio-3-small-sfx-base",
+      "revision": "cc5ddb990e30daa68336ac61c140c37c7033ab7c"
+    }
+  }
+}
