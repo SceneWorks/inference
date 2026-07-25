@@ -349,6 +349,8 @@ dependencies = [
  "candle-audio",
  "candle-nn",
  "core-llm",
+ "rand",
+ "rand_distr",
  "serde",
  "serde_json",
  "tokenizers 0.22.2",

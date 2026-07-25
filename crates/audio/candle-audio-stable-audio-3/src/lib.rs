@@ -23,6 +23,7 @@ pub use candle_audio::gen_core;
 pub mod config;
 pub mod prepare;
 pub mod pretransform;
+pub mod same;
 pub mod softnorm;
 pub mod t5gemma;
 pub mod transformer;

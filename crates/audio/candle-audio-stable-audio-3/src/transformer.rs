@@ -137,6 +137,20 @@ impl RotaryEmbedding {
         })
     }
 
+    /// Load the persisted upstream `rope.inv_freq` buffer.
+    ///
+    /// SAME checkpoints serialize this buffer for every transformer block. Loading it instead of
+    /// silently reconstructing the usual base-10,000 values makes the checkpoint the source of
+    /// truth and rejects shape-incompatible rotary state.
+    pub fn load(dim: usize, vb: VarBuilder) -> Result<Self> {
+        if dim < 2 || !dim.is_multiple_of(2) {
+            bail!("rotary dimension must be positive and even, got {dim}")
+        }
+        Ok(Self {
+            inv_freq: vb.get(dim / 2, "inv_freq")?,
+        })
+    }
+
     pub fn frequencies(&self, len: usize) -> Result<Tensor> {
         let positions =
             Tensor::arange(0u32, len as u32, self.inv_freq.device())?.to_dtype(DType::F32)?;
@@ -182,7 +196,7 @@ pub fn apply_rotary(t: &Tensor, freqs: &Tensor) -> Result<Tensor> {
     } else {
         y
     };
-    y.to_dtype(original)
+    y.to_dtype(original)?.contiguous()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

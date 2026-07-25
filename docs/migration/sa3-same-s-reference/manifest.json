@@ -1,0 +1,2217 @@
+{
+  "architecture": {
+    "alignmentSamples": 8192,
+    "attentionTokens": 34,
+    "blocks": 6,
+    "latentDim": 256,
+    "midpointShiftTokens": 17,
+    "midpointSplit": [
+      3,
+      3
+    ],
+    "patchSize": 256,
+    "ropePositions": [
+      0,
+      33
+    ],
+    "stride": 16,
+    "subchunkTokens": 17
+  },
+  "artifacts": [
+    {
+      "bytes": 15363456,
+      "file": "oracle.safetensors",
+      "sha256": "2a692ed3e93420ff82984228445e479d670d82ab66c6e7fd0914410fc9d2db54",
+      "tensors": {
+        "audio": {
+          "dtype": "float32",
+          "sha256": "5245be0bd48cd4082ad5fd9c216f3ef448822e85b4aa407df5ab556dd6b91655",
+          "shape": [
+            1,
+            2,
+            16384
+          ]
+        },
+        "decoded": {
+          "dtype": "float32",
+          "sha256": "98bb9cd599af399eb1349006467a9477b7e486ae81a228660d621432c0af9e8e",
+          "shape": [
+            1,
+            2,
+            16384
+          ]
+        },
+        "decoder.block_0": {
+          "dtype": "float32",
+          "sha256": "d32806c62fc1a6225b086ae991f26ce9cf9d927342ebbe56e3e758673d69ceec",
+          "shape": [
+            1,
+            68,
+            768
+          ]
+        },
+        "decoder.block_0_input": {
+          "dtype": "float32",
+          "sha256": "fdd8af0944059e90bb0fd581eefc92d5526a840bba8e70307b528ab4661e9acd",
+          "shape": [
+            2,
+            34,
+            768
+          ]
+        },
+        "decoder.block_1": {
+          "dtype": "float32",
+          "sha256": "60de5938798504c07ecdb908b14ed4903536067e62fae50c1d9de8e9f50de068",
+          "shape": [
+            1,
+            68,
+            768
+          ]
+        },
+        "decoder.block_1_input": {
+          "dtype": "float32",
+          "sha256": "d32806c62fc1a6225b086ae991f26ce9cf9d927342ebbe56e3e758673d69ceec",
+          "shape": [
+            2,
+            34,
+            768
+          ]
+        },
+        "decoder.block_2": {
+          "dtype": "float32",
+          "sha256": "9885fe235711323cb878adbd66bf0568cba27127cbfdcf58452c149437d27584",
+          "shape": [
+            1,
+            68,
+            768
+          ]
+        },
+        "decoder.block_2_input": {
+          "dtype": "float32",
+          "sha256": "60de5938798504c07ecdb908b14ed4903536067e62fae50c1d9de8e9f50de068",
+          "shape": [
+            2,
+            34,
+            768
+          ]
+        },
+        "decoder.block_3": {
+          "dtype": "float32",
+          "sha256": "091fcb4024c7235aa2fb1541ee655e1ef1be6bbd47552455650e16fd698e35b6",
+          "shape": [
+            1,
+            68,
+            768
+          ]
+        },
+        "decoder.block_3_input": {
+          "dtype": "float32",
+          "sha256": "e338d7403805e1a3b40e15fe72f63128c3671c57a135d0048f0c1fecc3991e55",
+          "shape": [
+            3,
+            34,
+            768
+          ]
+        },
+        "decoder.block_4": {
+          "dtype": "float32",
+          "sha256": "e099ed28d3f06f5ba5e3632fc4b280d84c13851aa908607318bba2512d323eef",
+          "shape": [
+            1,
+            68,
+            768
+          ]
+        },
+        "decoder.block_4_input": {
+          "dtype": "float32",
+          "sha256": "b5f869ad675cf28f15b8054a8f8b49d1c11833b0d7ec481593999ce8bb4b147b",
+          "shape": [
+            3,
+            34,
+            768
+          ]
+        },
+        "decoder.block_5": {
+          "dtype": "float32",
+          "sha256": "2207ffeb5230b35f267014134615df8fc656ee4e67c52db45c364461d8c8b800",
+          "shape": [
+            1,
+            68,
+            768
+          ]
+        },
+        "decoder.block_5_input": {
+          "dtype": "float32",
+          "sha256": "d973b1ea4dc8feaebfff89e6b5e8b0cab6e08916e2f6b617cfc992fd0d8fa4d0",
+          "shape": [
+            3,
+            34,
+            768
+          ]
+        },
+        "decoder.expanded_tokens": {
+          "dtype": "float32",
+          "sha256": "5e1d3fb45b0811c2207ab7d9f17f295c16de19db27f1948a7965a62a27bc757a",
+          "shape": [
+            1,
+            64,
+            768
+          ]
+        },
+        "decoder.folded_input": {
+          "dtype": "float32",
+          "sha256": "fdd8af0944059e90bb0fd581eefc92d5526a840bba8e70307b528ab4661e9acd",
+          "shape": [
+            2,
+            34,
+            768
+          ]
+        },
+        "decoder.mapped_sequence": {
+          "dtype": "float32",
+          "sha256": "31fd608c311f31b1c8051c06e8d86057e03aad7bd33b7c4522e365f797c6cccd",
+          "shape": [
+            1,
+            4,
+            768
+          ]
+        },
+        "decoder.output": {
+          "dtype": "float32",
+          "sha256": "f2862643e92a999c076bfb13057de9bc2d34e410a42b300a6739a70d8544ae20",
+          "shape": [
+            1,
+            512,
+            64
+          ]
+        },
+        "decoder.selected_segments": {
+          "dtype": "float32",
+          "sha256": "d5b286cd2a213d803d8b3f57bf7906cc073b8027f312c8405824005356055720",
+          "shape": [
+            1,
+            64,
+            768
+          ]
+        },
+        "decoder_mask_noise": {
+          "dtype": "float32",
+          "sha256": "393b32de4bfdb8a4f2dd099b6c67114a3c9581520bc3a89cf615e43612f2ec07",
+          "shape": [
+            1,
+            64,
+            768
+          ]
+        },
+        "encoder.block_0": {
+          "dtype": "float32",
+          "sha256": "da01e01cfff50e25884ffa7bffe7743ba713e6674e3860ebbe4af3fd894f60dd",
+          "shape": [
+            1,
+            68,
+            768
+          ]
+        },
+        "encoder.block_0_input": {
+          "dtype": "float32",
+          "sha256": "436db8bfcd81a2fbe3e45250946e81621d303c05740bc18694c9249487e1d154",
+          "shape": [
+            2,
+            34,
+            768
+          ]
+        },
+        "encoder.block_1": {
+          "dtype": "float32",
+          "sha256": "8710b6e4d3ef0ff1192205845b699dfe34e33a5a2b28e7e6f001ac4c16668f88",
+          "shape": [
+            1,
+            68,
+            768
+          ]
+        },
+        "encoder.block_1_input": {
+          "dtype": "float32",
+          "sha256": "da01e01cfff50e25884ffa7bffe7743ba713e6674e3860ebbe4af3fd894f60dd",
+          "shape": [
+            2,
+            34,
+            768
+          ]
+        },
+        "encoder.block_2": {
+          "dtype": "float32",
+          "sha256": "0bab2c80e339781efd4d9b60d23afce74ede3fe9bfede95132928920d55184d4",
+          "shape": [
+            1,
+            68,
+            768
+          ]
+        },
+        "encoder.block_2_input": {
+          "dtype": "float32",
+          "sha256": "8710b6e4d3ef0ff1192205845b699dfe34e33a5a2b28e7e6f001ac4c16668f88",
+          "shape": [
+            2,
+            34,
+            768
+          ]
+        },
+        "encoder.block_3": {
+          "dtype": "float32",
+          "sha256": "f6d8ca5af5df392fb4bc054b6ec16a605b67cd403636f7ba551586c5559e0600",
+          "shape": [
+            1,
+            68,
+            768
+          ]
+        },
+        "encoder.block_3_input": {
+          "dtype": "float32",
+          "sha256": "84a930e216ebb8f15eaad9d66cfc31ff02ce1de5f055787f550fcd7c4947cdf7",
+          "shape": [
+            3,
+            34,
+            768
+          ]
+        },
+        "encoder.block_4": {
+          "dtype": "float32",
+          "sha256": "4a06d77c9635a1ffbce8d46a1624e13eb54c957a1009809c1bf9def22d627762",
+          "shape": [
+            1,
+            68,
+            768
+          ]
+        },
+        "encoder.block_4_input": {
+          "dtype": "float32",
+          "sha256": "144440fcb69f6e50fce156226333c2863f100d5b93eb25e000ec2007540f0c38",
+          "shape": [
+            3,
+            34,
+            768
+          ]
+        },
+        "encoder.block_5": {
+          "dtype": "float32",
+          "sha256": "298b3fe6ad2d18d151c030758efad87589df732f8bfc8c6b8704783e94fe054b",
+          "shape": [
+            1,
+            68,
+            768
+          ]
+        },
+        "encoder.block_5_input": {
+          "dtype": "float32",
+          "sha256": "1a4a59e1b10afb19893c5dcf564169778f9e7cbc769b25ce39211fa40b06dd6a",
+          "shape": [
+            3,
+            34,
+            768
+          ]
+        },
+        "encoder.expanded_tokens": {
+          "dtype": "float32",
+          "sha256": "c05ec03bea3070b8be4de6bfdf68c8c9827e763119207dd4bf4234f85e20b372",
+          "shape": [
+            1,
+            4,
+            768
+          ]
+        },
+        "encoder.folded_input": {
+          "dtype": "float32",
+          "sha256": "436db8bfcd81a2fbe3e45250946e81621d303c05740bc18694c9249487e1d154",
+          "shape": [
+            2,
+            34,
+            768
+          ]
+        },
+        "encoder.mapped_sequence": {
+          "dtype": "float32",
+          "sha256": "2ab344daf4ebadc2601b053d278bce970ae9ac0c4aa9ea677b159286b6781e44",
+          "shape": [
+            1,
+            64,
+            768
+          ]
+        },
+        "encoder.output": {
+          "dtype": "float32",
+          "sha256": "c5d27e2748be1759fbd4dba184131d07ef9156ea31f69b887fb74a23438e9cc0",
+          "shape": [
+            1,
+            768,
+            4
+          ]
+        },
+        "encoder.selected_segments": {
+          "dtype": "float32",
+          "sha256": "37c8bf677a2a081b7b87b80f5970ebadc23a9aa4836452e0cb435c870b42808a",
+          "shape": [
+            1,
+            4,
+            768
+          ]
+        },
+        "latents": {
+          "dtype": "float32",
+          "sha256": "8dd3d080e3180e08cc0475e5f4f64201b11154d8877ac94cfe351068873ce0f1",
+          "shape": [
+            1,
+            256,
+            4
+          ]
+        },
+        "regularization_noise": {
+          "dtype": "float32",
+          "sha256": "0f28de390a92d1ffde08e3791be5a8a2d9a2b6aea48f6e88fdbc7718422b8744",
+          "shape": [
+            1,
+            256,
+            4
+          ]
+        },
+        "stride8.decoded": {
+          "dtype": "float32",
+          "sha256": "b41e659512797f192468c0f3d0ea6e06f2974710d9c3b5f053fa37ac6ca37362",
+          "shape": [
+            1,
+            2,
+            16384
+          ]
+        },
+        "stride8.decoder.block_0": {
+          "dtype": "float32",
+          "sha256": "eb13f3630d673bc31e219c8708a0de756db786789e06e541ee09cb6f2be21173",
+          "shape": [
+            1,
+            72,
+            768
+          ]
+        },
+        "stride8.decoder.block_0_input": {
+          "dtype": "float32",
+          "sha256": "2e62ae392df5a136dae6904bb91332b603074f51e8817ceeec2ed6925da1be05",
+          "shape": [
+            2,
+            36,
+            768
+          ]
+        },
+        "stride8.decoder.block_1": {
+          "dtype": "float32",
+          "sha256": "2b383963e7d9284c83ec6a1d2179ee4edb0442be2586704e49eb7c0322797987",
+          "shape": [
+            1,
+            72,
+            768
+          ]
+        },
+        "stride8.decoder.block_1_input": {
+          "dtype": "float32",
+          "sha256": "eb13f3630d673bc31e219c8708a0de756db786789e06e541ee09cb6f2be21173",
+          "shape": [
+            2,
+            36,
+            768
+          ]
+        },
+        "stride8.decoder.block_2": {
+          "dtype": "float32",
+          "sha256": "fd1ee13168100ee99a94f55455de556e6c209c725d4b780bc207b36921ebc378",
+          "shape": [
+            1,
+            72,
+            768
+          ]
+        },
+        "stride8.decoder.block_2_input": {
+          "dtype": "float32",
+          "sha256": "2b383963e7d9284c83ec6a1d2179ee4edb0442be2586704e49eb7c0322797987",
+          "shape": [
+            2,
+            36,
+            768
+          ]
+        },
+        "stride8.decoder.block_3": {
+          "dtype": "float32",
+          "sha256": "47b9b6ab5ae6389178496aecae0bf9ec9e2e485b798dbd9be5d7fa6b737b47f9",
+          "shape": [
+            1,
+            72,
+            768
+          ]
+        },
+        "stride8.decoder.block_3_input": {
+          "dtype": "float32",
+          "sha256": "dd52c20a1e9dad6b686f929159fb87b075a5a8fda4920ee7c3d3200b609ae561",
+          "shape": [
+            3,
+            36,
+            768
+          ]
+        },
+        "stride8.decoder.block_4": {
+          "dtype": "float32",
+          "sha256": "f585d535f2906bcfe8caff2ed878970af1ba37b5b646abfa6731a3f4082cc8b5",
+          "shape": [
+            1,
+            72,
+            768
+          ]
+        },
+        "stride8.decoder.block_4_input": {
+          "dtype": "float32",
+          "sha256": "bdd63c56cea258970ee6d099d75aed9ea5731acd389ab31df6402cae374e0b33",
+          "shape": [
+            3,
+            36,
+            768
+          ]
+        },
+        "stride8.decoder.block_5": {
+          "dtype": "float32",
+          "sha256": "9c76635b83487c5a0519af493ca1fb27055e66b8cd4d1b5c1804a99f6e4c404c",
+          "shape": [
+            1,
+            72,
+            768
+          ]
+        },
+        "stride8.decoder.block_5_input": {
+          "dtype": "float32",
+          "sha256": "eb679759066079267134a21eb99c8ea2c39976b97e2ea53a68db1c198cb0626b",
+          "shape": [
+            3,
+            36,
+            768
+          ]
+        },
+        "stride8.decoder.expanded_tokens": {
+          "dtype": "float32",
+          "sha256": "275e8db5e58d7cc0a02763d885ee151e22bb6e4dbbeaa4e422872b7023f78e26",
+          "shape": [
+            1,
+            64,
+            768
+          ]
+        },
+        "stride8.decoder.folded_input": {
+          "dtype": "float32",
+          "sha256": "2e62ae392df5a136dae6904bb91332b603074f51e8817ceeec2ed6925da1be05",
+          "shape": [
+            2,
+            36,
+            768
+          ]
+        },
+        "stride8.decoder.mapped_sequence": {
+          "dtype": "float32",
+          "sha256": "ff825c47419d01be27e88be4296c45ca95064bba4c3626d5c17f492243d71669",
+          "shape": [
+            1,
+            8,
+            768
+          ]
+        },
+        "stride8.decoder.output": {
+          "dtype": "float32",
+          "sha256": "cfd7f0cfba21ec5c7d1cb9eafad50922505a4493ce8b877f88549fa20c8fee26",
+          "shape": [
+            1,
+            512,
+            64
+          ]
+        },
+        "stride8.decoder.selected_segments": {
+          "dtype": "float32",
+          "sha256": "70e2b25a37552202a55ef466c6799a26838602a3cb308fb7650b67eb34e94063",
+          "shape": [
+            1,
+            64,
+            768
+          ]
+        },
+        "stride8.decoder_mask_noise": {
+          "dtype": "float32",
+          "sha256": "3eb425d86715b08dd785f28357a4adfe71836fca3b703a0f03ee7b62a65217d8",
+          "shape": [
+            1,
+            64,
+            768
+          ]
+        },
+        "stride8.encoder.block_0": {
+          "dtype": "float32",
+          "sha256": "69e57b5de880639712cc5c7987ed1ecd7f6c8d8a4e30aa57615537d282a25124",
+          "shape": [
+            1,
+            72,
+            768
+          ]
+        },
+        "stride8.encoder.block_0_input": {
+          "dtype": "float32",
+          "sha256": "664d8fb5dcac10f3dbd7292a3bd1979cf082e825b35a881b86a054ee1ea4d5b9",
+          "shape": [
+            2,
+            36,
+            768
+          ]
+        },
+        "stride8.encoder.block_1": {
+          "dtype": "float32",
+          "sha256": "14a13e3eef7dfe3c83f2bc7228f29d72cbbf68ed46eded0af292f4df5f2df9b0",
+          "shape": [
+            1,
+            72,
+            768
+          ]
+        },
+        "stride8.encoder.block_1_input": {
+          "dtype": "float32",
+          "sha256": "69e57b5de880639712cc5c7987ed1ecd7f6c8d8a4e30aa57615537d282a25124",
+          "shape": [
+            2,
+            36,
+            768
+          ]
+        },
+        "stride8.encoder.block_2": {
+          "dtype": "float32",
+          "sha256": "c43f43f5188d6b5f56892f0b8f12111b55668559b4fe82dd3e6bf886a2e8915b",
+          "shape": [
+            1,
+            72,
+            768
+          ]
+        },
+        "stride8.encoder.block_2_input": {
+          "dtype": "float32",
+          "sha256": "14a13e3eef7dfe3c83f2bc7228f29d72cbbf68ed46eded0af292f4df5f2df9b0",
+          "shape": [
+            2,
+            36,
+            768
+          ]
+        },
+        "stride8.encoder.block_3": {
+          "dtype": "float32",
+          "sha256": "37865c41a8c0f41503e7f6b2d21d4750e8458ccf31a54054d526fd086bebd9fb",
+          "shape": [
+            1,
+            72,
+            768
+          ]
+        },
+        "stride8.encoder.block_3_input": {
+          "dtype": "float32",
+          "sha256": "bc8314b22adef0531d17ba785068dbcd3897d01efdd790927cf226d167cbc44a",
+          "shape": [
+            3,
+            36,
+            768
+          ]
+        },
+        "stride8.encoder.block_4": {
+          "dtype": "float32",
+          "sha256": "8aea9688a84941af9308f10641faa8188dd114fd73363aad266ee834e9c7ae79",
+          "shape": [
+            1,
+            72,
+            768
+          ]
+        },
+        "stride8.encoder.block_4_input": {
+          "dtype": "float32",
+          "sha256": "23335470e87019de588c6c8956ca728893f7bc1da0516dae9b6989dd6ccaae80",
+          "shape": [
+            3,
+            36,
+            768
+          ]
+        },
+        "stride8.encoder.block_5": {
+          "dtype": "float32",
+          "sha256": "5f8eba8f9e1f8da2ff2b7a9361aa570821886e17a5ae274ad6eaba014df71408",
+          "shape": [
+            1,
+            72,
+            768
+          ]
+        },
+        "stride8.encoder.block_5_input": {
+          "dtype": "float32",
+          "sha256": "30df856b5886649c82fa2a3dedeabce3f5942f061601b2cc530fd395aeba5e65",
+          "shape": [
+            3,
+            36,
+            768
+          ]
+        },
+        "stride8.encoder.expanded_tokens": {
+          "dtype": "float32",
+          "sha256": "9de37a25a68a2555940a757a46dfe3e173906daec6130eabc8414c7bbdb436eb",
+          "shape": [
+            1,
+            8,
+            768
+          ]
+        },
+        "stride8.encoder.folded_input": {
+          "dtype": "float32",
+          "sha256": "664d8fb5dcac10f3dbd7292a3bd1979cf082e825b35a881b86a054ee1ea4d5b9",
+          "shape": [
+            2,
+            36,
+            768
+          ]
+        },
+        "stride8.encoder.mapped_sequence": {
+          "dtype": "float32",
+          "sha256": "2ab344daf4ebadc2601b053d278bce970ae9ac0c4aa9ea677b159286b6781e44",
+          "shape": [
+            1,
+            64,
+            768
+          ]
+        },
+        "stride8.encoder.output": {
+          "dtype": "float32",
+          "sha256": "374f2b031533893cdcdfb36a7a24f5697fcac221b1582b2bc5376a82fcfc0f85",
+          "shape": [
+            1,
+            768,
+            8
+          ]
+        },
+        "stride8.encoder.selected_segments": {
+          "dtype": "float32",
+          "sha256": "b5c8708e059dc4428adc41934e1db40542fbe9371790da33ddd13b41efcd7bfe",
+          "shape": [
+            1,
+            8,
+            768
+          ]
+        },
+        "stride8.latents": {
+          "dtype": "float32",
+          "sha256": "b060a0157ee961a67cafe20255a91d88adbb9bfbd32229d01afc0df90a2217db",
+          "shape": [
+            1,
+            256,
+            8
+          ]
+        },
+        "stride8.perturbation_1e-6.decoded": {
+          "dtype": "float32",
+          "sha256": "7d663814812ab9f68b613886053f45b2634f9deb87d186093cd9e5fc090869e5",
+          "shape": [
+            1,
+            2,
+            16384
+          ]
+        },
+        "stride8.perturbation_3e-6.decoded": {
+          "dtype": "float32",
+          "sha256": "4da70c147b0aa5d1a90455eb1c66be734cd29a474fa2f008c48a8cee6909c7cd",
+          "shape": [
+            1,
+            2,
+            16384
+          ]
+        },
+        "stride8.perturbation_unit": {
+          "dtype": "float32",
+          "sha256": "c4a9291c90feb4216a627a075d341543fba41c68cc7d3845eeb5c00bf8591c5d",
+          "shape": [
+            2,
+            36,
+            768
+          ]
+        },
+        "stride8.regularization_noise": {
+          "dtype": "float32",
+          "sha256": "7ab3bfa6ff17d0e4a0e1591f83018ea0a5536a6fea8a8e47b2e3a9f2394ee5fe",
+          "shape": [
+            1,
+            256,
+            8
+          ]
+        }
+      }
+    },
+    {
+      "bytes": 12597016,
+      "file": "music-roundtrip.safetensors",
+      "sha256": "75b37a732f4d245d0565bb99a5e675242ae508e5cac6776060490962e830fe90",
+      "tensors": {
+        "audio": {
+          "dtype": "float32",
+          "sha256": "0acee9eab425e38158f27c15afa79e14855b3ec2faca7934fd0d919ca0195999",
+          "shape": [
+            1,
+            2,
+            441000
+          ]
+        },
+        "decoded_padded": {
+          "dtype": "float32",
+          "sha256": "a327cad5faf5962546db3fc38c64b5a9dddaaecc35325dc747fab1c625bff7c8",
+          "shape": [
+            1,
+            2,
+            442368
+          ]
+        },
+        "decoder_mask_noise": {
+          "dtype": "float32",
+          "sha256": "8054201e04b62a8ad74d63760c1065a33562e9ad57a01ca4be0c740c887877f9",
+          "shape": [
+            1,
+            1728,
+            768
+          ]
+        },
+        "latents": {
+          "dtype": "float32",
+          "sha256": "ca6ec7b13c1b10ea05674d66b2bf41bce6360b2548d8b957ceab4f6acccd24a7",
+          "shape": [
+            1,
+            256,
+            108
+          ]
+        },
+        "regularization_noise": {
+          "dtype": "float32",
+          "sha256": "409e04257e06c7f7e39588aad18798f96b0f48940015c9c8692776b3310884cb",
+          "shape": [
+            1,
+            256,
+            108
+          ]
+        }
+      }
+    },
+    {
+      "bytes": 100708,
+      "file": "two-stage.safetensors",
+      "sha256": "e851a9141cb18ef6f03f0ede30d9f78d79cc02605012cb0f6bea7dd48af7e3d1",
+      "tensors": {
+        "audio": {
+          "dtype": "float32",
+          "sha256": "0c90ef08d3bbce013aa70c451d548348a7a8c314faad6c2d22222cd6c8a5fbda",
+          "shape": [
+            1,
+            2,
+            32
+          ]
+        },
+        "order24.decoded": {
+          "dtype": "float32",
+          "sha256": "fc4b0dcf5647b6a4293b690dcaa73a07f3626157147a4c72bb117df0e2a31509",
+          "shape": [
+            1,
+            2,
+            64
+          ]
+        },
+        "order24.decoder0.block_0": {
+          "dtype": "float32",
+          "sha256": "89014ef62e1120793bec1ba958de3821202066bbc21f3b25511e16c9585fe473",
+          "shape": [
+            1,
+            12,
+            16
+          ]
+        },
+        "order24.decoder0.block_0_input": {
+          "dtype": "float32",
+          "sha256": "89014ef62e1120793bec1ba958de3821202066bbc21f3b25511e16c9585fe473",
+          "shape": [
+            1,
+            12,
+            16
+          ]
+        },
+        "order24.decoder0.expanded_tokens": {
+          "dtype": "float32",
+          "sha256": "5776f0b49601b2c1f508fdd36175d74c89fd484e0dcca8c0bde81e4b58bc827e",
+          "shape": [
+            1,
+            8,
+            16
+          ]
+        },
+        "order24.decoder0.folded_input": {
+          "dtype": "float32",
+          "sha256": "89014ef62e1120793bec1ba958de3821202066bbc21f3b25511e16c9585fe473",
+          "shape": [
+            1,
+            12,
+            16
+          ]
+        },
+        "order24.decoder0.mapped_sequence": {
+          "dtype": "float32",
+          "sha256": "85b686a488c8575cadb3aa9915b3688a583c811206fb91b8f868e775ebe7c272",
+          "shape": [
+            1,
+            2,
+            16
+          ]
+        },
+        "order24.decoder0.output": {
+          "dtype": "float32",
+          "sha256": "d5a0f4f51b52cd5c7833b9295fe4bceff0d18c7b0facbc2e667ad5b134b50c23",
+          "shape": [
+            1,
+            8,
+            8
+          ]
+        },
+        "order24.decoder0.selected_segments": {
+          "dtype": "float32",
+          "sha256": "5776f0b49601b2c1f508fdd36175d74c89fd484e0dcca8c0bde81e4b58bc827e",
+          "shape": [
+            1,
+            8,
+            16
+          ]
+        },
+        "order24.decoder1.block_0": {
+          "dtype": "float32",
+          "sha256": "bcb45b076bc86e95b9fb44570b5a71809384bd03da42dcf27aa77621c6c8e2f7",
+          "shape": [
+            1,
+            40,
+            8
+          ]
+        },
+        "order24.decoder1.block_0_input": {
+          "dtype": "float32",
+          "sha256": "bcb45b076bc86e95b9fb44570b5a71809384bd03da42dcf27aa77621c6c8e2f7",
+          "shape": [
+            4,
+            10,
+            8
+          ]
+        },
+        "order24.decoder1.expanded_tokens": {
+          "dtype": "float32",
+          "sha256": "fdcf732d39666c25fb64368f8e103499f26fdb71b5dbc62f981c42927111006c",
+          "shape": [
+            1,
+            32,
+            8
+          ]
+        },
+        "order24.decoder1.folded_input": {
+          "dtype": "float32",
+          "sha256": "bcb45b076bc86e95b9fb44570b5a71809384bd03da42dcf27aa77621c6c8e2f7",
+          "shape": [
+            4,
+            10,
+            8
+          ]
+        },
+        "order24.decoder1.mapped_sequence": {
+          "dtype": "float32",
+          "sha256": "d488e2356c8f4959bea341c3229c874439753e38ec47e53de720d88a8d4a45d2",
+          "shape": [
+            1,
+            8,
+            8
+          ]
+        },
+        "order24.decoder1.output": {
+          "dtype": "float32",
+          "sha256": "458cc5403fc8c3f891c1032fc8be7cee0f3381436cf1af24a0ca3af338f9d5a6",
+          "shape": [
+            1,
+            4,
+            32
+          ]
+        },
+        "order24.decoder1.selected_segments": {
+          "dtype": "float32",
+          "sha256": "fdcf732d39666c25fb64368f8e103499f26fdb71b5dbc62f981c42927111006c",
+          "shape": [
+            1,
+            32,
+            8
+          ]
+        },
+        "order24.encoder0.block_0": {
+          "dtype": "float32",
+          "sha256": "ff6c73f69015c632f202e6a80f0a9fcc4c0875fd913fef3da563cfb0c631157e",
+          "shape": [
+            1,
+            24,
+            8
+          ]
+        },
+        "order24.encoder0.block_0_input": {
+          "dtype": "float32",
+          "sha256": "ff6c73f69015c632f202e6a80f0a9fcc4c0875fd913fef3da563cfb0c631157e",
+          "shape": [
+            2,
+            12,
+            8
+          ]
+        },
+        "order24.encoder0.expanded_tokens": {
+          "dtype": "float32",
+          "sha256": "6dfb35a4b6c7364ef8af21c93a58b5be94c9f238e5591a0ab3de4858ab00d9ec",
+          "shape": [
+            1,
+            8,
+            8
+          ]
+        },
+        "order24.encoder0.folded_input": {
+          "dtype": "float32",
+          "sha256": "ff6c73f69015c632f202e6a80f0a9fcc4c0875fd913fef3da563cfb0c631157e",
+          "shape": [
+            2,
+            12,
+            8
+          ]
+        },
+        "order24.encoder0.mapped_sequence": {
+          "dtype": "float32",
+          "sha256": "835581e3665cbb965e5d3ed8d4cc017b3ffa5731115f47d7fb41ce8a2513b02a",
+          "shape": [
+            1,
+            16,
+            8
+          ]
+        },
+        "order24.encoder0.output": {
+          "dtype": "float32",
+          "sha256": "e197c0fbf431a4088252c2b89c65a7750f4654e8913d098f4d9ce2da1dda5237",
+          "shape": [
+            1,
+            8,
+            8
+          ]
+        },
+        "order24.encoder0.selected_segments": {
+          "dtype": "float32",
+          "sha256": "6dfb35a4b6c7364ef8af21c93a58b5be94c9f238e5591a0ab3de4858ab00d9ec",
+          "shape": [
+            1,
+            8,
+            8
+          ]
+        },
+        "order24.encoder1.block_0": {
+          "dtype": "float32",
+          "sha256": "7e41731ec7da6b7302ac642562ce64a2fba8ae4886107b4b665da34bb0f30496",
+          "shape": [
+            1,
+            10,
+            16
+          ]
+        },
+        "order24.encoder1.block_0_input": {
+          "dtype": "float32",
+          "sha256": "7e41731ec7da6b7302ac642562ce64a2fba8ae4886107b4b665da34bb0f30496",
+          "shape": [
+            1,
+            10,
+            16
+          ]
+        },
+        "order24.encoder1.expanded_tokens": {
+          "dtype": "float32",
+          "sha256": "fddeb0fc9628d37df7c8596fd13dc744f32852839d20e319a5d351b84cdf821c",
+          "shape": [
+            1,
+            2,
+            16
+          ]
+        },
+        "order24.encoder1.folded_input": {
+          "dtype": "float32",
+          "sha256": "7e41731ec7da6b7302ac642562ce64a2fba8ae4886107b4b665da34bb0f30496",
+          "shape": [
+            1,
+            10,
+            16
+          ]
+        },
+        "order24.encoder1.mapped_sequence": {
+          "dtype": "float32",
+          "sha256": "fcdd54b922d3b985cb2f3fb7c7b4d4b32c110a795b63bb91c4105b7bbf23b244",
+          "shape": [
+            1,
+            8,
+            16
+          ]
+        },
+        "order24.encoder1.output": {
+          "dtype": "float32",
+          "sha256": "3a74c297e4af85b99c4d3cefd9253e8e4e0e968aa1c0a3bf473dbd29ce16cbcf",
+          "shape": [
+            1,
+            16,
+            2
+          ]
+        },
+        "order24.encoder1.selected_segments": {
+          "dtype": "float32",
+          "sha256": "fddeb0fc9628d37df7c8596fd13dc744f32852839d20e319a5d351b84cdf821c",
+          "shape": [
+            1,
+            2,
+            16
+          ]
+        },
+        "order24.latents": {
+          "dtype": "float32",
+          "sha256": "5b6992be07f8cabc23f2b112cffe11ddfeef11a905ea5a5a780bab6cdc3e59dc",
+          "shape": [
+            1,
+            4,
+            2
+          ]
+        },
+        "order42.decoded": {
+          "dtype": "float32",
+          "sha256": "fc4b0dcf5647b6a4293b690dcaa73a07f3626157147a4c72bb117df0e2a31509",
+          "shape": [
+            1,
+            2,
+            64
+          ]
+        },
+        "order42.decoder0.block_0": {
+          "dtype": "float32",
+          "sha256": "0d80babf8dce1e1f515a7b6d08061bdc412f36220f7573d11ad6dbcb96b968c0",
+          "shape": [
+            1,
+            20,
+            16
+          ]
+        },
+        "order42.decoder0.block_0_input": {
+          "dtype": "float32",
+          "sha256": "0d80babf8dce1e1f515a7b6d08061bdc412f36220f7573d11ad6dbcb96b968c0",
+          "shape": [
+            2,
+            10,
+            16
+          ]
+        },
+        "order42.decoder0.expanded_tokens": {
+          "dtype": "float32",
+          "sha256": "86dcaa03452ad5280686059c74f09b4add9b00132c11624619e8ed532aff056a",
+          "shape": [
+            1,
+            16,
+            16
+          ]
+        },
+        "order42.decoder0.folded_input": {
+          "dtype": "float32",
+          "sha256": "0d80babf8dce1e1f515a7b6d08061bdc412f36220f7573d11ad6dbcb96b968c0",
+          "shape": [
+            2,
+            10,
+            16
+          ]
+        },
+        "order42.decoder0.mapped_sequence": {
+          "dtype": "float32",
+          "sha256": "08731600d11821ed3e4fefa7cb340005e9a62c5f7b1dcb8b2c2d306c3c602525",
+          "shape": [
+            1,
+            4,
+            16
+          ]
+        },
+        "order42.decoder0.output": {
+          "dtype": "float32",
+          "sha256": "d01a9a9f70d9acd2eadceea9716ae0b41da35eb0509e7a7d09359110c7e57449",
+          "shape": [
+            1,
+            8,
+            16
+          ]
+        },
+        "order42.decoder0.selected_segments": {
+          "dtype": "float32",
+          "sha256": "86dcaa03452ad5280686059c74f09b4add9b00132c11624619e8ed532aff056a",
+          "shape": [
+            1,
+            16,
+            16
+          ]
+        },
+        "order42.decoder1.block_0": {
+          "dtype": "float32",
+          "sha256": "5421aaa872457eb68315538bd851a820fba0448d309575ca7df818ecfa3b74a4",
+          "shape": [
+            1,
+            48,
+            8
+          ]
+        },
+        "order42.decoder1.block_0_input": {
+          "dtype": "float32",
+          "sha256": "5421aaa872457eb68315538bd851a820fba0448d309575ca7df818ecfa3b74a4",
+          "shape": [
+            4,
+            12,
+            8
+          ]
+        },
+        "order42.decoder1.expanded_tokens": {
+          "dtype": "float32",
+          "sha256": "fdcf732d39666c25fb64368f8e103499f26fdb71b5dbc62f981c42927111006c",
+          "shape": [
+            1,
+            32,
+            8
+          ]
+        },
+        "order42.decoder1.folded_input": {
+          "dtype": "float32",
+          "sha256": "5421aaa872457eb68315538bd851a820fba0448d309575ca7df818ecfa3b74a4",
+          "shape": [
+            4,
+            12,
+            8
+          ]
+        },
+        "order42.decoder1.mapped_sequence": {
+          "dtype": "float32",
+          "sha256": "075b59e5dba43d7cc225bfc5669ef1d883ad0e965240555150ee0f6b4043725c",
+          "shape": [
+            1,
+            16,
+            8
+          ]
+        },
+        "order42.decoder1.output": {
+          "dtype": "float32",
+          "sha256": "458cc5403fc8c3f891c1032fc8be7cee0f3381436cf1af24a0ca3af338f9d5a6",
+          "shape": [
+            1,
+            4,
+            32
+          ]
+        },
+        "order42.decoder1.selected_segments": {
+          "dtype": "float32",
+          "sha256": "fdcf732d39666c25fb64368f8e103499f26fdb71b5dbc62f981c42927111006c",
+          "shape": [
+            1,
+            32,
+            8
+          ]
+        },
+        "order42.encoder0.block_0": {
+          "dtype": "float32",
+          "sha256": "31d0aaf32feafc8bbba4b7bc4a29f6ab494c2c0d62ff776a83b0fd1f1b047dd4",
+          "shape": [
+            1,
+            20,
+            8
+          ]
+        },
+        "order42.encoder0.block_0_input": {
+          "dtype": "float32",
+          "sha256": "31d0aaf32feafc8bbba4b7bc4a29f6ab494c2c0d62ff776a83b0fd1f1b047dd4",
+          "shape": [
+            2,
+            10,
+            8
+          ]
+        },
+        "order42.encoder0.expanded_tokens": {
+          "dtype": "float32",
+          "sha256": "b8b582761f13ad0a667214c97089b5a58f2e26c73be70c726a52a444dd843849",
+          "shape": [
+            1,
+            4,
+            8
+          ]
+        },
+        "order42.encoder0.folded_input": {
+          "dtype": "float32",
+          "sha256": "31d0aaf32feafc8bbba4b7bc4a29f6ab494c2c0d62ff776a83b0fd1f1b047dd4",
+          "shape": [
+            2,
+            10,
+            8
+          ]
+        },
+        "order42.encoder0.mapped_sequence": {
+          "dtype": "float32",
+          "sha256": "835581e3665cbb965e5d3ed8d4cc017b3ffa5731115f47d7fb41ce8a2513b02a",
+          "shape": [
+            1,
+            16,
+            8
+          ]
+        },
+        "order42.encoder0.output": {
+          "dtype": "float32",
+          "sha256": "351ce6958e1bbc5b0a03fb8dcd30ee93e469bd631e026228601b6487fb823497",
+          "shape": [
+            1,
+            8,
+            4
+          ]
+        },
+        "order42.encoder0.selected_segments": {
+          "dtype": "float32",
+          "sha256": "b8b582761f13ad0a667214c97089b5a58f2e26c73be70c726a52a444dd843849",
+          "shape": [
+            1,
+            4,
+            8
+          ]
+        },
+        "order42.encoder1.block_0": {
+          "dtype": "float32",
+          "sha256": "13558013e54ef4b2c89e5fe5b9af88ed5d47d901e82da43d1dd0d8bad4b23e57",
+          "shape": [
+            1,
+            12,
+            16
+          ]
+        },
+        "order42.encoder1.block_0_input": {
+          "dtype": "float32",
+          "sha256": "13558013e54ef4b2c89e5fe5b9af88ed5d47d901e82da43d1dd0d8bad4b23e57",
+          "shape": [
+            1,
+            12,
+            16
+          ]
+        },
+        "order42.encoder1.expanded_tokens": {
+          "dtype": "float32",
+          "sha256": "7fc26d6aa31d04e52a3b3e0ae691e89bfb8f274d00d8f3e0efdd801f555bfbed",
+          "shape": [
+            1,
+            4,
+            16
+          ]
+        },
+        "order42.encoder1.folded_input": {
+          "dtype": "float32",
+          "sha256": "13558013e54ef4b2c89e5fe5b9af88ed5d47d901e82da43d1dd0d8bad4b23e57",
+          "shape": [
+            1,
+            12,
+            16
+          ]
+        },
+        "order42.encoder1.mapped_sequence": {
+          "dtype": "float32",
+          "sha256": "4732e6adc1cee9847c778ed531921888923430003df12e9ac8af7877d42684f9",
+          "shape": [
+            1,
+            8,
+            16
+          ]
+        },
+        "order42.encoder1.output": {
+          "dtype": "float32",
+          "sha256": "194b791112d60fac0fcdb9e2be2d8ef3a24aaa571ea2e5017ad3cdd3e27e96d0",
+          "shape": [
+            1,
+            16,
+            4
+          ]
+        },
+        "order42.encoder1.selected_segments": {
+          "dtype": "float32",
+          "sha256": "7fc26d6aa31d04e52a3b3e0ae691e89bfb8f274d00d8f3e0efdd801f555bfbed",
+          "shape": [
+            1,
+            4,
+            16
+          ]
+        },
+        "order42.latents": {
+          "dtype": "float32",
+          "sha256": "db1d670a599bd415953d51d063b12f5c7c55a1aabe685586d0417d2ca56f02f4",
+          "shape": [
+            1,
+            4,
+            4
+          ]
+        },
+        "weights.bottleneck.bias": {
+          "dtype": "float32",
+          "sha256": "374708fff7719dd5979ec875d56cd2286f6d3cf7ec317a3b25632aab28ec37bb",
+          "shape": [
+            1,
+            4,
+            1
+          ]
+        },
+        "weights.bottleneck.noise_scaling_factor": {
+          "dtype": "float32",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "shape": [
+            1,
+            0,
+            1
+          ]
+        },
+        "weights.bottleneck.running_std": {
+          "dtype": "float32",
+          "sha256": "e00e5eb9444182f352323374ef4e08ebcb784725fdd4fd612d7730540b3e0c8c",
+          "shape": [
+            1
+          ]
+        },
+        "weights.bottleneck.scaling_factor": {
+          "dtype": "float32",
+          "sha256": "f6bb1294da2f78cd935b01c7656280df5eaa0439e9d97bc03775825a41a508e4",
+          "shape": [
+            1,
+            4,
+            1
+          ]
+        },
+        "weights.decoder.layers.1.bias": {
+          "dtype": "float32",
+          "sha256": "bcc8aeb1a2d85c4c7d1aa56d600351ad898c8c4352206b43ed55e0163f539f0f",
+          "shape": [
+            16
+          ]
+        },
+        "weights.decoder.layers.1.weight": {
+          "dtype": "float32",
+          "sha256": "32ecaed239cec76792bea449b4e51b7caaeae51cba261ceab8c45831b05f35dd",
+          "shape": [
+            16,
+            4
+          ]
+        },
+        "weights.decoder.layers.3.mapping.bias": {
+          "dtype": "float32",
+          "sha256": "f0abc21bab091d56af0fd8c70e32b595d905bcecdc8db3a39b399d79e7c2bcef",
+          "shape": [
+            8
+          ]
+        },
+        "weights.decoder.layers.3.mapping.weight_g": {
+          "dtype": "float32",
+          "sha256": "b30311c1781da9c3d0b9266154a29dac78f7cf77f9c008c0a634cb81483acf5b",
+          "shape": [
+            8,
+            1,
+            1
+          ]
+        },
+        "weights.decoder.layers.3.mapping.weight_v": {
+          "dtype": "float32",
+          "sha256": "ff0cc8ca730cc7352c6801733bbd8e4e3e4dcce5028fdf5a97d6fa0b33813d26",
+          "shape": [
+            8,
+            16,
+            3
+          ]
+        },
+        "weights.decoder.layers.3.new_tokens": {
+          "dtype": "float32",
+          "sha256": "061bd23cf3eda9d83825d0645d3f50c3a907e5870ff56e85c83765f252b990ad",
+          "shape": [
+            1,
+            1,
+            16
+          ]
+        },
+        "weights.decoder.layers.3.transformers.0.ff.ff.0.proj.bias": {
+          "dtype": "float32",
+          "sha256": "efff72e14f5f15afc4677dfeeae7d810378ae1073ed5240e15daa061ffc284cf",
+          "shape": [
+            96
+          ]
+        },
+        "weights.decoder.layers.3.transformers.0.ff.ff.0.proj.weight": {
+          "dtype": "float32",
+          "sha256": "140ccbdd9e0844391bff79307f71a4bb366f68b36ca5a05e20f98ce9e1d1bffb",
+          "shape": [
+            96,
+            16
+          ]
+        },
+        "weights.decoder.layers.3.transformers.0.ff.ff.2.bias": {
+          "dtype": "float32",
+          "sha256": "f5a5fd42d16a20302798ef6ed309979b43003d2320d9f0e8ea9831a92759fb4b",
+          "shape": [
+            16
+          ]
+        },
+        "weights.decoder.layers.3.transformers.0.ff.ff.2.weight": {
+          "dtype": "float32",
+          "sha256": "e80232b4d18d0bb7e794be263ba937626f383f9917d4b8a737ba893a8f752293",
+          "shape": [
+            16,
+            48
+          ]
+        },
+        "weights.decoder.layers.3.transformers.0.ff_norm.alpha": {
+          "dtype": "float32",
+          "sha256": "4f4b9b7d8b86633e2824e2f439819357b0cd010ab410ea1a691b12c5f94e91e0",
+          "shape": [
+            1
+          ]
+        },
+        "weights.decoder.layers.3.transformers.0.ff_norm.beta": {
+          "dtype": "float32",
+          "sha256": "f5a5fd42d16a20302798ef6ed309979b43003d2320d9f0e8ea9831a92759fb4b",
+          "shape": [
+            16
+          ]
+        },
+        "weights.decoder.layers.3.transformers.0.ff_norm.gamma": {
+          "dtype": "float32",
+          "sha256": "9628e545ed3ac074e5a6cbf542a642b62482fbfca9b4cb3ea4743a1874256e37",
+          "shape": [
+            16
+          ]
+        },
+        "weights.decoder.layers.3.transformers.0.pre_norm.alpha": {
+          "dtype": "float32",
+          "sha256": "4f4b9b7d8b86633e2824e2f439819357b0cd010ab410ea1a691b12c5f94e91e0",
+          "shape": [
+            1
+          ]
+        },
+        "weights.decoder.layers.3.transformers.0.pre_norm.beta": {
+          "dtype": "float32",
+          "sha256": "f5a5fd42d16a20302798ef6ed309979b43003d2320d9f0e8ea9831a92759fb4b",
+          "shape": [
+            16
+          ]
+        },
+        "weights.decoder.layers.3.transformers.0.pre_norm.gamma": {
+          "dtype": "float32",
+          "sha256": "9628e545ed3ac074e5a6cbf542a642b62482fbfca9b4cb3ea4743a1874256e37",
+          "shape": [
+            16
+          ]
+        },
+        "weights.decoder.layers.3.transformers.0.rope.inv_freq": {
+          "dtype": "float32",
+          "sha256": "9d877756a0997bd64e5c564ef48548b144e1fc500cee3eda442fbe375355f683",
+          "shape": [
+            2
+          ]
+        },
+        "weights.decoder.layers.3.transformers.0.self_attn.k_norm.alpha": {
+          "dtype": "float32",
+          "sha256": "4f4b9b7d8b86633e2824e2f439819357b0cd010ab410ea1a691b12c5f94e91e0",
+          "shape": [
+            1
+          ]
+        },
+        "weights.decoder.layers.3.transformers.0.self_attn.k_norm.beta": {
+          "dtype": "float32",
+          "sha256": "66687aadf862bd776c8fc18b8e9f8e20089714856ee233b3902a591d0d5f2925",
+          "shape": [
+            8
+          ]
+        },
+        "weights.decoder.layers.3.transformers.0.self_attn.k_norm.gamma": {
+          "dtype": "float32",
+          "sha256": "4f05df05f8da9356bd66425351f166a5f7305b7c805e6900d9ec0f50790c9886",
+          "shape": [
+            8
+          ]
+        },
+        "weights.decoder.layers.3.transformers.0.self_attn.q_norm.alpha": {
+          "dtype": "float32",
+          "sha256": "4f4b9b7d8b86633e2824e2f439819357b0cd010ab410ea1a691b12c5f94e91e0",
+          "shape": [
+            1
+          ]
+        },
+        "weights.decoder.layers.3.transformers.0.self_attn.q_norm.beta": {
+          "dtype": "float32",
+          "sha256": "66687aadf862bd776c8fc18b8e9f8e20089714856ee233b3902a591d0d5f2925",
+          "shape": [
+            8
+          ]
+        },
+        "weights.decoder.layers.3.transformers.0.self_attn.q_norm.gamma": {
+          "dtype": "float32",
+          "sha256": "4f05df05f8da9356bd66425351f166a5f7305b7c805e6900d9ec0f50790c9886",
+          "shape": [
+            8
+          ]
+        },
+        "weights.decoder.layers.3.transformers.0.self_attn.to_out.weight": {
+          "dtype": "float32",
+          "sha256": "5f70bf18a086007016e948b04aed3b82103a36bea41755b6cddfaf10ace3c6ef",
+          "shape": [
+            16,
+            16
+          ]
+        },
+        "weights.decoder.layers.3.transformers.0.self_attn.to_qkv.weight": {
+          "dtype": "float32",
+          "sha256": "cb49f75f0dcdb54f91207f9e2527a5d1671818691f2abf1cb6b73e94ad9959f2",
+          "shape": [
+            80,
+            16
+          ]
+        },
+        "weights.decoder.layers.4.mapping.bias": {
+          "dtype": "float32",
+          "sha256": "0c370dcd45a76228ff217e68f8ca75dab9b0562604ad5dceb0bc72b7108b7513",
+          "shape": [
+            4
+          ]
+        },
+        "weights.decoder.layers.4.mapping.weight_g": {
+          "dtype": "float32",
+          "sha256": "0ca9fdb641e70270b16e5a8a44db867f505ac6cf49b1e8d6aab5b0dc0b0863dc",
+          "shape": [
+            4,
+            1,
+            1
+          ]
+        },
+        "weights.decoder.layers.4.mapping.weight_v": {
+          "dtype": "float32",
+          "sha256": "0968f930951bb9b6a936be2988e47c7876b6807078e49200b39a341ed65429da",
+          "shape": [
+            4,
+            8,
+            3
+          ]
+        },
+        "weights.decoder.layers.4.new_tokens": {
+          "dtype": "float32",
+          "sha256": "aeb571d1247018b461be4dc36cb6045e19d73eb33993990036366f29a09a1c77",
+          "shape": [
+            1,
+            1,
+            8
+          ]
+        },
+        "weights.decoder.layers.4.transformers.0.ff.ff.0.proj.bias": {
+          "dtype": "float32",
+          "sha256": "5a0eaf75d47ce4dc0265b61387be21d87f0ee272f4e2d3849a5bf77324c56616",
+          "shape": [
+            48
+          ]
+        },
+        "weights.decoder.layers.4.transformers.0.ff.ff.0.proj.weight": {
+          "dtype": "float32",
+          "sha256": "66b185e15ac455c686b58f15807c4e3fdd64555f3e60babad60925f1d5e9609a",
+          "shape": [
+            48,
+            8
+          ]
+        },
+        "weights.decoder.layers.4.transformers.0.ff.ff.2.bias": {
+          "dtype": "float32",
+          "sha256": "66687aadf862bd776c8fc18b8e9f8e20089714856ee233b3902a591d0d5f2925",
+          "shape": [
+            8
+          ]
+        },
+        "weights.decoder.layers.4.transformers.0.ff.ff.2.weight": {
+          "dtype": "float32",
+          "sha256": "ef115a0e0c15cdc41958ca46b5b14b456115f4baec5e3ca68599d2a8f435e3b8",
+          "shape": [
+            8,
+            24
+          ]
+        },
+        "weights.decoder.layers.4.transformers.0.ff_norm.alpha": {
+          "dtype": "float32",
+          "sha256": "4f4b9b7d8b86633e2824e2f439819357b0cd010ab410ea1a691b12c5f94e91e0",
+          "shape": [
+            1
+          ]
+        },
+        "weights.decoder.layers.4.transformers.0.ff_norm.beta": {
+          "dtype": "float32",
+          "sha256": "66687aadf862bd776c8fc18b8e9f8e20089714856ee233b3902a591d0d5f2925",
+          "shape": [
+            8
+          ]
+        },
+        "weights.decoder.layers.4.transformers.0.ff_norm.gamma": {
+          "dtype": "float32",
+          "sha256": "4f05df05f8da9356bd66425351f166a5f7305b7c805e6900d9ec0f50790c9886",
+          "shape": [
+            8
+          ]
+        },
+        "weights.decoder.layers.4.transformers.0.pre_norm.alpha": {
+          "dtype": "float32",
+          "sha256": "4f4b9b7d8b86633e2824e2f439819357b0cd010ab410ea1a691b12c5f94e91e0",
+          "shape": [
+            1
+          ]
+        },
+        "weights.decoder.layers.4.transformers.0.pre_norm.beta": {
+          "dtype": "float32",
+          "sha256": "66687aadf862bd776c8fc18b8e9f8e20089714856ee233b3902a591d0d5f2925",
+          "shape": [
+            8
+          ]
+        },
+        "weights.decoder.layers.4.transformers.0.pre_norm.gamma": {
+          "dtype": "float32",
+          "sha256": "4f05df05f8da9356bd66425351f166a5f7305b7c805e6900d9ec0f50790c9886",
+          "shape": [
+            8
+          ]
+        },
+        "weights.decoder.layers.4.transformers.0.rope.inv_freq": {
+          "dtype": "float32",
+          "sha256": "9d877756a0997bd64e5c564ef48548b144e1fc500cee3eda442fbe375355f683",
+          "shape": [
+            2
+          ]
+        },
+        "weights.decoder.layers.4.transformers.0.self_attn.k_norm.alpha": {
+          "dtype": "float32",
+          "sha256": "4f4b9b7d8b86633e2824e2f439819357b0cd010ab410ea1a691b12c5f94e91e0",
+          "shape": [
+            1
+          ]
+        },
+        "weights.decoder.layers.4.transformers.0.self_attn.k_norm.beta": {
+          "dtype": "float32",
+          "sha256": "66687aadf862bd776c8fc18b8e9f8e20089714856ee233b3902a591d0d5f2925",
+          "shape": [
+            8
+          ]
+        },
+        "weights.decoder.layers.4.transformers.0.self_attn.k_norm.gamma": {
+          "dtype": "float32",
+          "sha256": "4f05df05f8da9356bd66425351f166a5f7305b7c805e6900d9ec0f50790c9886",
+          "shape": [
+            8
+          ]
+        },
+        "weights.decoder.layers.4.transformers.0.self_attn.q_norm.alpha": {
+          "dtype": "float32",
+          "sha256": "4f4b9b7d8b86633e2824e2f439819357b0cd010ab410ea1a691b12c5f94e91e0",
+          "shape": [
+            1
+          ]
+        },
+        "weights.decoder.layers.4.transformers.0.self_attn.q_norm.beta": {
+          "dtype": "float32",
+          "sha256": "66687aadf862bd776c8fc18b8e9f8e20089714856ee233b3902a591d0d5f2925",
+          "shape": [
+            8
+          ]
+        },
+        "weights.decoder.layers.4.transformers.0.self_attn.q_norm.gamma": {
+          "dtype": "float32",
+          "sha256": "4f05df05f8da9356bd66425351f166a5f7305b7c805e6900d9ec0f50790c9886",
+          "shape": [
+            8
+          ]
+        },
+        "weights.decoder.layers.4.transformers.0.self_attn.to_out.weight": {
+          "dtype": "float32",
+          "sha256": "5341e6b2646979a70e57653007a1f310169421ec9bdd9f1a5648f75ade005af1",
+          "shape": [
+            8,
+            8
+          ]
+        },
+        "weights.decoder.layers.4.transformers.0.self_attn.to_qkv.weight": {
+          "dtype": "float32",
+          "sha256": "fadc93c16fc29c0b35a980f3b1223aeb3fb4a13c2184e6dfa67f27bf16b4ad29",
+          "shape": [
+            40,
+            8
+          ]
+        },
+        "weights.encoder.layers.0.mapping.bias": {
+          "dtype": "float32",
+          "sha256": "2d7ac549395e92726f93b2f48857759d544991676e9e6e46b82ee4ace40a6275",
+          "shape": [
+            8
+          ]
+        },
+        "weights.encoder.layers.0.mapping.weight_g": {
+          "dtype": "float32",
+          "sha256": "c858bd1f9767c140327351b152067133d404d5c6058caebf53ba9c28acc28d5e",
+          "shape": [
+            8,
+            1,
+            1
+          ]
+        },
+        "weights.encoder.layers.0.mapping.weight_v": {
+          "dtype": "float32",
+          "sha256": "f33d44a092691c9c2818670accb28eef385738e38228a5a191db7f145b6f13a9",
+          "shape": [
+            8,
+            4,
+            1
+          ]
+        },
+        "weights.encoder.layers.0.new_tokens": {
+          "dtype": "float32",
+          "sha256": "a59c1b11a040bbce0cb18287ddd9df815d0e95a18cf74e4d31c94c7f13d2934f",
+          "shape": [
+            1,
+            1,
+            8
+          ]
+        },
+        "weights.encoder.layers.0.transformers.0.ff.ff.0.proj.bias": {
+          "dtype": "float32",
+          "sha256": "1c61852e8762b7cf8372b2a76e46065b7092b4943a60f3872b704acad29cf9b6",
+          "shape": [
+            48
+          ]
+        },
+        "weights.encoder.layers.0.transformers.0.ff.ff.0.proj.weight": {
+          "dtype": "float32",
+          "sha256": "d22fcd25508ca6a65d418538017e00bdbdfda22bdd894a2c60169ad9a6d57f3d",
+          "shape": [
+            48,
+            8
+          ]
+        },
+        "weights.encoder.layers.0.transformers.0.ff.ff.2.bias": {
+          "dtype": "float32",
+          "sha256": "66687aadf862bd776c8fc18b8e9f8e20089714856ee233b3902a591d0d5f2925",
+          "shape": [
+            8
+          ]
+        },
+        "weights.encoder.layers.0.transformers.0.ff.ff.2.weight": {
+          "dtype": "float32",
+          "sha256": "ef115a0e0c15cdc41958ca46b5b14b456115f4baec5e3ca68599d2a8f435e3b8",
+          "shape": [
+            8,
+            24
+          ]
+        },
+        "weights.encoder.layers.0.transformers.0.ff_norm.alpha": {
+          "dtype": "float32",
+          "sha256": "4f4b9b7d8b86633e2824e2f439819357b0cd010ab410ea1a691b12c5f94e91e0",
+          "shape": [
+            1
+          ]
+        },
+        "weights.encoder.layers.0.transformers.0.ff_norm.beta": {
+          "dtype": "float32",
+          "sha256": "66687aadf862bd776c8fc18b8e9f8e20089714856ee233b3902a591d0d5f2925",
+          "shape": [
+            8
+          ]
+        },
+        "weights.encoder.layers.0.transformers.0.ff_norm.gamma": {
+          "dtype": "float32",
+          "sha256": "4f05df05f8da9356bd66425351f166a5f7305b7c805e6900d9ec0f50790c9886",
+          "shape": [
+            8
+          ]
+        },
+        "weights.encoder.layers.0.transformers.0.pre_norm.alpha": {
+          "dtype": "float32",
+          "sha256": "4f4b9b7d8b86633e2824e2f439819357b0cd010ab410ea1a691b12c5f94e91e0",
+          "shape": [
+            1
+          ]
+        },
+        "weights.encoder.layers.0.transformers.0.pre_norm.beta": {
+          "dtype": "float32",
+          "sha256": "66687aadf862bd776c8fc18b8e9f8e20089714856ee233b3902a591d0d5f2925",
+          "shape": [
+            8
+          ]
+        },
+        "weights.encoder.layers.0.transformers.0.pre_norm.gamma": {
+          "dtype": "float32",
+          "sha256": "4f05df05f8da9356bd66425351f166a5f7305b7c805e6900d9ec0f50790c9886",
+          "shape": [
+            8
+          ]
+        },
+        "weights.encoder.layers.0.transformers.0.rope.inv_freq": {
+          "dtype": "float32",
+          "sha256": "9d877756a0997bd64e5c564ef48548b144e1fc500cee3eda442fbe375355f683",
+          "shape": [
+            2
+          ]
+        },
+        "weights.encoder.layers.0.transformers.0.self_attn.k_norm.alpha": {
+          "dtype": "float32",
+          "sha256": "4f4b9b7d8b86633e2824e2f439819357b0cd010ab410ea1a691b12c5f94e91e0",
+          "shape": [
+            1
+          ]
+        },
+        "weights.encoder.layers.0.transformers.0.self_attn.k_norm.beta": {
+          "dtype": "float32",
+          "sha256": "66687aadf862bd776c8fc18b8e9f8e20089714856ee233b3902a591d0d5f2925",
+          "shape": [
+            8
+          ]
+        },
+        "weights.encoder.layers.0.transformers.0.self_attn.k_norm.gamma": {
+          "dtype": "float32",
+          "sha256": "4f05df05f8da9356bd66425351f166a5f7305b7c805e6900d9ec0f50790c9886",
+          "shape": [
+            8
+          ]
+        },
+        "weights.encoder.layers.0.transformers.0.self_attn.q_norm.alpha": {
+          "dtype": "float32",
+          "sha256": "4f4b9b7d8b86633e2824e2f439819357b0cd010ab410ea1a691b12c5f94e91e0",
+          "shape": [
+            1
+          ]
+        },
+        "weights.encoder.layers.0.transformers.0.self_attn.q_norm.beta": {
+          "dtype": "float32",
+          "sha256": "66687aadf862bd776c8fc18b8e9f8e20089714856ee233b3902a591d0d5f2925",
+          "shape": [
+            8
+          ]
+        },
+        "weights.encoder.layers.0.transformers.0.self_attn.q_norm.gamma": {
+          "dtype": "float32",
+          "sha256": "4f05df05f8da9356bd66425351f166a5f7305b7c805e6900d9ec0f50790c9886",
+          "shape": [
+            8
+          ]
+        },
+        "weights.encoder.layers.0.transformers.0.self_attn.to_out.weight": {
+          "dtype": "float32",
+          "sha256": "5341e6b2646979a70e57653007a1f310169421ec9bdd9f1a5648f75ade005af1",
+          "shape": [
+            8,
+            8
+          ]
+        },
+        "weights.encoder.layers.0.transformers.0.self_attn.to_qkv.weight": {
+          "dtype": "float32",
+          "sha256": "c57192bf29e9cdaf4ff255db67fd38c4a61396dd9dc4e18e50d97dc116d835ea",
+          "shape": [
+            40,
+            8
+          ]
+        },
+        "weights.encoder.layers.1.mapping.bias": {
+          "dtype": "float32",
+          "sha256": "65eccb7df2ddb00a649913f9ed4b4c79e30125f2539dd017784c42eccd427716",
+          "shape": [
+            16
+          ]
+        },
+        "weights.encoder.layers.1.mapping.weight_g": {
+          "dtype": "float32",
+          "sha256": "3501e09d8b7a488374cdba4e331c282723e8fe329994c017ec4159f73c2ffb5a",
+          "shape": [
+            16,
+            1,
+            1
+          ]
+        },
+        "weights.encoder.layers.1.mapping.weight_v": {
+          "dtype": "float32",
+          "sha256": "b797914590541f7467b83f27d2198970f97b610e1f134ed0f3090c2a76e97060",
+          "shape": [
+            16,
+            8,
+            1
+          ]
+        },
+        "weights.encoder.layers.1.new_tokens": {
+          "dtype": "float32",
+          "sha256": "d74c58f4bf2e625998346214d0539f46afa3d1ddf95a42d984dc748ae48e9886",
+          "shape": [
+            1,
+            1,
+            16
+          ]
+        },
+        "weights.encoder.layers.1.transformers.0.ff.ff.0.proj.bias": {
+          "dtype": "float32",
+          "sha256": "403325b7b2e8825f8ebba6d2a88c7bcad9b9b659915674417475651257da7e4d",
+          "shape": [
+            96
+          ]
+        },
+        "weights.encoder.layers.1.transformers.0.ff.ff.0.proj.weight": {
+          "dtype": "float32",
+          "sha256": "6c43b98f23613ac02b197ce606125d5e844c91cd72fe96198d72de529b32847f",
+          "shape": [
+            96,
+            16
+          ]
+        },
+        "weights.encoder.layers.1.transformers.0.ff.ff.2.bias": {
+          "dtype": "float32",
+          "sha256": "f5a5fd42d16a20302798ef6ed309979b43003d2320d9f0e8ea9831a92759fb4b",
+          "shape": [
+            16
+          ]
+        },
+        "weights.encoder.layers.1.transformers.0.ff.ff.2.weight": {
+          "dtype": "float32",
+          "sha256": "e80232b4d18d0bb7e794be263ba937626f383f9917d4b8a737ba893a8f752293",
+          "shape": [
+            16,
+            48
+          ]
+        },
+        "weights.encoder.layers.1.transformers.0.ff_norm.alpha": {
+          "dtype": "float32",
+          "sha256": "4f4b9b7d8b86633e2824e2f439819357b0cd010ab410ea1a691b12c5f94e91e0",
+          "shape": [
+            1
+          ]
+        },
+        "weights.encoder.layers.1.transformers.0.ff_norm.beta": {
+          "dtype": "float32",
+          "sha256": "f5a5fd42d16a20302798ef6ed309979b43003d2320d9f0e8ea9831a92759fb4b",
+          "shape": [
+            16
+          ]
+        },
+        "weights.encoder.layers.1.transformers.0.ff_norm.gamma": {
+          "dtype": "float32",
+          "sha256": "9628e545ed3ac074e5a6cbf542a642b62482fbfca9b4cb3ea4743a1874256e37",
+          "shape": [
+            16
+          ]
+        },
+        "weights.encoder.layers.1.transformers.0.pre_norm.alpha": {
+          "dtype": "float32",
+          "sha256": "4f4b9b7d8b86633e2824e2f439819357b0cd010ab410ea1a691b12c5f94e91e0",
+          "shape": [
+            1
+          ]
+        },
+        "weights.encoder.layers.1.transformers.0.pre_norm.beta": {
+          "dtype": "float32",
+          "sha256": "f5a5fd42d16a20302798ef6ed309979b43003d2320d9f0e8ea9831a92759fb4b",
+          "shape": [
+            16
+          ]
+        },
+        "weights.encoder.layers.1.transformers.0.pre_norm.gamma": {
+          "dtype": "float32",
+          "sha256": "9628e545ed3ac074e5a6cbf542a642b62482fbfca9b4cb3ea4743a1874256e37",
+          "shape": [
+            16
+          ]
+        },
+        "weights.encoder.layers.1.transformers.0.rope.inv_freq": {
+          "dtype": "float32",
+          "sha256": "9d877756a0997bd64e5c564ef48548b144e1fc500cee3eda442fbe375355f683",
+          "shape": [
+            2
+          ]
+        },
+        "weights.encoder.layers.1.transformers.0.self_attn.k_norm.alpha": {
+          "dtype": "float32",
+          "sha256": "4f4b9b7d8b86633e2824e2f439819357b0cd010ab410ea1a691b12c5f94e91e0",
+          "shape": [
+            1
+          ]
+        },
+        "weights.encoder.layers.1.transformers.0.self_attn.k_norm.beta": {
+          "dtype": "float32",
+          "sha256": "66687aadf862bd776c8fc18b8e9f8e20089714856ee233b3902a591d0d5f2925",
+          "shape": [
+            8
+          ]
+        },
+        "weights.encoder.layers.1.transformers.0.self_attn.k_norm.gamma": {
+          "dtype": "float32",
+          "sha256": "4f05df05f8da9356bd66425351f166a5f7305b7c805e6900d9ec0f50790c9886",
+          "shape": [
+            8
+          ]
+        },
+        "weights.encoder.layers.1.transformers.0.self_attn.q_norm.alpha": {
+          "dtype": "float32",
+          "sha256": "4f4b9b7d8b86633e2824e2f439819357b0cd010ab410ea1a691b12c5f94e91e0",
+          "shape": [
+            1
+          ]
+        },
+        "weights.encoder.layers.1.transformers.0.self_attn.q_norm.beta": {
+          "dtype": "float32",
+          "sha256": "66687aadf862bd776c8fc18b8e9f8e20089714856ee233b3902a591d0d5f2925",
+          "shape": [
+            8
+          ]
+        },
+        "weights.encoder.layers.1.transformers.0.self_attn.q_norm.gamma": {
+          "dtype": "float32",
+          "sha256": "4f05df05f8da9356bd66425351f166a5f7305b7c805e6900d9ec0f50790c9886",
+          "shape": [
+            8
+          ]
+        },
+        "weights.encoder.layers.1.transformers.0.self_attn.to_out.weight": {
+          "dtype": "float32",
+          "sha256": "5f70bf18a086007016e948b04aed3b82103a36bea41755b6cddfaf10ace3c6ef",
+          "shape": [
+            16,
+            16
+          ]
+        },
+        "weights.encoder.layers.1.transformers.0.self_attn.to_qkv.weight": {
+          "dtype": "float32",
+          "sha256": "b47f1ad3170a77d71d70c53da46f9f5b4efac4152a871dc6267869c4adce655c",
+          "shape": [
+            80,
+            16
+          ]
+        },
+        "weights.encoder.layers.3.bias": {
+          "dtype": "float32",
+          "sha256": "facfab299c933e990baf3e681a6c0fb4ced1a722df91a87ec7c2e4a0249ec917",
+          "shape": [
+            4
+          ]
+        },
+        "weights.encoder.layers.3.weight": {
+          "dtype": "float32",
+          "sha256": "55aa9df0305a348d5d7af97cf51a4d653a1b9a7d5c410afa5accdec3cb053c37",
+          "shape": [
+            4,
+            16
+          ]
+        }
+      }
+    }
+  ],
+  "backendSensitivity": {
+    "injection": "frozen unit-normal perturbation after decoder block 0",
+    "scales": {
+      "1e-6": {
+        "afterBlock0MaxAbs": 4.537286258710083e-06,
+        "cosine": 0.9725882386915404,
+        "maxAbs": 2.293635368347168,
+        "relativeL2": 0.234568382716466,
+        "snrDb": 12.594610529587925
+      },
+      "3e-6": {
+        "afterBlock0MaxAbs": 1.361185968562495e-05,
+        "cosine": 0.9485032091841693,
+        "maxAbs": 3.6628634929656982,
+        "relativeL2": 0.3313625060979783,
+        "snrDb": 9.593932677293033
+      }
+    },
+    "unitSeed": 15338
+  },
+  "environment": {
+    "machine": "arm64",
+    "system": "Darwin",
+    "torchDevice": "cpu"
+  },
+  "music": {
+    "attribution": "Brahms Hungarian Dance No. 5, US Army Strings, via librosa",
+    "bounds": {
+      "mrstftMaximum": 3.0549999999999997,
+      "snrDbMinimum": 7.6000000000000005
+    },
+    "channels": 2,
+    "license": "Public Domain Mark 1.0",
+    "offsetSamples": 220500,
+    "quality": {
+      "center": true,
+      "mrstft": 3.05304217338562,
+      "mrstftEquation": "mean_r(||Mhat-M||_F/||M||_F + mean(abs(log(Mhat+1e-7)-log(M+1e-7))))",
+      "padMode": "reflect",
+      "resolutions": [
+        {
+          "hop": 128,
+          "logMagnitudeL1": 2.557659864425659,
+          "spectralConvergence": 0.25792503356933594,
+          "window": 512
+        },
+        {
+          "hop": 256,
+          "logMagnitudeL1": 2.8407068252563477,
+          "spectralConvergence": 0.26160508394241333,
+          "window": 1024
+        },
+        {
+          "hop": 512,
+          "logMagnitudeL1": 2.975397825241089,
+          "spectralConvergence": 0.26583194732666016,
+          "window": 2048
+        }
+      ],
+      "snrDb": 7.799531936645508,
+      "snrEquation": "10*log10(sum(reference^2)/sum((reference-decoded)^2))",
+      "window": "periodic Hann"
+    },
+    "sampleRate": 44100,
+    "samples": 441000,
+    "sourceSha256": "8e93ff0182a93168b15346c497b164cb49d2a97bf1e987a1149ea579e914532e",
+    "sourceUrl": "https://librosa.org/data/audio/Hungarian_Dance_number_5_-_Allegro_in_F_sharp_minor_(string_orchestra).hq.ogg"
+  },
+  "runtime": {
+    "python": "3.12.13",
+    "torch": "2.7.1",
+    "torchaudio": "2.7.1",
+    "transformers": "5.8.0"
+  },
+  "schemaVersion": 1,
+  "seed": 14538,
+  "snapshots": {
+    "embedded": {
+      "modelSha256": "da85866b11b01d0694d990785f6abbd79c8064df1b0e6f8aea52935e0ef84b64",
+      "prefix": "pretransform.model.",
+      "revision": "0fef1392cd842149a2b6d445e181c97608faac06"
+    },
+    "standalone": {
+      "modelSha256": "c19698ce3a0b462acb967ee495e9eb7945221f236968c50206cce8cf22b3d305",
+      "prefix": "",
+      "revision": "fbeb3dcf53a326e5682f38e22e7f740202d44232"
+    }
+  },
+  "story": "sc-14538",
+  "syntheticTwoStage": {
+    "config": "two-stage-config.json",
+    "configSha256": "a7bf22177267ef9aa26905c950d69008de621da3e4d44389cc03d6ad808f412a",
+    "overrideOrders": [
+      [
+        2,
+        4
+      ],
+      [
+        4,
+        2
+      ]
+    ]
+  },
+  "upstream": {
+    "commit": "124e8a799f57a1f665495ecb72e547d0a62867f1",
+    "files": {
+      "autoencoders.py": "44939e6b1c2a72690736757cec3f46cb7f8f6b9ccf9161b738daac320bdfa171",
+      "bottleneck.py": "1d19a7713dba78de6b87fc003f74a54c40c9ac1604917c827f730363e2214c88",
+      "transformer.py": "7436d5d1f040ed74af38899ca57c1eb7b6f3ee5e5c27a3e7402f39f22a52a83a"
+    },
+    "repository": "https://github.com/Stability-AI/stable-audio-3.git"
+  }
+}
