@@ -462,7 +462,7 @@ mod tests {
         let got = flow_euler_step(&sample, &velocity, delta).unwrap();
         let pre_add_rounded = sample
             .add(
-                &velocity
+                velocity
                     .as_dtype(Dtype::Float32)
                     .unwrap()
                     .multiply(Array::from_slice(&[delta], &[1]))
