@@ -94,7 +94,9 @@ REFERENCE_PACKAGES = {
     "transformers": "5.5.0",
     "typing_extensions": "4.15.0",
 }
-REFERENCE_PYTHON = (3, 12, 11)
+# Keep this aligned with real-weights.yml. 3.12.10 is the newest exact 3.12 release with an
+# actions/python-versions Darwin ARM64 artifact for the self-hosted macOS oracle runner.
+REFERENCE_PYTHON = (3, 12, 10)
 
 
 class InvalidOracle(RuntimeError):
