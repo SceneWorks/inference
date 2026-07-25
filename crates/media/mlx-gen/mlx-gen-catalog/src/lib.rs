@@ -186,6 +186,7 @@ mod tests {
                 "lens",
                 "ltx_2_3",
                 "mage_flow",
+                "mage_flow_turbo",
                 "mochi_1",
                 "pulid_flux",
                 "qwen_image",
@@ -254,6 +255,7 @@ mod tests {
             .map(|r| (r.descriptor)().id.to_string())
             .collect();
         assert!(shipped.contains(&"mage_flow".to_string()));
+        assert!(shipped.contains(&"mage_flow_turbo".to_string()));
         assert!(!shipped.contains(&"mage_flow_base".to_string()));
     }
 
