@@ -51,6 +51,10 @@ jobs:
       MAGE_EDIT_SNAPSHOT: ${{ vars.MAGE_EDIT_SNAPSHOT }}
       MAGE_EDIT_BASE_SNAPSHOT: ${{ vars.MAGE_EDIT_BASE_SNAPSHOT }}
       MAGE_EDIT_TURBO_SNAPSHOT: ${{ vars.MAGE_EDIT_TURBO_SNAPSHOT }}
+      # Operator-provisioned, runner-local bundle required on an exact cache miss. This keeps the
+      # multi-hour frozen-Torch CPU producer out of the shared Actions queue; the normal fail-closed
+      # verification below must accept every file before the bundle can be cached or consumed.
+      MAGE_ORACLE_SEED_DIR: ${{ vars.MAGE_ORACLE_SEED_DIR }}
       # Explicit operator-provided models root for the mlx-gen real-weight resolvers that resolve a
       # repo-keyed snapshot (sc-13755); inference never self-fetches or derives a cache location.
       MLX_GEN_MODELS_ROOT: ${{ vars.MLX_GEN_MODELS_ROOT }}
@@ -113,56 +117,54 @@ jobs:
         with:
           path: ${{ runner.temp }}/mage-flow-oracles
           key: ${{ steps.mage-oracle-key.outputs.key }}
-      - name: Regenerate and verify shared CPU Mage oracles
+      - name: Require operator-provisioned Mage oracle seed
+        id: mage-oracle-seed
         if: steps.mage-oracle-cache.outputs.cache-hit != 'true'
         run: |
-          python -m venv "$RUNNER_TEMP/mage-reference"
-          "$RUNNER_TEMP/mage-reference/bin/python" -m pip install \
-            --disable-pip-version-check --only-binary=:all: --require-hashes \
-            -r crates/media/mlx-gen/_vendor/mage_flow/requirements-oracles.txt
-          MAGE_DEVICE=cpu MAGE_EDIT_STEPS=30 "$RUNNER_TEMP/mage-reference/bin/python" \
-            scripts/release/provision_mage_oracles.py \
-            --snapshot "$MAGE_SNAPSHOT" \
-            --edit-snapshot "$MAGE_EDIT_SNAPSHOT" \
-            --output "$MAGE_GOLDEN_DIR"
-          "$RUNNER_TEMP/mage-reference/bin/python" \
-            scripts/release/provision_mage_edit_variants.py \
-            --gen "$MAGE_SNAPSHOT" \
-            --edit "$MAGE_EDIT_SNAPSHOT" \
-            --edit-base "$MAGE_EDIT_BASE_SNAPSHOT" \
-            --edit-turbo "$MAGE_EDIT_TURBO_SNAPSHOT" \
-            --output "$MAGE_GOLDEN_DIR"
+          if [[ -z "$MAGE_ORACLE_SEED_DIR" ]]; then
+            echo "Mage oracle cache missed and MAGE_ORACLE_SEED_DIR is unset; refusing to run the multi-hour CPU producer on the shared Actions runner" >&2
+            exit 1
+          fi
+          if [[ "$MAGE_ORACLE_SEED_DIR" != /* || ! -d "$MAGE_ORACLE_SEED_DIR" ]]; then
+            echo "MAGE_ORACLE_SEED_DIR must be an existing absolute directory" >&2
+            exit 1
+          fi
+          files=(
+            mage_flow_te_golden.safetensors
+            mage_flow_edit_golden.safetensors
+            mage_flow_edit_base_golden.safetensors
+            mage_flow_edit_turbo_golden.safetensors
+            mage_flow_vae_f32_256.safetensors
+            mage_flow_vae_f32_992.safetensors
+            mage_flow_vae_f32_1024.safetensors
+            mage_flow_vae_f32_2048.safetensors
+            mage_flow_vae_f32_512x2048.safetensors
+            mage_flow_vae_f32_768x1280.safetensors
+            mage_flow_vae_f32_768x1152.safetensors
+            mage_flow_dit_golden.safetensors
+            mage_flow_e2e_golden.safetensors
+            mage_oracles_manifest.json
+            mage_edit_oracle_manifest.json
+            mage_edit_variants_manifest.json
+            mage_candle_oracles_manifest.json
+            mage_candle_transfer_manifest.json
+          )
+          mkdir -p "$MAGE_GOLDEN_DIR"
+          for file in "${files[@]}"; do
+            source="$MAGE_ORACLE_SEED_DIR/$file"
+            if [[ ! -f "$source" || -L "$source" ]]; then
+              echo "Operator Mage oracle seed is missing a regular, non-symlink file: $source" >&2
+              exit 1
+            fi
+            install -m 0644 "$source" "$MAGE_GOLDEN_DIR/$file"
+          done
+          echo "imported=true" >> "$GITHUB_OUTPUT"
       # sc-14051 Candle acceptance oracle: one frozen-Torch 1024²/20-step reference run emits
       # both the step-zero full-DiT boundary and the final e2e image. It is generated on a
-      # different backend/job from the Candle implementation and transferred as an immutable
-      # workflow artifact; Candle never blesses its own output.
-      - name: Regenerate Candle Mage 1024² Torch acceptance oracles
-        if: steps.mage-oracle-cache.outputs.cache-hit != 'true'
-        run: |
-          cd crates/media/mlx-gen
-          MAGE_DEVICE=cpu MAGE_ATTN=sdpa MAGE_H=1024 MAGE_W=1024 MAGE_STEPS=20 \
-            MAGE_EDIT_STEPS=30 MAGE_CFG=5.0 MAGE_SEED=42 MAGE_GS_KEY=20260720 \
-            MAGE_PROMPT='a calico kitten sitting on a wooden windowsill beside a blue ceramic mug' \
-            MAGE_NEG=' ' MAGE_EDIT_INSTRUCTION='Replace the background with a field of sunflowers' \
-            MAGE_EDIT_REF="$PWD/_vendor/mage_flow/assets/dog.jpg" \
-            MAGE_GOLDEN_DIR="$MAGE_GOLDEN_DIR" PYTHONPATH="$PWD/_vendor" \
-            "$RUNNER_TEMP/mage-reference/bin/python" \
-            tools/dump_mage_flow_golden.py --stage dit
-          "$RUNNER_TEMP/mage-reference/bin/python" \
-            ../../../scripts/release/verify_mage_candle_oracles.py \
-            --snapshot "$MAGE_SNAPSHOT" \
-            --edit-snapshot "$MAGE_EDIT_SNAPSHOT" \
-            --output "$MAGE_GOLDEN_DIR" \
-            --write-manifest
-          "$RUNNER_TEMP/mage-reference/bin/python" \
-            ../../../scripts/release/verify_mage_candle_transfer.py \
-            --gen "$MAGE_SNAPSHOT" \
-            --edit "$MAGE_EDIT_SNAPSHOT" \
-            --edit-base "$MAGE_EDIT_BASE_SNAPSHOT" \
-            --edit-turbo "$MAGE_EDIT_TURBO_SNAPSHOT" \
-            --output "$MAGE_GOLDEN_DIR" \
-            --write-manifest
-      - name: Verify restored or generated Mage oracle cache
+      # different backend/process from the Candle implementation and transferred as an immutable
+      # workflow artifact; Candle never blesses its own output. Cache misses require that
+      # operator-generated bundle above instead of running the multi-hour producer in Actions.
+      - name: Verify restored or operator-provisioned Mage oracle cache
         run: |
           if [[ ! -x "$RUNNER_TEMP/mage-reference/bin/python" ]]; then
             python -m venv "$RUNNER_TEMP/mage-reference"
