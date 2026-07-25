@@ -94,6 +94,11 @@ def main() -> int:
     parser.add_argument("--edit-base", required=True, type=Path)
     parser.add_argument("--edit-turbo", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument(
+        "--verify-only",
+        action="store_true",
+        help="validate existing files and their exact hash manifest without generating",
+    )
     args = parser.parse_args()
     snapshots = {
         "edit": args.edit,
@@ -108,7 +113,7 @@ def main() -> int:
         destination = args.output / filename
         # provision_mage_oracles.py owns the primary Edit file and its two immutable manifests.
         # Reuse it here so adding Base/Turbo cannot overwrite a previously verified artifact.
-        if label != "edit":
+        if label != "edit" and not args.verify_only:
             with tempfile.TemporaryDirectory(prefix=f"mage-{label}-") as temporary:
                 temp = Path(temporary)
                 env = {
@@ -138,7 +143,7 @@ def main() -> int:
                 shutil.copy2(generated, destination)
         elif not destination.is_file():
             raise RuntimeError(
-                "primary Edit oracle must be provisioned before the Base/Turbo variants"
+                f"{destination.name} must already exist before variant verification"
             )
         validate(destination, pinned, steps, cfg)
         records.append(
@@ -158,9 +163,20 @@ def main() -> int:
         "device": "cpu",
         "files": records,
     }
-    (args.output / "mage_edit_variants_manifest.json").write_text(
-        json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
-    )
+    manifest_path = args.output / "mage_edit_variants_manifest.json"
+    if args.verify_only:
+        try:
+            existing = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise RuntimeError(f"invalid Mage edit variant manifest: {error}") from error
+        if existing != manifest:
+            raise RuntimeError(
+                "Mage edit variant manifest revisions/geometry/cfg/hash population is stale"
+            )
+    else:
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+        )
     print(f"verified {len(records)} Mage edit variant oracles under {args.output}")
     return 0
 

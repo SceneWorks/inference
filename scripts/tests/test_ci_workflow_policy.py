@@ -85,6 +85,40 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("Regenerate Candle Mage 1024² Torch acceptance oracles", workflow)
         self.assertIn("MAGE_H=1024 MAGE_W=1024 MAGE_STEPS=20", workflow)
         self.assertIn("tools/dump_mage_flow_golden.py --stage dit", workflow)
+        cache_sha = "5a3ec84eff668545956fd18022155c47e93e2684"
+        self.assertIn(f"uses: actions/cache/restore@{cache_sha}", workflow)
+        self.assertIn(f"uses: actions/cache/save@{cache_sha}", workflow)
+        self.assertNotIn("restore-keys:", workflow)
+        self.assertIn("id: mage-oracle-key", workflow)
+        self.assertIn("id: mage-oracle-cache", workflow)
+        for fingerprint_input in (
+            "crates/media/mlx-gen/_vendor/mage_flow/**",
+            "crates/media/mlx-gen/_vendor/mage_flow/requirements-oracles.txt",
+            "crates/media/mlx-gen/tools/dump_mage_flow_golden.py",
+            "scripts/release/provision_mage_oracles.py",
+            "scripts/release/provision_mage_edit_variants.py",
+        ):
+            self.assertIn(fingerprint_input, workflow)
+        for snapshot in (
+            "$MAGE_SNAPSHOT",
+            "$MAGE_EDIT_SNAPSHOT",
+            "$MAGE_EDIT_BASE_SNAPSHOT",
+            "$MAGE_EDIT_TURBO_SNAPSHOT",
+        ):
+            self.assertIn(f'snapshot_revision "{snapshot}"', workflow)
+        self.assertGreaterEqual(
+            workflow.count("steps.mage-oracle-cache.outputs.cache-hit != 'true'"),
+            3,
+        )
+        self.assertIn(
+            "Verify restored or generated Mage oracle cache",
+            workflow,
+        )
+        self.assertGreaterEqual(workflow.count("--verify-only"), 2)
+        self.assertLess(
+            workflow.index("Verify restored or generated Mage oracle cache"),
+            workflow.index("Save verified Mage oracle cache"),
+        )
         self.assertIn("mage-flow-candle-oracles-${{ github.sha }}", workflow)
         self.assertIn("mage_flow_dit_golden.safetensors", workflow)
         self.assertIn("mage_flow_e2e_golden.safetensors", workflow)
