@@ -440,17 +440,27 @@ def validate_upstream_checkout(
             str(upstream_root),
             "status",
             "--porcelain=v1",
+            "-z",
+            "--ignored=matching",
             "--untracked-files=all",
         ],
         check=True,
         capture_output=True,
         text=True,
         encoding="utf-8",
-    ).stdout.strip()
-    if checkout_status:
+    ).stdout
+    status_entries = [entry for entry in checkout_status.split("\0") if entry]
+    disallowed_entries = []
+    for entry in status_entries:
+        status = entry[:2]
+        path = entry[3:] if len(entry) >= 4 and entry[2] == " " else ""
+        allowed_environment_path = path == ".venv/" or path.startswith(".venv/")
+        if status not in {"??", "!!"} or not allowed_environment_path:
+            disallowed_entries.append(entry)
+    if disallowed_entries:
         raise InvalidReference(
             "upstream checkout is not clean: "
-            + checkout_status.replace("\n", "; ")
+            + "; ".join(disallowed_entries)
         )
     return revision
 

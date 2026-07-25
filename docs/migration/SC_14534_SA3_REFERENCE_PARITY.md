@@ -146,9 +146,10 @@ From this repository:
 ```
 
 Generation enables deterministic Torch algorithms and forces the Transformers
-and Hugging Face Hub offline modes before importing upstream. A missing path,
-revision drift, incomplete license/model/T5 payload, upstream SHA drift, Torch
-tracked modification or untracked file in the upstream checkout, payload
-size/hash drift, exact
+and Hugging Face Hub offline modes before importing upstream. The pinned
+checkout must contain no tracked modifications, untracked files, or ignored
+files other than the task environment under `.venv/`. A missing path, revision
+drift, incomplete license/model/T5 payload, upstream SHA drift, checkout
+contamination, payload size/hash drift, exact
 Python/Torch/torchaudio/Transformers version drift, truncated component/tensor
 inventory, safetensors metadata drift, or artifact mutation fails closed.

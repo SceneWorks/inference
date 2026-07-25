@@ -168,7 +168,14 @@ class StableAudio3ReferenceTests(unittest.TestCase):
             )
             source = root / "source.py"
             source.write_text("PINNED = True\n", encoding="utf-8")
-            subprocess.run(["git", "-C", str(root), "add", "source.py"], check=True)
+            gitignore = root / ".gitignore"
+            gitignore.write_text(
+                "*.py[cod]\nignored-cache/\n.venv/\n", encoding="utf-8"
+            )
+            subprocess.run(
+                ["git", "-C", str(root), "add", "source.py", ".gitignore"],
+                check=True,
+            )
             subprocess.run(
                 ["git", "-C", str(root), "commit", "-q", "-m", "fixture"],
                 check=True,
@@ -183,6 +190,17 @@ class StableAudio3ReferenceTests(unittest.TestCase):
             validate_upstream_checkout(root, revision)
             with self.assertRaisesRegex(InvalidReference, "checkout mismatch"):
                 validate_upstream_checkout(root, "0" * 40)
+            environment_file = root / ".venv" / "bin" / "python"
+            environment_file.parent.mkdir(parents=True)
+            environment_file.write_text("allowed\n", encoding="utf-8")
+            validate_upstream_checkout(root, revision)
+            ignored = root / "ignored-cache"
+            ignored.mkdir()
+            (ignored / "cache").write_text("rejected\n", encoding="utf-8")
+            with self.assertRaisesRegex(InvalidReference, "ignored-cache"):
+                validate_upstream_checkout(root, revision)
+            (ignored / "cache").unlink()
+            ignored.rmdir()
             untracked = root / "untracked"
             untracked.write_text("rejected\n", encoding="utf-8")
             with self.assertRaisesRegex(InvalidReference, "not clean"):
@@ -206,7 +224,12 @@ class StableAudio3ReferenceTests(unittest.TestCase):
             )
             source = root / "source.py"
             source.write_text("PINNED = True\n", encoding="utf-8")
-            subprocess.run(["git", "-C", str(root), "add", "source.py"], check=True)
+            gitignore = root / ".gitignore"
+            gitignore.write_text("*.py[cod]\n", encoding="utf-8")
+            subprocess.run(
+                ["git", "-C", str(root), "add", "source.py", ".gitignore"],
+                check=True,
+            )
             subprocess.run(
                 ["git", "-C", str(root), "commit", "-q", "-m", "fixture"],
                 check=True,
@@ -218,7 +241,12 @@ class StableAudio3ReferenceTests(unittest.TestCase):
                 text=True,
                 encoding="utf-8",
             ).stdout.strip()
-            for filename in ("torch.py", "transformers.py"):
+            for filename in (
+                "torch.py",
+                "transformers.py",
+                "torch.pyc",
+                "transformers.pyc",
+            ):
                 with self.subTest(filename=filename):
                     shadow = root / filename
                     shadow.write_text("raise RuntimeError('shadowed')\n", encoding="utf-8")
