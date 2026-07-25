@@ -135,10 +135,16 @@ pub const MAX_COUNT: u32 = 8;
 
 /// Immutable upstream revision used to establish the Turbo checkpoint fingerprint.
 pub const TURBO_SNAPSHOT_REVISION: &str = "8523c9d1ae3cbe2148241e4769c918d0ab158ef8";
+/// Immutable upstream revision used to establish the Base checkpoint fingerprint.
+pub const BASE_SNAPSHOT_REVISION: &str = "59a9cfd58cf6ecef28245852c6bdace3f12428a2";
 const TURBO_IDENTITY_TENSOR: &str = "img_in.weight";
+const BASE_IDENTITY_TENSOR: &str = "transformer_blocks.0.attn.add_k_proj.bias";
 const TURBO_IDENTITY_BYTES: usize = 4096;
+const BASE_IDENTITY_BYTES: usize = 4096;
 const TURBO_IDENTITY_SHA256: &str =
     "c71e8cd69c9128887ceb2de9a29917e4eb704a052813b19b02b51f363258bd5c";
+const BASE_IDENTITY_SHA256: &str =
+    "c6597b08e4efe45f7bbb5d2470c68e7975d71ca26dce13a1fb34db18ca6a9e3e";
 
 /// Build a variant's weights-free descriptor.
 ///
@@ -185,15 +191,18 @@ pub fn descriptor_for(variant: MageVariant) -> ModelDescriptor {
 /// Construct a Mage-Flow generator from a [`LoadSpec`].
 ///
 pub fn load(variant: MageVariant, spec: &LoadSpec) -> Result<Box<dyn Generator>> {
-    if !matches!(variant, MageVariant::Rl | MageVariant::Turbo) {
+    if !matches!(
+        variant,
+        MageVariant::Rl | MageVariant::Base | MageVariant::Turbo
+    ) {
         return Err(Error::Unsupported(format!(
-            "{}: only the Mage-Flow RL and Turbo generation checkpoints are enabled",
+            "{}: only the Mage-Flow RL, Base, and Turbo generation checkpoints are enabled",
             variant.id()
         )));
     }
     if spec.precision != Precision::Bf16 || spec.quantize.is_some() || !spec.adapters.is_empty() {
         return Err(Error::Unsupported(
-            "mage_flow: RL and Turbo support dense bf16 checkpoints without adapters".into(),
+            "mage_flow: RL, Base, and Turbo support dense bf16 checkpoints without adapters".into(),
         ));
     }
     let root = match &spec.weights {
@@ -204,8 +213,26 @@ pub fn load(variant: MageVariant, spec: &LoadSpec) -> Result<Box<dyn Generator>>
             ))
         }
     };
-    if variant == MageVariant::Turbo {
-        verify_turbo_checkpoint(root)?;
+    match variant {
+        MageVariant::Base => verify_checkpoint_identity(
+            root,
+            variant,
+            BASE_SNAPSHOT_REVISION,
+            BASE_IDENTITY_TENSOR,
+            BASE_IDENTITY_BYTES,
+            &[3072],
+            BASE_IDENTITY_SHA256,
+        )?,
+        MageVariant::Turbo => verify_checkpoint_identity(
+            root,
+            variant,
+            TURBO_SNAPSHOT_REVISION,
+            TURBO_IDENTITY_TENSOR,
+            TURBO_IDENTITY_BYTES,
+            &[3072, 128],
+            TURBO_IDENTITY_SHA256,
+        )?,
+        _ => {}
     }
     Ok(Box::new(MageFlow {
         variant,
@@ -217,15 +244,25 @@ pub fn load(variant: MageVariant, spec: &LoadSpec) -> Result<Box<dyn Generator>>
 /// Verify bytes from a weight-bearing tensor, not a path or model-card label.
 ///
 /// All Mage-Flow variants share byte-identical configs and tensor schemas, so those cannot detect
-/// an RL checkpoint accidentally routed under the Turbo id. This hashes the first 4096 serialized
-/// BF16 bytes of `img_in.weight`, pinned to [`TURBO_SNAPSHOT_REVISION`].
-fn verify_turbo_checkpoint(root: &Path) -> Result<()> {
+/// one checkpoint accidentally routed under another variant id. The caller supplies a tensor,
+/// byte count, and hash pinned to the immutable upstream revision. Base deliberately uses an
+/// attention bias because its `img_in.weight` prefix is byte-identical to RL's.
+fn verify_checkpoint_identity(
+    root: &Path,
+    variant: MageVariant,
+    revision: &str,
+    tensor_name: &str,
+    identity_bytes: usize,
+    expected_shape: &[u64],
+    expected_sha256: &str,
+) -> Result<()> {
+    let id = variant.id();
     let path = root
         .join("transformer")
         .join("diffusion_pytorch_model.safetensors");
     let mut file = std::fs::File::open(&path).map_err(|error| {
         Error::Msg(format!(
-            "mage_flow_turbo: cannot open transformer checkpoint {}: {error}",
+            "{id}: cannot open transformer checkpoint {}: {error}",
             path.display()
         ))
     })?;
@@ -234,57 +271,58 @@ fn verify_turbo_checkpoint(root: &Path) -> Result<()> {
     let header_len = u64::from_le_bytes(len_bytes);
     if header_len > 1_048_576 {
         return Err(Error::Msg(format!(
-            "mage_flow_turbo: invalid safetensors header length {header_len}"
+            "{id}: invalid safetensors header length {header_len}"
         )));
     }
     let mut header = vec![0u8; header_len as usize];
     file.read_exact(&mut header)?;
     let metadata: serde_json::Value = serde_json::from_slice(&header).map_err(|error| {
         Error::Msg(format!(
-            "mage_flow_turbo: invalid safetensors header in {}: {error}",
+            "{id}: invalid safetensors header in {}: {error}",
             path.display()
         ))
     })?;
     let tensor = metadata
-        .get(TURBO_IDENTITY_TENSOR)
-        .ok_or_else(|| Error::Msg(format!("mage_flow_turbo: missing {TURBO_IDENTITY_TENSOR}")))?;
+        .get(tensor_name)
+        .ok_or_else(|| Error::Msg(format!("{id}: missing {tensor_name}")))?;
     if tensor.get("dtype").and_then(serde_json::Value::as_str) != Some("BF16")
         || tensor.get("shape").and_then(serde_json::Value::as_array)
-            != Some(&vec![serde_json::json!(3072), serde_json::json!(128)])
+            != Some(
+                &expected_shape
+                    .iter()
+                    .map(|&dimension| serde_json::json!(dimension))
+                    .collect::<Vec<_>>(),
+            )
     {
         return Err(Error::Msg(format!(
-            "mage_flow_turbo: {TURBO_IDENTITY_TENSOR} has the wrong dtype or shape"
+            "{id}: {tensor_name} has the wrong dtype or shape"
         )));
     }
     let offsets = tensor
         .get("data_offsets")
         .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| {
-            Error::Msg(format!(
-                "mage_flow_turbo: {TURBO_IDENTITY_TENSOR} has no data offsets"
-            ))
-        })?;
+        .ok_or_else(|| Error::Msg(format!("{id}: {tensor_name} has no data offsets")))?;
     let start = offsets.first().and_then(serde_json::Value::as_u64);
     let end = offsets.get(1).and_then(serde_json::Value::as_u64);
     let (Some(start), Some(end)) = (start, end) else {
         return Err(Error::Msg(format!(
-            "mage_flow_turbo: {TURBO_IDENTITY_TENSOR} has invalid data offsets"
+            "{id}: {tensor_name} has invalid data offsets"
         )));
     };
-    if end.saturating_sub(start) < TURBO_IDENTITY_BYTES as u64 {
+    if end.saturating_sub(start) < identity_bytes as u64 {
         return Err(Error::Msg(format!(
-            "mage_flow_turbo: {TURBO_IDENTITY_TENSOR} is too short for identity verification"
+            "{id}: {tensor_name} is too short for identity verification"
         )));
     }
     file.seek(SeekFrom::Start(8 + header_len + start))?;
-    let mut bytes = [0u8; TURBO_IDENTITY_BYTES];
+    let mut bytes = vec![0u8; identity_bytes];
     file.read_exact(&mut bytes)?;
     let got = format!("{:x}", Sha256::digest(bytes));
-    if got != TURBO_IDENTITY_SHA256 {
+    if got != expected_sha256 {
         return Err(Error::Msg(format!(
-            "mage_flow_turbo: checkpoint fingerprint mismatch for {TURBO_IDENTITY_TENSOR} \
-             (expected revision {TURBO_SNAPSHOT_REVISION}, got sha256 {got}); \
-             an RL/Base/Edit checkpoint cannot serve the Turbo id"
+            "{id}: checkpoint fingerprint mismatch for {tensor_name} \
+             (expected revision {revision}, got sha256 {got}); \
+             another Mage-Flow checkpoint cannot serve the {id} id"
         )));
     }
     Ok(())
@@ -480,10 +518,9 @@ mod tests {
     }
 
     #[test]
-    fn base_and_edit_variants_remain_explicitly_disabled() {
+    fn edit_variants_remain_explicitly_disabled() {
         let spec = LoadSpec::new(mlx_gen::WeightsSource::Dir("/nonexistent".into()));
         for variant in [
-            MageVariant::Base,
             MageVariant::Edit,
             MageVariant::EditBase,
             MageVariant::EditTurbo,
@@ -505,6 +542,42 @@ mod tests {
             !matches!(err, Error::Unsupported(_)),
             "RL must not regress to the scaffold refusal: {err}"
         );
+    }
+
+    #[test]
+    fn base_has_a_distinct_registration_and_enters_the_full_snapshot_loader() {
+        assert_eq!(descriptor_base().id, "mage_flow_base");
+        assert_eq!(
+            MageVariant::Base.upstream_repo(),
+            "microsoft/Mage-Flow-Base"
+        );
+        assert_eq!((REGISTRATION_BASE.descriptor)().id, "mage_flow_base");
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent-mage-flow-base".into()));
+        let err = load_base(&spec)
+            .err()
+            .expect("missing Base snapshot must fail");
+        assert!(
+            !matches!(err, Error::Unsupported(_)),
+            "Base must enter the same complete component-tree loader: {err}"
+        );
+    }
+
+    #[test]
+    fn base_platform_defaults_are_thirty_steps_with_real_cfg() {
+        assert_eq!(MageVariant::Base.default_steps(), 30);
+        assert_eq!(MageVariant::Base.default_cfg(), 5.0);
+        let descriptor = descriptor_for(MageVariant::Base);
+        assert!(descriptor.capabilities.supports_guidance);
+        assert!(descriptor.capabilities.supports_negative_prompt);
+        let request = GenerationRequest {
+            prompt: "test".into(),
+            negative_prompt: Some("artifact".into()),
+            width: 1024,
+            height: 1024,
+            guidance: Some(5.0),
+            ..Default::default()
+        };
+        validate_generation_request(&descriptor, &request).unwrap();
     }
 
     #[test]

@@ -637,6 +637,23 @@ mod tests {
     }
 
     #[test]
+    fn exact_thirty_step_base_static_shift_schedule() {
+        let s = mage_flow_sigmas(30).unwrap();
+        assert_eq!(
+            s,
+            vec![
+                1.0, 0.9942857, 0.9882353, 0.98181814, 0.97499996, 0.96774185, 0.96000004,
+                0.9517242, 0.9428571, 0.9333334, 0.92307687, 0.912, 0.90000004, 0.8869566,
+                0.87272733, 0.85714287, 0.8399999, 0.8210527, 0.79999995, 0.77647054, 0.75,
+                0.71999997, 0.68571424, 0.6461538, 0.59999996, 0.54545456, 0.48, 0.39999998, 0.3,
+                0.17142859, 0.0,
+            ],
+            "all 31 Base sigmas must match the frozen Torch/Diffusers CPU oracle bit-for-bit"
+        );
+        assert!(s.windows(2).all(|w| w[0] > w[1]));
+    }
+
+    #[test]
     fn turbo_uses_the_same_shifted_four_step_ladder_and_no_cfg_branch() {
         let sigmas = mage_flow_sigmas(4).unwrap();
         assert_eq!(sigmas.len(), 5);
