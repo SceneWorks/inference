@@ -47,7 +47,7 @@ use mlx_rs::fast::rms_norm;
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::weights::Weights;
-use mlx_gen::{nn, Error, Result};
+use mlx_gen::{Error, Result};
 
 use crate::attention::DualStream;
 use crate::config::{MageFlowConfig, NORM_EPS};
@@ -72,52 +72,74 @@ pub const TRANSFORMER_CONFIG_FILE: &str = "config.json";
 ///
 /// This lives in `transformer.rs` rather than a shared `loader.rs` because this file owns weight
 /// loading for the DiT (see the module note above and the `lib.rs` decision record).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Linear {
-    weight: Array,
-    bias: Array,
+    inner: mlx_gen::adapters::AdaptableLinear,
+    in_features: i32,
+    out_features: i32,
+    dtype: Dtype,
+}
+
+impl std::fmt::Debug for Linear {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Linear")
+            .field("in_features", &self.in_features)
+            .field("out_features", &self.out_features)
+            .field("dtype", &self.dtype)
+            .field("quantized", &self.inner.is_quantized())
+            .finish()
+    }
 }
 
 impl Linear {
     pub fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
+        let weight = w.require(&format!("{prefix}.weight"))?.clone();
+        let bias = w.require(&format!("{prefix}.bias"))?.clone();
+        let shape = weight.shape();
         Ok(Self {
-            weight: w.require(&format!("{prefix}.weight"))?.clone(),
-            bias: w.require(&format!("{prefix}.bias"))?.clone(),
+            in_features: shape[1],
+            out_features: shape[0],
+            dtype: weight.dtype(),
+            inner: mlx_gen::adapters::AdaptableLinear::dense(weight, Some(bias)),
         })
     }
 
     pub fn out_features(&self) -> i32 {
-        self.weight.shape()[0]
+        self.out_features
     }
 
     pub fn in_features(&self) -> i32 {
-        self.weight.shape()[1]
+        self.in_features
     }
 
     pub fn dtype(&self) -> Dtype {
-        self.weight.dtype()
+        self.dtype
     }
 
     pub fn cast_weights(&mut self, dtype: Dtype) -> Result<()> {
-        if self.weight.dtype() != dtype {
-            self.weight = self.weight.as_dtype(dtype)?;
-        }
-        if self.bias.dtype() != dtype {
-            self.bias = self.bias.as_dtype(dtype)?;
-        }
+        self.inner.cast_weights(dtype)?;
+        self.dtype = dtype;
         Ok(())
+    }
+
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.inner.quantize(bits, None)
+    }
+
+    pub(crate) fn is_quantized(&self) -> bool {
+        self.inner.is_quantized()
     }
 
     /// `y = x · Wᵀ + b`, as the fused `addmm` MLX's own `nn.Linear` uses — a separate
     /// `matmul` + `add` double-rounds the bias in bf16, which compounds over 12 blocks.
     pub fn forward(&self, x: &Array) -> Result<Array> {
-        nn::linear(x, &self.weight, &self.bias)
+        self.inner.forward(x)
     }
 }
 
 /// The 4B NR-MMDiT: `img_in` / `txt_norm` / `txt_in` / timestep embedder → `depth` dual-stream
 /// blocks → `norm_out` / `proj_out`.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MageTransformer {
     cfg: MageFlowConfig,
     rope: MsRope,
@@ -130,6 +152,37 @@ pub struct MageTransformer {
 }
 
 impl MageTransformer {
+    /// Quantize every DiT Linear to MLX group-wise Q4/Q8; norms and RoPE stay dense.
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.img_in.quantize(bits)?;
+        self.txt_in.quantize(bits)?;
+        self.time_embed.quantize(bits)?;
+        for block in &mut self.blocks {
+            block.quantize(bits)?;
+        }
+        self.final_layer.quantize(bits)?;
+        let got = self.quantized_linear_count();
+        let expected = 2 + 2 + self.blocks.len() * 14 + 2;
+        if got != expected {
+            return Err(Error::Msg(format!(
+                "mage_flow: DiT quantization packed {got}/{expected} required Linear projections"
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn quantized_linear_count(&self) -> usize {
+        usize::from(self.img_in.is_quantized())
+            + usize::from(self.txt_in.is_quantized())
+            + self.time_embed.quantized_linear_count()
+            + self
+                .blocks
+                .iter()
+                .map(MageTransformerBlock::quantized_linear_count)
+                .sum::<usize>()
+            + self.final_layer.quantized_linear_count()
+    }
+
     /// Load from a caller-provisioned `transformer/` directory: `config.json` for the nine consumed
     /// fields, `diffusion_pytorch_model.safetensors` for the weights.
     ///
@@ -139,8 +192,8 @@ impl MageTransformer {
         let dir = transformer_dir.as_ref();
         let json = std::fs::read_to_string(dir.join(TRANSFORMER_CONFIG_FILE))?;
         let cfg = MageFlowConfig::from_transformer_config_json(&json)?;
-        let weights = Weights::from_file(dir.join(TRANSFORMER_WEIGHTS_FILE))?;
-        Self::from_weights(&weights, cfg)
+        let mut weights = Weights::from_file(dir.join(TRANSFORMER_WEIGHTS_FILE))?;
+        Self::from_weights_draining(&mut weights, cfg)
     }
 
     /// Build from an already-loaded checkpoint. Keys follow the published diffusers layout
@@ -168,6 +221,50 @@ impl MageTransformer {
             cfg,
         };
         model.check_geometry()?;
+        Ok(model)
+    }
+
+    /// Production loader that releases each source block from the checkpoint map as soon as the
+    /// corresponding module owns it. `Array::clone` is a shallow MLX handle; removing the map's
+    /// handle therefore avoids retaining a second full-checkpoint reference while later Q4/Q8
+    /// packing materializes replacement buffers.
+    pub fn from_weights_draining(w: &mut Weights, cfg: MageFlowConfig) -> Result<Self> {
+        cfg.validate()?;
+        let rope = MsRope::from_config(&cfg)?;
+        let img_in = Linear::from_weights(w, "img_in")?;
+        w.remove_prefix("img_in.");
+        let txt_norm = w.require("txt_norm.weight")?.clone();
+        w.remove("txt_norm.weight");
+        let txt_in = Linear::from_weights(w, "txt_in")?;
+        w.remove_prefix("txt_in.");
+        let time_embed = MageTimestepEmbedder::from_weights(w, "time_text_embed")?;
+        w.remove_prefix("time_text_embed.");
+        let mut blocks = Vec::with_capacity(cfg.depth);
+        for i in 0..cfg.depth {
+            let prefix = format!("transformer_blocks.{i}");
+            blocks.push(MageTransformerBlock::from_weights(w, &prefix, &cfg)?);
+            w.remove_prefix(&format!("{prefix}."));
+        }
+        let final_layer = MageFinalLayer::from_weights(w, "norm_out", "proj_out")?;
+        w.remove_prefix("norm_out.");
+        w.remove_prefix("proj_out.");
+        let model = Self {
+            cfg,
+            rope,
+            img_in,
+            txt_norm,
+            txt_in,
+            time_embed,
+            blocks,
+            final_layer,
+        };
+        model.check_geometry()?;
+        if !w.is_empty() {
+            return Err(Error::Msg(format!(
+                "mage_flow: transformer drain left {} source tensors resident",
+                w.len()
+            )));
+        }
         Ok(model)
     }
 
@@ -364,8 +461,11 @@ mod tests {
     #[test]
     fn missing_transformer_keys_are_a_load_error_not_a_silent_skip() {
         // torch's `strict=False` would leave these randomly initialised; the port refuses.
-        let err = MageTransformer::from_weights(&Weights::empty(), MageFlowConfig::mage_flow())
-            .unwrap_err();
+        let err =
+            match MageTransformer::from_weights(&Weights::empty(), MageFlowConfig::mage_flow()) {
+                Ok(_) => panic!("empty weights unexpectedly loaded"),
+                Err(err) => err,
+            };
         assert!(
             matches!(err, Error::MissingTensor(ref key) if key.starts_with("img_in")),
             "expected a missing-tensor error naming img_in, got {err:?}"

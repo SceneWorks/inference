@@ -27,6 +27,15 @@ pub struct Qwen3VlDecoderLayer {
 }
 
 impl Qwen3VlDecoderLayer {
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.attn.quantize(bits)?;
+        self.mlp.quantize(bits)
+    }
+
+    pub(crate) fn quantized_linear_count(&self) -> usize {
+        self.attn.quantized_linear_count() + self.mlp.quantized_linear_count()
+    }
+
     /// Load from `{prefix}.input_layernorm.weight`, `{prefix}.post_attention_layernorm.weight`,
     /// `{prefix}.self_attn.*` and `{prefix}.mlp.*`.
     pub fn from_weights(

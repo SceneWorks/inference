@@ -62,6 +62,15 @@ pub struct MageTimestepEmbedder {
 }
 
 impl MageTimestepEmbedder {
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.linear_1.quantize(bits)?;
+        self.linear_2.quantize(bits)
+    }
+
+    pub(crate) fn quantized_linear_count(&self) -> usize {
+        usize::from(self.linear_1.is_quantized()) + usize::from(self.linear_2.is_quantized())
+    }
+
     /// Load from `{prefix}.timestep_embedder.linear_{1,2}.{weight,bias}` — the diffusers
     /// `TimestepEmbedding` layout, `prefix = "time_text_embed"` in the published checkpoint. The
     /// sinusoidal `time_proj` half is weightless.

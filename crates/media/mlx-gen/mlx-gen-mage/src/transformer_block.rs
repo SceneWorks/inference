@@ -53,6 +53,22 @@ pub struct MageTransformerBlock {
 }
 
 impl MageTransformerBlock {
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.img_mod.quantize(bits)?;
+        self.txt_mod.quantize(bits)?;
+        self.attn.quantize(bits)?;
+        self.img_mlp.quantize(bits)?;
+        self.txt_mlp.quantize(bits)
+    }
+
+    pub(crate) fn quantized_linear_count(&self) -> usize {
+        usize::from(self.img_mod.is_quantized())
+            + usize::from(self.txt_mod.is_quantized())
+            + self.attn.quantized_linear_count()
+            + self.img_mlp.quantized_linear_count()
+            + self.txt_mlp.quantized_linear_count()
+    }
+
     /// Load from `{prefix}.{img_mod.1,txt_mod.1,attn.*,img_mlp.*,txt_mlp.*}` — e.g.
     /// `transformer_blocks.0`.
     ///

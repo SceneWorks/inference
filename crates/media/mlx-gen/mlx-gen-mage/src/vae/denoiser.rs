@@ -118,58 +118,76 @@ impl BottleneckPatchEmbed {
 struct NerfEmbedder {
     // Retained for the general nonzero-noise path. The decode fold reduces activations; it does
     // not claim to free this small 99-wide projection weight.
-    weight: Array,
-    bias: Array,
-    zero_rgb_weight: Option<Array>,
-    dct_bias: Option<Array>,
+    projection: mlx_gen::adapters::AdaptableLinear,
+    zero_rgb_projection: Option<mlx_gen::adapters::AdaptableLinear>,
 }
 
 impl NerfEmbedder {
     fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
         Ok(Self {
-            weight: w.require(&format!("{prefix}.embedder.0.weight"))?.clone(),
-            bias: w.require(&format!("{prefix}.embedder.0.bias"))?.clone(),
-            zero_rgb_weight: None,
-            dct_bias: None,
+            projection: mlx_gen::quant::lin(w, &format!("{prefix}.embedder.0"), true, 64)?,
+            zero_rgb_projection: None,
         })
     }
 
     /// Literal, unfused `[.., P², 99] → [.., P², 32]` projection.
     fn forward_unfolded(&self, x: &Array) -> Result<Array> {
-        linear(x, &self.weight, &self.bias)
+        self.projection.forward(x)
     }
 
     fn fold_zero_rgb_dct(&mut self, dct: &Array, dynamic_channels: i32) -> Result<()> {
-        let total = self.weight.shape()[1];
-        let dct_weight = self
-            .weight
+        let (weight, bias) = self.projection.dense_weight().ok_or_else(|| {
+            Error::Msg("mage-vae x_embedder must fold before quantization".into())
+        })?;
+        let bias = bias.expect("x_embedder is biased");
+        let total = weight.shape()[1];
+        let dct_weight = weight
             .split_axis(&[dynamic_channels, total], 1)?
             .swap_remove(1);
-        let zero_rgb_weight = self
-            .weight
-            .split_axis(&[3, dynamic_channels], 1)?
-            .swap_remove(1);
-        let dct_bias = linear(dct, &dct_weight, &self.bias)?;
+        let zero_rgb_weight = weight.split_axis(&[3, dynamic_channels], 1)?.swap_remove(1);
+        let dct_bias = linear(dct, &dct_weight, bias)?;
         mlx_rs::transforms::eval([&zero_rgb_weight, &dct_bias])?;
-        self.zero_rgb_weight = Some(zero_rgb_weight);
-        self.dct_bias = Some(dct_bias);
+        self.zero_rgb_projection = Some(mlx_gen::adapters::AdaptableLinear::dense(
+            zero_rgb_weight,
+            Some(dct_bias),
+        ));
         Ok(())
     }
 
     fn forward_zero_rgb(&self, y: &Array) -> Result<Array> {
-        linear(
-            y,
-            self.zero_rgb_weight
-                .as_ref()
-                .expect("decode fold must provide zero-RGB x_embedder weights"),
-            self.dct_bias
-                .as_ref()
-                .expect("decode fold must provide the DCT contribution"),
-        )
+        self.zero_rgb_projection
+            .as_ref()
+            .expect("decode fold must provide zero-RGB x_embedder weights")
+            .forward(y)
     }
 
     fn is_decode_folded(&self) -> bool {
-        self.zero_rgb_weight.is_some() && self.dct_bias.is_some()
+        self.zero_rgb_projection.is_some()
+    }
+
+    fn quantize(&mut self, bits: i32) -> Result<()> {
+        if self.projection.base_shape()[1] % 64 == 0 {
+            self.projection.quantize(bits, None)?;
+        }
+        if let Some(projection) = &mut self.zero_rgb_projection {
+            if projection.base_shape()[1] % 64 == 0 {
+                projection.quantize(bits, None)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn quantization_count(&self) -> (usize, usize) {
+        let mut expected = 0;
+        let mut packed = 0;
+        for projection in std::iter::once(&self.projection).chain(self.zero_rgb_projection.as_ref())
+        {
+            if projection.base_shape()[1] % 64 == 0 {
+                expected += 1;
+                packed += usize::from(projection.is_quantized());
+            }
+        }
+        (expected, packed)
     }
 }
 
@@ -229,6 +247,22 @@ struct MlpResBlock {
 }
 
 impl MlpResBlock {
+    fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.fc1.quantize(bits)?;
+        self.fc2.quantize(bits)?;
+        self.adaln.quantize(bits)
+    }
+
+    fn quantization_count(&self) -> (usize, usize) {
+        [
+            self.fc1.quantization_count(),
+            self.fc2.quantization_count(),
+            self.adaln.quantization_count(),
+        ]
+        .into_iter()
+        .fold((0, 0), |sum, item| (sum.0 + item.0, sum.1 + item.1))
+    }
+
     fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
         Ok(Self {
             in_ln: LayerNormAffine::from_weights(w, &format!("{prefix}.in_ln"))?,
@@ -263,6 +297,29 @@ struct SimpleMlpAdaLn {
 }
 
 impl SimpleMlpAdaLn {
+    fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.cond_embed.quantize(bits)?;
+        self.input_proj.quantize(bits)?;
+        for block in &mut self.res_blocks {
+            block.quantize(bits)?;
+        }
+        Ok(())
+    }
+
+    fn quantization_count(&self) -> (usize, usize) {
+        let mut count = [
+            self.cond_embed.quantization_count(),
+            self.input_proj.quantization_count(),
+        ]
+        .into_iter()
+        .fold((0, 0), |sum, item| (sum.0 + item.0, sum.1 + item.1));
+        for block in &self.res_blocks {
+            let next = block.quantization_count();
+            count = (count.0 + next.0, count.1 + next.1);
+        }
+        count
+    }
+
     fn from_weights(w: &Weights, prefix: &str, shape: MageVaeShape) -> Result<Self> {
         let res_blocks = (0..shape.num_mlp_blocks)
             .map(|i| MlpResBlock::from_weights(w, &format!("{prefix}.res_blocks.{i}")))
@@ -297,6 +354,14 @@ struct NerfFinalLayer {
 }
 
 impl NerfFinalLayer {
+    fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.linear.quantize(bits)
+    }
+
+    fn quantization_count(&self) -> (usize, usize) {
+        self.linear.quantization_count()
+    }
+
     fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
         Ok(Self {
             norm: RmsNorm::from_weights(w, &format!("{prefix}.norm"))?,
@@ -323,6 +388,32 @@ pub struct DConvDenoiser {
 }
 
 impl DConvDenoiser {
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.t_embedder.quantize(bits)?;
+        for block in &mut self.blocks {
+            block.quantize(bits)?;
+        }
+        self.dec_net.quantize(bits)?;
+        self.final_layer.quantize(bits)?;
+        self.x_embedder.quantize(bits)
+    }
+
+    pub(crate) fn quantization_count(&self) -> (usize, usize) {
+        let mut count = self.t_embedder.quantization_count();
+        for block in &self.blocks {
+            let next = block.quantization_count();
+            count = (count.0 + next.0, count.1 + next.1);
+        }
+        for next in [
+            self.dec_net.quantization_count(),
+            self.final_layer.quantization_count(),
+            self.x_embedder.quantization_count(),
+        ] {
+            count = (count.0 + next.0, count.1 + next.1);
+        }
+        count
+    }
+
     /// Load under `{prefix}` (`pipeline` in the published checkpoint).
     pub fn from_weights(w: &Weights, prefix: &str, shape: MageVaeShape) -> Result<Self> {
         let blocks = (0..shape.num_cond_blocks)

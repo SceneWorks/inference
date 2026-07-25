@@ -102,8 +102,13 @@ pub struct GenerationTrace {
 impl MageFlowPipeline {
     /// Load a published diffusers snapshot (`text_encoder/`, `transformer/`, `vae/`).
     pub fn load(root: impl AsRef<Path>) -> Result<Self> {
+        Self::load_with_quant(root, None)
+    }
+
+    /// Load and optionally quantize all live Linears in the TE, DiT, and VAE.
+    pub fn load_with_quant(root: impl AsRef<Path>, quant_bits: Option<i32>) -> Result<Self> {
         let root = root.as_ref();
-        Ok(Self {
+        let mut pipeline = Self {
             text_encoder: crate::text_encoder::load(root)?,
             transformer: MageTransformer::load(root.join("transformer"))?,
             vae: crate::vae::load(
@@ -111,7 +116,21 @@ impl MageFlowPipeline {
                 crate::vae::VaePart::Decode,
                 Dtype::Bfloat16,
             )?,
-        })
+        };
+        if let Some(bits) = quant_bits {
+            pipeline.text_encoder.quantize(bits)?;
+            pipeline.transformer.quantize(bits)?;
+            pipeline.vae.quantize(bits)?;
+            verify_quantized_counts(
+                "text encoder",
+                pipeline.text_encoder.quantized_linear_count(),
+                253,
+            )?;
+            verify_quantized_counts("DiT", pipeline.transformer.quantized_linear_count(), 174)?;
+            let (expected_vae, packed_vae) = pipeline.vae.quantization_count();
+            verify_quantized_counts("VAE", packed_vae, expected_vae)?;
+        }
+        Ok(pipeline)
     }
 
     /// Generate one decoded NCHW image in the reference's `[0,255]` float range.
@@ -327,6 +346,15 @@ impl MageFlowPipeline {
             packs,
         })
     }
+}
+
+fn verify_quantized_counts(component: &str, packed: usize, expected: usize) -> Result<()> {
+    if packed != expected {
+        return Err(Error::Msg(format!(
+            "mage_flow: {component} quantization packed {packed}/{expected} required projections"
+        )));
+    }
+    Ok(())
 }
 
 /// Validate exact requested geometry and greedily preserve input order under the 50k-token budget.
@@ -804,5 +832,15 @@ mod tests {
         assert_eq!(fused.img_lens(), &[4096, 4096, 3311, 4096, 4096, 3311]);
         assert_eq!(fused.txt_lens(), &[7, 11, 13, 5, 9, 15]);
         assert_eq!(fused.img_tokens(), 23_006);
+    }
+
+    #[test]
+    fn quant_audit_rejects_one_omitted_small_projection() {
+        // Mutation discriminator: skipping even one small projection (for example a timestep
+        // `linear_2`) changes 253→252 and must fail, independent of total memory movement.
+        assert!(verify_quantized_counts("text encoder", 252, 253).is_err());
+        assert!(verify_quantized_counts("DiT", 173, 174).is_err());
+        assert!(verify_quantized_counts("VAE", 4, 5).is_err());
+        assert!(verify_quantized_counts("VAE", 5, 5).is_ok());
     }
 }

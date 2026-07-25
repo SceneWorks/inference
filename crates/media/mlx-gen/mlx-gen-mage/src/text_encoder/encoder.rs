@@ -94,6 +94,31 @@ pub struct Qwen3VlTextEncoder {
 }
 
 impl Qwen3VlTextEncoder {
+    /// Quantize token embeddings and every attention/MLP projection; RMSNorms stay dense.
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.embed_tokens.quantize(bits, true)?;
+        for layer in &mut self.layers {
+            layer.quantize(bits)?;
+        }
+        let got = self.quantized_linear_count();
+        let expected = 1 + self.layers.len() * 7;
+        if got != expected {
+            return Err(mlx_gen::Error::Msg(format!(
+                "mage_flow: text encoder quantization packed {got}/{expected} required projections"
+            )));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn quantized_linear_count(&self) -> usize {
+        usize::from(self.embed_tokens.is_quantized())
+            + self
+                .layers
+                .iter()
+                .map(Qwen3VlDecoderLayer::quantized_linear_count)
+                .sum::<usize>()
+    }
+
     /// Load the LM under `prefix` — `"model.language_model"` for the published
     /// `text_encoder/` checkpoint (`{prefix}.embed_tokens.weight`, `{prefix}.layers.{i}.…`,
     /// `{prefix}.norm.weight`).
@@ -123,6 +148,46 @@ impl Qwen3VlTextEncoder {
             embed_tokens: embedding(w, &join(prefix, "embed_tokens"))?,
             layers,
             norm: w.require(&join(prefix, "norm.weight"))?.clone(),
+            eps,
+            head_dim: cfg.head_dim,
+            rope_theta,
+            mrope_section: cfg.mrope_section,
+        })
+    }
+
+    /// Consuming production variant of [`from_weights`](Self::from_weights). Each completed
+    /// decoder layer is removed from the source map immediately, bounding the load/quantize
+    /// transient instead of retaining all 36 source-layer handles to the end.
+    pub fn from_weights_draining(
+        w: &mut Weights,
+        prefix: &str,
+        cfg: &QwenVlTextConfig,
+        eps: f32,
+        rope_theta: f64,
+    ) -> Result<Self> {
+        let embed_prefix = join(prefix, "embed_tokens");
+        let embed_tokens = embedding(w, &embed_prefix)?;
+        w.remove_prefix(&format!("{embed_prefix}."));
+        let mut layers = Vec::with_capacity(cfg.num_layers);
+        for i in 0..cfg.num_layers {
+            let layer_prefix = join(prefix, &format!("layers.{i}"));
+            layers.push(Qwen3VlDecoderLayer::from_weights(
+                w,
+                &layer_prefix,
+                cfg.num_attention_heads,
+                cfg.num_key_value_heads,
+                cfg.head_dim,
+                eps,
+            )?);
+            w.remove_prefix(&format!("{layer_prefix}."));
+        }
+        let norm_key = join(prefix, "norm.weight");
+        let norm = w.require(&norm_key)?.clone();
+        w.remove(&norm_key);
+        Ok(Self {
+            embed_tokens,
+            layers,
+            norm,
             eps,
             head_dim: cfg.head_dim,
             rope_theta,

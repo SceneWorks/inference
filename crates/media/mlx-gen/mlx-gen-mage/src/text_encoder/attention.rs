@@ -41,6 +41,20 @@ pub struct Qwen3VlAttention {
 }
 
 impl Qwen3VlAttention {
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.q_proj.quantize(bits, None)?;
+        self.k_proj.quantize(bits, None)?;
+        self.v_proj.quantize(bits, None)?;
+        self.o_proj.quantize(bits, None)
+    }
+
+    pub(crate) fn quantized_linear_count(&self) -> usize {
+        [&self.q_proj, &self.k_proj, &self.v_proj, &self.o_proj]
+            .into_iter()
+            .filter(|linear| linear.is_quantized())
+            .count()
+    }
+
     /// Load from `{prefix}.{q,k,v,o}_proj.weight` + `{prefix}.{q,k}_norm.weight`.
     ///
     /// `attention_bias` is `false` for this checkpoint

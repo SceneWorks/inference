@@ -17,7 +17,6 @@ use mlx_rs::fast::layer_norm;
 use mlx_rs::ops::{conv2d as conv2d_op, multiply};
 use mlx_rs::Array;
 
-use mlx_gen::nn::linear;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
@@ -97,22 +96,38 @@ impl Conv2d {
 
 /// A PyTorch `nn.Linear` (weight `[out, in]`, always biased in this codec).
 pub struct Linear {
-    weight: Array,
-    bias: Array,
+    inner: mlx_gen::adapters::AdaptableLinear,
+    in_features: i32,
 }
 
 impl Linear {
     /// Load `{prefix}.weight` + `{prefix}.bias`.
     pub fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
+        let weight = w.require(&format!("{prefix}.weight"))?;
         Ok(Self {
-            weight: w.require(&format!("{prefix}.weight"))?.clone(),
-            bias: w.require(&format!("{prefix}.bias"))?.clone(),
+            inner: mlx_gen::quant::lin(w, prefix, true, 64)?,
+            in_features: weight.shape()[1],
         })
     }
 
     /// `x @ weightᵀ + bias` over the last axis.
     pub fn forward(&self, x: &Array) -> Result<Array> {
-        linear(x, &self.weight, &self.bias)
+        self.inner.forward(x)
+    }
+
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        if self.in_features % 64 == 0 {
+            self.inner.quantize(bits, None)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn quantization_count(&self) -> (usize, usize) {
+        if self.in_features % 64 == 0 {
+            (1, usize::from(self.inner.is_quantized()))
+        } else {
+            (0, 0)
+        }
     }
 }
 

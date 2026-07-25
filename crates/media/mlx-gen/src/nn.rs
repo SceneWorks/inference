@@ -102,6 +102,10 @@ impl TokenEmbedding {
         }
         Ok(())
     }
+
+    pub fn is_quantized(&self) -> bool {
+        matches!(self, Self::Quantized { .. })
+    }
 }
 
 /// sc-2963 (rollout of the Wan sc-2957 template): the shared compiled-elementwise-*glue* toggle and

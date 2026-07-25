@@ -176,7 +176,7 @@ pub fn descriptor_for(variant: MageVariant) -> ModelDescriptor {
                 Vec::new()
             },
             // Q4/Q8 tiers are sc-14046; `&[]` means dense-only, which is what the scaffold is.
-            supported_quants: &[] as &[Quant],
+            supported_quants: &[Quant::Q4, Quant::Q8],
             min_size: MIN_SIZE,
             max_size: MAX_SIZE,
             // A platform request has one geometry/prompt and `count` independent seeds. The
@@ -200,9 +200,9 @@ pub fn load(variant: MageVariant, spec: &LoadSpec) -> Result<Box<dyn Generator>>
             variant.id()
         )));
     }
-    if spec.precision != Precision::Bf16 || spec.quantize.is_some() || !spec.adapters.is_empty() {
+    if spec.precision != Precision::Bf16 || !spec.adapters.is_empty() {
         return Err(Error::Unsupported(
-            "mage_flow: RL, Base, and Turbo support dense bf16 checkpoints without adapters".into(),
+            "mage_flow: RL, Base, and Turbo support bf16/Q4/Q8 checkpoints without adapters".into(),
         ));
     }
     let root = match &spec.weights {
@@ -237,7 +237,8 @@ pub fn load(variant: MageVariant, spec: &LoadSpec) -> Result<Box<dyn Generator>>
     Ok(Box::new(MageFlow {
         variant,
         descriptor: descriptor_for(variant),
-        pipeline: MageFlowPipeline::load(root)?,
+        tier: spec.quantize,
+        pipeline: MageFlowPipeline::load_with_quant(root, spec.quantize.map(Quant::bits))?,
     }))
 }
 
@@ -331,6 +332,7 @@ fn verify_checkpoint_identity(
 pub struct MageFlow {
     variant: MageVariant,
     descriptor: ModelDescriptor,
+    tier: Option<Quant>,
     pipeline: MageFlowPipeline,
 }
 
@@ -349,6 +351,13 @@ impl Generator for MageFlow {
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<GenerationOutput> {
         self.validate(req)?;
+        crate::memory::ensure_generation_fits(
+            self.tier,
+            req.width,
+            req.height,
+            req.count,
+            crate::memory::production_safe_budget_gb()?,
+        )?;
         if req.cancel.is_cancelled() {
             return Err(mlx_gen::gen_core::Error::Canceled);
         }
@@ -412,6 +421,23 @@ fn validate_generation_request(
 /// pins each advertised resolution bucket to an engine stride constant.
 pub const REQUIRED_SIZE_MULTIPLE: u32 = SIZE_MULTIPLE;
 
+/// Per-component on-disk footprint used by the worker's staged-residency fit gate.
+///
+/// Mage-Flow quantizes all three weight-bearing components, so the accounting must follow the
+/// selected snapshot tree rather than a transformer-only approximation. Missing/unreadable
+/// subdirectories contribute zero bytes here; checkpoint identity/load validation separately rejects
+/// missing required components before generation.
+pub(crate) fn component_footprint(
+    spec: &mlx_gen::LoadSpec,
+) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
+    mlx_gen::PerComponentBytes::from_spec_subdirs(
+        spec,
+        &["text_encoder"],
+        &["transformer"],
+        &["vae"],
+    )
+}
+
 macro_rules! mage_registrations {
     ( $( $variant:ident => ( $descriptor_fn:ident, $load_fn:ident, $registration:ident ) ),+ $(,)? ) => {
         $(
@@ -425,7 +451,8 @@ macro_rules! mage_registrations {
             }
 
             mlx_gen::register_generators! {
-                pub const $registration = $descriptor_fn => $load_fn
+                pub const $registration = $descriptor_fn => $load_fn;
+                footprint = component_footprint
             }
         )+
 

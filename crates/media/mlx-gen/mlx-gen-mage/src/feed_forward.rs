@@ -79,6 +79,15 @@ pub struct MageFeedForward {
 }
 
 impl MageFeedForward {
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.proj.quantize(bits)?;
+        self.out.quantize(bits)
+    }
+
+    pub(crate) fn quantized_linear_count(&self) -> usize {
+        usize::from(self.proj.is_quantized()) + usize::from(self.out.is_quantized())
+    }
+
     /// Load from `{prefix}.net.0.proj.{weight,bias}` and `{prefix}.net.2.{weight,bias}` — e.g.
     /// `transformer_blocks.0.img_mlp`. Both projections carry a bias (`bias=True` default).
     pub fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {

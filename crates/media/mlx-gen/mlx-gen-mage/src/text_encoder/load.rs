@@ -94,8 +94,24 @@ pub fn load_lm(root: impl AsRef<Path>) -> Result<Qwen3VlTextEncoder> {
         ))
     })?;
     let cfg = verify_text_config(&published)?;
-    let w = Weights::from_dir(&dir)?;
-    Qwen3VlTextEncoder::from_weights(&w, LM_PREFIX, &cfg, TE_RMS_NORM_EPS, TE_ROPE_THETA)
+    let mut w = Weights::from_dir(&dir)?;
+    let model = Qwen3VlTextEncoder::from_weights_draining(
+        &mut w,
+        LM_PREFIX,
+        &cfg,
+        TE_RMS_NORM_EPS,
+        TE_ROPE_THETA,
+    )?;
+    let remaining_lm = w
+        .keys()
+        .filter(|key| key.starts_with(&format!("{LM_PREFIX}.")))
+        .count();
+    if remaining_lm != 0 {
+        return Err(Error::Msg(format!(
+            "mage_flow text encoder: drain left {remaining_lm} language-model source tensors resident"
+        )));
+    }
+    Ok(model)
 }
 
 /// Load tokenizer + LM together.
