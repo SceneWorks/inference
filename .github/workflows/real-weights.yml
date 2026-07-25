@@ -71,7 +71,7 @@ jobs:
         run: |
           python -m venv "$RUNNER_TEMP/mage-reference"
           "$RUNNER_TEMP/mage-reference/bin/python" -m pip install \
-            --disable-pip-version-check --only-binary=:all: \
+            --disable-pip-version-check --only-binary=:all: --require-hashes \
             -r crates/media/mlx-gen/_vendor/mage_flow/requirements-oracles.txt
           MAGE_DEVICE=cpu "$RUNNER_TEMP/mage-reference/bin/python" \
             scripts/release/provision_mage_oracles.py \

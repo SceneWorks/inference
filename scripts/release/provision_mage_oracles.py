@@ -63,21 +63,25 @@ REFERENCE_PACKAGES = {
     "torch": "2.13.0",
     "torchvision": "0.28.0",
     "transformers": "5.5.0",
-    "typing_extensions": "4.16.0",
+    "typing_extensions": "4.15.0",
 }
-REFERENCE_PYTHON = (3, 12)
+REFERENCE_PYTHON = (3, 12, 11)
 
 
 class InvalidOracle(RuntimeError):
     pass
 
 
-def _validate_reference_environment() -> dict[str, str]:
-    if sys.version_info[:2] != REFERENCE_PYTHON:
+def _validate_python_version(version: tuple[int, int, int]) -> None:
+    if version != REFERENCE_PYTHON:
         raise InvalidOracle(
-            f"reference Python is {sys.version_info.major}.{sys.version_info.minor}, "
-            f"expected {REFERENCE_PYTHON[0]}.{REFERENCE_PYTHON[1]}"
+            f"reference Python is {'.'.join(map(str, version))}, "
+            f"expected {'.'.join(map(str, REFERENCE_PYTHON))}"
         )
+
+
+def _validate_reference_environment() -> dict[str, str]:
+    _validate_python_version(sys.version_info[:3])
     actual = {}
     for package, expected in REFERENCE_PACKAGES.items():
         try:
@@ -309,6 +313,7 @@ def _self_test() -> None:
         _write_manifest(stale, "b" * 40, [], 0)
 
         cases = (
+            ("Python patch mismatch", lambda: _validate_python_version((3, 12, 12))),
             ("absent", lambda: _validate_files(missing, revision)),
             ("corrupt", lambda: _inspect(corrupt)),
             ("revision mismatch", lambda: verify(stale, snapshot)),
@@ -329,7 +334,7 @@ def _self_test() -> None:
             raise AssertionError(f"self-test failed to reject {label}")
     print(
         "Mage oracle provisioning self-test PASS: "
-        "absent/corrupt/revision/dtype/shape mutations rejected"
+        "Python-patch/absent/corrupt/revision/dtype/shape mutations rejected"
     )
 
 
