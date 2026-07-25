@@ -188,7 +188,14 @@ def _f32(t: torch.Tensor) -> np.ndarray:
     """
     if t.is_complex():
         raise TypeError("complex tensor reached _f32 — use _split_complex (real part only would be stored)")
-    return t.detach().to("cpu", torch.float32).contiguous().numpy()
+    value = t.detach()
+    # torch 2.13.0 MPS can silently copy the wrong storage region when a sliced view with a
+    # non-zero storage offset is transferred directly to CPU. Synchronizing does not help;
+    # materializing independent MPS storage first does. Always clone MPS tensors so this remains
+    # safe even for views that report `is_contiguous()` despite their non-zero storage offset.
+    if value.device.type == "mps":
+        value = value.clone(memory_format=torch.contiguous_format)
+    return value.to("cpu", torch.float32).contiguous().numpy()
 
 
 def _split_complex(t: torch.Tensor) -> tuple[np.ndarray, np.ndarray]:
@@ -202,6 +209,17 @@ def _split_complex(t: torch.Tensor) -> tuple[np.ndarray, np.ndarray]:
 
 def _i64(t: torch.Tensor) -> np.ndarray:
     return t.detach().to("cpu", torch.int64).contiguous().numpy()
+
+
+def _assert_exact_slice(label: str, actual: np.ndarray, expected: np.ndarray) -> None:
+    """Fail closed before writing when a separately transferred packed view is corrupted."""
+    if actual.shape != expected.shape or not np.array_equal(actual, expected):
+        delta = np.max(np.abs(actual - expected)) if actual.shape == expected.shape else np.inf
+        raise RuntimeError(
+            f"{label} is not the exact post-drop slice of its captured full hidden state "
+            f"(shape {actual.shape} vs {expected.shape}, max_abs={delta:.6f}); "
+            "refusing to write a silently corrupted text-encoder golden"
+        )
 
 
 def _shapes_arr(img_shapes) -> np.ndarray:
@@ -502,14 +520,22 @@ def dump_te(model) -> dict[str, np.ndarray]:
         cap.remove()
 
     pos_len, neg_len = int(lens[0]), int(lens[1])
+    gen_txt = _f32(txt[:pos_len])
+    neg_txt = _f32(txt[pos_len : pos_len + neg_len])
+    pos_seq_len = pos_len + drop_idx
+    for label, actual, expected in (
+        ("gen_txt", gen_txt, cap.hidden[drop_idx:pos_seq_len]),
+        ("neg_txt", neg_txt, cap.hidden[pos_seq_len + drop_idx :]),
+    ):
+        _assert_exact_slice(label, actual, expected)
     tensors.update(
         {
             "gen_input_ids": _i64(ids),
             "gen_hidden_full": cap.hidden,  # [pos_L + neg_L, 2560], post-final-RMSNorm, pre-drop
-            "gen_txt": _f32(txt[:pos_len]),
+            "gen_txt": gen_txt,
             "gen_vec": _f32(vec[0:1]),
             "gen_txt_len": np.array([pos_len], dtype=np.int32),
-            "neg_txt": _f32(txt[pos_len : pos_len + neg_len]),
+            "neg_txt": neg_txt,
             "neg_vec": _f32(vec[1:2]),
             "neg_txt_len": np.array([neg_len], dtype=np.int32),
             "gen_drop_idx": np.array([drop_idx], dtype=np.int32),
@@ -538,6 +564,9 @@ def dump_te(model) -> dict[str, np.ndarray]:
     finally:
         cap.remove()
 
+    edit_txt = _f32(etxt)
+    edit_expected = cap.hidden[edrop:]
+    _assert_exact_slice("edit_txt", edit_txt, edit_expected)
     tensors.update(
         {
             "edit_input_ids": _i64(vl["input_ids"].squeeze(0)),
@@ -545,7 +574,7 @@ def dump_te(model) -> dict[str, np.ndarray]:
             "edit_image_grid_thw": _i64(vl["image_grid_thw"]),
             "edit_vl_ref_u8": _pil_u8(vl_ref),
             "edit_hidden_full": cap.hidden,
-            "edit_txt": _f32(etxt),
+            "edit_txt": edit_txt,
             "edit_vec": _f32(evec),
             "edit_txt_len": np.array([int(elens[0])], dtype=np.int32),
             "edit_drop_idx": np.array([edrop], dtype=np.int32),
@@ -808,7 +837,23 @@ _STAGES = ("noise", "vae", "te", "dit_block", "dit", "e2e", "edit")
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--stage", choices=[*_STAGES, "all"], default="all")
+    parser.add_argument(
+        "--self-test-transfer",
+        action="store_true",
+        help="prove the pre-write packed-slice invariant accepts exact data and rejects corruption",
+    )
     args = parser.parse_args()
+    if args.self_test_transfer:
+        full = np.arange(24, dtype=np.float32).reshape(6, 4)
+        _assert_exact_slice("self-test exact", full[2:4].copy(), full[2:4])
+        corrupted = full[2:4].copy()
+        corrupted[0, 0] += 1
+        try:
+            _assert_exact_slice("self-test mutation", corrupted, full[2:4])
+        except RuntimeError:
+            print("packed-slice transfer self-test PASS: exact accepted, corruption rejected")
+            return 0
+        raise RuntimeError("packed-slice transfer self-test failed to reject corruption")
     stages = set(_STAGES) if args.stage == "all" else {args.stage}
 
     gen_repo = _snapshot_dir("MAGE_SNAPSHOT", "microsoft/Mage-Flow")

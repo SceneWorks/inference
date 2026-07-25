@@ -160,17 +160,21 @@ surface and `tools/golden/README.md` for the golden manifest.
   moderation pass runs twice per stage. That is deliberate: it turns a screening failure into a
   loud error instead of a blank-white refusal-image golden that every parity test would happily
   match.
-* **Never dump goldens on MPS — it corrupts them SILENTLY.** Measured under sc-14036: a
-  `--stage te` dump on MPS writes a **corrupted** `neg_txt` — the packed negative's post-drop
-  tail — while the hooked `gen_hidden_full` tail it must equal is fully populated. The
-  magnitude is stable (max_abs 61.4342, reproducible across three runs; `neg_vec` off by
-  21.0056); the *signature* is not — the bad tail has been observed both zero-filled and as
-  non-zero garbage, so do not treat "all-zero rows" as the thing to look for. The same
-  comparison made *in process* on the live torch tensors agrees at 0.0, so the corruption
-  appears in the `_f32` MPS→CPU copy, not in the reference. Nothing raises. `MAGE_DEVICE=cpu`
-  is the blessed path, and `verify_mage_flow_golden.py` now hard-fails an MPS-dumped bundle on
-  exactly this equality invariant (`neg_txt == gen_hidden_full` tail), however the tail is
-  garbled.
+* **MPS dumps require materializing views before CPU transfer.** On macOS 26.5.2 arm64 with
+  torch `2.13.0` (`cf30153c4c131c8164ee7798e5022d810682e2cb`), transferring the packed
+  negative slice directly from MPS to CPU silently read the wrong storage region: `neg_txt`
+  differed from the hooked `gen_hidden_full` tail by max_abs `61.434204` (`neg_vec` by
+  `21.0056`). The sc-14250 bisect isolated the condition: direct slice `61.434204`;
+  `mps.synchronize()` + slice `61.466061`; `cat` + slice `61.466061`; whole packed tensor then
+  CPU-slice `0.0`; **clone on MPS then transfer `0.0`**. A row slice can report contiguous while
+  retaining a non-zero storage offset, so `_f32` clones every MPS tensor before copying it to
+  CPU. `dump_mage_flow_golden.py` also checks the gen, negative, and edit post-drop slices
+  against the hooked full hidden states before writing and aborts loudly on any mismatch;
+  `verify_mage_flow_golden.py --self-test` mutates the negative slice to prove the
+  persisted-bundle invariant discriminates. This is consistent with PyTorch's broader MPS
+  non-contiguous/view buffer issue
+  [#167154](https://github.com/pytorch/pytorch/issues/167154), but that report is not confirmed
+  as the exact same copy-path defect.
 * **`torch 2.13.0` MPS also mis-handles `Tensor.repeat_interleave(repeats=<int32 tensor>)`**,
   which the adaLN modulation broadcast uses (`models/modules/mage_layers.py:566`, fed by the
   int32 `cu_seqlens` the reference builds in `pipeline._lens_to_cu`). That one fails loudly
