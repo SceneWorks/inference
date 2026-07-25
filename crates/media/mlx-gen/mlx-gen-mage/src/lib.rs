@@ -103,7 +103,10 @@ pub use latent::{
 }; // sc-14104 (Gaussian-Shading noise)
 
 // sc-14041 (pipeline + the loaded model) re-exports here:
-pub use pipeline::{mage_flow_sigmas, MageFlowPipeline, STATIC_SHIFT};
+pub use pipeline::{
+    mage_flow_sigmas, BatchGenerationTrace, GenerationPack, GenerationSample, GenerationTrace,
+    MageFlowPipeline, MAX_PACKED_IMAGE_TOKENS, STATIC_SHIFT,
+};
 
 // Later phases add their own modules rather than growing these: `quant` (Q4/Q8 tiers, sc-14046),
 // `convert` (offline pre-quantisation, sc-14046), `adapters` (LoRA/LoKr routing, sc-14057) and
