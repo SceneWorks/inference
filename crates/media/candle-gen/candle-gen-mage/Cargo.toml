@@ -9,7 +9,7 @@ default = []
 cuda = ["candle-gen/cuda", "candle-gen-boogu/cuda", "candle-transformers/cuda"]
 
 [dependencies]
-candle-gen = { path = "../candle-gen" }
+candle-gen = { path = "../candle-gen", features = ["testkit"] }
 candle-gen-boogu = { path = "../candle-gen-boogu" }
 candle-core = { workspace = true }
 candle-nn = { workspace = true }
