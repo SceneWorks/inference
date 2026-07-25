@@ -28,6 +28,7 @@ pub mod providers {
     pub use candle_gen_krea as krea;
     pub use candle_gen_lens as lens;
     pub use candle_gen_ltx as ltx;
+    pub use candle_gen_mage as mage;
     pub use candle_gen_mochi as mochi;
     pub use candle_gen_pid as pid;
     pub use candle_gen_pulid as pulid;
@@ -65,6 +66,7 @@ pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistry
     let registry = candle_gen_krea::register_providers(registry);
     let registry = candle_gen_lens::register_providers(registry);
     let registry = candle_gen_ltx::register_providers(registry);
+    let registry = candle_gen_mage::register_providers(registry);
     let registry = candle_gen_mochi::register_providers(registry);
     let registry = candle_gen_qwen_image::register_providers(registry);
     let registry = candle_gen_sana::register_providers(registry);
@@ -188,6 +190,12 @@ mod tests {
                 "lens_turbo",
                 "lens",
                 "ltx_2_3_distilled",
+                "mage_flow",
+                "mage_flow_base",
+                "mage_flow_turbo",
+                "mage_flow_edit",
+                "mage_flow_edit_base",
+                "mage_flow_edit_turbo",
                 "mochi_1",
                 "qwen_image",
                 "sana_1600m",
@@ -228,6 +236,34 @@ mod tests {
         );
         assert_eq!(image_embedders, ["clip_vit_l14"]);
         assert_eq!(text_embedders, ["clip_vit_l14_text"]);
+    }
+
+    #[test]
+    fn mage_is_shipped_with_truthful_quant_surface() {
+        let registry = super::provider_registry().expect("catalog");
+        for id in [
+            "mage_flow",
+            "mage_flow_base",
+            "mage_flow_turbo",
+            "mage_flow_edit",
+            "mage_flow_edit_base",
+            "mage_flow_edit_turbo",
+        ] {
+            let descriptor = registry
+                .generators()
+                .map(|registration| (registration.descriptor)())
+                .find(|descriptor| descriptor.id == id)
+                .unwrap_or_else(|| panic!("{id} missing from Candle catalog"));
+            assert_eq!(descriptor.backend, "candle");
+            assert!(!descriptor.capabilities.mac_only);
+            assert_eq!(
+                descriptor.capabilities.supported_quants,
+                &[
+                    super::media::gen_core::Quant::Q4,
+                    super::media::gen_core::Quant::Q8
+                ]
+            );
+        }
     }
 
     /// Pin the NVFP4 tier's catalog surface (epic 11037, sc-11042 Option A): the FP4 tier is exposed

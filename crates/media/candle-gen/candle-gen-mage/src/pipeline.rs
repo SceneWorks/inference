@@ -9,6 +9,7 @@ use crate::config::LATENT_CHANNELS;
 use crate::rope::{ImgShape, PackLayout};
 use crate::scheduler;
 use crate::{MageConfig, MageTextEncoder, MageTransformer, MageVae};
+use candle_gen::gen_core::Quant;
 
 pub struct MagePipeline {
     text: MageTextEncoder,
@@ -19,11 +20,20 @@ pub struct MagePipeline {
 
 impl MagePipeline {
     pub fn load(root: &Path, device: &Device) -> Result<Self> {
+        Self::load_with_quant(root, None, device)
+    }
+
+    pub fn load_with_quant(root: &Path, quant: Option<Quant>, device: &Device) -> Result<Self> {
         let cfg_text = std::fs::read_to_string(root.join("transformer/config.json"))?;
         let cfg = MageConfig::from_json(&cfg_text)?;
         Ok(Self {
             text: MageTextEncoder::load(root, device)?,
-            transformer: MageTransformer::load(&root.join("transformer"), &cfg, device)?,
+            transformer: MageTransformer::load_with_quant(
+                &root.join("transformer"),
+                &cfg,
+                quant,
+                device,
+            )?,
             vae: MageVae::load(&root.join("vae"), device)?,
             device: device.clone(),
         })

@@ -2,11 +2,13 @@
 
 use std::path::Path;
 
-use candle_core::{DType, Device, Module, Result, Tensor, D};
-use candle_gen_boogu::loader::{linear, Weights};
-use candle_nn::Linear;
+use candle_core::{DType, Device, Result, Tensor, D};
+use candle_gen::gen_core::Quant;
+use candle_gen::quant::QLinear;
+use candle_gen_boogu::loader::Weights;
 
 use crate::config::{HEAD_DIM, NORM_EPS};
+use crate::quant::{linear, move_onto, quantize_onto, tensor_onto};
 use crate::rope::{self, PackLayout, RopeTable};
 
 fn rms(x: &Tensor, weight: &Tensor) -> Result<Tensor> {
@@ -39,8 +41,8 @@ fn modulate(x: &Tensor, shift: &Tensor, scale: &Tensor) -> Result<Tensor> {
 }
 
 struct TimestepEmbedder {
-    l1: Linear,
-    l2: Linear,
+    l1: QLinear,
+    l2: QLinear,
 }
 
 impl TimestepEmbedder {
@@ -68,11 +70,20 @@ impl TimestepEmbedder {
         let emb = Tensor::cat(&[a.cos()?, a.sin()?], 1)?.to_dtype(dtype)?;
         self.l2.forward(&self.l1.forward(&emb)?.silu()?)
     }
+
+    fn place(&mut self, quant: Option<Quant>, device: &Device) -> Result<()> {
+        place_linear(&mut self.l1, quant, device)?;
+        place_linear(&mut self.l2, quant, device)
+    }
+
+    fn quantized_count(&self) -> usize {
+        usize::from(self.l1.is_quantized()) + usize::from(self.l2.is_quantized())
+    }
 }
 
 struct FeedForward {
-    proj: Linear,
-    out: Linear,
+    proj: QLinear,
+    out: QLinear,
 }
 
 impl FeedForward {
@@ -86,17 +97,26 @@ impl FeedForward {
         // Candle's `gelu` is the tanh approximation used by diffusers' gelu-approximate.
         self.out.forward(&self.proj.forward(x)?.gelu()?)
     }
+
+    fn place(&mut self, quant: Option<Quant>, device: &Device) -> Result<()> {
+        place_linear(&mut self.proj, quant, device)?;
+        place_linear(&mut self.out, quant, device)
+    }
+
+    fn quantized_count(&self) -> usize {
+        usize::from(self.proj.is_quantized()) + usize::from(self.out.is_quantized())
+    }
 }
 
 struct JointAttention {
-    to_q: Linear,
-    to_k: Linear,
-    to_v: Linear,
-    to_out: Linear,
-    add_q: Linear,
-    add_k: Linear,
-    add_v: Linear,
-    add_out: Linear,
+    to_q: QLinear,
+    to_k: QLinear,
+    to_v: QLinear,
+    to_out: QLinear,
+    add_q: QLinear,
+    add_k: QLinear,
+    add_v: QLinear,
+    add_out: QLinear,
     norm_q: Tensor,
     norm_k: Tensor,
     norm_add_q: Tensor,
@@ -191,11 +211,51 @@ impl JointAttention {
         let text = Tensor::cat(&text_parts.iter().collect::<Vec<_>>(), 0)?.unsqueeze(0)?;
         Ok((self.to_out.forward(&image)?, self.add_out.forward(&text)?))
     }
+
+    fn place(&mut self, quant: Option<Quant>, device: &Device) -> Result<()> {
+        for linear in [
+            &mut self.to_q,
+            &mut self.to_k,
+            &mut self.to_v,
+            &mut self.to_out,
+            &mut self.add_q,
+            &mut self.add_k,
+            &mut self.add_v,
+            &mut self.add_out,
+        ] {
+            place_linear(linear, quant, device)?;
+        }
+        for tensor in [
+            &mut self.norm_q,
+            &mut self.norm_k,
+            &mut self.norm_add_q,
+            &mut self.norm_add_k,
+        ] {
+            tensor_onto(tensor, device)?;
+        }
+        Ok(())
+    }
+
+    fn quantized_count(&self) -> usize {
+        [
+            &self.to_q,
+            &self.to_k,
+            &self.to_v,
+            &self.to_out,
+            &self.add_q,
+            &self.add_k,
+            &self.add_v,
+            &self.add_out,
+        ]
+        .into_iter()
+        .filter(|linear| linear.is_quantized())
+        .count()
+    }
 }
 
 struct Block {
-    image_mod: Linear,
-    text_mod: Linear,
+    image_mod: QLinear,
+    text_mod: QLinear,
     attention: JointAttention,
     image_ff: FeedForward,
     text_ff: FeedForward,
@@ -218,7 +278,7 @@ impl Block {
         })
     }
 
-    fn mods(linear: &Linear, temb: &Tensor, ids: &Tensor, tokens: usize) -> Result<(Mods, Mods)> {
+    fn mods(linear: &QLinear, temb: &Tensor, ids: &Tensor, tokens: usize) -> Result<(Mods, Mods)> {
         let p = linear.forward(&temb.silu()?)?;
         let dim = p.dim(1)? / 6;
         let one = |offset: usize| -> Result<Mods> {
@@ -270,22 +330,52 @@ impl Block {
             (&text + tff.broadcast_mul(&tx2.gate)?)?,
         ))
     }
+
+    fn place(&mut self, quant: Option<Quant>, device: &Device) -> Result<()> {
+        place_linear(&mut self.image_mod, quant, device)?;
+        place_linear(&mut self.text_mod, quant, device)?;
+        self.attention.place(quant, device)?;
+        self.image_ff.place(quant, device)?;
+        self.text_ff.place(quant, device)
+    }
+
+    fn quantized_count(&self) -> usize {
+        usize::from(self.image_mod.is_quantized())
+            + usize::from(self.text_mod.is_quantized())
+            + self.attention.quantized_count()
+            + self.image_ff.quantized_count()
+            + self.text_ff.quantized_count()
+    }
 }
 
 pub struct MageTransformer {
-    image_in: Linear,
+    image_in: QLinear,
     text_norm: Tensor,
-    text_in: Linear,
+    text_in: QLinear,
     timestep: TimestepEmbedder,
     blocks: Vec<Block>,
-    final_mod: Linear,
-    output: Linear,
+    final_mod: QLinear,
+    output: QLinear,
     dtype: DType,
 }
 
 impl MageTransformer {
     pub fn load(dir: &Path, cfg: &crate::config::MageConfig, device: &Device) -> Result<Self> {
-        let weights = Weights::from_dir(dir, device, DType::BF16)?;
+        Self::load_with_quant(dir, cfg, None, device)
+    }
+
+    pub fn load_with_quant(
+        dir: &Path,
+        cfg: &crate::config::MageConfig,
+        quant: Option<Quant>,
+        device: &Device,
+    ) -> Result<Self> {
+        let staging = if quant.is_some() {
+            Device::Cpu
+        } else {
+            device.clone()
+        };
+        let weights = Weights::from_dir(dir, &staging, DType::BF16)?;
         let mut blocks = Vec::with_capacity(cfg.depth);
         for i in 0..cfg.depth {
             blocks.push(Block::load(
@@ -294,7 +384,7 @@ impl MageTransformer {
                 cfg.num_heads,
             )?);
         }
-        Ok(Self {
+        let mut transformer = Self {
             image_in: linear(&weights, "img_in", true)?,
             text_norm: weights.get("txt_norm.weight")?,
             text_in: linear(&weights, "txt_in", true)?,
@@ -303,7 +393,42 @@ impl MageTransformer {
             final_mod: linear(&weights, "norm_out.linear", true)?,
             output: linear(&weights, "proj_out", true)?,
             dtype: DType::BF16,
-        })
+        };
+        if quant.is_some() {
+            transformer.place(quant, device)?;
+            let count = transformer.quantized_linear_count();
+            if count != 174 {
+                candle_core::bail!(
+                    "mage transformer quantized {count}/174 required live projections"
+                );
+            }
+        }
+        Ok(transformer)
+    }
+
+    fn place(&mut self, quant: Option<Quant>, device: &Device) -> Result<()> {
+        place_linear(&mut self.image_in, quant, device)?;
+        tensor_onto(&mut self.text_norm, device)?;
+        place_linear(&mut self.text_in, quant, device)?;
+        self.timestep.place(quant, device)?;
+        for block in &mut self.blocks {
+            block.place(quant, device)?;
+        }
+        place_linear(&mut self.final_mod, quant, device)?;
+        place_linear(&mut self.output, quant, device)
+    }
+
+    pub fn quantized_linear_count(&self) -> usize {
+        usize::from(self.image_in.is_quantized())
+            + usize::from(self.text_in.is_quantized())
+            + self.timestep.quantized_count()
+            + self
+                .blocks
+                .iter()
+                .map(Block::quantized_count)
+                .sum::<usize>()
+            + usize::from(self.final_mod.is_quantized())
+            + usize::from(self.output.is_quantized())
     }
 
     /// Inputs are packed `[1, image_tokens, 128]`, `[1, text_tokens, 2560]`, and one sigma per
@@ -344,6 +469,13 @@ impl MageTransformer {
     }
 }
 
+fn place_linear(linear: &mut QLinear, quant: Option<Quant>, device: &Device) -> Result<()> {
+    match quant {
+        Some(quant) => quantize_onto(linear, quant, device),
+        None => move_onto(linear, device),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -360,5 +492,10 @@ mod tests {
             .unwrap();
         assert!((got[0][0][0] - 8.).abs() < 1e-4);
         assert!((got[0][0][1] - 22.).abs() < 1e-4);
+    }
+
+    #[test]
+    fn quantized_projection_count_tracks_the_full_architecture() {
+        assert_eq!(6 + crate::config::DEPTH * 14, 174);
     }
 }
