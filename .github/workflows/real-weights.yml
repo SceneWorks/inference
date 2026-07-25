@@ -52,15 +52,18 @@ jobs:
       # Explicit operator-provided models root for the mlx-gen real-weight resolvers that resolve a
       # repo-keyed snapshot (sc-13755); inference never self-fetches or derives a cache location.
       MLX_GEN_MODELS_ROOT: ${{ vars.MLX_GEN_MODELS_ROOT }}
-      MAGE_GOLDEN_DIR: ${{ runner.temp }}/mage-flow-oracles
       MAGE_REQUIRE_GOLDENS: "1"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.12.11"
+          # 3.12.10 is the newest exact 3.12 pin with a Darwin ARM64 artifact in the official
+          # actions/python-versions manifest. 3.12.11+ publish Linux artifacts only.
+          python-version: "3.12.10"
           cache: pip
           cache-dependency-path: crates/media/mlx-gen/_vendor/mage_flow/requirements-oracles.txt
+      - name: Configure runner-local Mage oracle path
+        run: echo "MAGE_GOLDEN_DIR=$RUNNER_TEMP/mage-flow-oracles" >> "$GITHUB_ENV"
       - name: Toolchain versions
         run: rustc --version && cargo --version
       - name: Materialize and verify immutable snapshot
@@ -81,6 +84,17 @@ jobs:
             --edit-snapshot "$MAGE_EDIT_SNAPSHOT" \
             --output "$MAGE_GOLDEN_DIR"
           echo "MAGE_FLOW_TE_GOLDEN=$MAGE_GOLDEN_DIR/mage_flow_te_golden.safetensors" >> "$GITHUB_ENV"
+      # sc-14051 Candle acceptance oracle: one frozen-Torch 1024²/20-step reference run emits
+      # both the step-zero full-DiT boundary and the final e2e image. It is generated on a
+      # different backend/job from the Candle implementation and transferred as an immutable
+      # workflow artifact; Candle never blesses its own output.
+      - name: Regenerate Candle Mage 1024² Torch acceptance oracles
+        run: |
+          cd crates/media/mlx-gen
+          MAGE_DEVICE=cpu MAGE_H=1024 MAGE_W=1024 MAGE_STEPS=20 \
+            MAGE_GOLDEN_DIR="$MAGE_GOLDEN_DIR" PYTHONPATH="$PWD/_vendor" \
+            "$RUNNER_TEMP/mage-reference/bin/python" \
+            tools/dump_mage_flow_golden.py --stage dit
       - name: Run provider conformance
         run: >-
           cargo test --locked -p mlx-gen-z-image --test conformance
@@ -109,6 +123,17 @@ jobs:
           path: |
             ${{ runner.temp }}/mage-flow-oracles/mage_flow_edit_golden.safetensors
             ${{ runner.temp }}/mage-flow-oracles/mage_edit_oracle_manifest.json
+          if-no-files-found: error
+      - name: Upload Candle Mage acceptance oracles
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: mage-flow-candle-oracles-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/mage-flow-oracles/mage_flow_te_golden.safetensors
+            ${{ runner.temp }}/mage-flow-oracles/mage_flow_dit_golden.safetensors
+            ${{ runner.temp }}/mage-flow-oracles/mage_flow_vae_f32_1024.safetensors
+            ${{ runner.temp }}/mage-flow-oracles/mage_flow_e2e_golden.safetensors
+            ${{ runner.temp }}/mage-flow-oracles/mage_oracles_manifest.json
           if-no-files-found: error
 
   candle-audio:
@@ -276,8 +301,13 @@ jobs:
     name: Candle media real weights (CUDA)
     if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'media'
     runs-on: [self-hosted, windows, cuda, real-weights]
+    needs: mlx-media
     env:
       Z_IMAGE_SNAPSHOT: ${{ vars.Z_IMAGE_SNAPSHOT }}
+      # This is intentionally distinct from the macOS MAGE_SNAPSHOT path: repository variables
+      # contain runner-local absolute paths, so the Windows CUDA runner needs its own snapshot.
+      CANDLE_MAGE_SNAPSHOT: ${{ vars.CANDLE_MAGE_SNAPSHOT }}
+      MAGE_SNAPSHOT: ${{ vars.CANDLE_MAGE_SNAPSHOT }}
       # Explicit operator-provided models root for the candle-gen real-weight resolvers that resolve
       # a repo-keyed snapshot (sc-13755); inference never self-fetches or derives a cache location.
       CANDLE_GEN_MODELS_ROOT: ${{ vars.CANDLE_GEN_MODELS_ROOT }}
@@ -295,17 +325,33 @@ jobs:
         with:
           toolchain: 1.96.0
           components: rustfmt, clippy
+      - name: Download independent Candle Mage acceptance oracles
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: mage-flow-candle-oracles-${{ github.sha }}
+          path: ${{ runner.temp }}\mage-flow-oracles
+      - name: Require operator-provided Candle Mage snapshot
+        shell: cmd
+        run: |
+          if "%CANDLE_MAGE_SNAPSHOT%"=="" (
+            echo Missing repository variable CANDLE_MAGE_SNAPSHOT for the Windows CUDA runner.
+            exit /b 1
+          )
+          echo MAGE_GOLDEN_DIR=%RUNNER_TEMP%\mage-flow-oracles>>"%GITHUB_ENV%"
       - name: Materialize and verify immutable snapshot
         shell: cmd
         run: |
           python -m pip install --disable-pip-version-check --target "%RUNNER_TEMP%\huggingface-hub" "huggingface_hub==1.20.1"
           set "PYTHONPATH=%RUNNER_TEMP%\huggingface-hub"
           python scripts/release/ensure_model_snapshot.py --model z-image-turbo --snapshot "%Z_IMAGE_SNAPSHOT%" || exit /b 1
+          python scripts/release/ensure_model_snapshot.py --model mage-flow --snapshot "%CANDLE_MAGE_SNAPSHOT%" || exit /b 1
       - name: Run provider conformance
         shell: cmd
         run: |
           call "%VCVARS%"
           cargo test --locked -p candle-gen-z-image --features cuda --test conformance z_image_conformance -- --ignored --nocapture || exit /b 1
+          cargo test --locked --release -p candle-gen-mage --features cuda --test real_parity -- --ignored --nocapture || exit /b 1
+          cargo test --locked --release -p candle-gen-mage --features cuda --test cuda_1024 -- --ignored --nocapture || exit /b 1
 
   candle-sdxl:
     name: Candle SDXL real weights (CUDA)
@@ -326,11 +372,6 @@ jobs:
       IP_SDXL_BASE: ${{ vars.REALVISXL_SNAPSHOT }}
       # h94/IP-Adapter snapshot dir; ip_validate derives IP_BUNDLE + IP_IMAGE_ENCODER from it (sc-13963).
       IP_ADAPTER_SNAPSHOT: ${{ vars.IP_ADAPTER_SNAPSHOT }}
-      # Synthetic P6-PPM source/reference images (staged below) + output dirs for the edit/IP harnesses.
-      EDIT_SRC: ${{ runner.temp }}\sdxl-edit-src.ppm
-      EDIT_OUT: ${{ runner.temp }}\sdxl-edit-out
-      IP_REF: ${{ runner.temp }}\sdxl-ip-ref.ppm
-      IP_OUT: ${{ runner.temp }}\sdxl-ip-out
       # 80 on the Ampere runner; set 120 on a Blackwell runner (matches the other CUDA jobs here).
       CUDA_COMPUTE_CAP: "80"
       CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
@@ -346,6 +387,13 @@ jobs:
         with:
           toolchain: 1.96.0
           components: rustfmt, clippy
+      - name: Configure runner-local SDXL validation paths
+        shell: cmd
+        run: |
+          echo EDIT_SRC=%RUNNER_TEMP%\sdxl-edit-src.ppm>>"%GITHUB_ENV%"
+          echo EDIT_OUT=%RUNNER_TEMP%\sdxl-edit-out>>"%GITHUB_ENV%"
+          echo IP_REF=%RUNNER_TEMP%\sdxl-ip-ref.ppm>>"%GITHUB_ENV%"
+          echo IP_OUT=%RUNNER_TEMP%\sdxl-ip-out>>"%GITHUB_ENV%"
       - name: Materialize and verify immutable snapshots
         shell: cmd
         run: |
@@ -393,8 +441,6 @@ jobs:
       # tower at <MMAUDIO_CLIP_SNAPSHOT>/open_clip_pytorch_model.bin (clip.rs::load).
       SYNCHFORMER_SNAPSHOT: ${{ vars.MMAUDIO_MMAUDIO_SNAPSHOT }}
       DFN_CLIP_SNAPSHOT: ${{ vars.MMAUDIO_CLIP_SNAPSHOT }}
-      MMAUDIO_WAV_OUT: ${{ runner.temp }}\mmaudio_foley_16k.wav
-      MMAUDIO_WAV_OUT_44K: ${{ runner.temp }}\mmaudio_foley_44k.wav
       # 80 on the Ampere runner; set 120 on a Blackwell runner (matches the other CUDA jobs here).
       CUDA_COMPUTE_CAP: "80"
       CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
@@ -410,6 +456,11 @@ jobs:
         with:
           toolchain: 1.96.0
           components: rustfmt, clippy
+      - name: Configure runner-local MMAudio output paths
+        shell: cmd
+        run: |
+          echo MMAUDIO_WAV_OUT=%RUNNER_TEMP%\mmaudio_foley_16k.wav>>"%GITHUB_ENV%"
+          echo MMAUDIO_WAV_OUT_44K=%RUNNER_TEMP%\mmaudio_foley_44k.wav>>"%GITHUB_ENV%"
       - name: Materialize and verify immutable snapshots
         shell: cmd
         run: |

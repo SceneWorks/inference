@@ -60,14 +60,49 @@ class CiWorkflowPolicyTests(unittest.TestCase):
     def test_mage_media_lane_regenerates_complete_cpu_oracles_and_requires_them(self) -> None:
         workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
         self.assertIn('MAGE_REQUIRE_GOLDENS: "1"', workflow)
-        self.assertIn("MAGE_GOLDEN_DIR: ${{ runner.temp }}/mage-flow-oracles", workflow)
+        self.assertIn(
+            'echo "MAGE_GOLDEN_DIR=$RUNNER_TEMP/mage-flow-oracles" >> "$GITHUB_ENV"',
+            workflow,
+        )
         self.assertIn("MAGE_DEVICE=cpu", workflow)
         self.assertIn("scripts/release/provision_mage_oracles.py", workflow)
         self.assertIn("requirements-oracles.txt", workflow)
         self.assertIn("--require-hashes", workflow)
-        self.assertIn('python-version: "3.12.11"', workflow)
+        self.assertIn('python-version: "3.12.10"', workflow)
+        self.assertNotIn('python-version: "3.12.11"', workflow)
         self.assertIn("Run Mage-Flow text-encoder parity", workflow)
         self.assertIn("Run Mage-VAE all-geometry parity", workflow)
+        self.assertIn("Regenerate Candle Mage 1024² Torch acceptance oracles", workflow)
+        self.assertIn("MAGE_H=1024 MAGE_W=1024 MAGE_STEPS=20", workflow)
+        self.assertIn("tools/dump_mage_flow_golden.py --stage dit", workflow)
+        self.assertIn("mage-flow-candle-oracles-${{ github.sha }}", workflow)
+        self.assertIn("mage_flow_dit_golden.safetensors", workflow)
+        self.assertIn("mage_flow_e2e_golden.safetensors", workflow)
+        self.assertIn("CANDLE_MAGE_SNAPSHOT: ${{ vars.CANDLE_MAGE_SNAPSHOT }}", workflow)
+        self.assertIn(
+            "cargo test --locked --release -p candle-gen-mage --features cuda "
+            "--test real_parity -- --ignored --nocapture",
+            workflow,
+        )
+        self.assertIn(
+            "cargo test --locked --release -p candle-gen-mage --features cuda "
+            "--test cuda_1024 -- --ignored --nocapture",
+            workflow,
+        )
+        self.assertNotIn("MAGE_1024_GOLDEN_SHA256", workflow)
+        self.assertNotRegex(
+            workflow,
+            r"(?m)^      [A-Z][A-Z0-9_]+: \\$\\{\\{ runner\\.temp \\}\\}",
+        )
+        for assignment in (
+            r"EDIT_SRC=%RUNNER_TEMP%\sdxl-edit-src.ppm",
+            r"EDIT_OUT=%RUNNER_TEMP%\sdxl-edit-out",
+            r"IP_REF=%RUNNER_TEMP%\sdxl-ip-ref.ppm",
+            r"IP_OUT=%RUNNER_TEMP%\sdxl-ip-out",
+            r"MMAUDIO_WAV_OUT=%RUNNER_TEMP%\mmaudio_foley_16k.wav",
+            r"MMAUDIO_WAV_OUT_44K=%RUNNER_TEMP%\mmaudio_foley_44k.wav",
+        ):
+            self.assertIn(assignment, workflow)
         self.assertNotIn("MAGE_FLOW_TE_GOLDEN: ${{ vars.", workflow)
         self.assertNotIn("MAGE_REF_PYTHON", workflow)
 
