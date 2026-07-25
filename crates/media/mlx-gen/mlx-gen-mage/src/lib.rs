@@ -8,8 +8,9 @@
 //! ## Status
 //!
 //! The RL checkpoint is a complete registered text-to-image provider through the normal
-//! [`mlx_gen::Generator`] surface. Base, Turbo, and Edit checkpoints remain explicitly disabled
-//! until their owning stories land.
+//! [`mlx_gen::Generator`] surface. The separate full Turbo checkpoint is also registered at
+//! `mage_flow_turbo`; Base and Edit checkpoints remain explicitly disabled until their owning
+//! stories land.
 //!
 //! ## Reuse lineage
 //!
@@ -118,7 +119,9 @@ pub use pipeline::{
 pub fn register_providers(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
-    registry.register_generator(model::REGISTRATION)
+    registry
+        .register_generator(model::REGISTRATION)
+        .register_generator(model::REGISTRATION_TURBO)
 }
 
 /// Build the explicit Mage-Flow MLX provider catalog (this crate only).
@@ -137,7 +140,7 @@ mod explicit_registry_tests {
             .generators()
             .map(|registration| (registration.descriptor)().id.to_string())
             .collect();
-        assert_eq!(generators, ["mage_flow"]);
+        assert_eq!(generators, ["mage_flow", "mage_flow_turbo"]);
         // The scaffold ships no trainer (sc-14055/sc-14056) and no captioner/embedder surface.
         assert_eq!(registry.trainers().count(), 0);
         assert_eq!(

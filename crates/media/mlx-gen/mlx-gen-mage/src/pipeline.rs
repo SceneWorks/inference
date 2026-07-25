@@ -48,6 +48,11 @@ use std::path::Path;
 /// The published Mage-Flow scheduler shift.
 pub const STATIC_SHIFT: f32 = 6.0;
 
+/// The frozen pipeline constructs an unconditional branch only above guidance scale 1.
+pub const fn uses_cfg(cfg: f32) -> bool {
+    cfg > 1.0
+}
+
 /// Upstream's native-resolution image-token budget for one packed DiT invocation.
 ///
 /// This budget is applied before the optional fused-CFG duplication, exactly like the reference's
@@ -213,7 +218,7 @@ impl MageFlowPipeline {
                 .iter()
                 .map(|sample| sample.prompt)
                 .collect::<Vec<_>>();
-            if cfg > 1.0 {
+            if uses_cfg(cfg) {
                 texts.extend(pack_samples.iter().map(|sample| sample.negative_prompt));
             }
             let conditioning = self.text_encoder.encode(&texts, PromptKind::Gen)?;
@@ -224,14 +229,14 @@ impl MageFlowPipeline {
                 .collect::<Vec<_>>();
             let positive_tokens: i32 = positive_lens.iter().sum();
             let hidden = self.transformer.config().context_in_dim;
-            let (cond_flat, neg_flat) = if cfg > 1.0 {
+            let (cond_flat, neg_flat) = if uses_cfg(cfg) {
                 let parts = conditioning.txt.split_axis(&[positive_tokens], 0)?;
                 (parts[0].clone(), Some(parts[1].clone()))
             } else {
                 (conditioning.txt.clone(), None)
             };
             let cond = cond_flat.reshape(&[1, positive_tokens, hidden])?;
-            let negative_lens = if cfg > 1.0 {
+            let negative_lens = if uses_cfg(cfg) {
                 Some(
                     conditioning.seq_lens[sample_count..]
                         .iter()
@@ -516,7 +521,7 @@ fn denoise_capture(
             "mage_flow: scheduler needs a terminal sigma".into(),
         ));
     }
-    let use_cfg = cfg > 1.0;
+    let use_cfg = uses_cfg(cfg);
     if use_cfg && negative.is_none() {
         return Err(Error::Msg(
             "mage_flow: cfg > 1 requires negative conditioning".into(),
@@ -609,6 +614,21 @@ mod tests {
         assert!((s[19] - 0.24).abs() < 1e-6);
         assert_eq!(s[20], 0.0);
         assert!(s.windows(2).all(|w| w[0] > w[1]));
+    }
+
+    #[test]
+    fn turbo_uses_the_same_shifted_four_step_ladder_and_no_cfg_branch() {
+        let sigmas = mage_flow_sigmas(4).unwrap();
+        assert_eq!(sigmas.len(), 5);
+        let expected = [1.0, 0.94736844, 0.85714287, 0.6666667, 0.0];
+        for (index, (got, want)) in sigmas.iter().zip(expected).enumerate() {
+            assert!(
+                (got - want).abs() < 1e-6,
+                "Turbo sigma {index}: got {got}, want {want}"
+            );
+        }
+        assert!(!uses_cfg(1.0));
+        assert!(uses_cfg(1.0001));
     }
 
     #[test]

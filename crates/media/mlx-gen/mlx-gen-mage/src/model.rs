@@ -30,6 +30,9 @@ use mlx_gen::{
     Capabilities, ConditioningKind, Error, GenerationOutput, GenerationRequest, Generator, Image,
     LoadSpec, Modality, ModelDescriptor, Precision, Progress, Quant, Result, WeightsSource,
 };
+use sha2::{Digest, Sha256};
+use std::io::{Read, Seek, SeekFrom};
+use std::path::Path;
 
 use crate::config::{FAMILY, MAX_SIZE, MIN_SIZE, SIZE_MULTIPLE};
 use crate::{resolve_gs_key, GenerationSample, MageFlowPipeline};
@@ -130,6 +133,13 @@ pub const MODEL_IDS: [&str; 6] = [
 /// Maximum homogeneous output count exposed through the platform request surface.
 pub const MAX_COUNT: u32 = 8;
 
+/// Immutable upstream revision used to establish the Turbo checkpoint fingerprint.
+pub const TURBO_SNAPSHOT_REVISION: &str = "8523c9d1ae3cbe2148241e4769c918d0ab158ef8";
+const TURBO_IDENTITY_TENSOR: &str = "img_in.weight";
+const TURBO_IDENTITY_BYTES: usize = 4096;
+const TURBO_IDENTITY_SHA256: &str =
+    "c71e8cd69c9128887ceb2de9a29917e4eb704a052813b19b02b51f363258bd5c";
+
 /// Build a variant's weights-free descriptor.
 ///
 /// Capability fields that later stories own are left at their conservative `Default` (`false` /
@@ -175,15 +185,15 @@ pub fn descriptor_for(variant: MageVariant) -> ModelDescriptor {
 /// Construct a Mage-Flow generator from a [`LoadSpec`].
 ///
 pub fn load(variant: MageVariant, spec: &LoadSpec) -> Result<Box<dyn Generator>> {
-    if variant != MageVariant::Rl {
+    if !matches!(variant, MageVariant::Rl | MageVariant::Turbo) {
         return Err(Error::Unsupported(format!(
-            "{}: only the Mage-Flow RL checkpoint is enabled in sc-14041",
+            "{}: only the Mage-Flow RL and Turbo generation checkpoints are enabled",
             variant.id()
         )));
     }
     if spec.precision != Precision::Bf16 || spec.quantize.is_some() || !spec.adapters.is_empty() {
         return Err(Error::Unsupported(
-            "mage_flow: sc-14041 supports the dense bf16 RL checkpoint without adapters".into(),
+            "mage_flow: RL and Turbo support dense bf16 checkpoints without adapters".into(),
         ));
     }
     let root = match &spec.weights {
@@ -194,13 +204,94 @@ pub fn load(variant: MageVariant, spec: &LoadSpec) -> Result<Box<dyn Generator>>
             ))
         }
     };
+    if variant == MageVariant::Turbo {
+        verify_turbo_checkpoint(root)?;
+    }
     Ok(Box::new(MageFlow {
+        variant,
         descriptor: descriptor_for(variant),
         pipeline: MageFlowPipeline::load(root)?,
     }))
 }
 
+/// Verify bytes from a weight-bearing tensor, not a path or model-card label.
+///
+/// All Mage-Flow variants share byte-identical configs and tensor schemas, so those cannot detect
+/// an RL checkpoint accidentally routed under the Turbo id. This hashes the first 4096 serialized
+/// BF16 bytes of `img_in.weight`, pinned to [`TURBO_SNAPSHOT_REVISION`].
+fn verify_turbo_checkpoint(root: &Path) -> Result<()> {
+    let path = root
+        .join("transformer")
+        .join("diffusion_pytorch_model.safetensors");
+    let mut file = std::fs::File::open(&path).map_err(|error| {
+        Error::Msg(format!(
+            "mage_flow_turbo: cannot open transformer checkpoint {}: {error}",
+            path.display()
+        ))
+    })?;
+    let mut len_bytes = [0u8; 8];
+    file.read_exact(&mut len_bytes)?;
+    let header_len = u64::from_le_bytes(len_bytes);
+    if header_len > 1_048_576 {
+        return Err(Error::Msg(format!(
+            "mage_flow_turbo: invalid safetensors header length {header_len}"
+        )));
+    }
+    let mut header = vec![0u8; header_len as usize];
+    file.read_exact(&mut header)?;
+    let metadata: serde_json::Value = serde_json::from_slice(&header).map_err(|error| {
+        Error::Msg(format!(
+            "mage_flow_turbo: invalid safetensors header in {}: {error}",
+            path.display()
+        ))
+    })?;
+    let tensor = metadata
+        .get(TURBO_IDENTITY_TENSOR)
+        .ok_or_else(|| Error::Msg(format!("mage_flow_turbo: missing {TURBO_IDENTITY_TENSOR}")))?;
+    if tensor.get("dtype").and_then(serde_json::Value::as_str) != Some("BF16")
+        || tensor.get("shape").and_then(serde_json::Value::as_array)
+            != Some(&vec![serde_json::json!(3072), serde_json::json!(128)])
+    {
+        return Err(Error::Msg(format!(
+            "mage_flow_turbo: {TURBO_IDENTITY_TENSOR} has the wrong dtype or shape"
+        )));
+    }
+    let offsets = tensor
+        .get("data_offsets")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            Error::Msg(format!(
+                "mage_flow_turbo: {TURBO_IDENTITY_TENSOR} has no data offsets"
+            ))
+        })?;
+    let start = offsets.first().and_then(serde_json::Value::as_u64);
+    let end = offsets.get(1).and_then(serde_json::Value::as_u64);
+    let (Some(start), Some(end)) = (start, end) else {
+        return Err(Error::Msg(format!(
+            "mage_flow_turbo: {TURBO_IDENTITY_TENSOR} has invalid data offsets"
+        )));
+    };
+    if end.saturating_sub(start) < TURBO_IDENTITY_BYTES as u64 {
+        return Err(Error::Msg(format!(
+            "mage_flow_turbo: {TURBO_IDENTITY_TENSOR} is too short for identity verification"
+        )));
+    }
+    file.seek(SeekFrom::Start(8 + header_len + start))?;
+    let mut bytes = [0u8; TURBO_IDENTITY_BYTES];
+    file.read_exact(&mut bytes)?;
+    let got = format!("{:x}", Sha256::digest(bytes));
+    if got != TURBO_IDENTITY_SHA256 {
+        return Err(Error::Msg(format!(
+            "mage_flow_turbo: checkpoint fingerprint mismatch for {TURBO_IDENTITY_TENSOR} \
+             (expected revision {TURBO_SNAPSHOT_REVISION}, got sha256 {got}); \
+             an RL/Base/Edit checkpoint cannot serve the Turbo id"
+        )));
+    }
+    Ok(())
+}
+
 pub struct MageFlow {
+    variant: MageVariant,
     descriptor: ModelDescriptor,
     pipeline: MageFlowPipeline,
 }
@@ -223,8 +314,8 @@ impl Generator for MageFlow {
         if req.cancel.is_cancelled() {
             return Err(mlx_gen::gen_core::Error::Canceled);
         }
-        let steps = req.steps.unwrap_or(MageVariant::Rl.default_steps());
-        let cfg = req.guidance.unwrap_or(MageVariant::Rl.default_cfg());
+        let steps = req.steps.unwrap_or(self.variant.default_steps());
+        let cfg = req.guidance.unwrap_or(self.variant.default_cfg());
         let seed = req.seed.unwrap_or(0) as i64;
         let key = resolve_gs_key(None)?;
         let negative_prompt = req.negative_prompt.as_deref().unwrap_or(" ");
@@ -389,12 +480,19 @@ mod tests {
     }
 
     #[test]
-    fn non_rl_variants_remain_explicitly_disabled() {
+    fn base_and_edit_variants_remain_explicitly_disabled() {
         let spec = LoadSpec::new(mlx_gen::WeightsSource::Dir("/nonexistent".into()));
-        let err = load(MageVariant::Base, &spec)
-            .err()
-            .expect("non-RL variant must remain disabled");
-        assert!(matches!(err, Error::Unsupported(_)));
+        for variant in [
+            MageVariant::Base,
+            MageVariant::Edit,
+            MageVariant::EditBase,
+            MageVariant::EditTurbo,
+        ] {
+            let err = load(variant, &spec)
+                .err()
+                .expect("unimplemented variant must remain disabled");
+            assert!(matches!(err, Error::Unsupported(_)));
+        }
     }
 
     #[test]
@@ -407,6 +505,46 @@ mod tests {
             !matches!(err, Error::Unsupported(_)),
             "RL must not regress to the scaffold refusal: {err}"
         );
+    }
+
+    #[test]
+    fn turbo_has_a_distinct_registration_and_enters_the_full_snapshot_loader() {
+        assert_eq!(descriptor_turbo().id, "mage_flow_turbo");
+        assert_eq!(
+            MageVariant::Turbo.upstream_repo(),
+            "microsoft/Mage-Flow-Turbo"
+        );
+        assert_eq!((REGISTRATION_TURBO.descriptor)().id, "mage_flow_turbo");
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent-mage-flow-turbo".into()));
+        let err = load_turbo(&spec)
+            .err()
+            .expect("missing Turbo snapshot must fail");
+        assert!(
+            !matches!(err, Error::Unsupported(_)),
+            "Turbo must enter the same complete component-tree loader: {err}"
+        );
+    }
+
+    #[test]
+    fn turbo_platform_defaults_are_four_steps_with_cfg_and_negative_prompt_off() {
+        assert_eq!(MageVariant::Turbo.default_steps(), 4);
+        assert_eq!(MageVariant::Turbo.default_cfg(), 1.0);
+        let descriptor = descriptor_for(MageVariant::Turbo);
+        assert!(!descriptor.capabilities.supports_guidance);
+        assert!(!descriptor.capabilities.supports_negative_prompt);
+        let plain = GenerationRequest {
+            prompt: "test".into(),
+            width: 1024,
+            height: 1024,
+            ..Default::default()
+        };
+        validate_generation_request(&descriptor, &plain).unwrap();
+        let mut negative = plain.clone();
+        negative.negative_prompt = Some("must not be encoded".into());
+        assert!(validate_generation_request(&descriptor, &negative).is_err());
+        let mut guided = plain;
+        guided.guidance = Some(2.0);
+        assert!(validate_generation_request(&descriptor, &guided).is_err());
     }
 
     #[test]
