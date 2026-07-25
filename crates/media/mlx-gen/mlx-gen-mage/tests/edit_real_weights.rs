@@ -5,6 +5,7 @@ mod common;
 use common::{error, require_golden};
 use image::RgbImage;
 use mlx_gen_boogu::vision::preprocess::preprocess_image;
+use mlx_gen_mage::model::{EDIT_BASE_SNAPSHOT_REVISION, EDIT_TURBO_SNAPSHOT_REVISION};
 use mlx_gen_mage::{GsKey, MageFlowPipeline};
 use mlx_rs::Dtype;
 
@@ -22,6 +23,15 @@ fn fixed_instruction_edit_matches_the_torch_reference() {
     let (height, width, steps) = (geometry[0] as u32, geometry[1] as u32, geometry[3] as usize);
     let seed = golden.require("seed").unwrap().as_slice::<i64>()[0];
     let cfg = golden.require("cfg").unwrap().as_slice::<f32>()[0];
+    let edit_revision = golden.metadata("edit_revision");
+    let is_edit_base = edit_revision == Some(EDIT_BASE_SNAPSHOT_REVISION);
+    if is_edit_base {
+        assert_eq!((steps, cfg), (30, 5.0));
+    }
+    if edit_revision == Some(EDIT_TURBO_SNAPSHOT_REVISION) {
+        assert_eq!((steps, cfg), (4, 1.0));
+        assert!(!mlx_gen_mage::pipeline::uses_cfg(cfg));
+    }
     let key = GsKey::from_u64(golden.require("gs_key").unwrap().as_slice::<i64>()[0] as u64);
     let reference = golden
         .require("ref_u8")
@@ -93,13 +103,16 @@ fn fixed_instruction_edit_matches_the_torch_reference() {
             "final_tokens",
             &trace.final_tokens,
             golden.require("final_tokens").unwrap(),
-            0.20,
+            // Edit-Base accumulates bf16 Euler error for 30 transformer forwards. Key the measured
+            // long-schedule envelope to its immutable snapshot revision so the original Edit-RL
+            // regression gate remains unchanged.
+            if is_edit_base { 0.30 } else { 0.20 },
         ),
         (
             "image_u8",
             &trace.image_u8,
             golden.require("image_u8").unwrap(),
-            0.08,
+            if is_edit_base { 0.10 } else { 0.08 },
         ),
     ] {
         let (max_abs, _, mean_rel) = error(got, want);

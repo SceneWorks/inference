@@ -18,11 +18,11 @@
 //! | `mage_flow_edit_base` | `microsoft/Mage-Flow-Edit-Base` | edit | 30 | 5.0 |
 //! | `mage_flow_edit_turbo` | `microsoft/Mage-Flow-Edit-Turbo` | edit | 4 | 1.0 (off) |
 //!
-//! Each variant has its own future id (rather than one id plus a switch), keeping the variant part
-//! of the worker's model cache key. sc-14041 registers only the completed RL id.
+//! Each variant has its own id (rather than one id plus a switch), keeping the variant part
+//! of the worker's model cache key.
 //!
-//! The RL id is composed into the shipped platform catalog. The other descriptors remain available
-//! for their owning stories, but are not registered until their variant-specific paths are complete.
+//! All generation and edit IDs are composed into the shipped platform catalog after their owning
+//! stories validated the shared production paths and checkpoint-specific defaults.
 //!
 //! [`mlx_gen_catalog::provider_registry`]: https://docs.rs/mlx-gen-catalog
 
@@ -138,14 +138,24 @@ pub const MAX_COUNT: u32 = 8;
 pub const TURBO_SNAPSHOT_REVISION: &str = "8523c9d1ae3cbe2148241e4769c918d0ab158ef8";
 /// Immutable upstream revision used to establish the Base checkpoint fingerprint.
 pub const BASE_SNAPSHOT_REVISION: &str = "59a9cfd58cf6ecef28245852c6bdace3f12428a2";
+/// Immutable upstream revision used to establish the Edit-Base checkpoint fingerprint.
+pub const EDIT_BASE_SNAPSHOT_REVISION: &str = "8654a7bc0283ab2946385230b5b2eb944e0b76ea";
+/// Immutable upstream revision used to establish the Edit-Turbo checkpoint fingerprint.
+pub const EDIT_TURBO_SNAPSHOT_REVISION: &str = "14427bd7627d3a25436497a5939e1096f6a0d523";
 const TURBO_IDENTITY_TENSOR: &str = "img_in.weight";
 const BASE_IDENTITY_TENSOR: &str = "transformer_blocks.0.attn.add_k_proj.bias";
+const EDIT_IDENTITY_TENSOR: &str = "transformer_blocks.0.attn.add_k_proj.bias";
 const TURBO_IDENTITY_BYTES: usize = 4096;
 const BASE_IDENTITY_BYTES: usize = 4096;
+const EDIT_IDENTITY_BYTES: usize = 4096;
 const TURBO_IDENTITY_SHA256: &str =
     "c71e8cd69c9128887ceb2de9a29917e4eb704a052813b19b02b51f363258bd5c";
 const BASE_IDENTITY_SHA256: &str =
     "c6597b08e4efe45f7bbb5d2470c68e7975d71ca26dce13a1fb34db18ca6a9e3e";
+const EDIT_BASE_IDENTITY_SHA256: &str =
+    "bb53a04c20e5df443bb093c3f24027f9391f6d65e3edd60ed96546b050db717b";
+const EDIT_TURBO_IDENTITY_SHA256: &str =
+    "d387be05845ea0e0fc6b2bec5c05bccb3808c25a0123d9e2b3459e2e7f9705df";
 
 /// Build a variant's weights-free descriptor.
 ///
@@ -192,15 +202,9 @@ pub fn descriptor_for(variant: MageVariant) -> ModelDescriptor {
 /// Construct a Mage-Flow generator from a [`LoadSpec`].
 ///
 pub fn load(variant: MageVariant, spec: &LoadSpec) -> Result<Box<dyn Generator>> {
-    if matches!(variant, MageVariant::EditBase | MageVariant::EditTurbo) {
-        return Err(Error::Unsupported(format!(
-            "{}: edit variant selection is owned by sc-14049",
-            variant.id()
-        )));
-    }
     if spec.precision != Precision::Bf16 || !spec.adapters.is_empty() {
         return Err(Error::Unsupported(
-            "mage_flow: RL, Base, and Turbo support bf16/Q4/Q8 checkpoints without adapters".into(),
+            "mage_flow variants support bf16/Q4/Q8 checkpoints without adapters".into(),
         ));
     }
     let root = match &spec.weights {
@@ -229,6 +233,24 @@ pub fn load(variant: MageVariant, spec: &LoadSpec) -> Result<Box<dyn Generator>>
             TURBO_IDENTITY_BYTES,
             &[3072, 128],
             TURBO_IDENTITY_SHA256,
+        )?,
+        MageVariant::EditBase => verify_checkpoint_identity(
+            root,
+            variant,
+            EDIT_BASE_SNAPSHOT_REVISION,
+            EDIT_IDENTITY_TENSOR,
+            EDIT_IDENTITY_BYTES,
+            &[3072],
+            EDIT_BASE_IDENTITY_SHA256,
+        )?,
+        MageVariant::EditTurbo => verify_checkpoint_identity(
+            root,
+            variant,
+            EDIT_TURBO_SNAPSHOT_REVISION,
+            EDIT_IDENTITY_TENSOR,
+            EDIT_IDENTITY_BYTES,
+            &[3072],
+            EDIT_TURBO_IDENTITY_SHA256,
         )?,
         _ => {}
     }
@@ -606,20 +628,131 @@ mod tests {
     }
 
     #[test]
-    fn rl_edit_enters_the_full_multimodal_loader_but_follow_on_variants_stay_disabled() {
+    fn every_edit_variant_enters_the_full_multimodal_loader() {
         let spec = LoadSpec::new(mlx_gen::WeightsSource::Dir("/nonexistent".into()));
-        let err = load(MageVariant::Edit, &spec)
-            .err()
-            .expect("missing edit snapshot must fail");
-        assert!(
-            !matches!(err, Error::Unsupported(_)),
-            "RL edit must enter the multimodal component loader: {err}"
-        );
-        for variant in [MageVariant::EditBase, MageVariant::EditTurbo] {
+        for variant in [
+            MageVariant::Edit,
+            MageVariant::EditBase,
+            MageVariant::EditTurbo,
+        ] {
+            let err = load(variant, &spec)
+                .err()
+                .expect("missing edit snapshot must fail");
             assert!(
-                matches!(load(variant, &spec), Err(Error::Unsupported(_))),
-                "{} belongs to sc-14049",
-                variant.id()
+                !matches!(err, Error::Unsupported(_)),
+                "{} must enter the multimodal component loader: {err}",
+                variant.id(),
+            );
+        }
+    }
+
+    #[test]
+    fn edit_variant_defaults_and_cfg_surfaces_are_exact() {
+        let base = descriptor_edit_base();
+        assert_eq!(base.id, "mage_flow_edit_base");
+        assert_eq!(MageVariant::EditBase.default_steps(), 30);
+        assert_eq!(MageVariant::EditBase.default_cfg(), 5.0);
+        assert!(base.capabilities.supports_guidance);
+        assert!(base.capabilities.supports_negative_prompt);
+
+        let turbo = descriptor_edit_turbo();
+        assert_eq!(turbo.id, "mage_flow_edit_turbo");
+        assert_eq!(MageVariant::EditTurbo.default_steps(), 4);
+        assert_eq!(MageVariant::EditTurbo.default_cfg(), 1.0);
+        assert!(!crate::pipeline::uses_cfg(
+            MageVariant::EditTurbo.default_cfg()
+        ));
+        assert!(!turbo.capabilities.supports_guidance);
+        assert!(!turbo.capabilities.supports_negative_prompt);
+    }
+
+    #[test]
+    #[ignore = "needs complete MAGE_EDIT_SNAPSHOT, MAGE_EDIT_BASE_SNAPSHOT, and MAGE_EDIT_TURBO_SNAPSHOT"]
+    fn complete_edit_snapshots_are_config_identical_and_checkpoint_distinct() {
+        let root = |name: &str| {
+            std::path::PathBuf::from(
+                std::env::var(name).unwrap_or_else(|_| panic!("set {name} to a complete snapshot")),
+            )
+        };
+        let edit = root("MAGE_EDIT_SNAPSHOT");
+        let base = root("MAGE_EDIT_BASE_SNAPSHOT");
+        let turbo = root("MAGE_EDIT_TURBO_SNAPSHOT");
+        for relative in [
+            "model_index.json",
+            "scheduler/scheduler_config.json",
+            "text_encoder/chat_template.json",
+            "transformer/config.json",
+            "text_encoder/config.json",
+            "text_encoder/generation_config.json",
+            "text_encoder/model.safetensors.index.json",
+            "text_encoder/preprocessor_config.json",
+            "text_encoder/tokenizer.json",
+            "text_encoder/tokenizer_config.json",
+            "text_encoder/video_preprocessor_config.json",
+            "text_encoder/vocab.json",
+            "vae/config.json",
+        ] {
+            let expected = std::fs::read(edit.join(relative)).unwrap();
+            assert_eq!(
+                std::fs::read(base.join(relative)).unwrap(),
+                expected,
+                "Edit-Base {relative} must be byte-identical to Edit RL"
+            );
+            assert_eq!(
+                std::fs::read(turbo.join(relative)).unwrap(),
+                expected,
+                "Edit-Turbo {relative} must be byte-identical to Edit RL"
+            );
+        }
+
+        let check = |root: &Path, variant, revision, hash| {
+            verify_checkpoint_identity(
+                root,
+                variant,
+                revision,
+                EDIT_IDENTITY_TENSOR,
+                EDIT_IDENTITY_BYTES,
+                &[3072],
+                hash,
+            )
+        };
+        check(
+            &base,
+            MageVariant::EditBase,
+            EDIT_BASE_SNAPSHOT_REVISION,
+            EDIT_BASE_IDENTITY_SHA256,
+        )
+        .unwrap();
+        check(
+            &turbo,
+            MageVariant::EditTurbo,
+            EDIT_TURBO_SNAPSHOT_REVISION,
+            EDIT_TURBO_IDENTITY_SHA256,
+        )
+        .unwrap();
+
+        for wrong in [&edit, &turbo] {
+            assert!(
+                check(
+                    wrong,
+                    MageVariant::EditBase,
+                    EDIT_BASE_SNAPSHOT_REVISION,
+                    EDIT_BASE_IDENTITY_SHA256,
+                )
+                .is_err(),
+                "Edit-Base must reject RL and Turbo transformer weights"
+            );
+        }
+        for wrong in [&edit, &base] {
+            assert!(
+                check(
+                    wrong,
+                    MageVariant::EditTurbo,
+                    EDIT_TURBO_SNAPSHOT_REVISION,
+                    EDIT_TURBO_IDENTITY_SHA256,
+                )
+                .is_err(),
+                "Edit-Turbo must reject RL and Base transformer weights"
             );
         }
     }
