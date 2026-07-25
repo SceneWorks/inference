@@ -36,12 +36,16 @@ use std::sync::{Arc, Mutex};
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
+use candle_gen::gen_core::runtime::LoadPhase;
 use candle_gen::gen_core::{
     self, Capabilities, Conditioning, ConditioningKind, GenerationOutput, GenerationRequest,
-    Generator, Image, LoadSpec, Modality, ModelDescriptor, PerComponentBytes, Progress,
-    WeightsSource,
+    Generator, Image, LoadSpec, Modality, ModelDescriptor, OffloadPolicy, PerComponentBytes,
+    Progress, WeightsSource,
 };
-use candle_gen::{CandleError, Result as CResult};
+use candle_gen::{
+    check_cancel, effective_offload_policy, run_three_stage_sequential, CandleError,
+    Result as CResult,
+};
 
 use config::{
     ImageEncoderConfig, SchedulerConfig, UnetConfig, VaeConfig, MODEL_ID, SIZE_ALIGN, VAE_SCALE,
@@ -68,25 +72,59 @@ struct Components {
     unet: Arc<SvdUnet>,
 }
 
+struct ConditioningComponents {
+    image_encoder: SvdImageEncoder,
+    vae: SvdVae,
+}
+
+fn load_image_encoder(root: &Path, device: &Device) -> CResult<SvdImageEncoder> {
+    SvdImageEncoder::new(
+        &ImageEncoderConfig::default(),
+        component_vb(root, "image_encoder", "model", dense_dtype(), device)?,
+    )
+    .map_err(Into::into)
+}
+
+fn load_vae(root: &Path, device: &Device) -> CResult<SvdVae> {
+    SvdVae::new(
+        &VaeConfig::default(),
+        component_vb(root, "vae", "diffusion_pytorch_model", DType::F32, device)?,
+    )
+    .map_err(Into::into)
+}
+
+fn load_unet(root: &Path, device: &Device) -> CResult<SvdUnet> {
+    SvdUnet::new(
+        &UnetConfig::default(),
+        component_vb(
+            root,
+            "unet",
+            "diffusion_pytorch_model",
+            dense_dtype(),
+            device,
+        )?,
+    )
+    .map_err(Into::into)
+}
+
+impl ConditioningComponents {
+    fn load(root: &Path, device: &Device) -> CResult<Self> {
+        Ok(Self {
+            image_encoder: load_image_encoder(root, device)?,
+            vae: load_vae(root, device)?,
+        })
+    }
+}
+
 impl Components {
     /// Load every component from a checkpoint snapshot dir (`vae/` + `unet/` + `image_encoder/`). Every
     /// component defaults to **f32** (the VAE always does, `force_upcast=True`; the UNet + image encoder
     /// too — see the rationale below). The experimental fp16/bf16 paths are opt-in via `SVD_FORCE_F16` /
     /// `SVD_FORCE_BF16`.
     fn load(root: &Path, device: &Device) -> CResult<Self> {
-        let dense = dense_dtype();
-        let vae = SvdVae::new(
-            &VaeConfig::default(),
-            component_vb(root, "vae", "diffusion_pytorch_model", DType::F32, device)?,
-        )?;
-        let unet = SvdUnet::new(
-            &UnetConfig::default(),
-            component_vb(root, "unet", "diffusion_pytorch_model", dense, device)?,
-        )?;
-        let image_encoder = SvdImageEncoder::new(
-            &ImageEncoderConfig::default(),
-            component_vb(root, "image_encoder", "model", dense, device)?,
-        )?;
+        let vae = load_vae(root, device)?;
+        let unet = load_unet(root, device)?;
+        let image_encoder = load_image_encoder(root, device)?;
         Ok(Self {
             image_encoder: Arc::new(image_encoder),
             vae: Arc::new(vae),
@@ -176,8 +214,8 @@ fn component_vb(
 /// Mapping onto [`PerComponentBytes`]' three slots: `text_encoder` = the OpenCLIP ViT-H **image**
 /// encoder. SVD is image-conditioned and has no prompt encoder, but `image_encoder/` is the phase-A
 /// conditioning encoder — it runs once over the driving frame before the denoise — which is the slot's
-/// role. It is NOT a claim that the component is droppable: this engine advertises
-/// `supports_sequential_offload: false`, so no staged residency is ever selected for it.
+/// role. Under sequential residency the image encoder and source-image VAE encode are phase A, the
+/// UNet is phase B, and a reloaded VAE decode is phase C.
 ///
 /// A component whose file cannot be resolved contributes `0` rather than erroring: the footprint is a
 /// pre-load ADMISSION signal, and reporting no signal (⇒ the caller admits) is always safer than
@@ -241,7 +279,7 @@ pub fn descriptor() -> ModelDescriptor {
             mac_only: false,
             supports_kv_cache: false,
             requires_sigma_shift: false,
-            supports_sequential_offload: false,
+            supports_sequential_offload: true,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,
@@ -264,6 +302,9 @@ pub struct SvdGenerator {
     descriptor: ModelDescriptor,
     root: PathBuf,
     device: Device,
+    /// Resolved once at load. Resident preserves the historical warm aggregate; Sequential loads
+    /// conditioner → UNet → VAE in disjoint phases through the shared Candle lifecycle.
+    offload: OffloadPolicy,
     components: Mutex<Option<Components>>,
 }
 
@@ -349,7 +390,7 @@ impl SvdGenerator {
 
     /// CLIP `image_embeds` `[1, 1, 1024]` from the reference: diffusers `_resize_with_antialiasing` to
     /// 224 (gaussian-blur + align-corners bicubic, in `[-1,1]`) → CLIP mean/std normalize.
-    fn clip_embeds(&self, comps: &Components, img: &Image) -> CResult<Tensor> {
+    fn clip_embeds(&self, image_encoder: &SvdImageEncoder, img: &Image) -> CResult<Tensor> {
         let unit = preprocess::resize_with_antialiasing_unit(
             &img.pixels,
             img.height as usize,
@@ -368,7 +409,7 @@ impl SvdGenerator {
             }
         }
         let pix = Tensor::from_vec(chw, (1, 3, CLIP_SIZE, CLIP_SIZE), &self.device)?;
-        let embeds = comps.image_encoder.image_embeds(&pix)?; // [1, 1024]
+        let embeds = image_encoder.image_embeds(&pix)?; // [1, 1024]
         let d = embeds.dim(1)?;
         Ok(embeds.reshape((1, 1, d))?)
     }
@@ -378,7 +419,7 @@ impl SvdGenerator {
     #[allow(clippy::too_many_arguments)]
     fn image_latents(
         &self,
-        comps: &Components,
+        vae: &SvdVae,
         img: &Image,
         height: u32,
         width: u32,
@@ -407,13 +448,35 @@ impl SvdGenerator {
         let centered = unit.affine(2.0, -1.0)?; // [-1,1]
         let noise = pipeline::seeded_normal(seed.wrapping_add(7), (1, 3, oh, ow), &self.device)?;
         let augmented = (centered + noise.affine(noise_aug as f64, 0.0)?)?;
-        let latent = comps.vae.encode_mode(&augmented)?; // [1, 4, h, w]
+        let latent = vae.encode_mode(&augmented)?; // [1, 4, h, w]
         let (b, c, lh, lw) = latent.dims4()?;
         latent
             .reshape((b, 1, c, lh, lw))?
             .broadcast_as((b, num_frames, c, lh, lw))?
             .contiguous()
             .map_err(Into::into)
+    }
+}
+
+struct SequentialState<'a> {
+    image_embeds: Option<Tensor>,
+    image_latents: Option<Tensor>,
+    latents: Option<Tensor>,
+    on_progress: &'a mut dyn FnMut(Progress),
+}
+
+/// Production residency-policy dispatch seam. Passing the mutable request state into only the
+/// selected closure keeps the two routes mutually exclusive and makes that selection hermetically
+/// testable without loading model weights.
+fn dispatch_svd_offload<T, S: ?Sized>(
+    offload: OffloadPolicy,
+    state: &mut S,
+    resident: impl FnOnce(&mut S) -> CResult<T>,
+    sequential: impl FnOnce(&mut S) -> CResult<T>,
+) -> CResult<T> {
+    match offload {
+        OffloadPolicy::Resident => resident(state),
+        OffloadPolicy::Sequential => sequential(state),
     }
 }
 
@@ -442,7 +505,6 @@ impl Generator for SvdGenerator {
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
         let img = self.reference(req)?;
-        let comps = self.components()?;
 
         let mut params = SvdParams::default();
         if let Some(f) = req.frames {
@@ -503,22 +565,9 @@ impl Generator for SvdGenerator {
             }
         };
 
-        // Conditioning.
-        let image_embeds = self.clip_embeds(&comps, img)?;
-        dbg("image_embeds", &image_embeds);
-        let image_latents = self.image_latents(
-            &comps,
-            img,
-            req.height,
-            req.width,
-            params.num_frames,
-            params.noise_aug_strength,
-            seed,
-        )?;
-        dbg("image_latents", &image_latents);
         let atid = pipeline::added_time_ids(&params, &self.device)?;
 
-        // Seeded init noise scaled by `init_noise_sigma`.
+        // Seeded init noise scaled by `init_noise_sigma`; shared by both residency policies.
         let sched_cfg = SchedulerConfig::default();
         let sched = EdmSchedule::karras(params.num_inference_steps, &sched_cfg);
         let lh = (req.height / VAE_SCALE) as usize;
@@ -529,33 +578,142 @@ impl Generator for SvdGenerator {
             .map_err(CandleError::from)?;
         dbg("init_latents", &latents);
 
-        let final_latents = pipeline::denoise(
-            &comps.unet,
-            &sched_cfg,
-            &latents,
-            &image_embeds,
-            &image_latents,
-            &atid,
-            params.num_frames,
-            params.num_inference_steps,
-            params.min_guidance_scale,
-            params.max_guidance_scale,
-            req.sampler.as_deref(),
-            seed,
-            &req.cancel,
-            on_progress,
+        let mut dispatch_state = (on_progress, Some(latents));
+        let frames = dispatch_svd_offload(
+            self.offload,
+            &mut dispatch_state,
+            |dispatch| {
+                let (on_progress, latents) = dispatch;
+                let comps = self.components()?;
+                let image_embeds = self.clip_embeds(&comps.image_encoder, img)?;
+                dbg("image_embeds", &image_embeds);
+                let image_latents = self.image_latents(
+                    &comps.vae,
+                    img,
+                    req.height,
+                    req.width,
+                    params.num_frames,
+                    params.noise_aug_strength,
+                    seed,
+                )?;
+                dbg("image_latents", &image_latents);
+                let final_latents = pipeline::denoise(
+                    &comps.unet,
+                    &sched_cfg,
+                    latents
+                        .as_ref()
+                        .expect("init latents seeded before residency dispatch"),
+                    &image_embeds,
+                    &image_latents,
+                    &atid,
+                    params.num_frames,
+                    params.num_inference_steps,
+                    params.min_guidance_scale,
+                    params.max_guidance_scale,
+                    req.sampler.as_deref(),
+                    seed,
+                    &req.cancel,
+                    &mut **on_progress,
+                )?;
+                dbg("final_latents", &final_latents);
+                pipeline::decode_to_images_incremental(
+                    &comps.vae,
+                    &final_latents,
+                    params.num_frames,
+                    params.decode_chunk_size,
+                    &req.cancel,
+                    &mut **on_progress,
+                )
+            },
+            |dispatch| {
+                let (on_progress, latents) = dispatch;
+                let mut state = SequentialState {
+                    image_embeds: None,
+                    image_latents: None,
+                    latents: latents.take(),
+                    on_progress: &mut **on_progress,
+                };
+                run_three_stage_sequential(
+                    &mut state,
+                    |st| {
+                        check_cancel(&req.cancel)?;
+                        (st.on_progress)(Progress::Loading(LoadPhase::TextEncoder));
+                        ConditioningComponents::load(&self.root, &self.device)
+                    },
+                    |conditioners, st| {
+                        let image_embeds = self.clip_embeds(&conditioners.image_encoder, img)?;
+                        dbg("image_embeds", &image_embeds);
+                        let image_latents = self.image_latents(
+                            &conditioners.vae,
+                            img,
+                            req.height,
+                            req.width,
+                            params.num_frames,
+                            params.noise_aug_strength,
+                            seed,
+                        )?;
+                        dbg("image_latents", &image_latents);
+                        st.image_embeds = Some(image_embeds);
+                        st.image_latents = Some(image_latents);
+                        Ok(())
+                    },
+                    |st| {
+                        check_cancel(&req.cancel)?;
+                        (st.on_progress)(Progress::Loading(LoadPhase::Renderer));
+                        load_unet(&self.root, &self.device)
+                    },
+                    |unet, st| {
+                        let final_latents = pipeline::denoise(
+                            unet,
+                            &sched_cfg,
+                            st.latents
+                                .as_ref()
+                                .expect("init latents seeded before staging"),
+                            st.image_embeds
+                                .as_ref()
+                                .expect("image embeds produced in conditioning phase"),
+                            st.image_latents
+                                .as_ref()
+                                .expect("image latents produced in conditioning phase"),
+                            &atid,
+                            params.num_frames,
+                            params.num_inference_steps,
+                            params.min_guidance_scale,
+                            params.max_guidance_scale,
+                            req.sampler.as_deref(),
+                            seed,
+                            &req.cancel,
+                            st.on_progress,
+                        )?;
+                        dbg("final_latents", &final_latents);
+                        st.latents = Some(final_latents);
+                        Ok(())
+                    },
+                    |st| {
+                        // The denoise boundary sync has completed before this closure runs, so the
+                        // conditioning tensors can release before the decoder weights materialize.
+                        st.image_embeds.take();
+                        st.image_latents.take();
+                        check_cancel(&req.cancel)?;
+                        (st.on_progress)(Progress::Loading(LoadPhase::Renderer));
+                        load_vae(&self.root, &self.device)
+                    },
+                    |vae, st| {
+                        pipeline::decode_to_images_incremental(
+                            vae,
+                            st.latents
+                                .as_ref()
+                                .expect("denoised latents produced in UNet phase"),
+                            params.num_frames,
+                            params.decode_chunk_size,
+                            &req.cancel,
+                            st.on_progress,
+                        )
+                    },
+                    || Ok(self.device.synchronize()?),
+                )
+            },
         )?;
-        dbg("final_latents", &final_latents);
-
-        on_progress(Progress::Decoding);
-        let decoded = pipeline::decode(
-            &comps.vae,
-            &final_latents,
-            params.num_frames,
-            params.decode_chunk_size,
-        )?;
-        dbg("decoded", &decoded);
-        let frames = pipeline::frames_to_images(&decoded)?;
 
         Ok(GenerationOutput::Video {
             frames,
@@ -567,10 +725,7 @@ impl Generator for SvdGenerator {
     }
 }
 
-/// Construct a lazy candle SVD generator. `spec.weights` must be a [`WeightsSource::Dir`] pointing at a
-/// `stabilityai/stable-video-diffusion-img2vid-xt` snapshot (`vae/` + `unet/` + `image_encoder/`).
-/// Adapters / quantization / control overlays are rejected (SVD is image→video only).
-pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+fn load_generator(spec: &LoadSpec) -> gen_core::Result<SvdGenerator> {
     let root = match &spec.weights {
         WeightsSource::Dir(p) => p.clone(),
         WeightsSource::File(_) => {
@@ -597,12 +752,20 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         ));
     }
     let device = candle_gen::default_device()?;
-    Ok(Box::new(SvdGenerator {
+    Ok(SvdGenerator {
         descriptor: descriptor(),
         root,
         device,
+        offload: effective_offload_policy(spec.offload_policy),
         components: Mutex::new(None),
-    }))
+    })
+}
+
+/// Construct a lazy candle SVD generator. `spec.weights` must be a [`WeightsSource::Dir`] pointing at a
+/// `stabilityai/stable-video-diffusion-img2vid-xt` snapshot (`vae/` + `unet/` + `image_encoder/`).
+/// Adapters / quantization / control overlays are rejected (SVD is image→video only).
+pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    Ok(Box::new(load_generator(spec)?))
 }
 
 candle_gen::register_generators! {
@@ -665,6 +828,116 @@ mod tests {
         assert!(d.capabilities.schedulers.is_empty());
         assert_eq!(d.capabilities.min_size, 256);
         assert_eq!(d.capabilities.max_size, 1024);
+        assert!(
+            d.capabilities.supports_sequential_offload,
+            "svd_xt must advertise the staged conditioner → UNet → VAE lifecycle"
+        );
+    }
+
+    #[test]
+    fn load_honors_requested_sequential_policy_without_populating_resident_cache() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()))
+            .with_offload_policy(OffloadPolicy::Sequential);
+        let generator = load_generator(&spec).unwrap();
+        assert_eq!(generator.offload, OffloadPolicy::Sequential);
+        assert!(
+            candle_gen::lock_recover(&generator.components).is_none(),
+            "the sequential route must not populate the all-resident component aggregate"
+        );
+    }
+
+    /// Engine-level drop-order witness for the exact SVD phases. The conditioning aggregate contains
+    /// the image encoder + source-image VAE encode; it must release before the UNet loads, and the
+    /// UNet must release before the decode VAE reloads. An all-resident mutation raises `max_live`.
+    #[test]
+    fn sequential_svd_phases_never_make_conditioner_unet_and_decoder_co_resident() {
+        use std::cell::{Cell, RefCell};
+
+        struct Phase<'a> {
+            name: &'static str,
+            live: &'a Cell<usize>,
+            log: &'a RefCell<Vec<&'static str>>,
+        }
+        impl Drop for Phase<'_> {
+            fn drop(&mut self) {
+                self.live.set(self.live.get() - 1);
+                self.log.borrow_mut().push(match self.name {
+                    "conditioner" => "drop-conditioner",
+                    "unet" => "drop-unet",
+                    "decoder" => "drop-decoder",
+                    _ => unreachable!(),
+                });
+            }
+        }
+
+        let live = Cell::new(0usize);
+        let max_live = Cell::new(0usize);
+        let log = RefCell::new(Vec::new());
+        let load = |name: &'static str| {
+            let next = live.get() + 1;
+            live.set(next);
+            max_live.set(max_live.get().max(next));
+            log.borrow_mut().push(match name {
+                "conditioner" => "load-conditioner",
+                "unet" => "load-unet",
+                "decoder" => "load-decoder",
+                _ => unreachable!(),
+            });
+            Phase {
+                name,
+                live: &live,
+                log: &log,
+            }
+        };
+        let mut state = ();
+        dispatch_svd_offload(
+            OffloadPolicy::Sequential,
+            &mut state,
+            |_| {
+                log.borrow_mut().push("resident-route");
+                Err(CandleError::Msg(
+                    "the sequential policy selected the resident route".into(),
+                ))
+            },
+            |state| {
+                run_three_stage_sequential(
+                    state,
+                    |_| Ok(load("conditioner")),
+                    |_, _| {
+                        log.borrow_mut().push("use-conditioner");
+                        Ok(())
+                    },
+                    |_| Ok(load("unet")),
+                    |_, _| {
+                        log.borrow_mut().push("use-unet");
+                        Ok(())
+                    },
+                    |_| Ok(load("decoder")),
+                    |_, _| {
+                        log.borrow_mut().push("use-decoder");
+                        Ok(())
+                    },
+                    || Ok(()),
+                )
+            },
+        )
+        .unwrap();
+
+        assert_eq!(max_live.get(), 1, "no two SVD phases may be co-resident");
+        assert_eq!(
+            *log.borrow(),
+            vec![
+                "load-conditioner",
+                "use-conditioner",
+                "drop-conditioner",
+                "load-unet",
+                "use-unet",
+                "drop-unet",
+                "load-decoder",
+                "use-decoder",
+                "drop-decoder"
+            ]
+        );
     }
 
     fn ref_req(w: u32, h: u32) -> GenerationRequest {

@@ -166,8 +166,8 @@ pub use sync::{cached, lock_recover};
 // schedule and each omitted the same two things.
 pub mod residency;
 pub use residency::{
-    check_cancel, effective_offload_policy, run_sequential, sequential_offload_enabled, Residency,
-    OFFLOAD_ENV,
+    check_cancel, effective_offload_policy, run_sequential, run_three_stage_sequential,
+    sequential_offload_enabled, Residency, OFFLOAD_ENV,
 };
 
 // Shared test-support helpers (sc-9055 / F-069): the PPM read/write, cosine, env-path, and GPU

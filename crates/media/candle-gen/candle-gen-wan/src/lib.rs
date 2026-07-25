@@ -77,7 +77,10 @@ use candle_gen::gen_core::{
     self, AdapterSpec, Capabilities, GenerationOutput, GenerationRequest, Generator, Image,
     LoadSpec, Modality, ModelDescriptor, MoeExpert, OffloadPolicy, Progress, Quant, WeightsSource,
 };
-use candle_gen::{check_cancel, effective_offload_policy, CandleError, Result as CResult};
+use candle_gen::{
+    check_cancel, effective_offload_policy, run_three_stage_sequential, CandleError,
+    Result as CResult,
+};
 
 use candle_gen::gen_core::sampling::TimestepConvention;
 use config::{
@@ -444,7 +447,8 @@ impl Pipeline {
     /// Parity: the DiT `embed_text` projection is DiT-entangled, so it must happen after the DiT loads —
     /// the raw UMT5 context stays resident across the TE drop. The denoise runs the identical
     /// [`denoise`](Self::denoise) helper as the resident path, so the residency change is numerics-only.
-    /// Each heavy component is a local bound to its own scope (driven through [`staged_sequential`]), so
+    /// Each heavy component is a local bound to its own scope (driven through
+    /// [`run_three_stage_sequential`]), so
     /// Rust's scope drop frees it before the next loads; a `device.synchronize()` at each boundary drains
     /// the async encode/denoise kernels before the freed pool is reused (the sc-12195 eviction race).
     fn render_sequential(
@@ -472,7 +476,7 @@ impl Pipeline {
             on_progress: &mut *on_progress,
         };
 
-        staged_sequential(
+        run_three_stage_sequential(
             &mut state,
             // ── Stage 1: load UMT5 → raw pos/neg context. DROP the ~11 GB bf16 encoder at the brace. ──
             |st| {
@@ -552,7 +556,8 @@ struct RenderKnobs {
     shift: f64,
 }
 
-/// The mutable render state threaded through [`staged_sequential`] (sc-12757): the cross-stage tensors
+/// The mutable render state threaded through [`run_three_stage_sequential`] (sc-12757): the
+/// cross-stage tensors
 /// that must outlive a component drop (the raw UMT5 context; the latents seeded → denoised → decoded)
 /// plus the progress sink. Held so exclusive access moves between the load/use closures via the
 /// `&mut SeqState` param rather than being captured by each closure — the borrow-checker-clean way to
@@ -567,49 +572,6 @@ struct SeqState<'a> {
     /// stage 3 (survives the DiT drop).
     latents: Option<Tensor>,
     on_progress: &'a mut dyn FnMut(Progress),
-}
-
-/// Drive the dense TI2V-5B sequential offload so at most **one** heavy component is GPU-resident at a
-/// time (sc-12757, the dense Pillar-1 win — no expert swap, the 5B is a single DiT): the ~11 GB bf16
-/// UMT5 text encoder (sc-12778), then the bf16 DiT, then the f32 VAE. Each component is a local bound to its own
-/// block, so Rust's scope drop frees it **before** the next loads — the TE drops before the DiT loads
-/// (so it is off-GPU for the whole denoise) and the DiT drops before the VAE loads. `sync` runs at each
-/// stage boundary — after the component is used and before it drops (and before the next loads) — so
-/// in-flight kernels are drained before the freed allocator pool is reused (the sc-12195 eviction race).
-///
-/// Generic over the component types and the threaded state `St` so a CPU unit test can pin the
-/// never-co-resident + drop-order properties with a lightweight liveness witness — no GPU, no real
-/// weights — exactly as `wan14b`'s `staged_expert_swap` is pinned. The load closures receive `&mut St`
-/// so they can emit their [`Progress::Loading`] before the (heavy) load; the use closures receive
-/// `&mut St` to read/advance the cross-stage tensors.
-#[allow(clippy::too_many_arguments)]
-fn staged_sequential<Te, Dit, Vae, St, R>(
-    state: &mut St,
-    load_te: impl FnOnce(&mut St) -> CResult<Te>,
-    use_te: impl FnOnce(&Te, &mut St) -> CResult<()>,
-    load_dit: impl FnOnce(&mut St) -> CResult<Dit>,
-    use_dit: impl FnOnce(&Dit, &mut St) -> CResult<()>,
-    load_vae: impl FnOnce(&mut St) -> CResult<Vae>,
-    use_vae: impl FnOnce(&Vae, &mut St) -> CResult<R>,
-    mut sync: impl FnMut() -> CResult<()>,
-) -> CResult<R> {
-    // Stage 1: the UMT5 text encoder is resident ONLY for the encode.
-    {
-        let te = load_te(state)?;
-        use_te(&te, state)?;
-        // Drain the encode before `te` frees at the brace below and the DiT reuses the pool.
-        sync()?;
-    } // `te` drops HERE — off-GPU for the whole denoise (never co-resident with the DiT).
-      // Stage 2: the DiT is resident ONLY for the denoise.
-    {
-        let dit = load_dit(state)?;
-        use_dit(&dit, state)?;
-        // Drain the denoise before `dit` frees and the VAE reuses the pool.
-        sync()?;
-    } // `dit` drops HERE — freed before the VAE is ever loaded.
-      // Stage 3: the VAE decodes (the terminal component).
-    let vae = load_vae(state)?;
-    use_vae(&vae, state)
 }
 
 pub struct WanGenerator {
@@ -1286,7 +1248,7 @@ mod tests {
     }
 
     /// Stands in for a loaded heavy component (UMT5 / DiT / VAE): its lifetime on the live-counter is
-    /// exactly that component's GPU-residency window in `staged_sequential`.
+    /// exactly that component's GPU-residency window in `run_three_stage_sequential`.
     struct CompWitness<'a> {
         tracker: &'a LiveTracker,
         drop_tag: &'static str,
@@ -1307,14 +1269,15 @@ mod tests {
 
     /// The Pillar-1 invariant (sc-12757): at most ONE heavy component is resident at a time, and the
     /// stages drop in order — the TE is off-GPU before the denoise runs, and the DiT drops before the
-    /// VAE loads. Driven through the production `staged_sequential` with drop-order witnesses (candle's
+    /// VAE loads. Driven through the production `run_three_stage_sequential` with drop-order witnesses
+    /// (candle's
     /// cudarc pool makes `nvidia-smi` blind to a drop, so residency is asserted structurally, not by a
     /// VRAM read). `use_vae` returns a sentinel to prove the value threads back out.
     #[test]
     fn sequential_stages_are_never_co_resident_and_drop_in_order() {
         let tracker = LiveTracker::new();
         let mut st = ();
-        let out = staged_sequential(
+        let out = run_three_stage_sequential(
             &mut st,
             |_st| Ok(CompWitness::new(&tracker, "load-te", "drop-te")),
             |_w, _st| {
@@ -1389,14 +1352,14 @@ mod tests {
     }
 
     /// The sc-12195 eviction sync, applied per stage boundary (sc-12757): the boundary `sync` runs after
-    /// each heavy component is used and **before** it drops (and before the next loads) — draining
-    /// in-flight kernels so the freed allocator pool is never reused under them. The terminal VAE decode
-    /// has no trailing sync (nothing loads after it). Mirrors `wan14b`'s boundary-sync ordering witness.
+    /// each heavy component is used and **before** it drops (and before the next load or job) — draining
+    /// in-flight kernels so the freed allocator pool is never reused under them. Mirrors `wan14b`'s
+    /// boundary-sync ordering witness.
     #[test]
     fn sequential_syncs_before_each_component_drops() {
         let tracker = LiveTracker::new();
         let mut st = ();
-        staged_sequential(
+        run_three_stage_sequential(
             &mut st,
             |_st| Ok(CompWitness::new(&tracker, "load-te", "drop-te")),
             |_w, _st| {
@@ -1424,7 +1387,7 @@ mod tests {
             vec![
                 "load-te", "use-te", "sync", "drop-te", //
                 "load-dit", "use-dit", "sync", "drop-dit", //
-                "load-vae", "use-vae", "drop-vae",
+                "load-vae", "use-vae", "sync", "drop-vae",
             ],
             "each heavy component must be synced (kernels drained) before it drops and the next loads"
         );
@@ -1436,7 +1399,7 @@ mod tests {
     fn sequential_propagates_a_dit_load_failure_after_dropping_te() {
         let tracker = LiveTracker::new();
         let mut st = ();
-        let out: CResult<()> = staged_sequential(
+        let out: CResult<()> = run_three_stage_sequential(
             &mut st,
             |_st| Ok(CompWitness::new(&tracker, "load-te", "drop-te")),
             |_w, _st| Ok(()),

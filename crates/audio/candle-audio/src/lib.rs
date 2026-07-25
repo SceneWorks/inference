@@ -14,9 +14,9 @@
 //! discovery. This crate is the single audited home for the machinery every candle
 //! audio provider needs (the sibling of `candle-gen` for the media families):
 //!
-//! - [`dsp`] — Hann windowing, forward STFT, and the inverse-STFT overlap-add
-//!   reconstruction an iSTFT-Net-style vocoder head needs (Kokoro / StyleTTS2,
-//!   sc-12836).
+//! - [`dsp`] — whole-buffer interleaved PCM sample-rate conversion, Hann windowing,
+//!   forward STFT, and the inverse-STFT overlap-add reconstruction an iSTFT-Net-style
+//!   vocoder head needs (Kokoro / StyleTTS2, sc-12836; resampling, sc-14561).
 //! - [`ops`] — tensor ops the providers share but candle's GPU backends leave
 //!   unimplemented, expressed in backend-portable primitives (nearest ×k upsample,
 //!   sc-13886 / sc-13691).

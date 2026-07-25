@@ -13,7 +13,7 @@
 //! ([`candle_transformers::models::whisper`]) at the workspace's pinned candle revision — reused
 //! wholesale per the epic DoD. This crate owns only the gen-core adapter:
 //!
-//! - [`mel`] — the host front-end (downmix / linear-resample to 16 kHz / Slaney mel projection over
+//! - [`mel`] — the host front-end (downmix / Kaiser-sinc resample to 16 kHz / Slaney mel projection over
 //!   the bundled `melfilters.bytes`),
 //! - [`decode`] — the autoregressive decode policy (the `<|sot|>`+language+task+timestamp prompt,
 //!   greedy-or-temperature sampling honoring the request knobs, suppressed-token mask, cooperative

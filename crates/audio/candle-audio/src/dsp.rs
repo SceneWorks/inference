@@ -1,6 +1,6 @@
-//! Short-time Fourier analysis/synthesis primitives for the candle audio providers
-//! (sc-12835): Hann windowing, forward STFT, and the inverse-STFT overlap-add
-//! reconstruction an iSTFT-Net-style vocoder head needs (Kokoro / StyleTTS2, sc-12836).
+//! Host-side DSP primitives for the candle audio providers: whole-buffer rational
+//! sample-rate conversion (sc-14561), Hann windowing, forward STFT, and inverse-STFT
+//! overlap-add reconstruction (sc-12835/sc-12836).
 //!
 //! Everything here is plain `f32` DSP with no tensor dependency: a provider's model
 //! produces magnitude/phase (or mel) tensors on whatever candle device the bundle
@@ -21,6 +21,203 @@ pub fn hann_window(len: usize) -> Vec<f32> {
     (0..len)
         .map(|i| 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / n).cos()))
         .collect()
+}
+
+// An odd tap count makes the zero phase exactly sample-centered. With β=8.6, 197
+// unity-rate taps span the 6% guarded transition to approximately the window's
+// 85 dB stopband. Stronger downsampling scales this by src/dst so the kernel
+// always spans the same number of cutoff-frequency lobes.
+const RESAMPLE_BASE_TAPS_PER_PHASE: usize = 197;
+const RESAMPLE_MAX_TAPS_PER_PHASE: usize = 16_385;
+const RESAMPLE_KAISER_BETA: f64 = 8.6;
+const RESAMPLE_CUTOFF_GUARD: f64 = 0.94;
+const RESAMPLE_MAX_PRECOMPUTED_COEFFICIENTS: usize = 4_194_304;
+
+fn gcd(mut a: u32, mut b: u32) -> u32 {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a
+}
+
+fn bessel_i0(x: f64) -> f64 {
+    let y = x * x / 4.0;
+    let mut sum = 1.0;
+    let mut term = 1.0;
+    for k in 1.. {
+        term *= y / (k * k) as f64;
+        sum += term;
+        if term <= sum * f64::EPSILON {
+            break;
+        }
+    }
+    sum
+}
+
+fn normalized_sinc(x: f64) -> f64 {
+    if x.abs() < 1e-12 {
+        1.0
+    } else {
+        let px = std::f64::consts::PI * x;
+        px.sin() / px
+    }
+}
+
+fn phase_kernel(
+    phase: usize,
+    phase_count: usize,
+    taps_per_phase: usize,
+    cutoff: f64,
+    kaiser_denominator: f64,
+) -> Vec<f64> {
+    let fraction = phase as f64 / phase_count as f64;
+    let half_taps = (taps_per_phase / 2) as isize;
+    let radius = taps_per_phase as f64 / 2.0;
+    let mut kernel = vec![0.0; taps_per_phase];
+    let mut sum = 0.0;
+    for (tap, weight) in kernel.iter_mut().enumerate() {
+        let offset = tap as isize - half_taps;
+        let distance = offset as f64 - fraction;
+        let window_position = (distance / radius).clamp(-1.0, 1.0);
+        let window =
+            bessel_i0(RESAMPLE_KAISER_BETA * (1.0 - window_position * window_position).sqrt())
+                / kaiser_denominator;
+        *weight = cutoff * normalized_sinc(cutoff * distance) * window;
+        sum += *weight;
+    }
+    // Phase normalization gives unity DC gain. Each output frame is normalized again
+    // after boundary taps are omitted, preserving constants at clip edges as well.
+    for weight in &mut kernel {
+        *weight /= sum;
+    }
+    kernel
+}
+
+/// Resample one complete interleaved PCM buffer with a rational polyphase
+/// Kaiser-windowed-sinc FIR.
+///
+/// `channels` is the number of interleaved values per frame; each channel is filtered
+/// independently, so stereo and multichannel inputs cannot bleed across channel boundaries.
+/// The returned frame count is `round(input_frames * dst_rate / src_rate)`, clamped to one
+/// frame for every non-empty input. An equal-rate conversion is byte-identical.
+///
+/// This is deliberately a **whole-buffer** API. The centered FIR reads samples on both sides
+/// of each output position, intrinsically compensating group delay. Calling it separately on
+/// streaming chunks would discard that cross-boundary history and create seams; a future
+/// streaming caller must use a separate stateful contract.
+///
+/// The implementation is in-house rather than dependency-backed: the fixed-rate audio lane
+/// needs only rational conversion, and this small kernel keeps the coefficient design and
+/// channel/boundary behavior directly auditable. Filter support scales with the downsample
+/// ratio so large reductions retain the same stopband quality. Common ratios precompute all
+/// polyphase coefficients; unusually large coefficient tables calculate identical phases on
+/// demand to keep memory bounded.
+pub fn resample(samples: &[f32], src_rate: u32, dst_rate: u32, channels: u16) -> Result<Vec<f32>> {
+    if src_rate == 0 || dst_rate == 0 {
+        return Err(AudioError::Msg(format!(
+            "resample rates must be non-zero, got {src_rate} -> {dst_rate}"
+        )));
+    }
+    if channels == 0 {
+        return Err(AudioError::Msg("resample channels must be non-zero".into()));
+    }
+    let channels = channels as usize;
+    if !samples.len().is_multiple_of(channels) {
+        return Err(AudioError::Msg(format!(
+            "resample input has {} samples, not a whole number of {channels}-channel frames",
+            samples.len()
+        )));
+    }
+    if samples.is_empty() || src_rate == dst_rate {
+        return Ok(samples.to_vec());
+    }
+
+    let input_frames = samples.len() / channels;
+    let output_frames_u128 =
+        ((input_frames as u128) * (dst_rate as u128) + (src_rate as u128 / 2)) / src_rate as u128;
+    let output_frames = usize::try_from(output_frames_u128.max(1)).map_err(|_| {
+        AudioError::Msg(format!(
+            "resample output length does not fit usize for {input_frames} frames at \
+             {src_rate} -> {dst_rate}"
+        ))
+    })?;
+    let output_samples = output_frames.checked_mul(channels).ok_or_else(|| {
+        AudioError::Msg(format!(
+            "resample output sample count overflows usize ({output_frames} frames, \
+             {channels} channels)"
+        ))
+    })?;
+
+    let divisor = gcd(src_rate, dst_rate);
+    let phase_count = (dst_rate / divisor) as usize;
+    let phase_step = (src_rate / divisor) as usize;
+    let cutoff = (dst_rate as f64 / src_rate as f64).min(1.0) * RESAMPLE_CUTOFF_GUARD;
+    let required_taps = RESAMPLE_BASE_TAPS_PER_PHASE as f64 * RESAMPLE_CUTOFF_GUARD / cutoff;
+    if required_taps > RESAMPLE_MAX_TAPS_PER_PHASE as f64 {
+        return Err(AudioError::Msg(format!(
+            "resample ratio {src_rate} -> {dst_rate} needs more than \
+             {RESAMPLE_MAX_TAPS_PER_PHASE} taps per phase"
+        )));
+    }
+    let taps_per_phase = (required_taps.ceil() as usize) | 1;
+    let half_taps = (taps_per_phase / 2) as isize;
+    let kaiser_denominator = bessel_i0(RESAMPLE_KAISER_BETA);
+    let precompute = phase_count
+        .checked_mul(taps_per_phase)
+        .is_some_and(|count| count <= RESAMPLE_MAX_PRECOMPUTED_COEFFICIENTS);
+    let phase_kernels = precompute.then(|| {
+        (0..phase_count)
+            .map(|phase| {
+                phase_kernel(
+                    phase,
+                    phase_count,
+                    taps_per_phase,
+                    cutoff,
+                    kaiser_denominator,
+                )
+            })
+            .collect::<Vec<_>>()
+    });
+
+    let mut output = vec![0.0f32; output_samples];
+    for output_frame in 0..output_frames {
+        let source_numerator = (output_frame as u128) * (phase_step as u128);
+        let source_frame = (source_numerator / phase_count as u128) as isize;
+        let phase = (source_numerator % phase_count as u128) as usize;
+        let computed_kernel;
+        let kernel = if let Some(kernels) = &phase_kernels {
+            &kernels[phase]
+        } else {
+            computed_kernel = phase_kernel(
+                phase,
+                phase_count,
+                taps_per_phase,
+                cutoff,
+                kaiser_denominator,
+            );
+            &computed_kernel
+        };
+        let first_input_frame = source_frame - half_taps;
+
+        for channel in 0..channels {
+            let mut value = 0.0f64;
+            let mut included_weight = 0.0f64;
+            for (tap, &weight) in kernel.iter().enumerate() {
+                let input_frame = first_input_frame + tap as isize;
+                if (0..input_frames as isize).contains(&input_frame) {
+                    value += samples[input_frame as usize * channels + channel] as f64 * weight;
+                    included_weight += weight;
+                }
+            }
+            output[output_frame * channels + channel] = if included_weight.abs() > 1e-12 {
+                (value / included_weight) as f32
+            } else {
+                samples
+                    [source_frame.clamp(0, input_frames as isize - 1) as usize * channels + channel]
+            };
+        }
+    }
+    Ok(output)
 }
 
 /// A one-sided complex spectrogram: `n_bins = n_fft / 2 + 1` rows by `n_frames` columns,
@@ -336,5 +533,138 @@ mod tests {
         assert!(stft(&[0.0; 64], 16, 4, &hann_window(8)).is_err()); // window mismatch
         assert!(stft(&[0.0; 4], 16, 4, &w).is_err()); // too short to reflect-pad
         assert!(istft(&[0.0; 8], &[0.0; 8], 1, 16, 4, &w).is_err()); // 8 != n_fft/2+1 bins
+    }
+
+    #[test]
+    fn resample_identity_empty_and_single_frame_edges() {
+        let stereo = [0.25, -0.5, 0.75, -1.0];
+        assert_eq!(resample(&stereo, 48_000, 48_000, 2).unwrap(), stereo);
+        assert!(resample(&[], 48_000, 16_000, 1).unwrap().is_empty());
+        assert_eq!(
+            resample(&stereo[..2], 48_000, 16_000, 2).unwrap(),
+            stereo[..2]
+        );
+        assert_eq!(resample(&[5.0], 8_000, 48_000, 1).unwrap(), [5.0; 6]);
+        assert_eq!(resample(&[5.0], 48_000, 8_000, 1).unwrap(), [5.0]);
+        assert!(resample(&stereo, 0, 16_000, 2).is_err());
+        assert!(resample(&stereo, 48_000, 0, 2).is_err());
+        assert!(resample(&stereo, 48_000, 16_000, 0).is_err());
+        assert!(resample(&stereo[..3], 48_000, 16_000, 2).is_err());
+    }
+
+    #[test]
+    fn resample_changes_frame_count_and_preserves_constants() {
+        let mono = vec![0.375; 1_000];
+        let up = resample(&mono, 16_000, 24_000, 1).unwrap();
+        assert_eq!(up.len(), 1_500);
+        assert!(up.iter().all(|&x| (x - 0.375).abs() < 1e-5));
+
+        let down = resample(&mono, 48_000, 16_000, 1).unwrap();
+        assert_eq!(down.len(), 333);
+        assert!(down.iter().all(|&x| (x - 0.375).abs() < 1e-5));
+    }
+
+    #[test]
+    fn resample_keeps_interleaved_stereo_channels_separate_at_48k_to_44k1() {
+        let mut stereo = Vec::with_capacity(4_800 * 2);
+        for _ in 0..4_800 {
+            stereo.extend_from_slice(&[0.75, -0.25]);
+        }
+        let out = resample(&stereo, 48_000, 44_100, 2).unwrap();
+        assert_eq!(out.len(), 4_410 * 2);
+        for frame in out.chunks_exact(2) {
+            assert!((frame[0] - 0.75).abs() < 1e-5, "left {}", frame[0]);
+            assert!((frame[1] + 0.25).abs() < 1e-5, "right {}", frame[1]);
+        }
+    }
+
+    #[test]
+    fn resample_rejects_aliases_above_destination_nyquist() {
+        let src_rate = 48_000u32;
+        let input: Vec<f32> = (0..4_800)
+            .map(|i| (2.0 * std::f32::consts::PI * 9_000.0 * i as f32 / src_rate as f32).sin())
+            .collect();
+        let out = resample(&input, src_rate, 16_000, 1).unwrap();
+        let interior = &out[64..out.len() - 64];
+        let rms = (interior.iter().map(|x| x * x).sum::<f32>() / interior.len() as f32).sqrt();
+        assert!(
+            rms < 0.01,
+            "9 kHz alias leaked into 16 kHz output: RMS {rms}"
+        );
+    }
+
+    #[test]
+    fn resample_preserves_music_band_and_rejects_48k_to_44k1_aliases() {
+        fn tone(rate: u32, frequency: f32) -> Vec<f32> {
+            (0..rate / 2)
+                .map(|i| {
+                    (2.0 * std::f64::consts::PI * frequency as f64 * i as f64 / rate as f64).sin()
+                        as f32
+                })
+                .collect()
+        }
+
+        let passband = resample(&tone(48_000, 20_000.0), 48_000, 44_100, 1).unwrap();
+        let stopband = resample(&tone(48_000, 22_100.0), 48_000, 44_100, 1).unwrap();
+        let rms = |samples: &[f32]| {
+            (samples.iter().map(|x| x * x).sum::<f32>() / samples.len() as f32).sqrt()
+        };
+        let passband_rms = rms(&passband[256..passband.len() - 256]);
+        let stopband_rms = rms(&stopband[256..stopband.len() - 256]);
+        assert!(
+            passband_rms > 0.69,
+            "20 kHz passband drooped at 48 kHz -> 44.1 kHz: RMS {passband_rms}"
+        );
+        assert!(
+            stopband_rms < 0.00001,
+            "22.1 kHz alias leaked into 44.1 kHz output: RMS {stopband_rms}"
+        );
+    }
+
+    #[test]
+    fn resample_rejects_aliases_across_a_large_downsample_ratio() {
+        let src_rate = 192_000u32;
+        let input: Vec<f32> = (0..19_200)
+            .map(|i| (2.0 * std::f32::consts::PI * 6_000.0 * i as f32 / src_rate as f32).sin())
+            .collect();
+        let out = resample(&input, src_rate, 8_000, 1).unwrap();
+        let interior = &out[64..out.len() - 64];
+        let rms = (interior.iter().map(|x| x * x).sum::<f32>() / interior.len() as f32).sqrt();
+        assert!(
+            rms < 0.01,
+            "6 kHz alias leaked into 8 kHz output: RMS {rms}"
+        );
+    }
+
+    #[test]
+    fn resample_preserves_impulse_alignment_at_music_and_watermark_rates() {
+        let mut input = vec![0.0f32; 2_048];
+        input[1_000] = 1.0;
+
+        let music = resample(&input, 48_000, 44_100, 1).unwrap();
+        let music_peak = music
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .map(|(i, _)| i)
+            .unwrap();
+        let expected_music_peak = (1_000.0f64 * 44_100.0 / 48_000.0).round() as usize;
+        assert!(
+            music_peak.abs_diff(expected_music_peak) <= 1,
+            "48 kHz -> 44.1 kHz peak shifted from {expected_music_peak} to {music_peak}"
+        );
+
+        let up = resample(&input, 24_000, 32_000, 1).unwrap();
+        let back = resample(&up, 32_000, 24_000, 1).unwrap();
+        let peak = back
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .map(|(i, _)| i)
+            .unwrap();
+        assert!(
+            peak.abs_diff(1_000) <= 1,
+            "round-trip peak shifted from 1000 to {peak}"
+        );
     }
 }
