@@ -122,6 +122,8 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("--verify-edit-artifact", workflow)
         self.assertIn("--write-manifest", workflow)
         self.assertIn("mage_candle_oracles_manifest.json", workflow)
+        self.assertGreaterEqual(workflow.count("--edit-snapshot \"$MAGE_EDIT_SNAPSHOT\""), 4)
+        self.assertEqual(workflow.count("--gen \"$MAGE_SNAPSHOT\""), 2)
         self.assertLess(
             workflow.index("Verify restored or generated Mage oracle cache"),
             workflow.index("Save verified Mage oracle cache"),

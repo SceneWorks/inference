@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import importlib.metadata
 import json
+import math
 import os
 import re
 import subprocess
@@ -81,6 +82,9 @@ EDIT_SCHEMA = {
     "timesteps_30": ("F32", [30]),
 }
 EDIT_IMG_SHAPES = [[1, 16, 16]] * 4
+PROMPT = "a calico kitten sitting on a wooden windowsill beside a blue ceramic mug"
+EDIT_INSTRUCTION = "Replace the background with a field of sunflowers"
+REFERENCE = "microsoft/Mage @ _vendor/mage_flow (see VENDORED.md)"
 REFERENCE_PACKAGES = {
     "accelerate": "1.13.0",
     "diffusers": "0.38.0",
@@ -172,6 +176,93 @@ def _inspect(
     return metadata, keys, shapes, dtypes
 
 
+def _validate_finite_tensors(path: Path) -> None:
+    try:
+        with safe_open(path, framework="numpy") as handle:
+            failed = []
+            checked = []
+            for key in handle.keys():
+                tensor = handle.get_tensor(key)
+                if np.issubdtype(tensor.dtype, np.floating):
+                    checked.append(key)
+                    if not bool(np.isfinite(tensor).all()):
+                        failed.append(key)
+    except Exception as error:
+        raise InvalidOracle(f"{path.name} float-finiteness check failed: {error}") from error
+    if not checked or failed:
+        raise InvalidOracle(f"{path.name} non-finite or absent float tensors: {failed}")
+
+
+def _validate_reference_metadata(
+    name: str, metadata: dict[str, str], revision: str, edit_revision: str
+) -> None:
+    expected = {
+        "prompt": PROMPT,
+        "negative_prompt": " ",
+        "edit_instruction": EDIT_INSTRUCTION,
+        "edit_ref": "dog.jpg",
+        "device": "cpu",
+        "attn": "sdpa",
+        "reference": REFERENCE,
+        "gen_revision": revision,
+        "edit_revision": edit_revision,
+    }
+    if metadata != expected:
+        raise InvalidOracle(f"{name} metadata population/values are stale")
+
+
+def _validate_manifest_header(
+    document: dict,
+    revision: str,
+    edit_revision: str,
+    expected_names: set[str],
+) -> None:
+    expected_keys = {
+        "schema",
+        "reference",
+        "snapshotRevision",
+        "editSnapshotRevision",
+        "device",
+        "vaeGeometries",
+        "generationSeconds",
+        "referenceEnvironment",
+        "files",
+    }
+    seconds = document.get("generationSeconds")
+    records = document.get("files")
+    if (
+        set(document) != expected_keys
+        or document.get("schema") != 1
+        or document.get("reference") != "microsoft/Mage frozen vendored reference"
+        or document.get("snapshotRevision") != revision
+        or document.get("editSnapshotRevision") != edit_revision
+        or document.get("device") != "cpu"
+        or document.get("vaeGeometries") != list(GEOMETRIES)
+        or document.get("referenceEnvironment") != REFERENCE_PACKAGES
+        or not isinstance(seconds, (int, float))
+        or not math.isfinite(float(seconds))
+        or float(seconds) < 0.0
+        or not isinstance(records, list)
+        or any(
+            not isinstance(record, dict)
+            or set(record) != {"name", "bytes", "sha256"}
+            or not isinstance(record.get("bytes"), int)
+            or record["bytes"] <= 0
+            or re.fullmatch(r"[0-9a-f]{64}", record.get("sha256", "")) is None
+            for record in records
+        )
+        or {record.get("name") for record in records if isinstance(record, dict)}
+        != expected_names
+        or len(records) != len(expected_names)
+    ):
+        raise InvalidOracle("Mage oracle manifest header/population is incomplete or stale")
+
+
+def _validate_manifest_file_record(record: dict, path: Path) -> None:
+    if record.get("sha256") != _sha256(path) or record.get("bytes") != path.stat().st_size:
+        raise InvalidOracle(f"{path.name} hash/size differs from the manifest")
+
+
 def _expected_schedule(steps: int) -> tuple[list[float], list[float]]:
     base = [
         1.0 - index * (1.0 - 1.0 / steps) / (steps - 1)
@@ -188,7 +279,11 @@ def _require_ordered_values(
     if (
         not isinstance(actual, list)
         or len(actual) != len(expected)
-        or any(abs(float(left) - float(right)) > tolerance for left, right in zip(actual, expected))
+        or any(
+            not math.isfinite(float(left))
+            or abs(float(left) - float(right)) > tolerance
+            for left, right in zip(actual, expected)
+        )
     ):
         raise InvalidOracle(f"{key} ordered values are stale")
 
@@ -301,30 +396,24 @@ def _validate_files(
         if not path.is_file():
             raise InvalidOracle(f"required Mage oracle is missing: {path}")
         metadata, keys, shapes, dtypes = _inspect(path)
+        _validate_finite_tensors(path)
         if name == TE_FILE:
-            if metadata.get("device") != "cpu" or metadata.get("gen_revision") != revision:
-                raise InvalidOracle(
-                    f"{name} metadata mismatch: device={metadata.get('device')!r}, "
-                    f"gen_revision={metadata.get('gen_revision')!r}, expected cpu/{revision}"
-                )
+            _validate_reference_metadata(name, metadata, revision, edit_revision)
             _validate_schema(name, TE_SCHEMA, keys, shapes, dtypes)
         elif name == EDIT_FILE:
-            if metadata.get("device") != "cpu" or metadata.get("edit_revision") != edit_revision:
-                raise InvalidOracle(
-                    f"{name} metadata mismatch: device={metadata.get('device')!r}, "
-                    f"edit_revision={metadata.get('edit_revision')!r}, "
-                    f"expected cpu/{edit_revision}"
-                )
+            _validate_reference_metadata(name, metadata, revision, edit_revision)
             _validate_schema(name, EDIT_SCHEMA, keys, shapes, dtypes)
             _validate_primary_edit_policy(path)
         else:
             geometry = name.removeprefix("mage_flow_vae_f32_").removesuffix(".safetensors")
             expected_hw = list(_geometry(geometry))
-            if (
-                metadata.get("device") != "cpu"
-                or metadata.get("dtype") != "float32"
-                or metadata.get("revision") != revision
-            ):
+            if metadata != {
+                "reference": REFERENCE,
+                "device": "cpu",
+                "dtype": "float32",
+                "revision": revision,
+                "ref_image": "dog.jpg",
+            }:
                 raise InvalidOracle(
                     f"{name} metadata/schema mismatch for cpu/f32 revision {revision}"
                 )
@@ -378,50 +467,33 @@ def verify(output: Path, snapshot: Path, edit_snapshot: Path) -> None:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except Exception as error:
         raise InvalidOracle(f"invalid Mage oracle manifest: {error}") from error
-    if (
-        manifest.get("schema") != 1
-        or manifest.get("device") != "cpu"
-        or manifest.get("snapshotRevision") != revision
-        or manifest.get("editSnapshotRevision") != edit_revision
-        or manifest.get("vaeGeometries") != list(GEOMETRIES)
-    ):
-        raise InvalidOracle(f"Mage oracle manifest does not match cpu/{revision}/{GEOMETRIES}")
+    _validate_manifest_header(manifest, revision, edit_revision, set(EXPECTED_FILES))
     records = _validate_files(output, revision, edit_revision)
     expected = {record["name"]: record for record in manifest.get("files", [])}
     if set(expected) != set(EXPECTED_FILES):
         raise InvalidOracle("Mage oracle manifest file population is incomplete or stale")
     for record in records:
         manifest_record = expected[record["name"]]
-        if (
-            manifest_record.get("sha256") != record["sha256"]
-            or manifest_record.get("bytes") != record["bytes"]
-        ):
-            raise InvalidOracle(f"{record['name']} hash/size differs from the manifest")
+        _validate_manifest_file_record(manifest_record, output / record["name"])
     print(f"verified {len(records)} CPU Mage oracles for revision {revision} under {output}")
 
 
-def verify_edit_artifact(output: Path, edit_snapshot: Path) -> None:
+def verify_edit_artifact(output: Path, snapshot: Path, edit_snapshot: Path) -> None:
+    revision = _revision(snapshot)
     edit_revision = _revision(edit_snapshot)
     try:
         document = json.loads((output / EDIT_MANIFEST).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
         raise InvalidOracle(f"invalid Mage edit artifact manifest: {error}") from error
-    records = document.get("files", [])
-    if (
-        document.get("device") != "cpu"
-        or document.get("editSnapshotRevision") != edit_revision
-        or len(records) != 1
-        or records[0].get("name") != EDIT_FILE
-    ):
-        raise InvalidOracle("Mage edit artifact manifest is incomplete or stale")
+    _validate_manifest_header(document, revision, edit_revision, {EDIT_FILE})
+    records = document["files"]
     path = output / EDIT_FILE
     metadata, keys, shapes, dtypes = _inspect(path)
-    if metadata.get("device") != "cpu" or metadata.get("edit_revision") != edit_revision:
-        raise InvalidOracle("Mage edit artifact metadata does not match its CPU snapshot")
+    _validate_reference_metadata(EDIT_FILE, metadata, revision, edit_revision)
+    _validate_finite_tensors(path)
     _validate_schema(EDIT_FILE, EDIT_SCHEMA, keys, shapes, dtypes)
     _validate_primary_edit_policy(path)
-    if records[0].get("sha256") != _sha256(path) or records[0].get("bytes") != path.stat().st_size:
-        raise InvalidOracle("Mage edit artifact hash/size differs from its manifest")
+    _validate_manifest_file_record(records[0], path)
 
 
 def provision(output: Path, snapshot: Path, edit_snapshot: Path) -> None:
@@ -464,7 +536,7 @@ def provision(output: Path, snapshot: Path, edit_snapshot: Path) -> None:
     _write_manifest(
         output, revision, edit_revision, records, seconds, reference_environment
     )
-    verify_edit_artifact(output, edit_snapshot)
+    verify_edit_artifact(output, snapshot, edit_snapshot)
     verify(output, snapshot, edit_snapshot)
     print(f"regenerated shared CPU Mage oracle bundle in {seconds:.1f}s")
 
@@ -508,11 +580,11 @@ def _self_test() -> None:
             ("revision mismatch", lambda: verify(stale, snapshot, snapshot)),
             (
                 "stale standalone edit manifest",
-                lambda: verify_edit_artifact(stale, snapshot),
+                lambda: verify_edit_artifact(stale, snapshot, snapshot),
             ),
             (
                 "corrupt standalone edit manifest",
-                lambda: verify_edit_artifact(corrupt_edit, snapshot),
+                lambda: verify_edit_artifact(corrupt_edit, snapshot, snapshot),
             ),
             (
                 "wrong dtype",
@@ -558,10 +630,16 @@ def main() -> int:
         _self_test()
         return 0
     if args.verify_edit_artifact:
-        if not args.edit_snapshot or not args.output:
-            parser.error("--verify-edit-artifact requires --edit-snapshot and --output")
+        if not args.snapshot or not args.edit_snapshot or not args.output:
+            parser.error(
+                "--verify-edit-artifact requires --snapshot, --edit-snapshot, and --output"
+            )
         try:
-            verify_edit_artifact(args.output.resolve(), args.edit_snapshot.resolve())
+            verify_edit_artifact(
+                args.output.resolve(),
+                args.snapshot.resolve(),
+                args.edit_snapshot.resolve(),
+            )
         except (InvalidOracle, OSError, ValueError, json.JSONDecodeError) as error:
             print(f"Mage edit artifact verification FAILED: {error}", file=sys.stderr)
             return 1

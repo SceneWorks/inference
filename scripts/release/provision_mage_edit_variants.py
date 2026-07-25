@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -27,6 +28,9 @@ CASES = (
 REVISION_MARKER = ".sceneworks-model-revision"
 PROMPT = "a calico kitten sitting on a wooden windowsill beside a blue ceramic mug"
 EDIT_INSTRUCTION = "Replace the background with a field of sunflowers"
+REFERENCE = "microsoft/Mage @ _vendor/mage_flow (see VENDORED.md)"
+
+
 def expected_img_shapes(cfg: float) -> list[list[int]]:
     return [[1, 16, 16]] * (4 if cfg > 1.0 else 2)
 
@@ -92,9 +96,12 @@ def inspect(path: Path) -> dict:
             tensors = {}
             values = {}
             selected = {}
+            finite = {}
             for key in handle.keys():
                 tensor = handle.get_tensor(key)
                 tensors[key] = {"dtype": str(tensor.dtype), "shape": list(tensor.shape)}
+                if np.issubdtype(tensor.dtype, np.floating):
+                    finite[key] = bool(np.isfinite(tensor).all())
                 if key in {
                     "cfg",
                     "drop_idx",
@@ -155,6 +162,7 @@ def inspect(path: Path) -> dict:
         "metadata": metadata,
         "tensors": tensors,
         "values": values,
+        "finiteChecks": finite,
         "mutationChecks": checks,
     }
 
@@ -166,7 +174,11 @@ def require_values(record: dict, key: str, expected: object, tolerance: float = 
             not isinstance(actual, list)
             or not isinstance(expected, list)
             or len(actual) != len(expected)
-            or any(abs(float(left) - float(right)) > tolerance for left, right in zip(actual, expected))
+            or any(
+                not math.isfinite(float(left))
+                or abs(float(left) - float(right)) > tolerance
+                for left, right in zip(actual, expected)
+            )
         ):
             raise RuntimeError(f"{key} ordered values are stale")
     elif actual != expected:
@@ -174,7 +186,11 @@ def require_values(record: dict, key: str, expected: object, tolerance: float = 
 
 
 def validate_record(
-    record: dict, expected_revision: str, expected_steps: int, expected_cfg: float
+    record: dict,
+    expected_revision: str,
+    expected_gen_revision: str,
+    expected_steps: int,
+    expected_cfg: float,
 ) -> None:
     schema = edit_schema(expected_steps, expected_cfg)
     if set(record["tensors"]) != set(schema):
@@ -184,13 +200,37 @@ def validate_record(
         if actual != {"dtype": dtype, "shape": shape}:
             raise RuntimeError(f"{key} dtype/shape is stale")
     metadata = record["metadata"]
-    if (
-        metadata.get("device") != "cpu"
-        or metadata.get("edit_revision") != expected_revision
-        or metadata.get("prompt") != PROMPT
-        or metadata.get("edit_instruction") != EDIT_INSTRUCTION
+    if set(metadata) != {
+        "prompt",
+        "negative_prompt",
+        "edit_instruction",
+        "edit_ref",
+        "device",
+        "attn",
+        "reference",
+        "gen_revision",
+        "edit_revision",
+    } or any(
+        (
+            metadata.get("device") != "cpu",
+            metadata.get("edit_revision") != expected_revision,
+            metadata.get("prompt") != PROMPT,
+            metadata.get("negative_prompt") != " ",
+            metadata.get("edit_instruction") != EDIT_INSTRUCTION,
+            metadata.get("edit_ref") != "dog.jpg",
+            metadata.get("attn") != "sdpa",
+            metadata.get("reference") != REFERENCE,
+            metadata.get("gen_revision") != expected_gen_revision,
+        )
     ):
         raise RuntimeError(f"metadata does not pin cpu/{expected_revision}")
+    expected_float = {
+        key for key, tensor in record["tensors"].items() if tensor["dtype"].startswith("float")
+    }
+    finite = record.get("finiteChecks", {})
+    failed_finite = [key for key, passed in finite.items() if not passed]
+    if set(finite) != expected_float or failed_finite:
+        raise RuntimeError(f"non-finite or unchecked float tensors: {failed_finite}")
     for key, expected in (
         ("geometry", [256, 256, 4, expected_steps]),
         ("seed", [42]),
@@ -210,12 +250,25 @@ def validate_record(
         raise RuntimeError(f"load-bearing mutation/value checks failed: {failed}")
 
 
-def validate(path: Path, expected_revision: str, expected_steps: int, expected_cfg: float) -> None:
-    validate_record(inspect(path), expected_revision, expected_steps, expected_cfg)
+def validate(
+    path: Path,
+    expected_revision: str,
+    expected_gen_revision: str,
+    expected_steps: int,
+    expected_cfg: float,
+) -> None:
+    validate_record(
+        inspect(path),
+        expected_revision,
+        expected_gen_revision,
+        expected_steps,
+        expected_cfg,
+    )
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--gen", required=True, type=Path)
     parser.add_argument("--edit", required=True, type=Path)
     parser.add_argument("--edit-base", required=True, type=Path)
     parser.add_argument("--edit-turbo", required=True, type=Path)
@@ -231,6 +284,7 @@ def main() -> int:
         "edit-base": args.edit_base,
         "edit-turbo": args.edit_turbo,
     }
+    gen_pinned = revision(args.gen)
     args.output.mkdir(parents=True, exist_ok=True)
     records = []
     for label, filename, steps, cfg in CASES:
@@ -245,6 +299,7 @@ def main() -> int:
                 env = {
                     **os.environ,
                     "MAGE_DEVICE": "cpu",
+                    "MAGE_SNAPSHOT": str(args.gen),
                     "MAGE_EDIT_SNAPSHOT": str(snapshot),
                     "MAGE_GOLDEN_DIR": str(temp),
                     "MAGE_H": "256",
@@ -271,11 +326,12 @@ def main() -> int:
             raise RuntimeError(
                 f"{destination.name} must already exist before variant verification"
             )
-        validate(destination, pinned, steps, cfg)
+        validate(destination, pinned, gen_pinned, steps, cfg)
         records.append(
             {
                 "variant": label,
                 "snapshotRevision": pinned,
+                "generationSnapshotRevision": gen_pinned,
                 "file": filename,
                 "bytes": destination.stat().st_size,
                 "sha256": sha256(destination),
@@ -287,6 +343,7 @@ def main() -> int:
         "schema": 1,
         "reference": "microsoft/Mage frozen vendored reference",
         "device": "cpu",
+        "generationSnapshotRevision": gen_pinned,
         "files": records,
     }
     manifest_path = args.output / "mage_edit_variants_manifest.json"

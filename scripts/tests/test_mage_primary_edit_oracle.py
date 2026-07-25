@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -16,6 +17,7 @@ SCRIPT = (
 def load_script():
     numpy = types.ModuleType("numpy")
     numpy.ndarray = object
+    numpy.floating = object()
     safetensors = types.ModuleType("safetensors")
     safetensors.safe_open = lambda *_args, **_kwargs: None
     spec = importlib.util.spec_from_file_location("provision_mage_oracles_primary", SCRIPT)
@@ -78,6 +80,11 @@ class MagePrimaryEditOracleTests(unittest.TestCase):
         )
         with self.assertRaises(self.module.InvalidOracle):
             self.module._validate_edit_policy_record(schedule, self.checks())
+        for nonfinite in (float("nan"), float("inf"), -float("inf")):
+            values = self.values()
+            values["timesteps_30"][3] = nonfinite
+            with self.assertRaises(self.module.InvalidOracle):
+                self.module._validate_edit_policy_record(values, self.checks())
         for name in self.checks():
             checks = self.checks()
             checks[name] = False
@@ -111,6 +118,164 @@ class MagePrimaryEditOracleTests(unittest.TestCase):
             self.module._validate_schema(
                 "edit", schema, set(schema), wrong_channel, dtypes
             )
+
+    def manifest(self) -> dict:
+        return {
+            "schema": 1,
+            "reference": "microsoft/Mage frozen vendored reference",
+            "snapshotRevision": "a" * 40,
+            "editSnapshotRevision": "b" * 40,
+            "device": "cpu",
+            "vaeGeometries": list(self.module.GEOMETRIES),
+            "generationSeconds": 12.5,
+            "referenceEnvironment": dict(self.module.REFERENCE_PACKAGES),
+            "files": [
+                {
+                    "name": self.module.EDIT_FILE,
+                    "bytes": 123,
+                    "sha256": "c" * 64,
+                }
+            ],
+        }
+
+    def test_standalone_manifest_header_is_exact_and_finite(self) -> None:
+        expected = {self.module.EDIT_FILE}
+        self.module._validate_manifest_header(
+            self.manifest(), "a" * 40, "b" * 40, expected
+        )
+        mutations = []
+        for key, value in (
+            ("schema", 2),
+            ("reference", "wrong"),
+            ("snapshotRevision", "d" * 40),
+            ("editSnapshotRevision", "e" * 40),
+            ("device", "mps"),
+            ("vaeGeometries", ["256"]),
+            ("referenceEnvironment", {}),
+            ("generationSeconds", float("nan")),
+        ):
+            document = self.manifest()
+            document[key] = value
+            mutations.append(document)
+        extra = self.manifest()
+        extra["unexpected"] = True
+        mutations.append(extra)
+        wrong_hash = self.manifest()
+        wrong_hash["files"][0]["sha256"] = "bad"
+        mutations.append(wrong_hash)
+        wrong_size = self.manifest()
+        wrong_size["files"][0]["bytes"] = 0
+        mutations.append(wrong_size)
+        for document in mutations:
+            with self.assertRaises(self.module.InvalidOracle):
+                self.module._validate_manifest_header(
+                    document, "a" * 40, "b" * 40, expected
+                )
+
+    def test_reference_metadata_population_and_values_are_exact(self) -> None:
+        metadata = {
+            "prompt": self.module.PROMPT,
+            "negative_prompt": " ",
+            "edit_instruction": self.module.EDIT_INSTRUCTION,
+            "edit_ref": "dog.jpg",
+            "device": "cpu",
+            "attn": "sdpa",
+            "reference": self.module.REFERENCE,
+            "gen_revision": "a" * 40,
+            "edit_revision": "b" * 40,
+        }
+        self.module._validate_reference_metadata(
+            self.module.EDIT_FILE, metadata, "a" * 40, "b" * 40
+        )
+        for key in metadata:
+            mutated = dict(metadata)
+            mutated[key] = "wrong"
+            with self.assertRaises(self.module.InvalidOracle):
+                self.module._validate_reference_metadata(
+                    self.module.EDIT_FILE, mutated, "a" * 40, "b" * 40
+                )
+        extra = dict(metadata)
+        extra["unexpected"] = "value"
+        with self.assertRaises(self.module.InvalidOracle):
+            self.module._validate_reference_metadata(
+                self.module.EDIT_FILE, extra, "a" * 40, "b" * 40
+            )
+
+    def test_manifest_hash_and_size_are_exact(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / self.module.EDIT_FILE
+            path.write_bytes(b"oracle")
+            record = {
+                "name": self.module.EDIT_FILE,
+                "bytes": path.stat().st_size,
+                "sha256": self.module._sha256(path),
+            }
+            self.module._validate_manifest_file_record(record, path)
+            for key, value in (
+                ("bytes", record["bytes"] + 1),
+                ("sha256", "0" * 64),
+            ):
+                mutated = dict(record)
+                mutated[key] = value
+                with self.assertRaises(self.module.InvalidOracle):
+                    self.module._validate_manifest_file_record(mutated, path)
+
+    def test_every_float_tensor_must_be_finite(self) -> None:
+        class Tensor:
+            dtype = "float32"
+
+        class Handle:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            @staticmethod
+            def keys():
+                return ["weights"]
+
+            @staticmethod
+            def get_tensor(_key):
+                return Tensor()
+
+        class FiniteResult:
+            def __init__(self, value: bool):
+                self.value = value
+
+            def all(self):
+                return self.value
+
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "oracle.safetensors"
+            path.touch()
+            with (
+                mock.patch.object(self.module, "safe_open", return_value=Handle()),
+                mock.patch.object(
+                    self.module.np, "issubdtype", return_value=True, create=True
+                ),
+                mock.patch.object(
+                    self.module.np,
+                    "isfinite",
+                    return_value=FiniteResult(True),
+                    create=True,
+                ),
+            ):
+                self.module._validate_finite_tensors(path)
+            with (
+                mock.patch.object(self.module, "safe_open", return_value=Handle()),
+                mock.patch.object(
+                    self.module.np, "issubdtype", return_value=True, create=True
+                ),
+                mock.patch.object(
+                    self.module.np,
+                    "isfinite",
+                    return_value=FiniteResult(False),
+                    create=True,
+                ),
+                self.assertRaises(self.module.InvalidOracle),
+            ):
+                self.module._validate_finite_tensors(path)
 
 
 if __name__ == "__main__":

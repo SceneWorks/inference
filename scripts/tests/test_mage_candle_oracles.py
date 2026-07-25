@@ -45,6 +45,12 @@ class MageCandleOracleTests(unittest.TestCase):
         (self.snapshot / self.module.REVISION_MARKER).write_text(
             self.revision + "\n", encoding="utf-8"
         )
+        self.edit_snapshot = self.root / "edit-snapshot"
+        self.edit_snapshot.mkdir()
+        self.edit_revision = "b" * 40
+        (self.edit_snapshot / self.module.REVISION_MARKER).write_text(
+            self.edit_revision + "\n", encoding="utf-8"
+        )
 
     def tearDown(self) -> None:
         self.temp.cleanup()
@@ -59,8 +65,14 @@ class MageCandleOracleTests(unittest.TestCase):
             "bytes": 123,
             "sha256": f"hash:{filename}",
             "metadata": {
+                "negative_prompt": " ",
+                "edit_instruction": self.module.EDIT_INSTRUCTION,
+                "edit_ref": "dog.jpg",
                 "device": "cpu",
+                "attn": "sdpa",
+                "reference": self.module.REFERENCE,
                 "gen_revision": self.revision,
+                "edit_revision": self.edit_revision,
                 "prompt": self.module.PROMPT,
             },
             "tensors": {
@@ -79,6 +91,7 @@ class MageCandleOracleTests(unittest.TestCase):
                 "drop_idx": [34, 64],
                 "static_shift": [6.0],
             },
+            "finiteChecks": {},
             "mutationChecks": {
                 "ditChangesInput": None,
                 "trajectoryChanges": None,
@@ -109,6 +122,11 @@ class MageCandleOracleTests(unittest.TestCase):
             }
         )
         record["mutationChecks"]["ditChangesInput"] = True
+        record["finiteChecks"] = {
+            key: True
+            for key, tensor in record["tensors"].items()
+            if tensor["dtype"].startswith("float")
+        }
         return record
 
     def e2e(self) -> dict:
@@ -137,6 +155,11 @@ class MageCandleOracleTests(unittest.TestCase):
         record["mutationChecks"]["trajectoryChanges"] = True
         record["mutationChecks"]["finalChangesInitial"] = True
         record["mutationChecks"]["imageDiscriminating"] = True
+        record["finiteChecks"] = {
+            key: True
+            for key, tensor in record["tensors"].items()
+            if tensor["dtype"].startswith("float")
+        }
         return record
 
     def test_accepts_exact_schema_values_mutations_and_hash_manifest(self) -> None:
@@ -145,6 +168,7 @@ class MageCandleOracleTests(unittest.TestCase):
             "schema": 1,
             "reference": "microsoft/Mage frozen vendored CPU reference",
             "snapshotRevision": self.revision,
+            "editSnapshotRevision": self.edit_revision,
             "geometry": self.module.GEOMETRY,
             "files": records,
         }
@@ -152,7 +176,104 @@ class MageCandleOracleTests(unittest.TestCase):
             json.dumps(expected), encoding="utf-8"
         )
         with mock.patch.object(self.module, "inspect", side_effect=records):
-            self.module.verify(self.output, self.snapshot, False)
+            self.module.verify(self.output, self.snapshot, self.edit_snapshot, False)
+
+    def test_manifest_rejects_every_header_revision_and_population_mutation(self) -> None:
+        records = [self.dit(), self.e2e()]
+        expected = {
+            "schema": 1,
+            "reference": "microsoft/Mage frozen vendored CPU reference",
+            "snapshotRevision": self.revision,
+            "geometry": self.module.GEOMETRY,
+            "editSnapshotRevision": self.edit_revision,
+            "files": records,
+        }
+        mutations = []
+        for key, value in (
+            ("schema", 2),
+            ("reference", "wrong"),
+            ("snapshotRevision", "c" * 40),
+            ("editSnapshotRevision", "d" * 40),
+            ("geometry", [512, 512, 20, 4]),
+        ):
+            document = dict(expected)
+            document[key] = value
+            mutations.append(document)
+        extra = dict(expected)
+        extra["unexpected"] = True
+        mutations.append(extra)
+        missing = dict(expected)
+        missing["files"] = records[:1]
+        mutations.append(missing)
+        for document in mutations:
+            (self.output / self.module.MANIFEST).write_text(
+                json.dumps(document), encoding="utf-8"
+            )
+            with (
+                mock.patch.object(
+                    self.module, "inspect", side_effect=[self.dit(), self.e2e()]
+                ),
+                self.assertRaisesRegex(self.module.InvalidOracle, "manifest .* stale"),
+            ):
+                self.module.verify(
+                    self.output, self.snapshot, self.edit_snapshot, False
+                )
+
+    def test_nan_and_inf_never_pass_schedule_tolerance(self) -> None:
+        for nonfinite in (float("nan"), float("inf"), -float("inf")):
+            record = self.e2e()
+            record["values"]["sigmas_20"][1] = nonfinite
+            with self.assertRaisesRegex(self.module.InvalidOracle, "ordered values"):
+                self.module.require_values(
+                    record,
+                    "sigmas_20",
+                    self.module.expected_schedule(20)[0],
+                    1.0e-4,
+                )
+
+    def test_every_scalar_cu_and_full_schedule_is_load_bearing(self) -> None:
+        for key, replacement in (
+            ("geometry", [512, 1024, 20, 4]),
+            ("seed", [43]),
+            ("cfg", [4.0]),
+            ("gs_key", [0]),
+            ("drop_idx", [34, 63]),
+            ("static_shift", [5.0]),
+        ):
+            record = self.e2e()
+            record["values"][key] = replacement
+            with self.assertRaises(self.module.InvalidOracle):
+                self.module.validate_e2e(
+                    record, self.revision, self.edit_revision
+                )
+        for key, replacement in (
+            ("dit_in.img_cu_seqlens", [0, 4095, 8192]),
+            ("dit_in.txt_cu_seqlens", [0, 19, 26]),
+        ):
+            record = self.dit()
+            record["values"][key] = replacement
+            with self.assertRaises(self.module.InvalidOracle):
+                self.module.validate_dit(
+                    record, self.revision, self.edit_revision
+                )
+        for steps in (20, 4, 30):
+            for prefix in ("sigmas", "timesteps"):
+                key = f"{prefix}_{steps}"
+                for mutation in ("order", "value", "nan", "inf"):
+                    record = self.e2e()
+                    values = record["values"][key]
+                    if mutation == "order":
+                        values[1], values[2] = values[2], values[1]
+                    elif mutation == "value":
+                        values[1] += 0.25
+                    elif mutation == "nan":
+                        values[1] = float("nan")
+                    else:
+                        values[1] = float("inf")
+                    with self.assertRaises(self.module.InvalidOracle):
+                        self.module.validate_e2e(
+                            record, self.revision, self.edit_revision
+                        )
 
     def test_rejects_absent_corrupt_and_stale_manifest(self) -> None:
         with self.assertRaisesRegex(self.module.InvalidOracle, "missing"):
@@ -173,62 +294,84 @@ class MageCandleOracleTests(unittest.TestCase):
             mock.patch.object(self.module, "inspect", side_effect=[self.dit(), self.e2e()]),
             self.assertRaisesRegex(self.module.InvalidOracle, "manifest .* stale"),
         ):
-            self.module.verify(self.output, self.snapshot, False)
+            self.module.verify(self.output, self.snapshot, self.edit_snapshot, False)
 
     def test_rejects_schema_value_mutation_and_hash_drift(self) -> None:
         missing = self.dit()
         del missing["tensors"]["dit_out"]
         with self.assertRaisesRegex(self.module.InvalidOracle, "population"):
-            self.module.validate_dit(missing, self.revision)
+            self.module.validate_dit(missing, self.revision, self.edit_revision)
         wrong_geometry = self.e2e()
         wrong_geometry["values"]["geometry"] = [512, 512, 20, 4]
         with self.assertRaisesRegex(self.module.InvalidOracle, "geometry.*stale"):
-            self.module.validate_e2e(wrong_geometry, self.revision)
+            self.module.validate_e2e(wrong_geometry, self.revision, self.edit_revision)
         no_trajectory = self.e2e()
         no_trajectory["mutationChecks"]["trajectoryChanges"] = False
         with self.assertRaisesRegex(self.module.InvalidOracle, "step0 equals step1"):
-            self.module.validate_e2e(no_trajectory, self.revision)
+            self.module.validate_e2e(no_trajectory, self.revision, self.edit_revision)
         extra = self.e2e()
         extra["tensors"]["unexpected"] = self.tensor("float32", [1])
         with self.assertRaisesRegex(self.module.InvalidOracle, "population"):
-            self.module.validate_e2e(extra, self.revision)
+            self.module.validate_e2e(extra, self.revision, self.edit_revision)
         wrong_dtype = self.dit()
         wrong_dtype["tensors"]["dit_in.img"]["dtype"] = "float16"
         with self.assertRaisesRegex(self.module.InvalidOracle, "dtype"):
-            self.module.validate_dit(wrong_dtype, self.revision)
+            self.module.validate_dit(wrong_dtype, self.revision, self.edit_revision)
         wrong_channel = self.e2e()
         wrong_channel["tensors"]["image_u8"]["shape"] = [1024, 1024, 4]
         with self.assertRaisesRegex(self.module.InvalidOracle, "shape"):
-            self.module.validate_e2e(wrong_channel, self.revision)
+            self.module.validate_e2e(wrong_channel, self.revision, self.edit_revision)
         wrong_text = self.dit()
         wrong_text["tensors"]["dit_in.txt"]["shape"] = [1, 25, 2560]
         with self.assertRaisesRegex(self.module.InvalidOracle, "shape"):
-            self.module.validate_dit(wrong_text, self.revision)
+            self.module.validate_dit(wrong_text, self.revision, self.edit_revision)
         wrong_shapes = self.e2e()
         wrong_shapes["values"]["img_shapes"] = [[1, 64, 64], [0, 64, 64]]
         with self.assertRaisesRegex(self.module.InvalidOracle, "img_shapes.*stale"):
-            self.module.validate_e2e(wrong_shapes, self.revision)
+            self.module.validate_e2e(wrong_shapes, self.revision, self.edit_revision)
         wrong_schedule = self.e2e()
         wrong_schedule["values"]["sigmas_20"][5], wrong_schedule["values"]["sigmas_20"][6] = (
             wrong_schedule["values"]["sigmas_20"][6],
             wrong_schedule["values"]["sigmas_20"][5],
         )
         with self.assertRaisesRegex(self.module.InvalidOracle, "ordered values"):
-            self.module.validate_e2e(wrong_schedule, self.revision)
+            self.module.validate_e2e(wrong_schedule, self.revision, self.edit_revision)
         wrong_scalar = self.e2e()
         wrong_scalar["values"]["gs_key"] = [1]
         with self.assertRaisesRegex(self.module.InvalidOracle, "gs_key.*stale"):
-            self.module.validate_e2e(wrong_scalar, self.revision)
+            self.module.validate_e2e(wrong_scalar, self.revision, self.edit_revision)
         nondiscriminating = self.e2e()
         nondiscriminating["mutationChecks"]["imageDiscriminating"] = False
         with self.assertRaisesRegex(self.module.InvalidOracle, "non-discriminating"):
-            self.module.validate_e2e(nondiscriminating, self.revision)
+            self.module.validate_e2e(nondiscriminating, self.revision, self.edit_revision)
+        nonfinite = self.e2e()
+        nonfinite["finiteChecks"]["final_latent"] = False
+        with self.assertRaisesRegex(self.module.InvalidOracle, "non-finite"):
+            self.module.validate_e2e(nonfinite, self.revision, self.edit_revision)
+        metadata_extra = self.dit()
+        metadata_extra["metadata"]["unexpected"] = "value"
+        with self.assertRaisesRegex(self.module.InvalidOracle, "metadata population"):
+            self.module.validate_dit(metadata_extra, self.revision, self.edit_revision)
+        metadata_wrong = self.dit()
+        metadata_wrong["metadata"]["attn"] = "flash2"
+        with self.assertRaisesRegex(self.module.InvalidOracle, "metadata population"):
+            self.module.validate_dit(metadata_wrong, self.revision, self.edit_revision)
+        bad_cu = self.dit()
+        bad_cu["values"]["dit_in.img_cu_seqlens"] = [0, 4095, 8192]
+        with self.assertRaisesRegex(self.module.InvalidOracle, "cu_seqlens.*stale"):
+            self.module.validate_dit(bad_cu, self.revision, self.edit_revision)
+        for nonfinite_value in (float("nan"), float("inf"), -float("inf")):
+            bad = self.e2e()
+            bad["values"]["sigmas_4"][1] = nonfinite_value
+            with self.assertRaisesRegex(self.module.InvalidOracle, "ordered values"):
+                self.module.validate_e2e(bad, self.revision, self.edit_revision)
 
         records = [self.dit(), self.e2e()]
         stale = {
             "schema": 1,
             "reference": "microsoft/Mage frozen vendored CPU reference",
             "snapshotRevision": self.revision,
+            "editSnapshotRevision": self.edit_revision,
             "geometry": self.module.GEOMETRY,
             "files": records,
         }
@@ -240,7 +383,7 @@ class MageCandleOracleTests(unittest.TestCase):
             mock.patch.object(self.module, "inspect", side_effect=[self.dit(), self.e2e()]),
             self.assertRaisesRegex(self.module.InvalidOracle, "manifest .* stale"),
         ):
-            self.module.verify(self.output, self.snapshot, False)
+            self.module.verify(self.output, self.snapshot, self.edit_snapshot, False)
 
 
 if __name__ == "__main__":
