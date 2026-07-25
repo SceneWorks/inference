@@ -303,6 +303,37 @@ impl Decoder {
         cancel: &dyn Fn() -> bool,
         on_frame: &mut dyn FnMut(usize, &[u32]) -> CandleResult<()>,
     ) -> CandleResult<Option<DecodeResult>> {
+        self.generate_turn_observed(
+            cache,
+            prefill_block,
+            streamed_text,
+            max_frames,
+            seed,
+            cancel,
+            on_frame,
+            &mut |_| {},
+        )
+    }
+
+    /// Shared AR implementation with an internal observer for the exact frame fed back to the
+    /// backbone. Production callers use [`generate_turn`](Self::generate_turn), whose observer is a
+    /// no-op; focused tests use this seam to prove streamed text reaches `Backbone::step` without
+    /// relying on platform-sensitive equality of sampled audio tokens.
+    #[allow(clippy::too_many_arguments)]
+    fn generate_turn_observed<F>(
+        &self,
+        cache: &mut BackboneCache,
+        prefill_block: &[Frame],
+        streamed_text: &[u32],
+        max_frames: usize,
+        seed: u64,
+        cancel: &dyn Fn() -> bool,
+        on_frame: &mut dyn FnMut(usize, &[u32]) -> CandleResult<()>,
+        on_feedback: &mut F,
+    ) -> CandleResult<Option<DecodeResult>>
+    where
+        F: FnMut(&Frame),
+    {
         let mut out: Vec<RvqFrame> = Vec::new();
         let mut stop = StopReason::Budget;
         // The reference sampling distribution (temp 0.8 / top-k 30 / top-p 0.6 / rep-penalty 1.1),
@@ -340,6 +371,7 @@ impl Decoder {
                     text,
                     audio: prev.clone(),
                 };
+                on_feedback(&fed);
                 self.backbone.step(&fed, cache)?
             };
             let suppress_eos = out.len() < min_frames;
@@ -466,55 +498,6 @@ mod tests {
         }
     }
 
-    /// Like [`tiny_decoder`] but with a **dominant, per-token-distinct text embedding**
-    /// (`embed_tokens.0`): each text id maps to a large, well-separated direction (a ±3 bit-code), so
-    /// the text channel drives the backbone sum and the sampled frames are demonstrably sensitive to
-    /// *which* text token is fed. The default `tiny_decoder`'s tiny uniform weights are numerically
-    /// too flat for the discrete 8-token sampler to resolve the text channel, which would mask the
-    /// streaming feed under test.
-    fn text_sensitive_decoder() -> Decoder {
-        let cfg = tiny_cfg();
-        let hidden = cfg.language_config.hidden_size;
-        let varmap = VarMap::new();
-        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &Device::Cpu);
-        let backbone = crate::backbone::Backbone::new(
-            &cfg.language_config,
-            cfg.rvq,
-            cfg.audio_vocab_size,
-            vb.clone(),
-        )
-        .unwrap();
-        let local = crate::local::LocalTransformer::new(&cfg.local_config, vb.clone()).unwrap();
-        for (i, (name, var)) in varmap.data().lock().unwrap().iter().enumerate() {
-            let t = var.as_tensor();
-            let n = t.shape().elem_count();
-            let vals: Vec<f32> = if name == "embed_tokens.0.weight" {
-                // Row `id`, col `j`: a ±3 bit-code of `id` — distinct direction per text token.
-                (0..n)
-                    .map(|k| {
-                        let (id, j) = (k / hidden, k % hidden);
-                        if (id >> (j % 5)) & 1 == 1 {
-                            3.0
-                        } else {
-                            -3.0
-                        }
-                    })
-                    .collect()
-            } else {
-                (0..n)
-                    .map(|j| (((i * 31 + j * 17) % 13) as f64 * 0.03 - 0.18) as f32)
-                    .collect()
-            };
-            var.set(&Tensor::from_vec(vals, t.shape(), &Device::Cpu).unwrap())
-                .unwrap();
-        }
-        Decoder {
-            backbone,
-            local,
-            cfg,
-        }
-    }
-
     fn manual_prompt(rvq: usize) -> Vec<Frame> {
         // Small in-range ids (avoid the real BOS/EOS constants, which exceed the tiny audio vocab).
         (0..3)
@@ -584,18 +567,54 @@ mod tests {
     }
 
     /// The streamed text tokens (the delay-pattern beyond the prefill, sc-13570) must actually be
-    /// **consumed** on the text channel during the AR loop — not silently ignored. This is the cheap
-    /// mutation-discriminator for the streaming path: reverting `run` to feed `text_pad` every step
-    /// (the pre-sc-13570 bug) makes the two runs identical and turns this test RED. Real weights are
-    /// not needed — different text conditioning changes the summed multi-channel embedding, hence the
-    /// backbone hidden state, hence the sampled frames.
+    /// **consumed** on the text channel during the AR loop — not silently ignored. Observe the exact
+    /// frames passed to `Backbone::step`, rather than hoping different conditioning happens to cross
+    /// a discrete sampling boundary on every CPU implementation.
     #[test]
     fn streamed_text_is_consumed_by_the_ar_loop() {
-        let dec = text_sensitive_decoder();
+        let dec = tiny_decoder();
         let rvq = dec.cfg.rvq;
+        let text_pad = dec.cfg.text_pad;
         let no_cancel = || false;
         // Non-pad text ids (text vocab is 32; text_pad is 6, avoided) fed one per generation step.
         let streamed: [u32; 4] = [4, 5, 7, 8];
+        let mut cache = dec.backbone.new_cache();
+        let mut fed_text = Vec::new();
+        dec.generate_turn_observed(
+            &mut cache,
+            &manual_prompt(rvq),
+            &streamed,
+            5,
+            42,
+            &no_cancel,
+            &mut |_, _| Ok(()),
+            &mut |frame| fed_text.push(frame.text),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            fed_text, streamed,
+            "each prompt-tail token must be fed to the backbone in order"
+        );
+
+        // Empty stream ⇒ every feedback step must carry `text_pad` (the exhausted-stream behavior).
+        let mut pad_cache = dec.backbone.new_cache();
+        let mut fed_pad = Vec::new();
+        dec.generate_turn_observed(
+            &mut pad_cache,
+            &manual_prompt(rvq),
+            &[],
+            5,
+            42,
+            &no_cancel,
+            &mut |_, _| Ok(()),
+            &mut |frame| fed_pad.push(frame.text),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(fed_pad, vec![text_pad; streamed.len()]);
+
+        // The public path uses the same observed core and remains seeded/reproducible.
         let with_stream = dec
             .run(
                 manual_prompt(rvq),
@@ -607,18 +626,6 @@ mod tests {
             )
             .unwrap()
             .unwrap();
-        // Empty stream ⇒ every step feeds `text_pad` (the old, buggy behavior).
-        let all_pad = dec
-            .run(manual_prompt(rvq), &[], 5, 42, &no_cancel, &mut |_, _| {
-                Ok(())
-            })
-            .unwrap()
-            .unwrap();
-        assert_ne!(
-            with_stream.frames, all_pad.frames,
-            "streamed text must change the frames — a text_pad-only loop ignores the prompt tail"
-        );
-        // Same stream + seed ⇒ byte-identical frames (the streaming path is reproducible too).
         let again = dec
             .run(
                 manual_prompt(rvq),
