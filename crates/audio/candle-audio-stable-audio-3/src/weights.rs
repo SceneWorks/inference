@@ -1,7 +1,7 @@
 //! Explicit Stable Audio 3 snapshot layout and safetensors namespace routing.
 //!
 //! There is no repository-id resolver, network client, or cache-path derivation here. A caller
-//! supplies a [`gen_core::WeightsSource::Dir`] containing one immutable snapshot.
+//! supplies a [`crate::gen_core::WeightsSource::Dir`] containing one immutable snapshot.
 //!
 //! The upstream files use two key layouts:
 //!
