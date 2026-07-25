@@ -274,3 +274,83 @@ fn moss_sfx_wav_conformance() {
         "seeded synthesis must be deterministic"
     );
 }
+
+/// The **default sampler path** must produce audible audio.
+///
+/// `moss_sfx_wav_conformance` above pins `steps = 30`, so until this test existed nothing ever
+/// exercised the step count a caller actually gets when it leaves `steps` unset — and that is the
+/// overwhelmingly common case (SceneWorks' Audio Studio sends `steps: null` unless a user opens
+/// the advanced panel). At [`candle_audio_moss_sfx::pipeline::DEFAULT_STEPS`] (100) the
+/// flow-matching solver collapsed: the final latent kept a healthy norm but decoded to a −74 dBFS
+/// residual floor (peak 0.02, RMS 0.0002) instead of a sound effect. A consumer that
+/// peak-normalizes on write then amplified that floor to full scale and registered loud broadband
+/// noise as a finished asset.
+///
+/// The level floor is the assertion that catches it — a collapsed render is quiet, and no
+/// spectral-shape statistic will notice, because the residual floor is still *shaped*.
+#[test]
+#[ignore = "real weights: needs a MOSS-SoundEffect-v2.0 snapshot (MOSS_SFX_SNAPSHOT); run with --ignored"]
+fn moss_sfx_default_steps_produce_audible_audio() {
+    let spec = LoadSpec::new(snapshot());
+    let generator = candle_audio_moss_sfx::provider_registry()
+        .unwrap()
+        .load(candle_audio_moss_sfx::MODEL_ID, &spec)
+        .expect("moss_sfx_v2 loads through the explicit registry");
+
+    // `steps: None` ⇒ the pipeline's own DEFAULT_STEPS — exactly what an unset request resolves to.
+    let req = GenerationRequest {
+        prompt: "glass shattering on a stone floor".into(),
+        seed: Some(42),
+        steps: None,
+        guidance: None,
+        audio: Some(AudioParams {
+            target_duration: Some(3.0),
+            sample_rate: Some(48_000),
+            language: Some("en".into()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let mut observed_steps = 0u32;
+    let out = generator
+        .generate(&req, &mut |p| {
+            if matches!(p, Progress::Step { .. }) {
+                observed_steps += 1;
+            }
+        })
+        .expect("generate at the default step count");
+    assert_eq!(
+        observed_steps,
+        candle_audio_moss_sfx::pipeline::DEFAULT_STEPS as u32,
+        "an unset `steps` must resolve to the pipeline default"
+    );
+
+    let track = match out {
+        GenerationOutput::Audio(track) => track,
+        other => panic!("expected GenerationOutput::Audio, got {other:?}"),
+    };
+    assert!(
+        track.samples.iter().all(|s| s.is_finite()),
+        "finite samples"
+    );
+
+    let peak = track.samples.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+    let n = track.samples.len();
+    let interior = &track.samples[n / 20..n - n / 20];
+    let rms = (interior.iter().map(|s| s * s).sum::<f32>() / interior.len() as f32).sqrt();
+
+    // A real render peaks near full scale and carries an interior RMS well above 0.01; the
+    // collapsed one measured peak 0.02 / RMS 0.0002. Both floors sit far below any healthy render
+    // and far above the collapse, so this brackets the failure without being brittle.
+    assert!(
+        peak > 0.1,
+        "peak {peak:.5} at the default {} steps — a collapsed solver leaves only a residual floor",
+        candle_audio_moss_sfx::pipeline::DEFAULT_STEPS
+    );
+    assert!(
+        rms > 0.01,
+        "interior RMS {rms:.6} at the default {} steps — inaudible output is a failure, and a \
+         peak-normalizing consumer would amplify it into full-scale noise",
+        candle_audio_moss_sfx::pipeline::DEFAULT_STEPS
+    );
+}

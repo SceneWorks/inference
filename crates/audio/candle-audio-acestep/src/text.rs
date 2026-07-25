@@ -2,17 +2,20 @@
 //!
 //! The reference `AceStepPipeline.encode_prompt` splits conditioning into two token streams:
 //!
-//! - **Prompt** — the style/genre/instrument/mood/tempo caption, optionally prefixed with an
-//!   auto-generated task instruction and suffixed with musical metadata (`bpm`, `keyscale`,
-//!   `timesignature`, `vocal_language`). It is encoded through the *full* Qwen3-Embedding-0.6B
-//!   text encoder (contextual hidden states), truncated to [`MAX_TEXT_LEN`] tokens.
-//! - **Lyrics** — structured with `[verse]` / `[chorus]` / … tags; encoded through the text
-//!   encoder's **embedding layer only** (token lookup), truncated to [`MAX_LYRIC_LEN`]. The
+//! - **Prompt** — the reference `SFT_GEN_PROMPT` document: a structured markdown block carrying an
+//!   instruction, the style/genre/mood caption, and a `# Metas` list (`bpm`, `timesignature`,
+//!   `keyscale`, `duration`), terminated by `<|endoftext|>`. Encoded through the *full* Qwen3
+//!   text encoder (contextual hidden states), truncated to [`MAX_TEXT_LEN`] tokens. See
+//!   [`build_prompt`].
+//! - **Lyrics** — the reference lyric document (`# Languages` + `# Lyric`), encoded through the
+//!   text encoder's **embedding layer only** (token lookup), truncated to [`MAX_LYRIC_LEN`]. The
 //!   contextual encoding of those embeddings is done downstream by the condition encoder's lyric
-//!   encoder, so this module only supplies the token ids.
+//!   encoder, so this module only supplies the token ids. See [`build_lyrics`].
 //!
-//! The metadata weave below is the reference's textual conditioning convention (metadata that is
-//! `None` is estimated by the model, so an absent field is simply omitted from the prompt).
+//! Both templates are load-bearing: the model was trained on them, so absent metadata renders as an
+//! explicit `N/A` rather than being omitted, and an instrumental request still emits a non-empty
+//! lyric document. Emitting a bare comma-joined caption instead — as this module originally did —
+//! is out-of-distribution conditioning and yields incoherent audio.
 
 use candle_audio::{AudioError, Result};
 use tokenizers::Tokenizer;
@@ -32,41 +35,90 @@ pub struct Metadata {
     pub vocal_language: Option<String>,
 }
 
-/// Assemble the text prompt actually fed to the encoder: the style caption plus any supplied
-/// musical metadata, in a stable order. Whitespace is collapsed and the result trimmed.
-pub fn build_prompt(prompt: &str, meta: &Metadata) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    let base = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
-    if !base.is_empty() {
-        parts.push(base);
-    }
-    if let Some(bpm) = meta.bpm {
-        // Whole-number BPMs render without a trailing ".0" (the reference passes an int).
-        if (bpm.fract()).abs() < f32::EPSILON {
-            parts.push(format!("bpm: {}", bpm as i64));
-        } else {
-            parts.push(format!("bpm: {bpm}"));
-        }
-    }
-    if let Some(key) = &meta.key {
-        let key = key.trim();
-        if !key.is_empty() {
-            parts.push(format!("key: {key}"));
-        }
-    }
-    if let Some(ts) = &meta.time_signature {
-        let ts = ts.trim();
-        if !ts.is_empty() {
-            parts.push(format!("time signature: {ts}"));
-        }
-    }
-    if let Some(lang) = &meta.vocal_language {
-        let lang = lang.trim();
-        if !lang.is_empty() {
-            parts.push(format!("language: {lang}"));
-        }
-    }
-    parts.join(", ")
+/// The reference `DEFAULT_DIT_INSTRUCTION` — the instruction slot of the SFT prompt template when
+/// the caller supplies none. The reference appends a `:` if the instruction lacks one; this
+/// constant already ends in `:`.
+pub const DEFAULT_DIT_INSTRUCTION: &str =
+    "Fill the audio semantic mask based on the given conditions:";
+
+/// Assemble the text prompt actually fed to the encoder.
+///
+/// This is the reference `SFT_GEN_PROMPT` template verbatim, **not** a comma-joined caption:
+///
+/// ```text
+/// # Instruction
+/// {instruction}
+///
+/// # Caption
+/// {prompt}
+///
+/// # Metas
+/// - bpm: {bpm|N/A}
+/// - timesignature: {ts|N/A}
+/// - keyscale: {keyscale|N/A}
+/// - duration: {int(seconds)} seconds
+/// <|endoftext|>
+/// ```
+///
+/// The model is trained on this structured markdown document, including the `N/A` placeholders for
+/// absent metadata (they are *not* omitted) and the trailing `<|endoftext|>`. Feeding it a bare
+/// caption instead is badly out-of-distribution conditioning: the port previously emitted
+/// `"<caption>, bpm: 133, language: en"` (23 tokens against the reference's 67), which the DiT
+/// faithfully rendered as incoherent audio. Note `vocal_language` does **not** belong here — the
+/// reference carries it on the *lyric* stream (see [`build_lyrics`]).
+pub fn build_prompt(prompt: &str, meta: &Metadata, seconds: f32) -> String {
+    // The reference collapses nothing; only the caption slot carries user text.
+    let caption = prompt.trim();
+    let bpm_str = match meta.bpm {
+        // `str(bpm)` on an int in the reference (`bpm > 0` guards the N/A branch).
+        Some(bpm) if bpm > 0.0 => format!("{}", bpm as i64),
+        _ => "N/A".to_string(),
+    };
+    let ts_str = meta
+        .time_signature
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("N/A");
+    let ks_str = meta
+        .key
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("N/A");
+    // `f"{int(audio_duration)} seconds"`, falling back to 30 for a non-positive duration.
+    let dur_str = if seconds > 0.0 {
+        format!("{} seconds", seconds as i64)
+    } else {
+        "30 seconds".to_string()
+    };
+    let metas =
+        format!("- bpm: {bpm_str}\n- timesignature: {ts_str}\n- keyscale: {ks_str}\n- duration: {dur_str}\n");
+    format!("# Instruction\n{DEFAULT_DIT_INSTRUCTION}\n\n# Caption\n{caption}\n\n# Metas\n{metas}<|endoftext|>\n")
+}
+
+/// Assemble the lyric stream, which the reference encodes on **every** call — including a purely
+/// instrumental request, where the template still contributes ~11 tokens of conditioning:
+///
+/// ```text
+/// # Languages
+/// {vocal_language}
+///
+/// # Lyric
+/// {lyrics}<|endoftext|>
+/// ```
+///
+/// The port previously skipped the lyric stream entirely when `lyrics` was empty, dropping those
+/// rows (and the language signal) from the condition encoder's packed context.
+pub fn build_lyrics(lyrics: &str, vocal_language: Option<&str>) -> String {
+    let lang = vocal_language
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("en");
+    format!(
+        "# Languages\n{lang}\n\n# Lyric\n{}<|endoftext|>",
+        lyrics.trim()
+    )
 }
 
 /// Tokenize the assembled prompt to at most [`MAX_TEXT_LEN`] ids (reference truncation). An empty
@@ -98,29 +150,63 @@ mod tests {
     use super::*;
 
     #[test]
-    fn prompt_weaves_metadata_in_stable_order() {
+    fn prompt_matches_the_reference_sft_template() {
         let meta = Metadata {
             bpm: Some(128.0),
             key: Some("C minor".into()),
-            time_signature: Some("4".into()),
+            time_signature: Some("4/4".into()),
             vocal_language: Some("en".into()),
         };
+        // The reference `SFT_GEN_PROMPT` document, verbatim. vocal_language is NOT here — it rides
+        // the lyric stream.
+        let expected = concat!(
+            "# Instruction\n",
+            "Fill the audio semantic mask based on the given conditions:\n",
+            "\n",
+            "# Caption\n",
+            "upbeat electronic dance track\n",
+            "\n",
+            "# Metas\n",
+            "- bpm: 128\n",
+            "- timesignature: 4/4\n",
+            "- keyscale: C minor\n",
+            "- duration: 12 seconds\n",
+            "<|endoftext|>\n",
+        );
         assert_eq!(
-            build_prompt("  upbeat   electronic\ndance track ", &meta),
-            "upbeat electronic dance track, bpm: 128, key: C minor, time signature: 4, language: en"
+            build_prompt("upbeat electronic dance track", &meta, 12.0),
+            expected
         );
     }
 
     #[test]
-    fn absent_metadata_is_omitted() {
+    fn absent_metadata_renders_na_not_omitted() {
+        // The reference emits explicit `N/A` placeholders; omitting the lines would change the
+        // token stream the model was trained on.
+        let p = build_prompt("ambient pad", &Metadata::default(), 30.0);
+        assert!(p.contains("- bpm: N/A"), "{p}");
+        assert!(p.contains("- timesignature: N/A"), "{p}");
+        assert!(p.contains("- keyscale: N/A"), "{p}");
+        assert!(p.contains("- duration: 30 seconds"), "{p}");
+    }
+
+    #[test]
+    fn non_positive_duration_falls_back_to_thirty_seconds() {
+        assert!(build_prompt("x", &Metadata::default(), 0.0).contains("- duration: 30 seconds"));
+    }
+
+    #[test]
+    fn lyrics_are_templated_even_when_empty() {
+        // An instrumental request still contributes real conditioning rows.
         assert_eq!(
-            build_prompt("ambient pad", &Metadata::default()),
-            "ambient pad"
+            build_lyrics("", Some("en")),
+            "# Languages\nen\n\n# Lyric\n<|endoftext|>"
         );
-        let meta = Metadata {
-            bpm: Some(90.0),
-            ..Default::default()
-        };
-        assert_eq!(build_prompt("lofi", &meta), "lofi, bpm: 90");
+        assert_eq!(
+            build_lyrics("[verse]\nhello", Some("zh")),
+            "# Languages\nzh\n\n# Lyric\n[verse]\nhello<|endoftext|>"
+        );
+        // A missing language defaults to the reference's "en".
+        assert!(build_lyrics("", None).starts_with("# Languages\nen"));
     }
 }
