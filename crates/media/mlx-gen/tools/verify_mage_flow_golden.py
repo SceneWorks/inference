@@ -948,6 +948,11 @@ def _mutations(rng: np.random.Generator) -> dict[str, tuple[str, object]]:
 
         return apply
 
+    def corrupt_packed_negative(t):
+        # Reproduce the torch/MPS failure signature: only the sliced negative transfer is wrong
+        # while the full hooked hidden state remains intact.
+        t["neg_txt"] = np.roll(t["neg_txt"], 1, axis=0).copy()
+
     return {
         "block_out.{0,1} -> noise": ("dit_block", block_out),
         "dit_out -> noise": ("dit", dit_out),
@@ -957,6 +962,7 @@ def _mutations(rng: np.random.Generator) -> dict[str, tuple[str, object]]:
         "msrope angles -> random (unit modulus kept)": ("dit_block", msrope),
         "TE captured at a wrong layer (x3.7)": ("te", rescale_te(3.7)),
         "TE captured at a wrong layer (x1.3)": ("te", rescale_te(1.3)),
+        "MPS packed negative slice corruption": ("te", corrupt_packed_negative),
     }
 
 

@@ -174,6 +174,14 @@ def _revision_of(path: str) -> str:
 # ------------------------------------------------------------------------- utilities
 
 
+def _materialize_mps_view(t: torch.Tensor) -> torch.Tensor:
+    """Detach `t`; on MPS, give every view independent storage before any CPU transfer."""
+    value = t.detach()
+    if value.device.type == "mps":
+        return value.clone(memory_format=torch.contiguous_format)
+    return value
+
+
 def _f32(t: torch.Tensor) -> np.ndarray:
     """Detached float32 C-contiguous numpy view of a real reference tensor.
 
@@ -188,12 +196,17 @@ def _f32(t: torch.Tensor) -> np.ndarray:
     """
     if t.is_complex():
         raise TypeError("complex tensor reached _f32 — use _split_complex (real part only would be stored)")
-    return t.detach().to("cpu", torch.float32).contiguous().numpy()
+    # torch 2.13.0 MPS can silently copy the wrong storage region when a sliced view with a
+    # non-zero storage offset is transferred directly to CPU. Synchronizing does not help;
+    # materializing independent MPS storage first does. Always clone MPS tensors so this remains
+    # safe even for views that report `is_contiguous()` despite their non-zero storage offset.
+    value = _materialize_mps_view(t)
+    return value.to("cpu", torch.float32).contiguous().numpy()
 
 
 def _split_complex(t: torch.Tensor) -> tuple[np.ndarray, np.ndarray]:
     """`(real, imag)` float32 halves of a complex reference tensor (the RoPE frequency table)."""
-    c = t.detach().to("cpu").resolve_conj().contiguous()
+    c = _materialize_mps_view(t).to("cpu").resolve_conj().contiguous()
     return (
         torch.view_as_real(c)[..., 0].to(torch.float32).contiguous().numpy(),
         torch.view_as_real(c)[..., 1].to(torch.float32).contiguous().numpy(),
@@ -201,7 +214,18 @@ def _split_complex(t: torch.Tensor) -> tuple[np.ndarray, np.ndarray]:
 
 
 def _i64(t: torch.Tensor) -> np.ndarray:
-    return t.detach().to("cpu", torch.int64).contiguous().numpy()
+    return _materialize_mps_view(t).to("cpu", torch.int64).contiguous().numpy()
+
+
+def _assert_exact_slice(label: str, actual: np.ndarray, expected: np.ndarray) -> None:
+    """Fail closed before writing when a separately transferred packed view is corrupted."""
+    if actual.shape != expected.shape or not np.array_equal(actual, expected):
+        delta = np.max(np.abs(actual - expected)) if actual.shape == expected.shape else np.inf
+        raise RuntimeError(
+            f"{label} is not the exact post-drop slice of its captured full hidden state "
+            f"(shape {actual.shape} vs {expected.shape}, max_abs={delta:.6f}); "
+            "refusing to write a silently corrupted text-encoder golden"
+        )
 
 
 def _shapes_arr(img_shapes) -> np.ndarray:
@@ -502,14 +526,22 @@ def dump_te(model) -> dict[str, np.ndarray]:
         cap.remove()
 
     pos_len, neg_len = int(lens[0]), int(lens[1])
+    gen_txt = _f32(txt[:pos_len])
+    neg_txt = _f32(txt[pos_len : pos_len + neg_len])
+    pos_seq_len = pos_len + drop_idx
+    for label, actual, expected in (
+        ("gen_txt", gen_txt, cap.hidden[drop_idx:pos_seq_len]),
+        ("neg_txt", neg_txt, cap.hidden[pos_seq_len + drop_idx :]),
+    ):
+        _assert_exact_slice(label, actual, expected)
     tensors.update(
         {
             "gen_input_ids": _i64(ids),
             "gen_hidden_full": cap.hidden,  # [pos_L + neg_L, 2560], post-final-RMSNorm, pre-drop
-            "gen_txt": _f32(txt[:pos_len]),
+            "gen_txt": gen_txt,
             "gen_vec": _f32(vec[0:1]),
             "gen_txt_len": np.array([pos_len], dtype=np.int32),
-            "neg_txt": _f32(txt[pos_len : pos_len + neg_len]),
+            "neg_txt": neg_txt,
             "neg_vec": _f32(vec[1:2]),
             "neg_txt_len": np.array([neg_len], dtype=np.int32),
             "gen_drop_idx": np.array([drop_idx], dtype=np.int32),
@@ -538,6 +570,9 @@ def dump_te(model) -> dict[str, np.ndarray]:
     finally:
         cap.remove()
 
+    edit_txt = _f32(etxt)
+    edit_expected = cap.hidden[edrop:]
+    _assert_exact_slice("edit_txt", edit_txt, edit_expected)
     tensors.update(
         {
             "edit_input_ids": _i64(vl["input_ids"].squeeze(0)),
@@ -545,7 +580,7 @@ def dump_te(model) -> dict[str, np.ndarray]:
             "edit_image_grid_thw": _i64(vl["image_grid_thw"]),
             "edit_vl_ref_u8": _pil_u8(vl_ref),
             "edit_hidden_full": cap.hidden,
-            "edit_txt": _f32(etxt),
+            "edit_txt": edit_txt,
             "edit_vec": _f32(evec),
             "edit_txt_len": np.array([int(elens[0])], dtype=np.int32),
             "edit_drop_idx": np.array([edrop], dtype=np.int32),
@@ -808,7 +843,69 @@ _STAGES = ("noise", "vae", "te", "dit_block", "dit", "e2e", "edit")
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--stage", choices=[*_STAGES, "all"], default="all")
+    parser.add_argument(
+        "--self-test-transfer",
+        action="store_true",
+        help="prove the pre-write packed-slice invariant accepts exact data and rejects corruption",
+    )
     args = parser.parse_args()
+    if args.self_test_transfer:
+        cpu_base = torch.arange(24, dtype=torch.float32).reshape(6, 4)
+        cpu_view = cpu_base[2:4]
+        cpu_detached = _materialize_mps_view(cpu_view)
+        if (
+            cpu_detached.data_ptr() != cpu_view.data_ptr()
+            or cpu_detached.storage_offset() != cpu_view.storage_offset()
+        ):
+            raise RuntimeError("non-MPS materialization must detach without cloning or rebasing")
+
+        device = torch.device(DEVICE)
+        float_base = torch.arange(24, dtype=torch.float32, device=device).reshape(6, 4)
+        float_view = float_base[2:4]
+        if not np.array_equal(_f32(float_view), np.arange(8, 16, dtype=np.float32).reshape(2, 4)):
+            raise RuntimeError("_f32 failed a non-zero-offset view transfer")
+
+        int_base = torch.arange(24, dtype=torch.int64, device=device).reshape(6, 4)
+        int_view = int_base[3:5]
+        if not np.array_equal(_i64(int_view), np.arange(12, 20, dtype=np.int64).reshape(2, 4)):
+            raise RuntimeError("_i64 failed a non-zero-offset view transfer")
+
+        complex_status = "exercised"
+        try:
+            real = torch.arange(24, dtype=torch.float32, device=device).reshape(6, 4)
+            complex_base = torch.complex(real, real + 100)
+            complex_view = complex_base[1:3]
+            split_re, split_im = _split_complex(complex_view)
+            if not np.array_equal(split_re, np.arange(4, 12, dtype=np.float32).reshape(2, 4)):
+                raise RuntimeError("_split_complex real half failed a non-zero-offset view transfer")
+            if not np.array_equal(split_im, split_re + 100):
+                raise RuntimeError("_split_complex imaginary half failed a non-zero-offset view transfer")
+        except RuntimeError as error:
+            if device.type != "mps" or "does not support" not in str(error).lower():
+                raise
+            # torch 2.13.0 MPS does not expose complex tensors. The same helper path is still
+            # exercised by float/int MPS views, and complex splitting is tested on CPU below.
+            complex_status = f"MPS unsupported ({error}); CPU fallback exercised"
+            real = torch.arange(24, dtype=torch.float32).reshape(6, 4)
+            complex_base = torch.complex(real, real + 100)
+            split_re, split_im = _split_complex(complex_base[1:3])
+            if not np.array_equal(split_im, split_re + 100):
+                raise RuntimeError("_split_complex CPU fallback failed")
+
+        full = np.arange(24, dtype=np.float32).reshape(6, 4)
+        _assert_exact_slice("self-test exact", full[2:4].copy(), full[2:4])
+        corrupted = full[2:4].copy()
+        corrupted[0, 0] += 1
+        try:
+            _assert_exact_slice("self-test mutation", corrupted, full[2:4])
+        except RuntimeError:
+            print(
+                "packed-slice transfer self-test PASS: "
+                f"float/int serializers exercised on {device.type}; complex {complex_status}; "
+                "CPU no-clone guarded; exact accepted, corruption rejected"
+            )
+            return 0
+        raise RuntimeError("packed-slice transfer self-test failed to reject corruption")
     stages = set(_STAGES) if args.stage == "all" else {args.stage}
 
     gen_repo = _snapshot_dir("MAGE_SNAPSHOT", "microsoft/Mage-Flow")
