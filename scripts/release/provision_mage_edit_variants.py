@@ -32,6 +32,22 @@ EDIT_INSTRUCTION = "Replace the background with a field of sunflowers"
 REFERENCE = "microsoft/Mage @ _vendor/mage_flow (see VENDORED.md)"
 
 
+def exact_manifest_match(expected: object, actual: object) -> bool:
+    """Compare JSON documents without Python's bool/int/float equality aliases."""
+    if type(expected) is not type(actual):
+        return False
+    if isinstance(actual, dict):
+        return set(expected) == set(actual) and all(
+            exact_manifest_match(expected[key], actual[key]) for key in actual
+        )
+    if isinstance(actual, list):
+        return len(expected) == len(actual) and all(
+            exact_manifest_match(left, right)
+            for left, right in zip(expected, actual)
+        )
+    return bool(expected == actual)
+
+
 def producer_environment(
     output: Path, generation_snapshot: Path, edit_snapshot: Path, steps: int, cfg: float
 ) -> dict[str, str]:
@@ -372,7 +388,7 @@ def main() -> int:
             existing = json.loads(manifest_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as error:
             raise RuntimeError(f"invalid Mage edit variant manifest: {error}") from error
-        if existing != manifest:
+        if not exact_manifest_match(existing, manifest):
             raise RuntimeError(
                 "Mage edit variant manifest revisions/geometry/cfg/hash population is stale"
             )

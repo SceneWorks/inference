@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import copy
 import sys
 import tempfile
 import types
@@ -212,6 +213,63 @@ class MageCandleOracleTests(unittest.TestCase):
             with (
                 mock.patch.object(
                     self.module, "inspect", side_effect=[self.dit(), self.e2e()]
+                ),
+                self.assertRaisesRegex(self.module.InvalidOracle, "manifest .* stale"),
+            ):
+                self.module.verify(
+                    self.output, self.snapshot, self.edit_snapshot, False
+                )
+
+    def test_manifest_rejects_every_cross_type_numeric_alias(self) -> None:
+        records = [self.dit(), self.e2e()]
+        for record in records:
+            record["bytes"] = 1
+        expected = {
+            "schema": 1,
+            "reference": "microsoft/Mage frozen vendored CPU reference",
+            "snapshotRevision": self.revision,
+            "geometry": self.module.GEOMETRY,
+            "editSnapshotRevision": self.edit_revision,
+            "files": records,
+        }
+
+        def numeric_aliases(value, path=()):
+            found = []
+            if type(value) is bool:
+                found.append((path, int(value)))
+            elif type(value) is int:
+                found.append((path, float(value)))
+                if value in (0, 1):
+                    found.append((path, bool(value)))
+            elif type(value) is float and value.is_integer():
+                found.append((path, int(value)))
+                if value in (0.0, 1.0):
+                    found.append((path, bool(value)))
+            elif isinstance(value, dict):
+                for key, nested in value.items():
+                    found.extend(numeric_aliases(nested, (*path, key)))
+            elif isinstance(value, list):
+                for index, nested in enumerate(value):
+                    found.extend(numeric_aliases(nested, (*path, index)))
+            return found
+
+        mutations = numeric_aliases(expected)
+        self.assertGreater(len(mutations), 100)
+        for path, replacement in mutations:
+            document = copy.deepcopy(expected)
+            target = document
+            for part in path[:-1]:
+                target = target[part]
+            target[path[-1]] = replacement
+            (self.output / self.module.MANIFEST).write_text(
+                json.dumps(document), encoding="utf-8"
+            )
+            with (
+                self.subTest(path=path),
+                mock.patch.object(
+                    self.module,
+                    "inspect",
+                    side_effect=[copy.deepcopy(records[0]), copy.deepcopy(records[1])],
                 ),
                 self.assertRaisesRegex(self.module.InvalidOracle, "manifest .* stale"),
             ):

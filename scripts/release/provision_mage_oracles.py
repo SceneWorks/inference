@@ -265,12 +265,19 @@ def _validate_manifest_header(
     records = document.get("files")
     if (
         set(document) != expected_keys
+        or type(document.get("schema")) is not int
         or document.get("schema") != 1
+        or type(document.get("reference")) is not str
         or document.get("reference") != "microsoft/Mage frozen vendored reference"
+        or type(document.get("snapshotRevision")) is not str
         or document.get("snapshotRevision") != revision
+        or type(document.get("editSnapshotRevision")) is not str
         or document.get("editSnapshotRevision") != edit_revision
+        or type(document.get("device")) is not str
         or document.get("device") != "cpu"
+        or type(document.get("vaeGeometries")) is not list
         or document.get("vaeGeometries") != list(GEOMETRIES)
+        or type(document.get("referenceEnvironment")) is not dict
         or document.get("referenceEnvironment") != REFERENCE_PACKAGES
         or type(seconds) not in (int, float)
         or not math.isfinite(float(seconds))
@@ -279,8 +286,10 @@ def _validate_manifest_header(
         or any(
             not isinstance(record, dict)
             or set(record) != {"name", "bytes", "sha256"}
+            or type(record.get("name")) is not str
             or type(record.get("bytes")) is not int
             or record["bytes"] <= 0
+            or type(record.get("sha256")) is not str
             or re.fullmatch(r"[0-9a-f]{64}", record.get("sha256", "")) is None
             for record in records
         )

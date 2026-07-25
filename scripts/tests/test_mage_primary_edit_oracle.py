@@ -146,6 +146,8 @@ class MagePrimaryEditOracleTests(unittest.TestCase):
         mutations = []
         for key, value in (
             ("schema", 2),
+            ("schema", True),
+            ("schema", 1.0),
             ("reference", "wrong"),
             ("snapshotRevision", "d" * 40),
             ("editSnapshotRevision", "e" * 40),

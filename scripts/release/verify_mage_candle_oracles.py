@@ -57,6 +57,22 @@ class InvalidOracle(RuntimeError):
     pass
 
 
+def exact_manifest_match(expected: object, actual: object) -> bool:
+    """Compare JSON documents without Python's bool/int/float equality aliases."""
+    if type(expected) is not type(actual):
+        return False
+    if isinstance(actual, dict):
+        return set(expected) == set(actual) and all(
+            exact_manifest_match(expected[key], actual[key]) for key in actual
+        )
+    if isinstance(actual, list):
+        return len(expected) == len(actual) and all(
+            exact_manifest_match(left, right)
+            for left, right in zip(expected, actual)
+        )
+    return bool(expected == actual)
+
+
 def revision(path: Path) -> str:
     resolved = path.resolve()
     marker = resolved / REVISION_MARKER
@@ -304,7 +320,7 @@ def verify(output: Path, snapshot: Path, edit_snapshot: Path, write_manifest: bo
         expected = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
         raise InvalidOracle(f"invalid Candle acceptance manifest: {error}") from error
-    if expected != actual:
+    if not exact_manifest_match(expected, actual):
         raise InvalidOracle("Candle acceptance manifest revision/schema/value/hash is stale")
     print(f"verified {len(FILES)} Mage Candle acceptance oracles under {output}")
 

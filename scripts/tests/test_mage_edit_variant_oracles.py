@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import copy
 import sys
 import tempfile
 import types
@@ -217,6 +218,55 @@ class MageEditVariantOracleTests(unittest.TestCase):
             self.assertRaisesRegex(RuntimeError, "manifest .* stale"),
         ):
             self.module.main()
+
+    def test_manifest_rejects_every_cross_type_numeric_alias(self) -> None:
+        for _label, filename, _steps, _cfg in self.module.CASES:
+            (self.output / filename).write_bytes(b"x")
+        exact = self.manifest()
+
+        def aliases(value, path=()):
+            found = []
+            if type(value) is bool:
+                found.append((path, int(value)))
+            elif type(value) is int:
+                found.append((path, float(value)))
+                if value in (0, 1):
+                    found.append((path, bool(value)))
+            elif type(value) is float and value.is_integer():
+                found.append((path, int(value)))
+                if value in (0.0, 1.0):
+                    found.append((path, bool(value)))
+            elif isinstance(value, dict):
+                for key, nested in value.items():
+                    found.extend(aliases(nested, (*path, key)))
+            elif isinstance(value, list):
+                for index, nested in enumerate(value):
+                    found.extend(aliases(nested, (*path, index)))
+            return found
+
+        mutations = aliases(exact)
+        self.assertGreaterEqual(len(mutations), 12)
+        for path, replacement in mutations:
+            document = copy.deepcopy(exact)
+            target = document
+            for part in path[:-1]:
+                target = target[part]
+            target[path[-1]] = replacement
+            (self.output / "mage_edit_variants_manifest.json").write_text(
+                json.dumps(document), encoding="utf-8"
+            )
+            with (
+                self.subTest(path=path),
+                mock.patch.object(sys, "argv", self.args()),
+                mock.patch.object(
+                    self.module,
+                    "sha256",
+                    side_effect=lambda artifact: f"hash:{artifact.name}",
+                ),
+                mock.patch.object(self.module, "validate"),
+                self.assertRaisesRegex(RuntimeError, "manifest .* stale"),
+            ):
+                self.module.main()
 
     def test_exact_schema_values_and_discrimination_reject_producer_mutations(self) -> None:
         self.module.validate_record(
