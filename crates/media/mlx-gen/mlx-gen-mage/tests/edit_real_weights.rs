@@ -9,16 +9,20 @@ use mlx_gen_mage::model::{EDIT_BASE_SNAPSHOT_REVISION, EDIT_TURBO_SNAPSHOT_REVIS
 use mlx_gen_mage::{GsKey, MageFlowPipeline};
 use mlx_rs::Dtype;
 
-const GOLDEN: &str = "mage_flow_edit_golden.safetensors";
 const TE_GOLDEN: &str = "mage_flow_te_golden.safetensors";
 const INSTRUCTION: &str = "Replace the background with a field of sunflowers";
+
+fn edit_golden_name() -> String {
+    std::env::var("MAGE_EDIT_GOLDEN_NAME")
+        .unwrap_or_else(|_| "mage_flow_edit_golden.safetensors".into())
+}
 
 #[test]
 #[ignore = "needs MAGE_EDIT_SNAPSHOT, Metal, and mage_flow_edit_golden.safetensors"]
 fn fixed_instruction_edit_matches_the_torch_reference() {
     let root = std::env::var("MAGE_EDIT_SNAPSHOT")
         .expect("set MAGE_EDIT_SNAPSHOT to microsoft/Mage-Flow-Edit");
-    let golden = require_golden(GOLDEN);
+    let golden = require_golden(&edit_golden_name());
     let geometry = golden.require("geometry").unwrap().as_slice::<i32>();
     let (height, width, steps) = (geometry[0] as u32, geometry[1] as u32, geometry[3] as usize);
     let seed = golden.require("seed").unwrap().as_slice::<i64>()[0];
@@ -129,7 +133,7 @@ fn fixed_instruction_edit_matches_the_torch_reference() {
 fn seeded_mlx_posterior_sampling_is_deterministic_and_stochastic() {
     let root = std::env::var("MAGE_EDIT_SNAPSHOT")
         .expect("set MAGE_EDIT_SNAPSHOT to microsoft/Mage-Flow-Edit");
-    let golden = require_golden(GOLDEN);
+    let golden = require_golden(&edit_golden_name());
     let geometry = golden.require("geometry").unwrap().as_slice::<i32>();
     let (height, width) = (geometry[0] as u32, geometry[1] as u32);
     let seed = golden.require("seed").unwrap().as_slice::<i64>()[0] as u64;

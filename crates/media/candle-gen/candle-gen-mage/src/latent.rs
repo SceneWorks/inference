@@ -259,6 +259,27 @@ fn message() -> Vec<u8> {
         .collect()
 }
 
+/// Deterministic standard-normal tensor used by the Mage-VAE edit posterior.
+///
+/// Kept separate from Gaussian-Shading: reference-token parity replays Torch-recorded posterior
+/// samples, while this stream supplies stable request-seeded production sampling.
+pub fn normal_noise(shape: &[usize], seed: u64, device: &Device) -> Result<Tensor> {
+    let count = shape.iter().product();
+    let mut mt = Mt::new((seed & 0x7fff_ffff) as u32);
+    let mut values = Vec::with_capacity(count);
+    while values.len() < count {
+        let u1 = mt.uniform().max(f64::MIN_POSITIVE);
+        let u2 = mt.uniform();
+        let radius = (-2. * u1.ln()).sqrt();
+        let angle = std::f64::consts::TAU * u2;
+        values.push((radius * angle.cos()) as f32);
+        if values.len() < count {
+            values.push((radius * angle.sin()) as f32);
+        }
+    }
+    Tensor::from_vec(values, shape, &Device::Cpu)?.to_device(device)
+}
+
 pub fn watermarked_noise(
     channels: usize,
     height: usize,

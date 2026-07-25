@@ -75,10 +75,10 @@ EDIT_SCHEMA = {
     "seed": ("I64", [1]),
     "seq_step0": ("F32", [1, 1024, 128]),
     "seq_step1": ("F32", [1, 1024, 128]),
-    "sigmas_4": ("F32", [5]),
+    "sigmas_30": ("F32", [31]),
     "static_shift": ("F32", [1]),
     "target_tokens": ("I32", [1]),
-    "timesteps_4": ("F32", [4]),
+    "timesteps_30": ("F32", [30]),
 }
 REFERENCE_PACKAGES = {
     "accelerate": "1.13.0",
@@ -135,9 +135,18 @@ def _sha256(path: Path) -> str:
 
 
 def _revision(snapshot: Path) -> str:
-    revision = snapshot.resolve().name
+    resolved = snapshot.resolve()
+    marker = resolved / ".sceneworks-model-revision"
+    revision = (
+        marker.read_text(encoding="utf-8").strip()
+        if marker.is_file()
+        else resolved.name
+    )
     if not re.fullmatch(r"[0-9a-f]{40}", revision):
-        raise InvalidOracle(f"MAGE_SNAPSHOT must resolve to a 40-hex immutable snapshot, got {snapshot}")
+        raise InvalidOracle(
+            "MAGE_SNAPSHOT must resolve to a 40-hex immutable snapshot or carry "
+            f".sceneworks-model-revision, got {snapshot}"
+        )
     return revision
 
 
@@ -160,6 +169,18 @@ def _inspect(
     except Exception as error:
         raise InvalidOracle(f"{path.name} is not a readable safetensors bundle: {error}") from error
     return metadata, keys, shapes, dtypes
+
+
+def _validate_primary_edit_policy(path: Path) -> None:
+    with safe_open(path, framework="numpy") as handle:
+        geometry = handle.get_tensor("geometry").astype(np.int64).tolist()
+        cfg = float(handle.get_tensor("cfg")[0])
+    if geometry != [256, 256, 4, 30]:
+        raise InvalidOracle(
+            f"{path.name} geometry is {geometry}, expected [256, 256, 4, 30]"
+        )
+    if cfg != 5.0:
+        raise InvalidOracle(f"{path.name} cfg is {cfg}, expected 5.0")
 
 
 def _vae_schema(height: int, width: int) -> dict[str, tuple[str, list[int]]]:
@@ -223,6 +244,7 @@ def _validate_files(
                     f"expected cpu/{edit_revision}"
                 )
             _validate_schema(name, EDIT_SCHEMA, keys, shapes, dtypes)
+            _validate_primary_edit_policy(path)
         else:
             geometry = name.removeprefix("mage_flow_vae_f32_").removesuffix(".safetensors")
             expected_hw = list(_geometry(geometry))
@@ -322,6 +344,7 @@ def verify_edit_artifact(output: Path, edit_snapshot: Path) -> None:
     if metadata.get("device") != "cpu" or metadata.get("edit_revision") != edit_revision:
         raise InvalidOracle("Mage edit artifact metadata does not match its CPU snapshot")
     _validate_schema(EDIT_FILE, EDIT_SCHEMA, keys, shapes, dtypes)
+    _validate_primary_edit_policy(path)
     if records[0].get("sha256") != _sha256(path) or records[0].get("bytes") != path.stat().st_size:
         raise InvalidOracle("Mage edit artifact hash/size differs from its manifest")
 

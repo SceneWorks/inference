@@ -168,7 +168,9 @@ def _snapshot_dir(env: str, repo_id: str) -> str:
 
 def _revision_of(path: str) -> str:
     """The HF revision a resolved snapshot path represents (`unknown` outside the cache)."""
-    name = Path(path).name
+    resolved = Path(path)
+    marker = resolved / ".sceneworks-model-revision"
+    name = marker.read_text(encoding="utf-8").strip() if marker.is_file() else resolved.name
     return name if len(name) == 40 and all(c in "0123456789abcdef" for c in name) else "unknown"
 
 

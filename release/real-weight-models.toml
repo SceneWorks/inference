@@ -578,6 +578,50 @@ expected_files = [
 ]
 
 [[models]]
+# Mage-Flow-Edit-Base 4B instruction-editing training target. The component geometry is identical
+# to Edit; the transformer weights and 30-step default are distinct.
+key = "mage-flow-edit-base"
+repository = "microsoft/Mage-Flow-Edit-Base"
+revision = "8654a7bc0283ab2946385230b5b2eb944e0b76ea"
+license = "MIT"
+size_class = "very-large"
+profiles = ["media-macos", "media-cuda"]
+environment = ["MAGE_EDIT_BASE_SNAPSHOT"]
+expected_files = [
+    "model_index.json",
+    "scheduler/scheduler_config.json",
+    "transformer/config.json",
+    "transformer/diffusion_pytorch_model.safetensors",
+    "vae/config.json",
+    "vae/diffusion_pytorch_model.safetensors",
+    "text_encoder/config.json",
+    "text_encoder/tokenizer.json",
+    "text_encoder/model.safetensors.index.json",
+]
+
+[[models]]
+# Mage-Flow-Edit-Turbo 4B distilled instruction editor. Full checkpoint, not a LoRA; four steps
+# with CFG disabled.
+key = "mage-flow-edit-turbo"
+repository = "microsoft/Mage-Flow-Edit-Turbo"
+revision = "14427bd7627d3a25436497a5939e1096f6a0d523"
+license = "MIT"
+size_class = "very-large"
+profiles = ["media-macos", "media-cuda"]
+environment = ["MAGE_EDIT_TURBO_SNAPSHOT"]
+expected_files = [
+    "model_index.json",
+    "scheduler/scheduler_config.json",
+    "transformer/config.json",
+    "transformer/diffusion_pytorch_model.safetensors",
+    "vae/config.json",
+    "vae/diffusion_pytorch_model.safetensors",
+    "text_encoder/config.json",
+    "text_encoder/tokenizer.json",
+    "text_encoder/model.safetensors.index.json",
+]
+
+[[models]]
 # Mage-Flow-Edit 4B instruction editing (sc-14036 / epic 14034): the edit-variant repo the same
 # oracle runs for the `mage_flow_edit` golden — the transformer config is byte-identical to the
 # gen repo, so only the weights and the input-sequence assembly differ. Pinned at the current

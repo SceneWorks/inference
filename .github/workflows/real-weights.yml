@@ -49,16 +49,21 @@ jobs:
       ZIMAGE_SNAPSHOT: ${{ vars.ZIMAGE_SNAPSHOT }}
       MAGE_SNAPSHOT: ${{ vars.MAGE_SNAPSHOT }}
       MAGE_EDIT_SNAPSHOT: ${{ vars.MAGE_EDIT_SNAPSHOT }}
+      MAGE_EDIT_BASE_SNAPSHOT: ${{ vars.MAGE_EDIT_BASE_SNAPSHOT }}
+      MAGE_EDIT_TURBO_SNAPSHOT: ${{ vars.MAGE_EDIT_TURBO_SNAPSHOT }}
       # Explicit operator-provided models root for the mlx-gen real-weight resolvers that resolve a
       # repo-keyed snapshot (sc-13755); inference never self-fetches or derives a cache location.
       MLX_GEN_MODELS_ROOT: ${{ vars.MLX_GEN_MODELS_ROOT }}
       MAGE_REQUIRE_GOLDENS: "1"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      # setup-python otherwise inherits this self-hosted runner's unwritable /Users/runner cache.
+      - name: Prepare writable Python tool cache
+        run: mkdir -p "$RUNNER_TEMP/python-toolcache"
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        env:
+          AGENT_TOOLSDIRECTORY: ${{ runner.temp }}/python-toolcache
         with:
-          # 3.12.10 is the newest exact 3.12 pin with a Darwin ARM64 artifact in the official
-          # actions/python-versions manifest. 3.12.11+ publish Linux artifacts only.
           python-version: "3.12.10"
           cache: pip
           cache-dependency-path: crates/media/mlx-gen/_vendor/mage_flow/requirements-oracles.txt
@@ -72,17 +77,31 @@ jobs:
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model z-image-turbo --snapshot "$ZIMAGE_SNAPSHOT"
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model mage-flow --snapshot "$MAGE_SNAPSHOT"
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model mage-flow-edit --snapshot "$MAGE_EDIT_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model mage-flow-edit-base --snapshot "$MAGE_EDIT_BASE_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model mage-flow-edit-turbo --snapshot "$MAGE_EDIT_TURBO_SNAPSHOT"
       - name: Regenerate and verify shared CPU Mage oracles
         run: |
           python -m venv "$RUNNER_TEMP/mage-reference"
           "$RUNNER_TEMP/mage-reference/bin/python" -m pip install \
             --disable-pip-version-check --only-binary=:all: --require-hashes \
             -r crates/media/mlx-gen/_vendor/mage_flow/requirements-oracles.txt
-          MAGE_DEVICE=cpu "$RUNNER_TEMP/mage-reference/bin/python" \
+          MAGE_DEVICE=cpu MAGE_EDIT_STEPS=30 "$RUNNER_TEMP/mage-reference/bin/python" \
             scripts/release/provision_mage_oracles.py \
             --snapshot "$MAGE_SNAPSHOT" \
             --edit-snapshot "$MAGE_EDIT_SNAPSHOT" \
             --output "$MAGE_GOLDEN_DIR"
+          "$RUNNER_TEMP/mage-reference/bin/python" \
+            scripts/release/provision_mage_edit_variants.py \
+            --edit "$MAGE_EDIT_SNAPSHOT" \
+            --edit-base "$MAGE_EDIT_BASE_SNAPSHOT" \
+            --edit-turbo "$MAGE_EDIT_TURBO_SNAPSHOT" \
+            --output "$MAGE_GOLDEN_DIR"
+          "$RUNNER_TEMP/mage-reference/bin/python" \
+            scripts/release/provision_mage_oracles.py \
+            --snapshot "$MAGE_SNAPSHOT" \
+            --edit-snapshot "$MAGE_EDIT_SNAPSHOT" \
+            --output "$MAGE_GOLDEN_DIR" \
+            --verify-only
           echo "MAGE_FLOW_TE_GOLDEN=$MAGE_GOLDEN_DIR/mage_flow_te_golden.safetensors" >> "$GITHUB_ENV"
       # sc-14051 Candle acceptance oracle: one frozen-Torch 1024²/20-step reference run emits
       # both the step-zero full-DiT boundary and the final e2e image. It is generated on a
@@ -113,16 +132,28 @@ jobs:
           cargo test --locked --release -p mlx-gen-mage --test vae_decode_real_weights
           -- --ignored --nocapture
       - name: Run Mage-Flow instruction-edit parity
-        run: >-
-          cargo test --locked --release -p mlx-gen-mage --test edit_real_weights
-          -- --ignored --nocapture
+        run: |
+          MAGE_EDIT_GOLDEN_NAME=mage_flow_edit_golden.safetensors \
+            cargo test --locked --release -p mlx-gen-mage --test edit_real_weights \
+            -- --ignored --nocapture
+          MAGE_EDIT_SNAPSHOT="$MAGE_EDIT_BASE_SNAPSHOT" \
+            MAGE_EDIT_GOLDEN_NAME=mage_flow_edit_base_golden.safetensors \
+            cargo test --locked --release -p mlx-gen-mage --test edit_real_weights \
+            fixed_instruction_edit_matches_the_torch_reference -- --ignored --nocapture
+          MAGE_EDIT_SNAPSHOT="$MAGE_EDIT_TURBO_SNAPSHOT" \
+            MAGE_EDIT_GOLDEN_NAME=mage_flow_edit_turbo_golden.safetensors \
+            cargo test --locked --release -p mlx-gen-mage --test edit_real_weights \
+            fixed_instruction_edit_matches_the_torch_reference -- --ignored --nocapture
       - name: Upload verified Mage edit oracle
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: mage-flow-edit-oracle-${{ github.sha }}
           path: |
             ${{ runner.temp }}/mage-flow-oracles/mage_flow_edit_golden.safetensors
+            ${{ runner.temp }}/mage-flow-oracles/mage_flow_edit_base_golden.safetensors
+            ${{ runner.temp }}/mage-flow-oracles/mage_flow_edit_turbo_golden.safetensors
             ${{ runner.temp }}/mage-flow-oracles/mage_edit_oracle_manifest.json
+            ${{ runner.temp }}/mage-flow-oracles/mage_edit_variants_manifest.json
           if-no-files-found: error
       - name: Upload Candle Mage acceptance oracles
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -133,7 +164,11 @@ jobs:
             ${{ runner.temp }}/mage-flow-oracles/mage_flow_dit_golden.safetensors
             ${{ runner.temp }}/mage-flow-oracles/mage_flow_vae_f32_1024.safetensors
             ${{ runner.temp }}/mage-flow-oracles/mage_flow_e2e_golden.safetensors
+            ${{ runner.temp }}/mage-flow-oracles/mage_flow_edit_golden.safetensors
+            ${{ runner.temp }}/mage-flow-oracles/mage_flow_edit_base_golden.safetensors
+            ${{ runner.temp }}/mage-flow-oracles/mage_flow_edit_turbo_golden.safetensors
             ${{ runner.temp }}/mage-flow-oracles/mage_oracles_manifest.json
+            ${{ runner.temp }}/mage-flow-oracles/mage_edit_variants_manifest.json
           if-no-files-found: error
 
   candle-audio:
@@ -308,6 +343,12 @@ jobs:
       # contain runner-local absolute paths, so the Windows CUDA runner needs its own snapshot.
       CANDLE_MAGE_SNAPSHOT: ${{ vars.CANDLE_MAGE_SNAPSHOT }}
       MAGE_SNAPSHOT: ${{ vars.CANDLE_MAGE_SNAPSHOT }}
+      CANDLE_MAGE_EDIT_SNAPSHOT: ${{ vars.CANDLE_MAGE_EDIT_SNAPSHOT }}
+      CANDLE_MAGE_EDIT_BASE_SNAPSHOT: ${{ vars.CANDLE_MAGE_EDIT_BASE_SNAPSHOT }}
+      CANDLE_MAGE_EDIT_TURBO_SNAPSHOT: ${{ vars.CANDLE_MAGE_EDIT_TURBO_SNAPSHOT }}
+      MAGE_EDIT_SNAPSHOT: ${{ vars.CANDLE_MAGE_EDIT_SNAPSHOT }}
+      MAGE_EDIT_BASE_SNAPSHOT: ${{ vars.CANDLE_MAGE_EDIT_BASE_SNAPSHOT }}
+      MAGE_EDIT_TURBO_SNAPSHOT: ${{ vars.CANDLE_MAGE_EDIT_TURBO_SNAPSHOT }}
       # Explicit operator-provided models root for the candle-gen real-weight resolvers that resolve
       # a repo-keyed snapshot (sc-13755); inference never self-fetches or derives a cache location.
       CANDLE_GEN_MODELS_ROOT: ${{ vars.CANDLE_GEN_MODELS_ROOT }}
@@ -337,6 +378,9 @@ jobs:
             echo Missing repository variable CANDLE_MAGE_SNAPSHOT for the Windows CUDA runner.
             exit /b 1
           )
+          if "%CANDLE_MAGE_EDIT_SNAPSHOT%"=="" exit /b 1
+          if "%CANDLE_MAGE_EDIT_BASE_SNAPSHOT%"=="" exit /b 1
+          if "%CANDLE_MAGE_EDIT_TURBO_SNAPSHOT%"=="" exit /b 1
           echo MAGE_GOLDEN_DIR=%RUNNER_TEMP%\mage-flow-oracles>>"%GITHUB_ENV%"
       - name: Materialize and verify immutable snapshot
         shell: cmd
@@ -345,6 +389,9 @@ jobs:
           set "PYTHONPATH=%RUNNER_TEMP%\huggingface-hub"
           python scripts/release/ensure_model_snapshot.py --model z-image-turbo --snapshot "%Z_IMAGE_SNAPSHOT%" || exit /b 1
           python scripts/release/ensure_model_snapshot.py --model mage-flow --snapshot "%CANDLE_MAGE_SNAPSHOT%" || exit /b 1
+          python scripts/release/ensure_model_snapshot.py --model mage-flow-edit --snapshot "%CANDLE_MAGE_EDIT_SNAPSHOT%" || exit /b 1
+          python scripts/release/ensure_model_snapshot.py --model mage-flow-edit-base --snapshot "%CANDLE_MAGE_EDIT_BASE_SNAPSHOT%" || exit /b 1
+          python scripts/release/ensure_model_snapshot.py --model mage-flow-edit-turbo --snapshot "%CANDLE_MAGE_EDIT_TURBO_SNAPSHOT%" || exit /b 1
       - name: Run provider conformance
         shell: cmd
         run: |
@@ -352,6 +399,7 @@ jobs:
           cargo test --locked -p candle-gen-z-image --features cuda --test conformance z_image_conformance -- --ignored --nocapture || exit /b 1
           cargo test --locked --release -p candle-gen-mage --features cuda --test real_parity -- --ignored --nocapture || exit /b 1
           cargo test --locked --release -p candle-gen-mage --features cuda --test cuda_1024 -- --ignored --nocapture || exit /b 1
+          cargo test --locked --release -p candle-gen-mage --features cuda --test edit_parity -- --ignored --nocapture || exit /b 1
 
   candle-sdxl:
     name: Candle SDXL real weights (CUDA)

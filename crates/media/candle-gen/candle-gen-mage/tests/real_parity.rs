@@ -189,3 +189,28 @@ fn mage_vae_1024_decode_matches_torch() {
         assert!(mean_rel <= 1.5e-3, "{output} mean_rel {mean_rel}");
     }
 }
+
+#[test]
+#[ignore = "needs MAGE_SNAPSHOT and MAGE_GOLDEN_DIR real Torch artifacts"]
+fn mage_vae_1024_encoder_moments_match_torch() {
+    let root = snapshot();
+    let device = test_device();
+    let model = MageVae::load_full_dtype(&component_dir(&root, "vae"), &device, DType::F32)
+        .expect("load full f32 Mage-VAE");
+    let golden = goldens("mage_flow_vae_f32_1024.safetensors", &device);
+    let moments = model
+        .encode_moments(require(&golden, "pixels"))
+        .expect("VAE encode moments");
+    for (label, got, want) in [
+        ("enc_mean", &moments.mean, require(&golden, "enc_mean")),
+        (
+            "enc_logvar",
+            &moments.logvar,
+            require(&golden, "enc_logvar"),
+        ),
+    ] {
+        let (max_abs, mean_rel) = stats(got, want);
+        assert!(max_abs <= 4.0e-2, "{label} max_abs {max_abs}");
+        assert!(mean_rel <= 2.0e-3, "{label} mean_rel {mean_rel}");
+    }
+}
