@@ -179,14 +179,22 @@ fn adaln_constant_folding_is_numerically_identical() {
     let folded = build(&w, shape, true);
     let unfolded = build(&w, shape, false);
     assert!(folded.is_adaln_folded(), "fold=true must fold");
+    assert!(
+        folded.is_decode_folded(),
+        "fold=true must fold DCT/zero RGB"
+    );
     assert!(!unfolded.is_adaln_folded(), "fold=false must not fold");
+    assert!(
+        !unfolded.is_decode_folded(),
+        "fold=false must retain the original projection"
+    );
 
     let a = folded.decode(&latent).unwrap();
     let b = unfolded.decode(&latent).unwrap();
     let err = max_abs(&a, &b);
-    assert_eq!(
-        err, 0.0,
-        "folded and unfolded decode must be bit-identical, got max_abs {err}"
+    assert!(
+        err < 1e-5,
+        "algebraically folded and unfolded decode differ by max_abs {err}"
     );
 }
 

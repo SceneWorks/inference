@@ -2,15 +2,15 @@
 //!
 //! Given the CoD conditioning `cond` at latent resolution and a `[B, 3, H, W]` noise tensor, it
 //! produces the decoded image in a single forward. `decode` always passes **zero** noise
-//! (`mage_vae.py:631`), which is preserved explicitly here rather than specialised away — the
-//! zeros are constructed and concatenated exactly where the reference's `proj1(x)` and
-//! `unfold(x)` would land, so the data flow stays comparable line-for-line with the reference.
+//! (`mage_vae.py:631`). Production folds those algebraic zeros and the fixed DCT contribution out
+//! of the large x-embedder input; [`DConvDenoiser::forward`] retains the literal reference path
+//! for folded-versus-unfolded parity and any future nonzero-noise caller.
 //!
 //! ```text
 //! s = s_embedder(noise, cond)                 → [B, h, w, 384]
 //! s = DiCoBlock ×21 (s, c)                    → [B, h, w, 384]      (adaLN folded at t = 0)
-//! x = unfold(noise, 16) ‖ y_embedder_x(cond)  → [B·L, 256, 35]
-//! x = x_embedder(x)                           → [B·L, 256, 32]      (per-patch DCT, max_freqs 8)
+//! x = y_embedder_x(cond)                      → [B·L, 256, 32]      (zero RGB omitted)
+//! x = x_embedder(x) + folded_DCT_bias         → [B·L, 256, 32]      (max_freqs 8)
 //! x = dec_net(x, s)                           → [B·L, 256, 32]      (SimpleMLPAdaLN ×3)
 //! x = final_layer(x)                          → [B·L, 256, 3]
 //! fold → [B, 3, H, W]
@@ -29,7 +29,7 @@
 use mlx_rs::ops::{add, concatenate_axis, multiply, split, zeros_dtype};
 use mlx_rs::{Array, Dtype};
 
-use mlx_gen::nn::{modulate, silu};
+use mlx_gen::nn::{linear, modulate, silu};
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 
@@ -102,27 +102,74 @@ impl BottleneckPatchEmbed {
         self.proj2
             .forward(&concatenate_axis(&[patched, cond_nhwc.clone()], -1)?)
     }
+
+    /// Decode-only specialization: `proj1` is unbiased, so all-zero RGB maps to exact zeros
+    /// without materializing or convolving the full-resolution image.
+    fn forward_zero_rgb(&self, cond_nhwc: &Array, patched_channels: i32) -> Result<Array> {
+        let sh = cond_nhwc.shape();
+        let patched = zeros_dtype(&[sh[0], sh[1], sh[2], patched_channels], cond_nhwc.dtype())?;
+        self.proj2
+            .forward(&concatenate_axis(&[patched, cond_nhwc.clone()], -1)?)
+    }
 }
 
 /// `NerfEmbedder` (`mage_vae.py:180-208`): concatenate a fixed per-patch DCT position code onto the
 /// per-pixel features and project.
 struct NerfEmbedder {
-    embedder: Linear,
+    // Retained for the general nonzero-noise path. The decode fold reduces activations; it does
+    // not claim to free this small 99-wide projection weight.
+    weight: Array,
+    bias: Array,
+    zero_rgb_weight: Option<Array>,
+    dct_bias: Option<Array>,
 }
 
 impl NerfEmbedder {
     fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
         Ok(Self {
-            embedder: Linear::from_weights(w, &format!("{prefix}.embedder.0"))?,
+            weight: w.require(&format!("{prefix}.embedder.0.weight"))?.clone(),
+            bias: w.require(&format!("{prefix}.embedder.0.bias"))?.clone(),
+            zero_rgb_weight: None,
+            dct_bias: None,
         })
     }
 
-    /// `[.., P², in]` → `[.., P², 32]`, with the DCT table appended along the last axis.
-    fn forward(&self, x: &Array, dct: &Array) -> Result<Array> {
-        let lead = x.shape()[0];
-        let dct = mlx_rs::ops::broadcast_to(dct, &[lead, dct.shape()[1], dct.shape()[2]])?;
-        self.embedder
-            .forward(&concatenate_axis(&[x.clone(), dct], -1)?)
+    /// Literal, unfused `[.., P², 99] → [.., P², 32]` projection.
+    fn forward_unfolded(&self, x: &Array) -> Result<Array> {
+        linear(x, &self.weight, &self.bias)
+    }
+
+    fn fold_zero_rgb_dct(&mut self, dct: &Array, dynamic_channels: i32) -> Result<()> {
+        let total = self.weight.shape()[1];
+        let dct_weight = self
+            .weight
+            .split_axis(&[dynamic_channels, total], 1)?
+            .swap_remove(1);
+        let zero_rgb_weight = self
+            .weight
+            .split_axis(&[3, dynamic_channels], 1)?
+            .swap_remove(1);
+        let dct_bias = linear(dct, &dct_weight, &self.bias)?;
+        mlx_rs::transforms::eval([&zero_rgb_weight, &dct_bias])?;
+        self.zero_rgb_weight = Some(zero_rgb_weight);
+        self.dct_bias = Some(dct_bias);
+        Ok(())
+    }
+
+    fn forward_zero_rgb(&self, y: &Array) -> Result<Array> {
+        linear(
+            y,
+            self.zero_rgb_weight
+                .as_ref()
+                .expect("decode fold must provide zero-RGB x_embedder weights"),
+            self.dct_bias
+                .as_ref()
+                .expect("decode fold must provide the DCT contribution"),
+        )
+    }
+
+    fn is_decode_folded(&self) -> bool {
+        self.zero_rgb_weight.is_some() && self.dct_bias.is_some()
     }
 }
 
@@ -311,12 +358,17 @@ impl DConvDenoiser {
         for block in &mut self.blocks {
             block.fold_adaln(&c)?;
         }
+        self.x_embedder
+            .fold_zero_rgb_dct(&self.dct, self.shape.in_channels + self.shape.hidden_x)?;
         Ok(())
     }
 
-    /// Whether every DiCo block has had its adaLN folded.
-    pub fn is_folded(&self) -> bool {
+    pub fn is_adaln_folded(&self) -> bool {
         self.blocks.iter().all(DiCoBlock::is_folded)
+    }
+
+    pub fn is_decode_folded(&self) -> bool {
+        self.x_embedder.is_decode_folded()
     }
 
     /// Each DiCo block's packed `[B, 6·hidden]` adaLN modulation at conditioning `c`, in block
@@ -325,20 +377,57 @@ impl DConvDenoiser {
         self.blocks.iter().map(|b| b.adaln_packed(c)).collect()
     }
 
+    fn per_pixel_y(&self, cond_nhwc: &Array, height: i32, width: i32) -> Result<Array> {
+        let sh = cond_nhwc.shape();
+        let (b, patch, hidden_x) = (sh[0], self.shape.patch, self.shape.hidden_x);
+        let (hl, wl) = (height / patch, width / patch);
+        let p2 = patch * patch;
+        self.y_embedder_x
+            .forward(cond_nhwc)?
+            .reshape(&[b, hl, wl, hidden_x, p2])?
+            .transpose_axes(&[0, 1, 2, 4, 3])?
+            .reshape(&[b * hl * wl, p2, hidden_x])
+            .map_err(Into::into)
+    }
+
+    /// The exact x-embedder input builder shared by production decode and its allocator A/B.
+    pub fn decode_x_embedder_input(
+        &self,
+        noise_nhwc: Option<&Array>,
+        height: i32,
+        width: i32,
+        cond_nhwc: &Array,
+    ) -> Result<Array> {
+        let y = self.per_pixel_y(cond_nhwc, height, width)?;
+        if self.is_decode_folded() {
+            return Ok(y);
+        }
+        let noise = noise_nhwc.ok_or_else(|| {
+            Error::Msg("unfolded Mage decode x-embedder input requires zero RGB".into())
+        })?;
+        let b = noise.shape()[0];
+        let patch = self.shape.patch;
+        let (hl, wl) = (height / patch, width / patch);
+        let p2 = patch * patch;
+        let unfolded = noise
+            .reshape(&[b, hl, patch, wl, patch, self.shape.in_channels])?
+            .transpose_axes(&[0, 1, 3, 2, 4, 5])?
+            .reshape(&[b * hl * wl, p2, self.shape.in_channels])?;
+        let dct = mlx_rs::ops::broadcast_to(
+            &self.dct,
+            &[b * hl * wl, self.dct.shape()[1], self.dct.shape()[2]],
+        )?;
+        concatenate_axis(&[unfolded, y, dct], -1).map_err(Into::into)
+    }
+
     /// `noise` NHWC `[B, H, W, 3]`, `cond` NHWC `[B, h, w, 384]`, `t` `[B]` → NHWC `[B, H, W, 3]`.
     pub fn forward(&self, noise_nhwc: &Array, t: &Array, cond_nhwc: &Array) -> Result<Array> {
         let sh = noise_nhwc.shape();
         let (b, height, width) = (sh[0], sh[1], sh[2]);
         let dtype = noise_nhwc.dtype();
-        let (patch, hidden, hidden_x, in_ch) = (
-            self.shape.patch,
-            self.shape.hidden,
-            self.shape.hidden_x,
-            self.shape.in_channels,
-        );
+        let (patch, hidden, in_ch) = (self.shape.patch, self.shape.hidden, self.shape.in_channels);
         let (hl, wl) = (height / patch, width / patch);
         let length = hl * wl;
-        let p2 = patch * patch;
 
         let c = self.conditioning(t, dtype)?;
 
@@ -360,27 +449,47 @@ impl DConvDenoiser {
         // taking `noise_nhwc`, and silently ignoring the argument would give any future caller
         // (an encode round-trip, or a multi-step use of the denoiser) a half-wrong answer with
         // nothing to notice.
-        let unfolded = noise_nhwc
-            .reshape(&[b, hl, patch, wl, patch, in_ch])?
-            .transpose_axes(&[0, 1, 3, 2, 4, 5])?
-            .reshape(&[b * length, p2, in_ch])?;
-
-        // FEATURE-major: `[B, h, w, 32·P²]` -> `[B, h, w, 32, P²]` -> `[B·L, P², 32]`
-        // (`mage_vae.py:503-504`).
-        let y = self
-            .y_embedder_x
-            .forward(cond_nhwc)?
-            .reshape(&[b, hl, wl, hidden_x, p2])?
-            .transpose_axes(&[0, 1, 2, 4, 3])?
-            .reshape(&[b * length, p2, hidden_x])?;
-
-        let x = concatenate_axis(&[unfolded, y], -1)?; // [B·L, P², 35]
-        let x = self.x_embedder.forward(&x, &self.dct)?; // [B·L, P², 32]
+        let x = self.decode_x_embedder_input(Some(noise_nhwc), height, width, cond_nhwc)?;
+        let x = self.x_embedder.forward_unfolded(&x)?; // [B·L, P², 32]
         let x = self.dec_net.forward(&x, &s)?;
         let x = self.final_layer.forward(&x)?; // [B·L, P², 3]
 
         // `fold` with kernel == stride is the exact inverse of `unfold` (no overlap accumulation):
         // [B·L, P², 3] -> [B, h, w, P, P, 3] -> [B, h, P, w, P, 3] -> [B, H, W, 3].
+        Ok(x.reshape(&[b, hl, wl, patch, patch, in_ch])?
+            .transpose_axes(&[0, 1, 3, 2, 4, 5])?
+            .reshape(&[b, height, width, in_ch])?)
+    }
+
+    /// Exact decode specialization: RGB is known zero and the fixed DCT contribution was folded
+    /// at construction time, so neither appears in the large per-pixel concatenation.
+    pub fn forward_zero_rgb(
+        &self,
+        height: i32,
+        width: i32,
+        t: &Array,
+        cond_nhwc: &Array,
+    ) -> Result<Array> {
+        let sh = cond_nhwc.shape();
+        let b = sh[0];
+        let (patch, hidden, in_ch) = (self.shape.patch, self.shape.hidden, self.shape.in_channels);
+        let (hl, wl) = (height / patch, width / patch);
+        let length = hl * wl;
+        let c = self.conditioning(t, cond_nhwc.dtype())?;
+
+        let mut s = self
+            .s_embedder
+            .forward_zero_rgb(cond_nhwc, self.shape.bottleneck)?;
+        for block in &self.blocks {
+            s = block.forward(&s, &c)?;
+        }
+        let s = s.reshape(&[b * length, hidden])?;
+
+        let input = self.decode_x_embedder_input(None, height, width, cond_nhwc)?;
+        let x = self.x_embedder.forward_zero_rgb(&input)?;
+        let x = self.dec_net.forward(&x, &s)?;
+        let x = self.final_layer.forward(&x)?;
+
         Ok(x.reshape(&[b, hl, wl, patch, patch, in_ch])?
             .transpose_axes(&[0, 1, 3, 2, 4, 5])?
             .reshape(&[b, height, width, in_ch])?)

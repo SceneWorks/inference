@@ -317,6 +317,10 @@ fn check_decode(
 fn decode_matches_the_torch_golden_at_every_geometry() {
     let v = vae(true);
     assert!(v.is_adaln_folded(), "production load must fold adaLN");
+    assert!(
+        v.is_decode_folded(),
+        "production load must fold DCT/zero RGB"
+    );
 
     let mut checked = 0;
     for &size in GEOMETRIES {
@@ -370,16 +374,19 @@ fn no_large_decode_corruption() {
 
     // Report MLX's own peak allocation across the decode. `ps`-style RSS does not see Metal's
     // unified buffers, so this is the figure sc-14046's fit gate / memory coefficients want. The
-    // dominant intermediate is the per-pixel stream: [B·L, P², in+hidden_x+max_freqs²] — at 2048
-    // that is 16384 × 256 × 99 f32 ≈ 1.66 GB, which is why it is worth having a number for.
+    // sc-14372 folds the fixed DCT and zero RGB lanes out of the former 99-wide per-pixel stream.
+    // Report the allocator peak anyway: it captures the whole decoder, including larger downstream
+    // MLP intermediates, and is the coefficient sc-14046's fit gate needs.
     // Peak only. `get_active_memory()` sampled here would read ~0 and print as if it were a
     // measurement: MLX loads weights lazily, so nothing is resident until the first `eval`.
     mlx_rs::memory::reset_peak_memory();
     let got = v.decode(&latent).unwrap();
     mlx_rs::transforms::eval([&got]).unwrap();
+    let peak_gb = mlx_rs::memory::get_peak_memory() as f64 / 1e9;
+    let megapixels = 2048.0_f64 * 2048.0 / 1e6;
     println!(
-        "{size} decode: peak {:.2} GB",
-        mlx_rs::memory::get_peak_memory() as f64 / 1e9
+        "{size} decode: peak {peak_gb:.2} GB ({:.3} GB/output-MP)",
+        peak_gb / megapixels
     );
 
     let report = corruption_report(&got, want);
@@ -718,11 +725,11 @@ fn corruption_probes_reject_a_seeded_defect() {
     assert!(why.contains("constant"), "wrong probe fired for (f): {why}");
 }
 
-/// Constant-folding adaLN at `t = 0` must be numerically identical on the **real** weights, not
-/// just the tiny fixture — the production path frees ~18.6M parameters on the strength of this.
+/// Constant-folded decode must remain numerically equivalent on the **real** weights. This covers
+/// both adaLN at `t = 0` and the algebraic fixed-DCT/zero-RGB x-embedder specialization.
 #[test]
 #[ignore = "needs real Mage-Flow vae/ weights"]
-fn adaln_folding_is_identical_on_real_weights() {
+fn decode_folding_matches_unfolded_real_weights() {
     let Some((_, g)) = best_golden("256") else {
         panic!("need a 256² golden for a latent to decode");
     };
@@ -731,13 +738,71 @@ fn adaln_folding_is_identical_on_real_weights() {
     let folded = vae(true);
     let unfolded = vae(false);
     assert!(folded.is_adaln_folded());
+    assert!(folded.is_decode_folded());
     assert!(!unfolded.is_adaln_folded());
+    assert!(!unfolded.is_decode_folded());
 
     let a = folded.decode(&latent).unwrap();
     let b = unfolded.decode(&latent).unwrap();
-    let err = max_abs(&a, &b);
-    println!("folded vs unfolded max_abs {err}");
-    assert_eq!(err, 0.0, "adaLN folding changed the decode by {err}");
+    let (mx, mn) = (max_abs(&a, &b), mean_abs(&a, &b));
+    println!("folded vs unfolded max_abs {mx} mean_abs {mn}");
+    assert!(mx < 3e-4, "decode folding changed max_abs by {mx}");
+    assert!(mn < 2e-5, "decode folding changed mean_abs by {mn}");
+}
+
+/// Same-process real-model allocator A/B for the exact 2048² x-embedder activation sc-14372
+/// removes. The instrumentation invokes the production activation builder on independently
+/// constructed folded/unfolded VAE instances; removing or misrouting the production fold therefore
+/// makes both shapes 99-wide and fails this test before the byte threshold.
+#[test]
+#[ignore = "needs real Mage-Flow vae/ weights + the 2048 golden"]
+fn decode_fold_reduces_2048_activation_peak() {
+    let Some((_, g)) = best_golden("2048") else {
+        panic!("need the 2048 golden for the allocator A/B");
+    };
+    let latent = g.require("enc_latent").unwrap().clone();
+    let dir = pick_vae_dir(&snapshot());
+    let mut w = Weights::from_dir(&dir).expect("read vae weights");
+    w.cast_all(Dtype::Float32).unwrap();
+
+    fn measure(w: &Weights, fold: bool, latent: &Array) -> (usize, Vec<i32>) {
+        let v = MageVae::from_weights(w, Dtype::Float32, fold).expect("build Mage-VAE");
+        assert_eq!(v.is_decode_folded(), fold, "wrong production decode path");
+        let cond = v.decode_conditioning_for_memory_test(latent).unwrap();
+        mlx_rs::transforms::eval([&cond]).unwrap();
+        let height = latent.shape()[2] * 16;
+        let width = latent.shape()[3] * 16;
+        mlx_rs::memory::clear_cache();
+        mlx_rs::memory::reset_peak_memory();
+        let baseline = mlx_rs::memory::get_active_memory();
+        let activation = v
+            .decode_x_embedder_input_for_memory_test(&cond, height, width)
+            .unwrap();
+        mlx_rs::transforms::eval([&activation]).unwrap();
+        let shape = activation.shape().to_vec();
+        let peak = mlx_rs::memory::get_peak_memory();
+        drop(activation);
+        drop(v);
+        mlx_rs::memory::clear_cache();
+        (peak.saturating_sub(baseline), shape)
+    }
+
+    let (folded_activation, folded_shape) = measure(&w, true, &latent);
+    let (unfolded_activation, unfolded_shape) = measure(&w, false, &latent);
+    assert_eq!(folded_shape, [16384, 256, 32]);
+    assert_eq!(unfolded_shape, [16384, 256, 99]);
+    let saved = unfolded_activation.saturating_sub(folded_activation);
+    println!(
+        "2048 x-embedder activation A/B: folded {:.3} GB; unfolded {:.3} GB; saved {:.3} GB",
+        folded_activation as f64 / 1e9,
+        unfolded_activation as f64 / 1e9,
+        saved as f64 / 1e9,
+    );
+    assert!(
+        saved > 500_000_000,
+        "DCT/zero-RGB fold saved only {:.3} GB of 2048 decode activation peak",
+        saved as f64 / 1e9
+    );
 }
 
 /// Decoding is deterministic and batch-invariant: the same latent decodes identically whether it
