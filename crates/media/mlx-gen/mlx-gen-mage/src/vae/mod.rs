@@ -110,14 +110,14 @@ pub struct MageVae {
 impl MageVae {
     /// Build the decode path from a `vae/diffusion_pytorch_model.safetensors` weight map.
     ///
-    /// `fold_adaln` constant-folds the 21 DiCo blocks' adaLN MLPs at `t = 0` and frees them
-    /// (~18.6M parameters on this path). It is `true` in production; the parity suite builds an
-    /// unfolded copy to prove the two agree.
-    pub fn from_weights(w: &Weights, dtype: Dtype, fold_adaln: bool) -> Result<Self> {
+    /// `fold_decode` folds the 21 DiCo blocks' adaLN MLPs at `t = 0`, the fixed DCT contribution,
+    /// and the decode-only zero-RGB lanes. It is `true` in production; the parity suite builds an
+    /// unfolded copy to prove the paths agree.
+    pub fn from_weights(w: &Weights, dtype: Dtype, fold_decode: bool) -> Result<Self> {
         Self::from_weights_with_shape(
             w,
             dtype,
-            fold_adaln,
+            fold_decode,
             MageVaeShape::PUBLISHED,
             DECODER_PREFIX,
         )
@@ -128,14 +128,14 @@ impl MageVae {
     pub fn from_weights_with_shape(
         w: &Weights,
         dtype: Dtype,
-        fold_adaln: bool,
+        fold_decode: bool,
         shape: MageVaeShape,
         prefix: &str,
     ) -> Result<Self> {
         let cod =
             CodDecoder::from_weights(w, &format!("{prefix}.y_embedder.decoder"), shape.attn_tile)?;
         let mut denoiser = DConvDenoiser::from_weights(w, prefix, shape)?;
-        if fold_adaln {
+        if fold_decode {
             denoiser.fold_adaln_at_zero(dtype)?;
         }
         Ok(Self {
@@ -153,12 +153,53 @@ impl MageVae {
 
     /// Whether the adaLN MLPs have been constant-folded away.
     pub fn is_adaln_folded(&self) -> bool {
-        self.denoiser.is_folded()
+        self.denoiser.is_adaln_folded()
+    }
+
+    /// Whether the fixed DCT contribution and zero-RGB lanes are folded out of decode.
+    pub fn is_decode_folded(&self) -> bool {
+        self.denoiser.is_decode_folded()
     }
 
     /// The dtype the codec runs in.
     pub fn dtype(&self) -> Dtype {
         self.dtype
+    }
+
+    /// Test instrumentation for the real decode x-embedder activation. This deliberately calls
+    /// the same builder as [`Self::decode`]; it exists so allocator regression tests can measure
+    /// the folded 32-wide versus literal 99-wide boundary before a later MLP masks the saving.
+    #[doc(hidden)]
+    pub fn decode_conditioning_for_memory_test(&self, z_nchw: &Array) -> Result<Array> {
+        let sh = z_nchw.shape();
+        if sh.len() != 4 || sh[1] != self.shape.bottleneck {
+            return Err(Error::Msg(format!(
+                "mage-vae x-embedder probe: expected [B, {}, h, w], got {sh:?}",
+                self.shape.bottleneck
+            )));
+        }
+        let z = z_nchw.transpose_axes(&[0, 2, 3, 1])?.as_dtype(self.dtype)?;
+        self.cod.forward(&z)
+    }
+
+    #[doc(hidden)]
+    pub fn decode_x_embedder_input_for_memory_test(
+        &self,
+        cond: &Array,
+        height: i32,
+        width: i32,
+    ) -> Result<Array> {
+        let b = cond.shape()[0];
+        let noise = if self.denoiser.is_decode_folded() {
+            None
+        } else {
+            Some(zeros_dtype(
+                &[b, height, width, self.shape.in_channels],
+                self.dtype,
+            )?)
+        };
+        self.denoiser
+            .decode_x_embedder_input(noise.as_ref(), height, width, cond)
     }
 
     /// Decode a `[B, 128, h, w]` NCHW latent to `[B, 3, h·16, w·16]` NCHW RGB in `[-1, 1]`
@@ -185,12 +226,17 @@ impl MageVae {
         let z = z_nchw.transpose_axes(&[0, 2, 3, 1])?.as_dtype(self.dtype)?; // NHWC
         let cond = self.cod.forward(&z)?;
 
-        let noise = zeros_dtype(
-            &[b, hl * scale, wl * scale, self.shape.in_channels],
-            self.dtype,
-        )?;
         let t = zeros_dtype(&[b], self.dtype)?;
-        let out = self.denoiser.forward(&noise, &t, &cond)?;
+        let out = if self.denoiser.is_decode_folded() {
+            self.denoiser
+                .forward_zero_rgb(hl * scale, wl * scale, &t, &cond)?
+        } else {
+            let noise = zeros_dtype(
+                &[b, hl * scale, wl * scale, self.shape.in_channels],
+                self.dtype,
+            )?;
+            self.denoiser.forward(&noise, &t, &cond)?
+        };
 
         Ok(out.transpose_axes(&[0, 3, 1, 2])?) // NCHW
     }
