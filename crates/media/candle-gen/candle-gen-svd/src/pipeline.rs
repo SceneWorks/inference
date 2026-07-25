@@ -401,18 +401,11 @@ mod tests {
     fn sequential_cfg_matches_batched_reference_and_cancels_between_branches() {
         let dev = Device::Cpu;
         let num_frames = 2;
-        let x_in = Tensor::zeros(
-            (1, num_frames, 4, 1, 1),
-            candle_gen::candle_core::DType::F32,
-            &dev,
-        )
-        .unwrap();
-        let image_latents = Tensor::ones(
-            (1, num_frames, 4, 1, 1),
-            candle_gen::candle_core::DType::F32,
-            &dev,
-        )
-        .unwrap();
+        let x_values = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let x_in = Tensor::from_vec(x_values.clone(), (1, num_frames, 4, 1, 1), &dev).unwrap();
+        let image_values = vec![11.0f32, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0, 18.0];
+        let image_latents =
+            Tensor::from_vec(image_values.clone(), (1, num_frames, 4, 1, 1), &dev).unwrap();
         let zeros_l = image_latents.zeros_like().unwrap();
         let image_embeds =
             Tensor::ones((1, 1, 2), candle_gen::candle_core::DType::F32, &dev).unwrap();
@@ -445,12 +438,27 @@ mod tests {
                 assert_eq!(embeds.dims3().unwrap(), (1, 1, 2));
                 let call = calls.get();
                 calls.set(call + 1);
+                assert_eq!(
+                    inp.narrow(2, 0, 4)?.flatten_all()?.to_vec1::<f32>()?,
+                    x_values,
+                    "the first four channels must remain the scaled noise latent"
+                );
+                let routed_image = inp.narrow(2, 4, 4)?.flatten_all()?.to_vec1::<f32>()?;
                 match call {
                     0 => {
+                        assert_eq!(
+                            routed_image,
+                            vec![0.0; image_values.len()],
+                            "uncond must receive zero image latents in channels 4..8"
+                        );
                         assert_eq!(embeds.sum_all()?.to_scalar::<f32>()?, 0.0);
                         Ok(uncond_pred.clone())
                     }
                     1 => {
+                        assert_eq!(
+                            routed_image, image_values,
+                            "cond must receive source-image latents in channels 4..8"
+                        );
                         assert_eq!(embeds.sum_all()?.to_scalar::<f32>()?, 2.0);
                         Ok(cond_pred.clone())
                     }
