@@ -55,6 +55,7 @@ pub struct SnapshotLayout {
     pub config: StableAudioConfig,
     pub kind: SnapshotKind,
     pub keys: KeyMapSummary,
+    pub text_keys: Option<TextWeightSummary>,
 }
 
 impl SnapshotLayout {
@@ -108,6 +109,10 @@ impl SnapshotLayout {
             };
 
         let keys = KeyMapSummary::inspect(&weights_path, kind)?;
+        let text_keys = text_weights_path
+            .as_deref()
+            .map(TextWeightSummary::inspect)
+            .transpose()?;
         Ok(Self {
             root: root.to_path_buf(),
             config_path,
@@ -119,6 +124,7 @@ impl SnapshotLayout {
             config,
             kind,
             keys,
+            text_keys,
         })
     }
 
@@ -128,7 +134,21 @@ impl SnapshotLayout {
     /// alive. The explicit snapshot contract makes that invariant the caller's responsibility.
     pub fn mmap_builders(
         &self,
-        dtype: DType,
+        root_dtype: DType,
+        device: &Device,
+    ) -> Result<StableAudioVarBuilders<'static>> {
+        self.mmap_builders_with_text_dtype(root_dtype, DType::BF16, device)
+    }
+
+    /// Mmap the F32 SA3 root and bundled text weights with independent compute dtypes.
+    ///
+    /// Shipped checkpoints use F32 root tensors and BF16 T5Gemma tensors. The ordinary
+    /// [`Self::mmap_builders`] path therefore fixes the text side to BF16; this explicit form exists
+    /// for tests and callers that need to state both sides.
+    pub fn mmap_builders_with_text_dtype(
+        &self,
+        root_dtype: DType,
+        text_dtype: DType,
         device: &Device,
     ) -> Result<StableAudioVarBuilders<'static>> {
         // Safety: the API contract above requires a caller-provisioned immutable snapshot. The
@@ -136,7 +156,7 @@ impl SnapshotLayout {
         let root = unsafe {
             VarBuilder::from_mmaped_safetensors(
                 std::slice::from_ref(&self.weights_path),
-                dtype,
+                root_dtype,
                 device,
             )?
         };
@@ -144,7 +164,11 @@ impl SnapshotLayout {
             Some(path) => {
                 // Safety: same immutable-snapshot invariant as the root checkpoint.
                 Some(unsafe {
-                    VarBuilder::from_mmaped_safetensors(std::slice::from_ref(path), dtype, device)?
+                    VarBuilder::from_mmaped_safetensors(
+                        std::slice::from_ref(path),
+                        text_dtype,
+                        device,
+                    )?
                 })
             }
             None => None,
@@ -168,6 +192,100 @@ impl SnapshotLayout {
                 text_encoder: None,
             },
         })
+    }
+}
+
+/// Exact bundled T5Gemma safetensors inventory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextWeightSummary {
+    pub total: usize,
+    pub encoder: usize,
+    pub decoder: usize,
+    pub encoder_params: usize,
+    pub decoder_params: usize,
+}
+
+impl TextWeightSummary {
+    pub const TOTAL: usize = 340;
+    pub const ENCODER: usize = 134;
+    pub const DECODER: usize = 206;
+    pub const ENCODER_PARAMS: usize = 281_580_288;
+    pub const DECODER_PARAMS: usize = 309_910_272;
+
+    pub fn inspect(path: &Path) -> Result<Self> {
+        let entries = safetensors_header(path)?;
+        let expected: std::collections::BTreeSet<_> =
+            crate::t5gemma::encoder_weight_keys().into_iter().collect();
+        let mut actual_encoder = std::collections::BTreeSet::new();
+        let mut summary = Self {
+            total: 0,
+            encoder: 0,
+            decoder: 0,
+            encoder_params: 0,
+            decoder_params: 0,
+        };
+        for (key, value) in entries {
+            if key == "__metadata__" {
+                continue;
+            }
+            summary.total += 1;
+            let dtype = value
+                .get("dtype")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if dtype != "BF16" {
+                return Err(AudioError::Msg(format!(
+                    "{} tensor {key} has dtype {dtype}, expected BF16",
+                    path.display()
+                )));
+            }
+            let shape = value
+                .get("shape")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| {
+                    AudioError::Msg(format!("{} tensor {key} has no shape", path.display()))
+                })?;
+            let params = shape.iter().try_fold(1usize, |acc, dim| {
+                let dim = dim.as_u64().ok_or_else(|| {
+                    AudioError::Msg(format!("{} tensor {key} has invalid shape", path.display()))
+                })?;
+                let dim: usize = dim.try_into().map_err(|_| {
+                    AudioError::Msg(format!("{} tensor {key} shape overflows", path.display()))
+                })?;
+                acc.checked_mul(dim).ok_or_else(|| {
+                    AudioError::Msg(format!(
+                        "{} tensor {key} parameter count overflows",
+                        path.display()
+                    ))
+                })
+            })?;
+            if key.starts_with("model.encoder.") {
+                summary.encoder += 1;
+                summary.encoder_params += params;
+                actual_encoder.insert(key);
+            } else if key.starts_with("model.decoder.") {
+                summary.decoder += 1;
+                summary.decoder_params += params;
+            } else {
+                return Err(AudioError::Msg(format!(
+                    "{} has unexpected T5Gemma tensor {key}",
+                    path.display()
+                )));
+            }
+        }
+        if actual_encoder != expected
+            || summary.total != Self::TOTAL
+            || summary.encoder != Self::ENCODER
+            || summary.decoder != Self::DECODER
+            || summary.encoder_params != Self::ENCODER_PARAMS
+            || summary.decoder_params != Self::DECODER_PARAMS
+        {
+            return Err(AudioError::Msg(format!(
+                "{} T5Gemma inventory mismatch: {summary:?}",
+                path.display()
+            )));
+        }
+        Ok(summary)
     }
 }
 
@@ -287,6 +405,17 @@ impl KeyMapSummary {
 
 /// Read only the safetensors header and return its tensor keys.
 pub fn safetensors_keys(path: &Path) -> Result<Vec<String>> {
+    let object = safetensors_header(path)?;
+    let mut keys: Vec<String> = object
+        .into_iter()
+        .map(|(key, _)| key)
+        .filter(|key| key != "__metadata__")
+        .collect();
+    keys.sort();
+    Ok(keys)
+}
+
+fn safetensors_header(path: &Path) -> Result<serde_json::Map<String, serde_json::Value>> {
     let mut file =
         File::open(path).map_err(|e| AudioError::Msg(format!("open {}: {e}", path.display())))?;
     let mut len_bytes = [0_u8; 8];
@@ -313,15 +442,8 @@ pub fn safetensors_keys(path: &Path) -> Result<Vec<String>> {
     let mut header = vec![0_u8; header_len];
     file.read_exact(&mut header)
         .map_err(|e| AudioError::Msg(format!("read {} header: {e}", path.display())))?;
-    let object: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(&header)
-        .map_err(|e| AudioError::Msg(format!("parse {} header: {e}", path.display())))?;
-    let mut keys: Vec<String> = object
-        .into_iter()
-        .map(|(key, _)| key)
-        .filter(|key| key != "__metadata__")
-        .collect();
-    keys.sort();
-    Ok(keys)
+    serde_json::from_slice(&header)
+        .map_err(|e| AudioError::Msg(format!("parse {} header: {e}", path.display())))
 }
 
 #[cfg(test)]
