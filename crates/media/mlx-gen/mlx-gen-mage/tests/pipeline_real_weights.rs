@@ -49,7 +49,7 @@ fn public_pipeline_matches_the_torch_render() {
 
     // The oracle is torch-bf16 on CPU; the port is MLX-bf16 on Metal. The isolated step-zero DiT
     // gate measures 2.0741% mean-relative between those backends. CFG=5 then feeds that residual
-    // back through four nonlinear forwards, so final-token equality is not a valid gate.
+    // back through nonlinear forwards, so final-token equality is not a valid gate.
     //
     // Mutation measurements against this exact golden (256², 4 steps):
     // faithful:       step1 .008032, final .156555, image .04088 mean-relative
@@ -57,10 +57,17 @@ fn public_pipeline_matches_the_torch_render() {
     // GS key + 1:     step0 .994330, step1 1.012730, final 1.161042, image .42842
     // pre-add bf16:   step1 .008032, final .155926, image .04053
     //
-    // Thus the early trajectory and image mean discriminate semantic mistakes, while the
-    // scheduler cast-order mutation is explicitly NOT separable through this cross-backend
-    // four-step oracle. Source fidelity for that operation is covered by the unit-level scheduler
-    // contract, not by pretending the chaotic final latent supplies a tighter answer.
+    // The release 1024²/20-step CPU-oracle calibration is deterministic across repeated faithful
+    // Metal runs:
+    // faithful:       step1 .001308, final .367797, image .06577 mean-relative
+    // swapped CFG:    step1 .024629, final 1.182307, image .72362
+    // static shift 1: step1 .077033, final .595555, image .16303
+    // GS key + 1:     step0 .998221, step1 1.000689, final 1.133249, image .32631
+    //
+    // Thus the early trajectory and image means discriminate every strong semantic mutation. The
+    // final-latent gate is placed at .45: 8.2 points above the repeatable faithful value and 14.5
+    // below the nearest meaningful wrong mutation. Scheduler construction, CFG arithmetic, and
+    // Euler cast-order mutations also have direct unit contracts below the real-weight boundary.
     let mut failures = Vec::new();
     for (label, actual, expected, max_abs_gate, mean_rel_gate) in [
         (
@@ -82,14 +89,14 @@ fn public_pipeline_matches_the_torch_render() {
             &trace.final_tokens,
             golden.require("final_tokens").unwrap(),
             8.0,
-            0.30,
+            0.45,
         ),
         (
             "final_latent",
             &trace.final_latent,
             golden.require("final_latent").unwrap(),
             8.0,
-            0.30,
+            0.45,
         ),
     ] {
         let (max_abs, _, mean_rel) = error(actual, expected);

@@ -12,7 +12,8 @@
 //! - **Packing.** Latents flatten to a variable-length token sequence (`patch_size == 1`) and are
 //!   packed under a fixed budget with per-sample cumulative offsets (`cu_seqlens`) instead of
 //!   block-diagonal masks. Sides must be multiples of
-//!   [`SIZE_MULTIPLE`]; the native range is [`MIN_SIZE`]–[`MAX_SIZE`] per side.
+//!   [`SIZE_MULTIPLE`]; the native range is
+//!   [`MIN_SIZE`](crate::config::MIN_SIZE)–[`MAX_SIZE`](crate::config::MAX_SIZE) per side.
 //! - **CFG.** `use_neg = cfg > 1.0` (`:326`, `:535`): at cfg ≤ 1 the reference builds **no**
 //!   unconditional branch at all — one segment, one `cu_seqlens` pair, positive conditioning only.
 //!   Both Turbo variants default there, so the CFG-off path is a first-class case, not an edge one.
@@ -190,10 +191,26 @@ pub fn mage_flow_sigmas(steps: usize) -> Result<Vec<f32>> {
             "mage_flow: steps must be greater than zero".into(),
         ));
     }
+    // Match ATen's endpoint-aware f32 linspace fill before applying Diffusers' f32 static shift.
+    // A one-direction `start + i*step` accumulates several one-ULP errors late in the 20-step
+    // ladder, which feed back through every subsequent nonlinear DiT call.
     let n = steps as f32;
+    let start = 1.0f32;
+    let end = 1.0 / n;
+    let step = if steps > 1 {
+        (end - start) / (steps - 1) as f32
+    } else {
+        0.0
+    };
     let mut sigmas = (0..steps)
         .map(|i| {
-            let s = 1.0 - i as f32 * ((1.0 - 1.0 / n) / (n - 1.0).max(1.0));
+            // ATen fills from the nearer endpoint on each half, avoiding the extra endpoint error
+            // a one-direction `start + i*step` accumulates.
+            let s = if i < steps / 2 {
+                step.mul_add(i as f32, start)
+            } else {
+                (-step).mul_add((steps - i - 1) as f32, end)
+            };
             STATIC_SHIFT * s / (1.0 + (STATIC_SHIFT - 1.0) * s)
         })
         .collect::<Vec<_>>();
@@ -420,11 +437,15 @@ mod tests {
     #[test]
     fn exact_twenty_step_static_shift_schedule() {
         let s = mage_flow_sigmas(20).unwrap();
-        assert_eq!(s.len(), 21);
-        assert_eq!(s[0], 1.0);
-        assert!((s[1] - 0.99130434).abs() < 1e-6);
-        assert!((s[19] - 0.24).abs() < 1e-6);
-        assert_eq!(s[20], 0.0);
+        assert_eq!(
+            s,
+            vec![
+                1.0, 0.99130434, 0.98181814, 0.97142863, 0.96000004, 0.94736844, 0.9333333,
+                0.917647, 0.90000004, 0.88000005, 0.85714287, 0.83076924, 0.8, 0.76363635, 0.72,
+                0.6666667, 0.6, 0.51428574, 0.4, 0.24000001, 0.0,
+            ],
+            "every sigma must match the torch/diffusers CPU oracle bit-for-bit"
+        );
         assert!(s.windows(2).all(|w| w[0] > w[1]));
     }
 
