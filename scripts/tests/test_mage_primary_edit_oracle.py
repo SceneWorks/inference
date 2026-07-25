@@ -153,6 +153,7 @@ class MagePrimaryEditOracleTests(unittest.TestCase):
             ("vaeGeometries", ["256"]),
             ("referenceEnvironment", {}),
             ("generationSeconds", float("nan")),
+            ("generationSeconds", True),
         ):
             document = self.manifest()
             document[key] = value
@@ -166,6 +167,9 @@ class MagePrimaryEditOracleTests(unittest.TestCase):
         wrong_size = self.manifest()
         wrong_size["files"][0]["bytes"] = 0
         mutations.append(wrong_size)
+        bool_size = self.manifest()
+        bool_size["files"][0]["bytes"] = True
+        mutations.append(bool_size)
         for document in mutations:
             with self.assertRaises(self.module.InvalidOracle):
                 self.module._validate_manifest_header(
@@ -213,6 +217,7 @@ class MagePrimaryEditOracleTests(unittest.TestCase):
             self.module._validate_manifest_file_record(record, path)
             for key, value in (
                 ("bytes", record["bytes"] + 1),
+                ("bytes", True),
                 ("sha256", "0" * 64),
             ):
                 mutated = dict(record)
@@ -276,6 +281,47 @@ class MagePrimaryEditOracleTests(unittest.TestCase):
                 self.assertRaises(self.module.InvalidOracle),
             ):
                 self.module._validate_finite_tensors(path)
+
+    def test_producer_environment_rejects_hostile_ambient_mage_inputs(self) -> None:
+        output = Path("/tmp/oracles")
+        snapshot = Path("/tmp/gen")
+        edit_snapshot = Path("/tmp/edit")
+        hostile = {
+            "MAGE_EDIT_REF": "/tmp/hostile/dog.jpg",
+            "MAGE_PROMPT": "hostile prompt",
+            "MAGE_SEED": "999",
+            "MAGE_ATTN": "flash2",
+            "PATH": "/trusted/bin",
+        }
+        with mock.patch.dict(self.module.os.environ, hostile, clear=True):
+            env = self.module._producer_environment(output, snapshot, edit_snapshot)
+        self.assertEqual(env["MAGE_EDIT_REF"], str(self.module.CANONICAL_EDIT_REF))
+        self.assertEqual(env["MAGE_PROMPT"], self.module.PROMPT)
+        self.assertEqual(env["MAGE_SEED"], "42")
+        self.assertEqual(env["MAGE_ATTN"], "sdpa")
+        self.assertEqual(env["PATH"], "/trusted/bin")
+        self.assertEqual(
+            {key for key in env if key.startswith("MAGE_")},
+            {
+                "MAGE_DEVICE",
+                "MAGE_ATTN",
+                "MAGE_SNAPSHOT",
+                "MAGE_EDIT_SNAPSHOT",
+                "MAGE_GOLDEN_DIR",
+                "MAGE_PROMPT",
+                "MAGE_NEG",
+                "MAGE_EDIT_INSTRUCTION",
+                "MAGE_EDIT_REF",
+                "MAGE_SEED",
+                "MAGE_H",
+                "MAGE_W",
+                "MAGE_STEPS",
+                "MAGE_EDIT_STEPS",
+                "MAGE_CFG",
+                "MAGE_GS_KEY",
+                "MAGE_VAE_SIZES",
+            },
+        )
 
 
 if __name__ == "__main__":

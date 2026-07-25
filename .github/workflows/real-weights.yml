@@ -100,7 +100,7 @@ jobs:
             fi
             printf '%s' "$revision"
           }
-          producer="${{ hashFiles('.github/workflows/real-weights.yml', 'crates/media/mlx-gen/_vendor/mage_flow/**', 'crates/media/mlx-gen/_vendor/mage_flow/requirements-oracles.txt', 'crates/media/mlx-gen/tools/_paths.py', 'crates/media/mlx-gen/tools/dump_mage_flow_golden.py', 'crates/media/mlx-gen/tools/dump_mage_vae_sizes.py', 'scripts/release/provision_mage_oracles.py', 'scripts/release/provision_mage_edit_variants.py', 'scripts/release/verify_mage_candle_oracles.py') }}"
+          producer="${{ hashFiles('.github/workflows/real-weights.yml', 'crates/media/mlx-gen/_vendor/mage_flow/**', 'crates/media/mlx-gen/_vendor/mage_flow/assets/dog.jpg', 'crates/media/mlx-gen/_vendor/mage_flow/requirements-oracles.txt', 'crates/media/mlx-gen/tools/_paths.py', 'crates/media/mlx-gen/tools/dump_mage_flow_golden.py', 'crates/media/mlx-gen/tools/dump_mage_vae_sizes.py', 'scripts/release/provision_mage_oracles.py', 'scripts/release/provision_mage_edit_variants.py', 'scripts/release/verify_mage_candle_oracles.py', 'scripts/release/verify_mage_candle_transfer.py') }}"
           if [[ ! "$producer" =~ ^[0-9a-f]{64}$ ]]; then
             echo "Oracle producer fingerprint is missing or malformed: $producer" >&2
             exit 1
@@ -140,7 +140,11 @@ jobs:
         if: steps.mage-oracle-cache.outputs.cache-hit != 'true'
         run: |
           cd crates/media/mlx-gen
-          MAGE_DEVICE=cpu MAGE_H=1024 MAGE_W=1024 MAGE_STEPS=20 \
+          MAGE_DEVICE=cpu MAGE_ATTN=sdpa MAGE_H=1024 MAGE_W=1024 MAGE_STEPS=20 \
+            MAGE_EDIT_STEPS=30 MAGE_CFG=5.0 MAGE_SEED=42 MAGE_GS_KEY=20260720 \
+            MAGE_PROMPT='a calico kitten sitting on a wooden windowsill beside a blue ceramic mug' \
+            MAGE_NEG=' ' MAGE_EDIT_INSTRUCTION='Replace the background with a field of sunflowers' \
+            MAGE_EDIT_REF="$PWD/_vendor/mage_flow/assets/dog.jpg" \
             MAGE_GOLDEN_DIR="$MAGE_GOLDEN_DIR" PYTHONPATH="$PWD/_vendor" \
             "$RUNNER_TEMP/mage-reference/bin/python" \
             tools/dump_mage_flow_golden.py --stage dit
@@ -148,6 +152,14 @@ jobs:
             ../../../scripts/release/verify_mage_candle_oracles.py \
             --snapshot "$MAGE_SNAPSHOT" \
             --edit-snapshot "$MAGE_EDIT_SNAPSHOT" \
+            --output "$MAGE_GOLDEN_DIR" \
+            --write-manifest
+          "$RUNNER_TEMP/mage-reference/bin/python" \
+            ../../../scripts/release/verify_mage_candle_transfer.py \
+            --gen "$MAGE_SNAPSHOT" \
+            --edit "$MAGE_EDIT_SNAPSHOT" \
+            --edit-base "$MAGE_EDIT_BASE_SNAPSHOT" \
+            --edit-turbo "$MAGE_EDIT_TURBO_SNAPSHOT" \
             --output "$MAGE_GOLDEN_DIR" \
             --write-manifest
       - name: Verify restored or generated Mage oracle cache
@@ -182,6 +194,13 @@ jobs:
             scripts/release/verify_mage_candle_oracles.py \
             --snapshot "$MAGE_SNAPSHOT" \
             --edit-snapshot "$MAGE_EDIT_SNAPSHOT" \
+            --output "$MAGE_GOLDEN_DIR"
+          "$RUNNER_TEMP/mage-reference/bin/python" \
+            scripts/release/verify_mage_candle_transfer.py \
+            --gen "$MAGE_SNAPSHOT" \
+            --edit "$MAGE_EDIT_SNAPSHOT" \
+            --edit-base "$MAGE_EDIT_BASE_SNAPSHOT" \
+            --edit-turbo "$MAGE_EDIT_TURBO_SNAPSHOT" \
             --output "$MAGE_GOLDEN_DIR"
           echo "MAGE_FLOW_TE_GOLDEN=$MAGE_GOLDEN_DIR/mage_flow_te_golden.safetensors" >> "$GITHUB_ENV"
       - name: Save verified Mage oracle cache
@@ -243,9 +262,10 @@ jobs:
             ${{ runner.temp }}/mage-flow-oracles/mage_flow_edit_golden.safetensors
             ${{ runner.temp }}/mage-flow-oracles/mage_flow_edit_base_golden.safetensors
             ${{ runner.temp }}/mage-flow-oracles/mage_flow_edit_turbo_golden.safetensors
-            ${{ runner.temp }}/mage-flow-oracles/mage_oracles_manifest.json
+            ${{ runner.temp }}/mage-flow-oracles/mage_edit_oracle_manifest.json
             ${{ runner.temp }}/mage-flow-oracles/mage_edit_variants_manifest.json
             ${{ runner.temp }}/mage-flow-oracles/mage_candle_oracles_manifest.json
+            ${{ runner.temp }}/mage-flow-oracles/mage_candle_transfer_manifest.json
           if-no-files-found: error
 
   candle-audio:
@@ -469,6 +489,15 @@ jobs:
           python scripts/release/ensure_model_snapshot.py --model mage-flow-edit --snapshot "%CANDLE_MAGE_EDIT_SNAPSHOT%" || exit /b 1
           python scripts/release/ensure_model_snapshot.py --model mage-flow-edit-base --snapshot "%CANDLE_MAGE_EDIT_BASE_SNAPSHOT%" || exit /b 1
           python scripts/release/ensure_model_snapshot.py --model mage-flow-edit-turbo --snapshot "%CANDLE_MAGE_EDIT_TURBO_SNAPSHOT%" || exit /b 1
+      - name: Verify transferred Candle Mage acceptance oracles
+        shell: cmd
+        run: |
+          python scripts/release/verify_mage_candle_transfer.py --gen "%CANDLE_MAGE_SNAPSHOT%" --edit "%CANDLE_MAGE_EDIT_SNAPSHOT%" --edit-base "%CANDLE_MAGE_EDIT_BASE_SNAPSHOT%" --edit-turbo "%CANDLE_MAGE_EDIT_TURBO_SNAPSHOT%" --output "%MAGE_GOLDEN_DIR%" || exit /b 1
+          python -m pip install --disable-pip-version-check --only-binary=:all: --target "%RUNNER_TEMP%\mage-oracle-verify" "numpy==2.4.3" "safetensors==0.8.0" || exit /b 1
+          set "PYTHONPATH=%RUNNER_TEMP%\mage-oracle-verify"
+          python scripts/release/provision_mage_oracles.py --snapshot "%CANDLE_MAGE_SNAPSHOT%" --edit-snapshot "%CANDLE_MAGE_EDIT_SNAPSHOT%" --output "%MAGE_GOLDEN_DIR%" --verify-edit-artifact || exit /b 1
+          python scripts/release/provision_mage_edit_variants.py --gen "%CANDLE_MAGE_SNAPSHOT%" --edit "%CANDLE_MAGE_EDIT_SNAPSHOT%" --edit-base "%CANDLE_MAGE_EDIT_BASE_SNAPSHOT%" --edit-turbo "%CANDLE_MAGE_EDIT_TURBO_SNAPSHOT%" --output "%MAGE_GOLDEN_DIR%" --verify-only || exit /b 1
+          python scripts/release/verify_mage_candle_oracles.py --snapshot "%CANDLE_MAGE_SNAPSHOT%" --edit-snapshot "%CANDLE_MAGE_EDIT_SNAPSHOT%" --output "%MAGE_GOLDEN_DIR%" || exit /b 1
       - name: Run provider conformance
         shell: cmd
         run: |

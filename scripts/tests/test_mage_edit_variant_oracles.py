@@ -181,6 +181,29 @@ class MageEditVariantOracleTests(unittest.TestCase):
             ],
         )
 
+    def test_producer_environment_rejects_hostile_ambient_mage_inputs(self) -> None:
+        hostile = {
+            "MAGE_EDIT_REF": "/tmp/hostile/dog.jpg",
+            "MAGE_PROMPT": "hostile prompt",
+            "MAGE_CFG": "999",
+            "MAGE_ATTN": "flash2",
+            "PATH": "/trusted/bin",
+        }
+        with mock.patch.dict(self.module.os.environ, hostile, clear=True):
+            env = self.module.producer_environment(
+                self.output,
+                self.gen_snapshot,
+                self.snapshots["edit-base"],
+                30,
+                5.0,
+            )
+        self.assertEqual(env["MAGE_EDIT_REF"], str(self.module.CANONICAL_EDIT_REF))
+        self.assertEqual(env["MAGE_PROMPT"], self.module.PROMPT)
+        self.assertEqual(env["MAGE_CFG"], "5.0")
+        self.assertEqual(env["MAGE_ATTN"], "sdpa")
+        self.assertEqual(env["PATH"], "/trusted/bin")
+        self.assertNotIn("/tmp/hostile/dog.jpg", env.values())
+
     def test_verify_only_rejects_revision_geometry_cfg_or_hash_manifest_drift(self) -> None:
         manifest = self.manifest()
         manifest["files"][1]["sha256"] = "stale"

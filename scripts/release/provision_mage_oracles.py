@@ -21,6 +21,7 @@ from safetensors import safe_open
 
 ROOT = Path(__file__).resolve().parents[2]
 MLX = ROOT / "crates/media/mlx-gen"
+CANONICAL_EDIT_REF = MLX / "_vendor/mage_flow/assets/dog.jpg"
 GEOMETRIES = ("256", "992", "1024", "2048", "512x2048", "768x1280", "768x1152")
 TE_FILE = "mage_flow_te_golden.safetensors"
 EDIT_FILE = "mage_flow_edit_golden.safetensors"
@@ -106,6 +107,38 @@ REFERENCE_PYTHON = (3, 12, 10)
 
 class InvalidOracle(RuntimeError):
     pass
+
+
+def _producer_environment(
+    output: Path, snapshot: Path, edit_snapshot: Path
+) -> dict[str, str]:
+    """Return a deterministic producer environment with no ambient MAGE_* inputs."""
+    if not CANONICAL_EDIT_REF.is_file():
+        raise InvalidOracle(f"canonical Mage edit reference is missing: {CANONICAL_EDIT_REF}")
+    env = {key: value for key, value in os.environ.items() if not key.startswith("MAGE_")}
+    env.update(
+        {
+            "MAGE_DEVICE": "cpu",
+            "MAGE_ATTN": "sdpa",
+            "MAGE_SNAPSHOT": str(snapshot),
+            "MAGE_EDIT_SNAPSHOT": str(edit_snapshot),
+            "MAGE_GOLDEN_DIR": str(output),
+            "MAGE_PROMPT": PROMPT,
+            "MAGE_NEG": " ",
+            "MAGE_EDIT_INSTRUCTION": EDIT_INSTRUCTION,
+            "MAGE_EDIT_REF": str(CANONICAL_EDIT_REF),
+            "MAGE_SEED": "42",
+            "MAGE_H": "256",
+            "MAGE_W": "256",
+            "MAGE_STEPS": "4",
+            "MAGE_EDIT_STEPS": "30",
+            "MAGE_CFG": "5.0",
+            "MAGE_GS_KEY": "20260720",
+            "MAGE_VAE_SIZES": ",".join(GEOMETRIES),
+            "PYTHONPATH": str(MLX / "_vendor"),
+        }
+    )
+    return env
 
 
 def _validate_python_version(version: tuple[int, int, int]) -> None:
@@ -239,14 +272,14 @@ def _validate_manifest_header(
         or document.get("device") != "cpu"
         or document.get("vaeGeometries") != list(GEOMETRIES)
         or document.get("referenceEnvironment") != REFERENCE_PACKAGES
-        or not isinstance(seconds, (int, float))
+        or type(seconds) not in (int, float)
         or not math.isfinite(float(seconds))
         or float(seconds) < 0.0
         or not isinstance(records, list)
         or any(
             not isinstance(record, dict)
             or set(record) != {"name", "bytes", "sha256"}
-            or not isinstance(record.get("bytes"), int)
+            or type(record.get("bytes")) is not int
             or record["bytes"] <= 0
             or re.fullmatch(r"[0-9a-f]{64}", record.get("sha256", "")) is None
             for record in records
@@ -259,7 +292,11 @@ def _validate_manifest_header(
 
 
 def _validate_manifest_file_record(record: dict, path: Path) -> None:
-    if record.get("sha256") != _sha256(path) or record.get("bytes") != path.stat().st_size:
+    if (
+        type(record.get("bytes")) is not int
+        or record.get("sha256") != _sha256(path)
+        or record["bytes"] != path.stat().st_size
+    ):
         raise InvalidOracle(f"{path.name} hash/size differs from the manifest")
 
 
@@ -503,15 +540,7 @@ def provision(output: Path, snapshot: Path, edit_snapshot: Path) -> None:
     output.mkdir(parents=True, exist_ok=True)
     for name in (*EXPECTED_FILES, MANIFEST, EDIT_MANIFEST):
         (output / name).unlink(missing_ok=True)
-    env = {
-        **os.environ,
-        "MAGE_DEVICE": "cpu",
-        "MAGE_SNAPSHOT": str(snapshot),
-        "MAGE_EDIT_SNAPSHOT": str(edit_snapshot),
-        "MAGE_GOLDEN_DIR": str(output),
-        "MAGE_VAE_SIZES": ",".join(GEOMETRIES),
-        "PYTHONPATH": str(MLX / "_vendor"),
-    }
+    env = _producer_environment(output, snapshot, edit_snapshot)
     started = time.monotonic()
     subprocess.run(
         [sys.executable, str(MLX / "tools/dump_mage_flow_golden.py"), "--stage", "te"],

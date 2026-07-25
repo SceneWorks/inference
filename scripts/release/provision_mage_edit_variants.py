@@ -20,6 +20,7 @@ from safetensors import safe_open
 
 ROOT = Path(__file__).resolve().parents[2]
 MLX = ROOT / "crates/media/mlx-gen"
+CANONICAL_EDIT_REF = MLX / "_vendor/mage_flow/assets/dog.jpg"
 CASES = (
     ("edit", "mage_flow_edit_golden.safetensors", 30, 5.0),
     ("edit-base", "mage_flow_edit_base_golden.safetensors", 30, 5.0),
@@ -29,6 +30,37 @@ REVISION_MARKER = ".sceneworks-model-revision"
 PROMPT = "a calico kitten sitting on a wooden windowsill beside a blue ceramic mug"
 EDIT_INSTRUCTION = "Replace the background with a field of sunflowers"
 REFERENCE = "microsoft/Mage @ _vendor/mage_flow (see VENDORED.md)"
+
+
+def producer_environment(
+    output: Path, generation_snapshot: Path, edit_snapshot: Path, steps: int, cfg: float
+) -> dict[str, str]:
+    """Return a deterministic producer environment with no ambient MAGE_* inputs."""
+    if not CANONICAL_EDIT_REF.is_file():
+        raise RuntimeError(f"canonical Mage edit reference is missing: {CANONICAL_EDIT_REF}")
+    env = {key: value for key, value in os.environ.items() if not key.startswith("MAGE_")}
+    env.update(
+        {
+            "MAGE_DEVICE": "cpu",
+            "MAGE_ATTN": "sdpa",
+            "MAGE_SNAPSHOT": str(generation_snapshot),
+            "MAGE_EDIT_SNAPSHOT": str(edit_snapshot),
+            "MAGE_GOLDEN_DIR": str(output),
+            "MAGE_PROMPT": PROMPT,
+            "MAGE_NEG": " ",
+            "MAGE_EDIT_INSTRUCTION": EDIT_INSTRUCTION,
+            "MAGE_EDIT_REF": str(CANONICAL_EDIT_REF),
+            "MAGE_SEED": "42",
+            "MAGE_H": "256",
+            "MAGE_W": "256",
+            "MAGE_STEPS": "4",
+            "MAGE_EDIT_STEPS": str(steps),
+            "MAGE_CFG": str(cfg),
+            "MAGE_GS_KEY": "20260720",
+            "PYTHONPATH": str(MLX / "_vendor"),
+        }
+    )
+    return env
 
 
 def expected_img_shapes(cfg: float) -> list[list[int]]:
@@ -296,19 +328,7 @@ def main() -> int:
         if label != "edit" and not args.verify_only:
             with tempfile.TemporaryDirectory(prefix=f"mage-{label}-") as temporary:
                 temp = Path(temporary)
-                env = {
-                    **os.environ,
-                    "MAGE_DEVICE": "cpu",
-                    "MAGE_SNAPSHOT": str(args.gen),
-                    "MAGE_EDIT_SNAPSHOT": str(snapshot),
-                    "MAGE_GOLDEN_DIR": str(temp),
-                    "MAGE_H": "256",
-                    "MAGE_W": "256",
-                    "MAGE_STEPS": "4",
-                    "MAGE_EDIT_STEPS": str(steps),
-                    "MAGE_CFG": str(cfg),
-                    "PYTHONPATH": str(MLX / "_vendor"),
-                }
+                env = producer_environment(temp, args.gen, snapshot, steps, cfg)
                 subprocess.run(
                     [
                         sys.executable,
