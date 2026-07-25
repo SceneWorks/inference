@@ -13,9 +13,11 @@ import argparse
 import copy
 import gc
 import hashlib
+import importlib.metadata
 import json
 import os
 import platform
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -24,11 +26,25 @@ from typing import Any, Iterable
 
 
 UPSTREAM_COMMIT = "124e8a799f57a1f665495ecb72e547d0a62867f1"
+UPSTREAM_REPOSITORY = "https://github.com/Stability-AI/stable-audio-3.git"
+EXPECTED_RUNTIME = {
+    "python": "3.12.13",
+    "torch": "2.7.1",
+    "torchaudio": "2.7.1",
+    "transformers": "5.8.0",
+}
 SEED = 14534
 PROMPT = "Warm analog synth pulses, crisp percussion, spacious stereo field, 112 BPM"
 LATENT_LENGTH = 16
 AUDIO_SAMPLES = 16_384
 TIMESTEP = 0.5
+SNAPSHOT_LOCK_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "docs"
+    / "migration"
+    / "sa3-reference"
+    / "snapshot-files.json"
+)
 
 
 @dataclass(frozen=True)
@@ -108,12 +124,40 @@ COMMON_FILES = (
 )
 T5_FILES = (
     "config.json",
+    "generation_config.json",
     "model.safetensors",
     "tokenizer.json",
     "tokenizer.model",
     "tokenizer_config.json",
     "special_tokens_map.json",
 )
+SAFETENSORS_DTYPES = {
+    "BOOL": "bool",
+    "I8": "int8",
+    "I16": "int16",
+    "I32": "int32",
+    "I64": "int64",
+    "U8": "uint8",
+    "U16": "uint16",
+    "U32": "uint32",
+    "U64": "uint64",
+    "F16": "float16",
+    "BF16": "bfloat16",
+    "F32": "float32",
+    "F64": "float64",
+}
+
+
+def reference_inputs() -> dict[str, Any]:
+    return {
+        "seed": SEED,
+        "prompt": PROMPT,
+        "audioSamples": AUDIO_SAMPLES,
+        "latentLength": LATENT_LENGTH,
+        "timestep": TIMESTEP,
+        "sampler": "pingpong",
+        "samplerSteps": 8,
+    }
 
 
 class InvalidReference(RuntimeError):
@@ -137,7 +181,52 @@ def snapshot_revision(path: Path) -> str:
     return revision
 
 
-def resolve_snapshots(environ: dict[str, str] | None = None) -> dict[str, Path]:
+def required_snapshot_files(spec: SnapshotSpec) -> tuple[str, ...]:
+    required = list(COMMON_FILES)
+    if spec.kind == "dit":
+        required.extend(f"t5gemma-b-b-ul2/{name}" for name in T5_FILES)
+    return tuple(required)
+
+
+def _validate_snapshot_lock(lock: dict[str, Any]) -> dict[str, Any]:
+    if lock.get("schemaVersion") != 1:
+        raise InvalidReference("snapshot payload lock schema must be 1")
+    snapshots = lock.get("snapshots")
+    if not isinstance(snapshots, dict) or set(snapshots) != set(SPEC_BY_KEY):
+        raise InvalidReference("snapshot payload lock must contain exactly all eight snapshots")
+    for spec in SNAPSHOTS:
+        record = snapshots[spec.key]
+        if record.get("repository") != spec.repository:
+            raise InvalidReference(f"{spec.key} payload lock repository mismatch")
+        if record.get("revision") != spec.revision:
+            raise InvalidReference(f"{spec.key} payload lock revision mismatch")
+        files = record.get("files")
+        if not isinstance(files, dict) or set(files) != set(required_snapshot_files(spec)):
+            raise InvalidReference(f"{spec.key} payload lock file inventory mismatch")
+        for name, payload in files.items():
+            if (
+                not isinstance(payload, dict)
+                or not isinstance(payload.get("bytes"), int)
+                or payload["bytes"] < 0
+                or not isinstance(payload.get("sha256"), str)
+                or len(payload["sha256"]) != 64
+                or any(c not in "0123456789abcdef" for c in payload["sha256"])
+            ):
+                raise InvalidReference(f"{spec.key}/{name} has an invalid payload lock")
+    return lock
+
+
+def load_snapshot_lock(path: Path = SNAPSHOT_LOCK_PATH) -> dict[str, Any]:
+    if not path.is_file():
+        raise InvalidReference(f"missing pinned snapshot payload lock: {path}")
+    return _validate_snapshot_lock(
+        json.loads(path.read_text(encoding="utf-8"))
+    )
+
+
+def _resolve_snapshot_paths(
+    environ: dict[str, str] | None = None,
+) -> dict[str, Path]:
     environ = environ or os.environ
     missing_env = [spec.env for spec in SNAPSHOTS if not environ.get(spec.env)]
     if missing_env:
@@ -156,16 +245,65 @@ def resolve_snapshots(environ: dict[str, str] | None = None) -> dict[str, Path]:
             raise InvalidReference(
                 f"{spec.key} revision mismatch: {revision!r}, expected {spec.revision}"
             )
-        required = list(COMMON_FILES)
-        if spec.kind == "dit":
-            required.extend(f"t5gemma-b-b-ul2/{name}" for name in T5_FILES)
-        missing = [name for name in required if not (path / name).is_file()]
+        missing = [
+            name for name in required_snapshot_files(spec) if not (path / name).is_file()
+        ]
         if missing:
             raise InvalidReference(
                 f"{spec.key} snapshot is incomplete; missing: {', '.join(missing)}"
             )
         resolved[spec.key] = path
     return resolved
+
+
+def build_snapshot_lock(paths: dict[str, Path]) -> dict[str, Any]:
+    digest_cache: dict[tuple[int, int, int], str] = {}
+    snapshots = {}
+    for spec in SNAPSHOTS:
+        files = {}
+        for name in required_snapshot_files(spec):
+            path = paths[spec.key] / name
+            stat = path.stat()
+            identity = (stat.st_dev, stat.st_ino, stat.st_size)
+            digest = digest_cache.get(identity)
+            if digest is None:
+                digest = sha256_file(path)
+                digest_cache[identity] = digest
+            files[name] = {"bytes": stat.st_size, "sha256": digest}
+        snapshots[spec.key] = {
+            "repository": spec.repository,
+            "revision": spec.revision,
+            "files": files,
+        }
+    return {"schemaVersion": 1, "snapshots": snapshots}
+
+
+def resolve_snapshots(
+    environ: dict[str, str] | None = None,
+    snapshot_lock: dict[str, Any] | None = None,
+) -> dict[str, Path]:
+    paths = _resolve_snapshot_paths(environ)
+    lock = (
+        _validate_snapshot_lock(snapshot_lock)
+        if snapshot_lock is not None
+        else load_snapshot_lock()
+    )
+    for spec in SNAPSHOTS:
+        for name, expected in lock["snapshots"][spec.key]["files"].items():
+            path = paths[spec.key] / name
+            actual_size = path.stat().st_size
+            if actual_size != expected["bytes"]:
+                raise InvalidReference(
+                    f"{spec.key}/{name} size mismatch: {actual_size}, "
+                    f"expected {expected['bytes']}"
+                )
+            actual_hash = sha256_file(path)
+            if actual_hash != expected["sha256"]:
+                raise InvalidReference(
+                    f"{spec.key}/{name} SHA-256 mismatch: {actual_hash}, "
+                    f"expected {expected['sha256']}"
+                )
+    return paths
 
 
 def _config_evidence(config: dict[str, Any]) -> dict[str, Any]:
@@ -229,35 +367,129 @@ def build_snapshot_records(paths: dict[str, Path]) -> list[dict[str, Any]]:
     return records
 
 
-def _torch_modules(upstream_root: Path) -> tuple[Any, Any, Any, Any]:
+def validate_runtime_versions(actual: dict[str, str]) -> None:
+    if set(actual) != set(EXPECTED_RUNTIME):
+        raise InvalidReference("runtime version inventory is incomplete")
+    for package, expected in EXPECTED_RUNTIME.items():
+        if actual[package] != expected:
+            raise InvalidReference(
+                f"{package} {expected} required, got {actual[package]}"
+            )
+
+
+def _torch_modules(upstream_root: Path) -> tuple[Any, Any, Any, Any, dict[str, str]]:
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
+    python_version = platform.python_version()
+    if python_version != EXPECTED_RUNTIME["python"]:
+        raise InvalidReference(
+            f"python {EXPECTED_RUNTIME['python']} required, got {python_version}"
+        )
     root = str(upstream_root)
     if root not in sys.path:
         sys.path.insert(0, root)
     try:
         import torch
+        import torchaudio  # noqa: F401
+        import transformers  # noqa: F401
         from safetensors.torch import save_file
-        from stable_audio_3.inference.sampling import sample_diffusion
-        from stable_audio_3.loading_utils import load_autoencoder, load_diffusion_cond
     except ImportError as error:
         raise InvalidReference(
             "run generation from the pinned upstream pyproject environment"
         ) from error
-    return torch, save_file, sample_diffusion, (load_autoencoder, load_diffusion_cond)
+    versions = {
+        "python": python_version,
+        "torch": importlib.metadata.version("torch"),
+        "torchaudio": importlib.metadata.version("torchaudio"),
+        "transformers": importlib.metadata.version("transformers"),
+    }
+    validate_runtime_versions(versions)
+    # Import upstream model code only after the complete environment has passed.
+    try:
+        from stable_audio_3.inference.sampling import sample_diffusion
+        from stable_audio_3.loading_utils import load_autoencoder, load_diffusion_cond
+    except ImportError as error:
+        raise InvalidReference("pinned upstream source is not importable") from error
+    return (
+        torch,
+        save_file,
+        sample_diffusion,
+        (load_autoencoder, load_diffusion_cond),
+        versions,
+    )
 
 
-def _upstream_revision(upstream_root: Path) -> str:
-    import subprocess
-
-    result = subprocess.run(
+def validate_upstream_checkout(
+    upstream_root: Path, expected_commit: str = UPSTREAM_COMMIT
+) -> str:
+    revision = subprocess.run(
         ["git", "-C", str(upstream_root), "rev-parse", "HEAD"],
         check=True,
         capture_output=True,
         text=True,
         encoding="utf-8",
-    )
-    return result.stdout.strip()
+    ).stdout.strip()
+    if revision != expected_commit:
+        raise InvalidReference(
+            f"upstream checkout mismatch: {revision}, expected {expected_commit}"
+        )
+    tracked_status = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(upstream_root),
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=no",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    ).stdout.strip()
+    if tracked_status:
+        raise InvalidReference(
+            "upstream checkout has tracked modifications: "
+            + tracked_status.replace("\n", "; ")
+        )
+    return revision
+
+
+def _parse_safetensors_bytes(data: bytes) -> tuple[dict[str, Any], int]:
+    if len(data) < 8:
+        raise InvalidReference("truncated safetensors header")
+    header_length = int.from_bytes(data[:8], "little")
+    data_start = 8 + header_length
+    if header_length <= 0 or data_start > len(data):
+        raise InvalidReference("invalid safetensors header length")
+    try:
+        header = json.loads(data[8:data_start].decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise InvalidReference("invalid safetensors JSON header") from error
+    if not isinstance(header, dict):
+        raise InvalidReference("safetensors header must be an object")
+    return header, data_start
+
+
+def _tensor_payload_hash(
+    data: bytes, header: dict[str, Any], data_start: int, name: str
+) -> str:
+    record = header.get(name)
+    if not isinstance(record, dict):
+        raise InvalidReference(f"missing safetensors tensor {name}")
+    offsets = record.get("data_offsets")
+    if (
+        not isinstance(offsets, list)
+        or len(offsets) != 2
+        or not all(isinstance(value, int) for value in offsets)
+        or offsets[0] < 0
+        or offsets[1] < offsets[0]
+        or data_start + offsets[1] > len(data)
+    ):
+        raise InvalidReference(f"{name} has invalid safetensors data offsets")
+    return hashlib.sha256(
+        data[data_start + offsets[0] : data_start + offsets[1]]
+    ).hexdigest()
 
 
 def _save_tensors(
@@ -275,14 +507,17 @@ def _save_tensors(
         # not retain shared storage that safetensors correctly rejects.
         value = tensor.detach().cpu().contiguous().clone()
         portable[key] = value
-        # NumPy cannot represent bfloat16. Hashing a one-tensor safetensors
-        # serialization covers the exact dtype, shape, and payload portably.
+        # NumPy cannot represent bfloat16. A one-tensor safetensors
+        # serialization exposes the exact portable payload bytes.
         tensor_save = __import__("safetensors.torch", fromlist=["save"]).save
         raw = tensor_save({"tensor": value})
+        raw_header, raw_data_start = _parse_safetensors_bytes(raw)
         tensor_records[key] = {
             "dtype": str(value.dtype).removeprefix("torch."),
             "shape": list(value.shape),
-            "sha256": hashlib.sha256(raw).hexdigest(),
+            "sha256": _tensor_payload_hash(
+                raw, raw_header, raw_data_start, "tensor"
+            ),
         }
     save_file(portable, str(path), metadata=metadata)
     return {
@@ -528,19 +763,13 @@ def _dit_reference(
     )
 
 
-def _runtime_environment(torch: Any, device: str) -> dict[str, str]:
-    try:
-        import torchaudio
-        import transformers
-    except ImportError as error:
-        raise InvalidReference("pinned reference packages are incomplete") from error
+def _runtime_environment(
+    versions: dict[str, str], device: str
+) -> dict[str, str]:
     return {
-        "python": platform.python_version(),
+        **versions,
         "platform": platform.platform(),
         "device": device,
-        "torch": torch.__version__,
-        "torchaudio": torchaudio.__version__,
-        "transformers": transformers.__version__,
     }
 
 
@@ -551,20 +780,18 @@ def generate(
     selected: Iterable[str],
     environ: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    revision = _upstream_revision(upstream_root)
-    if revision != UPSTREAM_COMMIT:
-        raise InvalidReference(
-            f"upstream checkout mismatch: {revision}, expected {UPSTREAM_COMMIT}"
-        )
+    validate_upstream_checkout(upstream_root)
     paths = resolve_snapshots(environ)
     selected_keys = list(selected)
     unknown = sorted(set(selected_keys) - set(SPEC_BY_KEY))
     if unknown:
         raise InvalidReference(f"unknown components: {', '.join(unknown)}")
+    if len(selected_keys) != len(SPEC_BY_KEY) or set(selected_keys) != set(SPEC_BY_KEY):
+        raise InvalidReference(
+            "reference generation requires exactly all eight components"
+        )
     output.mkdir(parents=True, exist_ok=True)
-    torch, save_file, sample_diffusion, loaders = _torch_modules(upstream_root)
-    if torch.__version__.split("+", 1)[0] != "2.7.1":
-        raise InvalidReference(f"torch 2.7.1 required, got {torch.__version__}")
+    torch, save_file, sample_diffusion, loaders, versions = _torch_modules(upstream_root)
     if device == "mps" and not torch.backends.mps.is_available():
         raise InvalidReference("MPS requested but unavailable")
     torch.use_deterministic_algorithms(True)
@@ -596,19 +823,11 @@ def generate(
     manifest = {
         "schemaVersion": 1,
         "upstream": {
-            "repository": "https://github.com/Stability-AI/stable-audio-3.git",
+            "repository": UPSTREAM_REPOSITORY,
             "commit": UPSTREAM_COMMIT,
         },
-        "inputs": {
-            "seed": SEED,
-            "prompt": PROMPT,
-            "audioSamples": AUDIO_SAMPLES,
-            "latentLength": LATENT_LENGTH,
-            "timestep": TIMESTEP,
-            "sampler": "pingpong",
-            "samplerSteps": 8,
-        },
-        "referenceEnvironment": _runtime_environment(torch, device),
+        "inputs": reference_inputs(),
+        "referenceEnvironment": _runtime_environment(versions, device),
         "snapshots": build_snapshot_records(paths),
         "artifacts": artifacts,
         "elapsedSeconds": round(time.monotonic() - started, 3),
@@ -621,22 +840,150 @@ def generate(
     return manifest
 
 
+def expected_tensor_keys(component: str) -> set[str]:
+    if SPEC_BY_KEY[component].kind == "same":
+        return {
+            "audio_input",
+            "latents",
+            "decoded_audio",
+            "encoder_resampling_0_input",
+            "encoder_resampling_0_output",
+            "decoder_resampling_0_input",
+            "decoder_resampling_0_output",
+        }
+    keys = {
+        "t5_input_ids",
+        "t5_attention_mask",
+        "t5_last_hidden_state",
+        "t5_projected_padded",
+        "dit_noise",
+        "dit_timestep",
+        "dit_prediction",
+        "sampler_initial_noise",
+        "sampler_final",
+    }
+    for index in range(8):
+        keys.update(
+            {
+                f"step_{index:02d}_x",
+                f"step_{index:02d}_denoised",
+                f"step_{index:02d}_sigma",
+            }
+        )
+    return keys
+
+
+def expected_artifact_filename(component: str) -> str:
+    suffix = "same" if SPEC_BY_KEY[component].kind == "same" else "reference"
+    return f"{component}-{suffix}.safetensors"
+
+
+def expected_artifact_metadata(component: str) -> dict[str, str]:
+    metadata = {
+        "component": component,
+        "seed": str(SEED),
+        "upstreamCommit": UPSTREAM_COMMIT,
+    }
+    if SPEC_BY_KEY[component].kind == "dit":
+        metadata.update(
+            {
+                "prompt": PROMPT,
+                "sampler": "pingpong",
+                "steps": "8",
+            }
+        )
+    return metadata
+
+
+def _validate_safetensors_artifact(
+    component: str, path: Path, record: dict[str, Any]
+) -> None:
+    data = path.read_bytes()
+    header, data_start = _parse_safetensors_bytes(data)
+    metadata = header.pop("__metadata__", None)
+    if metadata != expected_artifact_metadata(component):
+        raise InvalidReference(f"{component} safetensors metadata mismatch")
+    expected_keys = expected_tensor_keys(component)
+    if set(header) != expected_keys:
+        raise InvalidReference(f"{component} safetensors tensor inventory mismatch")
+    payload_hashes = {
+        name: _tensor_payload_hash(data, header, data_start, name)
+        for name in expected_keys
+    }
+    cursor = 0
+    ranges = sorted(
+        (header[name]["data_offsets"][0], header[name]["data_offsets"][1], name)
+        for name in expected_keys
+    )
+    for start, end, name in ranges:
+        if start != cursor:
+            raise InvalidReference(
+                f"{component}/{name} has a non-contiguous payload range"
+            )
+        cursor = end
+    if data_start + cursor != len(data):
+        raise InvalidReference(f"{component} has trailing or truncated tensor payload")
+    tensors = record.get("tensors")
+    if not isinstance(tensors, dict) or set(tensors) != expected_keys:
+        raise InvalidReference(f"{component} manifest tensor inventory mismatch")
+    for name in sorted(expected_keys):
+        tensor_header = header[name]
+        tensor_record = tensors[name]
+        if not isinstance(tensor_header, dict) or not isinstance(tensor_record, dict):
+            raise InvalidReference(f"{component}/{name} tensor record is invalid")
+        dtype = SAFETENSORS_DTYPES.get(tensor_header.get("dtype"))
+        if dtype is None or tensor_record.get("dtype") != dtype:
+            raise InvalidReference(f"{component}/{name} dtype mismatch")
+        if tensor_record.get("shape") != tensor_header.get("shape"):
+            raise InvalidReference(f"{component}/{name} shape mismatch")
+        actual_hash = payload_hashes[name]
+        if tensor_record.get("sha256") != actual_hash:
+            raise InvalidReference(f"{component}/{name} payload hash mismatch")
+
+
 def verify_artifacts(output: Path) -> dict[str, Any]:
     manifest_path = output / "manifest.json"
     if not manifest_path.is_file():
         raise InvalidReference(f"missing artifact manifest: {manifest_path}")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if manifest.get("upstream", {}).get("commit") != UPSTREAM_COMMIT:
-        raise InvalidReference("artifact manifest has the wrong upstream commit")
-    for key, record in manifest.get("artifacts", {}).items():
+    if manifest.get("schemaVersion") != 1:
+        raise InvalidReference("artifact manifest schema must be 1")
+    if manifest.get("upstream") != {
+        "repository": UPSTREAM_REPOSITORY,
+        "commit": UPSTREAM_COMMIT,
+    }:
+        raise InvalidReference("artifact manifest has the wrong upstream source")
+    if manifest.get("inputs") != reference_inputs():
+        raise InvalidReference("artifact manifest reference inputs mismatch")
+    reference_environment = manifest.get("referenceEnvironment")
+    if not isinstance(reference_environment, dict):
+        raise InvalidReference("artifact manifest reference environment is missing")
+    validate_runtime_versions(
+        {name: reference_environment.get(name) for name in EXPECTED_RUNTIME}
+    )
+    if not isinstance(reference_environment.get("device"), str) or not isinstance(
+        reference_environment.get("platform"), str
+    ):
+        raise InvalidReference("artifact manifest platform/device metadata is missing")
+    artifacts = manifest.get("artifacts")
+    if not isinstance(artifacts, dict) or set(artifacts) != set(SPEC_BY_KEY):
+        raise InvalidReference("artifact manifest must contain exactly all eight components")
+    for key, record in artifacts.items():
+        if not isinstance(record, dict):
+            raise InvalidReference(f"{key} artifact record is invalid")
+        if record.get("file") != expected_artifact_filename(key):
+            raise InvalidReference(f"{key} artifact filename mismatch")
         path = output / record["file"]
         if not path.is_file():
             raise InvalidReference(f"{key} artifact is missing: {path.name}")
+        if record.get("bytes") != path.stat().st_size:
+            raise InvalidReference(f"{key} artifact size mismatch")
         actual = sha256_file(path)
         if actual != record["sha256"]:
             raise InvalidReference(
                 f"{key} artifact hash mismatch: {actual}, expected {record['sha256']}"
             )
+        _validate_safetensors_artifact(key, path, record)
     return manifest
 
 

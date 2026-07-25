@@ -40,7 +40,12 @@ The generation run verified every path, immutable revision, required
 The complete file sizes, config hashes, consumed configuration, and path-variable
 names are recorded in
 [`sa3-reference/manifest.json`](sa3-reference/manifest.json). Absolute local
-paths are deliberately not committed.
+paths are deliberately not committed. The independent
+[`sa3-reference/snapshot-files.json`](sa3-reference/snapshot-files.json) lock
+pins the byte size and SHA-256 of all 82 required snapshot payloads. Snapshot
+verification and generation re-hash every required model, config, license,
+notice, and bundled tokenizer/T5 file against that lock before importing model
+code.
 
 ## Actual consumed DiT configuration
 
@@ -88,8 +93,12 @@ Each full-checkpoint safetensors file contains:
 The SAME-S and SAME-L files contain a deterministic stereo input, encoded
 latents, decoded audio, and the input/output of the sole encoder and decoder
 `TransformerResamplingBlock`. Every file and every tensor has a SHA-256 record
-in the manifest. Downstream parity tests should load the safetensors values for
-tolerance checks and use the hashes to detect accidental oracle drift.
+in the manifest. Tensor hashes cover the exact safetensors payload bytes,
+independent of header ordering. Verification requires exactly all eight
+component files, their complete tensor inventories, exact safetensors metadata,
+shapes/dtypes, contiguous payload ranges, and matching file/tensor hashes.
+Downstream parity tests should load the safetensors values for tolerance checks
+and use the hashes to detect accidental oracle drift.
 
 ## Regeneration
 
@@ -139,4 +148,6 @@ From this repository:
 Generation enables deterministic Torch algorithms and forces the Transformers
 and Hugging Face Hub offline modes before importing upstream. A missing path,
 revision drift, incomplete license/model/T5 payload, upstream SHA drift, Torch
-version drift, or artifact mutation fails closed.
+tracked modification in the upstream checkout, payload size/hash drift, exact
+Python/Torch/torchaudio/Transformers version drift, truncated component/tensor
+inventory, safetensors metadata drift, or artifact mutation fails closed.
