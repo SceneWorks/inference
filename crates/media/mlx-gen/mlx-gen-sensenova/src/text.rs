@@ -11,10 +11,16 @@
 //! block, the user turn, and the empty assistant turn that primes generation. Image generation
 //! prepends [`SYSTEM_MESSAGE_FOR_GEN`].
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use mlx_gen::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use mlx_gen::{Error, Result};
+
+/// The quant-matrix sibling tier dirs a tokenizer may be borrowed from, in preference order (sc-14432).
+/// A model's fast tokenizer is identical across its quant tiers (same vocab), so when a tier ships no
+/// `tokenizer.json`, any sibling tier's copy is byte-correct. `q8` first because it is the tier that
+/// reliably carries it (the base `SceneWorks/sensenova-u1-8b-mlx` repo shipped it ONLY in `q8/`).
+const SIBLING_TIER_DIRS: [&str; 3] = ["q8", "bf16", "q4"];
 
 /// NEO-Unify special-token ids (from the snapshot's `added_tokens.json`).
 pub mod tokens {
@@ -83,18 +89,25 @@ pub fn build_neo1_query(prompt: &str, system_message: &str) -> String {
     s
 }
 
-/// Load the fast tokenizer from `<root>/tokenizer.json`. The crate builds the prompt strings itself
-/// and tokenizes them with [`TextTokenizer::encode_ids`], so no chat-template wrapping is applied
-/// here ([`ChatTemplate::None`]).
+/// Load the fast tokenizer for the tier dir `root`. The crate builds the prompt strings itself and
+/// tokenizes them with [`TextTokenizer::encode_ids`], so no chat-template wrapping is applied here
+/// ([`ChatTemplate::None`]).
+///
+/// Prefers `<root>/tokenizer.json`, and falls back to a **sibling tier's** copy when this tier ships
+/// none (sc-14432 — `resolve_tokenizer_path`). The base `SceneWorks/sensenova-u1-8b-mlx` re-host
+/// shipped `tokenizer.json` ONLY in `q8/`, so its `q4/`/`bf16/` tiers reported "complete" (the
+/// `<tier>/*` download glob resolved fine) yet failed to load. Borrowing a sibling's is byte-correct —
+/// the tokenizer is model-wide, identical across quant tiers.
 pub fn load_tokenizer(root: impl AsRef<Path>) -> Result<TextTokenizer> {
-    let path = root.as_ref().join("tokenizer.json");
-    if !path.exists() {
-        return Err(Error::Msg(format!(
-            "missing {}: the SenseNova-U1 snapshot ships only vocab.json + merges.txt; run \
+    let root = root.as_ref();
+    let path = resolve_tokenizer_path(root).ok_or_else(|| {
+        Error::Msg(format!(
+            "missing tokenizer.json under {} (and no sibling q4/q8/bf16 tier provides one): the \
+             SenseNova-U1 snapshot ships only vocab.json + merges.txt; run \
              tools/build_sensenova_tokenizer.py to materialize the fast tokenizer.json",
-            path.display()
-        )));
-    }
+            root.display()
+        ))
+    })?;
     Ok(TextTokenizer::from_file(
         path,
         TokenizerConfig {
@@ -104,6 +117,33 @@ pub fn load_tokenizer(root: impl AsRef<Path>) -> Result<TextTokenizer> {
             pad_to_max_length: false,
         },
     )?)
+}
+
+/// Resolve the `tokenizer.json` to load for the tier dir `root` (sc-14432).
+///
+/// `<root>/tokenizer.json` wins. If this tier ships none, borrow a **sibling tier's** — a quant-matrix
+/// turnkey lays `q4/`, `q8/`, `bf16/` side by side under one snapshot, and the fast tokenizer is
+/// model-wide (byte-identical across quant tiers). Only the fixed [`SIBLING_TIER_DIRS`] names under the
+/// same parent are consulted — never an arbitrary directory or a path above the snapshot — so this
+/// cannot pull a *different* model's tokenizer. `None` (→ a loud error at the call site) when nothing
+/// carries one. Mirrors `candle-gen-sensenova`'s `resolve_tokenizer_path`.
+pub(crate) fn resolve_tokenizer_path(root: &Path) -> Option<PathBuf> {
+    let own = root.join("tokenizer.json");
+    if own.is_file() {
+        return Some(own);
+    }
+    let parent = root.parent()?;
+    for tier in SIBLING_TIER_DIRS {
+        let sibling_dir = parent.join(tier);
+        if sibling_dir == root {
+            continue;
+        }
+        let candidate = sibling_dir.join("tokenizer.json");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 /// The three position rows for a run of `len` **text** tokens: temporal = `0..len`, height = width
@@ -138,6 +178,36 @@ pub fn image_indexes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// sc-14432: a tier ships its own `tokenizer.json` → use it; a tier that ships NONE borrows a
+    /// sibling tier's (the base `sensenova-u1-8b-mlx` repo puts it only in `q8/`); nothing anywhere →
+    /// `None`. Mirrors the candle crate's coverage. Path-only, so no tokenizer file need be valid.
+    #[test]
+    fn resolve_tokenizer_path_prefers_own_then_borrows_a_sibling_tier() {
+        let snap = std::env::temp_dir().join(format!("sensenova-mlx-tok-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&snap);
+        let touch = |rel: &str| {
+            let path = snap.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"{}").unwrap();
+        };
+        touch("q4/tokenizer.json");
+        touch("q8/tokenizer.json");
+        // Own wins even with a sibling present.
+        assert_eq!(
+            resolve_tokenizer_path(&snap.join("q4")),
+            Some(snap.join("q4/tokenizer.json"))
+        );
+        // bf16 ships none → borrow q8's (the sc-14432 defect shape).
+        assert_eq!(
+            resolve_tokenizer_path(&snap.join("bf16")),
+            Some(snap.join("q8/tokenizer.json"))
+        );
+        // Nothing to borrow → None.
+        let bare = snap.join("bare");
+        std::fs::create_dir_all(bare.join("q4")).unwrap();
+        assert_eq!(resolve_tokenizer_path(&bare.join("q4")), None);
+    }
 
     #[test]
     fn neo1_query_empty_system_has_no_system_block() {

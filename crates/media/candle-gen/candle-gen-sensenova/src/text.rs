@@ -13,10 +13,18 @@
 //! path (think-mode is an internal flag the registry path leaves off), so this slice needs neither
 //! the AR text decode nor the image-token-id constants the it2i/think/interleave surfaces use.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use candle_gen::{CandleError, Result};
 use tokenizers::Tokenizer;
+
+/// The quant-matrix sibling tier dirs a tokenizer may be borrowed from, in preference order (sc-14432).
+/// A model's fast tokenizer is identical across its quant tiers (same vocab), so when a tier ships no
+/// `tokenizer.json` of its own, any sibling tier's copy is byte-correct. `q8` first because it is the
+/// tier that reliably carries it (the base `SceneWorks/sensenova-u1-8b-mlx` repo shipped it ONLY in
+/// `q8/`, which is the whole defect); the order also makes resolution deterministic when more than one
+/// sibling has it.
+const SIBLING_TIER_DIRS: [&str; 3] = ["q8", "bf16", "q4"];
 
 /// NEO-Unify special-token ids (from the snapshot's `added_tokens.json`). Used by the understanding
 /// surface (VQA / interleave) — the `<IMG_CONTEXT>` splice target, the `<img>`/`</img>` image
@@ -127,17 +135,24 @@ pub struct SenseNovaTokenizer {
 }
 
 impl SenseNovaTokenizer {
-    /// Load the fast tokenizer from `<root>/tokenizer.json` (materialized by
+    /// Load the fast tokenizer for the tier dir `root` (materialized by
     /// `tools/build_sensenova_tokenizer.py` from the snapshot's `vocab.json` + `merges.txt`).
+    ///
+    /// Prefers `<root>/tokenizer.json`, and falls back to a **sibling tier's** copy when this tier
+    /// ships none (sc-14432 — `resolve_tokenizer_path`). The base `SceneWorks/sensenova-u1-8b-mlx`
+    /// re-host shipped `tokenizer.json` ONLY in `q8/`, so its `q4/` and `bf16/` tiers reported
+    /// "complete" (the `<tier>/*` download glob resolved fine) yet failed to load here. Borrowing a
+    /// sibling's is byte-correct — the tokenizer is model-wide, identical across quant tiers.
     pub fn from_dir(root: impl AsRef<Path>) -> Result<Self> {
-        let path = root.as_ref().join("tokenizer.json");
-        if !path.exists() {
-            return Err(CandleError::Msg(format!(
-                "missing {}: the SenseNova-U1 snapshot ships only vocab.json + merges.txt; run \
+        let root = root.as_ref();
+        let path = resolve_tokenizer_path(root).ok_or_else(|| {
+            CandleError::Msg(format!(
+                "missing tokenizer.json under {} (and no sibling q4/q8/bf16 tier provides one): the \
+                 SenseNova-U1 snapshot ships only vocab.json + merges.txt; run \
                  tools/build_sensenova_tokenizer.py to materialize the fast tokenizer.json",
-                path.display()
-            )));
-        }
+                root.display()
+            ))
+        })?;
         let inner = Tokenizer::from_file(&path)
             .map_err(|e| CandleError::Msg(format!("sensenova: load tokenizer.json: {e}")))?;
         Ok(Self { inner })
@@ -162,9 +177,79 @@ impl SenseNovaTokenizer {
     }
 }
 
+/// Resolve the `tokenizer.json` to load for the tier dir `root` (sc-14432).
+///
+/// `<root>/tokenizer.json` wins. If this tier ships none, borrow a **sibling tier's** — a
+/// quant-matrix turnkey lays `q4/`, `q8/`, `bf16/` side by side under one snapshot, and the fast
+/// tokenizer is model-wide (byte-identical across quant tiers), so a sibling's copy is correct. Only
+/// the fixed [`SIBLING_TIER_DIRS`] names under the same parent are consulted — never an arbitrary
+/// directory, and never a path above the snapshot — so this cannot pull a *different* model's
+/// tokenizer. Returns `None` (→ a loud, actionable error at the call site) when nothing carries one,
+/// e.g. a flat single-tier snapshot with no siblings.
+pub(crate) fn resolve_tokenizer_path(root: &Path) -> Option<PathBuf> {
+    let own = root.join("tokenizer.json");
+    if own.is_file() {
+        return Some(own);
+    }
+    let parent = root.parent()?;
+    for tier in SIBLING_TIER_DIRS {
+        let sibling_dir = parent.join(tier);
+        if sibling_dir == root {
+            continue; // don't rediscover our own (already-missing) tier
+        }
+        let candidate = sibling_dir.join("tokenizer.json");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pid-scoped scratch dir (this crate carries no `tempfile` dep — see `quant.rs`).
+    fn scratch(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("sensenova-tok-{}-{}", std::process::id(), tag));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn touch(path: &Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"{}").unwrap();
+    }
+
+    /// sc-14432: a tier ships its own `tokenizer.json` → use it; a tier that ships NONE borrows a
+    /// sibling tier's (the base `sensenova-u1-8b-mlx` repo puts it only in `q8/`); nothing anywhere →
+    /// `None` (a loud error at the call site, never a wrong-model tokenizer).
+    #[test]
+    fn resolve_tokenizer_path_prefers_own_then_borrows_a_sibling_tier() {
+        let snap = scratch("resolve");
+
+        // q4 has its own → own wins even with a sibling present.
+        touch(&snap.join("q4/tokenizer.json"));
+        touch(&snap.join("q8/tokenizer.json"));
+        assert_eq!(
+            resolve_tokenizer_path(&snap.join("q4")),
+            Some(snap.join("q4/tokenizer.json"))
+        );
+
+        // bf16 ships none → borrow q8's (the sc-14432 defect shape: only q8 has it).
+        assert_eq!(
+            resolve_tokenizer_path(&snap.join("bf16")),
+            Some(snap.join("q8/tokenizer.json")),
+            "a tier without its own tokenizer.json must borrow a sibling tier's"
+        );
+
+        // No sibling carries one → None (a flat/torn snapshot with nothing to borrow).
+        let bare = scratch("bare");
+        std::fs::create_dir_all(bare.join("q4")).unwrap();
+        assert_eq!(resolve_tokenizer_path(&bare.join("q4")), None);
+    }
 
     #[test]
     fn neo1_query_empty_system_has_no_system_block() {
