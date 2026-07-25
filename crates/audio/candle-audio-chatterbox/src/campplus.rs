@@ -61,7 +61,6 @@ use candle_nn::{
 
 use crate::config::S3_SR;
 use crate::s3gen::S3GEN_WEIGHTS_FILE;
-use crate::s3tokenizer::resample_to_16k;
 
 // --------------------------------------------------------------------------------------------
 // Architecture constants (transcribed from `CAMPPlus.__init__` / the FCM / the trunk builder).
@@ -741,18 +740,18 @@ impl Campplus {
     }
 
     /// Reference waveform → `[1, 192]` x-vector tensor.
-    fn embed_tensor(&self, samples: &[f32], sample_rate: u32) -> CandleResult<Tensor> {
-        let wav = resample_to_16k(samples, sample_rate);
+    fn embed_tensor(&self, samples: &[f32], sample_rate: u32) -> Result<Tensor> {
+        let wav = candle_audio::dsp::resample(samples, sample_rate, S3_SR, 1)?;
         let feat = self.fbank.compute(&wav); // frame-major [T][FEAT_DIM], CMN applied
         let n_frames = feat.len() / FEAT_DIM;
         if n_frames == 0 {
-            return Err(candle_audio::candle_core::Error::Msg(
+            return Err(AudioError::Msg(
                 "campplus: reference clip too short to produce any fbank frame".into(),
             ));
         }
         // Model input is (B, T, F).
         let x = Tensor::from_vec(feat, (1, n_frames, FEAT_DIM), &self.device)?;
-        self.forward(&x)
+        Ok(self.forward(&x)?)
     }
 
     /// `(B, T, F)` fbank → `(B, 192)` x-vector.
