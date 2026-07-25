@@ -1,0 +1,3008 @@
+{
+  "artifacts": {
+    "medium": {
+      "bytes": 1512548,
+      "file": "medium-reference.safetensors",
+      "sha256": "a40885be2dc0991d6358c6bfd31c1621e5f3eeeca36128232da517a121e2a234",
+      "tensors": {
+        "dit_noise": {
+          "dtype": "float32",
+          "sha256": "e9dbeabea577e9c3bd3b36db0d999e9673f741d89d5c3e5c6467fa501f3aa9c7",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "dit_prediction": {
+          "dtype": "float32",
+          "sha256": "05482c9e5e7318682568759aac8be02dcee31e3e83179b9e5ab2e10e7241ca86",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "dit_timestep": {
+          "dtype": "float32",
+          "sha256": "f4ae72e81b5b48609bb3ba0689381d54cd3b11a8d81b2ce5579f8caa671a71c2",
+          "shape": [
+            1
+          ]
+        },
+        "sampler_final": {
+          "dtype": "float32",
+          "sha256": "86f62dc1ae7068704f7de177e40231466fdbdd7793806c7d95102b00e9497138",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "sampler_initial_noise": {
+          "dtype": "float32",
+          "sha256": "e9dbeabea577e9c3bd3b36db0d999e9673f741d89d5c3e5c6467fa501f3aa9c7",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_00_denoised": {
+          "dtype": "float32",
+          "sha256": "d06d5db8d43d6ad962b2e4b3d957e3d4d013ffadb7d0e7d5e895b7ea94f0467d",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_00_sigma": {
+          "dtype": "float32",
+          "sha256": "3851b891ccee924ab5e123e82df08adf9ca1a916ff330c2a51d875ed5b3b0171",
+          "shape": [
+            1
+          ]
+        },
+        "step_00_x": {
+          "dtype": "float32",
+          "sha256": "e9dbeabea577e9c3bd3b36db0d999e9673f741d89d5c3e5c6467fa501f3aa9c7",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_01_denoised": {
+          "dtype": "float32",
+          "sha256": "48cdb4c175f666168c10cbd4bba43fd9f69f41b6ef8657446d35da15f4a0f503",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_01_sigma": {
+          "dtype": "float32",
+          "sha256": "9164f2afa091e6d05e5035b5eec63ef22f318617f7eaf434e536aa0be58e732a",
+          "shape": [
+            1
+          ]
+        },
+        "step_01_x": {
+          "dtype": "float32",
+          "sha256": "f034d175158424773d547485bb03c27303a5d037cdc6db34a87411e7bc92ead2",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_02_denoised": {
+          "dtype": "float32",
+          "sha256": "414be1cf6d166d3b2a24ab2a674bd6289fa7002aae30af65077c1fa8a8aea5dd",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_02_sigma": {
+          "dtype": "float32",
+          "sha256": "b37eef9568bbeebf3aebc3e283eb7245b16813dc0938ead61d1aed1cc0ab0fdd",
+          "shape": [
+            1
+          ]
+        },
+        "step_02_x": {
+          "dtype": "float32",
+          "sha256": "40792728bc95b75699aa385cc32a3753b7d9b70db04acf1e83055e54d00268af",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_03_denoised": {
+          "dtype": "float32",
+          "sha256": "fbb81ab2aa0ce7f006cf662d6f063c4733de35fb1b75a00d9acacfb956fb35f2",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_03_sigma": {
+          "dtype": "float32",
+          "sha256": "b763d16673a6dbbc5b30079cc9ac39b54b5ade2f583ae919216ca5e3c7ed7260",
+          "shape": [
+            1
+          ]
+        },
+        "step_03_x": {
+          "dtype": "float32",
+          "sha256": "a82c3d10edb0f04a2dc7514d41e84f57e0281647aef159ed8027e71cc462b4b4",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_04_denoised": {
+          "dtype": "float32",
+          "sha256": "bd19b52f37e61b26557f61a95863a879e3e649400b81007b0925c0259cff1252",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_04_sigma": {
+          "dtype": "float32",
+          "sha256": "238ab66f91028265545c06a9d7636a0c14c20a41eb6182fbe39a17d3938aa6ad",
+          "shape": [
+            1
+          ]
+        },
+        "step_04_x": {
+          "dtype": "float32",
+          "sha256": "46d721a5dd667fe0fba89a04e4adadf83168ce895a8882c790ccac5ee691112b",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_05_denoised": {
+          "dtype": "float32",
+          "sha256": "2765269cc3a0332737b254d497b60a0999f751db23841e9a9a5582af185b627a",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_05_sigma": {
+          "dtype": "float32",
+          "sha256": "902be42016fe670baa6d55b61dc075cf974470f70a842b47a5afadd4888c47e7",
+          "shape": [
+            1
+          ]
+        },
+        "step_05_x": {
+          "dtype": "float32",
+          "sha256": "0294d7a21e4289432319a0c2dac0df66c90e1cc05ae998264fca6bc82a1e8541",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_06_denoised": {
+          "dtype": "float32",
+          "sha256": "75e4fdfcf31d6e491208f58caf997178ad4300fff0f08fecf3c01e5da836fdb7",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_06_sigma": {
+          "dtype": "float32",
+          "sha256": "421e2f9794bf93f572d45da5332e662cd729d816fa014707ce5d13e2ed445959",
+          "shape": [
+            1
+          ]
+        },
+        "step_06_x": {
+          "dtype": "float32",
+          "sha256": "d2749426f0611bed1a56883bf0b1a6ff472f779f930adb92c010ca5ca52d84e8",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_07_denoised": {
+          "dtype": "float32",
+          "sha256": "86f62dc1ae7068704f7de177e40231466fdbdd7793806c7d95102b00e9497138",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_07_sigma": {
+          "dtype": "float32",
+          "sha256": "657f518318a22bc7077b0c30afd053879146223019c53ba2a9653aefceb0587d",
+          "shape": [
+            1
+          ]
+        },
+        "step_07_x": {
+          "dtype": "float32",
+          "sha256": "1a401fdcaf6fef04afcf6c5314783a0d51fa5bded4ae6f83dc0312ce0bb779b0",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "t5_attention_mask": {
+          "dtype": "bool",
+          "sha256": "49bd4e8ab440f006660f5875cfd959802d270b3f6f406802a902901a8bbec2a1",
+          "shape": [
+            1,
+            256
+          ]
+        },
+        "t5_input_ids": {
+          "dtype": "int64",
+          "sha256": "e69cde449aa147db764a4753848111da5df9ec5e73a0396c62a32e6ddbbfdcda",
+          "shape": [
+            1,
+            256
+          ]
+        },
+        "t5_last_hidden_state": {
+          "dtype": "bfloat16",
+          "sha256": "6032044435b5c2c133d489e80174c1a712cf44dceeff933cd6c3d55dbc9b7a73",
+          "shape": [
+            1,
+            256,
+            768
+          ]
+        },
+        "t5_projected_padded": {
+          "dtype": "float32",
+          "sha256": "fccd9d7a172db84c62e75450453fb876e7b2b4749b5d8e8f9edaf97bd550df42",
+          "shape": [
+            1,
+            256,
+            768
+          ]
+        }
+      }
+    },
+    "medium-base": {
+      "bytes": 1512556,
+      "file": "medium-base-reference.safetensors",
+      "sha256": "33aec2bd3adc3cd3295b87527ad26ed44ee669e0a4e562652f814a3120d80b7d",
+      "tensors": {
+        "dit_noise": {
+          "dtype": "float32",
+          "sha256": "e9dbeabea577e9c3bd3b36db0d999e9673f741d89d5c3e5c6467fa501f3aa9c7",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "dit_prediction": {
+          "dtype": "float32",
+          "sha256": "7d4a1ad21eecbfb993b95e57bb834dea985974102657a64378f23ff7106b8e8f",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "dit_timestep": {
+          "dtype": "float32",
+          "sha256": "f4ae72e81b5b48609bb3ba0689381d54cd3b11a8d81b2ce5579f8caa671a71c2",
+          "shape": [
+            1
+          ]
+        },
+        "sampler_final": {
+          "dtype": "float32",
+          "sha256": "35b9b6b462ef2d6325e5e3d58d04f8fea5e4e757107f4a6a8c2fbee0deb86d45",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "sampler_initial_noise": {
+          "dtype": "float32",
+          "sha256": "e9dbeabea577e9c3bd3b36db0d999e9673f741d89d5c3e5c6467fa501f3aa9c7",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_00_denoised": {
+          "dtype": "float32",
+          "sha256": "66a704dc55d3323f78581cdf38e85704f054b4f1c93a5d3fb05d0847ebdb1210",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_00_sigma": {
+          "dtype": "float32",
+          "sha256": "3851b891ccee924ab5e123e82df08adf9ca1a916ff330c2a51d875ed5b3b0171",
+          "shape": [
+            1
+          ]
+        },
+        "step_00_x": {
+          "dtype": "float32",
+          "sha256": "e9dbeabea577e9c3bd3b36db0d999e9673f741d89d5c3e5c6467fa501f3aa9c7",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_01_denoised": {
+          "dtype": "float32",
+          "sha256": "9fe5145c858f174f16cd48f816693b8905aa96585836438b98862697108d0ef6",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_01_sigma": {
+          "dtype": "float32",
+          "sha256": "9164f2afa091e6d05e5035b5eec63ef22f318617f7eaf434e536aa0be58e732a",
+          "shape": [
+            1
+          ]
+        },
+        "step_01_x": {
+          "dtype": "float32",
+          "sha256": "5b9dd150393073072e8e3ed6ebb2de9114592ee9dd145b1d1bc95c92cbce61a8",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_02_denoised": {
+          "dtype": "float32",
+          "sha256": "b02722bd0e37032534e007fbde79b7f961f9817d90ef43cc8efd5bb1def54b91",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_02_sigma": {
+          "dtype": "float32",
+          "sha256": "b37eef9568bbeebf3aebc3e283eb7245b16813dc0938ead61d1aed1cc0ab0fdd",
+          "shape": [
+            1
+          ]
+        },
+        "step_02_x": {
+          "dtype": "float32",
+          "sha256": "01d7da95580f82e96af58f6654d2d7b411564e408bbbd445364f5f9dbc34e6d5",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_03_denoised": {
+          "dtype": "float32",
+          "sha256": "515a2e3bcc95528c14e91e546623153a32af23dc665f0b18655edb7e162b5f39",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_03_sigma": {
+          "dtype": "float32",
+          "sha256": "b763d16673a6dbbc5b30079cc9ac39b54b5ade2f583ae919216ca5e3c7ed7260",
+          "shape": [
+            1
+          ]
+        },
+        "step_03_x": {
+          "dtype": "float32",
+          "sha256": "98f4b2256fc217134e812b384514a7a634c0052f0c51b6f8f04226445a1da830",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_04_denoised": {
+          "dtype": "float32",
+          "sha256": "8ebd74c0d237c6c4a32ac66b378bd18dd3374470297ebdff8368b8d54cb03e03",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_04_sigma": {
+          "dtype": "float32",
+          "sha256": "238ab66f91028265545c06a9d7636a0c14c20a41eb6182fbe39a17d3938aa6ad",
+          "shape": [
+            1
+          ]
+        },
+        "step_04_x": {
+          "dtype": "float32",
+          "sha256": "dc0dfa01019327007880b59ed50072f6f90086fc71d0325022360d9c2c221f1f",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_05_denoised": {
+          "dtype": "float32",
+          "sha256": "d88001c6015b86b7f87352ecf7da6e3286e0e1b34757efbad0df02ef672c26a2",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_05_sigma": {
+          "dtype": "float32",
+          "sha256": "902be42016fe670baa6d55b61dc075cf974470f70a842b47a5afadd4888c47e7",
+          "shape": [
+            1
+          ]
+        },
+        "step_05_x": {
+          "dtype": "float32",
+          "sha256": "d3de1152104446318927c8154e241bad870e0755fa56a0d0e0f9110fb8307fb2",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_06_denoised": {
+          "dtype": "float32",
+          "sha256": "d0bc8b151d32108b2102beaacd4e0a289bc4e4977154e0782d894aeb1ef120c0",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_06_sigma": {
+          "dtype": "float32",
+          "sha256": "421e2f9794bf93f572d45da5332e662cd729d816fa014707ce5d13e2ed445959",
+          "shape": [
+            1
+          ]
+        },
+        "step_06_x": {
+          "dtype": "float32",
+          "sha256": "a6a947ae29f83875ddf5db1b54ba2856250f28951015c2fa9b047361c84e4a2b",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_07_denoised": {
+          "dtype": "float32",
+          "sha256": "35b9b6b462ef2d6325e5e3d58d04f8fea5e4e757107f4a6a8c2fbee0deb86d45",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_07_sigma": {
+          "dtype": "float32",
+          "sha256": "657f518318a22bc7077b0c30afd053879146223019c53ba2a9653aefceb0587d",
+          "shape": [
+            1
+          ]
+        },
+        "step_07_x": {
+          "dtype": "float32",
+          "sha256": "7fe721df28e5820a1c61fb3bd10af62048475c4930591f763d4ce16d04b21717",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "t5_attention_mask": {
+          "dtype": "bool",
+          "sha256": "49bd4e8ab440f006660f5875cfd959802d270b3f6f406802a902901a8bbec2a1",
+          "shape": [
+            1,
+            256
+          ]
+        },
+        "t5_input_ids": {
+          "dtype": "int64",
+          "sha256": "e69cde449aa147db764a4753848111da5df9ec5e73a0396c62a32e6ddbbfdcda",
+          "shape": [
+            1,
+            256
+          ]
+        },
+        "t5_last_hidden_state": {
+          "dtype": "bfloat16",
+          "sha256": "6032044435b5c2c133d489e80174c1a712cf44dceeff933cd6c3d55dbc9b7a73",
+          "shape": [
+            1,
+            256,
+            768
+          ]
+        },
+        "t5_projected_padded": {
+          "dtype": "float32",
+          "sha256": "afb1348dc704d92877576525d81b1f25ca6b2837f8a2ccdcff3e5a047d3e8272",
+          "shape": [
+            1,
+            256,
+            768
+          ]
+        }
+      }
+    },
+    "same-l": {
+      "bytes": 578280,
+      "file": "same-l-same.safetensors",
+      "sha256": "f419059542bfc1af14d118b40a027a5887ac0ae9726ad7fdbf2ee949986e4869",
+      "tensors": {
+        "audio_input": {
+          "dtype": "float32",
+          "sha256": "153ba0106ee845354d03e9ab35990f8edb5830bc36535858175ae85c4b367637",
+          "shape": [
+            1,
+            2,
+            16384
+          ]
+        },
+        "decoded_audio": {
+          "dtype": "float32",
+          "sha256": "82f150ab51ef4e30ab9c8beb14ddd4006308971e5a18cc9bb69243b57c0eb7f4",
+          "shape": [
+            1,
+            2,
+            16384
+          ]
+        },
+        "decoder_resampling_0_input": {
+          "dtype": "float32",
+          "sha256": "de847ace7e2acc4baa26fd2c5d3e9bd6961d03f7e66b4ac91432759dacd65d31",
+          "shape": [
+            1,
+            1536,
+            4
+          ]
+        },
+        "decoder_resampling_0_output": {
+          "dtype": "float32",
+          "sha256": "5e12d2d2d7347752ffe7988086aeb2a2138e926d3429645b1b3a10c9f8f9d52f",
+          "shape": [
+            1,
+            512,
+            64
+          ]
+        },
+        "encoder_resampling_0_input": {
+          "dtype": "float32",
+          "sha256": "a180168c9a300fd758c2c8e4ad9043f57ce8f74f296300b499743a5736b6932a",
+          "shape": [
+            1,
+            512,
+            64
+          ]
+        },
+        "encoder_resampling_0_output": {
+          "dtype": "float32",
+          "sha256": "eec32b1c0a10ea9c274ddaa552a53f443edecf1b954b2769d70361a956b058c7",
+          "shape": [
+            1,
+            1536,
+            4
+          ]
+        },
+        "latents": {
+          "dtype": "float32",
+          "sha256": "dd72292fbc8bdfa220c834c1dd8132d3eb42e55f62bec070285ee2cf639f33d4",
+          "shape": [
+            1,
+            256,
+            4
+          ]
+        }
+      }
+    },
+    "same-s": {
+      "bytes": 553696,
+      "file": "same-s-same.safetensors",
+      "sha256": "c1f7ac845f419d4c42e22e6c53129f9abc00dc810b6edc317854d4fcc7fc7eaa",
+      "tensors": {
+        "audio_input": {
+          "dtype": "float32",
+          "sha256": "153ba0106ee845354d03e9ab35990f8edb5830bc36535858175ae85c4b367637",
+          "shape": [
+            1,
+            2,
+            16384
+          ]
+        },
+        "decoded_audio": {
+          "dtype": "float32",
+          "sha256": "674b34ee5af16e5d4349b76218c50ffe03079b54fd4bc3fbcbbe980162200218",
+          "shape": [
+            1,
+            2,
+            16384
+          ]
+        },
+        "decoder_resampling_0_input": {
+          "dtype": "float32",
+          "sha256": "60e653aecacf004f9ab0b555cfe07556bf16ffd4731da1ca69817d81e9655c4c",
+          "shape": [
+            1,
+            768,
+            4
+          ]
+        },
+        "decoder_resampling_0_output": {
+          "dtype": "float32",
+          "sha256": "60f8c6ddb5567733476b8bfd69ab3455728d6149d08ac05ff5e2c420789cd834",
+          "shape": [
+            1,
+            512,
+            64
+          ]
+        },
+        "encoder_resampling_0_input": {
+          "dtype": "float32",
+          "sha256": "a180168c9a300fd758c2c8e4ad9043f57ce8f74f296300b499743a5736b6932a",
+          "shape": [
+            1,
+            512,
+            64
+          ]
+        },
+        "encoder_resampling_0_output": {
+          "dtype": "float32",
+          "sha256": "e961c1af228b7bc5d7e126429075931a03a03e00497e0db1a5ae540e6200449e",
+          "shape": [
+            1,
+            768,
+            4
+          ]
+        },
+        "latents": {
+          "dtype": "float32",
+          "sha256": "6c5988b630c7c16039c7c2d144b1e1119528452cd3e0f83f1eb4ab9d7a1bde58",
+          "shape": [
+            1,
+            256,
+            4
+          ]
+        }
+      }
+    },
+    "small-music": {
+      "bytes": 1512556,
+      "file": "small-music-reference.safetensors",
+      "sha256": "b0ac8d572840d1cd9e1046e4734c6c286a7f2664e388758e508b4aab89c25296",
+      "tensors": {
+        "dit_noise": {
+          "dtype": "float32",
+          "sha256": "e9dbeabea577e9c3bd3b36db0d999e9673f741d89d5c3e5c6467fa501f3aa9c7",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "dit_prediction": {
+          "dtype": "float32",
+          "sha256": "1d9f3ec7096d773fb6fbc5ba49bfa3a3ddb28c23a0c3ebd3594ab19d51371401",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "dit_timestep": {
+          "dtype": "float32",
+          "sha256": "f4ae72e81b5b48609bb3ba0689381d54cd3b11a8d81b2ce5579f8caa671a71c2",
+          "shape": [
+            1
+          ]
+        },
+        "sampler_final": {
+          "dtype": "float32",
+          "sha256": "6befcd6ffcf2e7d2fd645e29a45891276d5ac010affb939752e855420fbb1e7a",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "sampler_initial_noise": {
+          "dtype": "float32",
+          "sha256": "e9dbeabea577e9c3bd3b36db0d999e9673f741d89d5c3e5c6467fa501f3aa9c7",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_00_denoised": {
+          "dtype": "float32",
+          "sha256": "ace15ff499000afea76a4ad3da6a61e9950c3212a5b0acd391c9723a1c83a120",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_00_sigma": {
+          "dtype": "float32",
+          "sha256": "3851b891ccee924ab5e123e82df08adf9ca1a916ff330c2a51d875ed5b3b0171",
+          "shape": [
+            1
+          ]
+        },
+        "step_00_x": {
+          "dtype": "float32",
+          "sha256": "e9dbeabea577e9c3bd3b36db0d999e9673f741d89d5c3e5c6467fa501f3aa9c7",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_01_denoised": {
+          "dtype": "float32",
+          "sha256": "c02a108b42b8fe204dcbd094037fb64da987e9467e9abb934e91a5b3fae5303b",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_01_sigma": {
+          "dtype": "float32",
+          "sha256": "9164f2afa091e6d05e5035b5eec63ef22f318617f7eaf434e536aa0be58e732a",
+          "shape": [
+            1
+          ]
+        },
+        "step_01_x": {
+          "dtype": "float32",
+          "sha256": "bc0a02f9938eaba2698455a71a65309c07a27360db2afe6b8d30e05034c0ddd8",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_02_denoised": {
+          "dtype": "float32",
+          "sha256": "289485b62026033082b2cd7fe7ce15fb8c08590f104da71279e2f40f7b551a12",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_02_sigma": {
+          "dtype": "float32",
+          "sha256": "b37eef9568bbeebf3aebc3e283eb7245b16813dc0938ead61d1aed1cc0ab0fdd",
+          "shape": [
+            1
+          ]
+        },
+        "step_02_x": {
+          "dtype": "float32",
+          "sha256": "facb04115398530339bad947af94e46a6dd8f96dc74c6cee98c74a471cefc789",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_03_denoised": {
+          "dtype": "float32",
+          "sha256": "37ad1bb8372aafc1c3c168107ac99ed070f257091168e8ef20d4c4dfe1d12449",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_03_sigma": {
+          "dtype": "float32",
+          "sha256": "b763d16673a6dbbc5b30079cc9ac39b54b5ade2f583ae919216ca5e3c7ed7260",
+          "shape": [
+            1
+          ]
+        },
+        "step_03_x": {
+          "dtype": "float32",
+          "sha256": "572ecf28c9a9599a98fee8473f9ecc53ae510b634b715cc5d4b1e4771c28e581",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_04_denoised": {
+          "dtype": "float32",
+          "sha256": "ba5fb9b0175fd27940915d7c5ca449f288f1b5bc08c233b1fa383631fe93dd9a",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_04_sigma": {
+          "dtype": "float32",
+          "sha256": "238ab66f91028265545c06a9d7636a0c14c20a41eb6182fbe39a17d3938aa6ad",
+          "shape": [
+            1
+          ]
+        },
+        "step_04_x": {
+          "dtype": "float32",
+          "sha256": "c71e5755fa720c03687a3ef40c98e15f6fe1dca2f074ebcbaa395ec45b6108cd",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_05_denoised": {
+          "dtype": "float32",
+          "sha256": "15b0e03cd43c627ca1da7425b6f0e75e2e3ba5df1d8d7b940db29934415a988e",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_05_sigma": {
+          "dtype": "float32",
+          "sha256": "902be42016fe670baa6d55b61dc075cf974470f70a842b47a5afadd4888c47e7",
+          "shape": [
+            1
+          ]
+        },
+        "step_05_x": {
+          "dtype": "float32",
+          "sha256": "0a7d38e2ba55c7374638e11fab180c2d10655198cab060e1c7d4cda6f5c878c2",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_06_denoised": {
+          "dtype": "float32",
+          "sha256": "1afae7da10241c4c89649fbc83625f1686bb6de74f176777338d1cf993da0b32",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_06_sigma": {
+          "dtype": "float32",
+          "sha256": "421e2f9794bf93f572d45da5332e662cd729d816fa014707ce5d13e2ed445959",
+          "shape": [
+            1
+          ]
+        },
+        "step_06_x": {
+          "dtype": "float32",
+          "sha256": "7ae1daf72d3ee3330ef7887fbb3d1fd71b083d9a9e17f6f2fa0906b9767ae9f8",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_07_denoised": {
+          "dtype": "float32",
+          "sha256": "6befcd6ffcf2e7d2fd645e29a45891276d5ac010affb939752e855420fbb1e7a",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_07_sigma": {
+          "dtype": "float32",
+          "sha256": "657f518318a22bc7077b0c30afd053879146223019c53ba2a9653aefceb0587d",
+          "shape": [
+            1
+          ]
+        },
+        "step_07_x": {
+          "dtype": "float32",
+          "sha256": "de77db2aa86f4c1167597187a87d4f872a59dee2af5fd20da44f4f2b727ab7cf",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "t5_attention_mask": {
+          "dtype": "bool",
+          "sha256": "49bd4e8ab440f006660f5875cfd959802d270b3f6f406802a902901a8bbec2a1",
+          "shape": [
+            1,
+            256
+          ]
+        },
+        "t5_input_ids": {
+          "dtype": "int64",
+          "sha256": "e69cde449aa147db764a4753848111da5df9ec5e73a0396c62a32e6ddbbfdcda",
+          "shape": [
+            1,
+            256
+          ]
+        },
+        "t5_last_hidden_state": {
+          "dtype": "bfloat16",
+          "sha256": "6032044435b5c2c133d489e80174c1a712cf44dceeff933cd6c3d55dbc9b7a73",
+          "shape": [
+            1,
+            256,
+            768
+          ]
+        },
+        "t5_projected_padded": {
+          "dtype": "float32",
+          "sha256": "c45a855ca69ebc3de098a7475451261bd322db0e82d7080585326b71a133a7a6",
+          "shape": [
+            1,
+            256,
+            768
+          ]
+        }
+      }
+    },
+    "small-music-base": {
+      "bytes": 1512556,
+      "file": "small-music-base-reference.safetensors",
+      "sha256": "7d5dd8dd18c3c2cfd98d4e6ccc26383f797bc2e0b960c8abb4be6d12695a4189",
+      "tensors": {
+        "dit_noise": {
+          "dtype": "float32",
+          "sha256": "e9dbeabea577e9c3bd3b36db0d999e9673f741d89d5c3e5c6467fa501f3aa9c7",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "dit_prediction": {
+          "dtype": "float32",
+          "sha256": "f60e83c05ac2b641d114564f66b43818c1671bfa49a931ef7f16fc65ad681e72",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "dit_timestep": {
+          "dtype": "float32",
+          "sha256": "f4ae72e81b5b48609bb3ba0689381d54cd3b11a8d81b2ce5579f8caa671a71c2",
+          "shape": [
+            1
+          ]
+        },
+        "sampler_final": {
+          "dtype": "float32",
+          "sha256": "93e0d7ae1556c95bfd41565d2f32a4d730618d838bfcd25015b68e74c5a3c5c0",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "sampler_initial_noise": {
+          "dtype": "float32",
+          "sha256": "e9dbeabea577e9c3bd3b36db0d999e9673f741d89d5c3e5c6467fa501f3aa9c7",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_00_denoised": {
+          "dtype": "float32",
+          "sha256": "98a40958d499183a9a7d8440641c821b76caa2c8ad08d4148e114e0f4867dc1f",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_00_sigma": {
+          "dtype": "float32",
+          "sha256": "3851b891ccee924ab5e123e82df08adf9ca1a916ff330c2a51d875ed5b3b0171",
+          "shape": [
+            1
+          ]
+        },
+        "step_00_x": {
+          "dtype": "float32",
+          "sha256": "e9dbeabea577e9c3bd3b36db0d999e9673f741d89d5c3e5c6467fa501f3aa9c7",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_01_denoised": {
+          "dtype": "float32",
+          "sha256": "7ce600e7f762041b852bc673e4059ebadf55cffb0c7929e7b3a9bc7c55f263fb",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_01_sigma": {
+          "dtype": "float32",
+          "sha256": "9164f2afa091e6d05e5035b5eec63ef22f318617f7eaf434e536aa0be58e732a",
+          "shape": [
+            1
+          ]
+        },
+        "step_01_x": {
+          "dtype": "float32",
+          "sha256": "2f01297f970ad23e215c202fa72a9a745ce7cb7ca643089f110beb4a435e903f",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_02_denoised": {
+          "dtype": "float32",
+          "sha256": "65d2ad1def5a61c6ccc595644504ce491dcadf25fbde718687b6da045e15ddb0",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_02_sigma": {
+          "dtype": "float32",
+          "sha256": "b37eef9568bbeebf3aebc3e283eb7245b16813dc0938ead61d1aed1cc0ab0fdd",
+          "shape": [
+            1
+          ]
+        },
+        "step_02_x": {
+          "dtype": "float32",
+          "sha256": "a2eea6650e872e898397190f41edf0acc4a7ee9882619d21c1fe749121beea52",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_03_denoised": {
+          "dtype": "float32",
+          "sha256": "59cf002bd338686f733b6e710fc360f5381b18b1d712bf0d0be2ad308b0a02ee",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_03_sigma": {
+          "dtype": "float32",
+          "sha256": "b763d16673a6dbbc5b30079cc9ac39b54b5ade2f583ae919216ca5e3c7ed7260",
+          "shape": [
+            1
+          ]
+        },
+        "step_03_x": {
+          "dtype": "float32",
+          "sha256": "58d4fab9dcc7361917e8e43f585825501119c1536e3bd7560dbe0e30563dcb1a",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_04_denoised": {
+          "dtype": "float32",
+          "sha256": "730cf6a84ef9f73076c1f45b659b347b405c4dcaad465b80c254da3438a229e0",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_04_sigma": {
+          "dtype": "float32",
+          "sha256": "238ab66f91028265545c06a9d7636a0c14c20a41eb6182fbe39a17d3938aa6ad",
+          "shape": [
+            1
+          ]
+        },
+        "step_04_x": {
+          "dtype": "float32",
+          "sha256": "129011d97fe16c52ad728d5a8735ac5018a3648200ff30bcb909ef10443b4fee",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_05_denoised": {
+          "dtype": "float32",
+          "sha256": "efe998eafbd1a426ea28be1433b3dba3dfdf9e9f46ffde736f01f58215ed08b6",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_05_sigma": {
+          "dtype": "float32",
+          "sha256": "902be42016fe670baa6d55b61dc075cf974470f70a842b47a5afadd4888c47e7",
+          "shape": [
+            1
+          ]
+        },
+        "step_05_x": {
+          "dtype": "float32",
+          "sha256": "76adbef57ee0bac95ed05d1e81c5712ccab970b416073b4af587cf0b1a6bd3f9",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_06_denoised": {
+          "dtype": "float32",
+          "sha256": "a10e51cb4454cafac18fb97555106cc01898f029a177be5321af2abb3e0cae78",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_06_sigma": {
+          "dtype": "float32",
+          "sha256": "421e2f9794bf93f572d45da5332e662cd729d816fa014707ce5d13e2ed445959",
+          "shape": [
+            1
+          ]
+        },
+        "step_06_x": {
+          "dtype": "float32",
+          "sha256": "5e0ec3c9837298ba5df4fd5b33e1c892592d1c1fc6209745b5a8e2a301e0c676",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_07_denoised": {
+          "dtype": "float32",
+          "sha256": "93e0d7ae1556c95bfd41565d2f32a4d730618d838bfcd25015b68e74c5a3c5c0",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_07_sigma": {
+          "dtype": "float32",
+          "sha256": "657f518318a22bc7077b0c30afd053879146223019c53ba2a9653aefceb0587d",
+          "shape": [
+            1
+          ]
+        },
+        "step_07_x": {
+          "dtype": "float32",
+          "sha256": "736b79c10a98e7875a72b22e4c4fe9735aff679f14718f3a1a3a8749aac588c2",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "t5_attention_mask": {
+          "dtype": "bool",
+          "sha256": "49bd4e8ab440f006660f5875cfd959802d270b3f6f406802a902901a8bbec2a1",
+          "shape": [
+            1,
+            256
+          ]
+        },
+        "t5_input_ids": {
+          "dtype": "int64",
+          "sha256": "e69cde449aa147db764a4753848111da5df9ec5e73a0396c62a32e6ddbbfdcda",
+          "shape": [
+            1,
+            256
+          ]
+        },
+        "t5_last_hidden_state": {
+          "dtype": "bfloat16",
+          "sha256": "6032044435b5c2c133d489e80174c1a712cf44dceeff933cd6c3d55dbc9b7a73",
+          "shape": [
+            1,
+            256,
+            768
+          ]
+        },
+        "t5_projected_padded": {
+          "dtype": "float32",
+          "sha256": "7ada809a95d6644cebcf8c507488f487b90ffd47b0f36d6edfabf11b33951ca6",
+          "shape": [
+            1,
+            256,
+            768
+          ]
+        }
+      }
+    },
+    "small-sfx": {
+      "bytes": 1512548,
+      "file": "small-sfx-reference.safetensors",
+      "sha256": "05bd2fb30751a51963d598457eacf21ba609eab741603c323fce53f7eae23639",
+      "tensors": {
+        "dit_noise": {
+          "dtype": "float32",
+          "sha256": "e9dbeabea577e9c3bd3b36db0d999e9673f741d89d5c3e5c6467fa501f3aa9c7",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "dit_prediction": {
+          "dtype": "float32",
+          "sha256": "309164e174ac3f2b5a51450fd3389bbaedf40292ee16575ec46c519a67daaa21",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "dit_timestep": {
+          "dtype": "float32",
+          "sha256": "f4ae72e81b5b48609bb3ba0689381d54cd3b11a8d81b2ce5579f8caa671a71c2",
+          "shape": [
+            1
+          ]
+        },
+        "sampler_final": {
+          "dtype": "float32",
+          "sha256": "d2fa5f6db6e06b334dfa201e732d580c3efd93f9f465e1aad8e846ee9c7018bc",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "sampler_initial_noise": {
+          "dtype": "float32",
+          "sha256": "e9dbeabea577e9c3bd3b36db0d999e9673f741d89d5c3e5c6467fa501f3aa9c7",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_00_denoised": {
+          "dtype": "float32",
+          "sha256": "8b03ffa9071cac7feb485b076bf13429661e2a401db9ddd804702a42aa1345a7",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_00_sigma": {
+          "dtype": "float32",
+          "sha256": "3851b891ccee924ab5e123e82df08adf9ca1a916ff330c2a51d875ed5b3b0171",
+          "shape": [
+            1
+          ]
+        },
+        "step_00_x": {
+          "dtype": "float32",
+          "sha256": "e9dbeabea577e9c3bd3b36db0d999e9673f741d89d5c3e5c6467fa501f3aa9c7",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_01_denoised": {
+          "dtype": "float32",
+          "sha256": "6cddce48276708b0b20a28d236624b220012dc037f9a96776927542a6314baa5",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_01_sigma": {
+          "dtype": "float32",
+          "sha256": "9164f2afa091e6d05e5035b5eec63ef22f318617f7eaf434e536aa0be58e732a",
+          "shape": [
+            1
+          ]
+        },
+        "step_01_x": {
+          "dtype": "float32",
+          "sha256": "1d7dd6f19aaa5fb9fda7f1f663830415446c02b02fc1e1bbb731acb21ccf79ef",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_02_denoised": {
+          "dtype": "float32",
+          "sha256": "95ad40ca19d396b8792beaf5acd360ed6410a4d780e57693c0c7b80ad1eddad5",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_02_sigma": {
+          "dtype": "float32",
+          "sha256": "b37eef9568bbeebf3aebc3e283eb7245b16813dc0938ead61d1aed1cc0ab0fdd",
+          "shape": [
+            1
+          ]
+        },
+        "step_02_x": {
+          "dtype": "float32",
+          "sha256": "b80991028f0312fdb8c096f2e20d987e3258c0a4eb5149f7336c0fbdea7e2f36",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_03_denoised": {
+          "dtype": "float32",
+          "sha256": "248f13b314bb5c6b6f4156a9cbfc2b831bb5cc91127d2f27c67ab591359e0162",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_03_sigma": {
+          "dtype": "float32",
+          "sha256": "b763d16673a6dbbc5b30079cc9ac39b54b5ade2f583ae919216ca5e3c7ed7260",
+          "shape": [
+            1
+          ]
+        },
+        "step_03_x": {
+          "dtype": "float32",
+          "sha256": "c3fc1458204516e7a5c0e6b284eaea1b5765ff96fbee65762aa563c46bfff7de",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_04_denoised": {
+          "dtype": "float32",
+          "sha256": "6c99d9cf21192b1741b9766de2aacb7e887908a25c5def9a2e97e18e3d10b653",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_04_sigma": {
+          "dtype": "float32",
+          "sha256": "238ab66f91028265545c06a9d7636a0c14c20a41eb6182fbe39a17d3938aa6ad",
+          "shape": [
+            1
+          ]
+        },
+        "step_04_x": {
+          "dtype": "float32",
+          "sha256": "967858f2ae6d0deb4b5ee4fcbb0acf48aacd07c6e1658011ec95498a2ba0db92",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_05_denoised": {
+          "dtype": "float32",
+          "sha256": "5c937355a1397067e6e38311d9771867695e9d969a591b2bf1df996a26eda868",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_05_sigma": {
+          "dtype": "float32",
+          "sha256": "902be42016fe670baa6d55b61dc075cf974470f70a842b47a5afadd4888c47e7",
+          "shape": [
+            1
+          ]
+        },
+        "step_05_x": {
+          "dtype": "float32",
+          "sha256": "deea4e5e493fb2b31304fa882502a52e08214df4e717f5a2551fd764474540a1",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_06_denoised": {
+          "dtype": "float32",
+          "sha256": "f20b7f11dea49c5c8dfbb5be939cc16dee6b9ce078c06620dc6a9c4fd2990001",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_06_sigma": {
+          "dtype": "float32",
+          "sha256": "421e2f9794bf93f572d45da5332e662cd729d816fa014707ce5d13e2ed445959",
+          "shape": [
+            1
+          ]
+        },
+        "step_06_x": {
+          "dtype": "float32",
+          "sha256": "ce107ac6b3aa32260e4a95ddaf537e7ca713e854aad7241fa34dd337912a3b81",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_07_denoised": {
+          "dtype": "float32",
+          "sha256": "d2fa5f6db6e06b334dfa201e732d580c3efd93f9f465e1aad8e846ee9c7018bc",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_07_sigma": {
+          "dtype": "float32",
+          "sha256": "657f518318a22bc7077b0c30afd053879146223019c53ba2a9653aefceb0587d",
+          "shape": [
+            1
+          ]
+        },
+        "step_07_x": {
+          "dtype": "float32",
+          "sha256": "cef2238887eece55b05f09c7057bf9b30b54dfb39bc20ce2e1765adb4351b4f7",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "t5_attention_mask": {
+          "dtype": "bool",
+          "sha256": "49bd4e8ab440f006660f5875cfd959802d270b3f6f406802a902901a8bbec2a1",
+          "shape": [
+            1,
+            256
+          ]
+        },
+        "t5_input_ids": {
+          "dtype": "int64",
+          "sha256": "e69cde449aa147db764a4753848111da5df9ec5e73a0396c62a32e6ddbbfdcda",
+          "shape": [
+            1,
+            256
+          ]
+        },
+        "t5_last_hidden_state": {
+          "dtype": "bfloat16",
+          "sha256": "6032044435b5c2c133d489e80174c1a712cf44dceeff933cd6c3d55dbc9b7a73",
+          "shape": [
+            1,
+            256,
+            768
+          ]
+        },
+        "t5_projected_padded": {
+          "dtype": "float32",
+          "sha256": "7143c3c7814e8241db77bac52a715979cc29b146e63b4654fe0ea53861fd94b1",
+          "shape": [
+            1,
+            256,
+            768
+          ]
+        }
+      }
+    },
+    "small-sfx-base": {
+      "bytes": 1512556,
+      "file": "small-sfx-base-reference.safetensors",
+      "sha256": "4394a65f157bddf60189f069f2a474fe5a99cb679ee20f4c4e9116ff62159e67",
+      "tensors": {
+        "dit_noise": {
+          "dtype": "float32",
+          "sha256": "e9dbeabea577e9c3bd3b36db0d999e9673f741d89d5c3e5c6467fa501f3aa9c7",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "dit_prediction": {
+          "dtype": "float32",
+          "sha256": "c4c5ed353a014ad6337b09e6a6caffcaa2ab737c0d616de4ef1364069df7ae5f",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "dit_timestep": {
+          "dtype": "float32",
+          "sha256": "f4ae72e81b5b48609bb3ba0689381d54cd3b11a8d81b2ce5579f8caa671a71c2",
+          "shape": [
+            1
+          ]
+        },
+        "sampler_final": {
+          "dtype": "float32",
+          "sha256": "2d49a4a382bd2f8030fd87d61bb504f92e30abafea7ab325f1c18a897e1f2382",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "sampler_initial_noise": {
+          "dtype": "float32",
+          "sha256": "e9dbeabea577e9c3bd3b36db0d999e9673f741d89d5c3e5c6467fa501f3aa9c7",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_00_denoised": {
+          "dtype": "float32",
+          "sha256": "7c8718fa086837ded7c85506fd691a47076d2f217ddc5df74bf2600119e296d7",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_00_sigma": {
+          "dtype": "float32",
+          "sha256": "3851b891ccee924ab5e123e82df08adf9ca1a916ff330c2a51d875ed5b3b0171",
+          "shape": [
+            1
+          ]
+        },
+        "step_00_x": {
+          "dtype": "float32",
+          "sha256": "e9dbeabea577e9c3bd3b36db0d999e9673f741d89d5c3e5c6467fa501f3aa9c7",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_01_denoised": {
+          "dtype": "float32",
+          "sha256": "0557cb755b8f4495cdc655ebf3dac7ea1335e1006e27472f2d4a7d836e53eb9a",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_01_sigma": {
+          "dtype": "float32",
+          "sha256": "9164f2afa091e6d05e5035b5eec63ef22f318617f7eaf434e536aa0be58e732a",
+          "shape": [
+            1
+          ]
+        },
+        "step_01_x": {
+          "dtype": "float32",
+          "sha256": "05d540eb3a052a1e5d71f062e8315d26af6523526e38523bf1b0a2a38dd2942b",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_02_denoised": {
+          "dtype": "float32",
+          "sha256": "919bdaac7dd44e6ee387be228991c497dd2a1fcff3ef0f750358245fbfde4b4a",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_02_sigma": {
+          "dtype": "float32",
+          "sha256": "b37eef9568bbeebf3aebc3e283eb7245b16813dc0938ead61d1aed1cc0ab0fdd",
+          "shape": [
+            1
+          ]
+        },
+        "step_02_x": {
+          "dtype": "float32",
+          "sha256": "a76d93780fdd1aa198e1cc1c6806db5838dac1db38cf2ce7273b8abefa4be014",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_03_denoised": {
+          "dtype": "float32",
+          "sha256": "0a4acd196e8912facb51a68b9bed075ba5bae1f1c5a50efb9f8fef439b1f65b3",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_03_sigma": {
+          "dtype": "float32",
+          "sha256": "b763d16673a6dbbc5b30079cc9ac39b54b5ade2f583ae919216ca5e3c7ed7260",
+          "shape": [
+            1
+          ]
+        },
+        "step_03_x": {
+          "dtype": "float32",
+          "sha256": "4ee40c66d8fcb492afa5080cb6a752e9f293808c684451cf20aee0a70bafa0d9",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_04_denoised": {
+          "dtype": "float32",
+          "sha256": "f9da3dedd1370d4c33bdd8fbb7978610bfdee2bb27d43c838e936d43ad4d14cd",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_04_sigma": {
+          "dtype": "float32",
+          "sha256": "238ab66f91028265545c06a9d7636a0c14c20a41eb6182fbe39a17d3938aa6ad",
+          "shape": [
+            1
+          ]
+        },
+        "step_04_x": {
+          "dtype": "float32",
+          "sha256": "f205807e4ee04a9f1bc9d63ca4c8bb42d567178cf03e08f0e91cd66c2d747d56",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_05_denoised": {
+          "dtype": "float32",
+          "sha256": "e1678155b3fcba3f231be7e70f8a0ed4e300c1ecdd9d7212fb4c9d970956473c",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_05_sigma": {
+          "dtype": "float32",
+          "sha256": "902be42016fe670baa6d55b61dc075cf974470f70a842b47a5afadd4888c47e7",
+          "shape": [
+            1
+          ]
+        },
+        "step_05_x": {
+          "dtype": "float32",
+          "sha256": "b95f9133f16189b2a9cfb7f67513d02b2b6a206352e793c772bbc67405567a7e",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_06_denoised": {
+          "dtype": "float32",
+          "sha256": "8329d210b2ff50bc0244551e18ba5b1bf182277f270e161cf6b6cbb648c36bb6",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_06_sigma": {
+          "dtype": "float32",
+          "sha256": "421e2f9794bf93f572d45da5332e662cd729d816fa014707ce5d13e2ed445959",
+          "shape": [
+            1
+          ]
+        },
+        "step_06_x": {
+          "dtype": "float32",
+          "sha256": "f3fd41926b500345b6a607bbccd4adad0ae585b730f2ef860fad9920740d1a18",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_07_denoised": {
+          "dtype": "float32",
+          "sha256": "2d49a4a382bd2f8030fd87d61bb504f92e30abafea7ab325f1c18a897e1f2382",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "step_07_sigma": {
+          "dtype": "float32",
+          "sha256": "657f518318a22bc7077b0c30afd053879146223019c53ba2a9653aefceb0587d",
+          "shape": [
+            1
+          ]
+        },
+        "step_07_x": {
+          "dtype": "float32",
+          "sha256": "60f7b827b61adf66decebd9d202bd29d47d57627e001b87ec1406620ac7f97b1",
+          "shape": [
+            1,
+            256,
+            16
+          ]
+        },
+        "t5_attention_mask": {
+          "dtype": "bool",
+          "sha256": "49bd4e8ab440f006660f5875cfd959802d270b3f6f406802a902901a8bbec2a1",
+          "shape": [
+            1,
+            256
+          ]
+        },
+        "t5_input_ids": {
+          "dtype": "int64",
+          "sha256": "e69cde449aa147db764a4753848111da5df9ec5e73a0396c62a32e6ddbbfdcda",
+          "shape": [
+            1,
+            256
+          ]
+        },
+        "t5_last_hidden_state": {
+          "dtype": "bfloat16",
+          "sha256": "6032044435b5c2c133d489e80174c1a712cf44dceeff933cd6c3d55dbc9b7a73",
+          "shape": [
+            1,
+            256,
+            768
+          ]
+        },
+        "t5_projected_padded": {
+          "dtype": "float32",
+          "sha256": "be85f8e17c15b948e2f3ef54af092658f946d8a0911db2aec78e79f06907d7c8",
+          "shape": [
+            1,
+            256,
+            768
+          ]
+        }
+      }
+    }
+  },
+  "elapsedSeconds": 32.771,
+  "inputs": {
+    "audioSamples": 16384,
+    "latentLength": 16,
+    "prompt": "Warm analog synth pulses, crisp percussion, spacious stereo field, 112 BPM",
+    "sampler": "pingpong",
+    "samplerSteps": 8,
+    "seed": 14534,
+    "timestep": 0.5
+  },
+  "referenceEnvironment": {
+    "device": "cpu",
+    "platform": "macOS-26.5.2-arm64-arm-64bit",
+    "python": "3.12.13",
+    "torch": "2.7.1",
+    "torchaudio": "2.7.1",
+    "transformers": "5.8.0"
+  },
+  "schemaVersion": 1,
+  "snapshots": [
+    {
+      "consumedConfig": {
+        "conditioning": {
+          "cond_dim": 768,
+          "configs": [
+            {
+              "config": {
+                "max_length": 256,
+                "padding_mode": "learned",
+                "repo_id": "stabilityai/stable-audio-3-small-music",
+                "subfolder": "t5gemma-b-b-ul2"
+              },
+              "id": "prompt",
+              "type": "t5gemma"
+            },
+            {
+              "config": {
+                "fourier_features_type": "expo",
+                "max_val": 384,
+                "min_val": 0
+              },
+              "id": "seconds_total",
+              "type": "number"
+            }
+          ]
+        },
+        "crossAttentionCondIds": [
+          "prompt",
+          "seconds_total"
+        ],
+        "diffusionObjective": "rf_denoiser",
+        "distributionShiftOptions": {
+          "max_length": 4096,
+          "min_length": 256,
+          "type": "full"
+        },
+        "dit": {
+          "attn_kwargs": {
+            "differential": false,
+            "qk_norm": "rms"
+          },
+          "cond_token_dim": 768,
+          "depth": 20,
+          "embed_dim": 1024,
+          "ff_kwargs": {
+            "mult": 4.0
+          },
+          "global_cond_dim": 768,
+          "global_cond_type": "adaLN",
+          "io_channels": 256,
+          "local_add_cond_dim": 257,
+          "norm_kwargs": {
+            "force_fp32": true
+          },
+          "norm_type": "rms_norm",
+          "num_heads": 16,
+          "num_memory_tokens": 64,
+          "timestep_features_logsnr": false,
+          "timestep_features_type": "expo"
+        },
+        "globalCondIds": [
+          "seconds_total"
+        ],
+        "inputConcatIds": [],
+        "ioChannels": 256,
+        "localAddCondIds": [
+          "inpaint_mask",
+          "inpaint_masked_input"
+        ],
+        "maskPaddingAttention": true,
+        "modelType": "diffusion_cond_inpaint",
+        "modularLocalCondConfigs": [],
+        "prependCondIds": [],
+        "pretransform": {
+          "chunked": true,
+          "config": {
+            "bottleneck": {
+              "config": {
+                "auto_scale": true,
+                "dim": 256,
+                "freeze": true,
+                "noise_augment_dim": 0,
+                "noise_regularize": true
+              },
+              "requires_grad": false,
+              "type": "softnorm"
+            },
+            "decoder": {
+              "config": {
+                "c_mults": [
+                  6
+                ],
+                "channels": 128,
+                "checkpointing": false,
+                "chunk_midpoint_shift": true,
+                "chunk_size": 32,
+                "conv_mapping": true,
+                "differential": true,
+                "dim_heads": 64,
+                "dyt": true,
+                "freeze_backbone": false,
+                "latent_dim": 256,
+                "mapping_style": "none",
+                "mask_noise": 0.01,
+                "out_channels": 512,
+                "sinusoidal_blocks": [
+                  0
+                ],
+                "strides": [
+                  16
+                ],
+                "transformer_depths": [
+                  6
+                ],
+                "use_flash": true,
+                "variable_stride": true
+              },
+              "requires_grad": false,
+              "type": "taae_v2"
+            },
+            "downsampling_ratio": 4096,
+            "encoder": {
+              "config": {
+                "c_mults": [
+                  6
+                ],
+                "channels": 128,
+                "checkpointing": false,
+                "chunk_midpoint_shift": true,
+                "chunk_size": 32,
+                "conv_mapping": false,
+                "differential": true,
+                "dim_heads": 64,
+                "dyt": true,
+                "in_channels": 512,
+                "latent_dim": 256,
+                "mapping_style": "none",
+                "mask_noise": 0.0,
+                "strides": [
+                  16
+                ],
+                "transformer_depths": [
+                  6
+                ],
+                "use_flash": true,
+                "variable_stride": true
+              },
+              "requires_grad": false,
+              "type": "taae_v2"
+            },
+            "io_channels": 2,
+            "latent_dim": 256,
+            "pretransform": {
+              "config": {
+                "channels": 2,
+                "patch_size": 256
+              },
+              "enable_grad": false,
+              "type": "patched"
+            }
+          },
+          "enable_grad": false,
+          "iterate_batch": false,
+          "type": "autoencoder"
+        },
+        "sampleRate": 44100,
+        "sampleSize": 5292032,
+        "samplingDistributionShiftOptions": null,
+        "svdBasesPath": null,
+        "useEffectiveLengthForSchedule": true
+      },
+      "key": "small-music",
+      "kind": "dit",
+      "modelBytes": 2270384940,
+      "modelConfigSha256": "100776f25af5aa83f70e0c6b384de6690cb4e5ad01c24f7cfbb6524d18765f06",
+      "pathEnvironmentVariable": "SA3_SMALL_MUSIC_SNAPSHOT",
+      "repository": "stabilityai/stable-audio-3-small-music",
+      "revision": "0fef1392cd842149a2b6d445e181c97608faac06",
+      "t5Gemma": {
+        "configSha256": "575334409716886ac2952f5a275ed92868deef8a0ea560258d9970a431c6fb3a",
+        "modelBytes": 1183022944,
+        "subfolder": "t5gemma-b-b-ul2"
+      }
+    },
+    {
+      "consumedConfig": {
+        "conditioning": {
+          "cond_dim": 768,
+          "configs": [
+            {
+              "config": {
+                "max_length": 256,
+                "padding_mode": "learned",
+                "repo_id": "stabilityai/stable-audio-3-small-sfx",
+                "subfolder": "t5gemma-b-b-ul2"
+              },
+              "id": "prompt",
+              "type": "t5gemma"
+            },
+            {
+              "config": {
+                "fourier_features_type": "expo",
+                "max_val": 384,
+                "min_val": 0
+              },
+              "id": "seconds_total",
+              "type": "number"
+            }
+          ]
+        },
+        "crossAttentionCondIds": [
+          "prompt",
+          "seconds_total"
+        ],
+        "diffusionObjective": "rf_denoiser",
+        "distributionShiftOptions": {
+          "max_length": 4096,
+          "min_length": 256,
+          "type": "full"
+        },
+        "dit": {
+          "attn_kwargs": {
+            "differential": false,
+            "qk_norm": "rms"
+          },
+          "cond_token_dim": 768,
+          "depth": 20,
+          "embed_dim": 1024,
+          "ff_kwargs": {
+            "mult": 4.0
+          },
+          "global_cond_dim": 768,
+          "global_cond_type": "adaLN",
+          "io_channels": 256,
+          "local_add_cond_dim": 257,
+          "norm_kwargs": {
+            "force_fp32": true
+          },
+          "norm_type": "rms_norm",
+          "num_heads": 16,
+          "num_memory_tokens": 64,
+          "timestep_features_logsnr": false,
+          "timestep_features_type": "expo"
+        },
+        "globalCondIds": [
+          "seconds_total"
+        ],
+        "inputConcatIds": [],
+        "ioChannels": 256,
+        "localAddCondIds": [
+          "inpaint_mask",
+          "inpaint_masked_input"
+        ],
+        "maskPaddingAttention": true,
+        "modelType": "diffusion_cond_inpaint",
+        "modularLocalCondConfigs": [],
+        "prependCondIds": [],
+        "pretransform": {
+          "chunked": true,
+          "config": {
+            "bottleneck": {
+              "config": {
+                "auto_scale": true,
+                "dim": 256,
+                "freeze": true,
+                "noise_augment_dim": 0,
+                "noise_regularize": true
+              },
+              "requires_grad": false,
+              "type": "softnorm"
+            },
+            "decoder": {
+              "config": {
+                "c_mults": [
+                  6
+                ],
+                "channels": 128,
+                "checkpointing": false,
+                "chunk_midpoint_shift": true,
+                "chunk_size": 32,
+                "conv_mapping": true,
+                "differential": true,
+                "dim_heads": 64,
+                "dyt": true,
+                "freeze_backbone": false,
+                "latent_dim": 256,
+                "mapping_style": "none",
+                "mask_noise": 0.01,
+                "out_channels": 512,
+                "sinusoidal_blocks": [
+                  0
+                ],
+                "strides": [
+                  16
+                ],
+                "transformer_depths": [
+                  6
+                ],
+                "use_flash": true,
+                "variable_stride": true
+              },
+              "requires_grad": false,
+              "type": "taae_v2"
+            },
+            "downsampling_ratio": 4096,
+            "encoder": {
+              "config": {
+                "c_mults": [
+                  6
+                ],
+                "channels": 128,
+                "checkpointing": false,
+                "chunk_midpoint_shift": true,
+                "chunk_size": 32,
+                "conv_mapping": false,
+                "differential": true,
+                "dim_heads": 64,
+                "dyt": true,
+                "in_channels": 512,
+                "latent_dim": 256,
+                "mapping_style": "none",
+                "mask_noise": 0.0,
+                "strides": [
+                  16
+                ],
+                "transformer_depths": [
+                  6
+                ],
+                "use_flash": true,
+                "variable_stride": true
+              },
+              "requires_grad": false,
+              "type": "taae_v2"
+            },
+            "io_channels": 2,
+            "latent_dim": 256,
+            "pretransform": {
+              "config": {
+                "channels": 2,
+                "patch_size": 256
+              },
+              "enable_grad": false,
+              "type": "patched"
+            }
+          },
+          "enable_grad": false,
+          "iterate_batch": false,
+          "type": "autoencoder"
+        },
+        "sampleRate": 44100,
+        "sampleSize": 5292032,
+        "samplingDistributionShiftOptions": null,
+        "svdBasesPath": null,
+        "useEffectiveLengthForSchedule": true
+      },
+      "key": "small-sfx",
+      "kind": "dit",
+      "modelBytes": 2270384940,
+      "modelConfigSha256": "a8aa5d45ae3d6524d3cd4e85e0d6e7d8d401267e7c6f28214bca8aae7b77bdeb",
+      "pathEnvironmentVariable": "SA3_SMALL_SFX_SNAPSHOT",
+      "repository": "stabilityai/stable-audio-3-small-sfx",
+      "revision": "ae12755283df9d62ca39a9b050a39a0b607b8c20",
+      "t5Gemma": {
+        "configSha256": "575334409716886ac2952f5a275ed92868deef8a0ea560258d9970a431c6fb3a",
+        "modelBytes": 1183022944,
+        "subfolder": "t5gemma-b-b-ul2"
+      }
+    },
+    {
+      "consumedConfig": {
+        "conditioning": {
+          "cond_dim": 768,
+          "configs": [
+            {
+              "config": {
+                "max_length": 256,
+                "padding_mode": "learned",
+                "repo_id": "stabilityai/stable-audio-3-medium",
+                "subfolder": "t5gemma-b-b-ul2"
+              },
+              "id": "prompt",
+              "type": "t5gemma"
+            },
+            {
+              "config": {
+                "fourier_features_type": "expo",
+                "max_val": 384,
+                "min_val": 0
+              },
+              "id": "seconds_total",
+              "type": "number"
+            }
+          ]
+        },
+        "crossAttentionCondIds": [
+          "prompt",
+          "seconds_total"
+        ],
+        "diffusionObjective": "rf_denoiser",
+        "distributionShiftOptions": {
+          "max_length": 4096,
+          "min_length": 256
+        },
+        "dit": {
+          "attn_kwargs": {
+            "differential": true,
+            "qk_norm": "rms"
+          },
+          "cond_token_dim": 768,
+          "depth": 24,
+          "embed_dim": 1536,
+          "ff_kwargs": {
+            "mult": 4.0
+          },
+          "global_cond_dim": 768,
+          "global_cond_type": "adaLN",
+          "io_channels": 256,
+          "local_add_cond_dim": 257,
+          "norm_kwargs": {
+            "force_fp32": true
+          },
+          "norm_type": "rms_norm",
+          "num_heads": 24,
+          "num_memory_tokens": 64,
+          "timestep_features_type": "expo"
+        },
+        "globalCondIds": [
+          "seconds_total"
+        ],
+        "inputConcatIds": [],
+        "ioChannels": 256,
+        "localAddCondIds": [
+          "inpaint_mask",
+          "inpaint_masked_input"
+        ],
+        "maskPaddingAttention": true,
+        "modelType": "diffusion_cond_inpaint",
+        "modularLocalCondConfigs": [],
+        "prependCondIds": [],
+        "pretransform": {
+          "chunked": true,
+          "config": {
+            "bottleneck": {
+              "config": {
+                "auto_scale": true,
+                "dim": 256,
+                "freeze": true,
+                "noise_augment_dim": 0,
+                "noise_regularize": true
+              },
+              "type": "softnorm"
+            },
+            "decoder": {
+              "config": {
+                "c_mults": [
+                  6
+                ],
+                "channels": 256,
+                "checkpointing": false,
+                "conformer": false,
+                "conv_bias": false,
+                "differential": true,
+                "dim_heads": 64,
+                "enable_inner_layer_dropout": false,
+                "latent_dim": 256,
+                "layer_scale": false,
+                "mapping_style": "none",
+                "mask_noise": 0.1,
+                "out_channels": 512,
+                "sinusoidal_blocks": [
+                  8
+                ],
+                "sliding_window": [
+                  1,
+                  1
+                ],
+                "strides": [
+                  16
+                ],
+                "transformer_depths": [
+                  12
+                ],
+                "use_dilated_conv": false,
+                "use_flash": true,
+                "use_snake": false,
+                "variable_stride": true
+              },
+              "requires_grad": false,
+              "type": "taae_v2"
+            },
+            "downsampling_ratio": 4096,
+            "encoder": {
+              "config": {
+                "c_mults": [
+                  6
+                ],
+                "channels": 256,
+                "checkpointing": true,
+                "conformer": false,
+                "conv_bias": false,
+                "differential": true,
+                "dim_heads": 64,
+                "enable_inner_layer_dropout": false,
+                "in_channels": 512,
+                "latent_dim": 256,
+                "layer_scale": false,
+                "mapping_style": "none",
+                "mask_noise": 0.001,
+                "sliding_window": [
+                  1,
+                  1
+                ],
+                "strides": [
+                  16
+                ],
+                "transformer_depths": [
+                  12
+                ],
+                "use_dilated_conv": false,
+                "use_flash": true,
+                "use_snake": false,
+                "variable_stride": true
+              },
+              "requires_grad": false,
+              "type": "taae_v2"
+            },
+            "io_channels": 2,
+            "latent_dim": 256,
+            "pretransform": {
+              "config": {
+                "channels": 2,
+                "patch_size": 256
+              },
+              "type": "patched"
+            }
+          },
+          "iterate_batch": false,
+          "type": "autoencoder"
+        },
+        "sampleRate": 44100,
+        "sampleSize": 16777216,
+        "samplingDistributionShiftOptions": null,
+        "svdBasesPath": null,
+        "useEffectiveLengthForSchedule": true
+      },
+      "key": "medium",
+      "kind": "dit",
+      "modelBytes": 9222116660,
+      "modelConfigSha256": "4f8846649df59167e1792d134acb6fc2bb7105227c5455300bad6cb107e20c88",
+      "pathEnvironmentVariable": "SA3_MEDIUM_SNAPSHOT",
+      "repository": "stabilityai/stable-audio-3-medium",
+      "revision": "27b5a21b791b1b033d193a9e1e3ce78493f102f9",
+      "t5Gemma": {
+        "configSha256": "575334409716886ac2952f5a275ed92868deef8a0ea560258d9970a431c6fb3a",
+        "modelBytes": 1183022944,
+        "subfolder": "t5gemma-b-b-ul2"
+      }
+    },
+    {
+      "consumedConfig": {
+        "conditioning": {
+          "cond_dim": 768,
+          "configs": [
+            {
+              "config": {
+                "max_length": 256,
+                "padding_mode": "learned",
+                "repo_id": "stabilityai/stable-audio-3-small-music",
+                "subfolder": "t5gemma-b-b-ul2"
+              },
+              "id": "prompt",
+              "type": "t5gemma"
+            },
+            {
+              "config": {
+                "fourier_features_type": "expo",
+                "max_val": 384,
+                "min_val": 0
+              },
+              "id": "seconds_total",
+              "type": "number"
+            }
+          ]
+        },
+        "crossAttentionCondIds": [
+          "prompt",
+          "seconds_total"
+        ],
+        "diffusionObjective": "rectified_flow",
+        "distributionShiftOptions": {
+          "max_length": 4096,
+          "min_length": 256,
+          "type": "full"
+        },
+        "dit": {
+          "attn_kwargs": {
+            "differential": false,
+            "qk_norm": "rms"
+          },
+          "cond_token_dim": 768,
+          "depth": 20,
+          "embed_dim": 1024,
+          "ff_kwargs": {
+            "mult": 4.0
+          },
+          "global_cond_dim": 768,
+          "global_cond_type": "adaLN",
+          "io_channels": 256,
+          "local_add_cond_dim": 257,
+          "norm_kwargs": {
+            "force_fp32": true
+          },
+          "norm_type": "rms_norm",
+          "num_heads": 16,
+          "num_memory_tokens": 64,
+          "timestep_features_logsnr": false,
+          "timestep_features_type": "expo"
+        },
+        "globalCondIds": [
+          "seconds_total"
+        ],
+        "inputConcatIds": [],
+        "ioChannels": 256,
+        "localAddCondIds": [
+          "inpaint_mask",
+          "inpaint_masked_input"
+        ],
+        "maskPaddingAttention": true,
+        "modelType": "diffusion_cond_inpaint",
+        "modularLocalCondConfigs": [],
+        "prependCondIds": [],
+        "pretransform": {
+          "chunked": true,
+          "config": {
+            "bottleneck": {
+              "config": {
+                "auto_scale": true,
+                "dim": 256,
+                "freeze": true,
+                "noise_augment_dim": 0,
+                "noise_regularize": true
+              },
+              "requires_grad": false,
+              "type": "softnorm"
+            },
+            "decoder": {
+              "config": {
+                "c_mults": [
+                  6
+                ],
+                "channels": 128,
+                "checkpointing": false,
+                "chunk_midpoint_shift": true,
+                "chunk_size": 32,
+                "conv_mapping": true,
+                "differential": true,
+                "dim_heads": 64,
+                "dyt": true,
+                "freeze_backbone": false,
+                "latent_dim": 256,
+                "mapping_style": "none",
+                "mask_noise": 0.01,
+                "out_channels": 512,
+                "sinusoidal_blocks": [
+                  0
+                ],
+                "strides": [
+                  16
+                ],
+                "transformer_depths": [
+                  6
+                ],
+                "use_flash": true,
+                "variable_stride": true
+              },
+              "requires_grad": false,
+              "type": "taae_v2"
+            },
+            "downsampling_ratio": 4096,
+            "encoder": {
+              "config": {
+                "c_mults": [
+                  6
+                ],
+                "channels": 128,
+                "checkpointing": false,
+                "chunk_midpoint_shift": true,
+                "chunk_size": 32,
+                "conv_mapping": false,
+                "differential": true,
+                "dim_heads": 64,
+                "dyt": true,
+                "in_channels": 512,
+                "latent_dim": 256,
+                "mapping_style": "none",
+                "mask_noise": 0.0,
+                "strides": [
+                  16
+                ],
+                "transformer_depths": [
+                  6
+                ],
+                "use_flash": true,
+                "variable_stride": true
+              },
+              "requires_grad": false,
+              "type": "taae_v2"
+            },
+            "io_channels": 2,
+            "latent_dim": 256,
+            "pretransform": {
+              "config": {
+                "channels": 2,
+                "patch_size": 256
+              },
+              "enable_grad": false,
+              "type": "patched"
+            }
+          },
+          "enable_grad": false,
+          "iterate_batch": false,
+          "type": "autoencoder"
+        },
+        "sampleRate": 44100,
+        "sampleSize": 5324800,
+        "samplingDistributionShiftOptions": null,
+        "svdBasesPath": null,
+        "useEffectiveLengthForSchedule": true
+      },
+      "key": "small-music-base",
+      "kind": "dit",
+      "modelBytes": 2270384940,
+      "modelConfigSha256": "e97f53a0882a99b0307cf7d87d63423f75925b5def5efc180d29740899c62486",
+      "pathEnvironmentVariable": "SA3_SMALL_MUSIC_BASE_SNAPSHOT",
+      "repository": "stabilityai/stable-audio-3-small-music-base",
+      "revision": "eab5ceee5ad9c1ed38800aff30a8e49d1161c539",
+      "t5Gemma": {
+        "configSha256": "575334409716886ac2952f5a275ed92868deef8a0ea560258d9970a431c6fb3a",
+        "modelBytes": 1183022944,
+        "subfolder": "t5gemma-b-b-ul2"
+      }
+    },
+    {
+      "consumedConfig": {
+        "conditioning": {
+          "cond_dim": 768,
+          "configs": [
+            {
+              "config": {
+                "max_length": 256,
+                "padding_mode": "learned",
+                "repo_id": "stabilityai/stable-audio-3-small-sfx",
+                "subfolder": "t5gemma-b-b-ul2"
+              },
+              "id": "prompt",
+              "type": "t5gemma"
+            },
+            {
+              "config": {
+                "fourier_features_type": "expo",
+                "max_val": 384,
+                "min_val": 0
+              },
+              "id": "seconds_total",
+              "type": "number"
+            }
+          ]
+        },
+        "crossAttentionCondIds": [
+          "prompt",
+          "seconds_total"
+        ],
+        "diffusionObjective": "rectified_flow",
+        "distributionShiftOptions": {
+          "max_length": 4096,
+          "min_length": 256,
+          "type": "full"
+        },
+        "dit": {
+          "attn_kwargs": {
+            "differential": false,
+            "qk_norm": "rms"
+          },
+          "cond_token_dim": 768,
+          "depth": 20,
+          "embed_dim": 1024,
+          "ff_kwargs": {
+            "mult": 4.0
+          },
+          "global_cond_dim": 768,
+          "global_cond_type": "adaLN",
+          "io_channels": 256,
+          "local_add_cond_dim": 257,
+          "norm_kwargs": {
+            "force_fp32": true
+          },
+          "norm_type": "rms_norm",
+          "num_heads": 16,
+          "num_memory_tokens": 64,
+          "timestep_features_logsnr": false,
+          "timestep_features_type": "expo"
+        },
+        "globalCondIds": [
+          "seconds_total"
+        ],
+        "inputConcatIds": [],
+        "ioChannels": 256,
+        "localAddCondIds": [
+          "inpaint_mask",
+          "inpaint_masked_input"
+        ],
+        "maskPaddingAttention": true,
+        "modelType": "diffusion_cond_inpaint",
+        "modularLocalCondConfigs": [],
+        "prependCondIds": [],
+        "pretransform": {
+          "chunked": true,
+          "config": {
+            "bottleneck": {
+              "config": {
+                "auto_scale": true,
+                "dim": 256,
+                "freeze": true,
+                "noise_augment_dim": 0,
+                "noise_regularize": true
+              },
+              "requires_grad": false,
+              "type": "softnorm"
+            },
+            "decoder": {
+              "config": {
+                "c_mults": [
+                  6
+                ],
+                "channels": 128,
+                "checkpointing": false,
+                "chunk_midpoint_shift": true,
+                "chunk_size": 32,
+                "conv_mapping": true,
+                "differential": true,
+                "dim_heads": 64,
+                "dyt": true,
+                "freeze_backbone": false,
+                "latent_dim": 256,
+                "mapping_style": "none",
+                "mask_noise": 0.01,
+                "out_channels": 512,
+                "sinusoidal_blocks": [
+                  0
+                ],
+                "strides": [
+                  16
+                ],
+                "transformer_depths": [
+                  6
+                ],
+                "use_flash": true,
+                "variable_stride": true
+              },
+              "requires_grad": false,
+              "type": "taae_v2"
+            },
+            "downsampling_ratio": 4096,
+            "encoder": {
+              "config": {
+                "c_mults": [
+                  6
+                ],
+                "channels": 128,
+                "checkpointing": false,
+                "chunk_midpoint_shift": true,
+                "chunk_size": 32,
+                "conv_mapping": false,
+                "differential": true,
+                "dim_heads": 64,
+                "dyt": true,
+                "in_channels": 512,
+                "latent_dim": 256,
+                "mapping_style": "none",
+                "mask_noise": 0.0,
+                "strides": [
+                  16
+                ],
+                "transformer_depths": [
+                  6
+                ],
+                "use_flash": true,
+                "variable_stride": true
+              },
+              "requires_grad": false,
+              "type": "taae_v2"
+            },
+            "io_channels": 2,
+            "latent_dim": 256,
+            "pretransform": {
+              "config": {
+                "channels": 2,
+                "patch_size": 256
+              },
+              "enable_grad": false,
+              "type": "patched"
+            }
+          },
+          "enable_grad": false,
+          "iterate_batch": false,
+          "scale": 1.0,
+          "type": "autoencoder"
+        },
+        "sampleRate": 44100,
+        "sampleSize": 5324800,
+        "samplingDistributionShiftOptions": null,
+        "svdBasesPath": null,
+        "useEffectiveLengthForSchedule": true
+      },
+      "key": "small-sfx-base",
+      "kind": "dit",
+      "modelBytes": 2270384940,
+      "modelConfigSha256": "cecfbca43fa8ece5d1d128fba74a39594ea954b2b128048534f72665c6721165",
+      "pathEnvironmentVariable": "SA3_SMALL_SFX_BASE_SNAPSHOT",
+      "repository": "stabilityai/stable-audio-3-small-sfx-base",
+      "revision": "cc5ddb990e30daa68336ac61c140c37c7033ab7c",
+      "t5Gemma": {
+        "configSha256": "575334409716886ac2952f5a275ed92868deef8a0ea560258d9970a431c6fb3a",
+        "modelBytes": 1183022944,
+        "subfolder": "t5gemma-b-b-ul2"
+      }
+    },
+    {
+      "consumedConfig": {
+        "conditioning": {
+          "cond_dim": 768,
+          "configs": [
+            {
+              "config": {
+                "max_length": 256,
+                "padding_mode": "learned",
+                "repo_id": "stabilityai/stable-audio-3-medium",
+                "subfolder": "t5gemma-b-b-ul2"
+              },
+              "id": "prompt",
+              "type": "t5gemma"
+            },
+            {
+              "config": {
+                "fourier_features_type": "expo",
+                "max_val": 384,
+                "min_val": 0
+              },
+              "id": "seconds_total",
+              "type": "number"
+            }
+          ]
+        },
+        "crossAttentionCondIds": [
+          "prompt",
+          "seconds_total"
+        ],
+        "diffusionObjective": "rectified_flow",
+        "distributionShiftOptions": {
+          "max_length": 4096,
+          "min_length": 256
+        },
+        "dit": {
+          "attn_kwargs": {
+            "differential": true,
+            "qk_norm": "rms"
+          },
+          "cond_token_dim": 768,
+          "depth": 24,
+          "embed_dim": 1536,
+          "ff_kwargs": {
+            "mult": 4.0
+          },
+          "global_cond_dim": 768,
+          "global_cond_type": "adaLN",
+          "io_channels": 256,
+          "local_add_cond_dim": 257,
+          "norm_kwargs": {
+            "force_fp32": true
+          },
+          "norm_type": "rms_norm",
+          "num_heads": 24,
+          "num_memory_tokens": 64,
+          "timestep_features_type": "expo"
+        },
+        "globalCondIds": [
+          "seconds_total"
+        ],
+        "inputConcatIds": [],
+        "ioChannels": 256,
+        "localAddCondIds": [
+          "inpaint_mask",
+          "inpaint_masked_input"
+        ],
+        "maskPaddingAttention": true,
+        "modelType": "diffusion_cond_inpaint",
+        "modularLocalCondConfigs": [],
+        "prependCondIds": [],
+        "pretransform": {
+          "chunked": true,
+          "config": {
+            "bottleneck": {
+              "config": {
+                "auto_scale": true,
+                "dim": 256,
+                "freeze": true,
+                "noise_augment_dim": 0,
+                "noise_regularize": true
+              },
+              "type": "softnorm"
+            },
+            "decoder": {
+              "config": {
+                "c_mults": [
+                  6
+                ],
+                "channels": 256,
+                "checkpointing": false,
+                "conformer": false,
+                "conv_bias": false,
+                "differential": true,
+                "dim_heads": 64,
+                "enable_inner_layer_dropout": false,
+                "latent_dim": 256,
+                "layer_scale": false,
+                "mapping_style": "none",
+                "mask_noise": 0.1,
+                "out_channels": 512,
+                "sinusoidal_blocks": [
+                  8
+                ],
+                "sliding_window": [
+                  1,
+                  1
+                ],
+                "strides": [
+                  16
+                ],
+                "transformer_depths": [
+                  12
+                ],
+                "use_dilated_conv": false,
+                "use_flash": true,
+                "use_snake": false,
+                "variable_stride": true
+              },
+              "requires_grad": false,
+              "type": "taae_v2"
+            },
+            "downsampling_ratio": 4096,
+            "encoder": {
+              "config": {
+                "c_mults": [
+                  6
+                ],
+                "channels": 256,
+                "checkpointing": true,
+                "conformer": false,
+                "conv_bias": false,
+                "differential": true,
+                "dim_heads": 64,
+                "enable_inner_layer_dropout": false,
+                "in_channels": 512,
+                "latent_dim": 256,
+                "layer_scale": false,
+                "mapping_style": "none",
+                "mask_noise": 0.001,
+                "sliding_window": [
+                  1,
+                  1
+                ],
+                "strides": [
+                  16
+                ],
+                "transformer_depths": [
+                  12
+                ],
+                "use_dilated_conv": false,
+                "use_flash": true,
+                "use_snake": false,
+                "variable_stride": true
+              },
+              "requires_grad": false,
+              "type": "taae_v2"
+            },
+            "io_channels": 2,
+            "latent_dim": 256,
+            "pretransform": {
+              "config": {
+                "channels": 2,
+                "patch_size": 256
+              },
+              "type": "patched"
+            }
+          },
+          "iterate_batch": false,
+          "type": "autoencoder"
+        },
+        "sampleRate": 44100,
+        "sampleSize": 16777216,
+        "samplingDistributionShiftOptions": null,
+        "svdBasesPath": null,
+        "useEffectiveLengthForSchedule": true
+      },
+      "key": "medium-base",
+      "kind": "dit",
+      "modelBytes": 9222116660,
+      "modelConfigSha256": "27e2a299f0bda6ff742d3387398f929299575642f2c6a4d4c4f94830928fd0d5",
+      "pathEnvironmentVariable": "SA3_MEDIUM_BASE_SNAPSHOT",
+      "repository": "stabilityai/stable-audio-3-medium-base",
+      "revision": "b32993f73c3bdc3864043a72d8032606bba737c8",
+      "t5Gemma": {
+        "configSha256": "575334409716886ac2952f5a275ed92868deef8a0ea560258d9970a431c6fb3a",
+        "modelBytes": 1183022944,
+        "subfolder": "t5gemma-b-b-ul2"
+      }
+    },
+    {
+      "key": "same-s",
+      "kind": "same",
+      "modelBytes": 433007588,
+      "modelConfigSha256": "c329dd0a6f61d0b3ea4f23930059a6c00437005692fed4310924eb286253303a",
+      "pathEnvironmentVariable": "SA3_SAME_S_SNAPSHOT",
+      "repository": "stabilityai/SAME-S",
+      "revision": "fbeb3dcf53a326e5682f38e22e7f740202d44232"
+    },
+    {
+      "key": "same-l",
+      "kind": "same",
+      "modelBytes": 3408566892,
+      "modelConfigSha256": "9ca55d03d868b8f6769cd7d678430a6b70c328db24350601903a92001bd4f9f1",
+      "pathEnvironmentVariable": "SA3_SAME_L_SNAPSHOT",
+      "repository": "stabilityai/SAME-L",
+      "revision": "41acf79dd242877d6499a1108ca5dba5d5eecfc5"
+    }
+  ],
+  "upstream": {
+    "commit": "124e8a799f57a1f665495ecb72e547d0a62867f1",
+    "repository": "https://github.com/Stability-AI/stable-audio-3.git"
+  }
+}
