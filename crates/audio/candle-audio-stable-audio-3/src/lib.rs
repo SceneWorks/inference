@@ -1,4 +1,4 @@
-//! Stable Audio 3 provider foundation (`sc-14535`).
+//! Stable Audio 3 provider foundation and shared primitives (`sc-14535`, `sc-14536`).
 //!
 //! This crate deliberately does **not** register a generator or preparer and is not referenced by
 //! `candle-audio-catalog` or a shipped bundle. It establishes the typed, offline seams later
@@ -8,6 +8,9 @@
 //!   constructor defaults, including DyT for SAME-S and SAME-L;
 //! - [`weights`] recognizes only caller-provisioned snapshot directories, validates their
 //!   safetensors headers, and maps the two checkpoint namespaces;
+//! - [`transformer`] implements the ordinary and direct-subtraction differential transformer
+//!   primitives shared by the DiT and SAME families;
+//! - [`pretransform`], [`softnorm`], and [`weight_norm`] cover the shared autoencoder seams;
 //! - [`prepare`] provides the unregistered dense passthrough implementation for later composition.
 //!
 //! Shared audio functionality stays in [`candle_audio`]. Consumers should use
@@ -18,6 +21,10 @@ pub use candle_audio::gen_core;
 
 pub mod config;
 pub mod prepare;
+pub mod pretransform;
+pub mod softnorm;
+pub mod transformer;
+pub mod weight_norm;
 pub mod weights;
 
 /// How a later Stable Audio 3 provider chooses its device.

@@ -157,6 +157,10 @@ fn all_eight_configs_and_real_headers_match() {
         let ae = roundtrip.autoencoder();
         assert!(ae.encoder.config.dyt, "{} encoder must use DyT", case.env);
         assert!(ae.decoder.config.dyt, "{} decoder must use DyT", case.env);
+        assert!(ae.encoder.config.differential, "{}", case.env);
+        assert!(ae.decoder.config.differential, "{}", case.env);
+        assert_eq!(ae.encoder.config.ff_mult, 3.0, "{}", case.env);
+        assert_eq!(ae.decoder.config.ff_mult, 3.0, "{}", case.env);
         let expected_ae_type = if case.kind == SnapshotKind::Full {
             AutoencoderModuleType::TaaeV2
         } else {
@@ -167,6 +171,25 @@ fn all_eight_configs_and_real_headers_match() {
 
         match (&roundtrip.model, case.objective) {
             (ModelConfig::Diffusion(model), Some(objective)) => {
+                let dit = &model.diffusion.config;
+                let medium = case.env.contains("MEDIUM");
+                assert_eq!(
+                    dit.embed_dim,
+                    if medium { 1536 } else { 1024 },
+                    "{}",
+                    case.env
+                );
+                assert_eq!(dit.depth, if medium { 24 } else { 20 }, "{}", case.env);
+                assert_eq!(dit.attn_kwargs.differential, medium, "{}", case.env);
+                assert_eq!(dit.num_memory_tokens, 64, "{}", case.env);
+                assert_eq!(
+                    dit.norm_type,
+                    candle_audio_stable_audio_3::config::NormType::RmsNorm
+                );
+                assert!(dit.norm_kwargs.force_fp32, "{}", case.env);
+                assert_eq!(dit.norm_kwargs.eps, 1e-5, "{}", case.env);
+                assert_eq!(dit.attn_kwargs.qk_norm_eps, 1e-6, "{}", case.env);
+                assert_eq!(dit.ff_kwargs.mult, 4.0, "{}", case.env);
                 assert_eq!(
                     model.diffusion.diffusion_objective, objective,
                     "{}",
@@ -179,7 +202,35 @@ fn all_eight_configs_and_real_headers_match() {
                     case.env
                 );
             }
-            (ModelConfig::Autoencoder(_), None) => {}
+            (ModelConfig::Autoencoder(model), None) => {
+                let large = case.env == "SA3_SAME_L_SNAPSHOT";
+                let expected_dim = if large { 1536 } else { 768 };
+                let expected_depth = if large { 12 } else { 6 };
+                assert_eq!(
+                    model.encoder.config.channels * model.encoder.config.c_mults[0],
+                    expected_dim,
+                    "{}",
+                    case.env
+                );
+                assert_eq!(
+                    model.encoder.config.transformer_depths,
+                    vec![expected_depth],
+                    "{}",
+                    case.env
+                );
+                assert_eq!(
+                    model.decoder.config.transformer_depths,
+                    vec![expected_depth],
+                    "{}",
+                    case.env
+                );
+                assert_eq!(
+                    model.decoder.config.sinusoidal_blocks,
+                    vec![if large { 8 } else { 0 }],
+                    "{}",
+                    case.env
+                );
+            }
             _ => panic!("{} config family/objective mismatch", case.env),
         }
 
