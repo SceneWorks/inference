@@ -113,6 +113,10 @@ jobs:
         run: ./scripts/check-workspace.py
       - name: Test repository tooling
         run: python3 -m unittest discover -s scripts/tests -v
+      - name: Test Mage oracle provisioning failures
+        run: |
+          python3 -m pip install --disable-pip-version-check numpy==2.4.3 safetensors==0.8.0
+          python3 scripts/release/provision_mage_oracles.py --self-test
 
   contracts:
     name: contracts + conformance testkits (Linux)

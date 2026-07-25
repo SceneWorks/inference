@@ -164,11 +164,15 @@ fn snapshot() -> PathBuf {
 /// Every golden bundle available for `size`, newest-oracle first.
 fn load_goldens(size: &str) -> Vec<(RefDtype, Weights)> {
     let dir = golden_dir();
+    let required_f32 = dir.join(format!("mage_flow_vae_f32_{size}.safetensors"));
+    if std::env::var_os("MAGE_REQUIRE_GOLDENS").is_some() && !required_f32.is_file() {
+        panic!(
+            "required CPU Mage-VAE oracle is missing: {}",
+            required_f32.display()
+        );
+    }
     let mut candidates = vec![
-        (
-            RefDtype::F32,
-            dir.join(format!("mage_flow_vae_f32_{size}.safetensors")),
-        ),
+        (RefDtype::F32, required_f32),
         (
             RefDtype::Bf16,
             dir.join(format!("mage_flow_vae_golden_{size}.safetensors")),

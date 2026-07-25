@@ -94,6 +94,7 @@ from _paths import fixture, hf_hub_cache
 # third-party reference source here). Put it on the path before importing it, so the harness
 # runs as `python tools/dump_mage_flow_golden.py` with no PYTHONPATH.
 VENDOR_ROOT = Path(__file__).resolve().parents[1] / "_vendor"
+GOLDEN_DIR = Path(os.environ.get("MAGE_GOLDEN_DIR", fixture("tools/golden")))
 if str(VENDOR_ROOT) not in sys.path:
     sys.path.insert(0, str(VENDOR_ROOT))
 
@@ -272,7 +273,7 @@ def _str_meta() -> dict[str, str]:
 
 
 def _write(rel_name: str, tensors: dict[str, np.ndarray]) -> None:
-    out = fixture(f"tools/golden/{rel_name}")
+    out = GOLDEN_DIR / rel_name
     Path(out).parent.mkdir(parents=True, exist_ok=True)
     save_file(tensors, out, metadata=_str_meta())
     print(f"wrote {out}")
@@ -281,7 +282,7 @@ def _write(rel_name: str, tensors: dict[str, np.ndarray]) -> None:
 
 
 def _write_png(rel_name: str, image: Image.Image) -> None:
-    out = fixture(f"tools/golden/{rel_name}")
+    out = GOLDEN_DIR / rel_name
     Path(out).parent.mkdir(parents=True, exist_ok=True)
     image.save(out)
     print(f"wrote {out}")
