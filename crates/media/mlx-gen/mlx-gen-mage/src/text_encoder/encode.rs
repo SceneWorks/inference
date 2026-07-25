@@ -66,6 +66,15 @@ pub struct MageTextEncoder {
 }
 
 impl MageTextEncoder {
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.lm.quantize(bits)?;
+        Ok(())
+    }
+
+    pub fn quantized_linear_count(&self) -> usize {
+        self.lm.quantized_linear_count()
+    }
+
     /// Pair an already-loaded tokenizer and LM. [`load`](super::load()) builds both from a snapshot.
     pub fn new(tokenizer: TextTokenizer, lm: Qwen3VlTextEncoder) -> Self {
         Self { tokenizer, lm }

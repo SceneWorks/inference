@@ -41,6 +41,15 @@ pub struct MageFinalLayer {
 }
 
 impl MageFinalLayer {
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.norm_linear.quantize(bits)?;
+        self.proj_out.quantize(bits)
+    }
+
+    pub(crate) fn quantized_linear_count(&self) -> usize {
+        usize::from(self.norm_linear.is_quantized()) + usize::from(self.proj_out.is_quantized())
+    }
+
     /// Load from `norm_out.linear.{weight,bias}` and `proj_out.{weight,bias}`. The LayerNorm inside
     /// `norm_out` is `elementwise_affine=False`, so it contributes no tensors.
     pub fn from_weights(w: &Weights, norm_prefix: &str, proj_prefix: &str) -> Result<Self> {

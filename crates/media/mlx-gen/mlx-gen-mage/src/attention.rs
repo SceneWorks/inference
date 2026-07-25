@@ -79,6 +79,38 @@ pub struct MageJointAttention {
 }
 
 impl MageJointAttention {
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        for linear in [
+            &mut self.to_q,
+            &mut self.to_k,
+            &mut self.to_v,
+            &mut self.to_out,
+            &mut self.add_q_proj,
+            &mut self.add_k_proj,
+            &mut self.add_v_proj,
+            &mut self.to_add_out,
+        ] {
+            linear.quantize(bits)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn quantized_linear_count(&self) -> usize {
+        [
+            &self.to_q,
+            &self.to_k,
+            &self.to_v,
+            &self.to_out,
+            &self.add_q_proj,
+            &self.add_k_proj,
+            &self.add_v_proj,
+            &self.to_add_out,
+        ]
+        .into_iter()
+        .filter(|linear| linear.is_quantized())
+        .count()
+    }
+
     /// Load from `{prefix}.{to_q,to_k,to_v,to_out.0,add_q_proj,add_k_proj,add_v_proj,to_add_out}`
     /// plus the four QK-norm scales — e.g. `transformer_blocks.0.attn`.
     ///

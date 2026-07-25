@@ -23,6 +23,19 @@ pub struct Qwen3VlMlp {
 }
 
 impl Qwen3VlMlp {
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.gate.quantize(bits, None)?;
+        self.up.quantize(bits, None)?;
+        self.down.quantize(bits, None)
+    }
+
+    pub(crate) fn quantized_linear_count(&self) -> usize {
+        [&self.gate, &self.up, &self.down]
+            .into_iter()
+            .filter(|linear| linear.is_quantized())
+            .count()
+    }
+
     /// Load from `{prefix}.{gate,up,down}_proj.weight`.
     pub fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
         Ok(Self {
