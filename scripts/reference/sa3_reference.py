@@ -433,24 +433,24 @@ def validate_upstream_checkout(
         raise InvalidReference(
             f"upstream checkout mismatch: {revision}, expected {expected_commit}"
         )
-    tracked_status = subprocess.run(
+    checkout_status = subprocess.run(
         [
             "git",
             "-C",
             str(upstream_root),
             "status",
             "--porcelain=v1",
-            "--untracked-files=no",
+            "--untracked-files=all",
         ],
         check=True,
         capture_output=True,
         text=True,
         encoding="utf-8",
     ).stdout.strip()
-    if tracked_status:
+    if checkout_status:
         raise InvalidReference(
-            "upstream checkout has tracked modifications: "
-            + tracked_status.replace("\n", "; ")
+            "upstream checkout is not clean: "
+            + checkout_status.replace("\n", "; ")
         )
     return revision
 

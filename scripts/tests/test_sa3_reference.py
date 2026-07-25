@@ -154,7 +154,7 @@ class StableAudio3ReferenceTests(unittest.TestCase):
                 with self.assertRaisesRegex(InvalidReference, package):
                     validate_runtime_versions(drifted)
 
-    def test_upstream_checkout_rejects_tracked_modifications(self) -> None:
+    def test_upstream_checkout_requires_exact_clean_state(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             subprocess.run(["git", "init", "-q", str(root)], check=True)
@@ -183,11 +183,48 @@ class StableAudio3ReferenceTests(unittest.TestCase):
             validate_upstream_checkout(root, revision)
             with self.assertRaisesRegex(InvalidReference, "checkout mismatch"):
                 validate_upstream_checkout(root, "0" * 40)
-            (root / "untracked").write_text("allowed\n", encoding="utf-8")
-            validate_upstream_checkout(root, revision)
-            source.write_text("PINNED = False\n", encoding="utf-8")
-            with self.assertRaisesRegex(InvalidReference, "tracked modifications"):
+            untracked = root / "untracked"
+            untracked.write_text("rejected\n", encoding="utf-8")
+            with self.assertRaisesRegex(InvalidReference, "not clean"):
                 validate_upstream_checkout(root, revision)
+            untracked.unlink()
+            source.write_text("PINNED = False\n", encoding="utf-8")
+            with self.assertRaisesRegex(InvalidReference, "not clean"):
+                validate_upstream_checkout(root, revision)
+
+    def test_upstream_checkout_rejects_dependency_shadowing_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            subprocess.run(
+                ["git", "-C", str(root), "config", "user.email", "codex@example.test"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(root), "config", "user.name", "Codex"],
+                check=True,
+            )
+            source = root / "source.py"
+            source.write_text("PINNED = True\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(root), "add", "source.py"], check=True)
+            subprocess.run(
+                ["git", "-C", str(root), "commit", "-q", "-m", "fixture"],
+                check=True,
+            )
+            revision = subprocess.run(
+                ["git", "-C", str(root), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+            ).stdout.strip()
+            for filename in ("torch.py", "transformers.py"):
+                with self.subTest(filename=filename):
+                    shadow = root / filename
+                    shadow.write_text("raise RuntimeError('shadowed')\n", encoding="utf-8")
+                    with self.assertRaisesRegex(InvalidReference, filename):
+                        validate_upstream_checkout(root, revision)
+                    shadow.unlink()
 
     def test_artifact_verifier_requires_all_components_and_tensors(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
