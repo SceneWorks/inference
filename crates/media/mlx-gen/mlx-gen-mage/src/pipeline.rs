@@ -13,7 +13,7 @@
 //!   packed under a fixed budget with per-sample cumulative offsets (`cu_seqlens`) instead of
 //!   block-diagonal masks. Sides must be multiples of
 //!   [`SIZE_MULTIPLE`]; the native range is
-//!   [`MIN_SIZE`](crate::config::MIN_SIZE)–[`MAX_SIZE`](crate::config::MAX_SIZE) per side.
+//!   [`MIN_SIZE`]–[`MAX_SIZE`] per side.
 //! - **CFG.** `use_neg = cfg > 1.0` (`:326`, `:535`): at cfg ≤ 1 the reference builds **no**
 //!   unconditional branch at all — one segment, one `cu_seqlens` pair, positive conditioning only.
 //!   Both Turbo variants default there, so the CFG-off path is a first-class case, not an edge one.
@@ -37,7 +37,7 @@ use mlx_gen::{Error, Progress, Result};
 use mlx_rs::ops::{concatenate_axis, maximum, minimum};
 use mlx_rs::{Array, Dtype};
 
-use crate::config::{LATENT_CHANNELS, SIZE_MULTIPLE, VAE_DOWNSAMPLE_FACTOR};
+use crate::config::{LATENT_CHANNELS, MAX_SIZE, MIN_SIZE, SIZE_MULTIPLE, VAE_DOWNSAMPLE_FACTOR};
 use crate::latent::{encode_noise, GsKey};
 use crate::rope_embedder::{ImgShape, PackLayout};
 use crate::text_encoder::{MageTextEncoder, PromptKind};
@@ -47,6 +47,36 @@ use std::path::Path;
 
 /// The published Mage-Flow scheduler shift.
 pub const STATIC_SHIFT: f32 = 6.0;
+
+/// Upstream's native-resolution image-token budget for one packed DiT invocation.
+///
+/// This budget is applied before the optional fused-CFG duplication, exactly like the reference's
+/// sample packer. It partitions samples; it never rounds or bucket-quantizes their dimensions.
+pub const MAX_PACKED_IMAGE_TOKENS: i32 = 50_000;
+
+/// One independently seeded, native-resolution generation request.
+#[derive(Debug, Clone, Copy)]
+pub struct GenerationSample<'a> {
+    pub prompt: &'a str,
+    pub negative_prompt: &'a str,
+    pub height: u32,
+    pub width: u32,
+    pub seed: i64,
+}
+
+/// A consecutive group of samples that fits one native-resolution DiT pack.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenerationPack {
+    pub sample_range: std::ops::Range<usize>,
+    pub grids: Vec<(i32, i32)>,
+    pub image_tokens: i32,
+}
+
+/// Per-sample observable outputs from variable-geometry generation.
+pub struct BatchGenerationTrace {
+    pub samples: Vec<GenerationTrace>,
+    pub packs: Vec<GenerationPack>,
+}
 
 /// The four loaded components needed for the Mage-Flow generation path.
 pub struct MageFlowPipeline {
@@ -124,61 +154,208 @@ impl MageFlowPipeline {
         renormalize: bool,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationTrace> {
-        let texts = if cfg > 1.0 {
-            vec![prompt, negative_prompt]
-        } else {
-            vec![prompt]
-        };
-        let conditioning = self.text_encoder.encode(&texts, PromptKind::Gen)?;
-        let cond = conditioning.segment(0)?.reshape(&[
-            1,
-            conditioning.seq_lens[0] as i32,
-            self.transformer.config().context_in_dim,
-        ])?;
-        let negative = if cfg > 1.0 {
-            let neg = conditioning.segment(1)?.reshape(&[
-                1,
-                conditioning.seq_lens[1] as i32,
-                self.transformer.config().context_in_dim,
-            ])?;
-            Some((neg, vec![conditioning.seq_lens[1] as i32]))
-        } else {
-            None
-        };
-        let (gh, gw) = latent_hw(height, width)?;
-        let layout = generation_layout(&[(gh, gw)], vec![conditioning.seq_lens[0] as i32])?;
-        let tokens = initial_tokens(height, width, seed, gs_key, Dtype::Bfloat16)?;
-        let sigmas = mage_flow_sigmas(steps)?;
-        let mut trajectories = Vec::with_capacity(2);
-        let out = denoise_capture(
-            &self.transformer,
-            tokens,
-            &cond,
-            layout,
-            negative.as_ref().map(|(txt, lens)| (txt, lens.clone())),
+        let mut batch = self.generate_batch_trace(
+            &[GenerationSample {
+                prompt,
+                negative_prompt,
+                height,
+                width,
+                seed,
+            }],
+            steps,
             cfg,
+            gs_key,
             renormalize,
-            &sigmas,
-            &mut |step, latent| {
-                if step < 2 {
-                    trajectories.push(latent.clone());
-                }
-                on_progress(Progress::Step {
-                    current: step as u32 + 1,
-                    total: steps as u32,
-                });
-            },
+            on_progress,
         )?;
-        let final_latent = unpack_tokens(&out, gh, gw)?;
-        on_progress(Progress::Decoding);
-        let image_u8 = decode(&self.vae, &out, gh, gw)?;
-        Ok(GenerationTrace {
-            final_tokens: out,
-            final_latent,
-            trajectories,
-            image_u8,
+        Ok(batch.samples.swap_remove(0))
+    }
+
+    /// Generate a variable-geometry batch without resizing or bucket quantization.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_batch(
+        &self,
+        samples: &[GenerationSample<'_>],
+        steps: usize,
+        cfg: f32,
+        gs_key: &GsKey,
+        renormalize: bool,
+    ) -> Result<Vec<Array>> {
+        Ok(self
+            .generate_batch_trace(samples, steps, cfg, gs_key, renormalize, &mut |_| {})?
+            .samples
+            .into_iter()
+            .map(|trace| trace.image_u8)
+            .collect())
+    }
+
+    /// Generate variable-length native-resolution packs while retaining per-sample boundaries.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_batch_trace(
+        &self,
+        samples: &[GenerationSample<'_>],
+        steps: usize,
+        cfg: f32,
+        gs_key: &GsKey,
+        renormalize: bool,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<BatchGenerationTrace> {
+        let packs = plan_generation_packs(samples)?;
+        let sigmas = mage_flow_sigmas(steps)?;
+        let total_steps = steps
+            .checked_mul(packs.len())
+            .ok_or_else(|| Error::Msg("mage_flow: progress step count overflow".into()))?;
+        let mut traces = Vec::with_capacity(samples.len());
+
+        for (pack_index, pack) in packs.iter().enumerate() {
+            let pack_samples = &samples[pack.sample_range.clone()];
+            let mut texts = pack_samples
+                .iter()
+                .map(|sample| sample.prompt)
+                .collect::<Vec<_>>();
+            if cfg > 1.0 {
+                texts.extend(pack_samples.iter().map(|sample| sample.negative_prompt));
+            }
+            let conditioning = self.text_encoder.encode(&texts, PromptKind::Gen)?;
+            let sample_count = pack_samples.len();
+            let positive_lens = conditioning.seq_lens[..sample_count]
+                .iter()
+                .map(|&len| len as i32)
+                .collect::<Vec<_>>();
+            let positive_tokens: i32 = positive_lens.iter().sum();
+            let hidden = self.transformer.config().context_in_dim;
+            let (cond_flat, neg_flat) = if cfg > 1.0 {
+                let parts = conditioning.txt.split_axis(&[positive_tokens], 0)?;
+                (parts[0].clone(), Some(parts[1].clone()))
+            } else {
+                (conditioning.txt.clone(), None)
+            };
+            let cond = cond_flat.reshape(&[1, positive_tokens, hidden])?;
+            let negative_lens = if cfg > 1.0 {
+                Some(
+                    conditioning.seq_lens[sample_count..]
+                        .iter()
+                        .map(|&len| len as i32)
+                        .collect::<Vec<_>>(),
+                )
+            } else {
+                None
+            };
+            let negative = match (neg_flat, negative_lens) {
+                (Some(txt), Some(lens)) => {
+                    let tokens = lens.iter().sum();
+                    Some((txt.reshape(&[1, tokens, hidden])?, lens))
+                }
+                _ => None,
+            };
+
+            let initial = pack_samples
+                .iter()
+                .map(|sample| {
+                    initial_tokens(
+                        sample.height,
+                        sample.width,
+                        sample.seed,
+                        gs_key,
+                        Dtype::Bfloat16,
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let initial_refs = initial.iter().collect::<Vec<_>>();
+            let tokens = concatenate_axis(&initial_refs, 1)?;
+            let layout = generation_layout(&pack.grids, positive_lens)?;
+            let mut trajectories = Vec::with_capacity(2);
+            let out = denoise_capture(
+                &self.transformer,
+                tokens,
+                &cond,
+                layout,
+                negative.as_ref().map(|(txt, lens)| (txt, lens.clone())),
+                cfg,
+                renormalize,
+                &sigmas,
+                &mut |step, latent| {
+                    if sample_count == 1 && step < 2 {
+                        trajectories.push(latent.clone());
+                    }
+                    on_progress(Progress::Step {
+                        current: (pack_index * steps + step + 1) as u32,
+                        total: total_steps as u32,
+                    });
+                },
+            )?;
+
+            let boundaries = pack
+                .grids
+                .iter()
+                .scan(0, |offset, &(gh, gw)| {
+                    *offset += gh * gw;
+                    Some(*offset)
+                })
+                .collect::<Vec<_>>();
+            let split_points = &boundaries[..boundaries.len().saturating_sub(1)];
+            let outputs = out.split_axis(split_points, 1)?;
+            for ((tokens, &(gh, gw)), sample) in
+                outputs.into_iter().zip(pack.grids.iter()).zip(pack_samples)
+            {
+                let final_latent = unpack_tokens(&tokens, gh, gw)?;
+                on_progress(Progress::Decoding);
+                let image_u8 = decode(&self.vae, &tokens, gh, gw)?;
+                debug_assert_eq!(
+                    image_u8.shape(),
+                    [sample.height as i32, sample.width as i32, 3]
+                );
+                traces.push(GenerationTrace {
+                    final_tokens: tokens,
+                    final_latent,
+                    trajectories: if sample_count == 1 {
+                        std::mem::take(&mut trajectories)
+                    } else {
+                        Vec::new()
+                    },
+                    image_u8,
+                });
+            }
+        }
+        Ok(BatchGenerationTrace {
+            samples: traces,
+            packs,
         })
     }
+}
+
+/// Validate exact requested geometry and greedily preserve input order under the 50k-token budget.
+pub fn plan_generation_packs(samples: &[GenerationSample<'_>]) -> Result<Vec<GenerationPack>> {
+    if samples.is_empty() {
+        return Err(Error::Msg(
+            "mage_flow: generation batch must not be empty".into(),
+        ));
+    }
+    let mut packs = Vec::new();
+    let mut start = 0;
+    let mut grids = Vec::new();
+    let mut tokens = 0;
+    for (index, sample) in samples.iter().enumerate() {
+        let grid = latent_hw(sample.height, sample.width)?;
+        let sample_tokens = grid.0 * grid.1;
+        if !grids.is_empty() && tokens + sample_tokens > MAX_PACKED_IMAGE_TOKENS {
+            packs.push(GenerationPack {
+                sample_range: start..index,
+                grids: std::mem::take(&mut grids),
+                image_tokens: tokens,
+            });
+            start = index;
+            tokens = 0;
+        }
+        grids.push(grid);
+        tokens += sample_tokens;
+    }
+    packs.push(GenerationPack {
+        sample_range: start..samples.len(),
+        grids,
+        image_tokens: tokens,
+    });
+    Ok(packs)
 }
 
 /// Build the exact diffusers static-shift schedule used by Mage-Flow.
@@ -204,6 +381,11 @@ pub fn mage_flow_sigmas(steps: usize) -> Result<Vec<f32>> {
 
 /// Validate and convert output pixels to Mage's latent grid.
 pub fn latent_hw(height: u32, width: u32) -> Result<(i32, i32)> {
+    if !(MIN_SIZE..=MAX_SIZE).contains(&height) || !(MIN_SIZE..=MAX_SIZE).contains(&width) {
+        return Err(Error::Msg(format!(
+            "mage_flow: {width}x{height} must be within {MIN_SIZE}..={MAX_SIZE} per side"
+        )));
+    }
     if !height.is_multiple_of(SIZE_MULTIPLE) || !width.is_multiple_of(SIZE_MULTIPLE) {
         return Err(Error::Msg(format!(
             "mage_flow: {width}x{height} must be divisible by {SIZE_MULTIPLE}"
@@ -486,11 +668,84 @@ mod tests {
     #[test]
     fn size_and_pack_round_trip_are_explicit() {
         assert_eq!(latent_hw(1024, 1024).unwrap(), (64, 64));
+        assert_eq!(latent_hw(512, 2048).unwrap(), (32, 128));
+        assert_eq!(latent_hw(2048, 512).unwrap(), (128, 32));
+        assert_eq!(latent_hw(688, 1232).unwrap(), (43, 77));
+        assert!(latent_hw(496, 512).is_err());
+        assert!(latent_hw(512, 2064).is_err());
         assert!(latent_hw(1023, 1024).is_err());
         let x = Array::from_slice(
             &vec![0.0f32; 2 * 3 * LATENT_CHANNELS as usize],
             &[1, 2 * 3, LATENT_CHANNELS],
         );
         assert_eq!(unpack_tokens(&x, 2, 3).unwrap().shape(), [1, 128, 2, 3]);
+    }
+
+    #[test]
+    fn native_geometry_packs_are_exact_and_budgeted() {
+        let samples = [
+            GenerationSample {
+                prompt: "a",
+                negative_prompt: "",
+                height: 2048,
+                width: 2048,
+                seed: 1,
+            },
+            GenerationSample {
+                prompt: "b",
+                negative_prompt: "",
+                height: 2048,
+                width: 2048,
+                seed: 2,
+            },
+            GenerationSample {
+                prompt: "c",
+                negative_prompt: "",
+                height: 2048,
+                width: 2048,
+                seed: 3,
+            },
+            GenerationSample {
+                prompt: "d",
+                negative_prompt: "",
+                height: 512,
+                width: 2048,
+                seed: 4,
+            },
+            GenerationSample {
+                prompt: "e",
+                negative_prompt: "",
+                height: 688,
+                width: 1232,
+                seed: 5,
+            },
+        ];
+        let packs = plan_generation_packs(&samples).unwrap();
+        assert_eq!(packs.len(), 2);
+        assert_eq!(packs[0].sample_range, 0..3);
+        assert_eq!(packs[0].image_tokens, 49_152);
+        assert_eq!(packs[0].grids, vec![(128, 128); 3]);
+        assert_eq!(packs[1].sample_range, 3..5);
+        assert_eq!(packs[1].grids, vec![(32, 128), (43, 77)]);
+        assert!(packs
+            .iter()
+            .all(|pack| pack.image_tokens <= MAX_PACKED_IMAGE_TOKENS));
+    }
+
+    #[test]
+    fn mixed_layout_carries_axes_boundaries_and_fused_cfg_segments() {
+        let layout = generation_layout(&[(32, 128), (128, 32), (43, 77)], vec![7, 11, 13]).unwrap();
+        // These image/text lens and cumulative boundaries are the frozen reference's concrete
+        // representation of the story's "axes_lens"; MSRoPE additionally consumes img_shapes.
+        assert_eq!(layout.img_lens(), &[4096, 4096, 3311]);
+        assert_eq!(layout.img_cu(), vec![0, 4096, 8192, 11503]);
+        assert_eq!(layout.txt_cu(), vec![0, 7, 18, 31]);
+        assert_eq!(layout.img_shapes().len(), 3);
+
+        let fused = layout.fused_cfg(&[5, 9, 15]).unwrap();
+        assert_eq!(fused.segments(), 6);
+        assert_eq!(fused.img_lens(), &[4096, 4096, 3311, 4096, 4096, 3311]);
+        assert_eq!(fused.txt_lens(), &[7, 11, 13, 5, 9, 15]);
+        assert_eq!(fused.img_tokens(), 23_006);
     }
 }

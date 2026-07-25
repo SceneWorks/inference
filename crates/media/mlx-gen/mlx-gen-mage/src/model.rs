@@ -32,7 +32,7 @@ use mlx_gen::{
 };
 
 use crate::config::{FAMILY, MAX_SIZE, MIN_SIZE, SIZE_MULTIPLE};
-use crate::{resolve_gs_key, MageFlowPipeline};
+use crate::{resolve_gs_key, GenerationSample, MageFlowPipeline};
 
 /// Which published checkpoint a registered id serves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,6 +127,9 @@ pub const MODEL_IDS: [&str; 6] = [
     "mage_flow_edit_turbo",
 ];
 
+/// Maximum homogeneous output count exposed through the platform request surface.
+pub const MAX_COUNT: u32 = 8;
+
 /// Build a variant's weights-free descriptor.
 ///
 /// Capability fields that later stories own are left at their conservative `Default` (`false` /
@@ -160,9 +163,9 @@ pub fn descriptor_for(variant: MageVariant) -> ModelDescriptor {
             supported_quants: &[] as &[Quant],
             min_size: MIN_SIZE,
             max_size: MAX_SIZE,
-            // The walking skeleton exposes one output per request. Packed multi-image generation
-            // remains disabled until its memory behavior is calibrated in sc-14046.
-            max_count: 1,
+            // A platform request has one geometry/prompt and `count` independent seeds. The
+            // pipeline additionally exposes heterogeneous geometry/prompt packs directly.
+            max_count: MAX_COUNT,
             mac_only: true,
             ..Default::default()
         },
@@ -224,31 +227,37 @@ impl Generator for MageFlow {
         let cfg = req.guidance.unwrap_or(MageVariant::Rl.default_cfg());
         let seed = req.seed.unwrap_or(0) as i64;
         let key = resolve_gs_key(None)?;
-        let pixels = self
+        let negative_prompt = req.negative_prompt.as_deref().unwrap_or(" ");
+        let samples = (0..req.count)
+            .map(|index| GenerationSample {
+                prompt: &req.prompt,
+                negative_prompt,
+                height: req.height,
+                width: req.width,
+                seed: seed.wrapping_add(index as i64),
+            })
+            .collect::<Vec<_>>();
+        let traces = self
             .pipeline
-            .generate_trace(
-                &req.prompt,
-                req.negative_prompt.as_deref().unwrap_or(" "),
-                req.height,
-                req.width,
-                steps as usize,
-                cfg,
-                seed,
-                &key,
-                false,
-                on_progress,
-            )?
-            .image_u8;
-        mlx_rs::transforms::eval([&pixels]).map_err(Error::from)?;
-        let bytes = pixels
-            .try_as_slice::<u8>()
-            .map_err(|e| Error::Msg(format!("mage_flow: RGB8 output is not host-readable: {e}")))?
-            .to_vec();
-        Ok(GenerationOutput::Images(vec![Image {
-            width: req.width,
-            height: req.height,
-            pixels: bytes,
-        }]))
+            .generate_batch_trace(&samples, steps as usize, cfg, &key, false, on_progress)?
+            .samples;
+        let mut images = Vec::with_capacity(traces.len());
+        for trace in traces {
+            mlx_rs::transforms::eval([&trace.image_u8]).map_err(Error::from)?;
+            let pixels = trace
+                .image_u8
+                .try_as_slice::<u8>()
+                .map_err(|e| {
+                    Error::Msg(format!("mage_flow: RGB8 output is not host-readable: {e}"))
+                })?
+                .to_vec();
+            images.push(Image {
+                width: req.width,
+                height: req.height,
+                pixels,
+            });
+        }
+        Ok(GenerationOutput::Images(images))
     }
 }
 
@@ -265,11 +274,6 @@ fn validate_generation_request(
         return Err(mlx_gen::gen_core::Error::Msg(format!(
             "mage_flow dimensions must be divisible by {REQUIRED_SIZE_MULTIPLE}"
         )));
-    }
-    if req.count != 1 {
-        return Err(mlx_gen::gen_core::Error::Msg(
-            "mage_flow sc-14041 generates exactly one image".into(),
-        ));
     }
     Ok(())
 }
@@ -406,11 +410,19 @@ mod tests {
     }
 
     #[test]
-    fn rl_platform_defaults_and_size_buckets_validate() {
+    fn rl_platform_defaults_and_exact_native_sizes_validate() {
         assert_eq!(MageVariant::Rl.default_steps(), 20);
         assert_eq!(MageVariant::Rl.default_cfg(), 5.0);
         let descriptor = descriptor_for(MageVariant::Rl);
-        for &(width, height) in &[(512, 512), (1024, 1024), (2048, 2048), (512, 2048)] {
+        assert_eq!(descriptor.capabilities.max_count, MAX_COUNT);
+        for &(width, height) in &[
+            (512, 512),
+            (1024, 1024),
+            (2048, 2048),
+            (512, 2048),
+            (2048, 512),
+            (1232, 688),
+        ] {
             let req = GenerationRequest {
                 prompt: "test".into(),
                 width,
@@ -431,5 +443,15 @@ mod tests {
                 "{width}x{height} must be rejected"
             );
         }
+        let mut batch = GenerationRequest {
+            prompt: "test".into(),
+            width: 2048,
+            height: 2048,
+            count: MAX_COUNT,
+            ..Default::default()
+        };
+        validate_generation_request(&descriptor, &batch).unwrap();
+        batch.count += 1;
+        assert!(validate_generation_request(&descriptor, &batch).is_err());
     }
 }
