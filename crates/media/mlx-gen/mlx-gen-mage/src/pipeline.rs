@@ -12,7 +12,8 @@
 //! - **Packing.** Latents flatten to a variable-length token sequence (`patch_size == 1`) and are
 //!   packed under a fixed budget with per-sample cumulative offsets (`cu_seqlens`) instead of
 //!   block-diagonal masks. Sides must be multiples of
-//!   [`SIZE_MULTIPLE`]; the native range is [`MIN_SIZE`]–[`MAX_SIZE`] per side.
+//!   [`SIZE_MULTIPLE`]; the native range is
+//!   [`MIN_SIZE`](crate::config::MIN_SIZE)–[`MAX_SIZE`](crate::config::MAX_SIZE) per side.
 //! - **CFG.** `use_neg = cfg > 1.0` (`:326`, `:535`): at cfg ≤ 1 the reference builds **no**
 //!   unconditional branch at all — one segment, one `cu_seqlens` pair, positive conditioning only.
 //!   Both Turbo variants default there, so the CFG-off path is a first-class case, not an edge one.
