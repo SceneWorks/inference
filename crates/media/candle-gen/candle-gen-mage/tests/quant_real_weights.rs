@@ -9,14 +9,14 @@
 use candle_core::{DType, Device};
 use candle_gen::gen_core::{GenerationOutput, GenerationRequest, LoadSpec, Quant, WeightsSource};
 use candle_gen::testkit::VramProbe;
-use candle_gen_mage::BASE_REGISTRATION;
+use candle_gen_mage::REGISTRATION;
 
 const PROMPT: &str = "a calico kitten sitting on a wooden windowsill beside a blue ceramic mug";
 
 fn snapshot() -> std::path::PathBuf {
     std::env::var_os("CANDLE_MAGE_SNAPSHOT")
         .map(Into::into)
-        .expect("set CANDLE_MAGE_SNAPSHOT to a complete Mage-Flow-Base snapshot")
+        .expect("set CANDLE_MAGE_SNAPSHOT to a complete Mage-Flow snapshot")
 }
 
 fn golden() -> Vec<u8> {
@@ -81,7 +81,7 @@ fn registered_tier_matches_independent_oracle_and_vram_budget() {
     let load_phase = probe.phase();
     let mut spec = LoadSpec::new(WeightsSource::Dir(snapshot()));
     spec.quantize = quant;
-    let generator = (BASE_REGISTRATION.load)(&spec).expect("registered Mage load");
+    let generator = (REGISTRATION.load)(&spec).expect("registered Mage load");
     probe.end_load(load_phase);
 
     let generation_phase = probe.phase();
