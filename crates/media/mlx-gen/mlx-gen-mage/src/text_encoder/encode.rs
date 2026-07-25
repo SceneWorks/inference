@@ -6,11 +6,18 @@
 use mlx_rs::ops::concatenate_axis;
 use mlx_rs::Array;
 
+use image::{imageops::FilterType, RgbImage};
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{Error, Result};
+use mlx_gen_boogu::vision::preprocess::preprocess_image;
+use mlx_gen_boogu::VisionTower;
 
-use super::encoder::{cu_seqlens_from_lens, seq_lens_from_cu, Qwen3VlTextEncoder};
-use super::prompt::{truncate, PromptKind};
+use super::encoder::{
+    cu_seqlens_from_lens, grounded_mrope_positions, seq_lens_from_cu, Qwen3VlTextEncoder,
+};
+use super::prompt::{edit_body, truncate, PromptKind};
+
+const IMAGE_TOKEN_ID: i32 = 151_655;
 
 /// The DiT-consumable text conditioning: the packed `txt` stream and its per-prompt lengths.
 ///
@@ -63,11 +70,15 @@ impl Conditioning {
 pub struct MageTextEncoder {
     tokenizer: TextTokenizer,
     lm: Qwen3VlTextEncoder,
+    vision: Option<VisionTower>,
 }
 
 impl MageTextEncoder {
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
         self.lm.quantize(bits)?;
+        if let Some(vision) = &mut self.vision {
+            vision.quantize(bits)?;
+        }
         Ok(())
     }
 
@@ -77,7 +88,23 @@ impl MageTextEncoder {
 
     /// Pair an already-loaded tokenizer and LM. [`load`](super::load()) builds both from a snapshot.
     pub fn new(tokenizer: TextTokenizer, lm: Qwen3VlTextEncoder) -> Self {
-        Self { tokenizer, lm }
+        Self {
+            tokenizer,
+            lm,
+            vision: None,
+        }
+    }
+
+    pub fn new_multimodal(
+        tokenizer: TextTokenizer,
+        lm: Qwen3VlTextEncoder,
+        vision: VisionTower,
+    ) -> Self {
+        Self {
+            tokenizer,
+            lm,
+            vision: Some(vision),
+        }
     }
 
     /// The Qwen2 fast tokenizer shipped in `text_encoder/tokenizer.json`.
@@ -148,6 +175,131 @@ impl MageTextEncoder {
         let hidden = self.lm.forward_packed(ids, cu_seqlens)?;
         drop_system_prompt(&hidden, &lens, drop_idx)
     }
+
+    /// Encode one edit instruction grounded by one or more source images through Qwen3-VL.
+    pub fn encode_edit(&self, instruction: &str, references: &[RgbImage]) -> Result<Conditioning> {
+        if references.is_empty() {
+            return Err(Error::Msg(
+                "mage_flow edit: at least one reference image is required".into(),
+            ));
+        }
+        let mut embeds = Vec::with_capacity(references.len());
+        let mut deepstack = Vec::with_capacity(references.len());
+        let mut grids = Vec::with_capacity(references.len());
+        for reference in references {
+            let (image_embeds, image_deepstack, grid) = self.vision_features(reference)?;
+            embeds.push(image_embeds);
+            deepstack.push(image_deepstack);
+            grids.push(grid);
+        }
+        self.encode_edit_with_features(instruction, &embeds, &deepstack, &grids)
+    }
+
+    /// Encode an edit instruction from precomputed vision/deepstack boundaries.
+    pub fn encode_edit_with_features(
+        &self,
+        instruction: &str,
+        embeds: &[Array],
+        deepstack: &[Vec<Array>],
+        grids: &[[i32; 3]],
+    ) -> Result<Conditioning> {
+        let counts = embeds
+            .iter()
+            .map(|embed| embed.shape()[0] as usize)
+            .collect::<Vec<_>>();
+        let ids = self.edit_input_ids(instruction, &counts)?;
+        let hidden = self
+            .lm
+            .forward_grounded(&ids, IMAGE_TOKEN_ID, embeds, deepstack, grids)?
+            .reshape(&[ids.len() as i32, -1])?;
+        drop_system_prompt(&hidden, &[ids.len()], PromptKind::Edit.drop_idx())
+    }
+
+    /// Return the shared Qwen3-VL vision boundaries for one edit reference.
+    pub fn vision_features(&self, reference: &RgbImage) -> Result<(Array, Vec<Array>, [i32; 3])> {
+        let vision = self.vision.as_ref().ok_or_else(|| {
+            Error::Msg("mage_flow edit: text encoder was loaded without the vision tower".into())
+        })?;
+        let capped = cap_long_edge(reference, crate::config::VL_COND_LONG_EDGE);
+        let (pixels, grid) = preprocess_image(&capped)?;
+        let (embeds, deepstack) = vision.forward(&pixels, &[grid])?;
+        Ok((embeds, deepstack, grid))
+    }
+
+    /// Render/tokenize an edit prompt and expand each visual placeholder to its merged-token run.
+    pub fn edit_input_ids(
+        &self,
+        instruction: &str,
+        image_token_counts: &[usize],
+    ) -> Result<Vec<i32>> {
+        let base = self.token_ids(
+            &edit_body(instruction, image_token_counts.len()),
+            PromptKind::Edit,
+        )?;
+        expand_image_tokens(&base, image_token_counts)
+    }
+
+    /// Return the distinct temporal/height/width M-RoPE axes for an expanded edit prompt.
+    pub fn edit_mrope_axes(
+        &self,
+        ids: &[i32],
+        grids: &[[i32; 3]],
+    ) -> Result<(Vec<i32>, Vec<i32>, Vec<i32>)> {
+        let positions = grounded_mrope_positions(ids, IMAGE_TOKEN_ID, grids)?;
+        let (t, h, w) = positions.axes();
+        Ok((t.to_vec(), h.to_vec(), w.to_vec()))
+    }
+
+    /// Return pre-deepstack outputs from LM layers 0/1/2 for parity localization.
+    pub fn edit_early_lm_trace(
+        &self,
+        instruction: &str,
+        embeds: &[Array],
+        deepstack: &[Vec<Array>],
+        grids: &[[i32; 3]],
+    ) -> Result<Vec<Array>> {
+        let counts = embeds
+            .iter()
+            .map(|embed| embed.shape()[0] as usize)
+            .collect::<Vec<_>>();
+        let ids = self.edit_input_ids(instruction, &counts)?;
+        Ok(self
+            .lm
+            .forward_grounded_trace(&ids, IMAGE_TOKEN_ID, embeds, deepstack, grids)?
+            .1)
+    }
+}
+
+fn cap_long_edge(image: &RgbImage, max_edge: u32) -> RgbImage {
+    let long = image.width().max(image.height());
+    if long <= max_edge {
+        return image.clone();
+    }
+    let scale = max_edge as f64 / long as f64;
+    let width = (image.width() as f64 * scale).round().max(1.0) as u32;
+    let height = (image.height() as f64 * scale).round().max(1.0) as u32;
+    image::imageops::resize(image, width, height, FilterType::CatmullRom)
+}
+
+fn expand_image_tokens(ids: &[i32], counts: &[usize]) -> Result<Vec<i32>> {
+    let placeholders = ids.iter().filter(|&&id| id == IMAGE_TOKEN_ID).count();
+    if placeholders != counts.len() {
+        return Err(Error::Msg(format!(
+            "mage_flow edit: template has {placeholders} image placeholder(s) but {} reference(s)",
+            counts.len()
+        )));
+    }
+    let mut out = Vec::with_capacity(ids.len() + counts.iter().sum::<usize>());
+    let mut image = 0usize;
+    for &id in ids {
+        if id == IMAGE_TOKEN_ID {
+            out.extend(std::iter::repeat_n(id, counts[image]));
+            image += 1;
+        } else {
+            out.push(id);
+        }
+    }
+    Ok(out)
 }
 
 /// Drop the first `drop_idx` tokens of every packed segment and re-concatenate — `h[drop_idx:]`
@@ -244,5 +396,34 @@ mod tests {
     fn a_pack_that_disagrees_with_the_hidden_state_is_rejected() {
         let hidden = ramp(9, 2);
         assert!(drop_system_prompt(&hidden, &[5, 5], 2).is_err());
+    }
+
+    #[test]
+    fn image_placeholders_expand_one_run_per_reference() {
+        let ids = [1, IMAGE_TOKEN_ID, 2, IMAGE_TOKEN_ID, 3];
+        assert_eq!(
+            expand_image_tokens(&ids, &[2, 3]).unwrap(),
+            [
+                1,
+                IMAGE_TOKEN_ID,
+                IMAGE_TOKEN_ID,
+                2,
+                IMAGE_TOKEN_ID,
+                IMAGE_TOKEN_ID,
+                IMAGE_TOKEN_ID,
+                3
+            ]
+        );
+        assert!(expand_image_tokens(&ids, &[2]).is_err());
+        assert!(expand_image_tokens(&[1, 2], &[2]).is_err());
+    }
+
+    #[test]
+    fn vision_conditioning_caps_only_the_long_edge() {
+        let wide = RgbImage::new(768, 192);
+        let capped = cap_long_edge(&wide, 384);
+        assert_eq!(capped.dimensions(), (384, 96));
+        let small = RgbImage::new(320, 160);
+        assert_eq!(cap_long_edge(&small, 384).dimensions(), (320, 160));
     }
 }

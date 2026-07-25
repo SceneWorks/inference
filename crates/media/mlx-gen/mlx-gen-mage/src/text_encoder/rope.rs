@@ -37,7 +37,7 @@
 
 use mlx_rs::{Array, Dtype};
 
-use mlx_gen::Result;
+use mlx_gen::{Error, Result};
 
 /// Per-token 3-axis M-RoPE positions. One entry per token in the (packed) sequence.
 ///
@@ -55,6 +55,19 @@ pub struct MRopePositions {
 }
 
 impl MRopePositions {
+    /// Build positions with genuinely independent temporal, height, and width axes.
+    pub fn from_axes(t: Vec<i32>, h: Vec<i32>, w: Vec<i32>) -> Result<Self> {
+        if t.len() != h.len() || t.len() != w.len() {
+            return Err(Error::Msg(format!(
+                "mage_flow text M-RoPE axes have different lengths: t={} h={} w={}",
+                t.len(),
+                h.len(),
+                w.len()
+            )));
+        }
+        Ok(Self { t, h, w })
+    }
+
     /// The text-only layout for ONE segment of `len` tokens: `0 … len-1` on all three axes.
     ///
     /// This is `torch.arange(length)` from `text_encoder.py:503`, expanded across the three axes by
@@ -78,6 +91,10 @@ impl MRopePositions {
     /// `true` when there are no tokens.
     pub fn is_empty(&self) -> bool {
         self.t.is_empty()
+    }
+
+    pub fn axes(&self) -> (&[i32], &[i32], &[i32]) {
+        (&self.t, &self.h, &self.w)
     }
 }
 

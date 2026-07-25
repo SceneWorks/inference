@@ -219,6 +219,19 @@ impl MageVae {
         Ok(self.encode_moments(image_nchw)?.mean)
     }
 
+    /// Sample the edit-path posterior with a request seed.
+    pub fn encode_sample(&self, image_nchw: &Array, seed: u64) -> Result<Array> {
+        let moments = self.encode_moments(image_nchw)?;
+        let key = mlx_rs::random::key(seed)?;
+        let noise = mlx_rs::random::normal::<f32>(moments.mean.shape(), None, None, Some(&key))?
+            .as_dtype(moments.mean.dtype())?;
+        let std = moments
+            .logvar
+            .multiply(Array::from_slice(&[0.5f32], &[1]))?
+            .exp()?;
+        Ok(moments.mean.add(&std.multiply(&noise)?)?)
+    }
+
     /// Test instrumentation for the real decode x-embedder activation. This deliberately calls
     /// the same builder as [`Self::decode`]; it exists so allocator regression tests can measure
     /// the folded 32-wide versus literal 99-wide boundary before a later MLP masks the saving.

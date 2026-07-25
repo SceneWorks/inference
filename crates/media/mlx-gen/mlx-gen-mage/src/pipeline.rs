@@ -33,6 +33,7 @@
 //! (76 invariants at cfg > 1, 71 at cfg ≤ 1, with `--self-test`), live in
 //! `crates/media/mlx-gen/tools/`.
 
+use image::{imageops::FilterType, RgbImage};
 use mlx_gen::{Error, Progress, Result};
 use mlx_rs::ops::{concatenate_axis, maximum, minimum};
 use mlx_rs::{Array, Dtype};
@@ -99,6 +100,13 @@ pub struct GenerationTrace {
     pub image_u8: Array,
 }
 
+pub struct EditTrace {
+    pub final_tokens: Array,
+    pub reference_tokens: Array,
+    pub trajectories: Vec<Array>,
+    pub image_u8: Array,
+}
+
 impl MageFlowPipeline {
     /// Load a published diffusers snapshot (`text_encoder/`, `transformer/`, `vae/`).
     pub fn load(root: impl AsRef<Path>) -> Result<Self> {
@@ -129,6 +137,22 @@ impl MageFlowPipeline {
             verify_quantized_counts("DiT", pipeline.transformer.quantized_linear_count(), 174)?;
             let (expected_vae, packed_vae) = pipeline.vae.quantization_count();
             verify_quantized_counts("VAE", packed_vae, expected_vae)?;
+        }
+        Ok(pipeline)
+    }
+
+    /// Load the full edit pipeline, including the Qwen3-VL vision tower and Mage-VAE encoder.
+    pub fn load_edit(root: impl AsRef<Path>, quant_bits: Option<i32>) -> Result<Self> {
+        let root = root.as_ref();
+        let mut pipeline = Self {
+            text_encoder: crate::text_encoder::load_multimodal(root)?,
+            transformer: MageTransformer::load(root.join("transformer"))?,
+            vae: crate::vae::load(root.join("vae"), crate::vae::VaePart::Both, Dtype::Bfloat16)?,
+        };
+        if let Some(bits) = quant_bits {
+            pipeline.text_encoder.quantize(bits)?;
+            pipeline.transformer.quantize(bits)?;
+            pipeline.vae.quantize(bits)?;
         }
         Ok(pipeline)
     }
@@ -193,6 +217,183 @@ impl MageFlowPipeline {
             on_progress,
         )?;
         Ok(batch.samples.swap_remove(0))
+    }
+
+    /// Instruction-edit one target from one or more references.
+    #[allow(clippy::too_many_arguments)]
+    pub fn edit_trace(
+        &self,
+        instruction: &str,
+        negative_instruction: &str,
+        references: &[RgbImage],
+        height: u32,
+        width: u32,
+        steps: usize,
+        cfg: f32,
+        seed: i64,
+        gs_key: &GsKey,
+        renormalize: bool,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<EditTrace> {
+        if references.is_empty() {
+            return Err(Error::Msg(
+                "mage_flow edit: at least one reference image is required".into(),
+            ));
+        }
+        let reference_tokens =
+            self.sample_reference_tokens(references, height, width, seed as u64)?;
+        self.edit_trace_from_reference_tokens(
+            instruction,
+            negative_instruction,
+            references,
+            &reference_tokens,
+            height,
+            width,
+            steps,
+            cfg,
+            seed,
+            gs_key,
+            renormalize,
+            on_progress,
+        )
+    }
+
+    /// Resize all references to the target and sample their VAE posteriors in one seeded batch.
+    pub fn sample_reference_tokens(
+        &self,
+        references: &[RgbImage],
+        height: u32,
+        width: u32,
+        seed: u64,
+    ) -> Result<Array> {
+        if references.is_empty() {
+            return Err(Error::Msg(
+                "mage_flow edit: at least one reference image is required".into(),
+            ));
+        }
+        let (gh, gw) = edit_latent_hw(height, width)?;
+        let resized = references
+            .iter()
+            .map(|image| reference_nchw(image, height, width))
+            .collect::<Result<Vec<_>>>()?;
+        let resized_refs = resized.iter().collect::<Vec<_>>();
+        let ref_batch = concatenate_axis(&resized_refs, 0)?;
+        // The reference seeds once before encoding the complete reference batch, then samples one
+        // posterior tensor. Keeping this as one call preserves that multi-reference RNG shape.
+        self.vae
+            .encode_sample(&ref_batch, seed)?
+            .transpose_axes(&[0, 2, 3, 1])?
+            .reshape(&[1, references.len() as i32 * gh * gw, LATENT_CHANNELS])?
+            .as_dtype(Dtype::Bfloat16)
+            .map_err(Into::into)
+    }
+
+    /// Run the instruction-edit algorithm from already sampled reference tokens.
+    ///
+    /// This boundary keeps the stochastic VAE posterior separate from denoise parity: a Torch
+    /// oracle can replay its recorded posterior through MLX without pretending the two runtimes'
+    /// seeded normal generators produce the same samples.
+    #[allow(clippy::too_many_arguments)]
+    pub fn edit_trace_from_reference_tokens(
+        &self,
+        instruction: &str,
+        negative_instruction: &str,
+        references: &[RgbImage],
+        reference_tokens: &Array,
+        height: u32,
+        width: u32,
+        steps: usize,
+        cfg: f32,
+        seed: i64,
+        gs_key: &GsKey,
+        renormalize: bool,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<EditTrace> {
+        if references.is_empty() {
+            return Err(Error::Msg(
+                "mage_flow edit: at least one reference image is required".into(),
+            ));
+        }
+        let (gh, gw) = edit_latent_hw(height, width)?;
+        let expected = [1, references.len() as i32 * gh * gw, LATENT_CHANNELS];
+        if reference_tokens.shape() != expected {
+            return Err(Error::Msg(format!(
+                "mage_flow edit: reference tokens must be {expected:?}, got {:?}",
+                reference_tokens.shape()
+            )));
+        }
+        let reference_tokens = reference_tokens.as_dtype(Dtype::Bfloat16)?;
+        let mut target = initial_tokens_for_grid(gh, gw, seed, gs_key, Dtype::Bfloat16)?;
+
+        let positive = self.text_encoder.encode_edit(instruction, references)?;
+        let cond = positive
+            .txt
+            .reshape(&[1, positive.seq_lens[0] as i32, -1])?;
+        let negative = if uses_cfg(cfg) {
+            let encoded = self
+                .text_encoder
+                .encode_edit(negative_instruction, references)?;
+            Some((
+                encoded.txt.reshape(&[1, encoded.seq_lens[0] as i32, -1])?,
+                encoded.seq_lens[0] as i32,
+            ))
+        } else {
+            None
+        };
+        let shapes =
+            std::iter::repeat_n(ImgShape::latent(gh, gw), references.len() + 1).collect::<Vec<_>>();
+        let total_tokens = (references.len() as i32 + 1) * gh * gw;
+        let layout = PackLayout::new(
+            shapes,
+            vec![total_tokens],
+            vec![positive.seq_lens[0] as i32],
+        )?;
+        let sigmas = mage_flow_sigmas(steps)?;
+        let mut trajectories = Vec::with_capacity(2);
+        let cond_ctx = self.transformer.pack_context(layout.clone())?;
+        for (step, pair) in sigmas.windows(2).enumerate() {
+            let sequence = assemble_edit_sequence(&target, &reference_tokens)?;
+            if step < 2 {
+                trajectories.push(if negative.is_some() {
+                    concatenate_axis(&[&sequence, &sequence], 1)?
+                } else {
+                    sequence.clone()
+                });
+            }
+            let velocity = if let Some((neg, neg_len)) = &negative {
+                let fused_layout = layout.fused_cfg(&[*neg_len])?;
+                let fused_ctx = self.transformer.pack_context(fused_layout)?;
+                let fused_img = concatenate_axis(&[&sequence, &sequence], 1)?;
+                let fused_txt = concatenate_axis(&[&cond, neg], 1)?;
+                let sigma = Array::from_slice(
+                    &vec![pair[0]; fused_ctx.segments()],
+                    &[fused_ctx.segments() as i32],
+                );
+                let output = self
+                    .transformer
+                    .forward(&fused_img, &fused_txt, &sigma, &fused_ctx)?;
+                let split = output.split_axis(&[total_tokens], 1)?;
+                cfg_velocity(&split[0], &split[1], cfg, renormalize)?
+            } else {
+                let sigma = Array::from_slice(&[pair[0]], &[1]);
+                self.transformer
+                    .forward(&sequence, &cond, &sigma, &cond_ctx)?
+            };
+            let target_velocity = velocity.split_axis(&[gh * gw], 1)?.swap_remove(0);
+            target = flow_euler_step(&target, &target_velocity, pair[1] - pair[0])?;
+            mlx_rs::transforms::eval([&target])?;
+            on_progress(Progress::Step {
+                current: (step + 1) as u32,
+                total: steps as u32,
+            });
+        }
+        let image_u8 = decode(&self.vae, &target, gh, gw)?;
+        Ok(EditTrace {
+            final_tokens: target,
+            reference_tokens,
+            trajectories,
+            image_u8,
+        })
     }
 
     /// Generate a variable-geometry batch without resizing or bucket quantization.
@@ -348,6 +549,22 @@ impl MageFlowPipeline {
     }
 }
 
+pub fn assemble_edit_sequence(target: &Array, references: &Array) -> Result<Array> {
+    if target.ndim() != 3
+        || references.ndim() != 3
+        || target.shape()[0] != 1
+        || references.shape()[0] != 1
+        || target.shape()[2] != references.shape()[2]
+    {
+        return Err(Error::Msg(format!(
+            "mage_flow edit: target/reference token shapes are incompatible: {:?} / {:?}",
+            target.shape(),
+            references.shape()
+        )));
+    }
+    concatenate_axis(&[target, references], 1).map_err(Into::into)
+}
+
 fn verify_quantized_counts(component: &str, packed: usize, expected: usize) -> Result<()> {
     if packed != expected {
         return Err(Error::Msg(format!(
@@ -446,6 +663,49 @@ pub fn latent_hw(height: u32, width: u32) -> Result<(i32, i32)> {
     ))
 }
 
+/// Convert edit pixels to the latent grid.
+///
+/// The public model descriptor still enforces the production 512..=2048 range. The reference
+/// parity oracle deliberately uses 256² to keep its 4.1B-parameter CPU run tractable, so the
+/// lower-level edit trace accepts that frozen test geometry as well.
+fn edit_latent_hw(height: u32, width: u32) -> Result<(i32, i32)> {
+    if height > MAX_SIZE || width > MAX_SIZE || height < 256 || width < 256 {
+        return Err(Error::Msg(format!(
+            "mage_flow edit: {width}x{height} must be within 256..={MAX_SIZE} per side"
+        )));
+    }
+    if !height.is_multiple_of(SIZE_MULTIPLE) || !width.is_multiple_of(SIZE_MULTIPLE) {
+        return Err(Error::Msg(format!(
+            "mage_flow edit: {width}x{height} must be divisible by {SIZE_MULTIPLE}"
+        )));
+    }
+    Ok((
+        (height / VAE_DOWNSAMPLE_FACTOR) as i32,
+        (width / VAE_DOWNSAMPLE_FACTOR) as i32,
+    ))
+}
+
+fn reference_nchw(image: &RgbImage, height: u32, width: u32) -> Result<Array> {
+    let resized = if image.dimensions() == (width, height) {
+        image.clone()
+    } else {
+        image::imageops::resize(image, width, height, FilterType::CatmullRom)
+    };
+    let mut values = vec![0f32; 3 * height as usize * width as usize];
+    for channel in 0..3usize {
+        for y in 0..height as usize {
+            for x in 0..width as usize {
+                let pixel = resized.get_pixel(x as u32, y as u32)[channel] as f32;
+                values[(channel * height as usize + y) * width as usize + x] = pixel / 127.5 - 1.0;
+            }
+        }
+    }
+    Ok(Array::from_slice(
+        &values,
+        &[1, 3, height as i32, width as i32],
+    ))
+}
+
 /// Create the required Gaussian-Shading initial latent and flatten it to image tokens.
 pub fn initial_tokens(
     height: u32,
@@ -455,6 +715,16 @@ pub fn initial_tokens(
     dtype: Dtype,
 ) -> Result<Array> {
     let (gh, gw) = latent_hw(height, width)?;
+    initial_tokens_for_grid(gh, gw, seed, key, dtype)
+}
+
+fn initial_tokens_for_grid(
+    gh: i32,
+    gw: i32,
+    seed: i64,
+    key: &GsKey,
+    dtype: Dtype,
+) -> Result<Array> {
     encode_noise(
         (LATENT_CHANNELS as usize, gh as usize, gw as usize),
         key,
@@ -647,6 +917,45 @@ mod tests {
             .unwrap();
         mlx_rs::transforms::eval([&scaled]).unwrap();
         assert_eq!(scaled.as_slice::<u8>(), &[0, 63, 127, 191, 255]);
+    }
+
+    #[test]
+    fn edit_stream_is_target_first_and_references_remain_clean() {
+        let target = Array::from_slice(&[1f32, 2.0, 3.0, 4.0], &[1, 2, 2]);
+        let refs = Array::from_slice(&[10f32, 11.0, 20.0, 21.0], &[1, 2, 2]);
+        let first = assemble_edit_sequence(&target, &refs).unwrap();
+        assert_eq!(
+            first.as_slice::<f32>(),
+            &[1.0, 2.0, 3.0, 4.0, 10.0, 11.0, 20.0, 21.0]
+        );
+        let stepped_target = Array::from_slice(&[5f32, 6.0, 7.0, 8.0], &[1, 2, 2]);
+        let second = assemble_edit_sequence(&stepped_target, &refs).unwrap();
+        assert_eq!(
+            &second.as_slice::<f32>()[4..],
+            &first.as_slice::<f32>()[4..],
+            "clean references must be re-concatenated unchanged at every step"
+        );
+        assert_ne!(
+            &second.as_slice::<f32>()[..4],
+            &first.as_slice::<f32>()[..4],
+            "only target tokens advance"
+        );
+        assert!(
+            assemble_edit_sequence(&target, &Array::from_slice(&[0f32; 3], &[1, 1, 3])).is_err()
+        );
+    }
+
+    #[test]
+    fn edit_layout_has_n_plus_one_shapes_in_one_attention_window() {
+        let shape = ImgShape::latent(4, 3);
+        let layout = PackLayout::new(vec![shape, shape, shape], vec![36], vec![9]).unwrap();
+        assert_eq!(layout.segments(), 1);
+        assert_eq!(layout.img_shapes().len(), 3);
+        assert_eq!(layout.img_lens(), &[36]);
+        assert!(
+            PackLayout::new(vec![ImgShape::latent(4, 3); 3], vec![12, 24], vec![9],).is_err(),
+            "splitting one edit sample into per-image attention windows must fail"
+        );
     }
 
     #[test]

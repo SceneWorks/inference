@@ -23,6 +23,7 @@ use std::path::Path;
 use mlx_gen::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
+use mlx_gen_boogu::{VisionConfig, VisionTower};
 
 use crate::config::{
     max_prompt_tokens, QwenVlTextConfig, DROP_IDX_EDIT, TE_HIDDEN_ACT, TE_RMS_NORM_EPS,
@@ -118,6 +119,35 @@ pub fn load_lm(root: impl AsRef<Path>) -> Result<Qwen3VlTextEncoder> {
 pub fn load(root: impl AsRef<Path>) -> Result<MageTextEncoder> {
     let root = root.as_ref();
     Ok(MageTextEncoder::new(load_tokenizer(root)?, load_lm(root)?))
+}
+
+pub fn mage_vision_config() -> VisionConfig {
+    VisionConfig {
+        hidden_size: 1024,
+        num_heads: 16,
+        intermediate_size: 4096,
+        depth: 24,
+        out_hidden_size: 2560,
+        patch_size: 16,
+        temporal_patch_size: 2,
+        spatial_merge_size: 2,
+        in_channels: 3,
+        num_position_embeddings: 2304,
+        deepstack_visual_indexes: vec![5, 11, 17],
+    }
+}
+
+/// Load tokenizer, language model, and the Qwen3-VL vision tower needed by Mage-Flow-Edit.
+pub fn load_multimodal(root: impl AsRef<Path>) -> Result<MageTextEncoder> {
+    let root = root.as_ref();
+    let dir = root.join(COMPONENT_DIR);
+    let weights = Weights::from_dir(&dir)?;
+    let vision = VisionTower::from_weights(&weights, mage_vision_config(), "model.visual")?;
+    Ok(MageTextEncoder::new_multimodal(
+        load_tokenizer(root)?,
+        load_lm(root)?,
+        vision,
+    ))
 }
 
 /// Check a `text_encoder/config.json` body against the pinned Qwen3-VL-4B shapes and return them.

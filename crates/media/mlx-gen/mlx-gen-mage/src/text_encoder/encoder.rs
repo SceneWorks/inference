@@ -67,7 +67,7 @@
 //! (Note that the reference's *own* edit path still feeds flat per-segment positions — see the
 //! [`super::rope`] module docs — so the 3-axis freedom is available but not currently exercised.)
 
-use mlx_rs::ops::concatenate_axis;
+use mlx_rs::ops::{add, concatenate_axis};
 use mlx_rs::Array;
 
 use mlx_gen::nn::{build_mask, TokenEmbedding};
@@ -248,6 +248,104 @@ impl Qwen3VlTextEncoder {
         self.final_norm(&h)
     }
 
+    /// Run the Qwen3-VL language stack with merged vision features spliced at each image-token run.
+    /// Deepstack features extracted by vision blocks 5/11/17 are injected into LM layers 0/1/2,
+    /// additively and only at the corresponding visual positions.
+    pub fn forward_grounded(
+        &self,
+        ids: &[i32],
+        image_token_id: i32,
+        image_embeds: &[Array],
+        deepstack: &[Vec<Array>],
+        grids: &[[i32; 3]],
+    ) -> Result<Array> {
+        Ok(self
+            .forward_grounded_trace(ids, image_token_id, image_embeds, deepstack, grids)?
+            .0)
+    }
+
+    /// Grounded forward plus the pre-deepstack outputs of LM layers 0/1/2.
+    pub fn forward_grounded_trace(
+        &self,
+        ids: &[i32],
+        image_token_id: i32,
+        image_embeds: &[Array],
+        deepstack: &[Vec<Array>],
+        grids: &[[i32; 3]],
+    ) -> Result<(Array, Vec<Array>)> {
+        if image_embeds.is_empty()
+            || image_embeds.len() != deepstack.len()
+            || image_embeds.len() != grids.len()
+        {
+            return Err(Error::Msg(format!(
+                "mage_flow grounded TE: need matching non-empty embeds/deepstack/grids, got {}/{}/{}",
+                image_embeds.len(),
+                deepstack.len(),
+                grids.len()
+            )));
+        }
+        let s = ids.len() as i32;
+        let runs = image_token_runs(ids, image_token_id);
+        if runs.len() != image_embeds.len() {
+            return Err(Error::Msg(format!(
+                "mage_flow grounded TE: {} image-token run(s) but {} vision embedding(s)",
+                runs.len(),
+                image_embeds.len()
+            )));
+        }
+        validate_deepstack(&runs, image_embeds, deepstack)?;
+        let ids_arr = Array::from_slice(ids, &[1, s]);
+        let mut hidden = self.embed(&ids_arr)?;
+        let dtype = hidden.dtype();
+        for (&(start, end), embeds) in runs.iter().zip(image_embeds) {
+            if embeds.shape()[0] != end - start {
+                return Err(Error::Msg(format!(
+                    "mage_flow grounded TE: image run has {} token(s) but vision produced {}",
+                    end - start,
+                    embeds.shape()[0]
+                )));
+            }
+            hidden = replace_seq(
+                &hidden,
+                &embeds.expand_dims(0)?.as_dtype(dtype)?,
+                start,
+                end,
+            )?;
+        }
+
+        // Mage's packed wrapper explicitly passes flat per-segment `position_ids` even for image
+        // inputs, so HF expands that one axis across T/H/W instead of invoking Qwen3-VL's native
+        // grid position builder. Keep the distinct-axis builder executable below as the oracle for
+        // that lower-level capability, but follow the frozen edit pipeline here.
+        let positions = MRopePositions::text(ids.len());
+        let (cos, sin) = mrope_cos_sin(
+            &positions,
+            self.head_dim,
+            self.rope_theta,
+            self.mrope_section,
+            dtype,
+        )?;
+        let mask = build_mask(&Array::from_slice(&vec![1i32; ids.len()], &[1, s]), 1, s)?;
+        let mut early = Vec::with_capacity(3);
+        for (layer_index, layer) in self.layers.iter().enumerate() {
+            hidden = layer.forward(&hidden, &cos, &sin, &mask)?;
+            if layer_index < 3 {
+                early.push(hidden.clone());
+            }
+            for (&(start, end), features) in runs.iter().zip(deepstack) {
+                if layer_index < 3 {
+                    let visual = slice_seq(&hidden, start, end)?;
+                    let injected = add(
+                        &visual,
+                        &features[layer_index].expand_dims(0)?.as_dtype(dtype)?,
+                    )?;
+                    hidden = replace_seq(&hidden, &injected, start, end)?;
+                }
+            }
+        }
+        Ok((self.final_norm(&hidden)?, early))
+    }
+
     /// Encode ONE sequence of token ids → `[s, hidden]`, the post-final-norm hidden state with no
     /// tokens dropped.
     pub fn forward_segment(&self, ids: &[i32]) -> Result<Array> {
@@ -282,6 +380,119 @@ impl Qwen3VlTextEncoder {
         let refs: Vec<&Array> = parts.iter().collect();
         Ok(concatenate_axis(&refs, 0)?)
     }
+}
+
+const IMAGE_SPATIAL_MERGE: i32 = 2;
+
+fn validate_deepstack(
+    runs: &[(i32, i32)],
+    image_embeds: &[Array],
+    deepstack: &[Vec<Array>],
+) -> Result<()> {
+    for ((&(start, end), embeds), features) in runs.iter().zip(image_embeds).zip(deepstack) {
+        let visual_tokens = end - start;
+        if features.len() != 3 {
+            return Err(Error::Msg(format!(
+                "mage_flow grounded TE: each image requires exactly 3 deepstack features, got {}",
+                features.len()
+            )));
+        }
+        for (index, feature) in features.iter().enumerate() {
+            if feature.shape() != [visual_tokens, embeds.shape()[1]] {
+                return Err(Error::Msg(format!(
+                    "mage_flow grounded TE: deepstack {index} must be [{visual_tokens}, {}], got {:?}",
+                    embeds.shape()[1],
+                    feature.shape()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn slice_seq(x: &Array, start: i32, end: i32) -> Result<Array> {
+    Ok(x.split_axis(&[start, end], 1)?.swap_remove(1))
+}
+
+fn replace_seq(x: &Array, replacement: &Array, start: i32, end: i32) -> Result<Array> {
+    let mut parts = x.split_axis(&[start, end], 1)?;
+    let after = parts.swap_remove(2);
+    let before = parts.swap_remove(0);
+    Ok(concatenate_axis(&[&before, replacement, &after], 1)?)
+}
+
+fn image_token_runs(ids: &[i32], image_token_id: i32) -> Vec<(i32, i32)> {
+    let mut runs = Vec::new();
+    let mut index = 0usize;
+    while index < ids.len() {
+        if ids[index] == image_token_id {
+            let start = index;
+            while index < ids.len() && ids[index] == image_token_id {
+                index += 1;
+            }
+            runs.push((start as i32, index as i32));
+        } else {
+            index += 1;
+        }
+    }
+    runs
+}
+
+pub(crate) fn grounded_mrope_positions(
+    ids: &[i32],
+    image_token_id: i32,
+    grids: &[[i32; 3]],
+) -> Result<MRopePositions> {
+    let runs = image_token_runs(ids, image_token_id);
+    if runs.len() != grids.len() {
+        return Err(Error::Msg(format!(
+            "mage_flow grounded TE: {} image-token run(s) but {} image grid(s)",
+            runs.len(),
+            grids.len()
+        )));
+    }
+    let (mut t, mut h, mut w) = (
+        Vec::with_capacity(ids.len()),
+        Vec::with_capacity(ids.len()),
+        Vec::with_capacity(ids.len()),
+    );
+    let mut cursor = 0i32;
+    let mut image_index = 0usize;
+    let mut index = 0usize;
+    while index < ids.len() {
+        if ids[index] == image_token_id {
+            let grid = grids[image_index];
+            let (rows, cols) = (grid[1] / IMAGE_SPATIAL_MERGE, grid[2] / IMAGE_SPATIAL_MERGE);
+            let tokens = rows * cols * grid[0];
+            let run = runs[image_index];
+            if run.1 - run.0 != tokens {
+                return Err(Error::Msg(format!(
+                    "mage_flow grounded TE: image run has {} token(s), grid {:?} requires {tokens}",
+                    run.1 - run.0,
+                    grid
+                )));
+            }
+            for frame in 0..grid[0] {
+                for row in 0..rows {
+                    for col in 0..cols {
+                        t.push(cursor + frame);
+                        h.push(cursor + row);
+                        w.push(cursor + col);
+                    }
+                }
+            }
+            cursor += grid[0].max(rows.max(cols));
+            index += tokens as usize;
+            image_index += 1;
+        } else {
+            t.push(cursor);
+            h.push(cursor);
+            w.push(cursor);
+            cursor += 1;
+            index += 1;
+        }
+    }
+    MRopePositions::from_axes(t, h, w)
 }
 
 /// Validate `cu_seqlens` against the packed token count and return the per-segment lengths.
@@ -362,5 +573,43 @@ mod tests {
             seq_lens_from_cu(&[0, 5, 3], 3).is_err(),
             "non-monotonic segment"
         );
+    }
+
+    #[test]
+    fn grounded_positions_use_distinct_t_h_w_axes_for_every_image() {
+        let image = 151_655;
+        let ids = [7, image, image, image, image, 8, image, image, 9];
+        let positions = grounded_mrope_positions(&ids, image, &[[1, 4, 4], [1, 2, 4]]).unwrap();
+        assert_eq!(positions.len(), ids.len());
+        let (t, h, w) = positions.axes();
+        // First image starts at cursor 1 and forms a 2x2 merged grid.
+        assert_eq!(&t[1..5], &[1, 1, 1, 1]);
+        assert_eq!(&h[1..5], &[1, 1, 2, 2]);
+        assert_eq!(&w[1..5], &[1, 2, 1, 2]);
+        // The second image has a distinct 1x2 grid and advances from the intervening text token.
+        assert_eq!(&t[6..8], &[4, 4]);
+        assert_eq!(&h[6..8], &[4, 4]);
+        assert_eq!(&w[6..8], &[4, 5]);
+        assert_ne!(t, h);
+        assert_ne!(h, w);
+        assert!(
+            grounded_mrope_positions(&ids, image, &[[1, 4, 4]]).is_err(),
+            "dropping a grid must not silently flatten the second image"
+        );
+        assert!(
+            grounded_mrope_positions(&ids, image, &[[1, 2, 4], [1, 2, 4]]).is_err(),
+            "a grid whose merged-token count disagrees with its placeholder run must fail"
+        );
+    }
+
+    #[test]
+    fn grounded_deepstack_requires_all_three_shape_exact_features() {
+        let a = || Array::from_slice(&[0f32; 32], &[4, 8]);
+        let embeds = vec![a()];
+        let good = vec![vec![a(), a(), a()]];
+        assert!(validate_deepstack(&[(1, 5)], &embeds, &good).is_ok());
+        assert!(validate_deepstack(&[(1, 5)], &embeds, &[good[0][..2].to_vec()]).is_err());
+        let wrong = vec![vec![a(), Array::from_slice(&[0f32; 24], &[3, 8]), a()]];
+        assert!(validate_deepstack(&[(1, 5)], &embeds, &wrong).is_err());
     }
 }
