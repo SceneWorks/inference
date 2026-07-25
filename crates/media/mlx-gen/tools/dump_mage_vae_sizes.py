@@ -42,7 +42,7 @@ from PIL import Image
 from safetensors.numpy import save_file
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-GOLDEN = os.path.join(HERE, "golden")
+GOLDEN = os.environ.get("MAGE_GOLDEN_DIR", os.path.join(HERE, "golden"))
 VENDOR = os.path.normpath(os.path.join(HERE, "..", "_vendor"))
 
 DEVICE = os.environ.get("MAGE_DEVICE", "cpu")
@@ -70,7 +70,7 @@ def _parse_sizes(spec: str) -> list[tuple[int, int]]:
 # pad_h/pad_w swap survives all of them. Do not drop 768x1152 without replacing it with another
 # geometry whose two pads differ.
 SIZES = _parse_sizes(
-    os.environ.get("MAGE_VAE_SIZES", "256,1024,2048,512x2048,768x1280,768x1152")
+    os.environ.get("MAGE_VAE_SIZES", "256,992,1024,2048,512x2048,768x1280,768x1152")
 )
 SEED = int(os.environ.get("MAGE_SEED", "42"))
 REF_IMAGE = os.environ.get(

@@ -51,14 +51,12 @@ jobs:
       # Explicit operator-provided models root for the mlx-gen real-weight resolvers that resolve a
       # repo-keyed snapshot (sc-13755); inference never self-fetches or derives a cache location.
       MLX_GEN_MODELS_ROOT: ${{ vars.MLX_GEN_MODELS_ROOT }}
-      # Explicit operator-provided path to the Mage-Flow TE boundary golden (sc-14038). The goldens
-      # under `crates/media/mlx-gen/tools/golden/` are gitignored by documented convention — they
-      # take the licensed multi-GB weights plus torch to produce — so the parity oracle cannot ship
-      # in the repo. Same posture as MLX_GEN_MODELS_ROOT above: an operator-provided path, never a
-      # location this repo derives. Produce it once per runner with
-      # `MAGE_DEVICE=cpu python3 crates/media/mlx-gen/tools/dump_mage_flow_golden.py --stage te`
-      # (MPS dumps are silently corrupt — sc-14250).
-      MAGE_FLOW_TE_GOLDEN: ${{ vars.MAGE_FLOW_TE_GOLDEN }}
+      # Pinned reference interpreter installed on the self-hosted runner. The workflow regenerates
+      # the small oracle bundle from the immutable snapshot on every run; no licensed golden is
+      # stored in GitHub or trusted from persistent runner state.
+      MAGE_REF_PYTHON: ${{ vars.MAGE_REF_PYTHON }}
+      MAGE_GOLDEN_DIR: ${{ runner.temp }}/mage-flow-oracles
+      MAGE_REQUIRE_GOLDENS: "1"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: Toolchain versions
@@ -68,6 +66,16 @@ jobs:
           python3 -m pip install --disable-pip-version-check --target "$RUNNER_TEMP/huggingface-hub" "huggingface_hub==1.20.1"
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model z-image-turbo --snapshot "$ZIMAGE_SNAPSHOT"
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model mage-flow --snapshot "$MAGE_SNAPSHOT"
+      - name: Regenerate and verify shared CPU Mage oracles
+        run: |
+          if [[ -z "$MAGE_REF_PYTHON" || ! -x "$MAGE_REF_PYTHON" ]]; then
+            echo "::error::MAGE_REF_PYTHON must name the executable pinned Mage reference interpreter"
+            exit 1
+          fi
+          MAGE_DEVICE=cpu "$MAGE_REF_PYTHON" scripts/release/provision_mage_oracles.py \
+            --snapshot "$MAGE_SNAPSHOT" \
+            --output "$MAGE_GOLDEN_DIR"
+          echo "MAGE_FLOW_TE_GOLDEN=$MAGE_GOLDEN_DIR/mage_flow_te_golden.safetensors" >> "$GITHUB_ENV"
       - name: Run provider conformance
         run: >-
           cargo test --locked -p mlx-gen-z-image --test conformance
@@ -80,6 +88,10 @@ jobs:
       - name: Run Mage-Flow text-encoder parity
         run: >-
           cargo test --locked --release -p mlx-gen-mage --test te_parity_real_weights
+          -- --ignored --nocapture
+      - name: Run Mage-VAE all-geometry parity
+        run: >-
+          cargo test --locked --release -p mlx-gen-mage --test vae_decode_real_weights
           -- --ignored --nocapture
 
   candle-audio:
