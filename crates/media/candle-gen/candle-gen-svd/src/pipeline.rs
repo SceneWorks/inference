@@ -231,16 +231,76 @@ pub fn decode(vae: &SvdVae, latents: &Tensor, num_frames: usize, chunk: usize) -
     Ok(frames.reshape((1, num_frames, oc, oh, ow))?)
 }
 
-/// Decoded frames `[1, F, 3, H, W]` (roughly `[-1, 1]`) → `Vec<Image>` (`clip(x·0.5+0.5)·255`).
-pub fn frames_to_images(decoded: &Tensor) -> CResult<Vec<Image>> {
+/// Run a temporal chunk pipeline in strict decode → materialize → release order. `materialize`
+/// consumes the decoded chunk, so its accelerator tensor drops before the next `decode` call begins.
+fn decode_chunks_incrementally<Chunk, Output, E>(
+    num_frames: usize,
+    chunk_size: usize,
+    mut decode_chunk: impl FnMut(usize, usize) -> std::result::Result<Chunk, E>,
+    mut materialize: impl FnMut(Chunk) -> std::result::Result<Vec<Output>, E>,
+) -> std::result::Result<Vec<Output>, E> {
+    let mut output = Vec::with_capacity(num_frames);
+    let mut start = 0usize;
+    let chunk_size = chunk_size.max(1);
+    while start < num_frames {
+        let count = chunk_size.min(num_frames - start);
+        let decoded = decode_chunk(start, count)?;
+        output.extend(materialize(decoded)?);
+        start += count;
+    }
+    Ok(output)
+}
+
+/// Decode temporal chunks one at a time, spatially tiling each chunk against live free VRAM, and
+/// materialize its RGB frames on CPU before the next GPU chunk begins. This deliberately has no final
+/// GPU concat: the returned value is already the provider's host-side `Vec<Image>`.
+pub fn decode_to_images_incremental(
+    vae: &SvdVae,
+    latents: &Tensor,
+    num_frames: usize,
+    chunk_size: usize,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+) -> CResult<Vec<Image>> {
+    let (b, f, c, h, w) = latents.dims5()?;
+    if b != 1 || f != num_frames {
+        return Err(CandleError::Msg(format!(
+            "svd decode: expected [1,{num_frames},C,H,W], got [{b},{f},{c},{h},{w}]"
+        )));
+    }
+    let z = latents
+        .reshape((f, c, h, w))?
+        .affine(1.0 / vae.scaling_factor() as f64, 0.0)?;
+
+    decode_chunks_incrementally(
+        num_frames,
+        chunk_size,
+        |start, count| {
+            candle_gen::check_cancel(cancel)?;
+            let chunk = z.narrow(0, start, count)?;
+            vae.decode_budgeted_with_progress(&chunk, count, cancel, on_progress)
+        },
+        |decoded| {
+            let images = decoded_chunk_to_images(&decoded)?;
+            // `decoded` is consumed by this closure and drops here, after the explicit CPU transfer
+            // inside `decoded_chunk_to_images`, before the next decode closure is entered.
+            drop(decoded);
+            candle_gen::check_cancel(cancel)?;
+            Ok(images)
+        },
+    )
+}
+
+/// One decoded GPU chunk `[F,3,H,W]` → CPU RGB images. The device transfer is intentionally inside
+/// the per-chunk materializer so no decoded GPU chunk survives into the next VAE pass.
+fn decoded_chunk_to_images(decoded: &Tensor) -> CResult<Vec<Image>> {
     let scaled = ((decoded.clamp(-1f32, 1f32)? + 1.0)? * 127.5)?;
     let u8s = candle_gen::round_rgb8(&scaled)?.to_device(&Device::Cpu)?;
-    let (_b, f, c, h, w) = u8s.dims5()?;
+    let (f, c, h, w) = u8s.dims4()?;
     debug_assert_eq!(c, 3);
-    let frames = u8s.squeeze(0)?; // [F, 3, H, W]
     let mut out = Vec::with_capacity(f);
     for fi in 0..f {
-        let frame = frames.narrow(0, fi, 1)?.squeeze(0)?; // [3, H, W]
+        let frame = u8s.narrow(0, fi, 1)?.squeeze(0)?;
         let pixels = frame.permute((1, 2, 0))?.flatten_all()?.to_vec1::<u8>()?;
         out.push(Image {
             width: w as u32,
@@ -251,9 +311,16 @@ pub fn frames_to_images(decoded: &Tensor) -> CResult<Vec<Image>> {
     Ok(out)
 }
 
+/// Decoded frames `[1, F, 3, H, W]` (roughly `[-1, 1]`) → `Vec<Image>` (`clip(x·0.5+0.5)·255`).
+pub fn frames_to_images(decoded: &Tensor) -> CResult<Vec<Image>> {
+    let frames = decoded.squeeze(0)?;
+    decoded_chunk_to_images(&frames)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
 
     /// sc-8993 (F-013): when guidance is disabled every per-frame scale is `1.0`, and the CFG blend
     /// `uncond + g·(cond − uncond)` with `g == 1.0` is exactly `cond` for ANY uncond. This is the
@@ -298,5 +365,53 @@ mod tests {
             diff < 1e-5,
             "guidance-1.0 CFG blend must equal cond; max |diff| = {diff}"
         );
+    }
+
+    /// Mutation witness for the production ordering: materialization consumes and releases each
+    /// decoded GPU chunk before the next decode begins. Removing the materialize step either leaves
+    /// the liveness witness resident or loses the output, and this test fails.
+    #[test]
+    fn incremental_materialization_releases_each_chunk_before_next_decode() {
+        struct GpuChunk<'a> {
+            id: usize,
+            live: &'a Cell<usize>,
+        }
+        impl Drop for GpuChunk<'_> {
+            fn drop(&mut self) {
+                self.live.set(self.live.get() - 1);
+            }
+        }
+
+        let live = Cell::new(0usize);
+        let out = decode_chunks_incrementally(
+            5,
+            2,
+            |start, count| {
+                assert_eq!(
+                    live.get(),
+                    0,
+                    "the previous GPU chunk must be released before decoding the next"
+                );
+                live.set(live.get() + 1);
+                Ok::<_, ()>(GpuChunk {
+                    id: start + count,
+                    live: &live,
+                })
+            },
+            |chunk| {
+                let id = chunk.id;
+                drop(chunk);
+                assert_eq!(
+                    live.get(),
+                    0,
+                    "CPU materialization must consume the GPU chunk"
+                );
+                Ok(vec![id])
+            },
+        )
+        .unwrap();
+
+        assert_eq!(out, vec![2, 4, 5]);
+        assert_eq!(live.get(), 0);
     }
 }

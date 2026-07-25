@@ -24,5 +24,6 @@ metal = ["candle-gen/metal"]
 cuda = ["candle-gen/cuda"]
 
 [dev-dependencies]
+candle-gen = { path = "../candle-gen", features = ["testkit"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 sceneworks-gen-core-testkit = { workspace = true }
