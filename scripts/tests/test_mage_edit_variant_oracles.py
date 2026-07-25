@@ -97,6 +97,41 @@ class MageEditVariantOracleTests(unittest.TestCase):
             "files": records,
         }
 
+    def record(self, steps: int = 30, cfg: float = 5.0) -> dict:
+        sigmas, timesteps = self.module.expected_schedule(steps)
+        return {
+            "metadata": {
+                "device": "cpu",
+                "edit_revision": self.revisions["edit"],
+                "prompt": self.module.PROMPT,
+                "edit_instruction": self.module.EDIT_INSTRUCTION,
+            },
+            "tensors": {
+                key: {"dtype": dtype, "shape": shape}
+                for key, (dtype, shape) in self.module.edit_schema(steps, cfg).items()
+            },
+            "values": {
+                "geometry": [256, 256, 4, steps],
+                "seed": [42],
+                "cfg": [cfg],
+                "gs_key": [20260720],
+                "drop_idx": [34, 64],
+                "static_shift": [6.0],
+                "target_tokens": [256],
+                "img_shapes": self.module.expected_img_shapes(cfg),
+                f"sigmas_{steps}": sigmas,
+                f"timesteps_{steps}": timesteps,
+            },
+            "mutationChecks": {
+                "trajectoryChanges": True,
+                "targetDiffersReference": True,
+                "finalChangesInitial": True,
+                "imageDiscriminating": True,
+                "referenceDiscriminating": True,
+                "imageDiffersReference": True,
+            },
+        }
+
     def test_verify_only_checks_every_variant_and_never_regenerates(self) -> None:
         (self.output / "mage_edit_variants_manifest.json").write_text(
             json.dumps(self.manifest(), indent=2) + "\n", encoding="utf-8"
@@ -138,6 +173,42 @@ class MageEditVariantOracleTests(unittest.TestCase):
             self.assertRaisesRegex(RuntimeError, "manifest .* stale"),
         ):
             self.module.main()
+
+    def test_exact_schema_values_and_discrimination_reject_producer_mutations(self) -> None:
+        self.module.validate_record(self.record(), self.revisions["edit"], 30, 5.0)
+        self.module.validate_record(self.record(4, 1.0), self.revisions["edit"], 4, 1.0)
+        mutations = []
+        extra = self.record()
+        extra["tensors"]["unexpected"] = {"dtype": "float32", "shape": [1]}
+        mutations.append(extra)
+        wrong_dtype = self.record()
+        wrong_dtype["tensors"]["final_tokens"]["dtype"] = "float16"
+        mutations.append(wrong_dtype)
+        wrong_shape = self.record()
+        wrong_shape["tensors"]["seq_step0"]["shape"] = [1, 768, 128]
+        mutations.append(wrong_shape)
+        wrong_channel = self.record()
+        wrong_channel["tensors"]["image_u8"]["shape"] = [256, 256, 4]
+        mutations.append(wrong_channel)
+        wrong_img_shapes = self.record()
+        wrong_img_shapes["values"]["img_shapes"] = [[1, 16, 16]] * 3 + [[0, 16, 16]]
+        mutations.append(wrong_img_shapes)
+        wrong_scalar = self.record()
+        wrong_scalar["values"]["seed"] = [43]
+        mutations.append(wrong_scalar)
+        wrong_schedule = self.record()
+        wrong_schedule["values"]["timesteps_30"][2], wrong_schedule["values"]["timesteps_30"][3] = (
+            wrong_schedule["values"]["timesteps_30"][3],
+            wrong_schedule["values"]["timesteps_30"][2],
+        )
+        mutations.append(wrong_schedule)
+        for check in self.record()["mutationChecks"]:
+            failed = self.record()
+            failed["mutationChecks"][check] = False
+            mutations.append(failed)
+        for mutated in mutations:
+            with self.assertRaises(RuntimeError):
+                self.module.validate_record(mutated, self.revisions["edit"], 30, 5.0)
 
 
 if __name__ == "__main__":

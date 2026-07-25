@@ -80,6 +80,7 @@ EDIT_SCHEMA = {
     "target_tokens": ("I32", [1]),
     "timesteps_30": ("F32", [30]),
 }
+EDIT_IMG_SHAPES = [[1, 16, 16]] * 4
 REFERENCE_PACKAGES = {
     "accelerate": "1.13.0",
     "diffusers": "0.38.0",
@@ -171,16 +172,87 @@ def _inspect(
     return metadata, keys, shapes, dtypes
 
 
+def _expected_schedule(steps: int) -> tuple[list[float], list[float]]:
+    base = [
+        1.0 - index * (1.0 - 1.0 / steps) / (steps - 1)
+        for index in range(steps)
+    ]
+    shifted = [6.0 * sigma / (1.0 + 5.0 * sigma) for sigma in base]
+    return shifted + [0.0], [sigma * 1000.0 for sigma in shifted]
+
+
+def _require_ordered_values(
+    values: dict[str, object], key: str, expected: list[float], tolerance: float
+) -> None:
+    actual = values.get(key)
+    if (
+        not isinstance(actual, list)
+        or len(actual) != len(expected)
+        or any(abs(float(left) - float(right)) > tolerance for left, right in zip(actual, expected))
+    ):
+        raise InvalidOracle(f"{key} ordered values are stale")
+
+
+def _validate_edit_policy_record(values: dict[str, object], checks: dict[str, bool]) -> None:
+    expected_values = {
+        "geometry": [256, 256, 4, 30],
+        "seed": [42],
+        "cfg": [5.0],
+        "gs_key": [20260720],
+        "drop_idx": [34, 64],
+        "static_shift": [6.0],
+        "target_tokens": [256],
+        "img_shapes": EDIT_IMG_SHAPES,
+    }
+    for key, expected in expected_values.items():
+        if values.get(key) != expected:
+            raise InvalidOracle(f"{key} value is stale")
+    sigmas, timesteps = _expected_schedule(30)
+    _require_ordered_values(values, "sigmas_30", sigmas, 1.0e-4)
+    _require_ordered_values(values, "timesteps_30", timesteps, 1.0e-3)
+    failed = [name for name, passed in checks.items() if passed is not True]
+    if failed:
+        raise InvalidOracle(f"load-bearing edit mutation/value checks failed: {failed}")
+
+
 def _validate_primary_edit_policy(path: Path) -> None:
     with safe_open(path, framework="numpy") as handle:
-        geometry = handle.get_tensor("geometry").astype(np.int64).tolist()
-        cfg = float(handle.get_tensor("cfg")[0])
-    if geometry != [256, 256, 4, 30]:
-        raise InvalidOracle(
-            f"{path.name} geometry is {geometry}, expected [256, 256, 4, 30]"
-        )
-    if cfg != 5.0:
-        raise InvalidOracle(f"{path.name} cfg is {cfg}, expected 5.0")
+        values = {
+            key: handle.get_tensor(key).tolist()
+            for key in (
+                "geometry",
+                "seed",
+                "cfg",
+                "gs_key",
+                "drop_idx",
+                "static_shift",
+                "target_tokens",
+                "img_shapes",
+                "sigmas_30",
+                "timesteps_30",
+            )
+        }
+        final = handle.get_tensor("final_tokens")
+        image = handle.get_tensor("image_u8")
+        reference = handle.get_tensor("ref_u8")
+        step0 = handle.get_tensor("seq_step0")
+        step1 = handle.get_tensor("seq_step1")
+    checks = {
+        "trajectoryChanges": not np.array_equal(step0, step1),
+        "targetDiffersReference": not np.array_equal(
+            step0[:, :256, :], step0[:, 256:512, :]
+        ),
+        "finalChangesInitial": not np.array_equal(final, step0[:, :256, :]),
+        "imageDiscriminating": (
+            int(image.max()) - int(image.min()) >= 64 and float(image.std()) > 5.0
+        ),
+        "referenceDiscriminating": (
+            int(reference.max()) - int(reference.min()) >= 64
+            and float(reference.std()) > 5.0
+        ),
+        "imageDiffersReference": not np.array_equal(image, reference),
+    }
+    _validate_edit_policy_record(values, checks)
 
 
 def _vae_schema(height: int, width: int) -> dict[str, tuple[str, list[int]]]:

@@ -47,6 +47,7 @@ E2E_KEYS = {
     "timesteps_30",
     *META_KEYS,
 }
+EXPECTED_IMG_SHAPES = [[1, 64, 64], [1, 64, 64]]
 
 
 class InvalidOracle(RuntimeError):
@@ -77,20 +78,61 @@ def inspect(path: Path) -> dict:
         with safe_open(path, framework="numpy") as handle:
             tensors = {}
             values = {}
-            mutation_tensors = {}
+            selected = {}
             for key in handle.keys():
                 tensor = handle.get_tensor(key)
                 tensors[key] = {
                     "dtype": str(tensor.dtype),
                     "shape": list(tensor.shape),
                 }
-                if key in META_KEYS or key.startswith(("sigmas_", "timesteps_")):
+                if (
+                    key in META_KEYS
+                    or key.startswith(("sigmas_", "timesteps_"))
+                    or key
+                    in {
+                        "dit_in.timesteps",
+                        "dit_in.img_cu_seqlens",
+                        "dit_in.txt_cu_seqlens",
+                        "img_shapes",
+                    }
+                ):
                     values[key] = tensor.tolist()
-                if key in {"dit_in.img", "dit_out", "traj_step0", "traj_step1"}:
-                    mutation_tensors[key] = tensor
+                if key in {
+                    "dit_in.img",
+                    "dit_out",
+                    "final_tokens",
+                    "image_u8",
+                    "traj_step0",
+                    "traj_step1",
+                }:
+                    selected[key] = tensor
             metadata = handle.metadata() or {}
     except Exception as error:
         raise InvalidOracle(f"cannot inspect {path.name}: {error}") from error
+    checks = {
+        "ditChangesInput": (
+            not np.array_equal(selected["dit_in.img"], selected["dit_out"])
+            if {"dit_in.img", "dit_out"} <= set(selected)
+            else None
+        ),
+        "trajectoryChanges": (
+            not np.array_equal(selected["traj_step0"], selected["traj_step1"])
+            if {"traj_step0", "traj_step1"} <= set(selected)
+            else None
+        ),
+        "finalChangesInitial": None,
+        "imageDiscriminating": None,
+    }
+    if {"final_tokens", "traj_step0"} <= set(selected):
+        final_tokens = selected["final_tokens"]
+        checks["finalChangesInitial"] = not np.array_equal(
+            final_tokens, selected["traj_step0"][:, : final_tokens.shape[1], :]
+        )
+    if "image_u8" in selected:
+        image = selected["image_u8"]
+        checks["imageDiscriminating"] = (
+            int(image.max()) - int(image.min()) >= 64 and float(image.std()) > 5.0
+        )
     return {
         "file": path.name,
         "bytes": path.stat().st_size,
@@ -98,23 +140,31 @@ def inspect(path: Path) -> dict:
         "metadata": metadata,
         "tensors": tensors,
         "values": values,
-        "mutationChecks": {
-            "ditChangesInput": (
-                not np.array_equal(
-                    mutation_tensors["dit_in.img"], mutation_tensors["dit_out"]
-                )
-                if {"dit_in.img", "dit_out"} <= set(mutation_tensors)
-                else None
-            ),
-            "trajectoryChanges": (
-                not np.array_equal(
-                    mutation_tensors["traj_step0"], mutation_tensors["traj_step1"]
-                )
-                if {"traj_step0", "traj_step1"} <= set(mutation_tensors)
-                else None
-            ),
-        },
+        "mutationChecks": checks,
     }
+
+
+def expected_schedule(steps: int) -> tuple[list[float], list[float]]:
+    base = [
+        1.0 - index * (1.0 - 1.0 / steps) / (steps - 1)
+        for index in range(steps)
+    ]
+    shifted = [6.0 * sigma / (1.0 + 5.0 * sigma) for sigma in base]
+    return shifted + [0.0], [sigma * 1000.0 for sigma in shifted]
+
+
+def require_values(record: dict, key: str, expected: object, tolerance: float = 0.0) -> None:
+    actual = record["values"].get(key)
+    if tolerance:
+        if (
+            not isinstance(actual, list)
+            or not isinstance(expected, list)
+            or len(actual) != len(expected)
+            or any(abs(float(left) - float(right)) > tolerance for left, right in zip(actual, expected))
+        ):
+            raise InvalidOracle(f"{record['file']}:{key} ordered values are stale")
+    elif actual != expected:
+        raise InvalidOracle(f"{record['file']}:{key} value is stale")
 
 
 def require_tensor(
@@ -151,52 +201,47 @@ def validate_common(record: dict, expected_revision: str, keys: set[str]) -> Non
         ("static_shift", "float32", [1], [6.0]),
     ):
         require_tensor(record, key, dtype, shape)
-        if record["values"].get(key) != value:
-            raise InvalidOracle(f"{record['file']}:{key} value is stale")
+        require_values(record, key, value)
 
 
 def validate_dit(record: dict, expected_revision: str) -> None:
     validate_common(record, expected_revision, DIT_KEYS)
-    image_shape = require_tensor(record, "dit_in.img", "float32")
-    output_shape = require_tensor(record, "dit_out", "float32")
-    text_shape = require_tensor(record, "dit_in.txt", "float32")
-    if image_shape != output_shape or len(image_shape) != 3 or image_shape[0] != 1:
-        raise InvalidOracle("DiT image input/output topology is stale")
-    if len(text_shape) != 3 or text_shape[0] != 1:
-        raise InvalidOracle("DiT text topology is stale")
+    require_tensor(record, "dit_in.img", "float32", [1, 8192, 128])
+    require_tensor(record, "dit_out", "float32", [1, 8192, 128])
+    require_tensor(record, "dit_in.txt", "float32", [1, 26, 2560])
     require_tensor(record, "dit_in.timesteps", "float32", [2])
     require_tensor(record, "dit_in.img_cu_seqlens", "int64", [3])
     require_tensor(record, "dit_in.txt_cu_seqlens", "int64", [3])
-    require_tensor(record, "img_shapes", "int32", [1, 3])
+    require_tensor(record, "img_shapes", "int32", [2, 3])
+    require_values(record, "dit_in.timesteps", [1.0, 1.0], 1.0e-6)
+    require_values(record, "dit_in.img_cu_seqlens", [0, 4096, 8192])
+    require_values(record, "dit_in.txt_cu_seqlens", [0, 20, 26])
+    require_values(record, "img_shapes", EXPECTED_IMG_SHAPES)
     if record["mutationChecks"].get("ditChangesInput") is not True:
         raise InvalidOracle("DiT output equals its input; mutation gate is non-load-bearing")
 
 
 def validate_e2e(record: dict, expected_revision: str) -> None:
     validate_common(record, expected_revision, E2E_KEYS)
-    final_tokens = require_tensor(record, "final_tokens", "float32")
-    final_latent = require_tensor(record, "final_latent", "float32")
-    step0 = require_tensor(record, "traj_step0", "float32")
-    step1 = require_tensor(record, "traj_step1", "float32")
-    if (
-        len(final_tokens) != 3
-        or final_tokens[:2] != [1, 4096]
-        or final_latent != [1, final_tokens[2], 64, 64]
-        or step0 != [1, 8192, final_tokens[2]]
-        or step1 != step0
-    ):
-        raise InvalidOracle("E2E latent/token topology is stale")
+    require_tensor(record, "final_tokens", "float32", [1, 4096, 128])
+    require_tensor(record, "final_latent", "float32", [1, 128, 64, 64])
+    require_tensor(record, "traj_step0", "float32", [1, 8192, 128])
+    require_tensor(record, "traj_step1", "float32", [1, 8192, 128])
     require_tensor(record, "image_u8", "uint8", [1024, 1024, 3])
-    require_tensor(record, "img_shapes", "int32", [1, 3])
+    require_tensor(record, "img_shapes", "int32", [2, 3])
+    require_values(record, "img_shapes", EXPECTED_IMG_SHAPES)
     if record["mutationChecks"].get("trajectoryChanges") is not True:
         raise InvalidOracle("E2E step0 equals step1; trajectory gate is non-load-bearing")
+    if record["mutationChecks"].get("finalChangesInitial") is not True:
+        raise InvalidOracle("E2E final tokens equal their initial trajectory slice")
+    if record["mutationChecks"].get("imageDiscriminating") is not True:
+        raise InvalidOracle("E2E image is constant or non-discriminating")
     for steps in (20, 4, 30):
         require_tensor(record, f"sigmas_{steps}", "float32", [steps + 1])
         require_tensor(record, f"timesteps_{steps}", "float32", [steps])
-        sigmas = record["values"][f"sigmas_{steps}"]
-        timesteps = record["values"][f"timesteps_{steps}"]
-        if sigmas[-1] != 0.0 or len(set(sigmas)) != len(sigmas) or len(set(timesteps)) != len(timesteps):
-            raise InvalidOracle(f"E2E {steps}-step schedule is non-load-bearing or stale")
+        sigmas, timesteps = expected_schedule(steps)
+        require_values(record, f"sigmas_{steps}", sigmas, 1.0e-4)
+        require_values(record, f"timesteps_{steps}", timesteps, 1.0e-3)
 
 
 def records(output: Path, expected_revision: str) -> list[dict]:

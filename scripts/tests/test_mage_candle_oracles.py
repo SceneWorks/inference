@@ -82,6 +82,8 @@ class MageCandleOracleTests(unittest.TestCase):
             "mutationChecks": {
                 "ditChangesInput": None,
                 "trajectoryChanges": None,
+                "finalChangesInitial": None,
+                "imageDiscriminating": None,
             },
         }
 
@@ -89,13 +91,21 @@ class MageCandleOracleTests(unittest.TestCase):
         record = self.common(self.module.FILES[0])
         record["tensors"].update(
             {
-                "dit_in.img": self.tensor("float32", [1, 8192, 64]),
-                "dit_in.txt": self.tensor("float32", [1, 512, 2560]),
+                "dit_in.img": self.tensor("float32", [1, 8192, 128]),
+                "dit_in.txt": self.tensor("float32", [1, 26, 2560]),
                 "dit_in.timesteps": self.tensor("float32", [2]),
                 "dit_in.img_cu_seqlens": self.tensor("int64", [3]),
                 "dit_in.txt_cu_seqlens": self.tensor("int64", [3]),
-                "dit_out": self.tensor("float32", [1, 8192, 64]),
-                "img_shapes": self.tensor("int32", [1, 3]),
+                "dit_out": self.tensor("float32", [1, 8192, 128]),
+                "img_shapes": self.tensor("int32", [2, 3]),
+            }
+        )
+        record["values"].update(
+            {
+                "dit_in.timesteps": [1.0, 1.0],
+                "dit_in.img_cu_seqlens": [0, 4096, 8192],
+                "dit_in.txt_cu_seqlens": [0, 20, 26],
+                "img_shapes": self.module.EXPECTED_IMG_SHAPES,
             }
         )
         record["mutationChecks"]["ditChangesInput"] = True
@@ -105,14 +115,15 @@ class MageCandleOracleTests(unittest.TestCase):
         record = self.common(self.module.FILES[1])
         record["tensors"].update(
             {
-                "final_tokens": self.tensor("float32", [1, 4096, 64]),
-                "final_latent": self.tensor("float32", [1, 64, 64, 64]),
+                "final_tokens": self.tensor("float32", [1, 4096, 128]),
+                "final_latent": self.tensor("float32", [1, 128, 64, 64]),
                 "image_u8": self.tensor("uint8", [1024, 1024, 3]),
-                "traj_step0": self.tensor("float32", [1, 8192, 64]),
-                "traj_step1": self.tensor("float32", [1, 8192, 64]),
-                "img_shapes": self.tensor("int32", [1, 3]),
+                "traj_step0": self.tensor("float32", [1, 8192, 128]),
+                "traj_step1": self.tensor("float32", [1, 8192, 128]),
+                "img_shapes": self.tensor("int32", [2, 3]),
             }
         )
+        record["values"]["img_shapes"] = self.module.EXPECTED_IMG_SHAPES
         for steps in (20, 4, 30):
             record["tensors"][f"sigmas_{steps}"] = self.tensor(
                 "float32", [steps + 1]
@@ -120,13 +131,12 @@ class MageCandleOracleTests(unittest.TestCase):
             record["tensors"][f"timesteps_{steps}"] = self.tensor(
                 "float32", [steps]
             )
-            record["values"][f"sigmas_{steps}"] = [
-                float(steps - index) for index in range(steps)
-            ] + [0.0]
-            record["values"][f"timesteps_{steps}"] = [
-                float(steps - index) for index in range(steps)
-            ]
+            sigmas, timesteps = self.module.expected_schedule(steps)
+            record["values"][f"sigmas_{steps}"] = sigmas
+            record["values"][f"timesteps_{steps}"] = timesteps
         record["mutationChecks"]["trajectoryChanges"] = True
+        record["mutationChecks"]["finalChangesInitial"] = True
+        record["mutationChecks"]["imageDiscriminating"] = True
         return record
 
     def test_accepts_exact_schema_values_mutations_and_hash_manifest(self) -> None:
@@ -178,6 +188,41 @@ class MageCandleOracleTests(unittest.TestCase):
         no_trajectory["mutationChecks"]["trajectoryChanges"] = False
         with self.assertRaisesRegex(self.module.InvalidOracle, "step0 equals step1"):
             self.module.validate_e2e(no_trajectory, self.revision)
+        extra = self.e2e()
+        extra["tensors"]["unexpected"] = self.tensor("float32", [1])
+        with self.assertRaisesRegex(self.module.InvalidOracle, "population"):
+            self.module.validate_e2e(extra, self.revision)
+        wrong_dtype = self.dit()
+        wrong_dtype["tensors"]["dit_in.img"]["dtype"] = "float16"
+        with self.assertRaisesRegex(self.module.InvalidOracle, "dtype"):
+            self.module.validate_dit(wrong_dtype, self.revision)
+        wrong_channel = self.e2e()
+        wrong_channel["tensors"]["image_u8"]["shape"] = [1024, 1024, 4]
+        with self.assertRaisesRegex(self.module.InvalidOracle, "shape"):
+            self.module.validate_e2e(wrong_channel, self.revision)
+        wrong_text = self.dit()
+        wrong_text["tensors"]["dit_in.txt"]["shape"] = [1, 25, 2560]
+        with self.assertRaisesRegex(self.module.InvalidOracle, "shape"):
+            self.module.validate_dit(wrong_text, self.revision)
+        wrong_shapes = self.e2e()
+        wrong_shapes["values"]["img_shapes"] = [[1, 64, 64], [0, 64, 64]]
+        with self.assertRaisesRegex(self.module.InvalidOracle, "img_shapes.*stale"):
+            self.module.validate_e2e(wrong_shapes, self.revision)
+        wrong_schedule = self.e2e()
+        wrong_schedule["values"]["sigmas_20"][5], wrong_schedule["values"]["sigmas_20"][6] = (
+            wrong_schedule["values"]["sigmas_20"][6],
+            wrong_schedule["values"]["sigmas_20"][5],
+        )
+        with self.assertRaisesRegex(self.module.InvalidOracle, "ordered values"):
+            self.module.validate_e2e(wrong_schedule, self.revision)
+        wrong_scalar = self.e2e()
+        wrong_scalar["values"]["gs_key"] = [1]
+        with self.assertRaisesRegex(self.module.InvalidOracle, "gs_key.*stale"):
+            self.module.validate_e2e(wrong_scalar, self.revision)
+        nondiscriminating = self.e2e()
+        nondiscriminating["mutationChecks"]["imageDiscriminating"] = False
+        with self.assertRaisesRegex(self.module.InvalidOracle, "non-discriminating"):
+            self.module.validate_e2e(nondiscriminating, self.revision)
 
         records = [self.dit(), self.e2e()]
         stale = {

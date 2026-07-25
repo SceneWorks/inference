@@ -25,6 +25,41 @@ CASES = (
     ("edit-turbo", "mage_flow_edit_turbo_golden.safetensors", 4, 1.0),
 )
 REVISION_MARKER = ".sceneworks-model-revision"
+PROMPT = "a calico kitten sitting on a wooden windowsill beside a blue ceramic mug"
+EDIT_INSTRUCTION = "Replace the background with a field of sunflowers"
+def expected_img_shapes(cfg: float) -> list[list[int]]:
+    return [[1, 16, 16]] * (4 if cfg > 1.0 else 2)
+
+
+def edit_schema(steps: int, cfg: float) -> dict[str, tuple[str, list[int]]]:
+    sequence_tokens = 1024 if cfg > 1.0 else 512
+    return {
+        "cfg": ("float32", [1]),
+        "drop_idx": ("int32", [2]),
+        "final_latent": ("float32", [1, 128, 16, 16]),
+        "final_tokens": ("float32", [1, 256, 128]),
+        "geometry": ("int32", [4]),
+        "gs_key": ("int64", [1]),
+        "image_u8": ("uint8", [256, 256, 3]),
+        "img_shapes": ("int32", [len(expected_img_shapes(cfg)), 3]),
+        "ref_u8": ("uint8", [256, 256, 3]),
+        "seed": ("int64", [1]),
+        "seq_step0": ("float32", [1, sequence_tokens, 128]),
+        "seq_step1": ("float32", [1, sequence_tokens, 128]),
+        f"sigmas_{steps}": ("float32", [steps + 1]),
+        "static_shift": ("float32", [1]),
+        "target_tokens": ("int32", [1]),
+        f"timesteps_{steps}": ("float32", [steps]),
+    }
+
+
+def expected_schedule(steps: int) -> tuple[list[float], list[float]]:
+    base = [
+        1.0 - index * (1.0 - 1.0 / steps) / (steps - 1)
+        for index in range(steps)
+    ]
+    shifted = [6.0 * sigma / (1.0 + 5.0 * sigma) for sigma in base]
+    return shifted + [0.0], [sigma * 1000.0 for sigma in shifted]
 
 
 def revision(path: Path) -> str:
@@ -50,42 +85,133 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def inspect(path: Path) -> dict:
+    try:
+        with safe_open(path, framework="numpy") as handle:
+            metadata = handle.metadata() or {}
+            tensors = {}
+            values = {}
+            selected = {}
+            for key in handle.keys():
+                tensor = handle.get_tensor(key)
+                tensors[key] = {"dtype": str(tensor.dtype), "shape": list(tensor.shape)}
+                if key in {
+                    "cfg",
+                    "drop_idx",
+                    "geometry",
+                    "gs_key",
+                    "img_shapes",
+                    "seed",
+                    "static_shift",
+                    "target_tokens",
+                } or key.startswith(("sigmas_", "timesteps_")):
+                    values[key] = tensor.tolist()
+                if key in {
+                    "final_tokens",
+                    "image_u8",
+                    "ref_u8",
+                    "seq_step0",
+                    "seq_step1",
+                }:
+                    selected[key] = tensor
+    except Exception as error:
+        raise RuntimeError(f"{path.name} is not a readable safetensors bundle: {error}") from error
+    image = selected.get("image_u8")
+    reference = selected.get("ref_u8")
+    step0 = selected.get("seq_step0")
+    step1 = selected.get("seq_step1")
+    final = selected.get("final_tokens")
+    checks = {
+        "trajectoryChanges": (
+            not np.array_equal(step0, step1) if step0 is not None and step1 is not None else None
+        ),
+        "targetDiffersReference": (
+            not np.array_equal(step0[:, :256, :], step0[:, 256:512, :])
+            if step0 is not None
+            else None
+        ),
+        "finalChangesInitial": (
+            not np.array_equal(final, step0[:, :256, :])
+            if final is not None and step0 is not None
+            else None
+        ),
+        "imageDiscriminating": (
+            int(image.max()) - int(image.min()) >= 64 and float(image.std()) > 5.0
+            if image is not None
+            else None
+        ),
+        "referenceDiscriminating": (
+            int(reference.max()) - int(reference.min()) >= 64 and float(reference.std()) > 5.0
+            if reference is not None
+            else None
+        ),
+        "imageDiffersReference": (
+            not np.array_equal(image, reference)
+            if image is not None and reference is not None
+            else None
+        ),
+    }
+    return {
+        "metadata": metadata,
+        "tensors": tensors,
+        "values": values,
+        "mutationChecks": checks,
+    }
+
+
+def require_values(record: dict, key: str, expected: object, tolerance: float = 0.0) -> None:
+    actual = record["values"].get(key)
+    if tolerance:
+        if (
+            not isinstance(actual, list)
+            or not isinstance(expected, list)
+            or len(actual) != len(expected)
+            or any(abs(float(left) - float(right)) > tolerance for left, right in zip(actual, expected))
+        ):
+            raise RuntimeError(f"{key} ordered values are stale")
+    elif actual != expected:
+        raise RuntimeError(f"{key} value is stale")
+
+
+def validate_record(
+    record: dict, expected_revision: str, expected_steps: int, expected_cfg: float
+) -> None:
+    schema = edit_schema(expected_steps, expected_cfg)
+    if set(record["tensors"]) != set(schema):
+        raise RuntimeError("tensor population mismatch")
+    for key, (dtype, shape) in schema.items():
+        actual = record["tensors"][key]
+        if actual != {"dtype": dtype, "shape": shape}:
+            raise RuntimeError(f"{key} dtype/shape is stale")
+    metadata = record["metadata"]
+    if (
+        metadata.get("device") != "cpu"
+        or metadata.get("edit_revision") != expected_revision
+        or metadata.get("prompt") != PROMPT
+        or metadata.get("edit_instruction") != EDIT_INSTRUCTION
+    ):
+        raise RuntimeError(f"metadata does not pin cpu/{expected_revision}")
+    for key, expected in (
+        ("geometry", [256, 256, 4, expected_steps]),
+        ("seed", [42]),
+        ("cfg", [expected_cfg]),
+        ("gs_key", [20260720]),
+        ("drop_idx", [34, 64]),
+        ("static_shift", [6.0]),
+        ("target_tokens", [256]),
+        ("img_shapes", expected_img_shapes(expected_cfg)),
+    ):
+        require_values(record, key, expected)
+    sigmas, timesteps = expected_schedule(expected_steps)
+    require_values(record, f"sigmas_{expected_steps}", sigmas, 1.0e-4)
+    require_values(record, f"timesteps_{expected_steps}", timesteps, 1.0e-3)
+    failed = [name for name, passed in record["mutationChecks"].items() if passed is not True]
+    if failed:
+        raise RuntimeError(f"load-bearing mutation/value checks failed: {failed}")
+
+
 def validate(path: Path, expected_revision: str, expected_steps: int, expected_cfg: float) -> None:
-    with safe_open(path, framework="numpy") as handle:
-        metadata = handle.metadata() or {}
-        required = {
-            "cfg",
-            "final_tokens",
-            "geometry",
-            "image_u8",
-            "img_shapes",
-            "ref_u8",
-            "seed",
-            "seq_step0",
-            "seq_step1",
-            "target_tokens",
-        }
-        missing = required - set(handle.keys())
-        if missing:
-            raise RuntimeError(f"{path.name} is missing {sorted(missing)}")
-        if metadata.get("device") != "cpu" or metadata.get("edit_revision") != expected_revision:
-            raise RuntimeError(f"{path.name} metadata does not pin cpu/{expected_revision}")
-        geometry = handle.get_tensor("geometry").astype(np.int64)
-        cfg = float(handle.get_tensor("cfg")[0])
-        image = handle.get_tensor("image_u8")
-        step0 = handle.get_tensor("seq_step0")
-        step1 = handle.get_tensor("seq_step1")
-    expected_geometry = [256, 256, 4, expected_steps]
-    if geometry.tolist() != expected_geometry:
-        raise RuntimeError(
-            f"{path.name} geometry is {geometry.tolist()}, expected {expected_geometry}"
-        )
-    if cfg != expected_cfg:
-        raise RuntimeError(f"{path.name} cfg is {cfg}, expected {expected_cfg}")
-    if int(image.max()) - int(image.min()) < 64 or float(image.std()) <= 5.0:
-        raise RuntimeError(f"{path.name} image is non-discriminating")
-    if np.array_equal(step0, step1):
-        raise RuntimeError(f"{path.name} mutation guard failed: step0 equals step1")
+    validate_record(inspect(path), expected_revision, expected_steps, expected_cfg)
 
 
 def main() -> int:
