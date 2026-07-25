@@ -152,16 +152,14 @@ pub fn denoise(
     // (sc-8993 F-013; the parent story scoped only lens/sd3/wan14b). Defaults (max 3.0) keep CFG on.
     let cfg_active = max_g > 1.0;
 
-    // CFG conditioning batches (constant across steps): row 0 = uncond (zeros), row 1 = cond. Built
-    // only when guidance is active — otherwise the cond-only single-batch path below is taken.
-    let cfg_batches = if cfg_active {
+    // CFG's constant uncond inputs and guidance ramp. Keep uncond and cond as separate batch-1
+    // forwards: retaining one batch-2 activation graph OOMs the canonical 25-frame workload on a
+    // physical 32 GB card even after the component-residency boundaries are made sequential.
+    let cfg_inputs = if cfg_active {
         let zeros_e = image_embeds.zeros_like()?;
-        let embeds2 = Tensor::cat(&[&zeros_e, image_embeds], 0)?; // [2, ctx, 1024]
         let zeros_l = image_latents.zeros_like()?;
-        let img_lat2 = Tensor::cat(&[&zeros_l, image_latents], 0)?; // [2, F, 4, h, w]
-        let atid2 = Tensor::cat(&[added_time_ids, added_time_ids], 0)?; // [2, 3]
         let guidance = guidance_schedule(num_frames, min_g, max_g, &device)?;
-        Some((embeds2, img_lat2, atid2, guidance))
+        Some((zeros_e, zeros_l, guidance))
     } else {
         None
     };
@@ -177,13 +175,17 @@ pub fn denoise(
         |x_in, t| -> CResult<Tensor> {
             // `x_in` is already the `1/√(σ²+1)`-scaled latent (`scale_model_input`) the driver applied
             // via `EdmModelSampling::input_scale`; `t` is the continuous EDM timestep `0.25·ln σ`.
-            match &cfg_batches {
-                Some((embeds2, img_lat2, atid2, guidance)) => {
-                    let lat2 = Tensor::cat(&[x_in, x_in], 0)?; // [2, F, 4, h, w]
-                    let inp = Tensor::cat(&[&lat2, img_lat2], 2)?; // [2, F, 8, h, w] (channel concat)
-                    let pred = unet.forward(&inp, t, embeds2, atid2, num_frames)?; // [2, F, 4, h, w]
-                    let uncond = pred.narrow(0, 0, 1)?;
-                    let cond = pred.narrow(0, 1, 1)?;
+            match &cfg_inputs {
+                Some((zeros_e, zeros_l, guidance)) => {
+                    let uncond_inp = Tensor::cat(&[x_in, zeros_l], 2)?;
+                    let uncond =
+                        unet.forward(&uncond_inp, t, zeros_e, added_time_ids, num_frames)?;
+                    drop(uncond_inp);
+
+                    let cond_inp = Tensor::cat(&[x_in, image_latents], 2)?;
+                    let cond =
+                        unet.forward(&cond_inp, t, image_embeds, added_time_ids, num_frames)?;
+                    drop(cond_inp);
                     // noise_pred = uncond + guidance · (cond − uncond), frame-wise (the raw v the EDM
                     // contract recombines into x0).
                     Ok(uncond.add(&guidance.broadcast_mul(&(cond - &uncond)?)?)?)

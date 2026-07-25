@@ -117,8 +117,14 @@ fn run_profile(
     let started = Instant::now();
     let output = generator
         .generate(request, &mut |progress| {
+            let live_high = cuda_mempool_used_high_bytes(CUDA_DEVICE).unwrap_or(0);
+            eprintln!(
+                "[[SVD_PROGRESS]] {{\"profile\":\"{label}\",\"progress\":\"{progress:?}\",\
+                 \"liveMemHighGib\":{:.3}}}",
+                gib(live_high)
+            );
             if progress == Progress::Loading(LoadPhase::Renderer) {
-                let completed = cuda_mempool_used_high_bytes(CUDA_DEVICE).unwrap_or(0);
+                let completed = live_high;
                 match renderer_loads {
                     0 => peaks.conditioning = completed,
                     1 => peaks.unet = completed,
