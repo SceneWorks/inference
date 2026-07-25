@@ -1,6 +1,6 @@
-//! Host-side (`f32`) front-end for the OpenVoice V2 converter (sc-13223): linear resampling and the
-//! exact `spectrogram_torch` linear spectrogram both the reference encoder and the posterior
-//! encoder consume.
+//! Host-side (`f32`) front-end for the OpenVoice V2 converter (sc-13223): the exact
+//! `spectrogram_torch` linear spectrogram both the reference encoder and the posterior encoder
+//! consume.
 //!
 //! `spectrogram_torch` (OpenVoice `mel_processing.py`) is **not** the `center=True` librosa default
 //! the shared [`candle_audio::dsp::stft`] implements — it reflect-pads the waveform by
@@ -11,29 +11,6 @@
 //! without weights and numerically identical across CPU/Metal/CUDA.
 
 use crate::config;
-
-/// Resample `samples` from `src_rate` to [`config::SAMPLE_RATE`] with linear interpolation. Timbre
-/// and content are spectral-envelope / pitch properties that survive linear resampling well enough
-/// for the converter; exact soxr/librosa-kaiser parity is not required (mirrors the sibling
-/// providers' `resample_to_16k`).
-pub fn resample_to_native(samples: &[f32], src_rate: u32) -> Vec<f32> {
-    if src_rate == config::SAMPLE_RATE || samples.is_empty() {
-        return samples.to_vec();
-    }
-    let ratio = config::SAMPLE_RATE as f64 / src_rate as f64;
-    let out_len = ((samples.len() as f64) * ratio).round() as usize;
-    let mut out = Vec::with_capacity(out_len);
-    let last = samples.len() - 1;
-    for i in 0..out_len {
-        let src_pos = i as f64 / ratio;
-        let left = src_pos.floor() as usize;
-        let frac = (src_pos - left as f64) as f32;
-        let a = samples[left.min(last)];
-        let b = samples[(left + 1).min(last)];
-        out.push(a + (b - a) * frac);
-    }
-    out
-}
 
 /// A periodic Hann window of length `n` (`torch.hann_window(n)`): `0.5 - 0.5·cos(2πk/n)`.
 fn hann_window(n: usize) -> Vec<f32> {
@@ -160,21 +137,6 @@ pub fn spectrogram(samples: &[f32]) -> Option<LinearSpectrogram> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn resample_is_identity_at_native_rate() {
-        let s = vec![0.1f32, 0.2, 0.3];
-        assert_eq!(resample_to_native(&s, config::SAMPLE_RATE), s);
-    }
-
-    #[test]
-    fn resample_changes_length_by_ratio() {
-        let s = vec![0.0f32; 24_000];
-        let out = resample_to_native(&s, 24_000);
-        // 24 kHz → 22.05 kHz shortens by the rate ratio.
-        let expected = (24_000.0f64 * (22_050.0 / 24_000.0)).round() as usize;
-        assert_eq!(out.len(), expected);
-    }
 
     #[test]
     fn fft_matches_known_single_tone() {

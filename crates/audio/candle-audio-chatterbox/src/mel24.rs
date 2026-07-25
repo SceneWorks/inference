@@ -114,26 +114,6 @@ fn reflect_pad(samples: &[f32], pad: usize) -> Vec<f32> {
     out
 }
 
-/// Linear-interpolation resample to `dst` Hz (adequate for the mel-conditioning path; exact soxr
-/// parity is not required for the flow's prompt mel).
-pub fn resample_linear(samples: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32> {
-    if src_rate == dst_rate || samples.is_empty() {
-        return samples.to_vec();
-    }
-    let ratio = dst_rate as f64 / src_rate as f64;
-    let out_len = ((samples.len() as f64) * ratio).round() as usize;
-    let mut out = Vec::with_capacity(out_len);
-    for i in 0..out_len {
-        let src_pos = i as f64 / ratio;
-        let left = src_pos.floor() as usize;
-        let frac = (src_pos - left as f64) as f32;
-        let a = samples[left.min(samples.len() - 1)];
-        let b = samples[(left + 1).min(samples.len() - 1)];
-        out.push(a + (b - a) * frac);
-    }
-    out
-}
-
 /// The S3Gen 24 kHz log-mel extractor: precomputed Slaney mel bank, periodic Hann window, and a
 /// direct real-DFT (`n_fft = 1920` is not a power of two).
 pub struct Mel24Extractor {
@@ -187,7 +167,8 @@ impl Mel24Extractor {
     /// (matching the reference `mel_spectrogram(...).transpose(1, 2)` layout the flow's
     /// `prompt_feat` expects).
     pub fn mel(&self, samples: &[f32], sample_rate: u32, device: &Device) -> CandleResult<Tensor> {
-        let wav = resample_linear(samples, sample_rate, S3GEN_SR);
+        let wav = candle_audio::dsp::resample(samples, sample_rate, S3GEN_SR, 1)
+            .map_err(|error| candle_audio::candle_core::Error::Msg(error.to_string()))?;
         let (frames, n_frames) = self.log_mel_frame_major(&wav);
         Tensor::from_vec(frames, (n_frames, self.cfg.mel_num_mels), device)
     }
@@ -291,13 +272,5 @@ mod tests {
         assert!((n as i64 - 50).abs() <= 1, "expected ≈50 frames, got {n}");
         assert_eq!(frames.len(), n * 80);
         assert!(frames.iter().all(|v| v.is_finite()));
-    }
-
-    #[test]
-    fn resample_changes_length_by_ratio_and_is_identity_at_rate() {
-        let s = vec![0.1f32, -0.2, 0.3, -0.4];
-        assert_eq!(resample_linear(&s, S3GEN_SR, S3GEN_SR), s);
-        let out = resample_linear(&vec![0.0f32; 16_000], 16_000, 24_000);
-        assert_eq!(out.len(), 24_000);
     }
 }
