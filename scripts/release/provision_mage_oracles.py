@@ -279,7 +279,7 @@ def _validate_manifest_header(
         or document.get("vaeGeometries") != list(GEOMETRIES)
         or type(document.get("referenceEnvironment")) is not dict
         or document.get("referenceEnvironment") != REFERENCE_PACKAGES
-        or type(seconds) not in (int, float)
+        or type(seconds) is not float
         or not math.isfinite(float(seconds))
         or float(seconds) < 0.0
         or not isinstance(records, list)

@@ -156,6 +156,7 @@ class MagePrimaryEditOracleTests(unittest.TestCase):
             ("referenceEnvironment", {}),
             ("generationSeconds", float("nan")),
             ("generationSeconds", True),
+            ("generationSeconds", 12),
         ):
             document = self.manifest()
             document[key] = value
