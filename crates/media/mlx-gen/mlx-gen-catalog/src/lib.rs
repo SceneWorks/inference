@@ -10,8 +10,7 @@ pub use mlx_gen::gen_core::{ProviderRegistry, ProviderRegistryBuilder};
 /// Complete backend package surface owned by the macOS runtime.
 ///
 /// Some modules are ordinary registry providers; `depth`, `face`, `instantid`, `pid`, `sam2`, and
-/// `sam3` are intentionally bespoke utilities consumed through provider-specific APIs, and `mage`
-/// is a scaffold whose registration is still pending (see [`PENDING_REGISTRATION_CRATES`]).
+/// `sam3` are intentionally bespoke utilities consumed through provider-specific APIs.
 pub mod providers {
     pub use mlx_gen_anima as anima;
     pub use mlx_gen_bernini as bernini;
@@ -53,20 +52,11 @@ pub mod providers {
 pub const BESPOKE_UTILITY_CRATES: &[&str] = &["depth", "face", "instantid", "pid", "sam2", "sam3"];
 
 /// Platform-owned crates that are **compiled but not yet registered** — scaffolds whose providers
-/// exist and whose descriptors are stable, but whose `load` cannot yet produce output.
+/// Provider crates deliberately compiled but not yet composed into this platform registry.
 ///
-/// This is deliberately a third category rather than an omission. `CLAUDE.md` makes catalog
-/// inclusion an explicit edit ("a provider crate existing in the repo does not mean it ships"), and
-/// registering a generator whose `load` hard-errors would put a broken model in front of every
-/// consumer that enumerates this registry. Naming the crate here keeps its platform membership as
-/// greppable as a registered generator while the ports land.
-///
-/// - `mage` — Mage-Flow (`mlx_gen_mage`, epic 14034). Six descriptors are published as
-///   [`mlx_gen_mage::model::REGISTRATIONS`]; the text encoder (sc-14038), Mage-VAE (sc-14039),
-///   NR-MMDiT (sc-14040) and watermarked initial noise (sc-14104) are not ported yet. sc-14041
-///   adds `mlx_gen_mage::register_providers` to [`register_providers`] once the pipeline renders a
-///   real image, and sc-14047 owns the manifest/classifier/schema surface that goes with it.
-pub const PENDING_REGISTRATION_CRATES: &[&str] = &["mage"];
+/// Empty after sc-14041 registered the complete Mage-Flow RL provider. Future structure-only
+/// crates must enter this list until their normal `Generator` load/generate path works.
+pub const PENDING_REGISTRATION_CRATES: &[&str] = &[];
 
 /// Add every provider shipped by the MLX media platform to an explicit registry builder.
 pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistryBuilder {
@@ -83,6 +73,7 @@ pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistry
     let registry = mlx_gen_krea::register_providers(registry);
     let registry = mlx_gen_lens::register_providers(registry);
     let registry = mlx_gen_ltx::register_providers(registry);
+    let registry = mlx_gen_mage::register_providers(registry);
     let registry = mlx_gen_mochi::register_providers(registry);
     let registry = mlx_gen_pulid::register_providers(registry);
     let registry = mlx_gen_qwen_image::register_providers(registry);
@@ -194,6 +185,7 @@ mod tests {
                 "lens_turbo",
                 "lens",
                 "ltx_2_3",
+                "mage_flow",
                 "mochi_1",
                 "pulid_flux",
                 "qwen_image",
@@ -254,33 +246,15 @@ mod tests {
     /// the shipped registry until it can load (sc-14041). Pinned so turning it on is a deliberate,
     /// reviewable edit rather than a side effect, and so the pending state cannot rot silently.
     #[test]
-    fn pending_registration_crates_are_absent_from_the_shipped_registry() {
-        assert_eq!(super::PENDING_REGISTRATION_CRATES, ["mage"]);
-
+    fn mage_rl_is_on_the_shipped_platform_surface() {
+        assert!(super::PENDING_REGISTRATION_CRATES.is_empty());
         let shipped: Vec<String> = super::provider_registry()
             .unwrap()
             .generators()
             .map(|r| (r.descriptor)().id.to_string())
             .collect();
-        // The crate publishes a real, conforming surface…
-        let pending = super::providers::mage::provider_registry().unwrap();
-        let pending_ids: Vec<String> = pending
-            .generators()
-            .map(|r| (r.descriptor)().id.to_string())
-            .collect();
-        assert!(!pending_ids.is_empty());
-        assert_eq!(
-            pending.descriptor_conformance_errors(),
-            Vec::<String>::new()
-        );
-        // …that the platform deliberately does not compose yet.
-        for id in &pending_ids {
-            assert!(
-                !shipped.contains(id),
-                "{id} reached the shipped MLX catalog while still listed in \
-                 PENDING_REGISTRATION_CRATES; remove it from that list in the same change"
-            );
-        }
+        assert!(shipped.contains(&"mage_flow".to_string()));
+        assert!(!shipped.contains(&"mage_flow_base".to_string()));
     }
 
     /// Defense in depth for epic 11037 SC#5: the MLX platform **rejects** the NVFP4 tier instead of
