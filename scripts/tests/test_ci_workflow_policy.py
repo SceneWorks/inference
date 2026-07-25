@@ -92,11 +92,15 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("id: mage-oracle-key", workflow)
         self.assertIn("id: mage-oracle-cache", workflow)
         for fingerprint_input in (
+            ".github/workflows/real-weights.yml",
             "crates/media/mlx-gen/_vendor/mage_flow/**",
             "crates/media/mlx-gen/_vendor/mage_flow/requirements-oracles.txt",
+            "crates/media/mlx-gen/tools/_paths.py",
             "crates/media/mlx-gen/tools/dump_mage_flow_golden.py",
+            "crates/media/mlx-gen/tools/dump_mage_vae_sizes.py",
             "scripts/release/provision_mage_oracles.py",
             "scripts/release/provision_mage_edit_variants.py",
+            "scripts/release/verify_mage_candle_oracles.py",
         ):
             self.assertIn(fingerprint_input, workflow)
         for snapshot in (
@@ -115,6 +119,9 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             workflow,
         )
         self.assertGreaterEqual(workflow.count("--verify-only"), 2)
+        self.assertIn("--verify-edit-artifact", workflow)
+        self.assertIn("--write-manifest", workflow)
+        self.assertIn("mage_candle_oracles_manifest.json", workflow)
         self.assertLess(
             workflow.index("Verify restored or generated Mage oracle cache"),
             workflow.index("Save verified Mage oracle cache"),

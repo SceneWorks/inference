@@ -330,7 +330,10 @@ def verify(output: Path, snapshot: Path, edit_snapshot: Path) -> None:
 
 def verify_edit_artifact(output: Path, edit_snapshot: Path) -> None:
     edit_revision = _revision(edit_snapshot)
-    document = json.loads((output / EDIT_MANIFEST).read_text(encoding="utf-8"))
+    try:
+        document = json.loads((output / EDIT_MANIFEST).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise InvalidOracle(f"invalid Mage edit artifact manifest: {error}") from error
     records = document.get("files", [])
     if (
         document.get("device") != "cpu"
@@ -422,12 +425,23 @@ def _self_test() -> None:
         stale = root / "stale"
         stale.mkdir()
         _write_manifest(stale, "b" * 40, "c" * 40, [], 0)
+        corrupt_edit = root / "corrupt-edit"
+        corrupt_edit.mkdir()
+        (corrupt_edit / EDIT_MANIFEST).write_text("{", encoding="utf-8")
 
         cases = (
             ("Python patch mismatch", lambda: _validate_python_version((3, 12, 12))),
             ("absent", lambda: _validate_files(missing, revision, revision)),
             ("corrupt", lambda: _inspect(corrupt)),
             ("revision mismatch", lambda: verify(stale, snapshot, snapshot)),
+            (
+                "stale standalone edit manifest",
+                lambda: verify_edit_artifact(stale, snapshot),
+            ),
+            (
+                "corrupt standalone edit manifest",
+                lambda: verify_edit_artifact(corrupt_edit, snapshot),
+            ),
             (
                 "wrong dtype",
                 lambda: _validate_schema("synthetic", schema, set(schema), shapes, wrong_dtype),
