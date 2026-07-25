@@ -11,6 +11,7 @@
 //! - [`transformer`] implements the ordinary and direct-subtraction differential transformer
 //!   primitives shared by the DiT and SAME families;
 //! - [`pretransform`], [`softnorm`], and [`weight_norm`] cover the shared autoencoder seams;
+//! - [`t5gemma`] implements the bundled encoder-only T5Gemma text conditioner without registration;
 //! - [`prepare`] provides the unregistered dense passthrough implementation for later composition.
 //!
 //! Shared audio functionality stays in [`candle_audio`]. Consumers should use
@@ -23,6 +24,7 @@ pub mod config;
 pub mod prepare;
 pub mod pretransform;
 pub mod softnorm;
+pub mod t5gemma;
 pub mod transformer;
 pub mod weight_norm;
 pub mod weights;

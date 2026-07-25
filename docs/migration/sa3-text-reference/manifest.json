@@ -1,0 +1,168 @@
+{
+  "cpuTensorArtifact": {
+    "bytes": 4729000,
+    "computePolicy": "BF16 on disk, F32 CPU compute and raw output",
+    "dtypes": {
+      "attention_mask": "U8",
+      "conditioned_embeddings": "F32",
+      "input_ids": "I64",
+      "padding_embedding": "F32",
+      "raw_embeddings": "F32"
+    },
+    "file": "text-cpu-f32.safetensors",
+    "role": "canonical",
+    "sha256": "beb5e15e40c89da227d430da2d65ea47b8fba7339af1570e0af184c814410eb8",
+    "shapes": {
+      "attention_mask": [
+        3,
+        256
+      ],
+      "conditioned_embeddings": [
+        3,
+        256,
+        768
+      ],
+      "input_ids": [
+        3,
+        256
+      ],
+      "padding_embedding": [
+        768
+      ],
+      "raw_embeddings": [
+        3,
+        256,
+        768
+      ]
+    }
+  },
+  "model": {
+    "attentionImplementation": "eager",
+    "attentionSoftcap": 50.0,
+    "attentionSoftmaxDtype": "float32",
+    "canonicalReference": "cpu-f32",
+    "mpsBf16Role": "backend-variance-evidence"
+  },
+  "prompts": [
+    {
+      "key": "short",
+      "rawTokenCount": 3,
+      "text": "A bell.",
+      "truncated": false,
+      "validTokenCount": 3
+    },
+    {
+      "key": "medium",
+      "rawTokenCount": 17,
+      "text": "Warm analog synth pulses, crisp percussion, spacious stereo field, 112 BPM",
+      "truncated": false,
+      "validTokenCount": 17
+    },
+    {
+      "key": "truncated",
+      "rawTokenCount": 394,
+      "text": "amber violin ocean thunder velvet rhythm copper forest lantern piano silver rain echo drum meadow sunrise crystal bass canyon pulse maple choir comet guitar harbor tempo winter flute aurora melody stone wave amber violin ocean thunder velvet rhythm copper forest lantern piano silver rain echo drum meadow sunrise crystal bass canyon pulse maple choir comet guitar harbor tempo winter flute aurora melody stone wave amber violin ocean thunder velvet rhythm copper forest lantern piano silver rain echo drum meadow sunrise crystal bass canyon pulse maple choir comet guitar harbor tempo winter flute aurora melody stone wave amber violin ocean thunder velvet rhythm copper forest lantern piano silver rain echo drum meadow sunrise crystal bass canyon pulse maple choir comet guitar harbor tempo winter flute aurora melody stone wave amber violin ocean thunder velvet rhythm copper forest lantern piano silver rain echo drum meadow sunrise crystal bass canyon pulse maple choir comet guitar harbor tempo winter flute aurora melody stone wave amber violin ocean thunder velvet rhythm copper forest lantern piano silver rain echo drum meadow sunrise crystal bass canyon pulse maple choir comet guitar harbor tempo winter flute aurora melody stone wave amber violin ocean thunder velvet rhythm copper forest lantern piano silver rain echo drum meadow sunrise crystal bass canyon pulse maple choir comet guitar harbor tempo winter flute aurora melody stone wave amber violin ocean thunder velvet rhythm copper forest lantern piano silver rain echo drum meadow sunrise crystal bass canyon pulse maple choir comet guitar harbor tempo winter flute aurora melody stone wave amber violin ocean thunder velvet rhythm copper forest lantern piano silver rain echo drum meadow sunrise crystal bass canyon pulse maple choir comet guitar harbor tempo winter flute aurora melody stone wave amber violin ocean thunder velvet rhythm copper forest lantern piano silver rain echo drum meadow sunrise crystal bass canyon pulse maple choir comet guitar harbor tempo winter flute aurora melody stone wave amber violin ocean thunder velvet rhythm copper forest lantern piano silver rain echo drum meadow sunrise crystal bass canyon pulse maple choir comet guitar harbor tempo winter flute aurora melody stone wave amber violin ocean thunder velvet rhythm copper forest lantern piano silver rain echo drum meadow sunrise crystal bass canyon pulse maple choir comet guitar harbor tempo winter flute aurora melody stone wave xylophone kumquat zucchini zephyr quasar",
+      "truncated": true,
+      "validTokenCount": 256
+    }
+  ],
+  "runtime": {
+    "python": "3.12.13",
+    "torch": "2.7.1",
+    "transformers": "5.8.0"
+  },
+  "schemaVersion": 1,
+  "snapshot": {
+    "repository": "stabilityai/stable-audio-3-small-music",
+    "revision": "0fef1392cd842149a2b6d445e181c97608faac06",
+    "textFiles": {
+      "config.json": {
+        "bytes": 2540,
+        "sha256": "575334409716886ac2952f5a275ed92868deef8a0ea560258d9970a431c6fb3a"
+      },
+      "model.safetensors": {
+        "bytes": 1183022944,
+        "sha256": "9b05ea5a4f211d023832f706fb2c0e83e4fc721b6da35ab69ceb0b55eb7800d3"
+      },
+      "tokenizer.json": {
+        "bytes": 34362429,
+        "sha256": "7794135caa3ea73918949c902a781cc61dab674a4b59c17d85931c77c1114cbd"
+      }
+    }
+  },
+  "story": "sc-14537",
+  "tensorArtifact": {
+    "bytes": 3549352,
+    "dtypes": {
+      "attention_mask": "U8",
+      "conditioned_embeddings": "F32",
+      "input_ids": "I64",
+      "padding_embedding": "F32",
+      "raw_embeddings": "BF16"
+    },
+    "file": "text.safetensors",
+    "role": "backend-variance-evidence",
+    "sha256": "51b37c402de952ea19022baf491755bd3b1f3aa06ac4f1d380dae6a7f46fdaf4",
+    "shapes": {
+      "attention_mask": [
+        3,
+        256
+      ],
+      "conditioned_embeddings": [
+        3,
+        256,
+        768
+      ],
+      "input_ids": [
+        3,
+        256
+      ],
+      "padding_embedding": [
+        768
+      ],
+      "raw_embeddings": [
+        3,
+        256,
+        768
+      ]
+    }
+  },
+  "tokenizer": {
+    "library": "tokenizers 0.22 via Transformers 5.8.0",
+    "maxLength": 256,
+    "padTokenId": 0,
+    "paddingSide": "right",
+    "postProcessor": "identity-no-special-tokens",
+    "truncationSide": "right"
+  },
+  "truncationProbe": {
+    "discardedTailStartsAt": 384,
+    "discardedTailTokenIds": [
+      54824,
+      545,
+      3953,
+      52524,
+      90083,
+      105165,
+      4949,
+      219990,
+      700,
+      62026
+    ],
+    "retainedBoundaryTokenIds": [
+      46107,
+      11030,
+      7830,
+      74458,
+      94510,
+      53188,
+      9566,
+      9591
+    ]
+  },
+  "upstream": {
+    "commit": "124e8a799f57a1f665495ecb72e547d0a62867f1",
+    "repository": "https://github.com/Stability-AI/stable-audio-3.git",
+    "uvLockSha256": "f6422550a634b3e44664235910835bde49ec930b8026ec34f28e4ddc2e724150"
+  }
+}
