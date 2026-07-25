@@ -27,8 +27,9 @@
 //! [`mlx_gen_catalog::provider_registry`]: https://docs.rs/mlx-gen-catalog
 
 use mlx_gen::{
-    Capabilities, ConditioningKind, Error, GenerationOutput, GenerationRequest, Generator, Image,
-    LoadSpec, Modality, ModelDescriptor, Precision, Progress, Quant, Result, WeightsSource,
+    Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput, GenerationRequest,
+    Generator, Image, LoadSpec, Modality, ModelDescriptor, Precision, Progress, Quant, Result,
+    WeightsSource,
 };
 use sha2::{Digest, Sha256};
 use std::io::{Read, Seek, SeekFrom};
@@ -191,12 +192,9 @@ pub fn descriptor_for(variant: MageVariant) -> ModelDescriptor {
 /// Construct a Mage-Flow generator from a [`LoadSpec`].
 ///
 pub fn load(variant: MageVariant, spec: &LoadSpec) -> Result<Box<dyn Generator>> {
-    if !matches!(
-        variant,
-        MageVariant::Rl | MageVariant::Base | MageVariant::Turbo
-    ) {
+    if matches!(variant, MageVariant::EditBase | MageVariant::EditTurbo) {
         return Err(Error::Unsupported(format!(
-            "{}: only the Mage-Flow RL, Base, and Turbo generation checkpoints are enabled",
+            "{}: edit variant selection is owned by sc-14049",
             variant.id()
         )));
     }
@@ -234,11 +232,16 @@ pub fn load(variant: MageVariant, spec: &LoadSpec) -> Result<Box<dyn Generator>>
         )?,
         _ => {}
     }
+    let pipeline = if variant.is_edit() {
+        MageFlowPipeline::load_edit(root, spec.quantize.map(Quant::bits))?
+    } else {
+        MageFlowPipeline::load_with_quant(root, spec.quantize.map(Quant::bits))?
+    };
     Ok(Box::new(MageFlow {
         variant,
         descriptor: descriptor_for(variant),
         tier: spec.quantize,
-        pipeline: MageFlowPipeline::load_with_quant(root, spec.quantize.map(Quant::bits))?,
+        pipeline,
     }))
 }
 
@@ -366,6 +369,40 @@ impl Generator for MageFlow {
         let seed = req.seed.unwrap_or(0) as i64;
         let key = resolve_gs_key(None)?;
         let negative_prompt = req.negative_prompt.as_deref().unwrap_or(" ");
+        if self.variant.is_edit() {
+            let references = edit_references(req)?;
+            let mut images = Vec::with_capacity(req.count as usize);
+            for index in 0..req.count {
+                let trace = self.pipeline.edit_trace(
+                    &req.prompt,
+                    negative_prompt,
+                    &references,
+                    req.height,
+                    req.width,
+                    steps as usize,
+                    cfg,
+                    seed.wrapping_add(index as i64),
+                    &key,
+                    false,
+                    on_progress,
+                )?;
+                mlx_rs::transforms::eval([&trace.image_u8]).map_err(Error::from)?;
+                images.push(Image {
+                    width: req.width,
+                    height: req.height,
+                    pixels: trace
+                        .image_u8
+                        .try_as_slice::<u8>()
+                        .map_err(|error| {
+                            Error::Msg(format!(
+                                "mage_flow edit: RGB8 output is not host-readable: {error}"
+                            ))
+                        })?
+                        .to_vec(),
+                });
+            }
+            return Ok(GenerationOutput::Images(images));
+        }
         let samples = (0..req.count)
             .map(|index| GenerationSample {
                 prompt: &req.prompt,
@@ -397,6 +434,30 @@ impl Generator for MageFlow {
         }
         Ok(GenerationOutput::Images(images))
     }
+}
+
+fn edit_references(req: &GenerationRequest) -> Result<Vec<image::RgbImage>> {
+    let mut images = Vec::new();
+    for conditioning in &req.conditioning {
+        match conditioning {
+            Conditioning::Reference { image, .. } => images.push(image),
+            Conditioning::MultiReference { images: refs } => images.extend(refs),
+            _ => {}
+        }
+    }
+    if images.is_empty() {
+        return Err(Error::Msg(
+            "mage_flow edit: Reference or MultiReference conditioning is required".into(),
+        ));
+    }
+    images
+        .into_iter()
+        .map(|image| {
+            image::RgbImage::from_raw(image.width, image.height, image.pixels.clone()).ok_or_else(
+                || Error::Msg("mage_flow edit: reference image is not valid RGB8".into()),
+            )
+        })
+        .collect()
 }
 
 fn validate_generation_request(
@@ -545,18 +606,61 @@ mod tests {
     }
 
     #[test]
-    fn edit_variants_remain_explicitly_disabled() {
+    fn rl_edit_enters_the_full_multimodal_loader_but_follow_on_variants_stay_disabled() {
         let spec = LoadSpec::new(mlx_gen::WeightsSource::Dir("/nonexistent".into()));
-        for variant in [
-            MageVariant::Edit,
-            MageVariant::EditBase,
-            MageVariant::EditTurbo,
-        ] {
-            let err = load(variant, &spec)
-                .err()
-                .expect("unimplemented variant must remain disabled");
-            assert!(matches!(err, Error::Unsupported(_)));
+        let err = load(MageVariant::Edit, &spec)
+            .err()
+            .expect("missing edit snapshot must fail");
+        assert!(
+            !matches!(err, Error::Unsupported(_)),
+            "RL edit must enter the multimodal component loader: {err}"
+        );
+        for variant in [MageVariant::EditBase, MageVariant::EditTurbo] {
+            assert!(
+                matches!(load(variant, &spec), Err(Error::Unsupported(_))),
+                "{} belongs to sc-14049",
+                variant.id()
+            );
         }
+    }
+
+    #[test]
+    fn edit_reference_shapes_are_required_and_preserve_order() {
+        let image = |byte| Image {
+            width: 1,
+            height: 1,
+            pixels: vec![byte, byte, byte],
+        };
+        let request = GenerationRequest {
+            conditioning: vec![
+                Conditioning::Reference {
+                    image: image(1),
+                    strength: None,
+                },
+                Conditioning::MultiReference {
+                    images: vec![image(2), image(3)],
+                },
+            ],
+            ..Default::default()
+        };
+        let refs = edit_references(&request).unwrap();
+        assert_eq!(refs.len(), 3);
+        assert_eq!(refs[0].as_raw(), &[1, 1, 1]);
+        assert_eq!(refs[1].as_raw(), &[2, 2, 2]);
+        assert_eq!(refs[2].as_raw(), &[3, 3, 3]);
+        assert!(edit_references(&GenerationRequest::default()).is_err());
+        let malformed = GenerationRequest {
+            conditioning: vec![Conditioning::Reference {
+                image: Image {
+                    width: 2,
+                    height: 2,
+                    pixels: vec![0; 3],
+                },
+                strength: None,
+            }],
+            ..Default::default()
+        };
+        assert!(edit_references(&malformed).is_err());
     }
 
     #[test]

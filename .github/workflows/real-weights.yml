@@ -48,6 +48,7 @@ jobs:
     env:
       ZIMAGE_SNAPSHOT: ${{ vars.ZIMAGE_SNAPSHOT }}
       MAGE_SNAPSHOT: ${{ vars.MAGE_SNAPSHOT }}
+      MAGE_EDIT_SNAPSHOT: ${{ vars.MAGE_EDIT_SNAPSHOT }}
       # Explicit operator-provided models root for the mlx-gen real-weight resolvers that resolve a
       # repo-keyed snapshot (sc-13755); inference never self-fetches or derives a cache location.
       MLX_GEN_MODELS_ROOT: ${{ vars.MLX_GEN_MODELS_ROOT }}
@@ -67,6 +68,7 @@ jobs:
           python3 -m pip install --disable-pip-version-check --target "$RUNNER_TEMP/huggingface-hub" "huggingface_hub==1.20.1"
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model z-image-turbo --snapshot "$ZIMAGE_SNAPSHOT"
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model mage-flow --snapshot "$MAGE_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model mage-flow-edit --snapshot "$MAGE_EDIT_SNAPSHOT"
       - name: Regenerate and verify shared CPU Mage oracles
         run: |
           python -m venv "$RUNNER_TEMP/mage-reference"
@@ -76,6 +78,7 @@ jobs:
           MAGE_DEVICE=cpu "$RUNNER_TEMP/mage-reference/bin/python" \
             scripts/release/provision_mage_oracles.py \
             --snapshot "$MAGE_SNAPSHOT" \
+            --edit-snapshot "$MAGE_EDIT_SNAPSHOT" \
             --output "$MAGE_GOLDEN_DIR"
           echo "MAGE_FLOW_TE_GOLDEN=$MAGE_GOLDEN_DIR/mage_flow_te_golden.safetensors" >> "$GITHUB_ENV"
       - name: Run provider conformance
@@ -95,6 +98,18 @@ jobs:
         run: >-
           cargo test --locked --release -p mlx-gen-mage --test vae_decode_real_weights
           -- --ignored --nocapture
+      - name: Run Mage-Flow instruction-edit parity
+        run: >-
+          cargo test --locked --release -p mlx-gen-mage --test edit_real_weights
+          -- --ignored --nocapture
+      - name: Upload verified Mage edit oracle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: mage-flow-edit-oracle-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/mage-flow-oracles/mage_flow_edit_golden.safetensors
+            ${{ runner.temp }}/mage-flow-oracles/mage_edit_oracle_manifest.json
+          if-no-files-found: error
 
   candle-audio:
     name: Candle audio real weights

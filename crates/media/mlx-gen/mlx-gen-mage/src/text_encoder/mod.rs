@@ -109,7 +109,10 @@ pub use attention::Qwen3VlAttention;
 pub use encode::{Conditioning, MageTextEncoder};
 pub use encoder::{cu_seqlens_from_lens, Qwen3VlTextEncoder};
 pub use layer::Qwen3VlDecoderLayer;
-pub use load::{load, load_lm, load_tokenizer, verify_text_config, COMPONENT_DIR, LM_PREFIX};
+pub use load::{
+    load, load_lm, load_multimodal, load_tokenizer, mage_vision_config, verify_text_config,
+    COMPONENT_DIR, LM_PREFIX,
+};
 pub use mlp::Qwen3VlMlp;
 pub use prompt::{edit_body, PromptKind, EDIT_IMAGE_PLACEHOLDER};
 pub use rope::{mrope_cos_sin, MRopePositions};

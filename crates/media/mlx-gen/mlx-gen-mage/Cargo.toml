@@ -14,6 +14,7 @@ categories = ["science"]
 # RESOLVED note at the bottom; it added nothing.
 [dependencies]
 mlx-gen = { path = ".." }
+mlx-gen-boogu = { path = "../mlx-gen-boogu" }
 # Must match the core crate's MLX binding exactly (shared `Array` type). See root Cargo.toml.
 mlx-rs = { workspace = true }
 # `transformer/config.json` / `vae/config.json` / `scheduler/scheduler_config.json` parsing
@@ -24,6 +25,7 @@ serde_json = { workspace = true }
 # and hashes non-numeric keys the same way (`:26`). Also used by the test suite as the byte tripwire
 # on the committed config fixtures.
 sha2 = { workspace = true }
+image = { workspace = true }
 
 # RESOLVED (sc-14104) — **no new dependency.** The scaffold left this open because bit-exact
 # watermark parity needs two RNG streams the reference mixes: `np.random.default_rng(key)`

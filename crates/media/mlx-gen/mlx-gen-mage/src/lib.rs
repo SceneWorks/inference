@@ -106,8 +106,8 @@ pub use latent::{
 
 // sc-14041 (pipeline + the loaded model) re-exports here:
 pub use pipeline::{
-    mage_flow_sigmas, BatchGenerationTrace, GenerationPack, GenerationSample, GenerationTrace,
-    MageFlowPipeline, MAX_PACKED_IMAGE_TOKENS, STATIC_SHIFT,
+    mage_flow_sigmas, BatchGenerationTrace, EditTrace, GenerationPack, GenerationSample,
+    GenerationTrace, MageFlowPipeline, MAX_PACKED_IMAGE_TOKENS, STATIC_SHIFT,
 };
 
 // Later phases add their own modules rather than growing these: `quant` (Q4/Q8 tiers, sc-14046),
@@ -124,6 +124,7 @@ pub fn register_providers(
         .register_generator(model::REGISTRATION)
         .register_generator(model::REGISTRATION_BASE)
         .register_generator(model::REGISTRATION_TURBO)
+        .register_generator(model::REGISTRATION_EDIT)
 }
 
 /// Build the explicit Mage-Flow MLX provider catalog (this crate only).
@@ -144,7 +145,12 @@ mod explicit_registry_tests {
             .collect();
         assert_eq!(
             generators,
-            ["mage_flow", "mage_flow_base", "mage_flow_turbo"]
+            [
+                "mage_flow",
+                "mage_flow_base",
+                "mage_flow_turbo",
+                "mage_flow_edit"
+            ]
         );
         // The scaffold ships no trainer (sc-14055/sc-14056) and no captioner/embedder surface.
         assert_eq!(registry.trainers().count(), 0);

@@ -188,6 +188,7 @@ mod tests {
                 "mage_flow",
                 "mage_flow_base",
                 "mage_flow_turbo",
+                "mage_flow_edit",
                 "mochi_1",
                 "pulid_flux",
                 "qwen_image",

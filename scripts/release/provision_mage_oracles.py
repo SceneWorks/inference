@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regenerate and verify the shared CPU-only Mage TE + VAE real-weight oracle bundle."""
+"""Regenerate and verify the shared CPU-only Mage TE + VAE + edit oracle bundle."""
 
 from __future__ import annotations
 
@@ -22,21 +22,32 @@ ROOT = Path(__file__).resolve().parents[2]
 MLX = ROOT / "crates/media/mlx-gen"
 GEOMETRIES = ("256", "992", "1024", "2048", "512x2048", "768x1280", "768x1152")
 TE_FILE = "mage_flow_te_golden.safetensors"
+EDIT_FILE = "mage_flow_edit_golden.safetensors"
 VAE_FILES = tuple(f"mage_flow_vae_f32_{geometry}.safetensors" for geometry in GEOMETRIES)
-EXPECTED_FILES = (TE_FILE, *VAE_FILES)
+EXPECTED_FILES = (TE_FILE, EDIT_FILE, *VAE_FILES)
 MANIFEST = "mage_oracles_manifest.json"
+EDIT_MANIFEST = "mage_edit_oracle_manifest.json"
 TE_SCHEMA = {
     "cfg": ("F32", [1]),
     "drop_idx": ("I32", [2]),
     "edit_drop_idx": ("I32", [1]),
+    "edit_deepstack_0": ("F32", [72, 2560]),
+    "edit_deepstack_1": ("F32", [72, 2560]),
+    "edit_deepstack_2": ("F32", [72, 2560]),
     "edit_hidden_full": ("F32", [157, 2560]),
     "edit_image_grid_thw": ("I64", [1, 3]),
     "edit_input_ids": ("I64", [157]),
+    "edit_lm_layer_0_pre_inject": ("F32", [1, 157, 2560]),
+    "edit_lm_layer_1_pre_inject": ("F32", [1, 157, 2560]),
+    "edit_lm_layer_2_pre_inject": ("F32", [1, 157, 2560]),
     "edit_pixel_values": ("F32", [288, 1536]),
+    "edit_position_ids": ("I64", [3, 1, 157]),
     "edit_txt": ("F32", [93, 2560]),
     "edit_txt_len": ("I32", [1]),
     "edit_vec": ("F32", [1, 2560]),
+    "edit_vision_embeds": ("F32", [72, 2560]),
     "edit_vl_ref_u8": ("U8", [384, 192, 3]),
+    "edit_vl_source_u8": ("U8", [2048, 1024, 3]),
     "gen_drop_idx": ("I32", [1]),
     "gen_hidden_full": ("F32", [94, 2560]),
     "gen_input_ids": ("I64", [54]),
@@ -50,6 +61,24 @@ TE_SCHEMA = {
     "neg_vec": ("F32", [1, 2560]),
     "seed": ("I64", [1]),
     "static_shift": ("F32", [1]),
+}
+EDIT_SCHEMA = {
+    "cfg": ("F32", [1]),
+    "drop_idx": ("I32", [2]),
+    "final_latent": ("F32", [1, 128, 16, 16]),
+    "final_tokens": ("F32", [1, 256, 128]),
+    "geometry": ("I32", [4]),
+    "gs_key": ("I64", [1]),
+    "image_u8": ("U8", [256, 256, 3]),
+    "img_shapes": ("I32", [4, 3]),
+    "ref_u8": ("U8", [256, 256, 3]),
+    "seed": ("I64", [1]),
+    "seq_step0": ("F32", [1, 1024, 128]),
+    "seq_step1": ("F32", [1, 1024, 128]),
+    "sigmas_4": ("F32", [5]),
+    "static_shift": ("F32", [1]),
+    "target_tokens": ("I32", [1]),
+    "timesteps_4": ("F32", [4]),
 }
 REFERENCE_PACKAGES = {
     "accelerate": "1.13.0",
@@ -168,7 +197,9 @@ def _validate_schema(
             )
 
 
-def _validate_files(output: Path, revision: str) -> list[dict[str, object]]:
+def _validate_files(
+    output: Path, revision: str, edit_revision: str
+) -> list[dict[str, object]]:
     records = []
     for name in EXPECTED_FILES:
         path = output / name
@@ -182,6 +213,14 @@ def _validate_files(output: Path, revision: str) -> list[dict[str, object]]:
                     f"gen_revision={metadata.get('gen_revision')!r}, expected cpu/{revision}"
                 )
             _validate_schema(name, TE_SCHEMA, keys, shapes, dtypes)
+        elif name == EDIT_FILE:
+            if metadata.get("device") != "cpu" or metadata.get("edit_revision") != edit_revision:
+                raise InvalidOracle(
+                    f"{name} metadata mismatch: device={metadata.get('device')!r}, "
+                    f"edit_revision={metadata.get('edit_revision')!r}, "
+                    f"expected cpu/{edit_revision}"
+                )
+            _validate_schema(name, EDIT_SCHEMA, keys, shapes, dtypes)
         else:
             geometry = name.removeprefix("mage_flow_vae_f32_").removesuffix(".safetensors")
             expected_hw = list(_geometry(geometry))
@@ -207,6 +246,7 @@ def _validate_files(output: Path, revision: str) -> list[dict[str, object]]:
 def _write_manifest(
     output: Path,
     revision: str,
+    edit_revision: str,
     records: list[dict[str, object]],
     seconds: float,
     reference_environment: dict[str, str] | None = None,
@@ -215,6 +255,7 @@ def _write_manifest(
         "schema": 1,
         "reference": "microsoft/Mage frozen vendored reference",
         "snapshotRevision": revision,
+        "editSnapshotRevision": edit_revision,
         "device": "cpu",
         "vaeGeometries": list(GEOMETRIES),
         "generationSeconds": round(seconds, 3),
@@ -222,10 +263,18 @@ def _write_manifest(
         "files": records,
     }
     (output / MANIFEST).write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+    edit_document = {
+        **document,
+        "files": [record for record in records if record["name"] == EDIT_FILE],
+    }
+    (output / EDIT_MANIFEST).write_text(
+        json.dumps(edit_document, indent=2) + "\n", encoding="utf-8"
+    )
 
 
-def verify(output: Path, snapshot: Path) -> None:
+def verify(output: Path, snapshot: Path, edit_snapshot: Path) -> None:
     revision = _revision(snapshot)
+    edit_revision = _revision(edit_snapshot)
     manifest_path = output / MANIFEST
     if not manifest_path.is_file():
         raise InvalidOracle(f"required Mage oracle manifest is missing: {manifest_path}")
@@ -237,10 +286,11 @@ def verify(output: Path, snapshot: Path) -> None:
         manifest.get("schema") != 1
         or manifest.get("device") != "cpu"
         or manifest.get("snapshotRevision") != revision
+        or manifest.get("editSnapshotRevision") != edit_revision
         or manifest.get("vaeGeometries") != list(GEOMETRIES)
     ):
         raise InvalidOracle(f"Mage oracle manifest does not match cpu/{revision}/{GEOMETRIES}")
-    records = _validate_files(output, revision)
+    records = _validate_files(output, revision, edit_revision)
     expected = {record["name"]: record for record in manifest.get("files", [])}
     if set(expected) != set(EXPECTED_FILES):
         raise InvalidOracle("Mage oracle manifest file population is incomplete or stale")
@@ -254,16 +304,38 @@ def verify(output: Path, snapshot: Path) -> None:
     print(f"verified {len(records)} CPU Mage oracles for revision {revision} under {output}")
 
 
-def provision(output: Path, snapshot: Path) -> None:
+def verify_edit_artifact(output: Path, edit_snapshot: Path) -> None:
+    edit_revision = _revision(edit_snapshot)
+    document = json.loads((output / EDIT_MANIFEST).read_text(encoding="utf-8"))
+    records = document.get("files", [])
+    if (
+        document.get("device") != "cpu"
+        or document.get("editSnapshotRevision") != edit_revision
+        or len(records) != 1
+        or records[0].get("name") != EDIT_FILE
+    ):
+        raise InvalidOracle("Mage edit artifact manifest is incomplete or stale")
+    path = output / EDIT_FILE
+    metadata, keys, shapes, dtypes = _inspect(path)
+    if metadata.get("device") != "cpu" or metadata.get("edit_revision") != edit_revision:
+        raise InvalidOracle("Mage edit artifact metadata does not match its CPU snapshot")
+    _validate_schema(EDIT_FILE, EDIT_SCHEMA, keys, shapes, dtypes)
+    if records[0].get("sha256") != _sha256(path) or records[0].get("bytes") != path.stat().st_size:
+        raise InvalidOracle("Mage edit artifact hash/size differs from its manifest")
+
+
+def provision(output: Path, snapshot: Path, edit_snapshot: Path) -> None:
     revision = _revision(snapshot)
+    edit_revision = _revision(edit_snapshot)
     reference_environment = _validate_reference_environment()
     output.mkdir(parents=True, exist_ok=True)
-    for name in (*EXPECTED_FILES, MANIFEST):
+    for name in (*EXPECTED_FILES, MANIFEST, EDIT_MANIFEST):
         (output / name).unlink(missing_ok=True)
     env = {
         **os.environ,
         "MAGE_DEVICE": "cpu",
         "MAGE_SNAPSHOT": str(snapshot),
+        "MAGE_EDIT_SNAPSHOT": str(edit_snapshot),
         "MAGE_GOLDEN_DIR": str(output),
         "MAGE_VAE_SIZES": ",".join(GEOMETRIES),
         "PYTHONPATH": str(MLX / "_vendor"),
@@ -276,15 +348,24 @@ def provision(output: Path, snapshot: Path) -> None:
         check=True,
     )
     subprocess.run(
+        [sys.executable, str(MLX / "tools/dump_mage_flow_golden.py"), "--stage", "edit"],
+        cwd=MLX,
+        env=env,
+        check=True,
+    )
+    subprocess.run(
         [sys.executable, str(MLX / "tools/dump_mage_vae_sizes.py")],
         cwd=MLX,
         env=env,
         check=True,
     )
     seconds = time.monotonic() - started
-    records = _validate_files(output, revision)
-    _write_manifest(output, revision, records, seconds, reference_environment)
-    verify(output, snapshot)
+    records = _validate_files(output, revision, edit_revision)
+    _write_manifest(
+        output, revision, edit_revision, records, seconds, reference_environment
+    )
+    verify_edit_artifact(output, edit_snapshot)
+    verify(output, snapshot, edit_snapshot)
     print(f"regenerated shared CPU Mage oracle bundle in {seconds:.1f}s")
 
 
@@ -303,6 +384,11 @@ def _self_test() -> None:
         wrong_dtype["pixels"] = "F16"
         wrong_shape = dict(shapes)
         wrong_shape["enc_mean"] = [1, 128, 15, 16]
+        wrong_edit_shape = {
+            key: shape for key, (_, shape) in EDIT_SCHEMA.items()
+        }
+        wrong_edit_shape["img_shapes"] = [2, 3]
+        edit_dtypes = {key: dtype for key, (dtype, _) in EDIT_SCHEMA.items()}
 
         missing = root / "missing"
         missing.mkdir()
@@ -310,13 +396,13 @@ def _self_test() -> None:
         corrupt.write_bytes(b"not safetensors")
         stale = root / "stale"
         stale.mkdir()
-        _write_manifest(stale, "b" * 40, [], 0)
+        _write_manifest(stale, "b" * 40, "c" * 40, [], 0)
 
         cases = (
             ("Python patch mismatch", lambda: _validate_python_version((3, 12, 12))),
-            ("absent", lambda: _validate_files(missing, revision)),
+            ("absent", lambda: _validate_files(missing, revision, revision)),
             ("corrupt", lambda: _inspect(corrupt)),
-            ("revision mismatch", lambda: verify(stale, snapshot)),
+            ("revision mismatch", lambda: verify(stale, snapshot, snapshot)),
             (
                 "wrong dtype",
                 lambda: _validate_schema("synthetic", schema, set(schema), shapes, wrong_dtype),
@@ -324,6 +410,16 @@ def _self_test() -> None:
             (
                 "wrong shape",
                 lambda: _validate_schema("synthetic", schema, set(schema), wrong_shape, dtypes),
+            ),
+            (
+                "wrong edit topology",
+                lambda: _validate_schema(
+                    EDIT_FILE,
+                    EDIT_SCHEMA,
+                    set(EDIT_SCHEMA),
+                    wrong_edit_shape,
+                    edit_dtypes,
+                ),
             ),
         )
         for label, mutation in cases:
@@ -341,20 +437,40 @@ def _self_test() -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--snapshot", type=Path)
+    parser.add_argument("--edit-snapshot", type=Path)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--verify-only", action="store_true")
+    parser.add_argument("--verify-edit-artifact", action="store_true")
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
     if args.self_test:
         _self_test()
         return 0
-    if not args.snapshot or not args.output:
-        parser.error("--snapshot and --output are required")
+    if args.verify_edit_artifact:
+        if not args.edit_snapshot or not args.output:
+            parser.error("--verify-edit-artifact requires --edit-snapshot and --output")
+        try:
+            verify_edit_artifact(args.output.resolve(), args.edit_snapshot.resolve())
+        except (InvalidOracle, OSError, ValueError, json.JSONDecodeError) as error:
+            print(f"Mage edit artifact verification FAILED: {error}", file=sys.stderr)
+            return 1
+        print(f"verified standalone Mage edit artifact under {args.output.resolve()}")
+        return 0
+    if not args.snapshot or not args.edit_snapshot or not args.output:
+        parser.error("--snapshot, --edit-snapshot, and --output are required")
     try:
         if args.verify_only:
-            verify(args.output.resolve(), args.snapshot.resolve())
+            verify(
+                args.output.resolve(),
+                args.snapshot.resolve(),
+                args.edit_snapshot.resolve(),
+            )
         else:
-            provision(args.output.resolve(), args.snapshot.resolve())
+            provision(
+                args.output.resolve(),
+                args.snapshot.resolve(),
+                args.edit_snapshot.resolve(),
+            )
     except InvalidOracle as error:
         print(f"Mage oracle provisioning FAILED: {error}", file=sys.stderr)
         return 1

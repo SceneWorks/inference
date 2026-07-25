@@ -2268,7 +2268,9 @@ dependencies = [
 name = "mlx-gen-mage"
 version = "0.0.0"
 dependencies = [
+ "image",
  "mlx-gen",
+ "mlx-gen-boogu",
  "pmetal-mlx-rs",
  "serde_json",
  "sha2",

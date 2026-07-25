@@ -561,15 +561,39 @@ def dump_te(model) -> dict[str, np.ndarray]:
         padding=True,
         return_tensors="pt",
     )
+    vision_outputs = model.txt_enc.hf_module.model.visual(
+        vl["pixel_values"].to(dev),
+        grid_thw=vl["image_grid_thw"].to(dev),
+        return_dict=True,
+    )
+    edit_position_ids = model.txt_enc.hf_module.model.compute_3d_position_ids(
+        input_ids=vl["input_ids"].to(dev),
+        inputs_embeds=None,
+        image_grid_thw=vl["image_grid_thw"].to(dev),
+        mm_token_type_ids=vl["mm_token_type_ids"].to(dev),
+    )
 
     cap = _HiddenCapture()
     cap.register(model.txt_enc.hf_module)
+    early_lm: dict[int, np.ndarray] = {}
+    early_handles = []
+    for layer_index in range(3):
+        def _capture_early(_module, _args, output, index=layer_index):
+            early_lm[index] = _f32(output)
+
+        early_handles.append(
+            model.txt_enc.hf_module.model.language_model.layers[layer_index].register_forward_hook(
+                _capture_early
+            )
+        )
     try:
         etxt, evec, elens = _encode_edits_packed(
             model, [[vl_ref]], [EDIT_INSTRUCTION], etemplate, edrop, dev
         )
     finally:
         cap.remove()
+        for handle in early_handles:
+            handle.remove()
 
     edit_txt = _f32(etxt)
     edit_expected = cap.hidden[edrop:]
@@ -577,10 +601,21 @@ def dump_te(model) -> dict[str, np.ndarray]:
     tensors.update(
         {
             "edit_input_ids": _i64(vl["input_ids"].squeeze(0)),
+            "edit_position_ids": _i64(edit_position_ids),
             "edit_pixel_values": _f32(vl["pixel_values"]),
+            "edit_vision_embeds": _f32(vision_outputs.pooler_output),
+            **{
+                f"edit_deepstack_{i}": _f32(features)
+                for i, features in enumerate(vision_outputs.deepstack_features)
+            },
             "edit_image_grid_thw": _i64(vl["image_grid_thw"]),
             "edit_vl_ref_u8": _pil_u8(vl_ref),
+            "edit_vl_source_u8": _pil_u8(ref_pil),
             "edit_hidden_full": cap.hidden,
+            **{
+                f"edit_lm_layer_{i}_pre_inject": early_lm[i]
+                for i in range(3)
+            },
             "edit_txt": edit_txt,
             "edit_vec": _f32(evec),
             "edit_txt_len": np.array([int(elens[0])], dtype=np.int32),
