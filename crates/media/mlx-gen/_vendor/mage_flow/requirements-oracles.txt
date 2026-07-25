@@ -1,0 +1,14 @@
+# Exact top-level environment used to regenerate Mage TE and VAE parity oracles.
+# Python itself is pinned to 3.12 by the workflow and validated by the provisioner.
+torch==2.13.0
+torchvision==0.28.0
+numpy==2.4.3
+diffusers==0.38.0
+transformers==5.5.0
+accelerate==1.13.0
+safetensors==0.8.0
+einops==0.8.2
+pydantic==2.12.5
+pillow==12.3.0
+loguru==0.7.3
+typing_extensions==4.16.0

@@ -9,7 +9,6 @@ import importlib.metadata
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -18,7 +17,6 @@ from pathlib import Path
 
 import numpy as np
 from safetensors import safe_open
-from safetensors.numpy import save_file
 
 ROOT = Path(__file__).resolve().parents[2]
 MLX = ROOT / "crates/media/mlx-gen"
@@ -27,15 +25,47 @@ TE_FILE = "mage_flow_te_golden.safetensors"
 VAE_FILES = tuple(f"mage_flow_vae_f32_{geometry}.safetensors" for geometry in GEOMETRIES)
 EXPECTED_FILES = (TE_FILE, *VAE_FILES)
 MANIFEST = "mage_oracles_manifest.json"
-TE_KEYS = {"gen_hidden_full", "gen_txt", "neg_txt", "edit_hidden_full", "edit_txt"}
-VAE_KEYS = {"geometry", "enc_mean", "enc_logvar", "enc_latent", "synth_latent",
-            "dec_from_latent", "dec_from_synth", "pixels", "image_u8"}
+TE_SCHEMA = {
+    "cfg": ("F32", [1]),
+    "drop_idx": ("I32", [2]),
+    "edit_drop_idx": ("I32", [1]),
+    "edit_hidden_full": ("F32", [157, 2560]),
+    "edit_image_grid_thw": ("I64", [1, 3]),
+    "edit_input_ids": ("I64", [157]),
+    "edit_pixel_values": ("F32", [288, 1536]),
+    "edit_txt": ("F32", [93, 2560]),
+    "edit_txt_len": ("I32", [1]),
+    "edit_vec": ("F32", [1, 2560]),
+    "edit_vl_ref_u8": ("U8", [384, 192, 3]),
+    "gen_drop_idx": ("I32", [1]),
+    "gen_hidden_full": ("F32", [94, 2560]),
+    "gen_input_ids": ("I64", [54]),
+    "gen_txt": ("F32", [20, 2560]),
+    "gen_txt_len": ("I32", [1]),
+    "gen_vec": ("F32", [1, 2560]),
+    "geometry": ("I32", [4]),
+    "gs_key": ("I64", [1]),
+    "neg_txt": ("F32", [6, 2560]),
+    "neg_txt_len": ("I32", [1]),
+    "neg_vec": ("F32", [1, 2560]),
+    "seed": ("I64", [1]),
+    "static_shift": ("F32", [1]),
+}
 REFERENCE_PACKAGES = {
+    "accelerate": "1.13.0",
     "diffusers": "0.38.0",
+    "einops": "0.8.2",
+    "loguru": "0.7.3",
+    "numpy": "2.4.3",
+    "pillow": "12.3.0",
+    "pydantic": "2.12.5",
     "safetensors": "0.8.0",
     "torch": "2.13.0",
+    "torchvision": "0.28.0",
     "transformers": "5.5.0",
+    "typing_extensions": "4.16.0",
 }
+REFERENCE_PYTHON = (3, 12)
 
 
 class InvalidOracle(RuntimeError):
@@ -43,6 +73,11 @@ class InvalidOracle(RuntimeError):
 
 
 def _validate_reference_environment() -> dict[str, str]:
+    if sys.version_info[:2] != REFERENCE_PYTHON:
+        raise InvalidOracle(
+            f"reference Python is {sys.version_info.major}.{sys.version_info.minor}, "
+            f"expected {REFERENCE_PYTHON[0]}.{REFERENCE_PYTHON[1]}"
+        )
     actual = {}
     for package, expected in REFERENCE_PACKAGES.items():
         try:
@@ -78,15 +113,55 @@ def _geometry(value: str) -> tuple[int, int]:
     return int(value), int(value)
 
 
-def _inspect(path: Path) -> tuple[dict[str, str], set[str], dict[str, list[int]]]:
+def _inspect(
+    path: Path,
+) -> tuple[dict[str, str], set[str], dict[str, list[int]], dict[str, str]]:
     try:
         with safe_open(path, framework="numpy") as handle:
             metadata = handle.metadata() or {}
             keys = set(handle.keys())
             shapes = {key: list(handle.get_slice(key).get_shape()) for key in keys}
+            dtypes = {key: handle.get_slice(key).get_dtype() for key in keys}
     except Exception as error:
         raise InvalidOracle(f"{path.name} is not a readable safetensors bundle: {error}") from error
-    return metadata, keys, shapes
+    return metadata, keys, shapes, dtypes
+
+
+def _vae_schema(height: int, width: int) -> dict[str, tuple[str, list[int]]]:
+    latent = [1, 128, height // 16, width // 16]
+    image = [1, 3, height, width]
+    return {
+        "dec_from_latent": ("F32", image),
+        "dec_from_synth": ("F32", image),
+        "enc_latent": ("F32", latent),
+        "enc_logvar": ("F32", latent),
+        "enc_mean": ("F32", latent),
+        "geometry": ("I32", [2]),
+        "image_u8": ("U8", [height, width, 3]),
+        "pixels": ("F32", image),
+        "seed": ("I64", [1]),
+        "synth_latent": ("F32", latent),
+    }
+
+
+def _validate_schema(
+    name: str,
+    schema: dict[str, tuple[str, list[int]]],
+    keys: set[str],
+    shapes: dict[str, list[int]],
+    dtypes: dict[str, str],
+) -> None:
+    if keys != set(schema):
+        raise InvalidOracle(
+            f"{name} tensor population mismatch: missing={sorted(set(schema) - keys)}, "
+            f"unexpected={sorted(keys - set(schema))}"
+        )
+    for key, (expected_dtype, expected_shape) in schema.items():
+        if dtypes.get(key) != expected_dtype or shapes.get(key) != expected_shape:
+            raise InvalidOracle(
+                f"{name}:{key} is {dtypes.get(key)}/{shapes.get(key)}, "
+                f"expected {expected_dtype}/{expected_shape}"
+            )
 
 
 def _validate_files(output: Path, revision: str) -> list[dict[str, object]]:
@@ -95,25 +170,21 @@ def _validate_files(output: Path, revision: str) -> list[dict[str, object]]:
         path = output / name
         if not path.is_file():
             raise InvalidOracle(f"required Mage oracle is missing: {path}")
-        metadata, keys, shapes = _inspect(path)
+        metadata, keys, shapes, dtypes = _inspect(path)
         if name == TE_FILE:
-            missing = TE_KEYS - keys
             if metadata.get("device") != "cpu" or metadata.get("gen_revision") != revision:
                 raise InvalidOracle(
                     f"{name} metadata mismatch: device={metadata.get('device')!r}, "
                     f"gen_revision={metadata.get('gen_revision')!r}, expected cpu/{revision}"
                 )
-            if missing:
-                raise InvalidOracle(f"{name} lacks required tensors: {sorted(missing)}")
+            _validate_schema(name, TE_SCHEMA, keys, shapes, dtypes)
         else:
             geometry = name.removeprefix("mage_flow_vae_f32_").removesuffix(".safetensors")
-            missing = VAE_KEYS - keys
             expected_hw = list(_geometry(geometry))
             if (
                 metadata.get("device") != "cpu"
                 or metadata.get("dtype") != "float32"
                 or metadata.get("revision") != revision
-                or shapes.get("geometry") != [2]
             ):
                 raise InvalidOracle(
                     f"{name} metadata/schema mismatch for cpu/f32 revision {revision}"
@@ -122,8 +193,9 @@ def _validate_files(output: Path, revision: str) -> list[dict[str, object]]:
                 actual_hw = handle.get_tensor("geometry").astype(np.int64).tolist()
             if actual_hw != expected_hw:
                 raise InvalidOracle(f"{name} geometry is {actual_hw}, expected {expected_hw}")
-            if missing:
-                raise InvalidOracle(f"{name} lacks required tensors: {sorted(missing)}")
+            _validate_schema(
+                name, _vae_schema(*expected_hw), keys, shapes, dtypes
+            )
         records.append({"name": name, "bytes": path.stat().st_size, "sha256": _sha256(path)})
     return records
 
@@ -218,53 +290,47 @@ def _self_test() -> None:
         root = Path(tmp)
         snapshot = root / revision
         snapshot.mkdir()
-        output = root / "oracles"
-        output.mkdir()
-        tensors = {
-            "gen_hidden_full": np.zeros((3, 2), np.float32),
-            "gen_txt": np.zeros((1, 2), np.float32),
-            "neg_txt": np.zeros((1, 2), np.float32),
-            "edit_hidden_full": np.zeros((2, 2), np.float32),
-            "edit_txt": np.zeros((1, 2), np.float32),
-        }
-        save_file(tensors, output / TE_FILE, metadata={"device": "cpu", "gen_revision": revision})
-        for geometry, name in zip(GEOMETRIES, VAE_FILES, strict=True):
-            height, width = _geometry(geometry)
-            arrays = {key: np.zeros((1,), np.float32) for key in VAE_KEYS - {"geometry"}}
-            arrays["geometry"] = np.array([height, width], np.int32)
-            save_file(
-                arrays,
-                output / name,
-                metadata={"device": "cpu", "dtype": "float32", "revision": revision},
-            )
-        records = _validate_files(output, revision)
-        _write_manifest(output, revision, records, 0)
-        verify(output, snapshot)
+        schema = _vae_schema(256, 256)
+        shapes = {key: shape for key, (_, shape) in schema.items()}
+        dtypes = {key: dtype for key, (dtype, _) in schema.items()}
+        _validate_schema("synthetic", schema, set(schema), shapes, dtypes)
 
-        cases = []
+        wrong_dtype = dict(dtypes)
+        wrong_dtype["pixels"] = "F16"
+        wrong_shape = dict(shapes)
+        wrong_shape["enc_mean"] = [1, 128, 15, 16]
+
         missing = root / "missing"
-        shutil.copytree(output, missing)
-        (missing / VAE_FILES[-1]).unlink()
-        cases.append(("absent", missing))
-        corrupt = root / "corrupt"
-        shutil.copytree(output, corrupt)
-        with (corrupt / TE_FILE).open("r+b") as handle:
-            handle.seek(-1, os.SEEK_END)
-            handle.write(b"\xff")
-        cases.append(("corrupt", corrupt))
+        missing.mkdir()
+        corrupt = root / "corrupt.safetensors"
+        corrupt.write_bytes(b"not safetensors")
         stale = root / "stale"
-        shutil.copytree(output, stale)
-        document = json.loads((stale / MANIFEST).read_text(encoding="utf-8"))
-        document["snapshotRevision"] = "b" * 40
-        (stale / MANIFEST).write_text(json.dumps(document), encoding="utf-8")
-        cases.append(("revision mismatch", stale))
-        for label, candidate in cases:
+        stale.mkdir()
+        _write_manifest(stale, "b" * 40, [], 0)
+
+        cases = (
+            ("absent", lambda: _validate_files(missing, revision)),
+            ("corrupt", lambda: _inspect(corrupt)),
+            ("revision mismatch", lambda: verify(stale, snapshot)),
+            (
+                "wrong dtype",
+                lambda: _validate_schema("synthetic", schema, set(schema), shapes, wrong_dtype),
+            ),
+            (
+                "wrong shape",
+                lambda: _validate_schema("synthetic", schema, set(schema), wrong_shape, dtypes),
+            ),
+        )
+        for label, mutation in cases:
             try:
-                verify(candidate, snapshot)
+                mutation()
             except InvalidOracle:
                 continue
             raise AssertionError(f"self-test failed to reject {label}")
-    print("Mage oracle provisioning self-test PASS: absent/corrupt/revision mismatch rejected")
+    print(
+        "Mage oracle provisioning self-test PASS: "
+        "absent/corrupt/revision/dtype/shape mutations rejected"
+    )
 
 
 def main() -> int:

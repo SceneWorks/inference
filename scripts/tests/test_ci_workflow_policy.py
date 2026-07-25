@@ -63,9 +63,15 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("MAGE_GOLDEN_DIR: ${{ runner.temp }}/mage-flow-oracles", workflow)
         self.assertIn("MAGE_DEVICE=cpu", workflow)
         self.assertIn("scripts/release/provision_mage_oracles.py", workflow)
+        self.assertIn("requirements-oracles.txt", workflow)
+        self.assertIn('python-version: "3.12.11"', workflow)
         self.assertIn("Run Mage-Flow text-encoder parity", workflow)
         self.assertIn("Run Mage-VAE all-geometry parity", workflow)
         self.assertNotIn("MAGE_FLOW_TE_GOLDEN: ${{ vars.", workflow)
+        self.assertNotIn("MAGE_REF_PYTHON", workflow)
+
+        ordinary_ci = WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn("provision_mage_oracles.py --self-test", ordinary_ci)
 
     def test_residency_ab_is_operator_run_without_ci_model_dependencies(self) -> None:
         workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
