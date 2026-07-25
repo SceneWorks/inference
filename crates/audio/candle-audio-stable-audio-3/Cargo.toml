@@ -2,7 +2,7 @@
 name = "candle-audio-stable-audio-3"
 version = "0.0.0"
 edition = "2021"
-description = "Unregistered Stable Audio 3 Candle provider foundation: typed config, explicit snapshot layout, and safetensors key routing (sc-14535)."
+description = "Unregistered Stable Audio 3 Candle provider primitives and snapshot loading."
 license = "Apache-2.0"
 repository = "https://github.com/SceneWorks/inference"
 keywords = ["candle", "audio", "diffusion", "stable-audio"]

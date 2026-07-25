@@ -768,6 +768,8 @@ pub enum NormType {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NormConfig {
     #[serde(default)]
+    pub fix_scale: bool,
+    #[serde(default)]
     pub force_fp32: bool,
     #[serde(default = "default_norm_eps")]
     pub eps: f64,
@@ -776,6 +778,7 @@ pub struct NormConfig {
 impl Default for NormConfig {
     fn default() -> Self {
         Self {
+            fix_scale: false,
             force_fp32: false,
             eps: default_norm_eps(),
         }
