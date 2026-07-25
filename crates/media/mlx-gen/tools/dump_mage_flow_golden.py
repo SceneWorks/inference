@@ -174,6 +174,14 @@ def _revision_of(path: str) -> str:
 # ------------------------------------------------------------------------- utilities
 
 
+def _materialize_mps_view(t: torch.Tensor) -> torch.Tensor:
+    """Detach `t`; on MPS, give every view independent storage before any CPU transfer."""
+    value = t.detach()
+    if value.device.type == "mps":
+        return value.clone(memory_format=torch.contiguous_format)
+    return value
+
+
 def _f32(t: torch.Tensor) -> np.ndarray:
     """Detached float32 C-contiguous numpy view of a real reference tensor.
 
@@ -188,19 +196,17 @@ def _f32(t: torch.Tensor) -> np.ndarray:
     """
     if t.is_complex():
         raise TypeError("complex tensor reached _f32 — use _split_complex (real part only would be stored)")
-    value = t.detach()
     # torch 2.13.0 MPS can silently copy the wrong storage region when a sliced view with a
     # non-zero storage offset is transferred directly to CPU. Synchronizing does not help;
     # materializing independent MPS storage first does. Always clone MPS tensors so this remains
     # safe even for views that report `is_contiguous()` despite their non-zero storage offset.
-    if value.device.type == "mps":
-        value = value.clone(memory_format=torch.contiguous_format)
+    value = _materialize_mps_view(t)
     return value.to("cpu", torch.float32).contiguous().numpy()
 
 
 def _split_complex(t: torch.Tensor) -> tuple[np.ndarray, np.ndarray]:
     """`(real, imag)` float32 halves of a complex reference tensor (the RoPE frequency table)."""
-    c = t.detach().to("cpu").resolve_conj().contiguous()
+    c = _materialize_mps_view(t).to("cpu").resolve_conj().contiguous()
     return (
         torch.view_as_real(c)[..., 0].to(torch.float32).contiguous().numpy(),
         torch.view_as_real(c)[..., 1].to(torch.float32).contiguous().numpy(),
@@ -208,7 +214,7 @@ def _split_complex(t: torch.Tensor) -> tuple[np.ndarray, np.ndarray]:
 
 
 def _i64(t: torch.Tensor) -> np.ndarray:
-    return t.detach().to("cpu", torch.int64).contiguous().numpy()
+    return _materialize_mps_view(t).to("cpu", torch.int64).contiguous().numpy()
 
 
 def _assert_exact_slice(label: str, actual: np.ndarray, expected: np.ndarray) -> None:
@@ -844,6 +850,48 @@ def main() -> int:
     )
     args = parser.parse_args()
     if args.self_test_transfer:
+        cpu_base = torch.arange(24, dtype=torch.float32).reshape(6, 4)
+        cpu_view = cpu_base[2:4]
+        cpu_detached = _materialize_mps_view(cpu_view)
+        if (
+            cpu_detached.data_ptr() != cpu_view.data_ptr()
+            or cpu_detached.storage_offset() != cpu_view.storage_offset()
+        ):
+            raise RuntimeError("non-MPS materialization must detach without cloning or rebasing")
+
+        device = torch.device(DEVICE)
+        float_base = torch.arange(24, dtype=torch.float32, device=device).reshape(6, 4)
+        float_view = float_base[2:4]
+        if not np.array_equal(_f32(float_view), np.arange(8, 16, dtype=np.float32).reshape(2, 4)):
+            raise RuntimeError("_f32 failed a non-zero-offset view transfer")
+
+        int_base = torch.arange(24, dtype=torch.int64, device=device).reshape(6, 4)
+        int_view = int_base[3:5]
+        if not np.array_equal(_i64(int_view), np.arange(12, 20, dtype=np.int64).reshape(2, 4)):
+            raise RuntimeError("_i64 failed a non-zero-offset view transfer")
+
+        complex_status = "exercised"
+        try:
+            real = torch.arange(24, dtype=torch.float32, device=device).reshape(6, 4)
+            complex_base = torch.complex(real, real + 100)
+            complex_view = complex_base[1:3]
+            split_re, split_im = _split_complex(complex_view)
+            if not np.array_equal(split_re, np.arange(4, 12, dtype=np.float32).reshape(2, 4)):
+                raise RuntimeError("_split_complex real half failed a non-zero-offset view transfer")
+            if not np.array_equal(split_im, split_re + 100):
+                raise RuntimeError("_split_complex imaginary half failed a non-zero-offset view transfer")
+        except RuntimeError as error:
+            if device.type != "mps" or "does not support" not in str(error).lower():
+                raise
+            # torch 2.13.0 MPS does not expose complex tensors. The same helper path is still
+            # exercised by float/int MPS views, and complex splitting is tested on CPU below.
+            complex_status = f"MPS unsupported ({error}); CPU fallback exercised"
+            real = torch.arange(24, dtype=torch.float32).reshape(6, 4)
+            complex_base = torch.complex(real, real + 100)
+            split_re, split_im = _split_complex(complex_base[1:3])
+            if not np.array_equal(split_im, split_re + 100):
+                raise RuntimeError("_split_complex CPU fallback failed")
+
         full = np.arange(24, dtype=np.float32).reshape(6, 4)
         _assert_exact_slice("self-test exact", full[2:4].copy(), full[2:4])
         corrupted = full[2:4].copy()
@@ -851,7 +899,11 @@ def main() -> int:
         try:
             _assert_exact_slice("self-test mutation", corrupted, full[2:4])
         except RuntimeError:
-            print("packed-slice transfer self-test PASS: exact accepted, corruption rejected")
+            print(
+                "packed-slice transfer self-test PASS: "
+                f"float/int serializers exercised on {device.type}; complex {complex_status}; "
+                "CPU no-clone guarded; exact accepted, corruption rejected"
+            )
             return 0
         raise RuntimeError("packed-slice transfer self-test failed to reject corruption")
     stages = set(_STAGES) if args.stage == "all" else {args.stage}
