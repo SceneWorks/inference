@@ -1,6 +1,6 @@
-//! LTX-2.3 **video VAE decoder** (`CausalVideoAutoencoder`, latent 128-ch, patch 4, 8× temporal /
-//! 32× spatial) — port of mlx-gen-ltx `vae.rs` (`LTX2VideoDecoder`). T2V needs only `decode`; the
-//! encoder (I2V) is deferred.
+//! LTX-2.3 **video VAE** (`CausalVideoAutoencoder`, latent 128-ch, patch 4, 8× temporal /
+//! 32× spatial) — port of mlx-gen-ltx `vae.rs`. Decoder-only construction serves inference;
+//! [`LtxVideoVae::new_with_encoder`] additionally loads the causal training encoder.
 //!
 //! Decode: denormalize `latent·std + mean` → `conv_in 128→1024` → 9 up_blocks (`Res` groups +
 //! `DepthToSpace` upsamplers) → pixel-norm (eps 1e-8) → SiLU → `conv_out 128→48` → unpatchify(×4).
@@ -17,9 +17,11 @@ use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::tiling::{TileCandidates, TilingConfig, VaeTiling};
 use candle_gen::vae_tiling;
 
+use crate::config::{LATENT_CHANNELS, SPATIAL_SCALE, TEMPORAL_SCALE};
 use crate::conv3d::CausalConv3d;
 
 const DEC_NORM_EPS: f64 = 1e-8;
+const ENC_NORM_EPS: f64 = 1e-6;
 
 /// `x / sqrt(mean(x² over C, keepdims) + eps)` — LTX PixelNorm (channel axis = 1, no √C, no γ).
 fn pixel_norm(x: &Tensor) -> Result<Tensor> {
@@ -129,7 +131,257 @@ fn unpatchify(x: &Tensor, p: usize) -> Result<Tensor> {
     x.reshape((b, c, f, h * p, w * p))?.contiguous()
 }
 
-/// The LTX-2.3 video VAE (decoder only, T2V).
+/// Spatial-only patchify (`patch_size_t = 1`) used at the encoder input.
+fn patchify(x: &Tensor, p: usize) -> Result<Tensor> {
+    let (b, c, f, h, w) = x.dims5()?;
+    if h % p != 0 || w % p != 0 {
+        return Err(candle_gen::candle_core::Error::Msg(format!(
+            "ltx vae encode: spatial dimensions {h}x{w} must be divisible by patch size {p}"
+        )));
+    }
+    let (nh, nw) = (h / p, w / p);
+    let x = x.reshape([b, c, f, 1, nh, p, nw, p].as_slice())?;
+    let x = x.permute([0usize, 1, 3, 7, 5, 2, 4, 6].as_slice())?;
+    x.reshape((b, c * p * p, f, nh, nw))?.contiguous()
+}
+
+#[cfg(test)]
+mod encoder_unit_tests {
+    use super::*;
+    use candle_gen::candle_core::{Device, Tensor};
+
+    #[test]
+    fn patchify_unpatchify_round_trip() -> Result<()> {
+        let data: Vec<f32> = (0..32).map(|value| value as f32).collect();
+        let video = Tensor::from_vec(data, (1, 2, 1, 4, 4), &Device::Cpu)?;
+        let packed = patchify(&video, 2)?;
+        assert_eq!(packed.dims(), &[1, 8, 1, 2, 2]);
+        let restored = unpatchify(&packed, 2)?;
+        assert_eq!(restored.dims(), video.dims());
+        assert_eq!(
+            restored.flatten_all()?.to_vec1::<f32>()?,
+            video.flatten_all()?.to_vec1::<f32>()?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn encoder_block_schedule_matches_ltx_scales() {
+        let mut temporal = 1;
+        let mut spatial = 4; // patchify
+        for block in &ENCODER_BLOCKS {
+            if let EBlock::Down((t, h, w)) = block {
+                temporal *= t;
+                assert_eq!(h, w);
+                spatial *= h;
+            }
+        }
+        assert_eq!(temporal, TEMPORAL_SCALE);
+        assert_eq!(spatial, SPATIAL_SCALE);
+    }
+}
+
+fn pixel_norm_eps(x: &Tensor, eps: f64) -> Result<Tensor> {
+    let c = x.dim(1)?;
+    let denom = ((x.sqr()?.sum_keepdim(1)? / c as f64)? + eps)?.sqrt()?;
+    x.broadcast_div(&denom)
+}
+
+struct EncResBlock {
+    conv1: CausalConv3d,
+    conv2: CausalConv3d,
+}
+
+impl EncResBlock {
+    fn load(vb: VarBuilder, prefix: &str) -> Result<Self> {
+        Ok(Self {
+            conv1: CausalConv3d::load(vb.clone(), &format!("{prefix}.conv1.conv"))?,
+            conv2: CausalConv3d::load(vb, &format!("{prefix}.conv2.conv"))?,
+        })
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let h = candle_gen::candle_nn::ops::silu(&pixel_norm_eps(x, ENC_NORM_EPS)?)?;
+        let h = self.conv1.forward(&h, true)?;
+        let h = candle_gen::candle_nn::ops::silu(&pixel_norm_eps(&h, ENC_NORM_EPS)?)?;
+        let h = self.conv2.forward(&h, true)?;
+        h + x
+    }
+}
+
+struct SpaceToDepth {
+    conv: CausalConv3d,
+    stride: (usize, usize, usize),
+    out_channels: usize,
+    group_size: usize,
+}
+
+impl SpaceToDepth {
+    fn load(vb: VarBuilder, prefix: &str, stride: (usize, usize, usize)) -> Result<Self> {
+        let conv = CausalConv3d::load(vb, &format!("{prefix}.conv.conv"))?;
+        let (conv_out, in_channels) = conv.channels()?;
+        let multiplier = stride.0 * stride.1 * stride.2;
+        let out_channels = conv_out.checked_mul(multiplier).ok_or_else(|| {
+            candle_gen::candle_core::Error::Msg(
+                "ltx vae encoder: downsample channel count overflow".into(),
+            )
+        })?;
+        let packed_input = in_channels.checked_mul(multiplier).ok_or_else(|| {
+            candle_gen::candle_core::Error::Msg(
+                "ltx vae encoder: downsample input channel count overflow".into(),
+            )
+        })?;
+        if out_channels == 0 || packed_input % out_channels != 0 {
+            return Err(candle_gen::candle_core::Error::Msg(format!(
+                "ltx vae encoder: invalid downsample channels in={in_channels}, conv_out={conv_out}, \
+                 stride={stride:?}"
+            )));
+        }
+        Ok(Self {
+            conv,
+            stride,
+            out_channels,
+            group_size: packed_input / out_channels,
+        })
+    }
+
+    fn space_to_depth(&self, x: &Tensor) -> Result<Tensor> {
+        let (b, c, d, h, w) = x.dims5()?;
+        let (st, sh, sw) = self.stride;
+        let x = x.reshape([b, c, d / st, st, h / sh, sh, w / sw, sw].as_slice())?;
+        let x = x.permute([0usize, 1, 3, 5, 7, 2, 4, 6].as_slice())?;
+        x.reshape((b, c * st * sh * sw, d / st, h / sh, w / sw))?
+            .contiguous()
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let (st, sh, sw) = self.stride;
+        let mut x = if st == 2 {
+            Tensor::cat(&[&x.narrow(2, 0, 1)?, x], 2)?
+        } else {
+            x.clone()
+        };
+        let (_b, _c, d, h, w) = x.dims5()?;
+        let pad_d = (st - d % st) % st;
+        let pad_h = (sh - h % sh) % sh;
+        let pad_w = (sw - w % sw) % sw;
+        if pad_d > 0 || pad_h > 0 || pad_w > 0 {
+            x = x
+                .pad_with_zeros(2, 0, pad_d)?
+                .pad_with_zeros(3, 0, pad_h)?
+                .pad_with_zeros(4, 0, pad_w)?;
+        }
+
+        let skip = self.space_to_depth(&x)?;
+        let (b, _c, d, h, w) = skip.dims5()?;
+        let skip = skip
+            .reshape((b, self.out_channels, self.group_size, d, h, w))?
+            .mean(2)?;
+        let conv = self.space_to_depth(&self.conv.forward(&x, true)?)?;
+        if conv.dims() == skip.dims() {
+            conv + skip
+        } else {
+            Ok(conv)
+        }
+    }
+}
+
+enum DownLayer {
+    Res(Vec<EncResBlock>),
+    Down(SpaceToDepth),
+}
+
+enum EBlock {
+    Res(usize),
+    Down((usize, usize, usize)),
+}
+
+const ENCODER_BLOCKS: [EBlock; 9] = [
+    EBlock::Res(4),
+    EBlock::Down((1, 2, 2)),
+    EBlock::Res(6),
+    EBlock::Down((2, 1, 1)),
+    EBlock::Res(4),
+    EBlock::Down((2, 2, 2)),
+    EBlock::Res(2),
+    EBlock::Down((2, 2, 2)),
+    EBlock::Res(2),
+];
+
+struct VideoEncoder {
+    conv_in: CausalConv3d,
+    down_blocks: Vec<DownLayer>,
+    conv_out: CausalConv3d,
+    mean: Tensor,
+    std: Tensor,
+    patch_size: usize,
+    latent_channels: usize,
+}
+
+impl VideoEncoder {
+    fn load(
+        vb: VarBuilder,
+        stats: VarBuilder,
+        latent_channels: usize,
+        patch_size: usize,
+    ) -> Result<Self> {
+        let mut down_blocks = Vec::with_capacity(ENCODER_BLOCKS.len());
+        for (idx, block) in ENCODER_BLOCKS.iter().enumerate() {
+            let prefix = format!("down_blocks.{idx}");
+            down_blocks.push(match block {
+                EBlock::Res(n) => {
+                    let mut blocks = Vec::with_capacity(*n);
+                    for j in 0..*n {
+                        blocks.push(EncResBlock::load(
+                            vb.clone(),
+                            &format!("{prefix}.res_blocks.{j}"),
+                        )?);
+                    }
+                    DownLayer::Res(blocks)
+                }
+                EBlock::Down(stride) => {
+                    DownLayer::Down(SpaceToDepth::load(vb.clone(), &prefix, *stride)?)
+                }
+            });
+        }
+        Ok(Self {
+            conv_in: CausalConv3d::load(vb.clone(), "conv_in.conv")?,
+            down_blocks,
+            conv_out: CausalConv3d::load(vb, "conv_out.conv")?,
+            mean: stats
+                .get_unchecked("mean-of-means")?
+                .reshape((1, latent_channels, 1, 1, 1))?,
+            std: stats
+                .get_unchecked("std-of-means")?
+                .reshape((1, latent_channels, 1, 1, 1))?,
+            patch_size,
+            latent_channels,
+        })
+    }
+
+    fn encode(&self, video: &Tensor) -> Result<Tensor> {
+        let mut x = self
+            .conv_in
+            .forward(&patchify(video, self.patch_size)?, true)?;
+        for layer in &self.down_blocks {
+            x = match layer {
+                DownLayer::Res(blocks) => {
+                    let mut h = x;
+                    for block in blocks {
+                        h = block.forward(&h)?;
+                    }
+                    h
+                }
+                DownLayer::Down(down) => down.forward(&x)?,
+            };
+        }
+        let x = candle_gen::candle_nn::ops::silu(&pixel_norm_eps(&x, ENC_NORM_EPS)?)?;
+        let x = self.conv_out.forward(&x, true)?;
+        let means = x.narrow(1, 0, self.latent_channels)?;
+        means.broadcast_sub(&self.mean)?.broadcast_div(&self.std)
+    }
+}
+
 pub struct LtxVideoVae {
     conv_in: CausalConv3d,
     up_blocks: Vec<UpLayer>,
@@ -137,11 +389,32 @@ pub struct LtxVideoVae {
     mean: Tensor, // [1, 128, 1, 1, 1]
     std: Tensor,  // [1, 128, 1, 1, 1]
     patch_size: usize,
+    encoder: Option<VideoEncoder>,
 }
 
 impl LtxVideoVae {
-    /// Build from a VarBuilder rooted at the `vae.` prefix of the checkpoint.
+    /// Build a decoder-only VAE from a VarBuilder rooted at the `vae.` prefix.
     pub fn new(vb: VarBuilder, latent_channels: usize, patch_size: usize) -> Result<Self> {
+        Self::build(vb, None, latent_channels, patch_size)
+    }
+
+    /// Build the decoder and causal encoder. Pass the same `vae`-rooted builder twice for a unified
+    /// checkpoint, or separate remapped builders for split decoder/encoder files.
+    pub fn new_with_encoder(
+        decoder_vb: VarBuilder,
+        encoder_vb: VarBuilder,
+        latent_channels: usize,
+        patch_size: usize,
+    ) -> Result<Self> {
+        Self::build(decoder_vb, Some(encoder_vb), latent_channels, patch_size)
+    }
+
+    fn build(
+        vb: VarBuilder,
+        encoder_vb: Option<VarBuilder>,
+        latent_channels: usize,
+        patch_size: usize,
+    ) -> Result<Self> {
         let dec = vb.pp("decoder");
         let mut up_blocks = Vec::with_capacity(DECODER_BLOCKS.len());
         for (idx, block) in DECODER_BLOCKS.iter().enumerate() {
@@ -169,6 +442,15 @@ impl LtxVideoVae {
         let std = stats
             .get_unchecked("std-of-means")?
             .reshape((1, latent_channels, 1, 1, 1))?;
+        let encoder = match encoder_vb {
+            Some(enc) => Some(VideoEncoder::load(
+                enc.pp("encoder"),
+                enc.pp("per_channel_statistics"),
+                latent_channels,
+                patch_size,
+            )?),
+            None => None,
+        };
         Ok(Self {
             conv_in: CausalConv3d::load(dec.clone(), "conv_in.conv")?,
             up_blocks,
@@ -176,7 +458,44 @@ impl LtxVideoVae {
             mean,
             std,
             patch_size,
+            encoder,
         })
+    }
+
+    /// Encode `[-1,1]` video `[B,3,F,H,W]` to normalized LTX latents
+    /// `[B,128,1+(F-1)/8,H/32,W/32]`.
+    pub fn encode(&self, video: &Tensor) -> Result<Tensor> {
+        let (_b, channels, frames, height, width) = video.dims5()?;
+        if channels != 3 {
+            return Err(candle_gen::candle_core::Error::Msg(format!(
+                "ltx vae encode: expected 3 input channels, got {channels}"
+            )));
+        }
+        if frames == 0 || (frames - 1) % TEMPORAL_SCALE != 0 {
+            return Err(candle_gen::candle_core::Error::Msg(format!(
+                "ltx vae encode: frame count {frames} must equal 1 + k*{TEMPORAL_SCALE}"
+            )));
+        }
+        if height == 0 || width == 0 || height % SPATIAL_SCALE != 0 || width % SPATIAL_SCALE != 0 {
+            return Err(candle_gen::candle_core::Error::Msg(format!(
+                "ltx vae encode: spatial dimensions {height}x{width} must be positive multiples of \
+                 {SPATIAL_SCALE}"
+            )));
+        }
+        let latent_channels = self.mean.dim(1)?;
+        if latent_channels != LATENT_CHANNELS {
+            return Err(candle_gen::candle_core::Error::Msg(format!(
+                "ltx vae encode: expected {LATENT_CHANNELS} latent channels, got {latent_channels}"
+            )));
+        }
+        self.encoder
+            .as_ref()
+            .ok_or_else(|| {
+                candle_gen::candle_core::Error::Msg(
+                    "ltx vae encode: encoder weights were not loaded; use new_with_encoder".into(),
+                )
+            })?
+            .encode(video)
     }
 
     /// Decode a normalized latent `[B, 128, F', H', W']` → video `[B, 3, F, 32·H', 32·W']` in ~[-1,1].
