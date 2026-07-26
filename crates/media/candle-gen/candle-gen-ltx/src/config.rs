@@ -10,6 +10,12 @@
 
 /// Registry id (the distilled 22B text-to-video model).
 pub const MODEL_ID: &str = "ltx_2_3_distilled";
+/// Registry id for LoRA training.
+///
+/// Training targets the base LTX-2.3 family recipe, while generation remains the separately pinned
+/// distilled engine [`MODEL_ID`]. Keep these ids distinct so callers can select the trainer without
+/// changing the generator route.
+pub const TRAINER_ID: &str = "ltx_2_3";
 
 // --- VAE compression factors + sampling defaults (mlx-gen-ltx positions.rs) ----------------------
 /// Temporal VAE compression: pixel frames → latent frames is `(F-1)/8 + 1`.

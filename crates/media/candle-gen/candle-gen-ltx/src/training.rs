@@ -24,8 +24,8 @@ use candle_gen::train::gradient_checkpoint::checkpointed_backward;
 use candle_gen::{CandleError, Result};
 
 use crate::config::{
-    AvConfig, ConnectorConfig, GemmaConfig, DEFAULT_FPS, LATENT_CHANNELS, MODEL_ID, SPATIAL_SCALE,
-    STAGE1_SIGMAS,
+    AvConfig, ConnectorConfig, GemmaConfig, DEFAULT_FPS, LATENT_CHANNELS, SPATIAL_SCALE,
+    STAGE1_SIGMAS, TRAINER_ID,
 };
 use crate::dit_train::{LtxDiT, LTX_ATTN_TARGETS};
 use crate::pipeline::{flatten_latent, frames_to_images, unflatten_latent};
@@ -57,7 +57,7 @@ pub struct LtxTrainer {
 
 pub fn trainer_descriptor() -> TrainerDescriptor {
     TrainerDescriptor {
-        id: MODEL_ID,
+        id: TRAINER_ID,
         family: "ltx",
         backend: "candle",
         modality: Modality::Video,
@@ -558,7 +558,7 @@ mod tests {
     #[test]
     fn descriptor_and_default_targets_are_exact() {
         let d = trainer_descriptor();
-        assert_eq!(d.id, MODEL_ID);
+        assert_eq!(d.id, TRAINER_ID);
         assert_eq!(d.backend, "candle");
         assert!(d.supports_lora);
         assert!(!d.supports_lokr);

@@ -19,7 +19,7 @@ let generator = registry.load("sdxl", &spec)?;
 let registry = register_providers(ProviderRegistryBuilder::new()).build()?;
 ```
 
-- **`provider_registry()`** — build the complete explicit Candle catalog (43 generators, 6
+- **`provider_registry()`** — build the complete explicit Candle catalog (51 generators, 7
   trainers, the JoyCaption captioner, and CLIP image/text embedders). The full list and the
   MLX/Candle deltas are in the [model catalog reference](../../../../docs/reference/model-catalog.md).
 - **`register_providers(builder)`** — add every shipped Candle family to a builder, in stable
