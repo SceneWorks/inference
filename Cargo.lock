@@ -427,6 +427,7 @@ dependencies = [
  "safetensors 0.7.0",
  "sceneworks-gen-core",
  "serde_json",
+ "sha2",
  "thiserror 2.0.18",
 ]
 
@@ -2135,6 +2136,7 @@ dependencies = [
  "mlx-gen-joycaption",
  "mlx-gen-kolors",
  "mlx-gen-krea",
+ "mlx-gen-krea-realtime",
  "mlx-gen-lens",
  "mlx-gen-ltx",
  "mlx-gen-mage",

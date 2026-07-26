@@ -123,7 +123,7 @@ LoRA/LoKr fine-tuning is available for a subset of generator families. Load with
 | `krea_2_raw` | ✓ | ✓ |
 | `krea_2_control` | — | ✓ |
 | `lens` | ✓ | ✓ |
-| `ltx_2_3` | ✓ | — |
+| `ltx_2_3` | ✓ | ✓ |
 | `sd3_5_large` | ✓ | — |
 | `sd3_5_medium` | ✓ | — |
 | `sdxl` | ✓ | ✓ |
@@ -186,9 +186,9 @@ differ; each difference is pinned in the exact-surface tests rather than papered
 - **LTX ships a different variant per backend.** MLX registers `ltx_2_3`; Candle
   registers `ltx_2_3_distilled`.
 - **The trainer sets differ substantially.** MLX offers 14 trainers (including the whole
-  `anima` family, `kolors`, `ltx_2_3`, `sd3_5_large` / `sd3_5_medium`, and the Wan
-  video trainers); Candle offers 6, and is the only backend with a `krea_2_control`
-  trainer.
+  `anima` family, `kolors`, `sd3_5_large` / `sd3_5_medium`, and the Wan video trainers);
+  Candle offers 7, including the shared `ltx_2_3` trainer, and is the only backend with a
+  `krea_2_control` trainer.
 
 ## See also
 

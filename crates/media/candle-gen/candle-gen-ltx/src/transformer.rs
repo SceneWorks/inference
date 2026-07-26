@@ -103,6 +103,22 @@ impl Attention {
         })
     }
 
+    fn visit_adaptable_mut(
+        &mut self,
+        f: &mut dyn FnMut(&str, &mut QLinear) -> Result<()>,
+    ) -> Result<()> {
+        for linear in [
+            &mut self.to_q,
+            &mut self.to_k,
+            &mut self.to_v,
+            &mut self.to_out,
+        ] {
+            let path = linear.path().to_string();
+            f(&path, linear)?;
+        }
+        Ok(())
+    }
+
     fn to_heads(&self, x: &Tensor) -> Result<Tensor> {
         let (b, s, _) = x.dims3()?;
         x.reshape((b, s, self.heads, self.dim_head))?
@@ -408,6 +424,16 @@ impl AvBlock {
         })
     }
 
+    /// Visit only the canonical video `attn1` / `attn2` adapter surface. Audio and cross-modal
+    /// projections deliberately remain frozen because the native trainer is video-only.
+    fn visit_video_adaptable_mut(
+        &mut self,
+        f: &mut dyn FnMut(&str, &mut QLinear) -> Result<()>,
+    ) -> Result<()> {
+        self.attn1.visit_adaptable_mut(f)?;
+        self.attn2.visit_adaptable_mut(f)
+    }
+
     /// Self-attn (RoPE) → prompt-modulated text cross-attention (no RoPE), for one modality.
     fn self_and_text(
         &self,
@@ -577,6 +603,22 @@ impl AvDiT {
             device,
             rope_cache: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Walk the exact inference adapter surface trained by [`crate::dit_train::LtxDiT`]:
+    /// `transformer_blocks.{i}.attn{1,2}.{to_q,to_k,to_v,to_out.0}`.
+    pub(crate) fn visit_video_adaptable_mut(
+        &mut self,
+        f: &mut dyn FnMut(&str, &mut QLinear) -> Result<()>,
+    ) -> Result<()> {
+        for block in &mut self.blocks {
+            block.visit_video_adaptable_mut(f)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn device(&self) -> &Device {
+        &self.device
     }
 
     /// Build (or reuse) the four split-RoPE tables for this render's fixed position grids (sc-8992).

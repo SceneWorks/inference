@@ -123,7 +123,12 @@ fn read_alpha(a: &Array) -> Result<f32> {
 /// `patch_embedding → patch_embedding_proj`. attn `q/k/v/o` pass through. Both the `.X.` infix and
 /// the bare `…X` suffix forms are handled, as the reference does (a LoRA module stem ends at the
 /// module, so the suffix forms fire).
-pub(crate) fn normalize_wan_key(key: &str) -> String {
+///
+/// Public because the Krea Realtime provider (`mlx-gen-krea-realtime`), whose DiT reuses this crate's
+/// [`WanTransformer`](crate::WanTransformer) verbatim, normalizes Wan-family LoRA keys through it in its
+/// own [`AdaptableHost`] before delegating to the inner Wan host
+/// (sc-15015) — the same reference-faithful renames the in-crate LoRA install path uses.
+pub fn normalize_wan_key(key: &str) -> String {
     let stripped = PREFIXES
         .iter()
         .find_map(|p| key.strip_prefix(p))

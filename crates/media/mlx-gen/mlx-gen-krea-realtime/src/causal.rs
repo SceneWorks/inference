@@ -4,7 +4,8 @@
 //! DiT — patchify, embeddings, adaLN-6vec modulation, text cross-attention, gated-GELU FFN, 3-axis
 //! RoPE, the modulated head — is **reused verbatim** from [`mlx_gen_wan::WanTransformer`]. The single
 //! net-new compute delta of the autoregressive regime is confined to **self-attention**, and it is
-//! three coupled pieces (mirroring the reference `transformer/causal_model.py`):
+//! three coupled pieces **adapted from** the reference `transformer/causal_model.py`
+//! (`krea-ai/realtime-video`) — reimplemented in native MLX, not copied source:
 //!
 //!   1. **Block-causal attention mask** ([`build_block_causal_mask`]) — a query attends to every token
 //!      up to the END of its own frame-block (intra-block bidirectional) but no later block
@@ -32,9 +33,10 @@
 //! mask + KV read window + causal RoPE offset — the released reference applies no additive attention
 //! bias / `score_mod` in its sampling path (see the crate-root reconciliation note).
 
+use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
 use mlx_gen::{Error, Result};
 use mlx_gen_wan::patchify::unpatchify;
-use mlx_gen_wan::WanTransformer;
+use mlx_gen_wan::{normalize_wan_key, WanTransformer};
 use mlx_rs::ops::concatenate_axis;
 use mlx_rs::{Array, Dtype};
 
@@ -504,9 +506,107 @@ impl CausalKreaTransformer {
     }
 }
 
+/// Every LoRA-adaptable target in the Krea Realtime DiT as a dotted path in the **Wan reference /
+/// diffusers** naming a Wan-family LoRA file carries (once its `diffusion_model.`/`transformer.`
+/// namespace is stripped), for a model with `num_layers` blocks. Krea Realtime 14B *is* Wan-2.1-14B
+/// T2V weight-for-weight, so these are exactly the per-block attention + FFN Linears a Wan-family
+/// style LoRA (musubi-tuner / diffusion-pipe / ComfyUI) targets. The reference spells the FFN as
+/// `ffn.0`/`ffn.2` (the converted DiT renames them to `ffn.fc1`/`ffn.fc2`); [`normalize_wan_key`]
+/// bridges that in [`CausalKreaTransformer::adaptable_mut`], so this file-naming surface stays the one
+/// a LoRA file speaks. Single source of truth for [`AdaptableHost::adaptable_paths`] (the kohya
+/// `flattened → dotted` table), kept in lock-step with the resolver by tests. The whole-model globals
+/// (patch/text/time embeddings, `head`) are NOT exposed — the reused inner
+/// [`WanTransformer`] routes only the per-block surface, matching the Wan
+/// DiT's own adaptable surface; a global-target key surfaces as unmatched (loud), never mis-folded.
+pub(crate) fn krea_adaptable_paths(num_layers: usize) -> Vec<String> {
+    let mut paths = Vec::with_capacity(num_layers * 10);
+    for i in 0..num_layers {
+        for attn in ["self_attn", "cross_attn"] {
+            for proj in ["q", "k", "v", "o"] {
+                paths.push(format!("blocks.{i}.{attn}.{proj}"));
+            }
+        }
+        paths.push(format!("blocks.{i}.ffn.0"));
+        paths.push(format!("blocks.{i}.ffn.2"));
+    }
+    paths
+}
+
+/// Install inference LoRA(s) onto the Krea Realtime DiT as forward-time residuals (sc-15015, S14).
+/// Krea Realtime 14B is Wan-2.1-14B T2V weight-for-weight, so the family-agnostic
+/// [`mlx_gen::adapters::loader`] path (the `mlx-gen-scail2` dense-Wan template) resolves a diffusers /
+/// PEFT / kohya / LoKr / LoHa file directly against the DiT's module names — the residual install the
+/// Z-Image / Qwen / SCAIL-2 providers use. The only wrinkle vs. SCAIL-2: Krea's DiT is the *converted*
+/// [`WanTransformer`] (whose adaptable surface names the FFN `ffn.fc1`/
+/// `ffn.fc2`), so a reference-named key (`ffn.0`/`ffn.2`) is normalized to the converted layout via the
+/// shared Wan key-normalizer before delegating to the inner host. Adapters apply *over* the dense bf16
+/// base as a forward-time residual (`base(x) + scale·x·A·B`); the quant/packed-tier install (Q4/Q8 via
+/// `apply_wan_adapters_additive`) is the separate quant-tier story (S19).
+impl AdaptableHost for CausalKreaTransformer {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        // Normalize the Wan reference / diffusers key (`ffn.0`→`ffn.fc1`, …) to the inner converted
+        // [`WanTransformer`] layout, then delegate to its per-block adaptable surface. `q/k/v/o` pass
+        // through unchanged; only the FFN (and the un-exposed globals) rename.
+        let dotted = path.join(".");
+        let native = normalize_wan_key(&dotted);
+        let parts: Vec<&str> = native.split('.').collect();
+        self.inner.adaptable_mut(&parts)
+    }
+
+    fn adaptable_paths(&self) -> Vec<String> {
+        krea_adaptable_paths(self.num_layers)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
+
+    /// A Wan-2.1-14B-T2V style LoRA (musubi-tuner / diffusion-pipe / ComfyUI), once its
+    /// `diffusion_model.`/`transformer.` namespace is stripped, names exactly these per-block dotted
+    /// targets — every one must be an adaptable Krea path or the strict installer would reject the file.
+    /// The FFN is named `ffn.0`/`ffn.2` (the reference layout the file carries; the resolver normalizes
+    /// it to the converted `ffn.fc1`/`ffn.fc2`). Mirrors the SCAIL-2 / Wan target guards.
+    #[test]
+    fn wan_family_style_lora_target_keys_are_adaptable_paths() {
+        let paths: BTreeSet<String> = krea_adaptable_paths(40).into_iter().collect();
+        for k in [
+            "blocks.0.self_attn.q",
+            "blocks.0.self_attn.k",
+            "blocks.0.self_attn.v",
+            "blocks.0.self_attn.o",
+            "blocks.0.cross_attn.q",
+            "blocks.0.cross_attn.o",
+            "blocks.0.ffn.0",
+            "blocks.0.ffn.2",
+            "blocks.39.self_attn.q",
+            "blocks.39.ffn.2",
+        ] {
+            assert!(
+                paths.contains(k),
+                "`{k}` is not an adaptable Krea LoRA target"
+            );
+        }
+        // T2V backbone: no I2V image cross-attn (`k_img`/`v_img`) and no whole-model globals exposed.
+        assert!(!paths.contains("blocks.0.cross_attn.k_img"));
+        assert!(!paths.contains("patch_embedding"));
+        assert!(!paths.contains("head.head"));
+    }
+
+    /// The path set must be duplicate-free AND stay collision-free under the kohya `.`→`_` flattening
+    /// (the [`AdaptableHost::adaptable_paths`] contract — the `flattened → dotted` table would otherwise
+    /// lose a target). 10 per-block Linears × `num_layers`, no globals.
+    #[test]
+    fn krea_adaptable_paths_unique_and_kohya_collision_free() {
+        let paths = krea_adaptable_paths(40);
+        let n = paths.len();
+        assert_eq!(n, 40 * 10);
+        let uniq: BTreeSet<&String> = paths.iter().collect();
+        assert_eq!(uniq.len(), n, "duplicate adaptable path");
+        let flat: BTreeSet<String> = paths.iter().map(|p| p.replace('.', "_")).collect();
+        assert_eq!(flat.len(), n, "kohya-flattened path collision");
+    }
 
     #[test]
     fn end_of_block_math() {

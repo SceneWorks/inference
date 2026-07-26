@@ -12,6 +12,11 @@
 //! carried on [`KreaArConfig`] here so the preset is complete, but they are **not consumed until
 //! S3–S5** (causal attention / KV cache / the AR loop). For S2 the DiT loads into the reused
 //! `mlx_gen_wan` transformer using only the [`WanModelConfig`] half.
+//!
+//! The AR knob defaults and the token-geometry helpers (`max_attention_size` / `sink_tokens` /
+//! `block_size`) are **adapted from** the reference `causal_model.py` (`krea-ai/realtime-video`): the
+//! shipped values are the reference model's published config (facts), and the geometry formulas are
+//! reimplemented from the reference's token-window algebra.
 
 use std::path::Path;
 
@@ -21,7 +26,7 @@ use serde_json::Value;
 
 /// Engine / provider id for Krea Realtime 14B. Distinct from the unrelated **image** crate
 /// `mlx-gen-krea` (Krea 2 Turbo, engine `krea_2_turbo`) — this is the autoregressive **video** model.
-/// Registration under this id is deliberately deferred to S6 (the crate ships no generator yet).
+/// The registered [`Generator`](crate::KreaRealtime) is composed under this id (sc-8439 S6).
 pub const MODEL_ID: &str = "krea_realtime_14b";
 
 /// The autoregressive / self-forcing inference knobs Krea Realtime carries on top of the shared

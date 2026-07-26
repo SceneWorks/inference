@@ -54,7 +54,11 @@ const ROPE_TYPE_DEFAULT: &str = "default";
 /// input dim divisible by 64 (2560 hidden, 4096 q, 1024 kv, 9728 FFN), so one group size covers the
 /// whole encoder — the codebase default, matching the `mlx-gen-krea` / `mlx-gen-z-image` Qwen3
 /// encoders. sc-14046 owns the packer and must pack at the same size.
-pub(crate) const QUANT_GROUP_SIZE: i32 = 64;
+///
+/// **Public** (sc-15154) because it is also the width the *shared* `mlx_gen_boogu::VisionTower` must
+/// be built with for this crate's snapshots — a cross-crate contract, not a private detail — and the
+/// edit-path tier gate asserts against the name rather than a literal `64`.
+pub const QUANT_GROUP_SIZE: i32 = 64;
 
 /// Load the tokenizer from `<root>/text_encoder/tokenizer.json`.
 ///
@@ -165,10 +169,22 @@ pub fn load_multimodal(root: impl AsRef<Path>) -> Result<MageTextEncoder> {
 }
 
 /// As [`load_multimodal`], but addressing the `text_encoder/` directory itself.
+///
+/// The vision tower is handed [`QUANT_GROUP_SIZE`] (64) — the width [`crate::convert`] packs
+/// `model.visual.*` at. Passing it is load-bearing here, unlike in Boogu/Krea whose towers stay
+/// dense: before sc-15154 the shared loader hard-coded Boogu's 32 and so mis-derived the geometry of
+/// every pre-quantized Mage tier — `q4` died on the first vision `quantized_matmul` (in 512 / bits 8
+/// against a 1024-wide input) and `q8` was rejected at load as "corrupt or mis-converted" (bits 16).
+/// Only the 17.5 GB `bf16` tier, whose tower is dense, could edit at all.
 pub fn load_multimodal_dir(dir: impl AsRef<Path>) -> Result<MageTextEncoder> {
     let dir = dir.as_ref();
     let weights = Weights::from_dir(dir)?;
-    let vision = VisionTower::from_weights(&weights, mage_vision_config(), "model.visual")?;
+    let vision = VisionTower::from_weights(
+        &weights,
+        mage_vision_config(),
+        "model.visual",
+        QUANT_GROUP_SIZE,
+    )?;
     Ok(MageTextEncoder::new_multimodal(
         load_tokenizer_dir(dir)?,
         load_lm_dir(dir)?,

@@ -225,6 +225,7 @@ mod tests {
                 "krea_2_raw",
                 "krea_2_control",
                 "lens",
+                "ltx_2_3",
                 "sdxl",
                 "wan2_2_t2v_14b",
                 "z_image_turbo",

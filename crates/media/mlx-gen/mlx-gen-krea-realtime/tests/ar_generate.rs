@@ -19,11 +19,24 @@
 
 use std::collections::HashMap;
 
+use mlx_gen::{CancelFlag, Progress};
 use mlx_gen_krea_realtime::{
-    generate_latents, generate_latents_into, load_krea_realtime_transformer, ArGenParams,
-    CausalKreaTransformer, KreaRealtimeConfig,
+    generate_i2v_latents, generate_latents, generate_latents_conditioned_into,
+    generate_latents_into, generate_v2v_latents, load_krea_realtime_transformer, ArGenParams,
+    CausalKreaTransformer, KreaRealtimeConfig, RefConditioning,
 };
 use mlx_rs::{Array, Dtype};
+
+/// A never-cancelled flag for the deterministic / structure integration tests (per-step cancel is
+/// exercised weight-free at the loop level in `src/generate.rs`; sc-8441 S8).
+fn no_cancel() -> CancelFlag {
+    CancelFlag::new()
+}
+
+/// A no-op progress sink for the integration tests that do not assert on progress.
+fn sink() -> impl FnMut(Progress) {
+    |_| {}
+}
 
 /// A tiny but structurally-complete Krea Realtime / Wan-2.1 geometry (dim 64, 2 heads → head_dim 32,
 /// 2 layers), with a small AR block geometry: `num_frames_per_block = 2`, `frame_seq_length = 4`
@@ -226,7 +239,15 @@ fn generate_latents_shape_and_determinism() {
     let (causal, cfg, ctx) = setup();
 
     // 4 latent frames, fpb 2 ⇒ 2 chunks.
-    let a = generate_latents(&causal, &cfg, &ctx, &params(42, 4, None)).unwrap();
+    let a = generate_latents(
+        &causal,
+        &cfg,
+        &ctx,
+        &params(42, 4, None),
+        &no_cancel(),
+        &mut sink(),
+    )
+    .unwrap();
     assert_eq!(
         a.shape(),
         &[cfg.wan.out_dim as i32, 4, 4, 4],
@@ -235,11 +256,27 @@ fn generate_latents_shape_and_determinism() {
     assert_eq!(a.dtype(), Dtype::Float32);
 
     // Same seed ⇒ bit-identical.
-    let b = generate_latents(&causal, &cfg, &ctx, &params(42, 4, None)).unwrap();
+    let b = generate_latents(
+        &causal,
+        &cfg,
+        &ctx,
+        &params(42, 4, None),
+        &no_cancel(),
+        &mut sink(),
+    )
+    .unwrap();
     assert_eq!(max_abs_diff(&a, &b), 0.0, "same seed must be deterministic");
 
     // Different seed ⇒ different latents.
-    let c = generate_latents(&causal, &cfg, &ctx, &params(43, 4, None)).unwrap();
+    let c = generate_latents(
+        &causal,
+        &cfg,
+        &ctx,
+        &params(43, 4, None),
+        &no_cancel(),
+        &mut sink(),
+    )
+    .unwrap();
     assert!(
         max_abs_diff(&a, &c) > 0.0,
         "a different seed must change the latents"
@@ -255,7 +292,16 @@ fn generate_latents_threads_persistent_kv_cache() {
 
     // 4 frames, fpb 2 ⇒ 2 full chunks.
     let mut cache = causal.new_cache();
-    let out = generate_latents_into(&causal, &cfg, &ctx, &params(7, 4, None), &mut cache).unwrap();
+    let out = generate_latents_into(
+        &causal,
+        &cfg,
+        &ctx,
+        &params(7, 4, None),
+        &mut cache,
+        &no_cancel(),
+        &mut sink(),
+    )
+    .unwrap();
     assert_eq!(out.shape(), &[cfg.wan.out_dim as i32, 4, 4, 4]);
     assert_eq!(
         cache.stored_tokens(),
@@ -266,14 +312,30 @@ fn generate_latents_threads_persistent_kv_cache() {
 
     // 3 frames, fpb 2 ⇒ chunks [2, 1] (partial trailing block).
     let mut cache3 = causal.new_cache();
-    let out3 =
-        generate_latents_into(&causal, &cfg, &ctx, &params(7, 3, None), &mut cache3).unwrap();
+    let out3 = generate_latents_into(
+        &causal,
+        &cfg,
+        &ctx,
+        &params(7, 3, None),
+        &mut cache3,
+        &no_cancel(),
+        &mut sink(),
+    )
+    .unwrap();
     assert_eq!(out3.shape(), &[cfg.wan.out_dim as i32, 3, 4, 4]);
     assert_eq!(cache3.stored_tokens(), 3 * fsl);
 
     // A non-empty cache is rejected (the driver owns the fresh-cache invariant).
-    let err = generate_latents_into(&causal, &cfg, &ctx, &params(7, 4, None), &mut cache)
-        .expect_err("a populated cache must be rejected");
+    let err = generate_latents_into(
+        &causal,
+        &cfg,
+        &ctx,
+        &params(7, 4, None),
+        &mut cache,
+        &no_cancel(),
+        &mut sink(),
+    )
+    .expect_err("a populated cache must be rejected");
     assert!(err.to_string().contains("empty"), "err: {err}");
 }
 
@@ -281,18 +343,42 @@ fn generate_latents_threads_persistent_kv_cache() {
 #[test]
 fn generate_latents_honors_steps_override() {
     let (causal, cfg, ctx) = setup();
-    let out = generate_latents(&causal, &cfg, &ctx, &params(11, 4, Some(3))).unwrap();
+    let out = generate_latents(
+        &causal,
+        &cfg,
+        &ctx,
+        &params(11, 4, Some(3)),
+        &no_cancel(),
+        &mut sink(),
+    )
+    .unwrap();
     assert_eq!(out.shape(), &[cfg.wan.out_dim as i32, 4, 4, 4]);
 
     // A different step count generally yields a different trajectory than the 5-step default.
-    let def = generate_latents(&causal, &cfg, &ctx, &params(11, 4, None)).unwrap();
+    let def = generate_latents(
+        &causal,
+        &cfg,
+        &ctx,
+        &params(11, 4, None),
+        &no_cancel(),
+        &mut sink(),
+    )
+    .unwrap();
     assert!(
         max_abs_diff(&out, &def) > 0.0,
         "a 3-step override should differ from the 5-step default"
     );
 
     // steps = 0 is rejected.
-    assert!(generate_latents(&causal, &cfg, &ctx, &params(11, 4, Some(0))).is_err());
+    assert!(generate_latents(
+        &causal,
+        &cfg,
+        &ctx,
+        &params(11, 4, Some(0)),
+        &no_cancel(),
+        &mut sink()
+    )
+    .is_err());
 }
 
 /// A latent geometry whose per-frame token count disagrees with `frame_seq_length` is rejected up
@@ -309,7 +395,7 @@ fn generate_latents_rejects_geometry_mismatch() {
         latent_width: 4,
         fps: 16,
     };
-    let err = generate_latents(&causal, &cfg, &ctx, &bad)
+    let err = generate_latents(&causal, &cfg, &ctx, &bad, &no_cancel(), &mut sink())
         .expect_err("mismatched per-frame token count must be rejected");
     assert!(err.to_string().contains("frame_seq_length"), "err: {err}");
 }
@@ -334,9 +420,27 @@ fn recompute_commits_clean_context_kv_distinct_from_s4_baseline() {
     let fsl = cfg_on.ar.frame_seq_length;
 
     let mut cache_on = causal.new_cache();
-    let _out_on = generate_latents_into(&causal, &cfg_on, &ctx, &p, &mut cache_on).unwrap();
+    let _out_on = generate_latents_into(
+        &causal,
+        &cfg_on,
+        &ctx,
+        &p,
+        &mut cache_on,
+        &no_cancel(),
+        &mut sink(),
+    )
+    .unwrap();
     let mut cache_off = causal.new_cache();
-    let _out_off = generate_latents_into(&causal, &cfg_off, &ctx, &p, &mut cache_off).unwrap();
+    let _out_off = generate_latents_into(
+        &causal,
+        &cfg_off,
+        &ctx,
+        &p,
+        &mut cache_off,
+        &no_cancel(),
+        &mut sink(),
+    )
+    .unwrap();
 
     // Exactly one commit per chunk in both modes ⇒ identical committed token count.
     assert_eq!(cache_on.stored_tokens(), 2 * fsl);
@@ -386,7 +490,16 @@ fn bounded_window_long_clip_stays_bounded_no_oob() {
 
     // 8 frames, fpb 2 ⇒ 4 chunks; committed 8·fsl = 32 ≫ window 12.
     let mut cache = causal.new_cache();
-    let out = generate_latents_into(&causal, &cfg, &ctx, &params(5, 8, None), &mut cache).unwrap();
+    let out = generate_latents_into(
+        &causal,
+        &cfg,
+        &ctx,
+        &params(5, 8, None),
+        &mut cache,
+        &no_cancel(),
+        &mut sink(),
+    )
+    .unwrap();
 
     assert_eq!(
         out.shape(),
@@ -407,5 +520,265 @@ fn bounded_window_long_clip_stays_bounded_no_oob() {
         "physical KV storage stays bounded to the window (+ at most one chunk): {} (clip {})",
         cache.retained_tokens(),
         8 * fsl
+    );
+}
+
+// ── S7 i2v / v2v conditioning (sc-8440) ──────────────────────────────────────────────────────────
+
+/// A clean (VAE-encoded) reference latent `[in_dim, frames, 4, 4]` (f32) — the stand-in for the still /
+/// source clip the pipeline VAE-encodes before conditioning.
+fn ref_latents(seed: u64, frames: i32) -> Array {
+    det_fill(&[16, frames, 4, 4], seed, 1.0, 0.0)
+        .as_dtype(Dtype::Float32)
+        .unwrap()
+}
+
+fn frame_slice(latents: &Array, start: i32, count: i32) -> Array {
+    let idx: Vec<i32> = (start..start + count).collect();
+    latents
+        .take_axis(Array::from_slice(&idx, &[count]), 1)
+        .unwrap()
+}
+
+/// **i2v**: a VAE-encoded reference still **warms** the KV cache (its clean-context K/V is committed
+/// before generation) and is prepended verbatim to the output, so the generated continuation differs
+/// from a same-seed t2v run — the still actually influences generation (the first generated chunk
+/// attends the warmed reference). Correct output shape; deterministic; a different still ⇒ a different
+/// continuation.
+#[test]
+fn i2v_reference_warms_cache_and_conditions_generation() {
+    let (causal, cfg, ctx) = setup();
+    let reference = ref_latents(314, 1); // one still ⇒ F_ref = 1
+    let reference_b = ref_latents(271, 1);
+    let p = params(42, 2, None); // generate 2 frames
+
+    let t2v = generate_latents(&causal, &cfg, &ctx, &p, &no_cancel(), &mut sink()).unwrap(); // [16, 2, 4, 4]
+    let i2v = generate_i2v_latents(
+        &causal,
+        &cfg,
+        &ctx,
+        &p,
+        &reference,
+        &no_cancel(),
+        &mut sink(),
+    )
+    .unwrap();
+
+    // (b) shape: the reference frame is prepended to the generated continuation.
+    assert_eq!(
+        i2v.shape(),
+        &[16, 3, 4, 4],
+        "F_ref (1) + num_latent_frames (2)"
+    );
+    // The reference frame is copied verbatim into output frame 0.
+    assert_eq!(
+        max_abs_diff(&frame_slice(&i2v, 0, 1), &reference),
+        0.0,
+        "the reference still is prepended verbatim"
+    );
+
+    // (a) DISCRIMINATING: the generated continuation differs from a same-seed t2v run — the ONLY
+    // difference between the two runs is the warmed reference cache, so a difference proves the first
+    // generated chunk attends the reference (the still influences generation).
+    let gen = frame_slice(&i2v, 1, 2);
+    assert!(
+        max_abs_diff(&gen, &t2v) > 1e-4,
+        "the warmed reference must change the generated frames vs t2v"
+    );
+
+    // (c) determinism: same seed ⇒ identical i2v latents.
+    let i2v_again = generate_i2v_latents(
+        &causal,
+        &cfg,
+        &ctx,
+        &p,
+        &reference,
+        &no_cancel(),
+        &mut sink(),
+    )
+    .unwrap();
+    assert_eq!(
+        max_abs_diff(&i2v, &i2v_again),
+        0.0,
+        "same seed ⇒ identical i2v latents"
+    );
+
+    // A different reference ⇒ a different continuation (the still actually conditions generation).
+    let i2v_b = generate_i2v_latents(
+        &causal,
+        &cfg,
+        &ctx,
+        &p,
+        &reference_b,
+        &no_cancel(),
+        &mut sink(),
+    )
+    .unwrap();
+    assert!(
+        max_abs_diff(&gen, &frame_slice(&i2v_b, 1, 2)) > 1e-4,
+        "a different reference still must change the generated continuation"
+    );
+}
+
+/// **Cache-warm correctness**: the reference frames' clean-context K/V populate the cache *before*
+/// generation — after `generate_latents_conditioned_into` the committed count is `(F_ref +
+/// num_latent_frames) · frame_seq_length`, i.e. one commit per reference block (the warm) plus one per
+/// generated block. Mirrors the S5 clean-context commit applied to the reference.
+#[test]
+fn i2v_cache_warm_commits_reference_before_generation() {
+    let (causal, cfg, ctx) = setup();
+    let reference = ref_latents(314, 1);
+    let p = params(42, 2, None);
+    let cond = RefConditioning {
+        context_latents: Some(reference.clone()),
+        source: None,
+    };
+    let mut cache = causal.new_cache();
+    let out = generate_latents_conditioned_into(
+        &causal,
+        &cfg,
+        &ctx,
+        &p,
+        &cond,
+        &mut cache,
+        &no_cancel(),
+        &mut sink(),
+    )
+    .unwrap();
+
+    // Reference block(s) committed by the warm + one commit per generated block.
+    assert_eq!(
+        cache.stored_tokens(),
+        (1 + 2) * cfg.ar.frame_seq_length,
+        "cache holds the warmed reference frame + the generated frames"
+    );
+    assert_eq!(out.shape(), &[16, 3, 4, 4]);
+}
+
+/// **v2v**: a VAE-encoded source clip drives a strength-controlled init. The source and the strength
+/// both influence the output (different source ⇒ different output at a partial strength; strength=0 vs
+/// strength=1 differ), the shape is correct, generation is deterministic, and at `strength = 1` the
+/// source is fully washed out (source-independent — a full regeneration).
+#[test]
+fn v2v_source_and_strength_condition_generation() {
+    let (causal, cfg, ctx) = setup();
+    let source_a = ref_latents(11, 2); // one source frame per generated frame
+    let source_b = ref_latents(22, 2);
+    let p = params(5, 2, None);
+
+    let v_a_half = generate_v2v_latents(
+        &causal,
+        &cfg,
+        &ctx,
+        &p,
+        &source_a,
+        0.5,
+        &no_cancel(),
+        &mut sink(),
+    )
+    .unwrap();
+    assert_eq!(
+        v_a_half.shape(),
+        &[16, 2, 4, 4],
+        "v2v output shape [C, num, H, W]"
+    );
+
+    // (a) a different source ⇒ a different output at a partial strength (the source conditions gen).
+    let v_b_half = generate_v2v_latents(
+        &causal,
+        &cfg,
+        &ctx,
+        &p,
+        &source_b,
+        0.5,
+        &no_cancel(),
+        &mut sink(),
+    )
+    .unwrap();
+    assert!(
+        max_abs_diff(&v_a_half, &v_b_half) > 1e-4,
+        "a different source must change v2v output at strength 0.5"
+    );
+
+    // (b) the strength lever has an effect: strength 0 (keep source) vs strength 1 (regenerate) differ.
+    let v_a_0 = generate_v2v_latents(
+        &causal,
+        &cfg,
+        &ctx,
+        &p,
+        &source_a,
+        0.0,
+        &no_cancel(),
+        &mut sink(),
+    )
+    .unwrap();
+    let v_a_1 = generate_v2v_latents(
+        &causal,
+        &cfg,
+        &ctx,
+        &p,
+        &source_a,
+        1.0,
+        &no_cancel(),
+        &mut sink(),
+    )
+    .unwrap();
+    assert!(
+        max_abs_diff(&v_a_0, &v_a_1) > 1e-4,
+        "strength 0 vs strength 1 must differ"
+    );
+
+    // (c) determinism: same seed + strength ⇒ identical.
+    let v_a_half_2 = generate_v2v_latents(
+        &causal,
+        &cfg,
+        &ctx,
+        &p,
+        &source_a,
+        0.5,
+        &no_cancel(),
+        &mut sink(),
+    )
+    .unwrap();
+    assert_eq!(
+        max_abs_diff(&v_a_half, &v_a_half_2),
+        0.0,
+        "same seed + strength ⇒ identical v2v latents"
+    );
+
+    // (d) strength = 1 washes out the source: the init is pure noise (σ ≈ 1), so different sources
+    // yield the same output — a full regeneration that no longer tracks the source.
+    let v_b_1 = generate_v2v_latents(
+        &causal,
+        &cfg,
+        &ctx,
+        &p,
+        &source_b,
+        1.0,
+        &no_cancel(),
+        &mut sink(),
+    )
+    .unwrap();
+    assert_eq!(
+        max_abs_diff(&v_a_1, &v_b_1),
+        0.0,
+        "strength = 1 is source-independent (the source is fully regenerated)"
+    );
+
+    // A geometry mismatch (source frame count ≠ num_latent_frames) is rejected.
+    let bad_source = ref_latents(33, 3);
+    assert!(
+        generate_v2v_latents(
+            &causal,
+            &cfg,
+            &ctx,
+            &p,
+            &bad_source,
+            0.5,
+            &no_cancel(),
+            &mut sink()
+        )
+        .is_err(),
+        "a source with the wrong frame count is rejected"
     );
 }
