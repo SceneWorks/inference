@@ -578,7 +578,10 @@ impl MageVae {
             .reshape((b * h * w, 256, 32))?;
         let rgb = Tensor::zeros((b * h * w, 256, 3), self.dtype, latent.device())?;
         let dct = Self::dct(latent.device(), self.dtype)?.broadcast_as((b * h * w, 256, 64))?;
-        let mut pixels = self.x_embed.forward(&Tensor::cat(&[rgb, y, dct], 2)?)?;
+        // CUDA matmul requires the concatenated feature tensor to be contiguous. `y` is a
+        // permuted view and `dct` is broadcast, so Candle can otherwise preserve a strided layout.
+        let pixel_features = Tensor::cat(&[rgb, y, dct], 2)?.contiguous()?;
+        let mut pixels = self.x_embed.forward(&pixel_features)?;
         pixels = self.input_proj.forward(&pixels)?;
         // cond_embed is position-major.
         let pos_cond = self

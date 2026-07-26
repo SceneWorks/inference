@@ -97,7 +97,11 @@ fn final_normalized_qwen_conditioning_matches_torch() {
     let root = snapshot();
     let device = test_device();
     let model = MageTextEncoder::load(&root, &device).expect("load Qwen3-VL-4B");
-    let got = model.encode(PROMPT).expect("encode prompt");
+    let got = model
+        .encode(PROMPT)
+        .expect("encode prompt")
+        .squeeze(0)
+        .expect("remove singleton text batch");
     let golden = goldens("mage_flow_te_golden.safetensors", &device);
     let (max_abs, mean_rel) = stats(&got, require(&golden, "gen_txt"));
     assert!(max_abs <= 3.0, "TE max_abs {max_abs} exceeds 3.0");
@@ -117,13 +121,21 @@ fn twelve_block_nr_mmdit_matches_torch() {
     let model = MageTransformer::load(&dir, &cfg, &device).expect("load NR-MMDiT");
     let golden = goldens("mage_flow_dit_golden.safetensors", &device);
     let ints = |key: &str| {
-        require(&golden, key)
+        let tensor = require(&golden, key)
             .to_device(&Device::Cpu)
             .unwrap()
             .flatten_all()
-            .unwrap()
-            .to_vec1::<i32>()
-            .unwrap()
+            .unwrap();
+        match tensor.dtype() {
+            DType::I32 => tensor.to_vec1::<i32>().unwrap(),
+            DType::I64 => tensor
+                .to_vec1::<i64>()
+                .unwrap()
+                .into_iter()
+                .map(|value| i32::try_from(value).expect("golden integer fits i32"))
+                .collect(),
+            dtype => panic!("golden {key} must be I32 or I64, got {dtype:?}"),
+        }
     };
     let shapes = ints("img_shapes")
         .chunks_exact(3)
