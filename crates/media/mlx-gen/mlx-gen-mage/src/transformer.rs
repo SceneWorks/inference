@@ -491,6 +491,20 @@ impl MageTransformer {
 /// inference reload. Paths follow the published diffusers checkpoint naming so a trained adapter's
 /// PEFT keys (`transformer_blocks.{i}.attn.to_q.lora_A.weight`, …) round-trip: the same
 /// `adaptable_paths` that name a target at save time resolve it at load time.
+///
+/// **Every** `Linear` in the DiT is routable (sc-14057), not just the ones our own trainer targets
+/// by default. The block projections cover a SceneWorks-trained adapter; the four *global* leaves —
+/// `img_in`, `txt_in`, `time_text_embed.timestep_embedder.linear_{1,2}` and the output head's
+/// `norm_out.linear` / `proj_out` — exist for **community** adapters, where `target_modules
+/// = "all-linear"` (PEFT's most common preset) trains every one of them. Before sc-14057 the last
+/// three were unroutable: [`apply_adapters_strict`](mlx_gen::adapters::loader::apply_adapters_strict)
+/// would surface them in `unmatched_paths` and **fail the whole file** — loud, never a silent
+/// no-op, but it made an otherwise-valid third-party Mage adapter unusable rather than partially
+/// applied. Enumerating them here also makes them kohya-reachable (the `flattened → dotted` table
+/// is built from this list); Mage is a new family with no upstream `lora_unet_` convention to
+/// mirror, so — unlike the z-image sibling, which must match its fork's mapping — nothing is gained
+/// by withholding them, and the flattened forms stay collision-free (guarded by
+/// `tests/adapter_routing.rs`).
 impl AdaptableHost for MageTransformer {
     fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
         match path {
@@ -500,6 +514,10 @@ impl AdaptableHost for MageTransformer {
                 .blocks
                 .get_mut(n.parse::<usize>().ok()?)?
                 .adaptable_mut(rest),
+            ["time_text_embed", rest @ ..] => self.time_embed.adaptable_mut(rest),
+            // The output head straddles two checkpoint roots (`norm_out.linear` and `proj_out`), so
+            // it matches on the FULL path rather than a stripped remainder.
+            ["norm_out", ..] | ["proj_out", ..] => self.final_layer.adaptable_mut(path),
             _ => None,
         }
     }
@@ -509,6 +527,9 @@ impl AdaptableHost for MageTransformer {
         for (i, block) in self.blocks.iter().enumerate() {
             out.extend(prefixed_paths(&format!("transformer_blocks.{i}"), block));
         }
+        out.extend(prefixed_paths("time_text_embed", &self.time_embed));
+        // Absolute, not prefixed — see the `MageFinalLayer` host impl.
+        out.extend(self.final_layer.adaptable_paths());
         out
     }
 }

@@ -38,6 +38,7 @@
 use mlx_rs::ops::{concatenate_axis, divide, multiply};
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
 use mlx_gen::array::scalar;
 use mlx_gen::weights::Weights;
 use mlx_gen::{nn, Error, Result};
@@ -169,6 +170,28 @@ impl MageTimestepEmbedder {
     }
 }
 
+/// LoRA/LoKr targets on the timestep conditioning (sc-14057). The `Timesteps` half is weightless,
+/// so the only adaptable leaves are the two `TimestepEmbedding` projections — named exactly as the
+/// published checkpoint spells them under the `time_text_embed` root
+/// ([`MageTimestepEmbedder::from_weights`]), which is also how a PEFT `target_modules="all-linear"`
+/// community adapter names them.
+impl AdaptableHost for MageTimestepEmbedder {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["timestep_embedder", "linear_1"] => Some(self.linear_1.adaptable_mut()),
+            ["timestep_embedder", "linear_2"] => Some(self.linear_2.adaptable_mut()),
+            _ => None,
+        }
+    }
+
+    fn adaptable_paths(&self) -> Vec<String> {
+        vec![
+            "timestep_embedder.linear_1".to_string(),
+            "timestep_embedder.linear_2".to_string(),
+        ]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,5 +288,28 @@ mod tests {
     fn a_non_vector_sigma_is_rejected() {
         let bad = Array::from_slice(&[1.0f32, 1.0], &[2, 1]);
         assert!(embedder().forward(&bad).is_err());
+    }
+
+    /// sc-14057: both `TimestepEmbedding` projections are adapter targets, spelled exactly as the
+    /// checkpoint (and a PEFT `all-linear` community adapter) names them. The weightless sinusoid
+    /// half has no target, and a bogus leaf must not resolve.
+    #[test]
+    fn the_timestep_projections_are_routable_adapter_targets() {
+        let mut e = embedder();
+        assert_eq!(
+            e.adaptable_paths(),
+            ["timestep_embedder.linear_1", "timestep_embedder.linear_2"]
+        );
+        for path in e.adaptable_paths() {
+            let segs: Vec<&str> = path.split('.').collect();
+            assert!(
+                e.adaptable_mut(&segs).is_some(),
+                "{path} is enumerated but does not resolve"
+            );
+        }
+        assert!(e
+            .adaptable_mut(&["timestep_embedder", "linear_3"])
+            .is_none());
+        assert!(e.adaptable_mut(&["time_proj"]).is_none());
     }
 }

@@ -24,6 +24,7 @@ use mlx_rs::fast::layer_norm;
 use mlx_rs::ops::split;
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
 use mlx_gen::weights::Weights;
 use mlx_gen::{nn, Error, Result};
 
@@ -101,6 +102,28 @@ impl MageFinalLayer {
     }
 }
 
+/// LoRA/LoKr targets on the output head (sc-14057).
+///
+/// Unlike every other sub-host in this crate, the paths here are **absolute** (rooted at the
+/// transformer), not relative: the head owns two *sibling* checkpoint roots — `norm_out.linear`
+/// (the `AdaLayerNormContinuous` projection) and `proj_out` — so there is no single prefix a parent
+/// could delegate under. [`MageTransformer`](crate::transformer::MageTransformer) therefore matches
+/// on `["norm_out", ..] | ["proj_out", ..]` and forwards the *whole* path, and splices this list in
+/// unprefixed. A PEFT `target_modules="all-linear"` community adapter trains both.
+impl AdaptableHost for MageFinalLayer {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["norm_out", "linear"] => Some(self.norm_linear.adaptable_mut()),
+            ["proj_out"] => Some(self.proj_out.adaptable_mut()),
+            _ => None,
+        }
+    }
+
+    fn adaptable_paths(&self) -> Vec<String> {
+        vec!["norm_out.linear".to_string(), "proj_out".to_string()]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,5 +176,34 @@ mod tests {
                 got[i]
             );
         }
+    }
+
+    /// sc-14057: both head projections are adapter targets, addressed by their **absolute**
+    /// checkpoint paths. `norm_out` alone (the weightless non-affine LayerNorm) is not a target,
+    /// and the head must not answer for a path it does not own.
+    #[test]
+    fn the_head_projections_are_routable_adapter_targets() {
+        let mut w = Weights::empty();
+        for (prefix, out, inp) in [("n.linear", 4, 2), ("p", 2, 2)] {
+            w.insert(
+                format!("{prefix}.weight"),
+                Array::from_slice(&vec![0.0f32; out * inp], &[out as i32, inp as i32]),
+            );
+            w.insert(
+                format!("{prefix}.bias"),
+                Array::from_slice(&vec![0.0f32; out], &[out as i32]),
+            );
+        }
+        let mut head = MageFinalLayer::from_weights(&w, "n", "p").unwrap();
+        assert_eq!(head.adaptable_paths(), ["norm_out.linear", "proj_out"]);
+        for path in head.adaptable_paths() {
+            let segs: Vec<&str> = path.split('.').collect();
+            assert!(
+                head.adaptable_mut(&segs).is_some(),
+                "{path} is enumerated but does not resolve"
+            );
+        }
+        assert!(head.adaptable_mut(&["norm_out"]).is_none());
+        assert!(head.adaptable_mut(&["img_in"]).is_none());
     }
 }
