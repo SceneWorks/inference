@@ -8,6 +8,9 @@ use candle_core::{Error, Result};
 
 pub const FAMILY: &str = "mage_flow";
 pub const MODEL_ID: &str = "mage_flow";
+pub const EDIT_MODEL_ID: &str = "mage_flow_edit";
+pub const EDIT_BASE_MODEL_ID: &str = "mage_flow_edit_base";
+pub const EDIT_TURBO_MODEL_ID: &str = "mage_flow_edit_turbo";
 pub const LATENT_CHANNELS: usize = 128;
 pub const VAE_DOWNSAMPLE: usize = 16;
 pub const HIDDEN_SIZE: usize = 3072;
@@ -24,6 +27,8 @@ pub const MIN_SIZE: u32 = 512;
 pub const MAX_SIZE: u32 = 2048;
 pub const TXT_MAX_LENGTH: usize = 2048;
 pub const DROP_IDX_GEN: usize = 34;
+pub const DROP_IDX_EDIT: usize = 64;
+pub const VL_COND_LONG_EDGE: u32 = 384;
 pub const TE_LAYERS: usize = 36;
 pub const TE_HEADS: usize = 32;
 pub const TE_KV_HEADS: usize = 8;
@@ -33,6 +38,15 @@ pub const TE_ROPE_THETA: f32 = 5_000_000.0;
 pub const PROMPT_TEMPLATE: &str = "<|im_start|>system\nDescribe the image by detailing the \
 color, shape, size, texture, quantity, text, spatial relationships of the objects and \
 background:<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n";
+
+pub const EDIT_PROMPT_TEMPLATE: &str =
+    "<|im_start|>system\nDescribe the key features of the input image (color, shape, size, \
+texture, objects, background), then explain how the user's text instruction should alter or \
+modify the image. Generate a new image that meets the user's requirements while maintaining \
+consistency with the original input where appropriate.<|im_end|>\n<|im_start|>user\n{}\
+<|im_end|>\n<|im_start|>assistant\n";
+
+pub const EDIT_IMAGE_PLACEHOLDER: &str = "<|vision_start|><|image_pad|><|vision_end|>";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MageConfig {

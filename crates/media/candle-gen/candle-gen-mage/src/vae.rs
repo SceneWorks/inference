@@ -269,22 +269,150 @@ struct VaeTime {
 }
 
 impl VaeTime {
-    fn load(w: &Weights) -> Result<Self> {
+    fn load(w: &Weights, prefix: &str) -> Result<Self> {
         Ok(Self {
-            l1: linear(w, "pipeline.t_embedder.mlp.0", true)?,
-            l2: linear(w, "pipeline.t_embedder.mlp.2", true)?,
+            l1: linear(w, &format!("{prefix}.t_embedder.mlp.0"), true)?,
+            l2: linear(w, &format!("{prefix}.t_embedder.mlp.2"), true)?,
         })
     }
-    fn zero(&self, dtype: DType, device: &Device) -> Result<Tensor> {
+    fn zero(&self, batch: usize, dtype: DType, device: &Device) -> Result<Tensor> {
         let input = Tensor::cat(
             &[
-                Tensor::ones((1, 128), DType::F32, device)?,
-                Tensor::zeros((1, 128), DType::F32, device)?,
+                Tensor::ones((batch, 128), DType::F32, device)?,
+                Tensor::zeros((batch, 128), DType::F32, device)?,
             ],
             1,
         )?
         .to_dtype(dtype)?;
         self.l2.forward(&self.l1.forward(&input)?.silu()?)
+    }
+}
+
+struct EncoderCore {
+    c1: Conv2d,
+    c2: Conv2d,
+    c3: Conv2d,
+    ca: Conv2d,
+    c4: Conv2d,
+    c5: Conv2d,
+}
+
+impl EncoderCore {
+    fn load(w: &Weights, prefix: &str, hidden: usize) -> Result<Self> {
+        Ok(Self {
+            c1: conv(w, &format!("{prefix}.conv1"), 1, 0, 1, true)?,
+            c2: conv(w, &format!("{prefix}.conv2"), 1, 1, hidden, true)?,
+            c3: conv(w, &format!("{prefix}.conv3"), 1, 0, 1, true)?,
+            ca: conv(w, &format!("{prefix}.ca.1"), 1, 0, 1, true)?,
+            c4: conv(w, &format!("{prefix}.conv4"), 1, 0, 1, true)?,
+            c5: conv(w, &format!("{prefix}.conv5"), 1, 0, 1, true)?,
+        })
+    }
+
+    fn spatial(&self, x: &Tensor) -> Result<Tensor> {
+        let h = self.c2.forward(&self.c1.forward(x)?)?.gelu_erf()?;
+        let ca = candle_nn::ops::sigmoid(&self.ca.forward(&h.mean_keepdim((2, 3))?)?)?;
+        self.c3.forward(&h.broadcast_mul(&ca)?)
+    }
+
+    fn channel(&self, x: &Tensor) -> Result<Tensor> {
+        self.c5.forward(&self.c4.forward(x)?.gelu_erf()?)
+    }
+}
+
+struct EncoderHeadBlock {
+    core: EncoderCore,
+    norm1: AffineNorm,
+    norm2: AffineNorm,
+}
+
+impl EncoderHeadBlock {
+    fn load(w: &Weights, prefix: &str) -> Result<Self> {
+        Ok(Self {
+            core: EncoderCore::load(w, prefix, 768)?,
+            norm1: AffineNorm::load(w, &format!("{prefix}.norm1"))?,
+            norm2: AffineNorm::load(w, &format!("{prefix}.norm2"))?,
+        })
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let x = (x + self.core.spatial(&self.norm1.layer(x)?)?)?;
+        &x + self.core.channel(&self.norm2.layer(&x)?)?
+    }
+}
+
+pub struct EncoderMoments {
+    pub mean: Tensor,
+    pub logvar: Tensor,
+}
+
+struct MageVaeEncoder {
+    patch_cond: Conv2d,
+    head: Vec<EncoderHeadBlock>,
+    proj_down: Conv2d,
+    z_proj: Conv2d,
+    fuse_proj: Conv2d,
+    time: VaeTime,
+    blocks: Vec<DiCoCore>,
+    norm_out: AffineNorm,
+    proj_out: Conv2d,
+    dtype: DType,
+}
+
+impl MageVaeEncoder {
+    fn load(w: &Weights, dtype: DType) -> Result<Self> {
+        const PREFIX: &str = "student.dconv_encoder";
+        let head = (0..2)
+            .map(|i| EncoderHeadBlock::load(w, &format!("{PREFIX}.head_blocks.{i}")))
+            .collect::<Result<Vec<_>>>()?;
+        let blocks = (0..21)
+            .map(|i| DiCoCore::load(w, &format!("{PREFIX}.blocks.{i}")))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            patch_cond: conv(w, &format!("{PREFIX}.patch_cond_embed"), 16, 0, 1, true)?,
+            head,
+            proj_down: conv(w, &format!("{PREFIX}.proj_down"), 1, 0, 1, true)?,
+            z_proj: conv(w, &format!("{PREFIX}.z_proj"), 1, 0, 1, true)?,
+            fuse_proj: conv(w, &format!("{PREFIX}.fuse_proj"), 1, 0, 1, true)?,
+            time: VaeTime::load(w, PREFIX)?,
+            blocks,
+            norm_out: AffineNorm::load(w, &format!("{PREFIX}.norm_out"))?,
+            proj_out: conv(w, &format!("{PREFIX}.proj_out"), 1, 0, 1, true)?,
+            dtype,
+        })
+    }
+
+    fn moments(&self, image: &Tensor) -> Result<EncoderMoments> {
+        let (b, c, h, w) = image.dims4()?;
+        if c != 3 || !h.is_multiple_of(16) || !w.is_multiple_of(16) {
+            candle_core::bail!(
+                "mage vae encode: expected [B,3,H,W] with H/W divisible by 16, got {:?}",
+                image.dims()
+            );
+        }
+        let mut cond = self.patch_cond.forward(&image.to_dtype(self.dtype)?)?;
+        for block in &self.head {
+            cond = block.forward(&cond)?;
+        }
+        cond = self.proj_down.forward(&cond)?;
+        let z = Tensor::zeros(
+            (b, LATENT_CHANNELS, h / 16, w / 16),
+            self.dtype,
+            image.device(),
+        )?;
+        let z = self.z_proj.forward(&z)?;
+        let mut state = self.fuse_proj.forward(&Tensor::cat(&[cond, z], 1)?)?;
+        let time = self.time.zero(b, self.dtype, image.device())?;
+        for block in &self.blocks {
+            state = block.forward(&state, &time)?;
+        }
+        let packed = self.proj_out.forward(&self.norm_out.layer(&state)?)?;
+        let parts = packed.chunk(2, 1)?;
+        let logvar = parts[1].clamp(-20f64, 10f64)?;
+        Ok(EncoderMoments {
+            mean: parts[0].clone(),
+            logvar,
+        })
     }
 }
 
@@ -324,6 +452,7 @@ impl MlpBlock {
 }
 
 pub struct MageVae {
+    encoder: Option<MageVaeEncoder>,
     cod: CodDecoder,
     time: VaeTime,
     patch_embed: Conv2d,
@@ -341,7 +470,19 @@ pub struct MageVae {
 
 impl MageVae {
     pub fn load(dir: &Path, device: &Device) -> Result<Self> {
-        let w = Weights::from_dir(dir, device, DType::BF16)?;
+        Self::load_inner(dir, device, false, DType::BF16)
+    }
+
+    pub fn load_full(dir: &Path, device: &Device) -> Result<Self> {
+        Self::load_inner(dir, device, true, DType::BF16)
+    }
+
+    pub fn load_full_dtype(dir: &Path, device: &Device, dtype: DType) -> Result<Self> {
+        Self::load_inner(dir, device, true, dtype)
+    }
+
+    fn load_inner(dir: &Path, device: &Device, with_encoder: bool, dtype: DType) -> Result<Self> {
+        let w = Weights::from_dir(dir, device, dtype)?;
         let mut blocks = Vec::with_capacity(21);
         for i in 0..21 {
             blocks.push(DiCoCore::load(&w, &format!("pipeline.blocks.{i}"))?);
@@ -354,8 +495,11 @@ impl MageVae {
             )?);
         }
         Ok(Self {
+            encoder: with_encoder
+                .then(|| MageVaeEncoder::load(&w, dtype))
+                .transpose()?,
             cod: CodDecoder::load(&w)?,
-            time: VaeTime::load(&w)?,
+            time: VaeTime::load(&w, "pipeline")?,
             patch_embed: conv(&w, "pipeline.s_embedder.proj1", 16, 0, 1, false)?,
             patch_fuse: conv(&w, "pipeline.s_embedder.proj2", 1, 0, 1, true)?,
             blocks,
@@ -366,8 +510,22 @@ impl MageVae {
             mlps,
             final_norm: w.get("pipeline.final_layer.norm.weight")?,
             final_linear: linear(&w, "pipeline.final_layer.linear", true)?,
-            dtype: DType::BF16,
+            dtype,
         })
+    }
+
+    pub fn encode_moments(&self, image: &Tensor) -> Result<EncoderMoments> {
+        self.encoder
+            .as_ref()
+            .ok_or_else(|| candle_core::Error::Msg("mage vae encoder was not loaded".into()))?
+            .moments(&image.to_dtype(self.dtype)?)
+    }
+
+    pub fn encode_sample(&self, image: &Tensor, seed: u64) -> Result<Tensor> {
+        let moments = self.encode_moments(image)?;
+        let noise = crate::latent::normal_noise(moments.mean.dims(), seed, moments.mean.device())?
+            .to_dtype(moments.mean.dtype())?;
+        &moments.mean + (moments.logvar.affine(0.5, 0.)?.exp()? * noise)?
     }
 
     fn dct(device: &Device, dtype: DType) -> Result<Tensor> {
@@ -406,7 +564,7 @@ impl MageVae {
         let mut state = self
             .patch_fuse
             .forward(&Tensor::cat(&[patched, cond.clone()], 1)?)?;
-        let t = self.time.zero(self.dtype, latent.device())?;
+        let t = self.time.zero(b, self.dtype, latent.device())?;
         for block in &self.blocks {
             state = block.forward(&state, &t)?;
         }
@@ -420,7 +578,10 @@ impl MageVae {
             .reshape((b * h * w, 256, 32))?;
         let rgb = Tensor::zeros((b * h * w, 256, 3), self.dtype, latent.device())?;
         let dct = Self::dct(latent.device(), self.dtype)?.broadcast_as((b * h * w, 256, 64))?;
-        let mut pixels = self.x_embed.forward(&Tensor::cat(&[rgb, y, dct], 2)?)?;
+        // CUDA matmul requires the concatenated feature tensor to be contiguous. `y` is a
+        // permuted view and `dct` is broadcast, so Candle can otherwise preserve a strided layout.
+        let pixel_features = Tensor::cat(&[rgb, y, dct], 2)?.contiguous()?;
+        let mut pixels = self.x_embed.forward(&pixel_features)?;
         pixels = self.input_proj.forward(&pixels)?;
         // cond_embed is position-major.
         let pos_cond = self

@@ -57,25 +57,118 @@ def evaluate_policy(
 
 
 class CiWorkflowPolicyTests(unittest.TestCase):
-    def test_mage_media_lane_regenerates_complete_cpu_oracles_and_requires_them(self) -> None:
+    def test_mage_media_lane_requires_verified_operator_cpu_oracles(self) -> None:
         workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
         self.assertIn('MAGE_REQUIRE_GOLDENS: "1"', workflow)
         self.assertIn(
             'echo "MAGE_GOLDEN_DIR=$RUNNER_TEMP/mage-flow-oracles" >> "$GITHUB_ENV"',
             workflow,
         )
-        self.assertIn("MAGE_DEVICE=cpu", workflow)
         self.assertIn("scripts/release/provision_mage_oracles.py", workflow)
         self.assertIn("requirements-oracles.txt", workflow)
         self.assertIn("--require-hashes", workflow)
-        self.assertIn('python-version: "3.12.10"', workflow)
-        self.assertNotIn('python-version: "3.12.11"', workflow)
+        self.assertIn("uv python install 3.12.10", workflow)
+        self.assertIn('python_path="$(uv python find 3.12.10)"', workflow)
+        self.assertIn(
+            "UV_CACHE_DIR: ${{ runner.temp }}/uv-cache",
+            workflow,
+        )
+        self.assertIn(
+            "UV_PYTHON_INSTALL_DIR: ${{ runner.temp }}/python-install",
+            workflow,
+        )
+        self.assertNotIn("uses: actions/setup-python", workflow)
+        self.assertNotIn("3.12.11", workflow)
         self.assertIn("Run Mage-Flow text-encoder parity", workflow)
         self.assertIn("Run Mage-VAE all-geometry parity", workflow)
-        self.assertIn("Regenerate Candle Mage 1024² Torch acceptance oracles", workflow)
-        self.assertIn("MAGE_H=1024 MAGE_W=1024 MAGE_STEPS=20", workflow)
-        self.assertIn("tools/dump_mage_flow_golden.py --stage dit", workflow)
+        self.assertNotIn("Regenerate Candle Mage 1024² Torch acceptance oracles", workflow)
+        self.assertNotIn("MAGE_H=1024 MAGE_W=1024 MAGE_STEPS=20", workflow)
+        self.assertNotIn("tools/dump_mage_flow_golden.py --stage dit", workflow)
+        cache_sha = "5a3ec84eff668545956fd18022155c47e93e2684"
+        self.assertIn(f"uses: actions/cache/restore@{cache_sha}", workflow)
+        self.assertIn(f"uses: actions/cache/save@{cache_sha}", workflow)
+        self.assertNotIn("restore-keys:", workflow)
+        self.assertIn("id: mage-oracle-key", workflow)
+        self.assertIn("id: mage-oracle-cache", workflow)
+        self.assertIn("id: mage-oracle-seed", workflow)
+        self.assertIn(
+            "MAGE_ORACLE_SEED_DIR: ${{ vars.MAGE_ORACLE_SEED_DIR }}",
+            workflow,
+        )
+        self.assertIn("refusing to run the multi-hour CPU producer", workflow)
+        self.assertNotIn("Regenerate and verify shared CPU Mage oracles", workflow)
+        self.assertIn(
+            'if [[ ! -f "$source" || -L "$source" ]]',
+            workflow,
+        )
+        for fingerprint_input in (
+            ".github/workflows/real-weights.yml",
+            "crates/media/mlx-gen/_vendor/mage_flow/**",
+            "crates/media/mlx-gen/_vendor/mage_flow/assets/dog.jpg",
+            "crates/media/mlx-gen/_vendor/mage_flow/requirements-oracles.txt",
+            "crates/media/mlx-gen/tools/_paths.py",
+            "crates/media/mlx-gen/tools/dump_mage_flow_golden.py",
+            "crates/media/mlx-gen/tools/dump_mage_vae_sizes.py",
+            "scripts/release/provision_mage_oracles.py",
+            "scripts/release/provision_mage_edit_variants.py",
+            "scripts/release/verify_mage_candle_oracles.py",
+            "scripts/release/verify_mage_candle_transfer.py",
+        ):
+            self.assertIn(fingerprint_input, workflow)
+        for snapshot in (
+            "$MAGE_SNAPSHOT",
+            "$MAGE_EDIT_SNAPSHOT",
+            "$MAGE_EDIT_BASE_SNAPSHOT",
+            "$MAGE_EDIT_TURBO_SNAPSHOT",
+        ):
+            self.assertIn(f'snapshot_revision "{snapshot}"', workflow)
+        self.assertGreaterEqual(
+            workflow.count("steps.mage-oracle-cache.outputs.cache-hit != 'true'"),
+            2,
+        )
+        self.assertIn(
+            "Verify restored or operator-provisioned Mage oracle cache",
+            workflow,
+        )
+        self.assertGreaterEqual(workflow.count("--verify-only"), 2)
+        self.assertIn("--verify-edit-artifact", workflow)
+        self.assertNotIn("--write-manifest", workflow)
+        self.assertIn("mage_candle_oracles_manifest.json", workflow)
+        self.assertGreaterEqual(workflow.count("--edit-snapshot \"$MAGE_EDIT_SNAPSHOT\""), 3)
+        self.assertEqual(workflow.count("--gen \"$MAGE_SNAPSHOT\""), 2)
+        self.assertLess(
+            workflow.index("Verify restored or operator-provisioned Mage oracle cache"),
+            workflow.index("Save verified Mage oracle cache"),
+        )
         self.assertIn("mage-flow-candle-oracles-${{ github.sha }}", workflow)
+        self.assertIn("mage_edit_oracle_manifest.json", workflow)
+        self.assertIn("mage_candle_transfer_manifest.json", workflow)
+        upload_block = workflow[
+            workflow.index("Upload Candle Mage acceptance oracles") :
+            workflow.index("\n  candle-audio:")
+        ]
+        uploaded = set(
+            re.findall(
+                r"\$\{\{ runner\.temp \}\}/mage-flow-oracles/([^\s]+)",
+                upload_block,
+            )
+        )
+        self.assertEqual(
+            uploaded,
+            {
+                "mage_flow_te_golden.safetensors",
+                "mage_flow_dit_golden.safetensors",
+                "mage_flow_vae_f32_1024.safetensors",
+                "mage_flow_e2e_golden.safetensors",
+                "mage_flow_edit_golden.safetensors",
+                "mage_flow_edit_base_golden.safetensors",
+                "mage_flow_edit_turbo_golden.safetensors",
+                "mage_edit_oracle_manifest.json",
+                "mage_edit_variants_manifest.json",
+                "mage_candle_oracles_manifest.json",
+                "mage_candle_transfer_manifest.json",
+            },
+        )
         self.assertIn("mage_flow_dit_golden.safetensors", workflow)
         self.assertIn("mage_flow_e2e_golden.safetensors", workflow)
         self.assertIn("CANDLE_MAGE_SNAPSHOT: ${{ vars.CANDLE_MAGE_SNAPSHOT }}", workflow)
@@ -88,6 +181,34 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             "cargo test --locked --release -p candle-gen-mage --features cuda "
             "--test cuda_1024 -- --ignored --nocapture",
             workflow,
+        )
+        self.assertIn('set "MAGE_CONFORMANCE_FAILED=0"', workflow)
+        self.assertEqual(
+            workflow.count('|| set "MAGE_CONFORMANCE_FAILED=1"'),
+            4,
+        )
+        self.assertIn(
+            'if not "%MAGE_CONFORMANCE_FAILED%"=="0" exit /b 1',
+            workflow,
+        )
+        transferred_verify = workflow.index(
+            "Verify transferred Candle Mage acceptance oracles"
+        )
+        candle_rust_acceptance = workflow.index(
+            "cargo test --locked --release -p candle-gen-mage --features cuda "
+            "--test real_parity"
+        )
+        self.assertLess(transferred_verify, candle_rust_acceptance)
+        self.assertIn('"numpy==2.4.3" "safetensors==0.8.0"', workflow)
+        self.assertIn("--verify-edit-artifact", workflow[transferred_verify:])
+        self.assertIn(
+            "provision_mage_edit_variants.py", workflow[transferred_verify:]
+        )
+        self.assertIn(
+            "verify_mage_candle_oracles.py", workflow[transferred_verify:]
+        )
+        self.assertIn(
+            "verify_mage_candle_transfer.py", workflow[transferred_verify:]
         )
         self.assertNotIn("MAGE_1024_GOLDEN_SHA256", workflow)
         self.assertNotRegex(

@@ -142,6 +142,8 @@ pub const BASE_SNAPSHOT_REVISION: &str = "59a9cfd58cf6ecef28245852c6bdace3f12428
 pub const EDIT_BASE_SNAPSHOT_REVISION: &str = "8654a7bc0283ab2946385230b5b2eb944e0b76ea";
 /// Immutable upstream revision used to establish the Edit-Turbo checkpoint fingerprint.
 pub const EDIT_TURBO_SNAPSHOT_REVISION: &str = "14427bd7627d3a25436497a5939e1096f6a0d523";
+/// Immutable upstream revision used to establish the primary Edit checkpoint fingerprint.
+pub const EDIT_SNAPSHOT_REVISION: &str = "b01d524f86498b7dabcc4b3572c6d264d786a16e";
 const TURBO_IDENTITY_TENSOR: &str = "img_in.weight";
 const BASE_IDENTITY_TENSOR: &str = "transformer_blocks.0.attn.add_k_proj.bias";
 const EDIT_IDENTITY_TENSOR: &str = "transformer_blocks.0.attn.add_k_proj.bias";
@@ -156,6 +158,8 @@ const EDIT_BASE_IDENTITY_SHA256: &str =
     "bb53a04c20e5df443bb093c3f24027f9391f6d65e3edd60ed96546b050db717b";
 const EDIT_TURBO_IDENTITY_SHA256: &str =
     "d387be05845ea0e0fc6b2bec5c05bccb3808c25a0123d9e2b3459e2e7f9705df";
+const EDIT_IDENTITY_SHA256: &str =
+    "bd24b2009764136298499d60750ded8ebdfa7950981d116e9937588471b2ecab";
 
 /// Build a variant's weights-free descriptor.
 ///
@@ -242,6 +246,15 @@ pub fn load(variant: MageVariant, spec: &LoadSpec) -> Result<Box<dyn Generator>>
             EDIT_IDENTITY_BYTES,
             &[3072],
             EDIT_BASE_IDENTITY_SHA256,
+        )?,
+        MageVariant::Edit => verify_checkpoint_identity(
+            root,
+            variant,
+            EDIT_SNAPSHOT_REVISION,
+            EDIT_IDENTITY_TENSOR,
+            EDIT_IDENTITY_BYTES,
+            &[3072],
+            EDIT_IDENTITY_SHA256,
         )?,
         MageVariant::EditTurbo => verify_checkpoint_identity(
             root,
@@ -717,6 +730,13 @@ mod tests {
             )
         };
         check(
+            &edit,
+            MageVariant::Edit,
+            EDIT_SNAPSHOT_REVISION,
+            EDIT_IDENTITY_SHA256,
+        )
+        .unwrap();
+        check(
             &base,
             MageVariant::EditBase,
             EDIT_BASE_SNAPSHOT_REVISION,
@@ -741,6 +761,18 @@ mod tests {
                 )
                 .is_err(),
                 "Edit-Base must reject RL and Turbo transformer weights"
+            );
+        }
+        for wrong in [&base, &turbo] {
+            assert!(
+                check(
+                    wrong,
+                    MageVariant::Edit,
+                    EDIT_SNAPSHOT_REVISION,
+                    EDIT_IDENTITY_SHA256,
+                )
+                .is_err(),
+                "Edit must reject Base and Turbo transformer weights"
             );
         }
         for wrong in [&edit, &base] {
