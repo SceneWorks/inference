@@ -262,6 +262,73 @@ impl SelfAttention {
         self.o.forward(&out)
     }
 
+    /// **Causal cached** self-attention — the Krea Realtime autoregressive delta (sc-8436, S3). Mirrors
+    /// `causal_model.py::CausalWanSelfAttention.forward` (the cached `else` branch): q/k/v are projected
+    /// and qk-RMSNorm'd exactly as [`forward`](Self::forward), the caller-supplied **offset** RoPE
+    /// `cos`/`sin` are applied to q and k (so this chunk's keys carry their global temporal position),
+    /// and this chunk's queries `[B, n, S, d]` attend over `[prev_k ‖ new_k]` / `[prev_v ‖ new_v]` under
+    /// the caller-built block-causal additive `mask` (`0` allowed, `-inf` masked; `None` = every key
+    /// allowed, the single-block AR step).
+    ///
+    /// `prev_k`/`prev_v` are the **already-windowed** cached post-RoPE keys / raw values
+    /// `[B, n, S_prev, d]` from earlier chunks (or `None` for the first chunk) — the cache append/read /
+    /// windowing policy is the caller's (`mlx_gen_krea_realtime`), so the reused Wan attention only
+    /// concatenates + scores. Returns `(out [B, S, dim] bf16, new_k [B, n, S, d] bf16,
+    /// new_v [B, n, S, d] bf16)`: `new_k`/`new_v` are **this chunk's** post-RoPE k / raw v for the
+    /// caller to append to its running cache. Inference-only (no SDPA checkpointing).
+    fn forward_causal(
+        &self,
+        x_mod: &Array,
+        cos: &Array,
+        sin: &Array,
+        prev_k: Option<&Array>,
+        prev_v: Option<&Array>,
+        mask: Option<&Array>,
+    ) -> Result<(Array, Array, Array)> {
+        // q/k/v projection + qk-RMSNorm + offset-RoPE + head split — byte-identical to `forward`.
+        let xw = bf16(x_mod)?;
+        let (n, d) = (self.num_heads as i32, self.head_dim as i32);
+        let b = x_mod.shape()[0];
+        let s = x_mod.shape()[1];
+
+        let q = rms_norm(&self.q.forward(&xw)?, &self.norm_q, self.eps)?;
+        let k = rms_norm(&self.k.forward(&xw)?, &self.norm_k, self.eps)?;
+        let q = bf16(&crate::rope::rope_apply(
+            &f32(&q.reshape(&[b, s, n, d])?)?,
+            cos,
+            sin,
+        )?)?
+        .transpose_axes(&[0, 2, 1, 3])?;
+        let k = bf16(&crate::rope::rope_apply(
+            &f32(&k.reshape(&[b, s, n, d])?)?,
+            cos,
+            sin,
+        )?)?
+        .transpose_axes(&[0, 2, 1, 3])?;
+        let v = self
+            .v
+            .forward(&xw)?
+            .reshape(&[b, s, n, d])?
+            .transpose_axes(&[0, 2, 1, 3])?;
+
+        // Prepend the cached window along the key/value time axis (axis 2) for the SDPA read; the
+        // returned k/v are THIS chunk's only, so the caller owns the running cache growth.
+        let (k_read, v_read) = match (prev_k, prev_v) {
+            (Some(pk), Some(pv)) => (
+                concatenate_axis(&[pk, &k], 2)?,
+                concatenate_axis(&[pv, &v], 2)?,
+            ),
+            _ => (k.clone(), v.clone()),
+        };
+
+        let out = match mask {
+            Some(m) => scaled_dot_product_attention(&q, &k_read, &v_read, self.scale, m, None)?,
+            None => scaled_dot_product_attention(&q, &k_read, &v_read, self.scale, None, None)?,
+        };
+        let out = out.transpose_axes(&[0, 2, 1, 3])?.reshape(&[b, s, n * d])?;
+        Ok((self.o.forward(&out)?, k, v))
+    }
+
     /// Toggle SDPA-segment checkpointing (sc-4942). Training-only — see `ckpt_sdpa`.
     fn set_sdpa_checkpoint(&mut self, on: bool) {
         self.ckpt_sdpa = on;
@@ -491,6 +558,51 @@ impl Block {
         let y = gelu_ffn(&self.ffn_fc1.forward(&bf16(&x_mod)?)?)?;
         let y = self.ffn_fc2.forward(&y)?;
         gated(&x, &y, &e5)
+    }
+
+    /// **Causal cached** block forward — the Krea Realtime AR delta (sc-8436, S3). Identical wiring to
+    /// [`forward`](Self::forward) — the same adaLN-6vec modulation, cross-attention over the cached text
+    /// K/V, and gated-GELU FFN are **reused verbatim** — except the self-attention runs
+    /// [`SelfAttention::forward_causal`] over the persistent KV cache under the block-causal `mask`, with
+    /// the caller's **offset** RoPE. Returns `(x_out [B, S, dim], new_k, new_v)` where `new_k`/`new_v`
+    /// are this chunk's post-RoPE k / raw v `[B, n, S, d]` for the caller to append to layer `i`'s cache.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_causal(
+        &self,
+        x: &Array,
+        e: &Array,
+        kv: &(Array, Array),
+        cos: &Array,
+        sin: &Array,
+        prev_k: Option<&Array>,
+        prev_v: Option<&Array>,
+        mask: Option<&Array>,
+    ) -> Result<(Array, Array, Array)> {
+        // adaLN-6vec modulation — identical to `forward`.
+        let dim = self.self_attn.num_heads as i32 * self.self_attn.head_dim as i32;
+        let m = add(&self.modulation, e)?;
+        let l_e = m.shape()[1];
+        let p = split(&m, 6, 2)?;
+        let v = |i: usize| -> Result<Array> { Ok(p[i].reshape(&[1, l_e, dim])?) };
+        let (e0, e1, e2) = (v(0)?, v(1)?, v(2)?);
+        let (e3, e4, e5) = (v(3)?, v(4)?, v(5)?);
+
+        // Self-attention — the causal cached delta.
+        let x_mod = modulate(&ln(x, self.eps)?, &e1, &e0)?;
+        let (y, new_k, new_v) = self
+            .self_attn
+            .forward_causal(&x_mod, cos, sin, prev_k, prev_v, mask)?;
+        let x = gated(x, &y, &e2)?;
+
+        // Cross-attention (reused verbatim — text context, position-independent).
+        let x_cross = layer_norm(&x, Some(&self.norm3_w), Some(&self.norm3_b), self.eps)?;
+        let x = add(&x, &self.cross_attn.forward(&x_cross, kv)?)?;
+
+        // Gated-GELU FFN (reused verbatim).
+        let x_mod = modulate(&ln(&x, self.eps)?, &e4, &e3)?;
+        let y = gelu_ffn(&self.ffn_fc1.forward(&bf16(&x_mod)?)?)?;
+        let y = self.ffn_fc2.forward(&y)?;
+        Ok((gated(&x, &y, &e5)?, new_k, new_v))
     }
 }
 
@@ -870,6 +982,22 @@ impl WanTransformer {
         Ok((bf16(&cos_t)?, bf16(&sin_t)?))
     }
 
+    /// Precompute the **bf16** RoPE `(cos, sin)` for a chunk grid `(f, h, w)` whose temporal band starts
+    /// at global latent frame `start_frame` — the Krea Realtime causal-AR offset (sc-8436, S3). Thin
+    /// bf16 wrapper over [`RopeTable::precompute_cos_sin_with_frame_offset`]; `start_frame = 0` equals
+    /// [`prepare_rope`](Self::prepare_rope). See that method for the tail-equivalence invariant that
+    /// makes a cached chunk's RoPE match its position in a full-sequence pass.
+    pub fn prepare_rope_with_frame_offset(
+        &self,
+        grid: (usize, usize, usize),
+        start_frame: usize,
+    ) -> Result<(Array, Array)> {
+        let (cos_t, sin_t) = self
+            .rope
+            .precompute_cos_sin_with_frame_offset(grid, start_frame)?;
+        Ok((bf16(&cos_t)?, bf16(&sin_t)?))
+    }
+
     /// Precompute every block's cross-attention K/V from the (CFG-batched) embedded context — call
     /// once per generate, reuse across all steps (mirrors the reference's `prepare_cross_kv`).
     /// `context_batch`: `[B, text_len, dim]` (bf16) from [`embed_text`](Self::embed_text), with the
@@ -1019,6 +1147,55 @@ impl WanTransformer {
             x = block.forward(&x, &e0, kv, cos, sin)?;
         }
         self.apply_head(&x, &e)
+    }
+
+    /// **Causal autoregressive** chunk forward over a persistent per-layer KV cache — the Krea Realtime
+    /// S3 core (sc-8436). Runs the full block stack + output head over a **pre-embedded, pre-broadcast**
+    /// chunk `tokens` `[B, S, dim]` (bf16, from [`patch_embed_tokens`](Self::patch_embed_tokens)),
+    /// reusing every non-self-attention piece of the block verbatim while each block's self-attention
+    /// attends over `[prev_self_kv[i] ‖ this-chunk]` under the caller's block-causal `mask` and **offset**
+    /// RoPE `cos`/`sin` (from [`prepare_rope_with_frame_offset`](Self::prepare_rope_with_frame_offset)).
+    ///
+    /// This is the additive AR analogue of [`forward_packed`](Self::forward_packed): the caller
+    /// (`mlx_gen_krea_realtime`) owns the KV-cache append/read/windowing and mask construction and passes
+    /// the per-layer windowed cache in; `prev_self_kv` is either **empty** (first chunk / full recompute)
+    /// or exactly `num_layers` long. Returns `(velocity [B, S, out_dim·∏patch] f32, new_self_kv)` where
+    /// `new_self_kv[i]` is layer `i`'s **this-chunk** post-RoPE k / raw v `[B, n, S, d]` for the caller
+    /// to append. The scheduler / few-step renoise / AR chunk loop that drives this per block are S4.
+    ///
+    /// Mirrors `causal_model.py::CausalWanModel.forward`'s cached path: patch tokens in → block stack
+    /// with cached causal self-attention → modulated head → per-token velocity out.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_causal_chunk(
+        &self,
+        tokens: &Array,
+        t: f32,
+        cross_kv: &[(Array, Array)],
+        cos: &Array,
+        sin: &Array,
+        prev_self_kv: &[(Array, Array)],
+        mask: Option<&Array>,
+    ) -> Result<(Array, Vec<(Array, Array)>)> {
+        if !prev_self_kv.is_empty() && prev_self_kv.len() != self.blocks.len() {
+            return Err(Error::Msg(format!(
+                "wan causal: prev_self_kv must be empty or one (k,v) per layer ({}), got {}",
+                self.blocks.len(),
+                prev_self_kv.len()
+            )));
+        }
+        let (e, e0) = self.time_embed(t)?;
+        let mut x = tokens.clone();
+        let mut new_self_kv = Vec::with_capacity(self.blocks.len());
+        for (i, (block, kv)) in self.blocks.iter().zip(cross_kv.iter()).enumerate() {
+            let (pk, pv) = match prev_self_kv.get(i) {
+                Some((k, v)) => (Some(k), Some(v)),
+                None => (None, None),
+            };
+            let (xo, nk, nv) = block.forward_causal(&x, &e0, kv, cos, sin, pk, pv, mask)?;
+            x = xo;
+            new_self_kv.push((nk, nv));
+        }
+        Ok((self.apply_head(&x, &e)?, new_self_kv))
     }
 
     /// TI2V **per-token-timestep** batched DiT forward (sc-2680). Identical to [`forward_cached`](

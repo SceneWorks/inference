@@ -57,6 +57,9 @@ fn stub_desc(id: &'static str) -> TrainerDescriptor {
         supports_lora: true,
         supports_lokr: true,
         supports_control: false,
+        // Adapter-only: no full base fine-tune path (sc-14056). The shared
+        // `validate_full_finetune_request` floor makes a `full_finetune` request a typed reject.
+        supports_full_finetune: false,
     }
 }
 
@@ -92,8 +95,9 @@ impl Trainer for StubTrainer {
         if !self.behavior.honest_validate {
             return Ok(());
         }
-        // Route through the shared control-training floor (F-006), like a real family trainer.
+        // Route through the shared capability floors (F-006), like a real family trainer.
         gen_core::train::validate_control_request(&self.desc, req)?;
+        gen_core::train::validate_full_finetune_request(&self.desc, req)?;
         if req.items.is_empty() {
             return Err(Error::Msg("stub trainer: dataset is empty".to_owned()));
         }
