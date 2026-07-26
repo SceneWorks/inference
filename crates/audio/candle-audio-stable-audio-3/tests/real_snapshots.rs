@@ -295,3 +295,104 @@ fn all_eight_configs_and_real_headers_match() {
         assert!(report.num_tensors >= layout.keys.total, "{}", case.env);
     }
 }
+
+#[test]
+#[ignore = "requires the pinned small-music snapshot"]
+fn shipped_dit_config_fails_closed_for_every_unsupported_branch() {
+    let config_path = path("SA3_SMALL_MUSIC_SNAPSHOT").join("model_config.json");
+    let original: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(config_path).unwrap()).unwrap();
+    let mutations: &[(&str, &str, serde_json::Value)] = &[
+        (
+            "logSNR timestep",
+            "/model/diffusion/config/timestep_features_logsnr",
+            true.into(),
+        ),
+        (
+            "prepend global conditioning",
+            "/model/diffusion/config/global_cond_type",
+            "prepend".into(),
+        ),
+        (
+            "mm transformer",
+            "/model/diffusion/config/transformer_type",
+            "mm_transformer".into(),
+        ),
+        (
+            "input concat",
+            "/model/diffusion/config/input_concat_dim",
+            1.into(),
+        ),
+        (
+            "prepend concat",
+            "/model/diffusion/config/prepend_cond_dim",
+            1.into(),
+        ),
+        (
+            "unprojected prompt",
+            "/model/diffusion/config/project_cond_tokens",
+            false.into(),
+        ),
+        (
+            "feature scaling",
+            "/model/diffusion/config/attn_kwargs/feat_scale",
+            true.into(),
+        ),
+        (
+            "conformer",
+            "/model/diffusion/config/conformer",
+            true.into(),
+        ),
+        (
+            "FF convolution",
+            "/model/diffusion/config/ff_kwargs/use_conv",
+            true.into(),
+        ),
+        (
+            "absolute position",
+            "/model/diffusion/config/use_abs_pos_emb",
+            true.into(),
+        ),
+        (
+            "cross RoPE",
+            "/model/diffusion/config/cross_attn_rotary_pos_emb",
+            true.into(),
+        ),
+        (
+            "sliding attention",
+            "/model/diffusion/config/sliding_window",
+            serde_json::json!([1, 1]),
+        ),
+        (
+            "layer scale",
+            "/model/diffusion/config/layer_scale",
+            true.into(),
+        ),
+        (
+            "partial cross attention",
+            "/model/diffusion/config/final_cross_attn_ix",
+            0.into(),
+        ),
+    ];
+    for (label, pointer, replacement) in mutations {
+        let mut value = original.clone();
+        let object = pointer.rsplit_once('/').unwrap();
+        let parent = value
+            .pointer_mut(object.0)
+            .unwrap()
+            .as_object_mut()
+            .unwrap();
+        parent.insert(object.1.into(), replacement.clone());
+        let parsed: StableAudioConfig = serde_json::from_value(value).unwrap();
+        assert!(parsed.validate().is_err(), "{label} must fail closed");
+    }
+
+    let mut modular = original;
+    modular["model"]["diffusion"]["modular_local_cond_configs"] =
+        serde_json::json!([{"id":"future","dim":1}]);
+    let parsed: StableAudioConfig = serde_json::from_value(modular).unwrap();
+    assert!(
+        parsed.validate().is_err(),
+        "modular local conditioning must fail closed"
+    );
+}

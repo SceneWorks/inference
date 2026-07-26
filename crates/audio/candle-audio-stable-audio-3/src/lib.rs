@@ -21,6 +21,7 @@ pub use candle_audio;
 pub use candle_audio::gen_core;
 
 pub mod config;
+pub mod dit;
 pub mod prepare;
 pub mod pretransform;
 pub mod same;

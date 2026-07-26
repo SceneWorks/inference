@@ -176,6 +176,7 @@ impl DiffusionModelConfig {
                 self.conditioning.cond_dim, self.diffusion.config.cond_token_dim
             )));
         }
+        self.conditioning.validate()?;
         self.diffusion.validate()
     }
 }
@@ -484,6 +485,74 @@ pub struct ConditioningConfig {
     pub pre_encoded_keys: Vec<String>,
 }
 
+impl ConditioningConfig {
+    fn validate(&self) -> Result<()> {
+        if self.cond_dim != 768 {
+            return Err(AudioError::Msg(format!(
+                "Stable Audio 3 shipped conditioning expects cond_dim=768, got {}",
+                self.cond_dim
+            )));
+        }
+        if !self.pre_encoded_keys.is_empty() || !self.default_keys.is_empty() {
+            return Err(AudioError::Msg(
+                "Stable Audio 3 pre-encoded/default conditioner branches are unsupported".into(),
+            ));
+        }
+        if self.configs.len() != 2 {
+            return Err(AudioError::Msg(format!(
+                "Stable Audio 3 expects exactly prompt and seconds_total conditioners, got {}",
+                self.configs.len()
+            )));
+        }
+        let mut prompt = false;
+        let mut seconds = false;
+        for conditioner in &self.configs {
+            match conditioner {
+                ConditionerConfig::T5gemma { id, config } if id == "prompt" => {
+                    prompt = true;
+                    if config.max_length != 256
+                        || config.padding_mode != PaddingMode::Learned
+                        || config.enable_grad
+                        || config.project_out
+                    {
+                        return Err(AudioError::Msg(
+                            "Stable Audio 3 prompt conditioner must be the shipped 256-token \
+                             learned-padding, unprojected T5Gemma encoder"
+                                .into(),
+                        ));
+                    }
+                }
+                ConditionerConfig::Number { id, config } if id == "seconds_total" => {
+                    seconds = true;
+                    if config.min_val != 0.0
+                        || config.max_val != 384.0
+                        || config.fourier_features_type != FourierFeaturesType::Expo
+                    {
+                        return Err(AudioError::Msg(
+                            "Stable Audio 3 seconds_total must use the shipped [0,384] Expo \
+                             NumberConditioner"
+                                .into(),
+                        ));
+                    }
+                }
+                _ => {
+                    return Err(AudioError::Msg(
+                        "Stable Audio 3 supports only prompt T5Gemma and seconds_total number \
+                         conditioning"
+                            .into(),
+                    ));
+                }
+            }
+        }
+        if !prompt || !seconds {
+            return Err(AudioError::Msg(
+                "Stable Audio 3 requires prompt and seconds_total conditioners".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ConditionerConfig {
@@ -576,7 +645,34 @@ impl DiffusionConfig {
                 self.config.embed_dim, self.config.num_heads
             )));
         }
-        Ok(())
+        if self.cross_attention_cond_ids != ["prompt", "seconds_total"]
+            || self.global_cond_ids != ["seconds_total"]
+            || self.local_add_cond_ids != ["inpaint_mask", "inpaint_masked_input"]
+        {
+            return Err(AudioError::Msg(
+                "Stable Audio 3 conditioning routes must be cross=[prompt,seconds_total], \
+                 global=[seconds_total], local=[inpaint_mask,inpaint_masked_input]"
+                    .into(),
+            ));
+        }
+        if !self.input_concat_ids.is_empty()
+            || !self.prepend_cond_ids.is_empty()
+            || !self.modular_local_cond_configs.is_empty()
+        {
+            return Err(AudioError::Msg(
+                "Stable Audio 3 input-concat, prepend, and modular-local conditioning branches \
+                 are unsupported"
+                    .into(),
+            ));
+        }
+        if !self.mask_padding_attention || !self.use_effective_length_for_schedule {
+            return Err(AudioError::Msg(
+                "Stable Audio 3 shipped DiTs require mask_padding_attention and \
+                 use_effective_length_for_schedule"
+                    .into(),
+            ));
+        }
+        self.config.validate_shipped()
     }
 
     /// Effective inference-time shift. Upstream supplies this LogSNR setting when the optional
@@ -679,6 +775,10 @@ pub struct DitConfig {
     pub abs_pos_emb_max_length: usize,
     #[serde(default)]
     pub sliding_window: Option<Vec<usize>>,
+    #[serde(default = "default_minus_one")]
+    pub final_cross_attn_ix: isize,
+    #[serde(default)]
+    pub layer_scale: bool,
 }
 
 fn default_one() -> usize {
@@ -692,6 +792,103 @@ fn default_12() -> usize {
 }
 fn default_abs_pos_length() -> usize {
     10_000
+}
+fn default_minus_one() -> isize {
+    -1
+}
+
+impl DitConfig {
+    fn validate_shipped(&self) -> Result<()> {
+        let small = self.embed_dim == 1024
+            && self.depth == 20
+            && self.num_heads == 16
+            && !self.attn_kwargs.differential;
+        let medium = self.embed_dim == 1536
+            && self.depth == 24
+            && self.num_heads == 24
+            && self.attn_kwargs.differential;
+        if !small && !medium {
+            return Err(AudioError::Msg(format!(
+                "Stable Audio 3 supports only shipped small 1024x20 ordinary or medium \
+                 1536x24 differential DiTs, got {}x{} heads={} differential={}",
+                self.embed_dim, self.depth, self.num_heads, self.attn_kwargs.differential
+            )));
+        }
+        if self.io_channels != 256
+            || self.patch_size != 1
+            || self.cond_token_dim != 768
+            || self.global_cond_dim != 768
+            || self.local_add_cond_dim != Some(257)
+            || self.input_concat_dim != 0
+            || self.prepend_cond_dim != 0
+        {
+            return Err(AudioError::Msg(
+                "Stable Audio 3 shipped DiT dimensions are io=256, patch=1, cond/global=768, \
+                 local=257 with no input/prepend concat"
+                    .into(),
+            ));
+        }
+        if self.transformer_type != TransformerType::ContinuousTransformer
+            || self.global_cond_type != GlobalConditioningType::AdaLn
+            || self.timestep_cond_type != TimestepConditioningType::Global
+            || self.timestep_embed_dim.is_some()
+            || self.timestep_features_type != FourierFeaturesType::Expo
+            || self.timestep_features_dim != 256
+            || self.timestep_features_logsnr
+        {
+            return Err(AudioError::Msg(
+                "Stable Audio 3 requires continuous AdaLN global conditioning and direct \
+                 256-dimensional Expo timestep features"
+                    .into(),
+            ));
+        }
+        if !self.project_cond_tokens
+            || !self.project_global_cond
+            || self.attn_kwargs.qk_norm != QkNorm::Rms
+            || self.attn_kwargs.qk_norm_eps != 1e-6
+            || self.attn_kwargs.feat_scale
+            || self.norm_type != NormType::RmsNorm
+            || !self.norm_kwargs.force_fp32
+            || self.norm_kwargs.fix_scale
+            || self.norm_kwargs.eps != 1e-5
+        {
+            return Err(AudioError::Msg(
+                "Stable Audio 3 requires projected conditioning, RMS block/QK norms, and \
+                 force-fp32 block normalization"
+                    .into(),
+            ));
+        }
+        if self.ff_kwargs.mult != 4.0
+            || self.ff_kwargs.no_bias
+            || !self.ff_kwargs.glu
+            || self.ff_kwargs.use_conv
+            || !self.ff_kwargs.zero_init_output
+            || self.ff_kwargs.sinusoidal
+        {
+            return Err(AudioError::Msg(
+                "Stable Audio 3 requires the shipped biased linear GLU feed-forward".into(),
+            ));
+        }
+        if self.num_memory_tokens != 64
+            || !self.rotary_pos_emb
+            || self.cross_attn_rotary_pos_emb
+            || !self.zero_init_branch_outputs
+            || self.conformer
+            || self.causal
+            || self.use_sinusoidal_emb
+            || self.use_abs_pos_emb
+            || self.sliding_window.is_some()
+            || self.final_cross_attn_ix != -1
+            || self.layer_scale
+        {
+            return Err(AudioError::Msg(
+                "Stable Audio 3 supports only 64-memory-token global RoPE blocks with every \
+                 layer cross-attending and no conformer/positional/sliding/layer-scale branches"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
