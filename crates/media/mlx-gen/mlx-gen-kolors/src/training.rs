@@ -191,6 +191,9 @@ fn trainer_descriptor() -> TrainerDescriptor {
         supports_lokr: true,
         // LoRA/LoKr only — no control-branch training path (F-006).
         supports_control: false,
+        // Adapter-only: no full base fine-tune path (sc-14056). The shared
+        // `validate_full_finetune_request` floor makes a `full_finetune` request a typed reject.
+        supports_full_finetune: false,
     }
 }
 
@@ -245,6 +248,9 @@ impl Trainer for KolorsTrainer {
         // Shared control-training floor (F-006): a LoRA-only trainer must reject a control-branch
         // request (typed `Unsupported`) rather than silently training a plain adapter.
         gen_core::train::validate_control_request(self.descriptor(), req)?;
+        // Shared full-base-fine-tune floor (sc-14056): an adapter-only trainer must reject a
+        // `full_finetune` request (typed `Unsupported`) rather than silently training a LoRA.
+        gen_core::train::validate_full_finetune_request(self.descriptor(), req)?;
         if req.items.is_empty() {
             return Err("kolors trainer: dataset is empty".into());
         }

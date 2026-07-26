@@ -32,6 +32,7 @@ pub mod audio_vae;
 pub mod config;
 pub mod connector;
 pub mod conv3d;
+pub mod dit_train;
 pub mod gemma;
 pub mod pipeline;
 pub mod quant;

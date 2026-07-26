@@ -57,6 +57,12 @@ pub mod config;
 pub mod memory;
 pub mod model;
 
+// --- Physical per-tier quant artifacts (sc-14980) --------------------------------------------
+// `quant` is the Group-B packed-load template (sc-8669); `convert` is the offline producer that
+// writes the `q4/`/`q8/`/`bf16/` artifacts the SceneWorks mirrors host.
+pub mod convert;
+pub(crate) mod quant;
+
 // --- NR-MMDiT (sc-14040) -------------------------------------------------------------------
 pub mod attention;
 pub mod feed_forward;
@@ -111,7 +117,7 @@ pub use latent::{
 // sc-14041 (pipeline + the loaded model) re-exports here:
 pub use pipeline::{
     mage_flow_sigmas, BatchGenerationTrace, EditTrace, GenerationPack, GenerationSample,
-    GenerationTrace, MageFlowPipeline, MAX_PACKED_IMAGE_TOKENS, STATIC_SHIFT,
+    GenerationTrace, MageComponentDirs, MageFlowPipeline, MAX_PACKED_IMAGE_TOKENS, STATIC_SHIFT,
 };
 
 // sc-14055 (LoRA/LoKr reload + rectified-flow trainer):

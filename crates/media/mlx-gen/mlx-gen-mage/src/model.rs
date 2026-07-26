@@ -36,6 +36,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use crate::config::{FAMILY, MAX_SIZE, MIN_SIZE, SIZE_MULTIPLE};
+use crate::pipeline::MageComponentDirs;
 use crate::{resolve_gs_key, GenerationSample, MageFlowPipeline};
 
 /// Which published checkpoint a registered id serves.
@@ -144,14 +145,24 @@ pub const EDIT_BASE_SNAPSHOT_REVISION: &str = "8654a7bc0283ab2946385230b5b2eb944
 pub const EDIT_TURBO_SNAPSHOT_REVISION: &str = "14427bd7627d3a25436497a5939e1096f6a0d523";
 /// Immutable upstream revision used to establish the primary Edit checkpoint fingerprint.
 pub const EDIT_SNAPSHOT_REVISION: &str = "b01d524f86498b7dabcc4b3572c6d264d786a16e";
-const TURBO_IDENTITY_TENSOR: &str = "img_in.weight";
+// Every identity tensor is a **bias**, deliberately (sc-14980). Biases are never quantized, so a
+// bias fingerprint is byte-identical in the dense flat snapshot and in every pre-quantized
+// `<tier>/transformer/` artifact — one pinned hash per variant verifies all three tiers, with no
+// per-tier constant and no weakening of the check on the packed path.
+//
+// Turbo previously pinned `img_in.weight`, which the Q4/Q8 packs rewrite into u32 codes; that hash
+// could not survive a tier artifact. `transformer_blocks.0.attn.add_k_proj.bias` replaces it and is
+// strictly stronger: measured over all six published checkpoints its first 4096 bytes yield **six
+// distinct** digests, so this one tensor discriminates every variant (`img_in.bias`, by contrast,
+// collides Base with RL and Edit-Base with Edit).
+const TURBO_IDENTITY_TENSOR: &str = "transformer_blocks.0.attn.add_k_proj.bias";
 const BASE_IDENTITY_TENSOR: &str = "transformer_blocks.0.attn.add_k_proj.bias";
 const EDIT_IDENTITY_TENSOR: &str = "transformer_blocks.0.attn.add_k_proj.bias";
 const TURBO_IDENTITY_BYTES: usize = 4096;
 const BASE_IDENTITY_BYTES: usize = 4096;
 const EDIT_IDENTITY_BYTES: usize = 4096;
 const TURBO_IDENTITY_SHA256: &str =
-    "c71e8cd69c9128887ceb2de9a29917e4eb704a052813b19b02b51f363258bd5c";
+    "52d3e3d2bcbb655f4575b71757081da3406dd13e5c58ef73173e070ff1c4767f";
 const BASE_IDENTITY_SHA256: &str =
     "c6597b08e4efe45f7bbb5d2470c68e7975d71ca26dce13a1fb34db18ca6a9e3e";
 const EDIT_BASE_IDENTITY_SHA256: &str =
@@ -170,9 +181,13 @@ const EDIT_IDENTITY_SHA256: &str =
 /// the published configs.
 pub fn descriptor_for(variant: MageVariant) -> ModelDescriptor {
     ModelDescriptor {
-        // The diffusers component tree (`transformer/`, `vae/`, `text_encoder/`, `scheduler/`)
-        // arrives as one `WeightsSource::Dir`; no extra caller-provisioned components.
-        required_components: &[],
+        // The text encoder (8.875 GB) and VAE (0.345 GB) are BIT-IDENTICAL across all six Mage
+        // variants — only the 8.232 GB DiT differs — so the SceneWorks mirrors host them once in a
+        // shared components repo and stage them as caller-provisioned co-requisite dirs
+        // (sc-14979): 58.65 GB for a full six-variant install instead of 105.04 GB. The DiT still
+        // arrives as the base `WeightsSource::Dir`. A spec that stages neither falls back to the
+        // flat published layout — see `resolve_component_dirs`.
+        required_components: REQUIRED_COMPONENTS,
         id: variant.id(),
         family: FAMILY,
         backend: "mlx",
@@ -235,7 +250,7 @@ pub fn load(variant: MageVariant, spec: &LoadSpec) -> Result<Box<dyn Generator>>
             TURBO_SNAPSHOT_REVISION,
             TURBO_IDENTITY_TENSOR,
             TURBO_IDENTITY_BYTES,
-            &[3072, 128],
+            &[3072],
             TURBO_IDENTITY_SHA256,
         )?,
         MageVariant::EditBase => verify_checkpoint_identity(
@@ -267,17 +282,60 @@ pub fn load(variant: MageVariant, spec: &LoadSpec) -> Result<Box<dyn Generator>>
         )?,
         _ => {}
     }
-    let pipeline = if variant.is_edit() {
-        MageFlowPipeline::load_edit(root, spec.quantize.map(Quant::bits))?
+    let dirs = resolve_component_dirs(root, spec)?;
+    let part = if variant.is_edit() {
+        crate::vae::VaePart::Both
     } else {
-        MageFlowPipeline::load_with_quant(root, spec.quantize.map(Quant::bits))?
+        crate::vae::VaePart::Decode
     };
+    let pipeline = MageFlowPipeline::load_components(&dirs, spec.quantize.map(Quant::bits), part)?;
     Ok(Box::new(MageFlow {
         variant,
         descriptor: descriptor_for(variant),
         tier: spec.quantize,
         pipeline,
     }))
+}
+
+/// The caller-provisioned component ids Mage-Flow advertises (sc-14979).
+pub const COMPONENT_TEXT_ENCODER: &str = "text_encoder";
+/// The caller-provisioned VAE component id (sc-14979).
+pub const COMPONENT_VAE: &str = "vae";
+/// Both shared components, in descriptor order.
+pub const REQUIRED_COMPONENTS: &[&str] = &[COMPONENT_TEXT_ENCODER, COMPONENT_VAE];
+
+/// Resolve where each component's weights live for this load.
+///
+/// **Split layout (the SceneWorks mirrors, sc-14980/sc-14979).** `spec.weights` is the variant's
+/// per-tier dir (`<variant snapshot>/<tier>/`), holding the DiT alone; the text encoder and VAE —
+/// bit-identical across all six variants — are staged by the caller in [`LoadSpec::components`] as
+/// exact component dirs resolved from the shared components mirror. Six installs cost 58.65 GB
+/// instead of 105.04 GB.
+///
+/// **Flat layout (upstream snapshots, existing installs, arbitrary user paths).** No components are
+/// staged and every component sits directly under `spec.weights`. This fallback is why the split is
+/// not a breaking change: a repo/revision without tier subdirs, and every `#[ignore]`d real-weights
+/// test that points at a raw `microsoft/Mage-Flow*` snapshot, keeps loading unchanged.
+///
+/// The two are distinguished per component, not globally, so a partially-staged spec is still
+/// coherent. Unknown component ids are rejected rather than ignored.
+pub(crate) fn resolve_component_dirs(root: &Path, spec: &LoadSpec) -> Result<MageComponentDirs> {
+    mlx_gen::gen_core::reject_unknown_components(spec, REQUIRED_COMPONENTS, FAMILY)?;
+    let staged = |id: &str, fallback: &str| -> Result<std::path::PathBuf> {
+        match spec.components.get(id) {
+            Some(WeightsSource::Dir(dir)) => Ok(dir.clone()),
+            Some(WeightsSource::File(file)) => Err(Error::Msg(format!(
+                "mage_flow: the '{id}' component must be staged as a directory, got the file {}",
+                file.display()
+            ))),
+            None => Ok(root.join(fallback)),
+        }
+    };
+    Ok(MageComponentDirs {
+        transformer: root.join("transformer"),
+        text_encoder: staged(COMPONENT_TEXT_ENCODER, "text_encoder")?,
+        vae: staged(COMPONENT_VAE, "vae")?,
+    })
 }
 
 /// Verify bytes from a weight-bearing tensor, not a path or model-card label.

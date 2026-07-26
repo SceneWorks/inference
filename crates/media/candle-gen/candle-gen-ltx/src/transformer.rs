@@ -94,8 +94,8 @@ impl Attention {
             to_k: linear(&vb, "to_k")?,
             to_v: linear(&vb, "to_v")?,
             to_out: linear(&vb, "to_out.0")?,
-            q_norm: vb.get_unchecked("q_norm.weight")?.to_dtype(DType::BF16)?,
-            k_norm: vb.get_unchecked("k_norm.weight")?.to_dtype(DType::BF16)?,
+            q_norm: vb.get_unchecked("q_norm.weight")?.to_dtype(vb.dtype())?,
+            k_norm: vb.get_unchecked("k_norm.weight")?.to_dtype(vb.dtype())?,
             gate: linear(&vb, "to_gate_logits")?,
             heads,
             dim_head,
@@ -164,7 +164,7 @@ impl Attention {
         let mut out = out
             .transpose(1, 2)?
             .reshape((b, s, inner))?
-            .to_dtype(DType::BF16)?;
+            .to_dtype(x.dtype())?;
         // Per-head gate: 2·sigmoid(logits) (zero-init → identity).
         let logits = self.gate.forward(x)?;
         let gates = (sigmoid(&logits)? * 2.0)?.reshape((b, s, self.heads, 1))?;
@@ -198,6 +198,7 @@ struct AdaLayerNormSingle {
     ts_lin1: QLinear,
     ts_lin2: QLinear,
     linear: QLinear,
+    dtype: DType,
 }
 
 impl AdaLayerNormSingle {
@@ -206,13 +207,14 @@ impl AdaLayerNormSingle {
             ts_lin1: linear(&vb.pp("emb.timestep_embedder"), "linear_1")?,
             ts_lin2: linear(&vb.pp("emb.timestep_embedder"), "linear_2")?,
             linear: linear(&vb, "linear")?,
+            dtype: vb.dtype(),
         })
     }
 
     /// `ts_flat` is `[N]` f32 (already scaled). Returns `(scale_shift [N, coeff·inner], embedded
     /// [N, inner])`, bf16.
     fn forward(&self, ts_flat: &Tensor, device: &Device) -> Result<(Tensor, Tensor)> {
-        let proj = timestep_embedding(ts_flat, device)?.to_dtype(DType::BF16)?;
+        let proj = timestep_embedding(ts_flat, device)?.to_dtype(self.dtype)?;
         let h = self.ts_lin1.forward(&proj)?.silu()?;
         let embedded = self.ts_lin2.forward(&h)?;
         let scale_shift = self.linear.forward(&embedded.silu()?)?;
@@ -258,6 +260,7 @@ struct AvStream {
     inner: usize,
     coeff: usize, // adaLN row count (9 gated)
     eps: f64,
+    dtype: DType,
 }
 
 impl AvStream {
@@ -280,11 +283,12 @@ impl AvStream {
             prompt_adaln: AdaLayerNormSingle::load(vb.pp(prompt))?,
             cross_ss_adaln: AdaLayerNormSingle::load(vb.pp(cross_ss))?,
             cross_gate_adaln: AdaLayerNormSingle::load(vb.pp(cross_gate))?,
-            scale_shift_table: vb.get_unchecked(sst)?.to_dtype(DType::BF16)?,
+            scale_shift_table: vb.get_unchecked(sst)?.to_dtype(vb.dtype())?,
             proj_out: linear(vb, proj_out)?,
             inner,
             coeff: 9,
             eps,
+            dtype: vb.dtype(),
         })
     }
 
@@ -375,7 +379,7 @@ impl AvBlock {
         let eps = cfg.video.norm_eps;
         let (vh, vdh) = (cfg.video.num_heads, cfg.video.head_dim);
         let (ah, adh) = (cfg.audio_heads, cfg.audio_head_dim);
-        let bf = |k: &str| -> Result<Tensor> { vb.get_unchecked(k)?.to_dtype(DType::BF16) };
+        let bf = |k: &str| -> Result<Tensor> { vb.get_unchecked(k)?.to_dtype(vb.dtype()) };
         // Split a (5, dim) cross table → 4-row scale-shift + 1-row gate.
         let split = |key: &str| -> Result<(Tensor, Tensor)> {
             let t = bf(key)?;
@@ -684,13 +688,13 @@ impl AvDiT {
         let mut vx = self
             .video
             .patchify
-            .forward(&video_latent.to_dtype(DType::BF16)?)?;
+            .forward(&video_latent.to_dtype(self.video.dtype)?)?;
         let mut ax = self
             .audio
             .patchify
-            .forward(&audio_latent.to_dtype(DType::BF16)?)?;
-        let v_ctx = video_context.to_dtype(DType::BF16)?;
-        let a_ctx = audio_context.to_dtype(DType::BF16)?;
+            .forward(&audio_latent.to_dtype(self.audio.dtype)?)?;
+        let v_ctx = video_context.to_dtype(self.video.dtype)?;
+        let a_ctx = audio_context.to_dtype(self.audio.dtype)?;
 
         let va = AvStreamArgs {
             ts_emb: &v_ts.ts_emb,
@@ -723,5 +727,63 @@ impl AvDiT {
         let v_vel = self.video.output_head(&vx, &v_ts.emb_ts)?;
         let a_vel = self.audio.output_head(&ax, &a_ts.emb_ts)?;
         Ok((v_vel, a_vel))
+    }
+
+    /// The inference `AvDiT`'s video-only reduction used by LoRA training: video patch/timestep
+    /// preparation, then each block's video self-attention, text cross-attention and feed-forward
+    /// branches, followed by the video velocity head. Audio and bidirectional cross-modal branches
+    /// are deliberately absent, matching the reference trainer's `audio=None` path.
+    pub fn forward_video_only(
+        &self,
+        video_latent: &Tensor,
+        sigma: f64,
+        video_context: &Tensor,
+        video_grid: &Tensor,
+    ) -> Result<Tensor> {
+        let b = video_latent.dim(0)?;
+        let v_ts = self.video.ts_embeds(
+            sigma,
+            self.cfg.video.timestep_scale_multiplier,
+            b,
+            &self.device,
+        )?;
+        let (v_cos, v_sin) = precompute_split_freqs_nd(
+            video_grid,
+            self.cfg.video.inner_dim(),
+            self.cfg.video.rope_theta,
+            &self.cfg.video.rope_max_pos,
+            self.cfg.video.num_heads,
+            &self.device,
+        )?;
+        let mut vx = self
+            .video
+            .patchify
+            .forward(&video_latent.to_dtype(self.video.dtype)?)?;
+        let v_ctx = video_context.to_dtype(self.video.dtype)?;
+        // The video-only path never consumes the cross-modal fields. Reuse the self-RoPE/timestep
+        // tensors to keep this borrowed argument bundle allocation-free.
+        let va = AvStreamArgs {
+            ts_emb: &v_ts.ts_emb,
+            prompt_ts: &v_ts.prompt_ts,
+            context: &v_ctx,
+            cos: &v_cos,
+            sin: &v_sin,
+            cross_cos: &v_cos,
+            cross_sin: &v_sin,
+            cross_ss_ts: &v_ts.cross_ss_ts,
+            cross_gate_ts: &v_ts.cross_gate_ts,
+        };
+        for block in &self.blocks {
+            vx = block.self_and_text(
+                &vx,
+                &block.attn1,
+                &block.attn2,
+                &block.v_sst,
+                &block.v_pst,
+                &va,
+            )?;
+            vx = block.feed_forward(&vx, &block.ff, &block.v_sst, &v_ts.ts_emb)?;
+        }
+        self.video.output_head(&vx, &v_ts.emb_ts)
     }
 }
