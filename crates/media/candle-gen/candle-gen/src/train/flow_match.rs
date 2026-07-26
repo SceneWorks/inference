@@ -50,7 +50,9 @@ use crate::gen_core::train::{
     NetworkType, TrainingConfig, TrainingOutput, TrainingProgress, TrainingRequest,
 };
 use crate::gen_core::Image;
-use crate::train::checkpoint::{checkpoint_filename, file_stem};
+use crate::train::checkpoint::{
+    checkpoint_filename, file_stem, find_latest_resume, load_resume, save_resume,
+};
 use crate::train::lora::{
     build_lokr_targets, build_lora_targets, save_lokr, save_lora_peft, AdapterKind, LoraHost,
     LoraSet,
@@ -411,6 +413,13 @@ pub trait FlowMatchTrainer {
     /// The family's default LoRA target suffixes (used when the request leaves the target list empty).
     fn default_targets(&self) -> &'static [&'static str];
 
+    /// Cheap, pre-cache validation for family-specific resource guards. Called before any encoder or
+    /// VAE is loaded so an unsafe dense-backward request fails catchably rather than OOM-killing the
+    /// process after minutes of caching.
+    fn preflight(&self, _req: &TrainingRequest) -> Result<()> {
+        Ok(())
+    }
+
     /// Cache the dataset: encode each item's latent + conditioning (reporting
     /// [`TrainingProgress::Caching`]) and return the per-sample cache plus any run-derived `Aux` and a
     /// [`SamplePlan`]. Honors `req.cancel` (a cancel mid-cache yields a short/empty cache; the driver maps
@@ -481,6 +490,15 @@ pub trait FlowMatchTrainer {
     }
 }
 
+fn validate_resume_step(label: &str, restored: u32, requested: u32) -> Result<()> {
+    if restored > requested {
+        return Err(CandleError::Msg(format!(
+            "{label}: resume snapshot step {restored} exceeds requested total steps {requested}"
+        )));
+    }
+    Ok(())
+}
+
 /// Drive a single-model flow-match trainer end to end: cache → install adapters → train loop → save.
 ///
 /// Owns the loop scaffolding every single-model trainer shared verbatim — optimizer + LR-schedule
@@ -498,6 +516,7 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
     let cfg = &req.config;
     let device = model.device();
     on_progress(TrainingProgress::Preparing);
+    model.preflight(req)?;
 
     // --- cache (latents + conditioning); the encoders load and drop inside the hook ---
     on_progress(TrainingProgress::LoadingModel);
@@ -528,16 +547,30 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
     let (total_updates, warmup_updates) = schedule_updates(cfg.steps, accum, cfg.lr_warmup_steps);
     let stem = file_stem(&req.file_name).to_string();
 
+    // --- optional full-state resume ---
+    let mut start_step = 0u32;
+    let mut update_idx = 0u32;
+    if cfg.resume {
+        if let Some((snapshot, _)) = find_latest_resume(&req.output_dir, &stem) {
+            let restored = load_resume(&snapshot, &mut opt, &set, cfg)?;
+            validate_resume_step(T::LABEL, restored.step, cfg.steps)?;
+            start_step = restored.step;
+            update_idx = restored.update_idx;
+        }
+    }
+
     // --- train loop ---
     let mut accumulated: Option<GradStore> = None;
     // Micro-grads accumulated into the CURRENT (not-yet-flushed) window. Resets to 0 on each flush; at
     // a full boundary it equals `accum`, and whatever it holds when the loop ends is the sub-`accum`
     // remainder the final flush must divide by (F-034, sc-9018).
     let mut pending = 0u32;
-    let mut update_idx = 0u32;
     let mut last_loss = 0.0f32;
-    let mut steps_run = 0u32;
-    for step in 1..=cfg.steps {
+    let mut steps_run = start_step;
+    // A PEFT checkpoint cadence may fall mid-accumulation. Delay the corresponding resume bundle
+    // until the next completed optimizer boundary instead of snapshotting without pending grads.
+    let mut resume_due = false;
+    for step in start_step.saturating_add(1)..=cfg.steps {
         if req.cancel.is_cancelled() {
             break;
         }
@@ -628,7 +661,14 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
             create_output_dir(&req.output_dir)?;
             let ckpt = req.output_dir.join(checkpoint_filename(&stem, step));
             model.save(&set, &ckpt)?;
+            resume_due = true;
             on_progress(TrainingProgress::Checkpoint { step });
+        }
+        // A resume bundle is exact only at a completed optimizer-update boundary. If its requested
+        // cadence occurred mid-window, this fires at the first later boundary.
+        if resume_due && pending == 0 {
+            save_resume(&req.output_dir, &stem, step, update_idx, &opt, &set, cfg)?;
+            resume_due = false;
         }
     }
 
@@ -651,6 +691,17 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
             total_updates,
             warmup_updates,
         )?;
+        if resume_due {
+            save_resume(
+                &req.output_dir,
+                &stem,
+                steps_run,
+                update_idx + 1,
+                &opt,
+                &set,
+                cfg,
+            )?;
+        }
     }
 
     // --- save final adapter ---
@@ -758,6 +809,13 @@ mod tests {
             assert_ne!(timestep_seed(42, step), noise_seed(42, step));
             assert_ne!(timestep_seed(42, step), timestep_seed(42, step + 1));
         }
+    }
+
+    #[test]
+    fn resume_step_cannot_exceed_requested_schedule() {
+        validate_resume_step("mock", 4, 4).unwrap();
+        let err = validate_resume_step("mock", 5, 4).unwrap_err().to_string();
+        assert!(err.contains("exceeds requested total steps"), "{err}");
     }
 
     // --- A mock single-model trainer exercising the Tier-2 driver (the loop scaffolding that had no

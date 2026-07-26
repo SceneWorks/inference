@@ -41,6 +41,7 @@ pub mod quant;
 pub mod rope;
 pub mod text_encoder;
 pub mod tier;
+pub mod training;
 pub mod transformer;
 pub mod vae;
 pub mod vocoder;

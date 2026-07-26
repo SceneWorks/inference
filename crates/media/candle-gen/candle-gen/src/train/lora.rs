@@ -147,9 +147,8 @@ fn kron2d(a: &Tensor, b: &Tensor) -> candle_core::Result<Tensor> {
 /// The frozen base projection behind a [`LoraLinear`] — a plain dense `Linear` (the training default,
 /// byte-identical to pre-sc-9416) or a **GGUF-quantized** [`QLinear`] loaded straight from a
 /// pre-quantized MLX tier (sc-9416, the candle SDXL packed-load). Both compute `x·Wᵀ + b`; the packed
-/// arm dequantizes-on-forward into a dense matmul (sc-7702). A packed base is an **inference-only**
-/// tier: it carries no `Var` master-weights and is never trained, so installing an adapter on it is
-/// rejected (see [`LoraLinear::install_lora`] / [`LoraLinear::install_lokr`]).
+/// arm dequantizes-on-forward into a dense matmul (sc-7702). The packed base remains frozen, but an
+/// independent trainable LoRA residual may be installed over it (the LTX q4 trainer path).
 #[derive(Clone)]
 enum LoraBase {
     Dense(Linear),
@@ -223,10 +222,10 @@ impl LoraLinear {
         }
     }
 
-    /// Wrap an already-built **packed** [`QLinear`] base (sc-9416) — the inference-only frozen base for
+    /// Wrap an already-built **packed** [`QLinear`] base (sc-9416) — the frozen base for
     /// a pre-quantized MLX tier. `in_features`/`out_features` are the logical projection dims; `path`
-    /// is the PEFT module path. A packed base is never trained, so [`install_lora`](Self::install_lora)
-    /// / `install_lokr` reject it; with no adapter the forward is exactly the packed base's `x·Wᵀ + b`.
+    /// is the PEFT module path. The packed weights are never trained; a LoRA can still be trained as an
+    /// independent additive residual. With no adapter the forward is exactly the packed base's `x·Wᵀ + b`.
     pub fn from_qlinear(
         base: QLinear,
         in_features: usize,
@@ -245,7 +244,7 @@ impl LoraLinear {
     }
 
     /// Whether the frozen base is a packed (GGUF-quantized) [`QLinear`] rather than a dense `Linear`
-    /// (sc-9416). A packed base cannot host a trainable residual.
+    /// (sc-9416).
     pub fn is_packed(&self) -> bool {
         self.base.is_packed()
     }
@@ -280,14 +279,9 @@ impl LoraLinear {
     /// Install a LoRA residual. `down`/`up` are expected to be `Var`-backed (storage-sharing) f32
     /// tensors of shape `[rank, in]` / `[out, rank]`; `scale = alpha / rank`.
     ///
-    /// A **packed** base (sc-9416) is an inference-only quantized tier with no `Var` master-weights, so
-    /// adapting it is a programmer error — guarded in debug (the training harness only ever builds dense
-    /// bases; the packed base is built only on the txt2img inference path, which installs no adapters).
+    /// The frozen base may be dense or packed. Adapter factors are independent f32 `Var`s, so a
+    /// quantized base remains immutable while gradients flow through the residual.
     pub fn install_lora(&mut self, down: Tensor, up: Tensor, scale: f64) {
-        debug_assert!(
-            !self.base.is_packed(),
-            "cannot install a LoRA residual on a packed (quantized) base"
-        );
         self.adapter = Some(Adapter::Lora { down, up, scale });
     }
 
@@ -298,7 +292,7 @@ impl LoraLinear {
 
     /// Attach a forward-time **additive LoRA** inference residual `scale·((x·a)·b)` (sc-11103): `a`
     /// `[in, rank]` (= `downᵀ`), `b` `[rank, out]` (= `upᵀ` with `alpha/rank` folded in), `scale` the
-    /// per-adapter user strength. Unlike [`install_lora`](Self::install_lora) (trainable, dense-only),
+    /// per-adapter user strength. Unlike [`install_lora`](Self::install_lora) (trainable),
     /// this is valid on **any** base including a **packed** [`QLinear`] — the base weight is never
     /// dequantized, so a q4/q8 tier keeps its footprint. Multiple pushes stack (applied in push order).
     pub fn push_additive_lora(&mut self, a: Tensor, b: Tensor, scale: f64) {
@@ -460,7 +454,8 @@ pub fn lora_linear(in_f: usize, out_f: usize, vs: VarBuilder) -> candle_core::Re
 /// parts at `group_size` (no dense weight materialized); otherwise it is the plain dense `Linear`,
 /// byte-identical to [`lora_linear`]. `base_key` is the full dotted prefix (e.g. `attn2.to_out.0`), so
 /// the `.scales`/`.biases` siblings survive the `to_out.0` nesting — the `linear_detect` contract. The
-/// packed base is inference-only (no adapter). Used by the candle SDXL packed txt2img UNet load.
+/// A packed base can host an independent trainable LoRA residual. Used by the candle SDXL packed
+/// txt2img load and the LTX q4 trainer.
 pub fn lora_linear_detect(
     in_f: usize,
     out_f: usize,
@@ -549,6 +544,48 @@ impl LoraSet {
 
     pub fn is_empty(&self) -> bool {
         self.targets.is_empty()
+    }
+
+    /// Stable, fully-qualified trainable surface used by resume snapshots. The names are the same
+    /// bare PEFT keys written to the final adapter.
+    pub fn named_vars(&self) -> Vec<(String, Var)> {
+        self.targets
+            .iter()
+            .flat_map(|target| {
+                target
+                    .factors
+                    .iter()
+                    .map(move |(suffix, var)| (format!("{}.{}", target.path, suffix), var.clone()))
+            })
+            .collect()
+    }
+
+    /// Restore trainable factors from a resume tensor map, rejecting any missing, extra, or
+    /// shape-incompatible key so a changed target-module config cannot resume an inert surface.
+    pub fn restore_named(&self, saved: &HashMap<String, Tensor>) -> Result<()> {
+        let named = self.named_vars();
+        let expected: std::collections::HashSet<&str> =
+            named.iter().map(|(name, _)| name.as_str()).collect();
+        let actual: std::collections::HashSet<&str> = saved.keys().map(String::as_str).collect();
+        if expected != actual {
+            let missing: Vec<_> = expected.difference(&actual).copied().collect();
+            let extra: Vec<_> = actual.difference(&expected).copied().collect();
+            return Err(CandleError::Msg(format!(
+                "resume: adapter target surface differs (missing={missing:?}, extra={extra:?})"
+            )));
+        }
+        for (name, var) in named {
+            let value = &saved[&name];
+            if value.dims() != var.dims() {
+                return Err(CandleError::Msg(format!(
+                    "resume: factor {name:?} shape {:?} does not match {:?}",
+                    value.dims(),
+                    var.dims()
+                )));
+            }
+            var.set(&value.to_dtype(var.dtype())?.to_device(var.device())?)?;
+        }
+        Ok(())
     }
 }
 
@@ -1251,20 +1288,20 @@ mod tests {
         assert!(dmax < 1e-4, "additive vs folded deviates by {dmax}");
     }
 
-    /// Installing an adapter on a packed base is a programmer error (debug-guarded): a packed tier has
-    /// no `Var` master-weights to adapt. Pins the sc-9416 invariant that the packed inference path and
-    /// the training-residual path never coexist.
+    /// A trainable residual is legal over an immutable packed base: the packed weights remain frozen
+    /// and only the independent f32 factors participate in autograd (the LTX q4 trainer path).
     #[test]
-    #[should_panic(expected = "packed")]
-    fn install_lora_on_packed_base_panics_in_debug() {
+    fn install_lora_on_packed_base_applies_residual() {
         let dev = Device::Cpu;
         let (out_f, in_f) = (64usize, 128usize);
         let (wq, s, b) = q4_packed_triple(out_f, in_f);
         let q = QLinear::from_packed(&wq, &s, &b, None, &dev).unwrap();
         let mut ll = LoraLinear::from_qlinear(q, in_f, out_f, "attn2.to_out.0".into());
-        let down = Tensor::zeros((4, in_f), DType::F32, &dev).unwrap();
-        let up = Tensor::zeros((out_f, 4), DType::F32, &dev).unwrap();
+        let down = Tensor::ones((4, in_f), DType::F32, &dev).unwrap();
+        let up = Tensor::ones((out_f, 4), DType::F32, &dev).unwrap();
         ll.install_lora(down, up, 1.0);
+        let x = Tensor::ones((1, in_f), DType::F32, &dev).unwrap();
+        assert!(ll.forward(&x).is_ok());
     }
 
     /// `lora_linear_detect` / `lora_linear_no_bias_detect` route to the packed base when the `.scales`
@@ -1686,6 +1723,44 @@ mod tests {
         assert!(path_matches("a.b.attn1.to_out.0", "to_out.0"));
         assert!(!path_matches("a.b.attn1.to_qx", "to_q"));
         assert!(path_matches("to_q", "to_q"));
+    }
+
+    #[test]
+    fn resume_restore_rejects_changed_factor_surface() {
+        let dev = Device::Cpu;
+        let a = Var::from_tensor(&Tensor::zeros((2, 3), DType::F32, &dev).unwrap()).unwrap();
+        let b = Var::from_tensor(&Tensor::zeros((4, 2), DType::F32, &dev).unwrap()).unwrap();
+        let set = LoraSet {
+            kind: AdapterKind::Lora,
+            rank: 2,
+            alpha: 2.0,
+            decompose_factor: -1,
+            vars: vec![a.clone(), b.clone()],
+            targets: vec![AdapterTarget {
+                path: "blocks.0.attn1.to_q".into(),
+                factors: vec![("lora_A.weight", a), ("lora_B.weight", b)],
+            }],
+        };
+        let mut missing: HashMap<String, Tensor> = set
+            .named_vars()
+            .into_iter()
+            .map(|(name, var)| (name, var.as_tensor().clone()))
+            .collect();
+        missing.remove("blocks.0.attn1.to_q.lora_B.weight");
+        let err = set.restore_named(&missing).unwrap_err().to_string();
+        assert!(err.contains("surface differs"), "{err}");
+
+        let mut extra: HashMap<String, Tensor> = set
+            .named_vars()
+            .into_iter()
+            .map(|(name, var)| (name, var.as_tensor().clone()))
+            .collect();
+        extra.insert(
+            "blocks.1.attn2.to_k.lora_A.weight".into(),
+            Tensor::zeros((2, 3), DType::F32, &dev).unwrap(),
+        );
+        let err = set.restore_named(&extra).unwrap_err().to_string();
+        assert!(err.contains("surface differs"), "{err}");
     }
 
     /// sc-5225: a 1×1 conv LoRA (rank 2, in 2, out 2). `down`/`up` are `[*, *, 1, 1]`; the fused delta
