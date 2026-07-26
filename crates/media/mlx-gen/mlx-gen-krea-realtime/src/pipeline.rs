@@ -1,11 +1,14 @@
 //! Krea Realtime 14B provider: capability surface, registration, snapshot resolution, and the
 //! [`Generator`] entrypoint (sc-8439, S6).
 //!
-//! [`Generator::generate`] maps a text-to-video [`GenerationRequest`] onto a [`KreaRealtimeJob`] and
-//! runs the live [`crate::t2v::generate_t2v`] pipeline (prompt → UMT5 → AR few-step latents → z16 Wan
-//! VAE decode → clip). Krea Realtime is an **autoregressive, self-forcing, CFG-off** text-to-video
-//! model: no negative prompt, no guidance scale, a fixed Self-Forcing few-step schedule. Image/video
-//! conditioning (i2v / v2v) is **S7**; the streaming realtime decode is the streaming epic.
+//! [`Generator::generate`] maps a [`GenerationRequest`] onto a [`KreaRealtimeJob`] and runs the live
+//! pipeline (prompt → UMT5 → AR few-step latents → z16 Wan VAE decode → clip). Krea Realtime is an
+//! **autoregressive, self-forcing, CFG-off** model: no negative prompt, no guidance scale, a fixed
+//! Self-Forcing few-step schedule. It advertises **i2v** ([`ConditioningKind::Reference`] — a still
+//! warms the AR KV cache, [`crate::t2v::generate_i2v`]) and **v2v** ([`ConditioningKind::VideoClip`] — a
+//! source clip drives the strength-controlled AR init, [`crate::t2v::generate_v2v`]) conditioning
+//! (sc-8440 S7); `run` routes a request's conditioning to the matching pipeline. The streaming realtime
+//! decode / webcam v2v deque is the streaming epic (8432).
 //!
 //! Registration mirrors the sibling Wan-2.1-14B video provider `mlx-gen-scail2`: an explicit
 //! `ModelRegistration` composed by the platform catalog (never linker-discovered), so
@@ -14,12 +17,12 @@
 use std::path::PathBuf;
 
 use mlx_gen::{
-    default_seed, Capabilities, Error, GenerationOutput, GenerationRequest, Generator, Modality,
-    ModelDescriptor, Progress, Result, WeightsSource,
+    default_seed, Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput,
+    GenerationRequest, Generator, Modality, ModelDescriptor, Progress, Result, WeightsSource,
 };
 
 use crate::config::{KreaRealtimeConfig, MODEL_ID};
-use crate::t2v::KreaRealtimeJob;
+use crate::t2v::{generate_i2v, generate_v2v, KreaRealtimeJob};
 
 /// The Self-Forcing few-step sampler name Krea Realtime advertises (a fixed short per-block flow-match
 /// renoise schedule, not a selectable classic solver). Distinct from Wan's UniPC/DPM++ so a consumer
@@ -51,8 +54,12 @@ pub fn descriptor() -> ModelDescriptor {
             supports_negative_prompt: false,
             supports_guidance: false,
             supports_true_cfg: false,
-            // Text-to-video only in S6 (no image/video conditioning); i2v/v2v is S7.
-            conditioning: Vec::new(),
+            // i2v / v2v conditioning (sc-8440 S7): a `Reference` still warms the AR KV cache
+            // (image-to-video, like the sibling `svd_xt` image→video), and a `VideoClip` source drives
+            // the strength-controlled AR init (video-to-video, like `bernini`'s v2v). Both are wired in
+            // the engine (`generate_i2v` / `generate_v2v`) and routed by `run`, so advertising them is
+            // honest. `VideoClip` is video-modality conditioning (allowed here — modality is Video).
+            conditioning: vec![ConditioningKind::Reference, ConditioningKind::VideoClip],
             // No inference LoRA/quant wired yet (the base DiT loads dense bf16). Advertising a knob the
             // load path does not honor would violate capability honesty — kept off until wired.
             supports_lora: false,
@@ -163,6 +170,41 @@ impl KreaRealtime {
             seed: req.seed.unwrap_or_else(default_seed),
             steps: req.steps.map(|s| s as usize),
         };
+
+        // Route on the advertised conditioning (sc-8440 S7): a `VideoClip` source → v2v; else a
+        // `Reference` still → i2v; else text-to-video. Advertising `Reference`/`VideoClip` in the
+        // descriptor makes `validate_request` accept them, so `run` MUST honor them (capability honesty)
+        // rather than silently generating t2v. The worker's mapping of its own reference inputs onto
+        // these `GenerationRequest` conditioning entries is S10.
+        if let Some((frames, strength)) = req.conditioning.iter().find_map(|c| match c {
+            Conditioning::VideoClip {
+                frames, strength, ..
+            } => Some((frames.as_slice(), *strength)),
+            _ => None,
+        }) {
+            return generate_v2v(
+                &self.root,
+                &self.config,
+                &job,
+                frames,
+                strength,
+                &req.cancel,
+                on_progress,
+            );
+        }
+        if let Some(image) = req.conditioning.iter().find_map(|c| match c {
+            Conditioning::Reference { image, .. } => Some(image),
+            _ => None,
+        }) {
+            return generate_i2v(
+                &self.root,
+                &self.config,
+                &job,
+                image,
+                &req.cancel,
+                on_progress,
+            );
+        }
         crate::t2v::generate_t2v(&self.root, &self.config, &job, &req.cancel, on_progress)
     }
 }
@@ -182,9 +224,10 @@ mod tests {
         }
     }
 
-    /// The advertised surface is text-to-video, CFG-off, with the Self-Forcing few-step sampler.
+    /// The advertised surface is CFG-off video with the Self-Forcing few-step sampler, now advertising
+    /// **i2v** (`Reference`) + **v2v** (`VideoClip`) conditioning (sc-8440 S7).
     #[test]
-    fn descriptor_is_cfg_off_text_to_video() {
+    fn descriptor_is_cfg_off_video_with_i2v_v2v() {
         let d = descriptor();
         assert_eq!(d.id, "krea_realtime_14b");
         assert_eq!(d.family, "krea_realtime");
@@ -194,12 +237,24 @@ mod tests {
         assert!(!c.supports_guidance, "Krea Realtime is CFG-off");
         assert!(!c.supports_negative_prompt, "CFG-off ⇒ no negative prompt");
         assert!(!c.supports_true_cfg);
-        assert!(c.conditioning.is_empty(), "t2v only in S6 (i2v/v2v is S7)");
+        // S7: advertises i2v (Reference) + v2v (VideoClip) — the engine wires + routes both.
+        assert!(
+            c.accepts(ConditioningKind::Reference),
+            "i2v: a reference still is accepted (S7)"
+        );
+        assert!(
+            c.accepts(ConditioningKind::VideoClip),
+            "v2v: a source clip is accepted (S7)"
+        );
+        assert_eq!(
+            c.conditioning,
+            vec![ConditioningKind::Reference, ConditioningKind::VideoClip]
+        );
         assert_eq!(c.samplers, vec!["self_forcing"]);
         assert!(c.supports_kv_cache, "the AR regime runs a rolling KV cache");
         assert!(c.mac_only);
-        assert!(!c.supports_streaming, "batch form in S6");
-        // The descriptor passes the weights-free conformance sweep.
+        assert!(!c.supports_streaming, "batch form; streaming is epic 8432");
+        // The descriptor passes the weights-free conformance sweep (Video modality admits VideoClip).
         assert!(
             mlx_gen::gen_core::registry::model_descriptor_errors(&d).is_empty(),
             "descriptor must be conformant: {:?}",

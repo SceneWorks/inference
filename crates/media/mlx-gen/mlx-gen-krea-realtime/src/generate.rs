@@ -16,8 +16,9 @@
 //! *that* clean-context K/V — the reference's `causal_inference.py:227-236` "rerun with timestep zero to
 //! update KV cache using clean context". The output is the **latent sequence**
 //! `[out_dim, num_frames, H, W]` (f32) — UMT5 text encoding and VAE decode / clip assembly (incl. the
-//! first-frame VAE re-anchor) are wired at the pipeline level in **S6**; i2v/v2v conditioning is **S7**;
-//! long-clip coherence with real weights is S13.
+//! first-frame VAE re-anchor) are wired at the pipeline level in **S6**; the i2v/v2v conditioning
+//! surface ([`generate_i2v_latents`] / [`generate_v2v_latents`] over [`RefConditioning`]) is added in
+//! **S7** (below); long-clip coherence with real weights is S13.
 //! `context` (the UMT5 text embedding) is taken as an input parameter; the DiT-side text embedding +
 //! cross-attention K/V are built here once per prompt.
 
@@ -158,6 +159,230 @@ pub fn generate_latents_into(
     )
 }
 
+/// Reference conditioning for autoregressive **i2v / v2v** generation (sc-8440 S7), mirroring the two
+/// reference mechanisms in `krea-ai/realtime-video`:
+///
+///   * **`context_latents`** — clean VAE-encoded reference/first-frame latents `[C, F_ctx, H, W]` (f32)
+///     that **warm the KV cache** before generation and are **prepended** verbatim to the output. Each
+///     context block is committed by one forward at the clean timestep `0` (the reference's
+///     `timestep * 0`, `causal_inference.py:147,165` — the S5 clean-context commit applied to the
+///     reference), and the latents are copied into the leading output frames
+///     (`output[:, :num_input] = initial_latent`). Used for i2v (a single still, `F_ctx = 1`) and video
+///     extension (`F_ctx > 1`). `None` ⇒ no warm (t2v / pure v2v restyle).
+///   * **`source`** — a v2v `(source_latents [C, num_latent_frames, H, W], strength)`. Each generated
+///     block starts from the VAE-encoded source clip **renoised to the strength level**, and the denoise
+///     schedule starts at `strength·1000` ([`FewStepSchedule::for_strength`] /
+///     `v2v.py::get_denoising_schedule` + `release_server.py:426,658`), so a lower `strength` preserves
+///     more of the source. `None` ⇒ pure-noise init on the config's few-step schedule (t2v / i2v).
+pub struct RefConditioning {
+    /// Clean VAE-encoded context latents that warm the cache + prepend to the output. See the type doc.
+    pub context_latents: Option<Array>,
+    /// v2v source clip + denoise strength. See the type doc.
+    pub source: Option<(Array, f32)>,
+}
+
+/// Autoregressive **i2v**: warm the KV cache from a clean VAE-encoded reference still (or first-frame
+/// clip) and generate `params.num_latent_frames` frames conditioned on it. Returns
+/// `[out_dim, F_ref + num_latent_frames, H, W]` (f32) — the reference frames prepended verbatim to the
+/// generated continuation, mirroring the reference `causal_inference.py` (`initial_latent`,
+/// `num_input_frames == 1` ⇒ image-to-video). `reference_latents` is `[in_dim, F_ref, latent_height,
+/// latent_width]` (the z16 Wan VAE `encode` of the still); the pipeline's
+/// [`generate_i2v_from_components`](crate::generate_i2v_from_components) owns the VAE encode + decode.
+pub fn generate_i2v_latents(
+    transformer: &CausalKreaTransformer,
+    cfg: &KreaRealtimeConfig,
+    context: &Array,
+    params: &ArGenParams,
+    reference_latents: &Array,
+) -> Result<Array> {
+    let mut cache = transformer.new_cache();
+    let cond = RefConditioning {
+        context_latents: Some(reference_latents.clone()),
+        source: None,
+    };
+    generate_latents_conditioned_into(transformer, cfg, context, params, &cond, &mut cache)
+}
+
+/// Autoregressive **v2v**: generate `params.num_latent_frames` frames conditioned on a clean
+/// VAE-encoded source clip, honoring a denoise `strength` (`0 ..= 1`). Each block starts from the source
+/// renoised to the strength schedule's max sigma and denoises down the strength-scaled schedule (a lower
+/// `strength` preserves more of the source); the AR loop's per-block clean-context recompute threads the
+/// rolling generated frames as context (`release_server.py` + `v2v.py`). Returns
+/// `[out_dim, num_latent_frames, H, W]` (f32). `source_latents` is `[in_dim, num_latent_frames,
+/// latent_height, latent_width]` (the z16 Wan VAE `encode_sample` of the source, one frame per generated
+/// frame); the pipeline's [`generate_v2v_from_components`](crate::generate_v2v_from_components) owns the
+/// VAE encode + decode.
+pub fn generate_v2v_latents(
+    transformer: &CausalKreaTransformer,
+    cfg: &KreaRealtimeConfig,
+    context: &Array,
+    params: &ArGenParams,
+    source_latents: &Array,
+    strength: f32,
+) -> Result<Array> {
+    let mut cache = transformer.new_cache();
+    let cond = RefConditioning {
+        context_latents: None,
+        source: Some((source_latents.clone(), strength)),
+    };
+    generate_latents_conditioned_into(transformer, cfg, context, params, &cond, &mut cache)
+}
+
+/// The shared i2v/v2v conditioned AR generation against a caller-owned KV cache (the seam the S7
+/// verification inspects to assert the reference frames' clean-context K/V populate the cache before
+/// generation). Validates the latent geometry, builds the schedule (strength-scaled for v2v), warms the
+/// cache from `cond.context_latents` (committing each context block at timestep `0`), then runs the AR
+/// loop for `params.num_latent_frames` frames — pure-noise init (i2v) or source-renoised init (v2v) —
+/// and prepends the context frames to the output. The `cache` must be empty on entry.
+pub fn generate_latents_conditioned_into(
+    transformer: &CausalKreaTransformer,
+    cfg: &KreaRealtimeConfig,
+    context: &Array,
+    params: &ArGenParams,
+    cond: &RefConditioning,
+    cache: &mut CausalKvCache,
+) -> Result<Array> {
+    let (ph, pw) = (cfg.wan.patch_size.1, cfg.wan.patch_size.2);
+    let frame_seq_length = cfg.ar.frame_seq_length;
+    if ph == 0
+        || pw == 0
+        || !params.latent_height.is_multiple_of(ph)
+        || !params.latent_width.is_multiple_of(pw)
+    {
+        return Err(Error::Msg(format!(
+            "krea AR: latent {}x{} is not divisible by the patch size {ph}x{pw}",
+            params.latent_height, params.latent_width
+        )));
+    }
+    let per_frame_tokens = (params.latent_height / ph) * (params.latent_width / pw);
+    if per_frame_tokens != frame_seq_length {
+        return Err(Error::Msg(format!(
+            "krea AR: latent {}x{} yields {per_frame_tokens} tokens/frame but the model's \
+             frame_seq_length is {frame_seq_length}; size the latents to the canonical per-frame \
+             token count",
+            params.latent_height, params.latent_width
+        )));
+    }
+    if !cache.is_empty() {
+        return Err(Error::Msg(
+            "krea AR: generate_latents_conditioned_into requires an empty KV cache".into(),
+        ));
+    }
+
+    // v2v uses the strength-scaled schedule (max timestep = strength·1000); i2v/t2v use the config list.
+    let schedule = match &cond.source {
+        Some((_, strength)) => {
+            let steps = params.steps.unwrap_or(cfg.ar.denoising_step_list.len());
+            FewStepSchedule::for_strength(cfg.ar.timestep_shift as f64, *strength as f64, steps)?
+        }
+        None => FewStepSchedule::new(
+            cfg.ar.timestep_shift as f64,
+            &cfg.ar.denoising_step_list,
+            params.steps,
+        )?,
+    };
+
+    // DiT text embedding + per-prompt cross-attention K/V (position-independent; built once).
+    let ctx = transformer.inner().embed_text(context)?;
+    let cross_kv = transformer.prepare_cross_kv(&ctx)?;
+
+    // Step 2: warm the KV cache from the clean context latents (i2v / first-frame / extension). Each
+    // context block is committed by ONE forward at the clean timestep 0 (the reference `timestep * 0`,
+    // `causal_inference.py:147,165` — the S5 clean-context commit applied to the reference latents), so
+    // the first generated chunk attends the warmed reference. `start_token` advances past the warmed
+    // context so the generated chunks' causal RoPE offset + read window line up
+    // (`current_start_frame · frame_seq_length`). The context latents are prepended to the output.
+    let c = cfg.wan.in_dim as i32;
+    let (h, w) = (params.latent_height as i32, params.latent_width as i32);
+    let mut start_token = 0usize;
+    let mut prefix: Option<Array> = None;
+    if let Some(ctx_lat) = &cond.context_latents {
+        let s = ctx_lat.shape();
+        if s.len() != 4 || s[0] != c || s[1] < 1 || s[2] != h || s[3] != w {
+            return Err(Error::Msg(format!(
+                "krea i2v: context latents shape {s:?} must be [{c}, F_ctx>=1, {h}, {w}]"
+            )));
+        }
+        let f_ctx = s[1] as usize;
+        let mut cursor = 0usize;
+        for chunk_frames in chunk_frame_counts(f_ctx, cfg.ar.num_frames_per_block) {
+            let idx: Vec<i32> = (cursor as i32..(cursor + chunk_frames) as i32).collect();
+            let chunk = ctx_lat.take_axis(Array::from_slice(&idx, &[idx.len() as i32]), 1)?;
+            // Commit (not read-only): populate the clean-context K/V for this reference block.
+            let _ = transformer.forward_chunk(&chunk, 0.0, &cross_kv, start_token, cache)?;
+            start_token += chunk_frames * frame_seq_length;
+            cursor += chunk_frames;
+        }
+        prefix = Some(ctx_lat.clone());
+    }
+
+    // v2v init noise level = the strength schedule's max-timestep sigma (source·(1−σ) + ε·σ).
+    let init_source: Option<(&Array, f64)> = cond.source.as_ref().map(|(src, _)| {
+        let sigma_init = schedule
+            .step_timesteps()
+            .first()
+            .map(|&t| schedule.sigma_at_timestep(t))
+            .unwrap_or(1.0);
+        (src, sigma_init)
+    });
+
+    // The per-chunk denoise forward, threading the (possibly warmed) persistent cache. Exactly one
+    // forward per call (CFG off).
+    let denoise = |chunk: &Array, t: f32, start: usize, commit: bool| -> Result<Array> {
+        if commit {
+            transformer.forward_chunk(chunk, t, &cross_kv, start, cache)
+        } else {
+            transformer.forward_chunk_readonly(chunk, t, &cross_kv, start, cache)
+        }
+    };
+
+    let generated = run_ar_loop_conditioned(
+        &schedule,
+        cfg.wan.in_dim,
+        frame_seq_length,
+        cfg.ar.num_frames_per_block,
+        params,
+        cfg.ar.do_kv_recomp,
+        cfg.ar.context_noise,
+        start_token,
+        init_source,
+        denoise,
+    )?;
+
+    // Prepend the clean context frames (copied verbatim) to the generated continuation.
+    match prefix {
+        Some(ctx_lat) => Ok(concatenate_axis(&[&ctx_lat, &generated], 1)?),
+        None => Ok(generated),
+    }
+}
+
+/// The AR chunk-loop core (t2v), a thin wrapper over [`run_ar_loop_conditioned`] with no cache-warm
+/// offset and pure-noise init — the S4/S6 t2v path. See [`run_ar_loop_conditioned`].
+#[allow(clippy::too_many_arguments)]
+fn run_ar_loop(
+    schedule: &FewStepSchedule,
+    channels: usize,
+    frame_seq_length: usize,
+    frames_per_block: usize,
+    params: &ArGenParams,
+    do_kv_recomp: bool,
+    context_noise: f32,
+    denoise: impl FnMut(&Array, f32, usize, bool) -> Result<Array>,
+) -> Result<Array> {
+    run_ar_loop_conditioned(
+        schedule,
+        channels,
+        frame_seq_length,
+        frames_per_block,
+        params,
+        do_kv_recomp,
+        context_noise,
+        0,
+        None,
+        denoise,
+    )
+}
+
 /// The AR chunk-loop core, generic over the per-chunk forward so it is unit-testable without weights.
 ///
 /// `denoise(chunk, t, start_token, commit) -> velocity` runs one batch-1 forward: it reads the
@@ -170,8 +395,18 @@ pub fn generate_latents_into(
 /// per chunk in both modes: the final denoise step when `do_kv_recomp` is off (the S4 baseline), or the
 /// recompute forward when it is on. Returns the frame-axis concatenation of every chunk's final `x0`,
 /// `[out_dim, num_frames, H, W]` (f32).
+///
+/// **Reference conditioning (sc-8440 S7).** `start_token_offset` is the global token index where
+/// generation begins — non-zero when the caller has already warmed the KV cache from clean context
+/// (i2v/v2v reference frames), so the first generated chunk's causal RoPE offset + read window line up
+/// past the warmed context (the reference's `current_start_frame · frame_seq_length` after the Step-2
+/// warm, `causal_inference.py:136-170`). `init_source = Some((source, sigma_init))` is the **v2v**
+/// strength init: each chunk starts from the VAE-encoded source clip renoised to `sigma_init` — the
+/// schedule's max-timestep sigma — instead of pure noise (`latents·(1−σ) + ε·σ`,
+/// `release_server.py:426,658` + `v2v.py::get_denoising_schedule`). `source` is `[C, num_latent_frames,
+/// H, W]` (one source frame per generated frame). `None` ⇒ pure-noise init (t2v / i2v continuation).
 #[allow(clippy::too_many_arguments)]
-fn run_ar_loop(
+fn run_ar_loop_conditioned(
     schedule: &FewStepSchedule,
     channels: usize,
     frame_seq_length: usize,
@@ -179,6 +414,8 @@ fn run_ar_loop(
     params: &ArGenParams,
     do_kv_recomp: bool,
     context_noise: f32,
+    start_token_offset: usize,
+    init_source: Option<(&Array, f64)>,
     mut denoise: impl FnMut(&Array, f32, usize, bool) -> Result<Array>,
 ) -> Result<Array> {
     let step_ts = schedule.step_timesteps();
@@ -190,6 +427,17 @@ fn run_ar_loop(
     let (h, w) = (params.latent_height as i32, params.latent_width as i32);
     let num_frames = params.num_latent_frames;
 
+    // v2v strength init requires one source frame per generated frame.
+    if let Some((source, _)) = init_source {
+        let s = source.shape();
+        if s.len() != 4 || s[0] != c || s[1] as usize != num_frames || s[2] != h || s[3] != w {
+            return Err(Error::Msg(format!(
+                "krea v2v: source latents shape {s:?} must be [{c}, {num_frames}, {h}, {w}] \
+                 (one source frame per generated frame)"
+            )));
+        }
+    }
+
     // Init the whole clip's noise once from the seed (then slice per chunk, matching the reference's
     // `noise[:, block]`), and carry a split PRNG key for the per-step renoise draws — all seed-derived.
     let mut key = random::key(params.seed)?;
@@ -200,11 +448,21 @@ fn run_ar_loop(
 
     let mut outputs: Vec<Array> = Vec::new();
     let mut frame_cursor = 0usize;
-    let mut start_token = 0usize;
+    let mut start_token = start_token_offset;
     for chunk_frames in chunk_frame_counts(num_frames, frames_per_block) {
-        // This chunk's init noise: full_noise[:, frame_cursor : frame_cursor + chunk_frames].
+        // This chunk's init: pure seeded noise (t2v / i2v), or — for v2v — the VAE-encoded source clip
+        // renoised to the strength schedule's max sigma (`source·(1−σ) + ε·σ`). Both slice the frame
+        // axis `[frame_cursor : frame_cursor + chunk_frames]` (the reference's `noise[:, block]`).
         let idx: Vec<i32> = (frame_cursor as i32..(frame_cursor + chunk_frames) as i32).collect();
-        let mut cur = full_noise.take_axis(Array::from_slice(&idx, &[idx.len() as i32]), 1)?;
+        let idx = Array::from_slice(&idx, &[idx.len() as i32]);
+        let noise_chunk = full_noise.take_axis(&idx, 1)?;
+        let mut cur = match init_source {
+            None => noise_chunk,
+            Some((source, sigma_init)) => {
+                let source_chunk = source.take_axis(&idx, 1)?;
+                renoise_step(&source_chunk, &noise_chunk, sigma_init)?
+            }
+        };
 
         // Commit the chunk's K/V at the final denoise step ONLY when the recompute is off (the S4
         // baseline). With recompute on, every denoise step is read-only and the single commit is the
@@ -440,5 +698,106 @@ mod tests {
         .unwrap()
         .item::<f32>();
         assert!(diff_seed > 0.0, "a different seed must change the latents");
+    }
+
+    /// S7 cache-warm offset: `start_token_offset` makes the generated chunks run against a pre-warmed
+    /// cache — every forward's `start` begins at the offset and advances by `chunk_frames · fsl`, and the
+    /// output shape is the generated frame count (the warm/prefix is added by the caller, not the loop).
+    #[test]
+    fn run_ar_loop_conditioned_threads_start_token_offset() {
+        let schedule = FewStepSchedule::new(5.0, &[1000, 937, 833, 625, 0], None).unwrap();
+        let fsl = 4;
+        let fpb = 2;
+        let p = params(1234, 4); // 2 generated chunks: [2, 2]
+        let offset = 3 * fsl; // pretend 3 context frames were warmed
+
+        let starts = RefCell::new(Vec::<usize>::new());
+        let out = run_ar_loop_conditioned(
+            &schedule,
+            16,
+            fsl,
+            fpb,
+            &p,
+            false,
+            0.0,
+            offset,
+            None,
+            |chunk, _t, start, _commit| {
+                starts.borrow_mut().push(start);
+                Ok(Array::zeros::<f32>(chunk.shape()).unwrap())
+            },
+        )
+        .unwrap();
+
+        let starts = starts.into_inner();
+        // Chunk 0 begins at the offset; chunk 1 at offset + 2·fsl. 5 steps each.
+        assert!(starts[0..5].iter().all(|&s| s == offset));
+        assert!(starts[5..10].iter().all(|&s| s == offset + 2 * fsl));
+        // The loop returns only the generated frames; the caller prepends the context.
+        assert_eq!(out.shape(), &[16, 4, 4, 4]);
+    }
+
+    /// S7 v2v init: `init_source` seeds each chunk from the source renoised to `sigma_init`, so the
+    /// first denoise input **depends on the source and the strength** — a different source or a different
+    /// `sigma_init` yields a different init (the discriminating v2v levers), while pure-noise init
+    /// (`None`) ignores the source entirely.
+    #[test]
+    fn run_ar_loop_conditioned_v2v_init_uses_source_and_strength() {
+        let schedule = FewStepSchedule::new(5.0, &[1000, 937, 833, 625, 0], None).unwrap();
+        let fsl = 4;
+        let fpb = 2;
+        let p = params(7, 2); // one chunk
+
+        // Capture the first denoise input's sum (the init the source feeds).
+        let first_input_sum = |src: Option<&Array>, sigma: f64| -> f32 {
+            let seen = RefCell::new(None::<f32>);
+            let init_source = src.map(|s| (s, sigma));
+            run_ar_loop_conditioned(
+                &schedule,
+                16,
+                fsl,
+                fpb,
+                &p,
+                false,
+                0.0,
+                0,
+                init_source,
+                |chunk, _t, _start, _commit| {
+                    if seen.borrow().is_none() {
+                        *seen.borrow_mut() =
+                            Some(mlx_rs::ops::sum(chunk, None).unwrap().item::<f32>());
+                    }
+                    Ok(Array::zeros::<f32>(chunk.shape()).unwrap())
+                },
+            )
+            .unwrap();
+            seen.into_inner().unwrap()
+        };
+
+        let source_a = Array::full::<f32>(&[16, 2, 4, 4], Array::from_f32(1.0)).unwrap();
+        let source_b = Array::full::<f32>(&[16, 2, 4, 4], Array::from_f32(-1.0)).unwrap();
+
+        // At a partial strength (sigma 0.5) the init carries (1−σ)·source, so A and B differ.
+        let a = first_input_sum(Some(&source_a), 0.5);
+        let b = first_input_sum(Some(&source_b), 0.5);
+        assert!(
+            (a - b).abs() > 1e-3,
+            "a different source must change the v2v init: {a} vs {b}"
+        );
+
+        // A different strength (sigma) with the same source also changes the init.
+        let a_low = first_input_sum(Some(&source_a), 0.05);
+        assert!(
+            (a - a_low).abs() > 1e-3,
+            "a different strength must change the v2v init"
+        );
+
+        // Pure-noise init (None) ignores the source: same seed ⇒ same init regardless of source.
+        let n1 = first_input_sum(None, 1.0);
+        let n2 = first_input_sum(None, 1.0);
+        assert_eq!(
+            n1, n2,
+            "pure-noise init is source-independent and seed-deterministic"
+        );
     }
 }

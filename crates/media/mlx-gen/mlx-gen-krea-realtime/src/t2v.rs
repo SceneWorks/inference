@@ -37,13 +37,16 @@ use std::path::Path;
 
 use mlx_gen::tiling::{TilingConfig, VaeTiling};
 use mlx_gen::weights::Weights;
-use mlx_gen::{CancelFlag, Error, GenerationOutput, Progress, Result};
-use mlx_gen_wan::{decode_to_frames, frames_to_images, load_tokenizer, Umt5Encoder, WanVae};
-use mlx_rs::Array;
+use mlx_gen::{CancelFlag, Error, GenerationOutput, Image, Progress, Result};
+use mlx_gen_wan::{
+    decode_to_frames, frames_to_images, load_tokenizer, preprocess_i2v_image, Umt5Encoder, WanVae,
+};
+use mlx_rs::ops::concatenate_axis;
+use mlx_rs::{random, Array};
 
 use crate::causal::CausalKreaTransformer;
 use crate::config::KreaRealtimeConfig;
-use crate::generate::{generate_latents, ArGenParams};
+use crate::generate::{generate_i2v_latents, generate_latents, generate_v2v_latents, ArGenParams};
 use crate::load::load_krea_realtime_transformer;
 
 /// z16 Wan VAE temporal compression (a latent frame decodes to `TEMPORAL_STRIDE` output frames).
@@ -233,6 +236,136 @@ pub fn generate_t2v_from_components(
     decode_latents_to_video(vae, &latents, params.fps, out_frames, tiling, cancel)
 }
 
+/// VAE-encode a reference **still** → clean i2v context latent `[in_dim, 1, latent_h, latent_w]` (f32)
+/// via the reused z16 Wan VAE [`WanVae::encode`] (`.mode()`, the Gaussian mean — the reference's image
+/// conditioning path, mirroring `mlx-gen-bernini`'s `vae_encode_image`). The image is cover-fit +
+/// center-cropped to `(width, height)` and normalized to `[-1, 1]` by the reused
+/// [`preprocess_i2v_image`], then encoded and the batch axis dropped. The pixel size `(width, height)`
+/// must be `latent · 8`, so the encoded latent matches the AR latent geometry.
+fn encode_reference_image(vae: &WanVae, image: &Image, width: u32, height: u32) -> Result<Array> {
+    let chw = preprocess_i2v_image(image, width, height)?; // [3, H, W] in [-1, 1]
+    let video = chw.expand_dims(1)?.expand_dims(0)?; // [1, 3, 1, H, W]
+    let z = vae.encode(&video)?; // [1, z, 1, h8, w8]
+    let s = z.shape();
+    Ok(z.reshape(&[s[1], s[2], s[3], s[4]])?) // drop the batch axis → [z, 1, h8, w8]
+}
+
+/// VAE-encode a **source clip** → clean v2v source latent `[in_dim, T_lat, latent_h, latent_w]` (f32)
+/// via the reused z16 Wan VAE [`WanVae::encode_sample`] (`.sample()` — the reference's **video** source
+/// path, mirroring `mlx-gen-bernini`'s `vae_encode_video`; `eps` is drawn from `key` so the encode is
+/// deterministic given the seed). Each frame is cover-fit + center-cropped to `(width, height)`,
+/// stacked on the temporal axis (`T = 1 + 4·k`), encoded, and the batch axis dropped. `T_lat =
+/// (T − 1)/4 + 1`.
+fn encode_source_clip(
+    vae: &WanVae,
+    cfg: &KreaRealtimeConfig,
+    frames: &[Image],
+    width: u32,
+    height: u32,
+    key: &Array,
+) -> Result<Array> {
+    if frames.is_empty() {
+        return Err(Error::Msg("krea v2v: source clip has no frames".into()));
+    }
+    let mut chw_t = Vec::with_capacity(frames.len());
+    for f in frames {
+        chw_t.push(preprocess_i2v_image(f, width, height)?.expand_dims(1)?); // [3, 1, H, W]
+    }
+    let refs: Vec<&Array> = chw_t.iter().collect();
+    let video = concatenate_axis(&refs, 1)?.expand_dims(0)?; // [1, 3, T, H, W]
+    let s = video.shape();
+    let (t, h, w) = (s[2], s[3], s[4]);
+    let t_lat = (t - 1) / 4 + 1; // z16 temporal stride 4
+    let z_dim = cfg.wan.vae_z_dim as i32;
+    let eps = random::normal::<f32>(&[1, z_dim, t_lat, h / 8, w / 8], None, None, Some(key))?;
+    let z = vae.encode_sample(&video, &eps)?; // [1, z, T_lat, h8, w8]
+    let s = z.shape();
+    Ok(z.reshape(&[s[1], s[2], s[3], s[4]])?) // drop the batch axis → [z, T_lat, h8, w8]
+}
+
+/// Component-level **image-to-video** (sc-8440 S7): given the built causal transformer + z16 VAE + UMT5
+/// `context`, VAE-encode the reference still, warm the KV cache from it, generate the continuation
+/// ([`generate_i2v_latents`]), and VAE-decode → assembled clip. The **weight-free e2e seam** the S7
+/// verification drives on a tiny random-weight config (mirrors [`generate_t2v_from_components`]). The
+/// returned clip is the reference frame(s) followed by the generated continuation (`F_ref +
+/// num_latent_frames` latent frames → `4·(F_ref + num_latent_frames)` output frames), trimmed by
+/// `out_frames`. Mirrors the reference `causal_inference.py` (`initial_latent`, image i2v).
+#[allow(clippy::too_many_arguments)]
+pub fn generate_i2v_from_components(
+    transformer: &CausalKreaTransformer,
+    cfg: &KreaRealtimeConfig,
+    vae: &WanVae,
+    context: &Array,
+    reference_image: &Image,
+    params: &ArGenParams,
+    out_frames: Option<usize>,
+    tiling: Option<&TilingConfig>,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<GenerationOutput> {
+    if cancel.is_cancelled() {
+        return Err(Error::Canceled);
+    }
+    let width = (params.latent_width * SPATIAL_STRIDE) as u32;
+    let height = (params.latent_height * SPATIAL_STRIDE) as u32;
+    // Stage 1: VAE-encode the reference still → clean context latent.
+    let reference_latents = encode_reference_image(vae, reference_image, width, height)?;
+    mlx_rs::transforms::eval([&reference_latents])?;
+    if cancel.is_cancelled() {
+        return Err(Error::Canceled);
+    }
+    // Stage 2: warm the cache from the reference + AR-generate the continuation conditioned on it.
+    let latents = generate_i2v_latents(transformer, cfg, context, params, &reference_latents)?;
+    if cancel.is_cancelled() {
+        return Err(Error::Canceled);
+    }
+    on_progress(Progress::Decoding);
+    decode_latents_to_video(vae, &latents, params.fps, out_frames, tiling, cancel)
+}
+
+/// Component-level **video-to-video** (sc-8440 S7): VAE-encode the source clip (`.sample()`), generate
+/// `params.num_latent_frames` frames conditioned on it at the given denoise `strength`
+/// ([`generate_v2v_latents`]), and VAE-decode → assembled clip. The **weight-free e2e seam** the S7
+/// verification drives on a tiny random-weight config. The source clip must have exactly
+/// `4·(num_latent_frames − 1) + 1` frames (so its encode yields `num_latent_frames` latent frames).
+/// A lower `strength` preserves more of the source; `strength = 1` fully regenerates. Mirrors the
+/// reference `v2v.py` + `release_server.py`.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_v2v_from_components(
+    transformer: &CausalKreaTransformer,
+    cfg: &KreaRealtimeConfig,
+    vae: &WanVae,
+    context: &Array,
+    source_frames: &[Image],
+    strength: f32,
+    params: &ArGenParams,
+    out_frames: Option<usize>,
+    tiling: Option<&TilingConfig>,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<GenerationOutput> {
+    if cancel.is_cancelled() {
+        return Err(Error::Canceled);
+    }
+    let width = (params.latent_width * SPATIAL_STRIDE) as u32;
+    let height = (params.latent_height * SPATIAL_STRIDE) as u32;
+    // Stage 1: VAE-encode the source clip → clean source latent (deterministic eps from the seed).
+    let key = random::key(params.seed)?;
+    let source_latents = encode_source_clip(vae, cfg, source_frames, width, height, &key)?;
+    mlx_rs::transforms::eval([&source_latents])?;
+    if cancel.is_cancelled() {
+        return Err(Error::Canceled);
+    }
+    // Stage 2: strength-controlled AR generation from the renoised source.
+    let latents =
+        generate_v2v_latents(transformer, cfg, context, params, &source_latents, strength)?;
+    if cancel.is_cancelled() {
+        return Err(Error::Canceled);
+    }
+    on_progress(Progress::Decoding);
+    decode_latents_to_video(vae, &latents, params.fps, out_frames, tiling, cancel)
+}
+
 /// Load the reused stock-Wan UMT5-XXL text encoder from the snapshot `root` and encode `prompt` →
 /// context `[text_len, text_dim]` (f32). Krea Realtime ships transformer-only, so the tokenizer +
 /// `t5_encoder.safetensors` are the stock Wan components (provisioned as caller-local paths). CFG is
@@ -306,19 +439,8 @@ pub fn generate_t2v(
     let num_latent_frames = latent_frame_count(job.num_frames)?;
     let cfg = resolve_request_config(base_cfg, latent_h, latent_w, num_latent_frames)?;
 
-    // Stage 1: UMT5 text encode (loaded → used → freed inside `encode_prompt`).
-    on_progress(Progress::Loading(mlx_gen::LoadPhase::TextEncoder));
-    let context = encode_prompt(root, &cfg, job.prompt)?;
-
-    // Stage 2: the Krea DiT (reused Wan 2.1 14B), wrapped causal with the Mac + resolution AR config.
-    on_progress(Progress::Loading(mlx_gen::LoadPhase::Renderer));
-    let transformer = load_transformer(root, &cfg)?;
-
-    // Stage 3: the reused z16 Wan VAE.
-    let vae = {
-        let w = Weights::from_file(root.join("vae.safetensors"))?;
-        WanVae::from_weights(&w)?
-    };
+    // Stage the reused components (UMT5 prompt encode + Krea DiT + z16 Wan VAE).
+    let (context, transformer, vae) = stage_components(root, &cfg, job.prompt, on_progress)?;
 
     let params = ArGenParams {
         seed: job.seed,
@@ -341,6 +463,165 @@ pub fn generate_t2v(
         &cfg,
         &vae,
         &context,
+        &params,
+        Some(job.num_frames as usize),
+        tiling.as_ref(),
+        cancel,
+        on_progress,
+    )
+}
+
+/// Shared real-weight component staging for the t2v/i2v/v2v pipeline paths: UMT5 prompt encode
+/// (loaded → used → freed) + the Krea DiT (reused Wan 2.1 14B) + the reused z16 Wan VAE, each from the
+/// snapshot `root`.
+fn stage_components(
+    root: &Path,
+    cfg: &KreaRealtimeConfig,
+    prompt: &str,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<(Array, CausalKreaTransformer, WanVae)> {
+    on_progress(Progress::Loading(mlx_gen::LoadPhase::TextEncoder));
+    let context = encode_prompt(root, cfg, prompt)?;
+    on_progress(Progress::Loading(mlx_gen::LoadPhase::Renderer));
+    let transformer = load_transformer(root, cfg)?;
+    let w = Weights::from_file(root.join("vae.safetensors"))?;
+    let vae = WanVae::from_weights(&w)?;
+    Ok((context, transformer, vae))
+}
+
+/// Validate the snapshot `root` + pixel size and derive the latent geometry `(latent_h, latent_w)`
+/// shared by the i2v/v2v pipeline paths (mirrors `generate_t2v`'s guards).
+fn resolve_latent_size(root: &Path, job: &KreaRealtimeJob, what: &str) -> Result<(usize, usize)> {
+    if !root.exists() {
+        return Err(Error::Msg(format!(
+            "krea {what}: snapshot dir does not exist: {}",
+            root.display()
+        )));
+    }
+    if job.width == 0 || job.height == 0 {
+        return Err(Error::Msg(format!("krea {what}: width/height must be > 0")));
+    }
+    let latent_h = job.height as usize / SPATIAL_STRIDE;
+    let latent_w = job.width as usize / SPATIAL_STRIDE;
+    if latent_h == 0 || latent_w == 0 {
+        return Err(Error::Msg(format!(
+            "krea {what}: {}x{} is smaller than one {SPATIAL_STRIDE}px VAE cell",
+            job.width, job.height
+        )));
+    }
+    Ok((latent_h, latent_w))
+}
+
+/// Run the full Krea Realtime **image-to-video** generation for `job` + a `reference_image`, loading
+/// each reused component from the snapshot `root` (same layout as [`generate_t2v`]). The reference still
+/// is VAE-encoded into the first latent frame and warms the AR KV cache; the pipeline generates the
+/// remaining `num_latent_frames − 1` frames so the assembled clip is `job.num_frames`. The tiny-config
+/// e2e drives [`generate_i2v_from_components`] instead. Mirrors the reference `causal_inference.py`
+/// (`initial_latent`, `num_input_frames == 1`).
+///
+/// **Anchor count (S13 coherence lever).** This warms **one** clean-context frame (the still).
+/// `release_server.py::setup_start_frame` instead repeats the still to `kv_cache_num_frames` (= 3)
+/// latent frames so the rolling window is fully seeded and the generation blocks stay frame-block
+/// aligned (`current_start_frame = kv_cache_num_frames`, a multiple of `num_frame_per_block`). The
+/// [`generate_i2v_latents`] engine seam already accepts a multi-frame reference, so the anchor count is
+/// a coherence choice to measure/tune on the gated real-weight run (S13), not an engine limitation.
+/// Real-weight watchable-clip coherence is gated to S13.
+pub fn generate_i2v(
+    root: &Path,
+    base_cfg: &KreaRealtimeConfig,
+    job: &KreaRealtimeJob,
+    reference_image: &Image,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<GenerationOutput> {
+    let (latent_h, latent_w) = resolve_latent_size(root, job, "i2v")?;
+    let total_latent = latent_frame_count(job.num_frames)?;
+    // The reference still is latent frame 0 (one clean context frame); generate the rest.
+    const F_REF: usize = 1;
+    let num_generate = total_latent
+        .checked_sub(F_REF)
+        .filter(|&n| n >= 1)
+        .ok_or_else(|| {
+            Error::Msg(
+                "krea i2v: num_frames too small — need at least 2 latent frames (a reference \
+                 frame + a generated frame)"
+                    .into(),
+            )
+        })?;
+    let cfg = resolve_request_config(base_cfg, latent_h, latent_w, total_latent)?;
+    let (context, transformer, vae) = stage_components(root, &cfg, job.prompt, on_progress)?;
+    let params = ArGenParams {
+        seed: job.seed,
+        steps: job.steps,
+        num_latent_frames: num_generate,
+        latent_height: latent_h,
+        latent_width: latent_w,
+        fps: job.fps,
+    };
+    let decoded_frames = ((F_REF + num_generate) * TEMPORAL_STRIDE) as i32;
+    let tiling = decode_tiling(
+        latent_h * SPATIAL_STRIDE,
+        latent_w * SPATIAL_STRIDE,
+        decoded_frames,
+    );
+    generate_i2v_from_components(
+        &transformer,
+        &cfg,
+        &vae,
+        &context,
+        reference_image,
+        &params,
+        Some(job.num_frames as usize),
+        tiling.as_ref(),
+        cancel,
+        on_progress,
+    )
+}
+
+/// Run the full Krea Realtime **video-to-video** generation for `job` + a `source_frames` clip at a
+/// denoise `strength`, loading each reused component from the snapshot `root` (same layout as
+/// [`generate_t2v`]). The source clip is VAE-encoded and drives the strength-controlled AR init; the
+/// number of generated latent frames is derived from the source length (`(frames − 1)/4 + 1`). The
+/// tiny-config e2e drives [`generate_v2v_from_components`] instead. Mirrors the reference `v2v.py` +
+/// `release_server.py`. Real-weight watchable-clip coherence is gated to S13.
+pub fn generate_v2v(
+    root: &Path,
+    base_cfg: &KreaRealtimeConfig,
+    job: &KreaRealtimeJob,
+    source_frames: &[Image],
+    strength: f32,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<GenerationOutput> {
+    let (latent_h, latent_w) = resolve_latent_size(root, job, "v2v")?;
+    if source_frames.is_empty() {
+        return Err(Error::Msg("krea v2v: source clip has no frames".into()));
+    }
+    // The generated latent-frame count is derived from the source clip length.
+    let num_latent = latent_frame_count(source_frames.len() as u32)?;
+    let cfg = resolve_request_config(base_cfg, latent_h, latent_w, num_latent)?;
+    let (context, transformer, vae) = stage_components(root, &cfg, job.prompt, on_progress)?;
+    let params = ArGenParams {
+        seed: job.seed,
+        steps: job.steps,
+        num_latent_frames: num_latent,
+        latent_height: latent_h,
+        latent_width: latent_w,
+        fps: job.fps,
+    };
+    let decoded_frames = (num_latent * TEMPORAL_STRIDE) as i32;
+    let tiling = decode_tiling(
+        latent_h * SPATIAL_STRIDE,
+        latent_w * SPATIAL_STRIDE,
+        decoded_frames,
+    );
+    generate_v2v_from_components(
+        &transformer,
+        &cfg,
+        &vae,
+        &context,
+        source_frames,
+        strength,
         &params,
         Some(job.num_frames as usize),
         tiling.as_ref(),

@@ -76,6 +76,42 @@ fn full_shifted_table(shift: f64, num_train: usize) -> (Vec<f64>, Vec<f64>) {
     (sigmas, timesteps)
 }
 
+/// The v2v **denoise-strength** step timesteps — the port of `v2v.py::get_denoising_schedule`:
+///
+/// ```text
+/// raw  = linspace(strength·1000, 0, steps).to(int64)          # descending, ends at 0 (steps ≥ 2)
+/// list = zero_padded_timesteps[1000 − raw]                    # re-index the warped model-timestep table
+/// ```
+///
+/// where `warped_timesteps` is the full shifted model-timestep table (`sigmas·1000`, length
+/// [`NUM_TRAIN_TIMESTEPS`], `timesteps[0] = 1000`) and `zero_padded_timesteps` is that table with a
+/// terminal `0` appended at index [`NUM_TRAIN_TIMESTEPS`] (the reference's
+/// `torch.cat((scheduler.timesteps, [0]))`). The returned per-step timesteps are truncated to integers
+/// (the reference stores `int64` timesteps), descending, with a terminal `0` for `steps ≥ 2`.
+///
+/// `strength = 1` reproduces the shipped few-step list (`[1000, 937, 833, 625, 0]` at `steps = 5`);
+/// `strength → 0` collapses the whole list toward `0` (keep the source clip — a 0-strength v2v renoises
+/// the source only to the smallest tabled sigma and denoises at `t = 0`, so the output tracks the
+/// source). Mirrors the reference so a lower strength preserves more of the VAE-encoded source.
+fn strength_step_timesteps(warped_timesteps: &[f64], strength: f64, steps: usize) -> Vec<f64> {
+    let n = steps.max(1);
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        // linspace(strength·1000, 0, n)[i]: descending from strength·1000 to 0.
+        let frac = if n == 1 {
+            0.0
+        } else {
+            i as f64 / (n - 1) as f64
+        };
+        let raw = (strength * NUM_TRAIN_TIMESTEPS as f64 * (1.0 - frac)).trunc() as i64;
+        // 1000 − raw indexes the zero-padded warped table (index NUM_TRAIN_TIMESTEPS ⇒ the appended 0).
+        let idx = (NUM_TRAIN_TIMESTEPS as i64 - raw).clamp(0, NUM_TRAIN_TIMESTEPS as i64) as usize;
+        let t = warped_timesteps.get(idx).copied().unwrap_or(0.0); // idx == NUM_TRAIN_TIMESTEPS ⇒ 0
+        out.push(t.trunc());
+    }
+    out
+}
+
 /// Resolve the per-step denoising timesteps (descending, terminal `0`).
 ///
 /// * `None` → the config's `default_list` verbatim (`[1000, 937, 833, 625, 0]` for the shipped 14B).
@@ -140,6 +176,38 @@ impl FewStepSchedule {
         }
         let (sigmas, timesteps) = full_shifted_table(shift, NUM_TRAIN_TIMESTEPS);
         let step_timesteps = resolve_step_timesteps(shift, default_list, steps)?;
+        Ok(Self {
+            shift,
+            sigmas,
+            timesteps,
+            step_timesteps,
+        })
+    }
+
+    /// The v2v **denoise-strength** schedule (sc-8440 S7) — the reference `v2v.py::get_denoising_schedule`.
+    /// Builds the same shifted-sigma table as [`new`](Self::new) but resolves the per-step timesteps so
+    /// the schedule's **max** timestep is `strength·1000` (warped), descending to `0` over `steps`
+    /// forwards. `strength = 1` reproduces the shipped few-step list; `strength → 0` collapses the list
+    /// toward `0` (keep the source). The v2v init noise level is
+    /// [`sigma_at_timestep`](Self::sigma_at_timestep) of the first (max) step timestep, so a lower
+    /// strength renoises the VAE-encoded source less and preserves more of it. `strength` must be finite
+    /// and in `[0, 1]`; `steps ≥ 1`.
+    pub fn for_strength(shift: f64, strength: f64, steps: usize) -> Result<Self> {
+        if shift <= 0.0 || shift.is_nan() {
+            return Err(Error::Msg(format!(
+                "krea few-step: timestep_shift must be > 0, got {shift}"
+            )));
+        }
+        if !strength.is_finite() || !(0.0..=1.0).contains(&strength) {
+            return Err(Error::Msg(format!(
+                "krea v2v: denoise strength must be finite in [0, 1], got {strength}"
+            )));
+        }
+        if steps == 0 {
+            return Err(Error::Msg("krea v2v: denoise steps must be >= 1".into()));
+        }
+        let (sigmas, timesteps) = full_shifted_table(shift, NUM_TRAIN_TIMESTEPS);
+        let step_timesteps = strength_step_timesteps(&timesteps, strength, steps);
         Ok(Self {
             shift,
             sigmas,
@@ -318,6 +386,67 @@ mod tests {
         assert!((got[1] - 7.0).abs() < 1e-6, "{got:?}");
         // The swapped coefficient would give [.25·4 = 1.0, .25·8 + .75·4 = 5.0] — distinct.
         assert!((got[0] - 1.0).abs() > 1e-3);
+    }
+
+    /// v2v strength schedule (`for_strength`): `strength = 1` reproduces the shipped few-step list
+    /// exactly (`get_denoising_schedule(warped, 1.0, 5) == [1000, 937, 833, 625, 0]`), so a full-strength
+    /// v2v is identical to the t2v denoise from max noise.
+    #[test]
+    fn strength_one_reproduces_shipped_list() {
+        let s = FewStepSchedule::for_strength(5.0, 1.0, 5).unwrap();
+        assert_eq!(
+            s.step_timesteps(),
+            &[1000.0, 937.0, 833.0, 625.0, 0.0],
+            "strength=1 reproduces the shipped few-step list (get_denoising_schedule at strength 1)"
+        );
+    }
+
+    /// The strength lever moves the schedule's **max** timestep (and thus the init noise level): a lower
+    /// strength starts closer to clean and ends at `0`, so more of the source survives. `strength = 0`
+    /// collapses the whole list to `0` (keep the source); the init sigma is the smallest tabled sigma.
+    #[test]
+    fn strength_scales_the_schedule_head_and_init_sigma() {
+        let full = FewStepSchedule::for_strength(5.0, 1.0, 5).unwrap();
+        let half = FewStepSchedule::for_strength(5.0, 0.5, 5).unwrap();
+        let zero = FewStepSchedule::for_strength(5.0, 0.0, 5).unwrap();
+
+        // The first (max) step timestep tracks strength·1000 (warped): 1 → 1000, 0.5 → ~833, 0 → 0.
+        assert_eq!(full.step_timesteps()[0], 1000.0);
+        // strength 0.5: raw[0] = 500 → 1000−500 = 500 → warped timesteps[500] = 833.
+        assert_eq!(half.step_timesteps()[0], 833.0);
+        assert_eq!(zero.step_timesteps(), &[0.0, 0.0, 0.0, 0.0, 0.0]);
+
+        // The init noise level (sigma at the max step) shrinks with strength.
+        let sig_full = full.sigma_at_timestep(full.step_timesteps()[0]);
+        let sig_half = half.sigma_at_timestep(half.step_timesteps()[0]);
+        let sig_zero = zero.sigma_at_timestep(zero.step_timesteps()[0]);
+        assert!(
+            (sig_full - 1.0).abs() < 1e-9,
+            "strength 1 ⇒ init sigma 1.0 (pure noise)"
+        );
+        assert!(
+            sig_half < sig_full && sig_half > sig_zero,
+            "strength 0.5 init sigma is intermediate"
+        );
+        // strength 0 ⇒ the smallest tabled sigma (source barely noised, near-clean denoise).
+        let want0 = 5.0 * 0.001 / (1.0 + 4.0 * 0.001);
+        assert!((sig_zero - want0).abs() < 1e-9);
+
+        // Every list is descending with a terminal 0 (for steps ≥ 2).
+        for s in [&full, &half] {
+            assert_eq!(*s.step_timesteps().last().unwrap(), 0.0);
+            assert!(s.step_timesteps().windows(2).all(|w| w[0] >= w[1]));
+        }
+    }
+
+    /// `for_strength` rejects an out-of-range or non-finite strength and a zero step count.
+    #[test]
+    fn for_strength_validates_inputs() {
+        assert!(FewStepSchedule::for_strength(5.0, 1.5, 5).is_err());
+        assert!(FewStepSchedule::for_strength(5.0, -0.1, 5).is_err());
+        assert!(FewStepSchedule::for_strength(5.0, f64::NAN, 5).is_err());
+        assert!(FewStepSchedule::for_strength(5.0, 0.5, 0).is_err());
+        assert!(FewStepSchedule::for_strength(0.0, 0.5, 5).is_err());
     }
 
     #[test]
