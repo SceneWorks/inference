@@ -8,10 +8,11 @@
 //!    `demo_cond` prompt and requires both to satisfy the same validity gates — non-silent, finite,
 //!    clamped, genuinely two-channel, neither white noise nor a pure tone.
 //! 2. **Medium is a distinct checkpoint from each specialist.** On identical prompt, seed, duration
-//!    and step count, medium's waveform must diverge from the specialist's by the envelope
-//!    `tests/variant_divergence.rs` already calibrated for a cross-checkpoint pair. A mis-wired
-//!    registration serving small weights under the medium id would produce valid audio and pass
-//!    every other gate in this crate; only a divergence gate catches it.
+//!    and step count, medium's waveform must diverge from the specialist's by an envelope measured
+//!    *here*, over three seeds per domain — not the one `tests/variant_divergence.rs` calibrated for
+//!    the same-architecture music/SFX pair, which turns out to reject honest output on this pairing.
+//!    A mis-wired registration serving small weights under the medium id would produce valid audio
+//!    and pass every other gate in this crate; only a divergence gate catches it.
 //! 3. **A measured character table**, printed for every render so a future change is diagnosable.
 //!
 //! # What this does NOT establish
@@ -72,9 +73,14 @@ const SEEDS: &[u64] = &[42, 7, 2_026];
 const MAX_CROSS_CHECKPOINT_COSINE: f64 = 0.45;
 
 /// The cosine a mis-wired registration produces: one checkpoint's weights served under both ids
-/// renders byte-identical audio at a fixed seed. Kept as a named constant so the control below is
-/// asserting the failure this gate exists for, not an arbitrary number.
+/// renders byte-identical audio at a fixed seed. Kept as a named constant so the controls below
+/// assert against the failure this gate exists for, not an arbitrary number.
 const MIS_WIRED_COSINE: f64 = 1.0;
+
+/// The bound must reject the mis-wiring it exists for. Compile-time rather than in a test body: it
+/// relates two constants, so there is nothing to observe at runtime, and this way a future edit that
+/// loosens the bound past 1.0 fails to build instead of failing a gate somebody has to run.
+const _: () = assert!(MIS_WIRED_COSINE >= MAX_CROSS_CHECKPOINT_COSINE);
 
 fn snapshot(env: &str) -> WeightsSource {
     WeightsSource::Dir(PathBuf::from(
@@ -262,11 +268,6 @@ fn medium_serves_both_domains_and_diverges_from_each_specialist() {
         "worst cross-checkpoint cosine over {} seeds x 2 domains: {worst:.9} against the \
          {MAX_CROSS_CHECKPOINT_COSINE} bound",
         SEEDS.len()
-    );
-    assert!(
-        MIS_WIRED_COSINE >= MAX_CROSS_CHECKPOINT_COSINE,
-        "the bound must reject the mis-wiring it exists for: a shared weight path renders \
-         byte-identical audio at cosine {MIS_WIRED_COSINE}"
     );
     assert!(
         worst < MAX_CROSS_CHECKPOINT_COSINE,
