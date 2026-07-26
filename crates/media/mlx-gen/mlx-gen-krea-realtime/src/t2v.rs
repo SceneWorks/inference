@@ -37,7 +37,7 @@ use std::path::Path;
 
 use mlx_gen::tiling::{TilingConfig, VaeTiling};
 use mlx_gen::weights::Weights;
-use mlx_gen::{CancelFlag, Error, GenerationOutput, Image, Progress, Result};
+use mlx_gen::{AdapterSpec, CancelFlag, Error, GenerationOutput, Image, Progress, Result};
 use mlx_gen_wan::{
     decode_to_frames, frames_to_images, load_tokenizer, preprocess_i2v_image, Umt5Encoder, WanVae,
 };
@@ -45,7 +45,7 @@ use mlx_rs::ops::concatenate_axis;
 use mlx_rs::{random, Array};
 
 use crate::causal::CausalKreaTransformer;
-use crate::config::KreaRealtimeConfig;
+use crate::config::{KreaRealtimeConfig, MODEL_ID};
 use crate::generate::{generate_i2v_latents, generate_latents, generate_v2v_latents, ArGenParams};
 use crate::load::load_krea_realtime_transformer;
 
@@ -405,7 +405,19 @@ fn encode_prompt(root: &Path, cfg: &KreaRealtimeConfig, prompt: &str) -> Result<
 /// `dit.safetensors` (converted MLX layout) or a sharded `transformer/` directory. The
 /// [`load_krea_realtime_transformer`] path handles either on-disk key layout (via
 /// [`crate::convert::sanitize_krea_realtime_transformer`]).
-fn load_transformer(root: &Path, cfg: &KreaRealtimeConfig) -> Result<CausalKreaTransformer> {
+///
+/// Any inference LoRA(s) in `adapters` (sc-15015, S14) are installed onto the built DiT as forward-time
+/// residuals over the dense bf16 base via the family-agnostic strict installer — the `mlx-gen-scail2`
+/// dense-Wan template. Krea Realtime is Wan-2.1-14B T2V weight-for-weight, so a diffusers / PEFT /
+/// kohya / LoKr file resolves against the DiT's module names (the FFN `ffn.0`/`ffn.2` reference keys
+/// normalized to the converted `ffn.fc1`/`fc2` by [`CausalKreaTransformer`]'s adaptable host); the
+/// installer **errors — never silently drops** — on a format/prefix mismatch or an unmatched target.
+/// The quant/packed-tier (Q4/Q8) LoRA install is the separate quant-tier story (S19).
+fn load_transformer(
+    root: &Path,
+    cfg: &KreaRealtimeConfig,
+    adapters: &[AdapterSpec],
+) -> Result<CausalKreaTransformer> {
     let dit_file = root.join("dit.safetensors");
     let transformer_dir = root.join("transformer");
     let weights = if dit_file.exists() {
@@ -423,7 +435,18 @@ fn load_transformer(root: &Path, cfg: &KreaRealtimeConfig) -> Result<CausalKreaT
         .map(|k| (k.to_string(), weights.get(k).expect("listed key").clone()))
         .collect();
     let dit = load_krea_realtime_transformer(raw, cfg)?;
-    Ok(CausalKreaTransformer::new(dit, cfg))
+    let mut transformer = CausalKreaTransformer::new(dit, cfg);
+    if !adapters.is_empty() {
+        let report =
+            mlx_gen::adapters::loader::apply_adapters_strict(&mut transformer, adapters, MODEL_ID)?;
+        // Surface the applied count (unmatched targets already errored above, never silently dropped).
+        eprintln!(
+            "{MODEL_ID}: installed {} LoRA target residual(s) from {} adapter file(s)",
+            report.applied,
+            adapters.len()
+        );
+    }
+    Ok(transformer)
 }
 
 /// Run the full Krea Realtime text-to-video generation for `job`, loading each reused component from
@@ -438,6 +461,7 @@ pub fn generate_t2v(
     root: &Path,
     base_cfg: &KreaRealtimeConfig,
     job: &KreaRealtimeJob,
+    adapters: &[AdapterSpec],
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<GenerationOutput> {
@@ -461,8 +485,10 @@ pub fn generate_t2v(
     let num_latent_frames = latent_frame_count(job.num_frames)?;
     let cfg = resolve_request_config(base_cfg, latent_h, latent_w, num_latent_frames)?;
 
-    // Stage the reused components (UMT5 prompt encode + Krea DiT + z16 Wan VAE).
-    let (context, transformer, vae) = stage_components(root, &cfg, job.prompt, on_progress)?;
+    // Stage the reused components (UMT5 prompt encode + Krea DiT + z16 Wan VAE); any inference LoRA(s)
+    // are installed onto the DiT inside `stage_components` (sc-15015, S14).
+    let (context, transformer, vae) =
+        stage_components(root, &cfg, job.prompt, adapters, on_progress)?;
 
     let params = ArGenParams {
         seed: job.seed,
@@ -500,12 +526,13 @@ fn stage_components(
     root: &Path,
     cfg: &KreaRealtimeConfig,
     prompt: &str,
+    adapters: &[AdapterSpec],
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<(Array, CausalKreaTransformer, WanVae)> {
     on_progress(Progress::Loading(mlx_gen::LoadPhase::TextEncoder));
     let context = encode_prompt(root, cfg, prompt)?;
     on_progress(Progress::Loading(mlx_gen::LoadPhase::Renderer));
-    let transformer = load_transformer(root, cfg)?;
+    let transformer = load_transformer(root, cfg, adapters)?;
     let w = Weights::from_file(root.join("vae.safetensors"))?;
     let vae = WanVae::from_weights(&w)?;
     Ok((context, transformer, vae))
@@ -553,6 +580,7 @@ pub fn generate_i2v(
     base_cfg: &KreaRealtimeConfig,
     job: &KreaRealtimeJob,
     reference_image: &Image,
+    adapters: &[AdapterSpec],
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<GenerationOutput> {
@@ -571,7 +599,8 @@ pub fn generate_i2v(
             )
         })?;
     let cfg = resolve_request_config(base_cfg, latent_h, latent_w, total_latent)?;
-    let (context, transformer, vae) = stage_components(root, &cfg, job.prompt, on_progress)?;
+    let (context, transformer, vae) =
+        stage_components(root, &cfg, job.prompt, adapters, on_progress)?;
     let params = ArGenParams {
         seed: job.seed,
         steps: job.steps,
@@ -606,12 +635,14 @@ pub fn generate_i2v(
 /// number of generated latent frames is derived from the source length (`(frames − 1)/4 + 1`). The
 /// tiny-config e2e drives [`generate_v2v_from_components`] instead. Mirrors the reference `v2v.py` +
 /// `release_server.py`. Real-weight watchable-clip coherence is gated to S13.
+#[allow(clippy::too_many_arguments)]
 pub fn generate_v2v(
     root: &Path,
     base_cfg: &KreaRealtimeConfig,
     job: &KreaRealtimeJob,
     source_frames: &[Image],
     strength: f32,
+    adapters: &[AdapterSpec],
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<GenerationOutput> {
@@ -622,7 +653,8 @@ pub fn generate_v2v(
     // The generated latent-frame count is derived from the source clip length.
     let num_latent = latent_frame_count(source_frames.len() as u32)?;
     let cfg = resolve_request_config(base_cfg, latent_h, latent_w, num_latent)?;
-    let (context, transformer, vae) = stage_components(root, &cfg, job.prompt, on_progress)?;
+    let (context, transformer, vae) =
+        stage_components(root, &cfg, job.prompt, adapters, on_progress)?;
     let params = ArGenParams {
         seed: job.seed,
         steps: job.steps,

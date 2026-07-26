@@ -17,8 +17,9 @@
 use std::path::PathBuf;
 
 use mlx_gen::{
-    default_seed, Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput,
-    GenerationRequest, Generator, Modality, ModelDescriptor, Progress, Result, WeightsSource,
+    default_seed, AdapterSpec, Capabilities, Conditioning, ConditioningKind, Error,
+    GenerationOutput, GenerationRequest, Generator, Modality, ModelDescriptor, Progress, Result,
+    WeightsSource,
 };
 
 use crate::config::{KreaRealtimeConfig, MODEL_ID};
@@ -60,10 +61,14 @@ pub fn descriptor() -> ModelDescriptor {
             // the engine (`generate_i2v` / `generate_v2v`) and routed by `run`, so advertising them is
             // honest. `VideoClip` is video-modality conditioning (allowed here — modality is Video).
             conditioning: vec![ConditioningKind::Reference, ConditioningKind::VideoClip],
-            // No inference LoRA/quant wired yet (the base DiT loads dense bf16). Advertising a knob the
-            // load path does not honor would violate capability honesty — kept off until wired.
-            supports_lora: false,
-            supports_lokr: false,
+            // Wan-family style-LoRA / LoKr on the dense bf16 DiT (sc-15015, S14): Krea Realtime 14B is
+            // Wan-2.1-14B T2V weight-for-weight, so a diffusers / PEFT / kohya / LoKr file installs onto
+            // the DiT as forward-time residuals via the shared `apply_adapters_strict` path (the
+            // `mlx-gen-scail2` dense-Wan template). `LoadSpec::adapters` is honored in the load path
+            // (`t2v::load_transformer`), so advertising these is capability-honest. The quant/packed-tier
+            // (Q4/Q8) LoRA install is the separate quant-tier story (S19).
+            supports_lora: true,
+            supports_lokr: true,
             samplers: vec![SELF_FORCING_SAMPLER],
             schedulers: Vec::new(),
             supported_guidance_methods: vec![],
@@ -100,6 +105,10 @@ pub struct KreaRealtime {
     descriptor: ModelDescriptor,
     config: KreaRealtimeConfig,
     root: PathBuf,
+    /// Inference LoRA(s) from [`LoadSpec::adapters`](mlx_gen::LoadSpec::adapters) (sc-15015, S14) —
+    /// installed onto the DiT as forward-time residuals in [`crate::t2v::load_transformer`], the
+    /// dense-Wan `apply_adapters_strict` path shared with `mlx-gen-scail2`.
+    adapters: Vec<AdapterSpec>,
 }
 
 /// Load Krea Realtime from a converted MLX snapshot directory (`dit.safetensors` + the stock Wan
@@ -124,6 +133,7 @@ pub fn load(spec: &mlx_gen::LoadSpec) -> Result<Box<dyn Generator>> {
         descriptor: descriptor(),
         config,
         root,
+        adapters: spec.adapters.clone(),
     }))
 }
 
@@ -188,6 +198,7 @@ impl KreaRealtime {
                 &job,
                 frames,
                 strength,
+                &self.adapters,
                 &req.cancel,
                 on_progress,
             );
@@ -201,11 +212,19 @@ impl KreaRealtime {
                 &self.config,
                 &job,
                 image,
+                &self.adapters,
                 &req.cancel,
                 on_progress,
             );
         }
-        crate::t2v::generate_t2v(&self.root, &self.config, &job, &req.cancel, on_progress)
+        crate::t2v::generate_t2v(
+            &self.root,
+            &self.config,
+            &job,
+            &self.adapters,
+            &req.cancel,
+            on_progress,
+        )
     }
 }
 
@@ -221,6 +240,7 @@ mod tests {
             descriptor: descriptor(),
             config: KreaRealtimeConfig::default(),
             root: PathBuf::from("/nonexistent-krea-realtime-snapshot"),
+            adapters: Vec::new(),
         }
     }
 
@@ -251,6 +271,10 @@ mod tests {
             vec![ConditioningKind::Reference, ConditioningKind::VideoClip]
         );
         assert_eq!(c.samplers, vec!["self_forcing"]);
+        // S14: Wan-family style-LoRA / LoKr on the dense bf16 DiT is wired (LoadSpec::adapters →
+        // apply_adapters_strict in the load path), so both knobs are advertised honestly.
+        assert!(c.supports_lora, "S14 wires dense Wan-family style LoRA");
+        assert!(c.supports_lokr, "S14 wires the dense LoKr install path too");
         assert!(c.supports_kv_cache, "the AR regime runs a rolling KV cache");
         assert!(c.mac_only);
         assert!(!c.supports_streaming, "batch form; streaming is epic 8432");
