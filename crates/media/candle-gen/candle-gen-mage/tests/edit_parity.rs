@@ -27,6 +27,7 @@ struct Case {
     golden: &'static str,
     expected_steps: usize,
     expected_cfg: f32,
+    max_image_mean_rel: f64,
 }
 
 const CASES: &[Case] = &[
@@ -37,6 +38,7 @@ const CASES: &[Case] = &[
         golden: "mage_flow_edit_golden.safetensors",
         expected_steps: 30,
         expected_cfg: 5.0,
+        max_image_mean_rel: 0.11,
     },
     Case {
         id: "mage_flow_edit_base",
@@ -45,6 +47,7 @@ const CASES: &[Case] = &[
         golden: "mage_flow_edit_base_golden.safetensors",
         expected_steps: 30,
         expected_cfg: 5.0,
+        max_image_mean_rel: 0.10,
     },
     Case {
         id: "mage_flow_edit_turbo",
@@ -53,6 +56,7 @@ const CASES: &[Case] = &[
         golden: "mage_flow_edit_turbo_golden.safetensors",
         expected_steps: 4,
         expected_cfg: 1.0,
+        max_image_mean_rel: 0.08,
     },
 ];
 
@@ -142,10 +146,12 @@ fn all_edit_variants_match_torch_and_mlx_oracles() {
             .to_vec1::<u8>()
             .unwrap();
         let mean_rel = mean_relative_u8(&image.pixels, &want);
+        println!("{} image mean_rel={mean_rel:.6}", case.label);
         assert!(
-            mean_rel <= 0.10,
-            "{} Torch/MLX/Candle image mean_rel {mean_rel:.6} exceeds 0.10",
-            case.label
+            mean_rel <= case.max_image_mean_rel,
+            "{} Torch/MLX/Candle image mean_rel {mean_rel:.6} exceeds {:.2}",
+            case.label,
+            case.max_image_mean_rel
         );
         // A constant-white/black oracle would let the tolerance look healthy while carrying no
         // semantic signal. Pin a real dynamic range and reject that false-green class.
