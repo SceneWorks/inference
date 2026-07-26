@@ -93,6 +93,24 @@ impl QLinear {
     pub fn is_packed(&self) -> bool {
         matches!(self, Self::Packed(_))
     }
+
+    /// Wrap this frozen projection in the shared training-time LoRA seam without changing its
+    /// forward. Dense bases remain dense; an MLX-packed base remains packed (and therefore
+    /// inference-only, as required by [`candle_gen::train::lora::LoraLinear`]).
+    pub(crate) fn into_lora(
+        self,
+        in_features: usize,
+        out_features: usize,
+        path: String,
+    ) -> candle_gen::train::lora::LoraLinear {
+        use candle_gen::train::lora::LoraLinear;
+        match self {
+            Self::Dense(linear) => LoraLinear::from_linear(linear, in_features, out_features, path),
+            Self::Packed(linear) => {
+                LoraLinear::from_qlinear(linear, in_features, out_features, path)
+            }
+        }
+    }
 }
 
 impl Module for QLinear {
