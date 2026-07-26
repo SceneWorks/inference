@@ -708,11 +708,13 @@ candle_gen::register_generators! {
     footprint = component_footprint
 }
 
-/// Add the Candle LTX generator to an explicit media registry builder.
+/// Add the Candle LTX generator and trainer to an explicit media registry builder.
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    registry.register_generator(REGISTRATION)
+    registry
+        .register_generator(REGISTRATION)
+        .register_trainer(training::TRAINER_REGISTRATION)
 }
 
 /// Build the complete explicit Candle LTX provider catalog.
@@ -725,12 +727,17 @@ mod explicit_registry_tests {
     #[test]
     fn explicit_catalog_has_stable_surface() {
         let registry = super::provider_registry().unwrap();
-        let explicit: Vec<String> = registry
+        let generators: Vec<String> = registry
             .generators()
             .map(|registration| (registration.descriptor)().id.to_string())
             .collect();
+        let trainers: Vec<String> = registry
+            .trainers()
+            .map(|registration| (registration.descriptor)().id.to_string())
+            .collect();
 
-        assert_eq!(explicit, ["ltx_2_3_distilled"]);
+        assert_eq!(generators, ["ltx_2_3_distilled"]);
+        assert_eq!(trainers, ["ltx_2_3"]);
     }
 }
 
