@@ -22,7 +22,7 @@
 //! `context` (the UMT5 text embedding) is taken as an input parameter; the DiT-side text embedding +
 //! cross-attention K/V are built here once per prompt.
 
-use mlx_gen::{Error, Result};
+use mlx_gen::{CancelFlag, Error, Progress, Result};
 use mlx_rs::ops::concatenate_axis;
 use mlx_rs::{random, Array};
 
@@ -73,6 +73,10 @@ fn chunk_frame_counts(num_frames: usize, frames_per_block: usize) -> Vec<usize> 
 /// embedding + per-prompt cross-attention K/V once, then drives the chunk loop. Returns the latent
 /// sequence `[out_dim, num_latent_frames, latent_height, latent_width]` (f32).
 ///
+/// `cancel` is polled per autoregressive step inside the loop and `on_progress` streams a
+/// [`Progress::Step`] per denoise step (sc-8441 S8) — a mid-clip cancel bails within ~one step with
+/// the typed [`Error::Canceled`], rather than only at stage boundaries.
+///
 /// Errors if the latent geometry does not yield exactly `frame_seq_length` tokens per frame (the S3
 /// causal forward bakes `frame_seq_length` into its cache windowing and RoPE frame offset, so the
 /// caller must size latents to the model's canonical per-frame token count).
@@ -81,9 +85,19 @@ pub fn generate_latents(
     cfg: &KreaRealtimeConfig,
     context: &Array,
     params: &ArGenParams,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
     let mut cache = transformer.new_cache();
-    generate_latents_into(transformer, cfg, context, params, &mut cache)
+    generate_latents_into(
+        transformer,
+        cfg,
+        context,
+        params,
+        &mut cache,
+        cancel,
+        on_progress,
+    )
 }
 
 /// [`generate_latents`] against a caller-owned KV cache — the seam S5 (clean-context recompute) and S6
@@ -96,6 +110,8 @@ pub fn generate_latents_into(
     context: &Array,
     params: &ArGenParams,
     cache: &mut CausalKvCache,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
     let (ph, pw) = (cfg.wan.patch_size.1, cfg.wan.patch_size.2);
     let frame_seq_length = cfg.ar.frame_seq_length;
@@ -155,6 +171,8 @@ pub fn generate_latents_into(
         params,
         cfg.ar.do_kv_recomp,
         cfg.ar.context_noise,
+        cancel,
+        on_progress,
         denoise,
     )
 }
@@ -194,13 +212,24 @@ pub fn generate_i2v_latents(
     context: &Array,
     params: &ArGenParams,
     reference_latents: &Array,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
     let mut cache = transformer.new_cache();
     let cond = RefConditioning {
         context_latents: Some(reference_latents.clone()),
         source: None,
     };
-    generate_latents_conditioned_into(transformer, cfg, context, params, &cond, &mut cache)
+    generate_latents_conditioned_into(
+        transformer,
+        cfg,
+        context,
+        params,
+        &cond,
+        &mut cache,
+        cancel,
+        on_progress,
+    )
 }
 
 /// Autoregressive **v2v**: generate `params.num_latent_frames` frames conditioned on a clean
@@ -212,6 +241,7 @@ pub fn generate_i2v_latents(
 /// latent_height, latent_width]` (the z16 Wan VAE `encode_sample` of the source, one frame per generated
 /// frame); the pipeline's [`generate_v2v_from_components`](crate::generate_v2v_from_components) owns the
 /// VAE encode + decode.
+#[allow(clippy::too_many_arguments)]
 pub fn generate_v2v_latents(
     transformer: &CausalKreaTransformer,
     cfg: &KreaRealtimeConfig,
@@ -219,13 +249,24 @@ pub fn generate_v2v_latents(
     params: &ArGenParams,
     source_latents: &Array,
     strength: f32,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
     let mut cache = transformer.new_cache();
     let cond = RefConditioning {
         context_latents: None,
         source: Some((source_latents.clone(), strength)),
     };
-    generate_latents_conditioned_into(transformer, cfg, context, params, &cond, &mut cache)
+    generate_latents_conditioned_into(
+        transformer,
+        cfg,
+        context,
+        params,
+        &cond,
+        &mut cache,
+        cancel,
+        on_progress,
+    )
 }
 
 /// The shared i2v/v2v conditioned AR generation against a caller-owned KV cache (the seam the S7
@@ -234,6 +275,7 @@ pub fn generate_v2v_latents(
 /// cache from `cond.context_latents` (committing each context block at timestep `0`), then runs the AR
 /// loop for `params.num_latent_frames` frames — pure-noise init (i2v) or source-renoised init (v2v) —
 /// and prepends the context frames to the output. The `cache` must be empty on entry.
+#[allow(clippy::too_many_arguments)]
 pub fn generate_latents_conditioned_into(
     transformer: &CausalKreaTransformer,
     cfg: &KreaRealtimeConfig,
@@ -241,6 +283,8 @@ pub fn generate_latents_conditioned_into(
     params: &ArGenParams,
     cond: &RefConditioning,
     cache: &mut CausalKvCache,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
     let (ph, pw) = (cfg.wan.patch_size.1, cfg.wan.patch_size.2);
     let frame_seq_length = cfg.ar.frame_seq_length;
@@ -306,6 +350,11 @@ pub fn generate_latents_conditioned_into(
         let f_ctx = s[1] as usize;
         let mut cursor = 0usize;
         for chunk_frames in chunk_frame_counts(f_ctx, cfg.ar.num_frames_per_block) {
+            // Cancellation checkpoint while warming the KV cache from clean context (bail before the
+            // next reference-block commit). The bulk cancel target is the per-step AR loop below.
+            if cancel.is_cancelled() {
+                return Err(Error::Canceled);
+            }
             let idx: Vec<i32> = (cursor as i32..(cursor + chunk_frames) as i32).collect();
             let chunk = ctx_lat.take_axis(Array::from_slice(&idx, &[idx.len() as i32]), 1)?;
             // Commit (not read-only): populate the clean-context K/V for this reference block.
@@ -346,6 +395,8 @@ pub fn generate_latents_conditioned_into(
         cfg.ar.context_noise,
         start_token,
         init_source,
+        cancel,
+        on_progress,
         denoise,
     )?;
 
@@ -367,6 +418,8 @@ fn run_ar_loop(
     params: &ArGenParams,
     do_kv_recomp: bool,
     context_noise: f32,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
     denoise: impl FnMut(&Array, f32, usize, bool) -> Result<Array>,
 ) -> Result<Array> {
     run_ar_loop_conditioned(
@@ -379,6 +432,8 @@ fn run_ar_loop(
         context_noise,
         0,
         None,
+        cancel,
+        on_progress,
         denoise,
     )
 }
@@ -405,6 +460,15 @@ fn run_ar_loop(
 /// schedule's max-timestep sigma — instead of pure noise (`latents·(1−σ) + ε·σ`,
 /// `release_server.py:426,658` + `v2v.py::get_denoising_schedule`). `source` is `[C, num_latent_frames,
 /// H, W]` (one source frame per generated frame). `None` ⇒ pure-noise init (t2v / i2v continuation).
+///
+/// **Per-step cancel + progress (sc-8441 S8).** `cancel` is polled at the top of every chunk **and**
+/// every denoise step (before the forward) — a set flag bails promptly with the typed
+/// [`Error::Canceled`], so a mid-clip cancel interrupts within ~one step instead of after the whole
+/// clip. The per-step [`mlx_rs::transforms::eval`] already materializes each step's compute, which is
+/// what makes the poll effective (MLX's lazy graph would otherwise defer all compute past the loop —
+/// mirrors `mlx-gen-scail2` / `mlx-gen-wan`). `on_progress` emits a [`Progress::Step`] after each
+/// denoise step's `eval` with a monotonic 1-based `current` over `total = num_chunks · n_steps`; the
+/// clean-context recompute forward is KV housekeeping, not a denoise step, so it is not counted.
 #[allow(clippy::too_many_arguments)]
 fn run_ar_loop_conditioned(
     schedule: &FewStepSchedule,
@@ -416,6 +480,8 @@ fn run_ar_loop_conditioned(
     context_noise: f32,
     start_token_offset: usize,
     init_source: Option<(&Array, f64)>,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
     mut denoise: impl FnMut(&Array, f32, usize, bool) -> Result<Array>,
 ) -> Result<Array> {
     let step_ts = schedule.step_timesteps();
@@ -446,10 +512,20 @@ fn run_ar_loop_conditioned(
     let full_noise =
         random::normal::<f32>(&[c, num_frames as i32, h, w], None, None, Some(&noise_key))?;
 
+    // Per-step progress is reported over the whole clip (num_chunks · n_steps), not per chunk, so the
+    // count is monotonic across chunk boundaries (mirrors the scail2 whole-job Step count).
+    let chunk_counts = chunk_frame_counts(num_frames, frames_per_block);
+    let total_steps = (chunk_counts.len() * n_steps) as u32;
+    let mut steps_done = 0u32;
+
     let mut outputs: Vec<Array> = Vec::new();
     let mut frame_cursor = 0usize;
     let mut start_token = start_token_offset;
-    for chunk_frames in chunk_frame_counts(num_frames, frames_per_block) {
+    for chunk_frames in chunk_counts {
+        // Per-chunk cancellation checkpoint (F-003): bail before committing to a new chunk's denoise.
+        if cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
         // This chunk's init: pure seeded noise (t2v / i2v), or — for v2v — the VAE-encoded source clip
         // renoised to the strength schedule's max sigma (`source·(1−σ) + ε·σ`). Both slice the frame
         // axis `[frame_cursor : frame_cursor + chunk_frames]` (the reference's `noise[:, block]`).
@@ -469,6 +545,12 @@ fn run_ar_loop_conditioned(
         // clean-context recompute below — exactly one commit per chunk either way.
         let mut chunk_x0: Option<Array> = None;
         for (i, &t) in step_ts.iter().enumerate() {
+            // Per-step cancellation checkpoint (F-003): poll before each forward so a mid-clip cancel
+            // bails within ~one step. The per-step `eval` below materializes the step's compute, which
+            // is what makes this effective (MLX would otherwise defer all compute past the loop).
+            if cancel.is_cancelled() {
+                return Err(Error::Canceled);
+            }
             let is_final = i + 1 == n_steps;
             let commit = is_final && !do_kv_recomp;
             let velocity = denoise(&cur, t as f32, start_token, commit)?;
@@ -485,6 +567,13 @@ fn run_ar_loop_conditioned(
                 cur = renoise_step(&x0_i, &eps, sigma_next)?;
                 mlx_rs::transforms::eval([&cur])?;
             }
+            // Report sampling progress after the step's compute is materialized (denoise steps only —
+            // the clean-context recompute below is KV housekeeping, not a denoise step).
+            steps_done += 1;
+            on_progress(Progress::Step {
+                current: steps_done,
+                total: total_steps,
+            });
         }
         let x0 = chunk_x0.ok_or_else(|| Error::Msg("krea AR: empty denoising schedule".into()))?;
 
@@ -508,6 +597,17 @@ fn run_ar_loop_conditioned(
 mod tests {
     use super::*;
     use std::cell::RefCell;
+
+    /// A never-cancelled flag for the loop-structure/determinism tests (cancel is exercised by the
+    /// dedicated `ar_loop_cancels_*` tests below).
+    fn no_cancel() -> CancelFlag {
+        CancelFlag::new()
+    }
+
+    /// A no-op progress sink for the tests that do not assert on progress.
+    fn sink() -> impl FnMut(Progress) {
+        |_| {}
+    }
 
     fn params(seed: u64, frames: usize) -> ArGenParams {
         ArGenParams {
@@ -557,6 +657,8 @@ mod tests {
             &p,
             false,
             0.0,
+            &no_cancel(),
+            &mut sink(),
             |chunk, t, start, commit| {
                 // Every step of a chunk sees the committed history (== the simulated cache position).
                 assert_eq!(
@@ -616,7 +718,19 @@ mod tests {
             calls.borrow_mut().push((t, start, commit, s));
             Ok(Array::ones::<f32>(chunk.shape())?)
         };
-        let out = run_ar_loop(&schedule, 16, fsl, fpb, &p, true, ctx_noise, denoise).unwrap();
+        let out = run_ar_loop(
+            &schedule,
+            16,
+            fsl,
+            fpb,
+            &p,
+            true,
+            ctx_noise,
+            &no_cancel(),
+            &mut sink(),
+            denoise,
+        )
+        .unwrap();
         let calls = calls.into_inner();
 
         // n_steps read-only denoise forwards + exactly one commit (the recompute).
@@ -660,7 +774,19 @@ mod tests {
             calls.borrow_mut().push((t, commit));
             Ok(Array::zeros::<f32>(chunk.shape()).unwrap())
         };
-        run_ar_loop(&schedule, 16, 4, 2, &p, false, 0.0, denoise).unwrap();
+        run_ar_loop(
+            &schedule,
+            16,
+            4,
+            2,
+            &p,
+            false,
+            0.0,
+            &no_cancel(),
+            &mut sink(),
+            denoise,
+        )
+        .unwrap();
         let calls = calls.into_inner();
         assert_eq!(calls.len(), n_steps, "no recompute forward when off");
         assert_eq!(
@@ -679,9 +805,45 @@ mod tests {
             Ok(Array::zeros::<f32>(chunk.shape()).unwrap())
         };
 
-        let a = run_ar_loop(&schedule, 16, 4, 3, &params(7, 6), false, 0.0, zeros).unwrap();
-        let b = run_ar_loop(&schedule, 16, 4, 3, &params(7, 6), false, 0.0, zeros).unwrap();
-        let c = run_ar_loop(&schedule, 16, 4, 3, &params(8, 6), false, 0.0, zeros).unwrap();
+        let a = run_ar_loop(
+            &schedule,
+            16,
+            4,
+            3,
+            &params(7, 6),
+            false,
+            0.0,
+            &no_cancel(),
+            &mut sink(),
+            zeros,
+        )
+        .unwrap();
+        let b = run_ar_loop(
+            &schedule,
+            16,
+            4,
+            3,
+            &params(7, 6),
+            false,
+            0.0,
+            &no_cancel(),
+            &mut sink(),
+            zeros,
+        )
+        .unwrap();
+        let c = run_ar_loop(
+            &schedule,
+            16,
+            4,
+            3,
+            &params(8, 6),
+            false,
+            0.0,
+            &no_cancel(),
+            &mut sink(),
+            zeros,
+        )
+        .unwrap();
 
         let diff_same = mlx_rs::ops::max(
             mlx_rs::ops::abs(mlx_rs::ops::subtract(&a, &b).unwrap()).unwrap(),
@@ -722,6 +884,8 @@ mod tests {
             0.0,
             offset,
             None,
+            &no_cancel(),
+            &mut sink(),
             |chunk, _t, start, _commit| {
                 starts.borrow_mut().push(start);
                 Ok(Array::zeros::<f32>(chunk.shape()).unwrap())
@@ -762,6 +926,8 @@ mod tests {
                 0.0,
                 0,
                 init_source,
+                &no_cancel(),
+                &mut sink(),
                 |chunk, _t, _start, _commit| {
                     if seen.borrow().is_none() {
                         *seen.borrow_mut() =
@@ -798,6 +964,242 @@ mod tests {
         assert_eq!(
             n1, n2,
             "pure-noise init is source-independent and seed-deterministic"
+        );
+    }
+
+    /// sc-8441 S8 — **cancel at a chunk boundary**: a `CancelFlag` tripped after the first chunk commits
+    /// makes the loop bail at the next chunk's per-chunk poll with [`Error::Canceled`], running
+    /// **strictly fewer** transformer forwards and committing **fewer chunks** than a full run (the
+    /// discriminating assertion: a mid-generation cancel must not complete all chunks).
+    #[test]
+    fn ar_loop_cancels_at_chunk_boundary_and_commits_fewer_chunks() {
+        let schedule = FewStepSchedule::new(5.0, &[1000, 937, 833, 625, 0], None).unwrap();
+        let n_steps = schedule.num_steps();
+        let fsl = 4;
+        let fpb = 2;
+        let p = params(1234, 6); // 3 chunks: [2, 2, 2]
+
+        // Baseline: a full (never-cancelled) run does 3·n_steps forwards and 3 commits.
+        let full_calls = RefCell::new(0usize);
+        let full_commits = RefCell::new(0usize);
+        run_ar_loop(
+            &schedule,
+            16,
+            fsl,
+            fpb,
+            &p,
+            false,
+            0.0,
+            &no_cancel(),
+            &mut sink(),
+            |chunk, _t, _s, commit| {
+                *full_calls.borrow_mut() += 1;
+                if commit {
+                    *full_commits.borrow_mut() += 1;
+                }
+                Ok(Array::zeros::<f32>(chunk.shape()).unwrap())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            *full_calls.borrow(),
+            3 * n_steps,
+            "full run = chunks · steps"
+        );
+        assert_eq!(*full_commits.borrow(), 3, "full run commits every chunk");
+
+        // Cancel after the first chunk commits (recompute off ⇒ the final step commits).
+        let cancel = CancelFlag::new();
+        let calls = RefCell::new(0usize);
+        let commits = RefCell::new(0usize);
+        let res = run_ar_loop(
+            &schedule,
+            16,
+            fsl,
+            fpb,
+            &p,
+            false,
+            0.0,
+            &cancel,
+            &mut sink(),
+            |chunk, _t, _s, commit| {
+                *calls.borrow_mut() += 1;
+                if commit {
+                    *commits.borrow_mut() += 1;
+                    cancel.cancel(); // trip cancellation the instant the first chunk commits
+                }
+                Ok(Array::zeros::<f32>(chunk.shape()).unwrap())
+            },
+        );
+
+        assert!(
+            matches!(res, Err(Error::Canceled)),
+            "a set flag must bail with the typed Error::Canceled"
+        );
+        // DISCRIMINATING: fewer forwards AND fewer committed chunks than the full run.
+        assert_eq!(
+            *calls.borrow(),
+            n_steps,
+            "only the first chunk's steps ran before the boundary poll bailed"
+        );
+        assert!(
+            *calls.borrow() < 3 * n_steps,
+            "a mid-clip cancel must run fewer forwards than the whole clip"
+        );
+        assert_eq!(*commits.borrow(), 1, "only the first chunk committed");
+        assert!(
+            *commits.borrow() < 3,
+            "a mid-clip cancel must commit fewer chunks than the whole clip"
+        );
+    }
+
+    /// sc-8441 S8 — **cancel mid-chunk** (per-denoise-step polling): a flag tripped partway through the
+    /// first chunk's denoise steps bails at the *next* per-step poll, before the chunk finishes its
+    /// steps or commits — proving the poll is per-step, not only per-chunk.
+    #[test]
+    fn ar_loop_cancels_mid_chunk_before_completing_the_chunk() {
+        let schedule = FewStepSchedule::new(5.0, &[1000, 937, 833, 625, 0], None).unwrap();
+        let n_steps = schedule.num_steps(); // 5
+        let fsl = 4;
+        let fpb = 2;
+        let p = params(1234, 6); // 3 chunks, but we bail during chunk 0
+
+        let cancel = CancelFlag::new();
+        let calls = RefCell::new(0usize);
+        let commits = RefCell::new(0usize);
+        let cancel_at = 2usize; // trip during the 2nd forward — well before the chunk's final (5th) step
+        let res = run_ar_loop(
+            &schedule,
+            16,
+            fsl,
+            fpb,
+            &p,
+            false,
+            0.0,
+            &cancel,
+            &mut sink(),
+            |chunk, _t, _s, commit| {
+                let n = {
+                    let mut c = calls.borrow_mut();
+                    *c += 1;
+                    *c
+                };
+                if commit {
+                    *commits.borrow_mut() += 1;
+                }
+                if n == cancel_at {
+                    cancel.cancel();
+                }
+                Ok(Array::zeros::<f32>(chunk.shape()).unwrap())
+            },
+        );
+
+        assert!(matches!(res, Err(Error::Canceled)));
+        // The per-step poll bails at the next step, before the chunk's remaining steps run.
+        assert_eq!(
+            *calls.borrow(),
+            cancel_at,
+            "the per-step poll bails before the next forward"
+        );
+        assert!(
+            *calls.borrow() < n_steps,
+            "a mid-chunk cancel must bail before completing the first chunk"
+        );
+        assert_eq!(
+            *commits.borrow(),
+            0,
+            "no chunk commits on a mid-chunk cancel (recompute off ⇒ commit is the final step)"
+        );
+    }
+
+    /// sc-8441 S8 — **per-step progress**: the loop emits exactly one [`Progress::Step`] per denoise
+    /// step across all chunks, with a strictly monotonic 1-based `current` over a constant
+    /// `total = num_chunks · n_steps` (the clean-context recompute forward is not counted).
+    #[test]
+    fn ar_loop_emits_monotonic_per_step_progress() {
+        let schedule = FewStepSchedule::new(5.0, &[1000, 937, 833, 625, 0], None).unwrap();
+        let n_steps = schedule.num_steps();
+        let fsl = 4;
+        let fpb = 2;
+        let p = params(1234, 6); // 3 chunks: [2, 2, 2] ⇒ 15 denoise steps
+
+        let events = RefCell::new(Vec::<(u32, u32)>::new());
+        run_ar_loop(
+            &schedule,
+            16,
+            fsl,
+            fpb,
+            &p,
+            false,
+            0.0,
+            &no_cancel(),
+            &mut |pr: Progress| {
+                if let Progress::Step { current, total } = pr {
+                    events.borrow_mut().push((current, total));
+                }
+            },
+            |chunk, _t, _s, _c| Ok(Array::zeros::<f32>(chunk.shape()).unwrap()),
+        )
+        .unwrap();
+
+        let events = events.into_inner();
+        let expected_total = 3 * n_steps as u32;
+        assert_eq!(
+            events.len(),
+            expected_total as usize,
+            "one Progress::Step per denoise step across all chunks"
+        );
+        assert!(
+            events.iter().all(|&(_, total)| total == expected_total),
+            "total is a constant num_chunks · n_steps"
+        );
+        for (i, &(current, _)) in events.iter().enumerate() {
+            assert_eq!(
+                current,
+                i as u32 + 1,
+                "1-based, strictly monotonic step count"
+            );
+        }
+        assert_eq!(
+            events.last().unwrap().0,
+            expected_total,
+            "the final step reaches total"
+        );
+    }
+
+    /// sc-8441 S8 — **recompute-on** (the shipped default) also polls + reports per denoise step: with
+    /// `do_kv_recomp = true` every denoise step is read-only and the single per-chunk commit is the
+    /// clean-context recompute, which must NOT emit a progress step (only the n_steps denoise steps do).
+    #[test]
+    fn ar_loop_progress_excludes_the_recompute_forward() {
+        let schedule = FewStepSchedule::new(5.0, &[1000, 937, 833, 625, 0], None).unwrap();
+        let n_steps = schedule.num_steps();
+        let fsl = 4;
+        let fpb = 2;
+        let p = params(1234, 2); // exactly one chunk
+
+        let count = RefCell::new(0usize);
+        run_ar_loop(
+            &schedule,
+            16,
+            fsl,
+            fpb,
+            &p,
+            true, // recompute on ⇒ one extra (commit) forward per chunk
+            7.0,
+            &no_cancel(),
+            &mut |pr: Progress| {
+                if matches!(pr, Progress::Step { .. }) {
+                    *count.borrow_mut() += 1;
+                }
+            },
+            |chunk, _t, _s, _c| Ok(Array::ones::<f32>(chunk.shape()).unwrap()),
+        )
+        .unwrap();
+        assert_eq!(
+            count.into_inner(),
+            n_steps,
+            "progress counts denoise steps only, not the clean-context recompute forward"
         );
     }
 }
