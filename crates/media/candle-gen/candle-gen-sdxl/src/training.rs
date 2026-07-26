@@ -515,6 +515,9 @@ pub fn trainer_descriptor() -> TrainerDescriptor {
         // sc-10894 lockstep catch-up: gen-core gained `TrainerDescriptor.supports_control` (mirrors
         // mlx-gen-sdxl's `false`).
         supports_control: false,
+        // Adapter-only: no full base fine-tune path (sc-14056). The shared
+        // `validate_full_finetune_request` floor makes a `full_finetune` request a typed reject.
+        supports_full_finetune: false,
     }
 }
 
@@ -566,6 +569,10 @@ impl Trainer for SdxlTrainer {
     }
 
     fn validate(&self, req: &TrainingRequest) -> gen_core::Result<()> {
+        // Shared full-base-fine-tune floor (sc-14056): an adapter-only trainer must reject a
+        // `full_finetune` request (typed `Unsupported`) rather than silently training a LoRA
+        // adapter the caller did not ask for (F-006/F-055).
+        gen_core::train::validate_full_finetune_request(self.descriptor(), req)?;
         self.validate_impl(req).map_err(Into::into)
     }
 

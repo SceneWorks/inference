@@ -97,6 +97,18 @@ pub struct TrainingConfig {
     /// the produced overlay's metadata so the model catalog / registration describes it correctly
     /// (rather than a hardcoded label). A control-branch trainer requires it set.
     pub control_type: Option<String>,
+    /// **Full base-model fine-tune** selector (F-6, epic 14034 / sc-14056): when `true`, the family
+    /// trainer updates *every* DiT weight rather than injecting a LoRA/LoKr adapter, producing a full
+    /// fine-tuned checkpoint instead of an adapter. `false` (the default) is the LoRA/LoKr path, so it
+    /// is additive — every existing `..Default::default()` caller and the whole conformance surface is
+    /// unaffected (the same additive shape as [`control_type`](Self::control_type)). Only a trainer that
+    /// advertises [`TrainerDescriptor::supports_full_finetune`] (Mage-Flow-Base today) may honor it; an
+    /// adapter-only trainer must **reject** the request via the shared
+    /// [`validate_full_finetune_request`] floor — it must never silently train a LoRA instead (F-006 /
+    /// F-055). Because the dense retained-graph backward holds the whole model,
+    /// a full fine-tune is memory-heavy: the platform/tier gate (SceneWorks) bounds it, and
+    /// production-resolution runs additionally need gradient checkpointing (not yet ported, sc-14989).
+    pub full_finetune: bool,
     /// Flow-match timestep sampling distribution (`sigmoid`/`linear`/`uniform`/…) — the *noise*
     /// schedule, distinct from `lr_scheduler`.
     pub timestep_type: String,
@@ -157,6 +169,9 @@ impl Default for TrainingConfig {
             decompose_factor: -1,
             lora_target_modules: Vec::new(),
             control_type: None,
+            // Full base fine-tune is OFF by default (F-6): a caller that does not opt in trains a
+            // LoRA/LoKr adapter exactly as before. The worker sets it from the plan for a full-tune run.
+            full_finetune: false,
             timestep_type: "sigmoid".to_string(),
             timestep_bias: "balanced".to_string(),
             loss_type: "mse".to_string(),
@@ -291,6 +306,14 @@ pub struct TrainerDescriptor {
     /// LoRA/LoKr-only trainer shipped today — they must *reject* a control request, not silently train
     /// a plain adapter (F-006 / F-055).
     pub supports_control: bool,
+    /// Whether this trainer can run a **full base fine-tune** (the sc-14056 / epic-14034
+    /// [`TrainingConfig::full_finetune`] contract) — updating *every* base weight and emitting a full
+    /// fine-tuned checkpoint — as opposed to injecting a LoRA/LoKr adapter. The shared
+    /// [`validate_full_finetune_request`] floor uses it to decide whether a `full_finetune` request is
+    /// a capability gap (reject typed). `false` for every adapter-only trainer shipped today — they
+    /// must *reject* a full-fine-tune request, not silently train a LoRA adapter and hand back
+    /// something the caller did not ask for (F-006 / F-055, the same class the control floor guards).
+    pub supports_full_finetune: bool,
 }
 
 /// The shared control-training validation floor (F-006) — the training analog of
@@ -328,6 +351,33 @@ pub fn validate_control_request(
         return Err(crate::Error::Msg(format!(
             "{}: control_type {control_type:?} requires a control image on every training item \
              (item {idx} has none)",
+            desc.id
+        )));
+    }
+    Ok(())
+}
+
+/// The shared **full-base-fine-tune** validation floor (F-006, sc-14056) — the exact analog of
+/// [`validate_control_request`] for the [`TrainingConfig::full_finetune`] selector. A family
+/// trainer's `validate` calls it so the "unsupported ⇒ typed reject" rule lives in one place instead
+/// of each adapter-only trainer independently deciding to ignore the flag.
+///
+/// - `full_finetune == false` ⇒ the plain LoRA/LoKr path: no-op.
+/// - `full_finetune == true` on a trainer that does **not** advertise
+///   [`supports_full_finetune`](TrainerDescriptor::supports_full_finetune) ⇒ typed
+///   [`crate::Error::Unsupported`]. Silently training an adapter instead would hand the caller a
+///   ~100 MB LoRA where they asked for a fine-tuned base checkpoint, and the consumer's memory gate,
+///   output registration, and UI would all describe the wrong artifact — the F-055 silent-adapter
+///   class, which this repo already refuses for `control_type`.
+/// - `full_finetune == true` on a full-tune-capable trainer ⇒ ok.
+pub fn validate_full_finetune_request(
+    desc: &TrainerDescriptor,
+    req: &TrainingRequest,
+) -> crate::Result<()> {
+    if req.config.full_finetune && !desc.supports_full_finetune {
+        return Err(crate::Error::Unsupported(format!(
+            "{}: full base fine-tune (full_finetune) is not supported by this trainer — it can only \
+             train a LoRA/LoKr adapter",
             desc.id
         )));
     }
@@ -382,7 +432,49 @@ mod tests {
         assert_eq!(TrainingConfig::default().control_type, None);
     }
 
+    #[test]
+    fn full_finetune_is_opt_in_and_the_flag_discriminates() {
+        // Additive (sc-14056): every `..Default::default()` caller and the whole conformance surface
+        // trains a LoRA/LoKr adapter; only a full-base-fine-tune run opts in.
+        //
+        // This deliberately does NOT just assert the default value — a bare
+        // `assert!(!TrainingConfig::default().full_finetune)` is a constant that passes no matter what
+        // the floor does with the field, and would still pass if `validate_full_finetune_request` were
+        // deleted. Instead assert the *behavioral* difference the flag must make: on one and the same
+        // adapter-only trainer, two requests differing ONLY by this field land on opposite sides of
+        // the floor. Flip the default, or stop reading the field, and exactly one half breaks.
+        let desc = trainer_desc(false);
+        let items = vec![TrainingItem::captioned(
+            PathBuf::from("a.png"),
+            "a cat".into(),
+        )];
+
+        let adapter_req = train_req(None, items);
+        assert!(
+            !adapter_req.config.full_finetune,
+            "the default request must be the adapter path"
+        );
+        assert!(
+            validate_full_finetune_request(&desc, &adapter_req).is_ok(),
+            "an adapter-only trainer must accept the default (non-full) request"
+        );
+
+        let mut full_req = adapter_req;
+        full_req.config.full_finetune = true;
+        assert!(
+            validate_full_finetune_request(&desc, &full_req).is_err(),
+            "flipping only `full_finetune` must change the outcome — otherwise the field is inert"
+        );
+    }
+
     fn trainer_desc(supports_control: bool) -> TrainerDescriptor {
+        trainer_desc_with(supports_control, false)
+    }
+
+    fn trainer_desc_with(
+        supports_control: bool,
+        supports_full_finetune: bool,
+    ) -> TrainerDescriptor {
         TrainerDescriptor {
             id: "fam_trainer",
             family: "fam",
@@ -391,6 +483,7 @@ mod tests {
             supports_lora: true,
             supports_lokr: false,
             supports_control,
+            supports_full_finetune,
         }
     }
 
@@ -450,5 +543,56 @@ mod tests {
             &train_req(Some("pose"), ctrl_items)
         )
         .is_ok());
+    }
+
+    #[test]
+    fn validate_full_finetune_request_floor() {
+        // F-006 (sc-14056): the shared full-base-fine-tune floor, mirroring the control floor above.
+        let items = vec![TrainingItem::captioned(
+            PathBuf::from("a.png"),
+            "a cat".into(),
+        )];
+        let full_req = |desc_items: Vec<TrainingItem>| {
+            let mut req = train_req(None, desc_items);
+            req.config.full_finetune = true;
+            req
+        };
+
+        // full_finetune unset ⇒ no-op on BOTH trainer kinds (additive; the whole existing surface).
+        for supports_full in [false, true] {
+            assert!(
+                validate_full_finetune_request(
+                    &trainer_desc_with(false, supports_full),
+                    &train_req(None, items.clone())
+                )
+                .is_ok(),
+                "a non-full request must pass regardless of supports_full_finetune"
+            );
+        }
+
+        // full_finetune set on a trainer that does NOT advertise it ⇒ typed Unsupported. It must
+        // REJECT, not fall through and silently train a LoRA adapter — the F-055 class.
+        let err = validate_full_finetune_request(
+            &trainer_desc_with(false, false),
+            &full_req(items.clone()),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported(_)),
+            "a full fine-tune on an adapter-only trainer is a capability gap → Unsupported, got \
+             {err:?}"
+        );
+        assert!(
+            err.to_string().contains("full_finetune"),
+            "the rejection must name the unsupported capability, got {err}"
+        );
+
+        // full_finetune set on a full-tune-capable trainer ⇒ ok. This is the half that proves the
+        // floor reads the descriptor flag rather than rejecting every full request outright.
+        assert!(
+            validate_full_finetune_request(&trainer_desc_with(false, true), &full_req(items))
+                .is_ok(),
+            "a trainer advertising supports_full_finetune must be allowed through the floor"
+        );
     }
 }

@@ -147,6 +147,23 @@ pub fn check_trainer_validate(t: &dyn Trainer, profile: &TrainerProfile) -> Resu
             ));
         }
     }
+
+    // Negative (F-006, sc-14056): a full-base-fine-tune request on a trainer that does NOT advertise
+    // `supports_full_finetune` must be rejected by `validate()` — not silently trained as a LoRA
+    // adapter (F-055), which would hand the caller a small adapter where they asked for a fine-tuned
+    // base checkpoint. The shared `validate_full_finetune_request` floor enforces this; assert the
+    // trainer routes through it. (A full-tune-capable trainer is exempt — it should accept.)
+    if !desc.supports_full_finetune {
+        let mut full = ok.clone();
+        full.config.full_finetune = true;
+        if t.validate(&full).is_ok() {
+            return Err(format!(
+                "validate-honesty[{id}]: a full base fine-tune request (full_finetune == true) was \
+                 accepted by validate() despite supports_full_finetune == false — it must be \
+                 rejected, not silently trained as a LoRA adapter (F-006/F-055)"
+            ));
+        }
+    }
     Ok(())
 }
 
