@@ -9,10 +9,12 @@
 //!   2. **sharded** `transformer/` (3 shards + index) — the **same** key names **without** the
 //!      `model.` prefix (the plain Wan native layout).
 //!
-//! [`normalize_krea_keys`] strips a leading `model.` from every key so both layouts collapse to the
-//! plain Wan native names, then the shared Wan sanitizer maps them onto the internal
-//! [`mlx_gen_wan::WanTransformer`] key layout. The reference runs the DiT in **bf16**, so — like every
-//! Wan converter ([`mlx_gen_wan::convert::convert_ti2v_5b`] etc.) — we cast the (F16) checkpoint to
+//! Both on-disk layouts are the reference `krea-ai/realtime-video` checkpoint's shipped formats, so the
+//! key normalization here is **adapted from** the reference checkpoint layout: [`normalize_krea_keys`]
+//! strips a leading `model.` from every key so both layouts collapse to the plain Wan native names, then
+//! the shared Wan sanitizer maps them onto the internal [`mlx_gen_wan::WanTransformer`] key layout. The
+//! reference runs the DiT in **bf16**, so — like every Wan converter
+//! ([`mlx_gen_wan::convert::convert_ti2v_5b`] etc.) — we cast the (F16) checkpoint to
 //! [`TRANSFORMER_DTYPE`] (`Bfloat16`) on the way out.
 //!
 //! This is the **non-gated** S2 converter: it is validated against the S1 tensor inventory with

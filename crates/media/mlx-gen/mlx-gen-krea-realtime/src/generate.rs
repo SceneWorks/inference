@@ -1,8 +1,8 @@
 //! Krea Realtime 14B **autoregressive chunk driver** (sc-8437 S4; clean-context recompute sc-8438 S5).
 //!
 //! The AR loop that turns the S3 causal forward + persistent KV cache
-//! ([`CausalKreaTransformer`]) into a latent video sequence, mirroring
-//! the reference `causal_inference.py:177-245`. For each of `ceil(num_frames / num_frames_per_block)`
+//! ([`CausalKreaTransformer`]) into a latent video sequence, **adapted from**
+//! the reference `causal_inference.py:177-245` (`krea-ai/realtime-video`). For each of `ceil(num_frames / num_frames_per_block)`
 //! chunks (a chunk = `num_frames_per_block` latent frames) it runs the Self-Forcing few-step denoise
 //! ([`FewStepSchedule`]) — one batch-1 forward per step, **CFG off** — threading the persistent cache
 //! and advancing the global token offset so chunk *k* attends chunk *k−1*'s committed context.

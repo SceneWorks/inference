@@ -1,7 +1,7 @@
 //! Krea Realtime 14B **Self-Forcing few-step** flow-matching scheduler (sc-8437, S4).
 //!
 //! Despite the config's UniPC-flavoured naming, Krea Realtime's per-block denoise is **not** UniPC
-//! (the S1 audit): it is the bespoke few-step flow-matching renoise loop from the reference
+//! (the S1 audit): it is the bespoke few-step flow-matching renoise loop **adapted from** the reference
 //! (`krea-ai/realtime-video utils/scheduler.py` + `before_denoise.py::WanRTSetTimestepsStep` +
 //! `denoise.py`, mirrored by Self-Forcing's `FlowMatchScheduler`). A short `denoising_step_list`
 //! (`[1000, 937, 833, 625, 0]` for the shipped 14B) is run over one autoregressive chunk; each step
@@ -26,6 +26,11 @@
 //! `x0` is `latents - 0.00498·noise_pred` (essentially the clean latent). The coefficient math runs
 //! in `f64` (the reference's Python-float / numpy path); only the final tensor combinations run in the
 //! latent dtype (f32), mirroring [`mlx_gen_wan::scheduler`].
+//!
+//! The sigma schedule, the time-shift, and the Euler/renoise formulas are **re-derived** published
+//! flow-matching algebra (mathematical facts), written independently in Rust and validated against
+//! hand-computed literals — an architecture/formula reimplementation, **not** a line-for-line
+//! transcription of the reference's source structure.
 
 use mlx_rs::ops::{add, multiply, subtract};
 use mlx_rs::Array;

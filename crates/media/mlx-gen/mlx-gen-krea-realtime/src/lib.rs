@@ -10,7 +10,9 @@
 //!
 //! What makes Krea Realtime distinct from stock Wan is its **inference regime**, not its weights: a
 //! short per-frame-block `denoising_step_list`, a rolling KV cache, and (optional) local/block-sparse
-//! causal attention. Those knobs live on [`KreaArConfig`] so the preset is complete, but they are
+//! causal attention. That autoregressive regime is **adapted from** the reference implementation
+//! (`krea-ai/realtime-video`) — an architecture reimplementation in native MLX, not a copy of its
+//! source. Those knobs live on [`KreaArConfig`] so the preset is complete, but they are
 //! **not consumed until S3–S5** (causal attention / KV cache / the AR self-forcing loop). Keep this
 //! crate mentally distinct from the unrelated **image** crate `mlx-gen-krea` (Krea 2 Turbo, engine
 //! `krea_2_turbo`).
