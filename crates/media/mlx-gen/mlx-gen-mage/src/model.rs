@@ -694,8 +694,8 @@ mod tests {
         write(flat.join("transformer"), 300);
         write(flat.join("text_encoder"), 700);
         write(flat.join("vae"), 50);
-        let got =
-            component_footprint(&mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir(flat))).unwrap();
+        let got = component_footprint(&mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir(flat)))
+            .unwrap();
         assert_eq!((got.dit, got.text_encoder, got.vae), (300, 700, 50));
 
         std::fs::remove_dir_all(root).ok();
