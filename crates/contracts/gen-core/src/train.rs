@@ -97,6 +97,16 @@ pub struct TrainingConfig {
     /// the produced overlay's metadata so the model catalog / registration describes it correctly
     /// (rather than a hardcoded label). A control-branch trainer requires it set.
     pub control_type: Option<String>,
+    /// **Full base-model fine-tune** selector (F-6, epic 14034 / sc-14056): when `true`, the family
+    /// trainer updates *every* DiT weight rather than injecting a LoRA/LoKr adapter, producing a full
+    /// fine-tuned checkpoint instead of an adapter. `false` (the default) is the LoRA/LoKr path, so it
+    /// is additive — every existing `..Default::default()` caller and the whole conformance surface is
+    /// unaffected (the same additive shape as [`control_type`](Self::control_type)). Only a trainer that
+    /// implements the full path (Mage-Flow-Base today) honors it; a LoRA-only trainer ignores the flag
+    /// and trains an adapter as before. Because the dense retained-graph backward holds the whole model,
+    /// a full fine-tune is memory-heavy: the platform/tier gate (SceneWorks) bounds it, and
+    /// production-resolution runs additionally need gradient checkpointing (not yet ported, sc-14989).
+    pub full_finetune: bool,
     /// Flow-match timestep sampling distribution (`sigmoid`/`linear`/`uniform`/…) — the *noise*
     /// schedule, distinct from `lr_scheduler`.
     pub timestep_type: String,
@@ -157,6 +167,9 @@ impl Default for TrainingConfig {
             decompose_factor: -1,
             lora_target_modules: Vec::new(),
             control_type: None,
+            // Full base fine-tune is OFF by default (F-6): a caller that does not opt in trains a
+            // LoRA/LoKr adapter exactly as before. The worker sets it from the plan for a full-tune run.
+            full_finetune: false,
             timestep_type: "sigmoid".to_string(),
             timestep_bias: "balanced".to_string(),
             loss_type: "mse".to_string(),
@@ -380,6 +393,13 @@ mod tests {
         // Additive: LoRA callers building via `..Default::default()` get `control_type: None` and
         // are unaffected; only a control-branch trainer sets it.
         assert_eq!(TrainingConfig::default().control_type, None);
+    }
+
+    #[test]
+    fn config_default_is_not_a_full_finetune() {
+        // Additive (sc-14056): every `..Default::default()` caller and the whole conformance surface
+        // trains a LoRA/LoKr adapter; only a full-base-fine-tune run opts in.
+        assert!(!TrainingConfig::default().full_finetune);
     }
 
     fn trainer_desc(supports_control: bool) -> TrainerDescriptor {
