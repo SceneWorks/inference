@@ -581,15 +581,32 @@ pub const REQUIRED_SIZE_MULTIPLE: u32 = SIZE_MULTIPLE;
 /// selected snapshot tree rather than a transformer-only approximation. Missing/unreadable
 /// subdirectories contribute zero bytes here; checkpoint identity/load validation separately rejects
 /// missing required components before generation.
+///
+/// **Resolves through [`resolve_component_dirs`], not the spec's weights root** (sc-15154). On the
+/// SPLIT layout the root is the variant's per-tier dir and holds the DiT *alone* — the text encoder
+/// and VAE are staged in [`LoadSpec::components`] from the shared mirror. Summing subdirs of the
+/// root therefore reported the DiT's bytes as the whole model: 2.33 GB for a q4 tier whose real
+/// install is 7.00 GB, and 8.23 GB for bf16's 17.46 GB. The worker's fit gate adds a flat activation
+/// headroom to this number, so the shortfall surfaced as an over-budget message quoting a figure
+/// that tracked neither the tier's weights nor its measured peak. The flat-layout fallback is
+/// unchanged: with nothing staged, `resolve_component_dirs` returns `root/<component>` exactly as
+/// before.
 pub(crate) fn component_footprint(
     spec: &mlx_gen::LoadSpec,
 ) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
-    mlx_gen::PerComponentBytes::from_spec_subdirs(
-        spec,
-        &["text_encoder"],
-        &["transformer"],
-        &["vae"],
-    )
+    let mlx_gen::WeightsSource::Dir(root) = &spec.weights else {
+        return Err(mlx_gen::gen_core::Error::Msg(
+            "mage_flow: per-component footprint requires a snapshot directory, not a single \
+             .safetensors file"
+                .to_owned(),
+        ));
+    };
+    let dirs = resolve_component_dirs(root, spec)?;
+    Ok(mlx_gen::PerComponentBytes {
+        text_encoder: mlx_gen::safetensors_path_bytes(dirs.text_encoder),
+        dit: mlx_gen::safetensors_path_bytes(dirs.transformer),
+        vae: mlx_gen::safetensors_path_bytes(dirs.vae),
+    })
 }
 
 macro_rules! mage_registrations {
@@ -628,6 +645,61 @@ mage_registrations! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// sc-15154 — the footprint must follow the SPLIT layout's staged components, not the tier dir.
+    ///
+    /// The discriminating case: the same fake tier tree scanned with and without the components
+    /// staged. A footprint that sums subdirs of `spec.weights` scores the split spec at the DiT's
+    /// bytes alone and cannot tell the two specs apart, which is exactly what made the worker's
+    /// over-budget message quote a figure unrelated to the tier's real install.
+    #[test]
+    fn the_footprint_counts_staged_components_not_just_the_tier_dir() {
+        let root = std::env::temp_dir().join(format!(
+            "mage-footprint-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+        ));
+        let write = |dir: std::path::PathBuf, bytes: usize| {
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("model.safetensors"), vec![0u8; bytes]).unwrap();
+            dir
+        };
+        // SPLIT: the variant tier dir holds the DiT; the shared mirror holds the TE + VAE.
+        let tier = root.join("q4");
+        write(tier.join("transformer"), 300);
+        let te = write(root.join("shared/q4/text_encoder"), 700);
+        let vae = write(root.join("shared/q4/vae"), 50);
+
+        let split = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir(tier.clone()))
+            .with_component(COMPONENT_TEXT_ENCODER, mlx_gen::WeightsSource::Dir(te))
+            .with_component(COMPONENT_VAE, mlx_gen::WeightsSource::Dir(vae));
+        let got = component_footprint(&split).unwrap();
+        assert_eq!(
+            (got.dit, got.text_encoder, got.vae),
+            (300, 700, 50),
+            "the staged text encoder and VAE are part of what this tier loads"
+        );
+
+        // ...and the same spec with nothing staged sees only the DiT — the pre-fix behavior, kept
+        // here so the assertion above is visibly about the staging and not about the tree.
+        let unstaged = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir(tier));
+        let got = component_footprint(&unstaged).unwrap();
+        assert_eq!((got.dit, got.text_encoder, got.vae), (300, 0, 0));
+
+        // FLAT (upstream snapshots / legacy installs): every component under the root, nothing
+        // staged. Unchanged by this fix.
+        let flat = root.join("flat");
+        write(flat.join("transformer"), 300);
+        write(flat.join("text_encoder"), 700);
+        write(flat.join("vae"), 50);
+        let got =
+            component_footprint(&mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir(flat))).unwrap();
+        assert_eq!((got.dit, got.text_encoder, got.vae), (300, 700, 50));
+
+        std::fs::remove_dir_all(root).ok();
+    }
 
     #[test]
     fn variant_table_matches_the_published_defaults() {
