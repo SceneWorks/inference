@@ -377,7 +377,7 @@ impl ChatterboxGenerator {
                     path.display()
                 )));
             }
-            let device = candle_audio::default_device_metal_incompatible()?;
+            let device = candle_audio::default_device()?;
             // SAFETY: mmap of a provider-resolved, pinned-SHA safetensors file — the shared idiom.
             let vb = unsafe {
                 VarBuilder::from_mmaped_safetensors(
