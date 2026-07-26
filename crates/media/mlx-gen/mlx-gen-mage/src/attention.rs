@@ -38,6 +38,7 @@ use mlx_rs::fast::{rms_norm, scaled_dot_product_attention};
 use mlx_rs::ops::{concatenate_axis, split, split_sections, stack_axis};
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
 use mlx_gen::weights::Weights;
 use mlx_gen::{nn, Error, Result};
 
@@ -286,6 +287,41 @@ impl MageJointAttention {
     }
 }
 
+/// LoRA/LoKr targets on the joint attention (sc-14055): both streams' q/k/v and output projections.
+/// Diffusers names the image output `to_out.0` (an `nn.Sequential`, Linear at index 0) and the text
+/// output `to_add_out`; the six input projections are bare.
+impl AdaptableHost for MageJointAttention {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["to_q"] => Some(self.to_q.adaptable_mut()),
+            ["to_k"] => Some(self.to_k.adaptable_mut()),
+            ["to_v"] => Some(self.to_v.adaptable_mut()),
+            ["to_out", "0"] => Some(self.to_out.adaptable_mut()),
+            ["add_q_proj"] => Some(self.add_q_proj.adaptable_mut()),
+            ["add_k_proj"] => Some(self.add_k_proj.adaptable_mut()),
+            ["add_v_proj"] => Some(self.add_v_proj.adaptable_mut()),
+            ["to_add_out"] => Some(self.to_add_out.adaptable_mut()),
+            _ => None,
+        }
+    }
+
+    fn adaptable_paths(&self) -> Vec<String> {
+        [
+            "to_q",
+            "to_k",
+            "to_v",
+            "to_out.0",
+            "add_q_proj",
+            "add_k_proj",
+            "add_v_proj",
+            "to_add_out",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect()
+    }
+}
+
 fn expect_packed(x: &Array, tokens: i32, dim: i32, what: &str) -> Result<()> {
     if x.shape() != [1, tokens, dim] {
         return Err(Error::Msg(format!(
@@ -367,6 +403,110 @@ mod tests {
             sin: Array::from_slice(&[0.0f32; 2], &[1, 2]),
         };
         assert!(apply_rope(&x, &rope).is_err());
+    }
+
+    /// A tiny 1-head, head_dim-4 joint attention (dim 4) built from zeroed weights — enough to
+    /// exercise the LoRA host routing and adapter save without a real checkpoint.
+    fn tiny_attention() -> MageJointAttention {
+        let mut w = Weights::empty();
+        for name in [
+            "to_q",
+            "to_k",
+            "to_v",
+            "to_out.0",
+            "add_q_proj",
+            "add_k_proj",
+            "add_v_proj",
+            "to_add_out",
+        ] {
+            w.insert(
+                format!("a.{name}.weight"),
+                Array::from_slice(&[0.0f32; 16], &[4, 4]),
+            );
+            w.insert(
+                format!("a.{name}.bias"),
+                Array::from_slice(&[0.0f32; 4], &[4]),
+            );
+        }
+        for name in ["norm_q", "norm_k", "norm_added_q", "norm_added_k"] {
+            w.insert(
+                format!("a.{name}.weight"),
+                Array::from_slice(&[1.0f32; 4], &[4]),
+            );
+        }
+        MageJointAttention::from_weights(&w, "a", 1, 4, 1e-6).unwrap()
+    }
+
+    /// sc-14055 — the LoRA host must reach every one of the eight joint-attention projections, and
+    /// every enumerated path must resolve (the save/reload round-trip depends on the two agreeing).
+    #[test]
+    fn adaptable_routing_covers_all_eight_projections() {
+        let mut attn = tiny_attention();
+        assert_eq!(
+            attn.adaptable_paths(),
+            [
+                "to_q",
+                "to_k",
+                "to_v",
+                "to_out.0",
+                "add_q_proj",
+                "add_k_proj",
+                "add_v_proj",
+                "to_add_out",
+            ]
+        );
+        for path in attn.adaptable_paths() {
+            let segs: Vec<&str> = path.split('.').collect();
+            assert!(
+                attn.adaptable_mut(&segs).is_some(),
+                "enumerated path {path} must resolve via adaptable_mut"
+            );
+        }
+        assert!(
+            attn.adaptable_mut(&["to_out"]).is_none(),
+            "the bare `to_out` (no `.0`) is not a target"
+        );
+        assert!(attn.adaptable_mut(&["nope"]).is_none());
+    }
+
+    /// sc-14055 — the known past gap: a saved LoRA adapter must carry `alpha` and `rank` in the
+    /// safetensors `__metadata__` (and `networkType`), and its PEFT keys must round-trip. Built on
+    /// the real Mage host routing so the saved paths are exactly what a reload resolves against.
+    #[test]
+    fn lora_adapter_persists_alpha_and_rank_in_metadata() {
+        use mlx_gen::adapters::AdaptableHost;
+        use mlx_gen::train::lora::{build_lora_targets, TrainAdapter};
+
+        let mut host = tiny_attention();
+        let paths = AdaptableHost::adaptable_paths(&host);
+        let (targets, params) = build_lora_targets(&mut host, &paths, 4, 7).unwrap();
+        let adapter = TrainAdapter::Lora { targets };
+
+        let dir = std::env::temp_dir().join("mage_lora_meta_roundtrip");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("m.safetensors");
+        adapter.save(&params, 8.0, 4.0, -1, "", &path).unwrap();
+
+        let w = Weights::from_file(&path).unwrap();
+        assert_eq!(w.metadata("networkType"), Some("lora"));
+        assert_eq!(
+            w.metadata("rank"),
+            Some("4"),
+            "rank must be in __metadata__"
+        );
+        assert_eq!(
+            w.metadata("alpha"),
+            Some("8"),
+            "alpha must be in __metadata__"
+        );
+        assert!(
+            w.keys().any(|k| k == "to_q.lora_A.weight"),
+            "PEFT LoRA-A factor key must be present"
+        );
+        assert!(
+            w.keys().any(|k| k == "to_q.alpha"),
+            "per-target alpha tensor must be present"
+        );
     }
 
     #[test]

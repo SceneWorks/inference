@@ -46,6 +46,7 @@ use std::path::Path;
 use mlx_rs::fast::rms_norm;
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear};
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 
@@ -134,6 +135,13 @@ impl Linear {
     /// `matmul` + `add` double-rounds the bias in bf16, which compounds over 12 blocks.
     pub fn forward(&self, x: &Array) -> Result<Array> {
         self.inner.forward(x)
+    }
+
+    /// The wrapped [`AdaptableLinear`], so a LoRA/LoKr residual can be installed onto this
+    /// projection (sc-14055). Every DiT `Linear` is adapter-hostable — the base weight is never
+    /// mutated, so an adapter composes with a quantized base and clears back to the bare base.
+    pub(crate) fn adaptable_mut(&mut self) -> &mut AdaptableLinear {
+        &mut self.inner
     }
 }
 
@@ -438,6 +446,58 @@ impl MageTransformer {
         // `temb = temb + txt_vec` where `txt_vec` is an all-zero `[B, dim]` of the same dtype
         // (`mage_flow.py:116-118`) — an exact no-op, so the pooled text vector is not ported at all.
         Ok((DualStream { txt, img }, temb))
+    }
+
+    /// Training forward (sc-14055): the [`forward`](Self::forward) computation WITHOUT the per-block
+    /// `eval`.
+    ///
+    /// The inference forward evals each block's streams to bound the lazy graph's peak memory. That
+    /// is illegal inside an autograd trace — `keyed_value_and_grad` builds one symbolic graph and
+    /// MLX forbids forcing an `eval` mid-transformation — so the LoRA trainer runs this variant,
+    /// which retains the whole forward graph for the backward. That retention is the trade the
+    /// backward needs; a LoRA overfit trains at a small resolution / tiny dataset where the dense
+    /// graph is cheap. High-resolution training would add gradient (activation) checkpointing to
+    /// bound the first-step working set (a follow-up mirroring z-image's sc-4874). The output is the
+    /// flow-matching velocity, exactly as [`forward`](Self::forward).
+    pub fn forward_train(
+        &self,
+        img: &Array,
+        txt: &Array,
+        sigma: &Array,
+        ctx: &PackContext,
+    ) -> Result<Array> {
+        let (mut stream, temb) = self.embed(img, txt, sigma, ctx)?;
+        for block in &self.blocks {
+            stream = block.forward(&stream, &temb, ctx)?;
+        }
+        self.final_layer.forward(&stream.img, &temb, ctx)
+    }
+}
+
+/// LoRA/LoKr host surface (sc-14055): the dotted-path → [`AdaptableLinear`] map the shared adapter
+/// core (`mlx_gen::adapters`, `mlx_gen::train::lora`) drives for both training injection and
+/// inference reload. Paths follow the published diffusers checkpoint naming so a trained adapter's
+/// PEFT keys (`transformer_blocks.{i}.attn.to_q.lora_A.weight`, …) round-trip: the same
+/// `adaptable_paths` that name a target at save time resolve it at load time.
+impl AdaptableHost for MageTransformer {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["img_in"] => Some(self.img_in.adaptable_mut()),
+            ["txt_in"] => Some(self.txt_in.adaptable_mut()),
+            ["transformer_blocks", n, rest @ ..] => self
+                .blocks
+                .get_mut(n.parse::<usize>().ok()?)?
+                .adaptable_mut(rest),
+            _ => None,
+        }
+    }
+
+    fn adaptable_paths(&self) -> Vec<String> {
+        let mut out = vec!["img_in".to_string(), "txt_in".to_string()];
+        for (i, block) in self.blocks.iter().enumerate() {
+            out.extend(prefixed_paths(&format!("transformer_blocks.{i}"), block));
+        }
+        out
     }
 }
 
