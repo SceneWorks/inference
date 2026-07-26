@@ -3,13 +3,16 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use candle_audio_stable_audio_3::candle_audio::candle_core::{
     DType, Device, Result as CandleResult, Shape, Tensor,
 };
 use candle_audio_stable_audio_3::candle_audio::dsp::{hann_window, stft};
 use candle_audio_stable_audio_3::config::StableAudioConfig;
-use candle_audio_stable_audio_3::same::{SameAutoencoder, SameNoiseKind, SameNoiseRng};
+use candle_audio_stable_audio_3::same::{
+    BandLayerTrace, SameAutoencoder, SameNoiseKind, SameNoiseRng,
+};
 use candle_audio_stable_audio_3::weights::{
     map_weight_key, safetensors_keys, SnapshotKind, SnapshotLayout, StableAudioVarBuilders,
     WeightSection,
@@ -26,16 +29,44 @@ fn snapshot(name: &str) -> PathBuf {
 fn test_device() -> Device {
     if std::env::var_os("SA3_TEST_METAL").is_some() {
         Device::new_metal(0).expect("SA3_TEST_METAL requested but Metal is unavailable")
+    } else if std::env::var_os("SA3_TEST_CUDA").is_some() {
+        #[cfg(feature = "cuda")]
+        {
+            Device::new_cuda(0).expect("SA3_TEST_CUDA requested but CUDA is unavailable")
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            panic!("SA3_TEST_CUDA requires --features cuda")
+        }
     } else {
         Device::Cpu
     }
 }
 
 fn mmap(path: &Path, device: &Device) -> VarBuilder<'static> {
+    mmap_many(&[path.to_path_buf()], device)
+}
+
+fn mmap_many(paths: &[PathBuf], device: &Device) -> VarBuilder<'static> {
     // Safety: tests require immutable, hash-pinned artifacts for the full process lifetime.
-    unsafe {
-        VarBuilder::from_mmaped_safetensors(&[path.to_path_buf()], DType::F32, device).unwrap()
-    }
+    unsafe { VarBuilder::from_mmaped_safetensors(paths, DType::F32, device).unwrap() }
+}
+
+fn same_l_fixture(device: &Device) -> VarBuilder<'static> {
+    let root = std::env::var_os("SA3_SAME_L_REFERENCE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../../docs/migration/sa3-same-l-reference")
+        });
+    mmap_many(
+        &[
+            root.join("same-l.safetensors"),
+            root.join("same-l-extended.safetensors"),
+            root.join("same-l-outputs-f16.safetensors"),
+        ],
+        device,
+    )
 }
 
 fn same_fixture(name: &str, device: &Device) -> VarBuilder<'static> {
@@ -66,7 +97,14 @@ impl SimpleBackend for TrackingBackend {
             .lock()
             .unwrap()
             .insert(format!("{}.{name}", self.component));
-        self.inner.get_with_hints(shape, name, hints)
+        self.inner
+            .get_with_hints(shape, name, hints)
+            .map_err(|error| {
+                candle_audio_stable_audio_3::candle_audio::candle_core::Error::Msg(format!(
+                    "{}.{name}: {error}",
+                    self.component
+                ))
+            })
     }
 
     fn get_unchecked(&self, name: &str, _dtype: DType, _device: &Device) -> CandleResult<Tensor> {
@@ -74,7 +112,12 @@ impl SimpleBackend for TrackingBackend {
             .lock()
             .unwrap()
             .insert(format!("{}.{name}", self.component));
-        self.inner.get_unchecked(name)
+        self.inner.get_unchecked(name).map_err(|error| {
+            candle_audio_stable_audio_3::candle_audio::candle_core::Error::Msg(format!(
+                "{}.{name}: {error}",
+                self.component
+            ))
+        })
     }
 
     fn contains_tensor(&self, name: &str) -> bool {
@@ -135,6 +178,20 @@ fn expected_autoencoder_weights(layout: &SnapshotLayout) -> BTreeSet<String> {
         .collect()
 }
 
+fn portable_noise(shape: &[usize], stream: u64, scale: f32, device: &Device) -> Tensor {
+    let count = shape.iter().product();
+    let values = (0..count)
+        .map(|index| {
+            let bits = (index as u64)
+                .wrapping_mul(1_664_525)
+                .wrapping_add((14_539 + stream).wrapping_mul(1_013_904_223))
+                & 0xffff_ffff;
+            ((bits as f64 / 2_147_483_648.0 - 1.0) as f32) * scale
+        })
+        .collect::<Vec<_>>();
+    Tensor::from_vec(values, shape.to_vec(), device).unwrap()
+}
+
 fn metric(name: &str, actual: &Tensor, expected: &Tensor, max_abs_limit: f32) -> f32 {
     let actual = actual
         .to_dtype(DType::F32)
@@ -176,6 +233,32 @@ fn metric(name: &str, actual: &Tensor, expected: &Tensor, max_abs_limit: f32) ->
         "{name}: max_abs {max_abs} > {max_abs_limit}"
     );
     max_abs
+}
+
+fn assert_same_l_band_trace(
+    name: &str,
+    layers: &[BandLayerTrace],
+    sequence_len: usize,
+    expected_starts: &[usize],
+) {
+    assert_eq!(
+        layers.len(),
+        12,
+        "{name}: every SAME-L layer must be traced"
+    );
+    for (index, layer) in layers.iter().enumerate() {
+        assert_eq!(layer.layer, index, "{name}: layer index");
+        assert_eq!(layer.sequence_len, sequence_len, "{name}: sequence length");
+        assert_eq!(
+            layer
+                .slices
+                .iter()
+                .map(|slice| slice.start)
+                .collect::<Vec<_>>(),
+            expected_starts,
+            "{name}: required edge/segment/tile/midpoint boundaries"
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -237,6 +320,531 @@ fn backend_sensitive_metric(
     assert!(
         (snr_db_range.0..=snr_db_range.1).contains(&snr_db),
         "{name}: snr_db {snr_db} outside {snr_db_range:?}"
+    );
+}
+
+#[test]
+#[ignore = "requires pinned SAME-L/medium snapshots and the generated sc-14539 artifact"]
+fn same_l_short_standalone_and_embedded_match_every_band_layer() {
+    let device = test_device();
+    let fixture = same_l_fixture(&device);
+    let selected = std::env::var("SA3_SAME_L_CASE").ok();
+    assert!(
+        selected
+            .as_deref()
+            .is_none_or(|value| matches!(value, "standalone" | "embedded")),
+        "SA3_SAME_L_CASE must be standalone or embedded"
+    );
+    for (env, prefix) in [
+        ("SA3_SAME_L_SNAPSHOT", "standalone.short"),
+        ("SA3_MEDIUM_SNAPSHOT", "embedded.short"),
+    ] {
+        if selected.as_deref().is_some_and(|selected| {
+            (selected == "standalone" && env != "SA3_SAME_L_SNAPSHOT")
+                || (selected == "embedded" && env != "SA3_MEDIUM_SNAPSHOT")
+        }) {
+            continue;
+        }
+        let layout = SnapshotLayout::from_dir(&snapshot(env)).unwrap();
+        let (model, consumed) = load_with_consumption_audit(&layout, &device);
+        assert_eq!(
+            consumed,
+            expected_autoencoder_weights(&layout),
+            "{env} must consume all and only its 472 autoencoder tensors, including 24 RoPE buffers"
+        );
+        assert_eq!(consumed.len(), 472, "{env}");
+
+        let audio = portable_noise(&[1, 2, 16_384], 100, 0.25, &device);
+        let encoder_noise = portable_noise(&[1, 4, 1536], 0, 0.001, &device);
+        let (latents, encoder_trace) = model
+            .encode_with_noise_and_trace(&audio, None, &[encoder_noise])
+            .unwrap();
+        metric(
+            &format!("{prefix}.latents"),
+            &latents,
+            &fixture
+                .get((1, 256, 4), &format!("{prefix}.latents.slice_0"))
+                .unwrap(),
+            0.001,
+        );
+        metric(
+            &format!("{prefix}.whole_latents"),
+            &latents,
+            &fixture
+                .get((1, 256, 4), &format!("{prefix}.latents"))
+                .unwrap(),
+            0.1,
+        );
+        let encoder = &encoder_trace.stages[0];
+        assert_eq!(
+            encoder.layout,
+            candle_audio_stable_audio_3::same::SameAttentionSchedule::Band {
+                latent_left: 1,
+                latent_right: 1,
+                query_tile: 1024,
+            }
+        );
+        assert!(encoder.block_outputs.is_empty());
+        assert_eq!(encoder.band_layers.len(), 12);
+        for layer in &encoder.band_layers {
+            for slice in &layer.slices {
+                metric(
+                    &format!(
+                        "{prefix}.encoder.block_{}.slice_{}",
+                        layer.layer, slice.start
+                    ),
+                    &slice.values,
+                    &fixture
+                        .get(
+                            slice.values.shape(),
+                            &format!(
+                                "{prefix}.encoder.block_{}.slice_{}",
+                                layer.layer, slice.start
+                            ),
+                        )
+                        .unwrap(),
+                    0.001,
+                );
+            }
+        }
+
+        let regularization = portable_noise(&[1, 256, 4], 1, 1.0, &device);
+        let decoder_noise = portable_noise(&[1, 64, 1536], 2, 0.1, &device);
+        let (decoded, decoder_trace) = model
+            .decode_with_trace(
+                &latents,
+                None,
+                Some(&regularization),
+                Some(&[decoder_noise]),
+            )
+            .unwrap();
+        let decoder = &decoder_trace.stages[0];
+        assert!(decoder.block_outputs.is_empty());
+        assert_eq!(decoder.band_layers.len(), 12);
+        for layer in &decoder.band_layers {
+            for slice in &layer.slices {
+                metric(
+                    &format!(
+                        "{prefix}.decoder.block_{}.slice_{}",
+                        layer.layer, slice.start
+                    ),
+                    &slice.values,
+                    &fixture
+                        .get(
+                            slice.values.shape(),
+                            &format!(
+                                "{prefix}.decoder.block_{}.slice_{}",
+                                layer.layer, slice.start
+                            ),
+                        )
+                        .unwrap(),
+                    0.001,
+                );
+            }
+        }
+        for start in [0, 12_288] {
+            metric(
+                &format!("{prefix}.decoded.slice_{start}"),
+                &decoded.narrow(2, start, 4096).unwrap(),
+                &fixture
+                    .get((1, 2, 4096), &format!("{prefix}.decoded.slice_{start}"))
+                    .unwrap(),
+                0.0001,
+            );
+        }
+        metric(
+            &format!("{prefix}.whole_decoded"),
+            &decoded,
+            &fixture
+                .get((1, 2, 16_384), &format!("{prefix}.decoded"))
+                .unwrap(),
+            0.001,
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires the pinned SAME-L snapshot and generated 10s/120s sc-14539 artifact"]
+fn same_l_long_durations_match_compact_band_boundaries() {
+    let device = test_device();
+    let fixture = same_l_fixture(&device);
+    let selected = std::env::var("SA3_SAME_L_CASE").ok();
+    assert!(
+        selected
+            .as_deref()
+            .is_none_or(|value| matches!(value, "standalone" | "embedded")),
+        "SA3_SAME_L_CASE must be standalone or embedded"
+    );
+    let selected_duration = std::env::var("SA3_SAME_L_DURATION").ok();
+    assert!(
+        selected_duration
+            .as_deref()
+            .is_none_or(|value| matches!(value, "ten_seconds" | "long_120_seconds")),
+        "SA3_SAME_L_DURATION must be ten_seconds or long_120_seconds"
+    );
+    for (env, snapshot_label) in [
+        ("SA3_SAME_L_SNAPSHOT", "standalone"),
+        ("SA3_MEDIUM_SNAPSHOT", "embedded"),
+    ] {
+        if selected.as_deref().is_some_and(|selected| {
+            (selected == "standalone" && env != "SA3_SAME_L_SNAPSHOT")
+                || (selected == "embedded" && env != "SA3_MEDIUM_SNAPSHOT")
+        }) {
+            continue;
+        }
+        let layout = SnapshotLayout::from_dir(&snapshot(env)).unwrap();
+        let builders = layout.mmap_builders(DType::F32, &device).unwrap();
+        let model = SameAutoencoder::load(layout.config.autoencoder(), builders).unwrap();
+        for (duration, samples) in [
+            ("ten_seconds", 441_000usize),
+            ("long_120_seconds", 5_292_000usize),
+        ] {
+            if selected_duration
+                .as_deref()
+                .is_some_and(|selected| selected != duration)
+            {
+                continue;
+            }
+            let label = format!("{snapshot_label}.{duration}");
+            let latent_len = samples.div_ceil(4096);
+            let padded_samples = latent_len * 4096;
+            let packed_len = latent_len * 17;
+            let expected_starts: &[usize] = match duration {
+                "ten_seconds" => &[0, 901, 1007, 1801],
+                "long_120_seconds" => &[0, 1007, 10_965, 21_929],
+                _ => unreachable!(),
+            };
+            let audio = portable_noise(&[1, 2, samples], 100, 0.25, &device);
+            let encoder_noise = portable_noise(&[1, latent_len, 1536], 0, 0.001, &device);
+            let (latents, encoder_trace) = model
+                .encode_with_noise_and_trace(&audio, None, &[encoder_noise])
+                .unwrap();
+            metric(
+                &format!("{label}.whole_latents"),
+                &latents,
+                &fixture
+                    .get((1, 256, latent_len), &format!("{label}.latents"))
+                    .unwrap(),
+                0.1,
+            );
+            for start in [0, latent_len.saturating_sub(64)] {
+                let width = latent_len.min(64);
+                metric(
+                    &format!("{label}.latents.slice_{start}"),
+                    &latents.narrow(2, start, width).unwrap(),
+                    &fixture
+                        .get((1, 256, width), &format!("{label}.latents.slice_{start}"))
+                        .unwrap(),
+                    0.05,
+                );
+            }
+            let encoder = &encoder_trace.stages[0];
+            assert!(encoder.block_outputs.is_empty());
+            assert_same_l_band_trace(
+                &format!("{label}.encoder"),
+                &encoder.band_layers,
+                packed_len,
+                expected_starts,
+            );
+            for layer in &encoder.band_layers {
+                for slice in &layer.slices {
+                    metric(
+                        &format!(
+                            "{label}.encoder.block_{}.slice_{}",
+                            layer.layer, slice.start
+                        ),
+                        &slice.values,
+                        &fixture
+                            .get(
+                                slice.values.shape(),
+                                &format!(
+                                    "{label}.encoder.block_{}.slice_{}",
+                                    layer.layer, slice.start
+                                ),
+                            )
+                            .unwrap(),
+                        0.1,
+                    );
+                }
+            }
+            drop(encoder_trace);
+
+            let regularization = portable_noise(&[1, 256, latent_len], 1, 1.0, &device);
+            let decoder_noise = portable_noise(&[1, latent_len * 16, 1536], 2, 0.1, &device);
+            let (decoded, decoder_trace) = model
+                .decode_with_trace(
+                    &latents,
+                    None,
+                    Some(&regularization),
+                    Some(&[decoder_noise]),
+                )
+                .unwrap();
+            let decoder = &decoder_trace.stages[0];
+            assert!(decoder.block_outputs.is_empty());
+            assert_same_l_band_trace(
+                &format!("{label}.decoder"),
+                &decoder.band_layers,
+                packed_len,
+                expected_starts,
+            );
+            for layer in &decoder.band_layers {
+                for slice in &layer.slices {
+                    metric(
+                        &format!(
+                            "{label}.decoder.block_{}.slice_{}",
+                            layer.layer, slice.start
+                        ),
+                        &slice.values,
+                        &fixture
+                            .get(
+                                slice.values.shape(),
+                                &format!(
+                                    "{label}.decoder.block_{}.slice_{}",
+                                    layer.layer, slice.start
+                                ),
+                            )
+                            .unwrap(),
+                        0.1,
+                    );
+                }
+            }
+            let expected_decoded = fixture
+                .get((1, 2, padded_samples), &format!("{label}.decoded"))
+                .unwrap();
+            metric(
+                &format!("{label}.whole_decoded"),
+                &decoded,
+                &expected_decoded,
+                0.001,
+            );
+            if duration == "ten_seconds" {
+                let (snr_db, mrstft) = roundtrip_metrics(
+                    &expected_decoded
+                        .to_dtype(DType::F32)
+                        .unwrap()
+                        .to_vec3()
+                        .unwrap(),
+                    &decoded.to_dtype(DType::F32).unwrap().to_vec3().unwrap(),
+                );
+                eprintln!(
+                    "{label}.whole_decoded_reference_quality: \
+                     snr_db={snr_db:.6}, mrstft={mrstft:.9}"
+                );
+                assert!(
+                    snr_db >= 70.0,
+                    "{label}: reference SNR {snr_db} dB is below 70 dB"
+                );
+                assert!(
+                    mrstft <= 0.08,
+                    "{label}: reference MR-STFT {mrstft} exceeds 0.08"
+                );
+            }
+            for start in [0, padded_samples - 4096] {
+                metric(
+                    &format!("{label}.decoded.slice_{start}"),
+                    &decoded.narrow(2, start, 4096).unwrap(),
+                    &fixture
+                        .get((1, 2, 4096), &format!("{label}.decoded.slice_{start}"))
+                        .unwrap(),
+                    0.1,
+                );
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires the pinned SAME-L snapshot and generated stride-7 sc-14539 artifact"]
+fn same_l_variable_stride_padding_gather_and_noise_order_match_upstream() {
+    let device = test_device();
+    let fixture = same_l_fixture(&device);
+    let layout = SnapshotLayout::from_dir(&snapshot("SA3_SAME_L_SNAPSHOT")).unwrap();
+    let model = SameAutoencoder::load(
+        layout.config.autoencoder(),
+        layout.mmap_builders(DType::F32, &device).unwrap(),
+    )
+    .unwrap();
+    let samples = 16_384;
+    let stride = [7usize];
+    let latent_len = 10;
+    let padded_samples = 17_920;
+    let audio = portable_noise(&[1, 2, samples], 100, 0.25, &device);
+    let encoder_noise = portable_noise(&[1, latent_len, 1536], 0, 0.001, &device);
+    let (latents, encoder_trace) = model
+        .encode_with_noise_and_trace(&audio, Some(&stride), std::slice::from_ref(&encoder_noise))
+        .unwrap();
+    assert_eq!(latents.dims3().unwrap(), (1, 256, latent_len));
+    assert_eq!(
+        encoder_trace.stages[0].layout,
+        candle_audio_stable_audio_3::same::SameAttentionSchedule::Band {
+            latent_left: 1,
+            latent_right: 1,
+            query_tile: 1024,
+        }
+    );
+    metric(
+        "standalone.stride7.whole_latents",
+        &latents,
+        &fixture
+            .get((1, 256, latent_len), "standalone.stride7.latents")
+            .unwrap(),
+        0.1,
+    );
+    let zero_encoder_noise = Tensor::zeros_like(&encoder_noise).unwrap();
+    let without_encoder_noise = model
+        .encode_with_noise(&audio, Some(&stride), &[zero_encoder_noise])
+        .unwrap();
+    assert!(
+        max_abs_tensor(&latents, &without_encoder_noise) > 1e-6,
+        "encoder token-noise mutation must affect band output"
+    );
+
+    let regularization = portable_noise(&[1, 256, latent_len], 1, 1.0, &device);
+    let decoder_noise = portable_noise(&[1, latent_len * 7, 1536], 2, 0.1, &device);
+    let decoded = model
+        .decode_with_noise(
+            &latents,
+            Some(&stride),
+            Some(&regularization),
+            Some(std::slice::from_ref(&decoder_noise)),
+        )
+        .unwrap();
+    assert_eq!(decoded.dims3().unwrap(), (1, 2, padded_samples));
+    metric(
+        "standalone.stride7.whole_decoded",
+        &decoded,
+        &fixture
+            .get((1, 2, padded_samples), "standalone.stride7.decoded")
+            .unwrap(),
+        0.001,
+    );
+    let zero_regularization = Tensor::zeros_like(&regularization).unwrap();
+    let without_regularization = model
+        .decode_with_noise(
+            &latents,
+            Some(&stride),
+            Some(&zero_regularization),
+            Some(std::slice::from_ref(&decoder_noise)),
+        )
+        .unwrap();
+    assert!(
+        max_abs_tensor(&decoded, &without_regularization) > 1e-6,
+        "SoftNorm noise mutation must affect band decode"
+    );
+    let zero_decoder_noise = Tensor::zeros_like(&decoder_noise).unwrap();
+    let without_decoder_noise = model
+        .decode_with_noise(
+            &latents,
+            Some(&stride),
+            Some(&regularization),
+            Some(&[zero_decoder_noise]),
+        )
+        .unwrap();
+    assert!(
+        max_abs_tensor(&decoded, &without_decoder_noise) > 1e-6,
+        "decoder token-noise mutation must affect band output"
+    );
+
+    let mut rng = SameNoiseRng::capturing(14_539);
+    let production_latents = model
+        .encode_with_rng(&audio, Some(&stride), &mut rng)
+        .unwrap();
+    model
+        .decode_with_rng(&production_latents, Some(&stride), &mut rng)
+        .unwrap();
+    let captures = rng.captures();
+    assert_eq!(captures.len(), 3);
+    assert_eq!(captures[0].kind, SameNoiseKind::EncoderTokens { stage: 0 });
+    assert_eq!(captures[0].scale, 0.001);
+    assert_eq!(captures[1].kind, SameNoiseKind::SoftNormRegularization);
+    assert_eq!(captures[1].scale, 0.001);
+    assert_eq!(captures[2].kind, SameNoiseKind::DecoderTokens { stage: 0 });
+    assert_eq!(captures[2].scale, 0.1);
+}
+
+fn max_abs_tensor(left: &Tensor, right: &Tensor) -> f32 {
+    (left - right)
+        .unwrap()
+        .abs()
+        .unwrap()
+        .max_all()
+        .unwrap()
+        .to_scalar::<f32>()
+        .unwrap()
+}
+
+#[test]
+#[ignore = "requires pinned SAME-L weights and executes a fresh-process long-duration roundtrip"]
+fn same_l_long_duration_roundtrip_resource_probe() {
+    const LITERAL_380_SECOND_SAMPLES: usize = 380 * 44_100;
+    let samples = std::env::var("SA3_SAME_L_RESOURCE_SAMPLES")
+        .map(|value| {
+            value
+                .parse()
+                .expect("SA3_SAME_L_RESOURCE_SAMPLES must be usize")
+        })
+        .unwrap_or(LITERAL_380_SECOND_SAMPLES);
+    let device = test_device();
+    let layout = SnapshotLayout::from_dir(&snapshot("SA3_SAME_L_SNAPSHOT")).unwrap();
+    let load_started = Instant::now();
+    let model = SameAutoencoder::load(
+        layout.config.autoencoder(),
+        layout.mmap_builders(DType::F32, &device).unwrap(),
+    )
+    .unwrap();
+    device.synchronize().unwrap();
+    let load_seconds = load_started.elapsed().as_secs_f64();
+    let load_peak_rss_bytes = candle_audio_stable_audio_3::candle_audio::harness::peak_rss_bytes();
+
+    let warm_audio = portable_noise(&[1, 2, 16_384], 100, 0.25, &device);
+    let mut warm_rng = SameNoiseRng::seeded(14_539);
+    let warm_latents = model
+        .encode_with_rng(&warm_audio, None, &mut warm_rng)
+        .unwrap();
+    model
+        .decode_with_rng(&warm_latents, None, &mut warm_rng)
+        .unwrap();
+    device.synchronize().unwrap();
+
+    let audio = portable_noise(&[1, 2, samples], 100, 0.25, &device);
+    let mut rng = SameNoiseRng::seeded(14_539);
+    let encode_started = Instant::now();
+    let latents = model.encode_with_rng(&audio, None, &mut rng).unwrap();
+    device.synchronize().unwrap();
+    let encode_seconds = encode_started.elapsed().as_secs_f64();
+    let latent_len = samples.div_ceil(4096);
+    assert_eq!(latents.dims3().unwrap(), (1, 256, latent_len));
+
+    let decode_started = Instant::now();
+    let decoded = model.decode_with_rng(&latents, None, &mut rng).unwrap();
+    device.synchronize().unwrap();
+    let decode_seconds = decode_started.elapsed().as_secs_f64();
+    let peak_rss_bytes = candle_audio_stable_audio_3::candle_audio::harness::peak_rss_bytes();
+    let checksum = decoded
+        .to_dtype(DType::F32)
+        .unwrap()
+        .sum_all()
+        .unwrap()
+        .to_scalar::<f32>()
+        .unwrap();
+    let decoded_values = decoded
+        .to_dtype(DType::F32)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+    let pcm_sha256 =
+        candle_audio_stable_audio_3::candle_audio::harness::pcm_sha256(&decoded_values);
+    let padded_samples = latent_len * 4096;
+    assert_eq!(decoded.dims3().unwrap(), (1, 2, padded_samples));
+    eprintln!(
+        "SA3_SAME_L_RESOURCE device={device:?} dtype=F32 input_samples={samples} \
+         padded_samples={padded_samples} latent_len={latent_len} packed_len={} query_tile=1024 \
+         load_seconds={load_seconds:.6} load_peak_rss_bytes={load_peak_rss_bytes:?} \
+         encode_seconds={encode_seconds:.6} decode_seconds={decode_seconds:.6} \
+         peak_rss_bytes={peak_rss_bytes:?} checksum={checksum:.9} pcm_sha256={pcm_sha256}",
+        latent_len * 17,
     );
 }
 

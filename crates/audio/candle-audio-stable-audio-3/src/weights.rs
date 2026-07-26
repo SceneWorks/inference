@@ -17,11 +17,13 @@
 //! `svd_bases.pt` is intentionally absent from the required-file list: some base repositories
 //! carry that training artifact, but no inference component consumes it.
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-use candle_audio::candle_core::{DType, Device};
+use candle_audio::candle_core::safetensors::MmapedSafetensors;
+use candle_audio::candle_core::{DType, Device, Tensor};
 use candle_audio::gen_core::{LoadSpec, WeightsSource};
 use candle_audio::{AudioError, Result};
 use candle_nn::VarBuilder;
@@ -35,6 +37,7 @@ pub const TEXT_CONFIG_FILE: &str = "config.json";
 pub const TEXT_WEIGHTS_FILE: &str = "model.safetensors";
 pub const TOKENIZER_FILE: &str = "tokenizer.json";
 pub const OPTIONAL_TOKENIZER_MODEL: &str = "tokenizer.model";
+const METAL_WEIGHT_PACK_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SnapshotKind {
@@ -151,26 +154,14 @@ impl SnapshotLayout {
         text_dtype: DType,
         device: &Device,
     ) -> Result<StableAudioVarBuilders<'static>> {
-        // Safety: the API contract above requires a caller-provisioned immutable snapshot. The
-        // returned backend owns its mmap for the lifetime of the 'static VarBuilder.
-        let root = unsafe {
-            VarBuilder::from_mmaped_safetensors(
-                std::slice::from_ref(&self.weights_path),
-                root_dtype,
-                device,
-            )?
-        };
+        let root = mmap_builder(
+            &self.weights_path,
+            root_dtype,
+            device,
+            packs_root_on_metal(self.kind),
+        )?;
         let text_encoder = match &self.text_weights_path {
-            Some(path) => {
-                // Safety: same immutable-snapshot invariant as the root checkpoint.
-                Some(unsafe {
-                    VarBuilder::from_mmaped_safetensors(
-                        std::slice::from_ref(path),
-                        text_dtype,
-                        device,
-                    )?
-                })
-            }
+            Some(path) => Some(mmap_builder(path, text_dtype, device, false)?),
             None => None,
         };
 
@@ -193,6 +184,93 @@ impl SnapshotLayout {
             },
         })
     }
+}
+
+fn packs_root_on_metal(kind: SnapshotKind) -> bool {
+    kind == SnapshotKind::StandaloneAutoencoder
+}
+
+fn mmap_builder(
+    path: &Path,
+    dtype: DType,
+    device: &Device,
+    pack_on_metal: bool,
+) -> Result<VarBuilder<'static>> {
+    if pack_on_metal && matches!(device, Device::Metal(_)) {
+        packed_metal_builder(path, dtype, device)
+    } else {
+        // Safety: callers of SnapshotLayout require an immutable snapshot. The returned backend
+        // owns its mmap for the lifetime of the 'static VarBuilder.
+        Ok(unsafe {
+            VarBuilder::from_mmaped_safetensors(std::slice::from_ref(&path), dtype, device)?
+        })
+    }
+}
+
+/// Coalesce persisted weights into bounded shared-storage packs on Metal.
+///
+/// Candle's ordinary mmap backend creates one MTLBuffer per requested tensor. Standalone SAME-L
+/// has 472 tensors, which exceeds the empirical Metal resource-allocation ceiling before the final
+/// tensors load. Packing preserves independently shaped tensor views while reducing persistent
+/// Metal resources to a few dozen bounded buffers. Full checkpoints stay on the lazy mmap path so
+/// component-only loaders do not eagerly materialize unrelated autoencoder, DiT, or text weights.
+fn packed_metal_builder(path: &Path, dtype: DType, device: &Device) -> Result<VarBuilder<'static>> {
+    // Safety: SnapshotLayout requires this file to remain immutable for the duration of loading.
+    // All values are copied into owned Candle storage before this function returns.
+    let safetensors = unsafe { MmapedSafetensors::new(path)? };
+    let mut names = safetensors
+        .tensors()
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect::<Vec<_>>();
+    names.sort_unstable();
+
+    let max_elements = METAL_WEIGHT_PACK_BYTES / dtype.size_in_bytes();
+    let mut tensors = HashMap::with_capacity(names.len());
+    let mut pending = Vec::<(String, Tensor)>::new();
+    let mut pending_elements = 0usize;
+
+    for name in names {
+        let tensor = safetensors.load(&name, &Device::Cpu)?.to_dtype(dtype)?;
+        let elements = tensor.elem_count();
+        if !pending.is_empty() && pending_elements.saturating_add(elements) > max_elements {
+            flush_weight_pack(&mut pending, &mut tensors, device)?;
+            pending_elements = 0;
+        }
+        pending_elements = pending_elements.checked_add(elements).ok_or_else(|| {
+            AudioError::Msg(format!("weight pack element count overflows: {name}"))
+        })?;
+        pending.push((name, tensor));
+    }
+    flush_weight_pack(&mut pending, &mut tensors, device)?;
+
+    Ok(VarBuilder::from_tensors(tensors, dtype, device))
+}
+
+fn flush_weight_pack(
+    pending: &mut Vec<(String, Tensor)>,
+    output: &mut HashMap<String, Tensor>,
+    device: &Device,
+) -> Result<()> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let flattened = pending
+        .iter()
+        .map(|(_, tensor)| tensor.flatten_all())
+        .collect::<candle_audio::candle_core::Result<Vec<_>>>()?;
+    let refs = flattened.iter().collect::<Vec<_>>();
+    let packed = Tensor::cat(&refs, 0)?.to_device(device)?;
+    let mut offset = 0usize;
+    for (name, tensor) in pending.drain(..) {
+        let elements = tensor.elem_count();
+        let view = packed
+            .narrow(0, offset, elements)?
+            .reshape(tensor.shape())?;
+        output.insert(name, view);
+        offset += elements;
+    }
+    Ok(())
 }
 
 /// Exact bundled T5Gemma safetensors inventory.
@@ -472,5 +550,49 @@ mod tests {
         .unwrap();
         assert_eq!(mapped.section, WeightSection::Decoder);
         assert_eq!(mapped.local_key, "layers.1.weight");
+    }
+
+    #[test]
+    fn packed_weight_views_preserve_names_shapes_and_values() {
+        let device = Device::Cpu;
+        let mut pending = vec![
+            (
+                "encoder.weight".to_owned(),
+                Tensor::from_vec(vec![1f32, 2., 3., 4.], (2, 2), &device).unwrap(),
+            ),
+            (
+                "bottleneck.scalar".to_owned(),
+                Tensor::from_vec(vec![5f32], (), &device).unwrap(),
+            ),
+            (
+                "decoder.weight".to_owned(),
+                Tensor::from_vec(vec![6f32, 7., 8.], 3, &device).unwrap(),
+            ),
+        ];
+        let mut packed = HashMap::new();
+        flush_weight_pack(&mut pending, &mut packed, &device).unwrap();
+
+        assert!(pending.is_empty());
+        assert_eq!(packed.len(), 3);
+        assert_eq!(packed["encoder.weight"].dims(), &[2, 2]);
+        assert_eq!(
+            packed["encoder.weight"]
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap(),
+            vec![1., 2., 3., 4.]
+        );
+        assert_eq!(packed["bottleneck.scalar"].to_scalar::<f32>().unwrap(), 5.);
+        assert_eq!(
+            packed["decoder.weight"].to_vec1::<f32>().unwrap(),
+            vec![6., 7., 8.]
+        );
+    }
+
+    #[test]
+    fn metal_packing_is_scoped_to_standalone_autoencoder_roots() {
+        assert!(packs_root_on_metal(SnapshotKind::StandaloneAutoencoder));
+        assert!(!packs_root_on_metal(SnapshotKind::Full));
     }
 }
