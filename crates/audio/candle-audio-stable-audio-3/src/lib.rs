@@ -50,15 +50,16 @@ pub fn provider_registry() -> gen_core::Result<gen_core::ProviderRegistry> {
     register_providers(gen_core::ProviderRegistryBuilder::new()).build()
 }
 
-/// How a later Stable Audio 3 provider chooses its device.
+/// How a Stable Audio 3 provider chooses its device.
 ///
-/// `MetalIncompatible` is the per-provider override added by sc-13698. Keeping this policy typed
-/// lets a later component opt out if an operation is found to be unsupported on Metal without
-/// cloning the lane's cfg/device logic here.
+/// One variant today: the lane has no per-provider device override. sc-13698 added a force-CPU one
+/// for the nearest-upsample vocoders, and sc-15074 retired it — candle-core's missing Metal
+/// `upsample_nearest1d` had already been routed around by `candle_audio::ops::nearest_upsample1d`
+/// (sc-13691 / sc-13886), so nothing needed to opt out. The policy stays typed so a component that
+/// does hit a real backend gap can add a variant without cloning the lane's device logic here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DevicePolicy {
     Default,
-    MetalIncompatible,
 }
 
 /// Resolve a device exclusively through the shared audio-lane device surface.
@@ -67,7 +68,6 @@ pub fn resolve_device(
 ) -> candle_audio::Result<candle_audio::candle_core::Device> {
     match policy {
         DevicePolicy::Default => candle_audio::default_device(),
-        DevicePolicy::MetalIncompatible => candle_audio::default_device_metal_incompatible(),
     }
 }
 
@@ -77,13 +77,8 @@ mod tests {
 
     #[test]
     fn device_policy_uses_shared_audio_surface() {
-        let override_device = resolve_device(DevicePolicy::MetalIncompatible).unwrap();
-        #[cfg(all(feature = "metal", not(feature = "cuda")))]
-        assert!(override_device.is_cpu());
-        #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
-        {
-            let default = resolve_device(DevicePolicy::Default).unwrap();
-            assert!(override_device.same_device(&default));
-        }
+        let device = resolve_device(DevicePolicy::Default).unwrap();
+        let shared = candle_audio::default_device().unwrap();
+        assert!(device.same_device(&shared));
     }
 }
