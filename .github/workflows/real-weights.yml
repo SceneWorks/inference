@@ -618,6 +618,12 @@ jobs:
             grep -E 'Model Name|Model Identifier|Chip|Total Number of Cores|Memory|Chipset Model|Metal Support'
           rustc --version
           cargo --version
+      - name: Run the crate unit tests against real Metal
+        # Weight-free, seconds long, and the only lane where the device-dependent unit tests execute
+        # on an accelerator: `zero_element_tensors_load_on_the_target_device` is a no-op on the CPU
+        # lane but is the regression gate for the zero-byte `noise_scaling_factor` buffer that broke
+        # the embedded SAME-L case below. Runs before the 10.4 GB downloads so it fails fast.
+        run: cargo test --locked --release -p candle-audio-stable-audio-3 --features metal --lib
       - name: Materialize and verify the immutable snapshots
         run: |
           python3 -m pip install --disable-pip-version-check --target "$RUNNER_TEMP/huggingface-hub" "huggingface_hub==1.20.1"
@@ -658,15 +664,30 @@ jobs:
         run: |
           cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
             --test dtype_policy -- --ignored --nocapture
-      - name: Measure the long-form 120 s and 300 s renders with peak memory
+      - name: Measure the long-form 120 s, 300 s and 380 s renders with peak memory
         run: |
           # The 380 s published cap is included: it is the only configuration that exercises the
           # full 4,096-latent adapted geometry and the 43-chunk SAME-L decode plan, which is the
           # entire reason this variant is registered separately from the smalls.
+          #
+          # `/usr/bin/time -l` reports `ru_maxrss` over the timed process *and its whole reaped
+          # child tree*, so timing `cargo test` conflates the release build — rustc and the linker
+          # peak in the multi-GB range on their own — with the render. Build first with `--no-run`,
+          # resolve the target's own executable from the JSON artifact stream, then time only that
+          # binary. The reported peak is then the render's, and nothing else's.
+          cargo test --locked --release --no-run -p candle-audio-stable-audio-3 --features metal \
+            --test provider
+          binary="$(
+            cargo test --locked --release --no-run --message-format=json \
+              -p candle-audio-stable-audio-3 --features metal --test provider |
+              python3 -c "import json, sys; print([m['executable'] for m in map(json.loads, sys.stdin) if m.get('reason') == 'compiler-artifact' and m.get('executable') and m.get('target', {}).get('name') == 'provider'][-1])"
+          )"
+          test -x "$binary" || { echo "could not resolve the provider test binary"; exit 1; }
+          echo "timing $binary"
           SA3_MEDIUM_LONG_SECONDS=120,300,380 \
           SA3_MEDIUM_LONG_WAV_DIR="$RUNNER_TEMP" \
-            /usr/bin/time -l cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
-              --test provider medium_long_form_renders_are_exact_and_timed -- --ignored --nocapture
+            /usr/bin/time -l "$binary" medium_long_form_renders_are_exact_and_timed \
+              --exact --ignored --nocapture
           for seconds in 120 300 380; do
             shasum -a 256 "$RUNNER_TEMP/sa3-medium-${seconds}s.wav"
           done
@@ -985,6 +1006,16 @@ jobs:
           rustc --version
           cargo --version
           nvidia-smi
+      - name: Run the crate unit tests against real CUDA
+        shell: cmd
+        # Weight-free and seconds long. `zero_element_tensors_load_on_the_target_device` is the
+        # regression gate for the zero-byte `noise_scaling_factor` buffer: on CUDA the F32 load
+        # succeeded but the F32-to-F16 cast launched a zero-sized grid, which is why medium loaded at
+        # F32 and failed at F16. This is the cheapest place that failure can be caught, and it runs
+        # before the 10.4 GB downloads.
+        run: |
+          call "%VCVARS%"
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --lib || exit /b 1
       - name: Materialize and verify the immutable snapshots
         shell: cmd
         run: |
@@ -1019,6 +1050,11 @@ jobs:
           cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --test dtype_policy -- --ignored --nocapture || exit /b 1
       - name: Measure the long-form renders and peak CUDA allocation
         shell: powershell
+        # A `nvidia-smi` sample taken *after* `cargo test` returns cannot observe a peak: the test
+        # process has already exited and the driver has freed its VRAM, so the "post-run" reading is
+        # the baseline again. Sample continuously for the whole render instead, which is the pattern
+        # `same-l-cuda`'s `Invoke-SameLProbe` already uses in this file. The release build is done
+        # first with `--no-run` so the sampled window contains the render and nothing else.
         run: |
           cmd /c "call `"$env:VCVARS`" && set" |
             ForEach-Object {
@@ -1026,15 +1062,80 @@ jobs:
             }
           $env:SA3_MEDIUM_LONG_SECONDS = "120,300,380"
           $env:SA3_MEDIUM_LONG_WAV_DIR = $env:RUNNER_TEMP
-          $baseline = [int]((nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits) -split "\s+")[0]
-          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda `
-            --test provider medium_long_form_renders_are_exact_and_timed -- --ignored --nocapture
+          cargo test --locked --release --no-run -p candle-audio-stable-audio-3 --features cuda `
+            --test provider
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $after = [int]((nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits) -split "\s+")[0]
-          Write-Host "SA3_MEDIUM_CUDA_MEMORY baseline_mib=$baseline post_run_mib=$after"
+          $stdout = Join-Path $env:RUNNER_TEMP "sa3-medium-long-form.stdout"
+          $stderr = Join-Path $env:RUNNER_TEMP "sa3-medium-long-form.stderr"
+          $stop = Join-Path $env:RUNNER_TEMP "sa3-medium-long-form.stop"
+          Remove-Item $stop -ErrorAction SilentlyContinue
+          $arguments = @(
+            "test", "--locked", "--release",
+            "-p", "candle-audio-stable-audio-3", "--features", "cuda",
+            "--test", "provider", "medium_long_form_renders_are_exact_and_timed",
+            "--", "--ignored", "--nocapture"
+          )
+          $baselineOutput = @(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits)
+          if ($LASTEXITCODE -ne 0) {
+            throw "nvidia-smi baseline query failed with exit code $LASTEXITCODE"
+          }
+          $baselineMiB = 0
+          $baselineText = [string]($baselineOutput | Select-Object -First 1)
+          if (-not [int]::TryParse($baselineText.Trim(), [ref]$baselineMiB)) {
+            throw "nvidia-smi baseline query returned an invalid value: '$baselineText'"
+          }
+          $sampler = Start-Job -ArgumentList $stop, $baselineMiB -ScriptBlock {
+            param([string]$stopPath, [int]$peakMiB)
+            while (-not (Test-Path $stopPath)) {
+              $sampleOutput = @(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits)
+              if ($LASTEXITCODE -ne 0) {
+                throw "nvidia-smi sampler query failed with exit code $LASTEXITCODE"
+              }
+              $usedMiB = 0
+              $sampleText = [string]($sampleOutput | Select-Object -First 1)
+              if (-not [int]::TryParse($sampleText.Trim(), [ref]$usedMiB)) {
+                throw "nvidia-smi sampler query returned an invalid value: '$sampleText'"
+              }
+              $peakMiB = [Math]::Max($peakMiB, $usedMiB)
+              Start-Sleep -Milliseconds 250
+            }
+            $peakMiB
+          }
+          try {
+            $process = Start-Process cargo -ArgumentList $arguments -Wait -PassThru `
+              -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+          } finally {
+            New-Item $stop -ItemType File -Force | Out-Null
+          }
+          Wait-Job $sampler | Out-Null
+          $samplerState = $sampler.State
+          try {
+            $samplerOutput = @(Receive-Job $sampler -ErrorAction Stop)
+          } finally {
+            Remove-Job $sampler -Force
+          }
+          if ($samplerState -ne "Completed") {
+            throw "nvidia-smi sampler job ended in state $samplerState"
+          }
+          if ($samplerOutput.Count -ne 1) {
+            throw "nvidia-smi sampler returned $($samplerOutput.Count) values; expected one"
+          }
+          $peakMiB = 0
+          if (-not [int]::TryParse(([string]$samplerOutput[0]).Trim(), [ref]$peakMiB)) {
+            throw "nvidia-smi sampler returned an invalid peak: '$($samplerOutput[0])'"
+          }
+          Get-Content $stdout
+          Get-Content $stderr
+          Write-Host "SA3_MEDIUM_CUDA_MEMORY baseline_total_mib=$baselineMiB peak_total_mib=$peakMiB peak_delta_mib=$($peakMiB - $baselineMiB)"
+          if ($process.ExitCode -ne 0) {
+            throw "medium long-form render failed with exit code $($process.ExitCode)"
+          }
           foreach ($seconds in 120, 300, 380) {
             Get-FileHash -Algorithm SHA256 (Join-Path $env:RUNNER_TEMP "sa3-medium-${seconds}s.wav")
           }
+          # Start-Process does not update LASTEXITCODE, and the vcvars bootstrap above can leave a
+          # stale non-zero value that GitHub's PowerShell wrapper would propagate.
+          exit 0
       - name: Render a real 30-second eight-step medium CUDA WAV
         shell: powershell
         run: |

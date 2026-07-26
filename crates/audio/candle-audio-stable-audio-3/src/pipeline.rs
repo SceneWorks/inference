@@ -72,10 +72,42 @@ pub struct VariantGeometry {
 /// Metal. Switching T5Gemma to BF16 *compute* would move a surface with a numeric parity gate behind
 /// it for no memory win worth having: the encoder is 281 MB of medium's 10.4 GB resident set.
 ///
-/// Norms and accumulations are pinned F32 independently of this: the DiT config carries
-/// `norm_kwargs.force_fp32 = true`, `same.rs` forces F32 RMS/DyT statistics, RoPE is evaluated in
-/// F32 against a persisted F32 `inv_freq`, and the sampler keeps the sigma schedule F32 for every
-/// value the model sees. None of those follow `root`.
+/// # The F16 path did not load on CUDA at all until sc-14545's second fix cycle
+///
+/// The first real-weight CUDA run of this seam failed at `load SA3 SAME` with
+/// `DriverError(CUDA_ERROR_INVALID_VALUE)` while F32 loaded cleanly. The cause was not the dtype
+/// threading: SAME's `bottleneck.noise_scaling_factor` is persisted as an empty `[1, 0, 1]` buffer,
+/// and casting a zero-element tensor to F16 launches a kernel with a zero grid dimension, which the
+/// driver rejects. The same zero-element buffer broke the Metal embedded-SAME-L lane by a different
+/// mechanism. Both are fixed in [`crate::weights`], where the reasoning is recorded in full. Worth
+/// stating here because it bounds what "the graph runs end to end at F16" meant before that fix: it
+/// was demonstrated on Metal, and on CUDA it was not demonstrated at all.
+///
+/// # What is pinned F32 independently of `root`, and what is not
+///
+/// Three things do not follow `root`:
+///
+/// * The **DiT's block normalizations**. `config.rs` rejects any Stable Audio 3 DiT config whose
+///   `norm_kwargs.force_fp32` is not `true`, and [`crate::transformer`]'s `Norm::forward` upcasts
+///   to F32 when that flag is set, so the DiT's RMS statistics are F32 at any `root`.
+/// * **RoPE**. `inv_freq` is requested at `DType::F32` explicitly rather than inheriting the
+///   `VarBuilder` dtype, and the position outer product is evaluated against it in F32.
+/// * **The sigma schedule**. `sampler.rs` materializes it in F32 and keeps it F32 for every value
+///   handed to the model; only the solver arithmetic runs at the latents' dtype.
+///
+/// **`same.rs` is not on that list, and that is load-bearing.** The SAME autoencoder builds its
+/// blocks with `NormConfig { eps: 1e-3, ..Default::default() }`, whose `force_fp32` is `false`, and
+/// the QK norms inside its attention are constructed with `force_fp32: false` as well. Medium's
+/// SAME-L config sets `dyt: true`, and `Norm::forward` returns through the `DynamicTanh` branch
+/// *before* the `force_fp32` upcast is reached, so DyT would not honour the flag even if it were
+/// set. At `root = F16` the whole autoencoder — normalization statistics included — runs in half
+/// precision.
+///
+/// That is the concrete mechanism behind the split policy filed as the follow-up (sc-15151). "Half
+/// the DiT, keep the SAME autoencoder at F32" is not merely a memory trade: it is the only
+/// arrangement in which SAME's statistics stay F32. Adopting F16 wholesale would mean either
+/// accepting half-precision DyT statistics through an 852M-parameter decoder or threading a second
+/// dtype into `same.rs`, and neither was measured here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ComputeDTypes {
     /// DiT + SAME + learned conditioner.

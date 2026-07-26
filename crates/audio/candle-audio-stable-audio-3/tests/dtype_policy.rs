@@ -68,18 +68,83 @@ const SEEDS: &[u64] = &[42, 7, 2_026];
 /// How far outside the F32 seed envelope an F16 statistic may fall, as a fraction of that envelope's
 /// own width.
 ///
-/// Measured on Metal at 30 s / 8 steps, the widest excursion is `side_ratio`: F16 reaches 0.951624
-/// against an F32 envelope of [0.502560, 0.650129], i.e. 2.04 envelope widths above the top. `3.0`
-/// clears that with margin.
+/// # What this value is bracketed by
 ///
-/// This is deliberately loose, and the looseness is the finding rather than a concession: at three
-/// seeds the fp16 spread genuinely is wider than the fp32 spread, because fp16 draws different
-/// samples rather than perturbing the same one. A tighter bound here would be a bound on which dice
-/// came up. What keeps the check honest is not its tightness but
-/// [`the_envelope_check_rejects_the_degradations_it_is_named_for`], which constructs a level
-/// collapse, a dulled high end and a narrowed image and asserts each is rejected at this exact
-/// slack.
-const ENVELOPE_SLACK: f64 = 3.0;
+/// It cannot go **below ≈ 2.044**. Measured on Metal at 30 s / 8 steps, the widest real excursion is
+/// `side_ratio`, where F16 reaches 0.951624 against an F32 envelope of [0.502560, 0.650129] — 2.043
+/// envelope widths above the top. A slack under that rejects a measurement this crate committed as
+/// honest, which would make the gate a bound on which dice came up rather than on quality.
+///
+/// It cannot go **above ≈ 2.79** without the gate ceasing to reject a dulled high end, which is the
+/// characteristic fp16 decoder failure. At 2.79 the `hf_emphasis` rejection point reaches a third of
+/// the committed F32 minimum, and past it a decoder that lost two thirds of its high end passes.
+///
+/// `2.5` sits inside that window with room on both sides.
+/// [`the_envelope_check_rejects_the_degradations_it_is_named_for`] asserts *both* edges against the
+/// committed measurements, so this constant cannot be loosened or tightened out of the window
+/// without a weight-free test failing. sc-14545 originally shipped `3.0`, which was outside it: at
+/// `3.0` a halved level and a two-thirds-dulled high end were both admitted.
+///
+/// # What the gate actually rejects at 2.5
+///
+/// Applied to the committed F32 envelopes, a statistic is rejected below these fractions of that
+/// envelope's own minimum:
+///
+/// | statistic | F32 minimum | rejection point | as a fraction |
+/// |---|---:|---:|---:|
+/// | rms | 0.057639 | 0.033144 | 57.5% |
+/// | peak | 0.519312 | 0.267834 | 51.6% |
+/// | hf emphasis | 0.121821 | 0.049096 | 40.3% |
+/// | side ratio | 0.502560 | 0.133637 | 26.6% |
+///
+/// So this is a **gross-degradation** gate, not a fine parity bound: it catches a decoder that
+/// halves the level, loses 60% of its high end, or narrows the image to a quarter. It does not catch
+/// a 10% dulling. That is the honest reach of a three-seed envelope on a sampler that re-injects
+/// noise at every step, and it is why the shipped policy rests on the measured table in this file's
+/// module documentation rather than on this check alone.
+const ENVELOPE_SLACK: f64 = 2.5;
+
+/// The F32 seed envelope committed in this file's module documentation, measured on Metal at
+/// 30 s / 8 steps over [`SEEDS`].
+///
+/// Two `Character`s carrying the per-statistic minima and maxima. They are not two real takes — no
+/// single seed produced all four minima — but [`envelope`] reduces any set of takes to exactly these
+/// per-statistic bounds, so as a *reference envelope* this pair is indistinguishable from the three
+/// measured takes and is reproducible from the committed table.
+const COMMITTED_F32_ENVELOPE: [Character; 2] = [
+    Character {
+        rms: 0.057639,
+        peak: 0.519312,
+        high_frequency_emphasis: 0.121821,
+        side_ratio: 0.502560,
+    },
+    Character {
+        rms: 0.067437,
+        peak: 0.619903,
+        high_frequency_emphasis: 0.150911,
+        side_ratio: 0.650129,
+    },
+];
+
+/// The F16 envelope committed in this file's module documentation, same run, same seeds.
+///
+/// This is the gate's *passing* control: a real half-precision measurement that the shipped slack
+/// admits. Its `side_ratio` maximum is the binding observation behind [`ENVELOPE_SLACK`]'s lower
+/// bracket.
+const COMMITTED_F16_ENVELOPE: [Character; 2] = [
+    Character {
+        rms: 0.069209,
+        peak: 0.525879,
+        high_frequency_emphasis: 0.095454,
+        side_ratio: 0.373487,
+    },
+    Character {
+        rms: 0.075448,
+        peak: 0.603027,
+        high_frequency_emphasis: 0.123614,
+        side_ratio: 0.951624,
+    },
+];
 
 fn snapshot(env: &str) -> PathBuf {
     PathBuf::from(
@@ -274,78 +339,108 @@ fn compute_policy_resolves_to_full_precision_on_every_backend() {
     );
 }
 
-/// The envelope machinery's own controls, without weights.
+/// The envelope machinery's own controls, driven by the committed measurements.
 ///
-/// A gate that cannot fail is not a gate. These construct the three degradations half precision
-/// actually produces in a decoder and assert the envelope check rejects each one, plus a passing
-/// control that is merely a different draw from the same distribution.
+/// A gate that cannot fail is not a gate — and a control built from invented numbers proves nothing
+/// about the *shipped* gate, because the gate's reach depends entirely on how wide the real
+/// reference envelope is relative to its own level. So every number here comes from
+/// [`COMMITTED_F32_ENVELOPE`] / [`COMMITTED_F16_ENVELOPE`], which are the measurements in this
+/// file's module documentation.
+///
+/// Four things are asserted, all at the shipped [`ENVELOPE_SLACK`]:
+///
+/// 1. The measured F16 envelope is **admitted**. That is the passing control, and it is a real
+///    half-precision render rather than a synthetic "different draw".
+/// 2. Each of the three degradations half precision produces in a decoder — a halved level, a
+///    high end cut to a third, an image narrowed to a tenth — is **rejected**.
+/// 3. A milder version of each of those three is **admitted**. This is what pins the constant: it
+///    fails if the slack is tightened past the point where the gate would start rejecting honest
+///    variation.
+/// 4. The rejection points documented on [`ENVELOPE_SLACK`] are the ones the gate actually has.
+///
+/// Together (2) and (3) bracket `ENVELOPE_SLACK` into roughly `[2.09, 2.79)`, and the F16 control
+/// independently requires it to be at least `2.05`. The `3.0` this file originally shipped is
+/// outside that window, and this test fails at `3.0`.
 #[test]
 fn the_envelope_check_rejects_the_degradations_it_is_named_for() {
-    let reference = [
-        Character {
-            rms: 0.100,
-            peak: 0.90,
-            high_frequency_emphasis: 0.30,
-            side_ratio: 0.50,
-        },
-        Character {
-            rms: 0.110,
-            peak: 0.95,
-            high_frequency_emphasis: 0.33,
-            side_ratio: 0.60,
-        },
-    ];
-    // Inside the envelope: a different draw with the same character.
+    // (1) The real F16 measurement is what the gate must admit.
     assert_within_envelope(
-        "control/passing",
-        &reference,
-        &[Character {
-            rms: 0.105,
-            peak: 0.92,
-            high_frequency_emphasis: 0.31,
-            side_ratio: 0.55,
-        }],
+        "control/measured F16",
+        &COMMITTED_F32_ENVELOPE,
+        &COMMITTED_F16_ENVELOPE,
     );
 
-    let degradations = [
-        (
-            "level collapse",
-            Character {
-                rms: 0.050,
-                peak: 0.90,
-                high_frequency_emphasis: 0.30,
-                side_ratio: 0.50,
-            },
-        ),
-        (
-            "dulled high end",
-            Character {
-                rms: 0.100,
-                peak: 0.90,
-                high_frequency_emphasis: 0.10,
-                side_ratio: 0.50,
-            },
-        ),
-        (
-            "narrowed image",
-            Character {
-                rms: 0.100,
-                peak: 0.90,
-                high_frequency_emphasis: 0.30,
-                side_ratio: 0.05,
-            },
-        ),
-    ];
-    for (label, degraded) in degradations {
-        let rejected = std::panic::catch_unwind(|| {
-            assert_within_envelope("control/degraded", &reference, &[degraded]);
-        })
-        .is_err();
+    // Every degradation starts from the committed F32 *minimum* of each statistic and scales one of
+    // them down. Starting at the minimum is the adversarial choice: it is the value closest to the
+    // gate's lower edge, so it is the easiest place for a degradation to slip through.
+    let baseline: [f64; 4] =
+        std::array::from_fn(|index| envelope(&COMMITTED_F32_ENVELOPE, index).0);
+
+    for (index, label, rejected_fraction, admitted_fraction) in [
+        (0usize, "level collapse", 0.50, 0.65),
+        (2, "dulled high end", 1.0 / 3.0, 0.50),
+        (3, "narrowed image", 0.10, 0.40),
+    ] {
+        // (4) The documented rejection point, recomputed from the committed envelope.
+        let (low, high) = envelope(&COMMITTED_F32_ENVELOPE, index);
+        let rejection_point = low - (high - low) * ENVELOPE_SLACK;
+        eprintln!(
+            "envelope gate {:>12}: F32 min {low:.6}, rejects below {rejection_point:.6} ({:.1}% of \
+             the minimum)",
+            Character::NAMES[index],
+            100.0 * rejection_point / low
+        );
+
+        // (2) The named degradation must be rejected.
         assert!(
-            rejected,
-            "the envelope check must reject a {label}, otherwise it gates nothing"
+            rejects(baseline, index, low * rejected_fraction),
+            "the envelope check must reject a {label} ({:.0}% of the F32 minimum, {:.6}); its \
+             rejection point is {rejection_point:.6}, so at this slack it gates nothing",
+            100.0 * rejected_fraction,
+            low * rejected_fraction
+        );
+
+        // (3) A milder version of the same degradation must be admitted, or the slack is so tight
+        // that the gate would flag honest seed-to-seed variation.
+        assert!(
+            !rejects(baseline, index, low * admitted_fraction),
+            "the envelope check must ADMIT {:.0}% of the F32 minimum for {}; rejecting it would \
+             make the gate tighter than the seed spread it is measured against",
+            100.0 * admitted_fraction,
+            Character::NAMES[index]
         );
     }
+
+    // (4) again, as a committed table rather than a log line, so the doc on `ENVELOPE_SLACK` cannot
+    // drift away from the constant.
+    let documented = [0.57503, 0.51575, 0.40302, 0.26591];
+    for (index, expected) in documented.into_iter().enumerate() {
+        let (low, high) = envelope(&COMMITTED_F32_ENVELOPE, index);
+        let fraction = (low - (high - low) * ENVELOPE_SLACK) / low;
+        assert!(
+            (fraction - expected).abs() < 5e-4,
+            "{} rejects below {:.5} of its F32 minimum, but ENVELOPE_SLACK's doc says {expected:.5}",
+            Character::NAMES[index],
+            fraction
+        );
+    }
+}
+
+/// Does the envelope check reject a candidate that is the committed F32 minima with statistic
+/// `index` replaced by `value`?
+fn rejects(baseline: [f64; 4], index: usize, value: f64) -> bool {
+    let mut values = baseline;
+    values[index] = value;
+    let candidate = Character {
+        rms: values[0],
+        peak: values[1],
+        high_frequency_emphasis: values[2],
+        side_ratio: values[3],
+    };
+    std::panic::catch_unwind(|| {
+        assert_within_envelope("control/candidate", &COMMITTED_F32_ENVELOPE, &[candidate]);
+    })
+    .is_err()
 }
 
 /// Render the same requests at F32 and at F16 on one device and measure what actually changes.

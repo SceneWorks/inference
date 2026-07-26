@@ -278,13 +278,40 @@ const MUSIC_SIDE_RATIO_FLOOR: f64 = 1e-2;
 /// "Dog barking next to a waterfall" collapses to 1.2e-4 at two of five seeds and recovers to
 /// 2.2e-1 / 3.4e-1 at two others. A floor set anywhere inside the music distribution would gate
 /// honest sparse-SFX output on this id, which is precisely the failure a generalist checkpoint
-/// invites. The floor is therefore taken from the union minimum with the same ~2x margin the SFX
-/// specialist uses: 1.02879e-4 / 5e-5 = 2.06x.
+/// invites. The floor is therefore taken from the union minimum with the same ~2x *margin ratio* the
+/// SFX specialist uses: 1.02879e-4 / 5e-5 = 2.06x.
+///
+/// # This floor is materially weaker than [`SFX_SIDE_RATIO_FLOOR`], and the margin ratio hides that
+///
+/// The 2.06x is the same ratio, but it is applied to a measured minimum an order of magnitude lower,
+/// so the absolute floor lands *below* the `1e-4` sc-14544 deliberately tightened away from as
+/// "equivalent to: the side signal is not exactly zero". Concretely, the `near_mono` control in
+/// [`the_quality_gates_reject_the_degeneracies_they_are_named_for`] — one channel duplicated with a
+/// ~77 dB-down alternating differential, which is dither, not an image — measures ≈ 1.4e-4 and
+/// **passes** this floor while failing the SFX floor. Claiming parity of rationale with the SFX
+/// specialist would be false, so it is not claimed.
+///
+/// What this floor genuinely is: a **near-mono detector with a discrimination point at 5e-5**, about
+/// -86 dB of side against mid. It is strictly stronger than "not exactly zero" —
+/// [`the_medium_side_ratio_floor_is_a_near_mono_detector_not_a_width_bar`] carries a control at
+/// ≈ 4.2e-5 that it rejects and one at ≈ 6.9e-5 that it admits, so its discrimination point is
+/// bracketed by executed assertions rather than asserted in prose.
+///
+/// Why it is not raised: medium's own measured minimum is 1.02879e-4. Any floor with SFX-grade
+/// strength (2e-4) rejects medium's honest output on `"Dog barking next to a waterfall"` at two of
+/// five seeds. A generalist checkpoint that renders near-mono sparse SFX and wide music cannot have
+/// one floor that is both calibrated and strong; this PR chose calibrated, and says so.
 ///
 /// Like the other two, this is a **duplicated-mono** gate, not a stereo-width bar. What it must
 /// catch is a decode path that emits one channel twice — exactly 0 — which matters more here than
 /// for the smalls because medium decodes through SAME-L rather than SAME-S.
 const MEDIUM_SIDE_RATIO_FLOOR: f64 = 5e-5;
+
+/// The lowest per-window median the 25-sample medium sweep produced (Metal, 30 s / 8 steps).
+///
+/// Kept as a constant so the relationship between the measurement and
+/// [`MEDIUM_SIDE_RATIO_FLOOR`] is an executed assertion rather than a number repeated in prose.
+const MEDIUM_MEASURED_MINIMUM: f64 = 1.02879e-4;
 
 /// Every shape/quality gate a registered SA3 small variant must satisfy on real weights.
 fn assert_real_audio(variant: Variant, track: &AudioTrack, duration: f32) {
@@ -538,6 +565,144 @@ fn the_quality_gates_reject_the_degeneracies_they_are_named_for() {
     // Lag-1 autocorrelation: white noise fails, a smooth signal passes.
     assert!(lag_one_autocorrelation(&signal) < 0.2);
     assert!(lag_one_autocorrelation(&tone(440.0, 11_025)) > 0.2);
+}
+
+/// The control [`MEDIUM_SIDE_RATIO_FLOOR`] was missing: what it rejects, and what it admits.
+///
+/// The test above exercises `minimum_side_ratio(Variant::SmallSfx)` only, so medium's floor shipped
+/// with no discriminating control at all — and it is the one floor that needs one, because at `5e-5`
+/// it sits *below* the `1e-4` sc-14544 explicitly tightened away from. Two questions have to be
+/// answered with numbers rather than prose:
+///
+/// * Is it stronger than "the side signal is not exactly zero"? Yes — a non-zero differential
+///   measuring ≈ 4.2e-5 (≈ -87 dB) is rejected, and one at ≈ 6.9e-5 is admitted, which brackets the
+///   discrimination point tightly around the constant.
+/// * Is it as strong as the SFX floor? No — the `near_mono` control that the SFX floor was tightened
+///   to reject passes here. That is a real weakness, it is forced by medium's own measured minimum,
+///   and it is committed here rather than left implicit.
+///
+/// Weight-free, so it runs on every PR in the same lane as the test above.
+#[test]
+fn the_medium_side_ratio_floor_is_a_near_mono_detector_not_a_width_bar() {
+    let medium_floor = minimum_side_ratio(Variant::Medium);
+    let sfx_floor = minimum_side_ratio(Variant::SmallSfx);
+    let signal = pseudo_noise(44_100, 0xA53F);
+
+    // One channel duplicated with an alternating differential of `amplitude`: the canonical
+    // near-mono degeneracy, with the side level as the single knob.
+    let near_mono = |amplitude: f32| {
+        signal
+            .iter()
+            .enumerate()
+            .map(|(index, sample)| {
+                sample
+                    + if index % 2 == 0 {
+                        amplitude
+                    } else {
+                        -amplitude
+                    }
+            })
+            .collect::<Vec<f32>>()
+    };
+
+    // Exactly duplicated mono. Necessary, but a floor of "> 0" would also catch this, so it cannot
+    // be the only control.
+    let duplicated = stereo_width(&signal, &signal);
+    assert_eq!(duplicated.global, 0.0);
+    assert!(
+        duplicated.global < medium_floor && duplicated.median_window < medium_floor,
+        "medium's floor must reject exactly duplicated mono"
+    );
+
+    // The rejecting control: non-zero, and below the floor. This is what makes the floor more than
+    // an exactly-zero detector. At this amplitude the side signal measures ≈ 4.16e-5, ≈ -87 dB.
+    let rejected = stereo_width(&signal, &near_mono(1.2e-5));
+    eprintln!(
+        "medium near-mono controls: rejected global={:.9} median_window={:.9} (floor {:e})",
+        rejected.global, rejected.median_window, medium_floor
+    );
+    assert!(
+        rejected.global > 0.0 && rejected.median_window > 0.0,
+        "the rejecting control must carry a non-zero side signal, otherwise it only re-tests the \
+         exactly-zero case: {} / {}",
+        rejected.global,
+        rejected.median_window
+    );
+    assert!(
+        rejected.global < medium_floor && rejected.median_window < medium_floor,
+        "medium's floor must reject a non-zero but degenerate side signal, otherwise it is only an \
+         exactly-zero detector: {} / {}",
+        rejected.global,
+        rejected.median_window
+    );
+
+    // The admitting control: the same degeneracy at 1.67x the amplitude, ≈ 6.93e-5. Together with
+    // the control above this brackets the discrimination point tightly around 5e-5 — the floor is
+    // not merely "> 0", and it is not stronger than it claims either.
+    let admitted = stereo_width(&signal, &near_mono(2e-5));
+    eprintln!(
+        "medium near-mono controls: admitted global={:.9} median_window={:.9} (sfx floor {:e})",
+        admitted.global, admitted.median_window, sfx_floor
+    );
+    assert!(
+        admitted.global > medium_floor && admitted.median_window > medium_floor,
+        "the admitting control must clear medium's floor, otherwise the bracket has no upper edge \
+         and the floor's discrimination point is unpinned: {} / {}",
+        admitted.global,
+        admitted.median_window
+    );
+    assert!(
+        admitted.global < sfx_floor && admitted.median_window < sfx_floor,
+        "the admitting control must be one the SFX floor rejects, otherwise it does not demonstrate \
+         the asymmetry: {} / {}",
+        admitted.global,
+        admitted.median_window
+    );
+
+    // And the asymmetry itself: the exact `near_mono` control sc-14544 tightened the SFX floor to
+    // reject (≈ 1.39e-4, a ~77 dB-down differential) passes medium's floor. That is the honest reach
+    // of this floor, and asserting it here stops the constant's doc from claiming otherwise.
+    let sfx_near_mono = stereo_width(&signal, &near_mono(4e-5));
+    eprintln!(
+        "medium admits the sc-14544 near-mono control: global={:.9} median_window={:.9}",
+        sfx_near_mono.global, sfx_near_mono.median_window
+    );
+    assert!(
+        sfx_near_mono.global > medium_floor && sfx_near_mono.median_window > medium_floor,
+        "medium's floor admits the near-mono control the SFX floor rejects; if that ever stops \
+         being true the constant's documentation has to change with it: {} / {}",
+        sfx_near_mono.global,
+        sfx_near_mono.median_window
+    );
+    assert!(
+        sfx_near_mono.global < sfx_floor && sfx_near_mono.median_window < sfx_floor,
+        "the sc-14544 near-mono control must still fail the SFX floor, otherwise this comparison is \
+         not the asymmetry it claims to be: {} / {}",
+        sfx_near_mono.global,
+        sfx_near_mono.median_window
+    );
+
+    // The calibration relation, committed rather than described.
+    assert!(
+        medium_floor < PREVIOUS_SFX_SIDE_RATIO_FLOOR,
+        "medium's floor is weaker than the 1e-4 sc-14544 rejected as too weak; that is a deliberate \
+         consequence of its measured minimum and must stay visible"
+    );
+    assert!(
+        medium_floor < MEDIUM_MEASURED_MINIMUM,
+        "the floor must sit below the sweep minimum it is calibrated from"
+    );
+    let margin = MEDIUM_MEASURED_MINIMUM / medium_floor;
+    assert!(
+        (1.9..2.3).contains(&margin),
+        "medium's floor should keep the ~2x margin its documentation claims, got {margin:.3}x"
+    );
+    // A floor with SFX-grade strength would reject medium's own honest output, which is why it is
+    // not raised. Committed so the trade-off cannot be quietly reversed.
+    assert!(
+        MEDIUM_MEASURED_MINIMUM < sfx_floor,
+        "if medium's measured minimum ever clears the SFX floor, this floor should be raised to it"
+    );
 }
 
 /// Every shipped SFX `demo_cond` prompt, plus the neutral prompt the divergence gate uses.

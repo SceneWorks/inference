@@ -233,6 +233,81 @@ fn packs_root_on_metal(kind: SnapshotKind) -> bool {
     kind == SnapshotKind::StandaloneAutoencoder
 }
 
+/// Candle's mmap backend, with zero-element tensors served by allocation instead of by host copy.
+///
+/// Stable Audio 3 checkpoints persist `bottleneck.noise_scaling_factor` as a genuinely empty
+/// `[1, 0, 1]` buffer whenever noise augmentation is disabled. It is present at zero bytes in both
+/// `stabilityai/SAME-L` and the SAME-L embedded in `stabilityai/stable-audio-3-medium`, and
+/// [`crate::softnorm::SoftNorm::load`] consumes it so the autoencoder inventory stays exact.
+///
+/// Candle materializes every mmapped tensor by copying host bytes to the device and then casting to
+/// the requested dtype. **Both halves of that are degenerate at zero elements, and each accelerator
+/// fails a different half:**
+///
+/// * **Metal fails the copy.** `MetalDevice::new_buffer_with_data` passes the byte length straight
+///   through, and `newBufferWithBytes:length:0` returns nil, surfacing as
+///   `Metal error Failed to create metal resource: Buffer`. The [`packed_metal_builder`] path is
+///   immune because it concatenates on the host and hands out `narrow` views, so an empty tensor
+///   becomes a zero-length view into a non-empty buffer — which is why the standalone SAME-L Metal
+///   lane was green while the embedded case, which uses this backend, was not.
+/// * **CUDA survives the copy but fails the cast.** cudarc explicitly supports `malloc(0)`, so an
+///   F32 load succeeds; the F32-to-F16 conversion then launches with
+///   `grid_dim.x = 0usize.div_ceil(1024) == 0`, and `cuLaunchKernel` rejects a zero grid dimension
+///   with `CUDA_ERROR_INVALID_VALUE`. That is why CUDA loaded medium at F32 and failed only at F16.
+///
+/// `Tensor::zeros` avoids both: Metal rounds the request up (`buf_size(0).next_power_of_two() == 1`)
+/// and CUDA's `malloc(0)` plus a zero-byte `memset` are both supported, and neither path launches a
+/// kernel. A zero-element tensor holds no values, so allocating one is exactly equivalent to reading
+/// it — the substitution cannot change any number.
+///
+/// The persisted shape is still verified against the requested shape before substituting, read from
+/// the safetensors header without touching the data, so this does not weaken the inventory check it
+/// exists to preserve.
+struct ZeroElementSafeMmap {
+    inner: MmapedSafetensors,
+}
+
+impl candle_nn::var_builder::SimpleBackend for ZeroElementSafeMmap {
+    fn get(
+        &self,
+        shape: candle_audio::candle_core::Shape,
+        name: &str,
+        hints: candle_nn::Init,
+        dtype: DType,
+        device: &Device,
+    ) -> candle_audio::candle_core::Result<Tensor> {
+        if shape.elem_count() == 0 {
+            let view = self.inner.get(name)?;
+            if view.shape() != shape.dims() {
+                return Err(candle_audio::candle_core::Error::Msg(format!(
+                    "{name}: persisted shape {:?} does not match the requested empty shape {:?}",
+                    view.shape(),
+                    shape.dims()
+                )));
+            }
+            return Tensor::zeros(shape, dtype, device);
+        }
+        candle_nn::var_builder::SimpleBackend::get(&self.inner, shape, name, hints, dtype, device)
+    }
+
+    fn get_unchecked(
+        &self,
+        name: &str,
+        dtype: DType,
+        device: &Device,
+    ) -> candle_audio::candle_core::Result<Tensor> {
+        let view = self.inner.get(name)?;
+        if view.shape().iter().product::<usize>() == 0 {
+            return Tensor::zeros(view.shape(), dtype, device);
+        }
+        candle_nn::var_builder::SimpleBackend::get_unchecked(&self.inner, name, dtype, device)
+    }
+
+    fn contains_tensor(&self, name: &str) -> bool {
+        candle_nn::var_builder::SimpleBackend::contains_tensor(&self.inner, name)
+    }
+}
+
 fn mmap_builder(
     path: &Path,
     dtype: DType,
@@ -244,9 +319,12 @@ fn mmap_builder(
     } else {
         // Safety: callers of SnapshotLayout require an immutable snapshot. The returned backend
         // owns its mmap for the lifetime of the 'static VarBuilder.
-        Ok(unsafe {
-            VarBuilder::from_mmaped_safetensors(std::slice::from_ref(&path), dtype, device)?
-        })
+        let safetensors = unsafe { MmapedSafetensors::new(path)? };
+        Ok(VarBuilder::from_backend(
+            Box::new(ZeroElementSafeMmap { inner: safetensors }),
+            dtype,
+            device.clone(),
+        ))
     }
 }
 
@@ -650,5 +728,83 @@ mod tests {
     fn metal_packing_is_scoped_to_standalone_autoencoder_roots() {
         assert!(packs_root_on_metal(SnapshotKind::StandaloneAutoencoder));
         assert!(!packs_root_on_metal(SnapshotKind::Full));
+    }
+
+    /// A persisted zero-element tensor must load, on whatever device this build targets.
+    ///
+    /// Stable Audio 3 checkpoints carry `bottleneck.noise_scaling_factor` as an empty `[1, 0, 1]`
+    /// buffer. Candle's stock mmap backend cannot materialize that on an accelerator — Metal
+    /// rejects the zero-byte buffer outright, and CUDA accepts the buffer but rejects the dtype
+    /// cast's zero-sized kernel launch. [`ZeroElementSafeMmap`] is the fix, and this is its control.
+    ///
+    /// It also covers the requested dtype, because the CUDA half of the failure was in the *cast*:
+    /// serializing F32 and requesting F16 is the exact combination that failed to load
+    /// `stable_audio_3_medium` at `root = F16`.
+    ///
+    /// On a CPU build this passes trivially; built with `--features metal` or `--features cuda` it
+    /// is the regression gate, and the real-weight lanes run the crate's unit tests under those
+    /// features for that reason.
+    #[test]
+    fn zero_element_tensors_load_on_the_target_device() {
+        let device = candle_audio::default_device().expect("device");
+        let directory = std::env::temp_dir().join(format!(
+            "sa3-zero-element-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&directory).expect("temp dir");
+        let path = directory.join("model.safetensors");
+        let empty = Tensor::zeros((1usize, 0usize, 1usize), DType::F32, &Device::Cpu).unwrap();
+        let occupied = Tensor::from_vec(vec![1f32, 2.0], (2usize,), &Device::Cpu).unwrap();
+        let mut tensors = HashMap::new();
+        tensors.insert("bottleneck.noise_scaling_factor".to_owned(), empty);
+        tensors.insert("bottleneck.running_std".to_owned(), occupied);
+        candle_audio::candle_core::safetensors::save(&tensors, &path).expect("write safetensors");
+
+        for dtype in [DType::F32, DType::F16] {
+            let builder = mmap_builder(&path, dtype, &device, false).expect("mmap builder");
+            let loaded = builder
+                .get_with_hints(
+                    (1usize, 0usize, 1usize),
+                    "bottleneck.noise_scaling_factor",
+                    candle_nn::Init::Const(1.0),
+                )
+                .unwrap_or_else(|error| panic!("empty tensor at {dtype:?} on {device:?}: {error}"));
+            assert_eq!(loaded.dims(), &[1, 0, 1]);
+            assert_eq!(loaded.dtype(), dtype);
+            assert_eq!(loaded.elem_count(), 0);
+
+            // The occupied tensor still goes through the ordinary backend, so the substitution is
+            // scoped to the degenerate case rather than replacing the loader.
+            let occupied = builder
+                .get_with_hints(
+                    2usize,
+                    "bottleneck.running_std",
+                    candle_nn::Init::Const(0.0),
+                )
+                .expect("occupied tensor");
+            assert_eq!(occupied.dims(), &[2]);
+            assert_eq!(
+                occupied
+                    .to_dtype(DType::F32)
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap(),
+                vec![1.0, 2.0]
+            );
+
+            // The empty path still verifies the persisted shape: substituting zeros must not become
+            // a way to silently accept a tensor the checkpoint does not have.
+            let mismatched = builder.get_with_hints(
+                (0usize, 3usize),
+                "bottleneck.noise_scaling_factor",
+                candle_nn::Init::Const(1.0),
+            );
+            assert!(
+                mismatched.is_err(),
+                "an empty request whose shape does not match the persisted shape must be rejected"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&directory);
     }
 }

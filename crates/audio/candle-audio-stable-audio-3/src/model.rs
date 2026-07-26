@@ -186,6 +186,27 @@ impl Variant {
     /// Upstream's variable-length schedule wastes no compute on unrequested length, so the shipped
     /// semantics for an unspecified duration is "the checkpoint's full length". That is what the
     /// smalls already do (`120 s` is both their default and their maximum) and medium keeps it.
+    ///
+    /// # The cost of that on medium, stated plainly
+    ///
+    /// It means a request that omits `audio.target_duration` renders **380 s** — a 6.3-minute track.
+    /// Measured on an M5 Max: ≈ 57–92 s on Metal depending on machine load, and extrapolating this
+    /// crate's own CPU-vs-Metal ratio, ≈ 10–16 minutes on CPU. The smalls' unspecified-duration render
+    /// is 120 s / ≈ 10 s on Metal, so this is an order of magnitude more expensive for the same
+    /// omission.
+    ///
+    /// It is kept anyway. A shorter default only for medium would make three ids in one family obey
+    /// two different rules for the same missing field, which is a worse contract than an expensive
+    /// but uniform one — and there is no principled shorter value: any number picked here would be a
+    /// product choice this crate has no basis to make, while "the checkpoint's full length" at least
+    /// follows from the architecture. Callers that care about cost pass the field; it is optional,
+    /// not absent.
+    ///
+    /// What is genuinely missing is *discoverability*: [`descriptor_for`] advertises
+    /// `max_audio_duration_secs` but `Capabilities` has no field for the default, so a caller cannot
+    /// see what omitting the field will cost without reading this source. Adding one is an additive
+    /// `gen-core` contract change and is tracked with the other additive descriptor gaps as
+    /// `sc-15041`.
     pub const fn default_duration_secs(self) -> f32 {
         self.max_duration_secs()
     }
@@ -494,6 +515,17 @@ pub const WEIGHT_LICENSES: &[gen_core::WeightLicenseEntry] = &[
 /// domain metadata: the ids, this doc comment, and the crate-level module doc are the entire signal
 /// a consumer gets, and no typed domain coverage is claimed. Adding typed domain / channel-count /
 /// quality-tier fields is an additive contract change tracked as `sc-15041`.
+///
+/// # The advertised cap is also the default, and the descriptor cannot say so
+///
+/// `max_audio_duration_secs` is advertised; [`Variant::default_duration_secs`] is not, because
+/// `Capabilities` has no field for it — and on this family the two are equal. A request that omits
+/// `audio.target_duration` therefore renders the **advertised maximum**: 120 s on either small, and
+/// **380 s** on medium (≈ 57–92 s of Metal compute, ≈ 16 minutes on CPU). That is a real cost
+/// difference between ids whose descriptors are otherwise identical, and nothing in the descriptor
+/// signals it. The reasoning for keeping the default equal to the cap, and for treating the missing
+/// capability field as the actual gap, is on [`Variant::default_duration_secs`]; the field itself is
+/// tracked with the other additive descriptor gaps as `sc-15041`.
 pub fn descriptor_for(variant: Variant) -> ModelDescriptor {
     ModelDescriptor {
         required_components: &[],
@@ -958,10 +990,22 @@ mod tests {
             assert_eq!(descriptor.backend, "candle");
             assert!(matches!(descriptor.modality, Modality::Audio));
             assert_eq!(descriptor.capabilities.audio_sample_rates, [SAMPLE_RATE]);
+            // sc-14545 made the cap per variant. Asserting it against `variant.max_duration_secs()`
+            // alone would be a tautology, so the expected value is spelled out per id: the smalls
+            // publish the crate constant, medium publishes its own.
+            let expected_cap = match variant {
+                Variant::SmallMusic | Variant::SmallSfx => MAX_DURATION_SECS,
+                Variant::Medium => MEDIUM_MAX_DURATION_SECS,
+            };
             assert_eq!(
                 descriptor.capabilities.max_audio_duration_secs,
-                Some(MAX_DURATION_SECS)
+                Some(expected_cap),
+                "{} advertised duration cap",
+                variant.model_id()
             );
+            // The advertised cap is also the default for an omitted `audio.target_duration`; see
+            // `Variant::default_duration_secs` for the cost that implies on medium.
+            assert_eq!(variant.default_duration_secs(), expected_cap);
             // sc-14544: both post-trained objectives share the batch-CFG/APG/rescale math, so SFX
             // must NOT be distinguished from music by a false guidance flag.
             assert!(descriptor.capabilities.supports_negative_prompt);
@@ -971,6 +1015,15 @@ mod tests {
                 ["pingpong", "euler", "rk4", "dpmpp"]
             );
         }
+        // The cap must be variant-bound rather than the crate-global it replaced.
+        assert_ne!(
+            descriptor_for(Variant::Medium)
+                .capabilities
+                .max_audio_duration_secs,
+            descriptor_for(Variant::SmallMusic)
+                .capabilities
+                .max_audio_duration_secs
+        );
         assert_eq!(descriptor().id, "stable_audio_3_small_music");
         assert_eq!(sfx_descriptor().id, "stable_audio_3_small_sfx");
         assert_eq!((REGISTRATION.descriptor)().id, MODEL_ID);
@@ -1011,7 +1064,9 @@ mod tests {
 
     #[test]
     fn every_variant_contributes_composite_and_component_license_rows() {
-        assert_eq!(WEIGHT_LICENSES.len(), 6);
+        // Three registered variants x (composite, root, t5gemma). sc-14545 added the medium trio.
+        assert_eq!(WEIGHT_LICENSES.len(), 9);
+        assert_eq!(VARIANTS.len(), 3);
         for variant in VARIANTS {
             let rows = variant.weight_licenses();
             assert_eq!(rows.len(), 3);
