@@ -30,11 +30,13 @@ pub const MODEL_ID: &str = "krea_realtime_14b";
 /// path. Values are the reference defaults from the Krea Realtime 14B release (S1 audit, 2026-07-26).
 #[derive(Clone, Debug, PartialEq)]
 pub struct KreaArConfig {
-    /// Local (sliding-window) causal-attention span in frame-blocks, or `-1` for full causal attention
-    /// over the whole generated history (the shipped default). Consumed by S3.
+    /// Local (sliding-window) causal-attention span in **latent frames**, or `-1` for full causal
+    /// attention over the whole generated history (the shipped default). The read window is
+    /// `local_attn_size × frame_seq_length` tokens (reference `causal_model.py:192`). Consumed by S3/S5.
     pub local_attn_size: i64,
-    /// Number of always-attended "sink" frame-blocks retained at the start of the KV cache (0 =
-    /// none). Consumed by S3/S4.
+    /// Number of always-attended "sink" **latent frames** retained at the start of the KV cache (0 =
+    /// none; the shipped default). The reference keeps the first `sink_size` frames unchanged when
+    /// rolling the KV cache (`causal_model.py:359,584`). Consumed by S3/S5.
     pub sink_size: usize,
     /// Frame-blocks denoised together as one autoregressive chunk (3). Consumed by S5.
     pub num_frames_per_block: usize,
@@ -51,6 +53,19 @@ pub struct KreaArConfig {
     pub denoising_step_list: Vec<u32>,
     /// Flow-match sigma shift applied to the schedule (5.0). Consumed by S5.
     pub timestep_shift: f32,
+    /// Whether to run the **clean-context KV-cache recompute** after each chunk's denoise: rerun the
+    /// transformer on the chunk's clean `x0` output at [`context_noise`](Self::context_noise) and commit
+    /// *that* (clean-context) K/V for the chunk, instead of the near-clean final-denoise-step K/V. The
+    /// shipped reference default is **on** (`configs/self_forcing_server_14b.yaml: do_kv_recomp: true`);
+    /// turning it off falls back to the S4 behaviour (final denoise step commits) — the A/B baseline.
+    /// Consumed by S5.
+    pub do_kv_recomp: bool,
+    /// The timestep the clean-context recompute forward runs at — the reference's `args.context_noise`,
+    /// applied as an int64 timestep (`context_timestep = ones_like(timestep) * context_noise`,
+    /// `pipeline/causal_inference.py:228`). The shipped default is `0` (`configs/default_config.yaml`),
+    /// which the few-step schedule's argmin maps to the smallest tabled sigma `≈ 0.00498` — near-clean,
+    /// not exactly clean. Consumed by S5.
+    pub context_noise: f32,
 }
 
 impl Default for KreaArConfig {
@@ -70,21 +85,40 @@ impl KreaArConfig {
 
     /// The self-attention read window in **tokens**: `k[max(0, end - max_attention_size):end]`. Global
     /// (= [`seq_length`](Self::seq_length), `32760`) when [`local_attn_size`](Self::local_attn_size) is
-    /// `-1` — the shipped checkpoint — else `local_attn_size` frame-blocks × [`block_size`](Self::block_size).
-    /// Mirrors `causal_model.py`'s `max_attention_size`.
+    /// `-1` — the shipped checkpoint — else [`local_attn_size`](Self::local_attn_size) **frames** ×
+    /// [`frame_seq_length`](Self::frame_seq_length). Mirrors the 14B reference exactly:
+    /// `max_attention_size = 32760 if local_attn_size == -1 else local_attn_size * 1560`
+    /// (`wan/modules/causal_model.py:192`, `CausalWanSelfAttention.__init__`). Note the unit is
+    /// **frames × frame_seq_length**, *not* blocks — an earlier port multiplied by
+    /// [`block_size`](Self::block_size) (= `frame_seq_length × num_frames_per_block`), overcounting the
+    /// window by `num_frames_per_block`×.
     pub fn max_attention_size(&self) -> usize {
         if self.local_attn_size < 0 {
             self.seq_length
         } else {
-            self.local_attn_size as usize * self.block_size()
+            self.local_attn_size as usize * self.frame_seq_length
         }
     }
 
-    /// Always-attended "sink" prefix in **tokens** = [`sink_size`](Self::sink_size) frame-blocks ×
-    /// [`block_size`](Self::block_size) (`0` for the shipped checkpoint). Retained regardless of the
-    /// sliding window. Mirrors `causal_model.py`'s attention-sink retention.
+    /// Always-attended "sink" prefix in **tokens** = [`sink_size`](Self::sink_size) **frames** ×
+    /// [`frame_seq_length`](Self::frame_seq_length) (`0` for the shipped checkpoint). Retained regardless
+    /// of the sliding window. Mirrors the reference's `sink_tokens = self.sink_size * frame_seqlen`
+    /// (`wan/modules/causal_model.py:359`) — frames × frame_seq_length, *not* blocks; the reference
+    /// docstring is explicit: "we keep the first `sink_size` frames unchanged when rolling the KV cache".
     pub fn sink_tokens(&self) -> usize {
-        self.sink_size * self.block_size()
+        self.sink_size * self.frame_seq_length
+    }
+
+    /// The bounded (streaming) local-attention window in **frames** for memory-feasible long-clip
+    /// generation on Mac: [`kv_cache_num_frames`](Self::kv_cache_num_frames) +
+    /// [`num_frames_per_block`](Self::num_frames_per_block) — the reference server's `attn_size`
+    /// (`release_server.py:543`, `kv_cache_num_frames + num_frame_per_block`). Setting
+    /// [`local_attn_size`](Self::local_attn_size) to this value bounds the KV read/store to
+    /// `× frame_seq_length` tokens (≈ `6 · 1560 = 9360`) instead of the shipped global
+    /// [`seq_length`](Self::seq_length) (`32760` ≈ 27 GB of KV on Mac). The shipped checkpoint itself is
+    /// global (`local_attn_size = -1`); this is the Mac streaming bound the S6 pipeline selects.
+    pub fn streaming_local_attn_frames(&self) -> usize {
+        self.kv_cache_num_frames + self.num_frames_per_block
     }
 
     /// The shipped Krea Realtime 14B AR defaults (S1 audit).
@@ -98,6 +132,8 @@ impl KreaArConfig {
             seq_length: 32760,
             denoising_step_list: vec![1000, 937, 833, 625, 0],
             timestep_shift: 5.0,
+            do_kv_recomp: true,
+            context_noise: 0.0,
         }
     }
 }
@@ -184,6 +220,12 @@ fn overlay_ar(v: &Value, ar: &mut KreaArConfig) {
     if let Some(n) = v.get("timestep_shift").and_then(Value::as_f64) {
         ar.timestep_shift = n as f32;
     }
+    if let Some(b) = v.get("do_kv_recomp").and_then(Value::as_bool) {
+        ar.do_kv_recomp = b;
+    }
+    if let Some(n) = v.get("context_noise").and_then(Value::as_f64) {
+        ar.context_noise = n as f32;
+    }
 }
 
 #[cfg(test)]
@@ -226,31 +268,65 @@ mod tests {
         assert_eq!(ar.seq_length, 32760);
         assert_eq!(ar.denoising_step_list, vec![1000, 937, 833, 625, 0]);
         assert_eq!(ar.timestep_shift, 5.0);
+        // KV-cache recompute is on by default (self_forcing_server_14b.yaml: do_kv_recomp: true), and
+        // the recompute runs at context_noise 0 (configs/default_config.yaml: context_noise: 0).
+        assert!(ar.do_kv_recomp);
+        assert_eq!(ar.context_noise, 0.0);
         // The canonical seq_length is 21 latent frames × frame_seq_length.
         assert_eq!(ar.seq_length, 21 * ar.frame_seq_length);
     }
 
+    /// Reference-anchored token geometry (replaces a prior tautological test that asserted the code's
+    /// own `× block_size` formula). The 14B reference measures the read window / sink in **frames ×
+    /// frame_seq_length**, NOT blocks: `causal_model.py:192`
+    /// `max_attention_size = 32760 if local_attn_size == -1 else local_attn_size * 1560`, and `:359`
+    /// `sink_tokens = self.sink_size * frame_seqlen`. The independent numeric literals here (9360, 3120,
+    /// and the rejected 28080) discriminate the earlier `× block_size` overcount.
     #[test]
-    fn ar_derived_token_geometry_matches_reference() {
+    fn ar_token_geometry_matches_reference_units() {
         let ar = KreaArConfig::krea_realtime_14b();
-        // Block size = frame_seq_length × num_frames_per_block = 1560 × 3.
+        // Block size stays the block-causal unit: frame_seq_length × num_frames_per_block = 1560 × 3.
         assert_eq!(ar.block_size(), 4680);
         assert_eq!(
             ar.block_size(),
             ar.frame_seq_length * ar.num_frames_per_block
         );
-        // Global checkpoint (local_attn_size = -1): the read window is the whole clip.
-        assert_eq!(ar.max_attention_size(), ar.seq_length);
+
+        // Global checkpoint (local_attn_size = -1): the read window is the whole clip (reference's
+        // else-branch constant 32760).
         assert_eq!(ar.max_attention_size(), 32760);
+        assert_eq!(ar.max_attention_size(), ar.seq_length);
         // No attention sink on the shipped checkpoint.
         assert_eq!(ar.sink_tokens(), 0);
 
-        // A windowed (local) config: max_attention_size = local_attn_size blocks × block_size.
+        // A windowed (local) config: local_attn_size = 6 frames, sink_size = 2 frames.
+        // Reference: max_attention_size = 6 × 1560 = 9360; sink_tokens = 2 × 1560 = 3120.
         let mut local = ar.clone();
-        local.local_attn_size = 2;
-        local.sink_size = 1;
-        assert_eq!(local.max_attention_size(), 2 * local.block_size());
-        assert_eq!(local.sink_tokens(), local.block_size());
+        local.local_attn_size = 6;
+        local.sink_size = 2;
+        assert_eq!(
+            local.max_attention_size(),
+            9360,
+            "6 frames × frame_seq_length 1560 (reference: local_attn_size * frame_seqlen)"
+        );
+        assert_eq!(local.max_attention_size(), 6 * local.frame_seq_length);
+        assert_eq!(
+            local.sink_tokens(),
+            3120,
+            "2 frames × frame_seq_length 1560"
+        );
+        assert_eq!(local.sink_tokens(), 2 * local.frame_seq_length);
+        // The block-based overcount the earlier port shipped would have been 6 × 4680 = 28080 — reject it.
+        assert_ne!(local.max_attention_size(), 6 * local.block_size());
+        assert_ne!(local.sink_tokens(), 2 * local.block_size());
+
+        // The Mac streaming bound: kv_cache_num_frames (3) + num_frames_per_block (3) = 6 frames → 9360
+        // tokens (release_server.py:543 attn_size), an order of magnitude under the global 32760.
+        assert_eq!(ar.streaming_local_attn_frames(), 6);
+        let mut streaming = ar.clone();
+        streaming.local_attn_size = ar.streaming_local_attn_frames() as i64;
+        assert_eq!(streaming.max_attention_size(), 9360);
+        assert!(streaming.max_attention_size() < ar.seq_length);
     }
 
     #[test]

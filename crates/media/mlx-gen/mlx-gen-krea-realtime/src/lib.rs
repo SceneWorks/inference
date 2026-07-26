@@ -34,13 +34,27 @@
 //! * [`scheduler`] — **S4**: the [`FewStepSchedule`] Self-Forcing few-step flow-matching scheduler
 //!   (the shifted-sigma table + argmin timestep→sigma lookup, the Euler [`euler_x0`] step, and the
 //!   [`renoise_step`]).
-//! * [`generate`] — **S4**: the autoregressive chunk driver [`generate_latents`] — per-chunk few-step
-//!   denoise (CFG off, one forward per step) threading the persistent KV cache across chunks, emitting
-//!   the latent sequence for a t2v clip.
+//! * [`generate`] — **S4/S5**: the autoregressive chunk driver [`generate_latents`] — per-chunk
+//!   few-step denoise (CFG off, one forward per step) threading the persistent KV cache across chunks,
+//!   emitting the latent sequence for a t2v clip. **S5** adds the togglable clean-context **KV-cache
+//!   recompute** ([`KreaArConfig::do_kv_recomp`], default on): after a chunk's (now read-only) denoise
+//!   steps, one forward reruns on the clean `x0` at [`KreaArConfig::context_noise`] and commits *that*
+//!   clean-context K/V (exactly one commit per chunk either way).
+//! * [`causal`] — **S5** also bounds the KV cache: [`CausalKvCache`] evicts older tail K/V beyond the
+//!   sink + read window (unit-corrected to the reference's `local_attn_size × frame_seq_length` frames),
+//!   so long clips stay memory-feasible on Mac. Pure cache slicing.
 //!
-//! The **clean-context KV recompute** (S5), **VAE decode / clip assembly / `Generator` registration**
-//! (S6), and **i2v/v2v conditioning** (S7) are still deferred. S4's cache is populated by the denoise
-//! forwards only (the final near-clean step of each chunk), not the S5 clean-context rerun.
+//! **Attention-bias reconciliation (S5).** The block-causal mask ([`build_block_causal_mask`]) + the KV
+//! read window + the causal RoPE offset are the *complete* causal mechanism: the released reference
+//! sampling path (`wan/modules/causal_model.py` cached branch → plain `attention(q, k, v)`;
+//! `wan/modules/attention.py` `attn_mask=None`; `flex_attention` gets only a structural `block_mask`,
+//! never a `score_mod`) applies **no additive attention bias**. The "KV-cache attention bias" the Krea
+//! blog describes (a negative bias on past-frame scores) is *not* present in the open-source code and no
+//! magnitude is specified — so none is invented here.
+//!
+//! **VAE decode / clip assembly / `Generator` registration** (S6, including the first-frame VAE
+//! re-anchor that re-encodes the first output frame — needs the VAE) and **i2v/v2v conditioning** (S7)
+//! remain deferred; long-clip coherence measurement with real weights is S13.
 //!
 //! The converter and load path are validated against the S1 tensor inventory with synthesized
 //! fixtures (`tests/`) — never the real 28.58 GB checkpoint. Real-weight byte-parity validation and
