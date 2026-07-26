@@ -7,7 +7,7 @@
 //!
 //! Two inference kernels are intentionally replaced on adapter-gradient paths. The fused
 //! `softmax_last_dim` and `rotary_emb::rope_i` custom ops do not implement backward in candle, so
-//! attention uses composable [`softmax`] and [`apply_rope_diff`]. Both implement the same forward math;
+//! attention uses composable [`softmax`] and `apply_rope_diff`. Both implement the same forward math;
 //! the zero-adapter parity tests compare this model with the inference AvDiT video reduction.
 
 use candle_gen::candle_core::{DType, Device, Module, Result, Tensor, D};
