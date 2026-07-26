@@ -95,10 +95,17 @@ pub struct Qwen3VlTextEncoder {
 
 impl Qwen3VlTextEncoder {
     /// Quantize token embeddings and every attention/MLP projection; RMSNorms stay dense.
+    ///
+    /// The 36 decoder layers are held at their 8-bit floor (sc-15071) — a uniformly-Q4 text encoder
+    /// is the second half of the defect that made the Q4 tier render a tiled texture instead of the
+    /// prompt, and the SwiGLU MLP is the specific offender. The token embedding takes the requested
+    /// width. [`crate::convert::quant_floor_bits`] documents both floors and their measurements, and
+    /// is the same seam the offline converter calls.
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
         self.embed_tokens.quantize(bits, true)?;
+        let layer_bits = crate::quant::floor_bits(crate::quant::LM_LAYER_PREFIX, bits);
         for layer in &mut self.layers {
-            layer.quantize(bits)?;
+            layer.quantize(layer_bits)?;
         }
         let got = self.quantized_linear_count();
         let expected = 1 + self.layers.len() * 7;

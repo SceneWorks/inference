@@ -16,11 +16,19 @@ pub const VAE_FIXED_GB: f64 = 0.267;
 pub const VAE_GB_PER_MEGAPIXEL: f64 = 2.039;
 
 /// Complete measured 512² peaks in decimal GB after source-map draining.
+///
+/// **Q4 moved from 5.940 to 7.868 in sc-15071**, and the anchor had to move with it. The tier that
+/// measured 5.940 was the one that rendered a tiled texture instead of the prompt; the precision
+/// floors that make it render correctly (`crate::quant::FINAL_MOD_MIN_BITS`,
+/// `crate::quant::LM_LAYER_MIN_BITS`) put the Qwen3-VL LM's 36 decoder layers at 8 bits, which is
+/// ~1.9 GB of the difference. Leaving the old anchor in place would have been worse than a stale
+/// number: this gate is what stands between an over-large request and MLX's default allocation
+/// handler, which calls `exit(-1)` rather than returning a catchable error.
 fn calibration_peak_gb(tier: Option<Quant>) -> f64 {
     match tier {
         None => 17.660,
         Some(Quant::Q8) => 10.012,
-        Some(Quant::Q4) => 5.940,
+        Some(Quant::Q4) => 7.868,
         Some(Quant::Nvfp4) => f64::INFINITY,
     }
 }
@@ -58,7 +66,7 @@ fn resolve_live_budget_gb(limit_bytes: usize, max_buffer_gib: Option<f64>) -> Re
 
 /// Query the actual MLX/Metal limits used by the allocator. Unlike the generic tiling helper, this
 /// provider cannot safely substitute an 8 GiB guess: its smallest measured complete tier is already
-/// ~5.94 GB at 512² and MLX terminates the process rather than returning a catchable allocation error.
+/// ~7.87 GB at 512² and MLX terminates the process rather than returning a catchable allocation error.
 pub fn production_safe_budget_gb() -> Result<f64> {
     resolve_live_budget_gb(get_memory_limit(), mlx_gen::memory::max_buffer_length_gib())
 }
@@ -109,11 +117,16 @@ mod tests {
         assert!((vae_peak_gb(2048, 2048) - 8.818).abs() < 0.002);
     }
 
+    /// The admit/reject boundary straddles the Q4 anchor, so it moves with it (sc-15071: 5.94 →
+    /// 7.87 GB). A 6.0 GB budget used to admit a Q4 512² generation and must now refuse it — that
+    /// is the point of re-anchoring, not collateral damage from it: the tier that fit in 6.0 GB was
+    /// the one that rendered a tiled texture.
     #[test]
     fn gate_fails_closed_for_unknown_or_insufficient_budget() {
         assert!(ensure_generation_fits(Some(Quant::Q4), 512, 512, 1, f64::NAN).is_err());
         assert!(ensure_generation_fits(Some(Quant::Q4), 512, 512, 1, 5.0).is_err());
-        assert!(ensure_generation_fits(Some(Quant::Q4), 512, 512, 1, 6.0).is_ok());
+        assert!(ensure_generation_fits(Some(Quant::Q4), 512, 512, 1, 6.0).is_err());
+        assert!(ensure_generation_fits(Some(Quant::Q4), 512, 512, 1, 8.0).is_ok());
     }
 
     #[test]
