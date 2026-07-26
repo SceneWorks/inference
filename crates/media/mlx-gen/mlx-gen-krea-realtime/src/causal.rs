@@ -299,6 +299,49 @@ impl CausalKreaTransformer {
         current_start_token: usize,
         cache: &mut CausalKvCache,
     ) -> Result<Array> {
+        let (velocity, new_kv) =
+            self.denoise_chunk_inner(latent_chunk, t, cross_kv, current_start_token, cache)?;
+        cache.append(new_kv)?;
+        Ok(velocity)
+    }
+
+    /// Like [`forward_chunk`](Self::forward_chunk) but **does not append** this chunk's self-attention
+    /// K/V to `cache` — the read-only denoise forward the S4 few-step loop uses for every denoising
+    /// step *except* the last. Every step of one AR chunk attends the **same** committed
+    /// previous-chunk window (the cache is untouched by the intermediate steps), so only the final
+    /// (near-clean) step commits its K/V via [`forward_chunk`](Self::forward_chunk) and the cache grows
+    /// by exactly one chunk per chunk. `current_start_token` must still equal `cache.stored_tokens()`
+    /// (the chunk begins where the committed history ends) and be frame-aligned; it fixes the causal
+    /// RoPE frame offset identically to [`forward_chunk`](Self::forward_chunk). Returns the denoised
+    /// velocity `[out_dim, F_chunk, H, W]` (f32).
+    pub fn forward_chunk_readonly(
+        &self,
+        latent_chunk: &Array,
+        t: f32,
+        cross_kv: &[(Array, Array)],
+        current_start_token: usize,
+        cache: &CausalKvCache,
+    ) -> Result<Array> {
+        let (velocity, _new_kv) =
+            self.denoise_chunk_inner(latent_chunk, t, cross_kv, current_start_token, cache)?;
+        Ok(velocity)
+    }
+
+    /// Shared per-chunk causal denoise forward: validate the chunk start, patch-embed the chunk, build
+    /// the offset RoPE, window the cache, assemble the block-causal mask over `[prev-window ‖ this-chunk]`,
+    /// run [`WanTransformer::forward_causal_chunk`], and unpatchify. Returns the denoised velocity
+    /// `[out_dim, F_chunk, H, W]` (f32) **and** this chunk's per-layer post-RoPE self-attention `(k, v)`
+    /// for the caller to append or discard — it does **not** mutate `cache`. The two public entries
+    /// differ only in whether they commit `new_kv`: [`forward_chunk`](Self::forward_chunk) appends,
+    /// [`forward_chunk_readonly`](Self::forward_chunk_readonly) drops it.
+    fn denoise_chunk_inner(
+        &self,
+        latent_chunk: &Array,
+        t: f32,
+        cross_kv: &[(Array, Array)],
+        current_start_token: usize,
+        cache: &CausalKvCache,
+    ) -> Result<(Array, Vec<LayerKv>)> {
         if current_start_token != cache.stored_tokens() {
             return Err(Error::Msg(format!(
                 "krea causal: current_start_token {current_start_token} must equal the cache's stored \
@@ -338,12 +381,14 @@ impl CausalKreaTransformer {
             &prev_kv,
             mask.as_ref(),
         )?;
-        cache.append(new_kv)?;
 
         // Unpatchify the per-token velocity [1, S, out_dim·∏patch] → [out_dim, F_chunk, H, W].
         let op = velocity.shape()[2];
         let xb = velocity.reshape(&[s_new as i32, op])?;
-        unpatchify(&xb, grid, self.out_dim, self.patch_size)
+        Ok((
+            unpatchify(&xb, grid, self.out_dim, self.patch_size)?,
+            new_kv,
+        ))
     }
 }
 

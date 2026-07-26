@@ -15,7 +15,7 @@
 //! crate mentally distinct from the unrelated **image** crate `mlx-gen-krea` (Krea 2 Turbo, engine
 //! `krea_2_turbo`).
 //!
-//! ## Scope of this crate today (S2 load path + the S3 causal AR forward)
+//! ## Scope of this crate today (S2 load path + the S3 causal AR forward + the S4 AR loop)
 //!
 //! * [`config`] — the [`KreaRealtimeConfig`] preset (`wan21_t2v_14b` DiT dims + the AR knobs).
 //! * [`convert`] — [`sanitize_krea_realtime_transformer`]: collapse either on-disk layout (single-file
@@ -29,9 +29,18 @@
 //!   ([`CausalKreaTransformer`], [`CausalKvCache`], [`build_block_causal_mask`]). The one net-new
 //!   compute delta over stock Wan is confined to self-attention — a block-causal mask, a per-layer
 //!   post-RoPE KV cache, and a causal RoPE temporal offset — reusing every other Wan DiT piece
-//!   verbatim (the reused Wan attention gained one additive `forward_causal_chunk` variant). The
-//!   Self-Forcing few-step scheduler / AR chunk loop (S4), KV-cache recompute (S5), VAE decode (S6),
-//!   and `Generator` registration (S7) are still deferred.
+//!   verbatim (the reused Wan attention gained one additive `forward_causal_chunk` variant), plus the
+//!   read-only [`CausalKreaTransformer::forward_chunk_readonly`] variant S4 drives.
+//! * [`scheduler`] — **S4**: the [`FewStepSchedule`] Self-Forcing few-step flow-matching scheduler
+//!   (the shifted-sigma table + argmin timestep→sigma lookup, the Euler [`euler_x0`] step, and the
+//!   [`renoise_step`]).
+//! * [`generate`] — **S4**: the autoregressive chunk driver [`generate_latents`] — per-chunk few-step
+//!   denoise (CFG off, one forward per step) threading the persistent KV cache across chunks, emitting
+//!   the latent sequence for a t2v clip.
+//!
+//! The **clean-context KV recompute** (S5), **VAE decode / clip assembly / `Generator` registration**
+//! (S6), and **i2v/v2v conditioning** (S7) are still deferred. S4's cache is populated by the denoise
+//! forwards only (the final near-clean step of each chunk), not the S5 clean-context rerun.
 //!
 //! The converter and load path are validated against the S1 tensor inventory with synthesized
 //! fixtures (`tests/`) — never the real 28.58 GB checkpoint. Real-weight byte-parity validation and
@@ -41,7 +50,9 @@
 pub mod causal;
 pub mod config;
 pub mod convert;
+pub mod generate;
 pub mod load;
+pub mod scheduler;
 
 pub use causal::{
     block_causal_mask, build_block_causal_mask, CausalKreaTransformer, CausalKvCache,
@@ -51,10 +62,12 @@ pub use convert::{
     convert_krea_realtime_transformer, normalize_krea_keys, sanitize_krea_realtime_transformer,
     strip_model_prefix, KREA_MODEL_PREFIX, TRANSFORMER_DTYPE,
 };
+pub use generate::{generate_latents, generate_latents_into, ArGenParams};
 pub use load::{
     expected_transformer_tensors, load_krea_realtime_transformer, verify_transformer_tensors,
     TensorSpec,
 };
+pub use scheduler::{euler_x0, renoise_step, FewStepSchedule, NUM_TRAIN_TIMESTEPS};
 
 // Re-export the reused Wan config type so callers can name the DiT dimensions without a direct
 // `mlx-gen-wan` dependency.
