@@ -35,6 +35,12 @@ const CASES: &[Case] = &[
         prompt: "Futuristic laser blast, sharp energy pulse, stereo movement, arcade style",
         wav_out: "SA3_SMALL_SFX_WAV_OUT",
     },
+    Case {
+        variant: Variant::Medium,
+        env: "SA3_MEDIUM_SNAPSHOT",
+        prompt: "Meditative lo-fi ambient piano jazz, soft acoustic drum kit",
+        wav_out: "SA3_MEDIUM_WAV_OUT",
+    },
 ];
 
 fn snapshot(env: &str) -> WeightsSource {
@@ -204,6 +210,7 @@ const fn minimum_side_ratio(variant: Variant) -> f64 {
     match variant {
         Variant::SmallMusic => MUSIC_SIDE_RATIO_FLOOR,
         Variant::SmallSfx => SFX_SIDE_RATIO_FLOOR,
+        Variant::Medium => MEDIUM_SIDE_RATIO_FLOOR,
     }
 }
 
@@ -257,6 +264,27 @@ const PREVIOUS_SFX_SIDE_RATIO_FLOOR: f64 = 1e-4;
 /// sweep adds is the measurement that was missing — the per-window median assertion is now
 /// enforced only at a configuration where it has been measured.
 const MUSIC_SIDE_RATIO_FLOOR: f64 = 1e-2;
+
+/// Set from the 25-sample medium sweep in
+/// [`medium_stereo_width_floor_is_calibrated_across_prompts_and_seeds`], run at the enforced
+/// 30 s / 8 steps on Metal:
+///
+/// | backend | min global | min median-window |
+/// |---|---:|---:|
+/// | Metal | 1.20543e-4 | 1.02879e-4 |
+///
+/// Medium is the only SA3 checkpoint registered for **both** domains, and its sweep says so: the
+/// three music prompts and the footsteps prompt all land between 2.65e-1 and 1.03, while
+/// "Dog barking next to a waterfall" collapses to 1.2e-4 at two of five seeds and recovers to
+/// 2.2e-1 / 3.4e-1 at two others. A floor set anywhere inside the music distribution would gate
+/// honest sparse-SFX output on this id, which is precisely the failure a generalist checkpoint
+/// invites. The floor is therefore taken from the union minimum with the same ~2x margin the SFX
+/// specialist uses: 1.02879e-4 / 5e-5 = 2.06x.
+///
+/// Like the other two, this is a **duplicated-mono** gate, not a stereo-width bar. What it must
+/// catch is a decode path that emits one channel twice — exactly 0 — which matters more here than
+/// for the smalls because medium decodes through SAME-L rather than SAME-S.
+const MEDIUM_SIDE_RATIO_FLOOR: f64 = 5e-5;
 
 /// Every shape/quality gate a registered SA3 small variant must satisfy on real weights.
 fn assert_real_audio(variant: Variant, track: &AudioTrack, duration: f32) {
@@ -533,7 +561,19 @@ const MUSIC_SWEEP_PROMPTS: &[&str] = &[
     "warm cinematic post-rock with bowed strings and restrained drums",
 ];
 
-/// Includes 42, the seed both per-run gates render at.
+/// The medium sweep deliberately spans **both** domains: two shipped music `demo_cond` prompts from
+/// medium's own `model_config.json`, two shipped SFX `demo_cond` prompts from `small-sfx`, and the
+/// prompt medium's per-run gate renders. Medium is the only SA3 checkpoint tagged for both domains,
+/// so a floor calibrated on music alone would not cover what this id is registered to serve.
+const MEDIUM_SWEEP_PROMPTS: &[&str] = &[
+    "Meditative lo-fi ambient piano jazz, soft acoustic drum kit",
+    "A tropical house track with upbeat melodies, a driving bassline, and cheery vibes",
+    "Dog barking next to a waterfall",
+    "Running footsteps on pavement, fast pace, urban street environment, energetic motion sound",
+    "warm cinematic post-rock with bowed strings and restrained drums",
+];
+
+/// Includes 42, the seed every per-run gate renders at.
 const SWEEP_SEEDS: &[u64] = &[42, 7, 14_544, 2_026, 31_337];
 
 /// Drive one registered variant over its own prompt space and return the measured side-ratio
@@ -649,6 +689,81 @@ fn music_stereo_width_floor_is_calibrated_across_prompts_and_seeds() {
         MUSIC_SWEEP_PROMPTS,
         50.0,
     );
+}
+
+/// Long-form medium renders, measured rather than asserted.
+///
+/// This is the variant's entire reason to exist: the smalls stop at 120 s, medium advertises 380 s,
+/// and the failure mode that matters is the one that only appears once the decode plan spans tens of
+/// SAME-L chunks. The durations are operator-selectable so one binary can produce the whole table,
+/// and the gate is the same `assert_real_audio` every other real-weight render must satisfy — exact
+/// `floor(seconds * 44100)` framing, finite and clamped PCM, a genuine two-channel image, non-silent
+/// output, and no white-noise or pure-tone degeneracy.
+///
+/// Set `SA3_MEDIUM_LONG_SECONDS` to a comma-separated list (default `120,300`). Wall-clock per
+/// render is printed; peak resident memory is captured by the caller (`/usr/bin/time -l` on macOS,
+/// the CUDA job's allocator probe on Windows), because a process-wide peak is not something a test
+/// can attribute to one render.
+#[test]
+#[ignore = "real 10.4 GB weights; set SA3_MEDIUM_SNAPSHOT"]
+fn medium_long_form_renders_are_exact_and_timed() {
+    let case = &CASES[2];
+    let generator = candle_audio_stable_audio_3::provider_registry()
+        .expect("provider registry")
+        .load(case.variant.model_id(), &LoadSpec::new(snapshot(case.env)))
+        .expect("strict registered variant-bound load");
+    let steps = env_u32("SA3_TEST_STEPS", CALIBRATION_STEPS);
+    let seed = 42u64;
+    let durations = std::env::var("SA3_MEDIUM_LONG_SECONDS")
+        .unwrap_or_else(|_| "120,300".to_owned())
+        .split(',')
+        .map(|value| value.trim().parse::<f32>().expect("duration list"))
+        .collect::<Vec<_>>();
+    assert!(
+        durations.iter().copied().fold(0.0f32, f32::max) >= 300.0,
+        "the >=300 s measurement is the point of this test; got {durations:?}"
+    );
+    for duration in durations {
+        let started = std::time::Instant::now();
+        let track = match generator
+            .generate(&request(case.prompt, duration, steps, seed), &mut |_| {})
+            .expect("connected long-form generation")
+        {
+            GenerationOutput::Audio(track) => track,
+            other => panic!("expected audio, got {other:?}"),
+        };
+        let elapsed = started.elapsed();
+        eprintln!(
+            "medium long-form: seconds={duration} steps={steps} wall_clock_s={:.3} \
+             realtime_factor={:.3}x",
+            elapsed.as_secs_f64(),
+            duration as f64 / elapsed.as_secs_f64()
+        );
+        assert_real_audio(case.variant, &track, duration);
+        if let Some(path) = std::env::var_os("SA3_MEDIUM_LONG_WAV_DIR") {
+            let path = PathBuf::from(path).join(format!("sa3-medium-{duration}s.wav"));
+            candle_audio::wav::write_wav_pcm16(&path, &track).expect("write WAV");
+            eprintln!("medium long-form WAV: {}", path.display());
+        }
+    }
+}
+
+/// The calibration behind [`MEDIUM_SIDE_RATIO_FLOOR`], over medium's own two-domain prompt space.
+#[test]
+#[ignore = "real 10.4 GB weights; set SA3_MEDIUM_SNAPSHOT"]
+fn medium_stereo_width_floor_is_calibrated_across_prompts_and_seeds() {
+    calibrate_side_ratio_floor(
+        Variant::Medium,
+        "SA3_MEDIUM_SNAPSHOT",
+        MEDIUM_SWEEP_PROMPTS,
+        10.0,
+    );
+}
+
+#[test]
+#[ignore = "real 10.4 GB weights; set SA3_MEDIUM_SNAPSHOT"]
+fn connected_medium_generation_is_stereo_finite_and_exact_length() {
+    run_case(&CASES[2]);
 }
 
 #[test]

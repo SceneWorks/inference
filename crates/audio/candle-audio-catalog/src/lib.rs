@@ -283,6 +283,7 @@ mod tests {
                 "acestep_v15_turbo",
                 "stable_audio_3_small_music",
                 "stable_audio_3_small_sfx",
+                "stable_audio_3_medium",
                 "moss_tts_realtime",
                 "chatterbox_tts",
                 "mmaudio_small_16k",
@@ -512,6 +513,27 @@ mod tests {
                 ),
                 (
                     "stable_audio_3_small_sfx",
+                    Some("t5gemma"),
+                    "LicenseRef-Gemma-Terms",
+                    true
+                ),
+                // sc-14545: medium's SAME-L is a namespace inside the same single root
+                // safetensors, not a separate artifact, so it contributes the same three rows the
+                // smalls do — composite, root, bundled T5Gemma — and not a fourth.
+                (
+                    "stable_audio_3_medium",
+                    None,
+                    "LicenseRef-Stability-AI-Community",
+                    false
+                ),
+                (
+                    "stable_audio_3_medium",
+                    Some("root"),
+                    "LicenseRef-Stability-AI-Community",
+                    false
+                ),
+                (
+                    "stable_audio_3_medium",
                     Some("t5gemma"),
                     "LicenseRef-Gemma-Terms",
                     true

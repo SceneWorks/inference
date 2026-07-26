@@ -1,4 +1,4 @@
-//! Mis-wiring gates for the two registered Stable Audio 3 small checkpoints (`sc-14544`).
+//! Mis-wiring gates for the registered Stable Audio 3 checkpoints (`sc-14544`, `sc-14545`).
 //!
 //! `small-music` and `small-sfx` are architecturally identical: same tensor inventory, same DiT
 //! geometry, same SAME-S pretransform, same bundled T5Gemma stack, and root checkpoints of exactly
@@ -7,6 +7,17 @@
 //! a real snapshot and asserts the load fails — a test that passes with swapped weights is a false
 //! green, and would be the only thing standing between a consumer and silently receiving music
 //! from `stable_audio_3_small_sfx`.
+//!
+//! `medium` (sc-14545) adds a second, sharper case. Against the smalls it is separated on shape
+//! alone (997 root tensors against 685, `1536x24` differential against `1024x20` ordinary, a
+//! `16,777,216`-frame ceiling against `5,292,032`), so those swaps never reach the hash pin. Against
+//! its own **base** sibling it is separated by almost nothing:
+//! `stabilityai/stable-audio-3-medium-base` ships the *same* 997/522/472 inventory, the *same*
+//! `16,777,216` `sample_size`, a root safetensors of the *same* 9,222,116,660 bytes, and — unlike
+//! the music/SFX pair — the *same* conditioner `repo_id` (`stabilityai/stable-audio-3-medium`).
+//! The only config-level difference in the entire file is `diffusion_objective`
+//! (`rectified_flow` against `rf_denoiser`). So for medium the `repo_id` check discriminates
+//! nothing, and the objective check plus the SHA-256 pin are the whole gate.
 
 use std::path::{Path, PathBuf};
 
@@ -54,6 +65,38 @@ fn music() -> PathBuf {
 
 fn sfx() -> PathBuf {
     snapshot("SA3_SMALL_SFX_SNAPSHOT")
+}
+
+fn medium() -> PathBuf {
+    snapshot("SA3_MEDIUM_SNAPSHOT")
+}
+
+/// A snapshot that is not part of any shipped registration, so a developer running this suite by
+/// hand can skip the mutations that need it.
+///
+/// A skip that CI also takes is a gate nobody runs, so the real-weight jobs set
+/// `SA3_REQUIRE_ALL_SNAPSHOTS=1`, which turns every skip below into a failure. Without that, adding
+/// a job and forgetting the environment variable would look identical to a passing run.
+fn optional_snapshot(env: &str) -> Option<PathBuf> {
+    match std::env::var(env) {
+        Ok(value) => Some(PathBuf::from(value)),
+        Err(_) if std::env::var("SA3_REQUIRE_ALL_SNAPSHOTS").is_ok() => panic!(
+            "{env} is unset while SA3_REQUIRE_ALL_SNAPSHOTS is set — this gate would have been \
+             skipped silently"
+        ),
+        Err(_) => None,
+    }
+}
+
+/// `stabilityai/stable-audio-3-medium-base` — same inventory, same `sample_size`, same root byte
+/// length, same conditioner `repo_id`.
+fn medium_base() -> Option<PathBuf> {
+    optional_snapshot("SA3_MEDIUM_BASE_SNAPSHOT")
+}
+
+/// `stabilityai/SAME-L` — the standalone autoencoder whose 472 tensors medium embeds verbatim.
+fn standalone_same_l() -> Option<PathBuf> {
+    optional_snapshot("SA3_SAME_L_SNAPSHOT")
 }
 
 /// Materialize one snapshot entry without copying gigabytes where the platform allows it.
@@ -308,7 +351,11 @@ fn swapping_the_root_after_load_is_rejected_before_any_tensor_is_read() {
 #[test]
 #[ignore = "requires both pinned 3.45 GB small snapshots"]
 fn shipped_configs_declare_the_conditioner_repo_that_identifies_them() {
-    for (root, expected) in [(music(), Variant::SmallMusic), (sfx(), Variant::SmallSfx)] {
+    for (root, expected) in [
+        (music(), Variant::SmallMusic),
+        (sfx(), Variant::SmallSfx),
+        (medium(), Variant::Medium),
+    ] {
         let layout = SnapshotLayout::from_dir(&root).unwrap();
         assert_eq!(
             conditioner_repo_id(&layout),
@@ -316,5 +363,166 @@ fn shipped_configs_declare_the_conditioner_repo_that_identifies_them() {
             "{} conditioner repo_id",
             expected.model_id()
         );
+    }
+}
+
+/// Medium against the two smalls, in both directions.
+///
+/// These are shape rejections rather than identity rejections — the wrapper never gets as far as
+/// hashing — which is exactly the property sc-14545 had to preserve when the hard-coded small
+/// geometry became a per-variant record. Before that change the validator pinned `685` tensors and
+/// `1024x20` for every registration; loosening it to admit medium would have silently opened the
+/// small ids to medium weights.
+#[test]
+#[ignore = "requires the pinned small and medium snapshots"]
+fn medium_and_the_smalls_reject_each_others_snapshots() {
+    // Controls first: each real snapshot must load under its own registration. Without these the
+    // rejections below would pass on a loader that rejects everything.
+    load_variant(
+        Variant::Medium,
+        &LoadSpec::new(WeightsSource::Dir(medium())),
+    )
+    .expect("the real medium snapshot must load under stable_audio_3_medium");
+    load_variant(
+        Variant::SmallMusic,
+        &LoadSpec::new(WeightsSource::Dir(music())),
+    )
+    .expect("the real small-music snapshot must load under stable_audio_3_small_music");
+    load_variant(Variant::SmallSfx, &LoadSpec::new(WeightsSource::Dir(sfx())))
+        .expect("the real small-sfx snapshot must load under stable_audio_3_small_sfx");
+
+    for (label, variant) in [
+        (
+            "music snapshot under the medium registration",
+            Variant::SmallMusic,
+        ),
+        (
+            "SFX snapshot under the medium registration",
+            Variant::SmallSfx,
+        ),
+    ] {
+        let root = if variant == Variant::SmallMusic {
+            music()
+        } else {
+            sfx()
+        };
+        expect_rejected(
+            label,
+            Variant::Medium,
+            &LoadSpec::new(WeightsSource::Dir(root)),
+        );
+    }
+    expect_rejected(
+        "medium snapshot under the music registration",
+        Variant::SmallMusic,
+        &LoadSpec::new(WeightsSource::Dir(medium())),
+    );
+    expect_rejected(
+        "medium snapshot under the SFX registration",
+        Variant::SmallSfx,
+        &LoadSpec::new(WeightsSource::Dir(medium())),
+    );
+}
+
+/// The medium mutation the `repo_id` check cannot see.
+///
+/// `medium-base` matches medium on every quantity the wrapper checks except `diffusion_objective`,
+/// and matches it byte-for-byte on root length. If this were admitted, `stable_audio_3_medium` would
+/// serve a base checkpoint whose 8-step Pingpong default and `cfg_scale=1` descriptor are wrong for
+/// it — a silent quality collapse rather than an error.
+#[test]
+#[ignore = "requires the pinned medium and medium-base snapshots"]
+fn the_medium_base_sibling_is_rejected_under_the_post_trained_medium_id() {
+    let Some(base) = medium_base() else {
+        eprintln!("SA3_MEDIUM_BASE_SNAPSHOT unset; skipping the sharpest medium mutation");
+        return;
+    };
+    // Control: the post-trained snapshot loads.
+    load_variant(
+        Variant::Medium,
+        &LoadSpec::new(WeightsSource::Dir(medium())),
+    )
+    .expect("the real medium snapshot must load under stable_audio_3_medium");
+
+    expect_rejected(
+        "medium-base snapshot under the post-trained medium registration",
+        Variant::Medium,
+        &LoadSpec::new(WeightsSource::Dir(base.clone())),
+    );
+
+    // And the mutation that isolates the hash pin from the objective check: the post-trained config
+    // (so `diffusion_objective` reads `rf_denoiser` and `repo_id` matches) over the base root
+    // weights, which are the same 9,222,116,660 bytes.
+    assert_unmutated_reassembly_loads("medium-reassembled", Variant::Medium, &medium());
+    let base_root_under_medium = Assembled::new(
+        "medium-base-root-under-medium",
+        &medium(),
+        &[("model.safetensors", base)],
+    );
+    expect_rejected(
+        "medium-base root safetensors under the post-trained medium config",
+        Variant::Medium,
+        &base_root_under_medium.spec(),
+    );
+}
+
+/// A standalone SAME-L snapshot is an autoencoder, not a provider checkpoint.
+#[test]
+#[ignore = "requires the pinned SAME-L snapshot"]
+fn the_standalone_same_l_autoencoder_is_rejected_under_every_registration() {
+    let Some(same_l) = standalone_same_l() else {
+        eprintln!("SA3_SAME_L_SNAPSHOT unset; skipping the standalone-autoencoder mutation");
+        return;
+    };
+    for variant in [Variant::Medium, Variant::SmallMusic, Variant::SmallSfx] {
+        match load_variant(variant, &LoadSpec::new(WeightsSource::Dir(same_l.clone()))) {
+            Ok(_) => panic!(
+                "{} accepted a standalone SAME-L autoencoder snapshot",
+                variant.model_id()
+            ),
+            Err(error) => eprintln!("{}: rejected with `{error}`", variant.model_id()),
+        }
+    }
+}
+
+/// Medium's own load-to-use window, with the same discriminating restore control the SFX case uses.
+#[test]
+#[ignore = "requires the pinned medium and medium-base snapshots"]
+fn swapping_the_medium_root_after_load_is_rejected_before_any_tensor_is_read() {
+    let Some(base) = medium_base() else {
+        eprintln!("SA3_MEDIUM_BASE_SNAPSHOT unset; skipping the medium post-load swap");
+        return;
+    };
+    let assembled = Assembled::new("medium-post-load-swap", &medium(), &[]);
+    let generator = load_variant(Variant::Medium, &assembled.spec())
+        .expect("the authentic medium reassembly must load");
+
+    assembled.replace("model.safetensors", &base);
+    match generator.generate(&short_request(), &mut |_| {}) {
+        Ok(_) => panic!(
+            "stable_audio_3_medium served base weights swapped in after load — the pinned identity \
+             is not re-checked at tensor-open time"
+        ),
+        Err(gen_core::Error::Msg(message)) => {
+            eprintln!("medium post-load root swap rejected with `{message}`");
+            assert!(
+                message.contains(Variant::Medium.model_id())
+                    && message.contains("model.safetensors"),
+                "rejection must name the registration and the swapped file: {message}"
+            );
+        }
+        Err(other) => panic!("expected an identity rejection, got {other:?}"),
+    }
+
+    assembled.replace("model.safetensors", &medium());
+    match generator
+        .generate(&short_request(), &mut |_| {})
+        .expect("the same generator must serve once the authentic root is restored")
+    {
+        GenerationOutput::Audio(track) => {
+            assert_eq!(track.sample_rate, 44_100);
+            assert!(!track.samples.is_empty());
+        }
+        other => panic!("expected audio, got {other:?}"),
     }
 }

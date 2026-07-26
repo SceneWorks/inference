@@ -10,7 +10,7 @@ on:
         type: choice
         required: true
         default: all
-        options: [all, llm, media, audio, same-l, same-chunked, sa3-small-music, sa3-small-sfx]
+        options: [all, llm, media, audio, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium]
 
 permissions:
   contents: read
@@ -584,6 +584,101 @@ jobs:
               -- --ignored --nocapture
           shasum -a 256 "$RUNNER_TEMP/sa3-small-sfx-metal.wav"
 
+  sa3-medium-metal:
+    name: Stable Audio 3 medium provider (Metal)
+    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'sa3-medium'
+    runs-on: [self-hosted, macOS, ARM64, real-weights]
+    env:
+      SA3_TEST_METAL: "1"
+      # Turn every "snapshot not provisioned, skipping" branch in the mutation gates into a
+      # failure. A skip CI also takes is a gate nobody runs.
+      SA3_REQUIRE_ALL_SNAPSHOTS: "1"
+      # The embedded-SAME-L oracle case. `same-l-metal` pins `standalone`, so before sc-14545 the
+      # embedded branch of `same_l_short_standalone_and_embedded_match_every_band_layer` and
+      # `same_l_long_durations_match_compact_band_boundaries` had never executed in CI despite both
+      # tests reading SA3_MEDIUM_SNAPSHOT. Medium is the only registered provider that decodes
+      # through SAME-L, so this is where that case belongs.
+      SA3_SAME_L_CASE: embedded
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Configure immutable medium, medium-base and small snapshot paths
+        run: |
+          # The cross-variant mutation gates compare medium against both smalls and against its own
+          # base sibling, and the two-domain comparison renders medium beside each specialist, so
+          # every snapshot they read has to be on this runner.
+          echo "SA3_MEDIUM_SNAPSHOT=$RUNNER_TEMP/sa3-medium/27b5a21b791b1b033d193a9e1e3ce78493f102f9" >> "$GITHUB_ENV"
+          echo "SA3_MEDIUM_BASE_SNAPSHOT=$RUNNER_TEMP/sa3-medium-base/b32993f73c3bdc3864043a72d8032606bba737c8" >> "$GITHUB_ENV"
+          echo "SA3_SMALL_MUSIC_SNAPSHOT=$RUNNER_TEMP/sa3-small-music/0fef1392cd842149a2b6d445e181c97608faac06" >> "$GITHUB_ENV"
+          echo "SA3_SMALL_SFX_SNAPSHOT=$RUNNER_TEMP/sa3-small-sfx/ae12755283df9d62ca39a9b050a39a0b607b8c20" >> "$GITHUB_ENV"
+          echo "SA3_SAME_L_SNAPSHOT=$RUNNER_TEMP/sa3-same-l/41acf79dd242877d6499a1108ca5dba5d5eecfc5" >> "$GITHUB_ENV"
+      - name: Toolchain and hardware versions
+        run: |
+          sw_vers
+          system_profiler SPHardwareDataType SPDisplaysDataType |
+            grep -E 'Model Name|Model Identifier|Chip|Total Number of Cores|Memory|Chipset Model|Metal Support'
+          rustc --version
+          cargo --version
+      - name: Materialize and verify the immutable snapshots
+        run: |
+          python3 -m pip install --disable-pip-version-check --target "$RUNNER_TEMP/huggingface-hub" "huggingface_hub==1.20.1"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model stable-audio-3-medium --snapshot "$SA3_MEDIUM_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model stable-audio-3-medium-base --snapshot "$SA3_MEDIUM_BASE_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-music --snapshot "$SA3_SMALL_MUSIC_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-sfx --snapshot "$SA3_SMALL_SFX_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model same-l --snapshot "$SA3_SAME_L_SNAPSHOT"
+      - name: Verify the embedded SAME-L band boundaries on Metal
+        run: |
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
+            same_l_short_standalone_and_embedded_match_every_band_layer -- --ignored --nocapture
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
+            same_l_long_durations_match_compact_band_boundaries -- --ignored --nocapture
+      - name: Reject cross-variant weight paths (mutation gates)
+        run: |
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
+            --test variant_binding -- --ignored --nocapture
+      - name: Run registered medium conformance and concurrent RNG isolation on Metal
+        run: |
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
+            --test conformance registered_medium_provider_passes_full_audio_conformance -- --ignored --nocapture
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
+            --test conformance concurrent_medium_requests_are_deterministic_and_do_not_share_rng_state -- --ignored --nocapture
+      - name: Re-calibrate the medium stereo-width floor across both domains
+        run: |
+          # Medium's floor is derived from a 25-sample sweep that deliberately mixes music and SFX
+          # prompts, because medium is the only SA3 checkpoint registered for both. The sweep's
+          # defaults are the render's own 30 s / 8 steps.
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
+            --test provider medium_stereo_width_floor_is_calibrated_across_prompts_and_seeds \
+            -- --ignored --nocapture
+      - name: Prove medium serves both domains and diverges from each specialist
+        run: |
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
+            --test variant_quality -- --ignored --nocapture
+      - name: Measure the F16-vs-F32 compute policy on real weights
+        run: |
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
+            --test dtype_policy -- --ignored --nocapture
+      - name: Measure the long-form 120 s and 300 s renders with peak memory
+        run: |
+          # The 380 s published cap is included: it is the only configuration that exercises the
+          # full 4,096-latent adapted geometry and the 43-chunk SAME-L decode plan, which is the
+          # entire reason this variant is registered separately from the smalls.
+          SA3_MEDIUM_LONG_SECONDS=120,300,380 \
+          SA3_MEDIUM_LONG_WAV_DIR="$RUNNER_TEMP" \
+            /usr/bin/time -l cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
+              --test provider medium_long_form_renders_are_exact_and_timed -- --ignored --nocapture
+          for seconds in 120 300 380; do
+            shasum -a 256 "$RUNNER_TEMP/sa3-medium-${seconds}s.wav"
+          done
+      - name: Render a real 30-second eight-step medium Metal WAV
+        run: |
+          SA3_TEST_DURATION=30 SA3_TEST_STEPS=8 \
+          SA3_MEDIUM_WAV_OUT="$RUNNER_TEMP/sa3-medium-metal.wav" \
+            cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
+              --test provider connected_medium_generation_is_stereo_finite_and_exact_length \
+              -- --ignored --nocapture
+          shasum -a 256 "$RUNNER_TEMP/sa3-medium-metal.wav"
+
   same-l-cuda:
     name: SAME-L real weights (CUDA)
     if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'same-l'
@@ -852,6 +947,109 @@ jobs:
             -- --ignored --nocapture
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Get-FileHash -Algorithm SHA256 $env:SA3_SMALL_SFX_WAV_OUT
+
+  sa3-medium-cuda:
+    name: Stable Audio 3 medium provider (CUDA)
+    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'sa3-medium'
+    runs-on: [self-hosted, windows, cuda, real-weights]
+    env:
+      SA3_TEST_CUDA: "1"
+      SA3_REQUIRE_ALL_SNAPSHOTS: "1"
+      SA3_SAME_L_CASE: embedded
+      CUDA_COMPUTE_CAP: "80"
+      CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
+      VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Configure immutable medium and small snapshot paths
+        shell: cmd
+        run: |
+          echo SA3_MEDIUM_SNAPSHOT=%RUNNER_TEMP%\sa3-medium\27b5a21b791b1b033d193a9e1e3ce78493f102f9>>"%GITHUB_ENV%"
+          echo SA3_MEDIUM_BASE_SNAPSHOT=%RUNNER_TEMP%\sa3-medium-base\b32993f73c3bdc3864043a72d8032606bba737c8>>"%GITHUB_ENV%"
+          echo SA3_SMALL_MUSIC_SNAPSHOT=%RUNNER_TEMP%\sa3-small-music\0fef1392cd842149a2b6d445e181c97608faac06>>"%GITHUB_ENV%"
+          echo SA3_SMALL_SFX_SNAPSHOT=%RUNNER_TEMP%\sa3-small-sfx\ae12755283df9d62ca39a9b050a39a0b607b8c20>>"%GITHUB_ENV%"
+          echo SA3_SAME_L_SNAPSHOT=%RUNNER_TEMP%\sa3-same-l\41acf79dd242877d6499a1108ca5dba5d5eecfc5>>"%GITHUB_ENV%"
+      - name: Select Git Bash
+        shell: cmd
+        run: |
+          if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
+          echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+        with:
+          toolchain: 1.96.0
+          components: rustfmt, clippy
+      - name: Toolchain and hardware versions
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          rustc --version
+          cargo --version
+          nvidia-smi
+      - name: Materialize and verify the immutable snapshots
+        shell: cmd
+        run: |
+          python -m pip install --disable-pip-version-check --target "%RUNNER_TEMP%\huggingface-hub" "huggingface_hub==1.20.1"
+          set "PYTHONPATH=%RUNNER_TEMP%\huggingface-hub"
+          python scripts/release/ensure_model_snapshot.py --model stable-audio-3-medium --snapshot "%SA3_MEDIUM_SNAPSHOT%" || exit /b 1
+          python scripts/release/ensure_model_snapshot.py --model stable-audio-3-medium-base --snapshot "%SA3_MEDIUM_BASE_SNAPSHOT%" || exit /b 1
+          python scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-music --snapshot "%SA3_SMALL_MUSIC_SNAPSHOT%" || exit /b 1
+          python scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-sfx --snapshot "%SA3_SMALL_SFX_SNAPSHOT%" || exit /b 1
+          python scripts/release/ensure_model_snapshot.py --model same-l --snapshot "%SA3_SAME_L_SNAPSHOT%" || exit /b 1
+      - name: Reject cross-variant weight paths and run medium conformance on CUDA
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --test variant_binding -- --ignored --nocapture || exit /b 1
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --test conformance registered_medium_provider_passes_full_audio_conformance -- --ignored --nocapture || exit /b 1
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --test conformance concurrent_medium_requests_are_deterministic_and_do_not_share_rng_state -- --ignored --nocapture || exit /b 1
+      - name: Re-calibrate the medium stereo-width floor on CUDA
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          REM The render step below enforces the side-ratio floor on this backend, so the sweep
+          REM behind it runs on this backend at the render's own 30 s / 8 steps.
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --test provider medium_stereo_width_floor_is_calibrated_across_prompts_and_seeds -- --ignored --nocapture || exit /b 1
+      - name: Prove medium serves both domains and measure the compute policy on CUDA
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --test variant_quality -- --ignored --nocapture || exit /b 1
+          REM The F16-vs-F32 measurement behind the shipped F32 policy, taken on the backend
+          REM upstream would half-cast. sc-14545 could only measure it on Metal.
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --test dtype_policy -- --ignored --nocapture || exit /b 1
+      - name: Measure the long-form renders and peak CUDA allocation
+        shell: powershell
+        run: |
+          cmd /c "call `"$env:VCVARS`" && set" |
+            ForEach-Object {
+              if ($_ -match "^(.*?)=(.*)$") { Set-Item -Force "env:$($matches[1])" $matches[2] }
+            }
+          $env:SA3_MEDIUM_LONG_SECONDS = "120,300,380"
+          $env:SA3_MEDIUM_LONG_WAV_DIR = $env:RUNNER_TEMP
+          $baseline = [int]((nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits) -split "\s+")[0]
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda `
+            --test provider medium_long_form_renders_are_exact_and_timed -- --ignored --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $after = [int]((nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits) -split "\s+")[0]
+          Write-Host "SA3_MEDIUM_CUDA_MEMORY baseline_mib=$baseline post_run_mib=$after"
+          foreach ($seconds in 120, 300, 380) {
+            Get-FileHash -Algorithm SHA256 (Join-Path $env:RUNNER_TEMP "sa3-medium-${seconds}s.wav")
+          }
+      - name: Render a real 30-second eight-step medium CUDA WAV
+        shell: powershell
+        run: |
+          cmd /c "call `"$env:VCVARS`" && set" |
+            ForEach-Object {
+              if ($_ -match "^(.*?)=(.*)$") { Set-Item -Force "env:$($matches[1])" $matches[2] }
+            }
+          $env:SA3_TEST_DURATION = "30"
+          $env:SA3_TEST_STEPS = "8"
+          $env:SA3_MEDIUM_WAV_OUT = Join-Path $env:RUNNER_TEMP "sa3-medium-cuda.wav"
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda `
+            --test provider connected_medium_generation_is_stereo_finite_and_exact_length `
+            -- --ignored --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-FileHash -Algorithm SHA256 $env:SA3_MEDIUM_WAV_OUT
 
   candle-llm:
     name: Candle LLM real weights (CUDA)

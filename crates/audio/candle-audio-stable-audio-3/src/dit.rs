@@ -204,6 +204,15 @@ pub struct StableAudio3Dit {
     io_channels: usize,
     embed_dim: usize,
     depth: usize,
+    /// Compute dtype of the loaded weights.
+    ///
+    /// Conditioning enters this module in F32 — T5Gemma's canonical output dtype (sc-14537) — and
+    /// both Fourier feature maps are evaluated in F32 on purpose. When the checkpoint is loaded at
+    /// half precision (upstream's `model_half=True`, CUDA only) those F32 tensors cannot meet F16
+    /// weights in a matmul, so each one is cast here, at the single boundary, rather than by
+    /// scattering `to_dtype` through the block stack. At F32 every cast is a no-op, so the frozen
+    /// oracles are bit-unaffected.
+    dtype: DType,
     number: NumberConditioner,
     to_cond_first: Linear,
     to_cond_second: Linear,
@@ -251,6 +260,7 @@ impl StableAudio3Dit {
             candle_audio::candle_core::Error::Msg("missing conditioner builder".into())
         })?;
         let transformer = root.pp("transformer");
+        let dtype = root.dtype();
         let dim_head = config.embed_dim / config.num_heads;
         let number = NumberConditioner::load(model, conditioner)?;
         let mut blocks = Vec::with_capacity(config.depth);
@@ -278,6 +288,7 @@ impl StableAudio3Dit {
             io_channels: config.io_channels,
             embed_dim: config.embed_dim,
             depth: config.depth,
+            dtype,
             number,
             to_cond_first: linear_no_bias(
                 config.cond_token_dim,
@@ -393,13 +404,19 @@ impl StableAudio3Dit {
             }
         }
 
-        let number_features = self.number.features(inputs.seconds_total)?;
+        // Single dtype boundary: everything below runs at the loaded weights' dtype. At F32 these
+        // casts are no-ops.
+        let latents = inputs.latents.to_dtype(self.dtype)?;
+        let local_conditioning = inputs.local_conditioning.to_dtype(self.dtype)?;
+        let prompt = inputs.prompt.to_dtype(self.dtype)?;
+
+        let number_features = self
+            .number
+            .features(inputs.seconds_total)?
+            .to_dtype(self.dtype)?;
         let number_embedding = self.number.projection.forward(&number_features)?;
-        let raw_context = assemble_raw_context(
-            inputs.prompt,
-            &number_embedding,
-            zero_cross_context_from_batch,
-        )?;
+        let raw_context =
+            assemble_raw_context(&prompt, &number_embedding, zero_cross_context_from_batch)?;
         let context = sequential_two(&self.to_cond_first, &self.to_cond_second, &raw_context)?;
         let duration_global = sequential_two(
             &self.to_global_first,
@@ -407,7 +424,8 @@ impl StableAudio3Dit {
             &number_embedding,
         )?;
         // Direct F32 t: no logSNR conversion.
-        let timestep_features = expo_fourier_features(&inputs.timestep.to_dtype(DType::F32)?, 256)?;
+        let timestep_features = expo_fourier_features(&inputs.timestep.to_dtype(DType::F32)?, 256)?
+            .to_dtype(self.dtype)?;
         let timestep_embedding = sequential_two(
             &self.to_timestep_first,
             &self.to_timestep_second,
@@ -417,14 +435,14 @@ impl StableAudio3Dit {
         let global_modulation =
             sequential_two(&self.global_first, &self.global_second, &combined_global)?;
 
-        let preprocessed = (inputs.latents + self.preprocess.forward(inputs.latents)?)?;
+        let preprocessed = (&latents + self.preprocess.forward(&latents)?)?;
         let projected_input = self
             .project_in
             .forward(&preprocessed.transpose(1, 2)?.contiguous()?)?;
         let (mut hidden, extended_mask) =
             self.memory.prepend(&projected_input, inputs.padding_mask)?;
         let rotary = self.rotary.frequencies(hidden.dim(1)?)?;
-        let local = inputs.local_conditioning.transpose(1, 2)?.contiguous()?;
+        let local = local_conditioning.transpose(1, 2)?.contiguous()?;
 
         if let Some(trace) = trace.as_deref_mut() {
             trace.number_features = Some(number_features.clone());
@@ -678,18 +696,25 @@ fn guided_prediction(
     padding_mask: Option<&Tensor>,
     guidance: Guidance,
 ) -> Result<Tensor> {
+    // Guidance arithmetic runs at the predictions' dtype. The sigma/alpha maps are still evaluated
+    // from the F32 schedule and cast once here, so a half-precision checkpoint never rounds the
+    // timestep before the trigonometry. At F32 every cast below is a no-op.
+    let compute = conditional.dtype();
+    let latents = &latents.to_dtype(compute)?;
     let sigma = match objective {
         DiffusionObjective::V => (timestep * (std::f64::consts::PI / 2.0))?.sin()?,
         DiffusionObjective::RfDenoiser | DiffusionObjective::RectifiedFlow => timestep.clone(),
     }
     .unsqueeze(1)?
-    .unsqueeze(2)?;
+    .unsqueeze(2)?
+    .to_dtype(compute)?;
     let conditional_denoised = match objective {
         DiffusionObjective::V => {
             let alpha = (timestep * (std::f64::consts::PI / 2.0))?
                 .cos()?
                 .unsqueeze(1)?
-                .unsqueeze(2)?;
+                .unsqueeze(2)?
+                .to_dtype(compute)?;
             latents
                 .broadcast_mul(&alpha)?
                 .broadcast_sub(&conditional.broadcast_mul(&sigma)?)?
@@ -701,7 +726,8 @@ fn guided_prediction(
             let alpha = (timestep * (std::f64::consts::PI / 2.0))?
                 .cos()?
                 .unsqueeze(1)?
-                .unsqueeze(2)?;
+                .unsqueeze(2)?
+                .to_dtype(compute)?;
             latents
                 .broadcast_mul(&alpha)?
                 .broadcast_sub(&unconditional.broadcast_mul(&sigma)?)?
@@ -738,7 +764,8 @@ fn guided_prediction(
             let alpha = (timestep * (std::f64::consts::PI / 2.0))?
                 .cos()?
                 .unsqueeze(1)?
-                .unsqueeze(2)?;
+                .unsqueeze(2)?
+                .to_dtype(compute)?;
             latents
                 .broadcast_mul(&alpha)?
                 .broadcast_sub(&guided_denoised)?

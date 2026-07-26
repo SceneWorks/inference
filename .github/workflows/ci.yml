@@ -212,9 +212,14 @@ jobs:
         # same `-j 1` the lld memory limit requires, and runs in ~0.01 s. The real-weight cases in
         # this target stay `#[ignore]`d and are skipped here. `--nocapture` keeps the discriminating
         # near-mono measurement in the log, so the gate is auditable from the run itself.
+        # sc-14545 adds two more weight-free control targets on the same reasoning: `dtype_policy`
+        # carries the controls for the F16-vs-F32 envelope check, and `variant_quality` carries the
+        # Gram-Schmidt control that shows the cross-checkpoint divergence bound rejects a shared
+        # weight path. Both are tiny and their real-weight cases stay `#[ignore]`d.
         run: >-
           cargo test --locked -j 1
-          -p candle-audio-stable-audio-3 --test provider -- --nocapture
+          -p candle-audio-stable-audio-3
+          --test provider --test dtype_policy --test variant_quality -- --nocapture
       - name: Test LLM-only CPU bundle
         run: cargo test --locked --no-default-features --lib -p runtime-cpu
       # The decided sc-12835 feature wiring: audio is its own additive bundle feature, so the

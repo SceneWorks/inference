@@ -638,7 +638,11 @@ fn expand(values: &Tensor) -> Result<Tensor> {
 }
 
 fn denoised(x: &Tensor, timestep: &Tensor, velocity: &Tensor) -> Result<Tensor> {
-    Ok(x.broadcast_sub(&velocity.broadcast_mul(&expand(timestep)?)?)?)
+    // The schedule stays F32 so the model sees a full-precision sigma; the solver arithmetic runs
+    // at the latents' dtype, which is F16 under a half-precision checkpoint. At F32 this is a
+    // no-op.
+    let sigma = expand(timestep)?.to_dtype(velocity.dtype())?;
+    Ok(x.broadcast_sub(&velocity.broadcast_mul(&sigma)?)?)
 }
 
 /// Run one corrected RF solver. The closure is the only model seam, allowing callers to reuse
@@ -732,6 +736,15 @@ where
     let mut calls = 0usize;
     let mut old_denoised: Option<Tensor> = None;
     let device_schedule = schedule.materialize(batch, initial.device())?;
+    // The materialized schedule is F32 and stays F32 for every value handed to the model: the DiT
+    // turns the sigma into 256 Expo Fourier features at frequencies up to 10 kHz, where F16's ~1e-3
+    // relative precision would become a large phase error. Solver arithmetic must instead match the
+    // latents, which are F16 when the checkpoint was loaded half-precision. `expand_as` is the one
+    // place that boundary is crossed; at F32 it is a no-op.
+    let solver_dtype = initial.dtype();
+    let expand_as = |values: &Tensor| -> Result<Tensor> {
+        Ok(values.unsqueeze(1)?.unsqueeze(2)?.to_dtype(solver_dtype)?)
+    };
 
     for index in 0..schedule.steps() {
         let t_values = schedule.values_at(index, batch);
@@ -756,7 +769,7 @@ where
                 if record_trajectory {
                     trajectory.push(progress);
                 }
-                x = (&x + velocity.broadcast_mul(&expand(&dt)?)?)?;
+                x = (&x + velocity.broadcast_mul(&expand_as(&dt)?)?)?;
             }
             SamplerKind::Rk4 => {
                 let k1 = model(&x, &t, &t_values)?;
@@ -781,21 +794,21 @@ where
                     .zip(&next_values)
                     .map(|(&current, &next)| current + (next - current) / 2.0)
                     .collect::<Vec<_>>();
-                let k2_x = (&x + k1.broadcast_mul(&expand(&half_dt)?)?)?;
+                let k2_x = (&x + k1.broadcast_mul(&expand_as(&half_dt)?)?)?;
                 let k2 = model(&k2_x, &midpoint, &midpoint_values)?;
-                let k3_x = (&x + k2.broadcast_mul(&expand(&half_dt)?)?)?;
+                let k3_x = (&x + k2.broadcast_mul(&expand_as(&half_dt)?)?)?;
                 let k3 = model(&k3_x, &midpoint, &midpoint_values)?;
                 let terminal_eval = next.clamp(1e-5, f64::INFINITY)?;
                 let terminal_values = next_values
                     .iter()
                     .map(|&value| value.max(1e-5))
                     .collect::<Vec<_>>();
-                let k4_x = (&x + k3.broadcast_mul(&expand(&dt)?)?)?;
+                let k4_x = (&x + k3.broadcast_mul(&expand_as(&dt)?)?)?;
                 let k4 = model(&k4_x, &terminal_eval, &terminal_values)?;
                 calls += 3;
                 let weighted = ((&k2 * 2f64)? + (&k3 * 2f64)?)?;
                 let weighted = ((&weighted + &k1)? + &k4)?;
-                x = (&x + weighted.broadcast_mul(&expand(&(&dt / 6f64)?)?)?)?;
+                x = (&x + weighted.broadcast_mul(&expand_as(&(&dt / 6f64)?)?)?)?;
             }
             SamplerKind::Dpmpp => {
                 let velocity = model(&x, &t, &t_values)?;
@@ -815,9 +828,9 @@ where
                 }
                 let terminal = index + 1 == schedule.steps();
                 let first = old_denoised.is_none();
-                let t_broadcast = expand(&t)?;
-                let next_broadcast = expand(&next)?;
-                let dt_broadcast = expand(&dt)?;
+                let t_broadcast = expand_as(&t)?;
+                let next_broadcast = expand_as(&next)?;
+                let dt_broadcast = expand_as(&dt)?;
                 let alpha = (1f64 - &next_broadcast)?;
                 let coefficient = dt_broadcast.broadcast_div(
                     &alpha
@@ -839,12 +852,12 @@ where
                     let ratio = h_last.broadcast_div(&h)?;
                     let inverse_twice_ratio = (ratio * 2f64)?.recip()?;
                     clean
-                        .broadcast_mul(&(1f64 + &expand(&inverse_twice_ratio)?)?)?
+                        .broadcast_mul(&(1f64 + &expand_as(&inverse_twice_ratio)?)?)?
                         .broadcast_sub(
                             &old_denoised
                                 .as_ref()
                                 .expect("non-first DPM++ step has history")
-                                .broadcast_mul(&expand(&inverse_twice_ratio)?)?,
+                                .broadcast_mul(&expand_as(&inverse_twice_ratio)?)?,
                         )?
                 };
                 x = next_broadcast
@@ -875,7 +888,7 @@ where
                 }
                 // Deliberately eager: frozen Python draws even when next==0.
                 let fresh = noise.standard_normal_like(&x)?;
-                let next_broadcast = expand(&next)?;
+                let next_broadcast = expand_as(&next)?;
                 x = clean
                     .broadcast_mul(&(1f64 - &next_broadcast)?)?
                     .broadcast_add(&fresh.broadcast_mul(&next_broadcast)?)?;

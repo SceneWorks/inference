@@ -1,21 +1,31 @@
-//! Stable Audio 3 provider foundation, shared primitives, and the registered small providers.
+//! Stable Audio 3 provider foundation, shared primitives, and the registered providers.
 //!
-//! Two post-trained 433M checkpoints are registered, in this order:
+//! Three post-trained checkpoints are registered, in this order:
 //!
-//! - [`MODEL_ID`] (`stable_audio_3_small_music`, sc-14543) — text-to-music;
-//! - [`SFX_MODEL_ID`] (`stable_audio_3_small_sfx`, sc-14544) — text-to-sound-effects / Foley.
+//! - [`MODEL_ID`] (`stable_audio_3_small_music`, sc-14543) — 433M text-to-music, SAME-S, 120 s;
+//! - [`SFX_MODEL_ID`] (`stable_audio_3_small_sfx`, sc-14544) — 433M text-to-sound-effects / Foley,
+//!   SAME-S, 120 s;
+//! - [`MEDIUM_MODEL_ID`] (`stable_audio_3_medium`, sc-14545) — 1.45B differential DiT over SAME-L,
+//!   380 s.
 //!
-//! They share the DiT/SAME-S architecture, the bundled encoder-only T5Gemma stack, 44.1 kHz stereo
-//! output, the 120-second logical maximum, and the eight-step Pingpong default; only the trained
-//! weights — and therefore the output character — differ. Because the two shipped
-//! `model_config.json` files are architecturally identical apart from the conditioner `repo_id`,
-//! loading is variant-bound through [`model::load_variant`] rather than shared and unconstrained.
+//! All three share the bundled encoder-only T5Gemma stack, 44.1 kHz stereo output, the eight-step
+//! Pingpong default, and the `rf_denoiser` objective; every load is variant-bound through
+//! [`model::load_variant`].
 //!
-//! `stable_audio_3_small_sfx` overlaps in intent with the shipped `moss_sfx_v2` provider but is a
-//! different tier and a different output shape: SA3 SFX is **44.1 kHz stereo** up to 120 s, while
-//! MOSS-SoundEffect is **48 kHz mono**. The descriptor contract cannot machine-encode domain,
-//! channel count, or quality tier today, so that distinction lives in the two ids and this note;
-//! adding those typed fields is tracked as `sc-15041`.
+//! The two smalls are architecturally identical to each other, so only the conditioner `repo_id`
+//! and the pinned file hashes separate them. Medium is a different graph — `1536x24` differential
+//! attention, 997 root tensors, a `16,777,216`-frame ceiling — so its wrapper rejects a small
+//! snapshot on shape before identity ever comes up. See [`model::VariantShape`].
+//!
+//! # Domain coverage is documentation-only
+//!
+//! Stability tags `stable_audio_3_medium` for **both** `music` and `sound-effects`; the two smalls
+//! are single-domain specialists. `stable_audio_3_small_sfx` additionally overlaps in intent with
+//! the shipped `moss_sfx_v2` provider but is a different tier and output shape: SA3 SFX is
+//! **44.1 kHz stereo**, MOSS-SoundEffect is **48 kHz mono**. The descriptor contract cannot
+//! machine-encode domain, channel count, or quality tier today, so those distinctions live in the
+//! ids and in these notes and nowhere else. sc-14545 accepts that explicitly rather than claiming
+//! typed coverage; adding the typed fields is tracked as `sc-15041`.
 //!
 //! `candle-audio-catalog` composes this crate into every shipped audio runtime bundle:
 //!
@@ -50,22 +60,26 @@ pub mod weight_norm;
 pub mod weights;
 
 pub use model::{
-    descriptor, descriptor_for, load, load_generator, load_sfx_generator, load_variant,
-    sfx_descriptor, sfx_load, StableAudio3SmallGenerator, Variant, HUB_REPO, HUB_REVISION,
-    MODEL_ID, REGISTRATION, SFX_HUB_REPO, SFX_HUB_REVISION, SFX_MODEL_ID, SFX_REGISTRATION,
-    WEIGHT_LICENSES,
+    descriptor, descriptor_for, load, load_generator, load_medium_generator, load_sfx_generator,
+    load_variant, medium_descriptor, medium_load, sfx_descriptor, sfx_load, StableAudio3Generator,
+    Variant, VariantShape, HUB_REPO, HUB_REVISION, MAX_DURATION_SECS, MEDIUM_HUB_REPO,
+    MEDIUM_HUB_REVISION, MEDIUM_MAX_DURATION_SECS, MEDIUM_MODEL_ID, MEDIUM_REGISTRATION,
+    MEDIUM_SHAPE, MODEL_ID, REGISTRATION, SFX_HUB_REPO, SFX_HUB_REVISION, SFX_MODEL_ID,
+    SFX_REGISTRATION, SMALL_SHAPE, WEIGHT_LICENSES,
 };
-pub use pipeline::StableAudio3SmallPipeline;
+pub use pipeline::{ComputeDTypes, StableAudio3Pipeline, VariantGeometry};
 
-/// Add both registered Stable Audio 3 small generators to an explicit audio registry builder.
+/// Add every registered Stable Audio 3 generator to an explicit audio registry builder.
 ///
-/// Registration order is stable and contiguous: music first (sc-14543), then SFX (sc-14544).
+/// Registration order is stable and contiguous: music (sc-14543), SFX (sc-14544), medium
+/// (sc-14545). New variants append, so no shipped ordered-surface assertion has to be rewritten.
 pub fn register_providers(
     registry: gen_core::ProviderRegistryBuilder,
 ) -> gen_core::ProviderRegistryBuilder {
     registry
         .register_generator(model::REGISTRATION)
         .register_generator(model::SFX_REGISTRATION)
+        .register_generator(model::MEDIUM_REGISTRATION)
 }
 
 /// Build this crate's complete explicit provider registry.
@@ -99,7 +113,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn registry_exposes_both_variants_in_stable_contiguous_order() {
+    fn registry_exposes_every_variant_in_stable_contiguous_order() {
         let registry = provider_registry().unwrap();
         let ids = registry
             .generators()
@@ -107,7 +121,18 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             ids,
-            ["stable_audio_3_small_music", "stable_audio_3_small_sfx"]
+            [
+                "stable_audio_3_small_music",
+                "stable_audio_3_small_sfx",
+                "stable_audio_3_medium"
+            ]
+        );
+        assert_eq!(
+            ids,
+            Variant::ALL
+                .iter()
+                .map(|variant| variant.model_id())
+                .collect::<Vec<_>>()
         );
     }
 
