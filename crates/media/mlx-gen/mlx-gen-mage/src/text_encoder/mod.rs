@@ -112,6 +112,7 @@ pub use layer::Qwen3VlDecoderLayer;
 pub use load::{
     load, load_dir, load_lm, load_lm_dir, load_multimodal, load_multimodal_dir, load_tokenizer,
     load_tokenizer_dir, mage_vision_config, verify_text_config, COMPONENT_DIR, LM_PREFIX,
+    QUANT_GROUP_SIZE,
 };
 pub use mlp::Qwen3VlMlp;
 pub use prompt::{edit_body, PromptKind, EDIT_IMAGE_PLACEHOLDER};

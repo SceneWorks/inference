@@ -48,6 +48,10 @@ pub fn load_text_encoder(root: impl AsRef<Path>) -> Result<BooguTextEncoder> {
 /// and a bf16 path drifts ~0.3% over its 27 layers (cross-framework GEMM rounding amplified by the
 /// merger's outlier channels — see the E7b-1 parity finding). f32 is parity-grade (image-embeds
 /// cosine 0.9998 vs the reference) for negligible cost; the 10 B DiT stays bf16.
+///
+/// Boogu's converter leaves `model.visual.*` **dense** (`mllm_quant_targets` covers the LM only), so
+/// the group size passed here never selects a packed branch today — it is passed explicitly because
+/// the tower is shared with crates that do pack it, at a different width (sc-15154).
 pub fn load_vision_tower(root: impl AsRef<Path>) -> Result<VisionTower> {
     let mut w = Weights::from_dir(root.as_ref().join("mllm"))?;
     let keys: Vec<String> = w
@@ -59,7 +63,12 @@ pub fn load_vision_tower(root: impl AsRef<Path>) -> Result<VisionTower> {
         let t = w.require(&k)?.as_dtype(mlx_rs::Dtype::Float32)?;
         w.insert(k, t);
     }
-    VisionTower::from_weights(&w, VisionConfig::qwen3_vl(), "model.visual")
+    VisionTower::from_weights(
+        &w,
+        VisionConfig::qwen3_vl(),
+        "model.visual",
+        crate::convert::QUANT_GROUP_SIZE,
+    )
 }
 
 /// Load the DiT from a snapshot's `transformer/` dir: parse the config, load the (identity-keyed)
