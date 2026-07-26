@@ -287,6 +287,7 @@ impl CausalKvCache {
         }
 
         let tail_base_old = self.tail_base;
+        let committed_before = self.committed_tokens;
         self.committed_tokens += s_new;
 
         // Bounded window: evict the oldest tail tokens beyond the sink prefix + read window. In the
@@ -301,16 +302,25 @@ impl CausalKvCache {
         // the sink is still filling (tail empty) is a no-op.
         let drop_start = tail_base_old.max(sink_kept);
         if tail_base_new > drop_start {
-            // Physical indices to KEEP in the current (pre-eviction) buffer: sink prefix [0, sink_kept)
-            // ‖ retained tail [tail_base_new, committed). Eviction implies the sink is full, so
-            // `tail_base_old ≥ sink_kept` and the tail sits at physical `[sink_kept, …)`.
+            // Physical indices to KEEP in the current (**pre-eviction**) buffer. That buffer's layout
+            // is the sink prefix `[0, sink_kept_prev)` followed by the rolling tail
+            // `[tail_base_old, committed)`, where `sink_kept_prev` is the sink length *before* this
+            // append — the physical layout predates any sink growth contributed by this chunk. The
+            // desired keep set is the (possibly grown) sink prefix `[0, sink_kept)` ‖ retained tail
+            // `[tail_base_new, committed)`, but each global position must be mapped through the
+            // pre-eviction sink length: using the post-append `sink_kept` here would overshoot the
+            // tail's true physical start by `sink_kept - sink_kept_prev` whenever the sink is still
+            // filling on the evicting append (e.g. one large first chunk), running the gather past the
+            // axis (`take`/`take_axis` is not bounds-checked on Metal → silent KV corruption). Once the
+            // sink is full `sink_kept_prev == sink_kept`, so this is byte-for-byte the steady state.
+            let sink_kept_prev = self.sink_tokens.min(committed_before);
             let keep: Vec<i32> = (0..sink_kept)
                 .chain(tail_base_new..self.committed_tokens)
                 .map(|g| {
-                    let p = if g < sink_kept {
+                    let p = if g < sink_kept_prev {
                         g
                     } else {
-                        sink_kept + (g - tail_base_old)
+                        sink_kept_prev + (g - tail_base_old)
                     };
                     p as i32
                 })
@@ -675,5 +685,48 @@ mod tests {
             vec![0.0, 1.0, 4.0, 5.0, 6.0, 7.0],
             "sink prefix [0,1] retained; oldest non-sink tail [2,3] evicted"
         );
+    }
+
+    #[test]
+    fn eviction_before_sink_fills_gathers_pre_eviction_layout() {
+        // Discriminating regression (the reviewer's repro): a single chunk that overshoots
+        // `sink_tokens + max_attention_size` *before* the sink prefix has filled. With
+        // `max_attention_size = 2`, `sink_tokens = 4`, ONE 10-token append (global 0..9) fires the
+        // first eviction while `committed_before (0) < sink_tokens (4)`. The pre-eviction buffer is
+        // contiguous (phys == global, `sink_kept_prev = 0`, `tail_base_old = 0`), so the keep map must
+        // gather physical `[0,1,2,3,8,9]` → retained global `[0,1,2,3,8,9]` (sink `[0..4)` ‖ the last
+        // `max_attention_size = 2` tokens `[8,9]`). The old map used the *post-append* sink length and
+        // gathered `[0,1,2,3,12,13]` — out of bounds on a length-10 axis (unchecked `take_axis` on
+        // Metal ⇒ silent KV corruption / crash). This test therefore fails on the buggy map and passes
+        // on the pre-eviction-layout fix.
+        let mut cache = CausalKvCache::new(1, 2, 4);
+        cache
+            .append(kv_block(&[
+                0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0,
+            ]))
+            .unwrap();
+        assert_eq!(cache.stored_tokens(), 10);
+        assert_eq!(
+            cache.retained_tokens(),
+            6,
+            "sink (4) + last max_attention_size (2) = 6 physically retained"
+        );
+        // The retained global positions are exactly [0,1,2,3,8,9] (values mirror global position),
+        // gathered without OOB — NOT the buggy [0,1,2,3,12,13] map.
+        assert_eq!(
+            retained_key_values(&cache),
+            vec![0.0, 1.0, 2.0, 3.0, 8.0, 9.0],
+            "sink prefix [0..4) retained; window is the last two tokens [8,9]"
+        );
+        // Values (v) mirror keys (k): the same retained source rows, no OOB.
+        let (_, v) = cache.layer_kv(0).expect("layer 0 populated");
+        assert_eq!(v.as_slice::<f32>(), &[0.0, 1.0, 2.0, 3.0, 8.0, 9.0]);
+        // The next chunk's read window is well-formed and gathers retained rows only (no OOB on read).
+        // With this tiny window (max_attention_size = 2), the sliding tail lands at/after `stored`, so
+        // the next chunk attends just the always-on sink prefix [0,1,2,3].
+        let (prev, positions) = cache.window_prev(2).unwrap();
+        assert_eq!(positions, vec![0, 1, 2, 3]);
+        let (k, _) = &prev[0];
+        assert_eq!(k.as_slice::<f32>(), &[0.0, 1.0, 2.0, 3.0]);
     }
 }
