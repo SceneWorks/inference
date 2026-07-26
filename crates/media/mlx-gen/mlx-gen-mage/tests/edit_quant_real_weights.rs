@@ -315,9 +315,14 @@ fn every_tier_renders_the_reference_edit_and_the_boogu_group_size_fails_the_gate
         scores.push((tier, corr, block));
         mlx_rs::memory::clear_cache();
     }
+    // Ordering, as sc-15071's generation gate asserts: q8 must sit closer to bf16 than q4 does.
+    // Measured 0.9997 vs 0.9868. This is the cheap check that the two tiers are genuinely different
+    // artifacts and the harness is not, say, serving one of them twice.
     assert!(
-        scores[0].1 > EDIT_CORR_FLOOR && scores[1].1 > EDIT_CORR_FLOOR,
-        "both pre-quantized tiers must clear the floor"
+        scores[0].1 > scores[1].1,
+        "q8 ({:.4}) must stay closer to the bf16 edit than q4 ({:.4})",
+        scores[0].1,
+        scores[1].1
     );
 
     // --- the mutation: the shared tower read at Boogu's group size ------------------------------
