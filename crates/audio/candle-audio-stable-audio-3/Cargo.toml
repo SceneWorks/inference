@@ -17,6 +17,8 @@ candle-nn = { workspace = true }
 # The audio-lane snapshot-preparer contracts. This crate remains unregistered until the later
 # catalog story, but owns a composable prepare probe now.
 core-llm = { workspace = true }
+rand = { workspace = true }
+rand_distr = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = { workspace = true }
 # Audio-lane side of the intentional 0.21/0.22 split enforced by check-workspace.py.

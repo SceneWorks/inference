@@ -25,15 +25,18 @@ impl SoftNorm {
             running_std: auto_scale
                 .then(|| vb.get_with_hints(1, "running_std", Init::Const(1.0)))
                 .transpose()?,
-            noise_scaling_factor: (noise_augment_dim > 0)
-                .then(|| {
-                    vb.get_with_hints(
-                        (1, noise_augment_dim, 1),
-                        "noise_scaling_factor",
-                        Init::Const(1.0),
-                    )
-                })
-                .transpose()?,
+            // Upstream persists an empty `[1, 0, 1]` buffer when augmentation is disabled.
+            // Consume it when present so standalone and embedded SAME inventories are exact.
+            noise_scaling_factor: (noise_augment_dim > 0
+                || vb.contains_tensor("noise_scaling_factor"))
+            .then(|| {
+                vb.get_with_hints(
+                    (1, noise_augment_dim, 1),
+                    "noise_scaling_factor",
+                    Init::Const(1.0),
+                )
+            })
+            .transpose()?,
             noise_regularize,
         })
     }
@@ -46,6 +49,10 @@ impl SoftNorm {
             Some(std) => x.broadcast_div(std),
             None => Ok(x),
         }
+    }
+
+    pub fn noise_regularize(&self) -> bool {
+        self.noise_regularize
     }
 
     /// Decode using explicit noise, making parity tests deterministic.
@@ -88,6 +95,9 @@ impl SoftNorm {
         if let Some(factor) = &self.noise_scaling_factor {
             let (batch, channels, length) = x.dims3()?;
             let aug_channels = factor.dim(1)?;
+            if aug_channels == 0 {
+                return Ok(x);
+            }
             let noise = match augment_noise {
                 Some(n) => n.clone(),
                 None => Tensor::randn(0f32, 1f32, (batch, aug_channels, length), x.device())?
