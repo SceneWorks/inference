@@ -202,6 +202,19 @@ jobs:
           -p candle-llm -p 'candle-gen*' -p 'candle-audio*' -p runtime-cpu
       - name: Test Candle LLM conformance
         run: cargo test --locked -j 1 -p candle-llm --test conformance
+      - name: Test Stable Audio 3 weight-free quality gates
+        # `--lib` above skips integration targets, so the SA3 `provider` target — which carries the
+        # only executable evidence that the side-ratio floors, the per-window median, and the
+        # zero-crossing spread reject the degeneracies they are named for — ran in no lane on PRs
+        # (the `--lib --tests` sweep lives on the manual `windows-cuda` job, and the real-weight
+        # lanes select `-- --ignored`, excluding it by both filter and flag). Name the single target
+        # rather than widening the step above to `--tests`: this links one small binary under the
+        # same `-j 1` the lld memory limit requires, and runs in ~0.01 s. The real-weight cases in
+        # this target stay `#[ignore]`d and are skipped here. `--nocapture` keeps the discriminating
+        # near-mono measurement in the log, so the gate is auditable from the run itself.
+        run: >-
+          cargo test --locked -j 1
+          -p candle-audio-stable-audio-3 --test provider -- --nocapture
       - name: Test LLM-only CPU bundle
         run: cargo test --locked --no-default-features --lib -p runtime-cpu
       # The decided sc-12835 feature wiring: audio is its own additive bundle feature, so the

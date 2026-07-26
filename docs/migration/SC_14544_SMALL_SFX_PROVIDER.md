@@ -261,7 +261,19 @@ A weight-free test
 these heuristics fails on the degeneracy it names — duplicated mono, mono plus
 numerical dust, mono plus one loud localized burst, a pure tone, DC, a 10 Hz
 tone, and white noise — each with a passing control alongside it, so the
-analysis itself is gated in the ordinary test lane.
+analysis itself is gated on every PR.
+
+It lives in the `provider` integration target, which the Linux lane's `--lib`
+step does not reach, so it is wired explicitly: the `Candle CPU packages (Linux)`
+job runs `cargo test --locked -j 1 -p candle-audio-stable-audio-3 --test provider
+-- --nocapture` in its `Test Stable Audio 3 weight-free quality gates` step
+(~0.01 s; the real-weight cases in the same target stay `#[ignore]`d and are
+skipped). It is deliberately not folded into the `--lib` step by widening it to
+`--tests`: that step is `-j 1` because concurrently linking several provider test
+binaries exhausts the hosted runner's linker memory. The `--lib --tests` sweep on
+the `windows-cuda` job does cover this target, but that job is
+`workflow_dispatch`-only, and the real-weight lanes select `-- --ignored`, which
+excludes this test by both filter and flag.
 
 The SFX floor was raised from `1e-4` to `2e-4`. That change needs a control that
 distinguishes the two values, or it halves the margin for nothing:

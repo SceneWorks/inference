@@ -403,8 +403,14 @@ fn pseudo_noise(len: usize, seed: u64) -> Vec<f32> {
 ///
 /// Every heuristic in this file is asserted against the exact degeneracy it is named for, with a
 /// passing control alongside it. These run without weights, so a regression in the analysis itself
-/// surfaces in the ordinary test lane instead of only on a real-weight runner — and the real-weight
-/// gates above are only meaningful because these hold.
+/// surfaces on every PR instead of only on a real-weight runner — and the real-weight gates above
+/// are only meaningful because these hold.
+///
+/// The lane is named, because a gate nothing executes is not a gate: the `Candle CPU packages
+/// (Linux)` job's `Test Stable Audio 3 weight-free quality gates` step runs this target. The
+/// step exists specifically because the step above it is `--lib`, which skips integration targets
+/// like this one; the `--lib --tests` sweep is on the manual `windows-cuda` job, and the
+/// real-weight lanes pass `-- --ignored`, so neither reaches this test.
 #[test]
 fn the_quality_gates_reject_the_degeneracies_they_are_named_for() {
     let sfx_floor = minimum_side_ratio(Variant::SmallSfx);
@@ -628,8 +634,12 @@ fn sfx_stereo_width_floor_is_calibrated_across_prompts_and_seeds() {
 /// standard applied to hide a number — the music checkpoint's image is genuinely two to three
 /// orders wider than the SFX checkpoint's, and `1e-2` is the shipped duplicated-mono floor rather
 /// than a width bar. Raising the floor into the measured distribution would convert a correctness
-/// gate into a quality gate on honest output. The bound still fails if the music image ever
-/// collapses toward the SFX one, which is the drift worth catching.
+/// gate into a quality gate on honest output.
+///
+/// The drift worth catching — the music image collapsing toward the SFX one — is caught by the
+/// `measured > floor` assertion, not by this margin bound. At the SFX scale (~4.8e-4) the ratio
+/// against the shipped `1e-2` floor is ~0.05, which passes 50x comfortably; what fails is the
+/// floor itself. The margin bound guards the opposite direction: a floor left far under the data.
 #[test]
 #[ignore = "real 3.45 GB weights; set SA3_SMALL_MUSIC_SNAPSHOT"]
 fn music_stereo_width_floor_is_calibrated_across_prompts_and_seeds() {
