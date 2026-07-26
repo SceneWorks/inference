@@ -14,7 +14,7 @@ candle-gen = { path = "../candle-gen" }
 # CausalVideoAutoencoder temporal VAE, the Gemma-3-12B text encoder + per-token-RMS aggregation +
 # 8-layer learnable-register connector, and the rectified-flow distilled scheduler are all written
 # here on candle-core/candle-nn (candle ships no conv3d — see `conv3d`). First slice is txt2video,
-# video-only (the audio stack, 2-stage latent upsampler, I2V, prompt-enhance, LoRA, and fp8/quant
+# video-only (the audio stack, 2-stage latent upsampler, I2V, prompt-enhance, IC-LoRA, and fp8/quant
 # paths are deferred to follow-up Shortcut stories).
 tokenizers = { workspace = true }
 # Deterministic CPU-seeded initial noise (sc-3673 parity).

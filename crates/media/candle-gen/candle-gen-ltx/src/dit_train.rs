@@ -444,7 +444,8 @@ mod tests {
     use candle_gen::candle_core::Shape;
     use candle_gen::candle_nn::VarBuilder;
     use candle_gen::train::gradient_checkpoint::checkpointed_backward;
-    use candle_gen::train::lora::build_lora_targets;
+    use candle_gen::train::lora::{build_lora_targets, save_lora_peft};
+    use candle_gen::train::optim::TrainOptimizer;
     use std::collections::HashMap;
 
     fn tiny_cfg() -> AvConfig {
@@ -691,6 +692,106 @@ mod tests {
             diff < 2e-3,
             "train/inference video velocity max diff {diff}"
         );
+    }
+
+    fn assert_trained_lora_inference_roundtrip(dev: Device, tag: &str) {
+        let cfg = tiny_cfg();
+        let map = weights(&cfg, &dev);
+        let mut train = LtxDiT::new(
+            VarBuilder::from_tensors(map.clone(), DType::F32, &dev),
+            &cfg.video,
+        )
+        .unwrap();
+        let suffixes = LTX_ATTN_TARGETS.map(str::to_string);
+        let set = build_lora_targets(&mut train, &suffixes, 2, 2.0, 17, &dev).unwrap();
+        let (latent, context, positions) = inputs(&dev);
+        // One real optimizer update through the trainable DiT. LoRA starts with B=0, so this first
+        // step updates B from a genuine velocity loss and makes the saved adapter nonzero.
+        let loss = train
+            .forward(&latent, 0.37, &context, &positions)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .sqr()
+            .unwrap()
+            .mean_all()
+            .unwrap();
+        let grads = loss.backward().unwrap();
+        let mut opt = TrainOptimizer::from_config("adamw", set.vars.clone(), 1e-2, 0.0).unwrap();
+        opt.step(&grads).unwrap();
+
+        let path = std::env::temp_dir().join(format!(
+            "ltx_infer_lora_roundtrip_{tag}_{}.safetensors",
+            std::process::id()
+        ));
+        save_lora_peft(&set, "", &HashMap::new(), &path).unwrap();
+        let spec = candle_gen::gen_core::AdapterSpec::new(
+            path.clone(),
+            1.0,
+            candle_gen::gen_core::AdapterKind::Lora,
+        );
+
+        let mut inference = AvDiT::new(
+            VarBuilder::from_tensors(map.clone(), DType::F32, &dev),
+            &cfg,
+        )
+        .unwrap();
+        let base = inference
+            .forward_video_only(&latent, 0.37, &context, &positions)
+            .unwrap();
+        let report =
+            crate::adapters::install_ltx_adapters(&mut inference, std::slice::from_ref(&spec))
+                .unwrap();
+        assert_eq!(report.applied, 8);
+        assert_eq!(report.skipped_keys, 0);
+        let adapted = inference
+            .forward_video_only(&latent, 0.37, &context, &positions)
+            .unwrap();
+        let effect = (adapted - &base)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(effect > 1e-6, "nonzero trained factors must change output");
+
+        let mut scale_zero =
+            AvDiT::new(VarBuilder::from_tensors(map, DType::F32, &dev), &cfg).unwrap();
+        let zero_spec = candle_gen::gen_core::AdapterSpec::new(
+            path.clone(),
+            0.0,
+            candle_gen::gen_core::AdapterKind::Lora,
+        );
+        crate::adapters::install_ltx_adapters(&mut scale_zero, &[zero_spec]).unwrap();
+        let zero = scale_zero
+            .forward_video_only(&latent, 0.37, &context, &positions)
+            .unwrap();
+        let zero_diff = (zero - base)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert_eq!(zero_diff, 0.0, "scale=0 must be an exact base no-op");
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn trained_lora_reloads_into_inference_and_changes_velocity() {
+        assert_trained_lora_inference_roundtrip(Device::Cpu, "cpu");
+    }
+
+    /// CUDA execution gate for the actual train→save→inference-load path. Ignored by default because
+    /// feature-enabled compile runners need not have a GPU; run explicitly on a CUDA host.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "requires a CUDA device"]
+    fn trained_lora_reloads_into_inference_and_changes_velocity_cuda() {
+        assert_trained_lora_inference_roundtrip(Device::new_cuda(0).unwrap(), "cuda");
     }
 
     #[test]
