@@ -93,15 +93,27 @@ impl std::fmt::Debug for Linear {
 }
 
 impl Linear {
+    /// Load `{prefix}` — **packed** (Q4/Q8) when `{prefix}.scales` is present, else **dense**.
+    ///
+    /// Auto-detection (sc-14980) is what lets one loader read both the flat dense snapshot and a
+    /// pre-quantized `<tier>/transformer/` artifact with no path branching on the load side. On the
+    /// packed path the on-disk `{prefix}.weight` is a `[out, in·bits/32]` u32 code tensor, so the
+    /// logical `in_features` must be derived from `scales` (`[out, in/group_size]`) rather than the
+    /// weight's own column count, and the compute dtype read off `scales` rather than the u32 codes
+    /// — otherwise `in_features()` reports `in/8` for Q4 and `dtype()` reports `Uint32`.
     pub fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
-        let weight = w.require(&format!("{prefix}.weight"))?.clone();
-        let bias = w.require(&format!("{prefix}.bias"))?.clone();
-        let shape = weight.shape();
+        let inner = crate::quant::lin(w, prefix, true)?;
+        let weight = w.require(&format!("{prefix}.weight"))?;
+        let out_features = weight.shape()[0];
+        let (in_features, dtype) = match w.get(&format!("{prefix}.scales")) {
+            Some(scales) => (scales.shape()[1] * crate::quant::GROUP_SIZE, scales.dtype()),
+            None => (weight.shape()[1], weight.dtype()),
+        };
         Ok(Self {
-            in_features: shape[1],
-            out_features: shape[0],
-            dtype: weight.dtype(),
-            inner: mlx_gen::adapters::AdaptableLinear::dense(weight, Some(bias)),
+            in_features,
+            out_features,
+            dtype,
+            inner,
         })
     }
 
