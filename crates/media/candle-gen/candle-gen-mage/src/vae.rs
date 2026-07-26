@@ -518,7 +518,7 @@ impl MageVae {
         self.encoder
             .as_ref()
             .ok_or_else(|| candle_core::Error::Msg("mage vae encoder was not loaded".into()))?
-            .moments(image)
+            .moments(&image.to_dtype(self.dtype)?)
     }
 
     pub fn encode_sample(&self, image: &Tensor, seed: u64) -> Result<Tensor> {
