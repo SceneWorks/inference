@@ -19,9 +19,10 @@
 use std::collections::HashMap;
 
 use mlx_gen::weights::Weights;
-use mlx_gen::{CancelFlag, GenerationOutput, Progress};
+use mlx_gen::{CancelFlag, GenerationOutput, Image, Progress};
 use mlx_gen_krea_realtime::{
-    generate_t2v_from_components, ArGenParams, CausalKreaTransformer, KreaRealtimeConfig,
+    generate_i2v_from_components, generate_t2v_from_components, generate_v2v_from_components,
+    ArGenParams, CausalKreaTransformer, KreaRealtimeConfig,
 };
 use mlx_gen_wan::WanVae;
 use mlx_rs::{Array, Dtype};
@@ -525,4 +526,192 @@ fn t2v_pipeline_trims_to_requested_frame_count() {
         13,
         "the pipeline returns exactly the requested output frame count"
     );
+}
+
+// ── S7 i2v / v2v component pipeline (sc-8440) ─────────────────────────────────────────────────────
+
+/// A 32×32 RGB8 image (the reference still is 8× the 4×4 latent) with a deterministic pixel pattern so
+/// the VAE encode is non-trivial and seed-distinct.
+fn tiny_image(seed: u64) -> Image {
+    let (w, h) = (32u32, 32u32);
+    let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(7);
+    let mut pixels = Vec::with_capacity((w * h * 3) as usize);
+    for _ in 0..(w * h * 3) {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        pixels.push((s >> 24) as u8);
+    }
+    Image {
+        width: w,
+        height: h,
+        pixels,
+    }
+}
+
+/// A `frames`-long 32×32 clip (`frames = 4·(num_latent − 1) + 1` so the encode yields `num_latent`
+/// latent frames).
+fn tiny_clip(seed: u64, frames: usize) -> Vec<Image> {
+    (0..frames)
+        .map(|i| tiny_image(seed.wrapping_add(i as u64 * 101)))
+        .collect()
+}
+
+/// **i2v** component pipeline: VAE-encode a reference still → warm the cache → generate → decode. The
+/// clip has the correct shape (`4·(F_ref + num_latent)` frames of 32×32), the reference still changes
+/// the decoded clip vs a same-seed t2v clip (the still influences generation), and the run is
+/// deterministic.
+#[test]
+fn i2v_pipeline_conditions_on_the_reference_and_has_correct_shape() {
+    let cfg = tiny_cfg();
+    let dit = mlx_gen_krea_realtime::load_krea_realtime_transformer(native_dit_map(&cfg), &cfg)
+        .expect("load tiny DiT");
+    let transformer = CausalKreaTransformer::new(dit, &cfg);
+    let vae = tiny_vae();
+    let context = tiny_context(&cfg);
+    let cancel = CancelFlag::default();
+    let mut noop = |_: Progress| {};
+
+    let reference = tiny_image(1234);
+    // Generate 2 frames on top of the 1 reference latent ⇒ 3 latent frames ⇒ 12 decoded frames.
+    let i2v = generate_i2v_from_components(
+        &transformer,
+        &cfg,
+        &vae,
+        &context,
+        &reference,
+        &params(42, 2),
+        None,
+        None,
+        &cancel,
+        &mut noop,
+    )
+    .expect("i2v pipeline");
+    let i2v_frames = video_frames(&i2v);
+    assert_eq!(
+        i2v_frames.len(),
+        4 * 3,
+        "4·(F_ref + num_latent_frames) = 4·3 output frames"
+    );
+    for f in i2v_frames {
+        assert_eq!((f.width, f.height), (32, 32));
+    }
+
+    // Discriminating: the reference still changes the decoded clip vs a same-seed t2v run of the SAME
+    // total latent length (3 frames), so the difference is the reference conditioning, not the length.
+    let t2v = generate_t2v_from_components(
+        &transformer,
+        &cfg,
+        &vae,
+        &context,
+        &params(42, 3),
+        None,
+        None,
+        &cancel,
+        &mut noop,
+    )
+    .expect("t2v pipeline");
+    let t2v_frames = video_frames(&t2v);
+    assert_eq!(t2v_frames.len(), 4 * 3);
+    assert!(
+        i2v_frames
+            .iter()
+            .zip(t2v_frames)
+            .any(|(a, b)| a.pixels != b.pixels),
+        "the reference still must change the decoded clip vs t2v"
+    );
+
+    // Determinism.
+    let i2v_again = generate_i2v_from_components(
+        &transformer,
+        &cfg,
+        &vae,
+        &context,
+        &reference,
+        &params(42, 2),
+        None,
+        None,
+        &cancel,
+        &mut noop,
+    )
+    .expect("i2v pipeline again");
+    for (a, b) in i2v_frames.iter().zip(video_frames(&i2v_again)) {
+        assert_eq!(a.pixels, b.pixels, "same seed ⇒ byte-identical i2v clip");
+    }
+}
+
+/// **v2v** component pipeline: VAE-encode a source clip → strength-controlled generate → decode. The
+/// clip has the correct shape, the source and the strength both influence the decoded clip
+/// (strength=0 vs strength=1 differ), and the run is deterministic.
+#[test]
+fn v2v_pipeline_conditions_on_source_and_strength() {
+    let cfg = tiny_cfg();
+    let dit = mlx_gen_krea_realtime::load_krea_realtime_transformer(native_dit_map(&cfg), &cfg)
+        .expect("load tiny DiT");
+    let transformer = CausalKreaTransformer::new(dit, &cfg);
+    let vae = tiny_vae();
+    let context = tiny_context(&cfg);
+    let cancel = CancelFlag::default();
+
+    // 5-frame source clip ⇒ (5−1)/4+1 = 2 latent frames ⇒ params.num_latent_frames = 2.
+    let source_a = tiny_clip(9000, 5);
+    let source_b = tiny_clip(4000, 5);
+
+    let run = |frames: &[Image], strength: f32| {
+        generate_v2v_from_components(
+            &transformer,
+            &cfg,
+            &vae,
+            &context,
+            frames,
+            strength,
+            &params(7, 2),
+            None,
+            None,
+            &cancel,
+            &mut |_: Progress| {},
+        )
+        .expect("v2v pipeline")
+    };
+
+    let a_half = run(&source_a, 0.5);
+    let a_half_frames = video_frames(&a_half);
+    assert_eq!(
+        a_half_frames.len(),
+        4 * 2,
+        "4·num_latent_frames output frames"
+    );
+    for f in a_half_frames {
+        assert_eq!((f.width, f.height), (32, 32));
+    }
+
+    // Different source ⇒ different clip at strength 0.5.
+    let b_half = run(&source_b, 0.5);
+    assert!(
+        a_half_frames
+            .iter()
+            .zip(video_frames(&b_half))
+            .any(|(x, y)| x.pixels != y.pixels),
+        "a different source must change the v2v clip"
+    );
+
+    // strength=0 vs strength=1 differ (the strength lever has an effect on the decoded clip).
+    let a_0 = run(&source_a, 0.0);
+    let a_1 = run(&source_a, 1.0);
+    assert!(
+        video_frames(&a_0)
+            .iter()
+            .zip(video_frames(&a_1))
+            .any(|(x, y)| x.pixels != y.pixels),
+        "strength 0 vs strength 1 must change the decoded clip"
+    );
+
+    // Determinism.
+    let a_half_2 = run(&source_a, 0.5);
+    for (x, y) in a_half_frames.iter().zip(video_frames(&a_half_2)) {
+        assert_eq!(
+            x.pixels, y.pixels,
+            "same seed + strength ⇒ byte-identical v2v clip"
+        );
+    }
 }
