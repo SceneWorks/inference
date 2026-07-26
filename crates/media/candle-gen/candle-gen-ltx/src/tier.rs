@@ -179,6 +179,19 @@ impl TierPaths {
         ))
     }
 
+    /// The video-VAE encoder builder over `vae_encoder.safetensors`. It presents the same synthetic
+    /// `vae.encoder.*` / `vae.per_channel_statistics.{mean-of-means,std-of-means}` namespace as the
+    /// unified checkpoint and transposes channels-last conv weights on demand.
+    pub fn vae_encoder_vb(&self, dtype: DType, device: &Device) -> CResult<VarBuilder<'static>> {
+        let inner =
+            candle_gen::mmap_var_builder(&[self.file("vae_encoder.safetensors")?], dtype, device)?;
+        Ok(VarBuilder::from_backend(
+            Box::new(VaeEncoderRemapBackend { inner }),
+            dtype,
+            device.clone(),
+        ))
+    }
+
     /// The Gemma-3-12B encoder VarBuilder rooted at `language_model.model.` over the tier's sibling
     /// `gemma/` shards. The tier ships Gemma **dense** with the standard `language_model.model.*` keys
     /// (matches the crate exactly), so no remap — just the sorted-shard resolve.
@@ -314,6 +327,65 @@ impl candle_gen::candle_nn::var_builder::SimpleBackend for VaeRemapBackend {
     }
 }
 
+struct VaeEncoderRemapBackend {
+    inner: VarBuilder<'static>,
+}
+
+impl VaeEncoderRemapBackend {
+    fn remap(key: &str) -> (String, bool) {
+        let k = key
+            .strip_prefix("vae.encoder.")
+            .or_else(|| key.strip_prefix("vae."))
+            .unwrap_or(key)
+            .replace(
+                "per_channel_statistics.mean-of-means",
+                "per_channel_statistics._mean_of_means",
+            )
+            .replace(
+                "per_channel_statistics.std-of-means",
+                "per_channel_statistics._std_of_means",
+            );
+        let is_conv_weight = k.ends_with(".conv.weight");
+        (k, is_conv_weight)
+    }
+}
+
+impl candle_gen::candle_nn::var_builder::SimpleBackend for VaeEncoderRemapBackend {
+    fn get(
+        &self,
+        s: candle_gen::candle_core::Shape,
+        name: &str,
+        _h: candle_gen::candle_nn::Init,
+        dtype: DType,
+        dev: &Device,
+    ) -> candle_gen::candle_core::Result<Tensor> {
+        let (k, _) = Self::remap(name);
+        self.inner
+            .get_with_hints_dtype(s, &k, Default::default(), dtype)?
+            .to_device(dev)
+    }
+
+    fn get_unchecked(
+        &self,
+        name: &str,
+        dtype: DType,
+        dev: &Device,
+    ) -> candle_gen::candle_core::Result<Tensor> {
+        let (k, is_conv) = Self::remap(name);
+        let t = self.inner.get_unchecked_dtype(&k, dtype)?.to_device(dev)?;
+        if is_conv {
+            VaeRemapBackend::permute_conv(t)
+        } else {
+            Ok(t)
+        }
+    }
+
+    fn contains_tensor(&self, name: &str) -> bool {
+        let (k, _) = Self::remap(name);
+        self.inner.contains_tensor(&k)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -423,6 +495,17 @@ mod tests {
         assert_eq!(k, "per_channel_statistics.mean");
         let (k, _) = VaeRemapBackend::remap("vae.per_channel_statistics.std-of-means");
         assert_eq!(k, "per_channel_statistics.std");
+    }
+
+    #[test]
+    fn vae_encoder_remap_matches_real_tier_layout() {
+        let (k, conv) = VaeEncoderRemapBackend::remap("vae.encoder.down_blocks.1.conv.conv.weight");
+        assert_eq!(k, "down_blocks.1.conv.conv.weight");
+        assert!(conv);
+        let (k, _) = VaeEncoderRemapBackend::remap("vae.per_channel_statistics.mean-of-means");
+        assert_eq!(k, "per_channel_statistics._mean_of_means");
+        let (k, _) = VaeEncoderRemapBackend::remap("vae.per_channel_statistics.std-of-means");
+        assert_eq!(k, "per_channel_statistics._std_of_means");
     }
 
     /// The permute turns a tier channels-last conv `[O,kt,kh,kw,I]` into the crate `[O,I,kt,kh,kw]`.
