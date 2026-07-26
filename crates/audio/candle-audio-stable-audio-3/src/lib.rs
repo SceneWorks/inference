@@ -1,4 +1,20 @@
-//! Stable Audio 3 provider foundation, shared primitives, and the registered small-music provider.
+//! Stable Audio 3 provider foundation, shared primitives, and the registered small providers.
+//!
+//! Two post-trained 433M checkpoints are registered, in this order:
+//!
+//! - [`MODEL_ID`] (`stable_audio_3_small_music`, sc-14543) — text-to-music;
+//! - [`SFX_MODEL_ID`] (`stable_audio_3_small_sfx`, sc-14544) — text-to-sound-effects / Foley.
+//!
+//! They share the DiT/SAME-S architecture, the bundled encoder-only T5Gemma stack, 44.1 kHz stereo
+//! output, the 120-second logical maximum, and the eight-step Pingpong default; only the trained
+//! weights — and therefore the output character — differ. Because the two shipped
+//! `model_config.json` files are architecturally identical apart from the conditioner `repo_id`,
+//! loading is variant-bound through [`model::load_variant`] rather than shared and unconstrained.
+//!
+//! `stable_audio_3_small_sfx` overlaps in intent with the shipped `moss_sfx_v2` provider but is a
+//! different tier and a different output shape: SA3 SFX is **44.1 kHz stereo** up to 120 s, while
+//! MOSS-SoundEffect is **48 kHz mono**. The descriptor contract cannot machine-encode domain,
+//! channel count, or quality tier today, so that distinction lives in the two ids and this note.
 //!
 //! `candle-audio-catalog` composes this crate into every shipped audio runtime bundle:
 //!
@@ -33,16 +49,22 @@ pub mod weight_norm;
 pub mod weights;
 
 pub use model::{
-    descriptor, load, load_generator, StableAudio3SmallMusicGenerator, HUB_REPO, HUB_REVISION,
-    MODEL_ID, REGISTRATION, WEIGHT_LICENSES,
+    descriptor, descriptor_for, load, load_generator, load_sfx_generator, load_variant,
+    sfx_descriptor, sfx_load, StableAudio3SmallGenerator, Variant, HUB_REPO, HUB_REVISION,
+    MODEL_ID, REGISTRATION, SFX_HUB_REPO, SFX_HUB_REVISION, SFX_MODEL_ID, SFX_REGISTRATION,
+    WEIGHT_LICENSES,
 };
-pub use pipeline::StableAudio3SmallMusicPipeline;
+pub use pipeline::StableAudio3SmallPipeline;
 
-/// Add the Stable Audio 3 small-music generator to an explicit audio registry builder.
+/// Add both registered Stable Audio 3 small generators to an explicit audio registry builder.
+///
+/// Registration order is stable and contiguous: music first (sc-14543), then SFX (sc-14544).
 pub fn register_providers(
     registry: gen_core::ProviderRegistryBuilder,
 ) -> gen_core::ProviderRegistryBuilder {
-    registry.register_generator(model::REGISTRATION)
+    registry
+        .register_generator(model::REGISTRATION)
+        .register_generator(model::SFX_REGISTRATION)
 }
 
 /// Build this crate's complete explicit provider registry.
@@ -74,6 +96,19 @@ pub fn resolve_device(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registry_exposes_both_variants_in_stable_contiguous_order() {
+        let registry = provider_registry().unwrap();
+        let ids = registry
+            .generators()
+            .map(|registration| (registration.descriptor)().id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            ["stable_audio_3_small_music", "stable_audio_3_small_sfx"]
+        );
+    }
 
     #[test]
     fn device_policy_uses_shared_audio_surface() {

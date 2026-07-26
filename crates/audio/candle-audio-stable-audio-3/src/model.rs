@@ -1,4 +1,13 @@
-//! `stable_audio_3_small_music` generator contract and lazy provider load.
+//! Variant-bound Stable Audio 3 small generator contracts and lazy provider loads.
+//!
+//! `small-music` (sc-14543) and `small-sfx` (sc-14544) are architecturally identical 433M
+//! post-trained checkpoints: the shipped `model_config.json` files differ only in the conditioner
+//! `repo_id`, the training-only ARC discriminator fields, and the demo prompts. Only the learned
+//! weights differ. That makes a single unconstrained loader a real mis-wiring hazard, because
+//! [`gen_core::ModelRegistration::load`] receives no provider id — nothing in the `LoadSpec` says
+//! which registration the caller reached. Every load therefore goes through
+//! [`load_variant`], which binds the expected [`Variant`] at the call site and rejects a snapshot
+//! whose conditioner `repo_id` or pinned file hashes belong to the other checkpoint.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -11,7 +20,7 @@ use sha2::{Digest, Sha256};
 
 use crate::dit::Guidance;
 use crate::pipeline::{
-    StableAudio3SmallMusicPipeline, SynthesisParameters, CHANNELS, DEFAULT_DURATION_SECS,
+    StableAudio3SmallPipeline, SynthesisParameters, CHANNELS, DEFAULT_DURATION_SECS,
     DEFAULT_GUIDANCE, DEFAULT_STEPS, SAMPLE_RATE,
 };
 use crate::sampler::SamplerKind;
@@ -21,9 +30,74 @@ use crate::{resolve_device, DevicePolicy};
 pub const MODEL_ID: &str = "stable_audio_3_small_music";
 pub const HUB_REPO: &str = "stabilityai/stable-audio-3-small-music";
 pub const HUB_REVISION: &str = "0fef1392cd842149a2b6d445e181c97608faac06";
+
+pub const SFX_MODEL_ID: &str = "stable_audio_3_small_sfx";
+pub const SFX_HUB_REPO: &str = "stabilityai/stable-audio-3-small-sfx";
+pub const SFX_HUB_REVISION: &str = "ae12755283df9d62ca39a9b050a39a0b607b8c20";
+
 pub const MAX_DURATION_SECS: f32 = 120.0;
 pub const MAX_STEPS: u32 = 500;
 pub const GUIDANCE_RANGE: (f32, f32) = (0.0, 25.0);
+
+/// The registered post-trained Stable Audio 3 small checkpoints.
+///
+/// Both variants share the DiT/SAME-S architecture, the bundled encoder-only T5Gemma stack, the
+/// 44.1 kHz stereo output geometry, and the 120-second logical maximum. They differ only in the
+/// trained checkpoint and therefore in output character.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Variant {
+    /// `stable_audio_3_small_music` — text-to-music.
+    SmallMusic,
+    /// `stable_audio_3_small_sfx` — text-to-sound-effects / Foley.
+    ///
+    /// Distinct from the shipped `moss_sfx_v2` provider: SA3 SFX is 44.1 kHz **stereo** with a
+    /// 120-second logical maximum, where MOSS-SoundEffect is 48 kHz **mono**. They are different
+    /// quality tiers and different output shapes, not interchangeable ids.
+    SmallSfx,
+}
+
+impl Variant {
+    pub const fn model_id(self) -> &'static str {
+        match self {
+            Self::SmallMusic => MODEL_ID,
+            Self::SmallSfx => SFX_MODEL_ID,
+        }
+    }
+
+    pub const fn hub_repo(self) -> &'static str {
+        match self {
+            Self::SmallMusic => HUB_REPO,
+            Self::SmallSfx => SFX_HUB_REPO,
+        }
+    }
+
+    pub const fn hub_revision(self) -> &'static str {
+        match self {
+            Self::SmallMusic => HUB_REVISION,
+            Self::SmallSfx => SFX_HUB_REVISION,
+        }
+    }
+
+    const fn pins(self) -> &'static [SnapshotFilePin] {
+        match self {
+            Self::SmallMusic => MUSIC_SNAPSHOT_FILE_PINS,
+            Self::SmallSfx => SFX_SNAPSHOT_FILE_PINS,
+        }
+    }
+
+    /// Every weight-license row this registration contributes to the catalog: the composite
+    /// effective-restriction row, the root checkpoint row, and the bundled T5Gemma component row.
+    pub const fn weight_licenses(self) -> &'static [gen_core::WeightLicenseEntry] {
+        match self {
+            Self::SmallMusic => MUSIC_WEIGHT_LICENSES,
+            Self::SmallSfx => SFX_WEIGHT_LICENSES,
+        }
+    }
+
+    pub fn descriptor(self) -> ModelDescriptor {
+        descriptor_for(self)
+    }
+}
 
 struct SnapshotFilePin {
     relative: &'static str,
@@ -31,7 +105,7 @@ struct SnapshotFilePin {
     sha256: &'static str,
 }
 
-const SNAPSHOT_FILE_PINS: &[SnapshotFilePin] = &[
+const MUSIC_SNAPSHOT_FILE_PINS: &[SnapshotFilePin] = &[
     SnapshotFilePin {
         relative: "model_config.json",
         bytes: 10_341,
@@ -41,6 +115,45 @@ const SNAPSHOT_FILE_PINS: &[SnapshotFilePin] = &[
         relative: "model.safetensors",
         bytes: 2_270_384_940,
         sha256: "da85866b11b01d0694d990785f6abbd79c8064df1b0e6f8aea52935e0ef84b64",
+    },
+    SnapshotFilePin {
+        relative: "t5gemma-b-b-ul2/config.json",
+        bytes: 2_540,
+        sha256: "575334409716886ac2952f5a275ed92868deef8a0ea560258d9970a431c6fb3a",
+    },
+    SnapshotFilePin {
+        relative: "t5gemma-b-b-ul2/model.safetensors",
+        bytes: 1_183_022_944,
+        sha256: "9b05ea5a4f211d023832f706fb2c0e83e4fc721b6da35ab69ceb0b55eb7800d3",
+    },
+    SnapshotFilePin {
+        relative: "t5gemma-b-b-ul2/tokenizer.json",
+        bytes: 34_362_429,
+        sha256: "7794135caa3ea73918949c902a781cc61dab674a4b59c17d85931c77c1114cbd",
+    },
+    SnapshotFilePin {
+        relative: "t5gemma-b-b-ul2/tokenizer.model",
+        bytes: 4_241_003,
+        sha256: "61a7b147390c64585d6c3543dd6fc636906c9af3865a5548f27f31aee1d4c8e2",
+    },
+];
+
+/// `stabilityai/stable-audio-3-small-sfx@ae12755283df9d62ca39a9b050a39a0b607b8c20`.
+///
+/// The bundled T5Gemma config, weights, and both tokenizer files are byte-identical to the
+/// small-music snapshot; the root checkpoint and its `model_config.json` are not. The root
+/// safetensors header carries no identity metadata, so this SHA-256 pin is the only thing that
+/// separates the two 2,270,384,940-byte checkpoints on disk.
+const SFX_SNAPSHOT_FILE_PINS: &[SnapshotFilePin] = &[
+    SnapshotFilePin {
+        relative: "model_config.json",
+        bytes: 10_454,
+        sha256: "a8aa5d45ae3d6524d3cd4e85e0d6e7d8d401267e7c6f28214bca8aae7b77bdeb",
+    },
+    SnapshotFilePin {
+        relative: "model.safetensors",
+        bytes: 2_270_384_940,
+        sha256: "ed9cf1b6172f1a8c2921a9560c21109ff3239524563ced9dce6dcdef41e2f515",
     },
     SnapshotFilePin {
         relative: "t5gemma-b-b-ul2/config.json",
@@ -84,7 +197,27 @@ pub const GEMMA_WEIGHT_LICENSE: gen_core::WeightLicense = gen_core::WeightLicens
     restriction: Some("Use is governed by the Gemma Terms of Use and Prohibited Use Policy."),
 };
 
-pub const WEIGHT_LICENSES: &[gen_core::WeightLicenseEntry] = &[
+pub const SFX_ROOT_WEIGHT_LICENSE: gen_core::WeightLicense = gen_core::WeightLicense {
+    spdx_id: "LicenseRef-Stability-AI-Community",
+    name: "Stability AI Community License",
+    source_url: "https://huggingface.co/stabilityai/stable-audio-3-small-sfx/blob/ae12755283df9d62ca39a9b050a39a0b607b8c20/LICENSE.md",
+    attribution: Some("Stable Audio 3 Small SFX © Stability AI"),
+    commercial_use: false,
+    restriction: Some(
+        "Use is governed by the Stability AI Community License, including its revenue threshold and prohibited-use terms.",
+    ),
+};
+
+pub const SFX_GEMMA_WEIGHT_LICENSE: gen_core::WeightLicense = gen_core::WeightLicense {
+    spdx_id: "LicenseRef-Gemma-Terms",
+    name: "Gemma Terms of Use",
+    source_url: "https://huggingface.co/stabilityai/stable-audio-3-small-sfx/blob/ae12755283df9d62ca39a9b050a39a0b607b8c20/LICENSE_GEMMA.md",
+    attribution: Some("T5Gemma model weights © Google"),
+    commercial_use: true,
+    restriction: Some("Use is governed by the Gemma Terms of Use and Prohibited Use Policy."),
+};
+
+const MUSIC_WEIGHT_LICENSES: &[gen_core::WeightLicenseEntry] = &[
     gen_core::WeightLicenseEntry {
         provider_id: MODEL_ID,
         component: None,
@@ -102,10 +235,48 @@ pub const WEIGHT_LICENSES: &[gen_core::WeightLicenseEntry] = &[
     },
 ];
 
-pub fn descriptor() -> ModelDescriptor {
+const SFX_WEIGHT_LICENSES: &[gen_core::WeightLicenseEntry] = &[
+    gen_core::WeightLicenseEntry {
+        provider_id: SFX_MODEL_ID,
+        component: None,
+        license: SFX_ROOT_WEIGHT_LICENSE,
+    },
+    gen_core::WeightLicenseEntry {
+        provider_id: SFX_MODEL_ID,
+        component: Some("root"),
+        license: SFX_ROOT_WEIGHT_LICENSE,
+    },
+    gen_core::WeightLicenseEntry {
+        provider_id: SFX_MODEL_ID,
+        component: Some("t5gemma"),
+        license: SFX_GEMMA_WEIGHT_LICENSE,
+    },
+];
+
+/// Every Stable Audio 3 weight-license row, in registration order (music then SFX).
+///
+/// The DiT, SAME-S pretransform, and learned conditioner all live inside the single
+/// `model.safetensors` root artifact and are covered by the `root` row; the bundled T5Gemma stack
+/// is a separately licensed component and carries its own row.
+pub const WEIGHT_LICENSES: &[gen_core::WeightLicenseEntry] = &[
+    MUSIC_WEIGHT_LICENSES[0],
+    MUSIC_WEIGHT_LICENSES[1],
+    MUSIC_WEIGHT_LICENSES[2],
+    SFX_WEIGHT_LICENSES[0],
+    SFX_WEIGHT_LICENSES[1],
+    SFX_WEIGHT_LICENSES[2],
+];
+
+/// Build the descriptor for one registered variant.
+///
+/// Both post-trained checkpoints share the same mathematically active batch-CFG/APG/rescale path,
+/// so they expose the same guidance and negative-prompt surface. The descriptor contract cannot
+/// machine-encode domain (music vs SFX), so the two ids — and their documentation — are the only
+/// signal a consumer gets.
+pub fn descriptor_for(variant: Variant) -> ModelDescriptor {
     ModelDescriptor {
         required_components: &[],
-        id: MODEL_ID,
+        id: variant.model_id(),
         family: "stable_audio_3",
         backend: "candle",
         modality: Modality::Audio,
@@ -141,23 +312,37 @@ pub fn descriptor() -> ModelDescriptor {
     }
 }
 
-fn verify_file_pin(path: &std::path::Path, pin: &SnapshotFilePin) -> gen_core::Result<()> {
+pub fn descriptor() -> ModelDescriptor {
+    descriptor_for(Variant::SmallMusic)
+}
+
+pub fn sfx_descriptor() -> ModelDescriptor {
+    descriptor_for(Variant::SmallSfx)
+}
+
+fn verify_file_pin(
+    model_id: &str,
+    repo: &str,
+    revision: &str,
+    path: &std::path::Path,
+    pin: &SnapshotFilePin,
+) -> gen_core::Result<()> {
     let metadata = std::fs::metadata(path).map_err(|error| {
         gen_core::Error::Msg(format!(
-            "{MODEL_ID}: read pinned file {}: {error}",
+            "{model_id}: read pinned file {}: {error}",
             path.display()
         ))
     })?;
     if metadata.len() != pin.bytes {
         return Err(gen_core::Error::Msg(format!(
-            "{MODEL_ID}: {} byte length {} does not match {HUB_REPO}@{HUB_REVISION}",
+            "{model_id}: {} byte length {} does not match {repo}@{revision}",
             pin.relative,
             metadata.len()
         )));
     }
     let file = std::fs::File::open(path).map_err(|error| {
         gen_core::Error::Msg(format!(
-            "{MODEL_ID}: open pinned file {}: {error}",
+            "{model_id}: open pinned file {}: {error}",
             path.display()
         ))
     })?;
@@ -165,23 +350,29 @@ fn verify_file_pin(path: &std::path::Path, pin: &SnapshotFilePin) -> gen_core::R
     let mut digest = Sha256::new();
     std::io::copy(&mut reader, &mut digest).map_err(|error| {
         gen_core::Error::Msg(format!(
-            "{MODEL_ID}: hash pinned file {}: {error}",
+            "{model_id}: hash pinned file {}: {error}",
             path.display()
         ))
     })?;
     let actual = format!("{:x}", digest.finalize());
     if actual != pin.sha256 {
         return Err(gen_core::Error::Msg(format!(
-            "{MODEL_ID}: {} SHA-256 does not match {HUB_REPO}@{HUB_REVISION}",
+            "{model_id}: {} SHA-256 does not match {repo}@{revision}",
             pin.relative
         )));
     }
     Ok(())
 }
 
-fn verify_snapshot_identity(layout: &SnapshotLayout) -> gen_core::Result<()> {
-    for pin in SNAPSHOT_FILE_PINS {
-        verify_file_pin(&layout.root.join(pin.relative), pin)?;
+fn verify_snapshot_identity(variant: Variant, layout: &SnapshotLayout) -> gen_core::Result<()> {
+    for pin in variant.pins() {
+        verify_file_pin(
+            variant.model_id(),
+            variant.hub_repo(),
+            variant.hub_revision(),
+            &layout.root.join(pin.relative),
+            pin,
+        )?;
     }
     Ok(())
 }
@@ -190,55 +381,56 @@ pub(crate) fn validate_request(
     descriptor: &ModelDescriptor,
     request: &GenerationRequest,
 ) -> gen_core::Result<()> {
+    let model_id = descriptor.id;
     descriptor
         .capabilities
-        .validate_request_audio(descriptor.id, request)?;
+        .validate_request_audio(model_id, request)?;
     if request.prompt.trim().is_empty() {
         return Err(gen_core::Error::Msg(format!(
-            "{MODEL_ID}: prompt must not be empty"
+            "{model_id}: prompt must not be empty"
         )));
     }
     let audio = request.audio.clone().unwrap_or_default();
     let duration = audio.target_duration.unwrap_or(DEFAULT_DURATION_SECS);
     if duration < 1.0 / SAMPLE_RATE as f32 {
         return Err(gen_core::Error::Msg(format!(
-            "{MODEL_ID}: audio.target_duration must contain at least one 44.1 kHz frame"
+            "{model_id}: audio.target_duration must contain at least one 44.1 kHz frame"
         )));
     }
     if audio.bpm.is_some() || audio.musical_key.is_some() || audio.lyrics.is_some() {
         return Err(gen_core::Error::Unsupported(format!(
-            "{MODEL_ID} exposes text-prompt music generation only; BPM, key, and lyrics conditioning are unsupported"
+            "{model_id} exposes text-prompt audio generation only; BPM, key, and lyrics conditioning are unsupported"
         )));
     }
     if let Some(steps) = request.steps {
         if steps > MAX_STEPS {
             return Err(gen_core::Error::Msg(format!(
-                "{MODEL_ID}: steps {steps} exceeds the {MAX_STEPS}-step model limit"
+                "{model_id}: steps {steps} exceeds the {MAX_STEPS}-step model limit"
             )));
         }
     }
     if let Some(guidance) = request.guidance {
         if !(GUIDANCE_RANGE.0..=GUIDANCE_RANGE.1).contains(&guidance) {
             return Err(gen_core::Error::Msg(format!(
-                "{MODEL_ID}: guidance {guidance} outside {}..={}",
+                "{model_id}: guidance {guidance} outside {}..={}",
                 GUIDANCE_RANGE.0, GUIDANCE_RANGE.1
             )));
         }
     }
     if request.guidance_momentum.unwrap_or(0.0) != 0.0 {
         return Err(gen_core::Error::Unsupported(format!(
-            "{MODEL_ID} does not support APG momentum"
+            "{model_id} does not support APG momentum"
         )));
     }
     let method = request.guidance_method.as_deref();
     if request.guidance_eta.is_some() && method != Some("apg") {
         return Err(gen_core::Error::Unsupported(format!(
-            "{MODEL_ID}: guidance_eta is only supported with guidance_method=apg"
+            "{model_id}: guidance_eta is only supported with guidance_method=apg"
         )));
     }
     if request.guidance_norm_threshold.is_some() && method != Some("apg") {
         return Err(gen_core::Error::Unsupported(format!(
-            "{MODEL_ID}: guidance_norm_threshold is only supported with guidance_method=apg"
+            "{model_id}: guidance_norm_threshold is only supported with guidance_method=apg"
         )));
     }
     Ok(())
@@ -277,15 +469,21 @@ fn synthesis_parameters(request: &GenerationRequest) -> SynthesisParameters {
     }
 }
 
-pub struct StableAudio3SmallMusicGenerator {
+/// One registered post-trained Stable Audio 3 small checkpoint, bound to its [`Variant`].
+pub struct StableAudio3SmallGenerator {
+    variant: Variant,
     descriptor: ModelDescriptor,
     root: PathBuf,
-    pipeline: Mutex<Option<Arc<StableAudio3SmallMusicPipeline>>>,
+    pipeline: Mutex<Option<Arc<StableAudio3SmallPipeline>>>,
     generation: Mutex<()>,
 }
 
-impl StableAudio3SmallMusicGenerator {
-    fn pipeline(&self) -> gen_core::Result<Arc<StableAudio3SmallMusicPipeline>> {
+impl StableAudio3SmallGenerator {
+    pub fn variant(&self) -> Variant {
+        self.variant
+    }
+
+    fn pipeline(&self) -> gen_core::Result<Arc<StableAudio3SmallPipeline>> {
         let mut guard = match self.pipeline.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -295,20 +493,31 @@ impl StableAudio3SmallMusicGenerator {
         }
         let layout = SnapshotLayout::from_dir(&self.root)?;
         let device = resolve_device(DevicePolicy::Default)?;
-        let pipeline = Arc::new(StableAudio3SmallMusicPipeline::from_layout(
-            &layout, &device,
+        let pipeline = Arc::new(StableAudio3SmallPipeline::from_layout(
+            &layout,
+            self.variant.hub_repo(),
+            &device,
         )?);
         *guard = Some(pipeline.clone());
         Ok(pipeline)
     }
 }
 
-pub fn load_generator(spec: &LoadSpec) -> gen_core::Result<StableAudio3SmallMusicGenerator> {
+/// Load one registered variant from a caller-provisioned snapshot directory.
+///
+/// `expected` is supplied by the registration site, never inferred from the snapshot: a snapshot
+/// that authenticates as the *other* checkpoint is rejected rather than silently accepted under the
+/// wrong provider id.
+pub fn load_variant(
+    expected: Variant,
+    spec: &LoadSpec,
+) -> gen_core::Result<StableAudio3SmallGenerator> {
+    let model_id = expected.model_id();
     let root = match &spec.weights {
         WeightsSource::Dir(path) => path.clone(),
         WeightsSource::File(path) => {
             return Err(gen_core::Error::Msg(format!(
-                "{MODEL_ID} requires a snapshot directory, got {}",
+                "{model_id} requires a snapshot directory, got {}",
                 path.display()
             )));
         }
@@ -326,25 +535,38 @@ pub fn load_generator(spec: &LoadSpec) -> gen_core::Result<StableAudio3SmallMusi
         || spec.offload_policy != OffloadPolicy::Resident
     {
         return Err(gen_core::Error::Unsupported(format!(
-            "{MODEL_ID} accepts only its native dense self-contained snapshot"
+            "{model_id} accepts only its native dense self-contained snapshot"
         )));
     }
     let layout = SnapshotLayout::from_dir(&root)?;
-    crate::pipeline::validate_small_music_layout(&layout)?;
-    verify_snapshot_identity(&layout)?;
-    Ok(StableAudio3SmallMusicGenerator {
-        descriptor: descriptor(),
+    crate::pipeline::validate_small_layout(&layout, expected.hub_repo())?;
+    verify_snapshot_identity(expected, &layout)?;
+    Ok(StableAudio3SmallGenerator {
+        variant: expected,
+        descriptor: descriptor_for(expected),
         root,
         pipeline: Mutex::new(None),
         generation: Mutex::new(()),
     })
 }
 
-pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
-    Ok(Box::new(load_generator(spec)?))
+pub fn load_generator(spec: &LoadSpec) -> gen_core::Result<StableAudio3SmallGenerator> {
+    load_variant(Variant::SmallMusic, spec)
 }
 
-impl Generator for StableAudio3SmallMusicGenerator {
+pub fn load_sfx_generator(spec: &LoadSpec) -> gen_core::Result<StableAudio3SmallGenerator> {
+    load_variant(Variant::SmallSfx, spec)
+}
+
+pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    Ok(Box::new(load_variant(Variant::SmallMusic, spec)?))
+}
+
+pub fn sfx_load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    Ok(Box::new(load_variant(Variant::SmallSfx, spec)?))
+}
+
+impl Generator for StableAudio3SmallGenerator {
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
     }
@@ -401,12 +623,18 @@ candle_audio::register_generators! {
     pub const REGISTRATION = descriptor => load
 }
 
+candle_audio::register_generators! {
+    pub const SFX_REGISTRATION = sfx_descriptor => sfx_load
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use candle_audio::gen_core::{
         AdapterKind, AdapterSpec, AudioParams, Conditioning, Image, Quant,
     };
+
+    const VARIANTS: [Variant; 2] = [Variant::SmallMusic, Variant::SmallSfx];
 
     fn request() -> GenerationRequest {
         GenerationRequest {
@@ -422,96 +650,164 @@ mod tests {
 
     #[test]
     fn descriptor_is_honest_and_conformant() {
-        let descriptor = descriptor();
-        assert_eq!(descriptor.id, MODEL_ID);
-        assert_eq!(descriptor.family, "stable_audio_3");
-        assert_eq!(descriptor.backend, "candle");
-        assert!(matches!(descriptor.modality, Modality::Audio));
-        assert_eq!(descriptor.capabilities.audio_sample_rates, [SAMPLE_RATE]);
-        assert_eq!(
-            descriptor.capabilities.max_audio_duration_secs,
-            Some(MAX_DURATION_SECS)
+        for variant in VARIANTS {
+            let descriptor = descriptor_for(variant);
+            assert_eq!(descriptor.id, variant.model_id());
+            assert_eq!(descriptor.family, "stable_audio_3");
+            assert_eq!(descriptor.backend, "candle");
+            assert!(matches!(descriptor.modality, Modality::Audio));
+            assert_eq!(descriptor.capabilities.audio_sample_rates, [SAMPLE_RATE]);
+            assert_eq!(
+                descriptor.capabilities.max_audio_duration_secs,
+                Some(MAX_DURATION_SECS)
+            );
+            // sc-14544: both post-trained objectives share the batch-CFG/APG/rescale math, so SFX
+            // must NOT be distinguished from music by a false guidance flag.
+            assert!(descriptor.capabilities.supports_negative_prompt);
+            assert!(descriptor.capabilities.supports_guidance);
+            assert_eq!(
+                descriptor.capabilities.samplers,
+                ["pingpong", "euler", "rk4", "dpmpp"]
+            );
+        }
+        assert_eq!(descriptor().id, "stable_audio_3_small_music");
+        assert_eq!(sfx_descriptor().id, "stable_audio_3_small_sfx");
+        assert_eq!((REGISTRATION.descriptor)().id, MODEL_ID);
+        assert_eq!((SFX_REGISTRATION.descriptor)().id, SFX_MODEL_ID);
+    }
+
+    #[test]
+    fn the_two_variants_are_distinct_checkpoints_with_distinct_pins() {
+        assert_ne!(Variant::SmallMusic.model_id(), Variant::SmallSfx.model_id());
+        assert_ne!(Variant::SmallMusic.hub_repo(), Variant::SmallSfx.hub_repo());
+        assert_ne!(
+            Variant::SmallMusic.hub_revision(),
+            Variant::SmallSfx.hub_revision()
         );
-        assert!(descriptor.capabilities.supports_negative_prompt);
-        assert!(descriptor.capabilities.supports_guidance);
+        let music = Variant::SmallMusic.pins();
+        let sfx = Variant::SmallSfx.pins();
+        assert_eq!(music.len(), sfx.len());
+        for (music, sfx) in music.iter().zip(sfx) {
+            assert_eq!(music.relative, sfx.relative);
+        }
+        // The root checkpoint and its config differ; the bundled T5Gemma stack is byte-identical.
+        let by_name = |pins: &'static [SnapshotFilePin], name: &str| {
+            pins.iter().find(|pin| pin.relative == name).unwrap()
+        };
+        assert_ne!(
+            by_name(music, "model.safetensors").sha256,
+            by_name(sfx, "model.safetensors").sha256
+        );
+        assert_ne!(
+            by_name(music, "model_config.json").sha256,
+            by_name(sfx, "model_config.json").sha256
+        );
         assert_eq!(
-            descriptor.capabilities.samplers,
-            ["pingpong", "euler", "rk4", "dpmpp"]
+            by_name(music, "t5gemma-b-b-ul2/model.safetensors").sha256,
+            by_name(sfx, "t5gemma-b-b-ul2/model.safetensors").sha256
         );
     }
 
     #[test]
+    fn every_variant_contributes_composite_and_component_license_rows() {
+        assert_eq!(WEIGHT_LICENSES.len(), 6);
+        for variant in VARIANTS {
+            let rows = variant.weight_licenses();
+            assert_eq!(rows.len(), 3);
+            assert!(rows.iter().all(|row| row.provider_id == variant.model_id()));
+            assert_eq!(rows[0].component, None);
+            assert_eq!(rows[1].component, Some("root"));
+            assert_eq!(rows[2].component, Some("t5gemma"));
+            assert_eq!(rows[0].license.spdx_id, "LicenseRef-Stability-AI-Community");
+            assert!(!rows[0].license.commercial_use);
+            assert!(rows[0].license.restriction.is_some());
+            assert_eq!(rows[2].license.spdx_id, "LicenseRef-Gemma-Terms");
+            assert!(rows[1].license.source_url.contains(variant.hub_revision()));
+            assert!(rows[2].license.source_url.contains(variant.hub_revision()));
+            assert!(
+                WEIGHT_LICENSES
+                    .iter()
+                    .filter(|row| row.provider_id == variant.model_id())
+                    .count()
+                    == 3
+            );
+        }
+    }
+
+    #[test]
     fn request_validation_maps_the_complete_public_surface() {
-        let descriptor = descriptor();
-        assert!(validate_request(&descriptor, &request()).is_ok());
-        let mut valid = request();
-        valid.negative_prompt = Some("harsh clipping and speech".into());
-        valid.guidance = Some(7.5);
-        valid.sampler = Some("dpmpp".into());
-        valid.guidance_method = Some("apg".into());
-        valid.guidance_eta = Some(0.25);
-        valid.guidance_norm_threshold = Some(2.0);
-        assert!(validate_request(&descriptor, &valid).is_ok());
+        for variant in VARIANTS {
+            let descriptor = descriptor_for(variant);
+            assert!(validate_request(&descriptor, &request()).is_ok());
+            let mut valid = request();
+            valid.negative_prompt = Some("harsh clipping and speech".into());
+            valid.guidance = Some(7.5);
+            valid.sampler = Some("dpmpp".into());
+            valid.guidance_method = Some("apg".into());
+            valid.guidance_eta = Some(0.25);
+            valid.guidance_norm_threshold = Some(2.0);
+            assert!(validate_request(&descriptor, &valid).is_ok());
 
-        let mut invalid = request();
-        invalid.audio.as_mut().unwrap().bpm = Some(120.0);
-        assert!(matches!(
-            validate_request(&descriptor, &invalid),
-            Err(gen_core::Error::Unsupported(_))
-        ));
-
-        for field in ["musical_key", "lyrics"] {
             let mut invalid = request();
-            match field {
-                "musical_key" => {
-                    invalid.audio.as_mut().unwrap().musical_key = Some("D minor".into())
-                }
-                "lyrics" => invalid.audio.as_mut().unwrap().lyrics = Some("sing this".into()),
-                _ => unreachable!(),
-            }
+            invalid.audio.as_mut().unwrap().bpm = Some(120.0);
             assert!(matches!(
                 validate_request(&descriptor, &invalid),
                 Err(gen_core::Error::Unsupported(_))
             ));
+
+            for field in ["musical_key", "lyrics"] {
+                let mut invalid = request();
+                match field {
+                    "musical_key" => {
+                        invalid.audio.as_mut().unwrap().musical_key = Some("D minor".into())
+                    }
+                    "lyrics" => invalid.audio.as_mut().unwrap().lyrics = Some("sing this".into()),
+                    _ => unreachable!(),
+                }
+                assert!(matches!(
+                    validate_request(&descriptor, &invalid),
+                    Err(gen_core::Error::Unsupported(_))
+                ));
+            }
+
+            let mut invalid = request();
+            invalid.conditioning.push(Conditioning::Reference {
+                image: Image {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![0, 0, 0],
+                },
+                strength: None,
+            });
+            assert!(matches!(
+                validate_request(&descriptor, &invalid),
+                Err(gen_core::Error::Unsupported(_))
+            ));
+
+            let mut invalid = request();
+            invalid.guidance_method = Some("apg".into());
+            invalid.guidance_momentum = Some(0.1);
+            assert!(matches!(
+                validate_request(&descriptor, &invalid),
+                Err(gen_core::Error::Unsupported(_))
+            ));
+
+            let mut invalid = request();
+            invalid.audio.as_mut().unwrap().target_duration = Some(0.0);
+            assert!(validate_request(&descriptor, &invalid).is_err());
+
+            let mut invalid = request();
+            invalid.prompt = "  ".into();
+            assert!(validate_request(&descriptor, &invalid).is_err());
+
+            let mut invalid = request();
+            invalid.steps = Some(MAX_STEPS + 1);
+            assert!(validate_request(&descriptor, &invalid).is_err());
+
+            let mut invalid = request();
+            invalid.guidance = Some(GUIDANCE_RANGE.1 + 0.1);
+            assert!(validate_request(&descriptor, &invalid).is_err());
         }
-
-        let mut invalid = request();
-        invalid.conditioning.push(Conditioning::Reference {
-            image: Image {
-                width: 1,
-                height: 1,
-                pixels: vec![0, 0, 0],
-            },
-            strength: None,
-        });
-        assert!(matches!(
-            validate_request(&descriptor, &invalid),
-            Err(gen_core::Error::Unsupported(_))
-        ));
-
-        let mut invalid = request();
-        invalid.guidance_method = Some("apg".into());
-        invalid.guidance_momentum = Some(0.1);
-        assert!(matches!(
-            validate_request(&descriptor, &invalid),
-            Err(gen_core::Error::Unsupported(_))
-        ));
-
-        let mut invalid = request();
-        invalid.audio.as_mut().unwrap().target_duration = Some(0.0);
-        assert!(validate_request(&descriptor, &invalid).is_err());
-
-        let mut invalid = request();
-        invalid.prompt = "  ".into();
-        assert!(validate_request(&descriptor, &invalid).is_err());
-
-        let mut invalid = request();
-        invalid.steps = Some(MAX_STEPS + 1);
-        assert!(validate_request(&descriptor, &invalid).is_err());
-
-        let mut invalid = request();
-        invalid.guidance = Some(GUIDANCE_RANGE.1 + 0.1);
-        assert!(validate_request(&descriptor, &invalid).is_err());
     }
 
     #[test]
@@ -545,41 +841,49 @@ mod tests {
     #[test]
     fn load_rejects_every_non_native_shape_before_touching_the_snapshot() {
         let missing = PathBuf::from("does-not-exist");
-        assert!(load(&LoadSpec::new(WeightsSource::File(missing.clone()))).is_err());
+        for loader in [
+            load as fn(&LoadSpec) -> gen_core::Result<Box<dyn Generator>>,
+            sfx_load,
+        ] {
+            assert!(loader(&LoadSpec::new(WeightsSource::File(missing.clone()))).is_err());
 
-        let dense = || LoadSpec::new(WeightsSource::Dir(missing.clone()));
-        let mut specs = Vec::new();
-        specs.push(dense().with_quant(Quant::Q4));
+            let dense = || LoadSpec::new(WeightsSource::Dir(missing.clone()));
+            let mut specs = Vec::new();
+            specs.push(dense().with_quant(Quant::Q4));
 
-        let mut precision = dense();
-        precision.precision = Precision::Fp32;
-        specs.push(precision);
+            let mut precision = dense();
+            precision.precision = Precision::Fp32;
+            specs.push(precision);
 
-        specs.push(dense().with_adapters(vec![AdapterSpec::new(
-            missing.clone(),
-            1.0,
-            AdapterKind::Lora,
-        )]));
-        specs.push(dense().with_control(WeightsSource::File(missing.clone())));
-        specs.push(dense().with_extra_control(WeightsSource::File(missing.clone())));
-        specs.push(dense().with_ip_adapter(WeightsSource::Dir(missing.clone())));
-        specs.push(dense().with_pid(
-            WeightsSource::File(missing.clone()),
-            WeightsSource::Dir(missing.clone()),
-        ));
-        specs.push(dense().with_component("unsupported", WeightsSource::Dir(missing.clone())));
-        specs.push(dense().with_offload_policy(OffloadPolicy::Sequential));
+            specs.push(dense().with_adapters(vec![AdapterSpec::new(
+                missing.clone(),
+                1.0,
+                AdapterKind::Lora,
+            )]));
+            specs.push(dense().with_control(WeightsSource::File(missing.clone())));
+            specs.push(dense().with_extra_control(WeightsSource::File(missing.clone())));
+            specs.push(dense().with_ip_adapter(WeightsSource::Dir(missing.clone())));
+            specs.push(dense().with_pid(
+                WeightsSource::File(missing.clone()),
+                WeightsSource::Dir(missing.clone()),
+            ));
+            specs.push(dense().with_component("unsupported", WeightsSource::Dir(missing.clone())));
+            specs.push(dense().with_offload_policy(OffloadPolicy::Sequential));
 
-        let mut text = dense();
-        text.text_encoder = Some(WeightsSource::Dir(missing.clone()));
-        specs.push(text);
+            let mut text = dense();
+            text.text_encoder = Some(WeightsSource::Dir(missing.clone()));
+            specs.push(text);
 
-        let mut identity = dense();
-        identity.identity = Some(Default::default());
-        specs.push(identity);
+            let mut identity = dense();
+            identity.identity = Some(Default::default());
+            specs.push(identity);
 
-        for spec in specs {
-            assert!(matches!(load(&spec), Err(gen_core::Error::Unsupported(_))));
+            for spec in specs {
+                assert!(matches!(
+                    loader(&spec),
+                    Err(gen_core::Error::Unsupported(_))
+                ));
+            }
         }
     }
 
@@ -599,13 +903,13 @@ mod tests {
             bytes: 5,
             sha256: "fa79d4746c21cd960a17b92db8976ddef95a7e20b590721f8e0fa7847a05e486",
         };
-        verify_file_pin(&path, &exact).unwrap();
+        verify_file_pin(MODEL_ID, HUB_REPO, HUB_REVISION, &path, &exact).unwrap();
 
         std::fs::write(&path, b"wrong").unwrap();
-        assert!(verify_file_pin(&path, &exact).is_err());
+        assert!(verify_file_pin(MODEL_ID, HUB_REPO, HUB_REVISION, &path, &exact).is_err());
         std::fs::write(&path, b"short").unwrap();
         let wrong_size = SnapshotFilePin { bytes: 4, ..exact };
-        assert!(verify_file_pin(&path, &wrong_size).is_err());
+        assert!(verify_file_pin(MODEL_ID, HUB_REPO, HUB_REVISION, &path, &wrong_size).is_err());
         let _ = std::fs::remove_dir_all(root);
     }
 }

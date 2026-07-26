@@ -109,7 +109,9 @@ mod tests {
         // moss_sfx_v2 (sc-12841), acestep_v15_turbo (sc-12842), moss_tts_realtime (sc-13392),
         // chatterbox_tts (sc-13239), mmaudio_small_16k (video->audio Foley, sc-12843) +
         // mmaudio_large_44k (44.1 kHz, sc-13441), stable_audio_3_small_music (text-to-music,
-        // sc-14543), and moss_ttsd_v05 (multi-speaker dialogue TTS, sc-13518), plus the
+        // sc-14543) + stable_audio_3_small_sfx (text-to-SFX/Foley, sc-14544 — 44.1 kHz stereo,
+        // distinct from the 48 kHz mono moss_sfx_v2), and moss_ttsd_v05 (multi-speaker dialogue
+        // TTS, sc-13518), plus the
         // voice-cloning identity embedder chatterbox_ve (sc-12844); later stories extend these exact
         // assertions in catalog order. The lane carries its own composed candle preparer
         // (sc-12835/sc-12836).
@@ -126,6 +128,7 @@ mod tests {
                     "moss_sfx_v2",
                     "acestep_v15_turbo",
                     "stable_audio_3_small_music",
+                    "stable_audio_3_small_sfx",
                     "moss_tts_realtime",
                     "chatterbox_tts",
                     "mmaudio_small_16k",
@@ -225,6 +228,7 @@ mod tests {
                 "moss_sfx_v2",
                 "acestep_v15_turbo",
                 "stable_audio_3_small_music",
+                "stable_audio_3_small_sfx",
                 "moss_tts_realtime",
                 "chatterbox_tts",
                 "mmaudio_small_16k",

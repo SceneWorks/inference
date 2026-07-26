@@ -6,7 +6,7 @@ use candle_audio_stable_audio_3::candle_audio::candle_core::{
     safetensors::MmapedSafetensors, DType, Device, Tensor,
 };
 use candle_audio_stable_audio_3::dit::Guidance;
-use candle_audio_stable_audio_3::pipeline::{StableAudio3SmallMusicPipeline, SynthesisParameters};
+use candle_audio_stable_audio_3::pipeline::{StableAudio3SmallPipeline, SynthesisParameters};
 use candle_audio_stable_audio_3::same::SameDecodeChunkNoise;
 use candle_audio_stable_audio_3::sampler::SamplerKind;
 use candle_audio_stable_audio_3::weights::SnapshotLayout;
@@ -70,7 +70,12 @@ fn metrics(actual: &[f32], expected: &[f32]) -> (f64, f32, f64) {
 fn thirty_second_eight_step_provider_matches_frozen_torch() {
     let device = Device::Cpu;
     let layout = SnapshotLayout::from_dir(&snapshot()).unwrap();
-    let pipeline = StableAudio3SmallMusicPipeline::from_layout(&layout, &device).unwrap();
+    let pipeline = StableAudio3SmallPipeline::from_layout(
+        &layout,
+        candle_audio_stable_audio_3::HUB_REPO,
+        &device,
+    )
+    .unwrap();
     let initial = portable(&[1, 256, LATENTS], 0, 1.0, &device);
     let pingpong = (1..=8)
         .map(|stream| portable(&[1, 256, LATENTS], stream, 1.0, &device))

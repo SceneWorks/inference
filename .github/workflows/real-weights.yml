@@ -10,7 +10,7 @@ on:
         type: choice
         required: true
         default: all
-        options: [all, llm, media, audio, same-l, same-chunked, sa3-small-music]
+        options: [all, llm, media, audio, same-l, same-chunked, sa3-small-music, sa3-small-sfx]
 
 permissions:
   contents: read
@@ -501,7 +501,12 @@ jobs:
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-music --snapshot "$SA3_SMALL_MUSIC_SNAPSHOT"
       - name: Run registered provider conformance and concurrent RNG isolation on Metal
         run: |
-          cargo test --locked --release -p candle-audio-stable-audio-3 --features metal --test conformance -- --ignored --nocapture
+          # Named tests: the shared `conformance` binary also carries the sc-14544 small-sfx cases,
+          # which need their own snapshot and run in the sa3-small-sfx job.
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
+            --test conformance registered_provider_passes_full_audio_conformance -- --ignored --nocapture
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
+            --test conformance concurrent_requests_are_deterministic_and_do_not_share_rng_state -- --ignored --nocapture
       - name: Render a real 30-second eight-step Metal WAV
         run: |
           SA3_TEST_DURATION=30 SA3_TEST_STEPS=8 \
@@ -510,6 +515,55 @@ jobs:
               --test provider connected_short_generation_is_stereo_finite_and_exact_length \
               -- --ignored --nocapture
           shasum -a 256 "$RUNNER_TEMP/sa3-small-music-metal.wav"
+
+  sa3-small-sfx-metal:
+    name: Stable Audio 3 small-sfx provider (Metal)
+    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'sa3-small-sfx'
+    runs-on: [self-hosted, macOS, ARM64, real-weights]
+    env:
+      SA3_TEST_METAL: "1"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Configure immutable small-sfx and small-music snapshot paths
+        run: |
+          # sc-14544's identity and divergence gates compare the two checkpoints against each other,
+          # so both snapshots are required on this runner.
+          echo "SA3_SMALL_SFX_SNAPSHOT=$RUNNER_TEMP/sa3-small-sfx/ae12755283df9d62ca39a9b050a39a0b607b8c20" >> "$GITHUB_ENV"
+          echo "SA3_SMALL_MUSIC_SNAPSHOT=$RUNNER_TEMP/sa3-small-music/0fef1392cd842149a2b6d445e181c97608faac06" >> "$GITHUB_ENV"
+      - name: Toolchain and hardware versions
+        run: |
+          sw_vers
+          system_profiler SPHardwareDataType SPDisplaysDataType |
+            grep -E 'Model Name|Model Identifier|Chip|Total Number of Cores|Memory|Chipset Model|Metal Support'
+          rustc --version
+          cargo --version
+      - name: Materialize and verify both immutable small snapshots
+        run: |
+          python3 -m pip install --disable-pip-version-check --target "$RUNNER_TEMP/huggingface-hub" "huggingface_hub==1.20.1"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-sfx --snapshot "$SA3_SMALL_SFX_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-music --snapshot "$SA3_SMALL_MUSIC_SNAPSHOT"
+      - name: Reject cross-variant weight paths (mutation gates)
+        run: |
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
+            --test variant_binding -- --ignored --nocapture
+      - name: Prove music and SFX actually diverge
+        run: |
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
+            --test variant_divergence -- --ignored --nocapture
+      - name: Run registered SFX provider conformance and concurrent RNG isolation on Metal
+        run: |
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
+            --test conformance registered_sfx_provider_passes_full_audio_conformance -- --ignored --nocapture
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
+            --test conformance concurrent_sfx_requests_are_deterministic_and_do_not_share_rng_state -- --ignored --nocapture
+      - name: Render a real 30-second eight-step SFX Metal WAV
+        run: |
+          SA3_TEST_DURATION=30 SA3_TEST_STEPS=8 \
+          SA3_SMALL_SFX_WAV_OUT="$RUNNER_TEMP/sa3-small-sfx-metal.wav" \
+            cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
+              --test provider connected_sfx_generation_is_stereo_finite_and_exact_length \
+              -- --ignored --nocapture
+          shasum -a 256 "$RUNNER_TEMP/sa3-small-sfx-metal.wav"
 
   same-l-cuda:
     name: SAME-L real weights (CUDA)
@@ -678,7 +732,8 @@ jobs:
         shell: cmd
         run: |
           call "%VCVARS%"
-          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --test conformance -- --ignored --nocapture || exit /b 1
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --test conformance registered_provider_passes_full_audio_conformance -- --ignored --nocapture || exit /b 1
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --test conformance concurrent_requests_are_deterministic_and_do_not_share_rng_state -- --ignored --nocapture || exit /b 1
       - name: Render a real 30-second eight-step CUDA WAV
         shell: powershell
         run: |
@@ -694,6 +749,73 @@ jobs:
             -- --ignored --nocapture
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Get-FileHash -Algorithm SHA256 $env:SA3_SMALL_MUSIC_WAV_OUT
+
+  sa3-small-sfx-cuda:
+    name: Stable Audio 3 small-sfx provider (CUDA)
+    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'sa3-small-sfx'
+    runs-on: [self-hosted, windows, cuda, real-weights]
+    env:
+      SA3_TEST_CUDA: "1"
+      CUDA_COMPUTE_CAP: "80"
+      CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
+      VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Configure immutable small-sfx and small-music snapshot paths
+        shell: cmd
+        run: |
+          echo SA3_SMALL_SFX_SNAPSHOT=%RUNNER_TEMP%\sa3-small-sfx\ae12755283df9d62ca39a9b050a39a0b607b8c20>>"%GITHUB_ENV%"
+          echo SA3_SMALL_MUSIC_SNAPSHOT=%RUNNER_TEMP%\sa3-small-music\0fef1392cd842149a2b6d445e181c97608faac06>>"%GITHUB_ENV%"
+      - name: Select Git Bash
+        shell: cmd
+        run: |
+          if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
+          echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+        with:
+          toolchain: 1.96.0
+          components: rustfmt, clippy
+      - name: Toolchain and hardware versions
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          rustc --version
+          cargo --version
+          nvidia-smi
+      - name: Materialize and verify both immutable small snapshots
+        shell: cmd
+        run: |
+          python -m pip install --disable-pip-version-check --target "%RUNNER_TEMP%\huggingface-hub" "huggingface_hub==1.20.1"
+          set "PYTHONPATH=%RUNNER_TEMP%\huggingface-hub"
+          python scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-sfx --snapshot "%SA3_SMALL_SFX_SNAPSHOT%" || exit /b 1
+          python scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-music --snapshot "%SA3_SMALL_MUSIC_SNAPSHOT%" || exit /b 1
+      - name: Reject cross-variant weight paths and prove divergence on CUDA
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --test variant_binding -- --ignored --nocapture || exit /b 1
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --test variant_divergence -- --ignored --nocapture || exit /b 1
+      - name: Run registered SFX provider conformance and concurrent RNG isolation on CUDA
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --test conformance registered_sfx_provider_passes_full_audio_conformance -- --ignored --nocapture || exit /b 1
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --test conformance concurrent_sfx_requests_are_deterministic_and_do_not_share_rng_state -- --ignored --nocapture || exit /b 1
+      - name: Render a real 30-second eight-step SFX CUDA WAV
+        shell: powershell
+        run: |
+          cmd /c "call `"$env:VCVARS`" && set" |
+            ForEach-Object {
+              if ($_ -match "^(.*?)=(.*)$") { Set-Item -Force "env:$($matches[1])" $matches[2] }
+            }
+          $env:SA3_TEST_DURATION = "30"
+          $env:SA3_TEST_STEPS = "8"
+          $env:SA3_SMALL_SFX_WAV_OUT = Join-Path $env:RUNNER_TEMP "sa3-small-sfx-cuda.wav"
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda `
+            --test provider connected_sfx_generation_is_stereo_finite_and_exact_length `
+            -- --ignored --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-FileHash -Algorithm SHA256 $env:SA3_SMALL_SFX_WAV_OUT
 
   candle-llm:
     name: Candle LLM real weights (CUDA)

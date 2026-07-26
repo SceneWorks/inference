@@ -1,9 +1,9 @@
-//! Connected Stable Audio 3 small-music inference pipeline.
+//! Connected Stable Audio 3 small (music / SFX) inference pipeline.
 
 use candle_audio::candle_core::{DType, Device, Tensor};
 use candle_audio::{AudioError, Result};
 
-use crate::config::{DiffusionObjective, ModelConfig};
+use crate::config::{ConditionerConfig, DiffusionObjective, ModelConfig};
 use crate::dit::{Guidance, StableAudio3Dit};
 use crate::same::{
     SameAutoencoder, SameChunkingParameters, SameChunkingPolicy, SameDecodeChunkNoise,
@@ -34,7 +34,7 @@ pub struct SynthesisParameters {
 }
 
 /// A loaded, connected text-to-stereo-audio graph.
-pub struct StableAudio3SmallMusicPipeline {
+pub struct StableAudio3SmallPipeline {
     config: crate::config::StableAudioConfig,
     conditioner: T5GemmaConditioner,
     dit: StableAudio3Dit,
@@ -42,9 +42,14 @@ pub struct StableAudio3SmallMusicPipeline {
     device: Device,
 }
 
-impl StableAudio3SmallMusicPipeline {
-    pub fn from_layout(layout: &SnapshotLayout, device: &Device) -> Result<Self> {
-        validate_small_music_layout(layout)?;
+impl StableAudio3SmallPipeline {
+    /// Build the connected graph, refusing any snapshot that is not `expected_repo`'s checkpoint.
+    pub fn from_layout(
+        layout: &SnapshotLayout,
+        expected_repo: &str,
+        device: &Device,
+    ) -> Result<Self> {
+        validate_small_layout(layout, expected_repo)?;
         let diffusion = match &layout.config.model {
             ModelConfig::Diffusion(model) => model,
             ModelConfig::Autoencoder(_) => unreachable!("validated full snapshot"),
@@ -100,7 +105,7 @@ impl StableAudio3SmallMusicPipeline {
             ModelConfig::Diffusion(model) => model,
             ModelConfig::Autoencoder(_) => unreachable!("validated full snapshot"),
         };
-        // The full small-music config owns the default-on outer chunking decision. The same
+        // The full small-variant config owns the default-on outer chunking decision. The same
         // request-local stream has already produced initial latents and every Pingpong draw.
         let decoded = self.same.decode_audio_with_request_rng(
             &sampled,
@@ -315,7 +320,34 @@ impl StableAudio3SmallMusicPipeline {
     }
 }
 
-pub fn validate_small_music_layout(layout: &SnapshotLayout) -> Result<()> {
+/// The conditioner `repo_id` declared by a full Stable Audio 3 snapshot's `model_config.json`.
+///
+/// This is the only field in the shipped configs that identifies which post-trained checkpoint the
+/// snapshot is: `small-music` and `small-sfx` are otherwise architecturally identical, differing
+/// only in training-only ARC fields and demo prompts.
+pub fn conditioner_repo_id(layout: &SnapshotLayout) -> Option<&str> {
+    let diffusion = match &layout.config.model {
+        ModelConfig::Diffusion(model) => model,
+        ModelConfig::Autoencoder(_) => return None,
+    };
+    diffusion
+        .conditioning
+        .configs
+        .iter()
+        .find_map(|config| match config {
+            ConditionerConfig::T5gemma { config, .. } => config.repo_id.as_deref(),
+            ConditionerConfig::Number { .. } => None,
+        })
+}
+
+/// Validate that `layout` is the exact post-trained SA3 small checkpoint published by
+/// `expected_repo`.
+///
+/// The architecture checks are shared by both registered variants; the `repo_id` check is what
+/// stops one variant's snapshot loading under the other's provider id. `ModelRegistration::load`
+/// carries no provider id, so without this the registry would happily serve music weights from the
+/// `stable_audio_3_small_sfx` registration.
+pub fn validate_small_layout(layout: &SnapshotLayout, expected_repo: &str) -> Result<()> {
     if layout.kind != SnapshotKind::Full
         || layout.config.sample_rate != SAMPLE_RATE
         || layout.config.sample_size != 5_292_032
@@ -325,16 +357,16 @@ pub fn validate_small_music_layout(layout: &SnapshotLayout) -> Result<()> {
         || layout.keys.encoder + layout.keys.decoder + layout.keys.bottleneck != 244
         || layout.keys.conditioner != 3
     {
-        return Err(AudioError::Msg(
-            "snapshot is not the exact Stable Audio 3 small-music full checkpoint".into(),
-        ));
+        return Err(AudioError::Msg(format!(
+            "snapshot is not the exact {expected_repo} full checkpoint"
+        )));
     }
     let diffusion = match &layout.config.model {
         ModelConfig::Diffusion(model) => model,
         ModelConfig::Autoencoder(_) => {
-            return Err(AudioError::Msg(
-                "small-music provider rejects standalone SAME snapshots".into(),
-            ));
+            return Err(AudioError::Msg(format!(
+                "{expected_repo} provider rejects standalone SAME snapshots"
+            )));
         }
     };
     let dit = &diffusion.diffusion;
@@ -352,21 +384,35 @@ pub fn validate_small_music_layout(layout: &SnapshotLayout) -> Result<()> {
         || diffusion.pretransform.config.downsampling_ratio != 4_096
         || !diffusion.pretransform.chunked
     {
-        return Err(AudioError::Msg(
-            "snapshot architecture is not stable-audio-3-small-music".into(),
-        ));
+        return Err(AudioError::Msg(format!(
+            "snapshot architecture is not {expected_repo}"
+        )));
     }
-    let text = layout
-        .text_keys
-        .as_ref()
-        .ok_or_else(|| AudioError::Msg("small-music snapshot has no bundled T5Gemma".into()))?;
+    match conditioner_repo_id(layout) {
+        Some(repo) if repo == expected_repo => {}
+        Some(repo) => {
+            return Err(AudioError::Msg(format!(
+                "snapshot declares conditioner repo_id {repo}, which is not {expected_repo}; \
+                 refusing to serve one Stable Audio 3 checkpoint under another's provider id"
+            )));
+        }
+        None => {
+            return Err(AudioError::Msg(format!(
+                "snapshot declares no conditioner repo_id and cannot be authenticated as \
+                 {expected_repo}"
+            )));
+        }
+    }
+    let text = layout.text_keys.as_ref().ok_or_else(|| {
+        AudioError::Msg(format!("{expected_repo} snapshot has no bundled T5Gemma"))
+    })?;
     if text.total != crate::weights::TextWeightSummary::TOTAL
         || text.encoder != crate::weights::TextWeightSummary::ENCODER
         || text.decoder != crate::weights::TextWeightSummary::DECODER
     {
-        return Err(AudioError::Msg(
-            "small-music bundled T5Gemma inventory mismatch".into(),
-        ));
+        return Err(AudioError::Msg(format!(
+            "{expected_repo} bundled T5Gemma inventory mismatch"
+        )));
     }
     Ok(())
 }
@@ -398,7 +444,7 @@ fn planar_to_interleaved(audio: &Tensor) -> Result<Vec<f32>> {
     let (batch, channels, frames) = audio.dims3()?;
     if batch != 1 || channels != CHANNELS {
         return Err(AudioError::Msg(format!(
-            "small-music decode expected [1,{CHANNELS},frames], got [{batch},{channels},{frames}]"
+            "SA3 small decode expected [1,{CHANNELS},frames], got [{batch},{channels},{frames}]"
         )));
     }
     let planar = audio.to_dtype(DType::F32)?.to_vec3::<f32>()?;

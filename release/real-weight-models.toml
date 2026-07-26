@@ -168,6 +168,30 @@ expected_files = [
 ]
 
 [[models]]
+# Exact registered Stable Audio 3 small-sfx graph. Architecturally identical to small-music; only
+# the trained DiT/conditioner weights differ, which is exactly why the music-vs-SFX divergence gate
+# needs both snapshots materialized on the same runner.
+key = "stable-audio-3-small-sfx"
+repository = "stabilityai/stable-audio-3-small-sfx"
+revision = "ae12755283df9d62ca39a9b050a39a0b607b8c20"
+requires_auth = true
+license = "Stability AI Community License"
+size_class = "very-large"
+profiles = ["audio-macos", "audio-cuda"]
+environment = ["SA3_SMALL_SFX_SNAPSHOT"]
+expected_files = [
+    "model_config.json",
+    "model.safetensors",
+    "t5gemma-b-b-ul2/config.json",
+    "t5gemma-b-b-ul2/model.safetensors",
+    "t5gemma-b-b-ul2/tokenizer.json",
+    "t5gemma-b-b-ul2/tokenizer.model",
+    "LICENSE.md",
+    "LICENSE_GEMMA.md",
+    "NOTICE",
+]
+
+[[models]]
 key = "moss-soundeffect-v2"
 repository = "OpenMOSS-Team/MOSS-SoundEffect-v2.0"
 revision = "e35df4d82fbe87fcd5d14e5d100e349c0c3c076d"

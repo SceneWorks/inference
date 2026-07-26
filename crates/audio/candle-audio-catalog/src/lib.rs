@@ -57,7 +57,8 @@ pub mod providers {
 }
 
 /// Add every provider shipped by the Candle audio lane to an explicit registry builder, in
-/// stable catalog order: the generators first (Kokoro TTS, MOSS SFX, ACE-Step music, MOSS-TTS-Realtime
+/// stable catalog order: the generators first (Kokoro TTS, MOSS SFX, ACE-Step music, Stable Audio 3
+/// small-music — sc-14543 and small-sfx — sc-14544, MOSS-TTS-Realtime
 /// streaming TTS — sc-13392, Chatterbox clone-TTS — sc-13239, MMAudio video→audio Foley 16k — sc-12843
 /// and 44.1 kHz — sc-13441), then the voice-cloning identity embedder (Chatterbox `ve`, sc-12844),
 /// then the audio transforms
@@ -281,6 +282,7 @@ mod tests {
                 "moss_sfx_v2",
                 "acestep_v15_turbo",
                 "stable_audio_3_small_music",
+                "stable_audio_3_small_sfx",
                 "moss_tts_realtime",
                 "chatterbox_tts",
                 "mmaudio_small_16k",
@@ -492,6 +494,24 @@ mod tests {
                 ),
                 (
                     "stable_audio_3_small_music",
+                    Some("t5gemma"),
+                    "LicenseRef-Gemma-Terms",
+                    true
+                ),
+                (
+                    "stable_audio_3_small_sfx",
+                    None,
+                    "LicenseRef-Stability-AI-Community",
+                    false
+                ),
+                (
+                    "stable_audio_3_small_sfx",
+                    Some("root"),
+                    "LicenseRef-Stability-AI-Community",
+                    false
+                ),
+                (
+                    "stable_audio_3_small_sfx",
                     Some("t5gemma"),
                     "LicenseRef-Gemma-Terms",
                     true
@@ -708,12 +728,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&empty);
     }
 
-    #[test]
-    #[ignore = "requires the pinned Stable Audio 3 small-music snapshot"]
-    fn connected_sa3_snapshot_resolves_through_the_composed_lane_preparer() {
+    fn assert_sa3_snapshot_prepares(env: &str) {
         let snapshot = std::path::PathBuf::from(
-            std::env::var("SA3_SMALL_MUSIC_SNAPSHOT")
-                .expect("set SA3_SMALL_MUSIC_SNAPSHOT to the pinned immutable snapshot"),
+            std::env::var(env)
+                .unwrap_or_else(|_| panic!("set {env} to the pinned immutable snapshot")),
         );
         let registry = super::snapshot_preparer_registry().unwrap();
         let registration = registry
@@ -722,10 +740,22 @@ mod tests {
             .expect("composed Candle audio preparer");
         let spec =
             super::core_llm::PrepareSpec::dense(&snapshot, snapshot.join("unused-prepared-output"));
-        assert!((registration.can_prepare)(&spec));
+        assert!((registration.can_prepare)(&spec), "{env}");
         let report = (registration.prepare)(&spec).expect("prepare exact SA3 snapshot");
-        assert!(report.passthrough);
-        assert_eq!(report.out_dir, snapshot);
-        assert_eq!(report.num_tensors, 1_025);
+        assert!(report.passthrough, "{env}");
+        assert_eq!(report.out_dir, snapshot, "{env}");
+        assert_eq!(report.num_tensors, 1_025, "{env}");
+    }
+
+    #[test]
+    #[ignore = "requires the pinned Stable Audio 3 small-music snapshot"]
+    fn connected_sa3_snapshot_resolves_through_the_composed_lane_preparer() {
+        assert_sa3_snapshot_prepares("SA3_SMALL_MUSIC_SNAPSHOT");
+    }
+
+    #[test]
+    #[ignore = "requires the pinned Stable Audio 3 small-sfx snapshot"]
+    fn connected_sa3_sfx_snapshot_resolves_through_the_composed_lane_preparer() {
+        assert_sa3_snapshot_prepares("SA3_SMALL_SFX_SNAPSHOT");
     }
 }
