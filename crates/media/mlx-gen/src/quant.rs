@@ -156,10 +156,16 @@ pub fn packed_bits(wq: &Array, scales: &Array, group_size: i32) -> Result<i32> {
     }
     let bits = wshape[1] * 32 / in_dim;
     if !matches!(bits, 4 | 8) {
+        // Name the assumed `group_size` (sc-15154). Every term here is derived FROM it, so a caller
+        // that passes the wrong one gets an illegal width from a perfectly good artifact — Mage's q8
+        // vision tower (packed at 64, read at 32) reported "bits 16" and was diagnosed as a bad
+        // upload. A reader who can see the assumption can check it before re-hosting anything.
         return Err(crate::Error::Msg(format!(
             "packed quant: inferred bit-width {bits} ∉ {{4, 8}} \
-             (weight cols {}, in_dim {in_dim}); snapshot is corrupt or mis-converted",
-            wshape[1]
+             (weight cols {}, scales cols {} × group_size {group_size} ⇒ in_dim {in_dim}); either \
+             the snapshot is corrupt/mis-converted, or it was packed at a different group_size than \
+             the {group_size} this loader assumed",
+            wshape[1], sshape[1]
         )));
     }
     Ok(bits)

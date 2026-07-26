@@ -545,6 +545,62 @@ mod tests {
         );
     }
 
+    /// sc-15154 — the vision tower's packed geometry is only recoverable at **this crate's** group
+    /// size, so the shared `mlx_gen_boogu::VisionTower` must be handed it rather than assume one.
+    ///
+    /// The cheap (weights-free, Metal-free) half of the edit-path gate in
+    /// `tests/edit_quant_real_weights.rs`: pack the real published shape of
+    /// `model.visual.blocks.*.attn.qkv` through the real `quantize_map`, then ask the real loader
+    /// helper what it derives — at [`GROUP_SIZE`] (correct) and at Boogu's 32 (the constant the
+    /// shared tower baked in until sc-15154). It reproduces both shipped symptoms exactly.
+    #[test]
+    fn the_vision_tower_geometry_is_only_recoverable_at_this_crates_group_size() {
+        // Boogu's `quant::GROUP_SIZE` — 32, forced by its `3360 = 32·105` DiT hidden.
+        const BOOGU_GROUP_SIZE: i32 = 32;
+        // The published `model.visual.blocks.0.attn.qkv.weight`: 3·1024 out, 1024 in.
+        let base = "model.visual.blocks.0.attn.qkv";
+        for (bits, want_weight_cols) in [(4, 128), (8, 256)] {
+            let map = HashMap::from([(
+                format!("{base}.weight"),
+                Array::zeros::<f32>(&[3072, 1024]).unwrap(),
+            )]);
+            let out = quantize_map(map, bits, GROUP_SIZE, is_te_target).unwrap();
+            let wq = &out[&format!("{base}.weight")];
+            let scales = &out[&format!("{base}.scales")];
+            // Exactly the headers published for the q4 / q8 tiers.
+            assert_eq!(wq.shape(), [3072, want_weight_cols], "Q{bits} weight shape");
+            assert_eq!(scales.shape(), [3072, 1024 / GROUP_SIZE], "Q{bits} scales");
+            assert_eq!(
+                mlx_gen::quant::packed_bits(wq, scales, GROUP_SIZE).unwrap(),
+                bits,
+                "the loader must recover Q{bits} at the width the converter packed at"
+            );
+            // ...and must NOT recover it at Boogu's. The shapes are identical either way — the
+            // misread is invisible on disk and surfaces only in the derived numbers, which is why
+            // this is worth asserting rather than trusting the constant.
+            match mlx_gen::quant::packed_bits(wq, scales, BOOGU_GROUP_SIZE) {
+                // Q4 read at 32 derives a legal-looking 8 bits over a halved input dim: it LOADS
+                // and then dies in the first `quantized_matmul` — the shipped q4 symptom.
+                Ok(wrong) => assert_eq!(
+                    (bits, wrong),
+                    (4, 8),
+                    "only the Q4 misread may yield a legal width; Q{bits} must be rejected outright"
+                ),
+                // Q8 read at 32 derives 16 bits — rejected at load, the shipped q8 symptom. The
+                // message must name the assumed group size or the next reader re-hosts a good
+                // artifact on the strength of the word "corrupt".
+                Err(error) => {
+                    let error = error.to_string();
+                    assert_eq!(bits, 8, "only the Q8 misread errors: {error}");
+                    assert!(
+                        error.contains("group_size"),
+                        "must name the assumption: {error}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn tier_bits_maps_the_published_tiers_and_rejects_others() {
         assert_eq!(tier_bits("bf16").unwrap(), None);
