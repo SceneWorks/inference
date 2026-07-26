@@ -157,6 +157,9 @@ fn trainer_descriptor() -> TrainerDescriptor {
         supports_lokr: true,
         // LoRA/LoKr only — no control-branch training path.
         supports_control: false,
+        // The one trainer with a full base fine-tune path today (sc-14056 / epic 14034): it trains
+        // every DiT weight and writes a full checkpoint rather than an adapter.
+        supports_full_finetune: true,
     }
 }
 
@@ -291,6 +294,11 @@ impl Trainer for MageFlowTrainer {
         // Shared control-training floor: a LoRA-only trainer must reject a control-branch request
         // (typed `Unsupported`) rather than silently training a plain adapter.
         gen_core::train::validate_control_request(self.descriptor(), req)?;
+        // Shared full-base-fine-tune floor (sc-14056). This trainer advertises
+        // `supports_full_finetune`, so the floor is a pass-through here — it is routed through
+        // anyway so the capability claim and the acceptance stay one fact (and the conformance
+        // suite's validate-honesty check exercises the same seam for every family).
+        gen_core::train::validate_full_finetune_request(self.descriptor(), req)?;
         validate_request(req)?;
         // `lora_target_modules` only scopes the LoRA/LoKr adapter; a full base fine-tune trains every
         // DiT weight, so the target-resolution guard below does not apply to it.
@@ -1468,13 +1476,45 @@ mod tests {
     }
 
     #[test]
-    fn descriptor_advertises_lora_lokr_no_control_on_the_base_target() {
+    fn descriptor_advertises_lora_lokr_full_finetune_no_control_on_the_base_target() {
         let d = trainer_descriptor();
         assert_eq!(d.id, "mage_flow_base");
         assert_eq!(d.family, FAMILY);
         assert_eq!(d.backend, "mlx");
         assert!(d.supports_lora && d.supports_lokr);
         assert!(!d.supports_control);
+        // sc-14056: this is the one trainer with a full base fine-tune path, so it must ADVERTISE it —
+        // the shared `validate_full_finetune_request` floor turns a `false` here into a typed reject of
+        // every full-tune request, which would strand the capability behind its own capability flag.
+        assert!(d.supports_full_finetune);
+    }
+
+    /// The capability claim and the acceptance must be one fact: because this trainer advertises
+    /// `supports_full_finetune`, the shared floor must let a full request through `validate` — and it
+    /// must reject one on a descriptor that does not advertise it. Asserting only the boolean above
+    /// would not prove `validate` routes through the floor at all.
+    #[test]
+    fn validate_routes_through_the_full_finetune_floor() {
+        let desc = trainer_descriptor();
+        let req = base_request(
+            one_item(),
+            TrainingConfig {
+                full_finetune: true,
+                ..Default::default()
+            },
+        );
+        assert!(
+            gen_core::train::validate_full_finetune_request(&desc, &req).is_ok(),
+            "the Mage trainer advertises the full path, so the floor must admit it"
+        );
+
+        let mut adapter_only = desc;
+        adapter_only.supports_full_finetune = false;
+        let err = gen_core::train::validate_full_finetune_request(&adapter_only, &req).unwrap_err();
+        assert!(
+            matches!(err, gen_core::Error::Unsupported(_)),
+            "a trainer without the full path must reject, not silently train an adapter, got {err:?}"
+        );
     }
 
     #[test]

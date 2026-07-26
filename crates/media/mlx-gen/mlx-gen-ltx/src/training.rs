@@ -115,6 +115,9 @@ fn trainer_descriptor() -> TrainerDescriptor {
         // No control-branch training path (F-006). The LTX trainer must reject a control request
         // rather than silently training a plain LoRA (F-055).
         supports_control: false,
+        // Adapter-only: no full base fine-tune path (sc-14056). The shared
+        // `validate_full_finetune_request` floor makes a `full_finetune` request a typed reject.
+        supports_full_finetune: false,
     }
 }
 
@@ -236,6 +239,9 @@ impl Trainer for LtxTrainer {
         // request carrying `control_type` / per-item control images is rejected (typed `Unsupported`)
         // rather than silently training a plain LoRA and reporting success.
         gen_core::train::validate_control_request(self.descriptor(), req)?;
+        // Shared full-base-fine-tune floor (sc-14056): an adapter-only trainer must reject a
+        // `full_finetune` request (typed `Unsupported`) rather than silently training a LoRA.
+        gen_core::train::validate_full_finetune_request(self.descriptor(), req)?;
         // Single-use enforcement (F-055): `train` frees the Gemma text encoder + tokenizer (~24 GB)
         // after the embed cache, so a second `train` on the same instance can't re-encode. Fail here,
         // up front (validate runs before any progress is emitted), instead of with a late, confusing

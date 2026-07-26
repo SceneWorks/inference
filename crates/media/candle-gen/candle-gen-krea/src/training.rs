@@ -244,6 +244,9 @@ pub fn trainer_descriptor() -> TrainerDescriptor {
         // main between this crate's prior gen-core pin and the footprint-seam re-pin; the base LoRA/LoKr
         // trainer does not train a control branch (mirrors mlx-gen-krea's `false`).
         supports_control: false,
+        // Adapter-only: no full base fine-tune path (sc-14056). The shared
+        // `validate_full_finetune_request` floor makes a `full_finetune` request a typed reject.
+        supports_full_finetune: false,
     }
 }
 
@@ -287,6 +290,10 @@ impl Trainer for KreaTrainer {
     }
 
     fn validate(&self, req: &TrainingRequest) -> gen_core::Result<()> {
+        // Shared full-base-fine-tune floor (sc-14056): an adapter-only trainer must reject a
+        // `full_finetune` request (typed `Unsupported`) rather than silently training a LoRA
+        // adapter the caller did not ask for (F-006/F-055).
+        gen_core::train::validate_full_finetune_request(self.descriptor(), req)?;
         validate_flow_match_request(req, LABEL).map_err(Into::into)
     }
 
