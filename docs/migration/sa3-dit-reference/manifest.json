@@ -1,0 +1,225 @@
+{
+  "artifact": {
+    "bytes": 3075888,
+    "file": "dit-intermediates.safetensors",
+    "sha256": "3e91409679043ac9c825eb7a1d28ea57989796e5a701d82238a9951692ad2083",
+    "tensors": {
+      "combined_global": {
+        "dtype": "F32",
+        "sha256": "179a415665cf94c389162d2b40af91524700f6bda1a72798a621c1883351e804",
+        "shape": [
+          1,
+          1024
+        ]
+      },
+      "duration_global": {
+        "dtype": "F32",
+        "sha256": "29506cc1ee369beee1d4fecf9e35d06e77882330ee5cb5d27260929bff319a4f",
+        "shape": [
+          1,
+          1024
+        ]
+      },
+      "global_modulation": {
+        "dtype": "F32",
+        "sha256": "f0a7a073da6c729bd56ffd0107c4dda727d866e32762bae84763c9d4ceda2202",
+        "shape": [
+          1,
+          6144
+        ]
+      },
+      "layer0_local": {
+        "dtype": "F32",
+        "sha256": "b3cf72c859936484d71960baf31acf32dd1898e79fb1fd1d34a23a73332816a0",
+        "shape": [
+          1,
+          80,
+          1024
+        ]
+      },
+      "layer0_output": {
+        "dtype": "F32",
+        "sha256": "921f8e382dc40c554f4975b94079aa773fdd31bc74fa4391a6da46a358351718",
+        "shape": [
+          1,
+          80,
+          1024
+        ]
+      },
+      "number_embedding": {
+        "dtype": "F32",
+        "sha256": "8097990249af6c03da545d2ab9a84ccd0da2e99c0b54be623f4ed5191c0ee41f",
+        "shape": [
+          1,
+          768
+        ]
+      },
+      "number_features": {
+        "dtype": "F32",
+        "sha256": "2c63b92d19dbb6a8966583d63a5cc507dd3a4262747c9e52546a127df245a06f",
+        "shape": [
+          1,
+          256
+        ]
+      },
+      "output": {
+        "dtype": "F32",
+        "sha256": "b8c7894b83d96144af297f987fd6b190d2caccc200fff522636e2e98e4b1d9a5",
+        "shape": [
+          1,
+          256,
+          16
+        ]
+      },
+      "padding_mask": {
+        "dtype": "U8",
+        "sha256": "3cda893eb18b58e6bf19bae09cd9cdd08450668b0d367b909b527ddadab7232c",
+        "shape": [
+          1,
+          16
+        ]
+      },
+      "partial_padding_output": {
+        "dtype": "F32",
+        "sha256": "28111928b5b205549386420eee2eeb500a4cc82c06a819e2fbb1a940e081c886",
+        "shape": [
+          1,
+          256,
+          16
+        ]
+      },
+      "preprocessed": {
+        "dtype": "F32",
+        "sha256": "28d6f3074e5233c3827e1a1d969fe591c07819562e1202823abdb11389276242",
+        "shape": [
+          1,
+          256,
+          16
+        ]
+      },
+      "projected_context": {
+        "dtype": "F32",
+        "sha256": "e2676dfdf1ebd234b5ab00aad0cf873188bf7d3274b4702fd30626b90ff279f2",
+        "shape": [
+          1,
+          257,
+          1024
+        ]
+      },
+      "projected_input": {
+        "dtype": "F32",
+        "sha256": "353105a853ee4889dca7a40910722635f758285d015af3ee60445dcb25e3b077",
+        "shape": [
+          1,
+          16,
+          1024
+        ]
+      },
+      "projected_output": {
+        "dtype": "F32",
+        "sha256": "c3e08416c903d913725064ae92a620074844c80dc56b40e2884c9d56277b1af0",
+        "shape": [
+          1,
+          16,
+          256
+        ]
+      },
+      "raw_context": {
+        "dtype": "F32",
+        "sha256": "cce723d586ff83161d722cb2faebf17cdf91b1b0cd45384b9eef6892cc743671",
+        "shape": [
+          1,
+          257,
+          768
+        ]
+      },
+      "rotary_frequencies": {
+        "dtype": "F32",
+        "sha256": "f49f3e925c636aa54bcef1be6d03ee9c75d7e8dcf83cb64ba061e18e1603a137",
+        "shape": [
+          80,
+          32
+        ]
+      },
+      "timestep_embedding": {
+        "dtype": "F32",
+        "sha256": "12f8a4db675adcb39cefb5b11f1154355dd867419d035e54cc031af9670f7381",
+        "shape": [
+          1,
+          1024
+        ]
+      },
+      "timestep_features": {
+        "dtype": "F32",
+        "sha256": "9552c9c31811dabd88d3e24eca0a7bbb539323b12931a13fe4ad392272c60c4c",
+        "shape": [
+          1,
+          256
+        ]
+      },
+      "trimmed": {
+        "dtype": "F32",
+        "sha256": "45cd798a3e5939fa637e4273d95d4adbd1555ffb0f2de2ed173dbcd0553866fa",
+        "shape": [
+          1,
+          16,
+          1024
+        ]
+      },
+      "with_memory": {
+        "dtype": "F32",
+        "sha256": "ffbd2bc5d61aeb1ed7da672cd4fb97361c702ea543891a6115dba4a6ffa59d35",
+        "shape": [
+          1,
+          80,
+          1024
+        ]
+      }
+    }
+  },
+  "inputs": {
+    "crossMask": null,
+    "latentShape": [
+      1,
+      256,
+      16
+    ],
+    "localOrder": [
+      "inpaint_mask",
+      "inpaint_masked_input"
+    ],
+    "paddingSemantics": "zero-v-only",
+    "promptShape": [
+      1,
+      256,
+      768
+    ],
+    "secondsTotal": 0.25,
+    "seed": 14534,
+    "timestep": 0.5
+  },
+  "p0Sha256": "b0ac8d572840d1cd9e1046e4734c6c286a7f2664e388758e508b4aab89c25296",
+  "runtime": {
+    "python": "3.12.13",
+    "torch": "2.7.1",
+    "transformers": "5.8.0"
+  },
+  "schemaVersion": 1,
+  "snapshot": {
+    "configSha256": "100776f25af5aa83f70e0c6b384de6690cb4e5ad01c24f7cfbb6524d18765f06",
+    "modelSha256": "da85866b11b01d0694d990785f6abbd79c8064df1b0e6f8aea52935e0ef84b64",
+    "repository": "stabilityai/stable-audio-3-small-music",
+    "revision": "0fef1392cd842149a2b6d445e181c97608faac06"
+  },
+  "story": "sc-14541",
+  "upstream": {
+    "commit": "124e8a799f57a1f665495ecb72e547d0a62867f1",
+    "sourceSha256": {
+      "stable_audio_3/models/blocks.py": "eae8aaa6eeee47d39b2276caea12627413ecd2816a61be5cce126453a69c3f01",
+      "stable_audio_3/models/conditioners.py": "11d3496a04c8390f0de2ea869e7188c621d97859734bef4930027ff626989a47",
+      "stable_audio_3/models/diffusion.py": "b0eab27f7965b4a21a34bf009c932128217524c09cddbfd601bffe866e4b6732",
+      "stable_audio_3/models/dit.py": "4b28dcb74937cdcab9ab5f745221178304f998f53aa60d2ee9e74b8fa76fd4fb",
+      "stable_audio_3/models/transformer.py": "7436d5d1f040ed74af38899ca57c1eb7b6f3ee5e5c27a3e7402f39f22a52a83a"
+    }
+  }
+}

@@ -828,6 +828,14 @@ impl TransformerBlock {
         }
     }
 
+    /// Project one block's local conditioning for provenance-locked parity traces.
+    pub fn project_local(&self, input: &Tensor, target_len: usize) -> Result<Option<Tensor>> {
+        self.local
+            .as_ref()
+            .map(|local| local.forward(input, target_len))
+            .transpose()
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
