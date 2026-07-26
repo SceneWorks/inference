@@ -8,6 +8,8 @@ use candle_core::{Error, Result};
 
 pub const FAMILY: &str = "mage_flow";
 pub const MODEL_ID: &str = "mage_flow";
+pub const BASE_MODEL_ID: &str = "mage_flow_base";
+pub const TURBO_MODEL_ID: &str = "mage_flow_turbo";
 pub const EDIT_MODEL_ID: &str = "mage_flow_edit";
 pub const EDIT_BASE_MODEL_ID: &str = "mage_flow_edit_base";
 pub const EDIT_TURBO_MODEL_ID: &str = "mage_flow_edit_turbo";

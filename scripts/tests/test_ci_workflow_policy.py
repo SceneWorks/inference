@@ -185,7 +185,14 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn('set "MAGE_CONFORMANCE_FAILED=0"', workflow)
         self.assertEqual(
             workflow.count('|| set "MAGE_CONFORMANCE_FAILED=1"'),
-            4,
+            5,
+        )
+        self.assertIn("for %%T in (q4 q8 bf16) do (", workflow)
+        self.assertIn(
+            "--test quant_real_weights "
+            "registered_tier_matches_independent_oracle_and_vram_budget "
+            "-- --ignored --nocapture || set \"MAGE_CONFORMANCE_FAILED=1\"",
+            workflow,
         )
         self.assertIn(
             'if not "%MAGE_CONFORMANCE_FAILED%"=="0" exit /b 1',

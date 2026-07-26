@@ -8,6 +8,7 @@ pub mod config;
 pub mod edit_provider;
 pub mod latent;
 pub mod pipeline;
+pub mod quant;
 pub mod rope;
 pub mod scheduler;
 pub mod text_encoder;
@@ -31,31 +32,52 @@ use candle_gen::gen_core::{
 };
 use sha2::{Digest, Sha256};
 
-pub fn descriptor() -> ModelDescriptor {
+fn generation_descriptor(
+    id: &'static str,
+    supports_guidance: bool,
+    supports_negative_prompt: bool,
+) -> ModelDescriptor {
     ModelDescriptor {
-        id: MODEL_ID,
+        id,
         family: config::FAMILY,
         backend: "candle",
         modality: Modality::Image,
         required_components: &[],
         capabilities: Capabilities {
-            supports_negative_prompt: true,
-            supports_guidance: true,
+            supports_negative_prompt,
+            supports_guidance,
             min_size: config::MIN_SIZE,
             max_size: config::MAX_SIZE,
             max_count: 8,
             mac_only: false,
-            // sc-14051 is the dense RL generation lane. Quantized loading is a separate story.
-            supported_quants: &[],
+            supported_quants: &[
+                candle_gen::gen_core::Quant::Q4,
+                candle_gen::gen_core::Quant::Q8,
+            ],
             ..Default::default()
         },
     }
+}
+
+pub fn descriptor() -> ModelDescriptor {
+    generation_descriptor(MODEL_ID, true, true)
+}
+
+pub fn descriptor_base() -> ModelDescriptor {
+    generation_descriptor(config::BASE_MODEL_ID, true, true)
+}
+
+pub fn descriptor_turbo() -> ModelDescriptor {
+    generation_descriptor(config::TURBO_MODEL_ID, false, false)
 }
 
 pub struct MageGenerator {
     descriptor: ModelDescriptor,
     root: PathBuf,
     device: candle_core::Device,
+    quant: Option<candle_gen::gen_core::Quant>,
+    default_steps: u32,
+    default_guidance: f32,
     components: Mutex<Option<Arc<MagePipeline>>>,
 }
 
@@ -64,6 +86,7 @@ pub struct MageEditGenerator {
     root: PathBuf,
     variant: MageEditVariant,
     device: candle_core::Device,
+    quant: Option<candle_gen::gen_core::Quant>,
     components: Mutex<Option<Arc<MageEdit>>>,
 }
 
@@ -71,7 +94,7 @@ impl MageEditGenerator {
     fn components(&self) -> gen_core::Result<Arc<MageEdit>> {
         candle_gen::cached(&self.components, || {
             verify_edit_checkpoint(&self.root, self.variant)?;
-            MageEdit::load(&self.root, &self.device)
+            MageEdit::load_with_quant(&self.root, self.quant, &self.device)
                 .map(Arc::new)
                 .map_err(candle_gen::CandleError::from)
         })
@@ -269,7 +292,7 @@ fn resolve_edit_references(
 impl MageGenerator {
     fn components(&self) -> gen_core::Result<Arc<MagePipeline>> {
         candle_gen::cached(&self.components, || {
-            MagePipeline::load(&self.root, &self.device)
+            MagePipeline::load_with_quant(&self.root, self.quant, &self.device)
                 .map(Arc::new)
                 .map_err(candle_gen::CandleError::from)
         })
@@ -325,8 +348,8 @@ impl Generator for MageGenerator {
                         req.negative_prompt.as_deref().unwrap_or(" "),
                         req.width,
                         req.height,
-                        req.steps.unwrap_or(20) as usize,
-                        req.guidance.unwrap_or(5.0),
+                        req.steps.unwrap_or(self.default_steps) as usize,
+                        req.guidance.unwrap_or(self.default_guidance),
                         base_seed.wrapping_add(index as u64),
                         on_progress,
                     )
@@ -337,10 +360,15 @@ impl Generator for MageGenerator {
     }
 }
 
-pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
-    if spec.quantize.is_some() {
+fn load_generation_variant(
+    spec: &LoadSpec,
+    descriptor: ModelDescriptor,
+    default_steps: u32,
+    default_guidance: f32,
+) -> gen_core::Result<Box<dyn Generator>> {
+    if matches!(spec.quantize, Some(candle_gen::gen_core::Quant::Nvfp4)) {
         return Err(gen_core::Error::Unsupported(
-            "mage_flow RL generation currently supports dense weights only".into(),
+            "mage_flow does not support NVFP4".into(),
         ));
     }
     let root = match &spec.weights {
@@ -362,11 +390,26 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     }
     let device = candle_gen::default_device()?;
     Ok(Box::new(MageGenerator {
-        descriptor: descriptor(),
+        descriptor,
         root,
         device,
+        quant: spec.quantize,
+        default_steps,
+        default_guidance,
         components: Mutex::new(None),
     }))
+}
+
+pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    load_generation_variant(spec, descriptor(), 20, 5.0)
+}
+
+pub fn load_base(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    load_generation_variant(spec, descriptor_base(), 30, 5.0)
+}
+
+pub fn load_turbo(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    load_generation_variant(spec, descriptor_turbo(), 4, 1.0)
 }
 
 pub fn edit_descriptor(variant: MageEditVariant) -> ModelDescriptor {
@@ -390,7 +433,10 @@ pub fn edit_descriptor(variant: MageEditVariant) -> ModelDescriptor {
             max_size: config::MAX_SIZE,
             max_count: 8,
             mac_only: false,
-            supported_quants: &[],
+            supported_quants: &[
+                candle_gen::gen_core::Quant::Q4,
+                candle_gen::gen_core::Quant::Q8,
+            ],
             ..Default::default()
         },
     }
@@ -412,9 +458,9 @@ fn load_edit_variant(
     spec: &LoadSpec,
     variant: MageEditVariant,
 ) -> gen_core::Result<Box<dyn Generator>> {
-    if spec.quantize.is_some() {
+    if matches!(spec.quantize, Some(candle_gen::gen_core::Quant::Nvfp4)) {
         return Err(gen_core::Error::Unsupported(format!(
-            "{} currently supports dense weights only",
+            "{} does not support NVFP4",
             variant.id()
         )));
     }
@@ -443,6 +489,7 @@ fn load_edit_variant(
         root,
         variant,
         device,
+        quant: spec.quantize,
         components: Mutex::new(None),
     }))
 }
@@ -463,6 +510,12 @@ candle_gen::register_generators! {
     pub const REGISTRATION = descriptor => load
 }
 candle_gen::register_generators! {
+    pub const BASE_REGISTRATION = descriptor_base => load_base
+}
+candle_gen::register_generators! {
+    pub const TURBO_REGISTRATION = descriptor_turbo => load_turbo
+}
+candle_gen::register_generators! {
     pub const EDIT_REGISTRATION = descriptor_edit => load_edit
 }
 candle_gen::register_generators! {
@@ -477,6 +530,8 @@ pub fn register_providers(
 ) -> gen_core::ProviderRegistryBuilder {
     registry
         .register_generator(REGISTRATION)
+        .register_generator(BASE_REGISTRATION)
+        .register_generator(TURBO_REGISTRATION)
         .register_generator(EDIT_REGISTRATION)
         .register_generator(EDIT_BASE_REGISTRATION)
         .register_generator(EDIT_TURBO_REGISTRATION)
@@ -498,6 +553,8 @@ mod registry_tests {
             ids,
             [
                 "mage_flow",
+                "mage_flow_base",
+                "mage_flow_turbo",
                 "mage_flow_edit",
                 "mage_flow_edit_base",
                 "mage_flow_edit_turbo"
@@ -596,15 +653,21 @@ mod registry_tests {
     }
 
     #[test]
-    fn quantized_loading_is_not_advertised_or_silently_ignored() {
+    fn quantized_loading_is_advertised_and_reaches_the_lazy_generator() {
         use candle_gen::gen_core::Quant;
 
-        assert!(descriptor().capabilities.supported_quants.is_empty());
+        assert_eq!(
+            descriptor().capabilities.supported_quants,
+            &[Quant::Q4, Quant::Q8]
+        );
         let mut spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
         spec.quantize = Some(Quant::Q4);
-        let err = load(&spec)
-            .err()
-            .expect("quantized loading must be rejected");
-        assert!(err.to_string().contains("dense weights only"), "{err}");
+        let generator = load(&spec).expect("q4 must reach the production lazy generator");
+        assert_eq!(
+            generator.descriptor().capabilities.supported_quants,
+            &[Quant::Q4, Quant::Q8]
+        );
+        spec.quantize = Some(Quant::Nvfp4);
+        assert!(load(&spec).is_err(), "unsupported NVFP4 must fail loudly");
     }
 }

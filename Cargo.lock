@@ -486,6 +486,7 @@ dependencies = [
  "candle-gen-krea",
  "candle-gen-lens",
  "candle-gen-ltx",
+ "candle-gen-mage",
  "candle-gen-mochi",
  "candle-gen-pid",
  "candle-gen-pulid",
