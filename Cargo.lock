@@ -2135,6 +2135,7 @@ dependencies = [
  "mlx-gen-joycaption",
  "mlx-gen-kolors",
  "mlx-gen-krea",
+ "mlx-gen-krea-realtime",
  "mlx-gen-lens",
  "mlx-gen-ltx",
  "mlx-gen-mage",

@@ -52,21 +52,41 @@
 //! blog describes (a negative bias on past-frame scores) is *not* present in the open-source code and no
 //! magnitude is specified — so none is invented here.
 //!
-//! **VAE decode / clip assembly / `Generator` registration** (S6, including the first-frame VAE
-//! re-anchor that re-encodes the first output frame — needs the VAE) and **i2v/v2v conditioning** (S7)
-//! remain deferred; long-clip coherence measurement with real weights is S13.
+//! * [`t2v`] — **S6**: the text-to-video pipeline orchestration — `prompt → UMT5 encode → context →
+//!   [`generate_latents`] → z16 Wan VAE decode → assembled clip` ([`t2v::generate_t2v`]), with the
+//!   weight-free component seam [`t2v::generate_t2v_from_components`] and the Mac streaming-window bound
+//!   ([`t2v::mac_ar_config`], the sc-8438 S5 follow-up). The VAE decode + `frames_to_images` clip
+//!   assembly reuse `mlx_gen_wan` (`decode_to_frames`). BATCH form = whole-latent single-pass decode;
+//!   the streaming per-chunk feat-cached decode is the realtime path (streaming epic).
+//! * [`pipeline`] — **S6**: the registered [`mlx_gen::Generator`] ([`pipeline::KreaRealtime`]) + its
+//!   [`pipeline::descriptor`] (text-to-video, **CFG-off**, the Self-Forcing few-step sampler) +
+//!   [`register_providers`], so `provider_registry().load("krea_realtime_14b", spec)` yields a working
+//!   provider. The crate is composed into the platform via `mlx-gen-catalog` (explicit composition, not
+//!   linker discovery).
 //!
-//! The converter and load path are validated against the S1 tensor inventory with synthesized
-//! fixtures (`tests/`) — never the real 28.58 GB checkpoint. Real-weight byte-parity validation and
-//! the MLX rehost to the SceneWorks HF org are the **gated** S2 remainder, tracked on sc-8435; a
-//! registered `Generator` is deferred to S6.
+//! The reference's **first-frame VAE re-anchor** (`release_server.py::get_clean_context_frames`,
+//! re-encoding the first decoded output frame as a persistent clean-context anchor) re-encodes decoded
+//! pixels *mid-generation*, so that *mechanism* is streaming-coupled and correctly out of this batch path
+//! (which decodes once at the end). But the bounded Mac window runs for every clip and the shipped 14B
+//! config sets `sink_size = 0` — so the always-attended sink prefix is empty and a long batch clip slides
+//! its window with **no** persistent anchor, a real long-range coherence risk **tracked as sc-15127
+//! (S18)** and measured on the gated real-weight run (see [`t2v::generate_t2v_from_components`]).
+//! **i2v/v2v conditioning** is **S7**.
+//!
+//! The converter, load, AR, and pipeline paths are validated against the S1 tensor inventory with
+//! synthesized / tiny random-weight fixtures (`tests/`) — never the real 28.58 GB checkpoint. The
+//! **real-weight watchable-clip e2e** (the real 28 GB DiT + stock Wan VAE/UMT5 → a watchable t2v clip)
+//! is the **gated** S6 remainder, overlapping the S13 real-weight validation; the MLX rehost to the
+//! SceneWorks HF org is the gated S2 remainder (sc-8435).
 
 pub mod causal;
 pub mod config;
 pub mod convert;
 pub mod generate;
 pub mod load;
+pub mod pipeline;
 pub mod scheduler;
+pub mod t2v;
 
 pub use causal::{
     block_causal_mask, build_block_causal_mask, CausalKreaTransformer, CausalKvCache,
@@ -81,8 +101,71 @@ pub use load::{
     expected_transformer_tensors, load_krea_realtime_transformer, verify_transformer_tensors,
     TensorSpec,
 };
+pub use pipeline::{descriptor, load as load_generator, KreaRealtime, SELF_FORCING_SAMPLER};
 pub use scheduler::{euler_x0, renoise_step, FewStepSchedule, NUM_TRAIN_TIMESTEPS};
+pub use t2v::{
+    decode_latents_to_video, generate_t2v, generate_t2v_from_components, mac_ar_config,
+    KreaRealtimeJob,
+};
 
 // Re-export the reused Wan config type so callers can name the DiT dimensions without a direct
 // `mlx-gen-wan` dependency.
 pub use mlx_gen_wan::config::WanModelConfig;
+
+/// Add the MLX Krea Realtime provider to an explicit media registry builder. Composed by the platform
+/// catalog (explicit, never linker-discovered) — see `mlx-gen-catalog`.
+pub fn register_providers(
+    registry: mlx_gen::gen_core::ProviderRegistryBuilder,
+) -> mlx_gen::gen_core::ProviderRegistryBuilder {
+    registry.register_generator(pipeline::REGISTRATION)
+}
+
+/// Build the complete explicit MLX Krea Realtime provider catalog.
+pub fn provider_registry() -> mlx_gen::gen_core::Result<mlx_gen::gen_core::ProviderRegistry> {
+    register_providers(mlx_gen::gen_core::ProviderRegistryBuilder::new()).build()
+}
+
+#[cfg(test)]
+mod explicit_registry_tests {
+    /// The crate's explicit catalog exposes exactly the registered `krea_realtime_14b` generator, and
+    /// `provider_registry().load("krea_realtime_14b", spec)` resolves it (a real load would then stage
+    /// weights — here we only assert the id is discoverable + routable). Weights-free.
+    #[test]
+    fn explicit_catalog_has_stable_surface() {
+        let registry = super::provider_registry().unwrap();
+        let explicit: Vec<String> = registry
+            .generators()
+            .map(|registration| (registration.descriptor)().id.to_string())
+            .collect();
+        assert_eq!(explicit, ["krea_realtime_14b"]);
+        // The descriptor sweep passes for the whole (one-generator) catalog.
+        assert_eq!(
+            registry.descriptor_conformance_errors(),
+            Vec::<String>::new()
+        );
+
+        // `load(id, spec)` routes to this provider by id (it fails on the nonexistent snapshot dir, not
+        // on an unknown id) — proving `mlx_gen::load("krea_realtime_14b", spec)` reaches the generator.
+        use mlx_gen::{LoadSpec, WeightsSource};
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent-krea-realtime".into()));
+        let err = registry
+            .load("krea_realtime_14b", &spec)
+            .err()
+            .expect("nonexistent snapshot must fail to load")
+            .to_string();
+        assert!(
+            err.contains("does not exist") || err.contains("snapshot"),
+            "expected a snapshot-load error (id resolved), got: {err}"
+        );
+        // An unknown id is a distinct error.
+        let unknown = registry
+            .load("not_a_model", &spec)
+            .err()
+            .expect("unknown id must fail")
+            .to_string();
+        assert!(
+            unknown.contains("no generator registered"),
+            "got: {unknown}"
+        );
+    }
+}
