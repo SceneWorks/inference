@@ -313,3 +313,99 @@ fn generate_latents_rejects_geometry_mismatch() {
         .expect_err("mismatched per-frame token count must be rejected");
     assert!(err.to_string().contains("frame_seq_length"), "err: {err}");
 }
+
+/// S5 clean-context KV recompute (sc-8438), through the real tiny causal transformer. With recompute
+/// **on** (the shipped default) the chunk's committed self-attention K/V is the clean-context rerun's
+/// (on the clean `x0` at `context_noise`); with recompute **off** (the S4 baseline) it is the near-clean
+/// final-denoise-step's. Both commit exactly once per chunk (identical committed token count), but the
+/// committed K/V **differ** — proving the recompute genuinely commits the clean-context forward, not the
+/// noisy final step. Same seed/model/context isolate the recompute as the only variable.
+#[test]
+fn recompute_commits_clean_context_kv_distinct_from_s4_baseline() {
+    let (causal, cfg_on, ctx) = setup();
+    assert!(
+        cfg_on.ar.do_kv_recomp,
+        "shipped reference default is recompute on"
+    );
+    let mut cfg_off = cfg_on.clone();
+    cfg_off.ar.do_kv_recomp = false;
+
+    let p = params(7, 2, None); // one chunk (num_frames == num_frames_per_block == 2)
+    let fsl = cfg_on.ar.frame_seq_length;
+
+    let mut cache_on = causal.new_cache();
+    let _out_on = generate_latents_into(&causal, &cfg_on, &ctx, &p, &mut cache_on).unwrap();
+    let mut cache_off = causal.new_cache();
+    let _out_off = generate_latents_into(&causal, &cfg_off, &ctx, &p, &mut cache_off).unwrap();
+
+    // Exactly one commit per chunk in both modes ⇒ identical committed token count.
+    assert_eq!(cache_on.stored_tokens(), 2 * fsl);
+    assert_eq!(
+        cache_off.stored_tokens(),
+        cache_on.stored_tokens(),
+        "one commit per chunk regardless of recompute"
+    );
+
+    // The committed K differs: recompute-on stores the clean-context forward's K, recompute-off the
+    // near-clean final-denoise-step's.
+    let (k_on, _) = cache_on.layer_kv(0).expect("on cache populated");
+    let (k_off, _) = cache_off.layer_kv(0).expect("off cache populated");
+    assert_eq!(k_on.shape(), k_off.shape());
+    assert!(
+        max_abs_diff(k_on, k_off) > 0.0,
+        "recompute must commit clean-context K/V distinct from the S4 near-clean-final-step K/V"
+    );
+}
+
+/// Bounded (streaming) window (sc-8438): a clip several windows long must (a) generate the correct
+/// latents, (b) keep physical KV storage bounded to the window (eviction — not the full clip), and
+/// (c) read only the last `max_attention_size` tokens each chunk without OOB. The window unit is the
+/// reference's `local_attn_size × frame_seq_length` (frames), and the AR loop drives the windowed read.
+#[test]
+fn bounded_window_long_clip_stays_bounded_no_oob() {
+    let mut cfg = tiny_cfg();
+    cfg.ar.local_attn_size = 3; // 3 frames ⇒ max_attention_size = 3 × frame_seq_length
+    let fsl = cfg.ar.frame_seq_length; // 4
+    let window = cfg.ar.max_attention_size();
+    assert_eq!(
+        window,
+        3 * fsl,
+        "reference unit: local_attn_size frames × frame_seq_length"
+    );
+
+    let dit = load_krea_realtime_transformer(native_random_map(&cfg), &cfg).expect("load tiny DiT");
+    let causal = CausalKreaTransformer::new(dit, &cfg);
+    let ctx = det_fill(
+        &[cfg.wan.text_len as i32, cfg.wan.text_dim as i32],
+        99,
+        1.0,
+        0.0,
+    )
+    .as_dtype(Dtype::Float32)
+    .unwrap();
+
+    // 8 frames, fpb 2 ⇒ 4 chunks; committed 8·fsl = 32 ≫ window 12.
+    let mut cache = causal.new_cache();
+    let out = generate_latents_into(&causal, &cfg, &ctx, &params(5, 8, None), &mut cache).unwrap();
+
+    assert_eq!(
+        out.shape(),
+        &[cfg.wan.out_dim as i32, 8, 4, 4],
+        "correct latents despite windowed eviction"
+    );
+    assert_eq!(
+        cache.stored_tokens(),
+        8 * fsl,
+        "global committed count keeps growing"
+    );
+    assert!(
+        cache.retained_tokens() < 8 * fsl,
+        "eviction must actually happen for a clip longer than the window"
+    );
+    assert!(
+        cache.retained_tokens() <= window + cfg.ar.num_frames_per_block * fsl,
+        "physical KV storage stays bounded to the window (+ at most one chunk): {} (clip {})",
+        cache.retained_tokens(),
+        8 * fsl
+    );
+}
