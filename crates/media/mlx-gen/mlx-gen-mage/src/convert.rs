@@ -33,6 +33,23 @@
 //!   0.1647 GB (1.8%) from q4 packing, because the VAE is conv-dominated. Shipping it dense also
 //!   keeps the sc-14046 memory envelope exactly as measured, since `vae.quantize` still runs at
 //!   load.
+//!
+//! # Precision floors — why the Q4 tier is not uniformly Q4 (sc-15071)
+//!
+//! Two projections tolerate 8 bits and not 4. Packed uniformly at Q4 the tier did not render the
+//! prompt at all — it produced a repeating tiled texture — so these are correctness floors, not
+//! quality preferences. [`quant_floor_bits`] is the single seam both the offline converter here and
+//! the load-time `quantize` methods call, so an artifact and a load-time tier cannot disagree.
+//!
+//! | base | floor | why |
+//! |---|---|---|
+//! | `norm_out.linear` | 8 | The output head's `AdaLayerNormContinuous` modulation. Its `scale`/`shift` come from `temb` — one vector per pack segment — so its error is a coherent per-channel distortion applied identically to every token, immediately after a non-affine LayerNorm has erased each token's own scale and with nothing downstream to dilute it. At Q4, on 0.5% of the DiT's parameters, it does 4× the damage of the next-worst group. |
+//! | `model.language_model.layers.*` | 8 | The 36 Qwen3-VL decoder layers; the SwiGLU MLP specifically. The Wan/UMT5 text-encoder-floor precedent. Q4 text and Q4 image weights are not independently tolerable errors — each alone is recoverable, together they are not. |
+//!
+//! The token embedding, the vision tower and every other DiT projection keep the tier's own width;
+//! flooring them buys nothing measurable and costs real bytes. Full per-group measurements are on
+//! the two constants in `crate::quant`, and the executable proof is the mutation probe in
+//! `tests/quant_real_weights.rs`.
 
 use std::path::Path;
 
@@ -41,7 +58,7 @@ use mlx_gen::quant::{
 };
 use mlx_gen::{Error, Result};
 
-use crate::quant::GROUP_SIZE;
+use crate::quant::{floor_bits, FINAL_MOD_BASE, GROUP_SIZE, LM_LAYER_PREFIX};
 use crate::transformer::{TRANSFORMER_CONFIG_FILE, TRANSFORMER_WEIGHTS_FILE};
 
 /// The tier subdirectory names the SceneWorks mirrors publish, in quality order.
@@ -67,6 +84,17 @@ pub fn tier_bits(tier: &str) -> Result<Option<i32>> {
 // backstop, so these are faithfulness + documentation — EXCEPT where noted, where the predicate is
 // the ONLY thing standing between a correct tier and a silently broken one.
 // ============================================================================================
+
+/// The bit-width a packable `base` is written at when tier `requested` was asked for.
+///
+/// `requested` for almost everything; **8** for the two projections that do not survive 4 bits (see
+/// the "Precision floors" section of this module's docs). This is the only place either floor is
+/// decided — the converters below and the load-time `quantize` methods all route through it, so a
+/// pre-quantized artifact and load-time quantization cannot drift apart. `a_packed_tier_renders_\
+/// identically_to_load_time_quantization` asserts that equality end to end (max_abs 0).
+pub fn quant_floor_bits(base: &str, requested: i32) -> i32 {
+    floor_bits(base, requested)
+}
 
 /// DiT dense-passthrough suffixes — the qk-RMSNorm scales, all 1-D.
 const DIT_DENSE_NORM_SUFFIXES: &[&str] = &[".norm_q", ".norm_k", ".norm_added_q", ".norm_added_k"];
@@ -132,8 +160,24 @@ pub fn quantize_mage_transformer(src: &Path, dst: &Path, bits: Option<i32>) -> R
         copy_asset(src, dst, TRANSFORMER_CONFIG_FILE)?;
         return Ok(());
     };
-    let map = quantize_map(load_dir_map(src)?, bits, GROUP_SIZE, is_dit_target)?;
+    // Two passes, because `norm_out.linear` has an 8-bit floor (sc-15071 — a uniformly-Q4 DiT
+    // renders a tiled texture instead of the prompt; see `crate::quant::FINAL_MOD_MIN_BITS`).
+    // Pass 2 re-reads pass 1's output, but its predicate matches only the still-dense floor base,
+    // so already-packed codes are passed straight through rather than re-quantized.
+    let map = quantize_map(load_dir_map(src)?, bits, GROUP_SIZE, |base| {
+        is_dit_target(base) && base != FINAL_MOD_BASE
+    })?;
+    let map = quantize_map(
+        map,
+        quant_floor_bits(FINAL_MOD_BASE, bits),
+        GROUP_SIZE,
+        |base| base == FINAL_MOD_BASE,
+    )?;
     save_map(&dst.join(TRANSFORMER_WEIGHTS_FILE), &map)?;
+    // The marker records the TIER, not a per-tensor width: `packed_quant_bits` uses it only to
+    // decide whether load-time quantization still has to run, while the loaders derive each
+    // tensor's actual bit-width from its packed shapes (`mlx_gen::quant::packed_bits`). A Q4 tier
+    // whose head modulation is packed at 8 is therefore still, correctly, `bits: 4`.
     write_quantized_config(src, dst, bits, GROUP_SIZE)
 }
 
@@ -162,7 +206,21 @@ pub fn quantize_mage_text_encoder(src: &Path, dst: &Path, bits: Option<i32>) -> 
     std::fs::create_dir_all(dst)?;
     let map = load_dir_map(src)?;
     let map = match bits {
-        Some(bits) => quantize_map(map, bits, GROUP_SIZE, is_te_target)?,
+        // Two passes for the same reason the DiT needs them: the 36 LM decoder layers have an
+        // 8-bit floor (sc-15071 — see `crate::quant::LM_LAYER_MIN_BITS`), while the token embedding
+        // and the vision tower take the tier's own width. Pass 2's predicate matches only keys pass
+        // 1 left dense, so packed codes are never re-quantized.
+        Some(bits) => {
+            let map = quantize_map(map, bits, GROUP_SIZE, |base| {
+                is_te_target(base) && !base.starts_with(LM_LAYER_PREFIX)
+            })?;
+            quantize_map(
+                map,
+                quant_floor_bits(LM_LAYER_PREFIX, bits),
+                GROUP_SIZE,
+                |base| is_te_target(base) && base.starts_with(LM_LAYER_PREFIX),
+            )?
+        }
         None => map,
     };
     save_map(&dst.join("model.safetensors"), &map)?;
@@ -338,6 +396,105 @@ mod tests {
             packed, 174,
             "the DiT predicate must select exactly the 174 Linears MageTransformer::quantize asserts"
         );
+    }
+
+    /// sc-15071: the head's adaLN modulation is still one of the 174 packed Linears, but never at
+    /// fewer than 8 bits. A regression that dropped the floor would reproduce the shipped defect
+    /// (the Q4 tier rendering a tiled texture), and the count assertions would NOT notice, because
+    /// the tensor stays packed either way.
+    #[test]
+    fn the_head_modulation_is_packed_but_never_below_eight_bits() {
+        assert!(is_dit_target(FINAL_MOD_BASE), "must still be packed");
+        assert_eq!(quant_floor_bits(FINAL_MOD_BASE, 4), 8, "Q4 must be floored");
+        assert_eq!(quant_floor_bits(FINAL_MOD_BASE, 8), 8);
+        // Every other projection takes the requested width unchanged — the floor is one tensor,
+        // not a blanket upgrade that would silently turn the Q4 tier into Q8.
+        for base in [
+            "img_in",
+            "txt_in",
+            "proj_out",
+            "time_text_embed.timestep_embedder.linear_1",
+            "transformer_blocks.0.img_mod.1",
+            "transformer_blocks.11.txt_mod.1",
+            "transformer_blocks.0.attn.to_q",
+        ] {
+            assert_eq!(
+                quant_floor_bits(base, 4),
+                4,
+                "{base} must stay at the tier width"
+            );
+            assert_eq!(quant_floor_bits(base, 8), 8, "{base}");
+        }
+    }
+
+    /// The converter's two-pass write must produce exactly the widths the load path produces:
+    /// Q8 shapes for the head modulation, Q4 shapes for everything else, in one Q4 artifact.
+    #[test]
+    fn the_q4_converter_writes_a_mixed_width_map_matching_the_load_path() {
+        let mut map = HashMap::new();
+        for base in [FINAL_MOD_BASE, "proj_out"] {
+            map.insert(
+                format!("{base}.weight"),
+                Array::zeros::<f32>(&[256, 128]).unwrap(),
+            );
+        }
+        let out = quantize_map(map, 4, GROUP_SIZE, |base| {
+            is_dit_target(base) && base != FINAL_MOD_BASE
+        })
+        .unwrap();
+        let out = quantize_map(
+            out,
+            quant_floor_bits(FINAL_MOD_BASE, 4),
+            GROUP_SIZE,
+            |base| base == FINAL_MOD_BASE,
+        )
+        .unwrap();
+        // scales are [out, in/gs] either way; the u32 code tensor is [out, in·bits/32], so the
+        // packed width is visible in the shape — which is exactly how the loader recovers it.
+        let bits_of = |base: &str| {
+            mlx_gen::quant::packed_bits(
+                out.get(&format!("{base}.weight")).unwrap(),
+                out.get(&format!("{base}.scales")).unwrap(),
+                GROUP_SIZE,
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            bits_of(FINAL_MOD_BASE),
+            8,
+            "head modulation must land at Q8"
+        );
+        assert_eq!(bits_of("proj_out"), 4, "the rest of the tier stays Q4");
+    }
+
+    /// sc-15071: the LM decoder layers keep their 8-bit floor, while the token embedding and the
+    /// vision tower stay at the tier's own width. Getting this wrong in either direction is silent
+    /// — every projection stays packed and every count assertion still passes.
+    #[test]
+    fn the_lm_decoder_layers_are_floored_but_the_embedding_and_vision_tower_are_not() {
+        for base in [
+            "model.language_model.layers.0.self_attn.q_proj",
+            "model.language_model.layers.35.self_attn.o_proj",
+            "model.language_model.layers.7.mlp.gate_proj",
+            "model.language_model.layers.7.mlp.down_proj",
+        ] {
+            assert!(is_te_target(base), "{base} must still be packed");
+            assert_eq!(quant_floor_bits(base, 4), 8, "{base} must be floored at Q8");
+            assert_eq!(quant_floor_bits(base, 8), 8, "{base}");
+        }
+        for base in [
+            "model.language_model.embed_tokens",
+            "model.visual.blocks.0.attn.qkv",
+            "model.visual.blocks.5.mlp.linear_fc1",
+            "model.visual.merger.linear_fc1",
+        ] {
+            assert_eq!(
+                quant_floor_bits(base, 4),
+                4,
+                "{base} must keep the tier width — flooring it would inflate the Q4 tier for no \
+                 measured quality gain"
+            );
+        }
     }
 
     #[test]
