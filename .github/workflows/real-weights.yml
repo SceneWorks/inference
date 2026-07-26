@@ -556,6 +556,15 @@ jobs:
             --test conformance registered_sfx_provider_passes_full_audio_conformance -- --ignored --nocapture
           cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
             --test conformance concurrent_sfx_requests_are_deterministic_and_do_not_share_rng_state -- --ignored --nocapture
+      - name: Re-calibrate the SFX stereo-width floor across prompts and seeds
+        run: |
+          # The floor the per-run stereo gate enforces is derived from this 25-sample sweep, so the
+          # calibration is re-checked rather than trusted. Metal only: the committed margin was
+          # measured here, and asserting it on unmeasured hardware would reintroduce exactly the
+          # unverified-envelope problem the sweep exists to fix.
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
+            --test provider sfx_stereo_width_floor_is_calibrated_across_prompts_and_seeds \
+            -- --ignored --nocapture
       - name: Render a real 30-second eight-step SFX Metal WAV
         run: |
           SA3_TEST_DURATION=30 SA3_TEST_STEPS=8 \

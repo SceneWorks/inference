@@ -272,7 +272,8 @@ pub const WEIGHT_LICENSES: &[gen_core::WeightLicenseEntry] = &[
 /// Both post-trained checkpoints share the same mathematically active batch-CFG/APG/rescale path,
 /// so they expose the same guidance and negative-prompt surface. The descriptor contract cannot
 /// machine-encode domain (music vs SFX), so the two ids — and their documentation — are the only
-/// signal a consumer gets.
+/// signal a consumer gets. Adding typed domain / channel-count / quality-tier fields is an additive
+/// contract change tracked as `sc-15041`; `family` is deliberately not overloaded to carry it.
 pub fn descriptor_for(variant: Variant) -> ModelDescriptor {
     ModelDescriptor {
         required_components: &[],
@@ -492,6 +493,16 @@ impl StableAudio3SmallGenerator {
             return Ok(pipeline.clone());
         }
         let layout = SnapshotLayout::from_dir(&self.root)?;
+        // Re-authenticate before any tensor is mmapped. `load_variant` already verified this
+        // snapshot, but tensors are materialized lazily here, and the two sibling checkpoints have
+        // byte-identical file lengths and no identity metadata in the safetensors header. Without
+        // this second pass, swapping `model.safetensors` between load and first generate — leaving
+        // `model_config.json` in place, so the `repo_id` check inside `from_layout` still passes —
+        // would be served without complaint. Measured cost of this second pass on an M-series Mac:
+        // +6.9 s, SHA-256 over the 3.45 GB of pinned files at ~500 MB/s, against a load-plus-first-
+        // generate of 6.9 s without it. It runs once per generator, and generators are constructed
+        // once and serve many requests; the alternative is serving unauthenticated weights.
+        verify_snapshot_identity(self.variant, &layout)?;
         let device = resolve_device(DevicePolicy::Default)?;
         let pipeline = Arc::new(StableAudio3SmallPipeline::from_layout(
             &layout,
@@ -508,6 +519,10 @@ impl StableAudio3SmallGenerator {
 /// `expected` is supplied by the registration site, never inferred from the snapshot: a snapshot
 /// that authenticates as the *other* checkpoint is rejected rather than silently accepted under the
 /// wrong provider id.
+///
+/// Weights are not read here. The pinned identity established by this call is re-verified in
+/// [`StableAudio3SmallGenerator::pipeline`] immediately before the tensors are mmapped, so a
+/// snapshot mutated between load and first generate is rejected rather than served.
 pub fn load_variant(
     expected: Variant,
     spec: &LoadSpec,

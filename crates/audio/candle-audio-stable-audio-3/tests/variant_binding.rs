@@ -10,10 +10,28 @@
 
 use std::path::{Path, PathBuf};
 
-use candle_audio_stable_audio_3::gen_core::{self, LoadSpec, WeightsSource};
+use candle_audio_stable_audio_3::gen_core::{
+    self, AudioParams, GenerationOutput, GenerationRequest, Generator, LoadSpec, WeightsSource,
+};
 use candle_audio_stable_audio_3::pipeline::conditioner_repo_id;
 use candle_audio_stable_audio_3::weights::SnapshotLayout;
 use candle_audio_stable_audio_3::{load_variant, Variant};
+
+/// The cheapest request that still exercises the whole lazy load and synthesis path.
+fn short_request() -> GenerationRequest {
+    GenerationRequest {
+        prompt: "Futuristic laser blast, sharp energy pulse, stereo movement, arcade style".into(),
+        seed: Some(42),
+        steps: Some(1),
+        sampler: Some("pingpong".into()),
+        audio: Some(AudioParams {
+            target_duration: Some(0.25),
+            sample_rate: Some(44_100),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
 
 const ENTRIES: &[&str] = &[
     "model_config.json",
@@ -88,6 +106,15 @@ impl Assembled {
 
     fn spec(&self) -> LoadSpec {
         LoadSpec::new(WeightsSource::Dir(self.root.clone()))
+    }
+
+    /// Re-point one entry at a different checkpoint *after* the directory has been handed to a
+    /// loader, without disturbing any other entry.
+    fn replace(&self, relative: &str, source_root: &Path) {
+        let destination = self.root.join(relative);
+        std::fs::remove_file(&destination)
+            .unwrap_or_else(|error| panic!("unlink {}: {error}", destination.display()));
+        link(&source_root.join(relative), &destination);
     }
 }
 
@@ -227,6 +254,55 @@ fn mixing_one_variants_conditioner_config_with_the_others_dit_fails() {
         Variant::SmallSfx,
         &sfx_config_on_music_dit.spec(),
     );
+}
+
+/// The snapshot must still be authentic when the tensors are actually read, not only when the
+/// generator was constructed.
+///
+/// `load_variant` verifies the pins, but the pipeline is built lazily on first generate, so there
+/// is a window between the two. Swapping `model.safetensors` inside that window and leaving
+/// `model_config.json` in place keeps the conditioner `repo_id` check passing, and both roots are
+/// exactly 2,270,384,940 bytes — the SHA-256 pin is the only thing that can tell them apart, and it
+/// has to run on the lazy path for that to matter.
+///
+/// The discriminating control is the **same generator instance** serving real audio once the
+/// authentic root is restored: this test cannot pass on a generator that simply never works, and
+/// it would fail outright if the re-verification in `pipeline()` were deleted.
+#[test]
+#[ignore = "requires both pinned 3.45 GB small snapshots"]
+fn swapping_the_root_after_load_is_rejected_before_any_tensor_is_read() {
+    let assembled = Assembled::new("post-load-swap", &sfx(), &[]);
+    let generator = load_variant(Variant::SmallSfx, &assembled.spec())
+        .expect("the authentic SFX reassembly must load");
+
+    assembled.replace("model.safetensors", &music());
+    match generator.generate(&short_request(), &mut |_| {}) {
+        Ok(_) => panic!(
+            "stable_audio_3_small_sfx served music weights swapped in after load — the pinned \
+             identity is not re-checked at tensor-open time"
+        ),
+        Err(gen_core::Error::Msg(message)) => {
+            eprintln!("post-load root swap rejected with `{message}`");
+            assert!(
+                message.contains(Variant::SmallSfx.model_id())
+                    && message.contains("model.safetensors"),
+                "rejection must name the registration and the swapped file: {message}"
+            );
+        }
+        Err(other) => panic!("expected an identity rejection, got {other:?}"),
+    }
+
+    assembled.replace("model.safetensors", &sfx());
+    match generator
+        .generate(&short_request(), &mut |_| {})
+        .expect("the same generator must serve once the authentic root is restored")
+    {
+        GenerationOutput::Audio(track) => {
+            assert_eq!(track.sample_rate, 44_100);
+            assert!(!track.samples.is_empty());
+        }
+        other => panic!("expected audio, got {other:?}"),
+    }
 }
 
 #[test]

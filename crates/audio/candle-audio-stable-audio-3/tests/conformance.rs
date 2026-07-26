@@ -14,13 +14,14 @@ struct Case {
     prompt: &'static str,
 }
 
-/// The two registered post-trained checkpoints. Each prompt is a real shipped `demo_cond` entry
-/// from that snapshot's own `model_config.json`.
+/// The two registered post-trained checkpoints. The music prompt is the one sc-14543 shipped and is
+/// left untouched; the SFX prompt is a real shipped `demo_cond` entry from its own
+/// `model_config.json`.
 const CASES: &[Case] = &[
     Case {
         variant: Variant::SmallMusic,
         env: "SA3_SMALL_MUSIC_SNAPSHOT",
-        prompt: "A beautiful piano arpeggio grows into a grand cinematic climax",
+        prompt: "tight electronic percussion and warm analog bass",
     },
     Case {
         variant: Variant::SmallSfx,

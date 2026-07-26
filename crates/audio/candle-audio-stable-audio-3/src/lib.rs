@@ -14,7 +14,8 @@
 //! `stable_audio_3_small_sfx` overlaps in intent with the shipped `moss_sfx_v2` provider but is a
 //! different tier and a different output shape: SA3 SFX is **44.1 kHz stereo** up to 120 s, while
 //! MOSS-SoundEffect is **48 kHz mono**. The descriptor contract cannot machine-encode domain,
-//! channel count, or quality tier today, so that distinction lives in the two ids and this note.
+//! channel count, or quality tier today, so that distinction lives in the two ids and this note;
+//! adding those typed fields is tracked as `sc-15041`.
 //!
 //! `candle-audio-catalog` composes this crate into every shipped audio runtime bundle:
 //!
