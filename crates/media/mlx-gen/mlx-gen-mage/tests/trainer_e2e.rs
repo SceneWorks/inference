@@ -157,6 +157,21 @@ fn train_and_check(network_type: NetworkType, kind: AdapterKind, tag: &str) {
     assert_eq!(w.metadata("networkType"), Some(want_net));
     assert_eq!(w.metadata("rank"), Some("8"), "rank in __metadata__");
     assert_eq!(w.metadata("alpha"), Some("8"), "alpha in __metadata__");
+    // sc-14057 family provenance. These exact tokens are what SceneWorks' importer reads
+    // (`sceneworks-core::lora_family::detect_metadata_family` checks `family` then `baseModel`):
+    // without them an exported Mage adapter re-imports family-less, because the NR-MMDiT's tensor
+    // names are indistinguishable from Qwen-Image's and the default target set reaches no
+    // dual-stream marker at all. Both adapter kinds must carry them.
+    assert_eq!(
+        w.metadata("family"),
+        Some("mage_flow"),
+        "family stamp in __metadata__ (sc-14057 import detection)"
+    );
+    assert_eq!(
+        w.metadata("baseModel"),
+        Some("mage_flow_base"),
+        "baseModel stamp in __metadata__ (sc-14057 import detection)"
+    );
     let factor_suffix = match network_type {
         NetworkType::Lora => ".lora_A.weight",
         NetworkType::Lokr => ".lokr_w1",

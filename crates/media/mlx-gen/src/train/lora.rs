@@ -217,6 +217,27 @@ pub fn save_lora_peft(
     key_prefix: &str,
     path: impl AsRef<Path>,
 ) -> Result<()> {
+    save_lora_peft_with_meta(params, targets, alpha, rank, key_prefix, &[], path)
+}
+
+/// [`save_lora_peft`] plus caller-supplied `__metadata__` entries (sc-14057).
+///
+/// `extra` is written **before** the `networkType`/`rank`/`alpha` contract keys, so a caller can
+/// never accidentally overwrite them. Its purpose is family *provenance*: SceneWorks' importer
+/// identifies an adapter's architecture from the safetensors header, and for a family whose tensor
+/// names are shared with a sibling (Mage-Flow's NR-MMDiT block leaves are spelled identically to
+/// Qwen-Image's) the keys alone cannot say which one wrote the file. A `family` / `baseModel` stamp
+/// — the same pair the candle Krea trainer writes — makes our own adapters self-identifying on
+/// re-import instead of landing family-less.
+pub fn save_lora_peft_with_meta(
+    params: &LoraParams,
+    targets: &[LoraTarget],
+    alpha: f32,
+    rank: u32,
+    key_prefix: &str,
+    extra: &[(&str, &str)],
+    path: impl AsRef<Path>,
+) -> Result<()> {
     let alphas: Vec<(String, Array)> = targets
         .iter()
         .map(|t| {
@@ -242,7 +263,10 @@ pub fn save_lora_peft(
     for (k, v) in &alphas {
         entries.push((k.clone(), v));
     }
-    let mut meta: HashMap<String, String> = HashMap::new();
+    let mut meta: HashMap<String, String> = extra
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+        .collect();
     meta.insert("networkType".to_string(), "lora".to_string());
     meta.insert("rank".to_string(), rank.to_string());
     meta.insert("alpha".to_string(), alpha.to_string());
@@ -400,6 +424,20 @@ pub fn save_lokr(
     decompose_factor: i32,
     path: impl AsRef<Path>,
 ) -> Result<()> {
+    save_lokr_with_meta(params, targets, alpha, rank, decompose_factor, &[], path)
+}
+
+/// [`save_lokr`] plus caller-supplied `__metadata__` entries — the LoKr twin of
+/// [`save_lora_peft_with_meta`] (sc-14057), so a family stamp rides both adapter kinds.
+pub fn save_lokr_with_meta(
+    params: &LoraParams,
+    targets: &[LokrTarget],
+    alpha: f32,
+    rank: f32,
+    decompose_factor: i32,
+    extra: &[(&str, &str)],
+    path: impl AsRef<Path>,
+) -> Result<()> {
     let mut entries: Vec<(String, &Array)> = Vec::with_capacity(targets.len() * 3);
     for t in targets {
         let keys = [
@@ -417,7 +455,10 @@ pub fn save_lokr(
             entries.push((key.to_string(), v));
         }
     }
-    let mut meta: HashMap<String, String> = HashMap::new();
+    let mut meta: HashMap<String, String> = extra
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+        .collect();
     meta.insert("networkType".to_string(), "lokr".to_string());
     meta.insert("rank".to_string(), (rank as i64).to_string());
     meta.insert("alpha".to_string(), (alpha as i64).to_string());
@@ -527,12 +568,35 @@ impl TrainAdapter {
         key_prefix: &str,
         path: &Path,
     ) -> Result<()> {
+        self.save_with_meta(params, alpha, rank, decompose_factor, key_prefix, &[], path)
+    }
+
+    /// [`save`](Self::save) with extra `__metadata__` entries (sc-14057) — one call site for both
+    /// adapter kinds, so a family/provenance stamp cannot be applied to LoRA and forgotten for
+    /// LoKr. See [`save_lora_peft_with_meta`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_with_meta(
+        &self,
+        params: &LoraParams,
+        alpha: f32,
+        rank: f32,
+        decompose_factor: i32,
+        key_prefix: &str,
+        extra: &[(&str, &str)],
+        path: &Path,
+    ) -> Result<()> {
         match self {
-            TrainAdapter::Lora { targets } => {
-                save_lora_peft(params, targets, alpha, rank as u32, key_prefix, path)
-            }
+            TrainAdapter::Lora { targets } => save_lora_peft_with_meta(
+                params,
+                targets,
+                alpha,
+                rank as u32,
+                key_prefix,
+                extra,
+                path,
+            ),
             TrainAdapter::Lokr { targets } => {
-                save_lokr(params, targets, alpha, rank, decompose_factor, path)
+                save_lokr_with_meta(params, targets, alpha, rank, decompose_factor, extra, path)
             }
         }
     }
@@ -565,6 +629,59 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("LoRA param missing"), "got: {err}");
+    }
+
+    /// sc-14057: caller-supplied `__metadata__` entries ride BOTH adapter kinds, and can never
+    /// displace the `networkType`/`rank`/`alpha` reload contract even when they collide by name.
+    #[test]
+    fn save_with_meta_stamps_extra_metadata_on_both_adapter_kinds() {
+        use crate::adapters::AdaptableLinear;
+        use crate::weights::Weights;
+        struct OneLin(AdaptableLinear);
+        impl AdaptableHost for OneLin {
+            fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+                (path == ["to_q"]).then_some(&mut self.0)
+            }
+            fn adaptable_paths(&self) -> Vec<String> {
+                vec!["to_q".to_string()]
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("sc14057-meta-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let extra = [("family", "mage_flow"), ("networkType", "IGNORED")];
+
+        for (kind, file) in [("lora", "a.safetensors"), ("lokr", "b.safetensors")] {
+            let mut host = OneLin(AdaptableLinear::dense(
+                mlx_rs::random::normal::<f32>(&[8, 8], None, None, None).unwrap(),
+                None,
+            ));
+            let (adapter, params) = if kind == "lora" {
+                let (targets, params) =
+                    build_lora_targets(&mut host, &["to_q".into()], 4, 0).expect("lora targets");
+                (TrainAdapter::Lora { targets }, params)
+            } else {
+                let (targets, params) = build_lokr_targets(&mut host, &["to_q".into()], 4, -1, 0)
+                    .expect("lokr targets");
+                (TrainAdapter::Lokr { targets }, params)
+            };
+            let path = dir.join(file);
+            adapter
+                .save_with_meta(&params, 8.0, 4.0, -1, "", &extra, &path)
+                .expect("save");
+            let w = Weights::from_file(&path).expect("reload");
+            assert_eq!(
+                w.metadata("family"),
+                Some("mage_flow"),
+                "{kind}: the provenance stamp must survive"
+            );
+            assert_eq!(
+                w.metadata("networkType"),
+                Some(kind),
+                "{kind}: the reload contract must win over a colliding extra key"
+            );
+            assert_eq!(w.metadata("rank"), Some("4"));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

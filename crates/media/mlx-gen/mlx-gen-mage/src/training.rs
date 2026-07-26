@@ -90,6 +90,18 @@ pub const MODEL_ID: &str = "mage_flow_base";
 /// reconstruct at the same dtype so the adapter round-trips bit-for-bit.
 const LOKR_DTYPE: Dtype = Dtype::Bfloat16;
 
+/// Provenance stamped into every saved adapter's `__metadata__` (sc-14057), alongside the
+/// `networkType`/`rank`/`alpha` reload contract.
+///
+/// This is what makes a Mage adapter **self-identifying on re-import**. Detection from tensor names
+/// alone cannot do it: the NR-MMDiT's diffusers module names (`transformer_blocks.<n>.attn.to_q`,
+/// `.img_mlp.net.0.proj`, …) are spelled identically to Qwen-Image's at the same 3072 hidden size,
+/// and the default target set (`to_q`/`to_k`/`to_v`/`to_out.0`) does not even reach the dual-stream
+/// markers a geometry classifier needs. Without the stamp an exported adapter re-imports
+/// family-less — invisible in every model's picker. The pair mirrors the candle Krea trainer's
+/// `family` / `baseModel` stamp, which SceneWorks' `detect_metadata_family` reads first.
+const ADAPTER_PROVENANCE: [(&str, &str); 2] = [("family", FAMILY), ("baseModel", MODEL_ID)];
+
 /// Max preview-sample prompts rendered per [`TrainingConfig::sample_every`] cadence.
 const SAMPLE_PROMPT_CAP: usize = 4;
 
@@ -550,7 +562,15 @@ impl MageFlowTrainer {
             if cfg.save_every > 0 && step % cfg.save_every == 0 && step != cfg.steps {
                 std::fs::create_dir_all(&req.output_dir)?;
                 let ckpt = req.output_dir.join(checkpoint_filename(&stem, step));
-                adapter.save(&params, alpha, rank, cfg.decompose_factor, "", &ckpt)?;
+                adapter.save_with_meta(
+                    &params,
+                    alpha,
+                    rank,
+                    cfg.decompose_factor,
+                    "",
+                    &ADAPTER_PROVENANCE,
+                    &ckpt,
+                )?;
                 checkpoint::save_resume(&req.output_dir, &stem, step, update_idx, &opt, &params)?;
                 on_progress(TrainingProgress::Checkpoint { step });
             }
@@ -614,16 +634,17 @@ impl MageFlowTrainer {
             return Err(mlx_gen::Error::Canceled);
         }
 
-        // --- save final adapter (PEFT keys + alpha/rank into __metadata__) ---
+        // --- save final adapter (PEFT keys + alpha/rank + family provenance into __metadata__) ---
         on_progress(TrainingProgress::Saving);
         std::fs::create_dir_all(&req.output_dir)?;
         let adapter_path = req.output_dir.join(&req.file_name);
-        adapter.save(
+        adapter.save_with_meta(
             &params,
             alpha,
             rank,
             cfg.decompose_factor,
             "",
+            &ADAPTER_PROVENANCE,
             &adapter_path,
         )?;
         Ok(TrainingOutput {
