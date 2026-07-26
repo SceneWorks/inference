@@ -191,15 +191,26 @@ fn mage_vae_1024_decode_matches_torch() {
     let model =
         MageVae::load(&component_dir(&root, "vae"), &device).expect("load Mage-VAE decoder");
     let golden = goldens("mage_flow_vae_f32_1024.safetensors", &device);
+    let mut failures = Vec::new();
     for (input, output) in [
         ("synth_latent", "dec_from_synth"),
         ("enc_latent", "dec_from_latent"),
     ] {
         let got = model.decode(require(&golden, input)).expect("VAE decode");
         let (max_abs, mean_rel) = stats(&got, require(&golden, output));
-        assert!(max_abs <= 4.0e-2, "{output} max_abs {max_abs}");
-        assert!(mean_rel <= 1.5e-3, "{output} mean_rel {mean_rel}");
+        println!("{output}: max_abs={max_abs:.8}, mean_rel={mean_rel:.8}");
+        if max_abs > 4.0e-2 {
+            failures.push(format!("{output} max_abs {max_abs} exceeds 4.0e-2"));
+        }
+        if mean_rel > 1.5e-3 {
+            failures.push(format!("{output} mean_rel {mean_rel} exceeds 1.5e-3"));
+        }
     }
+    assert!(
+        failures.is_empty(),
+        "VAE decode parity failures:\n{}",
+        failures.join("\n")
+    );
 }
 
 #[test]

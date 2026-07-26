@@ -182,6 +182,15 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             "--test cuda_1024 -- --ignored --nocapture",
             workflow,
         )
+        self.assertIn('set "MAGE_CONFORMANCE_FAILED=0"', workflow)
+        self.assertEqual(
+            workflow.count('|| set "MAGE_CONFORMANCE_FAILED=1"'),
+            4,
+        )
+        self.assertIn(
+            'if not "%MAGE_CONFORMANCE_FAILED%"=="0" exit /b 1',
+            workflow,
+        )
         transferred_verify = workflow.index(
             "Verify transferred Candle Mage acceptance oracles"
         )

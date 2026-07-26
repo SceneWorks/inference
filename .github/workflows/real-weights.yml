@@ -506,10 +506,12 @@ jobs:
         shell: cmd
         run: |
           call "%VCVARS%"
-          cargo test --locked -p candle-gen-z-image --features cuda --test conformance z_image_conformance -- --ignored --nocapture || exit /b 1
-          cargo test --locked --release -p candle-gen-mage --features cuda --test real_parity -- --ignored --nocapture || exit /b 1
-          cargo test --locked --release -p candle-gen-mage --features cuda --test cuda_1024 -- --ignored --nocapture || exit /b 1
-          cargo test --locked --release -p candle-gen-mage --features cuda --test edit_parity -- --ignored --nocapture || exit /b 1
+          set "MAGE_CONFORMANCE_FAILED=0"
+          cargo test --locked -p candle-gen-z-image --features cuda --test conformance z_image_conformance -- --ignored --nocapture || set "MAGE_CONFORMANCE_FAILED=1"
+          cargo test --locked --release -p candle-gen-mage --features cuda --test real_parity -- --ignored --nocapture || set "MAGE_CONFORMANCE_FAILED=1"
+          cargo test --locked --release -p candle-gen-mage --features cuda --test cuda_1024 -- --ignored --nocapture || set "MAGE_CONFORMANCE_FAILED=1"
+          cargo test --locked --release -p candle-gen-mage --features cuda --test edit_parity -- --ignored --nocapture || set "MAGE_CONFORMANCE_FAILED=1"
+          if not "%MAGE_CONFORMANCE_FAILED%"=="0" exit /b 1
 
   candle-sdxl:
     name: Candle SDXL real weights (CUDA)
