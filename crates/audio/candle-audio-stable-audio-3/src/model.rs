@@ -520,9 +520,9 @@ impl StableAudio3SmallGenerator {
 /// that authenticates as the *other* checkpoint is rejected rather than silently accepted under the
 /// wrong provider id.
 ///
-/// Weights are not read here. The pinned identity established by this call is re-verified in
-/// [`StableAudio3SmallGenerator::pipeline`] immediately before the tensors are mmapped, so a
-/// snapshot mutated between load and first generate is rejected rather than served.
+/// Weights are not read here. The pinned identity established by this call is re-verified on the
+/// generator's lazy pipeline path immediately before the tensors are mmapped, so a snapshot mutated
+/// between load and first generate is rejected rather than served.
 pub fn load_variant(
     expected: Variant,
     spec: &LoadSpec,
