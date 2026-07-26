@@ -29,6 +29,230 @@ enum Direction {
 
 /// Upstream's default bounded query size for the SAME-L chunked-halo fallback.
 pub const SAME_BAND_QUERY_TILE: usize = 1024;
+pub const SAME_OUTER_CHUNK_SIZE: usize = 128;
+pub const SAME_OUTER_CHUNK_OVERLAP: usize = 32;
+
+/// Request-time policy for the outer autoencoder chunker.
+///
+/// Full Stable Audio 3 checkpoints pass their parsed `pretransform.chunked` value as
+/// `model_default`; generation decode may additionally supply `request_override`. Standalone
+/// autoencoder calls use `model_default=false` and an explicit override.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SameChunkingPolicy {
+    pub model_default: bool,
+    pub request_override: Option<bool>,
+}
+
+impl SameChunkingPolicy {
+    /// Full-model encode is config-driven; upstream exposes no request-time encode override.
+    pub const fn full_model_encode(model_default: bool) -> Self {
+        Self {
+            model_default,
+            request_override: None,
+        }
+    }
+
+    /// Full-model generation decode accepts the public tri-state override.
+    pub const fn full_model_decode(model_default: bool, request_override: Option<bool>) -> Self {
+        Self {
+            model_default,
+            request_override,
+        }
+    }
+
+    pub const fn standalone(enabled: bool) -> Self {
+        Self {
+            model_default: false,
+            request_override: Some(enabled),
+        }
+    }
+
+    pub const fn enabled(self) -> bool {
+        match self.request_override {
+            Some(enabled) => enabled,
+            None => self.model_default,
+        }
+    }
+}
+
+/// Latent-space parameters for upstream's outer SAME chunker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SameChunkingParameters {
+    pub chunk_size: usize,
+    pub overlap: usize,
+}
+
+impl Default for SameChunkingParameters {
+    fn default() -> Self {
+        Self {
+            chunk_size: SAME_OUTER_CHUNK_SIZE,
+            overlap: SAME_OUTER_CHUNK_OVERLAP,
+        }
+    }
+}
+
+/// One disjoint final-ownership slice.
+///
+/// Frozen upstream writes every chunk sequentially into one output tensor. Later chunks overwrite
+/// earlier chunks where a right-anchored final window creates extra overlap. These disjoint slices
+/// are the equivalent immutable representation of that exact last-writer-wins result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SameChunkOwnership {
+    pub chunk_index: usize,
+    pub chunk_start: usize,
+    pub source_start: usize,
+    pub source_end: usize,
+    pub output_start: usize,
+    pub output_end: usize,
+}
+
+/// Pure, unit-agnostic plan for upstream's hard overlap-discard chunker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SameChunkPlan {
+    pub total_units: usize,
+    pub chunk_size: usize,
+    pub overlap: usize,
+    pub starts: Vec<usize>,
+    pub ownership: Vec<SameChunkOwnership>,
+    pub chunked: bool,
+}
+
+impl SameChunkPlan {
+    pub fn build(
+        total_units: usize,
+        enabled: bool,
+        parameters: SameChunkingParameters,
+    ) -> Result<Self> {
+        if !enabled {
+            return Ok(Self::direct(total_units, parameters));
+        }
+        if parameters.chunk_size == 0 {
+            bail!("SAME outer chunk_size must be non-zero")
+        }
+        if parameters.overlap >= parameters.chunk_size {
+            bail!(
+                "SAME outer overlap {} must be smaller than chunk_size {}",
+                parameters.overlap,
+                parameters.chunk_size
+            )
+        }
+        if total_units < parameters.chunk_size {
+            return Ok(Self::direct(total_units, parameters));
+        }
+
+        let hop = parameters.chunk_size - parameters.overlap;
+        let final_start = total_units - parameters.chunk_size;
+        let mut starts = Vec::new();
+        let mut start = 0usize;
+        loop {
+            if start > final_start {
+                break;
+            }
+            starts.push(start);
+            let Some(next) = start.checked_add(hop) else {
+                bail!("SAME outer chunk start overflow")
+            };
+            start = next;
+        }
+        if starts.last().copied() != Some(final_start) {
+            starts.push(final_start);
+        }
+
+        let half_overlap = parameters.overlap / 2;
+        let mut ownership = Vec::with_capacity(starts.len());
+        for (index, &chunk_start) in starts.iter().enumerate() {
+            let output_start = if index == 0 {
+                0
+            } else {
+                chunk_start.checked_add(half_overlap).ok_or_else(|| {
+                    candle_audio::candle_core::Error::Msg(
+                        "SAME outer ownership start overflow".into(),
+                    )
+                })?
+            };
+            let output_end = if index + 1 == starts.len() {
+                total_units
+            } else {
+                starts[index + 1].checked_add(half_overlap).ok_or_else(|| {
+                    candle_audio::candle_core::Error::Msg(
+                        "SAME outer ownership end overflow".into(),
+                    )
+                })?
+            };
+            if output_start > output_end || output_end > total_units {
+                bail!(
+                    "SAME outer ownership [{output_start},{output_end}) exceeds total {total_units}"
+                )
+            }
+            let source_start = output_start.checked_sub(chunk_start).ok_or_else(|| {
+                candle_audio::candle_core::Error::Msg(
+                    "SAME outer ownership precedes its source chunk".into(),
+                )
+            })?;
+            let source_end = output_end.checked_sub(chunk_start).ok_or_else(|| {
+                candle_audio::candle_core::Error::Msg(
+                    "SAME outer ownership precedes its source chunk".into(),
+                )
+            })?;
+            if source_end > parameters.chunk_size {
+                bail!(
+                    "SAME outer source [{source_start},{source_end}) exceeds chunk_size {}",
+                    parameters.chunk_size
+                )
+            }
+            ownership.push(SameChunkOwnership {
+                chunk_index: index,
+                chunk_start,
+                source_start,
+                source_end,
+                output_start,
+                output_end,
+            });
+        }
+        let covered: usize = ownership
+            .iter()
+            .map(|slice| slice.output_end - slice.output_start)
+            .sum();
+        if covered != total_units
+            || ownership.first().map(|slice| slice.output_start) != Some(0)
+            || ownership.last().map(|slice| slice.output_end) != Some(total_units)
+            || ownership
+                .windows(2)
+                .any(|pair| pair[0].output_end != pair[1].output_start)
+        {
+            bail!("SAME outer ownership does not cover the output exactly")
+        }
+        Ok(Self {
+            total_units,
+            chunk_size: parameters.chunk_size,
+            overlap: parameters.overlap,
+            starts,
+            ownership,
+            chunked: true,
+        })
+    }
+
+    fn direct(total_units: usize, parameters: SameChunkingParameters) -> Self {
+        Self {
+            total_units,
+            chunk_size: parameters.chunk_size,
+            overlap: parameters.overlap,
+            starts: Vec::new(),
+            ownership: Vec::new(),
+            chunked: false,
+        }
+    }
+}
+
+/// Per-chunk controlled decoder noise for frozen-reference parity.
+///
+/// `regularization_noise` is optional only for checkpoints whose SoftNorm has regularization
+/// disabled. A controlled decode fails closed instead of falling back to device RNG when the
+/// loaded checkpoint requires it.
+pub struct SameDecodeChunkNoise {
+    pub regularization_noise: Option<Tensor>,
+    pub mask_noises: Vec<Tensor>,
+}
 
 /// Config-driven transformer layout. SAME-S folds independent full-attention chunks; SAME-L keeps
 /// one globally positioned sequence and evaluates a bounded attention band.
@@ -839,6 +1063,7 @@ pub struct SameTrace {
 /// Config-driven SAME autoencoder. It is intentionally unregistered until the later provider slice.
 pub struct SameAutoencoder {
     patch: PatchedPretransform,
+    downsampling_ratio: usize,
     encoder: Vec<TransformerResamplingBlock>,
     encoder_out: Linear,
     decoder_in: Linear,
@@ -880,6 +1105,7 @@ impl SameAutoencoder {
         let bottleneck_cfg = &config.bottleneck.config;
         Ok(Self {
             patch,
+            downsampling_ratio: config.downsampling_ratio,
             encoder,
             encoder_out,
             decoder_in,
@@ -1173,6 +1399,216 @@ impl SameAutoencoder {
         Ok((x, traces))
     }
 
+    /// Upstream-compatible outer encode entry point.
+    ///
+    /// `chunk_size` and `overlap` are latent units. Chunk recursion deliberately does not forward
+    /// stride overrides or other inner kwargs, matching frozen upstream. A single request-local RNG
+    /// is threaded through chunks in start order so stochastic draw order remains observable.
+    pub fn encode_audio(
+        &self,
+        audio: &Tensor,
+        policy: SameChunkingPolicy,
+        parameters: SameChunkingParameters,
+    ) -> Result<Tensor> {
+        let mut rng = SameNoiseRng::from_entropy();
+        self.encode_audio_with_rng(audio, policy, parameters, &mut rng)
+    }
+
+    pub fn encode_audio_with_rng(
+        &self,
+        audio: &Tensor,
+        policy: SameChunkingPolicy,
+        parameters: SameChunkingParameters,
+        rng: &mut SameNoiseRng,
+    ) -> Result<Tensor> {
+        let plan = self.encode_chunk_plan(audio, policy, parameters)?;
+        if !plan.chunked {
+            return self.encode_with_rng(audio, None, rng);
+        }
+        let chunk_samples = plan
+            .chunk_size
+            .checked_mul(self.downsampling_ratio)
+            .ok_or_else(|| {
+                candle_audio::candle_core::Error::Msg(
+                    "SAME outer encode chunk size overflow".into(),
+                )
+            })?;
+        let mut pieces = Vec::with_capacity(plan.ownership.len());
+        for ownership in &plan.ownership {
+            let sample_start = ownership
+                .chunk_start
+                .checked_mul(self.downsampling_ratio)
+                .ok_or_else(|| {
+                    candle_audio::candle_core::Error::Msg("SAME outer encode start overflow".into())
+                })?;
+            let chunk = audio.narrow(2, sample_start, chunk_samples)?;
+            let encoded = self.encode_with_rng(&chunk, None, rng)?;
+            pieces.push(owned_piece(&encoded, ownership)?);
+        }
+        concatenate_owned(pieces, plan.total_units, "encode")
+    }
+
+    /// Controlled-noise outer encode seam. One stage-noise vector is required per executed chunk;
+    /// the direct/bypass path is represented by one vector.
+    pub fn encode_audio_with_chunk_noises(
+        &self,
+        audio: &Tensor,
+        policy: SameChunkingPolicy,
+        parameters: SameChunkingParameters,
+        chunk_noises: &[Vec<Tensor>],
+    ) -> Result<Tensor> {
+        let plan = self.encode_chunk_plan(audio, policy, parameters)?;
+        if !plan.chunked {
+            if chunk_noises.len() != 1 {
+                bail!(
+                    "SAME outer direct encode needs one chunk-noise entry, got {}",
+                    chunk_noises.len()
+                )
+            }
+            return self.encode_with_noise(audio, None, &chunk_noises[0]);
+        }
+        validate_outer_noise_count("encode", chunk_noises.len(), plan.starts.len())?;
+        let chunk_samples = plan
+            .chunk_size
+            .checked_mul(self.downsampling_ratio)
+            .ok_or_else(|| {
+                candle_audio::candle_core::Error::Msg(
+                    "SAME outer encode chunk size overflow".into(),
+                )
+            })?;
+        let mut pieces = Vec::with_capacity(plan.ownership.len());
+        for ownership in &plan.ownership {
+            let sample_start = ownership
+                .chunk_start
+                .checked_mul(self.downsampling_ratio)
+                .ok_or_else(|| {
+                    candle_audio::candle_core::Error::Msg("SAME outer encode start overflow".into())
+                })?;
+            let chunk = audio.narrow(2, sample_start, chunk_samples)?;
+            let encoded =
+                self.encode_with_noise(&chunk, None, &chunk_noises[ownership.chunk_index])?;
+            pieces.push(owned_piece(&encoded, ownership)?);
+        }
+        concatenate_owned(pieces, plan.total_units, "encode")
+    }
+
+    /// Upstream-compatible outer decode entry point.
+    pub fn decode_audio(
+        &self,
+        latents: &Tensor,
+        policy: SameChunkingPolicy,
+        parameters: SameChunkingParameters,
+    ) -> Result<Tensor> {
+        let mut rng = SameNoiseRng::from_entropy();
+        self.decode_audio_with_rng(latents, policy, parameters, &mut rng)
+    }
+
+    pub fn decode_audio_with_rng(
+        &self,
+        latents: &Tensor,
+        policy: SameChunkingPolicy,
+        parameters: SameChunkingParameters,
+        rng: &mut SameNoiseRng,
+    ) -> Result<Tensor> {
+        let total_latents = latents.dim(2)?;
+        let plan = SameChunkPlan::build(total_latents, policy.enabled(), parameters)?;
+        if !plan.chunked {
+            return self.decode_with_rng(latents, None, rng);
+        }
+        let mut pieces = Vec::with_capacity(plan.ownership.len());
+        for ownership in &plan.ownership {
+            let chunk = latents.narrow(2, ownership.chunk_start, plan.chunk_size)?;
+            let decoded = self.decode_with_rng(&chunk, None, rng)?;
+            let sample_ownership = scale_ownership(ownership, self.downsampling_ratio)?;
+            pieces.push(owned_piece(&decoded, &sample_ownership)?);
+        }
+        let total_samples = total_latents
+            .checked_mul(self.downsampling_ratio)
+            .ok_or_else(|| {
+                candle_audio::candle_core::Error::Msg(
+                    "SAME outer decode output size overflow".into(),
+                )
+            })?;
+        concatenate_owned(pieces, total_samples, "decode")
+    }
+
+    /// Controlled-noise outer decode seam. One entry is required per executed chunk; the
+    /// direct/bypass path is represented by one entry.
+    pub fn decode_audio_with_chunk_noises(
+        &self,
+        latents: &Tensor,
+        policy: SameChunkingPolicy,
+        parameters: SameChunkingParameters,
+        chunk_noises: &[SameDecodeChunkNoise],
+    ) -> Result<Tensor> {
+        let total_latents = latents.dim(2)?;
+        let plan = SameChunkPlan::build(total_latents, policy.enabled(), parameters)?;
+        if !plan.chunked {
+            if chunk_noises.len() != 1 {
+                bail!(
+                    "SAME outer direct decode needs one chunk-noise entry, got {}",
+                    chunk_noises.len()
+                )
+            }
+            let noise = &chunk_noises[0];
+            self.validate_controlled_decode_noise(noise)?;
+            return self.decode_with_noise(
+                latents,
+                None,
+                noise.regularization_noise.as_ref(),
+                Some(&noise.mask_noises),
+            );
+        }
+        validate_outer_noise_count("decode", chunk_noises.len(), plan.starts.len())?;
+        let mut pieces = Vec::with_capacity(plan.ownership.len());
+        for ownership in &plan.ownership {
+            let chunk = latents.narrow(2, ownership.chunk_start, plan.chunk_size)?;
+            let noise = &chunk_noises[ownership.chunk_index];
+            self.validate_controlled_decode_noise(noise)?;
+            let decoded = self.decode_with_noise(
+                &chunk,
+                None,
+                noise.regularization_noise.as_ref(),
+                Some(&noise.mask_noises),
+            )?;
+            let sample_ownership = scale_ownership(ownership, self.downsampling_ratio)?;
+            pieces.push(owned_piece(&decoded, &sample_ownership)?);
+        }
+        let total_samples = total_latents
+            .checked_mul(self.downsampling_ratio)
+            .ok_or_else(|| {
+                candle_audio::candle_core::Error::Msg(
+                    "SAME outer decode output size overflow".into(),
+                )
+            })?;
+        concatenate_owned(pieces, total_samples, "decode")
+    }
+
+    fn validate_controlled_decode_noise(&self, noise: &SameDecodeChunkNoise) -> Result<()> {
+        if self.bottleneck.noise_regularize() && noise.regularization_noise.is_none() {
+            bail!("SAME controlled decode requires explicit SoftNorm regularization noise")
+        }
+        Ok(())
+    }
+
+    fn encode_chunk_plan(
+        &self,
+        audio: &Tensor,
+        policy: SameChunkingPolicy,
+        parameters: SameChunkingParameters,
+    ) -> Result<SameChunkPlan> {
+        let samples = audio.dim(2)?;
+        let latent_units = samples / self.downsampling_ratio;
+        let plan = SameChunkPlan::build(latent_units, policy.enabled(), parameters)?;
+        if plan.chunked && !samples.is_multiple_of(self.downsampling_ratio) {
+            bail!(
+                "SAME outer chunked encode needs audio aligned to downsampling ratio {}, got {samples}",
+                self.downsampling_ratio
+            )
+        }
+        Ok(plan)
+    }
+
     /// Crop the padded decode to a caller-owned original length.
     pub fn crop_valid_prefix(decoded: &Tensor, original_samples: usize) -> Result<Tensor> {
         if original_samples > decoded.dim(2)? {
@@ -1183,6 +1619,60 @@ impl SameAutoencoder {
         }
         decoded.narrow(2, 0, original_samples)
     }
+}
+
+fn owned_piece(chunk: &Tensor, ownership: &SameChunkOwnership) -> Result<Tensor> {
+    let available = chunk.dim(2)?;
+    if ownership.source_end > available {
+        bail!(
+            "SAME outer chunk {} owns source [{},{}) but produced only {available} units",
+            ownership.chunk_index,
+            ownership.source_start,
+            ownership.source_end
+        )
+    }
+    chunk
+        .narrow(
+            2,
+            ownership.source_start,
+            ownership.source_end - ownership.source_start,
+        )?
+        .contiguous()
+}
+
+fn concatenate_owned(pieces: Vec<Tensor>, expected: usize, direction: &str) -> Result<Tensor> {
+    let refs: Vec<&Tensor> = pieces.iter().collect();
+    let output = Tensor::cat(&refs, 2)?;
+    if output.dim(2)? != expected {
+        bail!(
+            "SAME outer {direction} stitched {} units, expected {expected}",
+            output.dim(2)?
+        )
+    }
+    Ok(output)
+}
+
+fn scale_ownership(ownership: &SameChunkOwnership, scale: usize) -> Result<SameChunkOwnership> {
+    let multiply = |value: usize| {
+        value.checked_mul(scale).ok_or_else(|| {
+            candle_audio::candle_core::Error::Msg("SAME outer ownership scale overflow".into())
+        })
+    };
+    Ok(SameChunkOwnership {
+        chunk_index: ownership.chunk_index,
+        chunk_start: multiply(ownership.chunk_start)?,
+        source_start: multiply(ownership.source_start)?,
+        source_end: multiply(ownership.source_end)?,
+        output_start: multiply(ownership.output_start)?,
+        output_end: multiply(ownership.output_end)?,
+    })
+}
+
+fn validate_outer_noise_count(direction: &str, actual: usize, expected: usize) -> Result<()> {
+    if actual != expected {
+        bail!("SAME outer chunked {direction} needs {expected} chunk-noise entries, got {actual}")
+    }
+    Ok(())
 }
 
 fn validate_strides(strides: Option<&[usize]>, depth: usize, variable_stride: bool) -> Result<()> {
@@ -1396,5 +1886,213 @@ mod tests {
         assert!(validate_strides(Some(&[16]), 1, false).is_err());
         assert!(validate_strides(Some(&[16, 8]), 1, true).is_err());
         assert!(validate_strides(Some(&[16]), 1, true).is_ok());
+    }
+
+    fn parameters(chunk_size: usize, overlap: usize) -> SameChunkingParameters {
+        SameChunkingParameters {
+            chunk_size,
+            overlap,
+        }
+    }
+
+    #[test]
+    fn outer_chunk_policy_resolves_model_default_and_request_override() {
+        assert!(SameChunkingPolicy::full_model_encode(true).enabled());
+        assert!(!SameChunkingPolicy::full_model_encode(false).enabled());
+        assert!(SameChunkingPolicy::full_model_decode(true, None).enabled());
+        assert!(!SameChunkingPolicy::full_model_decode(false, None).enabled());
+        assert!(!SameChunkingPolicy::full_model_decode(true, Some(false)).enabled());
+        assert!(SameChunkingPolicy::full_model_decode(false, Some(true)).enabled());
+        assert!(!SameChunkingPolicy::standalone(false).enabled());
+        assert!(SameChunkingPolicy::standalone(true).enabled());
+    }
+
+    #[test]
+    fn outer_chunk_plan_matches_frozen_boundary_and_final_anchor_cases() {
+        let default = SameChunkingParameters::default();
+        for total in [0, 1, 127] {
+            let plan = SameChunkPlan::build(total, true, default).unwrap();
+            assert!(!plan.chunked, "{total}");
+            assert!(plan.starts.is_empty(), "{total}");
+        }
+
+        let cases = [
+            (128, vec![0]),
+            (129, vec![0, 1]),
+            (224, vec![0, 96]),
+            (225, vec![0, 96, 97]),
+            (256, vec![0, 96, 128]),
+            (257, vec![0, 96, 129]),
+            (
+                1292,
+                vec![
+                    0, 96, 192, 288, 384, 480, 576, 672, 768, 864, 960, 1056, 1152, 1164,
+                ],
+            ),
+            (
+                1300,
+                vec![
+                    0, 96, 192, 288, 384, 480, 576, 672, 768, 864, 960, 1056, 1152, 1172,
+                ],
+            ),
+            (
+                1358,
+                vec![
+                    0, 96, 192, 288, 384, 480, 576, 672, 768, 864, 960, 1056, 1152, 1230,
+                ],
+            ),
+        ];
+        for (total, expected) in cases {
+            let plan = SameChunkPlan::build(total, true, default).unwrap();
+            assert!(plan.chunked, "{total}");
+            assert_eq!(plan.starts, expected, "{total}");
+            assert_eq!(plan.ownership.first().unwrap().output_start, 0, "{total}");
+            assert_eq!(plan.ownership.last().unwrap().output_end, total, "{total}");
+            for pair in plan.ownership.windows(2) {
+                assert_eq!(pair[0].output_end, pair[1].output_start, "{total}");
+            }
+        }
+
+        let plan = SameChunkPlan::build(225, true, default).unwrap();
+        assert_eq!(
+            plan.ownership
+                .iter()
+                .map(|slice| (slice.output_start, slice.output_end))
+                .collect::<Vec<_>>(),
+            vec![(0, 112), (112, 113), (113, 225)]
+        );
+        let max = SameChunkPlan::build(4096, true, default).unwrap();
+        assert_eq!(max.starts.len(), 43);
+        assert_eq!(max.starts.last(), Some(&3968));
+        assert_eq!(max.starts.len() * max.chunk_size, 5504);
+    }
+
+    #[test]
+    fn outer_chunk_plan_preserves_floor_half_and_later_writer_ownership() {
+        for (chunk_size, overlap, total) in
+            [(7, 0, 19), (7, 1, 19), (7, 2, 19), (9, 3, 23), (9, 8, 23)]
+        {
+            let plan = SameChunkPlan::build(total, true, parameters(chunk_size, overlap)).unwrap();
+            let mut reconstructed = Vec::new();
+            for ownership in &plan.ownership {
+                for local in ownership.source_start..ownership.source_end {
+                    reconstructed.push((ownership.chunk_index, local));
+                }
+            }
+
+            let mut sequential = vec![(usize::MAX, usize::MAX); total];
+            let half = overlap / 2;
+            for (index, &start) in plan.starts.iter().enumerate() {
+                let left = if index == 0 { 0 } else { half };
+                let right = if index + 1 == plan.starts.len() {
+                    chunk_size
+                } else {
+                    chunk_size - half
+                };
+                for local in left..right {
+                    sequential[start + local] = (index, local);
+                }
+            }
+            assert_eq!(reconstructed, sequential, "{chunk_size}/{overlap}/{total}");
+            assert!(
+                sequential.iter().all(|owner| owner.0 != usize::MAX),
+                "{chunk_size}/{overlap}/{total}"
+            );
+        }
+    }
+
+    #[test]
+    fn outer_tensor_stitch_preserves_batch_channels_and_rejects_mutations() {
+        let device = Device::Cpu;
+        let parameters = parameters(7, 3);
+        let plan = SameChunkPlan::build(19, true, parameters).unwrap();
+        let chunks = plan
+            .starts
+            .iter()
+            .enumerate()
+            .map(|(chunk_index, _)| {
+                Tensor::from_vec(
+                    (0..2)
+                        .flat_map(|batch| {
+                            (0..2).flat_map(move |channel| {
+                                (0..parameters.chunk_size).map(move |local| {
+                                    (chunk_index * 1_000 + batch * 100 + channel * 10 + local)
+                                        as f32
+                                })
+                            })
+                        })
+                        .collect::<Vec<_>>(),
+                    (2, 2, parameters.chunk_size),
+                    &device,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let pieces = plan
+            .ownership
+            .iter()
+            .map(|ownership| owned_piece(&chunks[ownership.chunk_index], ownership).unwrap())
+            .collect();
+        let stitched = concatenate_owned(pieces, plan.total_units, "test")
+            .unwrap()
+            .to_vec3::<f32>()
+            .unwrap();
+
+        let mut sequential = vec![vec![vec![-1f32; plan.total_units]; 2]; 2];
+        let half = parameters.overlap / 2;
+        for (chunk_index, &start) in plan.starts.iter().enumerate() {
+            let left = if chunk_index == 0 { 0 } else { half };
+            let right = if chunk_index + 1 == plan.starts.len() {
+                parameters.chunk_size
+            } else {
+                parameters.chunk_size - half
+            };
+            for (batch, channels) in sequential.iter_mut().enumerate() {
+                for (channel, output) in channels.iter_mut().enumerate() {
+                    for local in left..right {
+                        output[start + local] =
+                            (chunk_index * 1_000 + batch * 100 + channel * 10 + local) as f32;
+                    }
+                }
+            }
+        }
+        assert_eq!(stitched, sequential);
+
+        let earlier_writer_at_final_anchor = chunks[2].to_vec3::<f32>().unwrap()[0][0][5];
+        assert_ne!(stitched[0][0][13], earlier_writer_at_final_anchor);
+        assert_eq!(
+            stitched[0][0][13],
+            chunks[3].to_vec3::<f32>().unwrap()[0][0][1]
+        );
+
+        let cropped = SameAutoencoder::crop_valid_prefix(
+            &Tensor::from_vec(
+                (0..40).map(|value| value as f32).collect(),
+                (2, 2, 10),
+                &device,
+            )
+            .unwrap(),
+            7,
+        )
+        .unwrap();
+        assert_eq!(cropped.dims3().unwrap(), (2, 2, 7));
+        assert!(SameAutoencoder::crop_valid_prefix(&cropped, 8).is_err());
+    }
+
+    #[test]
+    fn outer_chunk_validation_fails_closed_only_when_requested() {
+        assert!(SameChunkPlan::build(1, true, parameters(0, 0)).is_err());
+        assert!(SameChunkPlan::build(1, true, parameters(8, 8)).is_err());
+        assert!(SameChunkPlan::build(1, true, parameters(8, 9)).is_err());
+        assert!(SameChunkPlan::build(1, false, parameters(0, usize::MAX)).is_ok());
+        let ownership = SameChunkOwnership {
+            chunk_index: 0,
+            chunk_start: usize::MAX,
+            source_start: 0,
+            source_end: 1,
+            output_start: 0,
+            output_end: 1,
+        };
+        assert!(scale_ownership(&ownership, 2).is_err());
     }
 }

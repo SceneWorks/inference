@@ -10,7 +10,7 @@ on:
         type: choice
         required: true
         default: all
-        options: [all, llm, media, audio, same-l]
+        options: [all, llm, media, audio, same-l, same-chunked]
 
 permissions:
   contents: read
@@ -429,6 +429,54 @@ jobs:
         run: |
           cargo test --locked --release -p candle-audio-stable-audio-3 --features metal same_l_long_duration_roundtrip_resource_probe -- --ignored --nocapture
           SA3_SAME_L_RESOURCE_SAMPLES=16777216 cargo test --locked --release -p candle-audio-stable-audio-3 --features metal same_l_long_duration_roundtrip_resource_probe -- --ignored --nocapture
+
+  same-chunked-metal:
+    name: SAME outer chunking real weights (Metal)
+    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'same-chunked'
+    runs-on: [self-hosted, macOS, ARM64, real-weights]
+    env:
+      SA3_TEST_METAL: "1"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Configure immutable SAME snapshot paths
+        run: |
+          echo "SA3_SAME_S_SNAPSHOT=$RUNNER_TEMP/sa3-same-s/fbeb3dcf53a326e5682f38e22e7f740202d44232" >> "$GITHUB_ENV"
+          echo "SA3_SAME_L_SNAPSHOT=$RUNNER_TEMP/sa3-same-l/41acf79dd242877d6499a1108ca5dba5d5eecfc5" >> "$GITHUB_ENV"
+      - name: Toolchain and hardware versions
+        run: |
+          sw_vers
+          system_profiler SPHardwareDataType SPDisplaysDataType |
+            grep -E 'Model Name|Model Identifier|Chip|Total Number of Cores|Memory|Chipset Model|Metal Support'
+          rustc --version
+          cargo --version
+      - name: Materialize and verify immutable SAME snapshots
+        run: |
+          python3 -m pip install --disable-pip-version-check --target "$RUNNER_TEMP/huggingface-hub" "huggingface_hub==1.20.1"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model same-s --snapshot "$SA3_SAME_S_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model same-l --snapshot "$SA3_SAME_L_SNAPSHOT"
+      - name: Verify frozen SAME-S and SAME-L chunk ownership on Metal
+        run: |
+          SA3_CHUNKED_CASE=same_s cargo test --locked --release -p candle-audio-stable-audio-3 --features metal --test chunked_oracle chunked_same_s_and_same_l_match_frozen_torch_and_boundary_metrics -- --ignored --nocapture
+          SA3_CHUNKED_CASE=same_l cargo test --locked --release -p candle-audio-stable-audio-3 --features metal --test chunked_oracle chunked_same_s_and_same_l_match_frozen_torch_and_boundary_metrics -- --ignored --nocapture
+      - name: Measure and verify 120-second direct versus chunked resources
+        run: |
+          set -o pipefail
+          resource_log="$RUNNER_TEMP/sa3-chunked-resource.log"
+          : > "$resource_log"
+          for case in same_s same_l; do
+            for mode in direct chunked; do
+              for operation in encode decode; do
+                SA3_CHUNKED_CASE="$case" \
+                SA3_CHUNKED_RESOURCE_MODE="$mode" \
+                SA3_CHUNKED_RESOURCE_OPERATION="$operation" \
+                  cargo test --locked --release -p candle-audio-stable-audio-3 \
+                    --features metal --test chunked_oracle chunked_same_resource_probe \
+                    -- --ignored --nocapture 2>&1 | tee -a "$resource_log"
+              done
+            done
+          done
+          python3 scripts/reference/verify_sa3_chunked_resource_log.py \
+            "$resource_log" --json | tee "$RUNNER_TEMP/sa3-chunked-resource.json"
 
   same-l-cuda:
     name: SAME-L real weights (CUDA)

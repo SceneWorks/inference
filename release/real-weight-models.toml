@@ -108,6 +108,24 @@ environment = ["KOKORO_SNAPSHOT"]
 expected_files = ["config.json", "kokoro-v1_0.pth", "voices/af_heart.pt"]
 
 [[models]]
+# Standalone 108M SAME-S autoencoder used by the Stable Audio 3 outer-chunking parity and
+# long-duration resource gates.
+key = "same-s"
+repository = "stabilityai/SAME-S"
+revision = "fbeb3dcf53a326e5682f38e22e7f740202d44232"
+license = "Stability AI Community License"
+size_class = "large"
+profiles = ["audio-macos"]
+environment = ["SA3_SAME_S_SNAPSHOT"]
+expected_files = [
+    "model_config.json",
+    "model.safetensors",
+    "LICENSE.md",
+    "LICENSE_GEMMA.md",
+    "NOTICE",
+]
+
+[[models]]
 # Standalone 852M SAME-L autoencoder used by the Stable Audio 3 sliding-window parity and
 # maximum-duration resource gates. This repository is ungated; the full SA3 checkpoints remain
 # caller-provisioned because they carry a separate click-through license.
