@@ -16,7 +16,10 @@ candle-audio = { path = "../candle-audio" }
 candle-audio-kokoro = { path = "../candle-audio-kokoro" }
 candle-audio-moss-sfx = { path = "../candle-audio-moss-sfx" }
 candle-audio-acestep = { path = "../candle-audio-acestep" }
-# sc-14543: Stable Audio 3 small-music — 44.1 kHz stereo text-to-music diffusion.
+# sc-14543 / sc-14544: Stable Audio 3 small-music and small-sfx — 44.1 kHz stereo text-to-audio
+# diffusion. Two registered post-trained checkpoints on one architecture. The SFX variant overlaps
+# in intent with candle-audio-moss-sfx but is a different tier and output shape (44.1 kHz stereo up
+# to 120 s, against MOSS-SoundEffect's 48 kHz mono).
 candle-audio-stable-audio-3 = { path = "../candle-audio-stable-audio-3" }
 # sc-13392: MOSS-TTS-Realtime — streaming TTS (Qwen3-1.7B AR brain + the ported MOSS-Audio-Tokenizer
 # RLFQ codec). The audio lane's first streaming generator.
