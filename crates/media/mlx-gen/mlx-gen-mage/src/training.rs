@@ -140,11 +140,16 @@ pub struct MageFlowTrainer {
     /// its multi-GB residency for the (much larger) full-tune working set. Always `Some` on the LoRA
     /// path.
     transformer: Option<MageTransformer>,
-    /// The diffusers snapshot root (`text_encoder/ transformer/ vae/`) this trainer loaded from. The
-    /// full base fine-tune path (sc-14056) re-reads the raw `transformer/` checkpoint from here to seed
-    /// its f32 master-weight map and copies `transformer/config.json` beside the saved checkpoint so it
-    /// reloads through [`MageTransformer::load`]. The LoRA/LoKr path never touches it.
-    root: PathBuf,
+    /// The **resolved** DiT checkpoint directory this trainer loaded from. The full base fine-tune
+    /// path (sc-14056) re-reads the raw checkpoint from here to seed its f32 master-weight map and
+    /// copies its `config.json` beside the saved checkpoint so the result reloads through
+    /// [`MageTransformer::load`]. The LoRA/LoKr path never touches it.
+    ///
+    /// It is the dir [`crate::model::resolve_component_dirs`] resolved, not `root/transformer`:
+    /// under the sc-14980 split-tier mirror the DiT comes from the installed tier while the text
+    /// encoder and VAE are shared co-requisites staged from elsewhere, so re-deriving it from the
+    /// snapshot root would read the wrong (or a nonexistent) checkpoint.
+    transformer_dir: PathBuf,
 }
 
 fn trainer_descriptor() -> TrainerDescriptor {
@@ -177,12 +182,41 @@ pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
             ))
         }
     };
+    // sc-14980/sc-14979: training reads the DENSE base, which under the split mirror layout means
+    // the `bf16/` tier's DiT plus the SHARED text encoder + VAE staged as caller-provisioned
+    // co-requisite dirs. A flat snapshot (upstream, or an existing install) stages nothing and every
+    // component resolves under `root` exactly as before — the trainer is unchanged on that path.
+    let dirs = crate::model::resolve_component_dirs(root, spec)?;
+    // Training must never run against packed weights: the gradient path needs dense projections and
+    // `quantize` is a no-op over an already-packed base, so a q4/q8 tier would train silently wrong
+    // rather than fail. This is the engine-side twin of the app's `TrainingTierMissing` pre-flight.
+    for (label, dir) in [
+        ("transformer", &dirs.transformer),
+        ("text_encoder", &dirs.text_encoder),
+    ] {
+        let (Some(parent), Some(name)) = (dir.parent(), dir.file_name().and_then(|n| n.to_str()))
+        else {
+            continue;
+        };
+        if let Some(bits) = mlx_gen::quant::packed_quant_bits(parent, name)? {
+            return Err(mlx_gen::Error::Msg(format!(
+                "mage_flow_base trainer requires the dense bf16 base, but {label} at {} is a \
+                 pre-quantized Q{bits} artifact; install the bf16 tier to train",
+                dir.display()
+            )));
+        }
+    }
     Ok(Box::new(MageFlowTrainer {
         descriptor: trainer_descriptor(),
-        text_encoder: Some(crate::text_encoder::load(root)?),
-        vae: crate::vae::load(root.join("vae"), VaePart::Both, Dtype::Bfloat16)?,
-        transformer: Some(MageTransformer::load(root.join("transformer"))?),
-        root: root.clone(),
+        text_encoder: Some(crate::text_encoder::load_dir(&dirs.text_encoder)?),
+        vae: crate::vae::load(&dirs.vae, VaePart::Both, Dtype::Bfloat16)?,
+        transformer: Some(MageTransformer::load(&dirs.transformer)?),
+        // The full base fine-tune path (sc-14056) re-reads this exact checkpoint to seed its f32
+        // master weights, so keep the RESOLVED directory rather than re-deriving `root/transformer`
+        // later: under the sc-14980 split-tier mirror the DiT is the `bf16/` tier's while the text
+        // encoder and VAE are shared co-requisites staged from elsewhere, so `root` alone no longer
+        // determines where the checkpoint lives.
+        transformer_dir: dirs.transformer,
     }))
 }
 
@@ -707,7 +741,7 @@ impl MageFlowTrainer {
         on_progress: &mut dyn FnMut(TrainingProgress),
     ) -> Result<TrainingOutput> {
         let cfg = &req.config;
-        let transformer_dir = self.root.join("transformer");
+        let transformer_dir = self.transformer_dir.clone();
 
         // Free the pre-loaded bf16 DiT (LoRA-only) before allocating the much larger full-tune working
         // set: the full path never adapts it — it trains its own f32 master map — so holding the ~8 GB
