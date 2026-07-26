@@ -10,7 +10,7 @@ on:
         type: choice
         required: true
         default: all
-        options: [all, llm, media, audio]
+        options: [all, llm, media, audio, same-l]
 
 permissions:
   contents: read
@@ -397,6 +397,165 @@ jobs:
       # (macos/aarch64), so the exact-hash check gates here.
       - name: Run regression fixture
         run: cargo test --locked -p candle-audio-kokoro --test regression kokoro_regression_fixture -- --ignored --nocapture
+
+  same-l-metal:
+    name: SAME-L real weights (Metal)
+    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'same-l'
+    runs-on: [self-hosted, macOS, ARM64, real-weights]
+    env:
+      SA3_SAME_L_CASE: standalone
+      SA3_TEST_METAL: "1"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Configure immutable SAME-L snapshot path
+        run: echo "SA3_SAME_L_SNAPSHOT=$RUNNER_TEMP/sa3-same-l/41acf79dd242877d6499a1108ca5dba5d5eecfc5" >> "$GITHUB_ENV"
+      - name: Toolchain and hardware versions
+        run: |
+          sw_vers
+          system_profiler SPHardwareDataType SPDisplaysDataType |
+            grep -E 'Model Name|Model Identifier|Chip|Total Number of Cores|Memory|Chipset Model|Metal Support'
+          rustc --version
+          cargo --version
+      - name: Materialize and verify immutable SAME-L snapshot
+        run: |
+          python3 -m pip install --disable-pip-version-check --target "$RUNNER_TEMP/huggingface-hub" "huggingface_hub==1.20.1"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model same-l --snapshot "$SA3_SAME_L_SNAPSHOT"
+      - name: Verify SAME-L short and long band boundaries on Metal
+        run: |
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features metal same_l_short_standalone_and_embedded_match_every_band_layer -- --ignored --nocapture
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features metal same_l_long_durations_match_compact_band_boundaries -- --ignored --nocapture
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features metal same_l_variable_stride_padding_gather_and_noise_order_match_upstream -- --ignored --nocapture
+      - name: Measure literal 380-second and exact-max SAME-L roundtrips on Metal
+        run: |
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features metal same_l_long_duration_roundtrip_resource_probe -- --ignored --nocapture
+          SA3_SAME_L_RESOURCE_SAMPLES=16777216 cargo test --locked --release -p candle-audio-stable-audio-3 --features metal same_l_long_duration_roundtrip_resource_probe -- --ignored --nocapture
+
+  same-l-cuda:
+    name: SAME-L real weights (CUDA)
+    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'same-l'
+    runs-on: [self-hosted, windows, cuda, real-weights]
+    env:
+      SA3_SAME_L_CASE: standalone
+      SA3_TEST_CUDA: "1"
+      CUDA_COMPUTE_CAP: "80"
+      CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
+      VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Configure immutable SAME-L snapshot path
+        shell: cmd
+        run: echo SA3_SAME_L_SNAPSHOT=%RUNNER_TEMP%\sa3-same-l\41acf79dd242877d6499a1108ca5dba5d5eecfc5>>"%GITHUB_ENV%"
+      - name: Select Git Bash
+        shell: cmd
+        run: |
+          if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
+          echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+        with:
+          toolchain: 1.96.0
+          components: rustfmt, clippy
+      - name: Toolchain and hardware versions
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          rustc --version
+          cargo --version
+          nvidia-smi
+      - name: Materialize and verify immutable SAME-L snapshot
+        shell: cmd
+        run: |
+          python -m pip install --disable-pip-version-check --target "%RUNNER_TEMP%\huggingface-hub" "huggingface_hub==1.20.1"
+          set "PYTHONPATH=%RUNNER_TEMP%\huggingface-hub"
+          python scripts/release/ensure_model_snapshot.py --model same-l --snapshot "%SA3_SAME_L_SNAPSHOT%" || exit /b 1
+      - name: Verify SAME-L short and long band boundaries on CUDA
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda same_l_short_standalone_and_embedded_match_every_band_layer -- --ignored --nocapture || exit /b 1
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda same_l_long_durations_match_compact_band_boundaries -- --ignored --nocapture || exit /b 1
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda same_l_variable_stride_padding_gather_and_noise_order_match_upstream -- --ignored --nocapture || exit /b 1
+      - name: Measure literal 380-second and exact-max SAME-L roundtrips and peak CUDA allocation
+        shell: powershell
+        run: |
+          cmd /c "call `"$env:VCVARS`" && set" |
+            ForEach-Object {
+              if ($_ -match "^(.*?)=(.*)$") { Set-Item -Force "env:$($matches[1])" $matches[2] }
+            }
+          function Invoke-SameLProbe([string]$label, [string]$samples) {
+            if ($samples) {
+              $env:SA3_SAME_L_RESOURCE_SAMPLES = $samples
+            } else {
+              Remove-Item env:SA3_SAME_L_RESOURCE_SAMPLES -ErrorAction SilentlyContinue
+            }
+            $stdout = Join-Path $env:RUNNER_TEMP "same-l-resource-$label.stdout"
+            $stderr = Join-Path $env:RUNNER_TEMP "same-l-resource-$label.stderr"
+            $stop = Join-Path $env:RUNNER_TEMP "same-l-resource-$label.stop"
+            Remove-Item $stop -ErrorAction SilentlyContinue
+            $arguments = @(
+              "test", "--locked", "--release",
+              "-p", "candle-audio-stable-audio-3", "--features", "cuda",
+              "same_l_long_duration_roundtrip_resource_probe", "--", "--ignored", "--nocapture"
+            )
+            $baselineOutput = @(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits)
+            if ($LASTEXITCODE -ne 0) {
+              throw "nvidia-smi baseline query failed with exit code $LASTEXITCODE"
+            }
+            $baselineMiB = 0
+            $baselineText = [string]($baselineOutput | Select-Object -First 1)
+            if (-not [int]::TryParse($baselineText.Trim(), [ref]$baselineMiB)) {
+              throw "nvidia-smi baseline query returned an invalid value: '$baselineText'"
+            }
+            $sampler = Start-Job -ArgumentList $stop, $baselineMiB -ScriptBlock {
+              param([string]$stopPath, [int]$peakMiB)
+              while (-not (Test-Path $stopPath)) {
+                $sampleOutput = @(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits)
+                if ($LASTEXITCODE -ne 0) {
+                  throw "nvidia-smi sampler query failed with exit code $LASTEXITCODE"
+                }
+                $usedMiB = 0
+                $sampleText = [string]($sampleOutput | Select-Object -First 1)
+                if (-not [int]::TryParse($sampleText.Trim(), [ref]$usedMiB)) {
+                  throw "nvidia-smi sampler query returned an invalid value: '$sampleText'"
+                }
+                $peakMiB = [Math]::Max($peakMiB, $usedMiB)
+                Start-Sleep -Milliseconds 250
+              }
+              $peakMiB
+            }
+            try {
+              $process = Start-Process cargo -ArgumentList $arguments -Wait -PassThru `
+                -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+            } finally {
+              New-Item $stop -ItemType File -Force | Out-Null
+            }
+            Wait-Job $sampler | Out-Null
+            $samplerState = $sampler.State
+            try {
+              $samplerOutput = @(Receive-Job $sampler -ErrorAction Stop)
+            } finally {
+              Remove-Job $sampler -Force
+            }
+            if ($samplerState -ne "Completed") {
+              throw "nvidia-smi sampler job ended in state $samplerState"
+            }
+            if ($samplerOutput.Count -ne 1) {
+              throw "nvidia-smi sampler returned $($samplerOutput.Count) values; expected one"
+            }
+            $peakMiB = 0
+            if (-not [int]::TryParse(([string]$samplerOutput[0]).Trim(), [ref]$peakMiB)) {
+              throw "nvidia-smi sampler returned an invalid peak: '$($samplerOutput[0])'"
+            }
+            Get-Content $stdout
+            Get-Content $stderr
+            Write-Host "SA3_SAME_L_CUDA_MEMORY case=$label baseline_total_mib=$baselineMiB peak_total_mib=$peakMiB peak_delta_mib=$($peakMiB - $baselineMiB)"
+            if ($process.ExitCode -ne 0) { throw "SAME-L resource probe $label failed with exit code $($process.ExitCode)" }
+          }
+          Invoke-SameLProbe "literal-380s" ""
+          Invoke-SameLProbe "exact-max" "16777216"
+          # Start-Process does not update LASTEXITCODE. The vcvars bootstrap can
+          # leave it non-zero even after both foreground probes succeed, and
+          # GitHub's PowerShell wrapper propagates that stale value.
+          exit 0
 
   candle-llm:
     name: Candle LLM real weights (CUDA)

@@ -108,6 +108,25 @@ environment = ["KOKORO_SNAPSHOT"]
 expected_files = ["config.json", "kokoro-v1_0.pth", "voices/af_heart.pt"]
 
 [[models]]
+# Standalone 852M SAME-L autoencoder used by the Stable Audio 3 sliding-window parity and
+# maximum-duration resource gates. This repository is ungated; the full SA3 checkpoints remain
+# caller-provisioned because they carry a separate click-through license.
+key = "same-l"
+repository = "stabilityai/SAME-L"
+revision = "41acf79dd242877d6499a1108ca5dba5d5eecfc5"
+license = "Stability AI Community License"
+size_class = "very-large"
+profiles = ["audio-macos", "audio-cuda"]
+environment = ["SA3_SAME_L_SNAPSHOT"]
+expected_files = [
+    "model_config.json",
+    "model.safetensors",
+    "LICENSE.md",
+    "LICENSE_GEMMA.md",
+    "NOTICE",
+]
+
+[[models]]
 key = "moss-soundeffect-v2"
 repository = "OpenMOSS-Team/MOSS-SoundEffect-v2.0"
 revision = "e35df4d82fbe87fcd5d14e5d100e349c0c3c076d"

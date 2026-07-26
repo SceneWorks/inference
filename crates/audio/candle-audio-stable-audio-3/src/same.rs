@@ -27,6 +27,21 @@ enum Direction {
     Decode,
 }
 
+/// Upstream's default bounded query size for the SAME-L chunked-halo fallback.
+pub const SAME_BAND_QUERY_TILE: usize = 1024;
+
+/// Config-driven transformer layout. SAME-S folds independent full-attention chunks; SAME-L keeps
+/// one globally positioned sequence and evaluates a bounded attention band.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SameAttentionSchedule {
+    Full,
+    Band {
+        latent_left: usize,
+        latent_right: usize,
+        query_tile: usize,
+    },
+}
+
 /// Semantic identity of one SAME stochastic draw.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SameNoiseKind {
@@ -155,16 +170,36 @@ struct SameTransformerLayer {
 pub struct ResamplingTrace {
     /// Sequence after channel mapping and transpose, before segment folding.
     pub mapped_sequence: Tensor,
-    /// Folded 34-token chunks presented to the first transformer block.
+    /// Folded chunks for [`SameAttentionSchedule::Full`], or the globally packed sequence for
+    /// [`SameAttentionSchedule::Band`].
     pub folded_input: Tensor,
     /// Learned tokens after variable-stride expansion and any configured/explicit noise.
     pub expanded_tokens: Tensor,
     /// Output of every transformer block, restored to `[B, sequence, D]` and edge-cropped.
     pub block_outputs: Vec<Tensor>,
+    /// Compact absolute-position slices for every band-attention layer. Full layer activations are
+    /// deliberately never retained by the SAME-L trace path.
+    pub band_layers: Vec<BandLayerTrace>,
+    pub layout: SameAttentionSchedule,
     /// The selected learned-token portion of every final `(stride + 1)` subchunk.
     pub selected_segments: Tensor,
     /// Final channel-first block output.
     pub output: Tensor,
+}
+
+/// One compact globally positioned activation slice.
+#[derive(Clone)]
+pub struct BandBoundarySlice {
+    pub start: usize,
+    pub values: Tensor,
+}
+
+/// Bounded evidence for one globally packed SAME-L transformer layer.
+#[derive(Clone)]
+pub struct BandLayerTrace {
+    pub layer: usize,
+    pub sequence_len: usize,
+    pub slices: Vec<BandBoundarySlice>,
 }
 
 /// Frozen-input transformer evidence used to separate per-layer parity from accumulated roundoff.
@@ -183,6 +218,7 @@ struct TransformerResamplingBlock {
     stride: usize,
     chunk_size: usize,
     chunk_midpoint_shift: bool,
+    attention_schedule: SameAttentionSchedule,
     variable_stride: bool,
     mask_noise: f64,
 }
@@ -194,6 +230,7 @@ struct BlockOptions {
     dim_head: usize,
     chunk_size: usize,
     chunk_midpoint_shift: bool,
+    attention_schedule: SameAttentionSchedule,
     differential: bool,
     variable_stride: bool,
     mask_noise: f64,
@@ -213,15 +250,30 @@ impl TransformerResamplingBlock {
         options: BlockOptions,
         vb: VarBuilder,
     ) -> Result<Self> {
-        if options.stride == 0 || options.chunk_size == 0 {
-            bail!("SAME stride and chunk_size must be non-zero")
+        if options.stride == 0 {
+            bail!("SAME stride must be non-zero")
         }
-        if !options.chunk_size.is_multiple_of(options.stride) {
-            bail!(
-                "SAME stride {} must divide chunk_size {}",
-                options.stride,
-                options.chunk_size
-            )
+        match options.attention_schedule {
+            SameAttentionSchedule::Full => {
+                if options.chunk_size == 0 {
+                    bail!("SAME full-attention chunk_size must be non-zero")
+                }
+                if !options.chunk_size.is_multiple_of(options.stride) {
+                    bail!(
+                        "SAME stride {} must divide chunk_size {}",
+                        options.stride,
+                        options.chunk_size
+                    )
+                }
+            }
+            SameAttentionSchedule::Band { query_tile, .. } => {
+                if query_tile == 0 {
+                    bail!("SAME band-attention query tile must be non-zero")
+                }
+                if options.chunk_midpoint_shift {
+                    bail!("SAME band attention cannot use chunk_midpoint_shift")
+                }
+            }
         }
         let transformer_dim = match direction {
             Direction::Encode => out_channels,
@@ -315,6 +367,7 @@ impl TransformerResamplingBlock {
             stride: options.stride,
             chunk_size: options.chunk_size,
             chunk_midpoint_shift: options.chunk_midpoint_shift,
+            attention_schedule: options.attention_schedule,
             variable_stride: options.variable_stride,
             mask_noise: options.mask_noise,
         })
@@ -327,9 +380,14 @@ impl TransformerResamplingBlock {
                 if !self.variable_stride {
                     bail!("SAME stride override requires variable_stride=true")
                 }
-                if stride == 0 || !self.chunk_size.is_multiple_of(stride) {
+                if stride == 0 {
+                    bail!("SAME override stride must be non-zero")
+                }
+                if self.attention_schedule == SameAttentionSchedule::Full
+                    && !self.chunk_size.is_multiple_of(stride)
+                {
                     bail!(
-                        "SAME override stride {stride} must be non-zero and divide chunk_size {}",
+                        "SAME full-attention override stride {stride} must divide chunk_size {}",
                         self.chunk_size
                     )
                 }
@@ -360,7 +418,11 @@ impl TransformerResamplingBlock {
 
         let mut x = x.clone();
         if self.direction == Direction::Encode && !self.transformers.is_empty() {
-            x = zero_pad_channel_first(&x, self.chunk_size)?;
+            let modulo = match self.attention_schedule {
+                SameAttentionSchedule::Full => self.chunk_size,
+                SameAttentionSchedule::Band { .. } => input_segment,
+            };
+            x = zero_pad_channel_first(&x, modulo)?;
         }
         if self.direction == Direction::Encode {
             x = self.mapping.forward(&x)?;
@@ -373,9 +435,13 @@ impl TransformerResamplingBlock {
         }
 
         x = x.transpose(1, 2)?;
-        let mapped_sequence = x.clone();
+        let mapped_sequence = trace.then(|| x.clone());
         if self.direction == Direction::Decode {
-            x = zero_pad_sequence(&x, self.chunk_size / stride)?;
+            let modulo = match self.attention_schedule {
+                SameAttentionSchedule::Full => self.chunk_size / stride,
+                SameAttentionSchedule::Band { .. } => input_segment,
+            };
+            x = zero_pad_sequence(&x, modulo)?;
         }
         let (_, length, dim) = x.dims3()?;
         if !length.is_multiple_of(input_segment) {
@@ -423,81 +489,116 @@ impl TransformerResamplingBlock {
             };
             tokens = (&tokens + noise)?;
         }
-        let expanded_tokens = tokens.reshape((batch, segments * output_segment, dim))?;
+        let expanded_tokens = trace
+            .then(|| tokens.reshape((batch, segments * output_segment, dim)))
+            .transpose()?;
         x = Tensor::cat(&[&x, &tokens], 1)?
             .reshape((batch, segments, sub_chunk, dim))?
             .reshape((batch, segments * sub_chunk, dim))?;
+        drop(tokens);
 
-        let effective_chunk = self.chunk_size + self.chunk_size / stride;
-        if !x.dim(1)?.is_multiple_of(effective_chunk) {
-            bail!(
-                "SAME folded sequence {} is not divisible by effective chunk {effective_chunk}",
-                x.dim(1)?
-            )
-        }
-        let folded_input = fold_chunks(&x, effective_chunk)?;
         let mut block_outputs = Vec::with_capacity(self.transformers.len());
-        if self.chunk_midpoint_shift {
-            let split = self.transformers.len() / 2;
-            let shift = effective_chunk / 2;
-            let mut folded = folded_input.clone();
-            for layer in &self.transformers[..split] {
-                let rope = layer.rope.frequencies(effective_chunk)?;
-                folded = layer.block.forward(
-                    &folded,
-                    None,
-                    None,
-                    None,
-                    Some(&rope),
-                    None,
-                    TransformerBlockMasks::default(),
-                )?;
-                if trace {
-                    block_outputs.push(unfold_chunks(&folded, batch)?);
+        let mut band_layers = Vec::with_capacity(self.transformers.len());
+        let trace_input = match self.attention_schedule {
+            SameAttentionSchedule::Full => {
+                let effective_chunk = self.chunk_size + self.chunk_size / stride;
+                if !x.dim(1)?.is_multiple_of(effective_chunk) {
+                    bail!(
+                        "SAME folded sequence {} is not divisible by effective chunk {effective_chunk}",
+                        x.dim(1)?
+                    )
                 }
-            }
-            x = unfold_chunks(&folded, batch)?;
-            let first = x.narrow(1, 0, shift)?;
-            let last = x.narrow(1, x.dim(1)? - shift, shift)?;
-            x = Tensor::cat(&[&first, &x, &last], 1)?;
-            folded = fold_chunks(&x, effective_chunk)?;
-            for layer in &self.transformers[split..] {
-                let rope = layer.rope.frequencies(effective_chunk)?;
-                folded = layer.block.forward(
-                    &folded,
-                    None,
-                    None,
-                    None,
-                    Some(&rope),
-                    None,
-                    TransformerBlockMasks::default(),
-                )?;
-                if trace {
-                    let restored = unfold_chunks(&folded, batch)?;
-                    block_outputs.push(restored.narrow(1, shift, restored.dim(1)? - 2 * shift)?);
+                let folded_input = fold_chunks(&x, effective_chunk)?;
+                if self.chunk_midpoint_shift {
+                    let split = self.transformers.len() / 2;
+                    let shift = effective_chunk / 2;
+                    let mut folded = folded_input.clone();
+                    for layer in &self.transformers[..split] {
+                        let rope = layer.rope.frequencies(effective_chunk)?;
+                        folded = layer.block.forward(
+                            &folded,
+                            None,
+                            None,
+                            None,
+                            Some(&rope),
+                            None,
+                            TransformerBlockMasks::default(),
+                        )?;
+                        if trace {
+                            block_outputs.push(unfold_chunks(&folded, batch)?);
+                        }
+                    }
+                    x = unfold_chunks(&folded, batch)?;
+                    let first = x.narrow(1, 0, shift)?;
+                    let last = x.narrow(1, x.dim(1)? - shift, shift)?;
+                    x = Tensor::cat(&[&first, &x, &last], 1)?;
+                    folded = fold_chunks(&x, effective_chunk)?;
+                    for layer in &self.transformers[split..] {
+                        let rope = layer.rope.frequencies(effective_chunk)?;
+                        folded = layer.block.forward(
+                            &folded,
+                            None,
+                            None,
+                            None,
+                            Some(&rope),
+                            None,
+                            TransformerBlockMasks::default(),
+                        )?;
+                        if trace {
+                            let restored = unfold_chunks(&folded, batch)?;
+                            block_outputs.push(restored.narrow(
+                                1,
+                                shift,
+                                restored.dim(1)? - 2 * shift,
+                            )?);
+                        }
+                    }
+                    x = unfold_chunks(&folded, batch)?;
+                    x = x.narrow(1, shift, x.dim(1)? - 2 * shift)?;
+                } else {
+                    let mut folded = folded_input.clone();
+                    for layer in &self.transformers {
+                        let rope = layer.rope.frequencies(effective_chunk)?;
+                        folded = layer.block.forward(
+                            &folded,
+                            None,
+                            None,
+                            None,
+                            Some(&rope),
+                            None,
+                            TransformerBlockMasks::default(),
+                        )?;
+                        if trace {
+                            block_outputs.push(unfold_chunks(&folded, batch)?);
+                        }
+                    }
+                    x = unfold_chunks(&folded, batch)?;
                 }
+                trace.then(|| folded_input.clone())
             }
-            x = unfold_chunks(&folded, batch)?;
-            x = x.narrow(1, shift, x.dim(1)? - 2 * shift)?;
-        } else {
-            let mut folded = folded_input.clone();
-            for layer in &self.transformers {
-                let rope = layer.rope.frequencies(effective_chunk)?;
-                folded = layer.block.forward(
-                    &folded,
-                    None,
-                    None,
-                    None,
-                    Some(&rope),
-                    None,
-                    TransformerBlockMasks::default(),
-                )?;
-                if trace {
-                    block_outputs.push(unfold_chunks(&folded, batch)?);
+            SameAttentionSchedule::Band {
+                latent_left,
+                latent_right,
+                query_tile,
+            } => {
+                let packed_input = trace.then(|| x.clone());
+                let left = latent_left.saturating_mul(sub_chunk);
+                let right = latent_right.saturating_mul(sub_chunk);
+                for (index, layer) in self.transformers.iter().enumerate() {
+                    x = layer
+                        .block
+                        .forward_band(&x, &layer.rope, left, right, query_tile)?;
+                    if trace {
+                        band_layers.push(BandLayerTrace {
+                            layer: index,
+                            sequence_len: x.dim(1)?,
+                            slices: band_boundary_slices(&x, sub_chunk, left, right, query_tile)?,
+                        });
+                    }
                 }
+                packed_input
             }
-            x = unfold_chunks(&folded, batch)?;
-        }
+        };
 
         if !x.dim(1)?.is_multiple_of(sub_chunk) {
             bail!(
@@ -517,10 +618,12 @@ impl TransformerResamplingBlock {
             x = self.mapping.forward(&x)?;
         }
         let result_trace = trace.then(|| ResamplingTrace {
-            mapped_sequence,
-            folded_input,
-            expanded_tokens,
+            mapped_sequence: mapped_sequence.expect("mapped sequence exists when tracing"),
+            folded_input: trace_input.expect("trace input exists when tracing"),
+            expanded_tokens: expanded_tokens.expect("expanded tokens exist when tracing"),
             block_outputs,
+            band_layers,
+            layout: self.attention_schedule,
             selected_segments,
             output: x.clone(),
         });
@@ -541,6 +644,40 @@ impl TransformerResamplingBlock {
             )
         }
         let stride = self.active_stride(override_stride)?;
+        if let SameAttentionSchedule::Band {
+            latent_left,
+            latent_right,
+            query_tile,
+        } = self.attention_schedule
+        {
+            let sub_chunk = stride + 1;
+            let left = latent_left.saturating_mul(sub_chunk);
+            let right = latent_right.saturating_mul(sub_chunk);
+            let mut block_outputs = Vec::with_capacity(self.transformers.len());
+            let mut final_raw = None;
+            for (index, (layer, input)) in self
+                .transformers
+                .iter()
+                .zip(block_inputs.iter())
+                .enumerate()
+            {
+                if input.dim(0)? != batch {
+                    bail!(
+                        "SAME controlled band block {index} has batch {}, expected {batch}",
+                        input.dim(0)?
+                    )
+                }
+                let raw = layer
+                    .block
+                    .forward_band(input, &layer.rope, left, right, query_tile)?;
+                block_outputs.push(raw.clone());
+                final_raw = Some(raw);
+            }
+            let Some(sequence) = final_raw else {
+                bail!("SAME controlled trace requires a block")
+            };
+            return self.controlled_output(sequence, batch, stride, block_outputs);
+        }
         let effective_chunk = self.chunk_size + self.chunk_size / stride;
         let split = self.transformers.len() / 2;
         let shift = effective_chunk / 2;
@@ -582,6 +719,16 @@ impl TransformerResamplingBlock {
         if self.chunk_midpoint_shift {
             sequence = sequence.narrow(1, shift, sequence.dim(1)? - 2 * shift)?;
         }
+        self.controlled_output(sequence, batch, stride, block_outputs)
+    }
+
+    fn controlled_output(
+        &self,
+        sequence: Tensor,
+        batch: usize,
+        stride: usize,
+        block_outputs: Vec<Tensor>,
+    ) -> Result<ControlledResamplingTrace> {
         let output_segment = match self.direction {
             Direction::Encode => 1,
             Direction::Decode => stride,
@@ -608,6 +755,41 @@ impl TransformerResamplingBlock {
             output,
         })
     }
+}
+
+fn band_boundary_slices(
+    x: &Tensor,
+    sub_chunk: usize,
+    left: usize,
+    right: usize,
+    query_tile: usize,
+) -> Result<Vec<BandBoundarySlice>> {
+    let sequence_len = x.dim(1)?;
+    if sequence_len == 0 {
+        return Ok(Vec::new());
+    }
+    let width = sequence_len.min((left + right + 1).max(sub_chunk).max(1));
+    let radius = width / 2;
+    let mut starts = vec![0, sequence_len.saturating_sub(width)];
+    for boundary in [sub_chunk, query_tile, sequence_len / 2] {
+        if boundary > 0 && boundary < sequence_len {
+            starts.push(boundary.saturating_sub(radius).min(sequence_len - width));
+        }
+    }
+    starts.sort_unstable();
+    starts.dedup();
+    starts
+        .into_iter()
+        .map(|start| {
+            Ok(BandBoundarySlice {
+                start,
+                // `narrow` is a view and would otherwise keep the complete layer allocation alive
+                // for every trace slice. Force a storage copy so the compact trace is compact in
+                // memory as well as in logical shape.
+                values: x.narrow(1, start, width)?.force_contiguous()?,
+            })
+        })
+        .collect()
 }
 
 fn zero_pad_channel_first(x: &Tensor, modulo: usize) -> Result<Tensor> {
@@ -752,6 +934,18 @@ impl SameAutoencoder {
         Ok(self
             .encode_internal(audio, override_strides, Some(mask_noises), None, false)?
             .0)
+    }
+
+    /// Explicit-noise encoder parity seam with compact layout-aware layer tracing.
+    pub fn encode_with_noise_and_trace(
+        &self,
+        audio: &Tensor,
+        override_strides: Option<&[usize]>,
+        mask_noises: &[Tensor],
+    ) -> Result<(Tensor, SameTrace)> {
+        let (output, stages) =
+            self.encode_internal(audio, override_strides, Some(mask_noises), None, true)?;
+        Ok((output.clone(), SameTrace { stages, output }))
     }
 
     pub fn encode_with_trace(
@@ -1040,9 +1234,16 @@ fn validate_supported(config: &AutoencoderConfig) -> Result<()> {
             config.latent_dim
         )
     }
-    if encoder.sliding_window.is_some() || decoder.sliding_window.is_some() {
-        bail!("SAME sliding-window attention is not yet available; use the contiguous SAME runtime")
-    }
+    validate_attention_schedule(
+        "encoder",
+        &encoder.sliding_window,
+        encoder.chunk_midpoint_shift,
+    )?;
+    validate_attention_schedule(
+        "decoder",
+        &decoder.sliding_window,
+        decoder.chunk_midpoint_shift,
+    )?;
     if encoder.conformer || decoder.conformer {
         bail!("SAME conformer blocks are not supported by shipped SA3 checkpoints")
     }
@@ -1071,6 +1272,36 @@ fn validate_supported(config: &AutoencoderConfig) -> Result<()> {
     Ok(())
 }
 
+fn validate_attention_schedule(
+    direction: &str,
+    sliding_window: &Option<Vec<usize>>,
+    chunk_midpoint_shift: bool,
+) -> Result<()> {
+    if let Some(window) = sliding_window {
+        if window.len() != 2 {
+            bail!(
+                "SAME {direction} sliding_window must contain exactly [left,right], got {} values",
+                window.len()
+            )
+        }
+        if chunk_midpoint_shift {
+            bail!("SAME {direction} sliding_window cannot use chunk_midpoint_shift")
+        }
+    }
+    Ok(())
+}
+
+fn attention_schedule(window: &Option<Vec<usize>>) -> SameAttentionSchedule {
+    match window {
+        Some(window) => SameAttentionSchedule::Band {
+            latent_left: window[0],
+            latent_right: window[1],
+            query_tile: SAME_BAND_QUERY_TILE,
+        },
+        None => SameAttentionSchedule::Full,
+    }
+}
+
 fn load_encoder(config: &EncoderConfig, vb: VarBuilder) -> Result<Vec<TransformerResamplingBlock>> {
     let mut dimensions = Vec::with_capacity(config.c_mults.len() + 1);
     dimensions.push(config.in_channels);
@@ -1087,6 +1318,7 @@ fn load_encoder(config: &EncoderConfig, vb: VarBuilder) -> Result<Vec<Transforme
                 dim_head: config.dim_heads,
                 chunk_size: config.chunk_size,
                 chunk_midpoint_shift: config.chunk_midpoint_shift,
+                attention_schedule: attention_schedule(&config.sliding_window),
                 differential: config.differential,
                 variable_stride: config.variable_stride,
                 mask_noise: config.mask_noise,
@@ -1120,6 +1352,7 @@ fn load_decoder(config: &DecoderConfig, vb: VarBuilder) -> Result<Vec<Transforme
                 dim_head: config.dim_heads,
                 chunk_size: config.chunk_size,
                 chunk_midpoint_shift: config.chunk_midpoint_shift,
+                attention_schedule: attention_schedule(&config.sliding_window),
                 differential: config.differential,
                 variable_stride: config.variable_stride,
                 mask_noise: config.mask_noise,

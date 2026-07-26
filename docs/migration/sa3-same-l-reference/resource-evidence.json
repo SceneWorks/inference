@@ -1,0 +1,45 @@
+{
+  "backend": "Cpu",
+  "channels": 2,
+  "dtype": "F32",
+  "hardware": {
+    "cpuCores": 18,
+    "memoryBytes": 137438953472,
+    "model": "Apple M5 Max"
+  },
+  "queryTile": 1024,
+  "releaseProfile": true,
+  "runs": {
+    "exactMaximum": {
+      "checksum": -20443.29296875,
+      "decodeSeconds": 296.65371,
+      "encodeSeconds": 257.091381,
+      "inputSamples": 16777216,
+      "latentLength": 4096,
+      "loadPeakRssBytes": 6830161920,
+      "loadSeconds": 0.355389,
+      "packedLength": 69632,
+      "paddedSamples": 16777216,
+      "pcmSha256": "a357fb9f39b6dcfce24363f54127838d64087a6c93af4b6480a417f6ff80a809",
+      "peakRssBytes": 7203241984
+    },
+    "literal380Seconds": {
+      "checksum": -11548.334960938,
+      "decodeSeconds": 253.865439,
+      "encodeSeconds": 255.180838,
+      "inputSamples": 16758000,
+      "latentLength": 4092,
+      "loadPeakRssBytes": 6830112768,
+      "loadSeconds": 0.368862,
+      "packedLength": 69564,
+      "paddedSamples": 16760832,
+      "pcmSha256": "e453aaa90f24121fdbbe33e880be4fc2a92dd219ab6b39ab18d2feb3761cf9d1",
+      "peakRssBytes": 7455899648
+    }
+  },
+  "sampleRate": 44100,
+  "schemaVersion": 1,
+  "seed": 14539,
+  "story": "sc-14539",
+  "warmupSamples": 16384
+}

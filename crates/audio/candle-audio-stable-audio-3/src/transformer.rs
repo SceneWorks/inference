@@ -147,13 +147,36 @@ impl RotaryEmbedding {
             bail!("rotary dimension must be positive and even, got {dim}")
         }
         Ok(Self {
-            inv_freq: vb.get(dim / 2, "inv_freq")?,
+            // RoPE is intentionally evaluated in fp32 even when model weights use fp16.
+            // Request the persisted buffer at its compute dtype instead of inheriting the
+            // VarBuilder dtype; otherwise fp32 positions and fp16 frequencies cannot matmul.
+            inv_freq: vb.get_with_hints_dtype(
+                dim / 2,
+                "inv_freq",
+                Default::default(),
+                DType::F32,
+            )?,
         })
     }
 
     pub fn frequencies(&self, len: usize) -> Result<Tensor> {
-        let positions =
-            Tensor::arange(0u32, len as u32, self.inv_freq.device())?.to_dtype(DType::F32)?;
+        self.frequencies_range(0, len)
+    }
+
+    /// Build absolute-position frequencies for a bounded sequence range.
+    ///
+    /// SAME-L attention projects query tiles and their key/value halos independently.  Generating
+    /// the table from the global range keeps RoPE positions identical to the unchunked model without
+    /// retaining a full-sequence table in every layer.
+    pub fn frequencies_range(&self, start: usize, len: usize) -> Result<Tensor> {
+        let end = start
+            .checked_add(len)
+            .ok_or_else(|| candle_audio::candle_core::Error::Msg("RoPE range overflow".into()))?;
+        let start = u32::try_from(start)
+            .map_err(|_| candle_audio::candle_core::Error::Msg("RoPE start exceeds u32".into()))?;
+        let end = u32::try_from(end)
+            .map_err(|_| candle_audio::candle_core::Error::Msg("RoPE end exceeds u32".into()))?;
+        let positions = Tensor::arange(start, end, self.inv_freq.device())?.to_dtype(DType::F32)?;
         let freqs = positions
             .unsqueeze(1)?
             .matmul(&self.inv_freq.unsqueeze(0)?)?;
@@ -611,6 +634,97 @@ impl Attention {
         }
         self.to_out.forward(&from_heads(&out)?)
     }
+
+    /// Execute one bounded query tile of self-attention against its key/value halo.
+    ///
+    /// The fused projection is evaluated only for the query rows and halo rows.  Unused projection
+    /// components are discarded, but no full-sequence Q/K/V tensor or score matrix is materialized.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_self_band_tile(
+        &self,
+        query_input: &Tensor,
+        key_value_input: &Tensor,
+        query_start: usize,
+        key_start: usize,
+        left: usize,
+        right: usize,
+        query_rotary: &Tensor,
+        key_rotary: &Tensor,
+    ) -> Result<Tensor> {
+        if self.causal {
+            bail!("band self-attention does not support causal mode")
+        }
+        let Projection::SelfFused(projection) = &self.projection else {
+            bail!("band self-attention requires the fused self-attention projection")
+        };
+        let query_all = projection.forward(query_input)?;
+        let key_value_all = projection.forward(key_value_input)?;
+        let dim = self.num_heads * self.dim_head;
+        let mut q = to_heads(
+            &query_all.narrow(D::Minus1, 0, dim)?,
+            self.num_heads,
+            self.dim_head,
+        )?;
+        let mut k = to_heads(
+            &key_value_all.narrow(D::Minus1, dim, dim)?,
+            self.num_heads,
+            self.dim_head,
+        )?;
+        let v = to_heads(
+            &key_value_all.narrow(D::Minus1, 2 * dim, dim)?,
+            self.num_heads,
+            self.dim_head,
+        )?;
+        let mut q_diff = self
+            .differential
+            .then(|| {
+                to_heads(
+                    &query_all.narrow(D::Minus1, 3 * dim, dim)?,
+                    self.num_heads,
+                    self.dim_head,
+                )
+            })
+            .transpose()?;
+        let mut k_diff = self
+            .differential
+            .then(|| {
+                to_heads(
+                    &key_value_all.narrow(D::Minus1, 4 * dim, dim)?,
+                    self.num_heads,
+                    self.dim_head,
+                )
+            })
+            .transpose()?;
+        (q, k) = self.normalize(q, k)?;
+        if let (Some(qd), Some(kd)) = (q_diff.take(), k_diff.take()) {
+            let (qd, kd) = self.normalize(qd, kd)?;
+            q_diff = Some(qd);
+            k_diff = Some(kd);
+        }
+        q = apply_rotary(&q, query_rotary)?;
+        k = apply_rotary(&k, key_rotary)?;
+        if let Some(qd) = q_diff.as_mut() {
+            *qd = apply_rotary(qd, query_rotary)?;
+        }
+        if let Some(kd) = k_diff.as_mut() {
+            *kd = apply_rotary(kd, key_rotary)?;
+        }
+        let mask = sliding_window_additive_mask_with_offsets(
+            query_start,
+            query_input.dim(1)?,
+            key_start,
+            key_value_input.dim(1)?,
+            left,
+            right,
+            q.dtype(),
+            q.device(),
+        )?;
+        let mut out = self.attend(&q, &k, &v, None, Some(&mask))?;
+        if let (Some(qd), Some(kd)) = (&q_diff, &k_diff) {
+            out = combine_differential(&out, &self.attend(qd, kd, &v, None, Some(&mask))?)?;
+        }
+        self.to_out.forward(&from_heads(&out)?)
+    }
 }
 
 /// Learned memory-token prepend/extend/trim seam used by the shipped small and medium DiTs.
@@ -711,15 +825,66 @@ pub fn sliding_window_additive_mask(
     dtype: DType,
     device: &Device,
 ) -> Result<Tensor> {
+    sliding_window_additive_mask_with_offsets(0, query_len, 0, key_len, left, right, dtype, device)
+}
+
+/// Build a local band mask using absolute query/key offsets.
+#[allow(clippy::too_many_arguments)]
+pub fn sliding_window_additive_mask_with_offsets(
+    query_start: usize,
+    query_len: usize,
+    key_start: usize,
+    key_len: usize,
+    left: usize,
+    right: usize,
+    dtype: DType,
+    device: &Device,
+) -> Result<Tensor> {
     let mut values = vec![0f32; query_len * key_len];
     for i in 0..query_len {
         for j in 0..key_len {
-            if j.saturating_add(left) < i || j > i.saturating_add(right) {
+            let query = query_start.saturating_add(i);
+            let key = key_start.saturating_add(j);
+            if key.saturating_add(left) < query || key > query.saturating_add(right) {
                 values[i * key_len + j] = f32::NEG_INFINITY;
             }
         }
     }
     Tensor::from_vec(values, (query_len, key_len), device)?.to_dtype(dtype)
+}
+
+/// One bounded query tile and the key/value halo required to evaluate it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BandAttentionTile {
+    pub query_start: usize,
+    pub query_len: usize,
+    pub key_start: usize,
+    pub key_len: usize,
+}
+
+/// Pure allocation plan used by the SAME-L runtime and its no-dense-fallback structural tests.
+pub fn band_attention_plan(
+    sequence_len: usize,
+    left: usize,
+    right: usize,
+    query_tile: usize,
+) -> Result<Vec<BandAttentionTile>> {
+    if query_tile == 0 {
+        bail!("band attention query tile must be non-zero")
+    }
+    let mut tiles = Vec::with_capacity(sequence_len.div_ceil(query_tile));
+    for query_start in (0..sequence_len).step_by(query_tile) {
+        let query_end = sequence_len.min(query_start.saturating_add(query_tile));
+        let key_start = query_start.saturating_sub(left);
+        let key_end = sequence_len.min(query_end.saturating_add(right));
+        tiles.push(BandAttentionTile {
+            query_start,
+            query_len: query_end - query_start,
+            key_start,
+            key_len: key_end - key_start,
+        });
+    }
+    Ok(tiles)
 }
 
 pub struct TransformerBlock {
@@ -931,6 +1096,57 @@ impl TransformerBlock {
         }
         Ok(x)
     }
+
+    /// Bounded global sliding-window execution for SAME-L.
+    ///
+    /// Every normalization, attention projection, score matrix, and feed-forward intermediate is
+    /// evaluated per query tile.  The returned hidden state remains globally packed so all twelve
+    /// layers share absolute sequence positions.
+    pub fn forward_band(
+        &self,
+        x: &Tensor,
+        rope: &RotaryEmbedding,
+        left: usize,
+        right: usize,
+        query_tile: usize,
+    ) -> Result<Tensor> {
+        if self.cross.is_some() || self.to_scale_shift_gate.is_some() || self.local.is_some() {
+            bail!("SAME band blocks support only unconditioned self-attention")
+        }
+        let sequence_len = x.dim(1)?;
+        let plan = band_attention_plan(sequence_len, left, right, query_tile)?;
+        let mut attended = Vec::with_capacity(plan.len());
+        for tile in &plan {
+            let query = x.narrow(1, tile.query_start, tile.query_len)?;
+            let keys = x.narrow(1, tile.key_start, tile.key_len)?;
+            let normalized_query = self.pre_norm.forward(&query)?;
+            let normalized_keys = self.pre_norm.forward(&keys)?;
+            let query_rope = rope.frequencies_range(tile.query_start, tile.query_len)?;
+            let key_rope = rope.frequencies_range(tile.key_start, tile.key_len)?;
+            let attention = self.self_attn.forward_self_band_tile(
+                &normalized_query,
+                &normalized_keys,
+                tile.query_start,
+                tile.key_start,
+                left,
+                right,
+                &query_rope,
+                &key_rope,
+            )?;
+            attended.push((&query + Self::scale(&self.self_scale, &attention)?)?);
+        }
+        let attended_refs: Vec<_> = attended.iter().collect();
+        let attended = Tensor::cat(&attended_refs, 1)?;
+
+        let mut outputs = Vec::with_capacity(plan.len());
+        for tile in &plan {
+            let input = attended.narrow(1, tile.query_start, tile.query_len)?;
+            let ff = self.ff.forward(&self.ff_norm.forward(&input)?)?;
+            outputs.push((&input + Self::scale(&self.ff_scale, &ff)?)?);
+        }
+        let output_refs: Vec<_> = outputs.iter().collect();
+        Tensor::cat(&output_refs, 1)
+    }
 }
 
 /// Upstream's strict decoder rule: `(depth - block_index) < sinusoidal_blocks`.
@@ -943,6 +1159,116 @@ mod tests {
     use super::*;
     use candle_audio::candle_core::Device;
     use candle_nn::{VarBuilder, VarMap};
+
+    fn max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {
+        (a - b)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap()
+    }
+
+    #[test]
+    fn same_l_exact_max_band_plan_is_bounded() {
+        let plan = band_attention_plan(69_632, 17, 17, 1024).unwrap();
+        assert_eq!(plan.len(), 68);
+        assert_eq!(plan.first().unwrap().query_start, 0);
+        assert_eq!(plan.last().unwrap().query_start, 68_608);
+        assert_eq!(plan.iter().map(|tile| tile.key_len).max(), Some(1058));
+        assert!(plan
+            .iter()
+            .all(|tile| tile.query_len <= 1024 && tile.key_len <= 1058));
+        assert!(plan
+            .iter()
+            .all(|tile| tile.query_len * tile.key_len < 69_632usize.pow(2)));
+
+        for len in [1, 17, 18, 35, 36, 1023, 1024, 1025, 2051] {
+            let tiles = band_attention_plan(len, 5, 9, 1024).unwrap();
+            assert_eq!(tiles.iter().map(|tile| tile.query_len).sum::<usize>(), len);
+            assert_eq!(tiles.first().unwrap().query_start, 0);
+            assert_eq!(
+                tiles.last().unwrap().query_start + tiles.last().unwrap().query_len,
+                len
+            );
+        }
+        assert!(band_attention_plan(8, 1, 1, 0).is_err());
+    }
+
+    #[test]
+    fn tiled_band_matches_dense_mask_for_ordinary_and_differential_attention() {
+        let device = Device::Cpu;
+        let batch = 2;
+        let sequence = 37;
+        let dim = 8;
+        let dim_head = 4;
+        let left = 3;
+        let right = 5;
+        let query_tile = 8;
+        let values: Vec<f32> = (0..batch * sequence * dim)
+            .map(|index| ((index as f32 * 0.013).sin() + (index as f32 * 0.007).cos()) * 0.25)
+            .collect();
+        let x = Tensor::from_vec(values, (batch, sequence, dim), &device).unwrap();
+        let rope = RotaryEmbedding::new(dim_head / 2, &device).unwrap();
+        let full_rope = rope.frequencies(sequence).unwrap();
+        let dense_mask =
+            sliding_window_additive_mask(sequence, sequence, left, right, DType::F32, &device)
+                .unwrap();
+
+        for differential in [false, true] {
+            let map = VarMap::new();
+            let attention = Attention::load(
+                dim,
+                dim_head,
+                None,
+                QkNorm::Dyt,
+                1e-3,
+                differential,
+                false,
+                false,
+                VarBuilder::from_varmap(&map, DType::F32, &device).pp("attention"),
+            )
+            .unwrap();
+            let dense = attention
+                .forward(&x, None, Some(&full_rope), None, None, Some(&dense_mask))
+                .unwrap();
+            let plan = band_attention_plan(sequence, left, right, query_tile).unwrap();
+            let mut parts = Vec::with_capacity(plan.len());
+            for tile in plan {
+                let query = x.narrow(1, tile.query_start, tile.query_len).unwrap();
+                let keys = x.narrow(1, tile.key_start, tile.key_len).unwrap();
+                let query_rope = rope
+                    .frequencies_range(tile.query_start, tile.query_len)
+                    .unwrap();
+                let key_rope = rope
+                    .frequencies_range(tile.key_start, tile.key_len)
+                    .unwrap();
+                parts.push(
+                    attention
+                        .forward_self_band_tile(
+                            &query,
+                            &keys,
+                            tile.query_start,
+                            tile.key_start,
+                            left,
+                            right,
+                            &query_rope,
+                            &key_rope,
+                        )
+                        .unwrap(),
+                );
+            }
+            let refs: Vec<_> = parts.iter().collect();
+            let tiled = Tensor::cat(&refs, 1).unwrap();
+            let error = max_abs_diff(&dense, &tiled);
+            assert!(
+                error <= 2e-5,
+                "differential={differential}: dense/band max abs {error}"
+            );
+        }
+    }
 
     #[test]
     fn same_l_marks_exactly_indices_five_through_eleven() {
@@ -975,6 +1301,42 @@ mod tests {
         assert!((y[1] - 2.).abs() < 1e-5);
         assert!((y[2] - 1.).abs() < 1e-5);
         assert!((y[3] - 4.).abs() < 1e-5);
+    }
+
+    #[test]
+    fn f16_loaded_rope_supports_ranged_band_positions() {
+        let dev = Device::Cpu;
+        let inv_freq = Tensor::from_vec(vec![1f32, 0.01], 2, &dev).unwrap();
+        let tensors = std::collections::HashMap::from([("inv_freq".to_owned(), inv_freq)]);
+        let rope =
+            RotaryEmbedding::load(4, VarBuilder::from_tensors(tensors, DType::F16, &dev)).unwrap();
+        let x = Tensor::from_vec(
+            (0..2 * 11 * 4)
+                .map(|index| (index as f32 * 0.013).sin())
+                .collect::<Vec<_>>(),
+            (2, 11, 4),
+            &dev,
+        )
+        .unwrap()
+        .to_dtype(DType::F16)
+        .unwrap();
+
+        for tile in band_attention_plan(11, 3, 5, 4).unwrap() {
+            let frequencies = rope
+                .frequencies_range(tile.key_start, tile.key_len)
+                .unwrap();
+            assert_eq!(frequencies.dtype(), DType::F32);
+            let rotated = apply_rotary(
+                &x.narrow(1, tile.key_start, tile.key_len)
+                    .unwrap()
+                    .unsqueeze(1)
+                    .unwrap(),
+                &frequencies,
+            )
+            .unwrap();
+            assert_eq!(rotated.dtype(), DType::F16);
+            assert_eq!(rotated.dims(), &[2, 1, tile.key_len, 4]);
+        }
     }
 
     #[test]
