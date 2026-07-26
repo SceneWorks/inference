@@ -226,8 +226,11 @@ pub fn generate_t2v_from_components(
     if cancel.is_cancelled() {
         return Err(Error::Canceled);
     }
-    // AR few-step denoise over the causal transformer (owns a fresh KV cache).
-    let latents = generate_latents(transformer, cfg, context, params)?;
+    // AR few-step denoise over the causal transformer (owns a fresh KV cache). The `cancel` +
+    // `on_progress` are threaded INTO the loop (sc-8441 S8): it polls the flag per AR step and emits a
+    // `Progress::Step` per denoise step, so a mid-clip cancel bails within ~one step (not just here at
+    // the stage boundary).
+    let latents = generate_latents(transformer, cfg, context, params, cancel, on_progress)?;
     if cancel.is_cancelled() {
         return Err(Error::Canceled);
     }
@@ -314,8 +317,18 @@ pub fn generate_i2v_from_components(
     if cancel.is_cancelled() {
         return Err(Error::Canceled);
     }
-    // Stage 2: warm the cache from the reference + AR-generate the continuation conditioned on it.
-    let latents = generate_i2v_latents(transformer, cfg, context, params, &reference_latents)?;
+    // Stage 2: warm the cache from the reference + AR-generate the continuation conditioned on it. The
+    // `cancel` + `on_progress` thread INTO the loop (sc-8441 S8) — per-step cancel poll + per-step
+    // sampling progress across the generated chunks.
+    let latents = generate_i2v_latents(
+        transformer,
+        cfg,
+        context,
+        params,
+        &reference_latents,
+        cancel,
+        on_progress,
+    )?;
     if cancel.is_cancelled() {
         return Err(Error::Canceled);
     }
@@ -356,9 +369,18 @@ pub fn generate_v2v_from_components(
     if cancel.is_cancelled() {
         return Err(Error::Canceled);
     }
-    // Stage 2: strength-controlled AR generation from the renoised source.
-    let latents =
-        generate_v2v_latents(transformer, cfg, context, params, &source_latents, strength)?;
+    // Stage 2: strength-controlled AR generation from the renoised source. The `cancel` +
+    // `on_progress` thread INTO the loop (sc-8441 S8) — per-step cancel poll + per-step progress.
+    let latents = generate_v2v_latents(
+        transformer,
+        cfg,
+        context,
+        params,
+        &source_latents,
+        strength,
+        cancel,
+        on_progress,
+    )?;
     if cancel.is_cancelled() {
         return Err(Error::Canceled);
     }
