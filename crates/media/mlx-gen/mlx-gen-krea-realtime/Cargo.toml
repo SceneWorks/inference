@@ -1,0 +1,20 @@
+[package]
+name = "mlx-gen-krea-realtime"
+version = "0.0.0"
+edition = "2021"
+description = "Krea Realtime Video 14B (autoregressive real-time text-to-video, Wan2.1-T2V-14B backbone) provider crate for mlx-gen."
+license = "Apache-2.0"
+repository = "https://github.com/michaeltrefry/mlx-gen"
+keywords = ["mlx", "apple-silicon", "video", "autoregressive", "inference"]
+categories = ["science"]
+
+[dependencies]
+mlx-gen = { path = ".." }
+# Krea Realtime 14B is Wan2.1-T2V-14B weight-for-weight: the DiT config, transformer, RoPE, z16 VAE,
+# UMT5, scheduler, and patchify all come from mlx-gen-wan. The Krea deltas (causal/block-sparse
+# attention, KV cache, the AR self-forcing scheduler) layer on top in S3–S5; S2 reuses the base DiT.
+mlx-gen-wan = { path = "../mlx-gen-wan" }
+# Must match the core crate's MLX binding exactly (shared `Array` type). See root Cargo.toml.
+mlx-rs = { workspace = true }
+# config.json / AR-sidecar reading.
+serde_json = { workspace = true }
