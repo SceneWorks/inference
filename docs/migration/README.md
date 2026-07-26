@@ -27,6 +27,7 @@ Legacy activity that landed *after* the `runtime-2026.07.1` cutover is mapped in
 - [`SC_14534_SA3_REFERENCE_PARITY.md`](SC_14534_SA3_REFERENCE_PARITY.md): pinned Stable Audio 3 snapshots, upstream PyTorch harness, consumed-config evidence, and compact parity tensors
 - [`SC_14539_SAME_L.md`](SC_14539_SAME_L.md): global bounded SAME-L attention, provenance-locked short/long parity, embedded checkpoint identity, and 380-second platform resource gates
 - [`SC_14540_CHUNKED_SAME.md`](SC_14540_CHUNKED_SAME.md): exact hard-discard outer chunk ownership, SAME-S/SAME-L frozen parity, seam metrics, and 120-second resource gates
+- [`SC_14543_SMALL_MUSIC_PROVIDER.md`](SC_14543_SMALL_MUSIC_PROVIDER.md): registered 44.1 kHz stereo provider, exact snapshot and request mapping, connected 30-second oracle, deterministic request-local RNG, and CPU/Metal/CUDA runtime gates
 - [`PHASE_1_CHECKPOINT.md`](PHASE_1_CHECKPOINT.md): history import and exact tree equivalence
 - [`PHASE_2_CHECKPOINT.md`](PHASE_2_CHECKPOINT.md): ownership layout and unified workspace
 - [`PHASE_3_CHECKPOINT.md`](PHASE_3_CHECKPOINT.md): CI selection and release-train tooling

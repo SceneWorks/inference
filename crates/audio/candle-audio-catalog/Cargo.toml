@@ -16,6 +16,8 @@ candle-audio = { path = "../candle-audio" }
 candle-audio-kokoro = { path = "../candle-audio-kokoro" }
 candle-audio-moss-sfx = { path = "../candle-audio-moss-sfx" }
 candle-audio-acestep = { path = "../candle-audio-acestep" }
+# sc-14543: Stable Audio 3 small-music — 44.1 kHz stereo text-to-music diffusion.
+candle-audio-stable-audio-3 = { path = "../candle-audio-stable-audio-3" }
 # sc-13392: MOSS-TTS-Realtime — streaming TTS (Qwen3-1.7B AR brain + the ported MOSS-Audio-Tokenizer
 # RLFQ codec). The audio lane's first streaming generator.
 candle-audio-moss-tts-realtime = { path = "../candle-audio-moss-tts-realtime" }
@@ -52,6 +54,7 @@ metal = [
     "candle-audio-kokoro/metal",
     "candle-audio-moss-sfx/metal",
     "candle-audio-acestep/metal",
+    "candle-audio-stable-audio-3/metal",
     "candle-audio-moss-tts-realtime/metal",
     "candle-audio-chatterbox/metal",
     "candle-audio-chatterbox-ve/metal",
@@ -66,6 +69,7 @@ cuda = [
     "candle-audio-kokoro/cuda",
     "candle-audio-moss-sfx/cuda",
     "candle-audio-acestep/cuda",
+    "candle-audio-stable-audio-3/cuda",
     "candle-audio-moss-tts-realtime/cuda",
     "candle-audio-chatterbox/cuda",
     "candle-audio-chatterbox-ve/cuda",

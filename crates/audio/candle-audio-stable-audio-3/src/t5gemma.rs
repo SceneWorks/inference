@@ -15,7 +15,7 @@ use serde::Deserialize;
 use tokenizers::Tokenizer;
 
 use crate::config::{ConditionerConfig, ModelConfig, PaddingMode, T5GemmaConfig};
-use crate::weights::{SnapshotKind, SnapshotLayout};
+use crate::weights::{SnapshotKind, SnapshotLayout, StableAudioVarBuilders};
 
 const SHIPPED_HIDDEN: usize = 768;
 const SHIPPED_LAYERS: usize = 12;
@@ -466,6 +466,15 @@ impl T5GemmaEncoder {
     }
 
     pub fn forward(&self, input_ids: &Tensor, valid: &Tensor) -> CandleResult<Tensor> {
+        self.forward_impl(input_ids, valid, None)
+    }
+
+    fn forward_impl(
+        &self,
+        input_ids: &Tensor,
+        valid: &Tensor,
+        is_canceled: Option<&dyn Fn() -> bool>,
+    ) -> CandleResult<Tensor> {
         let (batch, seq) = input_ids.dims2()?;
         if valid.dims2()? != (batch, seq) {
             bail!("T5Gemma ids/mask shape mismatch")
@@ -490,6 +499,9 @@ impl T5GemmaEncoder {
         )?;
         let mask = attention_mask(valid, seq, x.dtype(), false)?;
         for layer in &self.layers {
+            if is_canceled.is_some_and(|probe| probe()) {
+                bail!("Stable Audio 3 T5Gemma canceled")
+            }
             x = layer.forward(&x, &mask, &cos, &sin)?;
         }
         self.norm.forward(&x)
@@ -579,6 +591,20 @@ pub struct T5GemmaConditioner {
 impl T5GemmaConditioner {
     /// Load the shipped conditioner from one caller-provisioned immutable snapshot.
     pub fn from_layout(layout: &SnapshotLayout, device: &Device) -> AudioResult<Self> {
+        let policy = text_compute_policy(device.location());
+        let builders = layout.mmap_builders_with_text_dtype(
+            policy.conditioned_output_dtype,
+            policy.compute_dtype,
+            device,
+        )?;
+        Self::from_layout_with_builders(layout, device, builders)
+    }
+
+    pub(crate) fn from_layout_with_builders(
+        layout: &SnapshotLayout,
+        device: &Device,
+        builders: StableAudioVarBuilders<'_>,
+    ) -> AudioResult<Self> {
         if layout.kind != SnapshotKind::Full {
             return Err(AudioError::Msg(
                 "T5Gemma conditioner requires a full Stable Audio 3 snapshot".into(),
@@ -619,11 +645,6 @@ impl T5GemmaConditioner {
         // location policy preserves CPU raw F32 while Metal and CUDA apply one final BF16 raw
         // boundary before the F32 learned-padding operation.
         let policy = text_compute_policy(device.location());
-        let builders = layout.mmap_builders_with_text_dtype(
-            policy.conditioned_output_dtype,
-            policy.compute_dtype,
-            device,
-        )?;
         let conditioner = builders
             .conditioner
             .ok_or_else(|| AudioError::Msg("snapshot has no conditioner weights".into()))?
@@ -727,6 +748,26 @@ impl T5GemmaConditioner {
     }
 
     pub fn encode(&self, prompts: &[String]) -> AudioResult<ConditioningOutput> {
+        self.encode_impl(prompts, None)
+    }
+
+    /// Encode with cooperative cancellation checked before every T5Gemma layer.
+    pub fn encode_with_cancel(
+        &self,
+        prompts: &[String],
+        is_canceled: &dyn Fn() -> bool,
+    ) -> AudioResult<ConditioningOutput> {
+        match self.encode_impl(prompts, Some(is_canceled)) {
+            Err(_) if is_canceled() => Err(AudioError::Canceled),
+            result => result,
+        }
+    }
+
+    fn encode_impl(
+        &self,
+        prompts: &[String],
+        is_canceled: Option<&dyn Fn() -> bool>,
+    ) -> AudioResult<ConditioningOutput> {
         let tokens = self.tokenize(prompts)?;
         let batch = tokens.input_ids.len();
         if batch == 0 {
@@ -741,7 +782,7 @@ impl T5GemmaConditioner {
         let attention_mask = Tensor::from_vec(mask, (batch, self.max_length), device)?;
         let raw = self
             .encoder
-            .forward(&input_ids, &attention_mask)?
+            .forward_impl(&input_ids, &attention_mask, is_canceled)?
             .to_dtype(self.raw_output_dtype)?;
         let projected = self.projection.forward(&raw)?;
         let embeddings = self.apply_padding(&projected, &attention_mask)?;

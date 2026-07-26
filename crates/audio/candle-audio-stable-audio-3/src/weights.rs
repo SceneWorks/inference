@@ -184,6 +184,49 @@ impl SnapshotLayout {
             },
         })
     }
+
+    /// Build the complete full-model graph through one shared weight backing.
+    ///
+    /// The ordinary component loaders stay lazy because standalone callers may request only one
+    /// component. A registered full provider consumes every root tensor, so on Metal this path
+    /// coalesces the 685 root tensors and the used T5 encoder tensors into bounded shared buffers.
+    /// This avoids Metal's persistent-resource ceiling while preserving independently shaped
+    /// views. CPU and CUDA retain the zero-copy mmap backend.
+    pub fn full_pipeline_builders(
+        &self,
+        root_dtype: DType,
+        text_dtype: DType,
+        device: &Device,
+    ) -> Result<StableAudioVarBuilders<'static>> {
+        if self.kind != SnapshotKind::Full {
+            return Err(AudioError::Msg(
+                "full pipeline builders require a full Stable Audio 3 snapshot".into(),
+            ));
+        }
+        let metal = matches!(device, Device::Metal(_));
+        let root = if metal {
+            packed_metal_builder(&self.weights_path, root_dtype, device, None)?
+        } else {
+            mmap_builder(&self.weights_path, root_dtype, device, false)?
+        };
+        let text_path = self
+            .text_weights_path
+            .as_deref()
+            .ok_or_else(|| AudioError::Msg("full snapshot has no text weights".into()))?;
+        let text_encoder = if metal {
+            packed_metal_builder(text_path, text_dtype, device, Some("model.encoder."))?
+        } else {
+            mmap_builder(text_path, text_dtype, device, false)?
+        };
+        Ok(StableAudioVarBuilders {
+            encoder: root.pp("pretransform.model.encoder"),
+            decoder: root.pp("pretransform.model.decoder"),
+            bottleneck: root.pp("pretransform.model.bottleneck"),
+            dit: Some(root.pp("model")),
+            conditioner: Some(root.pp("conditioner")),
+            text_encoder: Some(text_encoder),
+        })
+    }
 }
 
 fn packs_root_on_metal(kind: SnapshotKind) -> bool {
@@ -197,7 +240,7 @@ fn mmap_builder(
     pack_on_metal: bool,
 ) -> Result<VarBuilder<'static>> {
     if pack_on_metal && matches!(device, Device::Metal(_)) {
-        packed_metal_builder(path, dtype, device)
+        packed_metal_builder(path, dtype, device, None)
     } else {
         // Safety: callers of SnapshotLayout require an immutable snapshot. The returned backend
         // owns its mmap for the lifetime of the 'static VarBuilder.
@@ -214,7 +257,12 @@ fn mmap_builder(
 /// tensors load. Packing preserves independently shaped tensor views while reducing persistent
 /// Metal resources to a few dozen bounded buffers. Full checkpoints stay on the lazy mmap path so
 /// component-only loaders do not eagerly materialize unrelated autoencoder, DiT, or text weights.
-fn packed_metal_builder(path: &Path, dtype: DType, device: &Device) -> Result<VarBuilder<'static>> {
+fn packed_metal_builder(
+    path: &Path,
+    dtype: DType,
+    device: &Device,
+    prefix: Option<&str>,
+) -> Result<VarBuilder<'static>> {
     // Safety: SnapshotLayout requires this file to remain immutable for the duration of loading.
     // All values are copied into owned Candle storage before this function returns.
     let safetensors = unsafe { MmapedSafetensors::new(path)? };
@@ -222,7 +270,14 @@ fn packed_metal_builder(path: &Path, dtype: DType, device: &Device) -> Result<Va
         .tensors()
         .into_iter()
         .map(|(name, _)| name)
+        .filter(|name| prefix.is_none_or(|prefix| name.starts_with(prefix)))
         .collect::<Vec<_>>();
+    if names.is_empty() {
+        return Err(AudioError::Msg(format!(
+            "{} has no tensors matching packed prefix {prefix:?}",
+            path.display()
+        )));
+    }
     names.sort_unstable();
 
     let max_elements = METAL_WEIGHT_PACK_BYTES / dtype.size_in_bytes();
@@ -378,6 +433,7 @@ fn require_file(root: &Path, relative: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
+#[derive(Clone)]
 pub struct StableAudioVarBuilders<'a> {
     pub encoder: VarBuilder<'a>,
     pub decoder: VarBuilder<'a>,

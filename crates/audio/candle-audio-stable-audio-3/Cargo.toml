@@ -2,7 +2,7 @@
 name = "candle-audio-stable-audio-3"
 version = "0.0.0"
 edition = "2021"
-description = "Unregistered Stable Audio 3 Candle provider primitives and snapshot loading."
+description = "Stable Audio 3 small-music Candle text-to-audio provider."
 license = "Apache-2.0"
 repository = "https://github.com/SceneWorks/inference"
 keywords = ["candle", "audio", "diffusion", "stable-audio"]
@@ -14,15 +14,18 @@ categories = ["science"]
 # `candle_audio::dsp::resample`; this crate does not carry a second implementation.
 candle-audio = { path = "../candle-audio" }
 candle-nn = { workspace = true }
-# The audio-lane snapshot-preparer contracts. This crate remains unregistered until the later
-# catalog story, but owns a composable prepare probe now.
+# The audio-lane snapshot-preparer contracts.
 core-llm = { workspace = true }
 rand = { workspace = true }
 rand_distr = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 # Audio-lane side of the intentional 0.21/0.22 split enforced by check-workspace.py.
 tokenizers = { workspace = true }
+
+[dev-dependencies]
+sceneworks-gen-core-testkit = { workspace = true }
 
 [features]
 default = []

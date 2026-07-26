@@ -52,6 +52,7 @@ pub mod providers {
     pub use candle_audio_moss_tts;
     pub use candle_audio_moss_tts_realtime;
     pub use candle_audio_openvoice;
+    pub use candle_audio_stable_audio_3;
     pub use candle_audio_whisper;
 }
 
@@ -68,6 +69,7 @@ pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistry
     let registry = candle_audio_kokoro::register_providers(registry);
     let registry = candle_audio_moss_sfx::register_providers(registry);
     let registry = candle_audio_acestep::register_providers(registry);
+    let registry = candle_audio_stable_audio_3::register_providers(registry);
     let registry = candle_audio_moss_tts_realtime::register_providers(registry);
     let registry = candle_audio_chatterbox::register_providers(registry);
     let registry = candle_audio_mmaudio::register_providers(registry);
@@ -107,6 +109,7 @@ pub fn weight_licenses() -> Vec<gen_core::WeightLicenseEntry> {
     entries.extend_from_slice(candle_audio_kokoro::WEIGHT_LICENSES);
     entries.extend_from_slice(candle_audio_moss_sfx::WEIGHT_LICENSES);
     entries.extend_from_slice(candle_audio_acestep::WEIGHT_LICENSES);
+    entries.extend_from_slice(candle_audio_stable_audio_3::WEIGHT_LICENSES);
     entries.extend_from_slice(candle_audio_moss_tts_realtime::WEIGHT_LICENSES);
     entries.extend_from_slice(candle_audio_chatterbox::WEIGHT_LICENSES);
     // MMAudio ships two registered providers (mmaudio_small_16k, mmaudio_large_44k), each assembled
@@ -201,6 +204,7 @@ fn lane_can_prepare(spec: &core_llm::PrepareSpec) -> bool {
     candle_audio_kokoro::prepare::can_prepare(spec)
         || candle_audio_moss_sfx::prepare::can_prepare(spec)
         || candle_audio_acestep::prepare::can_prepare(spec)
+        || candle_audio_stable_audio_3::prepare::can_prepare(spec)
         || candle_audio_moss_tts_realtime::prepare::can_prepare(spec)
         || candle_audio_moss_tts::prepare::can_prepare(spec)
         || candle_audio_chatterbox::prepare::can_prepare(spec)
@@ -217,6 +221,8 @@ fn lane_prepare(spec: &core_llm::PrepareSpec) -> core_llm::Result<core_llm::Prep
         candle_audio_moss_sfx::prepare::prepare(spec)
     } else if candle_audio_acestep::prepare::can_prepare(spec) {
         candle_audio_acestep::prepare::prepare(spec)
+    } else if candle_audio_stable_audio_3::prepare::can_prepare(spec) {
+        candle_audio_stable_audio_3::prepare::prepare(spec)
     } else if candle_audio_moss_tts_realtime::prepare::can_prepare(spec) {
         candle_audio_moss_tts_realtime::prepare::prepare(spec)
     } else if candle_audio_moss_tts::prepare::can_prepare(spec) {
@@ -274,6 +280,7 @@ mod tests {
                 "kokoro_82m",
                 "moss_sfx_v2",
                 "acestep_v15_turbo",
+                "stable_audio_3_small_music",
                 "moss_tts_realtime",
                 "chatterbox_tts",
                 "mmaudio_small_16k",
@@ -471,6 +478,24 @@ mod tests {
                     true,
                 ),
                 ("acestep_v15_turbo", Some("transformer"), "MIT", true),
+                (
+                    "stable_audio_3_small_music",
+                    None,
+                    "LicenseRef-Stability-AI-Community",
+                    false
+                ),
+                (
+                    "stable_audio_3_small_music",
+                    Some("root"),
+                    "LicenseRef-Stability-AI-Community",
+                    false
+                ),
+                (
+                    "stable_audio_3_small_music",
+                    Some("t5gemma"),
+                    "LicenseRef-Gemma-Terms",
+                    true
+                ),
                 ("moss_tts_realtime", None, "Apache-2.0", true),
                 ("chatterbox_tts", None, "MIT", true),
                 // -- mmaudio_small_16k: composite + 5 per-checkpoint rows --
@@ -681,5 +706,26 @@ mod tests {
         assert!(!(regs[0].can_prepare)(&spec));
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&empty);
+    }
+
+    #[test]
+    #[ignore = "requires the pinned Stable Audio 3 small-music snapshot"]
+    fn connected_sa3_snapshot_resolves_through_the_composed_lane_preparer() {
+        let snapshot = std::path::PathBuf::from(
+            std::env::var("SA3_SMALL_MUSIC_SNAPSHOT")
+                .expect("set SA3_SMALL_MUSIC_SNAPSHOT to the pinned immutable snapshot"),
+        );
+        let registry = super::snapshot_preparer_registry().unwrap();
+        let registration = registry
+            .registrations()
+            .find(|registration| (registration.backend)() == "candle")
+            .expect("composed Candle audio preparer");
+        let spec =
+            super::core_llm::PrepareSpec::dense(&snapshot, snapshot.join("unused-prepared-output"));
+        assert!((registration.can_prepare)(&spec));
+        let report = (registration.prepare)(&spec).expect("prepare exact SA3 snapshot");
+        assert!(report.passthrough);
+        assert_eq!(report.out_dir, snapshot);
+        assert_eq!(report.num_tensors, 1_025);
     }
 }
