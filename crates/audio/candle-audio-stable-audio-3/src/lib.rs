@@ -25,6 +25,7 @@ pub mod dit;
 pub mod prepare;
 pub mod pretransform;
 pub mod same;
+pub mod sampler;
 pub mod softnorm;
 pub mod t5gemma;
 pub mod transformer;
