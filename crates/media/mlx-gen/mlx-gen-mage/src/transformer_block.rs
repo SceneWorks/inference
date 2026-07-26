@@ -26,6 +26,7 @@ use mlx_rs::fast::layer_norm;
 use mlx_rs::ops::split;
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear};
 use mlx_gen::weights::Weights;
 use mlx_gen::{nn, Error, Result};
 
@@ -185,6 +186,30 @@ impl MageTransformerBlock {
             Modulation::from_triple(&halves[0], segment_ids, tokens, dim)?,
             Modulation::from_triple(&halves[1], segment_ids, tokens, dim)?,
         ))
+    }
+}
+
+/// LoRA/LoKr targets on the dual-stream block (sc-14055): the two adaLN modulation projections
+/// (`img_mod.1` / `txt_mod.1` — the Linear at index 1 of each `SiLU → Linear` sequence), the joint
+/// attention, and both per-stream FFNs, each enumerating its own leaves.
+impl AdaptableHost for MageTransformerBlock {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["img_mod", "1"] => Some(self.img_mod.adaptable_mut()),
+            ["txt_mod", "1"] => Some(self.txt_mod.adaptable_mut()),
+            ["attn", rest @ ..] => self.attn.adaptable_mut(rest),
+            ["img_mlp", rest @ ..] => self.img_mlp.adaptable_mut(rest),
+            ["txt_mlp", rest @ ..] => self.txt_mlp.adaptable_mut(rest),
+            _ => None,
+        }
+    }
+
+    fn adaptable_paths(&self) -> Vec<String> {
+        let mut out = vec!["img_mod.1".to_string(), "txt_mod.1".to_string()];
+        out.extend(prefixed_paths("attn", &self.attn));
+        out.extend(prefixed_paths("img_mlp", &self.img_mlp));
+        out.extend(prefixed_paths("txt_mlp", &self.txt_mlp));
+        out
     }
 }
 

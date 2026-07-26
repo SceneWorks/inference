@@ -230,6 +230,7 @@ mod tests {
                 "krea_2_raw",
                 "lens",
                 "ltx_2_3",
+                "mage_flow_base",
                 "sd3_5_large",
                 "sd3_5_medium",
                 "sdxl",

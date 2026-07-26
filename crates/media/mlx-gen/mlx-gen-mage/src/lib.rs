@@ -78,6 +78,10 @@ pub mod latent;
 // --- Rectified-flow sampler + native-resolution packing (sc-14041) ---------------------------
 pub mod pipeline;
 
+// --- LoRA/LoKr adapter reload (sc-14055) + rectified-flow LoRA trainer (sc-14055) -------------
+pub mod adapters;
+pub mod training;
+
 // ---------------------------------------------------------------------------------------------
 // Re-export surface.
 //
@@ -110,6 +114,10 @@ pub use pipeline::{
     GenerationTrace, MageFlowPipeline, MAX_PACKED_IMAGE_TOKENS, STATIC_SHIFT,
 };
 
+// sc-14055 (LoRA/LoKr reload + rectified-flow trainer):
+pub use adapters::apply_mage_adapters;
+pub use training::{MageFlowTrainer, MODEL_ID as TRAINER_MODEL_ID};
+
 // Later phases add their own modules rather than growing these: `quant` (Q4/Q8 tiers, sc-14046),
 // `convert` (offline pre-quantisation, sc-14046), `adapters` (LoRA/LoKr routing, sc-14057) and
 // `training` (LoRA + base fine-tune, sc-14055/sc-14056). They are not stubbed here because their
@@ -127,6 +135,8 @@ pub fn register_providers(
         .register_generator(model::REGISTRATION_EDIT)
         .register_generator(model::REGISTRATION_EDIT_BASE)
         .register_generator(model::REGISTRATION_EDIT_TURBO)
+        // The rectified-flow LoRA/LoKr trainer targets the Base checkpoint (sc-14055).
+        .register_trainer(training::REGISTRATION)
 }
 
 /// Build the explicit Mage-Flow MLX provider catalog (this crate only).
@@ -156,8 +166,13 @@ mod explicit_registry_tests {
                 "mage_flow_edit_turbo"
             ]
         );
-        // The scaffold ships no trainer (sc-14055/sc-14056) and no captioner/embedder surface.
-        assert_eq!(registry.trainers().count(), 0);
+        // The rectified-flow LoRA/LoKr trainer targets the Base checkpoint (sc-14055); no
+        // captioner/embedder surface.
+        let trainers: Vec<String> = registry
+            .trainers()
+            .map(|registration| (registration.descriptor)().id.to_string())
+            .collect();
+        assert_eq!(trainers, ["mage_flow_base"]);
         assert_eq!(
             registry.descriptor_conformance_errors(),
             Vec::<String>::new()

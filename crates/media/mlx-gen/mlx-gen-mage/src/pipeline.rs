@@ -736,6 +736,19 @@ fn initial_tokens_for_grid(
     .map_err(Into::into)
 }
 
+/// Gaussian-Shading initial-latent tokens for an explicit latent grid, bypassing the production
+/// size-range check [`latent_hw`] enforces. Used by the LoRA trainer's preview render (sc-14055),
+/// which samples at the (possibly sub-512) training resolution rather than a production geometry.
+pub fn encode_noise_tokens(
+    gh: i32,
+    gw: i32,
+    seed: i64,
+    key: &GsKey,
+    dtype: Dtype,
+) -> Result<Array> {
+    initial_tokens_for_grid(gh, gw, seed, key, dtype)
+}
+
 /// Convert one packed token stream back to the NCHW latent consumed by Mage-VAE.
 pub fn unpack_tokens(tokens: &Array, gh: i32, gw: i32) -> Result<Array> {
     if tokens.shape() != [1, gh * gw, LATENT_CHANNELS] {
