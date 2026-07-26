@@ -1304,6 +1304,56 @@ mod tests {
         assert!(ll.forward(&x).is_ok());
     }
 
+    /// Backprop through a later packed projection must reach an adapter installed on an earlier
+    /// packed projection. This is the minimal two-block analogue of the LTX DiT: the second frozen
+    /// q4 base needs an input gradient even though none of its own packed weights are trainable.
+    #[test]
+    fn sequential_packed_bases_backprop_to_early_lora() {
+        let dev = Device::Cpu;
+        let width = 64usize;
+        let (first_w, first_s, first_b) = q4_packed_triple(width, width);
+        let (second_w, second_s, second_b) = q4_packed_triple(width, width);
+        let first_q = QLinear::from_packed(&first_w, &first_s, &first_b, None, &dev).unwrap();
+        let second_q = QLinear::from_packed(&second_w, &second_s, &second_b, None, &dev).unwrap();
+        let mut first = LoraLinear::from_qlinear(first_q, width, width, "blocks.0.to_q".into());
+        let second = LoraLinear::from_qlinear(second_q, width, width, "blocks.1.to_q".into());
+
+        let down = Var::from_tensor(
+            &(Tensor::randn(0f32, 1f32, (4, width), &dev).unwrap() * 0.01).unwrap(),
+        )
+        .unwrap();
+        let up = Var::from_tensor(
+            &(Tensor::randn(0f32, 1f32, (width, 4), &dev).unwrap() * 0.01).unwrap(),
+        )
+        .unwrap();
+        first.install_lora(down.as_tensor().clone(), up.as_tensor().clone(), 1.0);
+
+        let input = Tensor::randn(0f32, 1f32, (2, width), &dev).unwrap();
+        let loss = second
+            .forward(&first.forward(&input).unwrap())
+            .unwrap()
+            .sqr()
+            .unwrap()
+            .mean_all()
+            .unwrap();
+        let grads = loss.backward().unwrap();
+        for (name, factor) in [("down", &down), ("up", &up)] {
+            let max = grads
+                .get(factor.as_tensor())
+                .unwrap_or_else(|| panic!("missing gradient for early {name} factor"))
+                .abs()
+                .unwrap()
+                .max_all()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            assert!(
+                max.is_finite() && max > 0.0,
+                "early {name} gradient through later packed base was {max}"
+            );
+        }
+    }
+
     /// `lora_linear_detect` / `lora_linear_no_bias_detect` route to the packed base when the `.scales`
     /// sibling is present in the VarBuilder, and to the dense base otherwise — the one-call packed-detect
     /// contract used by the vendored SDXL attention. Uses an in-memory safetensors (no weights needed).

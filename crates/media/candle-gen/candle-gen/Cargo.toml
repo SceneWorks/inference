@@ -33,6 +33,7 @@ float8 = { version = "0.7", optional = true }
 # Parse the PEFT/diffusers `lora_adapter_metadata` JSON blob (sc-5374) in `train::lora` so the
 # inference adapter merge recovers `lora_alpha`/`r` when a file ships no per-target `.alpha` tensor.
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 rand = { workspace = true }
 rand_distr = { workspace = true }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }

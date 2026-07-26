@@ -25,7 +25,7 @@ use candle_gen::{CandleError, Result};
 
 use crate::config::{
     AvConfig, ConnectorConfig, GemmaConfig, DEFAULT_FPS, LATENT_CHANNELS, MODEL_ID, SPATIAL_SCALE,
-    STAGE1_SIGMAS, TEXT_MAX_LENGTH,
+    STAGE1_SIGMAS,
 };
 use crate::dit_train::{LtxDiT, LTX_ATTN_TARGETS};
 use crate::pipeline::{flatten_latent, frames_to_images, unflatten_latent};
@@ -36,6 +36,7 @@ use crate::vae::LtxVideoVae;
 
 const LABEL: &str = "ltx_2_3 trainer";
 const SAMPLE_PROMPT_CAP: usize = 4;
+const TRAIN_TEXT_MAX_LENGTH: usize = 128;
 const SAFE_MEMORY_FRACTION: f64 = 0.85;
 
 /// One preview prompt's already-encoded distilled conditioning.
@@ -180,6 +181,16 @@ fn tier(self_: &LtxTrainer) -> Result<TierPaths> {
     })
 }
 
+fn pad_training_ids(mut ids: Vec<u32>) -> (Vec<u32>, Vec<u32>) {
+    ids.truncate(TRAIN_TEXT_MAX_LENGTH);
+    let pad = TRAIN_TEXT_MAX_LENGTH - ids.len();
+    let mut padded = vec![0u32; pad];
+    padded.extend_from_slice(&ids);
+    let mut mask = vec![0u32; pad];
+    mask.extend(std::iter::repeat_n(1u32, ids.len()));
+    (padded, mask)
+}
+
 fn tokenize(
     tokenizer: &tokenizers::Tokenizer,
     text: &str,
@@ -188,15 +199,9 @@ fn tokenize(
     let enc = tokenizer
         .encode(text, true)
         .map_err(|e| CandleError::Msg(format!("{LABEL}: tokenize: {e}")))?;
-    let mut ids = enc.get_ids().to_vec();
-    ids.truncate(TEXT_MAX_LENGTH);
-    let pad = TEXT_MAX_LENGTH - ids.len();
-    let mut padded = vec![0u32; pad];
-    padded.extend_from_slice(&ids);
-    let mut mask = vec![0u32; pad];
-    mask.extend(std::iter::repeat_n(1u32, ids.len()));
+    let (padded, mask) = pad_training_ids(enc.get_ids().to_vec());
     Ok((
-        Tensor::from_vec(padded, (1, TEXT_MAX_LENGTH), device)?,
+        Tensor::from_vec(padded, (1, TRAIN_TEXT_MAX_LENGTH), device)?,
         mask,
     ))
 }
@@ -214,17 +219,9 @@ fn encode_context(
 /// Seeded sigma for LTX: always uniform and strictly inside `(1e-3, 1-1e-3)`. Timestep type/bias
 /// knobs intentionally do not participate in this family recipe.
 pub fn sample_ltx_sigma(seed: u64, step: u32) -> f64 {
-    // Reuse the shared deterministic sampler with hard-coded neutral uniform policy. Its generic
-    // clamp permits exact endpoints, while LTX requires an open interval, so move those bounds inward
-    // by one representable f32 value.
-    let raw = flow_match::sample_unit_timestep(
-        "uniform",
-        "balanced",
-        flow_match::timestep_seed(seed, step),
-    );
     let lower = f32::from_bits(1e-3f32.to_bits() + 1);
     let upper = f32::from_bits((1.0f32 - 1e-3).to_bits() - 1);
-    raw.clamp(lower, upper) as f64
+    flow_match::sample_uniform_range(flow_match::timestep_seed(seed, step), lower, upper) as f64
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -334,10 +331,13 @@ impl FlowMatchTrainer for LtxTrainer {
                 .take(SAMPLE_PROMPT_CAP)
                 .cloned()
                 .collect();
-            let contexts = prompts
-                .iter()
-                .map(|prompt| encode_context(&tokenizer, &encoder, prompt, device))
-                .collect::<Result<Vec<_>>>()?;
+            let mut contexts = Vec::with_capacity(prompts.len());
+            for prompt in &prompts {
+                if req.cancel.is_cancelled() {
+                    return Err(CandleError::Canceled);
+                }
+                contexts.push(encode_context(&tokenizer, &encoder, prompt, device)?);
+            }
             SamplePlan {
                 prompts,
                 state: Some(LtxSampleState {
@@ -453,6 +453,18 @@ mod tests {
 
     #[test]
     fn uniform_sigma_is_deterministic_strictly_interior_and_config_invariant() {
+        let lower = f32::from_bits(1e-3f32.to_bits() + 1) as f64;
+        let upper = f32::from_bits((1.0f32 - 1e-3).to_bits() - 1) as f64;
+        let mut endpoint_hits = 0;
+        for seed in 0..20_000 {
+            let sigma = sample_ltx_sigma(seed, 1);
+            assert!(sigma >= lower && sigma <= upper, "{sigma}");
+            endpoint_hits += usize::from(sigma == lower || sigma == upper);
+        }
+        assert!(
+            endpoint_hits <= 1,
+            "affine sampling must not pile clamped mass onto inward endpoints: {endpoint_hits}"
+        );
         for seed in [0, 1, 42, u64::MAX] {
             for step in 1..20 {
                 let a = sample_ltx_sigma(seed, step);
@@ -475,6 +487,21 @@ mod tests {
             sample_ltx_sigma(a.config.seed, 3),
             sample_ltx_sigma(b.config.seed, 3)
         );
+    }
+
+    #[test]
+    fn training_tokenization_truncates_and_masks_at_128_tokens() {
+        let (ids, mask) = pad_training_ids((0..200).collect());
+        assert_eq!(ids.len(), TRAIN_TEXT_MAX_LENGTH);
+        assert_eq!(mask.len(), TRAIN_TEXT_MAX_LENGTH);
+        assert_eq!(ids, (0..128).collect::<Vec<_>>());
+        assert!(mask.iter().all(|&value| value == 1));
+
+        let (ids, mask) = pad_training_ids(vec![7, 8, 9]);
+        assert_eq!(&ids[125..], &[7, 8, 9]);
+        assert!(ids[..125].iter().all(|&value| value == 0));
+        assert!(mask[..125].iter().all(|&value| value == 0));
+        assert_eq!(&mask[125..], &[1, 1, 1]);
     }
 
     #[test]

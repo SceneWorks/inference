@@ -57,6 +57,7 @@ pub fn find_latest_resume(dir: &Path, stem: &str) -> Option<(PathBuf, u32)> {
 }
 
 /// Save raw factors and optimizer state in one safetensors file.
+#[allow(clippy::too_many_arguments)]
 pub fn save_resume(
     dir: &Path,
     stem: &str,
@@ -65,6 +66,7 @@ pub fn save_resume(
     opt: &TrainOptimizer,
     set: &LoraSet,
     cfg: &TrainingConfig,
+    request_fingerprint: &str,
 ) -> Result<PathBuf> {
     std::fs::create_dir_all(dir)
         .map_err(|e| CandleError::Msg(format!("resume: create {}: {e}", dir.display())))?;
@@ -79,6 +81,7 @@ pub fn save_resume(
     meta.insert("update_idx".into(), update_idx.to_string());
     meta.insert("format".into(), "candle-gen-resume-v1".into());
     meta.insert("training_config".into(), training_fingerprint(cfg));
+    meta.insert("request_fingerprint".into(), request_fingerprint.into());
     let file_name = resume_snapshot_filename(stem, step);
     let path = dir.join(&file_name);
     // Same-directory temp + rename: `find_latest_resume` never observes a partially-written bundle.
@@ -118,6 +121,7 @@ pub fn load_resume(
     opt: &mut TrainOptimizer,
     set: &LoraSet,
     cfg: &TrainingConfig,
+    request_fingerprint: &str,
 ) -> Result<ResumeMeta> {
     let bytes = std::fs::read(path)
         .map_err(|e| CandleError::Msg(format!("resume: read {}: {e}", path.display())))?;
@@ -145,6 +149,15 @@ pub fn load_resume(
              {requested_config:?})"
         )));
     }
+    let saved_request = meta
+        .get("request_fingerprint")
+        .ok_or_else(|| CandleError::Msg("resume: missing request_fingerprint metadata".into()))?;
+    if saved_request != request_fingerprint {
+        return Err(CandleError::Msg(format!(
+            "resume: dataset/request fingerprint differs (saved {saved_request}, requested \
+             {request_fingerprint})"
+        )));
+    }
     let tensors = candle_core::safetensors::load(path, &Device::Cpu)?;
     let factors: HashMap<String, Tensor> = tensors
         .iter()
@@ -163,7 +176,7 @@ pub fn load_resume(
 
 fn training_fingerprint(cfg: &TrainingConfig) -> String {
     format!(
-        "steps={};accum={};scheduler={:?};warmup={};rank={};alpha={};seed={};loss={};dtype={};\
+        "steps={};accum={};scheduler={:?};warmup={};rank={};alpha={};seed={};resolution={};loss={};dtype={};\
          checkpoint={};timestep_type={};timestep_bias={}",
         cfg.steps,
         cfg.gradient_accumulation.max(1),
@@ -172,6 +185,7 @@ fn training_fingerprint(cfg: &TrainingConfig) -> String {
         cfg.rank,
         cfg.alpha,
         cfg.seed,
+        cfg.resolution,
         cfg.loss_type,
         cfg.train_dtype,
         cfg.gradient_checkpointing,
@@ -214,6 +228,7 @@ mod tests {
         set: &LoraSet,
         opt: &TrainOptimizer,
         cfg: &TrainingConfig,
+        request_fingerprint: &str,
         mutate: impl FnOnce(&mut HashMap<String, Tensor>),
     ) {
         let mut tensors: HashMap<String, Tensor> = set
@@ -228,6 +243,7 @@ mod tests {
         meta.insert("update_idx".into(), "2".into());
         meta.insert("format".into(), "candle-gen-resume-v1".into());
         meta.insert("training_config".into(), training_fingerprint(cfg));
+        meta.insert("request_fingerprint".into(), request_fingerprint.into());
         safetensors::serialize_to_file(tensors.iter(), Some(meta), path).unwrap();
     }
 
@@ -268,14 +284,32 @@ mod tests {
             weight_decay: 0.01,
             ..Default::default()
         };
-        let valid = save_resume(&dir, "adapter", 4, 2, &source_opt, &source, &cfg).unwrap();
+        let fingerprint = "request-a";
+        let valid = save_resume(
+            &dir,
+            "adapter",
+            4,
+            2,
+            &source_opt,
+            &source,
+            &cfg,
+            fingerprint,
+        )
+        .unwrap();
         // A colliding step fails without replacing the valid old bundle and leaves no temp file.
-        assert!(
-            save_resume(&dir, "adapter", 4, 2, &source_opt, &source, &cfg)
-                .unwrap_err()
-                .to_string()
-                .contains("already exists")
-        );
+        assert!(save_resume(
+            &dir,
+            "adapter",
+            4,
+            2,
+            &source_opt,
+            &source,
+            &cfg,
+            fingerprint,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("already exists"));
         assert!(std::fs::read_dir(&dir)
             .unwrap()
             .flatten()
@@ -284,7 +318,7 @@ mod tests {
         let restored = adapter(99);
         let mut restored_opt =
             TrainOptimizer::from_config("adamw", restored.vars.clone(), 1e-3, 0.01).unwrap();
-        let meta = load_resume(&valid, &mut restored_opt, &restored, &cfg).unwrap();
+        let meta = load_resume(&valid, &mut restored_opt, &restored, &cfg, fingerprint).unwrap();
         assert_eq!(
             meta,
             ResumeMeta {
@@ -336,11 +370,11 @@ mod tests {
             ),
         ] {
             let path = dir.join(format!("{name}.resume.safetensors"));
-            write_bundle(&path, &source, &source_opt, &cfg, mutate);
+            write_bundle(&path, &source, &source_opt, &cfg, fingerprint, mutate);
             let target = adapter(99);
             let mut opt =
                 TrainOptimizer::from_config("adamw", target.vars.clone(), 1e-3, 0.01).unwrap();
-            let err = load_resume(&path, &mut opt, &target, &cfg)
+            let err = load_resume(&path, &mut opt, &target, &cfg, fingerprint)
                 .unwrap_err()
                 .to_string();
             assert!(
@@ -353,10 +387,19 @@ mod tests {
         let target = adapter(99);
         let mut opt =
             TrainOptimizer::from_config("adamw", target.vars.clone(), 1e-3, 0.01).unwrap();
-        assert!(load_resume(&valid, &mut opt, &target, &changed)
+        assert!(
+            load_resume(&valid, &mut opt, &target, &changed, fingerprint)
+                .unwrap_err()
+                .to_string()
+                .contains("training configuration differs")
+        );
+        let target = adapter(99);
+        let mut opt =
+            TrainOptimizer::from_config("adamw", target.vars.clone(), 1e-3, 0.01).unwrap();
+        assert!(load_resume(&valid, &mut opt, &target, &cfg, "request-b")
             .unwrap_err()
             .to_string()
-            .contains("training configuration differs"));
+            .contains("dataset/request fingerprint differs"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
