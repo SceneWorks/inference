@@ -4,7 +4,8 @@
 //! DiT — patchify, embeddings, adaLN-6vec modulation, text cross-attention, gated-GELU FFN, 3-axis
 //! RoPE, the modulated head — is **reused verbatim** from [`mlx_gen_wan::WanTransformer`]. The single
 //! net-new compute delta of the autoregressive regime is confined to **self-attention**, and it is
-//! three coupled pieces (mirroring the reference `transformer/causal_model.py`):
+//! three coupled pieces **adapted from** the reference `transformer/causal_model.py`
+//! (`krea-ai/realtime-video`) — reimplemented in native MLX, not copied source:
 //!
 //!   1. **Block-causal attention mask** ([`build_block_causal_mask`]) — a query attends to every token
 //!      up to the END of its own frame-block (intra-block bidirectional) but no later block

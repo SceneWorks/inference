@@ -12,6 +12,11 @@
 //! carried on [`KreaArConfig`] here so the preset is complete, but they are **not consumed until
 //! S3–S5** (causal attention / KV cache / the AR loop). For S2 the DiT loads into the reused
 //! `mlx_gen_wan` transformer using only the [`WanModelConfig`] half.
+//!
+//! The AR knob defaults and the token-geometry helpers (`max_attention_size` / `sink_tokens` /
+//! `block_size`) are **adapted from** the reference `causal_model.py` (`krea-ai/realtime-video`): the
+//! shipped values are the reference model's published config (facts), and the geometry formulas are
+//! reimplemented from the reference's token-window algebra.
 
 use std::path::Path;
 
