@@ -28,8 +28,11 @@ pub const SELF_FORCING_SAMPLER: &str = "self_forcing";
 
 /// Default output cadence when a request omits `fps` (the reference realtime-video default).
 const DEFAULT_FPS: u32 = 16;
-/// Default output frame count when a request omits `frames`/`duration` — the reference canonical clip
-/// is 21 latent frames = 81 output frames (`(81 − 1)/4 + 1 = 21`).
+/// Default requested **output** frame count when a request omits `frames`/`duration`. The AR path turns
+/// this into `(81 − 1)/4 + 1 = 21` latent frames; the non-causal z16 Wan VAE decode then yields
+/// `4 · 21 = 84` output frames (`output = 4 · latent`, not `(latent − 1)·4 + 1`), which the pipeline
+/// trims back to this requested 81 (see [`crate::t2v::decode_latents_to_video`]). 81 is the reference
+/// realtime-video canonical clip length.
 const DEFAULT_FRAMES: u32 = 81;
 
 /// Stable identity + advertised capabilities for Krea Realtime 14B (Wan-2.1-T2V-14B backbone,

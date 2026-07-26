@@ -64,11 +64,14 @@
 //!   provider. The crate is composed into the platform via `mlx-gen-catalog` (explicit composition, not
 //!   linker discovery).
 //!
-//! **First-frame VAE re-anchor** (`release_server.py::get_clean_context_frames`, re-encoding the first
-//! decoded output frame as a persistent clean-context anchor) is evaluated in S6 and found to be
-//! **streaming-only** (the batch path decodes once at the end; the `sink_size` prefix + S5 clean-context
-//! recompute already anchor the batch generation) — deferred to the streaming epic, not dropped (see
-//! [`t2v::generate_t2v_from_components`]). **i2v/v2v conditioning** is **S7**.
+//! The reference's **first-frame VAE re-anchor** (`release_server.py::get_clean_context_frames`,
+//! re-encoding the first decoded output frame as a persistent clean-context anchor) re-encodes decoded
+//! pixels *mid-generation*, so that *mechanism* is streaming-coupled and correctly out of this batch path
+//! (which decodes once at the end). But the bounded Mac window runs for every clip and the shipped 14B
+//! config sets `sink_size = 0` — so the always-attended sink prefix is empty and a long batch clip slides
+//! its window with **no** persistent anchor, a real long-range coherence risk **tracked as sc-15127
+//! (S18)** and measured on the gated real-weight run (see [`t2v::generate_t2v_from_components`]).
+//! **i2v/v2v conditioning** is **S7**.
 //!
 //! The converter, load, AR, and pipeline paths are validated against the S1 tensor inventory with
 //! synthesized / tiny random-weight fixtures (`tests/`) — never the real 28.58 GB checkpoint. The

@@ -362,6 +362,7 @@ fn t2v_pipeline_produces_a_clip_of_correct_shape() {
         &vae,
         &context,
         &params(42, 4),
+        None, // no trim: assert the raw 4·num_latent decode
         None,
         &cancel,
         &mut on_progress,
@@ -410,7 +411,8 @@ fn t2v_pipeline_is_seed_deterministic() {
                c: &CancelFlag,
                np: &mut dyn FnMut(Progress)| {
         let out =
-            generate_t2v_from_components(t, &cfg, v, ctx, &params(seed, 2), None, c, np).unwrap();
+            generate_t2v_from_components(t, &cfg, v, ctx, &params(seed, 2), None, None, c, np)
+                .unwrap();
         match out {
             GenerationOutput::Video { frames, .. } => frames,
             _ => unreachable!(),
@@ -441,7 +443,7 @@ fn vae_decode_is_4x_temporal_8x_spatial() {
     let cancel = CancelFlag::default();
     // A [z16, T_lat=3, 5, 6] latent → [4·3, 8·5, 8·6, 3] = 12 frames of 48×40.
     let latents = det_fill(&[16, 3, 5, 6], 123, 1.0, 0.0, Dtype::Float32);
-    let out = decode_latents_to_video(&vae, &latents, 24, None, &cancel).unwrap();
+    let out = decode_latents_to_video(&vae, &latents, 24, None, None, &cancel).unwrap();
     let frames = match &out {
         GenerationOutput::Video { frames, fps, .. } => {
             assert_eq!(*fps, 24);
@@ -454,5 +456,73 @@ fn vae_decode_is_4x_temporal_8x_spatial() {
         (frames[0].width, frames[0].height),
         (6 * 8, 5 * 8),
         "×8 spatial upsample (W=6·8, H=5·8)"
+    );
+}
+
+/// The z16 decode over-delivers (latent count is `(f−1)/4+1` but the decode is `4·T_lat`), so a
+/// requested output count not ≡ 1 (mod 4) must be trimmed back to exactly that count by dropping the
+/// **leading** excess — never inventing frames when the request exceeds the decoded count.
+#[test]
+fn decode_trims_leading_frames_to_requested_count() {
+    use mlx_gen_krea_realtime::decode_latents_to_video;
+    let vae = tiny_vae();
+    let cancel = CancelFlag::default();
+    // [z16, T_lat=4, 4, 4] → 4·4 = 16 decoded frames. Request 13 (NOT a multiple of 4, < 16) → trim 3.
+    let latents = det_fill(&[16, 4, 4, 4], 99, 1.0, 0.0, Dtype::Float32);
+    let full = decode_latents_to_video(&vae, &latents, 16, None, None, &cancel).unwrap();
+    let trimmed = decode_latents_to_video(&vae, &latents, 16, Some(13), None, &cancel).unwrap();
+    let full = video_frames(&full);
+    let trimmed = video_frames(&trimmed);
+    assert_eq!(full.len(), 16, "raw z16 decode is 4·T_lat frames");
+    assert_eq!(trimmed.len(), 13, "trimmed to exactly the requested count");
+    // The kept frames are the LAST 13 (the leading 3 dropped), byte-identical to the untrimmed tail —
+    // a discriminating check that the trim removes leading, not trailing, frames.
+    for (i, tf) in trimmed.iter().enumerate() {
+        assert_eq!(
+            tf.pixels,
+            full[i + 3].pixels,
+            "trim drops the leading over-delivery, keeps the trailing requested frames"
+        );
+    }
+    // A request ≥ the decoded count never invents frames — returns the full decode.
+    let over = decode_latents_to_video(&vae, &latents, 16, Some(999), None, &cancel).unwrap();
+    assert_eq!(
+        video_frames(&over).len(),
+        16,
+        "over-request returns all decoded frames, no padding"
+    );
+}
+
+/// End-to-end plumbing: `generate_t2v_from_components` threads the requested output count into the decode
+/// trim, so the assembled clip is exactly the requested (non-multiple-of-4) frame count the real
+/// `generate_t2v` passes down from `job.num_frames`.
+#[test]
+fn t2v_pipeline_trims_to_requested_frame_count() {
+    let cfg = tiny_cfg();
+    let dit = mlx_gen_krea_realtime::load_krea_realtime_transformer(native_dit_map(&cfg), &cfg)
+        .expect("load tiny DiT");
+    let transformer = CausalKreaTransformer::new(dit, &cfg);
+    let vae = tiny_vae();
+    let context = tiny_context(&cfg);
+    let cancel = CancelFlag::default();
+    let mut noop = |_: Progress| {};
+
+    // 4 latent frames → 16 decoded frames; request 13 output frames (not ≡ 1 mod 4) → trimmed to 13.
+    let out = generate_t2v_from_components(
+        &transformer,
+        &cfg,
+        &vae,
+        &context,
+        &params(42, 4),
+        Some(13),
+        None,
+        &cancel,
+        &mut noop,
+    )
+    .expect("t2v pipeline");
+    assert_eq!(
+        video_frames(&out).len(),
+        13,
+        "the pipeline returns exactly the requested output frame count"
     );
 }

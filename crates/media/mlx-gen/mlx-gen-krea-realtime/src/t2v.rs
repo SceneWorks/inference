@@ -23,10 +23,14 @@
 //! **derived from the requested resolution** (`resolve_request_config`); the canonical `1560` /
 //! `32760` are only the reference resolution's values.
 //!
-//! The **first-frame VAE re-anchor** (`release_server.py::get_clean_context_frames`, re-encoding the
-//! first *decoded* output frame as a persistent clean-context anchor) is a **streaming-only** coherence
-//! mechanism and does **not** apply to this batch whole-clip path — see [`generate_t2v_from_components`]
-//! for the reasoning. It is deferred to the streaming epic, not silently dropped.
+//! The reference's **first-frame VAE re-anchor** (`release_server.py::get_clean_context_frames`,
+//! re-encoding the first *decoded* output frame as a persistent clean-context anchor) re-encodes decoded
+//! pixels *mid-generation*, so that specific **mechanism** is streaming-coupled and correctly out of this
+//! single-terminal-decode batch path. It does **not** follow that a long batch clip is anchored: the Mac
+//! path runs the bounded ~6-frame window ([`mac_ar_config`]) for *every* clip and the shipped 14B config
+//! sets `sink_size = 0`, so a long clip slides its window with **no** persistent anchor — a real
+//! long-range coherence risk **tracked as sc-15127 (S18)**, to be measured/addressed on the gated
+//! real-weight run. See [`generate_t2v_from_components`] for the full reasoning.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -141,18 +145,36 @@ fn decode_tiling(out_h: usize, out_w: usize, out_frames: i32) -> Option<TilingCo
 /// Decode the AR latent sequence `[z16, T_lat, lat_h, lat_w]` (f32) through the reused z16 Wan
 /// [`WanVae`] → an assembled RGB clip ([`GenerationOutput::Video`]). Single-pass for the batch form; a
 /// `tiling` config bounds a large decode via gen-core [`mlx_gen::tiling`]. The z16 VAE upsamples `T_lat
-/// → 4·T_lat` temporally and `×8` spatially, so the clip is `4·T_lat` frames of `8·lat_h × 8·lat_w`.
+/// → 4·T_lat` temporally and `×8` spatially, so the raw decode is `4·T_lat` frames of `8·lat_h ×
+/// 8·lat_w`.
+///
+/// `out_frames` is the **requested output frame count**. Because the latent count is derived from the
+/// requested output count via the causal convention (`T_lat = (frames − 1)/4 + 1`) while the decode is
+/// the non-causal `4·T_lat`, a request whose output count is not ≡ 1 (mod 4) over-delivers up to 3 extra
+/// **leading** frames (e.g. 81 requested → 21 latent → 84 decoded). When `out_frames` is `Some(n)` and
+/// the decode over-delivers, the leading excess is trimmed so the returned clip is exactly `n` frames —
+/// mirroring the sibling z16 Wan path's `images.drain(0..trim)` (`mlx-gen-wan::model`). `None` (or a
+/// request ≥ the decoded count) returns the full `4·T_lat` decode untrimmed.
 pub fn decode_latents_to_video(
     vae: &WanVae,
     latents: &Array,
     fps: u32,
+    out_frames: Option<usize>,
     tiling: Option<&TilingConfig>,
     cancel: &CancelFlag,
 ) -> Result<GenerationOutput> {
     // `decode_to_frames` reshapes `[C,F,H,W]` → `[1,C,F,H,W]`, decodes (single-pass or tiled), and
     // returns `[F_out, H_out, W_out, 3]` uint8; `frames_to_images` splits it into one `Image`/frame.
     let frames_u8 = decode_to_frames(vae, latents, tiling, Some(cancel))?;
-    let frames = frames_to_images(&frames_u8)?;
+    let mut frames = frames_to_images(&frames_u8)?;
+    // Trim the leading over-delivery so a batch product returns exactly the requested count (never
+    // invents frames when the request is ≥ what was decoded).
+    if let Some(requested) = out_frames {
+        if requested < frames.len() {
+            let excess = frames.len() - requested;
+            frames.drain(0..excess);
+        }
+    }
     Ok(GenerationOutput::Video {
         frames,
         fps,
@@ -166,18 +188,26 @@ pub fn decode_latents_to_video(
 /// verification drives on a tiny random-weight config (tiny UMT5 context + tiny DiT + tiny VAE): it
 /// exercises `context → latents → VAE decode → video` without the 28 GB checkpoint.
 ///
-/// **First-frame VAE re-anchor (sc-8438 S5 follow-up, evaluated in S6).** The reference
-/// `release_server.py::get_clean_context_frames` re-encodes the first *decoded* output frame through
-/// the VAE and pins it as a persistent clean-context anchor in the rolling KV cache. That is a
-/// **streaming-only** mechanism and does not apply here: (1) the batch path decodes exactly **once**,
-/// at the very end — there is no incrementally-decoded first frame to re-encode mid-generation; (2)
-/// within the batch generation the always-attended `sink_size` prefix + the S5 clean-context KV
-/// recompute already provide the persistent clean anchor; (3) the re-anchor's purpose — re-injecting
-/// decoded-pixel-clean context during *unbounded* streaming — has no analogue when the full latent
-/// sequence is produced in one pass. It is therefore **deferred to the streaming epic** (not dropped);
-/// wiring it into the batch path would add a VAE round-trip with no coherence effect on a single-decode
-/// clip. Confidence: moderate — the reference sampling path is unavailable here, but the architectural
-/// reasoning (single terminal decode, sink + recompute anchor) is sound.
+/// **First-frame VAE re-anchor (sc-8438 S5 follow-up, evaluated in S6; long-clip coherence tracked as
+/// sc-15127 / S18).** The reference `release_server.py::get_clean_context_frames` re-encodes the first
+/// *decoded* output frame through the VAE and pins it as a persistent clean-context anchor in the
+/// rolling KV cache. That specific **mechanism** is genuinely streaming-coupled and is correctly out of
+/// this batch path: it re-encodes decoded pixels *mid-generation*, but the batch form decodes exactly
+/// **once**, at the very end — there is no incrementally-decoded first frame to re-encode while the
+/// latents are still being produced. Wiring the pixel re-encode into the batch path would add a VAE
+/// round-trip with nothing to anchor against on a single terminal decode.
+///
+/// **This does *not* mean a long batch clip is anchored.** The Mac path runs the bounded ~6-frame
+/// streaming window ([`mac_ar_config`]) for *every* clip, and the shipped 14B config sets
+/// `sink_size = 0` (`config.rs`, asserted there), so the always-attended sink prefix is **empty** and
+/// anchors nothing. A long batch clip therefore slides that window with **no persistent clean anchor** —
+/// a real long-range coherence risk. The reference deliberately *pairs* the bounded window with the
+/// first-frame re-anchor to hold such an anchor; the batch path currently has neither the re-anchor nor a
+/// non-zero sink. That gap is **tracked as sc-15127 (S18)**: it must be measured — and a batch-compatible
+/// anchor chosen (a non-zero `sink_size` latent-space pin is the likely fix, needing no incremental
+/// decode) — on the gated real-weight run (S6(b) / S13). It is not addressable on the tiny random-weight
+/// fixtures here. Confidence: high that `sink_size = 0` leaves the sliding window unanchored; the
+/// coherence *impact* on a long clip is unmeasured until real weights.
 #[allow(clippy::too_many_arguments)]
 pub fn generate_t2v_from_components(
     transformer: &CausalKreaTransformer,
@@ -185,6 +215,7 @@ pub fn generate_t2v_from_components(
     vae: &WanVae,
     context: &Array,
     params: &ArGenParams,
+    out_frames: Option<usize>,
     tiling: Option<&TilingConfig>,
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
@@ -198,7 +229,8 @@ pub fn generate_t2v_from_components(
         return Err(Error::Canceled);
     }
     on_progress(Progress::Decoding);
-    decode_latents_to_video(vae, &latents, params.fps, tiling, cancel)
+    // `out_frames` trims the z16 decode's leading over-delivery back to the requested output count.
+    decode_latents_to_video(vae, &latents, params.fps, out_frames, tiling, cancel)
 }
 
 /// Load the reused stock-Wan UMT5-XXL text encoder from the snapshot `root` and encode `prompt` →
@@ -296,18 +328,21 @@ pub fn generate_t2v(
         latent_width: latent_w,
         fps: job.fps,
     };
-    let out_frames = (num_latent_frames * TEMPORAL_STRIDE) as i32;
+    let decoded_frames = (num_latent_frames * TEMPORAL_STRIDE) as i32;
     let tiling = decode_tiling(
         latent_h * SPATIAL_STRIDE,
         latent_w * SPATIAL_STRIDE,
-        out_frames,
+        decoded_frames,
     );
+    // Trim the z16 decode back to the exact requested output count (`(f−1)/4+1` latent → `4·T_lat`
+    // decoded over-delivers up to 3 leading frames when `num_frames` is not ≡ 1 (mod 4)).
     generate_t2v_from_components(
         &transformer,
         &cfg,
         &vae,
         &context,
         &params,
+        Some(job.num_frames as usize),
         tiling.as_ref(),
         cancel,
         on_progress,
