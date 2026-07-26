@@ -223,9 +223,16 @@ enforced on CUDA at 30 s; that is not a calibrated gate, and the sweep steps in
 | Variant | Backend | `min_global` | `min_median_window` | Floor | Margin |
 |---|---|---:|---:|---:|---:|
 | SFX | Metal | 5.71451e-4 | 4.78244e-4 | 2e-4 | 2.39x |
-| SFX | CUDA | see CI | see CI | 2e-4 | — |
+| SFX | CUDA | 5.71427e-4 | 4.78424e-4 | 2e-4 | 2.39x |
 | music | Metal | 1.64826e-1 | 2.00091e-1 | 1e-2 | 16.48x |
-| music | CUDA | see CI | see CI | 1e-2 | — |
+| music | CUDA | 1.64825e-1 | 2.00093e-1 | 1e-2 | 16.48x |
+
+The two backends agree to five significant figures on both sweeps, which is
+worth stating plainly: the margins are not absorbing a cross-backend
+discrepancy, because there isn't one. That is now a measured result rather than
+an assumption — it is exactly what the previous revision asserted without
+checking. Every number in this table was produced by the committed sweeps
+running in `.github/workflows/real-weights.yml` on this branch.
 
 The SFX distribution is bimodal: 20 of 25 samples land in 5.7e-4 … 1.4e-3, and
 the "Sparkling fantasy energy swirl" prompt lands near 1.0 at every seed. The

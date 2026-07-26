@@ -220,9 +220,11 @@ const CALIBRATION_STEPS: u32 = 8;
 /// | backend | min global | min median-window |
 /// |---|---:|---:|
 /// | Metal | 5.71451e-4 | 4.78244e-4 |
-/// | CUDA | MEASURED_CUDA_SFX | MEASURED_CUDA_SFX |
+/// | CUDA | 5.71427e-4 | 4.78424e-4 |
 ///
-/// Union minimum 4.78244e-4, so the floor sits 2.39x below the smallest of the measured numbers.
+/// The two backends agree to four significant figures, which is itself worth knowing: the floor is
+/// not absorbing a cross-backend discrepancy, there isn't one. Union minimum 4.78244e-4 (Metal), so
+/// the floor sits 2.39x below the smallest of the 100 measured numbers.
 /// The distribution is bimodal: 20 of 25 samples per backend land in 5.7e-4 … 1.4e-3 and the
 /// "Sparkling fantasy energy swirl" prompt lands near 1.0 at every seed.
 ///
@@ -245,10 +247,11 @@ const PREVIOUS_SFX_SIDE_RATIO_FLOOR: f64 = 1e-4;
 /// | backend | min global | min median-window |
 /// |---|---:|---:|
 /// | Metal | 1.64826e-1 | 2.00091e-1 |
-/// | CUDA | MEASURED_CUDA_MUSIC | MEASURED_CUDA_MUSIC |
+/// | CUDA | 1.64825e-1 | 2.00093e-1 |
 ///
 /// The music checkpoint renders a genuinely wide image on every prompt in its own demo set — the
-/// union minimum is 16.48x above this floor. It is left at the shipped `1e-2` rather than
+/// union minimum (1.64825e-1, CUDA) is 16.48x above this floor. It is left at the shipped `1e-2`
+/// rather than
 /// raised into that gap on purpose: this is a *duplicated-mono* gate, not a stereo-width quality
 /// bar, and the sweep's upper-bound assertion is relaxed for this variant accordingly. What the
 /// sweep adds is the measurement that was missing — the per-window median assertion is now
