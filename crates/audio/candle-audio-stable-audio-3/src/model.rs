@@ -991,8 +991,15 @@ mod tests {
             assert!(matches!(descriptor.modality, Modality::Audio));
             assert_eq!(descriptor.capabilities.audio_sample_rates, [SAMPLE_RATE]);
             // sc-14545 made the cap per variant. Asserting it against `variant.max_duration_secs()`
-            // alone would be a tautology, so the expected value is spelled out per id: the smalls
-            // publish the crate constant, medium publishes its own.
+            // would be a tautology, so re-derive the mapping here: the smalls publish the crate
+            // constant, medium publishes its own. Stated precisely, because a fix-cycle-2 review
+            // caught this being overclaimed: this re-derives the variant -> *named constant*
+            // mapping, so it catches `descriptor_for` wiring the wrong constant to an id, but it
+            // does **not** pin the constants' values — a global edit to `MEDIUM_MAX_DURATION_SECS`
+            // moves both sides together. The numeric literals (120 / 120 / 380) and the
+            // `sample_size` reachability they imply are pinned in
+            // `tests/conformance.rs::each_variant_advertises_a_cap_its_own_geometry_can_serve`,
+            // which is the gate that fails on a value change.
             let expected_cap = match variant {
                 Variant::SmallMusic | Variant::SmallSfx => MAX_DURATION_SECS,
                 Variant::Medium => MEDIUM_MAX_DURATION_SECS,
@@ -1265,10 +1272,15 @@ mod tests {
 
     #[test]
     fn pinned_file_authentication_rejects_size_and_payload_drift() {
+        // `ThreadId`, not `Thread::name()`: under libtest the thread name *is* the test path
+        // (`model::tests::pinned_file_authentication_rejects_size_and_payload_drift`), and `:` is
+        // an illegal character in a Windows path component, so `create_dir_all` returned
+        // `InvalidFilename` (os error 123) on the Windows CUDA runner the moment this crate's unit
+        // tests were first run there. `weights.rs` already uses the id for the same reason.
         let root = std::env::temp_dir().join(format!(
-            "sa3-provider-pin-{}-{}",
+            "sa3-provider-pin-{}-{:?}",
             std::process::id(),
-            std::thread::current().name().unwrap_or("test")
+            std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();

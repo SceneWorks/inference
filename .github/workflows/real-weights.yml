@@ -507,6 +507,18 @@ jobs:
             --test conformance registered_provider_passes_full_audio_conformance -- --ignored --nocapture
           cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
             --test conformance concurrent_requests_are_deterministic_and_do_not_share_rng_state -- --ignored --nocapture
+      - name: Match the frozen-torch provider oracle end to end
+        run: |
+          # sc-14543's end-to-end parity oracle against the vendored
+          # `docs/migration/sa3-small-music-provider-reference` artifact. It ran in no lane until
+          # sc-14545, which is how its `from_layout` call site could be re-pointed from a bare
+          # `HUB_REPO` string to `Variant::SmallMusic.geometry()` with nothing but a compile check
+          # behind it. `validate_layout` rejects a wrong variant before a tensor is read, so this is
+          # the executable proof that the rename kept the checkpoint binding. Deterministic
+          # (`Device::Cpu`, portable LCG noise, fixed seed) and measured at 20.6 s on an M-series
+          # Mac against this exact pinned snapshot.
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
+            --test provider_oracle -- --ignored --nocapture
       - name: Re-calibrate the music stereo-width floor across prompts and seeds
         run: |
           # sc-14544 added a per-window-median side-ratio assertion to the shared `assert_real_audio`
@@ -1075,7 +1087,26 @@ jobs:
             "--test", "provider", "medium_long_form_renders_are_exact_and_timed",
             "--", "--ignored", "--nocapture"
           )
-          $baselineOutput = @(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits)
+          # Resolve an absolute path in the parent scope and hand it to the job. `Start-Job` runs the
+          # scriptblock in a separate runspace that resolves commands from its own `PATH`, which is
+          # not guaranteed to be the one the vcvars import above installed into this scope; a bare
+          # `nvidia-smi` inside the job would surface as a CommandNotFound terminating error rather
+          # than a measurement. The bare form does in fact work on this runner today — run
+          # 30196371019's `SAME-L real weights (CUDA)` job logged
+          # `SA3_SAME_L_CUDA_MEMORY case=literal-380s baseline_total_mib=12252 peak_total_mib=28069`
+          # from the identical `Invoke-SameLProbe` sampler, which is proof the job runspace both
+          # resolved the tool and observed a real in-render peak. This binds it explicitly anyway so
+          # the failure mode is a named throw in the parent rather than a dead sampler, and so the
+          # resolved path is in the log. `Invoke-SameLProbe` above is deliberately left as-is: it is
+          # already green in a recorded run and this PR does not re-open it.
+          $nvidiaSmi = (Get-Command nvidia-smi -CommandType Application -ErrorAction SilentlyContinue |
+            Select-Object -First 1)
+          if (-not $nvidiaSmi) {
+            throw "nvidia-smi is not resolvable on PATH; cannot measure peak CUDA allocation"
+          }
+          $nvidiaSmiPath = $nvidiaSmi.Source
+          Write-Host "nvidia-smi resolved to $nvidiaSmiPath"
+          $baselineOutput = @(& $nvidiaSmiPath --query-gpu=memory.used --format=csv,noheader,nounits)
           if ($LASTEXITCODE -ne 0) {
             throw "nvidia-smi baseline query failed with exit code $LASTEXITCODE"
           }
@@ -1084,10 +1115,10 @@ jobs:
           if (-not [int]::TryParse($baselineText.Trim(), [ref]$baselineMiB)) {
             throw "nvidia-smi baseline query returned an invalid value: '$baselineText'"
           }
-          $sampler = Start-Job -ArgumentList $stop, $baselineMiB -ScriptBlock {
-            param([string]$stopPath, [int]$peakMiB)
+          $sampler = Start-Job -ArgumentList $nvidiaSmiPath, $stop, $baselineMiB -ScriptBlock {
+            param([string]$nvidiaSmiPath, [string]$stopPath, [int]$peakMiB)
             while (-not (Test-Path $stopPath)) {
-              $sampleOutput = @(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits)
+              $sampleOutput = @(& $nvidiaSmiPath --query-gpu=memory.used --format=csv,noheader,nounits)
               if ($LASTEXITCODE -ne 0) {
                 throw "nvidia-smi sampler query failed with exit code $LASTEXITCODE"
               }
