@@ -21,7 +21,7 @@ use serde_json::Value;
 
 /// Engine / provider id for Krea Realtime 14B. Distinct from the unrelated **image** crate
 /// `mlx-gen-krea` (Krea 2 Turbo, engine `krea_2_turbo`) — this is the autoregressive **video** model.
-/// Registration under this id is deliberately deferred to S6 (the crate ships no generator yet).
+/// The registered [`Generator`](crate::KreaRealtime) is composed under this id (sc-8439 S6).
 pub const MODEL_ID: &str = "krea_realtime_14b";
 
 /// The autoregressive / self-forcing inference knobs Krea Realtime carries on top of the shared

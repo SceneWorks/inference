@@ -26,6 +26,7 @@ pub mod providers {
     pub use mlx_gen_joycaption as joycaption;
     pub use mlx_gen_kolors as kolors;
     pub use mlx_gen_krea as krea;
+    pub use mlx_gen_krea_realtime as krea_realtime;
     pub use mlx_gen_lens as lens;
     pub use mlx_gen_ltx as ltx;
     pub use mlx_gen_mage as mage;
@@ -71,6 +72,7 @@ pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistry
     let registry = mlx_gen_joycaption::register_providers(registry);
     let registry = mlx_gen_kolors::register_providers(registry);
     let registry = mlx_gen_krea::register_providers(registry);
+    let registry = mlx_gen_krea_realtime::register_providers(registry);
     let registry = mlx_gen_lens::register_providers(registry);
     let registry = mlx_gen_ltx::register_providers(registry);
     let registry = mlx_gen_mage::register_providers(registry);
@@ -182,6 +184,7 @@ mod tests {
                 "krea_2_edit",
                 "krea_2_turbo_edit",
                 "krea_2_turbo_control",
+                "krea_realtime_14b",
                 "lens_turbo",
                 "lens",
                 "ltx_2_3",
