@@ -15,7 +15,7 @@
 //! `laion/clap-htsat-unfused` (Apache-2.0) checkpoint, module-for-module against `transformers`
 //! `modeling_clap.py`:
 //!
-//! - [`mel`] — the host front-end (downmix / linear-resample to 48 kHz / slaney log-mel over the
+//! - [`mel`] — the host front-end (downmix / Kaiser-sinc resample to 48 kHz / slaney log-mel over the
 //!   STFT in [`candle_audio::dsp`]),
 //! - [`audio`] — the HTSAT (Swin-transformer) audio tower: patch embed → 4 windowed-attention stages
 //!   with relative-position bias, shifted-window masks, and patch merging → mean pool,

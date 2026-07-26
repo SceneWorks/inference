@@ -26,7 +26,7 @@ use candle_gen::candle_nn::ops::softmax_last_dim;
 use candle_gen::candle_nn::rotary_emb::rope;
 use candle_gen::candle_nn::{LayerNorm, Linear, Module};
 
-use crate::loader::{linear_guard_dense, Weights};
+use crate::loader::Weights;
 
 const LN_EPS: f64 = 1e-6;
 const ROPE_THETA: f32 = 10000.0;
@@ -80,9 +80,26 @@ impl VisionConfig {
 
 /// Affine LayerNorm over the last dim (eps 1e-6), built from a `Weights` `{prefix}.weight`/`.bias`.
 fn layer_norm(w: &Weights, prefix: &str) -> Result<LayerNorm> {
-    let weight = w.get(&format!("{prefix}.weight"))?;
-    let bias = w.get(&format!("{prefix}.bias"))?;
+    let weight = w.get_f32(&format!("{prefix}.weight"))?;
+    let bias = w.get_f32(&format!("{prefix}.bias"))?;
     Ok(LayerNorm::new(weight, bias, LN_EPS))
+}
+
+/// Load an unpacked vision projection in f32 regardless of the surrounding language-model store
+/// dtype. Mage shares one Qwen3-VL component between a BF16 language model and this parity-grade
+/// f32 tower; using `Weights::get` here would silently inherit BF16 and reject f32 pixel inputs.
+fn vision_linear(w: &Weights, base: &str, bias: bool) -> Result<Linear> {
+    if w.packed().is_some() && w.contains(&format!("{base}.scales")) {
+        return Err(candle_gen::candle_core::Error::Msg(format!(
+            "boogu: `{base}` has a `.scales` sibling in a packed component but is loaded dense — the \
+             vision tower is bf16 on disk and computes in f32; a packed vision tower is unsupported."
+        )));
+    }
+    let weight = w.get_f32(&format!("{base}.weight"))?;
+    let bias = bias
+        .then(|| w.get_f32(&format!("{base}.bias")))
+        .transpose()?;
+    Ok(Linear::new(weight, bias))
 }
 
 /// One vision block: pre-LayerNorm full attention + pre-LayerNorm GELU-tanh MLP, both residual.
@@ -104,10 +121,10 @@ impl Block {
         Ok(Self {
             norm1: layer_norm(w, &format!("{prefix}.norm1"))?,
             norm2: layer_norm(w, &format!("{prefix}.norm2"))?,
-            qkv: linear_guard_dense(w, &format!("{prefix}.attn.qkv"), true)?,
-            proj: linear_guard_dense(w, &format!("{prefix}.attn.proj"), true)?,
-            fc1: linear_guard_dense(w, &format!("{prefix}.mlp.linear_fc1"), true)?,
-            fc2: linear_guard_dense(w, &format!("{prefix}.mlp.linear_fc2"), true)?,
+            qkv: vision_linear(w, &format!("{prefix}.attn.qkv"), true)?,
+            proj: vision_linear(w, &format!("{prefix}.attn.proj"), true)?,
+            fc1: vision_linear(w, &format!("{prefix}.mlp.linear_fc1"), true)?,
+            fc2: vision_linear(w, &format!("{prefix}.mlp.linear_fc2"), true)?,
             num_heads: cfg.num_heads,
             head_dim,
             scale: (head_dim as f64).powf(-0.5),
@@ -181,8 +198,8 @@ impl Merger {
     fn load(w: &Weights, prefix: &str, postshuffle: bool, merged_dim: usize) -> Result<Self> {
         Ok(Self {
             norm: layer_norm(w, &format!("{prefix}.norm"))?,
-            fc1: linear_guard_dense(w, &format!("{prefix}.linear_fc1"), true)?,
-            fc2: linear_guard_dense(w, &format!("{prefix}.linear_fc2"), true)?,
+            fc1: vision_linear(w, &format!("{prefix}.linear_fc1"), true)?,
+            fc2: vision_linear(w, &format!("{prefix}.linear_fc2"), true)?,
             postshuffle,
             merged_dim,
         })
@@ -240,11 +257,11 @@ impl VisionTower {
         }
         // Fold the Conv3d patch-embed weight `[embed, in, t, ph, pw]` → `[embed, in·t·ph·pw]` so the
         // full-kernel conv runs as a per-patch matmul; keep its bias.
-        let conv = w.get(&format!("{prefix}.patch_embed.proj.weight"))?;
+        let conv = w.get_f32(&format!("{prefix}.patch_embed.proj.weight"))?;
         let dims = conv.dims();
         let embed = dims[0];
         let in_dim: usize = dims[1..].iter().product();
-        let bias = w.get(&format!("{prefix}.patch_embed.proj.bias"))?;
+        let bias = w.get_f32(&format!("{prefix}.patch_embed.proj.bias"))?;
         let patch_embed = Linear::new(conv.reshape((embed, in_dim))?, Some(bias));
 
         let blocks = (0..cfg.depth)
@@ -266,7 +283,7 @@ impl VisionTower {
 
         Ok(Self {
             patch_embed,
-            pos_embed: w.get(&format!("{prefix}.pos_embed.weight"))?,
+            pos_embed: w.get_f32(&format!("{prefix}.pos_embed.weight"))?,
             blocks,
             merger,
             deepstack_mergers,

@@ -1,10 +1,12 @@
 //! Cross-backend Mage Edit / Edit-Base / Edit-Turbo acceptance.
 //!
 //! Each bundle is produced by the frozen Torch reference and separately consumed by the MLX suite.
-//! Candle enters through the registered provider and production reference-image path, covering
-//! checkpoint identity, resize, Qwen3-VL conditioning, Mage-VAE posterior sampling, packed edit
-//! DiT math, target-only Euler integration, and decode. The final-image tolerance absorbs the
-//! deliberately different random-normal algorithms used by the three runtimes.
+//! Candle enters through the production `MageEdit` component path, covering resize, Qwen3-VL
+//! conditioning, Mage-VAE posterior sampling, packed edit DiT math, target-only Euler integration,
+//! and decode. The registry contract separately pins the published 512..=2048 range; these frozen
+//! 256² parity traces intentionally use the lower-level component path so the CPU Torch producer
+//! remains tractable. The final-image tolerance absorbs the deliberately different random-normal
+//! algorithms used by the three runtimes.
 
 #![cfg(feature = "cuda")]
 
@@ -12,9 +14,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use candle_core::{DType, Device, Tensor};
-use candle_gen::gen_core::{
-    Conditioning, GenerationOutput, GenerationRequest, Image, LoadSpec, WeightsSource,
-};
+use candle_gen::gen_core::runtime::CancelFlag;
+use candle_gen::gen_core::Image;
+use candle_gen_mage::{MageEdit, MageEditVariant};
 
 const INSTRUCTION: &str = "Replace the background with a field of sunflowers";
 
@@ -25,6 +27,7 @@ struct Case {
     golden: &'static str,
     expected_steps: usize,
     expected_cfg: f32,
+    max_image_mean_rel: f64,
 }
 
 const CASES: &[Case] = &[
@@ -35,6 +38,7 @@ const CASES: &[Case] = &[
         golden: "mage_flow_edit_golden.safetensors",
         expected_steps: 30,
         expected_cfg: 5.0,
+        max_image_mean_rel: 0.11,
     },
     Case {
         id: "mage_flow_edit_base",
@@ -43,6 +47,7 @@ const CASES: &[Case] = &[
         golden: "mage_flow_edit_base_golden.safetensors",
         expected_steps: 30,
         expected_cfg: 5.0,
+        max_image_mean_rel: 0.10,
     },
     Case {
         id: "mage_flow_edit_turbo",
@@ -51,6 +56,7 @@ const CASES: &[Case] = &[
         golden: "mage_flow_edit_turbo_golden.safetensors",
         expected_steps: 4,
         expected_cfg: 1.0,
+        max_image_mean_rel: 0.08,
     },
 ];
 
@@ -71,7 +77,7 @@ fn mean_relative_u8(got: &[u8], want: &[u8]) -> f64 {
 
 #[test]
 #[ignore = "needs all three Mage edit snapshots, Torch goldens, and CUDA"]
-fn all_registered_edit_variants_match_torch_and_mlx_oracles() {
+fn all_edit_variants_match_torch_and_mlx_oracles() {
     let golden_root = PathBuf::from(
         std::env::var("MAGE_GOLDEN_DIR").expect("set MAGE_GOLDEN_DIR to transferred Torch oracles"),
     );
@@ -107,33 +113,29 @@ fn all_registered_edit_variants_match_torch_and_mlx_oracles() {
             height,
             pixels: source,
         };
-        let registry = candle_gen_mage::provider_registry().expect("Mage registry");
-        let generator = registry
-            .load(
-                case.id,
-                &LoadSpec::new(WeightsSource::Dir(snapshot.clone())),
-            )
-            .unwrap_or_else(|error| panic!("load {} provider: {error}", case.label));
-        let output = generator
-            .generate(
-                &GenerationRequest {
-                    prompt: INSTRUCTION.into(),
-                    width,
-                    height,
-                    seed: Some(seed),
-                    conditioning: vec![Conditioning::Reference {
-                        image: reference.clone(),
-                        strength: None,
-                    }],
-                    ..Default::default()
-                },
+        let variant = match case.id {
+            "mage_flow_edit" => MageEditVariant::Edit,
+            "mage_flow_edit_base" => MageEditVariant::EditBase,
+            "mage_flow_edit_turbo" => MageEditVariant::EditTurbo,
+            id => panic!("unknown Mage edit case {id}"),
+        };
+        assert_eq!(variant.defaults(), (case.expected_steps, case.expected_cfg));
+        let editor = MageEdit::load(&snapshot, &device)
+            .unwrap_or_else(|error| panic!("load {} components: {error}", case.label));
+        let image = editor
+            .edit(
+                INSTRUCTION,
+                " ",
+                std::slice::from_ref(&reference),
+                width,
+                height,
+                steps,
+                cfg,
+                seed,
+                &CancelFlag::new(),
                 &mut |_| {},
             )
-            .unwrap_or_else(|error| panic!("{} registered edit: {error}", case.label));
-        let image = match output {
-            GenerationOutput::Images(mut images) if images.len() == 1 => images.remove(0),
-            other => panic!("{} returned unexpected output: {other:?}", case.label),
-        };
+            .unwrap_or_else(|error| panic!("{} component edit: {error}", case.label));
         let want = golden["image_u8"]
             .to_device(&Device::Cpu)
             .unwrap()
@@ -144,10 +146,12 @@ fn all_registered_edit_variants_match_torch_and_mlx_oracles() {
             .to_vec1::<u8>()
             .unwrap();
         let mean_rel = mean_relative_u8(&image.pixels, &want);
+        println!("{} image mean_rel={mean_rel:.6}", case.label);
         assert!(
-            mean_rel <= 0.10,
-            "{} Torch/MLX/Candle image mean_rel {mean_rel:.6} exceeds 0.10",
-            case.label
+            mean_rel <= case.max_image_mean_rel,
+            "{} Torch/MLX/Candle image mean_rel {mean_rel:.6} exceeds {:.2}",
+            case.label,
+            case.max_image_mean_rel
         );
         // A constant-white/black oracle would let the tolerance look healthy while carrying no
         // semantic signal. Pin a real dynamic range and reject that false-green class.
@@ -164,26 +168,20 @@ fn all_registered_edit_variants_match_torch_and_mlx_oracles() {
             for value in &mut mutated.pixels {
                 *value = 255 - *value;
             }
-            let changed = generator
-                .generate(
-                    &GenerationRequest {
-                        prompt: INSTRUCTION.into(),
-                        width,
-                        height,
-                        seed: Some(seed),
-                        conditioning: vec![Conditioning::Reference {
-                            image: mutated,
-                            strength: None,
-                        }],
-                        ..Default::default()
-                    },
+            let changed = editor
+                .edit(
+                    INSTRUCTION,
+                    " ",
+                    &[mutated],
+                    width,
+                    height,
+                    steps,
+                    cfg,
+                    seed,
+                    &CancelFlag::new(),
                     &mut |_| {},
                 )
                 .expect("Edit-Turbo mutated-reference render");
-            let changed = match changed {
-                GenerationOutput::Images(mut images) if images.len() == 1 => images.remove(0),
-                other => panic!("Edit-Turbo mutation returned unexpected output: {other:?}"),
-            };
             let mutation = mean_relative_u8(&changed.pixels, &image.pixels);
             assert!(
                 mutation >= 0.01,

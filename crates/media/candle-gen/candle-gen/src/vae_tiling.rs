@@ -55,10 +55,10 @@ pub fn decode_tiled<F, E>(
     label: &str,
     latent: &Tensor,
     cfg: &TilingConfig,
-    decode_fn: F,
+    mut decode_fn: F,
 ) -> std::result::Result<Tensor, E>
 where
-    F: Fn(&Tensor) -> std::result::Result<Tensor, E>,
+    F: FnMut(&Tensor) -> std::result::Result<Tensor, E>,
     E: From<Error>,
 {
     let (_b, _c, f, h, w) = latent.dims5()?;
@@ -66,7 +66,7 @@ where
         return decode_fn(latent);
     }
     let plan = cfg.plan(vae, f as i32, h as i32, w as i32);
-    blend_plan(label, latent, &plan, decode_fn)
+    blend_plan(label, latent, &plan, &mut decode_fn)
 }
 
 /// The pure slice-and-accumulate tile blender (split out of [`decode_tiled`] so unit tests can drive a
@@ -77,10 +77,10 @@ fn blend_plan<F, E>(
     label: &str,
     latent: &Tensor,
     plan: &TilePlan,
-    decode_fn: F,
+    decode_fn: &mut F,
 ) -> std::result::Result<Tensor, E>
 where
-    F: Fn(&Tensor) -> std::result::Result<Tensor, E>,
+    F: FnMut(&Tensor) -> std::result::Result<Tensor, E>,
     E: From<Error>,
 {
     let dev = latent.device();
@@ -200,15 +200,17 @@ pub fn safe_budget_gib(env_var: &str, safe_frac: f64, default_gib: f64) -> f64 {
 }
 
 /// **Free-aware** safe-budget resolver — the opt-in sibling of [`safe_budget_gib`] that budgets a
-/// decode tiler against **FREE** VRAM instead of `total × safe_frac` (sc-12734).
+/// decode tiler against effective **FREE + REUSABLE POOL** VRAM instead of `total × safe_frac`
+/// (sc-12734 / sc-14625).
 ///
 /// Why: [`safe_budget_gib`] resolves `total × 0.85`, which IGNORES the model weights the denoise left
 /// resident + the cudarc pool. The Wan decode tiler runs *after* the denoise, so it must budget
-/// against what is genuinely free — otherwise the q8 / i2v-q4 OOMs land in the decode, on top of the
-/// resident weights. This resolver reads the live `nvidia-smi memory.free` of the **render's pinned
-/// device** ([`crate::gpu::nvidia_smi_rendered_free_gib`] — Candle's `cuda:0`, the
-/// `CUDA_VISIBLE_DEVICES` card the worker pinned), which is the driver's `total − used`, i.e. already
-/// `(total − resident)`; the returned budget is `free × safe_frac`.
+/// against what is genuinely available — otherwise the q8 / i2v-q4 OOMs land in the decode, on top
+/// of resident weights. Sequential drops add one nuance: cudarc retains freed allocations in its
+/// process pool, so they remain absent from `nvidia-smi memory.free` even though the next phase can
+/// reuse them. This resolver therefore reads the rendered device's driver-free bytes plus
+/// `RESERVED_MEM_CURRENT − USED_MEM_CURRENT` from Candle's default async pool via
+/// [`crate::gpu::rendered_effective_free_gib`].
 ///
 /// **sc-13298:** this used to read the MIN free across ALL GPUs, which let a busy CO-TENANT card on a
 /// multi-GPU box shrink the budget of a decode pinned to an idle one (poisoning it down to a spurious
@@ -218,7 +220,8 @@ pub fn safe_budget_gib(env_var: &str, safe_frac: f64, default_gib: f64) -> f64 {
 /// Resolved in order (mirrors [`safe_budget_gib`] so `env_var` stays the deterministic test/worker
 /// injection point):
 ///  1. the `env_var` override (a positive float — e.g. `WAN_VAE_BUDGET_GIB`);
-///  2. `free VRAM × safe_frac` via the live [`crate::gpu::nvidia_smi_rendered_free_gib`] probe;
+///  2. `(driver-free + reusable pool) × safe_frac` via
+///     [`crate::gpu::rendered_effective_free_gib`];
 ///  3. `default_gib` when no trusted `nvidia-smi` is present.
 ///
 /// **Opt-in / blast radius:** this is a *separate* entry point; [`safe_budget_gib`] (used by the LTX
@@ -228,7 +231,7 @@ pub fn free_aware_safe_budget_gib(env_var: &str, safe_frac: f64, default_gib: f6
         env_var,
         safe_frac,
         default_gib,
-        crate::gpu::nvidia_smi_rendered_free_gib,
+        crate::gpu::rendered_effective_free_gib,
     )
 }
 

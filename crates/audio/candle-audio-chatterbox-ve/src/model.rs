@@ -145,7 +145,7 @@ impl VoiceEmbedder for ChatterboxVoiceEmbedder {
         }
         // Down-mix to mono if the caller handed an interleaved multi-channel clip.
         let mono = to_mono(&audio.samples, audio.channels);
-        let mel = wav_to_mel_frames(&mono, audio.sample_rate);
+        let mel = wav_to_mel_frames(&mono, audio.sample_rate).map_err(gen_core::Error::from)?;
         if mel.is_empty() {
             return Err(gen_core::Error::Msg(format!(
                 "{MODEL_ID}: reference clip produced no analysis frames"

@@ -131,6 +131,74 @@ pub fn nvidia_smi_rendered_free_gib() -> Option<f64> {
         .or_else(nvidia_smi_min_free_gib)
 }
 
+/// Effective allocation headroom for Candle on the rendered GPU: physical driver-free memory plus
+/// bytes reserved by this process's default async pool that are no longer live and can be reused.
+///
+/// Dropping a sequential phase returns its allocations to cudarc's in-process pool, not to the
+/// driver. Consequently `nvidia-smi memory.free` alone undercounts what the following VAE allocation
+/// can use and may reject a viable tile after a large UNet drop. The default pool reports both
+/// `RESERVED_MEM_CURRENT` and `USED_MEM_CURRENT`; their difference is already owned by this process
+/// and immediately reusable without another physical allocation.
+///
+/// The pool query is best-effort. Non-CUDA builds and driver failures retain the conservative
+/// `nvidia-smi` value. CUDA logical device 0 is the rendered device after `CUDA_VISIBLE_DEVICES`
+/// remapping, matching Candle's `default_device`.
+pub fn rendered_effective_free_gib() -> Option<f64> {
+    nvidia_smi_rendered_free_gib()
+        .map(|driver_free| effective_free_gib(driver_free, cuda_default_pool_reusable_gib()))
+}
+
+fn effective_free_gib(driver_free_gib: f64, reusable_pool_gib: Option<f64>) -> f64 {
+    driver_free_gib + reusable_pool_gib.unwrap_or(0.0).max(0.0)
+}
+
+#[cfg(feature = "cuda")]
+fn cuda_default_pool_reusable_gib() -> Option<f64> {
+    use std::ffi::c_void;
+
+    use candle_core::cuda::cudarc::driver::sys;
+
+    unsafe fn read_attr(pool: sys::CUmemoryPool, attr: sys::CUmemPool_attribute) -> Option<u64> {
+        let mut value = 0u64;
+        if unsafe {
+            sys::cuMemPoolGetAttribute(pool, attr, (&mut value as *mut u64).cast::<c_void>())
+        } == sys::CUresult::CUDA_SUCCESS
+        {
+            Some(value)
+        } else {
+            None
+        }
+    }
+
+    unsafe {
+        if sys::cuInit(0) != sys::CUresult::CUDA_SUCCESS {
+            return None;
+        }
+        let mut device: sys::CUdevice = 0;
+        if sys::cuDeviceGet(&mut device, 0) != sys::CUresult::CUDA_SUCCESS {
+            return None;
+        }
+        let mut pool: sys::CUmemoryPool = std::ptr::null_mut();
+        if sys::cuDeviceGetDefaultMemPool(&mut pool, device) != sys::CUresult::CUDA_SUCCESS {
+            return None;
+        }
+        let reserved = read_attr(
+            pool,
+            sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT,
+        )?;
+        let used = read_attr(
+            pool,
+            sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_USED_MEM_CURRENT,
+        )?;
+        Some(reserved.saturating_sub(used) as f64 / (1024.0 * 1024.0 * 1024.0))
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+fn cuda_default_pool_reusable_gib() -> Option<f64> {
+    None
+}
+
 /// The physical GPU ordinal Candle's `cuda:0` renders on, from `CUDA_VISIBLE_DEVICES` (`std::env`).
 /// The production-path twin of `testkit::probe_gpu`, delegating to [`parse_rendered_ordinal`].
 fn rendered_gpu_ordinal() -> Option<usize> {
@@ -275,6 +343,13 @@ mod tests {
         assert_eq!(parse_min_mib_line_gib("no gpus\n\n"), None);
         // Zero/negative are filtered out (a driver quirk) → None, not 0.
         assert_eq!(parse_min_mib_line_gib("0\n"), None);
+    }
+
+    #[test]
+    fn effective_free_adds_only_reusable_pool_capacity() {
+        assert!((effective_free_gib(7.5, Some(4.25)) - 11.75).abs() < 1e-9);
+        assert_eq!(effective_free_gib(7.5, None), 7.5);
+        assert_eq!(effective_free_gib(7.5, Some(-1.0)), 7.5);
     }
 
     #[test]

@@ -24,6 +24,7 @@ Legacy activity that landed *after* the `runtime-2026.07.1` cutover is mapped in
 
 ## Checkpoints
 
+- [`SC_14534_SA3_REFERENCE_PARITY.md`](SC_14534_SA3_REFERENCE_PARITY.md): pinned Stable Audio 3 snapshots, upstream PyTorch harness, consumed-config evidence, and compact parity tensors
 - [`PHASE_1_CHECKPOINT.md`](PHASE_1_CHECKPOINT.md): history import and exact tree equivalence
 - [`PHASE_2_CHECKPOINT.md`](PHASE_2_CHECKPOINT.md): ownership layout and unified workspace
 - [`PHASE_3_CHECKPOINT.md`](PHASE_3_CHECKPOINT.md): CI selection and release-train tooling

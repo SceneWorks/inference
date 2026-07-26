@@ -82,6 +82,12 @@ impl S3Gen {
         &self,
         reference: &AudioTrack,
     ) -> Result<(Vec<u32>, candle_audio::candle_core::Tensor, Vec<f32>)> {
+        if reference.channels != 1 {
+            return Err(AudioError::Msg(format!(
+                "s3gen: expected provider-prepared mono reference audio, got {} channels",
+                reference.channels
+            )));
+        }
         let sr = reference.sample_rate;
         let clip = cap_reference(&reference.samples, sr);
         if clip.is_empty() {

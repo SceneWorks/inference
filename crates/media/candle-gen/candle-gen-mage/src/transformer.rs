@@ -284,6 +284,7 @@ impl Block {
         let one = |offset: usize| -> Result<Mods> {
             let expand = |part: usize| -> Result<Tensor> {
                 p.narrow(1, offset + part * dim, dim)?
+                    .contiguous()?
                     .index_select(ids, 0)?
                     .reshape((1, tokens, dim))
             };
@@ -455,13 +456,14 @@ impl MageTransformer {
         let dim = params.dim(1)? / 2;
         let ids = layout.image_segment_ids(image.device())?;
         // Output head is scale,shift—the opposite of block shift,scale,gate.
-        let scale = params.narrow(1, 0, dim)?.index_select(&ids, 0)?.reshape((
-            1,
-            layout.image_tokens(),
-            dim,
-        ))?;
+        let scale = params
+            .narrow(1, 0, dim)?
+            .contiguous()?
+            .index_select(&ids, 0)?
+            .reshape((1, layout.image_tokens(), dim))?;
         let shift = params
             .narrow(1, dim, dim)?
+            .contiguous()?
             .index_select(&ids, 0)?
             .reshape((1, layout.image_tokens(), dim))?;
         self.output

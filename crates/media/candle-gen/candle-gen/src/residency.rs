@@ -294,6 +294,70 @@ pub fn run_sequential<Text, Heavy, Enc, Out>(
     )
 }
 
+/// Drive a three-component sequential lifecycle while keeping at most one component resident:
+/// load/use/drop phase A, load/use/drop phase B, then load/use/drop phase C.
+///
+/// Video pipelines commonly need one more residency boundary than [`run_sequential`]: a conditioning
+/// encoder (and sometimes a source-image VAE encode), then a denoiser, then a VAE decode. Each
+/// component is bound inside its own lexical scope. `sync` runs after a successful load and use before
+/// the component drops, and also after either operation fails, so asynchronous accelerator work
+/// completes before the allocator pool is reused by the next load or job. When both the primary
+/// operation and sync fail, the primary error stays primary.
+///
+/// The caller owns progress and cancellation policy in the load/use closures because phase labels and
+/// cancellation points vary by pipeline. `state` carries only the small tensors and metadata that must
+/// survive component release.
+#[allow(clippy::too_many_arguments)]
+pub fn run_three_stage_sequential<A, B, C, St, Out>(
+    state: &mut St,
+    load_a: impl FnOnce(&mut St) -> Result<A>,
+    use_a: impl FnOnce(&A, &mut St) -> Result<()>,
+    load_b: impl FnOnce(&mut St) -> Result<B>,
+    use_b: impl FnOnce(&B, &mut St) -> Result<()>,
+    load_c: impl FnOnce(&mut St) -> Result<C>,
+    use_c: impl FnOnce(&C, &mut St) -> Result<Out>,
+    mut sync: impl FnMut() -> Result<()>,
+) -> Result<Out> {
+    {
+        let phase_a = match load_a(state) {
+            Ok(phase) => phase,
+            Err(primary) => return finish_synchronized_phase(Err(primary), sync()),
+        };
+        let used = use_a(&phase_a, state);
+        let synced = sync();
+        finish_synchronized_phase(used, synced)?;
+    }
+    {
+        let phase_b = match load_b(state) {
+            Ok(phase) => phase,
+            Err(primary) => return finish_synchronized_phase(Err(primary), sync()),
+        };
+        let used = use_b(&phase_b, state);
+        let synced = sync();
+        finish_synchronized_phase(used, synced)?;
+    }
+    let phase_c = match load_c(state) {
+        Ok(phase) => phase,
+        Err(primary) => return finish_synchronized_phase(Err(primary), sync()),
+    };
+    let used = use_c(&phase_c, state);
+    let synced = sync();
+    finish_synchronized_phase(used, synced)
+}
+
+/// Combine a phase's use result with its mandatory pre-drop synchronization. The synchronization is
+/// evaluated by the caller before this function is entered, so it cannot be skipped by an early
+/// `?`. Preserve the operation/cancellation error when both fail; that is the actionable job result.
+fn finish_synchronized_phase<T>(used: Result<T>, synced: Result<()>) -> Result<T> {
+    match used {
+        Err(primary) => Err(primary),
+        Ok(value) => {
+            synced?;
+            Ok(value)
+        }
+    }
+}
+
 /// [`run_sequential`] with the sc-12195 post-encode boundary sync injected as a closure, so the
 /// ordering contract — encode → sync → text drop → heavy load — is pinnable by tests without a
 /// mockable GPU device. Private on purpose: production callers must go through [`run_sequential`],
@@ -339,7 +403,7 @@ fn run_sequential_with_sync<Text, Heavy, Enc, Out>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::sync::{Arc, Mutex};
 
     /// A tripped flag short-circuits before ANY loader runs — the F-173 property that makes a
@@ -501,6 +565,282 @@ mod tests {
             vec!["encode", "sync", "text-dropped", "heavy-load"],
             "the boundary sync must run after the encode and before the text phase drops"
         );
+    }
+
+    /// The reusable video lifecycle never co-resides phase components: each used component is synced
+    /// and dropped before the next load begins. A provider that regresses to an all-resident aggregate
+    /// makes this witness fail.
+    #[test]
+    fn three_stage_lifecycle_loads_uses_syncs_and_drops_in_order() {
+        struct Witness<'a> {
+            name: &'static str,
+            log: &'a RefCell<Vec<&'static str>>,
+        }
+        impl Drop for Witness<'_> {
+            fn drop(&mut self) {
+                self.log.borrow_mut().push(match self.name {
+                    "a" => "drop-a",
+                    "b" => "drop-b",
+                    "c" => "drop-c",
+                    _ => unreachable!(),
+                });
+            }
+        }
+
+        let log = RefCell::new(Vec::new());
+        let mut state = ();
+        let out = run_three_stage_sequential(
+            &mut state,
+            |_| {
+                log.borrow_mut().push("load-a");
+                Ok(Witness {
+                    name: "a",
+                    log: &log,
+                })
+            },
+            |_, _| {
+                log.borrow_mut().push("use-a");
+                Ok(())
+            },
+            |_| {
+                log.borrow_mut().push("load-b");
+                Ok(Witness {
+                    name: "b",
+                    log: &log,
+                })
+            },
+            |_, _| {
+                log.borrow_mut().push("use-b");
+                Ok(())
+            },
+            |_| {
+                log.borrow_mut().push("load-c");
+                Ok(Witness {
+                    name: "c",
+                    log: &log,
+                })
+            },
+            |_, _| {
+                log.borrow_mut().push("use-c");
+                Ok(7)
+            },
+            || {
+                log.borrow_mut().push("sync");
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(out, 7);
+        assert_eq!(
+            *log.borrow(),
+            vec![
+                "load-a", "use-a", "sync", "drop-a", "load-b", "use-b", "sync", "drop-b", "load-c",
+                "use-c", "sync", "drop-c"
+            ]
+        );
+    }
+
+    /// A phase that fails or is cancelled still drains the device before its component drops. This
+    /// is the worker-health contract: the next job must not reuse allocator memory under queued work.
+    #[test]
+    fn three_stage_failures_sync_before_drop_and_preserve_the_primary_error() {
+        struct Witness<'a> {
+            name: &'static str,
+            log: &'a RefCell<Vec<&'static str>>,
+        }
+        impl Drop for Witness<'_> {
+            fn drop(&mut self) {
+                self.log.borrow_mut().push(match self.name {
+                    "a" => "drop-a",
+                    "b" => "drop-b",
+                    "c" => "drop-c",
+                    _ => unreachable!(),
+                });
+            }
+        }
+
+        for failing in ["a", "b", "c"] {
+            let log = RefCell::new(Vec::new());
+            let syncs = Cell::new(0usize);
+            let mut state = ();
+            let out: Result<()> = run_three_stage_sequential(
+                &mut state,
+                |_| {
+                    log.borrow_mut().push("load-a");
+                    Ok(Witness {
+                        name: "a",
+                        log: &log,
+                    })
+                },
+                |_, _| {
+                    log.borrow_mut().push("use-a");
+                    if failing == "a" {
+                        Err(CandleError::Msg("primary-a".into()))
+                    } else {
+                        Ok(())
+                    }
+                },
+                |_| {
+                    log.borrow_mut().push("load-b");
+                    Ok(Witness {
+                        name: "b",
+                        log: &log,
+                    })
+                },
+                |_, _| {
+                    log.borrow_mut().push("use-b");
+                    if failing == "b" {
+                        Err(CandleError::Canceled)
+                    } else {
+                        Ok(())
+                    }
+                },
+                |_| {
+                    log.borrow_mut().push("load-c");
+                    Ok(Witness {
+                        name: "c",
+                        log: &log,
+                    })
+                },
+                |_, _| {
+                    log.borrow_mut().push("use-c");
+                    Err(if failing == "c" {
+                        CandleError::Msg("primary-c".into())
+                    } else {
+                        unreachable!()
+                    })
+                },
+                || {
+                    log.borrow_mut().push("sync");
+                    let sync = syncs.get() + 1;
+                    syncs.set(sync);
+                    if failing == "c" && sync == 3 {
+                        Err(CandleError::Msg("secondary-sync".into()))
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+
+            match failing {
+                "a" => {
+                    assert!(matches!(out, Err(CandleError::Msg(ref msg)) if msg == "primary-a"));
+                    assert_eq!(*log.borrow(), vec!["load-a", "use-a", "sync", "drop-a"]);
+                }
+                "b" => {
+                    assert!(matches!(out, Err(CandleError::Canceled)));
+                    assert_eq!(
+                        *log.borrow(),
+                        vec![
+                            "load-a", "use-a", "sync", "drop-a", "load-b", "use-b", "sync",
+                            "drop-b"
+                        ]
+                    );
+                }
+                "c" => {
+                    assert!(matches!(out, Err(CandleError::Msg(ref msg)) if msg == "primary-c"));
+                    assert_eq!(
+                        *log.borrow(),
+                        vec![
+                            "load-a", "use-a", "sync", "drop-a", "load-b", "use-b", "sync",
+                            "drop-b", "load-c", "use-c", "sync", "drop-c"
+                        ]
+                    );
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    /// A loader can fail after queueing only part of a component's host-to-device copies. Every phase
+    /// must drain that partial upload before returning the load error, or the next job can reuse its
+    /// allocator blocks while copies are still in flight.
+    #[test]
+    fn three_stage_load_failures_sync_and_preserve_the_primary_error() {
+        for failing in ["a", "b", "c"] {
+            let log = RefCell::new(Vec::new());
+            let mut state = ();
+            let out: Result<()> = run_three_stage_sequential(
+                &mut state,
+                |_| {
+                    log.borrow_mut().push("load-a");
+                    if failing == "a" {
+                        Err(CandleError::Msg("primary-a-load".into()))
+                    } else {
+                        Ok(())
+                    }
+                },
+                |_, _| {
+                    log.borrow_mut().push("use-a");
+                    Ok(())
+                },
+                |_| {
+                    log.borrow_mut().push("load-b");
+                    if failing == "b" {
+                        Err(CandleError::Canceled)
+                    } else {
+                        Ok(())
+                    }
+                },
+                |_, _| {
+                    log.borrow_mut().push("use-b");
+                    Ok(())
+                },
+                |_| {
+                    log.borrow_mut().push("load-c");
+                    if failing == "c" {
+                        Err(CandleError::Msg("primary-c-load".into()))
+                    } else {
+                        Ok(())
+                    }
+                },
+                |_, _| {
+                    log.borrow_mut().push("use-c");
+                    Ok(())
+                },
+                || {
+                    let last = log.borrow().last().copied();
+                    log.borrow_mut().push("sync");
+                    if matches!(
+                        (failing, last),
+                        ("a", Some("load-a")) | ("b", Some("load-b")) | ("c", Some("load-c"))
+                    ) {
+                        Err(CandleError::Msg("secondary-sync".into()))
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+
+            match failing {
+                "a" => {
+                    assert!(
+                        matches!(out, Err(CandleError::Msg(ref msg)) if msg == "primary-a-load")
+                    );
+                    assert_eq!(*log.borrow(), vec!["load-a", "sync"]);
+                }
+                "b" => {
+                    assert!(matches!(out, Err(CandleError::Canceled)));
+                    assert_eq!(
+                        *log.borrow(),
+                        vec!["load-a", "use-a", "sync", "load-b", "sync"]
+                    );
+                }
+                "c" => {
+                    assert!(
+                        matches!(out, Err(CandleError::Msg(ref msg)) if msg == "primary-c-load")
+                    );
+                    assert_eq!(
+                        *log.borrow(),
+                        vec![
+                            "load-a", "use-a", "sync", "load-b", "use-b", "sync", "load-c", "sync"
+                        ]
+                    );
+                }
+                _ => unreachable!(),
+            }
+        }
     }
 
     /// A failed boundary sync aborts the run: the heavy load never starts (its allocations would be
