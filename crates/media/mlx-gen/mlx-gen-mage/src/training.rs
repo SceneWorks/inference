@@ -228,6 +228,22 @@ fn validate_request(req: &TrainingRequest) -> Result<()> {
     if !req.config.full_finetune && req.config.rank == 0 {
         return Err("mage_flow_base trainer: rank must be > 0".into());
     }
+    // Gradient (activation) checkpointing is NOT ported for Mage yet (sc-14989). On the LoRA path the
+    // flag has always been a silent no-op (sc-14055 shipped that way, and the SceneWorks Mage target
+    // sets it by default), so leave that behavior alone. On the FULL base fine-tune path silence is
+    // dangerous rather than merely untidy: this flag is the advertised mitigation for exactly the
+    // memory wall this path hits, and an MLX overcommit is an uncatchable SIGKILL — so a caller who
+    // asks for it and is silently ignored gets a hard process kill instead of the help they requested.
+    // Say so plainly, and name the levers that do work today.
+    if req.config.full_finetune && req.config.gradient_checkpointing {
+        return Err(
+            "mage_flow_base trainer: gradient (activation) checkpointing is not yet \
+                    available for Mage-Flow (sc-14989), so it cannot be honored for a full base \
+                    fine-tune. Lower the training resolution, or train a LoRA/LoKr adapter instead \
+                    — do not rely on this flag to fit a production-resolution full fine-tune."
+                .into(),
+        );
+    }
     if req.config.steps == 0 {
         return Err("mage_flow_base trainer: steps must be > 0".into());
     }
@@ -1521,6 +1537,55 @@ mod tests {
             }
         ))
         .is_err());
+    }
+
+    #[test]
+    fn full_finetune_rejects_unported_gradient_checkpointing_but_lora_is_unaffected() {
+        // sc-14989 is not ported. On the FULL path this flag is the advertised mitigation for the
+        // exact memory wall the path hits, and an MLX overcommit is an uncatchable SIGKILL — so
+        // silently ignoring it would hand the caller a hard process kill instead of the help they
+        // asked for. Reject it with a message that names the story and the levers that DO work.
+        let err = validate_request(&base_request(
+            one_item(),
+            TrainingConfig {
+                full_finetune: true,
+                gradient_checkpointing: true,
+                ..Default::default()
+            },
+        ))
+        .expect_err("a full fine-tune must not silently ignore gradient checkpointing");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("sc-14989"),
+            "must name the tracking story: {msg}"
+        );
+        assert!(
+            msg.contains("resolution") && msg.contains("LoRA"),
+            "must name the levers that work today: {msg}"
+        );
+
+        // The LoRA/LoKr path is deliberately UNCHANGED — the flag has always been a no-op there
+        // (sc-14055), and the SceneWorks Mage target sets it by default, so erroring would break the
+        // shipped adapter path.
+        assert!(validate_request(&base_request(
+            one_item(),
+            TrainingConfig {
+                gradient_checkpointing: true,
+                ..Default::default()
+            }
+        ))
+        .is_ok());
+
+        // A full fine-tune WITHOUT the flag is fine.
+        assert!(validate_request(&base_request(
+            one_item(),
+            TrainingConfig {
+                full_finetune: true,
+                gradient_checkpointing: false,
+                ..Default::default()
+            }
+        ))
+        .is_ok());
     }
 
     /// sc-14056 full base fine-tune **convergence** — a real run on this Mac's MLX GPU that trains
