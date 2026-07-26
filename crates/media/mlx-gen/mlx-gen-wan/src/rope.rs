@@ -115,13 +115,36 @@ impl RopeTable {
     /// f32 arrays of shape `[seq_len, 1, half_d]` (`seq_len = f·h·w`) ready to broadcast against a
     /// `[B, seq_len, n_heads, half_d]` real/imag split. Mirrors `rope_precompute_cos_sin`.
     pub fn precompute_cos_sin(&self, grid: (usize, usize, usize)) -> Result<(Array, Array)> {
+        self.precompute_cos_sin_with_frame_offset(grid, 0)
+    }
+
+    /// Precompute `(cos, sin)` for a constant grid `(f, h, w)` whose **temporal** band is indexed from
+    /// a global frame offset `start_frame` — the Krea Realtime causal-AR shift (sc-8436, S3). Token
+    /// `(ti, hi, wi)` reads temporal frequency row `start_frame + ti` (its **global** latent-frame
+    /// position); the height / width bands are unchanged (spatial position is intra-frame). `start_frame
+    /// = 0` reproduces [`precompute_cos_sin`](Self::precompute_cos_sin) exactly, so the standard
+    /// (non-causal) Wan path is a
+    /// zero-offset special case of this. Mirrors `causal_rope_apply`'s
+    /// `freqs[0][start_frame : start_frame + f]` temporal slice (spatial bands untouched).
+    ///
+    /// The returned rows are identical to the tail `[start_frame·h·w .. (start_frame+f)·h·w)` of
+    /// `precompute_cos_sin((start_frame + f, h, w))`, so a chunk generated at frame offset `start_frame`
+    /// carries exactly the RoPE it would have had in one full-sequence pass — the invariant that lets a
+    /// cached AR forward match a single full-recompute forward (sc-8436 test A).
+    pub fn precompute_cos_sin_with_frame_offset(
+        &self,
+        grid: (usize, usize, usize),
+        start_frame: usize,
+    ) -> Result<(Array, Array)> {
         let (f, h, w) = grid;
         // The per-axis frequency table holds only `MAX_SEQ_LEN` rows; `src_{t,h,w} = idx * half_d`
         // below indexes into it by grid coordinate, so any axis ≥ MAX_SEQ_LEN (an extreme
-        // resolution / very long video) would index out of bounds and panic. Reject up front (F-006).
-        if f > MAX_SEQ_LEN || h > MAX_SEQ_LEN || w > MAX_SEQ_LEN {
+        // resolution / very long video) would index out of bounds and panic. The temporal axis is
+        // offset by `start_frame`, so its ceiling is `start_frame + f`. Reject up front (F-006).
+        if start_frame + f > MAX_SEQ_LEN || h > MAX_SEQ_LEN || w > MAX_SEQ_LEN {
             return Err(Error::Msg(format!(
-                "wan rope: grid ({f},{h},{w}) exceeds MAX_SEQ_LEN ({MAX_SEQ_LEN}) on some axis"
+                "wan rope: grid ({f},{h},{w}) at frame offset {start_frame} exceeds MAX_SEQ_LEN \
+                 ({MAX_SEQ_LEN}) on some axis"
             )));
         }
         let seq_len = f * h * w;
@@ -138,8 +161,9 @@ impl RopeTable {
             for hi in 0..h {
                 for wi in 0..w {
                     let dst = p * half_d;
-                    // temporal columns [0, t0) indexed by ti; height [t0, t1) by hi; width [t1, half_d) by wi.
-                    let src_t = ti * half_d;
+                    // temporal columns [0, t0) indexed by the GLOBAL frame (start_frame + ti); height
+                    // [t0, t1) by hi; width [t1, half_d) by wi (both spatial bands offset-independent).
+                    let src_t = (start_frame + ti) * half_d;
                     let src_h = hi * half_d;
                     let src_w = wi * half_d;
                     cos_out[dst..dst + t0].copy_from_slice(&self.cos[src_t..src_t + t0]);
@@ -242,6 +266,58 @@ mod tests {
             .unwrap()
             .item();
         assert!((xn - yn).abs() / xn < 1e-4, "norm changed: {xn} vs {yn}");
+    }
+
+    #[test]
+    fn frame_offset_equals_tail_of_zero_offset_full_grid() {
+        // The causal-AR invariant (sc-8436): the offset precompute for a chunk of `f` frames at global
+        // frame `start_frame` must be byte-identical to the tail `[start_frame·h·w ..]` rows of the
+        // zero-offset precompute over `(start_frame + f, h, w)` — i.e. the chunk carries exactly the
+        // RoPE it would have in one full pass. This pins the temporal offset AND the spatial bands.
+        let t = RopeTable::new(64);
+        let (h, w) = (2usize, 2usize);
+        let f_chunk = 2usize;
+        let start_frame = 2usize;
+        let hw = (h * w) as i32;
+
+        let (cos_off, sin_off) = t
+            .precompute_cos_sin_with_frame_offset((f_chunk, h, w), start_frame)
+            .unwrap();
+        let (cos_full, sin_full) = t.precompute_cos_sin((start_frame + f_chunk, h, w)).unwrap();
+
+        // Tail rows [start_frame·h·w .. (start_frame+f_chunk)·h·w) of the full grid.
+        let first = (start_frame as i32) * hw;
+        let idx = Array::from_slice(
+            &((first..first + (f_chunk as i32) * hw).collect::<Vec<i32>>()),
+            &[(f_chunk as i32) * hw],
+        );
+        let cos_tail = cos_full.take_axis(&idx, 0).unwrap();
+        let sin_tail = sin_full.take_axis(&idx, 0).unwrap();
+
+        let max_abs_diff = |a: &Array, b: &Array| -> f32 {
+            mlx_rs::ops::max(mlx_rs::ops::abs(subtract(a, b).unwrap()).unwrap(), None)
+                .unwrap()
+                .item::<f32>()
+        };
+        assert_eq!(
+            max_abs_diff(&cos_off, &cos_tail),
+            0.0,
+            "offset cos must equal the full-grid tail exactly"
+        );
+        assert_eq!(
+            max_abs_diff(&sin_off, &sin_tail),
+            0.0,
+            "offset sin must equal the full-grid tail exactly"
+        );
+
+        // Discriminating: a WRONG offset (0) must NOT match the tail (temporal band differs).
+        let (cos_wrong, _) = t
+            .precompute_cos_sin_with_frame_offset((f_chunk, h, w), 0)
+            .unwrap();
+        assert!(
+            max_abs_diff(&cos_wrong, &cos_tail) > 1e-3,
+            "a zero offset must diverge from a start_frame=2 tail"
+        );
     }
 
     #[test]

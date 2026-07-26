@@ -60,6 +60,33 @@ impl Default for KreaArConfig {
 }
 
 impl KreaArConfig {
+    /// Tokens per **attention block** = [`frame_seq_length`](Self::frame_seq_length) ×
+    /// [`num_frames_per_block`](Self::num_frames_per_block) — the block-causal unit (a query attends to
+    /// all tokens up to the end of its own block, intra-block bidirectional, inter-block strictly
+    /// causal). At the shipped geometry: `1560 × 3 = 4680`. Consumed by S3's mask + KV cache.
+    pub fn block_size(&self) -> usize {
+        self.frame_seq_length * self.num_frames_per_block
+    }
+
+    /// The self-attention read window in **tokens**: `k[max(0, end - max_attention_size):end]`. Global
+    /// (= [`seq_length`](Self::seq_length), `32760`) when [`local_attn_size`](Self::local_attn_size) is
+    /// `-1` — the shipped checkpoint — else `local_attn_size` frame-blocks × [`block_size`](Self::block_size).
+    /// Mirrors `causal_model.py`'s `max_attention_size`.
+    pub fn max_attention_size(&self) -> usize {
+        if self.local_attn_size < 0 {
+            self.seq_length
+        } else {
+            self.local_attn_size as usize * self.block_size()
+        }
+    }
+
+    /// Always-attended "sink" prefix in **tokens** = [`sink_size`](Self::sink_size) frame-blocks ×
+    /// [`block_size`](Self::block_size) (`0` for the shipped checkpoint). Retained regardless of the
+    /// sliding window. Mirrors `causal_model.py`'s attention-sink retention.
+    pub fn sink_tokens(&self) -> usize {
+        self.sink_size * self.block_size()
+    }
+
     /// The shipped Krea Realtime 14B AR defaults (S1 audit).
     pub fn krea_realtime_14b() -> Self {
         Self {
@@ -201,6 +228,29 @@ mod tests {
         assert_eq!(ar.timestep_shift, 5.0);
         // The canonical seq_length is 21 latent frames × frame_seq_length.
         assert_eq!(ar.seq_length, 21 * ar.frame_seq_length);
+    }
+
+    #[test]
+    fn ar_derived_token_geometry_matches_reference() {
+        let ar = KreaArConfig::krea_realtime_14b();
+        // Block size = frame_seq_length × num_frames_per_block = 1560 × 3.
+        assert_eq!(ar.block_size(), 4680);
+        assert_eq!(
+            ar.block_size(),
+            ar.frame_seq_length * ar.num_frames_per_block
+        );
+        // Global checkpoint (local_attn_size = -1): the read window is the whole clip.
+        assert_eq!(ar.max_attention_size(), ar.seq_length);
+        assert_eq!(ar.max_attention_size(), 32760);
+        // No attention sink on the shipped checkpoint.
+        assert_eq!(ar.sink_tokens(), 0);
+
+        // A windowed (local) config: max_attention_size = local_attn_size blocks × block_size.
+        let mut local = ar.clone();
+        local.local_attn_size = 2;
+        local.sink_size = 1;
+        assert_eq!(local.max_attention_size(), 2 * local.block_size());
+        assert_eq!(local.sink_tokens(), local.block_size());
     }
 
     #[test]
