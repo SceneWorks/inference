@@ -214,6 +214,7 @@ dependencies = [
  "candle-audio-moss-tts",
  "candle-audio-moss-tts-realtime",
  "candle-audio-openvoice",
+ "candle-audio-stable-audio-3",
  "candle-audio-whisper",
  "candle-llm",
 ]
@@ -351,8 +352,10 @@ dependencies = [
  "core-llm",
  "rand",
  "rand_distr",
+ "sceneworks-gen-core-testkit",
  "serde",
  "serde_json",
+ "sha2",
  "tokenizers 0.22.2",
 ]
 

@@ -179,7 +179,7 @@ pub struct DitTrace {
 }
 
 /// Pure guidance controls consumed here; sampler scheduling remains outside this module.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Guidance {
     pub cfg_scale: f64,
     pub apg_scale: f64,
@@ -355,12 +355,12 @@ impl StableAudio3Dit {
     }
 
     pub fn forward(&self, inputs: DitInputs<'_>) -> Result<Tensor> {
-        self.forward_impl(inputs, None, None)
+        self.forward_impl(inputs, None, None, None)
     }
 
     pub fn forward_with_trace(&self, inputs: DitInputs<'_>) -> Result<(Tensor, DitTrace)> {
         let mut trace = DitTrace::default();
-        let output = self.forward_impl(inputs, Some(&mut trace), None)?;
+        let output = self.forward_impl(inputs, Some(&mut trace), None, None)?;
         Ok((output, trace))
     }
 
@@ -369,6 +369,7 @@ impl StableAudio3Dit {
         inputs: DitInputs<'_>,
         mut trace: Option<&mut DitTrace>,
         zero_cross_context_from_batch: Option<usize>,
+        is_canceled: Option<&dyn Fn() -> bool>,
     ) -> Result<Tensor> {
         let (batch, channels, time) = inputs.latents.dims3()?;
         if channels != self.io_channels {
@@ -443,6 +444,9 @@ impl StableAudio3Dit {
         }
 
         for (index, block) in self.blocks.iter().enumerate() {
+            if is_canceled.is_some_and(|probe| probe()) {
+                bail!("Stable Audio 3 DiT canceled")
+            }
             hidden = block.forward(
                 &hidden,
                 Some(&context),
@@ -491,15 +495,81 @@ impl StableAudio3Dit {
         padding_mask: Option<&Tensor>,
         guidance: Guidance,
     ) -> Result<Tensor> {
+        self.forward_guided_impl(
+            latents,
+            timestep,
+            positive_prompt,
+            negative_prompt,
+            negative_prompt_mask,
+            seconds_total,
+            local_conditioning,
+            padding_mask,
+            guidance,
+            None,
+        )
+    }
+
+    /// Guided forward with cooperative cancellation before every transformer block.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_guided_with_cancel(
+        &self,
+        latents: &Tensor,
+        timestep: &Tensor,
+        positive_prompt: &Tensor,
+        negative_prompt: Option<&Tensor>,
+        negative_prompt_mask: Option<&Tensor>,
+        seconds_total: &Tensor,
+        local_conditioning: &Tensor,
+        padding_mask: Option<&Tensor>,
+        guidance: Guidance,
+        is_canceled: &dyn Fn() -> bool,
+    ) -> candle_audio::Result<Tensor> {
+        match self.forward_guided_impl(
+            latents,
+            timestep,
+            positive_prompt,
+            negative_prompt,
+            negative_prompt_mask,
+            seconds_total,
+            local_conditioning,
+            padding_mask,
+            guidance,
+            Some(is_canceled),
+        ) {
+            Err(_) if is_canceled() => Err(candle_audio::AudioError::Canceled),
+            Err(error) => Err(error.into()),
+            Ok(output) => Ok(output),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_guided_impl(
+        &self,
+        latents: &Tensor,
+        timestep: &Tensor,
+        positive_prompt: &Tensor,
+        negative_prompt: Option<&Tensor>,
+        negative_prompt_mask: Option<&Tensor>,
+        seconds_total: &Tensor,
+        local_conditioning: &Tensor,
+        padding_mask: Option<&Tensor>,
+        guidance: Guidance,
+        is_canceled: Option<&dyn Fn() -> bool>,
+    ) -> Result<Tensor> {
         if guidance.cfg_scale == 1.0 {
-            return self.forward(DitInputs {
-                latents,
-                timestep,
-                prompt: positive_prompt,
-                seconds_total,
-                local_conditioning,
-                padding_mask,
-            });
+            return self.forward_impl(
+                DitInputs {
+                    latents,
+                    timestep,
+                    prompt: positive_prompt,
+                    seconds_total,
+                    local_conditioning,
+                    padding_mask,
+                },
+                None,
+                None,
+                is_canceled,
+            );
         }
         let (batch, _, _) = latents.dims3()?;
         let zero_cross_context_from_batch = negative_prompt.is_none().then_some(batch);
@@ -533,6 +603,7 @@ impl StableAudio3Dit {
             },
             None,
             zero_cross_context_from_batch,
+            is_canceled,
         )?;
         let conditional = predictions.narrow(0, 0, batch)?;
         let unconditional = predictions.narrow(0, batch, batch)?;

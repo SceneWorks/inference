@@ -42,7 +42,10 @@ def ensure_snapshot(model: dict, snapshot: Path, download: Download) -> bool:
         "repo_id": model["repository"],
         "revision": model["revision"],
         "local_dir": str(snapshot),
-        "token": False,
+        # Public release fixtures stay explicitly anonymous. Gated checkpoints
+        # opt in to the runner's configured Hugging Face credential without
+        # placing the token in the workflow or command line.
+        "token": bool(model.get("requires_auth", False)),
     }
     # Optional per-model download allow-list. When set, materialize ONLY these repo-relative paths
     # (snapshot_download `allow_patterns`) instead of the whole repo — for repos whose pinned

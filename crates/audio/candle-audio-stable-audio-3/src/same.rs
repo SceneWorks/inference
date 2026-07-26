@@ -14,6 +14,7 @@ use crate::config::{
     QkNorm,
 };
 use crate::pretransform::PatchedPretransform;
+use crate::sampler::SeededNoise;
 use crate::softnorm::SoftNorm;
 use crate::transformer::{
     is_sinusoidal_block, RotaryEmbedding, TransformerBlock, TransformerBlockMasks,
@@ -292,6 +293,26 @@ pub struct SameNoiseRng {
     captures: Vec<SameNoiseCapture>,
 }
 
+trait SameNoiseSource {
+    fn scaled(
+        &mut self,
+        kind: SameNoiseKind,
+        scale: f64,
+        shape: &[usize],
+        dtype: DType,
+        device: &Device,
+    ) -> Result<Tensor>;
+
+    fn unit(
+        &mut self,
+        kind: SameNoiseKind,
+        scale: f64,
+        shape: &[usize],
+        dtype: DType,
+        device: &Device,
+    ) -> Result<Tensor>;
+}
+
 impl SameNoiseRng {
     pub fn from_entropy() -> Self {
         Self {
@@ -324,7 +345,9 @@ impl SameNoiseRng {
     pub fn take_captures(&mut self) -> Vec<SameNoiseCapture> {
         std::mem::take(&mut self.captures)
     }
+}
 
+impl SameNoiseSource for SameNoiseRng {
     fn scaled(
         &mut self,
         kind: SameNoiseKind,
@@ -367,6 +390,39 @@ impl SameNoiseRng {
                 }
             }
         })
+    }
+}
+
+struct RequestSameNoise<'a> {
+    source: &'a mut SeededNoise,
+}
+
+impl SameNoiseSource for RequestSameNoise<'_> {
+    fn scaled(
+        &mut self,
+        _kind: SameNoiseKind,
+        scale: f64,
+        shape: &[usize],
+        dtype: DType,
+        device: &Device,
+    ) -> Result<Tensor> {
+        self.source
+            .standard_normal(shape, dtype, device)
+            .map_err(|error| candle_audio::candle_core::Error::Msg(error.to_string()))?
+            .affine(scale, 0.0)
+    }
+
+    fn unit(
+        &mut self,
+        _kind: SameNoiseKind,
+        _scale: f64,
+        shape: &[usize],
+        dtype: DType,
+        device: &Device,
+    ) -> Result<Tensor> {
+        self.source
+            .standard_normal(shape, dtype, device)
+            .map_err(|error| candle_audio::candle_core::Error::Msg(error.to_string()))
     }
 }
 
@@ -625,7 +681,7 @@ impl TransformerResamplingBlock {
         x: &Tensor,
         override_stride: Option<usize>,
         override_new_tokens: Option<&Tensor>,
-        noise_rng: Option<(&mut SameNoiseRng, SameNoiseKind)>,
+        noise_rng: Option<(&mut dyn SameNoiseSource, SameNoiseKind)>,
         trace: bool,
     ) -> Result<(Tensor, Option<ResamplingTrace>)> {
         let (batch, _, _) = x.dims3()?;
@@ -1190,7 +1246,7 @@ impl SameAutoencoder {
         audio: &Tensor,
         override_strides: Option<&[usize]>,
         mask_noises: Option<&[Tensor]>,
-        mut rng: Option<&mut SameNoiseRng>,
+        mut rng: Option<&mut dyn SameNoiseSource>,
         trace: bool,
     ) -> Result<(Tensor, Vec<ResamplingTrace>)> {
         validate_strides(
@@ -1202,16 +1258,23 @@ impl SameAutoencoder {
         let mut x = self.patch.encode(audio)?;
         let mut traces = Vec::new();
         for (index, block) in self.encoder.iter().enumerate() {
-            let noise_rng = rng
-                .as_deref_mut()
-                .map(|rng| (rng, SameNoiseKind::EncoderTokens { stage: index }));
-            let (next, block_trace) = block.forward(
-                &x,
-                override_strides.map(|s| s[index]),
-                mask_noises.map(|noises| &noises[index]),
-                noise_rng,
-                trace,
-            )?;
+            let kind = SameNoiseKind::EncoderTokens { stage: index };
+            let (next, block_trace) = match rng.as_mut() {
+                Some(source) => block.forward(
+                    &x,
+                    override_strides.map(|s| s[index]),
+                    mask_noises.map(|noises| &noises[index]),
+                    Some((&mut **source, kind)),
+                    trace,
+                )?,
+                None => block.forward(
+                    &x,
+                    override_strides.map(|s| s[index]),
+                    mask_noises.map(|noises| &noises[index]),
+                    None,
+                    trace,
+                )?,
+            };
             x = next;
             if let Some(block_trace) = block_trace {
                 traces.push(block_trace);
@@ -1240,6 +1303,15 @@ impl SameAutoencoder {
         latents: &Tensor,
         override_strides: Option<&[usize]>,
         rng: &mut SameNoiseRng,
+    ) -> Result<Tensor> {
+        self.decode_with_noise_source(latents, override_strides, rng)
+    }
+
+    fn decode_with_noise_source(
+        &self,
+        latents: &Tensor,
+        override_strides: Option<&[usize]>,
+        rng: &mut dyn SameNoiseSource,
     ) -> Result<Tensor> {
         Ok(self
             .decode_internal(
@@ -1341,7 +1413,7 @@ impl SameAutoencoder {
         override_strides: Option<&[usize]>,
         regularization_noise: Option<&Tensor>,
         mask_noises: Option<&[Tensor]>,
-        mut rng: Option<&mut SameNoiseRng>,
+        mut rng: Option<&mut dyn SameNoiseSource>,
         training: bool,
         trace: bool,
     ) -> Result<(Tensor, Vec<ResamplingTrace>)> {
@@ -1377,16 +1449,23 @@ impl SameAutoencoder {
             .transpose(1, 2)?;
         let mut traces = Vec::new();
         for (index, block) in self.decoder.iter().enumerate() {
-            let noise_rng = rng
-                .as_deref_mut()
-                .map(|rng| (rng, SameNoiseKind::DecoderTokens { stage: index }));
-            let (next, block_trace) = block.forward(
-                &x,
-                override_strides.map(|s| s[index]),
-                mask_noises.map(|n| &n[index]),
-                noise_rng,
-                trace,
-            )?;
+            let kind = SameNoiseKind::DecoderTokens { stage: index };
+            let (next, block_trace) = match rng.as_mut() {
+                Some(source) => block.forward(
+                    &x,
+                    override_strides.map(|s| s[index]),
+                    mask_noises.map(|n| &n[index]),
+                    Some((&mut **source, kind)),
+                    trace,
+                )?,
+                None => block.forward(
+                    &x,
+                    override_strides.map(|s| s[index]),
+                    mask_noises.map(|n| &n[index]),
+                    None,
+                    trace,
+                )?,
+            };
             x = next;
             if let Some(block_trace) = block_trace {
                 traces.push(block_trace);
@@ -1510,15 +1589,63 @@ impl SameAutoencoder {
         parameters: SameChunkingParameters,
         rng: &mut SameNoiseRng,
     ) -> Result<Tensor> {
+        self.decode_audio_with_source(latents, policy, parameters, rng)
+    }
+
+    /// Decode with the same request-local stream used for initial latents and Pingpong.
+    ///
+    /// Cancellation is checked before every direct or chunked SAME dispatch.
+    pub fn decode_audio_with_request_rng(
+        &self,
+        latents: &Tensor,
+        policy: SameChunkingPolicy,
+        parameters: SameChunkingParameters,
+        rng: &mut SeededNoise,
+        is_canceled: &dyn Fn() -> bool,
+    ) -> candle_audio::Result<Tensor> {
+        let mut adapter = RequestSameNoise { source: rng };
         let total_latents = latents.dim(2)?;
         let plan = SameChunkPlan::build(total_latents, policy.enabled(), parameters)?;
         if !plan.chunked {
-            return self.decode_with_rng(latents, None, rng);
+            if is_canceled() {
+                return Err(candle_audio::AudioError::Canceled);
+            }
+            return Ok(self.decode_with_noise_source(latents, None, &mut adapter)?);
+        }
+        let mut pieces = Vec::with_capacity(plan.ownership.len());
+        for ownership in &plan.ownership {
+            if is_canceled() {
+                return Err(candle_audio::AudioError::Canceled);
+            }
+            let chunk = latents.narrow(2, ownership.chunk_start, plan.chunk_size)?;
+            let decoded = self.decode_with_noise_source(&chunk, None, &mut adapter)?;
+            let sample_ownership = scale_ownership(ownership, self.downsampling_ratio)?;
+            pieces.push(owned_piece(&decoded, &sample_ownership)?);
+        }
+        let total_samples = total_latents
+            .checked_mul(self.downsampling_ratio)
+            .ok_or_else(|| {
+                candle_audio::AudioError::Msg("SAME outer decode output size overflow".into())
+            })?;
+        Ok(concatenate_owned(pieces, total_samples, "decode")?)
+    }
+
+    fn decode_audio_with_source(
+        &self,
+        latents: &Tensor,
+        policy: SameChunkingPolicy,
+        parameters: SameChunkingParameters,
+        rng: &mut dyn SameNoiseSource,
+    ) -> Result<Tensor> {
+        let total_latents = latents.dim(2)?;
+        let plan = SameChunkPlan::build(total_latents, policy.enabled(), parameters)?;
+        if !plan.chunked {
+            return self.decode_with_noise_source(latents, None, rng);
         }
         let mut pieces = Vec::with_capacity(plan.ownership.len());
         for ownership in &plan.ownership {
             let chunk = latents.narrow(2, ownership.chunk_start, plan.chunk_size)?;
-            let decoded = self.decode_with_rng(&chunk, None, rng)?;
+            let decoded = self.decode_with_noise_source(&chunk, None, rng)?;
             let sample_ownership = scale_ownership(ownership, self.downsampling_ratio)?;
             pieces.push(owned_piece(&decoded, &sample_ownership)?);
         }

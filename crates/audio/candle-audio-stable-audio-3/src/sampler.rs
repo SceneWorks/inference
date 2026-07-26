@@ -546,19 +546,33 @@ impl SeededNoise {
             draws: 0,
         }
     }
-}
 
-impl NoiseSource for SeededNoise {
-    fn standard_normal_like(&mut self, tensor: &Tensor) -> Result<Tensor> {
-        let count = tensor.elem_count();
+    /// Draw one host-generated standard-normal tensor and transfer it to `device`.
+    ///
+    /// The connected provider uses this explicit shape form to keep initial latents, Pingpong,
+    /// and stochastic SAME decoding on one request-local stream.
+    pub fn standard_normal(
+        &mut self,
+        shape: &[usize],
+        dtype: DType,
+        device: &Device,
+    ) -> Result<Tensor> {
+        let count = shape.iter().try_fold(1usize, |count, &dim| {
+            count
+                .checked_mul(dim)
+                .ok_or_else(|| AudioError::Msg("Stable Audio 3 noise shape overflows".into()))
+        })?;
         let values = (0..count)
             .map(|_| self.rng.sample::<f32, _>(StandardNormal))
             .collect::<Vec<_>>();
         self.draws += 1;
-        Ok(
-            Tensor::from_vec(values, Shape::from_dims(tensor.dims()), tensor.device())?
-                .to_dtype(tensor.dtype())?,
-        )
+        Ok(Tensor::from_vec(values, Shape::from_dims(shape), device)?.to_dtype(dtype)?)
+    }
+}
+
+impl NoiseSource for SeededNoise {
+    fn standard_normal_like(&mut self, tensor: &Tensor) -> Result<Tensor> {
+        self.standard_normal(tensor.dims(), tensor.dtype(), tensor.device())
     }
 
     fn draws(&self) -> usize {
@@ -1097,6 +1111,57 @@ pub fn sample_dit_with_interval<N: NoiseSource>(
                 padding,
                 step_guidance,
             )?)
+        },
+    )
+}
+
+/// Connected-provider sampler with cancellation checked inside every DiT transformer block.
+#[allow(clippy::too_many_arguments)]
+pub fn sample_dit_with_interval_and_cancel<N: NoiseSource>(
+    model: &StableAudio3Dit,
+    kind: SamplerKind,
+    initial: &Tensor,
+    schedule: &Schedule,
+    positive_prompt: &Tensor,
+    negative_prompt: Option<&Tensor>,
+    negative_prompt_mask: Option<&Tensor>,
+    seconds_total: &Tensor,
+    local_conditioning: &Tensor,
+    padding: Option<&Tensor>,
+    guidance: Guidance,
+    guidance_interval: GuidanceInterval,
+    callback: Option<&mut ProgressCallback<'_>>,
+    noise: &mut N,
+    record_trajectory: bool,
+    is_canceled: &dyn Fn() -> bool,
+) -> Result<SampleOutput> {
+    guidance_interval.validate()?;
+    validate_guidance(guidance)?;
+    if model.objective() == DiffusionObjective::V {
+        bail!("Stable Audio 3 RF samplers reject the unreachable v-diffusion objective")
+    }
+    sample_with_host_timestep(
+        kind,
+        initial,
+        schedule,
+        padding,
+        noise,
+        record_trajectory,
+        callback,
+        |latents, timestep, host_timestep| {
+            let step_guidance = guidance_interval.guidance_for_values(host_timestep, guidance)?;
+            model.forward_guided_with_cancel(
+                latents,
+                timestep,
+                positive_prompt,
+                negative_prompt,
+                negative_prompt_mask,
+                seconds_total,
+                local_conditioning,
+                padding,
+                step_guidance,
+                is_canceled,
+            )
         },
     )
 }

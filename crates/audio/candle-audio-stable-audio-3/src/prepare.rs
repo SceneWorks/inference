@@ -1,7 +1,7 @@
-//! Unregistered audio-lane snapshot preparation for Stable Audio 3.
+//! Audio-lane snapshot preparation for Stable Audio 3.
 //!
 //! Both supported snapshot shapes are already dense safetensors, so preparation is a validated
-//! passthrough. This module is intentionally not composed into `candle-audio-catalog` in sc-14535.
+//! passthrough. `candle-audio-catalog` composes this probe ahead of its generic LLM fallback.
 
 use core_llm::{Error as CoreError, ModelFormat, PrepareReport, PrepareSpec, Result as CoreResult};
 

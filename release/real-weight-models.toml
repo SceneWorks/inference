@@ -145,6 +145,29 @@ expected_files = [
 ]
 
 [[models]]
+# Exact registered Stable Audio 3 small-music graph: DiT, SAME-S, learned padding, and the bundled
+# encoder-only T5Gemma text stack. Used for 30-second CPU/Metal/CUDA provider execution.
+key = "stable-audio-3-small-music"
+repository = "stabilityai/stable-audio-3-small-music"
+revision = "0fef1392cd842149a2b6d445e181c97608faac06"
+requires_auth = true
+license = "Stability AI Community License"
+size_class = "very-large"
+profiles = ["audio-macos", "audio-cuda"]
+environment = ["SA3_SMALL_MUSIC_SNAPSHOT"]
+expected_files = [
+    "model_config.json",
+    "model.safetensors",
+    "t5gemma-b-b-ul2/config.json",
+    "t5gemma-b-b-ul2/model.safetensors",
+    "t5gemma-b-b-ul2/tokenizer.json",
+    "t5gemma-b-b-ul2/tokenizer.model",
+    "LICENSE.md",
+    "LICENSE_GEMMA.md",
+    "NOTICE",
+]
+
+[[models]]
 key = "moss-soundeffect-v2"
 repository = "OpenMOSS-Team/MOSS-SoundEffect-v2.0"
 revision = "e35df4d82fbe87fcd5d14e5d100e349c0c3c076d"

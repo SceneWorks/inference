@@ -122,6 +122,19 @@ class ModelSnapshotTests(unittest.TestCase):
             self.assertEqual(calls[0]["revision"], model["revision"])
             self.assertIs(calls[0]["token"], False)
 
+    def test_ensure_uses_configured_credential_for_gated_model(self) -> None:
+        model = {**MODEL, "requires_auth": True}
+        with tempfile.TemporaryDirectory() as temporary:
+            snapshot = Path(temporary) / "materialized"
+            calls = []
+
+            def download(**kwargs) -> None:
+                calls.append(kwargs)
+                self.make_snapshot(Path(temporary), "materialized")
+
+            self.assertTrue(ensure_snapshot(model, snapshot, download))
+            self.assertIs(calls[0]["token"], True)
+
     def test_ensure_omits_allow_patterns_without_download_files(self) -> None:
         # The default (no `download_files`) must NOT pass `allow_patterns` — the whole repo is fetched.
         with tempfile.TemporaryDirectory() as temporary:
