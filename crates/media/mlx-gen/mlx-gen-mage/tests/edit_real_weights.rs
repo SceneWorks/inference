@@ -96,6 +96,7 @@ fn fixed_instruction_edit_matches_the_torch_reference() {
         "replayed target and reference tokens must be exact"
     );
 
+    let mut failures = Vec::new();
     for (label, got, want, mean_gate) in [
         (
             "seq_step1",
@@ -121,11 +122,11 @@ fn fixed_instruction_edit_matches_the_torch_reference() {
     ] {
         let (max_abs, _, mean_rel) = error(got, want);
         println!("{label}: max_abs={max_abs:.6} mean_rel={mean_rel:.6}");
-        assert!(
-            mean_rel <= mean_gate,
-            "{label}: mean_rel={mean_rel} exceeds {mean_gate}"
-        );
+        if mean_rel > mean_gate {
+            failures.push(format!("{label}: mean_rel={mean_rel} exceeds {mean_gate}"));
+        }
     }
+    assert!(failures.is_empty(), "{}", failures.join("; "));
 }
 
 #[test]

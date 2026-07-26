@@ -230,17 +230,19 @@ jobs:
           -- --ignored --nocapture
       - name: Run Mage-Flow instruction-edit parity
         run: |
+          status=0
           MAGE_EDIT_GOLDEN_NAME=mage_flow_edit_golden.safetensors \
             cargo test --locked --release -p mlx-gen-mage --test edit_real_weights \
-            -- --ignored --nocapture
+            -- --ignored --nocapture || status=$?
           MAGE_EDIT_SNAPSHOT="$MAGE_EDIT_BASE_SNAPSHOT" \
             MAGE_EDIT_GOLDEN_NAME=mage_flow_edit_base_golden.safetensors \
             cargo test --locked --release -p mlx-gen-mage --test edit_real_weights \
-            fixed_instruction_edit_matches_the_torch_reference -- --ignored --nocapture
+            fixed_instruction_edit_matches_the_torch_reference -- --ignored --nocapture || status=$?
           MAGE_EDIT_SNAPSHOT="$MAGE_EDIT_TURBO_SNAPSHOT" \
             MAGE_EDIT_GOLDEN_NAME=mage_flow_edit_turbo_golden.safetensors \
             cargo test --locked --release -p mlx-gen-mage --test edit_real_weights \
-            fixed_instruction_edit_matches_the_torch_reference -- --ignored --nocapture
+            fixed_instruction_edit_matches_the_torch_reference -- --ignored --nocapture || status=$?
+          exit "$status"
       - name: Upload verified Mage edit oracle
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
