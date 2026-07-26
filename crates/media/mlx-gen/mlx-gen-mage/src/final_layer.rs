@@ -28,6 +28,7 @@ use mlx_gen::weights::Weights;
 use mlx_gen::{nn, Error, Result};
 
 use crate::config::NORM_EPS;
+use crate::quant::{floor_bits, FINAL_MOD_BASE};
 use crate::rope_embedder::PackContext;
 use crate::transformer::Linear;
 use crate::transformer_block::check_conditioning;
@@ -41,8 +42,15 @@ pub struct MageFinalLayer {
 }
 
 impl MageFinalLayer {
+    /// Pack both head projections, holding `norm_linear` at its 8-bit floor (sc-15071).
+    ///
+    /// A uniformly-Q4 head is what made the Q4 tier render a repeating tiled texture instead of the
+    /// prompt; [`crate::convert::quant_floor_bits`] documents the mechanism and the per-group
+    /// measurements, and is the same seam the offline converter calls, so a pre-quantized tier
+    /// stays byte-identical to load-time quantization.
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
-        self.norm_linear.quantize(bits)?;
+        self.norm_linear
+            .quantize(floor_bits(FINAL_MOD_BASE, bits))?;
         self.proj_out.quantize(bits)
     }
 
