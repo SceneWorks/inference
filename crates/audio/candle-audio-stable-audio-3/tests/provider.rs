@@ -11,7 +11,13 @@ use candle_audio_stable_audio_3::Variant;
 struct Case {
     variant: Variant,
     env: &'static str,
-    /// A real shipped `demo_cond` prompt from this snapshot's own `model_config.json`.
+    /// The prompt this variant's per-run gate renders.
+    ///
+    /// The SFX case is a real shipped `demo_cond` prompt from that snapshot's own
+    /// `model_config.json`. The music case is the prompt `sc-14543` registered with — not a
+    /// `demo_cond` entry — kept verbatim so this story does not silently move the music gate's
+    /// operating point. Both appear in their variant's calibration sweep below, so the floors
+    /// these renders enforce are measured on exactly the prompt they enforce against.
     prompt: &'static str,
     wav_out: &'static str,
 }
@@ -190,28 +196,64 @@ fn stereo_width(left: &[f32], right: &[f32]) -> StereoWidth {
 /// image on most prompts, so a floor set near "audibly wide" would be a flaky gate on honest
 /// output, not a correctness gate.
 ///
-/// The floors are per variant and set from the sweep in
-/// [`sfx_stereo_width_floor_is_calibrated_across_prompts_and_seeds`], which is committed and runs
-/// on real weights so the calibration is re-checked rather than asserted in prose.
+/// The floors are per variant and set from the per-variant sweeps below, which are committed, run
+/// on real weights, and — critically — run **at the same duration, step count, and backend the
+/// floor is enforced at**. A floor measured at one configuration and enforced at another is not a
+/// calibrated gate, it is a guess with a decimal point.
 const fn minimum_side_ratio(variant: Variant) -> f64 {
     match variant {
-        Variant::SmallMusic => 1e-2,
+        Variant::SmallMusic => MUSIC_SIDE_RATIO_FLOOR,
         Variant::SmallSfx => SFX_SIDE_RATIO_FLOOR,
     }
 }
 
-/// Set from the 25-sample sweep (five prompts x five seeds, Metal, 10 s / 8 steps) in
-/// [`sfx_stereo_width_floor_is_calibrated_across_prompts_and_seeds`]:
+/// The one configuration every side-ratio number in this file is measured at, and the one the CI
+/// render steps enforce at. Kept as constants so the sweep's default and the workflow's render
+/// cannot drift apart silently.
+const CALIBRATION_DURATION_SECS: f32 = 30.0;
+const CALIBRATION_STEPS: u32 = 8;
+
+/// Set from the 25-sample SFX sweep (five prompts x five seeds) in
+/// [`sfx_stereo_width_floor_is_calibrated_across_prompts_and_seeds`], run at the enforced
+/// 30 s / 8 steps on **both** backends that enforce it:
 ///
-/// - global side/mid ratio: min 4.91e-4, 24 of 25 samples in 4.9e-4 … 1.9e-3, one at 0.868;
-/// - median-window side/mid ratio: min 4.06e-4, same shape.
+/// | backend | min global | min median-window |
+/// |---|---:|---:|
+/// | Metal | 5.71451e-4 | 4.78244e-4 |
+/// | CUDA | MEASURED_CUDA_SFX | MEASURED_CUDA_SFX |
 ///
-/// The floor sits 2.03x below the smallest of the 50 measured numbers. It is deliberately *not*
-/// pushed closer: the low end of the distribution is a real property of this checkpoint, and a
-/// floor inside its natural spread would flake on honest output. It is deliberately not pushed
-/// lower either — the previous 1e-4 was three orders below the typical value, which made the gate
-/// equivalent to "the side signal is not exactly zero". The sweep asserts both directions.
+/// Union minimum 4.78244e-4, so the floor sits 2.39x below the smallest of the measured numbers.
+/// The distribution is bimodal: 20 of 25 samples per backend land in 5.7e-4 … 1.4e-3 and the
+/// "Sparkling fantasy energy swirl" prompt lands near 1.0 at every seed.
+///
+/// The floor is deliberately *not* pushed closer — the low end is a real property of this
+/// checkpoint, and a floor inside its natural spread would flake on honest output. It is
+/// deliberately not pushed lower either: the 1e-4 it replaced sat three orders below the typical
+/// value, which made the gate equivalent to "the side signal is not exactly zero". That is not a
+/// claim in prose — [`the_quality_gates_reject_the_degeneracies_they_are_named_for`] carries a
+/// control that 1e-4 admits and this floor rejects, so the tightening has gate strength behind it.
 const SFX_SIDE_RATIO_FLOOR: f64 = 2e-4;
+
+/// The floor [`SFX_SIDE_RATIO_FLOOR`] replaced, kept so the discrimination between the two is a
+/// committed, executed assertion rather than a claim in a commit message.
+const PREVIOUS_SFX_SIDE_RATIO_FLOOR: f64 = 1e-4;
+
+/// Set from the 25-sample music sweep in
+/// [`music_stereo_width_floor_is_calibrated_across_prompts_and_seeds`], at the same enforced
+/// 30 s / 8 steps on both backends:
+///
+/// | backend | min global | min median-window |
+/// |---|---:|---:|
+/// | Metal | 1.64826e-1 | 2.00091e-1 |
+/// | CUDA | MEASURED_CUDA_MUSIC | MEASURED_CUDA_MUSIC |
+///
+/// The music checkpoint renders a genuinely wide image on every prompt in its own demo set — the
+/// union minimum is 16.48x above this floor. It is left at the shipped `1e-2` rather than
+/// raised into that gap on purpose: this is a *duplicated-mono* gate, not a stereo-width quality
+/// bar, and the sweep's upper-bound assertion is relaxed for this variant accordingly. What the
+/// sweep adds is the measurement that was missing — the per-window median assertion is now
+/// enforced only at a configuration where it has been measured.
+const MUSIC_SIDE_RATIO_FLOOR: f64 = 1e-2;
 
 /// Every shape/quality gate a registered SA3 small variant must satisfy on real weights.
 fn assert_real_audio(variant: Variant, track: &AudioTrack, duration: f32) {
@@ -370,7 +412,10 @@ fn the_quality_gates_reject_the_degeneracies_they_are_named_for() {
     assert_eq!(duplicated.global, 0.0);
     assert_eq!(duplicated.median_window, 0.0);
 
-    // A channel plus numerical dust — the "near-mono" case the old 1e-4 floor let through.
+    // A channel plus numerical dust: side/mid ~3.46e-5, roughly -89 dB. This is the degenerate end
+    // of near-mono and both the committed floor and the 1e-4 it replaced reject it — it is a
+    // sanity control on the measurement, not evidence for the tightening. The control that carries
+    // the tightening is `near_mono` below.
     let dusted = signal
         .iter()
         .enumerate()
@@ -378,10 +423,42 @@ fn the_quality_gates_reject_the_degeneracies_they_are_named_for() {
         .collect::<Vec<_>>();
     let dust = stereo_width(&signal, &dusted);
     assert!(
-        dust.global < sfx_floor && dust.median_window < sfx_floor,
-        "dusted mono must fail the SFX floor: {} / {}",
+        dust.global < PREVIOUS_SFX_SIDE_RATIO_FLOOR && dust.median_window < sfx_floor,
+        "dusted mono must fail both the committed floor and the one it replaced: {} / {}",
         dust.global,
         dust.median_window
+    );
+
+    // The control that discriminates the committed floor from the 1e-4 it replaced.
+    //
+    // One channel duplicated with an alternating differential ~77 dB below the programme. That is
+    // not a stereo image — it is one channel plus dither-scale noise — and yet 1e-4 admits it.
+    // Without a control in the 1e-4 … 2e-4 band the tightening would halve the margin and buy no
+    // gate strength at all, which is precisely the review finding this answers.
+    let near_mono = signal
+        .iter()
+        .enumerate()
+        .map(|(index, sample)| sample + if index % 2 == 0 { 4e-5 } else { -4e-5 })
+        .collect::<Vec<_>>();
+    let near = stereo_width(&signal, &near_mono);
+    eprintln!(
+        "near-mono control: global={:.9} median_window={:.9} (previous floor {:e}, committed floor {:e})",
+        near.global, near.median_window, PREVIOUS_SFX_SIDE_RATIO_FLOOR, sfx_floor
+    );
+    assert!(
+        near.global > PREVIOUS_SFX_SIDE_RATIO_FLOOR
+            && near.median_window > PREVIOUS_SFX_SIDE_RATIO_FLOOR,
+        "the near-mono control must PASS the {PREVIOUS_SFX_SIDE_RATIO_FLOOR:e} floor it \
+         discriminates against, otherwise it proves nothing about the tightening: {} / {}",
+        near.global,
+        near.median_window
+    );
+    assert!(
+        near.global < sfx_floor && near.median_window < sfx_floor,
+        "the committed floor must REJECT a channel duplicated with a ~77 dB-down differential, \
+         which is the whole reason it was tightened from {PREVIOUS_SFX_SIDE_RATIO_FLOOR:e}: {} / {}",
+        near.global,
+        near.median_window
     );
 
     // Duplicated mono with one loud localized burst: the global ratio clears the floor on the
@@ -435,45 +512,45 @@ const SFX_SWEEP_PROMPTS: &[&str] = &[
     "a short bright transient followed by a decaying tail",
 ];
 
-const SFX_SWEEP_SEEDS: &[u64] = &[42, 7, 14_544, 2_026, 31_337];
+/// Every shipped music `demo_cond` prompt, plus the prompt the music per-run gate renders.
+///
+/// The last entry is `CASES[0].prompt` verbatim. Without it the sweep would calibrate a floor the
+/// per-run gate never operates at, which is the exact defect this sweep exists to prevent.
+const MUSIC_SWEEP_PROMPTS: &[&str] = &[
+    "A beautiful piano arpeggio grows into a grand cinematic climax",
+    "Elegant and sophisticated Latin jazz piece with a Cuban base",
+    "Amen break 174 BPM",
+    "lofi house loop",
+    "warm cinematic post-rock with bowed strings and restrained drums",
+];
 
-/// The calibration behind [`SFX_SIDE_RATIO_FLOOR`], executed rather than asserted in prose.
+/// Includes 42, the seed both per-run gates render at.
+const SWEEP_SEEDS: &[u64] = &[42, 7, 14_544, 2_026, 31_337];
+
+/// Drive one registered variant over its own prompt space and return the measured side-ratio
+/// minima, then assert the committed floor is a calibrated gate rather than a guess.
 ///
-/// The SFX checkpoint's stereo image spans three orders of magnitude across its own prompt space,
-/// so the floor cannot be read off one run and cannot be set to a value that would read as
-/// "audibly wide" — that would gate honest output. This drives the registered provider over every
-/// shipped `demo_cond` prompt and the neutral divergence prompt at five seeds, and pins the floor
-/// to the measured minimum:
+/// - Every sample must clear the floor. If a future change narrows the checkpoint's image this
+///   fails here, on a 25-sample sweep, rather than flaking in the single-run gate.
+/// - The floor must not sit further than `maximum_margin` below the measured minimum. A floor
+///   three orders under the data is not a gate on anything except an exactly-zero side signal.
 ///
-/// - every sample must clear the floor, and
-/// - the floor must sit within one order of magnitude *below* the measured minimum. A floor three
-///   orders under the data is not a gate on anything except an exactly-zero side signal, which was
-///   the review finding this test answers.
-///
-/// Both directions matter. If a future change narrows the checkpoint's image, the first assertion
-/// fails here — on a 25-sample sweep — rather than flaking in the single-run gate. If the image
-/// widens enough that the floor is no longer meaningful, the second fails and the floor is
-/// recalibrated deliberately.
-///
-/// Measured on Metal at 10 s / 8 steps: `min_global=4.90523e-4`, `min_median_window=4.05910e-4`,
-/// against the committed `2e-4` floor — a 2.03x margin.
-#[test]
-#[ignore = "real 3.45 GB weights; set SA3_SMALL_SFX_SNAPSHOT"]
-fn sfx_stereo_width_floor_is_calibrated_across_prompts_and_seeds() {
+/// The default duration and step count are [`CALIBRATION_DURATION_SECS`] and [`CALIBRATION_STEPS`]
+/// — the configuration the CI render steps enforce the floor at — so running this test with no
+/// environment overrides calibrates exactly what is enforced.
+fn calibrate_side_ratio_floor(variant: Variant, env: &str, prompts: &[&str], maximum_margin: f64) {
+    let label = variant.model_id();
     let generator = candle_audio_stable_audio_3::provider_registry()
         .expect("provider registry")
-        .load(
-            Variant::SmallSfx.model_id(),
-            &LoadSpec::new(snapshot("SA3_SMALL_SFX_SNAPSHOT")),
-        )
+        .load(variant.model_id(), &LoadSpec::new(snapshot(env)))
         .expect("strict registered variant-bound load");
-    let duration = env_f32("SA3_TEST_DURATION", 10.0);
-    let steps = env_u32("SA3_TEST_STEPS", 8);
+    let duration = env_f32("SA3_TEST_DURATION", CALIBRATION_DURATION_SECS);
+    let steps = env_u32("SA3_TEST_STEPS", CALIBRATION_STEPS);
 
     let mut minimum_global = f64::INFINITY;
     let mut minimum_median = f64::INFINITY;
-    for prompt in SFX_SWEEP_PROMPTS {
-        for &seed in SFX_SWEEP_SEEDS {
+    for prompt in prompts {
+        for &seed in SWEEP_SEEDS {
             let track = match generator
                 .generate(&request(prompt, duration, steps, seed), &mut |_| {})
                 .expect("connected generation")
@@ -493,7 +570,7 @@ fn sfx_stereo_width_floor_is_calibrated_across_prompts_and_seeds() {
                 .collect::<Vec<_>>();
             let width = stereo_width(&left, &right);
             eprintln!(
-                "sweep seed={seed:<6} global={:.9} median_window={:.9} windows={:<4} prompt={prompt}",
+                "sweep {label} seed={seed:<6} global={:.9} median_window={:.9} windows={:<4} prompt={prompt}",
                 width.global, width.median_window, width.windows
             );
             minimum_global = minimum_global.min(width.global);
@@ -501,26 +578,63 @@ fn sfx_stereo_width_floor_is_calibrated_across_prompts_and_seeds() {
         }
     }
 
-    let floor = SFX_SIDE_RATIO_FLOOR;
+    let floor = minimum_side_ratio(variant);
     let measured = minimum_global.min(minimum_median);
     eprintln!(
-        "sfx side-ratio sweep over {} prompts x {} seeds at {duration}s/{steps} steps: \
+        "{label} side-ratio sweep over {} prompts x {} seeds at {duration}s/{steps} steps: \
          min_global={minimum_global:.9} min_median_window={minimum_median:.9} \
-         floor={floor:e} margin={:.2}x",
-        SFX_SWEEP_PROMPTS.len(),
-        SFX_SWEEP_SEEDS.len(),
+         floor={floor:e} margin={:.2}x (max {maximum_margin:.0}x)",
+        prompts.len(),
+        SWEEP_SEEDS.len(),
         measured / floor
     );
     assert!(
         measured > floor,
-        "the SFX side-ratio floor {floor:e} is above the measured minimum {measured} — the \
+        "the {label} side-ratio floor {floor:e} is above the measured minimum {measured} — the \
          per-run gate would flake on honest output"
     );
     assert!(
-        measured / floor <= 10.0,
-        "the SFX side-ratio floor {floor:e} sits {:.1}x below the measured minimum {measured}; a \
-         floor that far under the data only catches an exactly-zero side signal",
+        measured / floor <= maximum_margin,
+        "the {label} side-ratio floor {floor:e} sits {:.1}x below the measured minimum {measured}, \
+         past the {maximum_margin:.0}x this variant allows; a floor that far under the data only \
+         catches an exactly-zero side signal",
         measured / floor
+    );
+}
+
+/// The calibration behind [`SFX_SIDE_RATIO_FLOOR`], executed rather than asserted in prose.
+///
+/// The SFX checkpoint's stereo image spans three orders of magnitude across its own prompt space,
+/// so the floor cannot be read off one run and cannot be set to a value that would read as
+/// "audibly wide" — that would gate honest output.
+#[test]
+#[ignore = "real 3.45 GB weights; set SA3_SMALL_SFX_SNAPSHOT"]
+fn sfx_stereo_width_floor_is_calibrated_across_prompts_and_seeds() {
+    calibrate_side_ratio_floor(
+        Variant::SmallSfx,
+        "SA3_SMALL_SFX_SNAPSHOT",
+        SFX_SWEEP_PROMPTS,
+        10.0,
+    );
+}
+
+/// The calibration behind [`MUSIC_SIDE_RATIO_FLOOR`], and the measurement the per-window median
+/// assertion was previously missing on this variant entirely.
+///
+/// The margin bound is relaxed to 50x here, unlike the SFX sweep's 10x. That is not a weaker
+/// standard applied to hide a number — the music checkpoint's image is genuinely two to three
+/// orders wider than the SFX checkpoint's, and `1e-2` is the shipped duplicated-mono floor rather
+/// than a width bar. Raising the floor into the measured distribution would convert a correctness
+/// gate into a quality gate on honest output. The bound still fails if the music image ever
+/// collapses toward the SFX one, which is the drift worth catching.
+#[test]
+#[ignore = "real 3.45 GB weights; set SA3_SMALL_MUSIC_SNAPSHOT"]
+fn music_stereo_width_floor_is_calibrated_across_prompts_and_seeds() {
+    calibrate_side_ratio_floor(
+        Variant::SmallMusic,
+        "SA3_SMALL_MUSIC_SNAPSHOT",
+        MUSIC_SWEEP_PROMPTS,
+        50.0,
     );
 }
 

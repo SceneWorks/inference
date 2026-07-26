@@ -136,15 +136,32 @@ Measured on this branch, Metal, release, both pinned snapshots present:
 |---|---:|---|
 | Candle single-step DiT music-vs-SFX cosine | 0.601294 | frozen Torch 0.601294 ± 0.02 |
 | shared-weight null (music vs itself, same seed) | cosine 1.000000, delta 0.000000 | must violate both thresholds |
+| partial-mis-wiring control (music blended toward SFX) | cosine 0.250000, delta 1.224745 | cosine > 0.15 and < the shipped 0.35 |
 
 The thresholds are one-sided: they detect *agreement*, so a shared weight path
 (cosine 1, delta 0) is rejected, and the self-comparison control proves the two
 metrics actually register that. They cannot certify that the divergence is the
 *right* divergence — the frozen-Torch `dit_prediction` reproduction does that.
-What tightening from 0.35 / 0.5 buys is the middle of the range: a partial
-mis-wiring landing at cosine 0.2 … 0.35 is now rejected where it previously
-passed. The seed spread is 0.0026 in cosine and 0.15 in delta, so the committed
+The seed spread is 0.0026 in cosine and 0.15 in delta, so the committed
 thresholds sit 2.4x and 1.4x outside the measured envelope.
+
+What tightening from 0.35 / 0.5 buys is the middle of the range, and that is now
+demonstrated rather than argued. The self-comparison null is byte-identical by
+construction, so it lands at exactly cosine 1.0 and can only prove the metrics
+register *total* agreement — it never exercises the 0.15 … 1.0 band. The
+partial-mis-wiring control fills that gap: the music take Gram-Schmidt blended
+toward the SFX take at exactly cosine 0.25, which is the signature of two
+registrations sharing a conditioner or a subset of DiT blocks. It is asserted to
+be rejected by the committed 0.15 *and* admitted by the shipped 0.35, so the
+tightening has committed gate strength behind it rather than a narrative. A naive
+mix overshoots to 0.304 because the two takes are only near-orthogonal
+(|cos| ≈ 0.06) — hence the orthogonalization, and hence the achieved cosine is
+asserted rather than assumed.
+
+The control also records what the RMS-delta gate does *not* do: the blend sits at
+delta 1.224745, well clear of the 0.9 threshold, so **only** the cosine gate
+closes the partial-mis-wiring hole. That is asserted too, so the claim cannot go
+stale silently.
 
 The Candle DiT reproduces the frozen Torch cosine to six decimal places because
 each variant is driven with its own `t5_projected_padded`, exactly as the frozen
@@ -168,6 +185,18 @@ any tensor is opened. Measured cost: +6.9 s once per generator (SHA-256 over the
 6.9 s without it. The control is the same generator instance serving real audio
 once the authentic root is restored.
 
+That pass runs with both the generation and pipeline mutexes held, so it roughly
+doubles the cold-start window — and a request cancelled inside it would not have
+observed the cancellation until the whole verification *and* load had finished
+(~14 s rather than ~7 s). `verify_snapshot_identity` therefore polls the caller's
+`CancelFlag` between pins, which bounds the unobserved window to one file while
+keeping the check off the hashing hot path. The gate
+(`cold_start_snapshot_verification_observes_cancellation_before_hashing`) is
+discriminating: it asserts that an *uncancelled* call against a missing snapshot
+reaches the filesystem and returns the I/O error, and that a cancelled call
+against the same path returns `Canceled` instead. With the poll removed the
+second leg would return the I/O error too, so the test cannot pass vacuously.
+
 `tests/provider.rs` requires a real shipped SFX demo prompt to produce audio
 that is exactly `floor(seconds × 44100)` frames, 44.1 kHz, finite, in range,
 non-silent by RMS and peak, genuinely stereo by side/mid energy ratio — measured
@@ -177,16 +206,48 @@ autocorrelation above 0.2), and not a pure tone (zero-crossing interval spread
 above 0.05, computed fail-closed so a DC or sub-16 Hz channel scores 0 rather
 than "infinitely spread").
 
-The SFX side/mid floor is calibrated by a committed 25-sample sweep
-(`sfx_stereo_width_floor_is_calibrated_across_prompts_and_seeds`: all four
-shipped `demo_cond` prompts plus the neutral divergence prompt, five seeds,
-Metal, 10 s / 8 steps). Measured `min_global` 4.90523e-4 and
-`min_median_window` 4.05910e-4, with 24 of 25 runs in 4.9e-4 … 1.9e-3 and one at
-0.868 — the checkpoint genuinely renders a near-centred image on most prompts.
-The floor is **2e-4**, a 2.03x margin, raised from the 1e-4 that sat three
-orders below the typical value and so gated only an exactly-zero side signal.
-The sweep asserts in both directions: every sample must clear the floor, and the
-floor must stay within an order of magnitude below the measured minimum.
+### Side/mid floors are calibrated where they are enforced
+
+Each variant's side/mid floor is calibrated by a committed 25-sample sweep — all
+four of that checkpoint's shipped `demo_cond` prompts plus the prompt its own
+per-run gate renders, at five seeds including the gate's seed 42.
+
+The governing rule is that **a gate is only enforced at a configuration where it
+has been measured**. The sweeps therefore default to 30 s / 8 steps, the exact
+duration and step count the CI render steps enforce at, and they run on **both**
+backends that enforce — Metal *and* CUDA — immediately before that backend's
+render. An earlier revision of this branch calibrated on Metal at 10 s and
+enforced on CUDA at 30 s; that is not a calibrated gate, and the sweep steps in
+`.github/workflows/real-weights.yml` now make the two coincide by construction.
+
+| Variant | Backend | `min_global` | `min_median_window` | Floor | Margin |
+|---|---|---:|---:|---:|---:|
+| SFX | Metal | 5.71451e-4 | 4.78244e-4 | 2e-4 | 2.39x |
+| SFX | CUDA | see CI | see CI | 2e-4 | — |
+| music | Metal | 1.64826e-1 | 2.00091e-1 | 1e-2 | 16.48x |
+| music | CUDA | see CI | see CI | 1e-2 | — |
+
+The SFX distribution is bimodal: 20 of 25 samples land in 5.7e-4 … 1.4e-3, and
+the "Sparkling fantasy energy swirl" prompt lands near 1.0 at every seed. The
+checkpoint genuinely renders a near-centred image on most prompts, so this is a
+*duplicated-mono* gate, not a stereo-width quality bar. The music checkpoint's
+image is two to three orders wider; its `1e-2` floor is left where sc-14543
+shipped it rather than raised into the measured distribution, for the same
+reason. The sweeps assert in both directions: every sample must clear the floor,
+and the floor must not sit further below the measured minimum than the variant
+allows (10x for SFX, 50x for music).
+
+The per-run renders reproduce their sweep entries exactly — SFX seed 42 at
+`global` 7.73298e-4 / `median_window` 4.78244e-4, music seed 42 at 4.51496e-1 /
+4.66927e-1 — confirming the sweep covers the enforced configuration rather than
+merely resembling it.
+
+The music sweep is new in this revision. sc-14544 added the per-window-median
+assertion to the shared `assert_real_audio` helper, which applies it to the music
+variant too; that assertion previously had no music measurement behind it at any
+duration.
+
+### The floors, and the controls that discriminate them
 
 A weight-free test
 (`the_quality_gates_reject_the_degeneracies_they_are_named_for`) proves each of
@@ -194,6 +255,23 @@ these heuristics fails on the degeneracy it names — duplicated mono, mono plus
 numerical dust, mono plus one loud localized burst, a pure tone, DC, a 10 Hz
 tone, and white noise — each with a passing control alongside it, so the
 analysis itself is gated in the ordinary test lane.
+
+The SFX floor was raised from `1e-4` to `2e-4`. That change needs a control that
+distinguishes the two values, or it halves the margin for nothing:
+
+| Control | side/mid | `1e-4` | `2e-4` |
+|---|---:|---|---|
+| duplicated mono | 0.0 | rejects | rejects |
+| mono + numerical dust (~-89 dB) | 3.4644e-5 | rejects | rejects |
+| **mono + ~-77 dB differential** | **1.38569e-4** | **admits** | **rejects** |
+| two independent channels | ~1.0 | admits | admits |
+
+Only the third row discriminates, and it is asserted in both directions — it
+must pass `1e-4` (or it proves nothing about the tightening) and must fail
+`2e-4`. The dust control is a sanity check on the measurement, not evidence for
+the tightening; an earlier revision of this branch labelled it as "the near-mono
+case the old 1e-4 floor let through", which was simply wrong — `1e-4` rejects it
+by a factor of three.
 
 ## Runtime and bundle gates
 

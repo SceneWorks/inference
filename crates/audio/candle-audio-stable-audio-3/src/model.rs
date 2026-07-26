@@ -9,7 +9,7 @@
 //! [`load_variant`], which binds the expected [`Variant`] at the call site and rejects a snapshot
 //! whose conditioner `repo_id` or pinned file hashes belong to the other checkpoint.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use candle_audio::gen_core::{
@@ -365,13 +365,27 @@ fn verify_file_pin(
     Ok(())
 }
 
-fn verify_snapshot_identity(variant: Variant, layout: &SnapshotLayout) -> gen_core::Result<()> {
+/// Re-hash every pinned file and reject a snapshot that no longer authenticates.
+///
+/// `cancel` is polled between pins. This pass costs ~6.9 s over 3.45 GB on an M-series Mac, and on
+/// the lazy pipeline path it runs with both the generation and pipeline mutexes held; without the
+/// poll a request cancelled during cold start would not observe it until the whole verification
+/// and load had finished. Polling between pins rather than inside the hash loop keeps the check
+/// off the hot path while bounding the unobserved window to one file.
+fn verify_snapshot_identity(
+    variant: Variant,
+    root: &Path,
+    cancel: Option<&gen_core::CancelFlag>,
+) -> gen_core::Result<()> {
     for pin in variant.pins() {
+        if cancel.is_some_and(|cancel| cancel.is_cancelled()) {
+            return Err(gen_core::Error::Canceled);
+        }
         verify_file_pin(
             variant.model_id(),
             variant.hub_repo(),
             variant.hub_revision(),
-            &layout.root.join(pin.relative),
+            &root.join(pin.relative),
             pin,
         )?;
     }
@@ -484,7 +498,10 @@ impl StableAudio3SmallGenerator {
         self.variant
     }
 
-    fn pipeline(&self) -> gen_core::Result<Arc<StableAudio3SmallPipeline>> {
+    fn pipeline(
+        &self,
+        cancel: &gen_core::CancelFlag,
+    ) -> gen_core::Result<Arc<StableAudio3SmallPipeline>> {
         let mut guard = match self.pipeline.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -502,7 +519,10 @@ impl StableAudio3SmallGenerator {
         // +6.9 s, SHA-256 over the 3.45 GB of pinned files at ~500 MB/s, against a load-plus-first-
         // generate of 6.9 s without it. It runs once per generator, and generators are constructed
         // once and serve many requests; the alternative is serving unauthenticated weights.
-        verify_snapshot_identity(self.variant, &layout)?;
+        //
+        // The caller's cancel flag is threaded in so a request cancelled during this cold-start
+        // window observes it between pins instead of after the full load.
+        verify_snapshot_identity(self.variant, &layout.root, Some(cancel))?;
         let device = resolve_device(DevicePolicy::Default)?;
         let pipeline = Arc::new(StableAudio3SmallPipeline::from_layout(
             &layout,
@@ -555,7 +575,8 @@ pub fn load_variant(
     }
     let layout = SnapshotLayout::from_dir(&root)?;
     crate::pipeline::validate_small_layout(&layout, expected.hub_repo())?;
-    verify_snapshot_identity(expected, &layout)?;
+    // No request is in flight on the load path, so there is no cancel flag to honour here.
+    verify_snapshot_identity(expected, &layout.root, None)?;
     Ok(StableAudio3SmallGenerator {
         variant: expected,
         descriptor: descriptor_for(expected),
@@ -607,7 +628,7 @@ impl Generator for StableAudio3SmallGenerator {
             Err(poisoned) => poisoned.into_inner(),
         };
         let parameters = synthesis_parameters(request);
-        let pipeline = self.pipeline()?;
+        let pipeline = self.pipeline(&request.cancel)?;
         let cancel = request.cancel.clone();
         let progress = std::cell::RefCell::new(on_progress);
         let mut step_progress = |current: usize, total: usize| {
@@ -650,6 +671,33 @@ mod tests {
     };
 
     const VARIANTS: [Variant; 2] = [Variant::SmallMusic, Variant::SmallSfx];
+
+    /// The +6.9 s cold-start re-hash runs with both the generation and pipeline mutexes held, so a
+    /// request cancelled during it must observe the cancellation there rather than after the load.
+    ///
+    /// The uncancelled leg is what makes this discriminating: with the poll removed, the cancelled
+    /// leg would reach the filesystem and return the same missing-file error, so a test that only
+    /// asserted "cancelled returns Canceled" would pass either way.
+    #[test]
+    fn cold_start_snapshot_verification_observes_cancellation_before_hashing() {
+        let root = Path::new("/nonexistent/sa3-small-snapshot");
+
+        let uncancelled = verify_snapshot_identity(Variant::SmallSfx, root, None)
+            .expect_err("a missing snapshot must not verify");
+        assert!(
+            !matches!(uncancelled, gen_core::Error::Canceled),
+            "without a cancel flag the pass must reach the filesystem, got {uncancelled:?}"
+        );
+
+        let cancel = gen_core::CancelFlag::new();
+        cancel.cancel();
+        let cancelled = verify_snapshot_identity(Variant::SmallSfx, root, Some(&cancel))
+            .expect_err("a cancelled request must not verify");
+        assert!(
+            matches!(cancelled, gen_core::Error::Canceled),
+            "a cancelled request must observe cancellation before hashing, got {cancelled:?}"
+        );
+    }
 
     fn request() -> GenerationRequest {
         GenerationRequest {

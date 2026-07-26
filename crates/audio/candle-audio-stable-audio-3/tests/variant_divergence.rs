@@ -54,7 +54,9 @@ const SEEDS: &[u64] = &[14_544, 7, 2_026];
 /// what the frozen-Torch `dit_cosine` reproduction in the second test does. What tightening from
 /// the shipped 0.35 / 0.5 buys is the middle of the range: a partial mis-wiring that leaves the two
 /// registrations sharing a conditioner or a subset of blocks, landing at |cos| 0.2 … 0.35, is now
-/// rejected where it previously passed.
+/// rejected where it previously passed. That is not left as an argument — the synthetic
+/// partial-blend control in the test below lands in exactly that band and is asserted to be
+/// rejected by `0.15` and admitted by the shipped `0.35`.
 const MAX_RUNTIME_COSINE: f64 = 0.15;
 const MIN_RUNTIME_RMS_DELTA: f64 = 0.9;
 
@@ -108,6 +110,55 @@ fn normalized_rms_delta(left: &[f32], right: &[f32]) -> f64 {
         .map(|(a, b)| a - b)
         .collect::<Vec<_>>();
     rms(&delta) / rms(left).max(f64::MIN_POSITIVE)
+}
+
+/// Blend `toward` into `anchor` so the result sits at exactly `target_cosine` against `anchor`, at
+/// `anchor`'s scale.
+///
+/// Naively mixing `t * anchor + sqrt(1 - t^2) * toward` does *not* land at `t`: the two takes are
+/// only near-orthogonal (|cos| ~ 0.06 measured), and that residual agreement pushes the achieved
+/// cosine up — at `t = 0.25` it overshoots to 0.304. So `toward` is first Gram-Schmidt
+/// orthogonalized against `anchor`, which makes the mix exact for any measured cross-cosine. The
+/// blend is therefore `anchor` at weight `t` plus the component of the SFX take that carries no
+/// music agreement, which is precisely "a signal agreeing with music by `t` and otherwise made of
+/// SFX". The caller still asserts the achieved value rather than trusting the algebra.
+fn partial_blend(anchor: &[f32], toward: &[f32], target_cosine: f64) -> Vec<f32> {
+    assert_eq!(anchor.len(), toward.len());
+    let anchor_rms = rms(anchor).max(f64::MIN_POSITIVE);
+    let toward_rms = rms(toward).max(f64::MIN_POSITIVE);
+    let unit_anchor = anchor
+        .iter()
+        .map(|a| *a as f64 / anchor_rms)
+        .collect::<Vec<_>>();
+    let unit_toward = toward
+        .iter()
+        .map(|b| *b as f64 / toward_rms)
+        .collect::<Vec<_>>();
+
+    // Remove the anchor component from `toward`, then renormalize, so the two basis signals are
+    // exactly orthonormal and the mix weights are the achieved cosine.
+    let overlap = unit_anchor
+        .iter()
+        .zip(&unit_toward)
+        .map(|(a, b)| a * b)
+        .sum::<f64>()
+        / unit_anchor.len() as f64;
+    let mut residual = unit_toward
+        .iter()
+        .zip(&unit_anchor)
+        .map(|(b, a)| b - overlap * a)
+        .collect::<Vec<_>>();
+    let residual_rms = (residual.iter().map(|v| v * v).sum::<f64>() / residual.len() as f64).sqrt();
+    for value in &mut residual {
+        *value /= residual_rms.max(f64::MIN_POSITIVE);
+    }
+
+    let mix = (1.0 - target_cosine * target_cosine).sqrt();
+    unit_anchor
+        .iter()
+        .zip(&residual)
+        .map(|(a, r)| ((target_cosine * a + mix * r) * anchor_rms) as f32)
+        .collect()
 }
 
 fn digest(samples: &[f32]) -> String {
@@ -269,6 +320,45 @@ fn music_and_sfx_produce_materially_different_audio_from_the_same_prompt_and_see
         "a checkpoint compared with itself must violate both thresholds, otherwise the cross-variant \
          assertions below cannot detect a shared weight path (cosine {self_cosine}, delta \
          {self_rms_delta})"
+    );
+
+    // The self-comparison above is byte-identical by construction, so it lands at exactly cos = 1
+    // and can only prove the metrics register total agreement. It says nothing about the 0.15 … 1.0
+    // middle, which is the entire range tightening from the shipped 0.35 was supposed to buy.
+    //
+    // This control synthesizes that middle: the music take blended with the SFX take at a ratio
+    // chosen to land near |cos| = 0.25 against music. That is the signature of a *partial*
+    // mis-wiring — two registrations sharing a conditioner or a subset of DiT blocks — and it is
+    // the case the shipped 0.35 threshold admitted and 0.15 rejects.
+    let blended = partial_blend(&music[0], &sfx[0], 0.25);
+    let blend_cosine = cosine(&music[0], &blended).abs();
+    let blend_rms_delta = normalized_rms_delta(&music[0], &blended);
+    eprintln!(
+        "partial-mis-wiring control (music blended toward SFX): cosine={blend_cosine:.6} \
+         rms_delta={blend_rms_delta:.6}"
+    );
+    assert!(
+        (0.245..0.255).contains(&blend_cosine),
+        "the blend must actually land on its 0.25 target, else it proves nothing about the band it \
+         is built to probe (cosine {blend_cosine})"
+    );
+    assert!(
+        blend_cosine > MAX_RUNTIME_COSINE,
+        "the committed cosine threshold {MAX_RUNTIME_COSINE} must REJECT a partial mis-wiring at \
+         cosine {blend_cosine}; this is what tightening from the shipped 0.35 buys"
+    );
+    assert!(
+        blend_cosine < 0.35,
+        "the control must be one the shipped 0.35 threshold ADMITTED, otherwise the tightening is \
+         not what rejects it (cosine {blend_cosine})"
+    );
+    // Deliberately recorded, not asserted as a rejection: the RMS-delta gate does *not* catch this
+    // case. A blend that is 97% SFX still differs from music by more than `MIN_RUNTIME_RMS_DELTA`,
+    // so the cosine threshold is the only one of the two that closes the partial-mis-wiring hole.
+    assert!(
+        blend_rms_delta >= MIN_RUNTIME_RMS_DELTA,
+        "the RMS-delta gate is documented as passing this control; if it now rejects it, the \
+         claim above is stale (delta {blend_rms_delta})"
     );
 
     let mut worst_cosine = 0f64;

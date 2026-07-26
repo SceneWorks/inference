@@ -507,6 +507,14 @@ jobs:
             --test conformance registered_provider_passes_full_audio_conformance -- --ignored --nocapture
           cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
             --test conformance concurrent_requests_are_deterministic_and_do_not_share_rng_state -- --ignored --nocapture
+      - name: Re-calibrate the music stereo-width floor across prompts and seeds
+        run: |
+          # sc-14544 added a per-window-median side-ratio assertion to the shared `assert_real_audio`
+          # helper, which the render step below enforces on this variant too. This sweep is the
+          # measurement behind it, at the render's own 30 s / 8 steps.
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
+            --test provider music_stereo_width_floor_is_calibrated_across_prompts_and_seeds \
+            -- --ignored --nocapture
       - name: Render a real 30-second eight-step Metal WAV
         run: |
           SA3_TEST_DURATION=30 SA3_TEST_STEPS=8 \
@@ -558,10 +566,12 @@ jobs:
             --test conformance concurrent_sfx_requests_are_deterministic_and_do_not_share_rng_state -- --ignored --nocapture
       - name: Re-calibrate the SFX stereo-width floor across prompts and seeds
         run: |
-          # The floor the per-run stereo gate enforces is derived from this 25-sample sweep, so the
-          # calibration is re-checked rather than trusted. Metal only: the committed margin was
-          # measured here, and asserting it on unmeasured hardware would reintroduce exactly the
-          # unverified-envelope problem the sweep exists to fix.
+          # The floor the render step below enforces is derived from this 25-sample sweep, so the
+          # calibration is re-checked rather than trusted. The sweep's own defaults are 30 s /
+          # 8 steps — the same duration and step count the render enforces at — so calibration and
+          # enforcement cannot drift apart. The CUDA job runs the identical sweep before its own
+          # render for the same reason: a floor measured on one backend and enforced on another is
+          # not a calibrated gate.
           cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
             --test provider sfx_stereo_width_floor_is_calibrated_across_prompts_and_seeds \
             -- --ignored --nocapture
@@ -743,6 +753,14 @@ jobs:
           call "%VCVARS%"
           cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --test conformance registered_provider_passes_full_audio_conformance -- --ignored --nocapture || exit /b 1
           cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --test conformance concurrent_requests_are_deterministic_and_do_not_share_rng_state -- --ignored --nocapture || exit /b 1
+      - name: Re-calibrate the music stereo-width floor on CUDA
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          REM Same reason as the SFX CUDA job: the render below enforces the per-window-median
+          REM side-ratio assertion on this backend, so the measurement behind it is taken on this
+          REM backend, at the render's own 30 s / 8 steps.
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --test provider music_stereo_width_floor_is_calibrated_across_prompts_and_seeds -- --ignored --nocapture || exit /b 1
       - name: Render a real 30-second eight-step CUDA WAV
         shell: powershell
         run: |
@@ -810,6 +828,15 @@ jobs:
           call "%VCVARS%"
           cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --test conformance registered_sfx_provider_passes_full_audio_conformance -- --ignored --nocapture || exit /b 1
           cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --test conformance concurrent_sfx_requests_are_deterministic_and_do_not_share_rng_state -- --ignored --nocapture || exit /b 1
+      - name: Re-calibrate the SFX stereo-width floor on CUDA
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          REM The render below enforces SFX_SIDE_RATIO_FLOOR on this backend, so the floor is
+          REM calibrated on this backend, at the render's own 30 s / 8 steps. Enforcing a
+          REM Metal-measured margin on CUDA is the "unverified envelope" the sweep exists to
+          REM prevent; running the sweep here is what makes the enforcement below honest.
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --test provider sfx_stereo_width_floor_is_calibrated_across_prompts_and_seeds -- --ignored --nocapture || exit /b 1
       - name: Render a real 30-second eight-step SFX CUDA WAV
         shell: powershell
         run: |
