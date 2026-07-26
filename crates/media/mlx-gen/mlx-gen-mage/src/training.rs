@@ -155,11 +155,35 @@ pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
             ))
         }
     };
+    // sc-14980/sc-14979: training reads the DENSE base, which under the split mirror layout means
+    // the `bf16/` tier's DiT plus the SHARED text encoder + VAE staged as caller-provisioned
+    // co-requisite dirs. A flat snapshot (upstream, or an existing install) stages nothing and every
+    // component resolves under `root` exactly as before — the trainer is unchanged on that path.
+    let dirs = crate::model::resolve_component_dirs(root, spec)?;
+    // Training must never run against packed weights: the gradient path needs dense projections and
+    // `quantize` is a no-op over an already-packed base, so a q4/q8 tier would train silently wrong
+    // rather than fail. This is the engine-side twin of the app's `TrainingTierMissing` pre-flight.
+    for (label, dir) in [
+        ("transformer", &dirs.transformer),
+        ("text_encoder", &dirs.text_encoder),
+    ] {
+        let (Some(parent), Some(name)) = (dir.parent(), dir.file_name().and_then(|n| n.to_str()))
+        else {
+            continue;
+        };
+        if let Some(bits) = mlx_gen::quant::packed_quant_bits(parent, name)? {
+            return Err(mlx_gen::Error::Msg(format!(
+                "mage_flow_base trainer requires the dense bf16 base, but {label} at {} is a \
+                 pre-quantized Q{bits} artifact; install the bf16 tier to train",
+                dir.display()
+            )));
+        }
+    }
     Ok(Box::new(MageFlowTrainer {
         descriptor: trainer_descriptor(),
-        text_encoder: Some(crate::text_encoder::load(root)?),
-        vae: crate::vae::load(root.join("vae"), VaePart::Both, Dtype::Bfloat16)?,
-        transformer: MageTransformer::load(root.join("transformer"))?,
+        text_encoder: Some(crate::text_encoder::load_dir(&dirs.text_encoder)?),
+        vae: crate::vae::load(&dirs.vae, VaePart::Both, Dtype::Bfloat16)?,
+        transformer: MageTransformer::load(&dirs.transformer)?,
     }))
 }
 

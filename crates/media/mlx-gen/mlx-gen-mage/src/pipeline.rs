@@ -107,28 +107,146 @@ pub struct EditTrace {
     pub image_u8: Array,
 }
 
+/// Where each Mage-Flow component's weights live.
+///
+/// The published upstream snapshot is FLAT — one directory holding `transformer/`, `text_encoder/`
+/// and `vae/` — and [`MageComponentDirs::flat`] preserves exactly that. The SceneWorks mirrors add a
+/// SPLIT layout (sc-14980 / sc-14979): the per-tier DiT lives in the variant mirror's
+/// `<tier>/transformer/`, while the text encoder and VAE — **bit-identical across all six
+/// variants** — are hosted once in a shared components mirror and staged as caller-provisioned
+/// co-requisite paths. Carrying the three dirs explicitly is what lets one loader serve both.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MageComponentDirs {
+    /// The `transformer/` dir (its `config.json` + `diffusion_pytorch_model.safetensors`).
+    pub transformer: std::path::PathBuf,
+    /// The `text_encoder/` dir (Qwen3-VL weights, config, tokenizer/processor assets).
+    pub text_encoder: std::path::PathBuf,
+    /// The `vae/` dir.
+    pub vae: std::path::PathBuf,
+}
+
+impl MageComponentDirs {
+    /// The flat published layout: every component directly under `root`.
+    pub fn flat(root: impl AsRef<Path>) -> Self {
+        let root = root.as_ref();
+        Self {
+            transformer: root.join("transformer"),
+            text_encoder: root.join("text_encoder"),
+            vae: root.join("vae"),
+        }
+    }
+}
+
+/// Read a component dir's packed tier marker (`config.json` → `quantization.bits`).
+///
+/// [`mlx_gen::quant::packed_quant_bits`] is keyed by `(root, component)`; these paths are already
+/// full component dirs, so split the last segment back off rather than re-implementing the parse.
+fn component_packed_bits(dir: &Path) -> Result<Option<i32>> {
+    let (Some(parent), Some(name)) = (dir.parent(), dir.file_name().and_then(|n| n.to_str()))
+    else {
+        return Err(Error::Msg(format!(
+            "mage_flow: component path {} has no directory name",
+            dir.display()
+        )));
+    };
+    mlx_gen::quant::packed_quant_bits(parent, name)
+}
+
+/// Decide whether `dir` still needs load-time quantization to serve `requested` bits.
+///
+/// `Some(bits)` ⇒ run the load-time `quantize(bits)`; `None` ⇒ skip it, because the artifact is
+/// already packed at the requested tier (or a dense tier was requested and the artifact is dense).
+/// A tier mismatch in either direction is a hard error, never a silent downgrade: `quantize` is a
+/// no-op over packed weights, so serving a Q4 request from a Q8 artifact would quietly hand back Q8.
+fn load_time_quant_bits(dir: &Path, requested: Option<i32>, model_id: &str) -> Result<Option<i32>> {
+    let (Some(parent), Some(name)) = (dir.parent(), dir.file_name().and_then(|n| n.to_str()))
+    else {
+        return Err(Error::Msg(format!(
+            "mage_flow: component path {} has no directory name",
+            dir.display()
+        )));
+    };
+    match requested {
+        // A bf16 request must be served by dense weights: `quantize` is never called, so a packed
+        // artifact here would silently serve Q4/Q8 under a bf16 label.
+        None => match component_packed_bits(dir)? {
+            Some(packed) => Err(Error::Msg(format!(
+                "{model_id}: {} is a pre-quantized Q{packed} artifact but the bf16 (dense) tier was \
+                 requested; point at the bf16 tier or request Q{packed}",
+                dir.display()
+            ))),
+            None => Ok(None),
+        },
+        Some(bits) => Ok(mlx_gen::quant::needs_load_time_quant(parent, name, bits, model_id)?
+            .then_some(bits)),
+    }
+}
+
 impl MageFlowPipeline {
     /// Load a published diffusers snapshot (`text_encoder/`, `transformer/`, `vae/`).
     pub fn load(root: impl AsRef<Path>) -> Result<Self> {
         Self::load_with_quant(root, None)
     }
 
-    /// Load and optionally quantize all live Linears in the TE, DiT, and VAE.
+    /// Load and optionally quantize all live Linears in the TE, DiT, and VAE, from a flat snapshot.
     pub fn load_with_quant(root: impl AsRef<Path>, quant_bits: Option<i32>) -> Result<Self> {
-        let root = root.as_ref();
+        Self::load_components(
+            &MageComponentDirs::flat(root),
+            quant_bits,
+            crate::vae::VaePart::Decode,
+        )
+    }
+
+    /// Load the full edit pipeline, including the Qwen3-VL vision tower and Mage-VAE encoder.
+    pub fn load_edit(root: impl AsRef<Path>, quant_bits: Option<i32>) -> Result<Self> {
+        Self::load_components(
+            &MageComponentDirs::flat(root),
+            quant_bits,
+            crate::vae::VaePart::Both,
+        )
+    }
+
+    /// Load from explicitly-addressed component dirs, quantizing **per component** only where the
+    /// artifact on disk is not already packed at the requested tier (sc-14980).
+    ///
+    /// This is the seam that makes a pre-quantized tier a drop-in for load-time quant: a packed
+    /// `transformer/` and `text_encoder/` skip the dense read + quantize entirely, while the VAE —
+    /// which ships dense in every tier because its quantizable weights are folded away at load (see
+    /// [`crate::convert`]) — still takes the load-time path. The `quantized_linear_count`
+    /// assertions run against the FINAL state either way, so a packed artifact that failed to
+    /// auto-detect is caught exactly as a failed load-time pack would be.
+    pub fn load_components(
+        dirs: &MageComponentDirs,
+        quant_bits: Option<i32>,
+        part: crate::vae::VaePart,
+    ) -> Result<Self> {
+        const MODEL_ID: &str = "mage_flow";
+        // Resolve every tier decision BEFORE loading, so a mismatched tier fails fast instead of
+        // after an 8 GB read.
+        let te_bits = load_time_quant_bits(&dirs.text_encoder, quant_bits, MODEL_ID)?;
+        let dit_bits = load_time_quant_bits(&dirs.transformer, quant_bits, MODEL_ID)?;
+        let vae_bits = load_time_quant_bits(&dirs.vae, quant_bits, MODEL_ID)?;
+
+        let multimodal = matches!(part, crate::vae::VaePart::Both);
         let mut pipeline = Self {
-            text_encoder: crate::text_encoder::load(root)?,
-            transformer: MageTransformer::load(root.join("transformer"))?,
-            vae: crate::vae::load(
-                root.join("vae"),
-                crate::vae::VaePart::Decode,
-                Dtype::Bfloat16,
-            )?,
+            text_encoder: if multimodal {
+                crate::text_encoder::load_multimodal_dir(&dirs.text_encoder)?
+            } else {
+                crate::text_encoder::load_dir(&dirs.text_encoder)?
+            },
+            transformer: MageTransformer::load(&dirs.transformer)?,
+            vae: crate::vae::load(&dirs.vae, part, Dtype::Bfloat16)?,
         };
-        if let Some(bits) = quant_bits {
+        if let Some(bits) = te_bits {
             pipeline.text_encoder.quantize(bits)?;
+        }
+        if let Some(bits) = dit_bits {
             pipeline.transformer.quantize(bits)?;
+        }
+        if let Some(bits) = vae_bits {
             pipeline.vae.quantize(bits)?;
+        }
+        if quant_bits.is_some() && !multimodal {
             verify_quantized_counts(
                 "text encoder",
                 pipeline.text_encoder.quantized_linear_count(),
@@ -137,22 +255,6 @@ impl MageFlowPipeline {
             verify_quantized_counts("DiT", pipeline.transformer.quantized_linear_count(), 174)?;
             let (expected_vae, packed_vae) = pipeline.vae.quantization_count();
             verify_quantized_counts("VAE", packed_vae, expected_vae)?;
-        }
-        Ok(pipeline)
-    }
-
-    /// Load the full edit pipeline, including the Qwen3-VL vision tower and Mage-VAE encoder.
-    pub fn load_edit(root: impl AsRef<Path>, quant_bits: Option<i32>) -> Result<Self> {
-        let root = root.as_ref();
-        let mut pipeline = Self {
-            text_encoder: crate::text_encoder::load_multimodal(root)?,
-            transformer: MageTransformer::load(root.join("transformer"))?,
-            vae: crate::vae::load(root.join("vae"), crate::vae::VaePart::Both, Dtype::Bfloat16)?,
-        };
-        if let Some(bits) = quant_bits {
-            pipeline.text_encoder.quantize(bits)?;
-            pipeline.transformer.quantize(bits)?;
-            pipeline.vae.quantize(bits)?;
         }
         Ok(pipeline)
     }

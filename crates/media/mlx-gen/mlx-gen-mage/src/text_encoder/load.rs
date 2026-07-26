@@ -71,8 +71,17 @@ pub(crate) const QUANT_GROUP_SIZE: i32 = 64;
 /// [`token_ids`](MageTextEncoder::token_ids) at the per-kind budget, so `max_length` here is only
 /// the ceiling for the unused padded path and is set to the larger of the two.
 pub fn load_tokenizer(root: impl AsRef<Path>) -> Result<TextTokenizer> {
+    load_tokenizer_dir(root.as_ref().join(COMPONENT_DIR))
+}
+
+/// As [`load_tokenizer`], but addressing the `text_encoder/` directory itself.
+///
+/// The `*_dir` twins (sc-14979) exist because the shared text encoder is hosted in its own mirror
+/// and staged as a caller-provisioned co-requisite path, so it is NOT under the variant snapshot
+/// root the `root`-taking wrappers assume.
+pub fn load_tokenizer_dir(dir: impl AsRef<Path>) -> Result<TextTokenizer> {
     TextTokenizer::from_file(
-        root.as_ref().join(COMPONENT_DIR).join("tokenizer.json"),
+        dir.as_ref().join("tokenizer.json"),
         TokenizerConfig {
             max_length: max_prompt_tokens(DROP_IDX_EDIT),
             pad_token_id: PAD_TOKEN_ID,
@@ -86,7 +95,12 @@ pub fn load_tokenizer(root: impl AsRef<Path>) -> Result<TextTokenizer> {
 /// Load the language model from `<root>/text_encoder/*.safetensors`, after verifying the
 /// snapshot's `config.json` describes the model this port implements.
 pub fn load_lm(root: impl AsRef<Path>) -> Result<Qwen3VlTextEncoder> {
-    let dir = root.as_ref().join(COMPONENT_DIR);
+    load_lm_dir(root.as_ref().join(COMPONENT_DIR))
+}
+
+/// As [`load_lm`], but addressing the `text_encoder/` directory itself.
+pub fn load_lm_dir(dir: impl AsRef<Path>) -> Result<Qwen3VlTextEncoder> {
+    let dir = dir.as_ref();
     let config_path = dir.join("config.json");
     let published = std::fs::read_to_string(&config_path).map_err(|e| {
         Error::Msg(format!(
@@ -95,7 +109,7 @@ pub fn load_lm(root: impl AsRef<Path>) -> Result<Qwen3VlTextEncoder> {
         ))
     })?;
     let cfg = verify_text_config(&published)?;
-    let mut w = Weights::from_dir(&dir)?;
+    let mut w = Weights::from_dir(dir)?;
     let model = Qwen3VlTextEncoder::from_weights_draining(
         &mut w,
         LM_PREFIX,
@@ -117,8 +131,16 @@ pub fn load_lm(root: impl AsRef<Path>) -> Result<Qwen3VlTextEncoder> {
 
 /// Load tokenizer + LM together.
 pub fn load(root: impl AsRef<Path>) -> Result<MageTextEncoder> {
-    let root = root.as_ref();
-    Ok(MageTextEncoder::new(load_tokenizer(root)?, load_lm(root)?))
+    load_dir(root.as_ref().join(COMPONENT_DIR))
+}
+
+/// As [`load`], but addressing the `text_encoder/` directory itself.
+pub fn load_dir(dir: impl AsRef<Path>) -> Result<MageTextEncoder> {
+    let dir = dir.as_ref();
+    Ok(MageTextEncoder::new(
+        load_tokenizer_dir(dir)?,
+        load_lm_dir(dir)?,
+    ))
 }
 
 pub fn mage_vision_config() -> VisionConfig {
@@ -139,13 +161,17 @@ pub fn mage_vision_config() -> VisionConfig {
 
 /// Load tokenizer, language model, and the Qwen3-VL vision tower needed by Mage-Flow-Edit.
 pub fn load_multimodal(root: impl AsRef<Path>) -> Result<MageTextEncoder> {
-    let root = root.as_ref();
-    let dir = root.join(COMPONENT_DIR);
-    let weights = Weights::from_dir(&dir)?;
+    load_multimodal_dir(root.as_ref().join(COMPONENT_DIR))
+}
+
+/// As [`load_multimodal`], but addressing the `text_encoder/` directory itself.
+pub fn load_multimodal_dir(dir: impl AsRef<Path>) -> Result<MageTextEncoder> {
+    let dir = dir.as_ref();
+    let weights = Weights::from_dir(dir)?;
     let vision = VisionTower::from_weights(&weights, mage_vision_config(), "model.visual")?;
     Ok(MageTextEncoder::new_multimodal(
-        load_tokenizer(root)?,
-        load_lm(root)?,
+        load_tokenizer_dir(dir)?,
+        load_lm_dir(dir)?,
         vision,
     ))
 }
