@@ -37,6 +37,7 @@
 //! the driver only orchestrates around it.
 
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use candle_core::backprop::GradStore;
@@ -45,12 +46,15 @@ use candle_nn::VarBuilder;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use rand_distr::{Distribution, StandardNormal};
+use sha2::{Digest, Sha256};
 
 use crate::gen_core::train::{
     NetworkType, TrainingConfig, TrainingOutput, TrainingProgress, TrainingRequest,
 };
 use crate::gen_core::Image;
-use crate::train::checkpoint::{checkpoint_filename, file_stem};
+use crate::train::checkpoint::{
+    checkpoint_filename, file_stem, find_latest_resume, load_resume, save_resume,
+};
 use crate::train::lora::{
     build_lokr_targets, build_lora_targets, save_lokr, save_lora_peft, AdapterKind, LoraHost,
     LoraSet,
@@ -144,6 +148,102 @@ pub fn sample_unit_timestep(timestep_type: &str, timestep_bias: &str, seed: u64)
         _ => t,
     };
     t.clamp(1e-3, 1.0 - 1e-3)
+}
+
+/// Deterministic affine-uniform sample over `[lower, upper)`. Family wrappers can pass representable
+/// inward bounds to implement a mathematically open interval without clamp-induced endpoint mass.
+pub fn sample_uniform_range(seed: u64, lower: f32, upper: f32) -> f32 {
+    debug_assert!(lower < upper);
+    let mut rng = StdRng::seed_from_u64(seed);
+    rng.random::<f32>().mul_add(upper - lower, lower)
+}
+
+fn fingerprint_field(hasher: &mut Sha256, tag: &[u8], bytes: &[u8]) {
+    hasher.update((tag.len() as u64).to_le_bytes());
+    hasher.update(tag);
+    hasher.update((bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
+}
+
+fn fingerprint_cancelled(req: &TrainingRequest) -> Result<()> {
+    if req.cancel.is_cancelled() {
+        Err(CandleError::Canceled)
+    } else {
+        Ok(())
+    }
+}
+
+fn fingerprint_file(
+    hasher: &mut Sha256,
+    tag: &[u8],
+    path: &Path,
+    req: &TrainingRequest,
+) -> Result<()> {
+    fingerprint_cancelled(req)?;
+    fingerprint_field(hasher, tag, path.to_string_lossy().as_bytes());
+    let mut file = std::fs::File::open(path).map_err(|e| {
+        CandleError::Msg(format!(
+            "training resume fingerprint: open {}: {e}",
+            path.display()
+        ))
+    })?;
+    let size = file
+        .metadata()
+        .map_err(|e| {
+            CandleError::Msg(format!(
+                "training resume fingerprint: stat {}: {e}",
+                path.display()
+            ))
+        })?
+        .len();
+    hasher.update(size.to_le_bytes());
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        fingerprint_cancelled(req)?;
+        let n = file.read(&mut buffer).map_err(|e| {
+            CandleError::Msg(format!(
+                "training resume fingerprint: read {}: {e}",
+                path.display()
+            ))
+        })?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buffer[..n]);
+    }
+    Ok(())
+}
+
+/// Stable digest of every input that selects cached training data. Item order, captions, paths, file
+/// contents, optional control inputs, and resolution are length-delimited to prevent ambiguity.
+pub fn request_fingerprint(req: &TrainingRequest) -> Result<String> {
+    fingerprint_cancelled(req)?;
+    let mut hasher = Sha256::new();
+    fingerprint_field(&mut hasher, b"format", b"candle-training-request-v1");
+    fingerprint_field(
+        &mut hasher,
+        b"resolution",
+        &req.config.resolution.to_le_bytes(),
+    );
+    fingerprint_field(
+        &mut hasher,
+        b"item_count",
+        &(req.items.len() as u64).to_le_bytes(),
+    );
+    for (index, item) in req.items.iter().enumerate() {
+        fingerprint_cancelled(req)?;
+        fingerprint_field(&mut hasher, b"item_index", &(index as u64).to_le_bytes());
+        fingerprint_field(&mut hasher, b"caption", item.caption.as_bytes());
+        fingerprint_file(&mut hasher, b"image", &item.image_path, req)?;
+        match &item.control_image_path {
+            Some(path) => {
+                fingerprint_field(&mut hasher, b"has_control", &[1]);
+                fingerprint_file(&mut hasher, b"control", path, req)?;
+            }
+            None => fingerprint_field(&mut hasher, b"has_control", &[0]),
+        }
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 /// The per-step timestep RNG seed: mixes the config `seed` with `step` via the golden-ratio constant —
@@ -411,6 +511,13 @@ pub trait FlowMatchTrainer {
     /// The family's default LoRA target suffixes (used when the request leaves the target list empty).
     fn default_targets(&self) -> &'static [&'static str];
 
+    /// Cheap, pre-cache validation for family-specific resource guards. Called before any encoder or
+    /// VAE is loaded so an unsafe dense-backward request fails catchably rather than OOM-killing the
+    /// process after minutes of caching.
+    fn preflight(&self, _req: &TrainingRequest) -> Result<()> {
+        Ok(())
+    }
+
     /// Cache the dataset: encode each item's latent + conditioning (reporting
     /// [`TrainingProgress::Caching`]) and return the per-sample cache plus any run-derived `Aux` and a
     /// [`SamplePlan`]. Honors `req.cancel` (a cancel mid-cache yields a short/empty cache; the driver maps
@@ -481,6 +588,15 @@ pub trait FlowMatchTrainer {
     }
 }
 
+fn validate_resume_step(label: &str, restored: u32, requested: u32) -> Result<()> {
+    if restored > requested {
+        return Err(CandleError::Msg(format!(
+            "{label}: resume snapshot step {restored} exceeds requested total steps {requested}"
+        )));
+    }
+    Ok(())
+}
+
 /// Drive a single-model flow-match trainer end to end: cache → install adapters → train loop → save.
 ///
 /// Owns the loop scaffolding every single-model trainer shared verbatim — optimizer + LR-schedule
@@ -498,10 +614,16 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
     let cfg = &req.config;
     let device = model.device();
     on_progress(TrainingProgress::Preparing);
+    model.preflight(req)?;
+    fingerprint_cancelled(req)?;
+    let fingerprint = request_fingerprint(req)?;
 
     // --- cache (latents + conditioning); the encoders load and drop inside the hook ---
     on_progress(TrainingProgress::LoadingModel);
     let (cache, aux, sample_plan) = model.cache(req, device, on_progress)?;
+    if req.cancel.is_cancelled() {
+        return Err(CandleError::Canceled);
+    }
     if cache.is_empty() {
         if req.cancel.is_cancelled() {
             return Err(CandleError::Canceled);
@@ -528,16 +650,30 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
     let (total_updates, warmup_updates) = schedule_updates(cfg.steps, accum, cfg.lr_warmup_steps);
     let stem = file_stem(&req.file_name).to_string();
 
+    // --- optional full-state resume ---
+    let mut start_step = 0u32;
+    let mut update_idx = 0u32;
+    if cfg.resume {
+        if let Some((snapshot, _)) = find_latest_resume(&req.output_dir, &stem) {
+            let restored = load_resume(&snapshot, &mut opt, &set, cfg, &fingerprint)?;
+            validate_resume_step(T::LABEL, restored.step, cfg.steps)?;
+            start_step = restored.step;
+            update_idx = restored.update_idx;
+        }
+    }
+
     // --- train loop ---
     let mut accumulated: Option<GradStore> = None;
     // Micro-grads accumulated into the CURRENT (not-yet-flushed) window. Resets to 0 on each flush; at
     // a full boundary it equals `accum`, and whatever it holds when the loop ends is the sub-`accum`
     // remainder the final flush must divide by (F-034, sc-9018).
     let mut pending = 0u32;
-    let mut update_idx = 0u32;
     let mut last_loss = 0.0f32;
-    let mut steps_run = 0u32;
-    for step in 1..=cfg.steps {
+    let mut steps_run = start_step;
+    // A PEFT checkpoint cadence may fall mid-accumulation. Delay the corresponding resume bundle
+    // until the next completed optimizer boundary instead of snapshotting without pending grads.
+    let mut resume_due = false;
+    for step in start_step.saturating_add(1)..=cfg.steps {
         if req.cancel.is_cancelled() {
             break;
         }
@@ -628,7 +764,23 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
             create_output_dir(&req.output_dir)?;
             let ckpt = req.output_dir.join(checkpoint_filename(&stem, step));
             model.save(&set, &ckpt)?;
+            resume_due = true;
             on_progress(TrainingProgress::Checkpoint { step });
+        }
+        // A resume bundle is exact only at a completed optimizer-update boundary. If its requested
+        // cadence occurred mid-window, this fires at the first later boundary.
+        if resume_due && pending == 0 {
+            save_resume(
+                &req.output_dir,
+                &stem,
+                step,
+                update_idx,
+                &opt,
+                &set,
+                cfg,
+                &fingerprint,
+            )?;
+            resume_due = false;
         }
     }
 
@@ -651,6 +803,18 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
             total_updates,
             warmup_updates,
         )?;
+        if resume_due {
+            save_resume(
+                &req.output_dir,
+                &stem,
+                steps_run,
+                update_idx + 1,
+                &opt,
+                &set,
+                cfg,
+                &fingerprint,
+            )?;
+        }
     }
 
     // --- save final adapter ---
@@ -674,6 +838,7 @@ mod tests {
     use candle_nn::Linear;
     use std::cell::Cell;
     use std::rc::Rc;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     /// `sample_unit_timestep` is deterministic in its seed, lands in `[1e-3, 1−1e-3]`, and the bias
     /// tilts shift the mass the documented way (`low` ⇒ smaller t than neutral than `high`, on
@@ -704,6 +869,46 @@ mod tests {
         assert!(
             lo < mid && mid < hi,
             "bias order low {lo} < mid {mid} < high {hi}"
+        );
+    }
+
+    #[test]
+    fn request_fingerprint_covers_resolution_order_caption_paths_and_contents() {
+        let req = mock_request(2, 1, 1, 0, CancelFlag::new());
+        let original = request_fingerprint(&req).unwrap();
+        assert_eq!(original, request_fingerprint(&req).unwrap());
+
+        let mut changed = req.clone();
+        changed.config.resolution += 64;
+        assert_ne!(original, request_fingerprint(&changed).unwrap());
+
+        let mut changed = req.clone();
+        changed.items[0].caption.push_str(" changed");
+        assert_ne!(original, request_fingerprint(&changed).unwrap());
+
+        let mut changed = req.clone();
+        changed.items.swap(0, 1);
+        assert_ne!(original, request_fingerprint(&changed).unwrap());
+
+        let same_contents = req.output_dir.join("same-contents.png");
+        std::fs::copy(&req.items[0].image_path, &same_contents).unwrap();
+        let mut changed = req.clone();
+        changed.items[0].image_path = same_contents;
+        assert_ne!(original, request_fingerprint(&changed).unwrap());
+
+        std::fs::write(&req.items[0].image_path, b"mutated image bytes").unwrap();
+        assert_ne!(original, request_fingerprint(&req).unwrap());
+
+        let control = req.output_dir.join("control.png");
+        std::fs::write(&control, b"control bytes").unwrap();
+        let mut with_control = req.clone();
+        with_control.items[0].control_image_path = Some(control.clone());
+        let control_fingerprint = request_fingerprint(&with_control).unwrap();
+        assert_ne!(request_fingerprint(&req).unwrap(), control_fingerprint);
+        std::fs::write(&control, b"changed control bytes").unwrap();
+        assert_ne!(
+            control_fingerprint,
+            request_fingerprint(&with_control).unwrap()
         );
     }
 
@@ -760,6 +965,13 @@ mod tests {
         }
     }
 
+    #[test]
+    fn resume_step_cannot_exceed_requested_schedule() {
+        validate_resume_step("mock", 4, 4).unwrap();
+        let err = validate_resume_step("mock", 5, 4).unwrap_err().to_string();
+        assert!(err.contains("exceeds requested total steps"), "{err}");
+    }
+
     // --- A mock single-model trainer exercising the Tier-2 driver (the loop scaffolding that had no
     //     unit coverage before sc-7787). The DiT is a single adaptable Linear; micro_step makes a loss
     //     out of the adapter factors directly so backprop reaches them with no real model. ---
@@ -779,6 +991,62 @@ mod tests {
         steps_seen: Cell<u32>,
         saves: Cell<u32>,
         cache_len: usize,
+    }
+
+    struct PartialCacheCancelTrainer {
+        device: Device,
+        cancel: CancelFlag,
+        built_dit: Rc<Cell<bool>>,
+    }
+
+    impl FlowMatchTrainer for PartialCacheCancelTrainer {
+        type Dit = MockDit;
+        type Cached = ();
+        type Aux = ();
+        type SampleState = ();
+        const LABEL: &'static str = "partial-cache cancel trainer";
+
+        fn device(&self) -> &Device {
+            &self.device
+        }
+
+        fn default_targets(&self) -> &'static [&'static str] {
+            &["to_q"]
+        }
+
+        fn cache(
+            &self,
+            _req: &TrainingRequest,
+            _device: &Device,
+            _on_progress: &mut dyn FnMut(TrainingProgress),
+        ) -> Result<(Vec<()>, (), SamplePlan<()>)> {
+            self.cancel.cancel();
+            Ok((vec![()], (), SamplePlan::disabled()))
+        }
+
+        fn build_dit(&self, _req: &TrainingRequest, device: &Device) -> Result<MockDit> {
+            self.built_dit.set(true);
+            let weight = Tensor::zeros((4, 4), DType::F32, device)?;
+            Ok(MockDit(LoraLinear::from_linear(
+                Linear::new(weight, None),
+                4,
+                4,
+                "to_q".into(),
+            )))
+        }
+
+        fn micro_step(
+            &self,
+            _dit: &MockDit,
+            _vars: &[Var],
+            _cached: &(),
+            _aux: &(),
+            _cfg: &TrainingConfig,
+            _step: u32,
+            _device: &Device,
+        ) -> Result<(f32, GradStore)> {
+            unreachable!("the driver must stop before building or training the DiT")
+        }
     }
 
     impl FlowMatchTrainer for MockTrainer {
@@ -852,6 +1120,14 @@ mod tests {
         save_every: u32,
         cancel: CancelFlag,
     ) -> TrainingRequest {
+        static NEXT_REQUEST: AtomicU64 = AtomicU64::new(0);
+        let id = NEXT_REQUEST.fetch_add(1, Ordering::Relaxed);
+        let fixture_dir = std::env::temp_dir().join(format!(
+            "candle_flow_match_driver_{}_{}",
+            std::process::id(),
+            id
+        ));
+        std::fs::create_dir_all(&fixture_dir).unwrap();
         let config = TrainingConfig {
             steps,
             gradient_accumulation: accum,
@@ -860,14 +1136,18 @@ mod tests {
         };
         TrainingRequest {
             items: (0..items)
-                .map(|i| TrainingItem {
-                    image_path: format!("/img{i}.png").into(),
-                    caption: "x".into(),
-                    control_image_path: None,
+                .map(|i| {
+                    let image_path = fixture_dir.join(format!("img{i}.png"));
+                    std::fs::write(&image_path, format!("fixture image {i}")).unwrap();
+                    TrainingItem {
+                        image_path,
+                        caption: "x".into(),
+                        control_image_path: None,
+                    }
                 })
                 .collect(),
             config,
-            output_dir: std::env::temp_dir().join("candle_flow_match_driver_test"),
+            output_dir: fixture_dir,
             file_name: "a.safetensors".into(),
             trigger_words: vec![],
             cancel,
@@ -920,13 +1200,33 @@ mod tests {
             saves: Cell::new(0),
             cache_len: 2,
         };
-        let req = mock_request(2, 5, 1, 0, cancel);
+        let mut req = mock_request(2, 5, 1, 0, cancel);
+        // Cancellation must win over fingerprint I/O: this deliberately missing path is never opened.
+        req.items[0].image_path = req.output_dir.join("does-not-exist.png");
         let err = run_flow_match_training(&model, &req, &mut |_| {}).unwrap_err();
         assert!(
             matches!(err, CandleError::Canceled),
             "expected Canceled, got {err:?}"
         );
         assert_eq!(model.saves.get(), 0, "nothing saved");
+    }
+
+    #[test]
+    fn driver_cancel_after_partial_cache_does_not_build_dit() {
+        let cancel = CancelFlag::new();
+        let built_dit = Rc::new(Cell::new(false));
+        let model = PartialCacheCancelTrainer {
+            device: Device::Cpu,
+            cancel: cancel.clone(),
+            built_dit: Rc::clone(&built_dit),
+        };
+        let req = mock_request(2, 5, 1, 0, cancel);
+        let err = run_flow_match_training(&model, &req, &mut |_| {}).unwrap_err();
+        assert!(matches!(err, CandleError::Canceled), "{err:?}");
+        assert!(
+            !built_dit.get(),
+            "a partial cache cancellation must stop before loading the DiT"
+        );
     }
 
     // --- F-034 (sc-9018): the final partial gradient-accumulation flush must average by the ACTUAL
@@ -1175,26 +1475,10 @@ mod tests {
     }
 
     fn preview_request(steps: u32, sample_every: u32) -> TrainingRequest {
-        let config = TrainingConfig {
-            steps,
-            gradient_accumulation: 1,
-            save_every: 0,
-            sample_every,
-            sample_prompts: vec!["a preview".into()],
-            ..TrainingConfig::default()
-        };
-        TrainingRequest {
-            items: vec![TrainingItem {
-                image_path: "/img0.png".into(),
-                caption: "x".into(),
-                control_image_path: None,
-            }],
-            config,
-            output_dir: std::env::temp_dir().join("candle_flow_match_preview_test"),
-            file_name: "a.safetensors".into(),
-            trigger_words: vec![],
-            cancel: CancelFlag::new(),
-        }
+        let mut req = mock_request(1, steps, 1, 0, CancelFlag::new());
+        req.config.sample_every = sample_every;
+        req.config.sample_prompts = vec!["a preview".into()];
+        req
     }
 
     /// After a preview whose render ERRORS, the thaw pass still runs, so the adapter is restored to its
