@@ -409,9 +409,9 @@ fn negative_prompt_divergence_at_the_base_default_exceeds_the_frozen_torch_agree
 /// same latent space on the same device and dtype, read at this test's guidance scale through
 /// [`cfg_error_amplification`]: the correct recomposition must land inside it and every mis-wiring
 /// must land outside it. The rescaling is not slack bought to make the gate pass — the closest
-/// mis-wiring misses by four orders of magnitude — it is what makes the bound device-portable, and
-/// it was added because the unscaled floor failed on CPU (residual `5.05e-3`, floor `4.03e-3`) while
-/// passing comfortably on Metal.
+/// mis-wiring still overshoots the bound by more than 6,690x — it is what makes the bound
+/// device-portable, and it was added because the unscaled floor failed on CPU (residual `5.05e-3`,
+/// floor `4.03e-3`) while passing comfortably on Metal.
 #[test]
 #[ignore = "requires the pinned small-music-base snapshot and real batch-2 CFG forwards"]
 fn the_guided_latents_are_exactly_the_cfg_recomposition_of_their_own_two_branches() {

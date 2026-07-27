@@ -200,7 +200,8 @@ of `4.03e-3`) — a Metal-only bound, exactly the accident the rescaling removes
 | CPU | 4.028320e-3 | 1.3092e-2 | **5.050659e-3** | 1138.90 | 87.61 | 454.05 |
 
 Every one of those mis-wirings diverges from the no-negative render just as loudly as the correct
-wiring, so every one passes step 3 — and misses this bound by four orders of magnitude.
+wiring, so every one passes step 3 — and overshoots this bound by at least 6,690x (the closest,
+`g − 1` on CPU), while the correct recomposition stays under it on both backends.
 
 `tests/dit_oracle.rs`'s `real_weights_detect_conditioning_mutations_and_exercise_cfg_apg` is the
 third leg: it is the only case that separates *absent* negative conditioning — which takes the
