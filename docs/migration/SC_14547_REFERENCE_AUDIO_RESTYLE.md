@@ -108,8 +108,8 @@ end; what the sampler then *does* with it is gated only with real weights.
 
 Every site below was mutated individually and the weight-free CI step re-run. Sites in `model.rs`
 and in `pipeline::sampler_strength_for` fail the suite. Sites inside the weights-only methods
-(`StableAudio3Generator::generate`, `StableAudio3Pipeline::synthesize_with_reference_traced`,
-`StableAudio3Pipeline::sample`) do **not** — no weight-free case evaluates them — so what is stated
+(`StableAudio3Generator::generate`, `StableAudio3Pipeline::synthesize_with_reference`,
+`StableAudio3Pipeline::synthesize_with_reference_traced`, `StableAudio3Pipeline::sample`) do **not** — no weight-free case evaluates them — so what is stated
 for those is which *runtime* check rejects them, each measured against `sampler::initialized_start`
 directly rather than inferred.
 
@@ -124,14 +124,17 @@ directly rather than inferred.
 | either `sampler_strength_for(reference)` call site in `sample` | invert it, or swap `reference` for `None` | runtime, fail-closed: it now disagrees with the other site, and `initialized_start` bails `init noise strength must equal every schedule's first sigma`. Measured at levels `0.75/0.9/0.0/1.0/0.5`; the only pairs that pass are the ones where the edit does not change the value (inversion at level `0.5`, `None` at level `1.0`), which are behaviour-neutral. |
 | `sample`'s `init_latents` or `reference` argument at the call site | drop one, keep the other | runtime, fail-closed: `reference_halves_agree` rejects the disagreement. Before this PR's third cycle, dropping `reference` alone was **silent** — the source was still encoded and then discarded at strength `1.0`, degrading a restyle to plain text-to-audio. |
 | `let reference = reference_audio_for(request)` in `generate` → `None` | delete the feature | real-weight only: `real_reference_restyle_is_bounded_and_ordered_on_all_six_variants` would measure a source correlation of ~0 at contract `1.0`. Nothing weight-free sees it; `generate` needs a loaded pipeline. |
+| the forwarded `reference` argument in `StableAudio3Pipeline::synthesize_with_reference` | `reference` → `None` | real-weight only: `real_reference_restyle_is_bounded_and_ordered_on_all_six_variants`, which drives `.generate()` and therefore passes through this wrapper. Same class as the `generate` row above — deleting the feature at a weights-only forwarding site, a total no-op rather than a silent sign inversion. Measured green weight-free (33 passed / 0 failed). |
 | `prepare_reference_pcm`'s target size in `reference_latents` | halve it | runtime, fail-closed: the SAME-encode shape check in `reference_latents` |
 
 Two things are worth stating plainly rather than as reassurance. First, a **coordinated edit to both
 `sampler_strength_for` call sites at once** agrees with itself, passes `initialized_start`, and is
 green weight-free — it is caught only by the real-weight case. That is a two-site edit, not a
-one-token one, but it is reachable. Second, deleting the feature at `generate` is likewise
-weight-free-invisible. Neither is claimed to be closed here; both are named so the next reader
-starts from them.
+one-token one, but it is reachable. Second, deleting the feature at either weights-only forwarding
+site — `generate`'s `reference_audio_for` binding, or the `reference` argument
+`synthesize_with_reference` forwards on to `synthesize_with_reference_traced` — is likewise
+weight-free-invisible; both are one-token `None` substitutions caught only by the real-weight case.
+Neither is claimed to be closed here; both are named so the next reader starts from them.
 
 Measured source correlation on Metal, 5 s / 4 steps, seed 7 (M-series, `--release --features metal`):
 
