@@ -229,14 +229,21 @@ jobs:
         # links the seven real-weight-only binaries, which costs the lld budget above nothing but
         # time for zero executed cases.
         #
-        # The named seven and what they execute on a PR (measured, `cargo test -p
-        # candle-audio-stable-audio-3 --tests`): `sampler_oracle` 17, `provider` 3,
-        # `dtype_policy` 2, `conformance` 1, `primitive_oracle` 1, `same_oracle` 1,
-        # `variant_quality` 1 — 26 weight-free cases. sc-14545 review found `sampler_oracle`,
+        # The named eight and what they execute on a PR (measured, `cargo test -p
+        # candle-audio-stable-audio-3 --tests`): `sampler_oracle` 17, `reference_audio` 5,
+        # `provider` 3, `dtype_policy` 2, `conformance` 1, `primitive_oracle` 1, `same_oracle` 1,
+        # `variant_quality` 1 — 31 weight-free cases. sc-14545 review found `sampler_oracle`,
         # `same_oracle` and `primitive_oracle` running in no automatic lane at all (19 dark gates,
         # pre-existing since sc-14543) and added them here. sc-14546 adds `provider`'s third case,
         # which asserts each `-base` side-ratio floor sits below the sweep minimum it was
         # calibrated from.
+        #
+        # sc-14547 adds `reference_audio`, the audio→audio restyle target. Its five weight-free
+        # cases carry the **sign gate** for that feature: the contract's
+        # `Conditioning::ReferenceAudio.strength` is retention-oriented and the sampler's is
+        # `init_noise_level`-oriented, so a silent inversion between them ships a feature that runs,
+        # emits plausible audio, and does the opposite of what was asked. That case is verified to
+        # fail under the flipped mapping, not merely to pass under the correct one.
         #
         # Deliberately **not** named, because every case in them is `#[ignore]`d behind a pinned
         # multi-GB snapshot and the target would link for zero executed tests: `base_guidance`,
@@ -259,6 +266,7 @@ jobs:
           -p candle-audio-stable-audio-3
           --test provider --test dtype_policy --test variant_quality --test conformance
           --test sampler_oracle --test same_oracle --test primitive_oracle
+          --test reference_audio
           -- --nocapture
       - name: Test LLM-only CPU bundle
         run: cargo test --locked --no-default-features --lib -p runtime-cpu

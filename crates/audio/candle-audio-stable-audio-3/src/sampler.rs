@@ -921,6 +921,46 @@ where
     F: FnMut(&Tensor, &Tensor) -> Result<Tensor>,
     N: NoiseSource,
 {
+    let start = initialized_start(noise_latents, init_latents, strength, schedule)?;
+    if start.skip_model {
+        return Ok(SampleOutput {
+            latents: start.latents,
+            trajectory: Vec::new(),
+            model_calls: 0,
+            noise_draws: noise.draws(),
+        });
+    }
+    sample(
+        kind,
+        &start.latents,
+        schedule,
+        padding_mask,
+        noise,
+        record_trajectory,
+        model,
+    )
+}
+
+/// The starting latents for an initialized sample, plus whether the DiT must be skipped entirely.
+#[derive(Debug, Clone)]
+pub struct InitializedStart {
+    pub latents: Tensor,
+    /// `true` only for `strength == 0` with init latents present — the frozen no-DiT short circuit,
+    /// which returns the prepared source latents unchanged.
+    pub skip_model: bool,
+}
+
+/// Shared preamble for every initialized sampling entry point.
+///
+/// Extracted so the raw-closure form ([`sample_initialized`]) and the connected DiT form
+/// ([`sample_dit_initialized_with_interval_and_cancel`]) cannot drift on the schedule/strength
+/// agreement check, the mix, or the `strength == 0` short circuit.
+pub fn initialized_start(
+    noise_latents: &Tensor,
+    init_latents: Option<&Tensor>,
+    strength: f32,
+    schedule: &Schedule,
+) -> Result<InitializedStart> {
     let batch = noise_latents.dim(0)?;
     schedule.validate_for(batch)?;
     if schedule
@@ -930,24 +970,11 @@ where
     {
         bail!("init noise strength must equal every schedule's first sigma")
     }
-    let initial = initialize_latents(noise_latents, init_latents, strength)?;
-    if init_latents.is_some() && strength == 0.0 {
-        return Ok(SampleOutput {
-            latents: initial,
-            trajectory: Vec::new(),
-            model_calls: 0,
-            noise_draws: noise.draws(),
-        });
-    }
-    sample(
-        kind,
-        &initial,
-        schedule,
-        padding_mask,
-        noise,
-        record_trajectory,
-        model,
-    )
+    let latents = initialize_latents(noise_latents, init_latents, strength)?;
+    Ok(InitializedStart {
+        skip_model: init_latents.is_some() && strength == 0.0,
+        latents,
+    })
 }
 
 /// Mix init latents and initial noise. With strength zero the caller must return init latents
@@ -1176,6 +1203,68 @@ pub fn sample_dit_with_interval_and_cancel<N: NoiseSource>(
                 is_canceled,
             )
         },
+    )
+}
+
+/// Connected-provider sampler that mixes init latents into the initial noise first (sc-14547).
+///
+/// The audio→audio restyle path needs both halves at once: the frozen `x0 = init*(1-s) + noise*s`
+/// initialization *and* the cancellable, guidance-interval-aware DiT loop. Composing them in the
+/// provider would have put the `strength == 0` no-DiT short circuit back under a caller convention,
+/// which is exactly what [`sample_initialized`] exists to prevent, so both forms share
+/// [`initialized_start`].
+///
+/// `strength` here is the **init noise level**: `1.0` is pure noise (the text-to-audio path) and
+/// `0.0` returns the prepared source latents without a single DiT forward. The provider-facing
+/// `Conditioning::ReferenceAudio.strength` is *retention*-oriented and is the complement of this
+/// value — see `model::reference_noise_level`.
+#[allow(clippy::too_many_arguments)]
+pub fn sample_dit_initialized_with_interval_and_cancel<N: NoiseSource>(
+    model: &StableAudio3Dit,
+    kind: SamplerKind,
+    noise_latents: &Tensor,
+    init_latents: Option<&Tensor>,
+    strength: f32,
+    schedule: &Schedule,
+    positive_prompt: &Tensor,
+    negative_prompt: Option<&Tensor>,
+    negative_prompt_mask: Option<&Tensor>,
+    seconds_total: &Tensor,
+    local_conditioning: &Tensor,
+    padding: Option<&Tensor>,
+    guidance: Guidance,
+    guidance_interval: GuidanceInterval,
+    callback: Option<&mut ProgressCallback<'_>>,
+    noise: &mut N,
+    record_trajectory: bool,
+    is_canceled: &dyn Fn() -> bool,
+) -> Result<SampleOutput> {
+    let start = initialized_start(noise_latents, init_latents, strength, schedule)?;
+    if start.skip_model {
+        return Ok(SampleOutput {
+            latents: start.latents,
+            trajectory: Vec::new(),
+            model_calls: 0,
+            noise_draws: noise.draws(),
+        });
+    }
+    sample_dit_with_interval_and_cancel(
+        model,
+        kind,
+        &start.latents,
+        schedule,
+        positive_prompt,
+        negative_prompt,
+        negative_prompt_mask,
+        seconds_total,
+        local_conditioning,
+        padding,
+        guidance,
+        guidance_interval,
+        callback,
+        noise,
+        record_trajectory,
+        is_canceled,
     )
 }
 

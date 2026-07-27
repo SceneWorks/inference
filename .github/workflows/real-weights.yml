@@ -850,6 +850,28 @@ jobs:
           cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
             --test dit_oracle real_weights_detect_conditioning_mutations_and_exercise_cfg_apg \
             -- --ignored --nocapture
+      - name: Prove the audio-to-audio restyle path on all six checkpoints
+        run: |
+          # sc-14547. This job is the only lane that provisions all six snapshots, and the story's
+          # acceptance is explicitly "every registered variant", so the target lands here rather
+          # than on a per-variant job.
+          #
+          # Both ignored cases in the target run, and both are wanted:
+          #
+          #   * `real_reference_restyle_is_bounded_and_ordered_on_all_six_variants` asserts *both*
+          #     bounds the story requires — measurable retained structure at full retention and a
+          #     divergence floor at zero retention — and, in the same sweep, the strength
+          #     *direction* through the full graph. The weight-free sign gate named in `ci.yml`
+          #     proves the mapping; this proves the mapping is the one the model responds to.
+          #   * `real_initial_sampler_noise_precedes_the_source_encode` is the only observation that
+          #     separates "initial noise first, then the source encode" from the reverse. Encoding
+          #     first would move every later draw, so the same seed would sound different merely for
+          #     having a clip attached.
+          #
+          # `--nocapture` keeps the measured per-variant correlations in the log, so the floors are
+          # auditable from the run rather than only from the source.
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
+            --test reference_audio -- --ignored --nocapture
 
   sa3-small-base-metal:
     name: Stable Audio 3 small base providers (Metal)
@@ -1501,6 +1523,16 @@ jobs:
           rem ignored cases need all six snapshots on CPU or an explicit SA3_DIT_CASE_ENV selection,
           rem and wiring the rest of `dit_oracle` is sc-15235.
           cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --test dit_oracle real_weights_detect_conditioning_mutations_and_exercise_cfg_apg -- --ignored --nocapture || exit /b 1
+      - name: Prove the audio-to-audio restyle path on all six checkpoints
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          rem sc-14547. This job and its Metal twin are the only lanes provisioning all six
+          rem snapshots, and the story's acceptance is "every registered variant". Both ignored
+          rem cases run: the sweep asserts retained structure, a divergence floor, and the strength
+          rem direction through the full graph, and the draw-order case is the only observation that
+          rem separates "initial noise first, then the source encode" from the reverse.
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --test reference_audio -- --ignored --nocapture || exit /b 1
 
   sa3-small-base-cuda:
     name: Stable Audio 3 small base providers (CUDA)

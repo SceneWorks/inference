@@ -11,7 +11,7 @@ use crate::same::{
 };
 use crate::sampler::{
     build_schedule, default_sample_geometry, inference_shift, padding_mask,
-    sample_dit_with_interval_and_cancel, GuidanceInterval, InjectedNoise, NoiseSource,
+    sample_dit_initialized_with_interval_and_cancel, GuidanceInterval, InjectedNoise, NoiseSource,
     ProgressCallback, SampleGeometry, SamplerKind, SeededNoise,
 };
 use crate::t5gemma::T5GemmaConditioner;
@@ -186,6 +186,106 @@ impl ComputeDTypes {
     }
 }
 
+/// A caller-supplied source clip for the audio→audio restyle path (sc-14547).
+///
+/// # `noise_level` is the sampler's orientation, deliberately not the contract's
+///
+/// This field is upstream's `init_noise_level`: `1.0` replaces the source with pure noise (i.e. the
+/// ordinary text-to-audio path) and `0.0` returns the prepared source without a single DiT forward.
+/// It is the **complement** of the backend-neutral
+/// [`gen_core::Conditioning::ReferenceAudio`](candle_audio::gen_core::Conditioning::ReferenceAudio)
+/// `strength`, which this workspace defines as *retention* — higher strength preserves more of the
+/// source. The one conversion lives in [`crate::model::reference_noise_level`] so the two
+/// same-named parameters can never meet unconverted; a flipped sign here produces a feature that
+/// runs, emits plausible audio, and does nothing the caller asked for.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ReferenceAudio<'a> {
+    /// Interleaved source PCM, `channels` values per frame.
+    pub samples: &'a [f32],
+    pub sample_rate: u32,
+    pub channels: u16,
+    /// Init **noise** level in `[0,1]` — see the type docs.
+    pub noise_level: f32,
+}
+
+/// Where the request-local stream's draws sat relative to the source encode (sc-14547).
+///
+/// Exposed for the draw-order gate. The invariant is `draws_after_initial_noise == 1`: the
+/// sampler's initial noise is drawn before the source is encoded, so a reference clip never
+/// perturbs the draw a text-only request at the same seed would have made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReferenceDrawOrder {
+    pub draws_after_initial_noise: usize,
+    pub draws_after_source_encode: usize,
+}
+
+/// Conform one caller clip onto this model's 44.1 kHz stereo timeline (sc-14547).
+///
+/// The order is fixed and each step depends on the previous one:
+///
+/// 1. **Resample the whole buffer** to [`SAMPLE_RATE`] through the shared
+///    [`candle_audio::dsp::resample`]. Off-rate source audio is converted, never rejected: the
+///    lane's other two audio generators emit 48 kHz, so rejecting would refuse audio produced one
+///    step earlier in the same product, and the 160:147 stereo ratio is already gated in
+///    `candle-audio`'s own resampler tests. (ACE-Step's "must be 48000 Hz" is a missing resampler,
+///    not a policy — that crate contains no DSP resampling of any kind.)
+/// 2. **Trim or right-zero-pad from offset 0** to exactly `target_frames`, which is the adapted
+///    sample size for the *requested* duration. Source extent never moves the geometry.
+/// 3. **Conform channels after padding**, so a mono source's duplicated pair and its silence agree:
+///    mono duplicates, stereo passes through, more than two channels keeps the first two.
+///
+/// Returns interleaved stereo of exactly `target_frames * CHANNELS` values.
+pub fn prepare_reference_pcm(
+    samples: &[f32],
+    sample_rate: u32,
+    channels: u16,
+    target_frames: usize,
+) -> Result<Vec<f32>> {
+    if channels == 0 {
+        return Err(AudioError::Msg(
+            "reference audio must declare at least one channel".into(),
+        ));
+    }
+    if sample_rate == 0 {
+        return Err(AudioError::Msg(
+            "reference audio must declare a non-zero sample rate".into(),
+        ));
+    }
+    if samples.is_empty() {
+        return Err(AudioError::Msg(
+            "reference audio must contain at least one frame".into(),
+        ));
+    }
+    let source_channels = channels as usize;
+    if !samples.len().is_multiple_of(source_channels) {
+        return Err(AudioError::Msg(format!(
+            "reference audio has {} samples, not a whole number of {source_channels}-channel frames",
+            samples.len()
+        )));
+    }
+    if let Some(value) = samples.iter().copied().find(|value| !value.is_finite()) {
+        return Err(AudioError::Msg(format!(
+            "reference audio contains the non-finite sample {value}"
+        )));
+    }
+    let resampled = candle_audio::dsp::resample(samples, sample_rate, SAMPLE_RATE, channels)?;
+    let available = (resampled.len() / source_channels).min(target_frames);
+    let mut conformed = vec![0.0f32; target_frames * source_channels];
+    conformed[..available * source_channels]
+        .copy_from_slice(&resampled[..available * source_channels]);
+    let mut output = vec![0.0f32; target_frames * CHANNELS];
+    for frame in 0..target_frames {
+        let source = &conformed[frame * source_channels..(frame + 1) * source_channels];
+        let (left, right) = match source_channels {
+            1 => (source[0], source[0]),
+            _ => (source[0], source[1]),
+        };
+        output[frame * CHANNELS] = left;
+        output[frame * CHANNELS + 1] = right;
+    }
+    Ok(output)
+}
+
 /// Runtime choices mapped from the backend-neutral generation request.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SynthesisParameters {
@@ -263,6 +363,66 @@ impl StableAudio3Pipeline {
         on_decoding: &mut dyn FnMut(),
         is_canceled: &dyn Fn() -> bool,
     ) -> Result<Vec<f32>> {
+        self.synthesize_with_reference(
+            prompt,
+            negative_prompt,
+            parameters,
+            None,
+            on_progress,
+            on_decoding,
+            is_canceled,
+        )
+    }
+
+    /// Synthesize, optionally starting from a caller-supplied source clip (sc-14547).
+    ///
+    /// With `reference` present the source is conformed by [`prepare_reference_pcm`], SAME-encoded
+    /// on the request's own stream, and mixed into the sampler's initial noise at
+    /// [`ReferenceAudio::noise_level`]. The `local` inpaint conditioning stays exactly zero on this
+    /// path: a whole-clip restyle supplies its source as `init_data` only, never as masked local
+    /// input, and the attention/padding mask still comes from the *requested* duration plus the
+    /// configured headroom rather than from the source's extent.
+    #[allow(clippy::too_many_arguments)]
+    pub fn synthesize_with_reference(
+        &self,
+        prompt: &str,
+        negative_prompt: Option<&str>,
+        parameters: SynthesisParameters,
+        reference: Option<ReferenceAudio<'_>>,
+        on_progress: &mut dyn FnMut(usize, usize),
+        on_decoding: &mut dyn FnMut(),
+        is_canceled: &dyn Fn() -> bool,
+    ) -> Result<Vec<f32>> {
+        Ok(self
+            .synthesize_with_reference_traced(
+                prompt,
+                negative_prompt,
+                parameters,
+                reference,
+                on_progress,
+                on_decoding,
+                is_canceled,
+            )?
+            .0)
+    }
+
+    /// [`Self::synthesize_with_reference`] plus the request stream's draw-order provenance.
+    ///
+    /// Exists so the draw-order requirement is *gated* rather than asserted in prose: the returned
+    /// [`ReferenceDrawOrder`] is the only observation that separates "initial noise first, then the
+    /// source encode" from the reverse.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn synthesize_with_reference_traced(
+        &self,
+        prompt: &str,
+        negative_prompt: Option<&str>,
+        parameters: SynthesisParameters,
+        reference: Option<ReferenceAudio<'_>>,
+        on_progress: &mut dyn FnMut(usize, usize),
+        on_decoding: &mut dyn FnMut(),
+        is_canceled: &dyn Fn() -> bool,
+    ) -> Result<(Vec<f32>, Option<ReferenceDrawOrder>)> {
         canceled(is_canceled)?;
         let geometry = self.geometry(parameters.duration_secs)?;
         let template = Tensor::zeros(
@@ -271,13 +431,40 @@ impl StableAudio3Pipeline {
             &self.device,
         )?;
         let mut noise = SeededNoise::new(parameters.seed);
+        // Frozen order, and the reason this is the first thing that happens: the sampler's initial
+        // noise is drawn *before* the source is encoded, so attaching a reference clip does not
+        // move the draw a text-only request at the same seed would have made.
         let initial = noise.standard_normal_like(&template)?;
+        let draws_after_initial_noise = noise.draws();
+        if draws_after_initial_noise != 1 {
+            return Err(AudioError::Msg(format!(
+                "initial sampler noise must be the request stream's first draw, saw \
+                 {draws_after_initial_noise}"
+            )));
+        }
+        let (init_latents, strength, order) = match reference {
+            Some(reference) => {
+                let latents =
+                    self.reference_latents(&reference, &geometry, &mut noise, is_canceled)?;
+                (
+                    Some(latents),
+                    reference.noise_level,
+                    Some(ReferenceDrawOrder {
+                        draws_after_initial_noise,
+                        draws_after_source_encode: noise.draws(),
+                    }),
+                )
+            }
+            None => (None, 1.0, None),
+        };
         let (sampled, padding) = self.sample(
             prompt,
             negative_prompt,
             parameters,
             &geometry,
             &initial,
+            init_latents.as_ref(),
+            strength,
             on_progress,
             &mut noise,
             is_canceled,
@@ -298,7 +485,46 @@ impl StableAudio3Pipeline {
             &mut noise,
             is_canceled,
         )?;
-        self.finish(decoded, &padding, parameters.duration_secs, is_canceled)
+        let audio = self.finish(decoded, &padding, parameters.duration_secs, is_canceled)?;
+        Ok((audio, order))
+    }
+
+    /// Conform and SAME-encode one source clip onto this request's own stream.
+    fn reference_latents(
+        &self,
+        reference: &ReferenceAudio<'_>,
+        geometry: &SampleGeometry,
+        noise: &mut SeededNoise,
+        is_canceled: &dyn Fn() -> bool,
+    ) -> Result<Tensor> {
+        canceled(is_canceled)?;
+        let prepared = prepare_reference_pcm(
+            reference.samples,
+            reference.sample_rate,
+            reference.channels,
+            geometry.sample_size,
+        )?;
+        let planar = interleaved_to_planar(&prepared, geometry.sample_size, &self.device)?
+            .to_dtype(self.dtypes.root)?;
+        let diffusion = match &self.config.model {
+            ModelConfig::Diffusion(model) => model,
+            ModelConfig::Autoencoder(_) => unreachable!("validated full snapshot"),
+        };
+        let latents = self.same.encode_audio_with_request_rng(
+            &planar,
+            SameChunkingPolicy::full_model_encode(diffusion.pretransform.chunked),
+            SameChunkingParameters::default(),
+            noise,
+            is_canceled,
+        )?;
+        if latents.dims() != [1, LATENT_CHANNELS, geometry.latent_length] {
+            return Err(AudioError::Msg(format!(
+                "SAME-encoded reference has shape {:?}, expected [1,{LATENT_CHANNELS},{}]",
+                latents.dims(),
+                geometry.latent_length
+            )));
+        }
+        Ok(latents)
     }
 
     /// Replay the complete frozen-upstream path with explicit stochastic inputs.
@@ -338,6 +564,8 @@ impl StableAudio3Pipeline {
             parameters,
             &geometry,
             &initial,
+            None,
+            1.0,
             on_progress,
             &mut noise,
             is_canceled,
@@ -426,6 +654,8 @@ impl StableAudio3Pipeline {
         parameters: SynthesisParameters,
         geometry: &SampleGeometry,
         initial: &Tensor,
+        init_latents: Option<&Tensor>,
+        strength: f32,
         on_progress: &mut dyn FnMut(usize, usize),
         noise: &mut N,
         is_canceled: &dyn Fn() -> bool,
@@ -443,6 +673,9 @@ impl StableAudio3Pipeline {
         canceled(is_canceled)?;
 
         let seconds = Tensor::new(&[parameters.duration_secs], &self.device)?;
+        // Exactly zero on every path, reference or not. A whole-clip restyle hands its source to the
+        // sampler as `init_data`; supplying it here as masked local input as well would be a
+        // different (inpaint) conditioning contract, which sc-14548 owns.
         let local = Tensor::zeros(
             (1, 1 + LATENT_CHANNELS, geometry.latent_length),
             self.dtypes.root,
@@ -457,9 +690,11 @@ impl StableAudio3Pipeline {
             ModelConfig::Diffusion(model) => model,
             ModelConfig::Autoencoder(_) => unreachable!("validated full snapshot"),
         };
+        // `strength` is the init noise level: `1.0` on the text-to-audio path, `1.0 - retention` on
+        // the reference path. The schedule's first sigma must equal it, which the sampler enforces.
         let schedule = build_schedule(
             parameters.steps,
-            1.0,
+            strength,
             &inference_shift(&diffusion.diffusion),
             geometry.effective_lengths.as_deref(),
             geometry.latent_length,
@@ -470,10 +705,12 @@ impl StableAudio3Pipeline {
             on_progress(step.index + 1, total);
             Ok(())
         };
-        let sampled = sample_dit_with_interval_and_cancel(
+        let sampled = sample_dit_initialized_with_interval_and_cancel(
             &self.dit,
             parameters.sampler,
             initial,
+            init_latents,
+            strength,
             &schedule,
             &positive.embeddings,
             negative.as_ref().map(|value| &value.embeddings),
@@ -651,6 +888,22 @@ fn apply_padding_mask(audio: &Tensor, padding: &Tensor, ratio: usize) -> Result<
         mask.pad_with_zeros(2, 0, samples - mask.dim(2)?)?
     };
     Ok(audio.broadcast_mul(&mask.to_dtype(audio.dtype())?)?)
+}
+
+/// Interleaved stereo PCM to the `[1, CHANNELS, frames]` channel-first tensor SAME encodes.
+fn interleaved_to_planar(samples: &[f32], frames: usize, device: &Device) -> Result<Tensor> {
+    if samples.len() != frames * CHANNELS {
+        return Err(AudioError::Msg(format!(
+            "prepared reference has {} samples, expected {}",
+            samples.len(),
+            frames * CHANNELS
+        )));
+    }
+    let mut planar = Vec::with_capacity(samples.len());
+    for channel in 0..CHANNELS {
+        planar.extend((0..frames).map(|frame| samples[frame * CHANNELS + channel]));
+    }
+    Ok(Tensor::from_vec(planar, (1, CHANNELS, frames), device)?)
 }
 
 fn planar_to_interleaved(audio: &Tensor) -> Result<Vec<f32>> {

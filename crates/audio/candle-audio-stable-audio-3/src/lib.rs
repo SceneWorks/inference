@@ -71,6 +71,21 @@
 //!
 //! Shared audio functionality stays in [`candle_audio`]. Consumers should use
 //! [`candle_audio::dsp::resample`] for sample-rate conversion rather than adding provider-local DSP.
+//!
+//! # Audio→audio restyle (sc-14547)
+//!
+//! All six ids advertise [`gen_core::ConditioningKind::ReferenceAudio`]: pass an existing recording
+//! plus a prompt and the source is conformed to the model's 44.1 kHz stereo timeline, SAME-encoded,
+//! and mixed into the sampler's initial noise instead of starting from pure noise. Off-rate source
+//! audio is **resampled**, not rejected — the rest of this lane emits 48 kHz.
+//!
+//! `Conditioning::ReferenceAudio.strength` is **retention**-oriented on this family, matching the
+//! workspace's mflux-derived img2img convention: `1.0` returns the prepared source without a DiT
+//! forward, `0.0` is pure generation, and an omitted value resolves to
+//! [`model::DEFAULT_REFERENCE_STRENGTH`]. The sampler's own `strength` is upstream's
+//! `init_noise_level` and runs the *other* way; the single conversion between the two lives in
+//! [`model::reference_noise_level`] and its sign is pinned by a mutation gate in
+//! `tests/reference_audio.rs`. See `docs/migration/SC_14547_REFERENCE_AUDIO_RESTYLE.md`.
 
 pub use candle_audio;
 pub use candle_audio::gen_core;
@@ -93,17 +108,22 @@ pub use model::{
     descriptor, descriptor_for, load, load_generator, load_medium_base_generator,
     load_medium_generator, load_music_base_generator, load_sfx_base_generator, load_sfx_generator,
     load_variant, medium_base_descriptor, medium_base_load, medium_descriptor, medium_load,
-    music_base_descriptor, music_base_load, sfx_base_descriptor, sfx_base_load, sfx_descriptor,
-    sfx_load, StableAudio3Generator, Variant, VariantShape, HUB_REPO, HUB_REVISION,
-    MAX_DURATION_SECS, MEDIUM_BASE_HUB_REPO, MEDIUM_BASE_HUB_REVISION, MEDIUM_BASE_MODEL_ID,
-    MEDIUM_BASE_REGISTRATION, MEDIUM_HUB_REPO, MEDIUM_HUB_REVISION, MEDIUM_MAX_DURATION_SECS,
-    MEDIUM_MODEL_ID, MEDIUM_REGISTRATION, MEDIUM_SHAPE, MODEL_ID, MUSIC_BASE_HUB_REPO,
-    MUSIC_BASE_HUB_REVISION, MUSIC_BASE_MODEL_ID, MUSIC_BASE_REGISTRATION, REGISTRATION,
-    SFX_BASE_HUB_REPO, SFX_BASE_HUB_REVISION, SFX_BASE_MODEL_ID, SFX_BASE_REGISTRATION,
-    SFX_HUB_REPO, SFX_HUB_REVISION, SFX_MODEL_ID, SFX_REGISTRATION, SMALL_BASE_MAX_SAMPLE_SIZE,
-    SMALL_BASE_SHAPE, SMALL_MAX_SAMPLE_SIZE, SMALL_SHAPE, WEIGHT_LICENSES,
+    music_base_descriptor, music_base_load, reference_noise_level, resolve_reference_audio,
+    sfx_base_descriptor, sfx_base_load, sfx_descriptor, sfx_load, ResolvedReference,
+    StableAudio3Generator, Variant, VariantShape, DEFAULT_REFERENCE_STRENGTH, HUB_REPO,
+    HUB_REVISION, MAX_DURATION_SECS, MEDIUM_BASE_HUB_REPO, MEDIUM_BASE_HUB_REVISION,
+    MEDIUM_BASE_MODEL_ID, MEDIUM_BASE_REGISTRATION, MEDIUM_HUB_REPO, MEDIUM_HUB_REVISION,
+    MEDIUM_MAX_DURATION_SECS, MEDIUM_MODEL_ID, MEDIUM_REGISTRATION, MEDIUM_SHAPE, MODEL_ID,
+    MUSIC_BASE_HUB_REPO, MUSIC_BASE_HUB_REVISION, MUSIC_BASE_MODEL_ID, MUSIC_BASE_REGISTRATION,
+    REFERENCE_STRENGTH_RANGE, REGISTRATION, SFX_BASE_HUB_REPO, SFX_BASE_HUB_REVISION,
+    SFX_BASE_MODEL_ID, SFX_BASE_REGISTRATION, SFX_HUB_REPO, SFX_HUB_REVISION, SFX_MODEL_ID,
+    SFX_REGISTRATION, SMALL_BASE_MAX_SAMPLE_SIZE, SMALL_BASE_SHAPE, SMALL_MAX_SAMPLE_SIZE,
+    SMALL_SHAPE, WEIGHT_LICENSES,
 };
-pub use pipeline::{ComputeDTypes, StableAudio3Pipeline, VariantGeometry};
+pub use pipeline::{
+    prepare_reference_pcm, ComputeDTypes, ReferenceAudio, ReferenceDrawOrder, StableAudio3Pipeline,
+    VariantGeometry,
+};
 
 /// Add every registered Stable Audio 3 generator to an explicit audio registry builder.
 ///
