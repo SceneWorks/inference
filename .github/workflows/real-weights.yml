@@ -272,6 +272,52 @@ jobs:
             ${{ runner.temp }}/mage-flow-oracles/mage_candle_transfer_manifest.json
           if-no-files-found: error
 
+  # sc-8446 (epic 8431) — the FIRST real-weight video lane. Kept a separate job from `mlx-media`
+  # because that one is entirely Mage-Flow oracle machinery (a pinned reference Python, a
+  # multi-GB golden cache, an operator seed dir) that a video smoke needs none of, and because a 20 GB
+  # tier fetch should be able to fail without taking the image lane's oracle work with it.
+  mlx-krea-realtime:
+    name: MLX Krea Realtime video real weights
+    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'media'
+    runs-on: [self-hosted, macOS, ARM64, real-weights]
+    env:
+      # The repo root of the pinned `SceneWorks/krea-realtime-14b-mlx` rehost. Each tier subdir is a
+      # complete snapshot, so the tests are pointed one level in (`/q4`).
+      KREA_REALTIME_SNAPSHOT: ${{ vars.KREA_REALTIME_SNAPSHOT }}
+      KREA_STYLE_LORA_SNAPSHOT: ${{ vars.KREA_STYLE_LORA_SNAPSHOT }}
+      # A bounded geometry: the reference 832x480 bucket at ~1.4 s of video. Enough latent frames
+      # (9 → 3 autoregressive chunks) for the bounded-window eviction and the tail drift/freeze gates to
+      # be meaningful, without spending the runner's day on a full 81-frame clip.
+      KREA_SMOKE_W: "832"
+      KREA_SMOKE_H: "480"
+      KREA_SMOKE_FRAMES: "33"
+      KREA_LORA_FRAMES: "13"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Toolchain versions
+        run: rustc --version && cargo --version
+      - name: Materialize and verify immutable snapshots
+        run: |
+          python3 -m pip install --disable-pip-version-check --target "$RUNNER_TEMP/huggingface-hub" "huggingface_hub==1.20.1"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model krea-realtime-14b-mlx --snapshot "$KREA_REALTIME_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model wan-origami-style-lora --snapshot "$KREA_STYLE_LORA_SNAPSHOT"
+      # Coherence + per-chunk/whole-clip timing + the MLX memory ceiling, then the measured KV-cache
+      # residency (bf16 activations on every weight tier — the term that sizes `mlx.minMemoryGb`), then
+      # the i2v single-frame anchor and the v2v strength=0 paths.
+      - name: Run Krea Realtime real-weight e2e (Q4 tier)
+        run: >-
+          KREA_REALTIME_SNAPSHOT_DIR="$KREA_REALTIME_SNAPSHOT/q4"
+          cargo test --locked --release -p mlx-gen-krea-realtime --test generate_smoke
+          -- --ignored --nocapture
+      # A published Wan style LoRA must load through `LoadSpec::adapters` and measurably change the
+      # render, with the scale-0 arm as the attribution control.
+      - name: Run Krea Realtime real Wan style-LoRA A/B
+        run: >-
+          KREA_REALTIME_SNAPSHOT_DIR="$KREA_REALTIME_SNAPSHOT/q4"
+          KREA_STYLE_LORA="$KREA_STYLE_LORA_SNAPSHOT/origami_000000500.safetensors"
+          cargo test --locked --release -p mlx-gen-krea-realtime --test style_lora_real_weights
+          real_wan_style_lora_loads_and_changes_the_render -- --ignored --nocapture
+
   candle-audio:
     name: Candle audio real weights
     if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio'

@@ -134,8 +134,12 @@ fn resolve_request_config(
 /// A memory-bounded temporal-only VAE-decode tiling for a latent of `[z, T_lat, lat_h, lat_w]` at
 /// output size `(out_h, out_w)`, or `None` when the clip is small enough to decode in one pass. Mirrors
 /// the scail2 z16 budget: window size shrinks as the resolution grows so the decode peak stays bounded,
-/// and each window is capped by the z16 **write** safety bound ([`VaeTiling::WAN::writable_frame_cap`]).
-fn decode_tiling(out_h: usize, out_w: usize, out_frames: i32) -> Option<TilingConfig> {
+/// and each window is capped by the z16 **write** safety bound (`VaeTiling::WAN`'s `writable_frame_cap`).
+///
+/// Public so a validation harness can decode a latent through the **same** windowing the product path
+/// uses (sc-8446, S13): a control that decodes single-pass is not comparable to a tiled product decode,
+/// and hard-coding the window in a test would silently drift from this policy.
+pub fn decode_tiling(out_h: usize, out_w: usize, out_frames: i32) -> Option<TilingConfig> {
     let px_per_frame = (out_h as i64) * (out_w as i64);
     let budget_frames = DECODE_TILE_BUDGET_PXFRAMES / px_per_frame.max(1);
     let write_cap = VaeTiling::WAN.writable_frame_cap(out_h as i32, out_w as i32);

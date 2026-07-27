@@ -122,7 +122,7 @@ mod conditioning_budget_tests {
 pub use text_encoder::encode_text_staged_for_tier;
 pub use text_encoder::{clean_text, load_tokenizer, umt5_tokenizer_config, Umt5Encoder};
 pub use training::{load_trainer, WanMoeTrainer};
-pub use transformer::WanTransformer;
+pub use transformer::{WanTransformer, WAN_GLOBAL_ADAPTABLE_PATHS};
 pub use vace::{
     binarize_mask, build_vace_control, denoise_vace_moe, prepare_masks, prepare_video_latents,
     WanVaceTransformer,
