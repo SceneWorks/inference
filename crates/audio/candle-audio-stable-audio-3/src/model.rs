@@ -43,9 +43,9 @@ use sha2::{Digest, Sha256};
 use crate::config::DiffusionObjective;
 use crate::dit::Guidance;
 use crate::pipeline::{
-    conditioning_is_forwarded, AudioEdit, ReferenceAudio, StableAudio3Pipeline,
-    SynthesisParameters, VariantGeometry, BASE_DEFAULT_GUIDANCE, BASE_DEFAULT_STEPS, CHANNELS,
-    DEFAULT_GUIDANCE, DEFAULT_STEPS, SAMPLE_RATE,
+    AudioEdit, ForwardedConditioning, ReferenceAudio, StableAudio3Pipeline, SynthesisParameters,
+    VariantGeometry, BASE_DEFAULT_GUIDANCE, BASE_DEFAULT_STEPS, CHANNELS, DEFAULT_GUIDANCE,
+    DEFAULT_STEPS, SAMPLE_RATE,
 };
 use crate::sampler::SamplerKind;
 use crate::weights::SnapshotLayout;
@@ -2013,31 +2013,31 @@ impl Generator for StableAudio3Generator {
         // retention → `init_noise_level` conversion (sc-14547), `audio_edit_for` carries the one
         // mode + region → `[start, end)` resolution (sc-14548). The combination is refused in
         // `validate` above, so at most one of these is `Some`.
-        let reference = reference_audio_for(request);
-        let edit = audio_edit_for(request);
-        // Both forwards below are one token wide, and substituting either for `None` is a silent,
-        // complete feature deletion that no weight-free lane can see, because this method needs
-        // weights. So they are re-derived from the request and compared before the call. There is
-        // deliberately no `match` selecting a synthesis method: `synthesize_conditioned` takes both
-        // and decides internally, so there is no arm for an edit to be routed into.
-        conditioning_is_forwarded(
-            request
+        // Each `..._for(request)` below is one token wide, and substituting either for `None` is a
+        // silent, complete feature deletion that no weight-free lane can see, because this method
+        // needs weights. So the resolved values travel bundled with the request facts they were
+        // resolved from, and `synthesize_conditioned` re-checks the pair on the far side of the
+        // boundary — an earlier revision checked them here and left the call's own argument list
+        // unguarded, which is the same shape one seam further along. There is deliberately no
+        // `match` selecting a synthesis method: that one entry point takes the whole receipt and
+        // decides internally, so there is no arm for an edit to be routed into.
+        let conditioning = ForwardedConditioning {
+            request_has_reference: request
                 .conditioning
                 .iter()
                 .any(|item| matches!(item, Conditioning::ReferenceAudio { .. })),
-            reference.is_some(),
-            request
+            request_has_edit: request
                 .conditioning
                 .iter()
                 .any(|item| matches!(item, Conditioning::AudioEdit { .. })),
-            edit.is_some(),
-        )?;
+            reference: reference_audio_for(request),
+            edit: audio_edit_for(request),
+        };
         let samples = pipeline.synthesize_conditioned(
             &request.prompt,
             request.negative_prompt.as_deref(),
             parameters,
-            reference,
-            edit,
+            conditioning,
             &mut step_progress,
             &mut decoding,
             &|| cancel.is_cancelled(),

@@ -325,6 +325,54 @@ pub fn conditioning_is_forwarded(
     Ok(())
 }
 
+/// A resolved conditioning pair carried together with the request facts it was resolved *from*
+/// (sc-14548).
+///
+/// # Why this is a struct rather than two arguments
+///
+/// [`conditioning_is_forwarded`] pins the values where they are **computed**, inside
+/// `StableAudio3Generator::generate`. That leaves the argument list of the call one line below it
+/// unchecked: writing `None` in place of the resolved `edit` at the call site satisfies the guard,
+/// because the guard read the local, not the argument. That is the identical shape to the finding it
+/// was written for, one seam further along.
+///
+/// Bundling the resolved values with the request booleans removes the second seam instead of
+/// documenting it. There is no longer a separate `edit` argument to null out, and
+/// [`Self::check`] runs inside [`StableAudio3Pipeline::synthesize_conditioned`] — the far side of the
+/// boundary — so nulling a *field* is refused there. The residual single-token edit is changing
+/// both a field and its matching boolean, which is two tokens.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ForwardedConditioning<'a> {
+    /// Whether the request carried a `Conditioning::ReferenceAudio` item.
+    pub request_has_reference: bool,
+    /// Whether the request carried a `Conditioning::AudioEdit` item.
+    pub request_has_edit: bool,
+    pub reference: Option<ReferenceAudio<'a>>,
+    pub edit: Option<AudioEdit<'a>>,
+}
+
+impl ForwardedConditioning<'_> {
+    /// Nothing requested, nothing forwarded.
+    pub fn none() -> Self {
+        Self {
+            request_has_reference: false,
+            request_has_edit: false,
+            reference: None,
+            edit: None,
+        }
+    }
+
+    /// Apply [`conditioning_is_forwarded`] to this receipt.
+    pub fn check(&self) -> Result<()> {
+        conditioning_is_forwarded(
+            self.request_has_reference,
+            self.reference.is_some(),
+            self.request_has_edit,
+            self.edit.is_some(),
+        )
+    }
+}
+
 /// Where the request-local stream's draws sat relative to the source encode (sc-14547).
 ///
 /// Exposed for the draw-order gate. The invariant is `draws_after_initial_noise == 1`: the
@@ -665,6 +713,141 @@ pub fn edit_local_conditioning(
     Ok(Tensor::cat(&[&latent_mask, &masked_input], 1)?)
 }
 
+/// Whether a tensor holds any non-zero element, as an `f32` reduction on the tensor's own device.
+fn tensor_has_nonzero(tensor: &Tensor) -> Result<bool> {
+    let total = tensor
+        .to_dtype(DType::F32)?
+        .abs()?
+        .sum_all()?
+        .to_scalar::<f32>()?;
+    Ok(total > 0.0)
+}
+
+/// How many latent positions the edit's keep mask actually retains (sc-14548).
+///
+/// Derived from the resolved indices alone — no tensor, no mask buffer, no encoder — so it is a
+/// **second, independent** expression of what [`edit_local_conditioning`] builds. That is the point:
+/// it is the expectation half of [`edit_local_conditioning_is_present`], and an expectation computed
+/// by re-running the thing it is checking would move with the mutation instead of catching it.
+///
+/// The rule it reproduces is [`edit_keep_mask`] seen *after*
+/// [`candle_audio::ops::nearest_downsample1d`], which samples `src[t * 4096]`. Latent `t` survives
+/// exactly when that audio frame is retained, i.e. when `t * 4096 < effective_samples` and
+/// `t * 4096` is outside `[start_sample, end_sample)` — which is `[start_latent, end_latent)` in
+/// latent units.
+///
+/// Zero is a legitimate result, not a bug: an edit whose region covers the whole effective span
+/// hands the DiT an all-zero local conditioning on purpose (regenerate everything). Naming that is
+/// what keeps the guard below from having to pretend zero is impossible.
+pub fn edit_retained_latent_count(geometry: &EditGeometry) -> usize {
+    let effective_latents = geometry
+        .effective_samples
+        .div_ceil(LATENT_DOWNSAMPLING)
+        .min(geometry.latent_length);
+    let zeroed_start = geometry.start_latent.min(effective_latents);
+    let zeroed_end = geometry.end_latent.min(effective_latents);
+    effective_latents - (zeroed_end - zeroed_start)
+}
+
+/// The edit's local conditioning must still be there when it crosses into the DiT (sc-14548).
+///
+/// # What this exists to stop, stated exactly
+///
+/// `local = edit_local_conditioning(...)` → `let _ = edit_local_conditioning(...)` inside
+/// `StableAudio3Pipeline::synthesize_traced` is one token wide, and it leaves `local` as the zero
+/// tensor the text-only path allocates. Every inpaint, repaint and extend then runs as **plain
+/// text-to-audio inside the region**, and none of the obvious acceptance measurements can see it:
+/// the outside is still bit-exact (that span is written by [`stitch_outside_region`] from the
+/// prepared source, which does not read `local` at all), the region still changes, two seeds still
+/// diverge — in fact an *unconditioned* interior diverges **more** on both counts, so a divergence
+/// floor is wrong-signed against this mutation and tightening it makes matters worse.
+///
+/// So the check is placed at the boundary the value **crosses** rather than where it is computed.
+/// [`conditioning_is_forwarded`] is the same shape one seam earlier and pinned at the computation
+/// site; this is the one that observes the handoff itself. Like that one, this call site needs
+/// weights, so the weight-free lane gates the **rule** and the real-weight lane is where a zeroed
+/// handoff actually fails closed — immediately, before any sampling, rather than after a plausible
+/// render.
+///
+/// # What it does and does not discriminate
+///
+/// * `expected` is [`edit_retained_latent_count`]` > 0`, computed from the resolved geometry;
+///   `observed` is whether the tensor handed to `sample` has any non-zero element. A zeroed handoff
+///   on any ordinary edit is refused here.
+/// * It is an **existence** check, not an equality one. A mutation that scales `local`, or builds it
+///   from the wrong source latents, keeps `observed` true and passes; those are covered by
+///   `the_local_conditioning_is_mask_first_then_the_masked_source` at the construction site and by
+///   the real-weight source-sensitivity assertion.
+/// * On the one geometry where the region covers the entire effective span, `expected` is `false`
+///   and an all-zero `local` is correct, so the zeroing mutation is invisible **there**. No shipped
+///   case uses such a region; the real-weight cases all edit an interior window.
+pub fn edit_local_conditioning_is_present(expected: bool, observed: bool) -> Result<()> {
+    if expected != observed {
+        return Err(AudioError::Msg(format!(
+            "an audio edit whose keep mask retains source latents ({expected}) must reach the DiT \
+             as non-zero local conditioning, saw {observed}"
+        )));
+    }
+    Ok(())
+}
+
+/// The resolved edit geometry must describe the geometry the request is actually sampled at
+/// (sc-14548).
+///
+/// [`edit_geometry`] takes `duration_secs` as a *separate* argument from the [`SampleGeometry`] it
+/// is resolved against, because the two are independent inputs — the output duration for an extend
+/// is not the source's. That separation is also the hazard: the `duration_secs` argument at the
+/// call site inside `StableAudio3Pipeline::synthesize_traced` is one token wide and it sets
+/// `effective_samples`, the training-parity padding boundary that [`edit_keep_mask`] zeroes from.
+/// Getting it wrong moves where the local conditioner stops describing the source, and every
+/// length, rate and preservation assertion still passes.
+///
+/// So the resolved values are compared against the sampling geometry, which was built from the same
+/// duration through [`crate::sampler::adapt_sample_size`] — a genuinely different derivation
+/// (`ceil` to a 4096 multiple, in latent units) rather than a copy of this one (`trunc`, in audio
+/// samples).
+///
+/// **Granularity, stated rather than implied**: `effective_lengths` is in latent units, so this
+/// compares `ceil(effective_samples / 4096)`. A wrong duration that lands inside the same
+/// 4096-sample latent frame — under 93 ms — moves `effective_samples` without moving this
+/// comparison. The alignment examples in `tests/audio_edit.rs` are what pin the sample-resolution
+/// value itself.
+pub fn edit_geometry_matches_request(
+    resolved: &EditGeometry,
+    geometry: &SampleGeometry,
+) -> Result<()> {
+    if resolved.adapted_size != geometry.sample_size
+        || resolved.latent_length != geometry.latent_length
+    {
+        return Err(AudioError::Msg(format!(
+            "resolved edit geometry spans {}/{} samples/latents, but the request is sampled at \
+             {}/{}",
+            resolved.adapted_size,
+            resolved.latent_length,
+            geometry.sample_size,
+            geometry.latent_length
+        )));
+    }
+    if let Some(effective_lengths) = geometry.effective_lengths.as_ref() {
+        let expected = effective_lengths
+            .first()
+            .copied()
+            .unwrap_or(geometry.latent_length)
+            .min(geometry.latent_length);
+        let actual = resolved
+            .effective_samples
+            .div_ceil(LATENT_DOWNSAMPLING)
+            .min(geometry.latent_length);
+        if actual != expected {
+            return Err(AudioError::Msg(format!(
+                "the edit's effective span covers {actual} latents, but the request's own duration \
+                 covers {expected}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Put the canonical prepared source back outside the edit window, bit-exactly (sc-14548).
 ///
 /// Frozen upstream regenerates and decodes the *whole* clip; it never pastes anything back. This
@@ -879,18 +1062,24 @@ impl StableAudio3Pipeline {
     /// convenience wrapper for the same reason: it would reintroduce the choice.
     ///
     /// Supplying both is refused rather than resolved by precedence.
+    ///
+    /// The conditioning arrives as a [`ForwardedConditioning`] receipt rather than as two optional
+    /// arguments, and is re-checked here, on the far side of the boundary — see that type.
     #[allow(clippy::too_many_arguments)]
     pub fn synthesize_conditioned(
         &self,
         prompt: &str,
         negative_prompt: Option<&str>,
         parameters: SynthesisParameters,
-        reference: Option<ReferenceAudio<'_>>,
-        edit: Option<AudioEdit<'_>>,
+        conditioning: ForwardedConditioning<'_>,
         on_progress: &mut dyn FnMut(usize, usize),
         on_decoding: &mut dyn FnMut(),
         is_canceled: &dyn Fn() -> bool,
     ) -> Result<Vec<f32>> {
+        conditioning.check()?;
+        let ForwardedConditioning {
+            reference, edit, ..
+        } = conditioning;
         Ok(self
             .synthesize_traced(
                 prompt,
@@ -1019,11 +1208,25 @@ impl StableAudio3Pipeline {
                 draws_after_source_encode: noise.draws(),
             });
             let resolved = edit_geometry(&edit, &geometry, parameters.duration_secs)?;
+            // The `duration_secs` argument one line up is weights-only and sets the padding
+            // boundary; this compares the result against the sampling geometry's own,
+            // independently-derived effective span. See `edit_geometry_matches_request`.
+            edit_geometry_matches_request(&resolved, &geometry)?;
             local = edit_local_conditioning(&resolved, &latents, &self.device, self.dtypes.root)?;
             // `init_latents` stays `None`: an edit starts from pure seeded noise. The source
             // reaches the model through the local conditioner only.
             edit_state = Some((prepared, resolved));
         }
+        // The handoff itself, checked where it *crosses* rather than where it was computed: with
+        // `local` left as the zeros allocated above, every edit degrades to unconditioned
+        // text-to-audio inside the region and every divergence measurement gets *better*. See
+        // `edit_local_conditioning_is_present`.
+        edit_local_conditioning_is_present(
+            edit_state
+                .as_ref()
+                .is_some_and(|(_, resolved)| edit_retained_latent_count(resolved) > 0),
+            tensor_has_nonzero(&local)?,
+        )?;
         let (sampled, padding) = self.sample(
             prompt,
             negative_prompt,

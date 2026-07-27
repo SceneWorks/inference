@@ -153,28 +153,70 @@ Applied to the shipped code, suite re-run, reverted.
 | `strength` accepted and ignored | **RED** | `audio_edit_validation_rejects_every_malformed_request_on_every_variant` |
 | second `AudioEdit` silently dropped | **RED** | `audio_edit_validation_rejects_every_malformed_request_on_every_variant` |
 | `nearest_downsample1d` keeps the last of each block | **RED** | `ops::tests::downsample_keeps_the_first_frame_of_each_block`, `..._maps_a_zeroed_span_to_the_ceiling_span` |
+| `edit_local_conditioning_is_present` stops rejecting the disagreement | **RED** | `the_local_conditioning_handoff_must_still_be_present_where_it_crosses_into_the_dit` |
+| `edit_retained_latent_count` ignores the padding boundary | **RED** | same case — the retained count stops agreeing with the tensor `edit_local_conditioning` builds |
+| `edit_geometry_matches_request` drops the effective-span comparison | **RED** | `the_resolved_edit_geometry_must_match_the_geometry_the_request_is_sampled_at` |
 
-### What a single-token edit can still do
+### Every weights-only call site on the edit path, mutated and run
 
-Named rather than claimed closed — the sc-14547 review history is that "closed" is what let the next
-hole survive.
+The whole edit path outside the weight-free helpers is two places: the `edit` arm of
+`StableAudio3Pipeline::synthesize_traced` (plus its tail) and the conditioning receipt built in
+`StableAudio3Generator::generate`. **Every** argument and binding in those was mutated one token at a
+time, the mutated tree rebuilt `--release`, and the relevant real-weight case run against the six
+pinned snapshots on Metal. The right-hand column is what the run *did*, quoted from its output — not
+what reading the code suggests. Round-2 review found a row in the previous version of this table that
+was reasoned rather than run and was wrong.
 
-| edit | weight-free lane | what catches it |
-|---|---|---|
-| the stitch invocation in `synthesize_traced` → `audio` (skip the stitch) | **green** | `real_inpaint_preserves_the_outside_exactly_and_changes_the_inside`, `real_extend_keeps_the_source_prefix_and_bridges_the_seam` |
-| `audio_edit_for(request)` → `None` at the forward in `generate` | **green** | fails **closed** at runtime via `pipeline::conditioning_is_forwarded`; any real render, i.e. every real-weight case |
-| `reference_audio_for(request)` → `None` at the same forward | **green** | same guard, same lane |
-| the local-tensor handoff into `sample` replaced with zeros | **green** | the real-weight inpaint/extend cases (the region would stop being conditioned on the source) |
+None of these are reachable by the weight-free lane, and that is the standing property of this path
+rather than a gap this table closes: `generate` and `synthesize_traced` both need multi-gigabyte
+weights. What the table records is which case fails, and how fast.
 
-Two structural choices shrank that list rather than documenting it larger:
+| # | site → mutation | result | what the run reported |
+|---|---|---|---|
+| 1 | `prepare_and_encode(..., edit.sample_rate, ...)` → `SAMPLE_RATE` | **RED** | `real_inpaint…`: "frame 0 channel 0 is outside [2s, 4s) and must be the prepared source exactly" |
+| 2 | `prepare_and_encode(..., edit.channels, ...)` → `1` | **GREEN** | see below — the inpaint fixture's source is **mono**, so this is a no-op there |
+| 3 | `edit_geometry(&edit, &geometry, parameters.duration_secs)` → `edit.end_secs` | **RED** | `real_inpaint…`: "the edit's effective span covers 44 latents, but the request's own duration covers 65" (`edit_geometry_matches_request`, new) |
+| 4 | `local = edit_local_conditioning(…)` → `let _ = …` | **RED**, 15 s | `real_inpaint…`: "an audio edit whose keep mask retains source latents (true) must reach the DiT as non-zero local conditioning, saw false" (`edit_local_conditioning_is_present`, new) |
+| 5 | `edit_local_conditioning(&resolved, &latents, …)` → `&latents.ones_like()?` | **RED** | `real_inpaint…`: "two inpaints differing only in their source rendered the *identical* interior, which is what an unconditioned region looks like" |
+| 6 | `edit_state = Some((prepared, resolved))` → `None` | **RED** | `real_inpaint…`: the same presence guard, in the *other* direction — "retains source latents (false) … saw true" |
+| 7 | `stitch_outside_region(&audio, prepared, resolved)` → `audio` | **RED** | `real_inpaint…`: "frame 0 channel 0 is outside [2s, 4s) and must be the prepared source exactly" |
+| 8 | `&local` argument to `self.sample(…)` → `&local.zeros_like()?` (*after* the presence guard) | **RED** | `real_inpaint…`: the source-sensitivity byte-inequality |
+| 9 | `init_latents` left `None` on the edit path → `Some(latents.clone())` | **RED** | `real_inpaint…`: "reference-audio init latents and the reference itself must be supplied together, saw init_latents=true reference=false" — sc-14547's `reference_halves_agree`, catching an sc-14548 mutation |
+| 10 | `order = Some(ReferenceDrawOrder {…})` in the edit arm → `None` | **RED** | `real_edit_initial_sampler_noise_precedes_the_source_encode`: "an edit render reports its draw order" |
+| 11 | receipt field `edit: audio_edit_for(request)` → `None` | **RED** | `real_inpaint…`: "a request carrying an audio edit (true) must forward it to the pipeline, saw false" |
+| 12 | receipt field `request_has_edit: …any(…)` → `false` | **RED** | `real_inpaint…`: "a request carrying an audio edit (false) must forward it to the pipeline, saw true" |
+
+Rows 11 and 12 are new coverage, not a restatement. Round-1 checked the forward where the values were
+**computed** and left the call's own argument list unguarded — writing `None` in the argument slot
+satisfied that guard, because the guard read the local. The resolved values now travel as a
+`pipeline::ForwardedConditioning` receipt carrying the request booleans with them, re-checked inside
+`synthesize_conditioned`, so there is no separate argument to null and nulling a field is refused.
+
+**Row 2 is a real hole in the fixture, not in the code, and it is left open deliberately.** The
+inpaint case's source is a 48 kHz **mono** clip, so hard-coding `1` for `edit.channels` changes
+nothing there and the case ran to completion green on all six ids. `real_repaint_…` and
+`real_extend_…` both use stereo sources and would see it; a fixture-level fix (making the inpaint
+source stereo) would move the row rather than close the class, since the mutation would then be
+invisible on a mono request instead. Stated here rather than silently omitted.
+
+**Row 9** was expected to be the weak one and is not. The edit path deliberately leaves
+`init_latents` at `None` — an edit starts from pure seeded noise and the source reaches the model
+only through the local conditioner; supplying the encoded source as `init_data` as well is the
+restyle contract, and it would change the render without changing its length, rate, finiteness,
+bit-exact outside, or any of the three interior divergences in a *signed* way. What refuses it is
+`pipeline::reference_halves_agree`, shipped by **sc-14547** for a different failure entirely (an
+encoded source travelling without the reference that produced it). It is recorded here because a gate
+catching a mutation it was not written for is the thing that stops being true silently.
+
+Two structural choices keep that list this short rather than longer:
 
 * `edit_local_conditioning` takes the encoded source as a plain **tensor** instead of encoding it, so
   the whole mask → resize → multiply → concat chain is drivable with synthetic latents and no weights.
   Inside the SAME-encoding method it would have been real-weight-only, which is exactly how
   sc-14547's three sign inversions each stayed green;
 * there is **no `match`** selecting a synthesis method in `generate`. `synthesize_conditioned` takes
-  both optional conditionings and decides internally, so "route the edit into the wrong arm" is not a
-  reachable edit.
+  the whole receipt and decides internally, so "route the edit into the wrong arm" is not a reachable
+  edit.
 
 ## Real-weight results — all six, Metal, `--release`
 
@@ -183,14 +225,18 @@ Two structural choices shrank that list rather than documenting it larger:
 Outside the region: **bit-exact** against `prepare_reference_pcm`'s own output, on every id, at
 **both** seeds. Interior source energy `0.124632` on every row (the same prepared buffer).
 
-| id | source divergence | seed divergence |
-|---|---|---|
-| `stable_audio_3_small_music` | 0.049032 | 0.060890 |
-| `stable_audio_3_small_sfx` | 0.040207 | 0.034959 |
-| `stable_audio_3_medium` | 0.023271 | 0.018139 |
-| `stable_audio_3_small_music_base` | 0.060283 | 0.043349 |
-| `stable_audio_3_small_sfx_base` | 0.072864 | 0.069078 |
-| `stable_audio_3_medium_base` | 0.022106 | 0.018048 |
+| id | source divergence | seed divergence | conditioning divergence |
+|---|---|---|---|
+| `stable_audio_3_small_music` | 0.049025 | 0.060849 | 0.164266 |
+| `stable_audio_3_small_sfx` | 0.040199 | 0.034961 | 0.181044 |
+| `stable_audio_3_medium` | 0.023272 | 0.018142 | 0.165492 |
+| `stable_audio_3_small_music_base` | 0.060284 | 0.043346 | 0.166105 |
+| `stable_audio_3_small_sfx_base` | 0.072861 | 0.068967 | 0.225991 |
+| `stable_audio_3_medium_base` | 0.022110 | 0.018060 | 0.178970 |
+
+The first two columns are re-measured on the current tree and move in the sixth decimal against the
+round-1 numbers (`0.049032` → `0.049025`, and so on) — Metal reduction order, not a behaviour change.
+The third column is new; see below.
 
 **The first calibration was wrong and is recorded rather than rewritten.** The case originally
 asserted a single measurement — `source_divergence > 0.25 * source_energy` — against a number picked
@@ -213,24 +259,82 @@ Two things changed as a result, not one:
   checkpoint no longer hides the other five's numbers, which is what made the first floor hard to
   calibrate in the first place.
 
+### The two floors above are **wrong-signed** against a dropped conditioning handoff
+
+Round-2 review finding, and the reason there is now a third measurement. `local =
+edit_local_conditioning(...)` → `let _ = edit_local_conditioning(...)` inside `synthesize_traced` is
+one token, and it leaves the DiT's local conditioner as the zero tensor the text-only path
+allocates: every inpaint, repaint and extend interior silently becomes plain text-to-audio. Nothing
+above could see it, and not by a narrow margin:
+
+* the bit-exact outside is written by `stitch_outside_region` from `prepared`, which never reads
+  `local`;
+* `source_divergence` and `seed_divergence` both get **larger** when the interior is unconditioned —
+  an unconditioned region wanders further from the source and further between seeds — so tightening
+  either floor makes the mutation *easier* to pass, not harder;
+* `real_repaint_is_byte_identical_to_inpaint` compares two renders that would both be unconditioned,
+  so they stay byte-identical;
+* `real_extend_...` asserts a non-silent tail, and text-to-audio is non-silent.
+
+So a third measurement was added: **`conditioning_divergence`**, the same region rendered from a
+*different source clip* at the identical seed, prompt, region, duration and geometry. If the source
+never reaches the DiT the two renders are bit-identical, so the assertion beside the floor is a
+byte-inequality — correctly signed, and unfalsifiable-proof in the direction that matters, since the
+mutation drives the quantity to exactly zero rather than to something merely small.
+
+| id | conditioning divergence | × source energy |
+|---|---|---|
+| `stable_audio_3_small_music` | 0.164266 | 1.318 |
+| `stable_audio_3_small_sfx` | 0.181044 | 1.453 |
+| `stable_audio_3_medium` | 0.165492 | 1.328 |
+| `stable_audio_3_small_music_base` | 0.166105 | 1.333 |
+| `stable_audio_3_small_sfx_base` | 0.225991 | 1.813 |
+| `stable_audio_3_medium_base` | 0.178970 | 1.436 |
+
+The graded floor is `0.70 * source_energy`, `1.88x` below the tightest measured row — the same
+relative distance the other two floors take from their own low mode, and set after the measurement,
+not before it.
+
+The weight-free half of the same seam is `pipeline::edit_local_conditioning_is_present`, evaluated
+in `synthesize_traced` immediately before `sample`. Its call site needs weights, exactly like
+`conditioning_is_forwarded`'s, so what the PR lane gates is the **rule** (all four boolean
+combinations, plus the agreement between `edit_retained_latent_count` and the tensor
+`edit_local_conditioning` actually builds); what the real-weight lane gets is a zeroed handoff that
+is refused before any sampling happens instead of rendering plausible audio.
+
 ### Extend, 10 s → 18 s, 4 steps
 
 Prefix: **exactly** the 441,000-frame prepared source on every id. Output exactly 793,800 frames.
-The seam bound is the material's own 99.9th-percentile frame-to-frame step over the second before
-the seam (`0.163181`), so it is measured rather than chosen.
+
+The seam predicate, stated in full rather than as "it is measured": **`seam <= typical`**, where
+`typical` is this fixture's own 99.9th-percentile frame-to-frame step over the second before the
+seam, `0.163181`. The *yardstick* is measured from the material; the multiplier is `1.0` and that is
+a choice. It is the choice it is because a join no sharper than the sharpest transition the source
+itself makes is not audible as an edit, while one sharper than that is — the click an extend produces
+when the tail is generated without reference to the prefix, or when the stitch boundary slips a
+frame. `typical` is separately asserted to be above `0.02`, so a future fixture with a nearly flat
+waveform fails loudly here instead of silently tightening the bound into a flake.
+
+**The shipped round-1 predicate was `(typical * 8.0).max(0.05)` and it was unfalsifiable.** At
+`typical = 0.163181` that bounds the seam at `1.305` — above the largest step reachable on this
+fixture at all, since `source_clip`'s envelope decays to zero at the 10 s mark and PCM here is in
+[-1, 1]. Every tail passed it, discontinuous or not. The doc claimed the bound was "measured rather
+than chosen" while the assertion multiplied the measurement by a chosen 8 and floored it at a chosen
+0.05; that claim was false and is corrected here.
 
 | id | seam step | tail energy |
 |---|---|---|
-| `stable_audio_3_small_music` | 0.039421 | 0.008514 |
-| `stable_audio_3_small_sfx` | 0.040421 | 0.044111 |
-| `stable_audio_3_medium` | 0.033704 | 0.012578 |
-| `stable_audio_3_small_music_base` | 0.037924 | 0.010317 |
-| `stable_audio_3_small_sfx_base` | 0.038054 | 0.036780 |
-| `stable_audio_3_medium_base` | 0.045983 | 0.059855 |
+| `stable_audio_3_small_music` | 0.039416 | 0.008523 |
+| `stable_audio_3_small_sfx` | 0.040418 | 0.043943 |
+| `stable_audio_3_medium` | 0.033704 | 0.012602 |
+| `stable_audio_3_small_music_base` | 0.037928 | 0.010388 |
+| `stable_audio_3_small_sfx_base` | 0.038057 | 0.036689 |
+| `stable_audio_3_medium_base` | 0.045981 | 0.059821 |
 
-Every seam step is **below** the material's own typical step, i.e. the join is smoother than the
-source's own waveform activity — not merely inside a generous bound. The prepared buffer is silent
-past the source, so a non-zero tail energy is proof the tail came from the model.
+Every seam step is `0.034`–`0.046` against a bound of `0.163181`, i.e. ~3.5x inside it. That headroom
+is what the multiplier `1.0` costs against checkpoint variation, and it is headroom against a bound
+that a genuinely discontinuous tail cannot clear — the whole point of dropping the 8x. The prepared
+buffer is silent past the source, so a non-zero tail energy is proof the tail came from the model.
 
 ### Repaint ≡ Inpaint
 

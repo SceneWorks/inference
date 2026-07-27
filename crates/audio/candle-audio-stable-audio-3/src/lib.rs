@@ -129,10 +129,12 @@ pub use model::{
     SMALL_MAX_SAMPLE_SIZE, SMALL_SHAPE, WEIGHT_LICENSES,
 };
 pub use pipeline::{
-    conditioning_is_forwarded, edit_geometry, edit_keep_mask, edit_local_conditioning,
-    edit_region_latents, edit_region_samples, prepare_reference_pcm, resampled_frame_count,
+    conditioning_is_forwarded, edit_geometry, edit_geometry_matches_request, edit_keep_mask,
+    edit_local_conditioning, edit_local_conditioning_is_present, edit_region_latents,
+    edit_region_samples, edit_retained_latent_count, prepare_reference_pcm, resampled_frame_count,
     sampler_strength_for, stitch_outside_region, AudioEdit, ComputeDTypes, EditGeometry,
-    ReferenceAudio, ReferenceDrawOrder, StableAudio3Pipeline, VariantGeometry,
+    ForwardedConditioning, ReferenceAudio, ReferenceDrawOrder, StableAudio3Pipeline,
+    VariantGeometry,
 };
 
 /// Add every registered Stable Audio 3 generator to an explicit audio registry builder.

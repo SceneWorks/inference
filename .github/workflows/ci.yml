@@ -230,9 +230,9 @@ jobs:
         # time for zero executed cases.
         #
         # The named ten and what they execute on a PR (measured, by running this step's exact
-        # command on the merged tree): `sampler_oracle` 17, `audio_edit` 10, `reference_audio` 7,
+        # command on the merged tree): `sampler_oracle` 17, `audio_edit` 12, `reference_audio` 7,
         # `provider` 3, `listening_stimuli` 3, `dtype_policy` 2, `conformance` 1,
-        # `primitive_oracle` 1, `same_oracle` 1, `variant_quality` 1 — 46 weight-free cases.
+        # `primitive_oracle` 1, `same_oracle` 1, `variant_quality` 1 — 48 weight-free cases.
         # sc-14545 review found
         # `sampler_oracle`, `same_oracle` and `primitive_oracle` running in no automatic lane at all
         # (19 dark gates, pre-existing since sc-14543) and added them here. sc-14546 adds
@@ -271,7 +271,7 @@ jobs:
         # between them. All three gates are verified to fail under their own single-token mutation,
         # not merely to pass under the correct code.
         #
-        # sc-14548 adds `audio_edit`, the inpaint/repaint/extend target. Its ten weight-free cases
+        # sc-14548 adds `audio_edit`, the inpaint/repaint/extend target. Its twelve weight-free cases
         # are the **whole** of the PR-time evidence for that feature: the DiT side was already
         # landed and the story is the producer — mask construction, the 257-channel local
         # conditioning, region resolution, and the PCM stitch — every part of which fails silently.
@@ -291,11 +291,26 @@ jobs:
         # resolution is reachable here. `conditioning_is_forwarded` then makes a dropped forward
         # fail closed at runtime rather than degrade silently to text-to-audio.
         #
-        # What these cases do **not** cover, stated rather than implied: the two call sites inside
-        # `StableAudio3Pipeline::synthesize_traced` — the stitch invocation and the local-tensor
-        # handoff — and the `conditioning_is_forwarded` call site inside `generate`. Those need
-        # weights; `real-weights.yml`'s `sa3-base-identity-{metal,cuda}` jobs are what catch them,
-        # and `docs/migration/SC_14548_AUDIO_EDIT_INPAINT.md` carries the per-site table.
+        # Round-2 review added the last two cases, and they carry a seam that had no gate at all:
+        # `local = edit_local_conditioning(...)` -> `let _ = ...` inside `synthesize_traced` leaves
+        # the DiT's local conditioner as the zero tensor the text-only path allocates, so every
+        # inpaint/repaint/extend *interior* degrades to plain text-to-audio while the outside stays
+        # bit-exact and both real-weight divergence floors get **larger** — an unconditioned interior
+        # wanders further from the source and further between seeds, so those floors are
+        # wrong-signed against it and tightening them cannot help.
+        # `pipeline::edit_local_conditioning_is_present` now cross-checks the handoff where it
+        # crosses into `sample`, and `edit_geometry_matches_request` does the same for the
+        # weights-only `duration_secs` argument that sets the padding boundary. Both call sites need
+        # weights, exactly like `conditioning_is_forwarded`'s, so what runs here is the **rule**; the
+        # real-weight lane is where a zeroed handoff is refused, before sampling rather than after a
+        # plausible render.
+        #
+        # What these cases do **not** cover, stated rather than implied: every call site inside
+        # `StableAudio3Pipeline::synthesize_traced`, and the conditioning receipt built in
+        # `generate`. Those need weights; `real-weights.yml`'s `sa3-base-identity-{metal,cuda}` jobs
+        # are what catch them, and `docs/migration/SC_14548_AUDIO_EDIT_INPAINT.md` carries the
+        # per-site table — every row of which names a mechanism verified by running the mutation
+        # rather than by reading the code.
         #
         # Scope, stated precisely rather than as "the sign is gated at the contract endpoint": these
         # three cases make the chain continuous from `GenerationRequest` to `sampler_strength_for` —

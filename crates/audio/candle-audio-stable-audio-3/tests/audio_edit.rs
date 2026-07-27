@@ -62,8 +62,9 @@ use candle_audio_stable_audio_3::gen_core::{
     GenerationRequest, Generator, LoadSpec, TimeRegion, WeightsSource,
 };
 use candle_audio_stable_audio_3::pipeline::{
-    conditioning_is_forwarded, edit_geometry, edit_keep_mask, edit_local_conditioning,
-    edit_region_latents, edit_region_samples, prepare_reference_pcm, resampled_frame_count,
+    conditioning_is_forwarded, edit_geometry, edit_geometry_matches_request, edit_keep_mask,
+    edit_local_conditioning, edit_local_conditioning_is_present, edit_region_latents,
+    edit_region_samples, edit_retained_latent_count, prepare_reference_pcm, resampled_frame_count,
     stitch_outside_region, AudioEdit, EditGeometry, SAMPLE_RATE,
 };
 use candle_audio_stable_audio_3::sampler::{
@@ -107,6 +108,27 @@ fn source_clip(seconds: f32, rate: u32, channels: u16) -> AudioTrack {
             let phase = 1.0 + 0.05 * channel as f64;
             let value = 0.4 * envelope * (2.0 * ((220.0 * phase * t) % 1.0) - 1.0) + 0.05 * saw;
             samples.push(value as f32);
+        }
+    }
+    track(samples, rate, channels)
+}
+
+/// A second deterministic clip, unmistakably different material at the same length and rate.
+///
+/// Exists for the source-sensitivity half of the real-weight inpaint case: two edits that differ
+/// **only** in their source must not render the same interior. A rising 147 Hz triangle against
+/// `source_clip`'s decaying 220 Hz saw differs in fundamental, timbre and envelope direction, so the
+/// two encode to genuinely different latents rather than to a scaled version of the same ones.
+fn alternate_source_clip(seconds: f32, rate: u32, channels: u16) -> AudioTrack {
+    let frames = (seconds as f64 * rate as f64) as usize;
+    let mut samples = Vec::with_capacity(frames * channels as usize);
+    for frame in 0..frames {
+        let t = frame as f64 / rate as f64;
+        let envelope = (t / seconds as f64).min(1.0);
+        for channel in 0..channels {
+            let phase = 1.0 + 0.11 * channel as f64;
+            let triangle = 4.0 * ((147.0 * phase * t) % 1.0 - 0.5).abs() - 1.0;
+            samples.push((0.45 * envelope * triangle) as f32);
         }
     }
     track(samples, rate, channels)
@@ -415,10 +437,16 @@ fn the_request_surface_hands_the_pipeline_the_resolved_region() {
 /// PR lane cannot evaluate that forward.
 ///
 /// What is gated here is the **rule** (`conditioning_is_forwarded`) plus the two resolutions that
-/// feed it, which together mean a dropped forward fails closed at runtime instead of degrading. What
-/// is **not** gated here is the call site itself. That residue is real and is recorded in
-/// `docs/migration/SC_14548_AUDIO_EDIT_INPAINT.md` with the lane that catches it, rather than
-/// described as closed.
+/// feed it, which together mean a dropped forward is refused at runtime instead of degrading.
+///
+/// Round-2 review found that the rule alone left the *next* token unguarded: the guard read the
+/// `edit` local, and the argument list of the call one line below it was a second, unchecked place
+/// to write `None`. The resolved values now travel as a `pipeline::ForwardedConditioning` receipt
+/// carrying the request booleans with them, and `synthesize_conditioned` re-checks the pair on the
+/// far side of the boundary — so there is no separate argument to null out, and nulling a field is
+/// refused there. Both of those call sites still need weights;
+/// `docs/migration/SC_14548_AUDIO_EDIT_INPAINT.md` carries the per-site table with the lane that
+/// catches each, every row verified by running the mutation.
 #[test]
 fn a_resolved_edit_must_be_the_one_the_pipeline_is_handed() {
     // Agreement in all four honest combinations.
@@ -762,6 +790,156 @@ fn the_local_conditioning_is_mask_first_then_the_masked_source() {
     // A latents tensor of the wrong length is refused rather than broadcast into place.
     let wrong = Tensor::zeros((1, LATENT_CHANNELS, length + 1), DType::F32, &device).unwrap();
     assert!(edit_local_conditioning(&resolved, &wrong, &device, DType::F32).is_err());
+}
+
+/// The local conditioning must still be non-zero where it **crosses** into the DiT.
+///
+/// # The mutation this is written against
+///
+/// `local = edit_local_conditioning(...)` → `let _ = edit_local_conditioning(...)` at the one call
+/// site inside `StableAudio3Pipeline::synthesize_traced`. One token, and it leaves `local` as the
+/// zero tensor the text-only path allocates, so every inpaint, repaint and extend runs as plain
+/// text-to-audio inside the region while still replacing the region and still preserving the
+/// outside.
+///
+/// The case above pins the construction; this pins the *handoff*, which is a different seam — the
+/// sc-14547 finding, applied. And the reason it cannot be a divergence floor instead: an
+/// unconditioned interior diverges **more** from the source and **more** between seeds than a
+/// conditioned one, so both real-weight floors are wrong-signed against this mutation and tightening
+/// them makes it easier to pass, not harder.
+///
+/// Two halves, because the rule and the expectation are separately falsifiable:
+///
+/// * the rule, over all four boolean combinations, the way sc-14547's `reference_halves_agree` is
+///   gated — including the reverse direction, so a text-only request that somehow carried a non-zero
+///   local conditioner is refused too;
+/// * the expectation, `edit_retained_latent_count`, cross-checked against what
+///   `edit_local_conditioning` actually builds over a spread of regions. That function is a second,
+///   independent derivation from the resolved indices; if it were computed by re-running the mask
+///   construction it would move with the mutation instead of catching it, so it is checked against
+///   the real tensor here rather than assumed to agree.
+///
+/// The degenerate row is included on purpose: a region covering the whole effective span retains
+/// nothing, hands the DiT an all-zero conditioner legitimately, and is therefore the one geometry on
+/// which the guard cannot see the zeroing mutation. Named, not hidden.
+#[test]
+fn the_local_conditioning_handoff_must_still_be_present_where_it_crosses_into_the_dit() {
+    // The rule, all four combinations.
+    assert!(edit_local_conditioning_is_present(false, false).is_ok());
+    assert!(edit_local_conditioning_is_present(true, true).is_ok());
+    assert!(
+        edit_local_conditioning_is_present(true, false).is_err(),
+        "an edit that retains source latents but hands the DiT zeros is the whole point of this \
+         guard"
+    );
+    assert!(
+        edit_local_conditioning_is_present(false, true).is_err(),
+        "and the reverse: nothing but an edit may put a non-zero local conditioner on the wire"
+    );
+
+    // The expectation, against the tensor the pipeline actually builds.
+    let device = Device::Cpu;
+    let geometry = small_geometry(10.0);
+    let source = source_clip(10.0, SAMPLE_RATE, 2);
+    let mut saw_retaining = false;
+    let mut saw_empty = false;
+    for (start, end) in [(2.0f32, 7.0f32), (0.0, 4.0), (9.0, 10.0), (0.0, 16.0)] {
+        let edit = AudioEdit {
+            samples: &source.samples,
+            sample_rate: SAMPLE_RATE,
+            channels: 2,
+            start_secs: start,
+            end_secs: end,
+        };
+        let resolved = edit_geometry(&edit, &geometry, 10.0).unwrap();
+        let length = resolved.latent_length;
+        let values: Vec<f32> = (0..LATENT_CHANNELS)
+            .flat_map(|channel| {
+                (0..length).map(move |position| (channel * 1_000 + position) as f32)
+            })
+            .collect();
+        let latents = Tensor::from_vec(values, (1, LATENT_CHANNELS, length), &device).unwrap();
+        let local = edit_local_conditioning(&resolved, &latents, &device, DType::F32).unwrap();
+        let observed = local
+            .to_vec3::<f32>()
+            .unwrap()
+            .iter()
+            .flatten()
+            .flatten()
+            .any(|value| *value != 0.0);
+        let expected = edit_retained_latent_count(&resolved) > 0;
+        assert_eq!(
+            expected, observed,
+            "[{start}s, {end}s): the retained-latent count and the built tensor must agree on \
+             whether the DiT is conditioned at all"
+        );
+        assert!(edit_local_conditioning_is_present(expected, observed).is_ok());
+        saw_retaining |= expected;
+        saw_empty |= !expected;
+    }
+    // Two-sided: the spread above covers both answers, so neither branch of the equality is
+    // untested and the assertion is not "true == true" four times.
+    assert!(
+        saw_retaining && saw_empty,
+        "the region spread must produce both a conditioning edit and the degenerate whole-span one"
+    );
+}
+
+/// The resolved edit geometry must describe the geometry the request is actually sampled at.
+///
+/// # The mutation this is written against
+///
+/// The `duration_secs` argument at `edit_geometry(&edit, &geometry, parameters.duration_secs)`
+/// inside `synthesize_traced`. One token, weights-only, and it sets `effective_samples` — the
+/// training-parity padding boundary the keep mask zeroes from. Substituting the source's own extent,
+/// or `edit.end_secs`, moves where the local conditioner stops describing the source; the output
+/// keeps its length, its rate and its bit-exact outside.
+///
+/// The comparison is against `SampleGeometry::effective_lengths`, which `adapt_sample_size` derives
+/// from the same duration by a genuinely different route — `ceil` to a 4096 multiple, in latent
+/// units, against this path's `trunc` in audio samples — so it is a cross-check rather than a copy.
+/// Its granularity is that latent frame: a duration wrong by under 93 ms is **not** caught here, and
+/// `the_edit_geometry_reproduces_the_pinned_alignment_examples` is what pins the sample-resolution
+/// value itself.
+#[test]
+fn the_resolved_edit_geometry_must_match_the_geometry_the_request_is_sampled_at() {
+    let geometry = small_geometry(10.0);
+    let source = source_clip(10.0, SAMPLE_RATE, 2);
+    let edit = AudioEdit {
+        samples: &source.samples,
+        sample_rate: SAMPLE_RATE,
+        channels: 2,
+        start_secs: 2.0,
+        end_secs: 7.0,
+    };
+    let resolved = edit_geometry(&edit, &geometry, 10.0).unwrap();
+    assert!(
+        edit_geometry_matches_request(&resolved, &geometry).is_ok(),
+        "the shipped pairing must pass"
+    );
+
+    // A duration argument that drifted: resolved against 10 s, sampled at 18 s and vice versa.
+    let other = small_geometry(18.0);
+    assert!(
+        edit_geometry_matches_request(&resolved, &other).is_err(),
+        "a resolution taken at the wrong duration must be refused"
+    );
+    let long = edit_geometry(&edit, &other, 18.0).unwrap();
+    assert!(edit_geometry_matches_request(&long, &other).is_ok());
+    assert!(
+        edit_geometry_matches_request(&long, &geometry).is_err(),
+        "and in the other direction"
+    );
+
+    // The same sampling geometry, resolved against a different *duration* only — the exact shape of
+    // the call-site mutation, with `edit` and `geometry` both untouched.
+    let drifted = edit_geometry(&edit, &geometry, 7.0).unwrap();
+    assert_eq!(drifted.adapted_size, resolved.adapted_size);
+    assert_ne!(drifted.effective_samples, resolved.effective_samples);
+    assert!(
+        edit_geometry_matches_request(&drifted, &geometry).is_err(),
+        "substituting the region's end for the output duration must be refused"
+    );
 }
 
 /// Guidance varies the prompt, and only the prompt: both CFG branches see the same local tensor.
@@ -1112,6 +1290,19 @@ fn audio(output: GenerationOutput) -> AudioTrack {
     }
 }
 
+/// Floor for the source-sensitivity measurement, as a fraction of the interior's source energy.
+///
+/// Set **after** the measurement, from the low end of the measured spread: the six ids land at
+/// `1.318`–`1.813` times the interior's source energy (see the case's own table), and this sits
+/// `1.88x` below the tightest of them — the same relative distance the other two floors take from
+/// their own low mode. It is an order of magnitude above the `0.08` the other two floors use because
+/// the quantity is an order of magnitude larger, not because it was tuned.
+///
+/// Its job is grading, not gating. The gate against a dropped local-conditioning handoff is the
+/// byte-inequality beside it, which that mutation fails at *any* threshold because the two renders
+/// become identical.
+const CONDITIONING_DIVERGENCE_FLOOR: f64 = 0.70;
+
 /// Mean absolute value of an interleaved span, both channels.
 fn energy(samples: &[f32]) -> f64 {
     if samples.is_empty() {
@@ -1144,8 +1335,8 @@ fn divergence(left: &[f32], right: &[f32]) -> f64 {
 /// slipped a frame, which is the failure the amended acceptance names.
 ///
 /// Preservation alone passes for a no-op, so the interior is asserted to have changed in the same
-/// pass. **Two** measurements, because one of them is a much better discriminator than the other and
-/// the weaker one alone was nearly shipped with a fitted floor:
+/// pass. **Three** measurements, because they answer three different questions and two of them are
+/// blind to the failure the third exists for:
 ///
 /// * `source_divergence` — the region against the prepared source. This is the obvious measurement
 ///   and it is the *weak* one: a full SAME encode/decode round trip already diverges from its input
@@ -1157,6 +1348,16 @@ fn divergence(left: &[f32], right: &[f32]) -> f64 {
 ///   satisfied by a copy: a stitch that overwrote the whole clip, an unmasked local conditioning
 ///   that handed the model its own answer, or any other degeneracy that returns the source produces
 ///   a *seed-independent* interior. Nothing about it is fitted — a copy scores identically zero.
+/// * `conditioning_divergence` — the same region rendered from a **different source clip** at the
+///   identical seed. This is the only one of the three that observes whether the DiT is conditioned
+///   on the source at all, and the only one correctly signed against that failure. Both measurements
+///   above get **larger** when the interior stops being conditioned — an unconditioned region
+///   wanders further from the source and further between seeds — so no tightening of either can
+///   catch a dropped local-conditioning handoff, and tightening them makes it *easier* to pass. Two
+///   renders that agree on prompt, seed, region, duration and geometry and differ only in their
+///   source clip are bit-identical if the source never reaches the model, so the assertion beside
+///   the floor is a **byte-inequality**, which that mutation fails at any threshold. The weight-free
+///   half of the same seam is `pipeline::edit_local_conditioning_is_present`.
 ///
 /// # The floors are measured, not chosen
 ///
@@ -1164,14 +1365,19 @@ fn divergence(left: &[f32], right: &[f32]) -> f64 {
 /// Interior source energy is `0.124632` on every row (the same prepared buffer), so the floor
 /// `0.08 * energy` is `0.009971`.
 ///
-/// | id | source divergence | seed divergence |
-/// |---|---|---|
-/// | `stable_audio_3_small_music` | 0.049032 | 0.060890 |
-/// | `stable_audio_3_small_sfx` | 0.040207 | 0.034959 |
-/// | `stable_audio_3_medium` | 0.023271 | 0.018139 |
-/// | `stable_audio_3_small_music_base` | 0.060283 | 0.043349 |
-/// | `stable_audio_3_small_sfx_base` | 0.072864 | 0.069078 |
-/// | `stable_audio_3_medium_base` | 0.022106 | 0.018048 |
+/// | id | source divergence | seed divergence | conditioning divergence |
+/// |---|---|---|---|
+/// | `stable_audio_3_small_music` | 0.049025 | 0.060849 | 0.164266 |
+/// | `stable_audio_3_small_sfx` | 0.040199 | 0.034961 | 0.181044 |
+/// | `stable_audio_3_medium` | 0.023272 | 0.018142 | 0.165492 |
+/// | `stable_audio_3_small_music_base` | 0.060284 | 0.043346 | 0.166105 |
+/// | `stable_audio_3_small_sfx_base` | 0.072861 | 0.068967 | 0.225991 |
+/// | `stable_audio_3_medium_base` | 0.022110 | 0.018060 | 0.178970 |
+///
+/// The conditioning column is `1.318`–`1.813` times the source energy, i.e. **an order of magnitude
+/// above** either of the other two: swapping the source clip changes the interior far more than
+/// changing the seed does, which is the shape "the region is conditioned on the source" has. Under
+/// the zeroed-handoff mutation that column is exactly `0.000000` on every row.
 ///
 /// The spread is bimodal by autoencoder family — the two SAME-L ids sit at roughly `0.018`–`0.023`
 /// and the four SAME-S ids at `0.035`–`0.073` — so the floor is taken from the **low** mode, at
@@ -1190,6 +1396,7 @@ fn real_inpaint_preserves_the_outside_exactly_and_changes_the_inside() {
     let seconds = 6.0f32;
     let frames = (seconds as f64 * SAMPLE_RATE as f64) as usize;
     let source = source_clip(seconds, 48_000, 1);
+    let other = alternate_source_clip(seconds, 48_000, 1);
     let prepared = prepare_reference_pcm(&source.samples, 48_000, 1, frames).unwrap();
     let (start_frame, end_frame) = edit_region_samples(2.0, 4.0);
 
@@ -1200,10 +1407,10 @@ fn real_inpaint_preserves_the_outside_exactly_and_changes_the_inside() {
         let spec = LoadSpec::new(snapshot(case.env));
         let generator = load_variant(case.variant, &spec).expect("load pinned snapshot");
         let id = generator.descriptor().id;
-        let render = |seed: u64| {
+        let render = |seed: u64, clip: &AudioTrack| {
             let mut request = edit_request(
                 case.prompt,
-                source.clone(),
+                clip.clone(),
                 AudioEditMode::Inpaint,
                 region(2.0, Some(4.0)),
                 Some(seconds),
@@ -1215,8 +1422,11 @@ fn real_inpaint_preserves_the_outside_exactly_and_changes_the_inside() {
                     .unwrap_or_else(|error| panic!("{id} @ seed {seed}: {error}")),
             )
         };
-        let output = render(7);
-        let alternate = render(4_242);
+        let output = render(7, &source);
+        let alternate = render(4_242, &source);
+        // Same seed, same prompt, same region, same duration — a different source clip and nothing
+        // else. See the doc comment: this is the half that observes conditioning.
+        let other_source = render(7, &other);
         assert_eq!(output.sample_rate, SAMPLE_RATE);
         assert_eq!(output.channels as usize, CHANNELS);
         assert_eq!(
@@ -1253,15 +1463,35 @@ fn real_inpaint_preserves_the_outside_exactly_and_changes_the_inside() {
             &output.samples[inside.clone()],
             &alternate.samples[inside.clone()],
         );
+        // The conditioning half. Two renders that agree on every input except the source clip; if
+        // the source never reaches the DiT they are bit-identical, because the request stream, the
+        // draw counts, the prompt and the geometry are all identical between them.
+        let conditioning_divergence = divergence(
+            &output.samples[inside.clone()],
+            &other_source.samples[inside.clone()],
+        );
+        // Deliberately `assert!` on a comparison rather than `assert_ne!`: the operands are
+        // 176,400-sample slices and the macro would dump both of them into the failure output.
+        assert!(
+            output.samples[inside.clone()] != other_source.samples[inside.clone()],
+            "{id}: two inpaints differing only in their source rendered the *identical* interior, \
+             which is what an unconditioned region looks like"
+        );
         let reference = energy(&prepared[inside]);
         println!(
             "{id} source_divergence={source_divergence:.6} seed_divergence={seed_divergence:.6} \
-             source_energy={reference:.6}"
+             conditioning_divergence={conditioning_divergence:.6} source_energy={reference:.6}"
         );
-        measured.push((id, source_divergence, seed_divergence, reference));
+        measured.push((
+            id,
+            source_divergence,
+            seed_divergence,
+            conditioning_divergence,
+            reference,
+        ));
     }
 
-    for (id, source_divergence, seed_divergence, reference) in &measured {
+    for (id, source_divergence, seed_divergence, conditioning_divergence, reference) in &measured {
         // The weak measurement, with a floor taken from the low end of the measured spread rather
         // than from an intuition. It is stated against the source's own energy so it means the same
         // thing whatever the material is.
@@ -1277,6 +1507,16 @@ fn real_inpaint_preserves_the_outside_exactly_and_changes_the_inside() {
             *seed_divergence > 0.08 * reference,
             "{id}: the region must be *generated* — two seeds produced interiors differing by only \
              {seed_divergence:.6}, which is what a copied region looks like"
+        );
+        // The correctly-signed one. Both floors above get *larger* when the interior stops being
+        // conditioned on the source, so neither can see a zeroed local conditioner; this one goes to
+        // exactly zero. The byte-inequality above is the threshold-free form and is the actual gate
+        // against the mutation; this floor is the graded version, taken from the measured spread.
+        assert!(
+            *conditioning_divergence > CONDITIONING_DIVERGENCE_FLOOR * reference,
+            "{id}: swapping the source changed the interior by only \
+             {conditioning_divergence:.6} against source energy {reference:.6} — the region is \
+             barely conditioned on the clip being edited"
         );
     }
 }
@@ -1332,8 +1572,15 @@ fn real_repaint_is_byte_identical_to_inpaint() {
 /// Three assertions, and the third is the one that is easy to omit. Preserving the prefix is the
 /// stitch's job and is exact. Producing *something* in the tail is not enough — silence would pass a
 /// preservation-only test. And a tail that is loud but discontinuous at 10 s is the specific failure
-/// an extend has: the seam step is compared against the source's own frame-to-frame steps, so the
-/// bound is measured from this material rather than chosen.
+/// an extend has.
+///
+/// The seam predicate, stated whole rather than as "measured": `seam <= typical`, where `typical` is
+/// this fixture's own 99.9th-percentile frame-to-frame step over the second before the seam. The
+/// *yardstick* is measured; the multiplier is `1.0` and that is a choice, made because a join no
+/// sharper than the material's own steepest transition is not audible as an edit. The earlier
+/// `(typical * 8.0).max(0.05)` was not a weaker version of this — at `typical = 0.163181` it bounded
+/// the seam at `1.305`, past the largest step reachable on this fixture at all, so it admitted every
+/// tail including a fully discontinuous one.
 #[test]
 #[ignore = "requires all six pinned immutable snapshots; set SA3_*_SNAPSHOT"]
 fn real_extend_keeps_the_source_prefix_and_bridges_the_seam() {
@@ -1386,9 +1633,28 @@ fn real_extend_keeps_the_source_prefix_and_bridges_the_seam() {
             "{id}: the prepared buffer is silent past the source, so the tail came from the model"
         );
 
-        // 3. The seam is not a discontinuity. The bound is the source's own 99.9th-percentile
-        //    frame-to-frame step over the last second before the seam, scaled by 8 — measured from
-        //    this material rather than picked, so it means the same thing on every checkpoint.
+        // 3. The seam is not a discontinuity. The predicate is stated in full because the
+        //    multiplier is part of it: the seam step must be **no larger than** the material's own
+        //    99.9th-percentile frame-to-frame step over the second before the seam. Multiplier
+        //    `1.0`, no additive floor.
+        //
+        //    What that protects against: a tail that starts at a level unrelated to where the
+        //    source left off — the click an extend produces when the model regenerates the tail
+        //    without conditioning on the prefix, or when the stitch boundary is off by a frame. The
+        //    source's own steepest transition is the right yardstick because a join sharper than
+        //    anything the material itself does is audible as an edit; a join no sharper than that
+        //    is not.
+        //
+        //    The 8x multiplier and 0.05 floor this replaces were **unfalsifiable**: `typical` is
+        //    0.163181 on this fixture, so the bound was 1.305, above the largest step reachable at
+        //    all here — `source_clip`'s envelope decays to zero at the 10 s mark, so the seam step
+        //    is bounded by the tail's own opening amplitude. Any tail passed, discontinuous or not.
+        //    At `1.0` the measured seam steps (0.034-0.046) sit ~4x inside the bound, which is
+        //    headroom against checkpoint variation rather than slack fitted to the numbers.
+        //
+        //    `typical` is itself asserted to be a meaningful number, so a future fixture whose
+        //    waveform was nearly flat would fail loudly here instead of silently tightening this
+        //    into a flake.
         let step = |buffer: &[f32], frame: usize| -> f64 {
             (0..CHANNELS)
                 .map(|channel| {
@@ -1406,8 +1672,14 @@ fn real_extend_keeps_the_source_prefix_and_bridges_the_seam() {
         let seam = step(&output.samples, source_frames);
         println!("{id} seam_step={seam:.6} typical_step={typical:.6} tail_energy={tail_energy:.6}");
         assert!(
-            seam <= (typical * 8.0).max(0.05),
-            "{id}: the 10 s seam jumps {seam:.6}, far past the material's own {typical:.6} step"
+            typical > 0.02,
+            "{id}: the fixture's own 99.9th-percentile step is {typical:.6}; a bound derived from \
+             material that flat would be a flake, not a gate"
+        );
+        assert!(
+            seam <= typical,
+            "{id}: the 10 s seam jumps {seam:.6}, past the material's own steepest {typical:.6} \
+             transition"
         );
     }
 }
