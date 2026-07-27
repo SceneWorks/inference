@@ -339,6 +339,16 @@ pub struct GenerationRequest {
     /// than silently ignoring the request (see `mlx_gen_pid::resolve_pid_decoder`).
     pub pid_capture_sigma: Option<f32>,
 
+    // --- Memory adaptation (provider-specific, quality-preserving levers) ---
+    /// Optional quality-preserving memory adaptations selected by the consumer from live device
+    /// budget plus measured, stage-specific peaks. `None` is the historical fast path. Providers
+    /// ignore levers they do not advertise or implement.
+    ///
+    /// These are execution choices, not creative settings: they must preserve the requested
+    /// precision, dimensions, seed, and sampling recipe. SceneWorks currently uses the complete
+    /// surface for ordinary Krea 2 Turbo on constrained CUDA cards.
+    pub memory: Option<GenerationMemory>,
+
     // --- Audio (Option; consumed by audio models — `Modality::Audio`) ---
     /// The typed audio sub-block (sc-12834). `None` for every image/video request — the top-level
     /// request stays un-bloated, mirroring the planned typed video guider block (§9 known additive
@@ -364,6 +374,24 @@ pub struct GenerationRequest {
 
     // --- Control ---
     pub cancel: CancelFlag,
+}
+
+/// Quality-preserving execution levers for a single generation.
+///
+/// The consumer selects these in increasing cost order from measured stage peaks. Keeping them on
+/// the per-generation request (rather than [`LoadSpec`](crate::LoadSpec)) lets one cached provider
+/// serve different resolutions and live budgets truthfully without a process-global toggle.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GenerationMemory {
+    /// Force the provider's bounded/tiled native VAE decode even below its automatic tiling threshold.
+    pub tile_vae_decode: bool,
+    /// Bound attention scratch by chunking independent query rows. This must preserve the provider's
+    /// existing byte-identity contract.
+    pub chunk_attention: bool,
+    /// Keep transformer trunk blocks in host-backed storage and materialize only the current block on
+    /// the accelerator. This is the last quality-preserving rung when complete weights plus bounded
+    /// activations still exceed the live device budget.
+    pub stream_transformer_blocks: bool,
 }
 
 /// The typed audio request sub-block carried by [`GenerationRequest::audio`] (sc-12834). A single
@@ -576,6 +604,7 @@ impl Default for GenerationRequest {
             enhance_temperature: None,
             use_pid: false,
             pid_capture_sigma: None,
+            memory: None,
             audio: None,
             phases: None,
             cancel: CancelFlag::default(),
@@ -700,6 +729,7 @@ impl GenerationRequest {
             use_uncensored_enhancer: _,
             enhance_max_tokens: _,
             use_pid: _,
+            memory: _,
             cancel: _,
             // The audio sub-block carries its own floats — destructured below the flat knobs.
             audio,
@@ -1763,6 +1793,20 @@ impl Capabilities {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generation_memory_is_opt_in_and_quality_preserving_levers_default_off() {
+        let request = GenerationRequest::default();
+        assert_eq!(request.memory, None);
+        assert_eq!(
+            GenerationMemory::default(),
+            GenerationMemory {
+                tile_vae_decode: false,
+                chunk_attention: false,
+                stream_transformer_blocks: false,
+            }
+        );
+    }
 
     fn img(w: u32, h: u32) -> Image {
         Image {

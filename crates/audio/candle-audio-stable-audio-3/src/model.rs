@@ -14,6 +14,21 @@
 //! `5,292,032`. Every geometry the wrapper pins is therefore per [`Variant`] through
 //! [`Variant::geometry`], so a small snapshot cannot authenticate as medium on shape alone and
 //! vice versa.
+//!
+//! The three `-base` checkpoints (sc-14546) are the pre-trained flow-matching models the
+//! post-trained ones were distilled from. They sharpen the same hazard in a new direction:
+//!
+//! * `small-{music,sfx}-base` differ from their post-trained siblings on `diffusion_objective` and
+//!   on `sample_size` (`5,324,800` against `5,292,032`) and on nothing else outside `training.*`;
+//! * `medium-base` differs from `medium` on **`diffusion_objective` alone** — same 997/522/472
+//!   inventory, same `16,777,216` `sample_size`, same `9,222,116,660`-byte root, same declared
+//!   conditioner `repo_id`.
+//!
+//! So [`crate::pipeline::VariantGeometry`] carries the objective per variant rather than pinning
+//! `rf_denoiser` globally, and it separates *provenance* ([`Variant::hub_repo`]) from the *gate
+//! value* ([`Variant::conditioner_repo`]): base configs declare their post-trained sibling's
+//! repository, so those two strings differ for every base id and comparing the wrong one rejects
+//! every base snapshot.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -24,10 +39,11 @@ use candle_audio::gen_core::{
 };
 use sha2::{Digest, Sha256};
 
+use crate::config::DiffusionObjective;
 use crate::dit::Guidance;
 use crate::pipeline::{
-    StableAudio3Pipeline, SynthesisParameters, VariantGeometry, CHANNELS, DEFAULT_GUIDANCE,
-    DEFAULT_STEPS, SAMPLE_RATE,
+    StableAudio3Pipeline, SynthesisParameters, VariantGeometry, BASE_DEFAULT_GUIDANCE,
+    BASE_DEFAULT_STEPS, CHANNELS, DEFAULT_GUIDANCE, DEFAULT_STEPS, SAMPLE_RATE,
 };
 use crate::sampler::SamplerKind;
 use crate::weights::SnapshotLayout;
@@ -44,6 +60,18 @@ pub const SFX_HUB_REVISION: &str = "ae12755283df9d62ca39a9b050a39a0b607b8c20";
 pub const MEDIUM_MODEL_ID: &str = "stable_audio_3_medium";
 pub const MEDIUM_HUB_REPO: &str = "stabilityai/stable-audio-3-medium";
 pub const MEDIUM_HUB_REVISION: &str = "27b5a21b791b1b033d193a9e1e3ce78493f102f9";
+
+pub const MUSIC_BASE_MODEL_ID: &str = "stable_audio_3_small_music_base";
+pub const MUSIC_BASE_HUB_REPO: &str = "stabilityai/stable-audio-3-small-music-base";
+pub const MUSIC_BASE_HUB_REVISION: &str = "eab5ceee5ad9c1ed38800aff30a8e49d1161c539";
+
+pub const SFX_BASE_MODEL_ID: &str = "stable_audio_3_small_sfx_base";
+pub const SFX_BASE_HUB_REPO: &str = "stabilityai/stable-audio-3-small-sfx-base";
+pub const SFX_BASE_HUB_REVISION: &str = "cc5ddb990e30daa68336ac61c140c37c7033ab7c";
+
+pub const MEDIUM_BASE_MODEL_ID: &str = "stable_audio_3_medium_base";
+pub const MEDIUM_BASE_HUB_REPO: &str = "stabilityai/stable-audio-3-medium-base";
+pub const MEDIUM_BASE_HUB_REVISION: &str = "b32993f73c3bdc3864043a72d8032606bba737c8";
 
 /// The smalls' advertised logical maximum.
 ///
@@ -64,17 +92,31 @@ pub const MEDIUM_MAX_DURATION_SECS: f32 = 380.0;
 /// `model_config.json` `sample_size`.
 pub const MEDIUM_MAX_SAMPLE_SIZE: usize = 16_777_216;
 
-/// The exact frame ceiling behind [`MAX_DURATION_SECS`].
+/// The exact frame ceiling behind [`MAX_DURATION_SECS`] on the two post-trained smalls.
 pub const SMALL_MAX_SAMPLE_SIZE: usize = 5_292_032;
+
+/// The two small **base** checkpoints' `sample_size`, which is *not* the post-trained smalls'.
+///
+/// `5,324,800` frames is `120.743764...` s. The advertised cap stays [`MAX_DURATION_SECS`] anyway:
+/// `conformance.rs` requires the advertised cap to be tight, i.e. one second past it must not fit,
+/// and `121 s = 5,336,100` frames does not fit in `5,324,800`. So the extra `0.74 s` is
+/// unreachable through the descriptor by exactly the same rule that keeps medium at `380` s.
+///
+/// What this constant *is* used for is the identity gate: it is what separates
+/// `stable_audio_3_small_music` from `stable_audio_3_small_music_base` on config alone, in both
+/// directions, before `diffusion_objective` is even consulted.
+pub const SMALL_BASE_MAX_SAMPLE_SIZE: usize = 5_324_800;
 
 pub const MAX_STEPS: u32 = 500;
 pub const GUIDANCE_RANGE: (f32, f32) = (0.0, 25.0);
 
-/// The registered post-trained Stable Audio 3 checkpoints.
+/// The registered Stable Audio 3 checkpoints: three post-trained, three `-base` (sc-14546).
 ///
-/// All three share the bundled encoder-only T5Gemma stack, the 44.1 kHz stereo output geometry, the
-/// eight-step Pingpong default, and the `rf_denoiser` objective. They differ in DiT size, in
-/// autoencoder (SAME-S for the smalls, SAME-L for medium), and in maximum duration.
+/// All six share the bundled encoder-only T5Gemma stack, the 44.1 kHz stereo output geometry, and
+/// the same mathematically active batch-CFG / APG / rescale path. They differ in DiT size, in
+/// autoencoder (SAME-S for the smalls, SAME-L for medium), in maximum duration, and — across the
+/// post-trained/base split — in `diffusion_objective` and therefore in the sampler and operating
+/// point resolved for a request that omits them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Variant {
     /// `stable_audio_3_small_music` — 433M text-to-music, SAME-S, 120 s.
@@ -92,6 +134,24 @@ pub enum Variant {
     /// domain field, so that coverage is documentation-only here — see [`descriptor_for`] and
     /// `sc-15041`.
     Medium,
+    /// `stable_audio_3_small_music_base` — the pre-trained flow-matching music checkpoint
+    /// (sc-14546).
+    ///
+    /// Same 433M `1024x20` graph and same SAME-S autoencoder as [`Variant::SmallMusic`], different
+    /// learned weights: this one has not been distilled or adversarially post-trained. Its config
+    /// declares `rectified_flow` rather than `rf_denoiser` and a `5,324,800`-frame `sample_size`
+    /// rather than `5,292,032`.
+    SmallMusicBase,
+    /// `stable_audio_3_small_sfx_base` — the pre-trained flow-matching SFX / Foley checkpoint
+    /// (sc-14546).
+    SmallSfxBase,
+    /// `stable_audio_3_medium_base` — the pre-trained flow-matching 1.45B checkpoint (sc-14546).
+    ///
+    /// The sharpest identity case in the family: against [`Variant::Medium`] it agrees on tensor
+    /// inventory (997/522/472), on `sample_size` (`16,777,216`), on root safetensors byte length
+    /// (`9,222,116,660`) *and* on conditioner `repo_id`. `diffusion_objective` plus the SHA-256 pin
+    /// are the entire gate in both directions.
+    MediumBase,
 }
 
 /// Every architectural quantity the strict wrapper pins, per registered checkpoint.
@@ -129,6 +189,23 @@ pub const SMALL_SHAPE: VariantShape = VariantShape {
     differential: false,
 };
 
+/// `stabilityai/stable-audio-3-small-{music,sfx}-base` — the smalls' graph at the base
+/// `sample_size`.
+///
+/// Identical to [`SMALL_SHAPE`] in every architectural field; only the frame ceiling differs, and
+/// that single field is what rejects a post-trained small snapshot under a base id and vice versa
+/// before the objective check is reached.
+pub const SMALL_BASE_SHAPE: VariantShape = VariantShape {
+    sample_size: SMALL_BASE_MAX_SAMPLE_SIZE,
+    total_keys: SMALL_SHAPE.total_keys,
+    dit_keys: SMALL_SHAPE.dit_keys,
+    autoencoder_keys: SMALL_SHAPE.autoencoder_keys,
+    embed_dim: SMALL_SHAPE.embed_dim,
+    depth: SMALL_SHAPE.depth,
+    num_heads: SMALL_SHAPE.num_heads,
+    differential: SMALL_SHAPE.differential,
+};
+
 /// `stabilityai/stable-audio-3-medium` — 997 root tensors, SAME-L, differential attention.
 ///
 /// The `472` autoencoder tensors are byte-for-byte the standalone `stabilityai/SAME-L` inventory
@@ -147,21 +224,58 @@ pub const MEDIUM_SHAPE: VariantShape = VariantShape {
 
 impl Variant {
     /// Every registered variant, in registration order.
-    pub const ALL: [Variant; 3] = [Variant::SmallMusic, Variant::SmallSfx, Variant::Medium];
+    ///
+    /// Post-trained first, then the three `-base` siblings in the same music / SFX / medium order.
+    /// New variants append, so no shipped ordered-surface assertion has to be rewritten.
+    pub const ALL: [Variant; 6] = [
+        Variant::SmallMusic,
+        Variant::SmallSfx,
+        Variant::Medium,
+        Variant::SmallMusicBase,
+        Variant::SmallSfxBase,
+        Variant::MediumBase,
+    ];
 
     pub const fn model_id(self) -> &'static str {
         match self {
             Self::SmallMusic => MODEL_ID,
             Self::SmallSfx => SFX_MODEL_ID,
             Self::Medium => MEDIUM_MODEL_ID,
+            Self::SmallMusicBase => MUSIC_BASE_MODEL_ID,
+            Self::SmallSfxBase => SFX_BASE_MODEL_ID,
+            Self::MediumBase => MEDIUM_BASE_MODEL_ID,
         }
     }
 
+    /// The repository this checkpoint was published from.
+    ///
+    /// **Provenance, not a gate value.** A base snapshot's `model_config.json` declares its
+    /// post-trained sibling's repository, so comparing this string to the snapshot's conditioner
+    /// `repo_id` rejects every base checkpoint. That comparison uses
+    /// [`Variant::conditioner_repo`]; this is used for license source URLs, the CI snapshot
+    /// manifest, and error messages.
     pub const fn hub_repo(self) -> &'static str {
         match self {
             Self::SmallMusic => HUB_REPO,
             Self::SmallSfx => SFX_HUB_REPO,
             Self::Medium => MEDIUM_HUB_REPO,
+            Self::SmallMusicBase => MUSIC_BASE_HUB_REPO,
+            Self::SmallSfxBase => SFX_BASE_HUB_REPO,
+            Self::MediumBase => MEDIUM_BASE_HUB_REPO,
+        }
+    }
+
+    /// The conditioner `repo_id` this checkpoint's own `model_config.json` declares.
+    ///
+    /// Equal to [`Variant::hub_repo`] for the three post-trained ids and to the **post-trained
+    /// sibling's** repository for the three `-base` ids, because that is what Stability shipped
+    /// inside the base configs. The value is compared as a string and never resolved over the
+    /// network.
+    pub const fn conditioner_repo(self) -> &'static str {
+        match self {
+            Self::SmallMusic | Self::SmallMusicBase => HUB_REPO,
+            Self::SmallSfx | Self::SmallSfxBase => SFX_HUB_REPO,
+            Self::Medium | Self::MediumBase => MEDIUM_HUB_REPO,
         }
     }
 
@@ -170,14 +284,88 @@ impl Variant {
             Self::SmallMusic => HUB_REVISION,
             Self::SmallSfx => SFX_HUB_REVISION,
             Self::Medium => MEDIUM_HUB_REVISION,
+            Self::SmallMusicBase => MUSIC_BASE_HUB_REVISION,
+            Self::SmallSfxBase => SFX_BASE_HUB_REVISION,
+            Self::MediumBase => MEDIUM_BASE_HUB_REVISION,
+        }
+    }
+
+    /// Whether this is one of the three pre-trained `-base` checkpoints.
+    pub const fn is_base(self) -> bool {
+        matches!(
+            self,
+            Self::SmallMusicBase | Self::SmallSfxBase | Self::MediumBase
+        )
+    }
+
+    /// The `diffusion_objective` this checkpoint's config must declare.
+    ///
+    /// The only universal post-trained/base discriminator. `rectified_flow` and `rf_denoiser` are
+    /// handled identically at every branch in [`crate::dit`] and [`crate::sampler`] — same
+    /// prediction target, same `denoised = x - sigma * out` interpretation, same guidance math — so
+    /// this field changes exactly two things: which snapshot authenticates under which id, and
+    /// which sampler [`SamplerKind::recommended`] resolves for a request that omits one.
+    pub const fn objective(self) -> DiffusionObjective {
+        if self.is_base() {
+            DiffusionObjective::RectifiedFlow
+        } else {
+            DiffusionObjective::RfDenoiser
+        }
+    }
+
+    /// The sampler a request that omits `sampler` resolves to.
+    ///
+    /// Derived from [`Variant::objective`] through [`SamplerKind::recommended`], which is the
+    /// frozen-upstream rule (`sampler_type = "pingpong" if diffusion_objective == "rf_denoiser"
+    /// else "euler"`). Before sc-14546 that function was dead code on the provider path — the
+    /// request-to-parameters mapping hard-coded Pingpong — so the two smalls and medium resolved
+    /// correctly only by coincidence.
+    ///
+    /// Infallible here even though `recommended` returns a `Result`: no registered variant declares
+    /// the unreachable `v` objective, and that is asserted rather than assumed
+    /// (`recommended_sampler_matches_the_frozen_objective_rule`).
+    pub fn recommended_sampler(self) -> SamplerKind {
+        SamplerKind::recommended(self.objective())
+            .expect("no registered Stable Audio 3 variant declares the v-diffusion objective")
+    }
+
+    /// The step count used when a request carries no `steps`.
+    ///
+    /// `8` for the post-trained checkpoints (upstream's API default and their own
+    /// `training.demo.demo_steps`), [`BASE_DEFAULT_STEPS`] for the bases. See that constant for why
+    /// `50` is a deliberate product choice rather than an upstream default.
+    pub const fn default_steps(self) -> usize {
+        if self.is_base() {
+            BASE_DEFAULT_STEPS
+        } else {
+            DEFAULT_STEPS
+        }
+    }
+
+    /// The guidance used when a request carries no `guidance`.
+    ///
+    /// `1.0` for the post-trained checkpoints, which is the one value at which
+    /// [`crate::dit::StableAudio3Dit::forward_guided`] takes its batch-1 branch and a negative
+    /// prompt genuinely has no effect. [`BASE_DEFAULT_GUIDANCE`] for the bases, which puts every
+    /// default base render on the batch-2 CFG path.
+    pub const fn default_guidance(self) -> f64 {
+        if self.is_base() {
+            BASE_DEFAULT_GUIDANCE
+        } else {
+            DEFAULT_GUIDANCE
         }
     }
 
     /// The advertised logical maximum duration, in seconds.
+    ///
+    /// The two small bases advertise [`MAX_DURATION_SECS`] like the post-trained smalls even though
+    /// their `sample_size` is larger — see [`SMALL_BASE_MAX_SAMPLE_SIZE`].
     pub const fn max_duration_secs(self) -> f32 {
         match self {
-            Self::SmallMusic | Self::SmallSfx => MAX_DURATION_SECS,
-            Self::Medium => MEDIUM_MAX_DURATION_SECS,
+            Self::SmallMusic | Self::SmallSfx | Self::SmallMusicBase | Self::SmallSfxBase => {
+                MAX_DURATION_SECS
+            }
+            Self::Medium | Self::MediumBase => MEDIUM_MAX_DURATION_SECS,
         }
     }
 
@@ -207,6 +395,17 @@ impl Variant {
     /// see what omitting the field will cost without reading this source. Adding one is an additive
     /// `gen-core` contract change and is tracked with the other additive descriptor gaps as
     /// `sc-15041`.
+    ///
+    /// # sc-14546 makes the medium-base case sharper still
+    ///
+    /// `stable_audio_3_medium_base` inherits the same 380 s default *and* the base operating point
+    /// of 50 Euler steps at guidance 7, which is a batch-2 CFG forward per step. That is 100 DiT
+    /// forwards where post-trained medium does 8 — **12.5x** the example-work, on the same 380 s of
+    /// audio. Extrapolating medium's measured 92 s Metal render at 380 s / 8 steps, an omitted
+    /// `audio.target_duration` on this id is on the order of **20 minutes** of Metal compute, and
+    /// correspondingly worse on CPU. The default is still not special-cased, for the reason above:
+    /// six ids in one family obeying two rules for the same missing field is a worse contract than
+    /// one expensive uniform rule, and no shorter number follows from anything but taste.
     pub const fn default_duration_secs(self) -> f32 {
         self.max_duration_secs()
     }
@@ -215,15 +414,22 @@ impl Variant {
     pub const fn shape(self) -> VariantShape {
         match self {
             Self::SmallMusic | Self::SmallSfx => SMALL_SHAPE,
-            Self::Medium => MEDIUM_SHAPE,
+            Self::SmallMusicBase | Self::SmallSfxBase => SMALL_BASE_SHAPE,
+            Self::Medium | Self::MediumBase => MEDIUM_SHAPE,
         }
     }
 
-    /// The wrapper's validation record: this variant's shape bound to its published repository.
+    /// The wrapper's validation record.
+    ///
+    /// Note the two distinct repository-shaped values: [`Variant::hub_repo`] is provenance and
+    /// [`Variant::conditioner_repo`] is the string the snapshot's config must declare. They differ
+    /// for every `-base` variant, which is why [`VariantGeometry`] carries both.
     pub const fn geometry(self) -> VariantGeometry {
         VariantGeometry {
             shape: self.shape(),
-            expected_repo: self.hub_repo(),
+            hub_repo: self.hub_repo(),
+            expected_conditioner_repo: self.conditioner_repo(),
+            expected_objective: self.objective(),
         }
     }
 
@@ -232,6 +438,9 @@ impl Variant {
             Self::SmallMusic => MUSIC_SNAPSHOT_FILE_PINS,
             Self::SmallSfx => SFX_SNAPSHOT_FILE_PINS,
             Self::Medium => MEDIUM_SNAPSHOT_FILE_PINS,
+            Self::SmallMusicBase => MUSIC_BASE_SNAPSHOT_FILE_PINS,
+            Self::SmallSfxBase => SFX_BASE_SNAPSHOT_FILE_PINS,
+            Self::MediumBase => MEDIUM_BASE_SNAPSHOT_FILE_PINS,
         }
     }
 
@@ -242,6 +451,9 @@ impl Variant {
             Self::SmallMusic => MUSIC_WEIGHT_LICENSES,
             Self::SmallSfx => SFX_WEIGHT_LICENSES,
             Self::Medium => MEDIUM_WEIGHT_LICENSES,
+            Self::SmallMusicBase => MUSIC_BASE_WEIGHT_LICENSES,
+            Self::SmallSfxBase => SFX_BASE_WEIGHT_LICENSES,
+            Self::MediumBase => MEDIUM_BASE_WEIGHT_LICENSES,
         }
     }
 
@@ -368,6 +580,123 @@ const MEDIUM_SNAPSHOT_FILE_PINS: &[SnapshotFilePin] = &[
     },
 ];
 
+/// `stabilityai/stable-audio-3-small-music-base@eab5ceee5ad9c1ed38800aff30a8e49d1161c539`.
+///
+/// The root checkpoint is exactly `2,270,384,940` bytes — the same length as **both** post-trained
+/// small roots and as the SFX base root. Four checkpoints of identical byte length and no identity
+/// metadata in any safetensors header, so these SHA-256 digests are the only thing separating them
+/// on disk. The bundled T5Gemma stack is byte-identical across all six SA3 repositories.
+///
+/// `svd_bases.pt` (1.27 GB) is deliberately not pinned: [`crate::weights::SnapshotLayout::from_dir`]
+/// names every file it opens and never scans the directory, so the artifact is unreachable from the
+/// inference path. `release/real-weight-models.toml` also stops downloading it.
+const MUSIC_BASE_SNAPSHOT_FILE_PINS: &[SnapshotFilePin] = &[
+    SnapshotFilePin {
+        relative: "model_config.json",
+        bytes: 8_452,
+        sha256: "e97f53a0882a99b0307cf7d87d63423f75925b5def5efc180d29740899c62486",
+    },
+    SnapshotFilePin {
+        relative: "model.safetensors",
+        bytes: 2_270_384_940,
+        sha256: "79691fac2a08a99a229b98963f8377ddc78c16f5c63f7e3a022375c311093ab4",
+    },
+    SnapshotFilePin {
+        relative: "t5gemma-b-b-ul2/config.json",
+        bytes: 2_540,
+        sha256: "575334409716886ac2952f5a275ed92868deef8a0ea560258d9970a431c6fb3a",
+    },
+    SnapshotFilePin {
+        relative: "t5gemma-b-b-ul2/model.safetensors",
+        bytes: 1_183_022_944,
+        sha256: "9b05ea5a4f211d023832f706fb2c0e83e4fc721b6da35ab69ceb0b55eb7800d3",
+    },
+    SnapshotFilePin {
+        relative: "t5gemma-b-b-ul2/tokenizer.json",
+        bytes: 34_362_429,
+        sha256: "7794135caa3ea73918949c902a781cc61dab674a4b59c17d85931c77c1114cbd",
+    },
+    SnapshotFilePin {
+        relative: "t5gemma-b-b-ul2/tokenizer.model",
+        bytes: 4_241_003,
+        sha256: "61a7b147390c64585d6c3543dd6fc636906c9af3865a5548f27f31aee1d4c8e2",
+    },
+];
+
+/// `stabilityai/stable-audio-3-small-sfx-base@cc5ddb990e30daa68336ac61c140c37c7033ab7c`.
+const SFX_BASE_SNAPSHOT_FILE_PINS: &[SnapshotFilePin] = &[
+    SnapshotFilePin {
+        relative: "model_config.json",
+        bytes: 8_476,
+        sha256: "cecfbca43fa8ece5d1d128fba74a39594ea954b2b128048534f72665c6721165",
+    },
+    SnapshotFilePin {
+        relative: "model.safetensors",
+        bytes: 2_270_384_940,
+        sha256: "0c7cddb22cd7bf5e8169c6731a9eb7690c27ef5b53e8a4f9b4b2aaf8afcdaea2",
+    },
+    SnapshotFilePin {
+        relative: "t5gemma-b-b-ul2/config.json",
+        bytes: 2_540,
+        sha256: "575334409716886ac2952f5a275ed92868deef8a0ea560258d9970a431c6fb3a",
+    },
+    SnapshotFilePin {
+        relative: "t5gemma-b-b-ul2/model.safetensors",
+        bytes: 1_183_022_944,
+        sha256: "9b05ea5a4f211d023832f706fb2c0e83e4fc721b6da35ab69ceb0b55eb7800d3",
+    },
+    SnapshotFilePin {
+        relative: "t5gemma-b-b-ul2/tokenizer.json",
+        bytes: 34_362_429,
+        sha256: "7794135caa3ea73918949c902a781cc61dab674a4b59c17d85931c77c1114cbd",
+    },
+    SnapshotFilePin {
+        relative: "t5gemma-b-b-ul2/tokenizer.model",
+        bytes: 4_241_003,
+        sha256: "61a7b147390c64585d6c3543dd6fc636906c9af3865a5548f27f31aee1d4c8e2",
+    },
+];
+
+/// `stabilityai/stable-audio-3-medium-base@b32993f73c3bdc3864043a72d8032606bba737c8`.
+///
+/// The sharpest pin in the crate. This root is `9,222,116,660` bytes, the *same* length as the
+/// post-trained medium root, under a config that agrees with medium's on tensor inventory,
+/// `sample_size` and conditioner `repo_id`. Strip `diffusion_objective` from the validator and this
+/// SHA-256 is all that stands between `stable_audio_3_medium` and a pre-trained checkpoint served
+/// under it — and vice versa.
+const MEDIUM_BASE_SNAPSHOT_FILE_PINS: &[SnapshotFilePin] = &[
+    SnapshotFilePin {
+        relative: "model_config.json",
+        bytes: 7_842,
+        sha256: "27e2a299f0bda6ff742d3387398f929299575642f2c6a4d4c4f94830928fd0d5",
+    },
+    SnapshotFilePin {
+        relative: "model.safetensors",
+        bytes: 9_222_116_660,
+        sha256: "c443fcc4d491475064cd0ff3eb92459b1e5f5060e86d96d016f048e528e24195",
+    },
+    SnapshotFilePin {
+        relative: "t5gemma-b-b-ul2/config.json",
+        bytes: 2_540,
+        sha256: "575334409716886ac2952f5a275ed92868deef8a0ea560258d9970a431c6fb3a",
+    },
+    SnapshotFilePin {
+        relative: "t5gemma-b-b-ul2/model.safetensors",
+        bytes: 1_183_022_944,
+        sha256: "9b05ea5a4f211d023832f706fb2c0e83e4fc721b6da35ab69ceb0b55eb7800d3",
+    },
+    SnapshotFilePin {
+        relative: "t5gemma-b-b-ul2/tokenizer.json",
+        bytes: 34_362_429,
+        sha256: "7794135caa3ea73918949c902a781cc61dab674a4b59c17d85931c77c1114cbd",
+    },
+    SnapshotFilePin {
+        relative: "t5gemma-b-b-ul2/tokenizer.model",
+        bytes: 4_241_003,
+        sha256: "61a7b147390c64585d6c3543dd6fc636906c9af3865a5548f27f31aee1d4c8e2",
+    },
+];
+
 pub const ROOT_WEIGHT_LICENSE: gen_core::WeightLicense = gen_core::WeightLicense {
     spdx_id: "LicenseRef-Stability-AI-Community",
     name: "Stability AI Community License",
@@ -428,6 +757,71 @@ pub const MEDIUM_GEMMA_WEIGHT_LICENSE: gen_core::WeightLicense = gen_core::Weigh
     restriction: Some("Use is governed by the Gemma Terms of Use and Prohibited Use Policy."),
 };
 
+/// The `-base` repositories are **ungated** on the Hub, unlike the three post-trained ones.
+///
+/// That changes acquisition, not terms: each base repository ships the same `LICENSE.md` (Stability
+/// AI Community License) and `LICENSE_GEMMA.md` (Gemma Terms of Use) as its post-trained sibling, so
+/// the rows below carry exactly the same restrictions. "No click-through" is not "no license".
+pub const MUSIC_BASE_ROOT_WEIGHT_LICENSE: gen_core::WeightLicense = gen_core::WeightLicense {
+    spdx_id: "LicenseRef-Stability-AI-Community",
+    name: "Stability AI Community License",
+    source_url: "https://huggingface.co/stabilityai/stable-audio-3-small-music-base/blob/eab5ceee5ad9c1ed38800aff30a8e49d1161c539/LICENSE.md",
+    attribution: Some("Stable Audio 3 Small Music Base © Stability AI"),
+    commercial_use: false,
+    restriction: Some(
+        "Use is governed by the Stability AI Community License, including its revenue threshold and prohibited-use terms.",
+    ),
+};
+
+pub const MUSIC_BASE_GEMMA_WEIGHT_LICENSE: gen_core::WeightLicense = gen_core::WeightLicense {
+    spdx_id: "LicenseRef-Gemma-Terms",
+    name: "Gemma Terms of Use",
+    source_url: "https://huggingface.co/stabilityai/stable-audio-3-small-music-base/blob/eab5ceee5ad9c1ed38800aff30a8e49d1161c539/LICENSE_GEMMA.md",
+    attribution: Some("T5Gemma model weights © Google"),
+    commercial_use: true,
+    restriction: Some("Use is governed by the Gemma Terms of Use and Prohibited Use Policy."),
+};
+
+pub const SFX_BASE_ROOT_WEIGHT_LICENSE: gen_core::WeightLicense = gen_core::WeightLicense {
+    spdx_id: "LicenseRef-Stability-AI-Community",
+    name: "Stability AI Community License",
+    source_url: "https://huggingface.co/stabilityai/stable-audio-3-small-sfx-base/blob/cc5ddb990e30daa68336ac61c140c37c7033ab7c/LICENSE.md",
+    attribution: Some("Stable Audio 3 Small SFX Base © Stability AI"),
+    commercial_use: false,
+    restriction: Some(
+        "Use is governed by the Stability AI Community License, including its revenue threshold and prohibited-use terms.",
+    ),
+};
+
+pub const SFX_BASE_GEMMA_WEIGHT_LICENSE: gen_core::WeightLicense = gen_core::WeightLicense {
+    spdx_id: "LicenseRef-Gemma-Terms",
+    name: "Gemma Terms of Use",
+    source_url: "https://huggingface.co/stabilityai/stable-audio-3-small-sfx-base/blob/cc5ddb990e30daa68336ac61c140c37c7033ab7c/LICENSE_GEMMA.md",
+    attribution: Some("T5Gemma model weights © Google"),
+    commercial_use: true,
+    restriction: Some("Use is governed by the Gemma Terms of Use and Prohibited Use Policy."),
+};
+
+pub const MEDIUM_BASE_ROOT_WEIGHT_LICENSE: gen_core::WeightLicense = gen_core::WeightLicense {
+    spdx_id: "LicenseRef-Stability-AI-Community",
+    name: "Stability AI Community License",
+    source_url: "https://huggingface.co/stabilityai/stable-audio-3-medium-base/blob/b32993f73c3bdc3864043a72d8032606bba737c8/LICENSE.md",
+    attribution: Some("Stable Audio 3 Medium Base © Stability AI"),
+    commercial_use: false,
+    restriction: Some(
+        "Use is governed by the Stability AI Community License, including its revenue threshold and prohibited-use terms.",
+    ),
+};
+
+pub const MEDIUM_BASE_GEMMA_WEIGHT_LICENSE: gen_core::WeightLicense = gen_core::WeightLicense {
+    spdx_id: "LicenseRef-Gemma-Terms",
+    name: "Gemma Terms of Use",
+    source_url: "https://huggingface.co/stabilityai/stable-audio-3-medium-base/blob/b32993f73c3bdc3864043a72d8032606bba737c8/LICENSE_GEMMA.md",
+    attribution: Some("T5Gemma model weights © Google"),
+    commercial_use: true,
+    restriction: Some("Use is governed by the Gemma Terms of Use and Prohibited Use Policy."),
+};
+
 const MUSIC_WEIGHT_LICENSES: &[gen_core::WeightLicenseEntry] = &[
     gen_core::WeightLicenseEntry {
         provider_id: MODEL_ID,
@@ -482,12 +876,71 @@ const MEDIUM_WEIGHT_LICENSES: &[gen_core::WeightLicenseEntry] = &[
     },
 ];
 
-/// Every Stable Audio 3 weight-license row, in registration order (music, SFX, medium).
+const MUSIC_BASE_WEIGHT_LICENSES: &[gen_core::WeightLicenseEntry] = &[
+    gen_core::WeightLicenseEntry {
+        provider_id: MUSIC_BASE_MODEL_ID,
+        component: None,
+        license: MUSIC_BASE_ROOT_WEIGHT_LICENSE,
+    },
+    gen_core::WeightLicenseEntry {
+        provider_id: MUSIC_BASE_MODEL_ID,
+        component: Some("root"),
+        license: MUSIC_BASE_ROOT_WEIGHT_LICENSE,
+    },
+    gen_core::WeightLicenseEntry {
+        provider_id: MUSIC_BASE_MODEL_ID,
+        component: Some("t5gemma"),
+        license: MUSIC_BASE_GEMMA_WEIGHT_LICENSE,
+    },
+];
+
+const SFX_BASE_WEIGHT_LICENSES: &[gen_core::WeightLicenseEntry] = &[
+    gen_core::WeightLicenseEntry {
+        provider_id: SFX_BASE_MODEL_ID,
+        component: None,
+        license: SFX_BASE_ROOT_WEIGHT_LICENSE,
+    },
+    gen_core::WeightLicenseEntry {
+        provider_id: SFX_BASE_MODEL_ID,
+        component: Some("root"),
+        license: SFX_BASE_ROOT_WEIGHT_LICENSE,
+    },
+    gen_core::WeightLicenseEntry {
+        provider_id: SFX_BASE_MODEL_ID,
+        component: Some("t5gemma"),
+        license: SFX_BASE_GEMMA_WEIGHT_LICENSE,
+    },
+];
+
+const MEDIUM_BASE_WEIGHT_LICENSES: &[gen_core::WeightLicenseEntry] = &[
+    gen_core::WeightLicenseEntry {
+        provider_id: MEDIUM_BASE_MODEL_ID,
+        component: None,
+        license: MEDIUM_BASE_ROOT_WEIGHT_LICENSE,
+    },
+    gen_core::WeightLicenseEntry {
+        provider_id: MEDIUM_BASE_MODEL_ID,
+        component: Some("root"),
+        license: MEDIUM_BASE_ROOT_WEIGHT_LICENSE,
+    },
+    gen_core::WeightLicenseEntry {
+        provider_id: MEDIUM_BASE_MODEL_ID,
+        component: Some("t5gemma"),
+        license: MEDIUM_BASE_GEMMA_WEIGHT_LICENSE,
+    },
+];
+
+/// Every Stable Audio 3 weight-license row, in registration order.
 ///
 /// The DiT, SAME pretransform, and learned conditioner all live inside the single
 /// `model.safetensors` root artifact and are covered by the `root` row; the bundled T5Gemma stack
 /// is a separately licensed component and carries its own row. Three rows per registration, not
 /// four: medium's SAME-L is not a separate artifact, it is a namespace inside the same file.
+///
+/// Eighteen rows since sc-14546 (six registrations x three). The `-base` repositories are ungated on
+/// the Hub, which is an acquisition difference and nothing else — they ship the same Stability
+/// Community and Gemma license files, so their rows carry the same restrictions and the same
+/// `commercial_use: false` on the root.
 pub const WEIGHT_LICENSES: &[gen_core::WeightLicenseEntry] = &[
     MUSIC_WEIGHT_LICENSES[0],
     MUSIC_WEIGHT_LICENSES[1],
@@ -498,13 +951,39 @@ pub const WEIGHT_LICENSES: &[gen_core::WeightLicenseEntry] = &[
     MEDIUM_WEIGHT_LICENSES[0],
     MEDIUM_WEIGHT_LICENSES[1],
     MEDIUM_WEIGHT_LICENSES[2],
+    MUSIC_BASE_WEIGHT_LICENSES[0],
+    MUSIC_BASE_WEIGHT_LICENSES[1],
+    MUSIC_BASE_WEIGHT_LICENSES[2],
+    SFX_BASE_WEIGHT_LICENSES[0],
+    SFX_BASE_WEIGHT_LICENSES[1],
+    SFX_BASE_WEIGHT_LICENSES[2],
+    MEDIUM_BASE_WEIGHT_LICENSES[0],
+    MEDIUM_BASE_WEIGHT_LICENSES[1],
+    MEDIUM_BASE_WEIGHT_LICENSES[2],
 ];
 
 /// Build the descriptor for one registered variant.
 ///
-/// All three post-trained checkpoints share the same mathematically active batch-CFG/APG/rescale
-/// path, so they expose the same guidance and negative-prompt surface. They differ only in
+/// All six checkpoints share the same mathematically active batch-CFG/APG/rescale path, so they
+/// expose the same guidance and negative-prompt surface. They differ only in
 /// `max_audio_duration_secs`.
+///
+/// # The `-base` variants advertise no extra capability, and that is the finding
+///
+/// sc-14546 was written expecting the base ids to set `supports_negative_prompt` and
+/// `supports_guidance` to `true` as a *divergence* from the post-trained ids. Both flags have been
+/// `true` for all three post-trained ids since sc-14544, pinned below with a comment saying so, and
+/// the code agrees: [`crate::dit::StableAudio3Dit::forward_guided`] takes its batch-1 shortcut on
+/// `cfg_scale == 1.0` alone, never on the checkpoint. Upstream's "these parameters have no effect on
+/// post-trained checkpoints" is a statement about what post-training did to the *weights*, not about
+/// a branch. Setting the flags per variant would therefore have meant *regressing* three shipped
+/// descriptors to manufacture a difference that does not exist.
+///
+/// What genuinely differs is the operating point a request resolves to when it omits `sampler`,
+/// `steps` or `guidance` — see [`Variant::recommended_sampler`], [`Variant::default_steps`] and
+/// [`Variant::default_guidance`]. `Capabilities` has no field for any of the three, so that
+/// difference is not advertised either; it is tracked with the other additive descriptor gaps as
+/// `sc-15041`.
 ///
 /// # Domain metadata is documentation-only
 ///
@@ -575,6 +1054,18 @@ pub fn sfx_descriptor() -> ModelDescriptor {
 
 pub fn medium_descriptor() -> ModelDescriptor {
     descriptor_for(Variant::Medium)
+}
+
+pub fn music_base_descriptor() -> ModelDescriptor {
+    descriptor_for(Variant::SmallMusicBase)
+}
+
+pub fn sfx_base_descriptor() -> ModelDescriptor {
+    descriptor_for(Variant::SmallSfxBase)
+}
+
+pub fn medium_base_descriptor() -> ModelDescriptor {
+    descriptor_for(Variant::MediumBase)
 }
 
 fn verify_file_pin(
@@ -710,11 +1201,24 @@ pub(crate) fn validate_request(
     Ok(())
 }
 
+/// Map the backend-neutral request onto this variant's runtime parameters.
+///
+/// Every "omitted" default is variant-bound (sc-14546): the post-trained ids resolve to upstream's
+/// 8-step Pingpong at `cfg_scale = 1.0`, the `-base` ids to [`BASE_DEFAULT_STEPS`] Euler steps at
+/// [`BASE_DEFAULT_GUIDANCE`]. Explicit request fields always win, on every id.
+///
+/// The sampler default now goes through [`Variant::recommended_sampler`] rather than the
+/// `None | Some("pingpong") => Pingpong` literal it replaced. That literal happened to be right for
+/// the three post-trained ids and is wrong for all three base ids, and it also meant
+/// [`SamplerKind::recommended`] — the port of upstream's own rule — was dead code on the provider
+/// path.
 fn synthesis_parameters(variant: Variant, request: &GenerationRequest) -> SynthesisParameters {
     let audio = request.audio.clone().unwrap_or_default();
     let method = request.guidance_method.as_deref();
     let guidance = Guidance {
-        cfg_scale: request.guidance.unwrap_or(DEFAULT_GUIDANCE as f32) as f64,
+        cfg_scale: request
+            .guidance
+            .unwrap_or(variant.default_guidance() as f32) as f64,
         apg_scale: match method {
             Some("cfg") | Some("cfg_rescale") => 0.0,
             Some("apg") => 1.0 - request.guidance_eta.unwrap_or(0.0) as f64,
@@ -732,9 +1236,10 @@ fn synthesis_parameters(variant: Variant, request: &GenerationRequest) -> Synthe
         duration_secs: audio
             .target_duration
             .unwrap_or_else(|| variant.default_duration_secs()),
-        steps: request.steps.unwrap_or(DEFAULT_STEPS as u32) as usize,
+        steps: request.steps.unwrap_or(variant.default_steps() as u32) as usize,
         sampler: match request.sampler.as_deref() {
-            None | Some("pingpong") => SamplerKind::Pingpong,
+            None => variant.recommended_sampler(),
+            Some("pingpong") => SamplerKind::Pingpong,
             Some("euler") => SamplerKind::Euler,
             Some("rk4") => SamplerKind::Rk4,
             Some("dpmpp") => SamplerKind::Dpmpp,
@@ -868,6 +1373,30 @@ pub fn medium_load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     Ok(Box::new(load_variant(Variant::Medium, spec)?))
 }
 
+pub fn load_music_base_generator(spec: &LoadSpec) -> gen_core::Result<StableAudio3Generator> {
+    load_variant(Variant::SmallMusicBase, spec)
+}
+
+pub fn load_sfx_base_generator(spec: &LoadSpec) -> gen_core::Result<StableAudio3Generator> {
+    load_variant(Variant::SmallSfxBase, spec)
+}
+
+pub fn load_medium_base_generator(spec: &LoadSpec) -> gen_core::Result<StableAudio3Generator> {
+    load_variant(Variant::MediumBase, spec)
+}
+
+pub fn music_base_load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    Ok(Box::new(load_variant(Variant::SmallMusicBase, spec)?))
+}
+
+pub fn sfx_base_load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    Ok(Box::new(load_variant(Variant::SmallSfxBase, spec)?))
+}
+
+pub fn medium_base_load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    Ok(Box::new(load_variant(Variant::MediumBase, spec)?))
+}
+
 impl Generator for StableAudio3Generator {
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
@@ -933,6 +1462,18 @@ candle_audio::register_generators! {
     pub const MEDIUM_REGISTRATION = medium_descriptor => medium_load
 }
 
+candle_audio::register_generators! {
+    pub const MUSIC_BASE_REGISTRATION = music_base_descriptor => music_base_load
+}
+
+candle_audio::register_generators! {
+    pub const SFX_BASE_REGISTRATION = sfx_base_descriptor => sfx_base_load
+}
+
+candle_audio::register_generators! {
+    pub const MEDIUM_BASE_REGISTRATION = medium_base_descriptor => medium_base_load
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -940,7 +1481,7 @@ mod tests {
         AdapterKind, AdapterSpec, AudioParams, Conditioning, Image, Quant,
     };
 
-    const VARIANTS: [Variant; 3] = Variant::ALL;
+    const VARIANTS: [Variant; 6] = Variant::ALL;
 
     /// The +6.9 s cold-start re-hash runs with both the generation and pipeline mutexes held, so a
     /// request cancelled during it must observe the cancellation there rather than after the load.
@@ -1001,8 +1542,11 @@ mod tests {
             // `tests/conformance.rs::each_variant_advertises_a_cap_its_own_geometry_can_serve`,
             // which is the gate that fails on a value change.
             let expected_cap = match variant {
-                Variant::SmallMusic | Variant::SmallSfx => MAX_DURATION_SECS,
-                Variant::Medium => MEDIUM_MAX_DURATION_SECS,
+                Variant::SmallMusic
+                | Variant::SmallSfx
+                | Variant::SmallMusicBase
+                | Variant::SmallSfxBase => MAX_DURATION_SECS,
+                Variant::Medium | Variant::MediumBase => MEDIUM_MAX_DURATION_SECS,
             };
             assert_eq!(
                 descriptor.capabilities.max_audio_duration_secs,
@@ -1015,6 +1559,13 @@ mod tests {
             assert_eq!(variant.default_duration_secs(), expected_cap);
             // sc-14544: both post-trained objectives share the batch-CFG/APG/rescale math, so SFX
             // must NOT be distinguished from music by a false guidance flag.
+            //
+            // sc-14546 re-reads this as the tripwire it is. The story asked for the `-base` ids to
+            // carry these two flags as a *divergence* from the post-trained ids; they have been
+            // `true` for every post-trained id since sc-14544, and `dit.rs`'s batch-1 shortcut keys
+            // on `cfg_scale == 1.0` and nothing else. Implementing that literally would mean
+            // flipping these three assertions to `false` for the post-trained ids — regressing
+            // shipped descriptors to invent a difference. If this loop starts failing, believe it.
             assert!(descriptor.capabilities.supports_negative_prompt);
             assert!(descriptor.capabilities.supports_guidance);
             assert_eq!(
@@ -1033,8 +1584,233 @@ mod tests {
         );
         assert_eq!(descriptor().id, "stable_audio_3_small_music");
         assert_eq!(sfx_descriptor().id, "stable_audio_3_small_sfx");
+        assert_eq!(medium_descriptor().id, "stable_audio_3_medium");
+        assert_eq!(
+            music_base_descriptor().id,
+            "stable_audio_3_small_music_base"
+        );
+        assert_eq!(sfx_base_descriptor().id, "stable_audio_3_small_sfx_base");
+        assert_eq!(medium_base_descriptor().id, "stable_audio_3_medium_base");
         assert_eq!((REGISTRATION.descriptor)().id, MODEL_ID);
         assert_eq!((SFX_REGISTRATION.descriptor)().id, SFX_MODEL_ID);
+        assert_eq!((MEDIUM_REGISTRATION.descriptor)().id, MEDIUM_MODEL_ID);
+        assert_eq!(
+            (MUSIC_BASE_REGISTRATION.descriptor)().id,
+            MUSIC_BASE_MODEL_ID
+        );
+        assert_eq!((SFX_BASE_REGISTRATION.descriptor)().id, SFX_BASE_MODEL_ID);
+        assert_eq!(
+            (MEDIUM_BASE_REGISTRATION.descriptor)().id,
+            MEDIUM_BASE_MODEL_ID
+        );
+    }
+
+    /// The identity gate's two repository-shaped fields must not collapse back into one.
+    ///
+    /// This is the highest-probability regression in sc-14546: `Variant::geometry` used to set
+    /// `expected_repo: self.hub_repo()`, and `validate_layout` compared that to the snapshot's
+    /// declared conditioner `repo_id`. Every base config declares its *post-trained sibling's*
+    /// repository, so a base variant whose gate value is its own `-base` repo rejects every base
+    /// snapshot that will ever exist. The inverse mistake — deleting the check — reopens the two
+    /// architecturally identical smalls to each other.
+    ///
+    /// Weight-free and discriminating in both directions: it asserts the fields differ exactly on
+    /// the three base variants and agree exactly on the three post-trained ones.
+    #[test]
+    fn base_variants_declare_their_post_trained_siblings_conditioner_repo() {
+        for variant in VARIANTS {
+            let geometry = variant.geometry();
+            assert_eq!(geometry.hub_repo, variant.hub_repo());
+            assert_eq!(
+                geometry.expected_conditioner_repo,
+                variant.conditioner_repo()
+            );
+            if variant.is_base() {
+                assert_ne!(
+                    variant.conditioner_repo(),
+                    variant.hub_repo(),
+                    "{}: a base snapshot declares its post-trained sibling's repo_id, so the gate \
+                     value must NOT be the base repository",
+                    variant.model_id()
+                );
+                assert!(variant.hub_repo().ends_with("-base"));
+                assert!(!variant.conditioner_repo().ends_with("-base"));
+            } else {
+                assert_eq!(
+                    variant.conditioner_repo(),
+                    variant.hub_repo(),
+                    "{}: a post-trained snapshot declares its own repo_id",
+                    variant.model_id()
+                );
+            }
+        }
+        // Each base variant shares its gate value with exactly its own post-trained sibling.
+        for (base, post) in [
+            (Variant::SmallMusicBase, Variant::SmallMusic),
+            (Variant::SmallSfxBase, Variant::SmallSfx),
+            (Variant::MediumBase, Variant::Medium),
+        ] {
+            assert_eq!(base.conditioner_repo(), post.conditioner_repo());
+            assert_ne!(base.hub_repo(), post.hub_repo());
+            assert_ne!(base.hub_revision(), post.hub_revision());
+            // ...and the objective is what separates them, in both directions.
+            assert_ne!(base.objective(), post.objective());
+            assert_eq!(
+                base.objective(),
+                crate::config::DiffusionObjective::RectifiedFlow
+            );
+            assert_eq!(
+                post.objective(),
+                crate::config::DiffusionObjective::RfDenoiser
+            );
+        }
+        // The two small bases are separated from each other by the gate value alone, exactly as the
+        // two post-trained smalls are.
+        assert_ne!(
+            Variant::SmallMusicBase.conditioner_repo(),
+            Variant::SmallSfxBase.conditioner_repo()
+        );
+    }
+
+    /// What each pair actually discriminates on, asserted rather than described.
+    ///
+    /// The medium pair is the sharp one: identical inventory, identical `sample_size`, identical
+    /// declared `repo_id`. If `expected_objective` were ever dropped from `VariantGeometry`, this
+    /// fails here — weight-free — instead of in a real-weight lane.
+    #[test]
+    fn each_post_trained_base_pair_has_at_least_one_config_level_discriminator() {
+        // Smalls: `sample_size` differs *and* the objective differs.
+        for (base, post) in [
+            (Variant::SmallMusicBase, Variant::SmallMusic),
+            (Variant::SmallSfxBase, Variant::SmallSfx),
+        ] {
+            assert_eq!(base.shape().sample_size, SMALL_BASE_MAX_SAMPLE_SIZE);
+            assert_eq!(post.shape().sample_size, SMALL_MAX_SAMPLE_SIZE);
+            assert_ne!(base.shape().sample_size, post.shape().sample_size);
+            // Everything else about the graph is the same, which is the point.
+            assert_eq!(base.shape().total_keys, post.shape().total_keys);
+            assert_eq!(base.shape().embed_dim, post.shape().embed_dim);
+            assert_eq!(base.shape().depth, post.shape().depth);
+            assert_eq!(base.shape().differential, post.shape().differential);
+        }
+        // Medium: the shapes are *identical*, so the objective is the entire config-level gate.
+        assert_eq!(
+            Variant::MediumBase.shape(),
+            Variant::Medium.shape(),
+            "medium and medium-base agree on every architectural field; if that ever stops being \
+             true the doc on `Variant::MediumBase` has to change with it"
+        );
+        assert_eq!(
+            Variant::MediumBase.conditioner_repo(),
+            Variant::Medium.conditioner_repo()
+        );
+        assert_ne!(
+            Variant::MediumBase.geometry(),
+            Variant::Medium.geometry(),
+            "the only thing left is `expected_objective` — without it the two geometries are equal \
+             and the SHA-256 pin is the sole defence"
+        );
+    }
+
+    /// Every omitted request field resolves to this variant's own operating point (sc-14546).
+    ///
+    /// Discriminating: the post-trained arm fails if the base numbers leak into it, the base arm
+    /// fails if the old hard-coded `8 / 1.0 / Pingpong` survives, and the explicit-override arm
+    /// fails if the defaults were made unconditional.
+    #[test]
+    fn omitted_request_fields_resolve_to_the_variants_own_operating_point() {
+        for variant in VARIANTS {
+            let resolved = synthesis_parameters(variant, &request());
+            let (steps, guidance, sampler) = if variant.is_base() {
+                (
+                    BASE_DEFAULT_STEPS,
+                    BASE_DEFAULT_GUIDANCE,
+                    SamplerKind::Euler,
+                )
+            } else {
+                (DEFAULT_STEPS, DEFAULT_GUIDANCE, SamplerKind::Pingpong)
+            };
+            assert_eq!(
+                resolved.steps,
+                steps,
+                "{} default steps",
+                variant.model_id()
+            );
+            assert_eq!(
+                resolved.guidance.cfg_scale,
+                guidance,
+                "{} default guidance",
+                variant.model_id()
+            );
+            assert_eq!(
+                resolved.sampler,
+                sampler,
+                "{} default sampler",
+                variant.model_id()
+            );
+
+            // Euler must not allocate Pingpong's per-step random tensors. This is the property the
+            // omitted-sampler default is worth having, stated as an executed assertion rather than
+            // as a claim about the solver.
+            let latent_elements = 256 * 16;
+            let estimate =
+                crate::sampler::resource_estimate(resolved.sampler, steps, 1, latent_elements)
+                    .unwrap();
+            if variant.is_base() {
+                assert_eq!(estimate.full_latent_noise_draws, 0);
+                assert_eq!(estimate.seeded_noise_device_elements, 0);
+            } else {
+                assert_eq!(estimate.full_latent_noise_draws, steps);
+                assert_eq!(
+                    estimate.seeded_noise_device_elements,
+                    latent_elements * steps
+                );
+            }
+            assert_eq!(estimate.model_calls, steps);
+
+            // Explicit fields win on every id, base included.
+            let mut explicit = request();
+            explicit.steps = Some(3);
+            explicit.guidance = Some(2.5);
+            explicit.sampler = Some("dpmpp".into());
+            let resolved = synthesis_parameters(variant, &explicit);
+            assert_eq!(resolved.steps, 3);
+            assert_eq!(resolved.guidance.cfg_scale, 2.5);
+            assert_eq!(resolved.sampler, SamplerKind::Dpmpp);
+            // ...including asking a base id for the post-trained default explicitly.
+            let mut pingpong = request();
+            pingpong.sampler = Some("pingpong".into());
+            assert_eq!(
+                synthesis_parameters(variant, &pingpong).sampler,
+                SamplerKind::Pingpong
+            );
+        }
+        // The defaults must actually differ across the split, or none of the above discriminates.
+        assert_ne!(DEFAULT_STEPS, BASE_DEFAULT_STEPS);
+        assert_ne!(DEFAULT_GUIDANCE, BASE_DEFAULT_GUIDANCE);
+    }
+
+    /// `SamplerKind::recommended` is the frozen-upstream rule; sc-14546 puts it on the provider path.
+    ///
+    /// The `expect` inside [`Variant::recommended_sampler`] is only sound while no registered
+    /// variant declares the unreachable `v` objective, so that is asserted rather than assumed.
+    #[test]
+    fn recommended_sampler_matches_the_frozen_objective_rule() {
+        for variant in VARIANTS {
+            assert_ne!(variant.objective(), crate::config::DiffusionObjective::V);
+            assert_eq!(
+                variant.recommended_sampler(),
+                SamplerKind::recommended(variant.objective()).unwrap()
+            );
+            assert_eq!(
+                variant.recommended_sampler(),
+                if variant.is_base() {
+                    SamplerKind::Euler
+                } else {
+                    SamplerKind::Pingpong
+                }
+            );
+        }
     }
 
     #[test]
@@ -1069,11 +1845,73 @@ mod tests {
         );
     }
 
+    /// No two registered checkpoints may share a root digest, and every pin set must be complete.
+    ///
+    /// sc-14546 makes this worth generalising: four of the six roots are exactly `2,270,384,940`
+    /// bytes and the remaining two are exactly `9,222,116,660`, so byte length authenticates
+    /// nothing. The T5Gemma stack is byte-identical across all six, which is why it is asserted
+    /// *equal* rather than distinct.
+    #[test]
+    fn every_registered_checkpoint_has_a_distinct_root_digest_and_a_complete_pin_set() {
+        let by_name = |pins: &'static [SnapshotFilePin], name: &str| {
+            pins.iter()
+                .find(|pin| pin.relative == name)
+                .unwrap_or_else(|| panic!("missing pin {name}"))
+        };
+        let gemma = by_name(
+            Variant::SmallMusic.pins(),
+            "t5gemma-b-b-ul2/model.safetensors",
+        )
+        .sha256;
+        let mut roots = Vec::new();
+        let mut configs = Vec::new();
+        for variant in VARIANTS {
+            let pins = variant.pins();
+            assert_eq!(pins.len(), 6, "{}", variant.model_id());
+            for relative in [
+                "model_config.json",
+                "model.safetensors",
+                "t5gemma-b-b-ul2/config.json",
+                "t5gemma-b-b-ul2/model.safetensors",
+                "t5gemma-b-b-ul2/tokenizer.json",
+                "t5gemma-b-b-ul2/tokenizer.model",
+            ] {
+                let pin = by_name(pins, relative);
+                assert_eq!(pin.sha256.len(), 64, "{}", variant.model_id());
+            }
+            assert_eq!(
+                by_name(pins, "t5gemma-b-b-ul2/model.safetensors").sha256,
+                gemma,
+                "{}: the bundled T5Gemma is byte-identical across all six SA3 repositories",
+                variant.model_id()
+            );
+            roots.push(by_name(pins, "model.safetensors").sha256);
+            configs.push(by_name(pins, "model_config.json").sha256);
+        }
+        let unique_roots: std::collections::BTreeSet<_> = roots.iter().collect();
+        assert_eq!(
+            unique_roots.len(),
+            VARIANTS.len(),
+            "two registrations share a root SHA-256"
+        );
+        let unique_configs: std::collections::BTreeSet<_> = configs.iter().collect();
+        assert_eq!(unique_configs.len(), VARIANTS.len());
+        // The byte lengths deliberately do NOT authenticate: four roots share one length, two share
+        // another. Committed so nobody "optimises" the hash away.
+        let lengths: std::collections::BTreeSet<u64> = VARIANTS
+            .iter()
+            .map(|variant| by_name(variant.pins(), "model.safetensors").bytes)
+            .collect();
+        assert_eq!(lengths.len(), 2, "{lengths:?}");
+    }
+
     #[test]
     fn every_variant_contributes_composite_and_component_license_rows() {
-        // Three registered variants x (composite, root, t5gemma). sc-14545 added the medium trio.
-        assert_eq!(WEIGHT_LICENSES.len(), 9);
-        assert_eq!(VARIANTS.len(), 3);
+        // Six registered variants x (composite, root, t5gemma). sc-14545 added the medium trio;
+        // sc-14546 the three `-base` trios. The base repositories are ungated on the Hub but ship
+        // the same Stability Community and Gemma license files, so the rows are not weaker.
+        assert_eq!(WEIGHT_LICENSES.len(), 18);
+        assert_eq!(VARIANTS.len(), 6);
         for variant in VARIANTS {
             let rows = variant.weight_licenses();
             assert_eq!(rows.len(), 3);
@@ -1227,6 +2065,10 @@ mod tests {
         for loader in [
             load as fn(&LoadSpec) -> gen_core::Result<Box<dyn Generator>>,
             sfx_load,
+            medium_load,
+            music_base_load,
+            sfx_base_load,
+            medium_base_load,
         ] {
             assert!(loader(&LoadSpec::new(WeightsSource::File(missing.clone()))).is_err());
 

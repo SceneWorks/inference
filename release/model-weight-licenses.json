@@ -273,6 +273,36 @@
       "restriction": "Use is governed by the Gemma Terms of Use and Prohibited Use Policy."
     },
     {
+      "provider_id": "stable_audio_3_medium_base",
+      "component": null,
+      "spdx_id": "LicenseRef-Stability-AI-Community",
+      "license_name": "Stability AI Community License",
+      "source_url": "https://huggingface.co/stabilityai/stable-audio-3-medium-base/blob/b32993f73c3bdc3864043a72d8032606bba737c8/LICENSE.md",
+      "commercial_use": false,
+      "attribution": "Stable Audio 3 Medium Base © Stability AI",
+      "restriction": "Use is governed by the Stability AI Community License, including its revenue threshold and prohibited-use terms."
+    },
+    {
+      "provider_id": "stable_audio_3_medium_base",
+      "component": "root",
+      "spdx_id": "LicenseRef-Stability-AI-Community",
+      "license_name": "Stability AI Community License",
+      "source_url": "https://huggingface.co/stabilityai/stable-audio-3-medium-base/blob/b32993f73c3bdc3864043a72d8032606bba737c8/LICENSE.md",
+      "commercial_use": false,
+      "attribution": "Stable Audio 3 Medium Base © Stability AI",
+      "restriction": "Use is governed by the Stability AI Community License, including its revenue threshold and prohibited-use terms."
+    },
+    {
+      "provider_id": "stable_audio_3_medium_base",
+      "component": "t5gemma",
+      "spdx_id": "LicenseRef-Gemma-Terms",
+      "license_name": "Gemma Terms of Use",
+      "source_url": "https://huggingface.co/stabilityai/stable-audio-3-medium-base/blob/b32993f73c3bdc3864043a72d8032606bba737c8/LICENSE_GEMMA.md",
+      "commercial_use": true,
+      "attribution": "T5Gemma model weights © Google",
+      "restriction": "Use is governed by the Gemma Terms of Use and Prohibited Use Policy."
+    },
+    {
       "provider_id": "stable_audio_3_small_music",
       "component": null,
       "spdx_id": "LicenseRef-Stability-AI-Community",
@@ -303,6 +333,36 @@
       "restriction": "Use is governed by the Gemma Terms of Use and Prohibited Use Policy."
     },
     {
+      "provider_id": "stable_audio_3_small_music_base",
+      "component": null,
+      "spdx_id": "LicenseRef-Stability-AI-Community",
+      "license_name": "Stability AI Community License",
+      "source_url": "https://huggingface.co/stabilityai/stable-audio-3-small-music-base/blob/eab5ceee5ad9c1ed38800aff30a8e49d1161c539/LICENSE.md",
+      "commercial_use": false,
+      "attribution": "Stable Audio 3 Small Music Base © Stability AI",
+      "restriction": "Use is governed by the Stability AI Community License, including its revenue threshold and prohibited-use terms."
+    },
+    {
+      "provider_id": "stable_audio_3_small_music_base",
+      "component": "root",
+      "spdx_id": "LicenseRef-Stability-AI-Community",
+      "license_name": "Stability AI Community License",
+      "source_url": "https://huggingface.co/stabilityai/stable-audio-3-small-music-base/blob/eab5ceee5ad9c1ed38800aff30a8e49d1161c539/LICENSE.md",
+      "commercial_use": false,
+      "attribution": "Stable Audio 3 Small Music Base © Stability AI",
+      "restriction": "Use is governed by the Stability AI Community License, including its revenue threshold and prohibited-use terms."
+    },
+    {
+      "provider_id": "stable_audio_3_small_music_base",
+      "component": "t5gemma",
+      "spdx_id": "LicenseRef-Gemma-Terms",
+      "license_name": "Gemma Terms of Use",
+      "source_url": "https://huggingface.co/stabilityai/stable-audio-3-small-music-base/blob/eab5ceee5ad9c1ed38800aff30a8e49d1161c539/LICENSE_GEMMA.md",
+      "commercial_use": true,
+      "attribution": "T5Gemma model weights © Google",
+      "restriction": "Use is governed by the Gemma Terms of Use and Prohibited Use Policy."
+    },
+    {
       "provider_id": "stable_audio_3_small_sfx",
       "component": null,
       "spdx_id": "LicenseRef-Stability-AI-Community",
@@ -328,6 +388,36 @@
       "spdx_id": "LicenseRef-Gemma-Terms",
       "license_name": "Gemma Terms of Use",
       "source_url": "https://huggingface.co/stabilityai/stable-audio-3-small-sfx/blob/ae12755283df9d62ca39a9b050a39a0b607b8c20/LICENSE_GEMMA.md",
+      "commercial_use": true,
+      "attribution": "T5Gemma model weights © Google",
+      "restriction": "Use is governed by the Gemma Terms of Use and Prohibited Use Policy."
+    },
+    {
+      "provider_id": "stable_audio_3_small_sfx_base",
+      "component": null,
+      "spdx_id": "LicenseRef-Stability-AI-Community",
+      "license_name": "Stability AI Community License",
+      "source_url": "https://huggingface.co/stabilityai/stable-audio-3-small-sfx-base/blob/cc5ddb990e30daa68336ac61c140c37c7033ab7c/LICENSE.md",
+      "commercial_use": false,
+      "attribution": "Stable Audio 3 Small SFX Base © Stability AI",
+      "restriction": "Use is governed by the Stability AI Community License, including its revenue threshold and prohibited-use terms."
+    },
+    {
+      "provider_id": "stable_audio_3_small_sfx_base",
+      "component": "root",
+      "spdx_id": "LicenseRef-Stability-AI-Community",
+      "license_name": "Stability AI Community License",
+      "source_url": "https://huggingface.co/stabilityai/stable-audio-3-small-sfx-base/blob/cc5ddb990e30daa68336ac61c140c37c7033ab7c/LICENSE.md",
+      "commercial_use": false,
+      "attribution": "Stable Audio 3 Small SFX Base © Stability AI",
+      "restriction": "Use is governed by the Stability AI Community License, including its revenue threshold and prohibited-use terms."
+    },
+    {
+      "provider_id": "stable_audio_3_small_sfx_base",
+      "component": "t5gemma",
+      "spdx_id": "LicenseRef-Gemma-Terms",
+      "license_name": "Gemma Terms of Use",
+      "source_url": "https://huggingface.co/stabilityai/stable-audio-3-small-sfx-base/blob/cc5ddb990e30daa68336ac61c140c37c7033ab7c/LICENSE_GEMMA.md",
       "commercial_use": true,
       "attribution": "T5Gemma model weights © Google",
       "restriction": "Use is governed by the Gemma Terms of Use and Prohibited Use Policy."
