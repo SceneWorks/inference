@@ -1161,6 +1161,14 @@ jobs:
           if ($process.ExitCode -ne 0) {
             throw "medium long-form render failed with exit code $($process.ExitCode)"
           }
+          # The sampler seeds its running peak with the baseline, so a sampler that observed nothing
+          # still returns the baseline and reports peak_delta_mib=0 — indistinguishable from "the
+          # render allocated no VRAM". A real medium render allocates gigabytes, so a zero delta
+          # means the probe is broken, not that the render was free.
+          if ($peakMiB -le $baselineMiB) {
+            throw ("nvidia-smi sampler observed no allocation above the $baselineMiB MiB baseline " +
+              "(peak $peakMiB MiB); the peak probe measured nothing")
+          }
           foreach ($seconds in 120, 300, 380) {
             Get-FileHash -Algorithm SHA256 (Join-Path $env:RUNNER_TEMP "sa3-medium-${seconds}s.wav")
           }
