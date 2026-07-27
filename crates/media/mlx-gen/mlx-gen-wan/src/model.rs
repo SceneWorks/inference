@@ -164,14 +164,14 @@ const TE_QUANT_BITS: i32 = 8;
 /// MLX-affine tier iff a pre-quantized snapshot manifest is present (`config.quantization`) **or** a
 /// load-time `Q4`/`Q8` `spec.quantize` was requested (`Nvfp4` is candle-only and never reaches the MLX
 /// Wan path — excluded so its `bits()` = 4 is not routed through `mlx quantize`). On such a tier the TE
-/// packs to [`TE_QUANT_BITS`] (Q8), retiring the residual ~12 GiB f32-TE-encode active peak (sc-12796)
+/// packs to `TE_QUANT_BITS` (Q8), retiring the residual ~12 GiB f32-TE-encode active peak (sc-12796)
 /// that no further component offload could lower — the epic's binding 5B constraint. On the bf16 tier
 /// this is `None` (the TE stays dense / bit-exact). Shared by the 5B [`Wan`], the A14B [`Wan14b`], and
-/// the VACE paths (`model_vace.rs`).
-pub(crate) fn effective_te_quant(
-    config: &WanModelConfig,
-    load_quant: Option<Quant>,
-) -> Option<WanQuant> {
+/// the VACE paths (`model_vace.rs`) — and, since sc-15203, by `mlx-gen-krea-realtime`, whose Krea
+/// Realtime 14B tiers reuse this same stock-Wan UMT5-XXL encoder and therefore this same Q8 floor.
+/// `pub` for that cross-crate reuse: the floor's rationale (and `TE_QUANT_BITS`) must live in exactly
+/// one place rather than being re-derived per Wan-family provider.
+pub fn effective_te_quant(config: &WanModelConfig, load_quant: Option<Quant>) -> Option<WanQuant> {
     let dit_affine_quantized =
         config.quantization.is_some() || matches!(load_quant, Some(Quant::Q4) | Some(Quant::Q8));
     dit_affine_quantized.then_some(WanQuant {

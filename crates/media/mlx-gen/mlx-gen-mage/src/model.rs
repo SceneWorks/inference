@@ -283,6 +283,84 @@ pub fn load(variant: MageVariant, spec: &LoadSpec) -> Result<Box<dyn Generator>>
         _ => {}
     }
     let dirs = resolve_component_dirs(root, spec)?;
+    assemble(variant, spec, dirs)
+}
+
+/// Construct a Mage-Flow generator from a caller-owned **fine-tuned transformer** (sc-15036,
+/// epic 14034 F6) — the artifact a full base fine-tune (sc-14056) writes.
+///
+/// Two things distinguish this from [`load`], and both are forced by what a fine-tune *is*:
+///
+/// 1. **`spec.weights` is the fine-tuned `transformer/` component directory itself** (a
+///    `config.json` + `diffusion_pytorch_model.safetensors` pair, exactly what the trainer's
+///    `save_full_checkpoint` emits), NOT a diffusers snapshot root. A training run produces the
+///    DiT alone; it never re-emits the text encoder or VAE, so there is no snapshot root to point
+///    at and no flat-layout sibling to fall back to. Both shared components must therefore be
+///    caller-staged in [`LoadSpec::components`] — normally the installed base model's own
+///    `text_encoder/` + `vae/`, which a fine-tune leaves untouched and is numerically paired with
+///    by construction. A missing one is a typed error here rather than a mid-load "No such file".
+/// 2. **The pinned-checkpoint identity verification is skipped.** That guard exists to catch one
+///    *published* variant's snapshot staged under another published variant's id, and it works by
+///    hashing a prefix of `transformer_blocks.0.attn.add_k_proj.bias`. A full fine-tune trains
+///    every DiT weight including that bias, so the guard would reject the user's own trained
+///    checkpoint **by construction** — it cannot distinguish "fine-tuned from Base" from "the
+///    wrong published checkpoint", because the caller is the only one who knows. `variant` states
+///    which published checkpoint the run started from, and with it the architecture, the
+///    sampling regime (steps / CFG / distillation) and the edit-vs-generate input assembly the
+///    fine-tune inherits.
+///
+/// Deliberately kept off the registry `load(id, spec)` path (like Krea's
+/// `load_from_native_dit_file`): a fine-tune is a caller-owned artifact at an arbitrary path, not
+/// a published id, so it is reached through this explicit API rather than by resolving an id.
+pub fn load_finetuned(variant: MageVariant, spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+    if spec.precision != Precision::Bf16 || !spec.adapters.is_empty() {
+        return Err(Error::Unsupported(
+            "mage_flow fine-tuned checkpoints load as bf16/Q4/Q8 without adapters".into(),
+        ));
+    }
+    let transformer = match &spec.weights {
+        WeightsSource::Dir(dir) => dir.clone(),
+        WeightsSource::File(file) => {
+            return Err(Error::Msg(format!(
+                "mage_flow: a fine-tuned checkpoint is a transformer DIRECTORY (config.json + \
+                 diffusion_pytorch_model.safetensors), got the file {}",
+                file.display()
+            )))
+        }
+    };
+    mlx_gen::gen_core::reject_unknown_components(spec, REQUIRED_COMPONENTS, FAMILY)?;
+    let staged = |id: &str| -> Result<std::path::PathBuf> {
+        match spec.components.get(id) {
+            Some(WeightsSource::Dir(dir)) => Ok(dir.clone()),
+            Some(WeightsSource::File(file)) => Err(Error::Msg(format!(
+                "mage_flow: the '{id}' component must be staged as a directory, got the file {}",
+                file.display()
+            ))),
+            // No flat-layout fallback: a fine-tune dir has no component siblings, so silently
+            // probing `<transformer>/text_encoder` would only turn a staging bug into a confusing
+            // deep load failure.
+            None => Err(Error::Msg(format!(
+                "mage_flow: loading a fine-tuned transformer requires the '{id}' component to be \
+                 staged from the installed base model — a training run produces the transformer \
+                 alone"
+            ))),
+        }
+    };
+    let dirs = MageComponentDirs {
+        transformer,
+        text_encoder: staged(COMPONENT_TEXT_ENCODER)?,
+        vae: staged(COMPONENT_VAE)?,
+    };
+    assemble(variant, spec, dirs)
+}
+
+/// Build the pipeline + generator from already-resolved component dirs — the half [`load`] and
+/// [`load_finetuned`] share once each has decided *where* the components live.
+fn assemble(
+    variant: MageVariant,
+    spec: &LoadSpec,
+    dirs: MageComponentDirs,
+) -> Result<Box<dyn Generator>> {
     let part = if variant.is_edit() {
         crate::vae::VaePart::Both
     } else {
@@ -699,6 +777,313 @@ mod tests {
         assert_eq!((got.dit, got.text_encoder, got.vae), (300, 700, 50));
 
         std::fs::remove_dir_all(root).ok();
+    }
+
+    /// A minimal but structurally valid safetensors file carrying exactly the Base identity tensor
+    /// (`transformer_blocks.0.attn.add_k_proj.bias`, BF16, `[3072]`) filled with `fill` — enough for
+    /// [`verify_checkpoint_identity`] to parse the header, seek, and hash. Nothing loads these
+    /// weights; the tests below only exercise which *guard* fires.
+    fn load_error(result: Result<Box<dyn Generator>>, context: &str) -> String {
+        match result {
+            Ok(_) => panic!("{context}"),
+            Err(error) => error.to_string(),
+        }
+    }
+
+    fn write_identity_only_checkpoint(path: &Path, fill: u8) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let payload = 3072 * 2; // BF16 [3072]
+        let header = format!(
+            "{{\"{BASE_IDENTITY_TENSOR}\":{{\"dtype\":\"BF16\",\"shape\":[3072],\"data_offsets\":[0,{payload}]}}}}"
+        );
+        let mut bytes = Vec::with_capacity(8 + header.len() + payload);
+        bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend(std::iter::repeat_n(fill, payload));
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// sc-15036 — `load_finetuned` must get PAST the pinned-checkpoint identity guard that `load`
+    /// enforces, because a full base fine-tune (sc-14056) rewrites every DiT weight *including*
+    /// `transformer_blocks.0.attn.add_k_proj.bias`, so `load` rejects the user's own trained
+    /// checkpoint by construction.
+    ///
+    /// Discriminating in both directions on ONE fabricated checkpoint:
+    ///   * `load(Base, …)` must fail with the **fingerprint-mismatch** message — delete the guard
+    ///     and this half fails;
+    ///   * `load_finetuned(Base, …)` must fail with something else entirely (it reaches component
+    ///     staging) — route `load_finetuned` back through the guard and this half fails.
+    #[test]
+    fn load_finetuned_bypasses_the_pinned_checkpoint_identity_guard() {
+        let root = std::env::temp_dir().join(format!(
+            "mage-finetuned-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+        ));
+        let transformer = root.join("transformer");
+        write_identity_only_checkpoint(
+            &transformer.join("diffusion_pytorch_model.safetensors"),
+            0x5a,
+        );
+
+        // `load` sees a snapshot ROOT and hashes `<root>/transformer/…`: the fill is not the pinned
+        // Base fingerprint, so the guard fires.
+        let published = load_error(
+            load(
+                MageVariant::Base,
+                &LoadSpec::new(WeightsSource::Dir(root.clone())),
+            ),
+            "a checkpoint whose identity tensor moved must not load as published Base",
+        );
+        assert!(
+            published.contains("checkpoint fingerprint mismatch"),
+            "expected the identity guard to fire, got: {published}"
+        );
+
+        // `load_finetuned` is handed the SAME root — deliberately, so the mutation "delegate to
+        // `load`" is caught: under it this call would report the fingerprint mismatch above. The
+        // real entrypoint treats the path as the transformer dir itself and never opens
+        // `<path>/transformer`, so it gets past identity and fails later, at the actual load.
+        let staged = std::env::temp_dir().join("mage-finetuned-nonexistent-component");
+        let finetuned = load_error(
+            load_finetuned(
+                MageVariant::Base,
+                &LoadSpec::new(WeightsSource::Dir(root.clone()))
+                    .with_component(COMPONENT_TEXT_ENCODER, WeightsSource::Dir(staged.clone()))
+                    .with_component(COMPONENT_VAE, WeightsSource::Dir(staged)),
+            ),
+            "the fabricated checkpoint has no real components to load",
+        );
+        assert!(
+            !finetuned.contains("checkpoint fingerprint"),
+            "load_finetuned must not enforce the published-checkpoint fingerprint, got: {finetuned}"
+        );
+        // ...and the transformer dir it DID read is the one it was handed.
+        assert!(
+            transformer.is_dir(),
+            "fixture sanity: the nested published-layout transformer dir exists"
+        );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// sc-15036 — the shared components are REQUIRED for a fine-tune and there is deliberately no
+    /// flat-layout fallback: a training run emits the transformer alone, so probing
+    /// `<transformer>/text_encoder` would turn a staging bug into a confusing deep load failure.
+    /// Each missing id must be named. Also pins that a FILE weights source is refused (a fine-tune
+    /// is a directory).
+    #[test]
+    fn load_finetuned_requires_both_shared_components_to_be_staged() {
+        let root = std::env::temp_dir().join(format!(
+            "mage-finetuned-components-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let dir = |name: &str| WeightsSource::Dir(root.join(name));
+
+        let bare = load_error(
+            load_finetuned(
+                MageVariant::Base,
+                &LoadSpec::new(WeightsSource::Dir(root.clone())),
+            ),
+            "no components staged",
+        );
+        assert!(
+            bare.contains(COMPONENT_TEXT_ENCODER),
+            "the missing component must be named, got: {bare}"
+        );
+
+        let vae_only = load_error(
+            load_finetuned(
+                MageVariant::Base,
+                &LoadSpec::new(WeightsSource::Dir(root.clone()))
+                    .with_component(COMPONENT_TEXT_ENCODER, dir("te")),
+            ),
+            "the VAE is still missing",
+        );
+        assert!(
+            vae_only.contains(COMPONENT_VAE),
+            "the missing VAE must be named, got: {vae_only}"
+        );
+
+        let as_file = load_error(
+            load_finetuned(
+                MageVariant::Base,
+                &LoadSpec::new(WeightsSource::File(
+                    root.join("diffusion_pytorch_model.safetensors"),
+                )),
+            ),
+            "a fine-tune is a transformer directory, not a single file",
+        );
+        assert!(
+            as_file.contains("transformer DIRECTORY"),
+            "expected the directory-shape refusal, got: {as_file}"
+        );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// sc-15036 real-weights end-to-end (epic 14034 F6): TRAIN a full base fine-tune, then RENDER
+    /// with it through [`load_finetuned`], pairing the trained transformer with the base snapshot's
+    /// own text encoder + VAE — the exact assembly the SceneWorks `mage_finetuned` worker lane
+    /// performs.
+    ///
+    /// This is the claim the story exists to make true, so it is proved on real weights rather than
+    /// asserted: before it, the checkpoint could not be loaded at all (the pinned-fingerprint guard
+    /// rejects a retrained `add_k_proj.bias` by construction).
+    ///
+    /// The training step is deliberately GENTLE (4 steps at lr 1e-7, resolution 64) — this test is
+    /// about the load + pairing seam, not convergence, and a gentle run is what makes the render a
+    /// meaningful assertion. Measured on this checkpoint: at 10 steps / lr 1e-5 the run genuinely
+    /// collapses the model onto its two-solid-swatch dataset and renders a FLAT FIELD, which would
+    /// pass any "did we get pixels" check while telling you nothing about whether the trained
+    /// transformer was correctly paired with the base's text encoder and VAE. At this budget the
+    /// fine-tuned checkpoint still renders the base's own image, so the structure assertions below
+    /// — dynamic range plus non-repeating rows, the same pair `base_real_weights.rs` uses — fail if
+    /// the assembly is wrong in any way that degrades the decode.
+    ///
+    ///     MAGE_BASE_SNAPSHOT=<flat Mage-Flow-Base snapshot> \
+    ///     MAGE_FINETUNE_RENDER_OUT=/tmp/finetuned.png \
+    ///     cargo test -p mlx-gen-mage --lib finetune_then_render -- --ignored --nocapture
+    #[test]
+    #[ignore = "needs real Mage-Flow-Base weights (MAGE_BASE_SNAPSHOT) and an authorized Metal device"]
+    fn finetune_then_render_through_load_finetuned() {
+        use crate::transformer::{TRANSFORMER_CONFIG_FILE, TRANSFORMER_WEIGHTS_FILE};
+        use mlx_gen::train::{TrainingConfig, TrainingItem, TrainingRequest};
+
+        let Ok(root) = std::env::var("MAGE_BASE_SNAPSHOT") else {
+            return;
+        };
+        let root = std::path::PathBuf::from(&root);
+        let tmp = std::env::temp_dir().join(format!("mage_finetune_render_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // --- train (tiny) ---
+        let mut items = Vec::new();
+        for (i, colour) in [[220u8, 60, 40], [40, 90, 210]].into_iter().enumerate() {
+            let path = tmp.join(format!("swatch_{i}.png"));
+            let mut im = image::RgbImage::new(96, 96);
+            for px in im.pixels_mut() {
+                *px = image::Rgb(colour);
+            }
+            im.save(&path).unwrap();
+            items.push(TrainingItem::captioned(
+                path,
+                format!("a solid colour swatch {i}"),
+            ));
+        }
+        let out_dir = tmp.join("finetune");
+        let mut trainer =
+            crate::training::load_trainer(&LoadSpec::new(WeightsSource::Dir(root.clone())))
+                .unwrap();
+        let output = trainer
+            .train(
+                &TrainingRequest {
+                    items,
+                    config: TrainingConfig {
+                        full_finetune: true,
+                        steps: 4,
+                        resolution: 64,
+                        learning_rate: 1e-7,
+                        train_dtype: "f32".into(),
+                        save_every: 0,
+                        sample_every: 0,
+                        seed: 7,
+                        ..Default::default()
+                    },
+                    output_dir: out_dir.clone(),
+                    file_name: "finetune.safetensors".into(),
+                    trigger_words: vec![],
+                    cancel: mlx_gen::CancelFlag::new(),
+                },
+                &mut |_| {},
+            )
+            .expect("the full fine-tune runs");
+        drop(trainer);
+        println!(
+            "[sc-15036] trained {} steps, final loss {:.5}; checkpoint at {}",
+            output.steps,
+            output.final_loss,
+            out_dir.display()
+        );
+        // The artifact really is a transformer component dir, not an adapter file.
+        assert!(out_dir.join(TRANSFORMER_CONFIG_FILE).is_file());
+        assert!(out_dir.join(TRANSFORMER_WEIGHTS_FILE).is_file());
+
+        // --- render through the fine-tuned entrypoint ---
+        // `spec.weights` is the trained transformer dir; the shared components come from the
+        // INSTALLED base, exactly as the worker lane stages them.
+        let spec = LoadSpec::new(WeightsSource::Dir(out_dir.clone()))
+            .with_component(
+                COMPONENT_TEXT_ENCODER,
+                WeightsSource::Dir(root.join("text_encoder")),
+            )
+            .with_component(COMPONENT_VAE, WeightsSource::Dir(root.join("vae")));
+        let model = match load_finetuned(MageVariant::Base, &spec) {
+            Ok(model) => model,
+            Err(error) => panic!("the fine-tuned checkpoint must load: {error}"),
+        };
+
+        let request = GenerationRequest {
+            prompt: "a red apple on a wooden table, soft daylight".to_owned(),
+            width: 512,
+            height: 512,
+            count: 1,
+            seed: Some(11),
+            steps: Some(20),
+            guidance: Some(5.0),
+            ..Default::default()
+        };
+        let out = model
+            .generate(&request, &mut |_| {})
+            .expect("the fine-tuned checkpoint renders");
+        let GenerationOutput::Images(images) = out else {
+            panic!("expected images");
+        };
+        let image = images.into_iter().next().expect("one image");
+        assert_eq!((image.width, image.height), (512, 512));
+        // Real STRUCTURE, not merely non-blank: full dynamic range and non-repeating rows. A flat
+        // field (what a heavier fine-tune on this dataset legitimately produces, and also what a
+        // mis-paired text encoder or a broken VAE decode produces) fails both.
+        let (min, max) = image
+            .pixels
+            .iter()
+            .fold((u8::MAX, u8::MIN), |(lo, hi), &v| (lo.min(v), hi.max(v)));
+        assert!(
+            max.saturating_sub(min) >= 32,
+            "the fine-tuned render has collapsed dynamic range: {min}..={max}"
+        );
+        let repeated_rows = image
+            .pixels
+            .chunks_exact(512 * 3)
+            .collect::<Vec<_>>()
+            .windows(2)
+            .filter(|rows| rows[0] == rows[1])
+            .count();
+        println!(
+            "[sc-15036] fine-tuned render dynamic range {min}..={max}; repeated adjacent rows \
+             {repeated_rows}/511"
+        );
+        assert!(
+            repeated_rows < 51,
+            "the fine-tuned render has {repeated_rows} repeated adjacent rows — the trained \
+             transformer is not correctly paired with the base's text encoder / VAE"
+        );
+
+        if let Ok(png) = std::env::var("MAGE_FINETUNE_RENDER_OUT") {
+            image::RgbImage::from_raw(image.width, image.height, image.pixels.clone())
+                .expect("rgb buffer")
+                .save(&png)
+                .expect("png writes");
+            println!("[sc-15036] wrote {png}");
+        }
+
+        std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]

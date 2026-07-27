@@ -514,10 +514,16 @@ impl CausalKreaTransformer {
 /// `ffn.0`/`ffn.2` (the converted DiT renames them to `ffn.fc1`/`ffn.fc2`); [`normalize_wan_key`]
 /// bridges that in [`CausalKreaTransformer::adaptable_mut`], so this file-naming surface stays the one
 /// a LoRA file speaks. Single source of truth for [`AdaptableHost::adaptable_paths`] (the kohya
-/// `flattened → dotted` table), kept in lock-step with the resolver by tests. The whole-model globals
-/// (patch/text/time embeddings, `head`) are NOT exposed — the reused inner
-/// [`WanTransformer`] routes only the per-block surface, matching the Wan
-/// DiT's own adaptable surface; a global-target key surfaces as unmatched (loud), never mis-folded.
+/// `flattened → dotted` table), kept in lock-step with the resolver by tests.
+///
+/// The whole-model globals (patch/text/time embeddings, `time_projection`, `head`) are **deliberately
+/// NOT exposed** — this surface is per-block-only *by design*, not by omission. It matches the reused
+/// inner [`WanTransformer`]'s own adaptable surface, which routes only the per-block Linears, and the
+/// canonical Wan-family style LoRAs target exactly those. It is therefore **narrower** than the
+/// SCAIL-2 host, which additionally exposes globals; a global-target key surfaces here as unmatched
+/// (loud, a hard error from the strict installer), never mis-folded. Whether to widen it or relax to a
+/// soft skip is the open decision on S13 (sc-8446) / S15 (sc-15017), to be settled against a real Wan
+/// style LoRA rather than guessed at here.
 pub(crate) fn krea_adaptable_paths(num_layers: usize) -> Vec<String> {
     let mut paths = Vec::with_capacity(num_layers * 10);
     for i in 0..num_layers {
@@ -534,14 +540,21 @@ pub(crate) fn krea_adaptable_paths(num_layers: usize) -> Vec<String> {
 
 /// Install inference LoRA(s) onto the Krea Realtime DiT as forward-time residuals (sc-15015, S14).
 /// Krea Realtime 14B is Wan-2.1-14B T2V weight-for-weight, so the family-agnostic
-/// [`mlx_gen::adapters::loader`] path (the `mlx-gen-scail2` dense-Wan template) resolves a diffusers /
-/// PEFT / kohya / LoKr / LoHa file directly against the DiT's module names — the residual install the
-/// Z-Image / Qwen / SCAIL-2 providers use. The only wrinkle vs. SCAIL-2: Krea's DiT is the *converted*
-/// [`WanTransformer`] (whose adaptable surface names the FFN `ffn.fc1`/
-/// `ffn.fc2`), so a reference-named key (`ffn.0`/`ffn.2`) is normalized to the converted layout via the
-/// shared Wan key-normalizer before delegating to the inner host. Adapters apply *over* the dense bf16
-/// base as a forward-time residual (`base(x) + scale·x·A·B`); the quant/packed-tier install (Q4/Q8 via
-/// `apply_wan_adapters_additive`) is the separate quant-tier story (S19).
+/// [`mlx_gen::adapters::loader`] path resolves a diffusers / PEFT / kohya / LoKr / LoHa file directly
+/// against the DiT's module names — the same residual install the Z-Image / Qwen / SCAIL-2 providers
+/// use. Two deliberate differences from SCAIL-2, so "follows the SCAIL-2 template" is not read as
+/// "identical to it": (1) Krea's DiT is the *converted* [`WanTransformer`] (whose adaptable surface
+/// names the FFN `ffn.fc1`/`ffn.fc2`), so a reference-named key (`ffn.0`/`ffn.2`) is normalized to the
+/// converted layout via the shared Wan key-normalizer before delegating to the inner host; and (2) the
+/// exposed surface is **per-block-only by design** (see `krea_adaptable_paths`), where SCAIL-2 also
+/// exposes whole-model globals.
+///
+/// Adapters apply as a forward-time residual (`base(x) + scale·x·A·B`) rather than folding into the
+/// weights, which makes them **tier-agnostic** (sc-15203): the identical install runs over a dense bf16
+/// base and over a packed Q4/Q8 one, with the packed base never dequantized — the additive-on-packed
+/// property epic 10043 / sc-10578 established for the Wan family, delivered here by the shared
+/// [`AdaptableLinear`] rather than by a separate `apply_wan_adapters_additive` path. `t2v` therefore
+/// installs adapters *after* any quantization, so the residual is a dense add over the quantized matmul.
 impl AdaptableHost for CausalKreaTransformer {
     fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
         // Normalize the Wan reference / diffusers key (`ffn.0`→`ffn.fc1`, …) to the inner converted
