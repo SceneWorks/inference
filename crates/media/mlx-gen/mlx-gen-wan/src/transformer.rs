@@ -676,9 +676,11 @@ impl AdaptableHost for WanTransformer {
 /// Deliberately **not** folded into [`AdaptableHost::adaptable_paths`] for [`WanTransformer`]: that
 /// surface is also the LoRA **trainer**'s target enumeration ([`crate::training`]), so widening it would
 /// change what a Wan fine-tune can be pointed at. This is an opt-in *inference* surface a host composes
-/// in — `mlx-gen-krea-realtime` does, so a real Wan-T2V step-distill LoRA (lightx2v / FastWan), which
-/// carries genuine low-rank factors for all seven of these, installs instead of hard-erroring as an
-/// unmatched target (sc-8446, S13).
+/// in — `mlx-gen-krea-realtime` does, so a real Wan-T2V step-distill LoRA (lightx2v / FastWan) installs
+/// instead of hard-erroring as an unmatched target (sc-8446, S13). Those files carry genuine low-rank
+/// factors for **six** of these seven — `patch_embedding` ships only a `.diff_b` bias delta — which is
+/// why a real install reports 406 targets against a 407-wide surface. The list stays seven wide because
+/// it describes the Linears the model HAS, not the ones a given file happens to populate.
 pub const WAN_GLOBAL_ADAPTABLE_PATHS: &[&str] = &[
     "patch_embedding_proj",
     "text_embedding_0",

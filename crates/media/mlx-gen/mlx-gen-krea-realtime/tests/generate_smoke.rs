@@ -389,7 +389,7 @@ fn decode_tiling_overlap_survives_but_the_tile_is_still_starved() {
     );
 }
 
-/// The request the real-weight smoke builds must be inside the model's *advertised* surface/// The request the real-weight smoke builds must be inside the model's *advertised* surface, checked
+/// The request the real-weight smoke builds must be inside the model's *advertised* surface, checked
 /// against the registered descriptor with no weights on disk. Discriminating: it goes through
 /// `Generator::validate` (the same floor `run` self-applies), so a smoke that quietly drifted
 /// out-of-surface — a guidance scale on this CFG-off model, an unadvertised sampler, a size below the
@@ -668,7 +668,16 @@ fn report(label: &str, r: &RunResult, w: usize, h: usize, frames: usize) {
     }
 }
 
-/// **The S13 clip.** Full product path at the requested geometry: coherence, timing, memory.
+/// **The S13 product-path run:** timing, memory, and the *structural* coherence floor.
+///
+/// ⚠️ **This gate does NOT certify image quality, and the clip it produces is known to be visibly
+/// corrupted** (sc-15325 — the tiled VAE decode blows ~26% of one frame in eight to near-white). The
+/// assertions below check flatness, plausible mean, tail motion and gross brightness drift; **none of
+/// those is violated by the corruption**, which is precisely why it went unnoticed in the first cut of
+/// this work. `report_artifacts` is therefore called on the product clip so the clipping figure is at
+/// least *printed* by the story's headline run — a green tick here means "the pipeline ran and produced
+/// a structurally sane clip", not "the clip looks right". Tightening this into a real quality gate
+/// depends on sc-15325 landing, since today it would fail by design.
 #[test]
 #[ignore = "real ~20 GB (q4) / ~40 GB (bf16) snapshot; run with --ignored on macOS (see module doc)"]
 fn t2v_produces_a_coherent_clip() {
@@ -692,6 +701,9 @@ fn t2v_produces_a_coherent_clip() {
         "the decode must be trimmed back to the requested frame count"
     );
     assert_coherent(&r.frames, w, h, "t2v");
+    // Print what `assert_coherent` structurally cannot see (sc-15325). Compare the clipping figure
+    // against the ~0.08% a single-pass decode of the same latents achieves.
+    report_artifacts(&r.frames, "t2v/product-path");
     dump_frames(&r.frames, "t2v");
 }
 
@@ -870,15 +882,16 @@ fn v2v_strength_zero_preserves_the_source() {
     assert_coherent(&r.frames, w, h, "v2v/strength=0");
 }
 
-/// **sc-15325, measured: the overlap fix helps but the TILE is the dominant term.**
+/// **sc-15325, measured: tile size dominates, but overlap is a real secondary term.**
 ///
-/// A focused two-point check of the claim the decision record rests on, on real weights: at a fixed
-/// tile size, widening the overlap from the old 2 output frames (0 latent) to 8 (2 latent) must help —
-/// and must then **plateau**, because the remaining error is receptive-field starvation the blend
-/// cannot recover. Growing the tile instead must beat both by a wide margin.
+/// A focused check of the claim the decision record rests on, on real weights. The comparison that
+/// matters is at a **fixed tile**, because `split_spatial` clamps `overlap` to `tile − 1` in *latent*
+/// space: at the shipped latent tile of 2 the overlap is already maxed at 1, so tile-2 rows cannot say
+/// how much blending is worth. This drives the shipped config, a same-tile/larger-overlap arm at a tile
+/// where overlap has room, and a larger tile.
 ///
-/// This is the test that would fail if the "it is a blending problem, so the fix is free" reading were
-/// right — and it is the reading an earlier cut of this work shipped in its decision record.
+/// The "fixed" arm is taken from `decode_tiling` itself rather than hard-coded, so it tests whatever
+/// the product actually emits.
 #[test]
 #[ignore = "real snapshot; run with --ignored on macOS (see module doc)"]
 fn decode_tile_size_dominates_overlap() {
@@ -942,27 +955,49 @@ fn decode_tile_size_dominates_overlap() {
         }),
     };
 
-    let single = decode(None);
-    let old = mean_abs_delta(&single, &decode(Some(&cfg(8, 2)))); // 0 latent overlap (pre-fix)
-    let fixed = mean_abs_delta(&single, &decode(Some(&cfg(8, 8)))); // 2 latent overlap (post-fix)
-    let bigger = mean_abs_delta(&single, &decode(Some(&cfg(32, 8)))); // 8 latent tile
+    // The SHIPPED config, read from the product policy rather than hard-coded.
+    let shipped = decode_tiling(h, w, (latent_frames * 4) as i32).expect("the clip must tile");
+    let st = shipped.temporal.expect("temporal tiling");
     println!(
-        "  sc-15325 vs single-pass: tile 8/ov 2 (old) = {old:.2}, tile 8/ov 8 (fixed) = {fixed:.2}, \
-         tile 32/ov 8 = {bigger:.2} (all /255)"
+        "  shipped: tile {} / overlap {} (latent {} / {})",
+        st.tile_frames,
+        st.overlap_frames,
+        st.tile_frames / 4,
+        (st.overlap_frames / 4).min(st.tile_frames / 4 - 1)
+    );
+
+    let single = decode(None);
+    let old = mean_abs_delta(&single, &decode(Some(&cfg(st.tile_frames, 2)))); // latent overlap 0
+    let now = mean_abs_delta(&single, &decode(Some(&shipped))); // latent overlap 1 (clamp max here)
+                                                                // Overlap has room to move only at a larger tile.
+    let big_lo = mean_abs_delta(&single, &decode(Some(&cfg(16, 4)))); // latent 4 / 1
+    let big_hi = mean_abs_delta(&single, &decode(Some(&cfg(16, 8)))); // latent 4 / 2
+    let bigger = mean_abs_delta(&single, &decode(Some(&cfg(32, 8)))); // latent 8 / 2
+    println!(
+        "  vs single-pass: shipped-tile overlap 0 = {old:.2}, shipped (overlap 1) = {now:.2}; \
+         latent tile 4 overlap 1 = {big_lo:.2} -> overlap 2 = {big_hi:.2}; latent tile 8 = {bigger:.2}"
     );
 
     assert!(
-        fixed < old,
-        "the overlap floor did not help at all ({fixed:.2} vs {old:.2})"
+        now < old,
+        "the overlap floor did not help at the shipped tile ({now:.2} vs {old:.2})"
     );
+    // Overlap is a REAL secondary term where it has room — this is the claim the earlier, degenerate
+    // tile-2-only comparison could not make.
     assert!(
-        bigger < fixed * 0.5,
-        "growing the TILE ({bigger:.2}) did not decisively beat widening the OVERLAP ({fixed:.2}) — \
-         the sc-15325 root cause (receptive-field starvation, not blending) needs revisiting"
+        big_hi < big_lo,
+        "doubling the overlap at latent tile 4 did not help ({big_hi:.2} vs {big_lo:.2}) — the \
+         decision record says blending is a real secondary term; it would be wrong"
+    );
+    // ...and tile size still dominates it by a wide margin.
+    assert!(
+        bigger < big_hi * 0.5,
+        "growing the TILE ({bigger:.2}) did not decisively beat widening the OVERLAP ({big_hi:.2}) — \
+         sc-15325's primary-term claim needs revisiting"
     );
 }
 
-/// **sc-15325 root cause: decode the SAME real t2v latents single-pass/// **sc-15325 root cause: decode the SAME real t2v latents single-pass vs. every tiling candidate.**
+/// **sc-15325 root cause: decode the SAME real t2v latents single-pass vs. every tiling candidate.**
 ///
 /// This is the experiment the whole diagnosis rests on. It generates a real clip's latents once, then
 /// decodes them repeatedly — single-pass (the reference every tiled decode approximates) and across a

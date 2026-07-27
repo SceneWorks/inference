@@ -147,10 +147,19 @@ impl VaeTiling {
     /// exceeds it (only reachable at resolutions far beyond any shipped bucket).
     ///
     /// On MLX 0.31.2 exceeding this returned **wrong pixels, silently** (the widest write is a conv3d).
-    /// **sc-12748: on the current pin (0.32.0, #3524) that conv is int64-safe** (see
-    /// [`MAX_WRITABLE_ELEMS`]), so this is no longer a correctness bound — it is retained as a
-    /// defense-in-depth tiling trigger (tiling yields correct output regardless) and is still used by
-    /// callers that want a conservative single-pass ceiling.
+    /// sc-12748 recorded that on the current pin (0.32.0, #3524) that conv is int64-safe (see
+    /// [`MAX_WRITABLE_ELEMS`]), and concluded this is no longer a correctness bound — retained as a
+    /// defense-in-depth tiling trigger and a conservative single-pass ceiling.
+    ///
+    /// ⚠️ **That conclusion is contradicted by observation and by this module's own
+    /// [`budgeted_plan`] doc, which still calls it "the correctness bound that memory cannot see".**
+    /// During sc-8446 an 84-output-frame single-pass z16 decode at 832×480 — 1.5× over this cap —
+    /// produced a washed-out result that diverges from every tiled decode of the same latents **at
+    /// frame 0** (saturation 0.068 vs 0.329; the two agree at 0.293 when the same comparison is run at
+    /// 36 frames, under the cap). A correct decode's first frame cannot depend on the clip length, so
+    /// this is the silently-wrong-wide-write signature, not a tiling artifact. Not root-caused to this
+    /// exact write, so the doc is not rewritten — but **do not rely on "no longer a correctness
+    /// bound"**. Tracked as sc-15352; until it is settled, treat exceeding this cap as unsafe.
     pub fn writable_frame_cap(&self, out_h: i32, out_w: i32) -> i64 {
         let per_frame = self.full_res_channels as i64 * out_h as i64 * out_w as i64;
         if per_frame <= 0 {

@@ -312,12 +312,14 @@ jobs:
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model krea-realtime-14b-mlx --snapshot "$KREA_REALTIME_SNAPSHOT"
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model wan-origami-style-lora --snapshot "$KREA_STYLE_LORA_SNAPSHOT"
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model wan-lightx2v-step-distill-lora --snapshot "$KREA_DISTILL_LORA_SNAPSHOT"
-      # Coherence + per-chunk/whole-clip timing + the MLX memory ceiling, then the i2v single-frame
-      # anchor and the v2v strength=0 paths, then the sc-15325 decode-tiling characterization.
+      # Coherence floor + per-chunk/whole-clip timing + the MLX memory ceiling, then the i2v
+      # single-frame anchor, the v2v strength=0 paths, and the sc-15325 decode-tiling characterization.
       #
-      # `KREA_SMOKE_FRAMES` is set PER STEP, not on the job: `kv_cache_residency_at_the_production_
-      # geometry` and the decode sweep are about the *production* 81-frame clip, and a job-scoped 33
-      # would silently gate them at the wrong geometry.
+      # 33 frames, not 81, and that is required rather than incidental: the sc-15325 sweep compares
+      # against a SINGLE-PASS decode, which is only valid below the z16 write cap of 56 output frames at
+      # 832x480 (the sweep asserts this itself and would fail at 81). `KREA_SMOKE_FRAMES` is set PER
+      # STEP so the one test that genuinely needs the production geometry -- the KV-cache residency,
+      # whose 6-latent-frame window must fill -- can run at 81 in its own step below.
       - name: Run Krea Realtime real-weight e2e (Q4 tier)
         env:
           KREA_SMOKE_W: "832"

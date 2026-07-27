@@ -146,40 +146,67 @@ fn resolve_request_config(
 ///
 /// Measured on real latents at 832×480 / 36 output frames, decoding the **same** latent every way and
 /// comparing against a single-pass reference (`tests/generate_smoke.rs::
-/// decode_tiling_sweep_against_single_pass`). "latent" columns are after `TilePlan::plan` divides by
-/// the z16 `temporal_scale` of 4:
+/// decode_tiling_sweep_against_single_pass`). The "latent" column is what actually runs: `TilePlan::
+/// plan` divides both tile and overlap by the z16 `temporal_scale` of 4, and `split_spatial` then
+/// clamps `overlap` to `tile − 1`.
 ///
-/// | tile / overlap (output) | latent | mean \|Δ\| /255 | highlight clipping mean / worst | MLX active peak |
+/// | tile / overlap (output) | latent tile / overlap | mean \|Δ\| /255 | clipping mean / worst | MLX active peak |
 /// |---|---|---|---|---|
 /// | single-pass | — | 0 (reference) | 0.08% / 0.25% | 85.1 GiB |
 /// | **8 / 2 — the ORIGINAL shipped value** | 2 / **0** | **18.5** | **9.7% / 26.6%** | 19.8 GiB |
-/// | 8 / 8 — what this function now emits | 2 / 2 | 17.1 | 5.2% / 14.7% | 19.8 GiB |
+/// | **8 / 4 — what this function now emits** | 2 / **1** | 17.1 | 5.2% / 14.7% | 19.8 GiB |
+/// | 16 / 4 | 4 / 1 | 7.5 | 1.8% / 12.9% | 38.5 GiB |
 /// | 16 / 8 | 4 / 2 | 6.4 | 1.4% / 7.0% | 38.5 GiB |
-/// | 32 / 16 | 8 / 4 | 2.0 | 0.1% / 1.1% | 75.8 GiB |
+/// | 32 / 8 | 8 / 2 | 2.5 | 0.08% / 0.25% | 75.8 GiB |
+/// | 32 / 16 | 8 / 4 | 2.0 | 0.14% / 1.1% | 75.8 GiB |
 ///
 /// This is not a cosmetic seam. At the original setting one frame in eight blows **26% of its pixels**
 /// to near-white with violet/green chroma separation and rainbow fringing, against 0.25% single-pass —
 /// the same latents decode to a photographic image single-pass and to a psychedelic one tiled.
 ///
-/// **The dominant term is TILE SIZE, not overlap.** Widening the overlap alone plateaus immediately
-/// (latent overlap 0 → 1 → 2 gives 18.5 → 17.1 → 17.1), while growing the tile keeps paying
-/// (latent 2 → 4 → 8 gives 18.5 → 6.4 → 2.0). So the mechanism is a **starved temporal receptive
-/// field**: two latent frames is less context than the z16 decoder's temporal convolutions need, and no
-/// amount of blending between two starved windows reconstructs what neither of them saw. An earlier
-/// reading of this bug as a *blending* failure (zero latent overlap ⇒ `trapezoidal_mask` has nothing to
-/// blend) is a real defect but a **minor** contributor, and predicts a free fix that the measurements
-/// above refute.
+/// ### Which knob — read the pairs at FIXED tile
 ///
-/// **What is fixed here, and what is not.** The overlap is now `max(tile/4, temporal_scale)` so it
-/// survives the ÷4 — free (identical 19.8 GiB peak) and it roughly halves the clipping. The tile size
-/// is **not** raised, because tile size *is* the memory bound: 16 costs 38.5 GiB and 32 costs 75.8 GiB
-/// against a whole-pipeline Q4 peak of 27.9 GiB, so raising it re-opens `mlx.minMemoryGb` for this
-/// engine **and** for `mlx-gen-scail2`, which computes the identical budget. That is a product decision
-/// about memory floors, not a local cleanup — **sc-15325** carries the full curve.
+/// ⚠️ At latent tile 2 the overlap clamp caps overlap at **1**, so `overlap = 4` is already the maximum
+/// legal value there and any larger request plans identically. The tile-2 rows therefore say nothing
+/// about how much blending is worth; only the fixed-tile pairs above it do:
 ///
-/// The families that route through [`budgeted_plan`](mlx_gen::tiling::budgeted_plan) instead (Wan
-/// z16/z48, LTX) pick from candidate tables of 24–96 output frames with 8–24-frame overlaps, so they
-/// are **not** in this regime. The exposure is this function and its `mlx-gen-scail2` twin.
+/// | comparison | mean \|Δ\| | worst-frame clipping | peak |
+/// |---|---|---|---|
+/// | overlap ×2 at latent tile 4 (1→2) | 7.5 → 6.4 (**−15%**) | 12.9% → 7.0% (**−46%**) | 38.5 → 38.5 GiB |
+/// | overlap ×2 at latent tile 8 (2→4) | 2.5 → 2.0 (**−22%**) | already at the single-pass floor | 75.8 → 75.8 GiB |
+/// | tile ×2 at matched overlap ratio (4/1 → 8/2) | 7.5 → 2.5 (**−67%**) | 12.9% → 0.25% | 38.5 → **75.8 GiB** |
+/// | tile ×2 at matched overlap ratio (4/2 → 8/4) | 6.4 → 2.0 (**−70%**) | 7.0% → 1.1% | 38.5 → **75.8 GiB** |
+///
+/// So **tile size dominates** (−67…−70% per doubling) but **overlap is a real secondary term**, not a
+/// negligible one (−15…−22% on mean error and −46% on worst-frame clipping at latent tile 4). An
+/// earlier cut of this note called blending a minor contributor on the strength of the tile-2 rows; that
+/// was a degenerate comparison and the claim is withdrawn.
+///
+/// The practical consequence for sc-15325: **raise the tile AND scale the overlap with it.** Overlap is
+/// free in *peak* (identical 38.5 / 75.8 GiB across each pair — it changes the stride and therefore the
+/// number of passes, i.e. wall time, not the resident window), so there is no reason to buy a bigger
+/// tile and leave the overlap at 1 latent frame.
+///
+/// ### What is fixed here, and what is not
+///
+/// The overlap is now `max(tile/4, temporal_scale)` so it survives the ÷4 — free, and it roughly halves
+/// the clipping. At the shipped tile that lands on latent overlap 1, which the clamp makes the maximum
+/// available; the remaining headroom is only reachable by growing the tile. The tile is **not** raised
+/// here, because tile size *is* the memory bound (38.5 / 75.8 GiB against a whole-pipeline Q4 peak of
+/// 27.9 GiB), so raising it re-opens `mlx.minMemoryGb` for this engine **and** for `mlx-gen-scail2`,
+/// which computes the identical budget. That is a product decision about memory floors — **sc-15325**
+/// carries the full curve.
+///
+/// ### Exposure
+///
+/// `mlx-gen-scail2` computes the identical `(tile_frames / 4).max(1)` from the same pxframe budget and
+/// collapses the same way. The collapse needs `tile_frames ∈ {8, 12}` — i.e. `budget_frames < 16`, i.e.
+/// **≥ ~233k px/frame**: 640×384, 512×512, 768×512, 832×480, 1280×720 all collapse; 512×384 (budget 17
+/// → tile 16 → latent overlap 1) does **not**. Wan z16/z48 route through
+/// [`budgeted_plan`](mlx_gen::tiling::budgeted_plan) and bottom out at latent tile 8 / overlap 2 — clear
+/// by the measurements above. **LTX is NOT cleared**: its `temporal_scale` is 8, so its smallest
+/// candidate bottoms out at latent tile **3** / overlap 1 — below the latent-4 tile that still measured
+/// 6.4/255 here. Unmeasured, and on sc-15325's step 1 alongside scail2.
 #[doc(hidden)]
 pub fn decode_tiling(out_h: usize, out_w: usize, out_frames: i32) -> Option<TilingConfig> {
     let px_per_frame = (out_h as i64) * (out_w as i64);

@@ -514,6 +514,11 @@ fn per_lora_scale_scales_the_residual() {
 /// keys but dropped the residual would still silently under-apply a real step-distill LoRA. So this
 /// installs a LoRA that targets **only** globals — every one in the reference/file spelling a real
 /// lightx2v / FastWan file carries — and requires all seven to install and the forward to change.
+///
+/// NB: this fixture deliberately targets **all seven** to exercise the whole routing surface. A *real*
+/// step-distill file populates only six (`patch_embedding` ships a `.diff_b` bias delta with no
+/// low-rank pair), which is the 406-vs-407 gap asserted in `causal.rs` and on the real weights in
+/// `tests/style_lora_real_weights.rs`. Seven here is a statement about the host, not about those files.
 #[test]
 fn globals_install_end_to_end_and_change_the_forward() {
     let cfg = tiny_cfg();
@@ -546,7 +551,8 @@ fn globals_install_end_to_end_and_change_the_forward() {
         .expect("a globals-only Wan LoRA must install (sc-8446 widened the surface)");
     assert_eq!(
         report.applied, 7,
-        "all seven whole-model globals must install, not just resolve"
+        "all seven whole-model globals must install (this synthetic file targets all seven; a real \
+         step-distill file populates six — see the note above)"
     );
     assert!(report.unmatched_paths.is_empty());
 

@@ -662,8 +662,10 @@ mod tests {
 
     /// sc-8446 S13 — the settled globals decision, pinned. A real Wan-T2V **step-distill** LoRA
     /// (lightx2v `Wan2.1-T2V-14B` cfg-step-distill v2, `FastWan` T2V-14B) carries low-rank factors for
-    /// all seven whole-model Linears in exactly these file spellings; every one must now be an adaptable
-    /// target or `apply_adapters_strict` rejects the whole file.
+    /// six of the seven whole-model Linears in exactly these file spellings (`patch_embedding` ships a
+    /// `.diff_b` bias delta only) — and every one of the seven must be an adaptable target or
+    /// `apply_adapters_strict` rejects the whole file. The surface is seven wide because it describes
+    /// the model; the *install* count is six, which is the 406-vs-407 gap pinned just below.
     #[test]
     fn step_distill_lora_global_target_keys_are_adaptable_paths() {
         let paths: BTreeSet<String> = krea_adaptable_paths(40).into_iter().collect();
