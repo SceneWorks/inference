@@ -157,9 +157,13 @@ impl VaeTiling {
     /// produced a washed-out result that diverges from every tiled decode of the same latents **at
     /// frame 0** (saturation 0.068 vs 0.329; the two agree at 0.293 when the same comparison is run at
     /// 36 frames, under the cap). A correct decode's first frame cannot depend on the clip length, so
-    /// this is the silently-wrong-wide-write signature, not a tiling artifact. Not root-caused to this
-    /// exact write, so the doc is not rewritten — but **do not rely on "no longer a correctness
-    /// bound"**. Tracked as sc-15352; until it is settled, treat exceeding this cap as unsafe.
+    /// this is the silently-wrong-wide-write signature, not a tiling artifact.
+    ///
+    /// ⚠️ Scope of that evidence: it is **one over-cap and one under-cap point**. It establishes a
+    /// *length-dependent* correctness failure; it does **not** establish that the threshold is exactly
+    /// this cap. A bisection belongs in the story before this doc is rewritten rather than annotated.
+    /// Tracked as **sc-15402** (which also links the prior sc-12438 / sc-12748 work); until it is
+    /// settled, treat exceeding this cap as unsafe.
     pub fn writable_frame_cap(&self, out_h: i32, out_w: i32) -> i64 {
         let per_frame = self.full_res_channels as i64 * out_h as i64 * out_w as i64;
         if per_frame <= 0 {
