@@ -466,6 +466,7 @@ impl QwenImageEdit {
                             out_w,
                             out_h,
                             &req.cancel,
+                            &req.preview,
                             progress,
                         )
                     },

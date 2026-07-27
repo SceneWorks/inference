@@ -438,6 +438,7 @@ impl QwenImage {
                             req.height,
                             start_step,
                             &req.cancel,
+                            &req.preview,
                             progress,
                         )
                     },

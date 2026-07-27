@@ -93,7 +93,8 @@ pub use registry::{
 };
 pub use runtime::{
     AdapterApplyReport, AdapterKind, AdapterSpec, CancelFlag, IdentityWeights, LoadPhase, LoadSpec,
-    MoeExpert, OffloadPolicy, PidWeights, Precision, Progress, Quant, WeightsSource,
+    MoeExpert, OffloadPolicy, PidWeights, Precision, PreviewFrame, PreviewSink, Progress, Quant,
+    WeightsSource,
 };
 pub use text_embed::{TextEmbedder, TextEmbedderDescriptor};
 pub use tiling::{TilingConfig, VaeTiling};

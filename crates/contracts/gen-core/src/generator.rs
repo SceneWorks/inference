@@ -7,7 +7,7 @@
 //! trait split (which breaks on multi-modal models).
 
 use crate::media::{AudioChunk, AudioTrack, Image};
-use crate::runtime::{CancelFlag, Progress, Quant};
+use crate::runtime::{CancelFlag, PreviewSink, Progress, Quant};
 use crate::voice_embed::VoiceEmbedding;
 use crate::{
     Error, ImageMemoryPhase, ImageMemoryProviderContract, ImageMemoryRequestScope,
@@ -439,6 +439,19 @@ pub struct GenerationRequest {
 
     // --- Control ---
     pub cancel: CancelFlag,
+    /// Per-step latent-preview sink: a supporting engine emits a small linear latent→RGB
+    /// approximation of the developing image on each denoise evaluation, so a consumer UI can
+    /// render the image developing instead of a bare progress bar. The inert
+    /// [`PreviewSink::default`] costs a supporting engine one
+    /// [`is_active`](PreviewSink::is_active) check per evaluation and nothing else — the
+    /// projection is skipped entirely, so a request that does not ask for previews is
+    /// byte-for-byte unaffected.
+    ///
+    /// A request **field** (the [`CancelFlag`] pattern), deliberately not a [`Progress`] variant:
+    /// `Progress` stays `Copy` and no exhaustive match downstream changes. Support is per-engine
+    /// and opt-in — an engine that never emits simply never calls it, which is indistinguishable
+    /// from an inert sink at the consumer. See [`PreviewSink`] for the frame contract.
+    pub preview: PreviewSink,
 }
 
 /// Quality-preserving execution levers for a single generation.
@@ -678,6 +691,7 @@ impl Default for GenerationRequest {
             audio: None,
             phases: None,
             cancel: CancelFlag::default(),
+            preview: PreviewSink::default(),
         }
     }
 }
@@ -818,6 +832,7 @@ impl GenerationRequest {
             use_pid: _,
             memory: _,
             cancel: _,
+            preview: _,
             // The audio sub-block carries its own floats — destructured below the flat knobs.
             audio,
             // The multi-phase list carries per-phase floats (guidance + adapter weights), checked

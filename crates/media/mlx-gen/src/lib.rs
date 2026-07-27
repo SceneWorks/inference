@@ -100,7 +100,8 @@ pub use registry::{
 pub use residency::{Residency, StagedHeavy};
 pub use runtime::{
     AdapterApplyReport, AdapterKind, AdapterSpec, CancelFlag, IdentityWeights, LoadPhase, LoadSpec,
-    MoeExpert, OffloadPolicy, PidWeights, Precision, Progress, Quant, WeightsSource,
+    MoeExpert, OffloadPolicy, PidWeights, Precision, PreviewFrame, PreviewSink, Progress, Quant,
+    WeightsSource,
 };
 pub use sampler::{
     curated_sampler_names, curated_scheduler_names, resolve_flow_schedule, resolve_schedule,
