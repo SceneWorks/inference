@@ -17,6 +17,29 @@ use candle_audio_stable_audio_3::sampler::{
 use candle_audio_stable_audio_3::weights::SnapshotLayout;
 use candle_nn::VarBuilder;
 
+/// The crate's three-way real-weight device selector, identical to `same_oracle.rs` and
+/// `chunked_oracle.rs`.
+///
+/// The three real-weight cases below each branched on `SA3_TEST_METAL` alone, so on the CUDA lanes
+/// — which set `SA3_TEST_CUDA` — they silently executed on `Device::Cpu`. A requested backend that
+/// is unavailable is a hard failure, never a fallback.
+fn test_device() -> Device {
+    if std::env::var_os("SA3_TEST_METAL").is_some() {
+        Device::new_metal(0).expect("SA3_TEST_METAL requested but Metal is unavailable")
+    } else if std::env::var_os("SA3_TEST_CUDA").is_some() {
+        #[cfg(feature = "cuda")]
+        {
+            Device::new_cuda(0).expect("SA3_TEST_CUDA requested but CUDA is unavailable")
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            panic!("SA3_TEST_CUDA requires --features cuda")
+        }
+    } else {
+        Device::Cpu
+    }
+}
+
 fn values(tensor: &Tensor) -> Vec<f32> {
     tensor
         .to_dtype(DType::F32)
@@ -840,11 +863,7 @@ fn metrics(actual: &Tensor, expected: &Tensor) -> (f64, f32) {
 #[test]
 #[ignore = "requires all six pinned immutable snapshots; set SA3_*_SNAPSHOT"]
 fn all_six_real_p0_pingpong_trajectories_match_stepwise() {
-    let device = if std::env::var_os("SA3_TEST_METAL").is_some() {
-        Device::new_metal(0).expect("SA3_TEST_METAL requested but Metal is unavailable")
-    } else {
-        Device::Cpu
-    };
+    let device = test_device();
     for case in REAL_CASES {
         let layout = SnapshotLayout::from_dir(&snapshot(case.env)).unwrap();
         assert_eq!(layout.config.sample_size, case.max_samples, "{}", case.env);
@@ -948,11 +967,7 @@ fn max_abs_diff(left: &Tensor, right: &Tensor) -> f32 {
 #[test]
 #[ignore = "requires pinned small-music post/base snapshots and real 2B CFG forwards"]
 fn real_sampler_cfg_apg_scale_phi_matches_frozen_upstream() {
-    let device = if std::env::var_os("SA3_TEST_METAL").is_some() {
-        Device::new_metal(0).expect("SA3_TEST_METAL requested but Metal is unavailable")
-    } else {
-        Device::Cpu
-    };
+    let device = test_device();
     let guidance_artifact = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../../docs/migration/sa3-sampler-reference/guidance.safetensors");
     let guidance_oracle = unsafe {
@@ -1053,11 +1068,7 @@ fn real_default_sampler_resource_probe() {
         .expect("SA3_RESOURCE_SECONDS is required")
         .parse()
         .expect("SA3_RESOURCE_SECONDS must be numeric");
-    let device = if std::env::var_os("SA3_TEST_METAL").is_some() {
-        Device::new_metal(0).expect("SA3_TEST_METAL requested but Metal is unavailable")
-    } else {
-        Device::Cpu
-    };
+    let device = test_device();
     let layout = SnapshotLayout::from_dir(&snapshot_path).unwrap();
     let model_config = match &layout.config.model {
         candle_audio_stable_audio_3::config::ModelConfig::Diffusion(model) => model,

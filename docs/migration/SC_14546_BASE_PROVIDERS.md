@@ -163,14 +163,72 @@ blindly:
    otherwise would be proving a bug.
 3. At `cfg_scale = 7.0` — the base default — it requires the negative-prompt divergence, measured in
    the same latent space from the same initial noise at the same single Euler step, to exceed the
-   floor from step 1 by at least 10×.
+   floor from step 1.
 
-A second case runs the same two facts end to end through `provider_registry().load(…)` on decoded
-PCM, which is what covers `GenerationRequest::negative_prompt` actually reaching the conditioner.
+Be precise about what step 3 proves. The floor is an *agreement* quantity (`3.685e-3` on Metal /
+`small-music-base`) and the divergence is a *signal* quantity (`368.9`), so the comparison
+discriminates exactly one alternative: a divergence of zero, i.e. negative threading removed
+outright. It says nothing about a negative branch that is threaded but wired **wrongly**. No second,
+larger multiple of the floor is asserted — an earlier draft required `≥ 10×`, which was a number
+chosen by taste that bought nothing at a measured margin of `100,105×`.
+
+What covers a mis-wired-but-non-zero branch is a separate case in the same file,
+`the_guided_latents_are_exactly_the_cfg_recomposition_of_their_own_two_branches`. With
+`apg_scale = 0`, `cfg_norm_threshold = 0` and `scale_phi = 0`, `dit::guided_prediction` reduces
+algebraically to `uncond + g·(cond − uncond)` in v-space, and one Euler step is affine in the model
+output, so the guided latents are pinned to an **identity**:
+
+```text
+L_guided(P, N, g) == L(N) + g · (L(P) − L(N))
+```
+
+where `L(X)` is the same Euler step at `cfg_scale = 1.0` — the batch-1 branch — on prompt `X`, and
+`N` is the negative embedding *after* the attention-mask multiply `forward_guided_impl` applies
+before batching. The only difference between the two sides is batch-2 versus batch-1 numerics.
+
+The bound is the same frozen-Torch floor, read at this comparison's own guidance scale. Both
+quantities are guided-space disagreements, and `uncond + g·(cond − uncond) = g·cond − (g − 1)·uncond`
+amplifies an independent per-branch error by `2g − 1`. The floor is measured at the oracle's
+`g = 2.5` (factor 4) and the residual at the base default `g = 7` (factor 13), so the floor is scaled
+by `13/4`. That is the same numerics at a different guidance scale, not slack: the first draft used
+the unscaled floor, which passed on Metal and **failed on CPU** (residual `5.05e-3` against a floor
+of `4.03e-3`) — a Metal-only bound, exactly the accident the rescaling removes.
+
+| | frozen-Torch floor (`g = 2.5`) | rescaled bound (`g = 7`) | correct recomposition | swapped halves | weight as `g − 1` | negative mask dropped |
+|---|---:|---:|---:|---:|---:|---:|
+| Metal | 3.684998e-3 | 1.1976e-2 | **6.1035e-5** | 1140.78 | 87.75 | 454.28 |
+| CPU | 4.028320e-3 | 1.3092e-2 | **5.050659e-3** | 1138.90 | 87.61 | 454.05 |
+
+Every one of those mis-wirings diverges from the no-negative render just as loudly as the correct
+wiring, so every one passes step 3 — and misses this bound by four orders of magnitude.
+
+`tests/dit_oracle.rs`'s `real_weights_detect_conditioning_mutations_and_exercise_cfg_apg` is the
+third leg: it is the only case that separates *absent* negative conditioning — which takes the
+`zero_cross_context_from_batch` path and zeroes the entire cross context — from an explicit
+all-invalid negative prompt, which retains its conditioned duration row. It ran in no lane before
+this story; sc-14546 wires it into `sa3-base-identity-{metal,cuda}` and switches it from a hardcoded
+`Device::Cpu` to the shared selector, since every assertion in it is a self-comparison between two
+real-weight forwards and it must certify the backend whose CFG path it covers.
+
+A further case runs the inertness/materiality pair end to end through `provider_registry().load(…)`
+on decoded PCM, which is what covers `GenerationRequest::negative_prompt` actually reaching the
+conditioner.
 
 CLAP text-audio similarity is deliberately **not** a gate. It is not guaranteed monotonic in CFG, so
 a monotonicity assertion would be a flake generator rather than a correctness gate. The hard gate is
 fixed-guidance frozen-Torch parity.
+
+## Device selection
+
+Every real-weight SA3 target now honours the same three-way selector — `SA3_TEST_METAL`, then
+`SA3_TEST_CUDA` (hard-failing without `--features cuda`), then `Device::Cpu` — that `same_oracle.rs`
+and `chunked_oracle.rs` already carried. `base_guidance.rs`, `sampler_oracle.rs` and `dit_oracle.rs`
+branched on `SA3_TEST_METAL` alone, so on the CUDA lanes they silently ran on `Device::Cpu`: this
+story's headline gate and the frozen-Torch floor it derives, both documented as measured "on this
+exact checkpoint, device and dtype", were not measuring the CUDA lane's device at all. A requested
+backend that is unavailable is now a hard failure, never a fallback. `dtype_policy.rs` selects by
+cargo feature rather than env var, and `dit_oracle.rs`'s `all_six_cpu_f32_predictions_match_p0` pins
+`Device::Cpu` by name; both are deliberate and unchanged.
 
 ## CI
 
@@ -183,18 +241,34 @@ fixed-guidance frozen-Torch parity.
   exclusion is documented at `weights.rs:17` and asserted in that module's tests.
 - Two new job pairs in `real-weights.yml`:
   - **`sa3-base-identity-{metal,cuda}`** provisions all six pinned snapshots and owns the full
-    `--test variant_binding` matrix, `--test base_guidance`, and the two `sampler_oracle`
+    `--test variant_binding` matrix, `--test base_guidance`, `dit_oracle`'s
+    `real_weights_detect_conditioning_mutations_and_exercise_cfg_apg`, and the two `sampler_oracle`
     real-weight cases (`all_six_real_p0_pingpong_trajectories_match_stepwise` and
-    `real_sampler_cfg_apg_scale_phi_matches_frozen_upstream`) that previously ran in **no lane at
-    all** — the second of which is this story's own fixed-guidance parity gate. It sets
+    `real_sampler_cfg_apg_scale_phi_matches_frozen_upstream`) — all four of which previously ran in
+    **no lane at all**, and one of which is this story's own fixed-guidance parity gate. It sets
     `SA3_REQUIRE_ALL_SNAPSHOTS: "1"`, because a silently skipped gate on the one job that has every
-    snapshot is a gate that runs nowhere.
+    snapshot is a gate that runs nowhere. That variable is read only by `variant_binding`, so
+    sc-14546 also drops it from the medium jobs, which no longer run that target.
   - **`sa3-small-base-{metal,cuda}`** owns the two small-base providers' conformance, floor
     calibration and defaulted renders.
 - `--test variant_binding` is **removed** from the small-sfx and medium jobs: since this story every
   gate in that target needs both sides of a post-trained/base pair, and those jobs provision two and
   five snapshots respectively. Running it there would fail on a missing snapshot — the correct
   failure, but the wrong job.
+
+  Net effect on coverage, stated exactly rather than waved at:
+
+  - On `schedule`, `workflow_dispatch` with `profile=all`, and `profile=audio`, coverage **increases**.
+    `sa3-base-identity-*` runs the full 13-case matrix, whereas the step it replaced in
+    `sa3-small-sfx-*` had been a *hard failure* since sc-14545: that job never sets
+    `SA3_MEDIUM_SNAPSHOT`, and `variant_binding`'s `medium()` helper panics when it is unset.
+  - On `workflow_dispatch` with `profile=sa3-small-sfx` or `profile=sa3-medium`, `variant_binding`
+    now runs **nowhere**. That is a real narrowing and it is deliberate: neither profile's snapshot
+    set can pass the target, so the only thing the old wiring produced on those dispatches was that
+    same panic. Reach the matrix through `profile=sa3-base-identity`, `profile=audio` or
+    `profile=all`. The `sa3-base-identity-*` jobs are not added to the two narrower profiles'
+    conditions because they would drag all six snapshots — including the 10.4 GB medium pair — onto
+    a dispatch chosen precisely to avoid them.
 - The medium jobs gain `stable_audio_3_medium_base` conformance, floor calibration and its defaulted
   render, because they already provision that 10.4 GB snapshot for the identity gates.
 - `sampler_oracle`'s real-weight cases are selected **by name**, not by `--test sampler_oracle --

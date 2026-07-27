@@ -15,7 +15,7 @@
 //! prompt and a default base request genuinely does not. Both halves are asserted, in the same run,
 //! against the same checkpoint.
 //!
-//! # The divergence floor is derived, not invented
+//! # What the divergence assertion proves, and what it does not
 //!
 //! "A negative prompt changes the output" is only evidence if the change is bigger than the
 //! implementation's own numerical disagreement with the reference. So the divergence gate measures
@@ -23,11 +23,29 @@
 //! (`docs/migration/sa3-sampler-reference/guidance.safetensors`) on this exact checkpoint, device
 //! and dtype, records the largest per-element gap against the reference, and then requires the
 //! negative-prompt divergence — measured in the same latent space, from the same initial noise, at
-//! the same single Euler step — to exceed it. Nothing in the threshold is chosen by taste.
+//! the same single Euler step — to exceed it.
+//!
+//! Be honest about the strength of that comparison. The floor is an *agreement* quantity (order
+//! `1e-3`); the divergence is a *signal* quantity (order `1e2`). The only alternative it
+//! distinguishes is a divergence of exactly zero — negative threading deleted outright. A
+//! mis-wired-but-non-zero negative branch — conditional and unconditional halves swapped, the
+//! guidance weight applied as `g` where it should be `g - 1`, the negative attention mask dropped —
+//! diverges just as loudly and would sail through it. No frozen-Torch artifact covers the explicit
+//! negative path (`guidance.safetensors` carries only `None`-negative renders), so parity cannot
+//! close that hole either.
+//!
+//! What closes it is the recomposition identity in
+//! [`the_guided_latents_are_exactly_the_cfg_recomposition_of_their_own_two_branches`]: with
+//! `apg_scale = 0`, `cfg_norm_threshold = 0` and `scale_phi = 0`, `guided_prediction` reduces to
+//! `uncond + g * (cond - uncond)` in v-space, and a single Euler step is affine in the model
+//! output, so the guided latents must equal `L(N) + g * (L(P) - L(N))` where `L(P)` and `L(N)` are
+//! the batch-1 `cfg_scale = 1.0` steps on the positive and the *masked* negative embeddings. That
+//! prediction is compared against three named mis-wirings of the same two branches, so it fails on
+//! each of them.
 
 use std::path::{Path, PathBuf};
 
-use candle_audio_stable_audio_3::candle_audio::candle_core::{DType, Device, Tensor};
+use candle_audio_stable_audio_3::candle_audio::candle_core::{DType, Device, Tensor, D};
 use candle_audio_stable_audio_3::dit::{Guidance, StableAudio3Dit};
 use candle_audio_stable_audio_3::gen_core::{
     AudioParams, GenerationOutput, GenerationRequest, LoadSpec, WeightsSource,
@@ -43,9 +61,40 @@ use candle_nn::VarBuilder;
 const GUIDANCE_ORACLE_PREFIX: &str = "small-music-base";
 const GUIDANCE_ORACLE_ENV: &str = "SA3_SMALL_MUSIC_BASE_SNAPSHOT";
 
+/// The guidance scale every case in `guidance.safetensors` was frozen at.
+const GUIDANCE_ORACLE_SCALE: f64 = 2.5;
+
+/// How much a CFG recombination amplifies an independent per-branch error.
+///
+/// `uncond + g·(cond − uncond) = g·cond − (g − 1)·uncond`, so an error of `ε` in each of the two
+/// branch predictions moves the guided result by up to `(2g − 1)·ε`. Both quantities this file
+/// compares are guided-space disagreements carrying that factor — the frozen-Torch floor at
+/// [`GUIDANCE_ORACLE_SCALE`], the recomposition residual at the base default — so converting one
+/// into a bound on the other means rescaling by the ratio of their factors. Nothing here is a
+/// tolerance: it is the same numerics read at a different guidance scale.
+fn cfg_error_amplification(guidance: f64) -> f64 {
+    2.0 * guidance - 1.0
+}
+
+/// The crate's three-way real-weight device selector, identical to `same_oracle.rs` and
+/// `chunked_oracle.rs`.
+///
+/// Honouring `SA3_TEST_METAL` alone would silently run every gate in this file — and the
+/// frozen-Torch agreement floor they derive, which is only meaningful as a statement about *this*
+/// device and dtype — on `Device::Cpu` inside `sa3-base-identity-cuda`, which sets `SA3_TEST_CUDA`.
+/// A requested backend that is unavailable is a hard failure, never a fallback.
 fn device() -> Device {
     if std::env::var_os("SA3_TEST_METAL").is_some() {
         Device::new_metal(0).expect("SA3_TEST_METAL requested but Metal is unavailable")
+    } else if std::env::var_os("SA3_TEST_CUDA").is_some() {
+        #[cfg(feature = "cuda")]
+        {
+            Device::new_cuda(0).expect("SA3_TEST_CUDA requested but CUDA is unavailable")
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            panic!("SA3_TEST_CUDA requires --features cuda")
+        }
     } else {
         Device::Cpu
     }
@@ -134,6 +183,88 @@ fn one_euler_step(
     output.latents
 }
 
+/// This implementation's own largest per-element disagreement with the frozen-Torch guidance oracle
+/// on this checkpoint, device and dtype, across all three frozen guidance variants.
+///
+/// Everything is fixed to the artifact's own frame — the oracle's initial noise, its projected
+/// prompt, the same schedule, the same single Euler step — so the returned number is a pure
+/// numerics quantity in the same latent space as everything else this file measures.
+#[allow(clippy::too_many_arguments)]
+fn frozen_torch_agreement_floor(
+    model: &StableAudio3Dit,
+    device: &Device,
+    initial: &Tensor,
+    oracle_prompt: &Tensor,
+    seconds: &Tensor,
+    local: &Tensor,
+    mask: &Tensor,
+) -> f32 {
+    let guidance_oracle = unsafe {
+        VarBuilder::from_mmaped_safetensors(
+            &[reference("sa3-sampler-reference/guidance.safetensors")],
+            DType::F32,
+            device,
+        )
+        .unwrap()
+    };
+    let mut floor = 0.0f32;
+    for (name, guidance) in [
+        (
+            "vanilla",
+            Guidance {
+                cfg_scale: GUIDANCE_ORACLE_SCALE,
+                apg_scale: 0.0,
+                ..Guidance::default()
+            },
+        ),
+        (
+            "apg",
+            Guidance {
+                cfg_scale: GUIDANCE_ORACLE_SCALE,
+                apg_scale: 1.0,
+                ..Guidance::default()
+            },
+        ),
+        (
+            "blended_rescaled",
+            Guidance {
+                cfg_scale: GUIDANCE_ORACLE_SCALE,
+                apg_scale: 0.5,
+                cfg_norm_threshold: 0.25,
+                scale_phi: 0.3,
+            },
+        ),
+    ] {
+        let actual = one_euler_step(
+            model,
+            initial,
+            oracle_prompt,
+            None,
+            None,
+            seconds,
+            local,
+            mask,
+            guidance,
+        );
+        let expected = guidance_oracle
+            .get_unchecked(&format!("{GUIDANCE_ORACLE_PREFIX}.{name}.final"))
+            .unwrap();
+        let cosine = cosine(&actual, &expected);
+        let gap = max_abs_diff(&actual, &expected);
+        eprintln!("{GUIDANCE_ORACLE_PREFIX}.{name}: cosine={cosine:.9} max_abs={gap:.9}");
+        assert!(
+            cosine >= 0.999,
+            "{GUIDANCE_ORACLE_PREFIX}.{name} lost frozen-Torch parity: cosine={cosine}"
+        );
+        floor = floor.max(gap);
+    }
+    assert!(
+        floor > 0.0,
+        "a zero agreement gap means the oracle comparison did not run"
+    );
+    floor
+}
+
 /// The whole gate, in one model load.
 ///
 /// 1. Replay the three frozen guidance variants at `cfg_scale = 2.5` and record the largest
@@ -142,10 +273,14 @@ fn one_euler_step(
 ///    **bit-identical**. This is the honest control: the DiT's batch-1 shortcut means a negative
 ///    prompt cannot matter here, and a test that "proved" otherwise would be proving a bug.
 /// 3. At `cfg_scale = 7.0` — the base default — run the same pair and require the divergence to
-///    exceed the floor from step 1 by a stated factor.
+///    exceed the floor from step 1.
 ///
-/// The gate discriminates: delete the negative-prompt threading and step 3 measures exactly 0.0;
-/// invert the batch-1 shortcut and step 2 fails.
+/// What this discriminates, precisely: delete the negative-prompt threading and step 3 measures
+/// exactly 0.0; invert the batch-1 shortcut and step 2 fails. What it does **not** discriminate is a
+/// negative branch that is threaded but wired wrongly — the divergence is a signal-scale quantity
+/// and the floor is a noise-scale one, so any non-zero mis-wiring clears it just as easily as the
+/// correct one. That case is
+/// [`the_guided_latents_are_exactly_the_cfg_recomposition_of_their_own_two_branches`]'s job.
 #[test]
 #[ignore = "requires the pinned small-music-base snapshot and real batch-2 CFG forwards"]
 fn negative_prompt_divergence_at_the_base_default_exceeds_the_frozen_torch_agreement_floor() {
@@ -170,68 +305,14 @@ fn negative_prompt_divergence_at_the_base_default_exceeds_the_frozen_torch_agree
     let mask = padding_mask(&[12], 16, &device).unwrap();
 
     // ---- step 1: the frozen-Torch agreement floor, on this checkpoint/device/dtype ----
-    let guidance_oracle = unsafe {
-        VarBuilder::from_mmaped_safetensors(
-            &[reference("sa3-sampler-reference/guidance.safetensors")],
-            DType::F32,
-            &device,
-        )
-        .unwrap()
-    };
-    let mut floor = 0.0f32;
-    for (name, guidance) in [
-        (
-            "vanilla",
-            Guidance {
-                cfg_scale: 2.5,
-                apg_scale: 0.0,
-                ..Guidance::default()
-            },
-        ),
-        (
-            "apg",
-            Guidance {
-                cfg_scale: 2.5,
-                apg_scale: 1.0,
-                ..Guidance::default()
-            },
-        ),
-        (
-            "blended_rescaled",
-            Guidance {
-                cfg_scale: 2.5,
-                apg_scale: 0.5,
-                cfg_norm_threshold: 0.25,
-                scale_phi: 0.3,
-            },
-        ),
-    ] {
-        let actual = one_euler_step(
-            &model,
-            &initial,
-            &oracle_prompt,
-            None,
-            None,
-            &seconds,
-            &local,
-            &mask,
-            guidance,
-        );
-        let expected = guidance_oracle
-            .get_unchecked(&format!("{GUIDANCE_ORACLE_PREFIX}.{name}.final"))
-            .unwrap();
-        let cosine = cosine(&actual, &expected);
-        let gap = max_abs_diff(&actual, &expected);
-        eprintln!("{GUIDANCE_ORACLE_PREFIX}.{name}: cosine={cosine:.9} max_abs={gap:.9}");
-        assert!(
-            cosine >= 0.999,
-            "{GUIDANCE_ORACLE_PREFIX}.{name} lost frozen-Torch parity: cosine={cosine}"
-        );
-        floor = floor.max(gap);
-    }
-    assert!(
-        floor > 0.0,
-        "a zero agreement gap means the oracle comparison did not run"
+    let floor = frozen_torch_agreement_floor(
+        &model,
+        &device,
+        &initial,
+        &oracle_prompt,
+        &seconds,
+        &local,
+        &mask,
     );
 
     // ---- steps 2 and 3: real text, real negative prompt ----
@@ -287,15 +368,193 @@ fn negative_prompt_divergence_at_the_base_default_exceeds_the_frozen_torch_agree
          this implementation's own {floor} disagreement with frozen Torch — that is not evidence \
          the negative conditioning is wired at all"
     );
-    assert!(
-        margin >= 10.0,
-        "the negative-prompt divergence ({divergence}) is only {margin:.2}x the frozen-Torch \
-         agreement floor ({floor}); the effect must be unambiguous, not marginal"
-    );
+    // No second, larger multiple of the floor is asserted. `margin` is reported because it is worth
+    // reading — but a "must be at least Nx" bound would be a number chosen by taste, and it would
+    // buy nothing: the two quantities are orders of magnitude apart, so every failure mode this
+    // comparison can see is already caught by `divergence > floor`. The strength that a bigger
+    // multiple only *looks* like it adds comes from the recomposition identity below instead.
 
     // ...and the guided renders must differ from the unguided ones, or the guidance scale itself is
     // not reaching the model.
     assert!(max_abs_diff(&guided_without, &unguided_without) > floor);
+}
+
+/// The gate that a mis-wired-but-non-zero negative branch cannot pass.
+///
+/// With `apg_scale = 0`, `cfg_norm_threshold = 0` and `scale_phi = 0`, `dit::guided_prediction`
+/// reduces algebraically to `uncond + g * (cond - uncond)` in v-space — the denoised-space detour it
+/// takes cancels exactly — and a single Euler step is affine in the model output. So the guided
+/// latents are pinned to an identity, not merely to an inequality:
+///
+/// ```text
+/// L_guided(P, N, g) == L(N) + g * (L(P) - L(N))
+/// ```
+///
+/// where `L(X)` is the same single Euler step run at `cfg_scale = 1.0` — the batch-1 branch — on
+/// prompt `X`, and `N` is the negative embedding **after** the attention-mask multiply that
+/// `forward_guided_impl` applies before batching. The only difference between the two sides is
+/// batch-2 versus batch-1 numerics.
+///
+/// The identity is checked against three named mis-wirings of the very same two branches, each of
+/// which diverges from the no-negative render just as loudly as the correct one and therefore passes
+/// `negative_prompt_divergence_at_the_base_default_exceeds_the_frozen_torch_agreement_floor`:
+///
+/// - **swapped halves** — `narrow(0, 0, batch)` and `narrow(0, batch, batch)` exchanged, i.e.
+///   `L(P) + g * (L(N) - L(P))`;
+/// - **off-by-one weight** — `(cfg_scale - 1.0)` written as `cfg_scale`, i.e.
+///   `L(N) + (g - 1) * (L(P) - L(N))`;
+/// - **dropped negative mask** — the raw negative embedding used instead of the masked one.
+///
+/// The bound is the same frozen-Torch agreement floor the divergence gate derives, measured in the
+/// same latent space on the same device and dtype, read at this test's guidance scale through
+/// [`cfg_error_amplification`]: the correct recomposition must land inside it and every mis-wiring
+/// must land outside it. The rescaling is not slack bought to make the gate pass — the closest
+/// mis-wiring misses by four orders of magnitude — it is what makes the bound device-portable, and
+/// it was added because the unscaled floor failed on CPU (residual `5.05e-3`, floor `4.03e-3`) while
+/// passing comfortably on Metal.
+#[test]
+#[ignore = "requires the pinned small-music-base snapshot and real batch-2 CFG forwards"]
+fn the_guided_latents_are_exactly_the_cfg_recomposition_of_their_own_two_branches() {
+    let device = device();
+    let layout = SnapshotLayout::from_dir(&snapshot(GUIDANCE_ORACLE_ENV)).unwrap();
+    let model = StableAudio3Dit::from_layout(&layout, &device).unwrap();
+
+    let p0 = unsafe {
+        VarBuilder::from_mmaped_safetensors(
+            &[reference(
+                "sa3-reference/small-music-base-reference.safetensors",
+            )],
+            DType::F32,
+            &device,
+        )
+        .unwrap()
+    };
+    let initial = p0.get_unchecked("sampler_initial_noise").unwrap();
+    let oracle_prompt = p0.get_unchecked("t5_projected_padded").unwrap();
+    let seconds = Tensor::from_vec(vec![0.25f32], 1, &device).unwrap();
+    let local = Tensor::zeros((1, 257, 16), DType::F32, &device).unwrap();
+    let mask = padding_mask(&[12], 16, &device).unwrap();
+
+    let step = |prompt: &Tensor, negative: Option<(&Tensor, &Tensor)>, cfg_scale: f64| {
+        one_euler_step(
+            &model,
+            &initial,
+            prompt,
+            negative.map(|(embeddings, _)| embeddings),
+            negative.map(|(_, mask)| mask),
+            &seconds,
+            &local,
+            &mask,
+            Guidance {
+                cfg_scale,
+                apg_scale: 0.0,
+                ..Guidance::default()
+            },
+        )
+    };
+
+    // The same agreement floor the divergence gate derives, from the same helper.
+    let floor = frozen_torch_agreement_floor(
+        &model,
+        &device,
+        &initial,
+        &oracle_prompt,
+        &seconds,
+        &local,
+        &mask,
+    );
+
+    let conditioner = T5GemmaConditioner::from_layout(&layout, &device).unwrap();
+    let positive = conditioner
+        .encode(&["A beautiful piano arpeggio grows into a grand cinematic climax".to_owned()])
+        .unwrap();
+    let negative = conditioner
+        .encode(&["harsh digital clipping, distorted noise, speech".to_owned()])
+        .unwrap();
+    // Exactly what `forward_guided_impl` builds before it concatenates the batch.
+    let masked_negative = negative
+        .embeddings
+        .broadcast_mul(
+            &negative
+                .attention_mask
+                .unsqueeze(D::Minus1)
+                .unwrap()
+                .to_dtype(negative.embeddings.dtype())
+                .unwrap(),
+        )
+        .unwrap();
+    assert!(
+        max_abs_diff(&masked_negative, &negative.embeddings) > 0.0,
+        "the encoded negative prompt is fully valid, so the mask multiply is a no-op and the \
+         dropped-mask mis-wiring below would be indistinguishable from the correct wiring"
+    );
+
+    let guidance = Variant::SmallMusicBase.default_guidance();
+    let guided = step(
+        &positive.embeddings,
+        Some((&negative.embeddings, &negative.attention_mask)),
+        guidance,
+    );
+    let branch_positive = step(&positive.embeddings, None, 1.0);
+    let branch_negative = step(&masked_negative, None, 1.0);
+    let branch_negative_unmasked = step(&negative.embeddings, None, 1.0);
+
+    // `low + weight * (high - low)`, in f32 on the test device.
+    let recompose = |low: &Tensor, high: &Tensor, weight: f64| {
+        (low + ((high - low).unwrap() * weight).unwrap()).unwrap()
+    };
+
+    let correct = recompose(&branch_negative, &branch_positive, guidance);
+    let residual = max_abs_diff(&guided, &correct);
+    let mis_wirings = [
+        (
+            "swapped conditional/unconditional halves",
+            recompose(&branch_positive, &branch_negative, guidance),
+        ),
+        (
+            "guidance weight applied as g-1 instead of g",
+            recompose(&branch_negative, &branch_positive, guidance - 1.0),
+        ),
+        (
+            "negative attention mask dropped",
+            recompose(&branch_negative_unmasked, &branch_positive, guidance),
+        ),
+    ];
+
+    // The floor is a guided-space disagreement measured at the oracle's own guidance scale; this
+    // residual is one measured at the base default. Both carry the CFG amplification factor of
+    // their own scale, so the floor is read at this test's scale before it is used as a bound. On
+    // Metal that is 3.685e-3 -> 1.198e-2; on CPU 4.028e-3 -> 1.309e-2. The correct recomposition
+    // measures 6.1e-5 (Metal) / 5.1e-3 (CPU) and the closest mis-wiring measures 87.75, so the
+    // rescaling is what makes the bound device-portable, not what makes the gate pass.
+    let bound = (floor as f64 * cfg_error_amplification(guidance)
+        / cfg_error_amplification(GUIDANCE_ORACLE_SCALE)) as f32;
+    eprintln!(
+        "cfg recomposition at g={guidance}: residual={residual:.9} \
+         frozen_torch_agreement_floor={floor:.9} rescaled_bound={bound:.9}"
+    );
+    for (name, prediction) in &mis_wirings {
+        eprintln!(
+            "  mis-wiring `{name}`: residual={:.9}",
+            max_abs_diff(&guided, prediction)
+        );
+    }
+
+    assert!(
+        residual <= bound,
+        "the guided latents are {residual} away from `L(N) + {guidance} * (L(P) - L(N))`, which is \
+         outside the {bound} this implementation's own {floor} disagreement with frozen Torch \
+         explains at this guidance scale — the batch-2 CFG path is not recomposing the two branches \
+         it actually evaluated"
+    );
+    for (name, prediction) in &mis_wirings {
+        let mis_wired = max_abs_diff(&guided, prediction);
+        assert!(
+            mis_wired > bound,
+            "the `{name}` mis-wiring predicts the guided latents to within {mis_wired}, inside the \
+             {bound} numerics bound — this gate cannot tell it apart from the correct wiring"
+        );
+    }
 }
 
 /// The same two facts, end to end through the registered provider and on decoded PCM.

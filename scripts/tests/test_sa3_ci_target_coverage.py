@@ -11,9 +11,12 @@ This check makes the comment executable: every target under the SA3 crate's `tes
 at least one non-`#[ignore]`d case must appear as a `--test` flag in the weight-free step.
 
 Scope caveat: this policies the **weight-free** half only. The `#[ignore]`d real-weight
-half is selected by `real-weights.yml`, and as of sc-14545 the `dit_oracle`,
-`real_snapshots` and `text_oracle` targets are named by no lane there. Wiring those is
-sc-15235's job — a green run of this check is not evidence of full SA3 coverage.
+half is selected by `real-weights.yml`, where `real_snapshots` and `text_oracle` are still
+named by no lane, and as of sc-14546 `dit_oracle` is named only for the one case that
+story's acceptance depends on -- `real_weights_detect_conditioning_mutations_and_exercise_cfg_apg`,
+in `sa3-base-identity-{metal,cuda}` -- while its other real-weight cases run nowhere.
+Wiring the remainder is sc-15235's job; a green run of this check is not evidence of full
+SA3 coverage.
 """
 
 import re

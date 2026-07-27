@@ -54,9 +54,25 @@ fn path(name: &str) -> PathBuf {
         .unwrap_or_else(|| panic!("{name} must point to its pinned immutable snapshot"))
 }
 
+/// The crate's three-way real-weight device selector, identical to `same_oracle.rs` and
+/// `chunked_oracle.rs`.
+///
+/// Branching on `SA3_TEST_METAL` alone would run every case that calls this on `Device::Cpu` inside
+/// the CUDA lanes, which set `SA3_TEST_CUDA`. A requested backend that is unavailable is a hard
+/// failure, never a fallback. `all_six_cpu_f32_predictions_match_p0` pins `Device::Cpu` by name and
+/// deliberately does not use this.
 fn device() -> Device {
     if std::env::var_os("SA3_TEST_METAL").is_some() {
         Device::new_metal(0).expect("SA3_TEST_METAL requested but Metal is unavailable")
+    } else if std::env::var_os("SA3_TEST_CUDA").is_some() {
+        #[cfg(feature = "cuda")]
+        {
+            Device::new_cuda(0).expect("SA3_TEST_CUDA requested but CUDA is unavailable")
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            panic!("SA3_TEST_CUDA requires --features cuda")
+        }
     } else {
         Device::Cpu
     }
@@ -234,10 +250,15 @@ fn small_music_intermediates_and_frozen_v_zero_padding_match() {
     );
 }
 
+/// Every assertion here is a self-comparison between two real-weight forwards — no frozen artifact
+/// is read — so the case is device-portable, and sc-14546 runs it on the accelerator lanes rather
+/// than pinning CPU: this is the one gate that separates "no negative conditioning" (the
+/// `zero_cross_context_from_batch` path) from "an explicit all-invalid negative prompt", and it has
+/// to execute on the backend whose CFG path it is certifying.
 #[test]
 #[ignore = "requires the pinned small-music snapshot"]
 fn real_weights_detect_conditioning_mutations_and_exercise_cfg_apg() {
-    let device = Device::Cpu;
+    let device = device();
     let case = &CASES[0];
     let layout = SnapshotLayout::from_dir(&path(case.env)).unwrap();
     let model = StableAudio3Dit::from_layout(&layout, &device).unwrap();

@@ -604,9 +604,8 @@ jobs:
     runs-on: [self-hosted, macOS, ARM64, real-weights]
     env:
       SA3_TEST_METAL: "1"
-      # Turn every "snapshot not provisioned, skipping" branch in the mutation gates into a
-      # failure. A skip CI also takes is a gate nobody runs.
-      SA3_REQUIRE_ALL_SNAPSHOTS: "1"
+      # No SA3_REQUIRE_ALL_SNAPSHOTS here: `variant_binding` is the only target that reads it, and
+      # sc-14546 moved that target to `sa3-base-identity-metal`, the one job with all six snapshots.
       # The embedded-SAME-L oracle case. `same-l-metal` pins `standalone`, so before sc-14545 the
       # embedded branch of `same_l_short_standalone_and_embedded_match_every_band_layer` and
       # `same_l_long_durations_match_compact_band_boundaries` had never executed in CI despite both
@@ -816,6 +815,27 @@ jobs:
           # `training.demo` block.
           cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
             --test base_guidance -- --ignored --nocapture
+      - name: Certify the explicit-negative conditioning path itself
+        run: |
+          # `base_guidance`'s divergence assertion proves the negative prompt reaches the model; it
+          # cannot prove the batch-2 path is wired *correctly*, because a swapped-halves or masked-
+          # wrong negative branch diverges from the no-negative render just as loudly. Two gates
+          # close that, and neither ran in any lane before sc-14546:
+          #
+          #   * `real_weights_detect_conditioning_mutations_and_exercise_cfg_apg` (dit_oracle) is
+          #     the only case that separates absent negative conditioning — which zeroes the whole
+          #     cross context — from an explicit all-invalid negative prompt, which keeps its
+          #     conditioned duration row. It is a pure self-comparison, so it runs on this backend.
+          #   * `the_guided_latents_are_exactly_the_cfg_recomposition_of_their_own_two_branches`
+          #     (base_guidance, above) pins the guided latents to `L(N) + g*(L(P) - L(N))` and
+          #     rejects three named mis-wirings of the same two branches.
+          #
+          # Named rather than `--test dit_oracle -- --ignored`: the other ignored cases in that
+          # target need all six snapshots on CPU (multi-gigabyte) or an explicit SA3_DIT_CASE_ENV /
+          # SA3_DIT_RESOURCE_LENGTH selection. Wiring the rest of `dit_oracle` is sc-15235.
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
+            --test dit_oracle real_weights_detect_conditioning_mutations_and_exercise_cfg_apg \
+            -- --ignored --nocapture
 
   sa3-small-base-metal:
     name: Stable Audio 3 small base providers (Metal)
@@ -1155,7 +1175,8 @@ jobs:
     runs-on: [self-hosted, windows, cuda, real-weights]
     env:
       SA3_TEST_CUDA: "1"
-      SA3_REQUIRE_ALL_SNAPSHOTS: "1"
+      # No SA3_REQUIRE_ALL_SNAPSHOTS: only `variant_binding` reads it, and sc-14546 moved that
+      # target to `sa3-base-identity-cuda`, the one job with all six snapshots.
       SA3_SAME_L_CASE: embedded
       CUDA_COMPUTE_CAP: "80"
       CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
@@ -1448,6 +1469,18 @@ jobs:
         run: |
           call "%VCVARS%"
           cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --test base_guidance -- --ignored --nocapture || exit /b 1
+      - name: Certify the explicit-negative conditioning path itself
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          rem `base_guidance`'s divergence assertion proves the negative prompt reaches the model,
+          rem not that the batch-2 path is wired correctly. This case is the only one that separates
+          rem absent negative conditioning — which zeroes the whole cross context — from an explicit
+          rem all-invalid negative prompt, which keeps its conditioned duration row. It ran in no
+          rem lane before sc-14546. Named rather than `--test dit_oracle -- --ignored`: the other
+          rem ignored cases need all six snapshots on CPU or an explicit SA3_DIT_CASE_ENV selection,
+          rem and wiring the rest of `dit_oracle` is sc-15235.
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --test dit_oracle real_weights_detect_conditioning_mutations_and_exercise_cfg_apg -- --ignored --nocapture || exit /b 1
 
   sa3-small-base-cuda:
     name: Stable Audio 3 small base providers (CUDA)
