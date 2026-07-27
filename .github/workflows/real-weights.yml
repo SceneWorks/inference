@@ -308,7 +308,7 @@ jobs:
         run: >-
           KREA_REALTIME_SNAPSHOT_DIR="$KREA_REALTIME_SNAPSHOT/q4"
           cargo test --locked --release -p mlx-gen-krea-realtime --test generate_smoke
-          -- --ignored --nocapture
+          -- --ignored --nocapture --test-threads 1
       # A published Wan style LoRA must load through `LoadSpec::adapters` and measurably change the
       # render, with the scale-0 arm as the attribution control.
       - name: Run Krea Realtime real Wan style-LoRA A/B
