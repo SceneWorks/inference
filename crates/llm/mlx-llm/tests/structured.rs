@@ -18,7 +18,7 @@ fn json_constrained_output_is_valid_json() {
     assert!(provider
         .descriptor()
         .capabilities
-        .supports_constraint(Constraint::Json));
+        .supports_constraint(&Constraint::Json));
 
     let req = TextLlmRequest {
         messages: vec![Message::user(

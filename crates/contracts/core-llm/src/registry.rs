@@ -257,9 +257,7 @@ fn meets(reg: &TextLlmRegistration, spec: &LoadSpec, reqs: &ModelRequirements) -
         return false;
     }
     let caps = (reg.descriptor)().capabilities;
-    reqs.constraints
-        .iter()
-        .all(|c| caps.supports_constraint(*c))
+    reqs.constraints.iter().all(|c| caps.supports_constraint(c))
 }
 
 /// `id (backend)` summary of a set of registrations, for diagnostics.
@@ -380,7 +378,7 @@ mod tests {
             supports_video: false,
             supports_thinking: false,
             supports_tools: false,
-            supported_constraints: constraints.to_vec(),
+            supported_constraints: constraints.iter().map(Constraint::kind).collect(),
         }
     }
 

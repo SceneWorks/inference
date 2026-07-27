@@ -12,11 +12,12 @@ use std::path::Path;
 
 use candle_core::{Device, Tensor};
 use core_llm::{
-    Channel, ChatTemplate, Constraint, ConstraintDecodeTable, Content, Error as CoreError,
-    FinishReason as CoreFinish, ImageRef, IncrementalDetok, JinjaChatTemplate, JsonConstraint,
-    Llama3Template, LoadSpec, Message, Quantize, RenderOptions, Result as CoreResult, Sampling,
-    StreamEvent as CoreEvent, TextLlm, TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput,
-    TextLlmRequest, ThinkingSegmenter, Tokenizer, ToolCallSegmenter, Usage, VideoRef,
+    Channel, ChatTemplate, Constraint, ConstraintDecodeTable, ConstraintKind, Content,
+    Error as CoreError, FinishReason as CoreFinish, ImageRef, IncrementalDetok, JinjaChatTemplate,
+    JsonConstraint, Llama3Template, LoadSpec, Message, Quantize, RenderOptions,
+    Result as CoreResult, Sampling, StreamEvent as CoreEvent, TextLlm, TextLlmCapabilities,
+    TextLlmDescriptor, TextLlmOutput, TextLlmRequest, ThinkingSegmenter, Tokenizer,
+    ToolCallSegmenter, Usage, VideoRef,
 };
 
 use crate::config::{Architecture, ModelConfig};
@@ -1091,7 +1092,7 @@ pub fn provider_descriptor() -> TextLlmDescriptor {
             // chat template renders tool calls (story 7636).
             supports_tools: false,
             // JSON-constrained decoding.
-            supported_constraints: vec![Constraint::Json],
+            supported_constraints: vec![ConstraintKind::Json],
         },
     }
 }
