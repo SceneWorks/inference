@@ -207,6 +207,9 @@ pub struct KreaGenerator {
     descriptor: ModelDescriptor,
     device: Device,
     residency: candle_gen::Residency<KreaTextPhase, KreaHeavyPhase>,
+    /// Effective load policy retained so per-generation memory levers can select the physical
+    /// three-stage Turbo path only when the consumer actually requested sequential residency.
+    offload_policy: OffloadPolicy,
     /// The snapshot root — retained so the multi-phase render (epic 13879, sc-13887) can load its
     /// **job-local** base DiT from `transformer/` regardless of residency mode (the shared resident DiT
     /// is never mutated for per-phase adapter toggling — the concurrency-safety invariant).
@@ -279,6 +282,29 @@ impl Generator for KreaGenerator {
             Vec::new()
         };
         let reference = img2img_reference(req);
+
+        if req.memory.is_some() {
+            if self.descriptor.id != KREA_2_TURBO_ID
+                || self.offload_policy != OffloadPolicy::Sequential
+                || reference.is_some()
+                || req.phases.is_some()
+                || req.use_pid
+            {
+                return Err(gen_core::Error::Unsupported(format!(
+                    "{}: per-generation memory adaptation is supported only for sequential, \
+                     native-VAE, ordinary Turbo text-to-image requests",
+                    self.descriptor.id
+                )));
+            }
+            let images = pipeline::render_three_stage(
+                &self.root,
+                &self.device,
+                &self.adapters,
+                req,
+                on_progress,
+            )?;
+            return Ok(GenerationOutput::Images(images));
+        }
 
         // Multi-phase denoise (epic 13879, sc-13887): resolve the phase list ONCE up-front so both the
         // text-encode phase (whether the unconditional context is needed) and the render phase drive from
@@ -825,6 +851,7 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
         descriptor,
         device,
         residency,
+        offload_policy: policy,
         root,
         // The multi-phase diff-patch guard input (sc-13887): read the adapter file keys at load. The
         // ConvRot path already rejected adapters above, so `spec.adapters` is empty there ⇒ `false`.
@@ -924,6 +951,7 @@ pub fn load_from_native_dit_file(
         descriptor,
         device,
         residency,
+        offload_policy: OffloadPolicy::Resident,
         root,
         // The single-file entrypoint threads no load-time adapters (S0b scope), so no diff-patch guard.
         adapters: Vec::new(),
@@ -1629,10 +1657,55 @@ mod tests {
                     ))
                 },
             ),
+            offload_policy: OffloadPolicy::Sequential,
             root: "/snap".into(),
             adapters: Vec::new(),
             has_diff_patch: false,
         }
+    }
+
+    #[test]
+    fn constrained_memory_route_requires_sequential_plain_turbo_t2i() {
+        let mut generator = sequential_generator(descriptor());
+        generator.offload_policy = OffloadPolicy::Resident;
+        let req = GenerationRequest {
+            prompt: "test".into(),
+            memory: Some(gen_core::GenerationMemory::default()),
+            ..Default::default()
+        };
+        let error = generator.generate(&req, &mut |_| {}).unwrap_err();
+        assert!(
+            error.to_string().contains("only for sequential"),
+            "unexpected error: {error}"
+        );
+
+        let raw = sequential_generator(raw_descriptor());
+        let error = raw.generate(&req, &mut |_| {}).unwrap_err();
+        assert!(
+            error.to_string().contains("only for sequential"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn constrained_memory_route_honors_a_pre_cancel_before_loading() {
+        let generator = sequential_generator(descriptor());
+        let cancel = gen_core::CancelFlag::default();
+        cancel.cancel();
+        let req = GenerationRequest {
+            prompt: "test".into(),
+            memory: Some(gen_core::GenerationMemory {
+                tile_vae_decode: true,
+                chunk_attention: true,
+                stream_transformer_blocks: true,
+            }),
+            cancel,
+            ..Default::default()
+        };
+        assert!(matches!(
+            generator.generate(&req, &mut |_| {}),
+            Err(gen_core::Error::Canceled)
+        ));
     }
 
     /// F-173 (sc-12089): a request cancelled before `generate` returns `Canceled` without loading a
@@ -1845,7 +1918,8 @@ mod tests {
             spec.text_encoder = Some(WeightsSource::File(convrot.into()));
         }
         let spec_mode = std::env::var("KREA_OFFLOAD_MODE").unwrap_or_default();
-        if spec_mode == "spec-sequential" {
+        let memory_mode = std::env::var("KREA_MEMORY_RUNG").unwrap_or_default();
+        if spec_mode == "spec-sequential" || !memory_mode.is_empty() {
             spec = spec.with_offload_policy(OffloadPolicy::Sequential);
         }
         // Square edge (default 768, the sc-11101 MLX A/B's resolution so the two backends compare).
@@ -1857,6 +1931,10 @@ mod tests {
             .ok()
             .and_then(|v| v.trim().parse().ok())
             .unwrap_or(768);
+        let measured_steps: u32 = std::env::var("KREA_AB_STEPS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(8);
         let conditioning = if edit {
             let source = std::env::var("KREA_EDIT_SOURCE")
                 .expect("set KREA_EDIT_SOURCE for KREA_SEQ_EDIT=1");
@@ -1875,6 +1953,31 @@ mod tests {
         } else {
             Vec::new()
         };
+        let memory = match memory_mode.as_str() {
+            "" => None,
+            "three-stage" => Some(gen_core::GenerationMemory::default()),
+            "tiled-vae" => Some(gen_core::GenerationMemory {
+                tile_vae_decode: true,
+                ..Default::default()
+            }),
+            "chunked-attention" => Some(gen_core::GenerationMemory {
+                tile_vae_decode: true,
+                chunk_attention: true,
+                ..Default::default()
+            }),
+            "streamed-blocks" => Some(gen_core::GenerationMemory {
+                tile_vae_decode: true,
+                chunk_attention: true,
+                stream_transformer_blocks: true,
+            }),
+            other => panic!(
+                "unknown KREA_MEMORY_RUNG={other}; use three-stage/tiled-vae/chunked-attention/streamed-blocks"
+            ),
+        };
+        assert!(
+            memory.is_none() || (!raw && !edit),
+            "KREA_MEMORY_RUNG measures ordinary Turbo text-to-image only"
+        );
         let req = GenerationRequest {
             prompt: if edit {
                 "make the person smile warmly, keep their identity".into()
@@ -1885,18 +1988,53 @@ mod tests {
             height: res,
             // Turbo is the 8-step distilled student; Raw is undistilled, so hold it to a short schedule
             // (the A/B measures PEAK, which is step-count-independent — not sample quality).
-            steps: Some(8),
+            steps: Some(measured_steps),
             seed: Some(42),
             count: 1,
             conditioning,
+            memory,
             ..Default::default()
         };
+
+        let max_baseline_gb = std::env::var("KREA_PROBE_MAX_BASELINE_GB")
+            .ok()
+            .and_then(|value| value.trim().parse::<f64>().ok())
+            .unwrap_or(1.0);
+        let mut probe = candle_gen::testkit::VramProbe::start_rendered();
+
+        // Optional same-process model-swap probe (sc-15205). Exercise another complete Turbo
+        // snapshot first, drop it, then perform the measured target-tier run below. This catches
+        // allocator/host-map retention that isolated one-model processes cannot expose. The swap uses
+        // the same constrained route and fixed seed, but one step is sufficient because the working
+        // set is step-count invariant.
+        if let Ok(swap_dir) = std::env::var("KREA_SWAP_DIR") {
+            assert!(
+                !raw && !edit && memory.is_some(),
+                "KREA_SWAP_DIR is supported only by the constrained ordinary Turbo probe"
+            );
+            let swap_spec = LoadSpec::new(WeightsSource::Dir(swap_dir.into()))
+                .with_offload_policy(OffloadPolicy::Sequential);
+            let swap = load(&swap_spec).expect("load KREA_SWAP_DIR");
+            let mut swap_req = req.clone();
+            swap_req.steps = Some(1);
+            let swap_output = swap
+                .generate(&swap_req, &mut |_| {})
+                .expect("generate KREA_SWAP_DIR before measured target");
+            let swap_bytes = match swap_output {
+                GenerationOutput::Images(mut images) => images.remove(0).pixels.len(),
+                other => panic!("expected swap images, got {other:?}"),
+            };
+            drop(swap);
+            eprintln!(
+                "KREA_SWAP completed before target tier: {}x{} bytes={swap_bytes}",
+                swap_req.width, swap_req.height
+            );
+        }
 
         // Load and generate are sampled as SEPARATE phases so the report separates the load transient
         // (weights → device) from the denoise/decode activation spike — the epic's open question is which
         // dominates, and a single fused peak can't say (sc-11925 notes the transient was only calibrated
         // at 1024²).
-        let mut probe = candle_gen::testkit::VramProbe::start_rendered();
         let load_phase = probe.phase();
         let g = if edit {
             load_edit(&spec).expect("load krea_2_edit")
@@ -1907,18 +2045,92 @@ mod tests {
         };
         probe.end_load(load_phase);
         let gen_phase = probe.phase();
-        let output = g.generate(&req, &mut |_| {}).expect("generate");
+        if let Ok(delay_ms) = std::env::var("KREA_CANCEL_AFTER_MS") {
+            let delay_ms = delay_ms
+                .trim()
+                .parse::<u64>()
+                .expect("KREA_CANCEL_AFTER_MS must be an integer");
+            let cancel = req.cancel.clone();
+            let timer = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                cancel.cancel();
+            });
+            let cancel_started = std::time::Instant::now();
+            let error = match g.generate(&req, &mut |_| {}) {
+                Ok(_) => panic!("delayed cancellation unexpectedly produced an image"),
+                Err(error) => error,
+            };
+            timer.join().expect("join delayed cancellation timer");
+            let cancel_elapsed_s = cancel_started.elapsed().as_secs_f64();
+            assert!(
+                matches!(error, gen_core::Error::Canceled),
+                "expected delayed cancellation, got {error:?}"
+            );
+            probe.end_gen(gen_phase);
+            let report = probe.report();
+            eprintln!("KREA_CANCEL delay_ms={delay_ms} elapsed_s={cancel_elapsed_s:.3} | {report}");
+            report.assert_trustworthy(max_baseline_gb);
+            return;
+        }
+        let repeats: usize = std::env::var("KREA_AB_REPEATS")
+            .ok()
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or(1);
+        assert!(repeats > 0, "KREA_AB_REPEATS must be positive");
+        let mut phase_peaks = Vec::new();
+        let mut repeat_elapsed = Vec::with_capacity(repeats);
+        let mut first_pixels = None;
+        let mut img = None;
+        let started = std::time::Instant::now();
+        for repeat in 0..repeats {
+            let mut observed = None;
+            let mut phase_index = 0usize;
+            let repeat_started = std::time::Instant::now();
+            let output = g
+                .generate(&req, &mut |progress| {
+                    if matches!(progress, Progress::Loading(_)) {
+                        if let Some((name, phase)) = observed.take() {
+                            phase_peaks.push((repeat, name, probe.end_observed(phase)));
+                        }
+                        let name = match phase_index {
+                            0 => "text",
+                            1 => "denoise",
+                            _ => "decode",
+                        };
+                        phase_index += 1;
+                        observed = Some((name, probe.phase()));
+                    }
+                })
+                .expect("generate");
+            repeat_elapsed.push(repeat_started.elapsed().as_secs_f64());
+            if let Some((name, phase)) = observed.take() {
+                phase_peaks.push((repeat, name, probe.end_observed(phase)));
+            }
+            let current = match output {
+                GenerationOutput::Images(mut images) => images.remove(0),
+                other => panic!("expected images, got {other:?}"),
+            };
+            if let Some(expected) = &first_pixels {
+                assert_eq!(
+                    &current.pixels, expected,
+                    "repeat {repeat} changed the fixed-seed RGB output"
+                );
+            } else {
+                first_pixels = Some(current.pixels.clone());
+            }
+            img = Some(current);
+        }
+        let elapsed_s = started.elapsed().as_secs_f64();
         probe.end_gen(gen_phase);
         let report = probe.report();
 
-        let img = match output {
-            GenerationOutput::Images(mut v) => v.remove(0),
-            other => panic!("expected images, got {other:?}"),
-        };
+        let img = img.expect("at least one repeated image");
         std::fs::write(&out, &img.pixels).expect("write pixels");
 
         let env_mode = std::env::var("CANDLE_GEN_OFFLOAD").unwrap_or_default();
-        let mode = if spec_mode == "spec-sequential" {
+        let mode = if !memory_mode.is_empty() {
+            memory_mode.as_str()
+        } else if spec_mode == "spec-sequential" {
             "spec-sequential"
         } else if env_mode.eq_ignore_ascii_case("sequential") {
             "env-sequential"
@@ -1933,14 +2145,21 @@ mod tests {
             KREA_2_TURBO_ID
         };
         eprintln!(
-            "SEQ_AB id={id} mode={mode} gpu={} {}x{} steps={:?} | {report} | bytes={} out={out}",
+            "SEQ_AB id={id} mode={mode} gpu={} {}x{} steps={:?} repeats={repeats} \
+             elapsed_s={elapsed_s:.3} repeat_elapsed_s={repeat_elapsed:?} | {report} | bytes={} \
+             out={out}",
             candle_gen::testkit::probe_gpu(),
             req.width,
             req.height,
             req.steps,
             img.pixels.len(),
         );
-        report.assert_trustworthy(1.0);
+        for (repeat, phase, peak_gb) in phase_peaks {
+            eprintln!(
+                "KREA_PHASE rung={memory_mode} repeat={repeat} phase={phase} peak_gb={peak_gb:.3}"
+            );
+        }
+        report.assert_trustworthy(max_baseline_gb);
     }
 
     /// Test helper: attach a ConvRot DiT single-file selector on `text_encoder` (sc-9300).

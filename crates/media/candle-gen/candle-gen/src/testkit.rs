@@ -530,8 +530,9 @@ mod vram_probe {
         }
 
         /// Close an arbitrary observed sub-phase and return its device peak over this probe's idle
-        /// baseline. Provider measurement harnesses use this to split one generate call into physical
-        /// text/denoise/decode residency phases while the ordinary report still samples the whole call.
+        /// baseline. Provider measurement harnesses use this to split a generate call into physical
+        /// text/denoise/decode residency phases while the ordinary load/generate report continues to
+        /// sample the whole call.
         pub fn end_observed(&self, phase: Phase) -> f64 {
             mib_to_gb(phase.0.stop().saturating_sub(self.baseline_mib))
         }
