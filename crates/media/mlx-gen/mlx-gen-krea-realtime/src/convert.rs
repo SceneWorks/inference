@@ -223,6 +223,41 @@ fn plan_shards(map: &HashMap<String, Array>, max_shard_bytes: u64) -> Vec<Vec<St
     shards
 }
 
+/// Does `name` look like a shard this emitter wrote (`dit-{i}-of-{n}.safetensors`)?
+fn is_shard_file(name: &str) -> bool {
+    name.strip_prefix("dit-")
+        .and_then(|r| r.strip_suffix(".safetensors"))
+        .and_then(|r| r.split_once("-of-"))
+        .is_some_and(|(i, n)| {
+            !i.is_empty()
+                && !n.is_empty()
+                && i.bytes().all(|b| b.is_ascii_digit())
+                && n.bytes().all(|b| b.is_ascii_digit())
+        })
+}
+
+/// Delete any shard files left in `shard_dir` by a previous emit.
+///
+/// The shard *count* is a function of the byte budget, so re-emitting the same tier at a different
+/// `max_shard_bytes` produces a differently-named set (`…-of-00007` vs `…-of-00004`) and would
+/// otherwise leave the old set sitting beside the new one. `Weights::from_dir` globs every
+/// `*.safetensors` in the directory and rejects duplicate keys, so that mixture fails loudly rather
+/// than loading something wrong — but on a multi-hour rehost it fails *after* the work, and a
+/// delete-as-you-go publisher would already have pushed the stale names to the remote. Clearing up
+/// front removes the foot-gun.
+///
+/// Only files matching this emitter's own `dit-{i}-of-{n}.safetensors` naming are removed; anything
+/// else the caller put in the directory is left alone.
+fn clear_stale_shards(shard_dir: &Path) -> Result<()> {
+    for entry in std::fs::read_dir(shard_dir)? {
+        let entry = entry?;
+        if entry.file_name().to_str().is_some_and(is_shard_file) {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(())
+}
+
 /// [`convert_krea_realtime_tier`] emitted as a **sharded** `transformer/` directory instead of one
 /// [`DIT_FILE`], writing one shard at a time and handing each finished shard to `on_shard` before the
 /// next is built.
@@ -243,6 +278,10 @@ fn plan_shards(map: &HashMap<String, Array>, max_shard_bytes: u64) -> Vec<Vec<St
 /// against the emitted config *before* any shard is written, so a geometry mismatch fails up front
 /// rather than after some shards have already been uploaded. Each shard's tensors are dropped from the
 /// working map once written, so peak memory is bounded by the shard rather than the tier.
+///
+/// Shard files from a previous emit are cleared first, so re-emitting at a different
+/// `max_shard_bytes` cannot leave a stale, differently-named set beside the new one (the shard count
+/// is a function of the budget, so the filenames change with it).
 ///
 /// Returns the shard paths in order (whether or not `on_shard` deleted them).
 pub fn convert_krea_realtime_tier_sharded(
@@ -277,6 +316,7 @@ pub fn convert_krea_realtime_tier_sharded(
 
     let shard_dir = out_dir.join(TRANSFORMER_DIR);
     std::fs::create_dir_all(&shard_dir)?;
+    clear_stale_shards(&shard_dir)?;
 
     // Write config.json first: a consumer that sees shards appearing has the geometry already.
     let text = serde_json::to_string_pretty(&cfg.to_json())

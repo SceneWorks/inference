@@ -6,6 +6,10 @@
 //! `SceneWorks/krea-realtime-14b-mlx` — the rehost driver, mirroring
 //! `mlx-gen-scail2/tests/quantize_snapshot.rs`.
 //!
+//! **This driver emits and validates; it does not publish.** Uploading is a credentialed network
+//! write, which does not belong inside a `cargo test` binary, so these tests stop at a verified local
+//! snapshot and the operator publishes it with the `hf` CLI (below). Nothing here reaches the network.
+//!
 //! `#[ignore]` (needs the real checkpoint). Run on macOS:
 //!
 //! ```text
@@ -17,7 +21,23 @@
 //! # 2. Emit ONE tier, then load it back. `KREA_REHOST_TIER` = bf16 | q8 | q4 (default q4).
 //! KREA_REHOST_TIER=q4 cargo test -p mlx-gen-krea-realtime --test rehost_real_weights \
 //!   -- --ignored --nocapture emit_tier_and_load_it_back
+//!
+//! # 2b. …or as a sharded `transformer/` dir (how the dense bf16 tier ships).
+//! KREA_REHOST_TIER=bf16 cargo test -p mlx-gen-krea-realtime --test rehost_real_weights \
+//!   -- --ignored --nocapture emit_tier_sharded_and_validate_every_shard
 //! ```
+//!
+//! Publishing the validated snapshot (operator step, outside the test binary) — the whole tier
+//! directory, so `config.json` and the stock-Wan companions go up with the DiT and the remote tier is
+//! never left partial:
+//!
+//! ```text
+//! hf upload SceneWorks/krea-realtime-14b-mlx ~/.cache/krea-realtime-mlx-q4 q4 --repo-type model
+//! ```
+//!
+//! On a host too small to hold a whole tier, publish shard-by-shard instead: that is what the
+//! `on_shard` callback on `convert_krea_realtime_tier_sharded` is for — upload the shard and delete it
+//! inside the callback, then upload `config.json` + the companions once at the end.
 //!
 //! Env:
 //!   * `KREA_REALTIME_CHECKPOINT` (**required**) — path to the native checkpoint: the single-file
@@ -26,9 +46,12 @@
 //!     component is handed in as a path by the caller.
 //!   * `KREA_REHOST_TIER` — `bf16` / `q8` / `q4` (default `q4`).
 //!   * `KREA_REHOST_OUT` — tier snapshot destination (default `~/.cache/krea-realtime-mlx-<tier>`).
+//!   * `KREA_REHOST_SHARD_GIB` — shard budget for the sharded emit (default 4 GiB).
+//!   * `KREA_REHOST_COMPANIONS` — staged stock-Wan components (default
+//!     `~/.cache/krea-realtime-mlx-companions`).
 //!
-//! **Disk:** the tiers are ~7.2 GB (Q4) / ~14.3 GB (Q8) / ~28.6 GB (bf16) and the emitter writes the
-//! full `dit.safetensors` before this loads it back, so run **one tier at a time** and remove the
+//! **Disk:** the tiers are ~8.4 GB (Q4) / ~15.4 GB (Q8) / ~28.6 GB (bf16) and every test here keeps
+//! the emitted tier on disk so it can be read back, so run **one tier at a time** and remove the
 //! previous tier's directory first.
 
 use std::collections::HashMap;
@@ -225,20 +248,28 @@ fn emit_tier_and_load_it_back() {
     check_tier_reconstructs_the_source(&src, &dit, &label, quant);
 }
 
-/// Emit a tier as a **sharded** `transformer/` directory, uploading and deleting each shard as it is
-/// written so the peak local footprint is one shard rather than the whole tier — the flow the dense
-/// bf16 tier (~28.6 GB) needs on a conversion host that cannot hold it.
+/// Emit a tier as a **sharded** `transformer/` directory — the layout the dense bf16 tier (~28.6 GB)
+/// ships in, and the one a conversion host that cannot hold the whole tier needs.
 ///
-/// Set `KREA_REHOST_UPLOAD_REPO` (e.g. `SceneWorks/krea-realtime-14b-mlx`) to upload each shard via
-/// the `hf` CLI and delete it; leave it unset to keep the shards locally (which needs room for the
-/// whole tier). `KREA_REHOST_SHARD_GIB` overrides the 4 GiB shard budget.
+/// This **emits and validates only; it does not publish.** Publishing is a credentialed network write
+/// and does not belong inside a `cargo test` binary, so the driver stops at a verified local snapshot
+/// and the operator uploads it with the `hf` CLI (see the module doc for the exact commands). The
+/// disk-bounded publish flow is still fully available — it is the `on_shard` callback on
+/// [`convert_krea_realtime_tier_sharded`], which the caller can use to upload and delete each shard —
+/// it is simply the operator's callback, not this test's.
+///
+/// Validation runs at two levels, and **unconditionally**: every shard is read back off disk the
+/// moment it is written and compared against the source (so the split + `save_map` path is checked
+/// per shard, not just the pre-write in-memory inventory), and the finished directory is then loaded
+/// through the production path and content-checked as a whole.
+///
+/// `KREA_REHOST_SHARD_GIB` overrides the 4 GiB shard budget.
 #[test]
 #[ignore = "real 28.58 GB checkpoint; run with --ignored on macOS (see module doc)"]
-fn emit_tier_sharded_uploading_each_shard() {
+fn emit_tier_sharded_and_validate_every_shard() {
     let src = checkpoint();
     let (label, quant) = tier();
     let dst = out_dir(&label);
-    let repo = std::env::var("KREA_REHOST_UPLOAD_REPO").ok();
     let budget = std::env::var("KREA_REHOST_SHARD_GIB")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
@@ -246,73 +277,99 @@ fn emit_tier_sharded_uploading_each_shard() {
         .unwrap_or(DEFAULT_SHARD_BYTES);
 
     let cfg = KreaRealtimeConfig::krea_realtime_14b();
+    // The sanitized source, to compare each shard against as it lands.
+    let source = sanitize_krea_realtime_transformer(read_native(&src)).expect("sanitize source");
+
     let t0 = std::time::Instant::now();
-    let mut uploaded = 0usize;
+    let mut checked = 0usize;
     let shards =
         convert_krea_realtime_tier_sharded(&src, &dst, quant, &cfg, budget, &mut |shard| {
             let bytes = std::fs::metadata(shard).expect("shard metadata").len();
-            if let Some(repo) = repo.as_deref() {
-                // `<tier>/transformer/<file>` — the path the load path's sharded branch reads.
-                let remote = format!(
-                    "{label}/{}/{}",
-                    mlx_gen_krea_realtime::TRANSFORMER_DIR,
-                    shard.file_name().unwrap().to_string_lossy()
-                );
-                let status = std::process::Command::new("hf")
-                    .args(["upload", repo])
-                    .arg(shard)
-                    .arg(&remote)
-                    .args(["--repo-type", "model", "--commit-message"])
-                    .arg(format!("sc-8435 S2b: {label} tier shard {remote}"))
-                    .status()
-                    .expect("run `hf upload`");
-                assert!(status.success(), "hf upload failed for {remote}");
-                std::fs::remove_file(shard).expect("delete the uploaded shard");
-                uploaded += 1;
-            }
+            let compared = check_shard_against_source(shard, &source, &label);
+            checked += compared;
             println!(
-                "  shard {} ({:.2} GB){}",
+                "  shard {} ({:.2} GB): {compared} tensor(s) bit-exact vs. source",
                 shard.file_name().unwrap().to_string_lossy(),
                 bytes as f64 / 1e9,
-                if repo.is_some() {
-                    " uploaded + deleted"
-                } else {
-                    ""
-                }
             );
             Ok(())
         })
         .unwrap_or_else(|e| panic!("sharded emit of the {label} tier: {e}"));
 
+    assert!(
+        checked > 0,
+        "{label}: no shard tensor was comparable against the source — the per-shard check is inert"
+    );
     println!(
-        "tier {label}: {} shard(s) emitted in {:.1?} ({} uploaded) -> {}",
+        "tier {label}: {} shard(s) emitted in {:.1?}, {checked} tensor(s) spot-checked -> {}",
         shards.len(),
         t0.elapsed(),
-        uploaded,
         dst.display()
     );
 
-    // When the shards were kept (no upload), hold the sharded tier to the SAME bar as the single-file
-    // one: it must load back through the production path at the tier it claims, and reconstruct the
-    // source weights. Uploading deletes each shard as it goes, so there is nothing left to check.
-    if repo.is_none() {
-        let dir = dst.join(mlx_gen_krea_realtime::TRANSFORMER_DIR);
-        let raw = read_native(&dir);
+    // Hold the sharded tier to the SAME bar as the single-file one: it must load back through the
+    // production path at the tier it claims, and reconstruct the source weights.
+    let dir = dst.join(mlx_gen_krea_realtime::TRANSFORMER_DIR);
+    let raw = read_native(&dir);
+    assert_eq!(
+        raw.len(),
+        AUDIT_TENSOR_COUNT + if quant.is_some() { 800 } else { 0 },
+        "{label}: the sharded set must be complete (and disjoint — from_dir rejects duplicates)"
+    );
+    let (_t, resolved) = load_krea_realtime_transformer_with_quant(raw, &cfg)
+        .unwrap_or_else(|e| panic!("load back the sharded {label} tier: {e}"));
+    let want = quant.map(|(bits, group_size)| WanQuant { bits, group_size });
+    assert_eq!(
+        resolved.map(|q| (q.bits, q.group_size)),
+        want.map(|q| (q.bits, q.group_size)),
+        "{label}: the sharded tier must resolve to the requested quantization"
+    );
+    check_tier_reconstructs_the_source(&src, &dir, &label, quant);
+}
+
+/// Read `shard` back off disk and bit-exact-compare its tensors against the sanitized `source`,
+/// returning how many were compared.
+///
+/// Only tensors that are **pass-through** at this tier are comparable — on a packed tier the predicate
+/// Linears hold u32 codes that by construction differ from the source's bf16, so the rule is "same key,
+/// same dtype, same shape ⇒ must be identical". A handful per shard is enough: this exists to catch a
+/// bad split or a bad write in *this* shard, and the whole-tier content check runs afterwards.
+///
+/// Every key must still be *accounted for*: it is either a source key, or a `.scales`/`.biases`
+/// companion that quantization created for a source `{base}.weight`. Anything else means the shard
+/// holds a tensor the source never had.
+fn check_shard_against_source(shard: &Path, source: &HashMap<String, Array>, label: &str) -> usize {
+    let w = Weights::from_file(shard).expect("read the shard back");
+    let mut names: Vec<&str> = w.keys().collect();
+    names.sort();
+
+    let mut compared = 0;
+    for name in names {
+        let got = w.require(name).expect("key from keys()");
+        let Some(want) = source.get(name) else {
+            // A packed companion is legitimate iff its base weight came from the source.
+            let base = name
+                .strip_suffix(".scales")
+                .or_else(|| name.strip_suffix(".biases"));
+            let ok = base.is_some_and(|b| source.contains_key(&format!("{b}.weight")));
+            assert!(
+                ok,
+                "{label}: shard {shard:?} holds `{name}`, which is neither a source tensor nor a \
+                 quantization companion of one"
+            );
+            continue;
+        };
+        if compared >= 8 || got.dtype() != want.dtype() || got.shape() != want.shape() {
+            continue; // packed at this tier — covered by the dequantize check on the whole tier
+        }
         assert_eq!(
-            raw.len(),
-            AUDIT_TENSOR_COUNT + if quant.is_some() { 800 } else { 0 },
-            "{label}: the sharded set must be complete (and disjoint — from_dir rejects duplicates)"
+            max_abs(&got.subtract(want).expect("sub")),
+            0.0,
+            "{label}: shard {shard:?} tensor `{name}` does not match the source bit for bit"
         );
-        let (_t, resolved) = load_krea_realtime_transformer_with_quant(raw, &cfg)
-            .unwrap_or_else(|e| panic!("load back the sharded {label} tier: {e}"));
-        let want = quant.map(|(bits, group_size)| WanQuant { bits, group_size });
-        assert_eq!(
-            resolved.map(|q| (q.bits, q.group_size)),
-            want.map(|q| (q.bits, q.group_size)),
-            "{label}: the sharded tier must resolve to the requested quantization"
-        );
-        check_tier_reconstructs_the_source(&src, &dir, &label, quant);
+        compared += 1;
     }
+    compared
 }
 
 /// The stock-Wan companion directory (`t5_encoder.safetensors` + `vae.safetensors` +
@@ -499,10 +556,14 @@ fn check_tier_reconstructs_the_source(
              tolerance {tol} — the packed tier does not reconstruct the source weight"
         );
         // Not a constant: a collapsed reconstruction would still pass a loose error bound if the
-        // source happened to be small, so require real spread.
+        // source happened to be small, so require real spread. `max_abs > 0` would NOT show this — a
+        // nonzero constant satisfies it — so compare the extremes.
+        let r32 = recon.as_dtype(Dtype::Float32).expect("f32");
+        let spread =
+            r32.max(None).expect("max").item::<f32>() - r32.min(None).expect("min").item::<f32>();
         assert!(
-            max_abs(&recon) > 0.0,
-            "{label}/{base}: reconstruction collapsed to zero"
+            spread > 0.0,
+            "{label}/{base}: reconstruction is constant (spread {spread}) — not a real weight"
         );
         println!("  {label}/{base}: Q{bits} relative reconstruction error {err:.4} (< {tol})");
     }

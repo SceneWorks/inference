@@ -730,9 +730,11 @@ fn tier_converter_writes_a_snapshot_the_load_path_reads_back() {
 /// single-file emitter writes from the same source.
 ///
 /// Discriminating: it asserts the shards are actually MULTIPLE (a budget that silently produced one
-/// shard would make the whole disk-bounded flow a no-op and still "pass"), that `on_shard` fires once
-/// per shard *before* the next exists (the property the rehost's delete-as-you-go depends on), and
-/// that a deleted shard really is gone — i.e. peak footprint is one shard, not the tier.
+/// shard would make the whole disk-bounded flow a no-op and still "pass"); that the emit is genuinely
+/// **incremental** — when `on_shard` fires for shard `i`, no shard `> i` exists on disk yet, so an
+/// emitter that wrote all N shards up front and only then invoked the callback N times (exactly the
+/// failure mode the disk bound exists to prevent) fails here; and that tensor **values**, not just key
+/// names, survive the split.
 #[test]
 fn sharded_emitter_matches_the_single_file_emitter_and_holds_one_shard_at_a_time() {
     let cfg = tiny_cfg();
@@ -752,6 +754,7 @@ fn sharded_emitter_matches_the_single_file_emitter_and_holds_one_shard_at_a_time
         let budget = total_bytes / 3;
 
         let sharded = base.join(format!("{tier}-sharded"));
+        let shard_dir = sharded.join(TRANSFORMER_DIR);
         let mut seen: Vec<PathBuf> = Vec::new();
         let paths = convert_krea_realtime_tier_sharded(
             &native,
@@ -762,14 +765,35 @@ fn sharded_emitter_matches_the_single_file_emitter_and_holds_one_shard_at_a_time
             &mut |p| {
                 // The callback must see a finished, readable shard...
                 assert!(p.is_file(), "{tier}: on_shard got a missing shard {p:?}");
-                // ...and it must be the only one on disk (the previous ones were deleted here), which
-                // is exactly what bounds the rehost's peak disk to a single shard.
-                for prev in &seen {
+
+                // ...and NOTHING later may exist yet. This is the load-bearing assertion: it is what
+                // separates a truly incremental emitter from one that writes every shard first and
+                // then calls back N times. Parse `dit-{i}-of-{n}` and require every higher index to be
+                // absent.
+                let (idx, total) = parse_shard_name(p);
+                for j in (idx + 1)..=total {
+                    let later = shard_dir.join(format!("dit-{j:05}-of-{total:05}.safetensors"));
                     assert!(
-                        !prev.exists(),
-                        "{tier}: shard {prev:?} still on disk — peak footprint is not one shard"
+                        !later.exists(),
+                        "{tier}: shard {j} already on disk while shard {idx} was being handed over — \
+                         the emit is not incremental, so the disk bound does not hold"
                     );
                 }
+                // Belt and braces: with the previous shards deleted below, exactly one shard file may
+                // be present at any moment — i.e. peak footprint really is one shard, not the tier.
+                let on_disk = std::fs::read_dir(&shard_dir)
+                    .unwrap()
+                    .filter(|e| {
+                        e.as_ref().is_ok_and(|e| {
+                            e.path().extension().and_then(|s| s.to_str()) == Some("safetensors")
+                        })
+                    })
+                    .count();
+                assert_eq!(
+                    on_disk, 1,
+                    "{tier}: {on_disk} shard files on disk at shard {idx} — expected exactly 1"
+                );
+
                 seen.push(p.to_path_buf());
                 std::fs::remove_file(p).unwrap(); // the rehost uploads, then deletes
                 Ok(())
@@ -808,6 +832,24 @@ fn sharded_emitter_matches_the_single_file_emitter_and_holds_one_shard_at_a_time
             "{tier}: the sharded tensor set must equal the single-file one"
         );
 
+        // Names matching is not the same as bytes matching: a shard that wrote the right keys with
+        // the wrong payload would pass the comparison above and load fine. Compare VALUES, bit for
+        // bit, across the whole set — at this geometry that is cheap.
+        for name in &want {
+            let a = sw.get(name).unwrap();
+            let b = fw.get(name).unwrap();
+            assert_eq!(a.dtype(), b.dtype(), "{tier}/{name}: dtype");
+            assert_eq!(a.shape(), b.shape(), "{tier}/{name}: shape");
+            assert_eq!(
+                max_abs_diff(
+                    &a.as_dtype(Dtype::Float32).unwrap(),
+                    &b.as_dtype(Dtype::Float32).unwrap()
+                ),
+                0.0,
+                "{tier}/{name}: sharded bytes must equal the single-file emit bit for bit"
+            );
+        }
+
         let read_back = KreaRealtimeConfig::from_model_dir(&keep).expect("emitted config");
         let raw: HashMap<String, Array> = sw
             .keys()
@@ -823,6 +865,73 @@ fn sharded_emitter_matches_the_single_file_emitter_and_holds_one_shard_at_a_time
             "{tier}: the sharded snapshot must resolve to the emitted tier"
         );
     }
+
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// `(index, total)` out of a `dit-{i}-of-{n}.safetensors` shard path.
+fn parse_shard_name(p: &std::path::Path) -> (usize, usize) {
+    let name = p.file_name().unwrap().to_str().unwrap();
+    let body = name
+        .strip_prefix("dit-")
+        .and_then(|r| r.strip_suffix(".safetensors"))
+        .unwrap_or_else(|| panic!("unexpected shard name {name}"));
+    let (i, n) = body
+        .split_once("-of-")
+        .unwrap_or_else(|| panic!("unexpected shard name {name}"));
+    (i.parse().unwrap(), n.parse().unwrap())
+}
+
+/// **Stale shards from a previous emit are cleared** (sc-8435 S2b review #6). The shard count is a
+/// function of the byte budget, so re-emitting the same tier at a different budget yields a
+/// differently-named set; without clearing, the old files sit beside the new ones and any consumer
+/// globbing `*.safetensors` sees a mixture. Discriminating: the stale set here uses a *different*
+/// total, so it cannot be overwritten by name — only an explicit clear removes it.
+#[test]
+fn re_emitting_at_a_different_budget_clears_the_previous_shard_set() {
+    let cfg = tiny_cfg();
+    let base = std::env::temp_dir().join(format!("krea_shard_restale_{}", std::process::id()));
+    let native = write_native_checkpoint(&cfg, &base);
+    let out = base.join("tier");
+
+    let total_bytes: u64 = {
+        let flat = base.join("flat");
+        convert_krea_realtime_tier_with_config(&native, &flat, None, &cfg).unwrap();
+        let fw = mlx_gen::weights::Weights::from_file(flat.join(DIT_FILE)).unwrap();
+        fw.keys().map(|k| fw.get(k).unwrap().nbytes() as u64).sum()
+    };
+
+    // First emit: many small shards.
+    let many =
+        convert_krea_realtime_tier_sharded(&native, &out, None, &cfg, total_bytes / 4, &mut |_| {
+            Ok(())
+        })
+        .unwrap();
+    assert!(many.len() > 2, "expected a multi-shard first emit");
+
+    // Second emit at a much larger budget → a different shard count, so different filenames.
+    let few =
+        convert_krea_realtime_tier_sharded(&native, &out, None, &cfg, total_bytes, &mut |_| Ok(()))
+            .unwrap();
+    assert_ne!(
+        many.len(),
+        few.len(),
+        "the two budgets must produce different shard counts for this to discriminate"
+    );
+
+    let dir = out.join(TRANSFORMER_DIR);
+    let present: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+        .filter(|n| n.ends_with(".safetensors"))
+        .collect();
+    assert_eq!(
+        present.len(),
+        few.len(),
+        "stale shards from the first emit were left behind: {present:?}"
+    );
+    // And the directory still loads cleanly (a leftover set would collide on duplicate keys).
+    mlx_gen::weights::Weights::from_dir(&dir).expect("re-emitted shard dir must load");
 
     std::fs::remove_dir_all(&base).ok();
 }
