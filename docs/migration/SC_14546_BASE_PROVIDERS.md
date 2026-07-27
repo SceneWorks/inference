@@ -220,12 +220,12 @@ run [30259152906](https://github.com/SceneWorks/inference/actions/runs/302591529
 The CUDA row is also what stops "the unscaled bound was a Metal-only accident" from reading as a
 CPU-only quirk. The CUDA residual, `3.524780e-3`, **exceeds its own unscaled floor**, `3.471375e-3` —
 so the first draft's bound would have failed on the CUDA lane too, not just on CPU. The rescaling was
-necessary on both non-Metal backends; Metal's `6.1035e-5` residual, two orders of magnitude under its
-floor, is the outlier.
+necessary on both non-Metal backends; Metal's `6.1035e-5` residual, about 60x under its own unscaled
+floor while the other two sit above theirs, is the outlier.
 
 Every one of those mis-wirings diverges from the no-negative render just as loudly as the correct
 wiring, so every one passes step 3 — and overshoots this bound by at least 6,690x (the closest,
-`g − 1` on CPU; 7,328x on Metal and 7,779x on CUDA), while the correct recomposition stays under it
+`g − 1` on CPU; 7,327x on Metal and 7,778x on CUDA), while the correct recomposition stays under it
 on all three backends.
 
 `tests/dit_oracle.rs`'s `real_weights_detect_conditioning_mutations_and_exercise_cfg_apg` is the
