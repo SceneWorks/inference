@@ -381,7 +381,6 @@ impl Linear {
                 // activation dtype (MLX promotes a bf16 factor against an f32 activation), the scale
                 // through a dtype-matched scalar so the multiply preserves the residual dtype (the
                 // reference's weak Python-float `scale·…`).
-                let r = ad.residual(x)?;
                 let ps = ad.pass_scale();
                 // A malformed adapter with an empty `pass_scale` would underflow `ps.len() - 1`
                 // (usize) into an out-of-bounds index → panic; use a checked access and surface a
@@ -394,7 +393,19 @@ impl Linear {
                             "ltx adapter: pass_scale must have at least one entry".to_string(),
                         )
                     })?;
-                out = add(&out, &multiply(&r, &scalar(s).as_dtype(r.dtype())?)?)?;
+                // sc-15265: LTX carries its own adapter stack rather than `AdaptableLinear`, so it
+                // needs the same two rules the shared seam now enforces (see
+                // `mlx_gen::adapters::AdaptableLinear::apply_adapters`):
+                //   * a `scale == 0` pass contributes nothing — skip it, so a disabled adapter (or a
+                //     pass the schedule turns off) leaves `out` byte-identical to the unadapted base;
+                //   * the residual is narrowed to `out`'s dtype BEFORE the add, so f32 factors over a
+                //     bf16 host cannot widen this Linear — and every op downstream of it — to f32.
+                if s == 0.0 {
+                    continue;
+                }
+                let r = ad.residual(x)?;
+                let r = multiply(&r, &scalar(s).as_dtype(r.dtype())?)?;
+                out = add(&out, &r.as_dtype(out.dtype())?)?;
             }
         }
         Ok(out)

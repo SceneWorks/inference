@@ -363,8 +363,12 @@ impl Adapter {
     ///   * LoKr — `scale · x·ΔWᵀ` with `ΔW` (stored bf16) cast to the **activation dtype** — bf16 on
     ///     the bf16 path — mirroring the fork's `delta.astype(x.dtype)`.
     ///
-    /// The result is NOT cast back: `base(x) + residual` promotes just as the fork's `out + residual`
-    /// does. An f32-activation target is unchanged (FLUX.2; Qwen's f32 image stream; SDXL merges
+    /// The result is NOT cast back **here** — this returns the residual in its natural promoted
+    /// dtype, byte-for-byte as the fork's `.residual` does. The hand-off to the host is a separate
+    /// concern and lives in `AdaptableLinear`'s adapter accumulation, which narrows the residual to the
+    /// host's output dtype before the add (sc-15265) so installing an adapter cannot widen the host
+    /// Linear — and therefore the whole downstream chain — from bf16 to f32. An f32-activation
+    /// target is unchanged either way (FLUX.2; Qwen's f32 image stream; SDXL merges
     /// instead) — the residual was f32 before and stays f32. A bf16-activation target now runs the
     /// residual in bf16 like the fork (Z-Image's latents; Qwen's bf16 text stream); validated against
     /// the fork goldens (Z-Image / Qwen LoRA+LoKr) — px>8 byte-identical to the old forced-f32 path,
@@ -386,6 +390,27 @@ impl Adapter {
         };
         // Dtype-matched scalar → preserves the residual's dtype (the fork's weak-float `scale * …`).
         Ok(multiply(&r, &scalar(scale).as_dtype(r.dtype())?)?)
+    }
+
+    /// `true` when this adapter contributes nothing — a `scale` of exactly zero (sc-15265).
+    ///
+    /// [`AdaptableLinear::forward`] skips a disabled adapter entirely rather than adding its
+    /// (mathematically zero) residual, so **"install an adapter at scale 0" is byte-identical to
+    /// "install no adapter at all"**: no residual is formed, nothing is added, and the host's
+    /// output array is returned untouched. That is what makes scale 0 usable both as the
+    /// "disabled LoRA" model a UI/worker reaches for and as an A/B control when validating an
+    /// adapter. (It is also strictly cheaper: two matmuls per adapted Linear are skipped.)
+    ///
+    /// [`Adapter::LokrStructured`] has no recoverable `scale` — it is baked into
+    /// [`LokrFactors::w2`] at build time — so it reports `false`. It needs no short-circuit: a
+    /// zero `scale` multiplies `w2` to *exact* zeros, its residual is exact zeros, and adding
+    /// exact zeros is already bit-exact (gated by
+    /// `scale_zero_lokr_variants_are_bit_exact_noops_on_a_bf16_base`).
+    pub fn is_disabled(&self) -> bool {
+        match self {
+            Adapter::Lora { scale, .. } | Adapter::Lokr { scale, .. } => *scale == 0.0,
+            Adapter::LokrStructured { .. } => false,
+        }
     }
 }
 
@@ -714,19 +739,53 @@ impl AdaptableLinear {
         Ok(())
     }
 
-    pub fn forward(&self, x: &Array) -> Result<Array> {
-        let mut out = self.base.forward(x)?;
+    /// Accumulate the adapter stack over an already-computed base output, in the **host's** dtype
+    /// (sc-15265). Two rules, both about the host staying the host:
+    ///
+    /// 1. A [disabled](Adapter::is_disabled) adapter (`scale == 0`) is skipped outright, so `out`
+    ///    is returned as the base produced it — installing an adapter and setting its scale to 0
+    ///    is byte-identical to never installing one.
+    /// 2. A live adapter's residual is cast to `out`'s dtype **before** the add.
+    ///
+    /// Rule 2 is the consequential one and is not confined to scale 0. Adapter factors carry their
+    /// on-disk dtype and [`Adapter::residual`] deliberately does not force one (sc-2718,
+    /// fork-faithful); the goldens ship **f32** factors, so on a **bf16** host `add(bf16, f32)`
+    /// promoted the Linear's output to f32 — and from there the whole downstream chain, since
+    /// every subsequent op inherits the widened activation. That is a global precision/allocation
+    /// change triggered by merely installing a LoRA, measured e2e at ≈1.9e-4 (dense) / ≈2.9e-4
+    /// (Q4) versus the unadapted model. Training already had to work around it per-call-site
+    /// (`install_training_lora_as`'s compute-dtype cast, sc-4887, whose doc names exactly this
+    /// "silently re-promotes the whole chain to f32"); this fixes it once at the shared seam.
+    ///
+    /// The residual itself is still computed in its natural promoted dtype — only the *hand-off*
+    /// to the host is narrowed — so an f32-activation host (FLUX.2, Qwen's image stream) is
+    /// completely unaffected: `out` is already f32 and the cast is a no-op.
+    fn apply_adapters(&self, x: &Array, mut out: Array) -> Result<Array> {
         for adapter in &self.adapters {
-            out = add(&out, &adapter.residual(x)?)?;
+            if adapter.is_disabled() {
+                continue;
+            }
+            let residual = adapter.residual(x)?;
+            let residual = if residual.dtype() == out.dtype() {
+                residual
+            } else {
+                residual.as_dtype(out.dtype())?
+            };
+            out = add(&out, &residual)?;
         }
         Ok(out)
+    }
+
+    pub fn forward(&self, x: &Array) -> Result<Array> {
+        let out = self.base.forward(x)?;
+        self.apply_adapters(x, out)
     }
 
     /// Evaluate with dense base weights widened to the activation dtype for this operation.
     /// Packed bases already compute from the activation dtype and are left packed. This supports
     /// bf16-resident/f32-compute text encoders without permanently widening their weight store.
     pub fn forward_upcast(&self, x: &Array) -> Result<Array> {
-        let mut out = match &self.base {
+        let out = match &self.base {
             LinearBase::Dense(l) => {
                 let weight = l.weight.value.as_dtype(x.dtype())?;
                 match l.bias.value.as_ref() {
@@ -736,10 +795,7 @@ impl AdaptableLinear {
             }
             LinearBase::Quantized(_) => self.base.forward(x)?,
         };
-        for adapter in &self.adapters {
-            out = add(&out, &adapter.residual(x)?)?;
-        }
-        Ok(out)
+        self.apply_adapters(x, out)
     }
 }
 
@@ -905,6 +961,194 @@ mod tests {
     #[test]
     fn lokr_delta_stored_bf16() {
         assert_eq!(lokr_2x2().dtype(), Dtype::Bfloat16);
+    }
+
+    // ── sc-15265: adapter installation must not change the host Linear's output dtype ──────────
+    //
+    // A bf16 base with f32 LoRA/LoKr factors used to promote the WHOLE forward to f32, so
+    // "install an adapter and set its scale to 0" was NOT the same as "don't install it"
+    // (measured drift ≈1.9e-4 dense / 2.9e-4 Q4 e2e), and a *live* adapter silently widened
+    // every downstream activation. The helpers below build a 64-wide (group-size-aligned, so the
+    // same base can be quantized) bf16 host and f32 rank-4 factors — the exact shape of the bug.
+
+    /// Deterministic `[rows, cols]` f32 array from a cheap analytic pattern.
+    fn synth(rows: i32, cols: i32, seed: f32) -> Array {
+        let n = (rows * cols) as usize;
+        let v: Vec<f32> = (0..n)
+            .map(|i| (i as f32 * 0.017 + seed).sin() * 0.05)
+            .collect();
+        Array::from_slice(&v, &[rows, cols])
+    }
+
+    /// A bf16 host Linear (`[64, 64]`, no bias), bf16 activations `[4, 64]`, and f32 rank-4
+    /// LoRA factors `a: [64, 4]`, `b: [4, 64]` — the promoting combination.
+    fn bf16_host() -> (AdaptableLinear, Array, Array, Array) {
+        let w = synth(64, 64, 0.3).as_dtype(Dtype::Bfloat16).unwrap();
+        let x = synth(4, 64, 1.1).as_dtype(Dtype::Bfloat16).unwrap();
+        (
+            AdaptableLinear::dense(w, None),
+            x,
+            synth(64, 4, 2.7),
+            synth(4, 64, 3.9),
+        )
+    }
+
+    /// `true` iff the two arrays are bit-identical in both dtype and every element.
+    fn bit_exact(got: &Array, want: &Array) -> bool {
+        got.dtype() == want.dtype()
+            && got.shape() == want.shape()
+            && array_eq(got, want, false).unwrap().item::<bool>()
+    }
+
+    #[test]
+    fn scale_zero_lora_is_bit_exact_noop_on_a_bf16_dense_base() {
+        let (mut lin, x, a, b) = bf16_host();
+        let base = lin.forward(&x).unwrap();
+        assert_eq!(base.dtype(), Dtype::Bfloat16, "host output is bf16");
+
+        lin.push(Adapter::Lora {
+            a: a.clone(),
+            b: b.clone(),
+            scale: 0.0,
+        });
+        let zero = lin.forward(&x).unwrap();
+        assert_eq!(
+            zero.dtype(),
+            Dtype::Bfloat16,
+            "installing an adapter must not widen the host's output dtype"
+        );
+        assert!(
+            bit_exact(&zero, &base),
+            "a scale-0 adapter must be bit-exact to no adapter at all"
+        );
+
+        // MUTATION: the same adapter at a live scale must actually change the output — otherwise
+        // the bit-exactness above would be a false green from a dead residual.
+        let mut live =
+            AdaptableLinear::dense(synth(64, 64, 0.3).as_dtype(Dtype::Bfloat16).unwrap(), None);
+        live.push(Adapter::Lora { a, b, scale: 1.0 });
+        assert!(
+            !bit_exact(&live.forward(&x).unwrap(), &base),
+            "a live adapter must change the forward (residual is not identically zero)"
+        );
+    }
+
+    #[test]
+    fn scale_zero_lora_is_bit_exact_noop_on_a_packed_base() {
+        for bits in [4, 8] {
+            let (mut lin, x, a, b) = bf16_host();
+            lin.quantize(bits, None).unwrap();
+            let base = lin.forward(&x).unwrap();
+            assert_eq!(base.dtype(), Dtype::Bfloat16, "q{bits} host output is bf16");
+
+            lin.push(Adapter::Lora { a, b, scale: 0.0 });
+            let zero = lin.forward(&x).unwrap();
+            assert_eq!(
+                zero.dtype(),
+                Dtype::Bfloat16,
+                "q{bits}: installing an adapter must not widen the host's output dtype"
+            );
+            assert!(
+                bit_exact(&zero, &base),
+                "q{bits}: a scale-0 adapter must be bit-exact to no adapter at all"
+            );
+        }
+    }
+
+    #[test]
+    fn scale_zero_lokr_variants_are_bit_exact_noops_on_a_bf16_base() {
+        // Materialized LoKr (bf16 delta, so this arm never promoted) and the *structured* LoKr,
+        // whose factors are built at an explicit `out_dtype` — build them f32 over a bf16 host to
+        // reproduce the promotion, and check `scale = 0` is still an exact no-op.
+        let (lin, x, _, _) = bf16_host();
+        let base = lin.forward(&x).unwrap();
+
+        let mut mat = lin.clone();
+        mat.push(Adapter::Lokr {
+            delta: synth(64, 64, 5.5).as_dtype(Dtype::Bfloat16).unwrap(),
+            scale: 0.0,
+        });
+        assert!(
+            bit_exact(&mat.forward(&x).unwrap(), &base),
+            "a scale-0 materialized LoKr must be bit-exact to no adapter"
+        );
+
+        let factors = build_lokr_factors(
+            0.0,
+            &[64, 64],
+            Some(&synth(8, 8, 6.1)),
+            None,
+            None,
+            Some(&synth(8, 8, 7.3)),
+            None,
+            None,
+            None,
+            Dtype::Float32,
+        )
+        .unwrap()
+        .expect("8×8 ⊗ 8×8 factors a 64×64 base");
+        let mut structured = lin.clone();
+        structured.push(Adapter::LokrStructured { factors });
+        let got = structured.forward(&x).unwrap();
+        assert_eq!(
+            got.dtype(),
+            Dtype::Bfloat16,
+            "a structured LoKr must not widen the host's output dtype"
+        );
+        assert!(
+            bit_exact(&got, &base),
+            "a scale-0 structured LoKr must be bit-exact to no adapter"
+        );
+    }
+
+    #[test]
+    fn live_adapter_keeps_the_host_output_dtype_and_matches_a_cast_residual() {
+        // Half 2 (sc-15265): the widening is NOT confined to scale 0. A live f32-factor adapter
+        // over a bf16 host must land its residual in the host dtype — `bf16(base) + bf16(residual)`
+        // — rather than promoting the whole downstream chain to f32.
+        let (mut lin, x, a, b) = bf16_host();
+        let base = lin.forward(&x).unwrap();
+        let adapter = Adapter::Lora { a, b, scale: 0.75 };
+        let residual = adapter.residual(&x).unwrap();
+        assert_eq!(
+            residual.dtype(),
+            Dtype::Float32,
+            "f32 factors still promote the RESIDUAL itself (Adapter::residual is unchanged)"
+        );
+
+        lin.push(adapter);
+        let got = lin.forward(&x).unwrap();
+        assert_eq!(
+            got.dtype(),
+            Dtype::Bfloat16,
+            "a live adapter must not widen the host's output dtype"
+        );
+        let want = add(&base, residual.as_dtype(Dtype::Bfloat16).unwrap()).unwrap();
+        assert!(
+            bit_exact(&got, &want),
+            "the forward must be base + host-dtype(residual)"
+        );
+    }
+
+    #[test]
+    fn forward_upcast_also_keeps_its_own_output_dtype() {
+        // `forward_upcast` widens the BASE to the activation dtype on purpose; the adapter must
+        // still not widen it any further than that.
+        let w = synth(64, 64, 0.3).as_dtype(Dtype::Bfloat16).unwrap();
+        let x = synth(4, 64, 1.1).as_dtype(Dtype::Bfloat16).unwrap();
+        let mut lin = AdaptableLinear::dense(w, None);
+        let base = lin.forward_upcast(&x).unwrap();
+        assert_eq!(base.dtype(), Dtype::Bfloat16);
+        lin.push(Adapter::Lora {
+            a: synth(64, 4, 2.7),
+            b: synth(4, 64, 3.9),
+            scale: 0.0,
+        });
+        let zero = lin.forward_upcast(&x).unwrap();
+        assert!(
+            bit_exact(&zero, &base),
+            "forward_upcast: a scale-0 adapter must be a bit-exact no-op too"
+        );
     }
 
     #[test]

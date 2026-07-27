@@ -64,7 +64,7 @@ The split is deliberate — see `ARCHITECTURE.md`:
 
 ### Adapters & quantization
 
-- Every quantizable/adaptable projection is an `AdaptableLinear` (`src/adapters.rs`): base + a stack of forward-time residual adapters → `base(x) + Σ adapter.residual(x)`. The **base is never fused/mutated** (fusing would force re-quantization on adapter swap and break quant-safety; LoRA/LoKr compose with Q4/Q8 for free). Adapters install by **dotted path** (the Rust replacement for Python's dynamic `getattr`).
+- Every quantizable/adaptable projection is an `AdaptableLinear` (`src/adapters.rs`): base + a stack of forward-time residual adapters → `base(x) + Σ adapter.residual(x)`. The **base is never fused/mutated** (fusing would force re-quantization on adapter swap and break quant-safety; LoRA/LoKr compose with Q4/Q8 for free). Adapters install by **dotted path** (the Rust replacement for Python's dynamic `getattr`). The sum is taken in the **host's** output dtype and a `scale == 0` adapter is skipped entirely (sc-15265), so installing an adapter never widens a bf16 Linear — or the chain downstream of it — to f32, and "installed at scale 0" is byte-identical to "not installed".
 - Quantization is group-wise affine Q4/Q8 at `group_size = 64`, verified **byte-identical** to the fork's packing.
 - Errors: one `thiserror` enum `error::Error` with `Result<T>` at the crate root. At the gen-core contract boundary, `?` on a raw `mlx_rs::Exception` will NOT bridge to `gen_core::Error` — provider `*_registered` adapters wrap `crate::Result` → `gen_core::Result` via `.map_err(Into::into)`.
 
