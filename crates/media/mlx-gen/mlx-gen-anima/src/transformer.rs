@@ -603,7 +603,7 @@ impl CosmosDiT {
                         .ok_or_else(|| {
                             Exception::custom(format!("checkpoint LoRA target not found: {local}"))
                         })?
-                        .set_adapters(vec![Adapter::Lora {
+                        .set_training_adapters(vec![Adapter::Lora {
                             a,
                             b: bmat,
                             scale: 1.0,

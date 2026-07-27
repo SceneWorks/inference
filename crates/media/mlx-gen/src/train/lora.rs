@@ -189,7 +189,7 @@ pub fn install_training_lora_as<H: AdaptableHost>(
         let lin = host
             .adaptable_mut(&segs)
             .ok_or_else(|| Exception::custom(format!("LoRA target not found: {}", t.path)))?;
-        lin.set_adapters(vec![Adapter::Lora { a, b, scale: 1.0 }]);
+        lin.set_training_adapters(vec![Adapter::Lora { a, b, scale: 1.0 }]);
     }
     Ok(())
 }
@@ -406,7 +406,7 @@ pub fn install_training_lokr<H: AdaptableHost>(
         let lin = host
             .adaptable_mut(&segs)
             .ok_or_else(|| Exception::custom(format!("LoKr target not found: {}", t.path)))?;
-        lin.set_adapters(vec![Adapter::Lokr { delta, scale: 1.0 }]);
+        lin.set_training_adapters(vec![Adapter::Lokr { delta, scale: 1.0 }]);
     }
     Ok(())
 }

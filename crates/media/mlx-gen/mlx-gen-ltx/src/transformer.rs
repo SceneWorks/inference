@@ -2307,13 +2307,37 @@ mod tests {
     /// A bare dense Linear (no bias contribution) for the residual-math gates.
     fn dense(w: Array) -> Linear {
         let out = w.shape()[0];
+        let dt = w.dtype();
         Linear {
             kind: LinearKind::Dense {
+                b: Array::zeros::<f32>(&[out]).unwrap().as_dtype(dt).unwrap(),
                 w,
-                b: Array::zeros::<f32>(&[out]).unwrap(),
             },
             lora: None,
         }
+    }
+
+    /// The sc-15265 contract this crate's `Linear::forward` implements, spelled out independently
+    /// of the implementation: the residual is scaled in its own (promoted) dtype and then **cast to
+    /// the host output's dtype before the add**, so the host's dtype is what comes out.
+    fn want_adapted(base: &Array, resid: &Array, s: f32) -> Array {
+        let r = multiply(resid, scalar(s).as_dtype(resid.dtype()).unwrap()).unwrap();
+        add(base, r.as_dtype(base.dtype()).unwrap()).unwrap()
+    }
+
+    /// Bit-pattern (not value) equality — `array_eq` would accept `-0.0 == +0.0`.
+    fn bit_exact(got: &Array, want: &Array) -> bool {
+        if got.dtype() != want.dtype() || got.shape() != want.shape() {
+            return false;
+        }
+        let bits = |a: &Array| match a.dtype() {
+            Dtype::Bfloat16 | Dtype::Float16 => a.view::<u16>().unwrap(),
+            Dtype::Float32 => a.view::<u32>().unwrap(),
+            _ => a.clone(),
+        };
+        array_eq(bits(got), bits(want), false)
+            .unwrap()
+            .item::<bool>()
     }
 
     #[test]
@@ -2326,23 +2350,116 @@ mod tests {
         let b = Array::from_slice(&[0.5f32, -0.5, 0.25, 0.75], &[2, 2]);
         let base = dense(w.clone()).forward(&x).unwrap();
 
-        // scale 0 → bit-exact no-op (`out + 0·residual`).
+        // scale 0 → bit-exact no-op. sc-15265: the residual is SKIPPED, not added-as-zero (that
+        // stronger claim is what `disabled_ltx_adapters_residual_is_never_evaluated` gates; this
+        // fixture is all-f32 and so cannot tell the two apart on its own).
         let mut lin0 = dense(w.clone());
         lin0.push_lora(a.clone(), b.clone(), vec![0.0]);
-        assert!(array_eq(lin0.forward(&x).unwrap(), &base, false)
-            .unwrap()
-            .item::<bool>());
+        assert!(bit_exact(&lin0.forward(&x).unwrap(), &base));
 
-        // scale 0.5 → differs from base and equals `base + 0.5·(x·a)·b` exactly.
+        // scale 0.5 → differs from base and equals the sc-15265 contract exactly:
+        // `base + host_dtype(0.5 · (x·a)·b)`. NOT the pre-fix `add(&base, &resid)`, which promotes
+        // whenever the factors are wider than the host (this all-f32 fixture makes the two
+        // coincide — `dtype_narrowing_*` below is the leg that separates them).
         let mut lin1 = dense(w);
         lin1.push_lora(a.clone(), b.clone(), vec![0.5]);
         let got = lin1.forward(&x).unwrap();
         assert!(!array_eq(&got, &base, false).unwrap().item::<bool>());
-        let resid = multiply(matmul(matmul(&x, &a).unwrap(), &b).unwrap(), scalar(0.5)).unwrap();
-        let want = add(&base, &resid).unwrap();
+        let resid = matmul(matmul(&x, &a).unwrap(), &b).unwrap();
+        let want = want_adapted(&base, &resid, 0.5);
+        assert_eq!(got.dtype(), base.dtype());
         assert!(all_close(&got, &want, 1e-6, 1e-6, false)
             .unwrap()
             .item::<bool>());
+    }
+
+    // ── sc-15265: LTX carries its own adapter stack, so the shared seam's two rules are
+    // DUPLICATED in `Linear::forward`. The pair below is the runnable gate for that copy — the
+    // only other test that touches a zero pass-scale on real factors is
+    // `tests/lora_real_weights.rs::…`, which is `#[ignore]`d behind a 20 GB checkpoint. Both use
+    // cheap synthetic fixtures and no weights.
+
+    #[test]
+    fn dtype_narrowing_keeps_a_bf16_ltx_linear_bf16_under_f32_factors() {
+        // Rule 2. A bf16 host with f32 LoRA factors: `add(bf16, f32)` promotes, so pre-sc-15265
+        // this Linear — and every op downstream of it — silently became f32 the moment a LoRA was
+        // installed. Delete the `.as_dtype(out.dtype())` in `Linear::forward` and the dtype
+        // assertion below fails.
+        let w = Array::from_slice(&[0.1f32, 0.2, 0.3, 0.4, 0.5, 0.6], &[2, 3])
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap();
+        let x = Array::from_slice(&[1.0f32, -2.0, 0.5], &[1, 3])
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap();
+        // f32 factors, left f32 on purpose — this is what the golden LoRA files ship.
+        let a = Array::from_slice(&[0.1f32, 0.2, 0.3, -0.1, -0.2, 0.4], &[3, 2]);
+        let b = Array::from_slice(&[0.5f32, -0.5, 0.25, 0.75], &[2, 2]);
+
+        let base = dense(w.clone()).forward(&x).unwrap();
+        assert_eq!(base.dtype(), Dtype::Bfloat16, "host output is bf16");
+
+        let mut lin = dense(w);
+        lin.push_lora(a.clone(), b.clone(), vec![0.75]);
+        let got = lin.forward(&x).unwrap();
+        assert_eq!(
+            got.dtype(),
+            Dtype::Bfloat16,
+            "installing an LTX adapter must not widen the host Linear's output dtype"
+        );
+        assert!(
+            !bit_exact(&got, &base),
+            "fixture check: the adapter must actually be live"
+        );
+        // The residual itself still promotes — only the hand-off to the host is narrowed.
+        let resid = matmul(matmul(&x, &a).unwrap(), &b).unwrap();
+        assert_eq!(resid.dtype(), Dtype::Float32);
+        assert!(
+            bit_exact(&got, &want_adapted(&base, &resid, 0.75)),
+            "forward must be base + bf16(0.75·residual)"
+        );
+    }
+
+    #[test]
+    fn disabled_ltx_adapters_residual_is_never_evaluated() {
+        // Rule 1. A pass whose scale is exactly 0 must be SKIPPED, not added as a zero — the
+        // distinction the all-f32 fixtures above cannot see, because casting an exact-zero
+        // residual is already bit-exact. An `INFINITY` factor makes the residual non-finite, so
+        // `Inf · 0.0 = NaN`: staying bit-exact to the unadapted base proves the residual was never
+        // formed. Delete the `if s == 0.0 { continue; }` in `Linear::forward` and this fails.
+        let w = Array::from_slice(&[0.1f32, 0.2, 0.3, 0.4, 0.5, 0.6], &[2, 3]);
+        let x = Array::from_slice(&[1.0f32, -2.0, 0.5], &[1, 3]);
+        let b = Array::from_slice(&[0.5f32, -0.5, 0.25, 0.75], &[2, 2]);
+        let base = dense(w.clone()).forward(&x).unwrap();
+
+        // LoRA with an Inf in `a`.
+        let a_inf = Array::from_slice(&[f32::INFINITY; 6], &[3, 2]);
+        let mut lin = dense(w.clone());
+        lin.push_lora(a_inf, b, vec![0.0]);
+        assert!(
+            bit_exact(&lin.forward(&x).unwrap(), &base),
+            "a zero-scale LTX LoRA pass must not evaluate its residual"
+        );
+
+        // LoKr with an Inf delta, and a per-pass schedule whose OFF pass must also skip.
+        let delta_inf = Array::from_slice(&[f32::INFINITY; 6], &[2, 3]);
+        let mut lin = dense(w);
+        lin.push_lokr(delta_inf, vec![0.0, 1.0]);
+        lin.set_lora_pass(0);
+        assert!(
+            bit_exact(&lin.forward(&x).unwrap(), &base),
+            "an OFF pass in a per-pass schedule must not evaluate its residual either"
+        );
+        lin.set_lora_pass(1);
+        assert!(
+            !lin.forward(&x)
+                .unwrap()
+                .is_finite()
+                .unwrap()
+                .all(None)
+                .unwrap()
+                .item::<bool>(),
+            "fixture check: the ON pass DOES evaluate the poisoned residual"
+        );
     }
 
     #[test]
@@ -2412,20 +2529,19 @@ mod tests {
         let delta = Array::from_slice(&[0.05f32, -0.1, 0.2, 0.15, -0.25, 0.3], &[2, 3]);
         let base = dense(w.clone()).forward(&x).unwrap();
 
-        // scale 0 → bit-exact no-op.
+        // scale 0 → bit-exact no-op (skipped outright, sc-15265).
         let mut lin0 = dense(w.clone());
         lin0.push_lokr(delta.clone(), vec![0.0]);
-        assert!(array_eq(lin0.forward(&x).unwrap(), &base, false)
-            .unwrap()
-            .item::<bool>());
+        assert!(bit_exact(&lin0.forward(&x).unwrap(), &base));
 
-        // scale 0.5 → `base + 0.5·x·ΔWᵀ` exactly, and differs from base.
+        // scale 0.5 → `base + host_dtype(0.5·x·ΔWᵀ)` (sc-15265), and differs from base.
         let mut lin = dense(w.clone());
         lin.push_lokr(delta.clone(), vec![0.5]);
         let got = lin.forward(&x).unwrap();
         assert!(!array_eq(&got, &base, false).unwrap().item::<bool>());
-        let resid = multiply(matmul(&x, delta.t()).unwrap(), scalar(0.5)).unwrap();
-        let want = add(&base, &resid).unwrap();
+        let resid = matmul(&x, delta.t()).unwrap();
+        let want = want_adapted(&base, &resid, 0.5);
+        assert_eq!(got.dtype(), base.dtype());
         assert!(all_close(&got, &want, 1e-6, 1e-6, false)
             .unwrap()
             .item::<bool>());
@@ -2458,9 +2574,11 @@ mod tests {
         lin.push_lokr(delta.clone(), vec![0.25]);
         let got = lin.forward(&x).unwrap();
 
-        let lora_r = multiply(matmul(matmul(&x, &a).unwrap(), &b).unwrap(), scalar(0.5)).unwrap();
-        let lokr_r = multiply(matmul(&x, delta.t()).unwrap(), scalar(0.25)).unwrap();
-        let want = add(add(&base, &lora_r).unwrap(), &lokr_r).unwrap();
+        // sc-15265: each residual is narrowed to the running output's dtype before ITS add, so the
+        // contract composes per-adapter (not "sum the residuals, then add once").
+        let after_lora = want_adapted(&base, &matmul(matmul(&x, &a).unwrap(), &b).unwrap(), 0.5);
+        let want = want_adapted(&after_lora, &matmul(&x, delta.t()).unwrap(), 0.25);
+        assert_eq!(got.dtype(), base.dtype());
         assert!(all_close(&got, &want, 1e-6, 1e-6, false)
             .unwrap()
             .item::<bool>());
