@@ -205,6 +205,14 @@ pub fn descriptor_for(variant: MageVariant) -> ModelDescriptor {
             } else {
                 Vec::new()
             },
+            // LoRA and LoKr both install through the one strict seam
+            // ([`crate::adapters::apply_mage_adapters`] → `apply_adapters_strict`), applied in
+            // [`assemble`] for EVERY variant — the adapter host is `MageTransformer`, which the
+            // edit and generate variants share verbatim. Stated as engine capability, not product
+            // exposure: which variants a user may attach an adapter to is decided by the catalog
+            // manifest's `loraCompatibility` and the router, not here (sc-15328).
+            supports_lora: true,
+            supports_lokr: true,
             // Q4/Q8 tiers are sc-14046; `&[]` means dense-only, which is what the scaffold is.
             supported_quants: &[Quant::Q4, Quant::Q8],
             min_size: MIN_SIZE,
@@ -220,10 +228,14 @@ pub fn descriptor_for(variant: MageVariant) -> ModelDescriptor {
 
 /// Construct a Mage-Flow generator from a [`LoadSpec`].
 ///
+/// `spec.adapters` carries LoRA/LoKr adapters to install on the DiT (sc-15328). They are applied in
+/// [`assemble`], AFTER the per-component tier quantization, through the strict shared seam
+/// [`crate::adapters::apply_mage_adapters`] — stacked and mixed LoRA/LoKr, erroring rather than
+/// silently dropping an unmatched target. An empty `adapters` is the unchanged no-adapter load.
 pub fn load(variant: MageVariant, spec: &LoadSpec) -> Result<Box<dyn Generator>> {
-    if spec.precision != Precision::Bf16 || !spec.adapters.is_empty() {
+    if spec.precision != Precision::Bf16 {
         return Err(Error::Unsupported(
-            "mage_flow variants support bf16/Q4/Q8 checkpoints without adapters".into(),
+            "mage_flow variants support bf16/Q4/Q8 checkpoints".into(),
         ));
     }
     let root = match &spec.weights {
@@ -313,9 +325,23 @@ pub fn load(variant: MageVariant, spec: &LoadSpec) -> Result<Box<dyn Generator>>
 /// `load_from_native_dit_file`): a fine-tune is a caller-owned artifact at an arbitrary path, not
 /// a published id, so it is reached through this explicit API rather than by resolving an id.
 pub fn load_finetuned(variant: MageVariant, spec: &LoadSpec) -> Result<Box<dyn Generator>> {
-    if spec.precision != Precision::Bf16 || !spec.adapters.is_empty() {
+    if spec.precision != Precision::Bf16 {
         return Err(Error::Unsupported(
-            "mage_flow fine-tuned checkpoints load as bf16/Q4/Q8 without adapters".into(),
+            "mage_flow fine-tuned checkpoints load as bf16/Q4/Q8".into(),
+        ));
+    }
+    // Unlike [`load`], a fine-tuned checkpoint keeps refusing adapters (sc-15328). A Mage adapter is
+    // trained against, and its residual is calibrated for, the *published* base weights; a full
+    // fine-tune moves every DiT weight (sc-15277 measured ~96% of `img_in.weight` changed), so
+    // stacking one on top composes two independent deltas the pair was never fit for. Refused here,
+    // loudly and terminally, rather than silently honoured — and the router must not queue the
+    // combination in the first place.
+    if !spec.adapters.is_empty() {
+        return Err(Error::Unsupported(
+            "mage_flow fine-tuned checkpoints cannot take LoRA/LoKr adapters: the adapter is fit \
+             against the published base weights, which a full fine-tune has moved. Render the \
+             adapter on the base model, or use the fine-tune without adapters."
+                .into(),
         ));
     }
     let transformer = match &spec.weights {
@@ -366,7 +392,13 @@ fn assemble(
     } else {
         crate::vae::VaePart::Decode
     };
-    let pipeline = MageFlowPipeline::load_components(&dirs, spec.quantize.map(Quant::bits), part)?;
+    let mut pipeline =
+        MageFlowPipeline::load_components(&dirs, spec.quantize.map(Quant::bits), part)?;
+    // Install LoRA/LoKr adapters AFTER the per-component tier quantization (sc-15328), matching the
+    // Chroma/FLUX composition: the adapter is a forward-time residual over the quantized base, so a
+    // Q4/Q8 tier and a bf16 tier take the same path. No-op when `spec.adapters` is empty; any
+    // unmatched target errors loudly rather than being silently dropped (`apply_adapters_strict`).
+    crate::adapters::apply_mage_adapters(&mut pipeline.transformer, &spec.adapters)?;
     Ok(Box::new(MageFlow {
         variant,
         descriptor: descriptor_for(variant),
@@ -867,6 +899,91 @@ mod tests {
         );
 
         std::fs::remove_dir_all(root).ok();
+    }
+
+    /// sc-15328 — `load` must ACCEPT `spec.adapters` (they install in [`assemble`] via
+    /// [`crate::adapters::apply_mage_adapters`]), while [`load_finetuned`] must keep refusing them
+    /// with a message that says why.
+    ///
+    /// Discriminating in both directions on one fixture, so neither half can pass vacuously:
+    ///
+    ///   * `load` carrying an adapter must get PAST the entry guard and fail on the *next* thing it
+    ///     checks — the published-checkpoint fingerprint. Restore `|| !spec.adapters.is_empty()` to
+    ///     `load`'s guard and this half fails, because the error becomes the `Unsupported` one.
+    ///   * `load_finetuned` carrying the same adapter must fail on the adapter refusal
+    ///     SPECIFICALLY — not on the missing components it would otherwise hit. Drop that guard and
+    ///     this half fails.
+    ///
+    /// The adapter path is deliberately nonexistent: neither call may get far enough to read it,
+    /// which is what makes the first half about the *guard* rather than about adapter loading.
+    #[test]
+    fn load_takes_adapters_while_a_fine_tuned_checkpoint_still_refuses_them() {
+        let root = std::env::temp_dir().join(format!(
+            "mage-adapters-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+        ));
+        write_identity_only_checkpoint(
+            &root
+                .join("transformer")
+                .join("diffusion_pytorch_model.safetensors"),
+            0x5a,
+        );
+        let adapters = vec![mlx_gen::runtime::AdapterSpec::new(
+            std::env::temp_dir().join("mage-adapter-never-read.safetensors"),
+            0.8,
+            mlx_gen::runtime::AdapterKind::Lora,
+        )];
+
+        let published = load_error(
+            load(
+                MageVariant::Base,
+                &LoadSpec::new(WeightsSource::Dir(root.clone())).with_adapters(adapters.clone()),
+            ),
+            "the fabricated checkpoint is not the pinned Base, so this must still fail",
+        );
+        assert!(
+            published.contains("checkpoint fingerprint mismatch"),
+            "an adapter must no longer be refused at `load`'s entry guard — it should reach the \
+             identity check like any other load, got: {published}"
+        );
+
+        let staged = std::env::temp_dir().join("mage-adapters-nonexistent-component");
+        let finetuned = load_error(
+            load_finetuned(
+                MageVariant::Base,
+                &LoadSpec::new(WeightsSource::Dir(root.clone()))
+                    .with_component(COMPONENT_TEXT_ENCODER, WeightsSource::Dir(staged.clone()))
+                    .with_component(COMPONENT_VAE, WeightsSource::Dir(staged))
+                    .with_adapters(adapters),
+            ),
+            "a fine-tuned checkpoint must not accept adapters",
+        );
+        assert!(
+            finetuned.contains("cannot take LoRA/LoKr adapters"),
+            "a fine-tune + adapter must be refused explicitly, and BEFORE the component staging it \
+             would otherwise trip over, got: {finetuned}"
+        );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// sc-15328 — the descriptor is the engine's capability statement, and every Mage variant hosts
+    /// adapters through the same `MageTransformer`. A variant that advertised neither would leave
+    /// the app's `supports_adapters()` reading `false` for a model that demonstrably takes them.
+    #[test]
+    fn every_variant_advertises_lora_and_lokr() {
+        for registration in REGISTRATIONS {
+            let descriptor = (registration.descriptor)();
+            assert!(
+                descriptor.capabilities.supports_lora && descriptor.capabilities.supports_lokr,
+                "{} must advertise supports_lora + supports_lokr: `assemble` installs both through \
+                 `apply_mage_adapters` for every variant",
+                descriptor.id
+            );
+        }
     }
 
     /// sc-15036 — the shared components are REQUIRED for a fine-tune and there is deliberately no
