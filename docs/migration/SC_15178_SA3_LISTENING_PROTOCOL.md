@@ -121,16 +121,27 @@ sweeps are what the shipped floors were *tuned on*, so every prompt in them is a
 point.
 
 Counted against the six on-disk snapshots (read from `model_config.json`, not fetched), the pool is
-**14 distinct prompts** and the crate commits **all of them**:
+**11 distinct prompts across 18 per-snapshot entries**, and the crate commits **all of them**:
 
 | snapshot | `demo_cond` prompts | committed as |
 |---|---|---|
 | `stable-audio-3-medium` | **2** | `MEDIUM_SWEEP_PROMPTS` (both) |
 | `stable-audio-3-small-music` | 4 | `MUSIC_SWEEP_PROMPTS` (all four) |
 | `stable-audio-3-small-sfx` | 4 | `SFX_SWEEP_PROMPTS` (all four) |
-| `stable-audio-3-small-music-base` | 4 | `MUSIC_BASE_SWEEP_PROMPTS` (all four) |
-| `stable-audio-3-small-sfx-base` | 4 | identical set to `small-music-base`'s, so the same four |
+| `stable-audio-3-small-music-base` | 4 | `MUSIC_BASE_SWEEP_PROMPTS` (all four) — but it **shares 3 of its 4 with `small-music`**, differing only in that its Latin-jazz entry ends "…and a whispered melodic female voice" |
+| `stable-audio-3-small-sfx-base` | 4 | identical set to `small-music-base`'s — music prompts, not SFX ones — so the same four |
 | `stable-audio-3-medium-base` | 0 | — |
+
+18 − 4 (`small-sfx-base`, wholly duplicated) − 3 (the `small-music` overlap) = 11.
+
+Neither count is written by hand. `tests/listening_stimuli.rs` commits the pool per snapshot as
+`DEMO_COND_POOL`; `the_committed_demo_cond_pool_matches_the_shipped_configs` re-reads the six
+`model_config.json` files behind it, and
+`test_the_demo_cond_pool_counts_are_derived_from_the_committed_pool` recomputes 11 / 18 / 3 from that
+constant and fails if this section or that file's prose says anything else. An earlier revision of
+this section said "14 distinct prompts", which is the per-snapshot sum with only `small-sfx-base`
+deduplicated — a derived number that nothing derived. That is the failure mode the two tests exist
+for.
 
 Medium's count is the one worth stating explicitly, because `MEDIUM_SWEEP_PROMPTS`'s own doc comment
 reads like a *selection* ("two shipped music `demo_cond` prompts from medium's own
@@ -365,17 +376,32 @@ basis for excluding a candidate before the session.** A candidate passes if all 
    would shrink the pool without bearing on the question.
 2. **Age 18–55.** High-frequency sensitivity declines with age; the band is stated so that the panel
    composition is a recorded fact rather than a convenience sample.
-3. **A passed practice ABX block**: **6 trials** on a *deliberately easy* contrast — the same take at
-   full bandwidth versus the same take low-passed at 4 kHz — with **at least 5 of 6 correct**. This
-   screens for candidates who have understood the ABX task and can operate the player, and nothing
-   else. It uses no panel stimulus and no panel checkpoint, so it cannot leak the contrast under
-   test or pre-expose the material.
+3. **A passed practice ABX block**: **6 trials** on a *deliberately easy* contrast — one pinned 4 s
+   take at full bandwidth versus that same take low-passed at 4 kHz — with **at least 5 of 6
+   correct**. This screens for candidates who have understood the ABX task and can operate the
+   player, and nothing else. It uses no panel stimulus and no panel checkpoint, so it cannot leak
+   the contrast under test or pre-expose the material.
 4. **No involvement in SceneWorks audio model work.** Anyone who has heard these checkpoints while
    developing them is not blind to them.
 
 Criterion 3 is the only performance-based one, and it is deliberately far easier than the panel task.
 It must not be tightened toward the real contrast: screening listeners on the difference under test
 would select the panel for the answer.
+
+**The practice material is committed, not chosen on the day.** Criterion 3 is the only criterion that
+can exclude a listener on performance, so leaving its material unnamed would have put the one
+performance gate outside the pre-registration everything else sits inside. The pair is
+`practice_full.wav` and `practice_lowpass.wav`, produced by
+`the_screening_practice_contrast_is_pinned_material_not_a_run_time_choice` in
+`tests/listening_stimuli.rs` when it is run with `SA3_LISTENING_WAV_DIR` set. The source is a
+deterministic broadband noise bed with re-triggered transients, drawn from the same SplitMix64
+generator the panel assignment uses, at seed `15178004` — **no model is involved at all**, which is what
+makes "no panel stimulus, no panel checkpoint" structural rather than a promise. The low-pass is a
+committed 101-tap linear-phase windowed-sinc kernel: flat to 3 kHz, −6.02 dB at 4 kHz, −93 dB an
+octave up; it removes 83% of the source power. Both takes are pinned by SHA-256 over their PCM
+(`59b1ad3a…` full bandwidth, `a885449d…` low-passed), and that case is weight-free and runs on every
+PR, so the screening material cannot drift between sessions or be substituted for an easier or
+harder one.
 
 **Anchor-consistency exclusion is a separate, post-hoc rule** (§5, 20 points) applied by `analyze`
 after the session; it is reported as `listeners_excluded` and is not screening.
@@ -388,6 +414,16 @@ session**; `L21`–`L24` exist only to replace no-shows and mid-session dropouts
 completed sessions are passed to `unblind`. The pre-registration embedded in the key is always the
 20-listener one regardless of how many playlists were generated, and `analyze` compares the counts
 that actually arrived against it and emits a `deviation` field naming any difference (§6, Reporting).
+
+**Recruitment source.** Candidates are recruited from SceneWorks staff and their contacts outside the
+audio model work, screened by criterion 4 above; this is a convenience sample of non-expert
+listeners, and the write-up must say so rather than imply a general population.
+
+**If attrition exceeds the four spares.** Do not recruit a twenty-fifth listener into the same run —
+`--panel-size 24` fixes the design, and extending it mid-run is the sort of on-the-day decision this
+protocol exists to remove. Analyse the sessions that completed; `analyze` will report a
+`deviation` naming the shortfall, and the result is reported as underpowered against the
+pre-registration rather than presented as the pre-registered test.
 
 ### Listener instructions, verbatim
 

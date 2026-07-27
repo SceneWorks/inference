@@ -119,10 +119,22 @@ struct Stimulus {
 /// `MUSIC_SWEEP_PROMPTS`, `MEDIUM_SWEEP_PROMPTS`, `MUSIC_BASE_SWEEP_PROMPTS`), and those sweeps are
 /// what the shipped floors were *tuned on*, so every prompt in them is a gate operating point.
 ///
-/// Counted against the six on-disk snapshots' `model_config.json`, the pool is 14 distinct prompts
-/// and the crate commits all of them: medium ships **2** (both in `MEDIUM_SWEEP_PROMPTS`);
-/// `small-music`, `small-sfx`, `small-music-base` and `small-sfx-base` ship 4 each, the last two
-/// being the same four; `medium-base` ships none. Medium's count is worth naming explicitly, because
+/// Counted against the six on-disk snapshots' `model_config.json`, the pool is **11 distinct
+/// prompts across 18 per-snapshot entries**, and the crate commits all of them: medium ships **2**
+/// (both in `MEDIUM_SWEEP_PROMPTS`); `small-music`, `small-sfx`, `small-music-base` and
+/// `small-sfx-base` ship 4 each; `medium-base` ships none. Two of those lists collapse into others.
+/// `small-sfx-base` ships the *same four as `small-music-base`* — music prompts, not SFX ones — and
+/// `small-music-base` in turn **shares 3 of its 4 with `small-music`**, differing only in that its
+/// Latin-jazz entry ends "…and a whispered melodic female voice". 18 − 4 − 3 = 11.
+///
+/// Neither count is asserted: [`DEMO_COND_POOL`] commits the pool per snapshot,
+/// `the_committed_demo_cond_pool_matches_the_shipped_configs` re-reads the six `model_config.json`
+/// files it was taken from, and `scripts/tests/test_sa3_listening_blind.py` recomputes 11 / 18 / 3
+/// from that constant and fails if this sentence or the protocol document states anything else. An
+/// earlier revision of this comment said "14 distinct", which is the per-snapshot sum with only
+/// `small-sfx-base` deduplicated — a derived number nothing derived.
+///
+/// Medium's count is worth naming explicitly, because
 /// `MEDIUM_SWEEP_PROMPTS`'s own doc comment reads like a *selection* ("two shipped music `demo_cond`
 /// prompts from medium's own `model_config.json`"). It is not a selection — two is all medium has.
 ///
@@ -186,6 +198,78 @@ const STIMULI: &[Stimulus] = &[
         prompt: "Dog barking next to a waterfall",
         held_out: false,
     },
+];
+
+/// The complete shipped `demo_cond` pool, transcribed from the six pinned snapshots'
+/// `model_config.json` (revisions in `docs/migration/SC_14534_SA3_REFERENCE_PARITY.md`).
+///
+/// It exists so the counts in [`STIMULI`]'s doc comment and in §3 of the protocol document are
+/// *computed* from a committed table rather than counted by hand. `medium-base` carries no
+/// `demo_cond` key at all and is listed with an empty slice so the six-snapshot scope is explicit
+/// rather than implied by omission.
+///
+/// `the_committed_demo_cond_pool_matches_the_shipped_configs` re-reads the snapshots and fails if
+/// this table drifts from them; `scripts/tests/test_sa3_listening_blind.py` derives the distinct
+/// count, the per-snapshot total and the `small-music` overlap from it, checks the prose against
+/// those, and checks that every entry is committed in one of `tests/provider.rs`'s sweep constants.
+const DEMO_COND_POOL: &[(&str, &[&str])] = &[
+    (
+        "stable-audio-3-medium",
+        &[
+            "Meditative lo-fi ambient piano jazz, soft acoustic drum kit",
+            "A tropical house track with upbeat melodies, a driving bassline, and cheery vibes",
+        ],
+    ),
+    ("stable-audio-3-medium-base", &[]),
+    (
+        "stable-audio-3-small-music",
+        &[
+            "A beautiful piano arpeggio grows into a grand cinematic climax",
+            "Elegant and sophisticated Latin jazz piece with a Cuban base",
+            "Amen break 174 BPM",
+            "lofi house loop",
+        ],
+    ),
+    (
+        "stable-audio-3-small-music-base",
+        &[
+            "A beautiful piano arpeggio grows into a grand cinematic climax",
+            "Elegant and sophisticated Latin jazz piece with a Cuban base and a whispered melodic \
+             female voice",
+            "Amen break 174 BPM",
+            "lofi house loop",
+        ],
+    ),
+    (
+        "stable-audio-3-small-sfx",
+        &[
+            "Futuristic laser blast, sharp energy pulse, stereo movement, arcade style",
+            "Dog barking next to a waterfall",
+            "Sparkling fantasy energy swirl, mystical shimmer, rising magical burst",
+            "Running footsteps on pavement, fast pace, urban street environment, energetic motion \
+             sound",
+        ],
+    ),
+    (
+        "stable-audio-3-small-sfx-base",
+        &[
+            "A beautiful piano arpeggio grows into a grand cinematic climax",
+            "Elegant and sophisticated Latin jazz piece with a Cuban base and a whispered melodic \
+             female voice",
+            "Amen break 174 BPM",
+            "lofi house loop",
+        ],
+    ),
+];
+
+/// The snapshot env vars behind [`DEMO_COND_POOL`], in the same order.
+const DEMO_COND_POOL_ENVS: &[&str] = &[
+    "SA3_MEDIUM_SNAPSHOT",
+    "SA3_MEDIUM_BASE_SNAPSHOT",
+    "SA3_SMALL_MUSIC_SNAPSHOT",
+    "SA3_SMALL_MUSIC_BASE_SNAPSHOT",
+    "SA3_SMALL_SFX_SNAPSHOT",
+    "SA3_SMALL_SFX_BASE_SNAPSHOT",
 ];
 
 /// At least this fraction of the set must be held out from committed test constants.
@@ -587,10 +671,59 @@ fn generate_the_level_matched_listening_stimulus_set() {
     eprintln!("stimulus manifest: {}", manifest_path.display());
 }
 
+/// Re-read the six pinned `model_config.json` files and check [`DEMO_COND_POOL`] against them.
+///
+/// This is what makes the pool a transcription rather than a memory. It needs the snapshots only
+/// for their configs — a few kilobytes each, no weights are loaded — but it still needs all six
+/// paths, so it is `#[ignore]`d with the crate's other snapshot-dependent cases and runs in the
+/// real-weight lanes. The counts derived *from* the pool are checked weight-free, in Python.
+#[test]
+#[ignore = "requires the six pinned snapshots' model_config.json"]
+fn the_committed_demo_cond_pool_matches_the_shipped_configs() {
+    assert_eq!(
+        DEMO_COND_POOL.len(),
+        DEMO_COND_POOL_ENVS.len(),
+        "the pool and its env-var list must stay aligned"
+    );
+    for ((model_id, committed), env) in DEMO_COND_POOL.iter().zip(DEMO_COND_POOL_ENVS) {
+        let path = PathBuf::from(
+            std::env::var(env).unwrap_or_else(|_| panic!("set {env} to the pinned snapshot")),
+        )
+        .join("model_config.json");
+        let config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        // `training.demo.demo_cond` is absent entirely on `medium-base`; absent and empty are the
+        // same fact here, and the committed table records it as an empty slice.
+        let shipped: Vec<String> = config["training"]["demo"]["demo_cond"]
+            .as_array()
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(|entry| {
+                        entry["prompt"]
+                            .as_str()
+                            .unwrap_or_else(|| {
+                                panic!("{model_id}: a demo_cond entry carries no prompt")
+                            })
+                            .to_string()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        eprintln!("{model_id}: {} shipped demo_cond prompt(s)", shipped.len());
+        assert_eq!(
+            shipped,
+            committed.iter().map(|p| p.to_string()).collect::<Vec<_>>(),
+            "{model_id}: DEMO_COND_POOL no longer matches {}",
+            path.display()
+        );
+    }
+}
+
 /// The level-matching control, without weights: an equal-**RMS** pair is *not* an equal-loudness
 /// pair, and the LUFS match closes the gap RMS matching leaves open.
 ///
-/// This is the only non-`#[ignore]`d case in this target, and it exists because the protocol's
+/// This is one of the target's three non-`#[ignore]`d cases, and it exists because the protocol's
 /// central control would otherwise be prose. Two tones at identical RMS — one at 60 Hz, one at
 /// 3 kHz — sit many LU apart under BS.1770-4's K-weighting, which high-passes the low end and
 /// boosts the presence region. A panel level-matched on RMS would therefore hear a loudness
@@ -782,4 +915,275 @@ fn the_common_target_is_pulled_down_by_the_sets_worst_peak_to_loudness_ratio() {
         (common_target(&tame) - TARGET_CEILING_LUFS).abs() < 1e-4,
         "with no high-PLR take the target should fall back to the {TARGET_CEILING_LUFS} LUFS cap"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The screening practice contrast (protocol §6, screening criterion 3).
+// ---------------------------------------------------------------------------
+
+/// Duration of each practice take, in seconds. Six ABX trials on 4 s takes is a ~3 minute block.
+const PRACTICE_SECONDS: f32 = 4.0;
+
+/// Seed for the practice source's noise bed. Disjoint from [`SEEDS`] and from the crate's gate
+/// seeds, though nothing depends on that here — the practice material is never rendered by a model.
+const PRACTICE_NOISE_SEED: u64 = 15_178_004;
+
+/// Nominal cutoff of the practice low-pass, in Hz. The protocol quotes this number.
+const PRACTICE_CUTOFF_HZ: f32 = 4_000.0;
+
+/// Amplitude of the noise bed before the transient envelope.
+const PRACTICE_AMPLITUDE: f32 = 0.6;
+
+/// Per-sample decay of the transient envelope, and how often it re-triggers, in frames.
+const PRACTICE_DECAY: f32 = 0.999_75;
+const PRACTICE_RETRIGGER_FRAMES: usize = 11_025;
+
+/// Half (centre outward) of a 101-tap linear-phase windowed-sinc low-pass: Blackman window,
+/// −6 dB at 4 kHz, flat to 3 kHz, below −49 dB by 5 kHz. Committed as literals rather than
+/// designed at runtime because designing it needs `sin`, and `sin` is a platform libm detail — the
+/// digests below would then differ per target. Everything on the digest path here is `+`, `-` and
+/// `*` on `f32`, which IEEE-754 pins exactly. The response *check* in the test may use `sin`/`cos`
+/// freely: it asserts a tolerance, not a hash.
+#[rustfmt::skip]
+const PRACTICE_LOWPASS_HALF_TAPS: &[f32] = &[
+    1.8141413e-01, 1.7147432e-01, 1.4367366e-01, 1.03564925e-01,
+    5.8865767e-02, 1.7602999e-02, -1.372459e-02, -3.1484712e-02,
+    -3.5432357e-02, -2.8339086e-02, -1.4908495e-02, -3.3818043e-04,
+    1.1047597e-02, 1.6734675e-02, 1.6327875e-02, 1.1237069e-02,
+    3.9227908e-03, -3.015015e-03, -7.6179365e-03, -9.015534e-03,
+    -7.465476e-03, -4.049527e-03, -1.8110452e-04, 2.8899254e-03,
+    4.422586e-03, 4.3028463e-03, 2.943159e-03, 1.0396474e-03,
+    -7.067358e-04, -1.8088807e-03, -2.095281e-03, -1.6881531e-03,
+    -8.930223e-04, -5.6162324e-05, 5.55905e-04, 8.205542e-04,
+    7.59546e-04, 4.91795e-04, 1.666423e-04, -9.455298e-05,
+    -2.3067648e-04, -2.4292208e-04, -1.7435457e-04, -8.069043e-05,
+    -5.533947e-06, 3.1911775e-05, 3.553106e-05, 2.1860295e-05,
+    7.5354137e-06, 7.9058015e-07, 1.93534e-20,
+];
+
+/// SHA-256 over the practice takes' PCM, in the canonical little-endian `f32` serialization
+/// [`candle_audio::harness::pcm_sha256`] defines. These are the pinned screening material.
+const PRACTICE_FULL_BAND_PCM_SHA256: &str =
+    "59b1ad3a7f7a16e5107cab50d8c5499ab62f868951fe0daaadec540c971a2036";
+const PRACTICE_LOW_PASSED_PCM_SHA256: &str =
+    "a885449d672a73b54065be121a44fa0fa7eec6d8d65eb792346c6461f9f92f60";
+
+/// The practice source: a deterministic broadband bed with re-triggered transients.
+///
+/// Deliberately **synthetic and model-free**. The protocol requires the practice contrast to use no
+/// panel stimulus and no panel checkpoint; generating it from a committed PRNG rather than from any
+/// checkpoint makes that structural instead of a promise, and it means the block exists without
+/// provisioning weights. Broadband noise plus hard transients is also the easiest possible material
+/// for a bandwidth ABX, which is what criterion 3 wants: it screens for understanding the task, not
+/// for acuity.
+fn practice_source() -> AudioTrack {
+    let frames = (PRACTICE_SECONDS * SAMPLE_RATE as f32) as usize;
+    let mut state = PRACTICE_NOISE_SEED;
+    let mut next = || {
+        // SplitMix64, the same stream `scripts/audio/sa3_listening_blind.py` commits, so the whole
+        // protocol has one PRNG rather than two.
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    };
+
+    let mut samples = Vec::with_capacity(frames * 2);
+    let mut envelope = 1.0f32;
+    for frame in 0..frames {
+        if frame % PRACTICE_RETRIGGER_FRAMES == 0 {
+            envelope = 1.0;
+        }
+        // 24 bits into `f32` is exact, and the scale is a power of two, so this mapping is the
+        // same bit pattern on every target — which is what lets the digests below be committed.
+        let unit = ((next() >> 40) as f32) * (1.0 / 8_388_608.0) - 1.0;
+        let value = unit * PRACTICE_AMPLITUDE * envelope;
+        samples.push(value);
+        samples.push(value);
+        envelope *= PRACTICE_DECAY;
+    }
+    AudioTrack {
+        samples,
+        sample_rate: SAMPLE_RATE,
+        channels: 2,
+        stems: Vec::new(),
+    }
+}
+
+/// Mirror [`PRACTICE_LOWPASS_HALF_TAPS`] into the full symmetric kernel.
+fn practice_taps() -> Vec<f32> {
+    let half = PRACTICE_LOWPASS_HALF_TAPS;
+    let mut taps = Vec::with_capacity(half.len() * 2 - 1);
+    taps.extend(half.iter().rev().copied());
+    taps.extend(half.iter().skip(1).copied());
+    taps
+}
+
+/// Apply the committed low-pass to an interleaved stereo track, per channel, delay-compensated.
+///
+/// Fixed accumulation order, `f32` throughout, no transcendental calls — so the output is
+/// bit-identical on every target and the committed digest means something.
+fn practice_low_pass(track: &AudioTrack) -> AudioTrack {
+    let taps = practice_taps();
+    let centre = taps.len() / 2;
+    let channels = track.channels as usize;
+    let frames = track.samples.len() / channels;
+    let mut samples = vec![0.0f32; track.samples.len()];
+    for channel in 0..channels {
+        for frame in 0..frames {
+            let mut acc = 0.0f32;
+            for (tap, coefficient) in taps.iter().enumerate() {
+                let source = frame as isize + tap as isize - centre as isize;
+                if source >= 0 && (source as usize) < frames {
+                    acc += coefficient * track.samples[source as usize * channels + channel];
+                }
+            }
+            samples[frame * channels + channel] = acc;
+        }
+    }
+    AudioTrack {
+        samples,
+        sample_rate: track.sample_rate,
+        channels: track.channels,
+        stems: Vec::new(),
+    }
+}
+
+/// Magnitude response of the committed kernel at `frequency`, in dB. Test-side only.
+fn practice_response_db(frequency: f32) -> f32 {
+    let taps = practice_taps();
+    let centre = (taps.len() - 1) as f64 / 2.0;
+    let (mut re, mut im) = (0.0f64, 0.0f64);
+    for (tap, coefficient) in taps.iter().enumerate() {
+        let phase = -std::f64::consts::TAU * f64::from(frequency) * (tap as f64 - centre)
+            / f64::from(SAMPLE_RATE);
+        re += f64::from(*coefficient) * phase.cos();
+        im += f64::from(*coefficient) * phase.sin();
+    }
+    (20.0 * (re.hypot(im) + 1e-30).log10()) as f32
+}
+
+/// Generate and pin the screening practice contrast, and check it is the contrast §6 describes.
+///
+/// # Why this case exists
+///
+/// Screening criterion 3 — six trials of a take at full bandwidth against the same take low-passed
+/// at 4 kHz, 5 of 6 to pass — is the protocol's **only performance-based inclusion criterion**. It
+/// was specified without naming which take, and no committed generator produced the block, so the
+/// one criterion that can exclude a listener rested on material chosen on the day. In a protocol
+/// whose thesis is that nothing is decided per session, that was the last thing decided per
+/// session.
+///
+/// The material is therefore committed: a deterministic source, a committed kernel, and a digest
+/// for each take. Nothing about it can vary between sessions, and nothing about it touches the
+/// panel — no panel prompt, no panel checkpoint, no model at all.
+///
+/// The case asserts, in order: that the kernel really is the low-pass §6 quotes (passband flat,
+/// −6 dB at the cutoff, deep stopband an octave up); that the source is valid, non-silent,
+/// unclipped audio; that the contrast is audible in the only machine-checkable sense — the takes
+/// differ, and the low-passed one has lost most of its energy; and that both digests are the
+/// committed ones. Setting `SA3_LISTENING_WAV_DIR` also writes the two WAVs, so the block is
+/// produced by the same committed code that pins it.
+#[test]
+fn the_screening_practice_contrast_is_pinned_material_not_a_run_time_choice() {
+    // 1. The kernel is the filter the protocol names.
+    let passband = practice_response_db(1_000.0);
+    let cutoff = practice_response_db(PRACTICE_CUTOFF_HZ);
+    let octave_up = practice_response_db(PRACTICE_CUTOFF_HZ * 2.0);
+    eprintln!(
+        "practice low-pass: {passband:.2} dB at 1 kHz, {cutoff:.2} dB at {PRACTICE_CUTOFF_HZ} Hz, \
+         {octave_up:.2} dB an octave up"
+    );
+    assert!(
+        passband.abs() < 0.5,
+        "the practice kernel is not flat in the passband ({passband:.2} dB at 1 kHz)"
+    );
+    assert!(
+        (-7.0..=-5.0).contains(&cutoff),
+        "the practice kernel's {PRACTICE_CUTOFF_HZ} Hz point is {cutoff:.2} dB; §6 calls this a \
+         {PRACTICE_CUTOFF_HZ} Hz low-pass, so the cutoff must sit at the usual −6 dB"
+    );
+    assert!(
+        octave_up < -40.0,
+        "the practice kernel only reaches {octave_up:.2} dB an octave above the cutoff; a listener \
+         could fail this block for lack of a difference rather than for lack of understanding"
+    );
+
+    // 2. Both takes are valid, unclipped, non-silent audio.
+    let full = practice_source();
+    let low_passed = practice_low_pass(&full);
+    let frames = (PRACTICE_SECONDS * SAMPLE_RATE as f32) as usize;
+    for (label, track) in [("practice-full", &full), ("practice-lowpass", &low_passed)] {
+        assert_eq!(track.sample_rate, SAMPLE_RATE, "{label}: sample rate");
+        assert_eq!(track.channels, 2, "{label}: channel count");
+        assert_eq!(track.samples.len(), frames * 2, "{label}: frame count");
+        assert!(
+            track
+                .samples
+                .iter()
+                .all(|s| s.is_finite() && (-1.0..=1.0).contains(s)),
+            "{label}: non-finite or unclamped PCM"
+        );
+        let energy: f64 = track.samples.iter().map(|s| f64::from(*s).powi(2)).sum();
+        let rms = (energy / track.samples.len() as f64).sqrt();
+        eprintln!("{label}: rms {rms:.6}");
+        assert!(rms > 1e-3, "{label}: output is effectively silent");
+    }
+
+    // 3. The contrast is real. Broadband noise low-passed at 4 kHz of a 22.05 kHz band loses most
+    //    of its power; if it did not, the block would be a coin flip and criterion 3 would exclude
+    //    listeners at random.
+    let power = |track: &AudioTrack| -> f64 {
+        track
+            .samples
+            .iter()
+            .map(|s| f64::from(*s).powi(2))
+            .sum::<f64>()
+    };
+    let retained = power(&low_passed) / power(&full);
+    eprintln!(
+        "practice low-pass retains {:.1}% of the source power",
+        retained * 100.0
+    );
+    assert!(
+        retained < 0.35,
+        "the low-passed take retains {:.1}% of the source power; the two takes are too close for a \
+         6-trial screening block to be the near-certain pass §6 assumes",
+        retained * 100.0
+    );
+    assert_ne!(
+        full.samples, low_passed.samples,
+        "the filter is a no-op; there is no contrast to practise on"
+    );
+
+    // 4. The material is the committed material.
+    let full_digest = candle_audio::harness::pcm_sha256(&full.samples);
+    let low_passed_digest = candle_audio::harness::pcm_sha256(&low_passed.samples);
+    eprintln!("practice-full    pcm_sha256 {full_digest}");
+    eprintln!("practice-lowpass pcm_sha256 {low_passed_digest}");
+    assert_ne!(
+        full_digest, low_passed_digest,
+        "both practice takes hash the same, so one of them is not what it claims to be"
+    );
+    assert_eq!(
+        full_digest, PRACTICE_FULL_BAND_PCM_SHA256,
+        "the full-bandwidth practice take is not the committed one; screening material may not \
+         change between sessions"
+    );
+    assert_eq!(
+        low_passed_digest, PRACTICE_LOW_PASSED_PCM_SHA256,
+        "the low-passed practice take is not the committed one; screening material may not change \
+         between sessions"
+    );
+
+    if let Ok(dir) = std::env::var("SA3_LISTENING_WAV_DIR") {
+        let dir = PathBuf::from(dir);
+        std::fs::create_dir_all(&dir).expect("create the stimulus output directory");
+        candle_audio::wav::write_wav_pcm16(&dir.join("practice_full.wav"), &full)
+            .expect("write the full-bandwidth practice take");
+        candle_audio::wav::write_wav_pcm16(&dir.join("practice_lowpass.wav"), &low_passed)
+            .expect("write the low-passed practice take");
+        eprintln!("practice block written to {}", dir.display());
+    }
 }

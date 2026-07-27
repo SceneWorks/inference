@@ -51,6 +51,17 @@ def _join_rust_continuations(source: str) -> str:
     return re.sub(r"\\\n\s*", "", source)
 
 
+def _prose(text: str) -> str:
+    """Flatten prose so a sentence needle survives line wrapping.
+
+    Both files wrap: Markdown at the column, Rust behind `///`. A needle matched against the raw
+    text would silently stop matching the moment a sentence rewrapped, which would make the count
+    checks below quietly vacuous rather than loudly wrong.
+    """
+    stripped = re.sub(r"(?m)^\s*(///|//!)\s?", "", text)
+    return re.sub(r"\s+", " ", stripped)
+
+
 def parse_stimuli() -> list[dict]:
     """Read the pinned stimulus table straight out of the Rust generator.
 
@@ -82,8 +93,42 @@ def parse_seeds() -> list[int]:
     return [int(value.strip().replace("_", "")) for value in block.group(1).split(",") if value.strip()]
 
 
+def parse_demo_cond_pool() -> list[tuple[str, list[str]]]:
+    """Read the committed per-snapshot `demo_cond` pool out of the Rust generator.
+
+    The pool itself is checked against the six on-disk `model_config.json` files by
+    `the_committed_demo_cond_pool_matches_the_shipped_configs`, which needs the snapshots and is
+    therefore `#[ignore]`d. What is checked *here*, weight-free, is everything derived from it.
+    """
+    source = _join_rust_continuations(GENERATOR.read_text(encoding="utf-8"))
+    block = re.search(
+        r"const DEMO_COND_POOL: &\[\(&str, &\[&str\]\)\] = &\[(.*?)\n\];", source, re.S
+    )
+    assert block, "could not locate the DEMO_COND_POOL table in listening_stimuli.rs"
+    pool: list[tuple[str, list[str]]] = []
+    for raw in re.finditer(r'\(\s*"([^"]+)",\s*&\[(.*?)\],?\s*\)', block.group(1), re.S):
+        prompts = [m.group(1) for m in re.finditer(r'"((?:[^"\\]|\\.)*)"', raw.group(2))]
+        pool.append((raw.group(1), prompts))
+    return pool
+
+
+def parse_sweep_prompts() -> dict[str, list[str]]:
+    """Read `tests/provider.rs`'s `*_SWEEP_PROMPTS` side-ratio calibration constants."""
+    source = _join_rust_continuations((SA3_TESTS / "provider.rs").read_text(encoding="utf-8"))
+    sweeps = {}
+    for raw in re.finditer(
+        r"const (\w+_SWEEP_PROMPTS): &\[&str\] = &\[(.*?)\n\];", source, re.S
+    ):
+        sweeps[raw.group(1)] = [
+            m.group(1) for m in re.finditer(r'"((?:[^"\\]|\\.)*)"', raw.group(2))
+        ]
+    return sweeps
+
+
 STIMULI = parse_stimuli()
 SEEDS = parse_seeds()
+DEMO_COND_POOL = parse_demo_cond_pool()
+SWEEP_PROMPTS = parse_sweep_prompts()
 
 
 def specialist_for(domain: str) -> str:
@@ -277,6 +322,23 @@ class PreRegistrationTests(unittest.TestCase):
         ):
             self.assertIn(needle, text, f"protocol document does not quote {needle!r}")
 
+    def test_the_protocol_document_pins_the_abx_effect_of_interest_and_its_power(self) -> None:
+        """`ABX_EFFECT_OF_INTEREST` sizes nothing else, so nothing above catches a change to it:
+        0.65 -> 0.70 moves the power from 0.9986 to 1.0000 and leaves every other number alone.
+        Both cells are bound to their table rows -- a bare `0.65` is a weak needle, and the
+        `power at that effect` row also exists for the MOS half at a different value."""
+        text = PROTOCOL.read_text(encoding="utf-8")
+        abx = blind.preregistration()["abx"]
+        for needle in (
+            f"| effect worth acting on | {abx['effect_of_interest']:g} pooled accuracy |",
+            f"| power at that effect | **{abx['power_at_effect_of_interest']:.3f}** |",
+        ):
+            self.assertIn(
+                needle,
+                text,
+                f"protocol document's Q1 table does not quote {needle!r}",
+            )
+
     def test_the_protocol_document_pins_the_committed_assignment_seed(self) -> None:
         """The bare-number needle above is weak for the seed -- `15178` is also the story id and a
         render seed, so it would be found in the document no matter what. This binds the seed to the
@@ -370,6 +432,115 @@ class StimulusHoldOutTests(unittest.TestCase):
     def test_the_seeds_are_disjoint_from_the_crates_gate_seeds(self) -> None:
         """A panel scored on the draws a threshold was calibrated at inherits that luck."""
         self.assertEqual(set(SEEDS) & {42, 7, 2_026, 14_544, 31_337}, set())
+
+
+class DemoCondPoolTests(unittest.TestCase):
+    """Everything §3 and `listening_stimuli.rs` say about the shipped `demo_cond` pool, recomputed.
+
+    Round-1 review asked for the blanket claim ("every prompt of every variant") to be replaced by
+    counts. The replacement stated **14 distinct prompts**, which is the per-snapshot sum with only
+    `small-sfx-base` deduplicated -- the correction introduced a derived number that nothing
+    derived. The true figures are 11 distinct across 18 per-snapshot entries, and they are computed
+    here from the committed table so no future edit can restate them by hand.
+    """
+
+    #: The two entries the sweep constants carry that are *not* `demo_cond` prompts: the neutral
+    #: prompt the SFX divergence gate renders, and the prompt the music/medium per-run gates
+    #: render. Both are named in the sweeps' own doc comments ("plus ...").
+    GATE_ADDITIONS = frozenset({
+        "a short bright transient followed by a decaying tail",
+        "warm cinematic post-rock with bowed strings and restrained drums",
+    })
+
+    def by_snapshot(self) -> dict[str, list[str]]:
+        return dict(DEMO_COND_POOL)
+
+    def test_the_parsers_found_the_real_tables(self) -> None:
+        """A parse that yields nothing would make every count below vacuously agree."""
+        self.assertEqual(len(DEMO_COND_POOL), 6, "the pool must cover all six SA3 snapshots")
+        self.assertEqual(
+            sorted(SWEEP_PROMPTS),
+            [
+                "MEDIUM_SWEEP_PROMPTS",
+                "MUSIC_BASE_SWEEP_PROMPTS",
+                "MUSIC_SWEEP_PROMPTS",
+                "SFX_SWEEP_PROMPTS",
+            ],
+        )
+        self.assertTrue(all(SWEEP_PROMPTS.values()))
+
+    def test_the_demo_cond_pool_counts_are_derived_from_the_committed_pool(self) -> None:
+        entries = sum(len(prompts) for _, prompts in DEMO_COND_POOL)
+        distinct = {prompt for _, prompts in DEMO_COND_POOL for prompt in prompts}
+        by_snapshot = self.by_snapshot()
+        overlap = set(by_snapshot["stable-audio-3-small-music"]) & set(
+            by_snapshot["stable-audio-3-small-music-base"]
+        )
+
+        # Discriminating: if the pool ever stopped overlapping, the sentence below would be a
+        # tautology and the two numbers would carry no information.
+        self.assertLess(len(distinct), entries, "the pool no longer contains any duplicates")
+        self.assertTrue(overlap, "small-music and small-music-base no longer overlap at all")
+
+        sentence = f"**{len(distinct)} distinct prompts across {entries} per-snapshot entries**"
+        share = f"**shares {len(overlap)} of its 4 with `small-music`**"
+        for path in (PROTOCOL, GENERATOR):
+            text = _prose(path.read_text(encoding="utf-8"))
+            self.assertIn(
+                sentence,
+                text,
+                f"{path.name} does not state the counts derived from DEMO_COND_POOL: {sentence!r}",
+            )
+            self.assertIn(
+                share,
+                text,
+                f"{path.name} does not state the small-music overlap derived from "
+                f"DEMO_COND_POOL: {share!r}",
+            )
+
+    def test_small_sfx_base_ships_the_music_base_list_not_an_sfx_one(self) -> None:
+        """The other duplication the counts depend on, and the more surprising of the two."""
+        by_snapshot = self.by_snapshot()
+        self.assertEqual(
+            by_snapshot["stable-audio-3-small-sfx-base"],
+            by_snapshot["stable-audio-3-small-music-base"],
+        )
+        self.assertNotEqual(
+            by_snapshot["stable-audio-3-small-sfx-base"],
+            by_snapshot["stable-audio-3-small-sfx"],
+        )
+
+    def test_the_crate_commits_every_pooled_prompt(self) -> None:
+        """§3's load-bearing claim: nothing in the `demo_cond` pool is held out, because
+        `tests/provider.rs` calibrated a floor on all of it."""
+        committed = {prompt for prompts in SWEEP_PROMPTS.values() for prompt in prompts}
+        missing = sorted(
+            {prompt for _, prompts in DEMO_COND_POOL for prompt in prompts} - committed
+        )
+        self.assertEqual(
+            missing,
+            [],
+            "these shipped demo_cond prompts are in no *_SWEEP_PROMPTS constant, so §3's "
+            "'the crate commits all of them' is false: " + "; ".join(missing),
+        )
+
+    def test_the_sweep_constants_add_only_the_two_gate_prompts(self) -> None:
+        """The other direction. If a sweep grew an entry that is neither a shipped `demo_cond`
+        prompt nor a named gate prompt, the test above would still pass while §3's account of what
+        those constants contain had gone stale."""
+        committed = {prompt for prompts in SWEEP_PROMPTS.values() for prompt in prompts}
+        pooled = {prompt for _, prompts in DEMO_COND_POOL for prompt in prompts}
+        self.assertEqual(sorted(committed - pooled), sorted(self.GATE_ADDITIONS))
+
+    def test_medium_ships_exactly_two_and_both_are_in_its_sweep(self) -> None:
+        """`MEDIUM_SWEEP_PROMPTS`'s doc comment reads like a selection; it is the whole list."""
+        medium = self.by_snapshot()["stable-audio-3-medium"]
+        self.assertEqual(len(medium), 2)
+        for prompt in medium:
+            self.assertIn(prompt, SWEEP_PROMPTS["MEDIUM_SWEEP_PROMPTS"])
+
+    def test_medium_base_ships_none(self) -> None:
+        self.assertEqual(self.by_snapshot()["stable-audio-3-medium-base"], [])
 
 
 class RandomnessTests(unittest.TestCase):
@@ -683,6 +854,54 @@ class AnalysisTests(unittest.TestCase):
         report = blind.analyze(unblinded)
         self.assertIn("L01", report["mos"]["listeners_excluded"])
         self.assertEqual(report["mos"]["listeners_analyzed"], blind.PANEL_SIZE - 1)
+
+    def _excluded_at_discrepancy(self, points: float) -> bool:
+        """Give `L01` exactly `points` of duplicate-vs-original discrepancy on every screen."""
+        unblinded = simulate(self.key, abx_accuracy=0.9, medium_bonus=12.0)
+        rows = [r for r in unblinded["ratings"] if r["listener"] == "L01"]
+        for screen in sorted({r["screen"] for r in rows}):
+            here = [r for r in rows if r["screen"] == screen]
+            duplicate = next(r for r in here if r["duplicate"])
+            original = next(
+                r for r in here if not r["duplicate"] and r["variant"] == duplicate["variant"]
+            )
+            # Move the *original* off the ceiling first so the offset is never clipped away.
+            original["rating"] = 40.0
+            duplicate["rating"] = 40.0 + points
+        return "L01" in blind.analyze(unblinded)["mos"]["listeners_excluded"]
+
+    def test_the_anchor_exclusion_threshold_is_the_pre_registered_twenty_points(self) -> None:
+        """`MAX_ANCHOR_DISCREPANCY` is a pre-registered *post-hoc exclusion* threshold, quoted twice
+        in §5 -- exactly the researcher degree of freedom §6 was written to close. Every other test
+        that touches it phrases its fixture relative to the constant, so raising it to 25 left the
+        whole suite green. This case is absolute: it flips at 20 and nowhere else."""
+        self.assertFalse(
+            self._excluded_at_discrepancy(18.0),
+            "a listener whose median discrepancy is 18 points is inside the pre-registered rule and "
+            "must be analyzed; the threshold has been tightened",
+        )
+        self.assertTrue(
+            self._excluded_at_discrepancy(22.0),
+            "a listener whose median discrepancy is 22 points exceeds the pre-registered 20-point "
+            "rule and must be excluded; the threshold has been loosened",
+        )
+        # The pair above brackets the threshold; this pins the literal inside the bracket.
+        self.assertEqual(blind.MAX_ANCHOR_DISCREPANCY, 20.0)
+
+    def test_the_protocol_document_pins_the_anchor_exclusion_threshold(self) -> None:
+        """The document quotes the threshold twice. Both are bound to their sentences here, because
+        a bare `20` appears in this document as the panel size, a band width and a section number."""
+        text = PROTOCOL.read_text(encoding="utf-8")
+        points = f"{blind.MAX_ANCHOR_DISCREPANCY:g}"
+        for needle in (
+            f"discrepancy exceeds **{points} points**",
+            f"(§5, {points} points)",
+        ):
+            self.assertIn(
+                needle,
+                text,
+                f"protocol document does not pin the anchor-exclusion threshold: {needle!r}",
+            )
 
 
 class StatisticsTests(unittest.TestCase):
