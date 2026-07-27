@@ -79,11 +79,18 @@ pub trait ControlBranch: crate::Generator {
     /// the shared error messages so they read identically to the hand-written originals.
     fn model_id(&self) -> &'static str;
 
-    /// Which control signals this branch admits (see [`AcceptedControlKinds`]). Defaults to the
-    /// input-agnostic Fun-Union policy ([`AcceptedControlKinds::Any`]); a single-signal branch
-    /// overrides (Qwen v1 → `Only([Pose])`).
+    /// Which control signals this branch admits (see [`AcceptedControlKinds`]).
+    ///
+    /// Reads [`ModelDescriptor::control_kinds`](crate::ModelDescriptor::control_kinds), so the
+    /// weights-free advertisement and the enforced policy are the same value and cannot drift — a
+    /// branch declares its policy on its descriptor rather than overriding here. An undeclared
+    /// descriptor (`None`) falls back to the historical input-agnostic Fun-Union default
+    /// ([`AcceptedControlKinds::Any`]), which is what every branch got before the field existed.
     fn accepted_control_kinds(&self) -> AcceptedControlKinds {
-        AcceptedControlKinds::Any
+        self.descriptor()
+            .control_kinds
+            .clone()
+            .unwrap_or(AcceptedControlKinds::Any)
     }
 
     /// The "requires a `Control` conditioning" message (used by both
@@ -318,6 +325,7 @@ mod tests {
     fn stub(accepted: AcceptedControlKinds) -> Stub {
         Stub {
             descriptor: ModelDescriptor {
+                control_kinds: None,
                 required_components: &[],
                 id: "stub_control",
                 family: "stub",

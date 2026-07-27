@@ -611,6 +611,7 @@ fn resolve_steps(requested: Option<u32>) -> usize {
 /// prompt; no conditioning (img2img/Edit deferred), no LoRA/quant, no Lightning sampler.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        control_kinds: None,
         required_components: &[],
         id: MODEL_ID,
         family: "qwen-image",

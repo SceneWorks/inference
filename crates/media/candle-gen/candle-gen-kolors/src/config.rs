@@ -47,6 +47,7 @@ pub const SIZE_MULTIPLE: u32 = 8;
 /// `discrete` scheduler alias is retained.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        control_kinds: None,
         required_components: &[],
         id: MODEL_ID,
         family: "kolors",

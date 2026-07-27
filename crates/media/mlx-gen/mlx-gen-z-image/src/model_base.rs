@@ -59,6 +59,7 @@ pub const PID_BACKBONE: &str = "zimage-turbo";
 /// base is a non-distilled foundation model: real CFG (guidance + negative prompt) is supported.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        control_kinds: None,
         required_components: &[],
         id: MODEL_ID,
         family: "z-image",

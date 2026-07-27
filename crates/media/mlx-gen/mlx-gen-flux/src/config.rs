@@ -70,6 +70,7 @@ impl FluxVariant {
 
     pub fn descriptor(self) -> ModelDescriptor {
         ModelDescriptor {
+            control_kinds: None,
             required_components: &[],
             id: self.id(),
             family: "flux",

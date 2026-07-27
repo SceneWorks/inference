@@ -1473,6 +1473,34 @@ pub struct ModelDescriptor {
     /// [`LoadSpec::components`](crate::LoadSpec::components) (e.g. chatterbox `["perth",
     /// "voice_embedding"]`).
     pub required_components: &'static [&'static str],
+    /// **Which control signals this model admits**, weights-free — the descriptor-level twin of
+    /// [`ControlBranch::accepted_control_kinds`](crate::control::ControlBranch::accepted_control_kinds).
+    ///
+    /// [`capabilities.conditioning`](Capabilities::conditioning) says *whether* a model takes
+    /// [`Conditioning::Control`] but never *which kind*, and the kind policy lived only on the
+    /// loaded control struct (`&self` on a `ControlBranch`). A consumer planning a render therefore
+    /// could not tell a pose-only branch from a pose/canny/depth union without loading multi-GB
+    /// weights, and a depth request aimed at a pose-only branch failed inside `generate` — after
+    /// residency — instead of before it.
+    ///
+    /// The distinction between the two `None`-ish answers is the point, because the permissive
+    /// answer is the dangerous one:
+    ///
+    /// - `None` — **not advertised**. The model may still reject kinds at render time; a consumer
+    ///   must treat control kind as unchecked. This is the `Default` for a reason: a model that
+    ///   forgot to declare must not read as "accepts anything".
+    /// - `Some(`[`Any`](crate::control::AcceptedControlKinds::Any)`)` — deliberately
+    ///   input-agnostic, the Fun-Controlnet-Union position (pose/canny/depth share one VAE-encoded
+    ///   path and differ only by the host-side preprocessor).
+    /// - `Some(`[`Only`](crate::control::AcceptedControlKinds::Only)`(..))` — exactly these kinds;
+    ///   anything else is rejected rather than silently coerced.
+    ///
+    /// A [`ControlBranch`](crate::control::ControlBranch) implementor should declare it here rather
+    /// than override the trait method: the trait's default **reads this field**, so the descriptor
+    /// is the single source of truth and the advertised policy cannot drift from the enforced one.
+    ///
+    /// [`Conditioning::Control`]: Conditioning::Control
+    pub control_kinds: Option<crate::control::AcceptedControlKinds>,
 }
 
 /// What a model supports — drives `validate()` and consumer UI. `Default` is "supports

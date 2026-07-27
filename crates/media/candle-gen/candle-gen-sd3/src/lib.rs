@@ -236,6 +236,7 @@ pub fn descriptor_for(variant: Variant) -> ModelDescriptor {
         Variant::LargeTurbo => (MODEL_ID_TURBO, false),
     };
     ModelDescriptor {
+        control_kinds: None,
         required_components: &[],
         id,
         family: "stable-diffusion-3",

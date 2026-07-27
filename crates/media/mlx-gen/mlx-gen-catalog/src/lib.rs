@@ -319,6 +319,79 @@ mod tests {
         assert!(shipped.contains(&"mage_flow_turbo".to_string()));
     }
 
+    /// Every shipped generator that advertises [`ConditioningKind::Control`] must also say **which**
+    /// control kinds it admits, so a consumer can plan a control render weights-free instead of
+    /// finding out when `generate` rejects the request after the weights are already resident.
+    ///
+    /// The exceptions are pinned by id rather than skipped by a predicate. That asymmetry is the
+    /// gate: a new control branch that forgets to declare its policy fails here, and an id that
+    /// gains one has to be removed from the list, so neither direction can rot quietly. Weights-free
+    /// — descriptors only, no snapshot and no device.
+    #[test]
+    fn every_control_generator_declares_its_control_kinds() {
+        use super::media::ConditioningKind;
+
+        // These two advertise `Control` but are not `ControlBranch` implementors: they take a
+        // caller-supplied ControlNet checkpoint through `LoadSpec::control`, so which signal is
+        // admitted follows whichever checkpoint was loaded and there is no per-model fact to
+        // advertise. Undeclared (`None`) is the honest answer — it reads as "control kind is
+        // unchecked here", which is exactly true.
+        //
+        // Note `ConditioningKind::ControlClip` is a DIFFERENT kind (LTX / VACE video control
+        // clips) and is not in scope here; only `Control` carries a ControlNet kind policy.
+        const NO_BRANCH_POLICY: &[&str] = &["kolors", "sdxl"];
+
+        let registry = super::provider_registry().unwrap();
+        let control: Vec<_> = registry
+            .generators()
+            .map(|r| (r.descriptor)())
+            .filter(|d| d.capabilities.accepts(ConditioningKind::Control))
+            .collect();
+        assert!(
+            !control.is_empty(),
+            "the catalog must ship control generators"
+        );
+
+        let undeclared: Vec<&str> = control
+            .iter()
+            .filter(|d| d.control_kinds.is_none())
+            .map(|d| d.id)
+            .filter(|id| !NO_BRANCH_POLICY.contains(id))
+            .collect();
+        assert!(
+            undeclared.is_empty(),
+            "these generators advertise Control but declare no control_kinds: {undeclared:?} — \
+             declare the policy on the descriptor, or add the id to NO_BRANCH_POLICY with the \
+             reason it has none"
+        );
+
+        let stale: Vec<&str> = control
+            .iter()
+            .filter(|d| d.control_kinds.is_some())
+            .map(|d| d.id)
+            .filter(|id| NO_BRANCH_POLICY.contains(id))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "these ids now declare control_kinds and must leave NO_BRANCH_POLICY: {stale:?}"
+        );
+
+        // Third direction: an id listed as an exception that does not advertise `Control` at all.
+        // Without this the list silently accumulates dead entries — `ConditioningKind::ControlClip`
+        // shares a prefix with `Control`, so a grep-derived list picks up video-clip providers that
+        // were never in scope, and neither assertion above would notice.
+        let ids: Vec<&str> = control.iter().map(|d| d.id).collect();
+        let not_control: Vec<&&str> = NO_BRANCH_POLICY
+            .iter()
+            .filter(|id| !ids.contains(id))
+            .collect();
+        assert!(
+            not_control.is_empty(),
+            "these NO_BRANCH_POLICY ids do not advertise Control and must be removed: \
+             {not_control:?} (shipped Control generators: {ids:?})"
+        );
+    }
+
     /// Defense in depth for epic 11037 SC#5: the MLX platform **rejects** the NVFP4 tier instead of
     /// silently int4-affine quantizing it (`Quant::Nvfp4.bits() == 4`, so a provider's
     /// `quantize(q.bits())` could not tell it from `Q4`). Weights-free — the guard fires at the

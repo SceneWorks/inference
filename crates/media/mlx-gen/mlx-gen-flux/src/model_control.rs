@@ -65,6 +65,7 @@ const DEFAULT_CONTROL_SCALE: f32 = 0.7;
 /// `resolve_control`, not capability introspection.
 pub fn descriptor_dev_control() -> ModelDescriptor {
     ModelDescriptor {
+        control_kinds: Some(accepted_control_kinds()),
         required_components: &[],
         id: FLUX1_DEV_CONTROL_ID,
         family: "flux",
@@ -394,10 +395,6 @@ fn accepted_control_kinds() -> AcceptedControlKinds {
 impl ControlBranch for Flux1DevControl {
     fn model_id(&self) -> &'static str {
         FLUX1_DEV_CONTROL_ID
-    }
-
-    fn accepted_control_kinds(&self) -> AcceptedControlKinds {
-        accepted_control_kinds()
     }
 
     fn unsupported_kind_message(&self, kind: &ControlKind) -> String {

@@ -320,6 +320,7 @@ const EDIT_IDENTITY_SHA256: &str =
 /// the published configs.
 pub fn descriptor_for(variant: MageVariant) -> ModelDescriptor {
     ModelDescriptor {
+        control_kinds: None,
         // The text encoder (8.875 GB) and VAE (0.345 GB) are BIT-IDENTICAL across all six Mage
         // variants — only the 8.232 GB DiT differs — so the SceneWorks mirrors host them once in a
         // shared components repo and stage them as caller-provisioned co-requisite dirs

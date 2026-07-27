@@ -205,6 +205,7 @@ impl Sd3Variant {
 
     pub fn descriptor(self) -> ModelDescriptor {
         ModelDescriptor {
+            control_kinds: None,
             required_components: &[],
             id: self.id(),
             family: "sd3",

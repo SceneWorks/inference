@@ -46,6 +46,11 @@ use crate::{loader, CONTROL_IN_DIM};
 /// init seed). Mac-only, like every FLUX.2 variant.
 pub fn descriptor_dev_control() -> ModelDescriptor {
     ModelDescriptor {
+        // Deliberately input-agnostic, not undeclared: the Fun-Controlnet-Union checkpoint runs
+        // pose / canny / depth down one VAE-encoded path with no mode index, so every kind is
+        // genuinely accepted. Declaring `Some(Any)` says that; leaving it `None` would say "nobody
+        // checked".
+        control_kinds: Some(mlx_gen::AcceptedControlKinds::Any),
         required_components: &[],
         id: FLUX2_DEV_CONTROL_ID,
         family: "flux2",

@@ -258,6 +258,7 @@ fn vace_decode_tail(
 /// Stable identity + advertised capabilities for `wan_vace`.
 pub fn descriptor_vace() -> ModelDescriptor {
     ModelDescriptor {
+        control_kinds: None,
         required_components: &[],
         id: MODEL_ID_VACE,
         family: "wan",

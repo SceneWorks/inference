@@ -115,6 +115,7 @@ pub const LANGUAGES: &[&str] = &[
 /// at the token level), with `max_speakers = 2`.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        control_kinds: None,
         required_components: &[CODEC_COMPONENT_ID],
         id: MODEL_ID,
         family: "moss_ttsd",

@@ -1126,6 +1126,7 @@ impl Generator for Wan14bGenerator {
 /// load; quant still deferred). `conditioning` differs per variant.
 fn descriptor_for(variant: Variant) -> ModelDescriptor {
     ModelDescriptor {
+        control_kinds: None,
         required_components: &[],
         id: variant.id(),
         family: "wan",

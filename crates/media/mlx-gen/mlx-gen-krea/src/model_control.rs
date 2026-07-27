@@ -52,6 +52,8 @@ pub fn descriptor() -> ModelDescriptor {
     d.id = KREA_2_TURBO_CONTROL_ID;
     // Pose ControlNet: a required Control conditioning replaces Turbo's optional img2img Reference.
     d.capabilities.conditioning = vec![ConditioningKind::Control];
+    // Pose only — this branch is a single-signal ControlNet, not a Fun-Union.
+    d.control_kinds = Some(AcceptedControlKinds::Only(vec![mlx_gen::ControlKind::Pose]));
     d
 }
 
@@ -257,10 +259,6 @@ fn tier_from_bits(bits: Option<i32>) -> Option<Quant> {
 impl ControlBranch for KreaTurboControl {
     fn model_id(&self) -> &'static str {
         KREA_2_TURBO_CONTROL_ID
-    }
-
-    fn accepted_control_kinds(&self) -> AcceptedControlKinds {
-        AcceptedControlKinds::Only(vec![mlx_gen::ControlKind::Pose])
     }
 
     fn default_control_scale(&self) -> f32 {

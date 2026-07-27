@@ -18,10 +18,10 @@ use mlx_gen::gen_core;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, default_seed, require_base_dir,
-    require_control, resolve_flow_schedule, AcceptedControlKinds, Capabilities, ConditioningKind,
-    ControlBranch, Error, FlowMatchEuler, GenerationOutput, GenerationRequest, Generator, LoadSpec,
-    Modality, ModelDescriptor, OffloadPolicy, Precision, Progress, Quant, Residency, Result,
-    StagedHeavy, WeightsSource,
+    require_control, resolve_flow_schedule, Capabilities, ConditioningKind, ControlBranch, Error,
+    FlowMatchEuler, GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality,
+    ModelDescriptor, OffloadPolicy, Precision, Progress, Quant, Residency, Result, StagedHeavy,
+    WeightsSource,
 };
 use mlx_rs::Dtype;
 use std::path::Path;
@@ -44,6 +44,7 @@ pub const MODEL_ID: &str = "z_image_turbo_control";
 /// `Reference` (an optional img2img init — the fork's `generate_image` accepts both).
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        control_kinds: Some(crate::model_base_control::accepted_kinds()),
         required_components: &[],
         id: MODEL_ID,
         family: "z-image",
@@ -316,10 +317,6 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 impl ControlBranch for ZImageTurboControl {
     fn model_id(&self) -> &'static str {
         MODEL_ID
-    }
-
-    fn accepted_control_kinds(&self) -> AcceptedControlKinds {
-        crate::model_base_control::accepted_kinds()
     }
 }
 

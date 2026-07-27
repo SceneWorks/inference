@@ -1035,6 +1035,7 @@ mod tests {
 
     fn dummy_descriptor() -> ModelDescriptor {
         ModelDescriptor {
+            control_kinds: None,
             required_components: &[],
             id: "dummy_test_model",
             family: "test",
@@ -1075,6 +1076,7 @@ mod tests {
 
     fn dummy_delegated_descriptor() -> ModelDescriptor {
         ModelDescriptor {
+            control_kinds: None,
             required_components: &[],
             id: "dummy_delegated_test_model",
             family: "test",
@@ -1101,6 +1103,7 @@ mod tests {
     // read as ZERO — so the provider-owned split is what finds it.
     fn dummy_footprint_descriptor() -> ModelDescriptor {
         ModelDescriptor {
+            control_kinds: None,
             required_components: &[],
             id: "dummy_footprint_model",
             family: "test",
@@ -1180,6 +1183,7 @@ mod tests {
     // Multi-provider fixtures verify that independently named constants compose into one catalog.
     fn dummy_multi_gen_a_descriptor() -> ModelDescriptor {
         ModelDescriptor {
+            control_kinds: None,
             required_components: &[],
             id: "dummy_multi_gen_a",
             family: "test",
@@ -1191,6 +1195,7 @@ mod tests {
 
     fn dummy_multi_gen_b_descriptor() -> ModelDescriptor {
         ModelDescriptor {
+            control_kinds: None,
             required_components: &[],
             id: "dummy_multi_gen_b",
             family: "test",
@@ -2338,6 +2343,7 @@ mod tests {
         // A stub audio generator that advertises VoiceEmbedding conditioning.
         let tts = DummyGen {
             desc: ModelDescriptor {
+                control_kinds: None,
                 required_components: &[],
                 id: "dummy_tts",
                 family: "test",
@@ -2394,6 +2400,7 @@ mod tests {
         assert!(model_descriptor_errors(&dummy_descriptor()).is_empty());
 
         let broken = ModelDescriptor {
+            control_kinds: None,
             // Blank + duplicate required-component ids (sc-13658) — unstageable / ambiguous keys.
             required_components: &["", "voice_embedding", "voice_embedding"],
             id: "Bad Id", // uppercase + whitespace
@@ -2433,6 +2440,7 @@ mod tests {
 
         // All-zero bounds report the Default-0 message (F-084), not the inverted-bounds one.
         let zeroed = ModelDescriptor {
+            control_kinds: None,
             required_components: &[],
             id: "zeroed",
             family: "test",
@@ -2452,6 +2460,7 @@ mod tests {
     #[test]
     fn model_descriptor_errors_flags_conversation_history_flag_without_kind() {
         let half_wired = ModelDescriptor {
+            control_kinds: None,
             required_components: &[],
             id: "convo",
             family: "test",
@@ -2489,6 +2498,7 @@ mod tests {
     #[test]
     fn audio_descriptor_with_zero_size_bounds_passes_sweep() {
         let audio = ModelDescriptor {
+            control_kinds: None,
             required_components: &[],
             id: "zeroed_audio",
             family: "test",
@@ -2534,6 +2544,7 @@ mod tests {
     fn visual_descriptor_with_invalid_size_bounds_still_fails_sweep() {
         // Video, zero bounds → the Default-0 footgun still fires.
         let video_zero = ModelDescriptor {
+            control_kinds: None,
             required_components: &[],
             id: "video_zero",
             family: "test",
@@ -2555,6 +2566,7 @@ mod tests {
 
         // Image, inverted bounds → the inverted-bounds message still fires.
         let image_inverted = ModelDescriptor {
+            control_kinds: None,
             required_components: &[],
             id: "image_inverted",
             family: "test",
@@ -2576,6 +2588,7 @@ mod tests {
 
         // `Both` (emits image or video) is a visual modality too — zero bounds still fail.
         let both_zero = ModelDescriptor {
+            control_kinds: None,
             required_components: &[],
             id: "both_zero",
             family: "test",

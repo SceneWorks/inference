@@ -142,6 +142,7 @@ pub const REQUIRED_COMPONENTS: &[&str] = &[COMPONENT_PERTH, COMPONENT_VOICE_EMBE
 /// Chatterbox clone-TTS identity + capabilities — constructible without weights.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        control_kinds: None,
         required_components: REQUIRED_COMPONENTS,
         id: MODEL_ID,
         family: "chatterbox",

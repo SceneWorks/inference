@@ -255,6 +255,7 @@ const MAX_STEPS: u32 = 200;
 /// (`req.guidance` overrides the ceiling), no negative prompt / sampler / scheduler / LoRA / quant.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        control_kinds: None,
         required_components: &[],
         id: MODEL_ID,
         family: "svd",

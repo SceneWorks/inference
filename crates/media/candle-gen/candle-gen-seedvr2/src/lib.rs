@@ -62,6 +62,7 @@ fn variant(id: &str) -> (&'static str, DitConfig) {
 
 fn descriptor_for(id: &'static str) -> ModelDescriptor {
     ModelDescriptor {
+        control_kinds: None,
         required_components: &[],
         id,
         family: "seedvr2",

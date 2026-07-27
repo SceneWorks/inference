@@ -1010,6 +1010,7 @@ pub const WEIGHT_LICENSES: &[gen_core::WeightLicenseEntry] = &[
 /// tracked with the other additive descriptor gaps as `sc-15041`.
 pub fn descriptor_for(variant: Variant) -> ModelDescriptor {
     ModelDescriptor {
+        control_kinds: None,
         required_components: &[],
         id: variant.model_id(),
         family: "stable_audio_3",
