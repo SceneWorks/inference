@@ -229,14 +229,20 @@ jobs:
         # links the seven real-weight-only binaries, which costs the lld budget above nothing but
         # time for zero executed cases.
         #
-        # The named seven and what they execute on a PR (measured, `cargo test -p
+        # The named eight and what they execute on a PR (measured, `cargo test -p
         # candle-audio-stable-audio-3 --tests`): `sampler_oracle` 17, `provider` 3,
         # `dtype_policy` 2, `conformance` 1, `primitive_oracle` 1, `same_oracle` 1,
-        # `variant_quality` 1 — 26 weight-free cases. sc-14545 review found `sampler_oracle`,
-        # `same_oracle` and `primitive_oracle` running in no automatic lane at all (19 dark gates,
-        # pre-existing since sc-14543) and added them here. sc-14546 adds `provider`'s third case,
-        # which asserts each `-base` side-ratio floor sits below the sweep minimum it was
-        # calibrated from.
+        # `variant_quality` 1, `listening_stimuli` 2 — 28 weight-free cases. sc-14545 review found
+        # `sampler_oracle`, `same_oracle` and `primitive_oracle` running in no automatic lane at all
+        # (19 dark gates, pre-existing since sc-14543) and added them here. sc-14546 adds
+        # `provider`'s third case, which asserts each `-base` side-ratio floor sits below the sweep
+        # minimum it was calibrated from. sc-15178 adds `listening_stimuli`'s two weight-free
+        # controls behind the listening protocol: one measures that an RMS-matched pair sits
+        # 6.71 LU apart under BS.1770-4 and that LUFS matching closes the gap (the evidence for the
+        # protocol specifying LUFS rather than RMS), the other replays the observed +0.031 dBTP
+        # inter-sample over that forced the loudness target to be peak-constrained. That target's
+        # real-weight case — the stimulus generator itself — stays `#[ignore]`d and runs in no lane
+        # by design; it is a generator, not a gate.
         #
         # Deliberately **not** named, because every case in them is `#[ignore]`d behind a pinned
         # multi-GB snapshot and the target would link for zero executed tests: `base_guidance`,
@@ -259,6 +265,7 @@ jobs:
           -p candle-audio-stable-audio-3
           --test provider --test dtype_policy --test variant_quality --test conformance
           --test sampler_oracle --test same_oracle --test primitive_oracle
+          --test listening_stimuli
           -- --nocapture
       - name: Test LLM-only CPU bundle
         run: cargo test --locked --no-default-features --lib -p runtime-cpu
