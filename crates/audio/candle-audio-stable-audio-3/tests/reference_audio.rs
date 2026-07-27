@@ -12,20 +12,29 @@
 //!
 //! A silent inversion between them produces a feature that runs, emits plausible audio, and does the
 //! opposite of what the caller asked. Nothing about the output's *shape* or *quality* would reveal
-//! it. So the sign is gated twice, at the **contract** endpoint both times:
+//! it. The inversion has **two** distinct shapes, and each needs its own weight-free gate:
 //!
-//! * weight-free, `contract_strength_is_retention_and_a_flipped_sign_fails_here` drives the real
-//!   conversion (`reference_noise_level`) into the real schedule builder and the real init mix, and
-//!   asserts that contract `1.0` returns the prepared source *bit-for-bit* while contract `0.0`
-//!   returns the sampler noise bit-for-bit. Swapping the mapping swaps those two, so the assertion
-//!   cannot pass under the inversion;
-//! * with real weights, `real_reference_restyle_is_bounded_and_ordered_on_all_six_variants`
-//!   requires the *measured* source correlation at contract `1.0` to exceed the one at contract
-//!   `0.0` by a wide margin, which is the same discrimination through the full graph.
+//! 1. the *conversion* is wrong — `reference_noise_level` returns something other than the
+//!    complement. Gated by `contract_strength_is_retention_and_a_flipped_sign_fails_here`, which
+//!    drives the shipped conversion into the shipped schedule builder and the shipped init mix and
+//!    asserts contract `1.0` returns the prepared source bit-for-bit while contract `0.0` returns
+//!    the sampler noise bit-for-bit;
+//! 2. the conversion is right but the *wrong field is handed to the pipeline* — the provider builds
+//!    its `ReferenceAudio` with `strength` where `noise_level` belongs. This is the mistake an
+//!    adversarial review actually landed, and (1) is blind to it: the conversion is still correct,
+//!    it is simply not the value that travels. Gated by
+//!    `the_request_surface_hands_the_pipeline_the_converted_noise_level`, which builds a real
+//!    `GenerationRequest`, calls the shipped `resolve_reference_audio` and the shipped
+//!    `reference_audio_for`, and compares the whole constructed struct.
 //!
-//! The remaining weight-free cases pin the preprocessing contract (resample-then-pad-then-conform,
-//! and geometry bounded by the *requested* duration rather than by the source's extent) and the
-//! typed rejections.
+//! Past `reference_audio_for` the value goes into `Pipeline::synthesize_with_reference`, which needs
+//! weights; that span is covered by
+//! `real_reference_restyle_is_bounded_and_ordered_on_all_six_variants`, which requires the measured
+//! source correlation at contract `1.0` to exceed the one at contract `0.0` by a wide margin.
+//!
+//! The remaining weight-free cases pin the preprocessing contract (resample, target sizing, channel
+//! conformance), the geometry seam that decides sizing from the *requested* duration rather than the
+//! source's extent, and the typed rejections.
 
 use std::path::PathBuf;
 
@@ -34,12 +43,13 @@ use candle_audio_stable_audio_3::gen_core::{
     self, AudioEditMode, AudioParams, AudioTrack, Conditioning, ConditioningKind, GenerationOutput,
     GenerationRequest, Generator, LoadSpec, WeightsSource,
 };
-use candle_audio_stable_audio_3::pipeline::{prepare_reference_pcm, SAMPLE_RATE};
+use candle_audio_stable_audio_3::pipeline::{prepare_reference_pcm, ReferenceAudio, SAMPLE_RATE};
 use candle_audio_stable_audio_3::sampler::{
     adapt_sample_size_for_max, build_schedule, initialized_start, DistributionShift, Schedule,
 };
 use candle_audio_stable_audio_3::{
-    descriptor_for, load_variant, reference_noise_level, Variant, DEFAULT_REFERENCE_STRENGTH,
+    descriptor_for, load_variant, reference_audio_for, reference_noise_level,
+    resolve_reference_audio, synthesis_parameters, Variant, DEFAULT_REFERENCE_STRENGTH,
 };
 
 const CHANNELS: usize = 2;
@@ -210,8 +220,89 @@ fn contract_strength_is_retention_and_a_flipped_sign_fails_here() {
     );
 }
 
+/// The other half of the sign gate: the converted value is the one that actually travels.
+///
+/// `contract_strength_is_retention_and_a_flipped_sign_fails_here` pins the *conversion*. It is
+/// deliberately blind to the mistake this case exists for: building the pipeline's `ReferenceAudio`
+/// out of the resolved **`strength`** instead of the resolved **`noise_level`**. Under that
+/// substitution the conversion is still perfectly correct and simply never reaches the sampler —
+/// the sampler receives retention where it expects an init noise level, i.e. exactly the inversion,
+/// arrived at by a different route. An adversarial review landed precisely that mutation and the
+/// whole weight-free suite stayed green, because no case here ever entered the request surface.
+///
+/// So this drives the shipped request path — a real `GenerationRequest` carrying
+/// `Conditioning::ReferenceAudio`, the shipped `resolve_reference_audio`, and the shipped
+/// `reference_audio_for` that `StableAudio3Generator::generate` itself calls — and compares the
+/// **whole constructed struct**, so it is the field selection that fails and not a derived quantity.
+///
+/// Every strength here is chosen so `strength != noise_level`; at `0.5` the two coincide and the
+/// substitution would be invisible.
 #[test]
-fn preparation_resamples_then_pads_then_conforms_channels() {
+fn the_request_surface_hands_the_pipeline_the_converted_noise_level() {
+    // (explicit strength, expected retention in force, expected init noise level)
+    let expectations = [
+        (Some(1.0f32), 1.0f32, 0.0f32),
+        (Some(0.0), 0.0, 1.0),
+        (Some(0.25), 0.25, 0.75),
+        (Some(0.75), 0.75, 0.25),
+        (None, DEFAULT_REFERENCE_STRENGTH, 0.9),
+    ];
+    for (strength, retention, level) in expectations {
+        assert_ne!(
+            retention, level,
+            "a case where retention equals the noise level cannot discriminate the two fields"
+        );
+        let clip = source_clip(0.5, 48_000, 1);
+        let request = reference_request("restyle this clip", 5.0, Some((clip.clone(), strength)));
+
+        let resolved = resolve_reference_audio(&request).unwrap_or_else(|| {
+            panic!("a request carrying ReferenceAudio must resolve ({strength:?})")
+        });
+        assert_eq!(
+            resolved.strength, retention,
+            "{strength:?}: the retention in force, explicit or defaulted"
+        );
+        assert_eq!(
+            resolved.noise_level, level,
+            "{strength:?}: the sampler-facing init noise level is the complement"
+        );
+
+        // The struct `generate` hands `Pipeline::synthesize_with_reference`, field for field. The
+        // scalar fields are asserted individually first so a failure names the wrong value instead
+        // of dumping the whole source buffer; the struct equality after them is what would catch a
+        // *new* field being added unconverted.
+        let handed =
+            reference_audio_for(&request).expect("the same request builds a pipeline reference");
+        assert_eq!(
+            handed.noise_level, level,
+            "{strength:?}: the pipeline must receive the converted init noise level {level}, not \
+             the contract retention {retention}"
+        );
+        assert_eq!(handed.sample_rate, 48_000, "{strength:?}: source rate");
+        assert_eq!(handed.channels, 1, "{strength:?}: source channels");
+        assert!(
+            handed.samples == clip.samples.as_slice(),
+            "{strength:?}: the source PCM must be passed through untouched"
+        );
+        assert_eq!(
+            handed,
+            ReferenceAudio {
+                samples: &clip.samples,
+                sample_rate: 48_000,
+                channels: 1,
+                noise_level: level,
+            }
+        );
+    }
+
+    // A request with no reference resolves to nothing, so the text-to-audio path is untouched.
+    let plain = reference_request("just generate", 5.0, None);
+    assert!(resolve_reference_audio(&plain).is_none());
+    assert!(reference_audio_for(&plain).is_none());
+}
+
+#[test]
+fn prepared_reference_pcm_is_resampled_channel_conformed_and_target_sized() {
     // 48 kHz mono — the exact case the rest of this audio lane emits, and the 160:147 ratio the
     // decision to resample rather than reject was taken on.
     let source = source_clip(0.5, 48_000, 1);
@@ -219,10 +310,17 @@ fn preparation_resamples_then_pads_then_conforms_channels() {
     let prepared = prepare_reference_pcm(&source.samples, 48_000, 1, target_frames).unwrap();
     assert_eq!(prepared.len(), target_frames * CHANNELS);
 
-    // Mono duplicates into both channels — including across the padded tail, which is what
-    // "conform channels *after* padding" buys: a channel conform done first would still be correct
-    // here, but the padded region would have been written before the duplication and is the half
-    // that silently diverges when the order is wrong.
+    // Mono duplicates into both channels, across the whole target including the padded tail.
+    //
+    // Note what this does *not* prove. The spec says "conform channels after padding", and that is
+    // what `prepare_reference_pcm` does, but the ordering is **not observable and is not gated
+    // here**: the pad value is zero, and duplicating a zero commutes with padding with zeros (as
+    // does keeping the first two of four zeros). Conform-then-pad produces byte-identical output,
+    // which a reviewer confirmed empirically by rewriting the function and watching every case in
+    // this file still pass. The spec bullet is satisfied by construction, not by a test, and it is
+    // recorded that way rather than dressed up — inventing a contrived way to make the two orders
+    // differ would gate an artefact, not the contract. What is asserted below is the channel
+    // conformance *result*, which is real.
     for frame in 0..target_frames {
         assert_eq!(
             prepared[frame * CHANNELS],
@@ -271,33 +369,92 @@ fn preparation_resamples_then_pads_then_conforms_channels() {
     assert!(prepare_reference_pcm(&[0.0, 1.0], SAMPLE_RATE, 0, 8).is_err());
 }
 
-/// The prepared length — and therefore the attention/padding mask behind it — comes from the
-/// *requested* duration plus the configured headroom, never from how long the caller's clip is.
+/// The sizing geometry this path runs on comes from the **requested** duration, never from how long
+/// the caller's clip is.
+///
+/// # What the previous version of this case got wrong
+///
+/// It asserted `prepare_reference_pcm(..., sample_size).len() == sample_size * CHANNELS` across
+/// three source lengths. That cannot fail: `prepare_reference_pcm` returns exactly
+/// `target_frames * CHANNELS` unconditionally, so sweeping the *source* length proved nothing about
+/// source extent. The seam that could actually get this wrong is upstream of it — the resolution of
+/// `SynthesisParameters::duration_secs`, which is the single number
+/// `Pipeline::synthesize_with_reference` turns into the adapted sample size, the length
+/// `prepare_reference_pcm` conforms to, and the attention mask. A source-extent leak *there* would
+/// be completely invisible in `prepare_reference_pcm`'s own output. So that is what is asserted,
+/// plus the geometry arithmetic behind it, two-sided.
 #[test]
-fn preparation_is_bounded_by_requested_duration_not_source_extent() {
+fn sizing_geometry_comes_from_the_requested_duration_not_the_source_extent() {
+    // 1. The provider's duration resolution ignores the clip, however long it is.
+    for source_seconds in [0.25f32, 10.0, 60.0] {
+        for variant in Variant::ALL {
+            let request = reference_request(
+                "restyle this",
+                10.0,
+                Some((source_clip(source_seconds, SAMPLE_RATE, 2), Some(0.5))),
+            );
+            let parameters = synthesis_parameters(variant, &request);
+            assert_eq!(
+                parameters.duration_secs,
+                10.0,
+                "{}: a {source_seconds}s source must not move the requested duration",
+                variant.model_id()
+            );
+        }
+    }
+    // And it is not simply pinned to a constant: the requested duration is what moves it, and an
+    // absent one falls back to the variant's default rather than to anything about the source.
+    let mut longer = reference_request(
+        "restyle this",
+        25.0,
+        Some((source_clip(1.0, SAMPLE_RATE, 2), Some(0.5))),
+    );
+    assert_eq!(
+        synthesis_parameters(Variant::SmallMusic, &longer).duration_secs,
+        25.0
+    );
+    longer.audio.as_mut().unwrap().target_duration = None;
+    assert_eq!(
+        synthesis_parameters(Variant::SmallMusic, &longer).duration_secs,
+        Variant::SmallMusic.default_duration_secs(),
+        "an omitted target duration falls back to the variant default, not to the source"
+    );
+
+    // 2. The geometry that duration produces is exact, not merely "at least".
+    //
+    // Derived independently of `adapt_sample_size_for_max`: at 4096 samples per latent frame,
+    // 10 s = 441_000 samples rounds up to 108 latent frames, and the 6 s headroom is
+    // floor(6 * 44_100 / 4096) = 64 more. 108 + 64 = 172.
     let max_sample_size = 5_292_032; // the smalls' own ceiling
     let geometry =
         adapt_sample_size_for_max(max_sample_size, &[Some(10.0)], DURATION_PADDING_SECS).unwrap();
-
-    for source_seconds in [0.25f32, 10.0, 60.0] {
-        let source = source_clip(source_seconds, SAMPLE_RATE, 2);
-        let prepared =
-            prepare_reference_pcm(&source.samples, SAMPLE_RATE, 2, geometry.sample_size).unwrap();
-        assert_eq!(
-            prepared.len(),
-            geometry.sample_size * CHANNELS,
-            "a {source_seconds}s source must not move the adapted geometry"
-        );
-    }
-
-    // And the geometry itself is the requested duration plus the 6 s headroom, not the source's.
-    let expected_valid =
-        ((10.0 + DURATION_PADDING_SECS) * SAMPLE_RATE as f64 / 4_096.0).floor() as usize;
+    assert_eq!(geometry.valid_lengths[0], 172);
+    assert_eq!(geometry.effective_lengths.as_ref().unwrap()[0], 108);
     assert!(
-        geometry.valid_lengths[0] >= expected_valid,
-        "valid length {} must cover the requested duration plus headroom ({expected_valid})",
-        geometry.valid_lengths[0]
+        geometry.latent_length > geometry.valid_lengths[0],
+        "the valid length must not be clamped by the adapted length, or the equality above is \
+         measuring the clamp instead of the arithmetic"
     );
+
+    // 3. Both terms are load-bearing, asserted by moving each one on its own.
+    let doubled =
+        adapt_sample_size_for_max(max_sample_size, &[Some(20.0)], DURATION_PADDING_SECS).unwrap();
+    assert!(
+        doubled.valid_lengths[0] > geometry.valid_lengths[0]
+            && doubled.sample_size > geometry.sample_size,
+        "a longer requested duration must grow the geometry"
+    );
+    let unpadded = adapt_sample_size_for_max(max_sample_size, &[Some(10.0)], 0.0).unwrap();
+    assert_eq!(
+        unpadded.valid_lengths[0], 108,
+        "without headroom the valid length is the requested duration alone"
+    );
+
+    // 4. And the prepared buffer is sized by that geometry, at the model's own timeline.
+    let source = source_clip(0.25, SAMPLE_RATE, 2);
+    let prepared =
+        prepare_reference_pcm(&source.samples, SAMPLE_RATE, 2, geometry.sample_size).unwrap();
+    assert_eq!(prepared.len(), geometry.sample_size * CHANNELS);
 }
 
 #[test]
@@ -320,13 +477,23 @@ fn reference_validation_rejects_every_malformed_clip_on_every_variant() {
             "{id} must accept a well-formed 48 kHz mono reference"
         );
 
-        // Two references.
+        // Two references. Typed `Unsupported`, deliberately the same type as the `AudioEdit`
+        // combination below: both are statements about what this family can do, as opposed to the
+        // malformed-clip rejections further down, which are about the caller's data and are `Msg`.
+        // The split is asserted by type on both sides so it cannot drift.
         let mut invalid = valid.clone();
         invalid.conditioning.push(Conditioning::ReferenceAudio {
             audio: source_clip(1.0, SAMPLE_RATE, 2),
             strength: None,
         });
-        assert!(validate(variant, &invalid).is_err(), "{id}: two references");
+        assert!(
+            matches!(
+                validate(variant, &invalid),
+                Err(gen_core::Error::Unsupported(_))
+            ),
+            "{id}: two references must be typed Unsupported, got {:?}",
+            validate(variant, &invalid)
+        );
 
         // Reference plus an audio edit.
         let mut invalid = valid.clone();
@@ -357,8 +524,9 @@ fn reference_validation_rejects_every_malformed_clip_on_every_variant() {
         ] {
             let invalid = reference_request("restyle this", 5.0, Some((audio, Some(0.4))));
             assert!(
-                validate(variant, &invalid).is_err(),
-                "{id}: a {name} reference clip must be rejected"
+                matches!(validate(variant, &invalid), Err(gen_core::Error::Msg(_))),
+                "{id}: a {name} reference clip must be rejected as Msg (bad caller data), got {:?}",
+                validate(variant, &invalid)
             );
         }
 

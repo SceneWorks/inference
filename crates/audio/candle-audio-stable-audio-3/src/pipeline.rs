@@ -213,6 +213,15 @@ pub struct ReferenceAudio<'a> {
 /// Exposed for the draw-order gate. The invariant is `draws_after_initial_noise == 1`: the
 /// sampler's initial noise is drawn before the source is encoded, so a reference clip never
 /// perturbs the draw a text-only request at the same seed would have made.
+///
+/// # How much this actually discriminates
+///
+/// Less than the invariant's phrasing suggests, and the difference matters. **SAME-S consumes zero
+/// draws on encode**, so on the four small ids `draws_after_source_encode` equals
+/// `draws_after_initial_noise` and reordering the two operations would not move either count. Only
+/// medium's SAME-L encode draws, so only `medium` and `medium_base` can falsify the ordering at
+/// all. That is why the real-weight case runs all six *and* separately requires at least one of
+/// them to report a drawing encode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReferenceDrawOrder {
     pub draws_after_initial_noise: usize,
@@ -231,8 +240,16 @@ pub struct ReferenceDrawOrder {
 ///    not a policy — that crate contains no DSP resampling of any kind.)
 /// 2. **Trim or right-zero-pad from offset 0** to exactly `target_frames`, which is the adapted
 ///    sample size for the *requested* duration. Source extent never moves the geometry.
-/// 3. **Conform channels after padding**, so a mono source's duplicated pair and its silence agree:
-///    mono duplicates, stereo passes through, more than two channels keeps the first two.
+/// 3. **Conform channels after padding**: mono duplicates, stereo passes through, more than two
+///    channels keeps the first two.
+///
+/// Steps 1 and 2 genuinely depend on their predecessor and their results are asserted. Step 3's
+/// *position* is not observable and is not claimed to be gated: because the pad value is zero,
+/// conforming before padding and conforming after it produce byte-identical output (duplicating a
+/// zero and padding with zeros commute, as does taking the first two of four zeros). The spec's
+/// "conform after padding" bullet is therefore satisfied here **by construction, not by a test** —
+/// stated plainly so nobody reads the ordering as load-bearing and builds on it. It would only
+/// become observable if the pad value ever stopped being zero.
 ///
 /// Returns interleaved stereo of exactly `target_frames * CHANNELS` values.
 pub fn prepare_reference_pcm(
@@ -436,6 +453,11 @@ impl StableAudio3Pipeline {
         // move the draw a text-only request at the same seed would have made.
         let initial = noise.standard_normal_like(&template)?;
         let draws_after_initial_noise = noise.draws();
+        // A guard against a *future* edit, not a live check: as written the stream is constructed
+        // three lines up and drawn from exactly once, so this can only fire if something is
+        // inserted between the two. Say so rather than calling it "fails closed" unqualified —
+        // and note it discriminates a reordering only where the encode itself draws, i.e. on
+        // SAME-L (`medium`, `medium_base`), never on the four SAME-S ids.
         if draws_after_initial_noise != 1 {
             return Err(AudioError::Msg(format!(
                 "initial sampler noise must be the request stream's first draw, saw \

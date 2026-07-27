@@ -947,6 +947,13 @@ pub struct InitializedStart {
     pub latents: Tensor,
     /// `true` only for `strength == 0` with init latents present — the frozen no-DiT short circuit,
     /// which returns the prepared source latents unchanged.
+    ///
+    /// Callers should note the progress consequence: every initialized entry point returns on this
+    /// flag **before invoking its progress callback even once**, so a request that trips it (the
+    /// restyle path's contract `strength = 1.0`) emits zero `Progress::Step` events and then goes
+    /// straight to `Progress::Decoding`. A progress bar driven off step counts will sit at zero for
+    /// the whole sample phase. That is accurate — there are no steps — but it is user-visible
+    /// behaviour of a documented endpoint, so it is stated rather than discovered.
     pub skip_model: bool,
 }
 

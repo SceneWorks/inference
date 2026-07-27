@@ -84,8 +84,11 @@
 //! forward, `0.0` is pure generation, and an omitted value resolves to
 //! [`model::DEFAULT_REFERENCE_STRENGTH`]. The sampler's own `strength` is upstream's
 //! `init_noise_level` and runs the *other* way; the single conversion between the two lives in
-//! [`model::reference_noise_level`] and its sign is pinned by a mutation gate in
-//! `tests/reference_audio.rs`. See `docs/migration/SC_14547_REFERENCE_AUDIO_RESTYLE.md`.
+//! [`model::reference_noise_level`]. Its sign is pinned by **two** mutation gates in
+//! `tests/reference_audio.rs` — one on the conversion itself and one on
+//! [`model::reference_audio_for`], the single site that carries the converted value into the
+//! pipeline, because a correct conversion whose result never travels is the same bug by another
+//! route. See `docs/migration/SC_14547_REFERENCE_AUDIO_RESTYLE.md`.
 
 pub use candle_audio;
 pub use candle_audio::gen_core;
@@ -108,17 +111,17 @@ pub use model::{
     descriptor, descriptor_for, load, load_generator, load_medium_base_generator,
     load_medium_generator, load_music_base_generator, load_sfx_base_generator, load_sfx_generator,
     load_variant, medium_base_descriptor, medium_base_load, medium_descriptor, medium_load,
-    music_base_descriptor, music_base_load, reference_noise_level, resolve_reference_audio,
-    sfx_base_descriptor, sfx_base_load, sfx_descriptor, sfx_load, ResolvedReference,
-    StableAudio3Generator, Variant, VariantShape, DEFAULT_REFERENCE_STRENGTH, HUB_REPO,
-    HUB_REVISION, MAX_DURATION_SECS, MEDIUM_BASE_HUB_REPO, MEDIUM_BASE_HUB_REVISION,
-    MEDIUM_BASE_MODEL_ID, MEDIUM_BASE_REGISTRATION, MEDIUM_HUB_REPO, MEDIUM_HUB_REVISION,
-    MEDIUM_MAX_DURATION_SECS, MEDIUM_MODEL_ID, MEDIUM_REGISTRATION, MEDIUM_SHAPE, MODEL_ID,
-    MUSIC_BASE_HUB_REPO, MUSIC_BASE_HUB_REVISION, MUSIC_BASE_MODEL_ID, MUSIC_BASE_REGISTRATION,
-    REFERENCE_STRENGTH_RANGE, REGISTRATION, SFX_BASE_HUB_REPO, SFX_BASE_HUB_REVISION,
-    SFX_BASE_MODEL_ID, SFX_BASE_REGISTRATION, SFX_HUB_REPO, SFX_HUB_REVISION, SFX_MODEL_ID,
-    SFX_REGISTRATION, SMALL_BASE_MAX_SAMPLE_SIZE, SMALL_BASE_SHAPE, SMALL_MAX_SAMPLE_SIZE,
-    SMALL_SHAPE, WEIGHT_LICENSES,
+    music_base_descriptor, music_base_load, reference_audio_for, reference_noise_level,
+    resolve_reference_audio, sfx_base_descriptor, sfx_base_load, sfx_descriptor, sfx_load,
+    synthesis_parameters, ResolvedReference, StableAudio3Generator, Variant, VariantShape,
+    DEFAULT_REFERENCE_STRENGTH, HUB_REPO, HUB_REVISION, MAX_DURATION_SECS, MEDIUM_BASE_HUB_REPO,
+    MEDIUM_BASE_HUB_REVISION, MEDIUM_BASE_MODEL_ID, MEDIUM_BASE_REGISTRATION, MEDIUM_HUB_REPO,
+    MEDIUM_HUB_REVISION, MEDIUM_MAX_DURATION_SECS, MEDIUM_MODEL_ID, MEDIUM_REGISTRATION,
+    MEDIUM_SHAPE, MODEL_ID, MUSIC_BASE_HUB_REPO, MUSIC_BASE_HUB_REVISION, MUSIC_BASE_MODEL_ID,
+    MUSIC_BASE_REGISTRATION, REFERENCE_STRENGTH_RANGE, REGISTRATION, SFX_BASE_HUB_REPO,
+    SFX_BASE_HUB_REVISION, SFX_BASE_MODEL_ID, SFX_BASE_REGISTRATION, SFX_HUB_REPO,
+    SFX_HUB_REVISION, SFX_MODEL_ID, SFX_REGISTRATION, SMALL_BASE_MAX_SAMPLE_SIZE, SMALL_BASE_SHAPE,
+    SMALL_MAX_SAMPLE_SIZE, SMALL_SHAPE, WEIGHT_LICENSES,
 };
 pub use pipeline::{
     prepare_reference_pcm, ComputeDTypes, ReferenceAudio, ReferenceDrawOrder, StableAudio3Pipeline,

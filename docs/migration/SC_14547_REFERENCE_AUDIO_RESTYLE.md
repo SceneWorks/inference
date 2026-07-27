@@ -43,19 +43,34 @@ init_noise_level = 1.0 - contract_strength
 | `1.0` | `0.0` | the prepared source, returned without a single DiT forward |
 
 A silent inversion here would still run, still emit plausible audio, and do the opposite of what the
-caller asked — no shape or quality check would reveal it. So the sign is gated twice, at the
-**contract** endpoint both times:
+caller asked — no shape or quality check would reveal it. It has **two distinct shapes**, and each
+needs its own gate. A review of the first version of this change found only shape (1) covered, then
+landed shape (2) as a mutation and watched the whole weight-free suite stay green.
 
-* **weight-free**, `tests/reference_audio.rs`
-  `contract_strength_is_retention_and_a_flipped_sign_fails_here` drives the shipped conversion into
-  the shipped schedule builder and the shipped init mix, and asserts contract `1.0` returns the
-  prepared source bit-for-bit while contract `0.0` returns the sampler noise bit-for-bit. It also
-  rejects the identity mapping and `|1-2s|` (which agrees at both endpoints) by pinning the interior
-  and requiring the distance-to-source to fall strictly as retention rises. **Verified to fail under
-  the flipped mapping**, not merely to pass under the correct one;
-* **with real weights**, `real_reference_restyle_is_bounded_and_ordered_on_all_six_variants`
-  requires the measured source correlation at contract `1.0` to exceed the one at contract `0.0` by
-  a wide margin — the same discrimination through the full graph.
+1. **The conversion is wrong.** Gated weight-free by `tests/reference_audio.rs`
+   `contract_strength_is_retention_and_a_flipped_sign_fails_here`, which drives the shipped
+   conversion into the shipped schedule builder and the shipped init mix and asserts contract `1.0`
+   returns the prepared source bit-for-bit while contract `0.0` returns the sampler noise
+   bit-for-bit. It also rejects the identity mapping and `|1-2s|` (which agrees at both endpoints) by
+   pinning the interior and requiring the distance-to-source to fall strictly as retention rises.
+2. **The conversion is right but the wrong field travels** — the provider builds the pipeline's
+   `ReferenceAudio` out of the resolved `strength` where `noise_level` belongs. Gate (1) is blind to
+   this: the conversion is still correct, it simply never reaches the sampler. Gated weight-free by
+   `the_request_surface_hands_the_pipeline_the_converted_noise_level`, which builds a real
+   `GenerationRequest` carrying `Conditioning::ReferenceAudio`, calls the shipped
+   `resolve_reference_audio` and the shipped `model::reference_audio_for` — the same function
+   `StableAudio3Generator::generate` calls — and compares the constructed struct field for field, at
+   strengths where retention and noise level differ. Verified by re-running the exact mutation
+   (`noise_level: reference.noise_level` → `reference.strength`): the case FAILS with
+   `the pipeline must receive the converted init noise level 0, not the contract retention 1`.
+
+`reference_audio_for` was extracted out of `generate` precisely so shape (2) is reachable without
+weights. Everything past it — `Pipeline::synthesize_with_reference` and below — needs a snapshot, and
+is covered by **the real-weight case**
+`real_reference_restyle_is_bounded_and_ordered_on_all_six_variants`, which requires the measured
+source correlation at contract `1.0` to exceed the one at contract `0.0` by a wide margin. So the
+honest statement of the split is: the conversion *and* its handoff to the pipeline are gated
+weight-free; the pipeline-to-sampler wiring is gated only with real weights.
 
 Measured source correlation on Metal, 5 s / 4 steps, seed 7 (M-series, `--release --features metal`):
 
@@ -79,6 +94,14 @@ Note the consequence of the mapping: `sampler.rs`'s `strength == 0` DiT short-ci
 contract `strength = 1`, so "returns the prepared source" is a **contract-endpoint** claim and is
 tested there rather than at the sampler's.
 
+That short circuit has a second, caller-visible consequence worth stating: every initialized sampler
+entry point returns on `skip_model` **before invoking its progress callback even once**, so a request
+at contract `strength = 1.0` emits zero `Progress::Step` events and then goes straight to
+`Progress::Decoding`. A progress bar driven off step counts sits at zero for the whole sample phase.
+That is accurate — there genuinely are no steps — but it is behaviour of a documented endpoint, so it
+is recorded here and on `sampler::InitializedStart::skip_model` and `model::reference_noise_level`
+rather than left to be discovered.
+
 ## Resample, do not reject
 
 The open decision on the story is settled by evidence rather than preference.
@@ -98,27 +121,53 @@ The same ruling is intended for sc-14548 (inpaint).
 
 ## Preprocessing order
 
-Each step depends on the previous one, so the order is fixed and tested:
-
 1. resolve the target duration → the adapted sample size (requested duration **plus** the 6 s
    `DEFAULT_DURATION_PADDING`, never the source's extent);
 2. `dsp::resample` the **whole** buffer to 44.1 kHz;
 3. trim, or right-zero-pad from offset 0, to exactly that sample size;
-4. conform channels **after** padding, so a mono source's duplicated pair and its silence agree;
+4. conform channels **after** padding — mono duplicates, stereo passes, `>2` keeps the first two;
 5. SAME-encode the complete adapted buffer.
+
+Steps 1–3 genuinely depend on their predecessor and their results are asserted by
+`sizing_geometry_comes_from_the_requested_duration_not_the_source_extent` and
+`prepared_reference_pcm_is_resampled_channel_conformed_and_target_sized`.
+
+**Step 4's position is not observable, and is not claimed to be gated.** Because the pad value is
+zero, conforming channels before padding and conforming after it produce byte-identical output —
+duplicating a zero commutes with padding zeros, as does keeping the first two of four zeros. A
+reviewer confirmed this empirically by rewriting `prepare_reference_pcm` to conform first and
+watching all five weight-free cases still pass. The spec's "conform after padding" bullet is
+therefore satisfied **by construction, not by a test**, and is recorded that way rather than
+overclaimed; it would only become observable if the pad value ever stopped being zero. What the test
+does pin is the channel-conformance *result*, which is real.
 
 The attention/padding mask is unchanged — it still derives from the requested duration plus the
 headroom. `local` inpaint conditioning stays exactly zero: on this path the source is `init_data`
 only, never masked local input.
 
+The geometry claim is asserted at the seam that could actually get it wrong. `prepare_reference_pcm`
+returns `target_frames * CHANNELS` unconditionally, so sweeping *source* lengths through it proves
+nothing; the number that decides sizing is `SynthesisParameters::duration_secs`, resolved by
+`model::synthesis_parameters` from `audio.target_duration` (or the variant default) and never from
+the clip. That resolution is asserted on all six ids across three source lengths, together with the
+exact geometry arithmetic behind it — `valid_lengths[0] == 172` for a 10 s request (108 latent frames
+of content plus 64 of headroom), two-sided, with each term separately shown to move the result.
+
 ## Draw order
 
 The request-local stream draws the sampler's initial noise **first**, then the source encode's
 draws, then Pingpong, then SAME decode. Encoding first would move every later draw, so the same seed
-would sound different merely for having a clip attached. This is enforced two ways: the pipeline
-fails closed if the initial noise is not the stream's first draw, and
-`real_initial_sampler_noise_precedes_the_source_encode` asserts the counts through
-`synthesize_with_reference_traced`.
+would sound different merely for having a clip attached. This is enforced two ways, neither of which
+is as strong as "fails closed" unqualified would suggest:
+
+* the pipeline **guards against a future edit**: it errors if `draws_after_initial_noise != 1`. As
+  shipped that cannot fire — the `SeededNoise` is constructed three lines above the check and drawn
+  from exactly once — so it is a tripwire for something being inserted between the two, not a live
+  check on the current code. And under a genuine reordering it only discriminates where the encode
+  itself draws, i.e. on the two SAME-L ids (`medium`, `medium_base`); on the four SAME-S ids it
+  cannot fire at all;
+* `real_initial_sampler_noise_precedes_the_source_encode` asserts the counts through
+  `synthesize_with_reference_traced`, on all six, with the same SAME-S caveat below.
 
 This is pinned as a **structural** invariant, not as an upstream-parity claim: no frozen SA3 fork is
 vendored in this repository, so the upstream order cannot be substantiated here.
@@ -156,6 +205,11 @@ rejects: more than one `ReferenceAudio`; `ReferenceAudio` combined with `AudioEd
 non-finite PCM; a zero sample rate; zero channels; a sample count that is not a whole number of
 frames; and a `strength` outside `0.0..=1.0`.
 
+The error **type** carries a deliberate split, and both sides are asserted by type so it cannot
+drift. The two arity/combination refusals — more than one clip, and a clip alongside an `AudioEdit` —
+are statements about what this family *can do* and are typed `Error::Unsupported`. Everything else is
+about the caller's data rather than the model's capability and stays `Error::Msg`.
+
 The `AudioEdit` combination check is defence in depth and is labelled as such in the source: this
 family advertises no audio-edit modes, so the generic floor already refuses such an item on its own.
 The check exists so that advertising audio editing later (sc-14548) cannot silently make the
@@ -165,7 +219,7 @@ The check exists so that advertising audio editing later (sc-14548) cannot silen
 
 | lane | selects |
 |---|---|
-| `ci.yml` "Test Stable Audio 3 weight-free quality gates" | `--test reference_audio` — 5 weight-free cases including the sign gate |
+| `ci.yml` "Test Stable Audio 3 weight-free quality gates" | `--test reference_audio` — 6 weight-free cases, including **both** sign gates |
 | `real-weights.yml` `sa3-base-identity-metal` | `--test reference_audio -- --ignored` |
 | `real-weights.yml` `sa3-base-identity-cuda` | `--test reference_audio -- --ignored` |
 

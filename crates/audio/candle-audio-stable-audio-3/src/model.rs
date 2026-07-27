@@ -1184,6 +1184,15 @@ pub const REFERENCE_STRENGTH_RANGE: (f32, f32) = (0.0, 1.0);
 /// A silent inversion here would still run, still emit plausible audio, and do the opposite of what
 /// the caller asked, which is why the sign is gated by a mutation test at the contract endpoint
 /// (`tests/reference_audio.rs`) rather than only by this table.
+///
+/// # A caller-visible consequence of the `1.0` row
+///
+/// At contract `strength = 1.0` the init noise level is `0.0`, which trips the sampler's
+/// `skip_model` short circuit: the DiT never runs, so **no `Progress::Step` is ever emitted**. A
+/// caller driving a progress bar sees zero steps and then `Progress::Decoding`. That is correct —
+/// there is genuinely nothing to step through — but it is user-visible behaviour of a documented
+/// endpoint, so it is stated here and in `docs/migration/SC_14547_REFERENCE_AUDIO_RESTYLE.md`
+/// rather than left to be discovered.
 pub fn reference_noise_level(strength: Option<f32>) -> f32 {
     1.0 - strength.unwrap_or(DEFAULT_REFERENCE_STRENGTH)
 }
@@ -1214,6 +1223,24 @@ pub fn resolve_reference_audio(request: &GenerationRequest) -> Option<ResolvedRe
             }),
             _ => None,
         })
+}
+
+/// Build the pipeline-facing [`ReferenceAudio`] a request implies — the single site where the
+/// contract's retention `strength` becomes the sampler's `init_noise_level` (sc-14547).
+///
+/// Extracted out of [`StableAudio3Generator::generate`] deliberately. `generate` needs
+/// multi-gigabyte weights, so while this construction lived inside it the **field selection** here
+/// (`noise_level`, not `strength`) was reachable only from the real-weight lane — and picking the
+/// wrong field is the exact shape of the sign inversion this feature's entire risk budget is spent
+/// on. It is now gated weight-free by `tests/reference_audio.rs`
+/// `the_request_surface_hands_the_pipeline_the_converted_noise_level`.
+pub fn reference_audio_for(request: &GenerationRequest) -> Option<ReferenceAudio<'_>> {
+    resolve_reference_audio(request).map(|reference| ReferenceAudio {
+        samples: &reference.track.samples,
+        sample_rate: reference.track.sample_rate,
+        channels: reference.track.channels,
+        noise_level: reference.noise_level,
+    })
 }
 
 /// Validate a request against one variant's own descriptor, without a snapshot.
@@ -1304,8 +1331,13 @@ fn validate_reference_audio(model_id: &str, request: &GenerationRequest) -> gen_
     if references == 0 {
         return Ok(());
     }
+    // Typed `Unsupported`, not `Msg`: "one clip only" is a statement about what this family *can
+    // do*, the same category as the `AudioEdit`-combination refusal immediately below, and this
+    // epic frames conditioning refusals as typed. The malformed-clip rejections further down stay
+    // `Msg` — those are about the caller's data, not about the model's capability. Both sides of
+    // that split are asserted by type in `tests/reference_audio.rs`.
     if references > 1 {
-        return Err(gen_core::Error::Msg(format!(
+        return Err(gen_core::Error::Unsupported(format!(
             "{model_id}: exactly one reference audio clip is supported, got {references}"
         )));
     }
@@ -1380,7 +1412,16 @@ fn validate_reference_audio(model_id: &str, request: &GenerationRequest) -> gen_
 /// the three post-trained ids and is wrong for all three base ids, and it also meant
 /// [`SamplerKind::recommended`] — the port of upstream's own rule — was dead code on the provider
 /// path.
-fn synthesis_parameters(variant: Variant, request: &GenerationRequest) -> SynthesisParameters {
+/// Resolve one request into the pipeline's own synthesis parameters.
+///
+/// `pub` (and hidden) so the weight-free lane can assert the seam that decides this path's
+/// geometry: `duration_secs` comes from `audio.target_duration`, or this variant's default, and
+/// **never** from the reference clip's extent. Everything downstream — the adapted sample size, the
+/// padded length `prepare_reference_pcm` conforms to, and the attention mask — is derived from that
+/// one number, so a source-extent leak here would be invisible in `prepare_reference_pcm`'s own
+/// output.
+#[doc(hidden)]
+pub fn synthesis_parameters(variant: Variant, request: &GenerationRequest) -> SynthesisParameters {
     let audio = request.audio.clone().unwrap_or_default();
     let method = request.guidance_method.as_deref();
     let guidance = Guidance {
@@ -1602,13 +1643,9 @@ impl Generator for StableAudio3Generator {
         };
         let mut decoding = || (progress.borrow_mut())(Progress::Decoding);
         // The one conversion between the contract's retention `strength` and the sampler's
-        // `init_noise_level` (see `reference_noise_level`).
-        let reference = resolve_reference_audio(request).map(|reference| ReferenceAudio {
-            samples: &reference.track.samples,
-            sample_rate: reference.track.sample_rate,
-            channels: reference.track.channels,
-            noise_level: reference.noise_level,
-        });
+        // `init_noise_level` (see `reference_noise_level`), and the one field selection that
+        // carries it. Both live in `reference_audio_for` so they are gated without weights.
+        let reference = reference_audio_for(request);
         let samples = pipeline.synthesize_with_reference(
             &request.prompt,
             request.negative_prompt.as_deref(),
