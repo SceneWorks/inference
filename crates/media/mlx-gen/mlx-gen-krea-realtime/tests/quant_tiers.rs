@@ -721,6 +721,21 @@ fn tier_converter_writes_a_snapshot_the_load_path_reads_back() {
     std::fs::remove_dir_all(&base).ok();
 }
 
+/// The mis-shaped-tensor count out of `verify_transformer_tensors`' summary
+/// (`"… {N} wrong-shape [{…}]"`). The literal `wrong-shape` is in that fixed format string on **every**
+/// verification failure — including one reporting `0 wrong-shape` — so only the count discriminates a
+/// shape mismatch from a missing/extra one.
+fn wrong_shape_count(msg: &str) -> usize {
+    let head = msg
+        .split(" wrong-shape")
+        .next()
+        .unwrap_or_else(|| panic!("no `wrong-shape` summary in: {msg}"));
+    head.rsplit(", ")
+        .next()
+        .and_then(|n| n.trim().parse().ok())
+        .unwrap_or_else(|| panic!("no wrong-shape count in: {msg}"))
+}
+
 /// (11) A source checkpoint whose geometry is **not** the config the snapshot would ship with is
 /// rejected **at conversion time**, on every tier — before `dit.safetensors` is written. Without the
 /// pre-write verification the emitter happily pairs any tensor set with the hard-coded 14B preset's
@@ -729,7 +744,9 @@ fn tier_converter_writes_a_snapshot_the_load_path_reads_back() {
 ///
 /// Discriminating: the identical source converts fine against its own geometry (gate 10), and the
 /// failure is asserted to leave **no output files** behind, so "it errored somewhere later" would not
-/// pass.
+/// pass. The near-miss half asserts the **counts** in the verifier's summary, not the literal word
+/// `wrong-shape` — that word is in the fixed format string of *every* verification error, including one
+/// reporting `0 wrong-shape`, so matching on it alone could not fail.
 #[test]
 fn a_geometry_mismatched_source_is_rejected_before_anything_is_written() {
     let cfg = tiny_cfg();
@@ -755,16 +772,33 @@ fn a_geometry_mismatched_source_is_rejected_before_anything_is_written() {
             "{tier}: nothing may be written when the geometry does not match"
         );
 
-        // The same rejection when the geometry differs by ONE field (a near-miss the tensor-count
-        // check alone would catch, but which the shape check must also flag).
+        // The same rejection when the geometry differs by ONE field. Doubling `ffn_dim` leaves the
+        // tensor NAMES identical, so this is caught by the SHAPE half of the verifier and nothing
+        // else — asserted as `0 missing, 0 extra, >0 wrong-shape`, the only form of the summary a
+        // name-only check could not produce.
         let mut wider = cfg.clone();
         wider.wan.ffn_dim = cfg.wan.ffn_dim * 2;
         let out = base.join(format!("near_miss_{tier}"));
         let err = convert_krea_realtime_tier_with_config(&native, &out, quantize, &wider)
             .expect_err("a one-field geometry mismatch must be rejected too");
+        let msg = err.to_string();
         assert!(
-            err.to_string().contains("wrong-shape"),
-            "{tier}: got: {err}"
+            wrong_shape_count(&msg) > 0,
+            "{tier}: a pure shape mismatch must report a NON-ZERO wrong-shape count: {msg}"
+        );
+        assert!(
+            msg.contains("0 missing [], 0 extra []"),
+            "{tier}: doubling ffn_dim changes no tensor name, so nothing may be missing or extra: \
+             {msg}"
+        );
+        // …and the mis-shaped list names the FFN Linear that actually moved.
+        assert!(
+            msg.contains("blocks.0.ffn.fc1.weight (want"),
+            "{tier}: {msg}"
+        );
+        assert!(
+            !out.join(DIT_FILE).exists() && !out.join("config.json").exists(),
+            "{tier}: nothing may be written on a near-miss geometry either"
         );
     }
 
