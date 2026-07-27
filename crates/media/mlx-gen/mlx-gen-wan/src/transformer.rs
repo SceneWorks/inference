@@ -669,7 +669,45 @@ impl AdaptableHost for WanTransformer {
     }
 }
 
+/// The whole-model (non-block) adaptable Linears in **native converted** naming — the spellings
+/// [`normalize_wan_key`](crate::adapters::normalize_wan_key) produces for a Wan-family LoRA's global
+/// targets. Paired with [`WanTransformer::global_adaptable_mut`], which routes exactly these.
+///
+/// Deliberately **not** folded into [`AdaptableHost::adaptable_paths`] for [`WanTransformer`]: that
+/// surface is also the LoRA **trainer**'s target enumeration ([`crate::training`]), so widening it would
+/// change what a Wan fine-tune can be pointed at. This is an opt-in *inference* surface a host composes
+/// in — `mlx-gen-krea-realtime` does, so a real Wan-T2V step-distill LoRA (lightx2v / FastWan) installs
+/// instead of hard-erroring as an unmatched target (sc-8446, S13). Those files carry genuine low-rank
+/// factors for **six** of these seven — `patch_embedding` ships only a `.diff_b` bias delta — which is
+/// why a real install reports 406 targets against a 407-wide surface. The list stays seven wide because
+/// it describes the Linears the model HAS, not the ones a given file happens to populate.
+pub const WAN_GLOBAL_ADAPTABLE_PATHS: &[&str] = &[
+    "patch_embedding_proj",
+    "text_embedding_0",
+    "text_embedding_1",
+    "time_embedding_0",
+    "time_embedding_1",
+    "time_projection",
+    "head.head",
+];
+
 impl WanTransformer {
+    /// Route one of the seven whole-model [`WAN_GLOBAL_ADAPTABLE_PATHS`] to its [`AdaptableLinear`], in
+    /// **native converted** naming. Returns `None` for anything else — including the per-block paths,
+    /// which [`AdaptableHost::adaptable_mut`] already routes; a host composes the two.
+    pub fn global_adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["patch_embedding_proj"] => Some(&mut self.patch_embedding),
+            ["text_embedding_0"] => Some(&mut self.text_embedding_0),
+            ["text_embedding_1"] => Some(&mut self.text_embedding_1),
+            ["time_embedding_0"] => Some(&mut self.time_embedding_0),
+            ["time_embedding_1"] => Some(&mut self.time_embedding_1),
+            ["time_projection"] => Some(&mut self.time_projection),
+            ["head", "head"] => Some(&mut self.head),
+            _ => None,
+        }
+    }
+
     pub fn from_weights(w: &Weights, cfg: &WanModelConfig) -> Result<Self> {
         let mut blocks = Vec::with_capacity(cfg.num_layers);
         for i in 0..cfg.num_layers {

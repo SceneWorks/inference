@@ -134,8 +134,93 @@ fn resolve_request_config(
 /// A memory-bounded temporal-only VAE-decode tiling for a latent of `[z, T_lat, lat_h, lat_w]` at
 /// output size `(out_h, out_w)`, or `None` when the clip is small enough to decode in one pass. Mirrors
 /// the scail2 z16 budget: window size shrinks as the resolution grows so the decode peak stays bounded,
-/// and each window is capped by the z16 **write** safety bound ([`VaeTiling::WAN::writable_frame_cap`]).
-fn decode_tiling(out_h: usize, out_w: usize, out_frames: i32) -> Option<TilingConfig> {
+/// and each window is capped by the z16 **write** safety bound (`VaeTiling::WAN`'s `writable_frame_cap`).
+///
+/// `#[doc(hidden)] pub` — reachable so a validation harness in `tests/` can decode through the **same**
+/// windowing the product path uses (sc-8446, S13; a single-pass control is not comparable to a tiled
+/// product decode, and hard-coding the window in a test would silently drift from this policy), but not
+/// part of the crate's advertised API. A dedicated `test-support` feature for one function is heavier
+/// than the problem.
+///
+/// ## 🔴 This tiling VISIBLY CORRUPTS the decode at every shipped bucket (sc-15325)
+///
+/// Measured on real latents at 832×480 / 36 output frames, decoding the **same** latent every way and
+/// comparing against a single-pass reference (`tests/generate_smoke.rs::
+/// decode_tiling_sweep_against_single_pass`). The "latent" column is what actually runs: `TilePlan::
+/// plan` divides both tile and overlap by the z16 `temporal_scale` of 4, and `split_spatial` then
+/// clamps `overlap` to `tile − 1`.
+///
+/// | tile / overlap (output) | latent tile / overlap | mean \|Δ\| /255 | clipping mean / worst | MLX active peak |
+/// |---|---|---|---|---|
+/// | single-pass | — | 0 (reference) | 0.08% / 0.25% | 85.1 GiB |
+/// | **8 / 2 — the ORIGINAL shipped value** | 2 / **0** | **18.5** | **9.7% / 26.6%** | 19.8 GiB |
+/// | **8 / 4 — what this function now emits** | 2 / **1** | 17.1 | 5.2% / 14.7% | 19.8 GiB |
+/// | 16 / 4 | 4 / 1 | 7.5 | 1.8% / 12.9% | 38.5 GiB |
+/// | 16 / 8 | 4 / 2 | 6.4 | 1.4% / 7.0% | 38.5 GiB |
+/// | 32 / 8 | 8 / 2 | 2.5 | 0.08% / 0.25% | 75.8 GiB |
+/// | 32 / 16 | 8 / 4 | 2.0 | 0.14% / 1.1% | 75.8 GiB |
+///
+/// This is not a cosmetic seam. At the original setting one frame in eight blows **26% of its pixels**
+/// to near-white with violet/green chroma separation and rainbow fringing, against 0.25% single-pass —
+/// the same latents decode to a photographic image single-pass and to a psychedelic one tiled.
+///
+/// ### Which knob — read the pairs at FIXED tile
+///
+/// ⚠️ At latent tile 2 the overlap clamp caps overlap at **1**, so `overlap = 4` is already the maximum
+/// legal value there and any larger request plans identically. The tile-2 rows therefore say nothing
+/// about how much blending is worth; only the fixed-tile pairs above it do:
+///
+/// | comparison | mean \|Δ\| | worst-frame clipping | peak |
+/// |---|---|---|---|
+/// | overlap ×2 at latent tile 4 (1→2) | 7.5 → 6.4 (**−15%**) | 12.9% → 7.0% (**−46%**) | 38.5 → 38.5 GiB |
+/// | overlap ×2 at latent tile 8 (2→4) | 2.5 → 2.0 (**−22%**) | 0.08% / 0.25% → 0.14% / 1.1% (**worse** — see note) | 75.8 → 75.8 GiB |
+/// | tile ×2 at matched overlap ratio (4/1 → 8/2) | 7.5 → 2.5 (**−67%**) | 12.9% → 0.25% | 38.5 → **75.8 GiB** |
+/// | tile ×2 at matched overlap ratio (4/2 → 8/4) | 6.4 → 2.0 (**−70%**) | 7.0% → 1.1% | 38.5 → **75.8 GiB** |
+///
+/// So **tile size dominates** (−67…−70% per doubling) but **overlap is a real secondary term**, not a
+/// negligible one. An earlier cut of this note called blending a minor contributor on the strength of
+/// the tile-2 rows; that was a degenerate comparison and the claim is withdrawn.
+///
+/// ⚠️ **The two metrics disagree in direction at latent tile 8, and that is unexplained.** Mean \|Δ\|
+/// improves with overlap in *both* pairs (−15% and −22%), and clipping improves sharply at latent tile 4
+/// (12.9% → 7.0%) — but at latent tile 8 clipping gets *worse* (0.08%/0.25% → 0.14%/1.1%). The
+/// "overlap is a real secondary term" conclusion rests on mean \|Δ\| in both pairs plus clipping at tile
+/// 4; **clipping does not corroborate it at tile 8**, and whoever designs the sc-15325 fix should know
+/// that rather than read a clean story. One plausible reading is that at 8 latent frames of context the
+/// decode is already at the reference floor and the residual differences are seam-placement noise rather
+/// than signal — but that is a hypothesis, not a measurement.
+///
+/// (The `32/8` row's `0.08% / 0.25%` is **not** the reference row copied down: it is an independent
+/// decode whose mean \|Δ\| against single-pass is 2.5/255, i.e. materially different pixels. The
+/// clipping metric simply saturates at the same floor.)
+///
+/// The practical consequence for sc-15325: **raise the tile AND scale the overlap with it.** Overlap is
+/// free in *peak* (identical 38.5 / 75.8 GiB across each pair — it changes the stride and therefore the
+/// number of passes, i.e. wall time, not the resident window), so there is no reason to buy a bigger
+/// tile and leave the overlap at 1 latent frame.
+///
+/// ### What is fixed here, and what is not
+///
+/// The overlap is now `max(tile/4, temporal_scale)` so it survives the ÷4 — free, and it roughly halves
+/// the clipping. At the shipped tile that lands on latent overlap 1, which the clamp makes the maximum
+/// available; the remaining headroom is only reachable by growing the tile. The tile is **not** raised
+/// here, because tile size *is* the memory bound (38.5 / 75.8 GiB against a whole-pipeline Q4 peak of
+/// 27.9 GiB), so raising it re-opens `mlx.minMemoryGb` for this engine **and** for `mlx-gen-scail2`,
+/// which computes the identical budget. That is a product decision about memory floors — **sc-15325**
+/// carries the full curve.
+///
+/// ### Exposure
+///
+/// `mlx-gen-scail2` computes the identical `(tile_frames / 4).max(1)` from the same pxframe budget and
+/// collapses the same way. The collapse needs `tile_frames ∈ {8, 12}` — i.e. `budget_frames < 16`, i.e.
+/// **≥ ~233k px/frame**: 640×384, 512×512, 768×512, 832×480, 1280×720 all collapse; 512×384 (budget 17
+/// → tile 16 → latent overlap 1) does **not**. Wan z16/z48 route through
+/// [`budgeted_plan`](mlx_gen::tiling::budgeted_plan) and bottom out at latent tile 8 / overlap 2 — clear
+/// by the measurements above. **LTX is NOT cleared**: its `temporal_scale` is 8, so its smallest
+/// candidate bottoms out at latent tile **3** / overlap 1 — below the latent-4 tile that still measured
+/// 6.4/255 here. Unmeasured, and on sc-15325's step 1 alongside scail2.
+#[doc(hidden)]
+pub fn decode_tiling(out_h: usize, out_w: usize, out_frames: i32) -> Option<TilingConfig> {
     let px_per_frame = (out_h as i64) * (out_w as i64);
     let budget_frames = DECODE_TILE_BUDGET_PXFRAMES / px_per_frame.max(1);
     let write_cap = VaeTiling::WAN.writable_frame_cap(out_h as i32, out_w as i32);
@@ -145,7 +230,10 @@ fn decode_tiling(out_h: usize, out_w: usize, out_frames: i32) -> Option<TilingCo
     if tile_frames >= out_frames {
         return None; // one window covers the clip → single-pass decode.
     }
-    let overlap = (tile_frames / 4).max(1);
+    // sc-15325: floor the overlap at one whole LATENT frame. `TilePlan::plan` divides by
+    // `temporal_scale`, so the previous `tile/4` gave 2 output frames ⇒ 0 latent ⇒ hard-cut windows.
+    // Free (the peak is set by `tile_frames`), and it halves the highlight clipping.
+    let overlap = (tile_frames / 4).max(TEMPORAL_STRIDE as i32);
     Some(TilingConfig::temporal_only(tile_frames, overlap))
 }
 

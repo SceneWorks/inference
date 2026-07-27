@@ -229,10 +229,11 @@ jobs:
         # links the seven real-weight-only binaries, which costs the lld budget above nothing but
         # time for zero executed cases.
         #
-        # The named eight and what they execute on a PR (measured, `cargo test -p
-        # candle-audio-stable-audio-3 --tests`): `sampler_oracle` 17, `provider` 3,
-        # `dtype_policy` 2, `conformance` 1, `primitive_oracle` 1, `same_oracle` 1,
-        # `variant_quality` 1, `listening_stimuli` 3 — 29 weight-free cases. sc-14545 review found
+        # The named nine and what they execute on a PR (measured, `cargo test -p
+        # candle-audio-stable-audio-3 --tests`): `sampler_oracle` 17, `reference_audio` 7,
+        # `provider` 3, `listening_stimuli` 3, `dtype_policy` 2, `conformance` 1,
+        # `primitive_oracle` 1, `same_oracle` 1, `variant_quality` 1 — 36 weight-free cases.
+        # sc-14545 review found
         # `sampler_oracle`, `same_oracle` and `primitive_oracle` running in no automatic lane at all
         # (19 dark gates, pre-existing since sc-14543) and added them here. sc-14546 adds
         # `provider`'s third case, which asserts each `-base` side-ratio floor sits below the sweep
@@ -248,6 +249,38 @@ jobs:
         # `model_config.json` files — run in no lane by design; the generator is a generator, not a
         # gate, and everything derived from the pool is checked weight-free in
         # `scripts/tests/test_sa3_listening_blind.py`.
+        #
+        # sc-14547 adds `reference_audio`, the audio→audio restyle target. Its seven weight-free
+        # cases carry the **sign gates** for that feature: the contract's
+        # `Conditioning::ReferenceAudio.strength` is retention-oriented and the sampler's is
+        # `init_noise_level`-oriented, so a silent inversion between them ships a feature that runs,
+        # emits plausible audio, and does the opposite of what was asked. There are three gates
+        # because there are three seams the value crosses and each is blind to the other two — three
+        # successive adversarial reviews each found the next one uncovered:
+        # `contract_strength_is_retention_and_a_flipped_sign_fails_here` catches a wrong
+        # *conversion*; `the_request_surface_hands_the_pipeline_the_converted_noise_level` catches a
+        # correct conversion whose value never travels — the provider building its `ReferenceAudio`
+        # from the retention `strength` instead of the converted `noise_level`; and
+        # `the_pipeline_hands_the_sampler_the_converted_noise_level_as_strength` catches the pipeline
+        # then handing the sampler `1.0 - noise_level`. That third one was silent to *both* the
+        # weight-free suite (the decision lived in a weights-only synthesis path) and the sampler's
+        # own `schedule[0] == strength` check, because `build_schedule` and the DiT sample call read
+        # one shared expression — first a forwarded `strength` argument, then a `let strength` local
+        # inside `sample` — so inverting it moved both sides of that comparison together. `sample`
+        # now calls `sampler_strength_for` inline at each of the two sites with no binding shared
+        # between them. All three gates are verified to fail under their own single-token mutation,
+        # not merely to pass under the correct code.
+        #
+        # Scope, stated precisely rather than as "the sign is gated at the contract endpoint": these
+        # three cases make the chain continuous from `GenerationRequest` to `sampler_strength_for` —
+        # conversion, field selection into `pipeline::ReferenceAudio`, and the strength decision
+        # itself, plus `pipeline::reference_halves_agree`, the rule that stops the encoded source and
+        # the reference from being forwarded apart. What they do **not** cover is the two
+        # `sampler_strength_for` call sites inside `StableAudio3Pipeline::sample`: that method needs
+        # weights, so no case here evaluates them. Editing one of them alone is rejected at runtime
+        # by `initialized_start`; editing both in the same way agrees with itself and is caught only
+        # by `real-weights.yml`. `docs/migration/SC_14547_REFERENCE_AUDIO_RESTYLE.md` carries the
+        # per-site mutation table.
         #
         # Deliberately **not** named, because every case in them is `#[ignore]`d behind a pinned
         # multi-GB snapshot and the target would link for zero executed tests: `base_guidance`,
@@ -270,7 +303,7 @@ jobs:
           -p candle-audio-stable-audio-3
           --test provider --test dtype_policy --test variant_quality --test conformance
           --test sampler_oracle --test same_oracle --test primitive_oracle
-          --test listening_stimuli
+          --test listening_stimuli --test reference_audio
           -- --nocapture
       - name: Test LLM-only CPU bundle
         run: cargo test --locked --no-default-features --lib -p runtime-cpu

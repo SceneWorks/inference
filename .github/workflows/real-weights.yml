@@ -10,7 +10,7 @@ on:
         type: choice
         required: true
         default: all
-        options: [all, llm, media, audio, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base]
+        options: [all, llm, media, krea-realtime, audio, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base]
 
 permissions:
   contents: read
@@ -271,6 +271,105 @@ jobs:
             ${{ runner.temp }}/mage-flow-oracles/mage_candle_oracles_manifest.json
             ${{ runner.temp }}/mage-flow-oracles/mage_candle_transfer_manifest.json
           if-no-files-found: error
+
+  # sc-8446 (epic 8431) — the FIRST real-weight video lane. Kept a separate job from `mlx-media`
+  # because that one is entirely Mage-Flow oracle machinery (a pinned reference Python, a
+  # multi-GB golden cache, an operator seed dir) that a video smoke needs none of, and because a 20 GB
+  # tier fetch should be able to fail without taking the image lane's oracle work with it.
+  mlx-krea-realtime:
+    name: MLX Krea Realtime video real weights
+    # `krea-realtime` is selectable on its own so the 20 GB tier fetch does not require running the
+    # Mage-oracle job that shares the `media` profile.
+    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'media' || inputs.profile == 'krea-realtime'
+    runs-on: [self-hosted, macOS, ARM64, real-weights]
+    env:
+      # The repo root of the pinned `SceneWorks/krea-realtime-14b-mlx` rehost. Each tier subdir is a
+      # complete snapshot, so the tests are pointed one level in (`/q4`).
+      KREA_REALTIME_SNAPSHOT: ${{ vars.KREA_REALTIME_SNAPSHOT }}
+      KREA_STYLE_LORA_SNAPSHOT: ${{ vars.KREA_STYLE_LORA_SNAPSHOT }}
+      KREA_DISTILL_LORA_SNAPSHOT: ${{ vars.KREA_DISTILL_LORA_SNAPSHOT }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Toolchain versions
+        run: rustc --version && cargo --version
+      # An unset repo variable would otherwise reach `ensure_model_snapshot.py` as an empty path and
+      # fail as a confusing "revision mismatch" rather than "you did not configure this lane".
+      - name: Require the operator-provisioned snapshot paths
+        run: |
+          for v in KREA_REALTIME_SNAPSHOT KREA_STYLE_LORA_SNAPSHOT KREA_DISTILL_LORA_SNAPSHOT; do
+            if [[ -z "${!v}" ]]; then
+              echo "Repository variable $v is unset; this lane cannot resolve its snapshot path" >&2
+              exit 1
+            fi
+            if [[ "${!v}" != /* ]]; then
+              echo "$v must be an absolute path, got: ${!v}" >&2
+              exit 1
+            fi
+          done
+      - name: Materialize and verify immutable snapshots
+        run: |
+          python3 -m pip install --disable-pip-version-check --target "$RUNNER_TEMP/huggingface-hub" "huggingface_hub==1.20.1"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model krea-realtime-14b-mlx --snapshot "$KREA_REALTIME_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model wan-origami-style-lora --snapshot "$KREA_STYLE_LORA_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model wan-lightx2v-step-distill-lora --snapshot "$KREA_DISTILL_LORA_SNAPSHOT"
+      # Coherence floor + per-chunk/whole-clip timing + the MLX memory ceiling, then the i2v
+      # single-frame anchor, the v2v strength=0 paths, and the sc-15325 decode-tiling characterization.
+      #
+      # 33 frames, not 81, and that is required rather than incidental: the sc-15325 sweep compares
+      # against a SINGLE-PASS decode, which is only valid below the z16 write cap of 56 output frames at
+      # 832x480 (the sweep asserts this itself and would fail at 81). `KREA_SMOKE_FRAMES` is set PER
+      # STEP so the one test that genuinely needs the production geometry -- the KV-cache residency,
+      # whose 6-latent-frame window must fill -- can run at 81 in its own step below.
+      - name: Run Krea Realtime real-weight e2e (Q4 tier)
+        env:
+          KREA_SMOKE_W: "832"
+          KREA_SMOKE_H: "480"
+          KREA_SMOKE_FRAMES: "33"
+        run: >-
+          KREA_REALTIME_SNAPSHOT_DIR="$KREA_REALTIME_SNAPSHOT/q4"
+          cargo test --locked --release -p mlx-gen-krea-realtime --test generate_smoke
+          -- --ignored --nocapture --test-threads 1
+          --skip kv_cache_residency_at_the_production_geometry
+      # The KV-cache residency IS a production-geometry measurement (the 6-latent-frame window must be
+      # full), so it runs at the real 81-frame clip.
+      - name: Run Krea Realtime KV-cache residency (production geometry)
+        env:
+          KREA_SMOKE_W: "832"
+          KREA_SMOKE_H: "480"
+          KREA_SMOKE_FRAMES: "81"
+        run: >-
+          KREA_REALTIME_SNAPSHOT_DIR="$KREA_REALTIME_SNAPSHOT/q4"
+          cargo test --locked --release -p mlx-gen-krea-realtime --test generate_smoke
+          kv_cache_residency_at_the_production_geometry --exact
+          -- --ignored --nocapture
+      # A published Wan style LoRA must load through `LoadSpec::adapters` and measurably change the
+      # render, with the scale-0 arm as the attribution control; and the step-distill file is the only
+      # real-weight regression gate on the sc-8446 globals-surface decision.
+      #
+      # `--exact` + a run-count assertion: selecting by bare name means a rename yields
+      # "0 passed; N filtered out" and a GREEN step, silently deleting the only coverage these have.
+      - name: Run Krea Realtime real Wan LoRA gates
+        env:
+          KREA_LORA_W: "832"
+          KREA_LORA_H: "480"
+          KREA_LORA_FRAMES: "13"
+        run: |
+          set -o pipefail
+          run_one() {
+            local name="$1"
+            local out
+            out="$(KREA_REALTIME_SNAPSHOT_DIR="$KREA_REALTIME_SNAPSHOT/q4" \
+              KREA_STYLE_LORA="$KREA_STYLE_LORA_SNAPSHOT/origami_000000500.safetensors" \
+              KREA_DISTILL_LORA="$KREA_DISTILL_LORA_SNAPSHOT/Lightx2v/lightx2v_T2V_14B_cfg_step_distill_v2_lora_rank64_bf16.safetensors" \
+              cargo test --locked --release -p mlx-gen-krea-realtime --test style_lora_real_weights \
+              "$name" --exact -- --ignored --nocapture 2>&1 | tee /dev/stderr)"
+            if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
+              echo "::error::'$name' did not run exactly one passing test — a rename would make this step vacuously green" >&2
+              return 1
+            fi
+          }
+          run_one real_wan_style_lora_loads_and_changes_the_render
+          run_one real_wan_step_distill_lora_installs_over_the_widened_globals
 
   candle-audio:
     name: Candle audio real weights
@@ -850,6 +949,28 @@ jobs:
           cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
             --test dit_oracle real_weights_detect_conditioning_mutations_and_exercise_cfg_apg \
             -- --ignored --nocapture
+      - name: Prove the audio-to-audio restyle path on all six checkpoints
+        run: |
+          # sc-14547. This job is the only lane that provisions all six snapshots, and the story's
+          # acceptance is explicitly "every registered variant", so the target lands here rather
+          # than on a per-variant job.
+          #
+          # Both ignored cases in the target run, and both are wanted:
+          #
+          #   * `real_reference_restyle_is_bounded_and_ordered_on_all_six_variants` asserts *both*
+          #     bounds the story requires — measurable retained structure at full retention and a
+          #     divergence floor at zero retention — and, in the same sweep, the strength
+          #     *direction* through the full graph. The weight-free sign gate named in `ci.yml`
+          #     proves the mapping; this proves the mapping is the one the model responds to.
+          #   * `real_initial_sampler_noise_precedes_the_source_encode` is the only observation that
+          #     separates "initial noise first, then the source encode" from the reverse. Encoding
+          #     first would move every later draw, so the same seed would sound different merely for
+          #     having a clip attached.
+          #
+          # `--nocapture` keeps the measured per-variant correlations in the log, so the floors are
+          # auditable from the run rather than only from the source.
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
+            --test reference_audio -- --ignored --nocapture
 
   sa3-small-base-metal:
     name: Stable Audio 3 small base providers (Metal)
@@ -1501,6 +1622,16 @@ jobs:
           rem ignored cases need all six snapshots on CPU or an explicit SA3_DIT_CASE_ENV selection,
           rem and wiring the rest of `dit_oracle` is sc-15235.
           cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --test dit_oracle real_weights_detect_conditioning_mutations_and_exercise_cfg_apg -- --ignored --nocapture || exit /b 1
+      - name: Prove the audio-to-audio restyle path on all six checkpoints
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          rem sc-14547. This job and its Metal twin are the only lanes provisioning all six
+          rem snapshots, and the story's acceptance is "every registered variant". Both ignored
+          rem cases run: the sweep asserts retained structure, a divergence floor, and the strength
+          rem direction through the full graph, and the draw-order case is the only observation that
+          rem separates "initial noise first, then the source encode" from the reverse.
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --test reference_audio -- --ignored --nocapture || exit /b 1
 
   sa3-small-base-cuda:
     name: Stable Audio 3 small base providers (CUDA)

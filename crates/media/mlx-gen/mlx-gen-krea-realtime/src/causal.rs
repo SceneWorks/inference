@@ -516,16 +516,47 @@ impl CausalKreaTransformer {
 /// a LoRA file speaks. Single source of truth for [`AdaptableHost::adaptable_paths`] (the kohya
 /// `flattened → dotted` table), kept in lock-step with the resolver by tests.
 ///
-/// The whole-model globals (patch/text/time embeddings, `time_projection`, `head`) are **deliberately
-/// NOT exposed** — this surface is per-block-only *by design*, not by omission. It matches the reused
-/// inner [`WanTransformer`]'s own adaptable surface, which routes only the per-block Linears, and the
-/// canonical Wan-family style LoRAs target exactly those. It is therefore **narrower** than the
-/// SCAIL-2 host, which additionally exposes globals; a global-target key surfaces here as unmatched
-/// (loud, a hard error from the strict installer), never mis-folded. Whether to widen it or relax to a
-/// soft skip is the open decision on S13 (sc-8446) / S15 (sc-15017), to be settled against a real Wan
-/// style LoRA rather than guessed at here.
+/// **The globals decision (sc-8446, S13) — SETTLED: widen, don't soft-skip.** The seven whole-model
+/// Linears (`patch_embedding`, `text_embedding.0/.2`, `time_embedding.0/.2`, `time_projection.1`,
+/// `head.head`) ARE exposed, in the same reference/file spelling a LoRA carries, and route to the reused
+/// inner [`WanTransformer`]'s own fields via [`WanTransformer::global_adaptable_mut`] — matching the
+/// SCAIL-2 host, which has always exposed its globals.
+///
+/// Settled against the safetensors headers of real published Wan LoRA files rather than a guess:
+/// * **Plain style LoRAs** (`shauray/Origami_WanLora`, `motimalu/wan-flat-color-v2`) carry exactly
+///   `num_layers × 10` per-block stems and **no** globals — they loaded on the pre-widening surface and
+///   are unaffected by it.
+/// * **Step-distill / lightning LoRAs for this very backbone** (`lightx2v` Wan2.1-T2V-14B
+///   cfg-step-distill v2 and `FastWan` T2V-14B — headers read, structurally identical) carry genuine
+///   `lora_down`/`lora_up` factors for **six** of the seven: `text_embedding.0/.2`,
+///   `time_embedding.0/.2`, `time_projection.1`, `head.head`. **`patch_embedding` carries only a
+///   `.diff_b` bias delta, no low-rank pair** — which is exactly why a real install reports **406**
+///   targets (400 per-block + 6) against a 407-wide surface, not 407. `patch_embedding` stays exposed
+///   because the surface is defined by what the model *has*, not by what one file happens to populate.
+///   On the narrow surface `apply_adapters_strict` rejected the whole file; soft-skipping the globals
+///   instead would have *silently* installed a step-distill LoRA with its text/time/output projections
+///   missing — a wrong render that still looks like a success, precisely the failure mode the strict
+///   installer exists to prevent. Widening applies them.
+///
+/// ⚠️ **Widening does NOT make a step-distill file fully applied, and this comment must not be read as
+/// claiming it does.** The same lightx2v/FastWan file carries **647 further keys the low-rank pass does
+/// not consume**: 447 `.diff_b` bias deltas (including `patch_embedding`'s) and 200 `.diff` weight
+/// deltas on the qk/`norm3` **norms**, which are not `AdaptableLinear`s at any surface width. Krea calls
+/// [`apply_adapters_strict`](mlx_gen::adapters::loader::apply_adapters_strict), not the
+/// `_with_diff_patch` variant, so those are dropped **without a word** — the same silent
+/// under-application this decision argues against, merely at a different seam. Tracked as **sc-15326**;
+/// until it lands, "a step-distill LoRA installs" means its low-rank half installs.
+///
+/// Still deliberately absent, and still a loud error: the I2V-only image cross-attention
+/// (`cross_attn.k_img`/`v_img`, which `Remade-AI/Squish`-style Wan-I2V LoRAs carry). Krea Realtime is the
+/// **T2V** backbone — those modules do not exist here at any surface width, so erroring is the honest
+/// answer, not a gap.
 pub(crate) fn krea_adaptable_paths(num_layers: usize) -> Vec<String> {
-    let mut paths = Vec::with_capacity(num_layers * 10);
+    let mut paths: Vec<String> = KREA_GLOBAL_ADAPTABLE_PATHS
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    paths.reserve(num_layers * 10);
     for i in 0..num_layers {
         for attn in ["self_attn", "cross_attn"] {
             for proj in ["q", "k", "v", "o"] {
@@ -538,16 +569,30 @@ pub(crate) fn krea_adaptable_paths(num_layers: usize) -> Vec<String> {
     paths
 }
 
+/// The whole-model adaptable targets in the **reference / LoRA-file** spelling (what a Wan-family LoRA
+/// actually names), the counterpart of [`mlx_gen_wan::WAN_GLOBAL_ADAPTABLE_PATHS`]'s converted spelling.
+/// [`normalize_wan_key`] is the bridge between the two, so this list and that one must stay in
+/// correspondence — pinned by `krea_global_paths_normalize_onto_the_wan_globals`.
+pub(crate) const KREA_GLOBAL_ADAPTABLE_PATHS: &[&str] = &[
+    "patch_embedding",
+    "text_embedding.0",
+    "text_embedding.2",
+    "time_embedding.0",
+    "time_embedding.2",
+    "time_projection.1",
+    "head.head",
+];
+
 /// Install inference LoRA(s) onto the Krea Realtime DiT as forward-time residuals (sc-15015, S14).
 /// Krea Realtime 14B is Wan-2.1-14B T2V weight-for-weight, so the family-agnostic
 /// [`mlx_gen::adapters::loader`] path resolves a diffusers / PEFT / kohya / LoKr / LoHa file directly
 /// against the DiT's module names — the same residual install the Z-Image / Qwen / SCAIL-2 providers
-/// use. Two deliberate differences from SCAIL-2, so "follows the SCAIL-2 template" is not read as
-/// "identical to it": (1) Krea's DiT is the *converted* [`WanTransformer`] (whose adaptable surface
-/// names the FFN `ffn.fc1`/`ffn.fc2`), so a reference-named key (`ffn.0`/`ffn.2`) is normalized to the
-/// converted layout via the shared Wan key-normalizer before delegating to the inner host; and (2) the
-/// exposed surface is **per-block-only by design** (see `krea_adaptable_paths`), where SCAIL-2 also
-/// exposes whole-model globals.
+/// use. One deliberate difference from SCAIL-2, so "follows the SCAIL-2 template" is not read as
+/// "identical to it": Krea's DiT is the *converted* [`WanTransformer`] (whose adaptable surface names the
+/// FFN `ffn.fc1`/`ffn.fc2` and the globals `text_embedding_0`/`patch_embedding_proj`/…), so a
+/// reference-named key is normalized to the converted layout via the shared Wan key-normalizer before
+/// routing. The **surface width now matches** SCAIL-2's: per-block Linears plus the whole-model globals
+/// (sc-8446 S13 settled this against real published Wan LoRAs — see `krea_adaptable_paths`).
 ///
 /// Adapters apply as a forward-time residual (`base(x) + scale·x·A·B`) rather than folding into the
 /// weights, which makes them **tier-agnostic** (sc-15203): the identical install runs over a dense bf16
@@ -557,13 +602,21 @@ pub(crate) fn krea_adaptable_paths(num_layers: usize) -> Vec<String> {
 /// installs adapters *after* any quantization, so the residual is a dense add over the quantized matmul.
 impl AdaptableHost for CausalKreaTransformer {
     fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
-        // Normalize the Wan reference / diffusers key (`ffn.0`→`ffn.fc1`, …) to the inner converted
-        // [`WanTransformer`] layout, then delegate to its per-block adaptable surface. `q/k/v/o` pass
-        // through unchanged; only the FFN (and the un-exposed globals) rename.
+        // Normalize the Wan reference / diffusers key to the inner converted [`WanTransformer`] layout
+        // (`ffn.0`→`ffn.fc1`, `text_embedding.0`→`text_embedding_0`, `patch_embedding`→
+        // `patch_embedding_proj`, …), then route: per-block first, then the whole-model globals
+        // (sc-8446 S13 — see `krea_adaptable_paths` for why they are exposed). `q/k/v/o` pass through
+        // the normalizer unchanged.
         let dotted = path.join(".");
         let native = normalize_wan_key(&dotted);
         let parts: Vec<&str> = native.split('.').collect();
-        self.inner.adaptable_mut(&parts)
+        // Disjoint by first segment, so this is a single borrow rather than a try-then-fall-back (which
+        // the borrow checker would reject for two `&mut self.inner` lookups in one expression).
+        if parts.first() == Some(&"blocks") {
+            self.inner.adaptable_mut(&parts)
+        } else {
+            self.inner.global_adaptable_mut(&parts)
+        }
     }
 
     fn adaptable_paths(&self) -> Vec<String> {
@@ -601,20 +654,103 @@ mod tests {
                 "`{k}` is not an adaptable Krea LoRA target"
             );
         }
-        // T2V backbone: no I2V image cross-attn (`k_img`/`v_img`) and no whole-model globals exposed.
+        // T2V backbone: the I2V-only image cross-attention does NOT exist on this model at any surface
+        // width, so it must stay unexposed (a Wan-I2V LoRA naming it is a loud, honest error).
         assert!(!paths.contains("blocks.0.cross_attn.k_img"));
-        assert!(!paths.contains("patch_embedding"));
-        assert!(!paths.contains("head.head"));
+        assert!(!paths.contains("blocks.0.cross_attn.v_img"));
+    }
+
+    /// sc-8446 S13 — the settled globals decision, pinned. A real Wan-T2V **step-distill** LoRA
+    /// (lightx2v `Wan2.1-T2V-14B` cfg-step-distill v2, `FastWan` T2V-14B) carries low-rank factors for
+    /// six of the seven whole-model Linears in exactly these file spellings (`patch_embedding` ships a
+    /// `.diff_b` bias delta only) — and every one of the seven must be an adaptable target or
+    /// `apply_adapters_strict` rejects the whole file. The surface is seven wide because it describes
+    /// the model; the *install* count is six, which is the 406-vs-407 gap pinned just below.
+    #[test]
+    fn step_distill_lora_global_target_keys_are_adaptable_paths() {
+        let paths: BTreeSet<String> = krea_adaptable_paths(40).into_iter().collect();
+        for k in [
+            "patch_embedding",
+            "text_embedding.0",
+            "text_embedding.2",
+            "time_embedding.0",
+            "time_embedding.2",
+            "time_projection.1",
+            "head.head",
+        ] {
+            assert!(
+                paths.contains(k),
+                "`{k}` is a real lightx2v/FastWan global target but is not an adaptable Krea path"
+            );
+        }
+    }
+
+    /// sc-8446 — the **406 vs 407** gap, pinned where it can be checked rather than left in a commit
+    /// message. The surface is 407 wide (400 per-block + 7 globals), but a real lightx2v / FastWan
+    /// step-distill file installs 406: `patch_embedding` ships a `.diff_b` bias delta only, with no
+    /// `lora_down`/`lora_up` pair for the low-rank pass to consume. Both facts have to stay true —
+    /// the surface must keep `patch_embedding` (the model *has* that Linear), and the expected real
+    /// install count must stay one below the surface width.
+    #[test]
+    fn step_distill_install_count_is_one_below_the_surface_width() {
+        let paths = krea_adaptable_paths(40);
+        assert_eq!(paths.len(), 407, "400 per-block + 7 globals");
+        assert!(
+            paths.iter().any(|p| p == "patch_embedding"),
+            "patch_embedding stays exposed even though step-distill files carry no low-rank pair for it"
+        );
+        // The six globals a real step-distill file DOES carry low-rank factors for.
+        let low_rank_globals = [
+            "text_embedding.0",
+            "text_embedding.2",
+            "time_embedding.0",
+            "time_embedding.2",
+            "time_projection.1",
+            "head.head",
+        ];
+        for g in low_rank_globals {
+            assert!(paths.iter().any(|p| p == g), "`{g}` must be adaptable");
+        }
+        assert_eq!(
+            400 + low_rank_globals.len(),
+            406,
+            "the expected real-weight install count for a step-distill file"
+        );
+        assert_eq!(
+            paths.len() - (400 + low_rank_globals.len()),
+            1,
+            "exactly one exposed global (patch_embedding) is unmatched by a step-distill file"
+        );
+    }
+
+    /// The file-spelled globals must normalize onto the converted spellings the inner Wan host routes —
+    /// otherwise the path list would advertise a target `adaptable_mut` cannot reach. Discriminating: it
+    /// compares the normalized set against `mlx_gen_wan`'s own constant, so a rename on either side that
+    /// is not mirrored fails here rather than silently at install time.
+    #[test]
+    fn krea_global_paths_normalize_onto_the_wan_globals() {
+        let normalized: BTreeSet<String> = KREA_GLOBAL_ADAPTABLE_PATHS
+            .iter()
+            .map(|p| normalize_wan_key(p))
+            .collect();
+        let wan: BTreeSet<String> = mlx_gen_wan::WAN_GLOBAL_ADAPTABLE_PATHS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        assert_eq!(normalized, wan);
+        // None of them normalizes into the `blocks.` namespace, which is what makes the routing split in
+        // `adaptable_mut` (first segment == "blocks") sound.
+        assert!(normalized.iter().all(|p| !p.starts_with("blocks")));
     }
 
     /// The path set must be duplicate-free AND stay collision-free under the kohya `.`→`_` flattening
     /// (the [`AdaptableHost::adaptable_paths`] contract — the `flattened → dotted` table would otherwise
-    /// lose a target). 10 per-block Linears × `num_layers`, no globals.
+    /// lose a target). 10 per-block Linears × `num_layers`, plus the 7 whole-model globals.
     #[test]
     fn krea_adaptable_paths_unique_and_kohya_collision_free() {
         let paths = krea_adaptable_paths(40);
         let n = paths.len();
-        assert_eq!(n, 40 * 10);
+        assert_eq!(n, 40 * 10 + 7);
         let uniq: BTreeSet<&String> = paths.iter().collect();
         assert_eq!(uniq.len(), n, "duplicate adaptable path");
         let flat: BTreeSet<String> = paths.iter().map(|p| p.replace('.', "_")).collect();
