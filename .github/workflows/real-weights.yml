@@ -507,7 +507,7 @@ jobs:
             --test conformance registered_provider_passes_full_audio_conformance -- --ignored --nocapture
           cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
             --test conformance concurrent_requests_are_deterministic_and_do_not_share_rng_state -- --ignored --nocapture
-      - name: Match the frozen-torch provider oracle end to end
+      - name: Match the frozen-torch provider oracle end to end (CPU-pinned, does not certify Metal)
         run: |
           # sc-14543's end-to-end parity oracle against the vendored
           # `docs/migration/sa3-small-music-provider-reference` artifact. It ran in no lane until
@@ -517,6 +517,14 @@ jobs:
           # the executable proof that the rename kept the checkpoint binding. Deterministic
           # (`Device::Cpu`, portable LCG noise, fixed seed) and measured at 20.6 s on an M-series
           # Mac against this exact pinned snapshot.
+          #
+          # This job sets `SA3_TEST_METAL`, but this step deliberately ignores it and every other
+          # `SA3_TEST_*` selector: its bounds are exact-reproduction-grade against a frozen Torch
+          # CPU-f32 artifact and are calibrated on CPU, so this step certifies frozen-Torch parity
+          # and **not** the Metal backend. The reasoning is on the test itself
+          # (`tests/provider_oracle.rs`). Metal small-music coverage comes from this job's
+          # conformance, stereo-width and render steps, which resolve their device through
+          # `candle_audio::default_device()`. This is why there is no CUDA counterpart.
           cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
             --test provider_oracle -- --ignored --nocapture
       - name: Re-calibrate the music stereo-width floor across prompts and seeds
@@ -570,6 +578,12 @@ jobs:
       # but the wrong job.
       - name: Prove music and SFX actually diverge
         run: |
+          # sc-14546: both cases in this target now run on the lane's device. The runtime half
+          # always did (it goes through `provider_registry().load(…)` ->
+          # `candle_audio::default_device()`); the single-step DiT half hardcoded `Device::Cpu` and
+          # now honours the shared `SA3_TEST_METAL`/`SA3_TEST_CUDA` selector. Its ±0.02 absolute
+          # cosine band sits far above accelerator reduced-precision noise, so nothing in it was
+          # CPU-calibrated.
           cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
             --test variant_divergence -- --ignored --nocapture
       - name: Run registered SFX provider conformance and concurrent RNG isolation on Metal
@@ -1135,6 +1149,12 @@ jobs:
         shell: cmd
         # sc-14546 moved `--test variant_binding` to `sa3-base-identity-cuda`, which provisions all
         # six pinned snapshots; every gate in that target now needs them.
+        #
+        # sc-14546 also made `single_step_dit_divergence_matches_the_frozen_torch_reference` honour
+        # `SA3_TEST_CUDA`. It hardcoded `Device::Cpu`, so this step ran two real-weight 3.45 GB DiT
+        # forwards on the CPU of a CUDA runner and certified nothing about the GPU. Its ±0.02
+        # absolute cosine band is far above accelerator reduced-precision noise, so no bound in it
+        # was CPU-calibrated.
         run: |
           call "%VCVARS%"
           cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --test variant_divergence -- --ignored --nocapture || exit /b 1

@@ -70,8 +70,18 @@ const GUIDANCE_ORACLE_SCALE: f64 = 2.5;
 /// branch predictions moves the guided result by up to `(2g − 1)·ε`. Both quantities this file
 /// compares are guided-space disagreements carrying that factor — the frozen-Torch floor at
 /// [`GUIDANCE_ORACLE_SCALE`], the recomposition residual at the base default — so converting one
-/// into a bound on the other means rescaling by the ratio of their factors. Nothing here is a
-/// tolerance: it is the same numerics read at a different guidance scale.
+/// into a bound on the other means rescaling by the ratio of their factors.
+///
+/// Be exact about what that yields: a principled cross-scale bound calibrated on two backends, not
+/// a derivation. Two caveats say why it is not stronger than that. First, the two quantities do not
+/// measure the same error — the floor is this implementation's disagreement with frozen Torch, the
+/// residual is batch-2-versus-batch-1 disagreement inside this implementation — so they are related
+/// by the shared `2g − 1` recombination by analogy, not by identity. Second,
+/// [`frozen_torch_agreement_floor`] is a `max` over three cases, two of which (`apg_scale = 1.0`
+/// and the blended rescale) do not recombine as `2g − 1` at all, so attributing factor 4 to the
+/// floor is loose in an unspecified direction. What *is* asserted is only that the scaling is
+/// fixed, derived from the two guidance scales, and device-portable — not tuned until the numbers
+/// passed.
 fn cfg_error_amplification(guidance: f64) -> f64 {
     2.0 * guidance - 1.0
 }

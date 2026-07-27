@@ -190,9 +190,18 @@ The bound is the same frozen-Torch floor, read at this comparison's own guidance
 quantities are guided-space disagreements, and `uncond + g·(cond − uncond) = g·cond − (g − 1)·uncond`
 amplifies an independent per-branch error by `2g − 1`. The floor is measured at the oracle's
 `g = 2.5` (factor 4) and the residual at the base default `g = 7` (factor 13), so the floor is scaled
-by `13/4`. That is the same numerics at a different guidance scale, not slack: the first draft used
-the unscaled floor, which passed on Metal and **failed on CPU** (residual `5.05e-3` against a floor
-of `4.03e-3`) — a Metal-only bound, exactly the accident the rescaling removes.
+by `13/4`.
+
+That makes it a principled cross-scale bound calibrated on two backends — not a derivation, and the
+difference matters. The two quantities do not measure the same error: the floor is this
+implementation's disagreement with frozen Torch, the residual is batch-2-versus-batch-1 disagreement
+inside this implementation. They are related through the shared `2g − 1` recombination by analogy,
+not by identity. The floor is also a `max` over three oracle cases, two of which (`apg_scale = 1.0`
+and the blended rescale) do not recombine as `2g − 1`, so attributing factor 4 to it is loose in an
+unspecified direction. What the rescaling is *not* is slack bought to make the gate pass: the first
+draft used the unscaled floor, which passed on Metal and **failed on CPU** (residual `5.05e-3`
+against a floor of `4.03e-3`) — a Metal-only bound, exactly the accident the rescaling removes — and
+the closest mis-wiring still overshoots the rescaled bound by 6,690x.
 
 | | frozen-Torch floor (`g = 2.5`) | rescaled bound (`g = 7`) | correct recomposition | swapped halves | weight as `g − 1` | negative mask dropped |
 |---|---:|---:|---:|---:|---:|---:|
@@ -221,15 +230,97 @@ fixed-guidance frozen-Torch parity.
 
 ## Device selection
 
-Every real-weight SA3 target now honours the same three-way selector — `SA3_TEST_METAL`, then
-`SA3_TEST_CUDA` (hard-failing without `--features cuda`), then `Device::Cpu` — that `same_oracle.rs`
-and `chunked_oracle.rs` already carried. `base_guidance.rs`, `sampler_oracle.rs` and `dit_oracle.rs`
-branched on `SA3_TEST_METAL` alone, so on the CUDA lanes they silently ran on `Device::Cpu`: this
-story's headline gate and the frozen-Torch floor it derives, both documented as measured "on this
-exact checkpoint, device and dtype", were not measuring the CUDA lane's device at all. A requested
-backend that is unavailable is now a hard failure, never a fallback. `dtype_policy.rs` selects by
-cargo feature rather than env var, and `dit_oracle.rs`'s `all_six_cpu_f32_predictions_match_p0` pins
-`Device::Cpu` by name; both are deliberate and unchanged.
+There is no blanket rule here, so this section enumerates instead of asserting one. Three mechanisms
+exist in `crates/audio/candle-audio-stable-audio-3/tests/`, and all 15 targets in that directory
+appear below. Several targets split across mechanisms case by case — `variant_divergence.rs`,
+`base_guidance.rs`, `dit_oracle.rs`, `text_oracle.rs` and `real_snapshots.rs` each do — and those
+splits are itemized rather than rounded to a single row.
+
+The list is meant to be checked against the tree, not taken on faith:
+
+```
+grep -n 'Device::Cpu\|Device::new_metal\|Device::new_cuda\|SA3_TEST_' \
+  crates/audio/candle-audio-stable-audio-3/tests/*.rs
+```
+
+enumerates every site that names a device, which is exactly mechanisms A and C. A real-weight case
+that appears in neither is mechanism B by construction — it never names a device, so there is nothing
+for that grep to find.
+
+**Mechanism A — the three-way env selector.** `SA3_TEST_METAL`, then `SA3_TEST_CUDA` (which panics
+without `--features cuda`), then `Device::Cpu`. A requested backend that is unavailable is a hard
+failure, never a fallback.
+
+| target | real-weight cases on the selector | lanes that select the target |
+|---|---|---|
+| `same_oracle.rs` | 11 of 11 (`test_device`) | `same-l-{metal,cuda}` and `same-chunked-metal` name 4 of the 11 between them, by bare name filter rather than `--test`; the other 7 run in no lane (pre-existing) |
+| `chunked_oracle.rs` | 2 of 2 (`test_device`) | `same-chunked-metal` names both |
+| `sampler_oracle.rs` | 3 of 3 (`test_device`) | `sa3-base-identity-{metal,cuda}` names 2 of the 3; `real_default_sampler_resource_probe` runs in no lane |
+| `dit_oracle.rs` | 4 of 6 (`device`) — `small_music_intermediates_and_frozen_v_zero_padding_match`, `real_weights_detect_conditioning_mutations_and_exercise_cfg_apg`, `selected_real_device_prediction_matches_p0`, `selected_real_device_resource_probe` | `sa3-base-identity-{metal,cuda}` names only `real_weights_detect_conditioning_mutations_and_exercise_cfg_apg`; the other 3 run in no lane (sc-15235) |
+| `base_guidance.rs` | 2 of 4 (`device`) — the two that build a `StableAudio3Dit` directly | `sa3-base-identity-{metal,cuda}` |
+| `variant_divergence.rs` | 1 of 2 (`test_device`) — `single_step_dit_divergence_matches_the_frozen_torch_reference` | `sa3-small-sfx-{metal,cuda}` |
+
+sc-14546 added the selector to `base_guidance.rs`, `sampler_oracle.rs`, `dit_oracle.rs` and
+`variant_divergence.rs`. The first three had branched on `SA3_TEST_METAL` alone, so on the CUDA lanes
+they silently ran on `Device::Cpu` — including this story's headline gate and the frozen-Torch floor
+it derives, both documented as measured "on this exact checkpoint, device and dtype".
+`variant_divergence.rs` read no `SA3_TEST_*` variable at all: its DiT half hardcoded `Device::Cpu`
+while `sa3-small-sfx-metal` **and** `sa3-small-sfx-cuda` both selected the whole target, so two
+real-weight 3.45 GB DiT forwards ran on each runner's CPU and certified neither backend. Its
+tolerance is a ±0.02 *absolute* band on a cosine the frozen reference pins into `0.5 … 0.75`, i.e.
+about ±3% relative against a ~1e-3 relative accelerator matmul delta on a globally normalized
+aggregate, so nothing in it was CPU-calibrated and the switch is safe.
+
+Measured rather than argued: with the switch in place, `cargo test --release -p
+candle-audio-stable-audio-3 --features metal --test variant_divergence -- --ignored` passes both
+cases on an M-series Mac in 29.39 s. The DiT cosine reads **0.601294** on Metal against a frozen
+Torch reference of 0.601294 — agreement to the printed six decimals, well inside the ±0.02 band. The
+runtime half is unchanged and reproduces its committed envelope exactly (max `|cos|` 0.062972 against
+a 0.15 threshold, min RMS delta 1.290740 against 0.9), as do both discriminating controls
+(shared-weight null `cos` = 1.000000 / delta 0.000000; partial-blend control `cos` = 0.250000). The
+same target with `SA3_TEST_CUDA=1` and no `--features cuda` fails closed on
+`SA3_TEST_CUDA requires --features cuda`, which is the proof the env read is live rather than dead
+code.
+
+**Mechanism B — resolved for them, by the loader.** These cases never name a device. They go through
+`provider_registry().load(…)` / `load_variant(…)` and inherit `candle_audio::default_device()`, which
+is chosen by cargo feature — CUDA under `--features cuda`, else Metal under `--features metal`, else
+CPU. On a `--features metal` lane they run on Metal, on a `--features cuda` lane on CUDA, with no env
+var involved. Or they touch no tensor at all.
+
+| target | cases | note |
+|---|---|---|
+| `conformance.rs` | 12 real-weight | registry `load` into `gen_core_testkit::audio_conformance` |
+| `provider.rs` | 13 real-weight | registry `load` |
+| `variant_quality.rs` | 1 real-weight | registry `load` |
+| `variant_binding.rs` | 13 real-weight | Names no device anywhere, and needs none: `load_variant` (`model.rs:1312`) validates the pinned checkpoint identity **without reading weights**, and the remaining cases read `SnapshotLayout` config/headers. No tensor is ever constructed, so there is no device to select |
+| `variant_divergence.rs` | 1 of 2 | the runtime half, `music_and_sfx_produce_materially_different_audio_from_the_same_prompt_and_seed` — the same file's DiT half is mechanism A |
+| `base_guidance.rs` | 2 of 4 | `the_request_negative_prompt_is_inert_at_guidance_one_and_material_at_the_base_default` goes through the registry; `the_shipped_configs_record_the_operating_point_each_half_of_the_family_defaults_to` reads configs only |
+| `text_oracle.rs` | 1 of 2 | `actual_metal_policy_matches_canonical_cpu_f32_oracle` calls `default_device()` **and asserts the result is not `Device::Cpu`** |
+| `dtype_policy.rs` | 1 real-weight | its `device()` is a `cfg(feature = …)` ladder, not an env read. Deliberate and unchanged: the target's subject *is* the per-backend dtype policy, so the backend must follow the build, not an env var |
+| `real_snapshots.rs` | 1 of 2 | `shipped_dit_config_fails_closed_for_every_unsupported_branch` is config validation with no tensors |
+
+**Mechanism C — deliberately pinned to `Device::Cpu`, with the reason.** These do not honour
+`SA3_TEST_*`, and must not. This is the complete list of hardcoded-CPU real-weight sites in the
+crate.
+
+| site | reason |
+|---|---|
+| `provider_oracle.rs` `thirty_second_eight_step_provider_matches_frozen_torch` | Bit-reproduction against a frozen Torch CPU-f32 artifact, not backend certification: portable host-LCG noise so no device RNG can enter, and bounds calibrated on CPU f32 — latent cosine `>= 0.99999`, exact-latent decode `max_abs <= 1e-3` and `mean_abs <= 1e-4`, `deltas_gt_0.1 == 0` across 1,323,000 stereo frames. A reduced-precision accelerator matmul across eight sampler steps plus a full VAE decode would break them. **`sa3-small-music-metal` selects this target while setting `SA3_TEST_METAL`, so that step does not certify Metal** — the job step and the test's doc comment now both say so. Metal small-music coverage comes from that job's conformance, stereo-width and render steps (all mechanism B). There is deliberately no CUDA counterpart. |
+| `dit_oracle.rs` `all_six_cpu_f32_predictions_match_p0` | The canonical-precision leg of a deliberate pair: it sweeps all six checkpoints against the frozen P0 artifact in CPU f32, while its twin `selected_real_device_prediction_matches_p0` runs one selected checkpoint against the same artifact on `device()`. Putting the sweep on the selector would delete the CPU-f32 leg rather than add coverage. Already documented in place at `dit_oracle.rs`'s `device()` doc comment before this story. Runs in no lane (sc-15235). |
+| `dit_oracle.rs` `all_six_consume_every_dit_and_number_conditioner_tensor_exactly` | A tensor-name consumption audit through a tracking `VarBuilder`. It asserts set equality over tensor names and no numerics at all, so the device is unobservable in the result; CPU is the cheapest. Runs in no lane (sc-15235). |
+| `text_oracle.rs` `actual_cpu_f32_fallback_matches_transformers_oracle` | The CPU-f32 fallback path is the subject of the test, named in the test. Runs in no lane (sc-15235). |
+| `primitive_oracle.rs` `actual_checkpoints_match_locked_primitive_oracle` | Per-primitive element-wise parity against the locked sc-14536 CPU-f32 `primitives.safetensors`, under per-primitive `max_abs` limits. Same class as `provider_oracle.rs`: the limits are exact-reproduction-grade and calibrated on CPU. Pre-existing; runs in no lane. |
+| `real_snapshots.rs` `all_eight_configs_and_real_headers_match` | Parses configs and safetensors headers. `mmap_builders` is constructed but no forward runs, so no kernel executes on any device. Runs in no lane (sc-15235). |
+| `variant_divergence.rs` `reference_divergence()` (helper, not a test) | Reads the committed frozen-Torch artifacts and reduces them to host `f64` scalars. No model runs; an accelerator round-trip would change the transport, not the quantity. |
+
+Weight-free cases inside these targets — `sampler_oracle.rs`'s 17 scalar/synthetic cases,
+`same_oracle.rs`'s `frozen_upstream_two_stage_model_locks_override_list_execution_order`,
+`primitive_oracle.rs`'s `frozen_upstream_missing_branches_match`, `provider.rs`'s and
+`conformance.rs`'s and `variant_quality.rs`'s non-`#[ignore]` cases, and `dtype_policy.rs`'s
+`compute_policy_resolves_to_full_precision_on_every_backend` (which names all three devices because
+it asserts the policy table itself) — construct their own small tensors on `Device::Cpu` and are the
+weight-free PR lane in `ci.yml`. They are out of scope for this section.
 
 ## CI
 

@@ -59,8 +59,15 @@ fn path(name: &str) -> PathBuf {
 ///
 /// Branching on `SA3_TEST_METAL` alone would run every case that calls this on `Device::Cpu` inside
 /// the CUDA lanes, which set `SA3_TEST_CUDA`. A requested backend that is unavailable is a hard
-/// failure, never a fallback. `all_six_cpu_f32_predictions_match_p0` pins `Device::Cpu` by name and
-/// deliberately does not use this.
+/// failure, never a fallback.
+///
+/// Two of this file's six cases deliberately do not use it. `all_six_cpu_f32_predictions_match_p0`
+/// pins `Device::Cpu` by name: it is the canonical-precision leg of a pair whose twin,
+/// `selected_real_device_prediction_matches_p0`, runs one selected checkpoint against the same
+/// frozen P0 artifact through this selector — moving the sweep here would delete the CPU-f32 leg
+/// rather than add coverage. `all_six_consume_every_dit_and_number_conditioner_tensor_exactly` pins
+/// `Device::Cpu` because it asserts set equality over consumed tensor *names* and no numerics at
+/// all, so the device is unobservable in its result and CPU is the cheapest.
 fn device() -> Device {
     if std::env::var_os("SA3_TEST_METAL").is_some() {
         Device::new_metal(0).expect("SA3_TEST_METAL requested but Metal is unavailable")
