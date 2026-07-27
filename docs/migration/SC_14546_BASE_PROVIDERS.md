@@ -253,7 +253,7 @@ failure, never a fallback.
 
 | target | real-weight cases on the selector | lanes that select the target |
 |---|---|---|
-| `same_oracle.rs` | 11 of 11 (`test_device`) | `same-l-{metal,cuda}` and `same-chunked-metal` name 4 of the 11 between them, by bare name filter rather than `--test`; the other 7 run in no lane (pre-existing) |
+| `same_oracle.rs` | 11 of 11 (`test_device`) | `same-l-{metal,cuda}` name 4 of the 11 by bare name filter rather than `--test`, and `sa3-medium-metal` re-runs 2 of those 4 for their embedded branch; the other 7 run in no lane (pre-existing) |
 | `chunked_oracle.rs` | 2 of 2 (`test_device`) | `same-chunked-metal` names both |
 | `sampler_oracle.rs` | 3 of 3 (`test_device`) | `sa3-base-identity-{metal,cuda}` names 2 of the 3; `real_default_sampler_resource_probe` runs in no lane |
 | `dit_oracle.rs` | 4 of 6 (`device`) — `small_music_intermediates_and_frozen_v_zero_padding_match`, `real_weights_detect_conditioning_mutations_and_exercise_cfg_apg`, `selected_real_device_prediction_matches_p0`, `selected_real_device_resource_probe` | `sa3-base-identity-{metal,cuda}` names only `real_weights_detect_conditioning_mutations_and_exercise_cfg_apg`; the other 3 run in no lane (sc-15235) |
