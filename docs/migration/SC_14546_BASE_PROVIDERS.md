@@ -192,25 +192,41 @@ amplifies an independent per-branch error by `2g − 1`. The floor is measured a
 `g = 2.5` (factor 4) and the residual at the base default `g = 7` (factor 13), so the floor is scaled
 by `13/4`.
 
-That makes it a principled cross-scale bound calibrated on two backends — not a derivation, and the
+That makes it a principled cross-scale bound calibrated on three backends — not a derivation, and the
 difference matters. The two quantities do not measure the same error: the floor is this
 implementation's disagreement with frozen Torch, the residual is batch-2-versus-batch-1 disagreement
 inside this implementation. They are related through the shared `2g − 1` recombination by analogy,
 not by identity. The floor is also a `max` over three oracle cases, two of which (`apg_scale = 1.0`
 and the blended rescale) do not recombine as `2g − 1`, so attributing factor 4 to it is loose in an
 unspecified direction. What the rescaling is *not* is slack bought to make the gate pass: the first
-draft used the unscaled floor, which passed on Metal and **failed on CPU** (residual `5.05e-3`
-against a floor of `4.03e-3`) — a Metal-only bound, exactly the accident the rescaling removes — and
-the closest mis-wiring still overshoots the rescaled bound by 6,690x.
+draft used the unscaled floor, which passed on Metal and **failed on every other backend measured**
+(CPU residual `5.05e-3` against a floor of `4.03e-3`; CUDA `3.524780e-3` against `3.471375e-3`) — a
+Metal-only bound, exactly the accident the rescaling removes — and the closest mis-wiring still
+overshoots the rescaled bound by 6,690x.
 
 | | frozen-Torch floor (`g = 2.5`) | rescaled bound (`g = 7`) | correct recomposition | swapped halves | weight as `g − 1` | negative mask dropped |
 |---|---:|---:|---:|---:|---:|---:|
 | Metal | 3.684998e-3 | 1.1976e-2 | **6.1035e-5** | 1140.78 | 87.75 | 454.28 |
+| CUDA | 3.471375e-3 | 1.1282e-2 | **3.524780e-3** | 1140.82 | 87.76 | 454.29 |
 | CPU | 4.028320e-3 | 1.3092e-2 | **5.050659e-3** | 1138.90 | 87.61 | 454.05 |
+
+Which rows are *enforced* and which are reference matters, because sc-14546 changed it. `base_guidance`
+now honours `SA3_TEST_CUDA`, so the two lanes that run this gate — `sa3-base-identity-metal` and
+`sa3-base-identity-cuda` — pin the Metal and CUDA rows, and **no lane measures the CPU row any more**.
+The CPU row is retained because it is the row that motivated the rescaling and is still reproducible
+locally with no `SA3_TEST_*` set; the Metal and CUDA figures are from
+run [30259152906](https://github.com/SceneWorks/inference/actions/runs/30259152906).
+
+The CUDA row is also what stops "the unscaled bound was a Metal-only accident" from reading as a
+CPU-only quirk. The CUDA residual, `3.524780e-3`, **exceeds its own unscaled floor**, `3.471375e-3` —
+so the first draft's bound would have failed on the CUDA lane too, not just on CPU. The rescaling was
+necessary on both non-Metal backends; Metal's `6.1035e-5` residual, two orders of magnitude under its
+floor, is the outlier.
 
 Every one of those mis-wirings diverges from the no-negative render just as loudly as the correct
 wiring, so every one passes step 3 — and overshoots this bound by at least 6,690x (the closest,
-`g − 1` on CPU), while the correct recomposition stays under it on both backends.
+`g − 1` on CPU; 7,328x on Metal and 7,779x on CUDA), while the correct recomposition stays under it
+on all three backends.
 
 `tests/dit_oracle.rs`'s `real_weights_detect_conditioning_mutations_and_exercise_cfg_apg` is the
 third leg: it is the only case that separates *absent* negative conditioning — which takes the
@@ -239,13 +255,48 @@ splits are itemized rather than rounded to a single row.
 The list is meant to be checked against the tree, not taken on faith:
 
 ```
-grep -n 'Device::Cpu\|Device::new_metal\|Device::new_cuda\|SA3_TEST_' \
-  crates/audio/candle-audio-stable-audio-3/tests/*.rs
+cd crates/audio/candle-audio-stable-audio-3/tests
+grep -c 'Device::Cpu\|Device::new_metal\|Device::new_cuda' *.rs
 ```
 
-enumerates every site that names a device, which is exactly mechanisms A and C. A real-weight case
-that appears in neither is mechanism B by construction — it never names a device, so there is nothing
-for that grep to find.
+```text
+base_guidance.rs:4
+chunked_oracle.rs:3
+conformance.rs:0
+dit_oracle.rs:8
+dtype_policy.rs:6
+primitive_oracle.rs:6
+provider.rs:0
+provider_oracle.rs:1
+real_snapshots.rs:1
+same_oracle.rs:4
+sampler_oracle.rs:15
+text_oracle.rs:3
+variant_binding.rs:0
+variant_divergence.rs:6
+variant_quality.rs:0
+```
+
+That is every site in the directory that names a device, which is a **superset** of mechanisms A and
+C — not a match for them. Read it with three qualifications, all of them consequences of rows the
+tables below already carry:
+
+- Two mechanism-B rows legitimately name devices, for the reasons given in their table entries:
+  `text_oracle.rs:166` asserts `!matches!(device, Device::Cpu)` — naming CPU in order to reject it —
+  and `dtype_policy.rs:158-166` is a `cfg(feature = …)` ladder whose subject *is* the per-backend
+  dtype policy. Neither is an env read, so neither is mechanism A.
+- The weight-free cases called out at the end of this section contribute most of the volume, and are
+  out of scope for the tables. 11 of `sampler_oracle.rs`'s 15 are scalar/synthetic `Device::Cpu`
+  tensors (the other 4 are its selector); 5 of `primitive_oracle.rs`'s 6 likewise (the sixth,
+  `:25`, is its mechanism-C loader); and `dtype_policy.rs:328-336` names all three devices because
+  it asserts the policy table itself.
+- Do **not** widen the pattern to `SA3_TEST_`. That alternative also matches the render-knob env
+  vars, which name no device: `provider.rs`, a pure mechanism-B target, contributes 11 hits that way
+  (`SA3_TEST_DURATION`/`STEPS`/`PROMPT`/`SEED`) and would read as a false mechanism-A entry. Use
+  `SA3_TEST_METAL\|SA3_TEST_CUDA` if you want the selector sites specifically.
+
+The four zeros are the load-bearing part: `conformance.rs`, `provider.rs`, `variant_binding.rs` and
+`variant_quality.rs` name no device at all, which is mechanism B by construction.
 
 **Mechanism A — the three-way env selector.** `SA3_TEST_METAL`, then `SA3_TEST_CUDA` (which panics
 without `--features cuda`), then `Device::Cpu`. A requested backend that is unavailable is a hard
