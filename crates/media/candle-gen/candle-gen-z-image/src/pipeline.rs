@@ -55,8 +55,10 @@ use std::sync::Arc;
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::sampling::TimestepConvention;
+use candle_gen::gen_core::tiling::{TilingConfig, VaeTiling};
 use candle_gen::gen_core::{
-    self, AdapterSpec, Conditioning, GenerationRequest, Image, PidWeights, Progress,
+    self, AdapterSpec, CancelFlag, Conditioning, GenerationRequest, Image, LoadPhase, PidWeights,
+    Progress,
 };
 // Shared per-image batch seed (`base + index`) — one home in `candle-gen` (sc-9043 / F-059).
 use candle_gen::{CandleError, Result};
@@ -107,6 +109,24 @@ impl DiT {
             Self::Packed(m) => m.forward(x, t, cap_feats, cap_mask),
         }
     }
+
+    pub(crate) fn forward_with_attention_budget(
+        &self,
+        x: &Tensor,
+        t: &Tensor,
+        cap_feats: &Tensor,
+        cap_mask: &Tensor,
+        attention_scores_budget: usize,
+    ) -> candle_gen::candle_core::Result<Tensor> {
+        match self {
+            // The dense stock model has no explicit budget seam. Its resident behavior stays
+            // unchanged; every sequential tier is loaded through the vendored arm below.
+            Self::Dense(m) => m.forward(x, t, cap_feats, cap_mask),
+            Self::Packed(m) => {
+                m.forward_with_attention_budget(x, t, cap_feats, cap_mask, attention_scores_budget)
+            }
+        }
+    }
 }
 
 /// The Qwen3 text encoder, dense (stock) or packed (vendored [`PackedTe`], sc-9408). Same
@@ -128,6 +148,25 @@ impl TextEnc {
 /// Z-Image-Turbo is guidance-distilled to a fixed 4-step schedule; used when a request omits
 /// `steps`. Matches `mlx-gen-z-image`'s `DEFAULT_STEPS`.
 pub(crate) const DEFAULT_STEPS: usize = 4;
+
+/// Z-Image's still-image AutoencoderKL geometry for the shared Candle tile planner. The decoder
+/// upsamples spatially by 8; the synthetic temporal axis stays at one. `full_res_channels` is
+/// conservative and is not used by this fixed 512/128 spatial plan.
+const Z_IMAGE_VAE_TILING: VaeTiling = VaeTiling {
+    spatial_scale: 8,
+    temporal_scale: 1,
+    causal_temporal: false,
+    full_res_channels: 128,
+};
+
+/// Bound the sequential packed-tier attention scores working set to 64 Mi elements. At 1024² the
+/// normal 1e9-element guard is still a single pass; this lower quality-preserving budget chunks
+/// independent query rows and releases roughly a gigabyte of transient CUDA storage.
+const Z_IMAGE_CONSTRAINED_ATTN_SCORES_BUDGET: usize = 64 * 1024 * 1024;
+
+fn check_decode_tile(cancel: &CancelFlag) -> Result<()> {
+    candle_gen::check_cancel(cancel)
+}
 
 /// Base (non-Turbo) Z-Image default steps — undistilled foundation model. The card recommends 28–50;
 /// 50 matches the reference `ZImagePipeline` example (`num_inference_steps=50`) and the mlx base
@@ -227,6 +266,60 @@ pub(crate) struct Components {
     pid: Option<Arc<PidEngine>>,
 }
 
+/// The prompt-encode phase kept physically separate on the sequential path. The tokenizer is small,
+/// but owning it here gives the phase one unambiguous lifetime and avoids a process cache silently
+/// retaining an encoder handle after its embeddings have been materialized.
+pub(crate) struct TextPhase {
+    text_encoder: TextEnc,
+    tokenizer: TextTokenizer,
+}
+
+/// Execute the three accelerator-residency phases with explicit scopes. Synchronization happens
+/// before every model drop, including error exits, so queued CUDA work cannot outlive the weights it
+/// references or race the next phase's allocator reuse.
+#[allow(clippy::too_many_arguments)]
+fn run_three_stage<Text, Encoded, Renderer, Latents, Decoder, Output>(
+    cancel: &CancelFlag,
+    device: &Device,
+    on_progress: &mut dyn FnMut(Progress),
+    load_text: impl FnOnce() -> Result<Text>,
+    encode: impl FnOnce(&Text) -> Result<Encoded>,
+    load_renderer: impl FnOnce() -> Result<Renderer>,
+    denoise: impl FnOnce(&Renderer, Encoded, &mut dyn FnMut(Progress)) -> Result<Latents>,
+    load_decoder: impl FnOnce() -> Result<Decoder>,
+    decode: impl FnOnce(&Decoder, Latents, &mut dyn FnMut(Progress)) -> Result<Output>,
+) -> Result<Output> {
+    candle_gen::check_cancel(cancel)?;
+    on_progress(Progress::Loading(LoadPhase::TextEncoder));
+    let text = load_text()?;
+    let encoded = encode(&text);
+    let text_sync = device.synchronize();
+    drop(text);
+    let encoded = encoded?;
+    text_sync?;
+
+    candle_gen::check_cancel(cancel)?;
+    on_progress(Progress::Loading(LoadPhase::Renderer));
+    let renderer = load_renderer()?;
+    let latents = denoise(&renderer, encoded, on_progress);
+    let renderer_sync = device.synchronize();
+    drop(renderer);
+    let latents = latents?;
+    renderer_sync?;
+
+    candle_gen::check_cancel(cancel)?;
+    // `Renderer` is the stable public heavy-component phase. Emitting it again marks the physically
+    // separate VAE load without expanding the exhaustive contract enum.
+    on_progress(Progress::Loading(LoadPhase::Renderer));
+    let decoder = load_decoder()?;
+    let output = decode(&decoder, latents, on_progress);
+    let decoder_sync = device.synchronize();
+    drop(decoder);
+    let output = output?;
+    decoder_sync?;
+    Ok(output)
+}
+
 impl Pipeline {
     /// Build the (light) pipeline handle for the Z-Image snapshot `root` at the given device/dtype,
     /// with `adapters` to merge into the DiT. Does **no** weight I/O — components load lazily via
@@ -265,6 +358,74 @@ impl Pipeline {
             adapters: Vec::new(),
             pid_spec: None,
             comfyui: Some(sources),
+        }
+    }
+
+    /// Load only the tokenizer + Qwen3 text encoder. This is the first sequential-residency phase and
+    /// is also reused by the resident aggregate loader so both policies build identical components.
+    pub(crate) fn load_text_phase(&self) -> Result<TextPhase> {
+        if self.comfyui.is_some() {
+            return Err(CandleError::Msg(
+                "z-image sequential residency is unavailable for bespoke ComfyUI component loads"
+                    .into(),
+            ));
+        }
+        let text_encoder = if self.component_is_packed("text_encoder")? {
+            let vb = self.component_vb("text_encoder")?;
+            TextEnc::Packed(Box::new(PackedTe::new(&TextEncoderConfig::z_image(), vb)?))
+        } else {
+            let vb = self.component_vb("text_encoder")?;
+            TextEnc::Dense(Box::new(ZImageTextEncoder::new(
+                &TextEncoderConfig::z_image(),
+                vb,
+            )?))
+        };
+        let tokenizer = common::build_tokenizer(&self.root, "z-image")?;
+        Ok(TextPhase {
+            text_encoder,
+            tokenizer,
+        })
+    }
+
+    /// Load only the DiT denoiser through the vendored implementation. Unlike the resident aggregate,
+    /// the sequential ladder must use this path for both packed and dense tiers so its explicit
+    /// attention-score budget is honored by bf16 as well as q4/q8.
+    pub(crate) fn load_transformer(&self, use_accelerated_attn: bool) -> Result<DiT> {
+        if self.comfyui.is_some() {
+            return Err(CandleError::Msg(
+                "z-image sequential residency is unavailable for bespoke ComfyUI component loads"
+                    .into(),
+            ));
+        }
+        let mut dit_cfg = DitConfig::z_image_turbo();
+        dit_cfg.set_use_accelerated_attn(use_accelerated_attn);
+        let vb = self.component_vb("transformer")?;
+        let mut dit = PackedDit::new(&dit_cfg, vb)?;
+        if !self.adapters.is_empty() {
+            crate::adapters::install_additive(&mut dit, &self.adapters)?;
+        }
+        Ok(DiT::Packed(Box::new(dit)))
+    }
+
+    /// Load only the native AutoencoderKL decoder. Packed tiers dequantize their tiny mid-block
+    /// attention projections exactly as the historical resident aggregate did.
+    pub(crate) fn load_vae(&self) -> Result<AutoEncoderKL> {
+        if self.comfyui.is_some() {
+            return Err(CandleError::Msg(
+                "z-image sequential residency is unavailable for bespoke ComfyUI component loads"
+                    .into(),
+            ));
+        }
+        if self.component_is_packed("vae")? {
+            Ok(AutoEncoderKL::new(
+                &VaeConfig::z_image(),
+                self.vae_vb_dequantized(self.dtype)?,
+            )?)
+        } else {
+            Ok(AutoEncoderKL::new(
+                &VaeConfig::z_image(),
+                self.component_vb("vae")?,
+            )?)
         }
     }
 
@@ -329,7 +490,7 @@ impl Pipeline {
         // dense (from the packed parts — no dense tier downloaded) and feeds the STOCK VAE. A dense VAE
         // mmaps as before.
         let vae = if self.component_is_packed("vae")? {
-            AutoEncoderKL::new(&VaeConfig::z_image(), self.vae_vb_dequantized()?)?
+            AutoEncoderKL::new(&VaeConfig::z_image(), self.vae_vb_dequantized(self.dtype)?)?
         } else {
             AutoEncoderKL::new(&VaeConfig::z_image(), self.component_vb("vae")?)?
         };
@@ -483,12 +644,12 @@ impl Pipeline {
     /// passing every other (already-dense) tensor through unchanged — so the stock `AutoEncoderKL` loads
     /// without seeing a `.weight` u32/`.scales`/`.biases` triple it can't read. The dequant is ~2 MB of
     /// one-time work (the sc-9408 pragmatic VAE path — see [`crate::quant::dequant_packed_to_dense`]).
-    fn vae_vb_dequantized(&self) -> Result<VarBuilder<'static>> {
+    fn vae_vb_dequantized(&self, dtype: DType) -> Result<VarBuilder<'static>> {
         use candle_gen::candle_core::safetensors::MmapedSafetensors;
         let files = self.component_files("vae")?;
         // SAFETY: mmap of read-only weight files; standard candle loading path.
         let st = unsafe { MmapedSafetensors::multi(&files)? };
-        let src = VarBuilder::from_backend(Box::new(st), self.dtype, self.device.clone());
+        let src = VarBuilder::from_backend(Box::new(st), dtype, self.device.clone());
 
         // Collect every tensor, dequantizing the packed attention triples and dropping their
         // `.scales`/`.biases` siblings; pass all other tensors through at their native dtype.
@@ -507,21 +668,17 @@ impl Pipeline {
             }
             if let Some(base) = key.strip_suffix(".weight") {
                 if packed_bases.contains(base) {
-                    let dense = crate::quant::dequant_packed_to_dense(
-                        &src,
-                        base,
-                        &self.device,
-                        self.dtype,
-                    )?;
+                    let dense =
+                        crate::quant::dequant_packed_to_dense(&src, base, &self.device, dtype)?;
                     tensors.insert(key.clone(), dense);
                     continue;
                 }
             }
             // Dense tensor — load it through at its stored dtype/device.
             let t = st2.load(&key, &self.device)?;
-            tensors.insert(key.clone(), t.to_dtype(self.dtype)?);
+            tensors.insert(key.clone(), t.to_dtype(dtype)?);
         }
-        Ok(VarBuilder::from_tensors(tensors, self.dtype, &self.device))
+        Ok(VarBuilder::from_tensors(tensors, dtype, &self.device))
     }
 
     /// Resolve the sorted list of `.safetensors` files in the snapshot component subdir `sub`
@@ -555,8 +712,12 @@ impl Pipeline {
     /// distribution **mean** deterministically. Only built on the first img2img request (cached by the
     /// generator), so the txt2img / Turbo path never pays for it.
     pub(crate) fn load_vae_encoder(&self) -> Result<VaeEncoder> {
-        let files = self.component_files("vae")?;
-        let vb = candle_gen::mmap_var_builder(&files, ENC_DTYPE, &self.device)?;
+        let vb = if self.component_is_packed("vae")? {
+            self.vae_vb_dequantized(ENC_DTYPE)?
+        } else {
+            let files = self.component_files("vae")?;
+            candle_gen::mmap_var_builder(&files, ENC_DTYPE, &self.device)?
+        };
         Ok(VaeEncoder::new(&VaeConfig::z_image(), vb.pp("encoder"))?)
     }
 
@@ -627,6 +788,164 @@ impl Pipeline {
     ) -> Result<Tensor> {
         let ids = common::uncond_ids(tok, negative_prompt, "z-image")?;
         self.encode_cap(te, &ids)
+    }
+
+    /// Render the generic Turbo route under true three-stage sequential residency:
+    /// Qwen3 encode/drop, DiT denoise/drop, then seam-blended tiled VAE decode/drop. A reference
+    /// request gets one additional, explicitly-scoped VAE-encoder phase before prompt encoding.
+    pub(crate) fn render_sequential(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Vec<Image>> {
+        let steps = req.steps.map(|s| s as usize).unwrap_or(DEFAULT_STEPS);
+        let reference = resolve_reference(req)?;
+        let start_step = match &reference {
+            Some((_, strength)) => init_time_step(steps, *strength),
+            None => 0,
+        };
+
+        let clean = if start_step > 0 {
+            candle_gen::check_cancel(&req.cancel)?;
+            on_progress(Progress::Loading(LoadPhase::Renderer));
+            let encoder = self.load_vae_encoder()?;
+            let encoded = match reference {
+                Some((image, _)) => self.encode_reference(&encoder, image, req.width, req.height),
+                None => unreachable!("start_step > 0 implies a reference"),
+            };
+            let sync = self.device.synchronize();
+            drop(encoder);
+            let encoded = encoded?;
+            sync?;
+            Some(encoded)
+        } else {
+            None
+        };
+
+        run_three_stage(
+            &req.cancel,
+            &self.device,
+            on_progress,
+            || self.load_text_phase(),
+            |text| self.text_embeddings(&text.text_encoder, &text.tokenizer, &req.prompt),
+            // sc-9032: accelerated attention is not currently wired; match the resident path's
+            // effective false value exactly.
+            || self.load_transformer(false),
+            |transformer, cap, on_progress| {
+                self.denoise_sequential(
+                    req,
+                    transformer,
+                    &cap,
+                    clean.as_ref(),
+                    start_step,
+                    on_progress,
+                )
+            },
+            || self.load_vae(),
+            |vae, latents, on_progress| {
+                latents
+                    .iter()
+                    .map(|latent| {
+                        candle_gen::check_cancel(&req.cancel)?;
+                        on_progress(Progress::Decoding);
+                        self.decode_tiled(vae, latent, &req.cancel)
+                    })
+                    .collect()
+            },
+        )
+    }
+
+    /// Denoise every requested seed while only the DiT and materialized prompt embedding are live.
+    /// Final latents are tiny relative to model weights and survive into the VAE phase.
+    fn denoise_sequential(
+        &self,
+        req: &GenerationRequest,
+        transformer: &DiT,
+        cap: &Tensor,
+        clean: Option<&Tensor>,
+        start_step: usize,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Vec<Tensor>> {
+        let steps = req.steps.map(|s| s as usize).unwrap_or(DEFAULT_STEPS);
+        let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
+        let lat_h = (req.height / SPATIAL_SCALE) as usize;
+        let lat_w = (req.width / SPATIAL_SCALE) as usize;
+
+        candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
+            let noise = common::seed_noise(seed, lat_h, lat_w, &self.device, self.dtype)?;
+            let image_seq_len =
+                ((lat_h as u32 / PATCH_SIZE) * (lat_w as u32 / PATCH_SIZE)) as usize;
+            let mu = calculate_shift(
+                image_seq_len,
+                BASE_IMAGE_SEQ_LEN,
+                MAX_IMAGE_SEQ_LEN,
+                BASE_SHIFT,
+                MAX_SHIFT,
+            );
+            let mut scheduler =
+                FlowMatchEulerDiscreteScheduler::new(SchedulerConfig::z_image_turbo());
+            scheduler.set_timesteps(steps, Some(mu));
+            let native: Vec<f32> = scheduler.sigmas.iter().map(|&s| s as f32).collect();
+            let sigmas =
+                candle_gen::resolve_flow_schedule(req.scheduler.as_deref(), 0.0, steps, &native);
+            let start = start_step.min(sigmas.len().saturating_sub(1));
+            let x_t = match clean {
+                Some(clean) => {
+                    let sigma_start = sigmas[start] as f64;
+                    (clean.affine(1.0 - sigma_start, 0.0)? + noise.affine(sigma_start, 0.0)?)?
+                }
+                None => noise,
+            };
+            let prepared = prepare_inputs(&x_t, std::slice::from_ref(cap), &self.device)?;
+            let cap_feats = prepared.cap_feats;
+            let cap_mask = prepared.cap_mask;
+            candle_gen::run_flow_sampler(
+                req.sampler.as_deref(),
+                TimestepConvention::OneMinusSigma,
+                &sigmas[start..],
+                prepared.latents,
+                seed,
+                &req.cancel,
+                on_progress,
+                |latents, t| -> Result<Tensor> {
+                    let t_tensor = Tensor::from_vec(vec![t], (1,), &self.device)?;
+                    Ok(transformer
+                        .forward_with_attention_budget(
+                            latents,
+                            &t_tensor,
+                            &cap_feats,
+                            &cap_mask,
+                            Z_IMAGE_CONSTRAINED_ATTN_SCORES_BUDGET,
+                        )?
+                        .neg()?)
+                },
+            )
+        })
+    }
+
+    /// Decode a final latent with 512 px tiles and 128 px overlap. The shared tile planner's
+    /// trapezoidal partition-of-unity blend preserves exact output dimensions and suppresses
+    /// boundary-convolution seams while bounding the CUDA working set to one tile.
+    fn decode_tiled(
+        &self,
+        vae: &AutoEncoderKL,
+        latents: &Tensor,
+        cancel: &CancelFlag,
+    ) -> Result<Image> {
+        let cfg = TilingConfig::spatial_only(512, 128);
+        let decoded = candle_gen::vae_tiling::decode_tiled(
+            Z_IMAGE_VAE_TILING,
+            "z-image AutoencoderKL",
+            latents,
+            &cfg,
+            |tile| -> Result<Tensor> {
+                check_decode_tile(cancel)?;
+                let tile = tile.squeeze(2)?;
+                let decoded = vae.decode(&tile)?.to_dtype(DType::F32)?;
+                Ok(decoded.unsqueeze(2)?)
+            },
+        )?;
+        common::decoded_to_image(&decoded.squeeze(2)?)
     }
 
     /// Render `req` against pre-loaded `components`, emitting per-step progress and honoring
@@ -925,6 +1244,199 @@ impl Pipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct DropTag {
+        name: &'static str,
+        events: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+    }
+
+    impl Drop for DropTag {
+        fn drop(&mut self) {
+            self.events.lock().unwrap().push(self.name);
+        }
+    }
+
+    /// The custom Z-Image ladder has three physical model lifetimes, not the shared two-phase
+    /// text/heavy aggregate. Lock the exact load/use/drop ordering and repeated heavy-phase progress
+    /// marker without weights or a GPU.
+    #[test]
+    fn three_stage_runner_drops_each_model_before_loading_the_next() {
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut progress = Vec::new();
+        let output = run_three_stage(
+            &CancelFlag::default(),
+            &Device::Cpu,
+            &mut |p| progress.push(p),
+            || {
+                events.lock().unwrap().push("load_text");
+                Ok(DropTag {
+                    name: "drop_text",
+                    events: events.clone(),
+                })
+            },
+            |_| {
+                events.lock().unwrap().push("encode");
+                Ok(7usize)
+            },
+            || {
+                events.lock().unwrap().push("load_dit");
+                Ok(DropTag {
+                    name: "drop_dit",
+                    events: events.clone(),
+                })
+            },
+            |_, encoded, _| {
+                assert_eq!(encoded, 7);
+                events.lock().unwrap().push("denoise");
+                Ok(11usize)
+            },
+            || {
+                events.lock().unwrap().push("load_vae");
+                Ok(DropTag {
+                    name: "drop_vae",
+                    events: events.clone(),
+                })
+            },
+            |_, latents, _| {
+                assert_eq!(latents, 11);
+                events.lock().unwrap().push("decode");
+                Ok(13usize)
+            },
+        )
+        .unwrap();
+        assert_eq!(output, 13);
+        assert_eq!(
+            *events.lock().unwrap(),
+            [
+                "load_text",
+                "encode",
+                "drop_text",
+                "load_dit",
+                "denoise",
+                "drop_dit",
+                "load_vae",
+                "decode",
+                "drop_vae",
+            ]
+        );
+        assert_eq!(
+            progress,
+            [
+                Progress::Loading(LoadPhase::TextEncoder),
+                Progress::Loading(LoadPhase::Renderer),
+                Progress::Loading(LoadPhase::Renderer),
+            ]
+        );
+    }
+
+    /// An error inside a phase still drops that phase's model and never loads the next one. This is
+    /// the cache-poisoning regression guard for cancellation/OOM/error exits.
+    #[test]
+    fn three_stage_runner_cleans_up_on_phase_error() {
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let result: Result<()> = run_three_stage(
+            &CancelFlag::default(),
+            &Device::Cpu,
+            &mut |_| {},
+            || {
+                events.lock().unwrap().push("load_text");
+                Ok(DropTag {
+                    name: "drop_text",
+                    events: events.clone(),
+                })
+            },
+            |_| Err(CandleError::Msg("encode failed".into())),
+            || -> Result<DropTag> { panic!("DiT must not load after a text-phase error") },
+            |_, (), _| Ok(()),
+            || -> Result<DropTag> { panic!("VAE must not load after a text-phase error") },
+            |_, (), _| Ok(()),
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            *events.lock().unwrap(),
+            ["load_text", "drop_text"],
+            "the failed phase must be evicted and later phases must not start"
+        );
+    }
+
+    /// Cancellation raised after one decode tile must stop before the next tile and still evict the
+    /// active decoder. This exercises the exact per-tile guard used by the production tiled VAE.
+    #[test]
+    fn three_stage_runner_cleans_up_when_decode_is_canceled() {
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let cancel = CancelFlag::default();
+        let cancel_during_decode = cancel.clone();
+        let result: Result<()> = run_three_stage(
+            &cancel,
+            &Device::Cpu,
+            &mut |_| {},
+            || {
+                Ok(DropTag {
+                    name: "drop_text",
+                    events: events.clone(),
+                })
+            },
+            |_| Ok(()),
+            || {
+                Ok(DropTag {
+                    name: "drop_dit",
+                    events: events.clone(),
+                })
+            },
+            |_, (), _| Ok(()),
+            || {
+                events.lock().unwrap().push("load_vae");
+                Ok(DropTag {
+                    name: "drop_vae",
+                    events: events.clone(),
+                })
+            },
+            |_, (), _| {
+                check_decode_tile(&cancel_during_decode)?;
+                events.lock().unwrap().push("decode_tile_0");
+                cancel_during_decode.cancel();
+                check_decode_tile(&cancel_during_decode)?;
+                events.lock().unwrap().push("decode_tile_1");
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            *events.lock().unwrap(),
+            [
+                "drop_text",
+                "drop_dit",
+                "load_vae",
+                "decode_tile_0",
+                "drop_vae",
+            ],
+            "cancel must prevent later tiles and evict the decoder"
+        );
+    }
+
+    /// The production 1024² decode plan must tile both axes, preserve exact dimensions, and form a
+    /// partition of unity across every overlap. This locks the Z-Image-specific geometry and blend
+    /// parameters independently of the shared tiling crate's own generic tests.
+    #[test]
+    fn sequential_vae_tile_plan_is_seam_blended_and_dimension_exact() {
+        let cfg = TilingConfig::spatial_only(512, 128);
+        let plan = cfg.plan(Z_IMAGE_VAE_TILING, 1, 128, 128);
+        assert_eq!((plan.out_h, plan.out_w), (1024, 1024));
+        assert!(plan.h.len() > 1 && plan.w.len() > 1);
+
+        for (axis, tiles) in [("height", &plan.h), ("width", &plan.w)] {
+            let mut weights = vec![0.0f32; 1024];
+            for tile in tiles {
+                for (offset, value) in tile.mask.iter().enumerate() {
+                    weights[tile.out_start as usize + offset] += value;
+                }
+            }
+            assert!(
+                weights.iter().all(|weight| (*weight - 1.0).abs() < 1e-5),
+                "{axis} blend weights must sum to one at every output pixel"
+            );
+        }
+    }
 
     /// `component_is_packed` detects the `quantization` block a packed MLX tier writes into a component
     /// `config.json` (sc-9408) and returns false for a dense config or a missing file — the seam that
