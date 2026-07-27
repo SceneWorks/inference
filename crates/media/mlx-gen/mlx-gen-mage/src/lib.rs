@@ -98,6 +98,8 @@ pub mod training;
 // ---------------------------------------------------------------------------------------------
 pub use config::{MageFlowConfig, QwenVlTextConfig, FAMILY};
 pub use model::{descriptor_for, MageVariant, MODEL_IDS};
+// sc-15036: the fine-tuned-checkpoint entrypoint + the component ids a caller must stage for it.
+pub use model::{load_finetuned, COMPONENT_TEXT_ENCODER, COMPONENT_VAE, REQUIRED_COMPONENTS};
 pub use text_encoder::{Conditioning, MageTextEncoder, PromptKind, Qwen3VlTextEncoder};
 
 pub use vae::{MageVae, VaePart};
