@@ -27,17 +27,30 @@
 //!   -- --ignored --nocapture emit_tier_sharded_and_validate_every_shard
 //! ```
 //!
-//! Publishing the validated snapshot (operator step, outside the test binary) — the whole tier
-//! directory, so `config.json` and the stock-Wan companions go up with the DiT and the remote tier is
-//! never left partial:
+//! Publishing the validated snapshot (operator step, outside the test binary).
+//!
+//! **A published tier needs FIVE files, and they come from TWO local directories.** The emitter writes
+//! only the DiT and `config.json` into the tier dir; the stock-Wan companions are staged separately
+//! (Krea Realtime ships transformer-only, and the same three companion files are shared by every
+//! tier, so they are not copied per tier). Nothing stages them into the tier dir, so publishing is
+//! **two uploads to the same remote prefix**:
 //!
 //! ```text
+//! # 1. the tier itself: dit.safetensors (or transformer/) + config.json
 //! hf upload SceneWorks/krea-realtime-14b-mlx ~/.cache/krea-realtime-mlx-q4 q4 --repo-type model
+//! # 2. the shared stock-Wan components: t5_encoder.safetensors + vae.safetensors + tokenizer.json
+//! hf upload SceneWorks/krea-realtime-14b-mlx ~/.cache/krea-realtime-mlx-companions q4 \
+//!   --repo-type model --exclude ".cache/*"
 //! ```
 //!
+//! Both are required: after only the first, the remote tier is incomplete and will not load. Run
+//! `companions_are_staged_for_publishing` to check the companion directory before uploading.
+//!
 //! On a host too small to hold a whole tier, publish shard-by-shard instead: that is what the
-//! `on_shard` callback on `convert_krea_realtime_tier_sharded` is for — upload the shard and delete it
-//! inside the callback, then upload `config.json` + the companions once at the end.
+//! `on_shard` callback on `convert_krea_realtime_tier_sharded` is for — verify the shard, upload it,
+//! and delete it inside the callback, then upload `config.json` + the companions once at the end.
+//! `KREA_REHOST_DELETE_SHARDS=1` runs that exact sequence here (minus the upload) so the disk-bounded
+//! flow is exercised, not just described.
 //!
 //! Env:
 //!   * `KREA_REALTIME_CHECKPOINT` (**required**) — path to the native checkpoint: the single-file
@@ -276,6 +289,12 @@ fn emit_tier_sharded_and_validate_every_shard() {
         .map(|g| g * 1024 * 1024 * 1024)
         .unwrap_or(DEFAULT_SHARD_BYTES);
 
+    // Delete-as-you-go: the disk-bounded flow an operator runs on a host too small for the whole
+    // tier. Keeping the shards is the default (it allows the whole-directory checks below), but the
+    // two paths must not diverge — with this set, the test exercises exactly the sequence the module
+    // doc directs operators to, so the flow is verified rather than merely described.
+    let delete_after_check = std::env::var("KREA_REHOST_DELETE_SHARDS").is_ok();
+
     let cfg = KreaRealtimeConfig::krea_realtime_14b();
     // The sanitized source, to compare each shard against as it lands.
     let source = sanitize_krea_realtime_transformer(read_native(&src)).expect("sanitize source");
@@ -285,12 +304,22 @@ fn emit_tier_sharded_and_validate_every_shard() {
     let shards =
         convert_krea_realtime_tier_sharded(&src, &dst, quant, &cfg, budget, &mut |shard| {
             let bytes = std::fs::metadata(shard).expect("shard metadata").len();
-            let compared = check_shard_against_source(shard, &source, &label);
+            // Verify BEFORE the shard can be handed off/removed — this is the only per-shard
+            // integrity check in the delete-as-you-go flow.
+            let compared = check_shard_against_source(shard, &source, &label, quant);
             checked += compared;
+            if delete_after_check {
+                std::fs::remove_file(shard).expect("remove the checked shard");
+            }
             println!(
-                "  shard {} ({:.2} GB): {compared} tensor(s) bit-exact vs. source",
+                "  shard {} ({:.2} GB): {compared} tensor(s) exact vs. source{}",
                 shard.file_name().unwrap().to_string_lossy(),
                 bytes as f64 / 1e9,
+                if delete_after_check {
+                    " — checked, then deleted"
+                } else {
+                    ""
+                }
             );
             Ok(())
         })
@@ -306,6 +335,23 @@ fn emit_tier_sharded_and_validate_every_shard() {
         t0.elapsed(),
         dst.display()
     );
+
+    if delete_after_check {
+        // The shards are gone by design; the per-shard checks above were the verification. Prove the
+        // flow really did bound the footprint rather than silently keeping everything.
+        let dir = dst.join(mlx_gen_krea_realtime::TRANSFORMER_DIR);
+        let left = std::fs::read_dir(&dir).map_or(0, |rd| {
+            rd.filter(|e| {
+                e.as_ref().is_ok_and(|e| {
+                    e.path().extension().and_then(|s| s.to_str()) == Some("safetensors")
+                })
+            })
+            .count()
+        });
+        assert_eq!(left, 0, "{label}: delete-as-you-go left {left} shard(s)");
+        println!("tier {label}: delete-as-you-go verified; peak footprint was one shard");
+        return;
+    }
 
     // Hold the sharded tier to the SAME bar as the single-file one: it must load back through the
     // production path at the tier it claims, and reconstruct the source weights.
@@ -327,18 +373,38 @@ fn emit_tier_sharded_and_validate_every_shard() {
     check_tier_reconstructs_the_source(&src, &dir, &label, quant);
 }
 
-/// Read `shard` back off disk and bit-exact-compare its tensors against the sanitized `source`,
-/// returning how many were compared.
+/// Do `a` and `b` differ in **any** element? Element-wise `!=` reduced with `any`, staying in the
+/// tensors' own dtype — a cast-to-f32 difference would compare u32 code words at only 24 bits of
+/// integer precision, and `as_slice` would expose the physical buffer and ignore strides.
+fn tensors_differ(a: &Array, b: &Array) -> bool {
+    a.ne(b)
+        .expect("elementwise ne")
+        .any(None)
+        .expect("any")
+        .item::<bool>()
+}
+
+/// Read `shard` back off disk and exact-compare its tensors against the sanitized `source`, returning
+/// how many were compared. `quant` is the tier being emitted, and it changes the rules:
 ///
-/// Only tensors that are **pass-through** at this tier are comparable — on a packed tier the predicate
-/// Linears hold u32 codes that by construction differ from the source's bf16, so the rule is "same key,
-/// same dtype, same shape ⇒ must be identical". A handful per shard is enough: this exists to catch a
-/// bad split or a bad write in *this* shard, and the whole-tier content check runs afterwards.
+/// * **Dense (`None`)** — nothing is packed, so the shard must be a faithful subset of the source:
+///   every key present, exact dtype, exact shape, exact values, and **no** `.scales`/`.biases`
+///   companion is legitimate. Being tier-blind here would silently `continue` past a genuinely
+///   wrong-dtype or wrong-shape tensor.
+/// * **Packed (`Some`)** — the predicate Linears hold u32 codes that by construction differ from the
+///   source's bf16, so those are skipped (the whole-tier dequantize check covers them) and a
+///   `.scales`/`.biases` companion is legitimate iff its `{base}.weight` came from the source. The
+///   pass-through tensors are still compared exactly, capped at a handful per shard.
 ///
-/// Every key must still be *accounted for*: it is either a source key, or a `.scales`/`.biases`
-/// companion that quantization created for a source `{base}.weight`. Anything else means the shard
-/// holds a tensor the source never had.
-fn check_shard_against_source(shard: &Path, source: &HashMap<String, Array>, label: &str) -> usize {
+/// This is what makes the delete-as-you-go flow verifiable: it runs on the shard while it is still on
+/// disk, before an operator's callback would upload and remove it.
+fn check_shard_against_source(
+    shard: &Path,
+    source: &HashMap<String, Array>,
+    label: &str,
+    quant: Option<(i32, i32)>,
+) -> usize {
+    let packed_tier = quant.is_some();
     let w = Weights::from_file(shard).expect("read the shard back");
     let mut names: Vec<&str> = w.keys().collect();
     names.sort();
@@ -347,25 +413,47 @@ fn check_shard_against_source(shard: &Path, source: &HashMap<String, Array>, lab
     for name in names {
         let got = w.require(name).expect("key from keys()");
         let Some(want) = source.get(name) else {
-            // A packed companion is legitimate iff its base weight came from the source.
+            // A packed companion is legitimate iff its base weight came from the source — and only
+            // on a packed tier. On a dense tier there are no companions at all.
             let base = name
                 .strip_suffix(".scales")
                 .or_else(|| name.strip_suffix(".biases"));
-            let ok = base.is_some_and(|b| source.contains_key(&format!("{b}.weight")));
+            let ok =
+                packed_tier && base.is_some_and(|b| source.contains_key(&format!("{b}.weight")));
             assert!(
                 ok,
                 "{label}: shard {shard:?} holds `{name}`, which is neither a source tensor nor a \
-                 quantization companion of one"
+                 quantization companion legitimate at this tier"
             );
             continue;
         };
-        if compared >= 8 || got.dtype() != want.dtype() || got.shape() != want.shape() {
-            continue; // packed at this tier — covered by the dequantize check on the whole tier
+
+        if packed_tier {
+            // Only the packed predicate Linears may differ in dtype/shape; everything else must match
+            // exactly, and the cap keeps the per-shard cost bounded.
+            if got.dtype() != want.dtype() || got.shape() != want.shape() {
+                continue; // covered by the whole-tier dequantize check
+            }
+            if compared >= 8 {
+                continue;
+            }
+        } else {
+            // Dense tier: nothing is packed, so a dtype/shape difference is a real defect.
+            assert_eq!(
+                got.dtype(),
+                want.dtype(),
+                "{label}: shard {shard:?} tensor `{name}` dtype differs from the source on a dense tier"
+            );
+            assert_eq!(
+                got.shape(),
+                want.shape(),
+                "{label}: shard {shard:?} tensor `{name}` shape differs from the source on a dense tier"
+            );
         }
-        assert_eq!(
-            max_abs(&got.subtract(want).expect("sub")),
-            0.0,
-            "{label}: shard {shard:?} tensor `{name}` does not match the source bit for bit"
+
+        assert!(
+            !tensors_differ(got, want),
+            "{label}: shard {shard:?} tensor `{name}` does not match the source exactly"
         );
         compared += 1;
     }
@@ -378,6 +466,53 @@ fn companions_dir() -> PathBuf {
     std::env::var("KREA_REHOST_COMPANIONS")
         .map(PathBuf::from)
         .unwrap_or_else(|_| home().join(".cache/krea-realtime-mlx-companions"))
+}
+
+/// The stock-Wan files a published tier needs **in addition to** what the emitter writes. They live in
+/// their own staged directory, not the tier directory, so publishing a tier is two uploads to the same
+/// remote prefix (see the module doc).
+const COMPANION_FILES: [&str; 3] = [
+    "t5_encoder.safetensors",
+    "vae.safetensors",
+    "tokenizer.json",
+];
+
+/// The emitter's own output — the rest of what a published tier needs. A single-file tier has
+/// `dit.safetensors`; a sharded one has `transformer/` instead.
+const TIER_FILES: [&str; 2] = ["config.json", DIT_FILE];
+
+/// A published tier is complete only if BOTH local directories are uploaded to the same remote prefix.
+/// The emitter writes [`TIER_FILES`] into the tier dir and nothing stages [`COMPANION_FILES`] there,
+/// so uploading the tier dir alone yields a remote tier that will not load. This is the cheap
+/// pre-publish check (no weights are loaded); `stock_wan_companions_load_at_the_krea_geometry` is the
+/// expensive one that proves they are the right components.
+#[test]
+#[ignore = "needs the staged Wan companions; run with --ignored (see module doc)"]
+fn companions_are_staged_for_publishing() {
+    let root = companions_dir();
+    for name in COMPANION_FILES {
+        let p = root.join(name);
+        let len = std::fs::metadata(&p)
+            .unwrap_or_else(|e| panic!("companion {} missing: {e}", p.display()))
+            .len();
+        assert!(len > 0, "companion {} is empty", p.display());
+    }
+    // The tier directory does NOT carry them — the thing the two-upload publish step exists for.
+    let tier = out_dir(&tier().0);
+    if tier.is_dir() {
+        for name in COMPANION_FILES {
+            assert!(
+                !tier.join(name).exists(),
+                "unexpected: {name} is in the tier dir; the publish doc says it is uploaded separately"
+            );
+        }
+    }
+    println!(
+        "companions staged at {} ({:?}); tier dir supplies {:?}",
+        root.display(),
+        COMPANION_FILES,
+        TIER_FILES
+    );
 }
 
 /// Krea Realtime ships **transformer-only**: the text encoder, VAE and tokenizer are the stock Wan 2.1

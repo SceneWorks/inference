@@ -833,20 +833,16 @@ fn sharded_emitter_matches_the_single_file_emitter_and_holds_one_shard_at_a_time
         );
 
         // Names matching is not the same as bytes matching: a shard that wrote the right keys with
-        // the wrong payload would pass the comparison above and load fine. Compare VALUES, bit for
-        // bit, across the whole set — at this geometry that is cheap.
+        // the wrong payload would pass the comparison above and load fine. Compare VALUES, exactly,
+        // across the whole set — at this geometry that is cheap.
         for name in &want {
             let a = sw.get(name).unwrap();
             let b = fw.get(name).unwrap();
             assert_eq!(a.dtype(), b.dtype(), "{tier}/{name}: dtype");
             assert_eq!(a.shape(), b.shape(), "{tier}/{name}: shape");
-            assert_eq!(
-                max_abs_diff(
-                    &a.as_dtype(Dtype::Float32).unwrap(),
-                    &b.as_dtype(Dtype::Float32).unwrap()
-                ),
-                0.0,
-                "{tier}/{name}: sharded bytes must equal the single-file emit bit for bit"
+            assert!(
+                !tensors_differ(a, b),
+                "{tier}/{name}: sharded bytes must equal the single-file emit exactly"
             );
         }
 
@@ -865,6 +861,96 @@ fn sharded_emitter_matches_the_single_file_emitter_and_holds_one_shard_at_a_time
             "{tier}: the sharded snapshot must resolve to the emitted tier"
         );
     }
+
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// Do `a` and `b` differ in **any** element? Element-wise `!=` reduced with `any`, which stays in the
+/// tensors' own dtype.
+///
+/// Deliberately not a cast-to-f32 difference: on a packed tier the `{base}.weight` tensors hold **u32**
+/// code words, and f32 carries only 24 bits of integer precision — two code words differing in their
+/// low bits above 2^24 would compare equal, exactly where a bad split is least visible. It also avoids
+/// `as_slice`, which exposes the physical buffer and ignores strides.
+fn tensors_differ(a: &Array, b: &Array) -> bool {
+    a.ne(b)
+        .expect("elementwise ne")
+        .any(None)
+        .expect("any")
+        .item::<bool>()
+}
+
+/// The tensor comparison used above must discriminate **u32 packed code words**, which is precisely
+/// where a cast-to-f32 difference goes blind: f32 has 24 bits of integer mantissa, so `2^24` and
+/// `2^24 + 1` are the *same* f32. Packed Q4/Q8 weights are full-range u32, so a split or write bug
+/// that perturbed a high code word would be invisible to an f32 compare while the tensor still loaded
+/// and still had the right shape.
+///
+/// This is the mutation check for `tensors_differ` in permanent form: swap it for a
+/// `max_abs_diff(a.as_dtype(f32), b.as_dtype(f32)) == 0.0` implementation and this test fails.
+#[test]
+fn tensor_comparison_sees_u32_code_words_that_f32_cannot_distinguish() {
+    let a = Array::from_slice(&[1u32 << 24, 7, 9], &[3]);
+    let b = Array::from_slice(&[(1u32 << 24) + 1, 7, 9], &[3]);
+
+    // The premise: f32 really cannot tell these apart.
+    assert_eq!(
+        max_abs_diff(
+            &a.as_dtype(Dtype::Float32).unwrap(),
+            &b.as_dtype(Dtype::Float32).unwrap()
+        ),
+        0.0,
+        "premise: the f32 cast collapses 2^24 and 2^24+1"
+    );
+    // The comparison we actually use does not.
+    assert!(
+        tensors_differ(&a, &b),
+        "u32 code words differing above 2^24 must be reported as different"
+    );
+    // …and it does not cry wolf on identical data.
+    assert!(
+        !tensors_differ(&a, &a.deep_clone()),
+        "identical u32 buffers"
+    );
+
+    // Float tensors still compare exactly too.
+    let x = Array::from_slice(&[1.0f32, 2.0, 3.0], &[3]);
+    let y = Array::from_slice(&[1.0f32, 2.0, 3.5], &[3]);
+    assert!(tensors_differ(&x, &y));
+    assert!(!tensors_differ(&x, &x.deep_clone()));
+}
+
+/// **Emitting into the source directory is refused.** The module doc accepts a sharded `transformer/`
+/// dir as a conversion *source*, and MLX safetensors loads are lazy — so if that dir were also the
+/// destination, the stale-shard clear would delete the very files the not-yet-materialized tensors are
+/// about to be read from. Discriminating: the source here is a real sharded tier dir that would
+/// otherwise be cleared, so without the guard this either shreds the input or emits from freed data.
+#[test]
+fn emitting_into_the_source_directory_is_refused() {
+    let cfg = tiny_cfg();
+    let base = std::env::temp_dir().join(format!("krea_shard_selfsrc_{}", std::process::id()));
+    let native = write_native_checkpoint(&cfg, &base);
+    let out = base.join("tier");
+
+    // Build a real sharded tier, then try to use its own transformer/ dir as the source.
+    convert_krea_realtime_tier_sharded(&native, &out, None, &cfg, 4096, &mut |_| Ok(())).unwrap();
+    let shard_dir = out.join(TRANSFORMER_DIR);
+    let before = std::fs::read_dir(&shard_dir).unwrap().count();
+    assert!(before > 0, "fixture must have shards to protect");
+
+    let err =
+        convert_krea_realtime_tier_sharded(&shard_dir, &out, None, &cfg, 4096, &mut |_| Ok(()))
+            .expect_err("emitting into the source directory must be refused");
+    assert!(
+        err.to_string().contains("source directory"),
+        "unexpected error: {err}"
+    );
+    // The source survived.
+    assert_eq!(
+        std::fs::read_dir(&shard_dir).unwrap().count(),
+        before,
+        "the source shards must not have been deleted"
+    );
 
     std::fs::remove_dir_all(&base).ok();
 }

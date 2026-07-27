@@ -236,6 +236,15 @@ fn is_shard_file(name: &str) -> bool {
         })
 }
 
+/// Do `a` and `b` name the same existing directory? Canonicalized, so symlinks and `..` cannot hide a
+/// match; a path that does not exist can never collide with the destination we just created.
+fn same_dir(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
 /// Delete any shard files left in `shard_dir` by a previous emit.
 ///
 /// The shard *count* is a function of the byte budget, so re-emitting the same tier at a different
@@ -316,6 +325,16 @@ pub fn convert_krea_realtime_tier_sharded(
 
     let shard_dir = out_dir.join(TRANSFORMER_DIR);
     std::fs::create_dir_all(&shard_dir)?;
+    // The source may itself be a sharded `transformer/` dir, and MLX loads are lazy — so if that dir
+    // is also the destination, clearing stale shards would delete the very files the (not yet
+    // materialized) tensors are about to be read from. Refuse rather than shred the input.
+    if same_dir(src, &shard_dir) {
+        return Err(Error::Msg(format!(
+            "krea-realtime: refusing to emit shards into the source directory ({}); \
+             choose an out_dir whose `{TRANSFORMER_DIR}/` is not the source",
+            src.display()
+        )));
+    }
     clear_stale_shards(&shard_dir)?;
 
     // Write config.json first: a consumer that sees shards appearing has the geometry already.
@@ -408,6 +427,43 @@ mod tests {
             strip_model_prefix("blocks.0.model.weight"),
             "blocks.0.model.weight"
         );
+    }
+
+    /// `is_shard_file` decides what gets **deleted**, so its negative side is the load-bearing one:
+    /// the documented safety property is that anything the caller put in the shard directory which is
+    /// not one of our own shards is left alone. A predicate that merely looked for a `.safetensors`
+    /// suffix, or for a `dit-` prefix, would pass every positive case below and still eat the
+    /// caller's files.
+    #[test]
+    fn is_shard_file_matches_only_this_emitters_own_shard_names() {
+        for name in [
+            "dit-00001-of-00007.safetensors",
+            "dit-00007-of-00007.safetensors",
+            "dit-1-of-2.safetensors",
+        ] {
+            assert!(is_shard_file(name), "should match: {name}");
+        }
+        for name in [
+            // Not our naming — a foreign sharded checkpoint in the same directory.
+            "model-00001-of-00002.safetensors",
+            "diffusion_pytorch_model-00001-of-00003.safetensors",
+            // Our prefix, but not our grammar.
+            "dit-1-of-2-of-3.safetensors",
+            "dit--of-.safetensors",
+            "dit-of-2.safetensors",
+            "dit-x-of-2.safetensors",
+            "dit-1-of-y.safetensors",
+            "dit-00001-of-00007.safetensors.tmp",
+            // The single-file emitter's own output must survive.
+            "dit.safetensors",
+            // Sibling components a caller may have staged alongside.
+            "t5_encoder.safetensors",
+            "vae.safetensors",
+            "index.json",
+            "config.json",
+        ] {
+            assert!(!is_shard_file(name), "should NOT match: {name}");
+        }
     }
 
     #[test]
