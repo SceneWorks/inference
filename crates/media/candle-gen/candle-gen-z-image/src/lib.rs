@@ -116,7 +116,8 @@ use std::sync::{Arc, Mutex};
 use candle_gen::candle_core::{DType, Device};
 use candle_gen::gen_core::{
     self, AdapterSpec, Capabilities, ConditioningKind, GenerationOutput, GenerationRequest,
-    Generator, LoadSpec, Modality, ModelDescriptor, PidWeights, Progress, WeightsSource,
+    Generator, LoadSpec, Modality, ModelDescriptor, OffloadPolicy, PidWeights, Progress,
+    WeightsSource,
 };
 use candle_transformers::models::z_image::vae::Encoder as VaeEncoder;
 
@@ -166,6 +167,9 @@ pub struct ZImageGenerator {
     root: PathBuf,
     device: Device,
     dtype: DType,
+    /// Effective component-residency policy selected at load. Sequential bypasses both component
+    /// caches and rebuilds/drops Qwen3, DiT, and VAE in explicit per-request phases.
+    offload_policy: OffloadPolicy,
     /// LoRA/LoKr adapters merged into the DiT weights at component-load (sc-5166). Fixed for this
     /// generator instance; empty ⇒ the stock unadapted build.
     adapters: Vec<AdapterSpec>,
@@ -272,6 +276,25 @@ impl Generator for ZImageGenerator {
                 self.pid_spec.clone(),
             ),
         };
+
+        if self.offload_policy == OffloadPolicy::Sequential {
+            if self.comfyui.is_some() {
+                return Err(gen_core::Error::Unsupported(
+                    "z_image_turbo: sequential residency is unavailable for bespoke ComfyUI \
+                     component loads"
+                        .into(),
+                ));
+            }
+            if req.use_pid {
+                return Err(gen_core::Error::Unsupported(
+                    "z_image_turbo: PiD decode is not supported under sequential residency; use the \
+                     native VAE route or resident policy"
+                        .into(),
+                ));
+            }
+            let images = pipe.render_sequential(req, on_progress)?;
+            return Ok(GenerationOutput::Images(images));
+        }
         let components = self.components(&pipe)?;
 
         // img2img / `Reference` (sc-11783): resolve the single reference + its effective strength, and —
@@ -343,7 +366,7 @@ pub fn descriptor() -> ModelDescriptor {
             supported_quants: &[],
             supports_kv_cache: false,
             requires_sigma_shift: false,
-            supports_sequential_offload: false,
+            supports_sequential_offload: true,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,
@@ -357,6 +380,12 @@ pub fn descriptor() -> ModelDescriptor {
             audio_edit_modes: vec![],
         },
     }
+}
+
+fn comfyui_descriptor() -> ModelDescriptor {
+    let mut descriptor = descriptor();
+    descriptor.capabilities.supports_sequential_offload = false;
+    descriptor
 }
 
 /// Construct the (lazy) candle Z-Image generator from a [`LoadSpec`]. `spec.weights` must be a
@@ -398,11 +427,13 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     // Z-Image is a bf16 model; load at bf16 regardless of the CPU-default dtype. The device is the
     // backend selected at compile time (CUDA on Windows, Metal/CPU on Mac).
     let device = candle_gen::default_device()?;
+    let offload_policy = candle_gen::effective_offload_policy(spec.offload_policy);
     Ok(Box::new(ZImageGenerator {
         descriptor: descriptor(),
         root,
         device,
         dtype: DType::BF16,
+        offload_policy,
         adapters: spec.adapters.clone(),
         // PiD is an optional aux decoder (epic 7840 / sc-7853): capture the load-spec component (if
         // any) so the lazy component build loads the engine once. Unlike quant/control above, it is not
@@ -441,10 +472,11 @@ pub fn load_from_comfyui_components(
         tokenizer_dir: tokenizer_dir.into(),
     });
     Ok(Box::new(ZImageGenerator {
-        descriptor: descriptor(),
+        descriptor: comfyui_descriptor(),
         root: sources.tokenizer_dir.clone(),
         device,
         dtype: DType::BF16,
+        offload_policy: OffloadPolicy::Resident,
         adapters: Vec::new(),
         pid_spec: None,
         comfyui: Some(sources),
@@ -466,10 +498,11 @@ pub fn load_from_comfyui_checkpoint(
         tokenizer_dir: tokenizer_dir.into(),
     });
     Ok(Box::new(ZImageGenerator {
-        descriptor: descriptor(),
+        descriptor: comfyui_descriptor(),
         root: sources.tokenizer_dir.clone(),
         device,
         dtype: DType::BF16,
+        offload_policy: OffloadPolicy::Resident,
         adapters: Vec::new(),
         pid_spec: None,
         comfyui: Some(sources),
@@ -524,6 +557,10 @@ mod tests {
         // LoRA/LoKr wired (sc-5166) — merged into the DiT at load.
         assert!(d.capabilities.supports_lora);
         assert!(d.capabilities.supports_lokr);
+        assert!(
+            d.capabilities.supports_sequential_offload,
+            "the generic txt2img/reference route stages Qwen3, DiT, and VAE"
+        );
         assert!(d.capabilities.supported_quants.is_empty());
         assert_eq!(d.capabilities.min_size, 256);
         assert_eq!(d.capabilities.max_size, 2048);
@@ -533,6 +570,16 @@ mod tests {
         assert_eq!(
             d.capabilities.schedulers,
             candle_gen::curated_scheduler_names()
+        );
+    }
+
+    #[test]
+    fn comfyui_descriptor_does_not_advertise_sequential_offload() {
+        assert!(
+            !comfyui_descriptor()
+                .capabilities
+                .supports_sequential_offload,
+            "bespoke ComfyUI loads remain resident-only"
         );
     }
 
@@ -633,6 +680,45 @@ mod tests {
                 ..Default::default()
             })
             .is_ok());
+    }
+
+    /// The worker-facing `LoadSpec::offload_policy` selects the staged route. A pre-cancel must return
+    /// before touching the deliberately missing snapshot, proving the policy is active rather than
+    /// silently serving the resident cache path.
+    #[test]
+    fn sequential_policy_is_active_and_honors_pre_cancel_before_load() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()))
+            .with_offload_policy(OffloadPolicy::Sequential);
+        let generator = load(&spec).expect("lazy sequential generator");
+        let cancel = gen_core::CancelFlag::default();
+        cancel.cancel();
+        let req = GenerationRequest {
+            prompt: "a rusty robot holding a lit candle".into(),
+            cancel,
+            ..Default::default()
+        };
+        assert!(matches!(
+            generator.generate(&req, &mut |_| {}),
+            Err(gen_core::Error::Canceled)
+        ));
+    }
+
+    /// PiD is a bespoke decoder whose student/caption stack does not yet have a phase-local loader.
+    /// Sequential requests reject it explicitly before any snapshot access instead of retaining it
+    /// through denoise and making the advertised peak false.
+    #[test]
+    fn sequential_policy_rejects_pid_explicitly_before_load() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()))
+            .with_offload_policy(OffloadPolicy::Sequential);
+        let generator = load(&spec).expect("lazy sequential generator");
+        let req = GenerationRequest {
+            prompt: "a rusty robot holding a lit candle".into(),
+            use_pid: true,
+            ..Default::default()
+        };
+        let error = generator.generate(&req, &mut |_| {}).unwrap_err();
+        assert!(matches!(error, gen_core::Error::Unsupported(_)));
+        assert!(error.to_string().contains("PiD"));
     }
 
     /// Quantization / control overlays are rejected at load as typed `Unsupported`, so the worker

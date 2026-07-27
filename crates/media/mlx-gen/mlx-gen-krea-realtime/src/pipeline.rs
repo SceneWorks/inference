@@ -18,8 +18,8 @@ use std::path::PathBuf;
 
 use mlx_gen::{
     default_seed, AdapterSpec, Capabilities, Conditioning, ConditioningKind, Error,
-    GenerationOutput, GenerationRequest, Generator, Modality, ModelDescriptor, Progress, Result,
-    WeightsSource,
+    GenerationOutput, GenerationRequest, Generator, Modality, ModelDescriptor, Progress, Quant,
+    Result, WeightsSource,
 };
 
 use crate::config::{KreaRealtimeConfig, MODEL_ID};
@@ -61,12 +61,15 @@ pub fn descriptor() -> ModelDescriptor {
             // the engine (`generate_i2v` / `generate_v2v`) and routed by `run`, so advertising them is
             // honest. `VideoClip` is video-modality conditioning (allowed here — modality is Video).
             conditioning: vec![ConditioningKind::Reference, ConditioningKind::VideoClip],
-            // Wan-family style-LoRA / LoKr on the dense bf16 DiT (sc-15015, S14): Krea Realtime 14B is
-            // Wan-2.1-14B T2V weight-for-weight, so a diffusers / PEFT / kohya / LoKr file installs onto
-            // the DiT as forward-time residuals via the shared `apply_adapters_strict` path (the
-            // `mlx-gen-scail2` dense-Wan template). `LoadSpec::adapters` is honored in the load path
-            // (`t2v::load_transformer`), so advertising these is capability-honest. The quant/packed-tier
-            // (Q4/Q8) LoRA install is the separate quant-tier story (S19).
+            // Wan-family style-LoRA / LoKr (sc-15015 S14; extended to the packed tiers by sc-15203 S19):
+            // Krea Realtime 14B is Wan-2.1-14B T2V weight-for-weight, so a diffusers / PEFT / kohya /
+            // LoKr file installs onto the DiT as **forward-time residuals** via the shared
+            // `apply_adapters_strict` path. Because the residual is added on top of the base's forward
+            // rather than folded into its weights, it is tier-agnostic: it stacks identically over a
+            // dense bf16 base and over a packed Q4/Q8 one (the base is never dequantized), which is the
+            // same additive-on-packed property epic 10043 / sc-10578 established for the Wan family.
+            // `LoadSpec::adapters` is honored on every tier in the load path (`t2v::load_transformer`),
+            // so advertising these is capability-honest at Q4/Q8 as well as bf16.
             supports_lora: true,
             supports_lokr: true,
             samplers: vec![SELF_FORCING_SAMPLER],
@@ -77,8 +80,21 @@ pub fn descriptor() -> ModelDescriptor {
             max_size: 1280,
             max_count: 1,
             mac_only: true,
-            // Q4/Q8 load-time quant is not wired in S6 (dense bf16 only) — advertise none until it is.
-            supported_quants: &[],
+            // Three tiers (sc-15203, S19): **Q4** (~7 GB) / **Q8** (~14 GB) / **bf16** (~28 GB, the
+            // absence of a `Quant`). A 14B bf16 DiT is ~28 GB resident and barely runnable on Mac, so the
+            // quantized tiers are the practically-usable ones — the SceneWorks manifest picks **Q4** as
+            // the default for this dense-video engine (sc-10750's dense-video convention); this slice is
+            // the engine's advertised surface, the per-model default tier is a manifest field
+            // (`mlx.quantize`) that rides S11 (sc-8444) in the SceneWorks repo, not a gen-core one.
+            //
+            // The tiers ship **pre-quantized (packed) on disk** — `dit.safetensors` carries the MLX
+            // affine triple for the Wan `_quantize_predicate` Linears and the reused
+            // `WanTransformer::from_weights` builds them packed (`load::resolve_snapshot_quant`). A
+            // load-time `LoadSpec::quantize` over a *dense* bf16 snapshot is also honored (the
+            // `AdaptableLinear::quantize` path the sibling Wan/SCAIL-2 providers use), and a request that
+            // conflicts with a packed snapshot's own tier is a hard error rather than a silent downgrade
+            // (`load::resolve_load_time_quant`). Both are what this slice advertises.
+            supported_quants: &[Quant::Q4, Quant::Q8],
             // The AR regime is built on a rolling causal KV cache (sc-8436 S3 / sc-8438 S5).
             supports_kv_cache: true,
             requires_sigma_shift: false,
@@ -107,8 +123,16 @@ pub struct KreaRealtime {
     root: PathBuf,
     /// Inference LoRA(s) from [`LoadSpec::adapters`](mlx_gen::LoadSpec::adapters) (sc-15015, S14) —
     /// installed onto the DiT as forward-time residuals in [`crate::t2v::load_transformer`], the
-    /// dense-Wan `apply_adapters_strict` path shared with `mlx-gen-scail2`.
+    /// `apply_adapters_strict` path shared with `mlx-gen-scail2`. Tier-agnostic: the residual stacks
+    /// over a dense bf16 base and over a packed Q4/Q8 one alike (sc-15203).
     adapters: Vec<AdapterSpec>,
+    /// The requested load-time quantization from [`LoadSpec::quantize`](mlx_gen::LoadSpec::quantize)
+    /// (sc-15203, S19). Reconciled in [`crate::t2v::load_transformer`] against the tier the snapshot
+    /// actually ships at: a **dense bf16** snapshot is quantized in memory after load; a
+    /// **pre-quantized** snapshot is already packed, so the request is a no-op at the same width and a
+    /// hard error at a different one ("stored wins", loudly — `quantize` no-ops over packed weights, so
+    /// a silent mismatch would serve a tier the caller did not ask for).
+    quant: Option<Quant>,
 }
 
 /// Load Krea Realtime from a converted MLX snapshot directory (`dit.safetensors` + the stock Wan
@@ -134,6 +158,7 @@ pub fn load(spec: &mlx_gen::LoadSpec) -> Result<Box<dyn Generator>> {
         config,
         root,
         adapters: spec.adapters.clone(),
+        quant: spec.quantize,
     }))
 }
 
@@ -199,6 +224,7 @@ impl KreaRealtime {
                 frames,
                 strength,
                 &self.adapters,
+                self.quant,
                 &req.cancel,
                 on_progress,
             );
@@ -213,6 +239,7 @@ impl KreaRealtime {
                 &job,
                 image,
                 &self.adapters,
+                self.quant,
                 &req.cancel,
                 on_progress,
             );
@@ -222,6 +249,7 @@ impl KreaRealtime {
             &self.config,
             &job,
             &self.adapters,
+            self.quant,
             &req.cancel,
             on_progress,
         )
@@ -241,6 +269,7 @@ mod tests {
             config: KreaRealtimeConfig::default(),
             root: PathBuf::from("/nonexistent-krea-realtime-snapshot"),
             adapters: Vec::new(),
+            quant: None,
         }
     }
 
@@ -283,6 +312,35 @@ mod tests {
             mlx_gen::gen_core::registry::model_descriptor_errors(&d).is_empty(),
             "descriptor must be conformant: {:?}",
             mlx_gen::gen_core::registry::model_descriptor_errors(&d)
+        );
+    }
+
+    /// S19 (sc-15203): the engine advertises the **three tiers** it actually ships — Q4 and Q8 as
+    /// `supported_quants` entries, bf16 as their absence. Discriminating rather than a default check:
+    /// `Capabilities::default()` is the *empty* slice, so this fails if the field is dropped, and the
+    /// order + exact membership are pinned (NVFP4 must NOT appear — it is candle-only, and the load
+    /// path rejects it as a typed capability gap rather than routing its `bits() == 4` through the MLX
+    /// affine quantizer).
+    #[test]
+    fn descriptor_advertises_the_three_shipped_tiers() {
+        let c = descriptor().capabilities;
+        assert_eq!(c.supported_quants, &[Quant::Q4, Quant::Q8]);
+        assert!(
+            !c.supported_quants.contains(&Quant::Nvfp4),
+            "NVFP4 is a candle/CUDA tier with no MLX affine equivalent"
+        );
+        // The tiers and the adapter surface are advertised together: a LoRA must work at Q4/Q8 too
+        // (the residual install is tier-agnostic — `tests/quant_tiers.rs` proves it on every tier).
+        assert!(c.supports_lora && c.supports_lokr);
+        // Matches the sibling Wan-2.1-14B video engines (`scail2_14b`, the Wan providers), which is the
+        // family this reuses its packed-load path from.
+        assert_eq!(
+            c.supported_quants,
+            mlx_gen_wan::model::descriptor_t2v_14b()
+                .capabilities
+                .supported_quants,
+            "Krea Realtime reuses the Wan packed-load path, so it advertises the same tier surface \
+             as the Wan-2.1/2.2 14B T2V sibling it shares that path with"
         );
     }
 

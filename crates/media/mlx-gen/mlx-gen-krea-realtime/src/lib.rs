@@ -107,16 +107,19 @@ pub use causal::{
 };
 pub use config::{KreaArConfig, KreaRealtimeConfig, MODEL_ID};
 pub use convert::{
-    convert_krea_realtime_transformer, normalize_krea_keys, sanitize_krea_realtime_transformer,
-    strip_model_prefix, KREA_MODEL_PREFIX, TRANSFORMER_DTYPE,
+    convert_krea_realtime_tier, convert_krea_realtime_tier_sharded,
+    convert_krea_realtime_tier_with_config, convert_krea_realtime_transformer, normalize_krea_keys,
+    quantize_krea_realtime_transformer, sanitize_krea_realtime_transformer, strip_model_prefix,
+    DEFAULT_SHARD_BYTES, DIT_FILE, KREA_MODEL_PREFIX, TRANSFORMER_DIR, TRANSFORMER_DTYPE,
 };
 pub use generate::{
     generate_i2v_latents, generate_latents, generate_latents_conditioned_into,
     generate_latents_into, generate_v2v_latents, ArGenParams, RefConditioning,
 };
 pub use load::{
-    expected_transformer_tensors, load_krea_realtime_transformer, verify_transformer_tensors,
-    TensorSpec,
+    expected_transformer_tensors, load_krea_realtime_transformer,
+    load_krea_realtime_transformer_with_quant, probe_packed_quant, resolve_load_time_quant,
+    resolve_snapshot_quant, verify_transformer_tensors, TensorSpec, PACKED_LINEARS_PER_BLOCK,
 };
 pub use pipeline::{descriptor, load as load_generator, KreaRealtime, SELF_FORCING_SAMPLER};
 pub use scheduler::{euler_x0, renoise_step, FewStepSchedule, NUM_TRAIN_TIMESTEPS};
@@ -126,9 +129,9 @@ pub use t2v::{
     KreaRealtimeJob,
 };
 
-// Re-export the reused Wan config type so callers can name the DiT dimensions without a direct
-// `mlx-gen-wan` dependency.
-pub use mlx_gen_wan::config::WanModelConfig;
+// Re-export the reused Wan config types so callers can name the DiT dimensions — and a snapshot's
+// pre-quantized tier (sc-15203) — without a direct `mlx-gen-wan` dependency.
+pub use mlx_gen_wan::config::{WanModelConfig, WanQuant};
 
 /// Add the MLX Krea Realtime provider to an explicit media registry builder. Composed by the platform
 /// catalog (explicit, never linker-discovered) — see `mlx-gen-catalog`.
