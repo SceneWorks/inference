@@ -219,28 +219,64 @@ pub struct ReferenceAudio<'a> {
 ///
 /// Inside [`StableAudio3Pipeline::synthesize_with_reference_traced`] it was reachable only with
 /// multi-gigabyte weights, so `1.0 - reference.noise_level` there — a complete, user-visible sign
-/// inversion on all six ids — left the whole weight-free suite green. It is *also* invisible to the
-/// sampler's own `schedule[0] == strength` cross-check, because both downstream consumers
-/// ([`build_schedule`] and the DiT sample call) read this same scalar, so an inversion moves them
-/// together and they still agree. Mutating either consumer alone is loud; mutating their shared
-/// input was silent. Extracted here it is gated weight-free by `tests/reference_audio.rs`
+/// inversion on all six ids — left the whole weight-free suite green. Extracted here it is gated
+/// weight-free by `tests/reference_audio.rs`
 /// `the_pipeline_hands_the_sampler_the_converted_noise_level_as_strength`, which feeds it the output
 /// of `reference_audio_for` so the whole request → sampler-strength chain is one assertion.
 ///
-/// # And it is the *only* site that produces the value
+/// # Why the synthesis path holds no `strength` binding
 ///
-/// Extracting the decision is not on its own enough: a `let strength = sampler_strength_for(..)`
-/// forwarded into a weights-only helper just moves the silent site to the forwarding argument, where
-/// the same "both consumers move together" reasoning still applies. So the scalar never crosses a
-/// call boundary — `StableAudio3Pipeline::sample` takes `Option<&ReferenceAudio>` and calls this,
-/// and the text-only replay path passes `None` instead of spelling `1.0` out a second time. Every
-/// remaining use of `strength` in this file is inside `sample`, where mutating one alone trips the
-/// sampler's `schedule[0] == strength` check.
+/// The sampler cross-checks the scalar it is handed against the schedule's first sigma
+/// ([`crate::sampler::initialized_start`]). That check only discriminates when the two sides are
+/// separate expressions. Two earlier shapes defeated it and were each silent weight-free:
+///
+/// * forwarding a pre-computed `strength` **argument** into the weights-only helper, and
+/// * binding `let strength = sampler_strength_for(reference)` **inside** the helper.
+///
+/// In both, [`build_schedule`] and the DiT sample call read one expression, so an edit to it moved
+/// both sides of the cross-check together and they still agreed. So `StableAudio3Pipeline::sample`
+/// now takes `Option<&ReferenceAudio>` and calls this function *inline at each of the two consumer
+/// sites*; the text-only replay path passes `None` rather than spelling `1.0` out a second time.
+///
+/// What that buys, stated exactly and measured rather than reasoned: editing **either one** of those
+/// two call sites alone — inverting it, or swapping its `reference` for `None` — leaves it
+/// disagreeing with the other, and `initialized_start` bails with `init noise strength must equal
+/// every schedule's first sigma`. The only such edits that survive the bail are the ones that do not
+/// change the value at that operating point (inverting at noise level `0.5`, `None`-substituting at
+/// noise level `1.0`), and those are behaviour-neutral.
+///
+/// It does **not** stop a coordinated edit to both sites at once, which agrees with itself, passes
+/// the bail, and is green weight-free; only the real-weight lane sees that. Editing this function's
+/// body instead is caught weight-free by the gate above.
 ///
 /// The `None` arm is the text-to-audio path: `1.0` is pure noise, i.e. no source influence, which is
 /// exactly what "no reference" means in the sampler's orientation.
 pub fn sampler_strength_for(reference: Option<&ReferenceAudio<'_>>) -> f32 {
     reference.map_or(1.0, |reference| reference.noise_level)
+}
+
+/// The two halves of a restyle must be forwarded together into the synthesis path (sc-14547).
+///
+/// `StableAudio3Pipeline::sample` receives the SAME-encoded source (`init_latents`) and the
+/// reference itself as separate arguments. The reference is what
+/// [`sampler_strength_for`] reads, so dropping *it* alone at the call site still encodes the source
+/// and then discards it under strength `1.0`: a silent degradation to plain text-to-audio. Dropping
+/// `init_latents` alone is the converse. Both are one-token edits inside a weights-only method,
+/// which is exactly the shape that has been missed before, so the disagreement is rejected here
+/// rather than left to be inferred.
+///
+/// The predicate is a free function so this rejection is exercised without weights by
+/// `tests/reference_audio.rs`
+/// `the_pipeline_hands_the_sampler_the_converted_noise_level_as_strength`. That gates the rule; it
+/// does not gate the call site inside `sample`, which still needs the real-weight lane.
+pub fn reference_halves_agree(init_latents_present: bool, reference_present: bool) -> Result<()> {
+    if init_latents_present != reference_present {
+        return Err(AudioError::Msg(format!(
+            "reference-audio init latents and the reference itself must be supplied together, saw \
+             init_latents={init_latents_present} reference={reference_present}"
+        )));
+    }
+    Ok(())
 }
 
 /// Where the request-local stream's draws sat relative to the source encode (sc-14547).
@@ -520,11 +556,10 @@ impl StableAudio3Pipeline {
             &geometry,
             &initial,
             init_latents.as_ref(),
-            // The reference itself, not a scalar derived here: `sample` runs the one shipped
-            // decision (`sampler_strength_for`) so the sampler-facing value never crosses a
-            // weights-only call boundary as a bare local. See that function for why forwarding the
-            // scalar was silent to *both* the weight-free suite and the sampler's own
-            // schedule/strength cross-check.
+            // The reference itself, not a scalar derived here: `sample` runs `sampler_strength_for`
+            // separately at each of its two consumer sites, so no single expression feeds both sides
+            // of the sampler's schedule/strength cross-check. See that function. Dropping this
+            // argument while keeping `init_latents` above is rejected by `reference_halves_agree`.
             reference.as_ref(),
             on_progress,
             &mut noise,
@@ -725,7 +760,14 @@ impl StableAudio3Pipeline {
         noise: &mut N,
         is_canceled: &dyn Fn() -> bool,
     ) -> Result<(Tensor, Tensor)> {
-        let strength = sampler_strength_for(reference);
+        // `init_latents` and `reference` are two forwarded halves of one decision: the caller
+        // encodes the source *because* there is a reference, and the strength that decides what to
+        // do with the encode is derived from that same reference below. Dropping either half at the
+        // call site while keeping the other is a one-token edit that the weight-free suite cannot
+        // see (`sample` needs weights). Dropping `reference` alone is the worse of the two — the
+        // source is still encoded, strength becomes `1.0`, and the restyle silently degrades to
+        // plain text-to-audio. This makes both halves fail closed instead.
+        reference_halves_agree(init_latents.is_some(), reference.is_some())?;
         let positive = self
             .conditioner
             .encode_with_cancel(&[prompt.to_owned()], is_canceled)?;
@@ -756,11 +798,14 @@ impl StableAudio3Pipeline {
             ModelConfig::Diffusion(model) => model,
             ModelConfig::Autoencoder(_) => unreachable!("validated full snapshot"),
         };
-        // `strength` is the init noise level: `1.0` on the text-to-audio path, `1.0 - retention` on
-        // the reference path. The schedule's first sigma must equal it, which the sampler enforces.
+        // The init noise level: `1.0` on the text-to-audio path, `1.0 - retention` on the reference
+        // path. The schedule's first sigma must equal the strength handed to the DiT call below,
+        // which the sampler enforces (`initialized_start`). The two sites call
+        // `sampler_strength_for` separately rather than sharing a local on purpose — see that
+        // function.
         let schedule = build_schedule(
             parameters.steps,
-            strength,
+            sampler_strength_for(reference),
             &inference_shift(&diffusion.diffusion),
             geometry.effective_lengths.as_deref(),
             geometry.latent_length,
@@ -776,7 +821,10 @@ impl StableAudio3Pipeline {
             parameters.sampler,
             initial,
             init_latents,
-            strength,
+            // Recomputed, not read from a binding shared with `build_schedule` above: an edit to
+            // this expression alone leaves it disagreeing with `schedule[0]`, which
+            // `initialized_start` rejects.
+            sampler_strength_for(reference),
             &schedule,
             &positive.embeddings,
             negative.as_ref().map(|value| &value.embeddings),

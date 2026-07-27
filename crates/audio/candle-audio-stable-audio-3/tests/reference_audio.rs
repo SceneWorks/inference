@@ -55,7 +55,8 @@ use candle_audio_stable_audio_3::gen_core::{
     GenerationRequest, Generator, LoadSpec, WeightsSource,
 };
 use candle_audio_stable_audio_3::pipeline::{
-    prepare_reference_pcm, sampler_strength_for, ReferenceAudio, SAMPLE_RATE,
+    prepare_reference_pcm, reference_halves_agree, sampler_strength_for, ReferenceAudio,
+    SAMPLE_RATE,
 };
 use candle_audio_stable_audio_3::sampler::{
     adapt_sample_size_for_max, build_schedule, initialized_start, DistributionShift, Schedule,
@@ -330,13 +331,21 @@ fn the_request_surface_hands_the_pipeline_the_converted_noise_level() {
 /// * the decision lived inside a synthesis path that cannot run without multi-gigabyte weights, so
 ///   nothing in the PR lane ever evaluated it;
 /// * the sampler's own `schedule[0] == strength` cross-check (`sampler::initialized_start`) cannot
-///   see it either. `build_schedule` and `sample_dit_initialized_with_interval_and_cancel` are both
-///   handed this one scalar, so inverting it moves both sides of that comparison together. Mutating
-///   either call site alone is loud; mutating their shared input was silent.
+///   see it either whenever both of its sides read one expression. `build_schedule` and
+///   `sample_dit_initialized_with_interval_and_cancel` did — first via a forwarded `strength`
+///   argument, then via a `let strength` local inside `sample` — so inverting that one expression
+///   moved both sides of the comparison together and they still agreed.
 ///
-/// So the decision is now `pipeline::sampler_strength_for`, and this drives it from the same
-/// `reference_audio_for` output the previous case pins — making request → resolve → field selection
-/// → sampler `strength` one continuous weight-free chain, with no weights-only gap left in it.
+/// So the decision is `pipeline::sampler_strength_for`, this case drives it from the same
+/// `reference_audio_for` output the previous case pins, and `sample` now calls it inline at each of
+/// the two consumer sites with no binding shared between them. That makes request → resolve → field
+/// selection → sampler `strength` one continuous weight-free chain. What it does **not** cover is
+/// the two call sites themselves: they live in a weights-only method, and editing one of them is
+/// caught by `initialized_start`'s runtime bail, not here.
+///
+/// The tail of this case pins `pipeline::reference_halves_agree`, the rule that stops the other
+/// forwarded half — the reference itself — from being dropped at that call site while the encoded
+/// source stays.
 #[test]
 fn the_pipeline_hands_the_sampler_the_converted_noise_level_as_strength() {
     // (explicit strength, expected retention in force, expected sampler strength / init noise level)
@@ -404,6 +413,27 @@ fn the_pipeline_hands_the_sampler_the_converted_noise_level_as_strength() {
         strengths.last().copied().expect("the defaulted case ran"),
         sampler_strength_for(None),
         "the defaulted reference arm must not coincide with the text-only arm"
+    );
+
+    // The other half that travels into the weights-only `sample`: the encoded source. Strength is
+    // derived from the reference, so a call site that keeps `init_latents` and drops `reference`
+    // encodes the source and then throws it away at strength 1.0 — a silent restyle deletion. The
+    // rule that rejects the disagreement is gated here; the call site obeying it is not.
+    assert!(
+        reference_halves_agree(true, true).is_ok(),
+        "a restyle supplies both halves"
+    );
+    assert!(
+        reference_halves_agree(false, false).is_ok(),
+        "a text-only request supplies neither half"
+    );
+    assert!(
+        reference_halves_agree(true, false).is_err(),
+        "an encoded source with no reference must fail closed, not degrade to text-to-audio"
+    );
+    assert!(
+        reference_halves_agree(false, true).is_err(),
+        "a reference with no encoded source must fail closed"
     );
 }
 

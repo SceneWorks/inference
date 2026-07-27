@@ -81,12 +81,21 @@ weight-free suite stay green, the second did the same with shape (3).
 
 `reference_audio_for` was extracted out of `generate` precisely so shape (2) is reachable without
 weights, and `sampler_strength_for` was extracted out of `synthesize_with_reference_traced` for
-shape (3). Extraction alone was not enough for (3): a `let strength = sampler_strength_for(..)`
-forwarded into the weights-only `sample` helper just relocates the silent site to the forwarding
-argument, where the same "both consumers move together" reasoning applies. So `sample` takes
-`Option<&ReferenceAudio>` and calls `sampler_strength_for` itself, and the text-only replay path
-passes `None` rather than spelling `1.0` out again. That leaves exactly one expression in the crate
-producing the sampler-facing scalar, and it is gated.
+shape (3). Extraction alone was not enough for (3), and neither was one further step. Three
+successive reviews each found the same defect one expression downstream:
+
+1. a pre-computed `strength` **argument** forwarded into the weights-only `sample` helper;
+2. that argument removed, but replaced by `let strength = sampler_strength_for(reference)` **inside**
+   `sample`.
+
+Both shapes are one expression read by both consumers, so an edit to it moves `build_schedule` and
+the DiT sample call together and the sampler's `schedule[0] == strength` check still agrees with
+itself. Measured on shape (2): `let strength = 1.0 - sampler_strength_for(reference)` — a complete
+user-visible inversion on all six ids — left the whole suite green, as did substituting `None`.
+
+So `sample` takes `Option<&ReferenceAudio>` and calls `sampler_strength_for` **inline at each of the
+two consumer sites**, with no binding shared between them; the text-only replay path passes `None`
+rather than spelling `1.0` out again.
 
 Everything past that `strength` argument — the sampling itself and below — needs a snapshot, and is
 covered by **the real-weight case**
@@ -95,23 +104,34 @@ source correlation at contract `1.0` to exceed the one at contract `0.0` by a wi
 honest statement of the split is: the request → sampler-`strength` chain is gated weight-free end to
 end; what the sampler then *does* with it is gated only with real weights.
 
-The residue, named rather than left for a third review to find. Two edits in this span still cannot
-be caught weight-free, and neither is silent:
+### What a single-token edit can still do
 
-* the two `strength` uses inside `StableAudio3Pipeline::sample` (`build_schedule` and the DiT sample
-  call). Mutating **either alone** fails closed at runtime — measured, both directions — with
-  `init noise strength must equal every schedule's first sigma`, and dropping `init_latents` while
-  keeping a reference strength fails with `partial init noise strength requires init latents`. They
-  are only silent when moved *together*, which is now impossible: they read one local produced by
-  `sampler_strength_for` three lines above them, and there is no forwarded scalar left to move.
-* `let reference = reference_audio_for(request)` in `StableAudio3Generator::generate` replaced by
-  `None`. That deletes the feature rather than inverting it, and it is caught by the real-weight
-  case, which drives `Generator::generate` and would measure a source correlation of ~0 at contract
-  `1.0`. It is not weight-free-reachable because `generate` needs a loaded pipeline.
+Every site below was mutated individually and the weight-free CI step re-run. Sites in `model.rs`
+and in `pipeline::sampler_strength_for` fail the suite. Sites inside the weights-only methods
+(`StableAudio3Generator::generate`, `StableAudio3Pipeline::synthesize_with_reference_traced`,
+`StableAudio3Pipeline::sample`) do **not** — no weight-free case evaluates them — so what is stated
+for those is which *runtime* check rejects them, each measured against `sampler::initialized_start`
+directly rather than inferred.
 
-What is genuinely irreducible is that *some* expression in the weights-only path must produce the
-scalar. That expression is a single call to the gated `sampler_strength_for`, adjacent to its
-consumers, rather than a value carried across a call boundary.
+| site | one-token edit | what catches it |
+|---|---|---|
+| `model::reference_noise_level` body | drop the `1.0 -` | weight-free: `contract_strength_is_retention_and_a_flipped_sign_fails_here` |
+| `model::resolve_reference_audio` `noise_level` / `strength` fields | swap the two | weight-free: both of the other two gates |
+| `model::DEFAULT_REFERENCE_STRENGTH` | `0.1` → `0.9` | weight-free: all three gates (the `assert_ne!` discriminator trips) |
+| `model::reference_audio_for` field selection | `noise_level` → `strength` | weight-free: `the_request_surface_hands_the_pipeline_the_converted_noise_level` |
+| `pipeline::sampler_strength_for` body (either arm) | invert, or change the `None` constant | weight-free: `the_pipeline_hands_the_sampler_the_converted_noise_level_as_strength` |
+| `pipeline::reference_halves_agree` body | flip or neuter the predicate | weight-free: the tail of the same gate |
+| either `sampler_strength_for(reference)` call site in `sample` | invert it, or swap `reference` for `None` | runtime, fail-closed: it now disagrees with the other site, and `initialized_start` bails `init noise strength must equal every schedule's first sigma`. Measured at levels `0.75/0.9/0.0/1.0/0.5`; the only pairs that pass are the ones where the edit does not change the value (inversion at level `0.5`, `None` at level `1.0`), which are behaviour-neutral. |
+| `sample`'s `init_latents` or `reference` argument at the call site | drop one, keep the other | runtime, fail-closed: `reference_halves_agree` rejects the disagreement. Before this PR's third cycle, dropping `reference` alone was **silent** — the source was still encoded and then discarded at strength `1.0`, degrading a restyle to plain text-to-audio. |
+| `let reference = reference_audio_for(request)` in `generate` → `None` | delete the feature | real-weight only: `real_reference_restyle_is_bounded_and_ordered_on_all_six_variants` would measure a source correlation of ~0 at contract `1.0`. Nothing weight-free sees it; `generate` needs a loaded pipeline. |
+| `prepare_reference_pcm`'s target size in `reference_latents` | halve it | runtime, fail-closed: the SAME-encode shape check in `reference_latents` |
+
+Two things are worth stating plainly rather than as reassurance. First, a **coordinated edit to both
+`sampler_strength_for` call sites at once** agrees with itself, passes `initialized_start`, and is
+green weight-free — it is caught only by the real-weight case. That is a two-site edit, not a
+one-token one, but it is reachable. Second, deleting the feature at `generate` is likewise
+weight-free-invisible. Neither is claimed to be closed here; both are named so the next reader
+starts from them.
 
 Measured source correlation on Metal, 5 s / 4 steps, seed 7 (M-series, `--release --features metal`):
 

@@ -243,7 +243,7 @@ jobs:
         # `Conditioning::ReferenceAudio.strength` is retention-oriented and the sampler's is
         # `init_noise_level`-oriented, so a silent inversion between them ships a feature that runs,
         # emits plausible audio, and does the opposite of what was asked. There are three gates
-        # because there are three seams the value crosses and each is blind to the other two — two
+        # because there are three seams the value crosses and each is blind to the other two — three
         # successive adversarial reviews each found the next one uncovered:
         # `contract_strength_is_retention_and_a_flipped_sign_fails_here` catches a wrong
         # *conversion*; `the_request_surface_hands_the_pipeline_the_converted_noise_level` catches a
@@ -252,18 +252,23 @@ jobs:
         # `the_pipeline_hands_the_sampler_the_converted_noise_level_as_strength` catches the pipeline
         # then handing the sampler `1.0 - noise_level`. That third one was silent to *both* the
         # weight-free suite (the decision lived in a weights-only synthesis path) and the sampler's
-        # own `schedule[0] == strength` check (`build_schedule` and the DiT sample call read one
-        # shared scalar, so inverting it moves both sides of that comparison together). All three are
-        # verified to fail under their own single-token mutation, not merely to pass under the
-        # correct code.
+        # own `schedule[0] == strength` check, because `build_schedule` and the DiT sample call read
+        # one shared expression — first a forwarded `strength` argument, then a `let strength` local
+        # inside `sample` — so inverting it moved both sides of that comparison together. `sample`
+        # now calls `sampler_strength_for` inline at each of the two sites with no binding shared
+        # between them. All three gates are verified to fail under their own single-token mutation,
+        # not merely to pass under the correct code.
         #
         # Scope, stated precisely rather than as "the sign is gated at the contract endpoint": these
-        # three cases make the chain continuous from `GenerationRequest` to the sampler `strength`
-        # argument — conversion, field selection into `pipeline::ReferenceAudio`, and
-        # `pipeline::sampler_strength_for`, which is now the only expression in the crate that
-        # produces that scalar (`StableAudio3Pipeline::sample` takes the reference, so the value
-        # never crosses a call boundary as a forwardable local). Everything past that argument needs
-        # a snapshot and is gated only by `real-weights.yml`.
+        # three cases make the chain continuous from `GenerationRequest` to `sampler_strength_for` —
+        # conversion, field selection into `pipeline::ReferenceAudio`, and the strength decision
+        # itself, plus `pipeline::reference_halves_agree`, the rule that stops the encoded source and
+        # the reference from being forwarded apart. What they do **not** cover is the two
+        # `sampler_strength_for` call sites inside `StableAudio3Pipeline::sample`: that method needs
+        # weights, so no case here evaluates them. Editing one of them alone is rejected at runtime
+        # by `initialized_start`; editing both in the same way agrees with itself and is caught only
+        # by `real-weights.yml`. `docs/migration/SC_14547_REFERENCE_AUDIO_RESTYLE.md` carries the
+        # per-site mutation table.
         #
         # Deliberately **not** named, because every case in them is `#[ignore]`d behind a pinned
         # multi-GB snapshot and the target would link for zero executed tests: `base_guidance`,
