@@ -10,18 +10,24 @@
 //!
 //! Surveyed from the published safetensors headers of real Wan-2.1-14B LoRA files:
 //!
-//! | class | example | targets |
+//! | class | example | low-rank targets |
 //! |---|---|---|
 //! | plain style | `shauray/Origami_WanLora`, `motimalu/wan-flat-color-v2` | 400 per-block stems only |
-//! | step-distill | lightx2v `Wan2.1-T2V-14B` cfg-step-distill v2, `FastWan` T2V-14B | the same 400 **plus all 7 whole-model globals** |
+//! | step-distill | lightx2v `Wan2.1-T2V-14B` cfg-step-distill v2, `FastWan` T2V-14B (both headers read) | the same 400 **plus 6 of the 7 whole-model globals** |
 //! | I2V-family | `Remade-AI/Squish` | per-block **plus `cross_attn.k_img`/`v_img`** |
 //!
 //! The step-distill class is what settled the decision: those globals carry genuine `lora_down`/
 //! `lora_up` factors, so **soft-skipping** them would have silently installed a step-distill LoRA with
-//! its patch/text/time/head projections missing — a wrong render that reports success. Widening the
+//! its text/time/output projections missing — a wrong render that reports success. Widening the
 //! surface applies them instead (see `causal::krea_adaptable_paths`). The I2V-only image cross-attention
 //! stays unexposed and still errors loudly: those modules do not exist on a T2V backbone at any surface
 //! width.
+//!
+//! **Six, not seven.** `patch_embedding` ships a `.diff_b` bias delta with **no** low-rank pair, so a
+//! real step-distill file installs **406** targets against the 407-wide surface — asserted below, not
+//! inferred. And widening does **not** make such a file fully applied: 647 of its 1459 keys (447
+//! `.diff_b` + 200 norm `.diff`) are dropped silently by `apply_adapters_strict`, tracked as
+//! **sc-15326**.
 //!
 //! ```text
 //! KREA_REALTIME_SNAPSHOT_DIR=~/.cache/krea-realtime-mlx-snapshot/q4 \
@@ -39,6 +45,49 @@ use mlx_gen::{
     AdapterKind, AdapterSpec, GenerationOutput, GenerationRequest, Image, LoadSpec, WeightsSource,
 };
 use mlx_gen_krea_realtime::MODEL_ID;
+
+/// The full adaptable surface: `num_layers × 10` per-block Linears + the 7 whole-model globals.
+const ADAPTABLE_SURFACE_WIDTH: usize = 40 * 10 + 7;
+/// What a canonical plain style LoRA resolves: the per-block Linears only.
+const STYLE_LORA_TARGETS: usize = 400;
+/// What a real step-distill file resolves: 400 per-block + the **6** globals that ship a low-rank pair.
+/// `patch_embedding` ships `.diff_b` only, so it is exposed but unmatched — hence 406, not 407.
+const STEP_DISTILL_TARGETS: usize = 406;
+
+/// Install `lora` onto a freshly-loaded real DiT and return the strict installer's own report. This is
+/// the only place the **resolved target count** is observable: the provider swallows it, and a render
+/// A/B can only show *that* something changed, never that the file resolved the targets we believe it
+/// has. A LoRA that silently resolved half its targets would still move the pixels.
+fn install_count(lora: &std::path::Path) -> usize {
+    use mlx_gen::adapters::loader::apply_adapters_strict;
+    use mlx_gen_krea_realtime::{
+        load_krea_realtime_transformer_with_quant, CausalKreaTransformer, KreaRealtimeConfig,
+    };
+    use mlx_rs::Array;
+
+    let root = snapshot_dir();
+    let cfg = KreaRealtimeConfig::krea_realtime_14b();
+    let w =
+        mlx_gen::weights::Weights::from_file(root.join("dit.safetensors")).expect("open the DiT");
+    let raw: std::collections::HashMap<String, Array> = w
+        .keys()
+        .map(|k| (k.to_string(), w.get(k).expect("listed key").clone()))
+        .collect();
+    let (dit, _) = load_krea_realtime_transformer_with_quant(raw, &cfg).expect("load the DiT");
+    let mut host = CausalKreaTransformer::new(dit, &cfg);
+    let report = apply_adapters_strict(
+        &mut host,
+        &[AdapterSpec::new(lora.to_path_buf(), 1.0, AdapterKind::Lora)],
+        MODEL_ID,
+    )
+    .expect("the strict installer must accept this file");
+    assert!(
+        report.unmatched_paths.is_empty(),
+        "unmatched targets: {:?}",
+        report.unmatched_paths
+    );
+    report.applied
+}
 
 fn snapshot_dir() -> PathBuf {
     std::env::var("KREA_REALTIME_SNAPSHOT_DIR")
@@ -136,6 +185,7 @@ fn real_wan_style_lora_loads_and_changes_the_render() {
     let h = env_usize("KREA_LORA_H", 480);
     let frames = env_usize("KREA_LORA_FRAMES", 13);
     let lora = require_lora("KREA_STYLE_LORA");
+    let lora_path = lora.clone();
     let req = request(w, h, frames);
 
     let base = render(Vec::new(), &req, "baseline");
@@ -153,6 +203,14 @@ fn real_wan_style_lora_loads_and_changes_the_render() {
     let applied = mean_abs_delta(&base, &with_lora);
     let noop = mean_abs_delta(&base, &zeroed);
     println!("  mean |Δ| vs baseline: lora@1.0 = {applied:.3}, lora@0.0 = {noop:.3} (0..255)");
+
+    // The count, not just the effect: a canonical style LoRA resolves exactly the per-block surface.
+    let n = install_count(&lora_path);
+    println!("  installed targets: {n} (surface width {ADAPTABLE_SURFACE_WIDTH})");
+    assert_eq!(
+        n, STYLE_LORA_TARGETS,
+        "a plain Wan style LoRA must resolve exactly the {STYLE_LORA_TARGETS} per-block Linears"
+    );
 
     assert!(
         applied > 1.0,
@@ -188,7 +246,7 @@ fn real_wan_step_distill_lora_installs_over_the_widened_globals() {
 
     let base = render(Vec::new(), &req, "baseline");
     let distilled = render(
-        vec![AdapterSpec::new(path, 1.0, AdapterKind::Lora)],
+        vec![AdapterSpec::new(path.clone(), 1.0, AdapterKind::Lora)],
         &req,
         "step-distill",
     );
@@ -197,5 +255,22 @@ fn real_wan_step_distill_lora_installs_over_the_widened_globals() {
     assert!(
         delta > 1.0,
         "the step-distill LoRA installed but changed nothing (mean |Δ| {delta:.3})"
+    );
+
+    // **The regression gate on the sc-8446 globals decision.** 406 = 400 per-block + 6 globals. On the
+    // pre-widening per-block-only surface this file did not install at all — `apply_adapters_strict`
+    // hard-errored on the unmatched globals — so a count of 400 here means the widening was reverted,
+    // and 407 would mean `patch_embedding` grew a low-rank pair (i.e. a different file).
+    let n = install_count(&path);
+    println!("  installed targets: {n} (surface width {ADAPTABLE_SURFACE_WIDTH})");
+    assert_eq!(
+        n, STEP_DISTILL_TARGETS,
+        "a step-distill file must resolve {STEP_DISTILL_TARGETS} targets (400 per-block + 6 globals); \
+         {STYLE_LORA_TARGETS} would mean the globals surface was re-narrowed"
+    );
+    assert_eq!(
+        ADAPTABLE_SURFACE_WIDTH - n,
+        1,
+        "exactly one exposed global (patch_embedding, `.diff_b`-only) goes unmatched by this file"
     );
 }

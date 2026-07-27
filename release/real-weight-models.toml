@@ -818,3 +818,20 @@ profiles = ["media-macos"]
 environment = ["KREA_STYLE_LORA_SNAPSHOT"]
 download_files = ["origami_000000500.safetensors"]
 expected_files = ["origami_000000500.safetensors"]
+
+[[models]]
+# A published Wan-2.1-T2V-14B **step-distill** LoRA (sc-8446 S13): the class that settled the
+# globals-surface decision. It carries low-rank factors for 6 of the 7 whole-model globals
+# (`patch_embedding` ships a `.diff_b` bias delta only), so a real install resolves 406 targets against
+# the 407-wide surface — on the pre-sc-8446 per-block-only surface `apply_adapters_strict` rejected the
+# whole file. This is the only real-weight regression gate on that decision. Only the one LoRA file is
+# fetched, not the ~200 other checkpoints in the repo.
+key = "wan-lightx2v-step-distill-lora"
+repository = "Kijai/WanVideo_comfy"
+revision = "8260d429d19fd7a72304cad059160b95d843913f"
+license = "Apache-2.0"
+size_class = "medium"
+profiles = ["media-macos"]
+environment = ["KREA_DISTILL_LORA_SNAPSHOT"]
+download_files = ["Lightx2v/lightx2v_T2V_14B_cfg_step_distill_v2_lora_rank64_bf16.safetensors"]
+expected_files = ["Lightx2v/lightx2v_T2V_14B_cfg_step_distill_v2_lora_rank64_bf16.safetensors"]

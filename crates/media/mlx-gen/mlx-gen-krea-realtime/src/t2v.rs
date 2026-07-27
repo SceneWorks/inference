@@ -136,9 +136,51 @@ fn resolve_request_config(
 /// the scail2 z16 budget: window size shrinks as the resolution grows so the decode peak stays bounded,
 /// and each window is capped by the z16 **write** safety bound (`VaeTiling::WAN`'s `writable_frame_cap`).
 ///
-/// Public so a validation harness can decode a latent through the **same** windowing the product path
-/// uses (sc-8446, S13): a control that decodes single-pass is not comparable to a tiled product decode,
-/// and hard-coding the window in a test would silently drift from this policy.
+/// `#[doc(hidden)] pub` — reachable so a validation harness in `tests/` can decode through the **same**
+/// windowing the product path uses (sc-8446, S13; a single-pass control is not comparable to a tiled
+/// product decode, and hard-coding the window in a test would silently drift from this policy), but not
+/// part of the crate's advertised API. A dedicated `test-support` feature for one function is heavier
+/// than the problem.
+///
+/// ## 🔴 This tiling VISIBLY CORRUPTS the decode at every shipped bucket (sc-15325)
+///
+/// Measured on real latents at 832×480 / 36 output frames, decoding the **same** latent every way and
+/// comparing against a single-pass reference (`tests/generate_smoke.rs::
+/// decode_tiling_sweep_against_single_pass`). "latent" columns are after `TilePlan::plan` divides by
+/// the z16 `temporal_scale` of 4:
+///
+/// | tile / overlap (output) | latent | mean \|Δ\| /255 | highlight clipping mean / worst | MLX active peak |
+/// |---|---|---|---|---|
+/// | single-pass | — | 0 (reference) | 0.08% / 0.25% | 85.1 GiB |
+/// | **8 / 2 — the ORIGINAL shipped value** | 2 / **0** | **18.5** | **9.7% / 26.6%** | 19.8 GiB |
+/// | 8 / 8 — what this function now emits | 2 / 2 | 17.1 | 5.2% / 14.7% | 19.8 GiB |
+/// | 16 / 8 | 4 / 2 | 6.4 | 1.4% / 7.0% | 38.5 GiB |
+/// | 32 / 16 | 8 / 4 | 2.0 | 0.1% / 1.1% | 75.8 GiB |
+///
+/// This is not a cosmetic seam. At the original setting one frame in eight blows **26% of its pixels**
+/// to near-white with violet/green chroma separation and rainbow fringing, against 0.25% single-pass —
+/// the same latents decode to a photographic image single-pass and to a psychedelic one tiled.
+///
+/// **The dominant term is TILE SIZE, not overlap.** Widening the overlap alone plateaus immediately
+/// (latent overlap 0 → 1 → 2 gives 18.5 → 17.1 → 17.1), while growing the tile keeps paying
+/// (latent 2 → 4 → 8 gives 18.5 → 6.4 → 2.0). So the mechanism is a **starved temporal receptive
+/// field**: two latent frames is less context than the z16 decoder's temporal convolutions need, and no
+/// amount of blending between two starved windows reconstructs what neither of them saw. An earlier
+/// reading of this bug as a *blending* failure (zero latent overlap ⇒ `trapezoidal_mask` has nothing to
+/// blend) is a real defect but a **minor** contributor, and predicts a free fix that the measurements
+/// above refute.
+///
+/// **What is fixed here, and what is not.** The overlap is now `max(tile/4, temporal_scale)` so it
+/// survives the ÷4 — free (identical 19.8 GiB peak) and it roughly halves the clipping. The tile size
+/// is **not** raised, because tile size *is* the memory bound: 16 costs 38.5 GiB and 32 costs 75.8 GiB
+/// against a whole-pipeline Q4 peak of 27.9 GiB, so raising it re-opens `mlx.minMemoryGb` for this
+/// engine **and** for `mlx-gen-scail2`, which computes the identical budget. That is a product decision
+/// about memory floors, not a local cleanup — **sc-15325** carries the full curve.
+///
+/// The families that route through [`budgeted_plan`](mlx_gen::tiling::budgeted_plan) instead (Wan
+/// z16/z48, LTX) pick from candidate tables of 24–96 output frames with 8–24-frame overlaps, so they
+/// are **not** in this regime. The exposure is this function and its `mlx-gen-scail2` twin.
+#[doc(hidden)]
 pub fn decode_tiling(out_h: usize, out_w: usize, out_frames: i32) -> Option<TilingConfig> {
     let px_per_frame = (out_h as i64) * (out_w as i64);
     let budget_frames = DECODE_TILE_BUDGET_PXFRAMES / px_per_frame.max(1);
@@ -149,7 +191,10 @@ pub fn decode_tiling(out_h: usize, out_w: usize, out_frames: i32) -> Option<Tili
     if tile_frames >= out_frames {
         return None; // one window covers the clip → single-pass decode.
     }
-    let overlap = (tile_frames / 4).max(1);
+    // sc-15325: floor the overlap at one whole LATENT frame. `TilePlan::plan` divides by
+    // `temporal_scale`, so the previous `tile/4` gave 2 output frames ⇒ 0 latent ⇒ hard-cut windows.
+    // Free (the peak is set by `tile_frames`), and it halves the highlight clipping.
+    let overlap = (tile_frames / 4).max(TEMPORAL_STRIDE as i32);
     Some(TilingConfig::temporal_only(tile_frames, overlap))
 }
 

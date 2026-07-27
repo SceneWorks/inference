@@ -145,9 +145,16 @@ fn dump_frames(frames: &[Image], label: &str) {
 /// Background sampler for the MLX allocator's high-water marks.
 ///
 /// `mlx_rs::memory::get_peak_memory` is the **active** high-water mark only — it excludes the
-/// allocator's buffer cache, which is real resident memory the OS must have available. A ceiling
-/// derived from `get_peak_memory` alone therefore under-reports, so this samples `active` and
-/// `active + cache` independently and reports both.
+/// allocator's buffer cache. So this samples `active` and `active + cache` independently.
+///
+/// Two caveats the reported numbers must be read with:
+/// * `active + cache` is **polled at 50 ms** and can miss a shorter spike, so it is a **lower bound**.
+///   (`active` is not: it takes the max of the sampler and MLX's own exact high-water mark.)
+/// * That cut both ways in the derivation. The cache is *reclaimable* — MLX frees cached buffers under
+///   pressure to stay inside `get_memory_limit()` — so the figure a machine must actually satisfy is
+///   the **active** peak, and `mlx.minMemoryGb` is derived from that. `active + cache` records what the
+///   allocator was willing to hold when RAM was abundant; it is the reason not to quote
+///   `get_peak_memory` as "the memory this uses", not itself the requirement.
 struct MemorySampler {
     stop: Arc<AtomicBool>,
     max_active: Arc<AtomicUsize>,
@@ -342,7 +349,47 @@ fn assert_coherent(frames: &[Image], w: usize, h: usize, label: &str) {
 // Weights-free gate (runs in CI)
 // ---------------------------------------------------------------------------------------------
 
-/// The request the real-weight smoke builds must be inside the model's *advertised* surface, checked
+/// **sc-15325 — the decode tiling's two properties, pinned. Weights-free arithmetic.**
+///
+/// 1. The overlap now survives the ÷`temporal_scale` to latent space (the sc-8446 fix — it used to be
+///    `tile/4` = 2 output frames ⇒ **0** latent frames ⇒ hard-cut windows).
+/// 2. The tile is **still** only 2 latent frames at every shipped bucket, which the real-weight sweep
+///    shows is the *dominant* cause of the corruption. That is deliberately NOT fixed here (it is the
+///    memory bound), so this pins the known-bad state rather than pretending it is resolved.
+#[test]
+fn decode_tiling_overlap_survives_but_the_tile_is_still_starved() {
+    const TEMPORAL_SCALE: i32 = 4; // VaeTiling::WAN
+
+    for (w, h) in [(832usize, 480usize), (640, 384), (1280, 720), (480, 832)] {
+        let cfg = decode_tiling(h, w, 84).expect("a full clip must tile at a shipped bucket");
+        let t = cfg.temporal.expect("temporal-only tiling");
+        assert!(
+            t.overlap_frames / TEMPORAL_SCALE >= 1,
+            "{w}x{h}: overlap {} output frames collapses to 0 latent frames — the sc-8446 floor \
+             regressed",
+            t.overlap_frames
+        );
+        // The known-bad half, pinned so a future budget change is a deliberate act with a test to
+        // update. Every shipped bucket lands at 2-3 latent frames; the real-weight sweep shows the
+        // corruption only clears around 8.
+        assert!(
+            (2..=3).contains(&(t.tile_frames / TEMPORAL_SCALE)),
+            "{w}x{h}: the tile is {} latent frames, outside the known-bad 2-3 band — if the sc-15325 \
+             budget was raised, re-measure the quality/memory curve and update the decision record",
+            t.tile_frames / TEMPORAL_SCALE
+        );
+    }
+
+    // The overlap fix costs nothing: `tile_frames` (the memory bound) is untouched by it.
+    let t = decode_tiling(480, 832, 84).unwrap().temporal.unwrap();
+    assert_eq!(
+        (t.tile_frames, t.overlap_frames),
+        (8, 4),
+        "832x480: tile 8 (unchanged, the memory bound) with the overlap floored to one latent frame"
+    );
+}
+
+/// The request the real-weight smoke builds must be inside the model's *advertised* surface/// The request the real-weight smoke builds must be inside the model's *advertised* surface, checked
 /// against the registered descriptor with no weights on disk. Discriminating: it goes through
 /// `Generator::validate` (the same floor `run` self-applies), so a smoke that quietly drifted
 /// out-of-surface — a guidance scale on this CFG-off model, an unadvertised sampler, a size below the
@@ -430,8 +477,12 @@ struct RunResult {
     decode: std::time::Duration,
     /// Model load + prompt encode + the first denoise step (everything before the first `Step` mark).
     prologue: std::time::Duration,
-    /// Mean measured denoise-step wall time (over every observable step-to-step interval).
+    /// Mean denoise-step wall time over **non-boundary** intervals — the cost of one denoise step, with
+    /// the unobservable KV-recompute forward excluded. This is the figure epic 8432 should use.
     mean_step: std::time::Duration,
+    /// The same mean including boundary intervals (each of which also contains a KV recompute), kept so
+    /// the inflation is visible rather than silently corrected away.
+    mean_step_with_boundaries: std::time::Duration,
     peak_active: usize,
     peak_total: usize,
     /// `(phase label, peak_active_so_far, peak_total_so_far)` at each pipeline boundary. Because both
@@ -465,7 +516,10 @@ fn run(req: &GenerationRequest, expected_chunks: usize, label: &str) -> RunResul
                     first_step = Some(now);
                     println!("  {label}: {total} denoise steps");
                     let (a, t) = sampler.snapshot();
-                    phase_peaks.push(("after load + prompt encode", a, t));
+                    // NB: this fires at the FIRST `Progress::Step`, which is emitted *after* that
+                    // step's compute and eval — so it already includes one full DiT forward and one
+                    // chunk of KV, not just load + encode. Named for what it measures.
+                    phase_peaks.push(("through the first denoise step", a, t));
                 }
                 last = current;
                 step_marks.push(now);
@@ -499,15 +553,36 @@ fn run(req: &GenerationRequest, expected_chunks: usize, label: &str) -> RunResul
         (Some(a), Some(b)) => b.duration_since(a),
         _ => std::time::Duration::ZERO,
     };
-    let step_intervals: Vec<std::time::Duration> = step_marks
+    // Per-step time. An interval that SPANS a chunk boundary also contains the S5 clean-context
+    // KV-recompute forward, which emits no `Progress` — including those inflates the per-step figure by
+    // ~17% (measured 6.2 vs 5.3 s at 832x480). The realtime epic wants the cost of a denoise step, so
+    // boundary intervals are excluded here and the recompute is reported inside the per-chunk time,
+    // where it belongs.
+    let all_intervals: Vec<std::time::Duration> = step_marks
         .windows(2)
         .map(|w| w[1].duration_since(w[0]))
         .collect();
-    let mean_step = if step_intervals.is_empty() {
-        std::time::Duration::ZERO
+    let per_chunk_steps = if expected_chunks > 0 && !step_marks.is_empty() {
+        step_marks.len() / expected_chunks
     } else {
-        step_intervals.iter().sum::<std::time::Duration>() / step_intervals.len() as u32
+        0
     };
+    let in_chunk: Vec<std::time::Duration> = all_intervals
+        .iter()
+        .enumerate()
+        // interval i sits between step i and step i+1; it crosses a boundary when step i+1 starts a chunk
+        .filter(|(i, _)| per_chunk_steps == 0 || !(i + 1).is_multiple_of(per_chunk_steps))
+        .map(|(_, d)| *d)
+        .collect();
+    let mean_of = |v: &[std::time::Duration]| {
+        if v.is_empty() {
+            std::time::Duration::ZERO
+        } else {
+            v.iter().sum::<std::time::Duration>() / v.len() as u32
+        }
+    };
+    let mean_step = mean_of(&in_chunk);
+    let mean_step_with_boundaries = mean_of(&all_intervals);
     let mut per_chunk = Vec::new();
     if expected_chunks > 0
         && !step_marks.is_empty()
@@ -539,6 +614,7 @@ fn run(req: &GenerationRequest, expected_chunks: usize, label: &str) -> RunResul
         decode,
         prologue,
         mean_step,
+        mean_step_with_boundaries,
         peak_active,
         peak_total,
         phase_peaks,
@@ -558,8 +634,9 @@ fn report(label: &str, r: &RunResult, w: usize, h: usize, frames: usize) {
         r.prologue
     );
     println!(
-        "  AR denoise   : {:.2?} ({:.2?}/step mean)",
-        r.denoise, r.mean_step
+        "  AR denoise   : {:.2?} ({:.2?}/step mean, excl. chunk boundaries; {:.2?} incl. — a \
+         boundary interval also carries the KV-recompute forward, which emits no progress event)",
+        r.denoise, r.mean_step, r.mean_step_with_boundaries
     );
     println!("  VAE decode   : {:.2?}", r.decode);
     for (i, d) in r.per_chunk.iter().enumerate() {
@@ -793,6 +870,346 @@ fn v2v_strength_zero_preserves_the_source() {
     assert_coherent(&r.frames, w, h, "v2v/strength=0");
 }
 
+/// **sc-15325, measured: the overlap fix helps but the TILE is the dominant term.**
+///
+/// A focused two-point check of the claim the decision record rests on, on real weights: at a fixed
+/// tile size, widening the overlap from the old 2 output frames (0 latent) to 8 (2 latent) must help —
+/// and must then **plateau**, because the remaining error is receptive-field starvation the blend
+/// cannot recover. Growing the tile instead must beat both by a wide margin.
+///
+/// This is the test that would fail if the "it is a blending problem, so the fix is free" reading were
+/// right — and it is the reading an earlier cut of this work shipped in its decision record.
+#[test]
+#[ignore = "real snapshot; run with --ignored on macOS (see module doc)"]
+fn decode_tile_size_dominates_overlap() {
+    use mlx_gen::tiling::{TemporalTiling, TilingConfig};
+    use mlx_gen_wan::{preprocess_i2v_image, WanVae};
+    use mlx_rs::ops::concatenate_axis;
+
+    let root = require_snapshot();
+    let w = env_usize("KREA_SMOKE_W", 832);
+    let h = env_usize("KREA_SMOKE_H", 480);
+    let frames = env_usize("KREA_SMOKE_FRAMES", 33);
+    let latent_frames = (frames - 1) / 4 + 1;
+    let write_cap = mlx_gen::tiling::VaeTiling::WAN.writable_frame_cap(h as i32, w as i32);
+    assert!(
+        (latent_frames * 4) as i64 <= write_cap,
+        "needs a valid single-pass reference: {} output frames exceeds the z16 write cap {write_cap}",
+        latent_frames * 4
+    );
+
+    let vw =
+        mlx_gen::weights::Weights::from_file(root.join("vae.safetensors")).expect("open the VAE");
+    let vae = WanVae::from_weights(&vw).expect("load the z16 Wan VAE");
+    let chw: Vec<mlx_rs::Array> = (0..frames)
+        .map(|i| {
+            preprocess_i2v_image(&smooth_frame(w, h, i), w as u32, h as u32)
+                .expect("preprocess")
+                .expand_dims(1)
+                .expect("expand")
+        })
+        .collect();
+    let video = concatenate_axis(&chw.iter().collect::<Vec<_>>(), 1)
+        .expect("stack")
+        .expand_dims(0)
+        .expect("batch");
+    let z = vae.encode(&video).expect("VAE encode");
+    let zs = z.shape().to_vec();
+    let latents = z
+        .reshape(&[zs[1], zs[2], zs[3], zs[4]])
+        .expect("drop batch");
+
+    let decode = |tiling: Option<&TilingConfig>| -> Vec<Image> {
+        match decode_latents_to_video(
+            &vae,
+            &latents,
+            24,
+            Some(frames),
+            tiling,
+            &mlx_gen::CancelFlag::default(),
+        )
+        .expect("VAE decode")
+        {
+            GenerationOutput::Video { frames, .. } => frames,
+            other => panic!("expected a Video output, got {other:?}"),
+        }
+    };
+    let cfg = |tile: i32, overlap: i32| TilingConfig {
+        spatial: None,
+        temporal: Some(TemporalTiling {
+            tile_frames: tile,
+            overlap_frames: overlap,
+        }),
+    };
+
+    let single = decode(None);
+    let old = mean_abs_delta(&single, &decode(Some(&cfg(8, 2)))); // 0 latent overlap (pre-fix)
+    let fixed = mean_abs_delta(&single, &decode(Some(&cfg(8, 8)))); // 2 latent overlap (post-fix)
+    let bigger = mean_abs_delta(&single, &decode(Some(&cfg(32, 8)))); // 8 latent tile
+    println!(
+        "  sc-15325 vs single-pass: tile 8/ov 2 (old) = {old:.2}, tile 8/ov 8 (fixed) = {fixed:.2}, \
+         tile 32/ov 8 = {bigger:.2} (all /255)"
+    );
+
+    assert!(
+        fixed < old,
+        "the overlap floor did not help at all ({fixed:.2} vs {old:.2})"
+    );
+    assert!(
+        bigger < fixed * 0.5,
+        "growing the TILE ({bigger:.2}) did not decisively beat widening the OVERLAP ({fixed:.2}) — \
+         the sc-15325 root cause (receptive-field starvation, not blending) needs revisiting"
+    );
+}
+
+/// **sc-15325 root cause: decode the SAME real t2v latents single-pass/// **sc-15325 root cause: decode the SAME real t2v latents single-pass vs. every tiling candidate.**
+///
+/// This is the experiment the whole diagnosis rests on. It generates a real clip's latents once, then
+/// decodes them repeatedly — single-pass (the reference every tiled decode approximates) and across a
+/// sweep of `(tile_frames, overlap_frames)` — and reports, per decode: mean |Δ| vs single-pass, the
+/// worst per-frame Δ and where it lands, highlight-clipping %, and mean saturation. If the shipped
+/// tiling's period-8 artifacts vanish single-pass, the tiled decode is the mechanism; the sweep then
+/// says whether the fix is *overlap* (a blending problem) or *tile size* (a temporal receptive-field
+/// problem), which are different bugs with different fixes.
+#[test]
+#[ignore = "real snapshot; run with --ignored on macOS (see module doc)"]
+fn decode_tiling_sweep_against_single_pass() {
+    use mlx_gen::tiling::{TemporalTiling, TilingConfig};
+    use mlx_gen_krea_realtime::{
+        generate_latents, load_krea_realtime_transformer_with_quant, ArGenParams,
+        CausalKreaTransformer,
+    };
+    use mlx_gen_wan::{load_tokenizer, Umt5Encoder, WanVae};
+    use mlx_rs::Array;
+
+    let root = require_snapshot();
+    let w = env_usize("KREA_SMOKE_W", 832);
+    let h = env_usize("KREA_SMOKE_H", 480);
+    let frames = env_usize("KREA_SMOKE_FRAMES", 33);
+    let (latent_h, latent_w) = (h / 8, w / 8);
+    let latent_frames = (frames - 1) / 4 + 1;
+
+    let mut cfg = KreaRealtimeConfig::krea_realtime_14b();
+    cfg.ar.local_attn_size = cfg.ar.streaming_local_attn_frames() as i64;
+    cfg.ar.frame_seq_length = (latent_h / cfg.wan.patch_size.1) * (latent_w / cfg.wan.patch_size.2);
+    cfg.ar.seq_length = latent_frames * cfg.ar.frame_seq_length;
+
+    // --- Generate one real clip's latents (the same content the shipped clip shows). ---
+    let latents = {
+        let tokenizer =
+            load_tokenizer(root.join("tokenizer.json"), cfg.wan.text_len).expect("tokenizer");
+        let mut tw = mlx_gen::weights::Weights::from_file(root.join("t5_encoder.safetensors"))
+            .expect("open the TE");
+        let context = {
+            let enc = Umt5Encoder::from_weights_quantized(
+                &mut tw,
+                &cfg.wan,
+                mlx_gen_wan::config::WanQuant {
+                    bits: 8,
+                    group_size: 64,
+                },
+            )
+            .expect("UMT5");
+            let c = enc
+                .encode(
+                    &tokenizer,
+                    "a red fox trotting through a snowy pine forest at sunrise, drifting snow, \
+                     cinematic, shallow depth of field",
+                )
+                .expect("encode");
+            mlx_rs::transforms::eval([&c]).expect("eval context");
+            c
+        };
+        let dw =
+            mlx_gen::weights::Weights::from_file(root.join("dit.safetensors")).expect("open DiT");
+        let raw: std::collections::HashMap<String, Array> = dw
+            .keys()
+            .map(|k| (k.to_string(), dw.get(k).expect("listed key").clone()))
+            .collect();
+        let (dit, _) = load_krea_realtime_transformer_with_quant(raw, &cfg).expect("load the DiT");
+        let transformer = CausalKreaTransformer::new(dit, &cfg);
+        let params = ArGenParams {
+            seed: 7,
+            steps: None,
+            num_latent_frames: latent_frames,
+            latent_height: latent_h,
+            latent_width: latent_w,
+            fps: 24,
+        };
+        let l = generate_latents(
+            &transformer,
+            &cfg,
+            &context,
+            &params,
+            &mlx_gen::CancelFlag::default(),
+            &mut |_| {},
+        )
+        .expect("generate latents");
+        mlx_rs::transforms::eval([&l]).expect("materialize latents");
+        l
+    };
+    mlx_rs::memory::clear_cache();
+
+    // --- Decode the SAME latents every way. ---
+    let vw =
+        mlx_gen::weights::Weights::from_file(root.join("vae.safetensors")).expect("open the VAE");
+    let vae = WanVae::from_weights(&vw).expect("load the z16 Wan VAE");
+    let decode = |tiling: Option<&TilingConfig>| -> Vec<Image> {
+        match decode_latents_to_video(
+            &vae,
+            &latents,
+            24,
+            Some(frames),
+            tiling,
+            &mlx_gen::CancelFlag::default(),
+        )
+        .expect("VAE decode")
+        {
+            GenerationOutput::Video { frames, .. } => frames,
+            other => panic!("expected a Video output, got {other:?}"),
+        }
+    };
+
+    // Peak is measured per decode: tile size is the decode's memory bound, so "is the fix
+    // affordable" is answered by the same run that answers "does the fix work".
+    let peak_of = |f: &dyn Fn() -> Vec<Image>| -> (Vec<Image>, usize) {
+        mlx_rs::memory::clear_cache();
+        mlx_rs::memory::reset_peak_memory();
+        let out = f();
+        (out, mlx_rs::memory::get_peak_memory())
+    };
+
+    // ⚠️ The single-pass reference is only valid BELOW the z16 write bound. At 832x480 the cap is 56
+    // output frames (`96 · f · h · w <= i32::MAX`); an 84-frame clip is 1.5x over it, and MLX writes
+    // silently WRONG results past that — a corrupt reference that would make every tiled candidate look
+    // catastrophically bad (measured: it collapses saturation 0.33 -> 0.07 and inflates every mean |Δ|
+    // to 58-71/255). Refuse to compare against garbage.
+    let out_frames_total = (latent_frames * 4) as i64;
+    let write_cap = mlx_gen::tiling::VaeTiling::WAN.writable_frame_cap(h as i32, w as i32);
+    assert!(
+        out_frames_total <= write_cap,
+        "this sweep needs a VALID single-pass reference, but {out_frames_total} output frames exceeds \
+         the z16 write cap of {write_cap} at {w}x{h} — past it the untiled decode is silently wrong. \
+         Re-run with KREA_SMOKE_FRAMES <= {}",
+        write_cap - 3
+    );
+
+    let (single, single_peak) = peak_of(&|| decode(None));
+    dump_frames(&single, "sweep_single_pass");
+    println!("--- single-pass (the reference) ---");
+    println!("    [single] MLX active peak {:.2} GiB", gib(single_peak));
+    report_artifacts(&single, "single");
+
+    let shipped = decode_tiling(h, w, (latent_frames * 4) as i32).expect("the clip must tile");
+    let ship_t = shipped.temporal.expect("temporal");
+    let mut candidates: Vec<(i32, i32)> = vec![(ship_t.tile_frames, ship_t.overlap_frames)];
+    for c in [(8, 4), (8, 8), (16, 4), (16, 8), (32, 8), (32, 16)] {
+        if !candidates.contains(&c) {
+            candidates.push(c);
+        }
+    }
+
+    for (tile, overlap) in candidates {
+        let cfg = TilingConfig {
+            spatial: None,
+            temporal: Some(TemporalTiling {
+                tile_frames: tile,
+                overlap_frames: overlap,
+            }),
+        };
+        let (out, peak) = peak_of(&|| decode(Some(&cfg)));
+        let d = mean_abs_delta(&single, &out);
+        let per: Vec<f64> = single
+            .iter()
+            .zip(out.iter())
+            .map(|(a, b)| {
+                a.pixels
+                    .iter()
+                    .zip(b.pixels.iter())
+                    .map(|(&x, &y)| (x as f64 - y as f64).abs())
+                    .sum::<f64>()
+                    / a.pixels.len() as f64
+            })
+            .collect();
+        let (worst_i, worst) =
+            per.iter().enumerate().fold(
+                (0usize, 0.0f64),
+                |acc, (i, &v)| if v > acc.1 { (i, v) } else { acc },
+            );
+        let label = if (tile, overlap) == (ship_t.tile_frames, ship_t.overlap_frames) {
+            format!("tile {tile:>2} / overlap {overlap:>2}  [SHIPPED]")
+        } else {
+            format!("tile {tile:>2} / overlap {overlap:>2}")
+        };
+        println!(
+            "  {label}: latent tile {} / overlap {} -> mean |Δ| {d:.2}/255, worst frame {worst_i} \
+             at {worst:.2}",
+            tile / 4,
+            overlap / 4
+        );
+        println!(
+            "    [t{tile}o{overlap}] MLX active peak {:.2} GiB",
+            gib(peak)
+        );
+        report_artifacts(&out, &format!("t{tile}o{overlap}"));
+        if (tile, overlap) == (ship_t.tile_frames, ship_t.overlap_frames) {
+            dump_frames(&out, "sweep_shipped");
+        }
+        if (tile, overlap) == (32, 16) {
+            dump_frames(&out, "sweep_best");
+        }
+    }
+
+    // The one thing this test must gate rather than merely report: the shipped tiling is materially
+    // worse than single-pass. If that ever stops being true the artifact is fixed and sc-15325 closes.
+    let shipped_out = decode(Some(&shipped));
+    let d_shipped = mean_abs_delta(&single, &shipped_out);
+    assert!(
+        d_shipped > 5.0,
+        "the shipped tiled decode now matches single-pass to {d_shipped:.2}/255 — sc-15325 appears \
+         fixed; update this gate and the decision record"
+    );
+}
+
+/// Per-clip artifact statistics the naive min/max/mean misses: highlight clipping and saturation are
+/// what a viewer actually sees blow out, and the period is what identifies the mechanism.
+fn report_artifacts(frames: &[Image], label: &str) {
+    let mut clip_pcts = Vec::with_capacity(frames.len());
+    let mut sats = Vec::with_capacity(frames.len());
+    for f in frames {
+        let n = f.pixels.len() / 3;
+        let mut clipped = 0usize;
+        let mut sat_sum = 0.0f64;
+        for px in f.pixels.chunks_exact(3) {
+            let (r, g, b) = (px[0] as f64, px[1] as f64, px[2] as f64);
+            let mx = r.max(g).max(b);
+            let mn = r.min(g).min(b);
+            if mx >= 250.0 {
+                clipped += 1;
+            }
+            sat_sum += if mx > 0.0 { (mx - mn) / mx } else { 0.0 };
+        }
+        clip_pcts.push(100.0 * clipped as f64 / n as f64);
+        sats.push(sat_sum / n as f64);
+    }
+    let worst_clip = clip_pcts.iter().cloned().fold(0.0f64, f64::max);
+    let worst_i = clip_pcts
+        .iter()
+        .enumerate()
+        .fold(
+            (0usize, 0.0f64),
+            |a, (i, &v)| if v > a.1 { (i, v) } else { a },
+        )
+        .0;
+    let mean_clip = clip_pcts.iter().sum::<f64>() / clip_pcts.len() as f64;
+    let sat0 = sats.first().copied().unwrap_or(0.0);
+    let satn = sats.last().copied().unwrap_or(0.0);
+    println!(
+        "    [{label}] clipping: mean {mean_clip:.2}% / worst {worst_clip:.2}% at frame {worst_i}; \
+         saturation {sat0:.3} -> {satn:.3}"
+    );
+}
+
 /// **The decisive form of S7 minor #2: is v2v@0 identity in the LATENTS?**
 ///
 /// The pixel test above cannot separate the AR loop from the VAE. This drives
@@ -973,10 +1390,12 @@ fn kv_cache_residency_at_the_production_geometry() {
     let cross_kv = transformer
         .prepare_cross_kv(&embedded)
         .expect("cross-attention cache");
-    // MLX safetensors loads are lazy, so the weights are not resident until something reads them.
-    // The per-prompt cross-attention cache touches every block's `cross_attn.{k,v}` (and the text
-    // embedding), which is enough to pull the packed DiT off disk — so the reading below is a real
-    // staged-model figure rather than the ~0 an unevaluated graph reports.
+    // MLX safetensors loads are lazy, so weights are not resident until something reads them. This
+    // evaluation touches only the text embedding and every block's `cross_attn.{k,v}` — **2 of the 10
+    // per-block Linears and none of the FFN, roughly 15% of the DiT's bytes** (~1.2 of 7.8 GiB at Q4).
+    // So the figure below is a PARTIAL-staging reading, not the DiT's footprint; it is reported as such
+    // and the full residency is the per-chunk `MLX active` column, which is measured after a real
+    // forward has pulled everything in.
     {
         let mut staged: Vec<&Array> = vec![&embedded];
         for (k, v) in &cross_kv {
@@ -985,7 +1404,7 @@ fn kv_cache_residency_at_the_production_geometry() {
         }
         mlx_rs::transforms::eval(staged).expect("stage the DiT");
     }
-    let staged_resident = mlx_rs::memory::get_active_memory();
+    let partially_staged = mlx_rs::memory::get_active_memory();
 
     let fpb = cfg.ar.num_frames_per_block as i32;
     let mut start = 0usize;
@@ -1034,11 +1453,12 @@ fn kv_cache_residency_at_the_production_geometry() {
 
     println!(
         "  KV-cache residency at {w}x{h} ({} tok/frame, window {} frames): {:.2} GiB \
-         (MLX active after staging the DiT: {:.2} GiB)",
+         (MLX active after PARTIAL staging -- text embed + cross-attn k/v only, ~15% of the DiT: \
+         {:.2} GiB)",
         cfg.ar.frame_seq_length,
         cfg.ar.streaming_local_attn_frames(),
         gib(peak_retained_bytes),
-        gib(staged_resident),
+        gib(partially_staged),
     );
     assert!(
         peak_retained_bytes > 0,

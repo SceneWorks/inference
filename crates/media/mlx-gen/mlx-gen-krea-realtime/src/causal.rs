@@ -522,17 +522,30 @@ impl CausalKreaTransformer {
 /// inner [`WanTransformer`]'s own fields via [`WanTransformer::global_adaptable_mut`] — matching the
 /// SCAIL-2 host, which has always exposed its globals.
 ///
-/// Settled against real published Wan LoRA files rather than a guess:
+/// Settled against the safetensors headers of real published Wan LoRA files rather than a guess:
 /// * **Plain style LoRAs** (`shauray/Origami_WanLora`, `motimalu/wan-flat-color-v2`) carry exactly
 ///   `num_layers × 10` per-block stems and **no** globals — they loaded on the pre-widening surface and
 ///   are unaffected by it.
 /// * **Step-distill / lightning LoRAs for this very backbone** (`lightx2v` Wan2.1-T2V-14B
-///   cfg-step-distill v2, `FastWan` T2V-14B) carry genuine `lora_down`/`lora_up` factors for **all
-///   seven** globals. On the narrow surface `apply_adapters_strict` rejected the whole file; soft-skipping
-///   them instead would have *silently* installed a step-distill LoRA with its input/time/output
-///   projections missing — a wrong render that still looks like a success, which is precisely the failure
-///   mode the strict installer exists to prevent. Widening applies them, so both real classes work and the
-///   loud-error property is kept for targets that genuinely do not exist on this model.
+///   cfg-step-distill v2 and `FastWan` T2V-14B — headers read, structurally identical) carry genuine
+///   `lora_down`/`lora_up` factors for **six** of the seven: `text_embedding.0/.2`,
+///   `time_embedding.0/.2`, `time_projection.1`, `head.head`. **`patch_embedding` carries only a
+///   `.diff_b` bias delta, no low-rank pair** — which is exactly why a real install reports **406**
+///   targets (400 per-block + 6) against a 407-wide surface, not 407. `patch_embedding` stays exposed
+///   because the surface is defined by what the model *has*, not by what one file happens to populate.
+///   On the narrow surface `apply_adapters_strict` rejected the whole file; soft-skipping the globals
+///   instead would have *silently* installed a step-distill LoRA with its text/time/output projections
+///   missing — a wrong render that still looks like a success, precisely the failure mode the strict
+///   installer exists to prevent. Widening applies them.
+///
+/// ⚠️ **Widening does NOT make a step-distill file fully applied, and this comment must not be read as
+/// claiming it does.** The same lightx2v/FastWan file carries **647 further keys the low-rank pass does
+/// not consume**: 447 `.diff_b` bias deltas (including `patch_embedding`'s) and 200 `.diff` weight
+/// deltas on the qk/`norm3` **norms**, which are not `AdaptableLinear`s at any surface width. Krea calls
+/// [`apply_adapters_strict`](mlx_gen::adapters::loader::apply_adapters_strict), not the
+/// `_with_diff_patch` variant, so those are dropped **without a word** — the same silent
+/// under-application this decision argues against, merely at a different seam. Tracked as **sc-15326**;
+/// until it lands, "a step-distill LoRA installs" means its low-rank half installs.
 ///
 /// Still deliberately absent, and still a loud error: the I2V-only image cross-attention
 /// (`cross_attn.k_img`/`v_img`, which `Remade-AI/Squish`-style Wan-I2V LoRAs carry). Krea Realtime is the
@@ -668,6 +681,44 @@ mod tests {
                 "`{k}` is a real lightx2v/FastWan global target but is not an adaptable Krea path"
             );
         }
+    }
+
+    /// sc-8446 — the **406 vs 407** gap, pinned where it can be checked rather than left in a commit
+    /// message. The surface is 407 wide (400 per-block + 7 globals), but a real lightx2v / FastWan
+    /// step-distill file installs 406: `patch_embedding` ships a `.diff_b` bias delta only, with no
+    /// `lora_down`/`lora_up` pair for the low-rank pass to consume. Both facts have to stay true —
+    /// the surface must keep `patch_embedding` (the model *has* that Linear), and the expected real
+    /// install count must stay one below the surface width.
+    #[test]
+    fn step_distill_install_count_is_one_below_the_surface_width() {
+        let paths = krea_adaptable_paths(40);
+        assert_eq!(paths.len(), 407, "400 per-block + 7 globals");
+        assert!(
+            paths.iter().any(|p| p == "patch_embedding"),
+            "patch_embedding stays exposed even though step-distill files carry no low-rank pair for it"
+        );
+        // The six globals a real step-distill file DOES carry low-rank factors for.
+        let low_rank_globals = [
+            "text_embedding.0",
+            "text_embedding.2",
+            "time_embedding.0",
+            "time_embedding.2",
+            "time_projection.1",
+            "head.head",
+        ];
+        for g in low_rank_globals {
+            assert!(paths.iter().any(|p| p == g), "`{g}` must be adaptable");
+        }
+        assert_eq!(
+            400 + low_rank_globals.len(),
+            406,
+            "the expected real-weight install count for a step-distill file"
+        );
+        assert_eq!(
+            paths.len() - (400 + low_rank_globals.len()),
+            1,
+            "exactly one exposed global (patch_embedding) is unmatched by a step-distill file"
+        );
     }
 
     /// The file-spelled globals must normalize onto the converted spellings the inner Wan host routes —

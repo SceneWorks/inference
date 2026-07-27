@@ -10,7 +10,7 @@ on:
         type: choice
         required: true
         default: all
-        options: [all, llm, media, audio, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium]
+        options: [all, llm, media, krea-realtime, audio, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium]
 
 permissions:
   contents: read
@@ -278,45 +278,96 @@ jobs:
   # tier fetch should be able to fail without taking the image lane's oracle work with it.
   mlx-krea-realtime:
     name: MLX Krea Realtime video real weights
-    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'media'
+    # `krea-realtime` is selectable on its own so the 20 GB tier fetch does not require running the
+    # Mage-oracle job that shares the `media` profile.
+    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'media' || inputs.profile == 'krea-realtime'
     runs-on: [self-hosted, macOS, ARM64, real-weights]
     env:
       # The repo root of the pinned `SceneWorks/krea-realtime-14b-mlx` rehost. Each tier subdir is a
       # complete snapshot, so the tests are pointed one level in (`/q4`).
       KREA_REALTIME_SNAPSHOT: ${{ vars.KREA_REALTIME_SNAPSHOT }}
       KREA_STYLE_LORA_SNAPSHOT: ${{ vars.KREA_STYLE_LORA_SNAPSHOT }}
-      # A bounded geometry: the reference 832x480 bucket at ~1.4 s of video. Enough latent frames
-      # (9 → 3 autoregressive chunks) for the bounded-window eviction and the tail drift/freeze gates to
-      # be meaningful, without spending the runner's day on a full 81-frame clip.
-      KREA_SMOKE_W: "832"
-      KREA_SMOKE_H: "480"
-      KREA_SMOKE_FRAMES: "33"
-      KREA_LORA_FRAMES: "13"
+      KREA_DISTILL_LORA_SNAPSHOT: ${{ vars.KREA_DISTILL_LORA_SNAPSHOT }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: Toolchain versions
         run: rustc --version && cargo --version
+      # An unset repo variable would otherwise reach `ensure_model_snapshot.py` as an empty path and
+      # fail as a confusing "revision mismatch" rather than "you did not configure this lane".
+      - name: Require the operator-provisioned snapshot paths
+        run: |
+          for v in KREA_REALTIME_SNAPSHOT KREA_STYLE_LORA_SNAPSHOT KREA_DISTILL_LORA_SNAPSHOT; do
+            if [[ -z "${!v}" ]]; then
+              echo "Repository variable $v is unset; this lane cannot resolve its snapshot path" >&2
+              exit 1
+            fi
+            if [[ "${!v}" != /* ]]; then
+              echo "$v must be an absolute path, got: ${!v}" >&2
+              exit 1
+            fi
+          done
       - name: Materialize and verify immutable snapshots
         run: |
           python3 -m pip install --disable-pip-version-check --target "$RUNNER_TEMP/huggingface-hub" "huggingface_hub==1.20.1"
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model krea-realtime-14b-mlx --snapshot "$KREA_REALTIME_SNAPSHOT"
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model wan-origami-style-lora --snapshot "$KREA_STYLE_LORA_SNAPSHOT"
-      # Coherence + per-chunk/whole-clip timing + the MLX memory ceiling, then the measured KV-cache
-      # residency (bf16 activations on every weight tier — the term that sizes `mlx.minMemoryGb`), then
-      # the i2v single-frame anchor and the v2v strength=0 paths.
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model wan-lightx2v-step-distill-lora --snapshot "$KREA_DISTILL_LORA_SNAPSHOT"
+      # Coherence + per-chunk/whole-clip timing + the MLX memory ceiling, then the i2v single-frame
+      # anchor and the v2v strength=0 paths, then the sc-15325 decode-tiling characterization.
+      #
+      # `KREA_SMOKE_FRAMES` is set PER STEP, not on the job: `kv_cache_residency_at_the_production_
+      # geometry` and the decode sweep are about the *production* 81-frame clip, and a job-scoped 33
+      # would silently gate them at the wrong geometry.
       - name: Run Krea Realtime real-weight e2e (Q4 tier)
+        env:
+          KREA_SMOKE_W: "832"
+          KREA_SMOKE_H: "480"
+          KREA_SMOKE_FRAMES: "33"
         run: >-
           KREA_REALTIME_SNAPSHOT_DIR="$KREA_REALTIME_SNAPSHOT/q4"
           cargo test --locked --release -p mlx-gen-krea-realtime --test generate_smoke
           -- --ignored --nocapture --test-threads 1
-      # A published Wan style LoRA must load through `LoadSpec::adapters` and measurably change the
-      # render, with the scale-0 arm as the attribution control.
-      - name: Run Krea Realtime real Wan style-LoRA A/B
+          --skip kv_cache_residency_at_the_production_geometry
+      # The KV-cache residency IS a production-geometry measurement (the 6-latent-frame window must be
+      # full), so it runs at the real 81-frame clip.
+      - name: Run Krea Realtime KV-cache residency (production geometry)
+        env:
+          KREA_SMOKE_W: "832"
+          KREA_SMOKE_H: "480"
+          KREA_SMOKE_FRAMES: "81"
         run: >-
           KREA_REALTIME_SNAPSHOT_DIR="$KREA_REALTIME_SNAPSHOT/q4"
-          KREA_STYLE_LORA="$KREA_STYLE_LORA_SNAPSHOT/origami_000000500.safetensors"
-          cargo test --locked --release -p mlx-gen-krea-realtime --test style_lora_real_weights
-          real_wan_style_lora_loads_and_changes_the_render -- --ignored --nocapture
+          cargo test --locked --release -p mlx-gen-krea-realtime --test generate_smoke
+          kv_cache_residency_at_the_production_geometry --exact
+          -- --ignored --nocapture
+      # A published Wan style LoRA must load through `LoadSpec::adapters` and measurably change the
+      # render, with the scale-0 arm as the attribution control; and the step-distill file is the only
+      # real-weight regression gate on the sc-8446 globals-surface decision.
+      #
+      # `--exact` + a run-count assertion: selecting by bare name means a rename yields
+      # "0 passed; N filtered out" and a GREEN step, silently deleting the only coverage these have.
+      - name: Run Krea Realtime real Wan LoRA gates
+        env:
+          KREA_LORA_W: "832"
+          KREA_LORA_H: "480"
+          KREA_LORA_FRAMES: "13"
+        run: |
+          set -o pipefail
+          run_one() {
+            local name="$1"
+            local out
+            out="$(KREA_REALTIME_SNAPSHOT_DIR="$KREA_REALTIME_SNAPSHOT/q4" \
+              KREA_STYLE_LORA="$KREA_STYLE_LORA_SNAPSHOT/origami_000000500.safetensors" \
+              KREA_DISTILL_LORA="$KREA_DISTILL_LORA_SNAPSHOT/Lightx2v/lightx2v_T2V_14B_cfg_step_distill_v2_lora_rank64_bf16.safetensors" \
+              cargo test --locked --release -p mlx-gen-krea-realtime --test style_lora_real_weights \
+              "$name" --exact -- --ignored --nocapture 2>&1 | tee /dev/stderr)"
+            if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
+              echo "::error::'$name' did not run exactly one passing test — a rename would make this step vacuously green" >&2
+              return 1
+            fi
+          }
+          run_one real_wan_style_lora_loads_and_changes_the_render
+          run_one real_wan_step_distill_lora_installs_over_the_widened_globals
 
   candle-audio:
     name: Candle audio real weights
