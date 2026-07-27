@@ -74,9 +74,9 @@ const GUIDANCE_ORACLE_SCALE: f64 = 2.5;
 ///
 /// Be exact about what that yields: a principled cross-scale bound calibrated on three backends —
 /// Metal, CUDA and CPU — not a derivation. Only the first two are still enforced: since sc-14546
-/// [`device`] honours `SA3_TEST_CUDA`, so `sa3-base-identity-{metal,cuda}` pin the Metal and CUDA
-/// points and no lane measures CPU any more. The CPU point is why the rescaling exists (the
-/// unscaled floor failed there), and the CUDA residual `3.524780e-3` likewise exceeds its own
+/// made [`device`] honour `SA3_TEST_CUDA`, `sa3-base-identity-{metal,cuda}` pin the Metal and CUDA
+/// points, and no lane measures CPU any more. CPU is why the rescaling exists — the unscaled floor
+/// failed there — and it was not alone: the CUDA residual `3.524780e-3` also exceeds its own
 /// unscaled floor `3.471375e-3`, so the unscaled bound would have failed on both non-Metal
 /// backends. Two caveats say why it is not stronger than that. First, the two quantities do not
 /// measure the same error — the floor is this implementation's disagreement with frozen Torch, the
