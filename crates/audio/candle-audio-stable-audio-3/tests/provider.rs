@@ -957,10 +957,11 @@ const MUSIC_SWEEP_PROMPTS: &[&str] = &[
     "warm cinematic post-rock with bowed strings and restrained drums",
 ];
 
-/// The medium sweep deliberately spans **both** domains: two shipped music `demo_cond` prompts from
-/// medium's own `model_config.json`, two shipped SFX `demo_cond` prompts from `small-sfx`, and the
-/// prompt medium's per-run gate renders. Medium is the only SA3 checkpoint tagged for both domains,
-/// so a floor calibrated on music alone would not cover what this id is registered to serve.
+/// The medium sweep deliberately spans **both** domains: **both** shipped music `demo_cond` prompts
+/// from medium's own `model_config.json` — it ships exactly two, so this is the entire list and not
+/// a selection from it — two shipped SFX `demo_cond` prompts from `small-sfx`, and the prompt
+/// medium's per-run gate renders. Medium is the only SA3 checkpoint tagged for both domains, so a
+/// floor calibrated on music alone would not cover what this id is registered to serve.
 const MEDIUM_SWEEP_PROMPTS: &[&str] = &[
     "Meditative lo-fi ambient piano jazz, soft acoustic drum kit",
     "A tropical house track with upbeat melodies, a driving bassline, and cheery vibes",
