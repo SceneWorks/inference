@@ -26,7 +26,17 @@
 //!   * [`multi_chunk_causal_forward_matches_torch_golden`] — the ≥2-chunk numeric anchor. Chunk 0
 //!     fills the KV cache; chunks 1 and 2 run at `current_start = block_size` / `2·block_size` (the
 //!     path where a mask-interpretation or RoPE-`start_frame` error shows up) and all three must
-//!     match the reference velocities.
+//!     match the reference velocities. Note the limit of this test taken alone: it catches a mask
+//!     rule error only insofar as that error changes the *effective attention set*. In this geometry
+//!     each AR chunk is exactly one block, so `block_causal_mask` returns `None` and no mask is ever
+//!     materialised in the numeric path. A rule change that makes the mask non-`None` does surface
+//!     here (making the intra-block attention causal instead of bidirectional moves `mean_rel` to
+//!     1.05e-1), but a rule change that merely widens the allowed set *ahead* of the current block is
+//!     structurally invisible: in the incremental AR path no future-block key is ever present in
+//!     `kv_positions`. Concretely, an off-by-one in the block boundary (`causal.rs`, `end_of_block`
+//!     returning `(q / bs + 1) * bs + 1`) leaves every chunk here bit-identical and is caught **only**
+//!     by test (1), at 16/576 mismatched mask entries. The two tests are complementary, not
+//!     redundant: (1) is the standalone mask-RULE anchor, this one is the end-to-end numeric anchor.
 //!   * [`wrong_rope_offset_fails_the_torch_golden`] — the NEGATIVE CONTROL. A golden test that would
 //!     pass against a wrong implementation is worthless, so this reproduces the deepest chunk with
 //!     the causal-RoPE `start_frame` deliberately zeroed and asserts the golden comparison goes RED,

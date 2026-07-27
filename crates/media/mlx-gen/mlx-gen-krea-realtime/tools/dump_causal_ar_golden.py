@@ -33,10 +33,12 @@ mask rule and the `causal_rope_apply` `start_frame` offset.**
   1. `model.py`: `device=torch.cuda.current_device()` → `device=position.device` (1x).
      PORTABILITY. `sinusoidal_embedding_1d` hard-codes a CUDA device; this host has none. Purely
      where the arange is allocated, not what it contains.
-  2. `model.py`: `dtype = torch.bfloat16` → `dtype = q.dtype` (cross-attention SDPA fallback).
-     PRECISION. The published fallback down-casts q/k/v to bf16 unconditionally, which both (a)
-     crashes an fp32 model at the following fp32 `self.o(x)` and (b) would put a bf16 noise floor
-     under the golden. Same math, higher precision.
+  2. `model.py`: `dtype = torch.bfloat16` → `dtype = q.dtype` — BOTH occurrences (2x): the
+     cross-attention SDPA fallback AND the sageattention branch above it (the latter is dead on this
+     host, which has no `sageattn`; it is patched only because the count-assert covers the whole
+     file and both sites are the identical cast). PRECISION. The published code down-casts q/k/v to
+     bf16 unconditionally, which both (a) crashes an fp32 model at the following fp32 `self.o(x)`
+     and (b) would put a bf16 noise floor under the golden. Same math, higher precision.
   3. `causal_model.attention` / `model.attention` are rebound to the reference's own `attention`
      with `dtype=torch.float32`. PRECISION, via a kwarg the reference itself exposes (its default is
      `torch.bfloat16`); the function body is unchanged.
