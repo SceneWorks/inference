@@ -30,12 +30,12 @@ use mlx_gen::adapters::loader::apply_adapters_strict;
 use mlx_gen::adapters::AdaptableHost;
 use mlx_gen::{AdapterKind, AdapterSpec, Quant};
 use mlx_gen_krea_realtime::{
-    convert_krea_realtime_tier, convert_krea_realtime_tier_with_config,
-    expected_transformer_tensors, load_krea_realtime_transformer,
-    load_krea_realtime_transformer_with_quant, quantize_krea_realtime_transformer,
-    resolve_load_time_quant, resolve_snapshot_quant, sanitize_krea_realtime_transformer,
-    verify_transformer_tensors, CausalKreaTransformer, KreaRealtimeConfig, WanQuant, DIT_FILE,
-    MODEL_ID, PACKED_LINEARS_PER_BLOCK,
+    convert_krea_realtime_tier, convert_krea_realtime_tier_sharded,
+    convert_krea_realtime_tier_with_config, expected_transformer_tensors,
+    load_krea_realtime_transformer, load_krea_realtime_transformer_with_quant,
+    quantize_krea_realtime_transformer, resolve_load_time_quant, resolve_snapshot_quant,
+    sanitize_krea_realtime_transformer, verify_transformer_tensors, CausalKreaTransformer,
+    KreaRealtimeConfig, WanQuant, DIT_FILE, MODEL_ID, PACKED_LINEARS_PER_BLOCK, TRANSFORMER_DIR,
 };
 use mlx_rs::{Array, Dtype};
 
@@ -717,6 +717,307 @@ fn tier_converter_writes_a_snapshot_the_load_path_reads_back() {
             "{tier}: packed-ness must match the tier"
         );
     }
+
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// (11) **The sharded emitter is interchangeable with the single-file one.** `convert_krea_realtime_
+/// tier_sharded` is what S2b's dense bf16 tier is written with — the tier is too large to materialize
+/// as one file on the conversion host, so it is emitted shard-by-shard and each shard is uploaded and
+/// deleted through the `on_shard` callback. This proves the layout it produces is a real snapshot:
+/// the shard set is disjoint and complete, the load path reads it back through the `transformer/`
+/// directory branch at the right tier, and the reconstructed tensor set is **identical** to what the
+/// single-file emitter writes from the same source.
+///
+/// Discriminating: it asserts the shards are actually MULTIPLE (a budget that silently produced one
+/// shard would make the whole disk-bounded flow a no-op and still "pass"); that the emit is genuinely
+/// **incremental** — when `on_shard` fires for shard `i`, no shard `> i` exists on disk yet, so an
+/// emitter that wrote all N shards up front and only then invoked the callback N times (exactly the
+/// failure mode the disk bound exists to prevent) fails here; and that tensor **values**, not just key
+/// names, survive the split.
+#[test]
+fn sharded_emitter_matches_the_single_file_emitter_and_holds_one_shard_at_a_time() {
+    let cfg = tiny_cfg();
+    let base = std::env::temp_dir().join(format!("krea_tier_sharded_{}", std::process::id()));
+    let native = write_native_checkpoint(&cfg, &base);
+
+    for (tier, quantize) in [("bf16", None), ("q4", Some((4, GROUP)))] {
+        // Reference: the single-file emitter over the same source.
+        let flat = base.join(format!("{tier}-flat"));
+        convert_krea_realtime_tier_with_config(&native, &flat, quantize, &cfg).unwrap();
+        let fw = mlx_gen::weights::Weights::from_file(flat.join(DIT_FILE)).unwrap();
+        let mut want: Vec<String> = fw.keys().map(|k| k.to_string()).collect();
+        want.sort();
+
+        // Sharded: budget deliberately below the tier size so the plan really splits.
+        let total_bytes: u64 = fw.keys().map(|k| fw.get(k).unwrap().nbytes() as u64).sum();
+        let budget = total_bytes / 3;
+
+        let sharded = base.join(format!("{tier}-sharded"));
+        let shard_dir = sharded.join(TRANSFORMER_DIR);
+        let mut seen: Vec<PathBuf> = Vec::new();
+        let paths = convert_krea_realtime_tier_sharded(
+            &native,
+            &sharded,
+            quantize,
+            &cfg,
+            budget,
+            &mut |p| {
+                // The callback must see a finished, readable shard...
+                assert!(p.is_file(), "{tier}: on_shard got a missing shard {p:?}");
+
+                // ...and NOTHING later may exist yet. This is the load-bearing assertion: it is what
+                // separates a truly incremental emitter from one that writes every shard first and
+                // then calls back N times. Parse `dit-{i}-of-{n}` and require every higher index to be
+                // absent.
+                let (idx, total) = parse_shard_name(p);
+                for j in (idx + 1)..=total {
+                    let later = shard_dir.join(format!("dit-{j:05}-of-{total:05}.safetensors"));
+                    assert!(
+                        !later.exists(),
+                        "{tier}: shard {j} already on disk while shard {idx} was being handed over — \
+                         the emit is not incremental, so the disk bound does not hold"
+                    );
+                }
+                // Belt and braces: with the previous shards deleted below, exactly one shard file may
+                // be present at any moment — i.e. peak footprint really is one shard, not the tier.
+                let on_disk = std::fs::read_dir(&shard_dir)
+                    .unwrap()
+                    .filter(|e| {
+                        e.as_ref().is_ok_and(|e| {
+                            e.path().extension().and_then(|s| s.to_str()) == Some("safetensors")
+                        })
+                    })
+                    .count();
+                assert_eq!(
+                    on_disk, 1,
+                    "{tier}: {on_disk} shard files on disk at shard {idx} — expected exactly 1"
+                );
+
+                seen.push(p.to_path_buf());
+                std::fs::remove_file(p).unwrap(); // the rehost uploads, then deletes
+                Ok(())
+            },
+        )
+        .unwrap_or_else(|e| panic!("{tier}: sharded convert failed: {e}"));
+
+        assert!(
+            paths.len() > 1,
+            "{tier}: the budget must actually split the tier (got {} shard(s))",
+            paths.len()
+        );
+        assert_eq!(
+            seen.len(),
+            paths.len(),
+            "{tier}: on_shard fires once a shard"
+        );
+        assert!(
+            sharded.join("config.json").is_file(),
+            "{tier}: sharded tier still writes config.json"
+        );
+
+        // Re-emit without deleting so the reconstructed set can be compared + loaded.
+        let keep = base.join(format!("{tier}-keep"));
+        convert_krea_realtime_tier_sharded(&native, &keep, quantize, &cfg, budget, &mut |_| Ok(()))
+            .unwrap();
+
+        let dir = keep.join(TRANSFORMER_DIR);
+        // `Weights::from_dir` errors on a duplicate key, so a successful read already proves the
+        // shard set is disjoint; this proves it is also complete and identical to the flat emit.
+        let sw = mlx_gen::weights::Weights::from_dir(&dir).unwrap();
+        let mut got: Vec<String> = sw.keys().map(|k| k.to_string()).collect();
+        got.sort();
+        assert_eq!(
+            got, want,
+            "{tier}: the sharded tensor set must equal the single-file one"
+        );
+
+        // Names matching is not the same as bytes matching: a shard that wrote the right keys with
+        // the wrong payload would pass the comparison above and load fine. Compare VALUES, exactly,
+        // across the whole set — at this geometry that is cheap.
+        for name in &want {
+            let a = sw.get(name).unwrap();
+            let b = fw.get(name).unwrap();
+            assert_eq!(a.dtype(), b.dtype(), "{tier}/{name}: dtype");
+            assert_eq!(a.shape(), b.shape(), "{tier}/{name}: shape");
+            assert!(
+                !tensors_differ(a, b),
+                "{tier}/{name}: sharded bytes must equal the single-file emit exactly"
+            );
+        }
+
+        let read_back = KreaRealtimeConfig::from_model_dir(&keep).expect("emitted config");
+        let raw: HashMap<String, Array> = sw
+            .keys()
+            .map(|k| (k.to_string(), sw.get(k).unwrap().clone()))
+            .collect();
+        let (_dit, resolved) = load_krea_realtime_transformer_with_quant(raw, &read_back)
+            .unwrap_or_else(|e| {
+                panic!("{tier}: the sharded snapshot must load through the normal path: {e}")
+            });
+        assert_eq!(
+            resolved,
+            quantize.map(|(bits, group_size)| WanQuant { bits, group_size }),
+            "{tier}: the sharded snapshot must resolve to the emitted tier"
+        );
+    }
+
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// Do `a` and `b` differ in **any** element? Element-wise `!=` reduced with `any`, which stays in the
+/// tensors' own dtype.
+///
+/// Deliberately not a cast-to-f32 difference: on a packed tier the `{base}.weight` tensors hold **u32**
+/// code words, and f32 carries only 24 bits of integer precision — two code words differing in their
+/// low bits above 2^24 would compare equal, exactly where a bad split is least visible. It also avoids
+/// `as_slice`, which exposes the physical buffer and ignores strides.
+fn tensors_differ(a: &Array, b: &Array) -> bool {
+    a.ne(b)
+        .expect("elementwise ne")
+        .any(None)
+        .expect("any")
+        .item::<bool>()
+}
+
+/// The tensor comparison used above must discriminate **u32 packed code words**, which is precisely
+/// where a cast-to-f32 difference goes blind: f32 has 24 bits of integer mantissa, so `2^24` and
+/// `2^24 + 1` are the *same* f32. Packed Q4/Q8 weights are full-range u32, so a split or write bug
+/// that perturbed a high code word would be invisible to an f32 compare while the tensor still loaded
+/// and still had the right shape.
+///
+/// This is the mutation check for `tensors_differ` in permanent form: swap it for a
+/// `max_abs_diff(a.as_dtype(f32), b.as_dtype(f32)) == 0.0` implementation and this test fails.
+#[test]
+fn tensor_comparison_sees_u32_code_words_that_f32_cannot_distinguish() {
+    let a = Array::from_slice(&[1u32 << 24, 7, 9], &[3]);
+    let b = Array::from_slice(&[(1u32 << 24) + 1, 7, 9], &[3]);
+
+    // The premise: f32 really cannot tell these apart.
+    assert_eq!(
+        max_abs_diff(
+            &a.as_dtype(Dtype::Float32).unwrap(),
+            &b.as_dtype(Dtype::Float32).unwrap()
+        ),
+        0.0,
+        "premise: the f32 cast collapses 2^24 and 2^24+1"
+    );
+    // The comparison we actually use does not.
+    assert!(
+        tensors_differ(&a, &b),
+        "u32 code words differing above 2^24 must be reported as different"
+    );
+    // …and it does not cry wolf on identical data.
+    assert!(
+        !tensors_differ(&a, &a.deep_clone()),
+        "identical u32 buffers"
+    );
+
+    // Float tensors still compare exactly too.
+    let x = Array::from_slice(&[1.0f32, 2.0, 3.0], &[3]);
+    let y = Array::from_slice(&[1.0f32, 2.0, 3.5], &[3]);
+    assert!(tensors_differ(&x, &y));
+    assert!(!tensors_differ(&x, &x.deep_clone()));
+}
+
+/// **Emitting into the source directory is refused.** The module doc accepts a sharded `transformer/`
+/// dir as a conversion *source*, and MLX safetensors loads are lazy — so if that dir were also the
+/// destination, the stale-shard clear would delete the very files the not-yet-materialized tensors are
+/// about to be read from. Discriminating: the source here is a real sharded tier dir that would
+/// otherwise be cleared, so without the guard this either shreds the input or emits from freed data.
+#[test]
+fn emitting_into_the_source_directory_is_refused() {
+    let cfg = tiny_cfg();
+    let base = std::env::temp_dir().join(format!("krea_shard_selfsrc_{}", std::process::id()));
+    let native = write_native_checkpoint(&cfg, &base);
+    let out = base.join("tier");
+
+    // Build a real sharded tier, then try to use its own transformer/ dir as the source.
+    convert_krea_realtime_tier_sharded(&native, &out, None, &cfg, 4096, &mut |_| Ok(())).unwrap();
+    let shard_dir = out.join(TRANSFORMER_DIR);
+    let before = std::fs::read_dir(&shard_dir).unwrap().count();
+    assert!(before > 0, "fixture must have shards to protect");
+
+    let err =
+        convert_krea_realtime_tier_sharded(&shard_dir, &out, None, &cfg, 4096, &mut |_| Ok(()))
+            .expect_err("emitting into the source directory must be refused");
+    assert!(
+        err.to_string().contains("source directory"),
+        "unexpected error: {err}"
+    );
+    // The source survived.
+    assert_eq!(
+        std::fs::read_dir(&shard_dir).unwrap().count(),
+        before,
+        "the source shards must not have been deleted"
+    );
+
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// `(index, total)` out of a `dit-{i}-of-{n}.safetensors` shard path.
+fn parse_shard_name(p: &std::path::Path) -> (usize, usize) {
+    let name = p.file_name().unwrap().to_str().unwrap();
+    let body = name
+        .strip_prefix("dit-")
+        .and_then(|r| r.strip_suffix(".safetensors"))
+        .unwrap_or_else(|| panic!("unexpected shard name {name}"));
+    let (i, n) = body
+        .split_once("-of-")
+        .unwrap_or_else(|| panic!("unexpected shard name {name}"));
+    (i.parse().unwrap(), n.parse().unwrap())
+}
+
+/// **Stale shards from a previous emit are cleared** (sc-8435 S2b review #6). The shard count is a
+/// function of the byte budget, so re-emitting the same tier at a different budget yields a
+/// differently-named set; without clearing, the old files sit beside the new ones and any consumer
+/// globbing `*.safetensors` sees a mixture. Discriminating: the stale set here uses a *different*
+/// total, so it cannot be overwritten by name — only an explicit clear removes it.
+#[test]
+fn re_emitting_at_a_different_budget_clears_the_previous_shard_set() {
+    let cfg = tiny_cfg();
+    let base = std::env::temp_dir().join(format!("krea_shard_restale_{}", std::process::id()));
+    let native = write_native_checkpoint(&cfg, &base);
+    let out = base.join("tier");
+
+    let total_bytes: u64 = {
+        let flat = base.join("flat");
+        convert_krea_realtime_tier_with_config(&native, &flat, None, &cfg).unwrap();
+        let fw = mlx_gen::weights::Weights::from_file(flat.join(DIT_FILE)).unwrap();
+        fw.keys().map(|k| fw.get(k).unwrap().nbytes() as u64).sum()
+    };
+
+    // First emit: many small shards.
+    let many =
+        convert_krea_realtime_tier_sharded(&native, &out, None, &cfg, total_bytes / 4, &mut |_| {
+            Ok(())
+        })
+        .unwrap();
+    assert!(many.len() > 2, "expected a multi-shard first emit");
+
+    // Second emit at a much larger budget → a different shard count, so different filenames.
+    let few =
+        convert_krea_realtime_tier_sharded(&native, &out, None, &cfg, total_bytes, &mut |_| Ok(()))
+            .unwrap();
+    assert_ne!(
+        many.len(),
+        few.len(),
+        "the two budgets must produce different shard counts for this to discriminate"
+    );
+
+    let dir = out.join(TRANSFORMER_DIR);
+    let present: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+        .filter(|n| n.ends_with(".safetensors"))
+        .collect();
+    assert_eq!(
+        present.len(),
+        few.len(),
+        "stale shards from the first emit were left behind: {present:?}"
+    );
+    // And the directory still loads cleanly (a leftover set would collide on duplicate keys).
+    mlx_gen::weights::Weights::from_dir(&dir).expect("re-emitted shard dir must load");
 
     std::fs::remove_dir_all(&base).ok();
 }
