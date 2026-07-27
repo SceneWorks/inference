@@ -212,9 +212,47 @@ jobs:
         # same `-j 1` the lld memory limit requires, and runs in ~0.01 s. The real-weight cases in
         # this target stay `#[ignore]`d and are skipped here. `--nocapture` keeps the discriminating
         # near-mono measurement in the log, so the gate is auditable from the run itself.
+        # sc-14545 adds three more weight-free control targets on the same reasoning: `dtype_policy`
+        # carries the controls for the F16-vs-F32 envelope check, `variant_quality` carries the
+        # Gram-Schmidt control that shows the cross-checkpoint divergence bound rejects a shared
+        # weight path, and `conformance` carries the only executable check that each variant's
+        # advertised duration cap is bound to its own `sample_size` rather than to the crate-global
+        # constant sc-14545 replaced. All three are tiny and their real-weight cases stay
+        # `#[ignore]`d.
+        #
+        # **Every SA3 integration target with at least one non-`#[ignore]`d case must be named
+        # here**: this list is the whole of the PR-time coverage for this crate's integration
+        # targets, so a target that is not named runs nowhere. That invariant is enforced rather
+        # than merely documented: `scripts/tests/test_sa3_ci_target_coverage.py` parses this step's
+        # `--test` flags against the crate's test sources and fails the build on drift. Naming
+        # targets individually rather than widening to `--tests` is deliberate — `--tests` also
+        # links the seven real-weight-only binaries, which costs the lld budget above nothing but
+        # time for zero executed cases.
+        #
+        # The named seven and what they execute on a PR (measured, `cargo test -p
+        # candle-audio-stable-audio-3 --tests`): `sampler_oracle` 17, `dtype_policy` 2, `provider`
+        # 2, `conformance` 1, `primitive_oracle` 1, `same_oracle` 1, `variant_quality` 1 — 25
+        # weight-free cases. sc-14545 review found `sampler_oracle`, `same_oracle` and
+        # `primitive_oracle` running in no automatic lane at all (19 dark gates, pre-existing since
+        # sc-14543) and added them here.
+        #
+        # Deliberately **not** named, because every case in them is `#[ignore]`d behind a pinned
+        # multi-GB snapshot and the target would link for zero executed tests: `chunked_oracle`,
+        # `dit_oracle`, `provider_oracle`, `real_snapshots`, `text_oracle`, `variant_binding`,
+        # `variant_divergence`. Only four of those seven are selected by any `real-weights.yml`
+        # lane: `chunked_oracle`, `provider_oracle`, `variant_binding` and `variant_divergence`.
+        # `dit_oracle` (6 cases), `real_snapshots` (2) and `text_oracle` (2) are named by no
+        # `--test` flag and matched by no name filter in any workflow, so those 10 real-weight
+        # gates currently execute in **no** lane at all. That is pre-existing debt from
+        # sc-14537/sc-14543, unchanged by sc-14545; sc-15235 tracks wiring the three targets into
+        # `real-weights.yml`. Adding a non-ignored case to any of these seven means adding that
+        # target to the list above.
         run: >-
           cargo test --locked -j 1
-          -p candle-audio-stable-audio-3 --test provider -- --nocapture
+          -p candle-audio-stable-audio-3
+          --test provider --test dtype_policy --test variant_quality --test conformance
+          --test sampler_oracle --test same_oracle --test primitive_oracle
+          -- --nocapture
       - name: Test LLM-only CPU bundle
         run: cargo test --locked --no-default-features --lib -p runtime-cpu
       # The decided sc-12835 feature wiring: audio is its own additive bundle feature, so the

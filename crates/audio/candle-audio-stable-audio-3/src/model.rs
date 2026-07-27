@@ -1,4 +1,4 @@
-//! Variant-bound Stable Audio 3 small generator contracts and lazy provider loads.
+//! Variant-bound Stable Audio 3 generator contracts and lazy provider loads.
 //!
 //! `small-music` (sc-14543) and `small-sfx` (sc-14544) are architecturally identical 433M
 //! post-trained checkpoints: the shipped `model_config.json` files differ only in the conditioner
@@ -7,7 +7,13 @@
 //! [`gen_core::ModelRegistration::load`] receives no provider id — nothing in the `LoadSpec` says
 //! which registration the caller reached. Every load therefore goes through
 //! [`load_variant`], which binds the expected [`Variant`] at the call site and rejects a snapshot
-//! whose conditioner `repo_id` or pinned file hashes belong to the other checkpoint.
+//! whose conditioner `repo_id` or pinned file hashes belong to another checkpoint.
+//!
+//! `medium` (sc-14545) is a different graph, not a checkpoint swap: a 1.45B `1536x24` differential
+//! DiT over the 852M SAME-L autoencoder, with a `16,777,216`-sample maximum instead of the smalls'
+//! `5,292,032`. Every geometry the wrapper pins is therefore per [`Variant`] through
+//! [`Variant::geometry`], so a small snapshot cannot authenticate as medium on shape alone and
+//! vice versa.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -20,8 +26,8 @@ use sha2::{Digest, Sha256};
 
 use crate::dit::Guidance;
 use crate::pipeline::{
-    StableAudio3SmallPipeline, SynthesisParameters, CHANNELS, DEFAULT_DURATION_SECS,
-    DEFAULT_GUIDANCE, DEFAULT_STEPS, SAMPLE_RATE,
+    StableAudio3Pipeline, SynthesisParameters, VariantGeometry, CHANNELS, DEFAULT_GUIDANCE,
+    DEFAULT_STEPS, SAMPLE_RATE,
 };
 use crate::sampler::SamplerKind;
 use crate::weights::SnapshotLayout;
@@ -35,32 +41,119 @@ pub const SFX_MODEL_ID: &str = "stable_audio_3_small_sfx";
 pub const SFX_HUB_REPO: &str = "stabilityai/stable-audio-3-small-sfx";
 pub const SFX_HUB_REVISION: &str = "ae12755283df9d62ca39a9b050a39a0b607b8c20";
 
+pub const MEDIUM_MODEL_ID: &str = "stable_audio_3_medium";
+pub const MEDIUM_HUB_REPO: &str = "stabilityai/stable-audio-3-medium";
+pub const MEDIUM_HUB_REVISION: &str = "27b5a21b791b1b033d193a9e1e3ce78493f102f9";
+
+/// The smalls' advertised logical maximum.
+///
+/// Their `sample_size` is `5,292,032` frames, i.e. `120.00072562...` s, so `120.0` is the largest
+/// round second count the adapted geometry can serve exactly.
 pub const MAX_DURATION_SECS: f32 = 120.0;
+
+/// Medium's advertised logical maximum, matching the number Stability publishes.
+///
+/// Medium's `sample_size` is `16,777,216` frames, i.e. `380.43573696...` s. The advertised cap is
+/// the published `380` s: it is strictly inside the geometric ceiling, so `floor(380 * 44100)`
+/// frames are always available, and it is the number the model card states. The residual
+/// `0.4357 s` is not reachable through the descriptor by design — advertising a cap the adapted
+/// geometry can only *just* satisfy would make the exact-framing gate depend on `f32` rounding.
+pub const MEDIUM_MAX_DURATION_SECS: f32 = 380.0;
+
+/// The exact frame ceiling behind [`MEDIUM_MAX_DURATION_SECS`], as declared by medium's
+/// `model_config.json` `sample_size`.
+pub const MEDIUM_MAX_SAMPLE_SIZE: usize = 16_777_216;
+
+/// The exact frame ceiling behind [`MAX_DURATION_SECS`].
+pub const SMALL_MAX_SAMPLE_SIZE: usize = 5_292_032;
+
 pub const MAX_STEPS: u32 = 500;
 pub const GUIDANCE_RANGE: (f32, f32) = (0.0, 25.0);
 
-/// The registered post-trained Stable Audio 3 small checkpoints.
+/// The registered post-trained Stable Audio 3 checkpoints.
 ///
-/// Both variants share the DiT/SAME-S architecture, the bundled encoder-only T5Gemma stack, the
-/// 44.1 kHz stereo output geometry, and the 120-second logical maximum. They differ only in the
-/// trained checkpoint and therefore in output character.
+/// All three share the bundled encoder-only T5Gemma stack, the 44.1 kHz stereo output geometry, the
+/// eight-step Pingpong default, and the `rf_denoiser` objective. They differ in DiT size, in
+/// autoencoder (SAME-S for the smalls, SAME-L for medium), and in maximum duration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Variant {
-    /// `stable_audio_3_small_music` — text-to-music.
+    /// `stable_audio_3_small_music` — 433M text-to-music, SAME-S, 120 s.
     SmallMusic,
-    /// `stable_audio_3_small_sfx` — text-to-sound-effects / Foley.
+    /// `stable_audio_3_small_sfx` — 433M text-to-sound-effects / Foley, SAME-S, 120 s.
     ///
     /// Distinct from the shipped `moss_sfx_v2` provider: SA3 SFX is 44.1 kHz **stereo** with a
     /// 120-second logical maximum, where MOSS-SoundEffect is 48 kHz **mono**. They are different
     /// quality tiers and different output shapes, not interchangeable ids.
     SmallSfx,
+    /// `stable_audio_3_medium` — 1.45B differential DiT over SAME-L, 380 s (sc-14545).
+    ///
+    /// The only released SA3 checkpoint Stability tags for **both** `music` and `sound-effects`;
+    /// the two smalls are single-domain specialists. The descriptor contract has no machine-readable
+    /// domain field, so that coverage is documentation-only here — see [`descriptor_for`] and
+    /// `sc-15041`.
+    Medium,
 }
 
+/// Every architectural quantity the strict wrapper pins, per registered checkpoint.
+///
+/// This exists because the wrapper's job is to reject a snapshot that is not the exact checkpoint
+/// the caller's provider id names. Before sc-14545 the small geometry was hard-coded in the
+/// validator, which meant medium could only ever have been admitted by loosening the check for
+/// everything. Making it a per-variant record keeps each id's rejection surface as tight as it was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VariantShape {
+    /// `model_config.json` `sample_size`, the frame ceiling the adapted geometry clamps to.
+    pub sample_size: usize,
+    /// Root safetensors tensor count.
+    pub total_keys: usize,
+    /// `model.*` (DiT) tensor count.
+    pub dit_keys: usize,
+    /// `pretransform.model.{encoder,decoder,bottleneck}.*` tensor count.
+    pub autoencoder_keys: usize,
+    pub embed_dim: usize,
+    pub depth: usize,
+    pub num_heads: usize,
+    /// `attn_kwargs.differential` — direct-subtraction attention. Medium only.
+    pub differential: bool,
+}
+
+/// `stabilityai/stable-audio-3-small-{music,sfx}` — 685 root tensors, SAME-S, ordinary attention.
+pub const SMALL_SHAPE: VariantShape = VariantShape {
+    sample_size: SMALL_MAX_SAMPLE_SIZE,
+    total_keys: 685,
+    dit_keys: 438,
+    autoencoder_keys: 244,
+    embed_dim: 1_024,
+    depth: 20,
+    num_heads: 16,
+    differential: false,
+};
+
+/// `stabilityai/stable-audio-3-medium` — 997 root tensors, SAME-L, differential attention.
+///
+/// The `472` autoencoder tensors are byte-for-byte the standalone `stabilityai/SAME-L` inventory
+/// (472 tensors / 53 biases), which is what makes the SAME-L parity oracles applicable to the
+/// embedded copy.
+pub const MEDIUM_SHAPE: VariantShape = VariantShape {
+    sample_size: MEDIUM_MAX_SAMPLE_SIZE,
+    total_keys: 997,
+    dit_keys: 522,
+    autoencoder_keys: 472,
+    embed_dim: 1_536,
+    depth: 24,
+    num_heads: 24,
+    differential: true,
+};
+
 impl Variant {
+    /// Every registered variant, in registration order.
+    pub const ALL: [Variant; 3] = [Variant::SmallMusic, Variant::SmallSfx, Variant::Medium];
+
     pub const fn model_id(self) -> &'static str {
         match self {
             Self::SmallMusic => MODEL_ID,
             Self::SmallSfx => SFX_MODEL_ID,
+            Self::Medium => MEDIUM_MODEL_ID,
         }
     }
 
@@ -68,6 +161,7 @@ impl Variant {
         match self {
             Self::SmallMusic => HUB_REPO,
             Self::SmallSfx => SFX_HUB_REPO,
+            Self::Medium => MEDIUM_HUB_REPO,
         }
     }
 
@@ -75,6 +169,61 @@ impl Variant {
         match self {
             Self::SmallMusic => HUB_REVISION,
             Self::SmallSfx => SFX_HUB_REVISION,
+            Self::Medium => MEDIUM_HUB_REVISION,
+        }
+    }
+
+    /// The advertised logical maximum duration, in seconds.
+    pub const fn max_duration_secs(self) -> f32 {
+        match self {
+            Self::SmallMusic | Self::SmallSfx => MAX_DURATION_SECS,
+            Self::Medium => MEDIUM_MAX_DURATION_SECS,
+        }
+    }
+
+    /// The duration used when a request carries no `audio.target_duration`.
+    ///
+    /// Upstream's variable-length schedule wastes no compute on unrequested length, so the shipped
+    /// semantics for an unspecified duration is "the checkpoint's full length". That is what the
+    /// smalls already do (`120 s` is both their default and their maximum) and medium keeps it.
+    ///
+    /// # The cost of that on medium, stated plainly
+    ///
+    /// It means a request that omits `audio.target_duration` renders **380 s** — a 6.3-minute track.
+    /// Measured on an M5 Max: ≈ 57–92 s on Metal depending on machine load, and extrapolating this
+    /// crate's own CPU-vs-Metal ratio, ≈ 10–16 minutes on CPU. The smalls' unspecified-duration render
+    /// is 120 s / ≈ 10 s on Metal, so this is an order of magnitude more expensive for the same
+    /// omission.
+    ///
+    /// It is kept anyway. A shorter default only for medium would make three ids in one family obey
+    /// two different rules for the same missing field, which is a worse contract than an expensive
+    /// but uniform one — and there is no principled shorter value: any number picked here would be a
+    /// product choice this crate has no basis to make, while "the checkpoint's full length" at least
+    /// follows from the architecture. Callers that care about cost pass the field; it is optional,
+    /// not absent.
+    ///
+    /// What is genuinely missing is *discoverability*: [`descriptor_for`] advertises
+    /// `max_audio_duration_secs` but `Capabilities` has no field for the default, so a caller cannot
+    /// see what omitting the field will cost without reading this source. Adding one is an additive
+    /// `gen-core` contract change and is tracked with the other additive descriptor gaps as
+    /// `sc-15041`.
+    pub const fn default_duration_secs(self) -> f32 {
+        self.max_duration_secs()
+    }
+
+    /// The exact architectural record the strict wrapper authenticates against.
+    pub const fn shape(self) -> VariantShape {
+        match self {
+            Self::SmallMusic | Self::SmallSfx => SMALL_SHAPE,
+            Self::Medium => MEDIUM_SHAPE,
+        }
+    }
+
+    /// The wrapper's validation record: this variant's shape bound to its published repository.
+    pub const fn geometry(self) -> VariantGeometry {
+        VariantGeometry {
+            shape: self.shape(),
+            expected_repo: self.hub_repo(),
         }
     }
 
@@ -82,6 +231,7 @@ impl Variant {
         match self {
             Self::SmallMusic => MUSIC_SNAPSHOT_FILE_PINS,
             Self::SmallSfx => SFX_SNAPSHOT_FILE_PINS,
+            Self::Medium => MEDIUM_SNAPSHOT_FILE_PINS,
         }
     }
 
@@ -91,6 +241,7 @@ impl Variant {
         match self {
             Self::SmallMusic => MUSIC_WEIGHT_LICENSES,
             Self::SmallSfx => SFX_WEIGHT_LICENSES,
+            Self::Medium => MEDIUM_WEIGHT_LICENSES,
         }
     }
 
@@ -177,6 +328,46 @@ const SFX_SNAPSHOT_FILE_PINS: &[SnapshotFilePin] = &[
     },
 ];
 
+/// `stabilityai/stable-audio-3-medium@27b5a21b791b1b033d193a9e1e3ce78493f102f9`.
+///
+/// The bundled T5Gemma config, weights, and both tokenizer files are byte-identical to both small
+/// snapshots — medium ships the same encoder. The root checkpoint is a different size entirely
+/// (9.22 GB against 2.27 GB), so unlike the music/SFX pair the byte length alone already separates
+/// medium from either small; the SHA-256 pin still carries the authentication, because a byte
+/// length is not an identity.
+const MEDIUM_SNAPSHOT_FILE_PINS: &[SnapshotFilePin] = &[
+    SnapshotFilePin {
+        relative: "model_config.json",
+        bytes: 10_360,
+        sha256: "4f8846649df59167e1792d134acb6fc2bb7105227c5455300bad6cb107e20c88",
+    },
+    SnapshotFilePin {
+        relative: "model.safetensors",
+        bytes: 9_222_116_660,
+        sha256: "48d9c65e290e7bcd5194e0633bfc2424a59ee9683f5c2d58762d997b7d8ce0b5",
+    },
+    SnapshotFilePin {
+        relative: "t5gemma-b-b-ul2/config.json",
+        bytes: 2_540,
+        sha256: "575334409716886ac2952f5a275ed92868deef8a0ea560258d9970a431c6fb3a",
+    },
+    SnapshotFilePin {
+        relative: "t5gemma-b-b-ul2/model.safetensors",
+        bytes: 1_183_022_944,
+        sha256: "9b05ea5a4f211d023832f706fb2c0e83e4fc721b6da35ab69ceb0b55eb7800d3",
+    },
+    SnapshotFilePin {
+        relative: "t5gemma-b-b-ul2/tokenizer.json",
+        bytes: 34_362_429,
+        sha256: "7794135caa3ea73918949c902a781cc61dab674a4b59c17d85931c77c1114cbd",
+    },
+    SnapshotFilePin {
+        relative: "t5gemma-b-b-ul2/tokenizer.model",
+        bytes: 4_241_003,
+        sha256: "61a7b147390c64585d6c3543dd6fc636906c9af3865a5548f27f31aee1d4c8e2",
+    },
+];
+
 pub const ROOT_WEIGHT_LICENSE: gen_core::WeightLicense = gen_core::WeightLicense {
     spdx_id: "LicenseRef-Stability-AI-Community",
     name: "Stability AI Community License",
@@ -212,6 +403,26 @@ pub const SFX_GEMMA_WEIGHT_LICENSE: gen_core::WeightLicense = gen_core::WeightLi
     spdx_id: "LicenseRef-Gemma-Terms",
     name: "Gemma Terms of Use",
     source_url: "https://huggingface.co/stabilityai/stable-audio-3-small-sfx/blob/ae12755283df9d62ca39a9b050a39a0b607b8c20/LICENSE_GEMMA.md",
+    attribution: Some("T5Gemma model weights © Google"),
+    commercial_use: true,
+    restriction: Some("Use is governed by the Gemma Terms of Use and Prohibited Use Policy."),
+};
+
+pub const MEDIUM_ROOT_WEIGHT_LICENSE: gen_core::WeightLicense = gen_core::WeightLicense {
+    spdx_id: "LicenseRef-Stability-AI-Community",
+    name: "Stability AI Community License",
+    source_url: "https://huggingface.co/stabilityai/stable-audio-3-medium/blob/27b5a21b791b1b033d193a9e1e3ce78493f102f9/LICENSE.md",
+    attribution: Some("Stable Audio 3 Medium © Stability AI"),
+    commercial_use: false,
+    restriction: Some(
+        "Use is governed by the Stability AI Community License, including its revenue threshold and prohibited-use terms.",
+    ),
+};
+
+pub const MEDIUM_GEMMA_WEIGHT_LICENSE: gen_core::WeightLicense = gen_core::WeightLicense {
+    spdx_id: "LicenseRef-Gemma-Terms",
+    name: "Gemma Terms of Use",
+    source_url: "https://huggingface.co/stabilityai/stable-audio-3-medium/blob/27b5a21b791b1b033d193a9e1e3ce78493f102f9/LICENSE_GEMMA.md",
     attribution: Some("T5Gemma model weights © Google"),
     commercial_use: true,
     restriction: Some("Use is governed by the Gemma Terms of Use and Prohibited Use Policy."),
@@ -253,11 +464,30 @@ const SFX_WEIGHT_LICENSES: &[gen_core::WeightLicenseEntry] = &[
     },
 ];
 
-/// Every Stable Audio 3 weight-license row, in registration order (music then SFX).
+const MEDIUM_WEIGHT_LICENSES: &[gen_core::WeightLicenseEntry] = &[
+    gen_core::WeightLicenseEntry {
+        provider_id: MEDIUM_MODEL_ID,
+        component: None,
+        license: MEDIUM_ROOT_WEIGHT_LICENSE,
+    },
+    gen_core::WeightLicenseEntry {
+        provider_id: MEDIUM_MODEL_ID,
+        component: Some("root"),
+        license: MEDIUM_ROOT_WEIGHT_LICENSE,
+    },
+    gen_core::WeightLicenseEntry {
+        provider_id: MEDIUM_MODEL_ID,
+        component: Some("t5gemma"),
+        license: MEDIUM_GEMMA_WEIGHT_LICENSE,
+    },
+];
+
+/// Every Stable Audio 3 weight-license row, in registration order (music, SFX, medium).
 ///
-/// The DiT, SAME-S pretransform, and learned conditioner all live inside the single
+/// The DiT, SAME pretransform, and learned conditioner all live inside the single
 /// `model.safetensors` root artifact and are covered by the `root` row; the bundled T5Gemma stack
-/// is a separately licensed component and carries its own row.
+/// is a separately licensed component and carries its own row. Three rows per registration, not
+/// four: medium's SAME-L is not a separate artifact, it is a namespace inside the same file.
 pub const WEIGHT_LICENSES: &[gen_core::WeightLicenseEntry] = &[
     MUSIC_WEIGHT_LICENSES[0],
     MUSIC_WEIGHT_LICENSES[1],
@@ -265,15 +495,37 @@ pub const WEIGHT_LICENSES: &[gen_core::WeightLicenseEntry] = &[
     SFX_WEIGHT_LICENSES[0],
     SFX_WEIGHT_LICENSES[1],
     SFX_WEIGHT_LICENSES[2],
+    MEDIUM_WEIGHT_LICENSES[0],
+    MEDIUM_WEIGHT_LICENSES[1],
+    MEDIUM_WEIGHT_LICENSES[2],
 ];
 
 /// Build the descriptor for one registered variant.
 ///
-/// Both post-trained checkpoints share the same mathematically active batch-CFG/APG/rescale path,
-/// so they expose the same guidance and negative-prompt surface. The descriptor contract cannot
-/// machine-encode domain (music vs SFX), so the two ids — and their documentation — are the only
-/// signal a consumer gets. Adding typed domain / channel-count / quality-tier fields is an additive
-/// contract change tracked as `sc-15041`; `family` is deliberately not overloaded to carry it.
+/// All three post-trained checkpoints share the same mathematically active batch-CFG/APG/rescale
+/// path, so they expose the same guidance and negative-prompt surface. They differ only in
+/// `max_audio_duration_secs`.
+///
+/// # Domain metadata is documentation-only
+///
+/// `stable_audio_3_medium` is the only released SA3 checkpoint Stability tags for **both** `music`
+/// and `sound-effects`; `stable_audio_3_small_music` and `stable_audio_3_small_sfx` are
+/// single-domain specialists. [`Capabilities`] has no field that can carry that, and `family` is
+/// deliberately not overloaded to carry it either. sc-14545 therefore accepts **documentation-only**
+/// domain metadata: the ids, this doc comment, and the crate-level module doc are the entire signal
+/// a consumer gets, and no typed domain coverage is claimed. Adding typed domain / channel-count /
+/// quality-tier fields is an additive contract change tracked as `sc-15041`.
+///
+/// # The advertised cap is also the default, and the descriptor cannot say so
+///
+/// `max_audio_duration_secs` is advertised; [`Variant::default_duration_secs`] is not, because
+/// `Capabilities` has no field for it — and on this family the two are equal. A request that omits
+/// `audio.target_duration` therefore renders the **advertised maximum**: 120 s on either small, and
+/// **380 s** on medium (≈ 57–92 s of Metal compute, ≈ 16 minutes on CPU). That is a real cost
+/// difference between ids whose descriptors are otherwise identical, and nothing in the descriptor
+/// signals it. The reasoning for keeping the default equal to the cap, and for treating the missing
+/// capability field as the actual gap, is on [`Variant::default_duration_secs`]; the field itself is
+/// tracked with the other additive descriptor gaps as `sc-15041`.
 pub fn descriptor_for(variant: Variant) -> ModelDescriptor {
     ModelDescriptor {
         required_components: &[],
@@ -296,7 +548,7 @@ pub fn descriptor_for(variant: Variant) -> ModelDescriptor {
             max_count: 1,
             mac_only: false,
             audio_sample_rates: vec![SAMPLE_RATE],
-            max_audio_duration_secs: Some(MAX_DURATION_SECS),
+            max_audio_duration_secs: Some(variant.max_duration_secs()),
             audio_voices: vec![],
             audio_languages: vec![],
             audio_edit_modes: vec![],
@@ -319,6 +571,10 @@ pub fn descriptor() -> ModelDescriptor {
 
 pub fn sfx_descriptor() -> ModelDescriptor {
     descriptor_for(Variant::SmallSfx)
+}
+
+pub fn medium_descriptor() -> ModelDescriptor {
+    descriptor_for(Variant::Medium)
 }
 
 fn verify_file_pin(
@@ -393,6 +649,7 @@ fn verify_snapshot_identity(
 }
 
 pub(crate) fn validate_request(
+    variant: Variant,
     descriptor: &ModelDescriptor,
     request: &GenerationRequest,
 ) -> gen_core::Result<()> {
@@ -406,7 +663,9 @@ pub(crate) fn validate_request(
         )));
     }
     let audio = request.audio.clone().unwrap_or_default();
-    let duration = audio.target_duration.unwrap_or(DEFAULT_DURATION_SECS);
+    let duration = audio
+        .target_duration
+        .unwrap_or_else(|| variant.default_duration_secs());
     if duration < 1.0 / SAMPLE_RATE as f32 {
         return Err(gen_core::Error::Msg(format!(
             "{model_id}: audio.target_duration must contain at least one 44.1 kHz frame"
@@ -451,7 +710,7 @@ pub(crate) fn validate_request(
     Ok(())
 }
 
-fn synthesis_parameters(request: &GenerationRequest) -> SynthesisParameters {
+fn synthesis_parameters(variant: Variant, request: &GenerationRequest) -> SynthesisParameters {
     let audio = request.audio.clone().unwrap_or_default();
     let method = request.guidance_method.as_deref();
     let guidance = Guidance {
@@ -470,7 +729,9 @@ fn synthesis_parameters(request: &GenerationRequest) -> SynthesisParameters {
         },
     };
     SynthesisParameters {
-        duration_secs: audio.target_duration.unwrap_or(DEFAULT_DURATION_SECS),
+        duration_secs: audio
+            .target_duration
+            .unwrap_or_else(|| variant.default_duration_secs()),
         steps: request.steps.unwrap_or(DEFAULT_STEPS as u32) as usize,
         sampler: match request.sampler.as_deref() {
             None | Some("pingpong") => SamplerKind::Pingpong,
@@ -484,16 +745,16 @@ fn synthesis_parameters(request: &GenerationRequest) -> SynthesisParameters {
     }
 }
 
-/// One registered post-trained Stable Audio 3 small checkpoint, bound to its [`Variant`].
-pub struct StableAudio3SmallGenerator {
+/// One registered post-trained Stable Audio 3 checkpoint, bound to its [`Variant`].
+pub struct StableAudio3Generator {
     variant: Variant,
     descriptor: ModelDescriptor,
     root: PathBuf,
-    pipeline: Mutex<Option<Arc<StableAudio3SmallPipeline>>>,
+    pipeline: Mutex<Option<Arc<StableAudio3Pipeline>>>,
     generation: Mutex<()>,
 }
 
-impl StableAudio3SmallGenerator {
+impl StableAudio3Generator {
     pub fn variant(&self) -> Variant {
         self.variant
     }
@@ -501,7 +762,7 @@ impl StableAudio3SmallGenerator {
     fn pipeline(
         &self,
         cancel: &gen_core::CancelFlag,
-    ) -> gen_core::Result<Arc<StableAudio3SmallPipeline>> {
+    ) -> gen_core::Result<Arc<StableAudio3Pipeline>> {
         let mut guard = match self.pipeline.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -524,9 +785,9 @@ impl StableAudio3SmallGenerator {
         // window observes it between pins instead of after the full load.
         verify_snapshot_identity(self.variant, &layout.root, Some(cancel))?;
         let device = resolve_device(DevicePolicy::Default)?;
-        let pipeline = Arc::new(StableAudio3SmallPipeline::from_layout(
+        let pipeline = Arc::new(StableAudio3Pipeline::from_layout(
             &layout,
-            self.variant.hub_repo(),
+            self.variant.geometry(),
             &device,
         )?);
         *guard = Some(pipeline.clone());
@@ -543,10 +804,7 @@ impl StableAudio3SmallGenerator {
 /// Weights are not read here. The pinned identity established by this call is re-verified on the
 /// generator's lazy pipeline path immediately before the tensors are mmapped, so a snapshot mutated
 /// between load and first generate is rejected rather than served.
-pub fn load_variant(
-    expected: Variant,
-    spec: &LoadSpec,
-) -> gen_core::Result<StableAudio3SmallGenerator> {
+pub fn load_variant(expected: Variant, spec: &LoadSpec) -> gen_core::Result<StableAudio3Generator> {
     let model_id = expected.model_id();
     let root = match &spec.weights {
         WeightsSource::Dir(path) => path.clone(),
@@ -574,10 +832,10 @@ pub fn load_variant(
         )));
     }
     let layout = SnapshotLayout::from_dir(&root)?;
-    crate::pipeline::validate_small_layout(&layout, expected.hub_repo())?;
+    crate::pipeline::validate_layout(&layout, expected.geometry())?;
     // No request is in flight on the load path, so there is no cancel flag to honour here.
     verify_snapshot_identity(expected, &layout.root, None)?;
-    Ok(StableAudio3SmallGenerator {
+    Ok(StableAudio3Generator {
         variant: expected,
         descriptor: descriptor_for(expected),
         root,
@@ -586,12 +844,16 @@ pub fn load_variant(
     })
 }
 
-pub fn load_generator(spec: &LoadSpec) -> gen_core::Result<StableAudio3SmallGenerator> {
+pub fn load_generator(spec: &LoadSpec) -> gen_core::Result<StableAudio3Generator> {
     load_variant(Variant::SmallMusic, spec)
 }
 
-pub fn load_sfx_generator(spec: &LoadSpec) -> gen_core::Result<StableAudio3SmallGenerator> {
+pub fn load_sfx_generator(spec: &LoadSpec) -> gen_core::Result<StableAudio3Generator> {
     load_variant(Variant::SmallSfx, spec)
+}
+
+pub fn load_medium_generator(spec: &LoadSpec) -> gen_core::Result<StableAudio3Generator> {
+    load_variant(Variant::Medium, spec)
 }
 
 pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
@@ -602,13 +864,17 @@ pub fn sfx_load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     Ok(Box::new(load_variant(Variant::SmallSfx, spec)?))
 }
 
-impl Generator for StableAudio3SmallGenerator {
+pub fn medium_load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    Ok(Box::new(load_variant(Variant::Medium, spec)?))
+}
+
+impl Generator for StableAudio3Generator {
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
     }
 
     fn validate(&self, request: &GenerationRequest) -> gen_core::Result<()> {
-        validate_request(&self.descriptor, request)
+        validate_request(self.variant, &self.descriptor, request)
     }
 
     fn generate(
@@ -627,7 +893,7 @@ impl Generator for StableAudio3SmallGenerator {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        let parameters = synthesis_parameters(request);
+        let parameters = synthesis_parameters(self.variant, request);
         let pipeline = self.pipeline(&request.cancel)?;
         let cancel = request.cancel.clone();
         let progress = std::cell::RefCell::new(on_progress);
@@ -663,6 +929,10 @@ candle_audio::register_generators! {
     pub const SFX_REGISTRATION = sfx_descriptor => sfx_load
 }
 
+candle_audio::register_generators! {
+    pub const MEDIUM_REGISTRATION = medium_descriptor => medium_load
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -670,7 +940,7 @@ mod tests {
         AdapterKind, AdapterSpec, AudioParams, Conditioning, Image, Quant,
     };
 
-    const VARIANTS: [Variant; 2] = [Variant::SmallMusic, Variant::SmallSfx];
+    const VARIANTS: [Variant; 3] = Variant::ALL;
 
     /// The +6.9 s cold-start re-hash runs with both the generation and pipeline mutexes held, so a
     /// request cancelled during it must observe the cancellation there rather than after the load.
@@ -720,10 +990,29 @@ mod tests {
             assert_eq!(descriptor.backend, "candle");
             assert!(matches!(descriptor.modality, Modality::Audio));
             assert_eq!(descriptor.capabilities.audio_sample_rates, [SAMPLE_RATE]);
+            // sc-14545 made the cap per variant. Asserting it against `variant.max_duration_secs()`
+            // would be a tautology, so re-derive the mapping here: the smalls publish the crate
+            // constant, medium publishes its own. Stated precisely, because a fix-cycle-2 review
+            // caught this being overclaimed: this re-derives the variant -> *named constant*
+            // mapping, so it catches `descriptor_for` wiring the wrong constant to an id, but it
+            // does **not** pin the constants' values — a global edit to `MEDIUM_MAX_DURATION_SECS`
+            // moves both sides together. The numeric literals (120 / 120 / 380) and the
+            // `sample_size` reachability they imply are pinned in
+            // `tests/conformance.rs::each_variant_advertises_a_cap_its_own_geometry_can_serve`,
+            // which is the gate that fails on a value change.
+            let expected_cap = match variant {
+                Variant::SmallMusic | Variant::SmallSfx => MAX_DURATION_SECS,
+                Variant::Medium => MEDIUM_MAX_DURATION_SECS,
+            };
             assert_eq!(
                 descriptor.capabilities.max_audio_duration_secs,
-                Some(MAX_DURATION_SECS)
+                Some(expected_cap),
+                "{} advertised duration cap",
+                variant.model_id()
             );
+            // The advertised cap is also the default for an omitted `audio.target_duration`; see
+            // `Variant::default_duration_secs` for the cost that implies on medium.
+            assert_eq!(variant.default_duration_secs(), expected_cap);
             // sc-14544: both post-trained objectives share the batch-CFG/APG/rescale math, so SFX
             // must NOT be distinguished from music by a false guidance flag.
             assert!(descriptor.capabilities.supports_negative_prompt);
@@ -733,6 +1022,15 @@ mod tests {
                 ["pingpong", "euler", "rk4", "dpmpp"]
             );
         }
+        // The cap must be variant-bound rather than the crate-global it replaced.
+        assert_ne!(
+            descriptor_for(Variant::Medium)
+                .capabilities
+                .max_audio_duration_secs,
+            descriptor_for(Variant::SmallMusic)
+                .capabilities
+                .max_audio_duration_secs
+        );
         assert_eq!(descriptor().id, "stable_audio_3_small_music");
         assert_eq!(sfx_descriptor().id, "stable_audio_3_small_sfx");
         assert_eq!((REGISTRATION.descriptor)().id, MODEL_ID);
@@ -773,7 +1071,9 @@ mod tests {
 
     #[test]
     fn every_variant_contributes_composite_and_component_license_rows() {
-        assert_eq!(WEIGHT_LICENSES.len(), 6);
+        // Three registered variants x (composite, root, t5gemma). sc-14545 added the medium trio.
+        assert_eq!(WEIGHT_LICENSES.len(), 9);
+        assert_eq!(VARIANTS.len(), 3);
         for variant in VARIANTS {
             let rows = variant.weight_licenses();
             assert_eq!(rows.len(), 3);
@@ -801,7 +1101,7 @@ mod tests {
     fn request_validation_maps_the_complete_public_surface() {
         for variant in VARIANTS {
             let descriptor = descriptor_for(variant);
-            assert!(validate_request(&descriptor, &request()).is_ok());
+            assert!(validate_request(variant, &descriptor, &request()).is_ok());
             let mut valid = request();
             valid.negative_prompt = Some("harsh clipping and speech".into());
             valid.guidance = Some(7.5);
@@ -809,12 +1109,12 @@ mod tests {
             valid.guidance_method = Some("apg".into());
             valid.guidance_eta = Some(0.25);
             valid.guidance_norm_threshold = Some(2.0);
-            assert!(validate_request(&descriptor, &valid).is_ok());
+            assert!(validate_request(variant, &descriptor, &valid).is_ok());
 
             let mut invalid = request();
             invalid.audio.as_mut().unwrap().bpm = Some(120.0);
             assert!(matches!(
-                validate_request(&descriptor, &invalid),
+                validate_request(variant, &descriptor, &invalid),
                 Err(gen_core::Error::Unsupported(_))
             ));
 
@@ -828,7 +1128,7 @@ mod tests {
                     _ => unreachable!(),
                 }
                 assert!(matches!(
-                    validate_request(&descriptor, &invalid),
+                    validate_request(variant, &descriptor, &invalid),
                     Err(gen_core::Error::Unsupported(_))
                 ));
             }
@@ -843,7 +1143,7 @@ mod tests {
                 strength: None,
             });
             assert!(matches!(
-                validate_request(&descriptor, &invalid),
+                validate_request(variant, &descriptor, &invalid),
                 Err(gen_core::Error::Unsupported(_))
             ));
 
@@ -851,25 +1151,25 @@ mod tests {
             invalid.guidance_method = Some("apg".into());
             invalid.guidance_momentum = Some(0.1);
             assert!(matches!(
-                validate_request(&descriptor, &invalid),
+                validate_request(variant, &descriptor, &invalid),
                 Err(gen_core::Error::Unsupported(_))
             ));
 
             let mut invalid = request();
             invalid.audio.as_mut().unwrap().target_duration = Some(0.0);
-            assert!(validate_request(&descriptor, &invalid).is_err());
+            assert!(validate_request(variant, &descriptor, &invalid).is_err());
 
             let mut invalid = request();
             invalid.prompt = "  ".into();
-            assert!(validate_request(&descriptor, &invalid).is_err());
+            assert!(validate_request(variant, &descriptor, &invalid).is_err());
 
             let mut invalid = request();
             invalid.steps = Some(MAX_STEPS + 1);
-            assert!(validate_request(&descriptor, &invalid).is_err());
+            assert!(validate_request(variant, &descriptor, &invalid).is_err());
 
             let mut invalid = request();
             invalid.guidance = Some(GUIDANCE_RANGE.1 + 0.1);
-            assert!(validate_request(&descriptor, &invalid).is_err());
+            assert!(validate_request(variant, &descriptor, &invalid).is_err());
         }
     }
 
@@ -879,7 +1179,7 @@ mod tests {
         cfg.guidance = Some(4.0);
         cfg.guidance_method = Some("cfg".into());
         assert_eq!(
-            synthesis_parameters(&cfg).guidance,
+            synthesis_parameters(Variant::SmallMusic, &cfg).guidance,
             Guidance {
                 cfg_scale: 4.0,
                 apg_scale: 0.0,
@@ -892,13 +1192,33 @@ mod tests {
         apg.guidance_method = Some("apg".into());
         apg.guidance_eta = Some(0.25);
         apg.guidance_norm_threshold = Some(3.0);
-        assert_eq!(synthesis_parameters(&apg).guidance.apg_scale, 0.75);
-        assert_eq!(synthesis_parameters(&apg).guidance.cfg_norm_threshold, 3.0);
+        assert_eq!(
+            synthesis_parameters(Variant::SmallMusic, &apg)
+                .guidance
+                .apg_scale,
+            0.75
+        );
+        assert_eq!(
+            synthesis_parameters(Variant::SmallMusic, &apg)
+                .guidance
+                .cfg_norm_threshold,
+            3.0
+        );
 
         let mut rescale = cfg;
         rescale.guidance_method = Some("cfg_rescale".into());
-        assert_eq!(synthesis_parameters(&rescale).guidance.apg_scale, 0.0);
-        assert_eq!(synthesis_parameters(&rescale).guidance.scale_phi, 1.0);
+        assert_eq!(
+            synthesis_parameters(Variant::SmallMusic, &rescale)
+                .guidance
+                .apg_scale,
+            0.0
+        );
+        assert_eq!(
+            synthesis_parameters(Variant::SmallMusic, &rescale)
+                .guidance
+                .scale_phi,
+            1.0
+        );
     }
 
     #[test]
@@ -952,10 +1272,15 @@ mod tests {
 
     #[test]
     fn pinned_file_authentication_rejects_size_and_payload_drift() {
+        // `ThreadId`, not `Thread::name()`: under libtest the thread name *is* the test path
+        // (`model::tests::pinned_file_authentication_rejects_size_and_payload_drift`), and `:` is
+        // an illegal character in a Windows path component, so `create_dir_all` returned
+        // `InvalidFilename` (os error 123) on the Windows CUDA runner the moment this crate's unit
+        // tests were first run there. `weights.rs` already uses the id for the same reason.
         let root = std::env::temp_dir().join(format!(
-            "sa3-provider-pin-{}-{}",
+            "sa3-provider-pin-{}-{:?}",
             std::process::id(),
-            std::thread::current().name().unwrap_or("test")
+            std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();

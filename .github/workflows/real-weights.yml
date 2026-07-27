@@ -10,7 +10,7 @@ on:
         type: choice
         required: true
         default: all
-        options: [all, llm, media, audio, same-l, same-chunked, sa3-small-music, sa3-small-sfx]
+        options: [all, llm, media, audio, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium]
 
 permissions:
   contents: read
@@ -507,6 +507,18 @@ jobs:
             --test conformance registered_provider_passes_full_audio_conformance -- --ignored --nocapture
           cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
             --test conformance concurrent_requests_are_deterministic_and_do_not_share_rng_state -- --ignored --nocapture
+      - name: Match the frozen-torch provider oracle end to end
+        run: |
+          # sc-14543's end-to-end parity oracle against the vendored
+          # `docs/migration/sa3-small-music-provider-reference` artifact. It ran in no lane until
+          # sc-14545, which is how its `from_layout` call site could be re-pointed from a bare
+          # `HUB_REPO` string to `Variant::SmallMusic.geometry()` with nothing but a compile check
+          # behind it. `validate_layout` rejects a wrong variant before a tensor is read, so this is
+          # the executable proof that the rename kept the checkpoint binding. Deterministic
+          # (`Device::Cpu`, portable LCG noise, fixed seed) and measured at 20.6 s on an M-series
+          # Mac against this exact pinned snapshot.
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
+            --test provider_oracle -- --ignored --nocapture
       - name: Re-calibrate the music stereo-width floor across prompts and seeds
         run: |
           # sc-14544 added a per-window-median side-ratio assertion to the shared `assert_real_audio`
@@ -583,6 +595,122 @@ jobs:
               --test provider connected_sfx_generation_is_stereo_finite_and_exact_length \
               -- --ignored --nocapture
           shasum -a 256 "$RUNNER_TEMP/sa3-small-sfx-metal.wav"
+
+  sa3-medium-metal:
+    name: Stable Audio 3 medium provider (Metal)
+    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'sa3-medium'
+    runs-on: [self-hosted, macOS, ARM64, real-weights]
+    env:
+      SA3_TEST_METAL: "1"
+      # Turn every "snapshot not provisioned, skipping" branch in the mutation gates into a
+      # failure. A skip CI also takes is a gate nobody runs.
+      SA3_REQUIRE_ALL_SNAPSHOTS: "1"
+      # The embedded-SAME-L oracle case. `same-l-metal` pins `standalone`, so before sc-14545 the
+      # embedded branch of `same_l_short_standalone_and_embedded_match_every_band_layer` and
+      # `same_l_long_durations_match_compact_band_boundaries` had never executed in CI despite both
+      # tests reading SA3_MEDIUM_SNAPSHOT. Medium is the only registered provider that decodes
+      # through SAME-L, so this is where that case belongs.
+      SA3_SAME_L_CASE: embedded
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Configure immutable medium, medium-base and small snapshot paths
+        run: |
+          # The cross-variant mutation gates compare medium against both smalls and against its own
+          # base sibling, and the two-domain comparison renders medium beside each specialist, so
+          # every snapshot they read has to be on this runner.
+          echo "SA3_MEDIUM_SNAPSHOT=$RUNNER_TEMP/sa3-medium/27b5a21b791b1b033d193a9e1e3ce78493f102f9" >> "$GITHUB_ENV"
+          echo "SA3_MEDIUM_BASE_SNAPSHOT=$RUNNER_TEMP/sa3-medium-base/b32993f73c3bdc3864043a72d8032606bba737c8" >> "$GITHUB_ENV"
+          echo "SA3_SMALL_MUSIC_SNAPSHOT=$RUNNER_TEMP/sa3-small-music/0fef1392cd842149a2b6d445e181c97608faac06" >> "$GITHUB_ENV"
+          echo "SA3_SMALL_SFX_SNAPSHOT=$RUNNER_TEMP/sa3-small-sfx/ae12755283df9d62ca39a9b050a39a0b607b8c20" >> "$GITHUB_ENV"
+          echo "SA3_SAME_L_SNAPSHOT=$RUNNER_TEMP/sa3-same-l/41acf79dd242877d6499a1108ca5dba5d5eecfc5" >> "$GITHUB_ENV"
+      - name: Toolchain and hardware versions
+        run: |
+          sw_vers
+          system_profiler SPHardwareDataType SPDisplaysDataType |
+            grep -E 'Model Name|Model Identifier|Chip|Total Number of Cores|Memory|Chipset Model|Metal Support'
+          rustc --version
+          cargo --version
+      - name: Run the crate unit tests against real Metal
+        # Weight-free, seconds long, and the only lane where the device-dependent unit tests execute
+        # on an accelerator: `zero_element_tensors_load_on_the_target_device` is a no-op on the CPU
+        # lane but is the regression gate for the zero-byte `noise_scaling_factor` buffer that broke
+        # the embedded SAME-L case below. Runs before the 10.4 GB downloads so it fails fast.
+        run: cargo test --locked --release -p candle-audio-stable-audio-3 --features metal --lib
+      - name: Materialize and verify the immutable snapshots
+        run: |
+          python3 -m pip install --disable-pip-version-check --target "$RUNNER_TEMP/huggingface-hub" "huggingface_hub==1.20.1"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model stable-audio-3-medium --snapshot "$SA3_MEDIUM_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model stable-audio-3-medium-base --snapshot "$SA3_MEDIUM_BASE_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-music --snapshot "$SA3_SMALL_MUSIC_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-sfx --snapshot "$SA3_SMALL_SFX_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model same-l --snapshot "$SA3_SAME_L_SNAPSHOT"
+      - name: Verify the embedded SAME-L band boundaries on Metal
+        run: |
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
+            same_l_short_standalone_and_embedded_match_every_band_layer -- --ignored --nocapture
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
+            same_l_long_durations_match_compact_band_boundaries -- --ignored --nocapture
+      - name: Reject cross-variant weight paths (mutation gates)
+        run: |
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
+            --test variant_binding -- --ignored --nocapture
+      - name: Run registered medium conformance and concurrent RNG isolation on Metal
+        run: |
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
+            --test conformance registered_medium_provider_passes_full_audio_conformance -- --ignored --nocapture
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
+            --test conformance concurrent_medium_requests_are_deterministic_and_do_not_share_rng_state -- --ignored --nocapture
+      - name: Re-calibrate the medium stereo-width floor across both domains
+        run: |
+          # Medium's floor is derived from a 25-sample sweep that deliberately mixes music and SFX
+          # prompts, because medium is the only SA3 checkpoint registered for both. The sweep's
+          # defaults are the render's own 30 s / 8 steps.
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
+            --test provider medium_stereo_width_floor_is_calibrated_across_prompts_and_seeds \
+            -- --ignored --nocapture
+      - name: Prove medium serves both domains and diverges from each specialist
+        run: |
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
+            --test variant_quality -- --ignored --nocapture
+      - name: Measure the F16-vs-F32 compute policy on real weights
+        run: |
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
+            --test dtype_policy -- --ignored --nocapture
+      - name: Measure the long-form 120 s, 300 s and 380 s renders with peak memory
+        run: |
+          # The 380 s published cap is included: it is the only configuration that exercises the
+          # full 4,096-latent adapted geometry and the 43-chunk SAME-L decode plan, which is the
+          # entire reason this variant is registered separately from the smalls.
+          #
+          # `/usr/bin/time -l` reports `ru_maxrss` over the timed process *and its whole reaped
+          # child tree*, so timing `cargo test` conflates the release build — rustc and the linker
+          # peak in the multi-GB range on their own — with the render. Build first with `--no-run`,
+          # resolve the target's own executable from the JSON artifact stream, then time only that
+          # binary. The reported peak is then the render's, and nothing else's.
+          cargo test --locked --release --no-run -p candle-audio-stable-audio-3 --features metal \
+            --test provider
+          binary="$(
+            cargo test --locked --release --no-run --message-format=json \
+              -p candle-audio-stable-audio-3 --features metal --test provider |
+              python3 -c "import json, sys; print([m['executable'] for m in map(json.loads, sys.stdin) if m.get('reason') == 'compiler-artifact' and m.get('executable') and m.get('target', {}).get('name') == 'provider'][-1])"
+          )"
+          test -x "$binary" || { echo "could not resolve the provider test binary"; exit 1; }
+          echo "timing $binary"
+          SA3_MEDIUM_LONG_SECONDS=120,300,380 \
+          SA3_MEDIUM_LONG_WAV_DIR="$RUNNER_TEMP" \
+            /usr/bin/time -l "$binary" medium_long_form_renders_are_exact_and_timed \
+              --exact --ignored --nocapture
+          for seconds in 120 300 380; do
+            shasum -a 256 "$RUNNER_TEMP/sa3-medium-${seconds}s.wav"
+          done
+      - name: Render a real 30-second eight-step medium Metal WAV
+        run: |
+          SA3_TEST_DURATION=30 SA3_TEST_STEPS=8 \
+          SA3_MEDIUM_WAV_OUT="$RUNNER_TEMP/sa3-medium-metal.wav" \
+            cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
+              --test provider connected_medium_generation_is_stereo_finite_and_exact_length \
+              -- --ignored --nocapture
+          shasum -a 256 "$RUNNER_TEMP/sa3-medium-metal.wav"
 
   same-l-cuda:
     name: SAME-L real weights (CUDA)
@@ -852,6 +980,216 @@ jobs:
             -- --ignored --nocapture
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Get-FileHash -Algorithm SHA256 $env:SA3_SMALL_SFX_WAV_OUT
+
+  sa3-medium-cuda:
+    name: Stable Audio 3 medium provider (CUDA)
+    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'sa3-medium'
+    runs-on: [self-hosted, windows, cuda, real-weights]
+    env:
+      SA3_TEST_CUDA: "1"
+      SA3_REQUIRE_ALL_SNAPSHOTS: "1"
+      SA3_SAME_L_CASE: embedded
+      CUDA_COMPUTE_CAP: "80"
+      CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
+      VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Configure immutable medium and small snapshot paths
+        shell: cmd
+        run: |
+          echo SA3_MEDIUM_SNAPSHOT=%RUNNER_TEMP%\sa3-medium\27b5a21b791b1b033d193a9e1e3ce78493f102f9>>"%GITHUB_ENV%"
+          echo SA3_MEDIUM_BASE_SNAPSHOT=%RUNNER_TEMP%\sa3-medium-base\b32993f73c3bdc3864043a72d8032606bba737c8>>"%GITHUB_ENV%"
+          echo SA3_SMALL_MUSIC_SNAPSHOT=%RUNNER_TEMP%\sa3-small-music\0fef1392cd842149a2b6d445e181c97608faac06>>"%GITHUB_ENV%"
+          echo SA3_SMALL_SFX_SNAPSHOT=%RUNNER_TEMP%\sa3-small-sfx\ae12755283df9d62ca39a9b050a39a0b607b8c20>>"%GITHUB_ENV%"
+          echo SA3_SAME_L_SNAPSHOT=%RUNNER_TEMP%\sa3-same-l\41acf79dd242877d6499a1108ca5dba5d5eecfc5>>"%GITHUB_ENV%"
+      - name: Select Git Bash
+        shell: cmd
+        run: |
+          if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
+          echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+        with:
+          toolchain: 1.96.0
+          components: rustfmt, clippy
+      - name: Toolchain and hardware versions
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          rustc --version
+          cargo --version
+          nvidia-smi
+      - name: Run the crate unit tests against real CUDA
+        shell: cmd
+        # Weight-free and seconds long. `zero_element_tensors_load_on_the_target_device` is the
+        # regression gate for the zero-byte `noise_scaling_factor` buffer: on CUDA the F32 load
+        # succeeded but the F32-to-F16 cast launched a zero-sized grid, which is why medium loaded at
+        # F32 and failed at F16. This is the cheapest place that failure can be caught, and it runs
+        # before the 10.4 GB downloads.
+        run: |
+          call "%VCVARS%"
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --lib || exit /b 1
+      - name: Materialize and verify the immutable snapshots
+        shell: cmd
+        run: |
+          python -m pip install --disable-pip-version-check --target "%RUNNER_TEMP%\huggingface-hub" "huggingface_hub==1.20.1"
+          set "PYTHONPATH=%RUNNER_TEMP%\huggingface-hub"
+          python scripts/release/ensure_model_snapshot.py --model stable-audio-3-medium --snapshot "%SA3_MEDIUM_SNAPSHOT%" || exit /b 1
+          python scripts/release/ensure_model_snapshot.py --model stable-audio-3-medium-base --snapshot "%SA3_MEDIUM_BASE_SNAPSHOT%" || exit /b 1
+          python scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-music --snapshot "%SA3_SMALL_MUSIC_SNAPSHOT%" || exit /b 1
+          python scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-sfx --snapshot "%SA3_SMALL_SFX_SNAPSHOT%" || exit /b 1
+          python scripts/release/ensure_model_snapshot.py --model same-l --snapshot "%SA3_SAME_L_SNAPSHOT%" || exit /b 1
+      - name: Reject cross-variant weight paths and run medium conformance on CUDA
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --test variant_binding -- --ignored --nocapture || exit /b 1
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --test conformance registered_medium_provider_passes_full_audio_conformance -- --ignored --nocapture || exit /b 1
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --test conformance concurrent_medium_requests_are_deterministic_and_do_not_share_rng_state -- --ignored --nocapture || exit /b 1
+      - name: Re-calibrate the medium stereo-width floor on CUDA
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          REM The render step below enforces the side-ratio floor on this backend, so the sweep
+          REM behind it runs on this backend at the render's own 30 s / 8 steps.
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --test provider medium_stereo_width_floor_is_calibrated_across_prompts_and_seeds -- --ignored --nocapture || exit /b 1
+      - name: Prove medium serves both domains and measure the compute policy on CUDA
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --test variant_quality -- --ignored --nocapture || exit /b 1
+          REM The F16-vs-F32 measurement behind the shipped F32 policy, taken on the backend
+          REM upstream would half-cast. sc-14545 could only measure it on Metal.
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --test dtype_policy -- --ignored --nocapture || exit /b 1
+      - name: Measure the long-form renders and peak CUDA allocation
+        shell: powershell
+        # A `nvidia-smi` sample taken *after* `cargo test` returns cannot observe a peak: the test
+        # process has already exited and the driver has freed its VRAM, so the "post-run" reading is
+        # the baseline again. Sample continuously for the whole render instead, which is the pattern
+        # `same-l-cuda`'s `Invoke-SameLProbe` already uses in this file. The release build is done
+        # first with `--no-run` so the sampled window contains the render and nothing else.
+        run: |
+          cmd /c "call `"$env:VCVARS`" && set" |
+            ForEach-Object {
+              if ($_ -match "^(.*?)=(.*)$") { Set-Item -Force "env:$($matches[1])" $matches[2] }
+            }
+          $env:SA3_MEDIUM_LONG_SECONDS = "120,300,380"
+          $env:SA3_MEDIUM_LONG_WAV_DIR = $env:RUNNER_TEMP
+          cargo test --locked --release --no-run -p candle-audio-stable-audio-3 --features cuda `
+            --test provider
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $stdout = Join-Path $env:RUNNER_TEMP "sa3-medium-long-form.stdout"
+          $stderr = Join-Path $env:RUNNER_TEMP "sa3-medium-long-form.stderr"
+          $stop = Join-Path $env:RUNNER_TEMP "sa3-medium-long-form.stop"
+          Remove-Item $stop -ErrorAction SilentlyContinue
+          $arguments = @(
+            "test", "--locked", "--release",
+            "-p", "candle-audio-stable-audio-3", "--features", "cuda",
+            "--test", "provider", "medium_long_form_renders_are_exact_and_timed",
+            "--", "--ignored", "--nocapture"
+          )
+          # Resolve an absolute path in the parent scope and hand it to the job. `Start-Job` runs the
+          # scriptblock in a separate runspace that resolves commands from its own `PATH`, which is
+          # not guaranteed to be the one the vcvars import above installed into this scope; a bare
+          # `nvidia-smi` inside the job would surface as a CommandNotFound terminating error rather
+          # than a measurement. The bare form does in fact work on this runner today — run
+          # 30196371019's `SAME-L real weights (CUDA)` job logged
+          # `SA3_SAME_L_CUDA_MEMORY case=literal-380s baseline_total_mib=12252 peak_total_mib=28069`
+          # from the identical `Invoke-SameLProbe` sampler, which is proof the job runspace both
+          # resolved the tool and observed a real in-render peak. This binds it explicitly anyway so
+          # the failure mode is a named throw in the parent rather than a dead sampler, and so the
+          # resolved path is in the log. `Invoke-SameLProbe` above is deliberately left as-is: it is
+          # already green in a recorded run and this PR does not re-open it.
+          $nvidiaSmi = (Get-Command nvidia-smi -CommandType Application -ErrorAction SilentlyContinue |
+            Select-Object -First 1)
+          if (-not $nvidiaSmi) {
+            throw "nvidia-smi is not resolvable on PATH; cannot measure peak CUDA allocation"
+          }
+          $nvidiaSmiPath = $nvidiaSmi.Source
+          Write-Host "nvidia-smi resolved to $nvidiaSmiPath"
+          $baselineOutput = @(& $nvidiaSmiPath --query-gpu=memory.used --format=csv,noheader,nounits)
+          if ($LASTEXITCODE -ne 0) {
+            throw "nvidia-smi baseline query failed with exit code $LASTEXITCODE"
+          }
+          $baselineMiB = 0
+          $baselineText = [string]($baselineOutput | Select-Object -First 1)
+          if (-not [int]::TryParse($baselineText.Trim(), [ref]$baselineMiB)) {
+            throw "nvidia-smi baseline query returned an invalid value: '$baselineText'"
+          }
+          $sampler = Start-Job -ArgumentList $nvidiaSmiPath, $stop, $baselineMiB -ScriptBlock {
+            param([string]$nvidiaSmiPath, [string]$stopPath, [int]$peakMiB)
+            while (-not (Test-Path $stopPath)) {
+              $sampleOutput = @(& $nvidiaSmiPath --query-gpu=memory.used --format=csv,noheader,nounits)
+              if ($LASTEXITCODE -ne 0) {
+                throw "nvidia-smi sampler query failed with exit code $LASTEXITCODE"
+              }
+              $usedMiB = 0
+              $sampleText = [string]($sampleOutput | Select-Object -First 1)
+              if (-not [int]::TryParse($sampleText.Trim(), [ref]$usedMiB)) {
+                throw "nvidia-smi sampler query returned an invalid value: '$sampleText'"
+              }
+              $peakMiB = [Math]::Max($peakMiB, $usedMiB)
+              Start-Sleep -Milliseconds 250
+            }
+            $peakMiB
+          }
+          try {
+            $process = Start-Process cargo -ArgumentList $arguments -Wait -PassThru `
+              -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+          } finally {
+            New-Item $stop -ItemType File -Force | Out-Null
+          }
+          Wait-Job $sampler | Out-Null
+          $samplerState = $sampler.State
+          try {
+            $samplerOutput = @(Receive-Job $sampler -ErrorAction Stop)
+          } finally {
+            Remove-Job $sampler -Force
+          }
+          if ($samplerState -ne "Completed") {
+            throw "nvidia-smi sampler job ended in state $samplerState"
+          }
+          if ($samplerOutput.Count -ne 1) {
+            throw "nvidia-smi sampler returned $($samplerOutput.Count) values; expected one"
+          }
+          $peakMiB = 0
+          if (-not [int]::TryParse(([string]$samplerOutput[0]).Trim(), [ref]$peakMiB)) {
+            throw "nvidia-smi sampler returned an invalid peak: '$($samplerOutput[0])'"
+          }
+          Get-Content $stdout
+          Get-Content $stderr
+          Write-Host "SA3_MEDIUM_CUDA_MEMORY baseline_total_mib=$baselineMiB peak_total_mib=$peakMiB peak_delta_mib=$($peakMiB - $baselineMiB)"
+          if ($process.ExitCode -ne 0) {
+            throw "medium long-form render failed with exit code $($process.ExitCode)"
+          }
+          # The sampler seeds its running peak with the baseline, so a sampler that observed nothing
+          # still returns the baseline and reports peak_delta_mib=0 — indistinguishable from "the
+          # render allocated no VRAM". A real medium render allocates gigabytes, so a zero delta
+          # means the probe is broken, not that the render was free.
+          if ($peakMiB -le $baselineMiB) {
+            throw ("nvidia-smi sampler observed no allocation above the $baselineMiB MiB baseline " +
+              "(peak $peakMiB MiB); the peak probe measured nothing")
+          }
+          foreach ($seconds in 120, 300, 380) {
+            Get-FileHash -Algorithm SHA256 (Join-Path $env:RUNNER_TEMP "sa3-medium-${seconds}s.wav")
+          }
+          # Start-Process does not update LASTEXITCODE, and the vcvars bootstrap above can leave a
+          # stale non-zero value that GitHub's PowerShell wrapper would propagate.
+          exit 0
+      - name: Render a real 30-second eight-step medium CUDA WAV
+        shell: powershell
+        run: |
+          cmd /c "call `"$env:VCVARS`" && set" |
+            ForEach-Object {
+              if ($_ -match "^(.*?)=(.*)$") { Set-Item -Force "env:$($matches[1])" $matches[2] }
+            }
+          $env:SA3_TEST_DURATION = "30"
+          $env:SA3_TEST_STEPS = "8"
+          $env:SA3_MEDIUM_WAV_OUT = Join-Path $env:RUNNER_TEMP "sa3-medium-cuda.wav"
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda `
+            --test provider connected_medium_generation_is_stereo_finite_and_exact_length `
+            -- --ignored --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-FileHash -Algorithm SHA256 $env:SA3_MEDIUM_WAV_OUT
 
   candle-llm:
     name: Candle LLM real weights (CUDA)

@@ -192,6 +192,58 @@ expected_files = [
 ]
 
 [[models]]
+# The medium **base** checkpoint. Not registered as a provider by sc-14545 — it is the sc-14546
+# subject — but the medium identity gate needs it on the runner, because it is the only snapshot
+# that matches the post-trained medium on tensor inventory, sample_size, root byte length AND
+# conditioner repo_id. Without it the sharpest cross-variant mutation in `variant_binding` is
+# skipped, which is indistinguishable from passing.
+key = "stable-audio-3-medium-base"
+repository = "stabilityai/stable-audio-3-medium-base"
+revision = "b32993f73c3bdc3864043a72d8032606bba737c8"
+requires_auth = true
+license = "Stability AI Community License"
+size_class = "very-large"
+profiles = ["audio-macos", "audio-cuda"]
+environment = ["SA3_MEDIUM_BASE_SNAPSHOT"]
+expected_files = [
+    "model_config.json",
+    "model.safetensors",
+    "t5gemma-b-b-ul2/config.json",
+    "t5gemma-b-b-ul2/model.safetensors",
+    "t5gemma-b-b-ul2/tokenizer.json",
+    "t5gemma-b-b-ul2/tokenizer.model",
+    "LICENSE.md",
+    "LICENSE_GEMMA.md",
+    "NOTICE",
+]
+
+[[models]]
+# Exact registered Stable Audio 3 medium graph: the 1.45B differential DiT, the embedded 852M
+# SAME-L autoencoder, and the same bundled encoder-only T5Gemma text stack the smalls carry. This is
+# the only checkpoint that exercises the differential-attention DiT and the embedded (rather than
+# standalone) SAME-L through a registered provider, and the only one whose 380-second ceiling
+# reaches a 43-chunk decode plan.
+key = "stable-audio-3-medium"
+repository = "stabilityai/stable-audio-3-medium"
+revision = "27b5a21b791b1b033d193a9e1e3ce78493f102f9"
+requires_auth = true
+license = "Stability AI Community License"
+size_class = "very-large"
+profiles = ["audio-macos", "audio-cuda"]
+environment = ["SA3_MEDIUM_SNAPSHOT"]
+expected_files = [
+    "model_config.json",
+    "model.safetensors",
+    "t5gemma-b-b-ul2/config.json",
+    "t5gemma-b-b-ul2/model.safetensors",
+    "t5gemma-b-b-ul2/tokenizer.json",
+    "t5gemma-b-b-ul2/tokenizer.model",
+    "LICENSE.md",
+    "LICENSE_GEMMA.md",
+    "NOTICE",
+]
+
+[[models]]
 key = "moss-soundeffect-v2"
 repository = "OpenMOSS-Team/MOSS-SoundEffect-v2.0"
 revision = "e35df4d82fbe87fcd5d14e5d100e349c0c3c076d"
