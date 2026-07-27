@@ -434,6 +434,31 @@ impl CancelFlag {
     pub fn is_cancelled(&self) -> bool {
         self.0.load(Ordering::Relaxed)
     }
+
+    /// Adopt a caller-owned cancellation token, so a consumer's existing
+    /// `Arc<AtomicBool>` **is** the flag the engine polls rather than something a bridge has to
+    /// mirror into.
+    ///
+    /// Without this, a consumer that already has a cancellation token (a job queue, a request
+    /// scope) can only forward cancellation from inside the progress callback, which means a
+    /// cancel is not observed until the next progress event. Sharing the atomic removes that
+    /// hop. Cancellation stays cooperative and unchanged: whoever sets the flag, the engine
+    /// still only observes it where it checks.
+    ///
+    /// **Where the engine checks is the real bound, and it is coarser than this handle.** Polling
+    /// happens at denoise step boundaries; component loading does not poll at all, so a cancel
+    /// raised during a multi-second weight load is not observed until the load finishes. Sharing
+    /// the token does not change that, and a consumer that needs to abandon a load must do it
+    /// above this seam.
+    pub fn from_arc(flag: Arc<AtomicBool>) -> Self {
+        Self(flag)
+    }
+
+    /// The underlying token, so a consumer can observe (or set) the same atomic the engine polls.
+    /// The inverse of [`from_arc`](Self::from_arc); see its note on where the engine checks.
+    pub fn as_arc(&self) -> &Arc<AtomicBool> {
+        &self.0
+    }
 }
 
 impl std::fmt::Debug for CancelFlag {
@@ -552,6 +577,36 @@ mod tests {
                 pixels: vec![0, 0, 0, 255, 255, 255],
             },
         }
+    }
+
+    /// A caller-owned token IS the flag the engine polls: cancelling through the consumer's own
+    /// `Arc` is observed by the engine's handle, with no bridge and no progress-callback hop.
+    #[test]
+    fn from_arc_shares_the_callers_token() {
+        let token = Arc::new(AtomicBool::new(false));
+        let flag = CancelFlag::from_arc(Arc::clone(&token));
+
+        assert!(!flag.is_cancelled());
+        token.store(true, Ordering::Relaxed);
+        assert!(
+            flag.is_cancelled(),
+            "the engine handle must see the caller's cancel"
+        );
+    }
+
+    /// And the reverse direction: `cancel()` on the engine handle is visible on the caller's token,
+    /// so a consumer can share one token across several in-flight requests.
+    #[test]
+    fn cancel_is_visible_on_the_shared_token() {
+        let token = Arc::new(AtomicBool::new(false));
+        let flag = CancelFlag::from_arc(Arc::clone(&token));
+
+        flag.cancel();
+        assert!(token.load(Ordering::Relaxed));
+        assert!(
+            Arc::ptr_eq(flag.as_arc(), &token),
+            "as_arc must expose the same allocation"
+        );
     }
 
     /// The inert default is the zero-cost path: engines gate their projection on `is_active`, and
