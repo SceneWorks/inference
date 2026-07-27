@@ -124,9 +124,9 @@ pub use load::{
 pub use pipeline::{descriptor, load as load_generator, KreaRealtime, SELF_FORCING_SAMPLER};
 pub use scheduler::{euler_x0, renoise_step, FewStepSchedule, NUM_TRAIN_TIMESTEPS};
 pub use t2v::{
-    decode_latents_to_video, generate_i2v, generate_i2v_from_components, generate_t2v,
-    generate_t2v_from_components, generate_v2v, generate_v2v_from_components, mac_ar_config,
-    KreaRealtimeJob,
+    decode_latents_to_video, decode_tiling, generate_i2v, generate_i2v_from_components,
+    generate_t2v, generate_t2v_from_components, generate_v2v, generate_v2v_from_components,
+    mac_ar_config, KreaRealtimeJob,
 };
 
 // Re-export the reused Wan config types so callers can name the DiT dimensions — and a snapshot's

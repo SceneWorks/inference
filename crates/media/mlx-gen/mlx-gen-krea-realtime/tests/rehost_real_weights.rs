@@ -325,10 +325,24 @@ fn emit_tier_sharded_and_validate_every_shard() {
         })
         .unwrap_or_else(|e| panic!("sharded emit of the {label} tier: {e}"));
 
-    assert!(
-        checked > 0,
-        "{label}: no shard tensor was comparable against the source — the per-shard check is inert"
-    );
+    // On a **dense** tier every tensor is comparable, so the per-shard check must have covered the
+    // whole audited inventory — not merely "something". That is what makes the delete-as-you-go flow
+    // self-verifying end to end: with the shards gone, this count is the only remaining evidence that
+    // all 1095 tensors were written and read back correctly. (A packed tier legitimately skips the
+    // affine-triple companions and caps its comparisons, so it keeps the weaker non-inert floor.)
+    if quant.is_none() {
+        assert_eq!(
+            checked, AUDIT_TENSOR_COUNT,
+            "{label}: the per-shard check covered {checked} tensor(s), not the full audited \
+             inventory of {AUDIT_TENSOR_COUNT} — a shard went unverified"
+        );
+    } else {
+        assert!(
+            checked > 0,
+            "{label}: no shard tensor was comparable against the source — the per-shard check is \
+             inert"
+        );
+    }
     println!(
         "tier {label}: {} shard(s) emitted in {:.1?}, {checked} tensor(s) spot-checked -> {}",
         shards.len(),

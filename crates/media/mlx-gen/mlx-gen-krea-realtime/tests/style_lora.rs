@@ -508,18 +508,81 @@ fn per_lora_scale_scales_the_residual() {
     );
 }
 
+/// **(3b) sc-8446 S13 — the whole-model globals install AND move the forward.**
+///
+/// The settled globals decision is not "the resolver returns `Some`": a widened surface that routed the
+/// keys but dropped the residual would still silently under-apply a real step-distill LoRA. So this
+/// installs a LoRA that targets **only** globals — every one in the reference/file spelling a real
+/// lightx2v / FastWan file carries — and requires all seven to install and the forward to change.
+///
+/// NB: this fixture deliberately targets **all seven** to exercise the whole routing surface. A *real*
+/// step-distill file populates only six (`patch_embedding` ships a `.diff_b` bias delta with no
+/// low-rank pair), which is the 406-vs-407 gap asserted in `causal.rs` and on the real weights in
+/// `tests/style_lora_real_weights.rs`. Seven here is a statement about the host, not about those files.
+#[test]
+fn globals_install_end_to_end_and_change_the_forward() {
+    let cfg = tiny_cfg();
+    let base = tiny_transformer(&cfg);
+    let vel_base = forward_once(&base, &cross_kv(&base, &cfg), &cfg);
+
+    // Shapes from `tiny_cfg`: dim 64, freq_dim 32, text_dim 32, in_dim 16, patch (1,2,2), out_dim 16.
+    //   patch_embedding_proj [dim, in_dim·∏patch] = [64, 64]   text_embedding_0 [64, 32]
+    //   text_embedding_1     [64, 64]                          time_embedding_0 [64, 32]
+    //   time_embedding_1     [64, 64]                          time_projection  [6·64, 64] = [384, 64]
+    //   head.head            [out_dim·∏patch, dim] = [64, 64]
+    let lora = write_lora(
+        "globals_only.safetensors",
+        &[
+            ("patch_embedding", 64, 64),
+            ("text_embedding.0", 64, 32),
+            ("text_embedding.2", 64, 64),
+            ("time_embedding.0", 64, 32),
+            ("time_embedding.2", 64, 64),
+            ("time_projection.1", 384, 64),
+            ("head.head", 64, 64),
+        ],
+        4,
+        77,
+        0.4,
+    );
+
+    let mut adapted = tiny_transformer(&cfg);
+    let report = apply_adapters_strict(&mut adapted, &[spec(lora, 1.0)], MODEL_ID)
+        .expect("a globals-only Wan LoRA must install (sc-8446 widened the surface)");
+    assert_eq!(
+        report.applied, 7,
+        "all seven whole-model globals must install (this synthetic file targets all seven; a real \
+         step-distill file populates six — see the note above)"
+    );
+    assert!(report.unmatched_paths.is_empty());
+
+    let vel_adapted = forward_once(&adapted, &cross_kv(&adapted, &cfg), &cfg);
+    let signal = max_abs(&vel_base).max(1e-6);
+    let delta = max_abs_diff(&vel_base, &vel_adapted);
+    assert!(
+        delta > 1e-3 * signal,
+        "a globals-only LoRA installed but did not move the forward (Δ {delta:.3e} vs signal \
+         {signal:.3e}) — the residual is not reaching the global Linears"
+    );
+}
+
 /// (4) An unsupported / unmatched adapter target is **surfaced** — the strict installer errors and names
-/// it — never silently dropped. Covers a whole-model global (not exposed by the per-block surface).
+/// it — never silently dropped.
+///
+/// The out-of-surface case is the **I2V-only image cross-attention** (`cross_attn.k_img`/`v_img`), which
+/// real Wan-**I2V** LoRAs carry and which does not exist on this T2V backbone at any surface width. It is
+/// deliberately NOT the whole-model globals: sc-8446 (S13) settled those as exposed, because real Wan-T2V
+/// step-distill LoRAs target them with genuine low-rank factors (see `globals_install_end_to_end`).
 #[test]
 fn unsupported_target_is_reported_not_silently_dropped() {
     let cfg = tiny_cfg();
 
-    // A file mixing a valid target with an out-of-surface global (`time_embedding.0`, not routed).
+    // A file mixing a valid target with an I2V-only module this T2V backbone does not have.
     let mixed = write_lora(
         "mixed_target.safetensors",
         &[
             ("blocks.0.self_attn.q", 64, 64),
-            ("time_embedding.0", 64, 32),
+            ("blocks.0.cross_attn.k_img", 64, 64),
         ],
         4,
         4,
@@ -530,7 +593,7 @@ fn unsupported_target_is_reported_not_silently_dropped() {
         .expect_err("an unmatched target must surface as an error, not be silently dropped");
     let msg = err.to_string();
     assert!(
-        msg.contains("time_embedding"),
+        msg.contains("k_img"),
         "the error must name the unmatched target: {msg}"
     );
 
@@ -579,9 +642,21 @@ fn wan_family_ffn_key_normalizes_and_resolves() {
         host.adaptable_mut(&["blocks", "0", "ffn", "9"]).is_none(),
         "a bogus FFN index must not resolve"
     );
+    // sc-8446 S13: the whole-model globals ARE exposed now, in the reference/file spelling a LoRA
+    // carries (the normalizer bridges to the converted names). The I2V-only image cross-attention still
+    // is not — those modules do not exist on a T2V backbone.
     assert!(
-        host.adaptable_mut(&["patch_embedding"]).is_none(),
-        "globals are not exposed"
+        host.adaptable_mut(&["patch_embedding"]).is_some(),
+        "patch_embedding is an exposed global (sc-8446)"
+    );
+    assert!(
+        host.adaptable_mut(&["head", "head"]).is_some(),
+        "head.head is an exposed global (sc-8446)"
+    );
+    assert!(
+        host.adaptable_mut(&["blocks", "0", "cross_attn", "k_img"])
+            .is_none(),
+        "the I2V-only image cross-attention does not exist on this T2V backbone"
     );
 
     // The reference-named `ffn.0` LoRA installs onto the FFN linear that `ffn.fc1` addresses: applying
