@@ -228,8 +228,8 @@ pub fn descriptor_for(variant: MageVariant) -> ModelDescriptor {
 
 /// Construct a Mage-Flow generator from a [`LoadSpec`].
 ///
-/// `spec.adapters` carries LoRA/LoKr adapters to install on the DiT (sc-15328). They are applied in
-/// [`assemble`], AFTER the per-component tier quantization, through the strict shared seam
+/// `spec.adapters` carries LoRA/LoKr adapters to install on the DiT (sc-15328). They are applied
+/// during assembly, AFTER the per-component tier quantization, through the strict shared seam
 /// [`crate::adapters::apply_mage_adapters`] — stacked and mixed LoRA/LoKr, erroring rather than
 /// silently dropping an unmatched target. An empty `adapters` is the unchanged no-adapter load.
 pub fn load(variant: MageVariant, spec: &LoadSpec) -> Result<Box<dyn Generator>> {
