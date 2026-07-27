@@ -529,6 +529,13 @@ mod vram_probe {
             Phase(PeakSampler::start(self.gpu))
         }
 
+        /// Close an arbitrary observed sub-phase and return its device peak over this probe's idle
+        /// baseline. Provider measurement harnesses use this to split one generate call into physical
+        /// text/denoise/decode residency phases while the ordinary report still samples the whole call.
+        pub fn end_observed(&self, phase: Phase) -> f64 {
+            mib_to_gb(phase.0.stop().saturating_sub(self.baseline_mib))
+        }
+
         /// Close the **load** phase: fold its peak into `load_peak`, and sample the settled resident
         /// (`steady`) right now (load done, denoise not started). Also seeds the overall peak.
         pub fn end_load(&mut self, phase: Phase) {
