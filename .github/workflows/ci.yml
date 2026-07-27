@@ -229,14 +229,26 @@ jobs:
         # links the seven real-weight-only binaries, which costs the lld budget above nothing but
         # time for zero executed cases.
         #
-        # The named eight and what they execute on a PR (measured, `cargo test -p
+        # The named nine and what they execute on a PR (measured, `cargo test -p
         # candle-audio-stable-audio-3 --tests`): `sampler_oracle` 17, `reference_audio` 7,
-        # `provider` 3, `dtype_policy` 2, `conformance` 1, `primitive_oracle` 1, `same_oracle` 1,
-        # `variant_quality` 1 — 33 weight-free cases. sc-14545 review found `sampler_oracle`,
-        # `same_oracle` and `primitive_oracle` running in no automatic lane at all (19 dark gates,
-        # pre-existing since sc-14543) and added them here. sc-14546 adds `provider`'s third case,
-        # which asserts each `-base` side-ratio floor sits below the sweep minimum it was
-        # calibrated from.
+        # `provider` 3, `listening_stimuli` 3, `dtype_policy` 2, `conformance` 1,
+        # `primitive_oracle` 1, `same_oracle` 1, `variant_quality` 1 — 36 weight-free cases.
+        # sc-14545 review found
+        # `sampler_oracle`, `same_oracle` and `primitive_oracle` running in no automatic lane at all
+        # (19 dark gates, pre-existing since sc-14543) and added them here. sc-14546 adds
+        # `provider`'s third case, which asserts each `-base` side-ratio floor sits below the sweep
+        # minimum it was calibrated from. sc-15178 adds `listening_stimuli`'s three weight-free
+        # controls behind the listening protocol: one measures that an RMS-matched pair sits
+        # 6.71 LU apart under BS.1770-4 and that LUFS matching closes the gap (the evidence for the
+        # protocol specifying LUFS rather than RMS), the second replays the observed +0.031 dBTP
+        # inter-sample over that forced the loudness target to be peak-constrained, and the third
+        # (round-2 review) generates and digest-pins the screening practice contrast, which is the
+        # material behind the protocol's only performance-based inclusion criterion and was
+        # otherwise chosen per session. That target's two `#[ignore]`d cases — the stimulus
+        # generator itself, and the check of the committed `demo_cond` pool against the six pinned
+        # `model_config.json` files — run in no lane by design; the generator is a generator, not a
+        # gate, and everything derived from the pool is checked weight-free in
+        # `scripts/tests/test_sa3_listening_blind.py`.
         #
         # sc-14547 adds `reference_audio`, the audio→audio restyle target. Its seven weight-free
         # cases carry the **sign gates** for that feature: the contract's
@@ -291,7 +303,7 @@ jobs:
           -p candle-audio-stable-audio-3
           --test provider --test dtype_policy --test variant_quality --test conformance
           --test sampler_oracle --test same_oracle --test primitive_oracle
-          --test reference_audio
+          --test listening_stimuli --test reference_audio
           -- --nocapture
       - name: Test LLM-only CPU bundle
         run: cargo test --locked --no-default-features --lib -p runtime-cpu
