@@ -1240,8 +1240,15 @@ fn decode_tiling_sweep_against_single_pass() {
         .expect("the clip must tile at a 20 GiB budget");
     std::env::remove_var("WAN_VAE_BUDGET_GIB");
     println!("--- product policy at a 20 GiB budget: {shipped:?} ---");
-    let ship_t = shipped.temporal.expect("temporal");
-    let mut candidates: Vec<(i32, i32)> = vec![(ship_t.tile_frames, ship_t.overlap_frames)];
+    // ⚠️ The product plan is NOT necessarily temporal. Since sc-15325 the selector relieves memory on
+    // the spatial axis, and at a short clip it will happily return a spatial-only plan — which is the
+    // *best* possible answer for this defect (no temporal tiling at all ⇒ the decoder sees the whole
+    // sequence). Assuming a temporal tile here is how this test first went red after the fix.
+    let ship_t = shipped.temporal;
+    let mut candidates: Vec<(i32, i32)> = Vec::new();
+    if let Some(t) = ship_t {
+        candidates.push((t.tile_frames, t.overlap_frames));
+    }
     for c in [(8, 4), (8, 8), (16, 4), (16, 8), (32, 8), (32, 16)] {
         if !candidates.contains(&c) {
             candidates.push(c);
@@ -1275,8 +1282,10 @@ fn decode_tiling_sweep_against_single_pass() {
                 (0usize, 0.0f64),
                 |acc, (i, &v)| if v > acc.1 { (i, v) } else { acc },
             );
-        let label = if (tile, overlap) == (ship_t.tile_frames, ship_t.overlap_frames) {
-            format!("tile {tile:>2} / overlap {overlap:>2}  [SHIPPED]")
+        let is_product =
+            ship_t.is_some_and(|t| (t.tile_frames, t.overlap_frames) == (tile, overlap));
+        let label = if is_product {
+            format!("tile {tile:>2} / overlap {overlap:>2}  [PRODUCT temporal tile]")
         } else {
             format!("tile {tile:>2} / overlap {overlap:>2}")
         };
@@ -1291,22 +1300,45 @@ fn decode_tiling_sweep_against_single_pass() {
             gib(peak)
         );
         report_artifacts(&out, &format!("t{tile}o{overlap}"));
-        if (tile, overlap) == (ship_t.tile_frames, ship_t.overlap_frames) {
-            dump_frames(&out, "sweep_shipped");
+        if is_product {
+            dump_frames(&out, "sweep_product_temporal");
         }
         if (tile, overlap) == (32, 16) {
             dump_frames(&out, "sweep_best");
         }
     }
 
-    // sc-15325 is fixed, so the gate inverts: the tiling the PRODUCT emits must now track single-pass.
-    // (The sweep rows above still show the old 2-latent-frame window failing at 17-18/255 — the
-    // corruption is still reproducible on demand, it is simply no longer selectable.)
-    let shipped_out = decode(Some(&shipped));
-    let d_shipped = mean_abs_delta(&single, &shipped_out);
+    // sc-15325 is fixed, so the gate inverts: the full plan the PRODUCT emits — spatial and temporal
+    // together, whatever the selector chose — must now track single-pass. (The `8 / 4` row above still
+    // shows the old 2-latent-frame window failing: the corruption is reproducible on demand, it is
+    // simply no longer selectable.) The old window is re-measured here as the control, so a run where
+    // this gate passes because the *harness* stopped discriminating is caught rather than believed.
+    let (product_out, product_peak) = peak_of(&|| decode(Some(&shipped)));
+    let d_product = mean_abs_delta(&single, &product_out);
+    dump_frames(&product_out, "sweep_product_plan");
+    println!(
+        "  PRODUCT plan {shipped:?}: mean abs err {d_product:.2}/255, peak {:.2} GiB",
+        gib(product_peak)
+    );
+    report_artifacts(&product_out, "product");
+
+    let old_window = TilingConfig {
+        spatial: None,
+        temporal: Some(TemporalTiling {
+            tile_frames: 8,
+            overlap_frames: 4,
+        }),
+    };
+    let d_old = mean_abs_delta(&single, &decode(Some(&old_window)));
     assert!(
-        d_shipped < 4.0,
-        "the product decode tiling is {d_shipped:.2}/255 from single-pass — sc-15325 has regressed"
+        d_old > 5.0,
+        "the pre-sc-15325 window is now only {d_old:.2}/255 from single-pass — this sweep has \
+         stopped reproducing the defect, so the gate below proves nothing"
+    );
+    assert!(
+        d_product < 4.0 && d_product < d_old * 0.35,
+        "the product decode plan is {d_product:.2}/255 from single-pass (old window: {d_old:.2}) — \
+         sc-15325 has regressed"
     );
 }
 
