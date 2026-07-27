@@ -13,7 +13,10 @@ half of it. It owns four things that must not be decided per session:
 4. **The pre-registered analysis**, including the rule that makes the whole thing interpretable:
    ABX answers *discriminability* and MOS answers *preference*, and **a failed ABX makes the MOS
    run uninterpretable, so it is not reported**. That rule is enforced here rather than trusted to
-   whoever runs the numbers.
+   whoever runs the numbers. `analyze` also checks the counts that actually arrived against the
+   pre-registration the key carries, and flags any difference as a `DEVIATION` -- its thresholds are
+   recomputed from the observed counts, so a trimmed panel would otherwise be scored against a
+   threshold that is quietly no longer the pre-registered one.
 
 Everything is dependency-free (standard library only), matching the rest of `scripts/`. The
 statistics are computed rather than tabulated: the exact binomial is `math.comb`, and the Student
@@ -217,14 +220,23 @@ def binomial_mde(n: int, target: float = TARGET_POWER, p0: float = ABX_CHANCE,
 def binomial_acceptance(n: int, p0: float = ABX_CHANCE, alpha: float = 0.05) -> tuple[int, int]:
     """Central `1 - alpha` acceptance interval on the count, for the same-checkpoint control.
 
-    The control's purpose is inverted from the contrast test: a *pass* is landing inside this band.
-    A panel scoring above it on identical files is not a panel that heard something, it is a panel
-    whose blinding leaked.
+    The control's purpose is inverted from the contrast test: a *pass* is landing inside this band,
+    and the band is returned **inclusive at both ends**. A panel scoring above it on identical files
+    is not a panel that heard something, it is a panel whose blinding leaked.
+
+    Both bounds are the extreme *accepted* counts, not the extreme rejected ones. `low` is the
+    smallest `k` with `P(X <= k - 1) <= alpha/2`, so `k - 1` is already in the lower rejection
+    region. `high` is derived the same way from the upper tail and then stepped back by one: the
+    `min` finds the smallest count in the *rejection* region, and returning it unchanged would widen
+    the band by one count on the upper side only. That asymmetry is in the leak direction -- the one
+    thing this control exists to catch -- so it is corrected here rather than left as slack.
     """
     tail = alpha / 2.0
     low = max(k for k in range(n + 1) if binomial_sf(k, n, p0) >= 1.0 - tail)
-    high = min(k for k in range(n + 1) if binomial_sf(k, n, p0) <= tail)
-    return low, high
+    # `default` covers the small-`n` case where even `n` correct is not significant at `tail`: the
+    # whole range is then acceptance, and `min` over an empty sequence would raise instead.
+    rejects_above = min((k for k in range(n + 1) if binomial_sf(k, n, p0) <= tail), default=n + 1)
+    return low, rejects_above - 1
 
 
 def _simpson(function, lo: float, hi: float, intervals: int = 4000) -> float:
@@ -384,6 +396,7 @@ def _preregistration(panel: int) -> dict:
     return {
         "panel_size": panel,
         "recruit_size": RECRUIT_SIZE,
+        "assignment_seed": DEFAULT_ASSIGNMENT_SEED,
         "abx": {
             "trials_per_listener": CONTRAST_TRIALS_PER_LISTENER,
             "pooled_trials": contrast_n,
@@ -446,6 +459,13 @@ def assign(manifest: dict, seed: int = DEFAULT_ASSIGNMENT_SEED,
     Returns `(playlists, key)`. `playlists` carries opaque handles only -- no variant name, no
     prompt, no seed -- because a listener who can see which take is medium is not blinded. The key
     carries the full mapping and is withheld until responses are collected.
+
+    `panel` is **how many playlists to generate**, which is not the same number as the pre-registered
+    panel. The runbook generates `RECRUIT_SIZE` of them so there is headroom for the attrition the
+    protocol states; the pre-registration embedded in the key is always the `PANEL_SIZE` one, because
+    it was fixed before any listening and generating spare playlists does not re-open it. Each
+    listener's design comes from its own stream (`seed * 1_000_003 + position`), so the spare
+    playlists are stable and independent -- a replacement listener does not perturb anyone else's.
     """
     grouped = index_takes(manifest)
     stimuli = sorted({stimulus for stimulus, _ in grouped})
@@ -462,8 +482,9 @@ def assign(manifest: dict, seed: int = DEFAULT_ASSIGNMENT_SEED,
     key: dict = {
         "story": "sc-15178",
         "assignment_seed": seed,
-        "panel_size": panel,
-        "preregistration": preregistration(panel),
+        "playlists_generated": panel,
+        "panel_size": PANEL_SIZE,
+        "preregistration": preregistration(),
         "listeners": {},
     }
 
@@ -705,7 +726,62 @@ def unblind(key: dict, abx_rows: list[dict], rating_rows: list[dict]) -> dict:
 # ---------------------------------------------------------------------------
 
 
+def preregistration_deviations(unblinded: dict) -> list[str]:
+    """Observed counts against the pre-registration the unblinded responses carry.
+
+    This exists because every threshold below is recomputed from the **observed** trial count. That
+    is the right thing to do arithmetically and the wrong thing to trust silently: drop trials or
+    listeners and the rejection threshold moves with them, so an incomplete or post-hoc-trimmed
+    panel would be scored against a threshold that is no longer the pre-registered 134/240 -- with
+    nothing in the report saying so. Pre-registration exists to close exactly that forking path, and
+    a file carrying the pre-registration is the place to enforce it.
+
+    Returns one string per difference, empty when the panel arrived as designed.
+    """
+    pre = unblinded.get("preregistration")
+    if not pre:
+        return ["the unblinded responses carry no pre-registration to check against"]
+
+    observed_contrast = sum(1 for row in unblinded["abx"] if row["kind"] == "contrast")
+    observed_null = sum(1 for row in unblinded["abx"] if row["kind"] == "null")
+    observed_listeners = len({row["listener"] for row in unblinded["abx"]})
+
+    deviations = []
+    for label, observed, expected in (
+        ("pooled contrast ABX trials", observed_contrast, pre["abx"]["pooled_trials"]),
+        ("pooled null-control ABX trials", observed_null, pre["null_control"]["pooled_trials"]),
+        ("listeners", observed_listeners, pre["panel_size"]),
+    ):
+        if observed != expected:
+            deviations.append(f"{label}: {observed} observed, {expected} pre-registered")
+    return deviations
+
+
 def analyze(unblinded: dict) -> dict:
+    """Run the pre-registered analysis and check the panel against the pre-registration.
+
+    The analysis itself is `_pre_registered_analysis`; this wrapper adds the enforcement half. A
+    count that does not match what was pre-registered is reported in an explicit `deviation` field
+    and prepended to the conclusion, so a trimmed panel cannot be read as a pre-registered result.
+    The numbers are still computed -- refusing outright would hide a partial run that is worth
+    looking at -- but they are labelled as no longer pre-registered, and that label is not
+    overridable.
+    """
+    report = _pre_registered_analysis(unblinded)
+    deviations = preregistration_deviations(unblinded)
+    report["deviation"] = deviations or None
+    if deviations:
+        report["conclusion"] = (
+            "DEVIATION FROM PRE-REGISTRATION: "
+            + "; ".join(deviations)
+            + ". Every threshold below was recomputed from the observed counts, so they are NOT "
+            "the pre-registered ones and this is no longer a pre-registered analysis. Report the "
+            "deviation with the result. --- " + report["conclusion"]
+        )
+    return report
+
+
+def _pre_registered_analysis(unblinded: dict) -> dict:
     """Run the pre-registered analysis, in the pre-registered order.
 
     The order is the point:
@@ -807,7 +883,19 @@ def analyze(unblinded: dict) -> dict:
             )
             if original is not None:
                 discrepancies.append(abs(duplicate["rating"] - original["rating"]))
-        median = sorted(discrepancies)[len(discrepancies) // 2] if discrepancies else 0.0
+        # A true median, not the upper-middle value: there are six rating screens, so the count is
+        # even and picking `sorted(...)[n // 2]` would silently pre-register one thing and compute
+        # another -- in the exclusion-happy direction.
+        if discrepancies:
+            ordered = sorted(discrepancies)
+            middle = len(ordered) // 2
+            median = (
+                ordered[middle]
+                if len(ordered) % 2
+                else (ordered[middle - 1] + ordered[middle]) / 2.0
+            )
+        else:
+            median = 0.0
         if median > MAX_ANCHOR_DISCREPANCY:
             excluded.append(listener)
             continue
@@ -892,7 +980,11 @@ def main(argv: list[str] | None = None) -> int:
     assign_parser.add_argument("--source-dir", type=Path,
                                help="stimulus WAV directory; copies takes to opaque names")
     assign_parser.add_argument("--seed", type=int, default=DEFAULT_ASSIGNMENT_SEED)
-    assign_parser.add_argument("--panel-size", type=int, default=PANEL_SIZE)
+    assign_parser.add_argument(
+        "--panel-size", type=int, default=RECRUIT_SIZE,
+        help=(f"how many playlists to generate; defaults to RECRUIT_SIZE ({RECRUIT_SIZE}) so there "
+              f"is headroom for attrition above the {PANEL_SIZE} listeners the pre-registration is "
+              "fixed at. The key's pre-registration is always the PANEL_SIZE one."))
 
     sheet_parser = sub.add_parser("sheet", help="emit blank response sheets for one playlist")
     sheet_parser.add_argument("--playlist", type=Path, required=True)

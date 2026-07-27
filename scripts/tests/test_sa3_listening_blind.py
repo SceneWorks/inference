@@ -212,7 +212,53 @@ class PreRegistrationTests(unittest.TestCase):
         n = pre["pooled_trials"]
         self.assertLess(low / n, blind.ABX_CHANCE)
         self.assertGreater(high / n, blind.ABX_CHANCE)
-        self.assertEqual([low, high], [31, 50])
+
+    def test_the_null_control_band_is_the_central_95_percent_and_is_symmetric(self) -> None:
+        """Derived from the tail probabilities, not hardcoded.
+
+        The previous version of this test asserted `[31, 50]` as a literal, which is how an
+        off-by-one survived: `binomial_acceptance` returned the smallest count in the *upper
+        rejection* region and used it as an inclusive bound, so the band was one count too wide at
+        the top -- and that end is the leak direction the control exists to catch. Re-deriving both
+        ends from an independent enumeration is what makes this assertion discriminate.
+        """
+        pre = blind.preregistration()["null_control"]
+        low, high = pre["acceptance_counts"]
+        n = pre["pooled_trials"]
+        tail = 0.05 / 2.0
+
+        def upper(k: int) -> float:
+            return sum(math.comb(n, i) for i in range(k, n + 1)) / 2**n
+
+        def lower(k: int) -> float:
+            return sum(math.comb(n, i) for i in range(0, k + 1)) / 2**n
+
+        # Both ends are the extreme *accepted* counts: one step outside the band is in a rejection
+        # region, one step inside is not.
+        self.assertLessEqual(lower(low - 1), tail)
+        self.assertGreater(lower(low), tail)
+        self.assertLessEqual(upper(high + 1), tail)
+        self.assertGreater(upper(high), tail)
+
+        # Symmetric about n/2 -- the binomial at p = 0.5 is, so an asymmetric band is a bug.
+        self.assertEqual(low + high, n)
+        self.assertAlmostEqual(lower(low - 1), upper(high + 1))
+
+        # And the band really is the central 95%, not the 97.4% the inclusive-rejection-bound
+        # version covered.
+        coverage = 1.0 - lower(low - 1) - upper(high + 1)
+        self.assertGreaterEqual(coverage, 0.95)
+        self.assertLess(coverage, 0.97)
+
+    def test_the_acceptance_band_never_returns_a_rejecting_count(self) -> None:
+        """Across panel sizes, so the fix is a property rather than a fact about n = 80."""
+        for n in (8, 16, 40, 80, 96, 120):
+            low, high = blind.binomial_acceptance(n)
+            self.assertLessEqual(low, high, f"n={n}")
+            self.assertGreater(blind.binomial_sf(high, n, 0.5), 0.025, f"n={n}: high rejects")
+            self.assertGreater(
+                1.0 - blind.binomial_sf(low + 1, n, 0.5), 0.025, f"n={n}: low rejects"
+            )
 
     def test_the_protocol_document_quotes_the_computed_numbers(self) -> None:
         """The doc's table and this script must not be able to drift apart."""
@@ -226,8 +272,28 @@ class PreRegistrationTests(unittest.TestCase):
             f"{pre['mos']['minimum_detectable_points']:.1f}",
             str(pre["null_control"]["acceptance_counts"][0]),
             str(pre["null_control"]["acceptance_counts"][1]),
+            str(pre["assignment_seed"]),
+            str(pre["recruit_size"]),
         ):
             self.assertIn(needle, text, f"protocol document does not quote {needle!r}")
+
+    def test_the_protocol_document_pins_the_committed_assignment_seed(self) -> None:
+        """The bare-number needle above is weak for the seed -- `15178` is also the story id and a
+        render seed, so it would be found in the document no matter what. This binds the seed to the
+        sentence that pins it, so the constant cannot be changed with the suite still green."""
+        text = PROTOCOL.read_text(encoding="utf-8")
+        self.assertIn(
+            f"committed randomization seed `{blind.DEFAULT_ASSIGNMENT_SEED}`",
+            text,
+            "protocol section 5 must pin the assignment seed the script actually uses",
+        )
+
+    def test_the_runbook_generates_the_recruited_number_of_playlists(self) -> None:
+        """`RECRUIT_SIZE` states attrition headroom; a runbook that never passes it would yield
+        exactly PANEL_SIZE playlists and no headroom at all."""
+        text = PROTOCOL.read_text(encoding="utf-8")
+        self.assertGreater(blind.RECRUIT_SIZE, blind.PANEL_SIZE)
+        self.assertIn(f"--panel-size {blind.RECRUIT_SIZE}", text)
 
 
 class StimulusHoldOutTests(unittest.TestCase):
@@ -535,6 +601,79 @@ class AnalysisTests(unittest.TestCase):
         self.assertIsNone(report["abx"])
         self.assertIsNone(report["mos"])
         self.assertIn("PANEL INVALID", report["conclusion"])
+
+    def test_a_panel_that_arrived_as_designed_reports_no_deviation(self) -> None:
+        """The discriminating half of the pair below: a check that always fires is not a check."""
+        report = blind.analyze(simulate(self.key, abx_accuracy=0.9, medium_bonus=12.0))
+        self.assertIsNone(report["deviation"])
+        self.assertNotIn("DEVIATION", report["conclusion"])
+
+    def test_a_trimmed_panel_is_flagged_as_a_deviation_from_the_preregistration(self) -> None:
+        """The garden-of-forking-paths hole the pre-registration exists to close.
+
+        `analyze` recomputes the rejection threshold from the observed trial count, so dropping
+        listeners moves it off the pre-registered 134/240. Silently recomputing is exactly what a
+        post-hoc trim looks like, so the report must name it.
+        """
+        unblinded = simulate(self.key, abx_accuracy=0.9, medium_bonus=12.0)
+        dropped = {"L01", "L02", "L03"}
+        trimmed = dict(unblinded)
+        trimmed["abx"] = [r for r in unblinded["abx"] if r["listener"] not in dropped]
+        trimmed["ratings"] = [r for r in unblinded["ratings"] if r["listener"] not in dropped]
+
+        report = blind.analyze(trimmed)
+        self.assertIsNotNone(report["deviation"])
+        self.assertIn("DEVIATION FROM PRE-REGISTRATION", report["conclusion"])
+        joined = "; ".join(report["deviation"])
+        self.assertIn("listeners", joined)
+        self.assertIn("pooled contrast ABX trials", joined)
+        self.assertIn("pooled null-control ABX trials", joined)
+        # And the deviation is real, not cosmetic: the threshold genuinely moved.
+        pre = unblinded["preregistration"]["abx"]
+        self.assertNotEqual(report["abx"]["critical_count"], pre["critical_count"])
+
+    def test_responses_carrying_no_preregistration_are_flagged_rather_than_trusted(self) -> None:
+        unblinded = simulate(self.key, abx_accuracy=0.9, medium_bonus=12.0)
+        stripped = {k: v for k, v in unblinded.items() if k != "preregistration"}
+        report = blind.analyze(stripped)
+        self.assertIsNotNone(report["deviation"])
+        self.assertIn("DEVIATION FROM PRE-REGISTRATION", report["conclusion"])
+
+    def test_the_key_embeds_the_preregistered_panel_size_not_the_playlist_count(self) -> None:
+        """Generating spare playlists for attrition must not re-open the pre-registration."""
+        _, key = blind.assign(fake_manifest(), panel=blind.RECRUIT_SIZE)
+        self.assertEqual(len(key["listeners"]), blind.RECRUIT_SIZE)
+        self.assertEqual(key["playlists_generated"], blind.RECRUIT_SIZE)
+        self.assertEqual(key["panel_size"], blind.PANEL_SIZE)
+        self.assertEqual(key["preregistration"]["panel_size"], blind.PANEL_SIZE)
+        self.assertEqual(
+            key["preregistration"]["abx"]["pooled_trials"],
+            blind.PANEL_SIZE * blind.CONTRAST_TRIALS_PER_LISTENER,
+        )
+
+    def test_the_anchor_median_is_a_true_median_over_an_even_number_of_screens(self) -> None:
+        """Six rating screens means the count is always even. The upper-middle value is not the
+        median the protocol pre-registers, and it excludes listeners the rule does not."""
+        self.assertEqual(blind.RATING_SCREENS_PER_LISTENER % 2, 0)
+        unblinded = simulate(self.key, abx_accuracy=0.9, medium_bonus=0.0)
+        # Lay down discrepancies whose true median straddles the threshold: half at 0, half well
+        # above it. mean(0, 30) = 15 <= 20 retains; the upper-middle value 30 would exclude.
+        rows = [r for r in unblinded["ratings"] if r["listener"] == "L01"]
+        screens = sorted({r["screen"] for r in rows})
+        for index, screen in enumerate(screens):
+            here = [r for r in rows if r["screen"] == screen]
+            duplicate = next(r for r in here if r["duplicate"])
+            original = next(
+                r for r in here if not r["duplicate"] and r["variant"] == duplicate["variant"]
+            )
+            offset = 0.0 if index < len(screens) // 2 else 30.0
+            duplicate["rating"] = min(original["rating"] + offset, 100.0)
+        report = blind.analyze(unblinded)
+        self.assertNotIn(
+            "L01",
+            report["mos"]["listeners_excluded"],
+            "the true median of {0,0,0,30,30,30} is 15, inside the 20-point rule",
+        )
 
     def test_inconsistent_listeners_are_excluded_by_the_preregistered_rule(self) -> None:
         unblinded = simulate(self.key, abx_accuracy=0.9, medium_bonus=12.0)

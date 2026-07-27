@@ -115,14 +115,33 @@ The obvious design is to draw the whole set from the checkpoints' own shipped `d
 each is heard on material its authors chose. **That design is unavailable, and discovering why is
 part of this story's result.**
 
-`tests/provider.rs` commits **every shipped `demo_cond` prompt of every SA3 variant** as a
-side-ratio calibration constant — `SFX_SWEEP_PROMPTS`, `MUSIC_SWEEP_PROMPTS`,
-`MEDIUM_SWEEP_PROMPTS`, `MUSIC_BASE_SWEEP_PROMPTS`. Those sweeps are what the shipped floors were
-*tuned on*. There is therefore no held-out prompt anywhere in the `demo_cond` pool, and a set drawn
-entirely from it would score the panel on the crate's own tuning data.
+`tests/provider.rs` commits the SA3 `demo_cond` prompts as side-ratio calibration constants —
+`SFX_SWEEP_PROMPTS`, `MUSIC_SWEEP_PROMPTS`, `MEDIUM_SWEEP_PROMPTS`, `MUSIC_BASE_SWEEP_PROMPTS`. Those
+sweeps are what the shipped floors were *tuned on*, so every prompt in them is a gate operating
+point.
+
+Counted against the six on-disk snapshots (read from `model_config.json`, not fetched), the pool is
+**14 distinct prompts** and the crate commits **all of them**:
+
+| snapshot | `demo_cond` prompts | committed as |
+|---|---|---|
+| `stable-audio-3-medium` | **2** | `MEDIUM_SWEEP_PROMPTS` (both) |
+| `stable-audio-3-small-music` | 4 | `MUSIC_SWEEP_PROMPTS` (all four) |
+| `stable-audio-3-small-sfx` | 4 | `SFX_SWEEP_PROMPTS` (all four) |
+| `stable-audio-3-small-music-base` | 4 | `MUSIC_BASE_SWEEP_PROMPTS` (all four) |
+| `stable-audio-3-small-sfx-base` | 4 | identical set to `small-music-base`'s, so the same four |
+| `stable-audio-3-medium-base` | 0 | — |
+
+Medium's count is the one worth stating explicitly, because `MEDIUM_SWEEP_PROMPTS`'s own doc comment
+reads like a *selection* ("two shipped music `demo_cond` prompts from medium's own
+`model_config.json`"). It is not a selection: medium ships exactly two, and both are committed.
+
+There is therefore no held-out prompt anywhere in the `demo_cond` pool, and a set drawn entirely from
+it would score the panel on the crate's own tuning data.
 
 So the four held-out entries are **authored for this panel**, in the same idiom and the same two
-domains, and appear nowhere else in the repository. Four of six is above the one-half minimum.
+domains, and appear **in no crate source** — which is the scope the test below actually checks. Four
+of six is above the one-half minimum.
 
 The two anchors (`music-3`, `sfx-3`) are the crate's existing gate prompts, kept deliberately: they
 tie the panel to the operating point the real-weight lanes measure at, so a panel result and a gate
@@ -132,6 +151,10 @@ None of this is asserted in prose alone. `scripts/tests/test_sa3_listening_blind
 stimulus table out of the Rust generator, scans every other `.rs` source under `crates/` for each
 prompt, and fails if a held-out prompt is committed elsewhere — with a discriminating control that
 requires the same scan to *find* the two anchors, so a scanner that matched nothing could not pass.
+
+The scan's scope is **`crates/**/*.rs` only**, which is what "held out" means here: held out from the
+crate's committed gate constants. It is deliberately not a whole-repository check — this document
+itself lists all six prompts in the table above, and so would any write-up of the result.
 
 ### Why `sfx-3` is load-bearing
 
@@ -257,6 +280,23 @@ The key must be withheld from listeners **and operators** until every response i
 > without listening. Presentation must therefore be through a player that exposes neither filenames
 > nor file contents. The same-checkpoint control (below) is what detects this failure if it happens.
 
+> **Unresolved dependency, named rather than assumed.** This protocol requires such a player and
+> **does not provide or specify one.** Nothing in this repository presents audio to a human listener,
+> and building or choosing that presentation harness is out of scope for sc-15178, which delivers the
+> stimulus generator and the blinding/analysis half only.
+>
+> **Selecting or building the presentation player is therefore a prerequisite of sc-15377**, and
+> sc-15377 must not begin collecting responses before it exists. Whatever is chosen has to meet three
+> requirements that follow from the paragraph above and from §5: it must not display the underlying
+> filename or path of a playing item; it must not expose the file to the listener (no reveal-in-folder,
+> no download, no drag-out); and it must accept the per-listener directory `assign --source-dir`
+> materializes, playing items in the order the playlist JSON lists them. Replay within a trial is
+> permitted (§6). The operator's own view is a separate exposure and is covered by the key-withholding
+> rule above.
+>
+> The same-checkpoint control is a *detector* for this failing, not a substitute for the player. It
+> catches a leak after the fact, on a run that cannot be repeated.
+
 ### The same-checkpoint control
 
 Four of each listener's sixteen ABX trials present **the same file as A, B and X**. A listener has
@@ -266,9 +306,19 @@ no information on these and scores at chance by construction, so their pooled ac
 There is no honest alternative. A same-checkpoint pair at *different seeds* is different audio and
 therefore genuinely discriminable, which would make the control measure the wrong thing.
 
-Pooled over the panel that is **80 null trials**. The central 95% acceptance band is **31 to 50
-correct** (0.388–0.625). A score above the band means the blinding leaked, not that listeners heard
-something: `analyze` reports `PANEL INVALID` and refuses to read the contrast trials at all.
+Pooled over the panel that is **80 null trials**. The central 95% acceptance band is **31 to 49
+correct** inclusive (0.388–0.613). A score above the band means the blinding leaked, not that
+listeners heard something: `analyze` reports `PANEL INVALID` and refuses to read the contrast trials
+at all.
+
+Both ends are the extreme *accepted* counts, and the band is symmetric by construction: P(X ≤ 30) =
+P(X ≥ 50) = 0.0165 under a fair coin, so 31 and 49 are the innermost counts still outside both
+rejection regions and the band covers 96.7%. The upper end matters more than the symmetry does —
+it is the leak direction. A partial leak on a quarter of trials lands at 50/80, and a band that
+included 50 would wave it through on a one-shot run with twenty human listeners, where there is no
+re-run. `test_the_null_control_band_is_the_central_95_percent_and_is_symmetric` re-derives both ends
+from the tail probabilities rather than asserting the literals, which is what would have caught the
+earlier off-by-one here.
 
 ### The rating consistency anchor
 
@@ -298,7 +348,123 @@ sizes ITU-R BS.1534 multi-stimulus tests are typically run at, which is a sanity
 than its justification.
 
 Per listener: **12 contrast ABX trials** (6 prompts × 2 seeds) + **4 null ABX trials** + **6 rating
-screens** × 3 slots. Run as three blocks with breaks; total session ≈ 50 minutes.
+screens** × 3 slots. Run as three blocks with breaks — two ABX blocks then the rating block, in that
+order (see *Block order and familiarization* below); total session ≈ 50 minutes.
+
+### Screening, and how the four spare listeners are used
+
+"Retained after screening" was previously named without being defined, which left the inclusion
+criterion — the largest remaining researcher degree of freedom in this protocol — to be settled on
+the day. It is pinned here.
+
+**Screening is a pass/fail check applied before any panel trial is presented, and it is the only
+basis for excluding a candidate before the session.** A candidate passes if all of:
+
+1. **Self-reported normal hearing**, no known hearing loss, no ear infection or congestion on the
+   day. Not audiometry — this is a preference panel, not a clinical study, and requiring audiometry
+   would shrink the pool without bearing on the question.
+2. **Age 18–55.** High-frequency sensitivity declines with age; the band is stated so that the panel
+   composition is a recorded fact rather than a convenience sample.
+3. **A passed practice ABX block**: **6 trials** on a *deliberately easy* contrast — the same take at
+   full bandwidth versus the same take low-passed at 4 kHz — with **at least 5 of 6 correct**. This
+   screens for candidates who have understood the ABX task and can operate the player, and nothing
+   else. It uses no panel stimulus and no panel checkpoint, so it cannot leak the contrast under
+   test or pre-expose the material.
+4. **No involvement in SceneWorks audio model work.** Anyone who has heard these checkpoints while
+   developing them is not blind to them.
+
+Criterion 3 is the only performance-based one, and it is deliberately far easier than the panel task.
+It must not be tightened toward the real contrast: screening listeners on the difference under test
+would select the panel for the answer.
+
+**Anchor-consistency exclusion is a separate, post-hoc rule** (§5, 20 points) applied by `analyze`
+after the session; it is reported as `listeners_excluded` and is not screening.
+
+**Attrition headroom.** Recruit and screen **24**; generate 24 playlists (`--panel-size 24` in §8).
+Seat listeners on `L01`…`L24` in recruitment order — each playlist's design comes from its own
+stream (`seed * 1_000_003 + position`), so the spare four are stable and independent and a
+replacement perturbs nobody else's design. Collect until **20 listeners have completed a full
+session**; `L21`–`L24` exist only to replace no-shows and mid-session dropouts. Exactly those 20
+completed sessions are passed to `unblind`. The pre-registration embedded in the key is always the
+20-listener one regardless of how many playlists were generated, and `analyze` compares the counts
+that actually arrived against it and emits a `deviation` field naming any difference (§6, Reporting).
+
+### Listener instructions, verbatim
+
+Read or displayed identically to every listener, before the familiarization block. The wording is
+fixed here because "quality" is exactly the term a panel would otherwise have defined for it
+informally, differently, by whoever ran each session:
+
+> You will hear short audio clips generated by two different computer models from the same written
+> description. There is no "original" or correct version to compare against — neither clip is the
+> real thing.
+>
+> **In the ABX part**, you hear three clips: **A**, **B**, and **X**. **X** is identical to either
+> **A** or **B**. Your task is to say which one. You may replay A, B and X as many times as you like,
+> in any order, before answering. If you cannot tell, guess — a guess is a useful answer and the
+> analysis expects some. Do not skip trials.
+>
+> **In the rating part**, you hear three clips on each screen and give each a score from 0 to 100.
+> Rate **overall audio quality**: how good the clip sounds as a piece of audio. Include anything that
+> affects that — clarity, absence of noise, distortion or artefacts, how natural and coherent it
+> sounds, and how well it holds together over its full length.
+>
+> **Do not rate how well the clip matches any description**, how much you personally like the style
+> or genre, or how loud it is. All clips have been loudness-matched, so any loudness difference you
+> think you hear is not a real difference between them.
+>
+> Use the full range of the scale. Two clips that sound equally good should get the same score;
+> there is no requirement to rank them apart.
+
+### The 0–100 scale and its labels
+
+Continuous 0–100, ITU-R BS.1534 style, presented with five equal labelled bands marked on the slider.
+The labels are shown; the numbers are recorded:
+
+| band | label |
+|---|---|
+| 80–100 | Excellent |
+| 60–80 | Good |
+| 40–60 | Fair |
+| 20–40 | Poor |
+| 0–20 | Bad |
+
+Each band is 20 points wide, which is where the **10-point** effect size in Q2 below comes from: half
+of one labelled band is the smallest difference that could plausibly correspond to a difference a
+listener would describe in words.
+
+### Monitoring and environment
+
+Fixed, and identical for every listener — a panel run half on headphones and half on laptop speakers
+would confound the presentation with the checkpoint:
+
+- **Closed-back over-ear headphones, one model for the whole panel**, wired, driven from one
+  interface. Not speakers (room modes vary per seat), not in-ears, not Bluetooth (lossy codecs alter
+  exactly the artefacts being judged).
+- **Fixed playback gain for the whole panel**, set once by the operator at the start of the run and
+  not adjustable by the listener. The set is already loudness-matched to a single target (§4); a
+  per-listener volume control would only add variance, and a per-*trial* one would destroy the level
+  matching entirely.
+- **Quiet room**, no other audio sources, one listener at a time.
+- The headphone model, interface, and playback gain are **recorded on sc-15377** with the results.
+
+### Block order and familiarization
+
+**Order is fixed: the two ABX blocks first, the rating block last.** This is not cosmetic. The
+familiarization a multi-stimulus rating test needs — hearing the range of material before scoring it,
+so the first screens are not systematically mis-ranged — is pre-exposure to the panel's own takes. If
+it ran before ABX it would be a confound in the discriminability half: a listener who has already
+heard these renders may recognize them rather than discriminate them, and the gate would inflate.
+Running ABX first removes the interaction entirely rather than arguing about its size.
+
+- **Before ABX:** no familiarization on panel material. The screening practice block (criterion 3
+  above) has already taught the ABX task, on non-panel audio.
+- **Before the rating block, after every ABX response is collected:** every listener hears the **six
+  anchor takes** — one per stimulus, the medium take at the first seed — unscored, no response
+  collected.
+
+Neither is a training block. No feedback is given and no correct answer is shown at any point in the
+session, including in screening.
 
 ### Q1 — ABX discriminability (the gate)
 
@@ -351,8 +517,19 @@ analysis emits one of five conclusions and none of them is a failure to report:
    was sized for before treating it as a product claim.
 5. `PREFERENCE AGAINST MEDIUM` — reported as-is.
 
+Every conclusion is additionally prefixed with **`DEVIATION FROM PRE-REGISTRATION`** if the counts
+that arrived do not match the ones the key committed to — pooled contrast trials, pooled null trials,
+or listeners. This matters because `analyze` recomputes its thresholds from the *observed* counts,
+which is arithmetically right and silently dangerous: an incomplete or post-hoc-trimmed panel would
+otherwise be scored against a threshold that is no longer the pre-registered 134/240, with nothing in
+the report saying so. The numbers are still computed — refusing outright would hide a partial run
+worth looking at — but they are labelled as no longer pre-registered, and the label is not
+overridable. `test_a_trimmed_panel_is_flagged_as_a_deviation_from_the_preregistration` drives it with
+three listeners removed and asserts both the flag and that the rejection threshold really did move;
+`test_a_panel_that_arrived_as_designed_reports_no_deviation` is the discriminating half.
+
 Results are recorded on **sc-15377**, together with the observed SD, the control score, the
-exclusions, and the raw unblinded responses.
+exclusions, the monitoring setup, any deviation reported above, and the raw unblinded responses.
 
 ---
 
@@ -418,8 +595,11 @@ Then design the panel, collect responses, and analyse:
 
 ```bash
 python3 scripts/audio/sa3_listening_blind.py power          # the pre-registration, recomputed
+# 24 playlists, not 20: RECRUIT_SIZE, so there is headroom for the attrition §6 states.
+# The key's pre-registration stays the 20-listener one whatever this is set to.
 python3 scripts/audio/sa3_listening_blind.py assign  --manifest stimuli/manifest.json \
-                                                     --source-dir stimuli/ --out-dir panel/
+                                                     --source-dir stimuli/ --out-dir panel/ \
+                                                     --panel-size 24
 python3 scripts/audio/sa3_listening_blind.py sheet   --playlist panel/playlist_L01.json \
                                                      --out-dir panel/
 # ... listening happens here ...

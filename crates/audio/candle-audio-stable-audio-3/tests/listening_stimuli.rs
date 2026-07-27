@@ -115,14 +115,25 @@ struct Stimulus {
 ///
 /// The obvious design — draw the whole set from the checkpoints' own shipped `demo_cond` lists — is
 /// unavailable, and finding that out is part of this story's result. `tests/provider.rs` commits
-/// **every shipped `demo_cond` prompt of every SA3 variant** as a side-ratio calibration constant
-/// (`SFX_SWEEP_PROMPTS`, `MUSIC_SWEEP_PROMPTS`, `MEDIUM_SWEEP_PROMPTS`,
-/// `MUSIC_BASE_SWEEP_PROMPTS`). Those sweeps are what the shipped floors were *tuned on*. There is
-/// therefore no held-out prompt anywhere in the `demo_cond` pool, and a set drawn entirely from it
-/// would score the panel on the crate's own tuning data.
+/// the SA3 `demo_cond` prompts as side-ratio calibration constants (`SFX_SWEEP_PROMPTS`,
+/// `MUSIC_SWEEP_PROMPTS`, `MEDIUM_SWEEP_PROMPTS`, `MUSIC_BASE_SWEEP_PROMPTS`), and those sweeps are
+/// what the shipped floors were *tuned on*, so every prompt in them is a gate operating point.
+///
+/// Counted against the six on-disk snapshots' `model_config.json`, the pool is 14 distinct prompts
+/// and the crate commits all of them: medium ships **2** (both in `MEDIUM_SWEEP_PROMPTS`);
+/// `small-music`, `small-sfx`, `small-music-base` and `small-sfx-base` ship 4 each, the last two
+/// being the same four; `medium-base` ships none. Medium's count is worth naming explicitly, because
+/// `MEDIUM_SWEEP_PROMPTS`'s own doc comment reads like a *selection* ("two shipped music `demo_cond`
+/// prompts from medium's own `model_config.json`"). It is not a selection — two is all medium has.
+///
+/// There is therefore no held-out prompt anywhere in the `demo_cond` pool, and a set drawn entirely
+/// from it would score the panel on the crate's own tuning data.
 ///
 /// So the four held-out entries are authored for this panel, in the same idiom and domains, and
-/// appear nowhere else in the repository.
+/// appear **in no crate source**. That is the scope `scripts/tests/test_sa3_listening_blind.py`
+/// actually scans (`crates/**/*.rs`) and the scope "held out" means here — deliberately not a
+/// whole-repository claim, since the protocol document lists all six prompts, as would any write-up
+/// of the result.
 ///
 /// The two anchors are deliberate and are the crate's existing gate prompts. They tie the panel to
 /// the operating point the real-weight lanes measure at, so a panel result and a gate measurement
@@ -322,6 +333,16 @@ fn level_match(track: &mut AudioTrack, target_lufs: f32) -> LevelMatch {
         total_gain *= gain;
         latest = measure(track);
     }
+
+    // Convergence is asserted *here*, not left to callers. Returning a non-converged track and
+    // trusting whoever called to notice is how a silently mis-levelled take reaches a listener, and
+    // level matching is the control the whole protocol rests on.
+    let residual = (latest.integrated_lufs - target_lufs).abs();
+    assert!(
+        residual < MAX_LUFS_DELTA,
+        "level_match did not converge: {residual:.3} LU from the {target_lufs:.3} LUFS target after \
+         {MAX_LEVEL_MATCH_PASSES} passes, at or above the {MAX_LUFS_DELTA} LU tolerance"
+    );
 
     LevelMatch {
         pre_lufs: initial.integrated_lufs,
