@@ -1252,7 +1252,7 @@ mod tests {
 
     impl Drop for DropTag {
         fn drop(&mut self) {
-            self.events.lock().unwrap().push(self.name);
+            candle_gen::lock_recover(&self.events).push(self.name);
         }
     }
 
@@ -1268,18 +1268,18 @@ mod tests {
             &Device::Cpu,
             &mut |p| progress.push(p),
             || {
-                events.lock().unwrap().push("load_text");
+                candle_gen::lock_recover(&events).push("load_text");
                 Ok(DropTag {
                     name: "drop_text",
                     events: events.clone(),
                 })
             },
             |_| {
-                events.lock().unwrap().push("encode");
+                candle_gen::lock_recover(&events).push("encode");
                 Ok(7usize)
             },
             || {
-                events.lock().unwrap().push("load_dit");
+                candle_gen::lock_recover(&events).push("load_dit");
                 Ok(DropTag {
                     name: "drop_dit",
                     events: events.clone(),
@@ -1287,11 +1287,11 @@ mod tests {
             },
             |_, encoded, _| {
                 assert_eq!(encoded, 7);
-                events.lock().unwrap().push("denoise");
+                candle_gen::lock_recover(&events).push("denoise");
                 Ok(11usize)
             },
             || {
-                events.lock().unwrap().push("load_vae");
+                candle_gen::lock_recover(&events).push("load_vae");
                 Ok(DropTag {
                     name: "drop_vae",
                     events: events.clone(),
@@ -1299,14 +1299,14 @@ mod tests {
             },
             |_, latents, _| {
                 assert_eq!(latents, 11);
-                events.lock().unwrap().push("decode");
+                candle_gen::lock_recover(&events).push("decode");
                 Ok(13usize)
             },
         )
         .unwrap();
         assert_eq!(output, 13);
         assert_eq!(
-            *events.lock().unwrap(),
+            *candle_gen::lock_recover(&events),
             [
                 "load_text",
                 "encode",
@@ -1339,7 +1339,7 @@ mod tests {
             &Device::Cpu,
             &mut |_| {},
             || {
-                events.lock().unwrap().push("load_text");
+                candle_gen::lock_recover(&events).push("load_text");
                 Ok(DropTag {
                     name: "drop_text",
                     events: events.clone(),
@@ -1353,7 +1353,7 @@ mod tests {
         );
         assert!(result.is_err());
         assert_eq!(
-            *events.lock().unwrap(),
+            *candle_gen::lock_recover(&events),
             ["load_text", "drop_text"],
             "the failed phase must be evicted and later phases must not start"
         );
@@ -1385,7 +1385,7 @@ mod tests {
             },
             |_, (), _| Ok(()),
             || {
-                events.lock().unwrap().push("load_vae");
+                candle_gen::lock_recover(&events).push("load_vae");
                 Ok(DropTag {
                     name: "drop_vae",
                     events: events.clone(),
@@ -1393,16 +1393,16 @@ mod tests {
             },
             |_, (), _| {
                 check_decode_tile(&cancel_during_decode)?;
-                events.lock().unwrap().push("decode_tile_0");
+                candle_gen::lock_recover(&events).push("decode_tile_0");
                 cancel_during_decode.cancel();
                 check_decode_tile(&cancel_during_decode)?;
-                events.lock().unwrap().push("decode_tile_1");
+                candle_gen::lock_recover(&events).push("decode_tile_1");
                 Ok(())
             },
         );
         assert!(result.is_err());
         assert_eq!(
-            *events.lock().unwrap(),
+            *candle_gen::lock_recover(&events),
             [
                 "drop_text",
                 "drop_dit",
