@@ -159,12 +159,13 @@ impl ZImageAttention {
         })
     }
 
-    fn forward(
+    fn forward_with_attention_budget(
         &self,
         hidden_states: &Tensor,
         attention_mask: Option<&Tensor>,
         cos: &Tensor,
         sin: &Tensor,
+        attention_scores_budget: usize,
     ) -> Result<Tensor> {
         let (b, seq_len, _) = hidden_states.dims3()?;
 
@@ -190,8 +191,8 @@ impl ZImageAttention {
         let v = v.transpose(1, 2)?.contiguous()?;
 
         let scale = 1.0 / (self.head_dim as f64).sqrt();
-        let device = hidden_states.device();
-        let context = self.attention_dispatch(&q, &k, &v, attention_mask, scale, device)?;
+        let context =
+            self.attention_dispatch(&q, &k, &v, attention_mask, scale, attention_scores_budget)?;
 
         let context = context.transpose(1, 2)?.reshape((b, seq_len, ()))?;
         self.to_out.forward(&context)
@@ -224,12 +225,12 @@ impl ZImageAttention {
         v: &Tensor,
         mask: Option<&Tensor>,
         scale: f64,
-        device: &candle_gen::candle_core::Device,
+        attention_scores_budget: usize,
     ) -> Result<Tensor> {
-        if self.use_accelerated_attn && device.is_metal() {
+        if self.use_accelerated_attn && q.device().is_metal() {
             self.attention_metal(q, k, v, mask, scale)
         } else {
-            self.attention_basic(q, k, v, mask, scale)
+            self.attention_basic(q, k, v, mask, scale, attention_scores_budget)
         }
     }
 
@@ -253,6 +254,7 @@ impl ZImageAttention {
         v: &Tensor,
         mask: Option<&Tensor>,
         scale: f64,
+        attention_scores_budget: usize,
     ) -> Result<Tensor> {
         // Build the optional additive `[B,1,1,seq]` mask up front. i32-overflow guard (sc-9116): the
         // image-token scores `[B, n, seq, seq]` reach `~24·16384² ≈ 6.4e9 > i32::MAX` at a 2048² render
@@ -272,7 +274,7 @@ impl ZImageAttention {
             scale,
             m.as_ref(),
             candle_gen::candle_nn::ops::softmax_last_dim,
-            candle_gen::ATTN_SCORES_BUDGET,
+            attention_scores_budget,
         )
     }
 
@@ -431,13 +433,14 @@ impl ZImageTransformerBlock {
         })
     }
 
-    fn forward(
+    fn forward_with_attention_budget(
         &self,
         x: &Tensor,
         attn_mask: Option<&Tensor>,
         cos: &Tensor,
         sin: &Tensor,
         adaln_input: Option<&Tensor>,
+        attention_scores_budget: usize,
     ) -> Result<Tensor> {
         if let Some(ref adaln) = self.adaln_modulation {
             let adaln_input = adaln_input.expect("adaln_input required when modulation=true");
@@ -453,7 +456,13 @@ impl ZImageTransformerBlock {
 
             let normed = self.attention_norm1.forward(x)?;
             let scaled = normed.broadcast_mul(&scale_msa)?;
-            let attn_out = self.attention.forward(&scaled, attn_mask, cos, sin)?;
+            let attn_out = self.attention.forward_with_attention_budget(
+                &scaled,
+                attn_mask,
+                cos,
+                sin,
+                attention_scores_budget,
+            )?;
             let attn_out = self.attention_norm2.forward(&attn_out)?;
             let x = (x + gate_msa.broadcast_mul(&attn_out)?)?;
 
@@ -464,7 +473,13 @@ impl ZImageTransformerBlock {
             x + gate_mlp.broadcast_mul(&ffn_out)?
         } else {
             let normed = self.attention_norm1.forward(x)?;
-            let attn_out = self.attention.forward(&normed, attn_mask, cos, sin)?;
+            let attn_out = self.attention.forward_with_attention_budget(
+                &normed,
+                attn_mask,
+                cos,
+                sin,
+                attention_scores_budget,
+            )?;
             let attn_out = self.attention_norm2.forward(&attn_out)?;
             let x = (x + attn_out)?;
 
@@ -611,6 +626,25 @@ impl ZImageTransformer2DModel {
         cap_feats: &Tensor,
         cap_mask: &Tensor,
     ) -> Result<Tensor> {
+        self.forward_with_attention_budget(
+            x,
+            t,
+            cap_feats,
+            cap_mask,
+            candle_gen::ATTN_SCORES_BUDGET,
+        )
+    }
+
+    /// [`Self::forward`] with an explicit attention-score budget. Query-row chunking preserves every
+    /// query's complete key/value domain while bounding the transient score/probability tensors.
+    pub fn forward_with_attention_budget(
+        &self,
+        x: &Tensor,
+        t: &Tensor,
+        cap_feats: &Tensor,
+        cap_mask: &Tensor,
+        attention_scores_budget: usize,
+    ) -> Result<Tensor> {
         let device = x.device();
         let (b, _c, f, h, w) = x.dims5()?;
         let patch_size = self.cfg.all_patch_size[0];
@@ -641,10 +675,24 @@ impl ZImageTransformer2DModel {
         let cap_attn_mask = cap_mask.to_dtype(DType::U8)?;
 
         for layer in &self.noise_refiner {
-            x = layer.forward(&x, Some(&x_attn_mask), &x_cos, &x_sin, Some(&adaln_input))?;
+            x = layer.forward_with_attention_budget(
+                &x,
+                Some(&x_attn_mask),
+                &x_cos,
+                &x_sin,
+                Some(&adaln_input),
+                attention_scores_budget,
+            )?;
         }
         for layer in &self.context_refiner {
-            cap = layer.forward(&cap, Some(&cap_attn_mask), &cap_cos, &cap_sin, None)?;
+            cap = layer.forward_with_attention_budget(
+                &cap,
+                Some(&cap_attn_mask),
+                &cap_cos,
+                &cap_sin,
+                None,
+                attention_scores_budget,
+            )?;
         }
 
         let unified = Tensor::cat(&[&x, &cap], 1)?;
@@ -654,12 +702,13 @@ impl ZImageTransformer2DModel {
 
         let mut unified = unified;
         for layer in &self.layers {
-            unified = layer.forward(
+            unified = layer.forward_with_attention_budget(
                 &unified,
                 Some(&unified_attn_mask),
                 &unified_cos,
                 &unified_sin,
                 Some(&adaln_input),
+                attention_scores_budget,
             )?;
         }
 
@@ -784,6 +833,49 @@ mod parity_tests {
         assert!(
             diff < 1e-5,
             "vendored dense DiT diverged from stock by {diff}"
+        );
+    }
+
+    #[test]
+    fn attention_query_chunking_matches_the_unbounded_forward() {
+        let dev = Device::Cpu;
+        let cfg = tiny_cfg();
+        let vm = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
+        let model = ZImageTransformer2DModel::new(&cfg, vb).unwrap();
+        let latent = Tensor::randn(0f32, 1f32, (1, cfg.in_channels, 4, 4), &dev).unwrap();
+        let cap = Tensor::randn(0f32, 1f32, (3usize, cfg.cap_feat_dim), &dev).unwrap();
+        let prepared = prepare_inputs(&latent, std::slice::from_ref(&cap), &dev).unwrap();
+        let t = Tensor::from_vec(vec![0.5f32], (1,), &dev).unwrap();
+
+        let full = model
+            .forward(
+                &prepared.latents,
+                &t,
+                &prepared.cap_feats,
+                &prepared.cap_mask,
+            )
+            .unwrap();
+        let chunked = model
+            .forward_with_attention_budget(
+                &prepared.latents,
+                &t,
+                &prepared.cap_feats,
+                &prepared.cap_mask,
+                2,
+            )
+            .unwrap();
+        let diff = (full - chunked)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(
+            diff < 1e-5,
+            "query-chunked attention changed the DiT output by {diff}"
         );
     }
 
