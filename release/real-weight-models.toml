@@ -192,11 +192,90 @@ expected_files = [
 ]
 
 [[models]]
-# The medium **base** checkpoint. Not registered as a provider by sc-14545 — it is the sc-14546
-# subject — but the medium identity gate needs it on the runner, because it is the only snapshot
-# that matches the post-trained medium on tensor inventory, sample_size, root byte length AND
-# conditioner repo_id. Without it the sharpest cross-variant mutation in `variant_binding` is
-# skipped, which is indistinguishable from passing.
+# Exact registered Stable Audio 3 small-music-base graph (`stable_audio_3_small_music_base`,
+# sc-14546): the pre-trained flow-matching checkpoint behind `stable-audio-3-small-music`. Same
+# 433M 1024x20 DiT and same SAME-S autoencoder; `diffusion_objective` is `rectified_flow` and
+# `sample_size` is 5,324,800 rather than 5,292,032, which is what separates it from its post-trained
+# sibling in both directions.
+#
+# The `download_files` allow-list excludes `svd_bases.pt` (1.27 GB of training pickles). No shipped
+# config references it and `SnapshotLayout::from_dir` never scans the snapshot directory, so it is
+# unreachable from the loader.
+key = "stable-audio-3-small-music-base"
+repository = "stabilityai/stable-audio-3-small-music-base"
+revision = "eab5ceee5ad9c1ed38800aff30a8e49d1161c539"
+requires_auth = true
+license = "Stability AI Community License"
+size_class = "very-large"
+profiles = ["audio-macos", "audio-cuda"]
+environment = ["SA3_SMALL_MUSIC_BASE_SNAPSHOT"]
+expected_files = [
+    "model_config.json",
+    "model.safetensors",
+    "t5gemma-b-b-ul2/config.json",
+    "t5gemma-b-b-ul2/model.safetensors",
+    "t5gemma-b-b-ul2/tokenizer.json",
+    "t5gemma-b-b-ul2/tokenizer.model",
+    "LICENSE.md",
+    "LICENSE_GEMMA.md",
+    "NOTICE",
+]
+download_files = [
+    "model_config.json",
+    "model.safetensors",
+    "t5gemma-b-b-ul2/*",
+    "LICENSE.md",
+    "LICENSE_GEMMA.md",
+    "NOTICE",
+]
+
+[[models]]
+# Exact registered Stable Audio 3 small-sfx-base graph (`stable_audio_3_small_sfx_base`,
+# sc-14546). Architecturally identical to small-music-base; only the trained DiT/conditioner weights
+# and the declared conditioner `repo_id` differ, which is why the base identity gates need both
+# snapshots materialized on the same runner. Same `svd_bases.pt` exclusion.
+key = "stable-audio-3-small-sfx-base"
+repository = "stabilityai/stable-audio-3-small-sfx-base"
+revision = "cc5ddb990e30daa68336ac61c140c37c7033ab7c"
+requires_auth = true
+license = "Stability AI Community License"
+size_class = "very-large"
+profiles = ["audio-macos", "audio-cuda"]
+environment = ["SA3_SMALL_SFX_BASE_SNAPSHOT"]
+expected_files = [
+    "model_config.json",
+    "model.safetensors",
+    "t5gemma-b-b-ul2/config.json",
+    "t5gemma-b-b-ul2/model.safetensors",
+    "t5gemma-b-b-ul2/tokenizer.json",
+    "t5gemma-b-b-ul2/tokenizer.model",
+    "LICENSE.md",
+    "LICENSE_GEMMA.md",
+    "NOTICE",
+]
+download_files = [
+    "model_config.json",
+    "model.safetensors",
+    "t5gemma-b-b-ul2/*",
+    "LICENSE.md",
+    "LICENSE_GEMMA.md",
+    "NOTICE",
+]
+
+[[models]]
+# The exact registered Stable Audio 3 medium-base graph (`stable_audio_3_medium_base`, sc-14546):
+# the pre-trained flow-matching 1.45B DiT, before distillation and adversarial post-training. Also
+# the other half of the medium identity gate — it is the only snapshot that matches the post-trained
+# medium on tensor inventory, sample_size, root byte length AND conditioner repo_id, so
+# `diffusion_objective` plus the SHA-256 pin are the whole discriminator in both directions.
+#
+# `requires_auth` stays true even though this repository is ungated: the runner's credential is
+# harmless when unused, and flipping it would be a second change to verify for no benefit.
+#
+# The `download_files` allow-list is what stops CI pulling `svd_bases.pt` — 3.84 GB of training
+# pickles no inference component reads. `SnapshotLayout::from_dir` names every file it opens and
+# never scans the directory, so the artifact is unreachable from the loader (asserted in
+# `weights.rs`). Before sc-14546 this entry had no allow-list and downloaded it on every run.
 key = "stable-audio-3-medium-base"
 repository = "stabilityai/stable-audio-3-medium-base"
 revision = "b32993f73c3bdc3864043a72d8032606bba737c8"
@@ -212,6 +291,14 @@ expected_files = [
     "t5gemma-b-b-ul2/model.safetensors",
     "t5gemma-b-b-ul2/tokenizer.json",
     "t5gemma-b-b-ul2/tokenizer.model",
+    "LICENSE.md",
+    "LICENSE_GEMMA.md",
+    "NOTICE",
+]
+download_files = [
+    "model_config.json",
+    "model.safetensors",
+    "t5gemma-b-b-ul2/*",
     "LICENSE.md",
     "LICENSE_GEMMA.md",
     "NOTICE",

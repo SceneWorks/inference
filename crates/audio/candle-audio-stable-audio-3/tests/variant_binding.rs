@@ -71,6 +71,43 @@ fn medium() -> PathBuf {
     snapshot("SA3_MEDIUM_SNAPSHOT")
 }
 
+/// The three `-base` snapshots (sc-14546).
+///
+/// Deliberately **required**, not [`optional_snapshot`]: since sc-14546 these are registered
+/// providers, so a lane that selects a base gate has provisioned them by definition. A skip here
+/// would be indistinguishable from a pass, and unlike the pre-sc-14546 medium-base case there is no
+/// hand-run scenario where the snapshot is legitimately absent while the gate is selected.
+fn music_base() -> PathBuf {
+    snapshot("SA3_SMALL_MUSIC_BASE_SNAPSHOT")
+}
+
+fn sfx_base() -> PathBuf {
+    snapshot("SA3_SMALL_SFX_BASE_SNAPSHOT")
+}
+
+fn required_medium_base() -> PathBuf {
+    snapshot("SA3_MEDIUM_BASE_SNAPSHOT")
+}
+
+/// The three post-trained/base pairs, with the snapshot accessor for each side.
+fn pairs() -> [(Variant, PathBuf, Variant, PathBuf); 3] {
+    [
+        (
+            Variant::SmallMusic,
+            music(),
+            Variant::SmallMusicBase,
+            music_base(),
+        ),
+        (Variant::SmallSfx, sfx(), Variant::SmallSfxBase, sfx_base()),
+        (
+            Variant::Medium,
+            medium(),
+            Variant::MediumBase,
+            required_medium_base(),
+        ),
+    ]
+}
+
 /// A snapshot that is not part of any shipped registration, so a developer running this suite by
 /// hand can skip the mutations that need it.
 ///
@@ -364,6 +401,179 @@ fn shipped_configs_declare_the_conditioner_repo_that_identifies_them() {
             expected.model_id()
         );
     }
+}
+
+/// The trap that would have rejected every base snapshot ever provisioned, asserted against the
+/// real shipped configs (sc-14546).
+///
+/// A base `model_config.json` declares its **post-trained sibling's** `repo_id`, not its own
+/// repository. `Variant::geometry` used to set the gate value to `hub_repo()`; had that survived,
+/// `stable_audio_3_small_music_base` would have demanded
+/// `stabilityai/stable-audio-3-small-music-base` from a config that says
+/// `stabilityai/stable-audio-3-small-music`, and no base checkpoint would ever load.
+///
+/// This is discriminating in both directions: it asserts the declared value is the sibling's repo
+/// **and** that it is not the base repository, so a "fix" that made the two equal fails here.
+#[test]
+#[ignore = "requires the three pinned base snapshots"]
+fn base_configs_declare_their_post_trained_siblings_conditioner_repo() {
+    for (post, _, base, base_root) in pairs() {
+        let layout = SnapshotLayout::from_dir(&base_root).unwrap();
+        let declared = conditioner_repo_id(&layout);
+        assert_eq!(
+            declared,
+            Some(post.hub_repo()),
+            "{} declares its post-trained sibling's repo_id",
+            base.model_id()
+        );
+        assert_ne!(
+            declared,
+            Some(base.hub_repo()),
+            "{}: if the shipped config ever starts declaring the base repository, \
+             `Variant::conditioner_repo` has to change with it",
+            base.model_id()
+        );
+        assert_eq!(declared, Some(base.conditioner_repo()));
+    }
+    // ...and the two small bases are still separated from each other by that same field.
+    assert_ne!(
+        conditioner_repo_id(&SnapshotLayout::from_dir(&music_base()).unwrap()),
+        conditioner_repo_id(&SnapshotLayout::from_dir(&sfx_base()).unwrap())
+    );
+}
+
+/// Every post-trained/base pair rejects its sibling under either id, with a load control per side.
+///
+/// This is the gate sc-14546 exists to install. Three separate mechanisms carry it and they are not
+/// interchangeable:
+///
+/// * the two **small** pairs are separated by `sample_size` (`5,292,032` against `5,324,800`) *and*
+///   by `diffusion_objective`;
+/// * the **medium** pair is separated by `diffusion_objective` and nothing else in the entire
+///   config — same inventory, same `sample_size`, same declared `repo_id`, same root byte length.
+///
+/// The controls are what make the rejections mean anything: all six real snapshots must load under
+/// their own registration in the same run.
+#[test]
+#[ignore = "requires all six pinned snapshots"]
+fn every_post_trained_base_pair_rejects_its_sibling_in_both_directions() {
+    for (post, post_root, base, base_root) in pairs() {
+        // Controls first.
+        load_variant(post, &LoadSpec::new(WeightsSource::Dir(post_root.clone()))).unwrap_or_else(
+            |error| panic!("the real {} snapshot must load ({error})", post.model_id()),
+        );
+        load_variant(base, &LoadSpec::new(WeightsSource::Dir(base_root.clone()))).unwrap_or_else(
+            |error| panic!("the real {} snapshot must load ({error})", base.model_id()),
+        );
+
+        expect_rejected(
+            &format!("{} snapshot under {}", base.model_id(), post.model_id()),
+            post,
+            &LoadSpec::new(WeightsSource::Dir(base_root.clone())),
+        );
+        expect_rejected(
+            &format!("{} snapshot under {}", post.model_id(), base.model_id()),
+            base,
+            &LoadSpec::new(WeightsSource::Dir(post_root.clone())),
+        );
+    }
+}
+
+/// The mutation that isolates the SHA-256 pin from every config-level check, both directions.
+///
+/// Each sibling's root `model.safetensors` is dropped under the other's `model_config.json`, so the
+/// objective, `sample_size` and `repo_id` checks all pass and only the hash can catch it. On the
+/// medium pair the two roots are also the same `9,222,116,660` bytes, so the byte-length check
+/// cannot catch it either — the digest is the entire remaining defence. Each direction is preceded
+/// by an unmutated-reassembly control.
+#[test]
+#[ignore = "requires all six pinned snapshots"]
+fn sibling_root_weights_under_the_other_config_fail_the_hash_pin_in_both_directions() {
+    for (post, post_root, base, base_root) in pairs() {
+        assert_unmutated_reassembly_loads(
+            &format!("{}-control", post.model_id()),
+            post,
+            &post_root,
+        );
+        assert_unmutated_reassembly_loads(
+            &format!("{}-control", base.model_id()),
+            base,
+            &base_root,
+        );
+
+        let base_root_under_post = Assembled::new(
+            &format!("{}-root-under-{}", base.model_id(), post.model_id()),
+            &post_root,
+            &[("model.safetensors", base_root.clone())],
+        );
+        expect_rejected(
+            &format!(
+                "{} root safetensors under the {} config",
+                base.model_id(),
+                post.model_id()
+            ),
+            post,
+            &base_root_under_post.spec(),
+        );
+
+        let post_root_under_base = Assembled::new(
+            &format!("{}-root-under-{}", post.model_id(), base.model_id()),
+            &base_root,
+            &[("model.safetensors", post_root.clone())],
+        );
+        expect_rejected(
+            &format!(
+                "{} root safetensors under the {} config",
+                post.model_id(),
+                base.model_id()
+            ),
+            base,
+            &post_root_under_base.spec(),
+        );
+    }
+}
+
+/// The two architecturally identical small **bases** must reject each other, exactly as the two
+/// post-trained smalls do.
+///
+/// They agree on inventory, geometry, `sample_size` and objective; only the conditioner `repo_id`
+/// and the pinned digests separate them. Without this, loosening the `repo_id` check to accommodate
+/// the base/post-trained mismatch would go unnoticed on this pair.
+#[test]
+#[ignore = "requires both pinned base small snapshots"]
+fn the_two_small_bases_reject_each_others_snapshots() {
+    load_variant(
+        Variant::SmallMusicBase,
+        &LoadSpec::new(WeightsSource::Dir(music_base())),
+    )
+    .expect("the real small-music-base snapshot must load under its own registration");
+    load_variant(
+        Variant::SmallSfxBase,
+        &LoadSpec::new(WeightsSource::Dir(sfx_base())),
+    )
+    .expect("the real small-sfx-base snapshot must load under its own registration");
+
+    expect_rejected(
+        "music-base snapshot under the SFX-base registration",
+        Variant::SmallSfxBase,
+        &LoadSpec::new(WeightsSource::Dir(music_base())),
+    );
+    expect_rejected(
+        "SFX-base snapshot under the music-base registration",
+        Variant::SmallMusicBase,
+        &LoadSpec::new(WeightsSource::Dir(sfx_base())),
+    );
+    // And the cross-size rejections: a small base is not medium-base and vice versa.
+    expect_rejected(
+        "medium-base snapshot under the music-base registration",
+        Variant::SmallMusicBase,
+        &LoadSpec::new(WeightsSource::Dir(required_medium_base())),
+    );
+    expect_rejected(
+        "music-base snapshot under the medium-base registration",
+        Variant::MediumBase,
+        &LoadSpec::new(WeightsSource::Dir(music_base())),
+    );
 }
 
 /// Medium against the two smalls, in both directions.
