@@ -1401,7 +1401,7 @@ fn validate_reference_audio(model_id: &str, request: &GenerationRequest) -> gen_
     Ok(())
 }
 
-/// Map the backend-neutral request onto this variant's runtime parameters.
+/// Resolve one request onto this variant's own runtime synthesis parameters.
 ///
 /// Every "omitted" default is variant-bound (sc-14546): the post-trained ids resolve to upstream's
 /// 8-step Pingpong at `cfg_scale = 1.0`, the `-base` ids to [`BASE_DEFAULT_STEPS`] Euler steps at
@@ -1412,7 +1412,6 @@ fn validate_reference_audio(model_id: &str, request: &GenerationRequest) -> gen_
 /// the three post-trained ids and is wrong for all three base ids, and it also meant
 /// [`SamplerKind::recommended`] — the port of upstream's own rule — was dead code on the provider
 /// path.
-/// Resolve one request into the pipeline's own synthesis parameters.
 ///
 /// `pub` (and hidden) so the weight-free lane can assert the seam that decides this path's
 /// geometry: `duration_secs` comes from `audio.target_duration`, or this variant's default, and

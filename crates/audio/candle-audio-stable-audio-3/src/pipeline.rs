@@ -208,6 +208,41 @@ pub struct ReferenceAudio<'a> {
     pub noise_level: f32,
 }
 
+/// The sampler `strength` a request implies, reference attached or not (sc-14547).
+///
+/// # Why this is a function and not two lines inside the synthesis path
+///
+/// This is the *last* seam on the sign's journey. [`crate::model::reference_noise_level`] converts
+/// the contract's retention into an init noise level and [`crate::model::reference_audio_for`]
+/// selects the converted field; this decides which value the sampler is actually handed, and it is
+/// the point at which the reference and text-only paths converge on one scalar.
+///
+/// Inside [`StableAudio3Pipeline::synthesize_with_reference_traced`] it was reachable only with
+/// multi-gigabyte weights, so `1.0 - reference.noise_level` there — a complete, user-visible sign
+/// inversion on all six ids — left the whole weight-free suite green. It is *also* invisible to the
+/// sampler's own `schedule[0] == strength` cross-check, because both downstream consumers
+/// ([`build_schedule`] and the DiT sample call) read this same scalar, so an inversion moves them
+/// together and they still agree. Mutating either consumer alone is loud; mutating their shared
+/// input was silent. Extracted here it is gated weight-free by `tests/reference_audio.rs`
+/// `the_pipeline_hands_the_sampler_the_converted_noise_level_as_strength`, which feeds it the output
+/// of `reference_audio_for` so the whole request → sampler-strength chain is one assertion.
+///
+/// # And it is the *only* site that produces the value
+///
+/// Extracting the decision is not on its own enough: a `let strength = sampler_strength_for(..)`
+/// forwarded into a weights-only helper just moves the silent site to the forwarding argument, where
+/// the same "both consumers move together" reasoning still applies. So the scalar never crosses a
+/// call boundary — `StableAudio3Pipeline::sample` takes `Option<&ReferenceAudio>` and calls this,
+/// and the text-only replay path passes `None` instead of spelling `1.0` out a second time. Every
+/// remaining use of `strength` in this file is inside `sample`, where mutating one alone trips the
+/// sampler's `schedule[0] == strength` check.
+///
+/// The `None` arm is the text-to-audio path: `1.0` is pure noise, i.e. no source influence, which is
+/// exactly what "no reference" means in the sampler's orientation.
+pub fn sampler_strength_for(reference: Option<&ReferenceAudio<'_>>) -> f32 {
+    reference.map_or(1.0, |reference| reference.noise_level)
+}
+
 /// Where the request-local stream's draws sat relative to the source encode (sc-14547).
 ///
 /// Exposed for the draw-order gate. The invariant is `draws_after_initial_noise == 1`: the
@@ -464,20 +499,19 @@ impl StableAudio3Pipeline {
                  {draws_after_initial_noise}"
             )));
         }
-        let (init_latents, strength, order) = match reference {
+        let (init_latents, order) = match reference {
             Some(reference) => {
                 let latents =
                     self.reference_latents(&reference, &geometry, &mut noise, is_canceled)?;
                 (
                     Some(latents),
-                    reference.noise_level,
                     Some(ReferenceDrawOrder {
                         draws_after_initial_noise,
                         draws_after_source_encode: noise.draws(),
                     }),
                 )
             }
-            None => (None, 1.0, None),
+            None => (None, None),
         };
         let (sampled, padding) = self.sample(
             prompt,
@@ -486,7 +520,12 @@ impl StableAudio3Pipeline {
             &geometry,
             &initial,
             init_latents.as_ref(),
-            strength,
+            // The reference itself, not a scalar derived here: `sample` runs the one shipped
+            // decision (`sampler_strength_for`) so the sampler-facing value never crosses a
+            // weights-only call boundary as a bare local. See that function for why forwarding the
+            // scalar was silent to *both* the weight-free suite and the sampler's own
+            // schedule/strength cross-check.
+            reference.as_ref(),
             on_progress,
             &mut noise,
             is_canceled,
@@ -587,7 +626,9 @@ impl StableAudio3Pipeline {
             &geometry,
             &initial,
             None,
-            1.0,
+            // No reference: the replay path is text-only, and `sampler_strength_for` turns that
+            // into the `1.0` this call used to spell out as a literal.
+            None,
             on_progress,
             &mut noise,
             is_canceled,
@@ -677,11 +718,14 @@ impl StableAudio3Pipeline {
         geometry: &SampleGeometry,
         initial: &Tensor,
         init_latents: Option<&Tensor>,
-        strength: f32,
+        // The request's reference, if any. `sample` takes the reference rather than a pre-computed
+        // `strength` on purpose — see `sampler_strength_for`.
+        reference: Option<&ReferenceAudio<'_>>,
         on_progress: &mut dyn FnMut(usize, usize),
         noise: &mut N,
         is_canceled: &dyn Fn() -> bool,
     ) -> Result<(Tensor, Tensor)> {
+        let strength = sampler_strength_for(reference);
         let positive = self
             .conditioner
             .encode_with_cancel(&[prompt.to_owned()], is_canceled)?;

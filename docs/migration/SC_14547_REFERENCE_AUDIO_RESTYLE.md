@@ -43,9 +43,11 @@ init_noise_level = 1.0 - contract_strength
 | `1.0` | `0.0` | the prepared source, returned without a single DiT forward |
 
 A silent inversion here would still run, still emit plausible audio, and do the opposite of what the
-caller asked — no shape or quality check would reveal it. It has **two distinct shapes**, and each
-needs its own gate. A review of the first version of this change found only shape (1) covered, then
-landed shape (2) as a mutation and watched the whole weight-free suite stay green.
+caller asked — no shape or quality check would reveal it. It has **three distinct shapes**, one per
+seam the value crosses on its way from the request to the sampler's `strength` argument, and each
+needs its own gate because each is blind to the other two. Two successive adversarial reviews each
+found the next shape uncovered: the first landed shape (2) as a mutation and watched the whole
+weight-free suite stay green, the second did the same with shape (3).
 
 1. **The conversion is wrong.** Gated weight-free by `tests/reference_audio.rs`
    `contract_strength_is_retention_and_a_flipped_sign_fails_here`, which drives the shipped
@@ -63,14 +65,53 @@ landed shape (2) as a mutation and watched the whole weight-free suite stay gree
    strengths where retention and noise level differ. Verified by re-running the exact mutation
    (`noise_level: reference.noise_level` → `reference.strength`): the case FAILS with
    `the pipeline must receive the converted init noise level 0, not the contract retention 1`.
+3. **The right value reaches the pipeline and the pipeline hands the sampler something else** —
+   `1.0 - reference.noise_level` where the reference and text-only paths converge on one scalar.
+   Gates (1) and (2) are both blind to it, and so is the sampler's own `schedule[0] == strength`
+   cross-check: `build_schedule` and `sample_dit_initialized_with_interval_and_cancel` are handed
+   that one scalar, so inverting it moves both sides of the comparison together and they still
+   agree. Mutating either consumer alone is loud; mutating their shared input was not. Gated
+   weight-free by `the_pipeline_hands_the_sampler_the_converted_noise_level_as_strength`, which
+   feeds the output of `reference_audio_for` straight into `pipeline::sampler_strength_for` — so
+   (2) and (3) together are one continuous request → sampler-strength assertion — and additionally
+   requires the sampler strength to fall strictly as retention rises, plus the `None` ⇒ `1.0`
+   text-only arm. Verified by re-running the exact mutation (`reference.noise_level` →
+   `1.0 - reference.noise_level` inside `sampler_strength_for`): the case FAILS with
+   `the sampler must receive the init noise level 0, not the contract retention 1`.
 
 `reference_audio_for` was extracted out of `generate` precisely so shape (2) is reachable without
-weights. Everything past it — `Pipeline::synthesize_with_reference` and below — needs a snapshot, and
-is covered by **the real-weight case**
+weights, and `sampler_strength_for` was extracted out of `synthesize_with_reference_traced` for
+shape (3). Extraction alone was not enough for (3): a `let strength = sampler_strength_for(..)`
+forwarded into the weights-only `sample` helper just relocates the silent site to the forwarding
+argument, where the same "both consumers move together" reasoning applies. So `sample` takes
+`Option<&ReferenceAudio>` and calls `sampler_strength_for` itself, and the text-only replay path
+passes `None` rather than spelling `1.0` out again. That leaves exactly one expression in the crate
+producing the sampler-facing scalar, and it is gated.
+
+Everything past that `strength` argument — the sampling itself and below — needs a snapshot, and is
+covered by **the real-weight case**
 `real_reference_restyle_is_bounded_and_ordered_on_all_six_variants`, which requires the measured
 source correlation at contract `1.0` to exceed the one at contract `0.0` by a wide margin. So the
-honest statement of the split is: the conversion *and* its handoff to the pipeline are gated
-weight-free; the pipeline-to-sampler wiring is gated only with real weights.
+honest statement of the split is: the request → sampler-`strength` chain is gated weight-free end to
+end; what the sampler then *does* with it is gated only with real weights.
+
+The residue, named rather than left for a third review to find. Two edits in this span still cannot
+be caught weight-free, and neither is silent:
+
+* the two `strength` uses inside `StableAudio3Pipeline::sample` (`build_schedule` and the DiT sample
+  call). Mutating **either alone** fails closed at runtime — measured, both directions — with
+  `init noise strength must equal every schedule's first sigma`, and dropping `init_latents` while
+  keeping a reference strength fails with `partial init noise strength requires init latents`. They
+  are only silent when moved *together*, which is now impossible: they read one local produced by
+  `sampler_strength_for` three lines above them, and there is no forwarded scalar left to move.
+* `let reference = reference_audio_for(request)` in `StableAudio3Generator::generate` replaced by
+  `None`. That deletes the feature rather than inverting it, and it is caught by the real-weight
+  case, which drives `Generator::generate` and would measure a source correlation of ~0 at contract
+  `1.0`. It is not weight-free-reachable because `generate` needs a loaded pipeline.
+
+What is genuinely irreducible is that *some* expression in the weights-only path must produce the
+scalar. That expression is a single call to the gated `sampler_strength_for`, adjacent to its
+consumers, rather than a value carried across a call boundary.
 
 Measured source correlation on Metal, 5 s / 4 steps, seed 7 (M-series, `--release --features metal`):
 
@@ -136,7 +177,7 @@ Steps 1–3 genuinely depend on their predecessor and their results are asserted
 zero, conforming channels before padding and conforming after it produce byte-identical output —
 duplicating a zero commutes with padding zeros, as does keeping the first two of four zeros. A
 reviewer confirmed this empirically by rewriting `prepare_reference_pcm` to conform first and
-watching all five weight-free cases still pass. The spec's "conform after padding" bullet is
+watching the five weight-free cases that existed at the time still pass. The spec's "conform after padding" bullet is
 therefore satisfied **by construction, not by a test**, and is recorded that way rather than
 overclaimed; it would only become observable if the pad value ever stopped being zero. What the test
 does pin is the channel-conformance *result*, which is real.
@@ -219,7 +260,7 @@ The check exists so that advertising audio editing later (sc-14548) cannot silen
 
 | lane | selects |
 |---|---|
-| `ci.yml` "Test Stable Audio 3 weight-free quality gates" | `--test reference_audio` — 6 weight-free cases, including **both** sign gates |
+| `ci.yml` "Test Stable Audio 3 weight-free quality gates" | `--test reference_audio` — 7 weight-free cases, including **all three** sign gates |
 | `real-weights.yml` `sa3-base-identity-metal` | `--test reference_audio -- --ignored` |
 | `real-weights.yml` `sa3-base-identity-cuda` | `--test reference_audio -- --ignored` |
 

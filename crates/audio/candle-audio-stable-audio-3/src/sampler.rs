@@ -32,7 +32,13 @@ const SAMPLE_RATE: usize = 44_100;
 const LATENT_DOWNSAMPLING: usize = 4_096;
 const ADAPT_CHUNK_FALLBACK: usize = 32;
 const ADAPT_FIRST_STRIDE: usize = 16;
-const DEFAULT_DURATION_PADDING: f64 = 6.0;
+/// Seconds of headroom [`default_sample_geometry`] adds on top of the requested duration.
+///
+/// `pub` so the weight-free geometry gate drives the *shipped* constant through the explicit
+/// [`adapt_sample_size_for_max`] overload instead of hand-copying `6.0` into the test. A mirrored
+/// copy would keep passing if this moved, while the geometry the pipeline actually produces changed
+/// underneath it.
+pub const DEFAULT_DURATION_PADDING: f64 = 6.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SamplerKind {

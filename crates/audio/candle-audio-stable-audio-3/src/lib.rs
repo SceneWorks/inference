@@ -84,11 +84,15 @@
 //! forward, `0.0` is pure generation, and an omitted value resolves to
 //! [`model::DEFAULT_REFERENCE_STRENGTH`]. The sampler's own `strength` is upstream's
 //! `init_noise_level` and runs the *other* way; the single conversion between the two lives in
-//! [`model::reference_noise_level`]. Its sign is pinned by **two** mutation gates in
-//! `tests/reference_audio.rs` — one on the conversion itself and one on
-//! [`model::reference_audio_for`], the single site that carries the converted value into the
-//! pipeline, because a correct conversion whose result never travels is the same bug by another
-//! route. See `docs/migration/SC_14547_REFERENCE_AUDIO_RESTYLE.md`.
+//! [`model::reference_noise_level`]. Its sign is pinned by **three** mutation gates in
+//! `tests/reference_audio.rs`, one per seam the value crosses, because a correct conversion whose
+//! result never travels is the same bug by another route: the conversion itself; the field selection
+//! in [`model::reference_audio_for`], which carries the converted value into the pipeline; and
+//! [`pipeline::sampler_strength_for`], which decides the scalar the sampler is handed. Each is
+//! verified to fail under its own single-token mutation. That chain is continuous from
+//! `GenerationRequest` to the sampler `strength` argument; past that argument
+//! (`build_schedule`/`initialize_latents`) the sampler's own oracles take over. See
+//! `docs/migration/SC_14547_REFERENCE_AUDIO_RESTYLE.md`.
 
 pub use candle_audio;
 pub use candle_audio::gen_core;
@@ -124,8 +128,8 @@ pub use model::{
     SMALL_MAX_SAMPLE_SIZE, SMALL_SHAPE, WEIGHT_LICENSES,
 };
 pub use pipeline::{
-    prepare_reference_pcm, ComputeDTypes, ReferenceAudio, ReferenceDrawOrder, StableAudio3Pipeline,
-    VariantGeometry,
+    prepare_reference_pcm, sampler_strength_for, ComputeDTypes, ReferenceAudio, ReferenceDrawOrder,
+    StableAudio3Pipeline, VariantGeometry,
 };
 
 /// Add every registered Stable Audio 3 generator to an explicit audio registry builder.

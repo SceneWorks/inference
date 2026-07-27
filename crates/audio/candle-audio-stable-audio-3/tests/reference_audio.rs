@@ -12,7 +12,9 @@
 //!
 //! A silent inversion between them produces a feature that runs, emits plausible audio, and does the
 //! opposite of what the caller asked. Nothing about the output's *shape* or *quality* would reveal
-//! it. The inversion has **two** distinct shapes, and each needs its own weight-free gate:
+//! it. The inversion has **three** distinct shapes — one per seam the value crosses on its way from
+//! the request to the sampler's `strength` argument — and each needs its own weight-free gate,
+//! because each is invisible to the other two:
 //!
 //! 1. the *conversion* is wrong — `reference_noise_level` returns something other than the
 //!    complement. Gated by `contract_strength_is_retention_and_a_flipped_sign_fails_here`, which
@@ -25,10 +27,19 @@
 //!    it is simply not the value that travels. Gated by
 //!    `the_request_surface_hands_the_pipeline_the_converted_noise_level`, which builds a real
 //!    `GenerationRequest`, calls the shipped `resolve_reference_audio` and the shipped
-//!    `reference_audio_for`, and compares the whole constructed struct.
+//!    `reference_audio_for`, and compares the whole constructed struct;
+//! 3. the right value reaches the pipeline and the *pipeline hands the sampler something else* —
+//!    `1.0 - reference.noise_level` where the reference and text-only paths converge on one scalar.
+//!    A second adversarial review landed exactly that and the whole weight-free suite stayed green,
+//!    because that decision lived inside a weights-only synthesis path. It is also invisible to the
+//!    sampler's own `schedule[0] == strength` cross-check: `build_schedule` and the DiT sample call
+//!    both read that same scalar, so inverting it moves them together and they still agree. Gated by
+//!    `the_pipeline_hands_the_sampler_the_converted_noise_level_as_strength`, which feeds the output
+//!    of `reference_audio_for` straight into the extracted `pipeline::sampler_strength_for`, so
+//!    (2) and (3) together are one continuous request → sampler-strength assertion.
 //!
-//! Past `reference_audio_for` the value goes into `Pipeline::synthesize_with_reference`, which needs
-//! weights; that span is covered by
+//! Past that `strength` argument the value goes into `Pipeline::synthesize_with_reference`'s own
+//! sampling, which needs weights; that span is covered by
 //! `real_reference_restyle_is_bounded_and_ordered_on_all_six_variants`, which requires the measured
 //! source correlation at contract `1.0` to exceed the one at contract `0.0` by a wide margin.
 //!
@@ -43,9 +54,12 @@ use candle_audio_stable_audio_3::gen_core::{
     self, AudioEditMode, AudioParams, AudioTrack, Conditioning, ConditioningKind, GenerationOutput,
     GenerationRequest, Generator, LoadSpec, WeightsSource,
 };
-use candle_audio_stable_audio_3::pipeline::{prepare_reference_pcm, ReferenceAudio, SAMPLE_RATE};
+use candle_audio_stable_audio_3::pipeline::{
+    prepare_reference_pcm, sampler_strength_for, ReferenceAudio, SAMPLE_RATE,
+};
 use candle_audio_stable_audio_3::sampler::{
     adapt_sample_size_for_max, build_schedule, initialized_start, DistributionShift, Schedule,
+    DEFAULT_DURATION_PADDING,
 };
 use candle_audio_stable_audio_3::{
     descriptor_for, load_variant, reference_audio_for, reference_noise_level,
@@ -53,8 +67,6 @@ use candle_audio_stable_audio_3::{
 };
 
 const CHANNELS: usize = 2;
-/// The `DEFAULT_DURATION_PADDING` the sampler applies on top of the requested duration.
-const DURATION_PADDING_SECS: f64 = 6.0;
 
 // ---------------------------------------------------------------------------------------------
 // Weight-free gates
@@ -161,10 +173,16 @@ fn contract_strength_is_retention_and_a_flipped_sign_fails_here() {
         0.25,
         "the conversion must not be the identity"
     );
+    // The literal, not `1.0 - DEFAULT_REFERENCE_STRENGTH`: written against the constant this is a
+    // tautology that follows the constant anywhere it moves, which is coverage of nothing.
     assert_eq!(
         reference_noise_level(None),
-        1.0 - DEFAULT_REFERENCE_STRENGTH,
-        "an omitted strength resolves to the documented default before conversion"
+        0.9,
+        "an omitted strength resolves to the documented 0.1 default before conversion"
+    );
+    assert_eq!(
+        DEFAULT_REFERENCE_STRENGTH, 0.1,
+        "and that default is the documented operating point, stated once here"
     );
 
     let device = Device::Cpu;
@@ -301,6 +319,94 @@ fn the_request_surface_hands_the_pipeline_the_converted_noise_level() {
     assert!(reference_audio_for(&plain).is_none());
 }
 
+/// The last seam on the sign's journey: the scalar the sampler is actually handed.
+///
+/// `the_request_surface_hands_the_pipeline_the_converted_noise_level` stops at
+/// `pipeline::ReferenceAudio`. One hop further, `synthesize_with_reference_traced` decides the
+/// sampler's `strength` from that struct — and an adversarial review wrote `1.0 -
+/// reference.noise_level` there, a complete user-visible inversion on all six ids, with **every**
+/// weight-free case in this crate still green. Two things hid it:
+///
+/// * the decision lived inside a synthesis path that cannot run without multi-gigabyte weights, so
+///   nothing in the PR lane ever evaluated it;
+/// * the sampler's own `schedule[0] == strength` cross-check (`sampler::initialized_start`) cannot
+///   see it either. `build_schedule` and `sample_dit_initialized_with_interval_and_cancel` are both
+///   handed this one scalar, so inverting it moves both sides of that comparison together. Mutating
+///   either call site alone is loud; mutating their shared input was silent.
+///
+/// So the decision is now `pipeline::sampler_strength_for`, and this drives it from the same
+/// `reference_audio_for` output the previous case pins — making request → resolve → field selection
+/// → sampler `strength` one continuous weight-free chain, with no weights-only gap left in it.
+#[test]
+fn the_pipeline_hands_the_sampler_the_converted_noise_level_as_strength() {
+    // (explicit strength, expected retention in force, expected sampler strength / init noise level)
+    let expectations = [
+        (Some(1.0f32), 1.0f32, 0.0f32),
+        (Some(0.0), 0.0, 1.0),
+        (Some(0.25), 0.25, 0.75),
+        (Some(0.75), 0.75, 0.25),
+        (None, DEFAULT_REFERENCE_STRENGTH, 0.9),
+    ];
+    let mut strengths = Vec::new();
+    for (strength, retention, level) in expectations {
+        // Same exclusion as the previous case, for the same reason: at contract 0.5 retention and
+        // the init noise level coincide, and both the field substitution and the complement
+        // mutation would be invisible. Asserting `== level` while `retention != level` is what
+        // rules out `1.0 - noise_level`, since that is exactly `retention`.
+        assert_ne!(
+            retention, level,
+            "a case where retention equals the noise level cannot discriminate the two"
+        );
+        let clip = source_clip(0.5, 48_000, 1);
+        let request = reference_request("restyle this clip", 5.0, Some((clip, strength)));
+        let handed =
+            reference_audio_for(&request).expect("a request carrying ReferenceAudio builds one");
+
+        let sampler_strength = sampler_strength_for(Some(&handed));
+        assert_eq!(
+            sampler_strength, level,
+            "{strength:?}: the sampler must receive the init noise level {level}, not the contract \
+             retention {retention}"
+        );
+        strengths.push(sampler_strength);
+    }
+
+    // Direction, so a mutation that happens to agree on one point still fails: raising the
+    // contract's retention must *lower* the sampler strength, strictly.
+    let mut ordered: Vec<f32> = Vec::new();
+    for retention in [0.0f32, 0.25, 0.5, 0.75, 1.0] {
+        let clip = source_clip(0.25, 48_000, 1);
+        let request = reference_request("restyle this clip", 5.0, Some((clip, Some(retention))));
+        let handed = reference_audio_for(&request).expect("a reference request builds one");
+        ordered.push(sampler_strength_for(Some(&handed)));
+    }
+    assert!(
+        ordered.windows(2).all(|pair| pair[1] < pair[0]),
+        "sampler strength must fall strictly as contract retention rises, got {ordered:?}"
+    );
+
+    // The text-only arm, driven the same way: no reference means pure noise, which is what the
+    // text-to-audio path has always done. `1.0` here is not a stand-in for "unset" — it is the
+    // sampler's own value for "the source has no influence".
+    let plain = reference_request("just generate", 5.0, None);
+    let none = reference_audio_for(&plain);
+    assert!(none.is_none(), "a plain request carries no reference");
+    assert_eq!(
+        sampler_strength_for(none.as_ref()),
+        1.0,
+        "a text-only request must start the sampler from pure noise"
+    );
+    assert_eq!(sampler_strength_for(None), 1.0);
+
+    // And the two arms are genuinely distinguishable: the text-only value is not what a defaulted
+    // reference produces, so a `map_or` collapsed to a constant cannot pass.
+    assert_ne!(
+        strengths.last().copied().expect("the defaulted case ran"),
+        sampler_strength_for(None),
+        "the defaulted reference arm must not coincide with the text-only arm"
+    );
+}
+
 #[test]
 fn prepared_reference_pcm_is_resampled_channel_conformed_and_target_sized() {
     // 48 kHz mono — the exact case the rest of this audio lane emits, and the 160:147 ratio the
@@ -425,9 +531,20 @@ fn sizing_geometry_comes_from_the_requested_duration_not_the_source_extent() {
     // Derived independently of `adapt_sample_size_for_max`: at 4096 samples per latent frame,
     // 10 s = 441_000 samples rounds up to 108 latent frames, and the 6 s headroom is
     // floor(6 * 44_100 / 4096) = 64 more. 108 + 64 = 172.
+    //
+    // The padding fed in below is the *shipped* `DEFAULT_DURATION_PADDING`, not a `6.0` copied into
+    // this file. The explicit-padding overload is what the arithmetic needs (step 3 moves the
+    // padding term on its own, which `default_sample_geometry` cannot do), but a mirrored constant
+    // would keep `valid_lengths[0] == 172` green while the geometry the pipeline actually builds
+    // moved underneath it. Driving the real constant makes the `172` two-sided against it too.
+    assert_eq!(
+        DEFAULT_DURATION_PADDING, 6.0,
+        "the headroom the arithmetic above is derived from"
+    );
     let max_sample_size = 5_292_032; // the smalls' own ceiling
     let geometry =
-        adapt_sample_size_for_max(max_sample_size, &[Some(10.0)], DURATION_PADDING_SECS).unwrap();
+        adapt_sample_size_for_max(max_sample_size, &[Some(10.0)], DEFAULT_DURATION_PADDING)
+            .unwrap();
     assert_eq!(geometry.valid_lengths[0], 172);
     assert_eq!(geometry.effective_lengths.as_ref().unwrap()[0], 108);
     assert!(
@@ -438,7 +555,8 @@ fn sizing_geometry_comes_from_the_requested_duration_not_the_source_extent() {
 
     // 3. Both terms are load-bearing, asserted by moving each one on its own.
     let doubled =
-        adapt_sample_size_for_max(max_sample_size, &[Some(20.0)], DURATION_PADDING_SECS).unwrap();
+        adapt_sample_size_for_max(max_sample_size, &[Some(20.0)], DEFAULT_DURATION_PADDING)
+            .unwrap();
     assert!(
         doubled.valid_lengths[0] > geometry.valid_lengths[0]
             && doubled.sample_size > geometry.sample_size,

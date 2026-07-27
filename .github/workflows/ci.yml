@@ -230,29 +230,40 @@ jobs:
         # time for zero executed cases.
         #
         # The named eight and what they execute on a PR (measured, `cargo test -p
-        # candle-audio-stable-audio-3 --tests`): `sampler_oracle` 17, `reference_audio` 6,
+        # candle-audio-stable-audio-3 --tests`): `sampler_oracle` 17, `reference_audio` 7,
         # `provider` 3, `dtype_policy` 2, `conformance` 1, `primitive_oracle` 1, `same_oracle` 1,
-        # `variant_quality` 1 — 32 weight-free cases. sc-14545 review found `sampler_oracle`,
+        # `variant_quality` 1 — 33 weight-free cases. sc-14545 review found `sampler_oracle`,
         # `same_oracle` and `primitive_oracle` running in no automatic lane at all (19 dark gates,
         # pre-existing since sc-14543) and added them here. sc-14546 adds `provider`'s third case,
         # which asserts each `-base` side-ratio floor sits below the sweep minimum it was
         # calibrated from.
         #
-        # sc-14547 adds `reference_audio`, the audio→audio restyle target. Its six weight-free cases
-        # carry the **sign gates** for that feature: the contract's
+        # sc-14547 adds `reference_audio`, the audio→audio restyle target. Its seven weight-free
+        # cases carry the **sign gates** for that feature: the contract's
         # `Conditioning::ReferenceAudio.strength` is retention-oriented and the sampler's is
         # `init_noise_level`-oriented, so a silent inversion between them ships a feature that runs,
-        # emits plausible audio, and does the opposite of what was asked. There are two gates because
-        # there are two ways to get it wrong, and review found only the first covered:
+        # emits plausible audio, and does the opposite of what was asked. There are three gates
+        # because there are three seams the value crosses and each is blind to the other two — two
+        # successive adversarial reviews each found the next one uncovered:
         # `contract_strength_is_retention_and_a_flipped_sign_fails_here` catches a wrong
-        # *conversion*, and `the_request_surface_hands_the_pipeline_the_converted_noise_level`
-        # catches a correct conversion whose value never travels — the provider building its
-        # `ReferenceAudio` from the retention `strength` instead of the converted `noise_level`.
-        # Both are verified to fail under their mutation, not merely to pass under the correct code.
+        # *conversion*; `the_request_surface_hands_the_pipeline_the_converted_noise_level` catches a
+        # correct conversion whose value never travels — the provider building its `ReferenceAudio`
+        # from the retention `strength` instead of the converted `noise_level`; and
+        # `the_pipeline_hands_the_sampler_the_converted_noise_level_as_strength` catches the pipeline
+        # then handing the sampler `1.0 - noise_level`. That third one was silent to *both* the
+        # weight-free suite (the decision lived in a weights-only synthesis path) and the sampler's
+        # own `schedule[0] == strength` check (`build_schedule` and the DiT sample call read one
+        # shared scalar, so inverting it moves both sides of that comparison together). All three are
+        # verified to fail under their own single-token mutation, not merely to pass under the
+        # correct code.
         #
         # Scope, stated precisely rather than as "the sign is gated at the contract endpoint": these
-        # two cases cover the conversion and its handoff into `pipeline::ReferenceAudio`. Everything
-        # past that handoff needs a snapshot and is gated only by `real-weights.yml`.
+        # three cases make the chain continuous from `GenerationRequest` to the sampler `strength`
+        # argument — conversion, field selection into `pipeline::ReferenceAudio`, and
+        # `pipeline::sampler_strength_for`, which is now the only expression in the crate that
+        # produces that scalar (`StableAudio3Pipeline::sample` takes the reference, so the value
+        # never crosses a call boundary as a forwardable local). Everything past that argument needs
+        # a snapshot and is gated only by `real-weights.yml`.
         #
         # Deliberately **not** named, because every case in them is `#[ignore]`d behind a pinned
         # multi-GB snapshot and the target would link for zero executed tests: `base_guidance`,
