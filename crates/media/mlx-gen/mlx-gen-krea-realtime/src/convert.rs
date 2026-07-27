@@ -32,6 +32,7 @@ use mlx_gen_wan::convert::sanitize_wan_transformer;
 use mlx_rs::{Array, Dtype};
 
 use crate::config::KreaRealtimeConfig;
+use crate::load::verify_transformer_tensors;
 
 /// The prefix the **single-file** Krea Realtime checkpoint layout adds to every tensor name. The
 /// sharded `transformer/` layout omits it, so stripping it (when present) normalizes both to the plain
@@ -125,13 +126,37 @@ pub fn quantize_krea_realtime_transformer(
 ///
 /// The TE / VAE / tokenizer are stock Wan and are assembled alongside by the rehost flow (Krea Realtime
 /// ships transformer-only) — this writes the DiT + config only.
+///
+/// The packed map is [`verify_transformer_tensors`]-checked against the emitted config's geometry
+/// **before** anything is written: the `config.json` asserts the shipped 14B preset's dimensions, so a
+/// source checkpoint that is not that geometry would otherwise produce a snapshot that is internally
+/// inconsistent and only fails at *load* — on the real rehost, after a 28.58 GB conversion and an HF
+/// upload. The check is shape-only (metadata, no materialization), so it costs nothing.
 pub fn convert_krea_realtime_tier(
     src: impl AsRef<Path>,
     out_dir: impl AsRef<Path>,
     quantize: Option<(i32, i32)>,
 ) -> Result<PathBuf> {
+    convert_krea_realtime_tier_with_config(
+        src,
+        out_dir,
+        quantize,
+        &KreaRealtimeConfig::krea_realtime_14b(),
+    )
+}
+
+/// [`convert_krea_realtime_tier`] against an explicit geometry instead of the shipped
+/// [`KreaRealtimeConfig::krea_realtime_14b`] preset: `cfg` is both what the emitted `config.json`
+/// declares **and** what the converted tensors are verified against, so the two can never disagree.
+/// The preset entry point is what the rehost drives; this seam exists so the emitter is exercised over
+/// a tiny fixture geometry (`tests/quant_tiers.rs`) without the real 28.58 GB checkpoint.
+pub fn convert_krea_realtime_tier_with_config(
+    src: impl AsRef<Path>,
+    out_dir: impl AsRef<Path>,
+    quantize: Option<(i32, i32)>,
+    cfg: &KreaRealtimeConfig,
+) -> Result<PathBuf> {
     let out_dir = out_dir.as_ref();
-    std::fs::create_dir_all(out_dir)?;
 
     let map = read_native_map(src.as_ref())?;
     let sanitized = sanitize_krea_realtime_transformer(map)?;
@@ -141,10 +166,21 @@ pub fn convert_krea_realtime_tier(
         }
         None => sanitized,
     };
-    save_map(&out_dir.join(DIT_FILE), &dit)?;
 
-    let mut cfg = KreaRealtimeConfig::krea_realtime_14b();
+    let mut cfg = cfg.clone();
     cfg.wan.quantization = quantize.map(|(bits, group_size)| WanQuant { bits, group_size });
+    // Fail here, before the (multi-GB) write, rather than at load: the emitted config declares this
+    // geometry, so the tensors must actually be it — at the tier that was just packed.
+    verify_transformer_tensors(&dit, &cfg.wan).map_err(|e| {
+        Error::Msg(format!(
+            "krea-realtime: refusing to write a tier snapshot whose transformer does not match the \
+             config it would ship with (source {}): {e}",
+            src.as_ref().display()
+        ))
+    })?;
+
+    std::fs::create_dir_all(out_dir)?;
+    save_map(&out_dir.join(DIT_FILE), &dit)?;
     let text = serde_json::to_string_pretty(&cfg.to_json())
         .map_err(|e| Error::Msg(format!("krea-realtime: serialize config.json: {e}")))?;
     std::fs::write(out_dir.join("config.json"), text)?;

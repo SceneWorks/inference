@@ -30,11 +30,12 @@ use mlx_gen::adapters::loader::apply_adapters_strict;
 use mlx_gen::adapters::AdaptableHost;
 use mlx_gen::{AdapterKind, AdapterSpec, Quant};
 use mlx_gen_krea_realtime::{
-    convert_krea_realtime_tier, expected_transformer_tensors, load_krea_realtime_transformer,
+    convert_krea_realtime_tier, convert_krea_realtime_tier_with_config,
+    expected_transformer_tensors, load_krea_realtime_transformer,
     load_krea_realtime_transformer_with_quant, quantize_krea_realtime_transformer,
     resolve_load_time_quant, resolve_snapshot_quant, sanitize_krea_realtime_transformer,
     verify_transformer_tensors, CausalKreaTransformer, KreaRealtimeConfig, WanQuant, DIT_FILE,
-    MODEL_ID,
+    MODEL_ID, PACKED_LINEARS_PER_BLOCK,
 };
 use mlx_rs::{Array, Dtype};
 
@@ -635,6 +636,21 @@ fn a_conflicting_load_time_request_is_rejected_against_the_real_tier() {
     );
 }
 
+/// Write the tiny geometry's **native** (single-file, `model.`-prefixed) checkpoint — the layout the
+/// real 14B ships in — under `base`, and return its path.
+fn write_native_checkpoint(cfg: &KreaRealtimeConfig, base: &std::path::Path) -> PathBuf {
+    std::fs::create_dir_all(base).unwrap();
+    let native = base.join("native.safetensors");
+    let map = native_random_map(cfg);
+    let prefixed: Vec<(String, Array)> = map
+        .iter()
+        .map(|(k, v)| (format!("model.{k}"), v.clone()))
+        .collect();
+    let refs: Vec<(&str, &Array)> = prefixed.iter().map(|(k, v)| (k.as_str(), v)).collect();
+    Array::save_safetensors(refs, None, &native).unwrap();
+    native
+}
+
 /// (10) **The rehost emitter and the load path agree, end to end.** `convert_krea_realtime_tier` writes
 /// a complete tier directory (`dit.safetensors` + `config.json`) from a *native* checkpoint; the
 /// pipeline's own config reader then recovers the tier from that `config.json`, and the DiT loads
@@ -644,17 +660,7 @@ fn a_conflicting_load_time_request_is_rejected_against_the_real_tier() {
 fn tier_converter_writes_a_snapshot_the_load_path_reads_back() {
     let cfg = tiny_cfg();
     let base = std::env::temp_dir().join(format!("krea_tier_convert_{}", std::process::id()));
-    std::fs::create_dir_all(&base).unwrap();
-
-    // A native (single-file, `model.`-prefixed) checkpoint, the layout the real 14B ships in.
-    let native = base.join("native.safetensors");
-    let map = native_random_map(&cfg);
-    let prefixed: Vec<(String, Array)> = map
-        .iter()
-        .map(|(k, v)| (format!("model.{k}"), v.clone()))
-        .collect();
-    let refs: Vec<(&str, &Array)> = prefixed.iter().map(|(k, v)| (k.as_str(), v)).collect();
-    Array::save_safetensors(refs, None, &native).unwrap();
+    let native = write_native_checkpoint(&cfg, &base);
 
     for (tier, quantize) in [
         ("bf16", None),
@@ -662,7 +668,9 @@ fn tier_converter_writes_a_snapshot_the_load_path_reads_back() {
         ("q4", Some((4, GROUP))),
     ] {
         let out = base.join(tier);
-        convert_krea_realtime_tier(&native, &out, quantize)
+        // The tiny-geometry seam of the same emitter (`convert_krea_realtime_tier` is this with the
+        // shipped 14B preset), so what is verified and what is declared are one config.
+        convert_krea_realtime_tier_with_config(&native, &out, quantize, &cfg)
             .unwrap_or_else(|e| panic!("{tier}: convert failed: {e}"));
         assert!(out.join(DIT_FILE).is_file(), "{tier}: dit must be written");
         assert!(
@@ -670,32 +678,39 @@ fn tier_converter_writes_a_snapshot_the_load_path_reads_back() {
             "{tier}: config must be written"
         );
 
-        // The emitted config declares exactly the tier that was packed (and nothing on bf16).
+        // The emitted config declares exactly the tier that was packed (and nothing on bf16), over the
+        // geometry it was converted against.
         let read_back = KreaRealtimeConfig::from_model_dir(&out).expect("read the emitted config");
         let expected = quantize.map(|(bits, group_size)| WanQuant { bits, group_size });
         assert_eq!(
             read_back.wan.quantization, expected,
             "{tier}: the emitted config.json must declare the tier that was written"
         );
+        assert_eq!(
+            (
+                read_back.wan.dim,
+                read_back.wan.ffn_dim,
+                read_back.wan.num_layers
+            ),
+            (cfg.wan.dim, cfg.wan.ffn_dim, cfg.wan.num_layers),
+            "{tier}: the emitted config.json must declare the converted geometry"
+        );
 
-        // …and the weights on disk resolve to the same tier. (The emitted config carries the shipped
-        // 14B geometry, so the load is verified against the tiny geometry these fixtures use, with the
-        // manifest cross-check the emitted config would supply.)
+        // …and the weights on disk resolve to the same tier, verified against the config that shipped
+        // with them.
         let w = mlx_gen::weights::Weights::from_file(out.join(DIT_FILE)).unwrap();
         let raw: HashMap<String, Array> = w
             .keys()
             .map(|k| (k.to_string(), w.get(k).unwrap().clone()))
             .collect();
-        let mut tier_cfg = cfg.clone();
-        tier_cfg.wan.quantization = expected;
-        let (dit, resolved) = load_krea_realtime_transformer_with_quant(raw, &tier_cfg)
+        let (dit, resolved) = load_krea_realtime_transformer_with_quant(raw, &read_back)
             .unwrap_or_else(|e| panic!("{tier}: load failed: {e}"));
         assert_eq!(
             resolved, expected,
             "{tier}: the written weights must resolve to the tier the config declares"
         );
         // A packed tier really loads packed; bf16 really loads dense.
-        let mut host = CausalKreaTransformer::new(dit, &tier_cfg);
+        let mut host = CausalKreaTransformer::new(dit, &read_back);
         assert_eq!(
             is_packed(&mut host, &["blocks", "0", "self_attn", "q"]),
             quantize.is_some(),
@@ -704,4 +719,98 @@ fn tier_converter_writes_a_snapshot_the_load_path_reads_back() {
     }
 
     std::fs::remove_dir_all(&base).ok();
+}
+
+/// (11) A source checkpoint whose geometry is **not** the config the snapshot would ship with is
+/// rejected **at conversion time**, on every tier — before `dit.safetensors` is written. Without the
+/// pre-write verification the emitter happily pairs any tensor set with the hard-coded 14B preset's
+/// `config.json`, and the mismatch first surfaces at *load* — on the real rehost that is after a
+/// 28.58 GB conversion and an HF upload.
+///
+/// Discriminating: the identical source converts fine against its own geometry (gate 10), and the
+/// failure is asserted to leave **no output files** behind, so "it errored somewhere later" would not
+/// pass.
+#[test]
+fn a_geometry_mismatched_source_is_rejected_before_anything_is_written() {
+    let cfg = tiny_cfg();
+    let base = std::env::temp_dir().join(format!("krea_tier_mismatch_{}", std::process::id()));
+    let native = write_native_checkpoint(&cfg, &base);
+
+    for (tier, quantize) in [
+        ("bf16", None),
+        ("q8", Some((8, GROUP))),
+        ("q4", Some((4, GROUP))),
+    ] {
+        let out = base.join(format!("preset_{tier}"));
+        // The preset entry point declares the shipped 14B geometry — which this tiny source is not.
+        let err = convert_krea_realtime_tier(&native, &out, quantize)
+            .expect_err("a tiny source under the 14B preset must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("does not match the config it would ship with"),
+            "{tier}: got: {msg}"
+        );
+        assert!(
+            !out.join(DIT_FILE).exists() && !out.join("config.json").exists(),
+            "{tier}: nothing may be written when the geometry does not match"
+        );
+
+        // The same rejection when the geometry differs by ONE field (a near-miss the tensor-count
+        // check alone would catch, but which the shape check must also flag).
+        let mut wider = cfg.clone();
+        wider.wan.ffn_dim = cfg.wan.ffn_dim * 2;
+        let out = base.join(format!("near_miss_{tier}"));
+        let err = convert_krea_realtime_tier_with_config(&native, &out, quantize, &wider)
+            .expect_err("a one-field geometry mismatch must be rejected too");
+        assert!(
+            err.to_string().contains("wrong-shape"),
+            "{tier}: got: {err}"
+        );
+    }
+
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// (12) [`PACKED_LINEARS_PER_BLOCK`] is the **real** predicate surface, not a stale description of it:
+/// the set of per-block Linears the reused Wan packer actually packs (every `.scales` it emits) is
+/// exactly this list. The constant drives `expected_transformer_tensors`, so if the packer's predicate
+/// ever moves (a fused `qkv`, a packed `time_projection`) this goes red here instead of every Q4/Q8
+/// snapshot failing verification at load.
+#[test]
+fn the_packed_linear_list_is_exactly_what_the_packer_packs() {
+    let cfg = tiny_cfg();
+    let packed = packed_map(&cfg, 4);
+
+    let mut packed_suffixes: Vec<String> = packed
+        .keys()
+        .filter_map(|k| k.strip_suffix(".scales"))
+        .filter_map(|stem| stem.strip_prefix("blocks.0."))
+        .map(str::to_string)
+        .collect();
+    packed_suffixes.sort();
+    let mut declared: Vec<String> = PACKED_LINEARS_PER_BLOCK
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    declared.sort();
+    assert_eq!(
+        packed_suffixes, declared,
+        "PACKED_LINEARS_PER_BLOCK must be exactly the per-block Linears the Wan packer packs"
+    );
+
+    // Non-vacuous: the packer did pack a real surface, and it packed the SAME surface in every block.
+    assert_eq!(declared.len(), 10);
+    let per_block: usize = packed
+        .keys()
+        .filter(|k| k.ends_with(".scales") && k.starts_with("blocks.1."))
+        .count();
+    assert_eq!(per_block, declared.len());
+    // …and nothing outside `blocks.` packed at all.
+    assert!(
+        packed
+            .keys()
+            .filter(|k| k.ends_with(".scales"))
+            .all(|k| k.starts_with("blocks.")),
+        "only per-block Linears are inside the quantize predicate"
+    );
 }

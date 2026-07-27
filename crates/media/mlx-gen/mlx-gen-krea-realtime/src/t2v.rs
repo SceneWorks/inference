@@ -825,6 +825,152 @@ mod tests {
         assert!(resolve_request_config(&base, 33, 32, 4).is_err());
     }
 
+    // ── The TE tier seam (sc-15203, S19) ────────────────────────────────────────────────────────
+
+    /// A tiny geometry whose `dim`/`ffn_dim` are both multiples of the MLX group size, so a packed
+    /// probe Linear is well-formed under it.
+    fn tiny_te_cfg() -> KreaRealtimeConfig {
+        let mut c = KreaRealtimeConfig::krea_realtime_14b();
+        c.wan.dim = 64;
+        c.wan.ffn_dim = 128;
+        c
+    }
+
+    /// Write a snapshot `root` containing a transformer at `bits` (`None` = dense bf16) under
+    /// `file_name` relative to the root — `dit.safetensors`, or `transformer/shard.safetensors` for the
+    /// sharded layout. Only the probe Linear is needed: [`probe_packed_quant`] reads shape metadata for
+    /// `blocks.0.self_attn.q` plus the presence of any `.scales`, and materializes nothing.
+    fn write_probe_snapshot(dir: &Path, file_name: &str, bits: Option<i32>) -> std::path::PathBuf {
+        const GROUP: i32 = 64;
+        let root = dir.to_path_buf();
+        let path = root.join(file_name);
+        std::fs::create_dir_all(path.parent().expect("file has a parent")).unwrap();
+        let dim = tiny_te_cfg().wan.dim as i32;
+        let mut entries: Vec<(String, Array)> = Vec::new();
+        match bits {
+            Some(b) => {
+                entries.push((
+                    "blocks.0.self_attn.q.weight".into(),
+                    Array::zeros::<u32>(&[dim, dim * b / 32]).unwrap(),
+                ));
+                entries.push((
+                    "blocks.0.self_attn.q.scales".into(),
+                    Array::zeros::<f32>(&[dim, dim / GROUP]).unwrap(),
+                ));
+                entries.push((
+                    "blocks.0.self_attn.q.biases".into(),
+                    Array::zeros::<f32>(&[dim, dim / GROUP]).unwrap(),
+                ));
+            }
+            None => entries.push((
+                "blocks.0.self_attn.q.weight".into(),
+                Array::zeros::<f32>(&[dim, dim]).unwrap(),
+            )),
+        }
+        entries.push((
+            "blocks.0.self_attn.q.bias".into(),
+            Array::zeros::<f32>(&[dim]).unwrap(),
+        ));
+        let refs: Vec<(&str, &Array)> = entries.iter().map(|(k, v)| (k.as_str(), v)).collect();
+        Array::save_safetensors(refs, None, &path).unwrap();
+        root
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "krea_te_quant_{}_{name}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// The UMT5 tier is resolved from the DiT tier **actually on disk** (probed before the TE is
+    /// staged, since the encoder loads first) and floored at **Q8** — never tier-matched to the DiT.
+    ///
+    /// Every case here discriminates: the Q4 snapshot must yield Q8 (matching the DiT's 4 would be
+    /// wrong, and `None` would drag an ~11 GB dense UMT5 through the encode phase of a Q4 run); the
+    /// dense + `Quant::Q4` case must also yield Q8, not `None` and not Q4; and the dense/no-request
+    /// case must be `None`, so "always Q8" fails too.
+    #[test]
+    fn te_quant_is_probed_off_the_snapshot_and_floors_at_q8() {
+        let cfg = tiny_te_cfg();
+        let q8 = Some(WanQuant {
+            bits: 8,
+            group_size: mlx_gen::quant::DEFAULT_GROUP_SIZE,
+        });
+
+        // A pre-quantized snapshot: the tier comes from the WEIGHTS (this cfg declares no
+        // `quantization`, so anything reading the manifest instead would answer `None`).
+        for dit_bits in [4, 8] {
+            let root = write_probe_snapshot(&scratch("packed"), "dit.safetensors", Some(dit_bits));
+            assert_eq!(
+                resolve_te_quant(&root, &cfg, None).unwrap(),
+                q8,
+                "a packed Q{dit_bits} DiT must floor the UMT5 at Q8"
+            );
+            // An explicit request never lowers the floor either.
+            assert_eq!(resolve_te_quant(&root, &cfg, Some(Quant::Q4)).unwrap(), q8);
+            std::fs::remove_dir_all(&root).ok();
+        }
+
+        // A dense bf16 snapshot with no request: the encoder stays dense.
+        let dense = write_probe_snapshot(&scratch("dense"), "dit.safetensors", None);
+        assert_eq!(resolve_te_quant(&dense, &cfg, None).unwrap(), None);
+        // …but a load-time Q4 request over that same dense snapshot still floors the TE at Q8.
+        assert_eq!(resolve_te_quant(&dense, &cfg, Some(Quant::Q4)).unwrap(), q8);
+        assert_eq!(resolve_te_quant(&dense, &cfg, Some(Quant::Q8)).unwrap(), q8);
+        // Nvfp4 is candle-only and never an MLX affine tier ⇒ the TE stays dense.
+        assert_eq!(
+            resolve_te_quant(&dense, &cfg, Some(Quant::Nvfp4)).unwrap(),
+            None
+        );
+
+        // The sharded `transformer/` layout is probed identically to the single-file one.
+        let sharded = write_probe_snapshot(
+            &scratch("sharded"),
+            "transformer/shard-00001.safetensors",
+            Some(4),
+        );
+        assert_eq!(resolve_te_quant(&sharded, &cfg, None).unwrap(), q8);
+
+        // A root with neither layout errors loudly (rather than silently answering "dense bf16" and
+        // letting the whole run proceed on a snapshot that has no transformer at all).
+        let empty = scratch("empty");
+        let err = resolve_te_quant(&empty, &cfg, None)
+            .expect_err("a root with no transformer weights must fail");
+        assert!(
+            err.to_string().contains("no transformer weights"),
+            "got: {err}"
+        );
+
+        for d in [dense, sharded, empty] {
+            std::fs::remove_dir_all(&d).ok();
+        }
+    }
+
+    /// A snapshot whose `config.json` geometry disagrees with its own packed tensors is a hard error at
+    /// the TE-probe seam too — the probe runs before anything is loaded, so a corrupt/mismatched
+    /// snapshot fails here rather than after the ~11 GB encoder has been staged.
+    #[test]
+    fn te_quant_probe_surfaces_a_snapshot_config_mismatch() {
+        let root = write_probe_snapshot(&scratch("mismatch"), "dit.safetensors", Some(4));
+        // The same packed file read under a config that declares a different tier.
+        let mut cfg = tiny_te_cfg();
+        cfg.wan.quantization = Some(WanQuant {
+            bits: 8,
+            group_size: 64,
+        });
+        let err = resolve_te_quant(&root, &cfg, None)
+            .expect_err("a manifest that disagrees with the packed weights must fail");
+        assert!(err.to_string().contains("declares Q8"), "got: {err}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn decode_tiling_is_single_pass_for_small_clips_and_tiles_large_ones() {
         // A short clip fits one window ⇒ None (single pass).

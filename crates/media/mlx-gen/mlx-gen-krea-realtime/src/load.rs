@@ -50,6 +50,11 @@ use crate::convert::sanitize_krea_realtime_transformer;
 /// surface). Everything else — the patch/text/time embeddings, `time_projection`, the modulation
 /// tables, the qk/`norm3` norms and the output head — stays dense on every tier, exactly as the
 /// reference predicate specifies.
+///
+/// This is the **source of truth** for the predicate surface, not a parallel description of it:
+/// [`expected_transformer_tensors`] emits each block's Linears by iterating this list (so an entry
+/// added/removed here moves the verified inventory), and `tests/quant_tiers.rs` cross-checks the list
+/// against what the reused Wan packer actually packs.
 pub const PACKED_LINEARS_PER_BLOCK: &[&str] = &[
     "self_attn.q",
     "self_attn.k",
@@ -67,6 +72,13 @@ pub const PACKED_LINEARS_PER_BLOCK: &[&str] = &[
 /// every Wan geometry with at least one block, always inside the quantize predicate, and always
 /// `[dim, dim]` dense — so its `in` dimension is known from the config without trusting the file.
 const QUANT_PROBE_LINEAR: &str = "blocks.0.self_attn.q";
+
+/// The group sizes MLX's affine quantization actually implements (`mlx::core::quantize` accepts 32, 64
+/// or 128). A `group_size` inferred from a snapshot's packed shapes is gated on this set for the same
+/// reason the inferred `bits` is gated on `{4, 8}`: a `scales` tensor with, say, `dim` columns infers
+/// `group_size = 1`, divides every predicate width happily, and would then fail opaquely deep inside
+/// `from_quantized_parts`.
+const SUPPORTED_GROUP_SIZES: [i32; 3] = [32, 64, 128];
 
 /// One expected **internal** (post-[`sanitize_krea_realtime_transformer`]) transformer tensor: the key
 /// [`mlx_gen_wan::WanTransformer::from_weights`] reads and the config-derived shape it must carry.
@@ -114,6 +126,20 @@ fn push_linear(
         None => specs.push(TensorSpec::new(format!("{name}.weight"), &[out, in_dim])),
     }
     specs.push(TensorSpec::new(format!("{name}.bias"), &[out]));
+}
+
+/// The `[out, in]` shape one [`PACKED_LINEARS_PER_BLOCK`] entry carries under this geometry. The eight
+/// attention projections (`{self,cross}_attn.{q,k,v,o}`) are square `[dim, dim]`; only the FFN pair is
+/// asymmetric — `fc1` widens `dim → ffn_dim` and `fc2` narrows back, so `fc2` packs over
+/// `in = ffn_dim`, which is what makes an out-vs-in transposition in the packed inventory detectable.
+/// (`packed_linear_list_is_the_attention_and_ffn_surface` pins the list this matches against, so a new
+/// entry cannot silently fall through to the square case.)
+fn predicate_linear_shape(suffix: &str, dim: i32, ffn: i32) -> (i32, i32) {
+    match suffix {
+        "ffn.fc1" => (ffn, dim),
+        "ffn.fc2" => (dim, ffn),
+        _ => (dim, dim),
+    }
 }
 
 /// Every internal transformer tensor Krea Realtime's reused Wan DiT expects, with its config-derived
@@ -174,27 +200,27 @@ pub fn expected_transformer_tensors(cfg: &WanModelConfig) -> Vec<TensorSpec> {
     specs.push(TensorSpec::new("head.head.bias", &[head_out]));
 
     // The per-block attention + FFN Linears are the reference `_quantize_predicate` surface: packed on
-    // a pre-quantized tier, dense on bf16.
+    // a pre-quantized tier, dense on bf16. Emitted by iterating `PACKED_LINEARS_PER_BLOCK`, so that
+    // constant *is* the predicate surface this inventory verifies rather than a parallel description of
+    // it (`self_attn/cross_attn.{q,k,v,o}` + `ffn.fc1`/`fc2`; the FFN is Linear(dim→ffn), GELU,
+    // Linear(ffn→dim)).
     let q = cfg.quantization;
     for i in 0..cfg.num_layers {
         let p = format!("blocks.{i}");
         // Per-block 6-vector modulation table.
         specs.push(TensorSpec::new(format!("{p}.modulation"), &[1, 6, dim]));
-        // Self- and cross-attention: q/k/v/o Linears (dim→dim) + full-dim qk-RMSNorm weights (dense on
-        // every tier — norms are outside the quantize predicate).
+        for lin in PACKED_LINEARS_PER_BLOCK {
+            let (out, in_dim) = predicate_linear_shape(lin, dim, ffn);
+            push_linear(&mut specs, format!("{p}.{lin}"), out, in_dim, q);
+        }
+        // The full-dim qk-RMSNorm weights and the cross-attention pre-norm (affine LayerNorm) are
+        // outside the quantize predicate and stay dense on every tier.
         for attn in ["self_attn", "cross_attn"] {
-            for proj in ["q", "k", "v", "o"] {
-                push_linear(&mut specs, format!("{p}.{attn}.{proj}"), dim, dim, q);
-            }
             specs.push(TensorSpec::new(format!("{p}.{attn}.norm_q.weight"), &[dim]));
             specs.push(TensorSpec::new(format!("{p}.{attn}.norm_k.weight"), &[dim]));
         }
-        // Cross-attention pre-norm (affine LayerNorm).
         specs.push(TensorSpec::new(format!("{p}.norm3.weight"), &[dim]));
         specs.push(TensorSpec::new(format!("{p}.norm3.bias"), &[dim]));
-        // FFN: Linear(dim→ffn), GELU, Linear(ffn→dim).
-        push_linear(&mut specs, format!("{p}.ffn.fc1"), ffn, dim, q);
-        push_linear(&mut specs, format!("{p}.ffn.fc2"), dim, ffn, q);
     }
 
     specs
@@ -350,6 +376,15 @@ fn packed_quant_from<'a>(
         )));
     }
     let group_size = in_dim / s_shape[1];
+    if !SUPPORTED_GROUP_SIZES.contains(&group_size) {
+        return Err(Error::Msg(format!(
+            "krea-realtime: inferred packed group_size {group_size} ∉ {SUPPORTED_GROUP_SIZES:?} (the \
+             group sizes MLX affine quantization implements) — from `{QUANT_PROBE_LINEAR}.scales` \
+             cols {} over the config's input width {in_dim}; the snapshot is corrupt or was packed \
+             for a different geometry",
+            s_shape[1]
+        )));
+    }
     if w_shape[1] <= 0 || (w_shape[1] * 32) % in_dim != 0 {
         return Err(Error::Msg(format!(
             "krea-realtime: packed `{QUANT_PROBE_LINEAR}.weight` has {} u32 column(s), which is not a \
@@ -701,6 +736,71 @@ mod tests {
                 group_size: 64
             })
         );
+    }
+
+    /// The inferred `group_size` is gated on MLX's implemented set, exactly as the sibling `bits` is
+    /// gated on `{4, 8}` — otherwise a `scales` with `dim` columns infers `group_size = 1`, divides
+    /// every predicate width, passes every other guard, and then fails opaquely inside MLX at
+    /// `from_quantized_parts`. Discriminating: `group_size = 1` and `group_size = 16` are BOTH exact
+    /// divisors of this geometry's `dim`/`ffn_dim`, so only the explicit set membership rejects them,
+    /// while the neighbouring legal sizes still resolve.
+    #[test]
+    fn group_size_must_be_one_mlx_implements() {
+        let cfg = tiny_wan(256, 512);
+        // 1 (one scale per input element), 16 and 256 all divide dim 256 AND ffn_dim 512 exactly, so
+        // every *other* guard passes them; only the set membership rejects them.
+        for bad_gs in [1, 16, 256] {
+            let mut map = HashMap::new();
+            packed_probe(&mut map, 256, 256, 4, bad_gs);
+            let err = resolve_snapshot_quant(&map, &cfg).expect_err(&format!(
+                "group_size {bad_gs} is not an MLX group size and must be rejected"
+            ));
+            let msg = err.to_string();
+            assert!(
+                msg.contains(&format!("group_size {bad_gs}")) && msg.contains("corrupt"),
+                "got: {msg}"
+            );
+        }
+        // …and the three MLX-implemented sizes still resolve (the guard is a bound, not a blanket).
+        for gs in [32, 64, 128] {
+            let mut map = HashMap::new();
+            packed_probe(&mut map, 256, 256, 8, gs);
+            assert_eq!(
+                resolve_snapshot_quant(&map, &cfg).unwrap(),
+                Some(WanQuant {
+                    bits: 8,
+                    group_size: gs
+                })
+            );
+        }
+    }
+
+    /// [`predicate_linear_shape`]'s square-`[dim, dim]` fallback is only safe because the list it
+    /// matches against is exactly the eight attention projections plus the two asymmetric FFN Linears.
+    /// Pinning that here means adding an entry with a different geometry to [`PACKED_LINEARS_PER_BLOCK`]
+    /// (say a fused `qkv`) goes red rather than silently emitting a square shape for it.
+    #[test]
+    fn packed_linear_list_is_the_attention_and_ffn_surface() {
+        let mut expected: Vec<String> = Vec::new();
+        for attn in ["self_attn", "cross_attn"] {
+            for proj in ["q", "k", "v", "o"] {
+                expected.push(format!("{attn}.{proj}"));
+            }
+        }
+        expected.push("ffn.fc1".into());
+        expected.push("ffn.fc2".into());
+        let mut got: Vec<String> = PACKED_LINEARS_PER_BLOCK
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        got.sort();
+        expected.sort();
+        assert_eq!(got, expected);
+        // The FFN pair is the asymmetric one, and `fc2` packs over `ffn_dim` (an out↔in transposition
+        // here would make every packed FFN inventory wrong).
+        assert_eq!(predicate_linear_shape("ffn.fc1", 64, 128), (128, 64));
+        assert_eq!(predicate_linear_shape("ffn.fc2", 64, 128), (64, 128));
+        assert_eq!(predicate_linear_shape("cross_attn.v", 64, 128), (64, 64));
     }
 
     /// A packed snapshot whose group size does not divide *every* predicate Linear's input width is
