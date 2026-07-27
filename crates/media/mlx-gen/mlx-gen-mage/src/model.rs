@@ -928,6 +928,164 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    /// sc-15036 real-weights end-to-end (epic 14034 F6): TRAIN a full base fine-tune, then RENDER
+    /// with it through [`load_finetuned`], pairing the trained transformer with the base snapshot's
+    /// own text encoder + VAE — the exact assembly the SceneWorks `mage_finetuned` worker lane
+    /// performs.
+    ///
+    /// This is the claim the story exists to make true, so it is proved on real weights rather than
+    /// asserted: before it, the checkpoint could not be loaded at all (the pinned-fingerprint guard
+    /// rejects a retrained `add_k_proj.bias` by construction).
+    ///
+    /// The training step is deliberately GENTLE (4 steps at lr 1e-7, resolution 64) — this test is
+    /// about the load + pairing seam, not convergence, and a gentle run is what makes the render a
+    /// meaningful assertion. Measured on this checkpoint: at 10 steps / lr 1e-5 the run genuinely
+    /// collapses the model onto its two-solid-swatch dataset and renders a FLAT FIELD, which would
+    /// pass any "did we get pixels" check while telling you nothing about whether the trained
+    /// transformer was correctly paired with the base's text encoder and VAE. At this budget the
+    /// fine-tuned checkpoint still renders the base's own image, so the structure assertions below
+    /// — dynamic range plus non-repeating rows, the same pair `base_real_weights.rs` uses — fail if
+    /// the assembly is wrong in any way that degrades the decode.
+    ///
+    ///     MAGE_BASE_SNAPSHOT=<flat Mage-Flow-Base snapshot> \
+    ///     MAGE_FINETUNE_RENDER_OUT=/tmp/finetuned.png \
+    ///     cargo test -p mlx-gen-mage --lib finetune_then_render -- --ignored --nocapture
+    #[test]
+    #[ignore = "needs real Mage-Flow-Base weights (MAGE_BASE_SNAPSHOT) and an authorized Metal device"]
+    fn finetune_then_render_through_load_finetuned() {
+        use crate::transformer::{TRANSFORMER_CONFIG_FILE, TRANSFORMER_WEIGHTS_FILE};
+        use mlx_gen::train::{TrainingConfig, TrainingItem, TrainingRequest};
+
+        let Ok(root) = std::env::var("MAGE_BASE_SNAPSHOT") else {
+            return;
+        };
+        let root = std::path::PathBuf::from(&root);
+        let tmp = std::env::temp_dir().join(format!("mage_finetune_render_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // --- train (tiny) ---
+        let mut items = Vec::new();
+        for (i, colour) in [[220u8, 60, 40], [40, 90, 210]].into_iter().enumerate() {
+            let path = tmp.join(format!("swatch_{i}.png"));
+            let mut im = image::RgbImage::new(96, 96);
+            for px in im.pixels_mut() {
+                *px = image::Rgb(colour);
+            }
+            im.save(&path).unwrap();
+            items.push(TrainingItem::captioned(
+                path,
+                format!("a solid colour swatch {i}"),
+            ));
+        }
+        let out_dir = tmp.join("finetune");
+        let mut trainer =
+            crate::training::load_trainer(&LoadSpec::new(WeightsSource::Dir(root.clone())))
+                .unwrap();
+        let output = trainer
+            .train(
+                &TrainingRequest {
+                    items,
+                    config: TrainingConfig {
+                        full_finetune: true,
+                        steps: 4,
+                        resolution: 64,
+                        learning_rate: 1e-7,
+                        train_dtype: "f32".into(),
+                        save_every: 0,
+                        sample_every: 0,
+                        seed: 7,
+                        ..Default::default()
+                    },
+                    output_dir: out_dir.clone(),
+                    file_name: "finetune.safetensors".into(),
+                    trigger_words: vec![],
+                    cancel: mlx_gen::CancelFlag::new(),
+                },
+                &mut |_| {},
+            )
+            .expect("the full fine-tune runs");
+        drop(trainer);
+        println!(
+            "[sc-15036] trained {} steps, final loss {:.5}; checkpoint at {}",
+            output.steps,
+            output.final_loss,
+            out_dir.display()
+        );
+        // The artifact really is a transformer component dir, not an adapter file.
+        assert!(out_dir.join(TRANSFORMER_CONFIG_FILE).is_file());
+        assert!(out_dir.join(TRANSFORMER_WEIGHTS_FILE).is_file());
+
+        // --- render through the fine-tuned entrypoint ---
+        // `spec.weights` is the trained transformer dir; the shared components come from the
+        // INSTALLED base, exactly as the worker lane stages them.
+        let spec = LoadSpec::new(WeightsSource::Dir(out_dir.clone()))
+            .with_component(
+                COMPONENT_TEXT_ENCODER,
+                WeightsSource::Dir(root.join("text_encoder")),
+            )
+            .with_component(COMPONENT_VAE, WeightsSource::Dir(root.join("vae")));
+        let model = match load_finetuned(MageVariant::Base, &spec) {
+            Ok(model) => model,
+            Err(error) => panic!("the fine-tuned checkpoint must load: {error}"),
+        };
+
+        let request = GenerationRequest {
+            prompt: "a red apple on a wooden table, soft daylight".to_owned(),
+            width: 512,
+            height: 512,
+            count: 1,
+            seed: Some(11),
+            steps: Some(20),
+            guidance: Some(5.0),
+            ..Default::default()
+        };
+        let out = model
+            .generate(&request, &mut |_| {})
+            .expect("the fine-tuned checkpoint renders");
+        let GenerationOutput::Images(images) = out else {
+            panic!("expected images");
+        };
+        let image = images.into_iter().next().expect("one image");
+        assert_eq!((image.width, image.height), (512, 512));
+        // Real STRUCTURE, not merely non-blank: full dynamic range and non-repeating rows. A flat
+        // field (what a heavier fine-tune on this dataset legitimately produces, and also what a
+        // mis-paired text encoder or a broken VAE decode produces) fails both.
+        let (min, max) = image
+            .pixels
+            .iter()
+            .fold((u8::MAX, u8::MIN), |(lo, hi), &v| (lo.min(v), hi.max(v)));
+        assert!(
+            max.saturating_sub(min) >= 32,
+            "the fine-tuned render has collapsed dynamic range: {min}..={max}"
+        );
+        let repeated_rows = image
+            .pixels
+            .chunks_exact(512 * 3)
+            .collect::<Vec<_>>()
+            .windows(2)
+            .filter(|rows| rows[0] == rows[1])
+            .count();
+        println!(
+            "[sc-15036] fine-tuned render dynamic range {min}..={max}; repeated adjacent rows \
+             {repeated_rows}/511"
+        );
+        assert!(
+            repeated_rows < 51,
+            "the fine-tuned render has {repeated_rows} repeated adjacent rows — the trained \
+             transformer is not correctly paired with the base's text encoder / VAE"
+        );
+
+        if let Ok(png) = std::env::var("MAGE_FINETUNE_RENDER_OUT") {
+            image::RgbImage::from_raw(image.width, image.height, image.pixels.clone())
+                .expect("rgb buffer")
+                .save(&png)
+                .expect("png writes");
+            println!("[sc-15036] wrote {png}");
+        }
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
     #[test]
     fn variant_table_matches_the_published_defaults() {
         // Pinned against the six model cards (epic sc-14034 ground-truth reference). Deliberately
