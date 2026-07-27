@@ -223,6 +223,14 @@ so the first draft's bound would have failed on the CUDA lane too, not just on C
 necessary on both non-Metal backends; Metal's `6.1035e-5` residual, about 60x under its own unscaled
 floor while the other two sit above theirs, is the outlier.
 
+One consequence worth recording rather than leaving to be recomputed from the table: **the headroom
+is not uniform, and it is smallest on an enforcing lane.** Bound ÷ residual is 196x on Metal but only
+**3.2x on CUDA** (and 2.6x on CPU). The gate is comfortable on Metal and comparatively tight on CUDA,
+so a future CUDA-side numerics change — a kernel, dtype or cuDNN/driver bump that moves batch-2
+against batch-1 by more than ~3x — would surface here first, as a `sa3-base-identity-cuda` failure.
+That is the gate doing its job, not a flake; but read a red on that lane as "batch-2 numerics moved",
+and re-derive the floor on the new stack before touching the constant.
+
 Every one of those mis-wirings diverges from the no-negative render just as loudly as the correct
 wiring, so every one passes step 3 — and overshoots this bound by at least 6,690x (the closest,
 `g − 1` on CPU; 7,327x on Metal and 7,778x on CUDA), while the correct recomposition stays under it
