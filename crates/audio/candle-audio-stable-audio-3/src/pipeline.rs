@@ -20,15 +20,68 @@ use crate::weights::{SnapshotKind, SnapshotLayout};
 pub const SAMPLE_RATE: u32 = 44_100;
 pub const CHANNELS: usize = 2;
 pub const LATENT_CHANNELS: usize = 256;
+/// The upstream API default step count, which is also the post-trained checkpoints' own
+/// `training.demo.demo_steps`.
 pub const DEFAULT_STEPS: usize = 8;
+/// The upstream API default guidance, which is also the post-trained checkpoints' own
+/// `training.demo.demo_cfg_scales` (`[1]`). At `1.0` the DiT takes the batch-1 branch and a negative
+/// prompt has no effect at all — see [`crate::dit::StableAudio3Dit::forward_guided`].
 pub const DEFAULT_GUIDANCE: f64 = 1.0;
 
+/// The `-base` checkpoints' default step count (sc-14546).
+///
+/// **This is a deliberate product choice, not an upstream API default.** Upstream's Python and CLI
+/// entry points default to [`DEFAULT_STEPS`] / [`DEFAULT_GUIDANCE`] for every checkpoint; only
+/// Stability's Gradio app varies them per model. The number is not invented here either: each base
+/// `model_config.json` ships `training.demo.demo_steps = 50` and
+/// `training.demo.demo_cfg_scales = [2, 4, 7]`, against `8` and `[1]` in all three post-trained
+/// configs, so the checkpoints themselves declare the operating point they were demoed at.
+/// `tests/base_guidance.rs` reads those two fields straight out of the pinned snapshots and
+/// asserts they still agree with these constants.
+///
+/// The cost is real and is not hidden: at [`BASE_DEFAULT_GUIDANCE`] every step is a batch-2 CFG
+/// forward, so a default base render is `50 x 2 = 100` DiT forwards against the post-trained
+/// default's `8 x 1 = 8` — 12.5x the example-work per second of audio.
+pub const BASE_DEFAULT_STEPS: usize = 50;
+
+/// The `-base` checkpoints' default guidance (sc-14546).
+///
+/// The largest of the base configs' own `training.demo.demo_cfg_scales`, and the value Stability's
+/// Gradio app presents for these checkpoints. See [`BASE_DEFAULT_STEPS`] for why this is a product
+/// choice rather than an upstream default.
+pub const BASE_DEFAULT_GUIDANCE: f64 = 7.0;
+
 /// What the strict wrapper authenticates a snapshot against: one variant's architecture bound to
-/// the repository that published it.
+/// the identity fields its own `model_config.json` declares.
+///
+/// # Provenance and gate value are different fields, deliberately
+///
+/// [`Self::hub_repo`] is **provenance**: the repository the checkpoint was published from. It feeds
+/// error messages, the weight-license source URLs, and the CI snapshot manifest.
+///
+/// [`Self::expected_conditioner_repo`] is the **gate value**: the `repo_id` the snapshot's own
+/// conditioner config declares. For the three post-trained checkpoints the two coincide, which is
+/// why sc-14544/sc-14545 could carry a single field. They do **not** coincide for the `-base`
+/// checkpoints: every base `model_config.json` declares its *post-trained sibling's* repository
+/// (`stable-audio-3-small-music-base` declares `stabilityai/stable-audio-3-small-music`). Collapsing
+/// the two back into one field rejects every base snapshot ever provisioned, and "fixing" that by
+/// dropping the check would open all three post-trained ids to their base siblings.
+///
+/// The declared `repo_id` is never resolved over the network. It is compared as a string and
+/// nothing else.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VariantGeometry {
     pub shape: VariantShape,
-    pub expected_repo: &'static str,
+    /// Provenance only: the repository that published this checkpoint.
+    pub hub_repo: &'static str,
+    /// The conditioner `repo_id` this checkpoint's `model_config.json` must declare.
+    pub expected_conditioner_repo: &'static str,
+    /// The `diffusion_objective` this checkpoint must declare.
+    ///
+    /// This is the **only universal** base/post-trained discriminator: medium and medium-base agree
+    /// on tensor inventory, `sample_size`, root byte length *and* conditioner `repo_id`, and differ
+    /// on nothing else in the entire config.
+    pub expected_objective: DiffusionObjective,
 }
 
 /// Compute dtypes for one loaded graph.
@@ -459,9 +512,15 @@ impl StableAudio3Pipeline {
 
 /// The conditioner `repo_id` declared by a full Stable Audio 3 snapshot's `model_config.json`.
 ///
-/// This is the only field in the shipped configs that identifies which post-trained checkpoint the
-/// snapshot is: `small-music` and `small-sfx` are otherwise architecturally identical, differing
-/// only in training-only ARC fields and demo prompts.
+/// This is the only field in the shipped configs that separates `small-music` from `small-sfx`:
+/// they are otherwise architecturally identical, differing only in training-only ARC fields and
+/// demo prompts.
+///
+/// It separates **nothing** on any post-trained/base pair — every base config declares its
+/// post-trained sibling's repository — which is why
+/// [`VariantGeometry::expected_conditioner_repo`] is a distinct field from
+/// [`VariantGeometry::hub_repo`], and why [`VariantGeometry::expected_objective`] carries the
+/// base/post-trained decision instead.
 pub fn conditioner_repo_id(layout: &SnapshotLayout) -> Option<&str> {
     let diffusion = match &layout.config.model {
         ModelConfig::Diffusion(model) => model,
@@ -477,15 +536,26 @@ pub fn conditioner_repo_id(layout: &SnapshotLayout) -> Option<&str> {
         })
 }
 
-/// Validate that `layout` is the exact post-trained SA3 checkpoint `geometry` describes.
+/// Validate that `layout` is the exact SA3 checkpoint `geometry` describes.
 ///
-/// The architecture record is per registered variant, so a small snapshot cannot authenticate as
-/// `stable_audio_3_medium` on shape alone and vice versa; the `repo_id` check is what separates the
-/// two architecturally identical smalls from each other. `ModelRegistration::load` carries no
-/// provider id, so without this the registry would happily serve one checkpoint's weights from
-/// another's registration.
+/// Three independent discriminators, each per registered variant:
+///
+/// * **architecture + `sample_size`** — a small snapshot cannot authenticate as
+///   `stable_audio_3_medium` on shape alone and vice versa, and the two small post-trained ids are
+///   separated from their base siblings by `sample_size` (`5,292,032` against `5,324,800`);
+/// * **`diffusion_objective`** — `rf_denoiser` for the post-trained ids, `rectified_flow` for the
+///   `-base` ids. This is the *only* thing separating `stable_audio_3_medium` from
+///   `stable-audio-3-medium-base` in the entire config, so it is parameterised per variant rather
+///   than loosened: a global relaxation would open all three post-trained ids to their base
+///   siblings at once;
+/// * **conditioner `repo_id`** — separates the two architecturally identical smalls, and the two
+///   architecturally identical small bases, from each other. It separates no post-trained/base pair
+///   (see [`conditioner_repo_id`]).
+///
+/// `ModelRegistration::load` carries no provider id, so without this the registry would happily
+/// serve one checkpoint's weights from another's registration.
 pub fn validate_layout(layout: &SnapshotLayout, geometry: VariantGeometry) -> Result<()> {
-    let expected_repo = geometry.expected_repo;
+    let expected_repo = geometry.hub_repo;
     let shape = geometry.shape;
     if layout.kind != SnapshotKind::Full
         || layout.config.sample_rate != SAMPLE_RATE
@@ -511,7 +581,7 @@ pub fn validate_layout(layout: &SnapshotLayout, geometry: VariantGeometry) -> Re
     };
     let dit = &diffusion.diffusion;
     let cfg = &dit.config;
-    if dit.diffusion_objective != DiffusionObjective::RfDenoiser
+    if dit.diffusion_objective != geometry.expected_objective
         || diffusion.io_channels != LATENT_CHANNELS
         || cfg.io_channels != LATENT_CHANNELS
         || cfg.embed_dim != shape.embed_dim
@@ -529,12 +599,14 @@ pub fn validate_layout(layout: &SnapshotLayout, geometry: VariantGeometry) -> Re
             "snapshot architecture is not {expected_repo}"
         )));
     }
+    let expected_conditioner_repo = geometry.expected_conditioner_repo;
     match conditioner_repo_id(layout) {
-        Some(repo) if repo == expected_repo => {}
+        Some(repo) if repo == expected_conditioner_repo => {}
         Some(repo) => {
             return Err(AudioError::Msg(format!(
-                "snapshot declares conditioner repo_id {repo}, which is not {expected_repo}; \
-                 refusing to serve one Stable Audio 3 checkpoint under another's provider id"
+                "snapshot declares conditioner repo_id {repo}, which is not \
+                 {expected_conditioner_repo}; refusing to serve one Stable Audio 3 checkpoint \
+                 under {expected_repo}'s provider id"
             )));
         }
         None => {

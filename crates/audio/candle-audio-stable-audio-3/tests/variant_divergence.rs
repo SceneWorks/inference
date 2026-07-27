@@ -66,6 +66,32 @@ fn snapshot(env: &str) -> PathBuf {
     )
 }
 
+/// The crate's three-way real-weight device selector, identical to `same_oracle.rs`,
+/// `chunked_oracle.rs`, `sampler_oracle.rs`, `dit_oracle.rs` and `base_guidance.rs`.
+///
+/// This target is run whole (`--test variant_divergence`) by `sa3-small-sfx-metal`, which sets
+/// `SA3_TEST_METAL`, **and** by `sa3-small-sfx-cuda`, which sets `SA3_TEST_CUDA`. Its runtime half
+/// drives `provider_registry().load(…)`, which resolves through `candle_audio::default_device()`
+/// and therefore already ran on the lane's accelerator; the single-step DiT half hardcoded
+/// `Device::Cpu` and so certified neither lane's backend while still spending both lanes' time.
+/// A requested backend that is unavailable is a hard failure, never a fallback.
+fn test_device() -> Device {
+    if std::env::var_os("SA3_TEST_METAL").is_some() {
+        Device::new_metal(0).expect("SA3_TEST_METAL requested but Metal is unavailable")
+    } else if std::env::var_os("SA3_TEST_CUDA").is_some() {
+        #[cfg(feature = "cuda")]
+        {
+            Device::new_cuda(0).expect("SA3_TEST_CUDA requested but CUDA is unavailable")
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            panic!("SA3_TEST_CUDA requires --features cuda")
+        }
+    } else {
+        Device::Cpu
+    }
+}
+
 fn reference_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../docs/migration/sa3-reference")
 }
@@ -177,6 +203,9 @@ struct ReferenceDivergence {
 }
 
 fn reference_divergence() -> ReferenceDivergence {
+    // Deliberately `Device::Cpu`, and not [`test_device`]: nothing here runs a model. This only
+    // reads the committed frozen-Torch artifacts and reduces them to host `f64` scalars, so an
+    // accelerator round-trip would change the transport and not the quantity.
     let device = Device::Cpu;
     let music = reference("small-music-reference.safetensors");
     let sfx = reference("small-sfx-reference.safetensors");
@@ -421,11 +450,19 @@ fn music_and_sfx_produce_materially_different_audio_from_the_same_prompt_and_see
 /// applies its own learned prompt padding, so substituting one variant's projected prompt for the
 /// other's would measure a different quantity than `expected.dit_cosine` and make the tolerance
 /// below meaningless. Noise, timestep, seconds, and local conditioning are shared and identical.
+///
+/// This runs on [`test_device`], so it certifies the DiT forward on the backend of whichever lane
+/// selected it. The tolerance survives that: the assertion is a ±0.02 **absolute** band on a cosine
+/// the frozen reference pins into `0.5 … 0.75`, i.e. roughly ±3% relative, against the ~1e-3
+/// relative delta a reduced-precision accelerator matmul introduces — and a cosine is a globally
+/// normalized aggregate, so per-element noise averages down rather than accumulating. Nothing in
+/// this bound was calibrated on CPU. Contrast `provider_oracle.rs`, whose bounds are
+/// exact-reproduction-grade and therefore stay CPU-pinned.
 #[test]
 #[ignore = "requires both pinned 3.45 GB small snapshots"]
 fn single_step_dit_divergence_matches_the_frozen_torch_reference() {
     let expected = reference_divergence();
-    let device = Device::Cpu;
+    let device = test_device();
     let music_reference = reference("small-music-reference.safetensors");
     let noise = music_reference.load("dit_noise", &device).unwrap();
     let timestep = music_reference.load("dit_timestep", &device).unwrap();

@@ -2,7 +2,7 @@
 name = "candle-audio-stable-audio-3"
 version = "0.0.0"
 edition = "2021"
-description = "Stable Audio 3 small-music, small-sfx and medium Candle text-to-audio providers."
+description = "Stable Audio 3 small-music, small-sfx, medium and their -base Candle text-to-audio providers."
 license = "Apache-2.0"
 repository = "https://github.com/SceneWorks/inference"
 keywords = ["candle", "audio", "diffusion", "stable-audio"]
