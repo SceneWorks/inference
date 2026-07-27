@@ -34,16 +34,18 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use candle_audio::gen_core::{
-    self, AudioTrack, Capabilities, GenerationOutput, GenerationRequest, Generator, LoadSpec,
-    Modality, ModelDescriptor, OffloadPolicy, Precision, Progress, WeightsSource,
+    self, AudioTrack, Capabilities, Conditioning, ConditioningKind, GenerationOutput,
+    GenerationRequest, Generator, LoadSpec, Modality, ModelDescriptor, OffloadPolicy, Precision,
+    Progress, WeightsSource,
 };
 use sha2::{Digest, Sha256};
 
 use crate::config::DiffusionObjective;
 use crate::dit::Guidance;
 use crate::pipeline::{
-    StableAudio3Pipeline, SynthesisParameters, VariantGeometry, BASE_DEFAULT_GUIDANCE,
-    BASE_DEFAULT_STEPS, CHANNELS, DEFAULT_GUIDANCE, DEFAULT_STEPS, SAMPLE_RATE,
+    ReferenceAudio, StableAudio3Pipeline, SynthesisParameters, VariantGeometry,
+    BASE_DEFAULT_GUIDANCE, BASE_DEFAULT_STEPS, CHANNELS, DEFAULT_GUIDANCE, DEFAULT_STEPS,
+    SAMPLE_RATE,
 };
 use crate::sampler::SamplerKind;
 use crate::weights::SnapshotLayout;
@@ -1016,7 +1018,11 @@ pub fn descriptor_for(variant: Variant) -> ModelDescriptor {
             supports_negative_prompt: true,
             supports_guidance: true,
             supports_true_cfg: false,
-            conditioning: Vec::new(),
+            // Audio→audio restyle (sc-14547), on all six checkpoints. Advertising it is what makes
+            // `Capabilities::validate_request_audio` *stop* rejecting the variant; the reference is
+            // consumed identically by every id, because the seam is the shared SAME encoder and the
+            // shared partial-strength schedule, neither of which is variant-specific.
+            conditioning: vec![ConditioningKind::ReferenceAudio],
             supports_lora: false,
             supports_lokr: false,
             samplers: vec!["pingpong", "euler", "rk4", "dpmpp"],
@@ -1139,6 +1145,113 @@ fn verify_snapshot_identity(
     Ok(())
 }
 
+/// The `Conditioning::ReferenceAudio` strength assumed when the caller omits it (sc-14547).
+///
+/// `0.1` retention, i.e. an init noise level of `0.9`, which is the operating point upstream's own
+/// audio→audio entry point defaults to. Stated in **contract** units: see
+/// [`reference_noise_level`] for why the two orientations are not interchangeable.
+pub const DEFAULT_REFERENCE_STRENGTH: f32 = 0.1;
+
+/// The accepted inclusive range for an explicit `Conditioning::ReferenceAudio` strength.
+///
+/// gen-core's request floor enforces finiteness only (it has no per-model range for this field), so
+/// without this gate a `strength` of `-3.0` or `40.0` would reach `build_schedule` and surface as a
+/// sampler-internal message about a value the caller never typed.
+pub const REFERENCE_STRENGTH_RANGE: (f32, f32) = (0.0, 1.0);
+
+/// Convert the contract's **retention** strength into the sampler's **init noise level**.
+///
+/// # This is the one place the two orientations meet, on purpose
+///
+/// Two same-named `strength` parameters with opposite meanings collide on this seam:
+///
+/// * `Conditioning::ReferenceAudio.strength` documents itself as mirroring the per-reference
+///   img2img strength, and this workspace's img2img strength is mflux-derived and **retention**
+///   oriented — it is the loop *start* index, so a higher value runs fewer steps and preserves
+///   **more** of the source. (That is the inverse of diffusers' convention, which is why the
+///   collision is easy to miss.)
+/// * Stable Audio 3's sampler `strength` is upstream's `init_noise_level`: `1.0` replaces the
+///   source with pure noise, `0.0` returns it untouched.
+///
+/// So the mapping is the complement, and the contract keeps the retention reading:
+///
+/// | contract `strength` | init noise level | result |
+/// |---|---|---|
+/// | `0.0` | `1.0` | pure generation; the source has no influence |
+/// | `0.1` (default) | `0.9` | a loose restyle |
+/// | `1.0` | `0.0` | the prepared source, returned without a single DiT forward |
+///
+/// A silent inversion here would still run, still emit plausible audio, and do the opposite of what
+/// the caller asked, which is why the sign is gated by a mutation test at the contract endpoint
+/// (`tests/reference_audio.rs`) rather than only by this table.
+///
+/// # A caller-visible consequence of the `1.0` row
+///
+/// At contract `strength = 1.0` the init noise level is `0.0`, which trips the sampler's
+/// `skip_model` short circuit: the DiT never runs, so **no `Progress::Step` is ever emitted**. A
+/// caller driving a progress bar sees zero steps and then `Progress::Decoding`. That is correct —
+/// there is genuinely nothing to step through — but it is user-visible behaviour of a documented
+/// endpoint, so it is stated here and in `docs/migration/SC_14547_REFERENCE_AUDIO_RESTYLE.md`
+/// rather than left to be discovered.
+pub fn reference_noise_level(strength: Option<f32>) -> f32 {
+    1.0 - strength.unwrap_or(DEFAULT_REFERENCE_STRENGTH)
+}
+
+/// One request's resolved reference-audio conditioning, borrowed from the request (sc-14547).
+#[derive(Debug, Clone, Copy)]
+pub struct ResolvedReference<'a> {
+    pub track: &'a AudioTrack,
+    /// The contract-facing **retention** strength actually in force, explicit or defaulted.
+    pub strength: f32,
+    /// The sampler-facing init noise level, `1.0 - strength`.
+    pub noise_level: f32,
+}
+
+/// Extract the single `Conditioning::ReferenceAudio` item, if the request carries one.
+///
+/// Returns the *first* item without complaint about duplicates: [`validate_request_for`] has already
+/// rejected a second one, and every generation path validates first.
+pub fn resolve_reference_audio(request: &GenerationRequest) -> Option<ResolvedReference<'_>> {
+    request
+        .conditioning
+        .iter()
+        .find_map(|conditioning| match conditioning {
+            Conditioning::ReferenceAudio { audio, strength } => Some(ResolvedReference {
+                track: audio,
+                strength: strength.unwrap_or(DEFAULT_REFERENCE_STRENGTH),
+                noise_level: reference_noise_level(*strength),
+            }),
+            _ => None,
+        })
+}
+
+/// Build the pipeline-facing [`ReferenceAudio`] a request implies — the single site where the
+/// contract's retention `strength` becomes the sampler's `init_noise_level` (sc-14547).
+///
+/// Extracted out of [`StableAudio3Generator::generate`] deliberately. `generate` needs
+/// multi-gigabyte weights, so while this construction lived inside it the **field selection** here
+/// (`noise_level`, not `strength`) was reachable only from the real-weight lane — and picking the
+/// wrong field is the exact shape of the sign inversion this feature's entire risk budget is spent
+/// on. It is now gated weight-free by `tests/reference_audio.rs`
+/// `the_request_surface_hands_the_pipeline_the_converted_noise_level`.
+pub fn reference_audio_for(request: &GenerationRequest) -> Option<ReferenceAudio<'_>> {
+    resolve_reference_audio(request).map(|reference| ReferenceAudio {
+        samples: &reference.track.samples,
+        sample_rate: reference.track.sample_rate,
+        channels: reference.track.channels,
+        noise_level: reference.noise_level,
+    })
+}
+
+/// Validate a request against one variant's own descriptor, without a snapshot.
+///
+/// `Generator::validate` needs a loaded generator, which needs multi-gigabyte weights; every
+/// request-shaping rule this family owns is weight-free, so exposing the pair lets the whole
+/// rejection surface be gated in the PR lane instead of only on a real-weight runner.
+pub fn validate_request_for(variant: Variant, request: &GenerationRequest) -> gen_core::Result<()> {
+    validate_request(variant, &descriptor_for(variant), request)
+}
+
 pub(crate) fn validate_request(
     variant: Variant,
     descriptor: &ModelDescriptor,
@@ -1198,10 +1311,97 @@ pub(crate) fn validate_request(
             "{model_id}: guidance_norm_threshold is only supported with guidance_method=apg"
         )));
     }
+    validate_reference_audio(model_id, request)?;
     Ok(())
 }
 
-/// Map the backend-neutral request onto this variant's runtime parameters.
+/// Gate the audio→audio restyle conditioning (sc-14547).
+///
+/// The generic floor above admits `ReferenceAudio` (the descriptor now advertises it) and enforces
+/// exactly one thing about it: that an explicit `strength` is finite. Everything a source clip can
+/// be wrong about — arity, PCM shape, declared rate/channels, and the strength *range* — is this
+/// family's own contract and is enforced here, before any of it reaches the resampler or
+/// `build_schedule`, where the message would name an internal value the caller never typed.
+fn validate_reference_audio(model_id: &str, request: &GenerationRequest) -> gen_core::Result<()> {
+    let references = request
+        .conditioning
+        .iter()
+        .filter(|conditioning| matches!(conditioning, Conditioning::ReferenceAudio { .. }))
+        .count();
+    if references == 0 {
+        return Ok(());
+    }
+    // Typed `Unsupported`, not `Msg`: "one clip only" is a statement about what this family *can
+    // do*, the same category as the `AudioEdit`-combination refusal immediately below, and this
+    // epic frames conditioning refusals as typed. The malformed-clip rejections further down stay
+    // `Msg` — those are about the caller's data, not about the model's capability. Both sides of
+    // that split are asserted by type in `tests/reference_audio.rs`.
+    if references > 1 {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{model_id}: exactly one reference audio clip is supported, got {references}"
+        )));
+    }
+    // Defence in depth, and honestly labelled as such: `audio_edit_modes` is empty and `AudioEdit`
+    // is not in `conditioning`, so the generic floor already refuses an `AudioEdit` item on its own.
+    // The check is kept so that advertising audio editing on this family later (sc-14548) cannot
+    // silently make the *combination* reachable — a request carrying both would otherwise arrive
+    // with a source clip in two contradictory roles, `init_data` and masked local input.
+    if request
+        .conditioning
+        .iter()
+        .any(|conditioning| matches!(conditioning, Conditioning::AudioEdit { .. }))
+    {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{model_id}: reference audio and audio editing cannot be combined in one request"
+        )));
+    }
+    let Some(reference) = resolve_reference_audio(request) else {
+        unreachable!("a nonzero reference count resolves");
+    };
+    let track = reference.track;
+    if track.samples.is_empty() {
+        return Err(gen_core::Error::Msg(format!(
+            "{model_id}: reference audio must contain at least one frame"
+        )));
+    }
+    if let Some(value) = track
+        .samples
+        .iter()
+        .copied()
+        .find(|value| !value.is_finite())
+    {
+        return Err(gen_core::Error::Msg(format!(
+            "{model_id}: reference audio contains the non-finite sample {value}"
+        )));
+    }
+    if track.sample_rate == 0 {
+        return Err(gen_core::Error::Msg(format!(
+            "{model_id}: reference audio must declare a non-zero sample rate"
+        )));
+    }
+    if track.channels == 0 {
+        return Err(gen_core::Error::Msg(format!(
+            "{model_id}: reference audio must declare at least one channel"
+        )));
+    }
+    if !track.samples.len().is_multiple_of(track.channels as usize) {
+        return Err(gen_core::Error::Msg(format!(
+            "{model_id}: reference audio has {} samples, not a whole number of {}-channel frames",
+            track.samples.len(),
+            track.channels
+        )));
+    }
+    let strength = reference.strength;
+    if !(REFERENCE_STRENGTH_RANGE.0..=REFERENCE_STRENGTH_RANGE.1).contains(&strength) {
+        return Err(gen_core::Error::Msg(format!(
+            "{model_id}: reference audio strength {strength} outside {}..={}",
+            REFERENCE_STRENGTH_RANGE.0, REFERENCE_STRENGTH_RANGE.1
+        )));
+    }
+    Ok(())
+}
+
+/// Resolve one request onto this variant's own runtime synthesis parameters.
 ///
 /// Every "omitted" default is variant-bound (sc-14546): the post-trained ids resolve to upstream's
 /// 8-step Pingpong at `cfg_scale = 1.0`, the `-base` ids to [`BASE_DEFAULT_STEPS`] Euler steps at
@@ -1212,7 +1412,15 @@ pub(crate) fn validate_request(
 /// the three post-trained ids and is wrong for all three base ids, and it also meant
 /// [`SamplerKind::recommended`] — the port of upstream's own rule — was dead code on the provider
 /// path.
-fn synthesis_parameters(variant: Variant, request: &GenerationRequest) -> SynthesisParameters {
+///
+/// `pub` (and hidden) so the weight-free lane can assert the seam that decides this path's
+/// geometry: `duration_secs` comes from `audio.target_duration`, or this variant's default, and
+/// **never** from the reference clip's extent. Everything downstream — the adapted sample size, the
+/// padded length `prepare_reference_pcm` conforms to, and the attention mask — is derived from that
+/// one number, so a source-extent leak here would be invisible in `prepare_reference_pcm`'s own
+/// output.
+#[doc(hidden)]
+pub fn synthesis_parameters(variant: Variant, request: &GenerationRequest) -> SynthesisParameters {
     let audio = request.audio.clone().unwrap_or_default();
     let method = request.guidance_method.as_deref();
     let guidance = Guidance {
@@ -1433,10 +1641,15 @@ impl Generator for StableAudio3Generator {
             });
         };
         let mut decoding = || (progress.borrow_mut())(Progress::Decoding);
-        let samples = pipeline.synthesize(
+        // The one conversion between the contract's retention `strength` and the sampler's
+        // `init_noise_level` (see `reference_noise_level`), and the one field selection that
+        // carries it. Both live in `reference_audio_for` so they are gated without weights.
+        let reference = reference_audio_for(request);
+        let samples = pipeline.synthesize_with_reference(
             &request.prompt,
             request.negative_prompt.as_deref(),
             parameters,
+            reference,
             &mut step_progress,
             &mut decoding,
             &|| cancel.is_cancelled(),

@@ -31,6 +31,7 @@ Legacy activity that landed *after* the `runtime-2026.07.1` cutover is mapped in
 - [`SC_14544_SMALL_SFX_PROVIDER.md`](SC_14544_SMALL_SFX_PROVIDER.md): second registered Stable Audio 3 checkpoint, variant-bound loading, cross-variant mutation gates, frozen-Torch-derived music-vs-SFX divergence floor, and the `moss_sfx_v2` distinction
 - [`SC_14545_MEDIUM_PROVIDER.md`](SC_14545_MEDIUM_PROVIDER.md): third registered Stable Audio 3 checkpoint, per-variant geometry and 380-second cap, embedded SAME-L in CI, the medium-vs-medium-base identity gate, and the measured device / dtype / domain-metadata decisions
 - [`SC_14546_BASE_PROVIDERS.md`](SC_14546_BASE_PROVIDERS.md): the three pre-trained `-base` checkpoints, the provenance/gate-value split that keeps every base snapshot loadable, per-variant Euler/50/7.0 defaults with their `training.demo` provenance, and the frozen-Torch-derived negative-prompt divergence floor
+- [`SC_14547_REFERENCE_AUDIO_RESTYLE.md`](SC_14547_REFERENCE_AUDIO_RESTYLE.md): audio→audio restyle on all six Stable Audio 3 ids, the retention-vs-`init_noise_level` strength collision and the mutation gate pinning its sign, the resample-not-reject ruling, and the request-RNG SAME encode seam
 - [`PHASE_1_CHECKPOINT.md`](PHASE_1_CHECKPOINT.md): history import and exact tree equivalence
 - [`PHASE_2_CHECKPOINT.md`](PHASE_2_CHECKPOINT.md): ownership layout and unified workspace
 - [`PHASE_3_CHECKPOINT.md`](PHASE_3_CHECKPOINT.md): CI selection and release-train tooling
