@@ -37,7 +37,9 @@ use std::path::Path;
 
 use mlx_gen::tiling::{TilingConfig, VaeTiling};
 use mlx_gen::weights::Weights;
-use mlx_gen::{AdapterSpec, CancelFlag, Error, GenerationOutput, Image, Progress, Result};
+use mlx_gen::{AdapterSpec, CancelFlag, Error, GenerationOutput, Image, Progress, Quant, Result};
+use mlx_gen_wan::config::WanQuant;
+use mlx_gen_wan::model::effective_te_quant;
 use mlx_gen_wan::{
     decode_to_frames, frames_to_images, load_tokenizer, preprocess_i2v_image, Umt5Encoder, WanVae,
 };
@@ -47,7 +49,9 @@ use mlx_rs::{random, Array};
 use crate::causal::CausalKreaTransformer;
 use crate::config::{KreaRealtimeConfig, MODEL_ID};
 use crate::generate::{generate_i2v_latents, generate_latents, generate_v2v_latents, ArGenParams};
-use crate::load::load_krea_realtime_transformer;
+use crate::load::{
+    load_krea_realtime_transformer_with_quant, probe_packed_quant, resolve_load_time_quant,
+};
 
 /// z16 Wan VAE temporal compression (a latent frame decodes to `TEMPORAL_STRIDE` output frames).
 const TEMPORAL_STRIDE: usize = 4;
@@ -392,13 +396,45 @@ pub fn generate_v2v_from_components(
 /// context `[text_len, text_dim]` (f32). Krea Realtime ships transformer-only, so the tokenizer +
 /// `t5_encoder.safetensors` are the stock Wan components (provisioned as caller-local paths). CFG is
 /// **off** (Krea Realtime is CFG-off), so only the positive prompt is encoded.
-fn encode_prompt(root: &Path, cfg: &KreaRealtimeConfig, prompt: &str) -> Result<Array> {
+///
+/// `te_quant` is the UMT5 tier for this run (`None` = the dense bf16 encoder). On a quantized DiT tier
+/// it is the shared Wan **Q8 floor** ([`mlx_gen_wan::model::effective_te_quant`], sc-12831): Q8 is
+/// near-lossless for this drift-sensitive encoder (measured prompt-embedding cosine 0.9998 vs bf16, vs
+/// 0.976 at Q4) while roughly halving the encode-phase active peak — so a Q4 *DiT* creative choice is
+/// honored without dragging the text encoder into a visible drift (sc-15203).
+fn encode_prompt(
+    root: &Path,
+    cfg: &KreaRealtimeConfig,
+    prompt: &str,
+    te_quant: Option<WanQuant>,
+) -> Result<Array> {
     let tokenizer = load_tokenizer(root.join("tokenizer.json"), cfg.wan.text_len)?;
-    let w = Weights::from_file(root.join("t5_encoder.safetensors"))?;
-    let enc = Umt5Encoder::from_weights(&w, &cfg.wan)?;
+    let mut w = Weights::from_file(root.join("t5_encoder.safetensors"))?;
+    let enc = match te_quant {
+        Some(q) => Umt5Encoder::from_weights_quantized(&mut w, &cfg.wan, q)?,
+        None => Umt5Encoder::from_weights(&w, &cfg.wan)?,
+    };
     let context = enc.encode(&tokenizer, prompt)?;
     mlx_rs::transforms::eval([&context])?;
     Ok(context)
+}
+
+/// Open the snapshot's transformer weights: a single-file `dit.safetensors` (the converted MLX layout)
+/// or a sharded `transformer/` directory. MLX safetensors loads are **lazy** — this materializes
+/// nothing, so the handle can be opened, probed for its packed tier, and dropped for free.
+fn open_transformer_weights(root: &Path) -> Result<Weights> {
+    let dit_file = root.join(crate::convert::DIT_FILE);
+    let transformer_dir = root.join("transformer");
+    if dit_file.exists() {
+        Weights::from_file(dit_file)
+    } else if transformer_dir.is_dir() {
+        Weights::from_dir(transformer_dir)
+    } else {
+        Err(Error::Msg(format!(
+            "krea t2v: no transformer weights in {} (expected dit.safetensors or a transformer/ dir)",
+            root.display()
+        )))
+    }
 }
 
 /// Load the Krea Realtime transformer weight map from the snapshot `root`: a single-file
@@ -406,35 +442,44 @@ fn encode_prompt(root: &Path, cfg: &KreaRealtimeConfig, prompt: &str) -> Result<
 /// [`load_krea_realtime_transformer`] path handles either on-disk key layout (via
 /// [`crate::convert::sanitize_krea_realtime_transformer`]).
 ///
-/// Any inference LoRA(s) in `adapters` (sc-15015, S14) are installed onto the built DiT as forward-time
-/// residuals over the dense bf16 base via the family-agnostic strict installer — the `mlx-gen-scail2`
-/// dense-Wan template. Krea Realtime is Wan-2.1-14B T2V weight-for-weight, so a diffusers / PEFT /
-/// kohya / LoKr file resolves against the DiT's module names (the FFN `ffn.0`/`ffn.2` reference keys
-/// normalized to the converted `ffn.fc1`/`fc2` by [`CausalKreaTransformer`]'s adaptable host); the
-/// installer **errors — never silently drops** — on a format/prefix mismatch or an unmatched target.
-/// The quant/packed-tier (Q4/Q8) LoRA install is the separate quant-tier story (S19).
+/// ## Quant tiers (sc-15203, S19)
+///
+/// A **pre-quantized (packed Q4/Q8)** snapshot is detected from the weights themselves
+/// ([`load::resolve_snapshot_quant`](crate::load::resolve_snapshot_quant)) and built packed directly by
+/// the reused Wan loader — no dequant, no load-time re-quantize. A **dense bf16** snapshot honors a
+/// caller's `quant` ([`LoadSpec::quantize`](mlx_gen::LoadSpec::quantize)) by packing the DiT in memory
+/// after the build, the same `AdaptableLinear::quantize` path the sibling Wan / SCAIL-2 providers use. A
+/// request that conflicts with a packed snapshot's own tier is a hard error
+/// ([`load::resolve_load_time_quant`](crate::load::resolve_load_time_quant)) rather than a silent
+/// downgrade.
+///
+/// Any inference LoRA(s) in `adapters` (sc-15015, S14) are installed onto the built DiT as **forward-time
+/// residuals** via the family-agnostic strict installer. They go on **after** any quantization, so the
+/// residual is a dense add over the quantized matmul and the base is never dequantized — which is what
+/// makes the adapter path tier-agnostic (the additive-on-packed property epic 10043 / sc-10578
+/// established for the Wan family, and the order `mlx-gen-scail2` uses). Krea Realtime is Wan-2.1-14B
+/// T2V weight-for-weight, so a diffusers / PEFT / kohya / LoKr file resolves against the DiT's module
+/// names (the FFN `ffn.0`/`ffn.2` reference keys normalized to the converted `ffn.fc1`/`fc2` by
+/// [`CausalKreaTransformer`]'s adaptable host); the installer **errors — never silently drops** — on a
+/// format/prefix mismatch or an unmatched target.
 fn load_transformer(
     root: &Path,
     cfg: &KreaRealtimeConfig,
     adapters: &[AdapterSpec],
+    quant: Option<Quant>,
 ) -> Result<CausalKreaTransformer> {
-    let dit_file = root.join("dit.safetensors");
-    let transformer_dir = root.join("transformer");
-    let weights = if dit_file.exists() {
-        Weights::from_file(dit_file)?
-    } else if transformer_dir.is_dir() {
-        Weights::from_dir(transformer_dir)?
-    } else {
-        return Err(Error::Msg(format!(
-            "krea t2v: no transformer weights in {} (expected dit.safetensors or a transformer/ dir)",
-            root.display()
-        )));
-    };
+    let weights = open_transformer_weights(root)?;
     let raw: HashMap<String, Array> = weights
         .keys()
         .map(|k| (k.to_string(), weights.get(k).expect("listed key").clone()))
         .collect();
-    let dit = load_krea_realtime_transformer(raw, cfg)?;
+    let (mut dit, packed) = load_krea_realtime_transformer_with_quant(raw, cfg)?;
+    // Reconcile the requested tier against the one actually on disk, then quantize a dense base if the
+    // caller asked for it (a no-op over an already-packed base — hence the reconciliation, which turns
+    // a width mismatch into a loud error instead of silently serving the stored tier).
+    if let Some(q) = resolve_load_time_quant(MODEL_ID, packed, quant)? {
+        dit.quantize(q.bits(), None)?;
+    }
     let mut transformer = CausalKreaTransformer::new(dit, cfg);
     if !adapters.is_empty() {
         let report =
@@ -457,11 +502,13 @@ fn load_transformer(
 /// The pipeline sizes the AR generation to the Mac streaming window ([`mac_ar_config`]) and the
 /// requested resolution (`resolve_request_config`), encodes the prompt (UMT5), runs the AR denoise,
 /// and VAE-decodes to a clip.
+#[allow(clippy::too_many_arguments)]
 pub fn generate_t2v(
     root: &Path,
     base_cfg: &KreaRealtimeConfig,
     job: &KreaRealtimeJob,
     adapters: &[AdapterSpec],
+    quant: Option<Quant>,
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<GenerationOutput> {
@@ -488,7 +535,7 @@ pub fn generate_t2v(
     // Stage the reused components (UMT5 prompt encode + Krea DiT + z16 Wan VAE); any inference LoRA(s)
     // are installed onto the DiT inside `stage_components` (sc-15015, S14).
     let (context, transformer, vae) =
-        stage_components(root, &cfg, job.prompt, adapters, on_progress)?;
+        stage_components(root, &cfg, job.prompt, adapters, quant, on_progress)?;
 
     let params = ArGenParams {
         seed: job.seed,
@@ -522,20 +569,46 @@ pub fn generate_t2v(
 /// Shared real-weight component staging for the t2v/i2v/v2v pipeline paths: UMT5 prompt encode
 /// (loaded → used → freed) + the Krea DiT (reused Wan 2.1 14B) + the reused z16 Wan VAE, each from the
 /// snapshot `root`.
+///
+/// The DiT's on-disk tier is probed **before** the text encoder is staged (sc-15203): the UMT5 Q8 floor
+/// applies whenever the DiT tier is quantized, but the encoder is loaded first, so the tier has to be
+/// known up front. The probe reads only safetensors shape metadata (MLX loads are lazy), so opening and
+/// dropping the DiT handle here costs nothing and materializes nothing.
 fn stage_components(
     root: &Path,
     cfg: &KreaRealtimeConfig,
     prompt: &str,
     adapters: &[AdapterSpec],
+    quant: Option<Quant>,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<(Array, CausalKreaTransformer, WanVae)> {
+    let te_quant = resolve_te_quant(root, cfg, quant)?;
     on_progress(Progress::Loading(mlx_gen::LoadPhase::TextEncoder));
-    let context = encode_prompt(root, cfg, prompt)?;
+    let context = encode_prompt(root, cfg, prompt, te_quant)?;
     on_progress(Progress::Loading(mlx_gen::LoadPhase::Renderer));
-    let transformer = load_transformer(root, cfg, adapters)?;
+    let transformer = load_transformer(root, cfg, adapters, quant)?;
     let w = Weights::from_file(root.join("vae.safetensors"))?;
     let vae = WanVae::from_weights(&w)?;
     Ok((context, transformer, vae))
+}
+
+/// The UMT5 tier for this run: the shared Wan Q8 floor whenever the DiT is quantized on **either**
+/// axis — a pre-quantized snapshot (read back from the packed weights, so a snapshot with no
+/// `config.json` is not mistaken for dense) or a load-time `Q4`/`Q8` request over a dense one — and
+/// `None` (dense bf16 encoder) on the bf16 tier. Delegates the floor policy itself to
+/// [`mlx_gen_wan::model::effective_te_quant`] so the Q8 rationale lives in exactly one place.
+fn resolve_te_quant(
+    root: &Path,
+    cfg: &KreaRealtimeConfig,
+    quant: Option<Quant>,
+) -> Result<Option<WanQuant>> {
+    let packed = {
+        let w = open_transformer_weights(root)?;
+        probe_packed_quant(&w, &cfg.wan)?
+    };
+    let mut probe = cfg.wan.clone();
+    probe.quantization = packed;
+    Ok(effective_te_quant(&probe, quant))
 }
 
 /// Validate the snapshot `root` + pixel size and derive the latent geometry `(latent_h, latent_w)`
@@ -575,12 +648,14 @@ fn resolve_latent_size(root: &Path, job: &KreaRealtimeJob, what: &str) -> Result
 /// [`generate_i2v_latents`] engine seam already accepts a multi-frame reference, so the anchor count is
 /// a coherence choice to measure/tune on the gated real-weight run (S13), not an engine limitation.
 /// Real-weight watchable-clip coherence is gated to S13.
+#[allow(clippy::too_many_arguments)]
 pub fn generate_i2v(
     root: &Path,
     base_cfg: &KreaRealtimeConfig,
     job: &KreaRealtimeJob,
     reference_image: &Image,
     adapters: &[AdapterSpec],
+    quant: Option<Quant>,
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<GenerationOutput> {
@@ -600,7 +675,7 @@ pub fn generate_i2v(
         })?;
     let cfg = resolve_request_config(base_cfg, latent_h, latent_w, total_latent)?;
     let (context, transformer, vae) =
-        stage_components(root, &cfg, job.prompt, adapters, on_progress)?;
+        stage_components(root, &cfg, job.prompt, adapters, quant, on_progress)?;
     let params = ArGenParams {
         seed: job.seed,
         steps: job.steps,
@@ -643,6 +718,7 @@ pub fn generate_v2v(
     source_frames: &[Image],
     strength: f32,
     adapters: &[AdapterSpec],
+    quant: Option<Quant>,
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<GenerationOutput> {
@@ -654,7 +730,7 @@ pub fn generate_v2v(
     let num_latent = latent_frame_count(source_frames.len() as u32)?;
     let cfg = resolve_request_config(base_cfg, latent_h, latent_w, num_latent)?;
     let (context, transformer, vae) =
-        stage_components(root, &cfg, job.prompt, adapters, on_progress)?;
+        stage_components(root, &cfg, job.prompt, adapters, quant, on_progress)?;
     let params = ArGenParams {
         seed: job.seed,
         steps: job.steps,

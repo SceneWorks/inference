@@ -12,17 +12,61 @@
 //! ([`expected_transformer_tensors`]), so the check is exact for any Wan geometry and needs no real
 //! checkpoint. This is the non-gated S2 surface: `tests/` validate it against the S1 inventory with
 //! synthesized fixtures; real-weight byte parity is the gated remainder on sc-8435.
+//!
+//! ## Quant tiers (sc-15203, S19)
+//!
+//! Krea Realtime ships three tiers — **bf16** (~28 GB), **Q8** (~14 GB) and **Q4** (~7 GB) — and the
+//! quantized ones ship **pre-quantized (packed) on disk**, not quantized on the fly: the Wan
+//! `_quantize_predicate` Linears (per-block self/cross-attention `q/k/v/o` + `ffn.fc1`/`fc2`) carry the
+//! u32-code `{base}.weight` + `{base}.scales` + `{base}.biases` triple, and the reused
+//! [`mlx_gen_wan::WanTransformer::from_weights`] builds them packed directly (its `load_linear` keys
+//! off `.scales` presence, gated by [`WanModelConfig::quantization`]). The quant surface here is:
+//!
+//!   * [`expected_transformer_tensors`] emits the **packed** inventory for the predicate Linears when
+//!     the config declares a tier, so [`verify_transformer_tensors`] stays exact on a packed snapshot
+//!     instead of rejecting `.scales`/`.biases` as "extra" and the u32 codes as "wrong shape";
+//!   * [`resolve_snapshot_quant`] / [`probe_packed_quant`] derive the tier **from the packed shapes**
+//!     (`scales` is `[out, in/group_size]`, the u32 `weight` is `[out, in·bits/32]`, and `in` is known
+//!     from the config geometry) — so both `bits` **and** `group_size` are recovered exactly and a
+//!     snapshot with no `config.json` still loads at the right tier, while a `config.json` that
+//!     *disagrees* with its own weights is a loud error rather than a silent mis-load (the sc-15154
+//!     trap: an *assumed* group size turns a perfectly good artifact into an "illegal width");
+//!   * [`resolve_load_time_quant`] reconciles a caller's [`LoadSpec::quantize`](mlx_gen::LoadSpec)
+//!     against the tier actually on disk — a deliberately loud "stored wins".
 
 use std::collections::{HashMap, HashSet};
 
 use mlx_gen::weights::Weights;
-use mlx_gen::{Error, Result};
-use mlx_gen_wan::config::WanModelConfig;
+use mlx_gen::{Error, Quant, Result};
+use mlx_gen_wan::config::{WanModelConfig, WanQuant};
 use mlx_gen_wan::WanTransformer;
 use mlx_rs::Array;
 
 use crate::config::KreaRealtimeConfig;
 use crate::convert::sanitize_krea_realtime_transformer;
+
+/// The reused Wan `_quantize_predicate` surface: the per-block Linears that ship **packed** on a
+/// quantized tier (mirrors `mlx_gen_wan::convert`'s `WAN_QUANT_SUFFIXES` and the `Block::quantize`
+/// surface). Everything else — the patch/text/time embeddings, `time_projection`, the modulation
+/// tables, the qk/`norm3` norms and the output head — stays dense on every tier, exactly as the
+/// reference predicate specifies.
+pub const PACKED_LINEARS_PER_BLOCK: &[&str] = &[
+    "self_attn.q",
+    "self_attn.k",
+    "self_attn.v",
+    "self_attn.o",
+    "cross_attn.q",
+    "cross_attn.k",
+    "cross_attn.v",
+    "cross_attn.o",
+    "ffn.fc1",
+    "ffn.fc2",
+];
+
+/// The Linear whose packed shapes [`resolve_snapshot_quant`] reads back to recover the tier. Present in
+/// every Wan geometry with at least one block, always inside the quantize predicate, and always
+/// `[dim, dim]` dense — so its `in` dimension is known from the config without trusting the file.
+const QUANT_PROBE_LINEAR: &str = "blocks.0.self_attn.q";
 
 /// One expected **internal** (post-[`sanitize_krea_realtime_transformer`]) transformer tensor: the key
 /// [`mlx_gen_wan::WanTransformer::from_weights`] reads and the config-derived shape it must carry.
@@ -43,6 +87,35 @@ impl TensorSpec {
     }
 }
 
+/// Push the tensors one biased `[out, in]` Linear contributes: the dense `{name}.weight` plus
+/// `{name}.bias`, or — when `packed` is `Some` (this Linear is inside the quantize predicate on a
+/// pre-quantized tier) — the MLX affine-quantized triple `{name}.weight` (u32 codes, at
+/// `[out, in·bits/32]`), `{name}.scales` and `{name}.biases` (both `[out, in/group_size]`), plus the
+/// still-dense `{name}.bias`. The dense bias is unaffected by quantization (MLX packs the weight
+/// only), which is why a packed Linear contributes three weight tensors where a dense one contributes
+/// one.
+fn push_linear(
+    specs: &mut Vec<TensorSpec>,
+    name: String,
+    out: i32,
+    in_dim: i32,
+    packed: Option<WanQuant>,
+) {
+    match packed {
+        Some(q) => {
+            specs.push(TensorSpec::new(
+                format!("{name}.weight"),
+                &[out, in_dim * q.bits / 32],
+            ));
+            let groups = in_dim / q.group_size;
+            specs.push(TensorSpec::new(format!("{name}.scales"), &[out, groups]));
+            specs.push(TensorSpec::new(format!("{name}.biases"), &[out, groups]));
+        }
+        None => specs.push(TensorSpec::new(format!("{name}.weight"), &[out, in_dim])),
+    }
+    specs.push(TensorSpec::new(format!("{name}.bias"), &[out]));
+}
+
 /// Every internal transformer tensor Krea Realtime's reused Wan DiT expects, with its config-derived
 /// shape. This is the **post-sanitize** layout (`patch_embedding_proj`, `text_embedding_{0,1}`,
 /// `time_projection`, `ffn.fc1`/`fc2`, `head.head`) — exactly what
@@ -52,6 +125,13 @@ impl TensorSpec {
 /// `freq_dim=256`, `in/out=16`, `patch=(1,2,2)`, `40` layers): `self_attn.q [5120,5120]`,
 /// `ffn.fc1 [13824,5120]`, `patch_embedding_proj [5120,64]`, `head.head [64,5120]`,
 /// `time_projection [30720,5120]`, `text_embedding_0 [5120,4096]`.
+///
+/// **Quant tiers (sc-15203).** When `cfg.quantization` declares a pre-quantized tier, the
+/// [`PACKED_LINEARS_PER_BLOCK`] surface switches to the packed triple (u32 codes + `.scales` +
+/// `.biases`) at that `bits`/`group_size` — so a Q4/Q8 snapshot verifies exactly. The whole-model
+/// embeddings / `time_projection` / head stay dense on every tier (they are outside the reference
+/// `_quantize_predicate`, and `WanTransformer::from_weights` loads them with `quant = None`
+/// unconditionally), so this table and the loader cannot drift.
 pub fn expected_transformer_tensors(cfg: &WanModelConfig) -> Vec<TensorSpec> {
     let dim = cfg.dim as i32;
     let ffn = cfg.ffn_dim as i32;
@@ -93,18 +173,18 @@ pub fn expected_transformer_tensors(cfg: &WanModelConfig) -> Vec<TensorSpec> {
     specs.push(TensorSpec::new("head.head.weight", &[head_out, dim]));
     specs.push(TensorSpec::new("head.head.bias", &[head_out]));
 
+    // The per-block attention + FFN Linears are the reference `_quantize_predicate` surface: packed on
+    // a pre-quantized tier, dense on bf16.
+    let q = cfg.quantization;
     for i in 0..cfg.num_layers {
         let p = format!("blocks.{i}");
         // Per-block 6-vector modulation table.
         specs.push(TensorSpec::new(format!("{p}.modulation"), &[1, 6, dim]));
-        // Self- and cross-attention: q/k/v/o Linears (dim→dim) + full-dim qk-RMSNorm weights.
+        // Self- and cross-attention: q/k/v/o Linears (dim→dim) + full-dim qk-RMSNorm weights (dense on
+        // every tier — norms are outside the quantize predicate).
         for attn in ["self_attn", "cross_attn"] {
             for proj in ["q", "k", "v", "o"] {
-                specs.push(TensorSpec::new(
-                    format!("{p}.{attn}.{proj}.weight"),
-                    &[dim, dim],
-                ));
-                specs.push(TensorSpec::new(format!("{p}.{attn}.{proj}.bias"), &[dim]));
+                push_linear(&mut specs, format!("{p}.{attn}.{proj}"), dim, dim, q);
             }
             specs.push(TensorSpec::new(format!("{p}.{attn}.norm_q.weight"), &[dim]));
             specs.push(TensorSpec::new(format!("{p}.{attn}.norm_k.weight"), &[dim]));
@@ -113,10 +193,8 @@ pub fn expected_transformer_tensors(cfg: &WanModelConfig) -> Vec<TensorSpec> {
         specs.push(TensorSpec::new(format!("{p}.norm3.weight"), &[dim]));
         specs.push(TensorSpec::new(format!("{p}.norm3.bias"), &[dim]));
         // FFN: Linear(dim→ffn), GELU, Linear(ffn→dim).
-        specs.push(TensorSpec::new(format!("{p}.ffn.fc1.weight"), &[ffn, dim]));
-        specs.push(TensorSpec::new(format!("{p}.ffn.fc1.bias"), &[ffn]));
-        specs.push(TensorSpec::new(format!("{p}.ffn.fc2.weight"), &[dim, ffn]));
-        specs.push(TensorSpec::new(format!("{p}.ffn.fc2.bias"), &[dim]));
+        push_linear(&mut specs, format!("{p}.ffn.fc1"), ffn, dim, q);
+        push_linear(&mut specs, format!("{p}.ffn.fc2"), dim, ffn, q);
     }
 
     specs
@@ -192,23 +270,217 @@ pub fn verify_transformer_tensors(
     )))
 }
 
+/// Recover the pre-quantized tier a Krea Realtime transformer weight **map** ships at, or `None` for a
+/// dense bf16 snapshot. The `HashMap` entry point, used after [`sanitize_krea_realtime_transformer`];
+/// [`probe_packed_quant`] is the [`Weights`]-flavoured sibling.
+///
+/// The tier is derived from the packed **shapes**, not trusted from a manifest: MLX affine quantization
+/// stores `scales` as `[out, in/group_size]` and the u32 codes as `[out, in·bits/32]`, and the probe
+/// Linear's `in` is `cfg.dim` by construction — so `group_size = in/scales.cols` and
+/// `bits = weight.cols·32/in` are both **exact**. That closes the sc-15154 trap where *assuming* a group
+/// size makes a good artifact report an illegal bit-width.
+///
+/// [`WanModelConfig::quantization`] (the snapshot's `config.json` block, when it has one) is then
+/// cross-checked against what the weights actually are; a disagreement in either direction is a hard
+/// error, never a silent mis-load:
+///
+///   * manifest declares a tier but no Linear is packed ⇒ the weights are dense (or the wrong file),
+///   * manifest declares `bits`/`group_size` different from the packed shapes ⇒ one of them is stale.
+pub fn resolve_snapshot_quant(
+    map: &HashMap<String, Array>,
+    cfg: &WanModelConfig,
+) -> Result<Option<WanQuant>> {
+    packed_quant_from(
+        map.keys().any(|k| k.ends_with(".scales")),
+        |k| map.get(k),
+        cfg,
+    )
+}
+
+// The shared core of `resolve_snapshot_quant` / `probe_packed_quant`, over a key→tensor lookup: derive
+// the tier from the packed shapes and cross-check it against any `config.json` manifest. See
+// `resolve_snapshot_quant`'s docs for the full contract.
+fn packed_quant_from<'a>(
+    any_packed: bool,
+    get: impl Fn(&str) -> Option<&'a Array>,
+    cfg: &WanModelConfig,
+) -> Result<Option<WanQuant>> {
+    let declared = cfg.quantization;
+    if !any_packed {
+        if let Some(q) = declared {
+            return Err(Error::Msg(format!(
+                "krea-realtime: config.json declares a pre-quantized Q{} tier (group {}), but the \
+                 transformer carries no packed weights (`.scales`) — the manifest and the weights \
+                 disagree. Point at the matching packed snapshot, or drop the `quantization` block \
+                 from a dense bf16 snapshot's config.json",
+                q.bits, q.group_size
+            )));
+        }
+        return Ok(None);
+    }
+
+    let scales = get(&format!("{QUANT_PROBE_LINEAR}.scales")).ok_or_else(|| {
+        Error::Msg(format!(
+            "krea-realtime: the transformer carries packed weights but `{QUANT_PROBE_LINEAR}.scales` \
+             is missing — a partially-packed snapshot cannot be loaded (every quantize-predicate \
+             Linear must be packed at one tier)"
+        ))
+    })?;
+    let wq = get(&format!("{QUANT_PROBE_LINEAR}.weight")).ok_or_else(|| {
+        Error::Msg(format!(
+            "krea-realtime: `{QUANT_PROBE_LINEAR}.weight` is missing from a packed transformer"
+        ))
+    })?;
+
+    // `blocks.0.self_attn.q` is `[dim, dim]` dense, so `in` is known from the geometry.
+    let in_dim = cfg.dim as i32;
+    let (s_shape, w_shape) = (scales.shape(), wq.shape());
+    if s_shape.len() != 2 || w_shape.len() != 2 {
+        return Err(Error::Msg(format!(
+            "krea-realtime: packed `{QUANT_PROBE_LINEAR}` must be 2-D, got weight {w_shape:?} / \
+             scales {s_shape:?}"
+        )));
+    }
+    if s_shape[1] <= 0 || in_dim % s_shape[1] != 0 {
+        return Err(Error::Msg(format!(
+            "krea-realtime: packed `{QUANT_PROBE_LINEAR}.scales` has {} group column(s), which does \
+             not divide the config's input width {in_dim} — the snapshot geometry does not match \
+             this config",
+            s_shape[1]
+        )));
+    }
+    let group_size = in_dim / s_shape[1];
+    if w_shape[1] <= 0 || (w_shape[1] * 32) % in_dim != 0 {
+        return Err(Error::Msg(format!(
+            "krea-realtime: packed `{QUANT_PROBE_LINEAR}.weight` has {} u32 column(s), which is not a \
+             whole bit-width over the config's input width {in_dim}",
+            w_shape[1]
+        )));
+    }
+    let bits = w_shape[1] * 32 / in_dim;
+    if !matches!(bits, 4 | 8) {
+        return Err(Error::Msg(format!(
+            "krea-realtime: inferred packed bit-width {bits} ∉ {{4, 8}} (weight cols {}, scales cols \
+             {} ⇒ group_size {group_size}, input width {in_dim}) — the snapshot is corrupt or was \
+             packed for a different geometry",
+            w_shape[1], s_shape[1]
+        )));
+    }
+    // Every packed Linear in the predicate must be group-aligned at this width, or `from_weights`
+    // would build a mis-shaped base further down.
+    for width in [in_dim, cfg.ffn_dim as i32] {
+        if width % group_size != 0 {
+            return Err(Error::Msg(format!(
+                "krea-realtime: inferred quantization group_size {group_size} does not divide the \
+                 input width {width} of every quantize-predicate Linear (dim {in_dim}, ffn_dim {})",
+                cfg.ffn_dim
+            )));
+        }
+    }
+
+    let found = WanQuant { bits, group_size };
+    if let Some(q) = declared {
+        if q != found {
+            return Err(Error::Msg(format!(
+                "krea-realtime: config.json declares Q{} at group {}, but the packed weights are Q{} \
+                 at group {} — the manifest is stale relative to its own tensors; re-convert the \
+                 snapshot or fix the `quantization` block",
+                q.bits, q.group_size, found.bits, found.group_size
+            )));
+        }
+    }
+    Ok(Some(found))
+}
+
+/// Recover the pre-quantized tier a Krea Realtime transformer [`Weights`] handle ships at, or `None` for
+/// a dense bf16 snapshot — the same contract as [`resolve_snapshot_quant`], over a `Weights` handle.
+///
+/// Reads **shape metadata only** (MLX safetensors loads are lazy, so nothing is materialized), which
+/// makes it a free probe usable *before* the DiT is built — what the pipeline needs, since the UMT5 Q8
+/// floor (sc-12831) depends on the DiT tier but the text encoder is staged first.
+pub fn probe_packed_quant(w: &Weights, cfg: &WanModelConfig) -> Result<Option<WanQuant>> {
+    packed_quant_from(w.keys().any(|k| k.ends_with(".scales")), |k| w.get(k), cfg)
+}
+
+/// Reconcile a caller's requested [`LoadSpec::quantize`](mlx_gen::LoadSpec) against the tier the
+/// snapshot **actually** ships at (`packed`, from [`probe_packed_quant`]), returning the load-time
+/// quantization to apply after the DiT is built — `None` when nothing further is needed.
+///
+/// Mirrors the sibling Wan providers' rule (`mlx_gen_wan::model`), with one hardening: it reconciles
+/// against the tier read back from the *weights*, not from a `config.json` that may be absent or stale.
+///
+///   * **Pre-quantized snapshot** ⇒ `from_weights` already built it packed, so no load-time requant
+///     (`None`). A request at a *different* width is a hard error — "stored wins", loudly, because
+///     `AdaptableLinear::quantize` no-ops over packed weights and would otherwise silently serve the
+///     stored tier while the caller believed it got the requested one.
+///   * **Dense bf16 snapshot** ⇒ honor the request (quantize in memory after load).
+///   * [`Quant::Nvfp4`] is a candle-only tier with no MLX affine equivalent; routing it through
+///     `quantize(bits)` on its `bits() == 4` alone would silently serve Q4, so it is rejected as a
+///     typed [`Error::Unsupported`] (the advertised `supported_quants` is `[Q4, Q8]`).
+pub fn resolve_load_time_quant(
+    model_id: &str,
+    packed: Option<WanQuant>,
+    requested: Option<Quant>,
+) -> Result<Option<Quant>> {
+    if requested == Some(Quant::Nvfp4) {
+        return Err(Error::Unsupported(format!(
+            "{model_id}: the NVFP4 tier is candle/CUDA-only and has no MLX affine equivalent — this \
+             MLX engine offers Q4 / Q8 / bf16"
+        )));
+    }
+    match (packed, requested) {
+        (Some(stored), Some(req)) if stored.bits != req.bits() => Err(Error::Msg(format!(
+            "{model_id}: this snapshot is pre-quantized Q{} (packed on disk), but a Q{} load was \
+             requested — quantize is a no-op over packed weights, so the request would silently \
+             serve Q{}. Point at the Q{} snapshot (or a dense bf16 one) instead",
+            stored.bits,
+            req.bits(),
+            stored.bits,
+            req.bits()
+        ))),
+        // Pre-quantized: `from_weights` already built it packed; no load-time requant.
+        (Some(_), _) => Ok(None),
+        // Dense bf16: honor the request.
+        (None, req) => Ok(req),
+    }
+}
+
 /// Load a native Krea Realtime 14B transformer weight map (either on-disk layout — single-file
 /// `model.`-prefixed or sharded `transformer/` bare) into the reused [`mlx_gen_wan::WanTransformer`].
 ///
 /// The pipeline is: [`sanitize_krea_realtime_transformer`] (normalize the layout, map onto the
-/// internal Wan DiT names, cast F16 → bf16) → [`verify_transformer_tensors`] (assert the full,
-/// exactly-shaped inventory is present) → [`mlx_gen_wan::WanTransformer::from_weights`]. The TE / VAE /
+/// internal Wan DiT names, cast the float tensors F16 → bf16) → [`resolve_snapshot_quant`] (recover the
+/// on-disk tier from the packed shapes) → [`verify_transformer_tensors`] (assert the full,
+/// exactly-shaped inventory for *that* tier is present) → [`mlx_gen_wan::WanTransformer::from_weights`],
+/// which builds the quantize-predicate Linears packed when the resolved tier says so. The TE / VAE /
 /// tokenizer are stock Wan and provisioned separately (Krea Realtime ships transformer-only), so this
-/// loads the DiT only. No inference, causal attention, KV cache, or scheduler — those AR pieces are
-/// S3–S5.
+/// loads the DiT only.
 pub fn load_krea_realtime_transformer(
     raw: HashMap<String, Array>,
     cfg: &KreaRealtimeConfig,
 ) -> Result<WanTransformer> {
+    Ok(load_krea_realtime_transformer_with_quant(raw, cfg)?.0)
+}
+
+/// [`load_krea_realtime_transformer`] plus the pre-quantized tier the snapshot turned out to ship at
+/// (`None` = dense bf16) — the value the caller feeds [`resolve_load_time_quant`] to decide whether a
+/// requested `LoadSpec::quantize` still has anything to do (sc-15203, S19).
+///
+/// The resolved tier is written onto a *copy* of the config before the DiT is built, so a packed
+/// snapshot whose `config.json` is missing (or which has no `config.json` at all — Krea Realtime ships
+/// transformer-only and the crate falls back to the shipped preset) still loads packed rather than
+/// failing verification with thousands of "extra `.scales`" lines.
+pub fn load_krea_realtime_transformer_with_quant(
+    raw: HashMap<String, Array>,
+    cfg: &KreaRealtimeConfig,
+) -> Result<(WanTransformer, Option<WanQuant>)> {
     let sanitized = sanitize_krea_realtime_transformer(raw)?;
-    verify_transformer_tensors(&sanitized, &cfg.wan)?;
+    let quant = resolve_snapshot_quant(&sanitized, &cfg.wan)?;
+    let mut wan = cfg.wan.clone();
+    wan.quantization = quant;
+    verify_transformer_tensors(&sanitized, &wan)?;
     let weights = Weights::from_map(sanitized);
-    WanTransformer::from_weights(&weights, &cfg.wan)
+    Ok((WanTransformer::from_weights(&weights, &wan)?, quant))
 }
 
 #[cfg(test)]
@@ -246,5 +518,240 @@ mod tests {
         let d =
             expected_transformer_tensors(&three).len() - expected_transformer_tensors(&two).len();
         assert_eq!(d, 27, "each transformer block contributes 27 tensors");
+    }
+
+    // ── Quant tiers (sc-15203, S19) ─────────────────────────────────────────────────────────────
+
+    fn q4_cfg() -> WanModelConfig {
+        let mut c = WanModelConfig::wan21_t2v_14b();
+        c.quantization = Some(WanQuant {
+            bits: 4,
+            group_size: 64,
+        });
+        c
+    }
+
+    /// The packed inventory is the MLX affine layout at the declared width — hand-derived numeric
+    /// literals, not the code's own formula re-run. `self_attn.q` is `[5120, 5120]` dense; at Q4/group-64
+    /// the u32 codes are `[5120, 5120·4/32 = 640]` and both `scales`/`biases` are `[5120, 5120/64 = 80]`.
+    /// The FFN's asymmetric widths (`fc1 [13824, 5120]`, `fc2 [5120, 13824]`) discriminate an
+    /// out-vs-in transposition: `fc2` packs over `in = 13824` ⇒ `[5120, 1728]` codes / `[5120, 216]` groups.
+    #[test]
+    fn packed_inventory_uses_mlx_affine_shapes_at_the_declared_width() {
+        let specs = expected_transformer_tensors(&q4_cfg());
+        let by_name: HashMap<&str, &[i32]> = specs
+            .iter()
+            .map(|s| (s.name.as_str(), s.shape.as_slice()))
+            .collect();
+
+        assert_eq!(by_name["blocks.0.self_attn.q.weight"], &[5120, 640]);
+        assert_eq!(by_name["blocks.0.self_attn.q.scales"], &[5120, 80]);
+        assert_eq!(by_name["blocks.0.self_attn.q.biases"], &[5120, 80]);
+        // The Linear's own dense bias is NOT quantized (MLX packs the weight only).
+        assert_eq!(by_name["blocks.0.self_attn.q.bias"], &[5120]);
+
+        assert_eq!(by_name["blocks.39.ffn.fc1.weight"], &[13824, 640]);
+        assert_eq!(by_name["blocks.39.ffn.fc1.scales"], &[13824, 80]);
+        assert_eq!(by_name["blocks.39.ffn.fc2.weight"], &[5120, 1728]);
+        assert_eq!(by_name["blocks.39.ffn.fc2.scales"], &[5120, 216]);
+
+        // Q8 is twice the code columns of Q4 at the same group size (the width genuinely propagates).
+        let mut q8 = q4_cfg();
+        q8.quantization = Some(WanQuant {
+            bits: 8,
+            group_size: 64,
+        });
+        let q8_specs = expected_transformer_tensors(&q8);
+        let q8_by: HashMap<&str, &[i32]> = q8_specs
+            .iter()
+            .map(|s| (s.name.as_str(), s.shape.as_slice()))
+            .collect();
+        assert_eq!(q8_by["blocks.0.self_attn.q.weight"], &[5120, 1280]);
+        // …and the group columns are unchanged by the bit width, only by the group size.
+        assert_eq!(q8_by["blocks.0.self_attn.q.scales"], &[5120, 80]);
+    }
+
+    /// Only the reference `_quantize_predicate` surface packs: the 10 per-block attention/FFN Linears
+    /// gain two tensors each (`.scales` + `.biases`) and nothing else moves. 1095 + 40·10·2 = 1895.
+    /// The whole-model embeddings / `time_projection` / head stay **dense** on a packed tier — the
+    /// discriminating half, since `WanTransformer::from_weights` loads them with `quant = None`
+    /// unconditionally, so packing them here would make every Q4 snapshot fail verification.
+    #[test]
+    fn packed_inventory_covers_only_the_quantize_predicate() {
+        let dense = expected_transformer_tensors(&WanModelConfig::wan21_t2v_14b());
+        let packed = expected_transformer_tensors(&q4_cfg());
+        assert_eq!(dense.len(), 1095);
+        assert_eq!(packed.len(), 1895);
+        assert_eq!(packed.len() - dense.len(), 40 * 10 * 2);
+
+        let names: HashSet<&str> = packed.iter().map(|s| s.name.as_str()).collect();
+        for lin in PACKED_LINEARS_PER_BLOCK {
+            assert!(
+                names.contains(format!("blocks.7.{lin}.scales").as_str()),
+                "`blocks.7.{lin}` must be packed on a quantized tier"
+            );
+        }
+        for dense_only in [
+            "patch_embedding_proj",
+            "text_embedding_0",
+            "text_embedding_1",
+            "time_embedding_0",
+            "time_embedding_1",
+            "time_projection",
+            "head.head",
+        ] {
+            assert!(
+                !names.contains(format!("{dense_only}.scales").as_str()),
+                "`{dense_only}` is outside the quantize predicate and must stay dense"
+            );
+        }
+        // The qk-RMSNorm / norm3 gains are not Linears and never pack.
+        assert!(!names.contains("blocks.0.self_attn.norm_q.scales"));
+        assert!(!names.contains("blocks.0.norm3.scales"));
+    }
+
+    /// A tiny synthetic packed probe pair: `scales [out, in/gs]` + u32 `weight [out, in·bits/32]`.
+    fn packed_probe(map: &mut HashMap<String, Array>, out: i32, in_dim: i32, bits: i32, gs: i32) {
+        let codes = in_dim * bits / 32;
+        map.insert(
+            format!("{QUANT_PROBE_LINEAR}.weight"),
+            Array::zeros::<u32>(&[out, codes]).unwrap(),
+        );
+        map.insert(
+            format!("{QUANT_PROBE_LINEAR}.scales"),
+            Array::zeros::<f32>(&[out, in_dim / gs]).unwrap(),
+        );
+    }
+
+    fn tiny_wan(dim: usize, ffn: usize) -> WanModelConfig {
+        let mut c = WanModelConfig::wan21_t2v_14b();
+        c.dim = dim;
+        c.ffn_dim = ffn;
+        c
+    }
+
+    /// The tier is recovered from the packed **shapes**, recovering `bits` AND `group_size` — the
+    /// discriminating property vs. assuming a group size (sc-15154). Two different group sizes at the
+    /// same bit width, and two different bit widths at the same group size, all resolve exactly.
+    #[test]
+    fn snapshot_quant_is_derived_from_the_packed_shapes() {
+        let cfg = tiny_wan(256, 512);
+        for (bits, gs) in [(4, 64), (8, 64), (4, 32), (8, 128)] {
+            let mut map = HashMap::new();
+            packed_probe(&mut map, 256, 256, bits, gs);
+            assert_eq!(
+                resolve_snapshot_quant(&map, &cfg).unwrap(),
+                Some(WanQuant {
+                    bits,
+                    group_size: gs
+                }),
+                "Q{bits} at group {gs} must round-trip out of the packed shapes"
+            );
+        }
+        // A dense map (no `.scales` anywhere) is the bf16 tier.
+        assert_eq!(resolve_snapshot_quant(&HashMap::new(), &cfg).unwrap(), None);
+    }
+
+    /// A `config.json` that disagrees with its own tensors is a hard error in BOTH directions — never a
+    /// silent mis-load. (Wan's loader keys packed-vs-dense off `.scales` presence per Linear, so a stale
+    /// manifest would otherwise load a Q8 file at Q4's group scales, or a dense file "as packed".)
+    #[test]
+    fn manifest_disagreeing_with_the_weights_is_a_hard_error() {
+        let mut cfg = tiny_wan(256, 512);
+
+        // (a) manifest declares a tier, weights are dense.
+        cfg.quantization = Some(WanQuant {
+            bits: 4,
+            group_size: 64,
+        });
+        let err = resolve_snapshot_quant(&HashMap::new(), &cfg)
+            .expect_err("dense weights under a quantized manifest must fail");
+        assert!(err.to_string().contains("no packed weights"), "got: {err}");
+
+        // (b) manifest declares Q4, weights are packed Q8.
+        let mut map = HashMap::new();
+        packed_probe(&mut map, 256, 256, 8, 64);
+        let err = resolve_snapshot_quant(&map, &cfg)
+            .expect_err("a stale manifest width must fail, not be silently overridden");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("declares Q4") && msg.contains("are Q8"),
+            "got: {msg}"
+        );
+
+        // (c) manifest declares Q8/group-32, weights are packed Q8/group-64 — the group size is checked
+        // too, not just the bit width.
+        cfg.quantization = Some(WanQuant {
+            bits: 8,
+            group_size: 32,
+        });
+        let err = resolve_snapshot_quant(&map, &cfg)
+            .expect_err("a stale group size must fail as loudly as a stale width");
+        assert!(err.to_string().contains("group"), "got: {err}");
+
+        // (d) matching manifest passes.
+        cfg.quantization = Some(WanQuant {
+            bits: 8,
+            group_size: 64,
+        });
+        assert_eq!(
+            resolve_snapshot_quant(&map, &cfg).unwrap(),
+            Some(WanQuant {
+                bits: 8,
+                group_size: 64
+            })
+        );
+    }
+
+    /// A packed snapshot whose group size does not divide *every* predicate Linear's input width is
+    /// rejected up front (the FFN packs over `ffn_dim`, not `dim`), instead of building a mis-shaped
+    /// base deep inside `from_weights`.
+    #[test]
+    fn group_size_must_divide_every_predicate_input_width() {
+        // dim 256 (divisible by 64), ffn_dim 100 (not) — the probe alone would happily say Q4/group-64.
+        let cfg = tiny_wan(256, 100);
+        let mut map = HashMap::new();
+        packed_probe(&mut map, 256, 256, 4, 64);
+        let err = resolve_snapshot_quant(&map, &cfg)
+            .expect_err("a group size that misses ffn_dim must be rejected");
+        assert!(err.to_string().contains("ffn_dim"), "got: {err}");
+    }
+
+    /// Load-time quant reconciles against the tier the weights ACTUALLY carry — "stored wins", loudly.
+    /// The discriminating case is (packed Q8, requested Q4): `AdaptableLinear::quantize` no-ops over
+    /// packed weights, so without this error the caller would silently be served Q8.
+    #[test]
+    fn load_time_quant_reconciles_against_the_stored_tier() {
+        let q8 = Some(WanQuant {
+            bits: 8,
+            group_size: 64,
+        });
+        // Dense snapshot: the request is honored verbatim.
+        assert_eq!(
+            resolve_load_time_quant("krea_realtime_14b", None, Some(Quant::Q4)).unwrap(),
+            Some(Quant::Q4)
+        );
+        assert_eq!(
+            resolve_load_time_quant("krea_realtime_14b", None, None).unwrap(),
+            None
+        );
+        // Packed snapshot at the SAME width: nothing further to do (already built packed).
+        assert_eq!(
+            resolve_load_time_quant("krea_realtime_14b", q8, Some(Quant::Q8)).unwrap(),
+            None
+        );
+        // Packed snapshot with no request: likewise a no-op.
+        assert_eq!(
+            resolve_load_time_quant("krea_realtime_14b", q8, None).unwrap(),
+            None
+        );
+        // Packed snapshot at a DIFFERENT width: hard error rather than a silent downgrade.
+        let err = resolve_load_time_quant("krea_realtime_14b", q8, Some(Quant::Q4))
+            .expect_err("Q4 requested over a packed Q8 snapshot must fail");
+        assert!(err.to_string().contains("silently serve Q8"), "got: {err}");
+        // NVFP4 is candle-only: rejected as a typed capability gap, never routed through `quantize(4)`.
+        let err = resolve_load_time_quant("krea_realtime_14b", None, Some(Quant::Nvfp4))
+            .expect_err("NVFP4 has no MLX affine equivalent");
+        assert!(matches!(err, Error::Unsupported(_)), "got: {err:?}");
     }
 }

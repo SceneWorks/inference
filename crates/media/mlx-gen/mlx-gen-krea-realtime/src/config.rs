@@ -191,6 +191,26 @@ impl KreaRealtimeConfig {
         }
         Ok(cfg)
     }
+
+    /// Serialize to the `config.json` schema [`from_model_dir`](Self::from_model_dir) reads back — the
+    /// shared Wan DiT half ([`WanModelConfig::to_json`], which carries the `quantization` block of a
+    /// pre-quantized tier) plus the AR knobs `overlay_ar` consumes. Round-trips by construction (the
+    /// test below asserts it), so a rehosted tier snapshot's config is generated from the preset rather
+    /// than hand-written — the sc-15203 tier converter's config emitter.
+    pub fn to_json(&self) -> Value {
+        let mut v = self.wan.to_json();
+        v["local_attn_size"] = serde_json::json!(self.ar.local_attn_size);
+        v["sink_size"] = serde_json::json!(self.ar.sink_size);
+        v["num_frames_per_block"] = serde_json::json!(self.ar.num_frames_per_block);
+        v["kv_cache_num_frames"] = serde_json::json!(self.ar.kv_cache_num_frames);
+        v["frame_seq_length"] = serde_json::json!(self.ar.frame_seq_length);
+        v["seq_length"] = serde_json::json!(self.ar.seq_length);
+        v["denoising_step_list"] = serde_json::json!(self.ar.denoising_step_list);
+        v["timestep_shift"] = serde_json::json!(self.ar.timestep_shift);
+        v["do_kv_recomp"] = serde_json::json!(self.ar.do_kv_recomp);
+        v["context_noise"] = serde_json::json!(self.ar.context_noise);
+        v
+    }
 }
 
 /// Overlay any AR knobs explicitly present in a `config.json` onto the shipped defaults.
@@ -382,6 +402,51 @@ mod tests {
         let mut ar = KreaArConfig::krea_realtime_14b();
         overlay_ar(&v, &mut ar);
         assert_eq!(ar, KreaArConfig::krea_realtime_14b());
+    }
+
+    /// `to_json` → `from_model_dir` round-trips the whole config, **including** a pre-quantized tier's
+    /// `quantization` block (sc-15203) — the property the tier converter's config emitter relies on.
+    /// Discriminating: the AR knobs and the quant manifest are perturbed away from the preset first, so
+    /// a `to_json` that dropped either would fail rather than accidentally matching the default.
+    #[test]
+    fn to_json_round_trips_through_from_model_dir_including_the_quant_tier() {
+        let mut cfg = KreaRealtimeConfig::krea_realtime_14b();
+        cfg.wan.quantization = Some(mlx_gen_wan::config::WanQuant {
+            bits: 4,
+            group_size: 64,
+        });
+        // Perturb the AR half away from the shipped defaults so the round-trip is not a tautology.
+        cfg.ar.local_attn_size = 6;
+        cfg.ar.sink_size = 2;
+        cfg.ar.do_kv_recomp = false;
+        cfg.ar.context_noise = 0.25;
+        cfg.ar.denoising_step_list = vec![900, 500, 0];
+
+        let root =
+            std::env::temp_dir().join(format!("krea_realtime_tojson_{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("config.json"),
+            serde_json::to_string_pretty(&cfg.to_json()).unwrap(),
+        )
+        .unwrap();
+
+        let back = KreaRealtimeConfig::from_model_dir(&root).unwrap();
+        assert_eq!(back, cfg);
+        assert_eq!(
+            back.wan.quantization,
+            Some(mlx_gen_wan::config::WanQuant {
+                bits: 4,
+                group_size: 64
+            }),
+            "the pre-quantized tier manifest must survive the round-trip"
+        );
+
+        // A bf16 tier emits no `quantization` block at all (so a dense snapshot never reads as packed).
+        let dense = KreaRealtimeConfig::krea_realtime_14b();
+        assert!(dense.to_json().get("quantization").is_none());
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
