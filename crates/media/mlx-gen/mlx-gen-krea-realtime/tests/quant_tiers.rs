@@ -30,12 +30,12 @@ use mlx_gen::adapters::loader::apply_adapters_strict;
 use mlx_gen::adapters::AdaptableHost;
 use mlx_gen::{AdapterKind, AdapterSpec, Quant};
 use mlx_gen_krea_realtime::{
-    convert_krea_realtime_tier, convert_krea_realtime_tier_with_config,
-    expected_transformer_tensors, load_krea_realtime_transformer,
-    load_krea_realtime_transformer_with_quant, quantize_krea_realtime_transformer,
-    resolve_load_time_quant, resolve_snapshot_quant, sanitize_krea_realtime_transformer,
-    verify_transformer_tensors, CausalKreaTransformer, KreaRealtimeConfig, WanQuant, DIT_FILE,
-    MODEL_ID, PACKED_LINEARS_PER_BLOCK,
+    convert_krea_realtime_tier, convert_krea_realtime_tier_sharded,
+    convert_krea_realtime_tier_with_config, expected_transformer_tensors,
+    load_krea_realtime_transformer, load_krea_realtime_transformer_with_quant,
+    quantize_krea_realtime_transformer, resolve_load_time_quant, resolve_snapshot_quant,
+    sanitize_krea_realtime_transformer, verify_transformer_tensors, CausalKreaTransformer,
+    KreaRealtimeConfig, WanQuant, DIT_FILE, MODEL_ID, PACKED_LINEARS_PER_BLOCK, TRANSFORMER_DIR,
 };
 use mlx_rs::{Array, Dtype};
 
@@ -715,6 +715,112 @@ fn tier_converter_writes_a_snapshot_the_load_path_reads_back() {
             is_packed(&mut host, &["blocks", "0", "self_attn", "q"]),
             quantize.is_some(),
             "{tier}: packed-ness must match the tier"
+        );
+    }
+
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// (11) **The sharded emitter is interchangeable with the single-file one.** `convert_krea_realtime_
+/// tier_sharded` is what S2b's dense bf16 tier is written with — the tier is too large to materialize
+/// as one file on the conversion host, so it is emitted shard-by-shard and each shard is uploaded and
+/// deleted through the `on_shard` callback. This proves the layout it produces is a real snapshot:
+/// the shard set is disjoint and complete, the load path reads it back through the `transformer/`
+/// directory branch at the right tier, and the reconstructed tensor set is **identical** to what the
+/// single-file emitter writes from the same source.
+///
+/// Discriminating: it asserts the shards are actually MULTIPLE (a budget that silently produced one
+/// shard would make the whole disk-bounded flow a no-op and still "pass"), that `on_shard` fires once
+/// per shard *before* the next exists (the property the rehost's delete-as-you-go depends on), and
+/// that a deleted shard really is gone — i.e. peak footprint is one shard, not the tier.
+#[test]
+fn sharded_emitter_matches_the_single_file_emitter_and_holds_one_shard_at_a_time() {
+    let cfg = tiny_cfg();
+    let base = std::env::temp_dir().join(format!("krea_tier_sharded_{}", std::process::id()));
+    let native = write_native_checkpoint(&cfg, &base);
+
+    for (tier, quantize) in [("bf16", None), ("q4", Some((4, GROUP)))] {
+        // Reference: the single-file emitter over the same source.
+        let flat = base.join(format!("{tier}-flat"));
+        convert_krea_realtime_tier_with_config(&native, &flat, quantize, &cfg).unwrap();
+        let fw = mlx_gen::weights::Weights::from_file(flat.join(DIT_FILE)).unwrap();
+        let mut want: Vec<String> = fw.keys().map(|k| k.to_string()).collect();
+        want.sort();
+
+        // Sharded: budget deliberately below the tier size so the plan really splits.
+        let total_bytes: u64 = fw.keys().map(|k| fw.get(k).unwrap().nbytes() as u64).sum();
+        let budget = total_bytes / 3;
+
+        let sharded = base.join(format!("{tier}-sharded"));
+        let mut seen: Vec<PathBuf> = Vec::new();
+        let paths = convert_krea_realtime_tier_sharded(
+            &native,
+            &sharded,
+            quantize,
+            &cfg,
+            budget,
+            &mut |p| {
+                // The callback must see a finished, readable shard...
+                assert!(p.is_file(), "{tier}: on_shard got a missing shard {p:?}");
+                // ...and it must be the only one on disk (the previous ones were deleted here), which
+                // is exactly what bounds the rehost's peak disk to a single shard.
+                for prev in &seen {
+                    assert!(
+                        !prev.exists(),
+                        "{tier}: shard {prev:?} still on disk — peak footprint is not one shard"
+                    );
+                }
+                seen.push(p.to_path_buf());
+                std::fs::remove_file(p).unwrap(); // the rehost uploads, then deletes
+                Ok(())
+            },
+        )
+        .unwrap_or_else(|e| panic!("{tier}: sharded convert failed: {e}"));
+
+        assert!(
+            paths.len() > 1,
+            "{tier}: the budget must actually split the tier (got {} shard(s))",
+            paths.len()
+        );
+        assert_eq!(
+            seen.len(),
+            paths.len(),
+            "{tier}: on_shard fires once a shard"
+        );
+        assert!(
+            sharded.join("config.json").is_file(),
+            "{tier}: sharded tier still writes config.json"
+        );
+
+        // Re-emit without deleting so the reconstructed set can be compared + loaded.
+        let keep = base.join(format!("{tier}-keep"));
+        convert_krea_realtime_tier_sharded(&native, &keep, quantize, &cfg, budget, &mut |_| Ok(()))
+            .unwrap();
+
+        let dir = keep.join(TRANSFORMER_DIR);
+        // `Weights::from_dir` errors on a duplicate key, so a successful read already proves the
+        // shard set is disjoint; this proves it is also complete and identical to the flat emit.
+        let sw = mlx_gen::weights::Weights::from_dir(&dir).unwrap();
+        let mut got: Vec<String> = sw.keys().map(|k| k.to_string()).collect();
+        got.sort();
+        assert_eq!(
+            got, want,
+            "{tier}: the sharded tensor set must equal the single-file one"
+        );
+
+        let read_back = KreaRealtimeConfig::from_model_dir(&keep).expect("emitted config");
+        let raw: HashMap<String, Array> = sw
+            .keys()
+            .map(|k| (k.to_string(), sw.get(k).unwrap().clone()))
+            .collect();
+        let (_dit, resolved) = load_krea_realtime_transformer_with_quant(raw, &read_back)
+            .unwrap_or_else(|e| {
+                panic!("{tier}: the sharded snapshot must load through the normal path: {e}")
+            });
+        assert_eq!(
+            resolved,
+            quantize.map(|(bits, group_size)| WanQuant { bits, group_size }),
+            "{tier}: the sharded snapshot must resolve to the emitted tier"
         );
     }
 

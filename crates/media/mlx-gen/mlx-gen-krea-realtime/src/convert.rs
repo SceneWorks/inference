@@ -188,6 +188,123 @@ pub fn convert_krea_realtime_tier_with_config(
     Ok(out_dir.to_path_buf())
 }
 
+/// The subdirectory a **sharded** tier snapshot puts its transformer shards in — the layout
+/// [`crate::t2v`]'s load path falls back to when a tier ships no single-file [`DIT_FILE`]
+/// (`Weights::from_dir` globs `*.safetensors` and requires the shard set to be disjoint).
+pub const TRANSFORMER_DIR: &str = "transformer";
+
+/// Default shard size for [`convert_krea_realtime_tier_sharded`] (4 GiB) — comfortably under the
+/// single-file sizes HF discourages, and small enough that a disk-bounded rehost only ever holds one
+/// shard locally.
+pub const DEFAULT_SHARD_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+/// Assign `map`'s tensors to shards of at most `max_shard_bytes` (a tensor larger than the budget gets
+/// its own shard). Keys are sorted first, so the plan is a pure function of the tensor set and the
+/// budget — the same source always shards identically.
+fn plan_shards(map: &HashMap<String, Array>, max_shard_bytes: u64) -> Vec<Vec<String>> {
+    let mut names: Vec<&String> = map.keys().collect();
+    names.sort();
+
+    let mut shards: Vec<Vec<String>> = Vec::new();
+    let mut current: Vec<String> = Vec::new();
+    let mut used: u64 = 0;
+    for name in names {
+        let bytes = map[name].nbytes() as u64;
+        if !current.is_empty() && used + bytes > max_shard_bytes {
+            shards.push(std::mem::take(&mut current));
+            used = 0;
+        }
+        current.push(name.clone());
+        used += bytes;
+    }
+    if !current.is_empty() {
+        shards.push(current);
+    }
+    shards
+}
+
+/// [`convert_krea_realtime_tier`] emitted as a **sharded** `transformer/` directory instead of one
+/// [`DIT_FILE`], writing one shard at a time and handing each finished shard to `on_shard` before the
+/// next is built.
+///
+/// This exists for the dense **bf16** tier of the rehost (sc-8435 S2b). That tier is a single ~28.6 GB
+/// tensor set, and materializing it as one file requires that much free disk *plus* whatever the
+/// upload needs — which the conversion host does not always have. Sharding bounds the requirement to
+/// one shard: `on_shard` can upload the shard and delete it, so the peak local footprint is
+/// `max_shard_bytes` rather than the whole tier. It is also the friendlier hosted layout for a tier
+/// this size (resumable per-shard downloads instead of one ~28.6 GB object).
+///
+/// The emitted directory is `<out_dir>/transformer/dit-{i}-of-{n}.safetensors` plus the same
+/// `<out_dir>/config.json` the single-file emitter writes, which is exactly the sharded layout
+/// [`crate::t2v`]'s loader already accepts — so a sharded tier and a single-file tier are
+/// interchangeable to every consumer.
+///
+/// Like the single-file emitter, the **whole** tensor set is [`verify_transformer_tensors`]-checked
+/// against the emitted config *before* any shard is written, so a geometry mismatch fails up front
+/// rather than after some shards have already been uploaded. Each shard's tensors are dropped from the
+/// working map once written, so peak memory is bounded by the shard rather than the tier.
+///
+/// Returns the shard paths in order (whether or not `on_shard` deleted them).
+pub fn convert_krea_realtime_tier_sharded(
+    src: impl AsRef<Path>,
+    out_dir: impl AsRef<Path>,
+    quantize: Option<(i32, i32)>,
+    cfg: &KreaRealtimeConfig,
+    max_shard_bytes: u64,
+    on_shard: &mut dyn FnMut(&Path) -> Result<()>,
+) -> Result<Vec<PathBuf>> {
+    let out_dir = out_dir.as_ref();
+    let src = src.as_ref();
+
+    let map = read_native_map(src)?;
+    let sanitized = sanitize_krea_realtime_transformer(map)?;
+    let mut dit = match quantize {
+        Some((bits, group_size)) => {
+            quantize_krea_realtime_transformer(sanitized, bits, group_size)?
+        }
+        None => sanitized,
+    };
+
+    let mut cfg = cfg.clone();
+    cfg.wan.quantization = quantize.map(|(bits, group_size)| WanQuant { bits, group_size });
+    verify_transformer_tensors(&dit, &cfg.wan).map_err(|e| {
+        Error::Msg(format!(
+            "krea-realtime: refusing to write a tier snapshot whose transformer does not match the \
+             config it would ship with (source {}): {e}",
+            src.display()
+        ))
+    })?;
+
+    let shard_dir = out_dir.join(TRANSFORMER_DIR);
+    std::fs::create_dir_all(&shard_dir)?;
+
+    // Write config.json first: a consumer that sees shards appearing has the geometry already.
+    let text = serde_json::to_string_pretty(&cfg.to_json())
+        .map_err(|e| Error::Msg(format!("krea-realtime: serialize config.json: {e}")))?;
+    std::fs::write(out_dir.join("config.json"), text)?;
+
+    let plan = plan_shards(&dit, max_shard_bytes);
+    let total = plan.len();
+    let mut written = Vec::with_capacity(total);
+    for (i, names) in plan.into_iter().enumerate() {
+        let path = shard_dir.join(format!("dit-{:05}-of-{:05}.safetensors", i + 1, total));
+        // Move this shard's tensors out of the working map so they are released after the write.
+        let shard: HashMap<String, Array> = names
+            .into_iter()
+            .map(|n| {
+                let a = dit.remove(&n).expect("planned key is in the map");
+                (n, a)
+            })
+            .collect();
+        save_map(&path, &shard)?;
+        drop(shard);
+        on_shard(&path)?;
+        written.push(path);
+    }
+
+    Ok(written)
+}
+
 /// Read either on-disk transformer layout into an owned key→`Array` map: a **directory** (the sharded
 /// `transformer/` layout — merged via its safetensors index) or a single **file** (the `model.`-
 /// prefixed single-file layout). MLX arrays are ref-counted, so the clones are handle copies.

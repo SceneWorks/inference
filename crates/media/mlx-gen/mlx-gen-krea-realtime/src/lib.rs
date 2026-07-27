@@ -107,10 +107,10 @@ pub use causal::{
 };
 pub use config::{KreaArConfig, KreaRealtimeConfig, MODEL_ID};
 pub use convert::{
-    convert_krea_realtime_tier, convert_krea_realtime_tier_with_config,
-    convert_krea_realtime_transformer, normalize_krea_keys, quantize_krea_realtime_transformer,
-    sanitize_krea_realtime_transformer, strip_model_prefix, DIT_FILE, KREA_MODEL_PREFIX,
-    TRANSFORMER_DTYPE,
+    convert_krea_realtime_tier, convert_krea_realtime_tier_sharded,
+    convert_krea_realtime_tier_with_config, convert_krea_realtime_transformer, normalize_krea_keys,
+    quantize_krea_realtime_transformer, sanitize_krea_realtime_transformer, strip_model_prefix,
+    DEFAULT_SHARD_BYTES, DIT_FILE, KREA_MODEL_PREFIX, TRANSFORMER_DIR, TRANSFORMER_DTYPE,
 };
 pub use generate::{
     generate_i2v_latents, generate_latents, generate_latents_conditioned_into,
