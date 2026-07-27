@@ -29,7 +29,13 @@ macro_rules! bail {
 }
 
 const SAMPLE_RATE: usize = 44_100;
-const LATENT_DOWNSAMPLING: usize = 4_096;
+/// Audio samples per latent frame — the SAME autoencoder's `downsampling_ratio`, which
+/// [`crate::pipeline::validate_layout`] pins to this value on every registered snapshot.
+///
+/// `pub` since sc-14548: the inpaint mask is built at audio-sample resolution and resized to latent
+/// resolution by exactly this factor, so a provider-local copy of the number would be free to drift
+/// away from the geometry it has to agree with.
+pub const LATENT_DOWNSAMPLING: usize = 4_096;
 const ADAPT_CHUNK_FALLBACK: usize = 32;
 const ADAPT_FIRST_STRIDE: usize = 16;
 /// Seconds of headroom [`default_sample_geometry`] adds on top of the requested duration.
