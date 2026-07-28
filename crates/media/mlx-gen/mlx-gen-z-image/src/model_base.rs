@@ -228,6 +228,11 @@ impl ZImage {
         // SC-15615 ladder rung 3: the shared selector's request-scoped attention budget. Unbounded
         // unless this request selected bounded attention, so the default forward is unchanged.
         let attention_budget = pipeline::attention_budget(req);
+        // SC-15754 ladder rung 4: the request-scoped transformer-residency window. `None` unless this
+        // request selected it; a selection on a non-Sequential generator is rejected rather than
+        // silently degraded (see `pipeline::resolve_block_window`).
+        let block_window =
+            pipeline::resolve_block_window(req, self.residency.is_sequential(), MODEL_ID)?;
         let images = self.residency.run_staged(
             &req.cancel,
             req.use_pid,
@@ -335,6 +340,7 @@ impl ZImage {
                             guidance,
                             start_step,
                             attention_budget,
+                            block_window,
                             &req.cancel,
                             op,
                         )

@@ -67,7 +67,7 @@ impl ZImageTransformerConfig {
         }
     }
 
-    fn block_cfg(&self) -> ZImageBlockConfig {
+    pub(crate) fn block_cfg(&self) -> ZImageBlockConfig {
         ZImageBlockConfig {
             dim: self.dim,
             n_heads: self.n_heads,
@@ -103,6 +103,11 @@ pub struct ZImageTransformer {
     /// the tiny context-refiner LoRA grads (per-param cosine vs f32 as low as 0.43), while costing
     /// nothing to keep precise. `None` (every inference path) = zero behavior change.
     pub(crate) train_unify_dtype: Option<mlx_rs::Dtype>,
+    /// Ladder rung 4 (SC-15754): how to rebuild the 30 unified `layers` from the snapshot one window
+    /// at a time. `Some` only for a re-openable source (a snapshot dir / single `.safetensors`);
+    /// `None` for an in-memory or ComfyUI-normalized load, where rung 4 is declared unavailable in the
+    /// contract rather than faked. See [`crate::block_stream`].
+    pub(crate) block_stream: Option<crate::block_stream::ZImageBlockStream>,
 }
 
 /// `where(keep == 1, emb, pad)` for `emb` `[N, dim]`, `keep` `[N, 1]` (1 = real, 0 = padded),
@@ -173,8 +178,85 @@ impl ZImageTransformer {
             x_pad_token: w.require(&p("x_pad_token"))?.reshape(&[1, cfg.dim])?,
             cap_pad_token: w.require(&p("cap_pad_token"))?.reshape(&[1, cfg.dim])?,
             train_unify_dtype: None,
+            block_stream: None,
             cfg,
         })
+    }
+
+    /// Arm ladder rung 4 (SC-15754) by recording where the unified `layers` can be re-read from.
+    ///
+    /// Called by [`crate::loader`] for a real snapshot; deliberately NOT called for a ComfyUI /
+    /// in-memory build, whose `Weights` has no re-openable source. `prefix` mirrors
+    /// [`Self::from_weights`]'s, so the streamed keys are the same keys the resident load used.
+    pub fn with_block_stream(mut self, source: mlx_gen::WeightsSource, prefix: &str) -> Self {
+        let base = if prefix.is_empty() {
+            "layers".to_owned()
+        } else {
+            format!("{prefix}.layers")
+        };
+        self.block_stream = Some(crate::block_stream::ZImageBlockStream::new(
+            source,
+            base,
+            self.cfg.block_cfg(),
+            self.cfg.n_layers,
+            false,
+        ));
+        self
+    }
+
+    /// Whether rung 4 can execute on this transformer (a re-openable weights source was recorded).
+    pub(crate) fn can_stream_blocks(&self) -> bool {
+        self.block_stream.is_some()
+    }
+
+    /// Turn a request's window size into the plan the windowed forward runs under, or `None` for the
+    /// historical resident stack. Errors when a window is asked for but the transformer has no
+    /// re-openable source, so a rung-4 request can never silently execute the resident path.
+    pub(crate) fn block_window<'a>(
+        &self,
+        window_size: Option<usize>,
+        cancel: &'a mlx_gen::CancelFlag,
+    ) -> Result<Option<crate::block_stream::BlockWindow<'a>>> {
+        let Some(size) = window_size else {
+            return Ok(None);
+        };
+        if self.block_stream.is_none() {
+            return Err(mlx_gen::Error::Unsupported(
+                "z-image: bounded transformer residency needs a re-openable snapshot; this \
+                 generator was built from in-memory weights (ComfyUI / fixture)"
+                    .to_owned(),
+            ));
+        }
+        Ok(Some(crate::block_stream::BlockWindow {
+            plan: mlx_gen::block_residency::BlockPlan::new(self.layers.len(), size)?,
+            cancel,
+        }))
+    }
+
+    /// Disarm ladder rung 4 after an in-place mutation a re-materialized block could not reproduce.
+    ///
+    /// The stream's contract is that a materialized block is byte-identical to its resident twin, and
+    /// it keeps that promise by replaying the load-time quantization and the captured adapters. The
+    /// two **training-only** mutations — the bf16 compute cast and the SDPA-checkpoint flag — are not
+    /// replayable: the cast is applied to the live arrays, and the flag is per-block state with no
+    /// on-disk representation. A streamed forward after either would silently run *different* weights
+    /// or a different backward, so the rung is turned off instead.
+    ///
+    /// Turning it off is safe rather than surprising: `block_window` then returns a typed error for a
+    /// window request, and no training path asks for one. Inference never calls either mutator
+    /// (KEEP-F32, sc-2609), so this is inert on every render.
+    fn disarm_block_stream(&mut self) {
+        self.block_stream = None;
+    }
+
+    /// Capture the adapters installed on the unified `layers` so a streamed block reproduces them.
+    /// A no-op when rung 4 is not armed. Called by the heavy loader *after*
+    /// [`crate::adapters::apply_z_image_adapters`], so the two paths cannot disagree about which
+    /// adapters landed where.
+    pub fn capture_block_adapters(&mut self) {
+        if let Some(stream) = self.block_stream.as_mut() {
+            stream.capture_adapters(&mut self.layers);
+        }
     }
 
     /// Quantize every Linear in the DiT to Q4/Q8 (group_size 64), the mlx-rs equivalent of the
@@ -206,6 +288,13 @@ impl ZImageTransformer {
         for block in &mut self.layers {
             block.quantize(bits)?;
         }
+        // Rung 4 replays the identical quantization on every materialized block, so a streamed window
+        // is byte-identical to its resident twin. Recorded unconditionally: on a pre-quantized
+        // (packed) snapshot `quantize` is a documented no-op, and replaying that same no-op is
+        // exactly right — it is the resident path's behaviour, reproduced.
+        if let Some(stream) = self.block_stream.as_mut() {
+            stream.set_quant_bits(bits);
+        }
         Ok(())
     }
 
@@ -222,6 +311,10 @@ impl ZImageTransformer {
     /// on, the trainer turns the MAIN flag off — the block recompute already covers attention, and
     /// nesting would recompute it twice for no memory win.
     pub fn set_sdpa_checkpoint(&mut self, main: bool, refiners: bool) {
+        // SC-15754: a training-only per-block flag a re-materialized block would not carry, so the
+        // rung-4 stream is disarmed rather than left able to produce a *different* forward. See
+        // `disarm_block_stream`.
+        self.disarm_block_stream();
         for b in &mut self.layers {
             b.set_sdpa_checkpoint(main);
         }
@@ -242,6 +335,9 @@ impl ZImageTransformer {
     /// Destructive for a narrowing cast (f32→bf16): reload for f32. Inference never calls this
     /// (KEEP-F32, sc-2609 — the f32 render is the preferred output).
     pub fn cast_weights(&mut self, dtype: mlx_rs::Dtype) -> Result<()> {
+        // SC-15754: same reason as `set_sdpa_checkpoint` — a streamed block would be re-read at the
+        // on-disk dtype, not this cast one.
+        self.disarm_block_stream();
         self.x_embedder.cast_weights(dtype)?;
         self.t_embedder.cast_weights(dtype)?;
         self.final_layer.cast_weights(dtype)?;
@@ -313,6 +409,28 @@ impl ZImageTransformer {
         timestep: f32,
         plan: AttentionPlan<'_>,
     ) -> Result<Array> {
+        self.forward_with_rungs(prep, x, timestep, plan, None)
+    }
+
+    /// [`forward_with_budgeted`](Self::forward_with_budgeted) with ladder rung 4 layered on top
+    /// (SC-15754): when `window` is `Some`, the 30 unified blocks are **not** taken from the resident
+    /// `self.layers` but rebuilt from the snapshot one window at a time through the shared
+    /// [`mlx_gen::block_residency::run_windowed`].
+    ///
+    /// Everything outside the unified stack — patchify, embedders, pad tokens, RoPE, the noise and
+    /// context refiners, the final layer, unpatchify and the output negation — is byte-for-byte the
+    /// resident path, and each streamed block is quantized and adapted identically to its resident
+    /// twin (see [`crate::block_stream`]). So the two forwards compute the same arithmetic in the same
+    /// order; only *when the weights exist* differs. `window = None` is the historical path and does
+    /// not so much as look at the stream.
+    pub(crate) fn forward_with_rungs(
+        &self,
+        prep: &Prepared,
+        x: &Array,
+        timestep: f32,
+        plan: AttentionPlan<'_>,
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+    ) -> Result<Array> {
         let t = Array::from_slice(&[timestep * self.cfg.t_scale], &[1]);
         let t_emb = self.t_embedder.forward(&t)?;
 
@@ -341,10 +459,18 @@ impl ZImageTransformer {
             None => cap_emb,
         };
         let x_len = x_emb.shape()[1];
-        let mut unified = concatenate_axis(&[&x_emb, &cap_emb], 1)?;
-        for layer in &self.layers {
-            unified = layer.forward_budgeted(&unified, &prep.unified_freqs, &t_emb, plan)?;
-        }
+        let unified = concatenate_axis(&[&x_emb, &cap_emb], 1)?;
+        let unified = match window {
+            None => {
+                let mut unified = unified;
+                for layer in &self.layers {
+                    unified =
+                        layer.forward_budgeted(&unified, &prep.unified_freqs, &t_emb, plan)?;
+                }
+                unified
+            }
+            Some(window) => self.run_windowed_layers(unified, prep, &t_emb, plan, window)?,
+        };
 
         // Final layer + unpatchify (only the real image tokens survive).
         let unified = self.final_layer.forward(&unified, &t_emb)?;
@@ -354,6 +480,87 @@ impl ZImageTransformer {
             .take_axis(row_indices(x_len), 0)?; // (x_len, embed_dim)
         let out = self.unpatchify(&head, prep.x_size)?;
         Ok(out.multiply(Array::from_slice(&[-1.0f32], &[1]))?)
+    }
+
+    /// Rung 4's unified stack: walk the 30 blocks in windows, materializing each window's weights from
+    /// the snapshot, running them, and releasing them before advancing.
+    ///
+    /// The lifecycle (open → apply → **materialize the carried state** → drop → release cache, with a
+    /// cancellation check at every window boundary) belongs entirely to
+    /// [`mlx_gen::block_residency::run_windowed`]. Nothing here re-implements it: SC-15750 measured
+    /// that hand-rolling the drop-before-eval order frees *nothing* while still producing correct
+    /// images (238.4 MiB vs 8.0 MiB at window = 1), so a family-local copy of this loop is a silent
+    /// failure waiting to happen.
+    fn run_windowed_layers(
+        &self,
+        unified: Array,
+        prep: &Prepared,
+        t_emb: &Array,
+        plan: AttentionPlan<'_>,
+        window: crate::block_stream::BlockWindow<'_>,
+    ) -> Result<Array> {
+        self.run_windowed_layers_with_hints(
+            unified,
+            &prep.unified_freqs,
+            t_emb,
+            plan,
+            window,
+            &mut |state: &Array, _i: usize| Ok(state.clone()),
+        )
+    }
+
+    /// [`run_windowed_layers`](Self::run_windowed_layers) with a post-block hook, so the ControlNet
+    /// variant can inject its per-place hint between blocks exactly where the resident loop does.
+    ///
+    /// `after_block(state, i)` runs immediately after unified block `i`, inside the window — the same
+    /// position as the resident `add_hint` call — so the value carried into block `i+1` is identical
+    /// whether or not the stack is windowed. It returns the (possibly unchanged) state rather than
+    /// mutating, mirroring the resident loop's `unified = add_hint(&unified, …)`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn run_windowed_layers_with_hints(
+        &self,
+        unified: Array,
+        unified_freqs: &Array,
+        t_emb: &Array,
+        plan: AttentionPlan<'_>,
+        window: crate::block_stream::BlockWindow<'_>,
+        after_block: &mut dyn FnMut(&Array, usize) -> Result<Array>,
+    ) -> Result<Array> {
+        let stream = self.block_stream.as_ref().ok_or_else(|| {
+            mlx_gen::Error::Msg(
+                "z-image: bounded transformer residency was requested but this transformer has no \
+                 re-openable weights source (a ComfyUI / in-memory load); the contract declares rung \
+                 4 unavailable for such a load"
+                    .to_owned(),
+            )
+        })?;
+        // The plan, the resident stack and the stream must all describe the same 30 blocks. A
+        // disagreement would silently skip or double-run layers, so it is an error rather than a
+        // clamp.
+        if window.plan.n_blocks() != self.layers.len() || stream.n_blocks() != self.layers.len() {
+            return Err(mlx_gen::Error::Msg(format!(
+                "z-image: block plan covers {} blocks and the stream {}, but the unified stack has {}",
+                window.plan.n_blocks(),
+                stream.n_blocks(),
+                self.layers.len()
+            )));
+        }
+        mlx_gen::block_residency::run_windowed(
+            &window.plan,
+            window.cancel,
+            unified,
+            || stream.open(),
+            |state, view, range| {
+                let mut cur = state;
+                for i in range {
+                    let block = stream.materialize(view, i)?;
+                    cur = block.forward_budgeted(&cur, unified_freqs, t_emb, plan)?;
+                    cur = after_block(&cur, i)?;
+                }
+                Ok(cur)
+            },
+            |state: &Array| Ok(mlx_rs::transforms::eval([state])?),
+        )
     }
 
     /// Training forward with **per-main-block gradient checkpointing** (sc-4874). Identical compute
@@ -504,6 +711,41 @@ impl ZImageTransformer {
         let sh = x.shape();
         let prep = self.prepare((sh[0], sh[1], sh[2], sh[3]), cap_feats)?;
         self.forward_with_budgeted(&prep, x, timestep, plan)
+    }
+
+    /// [`forward_budgeted`](Self::forward_budgeted) with a bounded transformer-residency window —
+    /// the public, DiT-level entry for ladder rung 4 (SC-15754).
+    ///
+    /// `window_size` is the number of consecutive unified blocks held materialized at once; a size at
+    /// or above the stack degenerates to one all-covering window, which is the resident schedule run
+    /// through the same code path (that is deliberately available, so a parity test compares the
+    /// windowed forward against the *same* driver rather than a second implementation).
+    ///
+    /// Exists as a public surface — rather than only the `pub(crate)` windowed forward — so the
+    /// equivalence, adapter-identity and cancellation tests can drive one whole DiT forward without
+    /// standing up a denoise loop, mirroring the rung-3 `forward_budgeted` entry.
+    pub fn forward_windowed(
+        &self,
+        x: &Array,
+        timestep: f32,
+        cap_feats: &Array,
+        plan: AttentionPlan<'_>,
+        window_size: usize,
+        cancel: &mlx_gen::CancelFlag,
+    ) -> Result<Array> {
+        let sh = x.shape();
+        let prep = self.prepare((sh[0], sh[1], sh[2], sh[3]), cap_feats)?;
+        let block_plan = mlx_gen::block_residency::BlockPlan::new(self.layers.len(), window_size)?;
+        self.forward_with_rungs(
+            &prep,
+            x,
+            timestep,
+            plan,
+            Some(crate::block_stream::BlockWindow {
+                plan: block_plan,
+                cancel,
+            }),
+        )
     }
 
     /// Step-invariant half of [`patchify`](Self::patchify): the caption + image position-ids, keep

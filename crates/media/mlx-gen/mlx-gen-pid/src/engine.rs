@@ -196,7 +196,7 @@ pub fn resolve_pid_decoder_at_sigma(
             "{model_id}: use_pid was requested but no PiD decoder is loaded (load with LoadSpec::pid)"
         ))
     })?;
-    Ok(Some(mint_planned_decoder(
+    Ok(Some(mint_planned_decoder_with_tiling(
         engine,
         model_id,
         &req.prompt,
@@ -205,7 +205,52 @@ pub fn resolve_pid_decoder_at_sigma(
         capture_sigma,
         base_seed,
         req.cancel.clone(),
+        selected_decode_tiling(req),
     )?))
+}
+
+/// The decode tile geometry a request explicitly selected, or `None` for the auto-plan (SC-15510).
+///
+/// This is the request half of the PiD reconciliation: before it, the student always planned its own
+/// tiling and a bounded-decode selection had to be refused at admission because honouring it was
+/// impossible. `Some` requires **both** the rung-2 signal and an explicit edge — the boolean is the
+/// switch and the parameter is only the value, so a request that turned the rung on without naming a
+/// geometry still gets the auto-plan rather than a fabricated one.
+///
+/// Pure, so the (easy to get subtly wrong) precedence is unit-testable without weights.
+///
+/// # Obligation on the adopting provider — read before wiring rung 2 with a PiD overlay
+///
+/// This is a **shared, provider-agnostic** seam: [`resolve_pid_decoder_at_sigma`] is reached by every
+/// PiD-eligible MLX provider. Today only `mlx-gen-z-image` populates
+/// [`GenerationMemory::decode_tile_edge`](mlx_gen::gen_core::GenerationMemory), so this returns `None`
+/// everywhere else and every other provider keeps the auto-plan byte-for-byte.
+///
+/// That changes the moment a second provider's image-memory adoption starts emitting **its native VAE
+/// ladder** into that field. Native VAE tiles (Z-Image's are 512-768 output px; Qwen's probe ladder
+/// runs 256-768) are **not legal PiD tiles** — the student decodes a `scale×` super-resolved output
+/// and its edges are [`TILE_ALIGN`](crate::budget::TILE_ALIGN)-aligned multiples from
+/// [`MIN_TILE_EDGE`](crate::budget::MIN_TILE_EDGE) up. So a `use_pid` + rung-2 request on such a
+/// provider would flip from "auto-plan, works" to a hard
+/// [`validate_tile`](crate::budget::validate_tile) rejection.
+///
+/// **The provider owns that, and it is deliberate that this seam does not paper over it.** Silently
+/// falling back to the auto-plan when the selected edge is not a legal PiD tile would execute a
+/// different strategy than the selector chose, which is the exact failure the shared contract forbids
+/// — so an out-of-domain edge must be loud. What an adopting provider has to do is refuse the
+/// combination at *admission*, where it has the route in hand: Z-Image's `image_memory::safety_check`
+/// validates the decode parameters against the route's own candidate domain and rejects a native
+/// geometry under `use_pid` (and vice versa) before a request ever reaches here. Copy that shape.
+pub fn selected_decode_tiling(req: &GenerationRequest) -> Option<(i32, i32)> {
+    let memory = req.memory?;
+    if !memory.tile_vae_decode {
+        return None;
+    }
+    let edge = memory.decode_tile_edge?;
+    let overlap = memory
+        .decode_overlap
+        .unwrap_or(crate::budget::DEFAULT_TILE_OVERLAP as u32);
+    Some((edge as i32, overlap as i32))
 }
 
 /// Mint a per-generation [`PidDecoder`] with the F-013/sc-10087 decode policy — budget `guard` →
@@ -237,6 +282,49 @@ pub fn mint_planned_decoder(
     seed: u64,
     cancel: CancelFlag,
 ) -> Result<PidDecoder> {
+    mint_planned_decoder_with_tiling(
+        engine,
+        model_id,
+        prompt,
+        width,
+        height,
+        capture_sigma,
+        seed,
+        cancel,
+        None,
+    )
+}
+
+/// [`mint_planned_decoder`] with an optional **externally selected** `(tile_edge, overlap)` —
+/// SC-15510's reconciliation of the PiD planner with the shared image-memory contract.
+///
+/// `None` is the historical behaviour, unchanged: the auto-plan decides, and a whole-image decode
+/// stays whole. `Some((edge, overlap))` is a bounded-decode selection the worker made from the
+/// provider's published candidates, so it is **honoured rather than re-derived**:
+///
+/// - the geometry is validated against the planner's own invariants
+///   ([`budget::validate_tile`](crate::budget::validate_tile)) — an out-of-domain edge is a typed
+///   rejection, never a silent fallback to a different plan, because "executed a different strategy
+///   than the selector chose" is exactly what the contract forbids;
+/// - the budget [`guard`](crate::budget::guard) still runs, so a machine that cannot hold the
+///   output-resolution buffers at all is still refused;
+/// - tiling is **forced** even when the whole output would fit, mirroring
+///   [`GenerationMemory::tile_vae_decode`](mlx_gen::gen_core::GenerationMemory)'s documented meaning
+///   ("force the bounded decode even below its automatic tiling threshold"). A selection that asked
+///   for a bounded decode and silently got an unbounded one would be a false green in the calibration
+///   evidence.
+#[allow(clippy::too_many_arguments)]
+pub fn mint_planned_decoder_with_tiling(
+    engine: &PidEngine,
+    model_id: &str,
+    prompt: &str,
+    width: u32,
+    height: u32,
+    capture_sigma: f32,
+    seed: u64,
+    cancel: CancelFlag,
+    selected: Option<(i32, i32)>,
+) -> Result<PidDecoder> {
     let safe_gib = mlx_gen::memory::safe_budget_gib();
     let scale = engine.scale();
     let cfg = engine.config();
@@ -245,12 +333,21 @@ pub fn mint_planned_decoder(
         (height * scale as u32) as i32,
         (width * scale as u32) as i32,
     );
-    let plan = crate::budget::plan_tile_edge(1, th, tw, cfg.patch_size, cfg.hidden_size, safe_gib);
     let mut decoder = engine
         .decoder(prompt, capture_sigma, seed)?
         .with_cancel(cancel);
-    if !plan.whole_fits {
-        decoder = decoder.with_tiling(plan.edge, plan.overlap);
+    match selected {
+        Some((edge, overlap)) => {
+            crate::budget::validate_tile(model_id, edge, overlap, th, tw)?;
+            decoder = decoder.with_tiling(edge, overlap);
+        }
+        None => {
+            let plan =
+                crate::budget::plan_tile_edge(1, th, tw, cfg.patch_size, cfg.hidden_size, safe_gib);
+            if !plan.whole_fits {
+                decoder = decoder.with_tiling(plan.edge, plan.overlap);
+            }
+        }
     }
     Ok(decoder)
 }
@@ -425,5 +522,86 @@ mod tests {
         assert!(resolve_pid_decoder(None, &req, 0, "flux")
             .unwrap()
             .is_none());
+    }
+}
+
+#[cfg(test)]
+mod selected_tiling_tests {
+    use super::*;
+    use mlx_gen::gen_core::GenerationMemory;
+
+    fn req(memory: Option<GenerationMemory>) -> GenerationRequest {
+        GenerationRequest {
+            prompt: "a fox".to_owned(),
+            use_pid: true,
+            memory,
+            ..Default::default()
+        }
+    }
+
+    /// The auto-plan is the default and stays the default: no memory block, a staged-only selection,
+    /// and a rung-2 selection that names no geometry all leave the planner in charge. This is what
+    /// keeps every pre-SC-15510 PiD render byte-identical.
+    #[test]
+    fn the_auto_plan_survives_everything_that_does_not_name_a_geometry() {
+        assert_eq!(selected_decode_tiling(&req(None)), None);
+        assert_eq!(
+            selected_decode_tiling(&req(Some(GenerationMemory::default()))),
+            None
+        );
+        assert_eq!(
+            selected_decode_tiling(&req(Some(GenerationMemory {
+                tile_vae_decode: true,
+                ..Default::default()
+            }))),
+            None,
+            "the rung-2 signal without an edge must not fabricate one"
+        );
+        // An edge WITHOUT the rung-2 signal is inert too — the boolean is the switch.
+        assert_eq!(
+            selected_decode_tiling(&req(Some(GenerationMemory {
+                decode_tile_edge: Some(2048),
+                ..Default::default()
+            }))),
+            None
+        );
+    }
+
+    #[test]
+    fn a_named_geometry_is_honoured_and_the_overlap_defaults_to_the_students_own() {
+        assert_eq!(
+            selected_decode_tiling(&req(Some(GenerationMemory {
+                tile_vae_decode: true,
+                decode_tile_edge: Some(2048),
+                decode_overlap: Some(256),
+                ..Default::default()
+            }))),
+            Some((2048, 256))
+        );
+        assert_eq!(
+            selected_decode_tiling(&req(Some(GenerationMemory {
+                tile_vae_decode: true,
+                decode_tile_edge: Some(1536),
+                ..Default::default()
+            }))),
+            Some((1536, crate::budget::DEFAULT_TILE_OVERLAP)),
+            "an unnamed overlap falls back to the student's own default, not to zero"
+        );
+    }
+
+    /// A geometry from the *native VAE* route reaches the validator as-is and is refused there — it is
+    /// never quietly re-planned, because executing a different strategy than the selector chose is
+    /// exactly what the shared contract forbids.
+    #[test]
+    fn a_native_vae_geometry_is_passed_through_to_be_refused_not_silently_replanned() {
+        let selected = selected_decode_tiling(&req(Some(GenerationMemory {
+            tile_vae_decode: true,
+            decode_tile_edge: Some(512),
+            decode_overlap: Some(64),
+            ..Default::default()
+        })));
+        assert_eq!(selected, Some((512, 64)));
+        let (edge, overlap) = selected.unwrap();
+        assert!(crate::budget::validate_tile("t", edge, overlap, 4096, 4096).is_err());
     }
 }

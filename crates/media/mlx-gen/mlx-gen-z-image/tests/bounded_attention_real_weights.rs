@@ -323,6 +323,7 @@ fn the_saving_comes_from_the_per_chunk_eval_barrier() {
             &cap,
             0,
             budget,
+            None,
             &CancelFlag::default(),
             &mut |_| {},
         )

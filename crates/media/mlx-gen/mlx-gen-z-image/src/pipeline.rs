@@ -78,6 +78,8 @@ pub fn slice_valid(encoder_out: &Array, num_valid: i32) -> Result<Array> {
 ///
 /// Mirrors the fork's loop: `timestep = 1 - sigma[t]` (the transformer applies its own
 /// `t_scale`), `latents += (sigma[t+1] - sigma[t]) * velocity`.
+/// `block_window` is ladder rung 4 (SC-15754): `Some(n)` streams the unified stack `n` blocks at a
+/// time instead of running the resident one; `None` is the historical forward, untouched.
 #[allow(clippy::too_many_arguments)]
 pub fn denoise_with_progress(
     transformer: &ZImageTransformer,
@@ -88,6 +90,7 @@ pub fn denoise_with_progress(
     cap_feats: &Array,
     start_step: usize,
     budget: AttentionBudget,
+    block_window: Option<usize>,
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
@@ -104,8 +107,11 @@ pub fn denoise_with_progress(
     // The cancel flag joins the budget here so a bounded call can stop between chunks (SC-15615);
     // the unbounded fast path has no boundary, so this is inert for every unselected request.
     let plan = AttentionPlan::budgeted(budget).with_cancel(cancel);
+    // Rung 4 (SC-15754): the window is built once for the whole loop (it is loop-constant), and the
+    // per-window cancellation check inside `run_windowed` joins the per-step one below.
+    let window = transformer.block_window(block_window, cancel)?;
     let predict =
-        |x: &Array, timestep: f32| transformer.forward_with_budgeted(&prep, x, timestep, plan);
+        |x: &Array, timestep: f32| transformer.forward_with_rungs(&prep, x, timestep, plan, window);
     let start = start_step.min(scheduler.sigmas.len().saturating_sub(1));
     run_flow_sampler(
         sampler_name,
@@ -137,6 +143,7 @@ pub fn denoise(
         cap_feats,
         0,
         AttentionBudget::UNBOUNDED,
+        None,
         &CancelFlag::default(),
         &mut |_| {},
     )
@@ -174,6 +181,7 @@ pub fn denoise_cfg_with_progress(
     guidance: f32,
     start_step: usize,
     budget: AttentionBudget,
+    block_window: Option<usize>,
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
@@ -188,13 +196,16 @@ pub fn denoise_cfg_with_progress(
     };
     let g = Array::from_slice(&[guidance], &[1]);
     let plan = AttentionPlan::budgeted(budget).with_cancel(cancel);
+    // Rung 4 covers BOTH CFG forwards — the uncond pass runs the same 30 blocks and would otherwise
+    // re-materialize the whole stack resident, leaving the bound half-applied.
+    let window = transformer.block_window(block_window, cancel)?;
     // Same FLOW / `1 - sigma` convention + unified curated-sampler routing as the base loop; the only
     // delta is the per-step CFG combine of two velocities.
     let predict = |x: &Array, timestep: f32| -> Result<Array> {
-        let v_cond = transformer.forward_with_budgeted(&prep, x, timestep, plan)?;
+        let v_cond = transformer.forward_with_rungs(&prep, x, timestep, plan, window)?;
         match &neg_prep {
             Some(np) => {
-                let v_uncond = transformer.forward_with_budgeted(np, x, timestep, plan)?;
+                let v_uncond = transformer.forward_with_rungs(np, x, timestep, plan, window)?;
                 // v = v_uncond + guidance·(v_cond − v_uncond).
                 let delta = v_cond.subtract(&v_uncond)?;
                 Ok(v_uncond.add(&delta.multiply(&g)?)?)
@@ -232,6 +243,7 @@ pub fn denoise_control_with_progress(
     control_context_scale: f32,
     start_step: usize,
     budget: AttentionBudget,
+    block_window: Option<usize>,
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
@@ -243,14 +255,16 @@ pub fn denoise_control_with_progress(
     // Same unified-framework routing as the base loop (epic 7114 P3), with the control branch in the
     // `predict` closure (the fork's `ZImageControl._control_predict`).
     let plan = AttentionPlan::budgeted(budget).with_cancel(cancel);
+    let window = transformer.control_block_window(block_window, cancel)?;
     let predict = |x: &Array, timestep: f32| {
-        transformer.forward_with_control_budgeted(
+        transformer.forward_with_control_rungs(
             &prep,
             x,
             timestep,
             control_context_scale,
             None,
             plan,
+            window,
         )
     };
     let start = start_step.min(scheduler.sigmas.len().saturating_sub(1));
@@ -296,6 +310,7 @@ pub fn denoise_control_cfg_with_progress(
     control_context_scale: f32,
     start_step: usize,
     budget: AttentionBudget,
+    block_window: Option<usize>,
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
@@ -314,27 +329,30 @@ pub fn denoise_control_cfg_with_progress(
     };
     let g = Array::from_slice(&[guidance], &[1]);
     let plan = AttentionPlan::budgeted(budget).with_cancel(cancel);
+    let window = transformer.control_block_window(block_window, cancel)?;
     // Same FLOW / `1 - sigma` convention + unified curated-sampler routing as the base CFG loop; the
     // delta vs `denoise_cfg_with_progress` is that each forward runs the control branch (constant
     // control context + scale threaded through every step, the fork's `ZImageControl._control_predict`).
     let predict = |x: &Array, timestep: f32| -> Result<Array> {
-        let v_cond = transformer.forward_with_control_budgeted(
+        let v_cond = transformer.forward_with_control_rungs(
             &prep,
             x,
             timestep,
             control_context_scale,
             None,
             plan,
+            window,
         )?;
         match &neg_prep {
             Some(np) => {
-                let v_uncond = transformer.forward_with_control_budgeted(
+                let v_uncond = transformer.forward_with_control_rungs(
                     np,
                     x,
                     timestep,
                     control_context_scale,
                     None,
                     plan,
+                    window,
                 )?;
                 // v = v_uncond + guidance·(v_cond − v_uncond).
                 let delta = v_cond.subtract(&v_uncond)?;
@@ -517,10 +535,76 @@ pub(crate) fn decode_tiling(req: &GenerationRequest, is_sequential: bool) -> Opt
     // SC-15615: the shared selector's explicit bounded-decode signal (`GenerationMemory::tile_vae_decode`)
     // joins the two historical triggers. The ladder is cumulative — a selector that picks rung 3
     // (bounded attention) also sets rung 2 — so without this a contract-driven rung-3 selection on a
-    // `Resident` load would silently decode untiled. `Some` is still exactly the same 512/64 policy.
+    // `Resident` load would silently decode untiled.
+    //
+    // SC-15510: the tile geometry is no longer hardcoded. A selection carries the exact edge/overlap
+    // it was calibrated at, from the ladder the contract publishes; the two historical triggers, and
+    // a selection that names no geometry, keep the 512/64 default this VAE was tuned at (sc-13571).
+    // Publishing a one-element candidate list was what blocked SC-15508's "a single-point pass cannot
+    // mark untested production parameters Verified".
     let requested = req.memory.is_some_and(|m| m.tile_vae_decode);
-    (is_sequential || requested || req.width.max(req.height) > 2048)
-        .then(|| TilingConfig::spatial_only(512, 64))
+    (is_sequential || requested || req.width.max(req.height) > 2048).then(|| {
+        let (edge, overlap) = decode_tile_geometry(req);
+        TilingConfig::spatial_only(edge as i32, overlap as i32)
+    })
+}
+
+/// The (edge, overlap) a request decodes at: the selection's values when it names them, else the
+/// provider default. Pure, so the ladder's plumbing is unit-testable without a VAE.
+pub(crate) fn decode_tile_geometry(req: &GenerationRequest) -> (u32, u32) {
+    let memory = req.memory;
+    (
+        memory
+            .and_then(|m| m.decode_tile_edge)
+            .unwrap_or(crate::image_memory::DECODE_TILE_EDGE),
+        memory
+            .and_then(|m| m.decode_overlap)
+            .unwrap_or(crate::image_memory::DECODE_OVERLAP),
+    )
+}
+
+/// The transformer-residency window for one request (SC-15754, ladder rung 4).
+///
+/// [`GenerationMemory::stream_transformer_blocks`] is the shared selector's rung-4 signal and
+/// `transformer_window_size` its parameter; a selection that sets the flag without a size falls back
+/// to the provider's default window. `None` — every request that did not select rung 4 — is the
+/// historical resident stack, untouched.
+pub(crate) fn block_window_size(req: &GenerationRequest) -> Option<usize> {
+    let memory = req.memory?;
+    memory.stream_transformer_blocks.then(|| {
+        memory
+            .transformer_window_size
+            .unwrap_or(crate::image_memory::TRANSFORMER_WINDOW_SIZE) as usize
+    })
+}
+
+/// [`block_window_size`] plus the residency-policy precondition, shared by all four generators.
+///
+/// **Why this rejects instead of degrading.** Streaming bounds transformer residency only if the
+/// resident `layers` are *not* also materialized. Under `Sequential` they are not — the heavy bundle
+/// is rebuilt per generate, its blocks are unevaluated lazy handles (SC-15744 measured 1073 handles at
+/// 0.0 MiB), and a windowed forward never touches them, so they stay at ~0 bytes. Under `Resident` the
+/// same generator serves many requests, so after the first ordinary render the blocks ARE materialized
+/// and a window would be *added on top of* them: strictly more memory and strictly slower.
+///
+/// Rung 1 resolves the same load-time-vs-request-time seam by silently yielding resident behaviour.
+/// Rung 4 must not: a silent degradation here writes a rung-4 row into the calibration evidence for a
+/// run that saved nothing, which is the false green SC-15750's own mutation check exists to prevent —
+/// one layer up, and invisible to it.
+pub(crate) fn resolve_block_window(
+    req: &GenerationRequest,
+    is_sequential: bool,
+    id: &str,
+) -> Result<Option<usize>> {
+    let window = block_window_size(req);
+    if window.is_some() && !is_sequential {
+        return Err(Error::Unsupported(format!(
+            "{id}: bounded transformer residency needs a Sequential (staged) load — on a Resident \
+             generator the trunk blocks are already materialized, so a window would add memory \
+             rather than bound it. Load with OffloadPolicy::Sequential."
+        )));
+    }
+    Ok(window)
 }
 
 /// Request-local, calibration-only fault injection at a physical phase boundary (SC-15449's
@@ -657,6 +741,7 @@ pub(crate) fn render_sample(
         0,
         // Training previews never select a memory rung; keep the unbounded (byte-identical) forward.
         AttentionBudget::UNBOUNDED,
+        None,
         cancel,
         &mut |_| {},
     )?;

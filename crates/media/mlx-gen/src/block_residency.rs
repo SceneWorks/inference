@@ -158,7 +158,12 @@ pub fn run_windowed<S>(
     for range in plan.windows() {
         if cancel.is_cancelled() {
             mlx_rs::memory::clear_cache();
-            return Err(Error::Msg("cancelled".to_owned()));
+            // The TYPED variant, not `Error::Msg("cancelled")`. `Error::Canceled` exists so the worker
+            // and the conformance harness can tell a user cancellation from a backend failure
+            // (sc-4481); a generic message here reports a cancelled render as a *failed* job. This was
+            // latent while nothing consumed the primitive — SC-15754 is its first production caller,
+            // so it would have shipped as a regression the moment rung 4 became selectable.
+            return Err(Error::Canceled);
         }
 
         let mut view = open()?;

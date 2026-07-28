@@ -67,6 +67,10 @@ pub struct ZImageControlTransformer {
     control_layers: Vec<ZImageControlBlock>,
     /// The 2-block control refiner (injects into `base.noise_refiner` at `CONTROL_REFINER_PLACES`).
     control_noise_refiner: Vec<ZImageControlBlock>,
+    /// Ladder rung 4 (SC-15754) for the 15-block main control stack. The 2-block refiner is left
+    /// resident: at ~97 MiB/block it is 2 blocks against the base stack's 30, so windowing it would
+    /// buy ~6% of the stack's weights for another 2 re-reads per step.
+    control_block_stream: Option<crate::block_stream::ZImageBlockStream>,
 }
 
 impl ZImageControlTransformer {
@@ -122,7 +126,65 @@ impl ZImageControlTransformer {
             control_x_embedder,
             control_layers,
             control_noise_refiner,
+            control_block_stream: None,
         })
+    }
+
+    /// Arm ladder rung 4 for the main control stack by recording where `control_layers` can be
+    /// re-read from (SC-15754). Called by [`crate::loader::load_control_transformer`], which is the
+    /// only place that knows the ControlNet checkpoint's source.
+    pub fn with_control_block_stream(
+        mut self,
+        source: mlx_gen::WeightsSource,
+        prefix: &str,
+    ) -> Self {
+        let base = if prefix.is_empty() {
+            "control_layers".to_owned()
+        } else {
+            format!("{prefix}.control_layers")
+        };
+        // The SAME derivation the base arm uses, not a second spelling of it — a control block is a
+        // base block plus two projections, so a divergence here would be silent.
+        let cfg = self.base.cfg.block_cfg();
+        self.control_block_stream = Some(crate::block_stream::ZImageBlockStream::new(
+            source,
+            base,
+            cfg,
+            CONTROL_LAYERS_PLACES.len(),
+            true,
+        ));
+        self
+    }
+
+    /// Whether rung 4 can execute here — it needs BOTH stacks streamable, because a control forward
+    /// runs both and the ladder bounds the transformer as a whole.
+    pub(crate) fn can_stream_blocks(&self) -> bool {
+        self.base.can_stream_blocks() && self.control_block_stream.is_some()
+    }
+
+    /// The control route's [`ZImageTransformer::block_window`]: same validation, plus the ControlNet
+    /// stack's own source. Refusing when only one of the two stacks is streamable is deliberate — a
+    /// half-bounded control forward would report a rung-4 run whose peak still carried 15 resident
+    /// control blocks.
+    pub(crate) fn control_block_window<'a>(
+        &self,
+        window_size: Option<usize>,
+        cancel: &'a mlx_gen::CancelFlag,
+    ) -> Result<Option<crate::block_stream::BlockWindow<'a>>> {
+        if window_size.is_some() && !self.can_stream_blocks() {
+            return Err(Error::Unsupported(
+                "z-image control: bounded transformer residency needs a re-openable snapshot for \
+                 BOTH the base DiT and the ControlNet checkpoint"
+                    .to_owned(),
+            ));
+        }
+        self.base.block_window(window_size, cancel)
+    }
+
+    /// See [`ZImageTransformer::capture_block_adapters`]. Only the base stack can carry adapters —
+    /// this type's [`AdaptableHost`] routes every path to the composed base DiT.
+    pub fn capture_block_adapters(&mut self) {
+        self.base.capture_block_adapters();
     }
 
     /// Quantize to Q4/Q8 (group_size 64) — the base transformer plus every control block, but
@@ -137,6 +199,10 @@ impl ZImageControlTransformer {
         }
         for block in &mut self.control_noise_refiner {
             block.quantize(bits)?;
+        }
+        // Rung 4 replays the same quantization on each materialized control block.
+        if let Some(stream) = self.control_block_stream.as_mut() {
+            stream.set_quant_bits(bits);
         }
         // control_x_embedder intentionally left dense (in-features not divisible by 64).
         Ok(())
@@ -192,6 +258,51 @@ impl ZImageControlTransformer {
                 None,
                 plan,
             ),
+        }
+    }
+
+    /// [`forward_budgeted`](Self::forward_budgeted) with a bounded transformer-residency window —
+    /// the public, DiT-level entry for ladder rung 4 (SC-15754) on the ControlNet route, so the
+    /// equivalence tests can drive one whole dual-injection forward without a denoise loop.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_windowed(
+        &self,
+        x: &Array,
+        timestep: f32,
+        cap_feats: &Array,
+        control_context: Option<&Array>,
+        control_context_scale: f32,
+        plan: AttentionPlan<'_>,
+        window_size: usize,
+        cancel: &mlx_gen::CancelFlag,
+    ) -> Result<Array> {
+        let block_plan =
+            mlx_gen::block_residency::BlockPlan::new(self.base.layers.len(), window_size)?;
+        let window = crate::block_stream::BlockWindow {
+            plan: block_plan,
+            cancel,
+        };
+        match control_context {
+            // No control context → the base transformer verbatim, windowed (the fork's short-circuit).
+            None => {
+                let sh = x.shape();
+                let prep = self.base.prepare((sh[0], sh[1], sh[2], sh[3]), cap_feats)?;
+                self.base
+                    .forward_with_rungs(&prep, x, timestep, plan, Some(window))
+            }
+            Some(cc) => {
+                let sh = x.shape();
+                let prep = self.prepare_control((sh[0], sh[1], sh[2], sh[3]), cap_feats, cc)?;
+                self.forward_with_control_rungs(
+                    &prep,
+                    x,
+                    timestep,
+                    control_context_scale,
+                    None,
+                    plan,
+                    Some(window),
+                )
+            }
         }
     }
 
@@ -303,8 +414,34 @@ impl ZImageControlTransformer {
         x: &Array,
         timestep: f32,
         control_context_scale: f32,
+        cap: Option<&mut Vec<(&'static str, Array)>>,
+        plan: AttentionPlan<'_>,
+    ) -> Result<Array> {
+        self.forward_with_control_rungs(prep, x, timestep, control_context_scale, cap, plan, None)
+    }
+
+    /// [`forward_with_control_budgeted`](Self::forward_with_control_budgeted) with ladder rung 4
+    /// (SC-15754) layered on.
+    ///
+    /// **Both** stacks are bounded when `window` is `Some`: the 15-block parallel control stack that
+    /// produces the hints, and the base DiT's 30 unified blocks that consume them. The dual-injection
+    /// schedule itself is untouched — `CONTROL_LAYERS_PLACES`, the `before_proj` seed, the per-block
+    /// `after_proj` hints and `control_context_scale` all behave exactly as on the resident path, so
+    /// the residual injected into base layer *i* is the same value regardless of window size.
+    ///
+    /// The control hints are computed for the whole stack **before** the base loop runs (that is the
+    /// fork's schedule, not a choice made here), so windowing the control stack bounds its *weights*
+    /// while its 15 hint activations stay live either way. Rung 3 is what bounds those.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_with_control_rungs(
+        &self,
+        prep: &ControlPrepared,
+        x: &Array,
+        timestep: f32,
+        control_context_scale: f32,
         mut cap: Option<&mut Vec<(&'static str, Array)>>,
         plan: AttentionPlan<'_>,
+        window: Option<crate::block_stream::BlockWindow<'_>>,
     ) -> Result<Array> {
         macro_rules! record {
             ($name:expr, $a:expr) => {
@@ -364,27 +501,56 @@ impl ZImageControlTransformer {
 
         // Unify image + caption.
         let x_len = x_emb.shape()[1];
-        let mut unified = concatenate_axis(&[&x_emb, &cap_emb], 1)?;
+        let unified = concatenate_axis(&[&x_emb, &cap_emb], 1)?;
 
         // Main control pass: thread the (refined) control state + caption through the 15 control
         // layers to produce the hints for the unified main loop.
         let control_unified = concatenate_axis(&[&threaded_control, &cap_emb], 1)?;
-        let (main_hints, _) = self.run_control_blocks(
-            &self.control_layers,
-            control_unified,
-            &unified,
-            &prep.unified_freqs,
-            &t_emb,
-            plan,
-        )?;
+        let (main_hints, _) = match window {
+            None => self.run_control_blocks(
+                &self.control_layers,
+                control_unified,
+                &unified,
+                &prep.unified_freqs,
+                &t_emb,
+                plan,
+            )?,
+            Some(window) => self.run_control_blocks_windowed(
+                control_unified,
+                &unified,
+                &prep.unified_freqs,
+                &t_emb,
+                plan,
+                window,
+            )?,
+        };
         record!("main_hint0", main_hints[0]);
         record!("main_hint_last", main_hints[main_hints.len() - 1]);
 
         // Main layers (with control hints).
-        for (i, layer) in self.base.layers.iter().enumerate() {
-            unified = layer.forward_budgeted(&unified, &prep.unified_freqs, &t_emb, plan)?;
-            if let Some(n) = hint_index(&CONTROL_LAYERS_PLACES, i) {
-                unified = add_hint(&unified, &main_hints[n], control_context_scale)?;
+        let mut unified = unified;
+        match window {
+            None => {
+                for (i, layer) in self.base.layers.iter().enumerate() {
+                    unified =
+                        layer.forward_budgeted(&unified, &prep.unified_freqs, &t_emb, plan)?;
+                    if let Some(n) = hint_index(&CONTROL_LAYERS_PLACES, i) {
+                        unified = add_hint(&unified, &main_hints[n], control_context_scale)?;
+                    }
+                }
+            }
+            Some(window) => {
+                unified = self.base.run_windowed_layers_with_hints(
+                    unified,
+                    &prep.unified_freqs,
+                    &t_emb,
+                    plan,
+                    window,
+                    &mut |state: &Array, i: usize| match hint_index(&CONTROL_LAYERS_PLACES, i) {
+                        Some(n) => add_hint(state, &main_hints[n], control_context_scale),
+                        None => Ok(state.clone()),
+                    },
+                )?;
             }
         }
         record!("unified_main", unified);
@@ -424,6 +590,80 @@ impl ZImageControlTransformer {
             c = block.base.forward_budgeted(&c, freqs_cis, t_emb, plan)?;
             hints.push(block.after_proj().forward(&c)?);
         }
+        Ok((hints, c))
+    }
+
+    /// [`run_control_blocks`](Self::run_control_blocks) for the main control stack under a residency
+    /// window (SC-15754) — same VACE threading, same `before_proj` seed on block 0, same per-block
+    /// `after_proj` hint, but each block is materialized from the ControlNet checkpoint and released
+    /// with its window.
+    ///
+    /// The carried state a window must materialize before releasing is BOTH the threaded control
+    /// state `c` **and** the hints produced so far: a hint is `after_proj(c)`, an unevaluated node
+    /// still referencing that block's projection weights, so evaluating only `c` would leave the
+    /// hints holding the window alive and the bound would silently not hold. `run_windowed`'s
+    /// `materialize` hook receives the whole carried tuple, which is exactly why it is a closure over
+    /// the state rather than a fixed `eval` of one array.
+    fn run_control_blocks_windowed(
+        &self,
+        c: Array,
+        x_base: &Array,
+        freqs_cis: &Array,
+        t_emb: &Array,
+        plan: AttentionPlan<'_>,
+        window: crate::block_stream::BlockWindow<'_>,
+    ) -> Result<(Vec<Array>, Array)> {
+        let stream = self.control_block_stream.as_ref().ok_or_else(|| {
+            Error::Msg(
+                "z-image control: bounded transformer residency was requested but the ControlNet \
+                 checkpoint has no re-openable weights source"
+                    .to_owned(),
+            )
+        })?;
+        // The control stack is shorter than the base stack (15 vs 30), so it gets its own plan at the
+        // same window size rather than the base plan — `BlockPlan::new` clamps a window larger than
+        // the stack, so a 30-wide window degenerates to one control window rather than erroring.
+        // The same invariant the base stack asserts (`run_windowed_layers_with_hints`): the plan, the
+        // stream and the resident stack must describe the same blocks. Both derive from
+        // `CONTROL_LAYERS_PLACES.len()` today so they cannot diverge — which is exactly why an
+        // assertion is cheap, and why dropping it on one of the two arms is the asymmetry worth
+        // closing rather than the risk worth taking.
+        if stream.n_blocks() != self.control_layers.len() {
+            return Err(Error::Msg(format!(
+                "z-image control: the block stream covers {} blocks but the control stack has {}",
+                stream.n_blocks(),
+                self.control_layers.len()
+            )));
+        }
+        let control_plan = mlx_gen::block_residency::BlockPlan::new(
+            self.control_layers.len(),
+            window.plan.window(),
+        )?;
+        let (hints, c) = mlx_gen::block_residency::run_windowed(
+            &control_plan,
+            window.cancel,
+            (Vec::<Array>::with_capacity(self.control_layers.len()), c),
+            || stream.open(),
+            |(mut hints, mut c), view, range| {
+                for i in range {
+                    let block = stream.materialize_control(view, i)?;
+                    if i == 0 {
+                        let bp = block.before_proj().ok_or_else(|| {
+                            Error::Msg("z-image control block 0 is missing before_proj".into())
+                        })?;
+                        c = add(&bp.forward(&c)?, x_base)?;
+                    }
+                    c = block.base.forward_budgeted(&c, freqs_cis, t_emb, plan)?;
+                    hints.push(block.after_proj().forward(&c)?);
+                }
+                Ok((hints, c))
+            },
+            |(hints, c): &(Vec<Array>, Array)| {
+                Ok(mlx_rs::transforms::eval(
+                    hints.iter().chain(std::iter::once(c)),
+                )?)
+            },
+        )?;
         Ok((hints, c))
     }
 }

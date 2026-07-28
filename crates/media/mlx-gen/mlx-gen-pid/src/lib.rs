@@ -41,8 +41,8 @@ pub use caption::CaptionEncoder;
 pub use config::{CaptionConfig, ConvPadding, PidConfig, RopeMode, SampleType, SamplerConfig};
 pub use decoder::PidDecoder;
 pub use engine::{
-    flow_capture_for_request, mint_planned_decoder, resolve_pid_decoder,
-    resolve_pid_decoder_at_sigma, PidEngine,
+    flow_capture_for_request, mint_planned_decoder, mint_planned_decoder_with_tiling,
+    resolve_pid_decoder, resolve_pid_decoder_at_sigma, PidEngine,
 };
 pub use gemma2::{Gemma2, Gemma2Config};
 pub use lq::{LqAdapter, PidNet};
