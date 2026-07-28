@@ -336,11 +336,19 @@ pub fn conditioning_is_forwarded(
 /// because the guard read the local, not the argument. That is the identical shape to the finding it
 /// was written for, one seam further along.
 ///
-/// Bundling the resolved values with the request booleans removes the second seam instead of
-/// documenting it. There is no longer a separate `edit` argument to null out, and
-/// [`Self::check`] runs inside [`StableAudio3Pipeline::synthesize_conditioned`] — the far side of the
-/// boundary — so nulling a *field* is refused there. The residual single-token edit is changing
-/// both a field and its matching boolean, which is two tokens.
+/// Bundling the resolved values with the request booleans **moves** that seam rather than removing
+/// it. [`Self::check`] runs inside [`StableAudio3Pipeline::synthesize_conditioned`] — the far side
+/// of the boundary — so nulling a *field* is refused there, and the single-token edit on the
+/// receipt itself becomes two tokens (a field and its matching boolean).
+///
+/// What is **not** claimed is that the nullable argument is gone. `synthesize_conditioned`
+/// destructures this receipt and forwards `edit` to
+/// `StableAudio3Pipeline::synthesize_traced` as a plain argument one line later, after
+/// [`Self::check`] has already run against the receipt rather than the argument, so that forward
+/// remains a one-token site. It is caught, with weights, by `real_inpaint_…`'s bit-exact-outside
+/// assertion — the same catcher as row 7 of the per-site table in
+/// `docs/migration/SC_14548_AUDIO_EDIT_INPAINT.md`, where the mutation is recorded as row 13 with
+/// the output of the run that verified it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ForwardedConditioning<'a> {
     /// Whether the request carried a `Conditioning::ReferenceAudio` item.
@@ -714,7 +722,19 @@ pub fn edit_local_conditioning(
 }
 
 /// Whether a tensor holds any non-zero element, as an `f32` reduction on the tensor's own device.
-fn tensor_has_nonzero(tensor: &Tensor) -> Result<bool> {
+///
+/// The reduction is over `|x|`, not `x`: a conditioning tensor whose elements happen to cancel to a
+/// zero sum is still present, and a bare sum would call it absent.
+///
+/// Exported (`#[doc(hidden)]`) rather than private so the weight-free lane can drive **this**
+/// predicate instead of restating it. Its only production call site is inside
+/// `StableAudio3Pipeline::synthesize_traced`, which needs weights, and a test that reimplements
+/// the rule it is checking moves with the mutation instead of catching it — the same
+/// "asserts a value rather than derives it" shape the rest of this module is written against.
+/// `the_local_conditioning_handoff_must_still_be_present_where_it_crosses_into_the_dit` calls it,
+/// including on a deliberately sign-cancelling tensor so the `.abs()` is load-bearing there.
+#[doc(hidden)]
+pub fn tensor_has_nonzero(tensor: &Tensor) -> Result<bool> {
     let total = tensor
         .to_dtype(DType::F32)?
         .abs()?

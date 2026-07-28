@@ -65,7 +65,7 @@ use candle_audio_stable_audio_3::pipeline::{
     conditioning_is_forwarded, edit_geometry, edit_geometry_matches_request, edit_keep_mask,
     edit_local_conditioning, edit_local_conditioning_is_present, edit_region_latents,
     edit_region_samples, edit_retained_latent_count, prepare_reference_pcm, resampled_frame_count,
-    stitch_outside_region, AudioEdit, EditGeometry, SAMPLE_RATE,
+    stitch_outside_region, tensor_has_nonzero, AudioEdit, EditGeometry, SAMPLE_RATE,
 };
 use candle_audio_stable_audio_3::sampler::{
     adapt_sample_size_for_max, SampleGeometry, DEFAULT_DURATION_PADDING, LATENT_DOWNSAMPLING,
@@ -443,10 +443,12 @@ fn the_request_surface_hands_the_pipeline_the_resolved_region() {
 /// `edit` local, and the argument list of the call one line below it was a second, unchecked place
 /// to write `None`. The resolved values now travel as a `pipeline::ForwardedConditioning` receipt
 /// carrying the request booleans with them, and `synthesize_conditioned` re-checks the pair on the
-/// far side of the boundary — so there is no separate argument to null out, and nulling a field is
-/// refused there. Both of those call sites still need weights;
-/// `docs/migration/SC_14548_AUDIO_EDIT_INPAINT.md` carries the per-site table with the lane that
-/// catches each, every row verified by running the mutation.
+/// far side of the boundary — which **moves** the seam rather than removing it. Nulling a *field*
+/// on the receipt is refused there; the destructured `edit` that `synthesize_conditioned` forwards
+/// to `synthesize_traced` one line later is still a one-token site, caught with weights by
+/// `real_inpaint_…`'s bit-exact-outside assertion (row 7's catcher, recorded as row 13).
+/// All of those call sites need weights; `docs/migration/SC_14548_AUDIO_EDIT_INPAINT.md` carries
+/// the per-site table with the lane that catches each, every row verified by running the mutation.
 #[test]
 fn a_resolved_edit_must_be_the_one_the_pipeline_is_handed() {
     // Agreement in all four honest combinations.
@@ -860,13 +862,11 @@ fn the_local_conditioning_handoff_must_still_be_present_where_it_crosses_into_th
             .collect();
         let latents = Tensor::from_vec(values, (1, LATENT_CHANNELS, length), &device).unwrap();
         let local = edit_local_conditioning(&resolved, &latents, &device, DType::F32).unwrap();
-        let observed = local
-            .to_vec3::<f32>()
-            .unwrap()
-            .iter()
-            .flatten()
-            .flatten()
-            .any(|value| *value != 0.0);
+        // The *shipped* predicate, not a restatement of it. `tensor_has_nonzero` is what
+        // `synthesize_traced` calls, and that call site needs weights; computing `observed` here
+        // with a hand-rolled `any(|v| *v != 0.0)` would move with any mutation of the real one
+        // instead of catching it, so the real one is exported `#[doc(hidden)]` and driven directly.
+        let observed = tensor_has_nonzero(&local).unwrap();
         let expected = edit_retained_latent_count(&resolved) > 0;
         assert_eq!(
             expected, observed,
@@ -882,6 +882,17 @@ fn the_local_conditioning_handoff_must_still_be_present_where_it_crosses_into_th
     assert!(
         saw_retaining && saw_empty,
         "the region spread must produce both a conditioning edit and the degenerate whole-span one"
+    );
+
+    // The rows above are all non-negative — the mask is 0/1 and the synthetic latents count upward
+    // — so the `.abs()` inside the predicate is invisible on them. Drive the cancelling case
+    // directly: a tensor that sums to zero elementwise-signed is still *present*, and a bare
+    // `sum_all` would call the DiT unconditioned on a source that happens to be symmetric.
+    let cancelling = Tensor::from_vec(vec![3.0f32, -3.0, 1.5, -1.5], (1, 2, 2), &device).unwrap();
+    assert!(
+        tensor_has_nonzero(&cancelling).unwrap(),
+        "a local conditioning whose elements cancel to a zero sum is still present; the presence \
+         reduction must be over |x|"
     );
 }
 
@@ -1528,6 +1539,16 @@ fn real_inpaint_preserves_the_outside_exactly_and_changes_the_inside() {
 /// distinction is written against ACE-Step's two native tasks; upstream Stable Audio 3 has one
 /// inpaint mechanism. `pipeline::AudioEdit` carries no mode field, so this is structural — and it is
 /// asserted anyway, because a structural argument does not survive somebody adding one.
+///
+/// # What this case is structurally blind to, and why it must never be cited as a fallback catcher
+///
+/// It compares **two renders of the same code**. Any mutation on the shared edit path is applied
+/// identically to both, so the equality holds and the `energy > 1e-4` control still passes: the case
+/// is blind, by construction, to every uniform mutation — not merely to the ones tried so far.
+/// This was confirmed by running it, not reasoned: under `edit.channels` → `1` it passes **GREEN**
+/// on all six ids, while `real_extend_…` under the same mutation is RED ("the first 10 s must be
+/// the prepared source bit for bit"). Cite `real_inpaint_…` or `real_extend_…` as the catcher for a
+/// shared-path mutation; this case only gates the alias itself.
 #[test]
 #[ignore = "requires all six pinned immutable snapshots; set SA3_*_SNAPSHOT"]
 fn real_repaint_is_byte_identical_to_inpaint() {

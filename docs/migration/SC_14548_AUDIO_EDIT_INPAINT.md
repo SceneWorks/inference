@@ -156,6 +156,8 @@ Applied to the shipped code, suite re-run, reverted.
 | `edit_local_conditioning_is_present` stops rejecting the disagreement | **RED** | `the_local_conditioning_handoff_must_still_be_present_where_it_crosses_into_the_dit` |
 | `edit_retained_latent_count` ignores the padding boundary | **RED** | same case — the retained count stops agreeing with the tensor `edit_local_conditioning` builds |
 | `edit_geometry_matches_request` drops the effective-span comparison | **RED** | `the_resolved_edit_geometry_must_match_the_geometry_the_request_is_sampled_at` |
+| `tensor_has_nonzero`'s `total > 0.0` → `total >= 0.0` | **RED** | `the_local_conditioning_handoff_must_still_be_present_where_it_crosses_into_the_dit` — "[0s, 16s): the retained-latent count and the built tensor must agree on whether the DiT is conditioned at all, left: false right: true" |
+| `tensor_has_nonzero` drops the `.abs()` before `sum_all` | **RED** | same case — "a local conditioning whose elements cancel to a zero sum is still present; the presence reduction must be over \|x\|" |
 
 ### Every weights-only call site on the edit path, mutated and run
 
@@ -174,30 +176,56 @@ weights. What the table records is which case fails, and how fast.
 | # | site → mutation | result | what the run reported |
 |---|---|---|---|
 | 1 | `prepare_and_encode(..., edit.sample_rate, ...)` → `SAMPLE_RATE` | **RED** | `real_inpaint…`: "frame 0 channel 0 is outside [2s, 4s) and must be the prepared source exactly" |
-| 2 | `prepare_and_encode(..., edit.channels, ...)` → `1` | **GREEN** | see below — the inpaint fixture's source is **mono**, so this is a no-op there |
+| 2 | `prepare_and_encode(..., edit.channels, ...)` → `1` | **GREEN** on `real_inpaint…` / `real_repaint…`, **RED** on `real_extend…` | see below — the inpaint fixture's source is **mono**, so this is a no-op there. `real_extend…`: "the first 10 s must be the prepared source bit for bit" |
 | 3 | `edit_geometry(&edit, &geometry, parameters.duration_secs)` → `edit.end_secs` | **RED** | `real_inpaint…`: "the edit's effective span covers 44 latents, but the request's own duration covers 65" (`edit_geometry_matches_request`, new) |
 | 4 | `local = edit_local_conditioning(…)` → `let _ = …` | **RED**, 15 s | `real_inpaint…`: "an audio edit whose keep mask retains source latents (true) must reach the DiT as non-zero local conditioning, saw false" (`edit_local_conditioning_is_present`, new) |
 | 5 | `edit_local_conditioning(&resolved, &latents, …)` → `&latents.ones_like()?` | **RED** | `real_inpaint…`: "two inpaints differing only in their source rendered the *identical* interior, which is what an unconditioned region looks like" |
 | 6 | `edit_state = Some((prepared, resolved))` → `None` | **RED** | `real_inpaint…`: the same presence guard, in the *other* direction — "retains source latents (false) … saw true" |
 | 7 | `stitch_outside_region(&audio, prepared, resolved)` → `audio` | **RED** | `real_inpaint…`: "frame 0 channel 0 is outside [2s, 4s) and must be the prepared source exactly" |
-| 8 | `&local` argument to `self.sample(…)` → `&local.zeros_like()?` (*after* the presence guard) | **RED** | `real_inpaint…`: the source-sensitivity byte-inequality |
+| 8 | `&local` argument to `self.sample(…)` → `&local.zeros_like()?` (*after* the presence guard) | **RED**, 16 s | `real_inpaint…`: "two inpaints differing only in their source rendered the *identical* interior, which is what an unconditioned region looks like" — the `conditioning_divergence` byte-inequality |
 | 9 | `init_latents` left `None` on the edit path → `Some(latents.clone())` | **RED** | `real_inpaint…`: "reference-audio init latents and the reference itself must be supplied together, saw init_latents=true reference=false" — sc-14547's `reference_halves_agree`, catching an sc-14548 mutation |
 | 10 | `order = Some(ReferenceDrawOrder {…})` in the edit arm → `None` | **RED** | `real_edit_initial_sampler_noise_precedes_the_source_encode`: "an edit render reports its draw order" |
 | 11 | receipt field `edit: audio_edit_for(request)` → `None` | **RED** | `real_inpaint…`: "a request carrying an audio edit (true) must forward it to the pipeline, saw false" |
 | 12 | receipt field `request_has_edit: …any(…)` → `false` | **RED** | `real_inpaint…`: "a request carrying an audio edit (false) must forward it to the pipeline, saw true" |
+| 13 | the `edit` the receipt is destructured into, forwarded to `synthesize_traced` one line after `conditioning.check()` → `None` | **RED**, 14 s | `real_inpaint…` at `tests/audio_edit.rs:1458`: "stable_audio_3_small_music: frame 0 channel 0 is outside [2s, 4s) and must be the prepared source exactly — left: -0.027633887, right: -0.44984582" |
 
 Rows 11 and 12 are new coverage, not a restatement. Round-1 checked the forward where the values were
 **computed** and left the call's own argument list unguarded — writing `None` in the argument slot
 satisfied that guard, because the guard read the local. The resolved values now travel as a
 `pipeline::ForwardedConditioning` receipt carrying the request booleans with them, re-checked inside
-`synthesize_conditioned`, so there is no separate argument to null and nulling a field is refused.
+`synthesize_conditioned`.
+
+**What that receipt does is *move* the nullable seam out of `generate` and into
+`synthesize_conditioned` — it does not remove it, and the earlier claim in this document that there
+was "no longer a separate `edit` argument to null out" was false.** Round-2 review ran it. Inside
+`synthesize_conditioned` the receipt is checked and then destructured, and the destructured `edit` is
+forwarded to `synthesize_traced` as a plain argument one line later; `check()` reads the receipt, not
+the argument, so `edit` → `None` there is still one token. It is **row 13** above, and it is caught —
+by row 7's catcher, the bit-exact-outside assertion in `real_inpaint_…`, with weights. What the
+receipt buys is that nulling a *field* is refused, so the single-token edit on the receipt itself
+becomes two tokens (a field plus its matching boolean). The three sites that carried the false
+wording — `pipeline.rs`'s `ForwardedConditioning` doc, `tests/audio_edit.rs`'s
+`a_resolved_edit_must_be_the_one_the_pipeline_is_handed` doc, and this paragraph — now say that.
 
 **Row 2 is a real hole in the fixture, not in the code, and it is left open deliberately.** The
 inpaint case's source is a 48 kHz **mono** clip, so hard-coding `1` for `edit.channels` changes
-nothing there and the case ran to completion green on all six ids. `real_repaint_…` and
-`real_extend_…` both use stereo sources and would see it; a fixture-level fix (making the inpaint
-source stereo) would move the row rather than close the class, since the mutation would then be
-invisible on a mono request instead. Stated here rather than silently omitted.
+nothing there and the case ran to completion green on all six ids. The catcher is
+`real_extend_…` — and **only** that case: run under the same mutation it is RED with "the first 10 s
+must be the prepared source bit for bit". A fixture-level fix (making the inpaint source stereo)
+would move the row rather than change the class, since the mutation would then be invisible on a mono
+request instead. Stated here rather than silently omitted.
+
+An earlier version of this paragraph also named `real_repaint_is_byte_identical_to_inpaint` as a
+catcher. That was reasoned rather than run, and running it disproved it: under the same mutation the
+case is **GREEN** on all six ids (414 s). The general property, worth stating once because it applies
+to every row of this table and not just this one:
+
+> **`real_repaint_is_byte_identical_to_inpaint` compares two renders of the same code, so it is
+> structurally blind to any mutation applied uniformly to both.** Both renders are mutated
+> identically, the equality holds, and the `energy > 1e-4` non-silence control still passes. It gates
+> the `Repaint` ≡ `Inpaint` alias and nothing else. For a shared-path mutation the catcher to name is
+> `real_inpaint_…` or `real_extend_…`. The same note is recorded on the case itself, so a future
+> reader of the source reaches it without this document.
 
 **Row 9** was expected to be the weak one and is not. The edit path deliberately leaves
 `init_latents` at `None` — an edit starts from pure seeded noise and the source reaches the model
@@ -234,9 +262,13 @@ Outside the region: **bit-exact** against `prepare_reference_pcm`'s own output, 
 | `stable_audio_3_small_sfx_base` | 0.072861 | 0.068967 | 0.225991 |
 | `stable_audio_3_medium_base` | 0.022110 | 0.018060 | 0.178970 |
 
-The first two columns are re-measured on the current tree and move in the sixth decimal against the
-round-1 numbers (`0.049032` → `0.049025`, and so on) — Metal reduction order, not a behaviour change.
-The third column is new; see below.
+All three columns are **run-to-run unstable in the fifth decimal on Metal** — reduction order, not a
+behaviour change. Measured across three separate `--release` runs of this suite on the same tree, the
+`small_music` row reported `source_divergence` `0.049025`/`0.049032`, `seed_divergence`
+`0.060849`/`0.060890` and `conditioning_divergence` `0.164266`/`0.164221`. The tables in this section
+are one such run and should be read to about four significant figures; every floor below is set far
+enough back that this spread cannot move a verdict. Do not treat a digit here as a pin. The third
+column is new; see below.
 
 **The first calibration was wrong and is recorded rather than rewritten.** The case originally
 asserted a single measurement — `source_divergence > 0.25 * source_energy` — against a number picked
@@ -302,6 +334,15 @@ combinations, plus the agreement between `edit_retained_latent_count` and the te
 `edit_local_conditioning` actually builds); what the real-weight lane gets is a zeroed handoff that
 is refused before any sampling happens instead of rendering plausible audio.
 
+The `observed` half of that rule is `pipeline::tensor_has_nonzero`. Round-2 review found it private,
+with the weight-free case **reimplementing** the predicate as `any(|v| *v != 0.0)` rather than
+calling it — so mutating the shipped one was invisible to the only lane that could have seen it. It
+is now exported `#[doc(hidden)] pub` and driven directly, which puts both of its own mutations in the
+weight-free matrix above: `> 0.0` → `>= 0.0` makes the guard vacuous (caught on the degenerate
+whole-span row, where the answer must be `false`), and dropping the `.abs()` makes a sign-cancelling
+conditioner read as absent (caught by an explicit cancelling tensor added to the same case, since
+every other row in it is non-negative and cannot see that one).
+
 ### Extend, 10 s → 18 s, 4 steps
 
 Prefix: **exactly** the 441,000-frame prepared source on every id. Output exactly 793,800 frames.
@@ -330,6 +371,10 @@ than chosen" while the assertion multiplied the measurement by a chosen 8 and fl
 | `stable_audio_3_small_music_base` | 0.037928 | 0.010388 |
 | `stable_audio_3_small_sfx_base` | 0.038057 | 0.036689 |
 | `stable_audio_3_medium_base` | 0.045981 | 0.059821 |
+
+These carry the same fifth-decimal Metal instability as the inpaint table above (`0.039416` /
+`0.039421` for `small_music`'s seam step across two runs); `typical_step` is `0.163181` on every row
+of every run, because it is measured from the fixture rather than from a render.
 
 Every seam step is `0.034`–`0.046` against a bound of `0.163181`, i.e. ~3.5x inside it. That headroom
 is what the multiplier `1.0` costs against checkpoint variation, and it is headroom against a bound
@@ -365,8 +410,11 @@ material), plus the mutation matrix above. Producing the oracle is filed as a fo
 ## CI wiring
 
 * **Weight-free** — `--test audio_edit` in `ci.yml`'s "Test Stable Audio 3 weight-free quality gates"
-  step: **10 cases**. `scripts/tests/test_sa3_ci_target_coverage.py` passes; the step's comment counts
-  are updated (33 → 43 SA3 weight-free cases across nine named targets).
+  step: **12 cases**, measured by running that step's exact command on this tree, not counted by
+  eye. `scripts/tests/test_sa3_ci_target_coverage.py` passes; the step's comment counts are updated
+  (33 → 48 SA3 weight-free cases across ten named targets). Two of the twelve are round-2's
+  (`edit_local_conditioning_is_present` and `edit_geometry_matches_request`); round 3 added no case,
+  only assertions inside an existing one, so the count is unchanged from the previous revision.
 * **Real weights** — `--test audio_edit -- --ignored` on `sa3-base-identity-metal` and
   `sa3-base-identity-cuda` (profile `sa3-base-identity`), the only jobs provisioning all six pinned
   snapshots. Verified against those jobs' actual `--test` flags rather than their comment blocks.
