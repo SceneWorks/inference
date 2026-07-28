@@ -80,10 +80,14 @@ fn quant() -> Option<Quant> {
 }
 
 fn spec() -> LoadSpec {
+    spec_with(OffloadPolicy::Sequential)
+}
+
+fn spec_with(policy: OffloadPolicy) -> LoadSpec {
     let mut spec = LoadSpec::new(WeightsSource::Dir(snapshot()));
     // The constrained-Mac path: staged residency (encode → drop encoder → denoise → drop DiT →
     // tiled decode) is exactly the configuration whose denoise peak the story asks about.
-    spec.offload_policy = OffloadPolicy::Sequential;
+    spec.offload_policy = policy;
     if let Some(q) = quant() {
         spec = spec.with_quant(q);
     }
@@ -419,12 +423,18 @@ fn bounded_attention_preserves_the_image() {
 }
 
 /// The measured answer to GitHub #1932's question, printed with its assumptions stated. This does not
-/// assert a fit — it records the number the truthful-rejection path (SC-15611) needs.
+/// assert a fit — it records the numbers the truthful-rejection path (SC-15611) needs.
+///
+/// **Reports the RESIDENT arm alongside the staged one, deliberately.** A staged-only verdict reads as
+/// "this fits an 8 GB Mac", which is true only if the fit gate actually selects staged residency —
+/// and GitHub #1932 is precisely the case where it did not. The resident number is what that user's
+/// machine was asked for.
 #[test]
 #[ignore = "needs a real Z-Image-Turbo snapshot + Apple/Metal GPU"]
 fn the_eight_gb_mac_verdict() {
     let staged = run(staged_only());
     let with_rung3 = run(bounded());
+    let resident = resident_peak();
     let peak = staged.request_bytes() as f64;
     let denoise = staged.denoise_bytes as f64;
     // The generic MLX gate's operational reserve today. On a Mac this is the *shared* pool macOS,
@@ -436,8 +446,16 @@ fn the_eight_gb_mac_verdict() {
         quant(),
         staged.image.width
     );
-    println!("  staged denoise peak : {:.3} GiB", denoise / GIB);
-    println!("  staged request peak : {:.3} GiB", peak / GIB);
+    println!(
+        "  phase peaks         : conditioning {:.3} / denoise {:.3} / decode {:.3} GiB",
+        staged.conditioning_bytes as f64 / GIB,
+        denoise / GIB,
+        staged.decode_bytes as f64 / GIB
+    );
+    println!(
+        "  staged request peak : {:.3} GiB (max over the three phases)",
+        peak / GIB
+    );
     println!(
         "  + {reserve_gib:.1} GiB reserve = {:.3} GiB against an {budget_gib:.1} GiB budget -> {}",
         peak / GIB + reserve_gib,
@@ -453,13 +471,44 @@ fn the_eight_gb_mac_verdict() {
         with_rung3.request_bytes() as f64 / GIB + reserve_gib
     );
     println!(
+        "  RESIDENT (OffloadPolicy::Resident)   : {:.3} GiB  <- what GitHub #1932's machine was \
+         asked for; {:.1}x the staged peak, because the untiled 1024² VAE decode transient is only \
+         bounded under Sequential",
+        resident as f64 / GIB,
+        resident as f64 / peak
+    );
+    println!(
         "  DISCLOSURE: measured on this host, which is NOT a physical 8 GB Mac. MLX's peak counter \
-         is ACTIVE bytes (not cache). Staged residency + tiled decode, count 1. On a real 8 GB Mac \
-         the pool is UNIFIED and shared with macOS/WindowServer/SceneWorks, so the 2 GiB reserve \
-         borrowed from the dedicated-VRAM lane is the open question (SC-15611 / SC-15614), not this \
-         rung."
+         is ACTIVE bytes (not cache). Count 1. On a real 8 GB Mac the pool is UNIFIED and shared \
+         with macOS/WindowServer/SceneWorks, so the 2 GiB reserve borrowed from the dedicated-VRAM \
+         lane is the open question (SC-15611 / SC-15614), not this rung."
     );
     assert!(peak > 0.0, "no peak was sampled");
+    // The staged path must be the cheaper one by a wide margin — if resident ever stops dominating,
+    // the admission story in SC-15611 changes shape and this evidence is stale.
+    assert!(
+        resident as f64 > peak * 2.0,
+        "resident ({:.3} GiB) is no longer far above staged ({:.3} GiB) — re-derive the SC-15611 \
+         admission evidence",
+        resident as f64 / GIB,
+        peak / GIB
+    );
+}
+
+/// Whole-request peak on the **resident** policy — every component held warm and, because
+/// `decode_tiling` keys off `is_sequential`, an untiled 1024² VAE decode.
+fn resident_peak() -> usize {
+    let generator = mlx_gen_z_image::load(&spec_with(OffloadPolicy::Resident)).expect("load");
+    clear_cache();
+    reset_peak_memory();
+    let out = generator
+        .generate(&request(None), &mut |_| {})
+        .expect("resident generation");
+    let peak = get_peak_memory();
+    assert!(matches!(out, GenerationOutput::Images(ref v) if v.len() == 1));
+    drop(generator);
+    clear_cache();
+    peak
 }
 
 /// Cancelling mid-denoise with the budget engaged must not leave a partially resident cache that
