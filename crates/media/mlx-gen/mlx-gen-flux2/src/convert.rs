@@ -552,8 +552,9 @@ fn reject_packed_source(src: &Path, component: &str, requested_bits: i32) -> Res
 /// VAE / tokenizer / scheduler are unchanged; the caller copies or symlinks them alongside to
 /// complete the turnkey snapshot. `group_size` is the mflux/reference default of 64.
 ///
-/// Errors, writing nothing, when `src` is already a packed snapshot — see
-/// [`reject_packed_source`].
+/// Errors, writing nothing, when `src` is already a packed snapshot: re-quantizing packed weights
+/// produces garbage that only fails later, inside the forward pass, so the converter refuses rather
+/// than substituting a tier (epic 11037 SC#5).
 pub fn quantize_flux2_dit(src: &Path, dst: &Path, bits: i32, group_size: i32) -> Result<()> {
     reject_packed_source(src, "transformer", bits)?;
     std::fs::create_dir_all(dst)?;
@@ -569,8 +570,9 @@ pub fn quantize_flux2_dit(src: &Path, dst: &Path, bits: i32, group_size: i32) ->
 /// manifest). The unused Pixtral vision tower / projector tensors pass through dense (they are
 /// small relative to the language tower and reserved for the edit path, sc-5919).
 ///
-/// Errors, writing nothing, when `src` is already a packed snapshot — see
-/// [`reject_packed_source`].
+/// Errors, writing nothing, when `src` is already a packed snapshot: re-quantizing packed weights
+/// produces garbage that only fails later, inside the forward pass, so the converter refuses rather
+/// than substituting a tier (epic 11037 SC#5).
 pub fn quantize_flux2_text_encoder_dir(
     src: &Path,
     dst: &Path,
