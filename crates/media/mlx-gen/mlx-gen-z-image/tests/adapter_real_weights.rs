@@ -2,7 +2,8 @@
 //!
 //! `#[ignore]`d — needs the real `Tongyi-MAI/Z-Image-Turbo` weights in the HF cache and the
 //! adapter goldens produced by `tools/dump_z_image_adapter_golden.py` (gitignored, local). Run:
-//!   cargo test -p mlx-gen-z-image --release --test adapter_real_weights -- --ignored --nocapture
+//!   python3 crates/media/mlx-gen/tools/verify_adapter_parity_artifacts.py
+//!   cargo test -p mlx-gen-z-image --release --test adapter_real_weights -- --ignored --nocapture --test-threads=1
 //!
 //! Three gates: (1) the key→module map resolves the FULL fork `ZImageLoRAMapping` target surface
 //! against the real module tree; (2) the public `load(spec.with_adapters(…)).generate()` render
@@ -144,26 +145,90 @@ fn px_gt8(a: &[u8], b: &[u8]) -> usize {
         .count()
 }
 
-/// The base (no-adapter) render's px>8 vs the fork base golden, at the SAME config as the `kind`
-/// adapter golden — the inherited bf16 toolchain drift floor the adapter render sits on. Z-Image is
-/// fully bf16, so this floor is inherently higher than the mixed-precision Qwen's. The base golden
-/// (`z_image_golden.safetensors`) MUST be dumped at the adapter golden's (seed, steps, size); a
-/// mismatch is a hard error (it would yield a bogus floor).
-fn base_floor_px(kind: &str) -> usize {
+/// Count elements where the Rust adapter residual differs from the fork adapter residual by >8.
+fn residual_px_gt8(adapted: &[u8], base: &[u8], fork_adapted: &[u8], fork_base: &[u8]) -> usize {
+    assert_eq!(adapted.len(), base.len());
+    assert_eq!(adapted.len(), fork_adapted.len());
+    assert_eq!(adapted.len(), fork_base.len());
+    (0..adapted.len())
+        .filter(|&index| {
+            let rust_residual = adapted[index] as i32 - base[index] as i32;
+            let fork_residual = fork_adapted[index] as i32 - fork_base[index] as i32;
+            (rust_residual - fork_residual).abs() > 8
+        })
+        .count()
+}
+
+fn matching_fork_base(kind: &str) -> Vec<u8> {
     let ag = Weights::from_file(golden_dir().join(format!("z_image_{kind}_golden.safetensors")))
         .unwrap();
     let bg = Weights::from_file(golden_dir().join("z_image_golden.safetensors"))
         .expect("base golden z_image_golden.safetensors (dump it at the adapter config)");
-    for k in ["seed", "steps", "w", "h"] {
+    for k in [
+        "prompt",
+        "seed",
+        "steps",
+        "w",
+        "h",
+        "num_valid",
+        "reference_mflux_repository",
+        "reference_mflux_revision",
+        "reference_model_repository",
+        "reference_model_revision",
+        "reference_model_ref",
+        "reference_model_subdirectory",
+        "reference_model_path",
+        "reference_model_inventory_sha256",
+        "reference_provenance_sha256",
+        "reference_runtime",
+    ] {
+        assert!(
+            ag.metadata(k).is_some(),
+            "adapter golden missing metadata {k}"
+        );
+        assert!(bg.metadata(k).is_some(), "base golden missing metadata {k}");
         assert_eq!(
             ag.metadata(k),
             bg.metadata(k),
             "base golden {k} != adapter golden {k} — regenerate z_image_golden.safetensors at the adapter config"
         );
     }
-    let pixels = render_with_adapter(None, kind);
-    let bimg = decoded_to_image(bg.require("decoded").unwrap()).unwrap();
-    px_gt8(&pixels, &bimg.pixels)
+    decoded_to_image(bg.require("decoded").unwrap())
+        .unwrap()
+        .pixels
+}
+
+fn print_residual_diagnostic(kind: &str, my_kind: AdapterKind) {
+    let adapted = render_with_adapter(
+        Some((&format!("z_image_{kind}_adapter.safetensors"), my_kind, 1.0)),
+        kind,
+    );
+    let base = render_with_adapter(None, kind);
+    let ag = Weights::from_file(golden_dir().join(format!("z_image_{kind}_golden.safetensors")))
+        .unwrap();
+    let fork_adapted = decoded_to_image(ag.require("decoded").unwrap())
+        .unwrap()
+        .pixels;
+    let fork_base = matching_fork_base(kind);
+    let residual_differ = residual_px_gt8(&adapted, &base, &fork_adapted, &fork_base);
+    // A dropped adapter has a zero Rust residual, so its error against the frozen-fork residual is
+    // exactly the fork adapter-vs-base delta.
+    let zero_residual_control = px_gt8(&fork_adapted, &fork_base);
+    println!(
+        "SC15505_RESULT z_image_{kind} residual_samples_gt8={residual_differ} zero_residual_samples_gt8={zero_residual_control} rgb_samples={}",
+        adapted.len()
+    );
+}
+
+/// Pre-tightening diagnostic. The source/env-bound recorder runs this exact test first; a cap may
+/// be locked only after the adapted residual is measured below the zero-residual control.
+#[test]
+#[ignore = "needs real Z-Image weights + adapter & base goldens (same config)"]
+fn residual_mutation_diagnostic() {
+    // Cargo prints `test <name> ... ` without a newline before test output.
+    println!();
+    print_residual_diagnostic("lora", AdapterKind::Lora);
+    print_residual_diagnostic("lokr", AdapterKind::Lokr);
 }
 
 fn assert_matches_golden(kind: &str, my_kind: AdapterKind) {
@@ -175,29 +240,40 @@ fn assert_matches_golden(kind: &str, my_kind: AdapterKind) {
         .unwrap();
     let gimg = decoded_to_image(g.require("decoded").unwrap()).unwrap();
     let differ = px_gt8(&pixels, &gimg.pixels);
+    let no_adapter = render_with_adapter(None, kind);
+    let fork_base = matching_fork_base(kind);
 
-    // Floor-relative gate (sc-2718): the adapter render must not diverge from the fork by materially
-    // more than the BASE render does — the inherited bf16 toolchain drift floor — i.e. the adapter
-    // itself adds ~zero divergence (the residual is fork-faithful; scale-0 is bit-exact). The
-    // `2×floor + 0.5%` cap allows the stronger-perturbation adapter image's larger content floor
-    // while staying FAR tighter than a flat %. Measured @512²: Z-Image base 0.82% / LoRA 0.39% /
-    // LoKr 1.13% (Z-Image is fully bf16, so its floor is ~0.8%, unlike mixed-precision Qwen's
-    // ~0.05%). (Replaces the old flat 5% guard, sized for the inflated 256² floor — a small latent
-    // lets bf16 drift flip a large *fraction* of the few pixels; the floor collapses ~2× at 512²,
-    // so the goldens are now dumped at 512².)
-    let base = base_floor_px(kind);
+    // Clause 1 retains the original floor-relative fork bound. Clause 2 isolates adapter behavior
+    // from that base backend drift: a dropped adapter has zero Rust residual and must cross the
+    // locked midpoint between the measured active residual and that zero-residual control.
+    let base = px_gt8(&no_adapter, &fork_base);
     let cap = base * 2 + pixels.len() / 200;
+    let residual_differ = residual_px_gt8(&pixels, &no_adapter, &gimg.pixels, &fork_base);
+    let zero_residual_control = px_gt8(&gimg.pixels, &fork_base);
+    let residual_cap = match kind {
+        "lora" => 21_139,
+        "lokr" => 27_798,
+        _ => panic!("unsupported adapter golden kind {kind}"),
+    };
     let pct = |n: usize| n as f64 / pixels.len() as f64 * 100.0;
     println!(
-        "✓ {kind} adapter render: {differ} px>8 ({:.4}%); base floor {base} ({:.4}%); cap {cap} ({:.4}%)",
+        "✓ {kind} adapter render: {differ} px>8 ({:.4}%); base floor {base} ({:.4}%); cap {cap} ({:.4}%); residual {residual_differ}; zero control {zero_residual_control}; residual cap {residual_cap}",
         pct(differ),
         pct(base),
         pct(cap),
+    );
+    println!(
+        "SC15505_RESULT z_image_{kind} samples_gt8={differ} base_floor={base} cap={cap} residual_samples_gt8={residual_differ} zero_residual_samples_gt8={zero_residual_control} residual_cap={residual_cap} rgb_samples={}",
+        pixels.len()
     );
     assert!(
         differ <= cap,
         "{kind} adapter render diverges beyond the base floor: {differ} px ({:.3}%) > cap {cap} px (base {base})",
         pct(differ),
+    );
+    assert!(
+        residual_differ <= residual_cap && residual_cap < zero_residual_control,
+        "{kind} residual mutation gate failed: active {residual_differ} <= cap {residual_cap} < zero control {zero_residual_control}"
     );
 }
 
