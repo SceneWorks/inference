@@ -52,6 +52,18 @@
 //! rung — and the measurement above was taken on a 128 GB machine, so it is a peak measurement, not a
 //! demonstration that an 8 GB Mac completes the render.
 //!
+//! ## Route coverage
+//!
+//! Rung 3 reaches **every** advertised denoise route — plain t2i, base CFG (both the cond and the
+//! uncond forward), turbo control and base control (including the ControlNet branch's own blocks),
+//! and the PiD route, whose denoise is the ordinary DiT.
+//!
+//! Rungs 2 and above are **refused on the PiD route** (see `safety_check`). PiD replaces the native
+//! VAE decode with a super-resolving student that plans its own tile edge/overlap from its own budget
+//! (`mlx_gen_pid::budget`) and never reads this contract's `decode_tile_edge`/`decode_overlap`, so
+//! admitting bounded decode there would execute a different strategy than the selector chose.
+//! Reconciling PiD's planner with the shared parameters is SC-15510's PiD/alternate-decode coverage.
+//!
 //! ## Ownership
 //!
 //! This file declares *structure and parameter domains only*. Measured coefficients, envelopes, and
@@ -390,6 +402,25 @@ pub(crate) fn safety_check(
             reason: error.to_string(),
         };
     }
+    // Defense in depth for the PiD overlay route. A PiD request replaces the native VAE decode with
+    // the super-resolving student, which plans its OWN tile edge/overlap from its own budget
+    // (`mlx_gen_pid::budget`) and ignores this contract's decode parameters entirely
+    // ([`crate::pipeline::decode_batch`] takes the PiD arm before the tiling arm). Admitting a
+    // bounded-decode selection here would therefore execute a different strategy than the one the
+    // shared selector chose — precisely what the contract forbids. Rungs 0-1 are unaffected: staged
+    // residency behaves identically with the overlay, and rung 3 rides the DiT denoise, which PiD
+    // does not touch. Reconciling PiD's planner with the shared parameters is SC-15510's
+    // "PiD/alternate-decode" coverage.
+    if context.use_pid && context.selection.strategy >= ImageMemoryStrategy::BoundedDecode {
+        return ImageMemorySafetyDecision::Reject {
+            reason: format!(
+                "{}: {:?} is not admissible with the PiD decode overlay — the PiD decoder plans its \
+                 own tiling and would not honour decode_tile_edge/decode_overlap (SC-15510 owns \
+                 reconciling them); select StagedResidency or run without PiD",
+                contract.provider_id, context.selection.strategy
+            ),
+        };
+    }
     if !context.budget.fits(context.predicted_peak_bytes) {
         return ImageMemorySafetyDecision::Reject {
             reason: format!(
@@ -678,6 +709,49 @@ mod tests {
             crate::pipeline::attention_budget(&staged),
             AttentionBudget::UNBOUNDED
         );
+    }
+
+    /// The PiD overlay replaces the decode with a student that plans its own tiling, so a
+    /// bounded-decode (or deeper) selection must be refused rather than silently executing different
+    /// parameters than the selector chose.
+    #[test]
+    fn the_pid_route_refuses_bounded_decode_but_keeps_the_cheaper_rungs() {
+        let contract = contract();
+        for strategy in [
+            ImageMemoryStrategy::BoundedDecode,
+            ImageMemoryStrategy::BoundedAttention,
+        ] {
+            let mut ctx = context(strategy);
+            ctx.use_pid = true;
+            match safety_check(&contract, &ctx) {
+                ImageMemorySafetyDecision::Reject { reason } => {
+                    assert!(reason.contains("PiD decode overlay"), "{reason}")
+                }
+                other => panic!("{strategy:?} with PiD must be rejected, got {other:?}"),
+            }
+            assert!(begin_request(crate::model::MODEL_ID, &contract, &ctx).is_err());
+        }
+        // Resident and staged residency stay available with the overlay — the DiT/encoder staging is
+        // unaffected by which decoder runs.
+        for strategy in [
+            ImageMemoryStrategy::Resident,
+            ImageMemoryStrategy::StagedResidency,
+        ] {
+            let mut ctx = context(strategy);
+            ctx.use_pid = true;
+            assert!(
+                matches!(
+                    safety_check(&contract, &ctx),
+                    ImageMemorySafetyDecision::Accept
+                ),
+                "{strategy:?} must stay admissible with PiD"
+            );
+        }
+        // And without PiD, bounded decode is admissible as usual — the guard is not a blanket refusal.
+        assert!(matches!(
+            safety_check(&contract, &context(ImageMemoryStrategy::BoundedDecode)),
+            ImageMemorySafetyDecision::Accept
+        ));
     }
 
     #[test]
