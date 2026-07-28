@@ -2471,6 +2471,7 @@ fn the_drift_metric_catches_the_plausible_ar_failure_shapes() {
 /// One measured row of the S18 sweep, as printed by the gated real-weight run.
 struct S18Row {
     label: String,
+    latent_frames: usize,
     /// The verdict statistic: worst trend or worst z-gated excursion (see [`worst_drift`]).
     drift: f64,
     trend: f64,
@@ -2821,6 +2822,7 @@ fn long_clip_coherence_under_the_bounded_window() {
             );
             results.push(S18Row {
                 label: format!("{} s{seed}", r.label),
+                latent_frames: lat,
                 drift: worst_drift(&d),
                 trend: worst_trend(&d),
                 excursion: worst_excursion(&d),
@@ -2922,18 +2924,7 @@ fn long_clip_coherence_under_the_bounded_window() {
 
     let sweep = S18Sweep {
         bucket: format!("{w}x{h}"),
-        cells: results
-            .iter()
-            .map(|r| S18Cell {
-                row: r.row,
-                seed: r.seed,
-                rolls: r.rolls,
-                trend: r.trend,
-                excursion: r.excursion,
-                slope: r.slope,
-                component: r.component,
-            })
-            .collect(),
+        cells: results.iter().map(S18Cell::from_measured).collect(),
     };
     println!("  {}", sweep.summary());
     if want_rows.contains('A') {
@@ -2955,7 +2946,10 @@ struct S18Cell {
     /// `A` shipped · `B` sink 1 · `C` sink 3 · `D` wide window · `E` global reference · `Z` zero-roll.
     row: char,
     seed: u64,
+    latent_frames: usize,
     rolls: usize,
+    /// The `S18CELL` verdict value as printed by the original run.
+    reported_drift: f64,
     /// Worst absolute one-way component trend, 0..255.
     trend: f64,
     /// Worst absolute z-gated component excursion, 0..255.
@@ -2966,6 +2960,17 @@ struct S18Cell {
     /// [`trend`](Self::trend) (they differ by the constant post-segment length), so the segment length
     /// is recoverable as `100 * trend / slope`.
     slope: f64,
+    /// MLX active peak bytes for this cell's AR loop.
+    peak_bytes: usize,
+    /// Mean percentage of pixels at or above 250 in the brightest channel.
+    clip_mean: f64,
+    /// Mean absolute RGB frame-to-frame delta over the first third, in 0..255 units.
+    head_motion: f64,
+    /// Mean absolute RGB frame-to-frame delta over the last third of the clip, in 0..255 units.
+    ///
+    /// This is the sweep's freeze check. It is retained in the recorded cells so the crate prose's
+    /// count and rounded range are derived from the raw `S18CELL` evidence rather than hand-copied.
+    tail_motion: f64,
     /// Which [`DESCRIPTOR_NAMES`] component actually produced [`drift`](Self::drift) for this cell.
     ///
     /// Recorded so the reader can check *which channel* scored a row rather than taking the earlier
@@ -2975,6 +2980,25 @@ struct S18Cell {
 }
 
 impl S18Cell {
+    /// Retain every verdict and freeze-evidence field emitted by the live real-weight sweep.
+    fn from_measured(row: &S18Row) -> Self {
+        Self {
+            row: row.row,
+            seed: row.seed,
+            latent_frames: row.latent_frames,
+            rolls: row.rolls,
+            reported_drift: row.drift,
+            trend: row.trend,
+            excursion: row.excursion,
+            slope: row.slope,
+            peak_bytes: row.peak,
+            clip_mean: row.clip_mean,
+            head_motion: row.head_motion,
+            tail_motion: row.tail_motion,
+            component: row.component,
+        }
+    }
+
     /// The gated statistic: trend AND excursion must be inside budget, i.e. their max must be.
     fn drift(&self) -> f64 {
         self.trend.abs().max(self.excursion.abs())
@@ -2984,6 +3008,31 @@ impl S18Cell {
     fn post_len(&self) -> Option<f64> {
         (self.slope.abs() > 1e-9).then(|| 100.0 * self.trend.abs() / self.slope.abs())
     }
+}
+
+#[test]
+fn an_s18_cell_retains_tail_motion_from_the_live_sweep() {
+    let measured = S18Row {
+        label: "test".into(),
+        latent_frames: 45,
+        drift: 1.0,
+        trend: 2.0,
+        excursion: 3.0,
+        slope: 4.0,
+        component: "luma-mean",
+        rolls: 5,
+        peak: 6,
+        clip_mean: 7.0,
+        head_motion: 8.0,
+        tail_motion: 12.3456,
+        row: 'A',
+        seed: 9,
+    };
+    let cell = S18Cell::from_measured(&measured);
+    assert_eq!(
+        cell.tail_motion, measured.tail_motion,
+        "the live S18 result-to-record conversion must not discard the freeze measurement"
+    );
 }
 
 /// Outcome of the within-regime window dose-response — row `D` (2.5× wider window, fewer evictions)
@@ -3416,13 +3465,19 @@ fn the_s18_verdict_rule_distinguishes_its_outcomes() {
                 cells.push(S18Cell {
                     row: *row,
                     seed: k as u64,
+                    latent_frames: 45,
                     rolls: if *row == 'E' { 0 } else { 13 },
+                    reported_drift: means[i] + off,
                     trend: means[i] + off,
                     excursion: 0.0,
                     // A 100-output-frame post segment, so slope == trend numerically. These synthetic
                     // sweeps have no row Z, so the rate-floor clause is inert here; it is exercised
                     // against the RECORDED data, which does have one.
                     slope: means[i] + off,
+                    peak_bytes: 1,
+                    clip_mean: 0.0,
+                    head_motion: 2.0,
+                    tail_motion: 2.0,
                     component: "luma-mean",
                 });
             }
@@ -3492,10 +3547,16 @@ fn the_s18_verdict_rule_distinguishes_its_outcomes() {
         vals.into_iter().enumerate().map(move |(k, t)| S18Cell {
             row,
             seed: k as u64,
+            latent_frames: 45,
             rolls: if row == 'D' { 10 } else { 13 },
+            reported_drift: t,
             trend: t,
             excursion: 0.0,
             slope: t,
+            peak_bytes: 1,
+            clip_mean: 0.0,
+            head_motion: 2.0,
+            tail_motion: 2.0,
             component: "luma-mean",
         })
     };
@@ -3680,268 +3741,507 @@ fn the_withdrawn_s18_claims_do_not_survive_in_crate_prose() {
 /// the recorded data.
 const RECORDED_VERDICT_PREFIX: &str = "drift is real";
 
+#[derive(Debug)]
+struct S18Evidence {
+    row: char,
+    seed: u64,
+    bucket: String,
+    latent_frames: usize,
+    rolls: usize,
+    drift: f64,
+    trend: f64,
+    excursion: f64,
+    slope: f64,
+    peak_bytes: usize,
+    clip_mean: f64,
+    head_motion: f64,
+    tail_motion: f64,
+}
+
+fn parse_s18_evidence(src: &str) -> Result<Vec<S18Evidence>, String> {
+    fn number<T: std::str::FromStr>(field: &str, name: &str, line: usize) -> Result<T, String> {
+        field
+            .parse()
+            .map_err(|_| format!("line {line}: invalid {name} `{field}`"))
+    }
+
+    src.lines()
+        .enumerate()
+        .map(|(index, line)| {
+            let line_number = index + 1;
+            let fields: Vec<&str> = line.split('\t').collect();
+            if fields.len() != 14 || fields[0] != "S18CELL" {
+                return Err(format!(
+                    "line {line_number}: expected an exact 14-field S18CELL record, got `{line}`"
+                ));
+            }
+            let mut row_chars = fields[1].chars();
+            let row = row_chars
+                .next()
+                .filter(|_| row_chars.next().is_none())
+                .ok_or_else(|| format!("line {line_number}: invalid row `{}`", fields[1]))?;
+            Ok(S18Evidence {
+                row,
+                seed: number(fields[2], "seed", line_number)?,
+                bucket: fields[3].to_string(),
+                latent_frames: number(fields[4], "latent_frames", line_number)?,
+                rolls: number(fields[5], "rolls", line_number)?,
+                drift: number(fields[6], "drift", line_number)?,
+                trend: number(fields[7], "trend", line_number)?,
+                excursion: number(fields[8], "excursion", line_number)?,
+                slope: number(fields[9], "slope", line_number)?,
+                peak_bytes: number(fields[10], "peak_bytes", line_number)?,
+                clip_mean: number(fields[11], "clip_mean", line_number)?,
+                head_motion: number(fields[12], "head_motion", line_number)?,
+                tail_motion: number(fields[13], "tail_motion", line_number)?,
+            })
+        })
+        .collect()
+}
+
 /// Measured cells at **640×384** (the bucket where the global reference row fits in 128 GiB).
 ///
-/// Row E is `n = 1`: its 45.0 GiB MLX peak drove this 128 GiB host into enough swap to fill the boot
+/// Row E is `n = 1`: its 41.90 GiB MLX peak (44,993,367,088 bytes; 45.0 GB decimal) drove this 128 GiB
+/// host into enough swap to fill the boot
 /// volume, so the remaining two seeds were abandoned. It is a *reference*, not a control, and nothing
 /// the verdict decides turns on it — the attribution is decided by row D, which is within regime and
 /// replicated.
+///
+/// Provenance: the exact source lines are committed in `tests/fixtures/s18_recorded_cells.tsv`.
+/// Rows A/B and C seeds 7/11 came from `s18_640.log`
+/// (SHA-256 `a9d3d0f4f4163171af2e83148bd75857266c7c97f26e16d391edd762f40d7803`);
+/// C seed 23 and rows D/E/Z came from `s18_640c.log`
+/// (SHA-256 `c89f4d7da05d3f367318dc03edf73e4f2e9c97509c13afcfaf508840f9e7019c`).
+/// `tail_motion` is the final field of each preserved `S18CELL` TSV line.
 const MEASURED_640: &[S18Cell] = &[
     S18Cell {
         row: 'A',
         seed: 7,
+        latent_frames: 45,
         rolls: 13,
+        reported_drift: 23.0413,
         trend: 19.9907,
         excursion: 23.0413,
         slope: 12.8146,
+        peak_bytes: 15_625_190_652,
+        clip_mean: 1.8230,
+        head_motion: 13.5111,
+        tail_motion: 8.4549,
         component: "spatial-sd",
     },
     S18Cell {
         row: 'A',
         seed: 11,
+        latent_frames: 45,
         rolls: 13,
+        reported_drift: 31.0541,
         trend: 31.0541,
         excursion: 19.3187,
         slope: 19.9064,
+        peak_bytes: 15_918_432_068,
+        clip_mean: 2.1838,
+        head_motion: 12.8849,
+        tail_motion: 9.7033,
         component: "luma-mean",
     },
     S18Cell {
         row: 'A',
         seed: 23,
+        latent_frames: 45,
         rolls: 13,
+        reported_drift: 28.4337,
         trend: 21.7860,
         excursion: 28.4337,
         slope: 13.9654,
+        peak_bytes: 15_918_432_068,
+        clip_mean: 2.9023,
+        head_motion: 13.0206,
+        tail_motion: 8.3340,
         component: "opp-B-Y",
     },
     S18Cell {
         row: 'B',
         seed: 7,
+        latent_frames: 45,
         rolls: 13,
+        reported_drift: 17.4084,
         trend: 11.6090,
         excursion: 17.4084,
         slope: 7.4416,
+        peak_bytes: 16_704_871_748,
+        clip_mean: 0.5835,
+        head_motion: 15.4236,
+        tail_motion: 8.7276,
         component: "spatial-sd",
     },
     S18Cell {
         row: 'B',
         seed: 11,
+        latent_frames: 45,
         rolls: 13,
+        reported_drift: 28.5211,
         trend: 28.5211,
         excursion: 12.3800,
         slope: 18.2828,
+        peak_bytes: 16_704_871_748,
+        clip_mean: 4.1115,
+        head_motion: 15.1563,
+        tail_motion: 10.9031,
         component: "luma-mean",
     },
     S18Cell {
         row: 'B',
         seed: 23,
+        latent_frames: 45,
         rolls: 13,
+        reported_drift: 11.8207,
         trend: 11.8207,
         excursion: 10.3263,
         slope: 7.5774,
+        peak_bytes: 16_704_871_748,
+        clip_mean: 3.7060,
+        head_motion: 15.8878,
+        tail_motion: 9.0604,
         component: "saturation",
     },
     S18Cell {
         row: 'C',
         seed: 7,
+        latent_frames: 45,
         rolls: 13,
+        reported_drift: 17.6473,
         trend: 17.6473,
         excursion: 14.7965,
         slope: 11.3124,
+        peak_bytes: 18_277_770_564,
+        clip_mean: 0.8194,
+        head_motion: 15.7777,
+        tail_motion: 9.0903,
         component: "contrast",
     },
     S18Cell {
         row: 'C',
         seed: 11,
+        latent_frames: 45,
         rolls: 13,
+        reported_drift: 15.7251,
         trend: 15.7251,
         excursion: 0.0,
         slope: 10.0802,
+        peak_bytes: 18_277_770_564,
+        clip_mean: 4.7272,
+        head_motion: 15.4910,
+        tail_motion: 8.9464,
         component: "opp-B-Y",
     },
     S18Cell {
         row: 'C',
         seed: 23,
+        latent_frames: 45,
         rolls: 13,
+        reported_drift: 6.2537,
         trend: 6.2537,
         excursion: 5.8270,
         slope: 4.0088,
+        peak_bytes: 17_984_529_148,
+        clip_mean: 3.9163,
+        head_motion: 15.3418,
+        tail_motion: 9.8476,
         component: "contrast",
     },
     S18Cell {
         row: 'D',
         seed: 7,
+        latent_frames: 45,
         rolls: 10,
+        reported_drift: 27.5739,
         trend: 27.5739,
         excursion: 21.8348,
         slope: 17.6756,
+        peak_bytes: 22_939_277_456,
+        clip_mean: 4.9800,
+        head_motion: 16.1245,
+        tail_motion: 6.8550,
         component: "opp-B-Y",
     },
     S18Cell {
         row: 'D',
         seed: 11,
+        latent_frames: 45,
         rolls: 10,
+        reported_drift: 33.0361,
         trend: 33.0361,
         excursion: 23.0505,
         slope: 21.1770,
+        peak_bytes: 23_232_518_872,
+        clip_mean: 5.0395,
+        head_motion: 15.3780,
+        tail_motion: 6.6431,
         component: "luma-mean",
     },
     S18Cell {
         row: 'D',
         seed: 23,
+        latent_frames: 45,
         rolls: 10,
+        reported_drift: 31.1090,
         trend: 31.1090,
         excursion: 30.5435,
         slope: 19.9416,
+        peak_bytes: 23_232_518_872,
+        clip_mean: 5.6215,
+        head_motion: 15.1025,
+        tail_motion: 6.5790,
         component: "opp-B-Y",
     },
     S18Cell {
         row: 'E',
         seed: 7,
+        latent_frames: 45,
         rolls: 0,
+        reported_drift: 34.0619,
         trend: 34.0619,
         excursion: 18.5963,
         slope: 21.8345,
+        peak_bytes: 44_993_367_088,
+        clip_mean: 11.6145,
+        head_motion: 16.1245,
+        tail_motion: 9.1457,
         component: "luma-mean",
     },
     S18Cell {
         row: 'Z',
         seed: 7,
+        latent_frames: 6,
         rolls: 0,
+        reported_drift: 1.3928,
         trend: 1.3928,
         excursion: 0.0,
         slope: 11.6069,
+        peak_bytes: 13_228_233_860,
+        clip_mean: 6.1379,
+        head_motion: 8.1185,
+        tail_motion: 6.9907,
         component: "saturation",
     },
     S18Cell {
         row: 'Z',
         seed: 11,
+        latent_frames: 6,
         rolls: 0,
+        reported_drift: 3.3254,
         trend: 3.3254,
         excursion: 0.0,
         slope: 27.7120,
+        peak_bytes: 13_228_233_860,
+        clip_mean: 3.2575,
+        head_motion: 8.8693,
+        tail_motion: 9.6543,
         component: "opp-B-Y",
     },
     S18Cell {
         row: 'Z',
         seed: 23,
+        latent_frames: 6,
         rolls: 0,
+        reported_drift: 5.9501,
         trend: 5.9501,
         excursion: 0.0,
         slope: 49.5845,
+        peak_bytes: 13_228_233_860,
+        clip_mean: 2.8602,
+        head_motion: 11.2963,
+        tail_motion: 17.8587,
         component: "opp-B-Y",
     },
 ];
 
 /// Measured cells at **832×480** — the crate default and a shipping bucket. Row E is absent by
 /// necessity: the global window at this bucket SIGKILLs a 128 GiB host.
+///
+/// Provenance: the exact source lines are committed in `tests/fixtures/s18_recorded_cells.tsv`.
+/// All rows came from `s18_832.log`
+/// (SHA-256 `e48d1d0ffd21b1d74833ee8d6624864132391b14b2f8f19d73bb216540704102`).
+/// `tail_motion` is the final field of each preserved `S18CELL` TSV line.
 const MEASURED_832: &[S18Cell] = &[
     S18Cell {
         row: 'A',
         seed: 7,
+        latent_frames: 45,
         rolls: 13,
+        reported_drift: 47.1323,
         trend: 45.8218,
         excursion: 47.1323,
         slope: 29.3729,
+        peak_bytes: 18_719_499_004,
+        clip_mean: 2.0986,
+        head_motion: 14.0278,
+        tail_motion: 14.0410,
         component: "opp-B-Y",
     },
     S18Cell {
         row: 'A',
         seed: 11,
+        latent_frames: 45,
         rolls: 13,
+        reported_drift: 34.5532,
         trend: 27.7189,
         excursion: 34.5532,
         slope: 17.7685,
+        peak_bytes: 19_012_740_420,
+        clip_mean: 2.3080,
+        head_motion: 15.8402,
+        tail_motion: 11.2383,
         component: "opp-B-Y",
     },
     S18Cell {
         row: 'A',
         seed: 23,
+        latent_frames: 45,
         rolls: 13,
+        reported_drift: 36.0093,
         trend: 29.2038,
         excursion: 36.0093,
         slope: 18.7204,
+        peak_bytes: 19_012_740_420,
+        clip_mean: 2.4257,
+        head_motion: 12.0546,
+        tail_motion: 4.9842,
         component: "opp-B-Y",
     },
     S18Cell {
         row: 'B',
         seed: 7,
+        latent_frames: 45,
         rolls: 13,
+        reported_drift: 34.1733,
         trend: 25.6222,
         excursion: 34.1733,
         slope: 16.4245,
+        peak_bytes: 20_336_515_800,
+        clip_mean: 2.6006,
+        head_motion: 15.8427,
+        tail_motion: 18.7733,
         component: "opp-B-Y",
     },
     S18Cell {
         row: 'B',
         seed: 11,
+        latent_frames: 45,
         rolls: 13,
+        reported_drift: 31.0055,
         trend: 23.7267,
         excursion: 31.0055,
         slope: 15.2094,
+        peak_bytes: 20_336_515_800,
+        clip_mean: 7.3309,
+        head_motion: 16.7797,
+        tail_motion: 15.2673,
         component: "opp-B-Y",
     },
     S18Cell {
         row: 'B',
         seed: 23,
+        latent_frames: 45,
         rolls: 13,
+        reported_drift: 26.8110,
         trend: 18.8356,
         excursion: 26.8110,
         slope: 12.0741,
+        peak_bytes: 20_336_515_800,
+        clip_mean: 6.4201,
+        head_motion: 14.5752,
+        tail_motion: 7.9430,
         component: "opp-B-Y",
     },
     S18Cell {
         row: 'C',
         seed: 7,
+        latent_frames: 45,
         rolls: 13,
+        reported_drift: 22.8868,
         trend: 14.6706,
         excursion: 22.8868,
         slope: 9.4042,
+        peak_bytes: 23_148_059_352,
+        clip_mean: 2.5411,
+        head_motion: 16.4200,
+        tail_motion: 15.0360,
         component: "opp-B-Y",
     },
     S18Cell {
         row: 'C',
         seed: 11,
+        latent_frames: 45,
         rolls: 13,
+        reported_drift: 19.4879,
         trend: 11.0461,
         excursion: 19.4879,
         slope: 7.0808,
+        peak_bytes: 23_148_059_352,
+        clip_mean: 5.8078,
+        head_motion: 16.8824,
+        tail_motion: 15.6104,
         component: "opp-B-Y",
     },
     S18Cell {
         row: 'C',
         seed: 23,
+        latent_frames: 45,
         rolls: 13,
+        reported_drift: 27.9238,
         trend: 21.1164,
         excursion: 27.9238,
         slope: 13.5362,
+        peak_bytes: 23_148_059_352,
+        clip_mean: 3.5535,
+        head_motion: 15.3301,
+        tail_motion: 8.2002,
         component: "opp-B-Y",
     },
     S18Cell {
         row: 'D',
         seed: 7,
+        latent_frames: 45,
         rolls: 10,
+        reported_drift: 47.4356,
         trend: 47.4356,
         excursion: 47.0857,
         slope: 30.4074,
+        peak_bytes: 31_582_640_856,
+        clip_mean: 3.0485,
+        head_motion: 16.6669,
+        tail_motion: 16.9721,
         component: "opp-B-Y",
     },
     S18Cell {
         row: 'D',
         seed: 11,
+        latent_frames: 45,
         rolls: 10,
+        reported_drift: 39.0004,
         trend: 35.2790,
         excursion: 39.0004,
         slope: 22.6147,
+        peak_bytes: 31_582_640_856,
+        clip_mean: 5.8909,
+        head_motion: 16.7670,
+        tail_motion: 10.8825,
         component: "opp-B-Y",
     },
     S18Cell {
         row: 'D',
         seed: 23,
+        latent_frames: 45,
         rolls: 10,
+        reported_drift: 22.8338,
         trend: 22.8338,
         excursion: 22.2395,
         slope: 14.6371,
+        peak_bytes: 31_582_640_856,
+        clip_mean: 5.0853,
+        head_motion: 15.1700,
+        tail_motion: 3.1060,
         component: "spatial-sd",
     },
 ];
@@ -4074,5 +4374,138 @@ fn the_recorded_s18_sweep_is_what_the_docs_claim() {
         "row Z's post segment is {z_post:.0} output frames against row A's {a_post:.0} — the docs' \
          \"a 12-frame OLS slope does not extrapolate across 156\" argument no longer describes the \
          data"
+    );
+
+    // The committed fixture is the durable copy of the exact S18CELL lines emitted by the preserved
+    // real-weight logs. Parse every field and compare it to the hand-shaped tables used by the verdict
+    // so neither representation can drift independently.
+    let evidence = parse_s18_evidence(include_str!("fixtures/s18_recorded_cells.tsv"))
+        .expect("the committed S18CELL evidence must parse");
+    let cells: Vec<&S18Cell> = MEASURED_640.iter().chain(MEASURED_832).collect();
+    assert_eq!(
+        evidence.len(),
+        28,
+        "the committed S18CELL evidence changed cell count; reconcile it with the source logs"
+    );
+    assert_eq!(
+        evidence.len(),
+        cells.len(),
+        "the committed S18CELL evidence and MEASURED tables have different cell counts"
+    );
+
+    let mut seen = Vec::new();
+    for raw in &evidence {
+        let table = match raw.bucket.as_str() {
+            "640x384" => MEASURED_640,
+            "832x480" => MEASURED_832,
+            other => panic!("fixture contains an unrecognised S18 bucket `{other}`"),
+        };
+        let matches: Vec<&S18Cell> = table
+            .iter()
+            .filter(|cell| cell.row == raw.row && cell.seed == raw.seed)
+            .collect();
+        assert_eq!(
+            matches.len(),
+            1,
+            "{} row {} seed {} must identify exactly one MEASURED cell, found {}",
+            raw.bucket,
+            raw.row,
+            raw.seed,
+            matches.len()
+        );
+        let cell = matches[0];
+        assert_eq!(
+            (raw.latent_frames, raw.rolls, raw.peak_bytes),
+            (cell.latent_frames, cell.rolls, cell.peak_bytes),
+            "{} row {} seed {} integer fields differ from the committed S18CELL evidence",
+            raw.bucket,
+            raw.row,
+            raw.seed
+        );
+        assert_eq!(
+            [
+                raw.drift,
+                raw.trend,
+                raw.excursion,
+                raw.slope,
+                raw.clip_mean,
+                raw.head_motion,
+                raw.tail_motion,
+            ],
+            [
+                cell.reported_drift,
+                cell.trend,
+                cell.excursion,
+                cell.slope,
+                cell.clip_mean,
+                cell.head_motion,
+                cell.tail_motion,
+            ],
+            "{} row {} seed {} numeric fields differ from the committed S18CELL evidence",
+            raw.bucket,
+            raw.row,
+            raw.seed
+        );
+        assert_eq!(
+            cell.reported_drift,
+            cell.drift(),
+            "{} row {} seed {} records a drift that is not max(trend, excursion)",
+            raw.bucket,
+            raw.row,
+            raw.seed
+        );
+        seen.push((raw.bucket.as_str(), raw.row, raw.seed));
+    }
+    seen.sort_unstable();
+    seen.dedup();
+    assert_eq!(
+        seen.len(),
+        evidence.len(),
+        "the committed S18CELL evidence contains a duplicate bucket/row/seed tuple"
+    );
+
+    assert!(
+        evidence
+            .iter()
+            .all(|cell| cell.tail_motion.is_finite() && cell.tail_motion > 0.0),
+        "every recorded S18 cell must retain its positive finite tail-motion freeze measurement"
+    );
+    let min_tail = evidence
+        .iter()
+        .map(|cell| cell.tail_motion)
+        .fold(f64::INFINITY, f64::min);
+    let max_tail = evidence
+        .iter()
+        .map(|cell| cell.tail_motion)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let documented = format!(
+        "tail motion {min_tail:.1}–{max_tail:.1}/255 per frame across all {} recorded cells",
+        evidence.len()
+    );
+    let prose = include_str!("../src/t2v.rs")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        prose.contains(&documented),
+        "src/t2v.rs must derive its freeze-evidence count/range from the recorded sweep: expected \
+         `{documented}`"
+    );
+
+    let row_e = evidence
+        .iter()
+        .find(|cell| cell.bucket == "640x384" && cell.row == 'E')
+        .expect("the 640x384 global reference row is committed");
+    let row_e_gib = row_e.peak_bytes as f64 / 1024_f64.powi(3);
+    let row_e_doc = format!("{row_e_gib:.2} GiB MLX peak");
+    let recorded_prose = include_str!("generate_smoke.rs")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let row_e_sentence = format!("Row E is `n = 1`: its {row_e_doc}");
+    assert!(
+        recorded_prose.contains(&row_e_sentence),
+        "the recorded-sweep prose must state Row E memory in binary GiB from its recorded byte \
+         count: expected `{row_e_sentence}`"
     );
 }
