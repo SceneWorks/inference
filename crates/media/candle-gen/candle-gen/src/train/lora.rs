@@ -117,6 +117,15 @@ enum AdditiveResidual {
 }
 
 impl AdditiveResidual {
+    /// A zero user strength is an exact disabled adapter. Check it before evaluating the factors so
+    /// unused non-finite data cannot contaminate the host output.
+    fn is_zero(&self) -> bool {
+        match self {
+            AdditiveResidual::Lora { scale, .. } => *scale == 0.0,
+            AdditiveResidual::LokrStructured { factors } => factors.scale == 0.0,
+        }
+    }
+
     /// The residual this adapter contributes, in the activation dtype of `x` (factors are held f32 and
     /// cast per forward — they are tiny). Identical to [`crate::quant::AdaptLinear`]'s residual so the
     /// packed-additive SDXL path and the dense-fold path agree to f32 tolerance.
@@ -390,6 +399,7 @@ impl Module for LoraLinear {
         let y = self.base.forward(x)?;
         let mut y = match &self.adapter {
             None => y,
+            Some(Adapter::Lora { scale, .. }) if *scale == 0.0 => y,
             // Factors are f32; cast to the activation dtype for the matmul. The cast is
             // differentiable, so grads flow back to the f32 `Var`s (master-weights). The factor
             // tensors share storage with those `Var`s, so this reads the current optimizer-updated value.
@@ -398,8 +408,10 @@ impl Module for LoraLinear {
                 let down = down.to_dtype(xd)?;
                 let up = up.to_dtype(xd)?;
                 let lora = x.broadcast_matmul(&down.t()?)?.broadcast_matmul(&up.t()?)?;
-                (y + (lora * *scale)?)?
+                let residual = (lora * *scale)?.to_dtype(y.dtype())?;
+                (y + residual)?
             }
+            Some(Adapter::Lokr { scale, .. }) if *scale == 0.0 => y,
             Some(Adapter::Lokr {
                 w1,
                 w2,
@@ -416,13 +428,20 @@ impl Module for LoraLinear {
                 // dtype for the residual matmul x·ΔWᵀ.
                 let delta = kron2d(w1, &factor2)?.reshape((*out_f, *in_f))?;
                 let delta = (delta * *scale)?.to_dtype(x.dtype())?;
-                (y + x.broadcast_matmul(&delta.t()?)?)?
+                let residual = x.broadcast_matmul(&delta.t()?)?.to_dtype(y.dtype())?;
+                (y + residual)?
             }
         };
         // Forward-time additive inference residuals (sc-11103), applied in push order after the base +
-        // trainable adapter. Empty on the plain / trainable path, so this loop is a no-op there.
+        // trainable adapter. Disabled residuals are skipped; live residuals retain their x-dtype math
+        // and cast only to the current host output dtype at the add. Empty on the plain / trainable
+        // path, so this loop is a no-op there.
         for ar in &self.additive {
-            y = (y + ar.residual(x)?)?;
+            if ar.is_zero() {
+                continue;
+            }
+            let residual = ar.residual(x)?.to_dtype(y.dtype())?;
+            y = (y + residual)?;
         }
         Ok(y)
     }
@@ -1115,11 +1134,186 @@ pub fn save_lokr(set: &LoraSet, extra_meta: &HashMap<String, String>, path: &Pat
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::quant::DenseLinear;
     use candle_core::IndexOp;
+    use gen_core::Quant;
 
     fn fixed_linear(weight: &[f32], out_f: usize, in_f: usize) -> LoraLinear {
         let w = Tensor::from_vec(weight.to_vec(), (out_f, in_f), &Device::Cpu).unwrap();
         LoraLinear::from_linear(Linear::new(w, None), in_f, out_f, "test.to_q".into())
+    }
+
+    fn deterministic_lora_weight(out_f: usize, in_f: usize) -> Tensor {
+        let values: Vec<f32> = (0..out_f * in_f)
+            .map(|i| ((i % 17) as f32 - 8.0) / 16.0)
+            .collect();
+        Tensor::from_vec(values, (out_f, in_f), &Device::Cpu).unwrap()
+    }
+
+    fn deterministic_lora_input(rows: usize, in_f: usize, dtype: DType) -> Tensor {
+        let values: Vec<f32> = (0..rows * in_f)
+            .map(|i| ((i % 11) as f32 + 1.0) / 8.0)
+            .collect();
+        Tensor::from_vec(values, (rows, in_f), &Device::Cpu)
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap()
+    }
+
+    fn int8_fast_lora(quant: Quant, out_f: usize, in_f: usize) -> LoraLinear {
+        let mut base = QLinear::from_dense(DenseLinear::Linear(Linear::new(
+            deterministic_lora_weight(out_f, in_f),
+            None,
+        )));
+        base.quantize_int8_fast(quant, false, false, false).unwrap();
+        LoraLinear::from_qlinear(base, in_f, out_f, "test.to_q".into())
+    }
+
+    fn exact_lora_values(t: &Tensor) -> Vec<Vec<f32>> {
+        t.to_dtype(DType::F32).unwrap().to_vec2::<f32>().unwrap()
+    }
+
+    fn assert_lora_tensor_exact(actual: &Tensor, expected: &Tensor, context: &str) {
+        assert_eq!(actual.dtype(), expected.dtype(), "{context}: dtype differs");
+        assert_eq!(
+            exact_lora_values(actual),
+            exact_lora_values(expected),
+            "{context}: element values differ"
+        );
+    }
+
+    /// sc-15444 bypass audit: `LoraLinear` is the only Candle adapter host that hand-rolls the
+    /// residual addition instead of delegating to `AdaptLinear`. Both its trainable and inference
+    /// additive LoRA arms must skip a zero-strength residual without evaluating poisoned factors.
+    #[test]
+    fn lora_linear_scale_zero_skips_trainable_and_additive_residuals_exactly() {
+        let (out_f, in_f, rank) = (16usize, 32usize, 2usize);
+        let x = deterministic_lora_input(2, in_f, DType::F32);
+        let base = LoraLinear::from_linear(
+            Linear::new(deterministic_lora_weight(out_f, in_f), None),
+            in_f,
+            out_f,
+            "test.to_q".into(),
+        );
+        let expected = base.forward(&x).unwrap();
+
+        let poison_down =
+            Tensor::from_vec(vec![f32::INFINITY; rank * in_f], (rank, in_f), &Device::Cpu).unwrap();
+        let poison_up = Tensor::ones((out_f, rank), DType::F32, &Device::Cpu).unwrap();
+        let mut trainable = LoraLinear::from_linear(
+            Linear::new(deterministic_lora_weight(out_f, in_f), None),
+            in_f,
+            out_f,
+            "test.to_q".into(),
+        );
+        trainable.install_lora(poison_down, poison_up, 0.0);
+        assert_lora_tensor_exact(
+            &trainable.forward(&x).unwrap(),
+            &expected,
+            "trainable scale=0",
+        );
+
+        let poison_a =
+            Tensor::from_vec(vec![f32::INFINITY; in_f * rank], (in_f, rank), &Device::Cpu).unwrap();
+        let poison_b = Tensor::ones((rank, out_f), DType::F32, &Device::Cpu).unwrap();
+        let mut additive = LoraLinear::from_linear(
+            Linear::new(deterministic_lora_weight(out_f, in_f), None),
+            in_f,
+            out_f,
+            "test.to_q".into(),
+        );
+        additive.push_additive_lora(poison_a, poison_b, 0.0);
+        assert_lora_tensor_exact(
+            &additive.forward(&x).unwrap(),
+            &expected,
+            "additive scale=0",
+        );
+
+        let poison_w1 = Tensor::from_vec(vec![f32::INFINITY; 4 * 4], (4, 4), &Device::Cpu).unwrap();
+        let poison_w2 = Tensor::ones((4, 8), DType::F32, &Device::Cpu).unwrap();
+        let mut trainable_lokr = LoraLinear::from_linear(
+            Linear::new(deterministic_lora_weight(out_f, in_f), None),
+            in_f,
+            out_f,
+            "test.to_q".into(),
+        );
+        trainable_lokr.install_lokr(poison_w1.clone(), LokrW2::Full(poison_w2.clone()), 0.0);
+        assert_lora_tensor_exact(
+            &trainable_lokr.forward(&x).unwrap(),
+            &expected,
+            "trainable LoKr scale=0",
+        );
+
+        let factors = LokrFactors::build(
+            0.0,
+            (out_f, in_f),
+            Some(&poison_w1),
+            None,
+            None,
+            Some(&poison_w2),
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        let mut additive_lokr = LoraLinear::from_linear(
+            Linear::new(deterministic_lora_weight(out_f, in_f), None),
+            in_f,
+            out_f,
+            "test.to_q".into(),
+        );
+        additive_lokr.push_additive_lokr(factors);
+        assert_lora_tensor_exact(
+            &additive_lokr.forward(&x).unwrap(),
+            &expected,
+            "additive structured LoKr scale=0",
+        );
+    }
+
+    /// sc-15444 bypass audit: the SDXL `LoraLinear` path must follow its quantized host's f32 output
+    /// dtype rather than the activation dtype when adding either residual form. f64 is the CPU-executable
+    /// proxy for production bf16 input because Candle CPU has no bf16 matmul.
+    #[test]
+    fn lora_linear_quantized_hosts_cast_live_residuals_to_output_dtype_exactly() {
+        let (out_f, in_f, rank) = (32usize, 32usize, 2usize);
+        let x = deterministic_lora_input(2, in_f, DType::F64);
+        let down = Tensor::ones((rank, in_f), DType::F32, &Device::Cpu).unwrap();
+        let up = Tensor::ones((out_f, rank), DType::F32, &Device::Cpu).unwrap();
+        let a = down.t().unwrap().contiguous().unwrap();
+        let b = up.t().unwrap().contiguous().unwrap();
+        let residual = ((x
+            .broadcast_matmul(&a.to_dtype(DType::F64).unwrap())
+            .unwrap()
+            .broadcast_matmul(&b.to_dtype(DType::F64).unwrap())
+            .unwrap())
+            * 0.5)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap();
+
+        for quant in [Quant::Q8, Quant::Q4] {
+            let bare = int8_fast_lora(quant, out_f, in_f);
+            let base_y = bare.forward(&x).unwrap();
+            assert_eq!(base_y.dtype(), DType::F32);
+            let expected = (&base_y + &residual).unwrap();
+
+            let mut trainable = int8_fast_lora(quant, out_f, in_f);
+            trainable.install_lora(down.clone(), up.clone(), 0.5);
+            assert_lora_tensor_exact(
+                &trainable.forward(&x).unwrap(),
+                &expected,
+                "quantized trainable live adapter",
+            );
+
+            let mut additive = int8_fast_lora(quant, out_f, in_f);
+            additive.push_additive_lora(a.clone(), b.clone(), 0.5);
+            assert_lora_tensor_exact(
+                &additive.forward(&x).unwrap(),
+                &expected,
+                "quantized additive live adapter",
+            );
+        }
     }
 
     // ---- packed base (sc-9416) ---------------------------------------------------------------
