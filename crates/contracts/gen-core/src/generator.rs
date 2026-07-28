@@ -3492,8 +3492,9 @@ mod tests {
     /// `…regions.start_secs` with no index — and the two range guards that *do* carry an index
     /// (`start < 0`, `end <= start`) never fire on a NaN, because both comparisons evaluate `false`
     /// for NaN. Without the indexed pass in `validate_request` the caller of a ten-region repaint is
-    /// told a region is malformed but not which one. The bad value sits in region **two** so a guard
-    /// that reached only `regions[0]` fails here.
+    /// told a region is malformed but not which one. The bad value is placed in region **two** so a
+    /// guard that reached only `regions[0]` fails here, and in region **one** so a pass that skips
+    /// `regions[0]` fails too.
     #[test]
     fn a_non_finite_region_bound_is_reported_with_its_index() {
         let c = multi_edit_caps();
@@ -3543,6 +3544,30 @@ mod tests {
             assert!(
                 matches!(err, Error::Msg(_)) && msg.contains("region 2") && msg.contains("end"),
                 "a non-finite end in region THREE must name `region 2`, got {msg:?} ({bad})"
+            );
+
+            // Non-finite START in region ONE (index 0), the symmetric twin of the two cases above:
+            // a pass that *skips* `regions[0]` drops the index and falls through to the index-free
+            // backstop, which the region-1 and region-2 cases alone do not catch.
+            let err = c
+                .validate_request(
+                    "m",
+                    &multi_edit_req(
+                        AudioEditMode::Repaint,
+                        vec![
+                            TimeRegion {
+                                start_secs: bad,
+                                end_secs: Some(6.0),
+                            },
+                            span(8.0, 10.0),
+                        ],
+                    ),
+                )
+                .unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                matches!(err, Error::Msg(_)) && msg.contains("region 0") && msg.contains("start"),
+                "a non-finite start in region ONE must name `region 0`, got {msg:?} ({bad})"
             );
         }
         // Discrimination: a well-formed multi-region request produces no error at all, so the
