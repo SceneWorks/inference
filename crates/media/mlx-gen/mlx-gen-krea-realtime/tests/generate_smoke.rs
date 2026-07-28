@@ -2968,9 +2968,9 @@ struct S18Cell {
     slope: f64,
     /// Which [`DESCRIPTOR_NAMES`] component actually produced [`drift`](Self::drift) for this cell.
     ///
-    /// Recorded so the reader can check *which channel* scored a row rather than taking "the mode is a
-    /// saturation run-away" on trust. It is not the same thing as the corroborating `report_artifacts`
-    /// saturation statistic, and this field is what makes that checkable.
+    /// Recorded so the reader can check *which channel* scored a row rather than taking the earlier
+    /// "saturation" framing of the mode on trust. It is not the same thing as the corroborating
+    /// `report_artifacts` saturation statistic, and this field is what makes that checkable.
     component: &'static str,
 }
 
@@ -3596,6 +3596,72 @@ fn the_s18_verdict_rule_distinguishes_its_outcomes() {
         cells: vec![],
     };
     assert!(empty.verdict().unwrap_err().contains("nothing to conclude"));
+}
+
+/// **The two WITHDRAWN sc-15127 claims must not survive in crate *prose*.**
+///
+/// Every other S18 gate in this file inspects the *generated verdict string*. That is exactly why two
+/// stale doc blocks in `src/t2v.rs` — the module header and the `mac_ar_config` ship-decision doc —
+/// asserted both withdrawn claims through two full review rounds: no gate reads hand-written prose, so
+/// prose is where a retracted conclusion hides. This test closes that hole by reading the doc-bearing
+/// sources themselves.
+///
+/// Doc comments wrap, so the check normalises `//!` / `///` markers and runs of whitespace to single
+/// spaces before matching — a banned phrase split across two lines is still a banned phrase.
+#[test]
+fn the_withdrawn_s18_claims_do_not_survive_in_crate_prose() {
+    /// `//!` / `///` markers and line wrapping removed, whitespace collapsed, lowercased.
+    fn normalise(src: &str) -> String {
+        src.split_whitespace()
+            .filter(|w| *w != "//!" && *w != "///")
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase()
+    }
+
+    // Both phrases are WITHDRAWN findings, not style nits — see sc-15571's "WITHDRAWN" section.
+    //
+    //   "not attributable to the bounded ..." — the window attribution is UNRESOLVED in both buckets,
+    //     not falsified: |D − A| is inside the combined between-seed 2·SEM (7.92/255 at 640×384,
+    //     22.38/255 at 832×480), and the 13 → 10 roll ladder is only a 23% dose reduction, too short to
+    //     exclude a linear-in-rolls mechanism at all.
+    //   "saturation run-away" — `saturation` wins NO row-A cell in either bucket (`S18Cell::component`
+    //     records the winner per cell); the headline mode is colour-cast/tone/structure.
+    const BANNED: &[(&str, &str)] = &[
+        (
+            "not attributable to the bounded",
+            "the window attribution is UNRESOLVED in both buckets, not falsified — |D − A| is inside \
+             the combined 2·SEM (7.92/255 at 640×384, 22.38/255 at 832×480), and a 13 → 10 roll \
+             ladder is a 23% dose reduction that cannot exclude a linear-in-rolls mechanism",
+        ),
+        (
+            "saturation run-away",
+            "`saturation` wins NO row-A cell in either bucket (see the per-cell `S18Cell::component` \
+             winners) — the headline mode is a colour-cast/tone/structure drift, alongside which a \
+             saturation rise is only separately observable",
+        ),
+    ];
+
+    for (file, src) in [
+        ("src/t2v.rs", include_str!("../src/t2v.rs")),
+        ("src/lib.rs", include_str!("../src/lib.rs")),
+    ] {
+        let prose = normalise(src);
+        for (phrase, why) in BANNED {
+            assert!(
+                !prose.contains(&phrase.to_lowercase()),
+                "{file} contains the WITHDRAWN sc-15127 claim \"{phrase}\".\n\n\
+                 Why it is banned: {why}.\n\n\
+                 Do NOT delete this assertion to make the build pass — it exists because both of \
+                 these phrases survived two review rounds in hand-written crate prose while every \
+                 other S18 gate only inspected the generated verdict string. Rewrite the prose to \
+                 match the verdict the recorded sweep actually supports (see \
+                 `generate_t2v_from_components`' doc and sc-15571's WITHDRAWN section). If a future \
+                 measurement genuinely re-establishes one of these claims, retire the entry here in \
+                 the same change that records the data."
+            );
+        }
+    }
 }
 
 // --- The recorded measurement -----------------------------------------------------------------

@@ -31,13 +31,18 @@
 //! `sink_size = 0`.
 //!
 //! **sc-15127 (S18) measured that on real weights (q4, 640×384 and 832×480, 45 latent frames = 13
-//! window rolls, three seeds per configuration) and found two things.** A long clip *does* drift — a
-//! one-way saturation run-away, well past the measurement's budget. But that drift is **not
-//! attributable to the bounded window**: widening the window to 2.5× (10 rolls instead of 13) does not
-//! reduce it, and the checkpoint's global window — zero evictions — is worse still. So **no sink anchor
-//! is wired**, and the drift itself is tracked as **sc-15571**. See [`generate_t2v_from_components`]
-//! for the table,
-//! the controls, and the explicit limits of the claim.
+//! window rolls, three seeds per configuration) and found one thing and one open question.** A long
+//! clip *does* drift, well past the measurement's budget. The headline mode is a
+//! **colour-cast/tone/structure** drift — the blue–yellow opponent axis (`opp-B-Y`) wins every row-A
+//! cell at 832×480 — alongside which a saturation rise is separately observable. **Whether the bounded
+//! window causes it is unresolved in both buckets**: the within-regime dose-response (a 2.5× wider
+//! window, 10 rolls instead of 13) sits inside the combined between-seed 2·SEM — **7.92**/255 at
+//! 640×384 and **22.38**/255 at 832×480 — so no window contribution larger than that is detectable and
+//! nothing smaller is excluded in either direction. So **no sink anchor is wired**: the window
+//! comparison and the sink comparison are *both* unresolved at three seeds, and permanently-resident KV
+//! is not bought on an unresolved comparison. The `sink_size` knob stays plumbed for a checkpoint that
+//! ships one, and the drift itself is tracked as **sc-15571**. See [`generate_t2v_from_components`]
+//! for the table, the controls, and the explicit limits of the claim.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -369,9 +374,9 @@ pub fn decode_latents_to_video(
 ///    And it is a *different channel* from the one that scored row A. The winning descriptor component
 ///    is now recorded per cell (`S18Cell::component`, gated): at 832×480 all three row-A cells are won
 ///    by the **blue–yellow opponent axis** (`opp-B-Y`); at 640×384 they are `spatial-sd`, `luma-mean`
-///    and `opp-B-Y`. `saturation` wins **no** row-A cell in either bucket. So "the mode is a saturation
-///    run-away" overstated it: the headline drift is a colour-cast/tone/structure mode, alongside which
-///    a saturation rise is separately observable.
+///    and `opp-B-Y`. `saturation` wins **no** row-A cell in either bucket. So the earlier
+///    "saturation" framing of the mode overstated it: the headline drift is a colour-cast/tone/
+///    structure mode, alongside which a saturation rise is separately observable.
 /// 2. **Whether the bounded KV window causes it is NOT resolved by this sweep**, in either direction.
 ///    The within-regime dose-response is inside the noise in both buckets: 640×384 A 27.51 vs D 30.57,
 ///    gap +3.06 against a combined 2·SEM of **7.92**; 832×480 A 39.23 vs D 36.42, gap −2.81 against a
@@ -405,7 +410,7 @@ pub fn decode_latents_to_video(
 /// tier (q4), three seeds, 45 latent frames, and only the drift modes the descriptor can see (global
 /// tone, global colour including the opponent axes, and a 5×5 block-luma spread). It says nothing about
 /// semantic or identity drift, texture degradation, or motion quality beyond a freeze check. No row
-/// froze (tail motion 6.6–9.9/255 per frame).
+/// froze (tail motion 3.1–18.8/255 per frame across all 29 recorded cells).
 ///
 /// The seed-to-seed scatter is the same order as the configuration-to-configuration differences, so
 /// **the only ranking this sweep supports is row A against the budget.** Every ordering *between* rows
@@ -1036,11 +1041,13 @@ mod tests {
 
     /// **sc-15127 (S18): the Mac bound ships with NO sink anchor, and that is a measured decision.**
     ///
-    /// The gated real-weight sweep found that long clips *do* drift, but that the drift does not track
-    /// the window-roll count — a 2.5x wider window (10 rolls) is no better than the shipped one (13),
-    /// and zero evictions is worse than both. A first-chunk sink exists to survive eviction, so it is
-    /// not what that evidence points at, and the sink rows' apparent advantage is inside the sweep's
-    /// seed scatter. This pins the outcome: `mac_ar_config` must not start manufacturing a sink the
+    /// The gated real-weight sweep found that long clips *do* drift — but **both** comparisons that
+    /// would justify buying a sink came back unresolved at three seeds. The A-vs-D contrast (shipped
+    /// window vs a 2.5× wider one) is inside the combined between-seed scatter in both buckets, so the
+    /// window is neither implicated nor exonerated; and the A-vs-sink contrast is likewise inside that
+    /// scatter. A first-chunk sink is permanently-resident KV (+0.83 GiB for one latent frame, +2.20
+    /// for three, measured), and permanently-resident KV must not be bought on an unresolved
+    /// comparison. This pins the outcome: `mac_ar_config` must not start manufacturing a sink the
     /// measurement did not justify, and - the other half - the `sink_size` knob must stay a real,
     /// honoured knob so a checkpoint that ships one is respected without a code change.
     #[test]
@@ -1053,8 +1060,8 @@ mod tests {
         let mac = mac_ar_config(&base);
         assert_eq!(
             mac.ar.sink_size, 0,
-            "the Mac bound must not invent a sink anchor — sc-15127 measured that the bounded window \
-             does not need one, and a sink is permanently-resident KV"
+            "the Mac bound must not invent a sink anchor — sc-15127 left both the window and the sink \
+             comparisons unresolved at three seeds, and a sink is permanently-resident KV"
         );
         assert_eq!(
             mac.ar.sink_tokens(),
