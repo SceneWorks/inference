@@ -38,6 +38,11 @@ An adopting provider:
    invalidate evidence; and
 5. runs `gen_core_testkit::image_memory_conformance`.
 
+`begin_image_memory_request` returns an executable request scope. Its `configure_request` method
+translates the shared selection into any provider-native request controls; `finish` is called for
+success, cancellation, and error. Dropping Krea's scope without finishing still synchronizes the
+device as a last-resort cleanup guard.
+
 The separate registration is intentional: adding a field to every existing `ModelRegistration`
 would create provider-wide churn. `ProviderRegistry::image_memory_contract` returns `Ok(None)` for a
 known non-adopter and an error for an unknown id or malformed adopted contract.
@@ -47,7 +52,11 @@ All named runtime bundles expose the contract at `runtime_{cpu,cuda,macos}::imag
 ## Ladder and backend realizations
 
 The stable order is Resident, Staged residency, Bounded decode, Bounded attention, then Bounded
-transformer residency. Rungs are cumulative unless evidence verifies a cheaper equivalent.
+transformer residency. Rungs are cumulative unless evidence verifies a cheaper equivalent. Each
+implemented parameterized rung owns a non-empty production domain: decode owns tile edge and overlap,
+attention owns chunk size, and transformer residency owns block-window size. A selection supplies all
+parameters required by its rung and cheaper cumulative rungs; missing, out-of-domain, or irrelevant
+parameters are rejected.
 
 Candle/CUDA realization describes device residency, host-backed weights, and optional host-to-device
 block materialization. MLX/Metal realization instead describes bounded wired residency,
@@ -80,7 +89,9 @@ Rejections may include a smaller verified geometry only when evidence actually m
 
 Numerical parity is `Exact` where operation ordering permits it. Otherwise evidence names a
 deterministic tolerance metric and limit or a versioned golden fixture; “looks similar” is not a
-contract.
+contract. Verified optimized evidence also requires an observed peak and an explicit passing parity
+result. Empty metrics/fixtures, NaN/infinite/negative tolerances, failed parity, and unexecuted parity
+all prevent optimized eligibility.
 
 ## Reconciliation of existing estimators
 
@@ -88,12 +99,19 @@ contract.
 
 Krea phase curves map to `ImageMemoryFormulaKind::PhaseEnvelope`. Existing measured coefficients and
 boundaries remain manifest evidence; they do not move into the provider crate. The worker evaluates
-those unchanged curves through the shared selector. `krea_2_turbo` is the first adopter: the Candle
-catalog returns its five-rung provider contract with calibration fingerprint
+those unchanged curves through the shared selector. `krea_2_turbo` is the first adopter: the CUDA
+Candle catalog returns its five-rung provider contract with calibration fingerprint
 `krea-turbo-cuda-phase-curves-v1`. The provider contributes lifecycle capability, Candle/CUDA
 realization, asset facts, and that fingerprint. Its local gate may reject a shared choice but must not
 pick a different rung or tier. Raw and Edit remain compatibility-default (`Ok(None)`) until their
-separate mode/envelope evidence is reconciled.
+separate mode/envelope evidence is reconciled. The CPU Candle catalog also returns `Ok(None)` for
+Turbo; a CUDA realization is never exposed by a named CPU bundle.
+
+Krea's request scope maps the cumulative rungs onto the existing, measured
+`GenerationMemory::{tile_vae_decode, chunk_attention, stream_transformer_blocks}` controls, using
+the production 512/128 decode tile, 128 Mi-element attention budget, and one-block transformer
+window. It accepts only sequentially loaded ordinary Turbo text-to-image. Reference/img2img, Edit,
+PiD, and multi-phase requests remain outside that evidence envelope and are rejected before render.
 
 ### Generic MLX
 

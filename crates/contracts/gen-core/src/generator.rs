@@ -36,7 +36,17 @@ pub trait Generator {
     ) -> ImageMemorySafetyDecision {
         match self.image_memory_contract() {
             Some(contract) => match contract.validate_selection(&context.selection) {
-                Ok(()) => ImageMemorySafetyDecision::Accept,
+                Ok(()) if context.budget.fits(context.predicted_peak_bytes) => {
+                    ImageMemorySafetyDecision::Accept
+                }
+                Ok(()) => ImageMemorySafetyDecision::Reject {
+                    reason: format!(
+                        "{}: predicted peak {} exceeds effective budget {}",
+                        self.descriptor().id,
+                        context.predicted_peak_bytes,
+                        context.budget.effective_bytes()
+                    ),
+                },
                 Err(error) => ImageMemorySafetyDecision::Reject {
                     reason: error.to_string(),
                 },

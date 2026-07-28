@@ -10,7 +10,7 @@
 //! fingerprint-mismatched, or out-of-envelope evidence is therefore never turned into a claimed
 //! optimized fit by provider-local policy.
 
-use crate::{Error, Precision, Quant, Result};
+use crate::{Error, GenerationRequest, Precision, Quant, Result};
 
 /// Current ABI of the provider/evidence calibration handshake.
 ///
@@ -357,6 +357,7 @@ impl ImageMemoryProviderContract {
                 }
             }
             validate_ranges(capability, &mut errors);
+            validate_owned_parameter_domain(capability, &mut errors);
         }
 
         if let Some(calibration) = &self.calibration {
@@ -391,7 +392,19 @@ impl ImageMemoryProviderContract {
                 self.provider_id, selection.strategy, capability.support
             )));
         }
-        validate_selected_parameters(selection, capability)
+        for rung in ImageMemoryStrategy::ALL
+            .into_iter()
+            .filter(|rung| *rung < selection.strategy)
+        {
+            let support = self.capability(rung).map(|capability| &capability.support);
+            if matches!(support, Some(ImageMemoryStrategySupport::Missing) | None) {
+                return Err(Error::Unsupported(format!(
+                    "{} cannot execute cumulative {:?}: prerequisite rung {rung:?} is missing",
+                    self.provider_id, selection.strategy
+                )));
+            }
+        }
+        validate_selected_parameters(selection, self)
             .map_err(|message| Error::Unsupported(format!("{}: {message}", self.provider_id)))
     }
 }
@@ -419,43 +432,135 @@ fn validate_ranges(capability: &ImageMemoryStrategyCapability, errors: &mut Vec<
     }
 }
 
+fn validate_owned_parameter_domain(
+    capability: &ImageMemoryStrategyCapability,
+    errors: &mut Vec<String>,
+) {
+    if !matches!(capability.support, ImageMemoryStrategySupport::Implemented) {
+        return;
+    }
+    let ranges = &capability.parameters;
+    let (decode, attention, transformer) = match capability.strategy {
+        ImageMemoryStrategy::Resident | ImageMemoryStrategy::StagedResidency => {
+            (false, false, false)
+        }
+        ImageMemoryStrategy::BoundedDecode => (true, false, false),
+        ImageMemoryStrategy::BoundedAttention => (false, true, false),
+        ImageMemoryStrategy::BoundedTransformerResidency => (false, false, true),
+    };
+    if decode && (ranges.decode_tile_edges.is_empty() || ranges.decode_overlaps.is_empty()) {
+        errors.push(
+            "BoundedDecode requires non-empty decode tile-edge and overlap candidates".to_owned(),
+        );
+    }
+    if attention && ranges.attention_chunk_sizes.is_empty() {
+        errors
+            .push("BoundedAttention requires non-empty attention chunk-size candidates".to_owned());
+    }
+    if transformer && ranges.transformer_window_sizes.is_empty() {
+        errors.push(
+            "BoundedTransformerResidency requires non-empty transformer window candidates"
+                .to_owned(),
+        );
+    }
+    if !decode && (!ranges.decode_tile_edges.is_empty() || !ranges.decode_overlaps.is_empty()) {
+        errors.push(format!(
+            "{:?} must not own decode parameter candidates",
+            capability.strategy
+        ));
+    }
+    if !attention && !ranges.attention_chunk_sizes.is_empty() {
+        errors.push(format!(
+            "{:?} must not own attention parameter candidates",
+            capability.strategy
+        ));
+    }
+    if !transformer && !ranges.transformer_window_sizes.is_empty() {
+        errors.push(format!(
+            "{:?} must not own transformer-window candidates",
+            capability.strategy
+        ));
+    }
+}
+
 fn validate_selected_parameters(
     selection: &ImageMemorySelection,
-    capability: &ImageMemoryStrategyCapability,
+    contract: &ImageMemoryProviderContract,
 ) -> std::result::Result<(), String> {
     let selected = selection.parameters;
-    let ranges = &capability.parameters;
-    for (name, value, allowed) in [
-        (
-            "decode_tile_edge",
-            selected.decode_tile_edge,
-            &ranges.decode_tile_edges,
-        ),
-        (
-            "decode_overlap",
-            selected.decode_overlap,
-            &ranges.decode_overlaps,
-        ),
-        (
-            "attention_chunk_size",
-            selected.attention_chunk_size,
-            &ranges.attention_chunk_sizes,
-        ),
-        (
-            "transformer_window_size",
-            selected.transformer_window_size,
-            &ranges.transformer_window_sizes,
-        ),
-    ] {
-        if let Some(value) = value {
-            if !allowed.contains(&value) {
-                return Err(format!(
-                    "{name}={value} is outside the declared production candidates {allowed:?}"
-                ));
-            }
-        }
-    }
+    let implemented = |strategy| {
+        matches!(
+            contract
+                .capability(strategy)
+                .map(|capability| &capability.support),
+            Some(ImageMemoryStrategySupport::Implemented)
+        )
+    };
+    let requires_decode = selection.strategy >= ImageMemoryStrategy::BoundedDecode
+        && implemented(ImageMemoryStrategy::BoundedDecode);
+    let requires_attention = selection.strategy >= ImageMemoryStrategy::BoundedAttention
+        && implemented(ImageMemoryStrategy::BoundedAttention);
+    let requires_transformer = selection.strategy
+        >= ImageMemoryStrategy::BoundedTransformerResidency
+        && implemented(ImageMemoryStrategy::BoundedTransformerResidency);
+
+    validate_required_parameter(
+        "decode_tile_edge",
+        selected.decode_tile_edge,
+        requires_decode,
+        contract
+            .capability(ImageMemoryStrategy::BoundedDecode)
+            .map(|capability| capability.parameters.decode_tile_edges.as_slice())
+            .unwrap_or_default(),
+    )?;
+    validate_required_parameter(
+        "decode_overlap",
+        selected.decode_overlap,
+        requires_decode,
+        contract
+            .capability(ImageMemoryStrategy::BoundedDecode)
+            .map(|capability| capability.parameters.decode_overlaps.as_slice())
+            .unwrap_or_default(),
+    )?;
+    validate_required_parameter(
+        "attention_chunk_size",
+        selected.attention_chunk_size,
+        requires_attention,
+        contract
+            .capability(ImageMemoryStrategy::BoundedAttention)
+            .map(|capability| capability.parameters.attention_chunk_sizes.as_slice())
+            .unwrap_or_default(),
+    )?;
+    validate_required_parameter(
+        "transformer_window_size",
+        selected.transformer_window_size,
+        requires_transformer,
+        contract
+            .capability(ImageMemoryStrategy::BoundedTransformerResidency)
+            .map(|capability| capability.parameters.transformer_window_sizes.as_slice())
+            .unwrap_or_default(),
+    )?;
     Ok(())
+}
+
+fn validate_required_parameter(
+    name: &str,
+    value: Option<u32>,
+    required: bool,
+    allowed: &[u32],
+) -> std::result::Result<(), String> {
+    match (required, value) {
+        (true, None) => Err(format!(
+            "{name} is required by the selected cumulative strategy"
+        )),
+        (false, Some(value)) => Err(format!(
+            "{name}={value} is irrelevant below its owning strategy rung"
+        )),
+        (true, Some(value)) if !allowed.contains(&value) => Err(format!(
+            "{name}={value} is outside the declared production candidates {allowed:?}"
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// Numeric tier is one immutable axis of a selection. Strategies cannot change it.
@@ -517,10 +622,23 @@ pub enum ImageMemoryCacheState {
     Warm,
 }
 
+/// Advertised request surface. Optimized evidence never transfers between these modes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ImageMemoryMode {
+    TextToImage,
+    ImageToImage,
+    Edit,
+    Other(String),
+}
+
 /// Context for provider safety and lifecycle hooks.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ImageMemoryRunContext {
     pub selection: ImageMemorySelection,
+    pub mode: ImageMemoryMode,
+    pub has_reference: bool,
+    pub use_pid: bool,
+    pub has_phases: bool,
     pub geometry: ImageMemoryGeometry,
     pub overlay: Option<String>,
     pub budget: ImageMemoryBudget,
@@ -546,6 +664,9 @@ pub enum ImageMemoryRunOutcome {
 
 /// Tensor-neutral lifecycle scope implemented by adopting providers.
 pub trait ImageMemoryRequestScope {
+    /// Translate the selected strategy into the provider's existing request controls. This is the
+    /// executable bridge for providers that predate the shared contract.
+    fn configure_request(&mut self, request: &mut GenerationRequest) -> Result<()>;
     fn enter_phase(&mut self, phase: ImageMemoryPhase) -> Result<()>;
     fn leave_phase(&mut self, phase: ImageMemoryPhase) -> Result<()>;
     fn configure_decode(
@@ -602,6 +723,7 @@ pub enum ImageMemoryEvidenceVerdict {
     Stale,
     FingerprintMismatch,
     OutOfEnvelope,
+    Invalid,
 }
 
 /// Explicit six-dimensional evidence result.
@@ -675,6 +797,14 @@ pub enum ImageMemoryParityContract {
     },
 }
 
+/// Result of executing the declared numerical contract.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ImageMemoryParityResult {
+    Passed,
+    Failed { reason: String },
+    NotRun,
+}
+
 /// Dynamic/static evidence handshake consumed by the shared selector.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ImageMemoryEvidence {
@@ -689,9 +819,42 @@ pub struct ImageMemoryEvidence {
     pub predicted_peak_bytes: u64,
     pub observed_peak_bytes: Option<u64>,
     pub parity: ImageMemoryParityContract,
+    pub parity_result: ImageMemoryParityResult,
 }
 
 impl ImageMemoryEvidence {
+    pub fn validation_errors(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        if self.observed_peak_bytes.is_none() {
+            errors.push("verified evidence requires an observed peak".to_owned());
+        }
+        match &self.parity {
+            ImageMemoryParityContract::Exact => {}
+            ImageMemoryParityContract::Tolerance {
+                metric,
+                maximum_error,
+            } => validate_parity_limit(metric, *maximum_error, &mut errors),
+            ImageMemoryParityContract::Golden {
+                fixture,
+                metric,
+                maximum_error,
+            } => {
+                if fixture.trim().is_empty() {
+                    errors.push("golden parity fixture must be non-empty".to_owned());
+                }
+                validate_parity_limit(metric, *maximum_error, &mut errors);
+            }
+        }
+        match &self.parity_result {
+            ImageMemoryParityResult::Passed => {}
+            ImageMemoryParityResult::Failed { reason } if reason.trim().is_empty() => {
+                errors.push("failed parity result requires a reason".to_owned());
+            }
+            ImageMemoryParityResult::Failed { .. } | ImageMemoryParityResult::NotRun => {}
+        }
+        errors
+    }
+
     /// Only a fully verified, six-dimension record matching the current provider handshake may
     /// authorize an optimized fit.
     pub fn optimized_eligibility(
@@ -702,6 +865,12 @@ impl ImageMemoryEvidence {
             return Ok(());
         }
         if self.conformance != ImageMemoryConformanceState::Verified {
+            return Err(ImageMemoryEvidenceVerdict::Unverified);
+        }
+        if !self.validation_errors().is_empty() {
+            return Err(ImageMemoryEvidenceVerdict::Invalid);
+        }
+        if self.parity_result != ImageMemoryParityResult::Passed {
             return Err(ImageMemoryEvidenceVerdict::Unverified);
         }
         for dimension in ImageMemoryEvidenceDimension::ALL {
@@ -719,6 +888,15 @@ impl ImageMemoryEvidence {
             return Err(ImageMemoryEvidenceVerdict::FingerprintMismatch);
         }
         Ok(())
+    }
+}
+
+fn validate_parity_limit(metric: &str, maximum_error: f64, errors: &mut Vec<String>) {
+    if metric.trim().is_empty() {
+        errors.push("parity metric must be non-empty".to_owned());
+    }
+    if !maximum_error.is_finite() || maximum_error < 0.0 {
+        errors.push("parity maximum_error must be finite and non-negative".to_owned());
     }
 }
 
@@ -845,6 +1023,7 @@ mod tests {
             predicted_peak_bytes: 10,
             observed_peak_bytes: Some(9),
             parity: ImageMemoryParityContract::Exact,
+            parity_result: ImageMemoryParityResult::Passed,
         };
         assert_eq!(evidence.optimized_eligibility(&contract), Ok(()));
 
@@ -908,5 +1087,117 @@ mod tests {
             contract.validate_selection(&selection),
             Err(Error::Unsupported(_))
         ));
+    }
+
+    #[test]
+    fn cumulative_parameters_are_required_and_irrelevant_parameters_are_rejected() {
+        let contract = adopted_contract();
+        let tier = ImageMemoryNumericTier {
+            precision: Precision::Bf16,
+            quant: None,
+        };
+        let mut selection = ImageMemorySelection {
+            strategy: ImageMemoryStrategy::BoundedAttention,
+            parameters: ImageMemoryStrategyParameters {
+                decode_tile_edge: Some(512),
+                decode_overlap: Some(64),
+                attention_chunk_size: Some(128),
+                transformer_window_size: None,
+            },
+            tier,
+        };
+        contract.validate_selection(&selection).unwrap();
+
+        selection.parameters.decode_overlap = None;
+        assert!(contract
+            .validate_selection(&selection)
+            .unwrap_err()
+            .to_string()
+            .contains("decode_overlap is required"));
+
+        selection.strategy = ImageMemoryStrategy::Resident;
+        selection.parameters = ImageMemoryStrategyParameters {
+            attention_chunk_size: Some(128),
+            ..Default::default()
+        };
+        assert!(contract
+            .validate_selection(&selection)
+            .unwrap_err()
+            .to_string()
+            .contains("irrelevant"));
+    }
+
+    #[test]
+    fn optimized_evidence_requires_valid_passing_parity_and_an_observed_peak() {
+        let contract = adopted_contract();
+        let mut evidence = ImageMemoryEvidence {
+            key: ImageMemoryEvidenceKey {
+                resolved_route: "test".to_owned(),
+                backend: "mlx".to_owned(),
+                tier: ImageMemoryNumericTier {
+                    precision: Precision::Bf16,
+                    quant: None,
+                },
+                mode: "text_to_image".to_owned(),
+                overlay: None,
+                geometry: ImageMemoryGeometry {
+                    width: 512,
+                    height: 512,
+                    batch: 1,
+                    frames: 1,
+                },
+                strategy: ImageMemoryStrategy::BoundedDecode,
+                parameters: ImageMemoryStrategyParameters {
+                    decode_tile_edge: Some(512),
+                    decode_overlap: Some(64),
+                    ..Default::default()
+                },
+            },
+            conformance: ImageMemoryConformanceState::Verified,
+            dimensions: ImageMemoryEvidenceDimensions::VERIFIED,
+            calibration_abi: IMAGE_MEMORY_CALIBRATION_ABI,
+            calibration_fingerprint: "test-layout-v1".to_owned(),
+            sceneworks_revision: "scene".to_owned(),
+            inference_revision: "inference".to_owned(),
+            harness_version: "v1".to_owned(),
+            predicted_peak_bytes: 10,
+            observed_peak_bytes: Some(9),
+            parity: ImageMemoryParityContract::Tolerance {
+                metric: "max_abs".to_owned(),
+                maximum_error: 0.001,
+            },
+            parity_result: ImageMemoryParityResult::Passed,
+        };
+        assert_eq!(evidence.optimized_eligibility(&contract), Ok(()));
+
+        evidence.parity = ImageMemoryParityContract::Tolerance {
+            metric: String::new(),
+            maximum_error: f64::NAN,
+        };
+        assert_eq!(
+            evidence.optimized_eligibility(&contract),
+            Err(ImageMemoryEvidenceVerdict::Invalid)
+        );
+        evidence.parity = ImageMemoryParityContract::Golden {
+            fixture: String::new(),
+            metric: "max_abs".to_owned(),
+            maximum_error: -1.0,
+        };
+        assert_eq!(
+            evidence.optimized_eligibility(&contract),
+            Err(ImageMemoryEvidenceVerdict::Invalid)
+        );
+        evidence.parity = ImageMemoryParityContract::Exact;
+        evidence.observed_peak_bytes = None;
+        assert_eq!(
+            evidence.optimized_eligibility(&contract),
+            Err(ImageMemoryEvidenceVerdict::Invalid)
+        );
+        evidence.observed_peak_bytes = Some(9);
+        evidence.parity_result = ImageMemoryParityResult::NotRun;
+        assert_eq!(
+            evidence.optimized_eligibility(&contract),
+            Err(ImageMemoryEvidenceVerdict::Unverified)
+        );
     }
 }

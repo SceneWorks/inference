@@ -104,7 +104,9 @@ pub use transformer::Krea2Transformer;
 pub use vae::{load_vae, QwenVae, QwenVaeEncoder};
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock};
+#[cfg(feature = "cuda")]
+use std::sync::OnceLock;
+use std::sync::{Arc, Mutex};
 
 use candle_gen::candle_core::{Device, Tensor};
 use candle_gen::gen_core::{
@@ -230,13 +232,204 @@ pub struct KreaGenerator {
     has_diff_patch: bool,
 }
 
+#[cfg(any(feature = "cuda", test))]
+struct KreaImageMemoryScope {
+    device: Device,
+    memory: Option<gen_core::GenerationMemory>,
+    finished: bool,
+}
+
+#[cfg(any(feature = "cuda", test))]
+impl KreaImageMemoryScope {
+    fn ensure_active(&self) -> gen_core::Result<()> {
+        if self.finished {
+            Err(gen_core::Error::Msg(
+                "krea image-memory request scope is already finished".to_owned(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[cfg(any(feature = "cuda", test))]
+impl gen_core::ImageMemoryRequestScope for KreaImageMemoryScope {
+    fn configure_request(&mut self, request: &mut GenerationRequest) -> gen_core::Result<()> {
+        self.ensure_active()?;
+        if img2img_reference(request).is_some()
+            || request.phases.is_some()
+            || request.use_pid
+            || !request.conditioning.is_empty()
+        {
+            return Err(gen_core::Error::Unsupported(
+                "krea_2_turbo: optimized image-memory strategies require ordinary text-to-image \
+                 without reference/edit conditioning, PiD, or multi-phase denoise"
+                    .to_owned(),
+            ));
+        }
+        // The shared selection is authoritative and request-scoped. Overwrite any state left on a
+        // reused warm request so a deeper prior rung cannot leak into the next run.
+        request.memory = self.memory;
+        Ok(())
+    }
+
+    fn enter_phase(&mut self, _phase: gen_core::ImageMemoryPhase) -> gen_core::Result<()> {
+        self.ensure_active()
+    }
+
+    fn leave_phase(&mut self, _phase: gen_core::ImageMemoryPhase) -> gen_core::Result<()> {
+        self.ensure_active()
+    }
+
+    fn configure_decode(
+        &mut self,
+        tile_edge: u32,
+        overlap: u32,
+        _geometry: gen_core::ImageMemoryGeometry,
+    ) -> gen_core::Result<()> {
+        self.ensure_active()?;
+        if tile_edge == 512 && overlap == 128 {
+            Ok(())
+        } else {
+            Err(gen_core::Error::Unsupported(format!(
+                "krea_2_turbo: decode tiling is fixed at 512/128, got {tile_edge}/{overlap}"
+            )))
+        }
+    }
+
+    fn configure_attention(&mut self, chunk_size: u32) -> gen_core::Result<()> {
+        self.ensure_active()?;
+        if chunk_size == pipeline::CONSTRAINED_ATTN_SCORES_BUDGET as u32 {
+            Ok(())
+        } else {
+            Err(gen_core::Error::Unsupported(format!(
+                "krea_2_turbo: attention chunk size is fixed at {}, got {chunk_size}",
+                pipeline::CONSTRAINED_ATTN_SCORES_BUDGET
+            )))
+        }
+    }
+
+    fn materialize_transformer_window(
+        &mut self,
+        _first_block: u32,
+        block_count: u32,
+    ) -> gen_core::Result<()> {
+        self.ensure_active()?;
+        if block_count == 1 {
+            Ok(())
+        } else {
+            Err(gen_core::Error::Unsupported(format!(
+                "krea_2_turbo: transformer residency window is fixed at one block, got {block_count}"
+            )))
+        }
+    }
+
+    fn finish(&mut self, _outcome: gen_core::ImageMemoryRunOutcome) -> gen_core::Result<()> {
+        self.ensure_active()?;
+        self.device
+            .synchronize()
+            .map_err(|error| gen_core::Error::backend(error))?;
+        self.finished = true;
+        Ok(())
+    }
+}
+
+#[cfg(any(feature = "cuda", test))]
+impl Drop for KreaImageMemoryScope {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = self.device.synchronize();
+            self.finished = true;
+        }
+    }
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn krea_generation_memory(
+    selection: gen_core::ImageMemorySelection,
+) -> Option<gen_core::GenerationMemory> {
+    use gen_core::ImageMemoryStrategy;
+
+    match selection.strategy {
+        ImageMemoryStrategy::Resident => None,
+        ImageMemoryStrategy::StagedResidency => Some(gen_core::GenerationMemory::default()),
+        ImageMemoryStrategy::BoundedDecode => Some(gen_core::GenerationMemory {
+            tile_vae_decode: true,
+            ..Default::default()
+        }),
+        ImageMemoryStrategy::BoundedAttention => Some(gen_core::GenerationMemory {
+            tile_vae_decode: true,
+            chunk_attention: true,
+            ..Default::default()
+        }),
+        ImageMemoryStrategy::BoundedTransformerResidency => Some(gen_core::GenerationMemory {
+            tile_vae_decode: true,
+            chunk_attention: true,
+            stream_transformer_blocks: true,
+        }),
+    }
+}
+
 impl Generator for KreaGenerator {
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
     }
 
     fn image_memory_contract(&self) -> Option<&gen_core::ImageMemoryProviderContract> {
-        (self.descriptor.id == KREA_2_TURBO_ID).then(krea_turbo_image_memory_contract)
+        #[cfg(feature = "cuda")]
+        {
+            return (self.descriptor.id == KREA_2_TURBO_ID).then(krea_turbo_image_memory_contract);
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            None
+        }
+    }
+
+    fn begin_image_memory_request(
+        &self,
+        context: &gen_core::ImageMemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::ImageMemoryRequestScope + '_>>> {
+        #[cfg(feature = "cuda")]
+        {
+            if self.descriptor.id != KREA_2_TURBO_ID {
+                return Ok(None);
+            }
+            if context.mode != gen_core::ImageMemoryMode::TextToImage
+                || context.has_reference
+                || context.use_pid
+                || context.has_phases
+            {
+                return Err(gen_core::Error::Unsupported(
+                    "krea_2_turbo: optimized image-memory strategies cover ordinary text-to-image \
+                     only (no reference, PiD, or multi-phase request)"
+                        .to_owned(),
+                ));
+            }
+            if context.selection.strategy.is_optimized()
+                && self.offload_policy != OffloadPolicy::Sequential
+            {
+                return Err(gen_core::Error::Unsupported(
+                    "krea_2_turbo: optimized image-memory strategies require a sequential load"
+                        .to_owned(),
+                ));
+            }
+            if let gen_core::ImageMemorySafetyDecision::Reject { reason } =
+                self.image_memory_safety_check(context)
+            {
+                return Err(gen_core::Error::Unsupported(reason));
+            }
+            return Ok(Some(Box::new(KreaImageMemoryScope {
+                device: self.device.clone(),
+                memory: krea_generation_memory(context.selection),
+                finished: false,
+            })));
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = context;
+            Ok(None)
+        }
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
@@ -979,6 +1172,7 @@ candle_gen::register_generators! {
 /// Krea Turbo's provider-owned half of the shared image-memory handshake. The measured phase
 /// coefficients and exact fit boundaries stay in SceneWorks generated evidence; this declaration
 /// pins the executable structure that makes those measurements valid.
+#[cfg(feature = "cuda")]
 fn build_krea_turbo_image_memory_contract() -> gen_core::ImageMemoryProviderContract {
     use gen_core::{
         ImageMemoryBackendRealization, ImageMemoryCalibrationIdentity, ImageMemoryFormulaKind,
@@ -999,9 +1193,28 @@ fn build_krea_turbo_image_memory_contract() -> gen_core::ImageMemoryProviderCont
             .map(|strategy| ImageMemoryStrategyCapability {
                 strategy,
                 support: ImageMemoryStrategySupport::Implemented,
-                // Krea's current production rungs are boolean seams. Their internal tile, attention
-                // budget, and one-block window are fingerprinted below and calibrated externally.
-                parameters: ImageMemoryParameterRanges::default(),
+                parameters: match strategy {
+                    ImageMemoryStrategy::BoundedDecode => ImageMemoryParameterRanges {
+                        decode_tile_edges: vec![512],
+                        decode_overlaps: vec![128],
+                        ..Default::default()
+                    },
+                    ImageMemoryStrategy::BoundedAttention => ImageMemoryParameterRanges {
+                        attention_chunk_sizes: vec![
+                            pipeline::CONSTRAINED_ATTN_SCORES_BUDGET as u32,
+                        ],
+                        ..Default::default()
+                    },
+                    ImageMemoryStrategy::BoundedTransformerResidency => {
+                        ImageMemoryParameterRanges {
+                            transformer_window_sizes: vec![1],
+                            ..Default::default()
+                        }
+                    }
+                    ImageMemoryStrategy::Resident | ImageMemoryStrategy::StagedResidency => {
+                        ImageMemoryParameterRanges::default()
+                    }
+                },
             })
             .collect(),
         lifecycle: ImageMemoryLifecycleCapabilities {
@@ -1037,17 +1250,20 @@ fn build_krea_turbo_image_memory_contract() -> gen_core::ImageMemoryProviderCont
     }
 }
 
+#[cfg(feature = "cuda")]
 fn krea_turbo_image_memory_contract() -> &'static gen_core::ImageMemoryProviderContract {
     static CONTRACT: OnceLock<gen_core::ImageMemoryProviderContract> = OnceLock::new();
     CONTRACT.get_or_init(build_krea_turbo_image_memory_contract)
 }
 
+#[cfg(feature = "cuda")]
 fn registered_krea_turbo_image_memory_contract(
     _spec: &LoadSpec,
 ) -> gen_core::Result<gen_core::ImageMemoryProviderContract> {
     Ok(krea_turbo_image_memory_contract().clone())
 }
 
+#[cfg(feature = "cuda")]
 const TURBO_IMAGE_MEMORY_REGISTRATION: gen_core::ImageMemoryRegistration =
     gen_core::ImageMemoryRegistration {
         provider_id: KREA_2_TURBO_ID,
@@ -1058,11 +1274,13 @@ const TURBO_IMAGE_MEMORY_REGISTRATION: gen_core::ImageMemoryRegistration =
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    registry
+    let registry = registry
         .register_generator(TURBO_REGISTRATION)
         .register_generator(RAW_REGISTRATION)
-        .register_generator(EDIT_REGISTRATION)
-        .register_image_memory(TURBO_IMAGE_MEMORY_REGISTRATION)
+        .register_generator(EDIT_REGISTRATION);
+    #[cfg(feature = "cuda")]
+    let registry = registry.register_image_memory(TURBO_IMAGE_MEMORY_REGISTRATION);
+    registry
         .register_trainer(training::TRAINER_REGISTRATION)
         .register_trainer(control_trainer::CONTROL_TRAINER_REGISTRATION)
 }
@@ -1092,35 +1310,158 @@ mod explicit_registry_tests {
         );
         assert_eq!(explicit_trainers, ["krea_2_raw", "krea_2_control"]);
 
-        let spec = candle_gen::gen_core::LoadSpec::new(
-            candle_gen::gen_core::WeightsSource::Dir("/nonexistent".into()),
-        );
-        let contract = registry
-            .image_memory_contract(super::KREA_2_TURBO_ID, &spec)
-            .unwrap()
-            .expect("Krea Turbo must register its image-memory contract");
-        assert_eq!(
-            contract.calibration.as_ref().unwrap().fingerprint,
-            "krea-turbo-cuda-phase-curves-v1"
-        );
-        assert_eq!(contract.strategies.len(), 5);
-        assert!(contract
-            .strategies
-            .iter()
-            .all(|capability| matches!(
+        let spec = candle_gen::gen_core::LoadSpec::new(candle_gen::gen_core::WeightsSource::Dir(
+            "/nonexistent".into(),
+        ));
+        #[cfg(feature = "cuda")]
+        {
+            let contract = registry
+                .image_memory_contract(super::KREA_2_TURBO_ID, &spec)
+                .unwrap()
+                .expect("Krea Turbo must register its CUDA image-memory contract");
+            assert_eq!(
+                contract.calibration.as_ref().unwrap().fingerprint,
+                "krea-turbo-cuda-phase-curves-v1"
+            );
+            assert_eq!(contract.strategies.len(), 5);
+            assert!(contract.strategies.iter().all(|capability| matches!(
                 capability.support,
                 candle_gen::gen_core::ImageMemoryStrategySupport::Implemented
             )));
+            gen_core_testkit::check_image_memory_contract(&contract).unwrap();
+
+            let edit_default =
+                candle_gen::gen_core::ImageMemoryProviderContract::compatibility_default(
+                    super::KREA_2_EDIT_ID,
+                    contract.backend.clone(),
+                );
+            gen_core_testkit::check_image_memory_contract(&edit_default).unwrap();
+        }
+        #[cfg(not(feature = "cuda"))]
         assert!(registry
-            .image_memory_contract(super::KREA_2_RAW_ID, &spec)
+            .image_memory_contract(super::KREA_2_TURBO_ID, &spec)
             .unwrap()
             .is_none());
+
+        for id in [super::KREA_2_RAW_ID, super::KREA_2_EDIT_ID] {
+            assert!(registry.image_memory_contract(id, &spec).unwrap().is_none());
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_memory_ladder_maps_to_cumulative_existing_controls() {
+        let tier = gen_core::ImageMemoryNumericTier {
+            precision: gen_core::Precision::Bf16,
+            quant: Some(Quant::Q4),
+        };
+        let parameters = gen_core::ImageMemoryStrategyParameters {
+            decode_tile_edge: Some(512),
+            decode_overlap: Some(128),
+            attention_chunk_size: Some(pipeline::CONSTRAINED_ATTN_SCORES_BUDGET as u32),
+            transformer_window_size: Some(1),
+        };
+        let selected = |strategy| gen_core::ImageMemorySelection {
+            strategy,
+            parameters,
+            tier,
+        };
+
+        assert_eq!(
+            krea_generation_memory(selected(gen_core::ImageMemoryStrategy::Resident)),
+            None
+        );
+        assert_eq!(
+            krea_generation_memory(selected(gen_core::ImageMemoryStrategy::StagedResidency)),
+            Some(gen_core::GenerationMemory::default())
+        );
+        assert_eq!(
+            krea_generation_memory(selected(gen_core::ImageMemoryStrategy::BoundedDecode)),
+            Some(gen_core::GenerationMemory {
+                tile_vae_decode: true,
+                ..Default::default()
+            })
+        );
+        assert_eq!(
+            krea_generation_memory(selected(gen_core::ImageMemoryStrategy::BoundedAttention)),
+            Some(gen_core::GenerationMemory {
+                tile_vae_decode: true,
+                chunk_attention: true,
+                ..Default::default()
+            })
+        );
+        assert_eq!(
+            krea_generation_memory(selected(
+                gen_core::ImageMemoryStrategy::BoundedTransformerResidency
+            )),
+            Some(gen_core::GenerationMemory {
+                tile_vae_decode: true,
+                chunk_attention: true,
+                stream_transformer_blocks: true,
+            })
+        );
+    }
+
+    #[test]
+    fn request_scope_reapplies_warm_state_rejects_non_t2i_and_finishes_once() {
+        use gen_core::ImageMemoryRequestScope;
+
+        let attention_memory = gen_core::GenerationMemory {
+            tile_vae_decode: true,
+            chunk_attention: true,
+            ..Default::default()
+        };
+        let mut scope = KreaImageMemoryScope {
+            device: Device::Cpu,
+            memory: Some(attention_memory),
+            finished: false,
+        };
+        let mut request = GenerationRequest {
+            prompt: "test".to_owned(),
+            memory: Some(gen_core::GenerationMemory {
+                stream_transformer_blocks: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        scope.configure_request(&mut request).unwrap();
+        assert_eq!(request.memory, Some(attention_memory));
+        scope
+            .finish(gen_core::ImageMemoryRunOutcome::Complete)
+            .unwrap();
+        assert!(scope
+            .finish(gen_core::ImageMemoryRunOutcome::Complete)
+            .is_err());
+
+        let mut rejected = KreaImageMemoryScope {
+            device: Device::Cpu,
+            memory: Some(attention_memory),
+            finished: false,
+        };
+        let mut img2img = GenerationRequest {
+            prompt: "test".to_owned(),
+            conditioning: vec![Conditioning::Reference {
+                image: Image {
+                    width: 16,
+                    height: 16,
+                    pixels: vec![0; 16 * 16 * 3],
+                },
+                strength: None,
+            }],
+            ..Default::default()
+        };
+        assert!(matches!(
+            rejected.configure_request(&mut img2img),
+            Err(gen_core::Error::Unsupported(_))
+        ));
+        rejected
+            .finish(gen_core::ImageMemoryRunOutcome::Canceled)
+            .unwrap();
+    }
 
     #[test]
     fn registers_krea_2_turbo_as_candle() {
