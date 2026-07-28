@@ -310,8 +310,8 @@ fn frame_stats(frames: &[Image]) -> Vec<FrameStat> {
 /// on its own terms.
 ///
 /// This is a *structural* floor, not the long-clip coherence measurement — that is
-/// [`long_clip_coherence_under_the_bounded_window`] (sc-15127), which measured that the drift mode is
-/// **not** caused by the bounded KV window sliding with an empty sink.
+/// [`long_clip_coherence_under_the_bounded_window`] (sc-15127/sc-15585), which measured real drift but
+/// did not resolve whether the bounded KV window causes it.
 fn assert_coherent(frames: &[Image], w: usize, h: usize, label: &str) {
     assert!(!frames.is_empty(), "{label}: no frames produced");
     for (i, f) in frames.iter().enumerate() {
@@ -1842,12 +1842,13 @@ fn kv_cache_residency_at_the_production_geometry() {
 // are not the same clip; they are the same *prompt and seed* under different attention. Row E is
 // retained as an out-of-regime reference (it is what the Mac bound replaces) and is explicitly **not**
 // a motion floor. What remains valid:
-//   * a **within-regime dose-response**: row D is the same bounded local-attention path at a 2.5×
-//     wider window (fewer rolls). If rolling causes drift, fewer rolls must drift less.
-//   * a **within-regime zero-eviction rate floor** (row Z): the shipped window on a clip short enough
-//     that it never rolls. Its clip is too short for a length-scaled trend to be comparable, so what it
-//     contributes is a *slope* (per 100 output frames) — the rate ordinary motion moves the descriptor
-//     under this exact attention regime.
+//   * a **within-regime three-dose response**: rows A/D/F use the same bounded local-attention path
+//     at windows 6/15/30 (13/10/5 rolls). The decision statistic is a paired-seed slope, not an
+//     endpoint ranking.
+//   * a **within-regime zero-eviction rate finding** (row Z): the shipped window on a clip short
+//     enough that it never rolls. Its short-segment slope is retained, but the recorded value is
+//     higher than row A's long-clip rate and over-predicts row A when extrapolated, so it does not
+//     establish a rate floor.
 //   * an **absolute budget** ([`DRIFT_BUDGET`]), justified against the metric's measured floor and its
 //     measured response to the plausible failure shapes, and gated in CI on both.
 
@@ -2493,8 +2494,8 @@ struct S18Row {
 }
 
 /// One row of the S18 sweep. Rows share a prompt, seed and geometry, but **not** a clip: changing
-/// `local_attn_size` changes the attention mask and therefore the sampling trajectory. Rows D and Z are
-/// the within-regime controls (same bounded local-attention path); row E is an out-of-regime reference.
+/// `local_attn_size` changes the attention mask and therefore the sampling trajectory. Rows D, F and Z
+/// are within-regime controls (same bounded local-attention path); row E is an out-of-regime reference.
 struct DriftRun {
     row: char,
     label: &'static str,
@@ -2505,6 +2506,17 @@ struct DriftRun {
     latent_frames: Option<usize>,
 }
 
+/// Number of AR chunks that append past a bounded read window. A negative window is the separate
+/// global-attention regime and never evicts.
+fn eviction_rolls(latent_frames: usize, frames_per_block: usize, window: i64) -> usize {
+    if window < 0 {
+        return 0;
+    }
+    (0..latent_frames.div_ceil(frames_per_block))
+        .filter(|chunk| frames_per_block * (chunk + 1) > window as usize)
+        .count()
+}
+
 /// **sc-15127 (S18) — does a long batch clip drift as the bounded KV window rolls, and does a
 /// first-chunk sink anchor fix it?**
 ///
@@ -2513,17 +2525,18 @@ struct DriftRun {
 /// peak is reported too, so the sink's KV cost is measured rather than asserted: a sink is permanently
 /// resident, and the bounded window exists precisely because KV is expensive on this host.
 ///
-/// **Rows.** `A` shipped (window 6, sink 0) · `B` sink 1 · `C` sink 3 · `D` wide window (the
-/// within-regime dose-response) · `E` the checkpoint's global window (an out-of-regime *reference*, not
-/// a floor, and **not attribution evidence** — different attention mask, `n = 1`, no variance estimate)
-/// · `Z` the within-regime zero-eviction *rate* row (shipped window, clip short enough never to roll).
+/// **Rows.** `A` shipped (window 6, sink 0) · `B` sink 1 · `C` sink 3 · `D` wide window 15 · `F`
+/// wider bounded window 30 (together A/D/F form the within-regime dose ladder) · `E` the checkpoint's
+/// global window (an out-of-regime *reference*, not a floor, and **not attribution evidence** —
+/// different attention mask, `n = 1`, no variance estimate) · `Z` the within-regime zero-eviction
+/// *rate* row (shipped window, clip short enough never to roll).
 ///
 /// Row Z was intended as a rate floor and **turned out not to be one** — see
 /// [`S18Sweep::rate_floor_clause`] for the measured reason. It is still run, still recorded and still
 /// reported in the verdict, because "the intended floor does not work, and here is the number that
 /// shows it" is the honest form of that result.
 ///
-/// **Driving it.** `KREA_S18_ROWS` (default `ABCDEZ`) selects rows; `KREA_S18_SEEDS` (comma-separated,
+/// **Driving it.** `KREA_S18_ROWS` (default `ABCDFEZ`) selects rows; `KREA_S18_SEEDS` (comma-separated,
 /// default `7`) selects seeds. Each (row, seed) prints one `S18CELL` TSV line, so a long sweep can be
 /// run in pieces and re-aggregated without holding a five-hour process open.
 ///
@@ -2560,15 +2573,16 @@ fn long_clip_coherence_under_the_bounded_window() {
         .filter_map(|s| s.trim().parse().ok())
         .collect();
     assert!(!seeds.is_empty(), "KREA_S18_SEEDS parsed to nothing");
-    let want_rows = std::env::var("KREA_S18_ROWS").unwrap_or_else(|_| "ABCDEZ".to_string());
+    let want_rows = std::env::var("KREA_S18_ROWS").unwrap_or_else(|_| "ABCDFEZ".to_string());
     let (latent_h, latent_w) = (h / 8, w / 8);
 
     let base = KreaRealtimeConfig::krea_realtime_14b();
     let fpb = base.ar.num_frames_per_block; // 3 latent frames per AR chunk
     let shipped_window = base.ar.streaming_local_attn_frames() as i64; // 6 latent frames
-    let wide_window = shipped_window * 2 + 3; // 15 latent frames — the dose-response control
-                                              // Row Z: the longest clip the SHIPPED window never evicts on. Chunk `c` commits `fpb*(c+1)` latent
-                                              // frames and evicts once that exceeds the window, so `shipped_window` latent frames is exactly it.
+    let wide_window = shipped_window * 2 + 3; // 15 latent frames — middle dose (10 rolls at 45f)
+    let wider_bounded_window = shipped_window * 5; // 30 latent frames — high dose (5 rolls at 45f)
+                                                   // Row Z: the longest clip the SHIPPED window never evicts on. Chunk `c` commits `fpb*(c+1)` latent
+                                                   // frames and evicts once that exceeds the window, so `shipped_window` latent frames is exactly it.
     let zero_roll_lat = shipped_window as usize;
 
     // Every long row is scored over the SAME split, fixed by the shipped window's geometry: the
@@ -2606,6 +2620,13 @@ fn long_clip_coherence_under_the_bounded_window() {
             row: 'D',
             label: "D wide win   (window 15, sink 0)",
             window: wide_window,
+            sink: 0,
+            latent_frames: None,
+        },
+        DriftRun {
+            row: 'F',
+            label: "F wider bound (window 30, sink 0)",
+            window: wider_bounded_window,
             sink: 0,
             latent_frames: None,
         },
@@ -2684,13 +2705,7 @@ fn long_clip_coherence_under_the_bounded_window() {
             let chunks = lat.div_ceil(fpb);
             // Chunk `c` commits latent frames up to `fpb*(c+1)`; it evicts once that exceeds the
             // window. A global window (`local_attn_size < 0`) never evicts.
-            let rolls = if r.window < 0 {
-                0
-            } else {
-                (0..chunks)
-                    .filter(|c| fpb * (c + 1) > r.window as usize)
-                    .count()
-            };
+            let rolls = eviction_rolls(lat, fpb, r.window);
 
             println!(
                 "=== {} seed {seed} | {lat} latent frames, {chunks} chunks, {rolls} evicting, \
@@ -2943,7 +2958,8 @@ fn long_clip_coherence_under_the_bounded_window() {
 /// One measured (row, seed) cell of the S18 sweep.
 #[derive(Clone, Copy, Debug)]
 struct S18Cell {
-    /// `A` shipped · `B` sink 1 · `C` sink 3 · `D` wide window · `E` global reference · `Z` zero-roll.
+    /// `A` shipped · `B` sink 1 · `C` sink 3 · `D` wide15 · `F` wide30 · `E` global reference ·
+    /// `Z` zero-roll.
     row: char,
     seed: u64,
     latent_frames: usize,
@@ -3035,8 +3051,17 @@ fn an_s18_cell_retains_tail_motion_from_the_live_sweep() {
     );
 }
 
-/// Outcome of the within-regime window dose-response — row `D` (2.5× wider window, fewer evictions)
-/// against row `A` (shipped).
+#[test]
+fn the_s18_bounded_dose_ladder_spans_thirteen_ten_and_five_rolls() {
+    let (latent_frames, frames_per_block) = (45, 3);
+    assert_eq!(eviction_rolls(latent_frames, frames_per_block, 6), 13);
+    assert_eq!(eviction_rolls(latent_frames, frames_per_block, 15), 10);
+    assert_eq!(eviction_rolls(latent_frames, frames_per_block, 30), 5);
+    assert_eq!(eviction_rolls(latent_frames, frames_per_block, -1), 0);
+}
+
+/// Outcome of the within-regime A/D/F window dose-response. The decision statistic is the mean,
+/// across matched seeds, of the OLS slope of drift against roll count at windows 6/15/30.
 ///
 /// **Symmetric by construction.** An earlier form fired whenever `D + combined_spread >= A`, i.e.
 /// whenever the wider window failed to *beat* the shipped one, and then asserted an unqualified
@@ -3045,33 +3070,37 @@ fn an_s18_cell_retains_tail_motion_from_the_live_sweep() {
 /// max−min → 2·SEM change fixed elsewhere in this file. It is also inconsistent with the sink
 /// comparison, which correctly applies a *resolvability* standard to exactly this shape of question.
 ///
-/// So: neither direction may be asserted unless `|D − A|` clears the combined between-seed spread, and
-/// when it does not, the outcome names the effect size the design **can** exclude.
+/// So: neither direction may be asserted unless the fitted slope clears its between-seed 2·SEM, and
+/// when it does not, the outcome names the effect size the enlarged roll span **can** exclude.
 enum WindowAttribution {
-    /// No row `D` was measured — the dose-response was not run.
+    /// One or more of A/D/F was not measured — the three-dose response was not run.
     Unmeasured,
-    /// `|D − A|` is inside the combined 2·SEM. Nothing may be concluded in either direction.
+    /// The fitted slope is inside its 2·SEM. Nothing may be concluded in either direction.
     Unresolved {
-        d: f64,
-        d_rolls: usize,
-        gap: f64,
+        f: f64,
+        f_rolls: usize,
+        slope: f64,
         unc: f64,
+        n: usize,
     },
-    /// `D` is worse than `A` by more than the combined spread: fewer evictions bought *less*
-    /// coherence, so eviction is not the mechanism. This is the only case that licenses the
-    /// falsification.
-    NotTheWindow {
-        d: f64,
-        d_rolls: usize,
-        gap: f64,
+    /// The fitted slope is negative beyond the predeclared 2·SEM heuristic. This rejects a positive
+    /// linear/monotone roll-count contribution over the measured 5–13-roll range; it does not exclude
+    /// every possible cache-window mechanism.
+    NoPositiveLinearDoseResponse {
+        f: f64,
+        f_rolls: usize,
+        slope: f64,
         unc: f64,
+        n: usize,
     },
-    /// `D` is better than `A` by more than the combined spread: the bounded window is implicated.
-    TheWindow {
-        d: f64,
-        d_rolls: usize,
-        gap: f64,
+    /// The fitted slope is positive beyond the predeclared 2·SEM heuristic: more evictions predict
+    /// more drift over the measured bounded-window dose range.
+    PositiveLinearDoseResponse {
+        f: f64,
+        f_rolls: usize,
+        slope: f64,
         unc: f64,
+        n: usize,
     },
 }
 
@@ -3096,9 +3125,11 @@ impl S18Sweep {
         (!v.is_empty()).then(|| mean_f64(&v))
     }
 
-    /// The between-seed uncertainty on a row's **mean**: twice the standard error, i.e. roughly a 95%
-    /// half-interval. `None` if the row has fewer than two seeds — in which case there is **no
-    /// variance estimate at all**, which the verdict must say out loud.
+    /// The between-seed uncertainty heuristic on a row's **mean**: twice the standard error.
+    /// This is the sweep's predeclared resolvability rule, not a Student-t 95% confidence interval
+    /// (with three seeds, that would need a materially larger multiplier). `None` if the row has fewer
+    /// than two seeds — in which case there is **no variance estimate at all**, which the verdict must
+    /// say out loud.
     ///
     /// Deliberately not the max−min range: that *grows* with the number of seeds, so a rule gated on
     /// it would get harder to satisfy the more evidence you collected. This shrinks as 1/√n, which is
@@ -3176,41 +3207,165 @@ impl S18Sweep {
         }
     }
 
-    /// Classify the within-regime window dose-response. See [`WindowAttribution`] for why this is
-    /// two-sided.
-    fn window_attribution(&self, a: f64) -> WindowAttribution {
-        let Some(d) = self.mean('D') else {
-            return WindowAttribution::Unmeasured;
-        };
-        let unc =
-            self.spread('A').unwrap_or(f64::INFINITY) + self.spread('D').unwrap_or(f64::INFINITY);
-        let d_rolls = self
+    /// Per-seed OLS slopes of drift against roll count over the A/D/F ladder. Matching by seed prevents
+    /// ordinary seed-to-seed content variation from masquerading as a dose response.
+    fn window_dose_slopes(&self) -> Vec<f64> {
+        let mut seeds: Vec<u64> = self
             .cells
             .iter()
-            .find(|c| c.row == 'D')
+            .filter(|c| c.row == 'A')
+            .map(|c| c.seed)
+            .collect();
+        seeds.sort_unstable();
+        seeds.dedup();
+        seeds
+            .into_iter()
+            .filter_map(|seed| {
+                let points: Vec<(f64, f64)> = ['A', 'D', 'F']
+                    .iter()
+                    .filter_map(|&row| {
+                        self.cells
+                            .iter()
+                            .find(|c| c.row == row && c.seed == seed)
+                            .map(|c| (c.rolls as f64, c.drift()))
+                    })
+                    .collect();
+                if points.len() != 3 {
+                    return None;
+                }
+                let x_mean = points.iter().map(|p| p.0).sum::<f64>() / 3.0;
+                let y_mean = points.iter().map(|p| p.1).sum::<f64>() / 3.0;
+                let denom = points.iter().map(|p| (p.0 - x_mean).powi(2)).sum::<f64>();
+                (denom > 0.0).then(|| {
+                    points
+                        .iter()
+                        .map(|p| (p.0 - x_mean) * (p.1 - y_mean))
+                        .sum::<f64>()
+                        / denom
+                })
+            })
+            .collect()
+    }
+
+    /// The slope is a paired-seed statistic over the exact three-dose experiment: 45 latent frames
+    /// with A/D/F at 13/10/5 rolls. Refuse malformed evidence instead of silently accepting duplicate
+    /// seeds, a shorter F clip, a different window width, a non-finite statistic, or fitting duplicate
+    /// roll counts.
+    fn validate_window_dose_ladder(&self) -> std::result::Result<(), String> {
+        if ['A', 'D', 'F'].iter().any(|&row| self.of(row).is_empty()) {
+            return Ok(());
+        }
+        let seeds = |row| {
+            let mut values: Vec<u64> = self
+                .cells
+                .iter()
+                .filter(|c| c.row == row)
+                .map(|c| c.seed)
+                .collect();
+            values.sort_unstable();
+            values
+        };
+        let (a_seeds, d_seeds, f_seeds) = (seeds('A'), seeds('D'), seeds('F'));
+        let has_duplicate = |values: &[u64]| values.windows(2).any(|pair| pair[0] == pair[1]);
+        if has_duplicate(&a_seeds) || has_duplicate(&d_seeds) || has_duplicate(&f_seeds) {
+            return Err(format!(
+                "the A/D/F dose ladder contains duplicate seed cells: \
+                 A={a_seeds:?}, D={d_seeds:?}, F={f_seeds:?}"
+            ));
+        }
+        if a_seeds != d_seeds || a_seeds != f_seeds {
+            return Err(format!(
+                "the A/D/F dose ladder does not contain the same matched seeds: \
+                 A={a_seeds:?}, D={d_seeds:?}, F={f_seeds:?}"
+            ));
+        }
+        for cell in self
+            .cells
+            .iter()
+            .filter(|c| matches!(c.row, 'A' | 'D' | 'F'))
+        {
+            let expected_rolls = match cell.row {
+                'A' => 13,
+                'D' => 10,
+                'F' => 5,
+                _ => unreachable!(),
+            };
+            if cell.latent_frames != 45 || cell.rolls != expected_rolls {
+                return Err(format!(
+                    "the A/D/F dose ladder must be the exact 45-latent-frame, 13/10/5-roll \
+                     experiment: row {} seed {} has {} latent frames and {} rolls",
+                    cell.row, cell.seed, cell.latent_frames, cell.rolls
+                ));
+            }
+            if !cell.reported_drift.is_finite()
+                || !cell.trend.is_finite()
+                || !cell.excursion.is_finite()
+            {
+                return Err(format!(
+                    "the A/D/F dose ladder contains a non-finite drift statistic: row {} seed {}",
+                    cell.row, cell.seed
+                ));
+            }
+        }
+        let slopes = self.window_dose_slopes();
+        if slopes.len() != a_seeds.len() || slopes.iter().any(|slope| !slope.is_finite()) {
+            return Err(format!(
+                "the A/D/F dose ladder did not produce one finite paired slope per seed: \
+                 {} slopes for {} matched seeds",
+                slopes.len(),
+                a_seeds.len()
+            ));
+        }
+        Ok(())
+    }
+
+    /// Classify the within-regime window dose-response. See [`WindowAttribution`] for why this is
+    /// two-sided.
+    fn window_attribution(&self) -> WindowAttribution {
+        let (Some(_d), Some(f)) = (self.mean('D'), self.mean('F')) else {
+            return WindowAttribution::Unmeasured;
+        };
+        let f_rolls = self
+            .cells
+            .iter()
+            .find(|c| c.row == 'F')
             .map(|c| c.rolls)
             .unwrap_or(0);
-        let gap = d - a;
-        if gap.abs() <= unc {
+        let slopes = self.window_dose_slopes();
+        let n = slopes.len();
+        let slope = if slopes.is_empty() {
+            0.0
+        } else {
+            mean_f64(&slopes)
+        };
+        let unc = if n >= 2 {
+            2.0 * std_f64(&slopes) / (n as f64).sqrt()
+        } else {
+            f64::INFINITY
+        };
+        if slope.abs() <= unc {
             WindowAttribution::Unresolved {
-                d,
-                d_rolls,
-                gap,
+                f,
+                f_rolls,
+                slope,
                 unc,
+                n,
             }
-        } else if gap > 0.0 {
-            WindowAttribution::NotTheWindow {
-                d,
-                d_rolls,
-                gap,
+        } else if slope < 0.0 {
+            WindowAttribution::NoPositiveLinearDoseResponse {
+                f,
+                f_rolls,
+                slope,
                 unc,
+                n,
             }
         } else {
-            WindowAttribution::TheWindow {
-                d,
-                d_rolls,
-                gap,
+            WindowAttribution::PositiveLinearDoseResponse {
+                f,
+                f_rolls,
+                slope,
                 unc,
+                n,
             }
         }
     }
@@ -3233,13 +3388,14 @@ impl S18Sweep {
             (Some(m), Some(s)) => format!("{m:.2} ±{s:.2} (n={}, 2*SEM)", self.of(r).len()),
         };
         format!(
-            "{} — A shipped {} | B sink1 {} | C sink3 {} | D wide {} | E global-ref {} | budget \
+            "{} — A shipped {} | B sink1 {} | C sink3 {} | D wide15 {} | F wide30 {} | E global-ref {} | budget \
              {DRIFT_BUDGET:.2}/255 (absolute)",
             self.bucket,
             f('A'),
             f('B'),
             f('C'),
             f('D'),
+            f('F'),
             f('E'),
         )
     }
@@ -3276,6 +3432,7 @@ impl S18Sweep {
                     .into(),
             );
         }
+        self.validate_window_dose_ladder()?;
         let a = self.mean('A').expect("row A measured above");
         let margin = (a - DRIFT_BUDGET).abs();
         // Which side of the budget the SHIPPED row is on is decided by the shipped row's own
@@ -3293,7 +3450,7 @@ impl S18Sweep {
             };
             // Underpowered to rank, but a *gross* result is still reportable: if every measured
             // bounded row is far inside the budget, "no gross drift observed" survives the scatter.
-            let worst_bounded = ['A', 'B', 'C', 'D']
+            let worst_bounded = ['A', 'B', 'C', 'D', 'F']
                 .iter()
                 .filter_map(|&r| self.mean(r))
                 .fold(0.0f64, f64::max);
@@ -3316,13 +3473,15 @@ impl S18Sweep {
         if a <= DRIFT_BUDGET {
             // No drift: the within-regime dose-response must agree — a wider window (half the rolls)
             // cannot be materially worse, or "no drift" was an artifact of an insensitive metric.
-            if let Some(d) = self.mean('D') {
-                if d > DRIFT_BUDGET {
-                    return Err(format!(
-                        "the shipped window scored {a:.2}/255 (inside the {DRIFT_BUDGET:.2} budget) \
-                         but the WIDER window scored {d:.2} — the within-regime dose-response \
-                         disagrees, so this run does not support a no-drift verdict"
-                    ));
+            for (row, dose) in [('D', self.mean('D')), ('F', self.mean('F'))] {
+                if let Some(d) = dose {
+                    if d > DRIFT_BUDGET {
+                        return Err(format!(
+                            "the shipped window scored {a:.2}/255 (inside the {DRIFT_BUDGET:.2} \
+                             budget) but wider bounded row {row} scored {d:.2} — the within-regime \
+                             dose-response disagrees, so this run does not support a no-drift verdict"
+                        ));
+                    }
                 }
             }
             Ok(format!(
@@ -3334,29 +3493,32 @@ impl S18Sweep {
         } else {
             // Drift is real. **Attribution first**: sc-15127 asks whether the *bounded window* costs
             // coherence, and "the clip drifts" does not answer that. The within-regime dose-response
-            // (row D, the same local-attention path at a wider window and fewer rolls) is what
+            // (rows A/D/F, the same local-attention path at wider windows and fewer rolls) is what
             // decides it, and it is judged SYMMETRICALLY — see `WindowAttribution`.
             //
-            // Note what this ladder can and cannot do. Window 6 -> 15 at 45 latent frames takes the
-            // eviction count from 13 to 10: a **23% reduction**, not a halving. So a mechanism whose
-            // damage is linear in the roll count would show up as ~23% of row A's drift, which at
-            // 640x384 is ~6.3/255 — *below* this sweep's own 7.92/255 combined resolution. The ladder
-            // is therefore too short to exclude a linear-in-rolls mechanism at all; what a large
-            // D-worse-than-A gap would exclude is a *strong* one, and a large D-better-than-A gap
-            // would positively implicate the window. Anything smaller is unresolved, and says so.
+            // sc-15585 enlarges the bounded ladder from A/D (13 -> 10 rolls) to A/D/F
+            // (13 -> 10 -> 5 rolls). The decision statistic is the matched-seed OLS slope over all
+            // three doses, not a two-row endpoint difference.
             let head = format!(
                 "drift is real ({a:.2}/255 over {shipped_rolls} rolls against a {DRIFT_BUDGET:.2} \
                  budget)"
             );
             let rate = self.rate_floor_clause();
-            let attribution = self.window_attribution(a);
+            let attribution = self.window_attribution();
+            let d_rolls = self
+                .cells
+                .iter()
+                .find(|c| c.row == 'D')
+                .map(|c| c.rolls)
+                .unwrap_or(0);
             let attrib_clause = match attribution {
                 WindowAttribution::Unmeasured => String::new(),
-                WindowAttribution::NotTheWindow {
-                    d,
-                    d_rolls,
-                    gap,
+                WindowAttribution::NoPositiveLinearDoseResponse {
+                    f,
+                    f_rolls,
+                    slope,
                     unc,
+                    n,
                 } => {
                     let sinks = ['B', 'C']
                         .iter()
@@ -3367,46 +3529,53 @@ impl S18Sweep {
                     // attention mask), n=1, and has no variance estimate. It is a reference, and a
                     // reference does not get to carry an attribution claim.
                     return Ok(format!(
-                        "{head} but it is NOT attributable to the bounded KV window: the \
-                         within-regime dose-response runs the wrong way — at {d_rolls} rolls (23% \
-                         fewer than the shipped row's {shipped_rolls}) the WIDER window scores \
-                         {d:.2}/255, worse than the shipped window's {a:.2} by {gap:.2}, clear of \
-                         the combined 2*SEM of {unc:.2}. Fewer evictions bought less coherence, so a \
-                         strong eviction-driven mechanism is excluded and a first-chunk sink anchor \
-                         is not indicated. This does NOT exclude a weak one: the ladder only removes \
-                         23% of the rolls, so a linear-in-rolls effect would move the score by less \
-                         than {unc:.2} and would be invisible here.{rate} No sink is wired. Sink \
+                        "{head}, but it does NOT support a positive linear bounded-window dose \
+                         response: the three-dose within-regime fit runs the wrong way — A/D/F span \
+                         {shipped_rolls}/{d_rolls}/{f_rolls} rolls across {n} matched seeds and fit \
+                         {slope:+.3}/255 per roll, clear of the predeclared 2*SEM heuristic \
+                         {unc:.3}. Row F scores {f:.2}/255 against shipped A's {a:.2}; fewer \
+                         evictions predict less coherence, excluding a positive linear/monotone \
+                         roll-count contribution over the measured 5-13-roll range. This does not \
+                         exclude a non-linear or otherwise different cache-window mechanism, and a \
+                         first-chunk sink anchor is not indicated.{rate} No sink is wired. Sink \
                          rows for the record: {sinks}. The drift itself needs its own investigation."
                     ));
                 }
                 WindowAttribution::Unresolved {
-                    d,
-                    d_rolls,
-                    gap,
+                    f,
+                    f_rolls,
+                    slope,
                     unc,
+                    n,
                 } => format!(
                     ", the attribution to the bounded KV window is NOT resolvable at this sample \
-                     size — the wider window at {d_rolls} rolls scores {d:.2}/255 against the \
-                     shipped window's {a:.2} at {shipped_rolls}, a gap of {gap:+.2} inside a \
-                     combined 2*SEM of {unc:.2}, so NEITHER direction may be asserted. What this \
-                     design can exclude is a window contribution larger than {unc:.2}/255 \
-                     ({:.0}% of the shipped row's drift); anything smaller than that, in either \
-                     direction, is invisible to it. Note also that window 6 -> 15 removes only 23% \
-                     of the evictions, not half, so a linear-in-rolls mechanism would produce about \
-                     {:.1}/255 here — under the resolution — and is not excluded either.{rate}",
-                    100.0 * unc / a.max(1e-6),
-                    0.23 * a
+                     size — the three-dose A/D/F fit over {n} matched seeds and \
+                     {shipped_rolls}/{d_rolls}/{f_rolls} rolls is {slope:+.3}/255 per roll, inside the \
+                     predeclared 2*SEM heuristic of {unc:.3}, so NEITHER direction may be asserted. \
+                     Row F scores \
+                     {f:.2}/255 against shipped A's {a:.2}. Across the enlarged {}-roll span, this \
+                     design's practical 2*SEM magnitude floor is {:.2}/255 \
+                     ({:.0}% of the shipped row's drift); anything smaller remains below the \
+                     practical floor.{rate}",
+                    shipped_rolls.saturating_sub(f_rolls),
+                    (slope.abs() + unc) * shipped_rolls.saturating_sub(f_rolls) as f64,
+                    100.0 * (slope.abs() + unc) * shipped_rolls.saturating_sub(f_rolls) as f64
+                        / a.max(1e-6)
                 ),
-                WindowAttribution::TheWindow {
-                    d,
-                    d_rolls,
-                    gap,
+                WindowAttribution::PositiveLinearDoseResponse {
+                    f,
+                    f_rolls,
+                    slope,
                     unc,
+                    n,
                 } => format!(
-                    ", and the bounded KV window IS implicated: the wider window at {d_rolls} rolls \
-                     scores {d:.2}/255 against the shipped window's {a:.2} at {shipped_rolls}, \
-                     better by {:.2}, clear of the combined 2*SEM of {unc:.2} (gap {gap:+.2}).{rate}",
-                    gap.abs()
+                    ", and it supports a positive bounded-window dose response: the three-dose A/D/F \
+                     fit over {n} matched seeds and {shipped_rolls}/{d_rolls}/{f_rolls} rolls is \
+                     {slope:+.3}/255 per roll, clear of the predeclared 2*SEM heuristic {unc:.3}. Row \
+                     F scores {f:.2}/255 against shipped A's {a:.2}; more evictions predict more drift \
+                     across the measured bounded-window dose range. This is evidence for a linear \
+                     roll-count contribution in that range, not proof that every drift mechanism is \
+                     cache-window driven.{rate}"
                 ),
             };
             // The remaining question is whether the anchored rows repair it — a SECOND comparison
@@ -3453,27 +3622,35 @@ impl S18Sweep {
 #[test]
 fn the_s18_verdict_rule_distinguishes_its_outcomes() {
     // Build a sweep with `n` seeds per row, each row's values spread by `spread` around its mean.
-    let sweep = |means: [f64; 5], spread: f64, n: usize| {
+    let sweep = |means: [f64; 6], spread: f64, n: usize| {
         let mut cells = Vec::new();
-        for (i, row) in ['A', 'B', 'C', 'D', 'E'].iter().enumerate() {
+        for (i, row) in ['A', 'B', 'C', 'D', 'F', 'E'].iter().enumerate() {
             for k in 0..n {
                 let off = if n < 2 {
                     0.0
                 } else {
                     spread * (k as f64 / (n - 1) as f64 - 0.5)
                 };
+                // Dose rows have independent per-seed noise. Reusing the same offset on every row
+                // would cancel it from each matched-seed slope and fabricate zero uncertainty.
+                let row_noise = if *row == 'F' { -off } else { off };
                 cells.push(S18Cell {
                     row: *row,
                     seed: k as u64,
                     latent_frames: 45,
-                    rolls: if *row == 'E' { 0 } else { 13 },
-                    reported_drift: means[i] + off,
-                    trend: means[i] + off,
+                    rolls: match *row {
+                        'D' => 10,
+                        'F' => 5,
+                        'E' => 0,
+                        _ => 13,
+                    },
+                    reported_drift: means[i] + row_noise,
+                    trend: means[i] + row_noise,
                     excursion: 0.0,
                     // A 100-output-frame post segment, so slope == trend numerically. These synthetic
                     // sweeps have no row Z, so the rate-floor clause is inert here; it is exercised
                     // against the RECORDED data, which does have one.
-                    slope: means[i] + off,
+                    slope: means[i] + row_noise,
                     peak_bytes: 1,
                     clip_mean: 0.0,
                     head_motion: 2.0,
@@ -3489,30 +3666,36 @@ fn the_s18_verdict_rule_distinguishes_its_outcomes() {
     };
 
     // 1. Coherent: every bounded row sits far under the budget, with a resolvable margin.
-    let v = sweep([2.0, 2.1, 1.9, 2.2, 1.8], 0.4, 3)
+    let v = sweep([2.0, 2.1, 1.9, 2.2, 2.0, 1.8], 0.4, 3)
         .verdict()
         .expect("a flat, replicated sweep must yield a verdict");
     assert!(v.starts_with("coherent"), "got: {v}");
 
     // 2. Drift, repaired by the anchor: the shipped row is far past the budget and the sinks pull it
     //    most of the way back.
-    let v = sweep([40.0, 8.0, 6.0, 20.0, 2.0], 2.0, 3)
+    let v = sweep([40.0, 8.0, 6.0, 30.0, 20.0, 2.0], 2.0, 3)
         .verdict()
         .expect("a repaired-drift sweep must yield a verdict");
     assert!(v.starts_with("drift is real"), "got: {v}");
 
-    // 2b. Drift that is NOT attributable to the window: the wider window (fewer rolls) is worse by
-    //     MORE than the combined scatter. Only then may the falsification be asserted, and the rule
-    //     must not reach for a sink even though the sink rows look great.
-    let v = sweep([40.0, 8.0, 6.0, 45.0, 2.0], 2.0, 3)
+    // 2b. Drift with a significant NEGATIVE linear dose response: fewer rolls are worse. This rejects
+    //     a positive linear/monotone roll-count contribution over the measured range, but must not
+    //     claim that every possible cache-window mechanism is impossible or reach for a sink.
+    let v = sweep([40.0, 8.0, 6.0, 42.0, 45.0, 2.0], 2.0, 3)
         .verdict()
         .expect("an unattributed drift is still a conclusion");
     assert!(v.starts_with("drift is real"), "got: {v}");
-    assert!(v.contains("NOT attributable"), "got: {v}");
+    assert!(
+        v.contains("does NOT support a positive linear bounded-window dose response"),
+        "got: {v}"
+    );
+    assert!(
+        v.contains("does not exclude a non-linear"),
+        "the conclusion must retain the model-form limitation: {v}"
+    );
     assert!(!v.contains("repairs it to"), "got: {v}");
     assert!(v.contains("No sink is wired"), "got: {v}");
-    // ...and it must be honest about what a 23%-shorter roll ladder cannot exclude.
-    assert!(v.contains("does NOT exclude a weak one"), "got: {v}");
+    assert!(v.contains("three-dose within-regime fit"), "got: {v}");
     // ...and it must NOT lean on row E. Row E is out of regime (a different attention mask), n=1 and
     // has no variance estimate; citing it as attribution evidence is the same inference this rule
     // refuses everywhere else, with the sign flipped.
@@ -3521,11 +3704,10 @@ fn the_s18_verdict_rule_distinguishes_its_outcomes() {
         "the out-of-regime, n=1 global reference row must not appear in the attribution sentence: {v}"
     );
 
-    // 2c. The SAME shape, but with the D-vs-A gap INSIDE the combined scatter. The old rule fired its
-    //     falsification here (it triggered on `d + unc >= a`, i.e. on any failure to beat A, which
-    //     noisier data makes EASIER). The symmetric rule must refuse, in both directions, and must
-    //     report the effect size it can exclude.
-    let v = sweep([40.0, 8.0, 6.0, 41.0, 2.0], 2.0, 3)
+    // 2c. A shallow three-dose slope inside its between-seed scatter. The symmetric rule must refuse,
+    //     in both directions, and report the practical 2*SEM magnitude floor without calling it a
+    //     confidence interval.
+    let v = sweep([40.0, 8.0, 6.0, 40.5, 41.0, 2.0], 2.0, 3)
         .verdict()
         .expect("an unresolvable attribution is still a conclusion");
     assert!(v.starts_with("drift is real"), "got: {v}");
@@ -3535,10 +3717,7 @@ fn the_s18_verdict_rule_distinguishes_its_outcomes() {
     );
     assert!(!v.contains("NOT attributable"), "got: {v}");
     assert!(v.contains("NEITHER direction may be asserted"), "got: {v}");
-    assert!(
-        v.contains("can exclude is a window contribution larger"),
-        "got: {v}"
-    );
+    assert!(v.contains("practical 2*SEM magnitude floor"), "got: {v}");
 
     // 2d. **The reviewer's own probe.** Row D is genuinely ~40% BETTER than row A, but the scatter
     //     swamps it. The old rule returned an unqualified "the dose-response runs the wrong way /
@@ -3548,7 +3727,11 @@ fn the_s18_verdict_rule_distinguishes_its_outcomes() {
             row,
             seed: k as u64,
             latent_frames: 45,
-            rolls: if row == 'D' { 10 } else { 13 },
+            rolls: match row {
+                'D' => 10,
+                'F' => 5,
+                _ => 13,
+            },
             reported_drift: t,
             trend: t,
             excursion: 0.0,
@@ -3562,6 +3745,7 @@ fn the_s18_verdict_rule_distinguishes_its_outcomes() {
     };
     let mut cells: Vec<S18Cell> = probe('A', [20.0, 40.0, 22.0]).collect();
     cells.extend(probe('D', [10.0, 26.0, 13.0]));
+    cells.extend(probe('F', [30.0, 5.0, 10.0]));
     cells.extend(probe('B', [18.0, 30.0, 20.0]));
     cells.extend(probe('C', [17.0, 28.0, 19.0]));
     let v = S18Sweep {
@@ -3585,15 +3769,36 @@ fn the_s18_verdict_rule_distinguishes_its_outcomes() {
         "got: {v}"
     );
 
-    // 2e. And the OTHER direction must be assertable when the evidence clears the scatter: a wider
-    //     window materially better than the shipped one implicates the window.
-    let v = sweep([40.0, 8.0, 6.0, 20.0, 2.0], 2.0, 3)
+    // 2e. And the OTHER direction must be assertable when the evidence clears the heuristic: a wider
+    //     window materially better than the shipped one supports a positive bounded-window response.
+    let v = sweep([40.0, 8.0, 6.0, 30.0, 20.0, 2.0], 2.0, 3)
         .verdict()
         .expect("an implicating dose-response is still a conclusion");
-    assert!(v.contains("bounded KV window IS implicated"), "got: {v}");
+    assert!(
+        v.contains("supports a positive bounded-window dose response"),
+        "got: {v}"
+    );
+
+    // 2f. The middle D dose must materially participate in the three-point fit. Hold the A/F
+    //     endpoints fixed and move only D across the curve: an endpoint-only implementation would
+    //     return the same classification for both sweeps and this mutation gate would fail.
+    let negative_middle = sweep([40.0, 8.0, 6.0, 0.0, 40.0, 2.0], 2.0, 3)
+        .verdict()
+        .expect("a negative middle-dose slope is still a conclusion");
+    let positive_middle = sweep([40.0, 8.0, 6.0, 100.0, 40.0, 2.0], 2.0, 3)
+        .verdict()
+        .expect("a positive middle-dose slope is still a conclusion");
+    assert!(
+        negative_middle.contains("does NOT support a positive linear bounded-window dose response"),
+        "moving only D low must make the fitted slope negative: {negative_middle}"
+    );
+    assert!(
+        positive_middle.contains("supports a positive bounded-window dose response"),
+        "moving only D high must make the fitted slope positive: {positive_middle}"
+    );
 
     // 3. Drift the sink does NOT repair — a real finding, but it must never read as "ship a sink".
-    let v = sweep([40.0, 38.0, 39.0, 20.0, 2.0], 2.0, 3)
+    let v = sweep([40.0, 38.0, 39.0, 30.0, 20.0, 2.0], 2.0, 3)
         .verdict()
         .expect("an unrepaired drift is still a conclusion");
     assert!(v.starts_with("drift is real"), "got: {v}");
@@ -3603,7 +3808,7 @@ fn the_s18_verdict_rule_distinguishes_its_outcomes() {
 
     // 3b. Drift where the sink comparison is swamped by seed scatter — must say so, and must still
     //     refuse to wire a sink.
-    let v = sweep([40.0, 22.0, 26.0, 20.0, 2.0], 12.0, 3)
+    let v = sweep([40.0, 22.0, 26.0, 30.0, 20.0, 2.0], 12.0, 3)
         .verdict()
         .expect("an unresolvable repair comparison is still a conclusion");
     assert!(v.starts_with("drift is real"), "got: {v}");
@@ -3612,14 +3817,14 @@ fn the_s18_verdict_rule_distinguishes_its_outcomes() {
 
     // 4. Incoherent evidence: the shipped row looks clean but the WIDER window looks worse. That
     //    ordering is impossible under the drift hypothesis, so the run proves nothing either way.
-    let e = sweep([3.0, 3.0, 3.0, 40.0, 2.0], 0.4, 3)
+    let e = sweep([3.0, 3.0, 3.0, 25.0, 40.0, 2.0], 0.4, 3)
         .verdict()
         .expect_err("contradictory rows must not produce a no-drift verdict");
     assert!(e.contains("dose-response"), "got: {e}");
 
     // 5. UNDERPOWERED, near the budget: one seed per row and a shipped row close to the budget. The
     //    rule must refuse rather than pick a side — this is the guard the review demanded.
-    let e = sweep([13.0, 8.0, 9.0, 12.0, 2.0], 0.0, 1)
+    let e = sweep([13.0, 8.0, 9.0, 12.5, 12.0, 2.0], 0.0, 1)
         .verdict()
         .expect_err("a single-seed sweep near the budget must not produce a verdict");
     assert!(e.contains("UNDERPOWERED"), "got: {e}");
@@ -3627,30 +3832,90 @@ fn the_s18_verdict_rule_distinguishes_its_outcomes() {
 
     // 5b. ...and the same means WITH enough seeds still refuse while the shipped row's own scatter
     //     swamps its margin against the budget.
-    let e = sweep([13.0, 8.0, 9.0, 12.0, 2.0], 12.0, 3)
+    let e = sweep([13.0, 8.0, 9.0, 12.5, 12.0, 2.0], 12.0, 3)
         .verdict()
         .expect_err("a sweep whose seed scatter swamps its margin must not produce a verdict");
     assert!(e.contains("between-seed spread"), "got: {e}");
 
     // 6. Underpowered but unambiguously clean: one seed, but everything is far under the budget. That
     //    is reportable — as a narrowed claim that says so.
-    let v = sweep([2.0, 2.0, 2.0, 2.0, 2.0], 0.0, 1)
+    let v = sweep([2.0, 2.0, 2.0, 2.0, 2.0, 2.0], 0.0, 1)
         .verdict()
         .expect("a single-seed but grossly clean sweep must yield a narrowed verdict");
     assert!(v.starts_with("underpowered but no gross drift"), "got: {v}");
     assert!(v.contains("does NOT rank the configs"), "got: {v}");
 
     // 7. And the sweep must have been long enough / the reference must really be a reference.
-    let mut short = sweep([2.0, 2.0, 2.0, 2.0, 2.0], 0.4, 3);
+    let mut short = sweep([2.0, 2.0, 2.0, 2.0, 2.0, 2.0], 0.4, 3);
     for c in short.cells.iter_mut().filter(|c| c.row == 'A') {
         c.rolls = 4;
     }
     assert!(short.verdict().unwrap_err().contains("not a long clip"));
-    let mut bad_ref = sweep([2.0, 2.0, 2.0, 2.0, 2.0], 0.4, 3);
+    let mut bad_ref = sweep([2.0, 2.0, 2.0, 2.0, 2.0, 2.0], 0.4, 3);
     for c in bad_ref.cells.iter_mut().filter(|c| c.row == 'E') {
         c.rolls = 3;
     }
     assert!(bad_ref.verdict().unwrap_err().contains("not a reference"));
+    let mut unmatched = sweep([40.0, 8.0, 6.0, 30.0, 20.0, 2.0], 2.0, 3);
+    unmatched.cells.retain(|c| !(c.row == 'F' && c.seed == 2));
+    assert!(
+        unmatched
+            .verdict()
+            .unwrap_err()
+            .contains("same matched seeds"),
+        "dropping one F seed must invalidate the paired slope"
+    );
+    let mut wrong_dose = sweep([40.0, 8.0, 6.0, 30.0, 20.0, 2.0], 2.0, 3);
+    for c in wrong_dose.cells.iter_mut().filter(|c| c.row == 'F') {
+        c.rolls = 10;
+    }
+    assert!(
+        wrong_dose
+            .verdict()
+            .unwrap_err()
+            .contains("exact 45-latent-frame, 13/10/5-roll"),
+        "using the wrong F window must invalidate the three-dose fit"
+    );
+    let mut short_f = sweep([40.0, 8.0, 6.0, 30.0, 20.0, 2.0], 2.0, 3);
+    for c in short_f.cells.iter_mut().filter(|c| c.row == 'F') {
+        c.latent_frames = 36;
+        c.rolls = 2;
+    }
+    assert!(
+        short_f
+            .verdict()
+            .unwrap_err()
+            .contains("exact 45-latent-frame, 13/10/5-roll"),
+        "a shorter F clip must not masquerade as the planned dose"
+    );
+    let mut duplicate_seed = sweep([40.0, 8.0, 6.0, 30.0, 20.0, 2.0], 2.0, 3);
+    let duplicate = *duplicate_seed
+        .cells
+        .iter()
+        .find(|c| c.row == 'F' && c.seed == 0)
+        .unwrap();
+    duplicate_seed.cells.push(duplicate);
+    assert!(
+        duplicate_seed
+            .verdict()
+            .unwrap_err()
+            .contains("duplicate seed cells"),
+        "duplicate evidence must not be silently reduced to the first matching cell"
+    );
+    let mut non_finite = sweep([40.0, 8.0, 6.0, 30.0, 20.0, 2.0], 2.0, 3);
+    non_finite
+        .cells
+        .iter_mut()
+        .find(|c| c.row == 'F' && c.seed == 0)
+        .unwrap()
+        .trend = f64::INFINITY;
+    assert!(
+        non_finite
+            .verdict()
+            .unwrap_err()
+            .contains("non-finite drift statistic"),
+        "non-finite evidence must never fall through to an attribution verdict"
+    );
     // 8. No shipped row at all — refuse, do not index off the end.
     let empty = S18Sweep {
         bucket: "test".into(),
@@ -3682,18 +3947,17 @@ fn the_withdrawn_s18_claims_do_not_survive_in_crate_prose() {
 
     // Both phrases are WITHDRAWN findings, not style nits — see sc-15571's "WITHDRAWN" section.
     //
-    //   "not attributable to the bounded ..." — the window attribution is UNRESOLVED in both buckets,
-    //     not falsified: |D − A| is inside the combined between-seed 2·SEM (7.92/255 at 640×384,
-    //     22.38/255 at 832×480), and the 13 → 10 roll ladder is only a 23% dose reduction, too short to
-    //     exclude a linear-in-rolls mechanism at all.
+    //   "not attributable to the bounded ..." — the enlarged A/D/F 13/10/5-roll ladder remains
+    //     UNRESOLVED in both buckets, not falsified: its matched-seed slopes (+0.571/255 at 640×384,
+    //     −0.278/255 at 832×480) are inside their predeclared 2·SEM heuristics (1.897 and 1.678).
     //   "saturation run-away" — `saturation` wins NO row-A cell in either bucket (`S18Cell::component`
     //     records the winner per cell); the headline mode is colour-cast/tone/structure.
     const BANNED: &[(&str, &str)] = &[
         (
             "not attributable to the bounded",
-            "the window attribution is UNRESOLVED in both buckets, not falsified — |D − A| is inside \
-             the combined 2·SEM (7.92/255 at 640×384, 22.38/255 at 832×480), and a 13 → 10 roll \
-             ladder is a 23% dose reduction that cannot exclude a linear-in-rolls mechanism",
+            "the enlarged A/D/F 13/10/5-roll ladder remains UNRESOLVED in both buckets, not \
+             falsified — its matched-seed slopes (+0.571/255 at 640×384, −0.278/255 at 832×480) \
+             remain inside their predeclared 2·SEM heuristics (1.897 and 1.678)",
         ),
         (
             "saturation run-away",
@@ -3756,6 +4020,7 @@ struct S18Evidence {
     clip_mean: f64,
     head_motion: f64,
     tail_motion: f64,
+    component: Option<String>,
 }
 
 fn parse_s18_evidence(src: &str) -> Result<Vec<S18Evidence>, String> {
@@ -3770,9 +4035,9 @@ fn parse_s18_evidence(src: &str) -> Result<Vec<S18Evidence>, String> {
         .map(|(index, line)| {
             let line_number = index + 1;
             let fields: Vec<&str> = line.split('\t').collect();
-            if fields.len() != 14 || fields[0] != "S18CELL" {
+            if !(14..=15).contains(&fields.len()) || fields[0] != "S18CELL" {
                 return Err(format!(
-                    "line {line_number}: expected an exact 14-field S18CELL record, got `{line}`"
+                    "line {line_number}: expected a 14- or 15-field S18CELL record, got `{line}`"
                 ));
             }
             let mut row_chars = fields[1].chars();
@@ -3794,6 +4059,7 @@ fn parse_s18_evidence(src: &str) -> Result<Vec<S18Evidence>, String> {
                 clip_mean: number(fields[11], "clip_mean", line_number)?,
                 head_motion: number(fields[12], "head_motion", line_number)?,
                 tail_motion: number(fields[13], "tail_motion", line_number)?,
+                component: fields.get(14).map(|value| (*value).to_string()),
             })
         })
         .collect()
@@ -3812,7 +4078,11 @@ fn parse_s18_evidence(src: &str) -> Result<Vec<S18Evidence>, String> {
 /// (SHA-256 `a9d3d0f4f4163171af2e83148bd75857266c7c97f26e16d391edd762f40d7803`);
 /// C seed 23 and rows D/E/Z came from `s18_640c.log`
 /// (SHA-256 `c89f4d7da05d3f367318dc03edf73e4f2e9c97509c13afcfaf508840f9e7019c`).
-/// `tail_motion` is the final field of each preserved `S18CELL` TSV line.
+/// Row F came from `sc15585-f640.log`
+/// (SHA-256 `802a4028e20059fb8ab75b64b56117fd8419b03e3b62502434bbe314706f8f56`).
+/// Historical rows predate the component field; current rows retain `tail_motion` followed by the
+/// winning descriptor component. The parser accepts both emitted schemas and binds every present
+/// component to the typed table.
 const MEASURED_640: &[S18Cell] = &[
     S18Cell {
         row: 'A',
@@ -3965,6 +4235,51 @@ const MEASURED_640: &[S18Cell] = &[
         component: "opp-B-Y",
     },
     S18Cell {
+        row: 'F',
+        seed: 7,
+        latent_frames: 45,
+        rolls: 5,
+        reported_drift: 32.7644,
+        trend: 32.7644,
+        excursion: 22.6072,
+        slope: 21.0028,
+        peak_bytes: 36_210_546_832,
+        clip_mean: 11.7163,
+        head_motion: 16.1245,
+        tail_motion: 8.0779,
+        component: "luma-mean",
+    },
+    S18Cell {
+        row: 'F',
+        seed: 11,
+        latent_frames: 45,
+        rolls: 5,
+        reported_drift: 15.9079,
+        trend: 6.2232,
+        excursion: 15.9079,
+        slope: 3.9892,
+        peak_bytes: 36_503_788_248,
+        clip_mean: 10.6727,
+        head_motion: 15.3780,
+        tail_motion: 10.0175,
+        component: "opp-B-Y",
+    },
+    S18Cell {
+        row: 'F',
+        seed: 23,
+        latent_frames: 45,
+        rolls: 5,
+        reported_drift: 22.3479,
+        trend: 18.2705,
+        excursion: 22.3479,
+        slope: 11.7119,
+        peak_bytes: 36_503_788_248,
+        clip_mean: 7.7144,
+        head_motion: 15.1025,
+        tail_motion: 7.4781,
+        component: "opp-B-Y",
+    },
+    S18Cell {
         row: 'D',
         seed: 11,
         latent_frames: 45,
@@ -4062,7 +4377,11 @@ const MEASURED_640: &[S18Cell] = &[
 /// Provenance: the exact source lines are committed in `tests/fixtures/s18_recorded_cells.tsv`.
 /// All rows came from `s18_832.log`
 /// (SHA-256 `e48d1d0ffd21b1d74833ee8d6624864132391b14b2f8f19d73bb216540704102`).
-/// `tail_motion` is the final field of each preserved `S18CELL` TSV line.
+/// Row F came from `sc15585-f832.log`
+/// (SHA-256 `b437a3d0beb6385f3f4231216380bf6841509069c2daa9d20f4f27ba0a47da75`).
+/// Historical rows predate the component field; current rows retain `tail_motion` followed by the
+/// winning descriptor component. The parser accepts both emitted schemas and binds every present
+/// component to the typed table.
 const MEASURED_832: &[S18Cell] = &[
     S18Cell {
         row: 'A',
@@ -4244,6 +4563,51 @@ const MEASURED_832: &[S18Cell] = &[
         tail_motion: 3.1060,
         component: "spatial-sd",
     },
+    S18Cell {
+        row: 'F',
+        seed: 7,
+        latent_frames: 45,
+        rolls: 5,
+        reported_drift: 52.3381,
+        trend: 52.3381,
+        excursion: 49.0238,
+        slope: 33.5501,
+        peak_bytes: 52_466_899_088,
+        clip_mean: 6.6029,
+        head_motion: 16.6669,
+        tail_motion: 17.0563,
+        component: "opp-B-Y",
+    },
+    S18Cell {
+        row: 'F',
+        seed: 11,
+        latent_frames: 45,
+        rolls: 5,
+        reported_drift: 46.4310,
+        trend: 43.6077,
+        excursion: 46.4310,
+        slope: 27.9537,
+        peak_bytes: 52_760_140_504,
+        clip_mean: 9.7644,
+        head_motion: 16.7670,
+        tail_motion: 17.9887,
+        component: "opp-B-Y",
+    },
+    S18Cell {
+        row: 'F',
+        seed: 23,
+        latent_frames: 45,
+        rolls: 5,
+        reported_drift: 23.9173,
+        trend: 17.5511,
+        excursion: 23.9173,
+        slope: 11.2507,
+        peak_bytes: 52_760_140_416,
+        clip_mean: 7.7918,
+        head_motion: 15.1700,
+        tail_motion: 9.5642,
+        component: "opp-B-Y",
+    },
 ];
 
 /// **CI gate on the recorded measurement.** The numbers the crate documentation cites live in
@@ -4275,19 +4639,40 @@ fn the_recorded_s18_sweep_is_what_the_docs_claim() {
              `{RECORDED_VERDICT_PREFIX}...` — src/t2v.rs and src/lib.rs are claiming something the \
              data does not say"
         );
-        // The docs no longer claim the drift is "not attributable to the bounded KV window" — under
-        // the symmetric rule neither bucket resolves the attribution. Gate that wording so it cannot
-        // silently drift back into a falsification the data does not support.
+        // The enlarged three-dose A/D/F ladder still does not resolve the attribution in either
+        // bucket. Gate that wording so an unsupported positive or negative causal claim cannot return.
         let v = v.expect("verdict asserted above");
         assert!(
             v.contains("attribution to the bounded KV window is NOT resolvable"),
-            "the recorded {bucket} sweep no longer returns an UNRESOLVED attribution — the docs, the \
-             PR body and sc-15571 all say it is unresolved, so one of them is now wrong: {v}"
+            "the recorded {bucket} sweep no longer returns an UNRESOLVED attribution — the docs and \
+             sc-15571 say it is unresolved, so one of them is now wrong: {v}"
         );
         assert!(
             !v.contains("NOT attributable"),
             "the recorded {bucket} sweep returned a window falsification — that claim was withdrawn \
-             in review and must not come back without data that clears the combined 2*SEM: {v}"
+             in review and must not come back without a slope that clears the predeclared 2*SEM \
+             heuristic: {v}"
+        );
+
+        // Bind the published exact statistics, not only the broad UNRESOLVED classification. This
+        // makes A, D and F all evidence-bearing: changing any dose or silently replacing the
+        // three-point OLS with an endpoint contrast changes at least one pinned number.
+        let slopes = sweep.window_dose_slopes();
+        let slope = mean_f64(&slopes);
+        let uncertainty = 2.0 * std_f64(&slopes) / (slopes.len() as f64).sqrt();
+        let practical_floor = 8.0 * (slope.abs() + uncertainty);
+        let (expected_slope, expected_uncertainty, expected_floor) = match bucket {
+            "640x384" => (0.5714, 1.8970, 19.75),
+            "832x480" => (-0.2780, 1.6781, 15.65),
+            _ => unreachable!(),
+        };
+        assert!(
+            (slope - expected_slope).abs() < 0.0001
+                && (uncertainty - expected_uncertainty).abs() < 0.0001
+                && (practical_floor - expected_floor).abs() < 0.01,
+            "{bucket} exact A/D/F statistics drifted: slope {slope:+.4}, 2*SEM \
+             {uncertainty:.4}, practical floor {practical_floor:.2}; expected \
+             {expected_slope:+.4}, {expected_uncertainty:.4}, {expected_floor:.2}"
         );
         // Every cell must name the descriptor component that actually scored it, and it must be a
         // real one. This is what makes "which channel failed?" checkable from the table.
@@ -4317,7 +4702,7 @@ fn the_recorded_s18_sweep_is_what_the_docs_claim() {
         );
         // Replication is the other half of what the review demanded: a recorded bucket with one seed
         // per row cannot support a ranking claim, so it must not be recorded as if it could.
-        for row in ['A', 'B', 'C', 'D'] {
+        for row in ['A', 'B', 'C', 'D', 'F'] {
             // ...and they must be DIFFERENT seeds. Three cells from one seed is determinism, not
             // replication, and would give a spread of zero that makes every comparison look resolved.
             let mut seeds: Vec<u64> = sweep
@@ -4384,7 +4769,7 @@ fn the_recorded_s18_sweep_is_what_the_docs_claim() {
     let cells: Vec<&S18Cell> = MEASURED_640.iter().chain(MEASURED_832).collect();
     assert_eq!(
         evidence.len(),
-        28,
+        34,
         "the committed S18CELL evidence changed cell count; reconcile it with the source logs"
     );
     assert_eq!(
@@ -4454,6 +4839,22 @@ fn the_recorded_s18_sweep_is_what_the_docs_claim() {
             raw.row,
             raw.seed
         );
+        if raw.row == 'F' {
+            assert!(
+                raw.component.is_some(),
+                "{} row F seed {} must retain the current 15-field S18CELL schema from the exact \
+                 sc-15585 log; dropping the winning component weakens the evidence",
+                raw.bucket,
+                raw.seed
+            );
+        }
+        if let Some(component) = &raw.component {
+            assert_eq!(
+                component, cell.component,
+                "{} row {} seed {} component differs from the committed S18CELL evidence",
+                raw.bucket, raw.row, raw.seed
+            );
+        }
         seen.push((raw.bucket.as_str(), raw.row, raw.seed));
     }
     seen.sort_unstable();
