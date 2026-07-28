@@ -20,6 +20,7 @@ pub mod face;
 pub mod generator;
 pub mod guidance;
 pub mod image_embed;
+pub mod image_memory;
 pub mod imageops;
 pub mod json_constraint;
 pub mod license;
@@ -66,14 +67,28 @@ pub use generator::{
     SpeechSegment, TimeRegion, VideoClipRef,
 };
 pub use image_embed::{ImageEmbedder, ImageEmbedderDescriptor};
+pub use image_memory::{
+    ImageMemoryAssetFacts, ImageMemoryBackendRealization, ImageMemoryBudget,
+    ImageMemoryCacheSemantics, ImageMemoryCacheState, ImageMemoryCalibrationIdentity,
+    ImageMemoryCleanupSemantics, ImageMemoryConformanceState, ImageMemoryEvidence,
+    ImageMemoryEvidenceDimension, ImageMemoryEvidenceDimensions, ImageMemoryEvidenceKey,
+    ImageMemoryEvidenceVerdict, ImageMemoryFormulaKind, ImageMemoryFormulaVariable,
+    ImageMemoryGeometry, ImageMemoryLifecycleCapabilities, ImageMemoryNumericTier,
+    ImageMemoryParameterRanges, ImageMemoryParityContract, ImageMemoryPhase,
+    ImageMemoryProviderContract, ImageMemoryRejection, ImageMemoryRequestScope,
+    ImageMemoryRunContext, ImageMemoryRunOutcome, ImageMemoryRuntimeSemantics,
+    ImageMemorySafetyDecision, ImageMemorySelection, ImageMemoryStrategy,
+    ImageMemoryStrategyCapability, ImageMemoryStrategyParameters, ImageMemoryStrategySupport,
+    ImageMemoryWarmRunSemantics, IMAGE_MEMORY_CALIBRATION_ABI,
+};
 pub use json_constraint::JsonState;
 pub use license::{weight_licenses_manifest_json, WeightLicense, WeightLicenseEntry};
 pub use media::{AudioChunk, AudioStem, AudioTrack, Image};
 pub use mempolicy::{plan_memory_adaptation, LaneLevers, Lever, MemoryPlan, StagePeaks};
 pub use registry::{
     AudioEmbedderRegistration, AudioTransformRegistration, CaptionerRegistration,
-    ImageEmbedderRegistration, ModelRegistration, PerComponentBytes, ProviderRegistry,
-    ProviderRegistryBuilder, TextEmbedderRegistration, TrainerRegistration,
+    ImageEmbedderRegistration, ImageMemoryRegistration, ModelRegistration, PerComponentBytes,
+    ProviderRegistry, ProviderRegistryBuilder, TextEmbedderRegistration, TrainerRegistration,
     TranscriberRegistration, TransformRegistration, VoiceEmbedderRegistration,
 };
 pub use runtime::{

@@ -104,7 +104,7 @@ pub use transformer::Krea2Transformer;
 pub use vae::{load_vae, QwenVae, QwenVaeEncoder};
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use candle_gen::candle_core::{Device, Tensor};
 use candle_gen::gen_core::{
@@ -233,6 +233,10 @@ pub struct KreaGenerator {
 impl Generator for KreaGenerator {
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
+    }
+
+    fn image_memory_contract(&self) -> Option<&gen_core::ImageMemoryProviderContract> {
+        (self.descriptor.id == KREA_2_TURBO_ID).then(krea_turbo_image_memory_contract)
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
@@ -972,6 +976,84 @@ candle_gen::register_generators! {
     pub(crate) const EDIT_REGISTRATION = edit_descriptor => load_edit
 }
 
+/// Krea Turbo's provider-owned half of the shared image-memory handshake. The measured phase
+/// coefficients and exact fit boundaries stay in SceneWorks generated evidence; this declaration
+/// pins the executable structure that makes those measurements valid.
+fn build_krea_turbo_image_memory_contract() -> gen_core::ImageMemoryProviderContract {
+    use gen_core::{
+        ImageMemoryBackendRealization, ImageMemoryCalibrationIdentity, ImageMemoryFormulaKind,
+        ImageMemoryFormulaVariable, ImageMemoryLifecycleCapabilities, ImageMemoryParameterRanges,
+        ImageMemoryPhase, ImageMemoryProviderContract, ImageMemoryRuntimeSemantics,
+        ImageMemoryStrategy, ImageMemoryStrategyCapability, ImageMemoryStrategySupport,
+    };
+
+    ImageMemoryProviderContract {
+        provider_id: KREA_2_TURBO_ID.to_owned(),
+        backend: ImageMemoryBackendRealization::CandleCuda {
+            device_residency: true,
+            host_backed_weights: true,
+            host_to_device_block_materialization: true,
+        },
+        strategies: ImageMemoryStrategy::ALL
+            .into_iter()
+            .map(|strategy| ImageMemoryStrategyCapability {
+                strategy,
+                support: ImageMemoryStrategySupport::Implemented,
+                // Krea's current production rungs are boolean seams. Their internal tile, attention
+                // budget, and one-block window are fingerprinted below and calibrated externally.
+                parameters: ImageMemoryParameterRanges::default(),
+            })
+            .collect(),
+        lifecycle: ImageMemoryLifecycleCapabilities {
+            phases: vec![
+                ImageMemoryPhase::Conditioning,
+                ImageMemoryPhase::Denoise,
+                ImageMemoryPhase::Decode,
+            ],
+            synchronized_phase_release: true,
+            decode_tiling: true,
+            attention_chunking: true,
+            transformer_window_materialization: true,
+        },
+        formula: ImageMemoryFormulaKind::PhaseEnvelope {
+            phases: vec![
+                ImageMemoryPhase::Conditioning,
+                ImageMemoryPhase::Denoise,
+                ImageMemoryPhase::Decode,
+            ],
+            variables: vec![
+                ImageMemoryFormulaVariable::PixelCount,
+                ImageMemoryFormulaVariable::BatchCount,
+                ImageMemoryFormulaVariable::OverlayBytes,
+            ],
+        },
+        calibration: Some(ImageMemoryCalibrationIdentity::new(
+            "krea-turbo-cuda-phase-curves-v1",
+        )),
+        // The Krea manifest phase curves already contain the measured resident floors. Asset facts
+        // remain zero here rather than substituting on-disk shard sums for load-exact CUDA residency.
+        asset_facts: gen_core::ImageMemoryAssetFacts::default(),
+        runtime: ImageMemoryRuntimeSemantics::default(),
+    }
+}
+
+fn krea_turbo_image_memory_contract() -> &'static gen_core::ImageMemoryProviderContract {
+    static CONTRACT: OnceLock<gen_core::ImageMemoryProviderContract> = OnceLock::new();
+    CONTRACT.get_or_init(build_krea_turbo_image_memory_contract)
+}
+
+fn registered_krea_turbo_image_memory_contract(
+    _spec: &LoadSpec,
+) -> gen_core::Result<gen_core::ImageMemoryProviderContract> {
+    Ok(krea_turbo_image_memory_contract().clone())
+}
+
+const TURBO_IMAGE_MEMORY_REGISTRATION: gen_core::ImageMemoryRegistration =
+    gen_core::ImageMemoryRegistration {
+        provider_id: KREA_2_TURBO_ID,
+        contract: registered_krea_turbo_image_memory_contract,
+    };
+
 /// Add all Candle Krea generators and trainers to an explicit media registry builder.
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
@@ -980,6 +1062,7 @@ pub fn register_providers(
         .register_generator(TURBO_REGISTRATION)
         .register_generator(RAW_REGISTRATION)
         .register_generator(EDIT_REGISTRATION)
+        .register_image_memory(TURBO_IMAGE_MEMORY_REGISTRATION)
         .register_trainer(training::TRAINER_REGISTRATION)
         .register_trainer(control_trainer::CONTROL_TRAINER_REGISTRATION)
 }
@@ -1008,6 +1091,30 @@ mod explicit_registry_tests {
             ["krea_2_turbo", "krea_2_raw", "krea_2_edit"]
         );
         assert_eq!(explicit_trainers, ["krea_2_raw", "krea_2_control"]);
+
+        let spec = candle_gen::gen_core::LoadSpec::new(
+            candle_gen::gen_core::WeightsSource::Dir("/nonexistent".into()),
+        );
+        let contract = registry
+            .image_memory_contract(super::KREA_2_TURBO_ID, &spec)
+            .unwrap()
+            .expect("Krea Turbo must register its image-memory contract");
+        assert_eq!(
+            contract.calibration.as_ref().unwrap().fingerprint,
+            "krea-turbo-cuda-phase-curves-v1"
+        );
+        assert_eq!(contract.strategies.len(), 5);
+        assert!(contract
+            .strategies
+            .iter()
+            .all(|capability| matches!(
+                capability.support,
+                candle_gen::gen_core::ImageMemoryStrategySupport::Implemented
+            )));
+        assert!(registry
+            .image_memory_contract(super::KREA_2_RAW_ID, &spec)
+            .unwrap()
+            .is_none());
     }
 }
 
