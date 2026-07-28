@@ -1507,6 +1507,124 @@ pub fn ti2v_blend_init(z_img: &Array, mask: &Array, noise: &Array) -> Result<Arr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    const WAN_OVERLAP_EVIDENCE: [(&str, &str); 4] = [
+        (
+            "z16-640",
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../../../docs/migration/evidence/sc-15445/z16-640.log"
+            )),
+        ),
+        (
+            "z16-832",
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../../../docs/migration/evidence/sc-15445/z16-832.log"
+            )),
+        ),
+        (
+            "z48-640",
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../../../docs/migration/evidence/sc-15445/z48-640.log"
+            )),
+        ),
+        (
+            "z48-832",
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../../../docs/migration/evidence/sc-15445/z48-832.log"
+            )),
+        ),
+    ];
+    const WAN_OVERLAP_Z48_832_CLEAN_QUALITY: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../../docs/migration/evidence/sc-15445/z48-832-quality-clean.log"
+    ));
+
+    fn evidence_result(log: &'static str) -> &'static str {
+        let mut results = log.lines().filter_map(|line| line.strip_prefix("RESULT "));
+        let result = results
+            .next()
+            .expect("evidence log must contain one RESULT");
+        assert!(
+            results.next().is_none(),
+            "evidence log must contain exactly one RESULT"
+        );
+        result
+    }
+
+    fn evidence_fields(log: &'static str) -> BTreeMap<&'static str, &'static str> {
+        evidence_result(log)
+            .split_ascii_whitespace()
+            .map(|field| {
+                field
+                    .split_once('=')
+                    .expect("every RESULT field must be key=value")
+            })
+            .collect()
+    }
+
+    fn evidence_f64(fields: &BTreeMap<&str, &str>, key: &str) -> f64 {
+        fields
+            .get(key)
+            .unwrap_or_else(|| panic!("evidence RESULT missing {key}"))
+            .parse()
+            .unwrap_or_else(|_| panic!("evidence RESULT {key} must be numeric"))
+    }
+
+    fn evidence_i32(fields: &BTreeMap<&str, &str>, key: &str) -> i32 {
+        fields
+            .get(key)
+            .unwrap_or_else(|| panic!("evidence RESULT missing {key}"))
+            .parse()
+            .unwrap_or_else(|_| panic!("evidence RESULT {key} must be an integer"))
+    }
+
+    fn evidence_pair(fields: &BTreeMap<&str, &str>, key: &str) -> (usize, usize) {
+        let value = fields
+            .get(key)
+            .unwrap_or_else(|| panic!("evidence RESULT missing {key}"));
+        let (old, half) = value
+            .split_once("=>")
+            .unwrap_or_else(|| panic!("evidence RESULT {key} must be old=>half"));
+        (
+            old.parse()
+                .unwrap_or_else(|_| panic!("evidence RESULT {key} old must be an integer")),
+            half.parse()
+                .unwrap_or_else(|_| panic!("evidence RESULT {key} half must be an integer")),
+        )
+    }
+
+    fn evidence_range(fields: &BTreeMap<&str, &str>, key: &str) -> (f64, f64) {
+        let value = fields
+            .get(key)
+            .unwrap_or_else(|| panic!("evidence RESULT missing {key}"));
+        let (min, max) = value
+            .split_once("..")
+            .unwrap_or_else(|| panic!("evidence RESULT {key} must be min..max"));
+        (
+            min.parse()
+                .unwrap_or_else(|_| panic!("evidence RESULT {key} min must be numeric")),
+            max.parse()
+                .unwrap_or_else(|_| panic!("evidence RESULT {key} max must be numeric")),
+        )
+    }
+
+    fn evidence_result_checksum() -> u64 {
+        WAN_OVERLAP_EVIDENCE
+            .iter()
+            .map(|(_, log)| evidence_result(log))
+            .chain(std::iter::once(evidence_result(
+                WAN_OVERLAP_Z48_832_CLEAN_QUALITY,
+            )))
+            .flat_map(|result| result.bytes().chain(std::iter::once(b'\n')))
+            .fold(0xcbf29ce484222325, |hash, byte| {
+                (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+            })
+    }
 
     /// Pin the actual callback order for all four curated samplers. Heun and DPM++ SDE add
     /// intermediate evaluations, but their sigma streams still cross the expert boundary exactly
@@ -2155,26 +2273,136 @@ mod tests {
             Some((32, 8)),
         );
 
-        // Recorded real-weight rows: half-tile overlap is always more accurate, but its small gain
-        // costs at least 20 % wall time while peak stays within measurement noise. This is the
-        // cost/quality conjunction behind Candidate—not either side in isolation.
-        for (old_s, half_s, old_err, half_err, old_peak, half_peak) in [
-            (66.325, 98.481, 2.4579, 1.8535, 7.793, 7.582),
-            (164.202, 216.347, 1.1873, 0.8875, 11.495, 11.811),
-            (87.143, 121.351, 0.9496, 0.7999, 4.725, 4.725),
-            (241.198, 292.123, 0.5729, 0.4760, 6.785, 6.785),
-        ] {
+        // Parse the committed raw RESULT records rather than restating their numbers in this test.
+        // The checksum makes any evidence-row edit explicit; the assertions below independently
+        // gate the four-cell scope, reproduce every recorded call count from live tiling geometry,
+        // and enforce the cost/quality thresholds behind Candidate.
+        let expected_cells = [
+            "Z16:640x384:81",
+            "Z16:832x480:121",
+            "Z48:640x384:81",
+            "Z48:832x480:121",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        let mut actual_cells = BTreeSet::new();
+        for (_, log) in WAN_OVERLAP_EVIDENCE {
+            let fields = evidence_fields(log);
+            let family = fields["family"];
+            let cell = format!("{family}:{}:{}", fields["bucket"], fields["product_frames"]);
+            assert!(actual_cells.insert(cell.clone()), "duplicate evidence cell");
+
+            let vae = match family {
+                "Z16" => VaeTiling::WAN,
+                "Z48" => VaeTiling::WAN22,
+                other => panic!("unexpected evidence family {other}"),
+            };
+            let (width, height) = fields["bucket"]
+                .split_once('x')
+                .map(|(w, h)| {
+                    (
+                        w.parse::<i32>().expect("numeric evidence width"),
+                        h.parse::<i32>().expect("numeric evidence height"),
+                    )
+                })
+                .expect("evidence bucket must be WIDTHxHEIGHT");
+            let decoded_frames = evidence_i32(&fields, "decoded_frames");
+            let latent_frames = if vae.causal_temporal {
+                (decoded_frames - 1) / vae.temporal_scale + 1
+            } else {
+                decoded_frames / vae.temporal_scale
+            };
+            let tile_frames = evidence_i32(&fields, "tile");
+            let candidate_overlap = evidence_i32(&fields, "old_overlap");
+            let half_overlap = evidence_i32(&fields, "current_overlap");
+            let iterations = |overlap_frames| {
+                let plan = TilingConfig {
+                    spatial: Some(mlx_gen::tiling::SpatialTiling {
+                        tile_px: 192,
+                        overlap_px: 64,
+                    }),
+                    temporal: Some(mlx_gen::tiling::TemporalTiling {
+                        tile_frames,
+                        overlap_frames,
+                    }),
+                }
+                .plan(
+                    vae,
+                    latent_frames,
+                    height / vae.spatial_scale,
+                    width / vae.spatial_scale,
+                );
+                (plan.t.len(), plan.t.len() * plan.h.len() * plan.w.len())
+            };
+            let candidate_iters = iterations(candidate_overlap);
+            let half_iters = iterations(half_overlap);
+            assert_eq!(
+                (candidate_iters.0, half_iters.0),
+                evidence_pair(&fields, "temporal_iterations"),
+                "{cell}: temporal calls must reproduce from the live planner",
+            );
+            assert_eq!(
+                (candidate_iters.1, half_iters.1),
+                evidence_pair(&fields, "all_iterations"),
+                "{cell}: all tile calls must reproduce from the live planner",
+            );
+
+            let old_s = evidence_f64(&fields, "old_seconds_median");
+            let half_s = evidence_f64(&fields, "current_seconds_median");
+            let recorded_ratio = evidence_f64(&fields, "wall_ratio");
+            assert!(
+                (half_s / old_s - recorded_ratio).abs() <= 0.0001,
+                "{cell}: recorded wall ratio must agree with medians",
+            );
             assert!(
                 half_s / old_s >= 1.20,
-                "half-tile wall cost stopped being material",
+                "{cell}: half-tile wall cost stopped being material",
             );
+            let (_, old_max) = evidence_range(&fields, "old_seconds_range");
+            let (half_min, _) = evidence_range(&fields, "current_seconds_range");
+            assert!(half_min > old_max, "{cell}: repeated timing ranges overlap",);
+
+            let old_err = evidence_f64(&fields, "old_mae255");
+            let half_err = evidence_f64(&fields, "current_mae255");
             assert!(
                 half_err < old_err && old_err - half_err <= 0.61,
-                "recorded quality trade no longer supports the measured decision",
+                "{cell}: recorded quality trade no longer supports the measured decision",
             );
+            let old_peak = evidence_f64(&fields, "old_peak_gib");
+            let half_peak = evidence_f64(&fields, "current_peak_gib");
             assert!(
                 (half_peak / old_peak - 1.0f64).abs() <= 0.05,
-                "overlap unexpectedly changed peak memory",
+                "{cell}: overlap unexpectedly changed peak memory",
+            );
+        }
+        assert_eq!(
+            actual_cells, expected_cells,
+            "evidence must contain exactly both shipping buckets for both Wan VAE families",
+        );
+        assert_eq!(
+            evidence_result_checksum(),
+            0x5717_3a67_4348_cabb,
+            "sc-15445 RESULT records changed; audit the new evidence and update this checksum",
+        );
+
+        // The final timed row's post-timing quality phase overlapped another Metal task. Its
+        // uncontended quality-only rerun must reproduce every metric used by the decision.
+        let timed = evidence_fields(WAN_OVERLAP_EVIDENCE[3].1);
+        let clean = evidence_fields(WAN_OVERLAP_Z48_832_CLEAN_QUALITY);
+        for key in [
+            "old_mae255",
+            "current_mae255",
+            "reference_clip_mean",
+            "reference_clip_worst",
+            "old_clip_mean",
+            "old_clip_worst",
+            "current_clip_mean",
+            "current_clip_worst",
+        ] {
+            assert_eq!(
+                timed[key], clean[key],
+                "clean z48 832 quality rerun changed {key}",
             );
         }
     }

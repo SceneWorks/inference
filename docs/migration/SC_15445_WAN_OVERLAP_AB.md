@@ -47,7 +47,9 @@ Weights:
 
 ## Results
 
-`calls` is `(temporal tiles / all temporal×height×width tiles)`.
+`calls` is `(temporal tiles / all temporal×height×width tiles)`. This table is the human-readable
+rendering of the committed raw `RESULT` records linked below. The Wan policy test parses those
+records directly; it does not carry a second copy of the measurement tuples.
 
 | family / bucket | temporal A/B | calls old → half | median seconds old → half (range) | wall | MAE/255 old → half | clip mean old → half | clip worst old → half | peak GiB old → half |
 |---|---|---|---|---:|---:|---:|---:|---:|
@@ -62,15 +64,15 @@ overlap. Peak is flat within measurement noise, confirming that overlap is recom
 a larger live tile. Clipping direction remains source-dependent and negligible here, matching the
 warning carried from sc-15325.
 
-Raw logs:
+Committed raw logs:
 
 | log | SHA-256 | use |
 |---|---|---|
-| `/private/tmp/sc15445-z16-640.log` | `648c5006f72e1e47e613291dfa457b16ec92658309a451c8bc6722a8c372c898` | z16 short timing + quality |
-| `/private/tmp/sc15445-z16-832.log` | `0f66caa2e964ed0c60cdf7ea096754b181134affb66a2bdbd818820900e5ed4a` | z16 long timing + quality |
-| `/private/tmp/sc15445-z48-640.log` | `dfb42bb0de1ac901229a1f2214318b91cd5b394475fefac048c3d63fbbdcbbd3` | z48 short timing + quality |
-| `/private/tmp/sc15445-z48-832.log` | `13449abf7606be22501a1bd1035572b2dc52d8cbdddb7854c1818cc261c55012` | z48 long timing; quality discarded after duplicate started |
-| `/private/tmp/sc15445-z48-832-quality-clean.log` | `23a35a7a9f04d1736c78c58e1fbddf12d073069d6f71b506e13066a52760a79d` | uncontended z48 long quality rerun |
+| [`z16-640.log`](evidence/sc-15445/z16-640.log) | `b513f902be3a8b0c23d4a2bb0285fa51ada2c24174859607be3194dda28204c9` | z16 short timing + quality |
+| [`z16-832.log`](evidence/sc-15445/z16-832.log) | `6634120259c0d5296423da1ec66c6e1c8fae6729219cc8886758d425d167d085` | z16 long timing + quality |
+| [`z48-640.log`](evidence/sc-15445/z48-640.log) | `83cf672e51598ce93e98ddf37b724ab67f3e0bda785dda091ee2952b117045e3` | z48 short timing + quality |
+| [`z48-832.log`](evidence/sc-15445/z48-832.log) | `46f1685de6aae8b104e9b033cc9a814af2ff5dfc3984aba232a6641140696b4a` | z48 long timing; quality discarded after duplicate started |
+| [`z48-832-quality-clean.log`](evidence/sc-15445/z48-832-quality-clean.log) | `72707ac7feb3df2a78b834c2b4c490571cde1062dfa4206ef5205ed4fbf79430` | uncontended z48 long quality rerun |
 
 ## Durable gate
 
@@ -78,8 +80,11 @@ The decision is mutation-gated at three levels:
 
 1. gen-core asserts candidate versus half-tile overlap on every shipping temporal row and reproduces
    the exact 60→75 / 96→120 iteration counts from all four measured cells;
-2. `mlx-gen-wan` asserts Wan product selectors emit candidate overlap, the z16 quality selector emits
-   half-tile overlap, and the recorded cost/quality conjunction remains the rationale;
+2. `mlx-gen-wan` asserts Wan product selectors emit candidate overlap and the z16 quality selector
+   emits half-tile overlap. It parses the four committed raw `RESULT` records, requires exactly both
+   buckets for both VAE families, reproduces every call count from the live planner, and gates the
+   measured wall-time, quality, peak, and uncontended-quality conditions. A RESULT checksum makes
+   any evidence-row change an explicit review event;
 3. Krea Realtime and SCAIL-2 each assert their live decode seam still emits 32/16 at the measured
    640×384 point, so either consumer accidentally switching back to Wan's product selector is red.
 
