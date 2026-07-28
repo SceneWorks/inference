@@ -25,6 +25,7 @@ use mlx_rs::Array;
 use crate::control_transformer_block::ZImageControlBlock;
 use crate::transformer::{apply_pad, row_indices, ZImageTransformer};
 use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
+use mlx_gen::attention::AttentionBudget;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 
@@ -263,7 +264,33 @@ impl ZImageControlTransformer {
         x: &Array,
         timestep: f32,
         control_context_scale: f32,
+        cap: Option<&mut Vec<(&'static str, Array)>>,
+    ) -> Result<Array> {
+        self.forward_with_control_budgeted(
+            prep,
+            x,
+            timestep,
+            control_context_scale,
+            cap,
+            AttentionBudget::UNBOUNDED,
+        )
+    }
+
+    /// [`forward_with_control`](Self::forward_with_control) with an explicit attention-score budget —
+    /// ladder rung 3 (SC-15615) on the ControlNet route. The budget reaches **both** stacks: the base
+    /// DiT's noise/context refiners and main layers, and the parallel control branch's own blocks
+    /// (whose `base` block runs the identical attention over the same unified sequence). The
+    /// before/after projections, hint injection, `control_context_scale`, and the dual-injection
+    /// schedule are untouched.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_with_control_budgeted(
+        &self,
+        prep: &ControlPrepared,
+        x: &Array,
+        timestep: f32,
+        control_context_scale: f32,
         mut cap: Option<&mut Vec<(&'static str, Array)>>,
+        budget: AttentionBudget,
     ) -> Result<Array> {
         macro_rules! record {
             ($name:expr, $a:expr) => {
@@ -296,6 +323,7 @@ impl ZImageControlTransformer {
             &x_emb,
             &prep.x_freqs,
             &t_emb,
+            budget,
         )?;
         record!("refiner_hint0", refiner_hints[0]);
         record!("refiner_hint1", refiner_hints[1]);
@@ -303,7 +331,7 @@ impl ZImageControlTransformer {
 
         // Noise refiner (with control hints).
         for (i, layer) in self.base.noise_refiner.iter().enumerate() {
-            x_emb = layer.forward(&x_emb, &prep.x_freqs, &t_emb)?;
+            x_emb = layer.forward_budgeted(&x_emb, &prep.x_freqs, &t_emb, budget)?;
             if let Some(n) = hint_index(&CONTROL_REFINER_PLACES, i) {
                 x_emb = add_hint(&x_emb, &refiner_hints[n], control_context_scale)?;
             }
@@ -316,7 +344,7 @@ impl ZImageControlTransformer {
         cap_emb = apply_pad(&cap_emb, &prep.cap_keep, &self.base.cap_pad_token)?;
         let mut cap_emb = cap_emb.expand_dims(0)?;
         for layer in &self.base.context_refiner {
-            cap_emb = layer.forward(&cap_emb, &prep.cap_freqs)?;
+            cap_emb = layer.forward_budgeted(&cap_emb, &prep.cap_freqs, budget)?;
         }
         record!("cap_refined", cap_emb);
 
@@ -333,13 +361,14 @@ impl ZImageControlTransformer {
             &unified,
             &prep.unified_freqs,
             &t_emb,
+            budget,
         )?;
         record!("main_hint0", main_hints[0]);
         record!("main_hint_last", main_hints[main_hints.len() - 1]);
 
         // Main layers (with control hints).
         for (i, layer) in self.base.layers.iter().enumerate() {
-            unified = layer.forward(&unified, &prep.unified_freqs, &t_emb)?;
+            unified = layer.forward_budgeted(&unified, &prep.unified_freqs, &t_emb, budget)?;
             if let Some(n) = hint_index(&CONTROL_LAYERS_PLACES, i) {
                 unified = add_hint(&unified, &main_hints[n], control_context_scale)?;
             }
@@ -367,6 +396,7 @@ impl ZImageControlTransformer {
         x_base: &Array,
         freqs_cis: &Array,
         t_emb: &Array,
+        budget: AttentionBudget,
     ) -> Result<(Vec<Array>, Array)> {
         let mut c = c;
         let mut hints = Vec::with_capacity(blocks.len());
@@ -377,7 +407,7 @@ impl ZImageControlTransformer {
                 })?;
                 c = add(&bp.forward(&c)?, x_base)?;
             }
-            c = block.base.forward(&c, freqs_cis, t_emb)?;
+            c = block.base.forward_budgeted(&c, freqs_cis, t_emb, budget)?;
             hints.push(block.after_proj().forward(&c)?);
         }
         Ok((hints, c))

@@ -7,6 +7,7 @@
 //! seeded noise → flow-match Euler denoise over the DiT → VAE decode → RGB8. The chain is
 //! parity-proven against the frozen Python fork on real bf16 weights (sc-2352).
 
+use mlx_gen::gen_core;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, default_seed, resolve_flow_schedule,
@@ -111,6 +112,9 @@ pub fn descriptor() -> ModelDescriptor {
 pub struct ZImageTurbo {
     descriptor: ModelDescriptor,
     tokenizer: TextTokenizer,
+    /// The provider's half of the shared image-memory handshake (SC-15449 / SC-15615), built from the
+    /// `LoadSpec` at load so its asset facts describe the snapshot this generator actually loaded.
+    image_memory: mlx_gen::gen_core::ImageMemoryProviderContract,
     /// Component-residency strategy (epic 10834 Phase 1, sc-10839; hoisted to the shared seam in
     /// sc-11125), selected from [`LoadSpec::offload_policy`]. `Resident` (default) holds the Qwen
     /// text encoder + DiT + VAE warm for the whole job and across jobs; `Sequential` holds only the
@@ -193,6 +197,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         descriptor: descriptor(),
         tokenizer,
         residency,
+        image_memory: crate::image_memory::image_memory_contract(MODEL_ID, spec),
     }))
 }
 
@@ -213,6 +218,14 @@ fn build_comfyui_generator(
     Ok(Box::new(ZImageTurbo {
         descriptor: descriptor(),
         tokenizer: loader::load_tokenizer(tokenizer_root)?,
+        // A community single-file / three-file load has no snapshot component tree, so the contract's
+        // asset facts are the truthful zero (see `image_memory::asset_facts`).
+        image_memory: crate::image_memory::image_memory_contract(
+            MODEL_ID,
+            &LoadSpec::new(WeightsSource::File(std::path::PathBuf::from(
+                "comfyui-in-place",
+            ))),
+        ),
         residency: Residency::resident(
             text,
             ZImageHeavyOwned {
@@ -414,10 +427,44 @@ fn load_heavy(
     })
 }
 
-mlx_gen::impl_generator!(ZImageTurbo {
-    validate: |s, req| validate_request(s.descriptor.id, &s.descriptor.capabilities, req),
-    generate: generate_impl,
-});
+// Hand-written rather than `impl_generator!` because this provider also implements the shared
+// image-memory hooks (SC-15449 / SC-15615); `descriptor` / `validate` / `generate` are the identical
+// plain delegation the macro would have emitted.
+impl Generator for ZImageTurbo {
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.descriptor
+    }
+
+    fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
+        validate_request(self.descriptor.id, &self.descriptor.capabilities, req).map_err(Into::into)
+    }
+
+    fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+
+    fn image_memory_contract(&self) -> Option<&gen_core::ImageMemoryProviderContract> {
+        Some(&self.image_memory)
+    }
+
+    fn image_memory_safety_check(
+        &self,
+        context: &gen_core::ImageMemoryRunContext,
+    ) -> gen_core::ImageMemorySafetyDecision {
+        crate::image_memory::safety_check(&self.image_memory, context)
+    }
+
+    fn begin_image_memory_request(
+        &self,
+        context: &gen_core::ImageMemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::ImageMemoryRequestScope + '_>>> {
+        crate::image_memory::begin_request(MODEL_ID, &self.image_memory, context)
+    }
+}
 
 impl ZImageTurbo {
     /// The rich-`Result` body behind [`Generator::generate`]. Kept on the crate's own
@@ -451,6 +498,9 @@ impl ZImageTurbo {
         // so the decode peak excludes the ~3.2 GiB DiT; under `Resident` nothing is shed. `tiling` bounds
         // the decode transient on the same small-Mac signal ([`pipeline::decode_tiling`]).
         let tiling = pipeline::decode_tiling(req, self.residency.is_sequential());
+        // SC-15615 ladder rung 3: the shared selector's request-scoped attention budget. Unbounded
+        // unless this request selected bounded attention, so the default forward is unchanged.
+        let attention_budget = pipeline::attention_budget(req);
         let images = self.residency.run_staged(
             &req.cancel,
             req.use_pid,
@@ -526,6 +576,7 @@ impl ZImageTurbo {
                             latents,
                             &cap,
                             start_step,
+                            attention_budget,
                             &req.cancel,
                             op,
                         )
@@ -614,6 +665,14 @@ mlx_gen::register_generators! {
     pub(crate) const REGISTRATION = descriptor => load;
     footprint = component_footprint
 }
+
+/// The shared image-memory contract registration (SC-15449) — resolvable before any weights load, so
+/// the worker can select a strategy from the static declaration plus its own measured evidence.
+pub const IMAGE_MEMORY_REGISTRATION: mlx_gen::gen_core::ImageMemoryRegistration =
+    mlx_gen::gen_core::ImageMemoryRegistration {
+        provider_id: MODEL_ID,
+        contract: |spec| Ok(crate::image_memory::image_memory_contract(MODEL_ID, spec)),
+    };
 
 #[cfg(test)]
 mod tests {

@@ -22,6 +22,7 @@ use super::rope_embedder::RopeEmbedder;
 use super::timestep_embedder::TimestepEmbedder;
 use super::transformer_block::{ZImageBlockConfig, ZImageTransformerBlock};
 use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear, Adapter};
+use mlx_gen::attention::AttentionBudget;
 use mlx_gen::train::lora::LoraParams;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
@@ -293,6 +294,25 @@ impl ZImageTransformer {
     /// `(C, F, H, W)` (same dims as `prep` was built for) and `timestep` ∈ [0,1]; only the latent
     /// values and timestep vary across steps. Returns the latent-shaped velocity `(C, F, H, W)`.
     pub(crate) fn forward_with(&self, prep: &Prepared, x: &Array, timestep: f32) -> Result<Array> {
+        self.forward_with_budgeted(prep, x, timestep, AttentionBudget::UNBOUNDED)
+    }
+
+    /// [`forward_with`](Self::forward_with) with an explicit attention-score budget — ladder rung 3
+    /// (SC-15615), the MLX twin of `candle_gen_z_image`'s
+    /// `ZImageTransformer::forward_with_attention_budget`.
+    ///
+    /// The budget is applied to **every** attention in the DiT (both noise refiners, both context
+    /// refiners, and all 30 unified blocks), so no stack is silently left unbounded. Everything else —
+    /// patchify, embedders, pad tokens, RoPE, adaLN, FFN, final layer, unpatchify, and the output
+    /// negation — is untouched, so precision, sampling, seed, conditioning, and the output contract are
+    /// preserved exactly; only the number of query rows attended per call changes.
+    pub(crate) fn forward_with_budgeted(
+        &self,
+        prep: &Prepared,
+        x: &Array,
+        timestep: f32,
+        budget: AttentionBudget,
+    ) -> Result<Array> {
         let t = Array::from_slice(&[timestep * self.cfg.t_scale], &[1]);
         let t_emb = self.t_embedder.forward(&t)?;
 
@@ -302,7 +322,7 @@ impl ZImageTransformer {
         x_emb = apply_pad(&x_emb, &prep.x_keep, &self.x_pad_token)?;
         let mut x_emb = x_emb.expand_dims(0)?;
         for layer in &self.noise_refiner {
-            x_emb = layer.forward(&x_emb, &prep.x_freqs, &t_emb)?;
+            x_emb = layer.forward_budgeted(&x_emb, &prep.x_freqs, &t_emb, budget)?;
         }
 
         // Caption stream: RMSNorm -> linear -> set padded to cap_pad_token -> context refiner.
@@ -311,7 +331,7 @@ impl ZImageTransformer {
         cap_emb = apply_pad(&cap_emb, &prep.cap_keep, &self.cap_pad_token)?;
         let mut cap_emb = cap_emb.expand_dims(0)?;
         for layer in &self.context_refiner {
-            cap_emb = layer.forward(&cap_emb, &prep.cap_freqs)?;
+            cap_emb = layer.forward_budgeted(&cap_emb, &prep.cap_freqs, budget)?;
         }
 
         // Unify and run the main stack. In bf16 training the f32 caption stream joins cast to the
@@ -323,7 +343,7 @@ impl ZImageTransformer {
         let x_len = x_emb.shape()[1];
         let mut unified = concatenate_axis(&[&x_emb, &cap_emb], 1)?;
         for layer in &self.layers {
-            unified = layer.forward(&unified, &prep.unified_freqs, &t_emb)?;
+            unified = layer.forward_budgeted(&unified, &prep.unified_freqs, &t_emb, budget)?;
         }
 
         // Final layer + unpatchify (only the real image tokens survive).

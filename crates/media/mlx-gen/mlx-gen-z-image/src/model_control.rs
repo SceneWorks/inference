@@ -94,6 +94,9 @@ pub fn descriptor() -> ModelDescriptor {
 pub struct ZImageTurboControl {
     descriptor: ModelDescriptor,
     tokenizer: TextTokenizer,
+    /// The provider's half of the shared image-memory handshake (SC-15449 / SC-15615), built from the
+    /// `LoadSpec` at load so its asset facts describe the snapshot this generator actually loaded.
+    image_memory: mlx_gen::gen_core::ImageMemoryProviderContract,
     /// Component-residency strategy (sc-11124), selected from [`LoadSpec::offload_policy`] via the
     /// shared [`load_control_residency`] builder.
     residency: Residency<TextEncoder, ZImageControlHeavyOwned>,
@@ -302,6 +305,7 @@ const PRECISION_MSG: &str =
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     let (tokenizer, residency) = load_control_residency(spec, MODEL_ID, PRECISION_MSG)?;
     Ok(Box::new(ZImageTurboControl {
+        image_memory: crate::image_memory::image_memory_contract(MODEL_ID, spec),
         descriptor: descriptor(),
         tokenizer,
         residency,
@@ -354,6 +358,9 @@ impl ZImageTurboControl {
         // single cond `cap`.
         // sc-13571 / GitHub #1658: DiT-dropping staged decode (see `crate::model` for the turbo path).
         let tiling = pipeline::decode_tiling(req, self.residency.is_sequential());
+        // SC-15615 ladder rung 3: the shared selector's request-scoped attention budget. Unbounded
+        // unless this request selected bounded attention, so the default forward is unchanged.
+        let attention_budget = pipeline::attention_budget(req);
         let images = self.residency.run_staged(
             &req.cancel,
             // No PiD overlay on the control path (sc-7846 is base-turbo-only); the heavy loader ignores
@@ -428,6 +435,7 @@ impl ZImageTurboControl {
                             &control_context,
                             control_scale,
                             start_step,
+                            attention_budget,
                             &req.cancel,
                             op,
                         )
@@ -475,6 +483,24 @@ impl Generator for ZImageTurboControl {
     ) -> gen_core::Result<GenerationOutput> {
         self.generate_impl(req, on_progress).map_err(Into::into)
     }
+
+    fn image_memory_contract(&self) -> Option<&gen_core::ImageMemoryProviderContract> {
+        Some(&self.image_memory)
+    }
+
+    fn image_memory_safety_check(
+        &self,
+        context: &gen_core::ImageMemoryRunContext,
+    ) -> gen_core::ImageMemorySafetyDecision {
+        crate::image_memory::safety_check(&self.image_memory, context)
+    }
+
+    fn begin_image_memory_request(
+        &self,
+        context: &gen_core::ImageMemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::ImageMemoryRequestScope + '_>>> {
+        crate::image_memory::begin_request(MODEL_ID, &self.image_memory, context)
+    }
 }
 
 // The registration constant bridges the crate's rich `Result` into backend-neutral
@@ -485,6 +511,14 @@ mlx_gen::register_generators! {
     pub(crate) const REGISTRATION = descriptor => load;
     footprint = crate::model::component_footprint
 }
+
+/// The shared image-memory contract registration (SC-15449) — resolvable before any weights load, so
+/// the worker can select a strategy from the static declaration plus its own measured evidence.
+pub const IMAGE_MEMORY_REGISTRATION: mlx_gen::gen_core::ImageMemoryRegistration =
+    mlx_gen::gen_core::ImageMemoryRegistration {
+        provider_id: MODEL_ID,
+        contract: |spec| Ok(crate::image_memory::image_memory_contract(MODEL_ID, spec)),
+    };
 
 #[cfg(test)]
 mod tests {

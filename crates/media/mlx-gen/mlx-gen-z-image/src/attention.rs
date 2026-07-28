@@ -18,6 +18,7 @@ use mlx_rs::{
 };
 
 use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
+use mlx_gen::attention::{sdpa_budgeted_bhsd, AttentionBudget};
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 
@@ -95,7 +96,26 @@ impl ZImageAttention {
         Ok(())
     }
 
+    /// The unbounded forward — one fused SDPA over the whole query axis. Byte-identical to the
+    /// pre-SC-15615 path and the default for every caller that has not selected the bounded-attention
+    /// rung (including the trainer).
     pub fn forward(&self, x: &Array, freqs_cis: &Array) -> Result<Array> {
+        self.forward_budgeted(x, freqs_cis, AttentionBudget::UNBOUNDED)
+    }
+
+    /// [`Self::forward`] with an explicit attention-score budget (SC-15615, ladder rung 3 — the MLX
+    /// twin of `candle_gen_z_image`'s `forward_with_attention_budget`). Query-row chunking preserves
+    /// every query's complete key/value domain and the exact projections, QK-norm, RoPE, and scale;
+    /// only the number of query rows attended per call changes.
+    ///
+    /// `budget` is threaded, not stored, so it is request-scoped by construction: nothing on a warm
+    /// generator carries a prior request's rung into the next one.
+    pub fn forward_budgeted(
+        &self,
+        x: &Array,
+        freqs_cis: &Array,
+        budget: AttentionBudget,
+    ) -> Result<Array> {
         let sh = x.shape();
         let (b, s) = (sh[0], sh[1]);
         let dim = self.n_heads * self.head_dim;
@@ -129,6 +149,10 @@ impl ZImageAttention {
         let v = v.transpose_axes(&[0, 2, 1, 3])?;
 
         // 6th arg is `sinks` (MLX ≥0.30 attention-sinks); `None` = standard attention.
+        // Gradient checkpointing (training) and query-row budgeting (inference rung 3) are mutually
+        // exclusive by construction: the trainer never selects a bounded rung, and `eval` inside a
+        // checkpoint segment is not valid under an autograd trace. The `ckpt_sdpa` arm therefore keeps
+        // the single unchunked call and is byte-identical to the pre-SC-15615 training path.
         let o = if self.ckpt_sdpa {
             // sc-4886: checkpoint just the SDPA. q/k/v are the threaded inputs (grads to the
             // QKV projections — and their LoRA — flow through them); only the f32 scale is
@@ -145,7 +169,7 @@ impl ZImageAttention {
                 .next()
                 .ok_or_else(|| Error::Msg("z-image: checkpoint SDPA produced no output".into()))?
         } else {
-            scaled_dot_product_attention(&q, &k, &v, self.scale, None, None)?
+            sdpa_budgeted_bhsd(&q, &k, &v, self.scale, None, budget)?
         };
         let o = o.transpose_axes(&[0, 2, 1, 3])?.reshape(&[b, s, dim])?;
         self.to_out.forward(&o)

@@ -14,6 +14,7 @@ use crate::attention::ZImageAttention;
 use crate::feed_forward::FeedForward;
 use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear};
 use mlx_gen::array::scalar;
+use mlx_gen::attention::AttentionBudget;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
@@ -117,7 +118,21 @@ impl ZImageTransformerBlock {
         Ok(())
     }
 
+    /// The unbounded block forward — byte-identical to the pre-SC-15615 path.
     pub fn forward(&self, x: &Array, freqs_cis: &Array, t_emb: &Array) -> Result<Array> {
+        self.forward_budgeted(x, freqs_cis, t_emb, AttentionBudget::UNBOUNDED)
+    }
+
+    /// [`Self::forward`] with an explicit attention-score budget (SC-15615). Only the block's
+    /// attention consumes it; the adaLN modulation, RMSNorms, gated residuals and SwiGLU FFN are
+    /// per-token and unchanged.
+    pub fn forward_budgeted(
+        &self,
+        x: &Array,
+        freqs_cis: &Array,
+        t_emb: &Array,
+        budget: AttentionBudget,
+    ) -> Result<Array> {
         // adaLN modulation: (1, 4*dim) -> (1, 1, 4*dim) -> 4 × (1, 1, dim)
         let modulation = self.ada_ln.forward(t_emb)?.expand_dims(1)?;
         // Dtype-following `1`: a hard f32 scalar would promote the whole modulated stream back to
@@ -131,7 +146,7 @@ impl ZImageTransformerBlock {
 
         // Modulated attention residual.
         let s1 = multiply(&rms_norm(x, &self.attention_norm1, self.eps)?, &scale_msa)?;
-        let attn_out = self.attention.forward(&s1, freqs_cis)?;
+        let attn_out = self.attention.forward_budgeted(&s1, freqs_cis, budget)?;
         let attn_normed = rms_norm(&attn_out, &self.attention_norm2, self.eps)?;
         let x1 = gated(x, &gate_msa, &attn_normed)?;
 

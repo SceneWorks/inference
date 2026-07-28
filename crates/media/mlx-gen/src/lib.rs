@@ -27,6 +27,8 @@ pub use gen_core::{
 // Local MLX modules (tensor ops, weights, quant, samplers' tensor application, error w/ mlx variants).
 pub mod adapters;
 pub mod array;
+// Query-row bounded attention (SC-15615): the MLX half of ladder rung 3, shared so no family forks it.
+pub mod attention;
 pub mod error;
 pub mod img2img;
 pub mod memory;
@@ -74,6 +76,7 @@ pub mod transform {
 // ([`tiling::TilePlan`]); this carries the tensor loop.
 pub mod vae_tiling;
 
+pub use attention::{sdpa_budgeted_bhsd, AttentionBudget, CONSTRAINED_ATTN_SCORES_BUDGET};
 pub use caption::{
     CaptionCapabilities, CaptionFinishReason, CaptionOptions, CaptionOutput, CaptionRequest,
     CaptionSampling, Captioner, CaptionerDescriptor,

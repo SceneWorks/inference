@@ -8,6 +8,7 @@
 //! small Mac.
 
 use mlx_gen::array::host_i32;
+use mlx_gen::attention::AttentionBudget;
 // The img2img leaves (start-step / init-image preprocess / noise-interp blend) are shared in core;
 // re-export so the crate's public surface (`mlx_gen_z_image::…`) and internal callers are unchanged.
 pub use mlx_gen::img2img::{add_noise_by_interpolation, init_time_step, preprocess_init_image};
@@ -86,6 +87,7 @@ pub fn denoise_with_progress(
     latents: Array,
     cap_feats: &Array,
     start_step: usize,
+    budget: AttentionBudget,
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
@@ -99,7 +101,8 @@ pub fn denoise_with_progress(
     // within the N1 tolerance, and the curated menu becomes selectable. Cancellation, the per-step
     // `eval` (sc-5522 / sc-5399), and progress live in `run_flow_sampler`. img2img slices the schedule
     // from `start_step` so the blended init latents are denoised from the matching sigma.
-    let predict = |x: &Array, timestep: f32| transformer.forward_with(&prep, x, timestep);
+    let predict =
+        |x: &Array, timestep: f32| transformer.forward_with_budgeted(&prep, x, timestep, budget);
     let start = start_step.min(scheduler.sigmas.len().saturating_sub(1));
     run_flow_sampler(
         sampler_name,
@@ -130,6 +133,7 @@ pub fn denoise(
         latents,
         cap_feats,
         0,
+        AttentionBudget::UNBOUNDED,
         &CancelFlag::default(),
         &mut |_| {},
     )
@@ -166,6 +170,7 @@ pub fn denoise_cfg_with_progress(
     neg_cap_feats: Option<&Array>,
     guidance: f32,
     start_step: usize,
+    budget: AttentionBudget,
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
@@ -182,10 +187,10 @@ pub fn denoise_cfg_with_progress(
     // Same FLOW / `1 - sigma` convention + unified curated-sampler routing as the base loop; the only
     // delta is the per-step CFG combine of two velocities.
     let predict = |x: &Array, timestep: f32| -> Result<Array> {
-        let v_cond = transformer.forward_with(&prep, x, timestep)?;
+        let v_cond = transformer.forward_with_budgeted(&prep, x, timestep, budget)?;
         match &neg_prep {
             Some(np) => {
-                let v_uncond = transformer.forward_with(np, x, timestep)?;
+                let v_uncond = transformer.forward_with_budgeted(np, x, timestep, budget)?;
                 // v = v_uncond + guidance·(v_cond − v_uncond).
                 let delta = v_cond.subtract(&v_uncond)?;
                 Ok(v_uncond.add(&delta.multiply(&g)?)?)
@@ -222,6 +227,7 @@ pub fn denoise_control_with_progress(
     control_context: &Array,
     control_context_scale: f32,
     start_step: usize,
+    budget: AttentionBudget,
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
@@ -233,7 +239,14 @@ pub fn denoise_control_with_progress(
     // Same unified-framework routing as the base loop (epic 7114 P3), with the control branch in the
     // `predict` closure (the fork's `ZImageControl._control_predict`).
     let predict = |x: &Array, timestep: f32| {
-        transformer.forward_with_control(&prep, x, timestep, control_context_scale, None)
+        transformer.forward_with_control_budgeted(
+            &prep,
+            x,
+            timestep,
+            control_context_scale,
+            None,
+            budget,
+        )
     };
     let start = start_step.min(scheduler.sigmas.len().saturating_sub(1));
     run_flow_sampler(
@@ -277,6 +290,7 @@ pub fn denoise_control_cfg_with_progress(
     control_context: &Array,
     control_context_scale: f32,
     start_step: usize,
+    budget: AttentionBudget,
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
@@ -298,16 +312,23 @@ pub fn denoise_control_cfg_with_progress(
     // delta vs `denoise_cfg_with_progress` is that each forward runs the control branch (constant
     // control context + scale threaded through every step, the fork's `ZImageControl._control_predict`).
     let predict = |x: &Array, timestep: f32| -> Result<Array> {
-        let v_cond =
-            transformer.forward_with_control(&prep, x, timestep, control_context_scale, None)?;
+        let v_cond = transformer.forward_with_control_budgeted(
+            &prep,
+            x,
+            timestep,
+            control_context_scale,
+            None,
+            budget,
+        )?;
         match &neg_prep {
             Some(np) => {
-                let v_uncond = transformer.forward_with_control(
+                let v_uncond = transformer.forward_with_control_budgeted(
                     np,
                     x,
                     timestep,
                     control_context_scale,
                     None,
+                    budget,
                 )?;
                 // v = v_uncond + guidance·(v_cond − v_uncond).
                 let delta = v_cond.subtract(&v_uncond)?;
@@ -487,7 +508,27 @@ pub(crate) fn resolve_reference<'a>(
 /// parity sweet spot for this GroupNorm VAE — visually seam-free at 1024²/1280², where smaller tiles
 /// would drift the per-tile norm statistics.
 pub(crate) fn decode_tiling(req: &GenerationRequest, is_sequential: bool) -> Option<TilingConfig> {
-    (is_sequential || req.width.max(req.height) > 2048).then(|| TilingConfig::spatial_only(512, 64))
+    // SC-15615: the shared selector's explicit bounded-decode signal (`GenerationMemory::tile_vae_decode`)
+    // joins the two historical triggers. The ladder is cumulative — a selector that picks rung 3
+    // (bounded attention) also sets rung 2 — so without this a contract-driven rung-3 selection on a
+    // `Resident` load would silently decode untiled. `Some` is still exactly the same 512/64 policy.
+    let requested = req.memory.is_some_and(|m| m.tile_vae_decode);
+    (is_sequential || requested || req.width.max(req.height) > 2048)
+        .then(|| TilingConfig::spatial_only(512, 64))
+}
+
+/// The attention rung for one request (SC-15615, ladder rung 3).
+///
+/// [`GenerationMemory::chunk_attention`] is the shared selector's rung-3 signal; the exact score
+/// budget is the single provider-declared [`mlx_gen::attention::CONSTRAINED_ATTN_SCORES_BUDGET`],
+/// which is also the value published in the provider contract's `attention_chunk_sizes` and
+/// re-validated by the request scope's `configure_attention`. Anything else — including a warm
+/// request that carried a rung last time — is the unbounded, byte-identical forward.
+pub(crate) fn attention_budget(req: &GenerationRequest) -> AttentionBudget {
+    match req.memory {
+        Some(memory) if memory.chunk_attention => AttentionBudget::CONSTRAINED,
+        _ => AttentionBudget::UNBOUNDED,
+    }
 }
 
 /// Phase 1 of the staged render (sc-13571): the per-image denoise count loop → `Vec` of **evaluated**
@@ -587,6 +628,8 @@ pub(crate) fn render_sample(
         noise,
         cap,
         0,
+        // Training previews never select a memory rung; keep the unbounded (byte-identical) forward.
+        AttentionBudget::UNBOUNDED,
         cancel,
         &mut |_| {},
     )?;
@@ -612,6 +655,100 @@ mod tests {
             height: h,
             pixels: vec![0u8; (w * h * 3) as usize],
         }
+    }
+
+    fn req(
+        w: u32,
+        h: u32,
+        memory: Option<mlx_gen::gen_core::GenerationMemory>,
+    ) -> GenerationRequest {
+        GenerationRequest {
+            prompt: "a fox".into(),
+            width: w,
+            height: h,
+            memory,
+            ..Default::default()
+        }
+    }
+
+    /// SC-15615: the shared selector's explicit bounded-decode signal is a THIRD trigger alongside the
+    /// two historical ones, so a contract-driven rung-2/3 selection tiles even on a `Resident` load.
+    #[test]
+    fn decode_tiling_honors_the_selector_signal_as_well_as_the_legacy_triggers() {
+        use mlx_gen::gen_core::GenerationMemory;
+
+        // Historical triggers, unchanged: Sequential, or an output edge above 2048.
+        assert!(decode_tiling(&req(1024, 1024, None), true).is_some());
+        assert!(decode_tiling(&req(2560, 1024, None), false).is_some());
+        // The default resident 1024² render still decodes EXACTLY (untiled) — no behaviour change.
+        assert!(decode_tiling(&req(1024, 1024, None), false).is_none());
+        // A staged-only selection does not ask for tiling, so it must not get it.
+        assert!(
+            decode_tiling(&req(1024, 1024, Some(GenerationMemory::default())), false).is_none()
+        );
+        // The rung-2 signal does, on a Resident load.
+        let tiled = decode_tiling(
+            &req(
+                1024,
+                1024,
+                Some(GenerationMemory {
+                    tile_vae_decode: true,
+                    ..Default::default()
+                }),
+            ),
+            false,
+        )
+        .expect("the bounded-decode signal must engage tiling");
+        // And it is the same 512/64 spatial-only policy the contract advertises — not a new one.
+        let spatial = tiled.spatial.expect("spatial tiling");
+        assert_eq!(
+            (spatial.tile_px, spatial.overlap_px),
+            (
+                crate::image_memory::DECODE_TILE_EDGE as i32,
+                crate::image_memory::DECODE_OVERLAP as i32
+            ),
+            "the executed tile geometry must match the contract's advertised candidates"
+        );
+        assert!(tiled.temporal.is_none(), "z-image decode is spatial-only");
+    }
+
+    /// The rung-3 request knob maps onto exactly one budget, and nothing else engages it.
+    #[test]
+    fn attention_budget_engages_only_on_the_rung_three_signal() {
+        use mlx_gen::attention::AttentionBudget;
+        use mlx_gen::gen_core::GenerationMemory;
+
+        assert_eq!(
+            attention_budget(&req(1024, 1024, None)),
+            AttentionBudget::UNBOUNDED
+        );
+        assert_eq!(
+            attention_budget(&req(1024, 1024, Some(GenerationMemory::default()))),
+            AttentionBudget::UNBOUNDED
+        );
+        assert_eq!(
+            attention_budget(&req(
+                1024,
+                1024,
+                Some(GenerationMemory {
+                    tile_vae_decode: true,
+                    ..Default::default()
+                })
+            )),
+            AttentionBudget::UNBOUNDED
+        );
+        assert_eq!(
+            attention_budget(&req(
+                1024,
+                1024,
+                Some(GenerationMemory {
+                    tile_vae_decode: true,
+                    chunk_attention: true,
+                    ..Default::default()
+                })
+            )),
+            AttentionBudget::CONSTRAINED
+        );
     }
 
     #[test]

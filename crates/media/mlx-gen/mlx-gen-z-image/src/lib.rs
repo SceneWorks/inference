@@ -22,6 +22,8 @@ pub mod control_transformer_block;
 pub mod convert;
 pub mod feed_forward;
 pub mod final_layer;
+// Shared image-memory contract adoption (SC-15449) + the SC-15615 rung-3 finding.
+pub mod image_memory;
 pub mod loader;
 pub mod model;
 pub mod model_base;
@@ -83,6 +85,10 @@ pub fn register_providers(
         .register_generator(model_base::REGISTRATION)
         .register_generator(model_base_control::REGISTRATION)
         .register_generator(model_control::REGISTRATION)
+        .register_image_memory(model::IMAGE_MEMORY_REGISTRATION)
+        .register_image_memory(model_base::IMAGE_MEMORY_REGISTRATION)
+        .register_image_memory(model_base_control::IMAGE_MEMORY_REGISTRATION)
+        .register_image_memory(model_control::IMAGE_MEMORY_REGISTRATION)
         .register_trainer(training::REGISTRATION)
 }
 
