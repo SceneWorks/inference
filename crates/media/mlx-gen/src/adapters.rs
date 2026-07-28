@@ -633,29 +633,50 @@ impl AdaptableLinear {
         }
     }
 
-    /// Merge a precomputed bias delta into the dense base **bias** (`b += δ`) — the bias-channel
+    /// Merge a precomputed bias delta into the base **bias** (`b += δ`) — the bias-channel
     /// analog of [`merge_dense_delta`](Self::merge_dense_delta), for a ComfyUI/lightx2v `.diff_b`
     /// diff-patch (a full bias delta a low-rank adapter cannot express). `delta` is cast to the base
-    /// bias's dtype before the add. Errors on a quantized base (merge before quantization) or a base
-    /// with **no** bias — the caller (the diff-patch fold) treats the no-bias case as a surfaced skip,
-    /// never inventing a bias the reference module doesn't have.
-    pub fn merge_dense_bias_delta(&mut self, delta: &Array) -> Result<()> {
-        match &mut self.base {
-            LinearBase::Dense(l) => match l.bias.value.as_ref() {
-                Some(b) => {
-                    let merged = add(b, &delta.as_dtype(b.dtype())?)?;
-                    l.bias = Param::new(Some(merged));
-                    Ok(())
-                }
-                None => Err(
-                    "merge_dense_bias_delta: base linear has no bias; a `.diff_b` cannot fold into a bias-free module"
-                        .into(),
-                ),
-            },
-            LinearBase::Quantized(_) => Err(
-                "merge_dense_bias_delta: base is quantized; a diff-patch must be merged before quantization"
+    /// bias's dtype before the add. Errors only on a base with **no** bias — the caller (the
+    /// diff-patch fold) treats that as a surfaced skip, never inventing a bias the reference module
+    /// doesn't have.
+    ///
+    /// **Tier-independent in *coverage*, unlike [`merge_dense_delta`](Self::merge_dense_delta)
+    /// (sc-15326).** A quantized base packs only its *weight*: `QuantizedLinear` keeps the bias as a
+    /// plain dense vector and its forward is `quantized_matmul(x, wq, …) + b`, so `b += δ_b` is exactly
+    /// as correct over a Q4/Q8 base as over a bf16 one. That is what lets Krea Realtime apply a
+    /// lightx2v step-distill LoRA's 407 `.diff_b` bias deltas on **every** tier instead of only on the
+    /// dense one. Quant tier is a *creative* choice in this product, so an adapter result that varied
+    /// with it would be a real defect.
+    ///
+    /// *Coverage*, not bit-for-bit: every `.diff_b` lands on every tier, but the fold dtype can still
+    /// differ, because [`quantize`](Self::quantize) casts the bias to bf16 along with the weight
+    /// (PARITY-BF16, sc-2609). A base that was f32 on disk therefore folds in f32 when dense and in
+    /// bf16 when packed. Immaterial for the bf16-native Krea DiT, where both sides are bf16 anyway.
+    pub fn merge_bias_delta(&mut self, delta: &Array) -> Result<()> {
+        let bias = match &mut self.base {
+            LinearBase::Dense(l) => &mut l.bias,
+            LinearBase::Quantized(q) => &mut q.inner.bias,
+        };
+        match bias.value.as_ref() {
+            Some(b) => {
+                let merged = add(b, &delta.as_dtype(b.dtype())?)?;
+                *bias = Param::new(Some(merged));
+                Ok(())
+            }
+            None => Err(
+                "merge_bias_delta: base linear has no bias; a `.diff_b` cannot fold into a bias-free module"
                     .into(),
             ),
+        }
+    }
+
+    /// The base's dense bias, packed or not — the tier-independent half of a diff-patch target.
+    /// `Some` for both a dense and a quantized base (a `QuantizedLinear` never packs its bias), so a
+    /// `.diff_b` shape check does not have to first ask whether the weight is packed (sc-15326).
+    pub fn bias(&self) -> Option<&Array> {
+        match &self.base {
+            LinearBase::Dense(l) => l.bias.value.as_ref(),
+            LinearBase::Quantized(q) => q.inner.bias.value.as_ref(),
         }
     }
 
@@ -1022,6 +1043,39 @@ pub trait AdaptableHost {
     fn bfl_targets(&self) -> Vec<loader::BflTarget> {
         Vec::new()
     }
+
+    /// Resolve a dotted path to a **non-Linear dense parameter** a ComfyUI/lightx2v diff-patch delta
+    /// can fold into — the norm-layer analog of [`adaptable_mut`](Self::adaptable_mut) (sc-15326).
+    ///
+    /// A step-distill / lightning LoRA for a Wan-family backbone patches its **norms** as well as its
+    /// Linears: the lightx2v `Wan2.1-T2V-14B` cfg-step-distill file carries 200 `.diff` weight deltas
+    /// on `self_attn.norm_q`/`norm_k`, `cross_attn.norm_q`/`norm_k` and `norm3`, plus 40 `norm3.diff_b`
+    /// bias deltas. Those are RMSNorm/LayerNorm parameters, not `AdaptableLinear`s, so they are
+    /// unreachable through the Linear surface at any width — and before this existed they were dropped
+    /// without a word.
+    ///
+    /// Every parameter reachable here MUST be dense on **every quant tier** (norm weights and biases
+    /// are: the Wan `_quantize_predicate` packs only the per-block attention/FFN Linears), which is
+    /// what makes a fold through this surface tier-independent — the property that distinguishes it
+    /// from a `.diff` weight fold into a Linear, which cannot happen over a packed base at all.
+    ///
+    /// The default is `None` for every host: a family with no norm-adaptable surface reports such a
+    /// delta as unmatched (loud), never silently dropped.
+    fn diff_patch_param_mut(&mut self, _path: &[&str], _part: DiffPatchPart) -> Option<&mut Array> {
+        None
+    }
+}
+
+/// Which half of a module a ComfyUI/lightx2v diff-patch delta addresses: `‹module›.diff` patches the
+/// [`Weight`](DiffPatchPart::Weight), `‹module›.diff_b` the [`Bias`](DiffPatchPart::Bias). The
+/// selector [`AdaptableHost::diff_patch_param_mut`] takes, so one path resolves both halves of e.g.
+/// an affine LayerNorm.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiffPatchPart {
+    /// `‹module›.diff` — the weight/gain parameter.
+    Weight,
+    /// `‹module›.diff_b` — the bias/offset parameter.
+    Bias,
 }
 
 /// Prefix each of `host`'s [`AdaptableHost::adaptable_paths`] with `‹prefix›.` — the enumeration
