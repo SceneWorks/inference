@@ -26,11 +26,23 @@
 //! The reference's **first-frame VAE re-anchor** (`release_server.py::get_clean_context_frames`,
 //! re-encoding the first *decoded* output frame as a persistent clean-context anchor) re-encodes decoded
 //! pixels *mid-generation*, so that specific **mechanism** is streaming-coupled and correctly out of this
-//! single-terminal-decode batch path. It does **not** follow that a long batch clip is anchored: the Mac
-//! path runs the bounded ~6-frame window ([`mac_ar_config`]) for *every* clip and the shipped 14B config
-//! sets `sink_size = 0`, so a long clip slides its window with **no** persistent anchor — a real
-//! long-range coherence risk **tracked as sc-15127 (S18)**, to be measured/addressed on the gated
-//! real-weight run. See [`generate_t2v_from_components`] for the full reasoning.
+//! single-terminal-decode batch path. A long batch clip is therefore genuinely unanchored: the Mac path
+//! runs the bounded ~6-frame window ([`mac_ar_config`]) for *every* clip and the shipped 14B config sets
+//! `sink_size = 0`.
+//!
+//! **sc-15127 (S18) measured that on real weights (q4, 640×384 and 832×480, 45 latent frames = 13
+//! window rolls, three seeds per configuration) and found one thing and one open question.** A long
+//! clip *does* drift, well past the measurement's budget. The headline mode is a
+//! **colour-cast/tone/structure** drift — the blue–yellow opponent axis (`opp-B-Y`) wins every row-A
+//! cell at 832×480 — alongside which a saturation rise is separately observable. **Whether the bounded
+//! window causes it is unresolved in both buckets**: the within-regime dose-response (a 2.5× wider
+//! window, 10 rolls instead of 13) sits inside the combined between-seed 2·SEM — **7.92**/255 at
+//! 640×384 and **22.38**/255 at 832×480 — so no window contribution larger than that is detectable and
+//! nothing smaller is excluded in either direction. So **no sink anchor is wired**: the window
+//! comparison and the sink comparison are *both* unresolved at three seeds, and permanently-resident KV
+//! is not bought on an unresolved comparison. The `sink_size` knob stays plumbed for a checkpoint that
+//! ships one, and the drift itself is tracked as **sc-15571**. See [`generate_t2v_from_components`]
+//! for the table, the controls, and the explicit limits of the claim.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -83,9 +95,19 @@ pub struct KreaRealtimeJob<'a> {
 /// `kv_cache_num_frames + num_frames_per_block`) instead of the shipped global `local_attn_size = -1`
 /// (the checkpoint's ~27 GB-of-KV global window). The crate/default config stays faithful to the
 /// checkpoint (global); this Mac bound is selected **only** in the pipeline path (sc-8438 S5 follow-up).
+///
+/// **`sink_size` is deliberately left at the checkpoint's `0` (sc-15127, S18)** — because the gated
+/// real-weight sweep did not produce evidence for one, **not** because it showed the bounded window to
+/// be clean. It showed the opposite: long clips drift. What it also showed is that the drift does not
+/// track the number of window rolls, so a first-chunk sink — whose entire rationale is surviving
+/// eviction — is not what the evidence points at, and it is permanently-resident KV (measured +0.83 GiB
+/// for one latent frame, +2.20 GiB for three, at 640×384). Full table, controls and limits on
+/// [`generate_t2v_from_components`]. The 27 GB figure is not rhetorical — the global window at
+/// 45 latent frames × 832×480 was measured to get SIGKILLed on a 128 GiB host.
 pub fn mac_ar_config(base: &KreaRealtimeConfig) -> KreaRealtimeConfig {
     let mut cfg = base.clone();
     cfg.ar.local_attn_size = cfg.ar.streaming_local_attn_frames() as i64;
+    // sink_size intentionally untouched — see the doc comment (sc-15127).
     cfg
 }
 
@@ -295,17 +317,113 @@ pub fn decode_latents_to_video(
 /// latents are still being produced. Wiring the pixel re-encode into the batch path would add a VAE
 /// round-trip with nothing to anchor against on a single terminal decode.
 ///
-/// **This does *not* mean a long batch clip is anchored.** The Mac path runs the bounded ~6-frame
-/// streaming window ([`mac_ar_config`]) for *every* clip, and the shipped 14B config sets
-/// `sink_size = 0` (`config.rs`, asserted there), so the always-attended sink prefix is **empty** and
-/// anchors nothing. A long batch clip therefore slides that window with **no persistent clean anchor** —
-/// a real long-range coherence risk. The reference deliberately *pairs* the bounded window with the
-/// first-frame re-anchor to hold such an anchor; the batch path currently has neither the re-anchor nor a
-/// non-zero sink. That gap is **tracked as sc-15127 (S18)**: it must be measured — and a batch-compatible
-/// anchor chosen (a non-zero `sink_size` latent-space pin is the likely fix, needing no incremental
-/// decode) — on the gated real-weight run (S6(b) / S13). It is not addressable on the tiny random-weight
-/// fixtures here. Confidence: high that `sink_size = 0` leaves the sliding window unanchored; the
-/// coherence *impact* on a long clip is unmeasured until real weights.
+/// **The long batch clip is unanchored, and sc-15127 (S18) measured what that costs.** The Mac path
+/// runs the bounded ~6-frame streaming window ([`mac_ar_config`]) for *every* clip and the shipped 14B
+/// config sets `sink_size = 0` (`config.rs`, asserted there), so the always-attended sink prefix is
+/// empty and a long clip slides its window with no persistent clean anchor.
+///
+/// The gated real-weight sweep (`tests/generate_smoke.rs::long_clip_coherence_under_the_bounded_window`,
+/// q4, 45 latent frames = 180 output frames = **13 window rolls**, **three seeds per configuration**)
+/// scores each clip on a descriptor spanning tone, colour and spatial structure, gated on **both** the
+/// one-way OLS trend and the plateau excursion, against an **absolute** 8/255 budget. (The budget is
+/// absolute because there is no valid within-regime floor to subtract: a bounded window over a long
+/// clip evicts *by definition*, so no zero-roll run exists at the shipped window and the shipped clip
+/// length. Its two sides are pinned by synthetic gates instead — motion and jitter score 2.81/255, the
+/// weakest injected failure shape 11.37.) Drift is the mean over seeds, ± twice the standard error:
+///
+/// ```text
+/// 640x384                        rolls   drift/255   peak GiB  clip%
+/// A shipped   (window  6, sink 0)   13   27.51 +-4.72   14.73   2.30
+/// B anchored  (window  6, sink 1)   13   19.25 +-9.82   15.56   2.80
+/// C anchored  (window  6, sink 3)   13   13.21 +-7.04   16.93   3.15
+/// D wider     (window 15, sink 0)   10   30.57 +-3.20   21.64   5.21
+/// E global    (no eviction)          0   34.06 (n=1)    41.90  11.61   <- out of regime, NOT probative
+///
+/// 832x480 (the crate default, a shipping bucket)
+/// A shipped   (window  6, sink 0)   13   39.23 +-7.95   17.62   2.28
+/// B anchored  (window  6, sink 1)   13   30.66 +-4.26   18.94   5.45
+/// C anchored  (window  6, sink 3)   13   23.43 +-4.90   21.56   3.97
+/// D wider     (window 15, sink 0)   10   36.42 +-14.4   29.41   4.67
+/// ```
+///
+/// Row E is absent at 832×480 by necessity: the global window at 45 latent frames is 70,200 tokens
+/// ≈ 38 GiB of KV and **SIGKILLs** a 128 GiB host (measured, jetsam at step 39/75) — which is exactly
+/// the problem [`mac_ar_config`] exists to dodge, so it is a finding rather than a harness bug. Even at
+/// 640×384 it peaks at 41.90 GiB, enough swap pressure to fill this host's boot volume, which is why it
+/// is `n = 1`.
+///
+/// **Both buckets say the same thing**, which matters because an earlier single-seed version of this
+/// measurement had them disagreeing — 832×480 appeared to show a clean sink dose-response that 640×384
+/// contradicted. With three seeds and a metric that gates the excursion as well as the trend, the
+/// apparent flip is gone: in both buckets the shipped row is far past the budget, and in both the
+/// A-vs-D comparison is inside the noise.
+///
+/// **One finding, and one open question.**
+///
+/// 1. **A long clip does drift**, far past the budget — 27.51/255 against 8. The earlier revision of
+///    this doc, which said the answer was "nothing", was wrong. The defect is tracked as **sc-15571**.
+///
+///    *Corroboration, stated precisely.* `report_artifacts`' mean frame saturation runs 0.21–0.23 →
+///    0.31–0.43 over row A (×1.5 to ×1.9) while the 24-frame zero-eviction row Z barely moves
+///    (0.225 → 0.237, ×1.05). That is **not** a statistic with "no construction in common" with the
+///    drift metric — an earlier wording claimed that and it was false. It is the *same pixel quantity*
+///    (per-pixel `max−min` over RGB) under a **different normalisation** (`(max−min)/max` vs `max−min`)
+///    and a genuinely **independent aggregation**: head frame vs tail frame, no baseline, no OLS, no
+///    z-gate. Independent aggregation is worth something; identical construction it is not.
+///
+///    And it is a *different channel* from the one that scored row A. The winning descriptor component
+///    is now recorded per cell (`S18Cell::component`, gated): at 832×480 all three row-A cells are won
+///    by the **blue–yellow opponent axis** (`opp-B-Y`); at 640×384 they are `spatial-sd`, `luma-mean`
+///    and `opp-B-Y`. `saturation` wins **no** row-A cell in either bucket. So the earlier
+///    "saturation" framing of the mode overstated it: the headline drift is a colour-cast/tone/
+///    structure mode, alongside which a saturation rise is separately observable.
+/// 2. **Whether the bounded KV window causes it is NOT resolved by this sweep**, in either direction.
+///    The within-regime dose-response is inside the noise in both buckets: 640×384 A 27.51 vs D 30.57,
+///    gap +3.06 against a combined 2·SEM of **7.92**; 832×480 A 39.23 vs D 36.42, gap −2.81 against a
+///    combined 2·SEM of **22.38**. A previous wording read this as a falsification ("the dose-response
+///    runs the wrong way; eviction is not the mechanism") — that rule was one-sided and got *easier* to
+///    satisfy as the data got noisier, and it has been replaced by a symmetric one.
+///
+///    **What the design can exclude:** a window contribution larger than **7.92/255** at 640×384 (29%
+///    of row A's drift) and **22.38/255** at 832×480 (57%). Nothing smaller, in either direction.
+///
+///    **What it cannot exclude, by construction:** window 6 → 15 at 45 latent frames takes the eviction
+///    count from **13 to 10 — a 23% reduction, not a halving**. A mechanism linear in the roll count
+///    would therefore move the score by ~6.3/255 at 640×384, *below* that bucket's own 7.92 resolution.
+///    The dose ladder is too short to falsify the hypothesis it was being used to falsify. A real
+///    ladder needs a longer clip or a third window width; that is follow-up work, not a claim this
+///    sweep supports.
+///
+///    Row E (the checkpoint's *global* window, zero evictions, 34.06) is **not** evidence here and is
+///    no longer cited as such: different attention mask, out of regime, `n = 1`, no variance estimate.
+///
+/// **A `sink_size` anchor is therefore still NOT wired.** The sink rows do read lower (B 19.25,
+/// C 13.21), but the comparison is not resolvable at this sample size: C is 3.30/255 from the repair
+/// threshold inside a combined 2·SEM of 11.76 — resolving it would take roughly fifty seeds per
+/// configuration, not three. Buying permanently-resident KV (+0.83 GiB for one latent frame, +2.20 GiB
+/// for three, measured) on an unresolved comparison is not warranted. The knob remains fully plumbed
+/// ([`crate::KreaArConfig::sink_size`] → `sink_tokens()` → `CausalKvCache`, and readable from
+/// `config.json`), so a future checkpoint that ships a non-zero sink is honoured without code changes.
+/// The reference's *pixel* re-anchor stays out for the structural reason above.
+///
+/// **Limits of the claim — read these before citing the table.** It covers one prompt, one quantisation
+/// tier (q4), three seeds, 45 latent frames, and only the drift modes the descriptor can see (global
+/// tone, global colour including the opponent axes, and a 5×5 block-luma spread). It says nothing about
+/// semantic or identity drift, texture degradation, or motion quality beyond a freeze check. No row
+/// froze (tail motion 3.1–18.8/255 per frame across all 29 recorded cells).
+///
+/// The seed-to-seed scatter is the same order as the configuration-to-configuration differences, so
+/// **the only ranking this sweep supports is row A against the budget.** Every ordering *between* rows
+/// in the table — A vs D, A vs the sinks, and anything involving row E — is inside the noise and is
+/// reported as unresolved rather than ranked.
+///
+/// The budget itself is bracketed by **synthetic** controls only (motion/jitter 2.81, weakest failure
+/// shape 11.37). There is no measured same-content floor: row Z, the within-regime zero-eviction row,
+/// runs at 29.63/100f over a 12-output-frame post segment against row A's 15.56/100f over 156, so its
+/// short-segment slope is *higher* and extrapolating it over-predicts row A's own measured drift by
+/// ~1.9×. Row Z cannot be lengthened either — the shipped 6-latent-frame window evicts as soon as a
+/// clip passes 6 latent frames. "Past the budget" therefore means past an absolute number pinned by
+/// synthetic stimuli, not past a measured baseline of the same content.
 #[allow(clippy::too_many_arguments)]
 pub fn generate_t2v_from_components(
     transformer: &CausalKreaTransformer,
@@ -919,6 +1037,53 @@ mod tests {
         assert!(mac.ar.max_attention_size() < base.ar.seq_length);
         // The crate default is untouched — the bound lives in the pipeline, not the config default.
         assert_eq!(KreaRealtimeConfig::default().ar.local_attn_size, -1);
+    }
+
+    /// **sc-15127 (S18): the Mac bound ships with NO sink anchor, and that is a measured decision.**
+    ///
+    /// The gated real-weight sweep found that long clips *do* drift — but **both** comparisons that
+    /// would justify buying a sink came back unresolved at three seeds. The A-vs-D contrast (shipped
+    /// window vs a 2.5× wider one) is inside the combined between-seed scatter in both buckets, so the
+    /// window is neither implicated nor exonerated; and the A-vs-sink contrast is likewise inside that
+    /// scatter. A first-chunk sink is permanently-resident KV (+0.83 GiB for one latent frame, +2.20
+    /// for three, measured), and permanently-resident KV must not be bought on an unresolved
+    /// comparison. This pins the outcome: `mac_ar_config` must not start manufacturing a sink the
+    /// measurement did not justify, and - the other half - the `sink_size` knob must stay a real,
+    /// honoured knob so a checkpoint that ships one is respected without a code change.
+    #[test]
+    fn mac_ar_config_ships_no_sink_anchor_but_honours_one_from_the_checkpoint() {
+        let base = KreaRealtimeConfig::krea_realtime_14b();
+        assert_eq!(
+            base.ar.sink_size, 0,
+            "the shipped 14B checkpoint has no sink"
+        );
+        let mac = mac_ar_config(&base);
+        assert_eq!(
+            mac.ar.sink_size, 0,
+            "the Mac bound must not invent a sink anchor — sc-15127 left both the window and the sink \
+             comparisons unresolved at three seeds, and a sink is permanently-resident KV"
+        );
+        assert_eq!(
+            mac.ar.sink_tokens(),
+            0,
+            "an empty sink prefix must cost zero tokens"
+        );
+        // ...but the knob is not dead: a checkpoint (or `config.json`) that declares a sink is carried
+        // through the Mac bound untouched and turns into real always-attended tokens.
+        let mut anchored = base.clone();
+        anchored.ar.sink_size = 2;
+        let mac_anchored = mac_ar_config(&anchored);
+        assert_eq!(
+            mac_anchored.ar.sink_size, 2,
+            "a checkpoint-declared sink must survive the Mac bound"
+        );
+        assert_eq!(
+            mac_anchored.ar.sink_tokens(),
+            2 * base.ar.frame_seq_length,
+            "sink frames × frame_seq_length (the reference's sink_tokens)"
+        );
+        // And the bound itself is unchanged by the sink — the two knobs are independent.
+        assert_eq!(mac_anchored.ar.local_attn_size, mac.ar.local_attn_size);
     }
 
     /// The per-request config derives `frame_seq_length` from the actual latent geometry (not the baked

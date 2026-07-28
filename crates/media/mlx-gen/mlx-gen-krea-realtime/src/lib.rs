@@ -80,10 +80,19 @@
 //! The reference's **first-frame VAE re-anchor** (`release_server.py::get_clean_context_frames`,
 //! re-encoding the first decoded output frame as a persistent clean-context anchor) re-encodes decoded
 //! pixels *mid-generation*, so that *mechanism* is streaming-coupled and correctly out of this batch path
-//! (which decodes once at the end). But the bounded Mac window runs for every clip and the shipped 14B
-//! config sets `sink_size = 0` — so the always-attended sink prefix is empty and a long batch clip slides
-//! its window with **no** persistent anchor, a real long-range coherence risk **tracked as sc-15127
-//! (S18)** and measured on the gated real-weight run (see [`t2v::generate_t2v_from_components`]).
+//! (which decodes once at the end). The bounded Mac window runs for every clip and the shipped 14B
+//! config sets `sink_size = 0`, so a long batch clip slides its window with no persistent anchor.
+//! **sc-15127 (S18) measured that on real weights (q4, three seeds, 13 window rolls) and found a long
+//! clip *does* drift, well past the measurement's budget** — headline mode a colour-cast/tone drift
+//! (the blue–yellow opponent axis wins every row-A cell at 832×480), alongside a separately observable
+//! saturation rise. **Whether the bounded window causes it is not resolved**: the within-regime
+//! dose-response (a wider window at 10 rolls instead of 13) is inside the between-seed noise in both
+//! buckets, so no window effect larger than 7.92/255 at 640×384 or 22.38/255 at 832×480 is detectable,
+//! and nothing smaller is excluded in either direction. The wider window also only removes 23% of the
+//! evictions, so the ladder is too short to exclude a linear-in-rolls mechanism at all. So no sink
+//! anchor is wired — the sink comparison is likewise unresolved at three seeds — the `sink_size` knob
+//! stays plumbed for a checkpoint that ships one, and the drift itself is tracked as **sc-15571**.
+//! See [`t2v::generate_t2v_from_components`] for the table and the limits of the claim.
 //! **i2v/v2v conditioning** (S7) is now wired (see [`generate`] / [`t2v`] above); its real-weight
 //! watchable-clip coherence overlaps the S13 real-weight validation.
 //!
