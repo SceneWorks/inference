@@ -35,14 +35,15 @@
 //! clip *does* drift, well past the measurement's budget. The headline mode is a
 //! **colour-cast/tone/structure** drift — the blue–yellow opponent axis (`opp-B-Y`) wins every row-A
 //! cell at 832×480 — alongside which a saturation rise is separately observable. **Whether the bounded
-//! window causes it is unresolved in both buckets**: the within-regime dose-response (a 2.5× wider
-//! window, 10 rolls instead of 13) sits inside the combined between-seed 2·SEM — **7.92**/255 at
-//! 640×384 and **22.38**/255 at 832×480 — so no window contribution larger than that is detectable and
-//! nothing smaller is excluded in either direction. So **no sink anchor is wired**: the window
-//! comparison and the sink comparison are *both* unresolved at three seeds, and permanently-resident KV
-//! is not bought on an unresolved comparison. The `sink_size` knob stays plumbed for a checkpoint that
-//! ships one, and the drift itself is tracked as **sc-15571**. See [`generate_t2v_from_components`]
-//! for the table, the controls, and the explicit limits of the claim.
+//! window causes it is unresolved in both buckets**: the enlarged within-regime A/D/F dose ladder spans
+//! 13/10/5 eviction rolls, but its matched-seed drift slope remains inside the predeclared 2·SEM
+//! heuristic in both buckets (+0.571 ±1.897/255 per roll at 640×384 and −0.278 ±1.678 at 832×480).
+//! Across the full eight-roll span, effects below practical floors of **19.75/255** and **15.65/255**
+//! respectively remain unresolved. So **no sink anchor is wired**: the window comparison and the sink
+//! comparison are *both* unresolved at three seeds, and permanently-resident KV is not bought on an
+//! unresolved comparison. The `sink_size` knob stays plumbed for a checkpoint that ships one, and the
+//! drift itself is tracked as **sc-15571**. See [`generate_t2v_from_components`] for the table, the
+//! controls, and the explicit limits of the claim.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -341,6 +342,7 @@ pub fn decode_latents_to_video(
 /// B anchored  (window  6, sink 1)   13   19.25 +-9.82   15.56   2.80
 /// C anchored  (window  6, sink 3)   13   13.21 +-7.04   16.93   3.15
 /// D wider     (window 15, sink 0)   10   30.57 +-3.20   21.64   5.21
+/// F wider     (window 30, sink 0)    5   23.67 +-9.82   34.00  10.03
 /// E global    (no eviction)          0   34.06 (n=1)    41.90  11.61   <- out of regime, NOT probative
 ///
 /// 832x480 (the crate default, a shipping bucket)
@@ -348,6 +350,7 @@ pub fn decode_latents_to_video(
 /// B anchored  (window  6, sink 1)   13   30.66 +-4.26   18.94   5.45
 /// C anchored  (window  6, sink 3)   13   23.43 +-4.90   21.56   3.97
 /// D wider     (window 15, sink 0)   10   36.42 +-14.4   29.41   4.67
+/// F wider     (window 30, sink 0)    5   40.90 +-17.3   49.14   8.05
 /// ```
 ///
 /// Row E is absent at 832×480 by necessity: the global window at 45 latent frames is 70,200 tokens
@@ -360,7 +363,7 @@ pub fn decode_latents_to_video(
 /// measurement had them disagreeing — 832×480 appeared to show a clean sink dose-response that 640×384
 /// contradicted. With three seeds and a metric that gates the excursion as well as the trend, the
 /// apparent flip is gone: in both buckets the shipped row is far past the budget, and in both the
-/// A-vs-D comparison is inside the noise.
+/// three-dose A/D/F slope is inside the noise.
 ///
 /// **One finding, and one open question.**
 ///
@@ -382,21 +385,16 @@ pub fn decode_latents_to_video(
 ///    "saturation" framing of the mode overstated it: the headline drift is a colour-cast/tone/
 ///    structure mode, alongside which a saturation rise is separately observable.
 /// 2. **Whether the bounded KV window causes it is NOT resolved by this sweep**, in either direction.
-///    The within-regime dose-response is inside the noise in both buckets: 640×384 A 27.51 vs D 30.57,
-///    gap +3.06 against a combined 2·SEM of **7.92**; 832×480 A 39.23 vs D 36.42, gap −2.81 against a
-///    combined 2·SEM of **22.38**. A previous wording read this as a falsification ("the dose-response
-///    runs the wrong way; eviction is not the mechanism") — that rule was one-sided and got *easier* to
-///    satisfy as the data got noisier, and it has been replaced by a symmetric one.
+///    The enlarged within-regime A/D/F ladder uses windows 6/15/30 at the same 45 latent frames,
+///    spanning **13/10/5 eviction rolls**. For each matched seed, OLS fits drift against roll count;
+///    across seeds the mean slope is **+0.571 ±1.897/255 per roll** at 640×384 and
+///    **−0.278 ±1.678/255 per roll** at 832×480 (mean ± the predeclared 2·SEM heuristic). Both slopes
+///    are inside their heuristic, so neither a positive linear dose response nor its absence is
+///    established.
 ///
-///    **What the design can exclude:** a window contribution larger than **7.92/255** at 640×384 (29%
-///    of row A's drift) and **22.38/255** at 832×480 (57%). Nothing smaller, in either direction.
-///
-///    **What it cannot exclude, by construction:** window 6 → 15 at 45 latent frames takes the eviction
-///    count from **13 to 10 — a 23% reduction, not a halving**. A mechanism linear in the roll count
-///    would therefore move the score by ~6.3/255 at 640×384, *below* that bucket's own 7.92 resolution.
-///    The dose ladder is too short to falsify the hypothesis it was being used to falsify. A real
-///    ladder needs a longer clip or a third window width; that is follow-up work, not a claim this
-///    sweep supports.
+///    **What the enlarged design can exclude:** across its full eight-roll span, its practical
+///    2·SEM magnitude floor is **19.75/255** at 640×384 (72% of shipped row A's drift) and
+///    **15.65/255** at 832×480 (40%). Anything smaller remains below the practical floor.
 ///
 ///    Row E (the checkpoint's *global* window, zero evictions, 34.06) is **not** evidence here and is
 ///    no longer cited as such: different attention mask, out of regime, `n = 1`, no variance estimate.
@@ -414,12 +412,12 @@ pub fn decode_latents_to_video(
 /// tier (q4), three seeds, 45 latent frames, and only the drift modes the descriptor can see (global
 /// tone, global colour including the opponent axes, and a 5×5 block-luma spread). It says nothing about
 /// semantic or identity drift, texture degradation, or motion quality beyond a freeze check. No row
-/// froze (tail motion 3.1–18.8/255 per frame across all 28 recorded cells).
+/// froze (tail motion 3.1–18.8/255 per frame across all 34 recorded cells).
 ///
 /// The seed-to-seed scatter is the same order as the configuration-to-configuration differences, so
 /// **the only ranking this sweep supports is row A against the budget.** Every ordering *between* rows
-/// in the table — A vs D, A vs the sinks, and anything involving row E — is inside the noise and is
-/// reported as unresolved rather than ranked.
+/// in the table — across A/D/F, A vs the sinks, and anything involving row E — is unresolved rather
+/// than ranked.
 ///
 /// The budget itself is bracketed by **synthetic** controls only (motion/jitter 2.81, weakest failure
 /// shape 11.37). There is no measured same-content floor: row Z, the within-regime zero-eviction row,
