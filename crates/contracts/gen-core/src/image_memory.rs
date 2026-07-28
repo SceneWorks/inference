@@ -637,6 +637,10 @@ pub enum ImageMemoryMode {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ImageMemoryRunContext {
     pub selection: ImageMemorySelection,
+    /// Provider calibration identity that the caller used for admission. Resident requests carry
+    /// this handshake too; optimized-only evidence validation is not sufficient.
+    pub calibration_abi: u32,
+    pub calibration_fingerprint: String,
     pub mode: ImageMemoryMode,
     pub has_reference: bool,
     pub use_pid: bool,

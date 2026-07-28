@@ -33,6 +33,13 @@ fn calibration_peak_gb(tier: Option<Quant>) -> f64 {
     }
 }
 
+/// Measured non-VAE portion of Mage's complete request peak. The caller uses this as a ceiling when
+/// attributing live MLX bytes to a cached Mage generator; process-global allocations above this
+/// envelope must remain charged to the request budget.
+pub fn generation_resident_gb(tier: Option<Quant>) -> f64 {
+    calibration_peak_gb(tier) - vae_peak_gb(512, 512)
+}
+
 pub fn vae_peak_gb(width: u32, height: u32) -> f64 {
     VAE_FIXED_GB + VAE_GB_PER_MEGAPIXEL * (width as f64 * height as f64 / 1e6)
 }
@@ -40,8 +47,7 @@ pub fn vae_peak_gb(width: u32, height: u32) -> f64 {
 /// Conservative complete-pipeline peak. Weight/DiT/TE residency is the tier's measured 512²
 /// anchor minus that anchor's VAE term; only the empirically resolution-linear VAE spike grows.
 pub fn generation_peak_gb(tier: Option<Quant>, width: u32, height: u32, count: u32) -> f64 {
-    let resident = calibration_peak_gb(tier) - vae_peak_gb(512, 512);
-    resident + vae_peak_gb(width, height) * count.max(1) as f64
+    generation_resident_gb(tier) + vae_peak_gb(width, height) * count.max(1) as f64
 }
 
 fn resolve_live_budget_gb(limit_bytes: usize, max_buffer_gib: Option<f64>) -> Result<f64> {
