@@ -252,6 +252,29 @@ fn mean_abs_delta(a: &[Image], b: &[Image]) -> f64 {
     total / n as f64
 }
 
+/// Per-**column** mean |Δ| across the whole clip (sc-15325). A whole-frame mean averages a spatial
+/// seam away: a tile boundary is a handful of columns out of hundreds, so a badly-blended spatial tile
+/// can cost well under 0.1/255 on the frame mean while being plainly visible. This is the metric that
+/// can *see* a seam — a spike at a multiple of the spatial tile stride is the signature.
+fn mean_abs_delta_columns(a: &[Image], b: &[Image]) -> Vec<f64> {
+    assert_eq!(a.len(), b.len(), "clip lengths differ");
+    let w = a.first().map(|f| f.width as usize).unwrap_or(0);
+    let mut sums = vec![0.0f64; w.max(1)];
+    let mut n = vec![0usize; w.max(1)];
+    for (x, y) in a.iter().zip(b.iter()) {
+        assert_eq!(x.pixels.len(), y.pixels.len(), "frame buffer sizes differ");
+        for (i, (&p, &q)) in x.pixels.iter().zip(y.pixels.iter()).enumerate() {
+            let col = (i / 3) % w.max(1);
+            sums[col] += (p as f64 - q as f64).abs();
+            n[col] += 1;
+        }
+    }
+    sums.iter()
+        .zip(n.iter())
+        .map(|(s, &c)| s / c.max(1) as f64)
+        .collect()
+}
+
 fn frame_stats(frames: &[Image]) -> Vec<FrameStat> {
     let mut out = Vec::with_capacity(frames.len());
     let mut prev: Option<&Image> = None;
@@ -349,44 +372,54 @@ fn assert_coherent(frames: &[Image], w: usize, h: usize, label: &str) {
 // Weights-free gate (runs in CI)
 // ---------------------------------------------------------------------------------------------
 
-/// **sc-15325 — the decode tiling's two properties, pinned. Weights-free arithmetic.**
+/// **sc-15325 regression guard — the tiled decode must never starve the temporal receptive field.**
 ///
-/// 1. The overlap now survives the ÷`temporal_scale` to latent space (the sc-8446 fix — it used to be
-///    `tile/4` = 2 output frames ⇒ **0** latent frames ⇒ hard-cut windows).
-/// 2. The tile is **still** only 2 latent frames at every shipped bucket, which the real-weight sweep
-///    shows is the *dominant* cause of the corruption. That is deliberately NOT fixed here (it is the
-///    memory bound), so this pins the known-bad state rather than pretending it is resolved.
+/// Weights-free arithmetic over the *product* policy (`decode_tiling`), at every bucket the old
+/// policy collapsed at, under a budget too small for a full-frame single pass — i.e. exactly the
+/// regime the defect lived in. The old policy emitted an 8-output-frame window = **2 latent frames**
+/// (overlap 1, the clamp maximum there) at all of these, so this test is red on it by construction;
+/// it is a property gate, not a snapshot of today's numbers.
+///
+/// The invariant: *if* a temporal tile is emitted, it spans ≥ `MIN_TEMPORAL_TILE_LATENT_FRAMES`
+/// latent frames with ≥ `MIN_TEMPORAL_TILE_LATENT_OVERLAP` latent frames of blend. A plan with no
+/// temporal tiling is trivially fine — the decoder sees the whole sequence.
 #[test]
-fn decode_tiling_overlap_survives_but_the_tile_is_still_starved() {
+fn decode_tiling_never_starves_the_temporal_receptive_field() {
+    use mlx_gen::tiling::{MIN_TEMPORAL_TILE_LATENT_FRAMES, MIN_TEMPORAL_TILE_LATENT_OVERLAP};
     const TEMPORAL_SCALE: i32 = 4; // VaeTiling::WAN
 
-    for (w, h) in [(832usize, 480usize), (640, 384), (1280, 720), (480, 832)] {
-        let cfg = decode_tiling(h, w, 84).expect("a full clip must tile at a shipped bucket");
-        let t = cfg.temporal.expect("temporal-only tiling");
+    // Pin the budget so this gates the policy, not the host's free memory.
+    std::env::set_var("WAN_VAE_BUDGET_GIB", "12");
+    for (w, h) in [
+        (832usize, 480usize),
+        (640, 384),
+        (512, 512),
+        (768, 512),
+        (1280, 720),
+        (480, 832),
+        (512, 384),
+    ] {
+        let cfg = decode_tiling(h, w, 84)
+            .unwrap_or_else(|e| panic!("{w}x{h} must stay decodable within 12 GiB: {e}"))
+            .unwrap_or_else(|| panic!("{w}x{h}/84f cannot fit a 12 GiB single pass"));
+        let Some(t) = cfg.temporal else { continue };
+        let lat_tile = t.tile_frames / TEMPORAL_SCALE;
+        let lat_over = (t.overlap_frames / TEMPORAL_SCALE).min(lat_tile - 1);
         assert!(
-            t.overlap_frames / TEMPORAL_SCALE >= 1,
-            "{w}x{h}: overlap {} output frames collapses to 0 latent frames — the sc-8446 floor \
-             regressed",
+            lat_tile >= MIN_TEMPORAL_TILE_LATENT_FRAMES,
+            "{w}x{h}: temporal tile {} output frames = {lat_tile} LATENT frames, under the \
+             {MIN_TEMPORAL_TILE_LATENT_FRAMES}-frame receptive-field floor — this is the sc-15325 \
+             defect (2 latent frames measured 18.5/255 vs single-pass, 26.6% worst-frame clipping)",
+            t.tile_frames
+        );
+        assert!(
+            lat_over >= MIN_TEMPORAL_TILE_LATENT_OVERLAP,
+            "{w}x{h}: temporal overlap {} output frames = {lat_over} LATENT frames after the tile-1 \
+             clamp, under the {MIN_TEMPORAL_TILE_LATENT_OVERLAP}-frame blend floor",
             t.overlap_frames
         );
-        // The known-bad half, pinned so a future budget change is a deliberate act with a test to
-        // update. Every shipped bucket lands at 2-3 latent frames; the real-weight sweep shows the
-        // corruption only clears around 8.
-        assert!(
-            (2..=3).contains(&(t.tile_frames / TEMPORAL_SCALE)),
-            "{w}x{h}: the tile is {} latent frames, outside the known-bad 2-3 band — if the sc-15325 \
-             budget was raised, re-measure the quality/memory curve and update the decision record",
-            t.tile_frames / TEMPORAL_SCALE
-        );
     }
-
-    // The overlap fix costs nothing: `tile_frames` (the memory bound) is untouched by it.
-    let t = decode_tiling(480, 832, 84).unwrap().temporal.unwrap();
-    assert_eq!(
-        (t.tile_frames, t.overlap_frames),
-        (8, 4),
-        "832x480: tile 8 (unchanged, the memory bound) with the overlap floored to one latent frame"
-    );
+    std::env::remove_var("WAN_VAE_BUDGET_GIB");
 }
 
 /// The request the real-weight smoke builds must be inside the model's *advertised* surface, checked
@@ -805,7 +838,7 @@ fn v2v_strength_zero_preserves_the_source() {
     // Decode through the SAME windowing the product path uses — a single-pass control is not
     // comparable to a tiled product decode, and the difference is not small (see the tile-seam note in
     // the S13 findings).
-    let tiling = decode_tiling(h, w, (latent_frames * 4) as i32);
+    let tiling = decode_tiling(h, w, (latent_frames * 4) as i32).expect("plan the decode tiling");
     println!("  control decode tiling: {tiling:?}");
     let decode = |latents: &mlx_rs::Array| -> Vec<Image> {
         match decode_latents_to_video(
@@ -882,20 +915,35 @@ fn v2v_strength_zero_preserves_the_source() {
     assert_coherent(&r.frames, w, h, "v2v/strength=0");
 }
 
-/// **sc-15325, measured: tile size dominates, but overlap is a real secondary term.**
+/// **sc-15325 real-weight regression guard — the new policy reaches single-pass quality at the OLD
+/// policy's memory peak; the old policy did not.**
 ///
-/// A focused check of the claim the decision record rests on, on real weights. The comparison that
-/// matters is at a **fixed tile**, because `split_spatial` clamps `overlap` to `tile − 1` in *latent*
-/// space: at the shipped latent tile of 2 the overlap is already maxed at 1, so tile-2 rows cannot say
-/// how much blending is worth. This drives the shipped config, a same-tile/larger-overlap arm at a tile
-/// where overlap has room, and a larger tile.
+/// Real z16 VAE, real encode/decode, the same latents decoded every way. Three arms:
 ///
-/// The "fixed" arm is taken from `decode_tiling` itself rather than hard-coded, so it tests whatever
-/// the product actually emits.
+///  * **single-pass** — the reference every tiled decode approximates (guarded to stay under the z16
+///    write cap; past it MLX writes silently wrong pixels and the reference is garbage, sc-15402);
+///  * **the OLD policy**, reproduced verbatim from the deleted `DECODE_TILE_BUDGET_PXFRAMES`
+///    arithmetic — this is what makes the test a *guard* rather than a snapshot: it is red on the
+///    shipped-before code by construction, because that code emitted exactly this config;
+///  * **the NEW policy**, read from `decode_tiling` under a budget pinned to the OLD policy's measured
+///    peak (~20 GiB at 832×480), so "did the fix cost memory?" is answered by the same run.
+///
+/// It then walks a candidate ladder (temporal-only vs. spatially-relieved) for the record, reporting
+/// mean abs err, highlight clipping and MLX active peak per decode.
+///
+/// ⚠️ **Read this test's SPATIAL rows as a memory measurement, not as quality evidence.** Its source is
+/// [`smooth_frame`] — a 5-6-cycle sinusoid with essentially no energy above DC, chosen so the VAE's own
+/// round-trip error would not swamp the v2v comparisons this module also runs. That stimulus
+/// *structurally cannot* exhibit a spatial seam or a starved spatial receptive field: there is no
+/// high-frequency content for either to destroy. The peaks it reports are real (memory does not care
+/// what the pixels are) and its temporal rows are diagnostic (the z16 collapse is a low-frequency
+/// content failure, which this source does show). But the claim "shrinking the spatial tile is nearly
+/// free" is evidenced by [`decode_tiling_sweep_against_single_pass`], which runs the same ladder on
+/// **real generated latents** and adds a per-column metric that a whole-frame mean would hide.
 #[test]
 #[ignore = "real snapshot; run with --ignored on macOS (see module doc)"]
-fn decode_tile_size_dominates_overlap() {
-    use mlx_gen::tiling::{TemporalTiling, TilingConfig};
+fn decode_policy_matches_single_pass_at_the_old_memory_peak() {
+    use mlx_gen::tiling::{SpatialTiling, TemporalTiling, TilingConfig, VaeTiling};
     use mlx_gen_wan::{preprocess_i2v_image, WanVae};
     use mlx_rs::ops::concatenate_axis;
 
@@ -904,11 +952,14 @@ fn decode_tile_size_dominates_overlap() {
     let h = env_usize("KREA_SMOKE_H", 480);
     let frames = env_usize("KREA_SMOKE_FRAMES", 33);
     let latent_frames = (frames - 1) / 4 + 1;
-    let write_cap = mlx_gen::tiling::VaeTiling::WAN.writable_frame_cap(h as i32, w as i32);
+    let out_frames = (latent_frames * 4) as i32;
+    // ⚠️ A single-pass z16 decode is only a valid reference below the write cap (56 output frames at
+    // 832×480). Past it MLX writes silently wrong pixels and every tiled candidate looks catastrophic.
+    let write_cap = VaeTiling::WAN.writable_frame_cap(h as i32, w as i32);
     assert!(
-        (latent_frames * 4) as i64 <= write_cap,
-        "needs a valid single-pass reference: {} output frames exceeds the z16 write cap {write_cap}",
-        latent_frames * 4
+        out_frames as i64 <= write_cap,
+        "needs a valid single-pass reference: {out_frames} output frames exceeds the z16 write cap \
+         {write_cap} at {w}x{h}"
     );
 
     let vw =
@@ -947,53 +998,131 @@ fn decode_tile_size_dominates_overlap() {
             other => panic!("expected a Video output, got {other:?}"),
         }
     };
-    let cfg = |tile: i32, overlap: i32| TilingConfig {
-        spatial: None,
-        temporal: Some(TemporalTiling {
-            tile_frames: tile,
-            overlap_frames: overlap,
-        }),
+    // Peak per decode: "does the fix work" and "is the fix affordable" answered by the same run.
+    let peak_of = |f: &dyn Fn() -> Vec<Image>| -> (Vec<Image>, usize) {
+        mlx_rs::memory::clear_cache();
+        mlx_rs::memory::reset_peak_memory();
+        let out = f();
+        (out, mlx_rs::memory::get_peak_memory())
     };
 
-    // The SHIPPED config, read from the product policy rather than hard-coded.
-    let shipped = decode_tiling(h, w, (latent_frames * 4) as i32).expect("the clip must tile");
-    let st = shipped.temporal.expect("temporal tiling");
+    /// The removed policy, verbatim: a 3.5e6 output px·frame budget snapped to the ×4 stride, with
+    /// the sc-8446 overlap floor. At every bucket ≥ ~233k px/frame this is 8 output frames = 2 latent.
+    fn old_policy(out_h: usize, out_w: usize, out_frames: i32) -> TilingConfig {
+        const BUDGET_PXFRAMES: i64 = 3_500_000;
+        let px_per_frame = (out_h as i64) * (out_w as i64);
+        let budget_frames = BUDGET_PXFRAMES / px_per_frame.max(1);
+        let write_cap = VaeTiling::WAN.writable_frame_cap(out_h as i32, out_w as i32);
+        let win = budget_frames.min(write_cap) as i32;
+        let tile_frames = (win / 4 * 4).clamp(8, out_frames.max(8));
+        TilingConfig::temporal_only(tile_frames, (tile_frames / 4).max(4))
+    }
+
+    let (single, single_peak) = peak_of(&|| decode(None));
+    let (single_clip_mean, single_clip_worst) = clip_stats(&single);
     println!(
-        "  shipped: tile {} / overlap {} (latent {} / {})",
-        st.tile_frames,
-        st.overlap_frames,
-        st.tile_frames / 4,
-        (st.overlap_frames / 4).min(st.tile_frames / 4 - 1)
+        "  single-pass (reference): clipping {single_clip_mean:.2}% / {single_clip_worst:.2}%, \
+         peak {:.2} GiB",
+        gib(single_peak)
     );
 
-    let single = decode(None);
-    let old = mean_abs_delta(&single, &decode(Some(&cfg(st.tile_frames, 2)))); // latent overlap 0
-    let now = mean_abs_delta(&single, &decode(Some(&shipped))); // latent overlap 1 (clamp max here)
-                                                                // Overlap has room to move only at a larger tile.
-    let big_lo = mean_abs_delta(&single, &decode(Some(&cfg(16, 4)))); // latent 4 / 1
-    let big_hi = mean_abs_delta(&single, &decode(Some(&cfg(16, 8)))); // latent 4 / 2
-    let bigger = mean_abs_delta(&single, &decode(Some(&cfg(32, 8)))); // latent 8 / 2
+    let old = old_policy(h, w, out_frames);
+    let ot = old.temporal.expect("the old policy is temporal-only");
+    let (old_out, old_peak) = peak_of(&|| decode(Some(&old)));
+    let old_err = mean_abs_delta(&single, &old_out);
+    let (old_clip_mean, old_clip_worst) = clip_stats(&old_out);
     println!(
-        "  vs single-pass: shipped-tile overlap 0 = {old:.2}, shipped (overlap 1) = {now:.2}; \
-         latent tile 4 overlap 1 = {big_lo:.2} -> overlap 2 = {big_hi:.2}; latent tile 8 = {bigger:.2}"
+        "  OLD policy tile {}/overlap {} (latent {}/{}): mean abs err {old_err:.2}/255, clipping \
+         {old_clip_mean:.2}% / {old_clip_worst:.2}%, peak {:.2} GiB",
+        ot.tile_frames,
+        ot.overlap_frames,
+        ot.tile_frames / 4,
+        (ot.overlap_frames / 4).min(ot.tile_frames / 4 - 1),
+        gib(old_peak)
     );
 
-    assert!(
-        now < old,
-        "the overlap floor did not help at the shipped tile ({now:.2} vs {old:.2})"
+    // Pin the NEW policy's budget to what the OLD one actually cost, so the comparison is like-for-like
+    // on memory and the quality result is not bought with a bigger machine.
+    let budget_gib = env_usize("KREA_DECODE_BUDGET_GIB", gib(old_peak).ceil() as usize);
+    std::env::set_var("WAN_VAE_BUDGET_GIB", budget_gib.to_string());
+    let new = decode_tiling(h, w, out_frames)
+        .expect("the new policy must be feasible at the old policy's peak")
+        .expect("the clip must still tile at that budget");
+    std::env::remove_var("WAN_VAE_BUDGET_GIB");
+    let (new_out, new_peak) = peak_of(&|| decode(Some(&new)));
+    let new_err = mean_abs_delta(&single, &new_out);
+    let (new_clip_mean, new_clip_worst) = clip_stats(&new_out);
+    println!(
+        "  NEW policy {new:?} (budget pinned {budget_gib} GiB): mean abs err {new_err:.2}/255, \
+         clipping {new_clip_mean:.2}% / {new_clip_worst:.2}%, peak {:.2} GiB",
+        gib(new_peak)
     );
-    // Overlap is a REAL secondary term where it has room — this is the claim the earlier, degenerate
-    // tile-2-only comparison could not make.
+    dump_frames(&single, "policy_single_pass");
+    dump_frames(&old_out, "policy_old");
+    dump_frames(&new_out, "policy_new");
+
+    // --- the record: temporal-only vs. spatially-relieved at the SAME latent tile ------------------
+    println!("  --- candidate ladder (for the operating-point record) ---");
+    let ladder: [(i32, i32, Option<i32>); 8] = [
+        (8, 4, None),        // the old policy: latent 2 / 1
+        (16, 8, None),       // latent 4 / 2
+        (32, 8, None),       // latent 8 / 2, full frame
+        (32, 16, None),      // latent 8 / 4, full frame
+        (32, 16, Some(448)), // latent 8 / 4, spatially relieved
+        (32, 16, Some(320)), // latent 8 / 4, spatially relieved further
+        (32, 16, Some(256)), // latent 8 / 4, 32 latent px spatial tiles
+        (32, 16, Some(192)), // latent 8 / 4, the SMALLEST spatial candidate (24 latent px)
+    ];
+    for (tile, overlap, tile_px) in ladder {
+        let cfg = TilingConfig {
+            spatial: tile_px.map(|tile_px| SpatialTiling {
+                tile_px,
+                overlap_px: 64,
+            }),
+            temporal: Some(TemporalTiling {
+                tile_frames: tile,
+                overlap_frames: overlap,
+            }),
+        };
+        let (out, peak) = peak_of(&|| decode(Some(&cfg)));
+        let (cm, cw) = clip_stats(&out);
+        println!(
+            "    latent tile {}/overlap {} spatial {:?}: mean abs err {:.2}/255, clipping \
+             {cm:.2}% / {cw:.2}%, peak {:.2} GiB",
+            tile / 4,
+            overlap / 4,
+            tile_px,
+            mean_abs_delta(&single, &out),
+            gib(peak)
+        );
+    }
+
+    // --- gates ------------------------------------------------------------------------------------
+    // 1. The harness reproduces the defect: the OLD policy is materially worse than single-pass. If
+    //    this ever goes green the measurement stopped measuring, and gate 2 proves nothing.
     assert!(
-        big_hi < big_lo,
-        "doubling the overlap at latent tile 4 did not help ({big_hi:.2} vs {big_lo:.2}) — the \
-         decision record says blending is a real secondary term; it would be wrong"
+        old_err > 5.0,
+        "the OLD policy now matches single-pass to {old_err:.2}/255 — this guard is no longer \
+         reproducing sc-15325 and gate 2 below is vacuous"
     );
-    // ...and tile size still dominates it by a wide margin.
+    // 2. The NEW policy is at single-pass level, not merely better.
     assert!(
-        bigger < big_hi * 0.5,
-        "growing the TILE ({bigger:.2}) did not decisively beat widening the OVERLAP ({big_hi:.2}) — \
-         sc-15325's primary-term claim needs revisiting"
+        new_err < 4.0 && new_err < old_err * 0.35,
+        "the new decode policy is {new_err:.2}/255 from single-pass (old: {old_err:.2}) — sc-15325 \
+         requires approximately single-pass quality at the shipping buckets"
+    );
+    // 3. ...on the metric a viewer actually sees. The old policy blew out whole frames.
+    assert!(
+        new_clip_worst <= single_clip_worst + 1.5,
+        "the new policy's worst-frame highlight clipping is {new_clip_worst:.2}% against \
+         {single_clip_worst:.2}% single-pass — highlights are still blowing out"
+    );
+    // 4. ...and it did not buy that with memory: the pinned budget must have been honoured.
+    assert!(
+        gib(new_peak) <= budget_gib as f64 * 1.15,
+        "the new policy peaked at {:.2} GiB against a {budget_gib} GiB budget — the selector's cost \
+         model is under-predicting and `mlx.minMemoryGb` cannot be trusted",
+        gib(new_peak)
     );
 }
 
@@ -1006,10 +1135,27 @@ fn decode_tile_size_dominates_overlap() {
 /// tiling's period-8 artifacts vanish single-pass, the tiled decode is the mechanism; the sweep then
 /// says whether the fix is *overlap* (a blending problem) or *tile size* (a temporal receptive-field
 /// problem), which are different bugs with different fixes.
+///
+/// It also carries the **spatial** ladder, because the fix's affordability claim ("relieve the memory
+/// on the spatial axis instead") has to be evidenced on the same real latents rather than on a
+/// band-limited synthetic source that cannot show a seam. Measured (832×480, 36 output frames, latent
+/// tile 8 / overlap 4):
+///
+/// | spatial tile | mean abs err | per-column mean abs err | clipping mean / worst | MLX active peak |
+/// |---|---|---|---|---|
+/// | none (full frame) | 1.954 /255 | 1.629 … 2.440 | 0.14 % / 1.05 % | 75.77 GiB |
+/// | 448 px | 2.021 | 1.696 … 2.505 | 0.14 % / 1.04 % | 38.57 GiB |
+/// | 320 px | 2.054 | 1.719 … 2.531 | 0.13 % / 1.04 % | 20.08 GiB |
+/// | 256 px | 2.075 | 1.735 … 2.579 | 0.13 % / 1.04 % | 12.99 GiB |
+/// | 192 px | 2.121 | 1.769 … 2.630 | 0.13 % / 1.02 % | 7.49 GiB |
+///
+/// **10.1× less memory for 0.17/255, and no seam**: the per-column error shifts uniformly rather than
+/// spiking at the tile stride (worst column 1.24× the clip mean at the smallest tile). Contrast the
+/// temporal axis on the same clip: latent 2 → 4 → 8 is 17.09 → 6.43 → 1.95 /255.
 #[test]
 #[ignore = "real snapshot; run with --ignored on macOS (see module doc)"]
 fn decode_tiling_sweep_against_single_pass() {
-    use mlx_gen::tiling::{TemporalTiling, TilingConfig};
+    use mlx_gen::tiling::{SpatialTiling, TemporalTiling, TilingConfig};
     use mlx_gen_krea_realtime::{
         generate_latents, load_krea_realtime_transformer_with_quant, ArGenParams,
         CausalKreaTransformer,
@@ -1135,15 +1281,33 @@ fn decode_tiling_sweep_against_single_pass() {
     println!("    [single] MLX active peak {:.2} GiB", gib(single_peak));
     report_artifacts(&single, "single");
 
-    let shipped = decode_tiling(h, w, (latent_frames * 4) as i32).expect("the clip must tile");
-    let ship_t = shipped.temporal.expect("temporal");
-    let mut candidates: Vec<(i32, i32)> = vec![(ship_t.tile_frames, ship_t.overlap_frames)];
+    // The product policy, pinned to a small budget so the sweep is comparable run-to-run rather than
+    // reflecting whatever this host happened to have free.
+    std::env::set_var("WAN_VAE_BUDGET_GIB", "20");
+    let shipped = decode_tiling(h, w, (latent_frames * 4) as i32)
+        .expect("the product policy must be feasible")
+        .expect("the clip must tile at a 20 GiB budget");
+    std::env::remove_var("WAN_VAE_BUDGET_GIB");
+    println!("--- product policy at a 20 GiB budget: {shipped:?} ---");
+    // ⚠️ The product plan is NOT necessarily temporal. Since sc-15325 the selector relieves memory on
+    // the spatial axis, and at a short clip it will happily return a spatial-only plan — which is the
+    // *best* possible answer for this defect (no temporal tiling at all ⇒ the decoder sees the whole
+    // sequence). Assuming a temporal tile here is how this test first went red after the fix.
+    let ship_t = shipped.temporal;
+    let mut candidates: Vec<(i32, i32)> = Vec::new();
+    if let Some(t) = ship_t {
+        candidates.push((t.tile_frames, t.overlap_frames));
+    }
     for c in [(8, 4), (8, 8), (16, 4), (16, 8), (32, 8), (32, 16)] {
         if !candidates.contains(&c) {
             candidates.push(c);
         }
     }
 
+    // The full-frame latent-8/4 decode is the reference the SPATIAL ladder below is compared against
+    // (it isolates "what does shrinking the spatial tile cost?" from "what does the temporal tile
+    // cost?"), so keep it rather than paying a second 70-GiB-class decode for it.
+    let mut full_frame_32_16: Option<(Vec<Image>, usize)> = None;
     for (tile, overlap) in candidates {
         let cfg = TilingConfig {
             spatial: None,
@@ -1171,8 +1335,10 @@ fn decode_tiling_sweep_against_single_pass() {
                 (0usize, 0.0f64),
                 |acc, (i, &v)| if v > acc.1 { (i, v) } else { acc },
             );
-        let label = if (tile, overlap) == (ship_t.tile_frames, ship_t.overlap_frames) {
-            format!("tile {tile:>2} / overlap {overlap:>2}  [SHIPPED]")
+        let is_product =
+            ship_t.is_some_and(|t| (t.tile_frames, t.overlap_frames) == (tile, overlap));
+        let label = if is_product {
+            format!("tile {tile:>2} / overlap {overlap:>2}  [PRODUCT temporal tile]")
         } else {
             format!("tile {tile:>2} / overlap {overlap:>2}")
         };
@@ -1187,23 +1353,153 @@ fn decode_tiling_sweep_against_single_pass() {
             gib(peak)
         );
         report_artifacts(&out, &format!("t{tile}o{overlap}"));
-        if (tile, overlap) == (ship_t.tile_frames, ship_t.overlap_frames) {
-            dump_frames(&out, "sweep_shipped");
+        if is_product {
+            dump_frames(&out, "sweep_product_temporal");
         }
         if (tile, overlap) == (32, 16) {
             dump_frames(&out, "sweep_best");
+            full_frame_32_16 = Some((out, peak));
         }
     }
 
-    // The one thing this test must gate rather than merely report: the shipped tiling is materially
-    // worse than single-pass. If that ever stops being true the artifact is fixed and sc-15325 closes.
-    let shipped_out = decode(Some(&shipped));
-    let d_shipped = mean_abs_delta(&single, &shipped_out);
-    assert!(
-        d_shipped > 5.0,
-        "the shipped tiled decode now matches single-pass to {d_shipped:.2}/255 — sc-15325 appears \
-         fixed; update this gate and the decision record"
+    // --- the SPATIAL ladder, on the same real latents ---------------------------------------------
+    //
+    // sc-15325's affordability claim ("the memory floor drops ~6-10× and it costs almost nothing")
+    // used to be evidenced only by `decode_policy_matches_single_pass_at_the_old_memory_peak`, whose
+    // source is `smooth_frame` — a 5-6-cycle sinusoid with essentially zero energy above DC. That
+    // stimulus *structurally cannot* show a spatial seam or a starved spatial receptive field, so it
+    // could not establish the claim it was cited for. These rows are the real-latent version: same
+    // clip, same latents, same latent tile 8 / overlap 4, varying only the spatial tile.
+    //
+    // Both metrics are reported. The whole-frame mean answers "how much error"; the per-COLUMN mean
+    // answers "is any of it concentrated at a tile boundary", which the frame mean averages away.
+    let (full_out, full_peak) =
+        full_frame_32_16.expect("the (32, 16) full-frame row must have run");
+    let full_err = mean_abs_delta(&single, &full_out);
+    let full_cols = mean_abs_delta_columns(&single, &full_out);
+    let col_span = |c: &[f64]| -> (f64, f64) {
+        let lo = c.iter().cloned().fold(f64::MAX, f64::min);
+        let hi = c.iter().cloned().fold(0.0f64, f64::max);
+        (lo, hi)
+    };
+    let (full_lo, full_hi) = col_span(&full_cols);
+    println!("  --- spatial ladder at latent tile 8 / overlap 4 (real latents) ---");
+    println!(
+        "    spatial none (full frame): mean |Δ| {full_err:.3}/255, per-column {full_lo:.3}..\
+         {full_hi:.3}, peak {:.2} GiB",
+        gib(full_peak)
     );
+    let mut spatial_rows: Vec<(i32, f64, f64, f64)> = Vec::new(); // (px, err, col_hi, peak_gib)
+    for tile_px in [448i32, 320, 256, 192] {
+        let cfg = TilingConfig {
+            spatial: Some(SpatialTiling {
+                tile_px,
+                overlap_px: 64,
+            }),
+            temporal: Some(TemporalTiling {
+                tile_frames: 32,
+                overlap_frames: 16,
+            }),
+        };
+        let (out, peak) = peak_of(&|| decode(Some(&cfg)));
+        let err = mean_abs_delta(&single, &out);
+        let cols = mean_abs_delta_columns(&single, &out);
+        let (lo, hi) = col_span(&cols);
+        let (cm, cw) = clip_stats(&out);
+        println!(
+            "    spatial {tile_px:>3} px: mean |Δ| {err:.3}/255, per-column {lo:.3}..{hi:.3}, \
+             clipping {cm:.2}% / {cw:.2}%, peak {:.2} GiB",
+            gib(peak)
+        );
+        spatial_rows.push((tile_px, err, hi, gib(peak)));
+    }
+
+    // Gate 1 — the spatial axis is nearly free. The SMALLEST candidate must stay close to the
+    // full-frame decode at the same temporal tile; if shrinking the spatial tile ever starts costing
+    // real error, "relieve memory spatially" stops being the right answer and the floor has to become
+    // a memory trade again.
+    let (small_px, small_err, small_hi, small_peak) = *spatial_rows
+        .last()
+        .expect("the ladder ran at least one row");
+    assert!(
+        small_err <= full_err + 1.0,
+        "the smallest spatial candidate ({small_px} px) is {small_err:.3}/255 against \
+         {full_err:.3}/255 full-frame at the same latent tile — spatial relief is no longer nearly \
+         free, so sc-15325's affordability argument needs re-deriving"
+    );
+    // Gate 2 — and none of that error is a SEAM. A trapezoidally blended spatial tile should raise
+    // every column a little, not spike at the stride. Compared against the row's own column floor so
+    // this measures concentration, not content.
+    assert!(
+        small_hi <= small_err * 2.0,
+        "the {small_px} px spatial plan has a worst column of {small_hi:.3}/255 against a clip mean \
+         of {small_err:.3} — that concentration is the signature of a spatial seam, which the \
+         whole-frame mean would have hidden"
+    );
+    // Gate 3 — and it actually bought the memory it is claimed to buy.
+    assert!(
+        small_peak < gib(full_peak) * 0.5,
+        "the {small_px} px spatial plan peaked at {small_peak:.2} GiB against {:.2} GiB full-frame — \
+         sc-15325's claim is that the spatial axis is where the memory comes from",
+        gib(full_peak)
+    );
+
+    // sc-15325 is fixed, so the gate inverts: the full plan the PRODUCT emits — spatial and temporal
+    // together, whatever the selector chose — must now track single-pass. (The `8 / 4` row above still
+    // shows the old 2-latent-frame window failing: the corruption is reproducible on demand, it is
+    // simply no longer selectable.) The old window is re-measured here as the control, so a run where
+    // this gate passes because the *harness* stopped discriminating is caught rather than believed.
+    let (product_out, product_peak) = peak_of(&|| decode(Some(&shipped)));
+    let d_product = mean_abs_delta(&single, &product_out);
+    dump_frames(&product_out, "sweep_product_plan");
+    println!(
+        "  PRODUCT plan {shipped:?}: mean abs err {d_product:.2}/255, peak {:.2} GiB",
+        gib(product_peak)
+    );
+    report_artifacts(&product_out, "product");
+
+    let old_window = TilingConfig {
+        spatial: None,
+        temporal: Some(TemporalTiling {
+            tile_frames: 8,
+            overlap_frames: 4,
+        }),
+    };
+    let d_old = mean_abs_delta(&single, &decode(Some(&old_window)));
+    assert!(
+        d_old > 5.0,
+        "the pre-sc-15325 window is now only {d_old:.2}/255 from single-pass — this sweep has \
+         stopped reproducing the defect, so the gate below proves nothing"
+    );
+    assert!(
+        d_product < 4.0 && d_product < d_old * 0.35,
+        "the product decode plan is {d_product:.2}/255 from single-pass (old window: {d_old:.2}) — \
+         sc-15325 has regressed"
+    );
+}
+
+/// Highlight-clipping statistics, returned rather than printed: `(mean %, worst-frame %)` of pixels
+/// whose brightest channel is >= 250. This is what a viewer sees blow out, and it is the metric that
+/// separates a starved tile from a healthy one — so a test has to be able to assert on it (sc-15325).
+fn clip_stats(frames: &[Image]) -> (f64, f64) {
+    let pcts: Vec<f64> = frames
+        .iter()
+        .map(|f| {
+            let n = f.pixels.len() / 3;
+            let clipped = f
+                .pixels
+                .chunks_exact(3)
+                .filter(|px| px.iter().map(|&c| c as u32).max().unwrap_or(0) >= 250)
+                .count();
+            100.0 * clipped as f64 / n.max(1) as f64
+        })
+        .collect();
+    if pcts.is_empty() {
+        return (0.0, 0.0);
+    }
+    let mean = pcts.iter().sum::<f64>() / pcts.len() as f64;
+    let worst = pcts.iter().cloned().fold(0.0f64, f64::max);
+    (mean, worst)
 }
 
 /// Per-clip artifact statistics the naive min/max/mean misses: highlight clipping and saturation are

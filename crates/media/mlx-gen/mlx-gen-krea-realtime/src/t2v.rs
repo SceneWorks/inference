@@ -35,11 +35,12 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use mlx_gen::tiling::{TilingConfig, VaeTiling};
+use mlx_gen::tiling::TilingConfig;
 use mlx_gen::weights::Weights;
 use mlx_gen::{AdapterSpec, CancelFlag, Error, GenerationOutput, Image, Progress, Quant, Result};
 use mlx_gen_wan::config::WanQuant;
 use mlx_gen_wan::model::effective_te_quant;
+use mlx_gen_wan::pipeline::auto_tiling_budgeted_z16;
 use mlx_gen_wan::{
     decode_to_frames, frames_to_images, load_tokenizer, preprocess_i2v_image, Umt5Encoder, WanVae,
 };
@@ -57,10 +58,6 @@ use crate::load::{
 const TEMPORAL_STRIDE: usize = 4;
 /// z16 Wan VAE spatial stride (latent → pixel; 8× per side). Mirrors `WanModelConfig::vae_stride.1/.2`.
 const SPATIAL_STRIDE: usize = 8;
-/// VAE-decode temporal-window budget (output pixel·frames per `decode_tiled` window) — mirrors the
-/// scail2 z16 decode bound so a large batch decode stays memory-bounded (fewer frames/window as the
-/// resolution grows). Only consulted when the clip is large enough to tile.
-const DECODE_TILE_BUDGET_PXFRAMES: i64 = 3_500_000;
 
 /// A fully-specified Krea Realtime text-to-video job (the engine-internal form
 /// [`crate::pipeline`] maps a `GenerationRequest` onto). Dimensions are **pixel** dimensions; the
@@ -131,10 +128,10 @@ fn resolve_request_config(
     Ok(cfg)
 }
 
-/// A memory-bounded temporal-only VAE-decode tiling for a latent of `[z, T_lat, lat_h, lat_w]` at
-/// output size `(out_h, out_w)`, or `None` when the clip is small enough to decode in one pass. Mirrors
-/// the scail2 z16 budget: window size shrinks as the resolution grows so the decode peak stays bounded,
-/// and each window is capped by the z16 **write** safety bound (`VaeTiling::WAN`'s `writable_frame_cap`).
+/// The **memory-budgeted** VAE-decode tiling for a latent of `[z, T_lat, lat_h, lat_w]` at output size
+/// `(out_h, out_w)` — `Ok(None)` when a single pass already fits the budget, `Ok(Some(cfg))` for the
+/// largest tile that does, and a catchable `Err` when even the smallest tile does not (returned
+/// *before* the decode rather than as an OOM kill).
 ///
 /// `#[doc(hidden)] pub` — reachable so a validation harness in `tests/` can decode through the **same**
 /// windowing the product path uses (sc-8446, S13; a single-pass control is not comparable to a tiled
@@ -142,99 +139,105 @@ fn resolve_request_config(
 /// part of the crate's advertised API. A dedicated `test-support` feature for one function is heavier
 /// than the problem.
 ///
-/// ## 🔴 This tiling VISIBLY CORRUPTS the decode at every shipped bucket (sc-15325)
+/// ## sc-15325 — this used to compute its own window, and that window CORRUPTED the decode
 ///
-/// Measured on real latents at 832×480 / 36 output frames, decoding the **same** latent every way and
-/// comparing against a single-pass reference (`tests/generate_smoke.rs::
-/// decode_tiling_sweep_against_single_pass`). The "latent" column is what actually runs: `TilePlan::
-/// plan` divides both tile and overlap by the z16 `temporal_scale` of 4, and `split_spatial` then
-/// clamps `overlap` to `tile − 1`.
+/// The previous policy sized a temporal-only window from a local `DECODE_TILE_BUDGET_PXFRAMES = 3.5e6`
+/// output px·frames, bypassing the shared [`budgeted_plan`](mlx_gen::tiling::budgeted_plan) selector
+/// that the sibling Wan decodes use. At every shipped bucket ≥ ~233k px/frame that budget yielded an
+/// **8-output-frame** window — *two* latent frames — and `TilePlan::plan`'s ÷`temporal_scale` then left
+/// an overlap of 1 latent frame (the clamp maximum at a tile of 2). Measured on real Krea latents at
+/// 832×480 / 36 output frames, decoding the **same** latent every way against a single-pass reference
+/// (`tests/generate_smoke.rs::decode_tiling_sweep_against_single_pass`):
 ///
-/// | tile / overlap (output) | latent tile / overlap | mean \|Δ\| /255 | clipping mean / worst | MLX active peak |
+/// | tile / overlap (output) | latent tile / overlap | mean abs err /255 | clipping mean / worst | MLX active peak |
 /// |---|---|---|---|---|
 /// | single-pass | — | 0 (reference) | 0.08% / 0.25% | 85.1 GiB |
-/// | **8 / 2 — the ORIGINAL shipped value** | 2 / **0** | **18.5** | **9.7% / 26.6%** | 19.8 GiB |
-/// | **8 / 4 — what this function now emits** | 2 / **1** | 17.1 | 5.2% / 14.7% | 19.8 GiB |
+/// | 8 / 2 — the original shipped value | 2 / **0** | **18.5** | **9.7% / 26.6%** | 19.8 GiB |
+/// | 8 / 4 — the sc-8446 overlap floor | 2 / **1** | 17.1 | 5.2% / 14.7% | 19.8 GiB |
 /// | 16 / 4 | 4 / 1 | 7.5 | 1.8% / 12.9% | 38.5 GiB |
 /// | 16 / 8 | 4 / 2 | 6.4 | 1.4% / 7.0% | 38.5 GiB |
-/// | 32 / 8 | 8 / 2 | 2.5 | 0.08% / 0.25% | 75.8 GiB |
+/// | **32 / 8** | **8 / 2** | **2.5** | **0.08% / 0.25%** | 75.8 GiB |
 /// | 32 / 16 | 8 / 4 | 2.0 | 0.14% / 1.1% | 75.8 GiB |
 ///
-/// This is not a cosmetic seam. At the original setting one frame in eight blows **26% of its pixels**
-/// to near-white with violet/green chroma separation and rainbow fringing, against 0.25% single-pass —
-/// the same latents decode to a photographic image single-pass and to a psychedelic one tiled.
+/// Not a cosmetic seam: at the original setting one frame in eight blew **26% of its pixels** to
+/// near-white with violet/green chroma separation, against 0.25% single-pass. Latent **tile size** is
+/// the dominant term (−67…−70% per doubling at matched overlap ratio); overlap is a real but secondary
+/// one, and free in peak.
 ///
-/// ### Which knob — read the pairs at FIXED tile
+/// ## The fix: one policy, in one place, and pay for it spatially
 ///
-/// ⚠️ At latent tile 2 the overlap clamp caps overlap at **1**, so `overlap = 4` is already the maximum
-/// legal value there and any larger request plans identically. The tile-2 rows therefore say nothing
-/// about how much blending is worth; only the fixed-tile pairs above it do:
+/// This function now delegates to [`auto_tiling_budgeted_z16`] — the *same* selector, cost model and
+/// candidate grid the Wan z16 T2V/I2V/VACE decodes use, which `mlx-gen-scail2` now shares too. Two
+/// things follow:
 ///
-/// | comparison | mean \|Δ\| | worst-frame clipping | peak |
-/// |---|---|---|---|
-/// | overlap ×2 at latent tile 4 (1→2) | 7.5 → 6.4 (**−15%**) | 12.9% → 7.0% (**−46%**) | 38.5 → 38.5 GiB |
-/// | overlap ×2 at latent tile 8 (2→4) | 2.5 → 2.0 (**−22%**) | 0.08% / 0.25% → 0.14% / 1.1% (**worse** — see note) | 75.8 → 75.8 GiB |
-/// | tile ×2 at matched overlap ratio (4/1 → 8/2) | 7.5 → 2.5 (**−67%**) | 12.9% → 0.25% | 38.5 → **75.8 GiB** |
-/// | tile ×2 at matched overlap ratio (4/2 → 8/4) | 6.4 → 2.0 (**−70%**) | 7.0% → 1.1% | 38.5 → **75.8 GiB** |
+///  * **the routing itself is the fix.** The starved window came from *this crate computing its own*,
+///    and it now cannot. gen-core's
+///    [`MIN_TEMPORAL_TILE_LATENT_FRAMES`](mlx_gen::tiling::MIN_TEMPORAL_TILE_LATENT_FRAMES) floor is a
+///    second line — and note it is a **no-op on the z16 grid today**: that grid already bottoms out at
+///    a latent-8 tile, and floor-on vs floor-off selects an identical tile in every cell of a
+///    6-bucket × 4-frame-count × 5-budget sweep. It exists so a future budget tweak or a new candidate
+///    entry cannot re-derive the starved window. Do not undo this delegation on the belief that the
+///    floor is what protects the picture — it is prospective insurance; the delegation is the fix;
+///  * memory pressure is relieved on the **spatial** axis instead, which is what makes the fix
+///    affordable. Measured on the **same real latents** at latent tile 8 / overlap 4, varying only the
+///    spatial tile (`tests/generate_smoke.rs::decode_tiling_sweep_against_single_pass`):
 ///
-/// So **tile size dominates** (−67…−70% per doubling) but **overlap is a real secondary term**, not a
-/// negligible one. An earlier cut of this note called blending a minor contributor on the strength of
-/// the tile-2 rows; that was a degenerate comparison and the claim is withdrawn.
+/// | spatial tile | mean abs err vs single-pass | per-**column** mean abs err | clipping mean / worst | MLX active peak |
+/// |---|---|---|---|---|
+/// | none (full frame) | 1.954 /255 | 1.629 … 2.440 | 0.14% / 1.05% | 75.77 GiB |
+/// | 448 px | 2.021 | 1.696 … 2.505 | 0.14% / 1.04% | 38.57 GiB |
+/// | **320 px** | **2.054** | **1.719 … 2.531** | **0.13% / 1.04%** | **20.08 GiB** |
+/// | 256 px | 2.075 | 1.735 … 2.579 | 0.13% / 1.04% | 12.99 GiB |
+/// | 192 px | 2.121 | 1.769 … 2.630 | 0.13% / 1.02% | 7.49 GiB |
 ///
-/// ⚠️ **The two metrics disagree in direction at latent tile 8, and that is unexplained.** Mean \|Δ\|
-/// improves with overlap in *both* pairs (−15% and −22%), and clipping improves sharply at latent tile 4
-/// (12.9% → 7.0%) — but at latent tile 8 clipping gets *worse* (0.08%/0.25% → 0.14%/1.1%). The
-/// "overlap is a real secondary term" conclusion rests on mean \|Δ\| in both pairs plus clipping at tile
-/// 4; **clipping does not corroborate it at tile 8**, and whoever designs the sc-15325 fix should know
-/// that rather than read a clean story. One plausible reading is that at 8 latent frames of context the
-/// decode is already at the reference floor and the residual differences are seam-placement noise rather
-/// than signal — but that is a hypothesis, not a measurement.
+/// A 10.1× memory reduction costs 0.17/255. The two axes are simply not comparable — halving the
+/// latent *temporal* tile costs 67-70 % more error, shrinking the spatial tile 4.3× costs 8 % —
+/// because at ×8 spatial scale even a 192 px tile is 24 latent px wide with an 8-latent-px overlap.
 ///
-/// (The `32/8` row's `0.08% / 0.25%` is **not** the reference row copied down: it is an independent
-/// decode whose mean \|Δ\| against single-pass is 2.5/255, i.e. materially different pixels. The
-/// clipping metric simply saturates at the same floor.)
+/// The per-column column is what rules out a **seam**; a whole-frame mean averages a tile boundary
+/// away. It shifts uniformly across the sweep — floor 1.629 → 1.769 as ceiling 2.440 → 2.630 — with no
+/// spike at the tile stride, and the 192 px row's worst column is 1.24× its own clip mean. These rows
+/// were previously measured on a band-limited synthetic source, which structurally could not have
+/// shown either a seam or a starved spatial receptive field; the conclusion held, but the evidence is
+/// now real latents.
 ///
-/// The practical consequence for sc-15325: **raise the tile AND scale the overlap with it.** Overlap is
-/// free in *peak* (identical 38.5 / 75.8 GiB across each pair — it changes the stride and therefore the
-/// number of passes, i.e. wall time, not the resident window), so there is no reason to buy a bigger
-/// tile and leave the overlap at 1 latent frame.
+/// **The operating point at 832×480**, with the budget pinned to what the OLD policy actually cost
+/// (20.3 GiB): spatial 320/64 + temporal 32/16, i.e. **latent tile 8 / overlap 4** and 40 latent px
+/// spatial tiles — **2.05/255 against single-pass at a 20.1 GiB peak**, with clipping (0.13 %/1.04 %)
+/// at the single-pass floor. The old window was 17.1/255 with 5.2 % mean / 14.7 % worst-frame clipping
+/// at 19.8 GiB (and 24.4/255 with 30.8 % worst-frame clipping at a longer bucket). Single-pass quality
+/// for the same memory; the decode's *floor* also drops from ~20 GiB to ~7.5 GiB (the 192 px row), so
+/// this lowers the memory bar rather than raising it. At this short a clip the selector in fact
+/// returns a **spatial-only** plan (256 px, no temporal tiling at all — 0.31/255), which is the best
+/// possible answer for this defect.
 ///
-/// ### What is fixed here, and what is not
+/// Because the budget is free-aware (`free × 0.85`, `free = MLX limit − resident`, pinnable with
+/// `WAN_VAE_BUDGET_GIB`), a large-memory host still gets the fastest plan that fits and a small one
+/// tiles further spatially rather than degrading the picture.
 ///
-/// The overlap is now `max(tile/4, temporal_scale)` so it survives the ÷4 — free, and it roughly halves
-/// the clipping. At the shipped tile that lands on latent overlap 1, which the clamp makes the maximum
-/// available; the remaining headroom is only reachable by growing the tile. The tile is **not** raised
-/// here, because tile size *is* the memory bound (38.5 / 75.8 GiB against a whole-pipeline Q4 peak of
-/// 27.9 GiB), so raising it re-opens `mlx.minMemoryGb` for this engine **and** for `mlx-gen-scail2`,
-/// which computes the identical budget. That is a product decision about memory floors — **sc-15325**
-/// carries the full curve.
+/// ### Exposure that this closes
 ///
-/// ### Exposure
+/// `mlx-gen-scail2` computed the identical window from the same budget and collapsed **harder** —
+/// it never received the sc-8446 overlap floor, so its latent overlap was **0**. Measured on its own
+/// VAE weights at 832×480: 24.09/255 with 24.1 % mean / **67.6 % worst-frame** clipping, against
+/// 0.01 %/0.25 % single-pass. It now calls the same selector (2.21/255, clipping back at the
+/// single-pass floor).
 ///
-/// `mlx-gen-scail2` computes the identical `(tile_frames / 4).max(1)` from the same pxframe budget and
-/// collapses the same way. The collapse needs `tile_frames ∈ {8, 12}` — i.e. `budget_frames < 16`, i.e.
-/// **≥ ~233k px/frame**: 640×384, 512×512, 768×512, 832×480, 1280×720 all collapse; 512×384 (budget 17
-/// → tile 16 → latent overlap 1) does **not**. Wan z16/z48 route through
-/// [`budgeted_plan`](mlx_gen::tiling::budgeted_plan) and bottom out at latent tile 8 / overlap 2 — clear
-/// by the measurements above. **LTX is NOT cleared**: its `temporal_scale` is 8, so its smallest
-/// candidate bottoms out at latent tile **3** / overlap 1 — below the latent-4 tile that still measured
-/// 6.4/255 here. Unmeasured, and on sc-15325's step 1 alongside scail2.
+/// **LTX was measured too and did not reproduce the defect**: at a latent tile of 3 it is 1.73/255
+/// with 0.00 % clipping. Take that verdict at its actual width — it is **empirical, at one bucket that
+/// never tiles in production, on a source whose amplitudes cannot reach the clip threshold, and the
+/// mechanism is unexplained** (the causal-tiling story does not hold: `causal_temporal` is also true
+/// for Wan z48, and z16 at matched effective context is still 3.7× worse). See
+/// `mlx-gen-ltx/tests/vae_decode_tiling_parity.rs`. The gen-core floor still removes LTX's `(24, 8)`
+/// and `(48, 16)` candidates, but as a cheap quality win (6.6× less error for 17 % more peak), not as
+/// a defect fix. Wan z16/z48 already bottomed out at latent tile 8 / overlap 2 and are unchanged.
 #[doc(hidden)]
-pub fn decode_tiling(out_h: usize, out_w: usize, out_frames: i32) -> Option<TilingConfig> {
-    let px_per_frame = (out_h as i64) * (out_w as i64);
-    let budget_frames = DECODE_TILE_BUDGET_PXFRAMES / px_per_frame.max(1);
-    let write_cap = VaeTiling::WAN.writable_frame_cap(out_h as i32, out_w as i32);
-    let win = budget_frames.min(write_cap) as i32;
-    // Snap to the z16 ×4 temporal stride; ≥ 8 output frames (2 latent frames of temporal-conv context).
-    let tile_frames = (win / 4 * 4).clamp(8, out_frames.max(8));
-    if tile_frames >= out_frames {
-        return None; // one window covers the clip → single-pass decode.
-    }
-    // sc-15325: floor the overlap at one whole LATENT frame. `TilePlan::plan` divides by
-    // `temporal_scale`, so the previous `tile/4` gave 2 output frames ⇒ 0 latent ⇒ hard-cut windows.
-    // Free (the peak is set by `tile_frames`), and it halves the highlight clipping.
-    let overlap = (tile_frames / 4).max(TEMPORAL_STRIDE as i32);
-    Some(TilingConfig::temporal_only(tile_frames, overlap))
+pub fn decode_tiling(out_h: usize, out_w: usize, out_frames: i32) -> Result<Option<TilingConfig>> {
+    // The z16 VAE this pipeline decodes through is `mlx_gen_wan`'s, so its tiling policy is
+    // `mlx_gen_wan`'s too: one selector, one cost model, one set of candidates, shared with the Wan
+    // T2V/I2V/VACE decodes and with `mlx-gen-scail2`. The budget is free-aware
+    // (`free × 0.85`, `free = MLX limit − resident`) and pinnable via `WAN_VAE_BUDGET_GIB`.
+    auto_tiling_budgeted_z16(out_h as i32, out_w as i32, out_frames)
 }
 
 /// Decode the AR latent sequence `[z16, T_lat, lat_h, lat_w]` (f32) through the reused z16 Wan
@@ -638,7 +641,7 @@ pub fn generate_t2v(
         latent_h * SPATIAL_STRIDE,
         latent_w * SPATIAL_STRIDE,
         decoded_frames,
-    );
+    )?;
     // Trim the z16 decode back to the exact requested output count (`(f−1)/4+1` latent → `4·T_lat`
     // decoded over-delivers up to 3 leading frames when `num_frames` is not ≡ 1 (mod 4)).
     generate_t2v_from_components(
@@ -777,7 +780,7 @@ pub fn generate_i2v(
         latent_h * SPATIAL_STRIDE,
         latent_w * SPATIAL_STRIDE,
         decoded_frames,
-    );
+    )?;
     generate_i2v_from_components(
         &transformer,
         &cfg,
@@ -832,7 +835,7 @@ pub fn generate_v2v(
         latent_h * SPATIAL_STRIDE,
         latent_w * SPATIAL_STRIDE,
         decoded_frames,
-    );
+    )?;
     generate_v2v_from_components(
         &transformer,
         &cfg,
@@ -1059,12 +1062,74 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// sc-15325 **regression guard** — the defect, expressed as a property of the policy rather than
+    /// as today's numbers.
+    ///
+    /// The shipped bug was a temporal window of 8 output frames = **2 latent frames**, which starves
+    /// the z16 decoder's temporal convolutions and corrupts the content of every tile (18.5/255 mean
+    /// abs err against single-pass, 26.6% of a worst frame blown to white). This asserts the invariant
+    /// that makes that unreachable: **whenever a temporal tile is emitted at a shipped bucket, it must
+    /// span at least `MIN_TEMPORAL_TILE_LATENT_FRAMES` latent frames, with at least
+    /// `MIN_TEMPORAL_TILE_LATENT_OVERLAP` latent frames of blend** — at any budget, including a budget
+    /// far too small for a full-frame decode (which is exactly the regime the old policy failed in).
+    ///
+    /// It is pinned to a small injected budget rather than the live free-memory probe so it gates the
+    /// *policy*, not this host: on the old `DECODE_TILE_BUDGET_PXFRAMES` window this fails at every one
+    /// of these buckets (latent tile 2, latent overlap ≤ 1).
+    #[test]
+    fn decode_tiling_never_starves_the_temporal_receptive_field() {
+        use mlx_gen::tiling::{MIN_TEMPORAL_TILE_LATENT_FRAMES, MIN_TEMPORAL_TILE_LATENT_OVERLAP};
+
+        // Every bucket the old policy collapsed at (≥ ~233k px/frame), plus the one it did not.
+        const BUCKETS: [(usize, usize); 6] = [
+            (384, 640),
+            (512, 512),
+            (512, 768),
+            (480, 832),
+            (720, 1280),
+            (384, 512),
+        ];
+        // A deliberately tight budget: small enough that a full-frame single pass cannot fit, so the
+        // selector is forced to tile. The old policy answered this regime with a 2-latent-frame tile.
+        std::env::set_var("WAN_VAE_BUDGET_GIB", "12");
+        for (h, w) in BUCKETS {
+            let cfg = decode_tiling(h, w, 81)
+                .unwrap_or_else(|e| panic!("{w}x{h} must remain decodable within 12 GiB: {e}"))
+                .unwrap_or_else(|| panic!("{w}x{h}/81f cannot fit a 12 GiB single pass"));
+            let Some(t) = cfg.temporal else {
+                continue; // a spatial-only plan keeps the whole temporal sequence — full context.
+            };
+            let lat_tile = t.tile_frames / TEMPORAL_STRIDE as i32;
+            let lat_over = (t.overlap_frames / TEMPORAL_STRIDE as i32).min(lat_tile - 1);
+            assert!(
+                lat_tile >= MIN_TEMPORAL_TILE_LATENT_FRAMES,
+                "{w}x{h}: temporal tile {} output frames = {lat_tile} LATENT frames, under the \
+                 {MIN_TEMPORAL_TILE_LATENT_FRAMES}-latent-frame receptive-field floor (sc-15325)",
+                t.tile_frames
+            );
+            assert!(
+                lat_over >= MIN_TEMPORAL_TILE_LATENT_OVERLAP,
+                "{w}x{h}: temporal overlap {} output frames = {lat_over} LATENT frames after the \
+                 tile−1 clamp, under the {MIN_TEMPORAL_TILE_LATENT_OVERLAP}-frame blend floor",
+                t.overlap_frames
+            );
+        }
+        std::env::remove_var("WAN_VAE_BUDGET_GIB");
+    }
+
+    /// The other half of the contract: a clip small enough for one pass is still decoded in one pass
+    /// (the floor must not force tiling that was not needed), and a long clip still tiles.
     #[test]
     fn decode_tiling_is_single_pass_for_small_clips_and_tiles_large_ones() {
-        // A short clip fits one window ⇒ None (single pass).
-        assert!(decode_tiling(256, 256, 8).is_none());
-        // A long, small-frame clip tiles temporally (window < out_frames).
-        let big = decode_tiling(256, 256, 400);
-        assert!(big.is_some(), "a 400-frame clip must tile");
+        std::env::set_var("WAN_VAE_BUDGET_GIB", "12");
+        assert!(
+            decode_tiling(256, 256, 8).unwrap().is_none(),
+            "a 256x256/8f clip fits one pass well inside 12 GiB"
+        );
+        assert!(
+            decode_tiling(256, 256, 400).unwrap().is_some(),
+            "a 400-frame clip must tile"
+        );
+        std::env::remove_var("WAN_VAE_BUDGET_GIB");
     }
 }
