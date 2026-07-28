@@ -7,11 +7,16 @@
 //!
 //! Throwaway measurement code — the ANSWER is the deliverable, not this file.
 //!
-//! Run:
-//!   cargo test -p mlx-gen --release --test rung4_block_residency_spike -- --ignored --nocapture
+//! Env-gated. Point `MLX_GEN_BLOCK_WEIGHTS` at a packed-quantized transformer `.safetensors` whose
+//! blocks are keyed `layers.<n>.…`, then:
+//!   MLX_GEN_BLOCK_WEIGHTS=/path/to/transformer/model.safetensors \
+//!     cargo test -p mlx-gen --release --test rung4_block_residency_spike -- --ignored --nocapture
 //!
-//! Subject: z-image-turbo q4 transformer — 3.23 GiB, 1073 tensors, `layers.0..29` (30 blocks),
-//! ~97 MiB/block, 2.85 GiB of block weights. Packed-quant triple per linear:
+//! The path is supplied, never derived: inference does not resolve HF caches itself — the caller owns
+//! artifact resolution and hands down a concrete path. `scripts/check-workspace.py` enforces that.
+//!
+//! Subject measured: z-image-turbo q4 transformer — 3.23 GiB, 1073 tensors, `layers.0..29`
+//! (30 blocks), ~97 MiB/block, 2.85 GiB of block weights. Packed-quant triple per linear:
 //! `weight U32[out, in/8]` + `scales`/`biases` BF16[out, in/group_size].
 
 use std::collections::{BTreeMap, HashMap};
@@ -22,10 +27,14 @@ use mlx_rs::memory::{
 use mlx_rs::transforms::eval;
 use mlx_rs::Array;
 
-const DEFAULT_PATH: &str = "/Users/michael/.cache/huggingface/hub/models--SceneWorks--z-image-turbo-mlx/snapshots/bb2bc9893b3c49ae96c813350775f791a2e8bc80/q4/transformer/model.safetensors";
-
 fn mib(bytes: usize) -> f64 {
     bytes as f64 / (1024.0 * 1024.0)
+}
+
+/// The caller-supplied weights path, or `None` to skip. Env-only by design — see the module docs.
+fn weights_path() -> Option<String> {
+    let p = std::env::var("MLX_GEN_BLOCK_WEIGHTS").ok()?;
+    std::path::Path::new(&p).exists().then_some(p)
 }
 
 fn snap(label: &str) -> (f64, f64, f64) {
@@ -46,13 +55,12 @@ fn block_index(key: &str) -> Option<usize> {
 }
 
 #[test]
-#[ignore = "needs the real z-image-turbo q4 transformer in the HF cache"]
+#[ignore = "set MLX_GEN_BLOCK_WEIGHTS to a packed-quantized transformer safetensors"]
 fn rung4_per_block_materialization_spike() {
-    let path = std::env::var("SPIKE_TRANSFORMER").unwrap_or_else(|_| DEFAULT_PATH.to_owned());
-    if !std::path::Path::new(&path).exists() {
-        println!("SKIP: {path} not found");
+    let Some(path) = weights_path() else {
+        println!("SKIP: set MLX_GEN_BLOCK_WEIGHTS to a packed-quantized transformer safetensors");
         return;
-    }
+    };
 
     println!("\n=== Q1: is load_safetensors LAZY? ===");
     clear_cache();
@@ -213,13 +221,12 @@ fn rung4_per_block_materialization_spike() {
 /// exactly the ones whose OS page cache is under pressure, so warm-cache numbers are the optimistic
 /// bound, not the expected one.
 #[test]
-#[ignore = "needs the real z-image-turbo q4 transformer in the HF cache"]
+#[ignore = "set MLX_GEN_BLOCK_WEIGHTS to a packed-quantized transformer safetensors"]
 fn rung4_rematerialization_cost_per_step() {
-    let path = std::env::var("SPIKE_TRANSFORMER").unwrap_or_else(|_| DEFAULT_PATH.to_owned());
-    if !std::path::Path::new(&path).exists() {
-        println!("SKIP: {path} not found");
+    let Some(path) = weights_path() else {
+        println!("SKIP: set MLX_GEN_BLOCK_WEIGHTS to a packed-quantized transformer safetensors");
         return;
-    }
+    };
     const STEPS: usize = 8; // z-image-turbo default
 
     let (mut tensors, _): (HashMap<String, Array>, HashMap<String, String>) =

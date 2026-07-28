@@ -1,8 +1,14 @@
 //! sc-15750 — rung 4 (`mlx_gen::block_residency`) bounds transformer weight residency on real
 //! packed-quantized weights, and the materialize guard that makes it work is load-bearing.
 //!
-//! `#[ignore]`d — needs the real `SceneWorks/z-image-turbo-mlx` q4 transformer in the HF cache:
-//!   cargo test -p mlx-gen --release --test block_residency_real_weights -- --ignored --nocapture
+//! `#[ignore]`d and env-gated. Point `MLX_GEN_BLOCK_WEIGHTS` at a packed-quantized transformer
+//! `.safetensors` whose blocks are keyed `layers.<n>.…` (measured against `SceneWorks/z-image-turbo-mlx`
+//! q4), then:
+//!   MLX_GEN_BLOCK_WEIGHTS=/path/to/transformer/model.safetensors \
+//!     cargo test -p mlx-gen --release --test block_residency_real_weights -- --ignored --nocapture
+//!
+//! The path is supplied, never derived: inference does not resolve HF caches itself — the caller owns
+//! artifact resolution and hands down a concrete path. `scripts/check-workspace.py` enforces that.
 //!
 //! The "forward pass" here is a chain of `quantized_matmul` calls through each block's `attention.to_k`
 //! triple. That is not the real Z-Image block, and deliberately so: this is the SHARED primitive's
@@ -18,7 +24,6 @@ use mlx_gen::weights::Weights;
 use mlx_rs::transforms::eval;
 use mlx_rs::{Array, Dtype};
 
-const DEFAULT_PATH: &str = "/Users/michael/.cache/huggingface/hub/models--SceneWorks--z-image-turbo-mlx/snapshots/bb2bc9893b3c49ae96c813350775f791a2e8bc80/q4/transformer/model.safetensors";
 const N_BLOCKS: usize = 30;
 const WIDTH: i32 = 3840;
 
@@ -26,8 +31,9 @@ fn mib(bytes: usize) -> f64 {
     bytes as f64 / (1024.0 * 1024.0)
 }
 
+/// The caller-supplied weights path, or `None` to skip. Env-only by design — see the module docs.
 fn path() -> Option<String> {
-    let p = std::env::var("SPIKE_TRANSFORMER").unwrap_or_else(|_| DEFAULT_PATH.to_owned());
+    let p = std::env::var("MLX_GEN_BLOCK_WEIGHTS").ok()?;
     std::path::Path::new(&p).exists().then_some(p)
 }
 
@@ -89,10 +95,10 @@ fn sweep(p: &str, window: usize, materialize_on: bool) -> f64 {
 }
 
 #[test]
-#[ignore = "needs the real z-image-turbo q4 transformer in the HF cache"]
+#[ignore = "set MLX_GEN_BLOCK_WEIGHTS to a packed-quantized transformer safetensors"]
 fn block_window_bounds_transformer_residency() {
     let Some(p) = path() else {
-        println!("SKIP: transformer weights not in cache");
+        println!("SKIP: set MLX_GEN_BLOCK_WEIGHTS to a packed-quantized transformer safetensors");
         return;
     };
 
@@ -129,10 +135,10 @@ fn block_window_bounds_transformer_residency() {
 /// does not hold. If this test ever passes with a bounded peak, the guard in `run_windowed` has
 /// stopped doing anything and the whole rung is decorative.
 #[test]
-#[ignore = "needs the real z-image-turbo q4 transformer in the HF cache"]
+#[ignore = "set MLX_GEN_BLOCK_WEIGHTS to a packed-quantized transformer safetensors"]
 fn block_window_without_materialize_frees_nothing() {
     let Some(p) = path() else {
-        println!("SKIP: transformer weights not in cache");
+        println!("SKIP: set MLX_GEN_BLOCK_WEIGHTS to a packed-quantized transformer safetensors");
         return;
     };
 
