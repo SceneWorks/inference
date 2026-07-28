@@ -228,6 +228,17 @@ jobs:
         run: >-
           cargo test --locked --release -p mlx-gen-mage --test vae_decode_real_weights
           -- --ignored --nocapture
+      # SC-15507: one loaded provider executes A -> B -> A request scopes, observes cancellation at
+      # Mage's terminal post-trace check, injects an error outcome after real work, and proves both
+      # cleanup paths permit follow-ups. SceneWorks owns selector/cache-state coverage; this workflow
+      # has the Apple MLX hardware and complete snapshot needed for the provider half.
+      - name: Run Mage request-memory lifecycle
+        env:
+          MAGE_REQUEST_SCOPE_SNAPSHOT: ${{ env.MAGE_SNAPSHOT }}
+          MAGE_REQUEST_SCOPE_QUANT: bf16
+        run: >-
+          cargo test --locked --release -p mlx-gen-mage
+          --test request_memory_scope_real_weights -- --ignored --nocapture
       - name: Run Mage-Flow instruction-edit parity
         run: |
           status=0
