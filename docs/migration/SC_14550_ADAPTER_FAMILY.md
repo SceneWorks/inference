@@ -384,10 +384,23 @@ stricter unit than the earlier figures used, which is part of why they do not si
 |---|---|---|---|
 | `load_native` | 19 | 18 | 1 |
 | `load_peft` | 17 | 15 | 2 |
-| distinct (two sites are shared) | **34** | **31** | **3** |
+| distinct (three sites are shared) | **33** | **30** | **3** |
 
-`finish_modules`' empty-modules refusal and `resolve_adapter_type`'s unknown-type refusal are the
-two shared sites, counted once per reader above and once in the distinct row.
+Three refusals are reachable from both readers and are therefore counted once per reader above and
+once in the distinct row: `finish_modules`' empty-modules refusal (called from
+`collect_native_modules:1040` and `load_peft:1167`), `resolve_adapter_type`'s unknown-type refusal
+(`load_native:960` and `load_peft:1168`), and `finite_or_err`'s non-finite refusal
+(`collect_native_modules:1026` and `load_peft:1154`).
+
+**That count is itself a correction, of the same class as the one above.** The distinct row first
+read **34 / 31 / 3**, computed as `19 + 17 − 2`, and named only the first two of those as "the two
+shared sites". `finite_or_err` is a third, so the arithmetic is `19 + 17 − 3` = **33** distinct and
+`18 + 15 − 3` = **30** RED. The per-reader rows reproduce exactly; only the distinct row was wrong.
+There is **no coverage consequence** — `finite_or_err` is RED under both readers, and appears in the
+shared table twice for that reason — so this is an enumeration error inside a figure presented as
+measured, not a newly found gap. It is stated here rather than quietly substituted, because a
+measured-sounding number that does not reproduce under its own stated unit is precisely the defect
+this section exists to record.
 
 The three that are still ungated, named rather than rounded away:
 
@@ -397,7 +410,10 @@ The three that are still ungated, named rather than rounded away:
   `Value::Null` whose `get("r")` is `None`. That is measured, not assumed: under both mutations the
   "invalid UTF-8" and "not JSON at all" rows still observed a refusal and the suite stayed green.
   So no adapter loads that would not have loaded before; what is missing is a witness pinning the
-  refusal to *this* site rather than the one behind it.
+  refusal to *this* site rather than the one behind it. Both are gateable by the technique this
+  branch invented for the non-object `__metadata__` row: assert the refusal **message** rather than
+  `is_err()`, since the site behind each of these words its refusal differently. That is an
+  expectation change per row, not a shape change — named here as the way in, not done.
 * **`collect_native_modules`' "carries {name} twice"** (the `seen` set). No fixture exercises it and
   none was written. Reading the path: `MmapedSafetensors::new` here opens a single file, that
   file's header is parsed as a JSON object, and `file.tensors()` yields one entry per key — so the
