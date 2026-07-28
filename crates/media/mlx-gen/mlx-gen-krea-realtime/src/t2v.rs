@@ -410,7 +410,7 @@ pub fn decode_latents_to_video(
 /// tier (q4), three seeds, 45 latent frames, and only the drift modes the descriptor can see (global
 /// tone, global colour including the opponent axes, and a 5×5 block-luma spread). It says nothing about
 /// semantic or identity drift, texture degradation, or motion quality beyond a freeze check. No row
-/// froze (tail motion 3.1–18.8/255 per frame across all 29 recorded cells).
+/// froze (tail motion 3.1–18.8/255 per frame across all 28 recorded cells).
 ///
 /// The seed-to-seed scatter is the same order as the configuration-to-configuration differences, so
 /// **the only ranking this sweep supports is row A against the budget.** Every ordering *between* rows

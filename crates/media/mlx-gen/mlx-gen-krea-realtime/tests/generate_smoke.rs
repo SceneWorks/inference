@@ -2922,18 +2922,7 @@ fn long_clip_coherence_under_the_bounded_window() {
 
     let sweep = S18Sweep {
         bucket: format!("{w}x{h}"),
-        cells: results
-            .iter()
-            .map(|r| S18Cell {
-                row: r.row,
-                seed: r.seed,
-                rolls: r.rolls,
-                trend: r.trend,
-                excursion: r.excursion,
-                slope: r.slope,
-                component: r.component,
-            })
-            .collect(),
+        cells: results.iter().map(S18Cell::from_measured).collect(),
     };
     println!("  {}", sweep.summary());
     if want_rows.contains('A') {
@@ -2966,6 +2955,11 @@ struct S18Cell {
     /// [`trend`](Self::trend) (they differ by the constant post-segment length), so the segment length
     /// is recoverable as `100 * trend / slope`.
     slope: f64,
+    /// Mean absolute RGB frame-to-frame delta over the last third of the clip, in 0..255 units.
+    ///
+    /// This is the sweep's freeze check. It is retained in the recorded cells so the crate prose's
+    /// count and rounded range are derived from the raw `S18CELL` evidence rather than hand-copied.
+    tail_motion: f64,
     /// Which [`DESCRIPTOR_NAMES`] component actually produced [`drift`](Self::drift) for this cell.
     ///
     /// Recorded so the reader can check *which channel* scored a row rather than taking the earlier
@@ -2975,6 +2969,20 @@ struct S18Cell {
 }
 
 impl S18Cell {
+    /// Retain every verdict and freeze-evidence field emitted by the live real-weight sweep.
+    fn from_measured(row: &S18Row) -> Self {
+        Self {
+            row: row.row,
+            seed: row.seed,
+            rolls: row.rolls,
+            trend: row.trend,
+            excursion: row.excursion,
+            slope: row.slope,
+            tail_motion: row.tail_motion,
+            component: row.component,
+        }
+    }
+
     /// The gated statistic: trend AND excursion must be inside budget, i.e. their max must be.
     fn drift(&self) -> f64 {
         self.trend.abs().max(self.excursion.abs())
@@ -2984,6 +2992,30 @@ impl S18Cell {
     fn post_len(&self) -> Option<f64> {
         (self.slope.abs() > 1e-9).then(|| 100.0 * self.trend.abs() / self.slope.abs())
     }
+}
+
+#[test]
+fn an_s18_cell_retains_tail_motion_from_the_live_sweep() {
+    let measured = S18Row {
+        label: "test".into(),
+        drift: 1.0,
+        trend: 2.0,
+        excursion: 3.0,
+        slope: 4.0,
+        component: "luma-mean",
+        rolls: 5,
+        peak: 6,
+        clip_mean: 7.0,
+        head_motion: 8.0,
+        tail_motion: 12.3456,
+        row: 'A',
+        seed: 9,
+    };
+    let cell = S18Cell::from_measured(&measured);
+    assert_eq!(
+        cell.tail_motion, measured.tail_motion,
+        "the live S18 result-to-record conversion must not discard the freeze measurement"
+    );
 }
 
 /// Outcome of the within-regime window dose-response — row `D` (2.5× wider window, fewer evictions)
@@ -3423,6 +3455,7 @@ fn the_s18_verdict_rule_distinguishes_its_outcomes() {
                     // sweeps have no row Z, so the rate-floor clause is inert here; it is exercised
                     // against the RECORDED data, which does have one.
                     slope: means[i] + off,
+                    tail_motion: 2.0,
                     component: "luma-mean",
                 });
             }
@@ -3496,6 +3529,7 @@ fn the_s18_verdict_rule_distinguishes_its_outcomes() {
             trend: t,
             excursion: 0.0,
             slope: t,
+            tail_motion: 2.0,
             component: "luma-mean",
         })
     };
@@ -3680,12 +3714,44 @@ fn the_withdrawn_s18_claims_do_not_survive_in_crate_prose() {
 /// the recorded data.
 const RECORDED_VERDICT_PREFIX: &str = "drift is real";
 
+/// FNV-1a fingerprint of `(bucket, row, seed, tail_motion.to_bits())` for every recorded cell.
+///
+/// Unlike the rounded prose range, this pins every recovered value exactly. Update it only from the
+/// preserved `S18CELL` logs identified by SHA-256 above the two measured tables.
+const RECORDED_TAIL_MOTION_FINGERPRINT: u64 = 9_701_062_213_232_306_698;
+
+fn recorded_tail_motion_fingerprint() -> u64 {
+    fn add(hash: &mut u64, bytes: &[u8]) {
+        for byte in bytes {
+            *hash ^= u64::from(*byte);
+            *hash = hash.wrapping_mul(0x100000001b3);
+        }
+    }
+
+    let mut hash = 0xcbf29ce484222325;
+    for (bucket, cells) in [(640_u16, MEASURED_640), (832_u16, MEASURED_832)] {
+        for cell in cells {
+            add(&mut hash, &bucket.to_le_bytes());
+            add(&mut hash, &[cell.row as u8]);
+            add(&mut hash, &cell.seed.to_le_bytes());
+            add(&mut hash, &cell.tail_motion.to_bits().to_le_bytes());
+        }
+    }
+    hash
+}
+
 /// Measured cells at **640×384** (the bucket where the global reference row fits in 128 GiB).
 ///
 /// Row E is `n = 1`: its 45.0 GiB MLX peak drove this 128 GiB host into enough swap to fill the boot
 /// volume, so the remaining two seeds were abandoned. It is a *reference*, not a control, and nothing
 /// the verdict decides turns on it — the attribution is decided by row D, which is within regime and
 /// replicated.
+///
+/// Provenance: rows A/B and C seeds 7/11 were transcribed from `s18_640.log`
+/// (SHA-256 `a9d3d0f4f4163171af2e83148bd75857266c7c97f26e16d391edd762f40d7803`);
+/// C seed 23 and rows D/E/Z came from `s18_640c.log`
+/// (SHA-256 `c89f4d7da05d3f367318dc03edf73e4f2e9c97509c13afcfaf508840f9e7019c`).
+/// `tail_motion` is the final field of each preserved `S18CELL` TSV line.
 const MEASURED_640: &[S18Cell] = &[
     S18Cell {
         row: 'A',
@@ -3694,6 +3760,7 @@ const MEASURED_640: &[S18Cell] = &[
         trend: 19.9907,
         excursion: 23.0413,
         slope: 12.8146,
+        tail_motion: 8.4549,
         component: "spatial-sd",
     },
     S18Cell {
@@ -3703,6 +3770,7 @@ const MEASURED_640: &[S18Cell] = &[
         trend: 31.0541,
         excursion: 19.3187,
         slope: 19.9064,
+        tail_motion: 9.7033,
         component: "luma-mean",
     },
     S18Cell {
@@ -3712,6 +3780,7 @@ const MEASURED_640: &[S18Cell] = &[
         trend: 21.7860,
         excursion: 28.4337,
         slope: 13.9654,
+        tail_motion: 8.3340,
         component: "opp-B-Y",
     },
     S18Cell {
@@ -3721,6 +3790,7 @@ const MEASURED_640: &[S18Cell] = &[
         trend: 11.6090,
         excursion: 17.4084,
         slope: 7.4416,
+        tail_motion: 8.7276,
         component: "spatial-sd",
     },
     S18Cell {
@@ -3730,6 +3800,7 @@ const MEASURED_640: &[S18Cell] = &[
         trend: 28.5211,
         excursion: 12.3800,
         slope: 18.2828,
+        tail_motion: 10.9031,
         component: "luma-mean",
     },
     S18Cell {
@@ -3739,6 +3810,7 @@ const MEASURED_640: &[S18Cell] = &[
         trend: 11.8207,
         excursion: 10.3263,
         slope: 7.5774,
+        tail_motion: 9.0604,
         component: "saturation",
     },
     S18Cell {
@@ -3748,6 +3820,7 @@ const MEASURED_640: &[S18Cell] = &[
         trend: 17.6473,
         excursion: 14.7965,
         slope: 11.3124,
+        tail_motion: 9.0903,
         component: "contrast",
     },
     S18Cell {
@@ -3757,6 +3830,7 @@ const MEASURED_640: &[S18Cell] = &[
         trend: 15.7251,
         excursion: 0.0,
         slope: 10.0802,
+        tail_motion: 8.9464,
         component: "opp-B-Y",
     },
     S18Cell {
@@ -3766,6 +3840,7 @@ const MEASURED_640: &[S18Cell] = &[
         trend: 6.2537,
         excursion: 5.8270,
         slope: 4.0088,
+        tail_motion: 9.8476,
         component: "contrast",
     },
     S18Cell {
@@ -3775,6 +3850,7 @@ const MEASURED_640: &[S18Cell] = &[
         trend: 27.5739,
         excursion: 21.8348,
         slope: 17.6756,
+        tail_motion: 6.8550,
         component: "opp-B-Y",
     },
     S18Cell {
@@ -3784,6 +3860,7 @@ const MEASURED_640: &[S18Cell] = &[
         trend: 33.0361,
         excursion: 23.0505,
         slope: 21.1770,
+        tail_motion: 6.6431,
         component: "luma-mean",
     },
     S18Cell {
@@ -3793,6 +3870,7 @@ const MEASURED_640: &[S18Cell] = &[
         trend: 31.1090,
         excursion: 30.5435,
         slope: 19.9416,
+        tail_motion: 6.5790,
         component: "opp-B-Y",
     },
     S18Cell {
@@ -3802,6 +3880,7 @@ const MEASURED_640: &[S18Cell] = &[
         trend: 34.0619,
         excursion: 18.5963,
         slope: 21.8345,
+        tail_motion: 9.1457,
         component: "luma-mean",
     },
     S18Cell {
@@ -3811,6 +3890,7 @@ const MEASURED_640: &[S18Cell] = &[
         trend: 1.3928,
         excursion: 0.0,
         slope: 11.6069,
+        tail_motion: 6.9907,
         component: "saturation",
     },
     S18Cell {
@@ -3820,6 +3900,7 @@ const MEASURED_640: &[S18Cell] = &[
         trend: 3.3254,
         excursion: 0.0,
         slope: 27.7120,
+        tail_motion: 9.6543,
         component: "opp-B-Y",
     },
     S18Cell {
@@ -3829,12 +3910,17 @@ const MEASURED_640: &[S18Cell] = &[
         trend: 5.9501,
         excursion: 0.0,
         slope: 49.5845,
+        tail_motion: 17.8587,
         component: "opp-B-Y",
     },
 ];
 
 /// Measured cells at **832×480** — the crate default and a shipping bucket. Row E is absent by
 /// necessity: the global window at this bucket SIGKILLs a 128 GiB host.
+///
+/// Provenance: all rows were transcribed from `s18_832.log`
+/// (SHA-256 `e48d1d0ffd21b1d74833ee8d6624864132391b14b2f8f19d73bb216540704102`).
+/// `tail_motion` is the final field of each preserved `S18CELL` TSV line.
 const MEASURED_832: &[S18Cell] = &[
     S18Cell {
         row: 'A',
@@ -3843,6 +3929,7 @@ const MEASURED_832: &[S18Cell] = &[
         trend: 45.8218,
         excursion: 47.1323,
         slope: 29.3729,
+        tail_motion: 14.0410,
         component: "opp-B-Y",
     },
     S18Cell {
@@ -3852,6 +3939,7 @@ const MEASURED_832: &[S18Cell] = &[
         trend: 27.7189,
         excursion: 34.5532,
         slope: 17.7685,
+        tail_motion: 11.2383,
         component: "opp-B-Y",
     },
     S18Cell {
@@ -3861,6 +3949,7 @@ const MEASURED_832: &[S18Cell] = &[
         trend: 29.2038,
         excursion: 36.0093,
         slope: 18.7204,
+        tail_motion: 4.9842,
         component: "opp-B-Y",
     },
     S18Cell {
@@ -3870,6 +3959,7 @@ const MEASURED_832: &[S18Cell] = &[
         trend: 25.6222,
         excursion: 34.1733,
         slope: 16.4245,
+        tail_motion: 18.7733,
         component: "opp-B-Y",
     },
     S18Cell {
@@ -3879,6 +3969,7 @@ const MEASURED_832: &[S18Cell] = &[
         trend: 23.7267,
         excursion: 31.0055,
         slope: 15.2094,
+        tail_motion: 15.2673,
         component: "opp-B-Y",
     },
     S18Cell {
@@ -3888,6 +3979,7 @@ const MEASURED_832: &[S18Cell] = &[
         trend: 18.8356,
         excursion: 26.8110,
         slope: 12.0741,
+        tail_motion: 7.9430,
         component: "opp-B-Y",
     },
     S18Cell {
@@ -3897,6 +3989,7 @@ const MEASURED_832: &[S18Cell] = &[
         trend: 14.6706,
         excursion: 22.8868,
         slope: 9.4042,
+        tail_motion: 15.0360,
         component: "opp-B-Y",
     },
     S18Cell {
@@ -3906,6 +3999,7 @@ const MEASURED_832: &[S18Cell] = &[
         trend: 11.0461,
         excursion: 19.4879,
         slope: 7.0808,
+        tail_motion: 15.6104,
         component: "opp-B-Y",
     },
     S18Cell {
@@ -3915,6 +4009,7 @@ const MEASURED_832: &[S18Cell] = &[
         trend: 21.1164,
         excursion: 27.9238,
         slope: 13.5362,
+        tail_motion: 8.2002,
         component: "opp-B-Y",
     },
     S18Cell {
@@ -3924,6 +4019,7 @@ const MEASURED_832: &[S18Cell] = &[
         trend: 47.4356,
         excursion: 47.0857,
         slope: 30.4074,
+        tail_motion: 16.9721,
         component: "opp-B-Y",
     },
     S18Cell {
@@ -3933,6 +4029,7 @@ const MEASURED_832: &[S18Cell] = &[
         trend: 35.2790,
         excursion: 39.0004,
         slope: 22.6147,
+        tail_motion: 10.8825,
         component: "opp-B-Y",
     },
     S18Cell {
@@ -3942,6 +4039,7 @@ const MEASURED_832: &[S18Cell] = &[
         trend: 22.8338,
         excursion: 22.2395,
         slope: 14.6371,
+        tail_motion: 3.1060,
         component: "spatial-sd",
     },
 ];
@@ -4074,5 +4172,50 @@ fn the_recorded_s18_sweep_is_what_the_docs_claim() {
         "row Z's post segment is {z_post:.0} output frames against row A's {a_post:.0} — the docs' \
          \"a 12-frame OLS slope does not extrapolate across 156\" argument no longer describes the \
          data"
+    );
+
+    // Freeze evidence is part of the documented conclusion too. Derive its cell count and rounded
+    // range from the recorded tables, then demand that the hand-written prose says exactly that.
+    // The fingerprint separately pins every unrounded value, so changing a non-extreme cell cannot
+    // evade this gate merely because the displayed range still rounds to the same endpoints.
+    let cells: Vec<&S18Cell> = MEASURED_640.iter().chain(MEASURED_832).collect();
+    assert_eq!(
+        cells.len(),
+        28,
+        "the recorded S18 sweep changed cell count; reconcile it with the preserved S18CELL logs and \
+         update the documented count"
+    );
+    assert!(
+        cells
+            .iter()
+            .all(|cell| cell.tail_motion.is_finite() && cell.tail_motion > 0.0),
+        "every recorded S18 cell must retain its positive finite tail-motion freeze measurement"
+    );
+    let min_tail = cells
+        .iter()
+        .map(|cell| cell.tail_motion)
+        .fold(f64::INFINITY, f64::min);
+    let max_tail = cells
+        .iter()
+        .map(|cell| cell.tail_motion)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let documented = format!(
+        "tail motion {min_tail:.1}–{max_tail:.1}/255 per frame across all {} recorded cells",
+        cells.len()
+    );
+    let prose = include_str!("../src/t2v.rs")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        prose.contains(&documented),
+        "src/t2v.rs must derive its freeze-evidence count/range from the recorded sweep: expected \
+         `{documented}`"
+    );
+    assert_eq!(
+        recorded_tail_motion_fingerprint(),
+        RECORDED_TAIL_MOTION_FINGERPRINT,
+        "a recorded tail-motion value changed; re-extract every final field from the preserved \
+         S18CELL logs and update the fingerprint only when the evidence justifies it"
     );
 }
