@@ -378,7 +378,7 @@ impl Generator for KreaGenerator {
     fn image_memory_contract(&self) -> Option<&gen_core::ImageMemoryProviderContract> {
         #[cfg(feature = "cuda")]
         {
-            return (self.descriptor.id == KREA_2_TURBO_ID).then(krea_turbo_image_memory_contract);
+            (self.descriptor.id == KREA_2_TURBO_ID).then(krea_turbo_image_memory_contract)
         }
         #[cfg(not(feature = "cuda"))]
         {
@@ -419,11 +419,11 @@ impl Generator for KreaGenerator {
             {
                 return Err(gen_core::Error::Unsupported(reason));
             }
-            return Ok(Some(Box::new(KreaImageMemoryScope {
+            Ok(Some(Box::new(KreaImageMemoryScope {
                 device: self.device.clone(),
                 memory: krea_generation_memory(context.selection),
                 finished: false,
-            })));
+            })))
         }
         #[cfg(not(feature = "cuda"))]
         {
