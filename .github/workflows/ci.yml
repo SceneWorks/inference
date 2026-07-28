@@ -230,9 +230,9 @@ jobs:
         # time for zero executed cases.
         #
         # The named eleven and what they execute on a PR (measured, by running this step's exact
-        # command on the merged tree): `adapters` 29, `audio_edit` 20, `sampler_oracle` 17,
+        # command on the merged tree): `adapters` 34, `audio_edit` 20, `sampler_oracle` 17,
         # `reference_audio` 7, `provider` 3, `listening_stimuli` 3, `dtype_policy` 2,
-        # `conformance` 1, `primitive_oracle` 1, `same_oracle` 1, `variant_quality` 1 — 85
+        # `conformance` 1, `primitive_oracle` 1, `same_oracle` 1, `variant_quality` 1 — 90
         # weight-free cases.
         # sc-14545 review found
         # `sampler_oracle`, `same_oracle` and `primitive_oracle` running in no automatic lane at all

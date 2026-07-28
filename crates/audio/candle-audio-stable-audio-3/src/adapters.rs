@@ -237,6 +237,14 @@ pub struct LoadedAdapter {
     pub exclude: Vec<String>,
     /// Target checkpoint key (**including** the trailing `.weight`) to its factors.
     pub modules: BTreeMap<String, AdapterModule>,
+    /// Position in the caller's [`candle_audio::gen_core::LoadSpec::adapters`].
+    ///
+    /// Assigned by [`plan_for`], which is the only place that can know it: [`load_adapter`] reads
+    /// one path and has no view of the stack, so it leaves this `0`. It is carried on the adapter
+    /// rather than recomputed while planning because [`plan_for`] builds the plan a second time
+    /// over the **zero-scale-filtered** slice, and a positional `enumerate()` there would renumber
+    /// the survivors — reporting the live member of `[zero, live]` as index 0.
+    pub spec_index: usize,
 }
 
 /// Which on-disk shape an adapter path is.
@@ -405,7 +413,9 @@ pub struct AdapterOp {
     pub effective_scale: f64,
     pub rank: usize,
     pub module: AdapterModule,
-    /// Which entry of [`candle_audio::gen_core::LoadSpec::adapters`] this came from, for error messages.
+    /// Which entry of [`candle_audio::gen_core::LoadSpec::adapters`] this came from, for error
+    /// messages. This is [`LoadedAdapter::spec_index`] — the position in the caller's **original**
+    /// request, not in the zero-scale-filtered slice the surviving plan is built from.
     pub adapter_index: usize,
 }
 
@@ -446,8 +456,13 @@ impl AdapterPlan {
     ///   from the adapter's metadata and describe the module set it was trained over, so a module
     ///   outside that set is an internal contradiction in the file, not a caller's subsetting
     ///   choice. Refusing it is what makes "every adapter tensor consumed exactly once" checkable.
-    /// * Zero matched targets, even if every individual module resolved (only reachable for an
-    ///   empty adapter).
+    /// * Zero matched targets. Reachable **only** through this function's own public signature,
+    ///   with a hand-built module-less [`LoadedAdapter`]: on every shipped path the per-module rule
+    ///   above is strictly stronger — an unmatched module returns early, so a loop that completes
+    ///   has `matched >= 1` — and [`load_adapter`] never yields a module-less adapter in the first
+    ///   place, because `finish_modules` refuses one. It is kept as a refusal rather than a
+    ///   `debug_assert!` precisely because `build` is public and its input is caller-constructed;
+    ///   `a_module_less_adapter_is_refused_by_build` is the case that holds it live.
     /// * A factor whose shape disagrees with the target weight.
     ///
     /// A `scale == 0.0` adapter is **fully loaded and fully validated** — it reaches here and every
@@ -458,7 +473,10 @@ impl AdapterPlan {
         targets: &BTreeMap<String, Vec<usize>>,
     ) -> Result<Self> {
         let mut by_target: BTreeMap<String, Vec<AdapterOp>> = BTreeMap::new();
-        for (adapter_index, adapter) in adapters.iter().enumerate() {
+        for adapter in adapters {
+            // `adapter.spec_index`, never `enumerate()`: this function is called a second time over
+            // the zero-scale-filtered slice, where a positional index would be the wrong one.
+            let adapter_index = adapter.spec_index;
             let mut matched = 0usize;
             for (key, module) in &adapter.modules {
                 let Some(shape) = targets.get(key) else {
@@ -954,6 +972,8 @@ fn load_native(path: &Path, scale: f32, device: &Device) -> Result<LoadedAdapter
         include,
         exclude,
         modules,
+        // `plan_for` stamps the caller-visible position; one path in isolation has no stack.
+        spec_index: 0,
     })
 }
 
@@ -1162,6 +1182,8 @@ fn load_peft(path: &Path, scale: f32, device: &Device) -> Result<LoadedAdapter> 
         include,
         exclude,
         modules,
+        // `plan_for` stamps the caller-visible position; one path in isolation has no stack.
+        spec_index: 0,
     })
 }
 
@@ -1279,8 +1301,12 @@ pub fn plan_for(
     device: &Device,
 ) -> Result<AdapterPlan> {
     let mut loaded = Vec::with_capacity(specs.len());
-    for spec in specs {
-        loaded.push(load_adapter(spec, device)?);
+    for (index, spec) in specs.iter().enumerate() {
+        let mut adapter = load_adapter(spec, device)?;
+        // Stamped here and carried through the zero-scale filter below, so an op built from the
+        // filtered slice still reports the caller's original position.
+        adapter.spec_index = index;
+        loaded.push(adapter);
     }
     // Resolve the FULL stack — zero-scale members included — against the checkpoint. This call is
     // the validation: a zero-scale adapter with a mistyped key, a wrong rank or a shape that does

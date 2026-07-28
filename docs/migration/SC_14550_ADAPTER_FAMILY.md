@@ -220,7 +220,17 @@ Split deliberately across two points:
 * `resolve_adapter_plan` runs after snapshot identity, still at `load_variant` — so a malformed,
   pickle-format, or key-mismatched adapter fails at **load** rather than at first generate, minutes
   later, behind a cold start. Its result is discarded; the plan the pipeline folds is rebuilt on the
-  compute device by the identical function, so the two paths cannot drift.
+  compute device by the identical function, so the two paths cannot drift. That second bullet is
+  gated by the real-weight `a_key_mismatched_adapter_is_refused_at_load_variant_not_at_first_generate`
+  case; deleting the call was green in every lane before it existed.
+
+### Target counts: the fixture's number is not the checkpoint's
+
+Worth stating because it has already been confused once, in a story comment since corrected. The
+**real** `small-music` checkpoint has **193** adaptable targets out of 685 tensors. The **8** that
+appears in `tests/adapters.rs` is the count for `real_key_shapes()`, a deliberately small
+representative slice of that header — not a property of the model. Any claim of the form "the
+checkpoint has N adaptable targets" must be read off the pinned header, not off the fixture.
 
 ## Mutation matrix
 
@@ -246,15 +256,50 @@ The first two rows are honestly green in the PR lane. Both are load-wiring, not 
 caught by the real-weight lane on `sa3-base-identity-{metal,cuda}` — the only jobs provisioning all
 six snapshots.
 
+### Gates added because the review found them ungated
+
+Adversarial review found no correctness bug in shipped code. What it found was **gates that would
+not have caught their own regression** — code that was right, guarded by a test that could not tell.
+Each row below was verified by applying the edit and observing the named case go RED; each was
+**green before** the case existed.
+
+| edit | before | after |
+|---|---|---|
+| delete `resolve_adapter_plan(…)` in `load_variant` | green everywhere, incl. the real-weight lane | **RED** — real-weight `a_key_mismatched_adapter_is_refused_at_load_variant_not_at_first_generate` |
+| `is_adaptable_target`'s `.weight` suffix rule → `if false` | green | **RED** — `only_dit_and_conditioner_…`, `the_target_set_is_read_from_a_real_safetensors_header` |
+| PEFT `r` absent → default to a constant | green | **RED** — `a_malformed_peft_config_is_refused_rather_than_defaulted` |
+| PEFT `lora_alpha` absent → default to `1.0` | green | **RED** — same |
+| PEFT `!alpha.is_finite()` → `if false` | green | **RED** — same |
+| PEFT `rank == 0` refusal deleted | green | **RED** — same |
+| `json_filter`'s non-string entry → coerce | green | **RED** — same |
+| native `{index}` integer check → `if false` | green | **RED** — `a_native_adapter_index_segment_must_be_an_integer` |
+| `has_row \|= module.magnitude_r.is_some()` → `\|= false` | green | **RED** — `the_legacy_dora_alias_…` (the both-magnitudes file) |
+| `AdapterBackend::get_unchecked` body → serve every key unadapted | green | **RED** — `the_adapter_backend_serves_unplanned_keys_untouched` |
+| `build`'s `matched == 0` refusal deleted | green | **RED** — `a_module_less_adapter_is_refused_by_build` |
+| `adapter_index` renumbered positionally after the zero-scale filter | green | **RED** — `adapter_index_survives_the_zero_scale_filter` |
+| classic-LoRA strength clamped to `[0, 1]` | green — the single-point `s = 0.5` case does not see it | **RED** — `classic_lora_delta_norm_is_exactly_linear_in_the_requested_strength` |
+
+The last row is the one worth reading twice. `classic_lora_folds_exactly_alpha_over_rank_times_scale…`
+pins the scale at **one** value, and a clamp to `[0, 1]` satisfies it exactly. Only the
+`{0.25, 0.5, 1, 2}` sweep — which asserts the analytically exact `‖δ(s)‖ == s·‖δ(1)‖`, not
+monotonicity — separates the two.
+
+The `.weight` row has a fixture note attached to it: the suffix rule was unobservable because every
+non-`.weight` key in `real_key_shapes()` was 1-D and thus rejected on rank alone. The real
+`small-music` header carries exactly **one** 2-D non-`.weight` tensor under an allowed prefix,
+`model.model.transformer.memory_tokens [64, 1024]` (verified against the pinned header: 1 of 685
+tensors), and adding it is what makes the rule discriminating. Without it a regression would make a
+learned parameter table an adapter target.
+
 ## CI
 
 * **Weight-free**: `--test adapters` added to ci.yml's SA3 step. The lane now runs **eleven targets /
-  85 live cases** (was ten / 56), measured by running the step. The audit comment is updated from the
+  90 live cases** (was ten / 56), measured by running the step. The audit comment is updated from the
   measurement, and `scripts/tests/test_sa3_ci_target_coverage.py` passes.
 * **Real weights**: `--test adapters -- --ignored` on `sa3-base-identity-metal` and
   `sa3-base-identity-cuda`, verified against the jobs' actual `--test` flags rather than their
-  comment blocks. Three cases: the two exactly-signed gates on all six checkpoints, the order case,
-  and the `-xs` case scoped to the conditioner Linear.
+  comment blocks. Four cases: the two exactly-signed gates on all six checkpoints, the order case,
+  the `-xs` case scoped to the conditioner Linear, and the load-time key-mismatch refusal.
 
 The Metal lane matters beyond redundancy here: `packed_metal_backend` is a **different**
 `SimpleBackend` from CPU/CUDA's mmap, and the wrapper composes over both. No other lane exercises

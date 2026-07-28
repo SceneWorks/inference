@@ -25,8 +25,17 @@
 //!   property of the construction, not a bound to be measured.
 //! * **It is exact, not iterative-approximate.** One-sided Jacobi converges to machine precision
 //!   with a fixed cyclic sweep order and no random start, so there is no seed, no tolerance
-//!   negotiation, and no spectral-gap dependence. A randomized or Lanczos truncated SVD would be
-//!   far faster and would reintroduce exactly the drift this module exists to avoid.
+//!   negotiation, and no spectral-gap dependence.
+//!
+//! Jacobi was chosen on **cost of implementation, not on determinism**, and this module should not
+//! be read as claiming it is the only deterministic option — it is not. Golub–Kahan
+//! bidiagonalization followed by implicit-shift QR is fully deterministic and asymptotically much
+//! cheaper, and a blocked or vectorized Jacobi keeps this exact arithmetic while only reordering
+//! it. What one-sided Jacobi bought was a short, dependency-free implementation whose sign
+//! convention is easy to match to upstream's. Those deterministic-and-faster alternatives are
+//! recorded on `sc-15551`. What *would* reintroduce the drift this module exists to avoid is the
+//! **randomized** family, and Lanczos with a random start: there the result depends on a seed and
+//! on the spectral gap.
 //!
 //! # The cost, stated plainly
 //!

@@ -34,7 +34,7 @@ use std::path::{Path, PathBuf};
 use candle_audio_stable_audio_3::adapters::{
     adaptable_targets, apply_adapter_ops, expand_bracket_ranges, is_adaptable_target, load_adapter,
     plan_for, resolve_adapter_type, validate_spec_shape, AdapterBackend, AdapterPlan,
-    AdapterSource, AdapterType, ADAPTABLE_PREFIXES,
+    AdapterSource, AdapterType, LoadedAdapter, ADAPTABLE_PREFIXES,
 };
 use candle_audio_stable_audio_3::model;
 use candle_audio_stable_audio_3::weights::safetensors_shapes;
@@ -78,6 +78,13 @@ fn real_key_shapes() -> BTreeMap<String, Vec<usize>> {
         ("model.model.postprocess_conv.weight", vec![256, 256, 1]),
         // DiT — 1-D norm gain, never a target.
         ("model.model.transformer.layers.0.ff_norm.gamma", vec![1024]),
+        // The ONE tensor in the real header that is 2-D, under an allowed prefix, and does *not*
+        // end in `.weight` — verified against the pinned small-music safetensors header, where it
+        // is the sole such tensor out of 685. It is the DiT's learned memory-token table, not a
+        // projection, so adapting it is meaningless; it is here because without it the `.weight`
+        // suffix rule in `is_adaptable_target` is unobservable (every other non-`.weight` key in
+        // this fixture is 1-D and would be rejected on rank alone) and deleting that rule is green.
+        ("model.model.transformer.memory_tokens", vec![64, 1024]),
         // Conditioner — the learned `seconds_total` NumberConditioner Linear, and a 1-D embedding.
         (
             "conditioner.conditioners.seconds_total.embedder.embedding.1.weight",
@@ -475,6 +482,73 @@ fn the_legacy_dora_alias_resolves_by_magnitude_shape_defaulting_to_rows() {
         .write_native(&path);
     let loaded = load_adapter(&spec(&path, 1.0), &Device::Cpu).expect("alias");
     assert_eq!(loaded.kind, AdapterType::DoraCols);
+
+    // The other side of the sniff, end-to-end through a file: an alias carrying BOTH magnitudes is
+    // ambiguous and must fall back to rows. Without this the `has_row` half of the sniff is never
+    // observed through a real file — every alias file above carries `magnitude_c` alone, so the
+    // row accumulator can be stuck at `false` and the loader still answers correctly.
+    let both = dir.join("alias-both.safetensors");
+    AdapterRecipe::new("dora", rank, 1.0)
+        .factor(
+            TARGET,
+            "lora_A",
+            vec![rank, in_features],
+            fill(rank, in_features, 1.0),
+        )
+        .factor(
+            TARGET,
+            "lora_B",
+            vec![out_features, rank],
+            fill(out_features, rank, 2.0),
+        )
+        .factor(
+            TARGET,
+            "magnitude_r",
+            vec![out_features],
+            vec![1.0, 2.0, 3.0, 4.0],
+        )
+        .factor(
+            TARGET,
+            "magnitude_c",
+            vec![in_features],
+            vec![1.0, 2.0, 3.0, 4.0],
+        )
+        .write_native(&both);
+    let loaded = load_adapter(&spec(&both, 1.0), &Device::Cpu).expect("ambiguous alias");
+    assert_eq!(
+        loaded.kind,
+        AdapterType::DoraRows,
+        "an alias file carrying both magnitudes must resolve to rows, not columns"
+    );
+}
+
+/// `AdapterPlan::build` refuses a module-less adapter handed to it directly.
+///
+/// `build` is public and takes caller-constructed [`LoadedAdapter`]s, which is the only way its
+/// zero-matched-targets refusal can fire: on every shipped path `load_adapter` has already rejected
+/// a module-less file at `finish_modules`, and any module that fails to match returns earlier and
+/// more specifically. Without this case that refusal is dead code that reads as live — deleting it
+/// is green — so this is what keeps the public entry point's contract honest.
+#[test]
+fn a_module_less_adapter_is_refused_by_build() {
+    let targets = small_targets(TARGET, 4, 4);
+    let empty = LoadedAdapter {
+        path: PathBuf::from("/synthetic/module-less.safetensors"),
+        kind: AdapterType::Lora,
+        rank: 2,
+        alpha: 1.0,
+        scale: 1.0,
+        include: Vec::new(),
+        exclude: Vec::new(),
+        modules: BTreeMap::new(),
+        spec_index: 0,
+    };
+    let error = AdapterPlan::build(&[empty], &targets)
+        .expect_err("a module-less adapter must not produce a plan");
+    assert!(
+        error.to_string().contains("no_target_matched"),
+        "unexpected refusal: {error}"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -514,6 +588,80 @@ fn classic_lora_folds_exactly_alpha_over_rank_times_scale_times_b_at_a() {
             );
         }
     }
+}
+
+/// Classic LoRA's delta is **exactly linear in the requested strength**: `‖δ(s)‖ == s·‖δ(1)‖`.
+///
+/// The single-point check above pins `alpha/rank · s` at `s = 0.5` only, which a scale applied to
+/// the wrong factor, squared, or clamped can still satisfy at that one value. This sweeps
+/// `{0.25, 0.5, 1, 2}` — including `s > 1`, where a clamp to `[0, 1]` shows up — and the relation is
+/// analytically exact for the classic family because `s` multiplies `B @ A` and nothing else. That
+/// exactness is the point: this is not a monotonicity check with a tolerance to tune, it is an
+/// equality, so it cannot be passed by a fold that merely trends the right way.
+///
+/// Deliberately **not** extended to DoRA/BoRA: there `s` participates inside the normalization, so
+/// the delta is genuinely non-linear in `s` and no such identity holds. That asymmetry is the reason
+/// the linearity gate is stated for classic LoRA specifically.
+#[test]
+fn classic_lora_delta_norm_is_exactly_linear_in_the_requested_strength() {
+    let dir = scratch("lora-linearity");
+    let (out_features, in_features, rank) = (4usize, 5usize, 2usize);
+    let path = dir.join("lora.safetensors");
+    AdapterRecipe::new("lora", rank, 3.0)
+        .factor(
+            TARGET,
+            "lora_A",
+            vec![rank, in_features],
+            fill(rank, in_features, 1.0),
+        )
+        .factor(
+            TARGET,
+            "lora_B",
+            vec![out_features, rank],
+            fill(out_features, rank, 2.0),
+        )
+        .write_native(&path);
+
+    let base = f32_tensor(
+        fill(out_features, in_features, 5.0),
+        (out_features, in_features),
+    );
+    let targets = small_targets(TARGET, out_features, in_features);
+
+    // ‖δ(s)‖: the Frobenius norm of (adapted − base) at strength `s`.
+    let delta_norm = |scale: f32| -> f64 {
+        let plan = plan_for(&[spec(&path, scale)], &targets, &Device::Cpu).expect("plan");
+        let adapted = apply_adapter_ops(&base, plan.ops_for(TARGET).unwrap()).expect("fold");
+        rows(&adapted)
+            .iter()
+            .flatten()
+            .zip(rows(&base).iter().flatten())
+            .map(|(got, want)| {
+                let difference = (*got - *want) as f64;
+                difference * difference
+            })
+            .sum::<f64>()
+            .sqrt()
+    };
+
+    let unit = delta_norm(1.0);
+    assert!(
+        unit > 1e-3,
+        "the fixture's delta is degenerate ({unit}); the ratios below would be vacuous"
+    );
+    for scale in [0.25f32, 0.5, 1.0, 2.0] {
+        let got = delta_norm(scale);
+        let want = scale as f64 * unit;
+        assert!(
+            (got - want).abs() <= 1e-5 * want.max(1.0),
+            "‖δ({scale})‖ = {got}, expected {want} = {scale}·‖δ(1)‖; the strength is not linear"
+        );
+    }
+    // The sweep is discriminating only because the values genuinely differ from one another.
+    assert!(
+        delta_norm(2.0) - delta_norm(0.25) > 1e-3,
+        "the strength sweep produced a constant delta norm"
+    );
 }
 
 /// `dora-rows` leaves **every row** with norm exactly `|magnitude_r[i]|`.
@@ -999,6 +1147,61 @@ fn the_plan_preserves_request_order_at_both_ends() {
     assert_eq!(ops[1].adapter_index, 1);
 }
 
+/// `adapter_index` is the position in the caller's **original** request, across the zero-scale
+/// filter.
+///
+/// `plan_for` validates the whole stack, then rebuilds the plan from the zero-scale-**filtered**
+/// slice. Numbering the ops positionally while rebuilding would renumber the survivors: for
+/// `[zero, live]` the live op would report index 0 and an error message would blame the wrong
+/// adapter — the inert one the caller explicitly turned off. Every other case in this file stacks
+/// only live adapters, so the filter is invisible to them and the bug is unobservable there.
+#[test]
+fn adapter_index_survives_the_zero_scale_filter() {
+    let dir = scratch("index-filter");
+    let (out_features, in_features, rank) = (4usize, 4usize, 2usize);
+    let targets = small_targets(TARGET, out_features, in_features);
+
+    let inert = dir.join("inert.safetensors");
+    let live = dir.join("live.safetensors");
+    for (path, seed) in [(&inert, 1.0f32), (&live, 2.0)] {
+        recipe_for(
+            AdapterType::Lora,
+            TARGET,
+            out_features,
+            in_features,
+            rank,
+            2.0,
+            seed,
+        )
+        .write_native(path);
+    }
+
+    // `[zero, live]`: the surviving op is request entry 1, not entry 0.
+    let plan = plan_for(
+        &[spec(&inert, 0.0), spec(&live, 1.0)],
+        &targets,
+        &Device::Cpu,
+    )
+    .expect("plan");
+    let ops = plan.ops_for(TARGET).expect("target");
+    assert_eq!(ops.len(), 1, "the zero-scale member contributed an op");
+    assert_eq!(
+        ops[0].adapter_index, 1,
+        "the surviving op reports its position in the filtered slice, not in the caller's request"
+    );
+
+    // The mirror image, so the assertion cannot be satisfied by a constant: `[live, zero]` keeps 0.
+    let plan = plan_for(
+        &[spec(&live, 1.0), spec(&inert, 0.0)],
+        &targets,
+        &Device::Cpu,
+    )
+    .expect("plan");
+    let ops = plan.ops_for(TARGET).expect("target");
+    assert_eq!(ops.len(), 1);
+    assert_eq!(ops[0].adapter_index, 0);
+}
+
 // ---------------------------------------------------------------------------------------------
 // 4. `scale == 0.0`
 // ---------------------------------------------------------------------------------------------
@@ -1164,6 +1367,10 @@ fn only_dit_and_conditioner_linear_and_conv1d_weights_are_targets() {
         "model.model.transformer.layers.0.ff_norm.gamma",
         "conditioner.conditioners.seconds_total.embedder.embedding.1.bias",
         "conditioner.conditioners.prompt.padding_embedding",
+        // 2-D, under an allowed prefix, and excluded **only** by the `.weight` suffix rule: a
+        // learned parameter table, not a projection. This is the one key in the fixture that makes
+        // that rule discriminating, so `targets.len()` below is a real assertion about it.
+        "model.model.transformer.memory_tokens",
     ] {
         assert!(!targets.contains_key(key), "{key} must not be adaptable");
     }
@@ -1186,6 +1393,11 @@ fn only_dit_and_conditioner_linear_and_conv1d_weights_are_targets() {
     ));
     assert!(is_adaptable_target("model.model.x.weight", &[4, 4]));
     assert!(is_adaptable_target("model.model.x.weight", &[4, 4, 3]));
+    // The suffix rule alone, isolated from prefix and rank: same prefix, same rank, no `.weight`.
+    assert!(
+        !is_adaptable_target("model.model.transformer.memory_tokens", &[64, 1024]),
+        "a 2-D non-`.weight` tensor under an allowed prefix became an adapter target"
+    );
 }
 
 /// An adapter naming a SAME tensor, or a T5Gemma one, is refused loudly.
@@ -1419,6 +1631,122 @@ fn a_peft_directory_round_trips_the_whole_family() {
     std::fs::create_dir_all(&partial).unwrap();
     std::fs::write(partial.join("adapter_config.json"), "{}").unwrap();
     assert!(AdapterSource::classify(&partial).is_err());
+}
+
+/// Every declaration a PEFT `adapter_config.json` is trusted for is **required**, not defaulted.
+///
+/// `r` and `lora_alpha` set `effective_scale = (alpha / rank) * scale`. Silently defaulting either
+/// one — `r` to some constant, `lora_alpha` to `1.0` — produces an adapter that loads, folds, and
+/// applies the **wrong strength**: a plausible-looking result that is quietly not what was trained,
+/// which is strictly worse than a refusal because nothing downstream can detect it. Both defaults
+/// are green without this case.
+#[test]
+fn a_malformed_peft_config_is_refused_rather_than_defaulted() {
+    let dir = scratch("peft-config");
+    let (out_features, in_features, rank) = (4usize, 4usize, 2usize);
+
+    // One valid PEFT directory, re-used by rewriting only `adapter_config.json` each time, so each
+    // case differs from a known-good load in exactly the config field under test.
+    let peft_dir = dir.join("peft");
+    recipe_for(
+        AdapterType::Lora,
+        TARGET,
+        out_features,
+        in_features,
+        rank,
+        4.0,
+        1.0,
+    )
+    .write_peft(&peft_dir);
+    let config_path = peft_dir.join("adapter_config.json");
+    let good = std::fs::read_to_string(&config_path).expect("baseline config");
+
+    // The baseline itself must load, or every refusal below is unattributable.
+    let loaded = load_adapter(&spec(&peft_dir, 1.0), &Device::Cpu).expect("baseline peft");
+    assert_eq!(loaded.rank, rank);
+    assert_eq!(loaded.alpha, 4.0);
+
+    for (case, config) in [
+        // `r` absent — must not fall back to a constant rank.
+        ("missing r", serde_json::json!({"lora_alpha": 4.0})),
+        // `lora_alpha` absent — must not fall back to 1.0.
+        ("missing lora_alpha", serde_json::json!({"r": 2})),
+        (
+            "non-finite lora_alpha",
+            serde_json::json!({"r": 2, "lora_alpha": "NaN"}),
+        ),
+        (
+            "null lora_alpha",
+            serde_json::json!({"r": 2, "lora_alpha": null}),
+        ),
+        // Parses as a JSON number but overflows f64/f32 to infinity — the one spelling that reaches
+        // the explicit `is_finite` guard, since JSON has no NaN/Infinity literal.
+        (
+            "overflowing lora_alpha",
+            serde_json::from_str::<serde_json::Value>(r#"{"r": 2, "lora_alpha": 1e400}"#)
+                .unwrap_or_else(|_| serde_json::json!({"r": 2, "lora_alpha": 1e39})),
+        ),
+        // A zero rank would make `alpha / rank` a division by zero.
+        ("r: 0", serde_json::json!({"r": 0, "lora_alpha": 4.0})),
+        (
+            "negative r",
+            serde_json::json!({"r": -2, "lora_alpha": 4.0}),
+        ),
+        (
+            "non-string target_modules entry",
+            serde_json::json!({"r": 2, "lora_alpha": 4.0, "target_modules": ["to_q", 7]}),
+        ),
+        (
+            "non-array target_modules",
+            serde_json::json!({"r": 2, "lora_alpha": 4.0, "target_modules": 7}),
+        ),
+    ] {
+        std::fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap())
+            .expect("write config");
+        assert!(
+            load_adapter(&spec(&peft_dir, 1.0), &Device::Cpu).is_err(),
+            "a PEFT config with `{case}` was accepted; the declaration was defaulted instead of \
+             refused, so the adapter folds at a strength it was not trained at"
+        );
+    }
+
+    // Restoring the baseline loads again, proving the refusals came from the edited field and not
+    // from a directory this test left broken.
+    std::fs::write(&config_path, &good).expect("restore config");
+    load_adapter(&spec(&peft_dir, 1.0), &Device::Cpu).expect("restored baseline");
+}
+
+/// A native adapter's `{target}.{index}.{factor}` index segment must be an integer.
+///
+/// The index is what separates the target stem from the factor name, so a non-integer there means
+/// the stem was split at the wrong dot and the target key is being guessed. Accepting `…x.lora_A`
+/// would silently retarget the module. The check is green to delete without this case.
+#[test]
+fn a_native_adapter_index_segment_must_be_an_integer() {
+    let dir = scratch("native-index");
+    let path = dir.join("bad-index.safetensors");
+
+    // Written by hand rather than through `AdapterRecipe`, which always emits the well-formed `.0.`
+    // index — the malformed spelling is the entire point of the fixture.
+    let values: Vec<f32> = fill(2, 4, 1.0);
+    let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let stem = TARGET.strip_suffix(".weight").unwrap();
+    let name = format!("{stem}.x.lora_A");
+    let view = safetensors::tensor::TensorView::new(safetensors::Dtype::F32, vec![2, 4], &bytes)
+        .expect("view");
+    let mut metadata = HashMap::new();
+    metadata.insert("adapter_type".to_string(), "lora".to_string());
+    metadata.insert("rank".to_string(), "2".to_string());
+    metadata.insert("alpha".to_string(), "1".to_string());
+    safetensors::serialize_to_file(vec![(name, view)], &Some(metadata), &path).expect("write");
+
+    let error = load_adapter(&spec(&path, 1.0), &Device::Cpu)
+        .expect_err("a non-integer adapter index must be refused");
+    let text = error.to_string();
+    assert!(
+        text.contains("is not an integer"),
+        "the refusal does not name the index segment: {text}"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1799,6 +2127,43 @@ fn the_adapter_backend_serves_unplanned_keys_untouched() {
         bystander_values,
         "a SAME key was mutated"
     );
+
+    // The same contract through `get_unchecked`, the shape-free entry point.
+    //
+    // `AdapterBackend` overrides *both* `SimpleBackend` methods, and no case in this file reached
+    // the second one: replacing its whole body with `match None::<&[AdapterOp]>` — i.e. serving
+    // every key unadapted — was green. The override is kept rather than dropped because which of
+    // the two `VarBuilder` routes through is candle's decision, not this crate's, and a backend
+    // whose two entry points disagree would adapt or not adapt depending on how a tensor happened
+    // to be requested. Gating it is what makes keeping it meaningful.
+    let fetch_unchecked = |name: &str| {
+        SimpleBackend::get_unchecked(&backend, name, DType::F32, &device)
+            .expect(name)
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+    };
+    assert_eq!(
+        fetch_unchecked(TARGET),
+        fetch(TARGET),
+        "get_unchecked and get disagree on a planned key"
+    );
+    assert_ne!(
+        fetch_unchecked(TARGET),
+        adapted_values,
+        "get_unchecked served the planned key unadapted"
+    );
+    assert_eq!(
+        fetch_unchecked("model.model.transformer.layers.9.ff.ff.2.weight"),
+        bystander_values,
+        "get_unchecked mutated an unplanned DiT key"
+    );
+    assert_eq!(
+        fetch_unchecked("pretransform.model.encoder.layers.0.mapping.weight"),
+        bystander_values,
+        "get_unchecked mutated a SAME key"
+    );
 }
 
 /// The load-time target set is derived from a real safetensors header, not from an in-test map.
@@ -2132,5 +2497,89 @@ fn real_lora_xs_folds_through_the_host_svd() {
             "{id}: the -xs fold on the conditioner Linear had no effect on the render"
         );
         assert!(adapted.iter().all(|value| value.is_finite()));
+    }
+}
+
+/// A key-mapping mismatch is refused by **`load_variant` itself**, not by the first `generate`.
+///
+/// This is the story's acceptance bullet — "adapter key-mapping mismatches fail loudly at load
+/// time, never silently no-op" — and it is the one gate for the `resolve_adapter_plan` call in
+/// `load_variant`. Deleting that call is green in the weight-free lane and green in every other
+/// real-weight case here, because none of them ever loads an adapter that does not resolve: this
+/// case is the only one that constructs the mismatch.
+///
+/// **What is observable, stated precisely.** `StableAudio3Generator` builds its pipeline lazily and
+/// exposes no residency accessor, so "no pipeline was built" cannot be read off the object. It does
+/// not need to be: the assertion is that `load_variant` returns `Err`, so **no generator exists at
+/// all**, and a pipeline that is only ever constructed from a generator therefore cannot have been
+/// built. Under the mutation the call is deleted, `load_variant` returns `Ok`, and the mismatch
+/// surfaces from `generate` instead — which is exactly the failure the bullet exists to prevent,
+/// and which flips this assertion.
+///
+/// The valid-adapter control on the same snapshot is what makes the refusal attributable to the
+/// adapter rather than to the checkpoint, the layout or the identity check.
+#[test]
+#[ignore = "requires all six pinned immutable snapshots; set SA3_*_SNAPSHOT"]
+fn a_key_mismatched_adapter_is_refused_at_load_variant_not_at_first_generate() {
+    let dir = scratch("real-mismatch");
+    // A well-formed adapter naming a layer index the DiT does not have. Everything about the file
+    // is valid — type, rank, alpha, finite factors, consistent shapes — so the *only* thing that can
+    // reject it is matching its key against the checkpoint's adaptable target set.
+    const ABSENT: &str = "model.model.transformer.layers.99.cross_attn.to_q.weight";
+
+    for case in REAL_CASES {
+        let root = snapshot_root(case.env);
+        let id = case.variant.model_id();
+
+        let bogus = dir.join(format!("{id}-absent.safetensors"));
+        write_real_adapter(
+            &bogus,
+            AdapterType::Lora,
+            &[(ABSENT.to_string(), 1024, 1024)],
+            5.0,
+        );
+
+        let load = |adapters: Vec<AdapterSpec>| {
+            let mut load_spec = candle_audio::gen_core::LoadSpec::new(
+                candle_audio::gen_core::WeightsSource::Dir(root.clone()),
+            );
+            load_spec.adapters = adapters;
+            model::load_variant(case.variant, &load_spec)
+        };
+
+        // THE GATE — the refusal happens here, at load, with no generator produced.
+        let error = match load(vec![spec(&bogus, 1.0)]) {
+            Err(error) => error,
+            Ok(_) => panic!(
+                "{id}: load_variant accepted an adapter naming {ABSENT:?}, a key the checkpoint \
+                 does not have. The mismatch is now deferred to the first generate."
+            ),
+        };
+        assert!(
+            matches!(error, candle_audio::gen_core::Error::Unsupported(_)),
+            "{id}: expected a typed Unsupported refusal, got {error:?}"
+        );
+        let text = error.to_string();
+        assert!(
+            text.contains("no_target_matched"),
+            "{id}: the refusal does not name no_target_matched: {text}"
+        );
+        assert!(
+            text.contains(ABSENT),
+            "{id}: the refusal does not name the offending key: {text}"
+        );
+
+        // A zero-scale mismatch is refused identically: validation is not what `scale == 0.0` skips.
+        assert!(
+            load(vec![spec(&bogus, 0.0)]).is_err(),
+            "{id}: a scale-0.0 adapter skipped key validation"
+        );
+
+        // CONTROL — a valid adapter on the same snapshot loads, so the refusal above is a statement
+        // about the adapter's keys and not about the checkpoint.
+        let valid = dir.join(format!("{id}-valid.safetensors"));
+        write_real_adapter(&valid, AdapterType::Lora, &real_targets(&root, 1), 5.0);
+        load(vec![spec(&valid, 1.0)])
+            .unwrap_or_else(|error| panic!("{id}: the valid control adapter was refused: {error}"));
     }
 }
