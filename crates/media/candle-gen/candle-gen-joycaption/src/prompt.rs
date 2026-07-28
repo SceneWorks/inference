@@ -1,3 +1,16 @@
+//! ATTRIBUTION: The caption-type taxonomy, prompt template bodies, and name option below are
+//! reproduced from fpgaminer/joycaption (<https://github.com/fpgaminer/joycaption>),
+//! `gradio-app/app.py`'s `CAPTION_TYPE_MAP` and `NAME_OPTION`, commit
+//! 8445b2e55db7856d522e44ae84e7415fcf3413f6, licensed under the Apache License 2.0
+//! (Copyright 2024 fpgaminer@bitcoin-mining.com). The license text ships in SceneWorks' About ->
+//! Licenses corpus as the `joycaption-source` component.
+//!
+//! MODIFIED BY SCENEWORKS (Apache-2.0 section 4(b)): ported from Python to Rust; renamed the
+//! prompt-table and name-option symbols; normalized prompt punctuation (em dashes, curly quotes,
+//! ellipses, backticks, quoted tag prefixes, and `(if any)`); removed `very long` from the caption
+//! lengths; and changed the three Straightforward prompts from requiring watermark, signature, and
+//! compression-artifact mentions to forbidding them.
+//!
 //! JoyCaption caption **product policy** — the SceneWorks caption prompt map, the default system
 //! prompt, the capability surface, and trigger-word post-processing. Pure string logic, backend
 //! agnostic.
