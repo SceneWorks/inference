@@ -29,6 +29,9 @@ pub mod adapters;
 pub mod array;
 // Query-row bounded attention (SC-15615): the MLX half of ladder rung 3, shared so no family forks it.
 pub mod attention;
+// Bounded transformer residency (SC-15750): ladder rung 4, likewise shared — see the module docs for
+// the lazy-graph trap that makes a hand-rolled version silently save nothing.
+pub mod block_residency;
 pub mod error;
 pub mod img2img;
 pub mod memory;
