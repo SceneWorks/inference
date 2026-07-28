@@ -400,6 +400,18 @@ impl Linear {
                 //     pass the schedule turns off) leaves `out` byte-identical to the unadapted base;
                 //   * the residual is narrowed to `out`'s dtype BEFORE the add, so f32 factors over a
                 //     bf16 host cannot widen this Linear — and every op downstream of it — to f32.
+                // Unlike the shared seam, this loop carries NO training exemption (rule 0 there),
+                // even though the training factors installed by `set_train_lora` (`training.rs`'s
+                // `install_train_lora`, and the checkpointed block closure below) flow through here
+                // too. That is safe only because LTX training is **f32-only today**: `train_impl`
+                // hardcodes `let compute_dtype = Dtype::Float32` (sc-4942 — a bf16 activation cast
+                // was measured to decorrelate the gradient, so the worker's `train_dtype=bf16` is
+                // deliberately ignored), both install paths derive their factor dtype from it, and
+                // the only `cast_weights(Bfloat16)` callers are `#[cfg(test)]` harnesses. Host and
+                // factors are therefore both f32 and the narrowing cast is a no-op. Enabling the
+                // sc-4942 bf16 compute lever REQUIRES revisiting this: f32 factors would then meet
+                // a bf16 host here and the training residual would be narrowed — exactly what
+                // `AdaptableLinear::apply_adapters` exempts training from.
                 if s == 0.0 {
                     continue;
                 }

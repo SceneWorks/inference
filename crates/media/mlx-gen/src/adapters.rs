@@ -811,11 +811,23 @@ impl AdaptableLinear {
     /// *fraction of the adapter's own effect* at that Linear the number is NOT stable — ~19% at the
     /// first fixture, ~92% at the second — because it depends entirely on how large the residual is
     /// relative to the host's bf16 ulp; quote it and you will mislead yourself. The claim that IS
-    /// stable is the absolute bound: narrowing to the host dtype perturbs the output by at most half
-    /// an ulp of that dtype **by construction** — i.e. **a bounded accuracy loss of the same order as
-    /// the host's own bf16 rounding, with a non-systematic end-to-end sign.** The krea e2e tier sweep
+    /// stable is the absolute bound. The narrowing path rounds **twice** — once casting the residual
+    /// to the host dtype, and once in the host-dtype `add` — each at most half an ulp, so the
+    /// constructive bound is **at most about one ulp of the host dtype**, not half. (The measured
+    /// extra `≈4.7e-4` / `≈5.3e-4` relative above is consistent with ~1 ulp: bf16's relative ulp is
+    /// ≈3.9e-3.) That is still **a bounded accuracy loss of the same order as the host's own bf16
+    /// rounding, with a non-systematic end-to-end sign** — the qualitative conclusion and every
+    /// measured number are unaffected by the correction. The krea e2e tier sweep
     /// bears the second half out: −0.17% (bf16), −1.1% (Q8), **+**1.5% (Q4) — non-monotonic,
     /// consistent with chaotic propagation of rounding rather than a directional bias.
+    ///
+    /// **User-visible consequence at inference.** Rule 2's dead zone is not confined to training:
+    /// on a bf16 host a sufficiently low user LoRA strength is now quantized to the host dtype
+    /// rather than accumulated in f32, so it can round away *entirely* where pre-fix it had a small
+    /// but visible f32 effect. The measured threshold is roughly half a bf16 ulp of the host output
+    /// — i.e. a residual/output ratio of about **2e-3** or less contributes nothing. This is the
+    /// accepted diffusers convention and is not a defect, but it is the answer to "my LoRA at very
+    /// low strength does nothing now": raise the strength, or run an f32-activation host.
     ///
     /// This is the diffusers convention (LoRA cast to the model dtype); it diverges from the frozen
     /// fork, which adds the promoted residual. **No image-level A/B on a shipped LoRA was run**, and
@@ -834,15 +846,24 @@ impl AdaptableLinear {
             // bit-identical. Reasons, in order:
             //   * Neither rule is *for* training. Rule 1 exists so "installed at scale 0" is a
             //     no-op; a trainer always installs at `scale = 1` and has no disabled case.
-            //   * Rule 2 would be an actual quality risk here. Wan installs its **f32 master**
-            //     factors unchanged (`install_training_lora` passes `dtype = None`; see
+            //   * Rule 2 would change shipped trainer numerics, and this is an inference-scoped
+            //     fix. Wan installs its **f32 master** factors unchanged (`install_training_lora`
+            //     passes `dtype = None`; see
             //     `mlx_gen_wan::transformer::WanTransformer::forward_train_checkpointed`) over a
             //     bf16 block stream. `b` initializes to zeros and the residual grows *from* zero,
-            //     so for a long initial stretch it sits far below the bf16 ulp of the base:
-            //     narrowing `base + r` to bf16 would round the entire adapter contribution away
-            //     and flatten the loss in the LoRA parameters, even though the straight-through
-            //     `astype` VJP still delivers a gradient. The wider accumulation is the
-            //     master-weights pattern working as intended.
+            //     so for an initial stretch it sits below the bf16 ulp of the base and narrowing
+            //     `base + r` to bf16 would round the adapter contribution away entirely. That
+            //     FORWARD dead zone is real and measured at the seam: at `|b|` up to 1e-4 the
+            //     residual peaks at 3.3e-7 and the narrowed output is bit-identical to the
+            //     unadapted base.
+            //     It does NOT, however, stall the optimizer — that would be an overclaim. The
+            //     `astype`/`add` VJP is straight-through, so gradient still reaches the LoRA
+            //     parameters through the narrowing path: `grad` of a squared-sum loss at `b == 0`
+            //     measures max|g| = 4.42e-2, and `b` grows out of the dead zone. The justification
+            //     for the exemption is therefore the narrower and sufficient one — it keeps the
+            //     shipped trainers **bit-identical** while this change stays inference-only, and
+            //     avoids a forward dead zone whose end-to-end training effect was never measured.
+            //     The wider accumulation is the master-weights pattern working as intended.
             //   * The alternative — casting the factors to bf16 at the install site — moves the
             //     low-rank matmul itself into bf16, which is a LARGER departure from shipped
             //     trainer numerics than doing nothing, so it cannot be justified as conservative.
