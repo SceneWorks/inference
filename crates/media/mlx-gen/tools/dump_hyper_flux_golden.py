@@ -35,6 +35,12 @@ import os
 
 import numpy as np
 import torch
+from _adapter_parity_provenance import (
+    assert_frozen_mflux,
+    assert_hf_file,
+    golden_metadata,
+    sha256,
+)
 from diffusers import FluxPipeline
 from diffusers.pipelines.flux.pipeline_flux import calculate_shift
 from safetensors.numpy import save_file
@@ -51,7 +57,12 @@ BASE = os.environ.get(
 )
 LORA = os.environ.get(
     "HYPER_LORA",
-    os.path.expanduser("~/repos/test-files/Hyper-FLUX.1-dev-8steps-lora.safetensors"),
+    os.path.join(
+        os.path.expanduser(os.environ.get("HF_HOME", "~/.cache/huggingface")),
+        "hub/models--ByteDance--Hyper-SD/snapshots/"
+        "bc08d970a87c74c71209491d64e3525845698863/"
+        "Hyper-FLUX.1-dev-8steps-lora.safetensors",
+    ),
 )
 PROMPT = os.environ.get("FLUX_PROMPT", "a photo of a red fox in a snowy forest, golden hour")
 SEED = int(os.environ.get("FLUX_SEED", "7"))
@@ -60,11 +71,30 @@ H = int(os.environ.get("FLUX_H", "512"))
 STEPS = int(os.environ.get("FLUX_STEPS", "8"))
 GUIDANCE = float(os.environ.get("FLUX_GUIDANCE", "3.5"))
 LORA_SCALE = float(os.environ.get("HYPER_LORA_SCALE", "0.125"))
+BASE_REPOSITORY = "black-forest-labs/FLUX.1-dev"
+BASE_REVISION = os.environ.get(
+    "FLUX_DEV_REVISION", "3de623fc3c33e44ffbe2bad470d0f45bccf2eb21"
+)
+LORA_REPOSITORY = "ByteDance/Hyper-SD"
+LORA_REVISION = "bc08d970a87c74c71209491d64e3525845698863"
+LORA_SHA256 = "e0ab0fdf569cd01a382f19bd87681f628879dea7ad51fe5a3799b6c18c7b2d03"
+assert_frozen_mflux()
 
 OUT = os.path.join(_GOLDEN_DIR, "flux1_dev_hyper_golden.safetensors")
 PNG = os.path.join(_GOLDEN_DIR, "diffusers_hyper_flux.png")
 
 print(f"loading FLUX.1-dev from {BASE} (bf16) …")
+assert_hf_file(
+    LORA,
+    repository=LORA_REPOSITORY,
+    revision=LORA_REVISION,
+    file="Hyper-FLUX.1-dev-8steps-lora.safetensors",
+)
+actual_lora_sha256 = sha256(LORA)
+if actual_lora_sha256 != LORA_SHA256:
+    raise RuntimeError(
+        f"Hyper-FLUX artifact mismatch: expected {LORA_SHA256}, got {actual_lora_sha256}"
+    )
 pipe = FluxPipeline.from_pretrained(BASE, torch_dtype=torch.bfloat16)
 pipe.to("mps" if torch.backends.mps.is_available() else "cpu")
 
@@ -143,6 +173,15 @@ meta = {
     "height": str(H),
     "guidance": str(GUIDANCE),
     "lora_scale": str(LORA_SCALE),
+    "lora_repository": LORA_REPOSITORY,
+    "lora_revision": LORA_REVISION,
+    "lora_sha256": LORA_SHA256,
+    **golden_metadata(
+        script=__file__,
+        model_path=BASE,
+        model_repository=BASE_REPOSITORY,
+        model_revision=BASE_REVISION,
+    ),
 }
 save_file(tensors, OUT, metadata=meta)
 print(f"wrote {OUT}")
