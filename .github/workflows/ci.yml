@@ -229,10 +229,11 @@ jobs:
         # links the seven real-weight-only binaries, which costs the lld budget above nothing but
         # time for zero executed cases.
         #
-        # The named ten and what they execute on a PR (measured, by running this step's exact
-        # command on the merged tree): `audio_edit` 20, `sampler_oracle` 17, `reference_audio` 7,
-        # `provider` 3, `listening_stimuli` 3, `dtype_policy` 2, `conformance` 1,
-        # `primitive_oracle` 1, `same_oracle` 1, `variant_quality` 1 — 56 weight-free cases.
+        # The named eleven and what they execute on a PR (measured, by running this step's exact
+        # command on the merged tree): `adapters` 29, `audio_edit` 20, `sampler_oracle` 17,
+        # `reference_audio` 7, `provider` 3, `listening_stimuli` 3, `dtype_policy` 2,
+        # `conformance` 1, `primitive_oracle` 1, `same_oracle` 1, `variant_quality` 1 — 85
+        # weight-free cases.
         # sc-14545 review found
         # `sampler_oracle`, `same_oracle` and `primitive_oracle` running in no automatic lane at all
         # (19 dark gates, pre-existing since sc-14543) and added them here. sc-14546 adds
@@ -270,6 +271,35 @@ jobs:
         # now calls `sampler_strength_for` inline at each of the two sites with no binding shared
         # between them. All three gates are verified to fail under their own single-token mutation,
         # not merely to pass under the correct code.
+        #
+        # sc-14550 adds `adapters`, the load-time adapter target, with 29 weight-free cases (three
+        # further cases are `#[ignore]`d and run on `sa3-base-identity-{metal,cuda}`). This target
+        # carries the whole eight-type family — `lora`, `dora-rows`, `dora-cols`, `bora` and their
+        # four `-xs` siblings, plus the legacy `dora` alias — because **no Stable Audio 3 adapter
+        # artifact exists on this machine or in any cache** (sc-15347), so every adapter it uses is
+        # synthesized by the suite in the on-disk format `src/adapters.rs` declares. That is a real
+        # exercise of the load -> validate -> plan -> fold path and explicitly NOT a real-weight
+        # claim.
+        #
+        # The two gates that carry the sign are the exact ones. `scale == 0.0` must resolve to an
+        # EMPTY plan, so the wrapper is never installed and the weights are byte-identical to an
+        # un-adapted load — the case additionally proves the hazard is real by showing the same
+        # adapter overflows to `inf` at scale 1.0, i.e. that a multiply-by-zero implementation would
+        # poison the checkpoint with NaN. And two adapters with different factors must render
+        # different weights. "The adapted weight differs from the base" is deliberately never a
+        # gate: a *misapplied* adapter differs too, usually by more, which is exactly the wrong-sign
+        # trap sc-14548 hit.
+        #
+        # `dora_stacks_do_not_commute_and_classic_lora_stacks_do` asserts BOTH directions, four
+        # orders of magnitude apart: classic LoRA's two orderings agree to F32 rounding (`< 1e-5`)
+        # because its delta is linear, while DoRA/BoRA disagree macroscopically (`> 1e-3`) because
+        # the strength sits inside the normalization. One direction alone would not prove the
+        # harness measures order rather than noise.
+        #
+        # sc-14549's start-late/stop-early finding is applied to the stack:
+        # `the_plan_preserves_request_order_at_both_ends` asserts the FIRST op's index is 0 and the
+        # LAST op's index is n-1 over a three-deep stack, so neither a loop that stops early nor one
+        # that starts late is invisible.
         #
         # sc-14549 adds eight cases to `audio_edit` (twelve -> twenty) for multi-region editing —
         # several non-contiguous spans regenerated in ONE pass. The defect they exist to catch is
@@ -375,6 +405,7 @@ jobs:
           --test provider --test dtype_policy --test variant_quality --test conformance
           --test sampler_oracle --test same_oracle --test primitive_oracle
           --test listening_stimuli --test reference_audio --test audio_edit
+          --test adapters
           -- --nocapture
       - name: Test LLM-only CPU bundle
         run: cargo test --locked --no-default-features --lib -p runtime-cpu
