@@ -18,7 +18,7 @@ use mlx_rs::{
 };
 
 use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
-use mlx_gen::attention::{sdpa_budgeted_bhsd, AttentionBudget};
+use mlx_gen::attention::{sdpa_budgeted_bhsd, AttentionPlan};
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 
@@ -100,7 +100,7 @@ impl ZImageAttention {
     /// pre-SC-15615 path and the default for every caller that has not selected the bounded-attention
     /// rung (including the trainer).
     pub fn forward(&self, x: &Array, freqs_cis: &Array) -> Result<Array> {
-        self.forward_budgeted(x, freqs_cis, AttentionBudget::UNBOUNDED)
+        self.forward_budgeted(x, freqs_cis, AttentionPlan::UNBOUNDED)
     }
 
     /// [`Self::forward`] with an explicit attention-score budget (SC-15615, ladder rung 3 — the MLX
@@ -108,13 +108,13 @@ impl ZImageAttention {
     /// every query's complete key/value domain and the exact projections, QK-norm, RoPE, and scale;
     /// only the number of query rows attended per call changes.
     ///
-    /// `budget` is threaded, not stored, so it is request-scoped by construction: nothing on a warm
-    /// generator carries a prior request's rung into the next one.
+    /// The plan is threaded, not stored, so it is request-scoped by construction: nothing on a warm
+    /// generator carries a prior request's rung — or cancel flag — into the next one.
     pub fn forward_budgeted(
         &self,
         x: &Array,
         freqs_cis: &Array,
-        budget: AttentionBudget,
+        plan: AttentionPlan<'_>,
     ) -> Result<Array> {
         let sh = x.shape();
         let (b, s) = (sh[0], sh[1]);
@@ -169,7 +169,7 @@ impl ZImageAttention {
                 .next()
                 .ok_or_else(|| Error::Msg("z-image: checkpoint SDPA produced no output".into()))?
         } else {
-            sdpa_budgeted_bhsd(&q, &k, &v, self.scale, None, budget)?
+            sdpa_budgeted_bhsd(&q, &k, &v, self.scale, None, plan)?
         };
         let o = o.transpose_axes(&[0, 2, 1, 3])?.reshape(&[b, s, dim])?;
         self.to_out.forward(&o)

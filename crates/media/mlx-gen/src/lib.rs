@@ -76,7 +76,9 @@ pub mod transform {
 // ([`tiling::TilePlan`]); this carries the tensor loop.
 pub mod vae_tiling;
 
-pub use attention::{sdpa_budgeted_bhsd, AttentionBudget, CONSTRAINED_ATTN_SCORES_BUDGET};
+pub use attention::{
+    sdpa_budgeted_bhsd, AttentionBudget, AttentionPlan, CONSTRAINED_ATTN_SCORES_BUDGET,
+};
 pub use caption::{
     CaptionCapabilities, CaptionFinishReason, CaptionOptions, CaptionOutput, CaptionRequest,
     CaptionSampling, Captioner, CaptionerDescriptor,

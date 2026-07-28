@@ -8,7 +8,7 @@
 //! small Mac.
 
 use mlx_gen::array::host_i32;
-use mlx_gen::attention::AttentionBudget;
+use mlx_gen::attention::{AttentionBudget, AttentionPlan};
 // The img2img leaves (start-step / init-image preprocess / noise-interp blend) are shared in core;
 // re-export so the crate's public surface (`mlx_gen_z_image::…`) and internal callers are unchanged.
 pub use mlx_gen::img2img::{add_noise_by_interpolation, init_time_step, preprocess_init_image};
@@ -101,8 +101,11 @@ pub fn denoise_with_progress(
     // within the N1 tolerance, and the curated menu becomes selectable. Cancellation, the per-step
     // `eval` (sc-5522 / sc-5399), and progress live in `run_flow_sampler`. img2img slices the schedule
     // from `start_step` so the blended init latents are denoised from the matching sigma.
+    // The cancel flag joins the budget here so a bounded call can stop between chunks (SC-15615);
+    // the unbounded fast path has no boundary, so this is inert for every unselected request.
+    let plan = AttentionPlan::budgeted(budget).with_cancel(cancel);
     let predict =
-        |x: &Array, timestep: f32| transformer.forward_with_budgeted(&prep, x, timestep, budget);
+        |x: &Array, timestep: f32| transformer.forward_with_budgeted(&prep, x, timestep, plan);
     let start = start_step.min(scheduler.sigmas.len().saturating_sub(1));
     run_flow_sampler(
         sampler_name,
@@ -184,13 +187,14 @@ pub fn denoise_cfg_with_progress(
         _ => None,
     };
     let g = Array::from_slice(&[guidance], &[1]);
+    let plan = AttentionPlan::budgeted(budget).with_cancel(cancel);
     // Same FLOW / `1 - sigma` convention + unified curated-sampler routing as the base loop; the only
     // delta is the per-step CFG combine of two velocities.
     let predict = |x: &Array, timestep: f32| -> Result<Array> {
-        let v_cond = transformer.forward_with_budgeted(&prep, x, timestep, budget)?;
+        let v_cond = transformer.forward_with_budgeted(&prep, x, timestep, plan)?;
         match &neg_prep {
             Some(np) => {
-                let v_uncond = transformer.forward_with_budgeted(np, x, timestep, budget)?;
+                let v_uncond = transformer.forward_with_budgeted(np, x, timestep, plan)?;
                 // v = v_uncond + guidance·(v_cond − v_uncond).
                 let delta = v_cond.subtract(&v_uncond)?;
                 Ok(v_uncond.add(&delta.multiply(&g)?)?)
@@ -238,6 +242,7 @@ pub fn denoise_control_with_progress(
         transformer.prepare_control((sh[0], sh[1], sh[2], sh[3]), cap_feats, control_context)?;
     // Same unified-framework routing as the base loop (epic 7114 P3), with the control branch in the
     // `predict` closure (the fork's `ZImageControl._control_predict`).
+    let plan = AttentionPlan::budgeted(budget).with_cancel(cancel);
     let predict = |x: &Array, timestep: f32| {
         transformer.forward_with_control_budgeted(
             &prep,
@@ -245,7 +250,7 @@ pub fn denoise_control_with_progress(
             timestep,
             control_context_scale,
             None,
-            budget,
+            plan,
         )
     };
     let start = start_step.min(scheduler.sigmas.len().saturating_sub(1));
@@ -308,6 +313,7 @@ pub fn denoise_control_cfg_with_progress(
         _ => None,
     };
     let g = Array::from_slice(&[guidance], &[1]);
+    let plan = AttentionPlan::budgeted(budget).with_cancel(cancel);
     // Same FLOW / `1 - sigma` convention + unified curated-sampler routing as the base CFG loop; the
     // delta vs `denoise_cfg_with_progress` is that each forward runs the control branch (constant
     // control context + scale threaded through every step, the fork's `ZImageControl._control_predict`).
@@ -318,7 +324,7 @@ pub fn denoise_control_cfg_with_progress(
             timestep,
             control_context_scale,
             None,
-            budget,
+            plan,
         )?;
         match &neg_prep {
             Some(np) => {
@@ -328,7 +334,7 @@ pub fn denoise_control_cfg_with_progress(
                     timestep,
                     control_context_scale,
                     None,
-                    budget,
+                    plan,
                 )?;
                 // v = v_uncond + guidance·(v_cond − v_uncond).
                 let delta = v_cond.subtract(&v_uncond)?;

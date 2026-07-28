@@ -64,7 +64,7 @@ use mlx_rs::fast::{scaled_dot_product_attention, ScaledDotProductAttentionMask};
 use mlx_rs::ops::concatenate_axis;
 use mlx_rs::Array;
 
-use crate::Result;
+use crate::{CancelFlag, Error, Result};
 
 /// The production constrained score budget: 64 Mi elements per attention call.
 ///
@@ -144,6 +144,58 @@ impl Default for AttentionBudget {
     }
 }
 
+/// A budget plus the request's cancel flag — what one bounded attention call needs.
+///
+/// `Copy`, so it threads through a forward chain as cheaply as the budget alone did. The cancel flag
+/// is checked **between chunks**, mirroring the per-tile checks in
+/// [`crate::vae_tiling::tiled_decode`] (and the Candle Z-Image rung-3 port's per-tile work): a
+/// bounded attention call splits one previously atomic kernel launch into N, so those boundaries are
+/// the only place inside a DiT forward where a cancel can land at all. The unbounded fast path has no
+/// boundary and is therefore unaffected — cancellation there stays at step granularity, exactly as
+/// before.
+#[derive(Clone, Copy, Debug)]
+pub struct AttentionPlan<'a> {
+    pub budget: AttentionBudget,
+    pub cancel: Option<&'a CancelFlag>,
+}
+
+impl AttentionPlan<'_> {
+    /// The unbounded, uncancellable plan — the default for every path that has not selected the
+    /// bounded-attention rung, and byte-identical to the pre-SC-15615 forward.
+    pub const UNBOUNDED: Self = Self {
+        budget: AttentionBudget::UNBOUNDED,
+        cancel: None,
+    };
+
+    /// A plan at `budget` with no cancel flag (unit tests, and callers with no request scope).
+    pub const fn budgeted(budget: AttentionBudget) -> Self {
+        Self {
+            budget,
+            cancel: None,
+        }
+    }
+
+    /// This plan with `cancel` attached.
+    pub fn with_cancel(self, cancel: &CancelFlag) -> AttentionPlan<'_> {
+        AttentionPlan {
+            budget: self.budget,
+            cancel: Some(cancel),
+        }
+    }
+}
+
+impl Default for AttentionPlan<'_> {
+    fn default() -> Self {
+        Self::UNBOUNDED
+    }
+}
+
+impl From<AttentionBudget> for AttentionPlan<'_> {
+    fn from(budget: AttentionBudget) -> Self {
+        Self::budgeted(budget)
+    }
+}
+
 /// Bounded scaled-dot-product attention over the 4-D DiT shape `q, k, v: [B, H, Sq, D]` (the key
 /// length `Sk` may differ from `Sq`), returning `[B, H, Sq, D]` — a drop-in around an existing
 /// [`scaled_dot_product_attention`] call.
@@ -162,19 +214,40 @@ pub fn sdpa_budgeted_bhsd(
     v: &Array,
     scale: f32,
     mask: Option<&Array>,
-    budget: AttentionBudget,
+    plan: AttentionPlan<'_>,
 ) -> Result<Array> {
     let qs = q.shape();
     if qs.len() != 4 {
-        return Err(crate::Error::Msg(format!(
+        return Err(Error::Msg(format!(
             "sdpa_budgeted_bhsd expects q as [B, H, Sq, D], got {qs:?}"
         )));
+    }
+    // `k`/`v` are indexed on the same axes as `q`, so they must have the same rank; a 3-D `k` would
+    // otherwise silently read the head axis as the key length and produce a wrong (not failed) chunk
+    // plan.
+    for (name, a) in [("k", k), ("v", v)] {
+        if a.shape().len() != 4 {
+            return Err(Error::Msg(format!(
+                "sdpa_budgeted_bhsd expects {name} as [B, H, Sk, D], got {:?}",
+                a.shape()
+            )));
+        }
+    }
+    if let Some(m) = mask {
+        // The narrowing below indexes `len() - 2`, so a rank-1 mask would underflow.
+        if m.shape().len() < 2 {
+            return Err(Error::Msg(format!(
+                "sdpa_budgeted_bhsd expects a mask with a query and a key axis, got {:?}",
+                m.shape()
+            )));
+        }
     }
     let (b, h, sq) = (qs[0], qs[1], qs[2]);
     let sk = k.shape()[2];
 
-    let block = budget.query_block(b, h, sq, sk);
+    let block = plan.budget.query_block(b, h, sq, sk);
     if block >= sq {
+        record_chunk_count(1);
         return Ok(scaled_dot_product_attention(
             q,
             k,
@@ -185,9 +258,16 @@ pub fn sdpa_budgeted_bhsd(
         )?);
     }
 
-    let mut outs: Vec<Array> = Vec::with_capacity(((sq + block - 1) / block) as usize);
+    let mut outs: Vec<Array> = Vec::with_capacity(sq.div_euclid(block) as usize + 1);
     let mut start = 0;
     while start < sq {
+        // Between-chunk cancellation: a bounded call is the only place inside a DiT forward with a
+        // boundary to check at. Checked BEFORE the chunk so a cancel that arrived during the previous
+        // chunk stops the next launch; the partial `outs` drop here and the caller's request scope
+        // does the synchronize-and-release.
+        if plan.cancel.is_some_and(|c| c.is_cancelled()) {
+            return Err(Error::Canceled);
+        }
         let len = block.min(sq - start);
         let q_chunk = slice_axis(q, 2, start, len)?;
         // Narrow only a per-query mask; a broadcast `[.., 1, Sk]` mask is shared by every chunk.
@@ -207,15 +287,52 @@ pub fn sdpa_budgeted_bhsd(
                 .map(ScaledDotProductAttentionMask::Array),
             None,
         )?;
-        if budget.eval_per_chunk {
+        if plan.budget.eval_per_chunk {
             mlx_rs::transforms::eval([&out])?;
         }
         outs.push(out);
         start += len;
     }
+    record_chunk_count(outs.len());
     let refs: Vec<&Array> = outs.iter().collect();
     Ok(concatenate_axis(&refs, 2)?)
 }
+
+/// Test-only observation of how many chunks the last [`sdpa_budgeted_bhsd`] call actually ran.
+///
+/// Without this, every equivalence test in this module — and every one in `mlx-gen-z-image` — passes
+/// with the chunking deleted, because they all assert *chunked == unbounded*, which is trivially true
+/// when the chunking never engages. This lets a test assert that the lever it is exercising is
+/// actually pulled. Compiled out entirely in release; `RUST_TEST_THREADS=1` is forced repo-wide, so a
+/// process-global counter is safe.
+#[cfg(test)]
+mod chunk_probe {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    pub(super) static LAST_CHUNK_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    /// Chunks run by the most recent [`super::sdpa_budgeted_bhsd`] call (`1` = the unchunked path).
+    pub fn last_chunk_count() -> usize {
+        LAST_CHUNK_COUNT.load(Ordering::Relaxed)
+    }
+
+    /// Reset before a call so a stale value cannot satisfy an assertion.
+    pub fn reset() {
+        LAST_CHUNK_COUNT.store(0, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+pub use chunk_probe::{last_chunk_count, reset as reset_chunk_count};
+
+#[cfg(test)]
+fn record_chunk_count(n: usize) {
+    chunk_probe::LAST_CHUNK_COUNT.store(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn record_chunk_count(_n: usize) {}
 
 /// Contiguous `[.., start..start+len, ..]` slice along `axis`, via boundary splits (no host index
 /// vector and no gather, unlike `take_axis`).
@@ -246,6 +363,11 @@ mod tests {
     }
 
     /// Peak-relative max delta of the chunked forward against the unbounded one.
+    ///
+    /// Asserts on the way through that the chunked arm **actually chunked** (`expect_chunks`). Without
+    /// that, every equivalence assertion in this module is a false green: `chunked == unbounded` is
+    /// trivially true when the chunking never engages, so deleting the lever would leave the whole
+    /// suite passing.
     fn chunked_delta(
         q: &Array,
         k: &Array,
@@ -253,9 +375,23 @@ mod tests {
         scale: f32,
         mask: Option<&Array>,
         budget: AttentionBudget,
+        expect_chunks: usize,
     ) -> f32 {
-        let full = sdpa_budgeted_bhsd(q, k, v, scale, mask, AttentionBudget::UNBOUNDED).unwrap();
-        let chunked = sdpa_budgeted_bhsd(q, k, v, scale, mask, budget).unwrap();
+        reset_chunk_count();
+        let full = sdpa_budgeted_bhsd(q, k, v, scale, mask, AttentionPlan::UNBOUNDED).unwrap();
+        assert_eq!(
+            last_chunk_count(),
+            1,
+            "the unbounded arm must be a single un-chunked call"
+        );
+        reset_chunk_count();
+        let chunked =
+            sdpa_budgeted_bhsd(q, k, v, scale, mask, AttentionPlan::budgeted(budget)).unwrap();
+        assert_eq!(
+            last_chunk_count(),
+            expect_chunks,
+            "the budgeted arm did not chunk as expected — the equivalence below would be vacuous"
+        );
         assert_eq!(chunked.shape(), full.shape());
         let (a, c) = (flat(&full), flat(&chunked));
         let peak = a.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-12);
@@ -320,7 +456,8 @@ mod tests {
                 rows % 2 == 1, // exercise both eval_per_chunk settings
             );
             assert_eq!(budget.query_block(b, h, s, s), rows, "rows {rows}");
-            let max_rel = chunked_delta(&q, &k, &v, scale, None, budget);
+            let expected_chunks = (s as usize).div_ceil(rows as usize);
+            let max_rel = chunked_delta(&q, &k, &v, scale, None, budget, expected_chunks);
             assert!(
                 max_rel < PRODUCTION_TOLERANCE,
                 "rows {rows}: max relative delta {max_rel:e} exceeds {PRODUCTION_TOLERANCE:e}"
@@ -330,9 +467,9 @@ mod tests {
         // Mutation check — the metric is not vacuously zero: perturbing `v` must move it far past
         // the tolerance, so a comparison that accidentally compared an array to itself fails here.
         let v_moved = mlx_rs::ops::add(&v, Array::from_slice(&[0.5f32], &[1])).unwrap();
-        let full = sdpa_budgeted_bhsd(&q, &k, &v, scale, None, AttentionBudget::UNBOUNDED).unwrap();
+        let full = sdpa_budgeted_bhsd(&q, &k, &v, scale, None, AttentionPlan::UNBOUNDED).unwrap();
         let moved =
-            sdpa_budgeted_bhsd(&q, &k, &v_moved, scale, None, AttentionBudget::UNBOUNDED).unwrap();
+            sdpa_budgeted_bhsd(&q, &k, &v_moved, scale, None, AttentionPlan::UNBOUNDED).unwrap();
         let (a, c) = (flat(&full), flat(&moved));
         let peak = a.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-12);
         let moved_rel = a
@@ -347,24 +484,78 @@ mod tests {
         );
     }
 
-    /// At the **production** Z-Image-turbo DiT shape and the production 64 Mi budget the chunked and
-    /// unbounded forwards agree **exactly** — the strongest form of the SC-15615 equivalence claim,
-    /// pinned at the geometry that ships (1024² → 4128 unified tokens, 30 heads, head_dim 128, f32,
-    /// the dtype the DiT stream runs at after `apply_pad`).
+    /// Two claims at the **production** Z-Image-turbo DiT shape (1024² → 4128 unified tokens, 30
+    /// heads, head_dim 128, f32 — the dtype the DiT stream runs at after `apply_pad`), asserted in one
+    /// test so the ~250 MB q/k/v allocation happens once rather than twice:
+    ///
+    /// 1. MLX's fused SDPA **streams** the `[B,H,Sq,Sk]` scores rather than materializing them, so
+    ///    there is no score tensor for query-row chunking to bound (unlike candle's
+    ///    `attention_basic`). This is the load-bearing fact behind the whole SC-15615 finding, and it
+    ///    is pinned by arithmetic, not a magic constant: with q/k/v already evaluated, the unbounded
+    ///    call's peak-active bytes must stay within one operand's slack of `4 · B·H·Sq·D · 4`.
+    ///    A materialized score tensor would add `B·H·Sq·Sk · 4` — 1.9 GiB here, ~8× the budget below.
+    /// 2. At the production 64 Mi budget the chunked and unbounded forwards agree **exactly** — the
+    ///    strongest form of the equivalence claim, at the geometry that ships.
     #[test]
-    fn chunking_is_exact_at_the_production_shape_and_budget() {
-        let (b, h, s, d) = (1, 30, 4128, 128);
-        let q = arange(&[b, h, s, d], 0.0007, 0.3);
-        let k = arange(&[b, h, s, d], 0.0011, -0.7);
-        let v = arange(&[b, h, s, d], 0.0013, 1.1);
+    fn at_the_production_shape_sdpa_streams_the_scores_and_chunking_is_exact() {
+        use mlx_rs::memory::{clear_cache, get_peak_memory, reset_peak_memory};
+
+        let (b, h, s, d) = (1i64, 30i64, 4128i64, 128i64);
+        let shape = [b as i32, h as i32, s as i32, d as i32];
+        let q = arange(&shape, 0.0007, 0.3);
+        let k = arange(&shape, 0.0011, -0.7);
+        let v = arange(&shape, 0.0013, 1.1);
         let scale = (d as f32).powf(-0.5);
+        mlx_rs::transforms::eval([&q, &k, &v]).unwrap();
+
+        // (1) No score materialization on the unbounded path.
+        clear_cache();
+        reset_peak_memory();
+        reset_chunk_count();
+        let unbounded =
+            sdpa_budgeted_bhsd(&q, &k, &v, scale, None, AttentionPlan::UNBOUNDED).unwrap();
+        mlx_rs::transforms::eval([&unbounded]).unwrap();
+        let peak = get_peak_memory() as i64;
+        assert_eq!(last_chunk_count(), 1, "the unbounded arm must not chunk");
+        let one_operand = b * h * s * d * 4; // f32
+        let scores = b * h * s * s * 4;
+        assert!(
+            peak <= 5 * one_operand,
+            "unbounded SDPA peaked at {peak} B, more than q+k+v+out ({} B) plus one operand of \
+             slack — MLX appears to be materializing the {scores} B score tensor, which would make \
+             query-row chunking a real memory rung on this backend. Re-measure SC-15615.",
+            4 * one_operand
+        );
+
+        // (2) Exact agreement at the production budget. 4128 rows / 541 per chunk = 8 chunks.
         let budget = AttentionBudget::CONSTRAINED;
-        assert_eq!(budget.query_block(b, h, s, s), 541);
-        let max_rel = chunked_delta(&q, &k, &v, scale, None, budget);
+        assert_eq!(
+            budget.query_block(shape[0], shape[1], shape[2], shape[2]),
+            541
+        );
+        reset_chunk_count();
+        let chunked =
+            sdpa_budgeted_bhsd(&q, &k, &v, scale, None, AttentionPlan::budgeted(budget)).unwrap();
+        assert_eq!(
+            last_chunk_count(),
+            8,
+            "the budgeted arm did not chunk — the exactness assertion below would be vacuous"
+        );
+        assert_eq!(chunked.shape(), unbounded.shape());
+        let (a, c) = (flat(&unbounded), flat(&chunked));
+        let peak_abs = a.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-12);
+        let max_rel = a
+            .iter()
+            .zip(&c)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0f32, f32::max)
+            / peak_abs;
         assert_eq!(
             max_rel, 0.0,
             "production-shape chunking must be exact, got {max_rel:e}"
         );
+        drop((unbounded, chunked));
+        clear_cache();
     }
 
     #[test]
@@ -381,7 +572,7 @@ mod tests {
             arange(&[b, 1, 1, s], 0.31, 0.0),  // broadcast over query rows
             arange(&[b, 1, s, s], 0.29, -0.1), // per-query rows -> must be narrowed
         ] {
-            let max_rel = chunked_delta(&q, &k, &v, scale, Some(&mask), budget);
+            let max_rel = chunked_delta(&q, &k, &v, scale, Some(&mask), budget, 4);
             assert!(
                 max_rel < PRODUCTION_TOLERANCE,
                 "mask {:?}: max relative delta {max_rel:e}",
@@ -408,66 +599,83 @@ mod tests {
             data[(i * s + i) as usize] = 0.0;
         }
         let mask = Array::from_slice(&data, &[b, 1, s, s]);
-        let max_rel = chunked_delta(&q, &k, &v, scale, Some(&mask), budget);
+        let max_rel = chunked_delta(&q, &k, &v, scale, Some(&mask), budget, 4);
         assert!(
             max_rel < PRODUCTION_TOLERANCE,
             "row-dependent mask: max relative delta {max_rel:e}"
         );
     }
 
-    /// The load-bearing MLX fact behind the whole SC-15615 finding: `fast::scaled_dot_product_attention`
-    /// **streams** the `[B,H,Sq,Sk]` scores rather than materializing them, so there is no score
-    /// tensor for query-row chunking to bound (unlike candle's `attention_basic`).
-    ///
-    /// Pinned by arithmetic, not by a magic constant: with q/k/v already evaluated, the unbounded
-    /// call's peak-active bytes must be within one output's worth of `4 · B·H·Sq·D · sizeof(f32)`.
-    /// A materialized score tensor would add `B·H·Sq·Sk · 4` — at this shape 1.9 GiB, ~8× the whole
-    /// budget below — so the assertion cannot pass if MLX ever falls back to the decomposition.
-    #[test]
-    fn fused_sdpa_does_not_materialize_the_scores() {
-        use mlx_rs::memory::{clear_cache, get_peak_memory, reset_peak_memory};
-
-        // The production Z-Image-turbo unified stack at 1024².
-        let (b, h, s, d) = (1i64, 30i64, 4128i64, 128i64);
-        let shape = [b as i32, h as i32, s as i32, d as i32];
-        let q = arange(&shape, 0.0007, 0.3);
-        let k = arange(&shape, 0.0011, -0.7);
-        let v = arange(&shape, 0.0013, 1.1);
-        mlx_rs::transforms::eval([&q, &k, &v]).unwrap();
-        clear_cache();
-        reset_peak_memory();
-
-        let out = sdpa_budgeted_bhsd(
-            &q,
-            &k,
-            &v,
-            (d as f32).powf(-0.5),
-            None,
-            AttentionBudget::UNBOUNDED,
-        )
-        .unwrap();
-        mlx_rs::transforms::eval([&out]).unwrap();
-        let peak = get_peak_memory() as i64;
-
-        let one_operand = b * h * s * d * 4; // f32
-        let scores = b * h * s * s * 4;
-        assert!(
-            peak <= 5 * one_operand,
-            "unbounded SDPA peaked at {peak} B, more than q+k+v+out ({} B) plus one operand of \
-             slack — MLX appears to be materializing the {scores} B score tensor, which would make \
-             query-row chunking a real memory rung on this backend. Re-measure SC-15615.",
-            4 * one_operand
-        );
-        drop(out);
-        clear_cache();
-    }
-
     #[test]
     fn rejects_a_non_4d_query() {
         let q = arange(&[2, 3, 4], 0.1, 0.0);
-        let err = sdpa_budgeted_bhsd(&q, &q, &q, 1.0, None, AttentionBudget::UNBOUNDED)
+        let err = sdpa_budgeted_bhsd(&q, &q, &q, 1.0, None, AttentionPlan::UNBOUNDED)
             .unwrap_err()
             .to_string();
         assert!(err.contains("[B, H, Sq, D]"), "{err}");
+    }
+
+    /// `k`/`v` are indexed on the same axes as `q`; a lower-rank one would silently read the head
+    /// axis as the key length and produce a wrong (not failed) chunk plan. Same for a rank-1 mask,
+    /// whose narrowing would underflow `len() - 2`.
+    #[test]
+    fn rejects_mismatched_key_value_and_mask_ranks() {
+        let q = arange(&[1, 2, 8, 4], 0.1, 0.0);
+        let flat = arange(&[1, 2, 8], 0.1, 0.0);
+        for (label, k, v) in [("k", &flat, &q), ("v", &q, &flat)] {
+            let err = sdpa_budgeted_bhsd(&q, k, v, 1.0, None, AttentionPlan::UNBOUNDED)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("[B, H, Sk, D]"), "{label}: {err}");
+        }
+        let bad_mask = arange(&[8], 0.1, 0.0);
+        let err = sdpa_budgeted_bhsd(&q, &q, &q, 1.0, Some(&bad_mask), AttentionPlan::UNBOUNDED)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("query and a key axis"), "{err}");
+    }
+
+    /// Between-chunk cancellation (SC-15615 scope: "per-chunk cancellation checks"). A bounded call
+    /// splits one atomic kernel launch into N, and the boundaries are the only place inside a DiT
+    /// forward a cancel can land; the unbounded fast path has no boundary and must be unaffected.
+    #[test]
+    fn a_cancel_stops_a_bounded_call_between_chunks() {
+        let (b, h, s, d) = (1, 2, 24, 8);
+        let q = arange(&[b, h, s, d], 0.019, 0.2);
+        let k = arange(&[b, h, s, d], 0.023, -0.4);
+        let v = arange(&[b, h, s, d], 0.007, 0.9);
+        let scale = (d as f32).powf(-0.5);
+        let budget = AttentionBudget::from_score_elements((b * h * s * 7) as u64, false);
+
+        let cancel = CancelFlag::default();
+        cancel.cancel();
+        let plan = AttentionPlan::budgeted(budget).with_cancel(&cancel);
+        let err = sdpa_budgeted_bhsd(&q, &k, &v, scale, None, plan).unwrap_err();
+        assert!(
+            matches!(err, Error::Canceled),
+            "a bounded call must return Error::Canceled, got {err}"
+        );
+
+        // An un-tripped flag changes nothing, and the UNBOUNDED fast path never consults it (there is
+        // no chunk boundary to consult it at) — so a cancelled flag cannot break an unselected request.
+        let live = CancelFlag::default();
+        let plan = AttentionPlan::budgeted(budget).with_cancel(&live);
+        assert!(sdpa_budgeted_bhsd(&q, &k, &v, scale, None, plan).is_ok());
+        let plan = AttentionPlan::UNBOUNDED.with_cancel(&cancel);
+        assert!(
+            sdpa_budgeted_bhsd(&q, &k, &v, scale, None, plan).is_ok(),
+            "a cancelled flag must not affect the unbounded fast path"
+        );
+    }
+
+    #[test]
+    fn the_chunk_probe_reports_the_unchunked_path_as_one_chunk() {
+        // Guards the guard: if `record_chunk_count` were dropped from the fast path, every
+        // `expect_chunks` assertion above would compare against a stale value instead of failing.
+        let q = arange(&[1, 2, 8, 4], 0.1, 0.0);
+        reset_chunk_count();
+        assert_eq!(last_chunk_count(), 0);
+        sdpa_budgeted_bhsd(&q, &q, &q, 1.0, None, AttentionPlan::UNBOUNDED).unwrap();
+        assert_eq!(last_chunk_count(), 1);
     }
 }

@@ -22,7 +22,7 @@ use super::rope_embedder::RopeEmbedder;
 use super::timestep_embedder::TimestepEmbedder;
 use super::transformer_block::{ZImageBlockConfig, ZImageTransformerBlock};
 use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear, Adapter};
-use mlx_gen::attention::AttentionBudget;
+use mlx_gen::attention::AttentionPlan;
 use mlx_gen::train::lora::LoraParams;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
@@ -294,7 +294,7 @@ impl ZImageTransformer {
     /// `(C, F, H, W)` (same dims as `prep` was built for) and `timestep` ∈ [0,1]; only the latent
     /// values and timestep vary across steps. Returns the latent-shaped velocity `(C, F, H, W)`.
     pub(crate) fn forward_with(&self, prep: &Prepared, x: &Array, timestep: f32) -> Result<Array> {
-        self.forward_with_budgeted(prep, x, timestep, AttentionBudget::UNBOUNDED)
+        self.forward_with_budgeted(prep, x, timestep, AttentionPlan::UNBOUNDED)
     }
 
     /// [`forward_with`](Self::forward_with) with an explicit attention-score budget — ladder rung 3
@@ -311,7 +311,7 @@ impl ZImageTransformer {
         prep: &Prepared,
         x: &Array,
         timestep: f32,
-        budget: AttentionBudget,
+        plan: AttentionPlan<'_>,
     ) -> Result<Array> {
         let t = Array::from_slice(&[timestep * self.cfg.t_scale], &[1]);
         let t_emb = self.t_embedder.forward(&t)?;
@@ -322,7 +322,7 @@ impl ZImageTransformer {
         x_emb = apply_pad(&x_emb, &prep.x_keep, &self.x_pad_token)?;
         let mut x_emb = x_emb.expand_dims(0)?;
         for layer in &self.noise_refiner {
-            x_emb = layer.forward_budgeted(&x_emb, &prep.x_freqs, &t_emb, budget)?;
+            x_emb = layer.forward_budgeted(&x_emb, &prep.x_freqs, &t_emb, plan)?;
         }
 
         // Caption stream: RMSNorm -> linear -> set padded to cap_pad_token -> context refiner.
@@ -331,7 +331,7 @@ impl ZImageTransformer {
         cap_emb = apply_pad(&cap_emb, &prep.cap_keep, &self.cap_pad_token)?;
         let mut cap_emb = cap_emb.expand_dims(0)?;
         for layer in &self.context_refiner {
-            cap_emb = layer.forward_budgeted(&cap_emb, &prep.cap_freqs, budget)?;
+            cap_emb = layer.forward_budgeted(&cap_emb, &prep.cap_freqs, plan)?;
         }
 
         // Unify and run the main stack. In bf16 training the f32 caption stream joins cast to the
@@ -343,7 +343,7 @@ impl ZImageTransformer {
         let x_len = x_emb.shape()[1];
         let mut unified = concatenate_axis(&[&x_emb, &cap_emb], 1)?;
         for layer in &self.layers {
-            unified = layer.forward_budgeted(&unified, &prep.unified_freqs, &t_emb, budget)?;
+            unified = layer.forward_budgeted(&unified, &prep.unified_freqs, &t_emb, plan)?;
         }
 
         // Final layer + unpatchify (only the real image tokens survive).
@@ -483,9 +483,27 @@ impl ZImageTransformer {
     /// `Prepared` and runs one `forward_with` — bit-identical to caching
     /// `prepare` across steps, since the prep depends only on the (loop-constant) dims + caption.
     pub fn forward(&self, x: &Array, timestep: f32, cap_feats: &Array) -> Result<Array> {
+        self.forward_budgeted(x, timestep, cap_feats, AttentionPlan::UNBOUNDED)
+    }
+
+    /// [`forward`](Self::forward) under an explicit [`AttentionPlan`] — the public, DiT-level entry for
+    /// ladder rung 3 (SC-15615) and the direct analog of `candle_gen_z_image`'s public
+    /// `ZImageTransformer::forward_with_attention_budget`.
+    ///
+    /// Exists as a public surface (rather than only the `pub(crate)`
+    /// [`forward_with_budgeted`](Self::forward_with_budgeted)) so the equivalence and
+    /// plan-threading tests can drive one whole DiT forward without standing up a denoise loop —
+    /// mirroring the CUDA twin's `attention_query_chunking_matches_the_unbounded_forward`.
+    pub fn forward_budgeted(
+        &self,
+        x: &Array,
+        timestep: f32,
+        cap_feats: &Array,
+        plan: AttentionPlan<'_>,
+    ) -> Result<Array> {
         let sh = x.shape();
         let prep = self.prepare((sh[0], sh[1], sh[2], sh[3]), cap_feats)?;
-        self.forward_with(&prep, x, timestep)
+        self.forward_with_budgeted(&prep, x, timestep, plan)
     }
 
     /// Step-invariant half of [`patchify`](Self::patchify): the caption + image position-ids, keep

@@ -101,16 +101,34 @@ fn request(memory: Option<GenerationMemory>) -> GenerationRequest {
     }
 }
 
-/// Peaks for one generation, in bytes: `(denoise-phase peak, whole-request peak)`.
+/// Per-phase peaks for one generation, in bytes.
 ///
 /// MLX's `get_peak_memory` is peak **active** bytes, not cache, so it is the right counter for a
-/// residency budget. The denoise-phase peak is isolated by resetting the counter at the first
-/// `Progress::Step` and reading it at `Progress::Decoding` — i.e. exactly the staged denoise window
-/// the Candle twin reported as 8.394 → 5.709 GB.
+/// residency budget. It is a high-water mark, so isolating a phase means resetting it at that phase's
+/// start — which destroys the earlier phases' readings unless they are sampled first. This samples
+/// each boundary *before* resetting, so `request_bytes` is the true whole-request peak (the max over
+/// all three phases) and not merely denoise+decode:
+///
+/// - `conditioning_bytes` — everything up to the first denoise step: the Qwen text encode and, under
+///   `Sequential`, the encoder drop plus the heavy (DiT + VAE) load.
+/// - `denoise_bytes` — the staged denoise window, i.e. the counterpart of the Candle twin's
+///   8.394 → 5.709 GB.
+/// - `decode_bytes` — the (tiled) VAE decode after the DiT is shed.
 struct Peaks {
+    conditioning_bytes: usize,
     denoise_bytes: usize,
-    total_bytes: usize,
+    decode_bytes: usize,
     image: Image,
+}
+
+impl Peaks {
+    /// The whole-request peak: the max over the three phases, since each was measured from its own
+    /// reset point.
+    fn request_bytes(&self) -> usize {
+        self.conditioning_bytes
+            .max(self.denoise_bytes)
+            .max(self.decode_bytes)
+    }
 }
 
 fn run(memory: Option<GenerationMemory>) -> Peaks {
@@ -120,16 +138,19 @@ fn run(memory: Option<GenerationMemory>) -> Peaks {
     clear_cache();
     reset_peak_memory();
 
+    let mut conditioning_bytes = 0usize;
     let mut denoise_bytes = 0usize;
-    let mut saw_step = false;
     let mut on_progress = |p: Progress| match p {
         Progress::Step { current: 1, .. } => {
-            // Start of the denoise phase: the encoder is already dropped and the DiT is resident.
+            // Start of the denoise phase. Sample the conditioning phase's high-water FIRST — the
+            // reset below would otherwise discard it, and the 8 GB verdict needs the true request
+            // peak, not denoise+decode.
+            conditioning_bytes = get_peak_memory();
             reset_peak_memory();
-            saw_step = true;
         }
-        Progress::Decoding if saw_step && denoise_bytes == 0 => {
+        Progress::Decoding if denoise_bytes == 0 => {
             denoise_bytes = get_peak_memory();
+            reset_peak_memory();
         }
         _ => {}
     };
@@ -137,16 +158,22 @@ fn run(memory: Option<GenerationMemory>) -> Peaks {
     let out = generator
         .generate(&req, &mut on_progress)
         .expect("generation");
-    let total_bytes = get_peak_memory().max(denoise_bytes);
+    let decode_bytes = get_peak_memory();
     let image = match out {
         GenerationOutput::Images(mut images) => images.pop().expect("one image"),
         other => panic!("expected images, got {other:?}"),
     };
     drop(generator);
     clear_cache();
+    assert!(
+        conditioning_bytes > 0 && denoise_bytes > 0 && decode_bytes > 0,
+        "a phase boundary was not sampled (conditioning {conditioning_bytes}, denoise \
+         {denoise_bytes}, decode {decode_bytes})"
+    );
     Peaks {
+        conditioning_bytes,
         denoise_bytes,
-        total_bytes,
+        decode_bytes,
         image,
     }
 }
@@ -183,54 +210,66 @@ fn staged_only() -> Option<GenerationMemory> {
     })
 }
 
-/// The A/B the story asked for: staged denoise peak WITH and WITHOUT the 64 Mi attention budget.
+/// The A/B the story asked for: staged peaks WITH and WITHOUT the 64 Mi attention budget.
+///
+/// Runs the pair twice with the arms **swapped** the second time. n=1 with a fixed arm order would
+/// let allocator warm-up masquerade as the rung's effect; requiring the saving in both orders rules
+/// that out.
 #[test]
 #[ignore = "needs a real Z-Image-Turbo snapshot + Apple/Metal GPU"]
 fn bounded_attention_reduces_the_staged_denoise_peak() {
+    println!(
+        "SC-15615 MLX Z-Image bounded-attention A/B ({:?} tier, {}x{}, {} steps)",
+        quant(),
+        env_u32("ZIMAGE_ATTN_SIZE", 1024),
+        env_u32("ZIMAGE_ATTN_SIZE", 1024),
+        env_u32("ZIMAGE_ATTN_STEPS", 4)
+    );
+
+    let report = |label: &str, p: &Peaks| {
+        println!(
+            "  {label:<28} conditioning {:.3} / denoise {:.3} / decode {:.3} / request {:.3} GiB",
+            p.conditioning_bytes as f64 / GIB,
+            p.denoise_bytes as f64 / GIB,
+            p.decode_bytes as f64 / GIB,
+            p.request_bytes() as f64 / GIB,
+        );
+    };
+
+    // Order A: unbounded first.
     let without = run(staged_only());
     let with = run(bounded());
+    report("WITHOUT budget", &without);
+    report("WITH 64Mi budget", &with);
+    // Order B: bounded first, to rule out warm-up masquerading as the effect.
+    let with_first = run(bounded());
+    let without_second = run(staged_only());
+    report("WITH 64Mi budget (first)", &with_first);
+    report("WITHOUT budget (second)", &without_second);
 
-    let (w_den, b_den) = (without.denoise_bytes as f64, with.denoise_bytes as f64);
-    let (w_tot, b_tot) = (without.total_bytes as f64, with.total_bytes as f64);
-    println!(
-        "SC-15615 MLX Z-Image bounded-attention A/B ({:?} tier)",
-        quant()
-    );
-    println!(
-        "  WITHOUT budget: denoise peak {:.3} GiB, request peak {:.3} GiB",
-        w_den / GIB,
-        w_tot / GIB
-    );
-    println!(
-        "  WITH 64Mi budget: denoise peak {:.3} GiB, request peak {:.3} GiB",
-        b_den / GIB,
-        b_tot / GIB
-    );
-    println!(
-        "  delta: denoise {:+.1}%, request {:+.1}%",
-        100.0 * (b_den - w_den) / w_den,
-        100.0 * (b_tot - w_tot) / w_tot
-    );
-
-    assert!(
-        without.denoise_bytes > 0,
-        "denoise-phase peak was not sampled"
-    );
-    assert!(with.denoise_bytes > 0, "denoise-phase peak was not sampled");
-
-    // Measured -5.0% end to end. Assert only that the rung is a genuine (non-noise) improvement, so
-    // this fails if a future change erases the saving that justifies declaring rung 3 Implemented —
-    // without over-fitting to this host's exact figure.
-    assert!(
-        b_den <= w_den * 0.99,
-        "bounded attention no longer reduces the MLX staged denoise peak ({:.3} -> {:.3} GiB, \
-         {:+.1}%). Rung 3's Implemented declaration in mlx_gen_z_image::image_memory rests on that \
-         saving — re-measure SC-15615 before shipping.",
-        w_den / GIB,
-        b_den / GIB,
-        100.0 * (b_den - w_den) / w_den
-    );
-    assert!(b_tot <= w_tot * 0.99, "request peak did not improve either");
+    for (order, w, b) in [
+        ("unbounded-first", &without, &with),
+        ("bounded-first", &without_second, &with_first),
+    ] {
+        let (wd, bd) = (w.denoise_bytes as f64, b.denoise_bytes as f64);
+        println!(
+            "  {order}: denoise {:+.1}%, request {:+.1}%",
+            100.0 * (bd - wd) / wd,
+            100.0 * (b.request_bytes() as f64 - w.request_bytes() as f64)
+                / w.request_bytes() as f64
+        );
+        // Measured -5.0%. Assert only that the rung is a genuine (non-noise) improvement in BOTH
+        // orders, so this fails if a future change erases the saving that justifies declaring rung 3
+        // Implemented — without over-fitting to this host's exact figure.
+        assert!(
+            bd <= wd * 0.99,
+            "{order}: bounded attention no longer reduces the MLX staged denoise peak \
+             ({:.3} -> {:.3} GiB). Rung 3's Implemented declaration in \
+             mlx_gen_z_image::image_memory rests on that saving — re-measure SC-15615.",
+            wd / GIB,
+            bd / GIB
+        );
+    }
 }
 
 /// Attribution: the saving is the per-chunk `eval` barrier cutting the lazy graph, not a bounded
@@ -383,7 +422,7 @@ fn bounded_attention_preserves_the_image() {
 fn the_eight_gb_mac_verdict() {
     let staged = run(staged_only());
     let with_rung3 = run(bounded());
-    let peak = staged.total_bytes as f64;
+    let peak = staged.request_bytes() as f64;
     let denoise = staged.denoise_bytes as f64;
     // The generic MLX gate's operational reserve today. On a Mac this is the *shared* pool macOS,
     // WindowServer and SceneWorks itself live in, which SC-15614 is separately re-deriving.
@@ -407,8 +446,8 @@ fn the_eight_gb_mac_verdict() {
     );
     println!(
         "  with rung 3 (64 Mi bounded attention): {:.3} GiB, + reserve = {:.3} GiB",
-        with_rung3.total_bytes as f64 / GIB,
-        with_rung3.total_bytes as f64 / GIB + reserve_gib
+        with_rung3.request_bytes() as f64 / GIB,
+        with_rung3.request_bytes() as f64 / GIB + reserve_gib
     );
     println!(
         "  DISCLOSURE: measured on this host, which is NOT a physical 8 GB Mac. MLX's peak counter \

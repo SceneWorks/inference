@@ -11,7 +11,7 @@
 //! | Rung | Support | Executable seam |
 //! |---|---|---|
 //! | 0 Resident | Implemented | `Residency::resident` — encoder + DiT + VAE held warm |
-//! | 1 Staged residency | Implemented | `Residency::run_staged` (sc-10839 / sc-13571): encode → drop encoder → denoise → **drop DiT** → decode |
+//! | 1 Staged residency | Implemented (load-time, see below) | `Residency::run_staged` (sc-10839 / sc-13571): encode → drop encoder → denoise → **drop DiT** → decode |
 //! | 2 Bounded decode | Implemented | `Vae::decode_tiled` at 512 px / 64 px overlap ([`crate::pipeline::decode_tiling`]) |
 //! | 3 Bounded attention | Implemented | [`mlx_gen::attention::sdpa_budgeted_bhsd`] threaded through every DiT attention (SC-15615) |
 //! | 4 Bounded transformer residency | **Missing** | No per-block wired-residency window exists on the MLX Z-Image DiT |
@@ -19,6 +19,15 @@
 //! Rung 4 is declared `Missing`, not `StructurallyNotApplicable`: the architecture *does* have 30
 //! independent trunk blocks a window could materialize one at a time, so the rung is applicable and
 //! simply unimplemented. Declaring it `StructurallyNotApplicable` would be a false Full.
+//!
+//! **Rung 1 has no request-scoped lever.** Staging is gated on [`mlx_gen::Residency::is_sequential`],
+//! which comes from the *load-time* [`OffloadPolicy`](mlx_gen::OffloadPolicy), so selecting
+//! `StagedResidency` on a generator that was loaded `Resident` yields resident behaviour — the
+//! selection is honoured only if the consumer also loaded the provider `Sequential`.
+//! [`z_image_generation_memory`] maps rung 1 to an all-false [`GenerationMemory`] for exactly that
+//! reason: there is nothing per-request to turn on. Krea's CUDA adoption has the same shape, so this
+//! is a shared-contract gap (a load-time-vs-request-time seam) rather than a Z-Image one; it is
+//! recorded here so no calibration reads a rung-1 cell as request-selectable.
 //!
 //! ## What rung 3 is worth here, and why it is not CUDA's rung 3 (SC-15615)
 //!
@@ -28,10 +37,17 @@
 //! tensor (pinned by `mlx_gen::attention`'s `fused_sdpa_does_not_materialize_the_scores`), so the
 //! same knob buys something different and much smaller here.
 //!
-//! Measured on Apple M5 Max, real `z_image_turbo` **q4** weights, 1024², 4 steps, staged residency,
-//! count 1 (`tests/bounded_attention_real_weights.rs`):
+//! Measured on Apple M5 Max, real `z_image_turbo` **q4** weights, 1024², 4 steps, count 1
+//! (`tests/bounded_attention_real_weights.rs`). **Two harnesses, deliberately:** the first four rows
+//! drive `denoise_with_progress` on a directly-loaded DiT with synthetic caption conditioning — no
+//! text encoder, no VAE, no `Residency::run_staged` — because that is the only way to swap the
+//! attention plan under otherwise identical conditions and run the never-chunks control. The last two
+//! rows are the real staged `generate`. The two baselines therefore differ (4.7746 vs 4.898 GiB — the
+//! staged run additionally holds the ~157 MB VAE through denoise), and so do the savings (−0.080 vs
+//! −0.245 GiB): freeing a transient earlier is worth more when more is co-resident. Read the first
+//! group as *attribution* and the second as *the number that ships*.
 //!
-//! | Arm | Staged denoise peak | vs unbounded |
+//! | Arm | Denoise peak | vs unbounded |
 //! |---|---:|---:|
 //! | DiT denoise loop, unbounded | 4.7746 GiB | — |
 //! | DiT denoise loop, 64 Mi chunk, **lazy** | 4.7708 GiB | −0.08% (noise) |
@@ -54,15 +70,20 @@
 //!
 //! ## Route coverage
 //!
-//! Rung 3 reaches **every** advertised denoise route — plain t2i, base CFG (both the cond and the
-//! uncond forward), turbo control and base control (including the ControlNet branch's own blocks),
-//! and the PiD route, whose denoise is the ordinary DiT.
+//! The attention budget itself reaches **every** advertised denoise route — plain t2i, base CFG (both
+//! the cond and the uncond forward), turbo control and base control (including the ControlNet
+//! branch's own blocks), and the PiD route, whose denoise is the ordinary DiT.
 //!
-//! Rungs 2 and above are **refused on the PiD route** (see `safety_check`). PiD replaces the native
-//! VAE decode with a super-resolving student that plans its own tile edge/overlap from its own budget
+//! **But rungs 2 and above are refused on the PiD route** (see `safety_check`), and because the
+//! ladder is cumulative that takes rung 3 with it: a `use_pid` request cannot select bounded
+//! attention through the contract, only through the raw `GenerationMemory::chunk_attention` request
+//! knob. The reason is rung 2, not rung 3 — PiD replaces the native VAE decode with a
+//! super-resolving student that plans its own tile edge/overlap from its own budget
 //! (`mlx_gen_pid::budget`) and never reads this contract's `decode_tile_edge`/`decode_overlap`, so
-//! admitting bounded decode there would execute a different strategy than the selector chose.
-//! Reconciling PiD's planner with the shared parameters is SC-15510's PiD/alternate-decode coverage.
+//! admitting a rung-2-or-deeper selection would execute a different strategy than the selector chose.
+//! Refusing is the contract-correct outcome; making rung 3 independently selectable on PiD needs
+//! PiD's planner reconciled with the shared parameters, which is SC-15510's PiD/alternate-decode
+//! coverage.
 //!
 //! ## Ownership
 //!
