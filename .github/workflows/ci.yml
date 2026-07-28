@@ -229,10 +229,10 @@ jobs:
         # links the seven real-weight-only binaries, which costs the lld budget above nothing but
         # time for zero executed cases.
         #
-        # The named nine and what they execute on a PR (measured, `cargo test -p
-        # candle-audio-stable-audio-3 --tests`): `sampler_oracle` 17, `reference_audio` 7,
+        # The named ten and what they execute on a PR (measured, by running this step's exact
+        # command on the merged tree): `sampler_oracle` 17, `audio_edit` 12, `reference_audio` 7,
         # `provider` 3, `listening_stimuli` 3, `dtype_policy` 2, `conformance` 1,
-        # `primitive_oracle` 1, `same_oracle` 1, `variant_quality` 1 — 36 weight-free cases.
+        # `primitive_oracle` 1, `same_oracle` 1, `variant_quality` 1 — 48 weight-free cases.
         # sc-14545 review found
         # `sampler_oracle`, `same_oracle` and `primitive_oracle` running in no automatic lane at all
         # (19 dark gates, pre-existing since sc-14543) and added them here. sc-14546 adds
@@ -271,6 +271,47 @@ jobs:
         # between them. All three gates are verified to fail under their own single-token mutation,
         # not merely to pass under the correct code.
         #
+        # sc-14548 adds `audio_edit`, the inpaint/repaint/extend target. Its twelve weight-free cases
+        # are the **whole** of the PR-time evidence for that feature: the DiT side was already
+        # landed and the story is the producer — mask construction, the 257-channel local
+        # conditioning, region resolution, and the PCM stitch — every part of which fails silently.
+        # A wrong mask polarity edits the complement of what was asked; a swapped concat order has
+        # the identical shape; a mask built at the un-adapted size or against the caller's own
+        # sample rate moves the edit window while every preservation assertion still passes; latent
+        # indices computed by rounding rather than derived from the resized mask are off by one
+        # frame at some boundaries and right at others. None of that changes an output's length,
+        # rate or finiteness.
+        #
+        # Two design decisions are what make this gateable in the PR lane at all, and both are the
+        # sc-14547 carry-forward applied up front rather than after three review rounds:
+        # `pipeline::edit_local_conditioning` takes the encoded source as a plain **tensor** instead
+        # of encoding it, so the entire mask -> resize -> multiply -> concat chain runs with
+        # synthetic latents and no weights; and `model::audio_edit_for` was written outside
+        # `generate` (which needs multi-gigabyte weights), so the mode + region -> `[start, end)`
+        # resolution is reachable here. `conditioning_is_forwarded` then makes a dropped forward
+        # fail closed at runtime rather than degrade silently to text-to-audio.
+        #
+        # Round-2 review added the last two cases, and they carry a seam that had no gate at all:
+        # `local = edit_local_conditioning(...)` -> `let _ = ...` inside `synthesize_traced` leaves
+        # the DiT's local conditioner as the zero tensor the text-only path allocates, so every
+        # inpaint/repaint/extend *interior* degrades to plain text-to-audio while the outside stays
+        # bit-exact and both real-weight divergence floors get **larger** — an unconditioned interior
+        # wanders further from the source and further between seeds, so those floors are
+        # wrong-signed against it and tightening them cannot help.
+        # `pipeline::edit_local_conditioning_is_present` now cross-checks the handoff where it
+        # crosses into `sample`, and `edit_geometry_matches_request` does the same for the
+        # weights-only `duration_secs` argument that sets the padding boundary. Both call sites need
+        # weights, exactly like `conditioning_is_forwarded`'s, so what runs here is the **rule**; the
+        # real-weight lane is where a zeroed handoff is refused, before sampling rather than after a
+        # plausible render.
+        #
+        # What these cases do **not** cover, stated rather than implied: every call site inside
+        # `StableAudio3Pipeline::synthesize_traced`, and the conditioning receipt built in
+        # `generate`. Those need weights; `real-weights.yml`'s `sa3-base-identity-{metal,cuda}` jobs
+        # are what catch them, and `docs/migration/SC_14548_AUDIO_EDIT_INPAINT.md` carries the
+        # per-site table — every row of which names a mechanism verified by running the mutation
+        # rather than by reading the code.
+        #
         # Scope, stated precisely rather than as "the sign is gated at the contract endpoint": these
         # three cases make the chain continuous from `GenerationRequest` to `sampler_strength_for` —
         # conversion, field selection into `pipeline::ReferenceAudio`, and the strength decision
@@ -303,7 +344,7 @@ jobs:
           -p candle-audio-stable-audio-3
           --test provider --test dtype_policy --test variant_quality --test conformance
           --test sampler_oracle --test same_oracle --test primitive_oracle
-          --test listening_stimuli --test reference_audio
+          --test listening_stimuli --test reference_audio --test audio_edit
           -- --nocapture
       - name: Test LLM-only CPU bundle
         run: cargo test --locked --no-default-features --lib -p runtime-cpu

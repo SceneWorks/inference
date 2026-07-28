@@ -127,10 +127,12 @@ fn reference_request(
 fn all_six_descriptors_advertise_reference_audio_conditioning() {
     for variant in Variant::ALL {
         let descriptor = descriptor_for(variant);
-        assert_eq!(
-            descriptor.capabilities.conditioning,
-            vec![ConditioningKind::ReferenceAudio],
-            "{} must advertise exactly ReferenceAudio",
+        assert!(
+            descriptor
+                .capabilities
+                .conditioning
+                .contains(&ConditioningKind::ReferenceAudio),
+            "{} must advertise ReferenceAudio",
             descriptor.id
         );
         // The advertisement is what makes the generic floor stop rejecting the variant, so prove
@@ -643,12 +645,20 @@ fn reference_validation_rejects_every_malformed_clip_on_every_variant() {
             validate(variant, &invalid)
         );
 
-        // Reference plus an audio edit.
+        // Reference plus an audio edit. The edit here is deliberately **well-formed** — an
+        // advertised mode with a valid region on a valid clip (sc-14548) — so what fails is the
+        // combination itself and not the mode allowlist. Before sc-14548 this case used
+        // `AudioEditMode::Cover`, which the generic floor refused on its own; the refusal it was
+        // named for was unreachable. `tests/audio_edit.rs` asserts the same rejection from the
+        // other side, and both must produce the same message.
         let mut invalid = valid.clone();
         invalid.conditioning.push(Conditioning::AudioEdit {
-            audio: source_clip(1.0, SAMPLE_RATE, 2),
-            mode: AudioEditMode::Cover,
-            region: None,
+            audio: source_clip(2.0, SAMPLE_RATE, 2),
+            mode: AudioEditMode::Inpaint,
+            region: Some(gen_core::TimeRegion {
+                start_secs: 0.5,
+                end_secs: Some(1.0),
+            }),
             strength: None,
         });
         assert!(
