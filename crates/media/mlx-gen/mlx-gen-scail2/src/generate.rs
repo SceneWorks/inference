@@ -24,7 +24,7 @@ use std::path::Path;
 use mlx_gen::array::scalar;
 use mlx_gen::weights::Weights;
 use mlx_gen::{AdapterSpec, CancelFlag, Error, GenerationOutput, Image, Progress, Quant, Result};
-use mlx_gen_wan::pipeline::auto_tiling_budgeted_z16;
+use mlx_gen_wan::pipeline::auto_tiling_budgeted_z16_quality_overlap;
 use mlx_gen_wan::{
     frames_to_images, load_tokenizer, make_scheduler, DitMemoryConfig, SolverKind, Umt5Encoder,
     WanVae,
@@ -40,6 +40,14 @@ use crate::resize::{clip_preprocess, downsample_half, interpolate, Interp};
 
 /// Wan2.1 flow-matching training horizon (upstream `config.num_train_timesteps`).
 const NUM_TRAIN_TIMESTEPS: usize = 1000;
+
+fn decode_tiling(
+    height: i32,
+    width: i32,
+    out_frames: i32,
+) -> Result<Option<mlx_gen::tiling::TilingConfig>> {
+    auto_tiling_budgeted_z16_quality_overlap(height, width, out_frames)
+}
 /// SCAIL-2 DiT-denoise activation-memory defaults (sc-5681). NOTE: measurement showed the 832×480/5s
 /// high-resolution OOM is the **VAE decode** (see the per-segment decode), not the DiT denoise — MLX's
 /// `scaled_dot_product_attention` is flash here, so the 40-layer denoise fits even un-chunked. These
@@ -618,9 +626,10 @@ pub fn generate(
         // single-pass reference, 18.5/255 mean abs err with 26.6% of a worst frame blown to white.
         // Content corruption with the period of the tile stride, not a seam the blend could fix.
         //
-        // It now goes through the SAME budgeted selector as the Wan z16 T2V/I2V/VACE decodes
-        // (`auto_tiling_budgeted_z16`), so there is exactly one z16 decode-tiling policy in the
-        // workspace. gen-core's `MIN_TEMPORAL_TILE_LATENT_FRAMES` floor makes a sub-8-latent-frame
+        // It now goes through the same budgeted core/cost model as the Wan z16 T2V/I2V/VACE decodes,
+        // but retains the quality-oriented overlap through
+        // `auto_tiling_budgeted_z16_quality_overlap`. gen-core's
+        // `MIN_TEMPORAL_TILE_LATENT_FRAMES` floor makes a sub-8-latent-frame
         // temporal tile unselectable at any budget, and memory pressure is relieved on the **spatial**
         // axis instead — which is affordable precisely because sc-5690 verified `tile_decode_accumulate`
         // reconstructs a combined spatial+temporal plan exactly on the real z16 VAE at this geometry,
@@ -635,7 +644,7 @@ pub fn generate(
         let out_frames = (seg_end - seg_start) as i32;
         let video = {
             // `Err` is the catchable over-budget signal (raised before the decode, not as a SIGKILL).
-            let cfg = auto_tiling_budgeted_z16(th as i32, tw as i32, out_frames)?;
+            let cfg = decode_tiling(th as i32, tw as i32, out_frames)?;
             match cfg.as_ref() {
                 // [1,3,T_out,H,W]; `decode_tiled` also falls back to a single pass if it doesn't tile.
                 Some(cfg) => vae.decode_tiled(&z, cfg, Some(cancel))?,
@@ -746,5 +755,19 @@ mod tests {
         // short-clip job must not be newly rejected over fields it doesn't use.
         validate_segment_params(13, 81, 81).expect("single-window job ignores window params");
         validate_segment_params(10, 10, 3).expect("total == segment_len is single-window");
+    }
+
+    /// sc-15445: SCAIL-2 shares Krea's half-tile quality policy, not Wan's restored product overlap.
+    #[test]
+    fn decode_tiling_retains_scail2s_half_tile_overlap() {
+        std::env::set_var("WAN_VAE_BUDGET_GIB", "10");
+        let cfg = decode_tiling(384, 640, 84)
+            .unwrap()
+            .expect("the measured SCAIL-2 row must tile at 10 GiB");
+        std::env::remove_var("WAN_VAE_BUDGET_GIB");
+        assert_eq!(
+            cfg.temporal.map(|t| (t.tile_frames, t.overlap_frames)),
+            Some((32, 16)),
+        );
     }
 }

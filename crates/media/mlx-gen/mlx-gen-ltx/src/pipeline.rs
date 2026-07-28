@@ -280,6 +280,7 @@ fn plan_ltx_tiling(
         spatial_px: &LTX_VAE_SPATIAL_PX,
         spatial_overlap_px: 64,
         temporal: &LTX_VAE_TEMPORAL_FR,
+        temporal_overlap_policy: mlx_gen::tiling::TemporalOverlapPolicy::HalfTile,
     };
     budgeted_plan(
         VaeTiling::LTX,

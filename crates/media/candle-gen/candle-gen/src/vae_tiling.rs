@@ -31,6 +31,8 @@
 
 use candle_core::{Error, Result, Tensor};
 
+#[cfg(test)]
+use gen_core::tiling::TemporalOverlapPolicy;
 use gen_core::tiling::{
     budgeted_plan, TileCandidates, TilePlan, TilingBudgetError, TilingConfig, VaeTiling,
 };
@@ -386,6 +388,7 @@ mod tests {
             spatial_px: &PX,
             spatial_overlap_px: 32,
             temporal: &FR,
+            temporal_overlap_policy: TemporalOverlapPolicy::HalfTile,
         };
 
         // This test is about the MEMORY selector, so use a VAE narrow enough that the write bound
