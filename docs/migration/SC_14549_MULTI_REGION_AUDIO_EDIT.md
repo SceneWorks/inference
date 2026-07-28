@@ -102,6 +102,29 @@ region one:
 `every_region_is_floored_not_just_the_first` at the region-TWO assertion (`left: None`,
 `right: Some("conditioning.audio_edit_regions.regions.start_secs")`) and at nothing else.
 
+### The refusal names which region
+
+`first_nonfinite_float` returns a `&'static str` key, so its multi-region arm can only report
+`conditioning.audio_edit_regions.regions.start_secs` — with no index. An earlier revision recorded
+that as acceptable on the grounds that `Capabilities::validate_request` messages do name the index.
+**That was true for range violations only.** The two indexed guards are `r.start_secs < 0.0` and
+`end <= r.start_secs`, and **both evaluate `false` for NaN** — so a non-finite bound never reached
+an indexed message. For the exact failure mode this whole gate exists to close, the caller of a
+ten-region repaint was told a region was malformed but not which one.
+
+`validate_request` therefore runs an **indexed** finiteness pass over `regions`, returning
+`Error::Msg` naming `region {i}`. It sits **before** `req.ensure_finite_floats()?` because that call
+returns on the first non-finite float anywhere in the request; placed after it, the indexed loop
+would be unreachable. No public signature changes.
+
+`ensure_finite_floats` stays intact as the backstop, and both layers are load-bearing: providers
+with a bespoke `validate` (flux1's IP-Adapter carve-out, `mlx-gen-flux`) call it directly without
+ever entering `validate_request`. This is defence in depth, not a replacement.
+
+**Mutation-verified**: deleting the indexed pass fails
+`a_non_finite_region_bound_is_reported_with_its_index` — the request is still rejected, by the
+index-free backstop, but the message no longer names `region 1`.
+
 ## The testkit gate, and why it is shaped that way
 
 `check_multi_region_audio_edit` joins `audio_conformance` (now 12 checks). A provider that does not

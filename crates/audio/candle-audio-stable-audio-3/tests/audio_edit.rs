@@ -2736,9 +2736,13 @@ fn real_multi_region_inpaint_regenerates_every_span_in_one_pass() {
 
 /// Floor for each window's source divergence, as a fraction of that window's own source energy.
 ///
-/// Set **after** the measurement, from the low end of the measured spread, in the same way and for
-/// the same reason as `CONDITIONING_DIVERGENCE_FLOOR`: the first attempt on sc-14548 used a number
-/// picked before any measurement and failed a checkpoint that was working correctly.
+/// **Inherited, not measured.** The value is carried verbatim from sc-14548's single-region floors,
+/// which *were* set after a measurement — but a measurement of a different quantity, on a different
+/// geometry. No multi-region measurement exists: the local real-weight run produced no numbers, so
+/// `0.08` is **unvalidated for multi-region** until the real-weight lane reports. If it fails there,
+/// re-derive it the way sc-14548 did — from the **low** mode of the measured spread — rather than
+/// nudging it to whatever makes the run pass. That hazard is sc-14548's own: its first attempt used
+/// a number picked before any measurement and failed a checkpoint that was working correctly.
 ///
 /// This measurement is deliberately **not** the gate against a dropped region two — it is
 /// wrong-signed for that, exactly as sc-14548's `source_divergence` was: a window left unedited is

@@ -1790,6 +1790,41 @@ impl Capabilities {
         // passes `x > 1.0`-style checks silently). The finiteness guard is centralized on the request
         // so every `Option<f32>` knob — including ones added after F-053 — inherits it by construction
         // (F-053 / F-001). `id`-prefixing is dropped from the message here; the field name is enough.
+        //
+        // Multi-region bounds get an **indexed** pass first (sc-14549). `first_nonfinite_float`
+        // returns a `&'static str` key, so the multi-region arm can only say
+        // `conditioning.audio_edit_regions.regions.start_secs` — it cannot say *which* region. That
+        // is precisely the failure mode the `Vec`-defeats-the-destructure gate exists to close, and
+        // the caller of a ten-region repaint needs the index to act on the message. The two
+        // range guards further down (`start < 0`, `end <= start`) do name the index but never see a
+        // NaN: both comparisons evaluate `false` for NaN, so without this pass a non-finite bound is
+        // caught only by the index-free key below.
+        //
+        // It runs **before** `ensure_finite_floats` because that call returns on the first
+        // non-finite float anywhere in the request; placed after it, this loop would be
+        // unreachable. `ensure_finite_floats` stays intact as the backstop — it is what providers
+        // with a bespoke `validate` (flux1's IP-Adapter carve-out, mlx-gen-flux) call directly
+        // without ever entering `validate_request`, so both layers are load-bearing.
+        for c in &req.conditioning {
+            if let Conditioning::AudioEditRegions { regions, .. } = c {
+                for (i, r) in regions.iter().enumerate() {
+                    if !r.start_secs.is_finite() {
+                        return Err(Error::Msg(format!(
+                            "{id}: multi-region audio edit region {i} start must be finite (got {})",
+                            r.start_secs
+                        )));
+                    }
+                    if let Some(end) = r.end_secs {
+                        if !end.is_finite() {
+                            return Err(Error::Msg(format!(
+                                "{id}: multi-region audio edit region {i} end must be finite (got \
+                                 {end})"
+                            )));
+                        }
+                    }
+                }
+            }
+        }
         req.ensure_finite_floats()?;
         if let Some(s) = &req.sampler {
             if !self.samplers.contains(&s.as_str()) {
@@ -1862,8 +1897,12 @@ impl Capabilities {
         // `audio_edit_modes` surface the single-region path uses rather than introducing a second
         // one to drift from it.
         //
-        // Region-bound finiteness is enforced by `ensure_finite_floats` above — for **every**
-        // region, not just the first. Clip-bound and latent-collapse checks stay with the provider.
+        // Region-bound finiteness is enforced above — for **every** region, not just the first — by
+        // the indexed pass that precedes `ensure_finite_floats`, with `ensure_finite_floats` itself
+        // as the backstop for callers that bypass `validate_request`. The two range guards below
+        // therefore only ever see finite bounds, which is what makes `start < 0` and `end <= start`
+        // safe to write as plain comparisons. Clip-bound and latent-collapse checks stay with the
+        // provider.
         for c in &req.conditioning {
             if let Conditioning::AudioEditRegions { mode, regions, .. } = c {
                 if !self.audio_edit_modes.contains(mode) {
@@ -3445,6 +3484,87 @@ mod tests {
         );
         assert_eq!(ok.first_nonfinite_float(), None);
         assert!(c.validate_request("m", &ok).is_ok());
+    }
+
+    /// The non-finite refusal must name **which** region is malformed.
+    ///
+    /// `first_nonfinite_float` keys are `&'static str`, so its multi-region arm can only report
+    /// `…regions.start_secs` with no index — and the two range guards that *do* carry an index
+    /// (`start < 0`, `end <= start`) never fire on a NaN, because both comparisons evaluate `false`
+    /// for NaN. Without the indexed pass in `validate_request` the caller of a ten-region repaint is
+    /// told a region is malformed but not which one. The bad value sits in region **two** so a guard
+    /// that reached only `regions[0]` fails here.
+    #[test]
+    fn a_non_finite_region_bound_is_reported_with_its_index() {
+        let c = multi_edit_caps();
+        let good = span(2.0, 6.0);
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            // Non-finite START in region TWO (index 1).
+            let err = c
+                .validate_request(
+                    "m",
+                    &multi_edit_req(
+                        AudioEditMode::Repaint,
+                        vec![
+                            good,
+                            TimeRegion {
+                                start_secs: bad,
+                                end_secs: Some(18.0),
+                            },
+                        ],
+                    ),
+                )
+                .unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                matches!(err, Error::Msg(_)) && msg.contains("region 1") && msg.contains("start"),
+                "a non-finite start in region TWO must name `region 1`, got {msg:?} ({bad})"
+            );
+
+            // Non-finite END in region THREE (index 2), so the message is not merely reporting a
+            // constant index — and so the pass is not checking only "the second one".
+            let err = c
+                .validate_request(
+                    "m",
+                    &multi_edit_req(
+                        AudioEditMode::Repaint,
+                        vec![
+                            good,
+                            span(8.0, 10.0),
+                            TimeRegion {
+                                start_secs: 14.0,
+                                end_secs: Some(bad),
+                            },
+                        ],
+                    ),
+                )
+                .unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                matches!(err, Error::Msg(_)) && msg.contains("region 2") && msg.contains("end"),
+                "a non-finite end in region THREE must name `region 2`, got {msg:?} ({bad})"
+            );
+        }
+        // Discrimination: a well-formed multi-region request produces no error at all, so the
+        // assertions above are not firing on everything. And the *index-free* backstop is still
+        // wired — a bespoke provider that calls `ensure_finite_floats` directly (never entering
+        // `validate_request`) still rejects the same request.
+        let ok = multi_edit_req(AudioEditMode::Repaint, vec![good, span(8.0, 10.0)]);
+        assert!(c.validate_request("m", &ok).is_ok());
+        let nan_req = multi_edit_req(
+            AudioEditMode::Repaint,
+            vec![
+                good,
+                TimeRegion {
+                    start_secs: f32::NAN,
+                    end_secs: Some(18.0),
+                },
+            ],
+        );
+        assert!(
+            nan_req.ensure_finite_floats().is_err(),
+            "the index-free floor stays the backstop for callers that bypass validate_request"
+        );
     }
 
     /// Malformed ranges are gated on **every** region, again with the bad value in region two.
