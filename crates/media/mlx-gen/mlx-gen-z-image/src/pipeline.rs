@@ -523,6 +523,27 @@ pub(crate) fn decode_tiling(req: &GenerationRequest, is_sequential: bool) -> Opt
         .then(|| TilingConfig::spatial_only(512, 64))
 }
 
+/// Request-local, calibration-only fault injection at a physical phase boundary (SC-15449's
+/// [`GenerationMemory::calibration_error_phase`](mlx_gen::gen_core::GenerationMemory), the MLX twin of
+/// `candle_gen_krea`'s `maybe_inject_calibration_error`).
+///
+/// This is what lets the cross-backend conformance harness verify the story's **cleanup on error**
+/// requirement the same way it verifies cancellation: fail deterministically at a named boundary, then
+/// assert the next request is unaffected. Production selectors leave the field `None` (the default),
+/// so every ordinary request is untouched — the check is a `None` comparison.
+pub(crate) fn calibration_fault(
+    req: &GenerationRequest,
+    phase: mlx_gen::gen_core::ImageMemoryPhase,
+    id: &str,
+) -> Result<()> {
+    match req.memory {
+        Some(memory) if memory.calibration_error_phase == Some(phase) => Err(Error::Msg(format!(
+            "{id}: injected image-memory calibration error at {phase:?}"
+        ))),
+        _ => Ok(()),
+    }
+}
+
 /// The attention rung for one request (SC-15615, ladder rung 3).
 ///
 /// [`GenerationMemory::chunk_attention`] is the shared selector's rung-3 signal; the exact score
@@ -716,6 +737,56 @@ mod tests {
             "the executed tile geometry must match the contract's advertised candidates"
         );
         assert!(tiled.temporal.is_none(), "z-image decode is spatial-only");
+    }
+
+    /// Calibration fault injection is inert unless a request explicitly names a phase, and fires at
+    /// exactly the named one. This is the hook the conformance harness uses to verify the story's
+    /// **cleanup on error** requirement.
+    #[test]
+    fn calibration_faults_fire_only_at_the_named_phase() {
+        use mlx_gen::gen_core::{GenerationMemory, ImageMemoryPhase};
+
+        const PHASES: [ImageMemoryPhase; 3] = [
+            ImageMemoryPhase::Conditioning,
+            ImageMemoryPhase::Denoise,
+            ImageMemoryPhase::Decode,
+        ];
+
+        // No memory block, and a memory block with no named phase: every boundary passes.
+        for memory in [None, Some(GenerationMemory::default())] {
+            let r = req(1024, 1024, memory);
+            for phase in PHASES {
+                calibration_fault(&r, phase, "z_image_turbo").unwrap();
+            }
+        }
+
+        // A named phase fails at that phase and only that phase.
+        for named in PHASES {
+            let r = req(
+                1024,
+                1024,
+                Some(GenerationMemory {
+                    calibration_error_phase: Some(named),
+                    ..Default::default()
+                }),
+            );
+            for phase in PHASES {
+                let result = calibration_fault(&r, phase, "z_image_turbo");
+                if phase == named {
+                    let err = result.unwrap_err().to_string();
+                    assert!(
+                        err.contains("injected image-memory calibration error"),
+                        "{err}"
+                    );
+                    assert!(err.contains(&format!("{named:?}")), "{err}");
+                    assert!(err.contains("z_image_turbo"), "{err}");
+                } else {
+                    result.unwrap_or_else(|e| {
+                        panic!("fault named at {named:?} must not fire at {phase:?}: {e}")
+                    });
+                }
+            }
+        }
     }
 
     /// The rung-3 request knob maps onto exactly one budget, and nothing else engages it.

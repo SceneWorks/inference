@@ -375,6 +375,13 @@ impl ZImageTurboControl {
             // cap (txt2img) + f32 control_context below. (img2img keeps f32 cap, mirroring the base
             // img2img; the DiT promotes per-op either way.)
             |text_encoder: &TextEncoder| {
+                // Calibration-only fault injection at a physical phase boundary (SC-15449);
+                // `None` for every production request, so this is a `None` comparison.
+                pipeline::calibration_fault(
+                    req,
+                    mlx_gen::gen_core::ImageMemoryPhase::Conditioning,
+                    MODEL_ID,
+                )?;
                 let cap =
                     pipeline::encode_prompt(&self.tokenizer, text_encoder, &req.prompt, MODEL_ID)?;
                 if is_img2img {
@@ -390,6 +397,11 @@ impl ZImageTurboControl {
             |cap| Ok(mlx_rs::transforms::eval([cap])?),
             // ── Phase B (denoise): heavy bundle + cap → evaluated latents.
             |heavy: &ZImageControlHeavyOwned, cap, on_progress| {
+                pipeline::calibration_fault(
+                    req,
+                    mlx_gen::gen_core::ImageMemoryPhase::Denoise,
+                    MODEL_ID,
+                )?;
                 // Static shift=3.0 schedule (shared with the base turbo, sc-2536) — build once. An
                 // unset `req.scheduler` keeps it byte-exact (epic 7114 N1); a curated name re-shapes σ
                 // over the shift.
@@ -448,6 +460,11 @@ impl ZImageTurboControl {
             // ── Phase C (decode): light (VAE) view + latents → images (no PiD on control). Tiled under
             // `Sequential`.
             |view, latents, on_progress| {
+                pipeline::calibration_fault(
+                    req,
+                    mlx_gen::gen_core::ImageMemoryPhase::Decode,
+                    MODEL_ID,
+                )?;
                 let images = pipeline::decode_batch(
                     view.vae,
                     None,

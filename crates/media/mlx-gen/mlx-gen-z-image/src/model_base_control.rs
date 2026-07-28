@@ -218,6 +218,13 @@ impl ZImageControl {
             // weights. The control branch's f32 mixed-precision flow (sc-2720) is preserved inside the
             // denoise closure regardless.
             |text_encoder: &TextEncoder| {
+                // Calibration-only fault injection at a physical phase boundary (SC-15449);
+                // `None` for every production request, so this is a `None` comparison.
+                pipeline::calibration_fault(
+                    req,
+                    mlx_gen::gen_core::ImageMemoryPhase::Conditioning,
+                    MODEL_ID,
+                )?;
                 let cap =
                     pipeline::encode_prompt(&self.tokenizer, text_encoder, &req.prompt, MODEL_ID)?;
                 // Uncond conditioning = the negative prompt (empty string when unset), encoded only
@@ -240,6 +247,11 @@ impl ZImageControl {
             },
             // ── Phase B (denoise): heavy bundle + (cap, neg_cap) → evaluated latents.
             |heavy: &ZImageControlHeavyOwned, (cap, neg_cap), on_progress| {
+                pipeline::calibration_fault(
+                    req,
+                    mlx_gen::gen_core::ImageMemoryPhase::Denoise,
+                    MODEL_ID,
+                )?;
                 // Static shift=6.0 schedule (the base model's scheduler_config.json) — build once. An
                 // unset `req.scheduler` keeps it byte-exact (epic 7114 N1); a curated name re-shapes σ
                 // over shift=6.0.
@@ -303,6 +315,11 @@ impl ZImageControl {
             // ── Phase C (decode): light (VAE) view + latents → images (no PiD on control). Tiled under
             // `Sequential`.
             |view, latents, on_progress| {
+                pipeline::calibration_fault(
+                    req,
+                    mlx_gen::gen_core::ImageMemoryPhase::Decode,
+                    MODEL_ID,
+                )?;
                 let images = pipeline::decode_batch(
                     view.vae,
                     None,

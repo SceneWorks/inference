@@ -236,6 +236,13 @@ impl ZImage {
             // Turbo there is no bf16 seed-parity golden to match, so keep the conditioning at the text
             // encoder's native precision and let the DiT promote per-op against the bf16 weights.
             |text_encoder: &TextEncoder| {
+                // Calibration-only fault injection at a physical phase boundary (SC-15449);
+                // `None` for every production request, so this is a `None` comparison.
+                pipeline::calibration_fault(
+                    req,
+                    mlx_gen::gen_core::ImageMemoryPhase::Conditioning,
+                    MODEL_ID,
+                )?;
                 let cap =
                     pipeline::encode_prompt(&self.tokenizer, text_encoder, &req.prompt, MODEL_ID)?;
                 // Uncond conditioning = the negative prompt (empty string when unset), encoded only
@@ -261,6 +268,11 @@ impl ZImage {
             },
             // ── Phase B (denoise): heavy bundle + (cap, neg_cap) → (evaluated latents, PiD decoder).
             |heavy: &ZImageHeavyOwned, (cap, neg_cap), on_progress| {
+                pipeline::calibration_fault(
+                    req,
+                    mlx_gen::gen_core::ImageMemoryPhase::Denoise,
+                    MODEL_ID,
+                )?;
                 // Static shift=6.0 schedule (the base model's scheduler_config.json) — build once. An
                 // unset `req.scheduler` keeps it byte-exact (epic 7114 N1); a curated name re-shapes σ
                 // over `shift=6.0`.
@@ -334,6 +346,11 @@ impl ZImage {
             |mid| Ok(mlx_rs::transforms::eval(mid.0.iter())?),
             // ── Phase C (decode): light (VAE) view + latents → images. Tiled under `Sequential`.
             |view, (latents, pid_decoder), on_progress| {
+                pipeline::calibration_fault(
+                    req,
+                    mlx_gen::gen_core::ImageMemoryPhase::Decode,
+                    MODEL_ID,
+                )?;
                 let images = pipeline::decode_batch(
                     view.vae,
                     pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder),

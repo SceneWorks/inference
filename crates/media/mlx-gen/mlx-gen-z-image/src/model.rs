@@ -510,6 +510,13 @@ impl ZImageTurbo {
             // round the text embeddings to bf16 to match the fork's golden; f32 is sharper — flip to
             // f32 once parity is not the goal.
             |text_encoder: &TextEncoder| {
+                // Calibration-only fault injection at a physical phase boundary (SC-15449);
+                // `None` for every production request, so this is a `None` comparison.
+                pipeline::calibration_fault(
+                    req,
+                    mlx_gen::gen_core::ImageMemoryPhase::Conditioning,
+                    MODEL_ID,
+                )?;
                 let cap =
                     pipeline::encode_prompt(&self.tokenizer, text_encoder, &req.prompt, MODEL_ID)?;
                 if is_img2img {
@@ -524,6 +531,11 @@ impl ZImageTurbo {
             // ── Phase B (denoise): heavy bundle + cap → (evaluated latents, minted PiD decoder). The
             // PiD decoder is minted here (owned, no borrow of `heavy.pid`) so it survives the shed.
             |heavy: &ZImageHeavyOwned, cap, on_progress| {
+                pipeline::calibration_fault(
+                    req,
+                    mlx_gen::gen_core::ImageMemoryPhase::Denoise,
+                    MODEL_ID,
+                )?;
                 // Static shift=3.0 schedule (the model's scheduler_config.json), resolution- and
                 // seed-independent. An unset `req.scheduler` keeps this native schedule byte-exact
                 // (epic 7114 N1); a curated name re-shapes the σ schedule over the same `shift=3.0`.
@@ -590,6 +602,11 @@ impl ZImageTurbo {
             },
             // ── Phase C (decode): light (VAE) view + latents → images. Tiled under `Sequential`.
             |view, (latents, pid_decoder), on_progress| {
+                pipeline::calibration_fault(
+                    req,
+                    mlx_gen::gen_core::ImageMemoryPhase::Decode,
+                    MODEL_ID,
+                )?;
                 let images = pipeline::decode_batch(
                     view.vae,
                     pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder),

@@ -41,6 +41,9 @@
 //!    Mac", with its host disclosure.
 //! 5. [`a_canceled_run_leaves_no_resident_cache`] — a cancel mid-denoise with the budget engaged must
 //!    not leave the next request worse off.
+//! 6. [`an_errored_run_at_any_phase_leaves_no_resident_cache`] — the same for the *error* half of the
+//!    story's "cleanup on error", driven through the calibration harness's phase-boundary fault
+//!    injection at each of the three physical boundaries.
 //!
 //! Every number printed here is what the story's evidence quotes; nothing is asserted as a saving
 //! that was not measured.
@@ -522,4 +525,82 @@ fn a_canceled_run_leaves_no_resident_cache() {
         after_cancel as f64 / GIB,
         after_success as f64 / GIB
     );
+}
+
+/// The error half of "per-chunk cancellation checks and **cleanup on error**".
+///
+/// Uses the shared contract's calibration fault injection
+/// (`GenerationMemory::calibration_error_phase`) to fail deterministically at each physical phase
+/// boundary in turn, then asserts the next request on the same warm generator is unaffected. Compared
+/// against a *warm second run after a success*, for the same reason as the cancel test: a warm run
+/// legitimately peaks a little above a cold one, and comparing against cold would blame that on the
+/// fault.
+#[test]
+#[ignore = "needs a real Z-Image-Turbo snapshot + Apple/Metal GPU"]
+fn an_errored_run_at_any_phase_leaves_no_resident_cache() {
+    use mlx_gen::gen_core::ImageMemoryPhase;
+
+    /// Peak of a warm second generation whose first generation either completed or failed at `fault`.
+    fn warm_second_run_peak(fault: Option<ImageMemoryPhase>) -> usize {
+        let generator = mlx_gen_z_image::load(&spec()).expect("load z_image_turbo");
+
+        let mut first = request(bounded());
+        if let Some(phase) = fault {
+            first.memory.as_mut().unwrap().calibration_error_phase = Some(phase);
+        }
+        let outcome = generator.generate(&first, &mut |_| {});
+        match (fault, outcome) {
+            (Some(phase), Err(err)) => {
+                let text = err.to_string();
+                assert!(
+                    text.contains("injected image-memory calibration error"),
+                    "{phase:?}: unexpected error {text}"
+                );
+                println!("  {phase:?} arm first run: {text}");
+            }
+            (Some(phase), Ok(_)) => {
+                panic!(
+                    "the injected fault at {phase:?} did not fire — the harness cannot verify \
+                        cleanup on error for this provider"
+                )
+            }
+            (None, outcome) => {
+                outcome.expect("the control arm's first run must succeed");
+            }
+        }
+
+        clear_cache();
+        reset_peak_memory();
+        let out = generator
+            .generate(&request(bounded()), &mut |_| {})
+            .expect("the warm follow-up after a fault must succeed");
+        let peak = get_peak_memory();
+        assert!(matches!(out, GenerationOutput::Images(ref v) if v.len() == 1));
+        drop(generator);
+        clear_cache();
+        peak
+    }
+
+    let after_success = warm_second_run_peak(None);
+    for phase in [
+        ImageMemoryPhase::Conditioning,
+        ImageMemoryPhase::Denoise,
+        ImageMemoryPhase::Decode,
+    ] {
+        let after_error = warm_second_run_peak(Some(phase));
+        println!(
+            "SC-15615 warm second-run peak after a {phase:?} fault: {:.3} GiB vs {:.3} GiB after a \
+             success ({:+.1}%)",
+            after_error as f64 / GIB,
+            after_success as f64 / GIB,
+            100.0 * (after_error as f64 - after_success as f64) / after_success as f64
+        );
+        assert!(
+            after_error as f64 <= after_success as f64 * 1.02,
+            "a request following a {phase:?} FAULT peaked {:.3} GiB vs {:.3} GiB following a \
+             success — the errored run left resident state behind",
+            after_error as f64 / GIB,
+            after_success as f64 / GIB
+        );
+    }
 }
