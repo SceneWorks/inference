@@ -558,50 +558,88 @@ pub struct TilePlan {
 /// clipping metric is indistinguishable from the reference there, which is why the floor is 8 and not
 /// 4 (4 still blows out 12.9 % of a worst frame).
 ///
-/// ## How it is enforced
+/// ## How it is enforced — and what is actually doing the work
 ///
 /// [`budgeted_plan`] refuses any temporal candidate spanning fewer than this many latent frames, so a
-/// too-short tile is never *selectable*. Consumers that used to size a window from their own budget
-/// (`mlx-gen-krea-realtime`, `mlx-gen-scail2`) now go through the same selector rather than computing
-/// a tile themselves.
+/// too-short tile is never *selectable*.
 ///
-/// ## ⚠️ The z16 collapse is NOT universal — LTX was measured and is CLEARED
+/// ⚠️ **For the Wan z16/z48 grids this floor is, today, a no-op.** Floor-on vs floor-off selects an
+/// identical tile in every cell of a 6-bucket × 4-frame-count × 5-budget sweep: the shipped z16
+/// candidate grid bottoms out at a latent-8 tile anyway, and the largest-volume search reaches for it
+/// first. **The change that actually fixed sc-15325 is that `mlx-gen-krea-realtime` and
+/// `mlx-gen-scail2` now call this selector at all** — both previously sized a temporal-only window
+/// from their own local px·frame budget and never saw these candidates. The floor is *prospective
+/// insurance*: it makes the starved window unreachable by a future budget tweak, a new candidate
+/// entry, or a cheaper cost model. Do not "simplify" the engine routing back to a locally-computed
+/// window on the belief that the floor is what protects the picture — it is not; the routing is.
+///
+/// Where the floor is not a no-op is LTX, whose grid does carry latent-3 and latent-6 entries (below),
+/// and any future family whose grid does the same.
+///
+/// ## ⚠️ The z16 collapse is not known to be universal — LTX was cleared EMPIRICALLY, not explained
 ///
 /// This constant is deliberately VAE-neutral, but the evidence behind it is z16's. **LTX was measured
-/// separately (`mlx-gen-ltx`'s `ltx_tiled_decode_tracks_single_pass`) and does not share the defect**:
-/// at a latent tile of **3** it is 1.73/255 from single-pass with **0.00 %** highlight clipping, where
-/// z16 at latent 2 is 24.4/255 with 30.8 % worst-frame clipping. LTX degrades gracefully — its
-/// temporal tiling is causal, so each tile is handed a preceding context frame, and at ×8 temporal
-/// scale a 3-latent-frame tile is still 17 output frames of receptive field.
+/// separately (`mlx-gen-ltx`'s `ltx_tiled_decode_tracks_single_pass`) and did not reproduce the
+/// defect** at the bucket that was measured: at a latent tile of **3** it is 1.73/255 from single-pass
+/// with **0.00 %** highlight clipping, where z16 at latent 2 is 24.4/255 with 30.8 % worst-frame
+/// clipping.
 ///
-/// The floor is applied to LTX anyway, but on a **cost/benefit** argument rather than a correctness
-/// one: latent 3 → 8 is 6.6× less error (1.73 → 0.26 /255) for 17 % more decode peak (7.34 →
-/// 8.57 GiB). Do not read a red `budgeted_never_selects_a_starved_temporal_tile` on a *new* VAE family
-/// as proof that family is corrupt — measure it the way LTX was measured before concluding anything,
-/// and if a family turns out to tolerate short tiles *and* the memory matters there, that is a
-/// legitimate reason to make the floor per-VAE.
+/// **The mechanism is unexplained, and the obvious candidate explanation is wrong.** It is tempting to
+/// credit LTX's *causal* temporal tiling (each tile is handed a preceding context frame). That cannot
+/// be the reason: `causal_temporal` is also `true` for [`VaeTiling::WAN22`] (z48, shipping), so a
+/// causal-VAE explanation would predict z48 is equally immune — which nobody has measured. Worse,
+/// z16's `4/2` row (6.4/255) has the *same effective context* as an LTX interior tile (4 latent
+/// frames, 1 overlap + 1 causal), yet LTX reads 1.73/255 there: a **3.7× gap at matched context** that
+/// no context-counting argument explains. Something else — decoder depth, channel width, the ×8 vs ×4
+/// temporal scale, the latent distribution itself — is responsible, and it has not been identified.
+///
+/// The verdict is also narrower than "LTX is fine". It was cleared at **one** bucket (640×384 × 89
+/// frames, q8, a smooth source) which **never tiles in production**: a single pass there peaks
+/// ~10 GiB, so this selector returns `Ok(None)` at any realistic budget and the test has to force the
+/// config by hand. That source's channel amplitudes (0.70/0.70/0.60 on [−1, 1]) also never approach
+/// the 0.9608 clip threshold, so LTX's "0.00 % clipping" is partly *structural* rather than purely a
+/// property of the decode. Read the LTX result as: **cleared empirically at one low-dynamic-range
+/// bucket, mechanism unknown — and post-fix it cannot reach the starved candidates anyway.**
+///
+/// The floor is applied to LTX on a **cost/benefit** argument rather than a correctness one: latent
+/// 3 → 8 is 6.6× less error (1.73 → 0.26 /255) for 17 % more decode peak (7.34 → 8.57 GiB). Do not
+/// read a red `budgeted_never_selects_a_starved_temporal_tile` on a *new* VAE family as proof that
+/// family is corrupt — measure it the way LTX was measured before concluding anything, and if a family
+/// turns out to tolerate short tiles *and* the memory matters there, that is a legitimate reason to
+/// make the floor per-VAE. Equally, do not treat "LTX was fine" as evidence that some *other* causal
+/// VAE is safe: that is exactly the inference shown above not to hold.
 ///
 /// ## Why this is affordable — the spatial axis is nearly free, the temporal axis is not
 ///
 /// A latent-8 temporal tile costs 76 GiB full-frame at 832×480, which is why the earlier analysis
 /// treated it as a memory trade. It is not: the receptive-field problem is **temporal**, and the
 /// memory can be bought back **spatially** at almost no quality cost. Same VAE, same clip, same latent
-/// tile 8 / overlap 4, varying only the spatial tile (measured, `mlx-gen-krea-realtime`'s
-/// `decode_policy_matches_single_pass_at_the_old_memory_peak`):
+/// tile 8 / overlap 4, varying only the spatial tile — measured on **real generated Krea latents** by
+/// `mlx-gen-krea-realtime`'s `decode_tiling_sweep_against_single_pass` (832×480, 36 output frames):
 ///
-/// | spatial tile | latent px per tile | mean abs err vs single-pass | MLX active peak |
-/// |---|---|---|---|
-/// | none (full frame) | 104 × 60 | 2.34 /255 | 76.3 GiB |
-/// | 448 px | 56 | 2.37 | 39.1 GiB |
-/// | 320 px | 40 | 2.38 | 20.6 GiB |
-/// | 256 px | 32 | 2.41 | 13.5 GiB |
-/// | 192 px | 24 | 2.44 | 8.0 GiB |
+/// | spatial tile | latent px per tile | mean abs err vs single-pass | per-**column** mean abs err | clipping mean / worst | MLX active peak |
+/// |---|---|---|---|---|---|
+/// | none (full frame) | 104 × 60 | 1.954 /255 | 1.629 … 2.440 | 0.14 % / 1.05 % | 75.77 GiB |
+/// | 448 px | 56 | 2.021 | 1.696 … 2.505 | 0.14 % / 1.04 % | 38.57 GiB |
+/// | 320 px | 40 | 2.054 | 1.719 … 2.531 | 0.13 % / 1.04 % | 20.08 GiB |
+/// | 256 px | 32 | 2.075 | 1.735 … 2.579 | 0.13 % / 1.04 % | 12.99 GiB |
+/// | 192 px | 24 | 2.121 | 1.769 … 2.630 | 0.13 % / 1.02 % | 7.49 GiB |
 ///
-/// **A 9.6× memory reduction costs 0.10/255**, and the highlight clipping is 0.00 % at every row. The
-/// two axes are not comparable: halving the latent *temporal* tile costs 67-70 % more error, while
-/// shrinking the spatial tile 4× costs 4 %. At ×8 spatial scale even the smallest 192 px candidate is
-/// 24 latent px per tile with an 8-latent-px overlap — an order of magnitude more context per axis
-/// than the 2 latent frames the pre-fix temporal window allowed.
+/// **A 10.1× memory reduction costs 0.17/255**, and highlight clipping is flat-to-improving on every
+/// row. The two axes are not comparable: halving the latent *temporal* tile costs 67-70 % more error,
+/// while shrinking the spatial tile 4.3× costs 8 %. At ×8 spatial scale even the smallest 192 px
+/// candidate is 24 latent px per tile with an 8-latent-px overlap — an order of magnitude more context
+/// per axis than the 2 latent frames the pre-fix temporal window allowed.
+///
+/// The **per-column** column is what rules out a seam, and it is why this table is measured on real
+/// latents rather than on a band-limited synthetic source. (It previously cited a smooth-sinusoid
+/// stimulus, which structurally cannot show either a spatial seam or a starved spatial receptive
+/// field — it had essentially no energy above DC. The conclusion survived the change of stimulus; the
+/// evidence had to.) A whole-frame mean averages a tile boundary away; the per-column mean does not.
+/// Across the whole sweep the per-column error just *shifts* — the floor rises 1.629 → 1.769 as the
+/// ceiling rises 2.440 → 2.630 — with **no spike at the tile stride**: the 192 px row's worst column
+/// is 1.24× its own clip mean. Spatial tiling costs a little error everywhere, not a lot in a few
+/// columns.
 pub const MIN_TEMPORAL_TILE_LATENT_FRAMES: i32 = 8;
 
 /// The minimum temporal **overlap**, in *latent* frames, stamped onto a selected temporal tile
@@ -609,6 +647,37 @@ pub const MIN_TEMPORAL_TILE_LATENT_FRAMES: i32 = 8;
 /// `eval`s per tile, so the peak is one tile's transient plus the output accumulators and the overlap
 /// enters neither — a shorter stride is more passes (wall time), not a bigger graph. So there is no
 /// reason to buy a large tile and leave the blend at one latent frame.
+///
+/// ## ⚠️ This raise is a separate change from the tile-size fix — here is its bound
+///
+/// sc-15325's defect was tile *size*. Raising the overlap is a distinct, **beneficial but
+/// independently-motivated** change that rides along on it, and it touches two already-shipping
+/// engines (Wan z16 and z48). [`temporal_overlap_for`] raises every Wan candidate:
+/// `(96, 24) → (96, 48)` (stride 72 → 48), `(64, 24) → (64, 32)`, `(48, 16) → (48, 24)`,
+/// `(32, 8) → (32, 16)`. Two things bound the risk:
+///
+///  * **Memory and plan selection are provably unchanged.** Overlap enters neither `peak_cost` (whose
+///    tile term is `tile_f · tile_h · tile_w`) nor [`budgeted_plan`]'s selection key (`voxels`, the
+///    same product). It is stamped onto the winner *after* the search, so it cannot change which
+///    candidate wins or what that candidate peaks at.
+///  * **Wall time only.** More overlap is a shorter stride, i.e. more decode passes over the same
+///    output. Worst case is **1.5× the temporal decode passes** (a stride cut from 72 → 48 on a clip
+///    long enough to be dominated by interior tiles); at a realistic 81-frame clip it is **~1.25×**.
+///    That is a fraction of one decode, not of a generation.
+///
+/// On **accuracy** the raise is unambiguously positive: at latent tile 8, going 8/2 → 8/4 improves
+/// mean |Δ| against single-pass from **2.51 → 1.95 /255** on real Krea latents (and 2.956 → 2.221 on
+/// a higher-detail source). On **highlight clipping the direction is source-dependent**, which
+/// resolves the "clipping got worse at tile 8" note in the sc-15325 story: on a high-dynamic-range
+/// source it improves (0.76 %/2.09 % → 0.61 %/1.52 %), while on the smoother real-latent clip it moves
+/// slightly the other way (0.08 %/0.25 % → 0.14 %/1.05 %, against a 0.08 %/0.25 % single-pass
+/// reference). The story's note is therefore **reproducible but not general**, and either way the
+/// clipping stays within ~1 % of the single-pass floor — two orders of magnitude below the
+/// 9.7 %/26.6 % the starved latent-2 window produced. Tile *size* is what governs clipping; the
+/// overlap barely moves it in either direction.
+///
+/// Quantifying the wall-time cost on the shipping Wan buckets (rather than bounding it, as here) is
+/// tracked as **sc-15445**.
 pub const MIN_TEMPORAL_TILE_LATENT_OVERLAP: i32 = 2;
 
 /// The smallest **output**-frame temporal tile that satisfies [`MIN_TEMPORAL_TILE_LATENT_FRAMES`] for
@@ -1068,6 +1137,23 @@ mod tests {
     /// decode was silently WRONG. sc-12748: on 0.32.0 that single pass is now *correct* (conv is
     /// int64-safe), so this is defense-in-depth rather than a correctness necessity — but the selector
     /// still tiles past the cap (a cheap, always-correct default), which this pins.
+    ///
+    /// ## sc-15325 — a DELIBERATE loosening of what this asserts
+    ///
+    /// This test used to assert "the selector must tile the **TEMPORAL** axis past the cap". That is
+    /// no longer the right property and the change is intentional, not incidental. 720p's write cap is
+    /// 24 output frames = **6 latent frames**, which is *below*
+    /// [`MIN_TEMPORAL_TILE_LATENT_FRAMES`]: after sc-15325 there is no temporal tile that both
+    /// satisfies the receptive-field floor and relieves the write bound, so the only correct relief is
+    /// spatial. Asserting the axis would have forced a choice between the write bound and the
+    /// receptive field, which is a false trade — the bound is on the tile's *volume*
+    /// (`full_res_channels · tile_f · tile_h · tile_w`), and either axis satisfies it.
+    ///
+    /// So the assertion is now on the property that actually matters — **the selected tile is
+    /// writable** — and is deliberately silent on which axis paid for it. It is strictly stronger in
+    /// the sense that it checks the tile the caller will really materialise rather than a proxy for
+    /// it; it is weaker only about an axis whose choice is now a memory/quality decision, not a
+    /// correctness one.
     #[test]
     fn budgeted_tiles_past_the_write_bound_even_with_an_infinite_budget() {
         // Free memory: without the write bound this returns Ok(None) — a single pass — always.
@@ -1135,19 +1221,72 @@ mod tests {
 
     // --- sc-15325: the temporal receptive-field floor ---------------------------------------------
 
-    /// **The regression guard for sc-15325 at the shared seam.** A temporal tile spanning fewer than
-    /// `MIN_TEMPORAL_TILE_LATENT_FRAMES` latent frames must be unselectable *at any budget* — including
-    /// a budget so tight that the old selector would have reached for the smallest temporal tile it
-    /// had. Red on the pre-fix selector, which would happily return the latent-4 `(16, 4)` candidate
-    /// here (and, for the engines that bypassed this function entirely, a latent-2 window).
+    /// **The regression guard for sc-15325 at the shared seam** — at a geometry where the *pre-fix*
+    /// selector genuinely reaches the starved candidate.
+    ///
+    /// ⚠️ **Vacuity is the failure mode this guard has already had once.** Its first draft swept
+    /// 8–80 GiB at 512²×64, where the pre-fix largest-volume search picks `(32, …)` at *every* budget:
+    /// `(16, 4)` was never reachable, and `(32, 8)`'s latent overlap of 2 already satisfied the blend
+    /// floor. It therefore passed verbatim on pre-fix production code (reverting both changed lines in
+    /// [`budgeted_plan`] — the `t >= min_tile_frames` filter and the [`temporal_overlap_for`] map —
+    /// left the whole `tiling::` suite green). The budgets below are chosen so the pre-fix answer
+    /// differs in **every** row, and the post-fix answer is *pinned* rather than merely constrained,
+    /// so a revert cannot be green.
+    ///
+    /// With `lin_cost(4e-8, 4e-6)` at 512×512×64 the accumulator floor is 0.671 GiB and a tile costs
+    /// 4e-6 GiB per output voxel, which makes the three regimes exactly reachable:
+    ///
+    /// | safe GiB | pre-fix choice | post-fix choice (asserted) |
+    /// |---|---|---|
+    /// | 2.0 | spatial 128 + temporal `(16, 4)` → **latent 4** | `Err(SmallestTileExceedsBudget)` — refuse rather than starve |
+    /// | 2.9 | spatial 128 + temporal `(32, 8)` → latent 8 / **overlap 2** | spatial 128 + temporal `(32, 16)` → **overlap 4** |
+    /// | 5.0 | spatial 256 + temporal `(16, 4)` → **latent 4** | **spatial-only** 128 px — no temporal tiling at all |
+    ///
+    /// Row 3 is the shape of the whole fix: memory pressure that used to be relieved by shortening the
+    /// temporal receptive field is now relieved on the spatial axis instead.
     #[test]
     fn budgeted_never_selects_a_starved_temporal_tile() {
         let cost = lin_cost(4e-8, 4e-6);
-        // Sweep the budget from "barely feasible" upwards: the invariant must hold across the whole
-        // range, not at one convenient point.
-        for safe in [8.0f64, 12.0, 20.0, 40.0, 80.0] {
-            let Ok(Some(cfg)) = budgeted_plan(VaeTiling::WAN, 512, 512, 64, safe, t_cands(), &cost)
-            else {
+        let plan = |safe: f64| budgeted_plan(VaeTiling::WAN, 512, 512, 64, safe, t_cands(), &cost);
+
+        // Row 1 — only a starved tile would have fit. Refusing is the correct answer; the caller
+        // surfaces it as a catchable over-budget error instead of silently corrupting the picture.
+        let tight = plan(2.0);
+        assert!(
+            matches!(
+                tight,
+                Err(TilingBudgetError::SmallestTileExceedsBudget { .. })
+            ),
+            "at 2.0 GiB the only affordable temporal tile is latent 4; the selector must refuse, not \
+             starve the decoder — got {tight:?}"
+        );
+
+        // Row 2 — the tile is fine but the candidate's own overlap is latent 2. The policy raises it
+        // to half the latent tile (4 latent = 16 output frames). Pre-fix this stayed at 8.
+        let raised = plan(2.9).unwrap().expect("2.9 GiB must tile");
+        let rt = raised.temporal.expect("2.9 GiB must tile temporally");
+        assert_eq!(
+            (rt.tile_frames, rt.overlap_frames),
+            (32, 16),
+            "the selected temporal tile must carry the RAISED overlap (latent 8 / 4), not the \
+             candidate grid's latent-2 value: {raised:?}"
+        );
+        assert_eq!(raised.spatial.map(|s| s.tile_px), Some(128));
+
+        // Row 3 — the pre-fix selector bought volume by shortening time (spatial 256 + latent-4
+        // temporal tile). The fix inverts that: the whole sequence stays intact and the memory comes
+        // off the spatial axis.
+        let relieved = plan(5.0).unwrap().expect("5.0 GiB must tile");
+        assert!(
+            relieved.temporal.is_none(),
+            "at 5.0 GiB a full-sequence, spatially-relieved plan fits — taking a latent-4 temporal \
+             tile for more tile volume is exactly the sc-15325 defect: {relieved:?}"
+        );
+        assert_eq!(relieved.spatial.map(|s| s.tile_px), Some(128));
+
+        // ...and the invariant itself, across the whole feasible range rather than at three points.
+        for safe in [2.0f64, 2.9, 3.5, 5.0, 8.0, 12.0, 20.0, 40.0, 80.0] {
+            let Ok(Some(cfg)) = plan(safe) else {
                 continue; // infeasible or single-pass — neither can starve a tile.
             };
             let Some(t) = cfg.temporal else { continue };

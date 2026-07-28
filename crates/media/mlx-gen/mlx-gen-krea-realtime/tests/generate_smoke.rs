@@ -252,6 +252,29 @@ fn mean_abs_delta(a: &[Image], b: &[Image]) -> f64 {
     total / n as f64
 }
 
+/// Per-**column** mean |Δ| across the whole clip (sc-15325). A whole-frame mean averages a spatial
+/// seam away: a tile boundary is a handful of columns out of hundreds, so a badly-blended spatial tile
+/// can cost well under 0.1/255 on the frame mean while being plainly visible. This is the metric that
+/// can *see* a seam — a spike at a multiple of the spatial tile stride is the signature.
+fn mean_abs_delta_columns(a: &[Image], b: &[Image]) -> Vec<f64> {
+    assert_eq!(a.len(), b.len(), "clip lengths differ");
+    let w = a.first().map(|f| f.width as usize).unwrap_or(0);
+    let mut sums = vec![0.0f64; w.max(1)];
+    let mut n = vec![0usize; w.max(1)];
+    for (x, y) in a.iter().zip(b.iter()) {
+        assert_eq!(x.pixels.len(), y.pixels.len(), "frame buffer sizes differ");
+        for (i, (&p, &q)) in x.pixels.iter().zip(y.pixels.iter()).enumerate() {
+            let col = (i / 3) % w.max(1);
+            sums[col] += (p as f64 - q as f64).abs();
+            n[col] += 1;
+        }
+    }
+    sums.iter()
+        .zip(n.iter())
+        .map(|(s, &c)| s / c.max(1) as f64)
+        .collect()
+}
+
 fn frame_stats(frames: &[Image]) -> Vec<FrameStat> {
     let mut out = Vec::with_capacity(frames.len());
     let mut prev: Option<&Image> = None;
@@ -906,8 +929,17 @@ fn v2v_strength_zero_preserves_the_source() {
 ///    peak (~20 GiB at 832×480), so "did the fix cost memory?" is answered by the same run.
 ///
 /// It then walks a candidate ladder (temporal-only vs. spatially-relieved) for the record, reporting
-/// mean abs err, highlight clipping and MLX active peak per decode — the evidence the operating point
-/// is chosen from, re-measured rather than extrapolated from the sweep table.
+/// mean abs err, highlight clipping and MLX active peak per decode.
+///
+/// ⚠️ **Read this test's SPATIAL rows as a memory measurement, not as quality evidence.** Its source is
+/// [`smooth_frame`] — a 5-6-cycle sinusoid with essentially no energy above DC, chosen so the VAE's own
+/// round-trip error would not swamp the v2v comparisons this module also runs. That stimulus
+/// *structurally cannot* exhibit a spatial seam or a starved spatial receptive field: there is no
+/// high-frequency content for either to destroy. The peaks it reports are real (memory does not care
+/// what the pixels are) and its temporal rows are diagnostic (the z16 collapse is a low-frequency
+/// content failure, which this source does show). But the claim "shrinking the spatial tile is nearly
+/// free" is evidenced by [`decode_tiling_sweep_against_single_pass`], which runs the same ladder on
+/// **real generated latents** and adds a per-column metric that a whole-frame mean would hide.
 #[test]
 #[ignore = "real snapshot; run with --ignored on macOS (see module doc)"]
 fn decode_policy_matches_single_pass_at_the_old_memory_peak() {
@@ -1103,10 +1135,27 @@ fn decode_policy_matches_single_pass_at_the_old_memory_peak() {
 /// tiling's period-8 artifacts vanish single-pass, the tiled decode is the mechanism; the sweep then
 /// says whether the fix is *overlap* (a blending problem) or *tile size* (a temporal receptive-field
 /// problem), which are different bugs with different fixes.
+///
+/// It also carries the **spatial** ladder, because the fix's affordability claim ("relieve the memory
+/// on the spatial axis instead") has to be evidenced on the same real latents rather than on a
+/// band-limited synthetic source that cannot show a seam. Measured (832×480, 36 output frames, latent
+/// tile 8 / overlap 4):
+///
+/// | spatial tile | mean abs err | per-column mean abs err | clipping mean / worst | MLX active peak |
+/// |---|---|---|---|---|
+/// | none (full frame) | 1.954 /255 | 1.629 … 2.440 | 0.14 % / 1.05 % | 75.77 GiB |
+/// | 448 px | 2.021 | 1.696 … 2.505 | 0.14 % / 1.04 % | 38.57 GiB |
+/// | 320 px | 2.054 | 1.719 … 2.531 | 0.13 % / 1.04 % | 20.08 GiB |
+/// | 256 px | 2.075 | 1.735 … 2.579 | 0.13 % / 1.04 % | 12.99 GiB |
+/// | 192 px | 2.121 | 1.769 … 2.630 | 0.13 % / 1.02 % | 7.49 GiB |
+///
+/// **10.1× less memory for 0.17/255, and no seam**: the per-column error shifts uniformly rather than
+/// spiking at the tile stride (worst column 1.24× the clip mean at the smallest tile). Contrast the
+/// temporal axis on the same clip: latent 2 → 4 → 8 is 17.09 → 6.43 → 1.95 /255.
 #[test]
 #[ignore = "real snapshot; run with --ignored on macOS (see module doc)"]
 fn decode_tiling_sweep_against_single_pass() {
-    use mlx_gen::tiling::{TemporalTiling, TilingConfig};
+    use mlx_gen::tiling::{SpatialTiling, TemporalTiling, TilingConfig};
     use mlx_gen_krea_realtime::{
         generate_latents, load_krea_realtime_transformer_with_quant, ArGenParams,
         CausalKreaTransformer,
@@ -1255,6 +1304,10 @@ fn decode_tiling_sweep_against_single_pass() {
         }
     }
 
+    // The full-frame latent-8/4 decode is the reference the SPATIAL ladder below is compared against
+    // (it isolates "what does shrinking the spatial tile cost?" from "what does the temporal tile
+    // cost?"), so keep it rather than paying a second 70-GiB-class decode for it.
+    let mut full_frame_32_16: Option<(Vec<Image>, usize)> = None;
     for (tile, overlap) in candidates {
         let cfg = TilingConfig {
             spatial: None,
@@ -1305,8 +1358,91 @@ fn decode_tiling_sweep_against_single_pass() {
         }
         if (tile, overlap) == (32, 16) {
             dump_frames(&out, "sweep_best");
+            full_frame_32_16 = Some((out, peak));
         }
     }
+
+    // --- the SPATIAL ladder, on the same real latents ---------------------------------------------
+    //
+    // sc-15325's affordability claim ("the memory floor drops ~6-10× and it costs almost nothing")
+    // used to be evidenced only by `decode_policy_matches_single_pass_at_the_old_memory_peak`, whose
+    // source is `smooth_frame` — a 5-6-cycle sinusoid with essentially zero energy above DC. That
+    // stimulus *structurally cannot* show a spatial seam or a starved spatial receptive field, so it
+    // could not establish the claim it was cited for. These rows are the real-latent version: same
+    // clip, same latents, same latent tile 8 / overlap 4, varying only the spatial tile.
+    //
+    // Both metrics are reported. The whole-frame mean answers "how much error"; the per-COLUMN mean
+    // answers "is any of it concentrated at a tile boundary", which the frame mean averages away.
+    let (full_out, full_peak) =
+        full_frame_32_16.expect("the (32, 16) full-frame row must have run");
+    let full_err = mean_abs_delta(&single, &full_out);
+    let full_cols = mean_abs_delta_columns(&single, &full_out);
+    let col_span = |c: &[f64]| -> (f64, f64) {
+        let lo = c.iter().cloned().fold(f64::MAX, f64::min);
+        let hi = c.iter().cloned().fold(0.0f64, f64::max);
+        (lo, hi)
+    };
+    let (full_lo, full_hi) = col_span(&full_cols);
+    println!("  --- spatial ladder at latent tile 8 / overlap 4 (real latents) ---");
+    println!(
+        "    spatial none (full frame): mean |Δ| {full_err:.3}/255, per-column {full_lo:.3}..\
+         {full_hi:.3}, peak {:.2} GiB",
+        gib(full_peak)
+    );
+    let mut spatial_rows: Vec<(i32, f64, f64, f64)> = Vec::new(); // (px, err, col_hi, peak_gib)
+    for tile_px in [448i32, 320, 256, 192] {
+        let cfg = TilingConfig {
+            spatial: Some(SpatialTiling {
+                tile_px,
+                overlap_px: 64,
+            }),
+            temporal: Some(TemporalTiling {
+                tile_frames: 32,
+                overlap_frames: 16,
+            }),
+        };
+        let (out, peak) = peak_of(&|| decode(Some(&cfg)));
+        let err = mean_abs_delta(&single, &out);
+        let cols = mean_abs_delta_columns(&single, &out);
+        let (lo, hi) = col_span(&cols);
+        let (cm, cw) = clip_stats(&out);
+        println!(
+            "    spatial {tile_px:>3} px: mean |Δ| {err:.3}/255, per-column {lo:.3}..{hi:.3}, \
+             clipping {cm:.2}% / {cw:.2}%, peak {:.2} GiB",
+            gib(peak)
+        );
+        spatial_rows.push((tile_px, err, hi, gib(peak)));
+    }
+
+    // Gate 1 — the spatial axis is nearly free. The SMALLEST candidate must stay close to the
+    // full-frame decode at the same temporal tile; if shrinking the spatial tile ever starts costing
+    // real error, "relieve memory spatially" stops being the right answer and the floor has to become
+    // a memory trade again.
+    let (small_px, small_err, small_hi, small_peak) = *spatial_rows
+        .last()
+        .expect("the ladder ran at least one row");
+    assert!(
+        small_err <= full_err + 1.0,
+        "the smallest spatial candidate ({small_px} px) is {small_err:.3}/255 against \
+         {full_err:.3}/255 full-frame at the same latent tile — spatial relief is no longer nearly \
+         free, so sc-15325's affordability argument needs re-deriving"
+    );
+    // Gate 2 — and none of that error is a SEAM. A trapezoidally blended spatial tile should raise
+    // every column a little, not spike at the stride. Compared against the row's own column floor so
+    // this measures concentration, not content.
+    assert!(
+        small_hi <= small_err * 2.0,
+        "the {small_px} px spatial plan has a worst column of {small_hi:.3}/255 against a clip mean \
+         of {small_err:.3} — that concentration is the signature of a spatial seam, which the \
+         whole-frame mean would have hidden"
+    );
+    // Gate 3 — and it actually bought the memory it is claimed to buy.
+    assert!(
+        small_peak < gib(full_peak) * 0.5,
+        "the {small_px} px spatial plan peaked at {small_peak:.2} GiB against {:.2} GiB full-frame — \
+         sc-15325's claim is that the spatial axis is where the memory comes from",
+        gib(full_peak)
+    );
 
     // sc-15325 is fixed, so the gate inverts: the full plan the PRODUCT emits — spatial and temporal
     // together, whatever the selector chose — must now track single-pass. (The `8 / 4` row above still

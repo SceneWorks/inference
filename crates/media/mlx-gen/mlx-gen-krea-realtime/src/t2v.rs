@@ -170,31 +170,46 @@ fn resolve_request_config(
 /// candidate grid the Wan z16 T2V/I2V/VACE decodes use, which `mlx-gen-scail2` now shares too. Two
 /// things follow:
 ///
-///  * gen-core's [`MIN_TEMPORAL_TILE_LATENT_FRAMES`](mlx_gen::tiling::MIN_TEMPORAL_TILE_LATENT_FRAMES)
-///    floor makes a sub-8-latent-frame temporal tile **unselectable at any budget**, so the starved
-///    receptive field that caused this defect cannot be re-derived by a future budget tweak;
+///  * **the routing itself is the fix.** The starved window came from *this crate computing its own*,
+///    and it now cannot. gen-core's
+///    [`MIN_TEMPORAL_TILE_LATENT_FRAMES`](mlx_gen::tiling::MIN_TEMPORAL_TILE_LATENT_FRAMES) floor is a
+///    second line — and note it is a **no-op on the z16 grid today**: that grid already bottoms out at
+///    a latent-8 tile, and floor-on vs floor-off selects an identical tile in every cell of a
+///    6-bucket × 4-frame-count × 5-budget sweep. It exists so a future budget tweak or a new candidate
+///    entry cannot re-derive the starved window. Do not undo this delegation on the belief that the
+///    floor is what protects the picture — it is prospective insurance; the delegation is the fix;
 ///  * memory pressure is relieved on the **spatial** axis instead, which is what makes the fix
-///    affordable. Measured on the same clip at latent tile 8 / overlap 4, varying only the spatial
-///    tile (`tests/generate_smoke.rs::decode_policy_matches_single_pass_at_the_old_memory_peak`):
+///    affordable. Measured on the **same real latents** at latent tile 8 / overlap 4, varying only the
+///    spatial tile (`tests/generate_smoke.rs::decode_tiling_sweep_against_single_pass`):
 ///
-/// | spatial tile | mean abs err vs single-pass | clipping mean / worst | MLX active peak |
-/// |---|---|---|---|
-/// | none (full frame) | 2.34 /255 | 0.00% / 0.00% | 76.3 GiB |
-/// | 448 px | 2.37 | 0.00% / 0.00% | 39.1 GiB |
-/// | **320 px** | **2.38** | **0.00% / 0.00%** | **20.6 GiB** |
-/// | 256 px | 2.41 | 0.00% / 0.00% | 13.5 GiB |
-/// | 192 px | 2.44 | 0.00% / 0.00% | 8.0 GiB |
+/// | spatial tile | mean abs err vs single-pass | per-**column** mean abs err | clipping mean / worst | MLX active peak |
+/// |---|---|---|---|---|
+/// | none (full frame) | 1.954 /255 | 1.629 … 2.440 | 0.14% / 1.05% | 75.77 GiB |
+/// | 448 px | 2.021 | 1.696 … 2.505 | 0.14% / 1.04% | 38.57 GiB |
+/// | **320 px** | **2.054** | **1.719 … 2.531** | **0.13% / 1.04%** | **20.08 GiB** |
+/// | 256 px | 2.075 | 1.735 … 2.579 | 0.13% / 1.04% | 12.99 GiB |
+/// | 192 px | 2.121 | 1.769 … 2.630 | 0.13% / 1.02% | 7.49 GiB |
 ///
-/// A 9.6× memory reduction costs 0.10/255. The two axes are simply not comparable — halving the
-/// latent *temporal* tile costs 67-70 % more error, shrinking the spatial tile 4× costs 4 % — because
-/// at ×8 spatial scale even a 192 px tile is 24 latent px wide with an 8-latent-px overlap.
+/// A 10.1× memory reduction costs 0.17/255. The two axes are simply not comparable — halving the
+/// latent *temporal* tile costs 67-70 % more error, shrinking the spatial tile 4.3× costs 8 % —
+/// because at ×8 spatial scale even a 192 px tile is 24 latent px wide with an 8-latent-px overlap.
+///
+/// The per-column column is what rules out a **seam**; a whole-frame mean averages a tile boundary
+/// away. It shifts uniformly across the sweep — floor 1.629 → 1.769 as ceiling 2.440 → 2.630 — with no
+/// spike at the tile stride, and the 192 px row's worst column is 1.24× its own clip mean. These rows
+/// were previously measured on a band-limited synthetic source, which structurally could not have
+/// shown either a seam or a starved spatial receptive field; the conclusion held, but the evidence is
+/// now real latents.
 ///
 /// **The operating point at 832×480**, with the budget pinned to what the OLD policy actually cost
 /// (20.3 GiB): spatial 320/64 + temporal 32/16, i.e. **latent tile 8 / overlap 4** and 40 latent px
-/// spatial tiles — **2.38/255 with 0.00 % clipping against single-pass, at a 20.6 GiB peak.** The old
-/// window was 24.4/255 with 10.3 % mean / 30.8 % worst-frame clipping at 20.3 GiB. Single-pass quality
-/// for the same memory; the decode's *floor* also drops from ~20 GiB to ~8 GiB (the 192 px row), so
-/// this lowers the memory bar rather than raising it.
+/// spatial tiles — **2.05/255 against single-pass at a 20.1 GiB peak**, with clipping (0.13 %/1.04 %)
+/// at the single-pass floor. The old window was 17.1/255 with 5.2 % mean / 14.7 % worst-frame clipping
+/// at 19.8 GiB (and 24.4/255 with 30.8 % worst-frame clipping at a longer bucket). Single-pass quality
+/// for the same memory; the decode's *floor* also drops from ~20 GiB to ~7.5 GiB (the 192 px row), so
+/// this lowers the memory bar rather than raising it. At this short a clip the selector in fact
+/// returns a **spatial-only** plan (256 px, no temporal tiling at all — 0.31/255), which is the best
+/// possible answer for this defect.
 ///
 /// Because the budget is free-aware (`free × 0.85`, `free = MLX limit − resident`, pinnable with
 /// `WAN_VAE_BUDGET_GIB`), a large-memory host still gets the fastest plan that fits and a small one
@@ -208,12 +223,14 @@ fn resolve_request_config(
 /// 0.01 %/0.25 % single-pass. It now calls the same selector (2.21/255, clipping back at the
 /// single-pass floor).
 ///
-/// **LTX was measured too, and is CLEARED**: at a latent tile of 3 it is 1.73/255 with 0.00 %
-/// clipping — it degrades gracefully rather than collapsing (causal tiling hands each tile a context
-/// frame, and ×8 temporal scale makes a 3-latent tile 17 output frames wide). The gen-core floor still
-/// removes its `(24, 8)` and `(48, 16)` candidates, but as a cheap quality win (6.6× less error for
-/// 17 % more peak), not as a defect fix. Wan z16/z48 already bottomed out at latent tile 8 / overlap 2
-/// and are unchanged.
+/// **LTX was measured too and did not reproduce the defect**: at a latent tile of 3 it is 1.73/255
+/// with 0.00 % clipping. Take that verdict at its actual width — it is **empirical, at one bucket that
+/// never tiles in production, on a source whose amplitudes cannot reach the clip threshold, and the
+/// mechanism is unexplained** (the causal-tiling story does not hold: `causal_temporal` is also true
+/// for Wan z48, and z16 at matched effective context is still 3.7× worse). See
+/// `mlx-gen-ltx/tests/vae_decode_tiling_parity.rs`. The gen-core floor still removes LTX's `(24, 8)`
+/// and `(48, 16)` candidates, but as a cheap quality win (6.6× less error for 17 % more peak), not as
+/// a defect fix. Wan z16/z48 already bottomed out at latent tile 8 / overlap 2 and are unchanged.
 #[doc(hidden)]
 pub fn decode_tiling(out_h: usize, out_w: usize, out_frames: i32) -> Result<Option<TilingConfig>> {
     // The z16 VAE this pipeline decodes through is `mlx_gen_wan`'s, so its tiling policy is

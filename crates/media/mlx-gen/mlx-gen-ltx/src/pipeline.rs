@@ -1329,9 +1329,20 @@ mod tests {
     ///
     /// ⚠️ **This is a quality improvement on LTX, not a defect fix.** The z16 VAE collapses at a
     /// starved temporal tile (24.4/255 vs single-pass, 30.8 % of a worst frame blown to white); LTX was
-    /// measured the same way (`tests/vae_decode_tiling_parity.rs`) and does **not** — its worst
-    /// candidate is 1.73/255 with 0.00 % clipping. The floor is applied here because latent 3 → 8 buys
-    /// 6.6× less error for 17 % more decode peak, which is worth having and not worth a second policy.
+    /// measured the same way (`tests/vae_decode_tiling_parity.rs`) and **did not reproduce that** — its
+    /// worst candidate read 1.73/255 with 0.00 % clipping. The floor is applied here because latent
+    /// 3 → 8 buys 6.6× less error for 17 % more decode peak, which is worth having and not worth a
+    /// second policy.
+    ///
+    /// ⚠️ **Scope of that clearing.** The numbers above are a **dated snapshot** (2026-07, one host,
+    /// q8, one source clip); the *asserted* contract is the **ratio**, gated in
+    /// `tests/vae_decode_tiling_parity.rs`. And the clearing is **empirical, at one bucket, with the
+    /// mechanism unexplained**: 640×384 × 89 frames never tiles in production (single-pass peaks
+    /// ~10.7 GiB, so this planner returns `Ok(None)` there and the test forces the config by hand),
+    /// and that test's source amplitudes never approach the clip threshold, so its 0.00 % clipping is
+    /// partly structural. The causal-tiling explanation originally offered does **not** hold —
+    /// `causal_temporal` is also true for Wan z48, and z16 at matched effective context is still 3.7×
+    /// worse than LTX. Do not generalise "LTX was fine" to any other VAE, causal or not.
     ///
     /// Red before the fix: at the tighter budgets the selector reached straight for `(24, 8)`.
     #[test]

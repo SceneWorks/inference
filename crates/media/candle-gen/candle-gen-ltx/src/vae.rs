@@ -718,6 +718,104 @@ mod budget_tests {
         assert!(plan_ltx_tiling(2160, 3840, 257, 8.0).is_err());
     }
 
+    /// **sc-15325 — the CUDA lane's LTX grid can no longer starve the decoder either.**
+    ///
+    /// This crate carries the *identical* [`LTX_VAE_TEMPORAL_FR`] grid and routes through the
+    /// *identical* gen-core `budgeted_plan`, so gen-core's `MIN_TEMPORAL_TILE_LATENT_FRAMES` removes
+    /// the same `(48, 16)` and `(24, 8)` candidates — latent **6** and **3** at LTX's ×8
+    /// `temporal_scale`. What is *not* shared is the cost model: these constants are CUDA-calibrated
+    /// (sc-7148, RTX PRO 6000) with a 2.7 GiB fixed floor, where the mlx sibling's are Metal ones. So
+    /// "does the floor keep the shipped envelope plannable?" is a genuinely different question here
+    /// and has to be asked separately — a candidate removed on both backends can still be the one
+    /// that made a CUDA budget fit.
+    ///
+    /// This is the mirror of `mlx-gen-ltx`'s `ltx_tiling_never_selects_a_starved_temporal_tile`
+    /// (`crates/media/mlx-gen/mlx-gen-ltx/src/pipeline.rs`). The Linux/CUDA CI lanes exercise
+    /// compilation, not tiling *selection*, so without this the CUDA lane would inherit the policy
+    /// change with no coverage at all.
+    #[test]
+    fn ltx_tiling_never_selects_a_starved_temporal_tile() {
+        use candle_gen::gen_core::tiling::{
+            min_temporal_tile_frames, MIN_TEMPORAL_TILE_LATENT_FRAMES,
+            MIN_TEMPORAL_TILE_LATENT_OVERLAP,
+        };
+        let scale = VaeTiling::LTX.temporal_scale;
+
+        // The grid this crate actually ships, read through the floor: the two starved entries go.
+        let kept: Vec<i32> = LTX_VAE_TEMPORAL_FR
+            .iter()
+            .map(|&(t, _)| t)
+            .filter(|&t| t >= min_temporal_tile_frames(VaeTiling::LTX))
+            .collect();
+        assert_eq!(
+            kept,
+            vec![96, 64],
+            "the floor must remove candle-gen-ltx's latent-6 (48f) and latent-3 (24f) candidates"
+        );
+
+        for (w, h, f) in [
+            (1280, 704, 121),
+            (1280, 720, 121),
+            (768, 512, 241),
+            (1920, 1088, 121),
+        ] {
+            for safe in [12.0f64, 16.0, 24.0, 32.0, 48.0, 96.0] {
+                let Ok(Some(cfg)) = plan_ltx_tiling(h, w, f, safe) else {
+                    continue; // infeasible or single-pass — neither can starve a tile.
+                };
+                let Some(t) = cfg.temporal else { continue };
+                let lat = t.tile_frames / scale;
+                assert!(
+                    lat >= MIN_TEMPORAL_TILE_LATENT_FRAMES,
+                    "{w}x{h}x{f} @ {safe} GiB: selected a {lat}-latent-frame LTX temporal tile \
+                     ({} output frames) — sc-15325's receptive-field floor",
+                    t.tile_frames
+                );
+                assert!(
+                    (t.overlap_frames / scale).min(lat - 1) >= MIN_TEMPORAL_TILE_LATENT_OVERLAP,
+                    "{w}x{h}x{f} @ {safe} GiB: latent overlap under the blend floor"
+                );
+            }
+        }
+
+        // ...and the shipped envelope is still plannable on a real CUDA card. **This is the check the
+        // mlx sibling could not make for us, and it found something**: on the CUDA cost model the
+        // floor genuinely narrows the feasible window at 1280×704×121, because the accumulator floor
+        // there is already 10.64 GiB and only the tile term is left to trade.
+        //
+        // | plan at 192 px spatial | latent tile | estimated peak |
+        // |---|---|---|
+        // | `(24, 8)` — removed by the floor | 3 | 11.15 GiB |
+        // | `(48, 16)` — removed by the floor | 6 | 11.66 GiB |
+        // | `(64, 16)` — the floor's smallest survivor | 8 | **12.00 GiB** |
+        //
+        // So the smallest budget that can plan this bucket moved **11.15 → 12.00 GiB safe**. No real
+        // card class crosses that gap: `safe = total × 0.85`, so a 12 GB card is 10.2 GiB (already
+        // under the 10.64 GiB accumulator floor — infeasible before *and* after, for a reason the
+        // floor has nothing to do with) and a 16 GB card is 13.6 GiB (feasible before and after). The
+        // exposed band is a 13.1–14.1 GB card, which is not a thing. Assert the 16 GB case, and pin
+        // the band explicitly so a future cost-model change that widens it is visible rather than
+        // discovered by a user.
+        const SAFE_16GB: f64 = 16.0 * LTX_VAE_BUDGET_SAFE_FRAC; // 13.6 GiB
+        for (w, h, f) in [(1280, 704, 121), (1280, 720, 121), (768, 512, 241)] {
+            plan_ltx_tiling(h, w, f, SAFE_16GB).unwrap_or_else(|e| {
+                panic!("{w}x{h}x{f} became infeasible on a 16 GB card ({SAFE_16GB} GiB safe): {e}")
+            });
+        }
+        // The narrowed band itself, pinned. If this ever starts passing, the floor's cost on this
+        // backend changed and the paragraph above needs re-deriving.
+        assert!(
+            plan_ltx_tiling(704, 1280, 121, 11.5).is_err(),
+            "1280x704x121 now plans at 11.5 GiB — the floor's CUDA feasibility floor moved; re-derive \
+             the 11.15 -> 12.00 GiB band documented above"
+        );
+        assert!(
+            plan_ltx_tiling(704, 1280, 121, 12.1).is_ok(),
+            "1280x704x121 no longer plans at 12.1 GiB — the floor's CUDA cost grew beyond the \
+             documented 12.00 GiB survivor"
+        );
+    }
+
     #[test]
     fn ltx_budget_env_override_wins() {
         // The deterministic injection point the worker/tests use. (Set/clear in-process.)

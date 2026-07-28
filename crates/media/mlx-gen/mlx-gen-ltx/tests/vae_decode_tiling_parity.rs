@@ -1,7 +1,10 @@
 //! **sc-15325 — is the LTX video VAE's tiled decode faithful to a single pass?**
 //!
-//! **Answer, measured: yes. LTX does NOT share the z16 defect.** This test is kept as the standing
-//! evidence for that verdict, and as the guard that would catch it changing.
+//! **Answer, measured: at the one bucket measured, yes — LTX did not reproduce the z16 defect.** This
+//! test is kept as the standing evidence for that verdict, and as the guard that would catch it
+//! changing. Read the scope carefully: the clearing is **empirical and narrow**, the mechanism is
+//! **unexplained**, and post-fix LTX cannot reach the starved candidates anyway (see "How far this
+//! verdict actually goes" below).
 //!
 //! ## Why it was asked
 //!
@@ -14,6 +17,14 @@
 //!
 //! ## What the measurement says (640×384 × 89 frames, q8, smooth source)
 //!
+//! ⚠️ **This table is a dated snapshot** (2026-07, one host, one tier, one source clip), reproduced
+//! verbatim in `sceneworks-gen-core`'s `MIN_TEMPORAL_TILE_LATENT_FRAMES` doc and in
+//! `mlx-gen-ltx::pipeline`'s `ltx_tiling_never_selects_a_starved_temporal_tile`. Numbers in a doc
+//! comment cannot go red. What is actually *asserted* — and therefore what the "6.6× less error for
+//! 17 % more peak" argument rests on — is the **ratio** between the latent-3 and latent-8 rows, gated
+//! in `ltx_tiled_decode_tracks_single_pass` below (`err8 < err3 · 0.5`, `peak8 ≤ peak3 · 1.5`).
+//! Treat the absolute values here as illustration; treat the ratio as the contract.
+//!
 //! | temporal tile | latent tile / overlap | mean abs err vs single-pass | clipping mean / worst | MLX active peak |
 //! |---|---|---|---|---|
 //! | single-pass | — | 0 (reference) | 0.00 % / 0.00 % | 10.68 GiB |
@@ -22,12 +33,45 @@
 //! | 64 / 16 | 8 / 2 | 0.26 | 0.00 % / 0.00 % | 8.57 GiB |
 //! | 64 / 32 | 8 / 4 | 0.16 | 0.00 % / 0.00 % | 9.49 GiB |
 //!
-//! LTX **degrades gracefully** where z16 collapses: at its worst candidate it is 1.73/255 with *zero*
-//! highlight clipping, against z16's 24.4/255 and 30.8 % clipping at a comparable starvation. Plausible
-//! reasons — LTX's temporal tiling is **causal**, so each tile is handed a preceding context frame
-//! (`split_temporal`'s `starts[i] -= 1`), and at ×8 temporal scale even a 3-latent-frame tile is 17
-//! output frames of receptive field. Neither is verified here; the *verdict* is, and it does not depend
-//! on the explanation.
+//! LTX degraded **gracefully** where z16 collapses: at its worst candidate it is 1.73/255 with zero
+//! highlight clipping, against z16's 24.4/255 and 30.8 % clipping at a comparable starvation. (The
+//! zero-clipping half of that comes partly from the stimulus — see below.)
+//!
+//! ## The mechanism is UNKNOWN — and the obvious explanation is wrong
+//!
+//! The tempting story is that LTX's temporal tiling is **causal**, so each tile is handed a preceding
+//! context frame (`split_temporal`'s `starts[i] -= 1`). That cannot be the reason:
+//!
+//!  * `causal_temporal` is **also `true` for `VaeTiling::WAN22`** (z48, shipping). A causal-VAE
+//!    explanation is not LTX-specific — it would predict z48 is equally immune, which nobody has
+//!    measured.
+//!  * At **matched context** the gap survives. z16's `4 / 2` row is a 4-latent tile with 1 latent of
+//!    overlap; an LTX interior tile at `24 / 8` is a 3-latent tile with 1 latent of overlap **plus**
+//!    1 causal context frame — the same 4 latent frames of input. z16 reads 6.4/255 there, LTX
+//!    1.73/255: a **3.7× gap that context-counting does not explain**.
+//!
+//! Something else is responsible — decoder depth, channel width, the ×8 vs ×4 temporal scale, the
+//! latent distribution itself. It has not been identified, and no replacement mechanism is asserted
+//! here. **The verdict is measured; the explanation is absent.** Anyone deciding whether to make the
+//! floor per-VAE should start from that, not from a causal-tiling story.
+//!
+//! ## How far this verdict actually goes
+//!
+//! Narrower than "LTX is fine":
+//!
+//!  * **One bucket, and one that never tiles in production.** 640×384 × 89 frames peaks ~10.7 GiB
+//!    single-pass, so `auto_tiling_budgeted_ltx` returns `Ok(None)` at any realistic budget — this
+//!    test has to *force* the tiling config by hand to measure it at all. Nothing here says anything
+//!    about 1080p × 241, which is where LTX genuinely tiles.
+//!  * **The source cannot clip.** `smooth_video`'s channel amplitudes are 0.70/0.70/0.60 on [−1, 1],
+//!    never near the 0.9608 that reads as ≥250/255. LTX's "0.00 % / 0.00 %" clipping is therefore
+//!    **partly structural** — the stimulus had little headroom to blow out. The mean-|Δ| column is
+//!    the load-bearing one; the clipping column mostly says the source was well-behaved.
+//!  * **It is also moot post-fix.** The floor removes `(48, 16)` and `(24, 8)` from the selectable
+//!    set, so production LTX cannot reach a starved tile regardless of how this verdict is read.
+//!
+//! Stated plainly: **cleared empirically at one low-dynamic-range bucket, mechanism unexplained, and
+//! unreachable in production anyway.**
 //!
 //! ## Why the shared floor still applies to LTX
 //!
@@ -252,11 +296,18 @@ fn ltx_tiled_decode_tracks_single_pass() {
     let (err3, clip3, peak3) = at(3);
     let (err8, _, peak8) = at(8);
 
-    // 1. **The verdict.** LTX is CLEARED of the sc-15325 defect: even its most starved candidate stays
-    //    far from the z16 collapse (24.4/255 with 30.8 % worst-frame clipping) on both metrics. This is
-    //    the assertion that carries the finding — if LTX ever starts behaving like z16 here, the
-    //    "cleared" verdict in the story and in `MIN_TEMPORAL_TILE_LATENT_FRAMES`'s doc is wrong and
+    // 1. **The verdict, at the width the evidence supports.** At THIS bucket LTX does not reproduce
+    //    the sc-15325 defect: even its most starved candidate stays far from the z16 collapse
+    //    (24.4/255 with 30.8 % worst-frame clipping) on both metrics. This is the assertion that
+    //    carries the finding — if LTX ever starts behaving like z16 here, the "cleared" verdict in the
+    //    story, in `MIN_TEMPORAL_TILE_LATENT_FRAMES`'s doc and in `mlx-gen-ltx::pipeline` is wrong and
     //    this goes red rather than the regression shipping.
+    //
+    //    What it does NOT establish (see the module header): a mechanism, anything about buckets that
+    //    actually tile in production, or that a high-dynamic-range source would clip as little. The
+    //    clipping assertion below is the weaker of the two precisely because this source's amplitudes
+    //    (0.70/0.70/0.60 on [-1, 1]) never approach the 0.9608 clip threshold — near-zero clipping is
+    //    partly structural here. `err3` is the load-bearing number.
     assert!(
         err3 < 5.0,
         "the old latent-3 LTX tile is {err3:.2}/255 from single-pass — LTX now looks like the z16 \
@@ -272,6 +323,15 @@ fn ltx_tiled_decode_tracks_single_pass() {
     //    fix. Pin both halves of that trade, because the trade is the justification — if the accuracy
     //    gain stops being large, or the memory cost stops being small, keeping one policy across both
     //    VAE families needs re-arguing.
+    //
+    //    ⚠️ **Deliberate trip-wire, and it fires on a GOOD change too.** `err8 < err3 · 0.5` is a
+    //    cost/benefit assertion, not a correctness one: it goes red if the floor's survivor regresses
+    //    *or* if the removed latent-3 candidate ever gets BETTER (a decoder improvement, a new tier, a
+    //    changed blend). Both readings are worth a human look, which is why it is a hard assert rather
+    //    than a println — but a red here is not automatically a bug. If it fires, read the printed
+    //    ladder first: if `err3` improved rather than `err8` regressing, the correct response is to
+    //    re-argue whether LTX still wants the shared floor (and possibly make it per-VAE), NOT to
+    //    loosen this number until it passes.
     assert!(
         err8 < err3 * 0.5,
         "the floor's smallest survivor ({err8:.2}/255) is no longer materially better than the \
