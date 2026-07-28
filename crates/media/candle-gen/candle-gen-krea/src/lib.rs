@@ -328,7 +328,7 @@ impl gen_core::ImageMemoryRequestScope for KreaImageMemoryScope {
         self.ensure_active()?;
         self.device
             .synchronize()
-            .map_err(|error| gen_core::Error::backend(error))?;
+            .map_err(gen_core::Error::backend)?;
         self.finished = true;
         Ok(())
     }

@@ -597,8 +597,9 @@ pub struct ImageMemoryBudget {
 }
 
 impl ImageMemoryBudget {
-    /// Effective request budget. Reclaimable memory cannot raise the result above total minus
-    /// reserved headroom, and all arithmetic is saturating.
+    /// Effective request budget. Reserved headroom is removed from the currently free plus
+    /// reclaimable memory, while the total-minus-headroom ceiling prevents reclaimable accounting
+    /// from exceeding physical capacity. All arithmetic is saturating.
     pub fn effective_bytes(self) -> u64 {
         let ceiling = self
             .total_bytes
@@ -606,6 +607,7 @@ impl ImageMemoryBudget {
         self.total_bytes
             .saturating_sub(self.committed_bytes)
             .saturating_add(self.reclaimable_bytes)
+            .saturating_sub(self.reserved_headroom_bytes)
             .min(ceiling)
     }
 
@@ -1041,16 +1043,59 @@ mod tests {
     }
 
     #[test]
-    fn exact_budget_boundary_fits_and_reclaimable_is_capped() {
+    fn effective_budget_reserves_headroom_from_free_and_reclaimable_memory() {
         let budget = ImageMemoryBudget {
             total_bytes: 100,
             committed_bytes: 80,
             reclaimable_bytes: 50,
             reserved_headroom_bytes: 10,
         };
-        assert_eq!(budget.effective_bytes(), 70);
-        assert!(budget.fits(70));
-        assert!(!budget.fits(71));
+        assert_eq!(budget.effective_bytes(), 60);
+        assert!(budget.fits(60));
+        assert!(!budget.fits(61));
+
+        assert_eq!(
+            ImageMemoryBudget {
+                reclaimable_bytes: 0,
+                ..budget
+            }
+            .effective_bytes(),
+            10
+        );
+    }
+
+    #[test]
+    fn effective_budget_saturates_at_zero_and_total_minus_headroom() {
+        assert_eq!(
+            ImageMemoryBudget {
+                total_bytes: 100,
+                committed_bytes: 110,
+                reclaimable_bytes: 5,
+                reserved_headroom_bytes: 10,
+            }
+            .effective_bytes(),
+            0
+        );
+        assert_eq!(
+            ImageMemoryBudget {
+                total_bytes: 100,
+                committed_bytes: 0,
+                reclaimable_bytes: u64::MAX,
+                reserved_headroom_bytes: 10,
+            }
+            .effective_bytes(),
+            90
+        );
+        assert_eq!(
+            ImageMemoryBudget {
+                total_bytes: 100,
+                committed_bytes: 0,
+                reclaimable_bytes: u64::MAX,
+                reserved_headroom_bytes: 101,
+            }
+            .effective_bytes(),
+            0
+        );
     }
 
     #[test]

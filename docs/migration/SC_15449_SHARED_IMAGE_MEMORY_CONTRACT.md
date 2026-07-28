@@ -84,7 +84,9 @@ is eligible only when:
   tier, mode, overlay, geometry, strategy, and exact parameters).
 
 Unknown, stale, fingerprint-mismatched, and out-of-envelope records remain unverified and cannot
-select an optimized fit. Exact budget boundaries fit (`predicted_peak <= effective_budget`).
+select an optimized fit. The effective budget subtracts reserved headroom from currently free plus
+reclaimable memory, then caps the result at total memory minus headroom; all arithmetic saturates.
+Exact budget boundaries fit (`predicted_peak <= effective_budget`).
 Rejections may include a smaller verified geometry only when evidence actually measured it.
 
 Numerical parity is `Exact` where operation ordering permits it. Otherwise evidence names a
