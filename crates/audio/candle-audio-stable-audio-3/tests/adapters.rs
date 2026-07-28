@@ -1710,6 +1710,27 @@ fn a_malformed_peft_config_is_refused_rather_than_defaulted() {
         );
     }
 
+    // The config is read before it is parsed, and both steps are refusals rather than fallbacks.
+    // These two cases are written as raw bytes because neither is expressible as a
+    // `serde_json::Value`: the first is not UTF-8 and the second is not JSON.
+    for (case, bytes) in [
+        // Not UTF-8 — `read_to_string` itself fails. Reachable without touching permissions, so
+        // this runs the same way on every platform and as any user.
+        ("invalid UTF-8", vec![0xffu8, 0xfe, 0x00, 0x7b]),
+        // Valid UTF-8, not JSON. A silently defaulted config here is the same wrong-strength fold
+        // as a missing `r`, with the added twist that the file looks present and populated.
+        ("not JSON at all", b"r = 2, lora_alpha = 4.0".to_vec()),
+        // JSON, but not an object — `get("r")` returns `None` on every non-object value.
+        ("a JSON array", b"[2, 4.0]".to_vec()),
+    ] {
+        std::fs::write(&config_path, &bytes).expect("write raw config");
+        assert!(
+            load_adapter(&spec(&peft_dir, 1.0), &Device::Cpu).is_err(),
+            "a PEFT config that is `{case}` was accepted; the declarations were defaulted instead \
+             of refused, so the adapter folds at a strength it was not trained at"
+        );
+    }
+
     // Restoring the baseline loads again, proving the refusals came from the edited field and not
     // from a directory this test left broken.
     std::fs::write(&config_path, &good).expect("restore config");
@@ -1747,6 +1768,373 @@ fn a_native_adapter_index_segment_must_be_an_integer() {
         text.contains("is not an integer"),
         "the refusal does not name the index segment: {text}"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// 6b. Tensor-level rules that BOTH readers enforce, driven over both readers
+// ---------------------------------------------------------------------------------------------
+
+/// Write a safetensors file from explicitly spelled tensor names.
+///
+/// [`AdapterRecipe`] always emits well-formed names; these fixtures exist to emit malformed ones,
+/// so the name is an input rather than something derived from a target key.
+fn write_raw_safetensors(
+    path: &Path,
+    tensors: &[(String, Vec<usize>, Vec<f32>)],
+    metadata: Option<HashMap<String, String>>,
+) {
+    let owned: Vec<(String, Vec<usize>, Vec<u8>)> = tensors
+        .iter()
+        .map(|(name, shape, values)| {
+            (
+                name.clone(),
+                shape.clone(),
+                values
+                    .iter()
+                    .flat_map(|value| value.to_le_bytes())
+                    .collect(),
+            )
+        })
+        .collect();
+    let views: Vec<(String, safetensors::tensor::TensorView<'_>)> = owned
+        .iter()
+        .map(|(name, shape, bytes)| {
+            (
+                name.clone(),
+                safetensors::tensor::TensorView::new(safetensors::Dtype::F32, shape.clone(), bytes)
+                    .expect("view"),
+            )
+        })
+        .collect();
+    safetensors::serialize_to_file(views, &metadata, path).expect("write safetensors");
+}
+
+/// One tensor-level refusal rule, spelled once per reader.
+///
+/// `load_native` and `load_peft` are two independent parsers over two different on-disk spellings,
+/// and each duplicates the same tensor-level rules. A case written against one reader says nothing
+/// about the other's copy, so every rule here carries both spellings and is asserted twice.
+struct TwoReaderRefusal {
+    /// What the rule is, for the failure message.
+    rule: &'static str,
+    /// The declared adapter type, written to native metadata and to the PEFT config alike. `"lora"`
+    /// for every row whose subject is a tensor rather than the declaration itself.
+    declared: &'static str,
+    /// Tensors for the native single-file layout, `"{stem}.{index}.{factor}"`.
+    native: Vec<(String, Vec<usize>, Vec<f32>)>,
+    /// Tensors for the PEFT directory layout, `"base_model.model.{stem}.{factor}.weight"`.
+    peft: Vec<(String, Vec<usize>, Vec<f32>)>,
+    /// A substring both readers' refusals must carry.
+    expect: &'static str,
+}
+
+impl TwoReaderRefusal {
+    /// Assert the rule is enforced by `load_native` **and** by `load_peft`.
+    fn assert_refused_by_both_readers(&self, dir: &Path) {
+        let device = Device::Cpu;
+        let slug: String = self
+            .rule
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
+
+        let mut metadata = HashMap::new();
+        metadata.insert("adapter_type".to_string(), self.declared.to_string());
+        metadata.insert("rank".to_string(), "2".to_string());
+        metadata.insert("alpha".to_string(), "1".to_string());
+        let native = dir.join(format!("native-{slug}.safetensors"));
+        write_raw_safetensors(&native, &self.native, Some(metadata));
+        self.assert_one(&native, "native", &device);
+
+        let peft = dir.join(format!("peft-{slug}"));
+        std::fs::create_dir_all(&peft).expect("peft dir");
+        write_raw_safetensors(&peft.join("adapter_model.safetensors"), &self.peft, None);
+        std::fs::write(
+            peft.join("adapter_config.json"),
+            serde_json::json!({"r": 2, "lora_alpha": 1.0, "sa3_adapter_type": self.declared})
+                .to_string(),
+        )
+        .expect("write peft config");
+        self.assert_one(&peft, "PEFT", &device);
+    }
+
+    fn assert_one(&self, path: &Path, reader: &str, device: &Device) {
+        match load_adapter(&spec(path, 1.0), device) {
+            Ok(_) => panic!(
+                "the {reader} reader ACCEPTED an adapter violating `{}`; that reader's copy of the \
+                 rule is not enforced",
+                self.rule
+            ),
+            Err(error) => {
+                let text = error.to_string();
+                assert!(
+                    text.contains(self.expect),
+                    "the {reader} reader refused `{}` but not for that reason (expected {:?}): \
+                     {text}",
+                    self.rule,
+                    self.expect
+                );
+            }
+        }
+    }
+}
+
+/// The refusals `load_native` and `load_peft` both carry, asserted on both.
+///
+/// Round-2 review found three of these — non-finite factors, unknown factor segments, duplicate
+/// factors — gated on `load_native` only, because every fixture that feeds tensors went through
+/// `write_native` and the single PEFT tensor case is a happy-path round trip. Deleting each of
+/// `load_peft`'s three copies left the suite green, which meant a PEFT adapter carrying NaN
+/// factors would load, plan and fold into the checkpoint.
+///
+/// The table shape is the actual fix. Three one-off PEFT cases would have gated those three and
+/// left the next shared rule in the same state — and there were three more: a name with no
+/// separator, a name missing its middle segment, and an unrecognized declared adapter type, that
+/// last one dark on **both** readers. A shared rule is now one row with two spellings, and adding
+/// a row asserts it on both parsers by construction.
+#[test]
+fn both_readers_enforce_the_same_tensor_level_rules() {
+    let dir = scratch("two-reader");
+    let stem = TARGET.strip_suffix(".weight").expect("target stem");
+
+    let a = (vec![2usize, 4usize], fill(2, 4, 1.0));
+    let b = (vec![4usize, 2usize], fill(4, 2, 2.0));
+    let mut nan = fill(2, 4, 1.0);
+    nan[3] = f32::NAN;
+
+    for case in [
+        // A NaN factor. Folded into the checkpoint it poisons every later sample, and nothing
+        // downstream re-checks, so the refusal has to happen at load.
+        TwoReaderRefusal {
+            rule: "a non-finite factor value",
+            declared: "lora",
+            native: vec![
+                (format!("{stem}.0.lora_A"), a.0.clone(), nan.clone()),
+                (format!("{stem}.0.lora_B"), b.0.clone(), b.1.clone()),
+            ],
+            peft: vec![
+                (
+                    format!("base_model.model.{stem}.lora_A.weight"),
+                    a.0.clone(),
+                    nan.clone(),
+                ),
+                (
+                    format!("base_model.model.{stem}.lora_B.weight"),
+                    b.0.clone(),
+                    b.1.clone(),
+                ),
+            ],
+            expect: "non-finite value",
+        },
+        // An unrecognized factor segment. `finish_modules` only removes the five known names, so
+        // an accepted `lora_Q` is silently dropped in a release build and "every adapter tensor is
+        // consumed exactly once" stops holding.
+        TwoReaderRefusal {
+            rule: "an unknown factor segment",
+            declared: "lora",
+            native: vec![
+                (format!("{stem}.0.lora_A"), a.0.clone(), a.1.clone()),
+                (format!("{stem}.0.lora_B"), b.0.clone(), b.1.clone()),
+                (format!("{stem}.0.lora_Q"), vec![2, 2], fill(2, 2, 3.0)),
+            ],
+            peft: vec![
+                (
+                    format!("base_model.model.{stem}.lora_A.weight"),
+                    a.0.clone(),
+                    a.1.clone(),
+                ),
+                (
+                    format!("base_model.model.{stem}.lora_B.weight"),
+                    b.0.clone(),
+                    b.1.clone(),
+                ),
+                (
+                    format!("base_model.model.{stem}.lora_Q.weight"),
+                    vec![2, 2],
+                    fill(2, 2, 3.0),
+                ),
+            ],
+            expect: "lora_Q",
+        },
+        // Two tensors collapsing to the same `(target, factor)`. Native reaches it through two
+        // adapter indices; PEFT reaches it because the `base_model.model.` prefix is optional, so
+        // the prefixed and bare spellings of one module strip to the same stem. Whichever tensor
+        // lost the race would be silently discarded.
+        TwoReaderRefusal {
+            rule: "a duplicated factor for one target",
+            declared: "lora",
+            native: vec![
+                (format!("{stem}.0.lora_A"), a.0.clone(), a.1.clone()),
+                (format!("{stem}.1.lora_A"), a.0.clone(), fill(2, 4, 5.0)),
+                (format!("{stem}.0.lora_B"), b.0.clone(), b.1.clone()),
+            ],
+            peft: vec![
+                (
+                    format!("base_model.model.{stem}.lora_A.weight"),
+                    a.0.clone(),
+                    a.1.clone(),
+                ),
+                (
+                    format!("{stem}.lora_A.weight"),
+                    a.0.clone(),
+                    fill(2, 4, 5.0),
+                ),
+                (
+                    format!("base_model.model.{stem}.lora_B.weight"),
+                    b.0.clone(),
+                    b.1.clone(),
+                ),
+            ],
+            expect: "more than once",
+        },
+        // A name with no dot at all — nothing can be split out of it, so the target key would be
+        // whatever the parser guessed.
+        TwoReaderRefusal {
+            rule: "a tensor name with no separator",
+            declared: "lora",
+            native: vec![("loraA".to_string(), a.0.clone(), a.1.clone())],
+            peft: vec![("loraA".to_string(), a.0.clone(), a.1.clone())],
+            expect: "unparseable",
+        },
+        // A name that splits once and then runs out: native loses its index segment, PEFT loses its
+        // factor segment. Either way the remaining text is not a target stem.
+        //
+        // The PEFT spelling is `lora_A.weight` rather than the more obvious `to_q.weight` on
+        // purpose. Without the refusal, `to_q.weight` still fails — the salvaged `to_q` is not a
+        // known factor — so it does not discriminate. `lora_A.weight` salvages a name that *is* a
+        // known factor, so dropping the refusal makes the file load, under the nonsense target key
+        // `lora_A.weight`.
+        TwoReaderRefusal {
+            rule: "a tensor name missing its middle segment",
+            declared: "lora",
+            native: vec![("to_q.lora_A".to_string(), a.0.clone(), a.1.clone())],
+            peft: vec![
+                ("lora_A.weight".to_string(), a.0.clone(), a.1.clone()),
+                ("lora_B.weight".to_string(), b.0.clone(), b.1.clone()),
+            ],
+            expect: "segment",
+        },
+        // No adapter modules at all. An empty adapter that loads is an adapter that folds nothing
+        // while every surface reports it as applied.
+        TwoReaderRefusal {
+            rule: "an adapter with no modules",
+            declared: "lora",
+            native: Vec::new(),
+            peft: Vec::new(),
+            expect: "no adapter modules",
+        },
+        // An adapter type neither reader implements. The declaration is spelled differently on each
+        // side — native metadata `adapter_type`, PEFT config `sa3_adapter_type` — but both hand it
+        // to the same `resolve_adapter_type`, and that refusal was ungated on *both* readers. A
+        // silent fallback to classic LoRA folds a file the crate does not implement and reports
+        // success.
+        TwoReaderRefusal {
+            rule: "an unrecognized declared adapter type",
+            declared: "lokr",
+            native: vec![
+                (format!("{stem}.0.lora_A"), a.0.clone(), a.1.clone()),
+                (format!("{stem}.0.lora_B"), b.0.clone(), b.1.clone()),
+            ],
+            peft: vec![
+                (
+                    format!("base_model.model.{stem}.lora_A.weight"),
+                    a.0.clone(),
+                    a.1.clone(),
+                ),
+                (
+                    format!("base_model.model.{stem}.lora_B.weight"),
+                    b.0.clone(),
+                    b.1.clone(),
+                ),
+            ],
+            expect: "unknown Stable Audio 3 adapter type",
+        },
+    ] {
+        case.assert_refused_by_both_readers(&dir);
+    }
+
+    // The control: the same two spellings, well formed, load from both readers — so every refusal
+    // above is attributable to the rule under test and not to a fixture this case cannot write.
+    let good = AdapterRecipe::new("lora", 2, 1.0)
+        .factor(TARGET, "lora_A", a.0.clone(), a.1.clone())
+        .factor(TARGET, "lora_B", b.0.clone(), b.1.clone());
+    let good_native = dir.join("control.safetensors");
+    good.write_native(&good_native);
+    load_adapter(&spec(&good_native, 1.0), &Device::Cpu).expect("native control");
+    let good_peft = dir.join("control-peft");
+    good.write_peft(&good_peft);
+    load_adapter(&spec(&good_peft, 1.0), &Device::Cpu).expect("peft control");
+}
+
+/// The native reader's safetensors metadata declarations are required, not defaulted.
+///
+/// The PEFT sibling of this case is `a_malformed_peft_config_is_refused_rather_than_defaulted`.
+/// The two readers do **not** agree here and are not supposed to: `sa3_adapter_type` is optional in
+/// a PEFT config and defaults to `"lora"`, because that is what upstream PEFT writes, while a
+/// native file is written by this crate and declares its type. That asymmetry is exactly why the
+/// native side needs its own case — the shared table above cannot express a rule only one reader
+/// has, and dropping `adapter_type` from a native file was green without this.
+#[test]
+fn native_metadata_declarations_are_required_not_defaulted() {
+    let dir = scratch("native-metadata");
+    let stem = TARGET.strip_suffix(".weight").expect("target stem");
+    let path = dir.join("metadata.safetensors");
+    let tensors = vec![
+        (format!("{stem}.0.lora_A"), vec![2, 4], fill(2, 4, 1.0)),
+        (format!("{stem}.0.lora_B"), vec![4, 2], fill(4, 2, 2.0)),
+    ];
+    let good: Vec<(&str, &str)> = vec![
+        ("adapter_type", "lora"),
+        ("rank", "2"),
+        ("alpha", "1"),
+        ("include", ""),
+        ("exclude", ""),
+    ];
+    let write = |entries: &[(&str, &str)]| {
+        let metadata: HashMap<String, String> = entries
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect();
+        write_raw_safetensors(&path, &tensors, Some(metadata));
+    };
+
+    // The baseline loads, so every refusal below is attributable to the edited key.
+    write(&good);
+    load_adapter(&spec(&path, 1.0), &Device::Cpu).expect("baseline native metadata");
+
+    // Each of the three required keys, dropped one at a time. A default for any of them produces an
+    // adapter that loads and folds at a strength or in a form it was not trained at.
+    for dropped in ["adapter_type", "rank", "alpha"] {
+        let entries: Vec<(&str, &str)> = good
+            .iter()
+            .copied()
+            .filter(|(key, _)| *key != dropped)
+            .collect();
+        write(&entries);
+        assert!(
+            load_adapter(&spec(&path, 1.0), &Device::Cpu).is_err(),
+            "a native adapter with no `{dropped}` metadata was accepted; the declaration was \
+             defaulted instead of refused"
+        );
+    }
+
+    // A present-but-unparseable `rank` or `alpha` is refused too, not silently coerced.
+    for (key, value) in [("rank", "two"), ("alpha", "loud"), ("rank", "0")] {
+        let entries: Vec<(&str, &str)> = good
+            .iter()
+            .copied()
+            .map(|(k, v)| if k == key { (k, value) } else { (k, v) })
+            .collect();
+        write(&entries);
+        assert!(
+            load_adapter(&spec(&path, 1.0), &Device::Cpu).is_err(),
+            "a native adapter declaring `{key}` as {value:?} was accepted"
+        );
+    }
+
+    // Restoring the baseline loads again, proving the refusals came from the edited key.
+    write(&good);
+    load_adapter(&spec(&path, 1.0), &Device::Cpu).expect("restored native metadata");
 }
 
 // ---------------------------------------------------------------------------------------------

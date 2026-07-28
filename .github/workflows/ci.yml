@@ -230,9 +230,9 @@ jobs:
         # time for zero executed cases.
         #
         # The named eleven and what they execute on a PR (measured, by running this step's exact
-        # command on the merged tree): `adapters` 34, `audio_edit` 20, `sampler_oracle` 17,
+        # command on the merged tree): `adapters` 36, `audio_edit` 20, `sampler_oracle` 17,
         # `reference_audio` 7, `provider` 3, `listening_stimuli` 3, `dtype_policy` 2,
-        # `conformance` 1, `primitive_oracle` 1, `same_oracle` 1, `variant_quality` 1 — 90
+        # `conformance` 1, `primitive_oracle` 1, `same_oracle` 1, `variant_quality` 1 — 92
         # weight-free cases.
         # sc-14545 review found
         # `sampler_oracle`, `same_oracle` and `primitive_oracle` running in no automatic lane at all
@@ -272,7 +272,7 @@ jobs:
         # between them. All three gates are verified to fail under their own single-token mutation,
         # not merely to pass under the correct code.
         #
-        # sc-14550 adds `adapters`, the load-time adapter target, with 29 weight-free cases (three
+        # sc-14550 adds `adapters`, the load-time adapter target, with 36 weight-free cases (four
         # further cases are `#[ignore]`d and run on `sa3-base-identity-{metal,cuda}`). This target
         # carries the whole eight-type family — `lora`, `dora-rows`, `dora-cols`, `bora` and their
         # four `-xs` siblings, plus the legacy `dora` alias — because **no Stable Audio 3 adapter

@@ -291,10 +291,73 @@ non-`.weight` key in `real_key_shapes()` was 1-D and thus rejected on rank alone
 tensors), and adding it is what makes the rule discriminating. Without it a regression would make a
 learned parameter table an adapter target.
 
+### Two readers, one rule: the asymmetry round 3 found
+
+`load_native` and `load_peft` are separate parsers over separate on-disk spellings, and each carries
+its **own copy** of the same tensor-level rules. Every non-`#[ignore]`d fixture that fed tensors went
+through `write_native`, and the only PEFT tensor case was a happy-path round trip — so each shared
+rule was gated exactly once, on whichever reader the fixture happened to use, and the other reader's
+copy was dark. Deleting `load_peft`'s `finite_or_err` left the whole suite green: a PEFT adapter
+carrying NaN factors would load, plan, and fold into the checkpoint.
+
+The fix is a table, not three more one-off cases. `both_readers_enforce_the_same_tensor_level_rules`
+holds one row per shared rule, each row carrying the two spellings and one expected substring, and
+the runner asserts refusal on **both** readers. Adding a shared rule is one row; it cannot be gated
+on one parser by accident. Writing it that way immediately paid: three more shared rules turned out
+to be dark, one of them on *both* readers.
+
+Every row below was verified by applying the edit to `src/adapters.rs` and re-running
+`--test adapters`. The "before" column is not an inference: each edit was re-run against the suite
+as it stood at `7ca082fb`, with `tests/adapters.rs` checked out from that commit, and observed green.
+
+Note that the native reader is *not* the well-covered one — six of these rows are native-side. The
+suite's shape, not either parser, is what decided which rules had a witness: whichever spelling a
+fixture happened to use is the one that got gated. `a_native_adapter_index_segment_must_be_an_integer`
+gates a **non-integer** index and says nothing about an index that is missing altogether.
+
+| edit | before | after |
+|---|---|---|
+| PEFT `finite_or_err(…)` deleted | green | **RED** — `both_readers_enforce_the_same_tensor_level_rules` |
+| PEFT `NATIVE_FACTORS` check deleted | green | **RED** — same |
+| PEFT duplicate-factor refusal → `&& false` | green | **RED** — same |
+| PEFT "unparseable tensor" → salvage the whole name | green | **RED** — same |
+| PEFT "no factor segment" → salvage `head` | green | **RED** — same |
+| native duplicate-factor refusal → `&& false` | green | **RED** — same |
+| native "unparseable tensor" → salvage the whole name | green | **RED** — same |
+| native "no index segment" → salvage `head` with index `0` | green | **RED** — same |
+| `resolve_adapter_type(…)?` → `.unwrap_or(Lora)`, **PEFT** | green | **RED** — same |
+| `resolve_adapter_type(…)?` → `.unwrap_or(Lora)`, **native** | green | **RED** — same |
+| `finish_modules`' `modules.is_empty()` → `if false` | green | **RED** — same |
+| native `adapter_type` metadata absent → default `"lora"` | green | **RED** — `native_metadata_declarations_are_required_not_defaulted` |
+| native `rank` metadata absent / non-integer / `0` | green | **RED** — same |
+| native `alpha` metadata absent / non-numeric | green | **RED** — same |
+| PEFT `adapter_config.json` not UTF-8, or not JSON, or not an object | green | **RED** — `a_malformed_peft_config_is_refused_rather_than_defaulted` |
+
+Two notes on making these discriminating, both learned by watching a case pass under the mutation:
+
+* The PEFT "missing middle segment" row is spelled `lora_A.weight`, not the more obvious
+  `to_q.weight`. Without the refusal, `to_q.weight` still fails — the salvaged `to_q` is not a known
+  factor — so it proves nothing. `lora_A.weight` salvages a name that *is* a known factor, so the
+  file loads under the nonsense target key `lora_A.weight`.
+* The unreadable-config row is spelled as **invalid UTF-8 bytes**, not as a permissions edit.
+  `read_to_string` fails on both, but only the bytes behave the same way on every platform and for
+  every user, including a CI job running as root.
+
+The native reader's metadata case is separate from the shared table on purpose: `sa3_adapter_type`
+is genuinely **optional** in a PEFT config and defaults to `"lora"`, because that is what upstream
+PEFT writes, while a native file is written by this crate and declares its type. That asymmetry is
+real, so it does not belong in a table whose contract is "both readers, same rule".
+
+The full sweep covered all fifteen refusals reachable in `load_peft`; each is now RED under a
+mutation that neuters it. The two remaining `?` sites in that function — `MmapedSafetensors::new`
+and `file.load` — are error propagation with no fallback branch to neuter; the missing-sidecar case
+ahead of them is gated by `a_peft_directory_round_trips_the_whole_family` (`weights.is_file() &&
+config.is_file()` → `true` is RED there).
+
 ## CI
 
 * **Weight-free**: `--test adapters` added to ci.yml's SA3 step. The lane now runs **eleven targets /
-  90 live cases** (was ten / 56), measured by running the step. The audit comment is updated from the
+  92 live cases** (was ten / 56), measured by running the step. The audit comment is updated from the
   measurement, and `scripts/tests/test_sa3_ci_target_coverage.py` passes.
 * **Real weights**: `--test adapters -- --ignored` on `sa3-base-identity-metal` and
   `sa3-base-identity-cuda`, verified against the jobs' actual `--test` flags rather than their
