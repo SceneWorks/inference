@@ -24,7 +24,7 @@
 //! is **0.31.2** (which reworked the NAX bf16 kernels), so bf16 parity is exact only up to that
 //! cross-version kernel difference (f32 is bit-exact across the two) until the pin moves to 0.31.2.
 
-use mlx_gen::adapters::{AdaptableHost, AdaptableLinear, Adapter};
+use mlx_gen::adapters::{AdaptableHost, AdaptableLinear, Adapter, DiffPatchPart};
 use mlx_gen::array::scalar;
 use mlx_gen::train::lora::LoraParams;
 use mlx_gen::weights::Weights;
@@ -221,6 +221,19 @@ impl SelfAttention {
             ["k"] => Some(&mut self.k),
             ["v"] => Some(&mut self.v),
             ["o"] => Some(&mut self.o),
+            _ => None,
+        }
+    }
+
+    /// Route a ComfyUI/lightx2v diff-patch target to this attention's qk-RMSNorm gain (sc-15326).
+    /// RMSNorm here is weight-only, so a `.diff_b` on `norm_q`/`norm_k` resolves to nothing and is
+    /// surfaced as a skip rather than inventing an offset the reference module does not have. These
+    /// gains are dense on **every** quant tier (`_quantize_predicate` packs only the attn/FFN Linears),
+    /// which is what makes a fold through this surface tier-independent.
+    fn norm_param_mut(&mut self, path: &[&str], part: DiffPatchPart) -> Option<&mut Array> {
+        match (path, part) {
+            (["norm_q"], DiffPatchPart::Weight) => Some(&mut self.norm_q),
+            (["norm_k"], DiffPatchPart::Weight) => Some(&mut self.norm_k),
             _ => None,
         }
     }
@@ -422,6 +435,19 @@ impl CrossAttention {
         }
     }
 
+    /// Route a ComfyUI/lightx2v diff-patch target to this attention's qk-RMSNorm gain (sc-15326).
+    /// RMSNorm here is weight-only, so a `.diff_b` on `norm_q`/`norm_k` resolves to nothing and is
+    /// surfaced as a skip rather than inventing an offset the reference module does not have. These
+    /// gains are dense on **every** quant tier (`_quantize_predicate` packs only the attn/FFN Linears),
+    /// which is what makes a fold through this surface tier-independent.
+    fn norm_param_mut(&mut self, path: &[&str], part: DiffPatchPart) -> Option<&mut Array> {
+        match (path, part) {
+            (["norm_q"], DiffPatchPart::Weight) => Some(&mut self.norm_q),
+            (["norm_k"], DiffPatchPart::Weight) => Some(&mut self.norm_k),
+            _ => None,
+        }
+    }
+
     /// Cached K/V from the (bf16) text context `[B, L_ctx, dim]` — computed once, reused per step.
     /// `B` is the forward batch (2 for CFG cond+uncond, 1 otherwise); returns `(k, v)` each
     /// `[B, n, L_ctx, d]`.
@@ -507,6 +533,20 @@ impl Block {
             ["cross_attn", rest @ ..] => self.cross_attn.adaptable_mut(rest),
             ["ffn", "fc1"] => Some(&mut self.ffn_fc1),
             ["ffn", "fc2"] => Some(&mut self.ffn_fc2),
+            _ => None,
+        }
+    }
+
+    /// Route a diff-patch target to this block's dense norm parameters (sc-15326): the two attentions'
+    /// qk-RMSNorm gains, and the affine cross-attention LayerNorm `norm3` (both halves). Every one of
+    /// them stays dense at Q4/Q8, so a lightx2v step-distill file's 200 `.diff` + 40 `norm3.diff_b`
+    /// deltas fold identically on every tier.
+    fn norm_param_mut(&mut self, path: &[&str], part: DiffPatchPart) -> Option<&mut Array> {
+        match (path, part) {
+            (["self_attn", rest @ ..], _) => self.self_attn.norm_param_mut(rest, part),
+            (["cross_attn", rest @ ..], _) => self.cross_attn.norm_param_mut(rest, part),
+            (["norm3"], DiffPatchPart::Weight) => Some(&mut self.norm3_w),
+            (["norm3"], DiffPatchPart::Bias) => Some(&mut self.norm3_b),
             _ => None,
         }
     }
@@ -691,7 +731,43 @@ pub const WAN_GLOBAL_ADAPTABLE_PATHS: &[&str] = &[
     "head.head",
 ];
 
+/// The per-block **norm** parameters a ComfyUI/lightx2v diff-patch can fold into, as
+/// `(module suffix, part)` pairs in native converted naming (sc-15326). Exactly the five norms a Wan
+/// step-distill / lightning file patches: the self- and cross-attention qk-RMSNorm gains (weight-only)
+/// and the affine cross-attention LayerNorm `norm3` (weight **and** bias).
+///
+/// Single source of truth for what [`WanTransformer::norm_param_mut`] routes, so a test can assert the
+/// two agree instead of trusting a hand-kept list. Deliberately **not** part of
+/// [`AdaptableHost::adaptable_paths`]: these are not `AdaptableLinear`s and are not LoRA-trainable
+/// targets — they are a diff-patch fold surface only.
+pub const WAN_BLOCK_NORM_DIFF_PATCH_TARGETS: &[(&str, DiffPatchPart)] = &[
+    ("self_attn.norm_q", DiffPatchPart::Weight),
+    ("self_attn.norm_k", DiffPatchPart::Weight),
+    ("cross_attn.norm_q", DiffPatchPart::Weight),
+    ("cross_attn.norm_k", DiffPatchPart::Weight),
+    ("norm3", DiffPatchPart::Weight),
+    ("norm3", DiffPatchPart::Bias),
+];
+
 impl WanTransformer {
+    /// Route a diff-patch delta to the dense **norm** parameter at `path` (native converted naming),
+    /// the norm analog of [`global_adaptable_mut`](Self::global_adaptable_mut) (sc-15326). Composed in
+    /// by a host's [`AdaptableHost::diff_patch_param_mut`]; `mlx-gen-krea-realtime` does, so a lightx2v
+    /// step-distill LoRA's 200 `.diff` + 40 `norm3.diff_b` norm deltas land instead of being dropped.
+    ///
+    /// Every parameter reachable here is dense on **every** quant tier — the reference
+    /// `_quantize_predicate` packs only the per-block attention/FFN Linears — so the fold is
+    /// tier-independent, unlike a weight `.diff` into a Linear.
+    pub fn norm_param_mut(&mut self, path: &[&str], part: DiffPatchPart) -> Option<&mut Array> {
+        match path {
+            ["blocks", i, rest @ ..] => self
+                .blocks
+                .get_mut(i.parse::<usize>().ok()?)?
+                .norm_param_mut(rest, part),
+            _ => None,
+        }
+    }
+
     /// Route one of the seven whole-model [`WAN_GLOBAL_ADAPTABLE_PATHS`] to its [`AdaptableLinear`], in
     /// **native converted** naming. Returns `None` for anything else — including the per-block paths,
     /// which [`AdaptableHost::adaptable_mut`] already routes; a host composes the two.

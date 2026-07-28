@@ -553,6 +553,24 @@ fn open_transformer_weights(root: &Path) -> Result<Weights> {
 /// names (the FFN `ffn.0`/`ffn.2` reference keys normalized to the converted `ffn.fc1`/`fc2` by
 /// [`CausalKreaTransformer`]'s adaptable host); the installer **errors — never silently drops** — on a
 /// format/prefix mismatch or an unmatched target.
+///
+/// ## Diff-patch deltas (sc-15326)
+///
+/// The installer is the **`_with_diff_patch`** variant, so a ComfyUI/lightx2v step-distill or lightning
+/// file's `‹module›.diff` / `.diff_b` deltas are folded as well as its low-rank factors. Measured on
+/// `lightx2v_T2V_14B_cfg_step_distill_v2_lora_rank64` (1459 tensors): 406 low-rank pairs **plus** 447
+/// `.diff_b` and 200 `.diff` — 647 keys the plain installer dropped without a word, leaving a render
+/// that is changed but not by the whole LoRA.
+///
+/// All 647 now land, **on every tier**. That is the whole reason this is the `_with_diff_patch` call
+/// rather than a warning: the naive switch would have folded only 7 of them at the default Q4 (a
+/// weight `.diff` cannot fold into a packed Linear) against 407 at bf16, so the same LoRA would render
+/// differently per tier — unacceptable where the quant tier is a creative choice. Both of the channels
+/// this file actually uses are tier-independent instead: a `.diff_b` folds into the Linear's **bias**,
+/// which a `QuantizedLinear` keeps dense, and the `.diff` deltas all target **norms**, which no tier
+/// packs (routed by [`CausalKreaTransformer`]'s `diff_patch_param_mut`). Anything that still cannot
+/// land is returned on `ApplyReport::diff_patch_unapplied` for the provider to put in front of the
+/// user, not left in a log line.
 fn load_transformer(
     root: &Path,
     cfg: &KreaRealtimeConfig,
@@ -573,13 +591,20 @@ fn load_transformer(
     }
     let mut transformer = CausalKreaTransformer::new(dit, cfg);
     if !adapters.is_empty() {
-        let report =
-            mlx_gen::adapters::loader::apply_adapters_strict(&mut transformer, adapters, MODEL_ID)?;
-        // Surface the applied count (unmatched targets already errored above, never silently dropped).
+        let report = mlx_gen::adapters::loader::apply_adapters_strict_with_diff_patch(
+            &mut transformer,
+            adapters,
+            MODEL_ID,
+        )?;
+        // Surface the applied count (unmatched low-rank targets already errored above, never silently
+        // dropped) AND anything the diff-patch pass could not land — the sc-15326 point: a partial
+        // install must never read as a clean one.
         eprintln!(
-            "{MODEL_ID}: installed {} LoRA target residual(s) from {} adapter file(s)",
+            "{MODEL_ID}: installed {} LoRA target(s) from {} adapter file(s); {} diff-patch delta(s) \
+             unapplied",
             report.applied,
-            adapters.len()
+            adapters.len(),
+            report.diff_patch_unapplied.len()
         );
     }
     Ok(transformer)

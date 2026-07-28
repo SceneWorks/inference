@@ -22,7 +22,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use mlx_gen::adapters::loader::apply_adapters_strict;
+use mlx_gen::adapters::loader::{apply_adapters_strict, apply_adapters_strict_with_diff_patch};
 use mlx_gen::adapters::AdaptableHost;
 use mlx_gen::{AdapterKind, AdapterSpec};
 use mlx_gen_krea_realtime::{
@@ -717,5 +717,220 @@ fn lokr_installs_on_dense_and_changes_forward() {
     assert!(
         delta > 1e-3 * signal,
         "a LoKr must change the forward: max|Δ|={delta} (signal ~{signal})"
+    );
+}
+
+// ── sc-15326: ComfyUI/lightx2v diff-patch deltas, and their tier-independence ────────────────────
+
+/// Write a **lightx2v-shaped diff-patch** file for the tiny geometry: the exact key *shapes* a real
+/// `lightx2v_T2V_14B_cfg_step_distill_v2_lora_rank64` carries, scaled down to this fixture.
+///
+/// Per block: a `.diff_b` bias delta on each of the 10 attention/FFN Linears, a `.diff` weight delta on
+/// each of the 5 norms (`self_attn.norm_q/norm_k`, `cross_attn.norm_q/norm_k`, `norm3`) and a
+/// `norm3.diff_b`. Whole-model: a `.diff_b` on each of the 7 globals. On the real 40-block file that is
+/// 447 `.diff_b` + 200 `.diff` = 647 keys, every one of which the plain `apply_adapters_strict` path
+/// dropped without a word before sc-15326.
+///
+/// Returns `(path, expected_fold_count)`.
+fn write_lightx2v_shaped_diff_patch(name: &str, cfg: &KreaRealtimeConfig) -> (PathBuf, usize) {
+    let w = &cfg.wan;
+    let dim = w.dim as i32;
+    let ffn = w.ffn_dim as i32;
+    let (pt, ph, pw) = w.patch_size;
+    let head_out = w.out_dim as i32 * pt as i32 * ph as i32 * pw as i32;
+
+    let mut entries: Vec<(String, Array)> = Vec::new();
+    let mut seed = 500u64;
+    let mut put = |entries: &mut Vec<(String, Array)>, key: String, shape: &[i32]| {
+        seed += 1;
+        entries.push((key, det_fill(shape, seed, 0.05, 0.0, Dtype::Float32)));
+    };
+
+    // The 7 whole-model Linears, in the file (reference) spelling.
+    for (stem, out) in [
+        ("patch_embedding", dim),
+        ("text_embedding.0", dim),
+        ("text_embedding.2", dim),
+        ("time_embedding.0", dim),
+        ("time_embedding.2", dim),
+        ("time_projection.1", 6 * dim),
+        ("head.head", head_out),
+    ] {
+        put(
+            &mut entries,
+            format!("diffusion_model.{stem}.diff_b"),
+            &[out],
+        );
+    }
+
+    for i in 0..w.num_layers {
+        let p = format!("diffusion_model.blocks.{i}");
+        for attn in ["self_attn", "cross_attn"] {
+            for proj in ["q", "k", "v", "o"] {
+                put(&mut entries, format!("{p}.{attn}.{proj}.diff_b"), &[dim]);
+            }
+            // qk-RMSNorm gains: weight-only (`.diff`), no bias channel.
+            put(&mut entries, format!("{p}.{attn}.norm_q.diff"), &[dim]);
+            put(&mut entries, format!("{p}.{attn}.norm_k.diff"), &[dim]);
+        }
+        put(&mut entries, format!("{p}.ffn.0.diff_b"), &[ffn]);
+        put(&mut entries, format!("{p}.ffn.2.diff_b"), &[dim]);
+        // The affine cross-attention LayerNorm carries BOTH halves.
+        put(&mut entries, format!("{p}.norm3.diff"), &[dim]);
+        put(&mut entries, format!("{p}.norm3.diff_b"), &[dim]);
+    }
+
+    let expected = entries.len();
+    let dir = std::env::temp_dir().join("mlx_gen_krea_style_lora_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(name);
+    let refs: Vec<(&str, &Array)> = entries.iter().map(|(k, v)| (k.as_str(), v)).collect();
+    Array::save_safetensors(refs, None, &path).unwrap();
+    (path, expected)
+}
+
+/// A tiny Krea Realtime DiT packed to Q4 **before** the adapter install — the default product tier, and
+/// the order `t2v::load_transformer` uses.
+fn tiny_transformer_q4(cfg: &KreaRealtimeConfig) -> CausalKreaTransformer {
+    let mut dit =
+        load_krea_realtime_transformer(native_random_map(cfg), cfg).expect("load tiny DiT");
+    dit.quantize(4, None).expect("quantize to Q4");
+    CausalKreaTransformer::new(dit, cfg)
+}
+
+/// **sc-15326, the decision gate.** A lightx2v-shaped diff-patch file must apply **completely and
+/// identically** on the default packed Q4 tier and on dense bf16.
+///
+/// This is the whole reason Krea Realtime folds diff-patch deltas through the bias + norm channels
+/// rather than simply calling `apply_adapters_strict_with_diff_patch` and accepting what lands: a
+/// weight `.diff` cannot fold into a packed Linear, so the naive switch would have applied only the 7
+/// dense globals at Q4 against 407 at bf16 — the same LoRA rendering differently depending on a tier
+/// the user picks for *creative* reasons. The two channels this file actually uses are dense on every
+/// tier (a `QuantizedLinear` keeps its bias dense; norms are never in the quantize predicate), so the
+/// counts must match exactly.
+///
+/// Discriminating on three axes at once: the fold count (a tier-gated bias fold collapses the Q4 arm),
+/// the unapplied list (any drop, silent or not, shows up), and the forward (a fold that resolved but
+/// wrote nothing leaves the output bit-identical to baseline).
+#[test]
+fn lightx2v_shaped_diff_patch_applies_identically_on_q4_and_dense() {
+    let cfg = tiny_cfg();
+    let (dp, expected) = write_lightx2v_shaped_diff_patch("krea_diff_patch.safetensors", &cfg);
+    // 2 blocks × (10 `.diff_b` + 5 `.diff` + 1 `norm3.diff_b`) + 7 global `.diff_b`.
+    assert_eq!(expected, 2 * 16 + 7, "fixture shape");
+
+    let mut reports = Vec::new();
+    let mut changed = Vec::new();
+    for (label, mut host) in [
+        ("dense", tiny_transformer(&cfg)),
+        ("q4", tiny_transformer_q4(&cfg)),
+    ] {
+        let xkv = cross_kv(&host, &cfg);
+        let before = forward_once(&host, &xkv, &cfg);
+        let report =
+            apply_adapters_strict_with_diff_patch(&mut host, &[spec(dp.clone(), 1.0)], MODEL_ID)
+                .unwrap_or_else(|e| panic!("{label}: diff-patch install failed: {e}"));
+        let after = forward_once(&host, &xkv, &cfg);
+        changed.push((label, max_abs_diff(&before, &after)));
+        reports.push((label, report));
+    }
+
+    for (label, report) in &reports {
+        assert_eq!(
+            report.applied, expected,
+            "{label}: every diff-patch delta must land, not just the dense ones"
+        );
+        assert!(
+            report.diff_patch_unapplied.is_empty(),
+            "{label}: nothing may be dropped: {:?}",
+            report.diff_patch_unapplied
+        );
+    }
+    assert_eq!(
+        reports[0].1.applied, reports[1].1.applied,
+        "the SAME LoRA must apply the same number of deltas on Q4 as on bf16 — tier is a creative \
+         choice, not an adapter-coverage knob"
+    );
+    for (label, delta) in &changed {
+        assert!(
+            *delta > 1e-4,
+            "{label}: the diff-patch fold changed nothing in the forward (delta {delta})"
+        );
+    }
+}
+
+/// The `.diff` norm deltas reach the **norm** parameters specifically — not silently absorbed by the
+/// Linear surface. A file carrying ONLY the 5 per-block norm `.diff` deltas (no `.diff_b`, no low-rank
+/// factors) installs cleanly and moves the forward; before sc-15326 these had nowhere to land at any
+/// `AdaptableHost` width and were dropped without a word.
+#[test]
+fn norm_only_diff_patch_installs_through_the_norm_param_surface() {
+    let cfg = tiny_cfg();
+    let dim = cfg.wan.dim as i32;
+    let mut entries: Vec<(String, Array)> = Vec::new();
+    for i in 0..cfg.wan.num_layers {
+        let p = format!("diffusion_model.blocks.{i}");
+        for stem in [
+            "self_attn.norm_q",
+            "self_attn.norm_k",
+            "cross_attn.norm_q",
+            "cross_attn.norm_k",
+            "norm3",
+        ] {
+            entries.push((
+                format!("{p}.{stem}.diff"),
+                det_fill(&[dim], 900 + i as u64, 0.2, 0.0, Dtype::Float32),
+            ));
+        }
+    }
+    let dir = std::env::temp_dir().join("mlx_gen_krea_style_lora_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("krea_norm_only_diff.safetensors");
+    let refs: Vec<(&str, &Array)> = entries.iter().map(|(k, v)| (k.as_str(), v)).collect();
+    Array::save_safetensors(refs, None, &path).unwrap();
+
+    let mut host = tiny_transformer_q4(&cfg);
+    let xkv = cross_kv(&host, &cfg);
+    let before = forward_once(&host, &xkv, &cfg);
+    let report =
+        apply_adapters_strict_with_diff_patch(&mut host, &[spec(path, 1.0)], MODEL_ID).unwrap();
+    assert_eq!(report.applied, 5 * cfg.wan.num_layers);
+    assert!(report.diff_patch_unapplied.is_empty());
+    let after = forward_once(&host, &xkv, &cfg);
+    assert!(
+        max_abs_diff(&before, &after) > 1e-4,
+        "a norm .diff fold that resolved but wrote nothing would leave the forward unchanged"
+    );
+}
+
+/// No silent drop survives: a diff-patch key for a module this **T2V** backbone does not have (an
+/// I2V file's `cross_attn.norm_k_img`) is reported on `ApplyReport::diff_patch_unapplied` — the
+/// channel a provider stamps into user-visible asset provenance — while the rest of the file installs.
+#[test]
+fn out_of_surface_diff_patch_key_is_reported_not_dropped() {
+    let cfg = tiny_cfg();
+    let dim = cfg.wan.dim as i32;
+    let d = det_fill(&[dim], 1234, 0.2, 0.0, Dtype::Float32);
+    let dir = std::env::temp_dir().join("mlx_gen_krea_style_lora_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("krea_i2v_norm_diff.safetensors");
+    Array::save_safetensors(
+        vec![
+            ("diffusion_model.blocks.0.norm3.diff", &d),
+            ("diffusion_model.blocks.0.cross_attn.norm_k_img.diff", &d),
+        ],
+        None,
+        &path,
+    )
+    .unwrap();
+
+    let mut host = tiny_transformer(&cfg);
+    let report =
+        apply_adapters_strict_with_diff_patch(&mut host, &[spec(path, 1.0)], MODEL_ID).unwrap();
+    assert_eq!(report.applied, 1, "the in-surface norm delta still lands");
+    assert_eq!(
+        report.diff_patch_unapplied,
+        vec!["blocks.0.cross_attn.norm_k_img".to_string()],
+        "an out-of-surface diff-patch target must reach the caller, never be dropped in silence"
     );
 }

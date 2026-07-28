@@ -2160,6 +2160,71 @@ mod tests {
         WanTransformer::from_weights(&w, cfg).unwrap()
     }
 
+    use crate::transformer::WAN_BLOCK_NORM_DIFF_PATCH_TARGETS;
+
+    /// sc-15326 — the norm diff-patch surface routes each `(module, part)` to a **distinct** parameter.
+    ///
+    /// A step-distill LoRA patches `norm3` on both halves (`norm3.diff` + `norm3.diff_b`), so an
+    /// aliased or swapped routing would fold the bias delta onto the LayerNorm *gain* — a wrong render
+    /// that still reports a clean, fully-applied install. Discriminating by construction: it stamps a
+    /// unique marker through each of the six targets and requires all six to read back distinctly, so
+    /// any two entries resolving to the same `&mut Array` fail.
+    #[test]
+    fn wan_norm_diff_patch_targets_route_to_distinct_parameters() {
+        let cfg = tiny_cfg();
+        let mut dit = tiny_transformer(&cfg);
+        assert_eq!(
+            WAN_BLOCK_NORM_DIFF_PATCH_TARGETS.len(),
+            6,
+            "4 qk-RMSNorm gains + norm3 weight + norm3 bias"
+        );
+
+        // Stamp a unique constant into every target.
+        for (i, (suffix, part)) in WAN_BLOCK_NORM_DIFF_PATCH_TARGETS.iter().enumerate() {
+            let dotted = format!("blocks.0.{suffix}");
+            let segs: Vec<&str> = dotted.split('.').collect();
+            let p = dit.norm_param_mut(&segs, *part).unwrap_or_else(|| {
+                panic!("`{dotted}` / {part:?} is advertised but does not route")
+            });
+            let marker = 100.0 + i as f32;
+            *p = Array::full::<f32>(p.shape(), &Array::from_f32(marker)).unwrap();
+        }
+
+        // Read them all back: each must still carry its OWN marker (no aliasing, no swap).
+        for (i, (suffix, part)) in WAN_BLOCK_NORM_DIFF_PATCH_TARGETS.iter().enumerate() {
+            let dotted = format!("blocks.0.{suffix}");
+            let segs: Vec<&str> = dotted.split('.').collect();
+            let p = dit.norm_param_mut(&segs, *part).expect("routed above");
+            let got = mlx_rs::ops::max(p.as_dtype(mlx_rs::Dtype::Float32).unwrap(), None)
+                .unwrap()
+                .item::<f32>();
+            assert_eq!(
+                got,
+                100.0 + i as f32,
+                "`{dotted}` / {part:?} aliases another diff-patch target"
+            );
+        }
+
+        // The qk-RMSNorms are weight-only: a `.diff_b` on one has nowhere to land and must NOT be
+        // quietly absorbed by the gain.
+        for suffix in ["self_attn.norm_q", "cross_attn.norm_k"] {
+            let dotted = format!("blocks.0.{suffix}");
+            let segs: Vec<&str> = dotted.split('.').collect();
+            assert!(
+                dit.norm_param_mut(&segs, mlx_gen::adapters::DiffPatchPart::Bias)
+                    .is_none(),
+                "`{dotted}` is an RMSNorm and has no bias channel"
+            );
+        }
+        // An out-of-surface stem routes nowhere (reported unmatched by the fold, never dropped).
+        assert!(dit
+            .norm_param_mut(
+                &["blocks", "0", "cross_attn", "norm_k_img"],
+                mlx_gen::adapters::DiffPatchPart::Weight
+            )
+            .is_none());
+    }
+
     /// A PEFT LoRA file targeting `blocks.0.self_attn.q` ([dim,dim]) — `diffusion_model.`-prefixed,
     /// A `[rank,dim]`, B `[dim,rank]`, no alpha.
     fn tiny_lora(name: &str, dim: i32, rank: i32) -> PathBuf {
