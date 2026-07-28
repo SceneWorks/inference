@@ -19,7 +19,10 @@ use mlx_rs::ops::{add, concatenate_axis, maximum, minimum, multiply, subtract};
 use mlx_rs::Array;
 
 use mlx_gen::image::resize_lanczos_u8;
-use mlx_gen::tiling::{budgeted_plan, TileCandidates, TilingBudgetError, TilingConfig, VaeTiling};
+use mlx_gen::tiling::{
+    budgeted_plan, TemporalOverlapPolicy, TileCandidates, TilingBudgetError, TilingConfig,
+    VaeTiling,
+};
 use mlx_gen::{default_seed, CancelFlag, Error, GenerationRequest, Image, Progress, Result};
 
 use crate::scheduler::{compute_sigmas, make_scheduler, SolverKind, WanScheduler};
@@ -419,6 +422,7 @@ fn plan_vae22_tiling(
         spatial_px: &VAE22_SPATIAL_PX,
         spatial_overlap_px: 64,
         temporal: &VAE22_TEMPORAL_FR,
+        temporal_overlap_policy: TemporalOverlapPolicy::Candidate,
     };
     budgeted_plan(
         VaeTiling::WAN22,
@@ -517,6 +521,24 @@ pub fn auto_tiling_budgeted_z16(
     plan_z16_tiling(height, width, out_frames, wan_vae_safe_budget_gib())
 }
 
+/// The z16 selector used by Krea Realtime and SCAIL-2. It shares Wan's candidate grid, peak model,
+/// and free-aware budget, but deliberately retains sc-15325's quality-oriented half-tile overlap.
+/// Wan's own product providers use [`auto_tiling_budgeted_z16`], which restores the measured
+/// candidate overlap after sc-15445 found the half-tile policy materially slower for a marginal gain.
+pub fn auto_tiling_budgeted_z16_quality_overlap(
+    height: i32,
+    width: i32,
+    out_frames: i32,
+) -> Result<Option<TilingConfig>> {
+    plan_z16_tiling_with_overlap(
+        height,
+        width,
+        out_frames,
+        wan_vae_safe_budget_gib(),
+        TemporalOverlapPolicy::HalfTile,
+    )
+}
+
 /// Pure z16 tile selector behind [`auto_tiling_budgeted_z16`] (the `safe_gib` ceiling is injected so it
 /// is unit-testable without touching the global memory limit). Supplies the z16 cost model + candidate
 /// grid to the shared [`budgeted_plan`]; same `Ok(None)` / `Ok(Some)` / catchable-`Err` contract as
@@ -527,10 +549,27 @@ fn plan_z16_tiling(
     out_frames: i32,
     safe_gib: f64,
 ) -> Result<Option<TilingConfig>> {
+    plan_z16_tiling_with_overlap(
+        height,
+        width,
+        out_frames,
+        safe_gib,
+        TemporalOverlapPolicy::Candidate,
+    )
+}
+
+fn plan_z16_tiling_with_overlap(
+    height: i32,
+    width: i32,
+    out_frames: i32,
+    safe_gib: f64,
+    temporal_overlap_policy: TemporalOverlapPolicy,
+) -> Result<Option<TilingConfig>> {
     let candidates = TileCandidates {
         spatial_px: &VAE16_SPATIAL_PX,
         spatial_overlap_px: 64,
         temporal: &VAE16_TEMPORAL_FR,
+        temporal_overlap_policy,
     };
     budgeted_plan(
         VaeTiling::WAN,
@@ -2082,6 +2121,62 @@ mod tests {
             peak <= safe,
             "z16 chosen peak {peak:.1} GiB over safe {safe:.1}"
         );
+    }
+
+    /// sc-15445 decision gate: Wan product selectors restore the historical candidate overlap while
+    /// Krea/SCAIL-2's z16 selector retains half-tile overlap. The budgets deliberately select the
+    /// 32-frame row measured at 640×384×81, so changing either policy is independently red.
+    #[test]
+    fn wan_product_and_quality_selectors_keep_the_measured_overlap_split() {
+        let wan_z16 = plan_z16_tiling(384, 640, 84, 10.0).unwrap().unwrap();
+        let quality_z16 =
+            plan_z16_tiling_with_overlap(384, 640, 84, 10.0, TemporalOverlapPolicy::HalfTile)
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            wan_z16.temporal.map(|t| (t.tile_frames, t.overlap_frames)),
+            Some((32, 8)),
+        );
+        assert_eq!(
+            quality_z16
+                .temporal
+                .map(|t| (t.tile_frames, t.overlap_frames)),
+            Some((32, 16)),
+        );
+        assert_eq!(
+            wan_z16.spatial.map(|s| (s.tile_px, s.overlap_px)),
+            quality_z16.spatial.map(|s| (s.tile_px, s.overlap_px)),
+            "the policy split must change only temporal overlap",
+        );
+
+        let wan_z48 = plan_vae22_tiling(384, 640, 81, 4.5, true).unwrap().unwrap();
+        assert_eq!(
+            wan_z48.temporal.map(|t| (t.tile_frames, t.overlap_frames)),
+            Some((32, 8)),
+        );
+
+        // Recorded real-weight rows: half-tile overlap is always more accurate, but its small gain
+        // costs at least 20 % wall time while peak stays within measurement noise. This is the
+        // cost/quality conjunction behind Candidate—not either side in isolation.
+        for (old_s, half_s, old_err, half_err, old_peak, half_peak) in [
+            (66.325, 98.481, 2.4579, 1.8535, 7.793, 7.582),
+            (164.202, 216.347, 1.1873, 0.8875, 11.495, 11.811),
+            (87.143, 121.351, 0.9496, 0.7999, 4.725, 4.725),
+            (241.198, 292.123, 0.5729, 0.4760, 6.785, 6.785),
+        ] {
+            assert!(
+                half_s / old_s >= 1.20,
+                "half-tile wall cost stopped being material",
+            );
+            assert!(
+                half_err < old_err && old_err - half_err <= 0.61,
+                "recorded quality trade no longer supports the measured decision",
+            );
+            assert!(
+                (half_peak / old_peak - 1.0f64).abs() <= 0.05,
+                "overlap unexpectedly changed peak memory",
+            );
+        }
     }
 
     #[test]
