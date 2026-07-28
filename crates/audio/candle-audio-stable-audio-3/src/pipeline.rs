@@ -349,11 +349,14 @@ pub fn conditioning_is_forwarded(
 /// assertion — the same catcher as row 7 of the per-site table in
 /// `docs/migration/SC_14548_AUDIO_EDIT_INPAINT.md`, where the mutation is recorded as row 13 with
 /// the output of the run that verified it.
-#[derive(Debug, Clone, Copy, PartialEq)]
+// Not `Copy`: `AudioEdit` owns its region list (sc-14549). The bound was never load-bearing — this
+// receipt is constructed once and moved into `synthesize_conditioned`.
+#[derive(Debug, Clone, PartialEq)]
 pub struct ForwardedConditioning<'a> {
     /// Whether the request carried a `Conditioning::ReferenceAudio` item.
     pub request_has_reference: bool,
-    /// Whether the request carried a `Conditioning::AudioEdit` item.
+    /// Whether the request carried **either** audio-edit carrier (`Conditioning::AudioEdit` or
+    /// `Conditioning::AudioEditRegions`).
     pub request_has_edit: bool,
     pub reference: Option<ReferenceAudio<'a>>,
     pub edit: Option<AudioEdit<'a>>,
@@ -504,24 +507,62 @@ pub fn prepare_reference_pcm(
 /// against their original rate and then resampling the audio underneath the mask moves the edit
 /// window silently, which is why the conversion to sample indices in [`edit_geometry`] uses
 /// [`SAMPLE_RATE`] and never [`Self::sample_rate`].
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AudioEdit<'a> {
     /// Interleaved source PCM, `channels` values per frame.
     pub samples: &'a [f32],
     pub sample_rate: u32,
     pub channels: u16,
-    /// Region start, seconds on the 44.1 kHz timeline.
+    /// The spans to regenerate, seconds on the 44.1 kHz timeline. **Non-empty**; single-region
+    /// editing is the one-element case and travels this same path rather than a parallel one
+    /// (sc-14549). Any order, and overlapping / touching / duplicate spans are legal — they are
+    /// normalized into a canonical union by [`edit_geometry`].
+    pub regions: Vec<EditRegionSecs>,
+}
+
+/// One requested edit span, seconds on the post-resample 44.1 kHz timeline (sc-14549).
+///
+/// Unlike gen-core's [`TimeRegion`](candle_audio::gen_core::TimeRegion) the end is **resolved**: an
+/// absent `end_secs` has already become the source's end in [`crate::model::resolve_audio_edit`], so
+/// nothing downstream has to know what "the end of the clip" meant.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EditRegionSecs {
     pub start_secs: f32,
-    /// Region end (exclusive), seconds on the 44.1 kHz timeline.
+    /// Exclusive.
     pub end_secs: f32,
 }
 
-/// Where one edit's region lands, at both resolutions (sc-14548).
+/// Where **one** span of the normalized union lands, at both resolutions (sc-14548 / sc-14549).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EditSpan {
+    /// Span start in 44.1 kHz frames, `int(start_secs * 44_100)`.
+    pub start_sample: usize,
+    /// Span end in 44.1 kHz frames, `int(end_secs * 44_100)`, clamped to `adapted_size`.
+    pub end_sample: usize,
+    /// `ceil(start_sample / 4096)` — where the edit begins once the mask is resized.
+    pub start_latent: usize,
+    /// `ceil(end_sample / 4096)`.
+    pub end_latent: usize,
+}
+
+/// Where an edit's regions land, at both resolutions (sc-14548, generalized to a list by sc-14549).
 ///
 /// Produced by [`edit_geometry`] and consumed by [`edit_keep_mask`], [`edit_local_conditioning`] and
 /// [`stitch_outside_region`], so every one of those reads the *same* resolved indices rather than
 /// re-deriving them from seconds and drifting apart.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// # `spans` is the normalized union, and that is load-bearing
+///
+/// It is **sorted, disjoint and non-touching** in audio-sample space — the output of
+/// [`merge_edit_regions`]. Downstream code therefore never has to reason about overlap: the mask
+/// zeroes each span independently and the stitch preserves everything outside all of them, and
+/// neither can double-apply because the spans cannot intersect. Any crossfade a future change adds
+/// lands wholly inside one merged span, so no frame could receive two fades.
+///
+/// There is deliberately **no** promoted `start_sample` / `end_sample` pair on this struct. Keeping
+/// the first span in named fields alongside a list of "the others" is exactly what makes a
+/// "honours the first region, drops the rest" regression easy to write and invisible to read.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EditGeometry {
     /// The adapted sample size the mask is built over — **not** the requested duration's extent.
     pub adapted_size: usize,
@@ -529,14 +570,8 @@ pub struct EditGeometry {
     pub latent_length: usize,
     /// `int(seconds_total * 44_100)`: everything at or past this is zeroed for training parity.
     pub effective_samples: usize,
-    /// Region start in 44.1 kHz frames, `int(start_secs * 44_100)`.
-    pub start_sample: usize,
-    /// Region end in 44.1 kHz frames, `int(end_secs * 44_100)`, clamped to `adapted_size`.
-    pub end_sample: usize,
-    /// `ceil(start_sample / 4096)` — where the edit begins once the mask is resized.
-    pub start_latent: usize,
-    /// `ceil(end_sample / 4096)`.
-    pub end_latent: usize,
+    /// The normalized union: sorted, disjoint, non-touching, non-empty.
+    pub spans: Vec<EditSpan>,
 }
 
 /// Frames a clip occupies on the model's own 44.1 kHz timeline once resampled (sc-14548).
@@ -609,38 +644,108 @@ pub fn edit_geometry(
     geometry: &SampleGeometry,
     duration_secs: f32,
 ) -> Result<EditGeometry> {
-    if !(edit.start_secs.is_finite() && edit.end_secs.is_finite() && duration_secs.is_finite()) {
+    if !duration_secs.is_finite() {
         return Err(AudioError::Msg(
             "audio edit region and duration must be finite".into(),
         ));
     }
-    if edit.start_secs < 0.0 || edit.end_secs <= edit.start_secs {
-        return Err(AudioError::Msg(format!(
-            "audio edit region [{}, {}) must be non-negative and non-empty",
-            edit.start_secs, edit.end_secs
-        )));
+    if edit.regions.is_empty() {
+        return Err(AudioError::Msg(
+            "an audio edit must name at least one region".into(),
+        ));
     }
     let adapted_size = geometry.sample_size;
-    let (start_sample, end_sample) = edit_region_samples(edit.start_secs, edit.end_secs);
-    let (start_sample, end_sample) = (start_sample.min(adapted_size), end_sample.min(adapted_size));
-    let effective_samples = seconds_to_samples(duration_secs).min(adapted_size);
-    let (start_latent, end_latent) = edit_region_latents(start_sample, end_sample);
-    if end_latent <= start_latent {
-        return Err(AudioError::Msg(format!(
-            "audio edit region [{}, {}) collapses to zero latent positions ({} .. {}); it must \
-             span at least one {LATENT_DOWNSAMPLING}-sample latent frame",
-            edit.start_secs, edit.end_secs, start_latent, end_latent
-        )));
+    let mut clamped = Vec::with_capacity(edit.regions.len());
+    for region in &edit.regions {
+        if !(region.start_secs.is_finite() && region.end_secs.is_finite()) {
+            return Err(AudioError::Msg(
+                "audio edit region and duration must be finite".into(),
+            ));
+        }
+        if region.start_secs < 0.0 || region.end_secs <= region.start_secs {
+            return Err(AudioError::Msg(format!(
+                "audio edit region [{}, {}) must be non-negative and non-empty",
+                region.start_secs, region.end_secs
+            )));
+        }
+        let (start_sample, end_sample) = edit_region_samples(region.start_secs, region.end_secs);
+        let (start_sample, end_sample) =
+            (start_sample.min(adapted_size), end_sample.min(adapted_size));
+        // Checked per **requested** region, not per merged span: a caller who names a span narrower
+        // than one latent frame gets told about *that* span, and two such spans that happen to
+        // merge into a wide one do not silently become acceptable. This is the same rule the
+        // single-region path has always enforced, applied to every entry.
+        let (start_latent, end_latent) = edit_region_latents(start_sample, end_sample);
+        if end_latent <= start_latent {
+            return Err(AudioError::Msg(format!(
+                "audio edit region [{}, {}) collapses to zero latent positions ({} .. {}); it must \
+                 span at least one {LATENT_DOWNSAMPLING}-sample latent frame",
+                region.start_secs, region.end_secs, start_latent, end_latent
+            )));
+        }
+        clamped.push((start_sample, end_sample));
     }
+    let effective_samples = seconds_to_samples(duration_secs).min(adapted_size);
+    let spans = merge_edit_regions(&clamped)
+        .into_iter()
+        .map(|(start_sample, end_sample)| {
+            let (start_latent, end_latent) = edit_region_latents(start_sample, end_sample);
+            EditSpan {
+                start_sample,
+                end_sample,
+                start_latent,
+                end_latent,
+            }
+        })
+        .collect();
     Ok(EditGeometry {
         adapted_size,
         latent_length: geometry.latent_length,
         effective_samples,
-        start_sample,
-        end_sample,
-        start_latent,
-        end_latent,
+        spans,
     })
+}
+
+/// Normalize requested audio-frame regions into a canonical union: sorted, disjoint, non-touching
+/// (sc-14549).
+///
+/// # Why this exists, and why it merges rather than rejects
+///
+/// The contract accepts regions in **any order**, and accepts overlapping, touching and duplicate
+/// spans (see [`Conditioning::AudioEditRegions`](candle_audio::gen_core::Conditioning)). All of
+/// those describe the same set of frames, so rejecting them would refuse requests with an
+/// unambiguous meaning — and, worse, would make the result depend on the order the caller happened
+/// to write. Merging makes order-independence a *property of the data structure* rather than
+/// something every consumer has to remember: `[a, b]` and `[b, a]` produce the identical `Vec`, so
+/// the mask, the local conditioning and the stitch cannot disagree about which is authoritative.
+///
+/// # Why the merge is at integer 44.1 kHz sample resolution
+///
+/// Because that is the resolution the mask is *built* at. Merging in seconds would leave two spans
+/// that round to the same sample boundary looking distinct; merging at latent resolution would
+/// coalesce spans that are genuinely separate in the PCM the stitch preserves. Neither is the
+/// resolution the decision is actually made at. Latent quantization happens **after** this, per
+/// merged span, and two merged spans coalescing into the same latent range is fine — the audio-space
+/// union stays authoritative for what the final PCM preserves.
+///
+/// **Touching counts as overlapping**: `[a, b)` and `[b, c)` are merged into `[a, c)`. They cover a
+/// contiguous set of frames with no gap, so leaving them separate would produce two adjacent spans
+/// whose union is identical but whose representation is not — order-independence would hold while
+/// canonical form did not.
+///
+/// Input pairs must already be non-empty and clamped; empty input yields empty output.
+pub fn merge_edit_regions(regions: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let mut sorted = regions.to_vec();
+    sorted.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(sorted.len());
+    for (start, end) in sorted {
+        match merged.last_mut() {
+            // `start <= last.1` rather than `<`: touching spans merge too.
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    merged
 }
 
 /// The audio-resolution **keep** mask: `1.0` keeps the source, `0.0` is regenerated (sc-14548).
@@ -659,10 +764,17 @@ pub fn edit_geometry(
 /// encoded source to zero out the region the model must invent.
 pub fn edit_keep_mask(geometry: &EditGeometry) -> Vec<f32> {
     let mut mask = vec![1.0f32; geometry.adapted_size];
-    for value in &mut mask[geometry.start_sample.min(geometry.adapted_size)
-        ..geometry.end_sample.min(geometry.adapted_size)]
-    {
-        *value = 0.0;
+    // **Every** span, in one mask — not one mask per span and not one sampler run per span. That
+    // is the whole point of the multi-region contract: the regions share a single denoising
+    // trajectory, which N sequential single-region edits cannot reproduce because each of those
+    // re-noises and re-decodes. The spans are disjoint by construction (`merge_edit_regions`), so
+    // no frame is zeroed twice and the loop is order-independent.
+    for span in &geometry.spans {
+        for value in &mut mask[span.start_sample.min(geometry.adapted_size)
+            ..span.end_sample.min(geometry.adapted_size)]
+        {
+            *value = 0.0;
+        }
     }
     for value in &mut mask[geometry.effective_samples.min(geometry.adapted_size)..] {
         *value = 0.0;
@@ -759,14 +871,31 @@ pub fn tensor_has_nonzero(tensor: &Tensor) -> Result<bool> {
 /// Zero is a legitimate result, not a bug: an edit whose region covers the whole effective span
 /// hands the DiT an all-zero local conditioning on purpose (regenerate everything). Naming that is
 /// what keeps the guard below from having to pretend zero is impossible.
+/// **The union is taken in latent space, not summed.** Two spans that are disjoint and non-touching
+/// in audio samples can still quantize onto overlapping — or identical — latent ranges, because
+/// `ceil(x/4096)` is not injective. Subtracting each span's latent width independently would then
+/// double-count the shared frames and under-report what survives, which on a two-region edit
+/// covering most of the clip could report zero retained latents and take the presence guard below
+/// into its "an all-zero local conditioning is correct here" branch — disarming it. So the zeroed
+/// latent positions are unioned first and counted once.
 pub fn edit_retained_latent_count(geometry: &EditGeometry) -> usize {
     let effective_latents = geometry
         .effective_samples
         .div_ceil(LATENT_DOWNSAMPLING)
         .min(geometry.latent_length);
-    let zeroed_start = geometry.start_latent.min(effective_latents);
-    let zeroed_end = geometry.end_latent.min(effective_latents);
-    effective_latents - (zeroed_end - zeroed_start)
+    // `spans` is sorted by audio-sample start, so the latent ranges derived from it are sorted too
+    // (`div_ceil` is monotonic) — a single pass merges them.
+    let mut zeroed = 0usize;
+    let mut cursor = 0usize;
+    for span in &geometry.spans {
+        let start = span.start_latent.min(effective_latents).max(cursor);
+        let end = span.end_latent.min(effective_latents);
+        if end > start {
+            zeroed += end - start;
+            cursor = end;
+        }
+    }
+    effective_latents - zeroed.min(effective_latents)
 }
 
 /// The edit's local conditioning must still be there when it crosses into the DiT (sc-14548).
@@ -902,8 +1031,15 @@ pub fn stitch_outside_region(
         )));
     }
     let mut output = rendered.to_vec();
+    // Outside **every** span. The union is sorted and disjoint, so a single forward walk suffices
+    // and no frame is visited twice — which is what makes "each merged span receives at most one
+    // treatment" structural rather than a rule a future crossfade has to remember.
+    let mut span = 0usize;
     for frame in 0..frames {
-        if (geometry.start_sample..geometry.end_sample).contains(&frame) {
+        while span < geometry.spans.len() && frame >= geometry.spans[span].end_sample {
+            span += 1;
+        }
+        if span < geometry.spans.len() && frame >= geometry.spans[span].start_sample {
             continue;
         }
         output[frame * CHANNELS] = prepared[frame * CHANNELS];

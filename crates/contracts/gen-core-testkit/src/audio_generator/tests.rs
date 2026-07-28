@@ -1169,3 +1169,209 @@ fn conformance_panics_on_a_history_ignoring_multi_turn_stub() {
         &cheap(),
     );
 }
+
+// --- Multi-region prompted audio editing (sc-14549) --------------------------------------------
+
+const MULTI_REGION_ID: &str = "testkit_audio_multi_region_edit_stub";
+
+/// A **multi-region audio-edit stub** (sc-14549): a `Modality::Audio` generator that advertises the
+/// distinct `AudioEditRegions` kind and renders a non-silent track whose fill derives from the seed
+/// **and every region's bounds**.
+///
+/// The two knobs are the two failure modes the gate exists for:
+///
+/// * `first_region_only` — honours `regions[0]` and silently drops the rest. This is the headline
+///   defect: the render stays plausible in every other respect (right length, non-silent, finite,
+///   reproducible, one region genuinely edited), so only a probe that holds `regions[0]` fixed and
+///   moves region two can see it — and against that probe it collapses to byte-identity.
+/// * `blind_validate` — reimplements the request floor by hand and walks only `regions[0]`, the way
+///   a provider that does not inherit gen-core's `validate_request_audio` would. Every malformed
+///   value the gate sends sits in region **two**, so this stub accepts them all.
+struct MultiRegionStubAudioGen {
+    desc: ModelDescriptor,
+    first_region_only: bool,
+    blind_validate: bool,
+}
+
+fn multi_region_stub_desc() -> ModelDescriptor {
+    let mut desc = stub_desc(MULTI_REGION_ID);
+    desc.capabilities.conditioning = vec![ConditioningKind::AudioEditRegions];
+    desc.capabilities.audio_edit_modes = vec![
+        gen_core::AudioEditMode::Inpaint,
+        gen_core::AudioEditMode::Repaint,
+    ];
+    desc
+}
+
+impl MultiRegionStubAudioGen {
+    fn new(first_region_only: bool, blind_validate: bool) -> Self {
+        Self {
+            desc: multi_region_stub_desc(),
+            first_region_only,
+            blind_validate,
+        }
+    }
+    fn boxed(first_region_only: bool, blind_validate: bool) -> Box<dyn Generator> {
+        Box::new(Self::new(first_region_only, blind_validate))
+    }
+
+    /// A deterministic 1 s 24 kHz mono track, DC-filled from the seed plus the bounds of every
+    /// region the stub chooses to look at.
+    fn track(&self, req: &GenerationRequest) -> AudioTrack {
+        let mut acc = req.seed.unwrap_or(0);
+        if let Some(edit) = req.audio_edit_regions() {
+            let n = if self.first_region_only {
+                1
+            } else {
+                edit.regions.len()
+            };
+            for r in edit.regions.iter().take(n) {
+                acc = acc
+                    .wrapping_mul(31)
+                    .wrapping_add(r.start_secs.to_bits() as u64);
+                acc = acc
+                    .wrapping_mul(31)
+                    .wrapping_add(r.end_secs.unwrap_or(0.0).to_bits() as u64);
+            }
+        }
+        let fill = (acc % 1_000_003) as f32 * 1e-3 + 1.0;
+        AudioTrack {
+            samples: vec![fill; 24_000],
+            sample_rate: 24_000,
+            channels: 1,
+            ..Default::default()
+        }
+    }
+}
+
+impl Generator for MultiRegionStubAudioGen {
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.desc
+    }
+
+    fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
+        if self.blind_validate {
+            if let Some(edit) = req.audio_edit_regions() {
+                // A hand-rolled floor that walks only the first region — the shape a provider gets
+                // by reaching for `regions[0]` instead of inheriting the shared floor.
+                let Some(r) = edit.regions.first() else {
+                    return Err(Error::Msg("empty region list".into()));
+                };
+                if !r.start_secs.is_finite() || r.start_secs < 0.0 {
+                    return Err(Error::Msg("bad region start".into()));
+                }
+                match r.end_secs {
+                    None => return Err(Error::Msg("open-ended region".into())),
+                    Some(end) if !end.is_finite() || end <= r.start_secs => {
+                        return Err(Error::Msg("bad region end".into()));
+                    }
+                    Some(_) => {}
+                }
+                return Ok(());
+            }
+        }
+        self.desc
+            .capabilities
+            .validate_request_audio(self.desc.id, req)
+    }
+
+    fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationOutput> {
+        self.validate(req)?;
+        let total = req.steps.unwrap_or(2);
+        for i in 1..=total {
+            if req.cancel.is_cancelled() {
+                return Err(Error::Canceled);
+            }
+            on_progress(Progress::Step { current: i, total });
+        }
+        on_progress(Progress::Decoding);
+        Ok(GenerationOutput::Audio(self.track(req)))
+    }
+}
+
+#[test]
+fn a_single_region_stub_refuses_multi_region_as_unsupported() {
+    // Default-deny with no capability flag and no provider code: the plain audio stub does not
+    // advertise `AudioEditRegions`, so the shared allowlist refuses it as typed `Unsupported`.
+    let g = StubAudioGen::new(STUB_ID, Behavior::good());
+    assert!(!g
+        .descriptor()
+        .capabilities
+        .accepts(ConditioningKind::AudioEditRegions));
+    check_multi_region_audio_edit(&g, &cheap()).unwrap();
+}
+
+/// The acceptance criterion "every non-multi-region audio provider rejects multi-region cleanly",
+/// proven against a surface that *does* serve single-region editing — the case that would slip
+/// through had the new carrier reused `ConditioningKind::AudioEdit`.
+#[test]
+fn a_single_region_edit_capable_stub_still_refuses_multi_region() {
+    let mut g = StubAudioGen::new(STUB_ID, Behavior::good());
+    g.desc.capabilities.conditioning = vec![ConditioningKind::AudioEdit];
+    g.desc.capabilities.audio_edit_modes = vec![
+        gen_core::AudioEditMode::Inpaint,
+        gen_core::AudioEditMode::Repaint,
+    ];
+    assert!(g
+        .descriptor()
+        .capabilities
+        .accepts(ConditioningKind::AudioEdit));
+    check_multi_region_audio_edit(&g, &cheap()).unwrap();
+}
+
+#[test]
+fn multi_region_stub_passes_the_check() {
+    let g = MultiRegionStubAudioGen::new(false, false);
+    assert!(g
+        .descriptor()
+        .capabilities
+        .accepts(ConditioningKind::AudioEditRegions));
+    check_multi_region_audio_edit(&g, &cheap()).unwrap();
+}
+
+#[test]
+fn multi_region_stub_passes_full_conformance() {
+    audio_conformance(|| MultiRegionStubAudioGen::boxed(false, false), &cheap());
+}
+
+/// **The headline non-vacuity proof.** A stub that honours `regions[0]` and drops the rest is
+/// plausible in every other respect; the moved-region-two probe collapses it to byte-identity.
+#[test]
+fn a_first_region_only_stub_fails_the_check() {
+    let g = MultiRegionStubAudioGen::new(true, false);
+    let err = check_multi_region_audio_edit(&g, &cheap()).unwrap_err();
+    assert!(
+        err.contains("moving ONLY region two"),
+        "the first-region-only defect must be caught by the moved-region-two probe, got: {err}"
+    );
+}
+
+#[test]
+#[should_panic(expected = "audio conformance FAILED")]
+fn conformance_panics_on_a_first_region_only_stub() {
+    audio_conformance(|| MultiRegionStubAudioGen::boxed(true, false), &cheap());
+}
+
+/// The floor half: a provider whose own validation walks only `regions[0]` accepts every malformed
+/// region two the gate sends. This is what proves the "bad value in region TWO" cases discriminate
+/// rather than passing because *any* floor would reject them.
+#[test]
+fn a_first_region_only_validator_fails_the_shape_floor() {
+    let g = MultiRegionStubAudioGen::new(false, true);
+    let err = check_multi_region_audio_edit(&g, &cheap()).unwrap_err();
+    assert!(
+        err.contains("region TWO") && err.contains("was accepted by validate()"),
+        "a floor walking only regions[0] must be caught, got: {err}"
+    );
+    // And it is specifically the *first* region-two case that trips: the empty-list case is caught
+    // by both floors, so it is not what discriminates here.
+    assert!(
+        err.contains("open-ended"),
+        "the empty-list case is caught by both floors; the discriminating case is region two's own \
+         shape, got: {err}"
+    );
+}

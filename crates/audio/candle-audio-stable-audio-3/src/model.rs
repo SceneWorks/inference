@@ -43,9 +43,9 @@ use sha2::{Digest, Sha256};
 use crate::config::DiffusionObjective;
 use crate::dit::Guidance;
 use crate::pipeline::{
-    AudioEdit, ForwardedConditioning, ReferenceAudio, StableAudio3Pipeline, SynthesisParameters,
-    VariantGeometry, BASE_DEFAULT_GUIDANCE, BASE_DEFAULT_STEPS, CHANNELS, DEFAULT_GUIDANCE,
-    DEFAULT_STEPS, SAMPLE_RATE,
+    AudioEdit, EditRegionSecs, ForwardedConditioning, ReferenceAudio, StableAudio3Pipeline,
+    SynthesisParameters, VariantGeometry, BASE_DEFAULT_GUIDANCE, BASE_DEFAULT_STEPS, CHANNELS,
+    DEFAULT_GUIDANCE, DEFAULT_STEPS, SAMPLE_RATE,
 };
 use crate::sampler::SamplerKind;
 use crate::weights::SnapshotLayout;
@@ -1027,6 +1027,12 @@ pub fn descriptor_for(variant: Variant) -> ModelDescriptor {
             conditioning: vec![
                 ConditioningKind::ReferenceAudio,
                 ConditioningKind::AudioEdit,
+                // Multi-region editing (sc-14549) is its **own** kind, not a flag on the one
+                // above, and advertising it here is the entire opt-in. A family that did not add
+                // this line keeps rejecting multi-region requests as typed `Unsupported` through
+                // the shared allowlist with no code of its own — which is why no capability flag
+                // and no other descriptor in the repository needed to change.
+                ConditioningKind::AudioEditRegions,
             ],
             supports_lora: false,
             supports_lokr: false,
@@ -1283,31 +1289,58 @@ pub const EDIT_TIMING_TOLERANCE_SECS: f32 = 1.0 / SAMPLE_RATE as f32;
 /// Every field is on the **post-resample** 44.1 kHz timeline. `mode` is carried here and consumed
 /// by [`audio_edit_for`]; nothing past that point can see it, which is what makes
 /// `Inpaint` ≡ `Repaint` structural rather than merely tested.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ResolvedEdit<'a> {
     pub track: &'a AudioTrack,
     pub mode: AudioEditMode,
     /// The source clip's duration once resampled to 44.1 kHz.
     pub source_duration_secs: f32,
-    /// Region start, seconds.
-    pub start_secs: f32,
-    /// Region end (exclusive), seconds. An absent `end_secs` resolves to the source's end.
-    pub end_secs: f32,
+    /// Every requested span, ends resolved, in the caller's own order (sc-14549). Non-empty for a
+    /// well-formed request; the single-region carrier resolves to exactly **one** entry, which is
+    /// what keeps both carriers on one path instead of a legacy path plus a parallel copy.
+    ///
+    /// Deliberately *not* normalized here: the union is computed once, in
+    /// [`crate::pipeline::edit_geometry`], so validation errors can name the span the caller
+    /// actually wrote rather than a merged one they never typed.
+    pub regions: Vec<EditRegionSecs>,
+    /// Whether the request used the multi-region carrier
+    /// ([`Conditioning::AudioEditRegions`]). Read only by validation — for the mode gate and for
+    /// error wording. The *geometry* is identical either way, which is the point.
+    pub multi_region: bool,
     /// The output duration this mode implies: the source's own duration for an inpaint/repaint, the
     /// region's end for an extend.
     pub output_duration_secs: f32,
 }
 
-/// Extract the single `Conditioning::AudioEdit` item, if the request carries one (sc-14548).
+/// The source clip's duration once resampled onto the model's own 44.1 kHz timeline.
+fn source_duration_secs(audio: &AudioTrack) -> f32 {
+    let channels = (audio.channels as usize).max(1);
+    let source_frames = audio.samples.len() / channels;
+    crate::pipeline::resampled_frame_count(source_frames, audio.sample_rate.max(1)) as f32
+        / SAMPLE_RATE as f32
+}
+
+/// Extract the request's single audio-edit carrier, if it has one (sc-14548, extended to the
+/// multi-region carrier by sc-14549).
 ///
 /// Total by construction — it resolves whatever it is given rather than reporting problems, because
 /// [`synthesis_parameters`] needs the output duration and every generation path validates first.
-/// `validate_audio_edit` is where a missing region, a misplaced extend boundary, or a conflicting
-/// `target_duration` is refused; the fallbacks below exist only so this cannot panic on input that
-/// validation has already rejected.
+/// `validate_audio_edit` is where a missing region, a misplaced extend boundary, a multi-region
+/// `Extend`, or a conflicting `target_duration` is refused; the fallbacks below exist only so this
+/// cannot panic on input that validation has already rejected.
 ///
-/// Returns the *first* item without complaint about duplicates, for the same reason
-/// [`resolve_reference_audio`] does: two edits are already refused.
+/// # Both carriers resolve here, into the same shape
+///
+/// [`Conditioning::AudioEdit`] and [`Conditioning::AudioEditRegions`] differ only in how many spans
+/// they carry and in whether an end may be elided. Past this function they are indistinguishable: a
+/// single-region edit is the one-element list. Nothing downstream branches on which carrier arrived,
+/// so there is no second code path for the multi-region case to drift away from — and, conversely,
+/// no way for the multi-region case to quietly reuse only the machinery the single-region case
+/// happened to exercise.
+///
+/// Returns the *first* carrier without complaint about duplicates, for the same reason
+/// [`resolve_reference_audio`] does: two edits are already refused by `validate_audio_edit`, which
+/// counts **both** kinds together.
 pub fn resolve_audio_edit(request: &GenerationRequest) -> Option<ResolvedEdit<'_>> {
     request
         .conditioning
@@ -1319,27 +1352,54 @@ pub fn resolve_audio_edit(request: &GenerationRequest) -> Option<ResolvedEdit<'_
                 region,
                 ..
             } => {
-                let channels = (audio.channels as usize).max(1);
-                let source_frames = audio.samples.len() / channels;
-                let source_duration_secs =
-                    crate::pipeline::resampled_frame_count(source_frames, audio.sample_rate.max(1))
-                        as f32
-                        / SAMPLE_RATE as f32;
+                let source = source_duration_secs(audio);
                 let start_secs = region.map_or(0.0, |region| region.start_secs);
-                let end_secs = region
-                    .and_then(|region| region.end_secs)
-                    .unwrap_or(source_duration_secs);
+                // The one place `end_secs: None` still means "to the end of the clip" — the
+                // single-region shorthand, unchanged. The multi-region carrier refuses `None`
+                // outright at the gen-core floor, because with an unordered region list "the end of
+                // the clip" has no unambiguous owner.
+                let end_secs = region.and_then(|region| region.end_secs).unwrap_or(source);
                 let output_duration_secs = match mode {
                     AudioEditMode::Extend => end_secs,
-                    _ => source_duration_secs,
+                    _ => source,
                 };
                 Some(ResolvedEdit {
                     track: audio,
                     mode: *mode,
-                    source_duration_secs,
-                    start_secs,
-                    end_secs,
+                    source_duration_secs: source,
+                    regions: vec![EditRegionSecs {
+                        start_secs,
+                        end_secs,
+                    }],
+                    multi_region: false,
                     output_duration_secs,
+                })
+            }
+            Conditioning::AudioEditRegions {
+                audio,
+                mode,
+                regions,
+                ..
+            } => {
+                let source = source_duration_secs(audio);
+                Some(ResolvedEdit {
+                    track: audio,
+                    mode: *mode,
+                    source_duration_secs: source,
+                    regions: regions
+                        .iter()
+                        .map(|region| EditRegionSecs {
+                            start_secs: region.start_secs,
+                            // Every end is `Some` on this carrier (the gen-core floor refuses
+                            // `None`); the fallback exists only so this stays total on input
+                            // validation has already rejected.
+                            end_secs: region.end_secs.unwrap_or(source),
+                        })
+                        .collect(),
+                    multi_region: true,
+                    // Multi-region is bounded-interior only — `Extend` is refused in
+                    // `validate_audio_edit` — so the output is always exactly the source's length.
+                    output_duration_secs: source,
                 })
             }
             _ => None,
@@ -1364,8 +1424,7 @@ pub fn audio_edit_for(request: &GenerationRequest) -> Option<AudioEdit<'_>> {
         samples: &edit.track.samples,
         sample_rate: edit.track.sample_rate,
         channels: edit.track.channels,
-        start_secs: edit.start_secs,
-        end_secs: edit.end_secs,
+        regions: edit.regions,
     })
 }
 
@@ -1467,10 +1526,14 @@ fn reject_reference_and_edit_combination(
         .conditioning
         .iter()
         .any(|conditioning| matches!(conditioning, Conditioning::ReferenceAudio { .. }));
-    let has_edit = request
-        .conditioning
-        .iter()
-        .any(|conditioning| matches!(conditioning, Conditioning::AudioEdit { .. }));
+    // Both edit carriers count (sc-14549): the rule is about the *role* the source clip plays, and
+    // a multi-region edit hands its clip to the DiT exactly as a single-region one does.
+    let has_edit = request.conditioning.iter().any(|conditioning| {
+        matches!(
+            conditioning,
+            Conditioning::AudioEdit { .. } | Conditioning::AudioEditRegions { .. }
+        )
+    });
     if has_reference && has_edit {
         return Err(gen_core::Error::Unsupported(format!(
             "{model_id}: reference audio and audio editing cannot be combined in one request"
@@ -1492,32 +1555,43 @@ fn validate_audio_edit(
     model_id: &str,
     request: &GenerationRequest,
 ) -> gen_core::Result<()> {
+    // **Both** carriers, counted together (sc-14549). Two legacy edits, two multi-region edits, or
+    // one of each are all the same mistake: `GenerationRequest::audio_edit()` and
+    // `audio_edit_regions()` are each first-match-only and neither sees the other, so without this
+    // the second carrier would be silently ignored rather than refused. Counting the kinds
+    // separately would leave the *mixed* case — one of each — passing both counts at one apiece.
     let edits = request
         .conditioning
         .iter()
-        .filter(|conditioning| matches!(conditioning, Conditioning::AudioEdit { .. }))
+        .filter(|conditioning| {
+            matches!(
+                conditioning,
+                Conditioning::AudioEdit { .. } | Conditioning::AudioEditRegions { .. }
+            )
+        })
         .count();
     if edits == 0 {
         return Ok(());
     }
-    // Typed `Unsupported`, matching the reference arity refusal: "one region only" is a statement
-    // about what this family can do. `GenerationRequest::audio_edit()` is first-match-only, so
-    // without this a second edit would be silently ignored rather than refused — the shape
-    // sc-14549 (additive multi-region) exists to extend, and the shape a caller must never hit by
-    // accident in the meantime.
+    // Typed `Unsupported`, matching the reference arity refusal: "one edit per request" is a
+    // statement about what this family can do. Note this is arity of *carriers*, not of regions —
+    // several regions inside one `AudioEditRegions` are exactly what sc-14549 added.
     if edits > 1 {
         return Err(gen_core::Error::Unsupported(format!(
-            "{model_id}: exactly one audio edit region is supported, got {edits}; multi-region \
-             editing is not available on this family"
+            "{model_id}: exactly one audio edit is supported per request, got {edits}; several \
+             spans belong in the regions list of a single Conditioning::AudioEditRegions, which \
+             regenerates them in one pass"
         )));
     }
-    let Some(Conditioning::AudioEdit { strength, .. }) = request
+    let strength = request
         .conditioning
         .iter()
-        .find(|conditioning| matches!(conditioning, Conditioning::AudioEdit { .. }))
-    else {
-        unreachable!("a nonzero edit count finds one");
-    };
+        .find_map(|conditioning| match conditioning {
+            Conditioning::AudioEdit { strength, .. }
+            | Conditioning::AudioEditRegions { strength, .. } => Some(strength),
+            _ => None,
+        })
+        .expect("a nonzero edit count finds one");
     // Refused, never ignored. Stable Audio 3's inpaint conditioner is a hard binary mask times the
     // encoded source, concatenated as channels: there is no scalar anywhere on this path a
     // "strength" could modulate, so honouring it would mean inventing a semantic. gen-core treats
@@ -1572,82 +1646,105 @@ fn validate_audio_edit(
             track.channels
         )));
     }
-    // Every advertised mode is a *bounded* region mode, so the region is mandatory on all three.
+    // Every advertised mode is a *bounded* region mode, so a region is mandatory on all three.
     // (`Cover`, the one gen-core mode that ignores it, is not advertised — see `descriptor_for`.)
-    let Some(region) = request
-        .conditioning
-        .iter()
-        .find_map(|conditioning| match conditioning {
-            Conditioning::AudioEdit { region, .. } => Some(*region),
-            _ => None,
-        })
-        .flatten()
-    else {
+    // On the single-region carrier that means `region: Some(..)`; on the multi-region carrier the
+    // gen-core floor has already refused an empty list, and this catches it either way.
+    let carries_region =
+        match request
+            .conditioning
+            .iter()
+            .find_map(|conditioning| match conditioning {
+                Conditioning::AudioEdit { region, .. } => Some(region.is_some()),
+                Conditioning::AudioEditRegions { regions, .. } => Some(!regions.is_empty()),
+                _ => None,
+            }) {
+            Some(present) => present,
+            None => unreachable!("a nonzero edit count finds one"),
+        };
+    if !carries_region {
         return Err(gen_core::Error::Msg(format!(
             "{model_id}: {:?} requires an audio edit region",
             edit.mode
         )));
-    };
-    let source = edit.source_duration_secs;
-    match edit.mode {
-        AudioEditMode::Extend => {
-            // The appended tail must start where the prepared source ends: an extend that begins
-            // before the source's end is an inpaint the caller has mislabelled, and one that begins
-            // after it asks the model to invent a gap it is given no context for.
-            if (region.start_secs - source).abs() > EDIT_TIMING_TOLERANCE_SECS {
-                return Err(gen_core::Error::Msg(format!(
-                    "{model_id}: an Extend region must start at the source's end ({source}s), got \
-                     {}s",
-                    region.start_secs
-                )));
-            }
-            // `end_secs = None` means "the end of the clip", which for an extend would be a no-op.
-            if region.end_secs.is_none() {
-                return Err(gen_core::Error::Msg(format!(
-                    "{model_id}: an Extend region must name the new total length as end_secs"
-                )));
-            }
-            if edit.end_secs <= source {
-                return Err(gen_core::Error::Msg(format!(
-                    "{model_id}: an Extend region must end past the source ({source}s), got {}s",
-                    edit.end_secs
-                )));
-            }
-        }
-        _ => {
-            if region.start_secs >= source {
-                return Err(gen_core::Error::Msg(format!(
-                    "{model_id}: audio edit region start {}s is at or past the source's end \
-                     ({source}s); use AudioEditMode::Extend to continue past it",
-                    region.start_secs
-                )));
-            }
-            if edit.end_secs > source + EDIT_TIMING_TOLERANCE_SECS {
-                return Err(gen_core::Error::Msg(format!(
-                    "{model_id}: audio edit region end {}s is past the source's end ({source}s); \
-                     use AudioEditMode::Extend to continue past it",
-                    edit.end_secs
-                )));
-            }
-        }
     }
-    // A region narrower than one latent frame masks nothing: `[ceil(start/4096), ceil(end/4096))`
-    // is empty, the local conditioner is the unedited source, and the render silently comes back
-    // identical to the input. Refuse instead of returning a no-op that looks like success.
-    let (start_sample, end_sample) =
-        crate::pipeline::edit_region_samples(edit.start_secs, edit.end_secs);
-    let (start_latent, end_latent) = crate::pipeline::edit_region_latents(start_sample, end_sample);
-    if end_latent <= start_latent {
-        return Err(gen_core::Error::Msg(format!(
-            "{model_id}: audio edit region [{}s, {}s) spans no latent frame (positions {}..{}); it \
-             must cover at least one {}-sample frame (~{:.3}s)",
-            edit.start_secs,
-            edit.end_secs,
-            start_latent,
-            end_latent,
-            crate::sampler::LATENT_DOWNSAMPLING,
-            crate::sampler::LATENT_DOWNSAMPLING as f32 / SAMPLE_RATE as f32
+    let source = edit.source_duration_secs;
+    // `Extend` is a **single-tail** operation and stays on the single-region carrier. Multi-region
+    // means "regenerate these interior spans in one pass": there is exactly one tail, so a list of
+    // them has no meaning, and the output length an extend implies is the region's end — which is
+    // not well-defined when region order is not significant. Refused as a typed capability gap
+    // rather than silently reinterpreted as an inpaint.
+    if edit.multi_region && edit.mode == AudioEditMode::Extend {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{model_id}: {:?} is a single-tail operation and is not supported on the multi-region \
+             carrier; use Conditioning::AudioEdit with one region to continue past the source's \
+             end",
+            edit.mode
         )));
+    }
+    for (index, region) in edit.regions.iter().enumerate() {
+        // Only the single-region carrier can reach the Extend arm (guarded above), so `regions`
+        // holds exactly one entry there and this loop states the tail rule once.
+        match edit.mode {
+            AudioEditMode::Extend => {
+                // The appended tail must start where the prepared source ends: an extend that
+                // begins before the source's end is an inpaint the caller has mislabelled, and one
+                // that begins after it asks the model to invent a gap it is given no context for.
+                if (region.start_secs - source).abs() > EDIT_TIMING_TOLERANCE_SECS {
+                    return Err(gen_core::Error::Msg(format!(
+                        "{model_id}: an Extend region must start at the source's end ({source}s), \
+                         got {}s",
+                        region.start_secs
+                    )));
+                }
+                // `end_secs = None` resolved to the source's end, which for an extend is a no-op.
+                if region.end_secs <= source {
+                    return Err(gen_core::Error::Msg(format!(
+                        "{model_id}: an Extend region must end past the source ({source}s), got \
+                         {}s — name the new total length as end_secs",
+                        region.end_secs
+                    )));
+                }
+            }
+            _ => {
+                if region.start_secs >= source {
+                    return Err(gen_core::Error::Msg(format!(
+                        "{model_id}: audio edit region {index} start {}s is at or past the \
+                         source's end ({source}s); use AudioEditMode::Extend to continue past it",
+                        region.start_secs
+                    )));
+                }
+                if region.end_secs > source + EDIT_TIMING_TOLERANCE_SECS {
+                    return Err(gen_core::Error::Msg(format!(
+                        "{model_id}: audio edit region {index} end {}s is past the source's end \
+                         ({source}s); use AudioEditMode::Extend to continue past it",
+                        region.end_secs
+                    )));
+                }
+            }
+        }
+        // A region narrower than one latent frame masks nothing: `[ceil(start/4096),
+        // ceil(end/4096))` is empty, the local conditioner is the unedited source there, and the
+        // render silently comes back identical to the input. Refuse instead of returning a no-op
+        // that looks like success — checked on **every** requested region, so a caller who names
+        // one usable span and one degenerate one is told about the degenerate one rather than
+        // having it quietly disappear from the union.
+        let (start_sample, end_sample) =
+            crate::pipeline::edit_region_samples(region.start_secs, region.end_secs);
+        let (start_latent, end_latent) =
+            crate::pipeline::edit_region_latents(start_sample, end_sample);
+        if end_latent <= start_latent {
+            return Err(gen_core::Error::Msg(format!(
+                "{model_id}: audio edit region {index} [{}s, {}s) spans no latent frame (positions \
+                 {}..{}); it must cover at least one {}-sample frame (~{:.3}s)",
+                region.start_secs,
+                region.end_secs,
+                start_latent,
+                end_latent,
+                crate::sampler::LATENT_DOWNSAMPLING,
+                crate::sampler::LATENT_DOWNSAMPLING as f32 / SAMPLE_RATE as f32
+            )));
+        }
     }
     // The mode decides the output length, so a `target_duration` that disagrees is a request the
     // provider would have to silently overrule. Refuse it instead — and note the generic floor's
@@ -2026,10 +2123,12 @@ impl Generator for StableAudio3Generator {
                 .conditioning
                 .iter()
                 .any(|item| matches!(item, Conditioning::ReferenceAudio { .. })),
-            request_has_edit: request
-                .conditioning
-                .iter()
-                .any(|item| matches!(item, Conditioning::AudioEdit { .. })),
+            request_has_edit: request.conditioning.iter().any(|item| {
+                matches!(
+                    item,
+                    Conditioning::AudioEdit { .. } | Conditioning::AudioEditRegions { .. }
+                )
+            }),
             reference: reference_audio_for(request),
             edit: audio_edit_for(request),
         };
