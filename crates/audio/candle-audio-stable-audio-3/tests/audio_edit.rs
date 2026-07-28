@@ -64,8 +64,9 @@ use candle_audio_stable_audio_3::gen_core::{
 use candle_audio_stable_audio_3::pipeline::{
     conditioning_is_forwarded, edit_geometry, edit_geometry_matches_request, edit_keep_mask,
     edit_local_conditioning, edit_local_conditioning_is_present, edit_region_latents,
-    edit_region_samples, edit_retained_latent_count, prepare_reference_pcm, resampled_frame_count,
-    stitch_outside_region, tensor_has_nonzero, AudioEdit, EditGeometry, SAMPLE_RATE,
+    edit_region_samples, edit_retained_latent_count, merge_edit_regions, prepare_reference_pcm,
+    resampled_frame_count, stitch_outside_region, tensor_has_nonzero, AudioEdit, EditGeometry,
+    EditRegionSecs, EditSpan, SAMPLE_RATE,
 };
 use candle_audio_stable_audio_3::sampler::{
     adapt_sample_size_for_max, SampleGeometry, DEFAULT_DURATION_PADDING, LATENT_DOWNSAMPLING,
@@ -313,8 +314,8 @@ fn the_request_surface_hands_the_pipeline_the_resolved_region() {
     );
     let resolved = resolve_audio_edit(&request).expect("an AudioEdit request resolves");
     assert_eq!(resolved.source_duration_secs, 6.0);
-    assert_eq!(resolved.start_secs, 2.0);
-    assert_eq!(resolved.end_secs, 4.0);
+    assert_eq!(resolved.regions[0].start_secs, 2.0);
+    assert_eq!(resolved.regions[0].end_secs, 4.0);
     assert_eq!(
         resolved.output_duration_secs, 6.0,
         "an inpaint's output is the source's own length"
@@ -326,8 +327,10 @@ fn the_request_surface_hands_the_pipeline_the_resolved_region() {
             samples: &source.samples,
             sample_rate: SAMPLE_RATE,
             channels: 2,
-            start_secs: 2.0,
-            end_secs: 4.0,
+            regions: vec![EditRegionSecs {
+                start_secs: 2.0,
+                end_secs: 4.0,
+            }],
         },
         "field for field, so a swapped or dropped endpoint fails here and not downstream"
     );
@@ -349,9 +352,9 @@ fn the_request_surface_hands_the_pipeline_the_resolved_region() {
         None,
     );
     let handed = audio_edit_for(&open).expect("an open-ended region resolves");
-    assert_eq!(handed.start_secs, 2.0);
+    assert_eq!(handed.regions[0].start_secs, 2.0);
     assert_eq!(
-        handed.end_secs, 6.0,
+        handed.regions[0].end_secs, 6.0,
         "an absent end resolves to the source end"
     );
 
@@ -407,8 +410,8 @@ fn the_request_surface_hands_the_pipeline_the_resolved_region() {
         handed.sample_rate, 48_000,
         "the source rate is passed through"
     );
-    assert_eq!(handed.start_secs, 2.0);
-    assert_eq!(handed.end_secs, 4.0);
+    assert_eq!(handed.regions[0].start_secs, 2.0);
+    assert_eq!(handed.regions[0].end_secs, 4.0);
 
     // 5. A request with no edit resolves to nothing, so the text-to-audio and restyle paths are
     //    untouched and `synthesis_parameters` still reads `target_duration`.
@@ -531,8 +534,10 @@ fn the_edit_geometry_reproduces_the_pinned_alignment_examples() {
         samples: &source.samples,
         sample_rate: SAMPLE_RATE,
         channels: 2,
-        start_secs: 2.0,
-        end_secs: 7.0,
+        regions: vec![EditRegionSecs {
+            start_secs: 2.0,
+            end_secs: 7.0,
+        }],
     };
     let resolved = edit_geometry(&edit, &geometry, 10.0).unwrap();
     assert_eq!(
@@ -541,10 +546,15 @@ fn the_edit_geometry_reproduces_the_pinned_alignment_examples() {
             adapted_size: 712_704,
             latent_length: 174,
             effective_samples: 441_000,
-            start_sample: 88_200,
-            end_sample: 308_700,
-            start_latent: 22,
-            end_latent: 76,
+            spans: vec![EditSpan {
+                start_sample: 88_200,
+
+                end_sample: 308_700,
+
+                start_latent: 22,
+
+                end_latent: 76,
+            }],
         }
     );
     // The mask spans the **adapted** size, not the requested duration's 441_000 samples. A mask
@@ -568,8 +578,10 @@ fn the_edit_geometry_reproduces_the_pinned_alignment_examples() {
         samples: &source.samples,
         sample_rate: SAMPLE_RATE,
         channels: 2,
-        start_secs: 10.0,
-        end_secs: 18.0,
+        regions: vec![EditRegionSecs {
+            start_secs: 10.0,
+            end_secs: 18.0,
+        }],
     };
     let resolved = edit_geometry(&edit, &geometry, 18.0).unwrap();
     assert_eq!(
@@ -578,10 +590,15 @@ fn the_edit_geometry_reproduces_the_pinned_alignment_examples() {
             adapted_size: 1_064_960,
             latent_length: 260,
             effective_samples: 793_800,
-            start_sample: 441_000,
-            end_sample: 793_800,
-            start_latent: 108,
-            end_latent: 194,
+            spans: vec![EditSpan {
+                start_sample: 441_000,
+
+                end_sample: 793_800,
+
+                start_latent: 108,
+
+                end_latent: 194,
+            }],
         }
     );
 
@@ -613,15 +630,19 @@ fn the_edit_geometry_reproduces_the_pinned_alignment_examples() {
         samples: &source.samples,
         sample_rate: SAMPLE_RATE,
         channels: 2,
-        start_secs: 2.0,
-        end_secs: 7.0,
+        regions: vec![EditRegionSecs {
+            start_secs: 2.0,
+            end_secs: 7.0,
+        }],
     };
     let converted = AudioEdit {
         samples: &off_rate.samples,
         sample_rate: 48_000,
         channels: 1,
-        start_secs: 2.0,
-        end_secs: 7.0,
+        regions: vec![EditRegionSecs {
+            start_secs: 2.0,
+            end_secs: 7.0,
+        }],
     };
     let geometry = small_geometry(10.0);
     assert_eq!(
@@ -636,8 +657,10 @@ fn the_edit_geometry_reproduces_the_pinned_alignment_examples() {
         sample_rate: SAMPLE_RATE,
         channels: 2,
         // 4096 samples is ~0.0929 s; this span sits strictly inside one latent frame.
-        start_secs: 0.01,
-        end_secs: 0.02,
+        regions: vec![EditRegionSecs {
+            start_secs: 0.01,
+            end_secs: 0.02,
+        }],
     };
     assert_eq!(edit_region_latents(441, 882), (1, 1));
     assert!(
@@ -650,8 +673,10 @@ fn the_edit_geometry_reproduces_the_pinned_alignment_examples() {
             samples: &source.samples,
             sample_rate: SAMPLE_RATE,
             channels: 2,
-            start_secs: start,
-            end_secs: end,
+            regions: vec![EditRegionSecs {
+                start_secs: start,
+                end_secs: end,
+            }],
         };
         assert!(
             edit_geometry(&bad, &geometry, 10.0).is_err(),
@@ -669,8 +694,10 @@ fn the_keep_mask_zeroes_the_region_and_the_padding_and_nothing_else() {
         samples: &source.samples,
         sample_rate: SAMPLE_RATE,
         channels: 2,
-        start_secs: 2.0,
-        end_secs: 7.0,
+        regions: vec![EditRegionSecs {
+            start_secs: 2.0,
+            end_secs: 7.0,
+        }],
     };
     let resolved = edit_geometry(&edit, &geometry, 10.0).unwrap();
     let mask = edit_keep_mask(&resolved);
@@ -723,8 +750,10 @@ fn the_local_conditioning_is_mask_first_then_the_masked_source() {
         samples: &source.samples,
         sample_rate: SAMPLE_RATE,
         channels: 2,
-        start_secs: 2.0,
-        end_secs: 7.0,
+        regions: vec![EditRegionSecs {
+            start_secs: 2.0,
+            end_secs: 7.0,
+        }],
     };
     let resolved = edit_geometry(&edit, &geometry, 10.0).unwrap();
     let length = resolved.latent_length;
@@ -850,8 +879,10 @@ fn the_local_conditioning_handoff_must_still_be_present_where_it_crosses_into_th
             samples: &source.samples,
             sample_rate: SAMPLE_RATE,
             channels: 2,
-            start_secs: start,
-            end_secs: end,
+            regions: vec![EditRegionSecs {
+                start_secs: start,
+                end_secs: end,
+            }],
         };
         let resolved = edit_geometry(&edit, &geometry, 10.0).unwrap();
         let length = resolved.latent_length;
@@ -920,8 +951,10 @@ fn the_resolved_edit_geometry_must_match_the_geometry_the_request_is_sampled_at(
         samples: &source.samples,
         sample_rate: SAMPLE_RATE,
         channels: 2,
-        start_secs: 2.0,
-        end_secs: 7.0,
+        regions: vec![EditRegionSecs {
+            start_secs: 2.0,
+            end_secs: 7.0,
+        }],
     };
     let resolved = edit_geometry(&edit, &geometry, 10.0).unwrap();
     assert!(
@@ -995,8 +1028,10 @@ fn the_stitch_restores_the_prepared_source_outside_the_region_exactly() {
         samples: &source.samples,
         sample_rate: 48_000,
         channels: 1,
-        start_secs: 2.0,
-        end_secs: 7.0,
+        regions: vec![EditRegionSecs {
+            start_secs: 2.0,
+            end_secs: 7.0,
+        }],
     };
     let resolved = edit_geometry(&edit, &geometry, 10.0).unwrap();
 
@@ -1753,8 +1788,10 @@ fn real_edit_initial_sampler_noise_precedes_the_source_encode() {
                     samples: &source.samples,
                     sample_rate: SAMPLE_RATE,
                     channels: 2,
-                    start_secs: 1.0,
-                    end_secs: 2.0,
+                    regions: vec![EditRegionSecs {
+                        start_secs: 1.0,
+                        end_secs: 2.0,
+                    }],
                 },
                 &mut |_, _| {},
                 &mut || {},
@@ -1786,3 +1823,930 @@ fn real_edit_initial_sampler_noise_precedes_the_source_encode() {
          on any of them — the SAME-L encoder's eval-time noise is what makes this a gate"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// Multi-region editing (sc-14549)
+// ---------------------------------------------------------------------------------------------
+
+/// A multi-region edit request: the `AudioEditRegions` carrier with explicit ends on every span.
+fn multi_edit_request(
+    prompt: &str,
+    audio: AudioTrack,
+    mode: AudioEditMode,
+    regions: &[(f32, f32)],
+    target_duration: Option<f32>,
+) -> GenerationRequest {
+    GenerationRequest {
+        prompt: prompt.into(),
+        seed: Some(7),
+        steps: Some(4),
+        audio: Some(AudioParams {
+            target_duration,
+            sample_rate: Some(SAMPLE_RATE),
+            ..Default::default()
+        }),
+        conditioning: vec![Conditioning::AudioEditRegions {
+            audio,
+            mode,
+            regions: regions
+                .iter()
+                .map(|(start, end)| TimeRegion {
+                    start_secs: *start,
+                    end_secs: Some(*end),
+                })
+                .collect(),
+            strength: None,
+        }],
+        ..Default::default()
+    }
+}
+
+fn multi_edit<'a>(samples: &'a [f32], regions: &[(f32, f32)]) -> AudioEdit<'a> {
+    AudioEdit {
+        samples,
+        sample_rate: SAMPLE_RATE,
+        channels: 2,
+        regions: regions
+            .iter()
+            .map(|(start, end)| EditRegionSecs {
+                start_secs: *start,
+                end_secs: *end,
+            })
+            .collect(),
+    }
+}
+
+/// **Order-independence and the merge rule, as properties rather than examples.**
+///
+/// The contract accepts regions in any order and accepts overlapping / touching / duplicate spans
+/// (this repository's stated semantics — see `Conditioning::AudioEditRegions`). Both of those are
+/// only true if the normalization is a genuine union, so this asserts the union directly:
+///
+/// * every permutation of a region list produces the **identical** merged result — the property
+///   that makes "order is not significant" a fact about the data structure rather than a promise;
+/// * touching spans `[a,b)` and `[b,c)` merge, because they cover a contiguous frame set with no
+///   gap and leaving them separate would give two representations of one union;
+/// * the output is sorted, disjoint and non-touching, which is what lets `edit_keep_mask` and
+///   `stitch_outside_region` each walk it once without either double-applying.
+#[test]
+fn merge_edit_regions_is_an_order_independent_disjoint_union() {
+    /// `(input, expected union)`.
+    type MergeCase = (&'static [(usize, usize)], &'static [(usize, usize)]);
+    // Overlapping, touching, duplicate, contained, and already-disjoint — one list covering every
+    // case the contract says is legal.
+    let cases: &[MergeCase] = &[
+        (&[(10, 20)], &[(10, 20)]),
+        (&[(10, 20), (30, 40)], &[(10, 20), (30, 40)]),
+        // overlapping
+        (&[(10, 20), (15, 30)], &[(10, 30)]),
+        // touching — the case that distinguishes `start <= last.1` from `start < last.1`
+        (&[(10, 20), (20, 30)], &[(10, 30)]),
+        // duplicate
+        (&[(10, 20), (10, 20)], &[(10, 20)]),
+        // contained
+        (&[(10, 40), (20, 30)], &[(10, 40)]),
+        // a chain that only collapses if merging is transitive
+        (&[(10, 20), (18, 25), (25, 33)], &[(10, 33)]),
+    ];
+    for (input, expected) in cases {
+        assert_eq!(
+            merge_edit_regions(input),
+            expected.to_vec(),
+            "merging {input:?}"
+        );
+        // Every permutation gives the identical answer.
+        let mut permuted = input.to_vec();
+        permuted.reverse();
+        assert_eq!(
+            merge_edit_regions(&permuted),
+            expected.to_vec(),
+            "reversing {input:?} must not change the union"
+        );
+        let mut rotated = input.to_vec();
+        rotated.rotate_left(1);
+        assert_eq!(
+            merge_edit_regions(&rotated),
+            expected.to_vec(),
+            "rotating {input:?} must not change the union"
+        );
+    }
+    // The structural post-conditions every consumer relies on.
+    for (input, _) in cases {
+        let merged = merge_edit_regions(input);
+        for pair in merged.windows(2) {
+            assert!(
+                pair[0].1 < pair[1].0,
+                "merged spans must be sorted, disjoint AND non-touching, got {merged:?}"
+            );
+        }
+        assert!(merged.iter().all(|(start, end)| start < end));
+    }
+    assert!(merge_edit_regions(&[]).is_empty());
+}
+
+/// **One region on the new carrier is byte-identical to the legacy carrier.**
+///
+/// This is the acceptance criterion "existing single-region callers behave identically", asserted
+/// rather than argued: both carriers resolve through the *same* `resolve_audio_edit`, so a
+/// one-element `AudioEditRegions` and a `AudioEdit` naming the same span produce the same
+/// `pipeline::AudioEdit`, the same `EditGeometry`, and the same keep mask. If the two carriers ever
+/// grew separate paths this is what fails.
+#[test]
+fn one_region_on_the_new_carrier_is_the_legacy_shape_exactly() {
+    let source = source_clip(6.0, SAMPLE_RATE, 2);
+    let legacy = edit_request(
+        "same edit, legacy carrier",
+        source.clone(),
+        AudioEditMode::Inpaint,
+        region(2.0, Some(4.0)),
+        None,
+    );
+    let modern = multi_edit_request(
+        "same edit, legacy carrier",
+        source.clone(),
+        AudioEditMode::Inpaint,
+        &[(2.0, 4.0)],
+        None,
+    );
+    let legacy_edit = audio_edit_for(&legacy).expect("legacy resolves");
+    let modern_edit = audio_edit_for(&modern).expect("multi-region resolves");
+    assert_eq!(
+        legacy_edit, modern_edit,
+        "a one-region AudioEditRegions must build the identical pipeline edit"
+    );
+    let resolved = resolve_audio_edit(&modern).expect("multi-region resolves");
+    assert_eq!(resolved.source_duration_secs, 6.0);
+    assert_eq!(resolved.output_duration_secs, 6.0);
+    assert!(resolved.multi_region);
+    assert!(!resolve_audio_edit(&legacy).unwrap().multi_region);
+    for variant in Variant::ALL {
+        assert_eq!(
+            synthesis_parameters(variant, &modern).duration_secs,
+            6.0,
+            "{}: a multi-region inpaint's output is the source's own length",
+            variant.model_id()
+        );
+    }
+    // And the derived geometry agrees all the way down.
+    let geometry = small_geometry(6.0);
+    assert_eq!(
+        edit_geometry(&legacy_edit, &geometry, 6.0).unwrap(),
+        edit_geometry(&modern_edit, &geometry, 6.0).unwrap()
+    );
+    // The new carrier is invisible to the legacy accessor and vice versa, so neither can silently
+    // serve the other's request.
+    assert!(modern.audio_edit().is_none());
+    assert!(legacy.audio_edit_regions().is_none());
+}
+
+/// **The pinned two-region alignment example, and the mask that covers both spans.**
+///
+/// The numbers are derived from *this repository's* own `adapt_sample_size_for_max` and resize rule,
+/// exactly as the single-region pinned examples are. They happen to agree with the figures recorded
+/// on sc-14549, and that agreement is worth noting — but **no cross-framework parity is claimed**:
+/// the frozen upstream checkout is not present on this machine and no multi-region oracle exists
+/// (sc-15431 tracks the conditioning oracle). This pins the geometry against the shipped
+/// preprocessing, nothing more.
+///
+/// A 20 s source with `[2,6)` and `[14,18)`:
+/// adapted `1,146,880`; latent `280`; effective boundary `216` latents; spans
+/// `[88,200, 264,600)` → `[22, 65)` and `[617,400, 793,800)` → `[151, 194)`.
+#[test]
+fn the_multi_region_geometry_and_keep_mask_cover_every_span() {
+    let source = source_clip(20.0, SAMPLE_RATE, 2);
+    let edit = multi_edit(&source.samples, &[(2.0, 6.0), (14.0, 18.0)]);
+    let geometry = small_geometry(20.0);
+    let resolved = edit_geometry(&edit, &geometry, 20.0).unwrap();
+    assert_eq!(
+        resolved,
+        EditGeometry {
+            adapted_size: 1_146_880,
+            latent_length: 280,
+            effective_samples: 882_000,
+            spans: vec![
+                EditSpan {
+                    start_sample: 88_200,
+                    end_sample: 264_600,
+                    start_latent: 22,
+                    end_latent: 65,
+                },
+                EditSpan {
+                    start_sample: 617_400,
+                    end_sample: 793_800,
+                    start_latent: 151,
+                    end_latent: 194,
+                },
+            ],
+        }
+    );
+    assert_eq!(
+        resolved.effective_samples.div_ceil(LATENT_DOWNSAMPLING),
+        216
+    );
+
+    // Order-independence, end to end: the reversed request resolves to the identical geometry.
+    let reversed = multi_edit(&source.samples, &[(14.0, 18.0), (2.0, 6.0)]);
+    assert_eq!(edit_geometry(&reversed, &geometry, 20.0).unwrap(), resolved);
+    // And so does an overlapping/duplicate spelling of the same union.
+    let sloppy = multi_edit(
+        &source.samples,
+        &[
+            (14.0, 16.0),
+            (2.0, 5.0),
+            (4.0, 6.0),
+            (15.0, 18.0),
+            (2.0, 6.0),
+        ],
+    );
+    assert_eq!(edit_geometry(&sloppy, &geometry, 20.0).unwrap(), resolved);
+
+    // The mask: zero inside BOTH spans and inside the padding, one everywhere else. Asserted over
+    // the whole buffer rather than at sample points, so a mask that zeroed only the first span
+    // fails on the second span's frames rather than passing a spot check.
+    let mask = edit_keep_mask(&resolved);
+    assert_eq!(mask.len(), 1_146_880);
+    for (index, value) in mask.iter().enumerate() {
+        let inside_span = (88_200..264_600).contains(&index) || (617_400..793_800).contains(&index);
+        let padding = index >= 882_000;
+        let expected = if inside_span || padding { 0.0 } else { 1.0 };
+        assert_eq!(
+            *value, expected,
+            "mask[{index}]: inside_span={inside_span} padding={padding}"
+        );
+    }
+    // The gap between the two spans is genuinely kept — the assertion that separates "two spans"
+    // from "one span spanning both".
+    assert!(mask[264_600..617_400].iter().all(|value| *value == 1.0));
+}
+
+/// **Moving only region two moves only region two's zeros.**
+///
+/// The weight-free half of the correctly-signed probe: hold `regions[0]` fixed and relocate
+/// `regions[1]`. A mask built from `regions[0]` alone is *identical* between the two, so this fails
+/// by equality rather than by a threshold.
+#[test]
+fn relocating_region_two_relocates_its_mask_and_nothing_else() {
+    let source = source_clip(20.0, SAMPLE_RATE, 2);
+    let geometry = small_geometry(20.0);
+    let first = edit_geometry(
+        &multi_edit(&source.samples, &[(2.0, 6.0), (14.0, 18.0)]),
+        &geometry,
+        20.0,
+    )
+    .unwrap();
+    let moved = edit_geometry(
+        &multi_edit(&source.samples, &[(2.0, 6.0), (8.0, 12.0)]),
+        &geometry,
+        20.0,
+    )
+    .unwrap();
+    assert_ne!(
+        first, moved,
+        "a geometry derived from regions[0] alone would be identical here"
+    );
+    assert_eq!(
+        first.spans[0], moved.spans[0],
+        "region one must be untouched by the relocation"
+    );
+    assert_ne!(first.spans[1], moved.spans[1]);
+    let (a, b) = (edit_keep_mask(&first), edit_keep_mask(&moved));
+    assert_ne!(a, b, "the two masks must differ");
+    // Specifically: they agree everywhere except the union of the two relocated spans.
+    for index in 0..a.len() {
+        let moved_area = (617_400..793_800).contains(&index) || (352_800..529_200).contains(&index);
+        if !moved_area {
+            assert_eq!(a[index], b[index], "mask[{index}] must be unaffected");
+        }
+    }
+}
+
+/// The retained-latent count is a **union**, not a sum — gated on input `edit_geometry` cannot
+/// produce, because that is the only input on which the two formulas differ.
+///
+/// # This case was vacuous once, and the reason is worth keeping
+///
+/// It originally drove `edit_geometry` with overlapping and touching *requests* and compared the
+/// result against a brute-force union. That passes whether the implementation unions or sums, and
+/// was verified GREEN under the sum mutation. `merge_edit_regions` leaves the audio spans disjoint
+/// and non-touching, `ceil(x/4096)` is monotonic, and a sub-latent-frame region is already refused —
+/// so `start_latent[i+1] >= end_latent[i]` always holds and the latent ranges can touch but never
+/// overlap. Normalized input is exactly the input on which union and sum agree, so a test that can
+/// only reach normalized input cannot discriminate between them.
+///
+/// The discriminating input is an `EditGeometry` built **by hand**, with spans that overlap in
+/// latent space — which is what the geometry becomes if the merge is ever removed or weakened. That
+/// is the property the union actually buys: correctness that does not depend on an invariant
+/// established in a different function. A count that wrongly reached zero would put
+/// `edit_local_conditioning_is_present` into its "an all-zero local conditioning is correct here"
+/// branch and disarm the presence guard on exactly the geometry that needed it.
+#[test]
+fn the_retained_latent_count_unions_overlapping_latent_ranges() {
+    let source = source_clip(20.0, SAMPLE_RATE, 2);
+    let geometry = small_geometry(20.0);
+    let resolved = edit_geometry(
+        &multi_edit(&source.samples, &[(2.0, 6.0), (14.0, 18.0)]),
+        &geometry,
+        20.0,
+    )
+    .unwrap();
+    // Derived independently of the function under test: 216 effective latents, minus [22,65) and
+    // [151,194) — two disjoint latent ranges, 43 positions each.
+    assert_eq!(edit_retained_latent_count(&resolved), 216 - 43 - 43);
+
+    // --- the discriminating case: overlapping latent ranges, constructed directly ---------------
+    // `edit_geometry` cannot produce this; the merge is what prevents it. Building it by hand is
+    // what makes the union/sum distinction reachable at all.
+    let overlapping = EditGeometry {
+        adapted_size: 1_146_880,
+        latent_length: 280,
+        effective_samples: 882_000,
+        spans: vec![
+            EditSpan {
+                start_sample: 88_200,
+                end_sample: 264_600,
+                start_latent: 22,
+                end_latent: 65,
+            },
+            EditSpan {
+                start_sample: 180_224,
+                end_sample: 356_352,
+                start_latent: 44,
+                end_latent: 87,
+            },
+        ],
+    };
+    // Union of [22,65) and [44,87) is [22,87) — 65 positions. A sum would say 43 + 43 = 86 and
+    // report 216 - 86 = 130, double-counting the 21 shared positions.
+    assert_eq!(
+        edit_retained_latent_count(&overlapping),
+        216 - 65,
+        "overlapping latent ranges must be unioned; a sum reports {} here",
+        216 - 86
+    );
+    // Fully contained, and duplicated — the other two ways a sum over-counts.
+    let contained = EditGeometry {
+        spans: vec![
+            EditSpan {
+                start_sample: 88_200,
+                end_sample: 264_600,
+                start_latent: 22,
+                end_latent: 65,
+            },
+            EditSpan {
+                start_sample: 122_880,
+                end_sample: 163_840,
+                start_latent: 30,
+                end_latent: 40,
+            },
+        ],
+        ..overlapping.clone()
+    };
+    assert_eq!(edit_retained_latent_count(&contained), 216 - 43);
+    let duplicated = EditGeometry {
+        spans: vec![overlapping.spans[0], overlapping.spans[0]],
+        ..overlapping.clone()
+    };
+    assert_eq!(edit_retained_latent_count(&duplicated), 216 - 43);
+
+    // The invariant the equality above depends on, pinned where it is established: every geometry
+    // `edit_geometry` produces has non-overlapping latent ranges. If this ever stops holding, the
+    // cases above are what keep the count correct anyway.
+    for regions in [
+        &[(2.0f32, 6.0f32), (4.0, 8.0)][..],
+        &[(2.0, 6.0), (6.0, 10.0)][..],
+        &[(1.0, 1.2), (1.2, 1.4), (1.4, 1.6)][..],
+    ] {
+        let normalized = edit_geometry(&multi_edit(&source.samples, regions), &geometry, 20.0)
+            .unwrap_or_else(|error| panic!("{regions:?}: {error}"));
+        for pair in normalized.spans.windows(2) {
+            assert!(
+                pair[0].end_latent <= pair[1].start_latent,
+                "{regions:?}: normalization must leave latent ranges non-overlapping, got                  {:?}",
+                normalized.spans
+            );
+        }
+    }
+
+    // Two audio spans one sample apart quantize onto ranges that touch or coincide. The count must
+    // not go negative, must not double-subtract, and must agree with a brute-force union.
+    for regions in [
+        &[(2.0f32, 2.2f32), (2.2, 2.4)][..],
+        &[(2.0, 2.5), (2.51, 3.0)][..],
+        &[(0.5, 19.0), (1.0, 19.5)][..],
+    ] {
+        let resolved = edit_geometry(&multi_edit(&source.samples, regions), &geometry, 20.0)
+            .unwrap_or_else(|error| panic!("{regions:?}: {error}"));
+        let effective = resolved
+            .effective_samples
+            .div_ceil(LATENT_DOWNSAMPLING)
+            .min(resolved.latent_length);
+        let brute: usize = (0..effective)
+            .filter(|latent| {
+                !resolved
+                    .spans
+                    .iter()
+                    .any(|span| (span.start_latent..span.end_latent).contains(latent))
+            })
+            .count();
+        assert_eq!(
+            edit_retained_latent_count(&resolved),
+            brute,
+            "{regions:?}: the retained count must equal the brute-force latent union"
+        );
+    }
+}
+
+/// The stitch preserves everything outside **every** span, bit for bit.
+///
+/// The 20 s / `[2,6)` + `[14,18)` case has three preserved spans — `[0,2)`, `[6,14)` and `[18,20)` —
+/// and the middle one is what a stitch written against `spans[0]` alone gets wrong: it would happily
+/// preserve `[0,2)` and then overwrite the second edit window with the source, undoing it.
+#[test]
+fn the_stitch_preserves_every_span_outside_the_union() {
+    let source = source_clip(20.0, SAMPLE_RATE, 2);
+    let geometry = small_geometry(20.0);
+    let resolved = edit_geometry(
+        &multi_edit(&source.samples, &[(2.0, 6.0), (14.0, 18.0)]),
+        &geometry,
+        20.0,
+    )
+    .unwrap();
+    let frames = (20.0 * SAMPLE_RATE as f32) as usize;
+    let prepared =
+        prepare_reference_pcm(&source.samples, SAMPLE_RATE, 2, geometry.sample_size).unwrap();
+    // A "render" that is recognisably not the source anywhere.
+    let rendered: Vec<f32> = (0..frames * CHANNELS)
+        .map(|index| 0.5 + index as f32 * 1e-7)
+        .collect();
+    let stitched = stitch_outside_region(&rendered, &prepared, &resolved).unwrap();
+    assert_eq!(stitched.len(), rendered.len());
+    for frame in 0..frames {
+        let inside = (88_200..264_600).contains(&frame) || (617_400..793_800).contains(&frame);
+        for channel in 0..CHANNELS {
+            let index = frame * CHANNELS + channel;
+            if inside {
+                assert_eq!(
+                    stitched[index], rendered[index],
+                    "frame {frame} is inside an edit span and must keep the render"
+                );
+            } else {
+                assert_eq!(
+                    stitched[index], prepared[index],
+                    "frame {frame} is outside every span and must be the prepared source exactly"
+                );
+            }
+        }
+    }
+    // Named explicitly: the *middle* preserved span is the one a spans[0]-only stitch destroys.
+    assert!((264_600..617_400).all_preserved(&stitched, &prepared));
+}
+
+trait AllPreserved {
+    fn all_preserved(self, stitched: &[f32], prepared: &[f32]) -> bool;
+}
+impl AllPreserved for std::ops::Range<usize> {
+    fn all_preserved(self, stitched: &[f32], prepared: &[f32]) -> bool {
+        self.flat_map(|frame| (0..CHANNELS).map(move |channel| frame * CHANNELS + channel))
+            .all(|index| stitched[index] == prepared[index])
+    }
+}
+
+/// Every multi-region rejection, on every variant.
+#[test]
+fn multi_region_validation_rejects_every_malformed_request_on_every_variant() {
+    let source = source_clip(20.0, SAMPLE_RATE, 2);
+    for variant in Variant::ALL {
+        let id = variant.model_id();
+        // The positive control first: a well-formed two-region inpaint is accepted, so every
+        // rejection below discriminates rather than the whole surface being closed.
+        let good = multi_edit_request(
+            "two windows",
+            source.clone(),
+            AudioEditMode::Inpaint,
+            &[(2.0, 6.0), (14.0, 18.0)],
+            None,
+        );
+        validate(variant, &good)
+            .unwrap_or_else(|error| panic!("{id}: valid request rejected: {error}"));
+        // Order and overlap are accepted, not rejected.
+        for regions in [
+            &[(14.0f32, 18.0f32), (2.0, 6.0)][..],
+            &[(2.0, 6.0), (4.0, 8.0)][..],
+            &[(2.0, 6.0), (6.0, 10.0)][..],
+            &[(2.0, 6.0), (2.0, 6.0)][..],
+        ] {
+            validate(
+                variant,
+                &multi_edit_request("x", source.clone(), AudioEditMode::Inpaint, regions, None),
+            )
+            .unwrap_or_else(|error| panic!("{id}: {regions:?} must be accepted: {error}"));
+        }
+
+        // --- refusals, each with the offending value in region TWO where a list can hide it ---
+        let cases: &[(&str, GenerationRequest)] = &[
+            (
+                "an empty region list",
+                multi_edit_request("x", source.clone(), AudioEditMode::Inpaint, &[], None),
+            ),
+            (
+                "region two past the source",
+                multi_edit_request(
+                    "x",
+                    source.clone(),
+                    AudioEditMode::Inpaint,
+                    &[(2.0, 6.0), (19.0, 25.0)],
+                    None,
+                ),
+            ),
+            (
+                "region two starting at the source's end",
+                multi_edit_request(
+                    "x",
+                    source.clone(),
+                    AudioEditMode::Inpaint,
+                    &[(2.0, 6.0), (20.0, 21.0)],
+                    None,
+                ),
+            ),
+            (
+                "region two narrower than one latent frame",
+                multi_edit_request(
+                    "x",
+                    source.clone(),
+                    AudioEditMode::Inpaint,
+                    &[(2.0, 6.0), (14.0, 14.01)],
+                    None,
+                ),
+            ),
+            (
+                "region two inverted",
+                multi_edit_request(
+                    "x",
+                    source.clone(),
+                    AudioEditMode::Inpaint,
+                    &[(2.0, 6.0), (18.0, 14.0)],
+                    None,
+                ),
+            ),
+            (
+                "a non-finite bound in region two",
+                multi_edit_request(
+                    "x",
+                    source.clone(),
+                    AudioEditMode::Inpaint,
+                    &[(2.0, 6.0), (f32::NAN, 18.0)],
+                    None,
+                ),
+            ),
+            (
+                "a conflicting target_duration",
+                multi_edit_request(
+                    "x",
+                    source.clone(),
+                    AudioEditMode::Inpaint,
+                    &[(2.0, 6.0), (14.0, 18.0)],
+                    Some(11.0),
+                ),
+            ),
+        ];
+        for (what, request) in cases {
+            assert!(
+                validate(variant, request).is_err(),
+                "{id}: {what} must be rejected"
+            );
+        }
+
+        // `end_secs: None` on the multi-region carrier is refused outright, at either position.
+        for regions in [
+            vec![TimeRegion {
+                start_secs: 2.0,
+                end_secs: None,
+            }],
+            vec![
+                TimeRegion {
+                    start_secs: 2.0,
+                    end_secs: Some(6.0),
+                },
+                TimeRegion {
+                    start_secs: 14.0,
+                    end_secs: None,
+                },
+            ],
+        ] {
+            let mut request = good.clone();
+            request.conditioning = vec![Conditioning::AudioEditRegions {
+                audio: source.clone(),
+                mode: AudioEditMode::Inpaint,
+                regions,
+                strength: None,
+            }];
+            assert!(
+                validate(variant, &request).is_err(),
+                "{id}: an open-ended region must be refused on the multi-region carrier"
+            );
+        }
+
+        // `Extend` is a single-tail operation: a typed capability gap on this carrier, never
+        // silently reinterpreted as an inpaint.
+        let extend = multi_edit_request(
+            "x",
+            source.clone(),
+            AudioEditMode::Extend,
+            &[(20.0, 28.0)],
+            Some(28.0),
+        );
+        assert!(
+            matches!(
+                validate(variant, &extend),
+                Err(gen_core::Error::Unsupported(_))
+            ),
+            "{id}: multi-region Extend must be a typed Unsupported"
+        );
+
+        // Strength is refused on this carrier too — the same reasoning as the legacy one.
+        let mut strengthened = good.clone();
+        strengthened.conditioning = vec![Conditioning::AudioEditRegions {
+            audio: source.clone(),
+            mode: AudioEditMode::Inpaint,
+            regions: vec![
+                TimeRegion {
+                    start_secs: 2.0,
+                    end_secs: Some(6.0),
+                },
+                TimeRegion {
+                    start_secs: 14.0,
+                    end_secs: Some(18.0),
+                },
+            ],
+            strength: Some(0.5),
+        }];
+        assert!(
+            matches!(
+                validate(variant, &strengthened),
+                Err(gen_core::Error::Unsupported(_))
+            ),
+            "{id}: multi-region strength must be a typed Unsupported"
+        );
+
+        // Carrier arity, counted across BOTH kinds: two multi carriers, and one of each. Counting
+        // the kinds separately would let the mixed case through at one apiece.
+        let mut two_multi = good.clone();
+        two_multi.conditioning.push(Conditioning::AudioEditRegions {
+            audio: source.clone(),
+            mode: AudioEditMode::Inpaint,
+            regions: vec![TimeRegion {
+                start_secs: 8.0,
+                end_secs: Some(10.0),
+            }],
+            strength: None,
+        });
+        assert!(
+            matches!(
+                validate(variant, &two_multi),
+                Err(gen_core::Error::Unsupported(_))
+            ),
+            "{id}: two multi-region carriers must be refused, not first-won"
+        );
+        let mut mixed = good.clone();
+        mixed.conditioning.push(Conditioning::AudioEdit {
+            audio: source.clone(),
+            mode: AudioEditMode::Inpaint,
+            region: region(8.0, Some(10.0)),
+            strength: None,
+        });
+        assert!(
+            matches!(
+                validate(variant, &mixed),
+                Err(gen_core::Error::Unsupported(_))
+            ),
+            "{id}: a mixed single + multi carrier pair must be refused, not first-won"
+        );
+
+        // And the combination refusal covers the new carrier.
+        let mut combined = good.clone();
+        combined.conditioning.push(Conditioning::ReferenceAudio {
+            audio: source.clone(),
+            strength: Some(0.5),
+        });
+        assert!(
+            matches!(
+                validate(variant, &combined),
+                Err(gen_core::Error::Unsupported(_))
+            ),
+            "{id}: ReferenceAudio + AudioEditRegions must be refused"
+        );
+    }
+}
+
+/// All six descriptors advertise the multi-region kind alongside the single-region one.
+#[test]
+fn all_six_descriptors_advertise_multi_region_editing() {
+    for variant in Variant::ALL {
+        let capabilities = candle_audio_stable_audio_3::model::descriptor_for(variant).capabilities;
+        assert!(
+            capabilities.accepts(ConditioningKind::AudioEditRegions),
+            "{}: must advertise AudioEditRegions",
+            variant.model_id()
+        );
+        assert!(
+            capabilities.accepts(ConditioningKind::AudioEdit),
+            "{}: the single-region kind stays advertised",
+            variant.model_id()
+        );
+    }
+}
+
+/// **Multi-region inpainting, with real weights, on all six ids** (sc-14549).
+///
+/// A 10 s source with two non-contiguous windows — `[1s, 3s)` and `[6s, 8s)` — regenerated in one
+/// pass, leaving three preserved spans: `[0,1)`, `[3,6)` and `[8,10)`.
+///
+/// # The probe is correctly signed, and that is the whole design
+///
+/// The defect this exists to catch is "honours `regions[0]`, silently drops the rest". sc-14548's
+/// blocker was precisely a defect that every floor in the case scored *better* under, so the shape
+/// used here is the one that finding produced: **hold everything constant except the thing under
+/// test, so a broken implementation collapses to identity rather than diverging.**
+///
+/// * `moved` renders at the identical seed, prompt, source, mode and `regions[0]`, differing **only
+///   in where region two sits**. If region two never reaches the mask, the two renders are
+///   bit-identical — the quantity is exactly zero and no threshold can hide it. If region two is
+///   honoured they differ, because both windows share one denoising trajectory.
+/// * `reversed` is the same union written in the other order and must be **byte-identical** to
+///   `base`. That is the order-independence claim, asserted with weights rather than argued from
+///   the merge function.
+/// * `legacy_one` proves the two carriers are one path: a one-region `AudioEditRegions` and a
+///   `AudioEdit` naming the same span render byte-identically.
+/// * `sequential` is two single-region edits run back to back, the second taking the first's output
+///   as its source. It must **differ** from `base`, because each sequential pass re-noises and
+///   re-decodes and so the windows do not share a trajectory. This is the story's headline claim
+///   ("not equivalent to N sequential single-region edits") measured rather than asserted in prose.
+///
+/// # What is NOT claimed
+///
+/// **No cross-framework parity.** There is no frozen-PyTorch multi-region oracle on this machine and
+/// none is vendored; the upstream checkout named in `SC_14534_SA3_REFERENCE_PARITY.md` is absent.
+/// The union semantics gated here are **this repository's**, stated in
+/// `Conditioning::AudioEditRegions`. sc-15431 tracks the conditioning oracle.
+#[test]
+#[ignore = "requires all six pinned immutable snapshots; set SA3_*_SNAPSHOT"]
+fn real_multi_region_inpaint_regenerates_every_span_in_one_pass() {
+    let seconds = 10.0f32;
+    let frames = (seconds as f64 * SAMPLE_RATE as f64) as usize;
+    let source = source_clip(seconds, 48_000, 1);
+    let prepared = prepare_reference_pcm(&source.samples, 48_000, 1, frames).unwrap();
+    let spans = [(1.0f32, 3.0f32), (6.0f32, 8.0f32)];
+    let windows: Vec<(usize, usize)> = spans
+        .iter()
+        .map(|(start, end)| edit_region_samples(*start, *end))
+        .collect();
+
+    let mut measured = Vec::new();
+    for case in CASES {
+        let spec = LoadSpec::new(snapshot(case.env));
+        let generator = load_variant(case.variant, &spec).expect("load pinned snapshot");
+        let id = generator.descriptor().id;
+        let render_multi = |clip: &AudioTrack, regions: &[(f32, f32)]| {
+            let request = multi_edit_request(
+                case.prompt,
+                clip.clone(),
+                AudioEditMode::Inpaint,
+                regions,
+                Some(seconds),
+            );
+            audio(
+                generator
+                    .generate(&request, &mut |_| {})
+                    .unwrap_or_else(|error| panic!("{id} multi {regions:?}: {error}")),
+            )
+        };
+        let render_single = |clip: &AudioTrack, start: f32, end: f32| {
+            let request = edit_request(
+                case.prompt,
+                clip.clone(),
+                AudioEditMode::Inpaint,
+                region(start, Some(end)),
+                Some(seconds),
+            );
+            audio(
+                generator
+                    .generate(&request, &mut |_| {})
+                    .unwrap_or_else(|error| panic!("{id} single [{start},{end}): {error}")),
+            )
+        };
+
+        let base = render_multi(&source, &spans);
+        // THE probe: regions[0] held fixed, region two relocated. Collapses to byte-identity if
+        // region two is dropped.
+        let moved = render_multi(&source, &[(1.0, 3.0), (4.0, 6.0)]);
+        // Order-independence, with weights.
+        let reversed = render_multi(&source, &[(6.0, 8.0), (1.0, 3.0)]);
+        // The two carriers are one path.
+        let multi_one = render_multi(&source, &[(1.0, 3.0)]);
+        let legacy_one = render_single(&source, 1.0, 3.0);
+        // Two passes, chained — the thing multi-region is NOT. `first_pass` is deliberately the
+        // same request as `legacy_one` rather than a reuse of its buffer: rendering it twice makes
+        // the reproducibility law part of this case too, and the assertion below would fail if the
+        // two ever diverged.
+        let first_pass = render_single(&source, 1.0, 3.0);
+        assert!(
+            first_pass.samples == legacy_one.samples,
+            "{id}: the same single-region request rendered twice must be byte-identical"
+        );
+        let sequential = render_single(&first_pass, 6.0, 8.0);
+
+        assert_eq!(base.sample_rate, SAMPLE_RATE);
+        assert_eq!(base.channels as usize, CHANNELS);
+        assert_eq!(
+            base.samples.len(),
+            frames * CHANNELS,
+            "{id}: a multi-region inpaint's output is exactly as long as its source"
+        );
+        assert!(base.samples.iter().all(|value| value.is_finite()));
+
+        // All three preserved spans, bit for bit. The MIDDLE one is what a spans[0]-only stitch
+        // destroys, so it is the load-bearing third of this assertion.
+        for frame in 0..frames {
+            if windows
+                .iter()
+                .any(|(start, end)| (*start..*end).contains(&frame))
+            {
+                continue;
+            }
+            for channel in 0..CHANNELS {
+                let index = frame * CHANNELS + channel;
+                assert_eq!(
+                    base.samples[index], prepared[index],
+                    "{id}: frame {frame} channel {channel} is outside both edit windows and must \
+                     be the prepared source exactly"
+                );
+            }
+        }
+
+        // Byte-level structural claims. `assert!` on a comparison rather than `assert_ne!` so a
+        // failure does not dump two 882,000-sample slices.
+        assert!(
+            moved.samples != base.samples,
+            "{id}: relocating ONLY region two produced byte-identical audio — the provider appears \
+             to honour regions[0] and drop the rest"
+        );
+        assert!(
+            reversed.samples == base.samples,
+            "{id}: the same union written in the other order must render byte-identically — region \
+             order is not significant"
+        );
+        assert!(
+            multi_one.samples == legacy_one.samples,
+            "{id}: a one-region AudioEditRegions and the legacy AudioEdit must be byte-identical"
+        );
+        assert!(
+            sequential.samples != base.samples,
+            "{id}: a two-region edit rendered identically to two chained single-region edits — the \
+             regions are supposed to share ONE denoising trajectory, not be applied in sequence"
+        );
+
+        // Per-window divergence from the source. Measured for every id before anything is
+        // asserted, so one failing checkpoint cannot hide the other five's numbers.
+        let mut per_window = Vec::new();
+        for (start, end) in &windows {
+            let inside = start * CHANNELS..end * CHANNELS;
+            per_window.push((
+                divergence(&base.samples[inside.clone()], &prepared[inside.clone()]),
+                energy(&prepared[inside]),
+            ));
+        }
+        println!(
+            "{id} window0_divergence={:.6} window0_energy={:.6} window1_divergence={:.6} \
+             window1_energy={:.6}",
+            per_window[0].0, per_window[0].1, per_window[1].0, per_window[1].1
+        );
+        measured.push((id, per_window));
+    }
+
+    for (id, per_window) in &measured {
+        for (index, (divergence, reference)) in per_window.iter().enumerate() {
+            assert!(
+                *divergence > MULTI_REGION_DIVERGENCE_FLOOR * reference,
+                "{id}: window {index} must differ from the source — divergence {divergence:.6} \
+                 against source energy {reference:.6}"
+            );
+        }
+    }
+}
+
+/// Floor for each window's source divergence, as a fraction of that window's own source energy.
+///
+/// **Inherited, not measured.** The value is carried verbatim from sc-14548's single-region floors,
+/// which *were* set after a measurement — but a measurement of a different quantity, on a different
+/// geometry. No multi-region measurement exists: the local real-weight run produced no numbers, so
+/// `0.08` is **unvalidated for multi-region** until the real-weight lane reports. If it fails there,
+/// re-derive it the way sc-14548 did — from the **low** mode of the measured spread — rather than
+/// nudging it to whatever makes the run pass. That hazard is sc-14548's own: its first attempt used
+/// a number picked before any measurement and failed a checkpoint that was working correctly.
+///
+/// This measurement is deliberately **not** the gate against a dropped region two — it is
+/// wrong-signed for that, exactly as sc-14548's `source_divergence` was: a window left unedited is
+/// still reconstructed through the SAME round trip and still scores above zero. The gate against a
+/// dropped region is the byte-inequality of the relocated-region-two render, which collapses to
+/// identity. This floor only says each window was genuinely regenerated rather than copied.
+const MULTI_REGION_DIVERGENCE_FLOOR: f64 = 0.08;

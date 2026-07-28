@@ -230,9 +230,9 @@ jobs:
         # time for zero executed cases.
         #
         # The named ten and what they execute on a PR (measured, by running this step's exact
-        # command on the merged tree): `sampler_oracle` 17, `audio_edit` 12, `reference_audio` 7,
+        # command on the merged tree): `audio_edit` 20, `sampler_oracle` 17, `reference_audio` 7,
         # `provider` 3, `listening_stimuli` 3, `dtype_policy` 2, `conformance` 1,
-        # `primitive_oracle` 1, `same_oracle` 1, `variant_quality` 1 — 48 weight-free cases.
+        # `primitive_oracle` 1, `same_oracle` 1, `variant_quality` 1 — 56 weight-free cases.
         # sc-14545 review found
         # `sampler_oracle`, `same_oracle` and `primitive_oracle` running in no automatic lane at all
         # (19 dark gates, pre-existing since sc-14543) and added them here. sc-14546 adds
@@ -270,6 +270,36 @@ jobs:
         # now calls `sampler_strength_for` inline at each of the two sites with no binding shared
         # between them. All three gates are verified to fail under their own single-token mutation,
         # not merely to pass under the correct code.
+        #
+        # sc-14549 adds eight cases to `audio_edit` (twelve -> twenty) for multi-region editing —
+        # several non-contiguous spans regenerated in ONE pass. The defect they exist to catch is
+        # "honours regions[0], silently drops the rest", which renders completely plausibly: one
+        # span genuinely regenerated, the rest of the clip preserved, right length, non-silent,
+        # finite, reproducible. Every well-formedness and divergence measurement passes.
+        #
+        # So the shape is sc-14548's carry-forward applied up front: hold everything constant except
+        # the thing under test, so a broken implementation collapses to IDENTITY rather than
+        # diverging. `relocating_region_two_relocates_its_mask_and_nothing_else` moves only
+        # regions[1] and requires the geometry and mask to change — a geometry derived from
+        # regions[0] alone is byte-identical between the two, so it fails by equality, not by a
+        # threshold. `merge_edit_regions_is_an_order_independent_disjoint_union` pins the union
+        # (order-independence over every permutation, touching-merges-too, sorted/disjoint output);
+        # `the_multi_region_geometry_and_keep_mask_cover_every_span` asserts the mask over the whole
+        # 1,146,880-sample buffer rather than at spot points, so a loop that zeroed only the first
+        # span fails on the second span's frames; `the_stitch_preserves_every_span_outside_the_union`
+        # covers the MIDDLE preserved span, which a stitch written against spans[0] destroys;
+        # `the_retained_latent_count_unions_overlapping_latent_ranges` pins that ceil(x/4096) is not
+        # injective so the count must union rather than sum — a count that wrongly reached zero
+        # would disarm `edit_local_conditioning_is_present` on exactly the geometry that needed it;
+        # `one_region_on_the_new_carrier_is_the_legacy_shape_exactly` is the "single-region callers
+        # are unchanged" acceptance criterion.
+        #
+        # The gen-core half rides the `contracts` job, not this one, and its headline case is
+        # `every_region_is_floored_not_just_the_first`: `first_nonfinite_float` destructures without
+        # `..` so a new *field* breaks the build, but a `Vec` defeats that mechanism entirely — a
+        # guard reaching only regions[0] compiles, passes every pre-existing test, and lets a NaN in
+        # region two poison the mask. Every malformed value in that case, and in the testkit's
+        # `check_multi_region_audio_edit`, sits in region TWO.
         #
         # sc-14548 adds `audio_edit`, the inpaint/repaint/extend target. Its twelve weight-free cases
         # are the **whole** of the PR-time evidence for that feature: the DiT side was already

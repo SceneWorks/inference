@@ -26,8 +26,9 @@
 //! guarantees that are identical across modalities.
 
 use gen_core::{
-    AudioChunk, AudioParams, AudioTrack, Conditioning, ConditioningKind, ConversationRole,
-    ConversationTurn, Error, GenerationOutput, GenerationRequest, Generator, Image, Modality,
+    AudioChunk, AudioEditMode, AudioParams, AudioTrack, Conditioning, ConditioningKind,
+    ConversationRole, ConversationTurn, Error, GenerationOutput, GenerationRequest, Generator,
+    Image, Modality, TimeRegion,
 };
 
 /// Cheap-request parameters for an audio conformance run — the audio analog of
@@ -1077,6 +1078,272 @@ fn expect_open_conversation_unsupported(
     }
 }
 
+/// The source clip a multi-region edit is applied to: long enough that two well-separated interior
+/// spans plus the gaps between them are all non-degenerate at any plausible VAE stride (sc-14549).
+///
+/// 8 s at the model's own advertised rate, with content that varies continuously along the clip, so
+/// "this span was regenerated" is distinguishable from "this span was copied" wherever the spans sit.
+/// The two 2-second spans are comfortably wider than any plausible VAE frame (Stable Audio 3's is
+/// ~93 ms, the widest in the repository), and the clip is kept short because this gate renders four
+/// times and runs inside `audio_conformance` on every provider's real-weight lane.
+const MULTI_REGION_SOURCE_SECS: f32 = 8.0;
+
+fn multi_region_source(sr: u32) -> AudioTrack {
+    let n = (sr as f32 * MULTI_REGION_SOURCE_SECS) as usize;
+    let samples = (0..n)
+        .map(|i| {
+            let t = i as f32 / sr as f32;
+            // Two incommensurate tones plus a slow sweep: every span of the clip has its own
+            // signature, so a copied span and a regenerated one are not confusable.
+            0.3 * (t * 220.0 * std::f32::consts::TAU).sin()
+                + 0.2 * (t * 331.0 * std::f32::consts::TAU).sin()
+                + 0.1 * (t * t * 9.0).sin()
+        })
+        .collect();
+    AudioTrack {
+        samples,
+        sample_rate: sr,
+        channels: 1,
+        ..Default::default()
+    }
+}
+
+/// A multi-region edit request: the profile's prompt + seed and one
+/// [`Conditioning::AudioEditRegions`] carrying `regions`.
+///
+/// `audio.target_duration` is deliberately **cleared**. An edit's output length is decided by the
+/// source and the regions, not requested alongside them, so a profile-supplied duration is not a
+/// constraint here — it is a second, conflicting statement of the same fact, and a provider that
+/// refuses the disagreement (Stable Audio 3 does) would reject this harness's own request. Every
+/// other field of the profile's audio sub-block is preserved, so an advertised voice / language /
+/// sample rate still rides along.
+fn multi_region_request(
+    g: &dyn Generator,
+    profile: &AudioProfile,
+    mode: AudioEditMode,
+    regions: Vec<TimeRegion>,
+) -> GenerationRequest {
+    let mut r = audio_base_request(g, profile);
+    r.audio = Some(AudioParams {
+        target_duration: None,
+        ..profile.audio.clone()
+    });
+    r.conditioning = vec![Conditioning::AudioEditRegions {
+        audio: multi_region_source(conversation_sr(&g.descriptor().capabilities)),
+        mode,
+        regions,
+        strength: None,
+    }];
+    r
+}
+
+fn edit_span(start_secs: f32, end_secs: f32) -> TimeRegion {
+    TimeRegion {
+        start_secs,
+        end_secs: Some(end_secs),
+    }
+}
+
+/// **Multi-region prompted audio editing (sc-14549).** A [`Generator`] advertising
+/// [`ConditioningKind::AudioEditRegions`] must regenerate **every** named span in one pass; a
+/// generator that does not advertise it must reject the request as the typed
+/// [`Error::Unsupported`].
+///
+/// # The one assertion this gate exists for, and why it is shaped the way it is
+///
+/// The failure this is built to catch is a provider that honours `regions[0]` and silently drops the
+/// rest — the multi-region analogue of `audio_edit()`'s first-match seam. That defect produces a
+/// *completely plausible* render: one region is genuinely regenerated, the rest of the clip is
+/// preserved, the output is the right length, non-silent, finite and reproducible. Every
+/// well-formedness and divergence measurement passes.
+///
+/// So the probe is **correctly signed**: two requests are rendered that are identical in seed,
+/// prompt, source, mode and `regions[0]`, and differ **only in where region two sits**. If the
+/// provider honours region two the outputs differ; if it drops region two the two renders are
+/// **byte-identical** and the quantity collapses to exactly zero. A broken implementation cannot
+/// score *better* here — it can only collapse to identity, which is the property a divergence floor
+/// against a fixed reference does not have.
+///
+/// The `regions.len()`-dependence assertion beneath it is the same shape one step coarser: a
+/// one-region request and a two-region request sharing `regions[0]` and a seed must differ.
+///
+/// # What else is gated
+///
+/// - The list-shape floor, refused through the provider's own `validate`, with every malformed value
+///   placed in region **two**: an empty list, an open-ended `end_secs: None`, a non-finite bound, an
+///   inverted span and a negative start. A provider inheriting gen-core's floor gets all of these
+///   for free; one that reimplements validation and walks only `regions[0]` fails here.
+/// - Order-independence: the reversed region list is accepted (this repository's stated semantics —
+///   the spans form an unordered union; see [`Conditioning::AudioEditRegions`]).
+/// - Reproducibility: the same request + seed re-renders byte-identically.
+/// - Well-formedness of the rendered track, as everywhere else in this suite.
+///
+/// It deliberately does **not** assert which spans of PCM were preserved: "preserved outside,
+/// changed inside" is a per-provider numeric contract needing the provider's own timeline and
+/// tolerance (Stable Audio 3 proves it bit-exactly in its own real-weight lane). This is the
+/// model-agnostic floor every provider inherits.
+pub fn check_multi_region_audio_edit(
+    g: &dyn Generator,
+    profile: &AudioProfile,
+) -> Result<(), String> {
+    let desc = g.descriptor();
+    let id = desc.id;
+    let advertises = desc
+        .capabilities
+        .accepts(ConditioningKind::AudioEditRegions);
+    // Whichever bounded-span mode the model advertises. A provider advertising the kind but no
+    // region mode is refused by the shared `audio_edit_modes` gate — a genuine capability gap, not
+    // this gate's business.
+    let mode = desc
+        .capabilities
+        .audio_edit_modes
+        .iter()
+        .copied()
+        .find(|m| matches!(m, AudioEditMode::Inpaint | AudioEditMode::Repaint))
+        .unwrap_or(AudioEditMode::Inpaint);
+
+    let two = [edit_span(1.0, 3.0), edit_span(5.0, 7.0)];
+    let req = multi_region_request(g, profile, mode, two.to_vec());
+
+    if !advertises {
+        // Default-deny, and it costs the provider nothing: `AudioEditRegions` is its own
+        // `ConditioningKind`, so the shared allowlist refuses it with no provider code and no
+        // capability flag. A single-region audio editor must never silently honour only the first
+        // span of a multi-region request.
+        return expect_unsupported(g, &req, id, "a multi-region AudioEditRegions edit");
+    }
+
+    // ---- The list-shape floor, with every malformed value in region TWO --------------------
+    for (regions, what) in [
+        (vec![], "an empty region list"),
+        (
+            vec![
+                edit_span(1.0, 3.0),
+                TimeRegion {
+                    start_secs: 5.0,
+                    end_secs: None,
+                },
+            ],
+            "an open-ended (end_secs: None) region two",
+        ),
+        (
+            vec![
+                edit_span(1.0, 3.0),
+                TimeRegion {
+                    start_secs: f32::NAN,
+                    end_secs: Some(7.0),
+                },
+            ],
+            "a NaN start in region two",
+        ),
+        (
+            vec![
+                edit_span(1.0, 3.0),
+                TimeRegion {
+                    start_secs: 5.0,
+                    end_secs: Some(f32::INFINITY),
+                },
+            ],
+            "an infinite end in region two",
+        ),
+        (
+            vec![edit_span(1.0, 3.0), edit_span(7.0, 5.0)],
+            "an inverted region two",
+        ),
+        (
+            vec![edit_span(1.0, 3.0), edit_span(-3.0, 1.0)],
+            "a negative start in region two",
+        ),
+    ] {
+        let bad = multi_region_request(g, profile, mode, regions);
+        if g.validate(&bad).is_ok() {
+            return Err(format!(
+                "multi-region-edit[{id}]: {what} was accepted by validate() — the malformed value \
+                 is in region TWO, so a floor that walks only regions[0] passes every other case \
+                 and lets this one reach the mask"
+            ));
+        }
+    }
+
+    // ---- The positive surface ---------------------------------------------------------------
+    g.validate(&req).map_err(|e| {
+        format!(
+            "multi-region-edit[{id}]: advertises AudioEditRegions but validate() rejected a valid \
+             two-region edit: {e}"
+        )
+    })?;
+    // Order is not significant: the same two spans, reversed, describe the same edit.
+    let reversed = multi_region_request(g, profile, mode, vec![two[1], two[0]]);
+    g.validate(&reversed).map_err(|e| {
+        format!(
+            "multi-region-edit[{id}]: the reversed region list was rejected — region order is not \
+             significant, the spans form an unordered union: {e}"
+        )
+    })?;
+
+    let out = g.generate(&req, &mut |_| {}).map_err(|e| {
+        format!("multi-region-edit[{id}]: generate() failed on a valid two-region edit: {e}")
+    })?;
+    let track = match &out {
+        GenerationOutput::Audio(t) => t,
+        other => {
+            return Err(format!(
+                "multi-region-edit[{id}]: a multi-region edit must render \
+                 GenerationOutput::Audio, got {}",
+                variant_name(other)
+            ));
+        }
+    };
+    validate_track(id, "multi-region-edit", track)?;
+    if !track.samples.iter().any(|s| s.abs() > 1e-6) {
+        return Err(format!(
+            "multi-region-edit[{id}]: the rendered track is silent (all samples ~0)"
+        ));
+    }
+
+    // Reproducibility law.
+    let again = g
+        .generate(&req, &mut |_| {})
+        .map_err(|e| format!("multi-region-edit[{id}]: second generate() failed: {e}"))?;
+    if crate::output_bytes(&out) != crate::output_bytes(&again) {
+        return Err(format!(
+            "multi-region-edit[{id}]: the same multi-region edit + seed produced different audio \
+             on re-synth — the reproducibility law is violated"
+        ));
+    }
+
+    // ---- THE gate: region two must be load-bearing -------------------------------------------
+    // Identical in every respect except where region TWO sits. A provider that honours only
+    // regions[0] renders these two byte-identically — the quantity collapses to zero rather than
+    // shrinking, so no threshold can hide the defect and no "better" score can mask it.
+    let moved = multi_region_request(g, profile, mode, vec![two[0], edit_span(3.5, 5.5)]);
+    let moved_out = g.generate(&moved, &mut |_| {}).map_err(|e| {
+        format!("multi-region-edit[{id}]: generate() with region two relocated failed: {e}")
+    })?;
+    if crate::output_bytes(&moved_out) == crate::output_bytes(&out) {
+        return Err(format!(
+            "multi-region-edit[{id}]: moving ONLY region two (regions[0], seed, prompt, source and \
+             mode all held constant) produced byte-identical audio — the provider appears to \
+             honour regions[0] and silently drop the rest, which is the exact first-match failure \
+             this kind exists to prevent"
+        ));
+    }
+
+    // The same property one step coarser: dropping region two must change the render.
+    let single = multi_region_request(g, profile, mode, vec![two[0]]);
+    let single_out = g.generate(&single, &mut |_| {}).map_err(|e| {
+        format!("multi-region-edit[{id}]: generate() on a one-region edit failed: {e}")
+    })?;
+    if crate::output_bytes(&single_out) == crate::output_bytes(&out) {
+        return Err(format!(
+            "multi-region-edit[{id}]: a one-region edit and a two-region edit sharing regions[0] \
+             and a seed produced byte-identical audio — the second region had no effect"
+        ));
+    }
+
+    Ok(())
+}
+
 /// Run the full audio-generator conformance suite against a freshly-`make`d generator. Panics with
 /// every failure aggregated — the audio twin of [`conformance`](crate::conformance).
 pub fn audio_conformance(make: impl Fn() -> Box<dyn Generator>, profile: &AudioProfile) {
@@ -1084,7 +1351,7 @@ pub fn audio_conformance(make: impl Fn() -> Box<dyn Generator>, profile: &AudioP
     let g: &dyn Generator = g.as_ref();
 
     type Check = fn(&dyn Generator, &AudioProfile) -> Result<(), String>;
-    let checks: [Check; 11] = [
+    let checks: [Check; 12] = [
         check_audio_validate_honesty,
         check_audio_output,
         check_audio_progress,
@@ -1096,6 +1363,7 @@ pub fn audio_conformance(make: impl Fn() -> Box<dyn Generator>, profile: &AudioP
         check_audio_multi_speaker,
         check_video_to_audio,
         check_multi_turn,
+        check_multi_region_audio_edit,
     ];
     let failures: Vec<String> = checks
         .into_iter()
