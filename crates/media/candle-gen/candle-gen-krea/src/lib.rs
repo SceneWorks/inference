@@ -366,6 +366,7 @@ fn krea_generation_memory(
             tile_vae_decode: true,
             chunk_attention: true,
             stream_transformer_blocks: true,
+            ..Default::default()
         }),
     }
 }
@@ -1402,6 +1403,7 @@ mod tests {
                 tile_vae_decode: true,
                 chunk_attention: true,
                 stream_transformer_blocks: true,
+                ..Default::default()
             })
         );
     }
@@ -1430,6 +1432,14 @@ mod tests {
         };
         scope.configure_request(&mut request).unwrap();
         assert_eq!(request.memory, Some(attention_memory));
+        request.memory.as_mut().unwrap().calibration_error_phase =
+            Some(gen_core::ImageMemoryPhase::Denoise);
+        scope.configure_request(&mut request).unwrap();
+        assert_eq!(
+            request.memory,
+            Some(attention_memory),
+            "a warm follow-up request must not inherit a prior calibration fault"
+        );
         scope
             .finish(gen_core::ImageMemoryRunOutcome::Complete)
             .unwrap();
@@ -2146,6 +2156,7 @@ mod tests {
                 tile_vae_decode: true,
                 chunk_attention: true,
                 stream_transformer_blocks: true,
+                ..Default::default()
             }),
             cancel,
             ..Default::default()
@@ -2417,6 +2428,7 @@ mod tests {
                 tile_vae_decode: true,
                 chunk_attention: true,
                 stream_transformer_blocks: true,
+                ..Default::default()
             }),
             other => panic!(
                 "unknown KREA_MEMORY_RUNG={other}; use three-stage/tiled-vae/chunked-attention/streamed-blocks"

@@ -659,14 +659,26 @@ pub(crate) fn render_three_stage(
     let memory = req.memory.unwrap_or_default();
     candle_gen::check_cancel(&req.cancel)?;
 
-    on_progress(Progress::Loading(gen_core::LoadPhase::TextEncoder));
+    enter_loading_boundary(
+        req,
+        memory,
+        gen_core::LoadPhase::TextEncoder,
+        gen_core::ImageMemoryPhase::Conditioning,
+        on_progress,
+    )?;
     let text = load_text(root, device)?;
     let context = encode_prompt_context(&text, req)?;
     device.synchronize()?;
     drop(text);
 
     candle_gen::check_cancel(&req.cancel)?;
-    on_progress(Progress::Loading(gen_core::LoadPhase::Renderer));
+    enter_loading_boundary(
+        req,
+        memory,
+        gen_core::LoadPhase::Renderer,
+        gen_core::ImageMemoryPhase::Denoise,
+        on_progress,
+    )?;
     let dit = load_dit(root, device, adapters, memory.stream_transformer_blocks)?;
     let steps = req.steps.map(|s| s as usize).unwrap_or(TURBO_STEPS);
     let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
@@ -712,7 +724,7 @@ pub(crate) fn render_three_stage(
         .iter()
         .map(|latent| {
             candle_gen::check_cancel(&req.cancel)?;
-            on_progress(Progress::Decoding);
+            enter_decode_boundary(req, memory, on_progress)?;
             let decoded = vae
                 .decode_with(latent, memory.tile_vae_decode)?
                 .to_dtype(DType::F32)?;
@@ -722,6 +734,45 @@ pub(crate) fn render_three_stage(
     device.synchronize()?;
     drop(vae);
     Ok(images)
+}
+
+fn enter_decode_boundary(
+    req: &GenerationRequest,
+    memory: gen_core::GenerationMemory,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<()> {
+    on_progress(Progress::Decoding);
+    // The callback is the public decode boundary used by callers to request cancellation. Observe a
+    // flag raised there before starting the expensive, otherwise non-interruptible VAE decode.
+    candle_gen::check_cancel(&req.cancel)?;
+    maybe_inject_calibration_error(memory, gen_core::ImageMemoryPhase::Decode)
+}
+
+fn enter_loading_boundary(
+    req: &GenerationRequest,
+    memory: gen_core::GenerationMemory,
+    load_phase: gen_core::LoadPhase,
+    memory_phase: gen_core::ImageMemoryPhase,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<()> {
+    on_progress(Progress::Loading(load_phase));
+    // Loading is a public phase boundary too. A cancellation raised by its callback must stop before
+    // opening or materializing the next multi-GB component.
+    candle_gen::check_cancel(&req.cancel)?;
+    maybe_inject_calibration_error(memory, memory_phase)
+}
+
+fn maybe_inject_calibration_error(
+    memory: gen_core::GenerationMemory,
+    phase: gen_core::ImageMemoryPhase,
+) -> Result<()> {
+    if memory.calibration_error_phase == Some(phase) {
+        Err(CandleError::Msg(format!(
+            "krea_2_turbo: injected image-memory calibration error at {phase:?}"
+        )))
+    } else {
+        Ok(())
+    }
 }
 
 /// SPIKE (sc-8596, HELD) — the ComfyUI-Conditioning-Rebalance trick ported to candle: reweight the 12
@@ -1905,6 +1956,80 @@ pub(crate) fn to_image(decoded: &Tensor) -> Result<Image> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn calibration_faults_are_request_local_and_default_path_is_inert() {
+        let clean = gen_core::GenerationMemory::default();
+        for phase in [
+            gen_core::ImageMemoryPhase::Conditioning,
+            gen_core::ImageMemoryPhase::Denoise,
+            gen_core::ImageMemoryPhase::Decode,
+        ] {
+            assert!(maybe_inject_calibration_error(clean, phase).is_ok());
+            let faulted = gen_core::GenerationMemory {
+                calibration_error_phase: Some(phase),
+                ..clean
+            };
+            let error = maybe_inject_calibration_error(faulted, phase)
+                .expect_err("the selected calibration phase must fail");
+            assert!(error.to_string().contains(&format!("{phase:?}")));
+            assert!(
+                maybe_inject_calibration_error(clean, phase).is_ok(),
+                "a warm follow-up request must not inherit the prior request's fault"
+            );
+        }
+    }
+
+    #[test]
+    fn decoding_progress_callback_can_cancel_before_decode_starts() {
+        let request = GenerationRequest {
+            prompt: "test".to_owned(),
+            ..Default::default()
+        };
+        let cancel = request.cancel.clone();
+        let error = enter_decode_boundary(
+            &request,
+            gen_core::GenerationMemory::default(),
+            &mut |progress| {
+                assert_eq!(progress, Progress::Decoding);
+                cancel.cancel();
+            },
+        )
+        .expect_err("decode-boundary cancellation must be observed");
+        assert!(matches!(error, CandleError::Canceled));
+    }
+
+    #[test]
+    fn loading_progress_callbacks_can_cancel_before_component_loads_start() {
+        for (load_phase, memory_phase) in [
+            (
+                gen_core::LoadPhase::TextEncoder,
+                gen_core::ImageMemoryPhase::Conditioning,
+            ),
+            (
+                gen_core::LoadPhase::Renderer,
+                gen_core::ImageMemoryPhase::Denoise,
+            ),
+        ] {
+            let request = GenerationRequest {
+                prompt: "test".to_owned(),
+                ..Default::default()
+            };
+            let cancel = request.cancel.clone();
+            let error = enter_loading_boundary(
+                &request,
+                gen_core::GenerationMemory::default(),
+                load_phase,
+                memory_phase,
+                &mut |progress| {
+                    assert_eq!(progress, Progress::Loading(load_phase));
+                    cancel.cancel();
+                },
+            )
+            .expect_err("loading-boundary cancellation must be observed");
+            assert!(matches!(error, CandleError::Canceled));
+        }
+    }
 
     /// sc-12828: `load_text` stores the Qwen3-VL TE at **bf16**, not f32 — the deliberate, non-default
     /// choice the ~7.6 GB/tier resident saving rides on (the encoder still computes f32 via

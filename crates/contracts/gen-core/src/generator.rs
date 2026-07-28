@@ -10,8 +10,8 @@ use crate::media::{AudioChunk, AudioTrack, Image};
 use crate::runtime::{CancelFlag, Progress, Quant};
 use crate::voice_embed::VoiceEmbedding;
 use crate::{
-    Error, ImageMemoryProviderContract, ImageMemoryRequestScope, ImageMemoryRunContext,
-    ImageMemorySafetyDecision, ImageMemoryStrategy, Result,
+    Error, ImageMemoryPhase, ImageMemoryProviderContract, ImageMemoryRequestScope,
+    ImageMemoryRunContext, ImageMemorySafetyDecision, ImageMemoryStrategy, Result,
 };
 
 /// A prompt-conditioned media generator. `generate` is **synchronous** (long/blocking; the
@@ -447,6 +447,11 @@ pub struct GenerationMemory {
     /// the accelerator. This is the last quality-preserving rung when complete weights plus bounded
     /// activations still exceed the live device budget.
     pub stream_transformer_blocks: bool,
+    /// Calibration-only request-local fault injection. Adopting providers may return a deterministic
+    /// error at the named physical phase boundary so a conformance harness can verify cleanup and a
+    /// warm follow-up request. Production selectors must leave this at `None` (the default).
+    #[doc(hidden)]
+    pub calibration_error_phase: Option<ImageMemoryPhase>,
 }
 
 /// The typed audio request sub-block carried by [`GenerationRequest::audio`] (sc-12834). A single
@@ -2085,6 +2090,7 @@ mod tests {
                 tile_vae_decode: false,
                 chunk_attention: false,
                 stream_transformer_blocks: false,
+                calibration_error_phase: None,
             }
         );
     }
