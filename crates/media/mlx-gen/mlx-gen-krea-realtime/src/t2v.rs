@@ -566,11 +566,13 @@ fn open_transformer_weights(root: &Path) -> Result<Weights> {
 /// rather than a warning: the naive switch would have folded only 7 of them at the default Q4 (a
 /// weight `.diff` cannot fold into a packed Linear) against 407 at bf16, so the same LoRA would render
 /// differently per tier — unacceptable where the quant tier is a creative choice. Both of the channels
-/// this file actually uses are tier-independent instead: a `.diff_b` folds into the Linear's **bias**,
-/// which a `QuantizedLinear` keeps dense, and the `.diff` deltas all target **norms**, which no tier
-/// packs (routed by [`CausalKreaTransformer`]'s `diff_patch_param_mut`). Anything that still cannot
-/// land is returned on `ApplyReport::diff_patch_unapplied` for the provider to put in front of the
-/// user, not left in a log line.
+/// this file actually uses are **tier-independent in coverage** instead: a `.diff_b` folds into the
+/// Linear's **bias**, which a `QuantizedLinear` keeps dense, and the `.diff` deltas all target
+/// **norms**, which no tier packs (routed by [`CausalKreaTransformer`]'s `diff_patch_param_mut`).
+/// "In coverage" is the exact claim — every key lands on every tier; the bias fold still happens in
+/// whatever dtype the base carries, which for this bf16-native DiT is bf16 either way. Anything that
+/// still cannot land is returned on `ApplyReport::diff_patch_unapplied` for the provider to put in
+/// front of the user, not left in a log line.
 fn load_transformer(
     root: &Path,
     cfg: &KreaRealtimeConfig,

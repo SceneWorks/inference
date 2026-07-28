@@ -1808,18 +1808,20 @@ pub fn apply_adapter_specs_autoprefix(
 // out-of-surface delta) is skipped as a whole module — its coupled `.diff_b` dropped with it, never a
 // half-patch — and surfaced, mirroring ComfyUI's own warn-and-skip and the SCAIL2 diff-patch contract.
 //
-// ## Two tier-independent channels, one tier-dependent one (sc-15326)
+// ## Two channels that cover every tier, one that does not (sc-15326)
 //
 // The "a dense delta cannot fold into a packed base" rule above is true only of a **weight** delta into
 // a **Linear**. Measured against the real lightx2v `Wan2.1-T2V-14B` cfg-step-distill file (647
 // diff-patch keys), taking that rule as the whole story would have folded **7 of 647** on the default Q4
 // tier and **407 of 647** on bf16 — the same LoRA rendering differently per tier, on a product where the
-// quant tier is a *creative* choice. Two of the three channels are in fact tier-independent, and this
-// fold uses them:
+// quant tier is a *creative* choice. Two of the three channels in fact fold on **every** tier
+// (tier-independent in *coverage* — see the per-channel dtype note below), and this fold uses them:
 //
 // * **`.diff_b` into a Linear (407 keys).** `QuantizedLinear` packs only the weight; the bias stays a
-//   plain dense vector and the forward is `quantized_matmul(…) + b`. So `b += scale·δ_b` is identical
-//   arithmetic on Q4, Q8 and bf16 — see [`AdaptableLinear::merge_bias_delta`].
+//   plain dense vector and the forward is `quantized_matmul(…) + b`. So `b += scale·δ_b` folds on Q4,
+//   Q8 and bf16 alike — see [`AdaptableLinear::merge_bias_delta`]. Tier-independent in *coverage*:
+//   every such key lands on every tier, though the fold dtype still follows the base (a quantize casts
+//   the bias to bf16, so an f32-on-disk base folds in f32 dense and bf16 packed).
 // * **`.diff` / `.diff_b` into a norm (240 keys).** RMSNorm/LayerNorm parameters are never packed by any
 //   family's quantize predicate, so they are dense on every tier. They are not `AdaptableLinear`s at any
 //   surface width, so they route through the separate [`AdaptableHost::diff_patch_param_mut`] surface.
@@ -1851,6 +1853,23 @@ pub struct DiffPatchReport {
     pub skipped: Vec<String>,
     /// Diff-patch stems that resolved to no adaptable module on the host.
     pub unmatched: Vec<String>,
+    /// Deltas that resolved to a host target and shape-checked clean but were **deliberately not
+    /// written**, because their spec's `scale` is 0 (sc-15265). Counted separately from
+    /// [`folded`](Self::folded) so the host's arrays stay byte-identical to a never-installed adapter
+    /// while the zero-match guard still sees that the file's targets *did* resolve.
+    pub disabled: usize,
+}
+
+impl DiffPatchReport {
+    /// Record one delta that resolved and shape-checked: [`folded`](Self::folded) when the spec is
+    /// live, [`disabled`](Self::disabled) when its scale is 0 and nothing was written.
+    fn record(&mut self, live: bool) {
+        if live {
+            self.folded += 1;
+        } else {
+            self.disabled += 1;
+        }
+    }
 }
 
 /// `true` if any of `keys` is a diff-patch delta name (`.diff` / `.diff_b`) — the structural marker of
@@ -1943,6 +1962,12 @@ fn fold_one_diff_module(
     scale: f32,
     report: &mut DiffPatchReport,
 ) -> Result<()> {
+    // sc-15265: a scale-0 install must be byte-identical to no install at all. Resolve and shape-check
+    // exactly as usual — so `skipped`/`unmatched` stay truthful and the zero-match guard still sees the
+    // targets — but write nothing. (`δ · 0.0` is not reliably inert: it flips `-0.0` to `+0.0`, and
+    // `Inf · 0.0` is NaN, which would poison the host at precisely the setting that turns the adapter
+    // OFF.)
+    let live = scale != 0.0;
     let segs: Vec<&str> = stem.split('.').collect();
     if host.adaptable_mut(&segs).is_none() {
         return fold_one_diff_param(host, stem, &segs, parts, scale, report);
@@ -1957,8 +1982,10 @@ fn fold_one_diff_module(
             skip_whole_module(stem, parts, report);
             return Ok(());
         }
-        lin.merge_dense_delta(&scaled_f32(diff, scale)?)?;
-        report.folded += 1;
+        if live {
+            lin.merge_dense_delta(&scaled_f32(diff, scale)?)?;
+        }
+        report.record(live);
     }
 
     // Bias delta (`.diff_b`): fold onto `{stem}.bias` when the base carries a shape-matching bias —
@@ -1966,8 +1993,10 @@ fn fold_one_diff_module(
     if let Some(diff_b) = &parts.diff_b {
         let bias_ok = lin.bias().is_some_and(|b| b.shape() == diff_b.shape());
         if bias_ok {
-            lin.merge_bias_delta(&scaled_f32(diff_b, scale)?)?;
-            report.folded += 1;
+            if live {
+                lin.merge_bias_delta(&scaled_f32(diff_b, scale)?)?;
+            }
+            report.record(live);
         } else {
             report.skipped.push(format!("{stem}.bias"));
         }
@@ -1981,8 +2010,18 @@ fn fold_one_diff_module(
 /// Unlike the Linear path this is tier-independent by construction: every parameter reachable through
 /// [`AdaptableHost::diff_patch_param_mut`] is dense on every quant tier (norm weights/biases are never
 /// in a family's quantize predicate), so `p += scale·δ` is the same arithmetic at Q4, Q8 and bf16.
-/// A shape mismatch skips the **whole** module, matching the Linear path's coupled rule; a stem with
-/// neither half present on the host is unmatched.
+///
+/// The two failure modes are split exactly as on the Linear path (sc-15326):
+///
+/// * A **shape mismatch** on either half skips the **whole** module — a delta that happens to fit one
+///   half of some other architecture's module is not a delta for this one, and a half-patched norm is
+///   worse than an unpatched one.
+/// * A half the **host does not expose** skips only *that* half. Every qk-RMSNorm is weight-only, so a
+///   lightning/step-distill file carrying `norm_q.diff_b` next to a perfectly valid `norm_q.diff` still
+///   lands the weight delta and surfaces just the bias — mirroring the Linear path, where a `.diff_b`
+///   with no shape-matching base bias is surfaced but does not undo the weight fold.
+///
+/// A stem with neither half present on the host is unmatched.
 fn fold_one_diff_param(
     host: &mut impl AdaptableHost,
     stem: &str,
@@ -2004,33 +2043,48 @@ fn fold_one_diff_param(
         return Ok(());
     }
 
-    // Shape-check both halves BEFORE mutating either, so a half-shaped module is skipped whole rather
-    // than half-patched.
-    for (part, delta) in [
-        (DiffPatchPart::Weight, parts.diff.as_ref()),
-        (DiffPatchPart::Bias, parts.diff_b.as_ref()),
-    ] {
+    let halves = [
+        (DiffPatchPart::Weight, parts.diff.as_ref(), stem.to_string()),
+        (
+            DiffPatchPart::Bias,
+            parts.diff_b.as_ref(),
+            format!("{stem}.bias"),
+        ),
+    ];
+
+    // Pre-check both halves BEFORE mutating either, so a shape-mismatched module is skipped whole
+    // rather than half-patched — while a half the host simply does not expose only takes itself out.
+    let mut absent = [false; 2];
+    for (i, (part, delta, _)) in halves.iter().enumerate() {
         let Some(delta) = delta else { continue };
-        let fits = host
-            .diff_patch_param_mut(segs, part)
-            .is_some_and(|p| p.shape() == delta.shape());
-        if !fits {
-            skip_whole_module(stem, parts, report);
-            return Ok(());
+        match host.diff_patch_param_mut(segs, *part) {
+            Some(p) if p.shape() == delta.shape() => {}
+            // Present but the wrong shape: not a delta for this module at all.
+            Some(_) => {
+                skip_whole_module(stem, parts, report);
+                return Ok(());
+            }
+            // Not a channel this module has (a `.diff_b` on a weight-only RMSNorm). Surfaced below;
+            // the other half still folds.
+            None => absent[i] = true,
         }
     }
 
-    for (part, delta) in [
-        (DiffPatchPart::Weight, parts.diff.as_ref()),
-        (DiffPatchPart::Bias, parts.diff_b.as_ref()),
-    ] {
+    for (i, (part, delta, label)) in halves.iter().enumerate() {
         let Some(delta) = delta else { continue };
-        let scaled = scaled_f32(delta, scale)?;
-        let p = host
-            .diff_patch_param_mut(segs, part)
-            .expect("shape-checked");
-        *p = add(&*p, &scaled.as_dtype(p.dtype())?)?;
-        report.folded += 1;
+        if absent[i] {
+            report.skipped.push(label.clone());
+            continue;
+        }
+        // Scale 0 (sc-15265): resolved and shape-checked, deliberately not written.
+        if scale != 0.0 {
+            let scaled = scaled_f32(delta, scale)?;
+            let p = host
+                .diff_patch_param_mut(segs, *part)
+                .expect("shape-checked");
+            *p = add(&*p, &scaled.as_dtype(p.dtype())?)?;
+        }
+        report.record(scale != 0.0);
     }
     Ok(())
 }
@@ -2058,6 +2112,10 @@ pub fn apply_adapters_strict(
 /// instead of leaving it in an engine log (sc-15326); a file that folds nothing **and** matches no
 /// low-rank target still errors via the combined guard. Krea's filter-bypass and Krea Realtime's
 /// step-distill entry.
+///
+/// A spec at **scale 0** folds nothing (sc-15265 — a disabled adapter is byte-identical to an
+/// uninstalled one), but its resolved targets still relax the guard, so disabling a *pure* diff-patch
+/// file does not turn into a "matched nothing" error.
 pub fn apply_adapters_strict_with_diff_patch(
     host: &mut impl AdaptableHost,
     specs: &[AdapterSpec],
@@ -2079,18 +2137,21 @@ pub fn apply_adapters_strict_with_diff_patch(
             dp.unmatched
         );
     }
-    let mut report = apply_adapters_strict_inner(host, specs, model, dp.folded)?;
-    // The folded diff-patch deltas count toward the total install, so the returned report is truthful.
-    report.applied += dp.folded;
+    let mut report = apply_adapters_strict_inner(host, specs, model, dp.folded + dp.disabled)?;
+    // Diff-patch deltas that resolved count toward the total install, so the returned report is
+    // truthful. A scale-0 delta is included for the same reason the low-rank pass counts a scale-0
+    // adapter as applied: the target matched and was accepted, it is simply inert.
+    report.applied += dp.folded + dp.disabled;
     // Everything that did NOT land, carried to the provider so a partial install can reach the user.
     report.diff_patch_unapplied = dp.skipped;
     report.diff_patch_unapplied.extend(dp.unmatched);
     Ok(report)
 }
 
-/// Core of [`apply_adapters_strict`]: `pre_applied` is the count already folded by a prior diff-patch
-/// pass (0 for the plain path). It only relaxes the zero-match guard — a diff-patch-only file whose
-/// delta already folded resolves zero low-rank residuals here, and must not read as "matched nothing".
+/// Core of [`apply_adapters_strict`]: `pre_applied` is the count of diff-patch targets a prior pass
+/// already resolved — folded, or deliberately left unwritten at scale 0 (0 for the plain path). It only
+/// relaxes the zero-match guard — a diff-patch-only file whose delta already folded resolves zero
+/// low-rank residuals here, and must not read as "matched nothing".
 fn apply_adapters_strict_inner(
     host: &mut impl AdaptableHost,
     specs: &[AdapterSpec],
@@ -5348,6 +5409,132 @@ mod tests {
             array_eq(&host.norm3_b, &b0, false).unwrap().item::<bool>(),
             "the coupled bias must not be folded when its weight delta is skipped"
         );
+    }
+
+    /// sc-15326 review — on the norm path, a `.diff_b` whose target has **no bias channel** must take
+    /// only itself out, not the module's perfectly valid weight `.diff`.
+    ///
+    /// Every qk-RMSNorm is weight-only, so a lightning / step-distill variant carrying `norm_q.diff_b`
+    /// next to `norm_q.diff` would otherwise lose all 200 valid norm weight deltas. This is exactly the
+    /// Linear path's rule ("a `.diff_b` with no shape-matching base bias is surfaced but does not undo
+    /// the weight fold"), which the norm path claimed to mirror and did not. A **shape** mismatch still
+    /// skips the whole module — that split is the point, and the sibling test above pins the other half.
+    #[test]
+    fn diff_patch_norm_bias_with_no_host_part_does_not_undo_the_weight_fold() {
+        let dp = save_one(
+            "dp_norm_qk_bias.safetensors",
+            vec![
+                (
+                    "diffusion_model.blocks.0.self_attn.norm_q.diff",
+                    &Array::from_slice(&[0.5f32; 8], &[8]),
+                ),
+                // An RMSNorm has no β. Correctly shaped, simply nowhere to land.
+                (
+                    "diffusion_model.blocks.0.self_attn.norm_q.diff_b",
+                    &Array::from_slice(&[9.0f32; 8], &[8]),
+                ),
+            ],
+        );
+        let mut host = TierHost::new();
+        let report =
+            fold_diff_patch_adapters(&mut host, &[AdapterSpec::new(dp, 2.0, AdapterKind::Lora)])
+                .unwrap();
+        assert_eq!(
+            report.folded, 1,
+            "the weight .diff must still fold: {report:?}"
+        );
+        assert_eq!(
+            report.skipped,
+            vec!["blocks.0.self_attn.norm_q.bias".to_string()],
+            "only the bias half is surfaced, and the weight stem is NOT: {report:?}"
+        );
+        assert!(report.unmatched.is_empty(), "{report:?}");
+        let expect = Array::from_slice(&[1.0 + 2.0 * 0.5f32; 8], &[8]);
+        assert!(
+            all_close(&host.norm_q, &expect, 1e-5, 1e-5, false)
+                .unwrap()
+                .item::<bool>(),
+            "norm_q must carry w + 2.0·δ, not the pre-fold value"
+        );
+    }
+
+    /// sc-15265's invariant, held on the diff-patch path too: **installing an adapter at scale 0 is
+    /// byte-identical to never installing one.** The fold resolves and shape-checks as usual — so the
+    /// skipped/unmatched surfaces stay truthful and the zero-match guard still sees the targets — but
+    /// writes nothing, and the resolved deltas land on `disabled` rather than `folded`.
+    ///
+    /// Also pins the consequence: a **pure** diff-patch file at scale 0 folds nothing, so without
+    /// counting `disabled` toward the guard relaxation, disabling it would turn into a spurious
+    /// "no target modules matched" error.
+    ///
+    /// Discriminating on two axes, because array equality alone is **not** enough — `\u{3b4} \u{b7} 0.0` is
+    /// exact zero for finite deltas, so a fold that runs anyway leaves the arrays bit-identical. So this
+    /// asserts the report split (`folded == 0`, `disabled == 3`) AND carries one **non-finite** delta
+    /// entry: `Inf \u{b7} 0.0 = NaN`, which a still-running fold would write into the host at precisely the
+    /// setting the user chose to turn the adapter OFF. That is sc-15265's own stated rationale for
+    /// skipping the residual outright rather than trusting the multiply.
+    #[test]
+    fn diff_patch_at_scale_zero_writes_nothing_and_still_clears_the_zero_match_guard() {
+        let mut nq_delta = [0.5f32; 8];
+        nq_delta[3] = f32::INFINITY;
+        let dp = save_one(
+            "dp_scale_zero.safetensors",
+            vec![
+                (
+                    "diffusion_model.blocks.0.self_attn.norm_q.diff",
+                    &Array::from_slice(&nq_delta, &[8]),
+                ),
+                (
+                    "diffusion_model.blocks.0.norm3.diff_b",
+                    &Array::from_slice(&[3.0f32; 8], &[8]),
+                ),
+                // A Linear bias delta — the other channel that folds on every tier.
+                (
+                    "diffusion_model.blocks.0.self_attn.q.diff_b",
+                    &Array::from_slice(&[7.0f32; 64], &[64]),
+                ),
+            ],
+        );
+        // The fold itself: everything resolves, nothing is written.
+        let mut probe = TierHost::new();
+        let dp_report = fold_diff_patch_adapters(
+            &mut probe,
+            &[AdapterSpec::new(dp.clone(), 0.0, AdapterKind::Lora)],
+        )
+        .unwrap();
+        assert_eq!(
+            (dp_report.folded, dp_report.disabled),
+            (0, 3),
+            "a scale-0 spec resolves its targets but folds none of them: {dp_report:?}"
+        );
+        assert!(
+            dp_report.skipped.is_empty() && dp_report.unmatched.is_empty(),
+            "resolution/shape surfacing stays truthful at scale 0: {dp_report:?}"
+        );
+
+        let mut host = TierHost::new();
+        let (nq0, n3b0) = (host.norm_q.clone(), host.norm3_b.clone());
+        let b0 = host.lin.bias().unwrap().clone();
+
+        let specs = [AdapterSpec::new(dp, 0.0, AdapterKind::Lora)];
+        let report = apply_adapters_strict_with_diff_patch(&mut host, &specs, "tier_host")
+            .expect("a disabled pure diff-patch file must install, not read as `matched nothing`");
+        assert_eq!(
+            report.applied, 3,
+            "all three targets resolved and were accepted: {report:?}"
+        );
+        assert!(report.diff_patch_unapplied.is_empty(), "{report:?}");
+
+        for (label, got, want) in [
+            ("norm_q", &host.norm_q, &nq0),
+            ("norm3.bias", &host.norm3_b, &n3b0),
+            ("q.bias", host.lin.bias().unwrap(), &b0),
+        ] {
+            assert!(
+                array_eq(got, want, false).unwrap().item::<bool>(),
+                "{label} moved at scale 0 — a disabled adapter must be byte-identical to none"
+            );
+        }
     }
 
     /// **No silent drop, and it reaches the caller.** Everything the diff-patch pass could not land —

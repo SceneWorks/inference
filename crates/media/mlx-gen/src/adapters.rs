@@ -640,13 +640,18 @@ impl AdaptableLinear {
     /// diff-patch fold) treats that as a surfaced skip, never inventing a bias the reference module
     /// doesn't have.
     ///
-    /// **Tier-independent, unlike [`merge_dense_delta`](Self::merge_dense_delta) (sc-15326).** A
-    /// quantized base packs only its *weight*: `QuantizedLinear` keeps the bias as a plain dense
-    /// vector and its forward is `quantized_matmul(x, wq, …) + b`, so `b += δ_b` is exactly as
-    /// correct — and bit-for-bit the same arithmetic — over a Q4/Q8 base as over a bf16 one. That is
-    /// what lets Krea Realtime apply a lightx2v step-distill LoRA's 407 `.diff_b` bias deltas
-    /// identically on every tier instead of only on the dense one. Quant tier is a *creative* choice
-    /// in this product, so an adapter result that varied with it would be a real defect.
+    /// **Tier-independent in *coverage*, unlike [`merge_dense_delta`](Self::merge_dense_delta)
+    /// (sc-15326).** A quantized base packs only its *weight*: `QuantizedLinear` keeps the bias as a
+    /// plain dense vector and its forward is `quantized_matmul(x, wq, …) + b`, so `b += δ_b` is exactly
+    /// as correct over a Q4/Q8 base as over a bf16 one. That is what lets Krea Realtime apply a
+    /// lightx2v step-distill LoRA's 407 `.diff_b` bias deltas on **every** tier instead of only on the
+    /// dense one. Quant tier is a *creative* choice in this product, so an adapter result that varied
+    /// with it would be a real defect.
+    ///
+    /// *Coverage*, not bit-for-bit: every `.diff_b` lands on every tier, but the fold dtype can still
+    /// differ, because [`quantize`](Self::quantize) casts the bias to bf16 along with the weight
+    /// (PARITY-BF16, sc-2609). A base that was f32 on disk therefore folds in f32 when dense and in
+    /// bf16 when packed. Immaterial for the bf16-native Krea DiT, where both sides are bf16 anyway.
     pub fn merge_bias_delta(&mut self, delta: &Array) -> Result<()> {
         let bias = match &mut self.base {
             LinearBase::Dense(l) => &mut l.bias,

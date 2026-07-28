@@ -238,6 +238,17 @@ impl SelfAttention {
         }
     }
 
+    /// sc-15326 — test-only **field-level** view of this attention's qk-RMSNorm gains, in the
+    /// [`WAN_BLOCK_NORM_DIFF_PATCH_TARGETS`] order (`norm_q`, then `norm_k`). Names the two fields
+    /// **directly** rather than routing through [`norm_param_mut`](Self::norm_param_mut), which is
+    /// exactly the point: a routing test that both writes and reads through the accessor passes under
+    /// any consistent bijection (including a `norm_q`↔`norm_k` or weight↔bias swap), so the read-back
+    /// side has to name the fields.
+    #[cfg(test)]
+    pub(crate) fn norm_diff_patch_fields(&self) -> [&Array; 2] {
+        [&self.norm_q, &self.norm_k]
+    }
+
     /// `x_mod`: `[B, L, dim]` (f32). `cos`/`sin`: `[L, 1, half_d]` (bf16). Returns `[B, L, dim]` bf16.
     /// Batched over `B` (the CFG cond/uncond branches) — attention never mixes batch elements, so the
     /// `B=2` result is bit-identical to two `B=1` calls (the cos/sin broadcast across batch + heads).
@@ -448,6 +459,17 @@ impl CrossAttention {
         }
     }
 
+    /// sc-15326 — test-only **field-level** view of this attention's qk-RMSNorm gains, in the
+    /// [`WAN_BLOCK_NORM_DIFF_PATCH_TARGETS`] order (`norm_q`, then `norm_k`). Names the two fields
+    /// **directly** rather than routing through [`norm_param_mut`](Self::norm_param_mut), which is
+    /// exactly the point: a routing test that both writes and reads through the accessor passes under
+    /// any consistent bijection (including a `norm_q`↔`norm_k` or weight↔bias swap), so the read-back
+    /// side has to name the fields.
+    #[cfg(test)]
+    pub(crate) fn norm_diff_patch_fields(&self) -> [&Array; 2] {
+        [&self.norm_q, &self.norm_k]
+    }
+
     /// Cached K/V from the (bf16) text context `[B, L_ctx, dim]` — computed once, reused per step.
     /// `B` is the forward batch (2 for CFG cond+uncond, 1 otherwise); returns `(k, v)` each
     /// `[B, n, L_ctx, d]`.
@@ -549,6 +571,21 @@ impl Block {
             (["norm3"], DiffPatchPart::Bias) => Some(&mut self.norm3_b),
             _ => None,
         }
+    }
+
+    /// sc-15326 — test-only **field-level** view of this block's six diff-patch norm parameters, in
+    /// the exact order of [`WAN_BLOCK_NORM_DIFF_PATCH_TARGETS`]. Every entry names its struct field
+    /// directly (`norm3_w` is the LayerNorm **gain**, `norm3_b` its **bias** — the γ/β passed to
+    /// `layer_norm` in both [`forward`](Self::forward) and [`forward_causal`](Self::forward_causal)),
+    /// so the routing test can assert that a marker stamped through `norm_param_mut` landed on the
+    /// parameter the forward actually reads. Round-tripping through the accessor cannot do that: a
+    /// weight↔bias swap in the match arms above is self-consistent and would read back clean while
+    /// corrupting the render on all 40 blocks.
+    #[cfg(test)]
+    pub(crate) fn norm_diff_patch_fields(&self) -> [&Array; 6] {
+        let [sq, sk] = self.self_attn.norm_diff_patch_fields();
+        let [cq, ck] = self.cross_attn.norm_diff_patch_fields();
+        [sq, sk, cq, ck, &self.norm3_w, &self.norm3_b]
     }
 
     fn prepare_kv(&self, context: &Array) -> Result<(Array, Array)> {
@@ -766,6 +803,15 @@ impl WanTransformer {
                 .norm_param_mut(rest, part),
             _ => None,
         }
+    }
+
+    /// sc-15326 — test-only **field-level** view of block `i`'s six diff-patch norm parameters, in
+    /// [`WAN_BLOCK_NORM_DIFF_PATCH_TARGETS`] order. See `Block::norm_diff_patch_fields`: the routing
+    /// test reads back through *this* rather than through [`norm_param_mut`](Self::norm_param_mut), so
+    /// a swapped or aliased match arm cannot round-trip clean.
+    #[cfg(test)]
+    pub(crate) fn block_norm_diff_patch_fields(&self, i: usize) -> [&Array; 6] {
+        self.blocks[i].norm_diff_patch_fields()
     }
 
     /// Route one of the seven whole-model [`WAN_GLOBAL_ADAPTABLE_PATHS`] to its [`AdaptableLinear`], in

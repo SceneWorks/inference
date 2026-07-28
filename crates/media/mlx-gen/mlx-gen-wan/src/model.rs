@@ -2162,13 +2162,19 @@ mod tests {
 
     use crate::transformer::WAN_BLOCK_NORM_DIFF_PATCH_TARGETS;
 
-    /// sc-15326 — the norm diff-patch surface routes each `(module, part)` to a **distinct** parameter.
+    /// sc-15326 — the norm diff-patch surface routes each `(module, part)` to the **field the forward
+    /// actually reads**.
     ///
     /// A step-distill LoRA patches `norm3` on both halves (`norm3.diff` + `norm3.diff_b`), so an
     /// aliased or swapped routing would fold the bias delta onto the LayerNorm *gain* — a wrong render
-    /// that still reports a clean, fully-applied install. Discriminating by construction: it stamps a
-    /// unique marker through each of the six targets and requires all six to read back distinctly, so
-    /// any two entries resolving to the same `&mut Array` fail.
+    /// on all 40 blocks that still reports a clean, fully-applied install.
+    ///
+    /// **Written through the accessor, read back off the fields.** Stamping a marker through
+    /// `norm_param_mut` and reading it back through the same accessor is non-discriminating: any
+    /// consistent bijection over the six targets passes, including swapping `norm3`'s `Weight` and
+    /// `Bias` arms (the γ and β of `layer_norm(x, γ, β, eps)`) or `norm_q`↔`norm_k`. So the read-back
+    /// side uses `WanTransformer::block_norm_diff_patch_fields`, which names `norm_q` / `norm_k` /
+    /// `norm3_w` / `norm3_b` **directly** and shares no code with the routing match arms.
     #[test]
     fn wan_norm_diff_patch_targets_route_to_distinct_parameters() {
         let cfg = tiny_cfg();
@@ -2190,18 +2196,20 @@ mod tests {
             *p = Array::full::<f32>(p.shape(), &Array::from_f32(marker)).unwrap();
         }
 
-        // Read them all back: each must still carry its OWN marker (no aliasing, no swap).
+        // Read them back OFF THE FIELDS, in the advertised order. Target `i` must have landed on
+        // field `i` — the parameter the block's forward passes to `rms_norm` / `layer_norm`. An
+        // aliased, swapped, or wrong-part arm fails here even though it round-trips through the
+        // accessor cleanly.
+        let fields = dit.block_norm_diff_patch_fields(0);
         for (i, (suffix, part)) in WAN_BLOCK_NORM_DIFF_PATCH_TARGETS.iter().enumerate() {
-            let dotted = format!("blocks.0.{suffix}");
-            let segs: Vec<&str> = dotted.split('.').collect();
-            let p = dit.norm_param_mut(&segs, *part).expect("routed above");
-            let got = mlx_rs::ops::max(p.as_dtype(mlx_rs::Dtype::Float32).unwrap(), None)
+            let got = mlx_rs::ops::max(fields[i].as_dtype(mlx_rs::Dtype::Float32).unwrap(), None)
                 .unwrap()
                 .item::<f32>();
             assert_eq!(
                 got,
                 100.0 + i as f32,
-                "`{dotted}` / {part:?} aliases another diff-patch target"
+                "`blocks.0.{suffix}` / {part:?} did not land on the field the forward reads \
+                 (aliased, swapped, or routed to the wrong part)"
             );
         }
 
