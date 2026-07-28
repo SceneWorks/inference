@@ -112,13 +112,14 @@ pub mod weight_norm;
 pub mod weights;
 
 pub use model::{
-    descriptor, descriptor_for, load, load_generator, load_medium_base_generator,
+    audio_edit_for, descriptor, descriptor_for, load, load_generator, load_medium_base_generator,
     load_medium_generator, load_music_base_generator, load_sfx_base_generator, load_sfx_generator,
     load_variant, medium_base_descriptor, medium_base_load, medium_descriptor, medium_load,
     music_base_descriptor, music_base_load, reference_audio_for, reference_noise_level,
-    resolve_reference_audio, sfx_base_descriptor, sfx_base_load, sfx_descriptor, sfx_load,
-    synthesis_parameters, ResolvedReference, StableAudio3Generator, Variant, VariantShape,
-    DEFAULT_REFERENCE_STRENGTH, HUB_REPO, HUB_REVISION, MAX_DURATION_SECS, MEDIUM_BASE_HUB_REPO,
+    resolve_audio_edit, resolve_reference_audio, sfx_base_descriptor, sfx_base_load,
+    sfx_descriptor, sfx_load, synthesis_parameters, ResolvedEdit, ResolvedReference,
+    StableAudio3Generator, Variant, VariantShape, DEFAULT_REFERENCE_STRENGTH,
+    EDIT_TIMING_TOLERANCE_SECS, HUB_REPO, HUB_REVISION, MAX_DURATION_SECS, MEDIUM_BASE_HUB_REPO,
     MEDIUM_BASE_HUB_REVISION, MEDIUM_BASE_MODEL_ID, MEDIUM_BASE_REGISTRATION, MEDIUM_HUB_REPO,
     MEDIUM_HUB_REVISION, MEDIUM_MAX_DURATION_SECS, MEDIUM_MODEL_ID, MEDIUM_REGISTRATION,
     MEDIUM_SHAPE, MODEL_ID, MUSIC_BASE_HUB_REPO, MUSIC_BASE_HUB_REVISION, MUSIC_BASE_MODEL_ID,
@@ -128,8 +129,12 @@ pub use model::{
     SMALL_MAX_SAMPLE_SIZE, SMALL_SHAPE, WEIGHT_LICENSES,
 };
 pub use pipeline::{
-    prepare_reference_pcm, sampler_strength_for, ComputeDTypes, ReferenceAudio, ReferenceDrawOrder,
-    StableAudio3Pipeline, VariantGeometry,
+    conditioning_is_forwarded, edit_geometry, edit_geometry_matches_request, edit_keep_mask,
+    edit_local_conditioning, edit_local_conditioning_is_present, edit_region_latents,
+    edit_region_samples, edit_retained_latent_count, prepare_reference_pcm, resampled_frame_count,
+    sampler_strength_for, stitch_outside_region, AudioEdit, ComputeDTypes, EditGeometry,
+    ForwardedConditioning, ReferenceAudio, ReferenceDrawOrder, StableAudio3Pipeline,
+    VariantGeometry,
 };
 
 /// Add every registered Stable Audio 3 generator to an explicit audio registry builder.

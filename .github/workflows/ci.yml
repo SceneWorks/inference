@@ -229,10 +229,10 @@ jobs:
         # links the seven real-weight-only binaries, which costs the lld budget above nothing but
         # time for zero executed cases.
         #
-        # The named nine and what they execute on a PR (measured, `cargo test -p
-        # candle-audio-stable-audio-3 --tests`): `sampler_oracle` 17, `reference_audio` 7,
+        # The named ten and what they execute on a PR (measured, by running this step's exact
+        # command on the merged tree): `audio_edit` 20, `sampler_oracle` 17, `reference_audio` 7,
         # `provider` 3, `listening_stimuli` 3, `dtype_policy` 2, `conformance` 1,
-        # `primitive_oracle` 1, `same_oracle` 1, `variant_quality` 1 — 36 weight-free cases.
+        # `primitive_oracle` 1, `same_oracle` 1, `variant_quality` 1 — 56 weight-free cases.
         # sc-14545 review found
         # `sampler_oracle`, `same_oracle` and `primitive_oracle` running in no automatic lane at all
         # (19 dark gates, pre-existing since sc-14543) and added them here. sc-14546 adds
@@ -271,6 +271,77 @@ jobs:
         # between them. All three gates are verified to fail under their own single-token mutation,
         # not merely to pass under the correct code.
         #
+        # sc-14549 adds eight cases to `audio_edit` (twelve -> twenty) for multi-region editing —
+        # several non-contiguous spans regenerated in ONE pass. The defect they exist to catch is
+        # "honours regions[0], silently drops the rest", which renders completely plausibly: one
+        # span genuinely regenerated, the rest of the clip preserved, right length, non-silent,
+        # finite, reproducible. Every well-formedness and divergence measurement passes.
+        #
+        # So the shape is sc-14548's carry-forward applied up front: hold everything constant except
+        # the thing under test, so a broken implementation collapses to IDENTITY rather than
+        # diverging. `relocating_region_two_relocates_its_mask_and_nothing_else` moves only
+        # regions[1] and requires the geometry and mask to change — a geometry derived from
+        # regions[0] alone is byte-identical between the two, so it fails by equality, not by a
+        # threshold. `merge_edit_regions_is_an_order_independent_disjoint_union` pins the union
+        # (order-independence over every permutation, touching-merges-too, sorted/disjoint output);
+        # `the_multi_region_geometry_and_keep_mask_cover_every_span` asserts the mask over the whole
+        # 1,146,880-sample buffer rather than at spot points, so a loop that zeroed only the first
+        # span fails on the second span's frames; `the_stitch_preserves_every_span_outside_the_union`
+        # covers the MIDDLE preserved span, which a stitch written against spans[0] destroys;
+        # `the_retained_latent_count_unions_overlapping_latent_ranges` pins that ceil(x/4096) is not
+        # injective so the count must union rather than sum — a count that wrongly reached zero
+        # would disarm `edit_local_conditioning_is_present` on exactly the geometry that needed it;
+        # `one_region_on_the_new_carrier_is_the_legacy_shape_exactly` is the "single-region callers
+        # are unchanged" acceptance criterion.
+        #
+        # The gen-core half rides the `contracts` job, not this one, and its headline case is
+        # `every_region_is_floored_not_just_the_first`: `first_nonfinite_float` destructures without
+        # `..` so a new *field* breaks the build, but a `Vec` defeats that mechanism entirely — a
+        # guard reaching only regions[0] compiles, passes every pre-existing test, and lets a NaN in
+        # region two poison the mask. Every malformed value in that case, and in the testkit's
+        # `check_multi_region_audio_edit`, sits in region TWO.
+        #
+        # sc-14548 adds `audio_edit`, the inpaint/repaint/extend target. Its twelve weight-free cases
+        # are the **whole** of the PR-time evidence for that feature: the DiT side was already
+        # landed and the story is the producer — mask construction, the 257-channel local
+        # conditioning, region resolution, and the PCM stitch — every part of which fails silently.
+        # A wrong mask polarity edits the complement of what was asked; a swapped concat order has
+        # the identical shape; a mask built at the un-adapted size or against the caller's own
+        # sample rate moves the edit window while every preservation assertion still passes; latent
+        # indices computed by rounding rather than derived from the resized mask are off by one
+        # frame at some boundaries and right at others. None of that changes an output's length,
+        # rate or finiteness.
+        #
+        # Two design decisions are what make this gateable in the PR lane at all, and both are the
+        # sc-14547 carry-forward applied up front rather than after three review rounds:
+        # `pipeline::edit_local_conditioning` takes the encoded source as a plain **tensor** instead
+        # of encoding it, so the entire mask -> resize -> multiply -> concat chain runs with
+        # synthetic latents and no weights; and `model::audio_edit_for` was written outside
+        # `generate` (which needs multi-gigabyte weights), so the mode + region -> `[start, end)`
+        # resolution is reachable here. `conditioning_is_forwarded` then makes a dropped forward
+        # fail closed at runtime rather than degrade silently to text-to-audio.
+        #
+        # Round-2 review added the last two cases, and they carry a seam that had no gate at all:
+        # `local = edit_local_conditioning(...)` -> `let _ = ...` inside `synthesize_traced` leaves
+        # the DiT's local conditioner as the zero tensor the text-only path allocates, so every
+        # inpaint/repaint/extend *interior* degrades to plain text-to-audio while the outside stays
+        # bit-exact and both real-weight divergence floors get **larger** — an unconditioned interior
+        # wanders further from the source and further between seeds, so those floors are
+        # wrong-signed against it and tightening them cannot help.
+        # `pipeline::edit_local_conditioning_is_present` now cross-checks the handoff where it
+        # crosses into `sample`, and `edit_geometry_matches_request` does the same for the
+        # weights-only `duration_secs` argument that sets the padding boundary. Both call sites need
+        # weights, exactly like `conditioning_is_forwarded`'s, so what runs here is the **rule**; the
+        # real-weight lane is where a zeroed handoff is refused, before sampling rather than after a
+        # plausible render.
+        #
+        # What these cases do **not** cover, stated rather than implied: every call site inside
+        # `StableAudio3Pipeline::synthesize_traced`, and the conditioning receipt built in
+        # `generate`. Those need weights; `real-weights.yml`'s `sa3-base-identity-{metal,cuda}` jobs
+        # are what catch them, and `docs/migration/SC_14548_AUDIO_EDIT_INPAINT.md` carries the
+        # per-site table — every row of which names a mechanism verified by running the mutation
+        # rather than by reading the code.
+        #
         # Scope, stated precisely rather than as "the sign is gated at the contract endpoint": these
         # three cases make the chain continuous from `GenerationRequest` to `sampler_strength_for` —
         # conversion, field selection into `pipeline::ReferenceAudio`, and the strength decision
@@ -303,7 +374,7 @@ jobs:
           -p candle-audio-stable-audio-3
           --test provider --test dtype_policy --test variant_quality --test conformance
           --test sampler_oracle --test same_oracle --test primitive_oracle
-          --test listening_stimuli --test reference_audio
+          --test listening_stimuli --test reference_audio --test audio_edit
           -- --nocapture
       - name: Test LLM-only CPU bundle
         run: cargo test --locked --no-default-features --lib -p runtime-cpu

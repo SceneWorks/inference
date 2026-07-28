@@ -7,6 +7,7 @@ use crate::audio_transform::{AudioTransform, AudioTransformDescriptor, AudioTran
 use crate::caption::{Captioner, CaptionerDescriptor};
 use crate::generator::{ConditioningKind, Generator, Modality, ModelDescriptor};
 use crate::image_embed::{ImageEmbedder, ImageEmbedderDescriptor};
+use crate::image_memory::ImageMemoryProviderContract;
 use crate::runtime::{LoadSpec, Quant, WeightsSource};
 use crate::text_embed::{TextEmbedder, TextEmbedderDescriptor};
 use crate::train::{Trainer, TrainerDescriptor};
@@ -122,6 +123,16 @@ pub struct ModelRegistration {
     pub footprint: Option<fn(&LoadSpec) -> Result<PerComponentBytes>>,
 }
 
+/// Optional, pre-load image-memory contract registration for one generator id.
+///
+/// Kept separate from [`ModelRegistration`] so every existing provider remains source-compatible:
+/// catalogs opt in with [`ProviderRegistryBuilder::register_image_memory`] as providers migrate.
+#[derive(Clone, Copy)]
+pub struct ImageMemoryRegistration {
+    pub provider_id: &'static str,
+    pub contract: fn(&LoadSpec) -> Result<ImageMemoryProviderContract>,
+}
+
 /// A transform provider's registration (parallel to [`ModelRegistration`]).
 #[derive(Clone, Copy)]
 pub struct TransformRegistration {
@@ -201,6 +212,7 @@ pub struct AudioEmbedderRegistration {
 #[derive(Default)]
 pub struct ProviderRegistryBuilder {
     generators: Vec<ModelRegistration>,
+    image_memory: Vec<ImageMemoryRegistration>,
     transforms: Vec<TransformRegistration>,
     audio_transforms: Vec<AudioTransformRegistration>,
     trainers: Vec<TrainerRegistration>,
@@ -229,6 +241,7 @@ impl ProviderRegistryBuilder {
     }
 
     builder_registration_method!(register_generator, generators, ModelRegistration);
+    builder_registration_method!(register_image_memory, image_memory, ImageMemoryRegistration);
     builder_registration_method!(register_transform, transforms, TransformRegistration);
     builder_registration_method!(
         register_audio_transform,
@@ -295,6 +308,27 @@ impl ProviderRegistryBuilder {
             }};
         }
         ensure_unique!(generators, "generator");
+        {
+            let mut ids = std::collections::BTreeSet::new();
+            for registration in &self.image_memory {
+                if !ids.insert(registration.provider_id) {
+                    return Err(Error::Msg(format!(
+                        "duplicate image-memory provider id '{}'",
+                        registration.provider_id
+                    )));
+                }
+                if !self
+                    .generators
+                    .iter()
+                    .any(|generator| (generator.descriptor)().id == registration.provider_id)
+                {
+                    return Err(Error::Msg(format!(
+                        "image-memory contract '{}' has no matching generator registration",
+                        registration.provider_id
+                    )));
+                }
+            }
+        }
         ensure_unique!(transforms, "transform");
         ensure_unique!(audio_transforms, "audio transform");
         ensure_unique!(trainers, "trainer");
@@ -307,6 +341,7 @@ impl ProviderRegistryBuilder {
 
         Ok(ProviderRegistry {
             generators: self.generators.into_boxed_slice(),
+            image_memory: self.image_memory.into_boxed_slice(),
             transforms: self.transforms.into_boxed_slice(),
             audio_transforms: self.audio_transforms.into_boxed_slice(),
             trainers: self.trainers.into_boxed_slice(),
@@ -324,6 +359,7 @@ impl ProviderRegistryBuilder {
 /// An immutable, explicit catalog of generative-media providers.
 pub struct ProviderRegistry {
     generators: Box<[ModelRegistration]>,
+    image_memory: Box<[ImageMemoryRegistration]>,
     transforms: Box<[TransformRegistration]>,
     audio_transforms: Box<[AudioTransformRegistration]>,
     trainers: Box<[TrainerRegistration]>,
@@ -478,6 +514,39 @@ impl ProviderRegistry {
             Some(footprint) => footprint(spec).map(Some),
             None => Ok(None),
         }
+    }
+
+    /// Return the provider-owned image-memory contract for `id`, when adopted.
+    ///
+    /// `Ok(None)` is the compatibility-safe resident-only/unverified state. Unknown generator ids
+    /// remain errors; a malformed adopted contract also fails instead of being silently trusted.
+    pub fn image_memory_contract(
+        &self,
+        id: &str,
+        spec: &LoadSpec,
+    ) -> Result<Option<ImageMemoryProviderContract>> {
+        if !self
+            .generators()
+            .any(|registration| (registration.descriptor)().id == id)
+        {
+            return Err(Error::Msg(format!("no generator registered for id '{id}'")));
+        }
+        let Some(registration) = self
+            .image_memory
+            .iter()
+            .find(|registration| registration.provider_id == id)
+        else {
+            return Ok(None);
+        };
+        let contract = (registration.contract)(spec)?;
+        let errors = contract.conformance_errors();
+        if !errors.is_empty() {
+            return Err(Error::Msg(format!(
+                "image-memory contract '{id}' is malformed: {}",
+                errors.join("; ")
+            )));
+        }
+        Ok(Some(contract))
     }
 
     /// Run the weights-free descriptor conformance sweep over this explicit catalog.

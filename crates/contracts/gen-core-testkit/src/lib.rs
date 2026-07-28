@@ -45,6 +45,7 @@ pub mod audio_embedder;
 pub mod audio_generator;
 pub mod audio_transform;
 pub mod captioner;
+pub mod image_memory;
 pub mod trainer;
 pub mod transcriber;
 pub mod voice_embedder;
@@ -68,6 +69,7 @@ pub use captioner::{
     captioner_conformance, check_captioner_cancellation, check_captioner_progress,
     check_captioner_registry, check_captioner_validate, CaptionerProfile,
 };
+pub use image_memory::{check_image_memory_contract, image_memory_conformance};
 pub use trainer::{
     check_trainer_cancellation, check_trainer_progress, check_trainer_registry,
     check_trainer_validate, trainer_conformance, TrainerProfile,

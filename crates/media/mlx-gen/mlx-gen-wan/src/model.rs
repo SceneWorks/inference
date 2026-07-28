@@ -2160,6 +2160,79 @@ mod tests {
         WanTransformer::from_weights(&w, cfg).unwrap()
     }
 
+    use crate::transformer::WAN_BLOCK_NORM_DIFF_PATCH_TARGETS;
+
+    /// sc-15326 — the norm diff-patch surface routes each `(module, part)` to the **field the forward
+    /// actually reads**.
+    ///
+    /// A step-distill LoRA patches `norm3` on both halves (`norm3.diff` + `norm3.diff_b`), so an
+    /// aliased or swapped routing would fold the bias delta onto the LayerNorm *gain* — a wrong render
+    /// on all 40 blocks that still reports a clean, fully-applied install.
+    ///
+    /// **Written through the accessor, read back off the fields.** Stamping a marker through
+    /// `norm_param_mut` and reading it back through the same accessor is non-discriminating: any
+    /// consistent bijection over the six targets passes, including swapping `norm3`'s `Weight` and
+    /// `Bias` arms (the γ and β of `layer_norm(x, γ, β, eps)`) or `norm_q`↔`norm_k`. So the read-back
+    /// side uses `WanTransformer::block_norm_diff_patch_fields`, which names `norm_q` / `norm_k` /
+    /// `norm3_w` / `norm3_b` **directly** and shares no code with the routing match arms.
+    #[test]
+    fn wan_norm_diff_patch_targets_route_to_distinct_parameters() {
+        let cfg = tiny_cfg();
+        let mut dit = tiny_transformer(&cfg);
+        assert_eq!(
+            WAN_BLOCK_NORM_DIFF_PATCH_TARGETS.len(),
+            6,
+            "4 qk-RMSNorm gains + norm3 weight + norm3 bias"
+        );
+
+        // Stamp a unique constant into every target.
+        for (i, (suffix, part)) in WAN_BLOCK_NORM_DIFF_PATCH_TARGETS.iter().enumerate() {
+            let dotted = format!("blocks.0.{suffix}");
+            let segs: Vec<&str> = dotted.split('.').collect();
+            let p = dit.norm_param_mut(&segs, *part).unwrap_or_else(|| {
+                panic!("`{dotted}` / {part:?} is advertised but does not route")
+            });
+            let marker = 100.0 + i as f32;
+            *p = Array::full::<f32>(p.shape(), &Array::from_f32(marker)).unwrap();
+        }
+
+        // Read them back OFF THE FIELDS, in the advertised order. Target `i` must have landed on
+        // field `i` — the parameter the block's forward passes to `rms_norm` / `layer_norm`. An
+        // aliased, swapped, or wrong-part arm fails here even though it round-trips through the
+        // accessor cleanly.
+        let fields = dit.block_norm_diff_patch_fields(0);
+        for (i, (suffix, part)) in WAN_BLOCK_NORM_DIFF_PATCH_TARGETS.iter().enumerate() {
+            let got = mlx_rs::ops::max(fields[i].as_dtype(mlx_rs::Dtype::Float32).unwrap(), None)
+                .unwrap()
+                .item::<f32>();
+            assert_eq!(
+                got,
+                100.0 + i as f32,
+                "`blocks.0.{suffix}` / {part:?} did not land on the field the forward reads \
+                 (aliased, swapped, or routed to the wrong part)"
+            );
+        }
+
+        // The qk-RMSNorms are weight-only: a `.diff_b` on one has nowhere to land and must NOT be
+        // quietly absorbed by the gain.
+        for suffix in ["self_attn.norm_q", "cross_attn.norm_k"] {
+            let dotted = format!("blocks.0.{suffix}");
+            let segs: Vec<&str> = dotted.split('.').collect();
+            assert!(
+                dit.norm_param_mut(&segs, mlx_gen::adapters::DiffPatchPart::Bias)
+                    .is_none(),
+                "`{dotted}` is an RMSNorm and has no bias channel"
+            );
+        }
+        // An out-of-surface stem routes nowhere (reported unmatched by the fold, never dropped).
+        assert!(dit
+            .norm_param_mut(
+                &["blocks", "0", "cross_attn", "norm_k_img"],
+                mlx_gen::adapters::DiffPatchPart::Weight
+            )
+            .is_none());
+    }
+
     /// A PEFT LoRA file targeting `blocks.0.self_attn.q` ([dim,dim]) — `diffusion_model.`-prefixed,
     /// A `[rank,dim]`, B `[dim,rank]`, no alpha.
     fn tiny_lora(name: &str, dim: i32, rank: i32) -> PathBuf {

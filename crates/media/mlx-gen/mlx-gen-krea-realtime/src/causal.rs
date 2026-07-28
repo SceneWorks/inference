@@ -33,7 +33,7 @@
 //! mask + KV read window + causal RoPE offset — the released reference applies no additive attention
 //! bias / `score_mod` in its sampling path (see the crate-root reconciliation note).
 
-use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
+use mlx_gen::adapters::{AdaptableHost, AdaptableLinear, DiffPatchPart};
 use mlx_gen::{Error, Result};
 use mlx_gen_wan::patchify::unpatchify;
 use mlx_gen_wan::{normalize_wan_key, WanTransformer};
@@ -538,14 +538,16 @@ impl CausalKreaTransformer {
 ///   missing — a wrong render that still looks like a success, precisely the failure mode the strict
 ///   installer exists to prevent. Widening applies them.
 ///
-/// ⚠️ **Widening does NOT make a step-distill file fully applied, and this comment must not be read as
-/// claiming it does.** The same lightx2v/FastWan file carries **647 further keys the low-rank pass does
-/// not consume**: 447 `.diff_b` bias deltas (including `patch_embedding`'s) and 200 `.diff` weight
-/// deltas on the qk/`norm3` **norms**, which are not `AdaptableLinear`s at any surface width. Krea calls
-/// [`apply_adapters_strict`](mlx_gen::adapters::loader::apply_adapters_strict), not the
-/// `_with_diff_patch` variant, so those are dropped **without a word** — the same silent
-/// under-application this decision argues against, merely at a different seam. Tracked as **sc-15326**;
-/// until it lands, "a step-distill LoRA installs" means its low-rank half installs.
+/// **The other 647 keys — RESOLVED in sc-15326.** Widening the *Linear* surface alone did not make a
+/// step-distill file fully applied: the same lightx2v/FastWan file carries 647 keys the low-rank pass
+/// does not consume — 447 `.diff_b` bias deltas (including `patch_embedding`'s) and 200 `.diff` weight
+/// deltas on the qk/`norm3` **norms**, which are not `AdaptableLinear`s at any surface width — and Krea
+/// used to drop them without a word. `t2v::load_transformer` now calls
+/// [`apply_adapters_strict_with_diff_patch`](mlx_gen::adapters::loader::apply_adapters_strict_with_diff_patch),
+/// the `.diff_b` deltas fold into the Linears' (always-dense) biases, and the norm deltas fold through
+/// [`AdaptableHost::diff_patch_param_mut`] — all 647 land, on every tier. So "a step-distill LoRA
+/// installs" now means the whole file installs, and `ApplyReport::diff_patch_unapplied` reports
+/// anything that ever does not.
 ///
 /// Still deliberately absent, and still a loud error: the I2V-only image cross-attention
 /// (`cross_attn.k_img`/`v_img`, which `Remade-AI/Squish`-style Wan-I2V LoRAs carry). Krea Realtime is the
@@ -621,6 +623,21 @@ impl AdaptableHost for CausalKreaTransformer {
 
     fn adaptable_paths(&self) -> Vec<String> {
         krea_adaptable_paths(self.num_layers)
+    }
+
+    /// Route a ComfyUI/lightx2v diff-patch delta to a dense **norm** parameter (sc-15326) — the
+    /// surface the 200 `.diff` (qk-RMSNorm gains, `norm3` gain) and 40 `norm3.diff_b` deltas a Wan-T2V
+    /// step-distill file carries need, and which the `AdaptableLinear` surface cannot reach at any
+    /// width. Same reference→converted normalization as [`Self::adaptable_mut`], then straight through
+    /// to the reused [`WanTransformer::norm_param_mut`](mlx_gen_wan::WanTransformer::norm_param_mut).
+    fn diff_patch_param_mut(
+        &mut self,
+        path: &[&str],
+        part: DiffPatchPart,
+    ) -> Option<&mut mlx_rs::Array> {
+        let native = normalize_wan_key(&path.join("."));
+        let parts: Vec<&str> = native.split('.').collect();
+        self.inner.norm_param_mut(&parts, part)
     }
 }
 
@@ -741,6 +758,49 @@ mod tests {
         // None of them normalizes into the `blocks.` namespace, which is what makes the routing split in
         // `adaptable_mut` (first segment == "blocks") sound.
         assert!(normalized.iter().all(|p| !p.starts_with("blocks")));
+    }
+
+    /// sc-15326 — the **norm diff-patch surface**, pinned in the same style as the globals above. A
+    /// Wan-T2V step-distill file's `.diff`/`.diff_b` norm keys are spelled in the reference layout;
+    /// [`normalize_wan_key`] must carry every one of them onto a `(suffix, part)` the reused Wan host
+    /// actually routes ([`mlx_gen_wan::WAN_BLOCK_NORM_DIFF_PATCH_TARGETS`]), or
+    /// `diff_patch_param_mut` would advertise a target it cannot reach and the delta would be reported
+    /// unmatched instead of applied.
+    ///
+    /// Discriminating: it compares against `mlx-gen-wan`'s own constant, so a rename on either side
+    /// that is not mirrored fails here rather than silently at install time.
+    #[test]
+    fn krea_norm_diff_patch_keys_normalize_onto_the_wan_norm_targets() {
+        // The five per-block norm stems a real lightx2v / FastWan T2V file carries, in FILE spelling.
+        let file_stems = [
+            "self_attn.norm_q",
+            "self_attn.norm_k",
+            "cross_attn.norm_q",
+            "cross_attn.norm_k",
+            "norm3",
+        ];
+        let routed: BTreeSet<&str> = mlx_gen_wan::WAN_BLOCK_NORM_DIFF_PATCH_TARGETS
+            .iter()
+            .map(|(suffix, _)| *suffix)
+            .collect();
+        for stem in file_stems {
+            let native = normalize_wan_key(&format!("diffusion_model.blocks.7.{stem}"));
+            let suffix = native
+                .strip_prefix("blocks.7.")
+                .unwrap_or_else(|| panic!("`{stem}` did not normalize under the block namespace"));
+            assert!(
+                routed.contains(suffix),
+                "`{stem}` normalizes to `{suffix}`, which the Wan norm diff-patch surface does not route"
+            );
+        }
+        // `norm3` is the only affine one — it alone carries a Bias part, matching the file's
+        // `norm3.diff_b`; the qk-RMSNorms are weight-only, so a `.diff_b` on them is honestly skipped.
+        let bias_targets: Vec<&str> = mlx_gen_wan::WAN_BLOCK_NORM_DIFF_PATCH_TARGETS
+            .iter()
+            .filter(|(_, part)| *part == mlx_gen::adapters::DiffPatchPart::Bias)
+            .map(|(suffix, _)| *suffix)
+            .collect();
+        assert_eq!(bias_targets, vec!["norm3"]);
     }
 
     /// The path set must be duplicate-free AND stay collision-free under the kohya `.`→`_` flattening

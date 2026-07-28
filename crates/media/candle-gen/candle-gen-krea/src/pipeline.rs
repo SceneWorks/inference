@@ -57,7 +57,7 @@ const DIT_DTYPE: DType = DType::BF16;
 /// Query-score budget used by the constrained-card rung. This matches the already GPU-validated Krea
 /// ControlNet chunk size: 128 Mi score elements (~512 MiB at f32) instead of the shared multi-GiB
 /// default. Chunking is only over independent query rows, so it does not alter the key/value domain.
-const CONSTRAINED_ATTN_SCORES_BUDGET: usize = 128 * 1024 * 1024;
+pub(crate) const CONSTRAINED_ATTN_SCORES_BUDGET: usize = 128 * 1024 * 1024;
 
 /// The TE weight **storage** dtype (sc-12828). Distinct from the encoder's **compute** dtype (f32,
 /// enforced inside [`KreaTextEncoder`] by upcasting the embedding to f32 and each projection via

@@ -9,7 +9,10 @@
 use crate::media::{AudioChunk, AudioTrack, Image};
 use crate::runtime::{CancelFlag, Progress, Quant};
 use crate::voice_embed::VoiceEmbedding;
-use crate::{Error, Result};
+use crate::{
+    Error, ImageMemoryProviderContract, ImageMemoryRequestScope, ImageMemoryRunContext,
+    ImageMemorySafetyDecision, ImageMemoryStrategy, Result,
+};
 
 /// A prompt-conditioned media generator. `generate` is **synchronous** (long/blocking; the
 /// worker runs each job on its own thread); the request carries a cancel flag and
@@ -17,6 +20,58 @@ use crate::{Error, Result};
 pub trait Generator {
     /// Identity + capabilities + modality (drives `validate` and consumer UI introspection).
     fn descriptor(&self) -> &ModelDescriptor;
+
+    /// The loaded provider's image-memory contract, when adopted. Existing providers inherit
+    /// `None`, which is the compatibility-safe resident-only/unverified state.
+    fn image_memory_contract(&self) -> Option<&ImageMemoryProviderContract> {
+        None
+    }
+
+    /// Provider safety defense in depth. This can reject a shared worker selection but cannot
+    /// replace its strategy, parameters, or numeric tier. Non-adopting providers accept only the
+    /// resident baseline.
+    fn image_memory_safety_check(
+        &self,
+        context: &ImageMemoryRunContext,
+    ) -> ImageMemorySafetyDecision {
+        match self.image_memory_contract() {
+            Some(contract) => match contract.validate_selection(&context.selection) {
+                Ok(()) if context.budget.fits(context.predicted_peak_bytes) => {
+                    ImageMemorySafetyDecision::Accept
+                }
+                Ok(()) => ImageMemorySafetyDecision::Reject {
+                    reason: format!(
+                        "{}: predicted peak {} exceeds effective budget {}",
+                        self.descriptor().id,
+                        context.predicted_peak_bytes,
+                        context.budget.effective_bytes()
+                    ),
+                },
+                Err(error) => ImageMemorySafetyDecision::Reject {
+                    reason: error.to_string(),
+                },
+            },
+            None if context.selection.strategy == ImageMemoryStrategy::Resident => {
+                ImageMemorySafetyDecision::Accept
+            }
+            None => ImageMemorySafetyDecision::Reject {
+                reason: format!(
+                    "{} has not adopted the shared image-memory contract",
+                    self.descriptor().id
+                ),
+            },
+        }
+    }
+
+    /// Open request-scoped lifecycle state after the shared selection passes the provider safety
+    /// check. Existing providers return `Ok(None)` and therefore cannot execute optimized rungs.
+    fn begin_image_memory_request(
+        &self,
+        context: &ImageMemoryRunContext,
+    ) -> Result<Option<Box<dyn ImageMemoryRequestScope + '_>>> {
+        let _ = context;
+        Ok(None)
+    }
 
     /// Reject a request this model cannot serve (unsupported conditioning, guidance on a
     /// distilled model, out-of-range size/count, …) before doing expensive work.
@@ -680,6 +735,23 @@ pub struct AudioEditRef<'a> {
     pub strength: Option<f32>,
 }
 
+/// A **multi-region** prompted source-audio edit — a borrowed, normalized view of a
+/// [`Conditioning::AudioEditRegions`]. Returned by [`GenerationRequest::audio_edit_regions`]
+/// (sc-14549).
+///
+/// Deliberately a separate accessor from [`AudioEditRef`] rather than a widened one: the two
+/// carriers are different [`ConditioningKind`]s, so a provider that serves only the single-region
+/// shape keeps refusing multi-region through the shared allowlist without writing any code.
+#[derive(Clone, Copy, Debug)]
+pub struct AudioEditRegionsRef<'a> {
+    pub audio: &'a AudioTrack,
+    pub mode: AudioEditMode,
+    /// One or more spans to regenerate in a **single** pass. Non-empty; every `end_secs` is
+    /// `Some` (see [`Conditioning::AudioEditRegions`] for why). Caller order is not significant.
+    pub regions: &'a [TimeRegion],
+    pub strength: Option<f32>,
+}
+
 /// A replace_person masked control clip — a borrowed view of a [`Conditioning::ControlClip`].
 /// Returned by [`GenerationRequest::control_clip`].
 #[derive(Clone, Copy, Debug)]
@@ -848,6 +920,39 @@ impl GenerationRequest {
                 } if !end.is_finite() => {
                     return Some(("conditioning.audio_edit.region.end_secs", *end));
                 }
+                // The multi-region carrier (sc-14549). Written as a **loop over every** region
+                // rather than as more `if`-guarded arms, and that difference is the whole point:
+                // the exhaustive destructuring above makes a new *field* break the build, but a
+                // `Vec` defeats that mechanism entirely — a guard that reached only `regions[0]`
+                // would compile, pass every pre-existing test, and let a NaN in region two flow
+                // into the provider's mask rasterisation and poison it silently. That is exactly
+                // the "the floor lags the request surface" regression this method exists to close,
+                // so the testkit gate puts its bad value in region **two**.
+                Conditioning::AudioEditRegions {
+                    regions, strength, ..
+                } => {
+                    if let Some(s) = strength {
+                        if !s.is_finite() {
+                            return Some(("conditioning.audio_edit_regions.strength", *s));
+                        }
+                    }
+                    for region in regions {
+                        if !region.start_secs.is_finite() {
+                            return Some((
+                                "conditioning.audio_edit_regions.regions.start_secs",
+                                region.start_secs,
+                            ));
+                        }
+                        if let Some(end) = region.end_secs {
+                            if !end.is_finite() {
+                                return Some((
+                                    "conditioning.audio_edit_regions.regions.end_secs",
+                                    end,
+                                ));
+                            }
+                        }
+                    }
+                }
                 Conditioning::VoiceEmbedding {
                     strength: Some(s), ..
                 } if !s.is_finite() => {
@@ -967,6 +1072,33 @@ impl GenerationRequest {
             _ => None,
         })
     }
+
+    /// The **multi-region** audio-edit conditioning ([`Conditioning::AudioEditRegions`]), if present
+    /// (sc-14549). The first one wins, exactly as [`audio_edit`](Self::audio_edit) does — a request
+    /// carries at most one source-audio edit per generation, and a provider that wants to refuse a
+    /// second carrier rather than silently take the first inspects `conditioning` directly (which is
+    /// what Stable Audio 3 does).
+    ///
+    /// This is a **separate accessor** from [`audio_edit`](Self::audio_edit), which is left
+    /// byte-identical: a single-region caller keeps its exact shape, and a provider that has not
+    /// opted into multi-region never sees one because
+    /// [`ConditioningKind::AudioEditRegions`] is a distinct kind the shared allowlist refuses.
+    pub fn audio_edit_regions(&self) -> Option<AudioEditRegionsRef<'_>> {
+        self.conditioning.iter().find_map(|c| match c {
+            Conditioning::AudioEditRegions {
+                audio,
+                mode,
+                regions,
+                strength,
+            } => Some(AudioEditRegionsRef {
+                audio,
+                mode: *mode,
+                regions,
+                strength: *strength,
+            }),
+            _ => None,
+        })
+    }
 }
 
 /// Seed when a [`GenerationRequest`] omits one: nanos since the epoch (any nonzero value works —
@@ -1028,6 +1160,55 @@ pub enum Conditioning {
         audio: AudioTrack,
         mode: AudioEditMode,
         region: Option<TimeRegion>,
+        strength: Option<f32>,
+    },
+    /// **Multi-region** prompted source-audio editing (sc-14549) — several non-contiguous spans
+    /// regenerated in a *single* pass, sharing one denoising trajectory.
+    ///
+    /// This is not equivalent to N sequential [`Conditioning::AudioEdit`]s: each sequential pass
+    /// re-noises and re-decodes, so the regions do not share a trajectory and the seams differ.
+    /// Providers that support it build **one** mask carrying every span and run **one** sampler.
+    ///
+    /// # Why a separate variant rather than a field on [`AudioEdit`](Conditioning::AudioEdit)
+    ///
+    /// Adding `regions` to the existing variant is not source-compatible in Rust — every
+    /// constructor and every exact destructuring pattern breaks — and it would make every
+    /// single-region caller carry a field it must ignore. A separate variant with its **own**
+    /// [`ConditioningKind::AudioEditRegions`] is additive in the only sense that matters: the
+    /// legacy variant, [`AudioEditRef`] and [`GenerationRequest::audio_edit`] are untouched, and
+    /// default-deny comes for free. [`Capabilities::accepts`] refuses any unadvertised kind as a
+    /// typed [`Error::Unsupported`], so every provider that has not opted in — ACE-Step included —
+    /// rejects multi-region cleanly with no code change and no capability flag.
+    ///
+    /// # Semantics (this repository's, deliberately stated rather than inherited)
+    ///
+    /// These are **not** claimed as parity with any upstream implementation; no upstream
+    /// multi-region reference has been verified here (see sc-15431).
+    ///
+    /// - **`regions` is non-empty.** An empty list is a malformed request, not a whole-clip edit —
+    ///   whole-clip restyle is [`Conditioning::ReferenceAudio`].
+    /// - **Order is not significant.** Regions may arrive in any order; a provider normalizes them
+    ///   into a canonical union, so `[a, b]` and `[b, a]` describe the same edit.
+    /// - **Overlapping, touching and duplicate regions are accepted, not rejected**, and merged
+    ///   into that union. Refusing them would make the contract order-sensitive in practice and
+    ///   would reject requests with an unambiguous meaning.
+    /// - **`end_secs` must be `Some` on every region.** `None` means "to the end of the clip",
+    ///   which is only well-defined for a *final* region — and since order is not significant,
+    ///   "final" is not well-defined here. Rather than leave that ambiguity, `None` is refused
+    ///   outright; a caller wanting a span that runs to the clip end states the end explicitly, and
+    ///   the single-region [`Conditioning::AudioEdit`] keeps the `None` shorthand unchanged. No
+    ///   capability is lost: [`AudioEditMode::Extend`] stays a single-tail operation on the legacy
+    ///   variant.
+    /// - Each region is otherwise gated exactly as [`TimeRegion`] already is: finite bounds
+    ///   (**every** region's, not just the first), `start_secs >= 0`, `end_secs > start_secs`.
+    /// - Clip-bound checks (a region inside the source's duration) and latent-collapse checks stay
+    ///   with the provider, which knows the clip length and its own VAE stride — the same division
+    ///   of labour the single-region path uses.
+    AudioEditRegions {
+        audio: AudioTrack,
+        mode: AudioEditMode,
+        /// The spans to regenerate. Non-empty; every `end_secs` is `Some`; any order.
+        regions: Vec<TimeRegion>,
         strength: Option<f32>,
     },
     /// A precomputed **voice-identity embedding** — a cloned voice driving TTS (sc-12838; the audio
@@ -1149,6 +1330,7 @@ impl Conditioning {
             Conditioning::Reference { .. } => ConditioningKind::Reference,
             Conditioning::ReferenceAudio { .. } => ConditioningKind::ReferenceAudio,
             Conditioning::AudioEdit { .. } => ConditioningKind::AudioEdit,
+            Conditioning::AudioEditRegions { .. } => ConditioningKind::AudioEditRegions,
             Conditioning::VoiceEmbedding { .. } => ConditioningKind::VoiceEmbedding,
             Conditioning::MultiReference { .. } => ConditioningKind::MultiReference,
             Conditioning::ReduxRefs { .. } => ConditioningKind::ReduxRefs,
@@ -1193,6 +1375,14 @@ pub enum ConditioningKind {
     ReferenceAudio,
     /// Prompted source-audio editing ([`Conditioning::AudioEdit`]).
     AudioEdit,
+    /// **Multi-region** prompted source-audio editing ([`Conditioning::AudioEditRegions`],
+    /// sc-14549). A **distinct** kind from [`AudioEdit`](Self::AudioEdit), deliberately: that is
+    /// what makes default-deny free. A provider serving only single-region editing advertises only
+    /// `AudioEdit`, and [`Capabilities::accepts`] then refuses a multi-region request as a typed
+    /// [`Error::Unsupported`] with no flag and no provider code. Reusing `AudioEdit` for both would
+    /// let every existing audio-edit provider through the allowlist and would require a
+    /// default-false capability flag purely to re-close the hole that created.
+    AudioEditRegions,
     /// A precomputed cloned-voice identity embedding ([`Conditioning::VoiceEmbedding`]).
     VoiceEmbedding,
     MultiReference,
@@ -1655,6 +1845,41 @@ impl Capabilities {
         // passes `x > 1.0`-style checks silently). The finiteness guard is centralized on the request
         // so every `Option<f32>` knob — including ones added after F-053 — inherits it by construction
         // (F-053 / F-001). `id`-prefixing is dropped from the message here; the field name is enough.
+        //
+        // Multi-region bounds get an **indexed** pass first (sc-14549). `first_nonfinite_float`
+        // returns a `&'static str` key, so the multi-region arm can only say
+        // `conditioning.audio_edit_regions.regions.start_secs` — it cannot say *which* region. That
+        // is precisely the failure mode the `Vec`-defeats-the-destructure gate exists to close, and
+        // the caller of a ten-region repaint needs the index to act on the message. The two
+        // range guards further down (`start < 0`, `end <= start`) do name the index but never see a
+        // NaN: both comparisons evaluate `false` for NaN, so without this pass a non-finite bound is
+        // caught only by the index-free key below.
+        //
+        // It runs **before** `ensure_finite_floats` because that call returns on the first
+        // non-finite float anywhere in the request; placed after it, this loop would be
+        // unreachable. `ensure_finite_floats` stays intact as the backstop — it is what providers
+        // with a bespoke `validate` (flux1's IP-Adapter carve-out, mlx-gen-flux) call directly
+        // without ever entering `validate_request`, so both layers are load-bearing.
+        for c in &req.conditioning {
+            if let Conditioning::AudioEditRegions { regions, .. } = c {
+                for (i, r) in regions.iter().enumerate() {
+                    if !r.start_secs.is_finite() {
+                        return Err(Error::Msg(format!(
+                            "{id}: multi-region audio edit region {i} start must be finite (got {})",
+                            r.start_secs
+                        )));
+                    }
+                    if let Some(end) = r.end_secs {
+                        if !end.is_finite() {
+                            return Err(Error::Msg(format!(
+                                "{id}: multi-region audio edit region {i} end must be finite (got \
+                                 {end})"
+                            )));
+                        }
+                    }
+                }
+            }
+        }
         req.ensure_finite_floats()?;
         if let Some(s) = &req.sampler {
             if !self.samplers.contains(&s.as_str()) {
@@ -1716,6 +1941,62 @@ impl Capabilities {
                                 r.start_secs
                             )));
                         }
+                    }
+                }
+            }
+        }
+        // Multi-region audio edit (sc-14549). The `AudioEditRegions` **kind** is already gated by
+        // the allowlist above — a provider that has not advertised it never reaches here, which is
+        // the whole reason this variant carries its own kind instead of a capability flag. What is
+        // left is the shape of the list itself, and the mode, which deliberately reuses the same
+        // `audio_edit_modes` surface the single-region path uses rather than introducing a second
+        // one to drift from it.
+        //
+        // Region-bound finiteness is enforced above — for **every** region, not just the first — by
+        // the indexed pass that precedes `ensure_finite_floats`, with `ensure_finite_floats` itself
+        // as the backstop for callers that bypass `validate_request`. The two range guards below
+        // therefore only ever see finite bounds, which is what makes `start < 0` and `end <= start`
+        // safe to write as plain comparisons. Clip-bound and latent-collapse checks stay with the
+        // provider.
+        for c in &req.conditioning {
+            if let Conditioning::AudioEditRegions { mode, regions, .. } = c {
+                if !self.audio_edit_modes.contains(mode) {
+                    return Err(Error::Unsupported(format!(
+                        "{id}: unsupported audio edit mode {mode:?} (supported: {:?})",
+                        self.audio_edit_modes
+                    )));
+                }
+                if regions.is_empty() {
+                    return Err(Error::Msg(format!(
+                        "{id}: multi-region audio edit carries no regions — it must name at least \
+                         one span to regenerate (a whole-clip restyle is ReferenceAudio)"
+                    )));
+                }
+                for (i, r) in regions.iter().enumerate() {
+                    if r.start_secs < 0.0 {
+                        return Err(Error::Msg(format!(
+                            "{id}: multi-region audio edit region {i} start {}s must be >= 0",
+                            r.start_secs
+                        )));
+                    }
+                    // `end_secs: None` means "to the end of the clip", which is only well-defined
+                    // for a *final* region — and region order is not significant here, so "final"
+                    // is not well-defined. Refused outright rather than left ambiguous; the
+                    // single-region `AudioEdit` keeps the `None` shorthand.
+                    let Some(end) = r.end_secs else {
+                        return Err(Error::Msg(format!(
+                            "{id}: multi-region audio edit region {i} has no end — every region \
+                             must state an explicit end_secs, because region order is not \
+                             significant so \"to the end of the clip\" has no unambiguous meaning \
+                             here (use a single-region AudioEdit for that)"
+                        )));
+                    };
+                    if end <= r.start_secs {
+                        return Err(Error::Msg(format!(
+                            "{id}: multi-region audio edit region {i} end {end}s must be > start \
+                             {}s",
+                            r.start_secs
+                        )));
                     }
                 }
             }
@@ -2985,6 +3266,403 @@ mod tests {
                 ),
             )
             .is_ok());
+    }
+
+    // ---- Multi-region prompted audio editing (sc-14549) ------------------------------------
+
+    /// A **multi-region** capability surface: admits the distinct `AudioEditRegions` kind.
+    fn multi_edit_caps() -> Capabilities {
+        Capabilities {
+            conditioning: vec![ConditioningKind::AudioEditRegions],
+            ..edit_caps()
+        }
+    }
+
+    fn multi_edit_req(mode: AudioEditMode, regions: Vec<TimeRegion>) -> GenerationRequest {
+        GenerationRequest {
+            prompt: "x".into(),
+            width: 512,
+            height: 512,
+            conditioning: vec![Conditioning::AudioEditRegions {
+                audio: track(),
+                mode,
+                regions,
+                strength: None,
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn span(start_secs: f32, end_secs: f32) -> TimeRegion {
+        TimeRegion {
+            start_secs,
+            end_secs: Some(end_secs),
+        }
+    }
+
+    #[test]
+    fn multi_region_audio_edit_kind_and_accessor_round_trip() {
+        let regions = vec![span(2.0, 6.0), span(14.0, 18.0)];
+        let req = multi_edit_req(AudioEditMode::Repaint, regions.clone());
+        assert_eq!(
+            req.conditioning[0].kind(),
+            ConditioningKind::AudioEditRegions,
+            "AudioEditRegions maps to its OWN kind — that is what makes default-deny free"
+        );
+        let e = req
+            .audio_edit_regions()
+            .expect("audio_edit_regions present");
+        assert_eq!(e.mode, AudioEditMode::Repaint);
+        assert_eq!(e.regions, regions.as_slice());
+        assert_eq!(e.strength, None);
+        assert_eq!(e.audio.sample_rate, 24_000);
+        assert!(GenerationRequest::default().audio_edit_regions().is_none());
+        // The two carriers do not alias: a multi-region request is invisible to the single-region
+        // accessor, and vice versa. This is what keeps the legacy path byte-identical.
+        assert!(
+            req.audio_edit().is_none(),
+            "a multi-region carrier must not be visible through the single-region accessor"
+        );
+        let single = edit_req(AudioEditMode::Repaint, Some(span(2.0, 6.0)), None);
+        assert!(single.audio_edit_regions().is_none());
+    }
+
+    /// Default-deny, with **no capability flag and no provider code**: a provider advertising only
+    /// the single-region `AudioEdit` kind refuses a multi-region request as typed `Unsupported`.
+    ///
+    /// This is the acceptance criterion "every non-multi-region audio provider rejects multi-region
+    /// cleanly", proven against the shared allowlist rather than against any one provider.
+    #[test]
+    fn a_single_region_provider_refuses_multi_region_as_typed_unsupported() {
+        let single_only = edit_caps();
+        assert!(
+            single_only.accepts(ConditioningKind::AudioEdit)
+                && !single_only.accepts(ConditioningKind::AudioEditRegions),
+            "precondition: the surface advertises single-region editing only"
+        );
+        let err = single_only
+            .validate_request(
+                "m",
+                &multi_edit_req(
+                    AudioEditMode::Repaint,
+                    vec![span(2.0, 6.0), span(14.0, 18.0)],
+                ),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Unsupported(_)),
+            "multi-region on a single-region surface → Unsupported, got {err:?}"
+        );
+        assert!(err.to_string().contains("AudioEditRegions"));
+        // And the same surface still accepts the single-region request it always did — so the
+        // refusal is a real discrimination, not a blanket rejection.
+        assert!(single_only
+            .validate_request(
+                "m",
+                &edit_req(AudioEditMode::Repaint, Some(span(2.0, 6.0)), None)
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn multi_region_reuses_the_advertised_audio_edit_mode_surface() {
+        let c = multi_edit_caps();
+        assert!(c
+            .validate_request(
+                "m",
+                &multi_edit_req(
+                    AudioEditMode::Repaint,
+                    vec![span(2.0, 6.0), span(14.0, 18.0)]
+                )
+            )
+            .is_ok());
+        // Order is not significant: the reversed list is equally valid.
+        assert!(c
+            .validate_request(
+                "m",
+                &multi_edit_req(
+                    AudioEditMode::Repaint,
+                    vec![span(14.0, 18.0), span(2.0, 6.0)]
+                )
+            )
+            .is_ok());
+        // Overlapping / touching / duplicate spans are ACCEPTED — the provider merges them.
+        for regions in [
+            vec![span(2.0, 6.0), span(4.0, 8.0)], // overlapping
+            vec![span(2.0, 6.0), span(6.0, 8.0)], // touching
+            vec![span(2.0, 6.0), span(2.0, 6.0)], // duplicate
+            vec![span(2.0, 6.0), span(3.0, 4.0)], // contained
+        ] {
+            assert!(
+                c.validate_request(
+                    "m",
+                    &multi_edit_req(AudioEditMode::Repaint, regions.clone())
+                )
+                .is_ok(),
+                "{regions:?} must be accepted and normalized by the provider, not rejected"
+            );
+        }
+        // An unadvertised mode is the same typed capability gap the single-region path gives.
+        let err = c
+            .validate_request(
+                "m",
+                &multi_edit_req(AudioEditMode::Cover, vec![span(2.0, 6.0)]),
+            )
+            .unwrap_err();
+        assert!(matches!(err, Error::Unsupported(_)));
+        assert!(err.to_string().contains("unsupported audio edit mode"));
+    }
+
+    #[test]
+    fn multi_region_list_shape_is_gated() {
+        let c = multi_edit_caps();
+        // Empty list → malformed request, not a whole-clip edit.
+        let err = c
+            .validate_request("m", &multi_edit_req(AudioEditMode::Repaint, vec![]))
+            .unwrap_err();
+        assert!(matches!(err, Error::Msg(_)));
+        assert!(err.to_string().contains("carries no regions"));
+        // `end_secs: None` is refused OUTRIGHT, on any position — "to the end of the clip" has no
+        // unambiguous meaning when order is not significant.
+        for regions in [
+            vec![TimeRegion {
+                start_secs: 2.0,
+                end_secs: None,
+            }],
+            vec![
+                span(2.0, 6.0),
+                TimeRegion {
+                    start_secs: 14.0,
+                    end_secs: None,
+                },
+            ],
+            vec![
+                TimeRegion {
+                    start_secs: 2.0,
+                    end_secs: None,
+                },
+                span(14.0, 18.0),
+            ],
+        ] {
+            let err = c
+                .validate_request(
+                    "m",
+                    &multi_edit_req(AudioEditMode::Repaint, regions.clone()),
+                )
+                .unwrap_err();
+            assert!(
+                matches!(err, Error::Msg(_)) && err.to_string().contains("must state an explicit"),
+                "{regions:?} → open-ended refusal, got {err:?}"
+            );
+        }
+    }
+
+    /// **The list defeats the exhaustive-destructuring mechanism, so this is the gate that replaces
+    /// it.** Every malformed value is placed in region **two**, never region one.
+    ///
+    /// `first_nonfinite_float` destructures `GenerationRequest` without `..` so a new *field* breaks
+    /// the build and must be classified. A `Vec` field satisfies that once and then hides an
+    /// unbounded number of floats behind it: a guard checking only `regions[0]` compiles, passes
+    /// every pre-existing test, and lets a NaN in region two reach the provider's mask.
+    #[test]
+    fn every_region_is_floored_not_just_the_first() {
+        let c = multi_edit_caps();
+        let good = span(2.0, 6.0);
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            // Non-finite START in region TWO.
+            let req = multi_edit_req(
+                AudioEditMode::Repaint,
+                vec![
+                    good,
+                    TimeRegion {
+                        start_secs: bad,
+                        end_secs: Some(18.0),
+                    },
+                ],
+            );
+            assert_eq!(
+                req.first_nonfinite_float().map(|(f, _)| f),
+                Some("conditioning.audio_edit_regions.regions.start_secs"),
+                "a non-finite start in region TWO must be found ({bad})"
+            );
+            assert!(c.validate_request("m", &req).is_err());
+
+            // Non-finite END in region TWO.
+            let req = multi_edit_req(
+                AudioEditMode::Repaint,
+                vec![
+                    good,
+                    TimeRegion {
+                        start_secs: 14.0,
+                        end_secs: Some(bad),
+                    },
+                ],
+            );
+            assert_eq!(
+                req.first_nonfinite_float().map(|(f, _)| f),
+                Some("conditioning.audio_edit_regions.regions.end_secs"),
+                "a non-finite end in region TWO must be found ({bad})"
+            );
+            assert!(c.validate_request("m", &req).is_err());
+
+            // And in region THREE, so the gate does not merely check "the last one".
+            let req = multi_edit_req(
+                AudioEditMode::Repaint,
+                vec![
+                    good,
+                    span(8.0, 10.0),
+                    TimeRegion {
+                        start_secs: bad,
+                        end_secs: Some(18.0),
+                    },
+                ],
+            );
+            assert!(req.first_nonfinite_float().is_some());
+            assert!(c.validate_request("m", &req).is_err());
+
+            // Strength still joins the floor.
+            let mut req = multi_edit_req(AudioEditMode::Repaint, vec![good]);
+            let Conditioning::AudioEditRegions { strength, .. } = &mut req.conditioning[0] else {
+                unreachable!()
+            };
+            *strength = Some(bad);
+            assert_eq!(
+                req.first_nonfinite_float().map(|(f, _)| f),
+                Some("conditioning.audio_edit_regions.strength")
+            );
+        }
+        // Control: a wholly well-formed multi-region request has no non-finite float at all, so the
+        // assertions above discriminate rather than firing on everything.
+        let ok = multi_edit_req(
+            AudioEditMode::Repaint,
+            vec![good, span(8.0, 10.0), span(14.0, 18.0)],
+        );
+        assert_eq!(ok.first_nonfinite_float(), None);
+        assert!(c.validate_request("m", &ok).is_ok());
+    }
+
+    /// The non-finite refusal must name **which** region is malformed.
+    ///
+    /// `first_nonfinite_float` keys are `&'static str`, so its multi-region arm can only report
+    /// `…regions.start_secs` with no index — and the two range guards that *do* carry an index
+    /// (`start < 0`, `end <= start`) never fire on a NaN, because both comparisons evaluate `false`
+    /// for NaN. Without the indexed pass in `validate_request` the caller of a ten-region repaint is
+    /// told a region is malformed but not which one. The bad value is placed in region **two** so a
+    /// guard that reached only `regions[0]` fails here, and in region **one** so a pass that skips
+    /// `regions[0]` fails too.
+    #[test]
+    fn a_non_finite_region_bound_is_reported_with_its_index() {
+        let c = multi_edit_caps();
+        let good = span(2.0, 6.0);
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            // Non-finite START in region TWO (index 1).
+            let err = c
+                .validate_request(
+                    "m",
+                    &multi_edit_req(
+                        AudioEditMode::Repaint,
+                        vec![
+                            good,
+                            TimeRegion {
+                                start_secs: bad,
+                                end_secs: Some(18.0),
+                            },
+                        ],
+                    ),
+                )
+                .unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                matches!(err, Error::Msg(_)) && msg.contains("region 1") && msg.contains("start"),
+                "a non-finite start in region TWO must name `region 1`, got {msg:?} ({bad})"
+            );
+
+            // Non-finite END in region THREE (index 2), so the message is not merely reporting a
+            // constant index — and so the pass is not checking only "the second one".
+            let err = c
+                .validate_request(
+                    "m",
+                    &multi_edit_req(
+                        AudioEditMode::Repaint,
+                        vec![
+                            good,
+                            span(8.0, 10.0),
+                            TimeRegion {
+                                start_secs: 14.0,
+                                end_secs: Some(bad),
+                            },
+                        ],
+                    ),
+                )
+                .unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                matches!(err, Error::Msg(_)) && msg.contains("region 2") && msg.contains("end"),
+                "a non-finite end in region THREE must name `region 2`, got {msg:?} ({bad})"
+            );
+
+            // Non-finite START in region ONE (index 0), the symmetric twin of the two cases above:
+            // a pass that *skips* `regions[0]` drops the index and falls through to the index-free
+            // backstop, which the region-1 and region-2 cases alone do not catch.
+            let err = c
+                .validate_request(
+                    "m",
+                    &multi_edit_req(
+                        AudioEditMode::Repaint,
+                        vec![
+                            TimeRegion {
+                                start_secs: bad,
+                                end_secs: Some(6.0),
+                            },
+                            span(8.0, 10.0),
+                        ],
+                    ),
+                )
+                .unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                matches!(err, Error::Msg(_)) && msg.contains("region 0") && msg.contains("start"),
+                "a non-finite start in region ONE must name `region 0`, got {msg:?} ({bad})"
+            );
+        }
+        // Discrimination: a well-formed multi-region request produces no error at all, so the
+        // assertions above are not firing on everything. And the *index-free* backstop is still
+        // wired — a bespoke provider that calls `ensure_finite_floats` directly (never entering
+        // `validate_request`) still rejects the same request.
+        let ok = multi_edit_req(AudioEditMode::Repaint, vec![good, span(8.0, 10.0)]);
+        assert!(c.validate_request("m", &ok).is_ok());
+        let nan_req = multi_edit_req(
+            AudioEditMode::Repaint,
+            vec![
+                good,
+                TimeRegion {
+                    start_secs: f32::NAN,
+                    end_secs: Some(18.0),
+                },
+            ],
+        );
+        assert!(
+            nan_req.ensure_finite_floats().is_err(),
+            "the index-free floor stays the backstop for callers that bypass validate_request"
+        );
+    }
+
+    /// Malformed ranges are gated on **every** region, again with the bad value in region two.
+    #[test]
+    fn every_region_range_is_gated_not_just_the_first() {
+        let c = multi_edit_caps();
+        for bad in [span(-1.0, 4.0), span(8.0, 4.0), span(4.0, 4.0)] {
+            let err = c
+                .validate_request(
+                    "m",
+                    &multi_edit_req(AudioEditMode::Repaint, vec![span(20.0, 24.0), bad]),
+                )
+                .unwrap_err();
+            assert!(
+                matches!(err, Error::Msg(_)) && err.to_string().contains("region 1"),
+                "{bad:?} in region two → Msg naming index 1, got {err:?}"
+            );
+        }
     }
 
     // ---- Video→audio (Foley) sync conditioning (sc-13436) ----------------------------------
