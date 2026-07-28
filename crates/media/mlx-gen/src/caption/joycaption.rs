@@ -173,7 +173,7 @@ pub fn build_prompt(options: &CaptionOptions) -> String {
     let caption_length = options.caption_length.as_str();
     let template_index = if caption_length == "any" {
         0
-    } else if caption_length.chars().all(|c| c.is_ascii_digit()) {
+    } else if !caption_length.is_empty() && caption_length.chars().all(|c| c.is_ascii_digit()) {
         1
     } else {
         2
@@ -234,27 +234,40 @@ mod tests {
     }
 
     #[test]
-    fn prompt_defaults_match_sceneworks() {
+    fn prompt_selection_matrix_matches_upstream_and_lane_policy() {
         assert_eq!(
             build_prompt(&CaptionOptions::default()),
             "Write a long detailed description for this image."
         );
-        assert_eq!(
-            build_prompt(&options("Descriptive", "any")),
-            "Write a detailed description for this image."
-        );
-        assert_eq!(
-            build_prompt(&options("Descriptive", "85")),
-            "Write a detailed description for this image in 85 words or less."
-        );
-    }
-
-    #[test]
-    fn prompt_falls_back_to_descriptive_for_unknown_type() {
-        assert_eq!(
-            build_prompt(&options("Not a real type", "short")),
-            "Write a short detailed description for this image."
-        );
+        for (kind, length, expected) in [
+            (
+                "Descriptive",
+                "any",
+                "Write a detailed description for this image.",
+            ),
+            (
+                "Descriptive",
+                "85",
+                "Write a detailed description for this image in 85 words or less.",
+            ),
+            (
+                "Descriptive",
+                "short",
+                "Write a short detailed description for this image.",
+            ),
+            (
+                "Descriptive",
+                "",
+                "Write a  detailed description for this image.",
+            ),
+            (
+                "Not a real type",
+                "short",
+                "Write a short detailed description for this image.",
+            ),
+        ] {
+            assert_eq!(build_prompt(&options(kind, length)), expected);
+        }
     }
 
     #[test]

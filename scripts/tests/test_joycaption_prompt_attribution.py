@@ -1,3 +1,4 @@
+import re
 import unittest
 from pathlib import Path
 
@@ -8,8 +9,29 @@ PROMPT_FILES = (
     ROOT / "crates/media/mlx-gen/src/caption/joycaption.rs",
 )
 NOTICE_END = "//! JoyCaption caption **product policy**"
+ATTRIBUTED_DATA_START = "pub const JOY_NAME_OPTION"
 PROMPT_TABLE_START = "const PROMPT_TEMPLATES"
 PROMPT_TABLE_END = "pub fn capabilities"
+SELECTION_START = "pub fn build_prompt"
+SELECTION_END = "#[cfg(test)]"
+EXPECTED_NAME_OPTION = (
+    "If there is a person/character in the image you must refer to them as {name}."
+)
+EXPECTED_CAPTION_TYPES = (
+    "Descriptive",
+    "Descriptive (Casual)",
+    "Straightforward",
+    "Stable Diffusion Prompt",
+    "MidJourney",
+    "Danbooru tag list",
+    "e621 tag list",
+    "Rule34 tag list",
+    "Booru-like tag list",
+    "Art Critic",
+    "Product Listing",
+    "Social Media Post",
+)
+EXPECTED_CAPTION_LENGTHS = ("any", "very short", "short", "medium-length", "long")
 STRAIGHTFORWARD_MODIFICATION = (
     "Never mention what is absent, resolution, watermarks, signatures, compression artifacts, "
     "or unobservable details."
@@ -53,14 +75,59 @@ def prompt_table(source: str) -> str:
     return source[start:end]
 
 
+def attributed_prompt_surface(source: str) -> str:
+    start = source.find(ATTRIBUTED_DATA_START)
+    end = source.find(PROMPT_TABLE_END)
+    if start < 0 or end < start:
+        raise AssertionError("JoyCaption attributed prompt surface is missing")
+    return source[start:end]
+
+
+def rust_string_list(source: str, start_marker: str, end_marker: str) -> tuple[str, ...]:
+    start = source.find(start_marker)
+    end = source.find(end_marker, start)
+    if start < 0 or end < start:
+        raise AssertionError(f"JoyCaption string list {start_marker!r} is missing")
+    return tuple(re.findall(r'"([^"]*)"', source[start:end]))
+
+
+def selection_behavior(source: str) -> str:
+    start = source.find(SELECTION_START)
+    end = source.find(SELECTION_END, start)
+    if start < 0 or end < start:
+        raise AssertionError("JoyCaption prompt-selection implementation is missing")
+    return source[start:end]
+
+
+def validate_attributed_prompt_surface(source: str) -> None:
+    attributed_prompt_surface(source)
+    name_options = rust_string_list(source, ATTRIBUTED_DATA_START, "pub const CAPTION_TYPES")
+    if name_options != (EXPECTED_NAME_OPTION,):
+        raise AssertionError("JoyCaption name option diverged from the attributed source")
+    caption_types = rust_string_list(source, "pub const CAPTION_TYPES", "pub const CAPTION_LENGTHS")
+    if caption_types != EXPECTED_CAPTION_TYPES:
+        raise AssertionError("JoyCaption caption taxonomy diverged from the attributed source")
+    caption_lengths = rust_string_list(source, "pub const CAPTION_LENGTHS", PROMPT_TABLE_START)
+    if caption_lengths != EXPECTED_CAPTION_LENGTHS:
+        raise AssertionError("JoyCaption caption lengths diverged from the documented modification")
+
+
+def validate_selection_behavior(source: str) -> None:
+    selection = selection_behavior(source)
+    for required_branch in (
+        'caption_length == "any"',
+        "!caption_length.is_empty() && caption_length.chars().all(|c| c.is_ascii_digit())",
+        "templates_for(&options.caption_type)[template_index]",
+        ".unwrap_or(&PROMPT_TEMPLATES[0].1)",
+    ):
+        if required_branch not in selection:
+            raise AssertionError(
+                f"JoyCaption prompt-selection behavior is missing {required_branch!r}"
+            )
+
+
 def validate_described_modifications(source: str) -> None:
     table = prompt_table(source)
-    lengths_start = source.find("pub const CAPTION_LENGTHS")
-    if lengths_start < 0:
-        raise AssertionError("JoyCaption caption lengths are missing")
-    caption_lengths = source[lengths_start : source.find(PROMPT_TABLE_START)]
-    if '"very long"' in caption_lengths:
-        raise AssertionError("JoyCaption caption lengths restored upstream's `very long` option")
     if table.count(STRAIGHTFORWARD_MODIFICATION) != 3:
         raise AssertionError("JoyCaption Straightforward modification is not present three times")
     for upstream_punctuation in (
@@ -85,8 +152,14 @@ class JoyCaptionPromptAttributionTests(unittest.TestCase):
         for notice in notices:
             validate_notice(notice)
         self.assertEqual(notices[0], notices[1])
+        self.assertEqual(
+            attributed_prompt_surface(sources[0]), attributed_prompt_surface(sources[1])
+        )
         self.assertEqual(prompt_table(sources[0]), prompt_table(sources[1]))
+        self.assertEqual(selection_behavior(sources[0]), selection_behavior(sources[1]))
         for source in sources:
+            validate_attributed_prompt_surface(source)
+            validate_selection_behavior(source)
             validate_described_modifications(source)
 
     def test_guard_rejects_each_required_notice_marker_mutation(self):
@@ -102,7 +175,6 @@ class JoyCaptionPromptAttributionTests(unittest.TestCase):
     def test_guard_rejects_each_described_source_mutation(self):
         source = PROMPT_FILES[0].read_text(encoding="utf-8")
         mutations = (
-            source.replace('"long"];', '"long", "very long"];', 1),
             source.replace(STRAIGHTFORWARD_MODIFICATION, "Note any watermarks.", 1),
             source.replace("elements-people", "elements—people", 1),
             source.replace("artist:, copyright:", "`artist:`, copyright:", 1),
@@ -113,6 +185,31 @@ class JoyCaptionPromptAttributionTests(unittest.TestCase):
             with self.subTest():
                 with self.assertRaisesRegex(AssertionError, "JoyCaption"):
                     validate_described_modifications(mutated)
+
+    def test_guard_rejects_attributed_surface_and_selection_mutations(self):
+        source = PROMPT_FILES[0].read_text(encoding="utf-8")
+        surface_mutations = (
+            (
+                "name option",
+                source.replace(EXPECTED_NAME_OPTION, f"{EXPECTED_NAME_OPTION} Changed.", 1),
+            ),
+            (
+                "caption taxonomy",
+                source.replace('"Social Media Post",', '"Social Media Thread",', 1),
+            ),
+            (
+                "caption lengths",
+                source.replace('"long"];', '"long", "very long"];', 1),
+            ),
+        )
+        for mutation, mutated in surface_mutations:
+            with self.subTest(mutation=mutation):
+                with self.assertRaisesRegex(AssertionError, "JoyCaption"):
+                    validate_attributed_prompt_surface(mutated)
+
+        empty_semantics_mutation = source.replace("!caption_length.is_empty() && ", "", 1)
+        with self.assertRaisesRegex(AssertionError, "JoyCaption"):
+            validate_selection_behavior(empty_semantics_mutation)
 
 
 if __name__ == "__main__":
