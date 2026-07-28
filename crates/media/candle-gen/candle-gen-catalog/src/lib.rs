@@ -129,6 +129,50 @@ pub const SURFACES_NVFP4_TIER: bool = cfg!(feature = "cuda");
 #[cfg(test)]
 mod tests {
     #[test]
+    fn cfg_capability_matrix_matches_the_registered_candle_render_paths() {
+        let registry = super::provider_registry().unwrap();
+        let descriptor = |id: &str| {
+            registry
+                .generators()
+                .find_map(|registration| {
+                    let descriptor = (registration.descriptor)();
+                    (descriptor.id == id).then_some(descriptor)
+                })
+                .unwrap_or_else(|| panic!("{id} missing from Candle catalog"))
+        };
+
+        let klein = descriptor("flux2_klein_9b").capabilities;
+        assert!(klein.supports_guidance);
+        assert!(klein.supports_negative_prompt);
+        assert!(!klein.supports_true_cfg);
+
+        for id in ["sd3_5_large", "sd3_5_medium"] {
+            let capabilities = descriptor(id).capabilities;
+            assert!(capabilities.supports_guidance, "{id}");
+            assert!(capabilities.supports_negative_prompt, "{id}");
+            assert!(!capabilities.supports_true_cfg, "{id}");
+        }
+        let turbo = descriptor("sd3_5_large_turbo").capabilities;
+        assert!(!turbo.supports_guidance);
+        assert!(!turbo.supports_negative_prompt);
+        assert!(!turbo.supports_true_cfg);
+
+        for id in ["sensenova_u1_8b", "sensenova_u1_8b_fast"] {
+            let capabilities = descriptor(id).capabilities;
+            assert!(capabilities.supports_guidance, "{id}");
+            assert!(!capabilities.supports_negative_prompt, "{id}");
+            assert!(
+                !capabilities.supports_true_cfg,
+                "{id} has no Candle reference/image-CFG path"
+            );
+            assert!(
+                capabilities.conditioning.is_empty(),
+                "{id} is Candle txt2img only"
+            );
+        }
+    }
+
+    #[test]
     fn complete_catalog_has_stable_conforming_surface() {
         let registry = super::provider_registry().unwrap();
         let generators: Vec<String> = registry

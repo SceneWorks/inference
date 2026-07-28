@@ -589,6 +589,13 @@ mod tests {
                 prompt: "x".into(),
                 width: 512,
                 height: 512,
+                true_cfg: Some(1.5),
+                ..Default::default()
+            },
+            GenerationRequest {
+                prompt: "x".into(),
+                width: 512,
+                height: 512,
                 conditioning: vec![Conditioning::Reference {
                     image: Image::default(),
                     strength: None,

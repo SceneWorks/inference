@@ -119,6 +119,58 @@ pub fn provider_registry() -> mlx_gen::gen_core::Result<ProviderRegistry> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn cfg_capability_matrix_matches_the_registered_mlx_render_paths() {
+        let registry = super::provider_registry().unwrap();
+        let descriptor = |id: &str| {
+            registry
+                .generators()
+                .find_map(|registration| {
+                    let descriptor = (registration.descriptor)();
+                    (descriptor.id == id).then_some(descriptor)
+                })
+                .unwrap_or_else(|| panic!("{id} missing from MLX catalog"))
+        };
+
+        for id in [
+            "flux2_klein_9b",
+            "flux2_klein_9b_edit",
+            "flux2_klein_9b_kv_edit",
+        ] {
+            let capabilities = descriptor(id).capabilities;
+            assert!(capabilities.supports_guidance, "{id}");
+            assert!(capabilities.supports_negative_prompt, "{id}");
+            assert!(!capabilities.supports_true_cfg, "{id}");
+        }
+        for id in ["sd3_5_large", "sd3_5_medium"] {
+            let capabilities = descriptor(id).capabilities;
+            assert!(capabilities.supports_guidance, "{id}");
+            assert!(capabilities.supports_negative_prompt, "{id}");
+            assert!(
+                !capabilities.supports_true_cfg,
+                "{id} does not consume request.true_cfg"
+            );
+        }
+        let turbo = descriptor("sd3_5_large_turbo").capabilities;
+        assert!(!turbo.supports_guidance);
+        assert!(!turbo.supports_negative_prompt);
+        assert!(!turbo.supports_true_cfg);
+
+        for id in ["sensenova_u1_8b", "sensenova_u1_8b_fast"] {
+            let capabilities = descriptor(id).capabilities;
+            assert!(capabilities.supports_guidance, "{id}");
+            assert!(!capabilities.supports_negative_prompt, "{id}");
+            assert!(
+                capabilities.supports_true_cfg,
+                "{id} consumes request.true_cfg as reference-image guidance"
+            );
+            assert!(
+                !capabilities.conditioning.is_empty(),
+                "{id} must retain its reference-conditioned it2i surface"
+            );
+        }
+    }
+
+    #[test]
     fn complete_catalog_has_stable_conforming_surface() {
         let registry = super::provider_registry().unwrap();
         let generators: Vec<String> = registry
