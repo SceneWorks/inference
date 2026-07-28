@@ -1927,9 +1927,21 @@ const DESCRIPTOR_NAMES: [&str; N_DESC] = [
 /// [`the_drift_metric_separates_drift_from_ordinary_motion`] and
 /// [`the_drift_metric_catches_the_plausible_ar_failure_shapes`]:
 /// * **from below** — the metric reads a violently moving clip and a violently jittery clip at
-///   ≤ 5/255, and the within-regime zero-eviction row Z bounds this content's own rate;
+///   ≤ 5/255;
 /// * **from above** — every plausible AR failure shape (linear wash-out ramp, plateauing wash-out,
 ///   localized subject collapse, hue rotation) scores above it, several of them by 2–6×.
+///
+/// **Both sides are synthetic, and that is a real limit.** An earlier revision of this comment also
+/// claimed the within-regime zero-eviction row `Z` "bounds this content's own rate". It does not, and
+/// the sweep now computes the comparison instead of asserting it ([`S18Sweep::rate_floor_clause`],
+/// reported in the verdict): row Z's post segment is only 12 output frames, its measured slope
+/// (29.63/100f) is *higher* than the shipped row's over 156 frames (15.56/100f), and extrapolating it
+/// across the long clip predicts ~46/255 — roughly 1.9× more drift than row A actually shows. A
+/// 12-frame OLS slope is dominated by ordinary frame-to-frame motion and does not extrapolate. Row Z
+/// also cannot be made longer: the shipped window evicts as soon as a clip passes 6 latent frames, so
+/// **no longer zero-eviction row exists at the shipped window**. There is therefore no measured
+/// same-content floor, and "past the budget" means "past an absolute number bracketed by synthetic
+/// controls", not "past a measured same-content baseline".
 ///
 /// The two sides are measured, not asserted, and they bracket a **narrow** range:
 /// * floor — motion and jitter both score **2.81/255**;
@@ -2091,6 +2103,19 @@ fn worst_slope(d: &[ComponentDrift; N_DESC]) -> f64 {
 /// Gating on the max is what makes the budget a "trend AND excursion" gate.
 fn worst_drift(d: &[ComponentDrift; N_DESC]) -> f64 {
     worst_trend(d).max(worst_excursion(d))
+}
+
+/// Which [`DESCRIPTOR_NAMES`] component produced [`worst_drift`]. Recorded per cell so "what mode is
+/// this clip failing in?" is answerable from the table instead of from prose.
+fn worst_component(d: &[ComponentDrift; N_DESC]) -> &'static str {
+    let mut best = (0usize, -1.0f64);
+    for (i, c) in d.iter().enumerate() {
+        let v = c.trend.abs().max(c.gated_excursion().abs());
+        if v > best.1 {
+            best = (i, v);
+        }
+    }
+    DESCRIPTOR_NAMES[best.0]
 }
 
 fn print_drift(label: &str, d: &[ComponentDrift; N_DESC]) {
@@ -2452,6 +2477,8 @@ struct S18Row {
     excursion: f64,
     /// Worst per-100-frame slope — the only length-comparable statistic, used for row Z.
     slope: f64,
+    /// Which descriptor component produced `drift` (see [`worst_component`]).
+    component: &'static str,
     rolls: usize,
     /// MLX active peak for this row's AR loop — the sink/window memory cost, measured.
     peak: usize,
@@ -2487,8 +2514,13 @@ struct DriftRun {
 ///
 /// **Rows.** `A` shipped (window 6, sink 0) · `B` sink 1 · `C` sink 3 · `D` wide window (the
 /// within-regime dose-response) · `E` the checkpoint's global window (an out-of-regime *reference*, not
-/// a floor — see the module comment) · `Z` the within-regime zero-eviction rate floor (shipped window,
-/// clip short enough never to roll).
+/// a floor, and **not attribution evidence** — different attention mask, `n = 1`, no variance estimate)
+/// · `Z` the within-regime zero-eviction *rate* row (shipped window, clip short enough never to roll).
+///
+/// Row Z was intended as a rate floor and **turned out not to be one** — see
+/// [`S18Sweep::rate_floor_clause`] for the measured reason. It is still run, still recorded and still
+/// reported in the verdict, because "the intended floor does not work, and here is the number that
+/// shows it" is the honest form of that result.
 ///
 /// **Driving it.** `KREA_S18_ROWS` (default `ABCDEZ`) selects rows; `KREA_S18_SEEDS` (comma-separated,
 /// default `7`) selects seeds. Each (row, seed) prints one `S18CELL` TSV line, so a long sweep can be
@@ -2775,7 +2807,7 @@ fn long_clip_coherence_under_the_bounded_window() {
             // Machine-readable, so a sweep split across processes can be re-aggregated.
             println!(
                 "S18CELL\t{}\t{seed}\t{w}x{h}\t{lat}\t{rolls}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{}\t\
-                 {:.4}\t{:.4}\t{:.4}",
+                 {:.4}\t{:.4}\t{:.4}\t{}",
                 r.row,
                 worst_drift(&d),
                 worst_trend(&d),
@@ -2784,7 +2816,8 @@ fn long_clip_coherence_under_the_bounded_window() {
                 ar_peak,
                 clip_mean,
                 head_motion,
-                tail_motion
+                tail_motion,
+                worst_component(&d)
             );
             results.push(S18Row {
                 label: format!("{} s{seed}", r.label),
@@ -2792,6 +2825,7 @@ fn long_clip_coherence_under_the_bounded_window() {
                 trend: worst_trend(&d),
                 excursion: worst_excursion(&d),
                 slope: worst_slope(&d),
+                component: worst_component(&d),
                 rolls,
                 peak: ar_peak,
                 clip_mean,
@@ -2807,11 +2841,11 @@ fn long_clip_coherence_under_the_bounded_window() {
     println!("=== sc-15127 S18 summary ({w}x{h}) ==========================================");
     println!(
         "  row                                       rolls   drift   trend   excur  slope/100f  \
-         peak GiB  clip%  tail motion"
+         peak GiB  clip%  tail motion  component"
     );
     for r in &results {
         println!(
-            "  {:<41} {:>5}  {:>6.2}  {:>6.2}  {:>6.2}  {:>10.3}  {:>8.2}  {:>5.2}  {:>8.2}",
+            "  {:<41} {:>5}  {:>6.2}  {:>6.2}  {:>6.2}  {:>10.3}  {:>8.2}  {:>5.2}  {:>8.2}  {}",
             r.label,
             r.rolls,
             r.drift,
@@ -2820,7 +2854,8 @@ fn long_clip_coherence_under_the_bounded_window() {
             r.slope,
             gib(r.peak),
             r.clip_mean,
-            r.tail_motion
+            r.tail_motion,
+            r.component
         );
     }
 
@@ -2866,8 +2901,9 @@ fn long_clip_coherence_under_the_bounded_window() {
             );
         }
     }
-    // Row Z's contribution: the within-regime, zero-eviction rate. The shipped row's rate must not be
-    // wildly above the rate the SAME attention regime shows with no evictions at all.
+    // Row Z's contribution: the within-regime, zero-eviction *rate*, in the only length-comparable
+    // statistic there is. This is REPORTED, not gated — see `S18Sweep::rate_floor_clause` for why the
+    // measured Z slope turned out not to bound row A's.
     let mean_slope = |row: char| {
         let v: Vec<f64> = results
             .iter()
@@ -2878,8 +2914,8 @@ fn long_clip_coherence_under_the_bounded_window() {
     };
     if let (Some(a), Some(z)) = (mean_slope('A'), mean_slope('Z')) {
         println!(
-            "  within-regime rate floor: zero-eviction row Z {z:.3}/100f vs shipped row A \
-             {a:.3}/100f ({:.2}x)",
+            "  within-regime rate: zero-eviction row Z {z:.3}/100f vs shipped row A {a:.3}/100f \
+             (A/Z {:.2}x) — a ratio at or above 1 would make Z a floor; below 1 it is not one",
             a / z.max(1e-6)
         );
     }
@@ -2894,6 +2930,8 @@ fn long_clip_coherence_under_the_bounded_window() {
                 rolls: r.rolls,
                 trend: r.trend,
                 excursion: r.excursion,
+                slope: r.slope,
+                component: r.component,
             })
             .collect(),
     };
@@ -2922,6 +2960,18 @@ struct S18Cell {
     trend: f64,
     /// Worst absolute z-gated component excursion, 0..255.
     excursion: f64,
+    /// Worst absolute component slope over the post-roll segment, per 100 output frames. Recorded
+    /// because it is the **only** statistic comparable across rows of different clip length, which is
+    /// the entire point of row Z — see [`S18Sweep::rate_floor_clause`]. Same component as
+    /// [`trend`](Self::trend) (they differ by the constant post-segment length), so the segment length
+    /// is recoverable as `100 * trend / slope`.
+    slope: f64,
+    /// Which [`DESCRIPTOR_NAMES`] component actually produced [`drift`](Self::drift) for this cell.
+    ///
+    /// Recorded so the reader can check *which channel* scored a row rather than taking "the mode is a
+    /// saturation run-away" on trust. It is not the same thing as the corroborating `report_artifacts`
+    /// saturation statistic, and this field is what makes that checkable.
+    component: &'static str,
 }
 
 impl S18Cell {
@@ -2929,6 +2979,51 @@ impl S18Cell {
     fn drift(&self) -> f64 {
         self.trend.abs().max(self.excursion.abs())
     }
+
+    /// Output frames in this cell's post-roll segment, recovered from the trend/slope pair.
+    fn post_len(&self) -> Option<f64> {
+        (self.slope.abs() > 1e-9).then(|| 100.0 * self.trend.abs() / self.slope.abs())
+    }
+}
+
+/// Outcome of the within-regime window dose-response — row `D` (2.5× wider window, fewer evictions)
+/// against row `A` (shipped).
+///
+/// **Symmetric by construction.** An earlier form fired whenever `D + combined_spread >= A`, i.e.
+/// whenever the wider window failed to *beat* the shipped one, and then asserted an unqualified
+/// falsification ("eviction is not the mechanism"). That is a non-inferiority test wearing a
+/// falsification's clothes: noisier data makes it *easier* to satisfy, which is the same inversion the
+/// max−min → 2·SEM change fixed elsewhere in this file. It is also inconsistent with the sink
+/// comparison, which correctly applies a *resolvability* standard to exactly this shape of question.
+///
+/// So: neither direction may be asserted unless `|D − A|` clears the combined between-seed spread, and
+/// when it does not, the outcome names the effect size the design **can** exclude.
+enum WindowAttribution {
+    /// No row `D` was measured — the dose-response was not run.
+    Unmeasured,
+    /// `|D − A|` is inside the combined 2·SEM. Nothing may be concluded in either direction.
+    Unresolved {
+        d: f64,
+        d_rolls: usize,
+        gap: f64,
+        unc: f64,
+    },
+    /// `D` is worse than `A` by more than the combined spread: fewer evictions bought *less*
+    /// coherence, so eviction is not the mechanism. This is the only case that licenses the
+    /// falsification.
+    NotTheWindow {
+        d: f64,
+        d_rolls: usize,
+        gap: f64,
+        unc: f64,
+    },
+    /// `D` is better than `A` by more than the combined spread: the bounded window is implicated.
+    TheWindow {
+        d: f64,
+        d_rolls: usize,
+        gap: f64,
+        unc: f64,
+    },
 }
 
 /// A measured S18 sweep at one geometry bucket, and the decision rule applied to it. Split out of the
@@ -2962,6 +3057,113 @@ impl S18Sweep {
     fn spread(&self, row: char) -> Option<f64> {
         let v = self.of(row);
         (v.len() >= 2).then(|| 2.0 * std_f64(&v) / (v.len() as f64).sqrt())
+    }
+
+    /// Mean of a row's worst per-100-frame slope — the length-comparable rate statistic.
+    fn mean_slope(&self, row: char) -> Option<f64> {
+        let v: Vec<f64> = self
+            .cells
+            .iter()
+            .filter(|c| c.row == row)
+            .map(|c| c.slope.abs())
+            .collect();
+        (!v.is_empty()).then(|| mean_f64(&v))
+    }
+
+    /// Mean post-roll segment length of a row, in output frames.
+    fn mean_post_len(&self, row: char) -> Option<f64> {
+        let v: Vec<f64> = self
+            .cells
+            .iter()
+            .filter(|c| c.row == row)
+            .filter_map(|c| c.post_len())
+            .collect();
+        (!v.is_empty()).then(|| mean_f64(&v))
+    }
+
+    /// The **within-regime rate** comparison the [`DRIFT_BUDGET`] doc used to assert and never compute:
+    /// row Z is the same attention regime with *zero* evictions, so if a per-frame rate floor exists
+    /// for this content, Z is where it lives, and [`S18Cell::slope`] is the only statistic comparable
+    /// across Z's short clip and A's long one.
+    ///
+    /// It is **reported, not gated**, because on the recorded data it does not separate: see the
+    /// returned text. A short-segment OLS slope is dominated by ordinary frame-to-frame motion, so Z's
+    /// slope is *larger* than A's, and extrapolating it over A's post segment over-predicts A's own
+    /// measured drift. Row Z cannot be lengthened either — the shipped 6-latent-frame window evicts as
+    /// soon as the clip passes 6 latent frames, so a longer zero-eviction row does not exist at the
+    /// shipped window. The consequence is stated rather than hidden: this sweep has **no measured
+    /// same-content rate floor**, and [`DRIFT_BUDGET`] is bracketed by the synthetic motion/jitter and
+    /// failure-shape controls alone.
+    fn rate_floor_clause(&self) -> String {
+        let (Some(a_slope), Some(z_slope)) = (self.mean_slope('A'), self.mean_slope('Z')) else {
+            return String::new();
+        };
+        let a_post = self.mean_post_len('A').unwrap_or(0.0);
+        let z_post = self.mean_post_len('Z').unwrap_or(0.0);
+        let a_trend = self.mean_slope('A').unwrap_or(0.0) * a_post / 100.0;
+        let predicted = z_slope * a_post / 100.0;
+        if z_slope < a_slope {
+            format!(
+                " The within-regime zero-eviction row Z does NOT establish a rate floor here: over \
+                 its {z_post:.0}-output-frame post segment it runs at {z_slope:.2}/100f against the \
+                 shipped row's {a_slope:.2}/100f over {a_post:.0} — Z is lower, so the shipped row's \
+                 rate does exceed the zero-eviction rate."
+            )
+        } else {
+            format!(
+                " The within-regime zero-eviction row Z does NOT establish a rate floor here, and \
+                 the sweep says so rather than omitting it: over its {z_post:.0}-output-frame post \
+                 segment Z runs at {z_slope:.2}/100f, which is HIGHER than the shipped row's \
+                 {a_slope:.2}/100f over {a_post:.0} frames. Extrapolated across the long clip that \
+                 rate predicts {predicted:.1}/255 of drift — {:.1}x what row A actually measures \
+                 ({a_trend:.1}/255) — so the extrapolation over-predicts and a {z_post:.0}-frame OLS \
+                 slope (dominated by ordinary frame-to-frame motion) is not extrapolable. Row Z \
+                 cannot be lengthened: the shipped window evicts as soon as the clip passes 6 latent \
+                 frames, so no longer zero-eviction row exists at the shipped window. This sweep \
+                 therefore has NO measured same-content rate floor, and the budget is bracketed by \
+                 the synthetic motion/jitter and failure-shape controls alone.",
+                predicted / a_trend.max(1e-6)
+            )
+        }
+    }
+
+    /// Classify the within-regime window dose-response. See [`WindowAttribution`] for why this is
+    /// two-sided.
+    fn window_attribution(&self, a: f64) -> WindowAttribution {
+        let Some(d) = self.mean('D') else {
+            return WindowAttribution::Unmeasured;
+        };
+        let unc =
+            self.spread('A').unwrap_or(f64::INFINITY) + self.spread('D').unwrap_or(f64::INFINITY);
+        let d_rolls = self
+            .cells
+            .iter()
+            .find(|c| c.row == 'D')
+            .map(|c| c.rolls)
+            .unwrap_or(0);
+        let gap = d - a;
+        if gap.abs() <= unc {
+            WindowAttribution::Unresolved {
+                d,
+                d_rolls,
+                gap,
+                unc,
+            }
+        } else if gap > 0.0 {
+            WindowAttribution::NotTheWindow {
+                d,
+                d_rolls,
+                gap,
+                unc,
+            }
+        } else {
+            WindowAttribution::TheWindow {
+                d,
+                d_rolls,
+                gap,
+                unc,
+            }
+        }
     }
 
     /// The row with the smaller mean of `B`/`C`, i.e. the sink anchor that did best.
@@ -3083,40 +3285,81 @@ impl S18Sweep {
         } else {
             // Drift is real. **Attribution first**: sc-15127 asks whether the *bounded window* costs
             // coherence, and "the clip drifts" does not answer that. The within-regime dose-response
-            // (row D, the same local-attention path at a 2.5x wider window and fewer rolls) is what
-            // decides it. If halving the roll count does not materially reduce the drift, eviction is
-            // not the demonstrated mechanism — and then a first-chunk sink, whose whole rationale is
-            // to survive eviction, is not what the evidence points at, whatever the sink rows read.
-            if let Some(d) = self.mean('D') {
-                let unc = self.spread('A').unwrap_or(0.0) + self.spread('D').unwrap_or(0.0);
-                if d + unc >= a {
-                    let d_rolls = self
-                        .cells
-                        .iter()
-                        .find(|c| c.row == 'D')
-                        .map(|c| c.rolls)
-                        .unwrap_or(0);
+            // (row D, the same local-attention path at a wider window and fewer rolls) is what
+            // decides it, and it is judged SYMMETRICALLY — see `WindowAttribution`.
+            //
+            // Note what this ladder can and cannot do. Window 6 -> 15 at 45 latent frames takes the
+            // eviction count from 13 to 10: a **23% reduction**, not a halving. So a mechanism whose
+            // damage is linear in the roll count would show up as ~23% of row A's drift, which at
+            // 640x384 is ~6.3/255 — *below* this sweep's own 7.92/255 combined resolution. The ladder
+            // is therefore too short to exclude a linear-in-rolls mechanism at all; what a large
+            // D-worse-than-A gap would exclude is a *strong* one, and a large D-better-than-A gap
+            // would positively implicate the window. Anything smaller is unresolved, and says so.
+            let head = format!(
+                "drift is real ({a:.2}/255 over {shipped_rolls} rolls against a {DRIFT_BUDGET:.2} \
+                 budget)"
+            );
+            let rate = self.rate_floor_clause();
+            let attribution = self.window_attribution(a);
+            let attrib_clause = match attribution {
+                WindowAttribution::Unmeasured => String::new(),
+                WindowAttribution::NotTheWindow {
+                    d,
+                    d_rolls,
+                    gap,
+                    unc,
+                } => {
                     let sinks = ['B', 'C']
                         .iter()
                         .filter_map(|&r| self.mean(r).map(|m| format!("{r} {m:.2}")))
                         .collect::<Vec<_>>()
                         .join(", ");
-                    let global = match self.mean('E') {
-                        Some(e) => format!(" The zero-eviction global reference reads {e:.2}."),
-                        None => String::new(),
-                    };
+                    // Row E is deliberately NOT cited here: it is out of regime (a different
+                    // attention mask), n=1, and has no variance estimate. It is a reference, and a
+                    // reference does not get to carry an attribution claim.
                     return Ok(format!(
-                        "drift is real ({a:.2}/255 over {shipped_rolls} rolls against a \
-                         {DRIFT_BUDGET:.2} budget) but it is NOT attributable to the bounded KV \
-                         window: the within-regime dose-response runs the wrong way — at {d_rolls} \
-                         rolls the 2.5x WIDER window scores {d:.2}/255, no better than the shipped \
-                         window's {a:.2} (combined 2*SEM {unc:.2}).{global} Fewer evictions do not \
-                         buy coherence, so eviction is not the mechanism and a first-chunk sink \
-                         anchor is not indicated. No sink is wired. Sink rows for the record: \
-                         {sinks}. The drift itself needs its own investigation."
+                        "{head} but it is NOT attributable to the bounded KV window: the \
+                         within-regime dose-response runs the wrong way — at {d_rolls} rolls (23% \
+                         fewer than the shipped row's {shipped_rolls}) the WIDER window scores \
+                         {d:.2}/255, worse than the shipped window's {a:.2} by {gap:.2}, clear of \
+                         the combined 2*SEM of {unc:.2}. Fewer evictions bought less coherence, so a \
+                         strong eviction-driven mechanism is excluded and a first-chunk sink anchor \
+                         is not indicated. This does NOT exclude a weak one: the ladder only removes \
+                         23% of the rolls, so a linear-in-rolls effect would move the score by less \
+                         than {unc:.2} and would be invisible here.{rate} No sink is wired. Sink \
+                         rows for the record: {sinks}. The drift itself needs its own investigation."
                     ));
                 }
-            }
+                WindowAttribution::Unresolved {
+                    d,
+                    d_rolls,
+                    gap,
+                    unc,
+                } => format!(
+                    ", the attribution to the bounded KV window is NOT resolvable at this sample \
+                     size — the wider window at {d_rolls} rolls scores {d:.2}/255 against the \
+                     shipped window's {a:.2} at {shipped_rolls}, a gap of {gap:+.2} inside a \
+                     combined 2*SEM of {unc:.2}, so NEITHER direction may be asserted. What this \
+                     design can exclude is a window contribution larger than {unc:.2}/255 \
+                     ({:.0}% of the shipped row's drift); anything smaller than that, in either \
+                     direction, is invisible to it. Note also that window 6 -> 15 removes only 23% \
+                     of the evictions, not half, so a linear-in-rolls mechanism would produce about \
+                     {:.1}/255 here — under the resolution — and is not excluded either.{rate}",
+                    100.0 * unc / a.max(1e-6),
+                    0.23 * a
+                ),
+                WindowAttribution::TheWindow {
+                    d,
+                    d_rolls,
+                    gap,
+                    unc,
+                } => format!(
+                    ", and the bounded KV window IS implicated: the wider window at {d_rolls} rolls \
+                     scores {d:.2}/255 against the shipped window's {a:.2} at {shipped_rolls}, \
+                     better by {:.2}, clear of the combined 2*SEM of {unc:.2} (gap {gap:+.2}).{rate}",
+                    gap.abs()
+                ),
+            };
             // The remaining question is whether the anchored rows repair it — a SECOND comparison
             // with its own power problem, so it gets its own resolvability check.
             let Some((row, best_sink)) = self.best_sink() else {
@@ -3132,26 +3375,24 @@ impl S18Sweep {
                 + self.spread(row).unwrap_or(f64::INFINITY);
             if (threshold - best_sink).abs() < combined {
                 return Ok(format!(
-                    "drift is real ({a:.2}/255 over {shipped_rolls} rolls against a \
-                     {DRIFT_BUDGET:.2} budget), and the sink anchor's effect on it is NOT resolvable \
-                     at this sample size: the best sink row ({row}) is {best_sink:.2}/255 against a \
-                     {threshold:.2} repair threshold, a gap of {:.2} inside a combined between-seed \
-                     scatter of {combined:.2}. No sink is wired — permanently-resident KV must not be \
-                     bought on an unresolved comparison.",
+                    "{head}{attrib_clause} And the sink anchor's effect on it is NOT resolvable at \
+                     this sample size either: the best sink row ({row}) is {best_sink:.2}/255 \
+                     against a {threshold:.2} repair threshold, a gap of {:.2} inside a combined \
+                     between-seed scatter of {combined:.2}. No sink is wired — permanently-resident \
+                     KV must not be bought on an unresolved comparison.",
                     (threshold - best_sink).abs()
                 ));
             }
             if best_sink >= threshold {
                 return Ok(format!(
-                    "drift is real ({a:.2}/255 over {shipped_rolls} rolls against a \
-                     {DRIFT_BUDGET:.2} budget) and a first-chunk sink anchor does NOT repair it: the \
+                    "{head}{attrib_clause} And a first-chunk sink anchor does NOT repair it: the \
                      best sink row ({row}) only reached {best_sink:.2}/255 against a {threshold:.2} \
                      repair threshold. No sink is wired; sc-15127 needs a different anchor."
                 ));
             }
             Ok(format!(
-                "drift is real ({a:.2}/255 over {shipped_rolls} rolls against a {DRIFT_BUDGET:.2} \
-                 budget) and a first-chunk sink anchor repairs it to {best_sink:.2}/255 (row {row})."
+                "{head}{attrib_clause} And a first-chunk sink anchor repairs it to \
+                 {best_sink:.2}/255 (row {row})."
             ))
         }
     }
@@ -3178,6 +3419,11 @@ fn the_s18_verdict_rule_distinguishes_its_outcomes() {
                     rolls: if *row == 'E' { 0 } else { 13 },
                     trend: means[i] + off,
                     excursion: 0.0,
+                    // A 100-output-frame post segment, so slope == trend numerically. These synthetic
+                    // sweeps have no row Z, so the rate-floor clause is inert here; it is exercised
+                    // against the RECORDED data, which does have one.
+                    slope: means[i] + off,
+                    component: "luma-mean",
                 });
             }
         }
@@ -3200,15 +3446,90 @@ fn the_s18_verdict_rule_distinguishes_its_outcomes() {
         .expect("a repaired-drift sweep must yield a verdict");
     assert!(v.starts_with("drift is real"), "got: {v}");
 
-    // 2b. Drift that is NOT attributable to the window: the wider window (fewer rolls) is no better.
-    //     The rule must say so and must not reach for a sink, even though the sink rows look great.
-    let v = sweep([40.0, 8.0, 6.0, 41.0, 2.0], 2.0, 3)
+    // 2b. Drift that is NOT attributable to the window: the wider window (fewer rolls) is worse by
+    //     MORE than the combined scatter. Only then may the falsification be asserted, and the rule
+    //     must not reach for a sink even though the sink rows look great.
+    let v = sweep([40.0, 8.0, 6.0, 45.0, 2.0], 2.0, 3)
         .verdict()
         .expect("an unattributed drift is still a conclusion");
     assert!(v.starts_with("drift is real"), "got: {v}");
     assert!(v.contains("NOT attributable"), "got: {v}");
     assert!(!v.contains("repairs it to"), "got: {v}");
     assert!(v.contains("No sink is wired"), "got: {v}");
+    // ...and it must be honest about what a 23%-shorter roll ladder cannot exclude.
+    assert!(v.contains("does NOT exclude a weak one"), "got: {v}");
+    // ...and it must NOT lean on row E. Row E is out of regime (a different attention mask), n=1 and
+    // has no variance estimate; citing it as attribution evidence is the same inference this rule
+    // refuses everywhere else, with the sign flipped.
+    assert!(
+        !v.contains("global"),
+        "the out-of-regime, n=1 global reference row must not appear in the attribution sentence: {v}"
+    );
+
+    // 2c. The SAME shape, but with the D-vs-A gap INSIDE the combined scatter. The old rule fired its
+    //     falsification here (it triggered on `d + unc >= a`, i.e. on any failure to beat A, which
+    //     noisier data makes EASIER). The symmetric rule must refuse, in both directions, and must
+    //     report the effect size it can exclude.
+    let v = sweep([40.0, 8.0, 6.0, 41.0, 2.0], 2.0, 3)
+        .verdict()
+        .expect("an unresolvable attribution is still a conclusion");
+    assert!(v.starts_with("drift is real"), "got: {v}");
+    assert!(
+        v.contains("attribution to the bounded KV window is NOT resolvable"),
+        "got: {v}"
+    );
+    assert!(!v.contains("NOT attributable"), "got: {v}");
+    assert!(v.contains("NEITHER direction may be asserted"), "got: {v}");
+    assert!(
+        v.contains("can exclude is a window contribution larger"),
+        "got: {v}"
+    );
+
+    // 2d. **The reviewer's own probe.** Row D is genuinely ~40% BETTER than row A, but the scatter
+    //     swamps it. The old rule returned an unqualified "the dose-response runs the wrong way /
+    //     eviction is not the mechanism" on exactly this data. It must not.
+    let probe = |row: char, vals: [f64; 3]| {
+        vals.into_iter().enumerate().map(move |(k, t)| S18Cell {
+            row,
+            seed: k as u64,
+            rolls: if row == 'D' { 10 } else { 13 },
+            trend: t,
+            excursion: 0.0,
+            slope: t,
+            component: "luma-mean",
+        })
+    };
+    let mut cells: Vec<S18Cell> = probe('A', [20.0, 40.0, 22.0]).collect();
+    cells.extend(probe('D', [10.0, 26.0, 13.0]));
+    cells.extend(probe('B', [18.0, 30.0, 20.0]));
+    cells.extend(probe('C', [17.0, 28.0, 19.0]));
+    let v = S18Sweep {
+        bucket: "reviewer-probe".into(),
+        cells,
+    }
+    .verdict()
+    .expect("the probe must still yield a conclusion");
+    assert!(v.starts_with("drift is real"), "got: {v}");
+    assert!(
+        !v.contains("NOT attributable"),
+        "the reviewer's probe has row D 40% BETTER than row A and must never return a window \
+         falsification — got: {v}"
+    );
+    assert!(
+        !v.contains("runs the wrong way"),
+        "the reviewer's probe must never return a wrong-way dose-response — got: {v}"
+    );
+    assert!(
+        v.contains("attribution to the bounded KV window is NOT resolvable"),
+        "got: {v}"
+    );
+
+    // 2e. And the OTHER direction must be assertable when the evidence clears the scatter: a wider
+    //     window materially better than the shipped one implicates the window.
+    let v = sweep([40.0, 8.0, 6.0, 20.0, 2.0], 2.0, 3)
+        .verdict()
+        .expect("an implicating dose-response is still a conclusion");
+    assert!(v.contains("bounded KV window IS implicated"), "got: {v}");
 
     // 3. Drift the sink does NOT repair — a real finding, but it must never read as "ship a sink".
     let v = sweep([40.0, 38.0, 39.0, 20.0, 2.0], 2.0, 3)
@@ -3306,6 +3627,8 @@ const MEASURED_640: &[S18Cell] = &[
         rolls: 13,
         trend: 19.9907,
         excursion: 23.0413,
+        slope: 12.8146,
+        component: "spatial-sd",
     },
     S18Cell {
         row: 'A',
@@ -3313,6 +3636,8 @@ const MEASURED_640: &[S18Cell] = &[
         rolls: 13,
         trend: 31.0541,
         excursion: 19.3187,
+        slope: 19.9064,
+        component: "luma-mean",
     },
     S18Cell {
         row: 'A',
@@ -3320,6 +3645,8 @@ const MEASURED_640: &[S18Cell] = &[
         rolls: 13,
         trend: 21.7860,
         excursion: 28.4337,
+        slope: 13.9654,
+        component: "opp-B-Y",
     },
     S18Cell {
         row: 'B',
@@ -3327,6 +3654,8 @@ const MEASURED_640: &[S18Cell] = &[
         rolls: 13,
         trend: 11.6090,
         excursion: 17.4084,
+        slope: 7.4416,
+        component: "spatial-sd",
     },
     S18Cell {
         row: 'B',
@@ -3334,6 +3663,8 @@ const MEASURED_640: &[S18Cell] = &[
         rolls: 13,
         trend: 28.5211,
         excursion: 12.3800,
+        slope: 18.2828,
+        component: "luma-mean",
     },
     S18Cell {
         row: 'B',
@@ -3341,6 +3672,8 @@ const MEASURED_640: &[S18Cell] = &[
         rolls: 13,
         trend: 11.8207,
         excursion: 10.3263,
+        slope: 7.5774,
+        component: "saturation",
     },
     S18Cell {
         row: 'C',
@@ -3348,6 +3681,8 @@ const MEASURED_640: &[S18Cell] = &[
         rolls: 13,
         trend: 17.6473,
         excursion: 14.7965,
+        slope: 11.3124,
+        component: "contrast",
     },
     S18Cell {
         row: 'C',
@@ -3355,6 +3690,8 @@ const MEASURED_640: &[S18Cell] = &[
         rolls: 13,
         trend: 15.7251,
         excursion: 0.0,
+        slope: 10.0802,
+        component: "opp-B-Y",
     },
     S18Cell {
         row: 'C',
@@ -3362,6 +3699,8 @@ const MEASURED_640: &[S18Cell] = &[
         rolls: 13,
         trend: 6.2537,
         excursion: 5.8270,
+        slope: 4.0088,
+        component: "contrast",
     },
     S18Cell {
         row: 'D',
@@ -3369,6 +3708,8 @@ const MEASURED_640: &[S18Cell] = &[
         rolls: 10,
         trend: 27.5739,
         excursion: 21.8348,
+        slope: 17.6756,
+        component: "opp-B-Y",
     },
     S18Cell {
         row: 'D',
@@ -3376,6 +3717,8 @@ const MEASURED_640: &[S18Cell] = &[
         rolls: 10,
         trend: 33.0361,
         excursion: 23.0505,
+        slope: 21.1770,
+        component: "luma-mean",
     },
     S18Cell {
         row: 'D',
@@ -3383,6 +3726,8 @@ const MEASURED_640: &[S18Cell] = &[
         rolls: 10,
         trend: 31.1090,
         excursion: 30.5435,
+        slope: 19.9416,
+        component: "opp-B-Y",
     },
     S18Cell {
         row: 'E',
@@ -3390,6 +3735,8 @@ const MEASURED_640: &[S18Cell] = &[
         rolls: 0,
         trend: 34.0619,
         excursion: 18.5963,
+        slope: 21.8345,
+        component: "luma-mean",
     },
     S18Cell {
         row: 'Z',
@@ -3397,6 +3744,8 @@ const MEASURED_640: &[S18Cell] = &[
         rolls: 0,
         trend: 1.3928,
         excursion: 0.0,
+        slope: 11.6069,
+        component: "saturation",
     },
     S18Cell {
         row: 'Z',
@@ -3404,6 +3753,8 @@ const MEASURED_640: &[S18Cell] = &[
         rolls: 0,
         trend: 3.3254,
         excursion: 0.0,
+        slope: 27.7120,
+        component: "opp-B-Y",
     },
     S18Cell {
         row: 'Z',
@@ -3411,6 +3762,8 @@ const MEASURED_640: &[S18Cell] = &[
         rolls: 0,
         trend: 5.9501,
         excursion: 0.0,
+        slope: 49.5845,
+        component: "opp-B-Y",
     },
 ];
 
@@ -3423,6 +3776,8 @@ const MEASURED_832: &[S18Cell] = &[
         rolls: 13,
         trend: 45.8218,
         excursion: 47.1323,
+        slope: 29.3729,
+        component: "opp-B-Y",
     },
     S18Cell {
         row: 'A',
@@ -3430,6 +3785,8 @@ const MEASURED_832: &[S18Cell] = &[
         rolls: 13,
         trend: 27.7189,
         excursion: 34.5532,
+        slope: 17.7685,
+        component: "opp-B-Y",
     },
     S18Cell {
         row: 'A',
@@ -3437,6 +3794,8 @@ const MEASURED_832: &[S18Cell] = &[
         rolls: 13,
         trend: 29.2038,
         excursion: 36.0093,
+        slope: 18.7204,
+        component: "opp-B-Y",
     },
     S18Cell {
         row: 'B',
@@ -3444,6 +3803,8 @@ const MEASURED_832: &[S18Cell] = &[
         rolls: 13,
         trend: 25.6222,
         excursion: 34.1733,
+        slope: 16.4245,
+        component: "opp-B-Y",
     },
     S18Cell {
         row: 'B',
@@ -3451,6 +3812,8 @@ const MEASURED_832: &[S18Cell] = &[
         rolls: 13,
         trend: 23.7267,
         excursion: 31.0055,
+        slope: 15.2094,
+        component: "opp-B-Y",
     },
     S18Cell {
         row: 'B',
@@ -3458,6 +3821,8 @@ const MEASURED_832: &[S18Cell] = &[
         rolls: 13,
         trend: 18.8356,
         excursion: 26.8110,
+        slope: 12.0741,
+        component: "opp-B-Y",
     },
     S18Cell {
         row: 'C',
@@ -3465,6 +3830,8 @@ const MEASURED_832: &[S18Cell] = &[
         rolls: 13,
         trend: 14.6706,
         excursion: 22.8868,
+        slope: 9.4042,
+        component: "opp-B-Y",
     },
     S18Cell {
         row: 'C',
@@ -3472,6 +3839,8 @@ const MEASURED_832: &[S18Cell] = &[
         rolls: 13,
         trend: 11.0461,
         excursion: 19.4879,
+        slope: 7.0808,
+        component: "opp-B-Y",
     },
     S18Cell {
         row: 'C',
@@ -3479,6 +3848,8 @@ const MEASURED_832: &[S18Cell] = &[
         rolls: 13,
         trend: 21.1164,
         excursion: 27.9238,
+        slope: 13.5362,
+        component: "opp-B-Y",
     },
     S18Cell {
         row: 'D',
@@ -3486,6 +3857,8 @@ const MEASURED_832: &[S18Cell] = &[
         rolls: 10,
         trend: 47.4356,
         excursion: 47.0857,
+        slope: 30.4074,
+        component: "opp-B-Y",
     },
     S18Cell {
         row: 'D',
@@ -3493,6 +3866,8 @@ const MEASURED_832: &[S18Cell] = &[
         rolls: 10,
         trend: 35.2790,
         excursion: 39.0004,
+        slope: 22.6147,
+        component: "opp-B-Y",
     },
     S18Cell {
         row: 'D',
@@ -3500,6 +3875,8 @@ const MEASURED_832: &[S18Cell] = &[
         rolls: 10,
         trend: 22.8338,
         excursion: 22.2395,
+        slope: 14.6371,
+        component: "spatial-sd",
     },
 ];
 
@@ -3532,6 +3909,46 @@ fn the_recorded_s18_sweep_is_what_the_docs_claim() {
              `{RECORDED_VERDICT_PREFIX}...` — src/t2v.rs and src/lib.rs are claiming something the \
              data does not say"
         );
+        // The docs no longer claim the drift is "not attributable to the bounded KV window" — under
+        // the symmetric rule neither bucket resolves the attribution. Gate that wording so it cannot
+        // silently drift back into a falsification the data does not support.
+        let v = v.expect("verdict asserted above");
+        assert!(
+            v.contains("attribution to the bounded KV window is NOT resolvable"),
+            "the recorded {bucket} sweep no longer returns an UNRESOLVED attribution — the docs, the \
+             PR body and sc-15571 all say it is unresolved, so one of them is now wrong: {v}"
+        );
+        assert!(
+            !v.contains("NOT attributable"),
+            "the recorded {bucket} sweep returned a window falsification — that claim was withdrawn \
+             in review and must not come back without data that clears the combined 2*SEM: {v}"
+        );
+        // Every cell must name the descriptor component that actually scored it, and it must be a
+        // real one. This is what makes "which channel failed?" checkable from the table.
+        for c in &sweep.cells {
+            assert!(
+                DESCRIPTOR_NAMES.contains(&c.component),
+                "{bucket} row {} seed {} records component `{}`, which is not a descriptor component",
+                c.row,
+                c.seed,
+                c.component
+            );
+        }
+        // ...and specifically: the corroborating `report_artifacts` saturation statistic is NOT the
+        // channel that scored row A. Recording the winners is what lets the docs say that instead of
+        // implying the two are the same mode.
+        let a_components: Vec<&str> = sweep
+            .cells
+            .iter()
+            .filter(|c| c.row == 'A')
+            .map(|c| c.component)
+            .collect();
+        assert!(
+            !a_components.contains(&"saturation"),
+            "{bucket} row A is now scored by the `saturation` component — the docs say the \
+             corroborating saturation statistic is a DIFFERENT channel from the one that scored row \
+             A, so that wording must be revisited: {a_components:?}"
+        );
         // Replication is the other half of what the review demanded: a recorded bucket with one seed
         // per row cannot support a ranking claim, so it must not be recorded as if it could.
         for row in ['A', 'B', 'C', 'D'] {
@@ -3561,4 +3978,35 @@ fn the_recorded_s18_sweep_is_what_the_docs_claim() {
             }
         }
     }
+
+    // The within-regime rate comparison the DRIFT_BUDGET doc used to assert and never compute. It is
+    // recorded here as a FINDING, not a floor: row Z's 12-frame slope is higher than row A's over 156
+    // frames, so it does not bound row A and the budget rests on the synthetic controls alone. If a
+    // future measurement makes Z genuinely lower, this goes red and the doc's narrowed wording — and
+    // sc-15571's — must be revisited, because then a same-content floor WOULD exist.
+    let sweep = S18Sweep {
+        bucket: "640x384".into(),
+        cells: MEASURED_640.to_vec(),
+    };
+    let (z, a) = (
+        sweep.mean_slope('Z').expect("row Z is recorded at 640x384"),
+        sweep.mean_slope('A').expect("row A is recorded at 640x384"),
+    );
+    println!("  rate floor: {}", sweep.rate_floor_clause());
+    assert!(
+        z > a,
+        "row Z's zero-eviction rate is now {z:.2}/100f against row A's {a:.2} — Z is LOWER, so it \
+         does bound row A's rate after all and the docs' \"no measured same-content rate floor\" \
+         wording is stale"
+    );
+    // Row Z's post segment really is short — 12 output frames against row A's 156 — which is the
+    // stated reason its slope does not extrapolate. Pin it so the argument cannot rot.
+    let z_post = sweep.mean_post_len('Z').expect("row Z has a slope");
+    let a_post = sweep.mean_post_len('A').expect("row A has a slope");
+    assert!(
+        z_post < a_post / 4.0,
+        "row Z's post segment is {z_post:.0} output frames against row A's {a_post:.0} — the docs' \
+         \"a 12-frame OLS slope does not extrapolate across 156\" argument no longer describes the \
+         data"
+    );
 }

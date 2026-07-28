@@ -332,7 +332,7 @@ pub fn decode_latents_to_video(
 /// B anchored  (window  6, sink 1)   13   19.25 +-9.82   15.56   2.80
 /// C anchored  (window  6, sink 3)   13   13.21 +-7.04   16.93   3.15
 /// D wider     (window 15, sink 0)   10   30.57 +-3.20   21.64   5.21
-/// E global    (no eviction)          0   34.06 (n=1)    41.90  11.61
+/// E global    (no eviction)          0   34.06 (n=1)    41.90  11.61   <- out of regime, NOT probative
 ///
 /// 832x480 (the crate default, a shipping bucket)
 /// A shipped   (window  6, sink 0)   13   39.23 +-7.95   17.62   2.28
@@ -350,29 +350,53 @@ pub fn decode_latents_to_video(
 /// **Both buckets say the same thing**, which matters because an earlier single-seed version of this
 /// measurement had them disagreeing — 832×480 appeared to show a clean sink dose-response that 640×384
 /// contradicted. With three seeds and a metric that gates the excursion as well as the trend, the
-/// apparent flip is gone: in both buckets the shipped row is far past the budget and the wider window
-/// is no better.
+/// apparent flip is gone: in both buckets the shipped row is far past the budget, and in both the
+/// A-vs-D comparison is inside the noise.
 ///
-/// **Two findings, and they point in different directions.**
+/// **One finding, and one open question.**
 ///
-/// 1. **A long clip does drift**, far past the budget — 27.51/255 against 8. The mode is a one-way
-///    *saturation run-away*, and it is corroborated by a statistic with no construction in common with
-///    the drift metric: mean frame saturation over the clip runs 0.21–0.23 → 0.31–0.43, i.e. ×1.5 to
-///    ×1.9. This is a real defect and the earlier revision of this doc, which said the answer was
-///    "nothing", was wrong. The defect is tracked as **sc-15571**.
-/// 2. **It is not attributable to the bounded KV window.** The within-regime dose-response runs the
-///    wrong way: at **10** rolls the 2.5× wider window scores **30.57**, no better than the shipped
-///    window's 27.51 at **13** (combined 2·SEM 7.92) — and the checkpoint's global window, with **zero**
-///    evictions, is worse still at 34.06. Fewer evictions do not buy coherence. Whatever is degrading
-///    the clip is not the window rolling out from under it.
+/// 1. **A long clip does drift**, far past the budget — 27.51/255 against 8. The earlier revision of
+///    this doc, which said the answer was "nothing", was wrong. The defect is tracked as **sc-15571**.
 ///
-/// **A `sink_size` anchor is therefore still NOT wired** — but for a different reason than this doc
-/// used to give. The sink rows do read lower (B 19.25, C 13.21), yet a first-chunk sink exists to
-/// survive *eviction*, and eviction is not the demonstrated mechanism; and the comparison is not
-/// resolvable at this sample size anyway (C is 3.30/255 from the repair threshold inside a combined
-/// 2·SEM of 11.76 — resolving it would take roughly fifty seeds per configuration, not three). Buying
-/// permanently-resident KV (+0.83 GiB for one latent frame, +2.20 GiB for three, measured) on an
-/// unresolved comparison is not warranted. The knob remains fully plumbed
+///    *Corroboration, stated precisely.* `report_artifacts`' mean frame saturation runs 0.21–0.23 →
+///    0.31–0.43 over row A (×1.5 to ×1.9) while the 24-frame zero-eviction row Z barely moves
+///    (0.225 → 0.237, ×1.05). That is **not** a statistic with "no construction in common" with the
+///    drift metric — an earlier wording claimed that and it was false. It is the *same pixel quantity*
+///    (per-pixel `max−min` over RGB) under a **different normalisation** (`(max−min)/max` vs `max−min`)
+///    and a genuinely **independent aggregation**: head frame vs tail frame, no baseline, no OLS, no
+///    z-gate. Independent aggregation is worth something; identical construction it is not.
+///
+///    And it is a *different channel* from the one that scored row A. The winning descriptor component
+///    is now recorded per cell (`S18Cell::component`, gated): at 832×480 all three row-A cells are won
+///    by the **blue–yellow opponent axis** (`opp-B-Y`); at 640×384 they are `spatial-sd`, `luma-mean`
+///    and `opp-B-Y`. `saturation` wins **no** row-A cell in either bucket. So "the mode is a saturation
+///    run-away" overstated it: the headline drift is a colour-cast/tone/structure mode, alongside which
+///    a saturation rise is separately observable.
+/// 2. **Whether the bounded KV window causes it is NOT resolved by this sweep**, in either direction.
+///    The within-regime dose-response is inside the noise in both buckets: 640×384 A 27.51 vs D 30.57,
+///    gap +3.06 against a combined 2·SEM of **7.92**; 832×480 A 39.23 vs D 36.42, gap −2.81 against a
+///    combined 2·SEM of **22.38**. A previous wording read this as a falsification ("the dose-response
+///    runs the wrong way; eviction is not the mechanism") — that rule was one-sided and got *easier* to
+///    satisfy as the data got noisier, and it has been replaced by a symmetric one.
+///
+///    **What the design can exclude:** a window contribution larger than **7.92/255** at 640×384 (29%
+///    of row A's drift) and **22.38/255** at 832×480 (57%). Nothing smaller, in either direction.
+///
+///    **What it cannot exclude, by construction:** window 6 → 15 at 45 latent frames takes the eviction
+///    count from **13 to 10 — a 23% reduction, not a halving**. A mechanism linear in the roll count
+///    would therefore move the score by ~6.3/255 at 640×384, *below* that bucket's own 7.92 resolution.
+///    The dose ladder is too short to falsify the hypothesis it was being used to falsify. A real
+///    ladder needs a longer clip or a third window width; that is follow-up work, not a claim this
+///    sweep supports.
+///
+///    Row E (the checkpoint's *global* window, zero evictions, 34.06) is **not** evidence here and is
+///    no longer cited as such: different attention mask, out of regime, `n = 1`, no variance estimate.
+///
+/// **A `sink_size` anchor is therefore still NOT wired.** The sink rows do read lower (B 19.25,
+/// C 13.21), but the comparison is not resolvable at this sample size: C is 3.30/255 from the repair
+/// threshold inside a combined 2·SEM of 11.76 — resolving it would take roughly fifty seeds per
+/// configuration, not three. Buying permanently-resident KV (+0.83 GiB for one latent frame, +2.20 GiB
+/// for three, measured) on an unresolved comparison is not warranted. The knob remains fully plumbed
 /// ([`crate::KreaArConfig::sink_size`] → `sink_tokens()` → `CausalKvCache`, and readable from
 /// `config.json`), so a future checkpoint that ships a non-zero sink is honoured without code changes.
 /// The reference's *pixel* re-anchor stays out for the structural reason above.
@@ -381,9 +405,20 @@ pub fn decode_latents_to_video(
 /// tier (q4), three seeds, 45 latent frames, and only the drift modes the descriptor can see (global
 /// tone, global colour including the opponent axes, and a 5×5 block-luma spread). It says nothing about
 /// semantic or identity drift, texture degradation, or motion quality beyond a freeze check. No row
-/// froze (tail motion 6.6–9.9/255 per frame). The seed-to-seed scatter is the same order as the
-/// configuration-to-configuration differences, so **this sweep ranks nothing except row A against the
-/// budget and row D against row A**; every other ordering in the table is inside the noise.
+/// froze (tail motion 6.6–9.9/255 per frame).
+///
+/// The seed-to-seed scatter is the same order as the configuration-to-configuration differences, so
+/// **the only ranking this sweep supports is row A against the budget.** Every ordering *between* rows
+/// in the table — A vs D, A vs the sinks, and anything involving row E — is inside the noise and is
+/// reported as unresolved rather than ranked.
+///
+/// The budget itself is bracketed by **synthetic** controls only (motion/jitter 2.81, weakest failure
+/// shape 11.37). There is no measured same-content floor: row Z, the within-regime zero-eviction row,
+/// runs at 29.63/100f over a 12-output-frame post segment against row A's 15.56/100f over 156, so its
+/// short-segment slope is *higher* and extrapolating it over-predicts row A's own measured drift by
+/// ~1.9×. Row Z cannot be lengthened either — the shipped 6-latent-frame window evicts as soon as a
+/// clip passes 6 latent frames. "Past the budget" therefore means past an absolute number pinned by
+/// synthetic stimuli, not past a measured baseline of the same content.
 #[allow(clippy::too_many_arguments)]
 pub fn generate_t2v_from_components(
     transformer: &CausalKreaTransformer,
