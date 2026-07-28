@@ -332,6 +332,21 @@ gates a **non-integer** index and says nothing about an index that is missing al
 | native `rank` metadata absent / non-integer / `0` | green | **RED** — same |
 | native `alpha` metadata absent / non-numeric | green | **RED** — same |
 | PEFT `adapter_config.json` not UTF-8, or not JSON, or not an object | green | **RED** — `a_malformed_peft_config_is_refused_rather_than_defaulted` |
+| native `parse_alpha`'s `!alpha.is_finite()` deleted | green | **RED** — `native_metadata_declarations_are_required_not_defaulted` |
+| native `parse_filter(metadata.get("include"))?` → `.unwrap_or_default()` | green | **RED** — same |
+| native `parse_filter(metadata.get("exclude"))?` → `.unwrap_or_default()` | green | **RED** — same |
+| native non-object `__metadata__` refusal → fall back to empty metadata | green | **RED** — same |
+| PEFT `json_filter(config.get("exclude_modules"))?` → `.unwrap_or_default()` | green | **RED** — `a_malformed_peft_config_is_refused_rather_than_defaulted` |
+
+The last five rows were **not** found by reading the code. They were found by an independent
+mutation sweep run against this branch after the previous revision claimed completeness, and every
+one of them is the same shape as the hole this section exists to describe: one arm of a pair gated,
+the sibling dark. `parse_alpha`'s finiteness guard was ungated while its PEFT twin (the `1e400` row)
+was RED — the native mirror only tried `"loud"`, which dies one step earlier at `parse`, so an
+`alpha = inf` would have folded `inf` into every targeted weight. `exclude_modules` was ungated
+while `target_modules` at the adjacent call site was RED, so an adapter with a malformed exclude
+list folds into precisely the modules its author excluded. Both native `parse_filter` call sites
+were ungated, leaving no native filter-parse failure with any witness at all.
 
 Two notes on making these discriminating, both learned by watching a case pass under the mutation:
 
@@ -348,11 +363,66 @@ is genuinely **optional** in a PEFT config and defaults to `"lora"`, because tha
 PEFT writes, while a native file is written by this crate and declares its type. That asymmetry is
 real, so it does not belong in a table whose contract is "both readers, same rule".
 
-The full sweep covered all fifteen refusals reachable in `load_peft`; each is now RED under a
-mutation that neuters it. The two remaining `?` sites in that function — `MmapedSafetensors::new`
-and `file.load` — are error propagation with no fallback branch to neuter; the missing-sidecar case
-ahead of them is gated by `a_peft_directory_round_trips_the_whole_family` (`weights.is_file() &&
-config.is_file()` → `true` is RED there).
+### The sweep, re-measured — and a correction
+
+An earlier revision of this document, and the commit message of `bf597d88`, both said the sweep had
+covered **all fifteen** refusals reachable in `load_peft` and **thirteen** native ones, each RED
+under a mutation that neuters it. Both figures were wrong, and the completeness claim attached to
+them was false. It was falsified by an independent mutation sweep run afterwards, not by anyone
+re-reading the code: three reachable refusals — native `parse_alpha`'s finiteness guard, PEFT's
+`json_filter(exclude_modules)`, and both native `parse_filter` call sites — survived being neutered
+with the suite still green. Each of those now has a witness (the last five rows of the table), and
+this section states what was measured rather than restating a tidier number.
+
+The numbers below come from re-running the whole sweep against this branch: one mutation per site,
+applied to `src/adapters.rs` in isolation, `--test adapters` run after each, and the source restored
+between runs. A "refusal site" is one `return Err` / `ok_or_else` / `map_err` reachable from a
+reader, counted individually — so `parse_rank`'s three refusals are three sites, not one. That is a
+stricter unit than the earlier figures used, which is part of why they do not simply go up by three.
+
+| reader | refusal sites | RED under a mutation that neuters them | still ungated |
+|---|---|---|---|
+| `load_native` | 19 | 18 | 1 |
+| `load_peft` | 17 | 15 | 2 |
+| distinct (two sites are shared) | **34** | **31** | **3** |
+
+`finish_modules`' empty-modules refusal and `resolve_adapter_type`'s unknown-type refusal are the
+two shared sites, counted once per reader above and once in the distinct row.
+
+The three that are still ungated, named rather than rounded away:
+
+* **PEFT `read_to_string(adapter_config.json)`** and **PEFT `serde_json::from_str`**. Neutering
+  either one to a fallback leaves the file refused anyway, one step further along — an unreadable
+  config becomes an empty string that fails to parse, and an unparseable config becomes
+  `Value::Null` whose `get("r")` is `None`. That is measured, not assumed: under both mutations the
+  "invalid UTF-8" and "not JSON at all" rows still observed a refusal and the suite stayed green.
+  So no adapter loads that would not have loaded before; what is missing is a witness pinning the
+  refusal to *this* site rather than the one behind it.
+* **`collect_native_modules`' "carries {name} twice"** (the `seen` set). No fixture exercises it and
+  none was written. Reading the path: `MmapedSafetensors::new` here opens a single file, that
+  file's header is parsed as a JSON object, and `file.tensors()` yields one entry per key — so the
+  input this refusal is written against is not one the suite could hand it through the normal
+  loader. It is left as-is and recorded here rather than gated with a fixture that would have to
+  bypass the reader to construct its input.
+
+Two `?` sites in each reader are not counted as refusals at all: `MmapedSafetensors::new` and
+`file.load` propagate an error with no fallback branch to neuter. The missing-sidecar case ahead of
+them is gated by `a_peft_directory_round_trips_the_whole_family` (`weights.is_file() &&
+config.is_file()` → `true` is RED there). `expand_bracket_ranges`' own six refusals are reached
+through both filter parsers and carry their own gate,
+`bracket_ranges_expand_and_malformed_ones_are_refused`.
+
+### One row in the shared table is looser than the rest
+
+`both_readers_enforce_the_same_tensor_level_rules` matches an expected substring per row. The
+"missing middle segment" row expects the bare word `segment`, because the two readers word that
+refusal differently — native "without an adapter index segment", PEFT "with no factor segment" —
+and `segment` is their longest shared substring. The adjacent `NATIVE_FACTORS` refusal also contains
+it, so neutering the rule under test leaves that row failing on the substring rather than on
+acceptance. The row is still RED; it is over-strict, not under-strict. Tightening it needs a
+per-reader expected substring instead of one shared field, which changes the table's shape, so it is
+recorded here rather than done. The sibling "no separator" row was tightened from `unparseable` to
+`has unparseable tensor`, which needed no shape change.
 
 ## CI
 

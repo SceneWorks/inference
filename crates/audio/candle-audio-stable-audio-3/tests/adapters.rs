@@ -1700,6 +1700,15 @@ fn a_malformed_peft_config_is_refused_rather_than_defaulted() {
             "non-array target_modules",
             serde_json::json!({"r": 2, "lora_alpha": 4.0, "target_modules": 7}),
         ),
+        // `exclude_modules` goes through the same `json_filter`, and its call site was ungated
+        // while `target_modules`' was RED — one arm gated, the sibling dark, the same class of hole
+        // this whole case exists to close. Dropping this filter is worse than dropping `include`:
+        // an adapter whose `exclude_modules` is silently defaulted to empty folds into precisely
+        // the modules its author named as must-not-touch, and every surface reports success.
+        (
+            "non-array exclude_modules",
+            serde_json::json!({"r": 2, "lora_alpha": 4.0, "exclude_modules": 7}),
+        ),
     ] {
         std::fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap())
             .expect("write config");
@@ -1994,7 +2003,7 @@ fn both_readers_enforce_the_same_tensor_level_rules() {
             declared: "lora",
             native: vec![("loraA".to_string(), a.0.clone(), a.1.clone())],
             peft: vec![("loraA".to_string(), a.0.clone(), a.1.clone())],
-            expect: "unparseable",
+            expect: "has unparseable tensor",
         },
         // A name that splits once and then runs out: native loses its index segment, PEFT loses its
         // factor segment. Either way the remaining text is not a target stem.
@@ -2004,6 +2013,15 @@ fn both_readers_enforce_the_same_tensor_level_rules() {
         // known factor — so it does not discriminate. `lora_A.weight` salvages a name that *is* a
         // known factor, so dropping the refusal makes the file load, under the nonsense target key
         // `lora_A.weight`.
+        //
+        // `expect` is the bare word "segment" because the two readers word this refusal
+        // differently — native says "without an adapter index segment", PEFT "with no factor
+        // segment" — and "segment" is their longest shared substring. It is looser than the other
+        // rows: the adjacent `NATIVE_FACTORS` refusal also contains "segment", so neutering the
+        // rule under test leaves this row failing on the substring rather than on acceptance. That
+        // is over-strict, not under-strict — the row is still RED — but tightening it needs a
+        // per-reader expected substring rather than one shared field, which is a change to the
+        // table's shape and is deliberately not made here.
         TwoReaderRefusal {
             rule: "a tensor name missing its middle segment",
             declared: "lora",
@@ -2119,7 +2137,29 @@ fn native_metadata_declarations_are_required_not_defaulted() {
     }
 
     // A present-but-unparseable `rank` or `alpha` is refused too, not silently coerced.
-    for (key, value) in [("rank", "two"), ("alpha", "loud"), ("rank", "0")] {
+    //
+    // `alpha` carries two rows because it has two guards and only one of them is reachable by a
+    // non-numeric spelling. `"loud"` dies at `parse`, so it leaves the `is_finite` guard behind it
+    // ungated — deleting that guard was green. `"inf"` parses *successfully* as an `f32`, which is
+    // the only way to reach it: without the guard a native adapter declaring `alpha = inf` loads
+    // and folds `inf` into every targeted weight. The PEFT sibling of this row is the `1e400` case
+    // in `a_malformed_peft_config_is_refused_rather_than_defaulted`, which had to be spelled as an
+    // overflowing literal because JSON has no infinity token; native metadata is plain strings, so
+    // here the word itself is enough.
+    //
+    // The `include`/`exclude` rows gate the two `parse_filter` call sites. Both were ungated:
+    // `.unwrap_or_default()` on either one was green, and a dropped filter is not inert — an
+    // adapter with an unreadable `exclude` folds into exactly the modules its author excluded, and
+    // one with an unreadable `include` folds into every target instead of the chosen few. An
+    // inverted bracket range is malformed for both keys, so one spelling covers both call sites.
+    for (key, value) in [
+        ("rank", "two"),
+        ("alpha", "loud"),
+        ("alpha", "inf"),
+        ("rank", "0"),
+        ("include", "layers.[3-0]"),
+        ("exclude", "layers.[3-0]"),
+    ] {
         let entries: Vec<(&str, &str)> = good
             .iter()
             .copied()
@@ -2129,6 +2169,47 @@ fn native_metadata_declarations_are_required_not_defaulted() {
         assert!(
             load_adapter(&spec(&path, 1.0), &Device::Cpu).is_err(),
             "a native adapter declaring `{key}` as {value:?} was accepted"
+        );
+    }
+
+    // `__metadata__` present but not an object at all. `write_raw_safetensors` cannot spell this —
+    // the safetensors writer always emits an object — so the file is assembled by hand: an 8-byte
+    // little-endian header length, the header JSON, then the tensor data.
+    //
+    // This row asserts the refusal *message*, not merely that a refusal happened, because the two
+    // are not the same thing here. Reading the non-object as empty metadata does not make the file
+    // load: it fails one step later on the missing `adapter_type`, so an `is_err()` row would hold
+    // either way and the site would stay dark. The message is what separates the rule under test
+    // from the one standing behind it.
+    {
+        let odd = dir.join("non-object-metadata.safetensors");
+        let values = fill(2, 4, 1.0);
+        let data: Vec<u8> = values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        let mut header = serde_json::Map::new();
+        header.insert("__metadata__".to_string(), serde_json::json!(7));
+        header.insert(
+            format!("{stem}.0.lora_A"),
+            serde_json::json!({
+                "dtype": "F32",
+                "shape": [2, 4],
+                "data_offsets": [0, data.len()],
+            }),
+        );
+        let header = serde_json::to_vec(&serde_json::Value::Object(header)).expect("header bytes");
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(&header);
+        bytes.extend_from_slice(&data);
+        std::fs::write(&odd, &bytes).expect("write non-object metadata");
+        let error = load_adapter(&spec(&odd, 1.0), &Device::Cpu)
+            .expect_err("a native adapter whose `__metadata__` is not an object was accepted")
+            .to_string();
+        assert!(
+            error.contains("non-object safetensors __metadata__"),
+            "the file was refused, but one step later than the rule under test: a non-object \
+             `__metadata__` was read as empty metadata instead of refused. {error}"
         );
     }
 
