@@ -659,16 +659,26 @@ pub(crate) fn render_three_stage(
     let memory = req.memory.unwrap_or_default();
     candle_gen::check_cancel(&req.cancel)?;
 
-    on_progress(Progress::Loading(gen_core::LoadPhase::TextEncoder));
-    maybe_inject_calibration_error(memory, gen_core::ImageMemoryPhase::Conditioning)?;
+    enter_loading_boundary(
+        req,
+        memory,
+        gen_core::LoadPhase::TextEncoder,
+        gen_core::ImageMemoryPhase::Conditioning,
+        on_progress,
+    )?;
     let text = load_text(root, device)?;
     let context = encode_prompt_context(&text, req)?;
     device.synchronize()?;
     drop(text);
 
     candle_gen::check_cancel(&req.cancel)?;
-    on_progress(Progress::Loading(gen_core::LoadPhase::Renderer));
-    maybe_inject_calibration_error(memory, gen_core::ImageMemoryPhase::Denoise)?;
+    enter_loading_boundary(
+        req,
+        memory,
+        gen_core::LoadPhase::Renderer,
+        gen_core::ImageMemoryPhase::Denoise,
+        on_progress,
+    )?;
     let dit = load_dit(root, device, adapters, memory.stream_transformer_blocks)?;
     let steps = req.steps.map(|s| s as usize).unwrap_or(TURBO_STEPS);
     let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
@@ -736,6 +746,20 @@ fn enter_decode_boundary(
     // flag raised there before starting the expensive, otherwise non-interruptible VAE decode.
     candle_gen::check_cancel(&req.cancel)?;
     maybe_inject_calibration_error(memory, gen_core::ImageMemoryPhase::Decode)
+}
+
+fn enter_loading_boundary(
+    req: &GenerationRequest,
+    memory: gen_core::GenerationMemory,
+    load_phase: gen_core::LoadPhase,
+    memory_phase: gen_core::ImageMemoryPhase,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<()> {
+    on_progress(Progress::Loading(load_phase));
+    // Loading is a public phase boundary too. A cancellation raised by its callback must stop before
+    // opening or materializing the next multi-GB component.
+    candle_gen::check_cancel(&req.cancel)?;
+    maybe_inject_calibration_error(memory, memory_phase)
 }
 
 fn maybe_inject_calibration_error(
@@ -1973,6 +1997,38 @@ mod tests {
         )
         .expect_err("decode-boundary cancellation must be observed");
         assert!(matches!(error, CandleError::Canceled));
+    }
+
+    #[test]
+    fn loading_progress_callbacks_can_cancel_before_component_loads_start() {
+        for (load_phase, memory_phase) in [
+            (
+                gen_core::LoadPhase::TextEncoder,
+                gen_core::ImageMemoryPhase::Conditioning,
+            ),
+            (
+                gen_core::LoadPhase::Renderer,
+                gen_core::ImageMemoryPhase::Denoise,
+            ),
+        ] {
+            let request = GenerationRequest {
+                prompt: "test".to_owned(),
+                ..Default::default()
+            };
+            let cancel = request.cancel.clone();
+            let error = enter_loading_boundary(
+                &request,
+                gen_core::GenerationMemory::default(),
+                load_phase,
+                memory_phase,
+                &mut |progress| {
+                    assert_eq!(progress, Progress::Loading(load_phase));
+                    cancel.cancel();
+                },
+            )
+            .expect_err("loading-boundary cancellation must be observed");
+            assert!(matches!(error, CandleError::Canceled));
+        }
     }
 
     /// sc-12828: `load_text` stores the Qwen3-VL TE at **bf16**, not f32 — the deliberate, non-default
