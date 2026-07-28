@@ -216,6 +216,7 @@ fn control_denoise_loop_matches_golden() {
         scale,
         0,
         AttentionBudget::UNBOUNDED,
+        None,
         &Default::default(),
         &mut |_| {},
     )
@@ -278,6 +279,7 @@ fn control_dtype_compare() {
             scale,
             0,
             AttentionBudget::UNBOUNDED,
+            None,
             &Default::default(),
             &mut |_| {},
         )
@@ -401,6 +403,7 @@ fn control_q8_transformer_matches_golden() {
         scale,
         0,
         AttentionBudget::UNBOUNDED,
+        None,
         &Default::default(),
         &mut |_| {},
     )
@@ -616,6 +619,7 @@ fn control_q8_determinism() {
             scale,
             0,
             AttentionBudget::UNBOUNDED,
+            None,
             &Default::default(),
             &mut |_| {},
         )

@@ -212,6 +212,9 @@ pub(crate) fn load_control_heavy(
     if !spec.adapters.is_empty() {
         crate::adapters::apply_z_image_adapters(&mut transformer, &spec.adapters)?;
     }
+    // SC-15754: capture the base blocks' final adapter state for the rung-4 stream (see
+    // `model::load_heavy`). The control branch carries none by construction.
+    transformer.capture_block_adapters();
     Ok(ZImageControlHeavyOwned { transformer, vae })
 }
 
@@ -361,6 +364,11 @@ impl ZImageTurboControl {
         // SC-15615 ladder rung 3: the shared selector's request-scoped attention budget. Unbounded
         // unless this request selected bounded attention, so the default forward is unchanged.
         let attention_budget = pipeline::attention_budget(req);
+        // SC-15754 ladder rung 4: the request-scoped transformer-residency window. `None` unless this
+        // request selected it; a selection on a non-Sequential generator is rejected rather than
+        // silently degraded (see `pipeline::resolve_block_window`).
+        let block_window =
+            pipeline::resolve_block_window(req, self.residency.is_sequential(), MODEL_ID)?;
         let images = self.residency.run_staged(
             &req.cancel,
             // No PiD overlay on the control path (sc-7846 is base-turbo-only); the heavy loader ignores
@@ -448,6 +456,7 @@ impl ZImageTurboControl {
                             control_scale,
                             start_step,
                             attention_budget,
+                            block_window,
                             &req.cancel,
                             op,
                         )

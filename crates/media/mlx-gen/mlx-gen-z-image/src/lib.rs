@@ -15,6 +15,10 @@
 
 pub mod adapters;
 pub mod attention;
+// Ladder rung 4 (SC-15754): the family half of bounded transformer residency — how a Z-Image block is
+// rebuilt from its snapshot, quantized and adapted like its resident twin. The window lifecycle itself
+// is the shared `mlx_gen::block_residency` (SC-15750), never re-implemented here.
+mod block_stream;
 mod comfyui;
 pub mod context_block;
 pub mod control_transformer;
@@ -176,7 +180,10 @@ mod explicit_registry_tests {
         };
 
         let registry = super::provider_registry().unwrap();
-        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        // SC-15754: rung 4 is declared per LOAD — a re-openable snapshot dir loaded `Sequential`.
+        // The registry must hand back the same contract the direct builder produces for that load.
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()))
+            .with_offload_policy(mlx_gen::OffloadPolicy::Sequential);
         for id in [
             "z_image_turbo",
             "z_image",
@@ -194,13 +201,17 @@ mod explicit_registry_tests {
                 "{id}"
             );
             // The registry-resolved contract must be the same one the direct builder produces —
-            // rung 3 selectable with its recorded parameter, rung 4 honestly Missing.
-            assert!(matches!(
-                contract
-                    .capability(ImageMemoryStrategy::BoundedAttention)
-                    .map(|c| &c.support),
-                Some(ImageMemoryStrategySupport::Implemented)
-            ));
+            // every rung Implemented on a snapshot load (SC-15510 / SC-15754), each with its
+            // recorded parameter domain.
+            for strategy in ImageMemoryStrategy::ALL {
+                assert!(
+                    matches!(
+                        contract.capability(strategy).map(|c| &c.support),
+                        Some(ImageMemoryStrategySupport::Implemented)
+                    ),
+                    "{id}: {strategy:?}"
+                );
+            }
             assert_eq!(
                 contract
                     .capability(ImageMemoryStrategy::BoundedAttention)
@@ -210,12 +221,25 @@ mod explicit_registry_tests {
                 vec![super::image_memory::ATTENTION_CHUNK_SIZE],
                 "{id}"
             );
-            assert!(matches!(
+            assert_eq!(
                 contract
                     .capability(ImageMemoryStrategy::BoundedTransformerResidency)
-                    .map(|c| &c.support),
-                Some(ImageMemoryStrategySupport::Missing)
-            ));
+                    .unwrap()
+                    .parameters
+                    .transformer_window_sizes,
+                super::image_memory::TRANSFORMER_WINDOW_SIZES.to_vec(),
+                "{id}"
+            );
+            assert!(
+                contract
+                    .capability(ImageMemoryStrategy::BoundedDecode)
+                    .unwrap()
+                    .parameters
+                    .decode_tile_edges
+                    .len()
+                    > 1,
+                "{id}: the decode ladder must be sweepable, not a single point"
+            );
         }
     }
 }
