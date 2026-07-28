@@ -14,8 +14,12 @@
 //! | full SA3 | `conditioner.` | `conditioner` |
 //! | standalone SAME | `encoder.` / `decoder.` / `bottleneck.` | matching root |
 //!
-//! `svd_bases.pt` is intentionally absent from the required-file list: some base repositories
-//! carry that training artifact, but no inference component consumes it.
+//! `svd_bases.pt` is intentionally absent from the required-file list, and is never read. Some base
+//! repositories carry it; it is a **startup cache** for the SVD that `crate::adapters`' four `-xs`
+//! types need, not a correctness requirement — [`crate::svd`] computes that decomposition itself.
+//! It also ships as a pickle, which `crate::adapters::AdapterSource::classify` refuses outright, so
+//! nothing has to special-case it. (Before sc-14550 this note said no inference component consumes
+//! it; that was right about the *file* and wrong about the *math*.)
 
 use std::collections::HashMap;
 use std::fs::File;
