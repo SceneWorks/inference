@@ -1001,6 +1001,33 @@ jobs:
           # `docs/migration/SC_14548_AUDIO_EDIT_INPAINT.md`.
           cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
             --test audio_edit -- --ignored --nocapture
+      - name: Prove the load-time adapter fold on all six checkpoints
+        run: |
+          # sc-14550. This job and its CUDA twin are the only lanes provisioning all six snapshots.
+          #
+          # ⚠ These cases do NOT validate a real adapter artifact. **None exists** — there is no
+          # Stable Audio 3 adapter of any type in any cache, and no published community one
+          # (sc-15347). Every adapter here is synthesized by the test against the real checkpoint's
+          # own safetensors header, in the format `src/adapters.rs` declares. What they prove is
+          # that the resolved plan reaches the real backend — including Metal's packed-buffer
+          # `SimpleBackend`, which is a different object from CPU/CUDA's mmap and is exercised in no
+          # other lane — and that the fold changes the rendered audio.
+          #
+          # The gates are the two exactly-signed ones, never a threshold:
+          #   * a `scale == 0.0` request renders **byte-identical** audio to a request with no
+          #     adapters at all. Exactly zero difference; a fold that ran at all breaks it.
+          #   * two adapters differing only in their factor values render **different** audio.
+          # "Adapted differs from un-adapted" appears only as a liveness check, because a
+          # *misapplied* adapter differs too — that is sc-14548's wrong-sign lesson applied up front.
+          #
+          # `real_lora_xs_folds_through_the_host_svd` is deliberately scoped to the conditioner's
+          # single [768, 256] Linear. Candle has no `linalg.svd`, so the `-xs` family computes one on
+          # the host in f64 (never on the accelerator, which is what makes it cross-platform
+          # deterministic by construction). Measured: ~1.9 s for [768, 256], ~113 s for
+          # [1024, 1024]. Covering the DiT's attention stack would be a multi-hour cold start; the
+          # math is identical at either scale and only the wall clock is not.
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
+            --test adapters -- --ignored --nocapture
 
   sa3-small-base-metal:
     name: Stable Audio 3 small base providers (Metal)
@@ -1675,6 +1702,21 @@ jobs:
           rem reaches the three weights-only edit sites named in
           rem docs/migration/SC_14548_AUDIO_EDIT_INPAINT.md.
           cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --test audio_edit -- --ignored --nocapture || exit /b 1
+      - name: Prove the load-time adapter fold on all six checkpoints
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          rem sc-14550. This job and its Metal twin are the only lanes provisioning all six
+          rem snapshots. These cases do NOT validate a real adapter artifact -- none exists
+          rem (sc-15347); every adapter is synthesized by the test against the real checkpoint's own
+          rem safetensors header. What they prove is that the resolved plan reaches the real backend
+          rem and that the fold changes the rendered audio. The two gates are exactly signed: a
+          rem scale-0.0 request renders byte-identical audio to a request with no adapters, and two
+          rem adapters differing only in their factors render different audio. "Adapted differs from
+          rem un-adapted" is liveness only, because a misapplied adapter differs too.
+          rem The -xs case is scoped to the conditioner's [768, 256] Linear: the deterministic host
+          rem f64 SVD costs ~1.9 s there and ~113 s at [1024, 1024].
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --test adapters -- --ignored --nocapture || exit /b 1
 
   sa3-small-base-cuda:
     name: Stable Audio 3 small base providers (CUDA)

@@ -14,8 +14,12 @@
 //! | full SA3 | `conditioner.` | `conditioner` |
 //! | standalone SAME | `encoder.` / `decoder.` / `bottleneck.` | matching root |
 //!
-//! `svd_bases.pt` is intentionally absent from the required-file list: some base repositories
-//! carry that training artifact, but no inference component consumes it.
+//! `svd_bases.pt` is intentionally absent from the required-file list, and is never read. Some base
+//! repositories carry it; it is a **startup cache** for the SVD that `crate::adapters`' four `-xs`
+//! types need, not a correctness requirement — [`crate::svd`] computes that decomposition itself.
+//! It also ships as a pickle, which `crate::adapters::AdapterSource::classify` refuses outright, so
+//! nothing has to special-case it. (Before sc-14550 this note said no inference component consumes
+//! it; that was right about the *file* and wrong about the *math*.)
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -198,23 +202,62 @@ impl SnapshotLayout {
         text_dtype: DType,
         device: &Device,
     ) -> Result<StableAudioVarBuilders<'static>> {
+        self.full_pipeline_builders_with_adapters(root_dtype, text_dtype, device, None)
+    }
+
+    /// [`Self::full_pipeline_builders`], with a resolved adapter stack folded into the root
+    /// checkpoint's weights as they are served (sc-14550).
+    ///
+    /// # The two structural guarantees this signature carries
+    ///
+    /// 1. **`None` is the identical object graph as before.** The wrapper is installed only for a
+    ///    non-empty plan, so a request with no adapters — or one whose every adapter has
+    ///    `scale == 0.0`, which [`crate::adapters::plan_for`] resolves to an empty plan — takes the
+    ///    unmodified mmap/packed path and produces byte-identical weights. There is no
+    ///    "multiply by zero" anywhere.
+    /// 2. **T5Gemma is unreachable.** `text_encoder` is built from a *different file* with its own
+    ///    backend and is never wrapped. No adapter key, however spelled, can reach a text-encoder
+    ///    tensor, because the backend that serves them has no plan to consult.
+    ///
+    /// SAME (`pretransform.…`) *is* in the wrapped file, and is excluded by
+    /// [`crate::adapters::is_adaptable_target`] instead — an adapter naming one fails at plan time.
+    pub fn full_pipeline_builders_with_adapters(
+        &self,
+        root_dtype: DType,
+        text_dtype: DType,
+        device: &Device,
+        adapters: Option<&crate::adapters::AdapterPlan>,
+    ) -> Result<StableAudioVarBuilders<'static>> {
         if self.kind != SnapshotKind::Full {
             return Err(AudioError::Msg(
                 "full pipeline builders require a full Stable Audio 3 snapshot".into(),
             ));
         }
         let metal = matches!(device, Device::Metal(_));
-        let root = if metal {
-            packed_metal_builder(&self.weights_path, root_dtype, device, None)?
+        let root_backend = if metal {
+            packed_metal_backend(&self.weights_path, root_dtype, device, None)?
         } else {
-            mmap_builder(&self.weights_path, root_dtype, device, false)?
+            mmap_backend(&self.weights_path)?
         };
+        let root_backend = match adapters {
+            Some(plan) if !plan.is_empty() => Box::new(crate::adapters::AdapterBackend::new(
+                root_backend,
+                plan.clone(),
+            ))
+                as Box<dyn candle_nn::var_builder::SimpleBackend>,
+            _ => root_backend,
+        };
+        let root = VarBuilder::from_backend(root_backend, root_dtype, device.clone());
         let text_path = self
             .text_weights_path
             .as_deref()
             .ok_or_else(|| AudioError::Msg("full snapshot has no text weights".into()))?;
         let text_encoder = if metal {
-            packed_metal_builder(text_path, text_dtype, device, Some("model.encoder."))?
+            VarBuilder::from_backend(
+                packed_metal_backend(text_path, text_dtype, device, Some("model.encoder."))?,
+                text_dtype,
+                device.clone(),
+            )
         } else {
             mmap_builder(text_path, text_dtype, device, false)?
         };
@@ -246,7 +289,7 @@ fn packs_root_on_metal(kind: SnapshotKind) -> bool {
 ///
 /// * **Metal fails the copy.** `MetalDevice::new_buffer_with_data` passes the byte length straight
 ///   through, and `newBufferWithBytes:length:0` returns nil, surfacing as
-///   `Metal error Failed to create metal resource: Buffer`. The [`packed_metal_builder`] path is
+///   `Metal error Failed to create metal resource: Buffer`. The [`packed_metal_backend`] path is
 ///   immune because it concatenates on the host and hands out `narrow` views, so an empty tensor
 ///   becomes a zero-length view into a non-empty buffer — which is why the standalone SAME-L Metal
 ///   lane was green while the embedded case, which uses this backend, was not.
@@ -314,18 +357,24 @@ fn mmap_builder(
     device: &Device,
     pack_on_metal: bool,
 ) -> Result<VarBuilder<'static>> {
-    if pack_on_metal && matches!(device, Device::Metal(_)) {
-        packed_metal_builder(path, dtype, device, None)
+    let backend = if pack_on_metal && matches!(device, Device::Metal(_)) {
+        packed_metal_backend(path, dtype, device, None)?
     } else {
-        // Safety: callers of SnapshotLayout require an immutable snapshot. The returned backend
-        // owns its mmap for the lifetime of the 'static VarBuilder.
-        let safetensors = unsafe { MmapedSafetensors::new(path)? };
-        Ok(VarBuilder::from_backend(
-            Box::new(ZeroElementSafeMmap { inner: safetensors }),
-            dtype,
-            device.clone(),
-        ))
-    }
+        mmap_backend(path)?
+    };
+    Ok(VarBuilder::from_backend(backend, dtype, device.clone()))
+}
+
+/// The raw mmap backend, before it is wrapped in a [`VarBuilder`].
+///
+/// Split out so [`SnapshotLayout::full_pipeline_builders_with_adapters`] can interpose
+/// [`crate::adapters::AdapterBackend`] between the mmap and the builder. Nothing else changed: the
+/// no-adapter path composes exactly the same backend it always did.
+fn mmap_backend(path: &Path) -> Result<Box<dyn candle_nn::var_builder::SimpleBackend>> {
+    // Safety: callers of SnapshotLayout require an immutable snapshot. The returned backend
+    // owns its mmap for the lifetime of the 'static VarBuilder.
+    let safetensors = unsafe { MmapedSafetensors::new(path)? };
+    Ok(Box::new(ZeroElementSafeMmap { inner: safetensors }))
 }
 
 /// Coalesce persisted weights into bounded shared-storage packs on Metal.
@@ -335,12 +384,12 @@ fn mmap_builder(
 /// tensors load. Packing preserves independently shaped tensor views while reducing persistent
 /// Metal resources to a few dozen bounded buffers. Full checkpoints stay on the lazy mmap path so
 /// component-only loaders do not eagerly materialize unrelated autoencoder, DiT, or text weights.
-fn packed_metal_builder(
+fn packed_metal_backend(
     path: &Path,
     dtype: DType,
     device: &Device,
     prefix: Option<&str>,
-) -> Result<VarBuilder<'static>> {
+) -> Result<Box<dyn candle_nn::var_builder::SimpleBackend>> {
     // Safety: SnapshotLayout requires this file to remain immutable for the duration of loading.
     // All values are copied into owned Candle storage before this function returns.
     let safetensors = unsafe { MmapedSafetensors::new(path)? };
@@ -377,7 +426,7 @@ fn packed_metal_builder(
     }
     flush_weight_pack(&mut pending, &mut tensors, device)?;
 
-    Ok(VarBuilder::from_tensors(tensors, dtype, device))
+    Ok(Box::new(tensors))
 }
 
 fn flush_weight_pack(
@@ -625,6 +674,46 @@ pub fn safetensors_keys(path: &Path) -> Result<Vec<String>> {
         .collect();
     keys.sort();
     Ok(keys)
+}
+
+/// Read only the safetensors header and return each tensor's persisted shape.
+///
+/// Used by [`crate::adapters`] to build the adaptable-target set without touching tensor data: an
+/// adapter is matched, shape-checked and refused entirely from the header, so a mismatched adapter
+/// fails before a single weight is materialized.
+pub fn safetensors_shapes(path: &Path) -> Result<std::collections::BTreeMap<String, Vec<usize>>> {
+    let object = safetensors_header(path)?;
+    let mut out = std::collections::BTreeMap::new();
+    for (key, value) in object {
+        if key == "__metadata__" {
+            continue;
+        }
+        let shape = value
+            .get("shape")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| {
+                AudioError::Msg(format!("{} entry {key:?} has no shape", path.display()))
+            })?
+            .iter()
+            .map(|dim| {
+                dim.as_u64().map(|dim| dim as usize).ok_or_else(|| {
+                    AudioError::Msg(format!(
+                        "{} entry {key:?} has a non-integer dimension",
+                        path.display()
+                    ))
+                })
+            })
+            .collect::<Result<Vec<usize>>>()?;
+        out.insert(key, shape);
+    }
+    Ok(out)
+}
+
+/// The parsed safetensors header object, `__metadata__` included.
+pub fn safetensors_header_object(
+    path: &Path,
+) -> Result<serde_json::Map<String, serde_json::Value>> {
+    safetensors_header(path)
 }
 
 fn safetensors_header(path: &Path) -> Result<serde_json::Map<String, serde_json::Value>> {

@@ -97,6 +97,7 @@
 pub use candle_audio;
 pub use candle_audio::gen_core;
 
+pub mod adapters;
 pub mod config;
 pub mod dit;
 pub mod model;
@@ -106,6 +107,7 @@ pub mod pretransform;
 pub mod same;
 pub mod sampler;
 pub mod softnorm;
+pub mod svd;
 pub mod t5gemma;
 pub mod transformer;
 pub mod weight_norm;

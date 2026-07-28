@@ -352,6 +352,7 @@ dependencies = [
  "core-llm",
  "rand",
  "rand_distr",
+ "safetensors 0.4.5",
  "sceneworks-gen-core-testkit",
  "serde",
  "serde_json",

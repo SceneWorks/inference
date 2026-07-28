@@ -33,8 +33,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use candle_audio::candle_core::Device;
 use candle_audio::gen_core::{
-    self, AudioEditMode, AudioTrack, Capabilities, Conditioning, ConditioningKind,
+    self, AdapterSpec, AudioEditMode, AudioTrack, Capabilities, Conditioning, ConditioningKind,
     GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality, ModelDescriptor,
     OffloadPolicy, Precision, Progress, WeightsSource,
 };
@@ -1034,7 +1035,14 @@ pub fn descriptor_for(variant: Variant) -> ModelDescriptor {
                 // and no other descriptor in the repository needed to change.
                 ConditioningKind::AudioEditRegions,
             ],
-            supports_lora: false,
+            // sc-14550. The full eight-type native adapter family — `lora`, `dora-rows`,
+            // `dora-cols`, `bora` and their four `-xs` siblings — plus the legacy `dora` alias,
+            // stacked in request order and folded at load time. See [`crate::adapters`].
+            //
+            // `supports_lokr` stays false and `AdapterKind::Lokr` is refused as typed
+            // `Unsupported`: no published Stable Audio 3 adapter is a Kronecker factorization, and
+            // accepting one would mean guessing a decomposition this family does not have.
+            supports_lora: true,
             supports_lokr: false,
             samplers: vec!["pingpong", "euler", "rk4", "dpmpp"],
             schedulers: vec![],
@@ -1927,6 +1935,13 @@ pub struct StableAudio3Generator {
     variant: Variant,
     descriptor: ModelDescriptor,
     root: PathBuf,
+    /// The caller's adapter stack, in request order (sc-14550).
+    ///
+    /// Kept as *specs* rather than as a resolved plan because the plan's tensors must live on the
+    /// compute device, and the device is not chosen until the lazy [`Self::pipeline`] path runs.
+    /// `load_variant` still resolves the identical stack on the host first, so a malformed or
+    /// mismatched adapter fails at **load** rather than at first generate.
+    adapters: Vec<AdapterSpec>,
     pipeline: Mutex<Option<Arc<StableAudio3Pipeline>>>,
     generation: Mutex<()>,
 }
@@ -1962,10 +1977,12 @@ impl StableAudio3Generator {
         // window observes it between pins instead of after the full load.
         verify_snapshot_identity(self.variant, &layout.root, Some(cancel))?;
         let device = resolve_device(DevicePolicy::Default)?;
-        let pipeline = Arc::new(StableAudio3Pipeline::from_layout(
+        let plan = resolve_adapter_plan(&layout, &self.adapters, &device)?;
+        let pipeline = Arc::new(StableAudio3Pipeline::from_layout_with_adapters(
             &layout,
             self.variant.geometry(),
             &device,
+            &plan,
         )?);
         *guard = Some(pipeline.clone());
         Ok(pipeline)
@@ -1994,7 +2011,6 @@ pub fn load_variant(expected: Variant, spec: &LoadSpec) -> gen_core::Result<Stab
     };
     if spec.quantize.is_some()
         || spec.precision != Precision::Bf16
-        || !spec.adapters.is_empty()
         || spec.control.is_some()
         || !spec.extra_controls.is_empty()
         || spec.ip_adapter.is_some()
@@ -2008,17 +2024,52 @@ pub fn load_variant(expected: Variant, spec: &LoadSpec) -> gen_core::Result<Stab
             "{model_id} accepts only its native dense self-contained snapshot"
         )));
     }
+    // Judged before the snapshot is opened: a `Lokr` request, or one carrying LTX's `pass_scales`
+    // or Wan's `moe_expert`, is a statement about the request that reading the checkpoint cannot
+    // change. `load_adapter` calls the identical function, so the two paths cannot drift.
+    for adapter in &spec.adapters {
+        crate::adapters::validate_spec_shape(adapter).map_err(crate::adapters::into_unsupported)?;
+    }
     let layout = SnapshotLayout::from_dir(&root)?;
     crate::pipeline::validate_layout(&layout, expected.geometry())?;
     // No request is in flight on the load path, so there is no cancel flag to honour here.
     verify_snapshot_identity(expected, &layout.root, None)?;
+    // Resolve the adapter stack against this checkpoint *now*, on the host, and throw the result
+    // away. The plan the pipeline actually folds is rebuilt on the compute device, but doing the
+    // work here is what makes a malformed, mistyped, pickle-format, or key-mismatched adapter fail
+    // at `load_variant` — the moment the caller can still act on it — instead of at the first
+    // generate, minutes later, behind a snapshot hash and a cold start.
+    resolve_adapter_plan(&layout, &spec.adapters, &Device::Cpu)?;
     Ok(StableAudio3Generator {
         variant: expected,
         descriptor: descriptor_for(expected),
         root,
+        adapters: spec.adapters.clone(),
         pipeline: Mutex::new(None),
         generation: Mutex::new(()),
     })
+}
+
+/// Resolve a `LoadSpec` adapter stack against one snapshot, or return the empty plan.
+///
+/// Separated from both call sites so the load-time refusal and the device-time fold read the
+/// *same* function rather than two spellings of it — a divergence between them would be a load
+/// that accepts an adapter the fold then cannot apply, discovered only under weights.
+///
+/// The target set comes from the checkpoint's safetensors header alone, so nothing is materialized
+/// to decide whether an adapter matches.
+fn resolve_adapter_plan(
+    layout: &SnapshotLayout,
+    specs: &[AdapterSpec],
+    device: &Device,
+) -> gen_core::Result<crate::adapters::AdapterPlan> {
+    if specs.is_empty() {
+        return Ok(crate::adapters::AdapterPlan::default());
+    }
+    let header = crate::weights::safetensors_shapes(&layout.weights_path)
+        .map_err(crate::adapters::into_unsupported)?;
+    let targets = crate::adapters::adaptable_targets(&header);
+    crate::adapters::plan_for(specs, &targets, device).map_err(crate::adapters::into_unsupported)
 }
 
 pub fn load_generator(spec: &LoadSpec) -> gen_core::Result<StableAudio3Generator> {
@@ -2780,11 +2831,28 @@ mod tests {
             precision.precision = Precision::Fp32;
             specs.push(precision);
 
+            // sc-14550: a `Lora` adapter is no longer refused *as a shape* — the family is
+            // supported — but `Lokr` still is, and it is refused **before** the snapshot is opened,
+            // which is what this loop tests. The accepted-`Lora` half is gated weight-free in
+            // `tests/adapters.rs`; here the point is only that the pre-snapshot guard still names
+            // the kinds this provider cannot serve.
+            specs.push(dense().with_adapters(vec![AdapterSpec::new(
+                missing.clone(),
+                1.0,
+                AdapterKind::Lokr,
+            )]));
             specs.push(dense().with_adapters(vec![AdapterSpec::new(
                 missing.clone(),
                 1.0,
                 AdapterKind::Lora,
-            )]));
+            )
+            .with_pass_scales(vec![1.0, 0.5])]));
+            specs.push(dense().with_adapters(vec![AdapterSpec::new(
+                missing.clone(),
+                1.0,
+                AdapterKind::Lora,
+            )
+            .with_moe_expert(gen_core::MoeExpert::High)]));
             specs.push(dense().with_control(WeightsSource::File(missing.clone())));
             specs.push(dense().with_extra_control(WeightsSource::File(missing.clone())));
             specs.push(dense().with_ip_adapter(WeightsSource::Dir(missing.clone())));
