@@ -12,7 +12,9 @@
 use candle_gen::candle_core::{DType, Result, Tensor, D};
 use candle_gen::candle_nn::ops::softmax_last_dim;
 use candle_gen::candle_nn::{linear, Linear, Module, VarBuilder};
-use candle_gen::gen_core::tiling::{TileCandidates, TilingConfig, VaeTiling};
+use candle_gen::gen_core::tiling::{
+    TemporalOverlapPolicy, TileCandidates, TilingConfig, VaeTiling,
+};
 use candle_gen::gen_core::{CancelFlag, Progress};
 use candle_gen::{check_cancel, vae_tiling, Result as CResult};
 
@@ -92,6 +94,7 @@ fn plan_svd_tiling(
             spatial_px: &SVD_VAE_SPATIAL_PX,
             spatial_overlap_px: SVD_VAE_SPATIAL_OVERLAP_PX,
             temporal: &SVD_VAE_TEMPORAL_FR,
+            temporal_overlap_policy: TemporalOverlapPolicy::HalfTile,
         },
         estimated_svd_decode_peak_gib,
     )

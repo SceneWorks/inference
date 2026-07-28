@@ -55,7 +55,7 @@ use mlx_gen::{
 };
 use mlx_gen_wan::config::WanQuant;
 use mlx_gen_wan::model::effective_te_quant;
-use mlx_gen_wan::pipeline::auto_tiling_budgeted_z16;
+use mlx_gen_wan::pipeline::auto_tiling_budgeted_z16_quality_overlap;
 use mlx_gen_wan::{
     decode_to_frames, frames_to_images, load_tokenizer, preprocess_i2v_image, Umt5Encoder, WanVae,
 };
@@ -191,7 +191,8 @@ fn resolve_request_config(
 ///
 /// ## The fix: one policy, in one place, and pay for it spatially
 ///
-/// This function now delegates to [`auto_tiling_budgeted_z16`] — the *same* selector, cost model and
+/// This function now delegates to [`auto_tiling_budgeted_z16_quality_overlap`] — the same selector,
+/// cost model and
 /// candidate grid the Wan z16 T2V/I2V/VACE decodes use, which `mlx-gen-scail2` now shares too. Two
 /// things follow:
 ///
@@ -262,7 +263,7 @@ pub fn decode_tiling(out_h: usize, out_w: usize, out_frames: i32) -> Result<Opti
     // `mlx_gen_wan`'s too: one selector, one cost model, one set of candidates, shared with the Wan
     // T2V/I2V/VACE decodes and with `mlx-gen-scail2`. The budget is free-aware
     // (`free × 0.85`, `free = MLX limit − resident`) and pinnable via `WAN_VAE_BUDGET_GIB`.
-    auto_tiling_budgeted_z16(out_h as i32, out_w as i32, out_frames)
+    auto_tiling_budgeted_z16_quality_overlap(out_h as i32, out_w as i32, out_frames)
 }
 
 /// Decode the AR latent sequence `[z16, T_lat, lat_h, lat_w]` (f32) through the reused z16 Wan
@@ -1415,5 +1416,21 @@ mod tests {
             "a 400-frame clip must tile"
         );
         std::env::remove_var("WAN_VAE_BUDGET_GIB");
+    }
+
+    /// sc-15445: Krea deliberately keeps the quality-oriented half-tile overlap even though Wan's
+    /// own product selector restored the faster candidate overlap. This exact row is mutation-red if
+    /// `decode_tiling` is accidentally routed back through Wan's product wrapper.
+    #[test]
+    fn decode_tiling_retains_kreas_half_tile_overlap() {
+        std::env::set_var("WAN_VAE_BUDGET_GIB", "10");
+        let cfg = decode_tiling(384, 640, 84)
+            .unwrap()
+            .expect("the measured Krea row must tile at 10 GiB");
+        std::env::remove_var("WAN_VAE_BUDGET_GIB");
+        assert_eq!(
+            cfg.temporal.map(|t| (t.tile_frames, t.overlap_frames)),
+            Some((32, 16)),
+        );
     }
 }
