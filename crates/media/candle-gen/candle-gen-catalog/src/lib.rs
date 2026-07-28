@@ -293,4 +293,25 @@ mod tests {
             "SURFACES_NVFP4_TIER must agree with nvfp4_quant_tiers()"
         );
     }
+
+    #[test]
+    fn krea_cuda_memory_contract_is_not_exposed_by_the_cpu_catalog() {
+        let registry = super::provider_registry().expect("catalog");
+        let spec = super::media::gen_core::LoadSpec::new(
+            super::media::gen_core::WeightsSource::Dir("/nonexistent".into()),
+        );
+        let contract = registry
+            .image_memory_contract("krea_2_turbo", &spec)
+            .expect("known Krea generator");
+        #[cfg(feature = "cuda")]
+        assert!(
+            contract.is_some(),
+            "CUDA catalog must expose the Krea CUDA contract"
+        );
+        #[cfg(not(feature = "cuda"))]
+        assert!(
+            contract.is_none(),
+            "CPU catalog must leave Krea on its compatibility default"
+        );
+    }
 }

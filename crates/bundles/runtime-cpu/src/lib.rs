@@ -5,7 +5,9 @@ pub use candle_audio_catalog::audio;
 #[cfg(feature = "media")]
 pub use candle_gen_catalog::media;
 pub use candle_llm as llm;
-pub use runtime_catalog::{core_llm, gen_core, RuntimeCatalog, RuntimeCatalogSnapshot};
+pub use runtime_catalog::{
+    core_llm, gen_core, image_memory, RuntimeCatalog, RuntimeCatalogSnapshot,
+};
 
 /// The Candle backend crates this platform owns, re-exported from the media catalog
 /// (available under the default `media` feature).

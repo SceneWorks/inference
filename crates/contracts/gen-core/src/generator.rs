@@ -9,7 +9,10 @@
 use crate::media::{AudioChunk, AudioTrack, Image};
 use crate::runtime::{CancelFlag, Progress, Quant};
 use crate::voice_embed::VoiceEmbedding;
-use crate::{Error, Result};
+use crate::{
+    Error, ImageMemoryProviderContract, ImageMemoryRequestScope, ImageMemoryRunContext,
+    ImageMemorySafetyDecision, ImageMemoryStrategy, Result,
+};
 
 /// A prompt-conditioned media generator. `generate` is **synchronous** (long/blocking; the
 /// worker runs each job on its own thread); the request carries a cancel flag and
@@ -17,6 +20,58 @@ use crate::{Error, Result};
 pub trait Generator {
     /// Identity + capabilities + modality (drives `validate` and consumer UI introspection).
     fn descriptor(&self) -> &ModelDescriptor;
+
+    /// The loaded provider's image-memory contract, when adopted. Existing providers inherit
+    /// `None`, which is the compatibility-safe resident-only/unverified state.
+    fn image_memory_contract(&self) -> Option<&ImageMemoryProviderContract> {
+        None
+    }
+
+    /// Provider safety defense in depth. This can reject a shared worker selection but cannot
+    /// replace its strategy, parameters, or numeric tier. Non-adopting providers accept only the
+    /// resident baseline.
+    fn image_memory_safety_check(
+        &self,
+        context: &ImageMemoryRunContext,
+    ) -> ImageMemorySafetyDecision {
+        match self.image_memory_contract() {
+            Some(contract) => match contract.validate_selection(&context.selection) {
+                Ok(()) if context.budget.fits(context.predicted_peak_bytes) => {
+                    ImageMemorySafetyDecision::Accept
+                }
+                Ok(()) => ImageMemorySafetyDecision::Reject {
+                    reason: format!(
+                        "{}: predicted peak {} exceeds effective budget {}",
+                        self.descriptor().id,
+                        context.predicted_peak_bytes,
+                        context.budget.effective_bytes()
+                    ),
+                },
+                Err(error) => ImageMemorySafetyDecision::Reject {
+                    reason: error.to_string(),
+                },
+            },
+            None if context.selection.strategy == ImageMemoryStrategy::Resident => {
+                ImageMemorySafetyDecision::Accept
+            }
+            None => ImageMemorySafetyDecision::Reject {
+                reason: format!(
+                    "{} has not adopted the shared image-memory contract",
+                    self.descriptor().id
+                ),
+            },
+        }
+    }
+
+    /// Open request-scoped lifecycle state after the shared selection passes the provider safety
+    /// check. Existing providers return `Ok(None)` and therefore cannot execute optimized rungs.
+    fn begin_image_memory_request(
+        &self,
+        context: &ImageMemoryRunContext,
+    ) -> Result<Option<Box<dyn ImageMemoryRequestScope + '_>>> {
+        let _ = context;
+        Ok(None)
+    }
 
     /// Reject a request this model cannot serve (unsupported conditioning, guidance on a
     /// distilled model, out-of-range size/count, …) before doing expensive work.
