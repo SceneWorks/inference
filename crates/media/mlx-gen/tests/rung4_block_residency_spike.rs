@@ -63,10 +63,17 @@ fn rung4_per_block_materialization_spike() {
         Array::load_safetensors_with_metadata(&path).expect("load safetensors");
     let n_tensors = tensors.len();
     let (after_load, _, _) = snap("after load_safetensors (no eval)");
-    println!("  -> {n_tensors} tensor handles; delta {:.1} MiB", after_load - base_active);
+    println!(
+        "  -> {n_tensors} tensor handles; delta {:.1} MiB",
+        after_load - base_active
+    );
     println!(
         "  -> LAZY: {}",
-        if after_load - base_active < 64.0 { "YES" } else { "NO" }
+        if after_load - base_active < 64.0 {
+            "YES"
+        } else {
+            "NO"
+        }
     );
 
     // Group block keys.
@@ -154,9 +161,11 @@ fn rung4_per_block_materialization_spike() {
     }
 
     let bounded_peak = mib(get_peak_memory());
-    println!("\n  per-block eval cost: min {:.1} / max {:.1} MiB",
+    println!(
+        "\n  per-block eval cost: min {:.1} / max {:.1} MiB",
         per_block_cost.iter().cloned().fold(f64::INFINITY, f64::min),
-        per_block_cost.iter().cloned().fold(0.0, f64::max));
+        per_block_cost.iter().cloned().fold(0.0, f64::max)
+    );
     println!("  MAX ACTIVE across the sweep: {max_active:.1} MiB");
     println!("  PEAK (MLX counter) across the sweep: {bounded_peak:.1} MiB");
 
@@ -183,11 +192,18 @@ fn rung4_per_block_materialization_spike() {
     println!("  bounded (one block at a time) : peak {bounded_peak:>9.1} MiB");
     println!("  resident (all blocks)         : peak {resident_peak:>9.1} MiB (active {resident_active:.1})");
     if bounded_peak > 0.0 {
-        println!("  reduction factor              : {:.1}x", resident_active / bounded_peak.max(1.0));
+        println!(
+            "  reduction factor              : {:.1}x",
+            resident_active / bounded_peak.max(1.0)
+        );
     }
     println!(
         "  RUNG 4 EXPRESSIBLE ON MLX     : {}",
-        if bounded_peak < resident_active * 0.5 { "YES" } else { "NO" }
+        if bounded_peak < resident_active * 0.5 {
+            "YES"
+        } else {
+            "NO"
+        }
     );
 }
 
@@ -219,7 +235,10 @@ fn rung4_rematerialization_cost_per_step() {
     drop(std::mem::take(&mut tensors));
     clear_cache();
 
-    println!("\n=== re-materialization cost: {STEPS} steps x {} blocks ===", block_keys.len());
+    println!(
+        "\n=== re-materialization cost: {STEPS} steps x {} blocks ===",
+        block_keys.len()
+    );
     let mut step_times = Vec::new();
     for step in 0..STEPS {
         let t0 = std::time::Instant::now();
@@ -237,7 +256,11 @@ fn rung4_rematerialization_cost_per_step() {
         clear_cache();
         let dt = t0.elapsed();
         step_times.push(dt.as_secs_f64());
-        println!("  step {step}: {:.3}s   (active after {:.1} MiB)", dt.as_secs_f64(), mib(get_active_memory()));
+        println!(
+            "  step {step}: {:.3}s   (active after {:.1} MiB)",
+            dt.as_secs_f64(),
+            mib(get_active_memory())
+        );
     }
     let total: f64 = step_times.iter().sum();
     let mean = total / STEPS as f64;
@@ -246,6 +269,10 @@ fn rung4_rematerialization_cost_per_step() {
     println!("  (compare: a resident DiT pays this ONCE at load)");
     println!(
         "  throughput verdict: {}",
-        if mean < 0.5 { "cheap enough to schedule per step" } else { "EXPENSIVE — needs a block WINDOW, not per-block" }
+        if mean < 0.5 {
+            "cheap enough to schedule per step"
+        } else {
+            "EXPENSIVE — needs a block WINDOW, not per-block"
+        }
     );
 }

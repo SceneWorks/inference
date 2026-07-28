@@ -27,6 +27,7 @@ pub use gen_core::{
 // Local MLX modules (tensor ops, weights, quant, samplers' tensor application, error w/ mlx variants).
 pub mod adapters;
 pub mod array;
+pub mod block_residency;
 pub mod error;
 pub mod img2img;
 pub mod memory;
