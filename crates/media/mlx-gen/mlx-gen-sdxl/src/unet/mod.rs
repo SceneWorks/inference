@@ -709,7 +709,7 @@ fn install_threaded_lora<H: AdaptableHost>(
         block
             .adaptable_mut(&segs)
             .ok_or_else(|| Exception::custom(format!("checkpoint LoRA target not found: {local}")))?
-            .set_adapters(vec![Adapter::Lora { a, b, scale: 1.0 }]);
+            .set_training_adapters(vec![Adapter::Lora { a, b, scale: 1.0 }]);
     }
     Ok(())
 }
