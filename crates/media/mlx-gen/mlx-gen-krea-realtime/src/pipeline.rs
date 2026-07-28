@@ -15,15 +15,18 @@
 //! `provider_registry().load("krea_realtime_14b", spec)` yields this generator.
 
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 use mlx_gen::{
-    default_seed, AdapterSpec, Capabilities, Conditioning, ConditioningKind, Error,
-    GenerationOutput, GenerationRequest, Generator, Modality, ModelDescriptor, Progress, Quant,
-    Result, WeightsSource,
+    default_seed, AdapterApplyReport, AdapterSpec, Capabilities, Conditioning, ConditioningKind,
+    Error, GenerationOutput, GenerationRequest, Generator, Modality, ModelDescriptor, Progress,
+    Quant, Result, WeightsSource,
 };
 
 use crate::config::{KreaRealtimeConfig, MODEL_ID};
-use crate::t2v::{generate_i2v, generate_v2v, KreaRealtimeJob};
+use crate::t2v::{
+    generate_i2v_reported, generate_t2v_reported, generate_v2v_reported, KreaRealtimeJob,
+};
 
 /// The Self-Forcing few-step sampler name Krea Realtime advertises (a fixed short per-block flow-match
 /// renoise schedule, not a selectable classic solver). Distinct from Wan's UniPC/DPM++ so a consumer
@@ -64,10 +67,9 @@ pub fn descriptor() -> ModelDescriptor {
             // Wan-family style-LoRA / LoKr (sc-15015 S14; extended to the packed tiers by sc-15203 S19):
             // Krea Realtime 14B is Wan-2.1-14B T2V weight-for-weight, so a diffusers / PEFT / kohya /
             // LoKr file installs onto the DiT as **forward-time residuals** via the shared
-            // `apply_adapters_strict` path. Because the residual is added on top of the base's forward
-            // rather than folded into its weights, it is tier-agnostic: it stacks identically over a
-            // dense bf16 base and over a packed Q4/Q8 one (the base is never dequantized), which is the
-            // same additive-on-packed property epic 10043 / sc-10578 established for the Wan family.
+            // diff-patch-aware strict path. Low-rank residuals stay additive over dense or packed
+            // bases, while lightx2v `.diff_b`/norm `.diff` targets fold through dense parameters that
+            // exist on every tier (sc-15326).
             // `LoadSpec::adapters` is honored on every tier in the load path (`t2v::load_transformer`),
             // so advertising these is capability-honest at Q4/Q8 as well as bf16.
             supports_lora: true,
@@ -123,8 +125,9 @@ pub struct KreaRealtime {
     root: PathBuf,
     /// Inference LoRA(s) from [`LoadSpec::adapters`](mlx_gen::LoadSpec::adapters) (sc-15015, S14) —
     /// installed onto the DiT as forward-time residuals in [`crate::t2v::load_transformer`], the
-    /// `apply_adapters_strict` path shared with `mlx-gen-scail2`. Tier-agnostic: the residual stacks
-    /// over a dense bf16 base and over a packed Q4/Q8 one alike (sc-15203).
+    /// `apply_adapters_strict_with_diff_patch` path. Low-rank residuals stack over dense bf16 and
+    /// packed Q4/Q8 alike; supported lightx2v diff-patch deltas land through tier-stable dense bias and
+    /// norm parameters (sc-15326).
     adapters: Vec<AdapterSpec>,
     /// The requested load-time quantization from [`LoadSpec::quantize`](mlx_gen::LoadSpec::quantize)
     /// (sc-15203, S19). Reconciled in [`crate::t2v::load_transformer`] against the tier the snapshot
@@ -133,6 +136,10 @@ pub struct KreaRealtime {
     /// hard error at a different one ("stored wins", loudly — `quantize` no-ops over packed weights, so
     /// a silent mismatch would serve a tier the caller did not ask for).
     quant: Option<Quant>,
+    /// Actual engine-owned adapter outcomes from the most recent successful generation. The loaded
+    /// provider is cached and `Generator::generate` takes `&self`, so the compatibility-safe report
+    /// accessor uses interior mutability rather than changing generation's return type.
+    adapter_reports: Mutex<Vec<AdapterApplyReport>>,
 }
 
 /// Load Krea Realtime from a converted MLX snapshot directory (`dit.safetensors` + the stock Wan
@@ -159,6 +166,7 @@ pub fn load(spec: &mlx_gen::LoadSpec) -> Result<Box<dyn Generator>> {
         root,
         adapters: spec.adapters.clone(),
         quant: spec.quantize,
+        adapter_reports: Mutex::new(Vec::new()),
     }))
 }
 
@@ -166,15 +174,46 @@ pub fn load(spec: &mlx_gen::LoadSpec) -> Result<Box<dyn Generator>> {
 // the crate `Result` into backend-neutral `gen_core::Result`.
 mlx_gen::register_generators! { pub(crate) const REGISTRATION = descriptor => load }
 
-mlx_gen::impl_generator!(KreaRealtime {
-    validate: |s, req| s
-        .descriptor
-        .capabilities
-        .validate_request(s.descriptor.id, req),
-    generate: run,
-});
+impl Generator for KreaRealtime {
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.descriptor
+    }
+
+    fn adapter_apply_reports(&self) -> Vec<AdapterApplyReport> {
+        self.adapter_reports
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn validate(&self, req: &GenerationRequest) -> mlx_gen::gen_core::Result<()> {
+        self.descriptor
+            .capabilities
+            .validate_request(self.descriptor.id, req)
+    }
+
+    fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<GenerationOutput> {
+        self.run(req, on_progress).map_err(Into::into)
+    }
+}
 
 impl KreaRealtime {
+    fn finish_reported_generation(
+        &self,
+        result: Result<(GenerationOutput, Vec<AdapterApplyReport>)>,
+    ) -> Result<GenerationOutput> {
+        let (output, reports) = result?;
+        *self
+            .adapter_reports
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = reports;
+        Ok(output)
+    }
+
     /// Map the text-to-video request onto a [`KreaRealtimeJob`] and run the AR pipeline. Self-validates
     /// the shared capability floor first (`impl_generator!`'s `generate` does not call `validate`), so a
     /// direct `Generator::generate` still rejects an out-of-surface request (count / size / sampler /
@@ -184,6 +223,12 @@ impl KreaRealtime {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
+        // Cached providers survive across jobs. Clear the previous run before validation/load so a
+        // failed generation can never expose stale adapter evidence to its caller.
+        self.adapter_reports
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
         self.descriptor
             .capabilities
             .validate_request(self.descriptor.id, req)?;
@@ -217,7 +262,7 @@ impl KreaRealtime {
             } => Some((frames.as_slice(), *strength)),
             _ => None,
         }) {
-            return generate_v2v(
+            return self.finish_reported_generation(generate_v2v_reported(
                 &self.root,
                 &self.config,
                 &job,
@@ -227,13 +272,13 @@ impl KreaRealtime {
                 self.quant,
                 &req.cancel,
                 on_progress,
-            );
+            ));
         }
         if let Some(image) = req.conditioning.iter().find_map(|c| match c {
             Conditioning::Reference { image, .. } => Some(image),
             _ => None,
         }) {
-            return generate_i2v(
+            return self.finish_reported_generation(generate_i2v_reported(
                 &self.root,
                 &self.config,
                 &job,
@@ -242,9 +287,9 @@ impl KreaRealtime {
                 self.quant,
                 &req.cancel,
                 on_progress,
-            );
+            ));
         }
-        crate::t2v::generate_t2v(
+        self.finish_reported_generation(generate_t2v_reported(
             &self.root,
             &self.config,
             &job,
@@ -252,7 +297,7 @@ impl KreaRealtime {
             self.quant,
             &req.cancel,
             on_progress,
-        )
+        ))
     }
 }
 
@@ -270,7 +315,28 @@ mod tests {
             root: PathBuf::from("/nonexistent-krea-realtime-snapshot"),
             adapters: Vec::new(),
             quant: None,
+            adapter_reports: Mutex::new(Vec::new()),
         }
+    }
+
+    #[test]
+    fn generator_contract_returns_the_provider_owned_adapter_reports() {
+        let provider = unloaded();
+        let expected = AdapterApplyReport {
+            adapter_path: PathBuf::from("/models/out_of_surface.safetensors"),
+            applied: 1,
+            skipped: vec!["blocks.0.cross_attn.norm_k_img".to_owned()],
+        };
+        provider
+            .adapter_reports
+            .lock()
+            .unwrap()
+            .push(expected.clone());
+        assert_eq!(
+            Generator::adapter_apply_reports(&provider),
+            vec![expected],
+            "severing the Krea override must not fall back to the empty compatibility default"
+        );
     }
 
     /// The advertised surface is CFG-off video with the Self-Forcing few-step sampler, now advertising
@@ -301,7 +367,7 @@ mod tests {
         );
         assert_eq!(c.samplers, vec!["self_forcing"]);
         // S14: Wan-family style-LoRA / LoKr on the dense bf16 DiT is wired (LoadSpec::adapters →
-        // apply_adapters_strict in the load path), so both knobs are advertised honestly.
+        // the strict diff-patch-aware load path), so both knobs are advertised honestly.
         assert!(c.supports_lora, "S14 wires dense Wan-family style LoRA");
         assert!(c.supports_lokr, "S14 wires the dense LoKr install path too");
         assert!(c.supports_kv_cache, "the AR regime runs a rolling KV cache");

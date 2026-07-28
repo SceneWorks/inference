@@ -25,9 +25,9 @@
 //!
 //! **Six, not seven.** `patch_embedding` ships a `.diff_b` bias delta with **no** low-rank pair, so a
 //! real step-distill file installs **406** targets against the 407-wide surface — asserted below, not
-//! inferred. And widening does **not** make such a file fully applied: 647 of its 1459 keys (447
-//! `.diff_b` + 200 norm `.diff`) are dropped silently by `apply_adapters_strict`, tracked as
-//! **sc-15326**.
+//! inferred. sc-15326 completed that surface: the remaining 647 keys (447 `.diff_b` + 200 norm
+//! `.diff`) now land through the diff-patch-aware path on every tier, and any genuinely unsupported
+//! target is returned to the provider instead of being dropped silently.
 //!
 //! ```text
 //! KREA_REALTIME_SNAPSHOT_DIR=~/.cache/krea-realtime-mlx-snapshot/q4 \

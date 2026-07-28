@@ -49,7 +49,10 @@ use std::path::Path;
 
 use mlx_gen::tiling::TilingConfig;
 use mlx_gen::weights::Weights;
-use mlx_gen::{AdapterSpec, CancelFlag, Error, GenerationOutput, Image, Progress, Quant, Result};
+use mlx_gen::{
+    AdapterApplyReport, AdapterSpec, CancelFlag, Error, GenerationOutput, Image, Progress, Quant,
+    Result,
+};
 use mlx_gen_wan::config::WanQuant;
 use mlx_gen_wan::model::effective_te_quant;
 use mlx_gen_wan::pipeline::auto_tiling_budgeted_z16;
@@ -696,7 +699,7 @@ fn load_transformer(
     cfg: &KreaRealtimeConfig,
     adapters: &[AdapterSpec],
     quant: Option<Quant>,
-) -> Result<CausalKreaTransformer> {
+) -> Result<(CausalKreaTransformer, Vec<AdapterApplyReport>)> {
     let weights = open_transformer_weights(root)?;
     let raw: HashMap<String, Array> = weights
         .keys()
@@ -710,24 +713,37 @@ fn load_transformer(
         dit.quantize(q.bits(), None)?;
     }
     let mut transformer = CausalKreaTransformer::new(dit, cfg);
-    if !adapters.is_empty() {
+    let adapter_reports = apply_adapters_reported(&mut transformer, adapters)?;
+    Ok((transformer, adapter_reports))
+}
+
+/// Install Krea adapters one file at a time and preserve each engine-owned outcome for the provider
+/// contract. Public for weight-free integration tests; product callers use [`crate::KreaRealtime`].
+#[doc(hidden)]
+pub fn apply_adapters_reported(
+    transformer: &mut CausalKreaTransformer,
+    adapters: &[AdapterSpec],
+) -> Result<Vec<AdapterApplyReport>> {
+    let mut adapter_reports = Vec::with_capacity(adapters.len());
+    for adapter in adapters {
         let report = mlx_gen::adapters::loader::apply_adapters_strict_with_diff_patch(
-            &mut transformer,
-            adapters,
+            transformer,
+            std::slice::from_ref(adapter),
             MODEL_ID,
         )?;
-        // Surface the applied count (unmatched low-rank targets already errored above, never silently
-        // dropped) AND anything the diff-patch pass could not land — the sc-15326 point: a partial
-        // install must never read as a clean one.
         eprintln!(
-            "{MODEL_ID}: installed {} LoRA target(s) from {} adapter file(s); {} diff-patch delta(s) \
+            "{MODEL_ID}: installed {} LoRA target(s) from 1 adapter file(s); {} diff-patch delta(s) \
              unapplied",
             report.applied,
-            adapters.len(),
             report.diff_patch_unapplied.len()
         );
+        adapter_reports.push(AdapterApplyReport {
+            adapter_path: adapter.path.clone(),
+            applied: report.applied,
+            skipped: report.diff_patch_unapplied,
+        });
     }
-    Ok(transformer)
+    Ok(adapter_reports)
 }
 
 /// Run the full Krea Realtime text-to-video generation for `job`, loading each reused component from
@@ -748,6 +764,22 @@ pub fn generate_t2v(
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<GenerationOutput> {
+    generate_t2v_reported(root, base_cfg, job, adapters, quant, cancel, on_progress)
+        .map(|(output, _)| output)
+}
+
+/// Provider entrypoint that preserves the public generation output while also returning the actual
+/// per-adapter install reports produced during component staging.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn generate_t2v_reported(
+    root: &Path,
+    base_cfg: &KreaRealtimeConfig,
+    job: &KreaRealtimeJob,
+    adapters: &[AdapterSpec],
+    quant: Option<Quant>,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<(GenerationOutput, Vec<AdapterApplyReport>)> {
     if !root.exists() {
         return Err(Error::Msg(format!(
             "krea t2v: snapshot dir does not exist: {}",
@@ -770,7 +802,7 @@ pub fn generate_t2v(
 
     // Stage the reused components (UMT5 prompt encode + Krea DiT + z16 Wan VAE); any inference LoRA(s)
     // are installed onto the DiT inside `stage_components` (sc-15015, S14).
-    let (context, transformer, vae) =
+    let (context, transformer, vae, adapter_reports) =
         stage_components(root, &cfg, job.prompt, adapters, quant, on_progress)?;
 
     let params = ArGenParams {
@@ -789,7 +821,7 @@ pub fn generate_t2v(
     )?;
     // Trim the z16 decode back to the exact requested output count (`(f−1)/4+1` latent → `4·T_lat`
     // decoded over-delivers up to 3 leading frames when `num_frames` is not ≡ 1 (mod 4)).
-    generate_t2v_from_components(
+    let output = generate_t2v_from_components(
         &transformer,
         &cfg,
         &vae,
@@ -799,7 +831,8 @@ pub fn generate_t2v(
         tiling.as_ref(),
         cancel,
         on_progress,
-    )
+    )?;
+    Ok((output, adapter_reports))
 }
 
 /// Shared real-weight component staging for the t2v/i2v/v2v pipeline paths: UMT5 prompt encode
@@ -817,15 +850,20 @@ fn stage_components(
     adapters: &[AdapterSpec],
     quant: Option<Quant>,
     on_progress: &mut dyn FnMut(Progress),
-) -> Result<(Array, CausalKreaTransformer, WanVae)> {
+) -> Result<(
+    Array,
+    CausalKreaTransformer,
+    WanVae,
+    Vec<AdapterApplyReport>,
+)> {
     let te_quant = resolve_te_quant(root, cfg, quant)?;
     on_progress(Progress::Loading(mlx_gen::LoadPhase::TextEncoder));
     let context = encode_prompt(root, cfg, prompt, te_quant)?;
     on_progress(Progress::Loading(mlx_gen::LoadPhase::Renderer));
-    let transformer = load_transformer(root, cfg, adapters, quant)?;
+    let (transformer, adapter_reports) = load_transformer(root, cfg, adapters, quant)?;
     let w = Weights::from_file(root.join("vae.safetensors"))?;
     let vae = WanVae::from_weights(&w)?;
-    Ok((context, transformer, vae))
+    Ok((context, transformer, vae, adapter_reports))
 }
 
 /// The UMT5 tier for this run: the shared Wan Q8 floor whenever the DiT is quantized on **either**
@@ -895,6 +933,30 @@ pub fn generate_i2v(
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<GenerationOutput> {
+    generate_i2v_reported(
+        root,
+        base_cfg,
+        job,
+        reference_image,
+        adapters,
+        quant,
+        cancel,
+        on_progress,
+    )
+    .map(|(output, _)| output)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn generate_i2v_reported(
+    root: &Path,
+    base_cfg: &KreaRealtimeConfig,
+    job: &KreaRealtimeJob,
+    reference_image: &Image,
+    adapters: &[AdapterSpec],
+    quant: Option<Quant>,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<(GenerationOutput, Vec<AdapterApplyReport>)> {
     let (latent_h, latent_w) = resolve_latent_size(root, job, "i2v")?;
     let total_latent = latent_frame_count(job.num_frames)?;
     // The reference still is latent frame 0 (one clean context frame); generate the rest.
@@ -910,7 +972,7 @@ pub fn generate_i2v(
             )
         })?;
     let cfg = resolve_request_config(base_cfg, latent_h, latent_w, total_latent)?;
-    let (context, transformer, vae) =
+    let (context, transformer, vae, adapter_reports) =
         stage_components(root, &cfg, job.prompt, adapters, quant, on_progress)?;
     let params = ArGenParams {
         seed: job.seed,
@@ -926,7 +988,7 @@ pub fn generate_i2v(
         latent_w * SPATIAL_STRIDE,
         decoded_frames,
     )?;
-    generate_i2v_from_components(
+    let output = generate_i2v_from_components(
         &transformer,
         &cfg,
         &vae,
@@ -937,7 +999,8 @@ pub fn generate_i2v(
         tiling.as_ref(),
         cancel,
         on_progress,
-    )
+    )?;
+    Ok((output, adapter_reports))
 }
 
 /// Run the full Krea Realtime **video-to-video** generation for `job` + a `source_frames` clip at a
@@ -958,6 +1021,32 @@ pub fn generate_v2v(
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<GenerationOutput> {
+    generate_v2v_reported(
+        root,
+        base_cfg,
+        job,
+        source_frames,
+        strength,
+        adapters,
+        quant,
+        cancel,
+        on_progress,
+    )
+    .map(|(output, _)| output)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn generate_v2v_reported(
+    root: &Path,
+    base_cfg: &KreaRealtimeConfig,
+    job: &KreaRealtimeJob,
+    source_frames: &[Image],
+    strength: f32,
+    adapters: &[AdapterSpec],
+    quant: Option<Quant>,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<(GenerationOutput, Vec<AdapterApplyReport>)> {
     let (latent_h, latent_w) = resolve_latent_size(root, job, "v2v")?;
     if source_frames.is_empty() {
         return Err(Error::Msg("krea v2v: source clip has no frames".into()));
@@ -965,7 +1054,7 @@ pub fn generate_v2v(
     // The generated latent-frame count is derived from the source clip length.
     let num_latent = latent_frame_count(source_frames.len() as u32)?;
     let cfg = resolve_request_config(base_cfg, latent_h, latent_w, num_latent)?;
-    let (context, transformer, vae) =
+    let (context, transformer, vae, adapter_reports) =
         stage_components(root, &cfg, job.prompt, adapters, quant, on_progress)?;
     let params = ArGenParams {
         seed: job.seed,
@@ -981,7 +1070,7 @@ pub fn generate_v2v(
         latent_w * SPATIAL_STRIDE,
         decoded_frames,
     )?;
-    generate_v2v_from_components(
+    let output = generate_v2v_from_components(
         &transformer,
         &cfg,
         &vae,
@@ -993,7 +1082,8 @@ pub fn generate_v2v(
         tiling.as_ref(),
         cancel,
         on_progress,
-    )
+    )?;
+    Ok((output, adapter_reports))
 }
 
 #[cfg(test)]

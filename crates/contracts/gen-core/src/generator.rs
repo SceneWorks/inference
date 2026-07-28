@@ -21,6 +21,16 @@ pub trait Generator {
     /// Identity + capabilities + modality (drives `validate` and consumer UI introspection).
     fn descriptor(&self) -> &ModelDescriptor;
 
+    /// Actual per-adapter install outcomes from the most recent successful generation.
+    ///
+    /// Most providers either reject an adapter atomically or have no partial-install surface, so the
+    /// compatibility default is empty. Providers that can accept part of a file override this and
+    /// publish their engine-owned result after [`generate`](Self::generate); consumers must not
+    /// predict the outcome by inspecting an adapter header.
+    fn adapter_apply_reports(&self) -> Vec<crate::AdapterApplyReport> {
+        Vec::new()
+    }
+
     /// The loaded provider's image-memory contract, when adopted. Existing providers inherit
     /// `None`, which is the compatibility-safe resident-only/unverified state.
     fn image_memory_contract(&self) -> Option<&ImageMemoryProviderContract> {
