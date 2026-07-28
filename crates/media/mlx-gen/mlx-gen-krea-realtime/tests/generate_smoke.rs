@@ -1816,43 +1816,139 @@ fn kv_cache_residency_at_the_production_geometry() {
 // clip's *established scene* survive the KV window rolling out from under it". So the metric is
 // built to be blind to ordinary motion and sensitive to a one-way excursion:
 //
-//   * The descriptor is a set of **scene-level** statistics (luma mean, contrast, saturation) that
-//     ordinary camera/subject motion perturbs in a bounded, oscillating way, and that every known AR
-//     drift mode (wash-out, saturation collapse, contrast blow-up) moves monotonically.
+//   * The descriptor is a set of **scene-level** statistics that ordinary camera/subject motion
+//     perturbs in a bounded, oscillating way, and that a degenerating AR loop moves one way. It spans
+//     three axes deliberately, because a single-axis descriptor has large blind spots (see
+//     [`the_drift_metric_catches_the_plausible_ar_failure_shapes`]): **tone** (luma mean, contrast),
+//     **colour** (saturation and the two opponent-colour means, which a hue rotation moves and a
+//     luma/saturation descriptor cannot see), and **space** (the spread of a 5x5 grid of block luma
+//     means, which a localized subject collapse moves and every global moment cannot see).
 //   * The **baseline** is the pre-roll segment: the output frames produced before the first KV
 //     eviction. Those frames saw the full history, so their frame-to-frame fluctuation IS the
-//     ordinary-motion scale for this clip, measured on this clip. Everything after is scored in
-//     units of that fluctuation (a z-score) as well as raw 0..255 units.
-//   * The reported statistic is the **per-roll-bucket** excursion — a table, not a point — so a
-//     monotone one-way trend is distinguishable from a bounded wander that happens to end far away.
+//     ordinary-motion scale for this clip, measured on this clip.
+//   * The verdict statistic is **trend AND excursion**, both gated. The OLS trend catches a ramp; it
+//     is structurally blind to a *plateau* (the loop settling into a degenerate attractor, which is
+//     the most likely AR failure), which is exactly what the excursion catches. The excursion's own
+//     failure mode — an oscillating scene whose baseline sits at an extreme of its cycle — is handled
+//     by suppressing it when it is small relative to the pre-roll fluctuation scale (`z`), not by
+//     discarding the statistic.
+//   * The **per-roll-bucket** table is printed alongside, so a non-linear collapse is visible rather
+//     than averaged into a slope.
 //
-// Two controls make the answer falsifiable:
-//   * a **null control**: a clip short enough that the window never rolls at all. Any excursion it
-//     shows is pure motion, and bounds what the metric can attribute to drift.
-//   * a **dose-response control**: the same long clip at a wider window (fewer rolls). If drift is
-//     caused by rolling, halving the roll count must reduce the excursion; if the excursion is
-//     identical at both window sizes it is the content, not the window.
+// **What is NOT available as a control, and why the budget is absolute.** A bounded window over a long
+// clip evicts *by definition* — so there is no such thing as a zero-roll run at the shipped window and
+// the shipped clip length. The checkpoint's global window (row E) is *not* that null: changing
+// `local_attn_size` changes the attention mask, hence the sampling trajectory, hence the video. Rows
+// are not the same clip; they are the same *prompt and seed* under different attention. Row E is
+// retained as an out-of-regime reference (it is what the Mac bound replaces) and is explicitly **not**
+// a motion floor. What remains valid:
+//   * a **within-regime dose-response**: row D is the same bounded local-attention path at a 2.5×
+//     wider window (fewer rolls). If rolling causes drift, fewer rolls must drift less.
+//   * a **within-regime zero-eviction rate floor** (row Z): the shipped window on a clip short enough
+//     that it never rolls. Its clip is too short for a length-scaled trend to be comparable, so what it
+//     contributes is a *slope* (per 100 output frames) — the rate ordinary motion moves the descriptor
+//     under this exact attention regime.
+//   * an **absolute budget** ([`DRIFT_BUDGET`]), justified against the metric's measured floor and its
+//     measured response to the plausible failure shapes, and gated in CI on both.
 
-/// Per-frame scene descriptor in 0..255 units: `[luma mean, luma std (contrast), mean saturation]`.
-/// Deliberately global statistics — a per-pixel comparison against frame 0 measures motion, which is
-/// exactly the signal that must NOT drive this conclusion.
-fn scene_descriptor(f: &Image) -> [f64; 3] {
+/// Grid resolution for the spatial component of [`scene_descriptor`]: `SPATIAL_GRID`^2.
+const SPATIAL_GRID: usize = 5;
+
+/// Number of components in [`scene_descriptor`].
+const N_DESC: usize = 6;
+
+/// Per-frame scene descriptor in 0..255 units.
+///
+/// Three axes, because each covers a failure shape the others are blind to:
+/// * **tone** — `luma-mean`, `contrast` (luma std).
+/// * **colour** — `saturation` (max−min chroma), and the two opponent means `R−G` and `B−(R+G)/2`.
+///   A hue rotation at constant luma and constant saturation moves *only* the opponent pair; without
+///   them the descriptor cannot see a colour cast developing.
+/// * **space** — `spatial-sd`, the standard deviation of a `SPATIAL_GRID`^2 grid of block luma means.
+///   A subject collapsing in the centre while the surround compensates leaves every *global* moment
+///   unchanged; it moves this one hard.
+///
+/// Deliberately still statistics, not a per-pixel comparison against frame 0 — that measures motion,
+/// which is exactly the signal that must NOT drive this conclusion.
+fn scene_descriptor(f: &Image) -> [f64; N_DESC] {
+    let w = (f.width as usize).max(1);
+    let h = (f.height as usize).max(1);
     let n = (f.pixels.len() / 3).max(1);
-    let (mut sum, mut sumsq, mut sat) = (0.0f64, 0.0f64, 0.0f64);
-    for px in f.pixels.chunks_exact(3) {
+    let (mut sum, mut sumsq, mut sat, mut rg, mut by) = (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
+    let mut blk = [0.0f64; SPATIAL_GRID * SPATIAL_GRID];
+    let mut blk_n = [0usize; SPATIAL_GRID * SPATIAL_GRID];
+    for (i, px) in f.pixels.chunks_exact(3).enumerate() {
         let (r, g, b) = (px[0] as f64, px[1] as f64, px[2] as f64);
         let y = 0.299 * r + 0.587 * g + 0.114 * b;
         sum += y;
         sumsq += y * y;
         sat += r.max(g).max(b) - r.min(g).min(b);
+        rg += r - g;
+        by += b - 0.5 * (r + g);
+        let bx = (i % w) * SPATIAL_GRID / w;
+        let byi = (i / w).min(h - 1) * SPATIAL_GRID / h;
+        let bi = byi.min(SPATIAL_GRID - 1) * SPATIAL_GRID + bx.min(SPATIAL_GRID - 1);
+        blk[bi] += y;
+        blk_n[bi] += 1;
     }
     let mean = sum / n as f64;
     let var = (sumsq / n as f64 - mean * mean).max(0.0);
-    [mean, var.sqrt(), sat / n as f64]
+    let block_means: Vec<f64> = blk
+        .iter()
+        .zip(blk_n.iter())
+        .filter(|(_, &c)| c > 0)
+        .map(|(&s, &c)| s / c as f64)
+        .collect();
+    [
+        mean,
+        var.sqrt(),
+        sat / n as f64,
+        rg / n as f64,
+        by / n as f64,
+        std_f64(&block_means),
+    ]
 }
 
 /// Names of the [`scene_descriptor`] components, for the printed table.
-const DESCRIPTOR_NAMES: [&str; 3] = ["luma-mean", "contrast", "saturation"];
+const DESCRIPTOR_NAMES: [&str; N_DESC] = [
+    "luma-mean",
+    "contrast",
+    "saturation",
+    "opp-R-G",
+    "opp-B-Y",
+    "spatial-sd",
+];
+
+/// The absolute one-way drift budget, in 0..255 units, for both the trend and the z-gated excursion.
+///
+/// **Absolute, not derived from a control row** — see the module comment: no zero-roll run exists at
+/// the shipped window and the shipped clip length, so there is no valid within-regime floor to subtract.
+/// The number is instead pinned from both sides, and both sides are gated in CI by
+/// [`the_drift_metric_separates_drift_from_ordinary_motion`] and
+/// [`the_drift_metric_catches_the_plausible_ar_failure_shapes`]:
+/// * **from below** — the metric reads a violently moving clip and a violently jittery clip at
+///   ≤ 5/255, and the within-regime zero-eviction row Z bounds this content's own rate;
+/// * **from above** — every plausible AR failure shape (linear wash-out ramp, plateauing wash-out,
+///   localized subject collapse, hue rotation) scores above it, several of them by 2–6×.
+///
+/// The two sides are measured, not asserted, and they bracket a **narrow** range:
+/// * floor — motion and jitter both score **2.81/255**;
+/// * ceiling — the *weakest* of the four failure shapes (a 180° hue rotation at constant luma and
+///   constant chroma magnitude, whose scene-mean chroma partially cancels across pixels) scores
+///   **11.37/255**. Everything else scores 21–80.
+///
+/// So the budget must lie in `(2.81, 11.37)`. 8/255 ≈ 3.1% of the range sits at 2.85× the measured
+/// floor and 0.70× the weakest detection, and is about where a *sustained one-way* shift in scene
+/// luma, colour cast or spatial structure starts to read as the picture changing rather than the
+/// subject moving. Both margins are asserted in the two gates above, so this cannot silently rot into
+/// a number that admits gross drift or rejects ordinary motion.
+const DRIFT_BUDGET: f64 = 8.0;
+
+/// Minimum `|z|` for an excursion to count. Below this the tail's offset from the baseline is inside
+/// the clip's own pre-roll fluctuation, i.e. it is where a moving scene happens to be in its cycle, and
+/// gating on it would flag every real clip. (Measured on the synthetic motion control, whose raw
+/// excursion is large and whose `z` is not.)
+const EXCURSION_Z_MIN: f64 = 3.0;
 
 fn mean_f64(v: &[f64]) -> f64 {
     if v.is_empty() {
@@ -1894,27 +1990,42 @@ fn slope_per_100(y: &[f64]) -> f64 {
 /// The drift summary for one descriptor component of one clip.
 #[derive(Clone)]
 struct ComponentDrift {
-    /// **The verdict statistic.** The total *one-way* movement the rolling portion of the clip
-    /// accumulates, in 0..255 units: the OLS trend over the post-roll segment × that segment's length.
+    /// The total *one-way* movement the rolling portion of the clip accumulates, in 0..255 units: the
+    /// OLS trend over the post-roll segment × that segment's length.
     ///
-    /// Why the trend and not the head→tail offset: an oscillating (i.e. ordinary, moving) scene whose
-    /// baseline window happens to sit at an extreme of its cycle shows a large *offset* while going
-    /// nowhere — measured at +11.7/255 on the synthetic motion control, which would have been read as
-    /// drift. A symmetric oscillation contributes ~0 to a least-squares trend, while every AR drift
-    /// mode (wash-out, saturation collapse, contrast run-away) is one-way by definition.
+    /// Catches a ramp. **Structurally blind to a plateau** — a loop that washes out by frame 54 and
+    /// then holds has a small trend and a large [`excursion`](Self::excursion), which is why both are
+    /// gated.
     trend: f64,
-    /// Signed offset of the clip's final segment from the pre-roll baseline, in 0..255 units. Reported
-    /// because it is informative, **not** gated on — see [`trend`](Self::trend).
+    /// Signed offset of the clip's final segment from the pre-roll baseline, in 0..255 units.
+    ///
+    /// Catches a plateau. Its own failure mode is an oscillating (i.e. ordinary, moving) scene whose
+    /// baseline window happens to sit at an extreme of its cycle: that shows a large offset while going
+    /// nowhere — measured at +11.7/255 on the synthetic motion control. That is handled by
+    /// [`gated_excursion`](Self::gated_excursion), not by discarding the statistic.
     excursion: f64,
     /// [`excursion`](Self::excursion) in units of the pre-roll frame-to-frame fluctuation.
     z: f64,
-    /// OLS slope over the post-roll segment, per 100 output frames.
+    /// OLS slope over the post-roll segment, per 100 output frames. **Length-independent**, so this is
+    /// the statistic that can be compared across rows of different clip length (row Z).
     slope_post: f64,
     /// OLS slope over the pre-roll baseline segment, per 100 output frames.
     slope_pre: f64,
     /// Per-bucket signed excursion from the baseline (bucket = one window-roll's worth of frames).
     /// Printed so a non-linear collapse is visible rather than averaged into a single slope.
     buckets: Vec<f64>,
+}
+
+impl ComponentDrift {
+    /// [`excursion`](Self::excursion), suppressed when it is inside the clip's own pre-roll
+    /// fluctuation scale (see [`EXCURSION_Z_MIN`]).
+    fn gated_excursion(&self) -> f64 {
+        if self.z.abs() < EXCURSION_Z_MIN {
+            0.0
+        } else {
+            self.excursion
+        }
+    }
 }
 
 /// Score one clip's drift. `pre_len` is the number of leading output frames generated *before* the
@@ -1950,35 +2061,83 @@ fn score_drift(series: &[f64], pre_len: usize, bucket: usize) -> ComponentDrift 
 }
 
 /// Score a whole clip: one [`ComponentDrift`] per [`scene_descriptor`] component.
-fn score_clip(frames: &[Image], pre_len: usize, bucket: usize) -> [ComponentDrift; 3] {
-    let d: Vec<[f64; 3]> = frames.iter().map(scene_descriptor).collect();
+fn score_clip(frames: &[Image], pre_len: usize, bucket: usize) -> [ComponentDrift; N_DESC] {
+    let d: Vec<[f64; N_DESC]> = frames.iter().map(scene_descriptor).collect();
     std::array::from_fn(|c| {
         let series: Vec<f64> = d.iter().map(|x| x[c]).collect();
         score_drift(&series, pre_len, bucket)
     })
 }
 
-/// The clip's headline drift figure: the largest absolute one-way component trend, in 0..255 units.
-fn worst_trend(d: &[ComponentDrift; 3]) -> f64 {
+/// Largest absolute one-way component trend, in 0..255 units.
+fn worst_trend(d: &[ComponentDrift; N_DESC]) -> f64 {
     d.iter().map(|c| c.trend.abs()).fold(0.0, f64::max)
 }
 
-fn print_drift(label: &str, d: &[ComponentDrift; 3]) {
+/// Largest absolute **z-gated** component excursion, in 0..255 units.
+fn worst_excursion(d: &[ComponentDrift; N_DESC]) -> f64 {
+    d.iter()
+        .map(|c| c.gated_excursion().abs())
+        .fold(0.0, f64::max)
+}
+
+/// Largest absolute component slope over the rolling portion, per 100 output frames. This is the only
+/// statistic comparable across clips of *different length* (row Z is 24 output frames, row A is 180).
+fn worst_slope(d: &[ComponentDrift; N_DESC]) -> f64 {
+    d.iter().map(|c| c.slope_post.abs()).fold(0.0, f64::max)
+}
+
+/// The clip's headline drift figure: worst trend **or** worst gated excursion, whichever is larger.
+/// Gating on the max is what makes the budget a "trend AND excursion" gate.
+fn worst_drift(d: &[ComponentDrift; N_DESC]) -> f64 {
+    worst_trend(d).max(worst_excursion(d))
+}
+
+fn print_drift(label: &str, d: &[ComponentDrift; N_DESC]) {
     for (name, c) in DESCRIPTOR_NAMES.iter().zip(d.iter()) {
         println!(
-            "    {label} {name:<11}: TREND {:+7.2}/255 over the rolling portion | excursion \
-             {:+7.2}/255 (z {:+6.2}), slope pre {:+7.3} -> post {:+7.3} per 100f",
-            c.trend, c.excursion, c.z, c.slope_pre, c.slope_post
+            "    {label} {name:<11}: TREND {:+7.2}/255 | excursion {:+7.2} (z {:+6.2}, gated \
+             {:+7.2}), slope pre {:+7.3} -> post {:+7.3} per 100f",
+            c.trend,
+            c.excursion,
+            c.z,
+            c.gated_excursion(),
+            c.slope_pre,
+            c.slope_post
         );
         let b: Vec<String> = c.buckets.iter().map(|v| format!("{v:+.2}")).collect();
         println!("      per-roll buckets: [{}]", b.join(", "));
     }
 }
 
+/// Apply a per-frame pixel transform, for building the synthetic drift stimuli.
+fn map_frames(
+    n: usize,
+    w: usize,
+    h: usize,
+    mut f: impl FnMut(usize, f64, &mut Image),
+) -> Vec<Image> {
+    (0..n)
+        .map(|i| {
+            let t = if n > 1 {
+                i as f64 / (n - 1) as f64
+            } else {
+                0.0
+            };
+            let mut img = smooth_frame(w, h, i);
+            f(i, t, &mut img);
+            img
+        })
+        .collect()
+}
+
 /// **CI gate for the metric itself.** A metric that cannot tell drift from motion is not evidence, so
 /// this drives [`score_clip`] on two synthetic clips with the *same* total excursion budget: one that
 /// oscillates (ordinary motion) and one that ramps one way (drift). The gate is that the drift score
 /// separates them — it is red if the descriptor, the baseline, or the bucketing stops discriminating.
+///
+/// It also pins the **lower** side of [`DRIFT_BUDGET`]: motion and noise must both land well under it,
+/// or the budget is not a budget.
 #[test]
 fn the_drift_metric_separates_drift_from_ordinary_motion() {
     const W: usize = 128;
@@ -1995,30 +2154,26 @@ fn the_drift_metric_separates_drift_from_ordinary_motion() {
 
     // Drift: the same clip with a one-way wash-out applied — luma pulled up and saturation pulled
     // down, both proportional to the frame index, i.e. exactly the bounded-window AR failure mode.
-    let drift: Vec<Image> = (0..N)
-        .map(|i| {
-            let t = i as f64 / (N - 1) as f64;
-            let mut f = smooth_frame(W, H, i);
-            for px in f.pixels.chunks_exact_mut(3) {
-                let g = 0.299 * px[0] as f64 + 0.587 * px[1] as f64 + 0.114 * px[2] as f64;
-                for c in px.iter_mut() {
-                    // Pull each channel toward a rising grey: desaturates and brightens together.
-                    let v = *c as f64;
-                    *c = (v + t * 0.85 * (g + 60.0 - v)).clamp(0.0, 255.0) as u8;
-                }
+    let drift = map_frames(N, W, H, |_, t, f| {
+        for px in f.pixels.chunks_exact_mut(3) {
+            let g = 0.299 * px[0] as f64 + 0.587 * px[1] as f64 + 0.114 * px[2] as f64;
+            for c in px.iter_mut() {
+                // Pull each channel toward a rising grey: desaturates and brightens together.
+                let v = *c as f64;
+                *c = (v + t * 0.85 * (g + 60.0 - v)).clamp(0.0, 255.0) as u8;
             }
-            f
-        })
-        .collect();
+        }
+    });
     let d = score_clip(&drift, PRE, BUCKET);
     print_drift("drift", &d);
 
-    let m_worst = worst_trend(&m);
-    let d_worst = worst_trend(&d);
+    let m_worst = worst_drift(&m);
+    let d_worst = worst_drift(&d);
     assert!(
-        m_worst < 5.0,
-        "the ordinary-motion clip scored {m_worst:.2}/255 — the metric is reading motion as drift, \
-         so it cannot support a no-drift verdict"
+        m_worst * 2.5 < DRIFT_BUDGET,
+        "the ordinary-motion clip scored {m_worst:.2}/255 against a {DRIFT_BUDGET:.2} budget — that \
+         is under a 2.5x margin, so the budget is not comfortably above the metric's own motion \
+         floor and a no-drift verdict would be resting on noise"
     );
     assert!(
         d_worst > 25.0,
@@ -2030,38 +2185,41 @@ fn the_drift_metric_separates_drift_from_ordinary_motion() {
         "drift {d_worst:.2}/255 vs motion {m_worst:.2}/255 — the separation is too small for the \
          long-clip verdict to rest on"
     );
-    // The head→tail OFFSET is explicitly NOT the statistic: on this very stimulus it reads the moving
-    // clip as drifting harder than several plausible real-drift budgets. Pin that so nobody
-    // "simplifies" the trend back into an offset.
+    // The RAW head->tail offset is explicitly not gated: on this very stimulus it reads the moving clip
+    // as drifting harder than several plausible real-drift budgets. That is what `EXCURSION_Z_MIN`
+    // exists for, and this pins both halves — the raw offset is big, and the gated one is not.
     let m_offset = m.iter().map(|c| c.excursion.abs()).fold(0.0, f64::max);
     assert!(
-        m_offset > m_worst * 3.0,
-        "the moving control's offset ({m_offset:.2}/255) is no longer much larger than its trend \
-         ({m_worst:.2}) — this stimulus has stopped demonstrating why the offset is unusable, so \
-         the choice of statistic is no longer evidenced"
+        m_offset > worst_trend(&m) * 3.0,
+        "the moving control's raw offset ({m_offset:.2}/255) is no longer much larger than its trend \
+         ({:.2}) — this stimulus has stopped demonstrating why the raw offset is unusable, so the \
+         z-gate is no longer evidenced",
+        worst_trend(&m)
+    );
+    assert!(
+        worst_excursion(&m) < DRIFT_BUDGET,
+        "the z-gate let the moving control's offset through at {:.2}/255 — EXCURSION_Z_MIN is too \
+         low to keep ordinary motion out of the verdict",
+        worst_excursion(&m)
     );
     // A second, INDEPENDENT way the metric could be fooled: per-frame noise. A jittery clip has huge
     // frame-to-frame variance and goes nowhere, and a metric that reported that as drift would flag
     // every real clip. Same stimulus, plus a large zero-mean per-frame brightness jitter.
     let mut lcg = 0x2545_F491_4F6C_DD1Du64;
-    let jitter: Vec<Image> = (0..N)
-        .map(|i| {
-            lcg = lcg
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            let j = ((lcg >> 33) as f64 / (1u64 << 31) as f64 - 0.5) * 60.0;
-            let mut f = smooth_frame(W, H, i);
-            for c in f.pixels.iter_mut() {
-                *c = (*c as f64 + j).clamp(0.0, 255.0) as u8;
-            }
-            f
-        })
-        .collect();
+    let jitter = map_frames(N, W, H, |_, _, f| {
+        lcg = lcg
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let j = ((lcg >> 33) as f64 / (1u64 << 31) as f64 - 0.5) * 60.0;
+        for c in f.pixels.iter_mut() {
+            *c = (*c as f64 + j).clamp(0.0, 255.0) as u8;
+        }
+    });
     let j = score_clip(&jitter, PRE, BUCKET);
     print_drift("jitter", &j);
-    let j_worst = worst_trend(&j);
+    let j_worst = worst_drift(&j);
     assert!(
-        j_worst < 5.0,
+        j_worst < DRIFT_BUDGET,
         "a zero-mean per-frame jitter scored {j_worst:.2}/255 — the metric is reading noise as \
          drift, so it cannot support a drift verdict either"
     );
@@ -2087,11 +2245,213 @@ fn the_drift_metric_separates_drift_from_ordinary_motion() {
     );
 }
 
-/// One measured row of the S18 sweep.
+/// **CI gate for the metric's blind spots.** The linear full-amplitude ramp above is the shape an OLS
+/// trend is *maximally* good at; passing on it is not a sensitivity floor. This drives [`score_clip`]
+/// on three failure shapes an autoregressive loop is at least as likely to produce, each of which
+/// defeats a single-statistic, single-axis descriptor:
+///
+/// 1. **Plateauing wash-out** — the loop settles into a degenerate attractor: brightness ramps for a
+///    third of the clip and then holds. The OLS trend over the post-roll segment is structurally small;
+///    only the excursion sees it. (Measured at TREND ≈ 11.9 against excursion ≈ 32.)
+/// 2. **Localized subject collapse** — the centre of the frame goes dark while the surround brightens
+///    to hold the global mean. Every *global* moment is unmoved; only the spatial component sees it.
+/// 3. **Hue rotation at constant luma and saturation** — a colour cast develops. Luma, contrast and
+///    max−min saturation are all unmoved; only the opponent-colour components see it.
+///
+/// Each must exceed [`DRIFT_BUDGET`], and — because "it scored high on *something*" is not enough —
+/// each is also asserted to be caught by the *specific* statistic/axis that exists for it, so the
+/// coverage cannot silently rot away.
+#[test]
+fn the_drift_metric_catches_the_plausible_ar_failure_shapes() {
+    const W: usize = 128;
+    const H: usize = 96;
+    const N: usize = 180;
+    const PRE: usize = 24;
+    const BUCKET: usize = 12;
+
+    // 1. Plateau: +40/255 wash-out that starts at the first eviction (frame `PRE` — a real AR drift
+    //    cannot begin before the window first rolls), is fully in place by frame 54, and then holds.
+    let plateau = map_frames(N, W, H, |i, _, f| {
+        let a = 40.0 * ((i.saturating_sub(PRE) as f64 / (54 - PRE) as f64).min(1.0));
+        for c in f.pixels.iter_mut() {
+            *c = (*c as f64 + a).clamp(0.0, 255.0) as u8;
+        }
+    });
+    let p = score_clip(&plateau, PRE, BUCKET);
+    print_drift("plateau", &p);
+    assert!(
+        worst_drift(&p) > DRIFT_BUDGET,
+        "a permanent +40/255 wash-out that plateaus scored {:.2}/255, inside the {DRIFT_BUDGET:.2} \
+         budget — the metric is blind to the most likely AR failure shape",
+        worst_drift(&p)
+    );
+    assert!(
+        worst_excursion(&p) > worst_trend(&p),
+        "the plateau was caught by the TREND ({:.2}) not the excursion ({:.2}) — this stimulus has \
+         stopped demonstrating why the excursion is gated, so MAJOR-4 is no longer evidenced",
+        worst_trend(&p),
+        worst_excursion(&p)
+    );
+
+    // 1b. STEP plateau: the same +40/255 wash-out, but the loop falls into the degenerate attractor
+    //     within one AR chunk of the first eviction and then holds. This is where an OLS trend is
+    //     *genuinely* blind — a step early in the segment leaves almost no slope — so it is the
+    //     stimulus that makes the excursion gate load-bearing rather than merely redundant.
+    let step = map_frames(N, W, H, |i, _, f| {
+        if i >= PRE + 4 {
+            for c in f.pixels.iter_mut() {
+                *c = (*c as f64 + 40.0).clamp(0.0, 255.0) as u8;
+            }
+        }
+    });
+    let st = score_clip(&step, PRE, BUCKET);
+    print_drift("step", &st);
+    assert!(
+        worst_trend(&st) < DRIFT_BUDGET,
+        "the step-onset plateau scored {:.2}/255 on the TREND alone — this stimulus no longer \
+         demonstrates the OLS blind spot, so it cannot evidence why the excursion is gated",
+        worst_trend(&st)
+    );
+    assert!(
+        worst_drift(&st) > DRIFT_BUDGET,
+        "a +40/255 wash-out that lands one chunk after the first eviction and holds scored {:.2}/255 \
+         — the gate is blind to a degenerate attractor, which is the most likely AR failure",
+        worst_drift(&st)
+    );
+
+    // 2. Localized collapse: the central 12% of the frame fades to black while the surround brightens
+    //    to keep the GLOBAL luma mean where it started. Statistically invisible to global moments.
+    let (cx, cy) = (W as f64 / 2.0, H as f64 / 2.0);
+    let r2 = 0.12 * (W * H) as f64 / std::f64::consts::PI;
+    let localized = map_frames(N, W, H, |_, t, f| {
+        let (mut inside, mut outside) = (0usize, 0usize);
+        let mut lost = 0.0f64;
+        for (i, px) in f.pixels.chunks_exact(3).enumerate() {
+            let (x, y) = ((i % W) as f64 - cx, (i / W) as f64 - cy);
+            let luma = 0.299 * px[0] as f64 + 0.587 * px[1] as f64 + 0.114 * px[2] as f64;
+            if x * x + y * y <= r2 {
+                inside += 1;
+                lost += t * luma;
+            } else {
+                outside += 1;
+            }
+        }
+        let comp = lost / outside.max(1) as f64;
+        let _ = inside;
+        for (i, px) in f.pixels.chunks_exact_mut(3).enumerate() {
+            let (x, y) = ((i % W) as f64 - cx, (i / W) as f64 - cy);
+            if x * x + y * y <= r2 {
+                for c in px.iter_mut() {
+                    *c = (*c as f64 * (1.0 - t)).clamp(0.0, 255.0) as u8;
+                }
+            } else {
+                for c in px.iter_mut() {
+                    *c = (*c as f64 + comp).clamp(0.0, 255.0) as u8;
+                }
+            }
+        }
+    });
+    let l = score_clip(&localized, PRE, BUCKET);
+    print_drift("localized", &l);
+    assert!(
+        worst_drift(&l) > DRIFT_BUDGET,
+        "a localized subject collapse that holds the global mean scored {:.2}/255, inside the \
+         {DRIFT_BUDGET:.2} budget — global moments alone cannot see subject-identity loss",
+        worst_drift(&l)
+    );
+    // ...and it is the SPATIAL component that caught it, which is why that component exists.
+    let spatial = l[5].trend.abs().max(l[5].gated_excursion().abs());
+    assert!(
+        spatial > DRIFT_BUDGET,
+        "the spatial component scored only {spatial:.2}/255 on a localized collapse — the block-luma \
+         spread is not doing the job it was added for"
+    );
+
+    // 3. Hue rotation at constant luma AND constant chroma magnitude: rotate the (Cb, Cr) opponent
+    //    pair through 180 degrees over the clip. Luma is preserved exactly by reconstruction and the
+    //    chroma *magnitude* is preserved by the rotation, so neither luma-mean, contrast, saturation
+    //    nor the spatial spread can see it — only the opponent pair, which ends sign-reversed.
+    let hue = map_frames(N, W, H, |_, t, f| {
+        let (s, c) = (std::f64::consts::PI * t).sin_cos();
+        for px in f.pixels.chunks_exact_mut(3) {
+            let (r, g, b) = (px[0] as f64, px[1] as f64, px[2] as f64);
+            let y = 0.299 * r + 0.587 * g + 0.114 * b;
+            let (cb, cr) = (b - y, r - y);
+            let (cb2, cr2) = (cb * c - cr * s, cb * s + cr * c);
+            let (r2, b2) = (y + cr2, y + cb2);
+            let g2 = (y - 0.299 * r2 - 0.114 * b2) / 0.587;
+            px[0] = r2.clamp(0.0, 255.0) as u8;
+            px[1] = g2.clamp(0.0, 255.0) as u8;
+            px[2] = b2.clamp(0.0, 255.0) as u8;
+        }
+    });
+    let hu = score_clip(&hue, PRE, BUCKET);
+    print_drift("hue", &hu);
+    assert!(
+        worst_drift(&hu) > DRIFT_BUDGET,
+        "a 180-degree hue rotation at constant luma scored {:.2}/255, inside the {DRIFT_BUDGET:.2} \
+         budget — the descriptor cannot see a colour cast",
+        worst_drift(&hu)
+    );
+    let opponent = hu[3..5]
+        .iter()
+        .map(|c| c.trend.abs().max(c.gated_excursion().abs()))
+        .fold(0.0, f64::max);
+    assert!(
+        opponent > DRIFT_BUDGET,
+        "the opponent-colour components scored only {opponent:.2}/255 on a hue rotation — they are \
+         not doing the job they were added for"
+    );
+
+    // The budget's UPPER pin: the weakest of these four shapes bounds how high `DRIFT_BUDGET` may be
+    // set. Assert the margin explicitly, so raising the budget past what the metric can actually
+    // detect turns this gate red instead of silently widening the blind spot.
+    let weakest = [&p, &st, &l, &hu]
+        .into_iter()
+        .map(worst_drift)
+        .fold(f64::INFINITY, f64::min);
+    assert!(
+        weakest > DRIFT_BUDGET * 1.3,
+        "the weakest plausible failure shape scores {weakest:.2}/255 against a {DRIFT_BUDGET:.2} \
+         budget — under a 1.3x margin, so the budget is too close to the metric's detection limit \
+         for a no-drift verdict to mean anything"
+    );
+
+    // No descriptor component may be INERT: a channel that returns the same number on every stimulus
+    // is contributing nothing and would silently narrow the coverage this gate claims. Compare each
+    // component's trend across the four stimuli and require it to actually move somewhere.
+    let motion: Vec<Image> = (0..N).map(|i| smooth_frame(W, H, i)).collect();
+    let mo = score_clip(&motion, PRE, BUCKET);
+    for (c, name) in DESCRIPTOR_NAMES.iter().enumerate().map(|(i, n)| (i, *n)) {
+        let vals = [
+            mo[c].trend,
+            p[c].trend,
+            l[c].trend,
+            hu[c].trend,
+            mo[c].excursion,
+            p[c].excursion,
+            l[c].excursion,
+            hu[c].excursion,
+        ];
+        let span = vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max)
+            - vals.iter().cloned().fold(f64::INFINITY, f64::min);
+        assert!(
+            span > 1.0,
+            "descriptor component `{name}` moves only {span:.4}/255 across four different failure \
+             shapes — it is inert and the descriptor is narrower than it claims"
+        );
+    }
+}
+
+/// One measured row of the S18 sweep, as printed by the gated real-weight run.
 struct S18Row {
-    label: &'static str,
-    /// The verdict statistic: worst absolute one-way component trend over the rolling portion.
-    worst: f64,
+    label: String,
+    /// The verdict statistic: worst trend or worst z-gated excursion (see [`worst_drift`]).
+    drift: f64,
+    trend: f64,
+    excursion: f64,
+    /// Worst per-100-frame slope — the only length-comparable statistic, used for row Z.
+    slope: f64,
     rolls: usize,
     /// MLX active peak for this row's AR loop — the sink/window memory cost, measured.
     peak: usize,
@@ -2100,39 +2460,55 @@ struct S18Row {
     /// Mean |Δ| per frame over the first / last third: the freeze check.
     head_motion: f64,
     tail_motion: f64,
+    row: char,
+    seed: u64,
 }
 
-/// One row of the S18 sweep. Every row generates the **same** clip (same prompt, seed, geometry and
-/// latent-frame count) so the only free variables are the KV read window and the sink anchor.
+/// One row of the S18 sweep. Rows share a prompt, seed and geometry, but **not** a clip: changing
+/// `local_attn_size` changes the attention mask and therefore the sampling trajectory. Rows D and Z are
+/// the within-regime controls (same bounded local-attention path); row E is an out-of-regime reference.
 struct DriftRun {
+    row: char,
     label: &'static str,
     window: i64,
     sink: usize,
+    /// Latent frames for this row. Row Z is deliberately short — short enough that the shipped window
+    /// never evicts — so only its *slope* is comparable with the long rows.
+    latent_frames: Option<usize>,
 }
 
 /// **sc-15127 (S18) — does a long batch clip drift as the bounded KV window rolls, and does a
 /// first-chunk sink anchor fix it?**
 ///
-/// Generates the **same clip** five times — varying only the KV read window and the sink anchor —
-/// scores each with [`score_clip`], and prints the table the verdict rests on. Each row's MLX peak is
-/// reported too, so the sink's KV cost is measured rather than asserted: a sink is permanently
+/// Generates the clip once per (row, seed) — varying only the KV read window, the sink anchor and the
+/// seed — scores each with [`score_clip`], and prints the table the verdict rests on. Each row's MLX
+/// peak is reported too, so the sink's KV cost is measured rather than asserted: a sink is permanently
 /// resident, and the bounded window exists precisely because KV is expensive on this host.
 ///
-/// ⚠️ **Geometry — the null control has to fit in memory.** Row E runs the checkpoint's *global*
+/// **Rows.** `A` shipped (window 6, sink 0) · `B` sink 1 · `C` sink 3 · `D` wide window (the
+/// within-regime dose-response) · `E` the checkpoint's global window (an out-of-regime *reference*, not
+/// a floor — see the module comment) · `Z` the within-regime zero-eviction rate floor (shipped window,
+/// clip short enough never to roll).
+///
+/// **Driving it.** `KREA_S18_ROWS` (default `ABCDEZ`) selects rows; `KREA_S18_SEEDS` (comma-separated,
+/// default `7`) selects seeds. Each (row, seed) prints one `S18CELL` TSV line, so a long sweep can be
+/// run in pieces and re-aggregated without holding a five-hour process open.
+///
+/// ⚠️ **Geometry — the global reference has to fit in memory.** Row E runs the checkpoint's *global*
 /// window, whose KV is `latent_frames × frame_seq_length` tokens at ≈546 KB/token. At the 832×480
 /// reference bucket a 45-latent-frame clip is 70,200 tokens ≈ 38 GiB of KV before activations, and this
 /// 128 GiB host **SIGKILLs** it (measured, sc-15127: jetsam at step 39/75) — which is exactly the
 /// ~27 GB-of-KV problem [`mac_ar_config`](mlx_gen_krea_realtime::mac_ar_config) exists to dodge, so it
-/// is a finding rather than a harness bug. Run the full five-row sweep at a bucket where the global row
-/// fits (`KREA_SMOKE_W=640 KREA_SMOKE_H=384` → 960 tok/frame → 43,200 tokens ≈ 15 GiB, measured to
-/// complete); the bounded rows A–D can additionally be run at 832×480 to confirm the ordering carries
-/// to the product bucket, which they do.
+/// is a finding rather than a harness bug. Run row E only at a bucket where it fits
+/// (`KREA_SMOKE_W=640 KREA_SMOKE_H=384` → 960 tok/frame → 43,200 tokens ≈ 15 GiB, measured to
+/// complete). The bounded rows run at both buckets, and **both buckets are recorded** — see
+/// [`the_recorded_s18_sweep_is_what_the_docs_claim`].
 ///
 /// ⚠️ Must be run on a tree that has sc-15325 (the tiled-decode fix). Before it, the decode injected an
 /// 8-output-frame-period artifact that a drift metric reads as AR drift; an earlier attempt at this
 /// exact measurement drew the wrong conclusion from it.
 #[test]
-#[ignore = "real snapshot, ~30 min of GPU; run with --ignored on macOS (see module doc)"]
+#[ignore = "real snapshot, hours of GPU; run with --ignored on macOS (see module doc)"]
 fn long_clip_coherence_under_the_bounded_window() {
     use mlx_gen_krea_realtime::{
         generate_latents, load_krea_realtime_transformer_with_quant, ArGenParams,
@@ -2145,53 +2521,84 @@ fn long_clip_coherence_under_the_bounded_window() {
     let w = env_usize("KREA_SMOKE_W", 832);
     let h = env_usize("KREA_SMOKE_H", 480);
     let long_lat = env_usize("KREA_S18_LATENT_FRAMES", 45);
-    let seed = env_usize("KREA_SMOKE_SEED", 7) as u64;
+    let seeds: Vec<u64> = std::env::var("KREA_S18_SEEDS")
+        .unwrap_or_else(|_| "7".to_string())
+        .split(',')
+        .filter_map(|s| s.trim().parse().ok())
+        .collect();
+    assert!(!seeds.is_empty(), "KREA_S18_SEEDS parsed to nothing");
+    let want_rows = std::env::var("KREA_S18_ROWS").unwrap_or_else(|_| "ABCDEZ".to_string());
     let (latent_h, latent_w) = (h / 8, w / 8);
 
     let base = KreaRealtimeConfig::krea_realtime_14b();
     let fpb = base.ar.num_frames_per_block; // 3 latent frames per AR chunk
     let shipped_window = base.ar.streaming_local_attn_frames() as i64; // 6 latent frames
     let wide_window = shipped_window * 2 + 3; // 15 latent frames — the dose-response control
+                                              // Row Z: the longest clip the SHIPPED window never evicts on. Chunk `c` commits `fpb*(c+1)` latent
+                                              // frames and evicts once that exceeds the window, so `shipped_window` latent frames is exactly it.
+    let zero_roll_lat = shipped_window as usize;
 
-    // Every row is scored over the SAME split, fixed by the shipped window's geometry: the baseline is
-    // the output frames the *shipped* configuration produces before its first eviction, and the trend
-    // is measured over everything after. A per-row split would make the rows incomparable — and the
-    // zero-roll control's split would be the whole clip, leaving it with no trend to measure at all.
+    // Every long row is scored over the SAME split, fixed by the shipped window's geometry: the
+    // baseline is the output frames the *shipped* configuration produces before its first eviction, and
+    // the trend is measured over everything after. A per-row split would make the rows incomparable.
     let pre_len = shipped_window as usize * 4;
     let bucket = fpb * 4; // one AR chunk == one window roll == 12 output frames
+                          // Row Z's whole clip is `pre_len` frames long, so it needs its own (shorter) baseline. Its trend is
+                          // therefore NOT comparable with the long rows — only its slope is, which is what it is used for.
+    let z_pre_len = fpb * 4;
 
-    // Row E is the **null control**: the checkpoint-faithful *global* window. Same clip, same seed,
-    // full history, zero evictions — so whatever trend it shows is this content's ordinary motion, and
-    // it is the floor everything else is judged against. It is also the most expensive row (the KV it
-    // avoids evicting is the ~27 GB-of-KV problem `mac_ar_config` exists to dodge), so it runs LAST:
-    // if this host cannot afford it, the four bounded rows above it have already printed.
-    let runs = [
+    let all_runs = [
         DriftRun {
+            row: 'A',
             label: "A shipped    (window  6, sink 0)",
             window: shipped_window,
             sink: 0,
+            latent_frames: None,
         },
         DriftRun {
+            row: 'B',
             label: "B anchor 1f  (window  6, sink 1)",
             window: shipped_window,
             sink: 1,
+            latent_frames: None,
         },
         DriftRun {
+            row: 'C',
             label: "C anchor 3f  (window  6, sink 3)",
             window: shipped_window,
             sink: fpb,
+            latent_frames: None,
         },
         DriftRun {
+            row: 'D',
             label: "D wide win   (window 15, sink 0)",
             window: wide_window,
             sink: 0,
+            latent_frames: None,
         },
         DriftRun {
-            label: "E null ctl   (global window, sink 0)",
+            row: 'E',
+            label: "E global ref (global window, sink 0)",
             window: -1,
             sink: 0,
+            latent_frames: None,
+        },
+        DriftRun {
+            row: 'Z',
+            label: "Z zero-roll  (window  6, sink 0, short)",
+            window: shipped_window,
+            sink: 0,
+            latent_frames: Some(zero_roll_lat),
         },
     ];
+    let runs: Vec<&DriftRun> = all_runs
+        .iter()
+        .filter(|r| want_rows.contains(r.row))
+        .collect();
+    assert!(
+        !runs.is_empty(),
+        "KREA_S18_ROWS `{want_rows}` selected no rows"
+    );
 
     // --- Encode the prompt ONCE, then drop the ~11 GB text encoder before any DiT is resident. ---
     let prompt = "a red fox trotting through a snowy pine forest at sunrise, drifting snow, \
@@ -2227,160 +2634,190 @@ fn long_clip_coherence_under_the_bounded_window() {
 
     let mut results: Vec<S18Row> = Vec::new();
     for r in &runs {
-        let mut cfg = base.clone();
-        cfg.ar.local_attn_size = r.window;
-        cfg.ar.sink_size = r.sink;
-        cfg.ar.frame_seq_length =
-            (latent_h / cfg.wan.patch_size.1) * (latent_w / cfg.wan.patch_size.2);
-        cfg.ar.seq_length = long_lat * cfg.ar.frame_seq_length;
-
-        let chunks = long_lat.div_ceil(fpb);
-        // Chunk `c` commits latent frames up to `fpb*(c+1)`; it evicts once that exceeds the window.
-        // A global window (`local_attn_size < 0`) never evicts — that is the null control.
-        let rolls = if r.window < 0 {
-            0
-        } else {
-            (0..chunks)
-                .filter(|c| fpb * (c + 1) > r.window as usize)
-                .count()
-        };
-
-        println!(
-            "=== {} | {long_lat} latent frames, {chunks} chunks, {rolls} evicting, baseline \
-             {pre_len} output frames, window {} tok",
-            r.label,
-            cfg.ar.max_attention_size()
-        );
-
-        mlx_rs::memory::clear_cache();
-        mlx_rs::memory::reset_peak_memory();
-        let t0 = Instant::now();
-        let latents = {
-            let dw =
-                mlx_gen::weights::Weights::from_file(root.join("dit.safetensors")).expect("DiT");
-            let raw: std::collections::HashMap<String, Array> = dw
-                .keys()
-                .map(|k| (k.to_string(), dw.get(k).expect("listed key").clone()))
-                .collect();
-            let (dit, _) =
-                load_krea_realtime_transformer_with_quant(raw, &cfg).expect("load the DiT");
-            let transformer = CausalKreaTransformer::new(dit, &cfg);
-            let params = ArGenParams {
-                seed,
-                steps: None,
-                num_latent_frames: long_lat,
-                latent_height: latent_h,
-                latent_width: latent_w,
-                fps: 24,
+        for &seed in &seeds {
+            let lat = r.latent_frames.unwrap_or(long_lat);
+            let row_pre_len = if r.latent_frames.is_some() {
+                z_pre_len
+            } else {
+                pre_len
             };
-            // Print a per-step mark. This sweep is long enough that a silent run is indistinguishable
-            // from a hung one, and the per-step cadence is also how a memory-contended row (the global
-            // control especially) announces itself.
-            let mut tstep = Instant::now();
-            let l = generate_latents(
-                &transformer,
-                &cfg,
-                &context,
-                &params,
+            let mut cfg = base.clone();
+            cfg.ar.local_attn_size = r.window;
+            cfg.ar.sink_size = r.sink;
+            cfg.ar.frame_seq_length =
+                (latent_h / cfg.wan.patch_size.1) * (latent_w / cfg.wan.patch_size.2);
+            cfg.ar.seq_length = lat * cfg.ar.frame_seq_length;
+
+            let chunks = lat.div_ceil(fpb);
+            // Chunk `c` commits latent frames up to `fpb*(c+1)`; it evicts once that exceeds the
+            // window. A global window (`local_attn_size < 0`) never evicts.
+            let rolls = if r.window < 0 {
+                0
+            } else {
+                (0..chunks)
+                    .filter(|c| fpb * (c + 1) > r.window as usize)
+                    .count()
+            };
+
+            println!(
+                "=== {} seed {seed} | {lat} latent frames, {chunks} chunks, {rolls} evicting, \
+                 baseline {row_pre_len} output frames, window {} tok",
+                r.label,
+                cfg.ar.max_attention_size()
+            );
+
+            mlx_rs::memory::clear_cache();
+            mlx_rs::memory::reset_peak_memory();
+            let t0 = Instant::now();
+            let latents = {
+                let dw = mlx_gen::weights::Weights::from_file(root.join("dit.safetensors"))
+                    .expect("DiT");
+                let raw: std::collections::HashMap<String, Array> = dw
+                    .keys()
+                    .map(|k| (k.to_string(), dw.get(k).expect("listed key").clone()))
+                    .collect();
+                let (dit, _) =
+                    load_krea_realtime_transformer_with_quant(raw, &cfg).expect("load the DiT");
+                let transformer = CausalKreaTransformer::new(dit, &cfg);
+                let params = ArGenParams {
+                    seed,
+                    steps: None,
+                    num_latent_frames: lat,
+                    latent_height: latent_h,
+                    latent_width: latent_w,
+                    fps: 24,
+                };
+                // Print a per-step mark. This sweep is long enough that a silent run is
+                // indistinguishable from a hung one, and the per-step cadence is also how a
+                // memory-contended row (the global reference especially) announces itself.
+                let mut tstep = Instant::now();
+                let l = generate_latents(
+                    &transformer,
+                    &cfg,
+                    &context,
+                    &params,
+                    &mlx_gen::CancelFlag::default(),
+                    &mut |p| {
+                        if let Progress::Step { current, total } = p {
+                            let now = Instant::now();
+                            println!(
+                                "    step {current:>3}/{total} (+{:.1?}, {:.1?} elapsed)",
+                                now.duration_since(tstep),
+                                t0.elapsed()
+                            );
+                            tstep = now;
+                        }
+                    },
+                )
+                .expect("generate latents");
+                // MLX is lazy — without this the AR loop has not actually run and the peak below is a
+                // shape calculation. Three measurements in this epic read ~0 for exactly this reason.
+                mlx_rs::transforms::eval([&l]).expect("materialize latents");
+                l
+            };
+            let ar_peak = mlx_rs::memory::get_peak_memory();
+            let ar_wall = t0.elapsed();
+            mlx_rs::memory::clear_cache();
+
+            let out_frames = lat * 4;
+            let tiling =
+                decode_tiling(h, w, out_frames as i32).expect("decode policy must be feasible");
+            let frames = match decode_latents_to_video(
+                &vae,
+                &latents,
+                24,
+                None,
+                tiling.as_ref(),
                 &mlx_gen::CancelFlag::default(),
-                &mut |p| {
-                    if let Progress::Step { current, total } = p {
-                        let now = Instant::now();
-                        println!(
-                            "    step {current:>3}/{total} (+{:.1?}, {:.1?} elapsed)",
-                            now.duration_since(tstep),
-                            t0.elapsed()
-                        );
-                        tstep = now;
-                    }
-                },
             )
-            .expect("generate latents");
-            // MLX is lazy — without this the AR loop has not actually run and the peak below is a
-            // shape calculation. Three measurements in this epic read ~0 for exactly this reason.
-            mlx_rs::transforms::eval([&l]).expect("materialize latents");
-            l
-        };
-        let ar_peak = mlx_rs::memory::get_peak_memory();
-        let ar_wall = t0.elapsed();
-        mlx_rs::memory::clear_cache();
+            .expect("VAE decode")
+            {
+                GenerationOutput::Video { frames, .. } => frames,
+                other => panic!("expected a Video output, got {other:?}"),
+            };
+            drop(latents);
+            mlx_rs::memory::clear_cache();
 
-        let out_frames = long_lat * 4;
-        let tiling =
-            decode_tiling(h, w, out_frames as i32).expect("decode policy must be feasible");
-        let frames = match decode_latents_to_video(
-            &vae,
-            &latents,
-            24,
-            None,
-            tiling.as_ref(),
-            &mlx_gen::CancelFlag::default(),
-        )
-        .expect("VAE decode")
-        {
-            GenerationOutput::Video { frames, .. } => frames,
-            other => panic!("expected a Video output, got {other:?}"),
-        };
-        drop(latents);
-        mlx_rs::memory::clear_cache();
+            assert_eq!(frames.len(), out_frames, "{}: decoded frame count", r.label);
+            println!(
+                "  AR wall {:.1?} ({:.1?}/chunk), MLX active peak {:.2} GiB, decode plan {tiling:?}",
+                ar_wall,
+                ar_wall / chunks as u32,
+                gib(ar_peak)
+            );
+            report_artifacts(&frames, r.label);
+            let d = score_clip(&frames, row_pre_len, bucket);
+            print_drift(r.label, &d);
+            dump_frames(
+                &frames,
+                &format!("s18_{}_w{}_sink{}_{lat}_s{seed}", r.row, r.window, r.sink),
+            );
 
-        assert_eq!(frames.len(), out_frames, "{}: decoded frame count", r.label);
-        println!(
-            "  AR wall {:.1?} ({:.1?}/chunk), MLX active peak {:.2} GiB, decode plan {tiling:?}",
-            ar_wall,
-            ar_wall / chunks as u32,
-            gib(ar_peak)
-        );
-        report_artifacts(&frames, r.label);
-        let d = score_clip(&frames, pre_len, bucket);
-        print_drift(r.label, &d);
-        dump_frames(
-            &frames,
-            &format!("s18_w{}_sink{}_{long_lat}", r.window, r.sink),
-        );
-
-        // Two INDEPENDENT cross-checks, because "the trend statistic is small" is not by itself a
-        // quality claim:
-        //   * highlight clipping — what a viewer actually sees blow out, and a metric with no
-        //     construction in common with `score_clip`. If it disagrees with the trend, the trend is
-        //     not measuring quality.
-        //   * tail motion — a clip that has stopped moving also has no trend. Freeze and drift are the
-        //     two AR failure modes, and a gate that only sees one can be passed by the other.
-        let (clip_mean, _) = clip_stats(&frames);
-        let deltas: Vec<f64> = frame_stats(&frames)
-            .iter()
-            .skip(1)
-            .map(|s| s.delta)
-            .collect();
-        let third = (deltas.len() / 3).max(1);
-        let head_motion = mean_f64(&deltas[..third]);
-        let tail_motion = mean_f64(&deltas[deltas.len() - third..]);
-        println!(
-            "    motion: head {head_motion:.2}/255 -> tail {tail_motion:.2}/255 per frame; \
-             clipping mean {clip_mean:.2}%"
-        );
-        results.push(S18Row {
-            label: r.label,
-            worst: worst_trend(&d),
-            rolls,
-            peak: ar_peak,
-            clip_mean,
-            head_motion,
-            tail_motion,
-        });
+            // Two INDEPENDENT cross-checks, because "the drift statistic is small" is not by itself a
+            // quality claim:
+            //   * highlight clipping — what a viewer actually sees blow out, and a metric with no
+            //     construction in common with `score_clip`.
+            //   * tail motion — a clip that has stopped moving also has no trend. Freeze and drift are
+            //     the two AR failure modes, and a gate that only sees one can be passed by the other.
+            let (clip_mean, _) = clip_stats(&frames);
+            let deltas: Vec<f64> = frame_stats(&frames)
+                .iter()
+                .skip(1)
+                .map(|s| s.delta)
+                .collect();
+            let third = (deltas.len() / 3).max(1);
+            let head_motion = mean_f64(&deltas[..third]);
+            let tail_motion = mean_f64(&deltas[deltas.len() - third..]);
+            println!(
+                "    motion: head {head_motion:.2}/255 -> tail {tail_motion:.2}/255 per frame; \
+                 clipping mean {clip_mean:.2}%"
+            );
+            // Machine-readable, so a sweep split across processes can be re-aggregated.
+            println!(
+                "S18CELL\t{}\t{seed}\t{w}x{h}\t{lat}\t{rolls}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{}\t\
+                 {:.4}\t{:.4}\t{:.4}",
+                r.row,
+                worst_drift(&d),
+                worst_trend(&d),
+                worst_excursion(&d),
+                worst_slope(&d),
+                ar_peak,
+                clip_mean,
+                head_motion,
+                tail_motion
+            );
+            results.push(S18Row {
+                label: format!("{} s{seed}", r.label),
+                drift: worst_drift(&d),
+                trend: worst_trend(&d),
+                excursion: worst_excursion(&d),
+                slope: worst_slope(&d),
+                rolls,
+                peak: ar_peak,
+                clip_mean,
+                head_motion,
+                tail_motion,
+                row: r.row,
+                seed,
+            });
+        }
     }
     std::env::remove_var("WAN_VAE_BUDGET_GIB");
 
-    println!("=== sc-15127 S18 summary ===================================================");
+    println!("=== sc-15127 S18 summary ({w}x{h}) ==========================================");
     println!(
-        "  row                                  rolls  worst trend  peak GiB  clip%  tail motion"
+        "  row                                       rolls   drift   trend   excur  slope/100f  \
+         peak GiB  clip%  tail motion"
     );
     for r in &results {
         println!(
-            "  {:<36} {:>5}  {:>8.2}/255  {:>8.2}  {:>5.2}  {:>8.2}",
+            "  {:<41} {:>5}  {:>6.2}  {:>6.2}  {:>6.2}  {:>10.3}  {:>8.2}  {:>5.2}  {:>8.2}",
             r.label,
             r.rolls,
-            r.worst,
+            r.drift,
+            r.trend,
+            r.excursion,
+            r.slope,
             gib(r.peak),
             r.clip_mean,
             r.tail_motion
@@ -2388,7 +2825,7 @@ fn long_clip_coherence_under_the_bounded_window() {
     }
 
     // FREEZE gate, every row. A frozen tail is the other way a bounded window can ruin a long clip,
-    // and it would read as *excellent* on a drift metric — so the no-drift verdict is only meaningful
+    // and it would read as *excellent* on a drift metric — so a no-drift verdict is only meaningful
     // alongside this.
     for r in &results {
         assert!(
@@ -2400,179 +2837,728 @@ fn long_clip_coherence_under_the_bounded_window() {
             r.head_motion
         );
     }
-    // CROSS-CHECK gate: the shipped bounded window must not blow highlights harder than the
-    // fully-anchored global control. This is the independent confirmation that a low trend score is a
-    // healthy clip and not an artifact of the trend statistic.
-    assert!(
-        results[0].clip_mean <= results[4].clip_mean,
-        "the shipped bounded window clips {:.2}% of pixels against the global control's {:.2}% — the \
-         independent metric disagrees with the trend statistic, so neither verdict is supportable",
-        results[0].clip_mean,
-        results[4].clip_mean
-    );
+    // CROSS-CHECK gate: highlight clipping, an independent metric, must agree that the shipped bounded
+    // window is a healthy operating point. Judged **within regime** against the wider bounded window
+    // (row D) — comparing it against the global row would be comparing against a different attention
+    // regime, and against an absolute ceiling, so a run where everything clips cannot pass by being
+    // uniformly bad.
+    const CLIP_CEILING: f64 = 8.0;
+    let mean_clip = |row: char| {
+        let v: Vec<f64> = results
+            .iter()
+            .filter(|r| r.row == row)
+            .map(|r| r.clip_mean)
+            .collect();
+        (!v.is_empty()).then(|| mean_f64(&v))
+    };
+    if let Some(a) = mean_clip('A') {
+        assert!(
+            a <= CLIP_CEILING,
+            "the shipped bounded window clips {a:.2}% of pixels — over the {CLIP_CEILING:.1}% \
+             ceiling, so it is not a healthy operating point whatever the drift statistic says"
+        );
+        if let Some(d) = mean_clip('D') {
+            assert!(
+                a <= d * 2.0,
+                "the shipped window clips {a:.2}% against the wider bounded window's {d:.2}% — the \
+                 within-regime dose-response says tightening the window blows highlights, which the \
+                 drift statistic must not be allowed to paper over"
+            );
+        }
+    }
+    // Row Z's contribution: the within-regime, zero-eviction rate. The shipped row's rate must not be
+    // wildly above the rate the SAME attention regime shows with no evictions at all.
+    let mean_slope = |row: char| {
+        let v: Vec<f64> = results
+            .iter()
+            .filter(|r| r.row == row)
+            .map(|r| r.slope)
+            .collect();
+        (!v.is_empty()).then(|| mean_f64(&v))
+    };
+    if let (Some(a), Some(z)) = (mean_slope('A'), mean_slope('Z')) {
+        println!(
+            "  within-regime rate floor: zero-eviction row Z {z:.3}/100f vs shipped row A \
+             {a:.3}/100f ({:.2}x)",
+            a / z.max(1e-6)
+        );
+    }
 
     let sweep = S18Sweep {
-        shipped: results[0].worst,
-        sink1: results[1].worst,
-        sink3: results[2].worst,
-        wide: results[3].worst,
-        global: results[4].worst,
-        shipped_rolls: results[0].rolls,
-        global_rolls: results[4].rolls,
+        bucket: format!("{w}x{h}"),
+        cells: results
+            .iter()
+            .map(|r| S18Cell {
+                row: r.row,
+                seed: r.seed,
+                rolls: r.rolls,
+                trend: r.trend,
+                excursion: r.excursion,
+            })
+            .collect(),
     };
     println!("  {}", sweep.summary());
-    match sweep.verdict() {
-        Ok(v) => println!("  VERDICT: {v}"),
-        Err(e) => panic!("{e}"),
+    if want_rows.contains('A') {
+        match sweep.verdict() {
+            Ok(v) => println!("  VERDICT: {v}"),
+            Err(e) => panic!("{e}"),
+        }
+    } else {
+        println!(
+            "  (partial sweep: rows `{want_rows}` do not include the shipped row A, so no verdict \
+             is computed — re-aggregate the S18CELL lines)"
+        );
     }
 }
 
-/// The five trend figures the S18 verdict is computed from, split out of the real-weight driver so the
-/// **decision rule** is gated in CI rather than only exercised on the one gated GPU run.
+/// One measured (row, seed) cell of the S18 sweep.
+#[derive(Clone, Copy, Debug)]
+struct S18Cell {
+    /// `A` shipped · `B` sink 1 · `C` sink 3 · `D` wide window · `E` global reference · `Z` zero-roll.
+    row: char,
+    seed: u64,
+    rolls: usize,
+    /// Worst absolute one-way component trend, 0..255.
+    trend: f64,
+    /// Worst absolute z-gated component excursion, 0..255.
+    excursion: f64,
+}
+
+impl S18Cell {
+    /// The gated statistic: trend AND excursion must be inside budget, i.e. their max must be.
+    fn drift(&self) -> f64 {
+        self.trend.abs().max(self.excursion.abs())
+    }
+}
+
+/// A measured S18 sweep at one geometry bucket, and the decision rule applied to it. Split out of the
+/// real-weight driver so the **rule** is gated in CI rather than only exercised on the gated GPU run.
 struct S18Sweep {
-    /// Row A — the shipped Mac config: bounded window, `sink_size = 0`.
-    shipped: f64,
-    /// Row B — bounded window + a 1-latent-frame sink anchor.
-    sink1: f64,
-    /// Row C — bounded window + a 3-latent-frame (one full AR chunk) sink anchor.
-    sink3: f64,
-    /// Row D — the dose-response control: a 2.5× wider window, roughly half the rolls, no sink.
-    wide: f64,
-    /// Row E — the null control: the checkpoint's global window. Zero evictions, so its trend is this
-    /// content's ordinary motion and nothing else.
-    global: f64,
-    shipped_rolls: usize,
-    global_rolls: usize,
+    bucket: String,
+    cells: Vec<S18Cell>,
 }
 
 impl S18Sweep {
-    /// The motion floor plus the metric's own separation margin. The synthetic gate measures
-    /// motion/noise at ≈1.8/255 against >25/255 for a real wash-out, so 6/255 is several times the
-    /// metric's noise and still far under anything a viewer would call drift.
-    fn budget(&self) -> f64 {
-        self.global + 6.0
+    fn of(&self, row: char) -> Vec<f64> {
+        self.cells
+            .iter()
+            .filter(|c| c.row == row)
+            .map(|c| c.drift())
+            .collect()
+    }
+
+    fn mean(&self, row: char) -> Option<f64> {
+        let v = self.of(row);
+        (!v.is_empty()).then(|| mean_f64(&v))
+    }
+
+    /// The between-seed uncertainty on a row's **mean**: twice the standard error, i.e. roughly a 95%
+    /// half-interval. `None` if the row has fewer than two seeds — in which case there is **no
+    /// variance estimate at all**, which the verdict must say out loud.
+    ///
+    /// Deliberately not the max−min range: that *grows* with the number of seeds, so a rule gated on
+    /// it would get harder to satisfy the more evidence you collected. This shrinks as 1/√n, which is
+    /// what makes "add seeds until the comparison resolves" a real option.
+    fn spread(&self, row: char) -> Option<f64> {
+        let v = self.of(row);
+        (v.len() >= 2).then(|| 2.0 * std_f64(&v) / (v.len() as f64).sqrt())
+    }
+
+    /// The row with the smaller mean of `B`/`C`, i.e. the sink anchor that did best.
+    fn best_sink(&self) -> Option<(char, f64)> {
+        ['B', 'C']
+            .iter()
+            .filter_map(|&r| self.mean(r).map(|m| (r, m)))
+            .fold(None, |acc: Option<(char, f64)>, x| match acc {
+                Some(a) if a.1 <= x.1 => Some(a),
+                _ => Some(x),
+            })
     }
 
     fn summary(&self) -> String {
+        let f = |r: char| match (self.mean(r), self.spread(r)) {
+            (None, _) => "-".to_string(),
+            (Some(m), None) => format!("{m:.2} (n=1)"),
+            (Some(m), Some(s)) => format!("{m:.2} ±{s:.2} (n={}, 2*SEM)", self.of(r).len()),
+        };
         format!(
-            "dose-response: {} rolls {:.2}/255 (global, the motion floor) -> wide-window {:.2} -> \
-             shipped {} rolls {:.2}; anchored sink1 {:.2}, sink3 {:.2}; budget {:.2}/255",
-            self.global_rolls,
-            self.global,
-            self.wide,
-            self.shipped_rolls,
-            self.shipped,
-            self.sink1,
-            self.sink3,
-            self.budget()
+            "{} — A shipped {} | B sink1 {} | C sink3 {} | D wide {} | E global-ref {} | budget \
+             {DRIFT_BUDGET:.2}/255 (absolute)",
+            self.bucket,
+            f('A'),
+            f('B'),
+            f('C'),
+            f('D'),
+            f('E'),
         )
     }
 
     /// The verdict, or the reason this sweep cannot support one.
     ///
-    /// The rule rests on the **roll dose-response**, not on any single row: row E is the same clip with
-    /// the checkpoint's global window (full history, zero evictions), row D is the same clip at ~half
-    /// the rolls, row A is the shipped bound. If the bounded window causes drift, the trend must grow
-    /// with the roll count E → D → A, and the sink rows must repair it. If it does not, the shipped
-    /// window is coherent and a permanently-resident sink is memory spent for nothing.
+    /// The rule is deliberately conservative about **statistical power**: a single seed per row gives
+    /// no variance estimate, and this sweep's config-to-config differences are of the same order as its
+    /// seed-to-seed scatter. So the rule refuses to *rank configs* unless the margin it would rank them
+    /// by exceeds the measured scatter; what it will still do with one seed is state whether gross
+    /// drift was observed, which is a much weaker claim and is labelled as such.
     fn verdict(&self) -> std::result::Result<String, String> {
-        // The measurement must actually have exercised the regime it claims to measure.
-        if self.shipped_rolls < 10 {
+        let shipped_rolls = self
+            .cells
+            .iter()
+            .filter(|c| c.row == 'A')
+            .map(|c| c.rolls)
+            .max()
+            .ok_or_else(|| "no shipped (A) row was measured — nothing to conclude".to_string())?;
+        if shipped_rolls < 10 {
             return Err(format!(
-                "the shipped row only rolled the window {} times — that is not a long clip, so it \
-                 cannot answer the long-clip question. Raise KREA_S18_LATENT_FRAMES.",
-                self.shipped_rolls
+                "the shipped row only rolled the window {shipped_rolls} times — that is not a long \
+                 clip, so it cannot answer the long-clip question. Raise KREA_S18_LATENT_FRAMES."
             ));
         }
-        if self.global_rolls != 0 {
-            return Err(format!(
-                "the null control rolled the window {} times — it is not a control",
-                self.global_rolls
-            ));
+        if self.cells.iter().any(|c| c.row == 'E' && c.rolls != 0) {
+            return Err(
+                "the global reference row rolled the window — it is not a reference".into(),
+            );
         }
-        let budget = self.budget();
-        if self.shipped <= budget {
-            // No drift: the dose-response control must agree — a wider window (half the rolls) cannot
-            // be materially better, or "no drift" was an artifact of an insensitive metric.
-            if self.wide > budget {
-                return Err(format!(
-                    "the shipped window scored {:.2}/255 (inside the {budget:.2} budget) but the \
-                     WIDER window scored {:.2} — the rows disagree, so this run does not support a \
-                     no-drift verdict",
-                    self.shipped, self.wide
+        if self.cells.iter().any(|c| c.row == 'Z' && c.rolls != 0) {
+            return Err(
+                "the zero-roll row Z evicted — its clip is too long to be a zero-eviction floor"
+                    .into(),
+            );
+        }
+        let a = self.mean('A').expect("row A measured above");
+        let margin = (a - DRIFT_BUDGET).abs();
+        // Which side of the budget the SHIPPED row is on is decided by the shipped row's own
+        // between-seed spread, not by the noisiest row in the sweep.
+        let a_spread = self.spread('A');
+        let resolvable = match a_spread {
+            None => false,
+            Some(s) => s < margin,
+        };
+
+        if !resolvable {
+            let power = match a_spread {
+                None => "one seed per row — NO variance estimate".to_string(),
+                Some(s) => format!("between-seed spread {s:.2}/255 vs a {margin:.2}/255 margin"),
+            };
+            // Underpowered to rank, but a *gross* result is still reportable: if every measured
+            // bounded row is far inside the budget, "no gross drift observed" survives the scatter.
+            let worst_bounded = ['A', 'B', 'C', 'D']
+                .iter()
+                .filter_map(|&r| self.mean(r))
+                .fold(0.0f64, f64::max);
+            if worst_bounded <= DRIFT_BUDGET / 2.0 {
+                return Ok(format!(
+                    "underpowered but no gross drift — every bounded row sits at or below \
+                     {worst_bounded:.2}/255 against a {DRIFT_BUDGET:.2} budget over \
+                     {shipped_rolls} rolls ({power}). This does NOT rank the configs and does not \
+                     license a claim about any drift mode outside the measured descriptor."
                 ));
             }
+            return Err(format!(
+                "UNDERPOWERED: the shipped row is {a:.2}/255 against a {DRIFT_BUDGET:.2} budget \
+                 ({power}), and the bounded rows reach {worst_bounded:.2}. The sweep cannot resolve \
+                 which side of the budget the shipped config is on. Add seeds \
+                 (KREA_S18_SEEDS) before concluding."
+            ));
+        }
+
+        if a <= DRIFT_BUDGET {
+            // No drift: the within-regime dose-response must agree — a wider window (half the rolls)
+            // cannot be materially worse, or "no drift" was an artifact of an insensitive metric.
+            if let Some(d) = self.mean('D') {
+                if d > DRIFT_BUDGET {
+                    return Err(format!(
+                        "the shipped window scored {a:.2}/255 (inside the {DRIFT_BUDGET:.2} budget) \
+                         but the WIDER window scored {d:.2} — the within-regime dose-response \
+                         disagrees, so this run does not support a no-drift verdict"
+                    ));
+                }
+            }
             Ok(format!(
-                "coherent — the shipped bounded window holds the clip over {} window rolls at \
-                 {:.2}/255 against a {:.2}/255 global-window motion floor. No sink anchor warranted.",
-                self.shipped_rolls, self.shipped, self.global
+                "coherent — the shipped bounded window holds the clip over {shipped_rolls} window \
+                 rolls at {a:.2}/255 against a {DRIFT_BUDGET:.2}/255 absolute budget, with the \
+                 between-seed scatter under the margin. No sink anchor warranted for the drift \
+                 modes this descriptor covers."
             ))
         } else {
-            // Drift is real: the anchored rows must actually repair it, or a sink is not the fix.
-            let best_sink = self.sink1.min(self.sink3);
-            if best_sink >= self.shipped * 0.6 {
+            // Drift is real. **Attribution first**: sc-15127 asks whether the *bounded window* costs
+            // coherence, and "the clip drifts" does not answer that. The within-regime dose-response
+            // (row D, the same local-attention path at a 2.5x wider window and fewer rolls) is what
+            // decides it. If halving the roll count does not materially reduce the drift, eviction is
+            // not the demonstrated mechanism — and then a first-chunk sink, whose whole rationale is
+            // to survive eviction, is not what the evidence points at, whatever the sink rows read.
+            if let Some(d) = self.mean('D') {
+                let unc = self.spread('A').unwrap_or(0.0) + self.spread('D').unwrap_or(0.0);
+                if d + unc >= a {
+                    let d_rolls = self
+                        .cells
+                        .iter()
+                        .find(|c| c.row == 'D')
+                        .map(|c| c.rolls)
+                        .unwrap_or(0);
+                    let sinks = ['B', 'C']
+                        .iter()
+                        .filter_map(|&r| self.mean(r).map(|m| format!("{r} {m:.2}")))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let global = match self.mean('E') {
+                        Some(e) => format!(" The zero-eviction global reference reads {e:.2}."),
+                        None => String::new(),
+                    };
+                    return Ok(format!(
+                        "drift is real ({a:.2}/255 over {shipped_rolls} rolls against a \
+                         {DRIFT_BUDGET:.2} budget) but it is NOT attributable to the bounded KV \
+                         window: the within-regime dose-response runs the wrong way — at {d_rolls} \
+                         rolls the 2.5x WIDER window scores {d:.2}/255, no better than the shipped \
+                         window's {a:.2} (combined 2*SEM {unc:.2}).{global} Fewer evictions do not \
+                         buy coherence, so eviction is not the mechanism and a first-chunk sink \
+                         anchor is not indicated. No sink is wired. Sink rows for the record: \
+                         {sinks}. The drift itself needs its own investigation."
+                    ));
+                }
+            }
+            // The remaining question is whether the anchored rows repair it — a SECOND comparison
+            // with its own power problem, so it gets its own resolvability check.
+            let Some((row, best_sink)) = self.best_sink() else {
                 return Err(format!(
-                    "the shipped window drifted {:.2}/255 but the best sink anchor only reached \
-                     {best_sink:.2} — a sink is not the fix and sc-15127 needs a different anchor",
-                    self.shipped
+                    "the shipped window drifted {a:.2}/255 past the {DRIFT_BUDGET:.2} budget but no \
+                     sink row was measured — run rows B and C before concluding"
+                ));
+            };
+            let threshold = a * 0.6;
+            // The repair claim is a comparison between two noisy means, so the gap must clear the
+            // scatter of BOTH rows before it can be called either way.
+            let combined = self.spread('A').unwrap_or(f64::INFINITY)
+                + self.spread(row).unwrap_or(f64::INFINITY);
+            if (threshold - best_sink).abs() < combined {
+                return Ok(format!(
+                    "drift is real ({a:.2}/255 over {shipped_rolls} rolls against a \
+                     {DRIFT_BUDGET:.2} budget), and the sink anchor's effect on it is NOT resolvable \
+                     at this sample size: the best sink row ({row}) is {best_sink:.2}/255 against a \
+                     {threshold:.2} repair threshold, a gap of {:.2} inside a combined between-seed \
+                     scatter of {combined:.2}. No sink is wired — permanently-resident KV must not be \
+                     bought on an unresolved comparison.",
+                    (threshold - best_sink).abs()
+                ));
+            }
+            if best_sink >= threshold {
+                return Ok(format!(
+                    "drift is real ({a:.2}/255 over {shipped_rolls} rolls against a \
+                     {DRIFT_BUDGET:.2} budget) and a first-chunk sink anchor does NOT repair it: the \
+                     best sink row ({row}) only reached {best_sink:.2}/255 against a {threshold:.2} \
+                     repair threshold. No sink is wired; sc-15127 needs a different anchor."
                 ));
             }
             Ok(format!(
-                "drift is real ({:.2}/255 over {} rolls, floor {:.2}) and a first-chunk sink anchor \
-                 repairs it to {best_sink:.2}/255.",
-                self.shipped, self.shipped_rolls, self.global
+                "drift is real ({a:.2}/255 over {shipped_rolls} rolls against a {DRIFT_BUDGET:.2} \
+                 budget) and a first-chunk sink anchor repairs it to {best_sink:.2}/255 (row {row})."
             ))
         }
     }
 }
 
-/// **CI gate for the S18 decision rule.** The real-weight run happens once, on a gated host; the rule
-/// it applies to those numbers must not be un-tested. Drives [`S18Sweep::verdict`] over the four
-/// outcomes it distinguishes.
+/// **CI gate for the S18 decision rule.** The real-weight run happens on a gated host; the rule it
+/// applies to those numbers must not be un-tested. Drives [`S18Sweep::verdict`] over every outcome it
+/// distinguishes, including the two power-related ones added after review.
 #[test]
-fn the_s18_verdict_rule_distinguishes_its_four_outcomes() {
-    let sweep = |shipped, sink1, sink3, wide, global| S18Sweep {
-        shipped,
-        sink1,
-        sink3,
-        wide,
-        global,
-        shipped_rolls: 13,
-        global_rolls: 0,
+fn the_s18_verdict_rule_distinguishes_its_outcomes() {
+    // Build a sweep with `n` seeds per row, each row's values spread by `spread` around its mean.
+    let sweep = |means: [f64; 5], spread: f64, n: usize| {
+        let mut cells = Vec::new();
+        for (i, row) in ['A', 'B', 'C', 'D', 'E'].iter().enumerate() {
+            for k in 0..n {
+                let off = if n < 2 {
+                    0.0
+                } else {
+                    spread * (k as f64 / (n - 1) as f64 - 0.5)
+                };
+                cells.push(S18Cell {
+                    row: *row,
+                    seed: k as u64,
+                    rolls: if *row == 'E' { 0 } else { 13 },
+                    trend: means[i] + off,
+                    excursion: 0.0,
+                });
+            }
+        }
+        S18Sweep {
+            bucket: "test".into(),
+            cells,
+        }
     };
 
-    // 1. Coherent: every bounded row sits at the global window's motion floor.
-    let v = sweep(2.0, 2.1, 1.9, 2.2, 1.8)
+    // 1. Coherent: every bounded row sits far under the budget, with a resolvable margin.
+    let v = sweep([2.0, 2.1, 1.9, 2.2, 1.8], 0.4, 3)
         .verdict()
-        .expect("a flat sweep must yield a verdict");
+        .expect("a flat, replicated sweep must yield a verdict");
     assert!(v.starts_with("coherent"), "got: {v}");
 
     // 2. Drift, repaired by the anchor: the shipped row is far past the budget and the sinks pull it
     //    most of the way back.
-    let v = sweep(40.0, 8.0, 6.0, 20.0, 2.0)
+    let v = sweep([40.0, 8.0, 6.0, 20.0, 2.0], 2.0, 3)
         .verdict()
         .expect("a repaired-drift sweep must yield a verdict");
     assert!(v.starts_with("drift is real"), "got: {v}");
 
-    // 3. Drift the sink does NOT repair — must refuse to conclude, not quietly ship a sink.
-    let e = sweep(40.0, 38.0, 39.0, 20.0, 2.0)
+    // 2b. Drift that is NOT attributable to the window: the wider window (fewer rolls) is no better.
+    //     The rule must say so and must not reach for a sink, even though the sink rows look great.
+    let v = sweep([40.0, 8.0, 6.0, 41.0, 2.0], 2.0, 3)
         .verdict()
-        .expect_err("an unrepaired drift must not produce a verdict");
-    assert!(e.contains("a sink is not the fix"), "got: {e}");
+        .expect("an unattributed drift is still a conclusion");
+    assert!(v.starts_with("drift is real"), "got: {v}");
+    assert!(v.contains("NOT attributable"), "got: {v}");
+    assert!(!v.contains("repairs it to"), "got: {v}");
+    assert!(v.contains("No sink is wired"), "got: {v}");
+
+    // 3. Drift the sink does NOT repair — a real finding, but it must never read as "ship a sink".
+    let v = sweep([40.0, 38.0, 39.0, 20.0, 2.0], 2.0, 3)
+        .verdict()
+        .expect("an unrepaired drift is still a conclusion");
+    assert!(v.starts_with("drift is real"), "got: {v}");
+    assert!(v.contains("does NOT repair it"), "got: {v}");
+    assert!(!v.contains("repairs it to"), "got: {v}");
+    assert!(v.contains("No sink is wired"), "got: {v}");
+
+    // 3b. Drift where the sink comparison is swamped by seed scatter — must say so, and must still
+    //     refuse to wire a sink.
+    let v = sweep([40.0, 22.0, 26.0, 20.0, 2.0], 12.0, 3)
+        .verdict()
+        .expect("an unresolvable repair comparison is still a conclusion");
+    assert!(v.starts_with("drift is real"), "got: {v}");
+    assert!(v.contains("NOT resolvable"), "got: {v}");
+    assert!(v.contains("No sink is wired"), "got: {v}");
 
     // 4. Incoherent evidence: the shipped row looks clean but the WIDER window looks worse. That
-    //    ordering is impossible under the drift hypothesis, so the run proves nothing either way —
-    //    this is the guard against declaring "no drift" from an insensitive measurement.
-    let e = sweep(3.0, 3.0, 3.0, 40.0, 2.0)
+    //    ordering is impossible under the drift hypothesis, so the run proves nothing either way.
+    let e = sweep([3.0, 3.0, 3.0, 40.0, 2.0], 0.4, 3)
         .verdict()
         .expect_err("contradictory rows must not produce a no-drift verdict");
-    assert!(e.contains("the rows disagree"), "got: {e}");
+    assert!(e.contains("dose-response"), "got: {e}");
 
-    // 5. And the sweep must have been long enough / the control must really be a control.
-    let mut short = sweep(2.0, 2.0, 2.0, 2.0, 2.0);
-    short.shipped_rolls = 4;
+    // 5. UNDERPOWERED, near the budget: one seed per row and a shipped row close to the budget. The
+    //    rule must refuse rather than pick a side — this is the guard the review demanded.
+    let e = sweep([13.0, 8.0, 9.0, 12.0, 2.0], 0.0, 1)
+        .verdict()
+        .expect_err("a single-seed sweep near the budget must not produce a verdict");
+    assert!(e.contains("UNDERPOWERED"), "got: {e}");
+    assert!(e.contains("NO variance estimate"), "got: {e}");
+
+    // 5b. ...and the same means WITH enough seeds still refuse while the shipped row's own scatter
+    //     swamps its margin against the budget.
+    let e = sweep([13.0, 8.0, 9.0, 12.0, 2.0], 12.0, 3)
+        .verdict()
+        .expect_err("a sweep whose seed scatter swamps its margin must not produce a verdict");
+    assert!(e.contains("between-seed spread"), "got: {e}");
+
+    // 6. Underpowered but unambiguously clean: one seed, but everything is far under the budget. That
+    //    is reportable — as a narrowed claim that says so.
+    let v = sweep([2.0, 2.0, 2.0, 2.0, 2.0], 0.0, 1)
+        .verdict()
+        .expect("a single-seed but grossly clean sweep must yield a narrowed verdict");
+    assert!(v.starts_with("underpowered but no gross drift"), "got: {v}");
+    assert!(v.contains("does NOT rank the configs"), "got: {v}");
+
+    // 7. And the sweep must have been long enough / the reference must really be a reference.
+    let mut short = sweep([2.0, 2.0, 2.0, 2.0, 2.0], 0.4, 3);
+    for c in short.cells.iter_mut().filter(|c| c.row == 'A') {
+        c.rolls = 4;
+    }
     assert!(short.verdict().unwrap_err().contains("not a long clip"));
-    let mut bad_control = sweep(2.0, 2.0, 2.0, 2.0, 2.0);
-    bad_control.global_rolls = 3;
-    assert!(bad_control.verdict().unwrap_err().contains("not a control"));
+    let mut bad_ref = sweep([2.0, 2.0, 2.0, 2.0, 2.0], 0.4, 3);
+    for c in bad_ref.cells.iter_mut().filter(|c| c.row == 'E') {
+        c.rolls = 3;
+    }
+    assert!(bad_ref.verdict().unwrap_err().contains("not a reference"));
+    // 8. No shipped row at all — refuse, do not index off the end.
+    let empty = S18Sweep {
+        bucket: "test".into(),
+        cells: vec![],
+    };
+    assert!(empty.verdict().unwrap_err().contains("nothing to conclude"));
+}
+
+// --- The recorded measurement -----------------------------------------------------------------
+//
+// The gated real-weight sweep runs on one host; the numbers it produced are recorded here so the
+// documented conclusion is gated by the data rather than by prose. Regenerate with:
+//
+//   KREA_REALTIME_SNAPSHOT_DIR=... KREA_SMOKE_W=640 KREA_SMOKE_H=384 KREA_S18_SEEDS=7,11,23 \
+//     cargo test -p mlx-gen-krea-realtime --test generate_smoke -- --ignored --nocapture \
+//     long_clip_coherence_under_the_bounded_window
+//
+// and paste the `S18CELL` lines below.
+
+/// The prefix of the verdict the crate documentation claims. Changing the documented conclusion means
+/// changing this, which means [`the_recorded_s18_sweep_is_what_the_docs_claim`] re-checks it against
+/// the recorded data.
+const RECORDED_VERDICT_PREFIX: &str = "drift is real";
+
+/// Measured cells at **640×384** (the bucket where the global reference row fits in 128 GiB).
+///
+/// Row E is `n = 1`: its 45.0 GiB MLX peak drove this 128 GiB host into enough swap to fill the boot
+/// volume, so the remaining two seeds were abandoned. It is a *reference*, not a control, and nothing
+/// the verdict decides turns on it — the attribution is decided by row D, which is within regime and
+/// replicated.
+const MEASURED_640: &[S18Cell] = &[
+    S18Cell {
+        row: 'A',
+        seed: 7,
+        rolls: 13,
+        trend: 19.9907,
+        excursion: 23.0413,
+    },
+    S18Cell {
+        row: 'A',
+        seed: 11,
+        rolls: 13,
+        trend: 31.0541,
+        excursion: 19.3187,
+    },
+    S18Cell {
+        row: 'A',
+        seed: 23,
+        rolls: 13,
+        trend: 21.7860,
+        excursion: 28.4337,
+    },
+    S18Cell {
+        row: 'B',
+        seed: 7,
+        rolls: 13,
+        trend: 11.6090,
+        excursion: 17.4084,
+    },
+    S18Cell {
+        row: 'B',
+        seed: 11,
+        rolls: 13,
+        trend: 28.5211,
+        excursion: 12.3800,
+    },
+    S18Cell {
+        row: 'B',
+        seed: 23,
+        rolls: 13,
+        trend: 11.8207,
+        excursion: 10.3263,
+    },
+    S18Cell {
+        row: 'C',
+        seed: 7,
+        rolls: 13,
+        trend: 17.6473,
+        excursion: 14.7965,
+    },
+    S18Cell {
+        row: 'C',
+        seed: 11,
+        rolls: 13,
+        trend: 15.7251,
+        excursion: 0.0,
+    },
+    S18Cell {
+        row: 'C',
+        seed: 23,
+        rolls: 13,
+        trend: 6.2537,
+        excursion: 5.8270,
+    },
+    S18Cell {
+        row: 'D',
+        seed: 7,
+        rolls: 10,
+        trend: 27.5739,
+        excursion: 21.8348,
+    },
+    S18Cell {
+        row: 'D',
+        seed: 11,
+        rolls: 10,
+        trend: 33.0361,
+        excursion: 23.0505,
+    },
+    S18Cell {
+        row: 'D',
+        seed: 23,
+        rolls: 10,
+        trend: 31.1090,
+        excursion: 30.5435,
+    },
+    S18Cell {
+        row: 'E',
+        seed: 7,
+        rolls: 0,
+        trend: 34.0619,
+        excursion: 18.5963,
+    },
+    S18Cell {
+        row: 'Z',
+        seed: 7,
+        rolls: 0,
+        trend: 1.3928,
+        excursion: 0.0,
+    },
+    S18Cell {
+        row: 'Z',
+        seed: 11,
+        rolls: 0,
+        trend: 3.3254,
+        excursion: 0.0,
+    },
+    S18Cell {
+        row: 'Z',
+        seed: 23,
+        rolls: 0,
+        trend: 5.9501,
+        excursion: 0.0,
+    },
+];
+
+/// Measured cells at **832×480** — the crate default and a shipping bucket. Row E is absent by
+/// necessity: the global window at this bucket SIGKILLs a 128 GiB host.
+const MEASURED_832: &[S18Cell] = &[
+    S18Cell {
+        row: 'A',
+        seed: 7,
+        rolls: 13,
+        trend: 45.8218,
+        excursion: 47.1323,
+    },
+    S18Cell {
+        row: 'A',
+        seed: 11,
+        rolls: 13,
+        trend: 27.7189,
+        excursion: 34.5532,
+    },
+    S18Cell {
+        row: 'A',
+        seed: 23,
+        rolls: 13,
+        trend: 29.2038,
+        excursion: 36.0093,
+    },
+    S18Cell {
+        row: 'B',
+        seed: 7,
+        rolls: 13,
+        trend: 25.6222,
+        excursion: 34.1733,
+    },
+    S18Cell {
+        row: 'B',
+        seed: 11,
+        rolls: 13,
+        trend: 23.7267,
+        excursion: 31.0055,
+    },
+    S18Cell {
+        row: 'B',
+        seed: 23,
+        rolls: 13,
+        trend: 18.8356,
+        excursion: 26.8110,
+    },
+    S18Cell {
+        row: 'C',
+        seed: 7,
+        rolls: 13,
+        trend: 14.6706,
+        excursion: 22.8868,
+    },
+    S18Cell {
+        row: 'C',
+        seed: 11,
+        rolls: 13,
+        trend: 11.0461,
+        excursion: 19.4879,
+    },
+    S18Cell {
+        row: 'C',
+        seed: 23,
+        rolls: 13,
+        trend: 21.1164,
+        excursion: 27.9238,
+    },
+    S18Cell {
+        row: 'D',
+        seed: 7,
+        rolls: 10,
+        trend: 47.4356,
+        excursion: 47.0857,
+    },
+    S18Cell {
+        row: 'D',
+        seed: 11,
+        rolls: 10,
+        trend: 35.2790,
+        excursion: 39.0004,
+    },
+    S18Cell {
+        row: 'D',
+        seed: 23,
+        rolls: 10,
+        trend: 22.8338,
+        excursion: 22.2395,
+    },
+];
+
+/// **CI gate on the recorded measurement.** The numbers the crate documentation cites live in
+/// [`MEASURED_640`] / [`MEASURED_832`], and this applies the *same* [`S18Sweep::verdict`] rule to them
+/// that the gated GPU run applies to fresh ones. Editing the docs' conclusion without re-measuring, or
+/// pasting in a sweep that does not actually support it, turns this red.
+///
+/// It also gates the thing the review caught: **both buckets are recorded and both are checked.** The
+/// 832×480 bucket is the crate default and a shipping bucket; a result there that disagrees with
+/// 640×384 cannot be set aside.
+#[test]
+fn the_recorded_s18_sweep_is_what_the_docs_claim() {
+    for (bucket, cells) in [("640x384", MEASURED_640), ("832x480", MEASURED_832)] {
+        assert!(
+            !cells.is_empty(),
+            "the {bucket} sweep is not recorded — the documented conclusion has no data behind it"
+        );
+        let sweep = S18Sweep {
+            bucket: bucket.to_string(),
+            cells: cells.to_vec(),
+        };
+        println!("{}", sweep.summary());
+        let v = sweep.verdict();
+        println!("  {bucket}: {v:?}");
+        assert_eq!(
+            v.as_ref().map(|s| s.starts_with(RECORDED_VERDICT_PREFIX)),
+            Ok(true),
+            "the recorded {bucket} sweep yields `{v:?}`, not the documented \
+             `{RECORDED_VERDICT_PREFIX}...` — src/t2v.rs and src/lib.rs are claiming something the \
+             data does not say"
+        );
+        // Replication is the other half of what the review demanded: a recorded bucket with one seed
+        // per row cannot support a ranking claim, so it must not be recorded as if it could.
+        for row in ['A', 'B', 'C', 'D'] {
+            // ...and they must be DIFFERENT seeds. Three cells from one seed is determinism, not
+            // replication, and would give a spread of zero that makes every comparison look resolved.
+            let mut seeds: Vec<u64> = sweep
+                .cells
+                .iter()
+                .filter(|c| c.row == row)
+                .map(|c| c.seed)
+                .collect();
+            let n = seeds.len();
+            seeds.sort_unstable();
+            seeds.dedup();
+            assert_eq!(
+                seeds.len(),
+                n,
+                "{bucket} row {row} records a repeated seed — that is determinism, not replication"
+            );
+            if !sweep.of(row).is_empty() {
+                assert!(
+                    sweep.of(row).len() >= 3,
+                    "{bucket} row {row} is recorded with only {} seed(s) — the documented \
+                     conclusion would rest on an unreplicated cell",
+                    sweep.of(row).len()
+                );
+            }
+        }
+    }
 }

@@ -81,12 +81,13 @@
 //! re-encoding the first decoded output frame as a persistent clean-context anchor) re-encodes decoded
 //! pixels *mid-generation*, so that *mechanism* is streaming-coupled and correctly out of this batch path
 //! (which decodes once at the end). The bounded Mac window runs for every clip and the shipped 14B
-//! config sets `sink_size = 0`, so a long batch clip slides its window with no persistent anchor —
-//! **sc-15127 (S18) measured that on real weights over 13 window rolls and it does not cost coherence**:
-//! against the checkpoint's global window as a zero-roll control the bounded window drifts *less*
-//! (17.54 vs 34.06/255) and clips far fewer highlights (1.82% vs 11.61%), with no freeze, so no sink
-//! anchor is wired (the `sink_size` knob stays plumbed for a checkpoint that ships one). See
-//! [`t2v::generate_t2v_from_components`] for the table.
+//! config sets `sink_size = 0`, so a long batch clip slides its window with no persistent anchor.
+//! **sc-15127 (S18) measured that on real weights (q4, three seeds, 13 window rolls) and found a long
+//! clip *does* drift — a one-way saturation run-away well past the measurement's budget — but that the
+//! drift is *not* attributable to the bounded window**: a 2.5× wider window (10 rolls) is no better,
+//! and the checkpoint's global window with zero evictions is worse. So no sink anchor is wired (the
+//! `sink_size` knob stays plumbed for a checkpoint that ships one) and the drift itself is tracked as
+//! **sc-15571**. See [`t2v::generate_t2v_from_components`] for the table and the limits of the claim.
 //! **i2v/v2v conditioning** (S7) is now wired (see [`generate`] / [`t2v`] above); its real-weight
 //! watchable-clip coherence overlaps the S13 real-weight validation.
 //!
