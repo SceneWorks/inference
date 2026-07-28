@@ -980,3 +980,56 @@ fn provider_reports_fully_applied_and_partial_adapters_separately() {
         vec!["blocks.0.cross_attn.norm_k_img".to_owned()]
     );
 }
+
+/// Per-file reporting must not weaken the established batch-strict contract. A wholly unsupported
+/// diff-patch file is a surfaced partial outcome when another file in the same ordered batch lands;
+/// it is not independently strict-failed. Both orders are gated because an implementation that
+/// applies/report files one at a time fails on whichever order reaches the unsupported file.
+#[test]
+fn reported_batch_accepts_supported_plus_wholly_unsupported_in_both_orders() {
+    let cfg = tiny_cfg();
+    let (supported, supported_applied) =
+        write_lightx2v_shaped_diff_patch("krea_report_batch_supported.safetensors", &cfg);
+    let dim = cfg.wan.dim as i32;
+    let foreign = det_fill(&[dim], 2011, 0.2, 0.0, Dtype::Float32);
+    let unsupported = std::env::temp_dir()
+        .join("mlx_gen_krea_style_lora_test")
+        .join("krea_report_batch_unsupported.safetensors");
+    Array::save_safetensors(
+        vec![(
+            "diffusion_model.blocks.0.cross_attn.norm_k_img.diff",
+            &foreign,
+        )],
+        None,
+        &unsupported,
+    )
+    .unwrap();
+
+    for paths in [
+        [supported.clone(), unsupported.clone()],
+        [unsupported.clone(), supported.clone()],
+    ] {
+        let specs = paths
+            .iter()
+            .cloned()
+            .map(|path| spec(path, 1.0))
+            .collect::<Vec<_>>();
+        let mut host = tiny_transformer_q4(&cfg);
+        let reports = mlx_gen_krea_realtime::t2v::apply_adapters_reported(&mut host, &specs)
+            .expect("batch strictness is evaluated across both files");
+        assert_eq!(reports.len(), 2);
+        for (report, path) in reports.iter().zip(paths) {
+            assert_eq!(report.adapter_path, path);
+            if path == supported {
+                assert_eq!(report.applied, supported_applied);
+                assert!(report.skipped.is_empty());
+            } else {
+                assert_eq!(report.applied, 0);
+                assert_eq!(
+                    report.skipped,
+                    vec!["blocks.0.cross_attn.norm_k_img".to_owned()]
+                );
+            }
+        }
+    }
+}

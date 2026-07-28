@@ -717,24 +717,26 @@ fn load_transformer(
     Ok((transformer, adapter_reports))
 }
 
-/// Install Krea adapters one file at a time and preserve each engine-owned outcome for the provider
-/// contract. Public for weight-free integration tests; product callers use [`crate::KreaRealtime`].
+/// Install the ordered Krea adapter batch and preserve each engine-owned per-file outcome for the
+/// provider contract. Public for weight-free integration tests; product callers use
+/// [`crate::KreaRealtime`].
 #[doc(hidden)]
 pub fn apply_adapters_reported(
     transformer: &mut CausalKreaTransformer,
     adapters: &[AdapterSpec],
 ) -> Result<Vec<AdapterApplyReport>> {
+    let reports = mlx_gen::adapters::loader::apply_adapters_strict_with_diff_patch_reported(
+        transformer,
+        adapters,
+        MODEL_ID,
+    )?;
     let mut adapter_reports = Vec::with_capacity(adapters.len());
-    for adapter in adapters {
-        let report = mlx_gen::adapters::loader::apply_adapters_strict_with_diff_patch(
-            transformer,
-            std::slice::from_ref(adapter),
-            MODEL_ID,
-        )?;
+    for (adapter, report) in adapters.iter().zip(reports) {
         eprintln!(
-            "{MODEL_ID}: installed {} LoRA target(s) from 1 adapter file(s); {} diff-patch delta(s) \
+            "{MODEL_ID}: installed {} LoRA target(s) from adapter {}; {} diff-patch delta(s) \
              unapplied",
             report.applied,
+            adapter.path.display(),
             report.diff_patch_unapplied.len()
         );
         adapter_reports.push(AdapterApplyReport {

@@ -18,9 +18,9 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use mlx_gen::{
-    default_seed, AdapterApplyReport, AdapterSpec, Capabilities, Conditioning, ConditioningKind,
-    Error, GenerationOutput, GenerationRequest, Generator, Modality, ModelDescriptor, Progress,
-    Quant, Result, WeightsSource,
+    default_seed, AdapterApplyReport, AdapterSpec, CancelFlag, Capabilities, Conditioning,
+    ConditioningKind, Error, GenerationOutput, GenerationRequest, Generator, Image, Modality,
+    ModelDescriptor, Progress, Quant, Result, WeightsSource,
 };
 
 use crate::config::{KreaRealtimeConfig, MODEL_ID};
@@ -142,6 +142,82 @@ pub struct KreaRealtime {
     adapter_reports: Mutex<Vec<AdapterApplyReport>>,
 }
 
+/// The three advertised request routes, selected once by [`KreaRealtime::run`] and executed through
+/// one report-publishing funnel.
+enum GenerationRoute<'a> {
+    T2v,
+    I2v(&'a Image),
+    V2v { frames: &'a [Image], strength: f32 },
+}
+
+/// A reported generation backend. Production delegates to the real T2V/I2V/V2V entrypoints; tests
+/// can drive the mandatory route/finalize contract with actual tiny-host adapter output and no model
+/// snapshot.
+trait ReportedGeneration {
+    fn t2v(&mut self) -> Result<(GenerationOutput, Vec<AdapterApplyReport>)>;
+    fn i2v(&mut self, image: &Image) -> Result<(GenerationOutput, Vec<AdapterApplyReport>)>;
+    fn v2v(
+        &mut self,
+        frames: &[Image],
+        strength: f32,
+    ) -> Result<(GenerationOutput, Vec<AdapterApplyReport>)>;
+}
+
+struct ProductReportedGeneration<'a> {
+    root: &'a std::path::Path,
+    config: &'a KreaRealtimeConfig,
+    job: &'a KreaRealtimeJob<'a>,
+    adapters: &'a [AdapterSpec],
+    quant: Option<Quant>,
+    cancel: &'a CancelFlag,
+    on_progress: &'a mut dyn FnMut(Progress),
+}
+
+impl ReportedGeneration for ProductReportedGeneration<'_> {
+    fn t2v(&mut self) -> Result<(GenerationOutput, Vec<AdapterApplyReport>)> {
+        generate_t2v_reported(
+            self.root,
+            self.config,
+            self.job,
+            self.adapters,
+            self.quant,
+            self.cancel,
+            self.on_progress,
+        )
+    }
+
+    fn i2v(&mut self, image: &Image) -> Result<(GenerationOutput, Vec<AdapterApplyReport>)> {
+        generate_i2v_reported(
+            self.root,
+            self.config,
+            self.job,
+            image,
+            self.adapters,
+            self.quant,
+            self.cancel,
+            self.on_progress,
+        )
+    }
+
+    fn v2v(
+        &mut self,
+        frames: &[Image],
+        strength: f32,
+    ) -> Result<(GenerationOutput, Vec<AdapterApplyReport>)> {
+        generate_v2v_reported(
+            self.root,
+            self.config,
+            self.job,
+            frames,
+            strength,
+            self.adapters,
+            self.quant,
+            self.cancel,
+            self.on_progress,
+        )
+    }
+}
+
 /// Load Krea Realtime from a converted MLX snapshot directory (`dit.safetensors` + the stock Wan
 /// `t5_encoder.safetensors` / `vae.safetensors` / `tokenizer.json` — Krea Realtime ships
 /// transformer-only, reusing stock Wan for the TE / VAE / tokenizer).
@@ -214,6 +290,22 @@ impl KreaRealtime {
         Ok(output)
     }
 
+    /// Execute every advertised modality through the same report-publishing finish seam. Keeping the
+    /// route match inside this method makes it impossible for a T2V/I2V/V2V call site to consume a
+    /// reported generation while forgetting to expose its adapter outcome.
+    fn finish_routed_generation(
+        &self,
+        route: GenerationRoute<'_>,
+        generation: &mut impl ReportedGeneration,
+    ) -> Result<GenerationOutput> {
+        let reported = match route {
+            GenerationRoute::T2v => generation.t2v(),
+            GenerationRoute::I2v(image) => generation.i2v(image),
+            GenerationRoute::V2v { frames, strength } => generation.v2v(frames, strength),
+        };
+        self.finish_reported_generation(reported)
+    }
+
     /// Map the text-to-video request onto a [`KreaRealtimeJob`] and run the AR pipeline. Self-validates
     /// the shared capability floor first (`impl_generator!`'s `generate` does not call `validate`), so a
     /// direct `Generator::generate` still rejects an out-of-surface request (count / size / sampler /
@@ -256,54 +348,41 @@ impl KreaRealtime {
         // descriptor makes `validate_request` accept them, so `run` MUST honor them (capability honesty)
         // rather than silently generating t2v. The worker's mapping of its own reference inputs onto
         // these `GenerationRequest` conditioning entries is S10.
-        if let Some((frames, strength)) = req.conditioning.iter().find_map(|c| match c {
-            Conditioning::VideoClip {
-                frames, strength, ..
-            } => Some((frames.as_slice(), *strength)),
-            _ => None,
-        }) {
-            return self.finish_reported_generation(generate_v2v_reported(
-                &self.root,
-                &self.config,
-                &job,
-                frames,
-                strength,
-                &self.adapters,
-                self.quant,
-                &req.cancel,
-                on_progress,
-            ));
-        }
-        if let Some(image) = req.conditioning.iter().find_map(|c| match c {
+        let route = if let Some((frames, strength)) =
+            req.conditioning.iter().find_map(|c| match c {
+                Conditioning::VideoClip {
+                    frames, strength, ..
+                } => Some((frames.as_slice(), *strength)),
+                _ => None,
+            }) {
+            GenerationRoute::V2v { frames, strength }
+        } else if let Some(image) = req.conditioning.iter().find_map(|c| match c {
             Conditioning::Reference { image, .. } => Some(image),
             _ => None,
         }) {
-            return self.finish_reported_generation(generate_i2v_reported(
-                &self.root,
-                &self.config,
-                &job,
-                image,
-                &self.adapters,
-                self.quant,
-                &req.cancel,
-                on_progress,
-            ));
-        }
-        self.finish_reported_generation(generate_t2v_reported(
-            &self.root,
-            &self.config,
-            &job,
-            &self.adapters,
-            self.quant,
-            &req.cancel,
+            GenerationRoute::I2v(image)
+        } else {
+            GenerationRoute::T2v
+        };
+        let mut generation = ProductReportedGeneration {
+            root: &self.root,
+            config: &self.config,
+            job: &job,
+            adapters: &self.adapters,
+            quant: self.quant,
+            cancel: &req.cancel,
             on_progress,
-        ))
+        };
+        self.finish_routed_generation(route, &mut generation)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mlx_gen::adapters::{AdaptableHost, AdaptableLinear, DiffPatchPart};
+    use mlx_gen::{AdapterKind, GenerationOutput};
+    use mlx_rs::Array;
 
     /// A weights-free [`KreaRealtime`] whose [`KreaRealtime::run`] hits the shared floor before any
     /// load. Sound only because validation runs first: a *passing* request would then try to load
@@ -337,6 +416,130 @@ mod tests {
             vec![expected],
             "severing the Krea override must not fall back to the empty compatibility default"
         );
+    }
+
+    struct TinyDiffPatchHost {
+        norm: Array,
+    }
+
+    impl AdaptableHost for TinyDiffPatchHost {
+        fn adaptable_mut(&mut self, _path: &[&str]) -> Option<&mut AdaptableLinear> {
+            None
+        }
+
+        fn diff_patch_param_mut(
+            &mut self,
+            path: &[&str],
+            part: DiffPatchPart,
+        ) -> Option<&mut Array> {
+            (path == ["norm"] && part == DiffPatchPart::Weight).then_some(&mut self.norm)
+        }
+    }
+
+    fn actual_tiny_adapter_report() -> AdapterApplyReport {
+        let dir = std::env::temp_dir().join("mlx_gen_krea_pipeline_report_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("actual_report_{}.safetensors", std::process::id()));
+        let delta = Array::from_slice(&[0.25f32, -0.5], &[2]);
+        Array::save_safetensors(vec![("diffusion_model.norm.diff", &delta)], None, &path).unwrap();
+        let mut host = TinyDiffPatchHost {
+            norm: Array::from_slice(&[1.0f32, 1.0], &[2]),
+        };
+        let reports = mlx_gen::adapters::loader::apply_adapters_strict_with_diff_patch_reported(
+            &mut host,
+            &[AdapterSpec::new(path.clone(), 1.0, AdapterKind::Lora)],
+            MODEL_ID,
+        )
+        .expect("the material diff-patch tensor applies");
+        assert_eq!(reports.len(), 1);
+        let report = reports.into_iter().next().unwrap();
+        assert_eq!(report.applied, 1);
+        assert!(report.diff_patch_unapplied.is_empty());
+        AdapterApplyReport {
+            adapter_path: path,
+            applied: report.applied,
+            skipped: report.diff_patch_unapplied,
+        }
+    }
+
+    struct TinyReportedGeneration {
+        report: AdapterApplyReport,
+        called: Option<&'static str>,
+    }
+
+    impl TinyReportedGeneration {
+        fn result(&self) -> Result<(GenerationOutput, Vec<AdapterApplyReport>)> {
+            Ok((
+                GenerationOutput::Video {
+                    frames: Vec::new(),
+                    fps: 1,
+                    audio: None,
+                },
+                vec![self.report.clone()],
+            ))
+        }
+    }
+
+    impl ReportedGeneration for TinyReportedGeneration {
+        fn t2v(&mut self) -> Result<(GenerationOutput, Vec<AdapterApplyReport>)> {
+            self.called = Some("t2v");
+            self.result()
+        }
+
+        fn i2v(&mut self, _image: &Image) -> Result<(GenerationOutput, Vec<AdapterApplyReport>)> {
+            self.called = Some("i2v");
+            self.result()
+        }
+
+        fn v2v(
+            &mut self,
+            _frames: &[Image],
+            _strength: f32,
+        ) -> Result<(GenerationOutput, Vec<AdapterApplyReport>)> {
+            self.called = Some("v2v");
+            self.result()
+        }
+    }
+
+    /// A material adapter is applied by the real loader, then its actual report crosses the single
+    /// mandatory route→finish→Generator contract for every advertised generation mode. This is
+    /// mutation-discriminating: returning a reported result from any route without
+    /// `finish_reported_generation` leaves the accessor empty and fails.
+    #[test]
+    fn every_generation_route_publishes_actual_adapter_application_output() {
+        let actual = actual_tiny_adapter_report();
+        let image = Image {
+            width: 1,
+            height: 1,
+            pixels: vec![1, 2, 3],
+        };
+        let frames = vec![image.clone()];
+        for (route, expected_route) in [
+            (GenerationRoute::T2v, "t2v"),
+            (GenerationRoute::I2v(&image), "i2v"),
+            (
+                GenerationRoute::V2v {
+                    frames: &frames,
+                    strength: 0.5,
+                },
+                "v2v",
+            ),
+        ] {
+            let provider = unloaded();
+            let mut generation = TinyReportedGeneration {
+                report: actual.clone(),
+                called: None,
+            };
+            provider
+                .finish_routed_generation(route, &mut generation)
+                .expect("reported generation succeeds");
+            assert_eq!(generation.called, Some(expected_route));
+            assert_eq!(
+                Generator::adapter_apply_reports(&provider),
+                vec![actual.clone()],
+                "{expected_route} must publish the actual loader report through the Generator contract"
+            );
+        }
     }
 
     /// The advertised surface is CFG-off video with the Self-Forcing few-step sampler, now advertising

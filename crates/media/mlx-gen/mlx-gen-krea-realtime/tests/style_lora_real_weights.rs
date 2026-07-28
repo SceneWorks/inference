@@ -3,8 +3,8 @@
 //! `tests/style_lora.rs` proves the install mechanics on synthetic low-rank files. This proves the
 //! thing that could not be proven synthetically: that **published** Wan-2.1-14B LoRA files resolve
 //! against this DiT's [`AdaptableHost`] surface, install through `LoadSpec::adapters` →
-//! `apply_adapters_strict`, and **measurably change the render** — without tripping the strict
-//! installer's unmatched-target hard error.
+//! `apply_adapters_strict_with_diff_patch`, and **measurably change the render** — without tripping
+//! the strict installer's unmatched-target hard error.
 //!
 //! ## The two real classes, and why the globals surface was widened (the S13 decision)
 //!
@@ -42,7 +42,8 @@
 use std::path::PathBuf;
 
 use mlx_gen::{
-    AdapterKind, AdapterSpec, GenerationOutput, GenerationRequest, Image, LoadSpec, WeightsSource,
+    AdapterKind, AdapterSpec, Conditioning, GenerationOutput, GenerationRequest, Image, LoadSpec,
+    WeightsSource,
 };
 use mlx_gen_krea_realtime::MODEL_ID;
 
@@ -126,6 +127,83 @@ fn request(w: usize, h: usize, frames: usize) -> GenerationRequest {
         fps: Some(24),
         sampler: Some("self_forcing".into()),
         ..Default::default()
+    }
+}
+
+/// Product-contract proof for the report path: actual real-weight adapter application must traverse
+/// registry load → each advertised Generator route → the common reported finish seam → the public
+/// accessor. The non-ignored tiny-host companion in `pipeline` gates the same funnel in CI; this
+/// hardware-gated test proves the complete snapshot/runtime route without a test backend.
+#[test]
+#[ignore = "real snapshot + real Wan step-distill LoRA; run with --ignored on macOS"]
+fn registry_t2v_i2v_v2v_routes_publish_the_real_adapter_report() {
+    let root = snapshot_dir();
+    assert!(
+        root.join("dit.safetensors").exists() || root.join("transformer").is_dir(),
+        "no Krea Realtime DiT at {} — set KREA_REALTIME_SNAPSHOT_DIR",
+        root.display()
+    );
+    let adapter = require_lora("KREA_DISTILL_LORA");
+    let image = Image {
+        width: 16,
+        height: 16,
+        pixels: vec![127; 16 * 16 * 3],
+    };
+    let source = vec![image.clone(); 5];
+    let requests = [
+        ("t2v", request(16, 16, 5)),
+        (
+            "i2v",
+            GenerationRequest {
+                conditioning: vec![Conditioning::Reference {
+                    image: image.clone(),
+                    strength: None,
+                }],
+                ..request(16, 16, 5)
+            },
+        ),
+        (
+            "v2v",
+            GenerationRequest {
+                conditioning: vec![Conditioning::VideoClip {
+                    frames: source,
+                    frame_idx: 0,
+                    strength: 0.5,
+                }],
+                ..request(16, 16, 5)
+            },
+        ),
+    ];
+
+    for (route, req) in requests {
+        let mut spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
+        spec.adapters = vec![AdapterSpec::new(adapter.clone(), 1.0, AdapterKind::Lora)];
+        let provider = mlx_gen_krea_realtime::provider_registry()
+            .unwrap()
+            .load(MODEL_ID, &spec)
+            .unwrap_or_else(|e| panic!("{route}: registry load must succeed: {e}"));
+        assert!(
+            provider.adapter_apply_reports().is_empty(),
+            "{route}: reports describe completed generation, never an unrun provider"
+        );
+        provider
+            .generate(&req, &mut |_| {})
+            .unwrap_or_else(|e| panic!("{route}: generation must succeed: {e}"));
+        let reports = provider.adapter_apply_reports();
+        assert_eq!(reports.len(), 1, "{route}: one selected adapter");
+        assert_eq!(
+            reports[0].adapter_path, adapter,
+            "{route}: file attribution"
+        );
+        assert!(
+            reports[0].applied > 0,
+            "{route}: the real engine must report material adapter targets"
+        );
+        assert!(
+            reports[0].skipped.is_empty(),
+            "{route}: the real T2V step-distill file must fully land: {:?}",
+            reports[0].skipped
+        );
     }
 }
 
