@@ -491,7 +491,7 @@ impl ZImageTransformer {
     /// `ZImageTransformer::forward_with_attention_budget`.
     ///
     /// Exists as a public surface (rather than only the `pub(crate)`
-    /// [`forward_with_budgeted`](Self::forward_with_budgeted)) so the equivalence and
+    /// `forward_with_budgeted`) so the equivalence and
     /// plan-threading tests can drive one whole DiT forward without standing up a denoise loop —
     /// mirroring the CUDA twin's `attention_query_chunking_matches_the_unbounded_forward`.
     pub fn forward_budgeted(

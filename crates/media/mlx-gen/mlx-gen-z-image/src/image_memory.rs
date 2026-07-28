@@ -12,7 +12,7 @@
 //! |---|---|---|
 //! | 0 Resident | Implemented | `Residency::resident` — encoder + DiT + VAE held warm |
 //! | 1 Staged residency | Implemented (load-time, see below) | `Residency::run_staged` (sc-10839 / sc-13571): encode → drop encoder → denoise → **drop DiT** → decode |
-//! | 2 Bounded decode | Implemented | `Vae::decode_tiled` at 512 px / 64 px overlap ([`crate::pipeline::decode_tiling`]) |
+//! | 2 Bounded decode | Implemented | `Vae::decode_tiled` at 512 px / 64 px overlap (`pipeline::decode_tiling`) |
 //! | 3 Bounded attention | Implemented | [`mlx_gen::attention::sdpa_budgeted_bhsd`] threaded through every DiT attention (SC-15615) |
 //! | 4 Bounded transformer residency | **Missing** | No per-block wired-residency window exists on the MLX Z-Image DiT |
 //!
@@ -24,7 +24,7 @@
 //! which comes from the *load-time* [`OffloadPolicy`](mlx_gen::OffloadPolicy), so selecting
 //! `StagedResidency` on a generator that was loaded `Resident` yields resident behaviour — the
 //! selection is honoured only if the consumer also loaded the provider `Sequential`.
-//! [`z_image_generation_memory`] maps rung 1 to an all-false [`GenerationMemory`] for exactly that
+//! `z_image_generation_memory` maps rung 1 to an all-false [`GenerationMemory`] for exactly that
 //! reason: there is nothing per-request to turn on. Krea's CUDA adoption has the same shape, so this
 //! is a shared-contract gap (a load-time-vs-request-time seam) rather than a Z-Image one; it is
 //! recorded here so no calibration reads a rung-1 cell as request-selectable.
@@ -104,7 +104,7 @@ use mlx_gen::gen_core::{
 };
 
 /// The decode tile edge / overlap the Z-Image MLX bounded decode is fixed at — the 512 px parity
-/// sweet spot for this GroupNorm VAE (sc-13571, [`crate::pipeline::decode_tiling`]).
+/// sweet spot for this GroupNorm VAE (sc-13571, `pipeline::decode_tiling`).
 pub const DECODE_TILE_EDGE: u32 = 512;
 /// The decode overlap paired with [`DECODE_TILE_EDGE`].
 pub const DECODE_OVERLAP: u32 = 64;

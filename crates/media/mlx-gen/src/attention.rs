@@ -23,7 +23,7 @@
 //! already materialized and pinned alive — chunking only *adds* transients (+50% peak).
 //!
 //! Inside a real DiT forward the result inverts, for a different reason. There q/k/v are intermediates
-//! in a deep lazy graph, and [`AttentionBudget::eval_per_chunk`] cuts that graph at every chunk
+//! in a deep lazy graph, and `AttentionBudget::eval_per_chunk` cuts that graph at every chunk
 //! boundary, letting MLX free upstream transients earlier. Measured on the real Z-Image-turbo q4 DiT
 //! (1024², 4 steps, staged residency):
 //!

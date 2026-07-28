@@ -4,7 +4,7 @@
 //! q4/q8) and an Apple/Metal GPU. Run:
 //!
 //! ```text
-//! ZIMAGE_SNAPSHOT=~/.cache/huggingface/hub/models--SceneWorks--z-image-turbo-mlx/snapshots/<rev>/q4 \
+//! ZIMAGE_SNAPSHOT=<path to a Z-Image-Turbo snapshot, or its q4/q8 tier subdirectory> \
 //!   cargo test -p mlx-gen-z-image --release --test bounded_attention_real_weights -- --ignored --nocapture
 //! ```
 //!
