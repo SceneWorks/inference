@@ -163,6 +163,15 @@ pub struct LokrFactors {
     pub c: i32,
     /// `d` — trailing (col) count of `w2`.
     pub d: i32,
+    /// The **pre-bake** `scale` (sc-15265). `scale` is folded into [`w2`](Self::w2) at build time and
+    /// is not otherwise recoverable from the factors — but [`Adapter::is_disabled`] needs it to
+    /// short-circuit a disabled structured LoKr exactly as it short-circuits LoRA/LoKr. Keeping it
+    /// here is what makes the short-circuit *universal* instead of a two-of-three exemption: at
+    /// `scale == 0` the residual is never computed, so a `w2` factor carrying a non-finite value (an
+    /// `Inf` in a third-party checkpoint — [`build_lokr_factors`] guards the *scale* for finiteness
+    /// but cannot vouch for the factors) can no longer turn `Inf · 0.0` into a `NaN` that poisons the
+    /// output. It is otherwise unused: the residual math still reads the already-baked `w2`.
+    pub scale: f32,
 }
 
 /// Build the small [`LokrFactors`] from a LoKr module's factors (full `w1`/`w2` or low-rank
@@ -231,6 +240,9 @@ pub fn build_lokr_factors(
         b,
         c,
         d,
+        // Retained so a `scale == 0` structured LoKr is recoverably disabled (sc-15265) — see the
+        // field doc. The value baked into `w2` above is the authoritative one for the math.
+        scale,
     }))
 }
 
@@ -363,8 +375,12 @@ impl Adapter {
     ///   * LoKr — `scale · x·ΔWᵀ` with `ΔW` (stored bf16) cast to the **activation dtype** — bf16 on
     ///     the bf16 path — mirroring the fork's `delta.astype(x.dtype)`.
     ///
-    /// The result is NOT cast back: `base(x) + residual` promotes just as the fork's `out + residual`
-    /// does. An f32-activation target is unchanged (FLUX.2; Qwen's f32 image stream; SDXL merges
+    /// The result is NOT cast back **here** — this returns the residual in its natural promoted
+    /// dtype, byte-for-byte as the fork's `.residual` does. The hand-off to the host is a separate
+    /// concern and lives in `AdaptableLinear`'s adapter accumulation, which narrows the residual to the
+    /// host's output dtype before the add (sc-15265) so installing an adapter cannot widen the host
+    /// Linear — and therefore the whole downstream chain — from bf16 to f32. An f32-activation
+    /// target is unchanged either way (FLUX.2; Qwen's f32 image stream; SDXL merges
     /// instead) — the residual was f32 before and stays f32. A bf16-activation target now runs the
     /// residual in bf16 like the fork (Z-Image's latents; Qwen's bf16 text stream); validated against
     /// the fork goldens (Z-Image / Qwen LoRA+LoKr) — px>8 byte-identical to the old forced-f32 path,
@@ -386,6 +402,29 @@ impl Adapter {
         };
         // Dtype-matched scalar → preserves the residual's dtype (the fork's weak-float `scale * …`).
         Ok(multiply(&r, &scalar(scale).as_dtype(r.dtype())?)?)
+    }
+
+    /// `true` when this adapter contributes nothing — a `scale` of exactly zero (sc-15265).
+    ///
+    /// [`AdaptableLinear::forward`] skips a disabled adapter entirely rather than adding its
+    /// (mathematically zero) residual, so **"install an adapter at scale 0" is byte-identical to
+    /// "install no adapter at all"**: no residual is formed, nothing is added, and the host's
+    /// output array is returned untouched. That is what makes scale 0 usable both as the
+    /// "disabled LoRA" model a UI/worker reaches for and as an A/B control when validating an
+    /// adapter. (It is also strictly cheaper: two matmuls per adapted Linear are skipped.)
+    ///
+    /// [`Adapter::LokrStructured`] bakes its `scale` into [`LokrFactors::w2`], so it carries the
+    /// pre-bake value in [`LokrFactors::scale`] purely to answer this question (sc-15265). It
+    /// deliberately is NOT exempted: a zero `scale` does multiply `w2` to exact zeros, and adding
+    /// exact zeros would already be bit-exact — but only for *finite* factors. `Inf · 0.0 = NaN`,
+    /// so a checkpoint carrying a non-finite `w2` entry would otherwise NaN-poison the output at
+    /// exactly the setting the user chose to turn the adapter OFF. Skipping the residual outright
+    /// makes that unreachable rather than merely unlikely.
+    pub fn is_disabled(&self) -> bool {
+        match self {
+            Adapter::Lora { scale, .. } | Adapter::Lokr { scale, .. } => *scale == 0.0,
+            Adapter::LokrStructured { factors } => factors.scale == 0.0,
+        }
     }
 }
 
@@ -478,6 +517,10 @@ impl LinearBase {
 pub struct AdaptableLinear {
     base: LinearBase,
     adapters: Vec<Adapter>,
+    /// `true` only for a **training** adapter stack (installed via
+    /// [`set_training_adapters`](Self::set_training_adapters)), which opts OUT of both sc-15265
+    /// rules in `apply_adapters` — see that method's doc for why.
+    training_residual: bool,
 }
 
 impl AdaptableLinear {
@@ -495,6 +538,7 @@ impl AdaptableLinear {
         Self {
             base: LinearBase::Dense(linear),
             adapters: Vec::new(),
+            training_residual: false,
         }
     }
 
@@ -503,6 +547,7 @@ impl AdaptableLinear {
         Self {
             base: LinearBase::Quantized(q),
             adapters: Vec::new(),
+            training_residual: false,
         }
     }
 
@@ -537,14 +582,29 @@ impl AdaptableLinear {
         self.adapters.push(adapter);
     }
 
-    /// Replace the entire adapter stack. The forward-time counterpart to [`push`](Self::push) used
-    /// by **training** (sc-3042/3039): each optimizer step produces new trainable LoRA factor arrays,
-    /// so the trainer re-injects a single fresh `Adapter::Lora` per target every step rather than
-    /// accumulating residuals. Setting the SAME `(transpose, alpha/rank fold, scale)` an inference
-    /// reload applies (`adapters::loader::install_lora_groups`) makes the trained adapter round-trip
-    /// bit-for-bit. An empty `Vec` clears the stack (back to the bare frozen base).
+    /// Replace the entire adapter stack under the normal (inference) dtype rules — see
+    /// `apply_adapters`. An empty `Vec` clears the stack back to the bare
+    /// frozen base, which is what every non-training caller uses this for.
     pub fn set_adapters(&mut self, adapters: Vec<Adapter>) {
         self.adapters = adapters;
+        self.training_residual = false;
+    }
+
+    /// Replace the entire adapter stack as a **training** stack. The forward-time counterpart to
+    /// [`push`](Self::push) used by training (sc-3042/3039): each optimizer step produces new
+    /// trainable LoRA factor arrays, so the trainer re-injects a single fresh `Adapter::Lora` per
+    /// target every step rather than accumulating residuals. Setting the SAME
+    /// `(transpose, alpha/rank fold, scale)` an inference reload applies
+    /// (`adapters::loader::install_lora_groups`) makes the trained adapter round-trip bit-for-bit.
+    ///
+    /// The stack is flagged so `apply_adapters` leaves the trainer's
+    /// numerics **exactly as they shipped** — no scale-0 skip, no narrowing cast (sc-15265). Both
+    /// the traced `loss_fn` install (`train::lora::install_training_lora_as` /
+    /// `install_training_lokr`) and every family's gradient-checkpoint recompute go through this
+    /// method, so the train/recompute consistency invariant is preserved by construction.
+    pub fn set_training_adapters(&mut self, adapters: Vec<Adapter>) {
+        self.adapters = adapters;
+        self.training_residual = true;
     }
 
     pub fn adapters(&self) -> &[Adapter] {
@@ -714,19 +774,129 @@ impl AdaptableLinear {
         Ok(())
     }
 
-    pub fn forward(&self, x: &Array) -> Result<Array> {
-        let mut out = self.base.forward(x)?;
+    /// Accumulate the adapter stack over an already-computed base output, in the **host's** dtype
+    /// (sc-15265). Two rules, both about the host staying the host:
+    ///
+    /// 1. A [disabled](Adapter::is_disabled) adapter (`scale == 0`) is skipped outright, so `out`
+    ///    is returned as the base produced it — installing an adapter and setting its scale to 0
+    ///    is byte-identical to never installing one.
+    /// 2. A live adapter's residual is cast to `out`'s dtype **before** the add.
+    ///
+    /// Rule 2 is the consequential one and is not confined to scale 0. Adapter factors carry their
+    /// on-disk dtype and [`Adapter::residual`] deliberately does not force one (sc-2718,
+    /// fork-faithful); the goldens ship **f32** factors, so on a **bf16** host `add(bf16, f32)`
+    /// promoted the Linear's output to f32 — and from there the whole downstream chain, since
+    /// every subsequent op inherits the widened activation. That is a global precision/allocation
+    /// change triggered by merely installing a LoRA, measured e2e at ≈1.9e-4 (dense) / ≈2.9e-4
+    /// (Q4) versus the unadapted model. Training already had to work around it per-call-site
+    /// (`install_training_lora_as`'s compute-dtype cast, sc-4887, whose doc names exactly this
+    /// "silently re-promotes the whole chain to f32"); this fixes it once at the shared seam.
+    ///
+    /// The residual itself is still computed in its natural promoted dtype — only the *hand-off*
+    /// to the host is narrowed — so an f32-activation host (FLUX.2, Qwen's image stream) is
+    /// completely unaffected: `out` is already f32 and the cast is a no-op.
+    ///
+    /// **What rule 2 costs, stated honestly.** It is not free and it is not an accuracy *gain* — it
+    /// moves the adapted Linear AWAY from a fully-f32 reference, not toward it. Two independent
+    /// seam-level measurements (bf16 host, f32 rank-4 factors, relative L2 vs an all-f32 reference):
+    ///
+    /// | fixture   | unadapted bf16 base floor | err before | err after |
+    /// |-----------|---------------------------|------------|-----------|
+    /// | 64-wide   | 6.3014e-4                 | 6.3066e-4  | 7.4336e-4 |
+    /// | 1024-wide | 1.95376e-3                | 1.95376e-3 | 2.0238e-3 |
+    ///
+    /// The load-bearing observation is that `err(before)` equals the unadapted base's own bf16 floor
+    /// to five/six digits: the promoted residual was essentially exact and contributed ~nothing on
+    /// top of that floor. Narrowing it costs a further `≈4.7e-4` / `≈5.3e-4` relative. Expressed as a
+    /// *fraction of the adapter's own effect* at that Linear the number is NOT stable — ~19% at the
+    /// first fixture, ~92% at the second — because it depends entirely on how large the residual is
+    /// relative to the host's bf16 ulp; quote it and you will mislead yourself. The claim that IS
+    /// stable is the absolute bound. The narrowing path rounds **twice** — once casting the residual
+    /// to the host dtype, and once in the host-dtype `add` — each at most half an ulp, so the
+    /// constructive bound is **at most about one ulp of the host dtype**, not half. (The measured
+    /// extra `≈4.7e-4` / `≈5.3e-4` relative above is consistent with ~1 ulp: bf16's relative ulp is
+    /// ≈3.9e-3.) That is still **a bounded accuracy loss of the same order as the host's own bf16
+    /// rounding, with a non-systematic end-to-end sign** — the qualitative conclusion and every
+    /// measured number are unaffected by the correction. The krea e2e tier sweep
+    /// bears the second half out: −0.17% (bf16), −1.1% (Q8), **+**1.5% (Q4) — non-monotonic,
+    /// consistent with chaotic propagation of rounding rather than a directional bias.
+    ///
+    /// **User-visible consequence at inference.** Rule 2's dead zone is not confined to training:
+    /// on a bf16 host a sufficiently low user LoRA strength is now quantized to the host dtype
+    /// rather than accumulated in f32, so it can round away *entirely* where pre-fix it had a small
+    /// but visible f32 effect. The measured threshold is roughly half a bf16 ulp of the host output
+    /// — i.e. a residual/output ratio of about **2e-3** or less contributes nothing. This is the
+    /// accepted diffusers convention and is not a defect, but it is the answer to "my LoRA at very
+    /// low strength does nothing now": raise the strength, or run an f32-activation host.
+    ///
+    /// This is the diffusers convention (LoRA cast to the model dtype); it diverges from the frozen
+    /// fork, which adds the promoted residual. **No image-level A/B on a shipped LoRA was run**, and
+    /// the Z-Image / Qwen LoRA+LoKr **fork-parity goldens named in [`Adapter::residual`] were not
+    /// re-run** against this narrowing — they need a licensed host. Both are open follow-ups, not
+    /// claims. What is bought is the invariant above: installing an adapter no longer silently
+    /// re-dtypes the model, and "installed at scale 0" is genuinely nothing.
+    ///
+    /// `candle-gen`'s `quant::adapt` carries the same defect at its own seam and is NOT fixed here
+    /// (tracked as sc-15444).
+    fn apply_adapters(&self, x: &Array, mut out: Array) -> Result<Array> {
         for adapter in &self.adapters {
-            out = add(&out, &adapter.residual(x)?)?;
+            // sc-15265 rule 0 — the TRAINING exemption. A training stack
+            // ([`set_training_adapters`]) opts out of both rules and runs the pre-sc-15265 add
+            // verbatim, so this change is inference-only and the shipped trainers are
+            // bit-identical. Reasons, in order:
+            //   * Neither rule is *for* training. Rule 1 exists so "installed at scale 0" is a
+            //     no-op; a trainer always installs at `scale = 1` and has no disabled case.
+            //   * Rule 2 would change shipped trainer numerics, and this is an inference-scoped
+            //     fix. Wan installs its **f32 master** factors unchanged (`install_training_lora`
+            //     passes `dtype = None`; see
+            //     `mlx_gen_wan::transformer::WanTransformer::forward_train_checkpointed`) over a
+            //     bf16 block stream. `b` initializes to zeros and the residual grows *from* zero,
+            //     so for an initial stretch it sits below the bf16 ulp of the base and narrowing
+            //     `base + r` to bf16 would round the adapter contribution away entirely. That
+            //     FORWARD dead zone is real and measured at the seam: at `|b|` up to 1e-4 the
+            //     residual peaks at 3.3e-7 and the narrowed output is bit-identical to the
+            //     unadapted base.
+            //     It does NOT, however, stall the optimizer — that would be an overclaim. The
+            //     `astype`/`add` VJP is straight-through, so gradient still reaches the LoRA
+            //     parameters through the narrowing path: `grad` of a squared-sum loss at `b == 0`
+            //     measures max|g| = 4.42e-2, and `b` grows out of the dead zone. The justification
+            //     for the exemption is therefore the narrower and sufficient one — it keeps the
+            //     shipped trainers **bit-identical** while this change stays inference-only, and
+            //     avoids a forward dead zone whose end-to-end training effect was never measured.
+            //     The wider accumulation is the master-weights pattern working as intended.
+            //   * The alternative — casting the factors to bf16 at the install site — moves the
+            //     low-rank matmul itself into bf16, which is a LARGER departure from shipped
+            //     trainer numerics than doing nothing, so it cannot be justified as conservative.
+            // No before/after Wan training run was measured (a 14B run is not a CI-scale
+            // experiment); this exemption is what makes that measurement unnecessary.
+            if self.training_residual {
+                out = add(&out, &adapter.residual(x)?)?;
+                continue;
+            }
+            if adapter.is_disabled() {
+                continue;
+            }
+            let residual = adapter.residual(x)?;
+            let residual = if residual.dtype() == out.dtype() {
+                residual
+            } else {
+                residual.as_dtype(out.dtype())?
+            };
+            out = add(&out, &residual)?;
         }
         Ok(out)
+    }
+
+    pub fn forward(&self, x: &Array) -> Result<Array> {
+        let out = self.base.forward(x)?;
+        self.apply_adapters(x, out)
     }
 
     /// Evaluate with dense base weights widened to the activation dtype for this operation.
     /// Packed bases already compute from the activation dtype and are left packed. This supports
     /// bf16-resident/f32-compute text encoders without permanently widening their weight store.
     pub fn forward_upcast(&self, x: &Array) -> Result<Array> {
-        let mut out = match &self.base {
+        let out = match &self.base {
             LinearBase::Dense(l) => {
                 let weight = l.weight.value.as_dtype(x.dtype())?;
                 match l.bias.value.as_ref() {
@@ -736,10 +906,7 @@ impl AdaptableLinear {
             }
             LinearBase::Quantized(_) => self.base.forward(x)?,
         };
-        for adapter in &self.adapters {
-            out = add(&out, &adapter.residual(x)?)?;
-        }
-        Ok(out)
+        self.apply_adapters(x, out)
     }
 }
 
@@ -905,6 +1072,392 @@ mod tests {
     #[test]
     fn lokr_delta_stored_bf16() {
         assert_eq!(lokr_2x2().dtype(), Dtype::Bfloat16);
+    }
+
+    // ── sc-15265: adapter installation must not change the host Linear's output dtype ──────────
+    //
+    // A bf16 base with f32 LoRA/LoKr factors used to promote the WHOLE forward to f32, so
+    // "install an adapter and set its scale to 0" was NOT the same as "don't install it"
+    // (measured drift ≈1.9e-4 dense / 2.9e-4 Q4 e2e), and a *live* adapter silently widened
+    // every downstream activation. The helpers below build a 64-wide (group-size-aligned, so the
+    // same base can be quantized) bf16 host and f32 rank-4 factors — the exact shape of the bug.
+
+    /// Deterministic `[rows, cols]` f32 array from a cheap analytic pattern.
+    fn synth(rows: i32, cols: i32, seed: f32) -> Array {
+        let n = (rows * cols) as usize;
+        let v: Vec<f32> = (0..n)
+            .map(|i| (i as f32 * 0.017 + seed).sin() * 0.05)
+            .collect();
+        Array::from_slice(&v, &[rows, cols])
+    }
+
+    /// A bf16 host Linear (`[64, 64]`, no bias), bf16 activations `[4, 64]`, and f32 rank-4
+    /// LoRA factors `a: [64, 4]`, `b: [4, 64]` — the promoting combination.
+    fn bf16_host() -> (AdaptableLinear, Array, Array, Array) {
+        let w = synth(64, 64, 0.3).as_dtype(Dtype::Bfloat16).unwrap();
+        let x = synth(4, 64, 1.1).as_dtype(Dtype::Bfloat16).unwrap();
+        (
+            AdaptableLinear::dense(w, None),
+            x,
+            synth(64, 4, 2.7),
+            synth(4, 64, 3.9),
+        )
+    }
+
+    /// `true` iff the two arrays are bit-identical in dtype, shape, and every element's **raw bit
+    /// pattern**.
+    ///
+    /// This deliberately does NOT use `array_eq`, which is *value* equality and therefore accepts
+    /// `-0.0 == +0.0` (and, for that matter, rejects `NaN == NaN`). The contract these tests pin is
+    /// byte identity — "installed at scale 0" produces the same bytes as "not installed" — and the
+    /// sign bit is exactly where a value comparison would let a real regression through: a LoKr
+    /// residual is built as `multiply(&factor2, scalar(0.0))`, which yields **signed** zeros, so
+    /// `base(-0.0) + (+0.0) = +0.0` flips a sign bit that `array_eq` cannot see. Reinterpret through
+    /// `view` (an unsigned integer of the same width) and compare those instead.
+    fn bit_exact(got: &Array, want: &Array) -> bool {
+        if got.dtype() != want.dtype() || got.shape() != want.shape() {
+            return false;
+        }
+        let bits = |a: &Array| match a.dtype() {
+            Dtype::Bfloat16 | Dtype::Float16 => a.view::<u16>().unwrap(),
+            Dtype::Float32 => a.view::<u32>().unwrap(),
+            Dtype::Float64 => a.view::<u64>().unwrap(),
+            // Integer/bool dtypes have no redundant encodings — value equality IS bit equality.
+            _ => a.clone(),
+        };
+        array_eq(bits(got), bits(want), false)
+            .unwrap()
+            .item::<bool>()
+    }
+
+    #[test]
+    fn bit_exact_rejects_a_signed_zero_flip_that_value_equality_accepts() {
+        // Pins the helper above (MINOR 5): the gates below are only as strong as this comparison.
+        let neg = Array::from_slice(&[-0.0f32, 1.0], &[2]);
+        let pos = Array::from_slice(&[0.0f32, 1.0], &[2]);
+        assert!(
+            array_eq(&neg, &pos, false).unwrap().item::<bool>(),
+            "value equality cannot see the sign bit — which is why bit_exact must not use it"
+        );
+        assert!(!bit_exact(&neg, &pos), "bit_exact must see the sign bit");
+        assert!(bit_exact(&neg, &neg.clone()));
+    }
+
+    #[test]
+    fn scale_zero_lora_is_bit_exact_noop_on_a_bf16_dense_base() {
+        let (mut lin, x, a, b) = bf16_host();
+        let base = lin.forward(&x).unwrap();
+        assert_eq!(base.dtype(), Dtype::Bfloat16, "host output is bf16");
+
+        lin.push(Adapter::Lora {
+            a: a.clone(),
+            b: b.clone(),
+            scale: 0.0,
+        });
+        let zero = lin.forward(&x).unwrap();
+        assert_eq!(
+            zero.dtype(),
+            Dtype::Bfloat16,
+            "installing an adapter must not widen the host's output dtype"
+        );
+        assert!(
+            bit_exact(&zero, &base),
+            "a scale-0 adapter must be bit-exact to no adapter at all"
+        );
+
+        // MUTATION: the same adapter at a live scale must actually change the output — otherwise
+        // the bit-exactness above would be a false green from a dead residual.
+        let mut live =
+            AdaptableLinear::dense(synth(64, 64, 0.3).as_dtype(Dtype::Bfloat16).unwrap(), None);
+        live.push(Adapter::Lora { a, b, scale: 1.0 });
+        assert!(
+            !bit_exact(&live.forward(&x).unwrap(), &base),
+            "a live adapter must change the forward (residual is not identically zero)"
+        );
+    }
+
+    /// A `[rows, cols]` f32 array whose every entry is `+INFINITY`.
+    fn inf(rows: i32, cols: i32) -> Array {
+        Array::from_slice(&vec![f32::INFINITY; (rows * cols) as usize], &[rows, cols])
+    }
+
+    #[test]
+    fn a_disabled_adapters_residual_is_never_evaluated() {
+        // sc-15265, MAJOR-1 gate. This is the ONLY test that discriminates the `is_disabled()`
+        // short-circuit in `apply_adapters` from the narrowing cast beside it. Every other
+        // scale-0 gate here (and the krea e2e tier sweep) stays green with the short-circuit
+        // deleted, because `0 · finite = 0` and casting an exact-zero residual to the host dtype is
+        // *already* bit-exact — the cast alone carries them.
+        //
+        // The discriminator is a residual that is NOT zero when you compute it: a factor of
+        // `+INFINITY` makes the low-rank product non-finite, and `Inf · 0.0 = NaN`. So a scale-0
+        // adapter whose forward is still bit-exact to the unadapted base proves the residual was
+        // never formed at all — no arithmetic identity can rescue a NaN. Delete the
+        // `if adapter.is_disabled() { continue; }` in `apply_adapters` and every assertion below
+        // fails with a NaN output.
+        //
+        // This is not a synthetic-only worry: it is exactly the failure mode a third-party
+        // checkpoint carrying an `Inf` weight would hit at the moment a user turns the adapter OFF.
+        let (lin, x, _, b) = bf16_host();
+        let base = lin.forward(&x).unwrap();
+
+        // (1) LoRA — an `Inf` in `a`.
+        let poison_lora = Adapter::Lora {
+            a: inf(64, 4),
+            b: b.clone(),
+            scale: 0.0,
+        };
+        // The fixture must actually be a trap, or this whole test is vacuous.
+        let raw = poison_lora.residual(&x).unwrap();
+        assert!(
+            !raw.is_finite().unwrap().all(None).unwrap().item::<bool>(),
+            "fixture check: evaluating this residual must produce a non-finite value"
+        );
+        let mut poisoned = lin.clone();
+        poisoned.push(poison_lora);
+        assert!(
+            bit_exact(&poisoned.forward(&x).unwrap(), &base),
+            "a disabled LoRA's residual must never be evaluated (short-circuit deleted?)"
+        );
+
+        // (2) Materialized LoKr — an `Inf` in the delta.
+        let mut poisoned = lin.clone();
+        poisoned.push(Adapter::Lokr {
+            delta: inf(64, 64).as_dtype(Dtype::Bfloat16).unwrap(),
+            scale: 0.0,
+        });
+        assert!(
+            bit_exact(&poisoned.forward(&x).unwrap(), &base),
+            "a disabled LoKr's residual must never be evaluated"
+        );
+
+        // (3) Structured LoKr — an `Inf` in `w2`. This arm is why `LokrFactors` retains its
+        // pre-bake `scale` (sc-15265): the scale is folded into `w2` at build time, so `Inf · 0.0`
+        // bakes a NaN straight into the factor. Without a recoverable disabled flag there is no
+        // way to skip it, and "turn the adapter off" would output NaN.
+        let factors = build_lokr_factors(
+            0.0,
+            &[64, 64],
+            Some(&synth(8, 8, 6.1)),
+            None,
+            None,
+            Some(&inf(8, 8)),
+            None,
+            None,
+            None,
+            Dtype::Float32,
+        )
+        .unwrap()
+        .expect("8×8 ⊗ 8×8 factors a 64×64 base");
+        assert!(
+            !factors
+                .w2
+                .is_finite()
+                .unwrap()
+                .all(None)
+                .unwrap()
+                .item::<bool>(),
+            "fixture check: Inf · 0.0 must bake a NaN into w2"
+        );
+        let mut poisoned = lin.clone();
+        poisoned.push(Adapter::LokrStructured { factors });
+        assert!(
+            bit_exact(&poisoned.forward(&x).unwrap(), &base),
+            "a disabled structured LoKr's residual must never be evaluated"
+        );
+
+        // And `forward_upcast` runs the same accumulation, so it inherits the same guarantee.
+        let upcast_base = lin.forward_upcast(&x).unwrap();
+        let mut poisoned = lin.clone();
+        poisoned.push(Adapter::Lora {
+            a: inf(64, 4),
+            b,
+            scale: 0.0,
+        });
+        assert!(
+            bit_exact(&poisoned.forward_upcast(&x).unwrap(), &upcast_base),
+            "forward_upcast must short-circuit a disabled adapter too"
+        );
+    }
+
+    #[test]
+    fn scale_zero_lora_is_bit_exact_noop_on_a_packed_base() {
+        for bits in [4, 8] {
+            let (mut lin, x, a, b) = bf16_host();
+            lin.quantize(bits, None).unwrap();
+            let base = lin.forward(&x).unwrap();
+            assert_eq!(base.dtype(), Dtype::Bfloat16, "q{bits} host output is bf16");
+
+            lin.push(Adapter::Lora { a, b, scale: 0.0 });
+            let zero = lin.forward(&x).unwrap();
+            assert_eq!(
+                zero.dtype(),
+                Dtype::Bfloat16,
+                "q{bits}: installing an adapter must not widen the host's output dtype"
+            );
+            assert!(
+                bit_exact(&zero, &base),
+                "q{bits}: a scale-0 adapter must be bit-exact to no adapter at all"
+            );
+        }
+    }
+
+    #[test]
+    fn scale_zero_lokr_variants_are_bit_exact_noops_on_a_bf16_base() {
+        // The two LoKr arms, both of which are pure regression pins rather than reproductions of
+        // the sc-15265 promotion:
+        //   * materialized LoKr casts its delta to the ACTIVATION dtype in `Adapter::residual`, so
+        //     its residual was already bf16 on a bf16 host — this arm never promoted;
+        //   * structured LoKr builds its factors at an explicit `out_dtype` (f32 here), but
+        //     `LokrFactors::residual` likewise casts them to the activation dtype, so this arm
+        //     never promoted either. Building it f32 over a bf16 host does NOT reproduce the bug —
+        //     the arm is exercised only to pin that it *stays* a bit-exact no-op at `scale = 0`.
+        // (The arm that actually promoted is LoRA, whose factors are used at their file dtype; see
+        // `live_adapter_keeps_the_host_output_dtype_and_matches_a_cast_residual`.)
+        let (lin, x, _, _) = bf16_host();
+        let base = lin.forward(&x).unwrap();
+
+        let mut mat = lin.clone();
+        mat.push(Adapter::Lokr {
+            delta: synth(64, 64, 5.5).as_dtype(Dtype::Bfloat16).unwrap(),
+            scale: 0.0,
+        });
+        assert!(
+            bit_exact(&mat.forward(&x).unwrap(), &base),
+            "a scale-0 materialized LoKr must be bit-exact to no adapter"
+        );
+
+        let factors = build_lokr_factors(
+            0.0,
+            &[64, 64],
+            Some(&synth(8, 8, 6.1)),
+            None,
+            None,
+            Some(&synth(8, 8, 7.3)),
+            None,
+            None,
+            None,
+            Dtype::Float32,
+        )
+        .unwrap()
+        .expect("8×8 ⊗ 8×8 factors a 64×64 base");
+        let mut structured = lin.clone();
+        structured.push(Adapter::LokrStructured { factors });
+        let got = structured.forward(&x).unwrap();
+        assert_eq!(
+            got.dtype(),
+            Dtype::Bfloat16,
+            "a structured LoKr must not widen the host's output dtype"
+        );
+        assert!(
+            bit_exact(&got, &base),
+            "a scale-0 structured LoKr must be bit-exact to no adapter"
+        );
+    }
+
+    #[test]
+    fn live_adapter_keeps_the_host_output_dtype_and_matches_a_cast_residual() {
+        // Half 2 (sc-15265): the widening is NOT confined to scale 0. A live f32-factor adapter
+        // over a bf16 host must land its residual in the host dtype — `bf16(base) + bf16(residual)`
+        // — rather than promoting the whole downstream chain to f32.
+        let (mut lin, x, a, b) = bf16_host();
+        let base = lin.forward(&x).unwrap();
+        let adapter = Adapter::Lora { a, b, scale: 0.75 };
+        let residual = adapter.residual(&x).unwrap();
+        assert_eq!(
+            residual.dtype(),
+            Dtype::Float32,
+            "f32 factors still promote the RESIDUAL itself (Adapter::residual is unchanged)"
+        );
+
+        lin.push(adapter);
+        let got = lin.forward(&x).unwrap();
+        assert_eq!(
+            got.dtype(),
+            Dtype::Bfloat16,
+            "a live adapter must not widen the host's output dtype"
+        );
+        let want = add(&base, residual.as_dtype(Dtype::Bfloat16).unwrap()).unwrap();
+        assert!(
+            bit_exact(&got, &want),
+            "the forward must be base + host-dtype(residual)"
+        );
+    }
+
+    #[test]
+    fn a_training_stack_keeps_its_pre_sc15265_numerics() {
+        // sc-15265 rule 0. The trainers ship f32 master factors over bf16 block streams
+        // (`install_training_lora` passes `dtype = None`); narrowing that residual would round the
+        // adapter's whole contribution away while it is still small, so a training stack opts out
+        // of BOTH rules. This pins that: `set_training_adapters` must reproduce the pre-fix
+        // `add(base, residual)` exactly — promotion and all — while the same adapters installed the
+        // inference way must not.
+        let (lin, x, a, b) = bf16_host();
+        let base = lin.forward(&x).unwrap();
+        let adapter = Adapter::Lora {
+            a: a.clone(),
+            b: b.clone(),
+            scale: 1.0,
+        };
+        let residual = adapter.residual(&x).unwrap();
+        assert_eq!(residual.dtype(), Dtype::Float32);
+
+        let mut train = lin.clone();
+        train.set_training_adapters(vec![adapter]);
+        let got = train.forward(&x).unwrap();
+        assert_eq!(
+            got.dtype(),
+            Dtype::Float32,
+            "a training stack must keep the promoted (pre-fix) accumulation dtype"
+        );
+        assert!(
+            bit_exact(&got, &add(&base, &residual).unwrap()),
+            "a training stack must be bit-identical to the pre-sc-15265 add"
+        );
+
+        // Rule 1 is opted out of too, so a training install is untouched even at scale 0 — an f32
+        // zero residual still promotes, exactly as it did before. No partial exemption.
+        let mut train0 = lin.clone();
+        train0.set_training_adapters(vec![Adapter::Lora { a, b, scale: 0.0 }]);
+        assert_eq!(
+            train0.forward(&x).unwrap().dtype(),
+            Dtype::Float32,
+            "the training exemption covers the scale-0 skip as well"
+        );
+
+        // And `set_adapters` (the inference / clear path) must NOT inherit the flag.
+        let mut back = train;
+        back.set_adapters(vec![Adapter::Lora {
+            a: synth(64, 4, 2.7),
+            b: synth(4, 64, 3.9),
+            scale: 1.0,
+        }]);
+        assert_eq!(
+            back.forward(&x).unwrap().dtype(),
+            Dtype::Bfloat16,
+            "set_adapters must clear the training flag, not leave it latched"
+        );
+    }
+
+    #[test]
+    fn forward_upcast_also_keeps_its_own_output_dtype() {
+        // `forward_upcast` widens the BASE to the activation dtype on purpose; the adapter must
+        // still not widen it any further than that.
+        let w = synth(64, 64, 0.3).as_dtype(Dtype::Bfloat16).unwrap();
+        let x = synth(4, 64, 1.1).as_dtype(Dtype::Bfloat16).unwrap();
+        let mut lin = AdaptableLinear::dense(w, None);
+        let base = lin.forward_upcast(&x).unwrap();
+        assert_eq!(base.dtype(), Dtype::Bfloat16);
+        lin.push(Adapter::Lora {
+            a: synth(64, 4, 2.7),
+            b: synth(4, 64, 3.9),
+            scale: 0.0,
+        });
+        let zero = lin.forward_upcast(&x).unwrap();
+        assert!(
+            bit_exact(&zero, &base),
+            "forward_upcast: a scale-0 adapter must be a bit-exact no-op too"
+        );
     }
 
     #[test]

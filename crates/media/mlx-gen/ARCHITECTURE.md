@@ -41,7 +41,12 @@ carries an explicit remap in its `from_weights`. Today the Z-Image block keys al
 ### Linears & adapters
 - Every quantizable/adaptable projection is an [`AdaptableLinear`](src/adapters.rs): a base
   (`LinearBase::{Dense(nn::Linear), Quantized(nn::QuantizedLinear)}`) plus a stack of
-  forward-time residual adapters — `base(x) + Σ adapter.residual(x)`.
+  forward-time residual adapters — `base(x) + Σ adapter.residual(x)`. The sum is taken in the
+  **host's** output dtype and a `scale == 0` adapter is skipped entirely (sc-15265), so installing
+  an adapter never widens a bf16 Linear — or the chain downstream of it — to f32, and "installed at
+  scale 0" is byte-identical to "not installed". Training stacks
+  (`AdaptableLinear::set_training_adapters`) are exempt from both rules and keep their
+  pre-sc-15265 numerics.
 - The base is **never fused/mutated**: fusing would force re-quantization on every adapter
   swap and break the quant-safe property. LoRA/LoKr compose with Q4/Q8 for free.
 - Adapters are installed by **dotted path** (`AdaptableHost::adaptable_mut` +

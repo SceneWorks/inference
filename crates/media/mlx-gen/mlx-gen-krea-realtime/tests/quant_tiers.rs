@@ -447,11 +447,12 @@ fn verification_is_exact_on_a_packed_tier() {
 /// attention + FFN targets — the FFN spelled in the reference `ffn.0`/`ffn.2` naming a real
 /// Wan-family file carries, so the host's key normalization is exercised too.
 ///
-/// `dt` is the **factor dtype**, and it matters (see
-/// [`scale_zero_is_a_bit_exact_no_op_on_every_tier`]): the residual is added to the base's output at
-/// the promoted dtype, so f32 factors widen the Linear's bf16 output to f32. That widening is
-/// value-preserving at the Linear itself but changes downstream rounding, on a **dense** base exactly
-/// as much as on a packed one.
+/// `dt` is the **factor dtype**. It used to matter (see
+/// [`scale_zero_is_a_bit_exact_no_op_on_every_tier`]): the residual was added to the base's output at
+/// the *promoted* dtype, so f32 factors widened the Linear's bf16 output to f32 — value-preserving at
+/// the Linear itself, but it changed downstream rounding, on a **dense** base exactly as much as on a
+/// packed one. sc-15265 fixed that at the shared `mlx-gen` seam (the residual is narrowed to the
+/// host's output dtype before the add), so both factor dtypes are now gated identically.
 fn write_lora(name: &str, seed: u64, mag: f32, dt: Dtype) -> PathBuf {
     const RANK: i32 = 4;
     let stems: [(&str, i32, i32); 5] = [
@@ -536,43 +537,60 @@ fn lora_installs_additively_over_a_packed_base_without_dequantizing_it() {
 /// what excludes "the forward changed by accident" from gate (6), and it proves the install never
 /// mutates the base (which on a packed tier would mean an unpack/repack round trip).
 ///
-/// The factors are **bf16** here deliberately. The shared loader adds the residual at the factors'
-/// promoted dtype, so an *f32*-factor adapter widens the host Linear's bf16 output to f32 — a
-/// value-preserving widening at the Linear, but one that changes downstream rounding (`rms_norm`,
-/// SDPA, the FFN chain) and so is not bit-exact end-to-end even at scale 0. Measured, that artifact is
-/// ~1.9e-4 on a dense base and ~2.9e-4 on Q4: present on **both**, i.e. a property of the shared
-/// adapter path, not of the packed tier. Pinning the bf16 case keeps this gate about the tier.
+/// It is gated at **both** factor dtypes, and the f32 leg is the discriminating one (sc-15265). The
+/// shared loader used to add the residual at the factors' *promoted* dtype, so an f32-factor adapter
+/// widened the host Linear's bf16 output to f32 — value-preserving at the Linear, but it changed
+/// downstream rounding (`rms_norm`, SDPA, the FFN chain) and so was **not** bit-exact end-to-end even
+/// at scale 0. Measured on this geometry before the fix: `1.91e-4` bf16 / `2.99e-4` Q8 / `2.94e-4`
+/// Q4 — present on a dense base as much as on a packed one, i.e. a property of the shared adapter
+/// path, not of the packed tier. `mlx-gen`'s `AdaptableLinear` now narrows the residual to the host's
+/// output dtype before adding it (and skips a `scale == 0` adapter outright), so all six legs are
+/// exactly `0.0`. Keeping both dtypes here is what stops the artifact silently coming back.
 #[test]
 fn scale_zero_is_a_bit_exact_no_op_on_every_tier() {
     let cfg = tiny_cfg();
-    let lora = write_lora("scale_zero.safetensors", 5, 0.5, Dtype::Bfloat16);
+    // Same factors, two on-disk dtypes: bf16 matches the host's activation dtype, f32 (what the
+    // real community/PEFT files ship) is the combination that used to promote the host to f32.
+    let loras = [
+        (
+            "bf16",
+            write_lora("scale_zero.safetensors", 5, 0.5, Dtype::Bfloat16),
+        ),
+        (
+            "f32",
+            write_lora("scale_zero_f32.safetensors", 5, 0.5, Dtype::Float32),
+        ),
+    ];
 
     for (name, bits) in TIERS {
         let baseline = forward_once(&tier_transformer(&cfg, bits), &cfg);
-        let mut zero = tier_transformer(&cfg, bits);
-        apply_adapters_strict(
-            &mut zero,
-            &[AdapterSpec::new(lora.clone(), 0.0, AdapterKind::Lora)],
-            MODEL_ID,
-        )
-        .unwrap_or_else(|e| panic!("{name}: scale-0 install failed: {e}"));
-        assert_eq!(
-            max_abs_diff(&baseline, &forward_once(&zero, &cfg)),
-            0.0,
-            "{name}: a scale-0 LoRA must be a bit-exact no-op"
-        );
-        // …and a non-zero scale of the SAME file does move it, so the no-op is not vacuous.
-        let mut on = tier_transformer(&cfg, bits);
-        apply_adapters_strict(
-            &mut on,
-            &[AdapterSpec::new(lora.clone(), 1.0, AdapterKind::Lora)],
-            MODEL_ID,
-        )
-        .unwrap();
-        assert!(
-            max_abs_diff(&baseline, &forward_once(&on, &cfg)) > 1e-4,
-            "{name}: the same file at scale 1 must move the forward"
-        );
+        for (dt, lora) in &loras {
+            let mut zero = tier_transformer(&cfg, bits);
+            apply_adapters_strict(
+                &mut zero,
+                &[AdapterSpec::new(lora.clone(), 0.0, AdapterKind::Lora)],
+                MODEL_ID,
+            )
+            .unwrap_or_else(|e| panic!("{name}/{dt}: scale-0 install failed: {e}"));
+            let drift = max_abs_diff(&baseline, &forward_once(&zero, &cfg));
+            println!("{name}/{dt} factors: scale-0 drift vs no-adapter = {drift:e}");
+            assert_eq!(
+                drift, 0.0,
+                "{name}/{dt}: a scale-0 LoRA must be a bit-exact no-op vs no adapter at all"
+            );
+            // …and a non-zero scale of the SAME file does move it, so the no-op is not vacuous.
+            let mut on = tier_transformer(&cfg, bits);
+            apply_adapters_strict(
+                &mut on,
+                &[AdapterSpec::new(lora.clone(), 1.0, AdapterKind::Lora)],
+                MODEL_ID,
+            )
+            .unwrap();
+            assert!(
+                max_abs_diff(&baseline, &forward_once(&on, &cfg)) > 1e-4,
+                "{name}/{dt}: the same file at scale 1 must move the forward"
+            );
+        }
     }
 }
 

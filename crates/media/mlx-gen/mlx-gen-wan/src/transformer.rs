@@ -873,7 +873,7 @@ impl WanTransformer {
                                 local.join(".")
                             ))
                         })?
-                        .set_adapters(vec![Adapter::Lora { a, b, scale: 1.0 }]);
+                        .set_training_adapters(vec![Adapter::Lora { a, b, scale: 1.0 }]);
                 }
                 let kv = blk
                     .prepare_kv(&context_c)

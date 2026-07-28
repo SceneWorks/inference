@@ -120,11 +120,21 @@ fn hyper_flux_lora_resolves_all_targets_no_unmatched() {
 }
 
 /// (2) A scale-0 Hyper LoRA is a NEAR no-op — the residual `scale·x·A·B` is mathematically zero, so
-/// no LoRA energy flows. It is NOT bit-exact (unlike the f32-main-stream-only zhibi block LoRA):
-/// the Hyper LoRA also targets the bf16 conditioning-path globals (`time_text_embed.*`, `norm_out`),
-/// and its f32 factors make `matmul(x_bf16, A_f32)` promote those nodes' output to f32 — a fork-
-/// faithful dtype promotion (sc-2718) that the chaotic few-step path turns into sub-threshold
-/// per-pixel jitter. So the gate is "zero LoRA effect" (px>8 ≈ 0), not byte-equality.
+/// no LoRA energy flows. Historically it was NOT bit-exact (unlike the f32-main-stream-only zhibi
+/// block LoRA): the Hyper LoRA also targets the bf16 conditioning-path globals
+/// (`time_text_embed.*`, `norm_out`), and its f32 factors made `matmul(x_bf16, A_f32)` promote those
+/// nodes' output to f32 — a dtype promotion the chaotic few-step path turned into sub-threshold
+/// per-pixel jitter. Hence the loose gate below: "zero LoRA effect" (px>8 ≈ 0), not byte-equality.
+///
+/// **sc-15265 removed that mechanism.** `AdaptableLinear` now narrows the residual to the host's
+/// output dtype and skips a `scale == 0` adapter outright, so this render should now be **bit-exact**
+/// — the equivalent krea-realtime e2e gate
+/// (`mlx-gen-krea-realtime/tests/quant_tiers.rs::scale_zero_is_a_bit_exact_no_op_on_every_tier`)
+/// tightened from a tolerance to exactly `0.0` on all six legs. The `0.62%` px>8 budget here is
+/// therefore stale and too loose. It was NOT tightened in that change because this test is
+/// `#[ignore]`d behind licensed FLUX.1-dev weights + the Hyper-FLUX LoRA + a golden, none of which
+/// are available on an unlicensed host — tightening it blind would ship an unrunnable assertion.
+/// FOLLOW-UP: on a licensed host, run this and drop the tolerance to a byte-equality assertion.
 #[test]
 #[ignore = "needs real FLUX.1-dev weights + the Hyper-FLUX LoRA + golden"]
 fn hyper_flux_scale_zero_is_near_noop() {
