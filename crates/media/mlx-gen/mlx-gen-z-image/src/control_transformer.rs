@@ -25,6 +25,7 @@ use mlx_rs::Array;
 use crate::control_transformer_block::ZImageControlBlock;
 use crate::transformer::{apply_pad, row_indices, ZImageTransformer};
 use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
+use mlx_gen::attention::AttentionPlan;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 
@@ -155,13 +156,42 @@ impl ZImageControlTransformer {
         control_context: Option<&Array>,
         control_context_scale: f32,
     ) -> Result<Array> {
+        self.forward_budgeted(
+            x,
+            timestep,
+            cap_feats,
+            control_context,
+            control_context_scale,
+            AttentionPlan::UNBOUNDED,
+        )
+    }
+
+    /// [`forward`](Self::forward) under an explicit [`AttentionPlan`] — the public, DiT-level entry
+    /// for ladder rung 3 (SC-15615) on the ControlNet route, so the equivalence and plan-threading
+    /// tests can drive one whole dual-injection forward without standing up a denoise loop.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_budgeted(
+        &self,
+        x: &Array,
+        timestep: f32,
+        cap_feats: &Array,
+        control_context: Option<&Array>,
+        control_context_scale: f32,
+        plan: AttentionPlan<'_>,
+    ) -> Result<Array> {
         // No control context → identical to the base transformer (the fork's `control_context is
         // None` short-circuit). Delegating keeps the base path byte-for-byte the parity-proven one.
         match control_context {
-            None => self.base.forward(x, timestep, cap_feats),
-            Some(cc) => {
-                self.forward_control(x, timestep, cap_feats, cc, control_context_scale, None)
-            }
+            None => self.base.forward_budgeted(x, timestep, cap_feats, plan),
+            Some(cc) => self.forward_control(
+                x,
+                timestep,
+                cap_feats,
+                cc,
+                control_context_scale,
+                None,
+                plan,
+            ),
         }
     }
 
@@ -184,6 +214,7 @@ impl ZImageControlTransformer {
             control_context,
             control_context_scale,
             Some(&mut stages),
+            AttentionPlan::UNBOUNDED,
         )?;
         Ok((v, stages))
     }
@@ -240,6 +271,7 @@ impl ZImageControlTransformer {
     /// caching `prepare_control` across a denoise loop (the prep depends only on the loop-constant
     /// dims + caption + control context). `cap`, when `Some`, collects the named per-stage
     /// intermediates for the capture variant.
+    #[allow(clippy::too_many_arguments)]
     fn forward_control(
         &self,
         x: &Array,
@@ -248,22 +280,31 @@ impl ZImageControlTransformer {
         cc: &Array,
         control_context_scale: f32,
         cap: Option<&mut Vec<(&'static str, Array)>>,
+        plan: AttentionPlan<'_>,
     ) -> Result<Array> {
         let sh = x.shape();
         let prep = self.prepare_control((sh[0], sh[1], sh[2], sh[3]), cap_feats, cc)?;
-        self.forward_with_control(&prep, x, timestep, control_context_scale, cap)
+        self.forward_with_control_budgeted(&prep, x, timestep, control_context_scale, cap, plan)
     }
 
     /// Run the dual-injection control DiT for one denoise step against a cached [`ControlPrepared`].
     /// Only the latent values and timestep vary per step; the metadata, freqs, and control embedding
     /// come from `prep`. `cap`, when `Some`, records the named per-stage intermediates.
-    pub(crate) fn forward_with_control(
+    /// [`forward_with_control`](Self::forward_with_control) with an explicit attention-score budget —
+    /// ladder rung 3 (SC-15615) on the ControlNet route. The budget reaches **both** stacks: the base
+    /// DiT's noise/context refiners and main layers, and the parallel control branch's own blocks
+    /// (whose `base` block runs the identical attention over the same unified sequence). The
+    /// before/after projections, hint injection, `control_context_scale`, and the dual-injection
+    /// schedule are untouched.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_with_control_budgeted(
         &self,
         prep: &ControlPrepared,
         x: &Array,
         timestep: f32,
         control_context_scale: f32,
         mut cap: Option<&mut Vec<(&'static str, Array)>>,
+        plan: AttentionPlan<'_>,
     ) -> Result<Array> {
         macro_rules! record {
             ($name:expr, $a:expr) => {
@@ -296,6 +337,7 @@ impl ZImageControlTransformer {
             &x_emb,
             &prep.x_freqs,
             &t_emb,
+            plan,
         )?;
         record!("refiner_hint0", refiner_hints[0]);
         record!("refiner_hint1", refiner_hints[1]);
@@ -303,7 +345,7 @@ impl ZImageControlTransformer {
 
         // Noise refiner (with control hints).
         for (i, layer) in self.base.noise_refiner.iter().enumerate() {
-            x_emb = layer.forward(&x_emb, &prep.x_freqs, &t_emb)?;
+            x_emb = layer.forward_budgeted(&x_emb, &prep.x_freqs, &t_emb, plan)?;
             if let Some(n) = hint_index(&CONTROL_REFINER_PLACES, i) {
                 x_emb = add_hint(&x_emb, &refiner_hints[n], control_context_scale)?;
             }
@@ -316,7 +358,7 @@ impl ZImageControlTransformer {
         cap_emb = apply_pad(&cap_emb, &prep.cap_keep, &self.base.cap_pad_token)?;
         let mut cap_emb = cap_emb.expand_dims(0)?;
         for layer in &self.base.context_refiner {
-            cap_emb = layer.forward(&cap_emb, &prep.cap_freqs)?;
+            cap_emb = layer.forward_budgeted(&cap_emb, &prep.cap_freqs, plan)?;
         }
         record!("cap_refined", cap_emb);
 
@@ -333,13 +375,14 @@ impl ZImageControlTransformer {
             &unified,
             &prep.unified_freqs,
             &t_emb,
+            plan,
         )?;
         record!("main_hint0", main_hints[0]);
         record!("main_hint_last", main_hints[main_hints.len() - 1]);
 
         // Main layers (with control hints).
         for (i, layer) in self.base.layers.iter().enumerate() {
-            unified = layer.forward(&unified, &prep.unified_freqs, &t_emb)?;
+            unified = layer.forward_budgeted(&unified, &prep.unified_freqs, &t_emb, plan)?;
             if let Some(n) = hint_index(&CONTROL_LAYERS_PLACES, i) {
                 unified = add_hint(&unified, &main_hints[n], control_context_scale)?;
             }
@@ -367,6 +410,7 @@ impl ZImageControlTransformer {
         x_base: &Array,
         freqs_cis: &Array,
         t_emb: &Array,
+        plan: AttentionPlan<'_>,
     ) -> Result<(Vec<Array>, Array)> {
         let mut c = c;
         let mut hints = Vec::with_capacity(blocks.len());
@@ -377,7 +421,7 @@ impl ZImageControlTransformer {
                 })?;
                 c = add(&bp.forward(&c)?, x_base)?;
             }
-            c = block.base.forward(&c, freqs_cis, t_emb)?;
+            c = block.base.forward_budgeted(&c, freqs_cis, t_emb, plan)?;
             hints.push(block.after_proj().forward(&c)?);
         }
         Ok((hints, c))

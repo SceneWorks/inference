@@ -22,6 +22,8 @@ pub mod control_transformer_block;
 pub mod convert;
 pub mod feed_forward;
 pub mod final_layer;
+// Shared image-memory contract adoption (SC-15449) + the SC-15615 rung-3 finding.
+pub mod image_memory;
 pub mod loader;
 pub mod model;
 pub mod model_base;
@@ -83,6 +85,10 @@ pub fn register_providers(
         .register_generator(model_base::REGISTRATION)
         .register_generator(model_base_control::REGISTRATION)
         .register_generator(model_control::REGISTRATION)
+        .register_image_memory(model::IMAGE_MEMORY_REGISTRATION)
+        .register_image_memory(model_base::IMAGE_MEMORY_REGISTRATION)
+        .register_image_memory(model_base_control::IMAGE_MEMORY_REGISTRATION)
+        .register_image_memory(model_control::IMAGE_MEMORY_REGISTRATION)
         .register_trainer(training::REGISTRATION)
 }
 
@@ -158,5 +164,58 @@ mod explicit_registry_tests {
             .map(|registration| (registration.descriptor)().id.to_string())
             .collect();
         assert_eq!(explicit_trainers, ["z_image_turbo"]);
+    }
+
+    /// The four `register_image_memory` calls are what makes the SC-15449 contract resolvable before
+    /// weights load. Without this test, dropping any one of them is green — every other contract test
+    /// builds the contract directly instead of going through the registry.
+    #[test]
+    fn every_variant_resolves_its_image_memory_contract_through_the_registry() {
+        use mlx_gen::gen_core::{
+            ImageMemoryStrategy, ImageMemoryStrategySupport, LoadSpec, WeightsSource,
+        };
+
+        let registry = super::provider_registry().unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        for id in [
+            "z_image_turbo",
+            "z_image",
+            "z_image_turbo_control",
+            "z_image_control",
+        ] {
+            let contract = registry
+                .image_memory_contract(id, &spec)
+                .unwrap()
+                .unwrap_or_else(|| panic!("{id} must register an image-memory contract"));
+            assert_eq!(contract.provider_id, id);
+            assert_eq!(
+                contract.calibration.as_ref().unwrap().fingerprint,
+                super::image_memory::IMAGE_MEMORY_CALIBRATION_FINGERPRINT,
+                "{id}"
+            );
+            // The registry-resolved contract must be the same one the direct builder produces —
+            // rung 3 selectable with its recorded parameter, rung 4 honestly Missing.
+            assert!(matches!(
+                contract
+                    .capability(ImageMemoryStrategy::BoundedAttention)
+                    .map(|c| &c.support),
+                Some(ImageMemoryStrategySupport::Implemented)
+            ));
+            assert_eq!(
+                contract
+                    .capability(ImageMemoryStrategy::BoundedAttention)
+                    .unwrap()
+                    .parameters
+                    .attention_chunk_sizes,
+                vec![super::image_memory::ATTENTION_CHUNK_SIZE],
+                "{id}"
+            );
+            assert!(matches!(
+                contract
+                    .capability(ImageMemoryStrategy::BoundedTransformerResidency)
+                    .map(|c| &c.support),
+                Some(ImageMemoryStrategySupport::Missing)
+            ));
+        }
     }
 }

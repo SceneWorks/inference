@@ -16,6 +16,7 @@ import os
 
 import mlx.core as mx
 import numpy as np
+from _adapter_parity_provenance import assert_frozen_mflux, golden_metadata, sha256
 from mflux.models.common.config.config import Config
 from mflux.models.qwen.latent_creator.qwen_latent_creator import QwenLatentCreator
 from mflux.models.qwen.model.qwen_text_encoder.qwen_prompt_encoder import QwenPromptEncoder
@@ -23,6 +24,13 @@ from mflux.models.qwen.variants.txt2img.qwen_image import QwenImage
 
 _GOLDEN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "golden")
 os.makedirs(_GOLDEN_DIR, exist_ok=True)
+MODEL_REPOSITORY = os.environ.get("QWEN_REFERENCE_REPOSITORY", "Qwen/Qwen-Image")
+MODEL_REVISION = os.environ.get(
+    "QWEN_REFERENCE_REVISION", "75e0b4be04f60ec59a75f475837eced720f823b6"
+)
+MODEL_PATH = os.environ.get("QWEN_REFERENCE_MODEL", "Qwen/Qwen-Image")
+BUILD_ADAPTERS_ONLY = os.environ.get("BUILD_ADAPTERS_ONLY") == "1"
+assert_frozen_mflux()
 
 SEED = 42
 PROMPT = "a fox sitting in a forest, photorealistic"
@@ -47,6 +55,20 @@ LOKR_PROJS = [p for p in PROJS if p != "to_out.0"]
 DIM = 3072  # all attention projections are [3072, 3072]
 
 
+def adapter_metadata(kind):
+    return {
+        "artifact_role": "adapter",
+        "adapter_kind": kind,
+        **golden_metadata(
+            script=__file__,
+            model_path=MODEL_PATH,
+            model_repository=MODEL_REPOSITORY,
+            model_revision=MODEL_REVISION,
+            model_subdirectory="bf16",
+        ),
+    }
+
+
 def build_lora(path):
     # peft `lora_A/B` under the `diffusion_model.` prefix, but a BARE `alpha` (the fork's Qwen
     # mapping has bare-only alpha patterns). alpha = 2*RANK so alpha/rank = 2 has a visible,
@@ -63,7 +85,7 @@ def build_lora(path):
             t[f"{base}.lora_A.weight"] = mx.array(a)
             t[f"{base}.lora_B.weight"] = mx.array(bb)
             t[f"{bare}.alpha"] = mx.array(np.array([float(2 * RANK)], dtype=np.float32))
-    mx.save_safetensors(path, t)
+    mx.save_safetensors(path, t, adapter_metadata("lora"))
     return path
 
 
@@ -77,12 +99,26 @@ def build_lokr(path):
             w2 = rng.normal(0.0, LOKR_STD, size=(64, 64)).astype(np.float32)
             t[f"{base}.lokr_w1"] = mx.array(w1)
             t[f"{base}.lokr_w2"] = mx.array(w2)
-    mx.save_safetensors(path, t, {"networkType": "lokr", "alpha": "1.0", "rank": "1"})
+    mx.save_safetensors(
+        path,
+        t,
+        {
+            "networkType": "lokr",
+            "alpha": "1.0",
+            "rank": "1",
+            **adapter_metadata("lokr"),
+        },
+    )
     return path
 
 
 def render(adapter_path):
-    model = QwenImage(quantize=None, lora_paths=[adapter_path], lora_scales=[1.0])
+    model = QwenImage(
+        quantize=None,
+        lora_paths=[adapter_path],
+        lora_scales=[1.0],
+        model_path=MODEL_PATH,
+    )
     config = Config(
         model_config=model.model_config,
         num_inference_steps=STEPS,
@@ -115,6 +151,9 @@ def render(adapter_path):
 for kind, builder in [("lora", build_lora), ("lokr", build_lokr)]:
     adapter_path = os.path.join(_GOLDEN_DIR, f"qwen_{kind}_adapter.safetensors")
     builder(adapter_path)
+    if BUILD_ADAPTERS_ONLY:
+        print(f"wrote deterministic {kind} adapter → {adapter_path}")
+        continue
     decoded = render(adapter_path)
     out = os.path.join(_GOLDEN_DIR, f"qwen_{kind}_golden.safetensors")
     mx.save_safetensors(
@@ -123,6 +162,14 @@ for kind, builder in [("lora", build_lora), ("lokr", build_lokr)]:
         {
             "prompt": PROMPT, "seed": str(SEED), "steps": str(STEPS), "width": str(W),
             "height": str(H), "guidance": str(GUIDANCE), "kind": kind,
+            "adapter_sha256": sha256(adapter_path),
+            **golden_metadata(
+                script=__file__,
+                model_path=MODEL_PATH,
+                model_repository=MODEL_REPOSITORY,
+                model_revision=MODEL_REVISION,
+                model_subdirectory="bf16",
+            ),
         },
     )
     print(f"wrote {out} + {adapter_path}; decoded {tuple(decoded.shape)}")
