@@ -6,6 +6,7 @@
 
 pub use core_llm;
 pub use gen_core;
+pub use gen_core::image_memory;
 
 use core_llm::{SnapshotPreparerRegistry, TextLlmRegistry};
 use gen_core::ProviderRegistry;

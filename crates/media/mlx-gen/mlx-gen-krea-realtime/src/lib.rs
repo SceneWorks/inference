@@ -80,10 +80,19 @@
 //! The reference's **first-frame VAE re-anchor** (`release_server.py::get_clean_context_frames`,
 //! re-encoding the first decoded output frame as a persistent clean-context anchor) re-encodes decoded
 //! pixels *mid-generation*, so that *mechanism* is streaming-coupled and correctly out of this batch path
-//! (which decodes once at the end). But the bounded Mac window runs for every clip and the shipped 14B
-//! config sets `sink_size = 0` — so the always-attended sink prefix is empty and a long batch clip slides
-//! its window with **no** persistent anchor, a real long-range coherence risk **tracked as sc-15127
-//! (S18)** and measured on the gated real-weight run (see [`t2v::generate_t2v_from_components`]).
+//! (which decodes once at the end). The bounded Mac window runs for every clip and the shipped 14B
+//! config sets `sink_size = 0`, so a long batch clip slides its window with no persistent anchor.
+//! **sc-15127 (S18) measured that on real weights (q4, three seeds, 13 window rolls) and found a long
+//! clip *does* drift, well past the measurement's budget** — headline mode a colour-cast/tone drift
+//! (the blue–yellow opponent axis wins every row-A cell at 832×480), alongside a separately observable
+//! saturation rise. **Whether the bounded window causes it is not resolved**: an enlarged
+//! within-regime dose ladder at 13/10/5 eviction rolls fits +0.571 ±1.897/255 per roll at 640×384 and
+//! −0.278 ±1.678/255 per roll at 832×480 (mean ± the predeclared 2·SEM heuristic). Neither direction
+//! clears the heuristic. Across the full eight-roll span, effects below practical floors of 19.75/255
+//! and 15.65/255 respectively remain unresolved. So no sink anchor is wired — the sink comparison is
+//! likewise unresolved at three seeds — the `sink_size` knob stays plumbed for a checkpoint that ships
+//! one, and the drift itself is tracked as **sc-15571**.
+//! See [`t2v::generate_t2v_from_components`] for the table and the limits of the claim.
 //! **i2v/v2v conditioning** (S7) is now wired (see [`generate`] / [`t2v`] above); its real-weight
 //! watchable-clip coherence overlaps the S13 real-weight validation.
 //!
@@ -124,9 +133,9 @@ pub use load::{
 pub use pipeline::{descriptor, load as load_generator, KreaRealtime, SELF_FORCING_SAMPLER};
 pub use scheduler::{euler_x0, renoise_step, FewStepSchedule, NUM_TRAIN_TIMESTEPS};
 pub use t2v::{
-    decode_latents_to_video, generate_i2v, generate_i2v_from_components, generate_t2v,
-    generate_t2v_from_components, generate_v2v, generate_v2v_from_components, mac_ar_config,
-    KreaRealtimeJob,
+    decode_latents_to_video, decode_tiling, generate_i2v, generate_i2v_from_components,
+    generate_t2v, generate_t2v_from_components, generate_v2v, generate_v2v_from_components,
+    mac_ar_config, KreaRealtimeJob,
 };
 
 // Re-export the reused Wan config types so callers can name the DiT dimensions — and a snapshot's

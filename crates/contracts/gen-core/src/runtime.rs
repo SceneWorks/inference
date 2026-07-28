@@ -353,6 +353,25 @@ pub struct AdapterSpec {
     pub moe_expert: Option<MoeExpert>,
 }
 
+/// One adapter file's actual provider-side install outcome.
+///
+/// Providers that can partially accept an adapter publish these reports through
+/// [`Generator::adapter_apply_reports`](crate::Generator::adapter_apply_reports) after generation.
+/// The report is deliberately tensor-free and additive to the existing generator contract: providers
+/// that do not opt in return an empty list, preserving their current behavior.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdapterApplyReport {
+    /// The adapter file the report describes. This is the resolved local path from
+    /// [`AdapterSpec::path`], allowing a consumer to correlate reports with load-order specs without
+    /// guessing from file headers.
+    pub adapter_path: PathBuf,
+    /// Target deltas/factors the provider accepted for this adapter.
+    pub applied: usize,
+    /// Target stems the provider did not apply. Empty means the provider accepted the whole adapter
+    /// surface it recognized.
+    pub skipped: Vec<String>,
+}
+
 impl AdapterSpec {
     /// A uniform-strength adapter (the common case): [`scale`](Self::scale) on every denoise pass,
     /// no per-pass override, shared across both MoE experts. Equivalent to a literal with

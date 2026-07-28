@@ -26,20 +26,37 @@
 //! The reference's **first-frame VAE re-anchor** (`release_server.py::get_clean_context_frames`,
 //! re-encoding the first *decoded* output frame as a persistent clean-context anchor) re-encodes decoded
 //! pixels *mid-generation*, so that specific **mechanism** is streaming-coupled and correctly out of this
-//! single-terminal-decode batch path. It does **not** follow that a long batch clip is anchored: the Mac
-//! path runs the bounded ~6-frame window ([`mac_ar_config`]) for *every* clip and the shipped 14B config
-//! sets `sink_size = 0`, so a long clip slides its window with **no** persistent anchor — a real
-//! long-range coherence risk **tracked as sc-15127 (S18)**, to be measured/addressed on the gated
-//! real-weight run. See [`generate_t2v_from_components`] for the full reasoning.
+//! single-terminal-decode batch path. A long batch clip is therefore genuinely unanchored: the Mac path
+//! runs the bounded ~6-frame window ([`mac_ar_config`]) for *every* clip and the shipped 14B config sets
+//! `sink_size = 0`.
+//!
+//! **sc-15127 (S18) measured that on real weights (q4, 640×384 and 832×480, 45 latent frames = 13
+//! window rolls, three seeds per configuration) and found one thing and one open question.** A long
+//! clip *does* drift, well past the measurement's budget. The headline mode is a
+//! **colour-cast/tone/structure** drift — the blue–yellow opponent axis (`opp-B-Y`) wins every row-A
+//! cell at 832×480 — alongside which a saturation rise is separately observable. **Whether the bounded
+//! window causes it is unresolved in both buckets**: the enlarged within-regime A/D/F dose ladder spans
+//! 13/10/5 eviction rolls, but its matched-seed drift slope remains inside the predeclared 2·SEM
+//! heuristic in both buckets (+0.571 ±1.897/255 per roll at 640×384 and −0.278 ±1.678 at 832×480).
+//! Across the full eight-roll span, effects below practical floors of **19.75/255** and **15.65/255**
+//! respectively remain unresolved. So **no sink anchor is wired**: the window comparison and the sink
+//! comparison are *both* unresolved at three seeds, and permanently-resident KV is not bought on an
+//! unresolved comparison. The `sink_size` knob stays plumbed for a checkpoint that ships one, and the
+//! drift itself is tracked as **sc-15571**. See [`generate_t2v_from_components`] for the table, the
+//! controls, and the explicit limits of the claim.
 
 use std::collections::HashMap;
 use std::path::Path;
 
-use mlx_gen::tiling::{TilingConfig, VaeTiling};
+use mlx_gen::tiling::TilingConfig;
 use mlx_gen::weights::Weights;
-use mlx_gen::{AdapterSpec, CancelFlag, Error, GenerationOutput, Image, Progress, Quant, Result};
+use mlx_gen::{
+    AdapterApplyReport, AdapterSpec, CancelFlag, Error, GenerationOutput, Image, Progress, Quant,
+    Result,
+};
 use mlx_gen_wan::config::WanQuant;
 use mlx_gen_wan::model::effective_te_quant;
+use mlx_gen_wan::pipeline::auto_tiling_budgeted_z16_quality_overlap;
 use mlx_gen_wan::{
     decode_to_frames, frames_to_images, load_tokenizer, preprocess_i2v_image, Umt5Encoder, WanVae,
 };
@@ -57,10 +74,6 @@ use crate::load::{
 const TEMPORAL_STRIDE: usize = 4;
 /// z16 Wan VAE spatial stride (latent → pixel; 8× per side). Mirrors `WanModelConfig::vae_stride.1/.2`.
 const SPATIAL_STRIDE: usize = 8;
-/// VAE-decode temporal-window budget (output pixel·frames per `decode_tiled` window) — mirrors the
-/// scail2 z16 decode bound so a large batch decode stays memory-bounded (fewer frames/window as the
-/// resolution grows). Only consulted when the clip is large enough to tile.
-const DECODE_TILE_BUDGET_PXFRAMES: i64 = 3_500_000;
 
 /// A fully-specified Krea Realtime text-to-video job (the engine-internal form
 /// [`crate::pipeline`] maps a `GenerationRequest` onto). Dimensions are **pixel** dimensions; the
@@ -86,9 +99,19 @@ pub struct KreaRealtimeJob<'a> {
 /// `kv_cache_num_frames + num_frames_per_block`) instead of the shipped global `local_attn_size = -1`
 /// (the checkpoint's ~27 GB-of-KV global window). The crate/default config stays faithful to the
 /// checkpoint (global); this Mac bound is selected **only** in the pipeline path (sc-8438 S5 follow-up).
+///
+/// **`sink_size` is deliberately left at the checkpoint's `0` (sc-15127, S18)** — because the gated
+/// real-weight sweep did not produce evidence for one, **not** because it showed the bounded window to
+/// be clean. It showed the opposite: long clips drift. What it also showed is that the drift does not
+/// track the number of window rolls, so a first-chunk sink — whose entire rationale is surviving
+/// eviction — is not what the evidence points at, and it is permanently-resident KV (measured +0.83 GiB
+/// for one latent frame, +2.20 GiB for three, at 640×384). Full table, controls and limits on
+/// [`generate_t2v_from_components`]. The 27 GB figure is not rhetorical — the global window at
+/// 45 latent frames × 832×480 was measured to get SIGKILLed on a 128 GiB host.
 pub fn mac_ar_config(base: &KreaRealtimeConfig) -> KreaRealtimeConfig {
     let mut cfg = base.clone();
     cfg.ar.local_attn_size = cfg.ar.streaming_local_attn_frames() as i64;
+    // sink_size intentionally untouched — see the doc comment (sc-15127).
     cfg
 }
 
@@ -131,22 +154,117 @@ fn resolve_request_config(
     Ok(cfg)
 }
 
-/// A memory-bounded temporal-only VAE-decode tiling for a latent of `[z, T_lat, lat_h, lat_w]` at
-/// output size `(out_h, out_w)`, or `None` when the clip is small enough to decode in one pass. Mirrors
-/// the scail2 z16 budget: window size shrinks as the resolution grows so the decode peak stays bounded,
-/// and each window is capped by the z16 **write** safety bound ([`VaeTiling::WAN::writable_frame_cap`]).
-fn decode_tiling(out_h: usize, out_w: usize, out_frames: i32) -> Option<TilingConfig> {
-    let px_per_frame = (out_h as i64) * (out_w as i64);
-    let budget_frames = DECODE_TILE_BUDGET_PXFRAMES / px_per_frame.max(1);
-    let write_cap = VaeTiling::WAN.writable_frame_cap(out_h as i32, out_w as i32);
-    let win = budget_frames.min(write_cap) as i32;
-    // Snap to the z16 ×4 temporal stride; ≥ 8 output frames (2 latent frames of temporal-conv context).
-    let tile_frames = (win / 4 * 4).clamp(8, out_frames.max(8));
-    if tile_frames >= out_frames {
-        return None; // one window covers the clip → single-pass decode.
-    }
-    let overlap = (tile_frames / 4).max(1);
-    Some(TilingConfig::temporal_only(tile_frames, overlap))
+/// The **memory-budgeted** VAE-decode tiling for a latent of `[z, T_lat, lat_h, lat_w]` at output size
+/// `(out_h, out_w)` — `Ok(None)` when a single pass already fits the budget, `Ok(Some(cfg))` for the
+/// largest tile that does, and a catchable `Err` when even the smallest tile does not (returned
+/// *before* the decode rather than as an OOM kill).
+///
+/// `#[doc(hidden)] pub` — reachable so a validation harness in `tests/` can decode through the **same**
+/// windowing the product path uses (sc-8446, S13; a single-pass control is not comparable to a tiled
+/// product decode, and hard-coding the window in a test would silently drift from this policy), but not
+/// part of the crate's advertised API. A dedicated `test-support` feature for one function is heavier
+/// than the problem.
+///
+/// ## sc-15325 — this used to compute its own window, and that window CORRUPTED the decode
+///
+/// The previous policy sized a temporal-only window from a local `DECODE_TILE_BUDGET_PXFRAMES = 3.5e6`
+/// output px·frames, bypassing the shared [`budgeted_plan`](mlx_gen::tiling::budgeted_plan) selector
+/// that the sibling Wan decodes use. At every shipped bucket ≥ ~233k px/frame that budget yielded an
+/// **8-output-frame** window — *two* latent frames — and `TilePlan::plan`'s ÷`temporal_scale` then left
+/// an overlap of 1 latent frame (the clamp maximum at a tile of 2). Measured on real Krea latents at
+/// 832×480 / 36 output frames, decoding the **same** latent every way against a single-pass reference
+/// (`tests/generate_smoke.rs::decode_tiling_sweep_against_single_pass`):
+///
+/// | tile / overlap (output) | latent tile / overlap | mean abs err /255 | clipping mean / worst | MLX active peak |
+/// |---|---|---|---|---|
+/// | single-pass | — | 0 (reference) | 0.08% / 0.25% | 85.1 GiB |
+/// | 8 / 2 — the original shipped value | 2 / **0** | **18.5** | **9.7% / 26.6%** | 19.8 GiB |
+/// | 8 / 4 — the sc-8446 overlap floor | 2 / **1** | 17.1 | 5.2% / 14.7% | 19.8 GiB |
+/// | 16 / 4 | 4 / 1 | 7.5 | 1.8% / 12.9% | 38.5 GiB |
+/// | 16 / 8 | 4 / 2 | 6.4 | 1.4% / 7.0% | 38.5 GiB |
+/// | **32 / 8** | **8 / 2** | **2.5** | **0.08% / 0.25%** | 75.8 GiB |
+/// | 32 / 16 | 8 / 4 | 2.0 | 0.14% / 1.1% | 75.8 GiB |
+///
+/// Not a cosmetic seam: at the original setting one frame in eight blew **26% of its pixels** to
+/// near-white with violet/green chroma separation, against 0.25% single-pass. Latent **tile size** is
+/// the dominant term (−67…−70% per doubling at matched overlap ratio); overlap is a real but secondary
+/// one, and free in peak.
+///
+/// ## The fix: one policy, in one place, and pay for it spatially
+///
+/// This function now delegates to [`auto_tiling_budgeted_z16_quality_overlap`] — the same selector,
+/// cost model and
+/// candidate grid the Wan z16 T2V/I2V/VACE decodes use, which `mlx-gen-scail2` now shares too. Two
+/// things follow:
+///
+///  * **the routing itself is the fix.** The starved window came from *this crate computing its own*,
+///    and it now cannot. gen-core's
+///    [`MIN_TEMPORAL_TILE_LATENT_FRAMES`](mlx_gen::tiling::MIN_TEMPORAL_TILE_LATENT_FRAMES) floor is a
+///    second line — and note it is a **no-op on the z16 grid today**: that grid already bottoms out at
+///    a latent-8 tile, and floor-on vs floor-off selects an identical tile in every cell of a
+///    6-bucket × 4-frame-count × 5-budget sweep. It exists so a future budget tweak or a new candidate
+///    entry cannot re-derive the starved window. Do not undo this delegation on the belief that the
+///    floor is what protects the picture — it is prospective insurance; the delegation is the fix;
+///  * memory pressure is relieved on the **spatial** axis instead, which is what makes the fix
+///    affordable. Measured on the **same real latents** at latent tile 8 / overlap 4, varying only the
+///    spatial tile (`tests/generate_smoke.rs::decode_tiling_sweep_against_single_pass`):
+///
+/// | spatial tile | mean abs err vs single-pass | per-**column** mean abs err | clipping mean / worst | MLX active peak |
+/// |---|---|---|---|---|
+/// | none (full frame) | 1.954 /255 | 1.629 … 2.440 | 0.14% / 1.05% | 75.77 GiB |
+/// | 448 px | 2.021 | 1.696 … 2.505 | 0.14% / 1.04% | 38.57 GiB |
+/// | **320 px** | **2.054** | **1.719 … 2.531** | **0.13% / 1.04%** | **20.08 GiB** |
+/// | 256 px | 2.075 | 1.735 … 2.579 | 0.13% / 1.04% | 12.99 GiB |
+/// | 192 px | 2.121 | 1.769 … 2.630 | 0.13% / 1.02% | 7.49 GiB |
+///
+/// A 10.1× memory reduction costs 0.17/255. The two axes are simply not comparable — halving the
+/// latent *temporal* tile costs 67-70 % more error, shrinking the spatial tile 4.3× costs 8 % —
+/// because at ×8 spatial scale even a 192 px tile is 24 latent px wide with an 8-latent-px overlap.
+///
+/// The per-column column is what rules out a **seam**; a whole-frame mean averages a tile boundary
+/// away. It shifts uniformly across the sweep — floor 1.629 → 1.769 as ceiling 2.440 → 2.630 — with no
+/// spike at the tile stride, and the 192 px row's worst column is 1.24× its own clip mean. These rows
+/// were previously measured on a band-limited synthetic source, which structurally could not have
+/// shown either a seam or a starved spatial receptive field; the conclusion held, but the evidence is
+/// now real latents.
+///
+/// **The operating point at 832×480**, with the budget pinned to what the OLD policy actually cost
+/// (20.3 GiB): spatial 320/64 + temporal 32/16, i.e. **latent tile 8 / overlap 4** and 40 latent px
+/// spatial tiles — **2.05/255 against single-pass at a 20.1 GiB peak**, with clipping (0.13 %/1.04 %)
+/// at the single-pass floor. The old window was 17.1/255 with 5.2 % mean / 14.7 % worst-frame clipping
+/// at 19.8 GiB (and 24.4/255 with 30.8 % worst-frame clipping at a longer bucket). Single-pass quality
+/// for the same memory; the decode's *floor* also drops from ~20 GiB to ~7.5 GiB (the 192 px row), so
+/// this lowers the memory bar rather than raising it. At this short a clip the selector in fact
+/// returns a **spatial-only** plan (256 px, no temporal tiling at all — 0.31/255), which is the best
+/// possible answer for this defect.
+///
+/// Because the budget is free-aware (`free × 0.85`, `free = MLX limit − resident`, pinnable with
+/// `WAN_VAE_BUDGET_GIB`), a large-memory host still gets the fastest plan that fits and a small one
+/// tiles further spatially rather than degrading the picture.
+///
+/// ### Exposure that this closes
+///
+/// `mlx-gen-scail2` computed the identical window from the same budget and collapsed **harder** —
+/// it never received the sc-8446 overlap floor, so its latent overlap was **0**. Measured on its own
+/// VAE weights at 832×480: 24.09/255 with 24.1 % mean / **67.6 % worst-frame** clipping, against
+/// 0.01 %/0.25 % single-pass. It now calls the same selector (2.21/255, clipping back at the
+/// single-pass floor).
+///
+/// **LTX was measured too and did not reproduce the defect**: at a latent tile of 3 it is 1.73/255
+/// with 0.00 % clipping. Take that verdict at its actual width — it is **empirical, at one bucket that
+/// never tiles in production, on a source whose amplitudes cannot reach the clip threshold, and the
+/// mechanism is unexplained** (the causal-tiling story does not hold: `causal_temporal` is also true
+/// for Wan z48, and z16 at matched effective context is still 3.7× worse). See
+/// `mlx-gen-ltx/tests/vae_decode_tiling_parity.rs`. The gen-core floor still removes LTX's `(24, 8)`
+/// and `(48, 16)` candidates, but as a cheap quality win (6.6× less error for 17 % more peak), not as
+/// a defect fix. Wan z16/z48 already bottomed out at latent tile 8 / overlap 2 and are unchanged.
+#[doc(hidden)]
+pub fn decode_tiling(out_h: usize, out_w: usize, out_frames: i32) -> Result<Option<TilingConfig>> {
+    // The z16 VAE this pipeline decodes through is `mlx_gen_wan`'s, so its tiling policy is
+    // `mlx_gen_wan`'s too: one selector, one cost model, one set of candidates, shared with the Wan
+    // T2V/I2V/VACE decodes and with `mlx-gen-scail2`. The budget is free-aware
+    // (`free × 0.85`, `free = MLX limit − resident`) and pinnable via `WAN_VAE_BUDGET_GIB`.
+    auto_tiling_budgeted_z16_quality_overlap(out_h as i32, out_w as i32, out_frames)
 }
 
 /// Decode the AR latent sequence `[z16, T_lat, lat_h, lat_w]` (f32) through the reused z16 Wan
@@ -204,17 +322,110 @@ pub fn decode_latents_to_video(
 /// latents are still being produced. Wiring the pixel re-encode into the batch path would add a VAE
 /// round-trip with nothing to anchor against on a single terminal decode.
 ///
-/// **This does *not* mean a long batch clip is anchored.** The Mac path runs the bounded ~6-frame
-/// streaming window ([`mac_ar_config`]) for *every* clip, and the shipped 14B config sets
-/// `sink_size = 0` (`config.rs`, asserted there), so the always-attended sink prefix is **empty** and
-/// anchors nothing. A long batch clip therefore slides that window with **no persistent clean anchor** —
-/// a real long-range coherence risk. The reference deliberately *pairs* the bounded window with the
-/// first-frame re-anchor to hold such an anchor; the batch path currently has neither the re-anchor nor a
-/// non-zero sink. That gap is **tracked as sc-15127 (S18)**: it must be measured — and a batch-compatible
-/// anchor chosen (a non-zero `sink_size` latent-space pin is the likely fix, needing no incremental
-/// decode) — on the gated real-weight run (S6(b) / S13). It is not addressable on the tiny random-weight
-/// fixtures here. Confidence: high that `sink_size = 0` leaves the sliding window unanchored; the
-/// coherence *impact* on a long clip is unmeasured until real weights.
+/// **The long batch clip is unanchored, and sc-15127 (S18) measured what that costs.** The Mac path
+/// runs the bounded ~6-frame streaming window ([`mac_ar_config`]) for *every* clip and the shipped 14B
+/// config sets `sink_size = 0` (`config.rs`, asserted there), so the always-attended sink prefix is
+/// empty and a long clip slides its window with no persistent clean anchor.
+///
+/// The gated real-weight sweep (`tests/generate_smoke.rs::long_clip_coherence_under_the_bounded_window`,
+/// q4, 45 latent frames = 180 output frames = **13 window rolls**, **three seeds per configuration**)
+/// scores each clip on a descriptor spanning tone, colour and spatial structure, gated on **both** the
+/// one-way OLS trend and the plateau excursion, against an **absolute** 8/255 budget. (The budget is
+/// absolute because there is no valid within-regime floor to subtract: a bounded window over a long
+/// clip evicts *by definition*, so no zero-roll run exists at the shipped window and the shipped clip
+/// length. Its two sides are pinned by synthetic gates instead — motion and jitter score 2.81/255, the
+/// weakest injected failure shape 11.37.) Drift is the mean over seeds, ± twice the standard error:
+///
+/// ```text
+/// 640x384                        rolls   drift/255   peak GiB  clip%
+/// A shipped   (window  6, sink 0)   13   27.51 +-4.72   14.73   2.30
+/// B anchored  (window  6, sink 1)   13   19.25 +-9.82   15.56   2.80
+/// C anchored  (window  6, sink 3)   13   13.21 +-7.04   16.93   3.15
+/// D wider     (window 15, sink 0)   10   30.57 +-3.20   21.64   5.21
+/// F wider     (window 30, sink 0)    5   23.67 +-9.82   34.00  10.03
+/// E global    (no eviction)          0   34.06 (n=1)    41.90  11.61   <- out of regime, NOT probative
+///
+/// 832x480 (the crate default, a shipping bucket)
+/// A shipped   (window  6, sink 0)   13   39.23 +-7.95   17.62   2.28
+/// B anchored  (window  6, sink 1)   13   30.66 +-4.26   18.94   5.45
+/// C anchored  (window  6, sink 3)   13   23.43 +-4.90   21.56   3.97
+/// D wider     (window 15, sink 0)   10   36.42 +-14.4   29.41   4.67
+/// F wider     (window 30, sink 0)    5   40.90 +-17.3   49.14   8.05
+/// ```
+///
+/// Row E is absent at 832×480 by necessity: the global window at 45 latent frames is 70,200 tokens
+/// ≈ 38 GiB of KV and **SIGKILLs** a 128 GiB host (measured, jetsam at step 39/75) — which is exactly
+/// the problem [`mac_ar_config`] exists to dodge, so it is a finding rather than a harness bug. Even at
+/// 640×384 it peaks at 41.90 GiB, enough swap pressure to fill this host's boot volume, which is why it
+/// is `n = 1`.
+///
+/// **Both buckets say the same thing**, which matters because an earlier single-seed version of this
+/// measurement had them disagreeing — 832×480 appeared to show a clean sink dose-response that 640×384
+/// contradicted. With three seeds and a metric that gates the excursion as well as the trend, the
+/// apparent flip is gone: in both buckets the shipped row is far past the budget, and in both the
+/// three-dose A/D/F slope is inside the noise.
+///
+/// **One finding, and one open question.**
+///
+/// 1. **A long clip does drift**, far past the budget — 27.51/255 against 8. The earlier revision of
+///    this doc, which said the answer was "nothing", was wrong. The defect is tracked as **sc-15571**.
+///
+///    *Corroboration, stated precisely.* `report_artifacts`' mean frame saturation runs 0.21–0.23 →
+///    0.31–0.43 over row A (×1.5 to ×1.9) while the 24-frame zero-eviction row Z barely moves
+///    (0.225 → 0.237, ×1.05). That is **not** a statistic with "no construction in common" with the
+///    drift metric — an earlier wording claimed that and it was false. It is the *same pixel quantity*
+///    (per-pixel `max−min` over RGB) under a **different normalisation** (`(max−min)/max` vs `max−min`)
+///    and a genuinely **independent aggregation**: head frame vs tail frame, no baseline, no OLS, no
+///    z-gate. Independent aggregation is worth something; identical construction it is not.
+///
+///    And it is a *different channel* from the one that scored row A. The winning descriptor component
+///    is now recorded per cell (`S18Cell::component`, gated): at 832×480 all three row-A cells are won
+///    by the **blue–yellow opponent axis** (`opp-B-Y`); at 640×384 they are `spatial-sd`, `luma-mean`
+///    and `opp-B-Y`. `saturation` wins **no** row-A cell in either bucket. So the earlier
+///    "saturation" framing of the mode overstated it: the headline drift is a colour-cast/tone/
+///    structure mode, alongside which a saturation rise is separately observable.
+/// 2. **Whether the bounded KV window causes it is NOT resolved by this sweep**, in either direction.
+///    The enlarged within-regime A/D/F ladder uses windows 6/15/30 at the same 45 latent frames,
+///    spanning **13/10/5 eviction rolls**. For each matched seed, OLS fits drift against roll count;
+///    across seeds the mean slope is **+0.571 ±1.897/255 per roll** at 640×384 and
+///    **−0.278 ±1.678/255 per roll** at 832×480 (mean ± the predeclared 2·SEM heuristic). Both slopes
+///    are inside their heuristic, so neither a positive linear dose response nor its absence is
+///    established.
+///
+///    **What the enlarged design can exclude:** across its full eight-roll span, its practical
+///    2·SEM magnitude floor is **19.75/255** at 640×384 (72% of shipped row A's drift) and
+///    **15.65/255** at 832×480 (40%). Anything smaller remains below the practical floor.
+///
+///    Row E (the checkpoint's *global* window, zero evictions, 34.06) is **not** evidence here and is
+///    no longer cited as such: different attention mask, out of regime, `n = 1`, no variance estimate.
+///
+/// **A `sink_size` anchor is therefore still NOT wired.** The sink rows do read lower (B 19.25,
+/// C 13.21), but the comparison is not resolvable at this sample size: C is 3.30/255 from the repair
+/// threshold inside a combined 2·SEM of 11.76 — resolving it would take roughly fifty seeds per
+/// configuration, not three. Buying permanently-resident KV (+0.83 GiB for one latent frame, +2.20 GiB
+/// for three, measured) on an unresolved comparison is not warranted. The knob remains fully plumbed
+/// ([`crate::KreaArConfig::sink_size`] → `sink_tokens()` → `CausalKvCache`, and readable from
+/// `config.json`), so a future checkpoint that ships a non-zero sink is honoured without code changes.
+/// The reference's *pixel* re-anchor stays out for the structural reason above.
+///
+/// **Limits of the claim — read these before citing the table.** It covers one prompt, one quantisation
+/// tier (q4), three seeds, 45 latent frames, and only the drift modes the descriptor can see (global
+/// tone, global colour including the opponent axes, and a 5×5 block-luma spread). It says nothing about
+/// semantic or identity drift, texture degradation, or motion quality beyond a freeze check. No row
+/// froze (tail motion 3.1–18.8/255 per frame across all 34 recorded cells).
+///
+/// The seed-to-seed scatter is the same order as the configuration-to-configuration differences, so
+/// **the only ranking this sweep supports is row A against the budget.** Every ordering *between* rows
+/// in the table — across A/D/F, A vs the sinks, and anything involving row E — is unresolved rather
+/// than ranked.
+///
+/// The budget itself is bracketed by **synthetic** controls only (motion/jitter 2.81, weakest failure
+/// shape 11.37). There is no measured same-content floor: row Z, the within-regime zero-eviction row,
+/// runs at 29.63/100f over a 12-output-frame post segment against row A's 15.56/100f over 156, so its
+/// short-segment slope is *higher* and extrapolating it over-predicts row A's own measured drift by
+/// ~1.9×. Row Z cannot be lengthened either — the shipped 6-latent-frame window evicts as soon as a
+/// clip passes 6 latent frames. "Past the budget" therefore means past an absolute number pinned by
+/// synthetic stimuli, not past a measured baseline of the same content.
 #[allow(clippy::too_many_arguments)]
 pub fn generate_t2v_from_components(
     transformer: &CausalKreaTransformer,
@@ -462,12 +673,32 @@ fn open_transformer_weights(root: &Path) -> Result<Weights> {
 /// names (the FFN `ffn.0`/`ffn.2` reference keys normalized to the converted `ffn.fc1`/`fc2` by
 /// [`CausalKreaTransformer`]'s adaptable host); the installer **errors — never silently drops** — on a
 /// format/prefix mismatch or an unmatched target.
+///
+/// ## Diff-patch deltas (sc-15326)
+///
+/// The installer is the **`_with_diff_patch`** variant, so a ComfyUI/lightx2v step-distill or lightning
+/// file's `‹module›.diff` / `.diff_b` deltas are folded as well as its low-rank factors. Measured on
+/// `lightx2v_T2V_14B_cfg_step_distill_v2_lora_rank64` (1459 tensors): 406 low-rank pairs **plus** 447
+/// `.diff_b` and 200 `.diff` — 647 keys the plain installer dropped without a word, leaving a render
+/// that is changed but not by the whole LoRA.
+///
+/// All 647 now land, **on every tier**. That is the whole reason this is the `_with_diff_patch` call
+/// rather than a warning: the naive switch would have folded only 7 of them at the default Q4 (a
+/// weight `.diff` cannot fold into a packed Linear) against 407 at bf16, so the same LoRA would render
+/// differently per tier — unacceptable where the quant tier is a creative choice. Both of the channels
+/// this file actually uses are **tier-independent in coverage** instead: a `.diff_b` folds into the
+/// Linear's **bias**, which a `QuantizedLinear` keeps dense, and the `.diff` deltas all target
+/// **norms**, which no tier packs (routed by [`CausalKreaTransformer`]'s `diff_patch_param_mut`).
+/// "In coverage" is the exact claim — every key lands on every tier; the bias fold still happens in
+/// whatever dtype the base carries, which for this bf16-native DiT is bf16 either way. Anything that
+/// still cannot land is returned on `ApplyReport::diff_patch_unapplied` for the provider to put in
+/// front of the user, not left in a log line.
 fn load_transformer(
     root: &Path,
     cfg: &KreaRealtimeConfig,
     adapters: &[AdapterSpec],
     quant: Option<Quant>,
-) -> Result<CausalKreaTransformer> {
+) -> Result<(CausalKreaTransformer, Vec<AdapterApplyReport>)> {
     let weights = open_transformer_weights(root)?;
     let raw: HashMap<String, Array> = weights
         .keys()
@@ -481,17 +712,39 @@ fn load_transformer(
         dit.quantize(q.bits(), None)?;
     }
     let mut transformer = CausalKreaTransformer::new(dit, cfg);
-    if !adapters.is_empty() {
-        let report =
-            mlx_gen::adapters::loader::apply_adapters_strict(&mut transformer, adapters, MODEL_ID)?;
-        // Surface the applied count (unmatched targets already errored above, never silently dropped).
+    let adapter_reports = apply_adapters_reported(&mut transformer, adapters)?;
+    Ok((transformer, adapter_reports))
+}
+
+/// Install the ordered Krea adapter batch and preserve each engine-owned per-file outcome for the
+/// provider contract. Public for weight-free integration tests; product callers use
+/// [`crate::KreaRealtime`].
+#[doc(hidden)]
+pub fn apply_adapters_reported(
+    transformer: &mut CausalKreaTransformer,
+    adapters: &[AdapterSpec],
+) -> Result<Vec<AdapterApplyReport>> {
+    let reports = mlx_gen::adapters::loader::apply_adapters_strict_with_diff_patch_reported(
+        transformer,
+        adapters,
+        MODEL_ID,
+    )?;
+    let mut adapter_reports = Vec::with_capacity(adapters.len());
+    for (adapter, report) in adapters.iter().zip(reports) {
         eprintln!(
-            "{MODEL_ID}: installed {} LoRA target residual(s) from {} adapter file(s)",
+            "{MODEL_ID}: installed {} LoRA target(s) from adapter {}; {} diff-patch delta(s) \
+             unapplied",
             report.applied,
-            adapters.len()
+            adapter.path.display(),
+            report.diff_patch_unapplied.len()
         );
+        adapter_reports.push(AdapterApplyReport {
+            adapter_path: adapter.path.clone(),
+            applied: report.applied,
+            skipped: report.diff_patch_unapplied,
+        });
     }
-    Ok(transformer)
+    Ok(adapter_reports)
 }
 
 /// Run the full Krea Realtime text-to-video generation for `job`, loading each reused component from
@@ -512,6 +765,22 @@ pub fn generate_t2v(
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<GenerationOutput> {
+    generate_t2v_reported(root, base_cfg, job, adapters, quant, cancel, on_progress)
+        .map(|(output, _)| output)
+}
+
+/// Provider entrypoint that preserves the public generation output while also returning the actual
+/// per-adapter install reports produced during component staging.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn generate_t2v_reported(
+    root: &Path,
+    base_cfg: &KreaRealtimeConfig,
+    job: &KreaRealtimeJob,
+    adapters: &[AdapterSpec],
+    quant: Option<Quant>,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<(GenerationOutput, Vec<AdapterApplyReport>)> {
     if !root.exists() {
         return Err(Error::Msg(format!(
             "krea t2v: snapshot dir does not exist: {}",
@@ -534,7 +803,7 @@ pub fn generate_t2v(
 
     // Stage the reused components (UMT5 prompt encode + Krea DiT + z16 Wan VAE); any inference LoRA(s)
     // are installed onto the DiT inside `stage_components` (sc-15015, S14).
-    let (context, transformer, vae) =
+    let (context, transformer, vae, adapter_reports) =
         stage_components(root, &cfg, job.prompt, adapters, quant, on_progress)?;
 
     let params = ArGenParams {
@@ -550,10 +819,10 @@ pub fn generate_t2v(
         latent_h * SPATIAL_STRIDE,
         latent_w * SPATIAL_STRIDE,
         decoded_frames,
-    );
+    )?;
     // Trim the z16 decode back to the exact requested output count (`(f−1)/4+1` latent → `4·T_lat`
     // decoded over-delivers up to 3 leading frames when `num_frames` is not ≡ 1 (mod 4)).
-    generate_t2v_from_components(
+    let output = generate_t2v_from_components(
         &transformer,
         &cfg,
         &vae,
@@ -563,7 +832,8 @@ pub fn generate_t2v(
         tiling.as_ref(),
         cancel,
         on_progress,
-    )
+    )?;
+    Ok((output, adapter_reports))
 }
 
 /// Shared real-weight component staging for the t2v/i2v/v2v pipeline paths: UMT5 prompt encode
@@ -581,15 +851,20 @@ fn stage_components(
     adapters: &[AdapterSpec],
     quant: Option<Quant>,
     on_progress: &mut dyn FnMut(Progress),
-) -> Result<(Array, CausalKreaTransformer, WanVae)> {
+) -> Result<(
+    Array,
+    CausalKreaTransformer,
+    WanVae,
+    Vec<AdapterApplyReport>,
+)> {
     let te_quant = resolve_te_quant(root, cfg, quant)?;
     on_progress(Progress::Loading(mlx_gen::LoadPhase::TextEncoder));
     let context = encode_prompt(root, cfg, prompt, te_quant)?;
     on_progress(Progress::Loading(mlx_gen::LoadPhase::Renderer));
-    let transformer = load_transformer(root, cfg, adapters, quant)?;
+    let (transformer, adapter_reports) = load_transformer(root, cfg, adapters, quant)?;
     let w = Weights::from_file(root.join("vae.safetensors"))?;
     let vae = WanVae::from_weights(&w)?;
-    Ok((context, transformer, vae))
+    Ok((context, transformer, vae, adapter_reports))
 }
 
 /// The UMT5 tier for this run: the shared Wan Q8 floor whenever the DiT is quantized on **either**
@@ -659,6 +934,30 @@ pub fn generate_i2v(
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<GenerationOutput> {
+    generate_i2v_reported(
+        root,
+        base_cfg,
+        job,
+        reference_image,
+        adapters,
+        quant,
+        cancel,
+        on_progress,
+    )
+    .map(|(output, _)| output)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn generate_i2v_reported(
+    root: &Path,
+    base_cfg: &KreaRealtimeConfig,
+    job: &KreaRealtimeJob,
+    reference_image: &Image,
+    adapters: &[AdapterSpec],
+    quant: Option<Quant>,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<(GenerationOutput, Vec<AdapterApplyReport>)> {
     let (latent_h, latent_w) = resolve_latent_size(root, job, "i2v")?;
     let total_latent = latent_frame_count(job.num_frames)?;
     // The reference still is latent frame 0 (one clean context frame); generate the rest.
@@ -674,7 +973,7 @@ pub fn generate_i2v(
             )
         })?;
     let cfg = resolve_request_config(base_cfg, latent_h, latent_w, total_latent)?;
-    let (context, transformer, vae) =
+    let (context, transformer, vae, adapter_reports) =
         stage_components(root, &cfg, job.prompt, adapters, quant, on_progress)?;
     let params = ArGenParams {
         seed: job.seed,
@@ -689,8 +988,8 @@ pub fn generate_i2v(
         latent_h * SPATIAL_STRIDE,
         latent_w * SPATIAL_STRIDE,
         decoded_frames,
-    );
-    generate_i2v_from_components(
+    )?;
+    let output = generate_i2v_from_components(
         &transformer,
         &cfg,
         &vae,
@@ -701,7 +1000,8 @@ pub fn generate_i2v(
         tiling.as_ref(),
         cancel,
         on_progress,
-    )
+    )?;
+    Ok((output, adapter_reports))
 }
 
 /// Run the full Krea Realtime **video-to-video** generation for `job` + a `source_frames` clip at a
@@ -722,6 +1022,32 @@ pub fn generate_v2v(
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<GenerationOutput> {
+    generate_v2v_reported(
+        root,
+        base_cfg,
+        job,
+        source_frames,
+        strength,
+        adapters,
+        quant,
+        cancel,
+        on_progress,
+    )
+    .map(|(output, _)| output)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn generate_v2v_reported(
+    root: &Path,
+    base_cfg: &KreaRealtimeConfig,
+    job: &KreaRealtimeJob,
+    source_frames: &[Image],
+    strength: f32,
+    adapters: &[AdapterSpec],
+    quant: Option<Quant>,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<(GenerationOutput, Vec<AdapterApplyReport>)> {
     let (latent_h, latent_w) = resolve_latent_size(root, job, "v2v")?;
     if source_frames.is_empty() {
         return Err(Error::Msg("krea v2v: source clip has no frames".into()));
@@ -729,7 +1055,7 @@ pub fn generate_v2v(
     // The generated latent-frame count is derived from the source clip length.
     let num_latent = latent_frame_count(source_frames.len() as u32)?;
     let cfg = resolve_request_config(base_cfg, latent_h, latent_w, num_latent)?;
-    let (context, transformer, vae) =
+    let (context, transformer, vae, adapter_reports) =
         stage_components(root, &cfg, job.prompt, adapters, quant, on_progress)?;
     let params = ArGenParams {
         seed: job.seed,
@@ -744,8 +1070,8 @@ pub fn generate_v2v(
         latent_h * SPATIAL_STRIDE,
         latent_w * SPATIAL_STRIDE,
         decoded_frames,
-    );
-    generate_v2v_from_components(
+    )?;
+    let output = generate_v2v_from_components(
         &transformer,
         &cfg,
         &vae,
@@ -757,7 +1083,8 @@ pub fn generate_v2v(
         tiling.as_ref(),
         cancel,
         on_progress,
-    )
+    )?;
+    Ok((output, adapter_reports))
 }
 
 #[cfg(test)]
@@ -801,6 +1128,53 @@ mod tests {
         assert!(mac.ar.max_attention_size() < base.ar.seq_length);
         // The crate default is untouched — the bound lives in the pipeline, not the config default.
         assert_eq!(KreaRealtimeConfig::default().ar.local_attn_size, -1);
+    }
+
+    /// **sc-15127 (S18): the Mac bound ships with NO sink anchor, and that is a measured decision.**
+    ///
+    /// The gated real-weight sweep found that long clips *do* drift — but **both** comparisons that
+    /// would justify buying a sink came back unresolved at three seeds. The A-vs-D contrast (shipped
+    /// window vs a 2.5× wider one) is inside the combined between-seed scatter in both buckets, so the
+    /// window is neither implicated nor exonerated; and the A-vs-sink contrast is likewise inside that
+    /// scatter. A first-chunk sink is permanently-resident KV (+0.83 GiB for one latent frame, +2.20
+    /// for three, measured), and permanently-resident KV must not be bought on an unresolved
+    /// comparison. This pins the outcome: `mac_ar_config` must not start manufacturing a sink the
+    /// measurement did not justify, and - the other half - the `sink_size` knob must stay a real,
+    /// honoured knob so a checkpoint that ships one is respected without a code change.
+    #[test]
+    fn mac_ar_config_ships_no_sink_anchor_but_honours_one_from_the_checkpoint() {
+        let base = KreaRealtimeConfig::krea_realtime_14b();
+        assert_eq!(
+            base.ar.sink_size, 0,
+            "the shipped 14B checkpoint has no sink"
+        );
+        let mac = mac_ar_config(&base);
+        assert_eq!(
+            mac.ar.sink_size, 0,
+            "the Mac bound must not invent a sink anchor — sc-15127 left both the window and the sink \
+             comparisons unresolved at three seeds, and a sink is permanently-resident KV"
+        );
+        assert_eq!(
+            mac.ar.sink_tokens(),
+            0,
+            "an empty sink prefix must cost zero tokens"
+        );
+        // ...but the knob is not dead: a checkpoint (or `config.json`) that declares a sink is carried
+        // through the Mac bound untouched and turns into real always-attended tokens.
+        let mut anchored = base.clone();
+        anchored.ar.sink_size = 2;
+        let mac_anchored = mac_ar_config(&anchored);
+        assert_eq!(
+            mac_anchored.ar.sink_size, 2,
+            "a checkpoint-declared sink must survive the Mac bound"
+        );
+        assert_eq!(
+            mac_anchored.ar.sink_tokens(),
+            2 * base.ar.frame_seq_length,
+            "sink frames × frame_seq_length (the reference's sink_tokens)"
+        );
+        // And the bound itself is unchanged by the sink — the two knobs are independent.
+        assert_eq!(mac_anchored.ar.local_attn_size, mac.ar.local_attn_size);
     }
 
     /// The per-request config derives `frame_seq_length` from the actual latent geometry (not the baked
@@ -971,12 +1345,90 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// sc-15325 **regression guard** — the defect, expressed as a property of the policy rather than
+    /// as today's numbers.
+    ///
+    /// The shipped bug was a temporal window of 8 output frames = **2 latent frames**, which starves
+    /// the z16 decoder's temporal convolutions and corrupts the content of every tile (18.5/255 mean
+    /// abs err against single-pass, 26.6% of a worst frame blown to white). This asserts the invariant
+    /// that makes that unreachable: **whenever a temporal tile is emitted at a shipped bucket, it must
+    /// span at least `MIN_TEMPORAL_TILE_LATENT_FRAMES` latent frames, with at least
+    /// `MIN_TEMPORAL_TILE_LATENT_OVERLAP` latent frames of blend** — at any budget, including a budget
+    /// far too small for a full-frame decode (which is exactly the regime the old policy failed in).
+    ///
+    /// It is pinned to a small injected budget rather than the live free-memory probe so it gates the
+    /// *policy*, not this host: on the old `DECODE_TILE_BUDGET_PXFRAMES` window this fails at every one
+    /// of these buckets (latent tile 2, latent overlap ≤ 1).
+    #[test]
+    fn decode_tiling_never_starves_the_temporal_receptive_field() {
+        use mlx_gen::tiling::{MIN_TEMPORAL_TILE_LATENT_FRAMES, MIN_TEMPORAL_TILE_LATENT_OVERLAP};
+
+        // Every bucket the old policy collapsed at (≥ ~233k px/frame), plus the one it did not.
+        const BUCKETS: [(usize, usize); 6] = [
+            (384, 640),
+            (512, 512),
+            (512, 768),
+            (480, 832),
+            (720, 1280),
+            (384, 512),
+        ];
+        // A deliberately tight budget: small enough that a full-frame single pass cannot fit, so the
+        // selector is forced to tile. The old policy answered this regime with a 2-latent-frame tile.
+        std::env::set_var("WAN_VAE_BUDGET_GIB", "12");
+        for (h, w) in BUCKETS {
+            let cfg = decode_tiling(h, w, 81)
+                .unwrap_or_else(|e| panic!("{w}x{h} must remain decodable within 12 GiB: {e}"))
+                .unwrap_or_else(|| panic!("{w}x{h}/81f cannot fit a 12 GiB single pass"));
+            let Some(t) = cfg.temporal else {
+                continue; // a spatial-only plan keeps the whole temporal sequence — full context.
+            };
+            let lat_tile = t.tile_frames / TEMPORAL_STRIDE as i32;
+            let lat_over = (t.overlap_frames / TEMPORAL_STRIDE as i32).min(lat_tile - 1);
+            assert!(
+                lat_tile >= MIN_TEMPORAL_TILE_LATENT_FRAMES,
+                "{w}x{h}: temporal tile {} output frames = {lat_tile} LATENT frames, under the \
+                 {MIN_TEMPORAL_TILE_LATENT_FRAMES}-latent-frame receptive-field floor (sc-15325)",
+                t.tile_frames
+            );
+            assert!(
+                lat_over >= MIN_TEMPORAL_TILE_LATENT_OVERLAP,
+                "{w}x{h}: temporal overlap {} output frames = {lat_over} LATENT frames after the \
+                 tile−1 clamp, under the {MIN_TEMPORAL_TILE_LATENT_OVERLAP}-frame blend floor",
+                t.overlap_frames
+            );
+        }
+        std::env::remove_var("WAN_VAE_BUDGET_GIB");
+    }
+
+    /// The other half of the contract: a clip small enough for one pass is still decoded in one pass
+    /// (the floor must not force tiling that was not needed), and a long clip still tiles.
     #[test]
     fn decode_tiling_is_single_pass_for_small_clips_and_tiles_large_ones() {
-        // A short clip fits one window ⇒ None (single pass).
-        assert!(decode_tiling(256, 256, 8).is_none());
-        // A long, small-frame clip tiles temporally (window < out_frames).
-        let big = decode_tiling(256, 256, 400);
-        assert!(big.is_some(), "a 400-frame clip must tile");
+        std::env::set_var("WAN_VAE_BUDGET_GIB", "12");
+        assert!(
+            decode_tiling(256, 256, 8).unwrap().is_none(),
+            "a 256x256/8f clip fits one pass well inside 12 GiB"
+        );
+        assert!(
+            decode_tiling(256, 256, 400).unwrap().is_some(),
+            "a 400-frame clip must tile"
+        );
+        std::env::remove_var("WAN_VAE_BUDGET_GIB");
+    }
+
+    /// sc-15445: Krea deliberately keeps the quality-oriented half-tile overlap even though Wan's
+    /// own product selector restored the faster candidate overlap. This exact row is mutation-red if
+    /// `decode_tiling` is accidentally routed back through Wan's product wrapper.
+    #[test]
+    fn decode_tiling_retains_kreas_half_tile_overlap() {
+        std::env::set_var("WAN_VAE_BUDGET_GIB", "10");
+        let cfg = decode_tiling(384, 640, 84)
+            .unwrap()
+            .expect("the measured Krea row must tile at 10 GiB");
+        std::env::remove_var("WAN_VAE_BUDGET_GIB");
+        assert_eq!(
+            cfg.temporal.map(|t| (t.tile_frames, t.overlap_frames)),
+            Some((32, 16)),
+        );
     }
 }

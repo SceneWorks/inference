@@ -54,6 +54,11 @@ use crate::vae::{load_vae, load_vae_encoder, QwenVaeEncoder};
 /// runs **f32** (decode-precision-sensitive).
 const DIT_DTYPE: DType = DType::BF16;
 
+/// Query-score budget used by the constrained-card rung. This matches the already GPU-validated Krea
+/// ControlNet chunk size: 128 Mi score elements (~512 MiB at f32) instead of the shared multi-GiB
+/// default. Chunking is only over independent query rows, so it does not alter the key/value domain.
+pub(crate) const CONSTRAINED_ATTN_SCORES_BUDGET: usize = 128 * 1024 * 1024;
+
 /// The TE weight **storage** dtype (sc-12828). Distinct from the encoder's **compute** dtype (f32,
 /// enforced inside [`KreaTextEncoder`] by upcasting the embedding to f32 and each projection via
 /// `forward_upcast`): the encoder holds bf16 weights and upcasts to f32 at each op, byte-identical to
@@ -394,6 +399,33 @@ pub(crate) fn load_heavy(
     pid_spec: Option<&PidWeights>,
     use_pid: bool,
 ) -> Result<KreaHeavy> {
+    let dit = load_dit(root, device, adapters, false)?;
+    let vae = load_vae(root, device)?;
+
+    // The optional PiD super-resolving decoder (epic 7840 / sc-7853), loaded when the caller opted in via
+    // `LoadSpec::pid` AND this load will actually use it (F-177 — see the `use_pid` doc above; under
+    // `Sequential` this whole fn runs per generate). Krea shares the Qwen-Image VAE latent space
+    // (`qwenimage` student).
+    let pid = match pid_to_load(pid_spec, use_pid) {
+        Some(spec) => Some(Arc::new(PidEngine::from_spec(spec, PID_BACKBONE, device)?)),
+        None => None,
+    };
+
+    Ok(KreaHeavy {
+        dit,
+        vae: Arc::new(vae),
+        pid,
+    })
+}
+
+/// Load only the ordinary snapshot DiT. `stream_blocks` retains its host-backed safetensors and keeps
+/// just the front-end/head resident on the accelerator, materializing one trunk block per forward.
+fn load_dit(
+    root: &Path,
+    device: &Device,
+    adapters: &[AdapterSpec],
+    stream_blocks: bool,
+) -> Result<Krea2Transformer> {
     let cfg = Krea2Config::from_snapshot(root)?;
     let mut dit_w = Weights::from_dir(&root.join("transformer"), device, DIT_DTYPE)?;
     crate::convert::validate_transformer(&dit_w, &cfg)?;
@@ -411,27 +443,27 @@ pub(crate) fn load_heavy(
     // fold to f32 tolerance (~1 ULP). A non-empty spec that matches no target (across the diff fold AND
     // the residual install) is a hard error (the worker then falls back rather than silently rendering
     // unadapted).
-    let mut dit = Krea2Transformer::load(&dit_w, &cfg)?;
+    if stream_blocks && !adapters.is_empty() {
+        return Err(CandleError::Msg(
+            "Krea block streaming does not support load-time LoRA/LoKr or diff-patch adapters"
+                .into(),
+        ));
+    }
+    if stream_blocks && diff.merged > 0 {
+        return Err(CandleError::Msg(
+            "Krea block streaming cannot retain a folded diff-patch overlay".into(),
+        ));
+    }
+
+    let mut dit = if stream_blocks {
+        Krea2Transformer::load_block_streamed(Arc::new(dit_w), &cfg)?
+    } else {
+        Krea2Transformer::load(&dit_w, &cfg)?
+    };
     if !adapters.is_empty() {
         crate::adapters::install_additive(&mut dit, adapters, diff.merged)?;
     }
-
-    let vae = load_vae(root, device)?;
-
-    // The optional PiD super-resolving decoder (epic 7840 / sc-7853), loaded when the caller opted in via
-    // `LoadSpec::pid` AND this load will actually use it (F-177 — see the `use_pid` doc above; under
-    // `Sequential` this whole fn runs per generate). Krea shares the Qwen-Image VAE latent space
-    // (`qwenimage` student).
-    let pid = match pid_to_load(pid_spec, use_pid) {
-        Some(spec) => Some(Arc::new(PidEngine::from_spec(spec, PID_BACKBONE, device)?)),
-        None => None,
-    };
-
-    Ok(KreaHeavy {
-        dit,
-        vae: Arc::new(vae),
-        pid,
-    })
+    Ok(dit)
 }
 
 /// Load Turbo components with the DiT taken from a **single-file INT8-ConvRot checkpoint** (sc-9300)
@@ -608,6 +640,139 @@ pub fn render(
     // prefix-dropped → the DiT's text_fusion context [1, n_tok, 12, 2560]. CFG-free, B=1.
     let context = encode_prompt_context(&comps.text, req)?;
     render_from_context(&comps.heavy, req, device, &context, on_progress)
+}
+
+/// Render ordinary Krea 2 Turbo with three physically disjoint accelerator-residency phases:
+/// text encode → DiT denoise → VAE decode. This path is selected only for a sequentially loaded,
+/// reference-free Turbo request carrying [`gen_core::GenerationMemory`].
+///
+/// The context and final latents intentionally survive their producing phase; model weights do not.
+/// A device synchronization precedes each model drop so asynchronous CUDA work cannot keep the prior
+/// phase alive while the next allocates. The resident/default path never calls this function.
+pub(crate) fn render_three_stage(
+    root: &Path,
+    device: &Device,
+    adapters: &[AdapterSpec],
+    req: &GenerationRequest,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Vec<Image>> {
+    let memory = req.memory.unwrap_or_default();
+    candle_gen::check_cancel(&req.cancel)?;
+
+    enter_loading_boundary(
+        req,
+        memory,
+        gen_core::LoadPhase::TextEncoder,
+        gen_core::ImageMemoryPhase::Conditioning,
+        on_progress,
+    )?;
+    let text = load_text(root, device)?;
+    let context = encode_prompt_context(&text, req)?;
+    device.synchronize()?;
+    drop(text);
+
+    candle_gen::check_cancel(&req.cancel)?;
+    enter_loading_boundary(
+        req,
+        memory,
+        gen_core::LoadPhase::Renderer,
+        gen_core::ImageMemoryPhase::Denoise,
+        on_progress,
+    )?;
+    let dit = load_dit(root, device, adapters, memory.stream_transformer_blocks)?;
+    let steps = req.steps.map(|s| s as usize).unwrap_or(TURBO_STEPS);
+    let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
+    let native = turbo_sigmas(steps);
+    let sigmas = candle_gen::resolve_flow_schedule(
+        req.scheduler.as_deref(),
+        TURBO_MU as f32,
+        steps,
+        &native,
+    );
+    let attention_budget = if memory.chunk_attention {
+        CONSTRAINED_ATTN_SCORES_BUDGET
+    } else {
+        candle_gen::ATTN_SCORES_BUDGET
+    };
+    let latents = candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
+        let noise = init_noise(req.height, req.width, seed, device)?;
+        candle_gen::run_flow_sampler(
+            req.sampler.as_deref(),
+            TimestepConvention::Sigma,
+            &sigmas,
+            noise,
+            seed,
+            &req.cancel,
+            on_progress,
+            |x, timestep| -> Result<Tensor> {
+                let t = Tensor::from_vec(vec![timestep], (1,), device)?;
+                let v = dit.forward_with_memory(x, &t, &context, attention_budget, &req.cancel)?;
+                Ok(v.to_dtype(DType::F32)?)
+            },
+        )
+    })?;
+    device.synchronize()?;
+    drop(dit);
+    drop(context);
+
+    candle_gen::check_cancel(&req.cancel)?;
+    // `Renderer` remains the stable public load-phase name for heavy components. Emitting it again
+    // marks the separately loaded decoder without expanding the exhaustive public enum.
+    on_progress(Progress::Loading(gen_core::LoadPhase::Renderer));
+    let vae = load_vae(root, device)?;
+    let images = latents
+        .iter()
+        .map(|latent| {
+            candle_gen::check_cancel(&req.cancel)?;
+            enter_decode_boundary(req, memory, on_progress)?;
+            let decoded = vae
+                .decode_with(latent, memory.tile_vae_decode)?
+                .to_dtype(DType::F32)?;
+            to_image(&decoded)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    device.synchronize()?;
+    drop(vae);
+    Ok(images)
+}
+
+fn enter_decode_boundary(
+    req: &GenerationRequest,
+    memory: gen_core::GenerationMemory,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<()> {
+    on_progress(Progress::Decoding);
+    // The callback is the public decode boundary used by callers to request cancellation. Observe a
+    // flag raised there before starting the expensive, otherwise non-interruptible VAE decode.
+    candle_gen::check_cancel(&req.cancel)?;
+    maybe_inject_calibration_error(memory, gen_core::ImageMemoryPhase::Decode)
+}
+
+fn enter_loading_boundary(
+    req: &GenerationRequest,
+    memory: gen_core::GenerationMemory,
+    load_phase: gen_core::LoadPhase,
+    memory_phase: gen_core::ImageMemoryPhase,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<()> {
+    on_progress(Progress::Loading(load_phase));
+    // Loading is a public phase boundary too. A cancellation raised by its callback must stop before
+    // opening or materializing the next multi-GB component.
+    candle_gen::check_cancel(&req.cancel)?;
+    maybe_inject_calibration_error(memory, memory_phase)
+}
+
+fn maybe_inject_calibration_error(
+    memory: gen_core::GenerationMemory,
+    phase: gen_core::ImageMemoryPhase,
+) -> Result<()> {
+    if memory.calibration_error_phase == Some(phase) {
+        Err(CandleError::Msg(format!(
+            "krea_2_turbo: injected image-memory calibration error at {phase:?}"
+        )))
+    } else {
+        Ok(())
+    }
 }
 
 /// SPIKE (sc-8596, HELD) — the ComfyUI-Conditioning-Rebalance trick ported to candle: reweight the 12
@@ -1791,6 +1956,80 @@ pub(crate) fn to_image(decoded: &Tensor) -> Result<Image> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn calibration_faults_are_request_local_and_default_path_is_inert() {
+        let clean = gen_core::GenerationMemory::default();
+        for phase in [
+            gen_core::ImageMemoryPhase::Conditioning,
+            gen_core::ImageMemoryPhase::Denoise,
+            gen_core::ImageMemoryPhase::Decode,
+        ] {
+            assert!(maybe_inject_calibration_error(clean, phase).is_ok());
+            let faulted = gen_core::GenerationMemory {
+                calibration_error_phase: Some(phase),
+                ..clean
+            };
+            let error = maybe_inject_calibration_error(faulted, phase)
+                .expect_err("the selected calibration phase must fail");
+            assert!(error.to_string().contains(&format!("{phase:?}")));
+            assert!(
+                maybe_inject_calibration_error(clean, phase).is_ok(),
+                "a warm follow-up request must not inherit the prior request's fault"
+            );
+        }
+    }
+
+    #[test]
+    fn decoding_progress_callback_can_cancel_before_decode_starts() {
+        let request = GenerationRequest {
+            prompt: "test".to_owned(),
+            ..Default::default()
+        };
+        let cancel = request.cancel.clone();
+        let error = enter_decode_boundary(
+            &request,
+            gen_core::GenerationMemory::default(),
+            &mut |progress| {
+                assert_eq!(progress, Progress::Decoding);
+                cancel.cancel();
+            },
+        )
+        .expect_err("decode-boundary cancellation must be observed");
+        assert!(matches!(error, CandleError::Canceled));
+    }
+
+    #[test]
+    fn loading_progress_callbacks_can_cancel_before_component_loads_start() {
+        for (load_phase, memory_phase) in [
+            (
+                gen_core::LoadPhase::TextEncoder,
+                gen_core::ImageMemoryPhase::Conditioning,
+            ),
+            (
+                gen_core::LoadPhase::Renderer,
+                gen_core::ImageMemoryPhase::Denoise,
+            ),
+        ] {
+            let request = GenerationRequest {
+                prompt: "test".to_owned(),
+                ..Default::default()
+            };
+            let cancel = request.cancel.clone();
+            let error = enter_loading_boundary(
+                &request,
+                gen_core::GenerationMemory::default(),
+                load_phase,
+                memory_phase,
+                &mut |progress| {
+                    assert_eq!(progress, Progress::Loading(load_phase));
+                    cancel.cancel();
+                },
+            )
+            .expect_err("loading-boundary cancellation must be observed");
+            assert!(matches!(error, CandleError::Canceled));
+        }
+    }
 
     /// sc-12828: `load_text` stores the Qwen3-VL TE at **bf16**, not f32 — the deliberate, non-default
     /// choice the ~7.6 GB/tier resident saving rides on (the encoder still computes f32 via

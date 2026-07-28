@@ -22,7 +22,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use mlx_gen::adapters::loader::apply_adapters_strict;
+use mlx_gen::adapters::loader::{apply_adapters_strict, apply_adapters_strict_with_diff_patch};
 use mlx_gen::adapters::AdaptableHost;
 use mlx_gen::{AdapterKind, AdapterSpec};
 use mlx_gen_krea_realtime::{
@@ -508,18 +508,81 @@ fn per_lora_scale_scales_the_residual() {
     );
 }
 
+/// **(3b) sc-8446 S13 — the whole-model globals install AND move the forward.**
+///
+/// The settled globals decision is not "the resolver returns `Some`": a widened surface that routed the
+/// keys but dropped the residual would still silently under-apply a real step-distill LoRA. So this
+/// installs a LoRA that targets **only** globals — every one in the reference/file spelling a real
+/// lightx2v / FastWan file carries — and requires all seven to install and the forward to change.
+///
+/// NB: this fixture deliberately targets **all seven** to exercise the whole routing surface. A *real*
+/// step-distill file populates only six (`patch_embedding` ships a `.diff_b` bias delta with no
+/// low-rank pair), which is the 406-vs-407 gap asserted in `causal.rs` and on the real weights in
+/// `tests/style_lora_real_weights.rs`. Seven here is a statement about the host, not about those files.
+#[test]
+fn globals_install_end_to_end_and_change_the_forward() {
+    let cfg = tiny_cfg();
+    let base = tiny_transformer(&cfg);
+    let vel_base = forward_once(&base, &cross_kv(&base, &cfg), &cfg);
+
+    // Shapes from `tiny_cfg`: dim 64, freq_dim 32, text_dim 32, in_dim 16, patch (1,2,2), out_dim 16.
+    //   patch_embedding_proj [dim, in_dim·∏patch] = [64, 64]   text_embedding_0 [64, 32]
+    //   text_embedding_1     [64, 64]                          time_embedding_0 [64, 32]
+    //   time_embedding_1     [64, 64]                          time_projection  [6·64, 64] = [384, 64]
+    //   head.head            [out_dim·∏patch, dim] = [64, 64]
+    let lora = write_lora(
+        "globals_only.safetensors",
+        &[
+            ("patch_embedding", 64, 64),
+            ("text_embedding.0", 64, 32),
+            ("text_embedding.2", 64, 64),
+            ("time_embedding.0", 64, 32),
+            ("time_embedding.2", 64, 64),
+            ("time_projection.1", 384, 64),
+            ("head.head", 64, 64),
+        ],
+        4,
+        77,
+        0.4,
+    );
+
+    let mut adapted = tiny_transformer(&cfg);
+    let report = apply_adapters_strict(&mut adapted, &[spec(lora, 1.0)], MODEL_ID)
+        .expect("a globals-only Wan LoRA must install (sc-8446 widened the surface)");
+    assert_eq!(
+        report.applied, 7,
+        "all seven whole-model globals must install (this synthetic file targets all seven; a real \
+         step-distill file populates six — see the note above)"
+    );
+    assert!(report.unmatched_paths.is_empty());
+
+    let vel_adapted = forward_once(&adapted, &cross_kv(&adapted, &cfg), &cfg);
+    let signal = max_abs(&vel_base).max(1e-6);
+    let delta = max_abs_diff(&vel_base, &vel_adapted);
+    assert!(
+        delta > 1e-3 * signal,
+        "a globals-only LoRA installed but did not move the forward (Δ {delta:.3e} vs signal \
+         {signal:.3e}) — the residual is not reaching the global Linears"
+    );
+}
+
 /// (4) An unsupported / unmatched adapter target is **surfaced** — the strict installer errors and names
-/// it — never silently dropped. Covers a whole-model global (not exposed by the per-block surface).
+/// it — never silently dropped.
+///
+/// The out-of-surface case is the **I2V-only image cross-attention** (`cross_attn.k_img`/`v_img`), which
+/// real Wan-**I2V** LoRAs carry and which does not exist on this T2V backbone at any surface width. It is
+/// deliberately NOT the whole-model globals: sc-8446 (S13) settled those as exposed, because real Wan-T2V
+/// step-distill LoRAs target them with genuine low-rank factors (see `globals_install_end_to_end`).
 #[test]
 fn unsupported_target_is_reported_not_silently_dropped() {
     let cfg = tiny_cfg();
 
-    // A file mixing a valid target with an out-of-surface global (`time_embedding.0`, not routed).
+    // A file mixing a valid target with an I2V-only module this T2V backbone does not have.
     let mixed = write_lora(
         "mixed_target.safetensors",
         &[
             ("blocks.0.self_attn.q", 64, 64),
-            ("time_embedding.0", 64, 32),
+            ("blocks.0.cross_attn.k_img", 64, 64),
         ],
         4,
         4,
@@ -530,7 +593,7 @@ fn unsupported_target_is_reported_not_silently_dropped() {
         .expect_err("an unmatched target must surface as an error, not be silently dropped");
     let msg = err.to_string();
     assert!(
-        msg.contains("time_embedding"),
+        msg.contains("k_img"),
         "the error must name the unmatched target: {msg}"
     );
 
@@ -579,9 +642,21 @@ fn wan_family_ffn_key_normalizes_and_resolves() {
         host.adaptable_mut(&["blocks", "0", "ffn", "9"]).is_none(),
         "a bogus FFN index must not resolve"
     );
+    // sc-8446 S13: the whole-model globals ARE exposed now, in the reference/file spelling a LoRA
+    // carries (the normalizer bridges to the converted names). The I2V-only image cross-attention still
+    // is not — those modules do not exist on a T2V backbone.
     assert!(
-        host.adaptable_mut(&["patch_embedding"]).is_none(),
-        "globals are not exposed"
+        host.adaptable_mut(&["patch_embedding"]).is_some(),
+        "patch_embedding is an exposed global (sc-8446)"
+    );
+    assert!(
+        host.adaptable_mut(&["head", "head"]).is_some(),
+        "head.head is an exposed global (sc-8446)"
+    );
+    assert!(
+        host.adaptable_mut(&["blocks", "0", "cross_attn", "k_img"])
+            .is_none(),
+        "the I2V-only image cross-attention does not exist on this T2V backbone"
     );
 
     // The reference-named `ffn.0` LoRA installs onto the FFN linear that `ffn.fc1` addresses: applying
@@ -643,4 +718,318 @@ fn lokr_installs_on_dense_and_changes_forward() {
         delta > 1e-3 * signal,
         "a LoKr must change the forward: max|Δ|={delta} (signal ~{signal})"
     );
+}
+
+// ── sc-15326: ComfyUI/lightx2v diff-patch deltas, and their tier-independence ────────────────────
+
+/// Write a **lightx2v-shaped diff-patch** file for the tiny geometry: the exact key *shapes* a real
+/// `lightx2v_T2V_14B_cfg_step_distill_v2_lora_rank64` carries, scaled down to this fixture.
+///
+/// Per block: a `.diff_b` bias delta on each of the 10 attention/FFN Linears, a `.diff` weight delta on
+/// each of the 5 norms (`self_attn.norm_q/norm_k`, `cross_attn.norm_q/norm_k`, `norm3`) and a
+/// `norm3.diff_b`. Whole-model: a `.diff_b` on each of the 7 globals. On the real 40-block file that is
+/// 447 `.diff_b` + 200 `.diff` = 647 keys, every one of which the plain `apply_adapters_strict` path
+/// dropped without a word before sc-15326.
+///
+/// Returns `(path, expected_fold_count)`.
+fn write_lightx2v_shaped_diff_patch(name: &str, cfg: &KreaRealtimeConfig) -> (PathBuf, usize) {
+    let w = &cfg.wan;
+    let dim = w.dim as i32;
+    let ffn = w.ffn_dim as i32;
+    let (pt, ph, pw) = w.patch_size;
+    let head_out = w.out_dim as i32 * pt as i32 * ph as i32 * pw as i32;
+
+    let mut entries: Vec<(String, Array)> = Vec::new();
+    let mut seed = 500u64;
+    let mut put = |entries: &mut Vec<(String, Array)>, key: String, shape: &[i32]| {
+        seed += 1;
+        entries.push((key, det_fill(shape, seed, 0.05, 0.0, Dtype::Float32)));
+    };
+
+    // The 7 whole-model Linears, in the file (reference) spelling.
+    for (stem, out) in [
+        ("patch_embedding", dim),
+        ("text_embedding.0", dim),
+        ("text_embedding.2", dim),
+        ("time_embedding.0", dim),
+        ("time_embedding.2", dim),
+        ("time_projection.1", 6 * dim),
+        ("head.head", head_out),
+    ] {
+        put(
+            &mut entries,
+            format!("diffusion_model.{stem}.diff_b"),
+            &[out],
+        );
+    }
+
+    for i in 0..w.num_layers {
+        let p = format!("diffusion_model.blocks.{i}");
+        for attn in ["self_attn", "cross_attn"] {
+            for proj in ["q", "k", "v", "o"] {
+                put(&mut entries, format!("{p}.{attn}.{proj}.diff_b"), &[dim]);
+            }
+            // qk-RMSNorm gains: weight-only (`.diff`), no bias channel.
+            put(&mut entries, format!("{p}.{attn}.norm_q.diff"), &[dim]);
+            put(&mut entries, format!("{p}.{attn}.norm_k.diff"), &[dim]);
+        }
+        put(&mut entries, format!("{p}.ffn.0.diff_b"), &[ffn]);
+        put(&mut entries, format!("{p}.ffn.2.diff_b"), &[dim]);
+        // The affine cross-attention LayerNorm carries BOTH halves.
+        put(&mut entries, format!("{p}.norm3.diff"), &[dim]);
+        put(&mut entries, format!("{p}.norm3.diff_b"), &[dim]);
+    }
+
+    let expected = entries.len();
+    let dir = std::env::temp_dir().join("mlx_gen_krea_style_lora_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(name);
+    let refs: Vec<(&str, &Array)> = entries.iter().map(|(k, v)| (k.as_str(), v)).collect();
+    Array::save_safetensors(refs, None, &path).unwrap();
+    (path, expected)
+}
+
+/// A tiny Krea Realtime DiT packed to Q4 **before** the adapter install — the default product tier, and
+/// the order `t2v::load_transformer` uses.
+fn tiny_transformer_q4(cfg: &KreaRealtimeConfig) -> CausalKreaTransformer {
+    let mut dit =
+        load_krea_realtime_transformer(native_random_map(cfg), cfg).expect("load tiny DiT");
+    dit.quantize(4, None).expect("quantize to Q4");
+    CausalKreaTransformer::new(dit, cfg)
+}
+
+/// **sc-15326, the decision gate.** A lightx2v-shaped diff-patch file must apply **completely and
+/// identically** on the default packed Q4 tier and on dense bf16.
+///
+/// This is the whole reason Krea Realtime folds diff-patch deltas through the bias + norm channels
+/// rather than simply calling `apply_adapters_strict_with_diff_patch` and accepting what lands: a
+/// weight `.diff` cannot fold into a packed Linear, so the naive switch would have applied only the 7
+/// dense globals at Q4 against 407 at bf16 — the same LoRA rendering differently depending on a tier
+/// the user picks for *creative* reasons. The two channels this file actually uses are dense on every
+/// tier (a `QuantizedLinear` keeps its bias dense; norms are never in the quantize predicate), so the
+/// counts must match exactly.
+///
+/// Discriminating on three axes at once: the fold count (a tier-gated bias fold collapses the Q4 arm),
+/// the unapplied list (any drop, silent or not, shows up), and the forward (a fold that resolved but
+/// wrote nothing leaves the output bit-identical to baseline).
+#[test]
+fn lightx2v_shaped_diff_patch_applies_identically_on_q4_and_dense() {
+    let cfg = tiny_cfg();
+    let (dp, expected) = write_lightx2v_shaped_diff_patch("krea_diff_patch.safetensors", &cfg);
+    // 2 blocks × (10 `.diff_b` + 5 `.diff` + 1 `norm3.diff_b`) + 7 global `.diff_b`.
+    assert_eq!(expected, 2 * 16 + 7, "fixture shape");
+
+    let mut reports = Vec::new();
+    let mut changed = Vec::new();
+    for (label, mut host) in [
+        ("dense", tiny_transformer(&cfg)),
+        ("q4", tiny_transformer_q4(&cfg)),
+    ] {
+        let xkv = cross_kv(&host, &cfg);
+        let before = forward_once(&host, &xkv, &cfg);
+        let report =
+            apply_adapters_strict_with_diff_patch(&mut host, &[spec(dp.clone(), 1.0)], MODEL_ID)
+                .unwrap_or_else(|e| panic!("{label}: diff-patch install failed: {e}"));
+        let after = forward_once(&host, &xkv, &cfg);
+        changed.push((label, max_abs_diff(&before, &after)));
+        reports.push((label, report));
+    }
+
+    for (label, report) in &reports {
+        assert_eq!(
+            report.applied, expected,
+            "{label}: every diff-patch delta must land, not just the dense ones"
+        );
+        assert!(
+            report.diff_patch_unapplied.is_empty(),
+            "{label}: nothing may be dropped: {:?}",
+            report.diff_patch_unapplied
+        );
+    }
+    assert_eq!(
+        reports[0].1.applied, reports[1].1.applied,
+        "the SAME LoRA must apply the same number of deltas on Q4 as on bf16 — tier is a creative \
+         choice, not an adapter-coverage knob"
+    );
+    for (label, delta) in &changed {
+        assert!(
+            *delta > 1e-4,
+            "{label}: the diff-patch fold changed nothing in the forward (delta {delta})"
+        );
+    }
+}
+
+/// The `.diff` norm deltas reach the **norm** parameters specifically — not silently absorbed by the
+/// Linear surface. A file carrying ONLY the 5 per-block norm `.diff` deltas (no `.diff_b`, no low-rank
+/// factors) installs cleanly and moves the forward; before sc-15326 these had nowhere to land at any
+/// `AdaptableHost` width and were dropped without a word.
+#[test]
+fn norm_only_diff_patch_installs_through_the_norm_param_surface() {
+    let cfg = tiny_cfg();
+    let dim = cfg.wan.dim as i32;
+    let mut entries: Vec<(String, Array)> = Vec::new();
+    for i in 0..cfg.wan.num_layers {
+        let p = format!("diffusion_model.blocks.{i}");
+        for stem in [
+            "self_attn.norm_q",
+            "self_attn.norm_k",
+            "cross_attn.norm_q",
+            "cross_attn.norm_k",
+            "norm3",
+        ] {
+            entries.push((
+                format!("{p}.{stem}.diff"),
+                det_fill(&[dim], 900 + i as u64, 0.2, 0.0, Dtype::Float32),
+            ));
+        }
+    }
+    let dir = std::env::temp_dir().join("mlx_gen_krea_style_lora_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("krea_norm_only_diff.safetensors");
+    let refs: Vec<(&str, &Array)> = entries.iter().map(|(k, v)| (k.as_str(), v)).collect();
+    Array::save_safetensors(refs, None, &path).unwrap();
+
+    let mut host = tiny_transformer_q4(&cfg);
+    let xkv = cross_kv(&host, &cfg);
+    let before = forward_once(&host, &xkv, &cfg);
+    let report =
+        apply_adapters_strict_with_diff_patch(&mut host, &[spec(path, 1.0)], MODEL_ID).unwrap();
+    assert_eq!(report.applied, 5 * cfg.wan.num_layers);
+    assert!(report.diff_patch_unapplied.is_empty());
+    let after = forward_once(&host, &xkv, &cfg);
+    assert!(
+        max_abs_diff(&before, &after) > 1e-4,
+        "a norm .diff fold that resolved but wrote nothing would leave the forward unchanged"
+    );
+}
+
+/// No silent drop survives: a diff-patch key for a module this **T2V** backbone does not have (an
+/// I2V file's `cross_attn.norm_k_img`) is reported on `ApplyReport::diff_patch_unapplied` — the
+/// channel a provider stamps into user-visible asset provenance — while the rest of the file installs.
+#[test]
+fn out_of_surface_diff_patch_key_is_reported_not_dropped() {
+    let cfg = tiny_cfg();
+    let dim = cfg.wan.dim as i32;
+    let d = det_fill(&[dim], 1234, 0.2, 0.0, Dtype::Float32);
+    let dir = std::env::temp_dir().join("mlx_gen_krea_style_lora_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("krea_i2v_norm_diff.safetensors");
+    Array::save_safetensors(
+        vec![
+            ("diffusion_model.blocks.0.norm3.diff", &d),
+            ("diffusion_model.blocks.0.cross_attn.norm_k_img.diff", &d),
+        ],
+        None,
+        &path,
+    )
+    .unwrap();
+
+    let mut host = tiny_transformer(&cfg);
+    let report =
+        apply_adapters_strict_with_diff_patch(&mut host, &[spec(path, 1.0)], MODEL_ID).unwrap();
+    assert_eq!(report.applied, 1, "the in-surface norm delta still lands");
+    assert_eq!(
+        report.diff_patch_unapplied,
+        vec!["blocks.0.cross_attn.norm_k_img".to_string()],
+        "an out-of-surface diff-patch target must reach the caller, never be dropped in silence"
+    );
+}
+
+/// The Krea provider-facing seam preserves the engine result per adapter: a fully-applied
+/// lightx2v-shaped file has no skipped targets, while a second file with one real norm delta and one
+/// foreign I2V norm target reports exactly 1 applied / 1 skipped. Both files contain material tensor
+/// payloads, so an empty-fixture fast path cannot make this green.
+#[test]
+fn provider_reports_fully_applied_and_partial_adapters_separately() {
+    let cfg = tiny_cfg();
+    let (lightx2v, expected) =
+        write_lightx2v_shaped_diff_patch("krea_report_lightx2v.safetensors", &cfg);
+    let dim = cfg.wan.dim as i32;
+    let landed = det_fill(&[dim], 2001, 0.2, 0.0, Dtype::Float32);
+    let foreign = det_fill(&[dim], 2002, 0.2, 0.0, Dtype::Float32);
+    let dir = std::env::temp_dir().join("mlx_gen_krea_style_lora_test");
+    let partial = dir.join("krea_report_partial.safetensors");
+    Array::save_safetensors(
+        vec![
+            ("diffusion_model.blocks.0.norm3.diff", &landed),
+            (
+                "diffusion_model.blocks.0.cross_attn.norm_k_img.diff",
+                &foreign,
+            ),
+        ],
+        None,
+        &partial,
+    )
+    .unwrap();
+
+    let specs = vec![spec(lightx2v.clone(), 1.0), spec(partial.clone(), 1.0)];
+    let mut host = tiny_transformer_q4(&cfg);
+    let reports = mlx_gen_krea_realtime::t2v::apply_adapters_reported(&mut host, &specs)
+        .expect("both adapters install with the foreign target surfaced");
+    assert_eq!(reports.len(), 2);
+    assert_eq!(reports[0].adapter_path, lightx2v);
+    assert_eq!(reports[0].applied, expected);
+    assert!(
+        reports[0].skipped.is_empty(),
+        "the lightx2v-shaped file is fully applied on the product Q4 tier"
+    );
+    assert_eq!(reports[1].adapter_path, partial);
+    assert_eq!(reports[1].applied, 1);
+    assert_eq!(
+        reports[1].skipped,
+        vec!["blocks.0.cross_attn.norm_k_img".to_owned()]
+    );
+}
+
+/// Per-file reporting must not weaken the established batch-strict contract. A wholly unsupported
+/// diff-patch file is a surfaced partial outcome when another file in the same ordered batch lands;
+/// it is not independently strict-failed. Both orders are gated because an implementation that
+/// applies/report files one at a time fails on whichever order reaches the unsupported file.
+#[test]
+fn reported_batch_accepts_supported_plus_wholly_unsupported_in_both_orders() {
+    let cfg = tiny_cfg();
+    let (supported, supported_applied) =
+        write_lightx2v_shaped_diff_patch("krea_report_batch_supported.safetensors", &cfg);
+    let dim = cfg.wan.dim as i32;
+    let foreign = det_fill(&[dim], 2011, 0.2, 0.0, Dtype::Float32);
+    let unsupported = std::env::temp_dir()
+        .join("mlx_gen_krea_style_lora_test")
+        .join("krea_report_batch_unsupported.safetensors");
+    Array::save_safetensors(
+        vec![(
+            "diffusion_model.blocks.0.cross_attn.norm_k_img.diff",
+            &foreign,
+        )],
+        None,
+        &unsupported,
+    )
+    .unwrap();
+
+    for paths in [
+        [supported.clone(), unsupported.clone()],
+        [unsupported.clone(), supported.clone()],
+    ] {
+        let specs = paths
+            .iter()
+            .cloned()
+            .map(|path| spec(path, 1.0))
+            .collect::<Vec<_>>();
+        let mut host = tiny_transformer_q4(&cfg);
+        let reports = mlx_gen_krea_realtime::t2v::apply_adapters_reported(&mut host, &specs)
+            .expect("batch strictness is evaluated across both files");
+        assert_eq!(reports.len(), 2);
+        for (report, path) in reports.iter().zip(paths) {
+            assert_eq!(report.adapter_path, path);
+            if path == supported {
+                assert_eq!(report.applied, supported_applied);
+                assert!(report.skipped.is_empty());
+            } else {
+                assert_eq!(report.applied, 0);
+                assert_eq!(
+                    report.skipped,
+                    vec!["blocks.0.cross_attn.norm_k_img".to_owned()]
+                );
+            }
+        }
+    }
 }

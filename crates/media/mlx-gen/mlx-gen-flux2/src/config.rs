@@ -180,10 +180,10 @@ impl Flux2Variant {
             backend: "mlx",
             modality: Modality::Image,
             capabilities: Capabilities {
-                supports_negative_prompt: false,
-                // klein is distilled (guidance 1.0); base variants would flip this on. The
-                // fork's `supports_guidance` is True, but the distilled klein the story targets
-                // runs CFG-free, so we expose guidance but default it to 1.0.
+                // Klein defaults to guidance 1.0 (CFG-free), but every Klein variant runs a
+                // classifier-free negative pass when callers explicitly request guidance > 1.
+                // Dev consumes guidance as an embedded scalar and never takes that negative pass.
+                supports_negative_prompt: !self.uses_embedded_guidance(),
                 supports_guidance: true,
                 supports_true_cfg: false,
                 conditioning,

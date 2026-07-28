@@ -351,7 +351,17 @@ while failing the SFX floor — so none of the above is prose-only.
 Medium is **not** claimed to be perceptually better than `small_music`. The story's original wording
 asked for "audibly higher quality"; no objective metric that fits in a test can carry that, because
 `MR-STFT` and SNR measure agreement with a reference and two different checkpoints rendering the same
-prompt are supposed to disagree. A perceptual claim needs a pinned blinded protocol (ABX or MOS-style,
-multiple listeners, held-out prompts), which is separate work and was not run. What is claimed is the
-capability difference, which is objective and enforced: 380 s against 120 s, SAME-L against SAME-S,
-and both domains against one.
+prompt are supposed to disagree. What is claimed is the capability difference, which is objective and
+enforced: 380 s against 120 s, SAME-L against SAME-S, and both domains against one.
+
+**The "audibly higher quality" wording is retired** (sc-15178), not merely left unclaimed. What a
+rigorous perceptual claim would take is now pinned rather than gestured at:
+[`SC_15178_SA3_LISTENING_PROTOCOL.md`](SC_15178_SA3_LISTENING_PROTOCOL.md) specifies the blinded ABX
++ preference design, the held-out LUFS-level-matched stimulus set, the same-checkpoint validity
+control, and a panel size and analysis pre-registered from a stated effect size. It also fixes the
+rule that makes the result interpretable — ABX answers *discriminability* and gates the preference
+question, so a failed ABX means the preference result is not reported.
+
+That protocol is **designed but not executed**; the listening itself needs a human panel and is
+tracked as **sc-15377**. The wording is reinstated only if that run substantiates it, and never by a
+metric: no test here may be changed to assert perceptual superiority from an agreement metric.

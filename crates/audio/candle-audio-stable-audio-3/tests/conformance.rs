@@ -14,9 +14,24 @@ struct Case {
     prompt: &'static str,
 }
 
-/// The three registered post-trained checkpoints. The music prompt is the one sc-14543 shipped and
-/// is left untouched; the SFX and medium prompts are real shipped `demo_cond` entries from their own
+/// The six registered checkpoints. The music prompt is the one sc-14543 shipped and is left
+/// untouched; the SFX and medium prompts are real shipped `demo_cond` entries from their own
 /// `model_config.json` files.
+///
+/// # The `-base` prompts could not follow that convention, and here is why
+///
+/// sc-14543/14544/14545 sourced each variant's prompt from the checkpoint's own `demo_cond`. That
+/// rule breaks on two of the three bases, so it is abandoned deliberately rather than applied
+/// blindly:
+///
+/// * `small-music-base` ships four genuine music `demo_cond` prompts; the first is used verbatim.
+/// * `small-sfx-base` ships the **music-base prompt list**, unchanged — "A beautiful piano
+///   arpeggio...", "Amen break 174 BPM", "lofi house loop". Those are copy-paste from the music
+///   config, not SFX prompts, and rendering a Foley checkpoint on them would gate it on
+///   out-of-domain text. It therefore takes its post-trained sibling's shipped SFX `demo_cond`
+///   prompt, which is the same training domain and the same lineage.
+/// * `medium-base` ships **no `demo_cond` at all** (`training.demo` carries only `num_demos: 4`).
+///   It takes its post-trained sibling's shipped prompt for the same reason.
 const CASES: &[Case] = &[
     Case {
         variant: Variant::SmallMusic,
@@ -31,6 +46,21 @@ const CASES: &[Case] = &[
     Case {
         variant: Variant::Medium,
         env: "SA3_MEDIUM_SNAPSHOT",
+        prompt: "Meditative lo-fi ambient piano jazz, soft acoustic drum kit",
+    },
+    Case {
+        variant: Variant::SmallMusicBase,
+        env: "SA3_SMALL_MUSIC_BASE_SNAPSHOT",
+        prompt: "A beautiful piano arpeggio grows into a grand cinematic climax",
+    },
+    Case {
+        variant: Variant::SmallSfxBase,
+        env: "SA3_SMALL_SFX_BASE_SNAPSHOT",
+        prompt: "Futuristic laser blast, sharp energy pulse, stereo movement, arcade style",
+    },
+    Case {
+        variant: Variant::MediumBase,
+        env: "SA3_MEDIUM_BASE_SNAPSHOT",
         prompt: "Meditative lo-fi ambient piano jazz, soft acoustic drum kit",
     },
 ];
@@ -150,6 +180,42 @@ fn concurrent_medium_requests_are_deterministic_and_do_not_share_rng_state() {
     run_rng_isolation(&CASES[2]);
 }
 
+#[test]
+#[ignore = "requires the pinned 3.45 GB small-music-base snapshot"]
+fn registered_music_base_provider_passes_full_audio_conformance() {
+    run_conformance(&CASES[3]);
+}
+
+#[test]
+#[ignore = "requires the pinned 3.45 GB small-music-base snapshot"]
+fn concurrent_music_base_requests_are_deterministic_and_do_not_share_rng_state() {
+    run_rng_isolation(&CASES[3]);
+}
+
+#[test]
+#[ignore = "requires the pinned 3.45 GB small-sfx-base snapshot"]
+fn registered_sfx_base_provider_passes_full_audio_conformance() {
+    run_conformance(&CASES[4]);
+}
+
+#[test]
+#[ignore = "requires the pinned 3.45 GB small-sfx-base snapshot"]
+fn concurrent_sfx_base_requests_are_deterministic_and_do_not_share_rng_state() {
+    run_rng_isolation(&CASES[4]);
+}
+
+#[test]
+#[ignore = "requires the pinned 10.4 GB medium-base snapshot"]
+fn registered_medium_base_provider_passes_full_audio_conformance() {
+    run_conformance(&CASES[5]);
+}
+
+#[test]
+#[ignore = "requires the pinned 10.4 GB medium-base snapshot"]
+fn concurrent_medium_base_requests_are_deterministic_and_do_not_share_rng_state() {
+    run_rng_isolation(&CASES[5]);
+}
+
 /// The advertised cap must be the one the adapted geometry can actually serve, and it must be a
 /// per-variant number rather than the crate-global `120.0` that sc-14545 replaced.
 ///
@@ -157,12 +223,25 @@ fn concurrent_medium_requests_are_deterministic_and_do_not_share_rng_state() {
 /// regression to a shared constant makes medium's advertised cap 120 s while `sample_size` still
 /// says `16,777,216`, and a regression that hands medium the smalls' geometry makes the requested
 /// frame count unreachable.
+///
+/// # The small bases keep the 120 s cap despite a larger `sample_size`
+///
+/// `5,324,800` frames is `120.743764...` s, so it is tempting to advertise `120.74` — an earlier
+/// note on this story said exactly that. The tightness assertion below is what rules it out from
+/// the other side: the cap must be a whole second count whose successor does **not** fit, and
+/// `121 s = 5,336,100 > 5,324,800`. `120` is therefore still the tightest advertisable cap, and the
+/// residual `0.74 s` is unreachable through the descriptor by the same rule that keeps medium at
+/// `380`. What the larger `sample_size` changes is the *validator*, not the advertisement — and
+/// that is precisely what separates a base snapshot from its post-trained sibling.
 #[test]
 fn each_variant_advertises_a_cap_its_own_geometry_can_serve() {
     for (variant, expected_cap, sample_size) in [
         (Variant::SmallMusic, 120.0f32, 5_292_032usize),
         (Variant::SmallSfx, 120.0, 5_292_032),
         (Variant::Medium, 380.0, 16_777_216),
+        (Variant::SmallMusicBase, 120.0, 5_324_800),
+        (Variant::SmallSfxBase, 120.0, 5_324_800),
+        (Variant::MediumBase, 380.0, 16_777_216),
     ] {
         let descriptor = variant.descriptor();
         assert_eq!(
@@ -198,5 +277,23 @@ fn each_variant_advertises_a_cap_its_own_geometry_can_serve() {
             .capabilities
             .max_audio_duration_secs,
         "the cap must be variant-bound, not the crate-global constant it replaced"
+    );
+    // ...and the base `sample_size` must be variant-bound too, or a post-trained small snapshot
+    // authenticates under a base id and vice versa.
+    assert_ne!(
+        Variant::SmallMusicBase.shape().sample_size,
+        Variant::SmallMusic.shape().sample_size,
+        "the small bases' 5,324,800-frame ceiling is what rejects a post-trained small snapshot \
+         under a base id before the objective check is reached"
+    );
+    assert_eq!(
+        Variant::SmallSfxBase.shape().sample_size,
+        Variant::SmallMusicBase.shape().sample_size
+    );
+    // Medium and medium-base share every geometric field, which is exactly why the objective and
+    // the SHA-256 pin carry that pair alone.
+    assert_eq!(
+        Variant::MediumBase.shape().sample_size,
+        Variant::Medium.shape().sample_size
     );
 }

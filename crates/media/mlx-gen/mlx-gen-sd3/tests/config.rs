@@ -47,7 +47,7 @@ fn variant_ids_and_schedules() {
     );
     assert_eq!(Sd3Variant::Large.default_steps(), 28);
     assert!((Sd3Variant::Large.default_guidance() - 3.5).abs() < 1e-6);
-    assert!(Sd3Variant::Large.supports_true_cfg());
+    assert!(Sd3Variant::Large.uses_classifier_free_guidance());
 
     assert_eq!(Sd3Variant::LargeTurbo.id(), SD3_5_LARGE_TURBO_ID);
     assert_eq!(
@@ -56,8 +56,8 @@ fn variant_ids_and_schedules() {
     );
     assert_eq!(Sd3Variant::LargeTurbo.default_steps(), 4);
     assert!((Sd3Variant::LargeTurbo.default_guidance() - 1.0).abs() < 1e-6);
-    // Turbo is distilled, guidance-free (no true CFG / negative prompt).
-    assert!(!Sd3Variant::LargeTurbo.supports_true_cfg());
+    // Turbo is distilled, guidance-free (no classifier-free guidance / negative prompt).
+    assert!(!Sd3Variant::LargeTurbo.uses_classifier_free_guidance());
 
     // Both variants share one MMDiT arch.
     assert_eq!(Sd3Variant::Large.arch(), Sd3Variant::LargeTurbo.arch());
@@ -69,7 +69,11 @@ fn descriptor_capabilities() {
     assert_eq!(large.id, SD3_5_LARGE_ID);
     assert_eq!(large.family, "sd3");
     assert_eq!(large.backend, "mlx");
-    assert!(large.capabilities.supports_true_cfg);
+    assert!(
+        !large.capabilities.supports_true_cfg,
+        "request.true_cfg is not consumed; SD3.5 CFG uses guidance + negative_prompt"
+    );
+    assert!(large.capabilities.supports_guidance);
     assert!(large.capabilities.supports_negative_prompt);
     assert!(large.capabilities.supports_lora);
     assert!(large.capabilities.supports_lokr);

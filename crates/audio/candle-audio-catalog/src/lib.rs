@@ -284,6 +284,9 @@ mod tests {
                 "stable_audio_3_small_music",
                 "stable_audio_3_small_sfx",
                 "stable_audio_3_medium",
+                "stable_audio_3_small_music_base",
+                "stable_audio_3_small_sfx_base",
+                "stable_audio_3_medium_base",
                 "moss_tts_realtime",
                 "chatterbox_tts",
                 "mmaudio_small_16k",
@@ -534,6 +537,64 @@ mod tests {
                 ),
                 (
                     "stable_audio_3_medium",
+                    Some("t5gemma"),
+                    "LicenseRef-Gemma-Terms",
+                    true
+                ),
+                // sc-14546: the three `-base` registrations. Their Hub repositories are ungated,
+                // unlike the post-trained three, but they ship the same LICENSE.md and
+                // LICENSE_GEMMA.md — so the rows are identical in shape and in restriction, and the
+                // root rows stay `commercial_use: false`.
+                (
+                    "stable_audio_3_small_music_base",
+                    None,
+                    "LicenseRef-Stability-AI-Community",
+                    false
+                ),
+                (
+                    "stable_audio_3_small_music_base",
+                    Some("root"),
+                    "LicenseRef-Stability-AI-Community",
+                    false
+                ),
+                (
+                    "stable_audio_3_small_music_base",
+                    Some("t5gemma"),
+                    "LicenseRef-Gemma-Terms",
+                    true
+                ),
+                (
+                    "stable_audio_3_small_sfx_base",
+                    None,
+                    "LicenseRef-Stability-AI-Community",
+                    false
+                ),
+                (
+                    "stable_audio_3_small_sfx_base",
+                    Some("root"),
+                    "LicenseRef-Stability-AI-Community",
+                    false
+                ),
+                (
+                    "stable_audio_3_small_sfx_base",
+                    Some("t5gemma"),
+                    "LicenseRef-Gemma-Terms",
+                    true
+                ),
+                (
+                    "stable_audio_3_medium_base",
+                    None,
+                    "LicenseRef-Stability-AI-Community",
+                    false
+                ),
+                (
+                    "stable_audio_3_medium_base",
+                    Some("root"),
+                    "LicenseRef-Stability-AI-Community",
+                    false
+                ),
+                (
+                    "stable_audio_3_medium_base",
                     Some("t5gemma"),
                     "LicenseRef-Gemma-Terms",
                     true

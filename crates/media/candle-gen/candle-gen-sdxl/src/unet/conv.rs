@@ -79,6 +79,11 @@ impl Module for Conv2d {
             ..Default::default()
         };
         for r in &self.residuals {
+            // A disabled adapter must not be evaluated: poisoned/non-finite factors multiplied by zero
+            // would otherwise contaminate the base output with NaNs.
+            if r.scale == 0.0 {
+                continue;
+            }
             let down = candle_nn::Conv2d::new(r.down.to_dtype(xd)?, None, self.cfg);
             let up = candle_nn::Conv2d::new(r.up.to_dtype(xd)?, None, up_cfg);
             let res = up.forward(&down.forward(x)?)?;
@@ -183,5 +188,40 @@ mod tests {
             .to_scalar::<f32>()
             .unwrap();
         assert_eq!(z0, 0.0, "a scale-0 conv residual must be an exact no-op");
+    }
+
+    /// sc-15444: zero dose is a control-plane off switch, so its factors must never be evaluated.
+    /// Poisoned factors make the test fail if the early skip is removed (`NaN * 0` is still `NaN`).
+    #[test]
+    fn zero_scale_conv_skips_poisoned_factors_exactly() {
+        let dev = Device::Cpu;
+        let cfg = Conv2dConfig {
+            stride: 1,
+            padding: 1,
+            groups: 1,
+            dilation: 1,
+            ..Default::default()
+        };
+        let base_w = Tensor::randn(0f32, 1f32, (2usize, 2usize, 3usize, 3usize), &dev).unwrap();
+        let mut conv = Conv2d {
+            inner: candle_nn::Conv2d::new(base_w, None, cfg),
+            cfg,
+            path: String::new(),
+            residuals: Vec::new(),
+        };
+        let bare = conv.inner.clone();
+        let down = Tensor::full(f32::NAN, (1usize, 2usize, 3usize, 3usize), &dev).unwrap();
+        let up = Tensor::full(f32::NAN, (2usize, 1usize, 1usize, 1usize), &dev).unwrap();
+        conv.push_additive_conv(down, up, 0.0);
+
+        let x = Tensor::randn(0f32, 1f32, (1usize, 2usize, 5usize, 5usize), &dev).unwrap();
+        let actual = conv.forward(&x).unwrap();
+        let expected = bare.forward(&x).unwrap();
+        assert_eq!(actual.dtype(), expected.dtype());
+        assert_eq!(
+            actual.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            expected.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            "zero-scale poisoned factors must preserve the exact base output"
+        );
     }
 }

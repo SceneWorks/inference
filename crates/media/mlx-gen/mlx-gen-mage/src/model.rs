@@ -26,6 +26,13 @@
 //!
 //! [`mlx_gen_catalog::provider_registry`]: https://docs.rs/mlx-gen-catalog
 
+use mlx_gen::gen_core::{
+    Error as CoreError, GenerationMemory, ImageMemoryBackendRealization,
+    ImageMemoryCalibrationIdentity, ImageMemoryFormulaKind, ImageMemoryFormulaVariable,
+    ImageMemoryGeometry, ImageMemoryMode, ImageMemoryPhase, ImageMemoryProviderContract,
+    ImageMemoryRequestScope, ImageMemoryRunContext, ImageMemoryRunOutcome,
+    ImageMemorySafetyDecision, ImageMemorySelection, ImageMemoryStrategy, Result as CoreResult,
+};
 use mlx_gen::{
     Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput, GenerationRequest,
     Generator, Image, LoadSpec, Modality, ModelDescriptor, Precision, Progress, Quant, Result,
@@ -38,6 +45,138 @@ use std::path::Path;
 use crate::config::{FAMILY, MAX_SIZE, MIN_SIZE, SIZE_MULTIPLE};
 use crate::pipeline::MageComponentDirs;
 use crate::{resolve_gs_key, GenerationSample, MageFlowPipeline};
+
+pub const IMAGE_MEMORY_CALIBRATION_FINGERPRINT: &str = "mage-flow-generation-peak-v1";
+
+/// Mage's first shared-contract adoption is intentionally resident-only. The exact measured
+/// request estimator and fail-closed wired-memory boundary are exposed now; SC-15509 owns adding
+/// verified optimized rungs and their provider implementation.
+pub fn image_memory_contract(
+    provider_id: &str,
+    tier: Option<Quant>,
+) -> ImageMemoryProviderContract {
+    let mut contract = ImageMemoryProviderContract::compatibility_default(
+        provider_id,
+        ImageMemoryBackendRealization::MlxMetal {
+            bounded_wired_residency: true,
+            lazy_or_mmap_materialization: true,
+            explicit_evaluation_and_synchronization: true,
+            cache_eviction: true,
+        },
+    );
+    contract.formula = ImageMemoryFormulaKind::PhaseEnvelope {
+        phases: vec![
+            ImageMemoryPhase::Conditioning,
+            ImageMemoryPhase::Denoise,
+            ImageMemoryPhase::Decode,
+        ],
+        variables: vec![
+            ImageMemoryFormulaVariable::PixelCount,
+            ImageMemoryFormulaVariable::BatchCount,
+        ],
+    };
+    contract.calibration = Some(ImageMemoryCalibrationIdentity::new(
+        IMAGE_MEMORY_CALIBRATION_FINGERPRINT,
+    ));
+    contract.asset_facts.base_bytes =
+        (crate::memory::generation_resident_gb(tier) * 1_000_000_000.0).round() as u64;
+    contract
+}
+
+struct MageImageMemoryScope {
+    selection: ImageMemorySelection,
+    geometry: ImageMemoryGeometry,
+    finished: bool,
+}
+
+impl MageImageMemoryScope {
+    fn synchronize_and_release(&mut self) -> CoreResult<()> {
+        // `mlx_eval` is synchronous. Evaluating a sentinel on MLX's ordered default stream is a
+        // terminal barrier for work queued by this request, including an error/cancellation exit
+        // after a progress callback. Only after that barrier may allocator-retained buffers be
+        // evicted for the next warm request.
+        let barrier = mlx_rs::Array::from(0.0_f32);
+        barrier.eval().map_err(Error::from)?;
+        drop(barrier);
+        mlx_rs::memory::clear_cache();
+        self.finished = true;
+        Ok(())
+    }
+}
+
+impl ImageMemoryRequestScope for MageImageMemoryScope {
+    fn configure_request(&mut self, request: &mut GenerationRequest) -> CoreResult<()> {
+        if self.selection.strategy != ImageMemoryStrategy::Resident {
+            return Err(CoreError::Unsupported(
+                "mage_flow: optimized image-memory strategies are not implemented yet".into(),
+            ));
+        }
+        if request.width != self.geometry.width
+            || request.height != self.geometry.height
+            || request.count == 0
+            || request.count > self.geometry.batch
+        {
+            return Err(CoreError::Unsupported(format!(
+                "mage_flow: request geometry {}x{} count {} does not match admitted {}x{} count {}",
+                request.width,
+                request.height,
+                request.count,
+                self.geometry.width,
+                self.geometry.height,
+                self.geometry.batch
+            )));
+        }
+        request.memory = Some(GenerationMemory::default());
+        Ok(())
+    }
+
+    fn enter_phase(&mut self, _phase: ImageMemoryPhase) -> CoreResult<()> {
+        Ok(())
+    }
+
+    fn leave_phase(&mut self, _phase: ImageMemoryPhase) -> CoreResult<()> {
+        Ok(())
+    }
+
+    fn configure_decode(
+        &mut self,
+        _tile_edge: u32,
+        _overlap: u32,
+        _geometry: ImageMemoryGeometry,
+    ) -> CoreResult<()> {
+        Err(CoreError::Unsupported(
+            "mage_flow: bounded decode is reserved for SC-15509".into(),
+        ))
+    }
+
+    fn configure_attention(&mut self, _chunk_size: u32) -> CoreResult<()> {
+        Err(CoreError::Unsupported(
+            "mage_flow: bounded attention is reserved for SC-15509".into(),
+        ))
+    }
+
+    fn materialize_transformer_window(
+        &mut self,
+        _first_block: u32,
+        _block_count: u32,
+    ) -> CoreResult<()> {
+        Err(CoreError::Unsupported(
+            "mage_flow: bounded transformer residency is reserved for SC-15509".into(),
+        ))
+    }
+
+    fn finish(&mut self, _outcome: ImageMemoryRunOutcome) -> CoreResult<()> {
+        self.synchronize_and_release()
+    }
+}
+
+impl Drop for MageImageMemoryScope {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = self.synchronize_and_release();
+        }
+    }
+}
 
 /// Which published checkpoint a registered id serves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -205,6 +344,14 @@ pub fn descriptor_for(variant: MageVariant) -> ModelDescriptor {
             } else {
                 Vec::new()
             },
+            // LoRA and LoKr both install through the one strict seam
+            // ([`crate::adapters::apply_mage_adapters`] → `apply_adapters_strict`), applied in
+            // [`assemble`] for EVERY variant — the adapter host is `MageTransformer`, which the
+            // edit and generate variants share verbatim. Stated as engine capability, not product
+            // exposure: which variants a user may attach an adapter to is decided by the catalog
+            // manifest's `loraCompatibility` and the router, not here (sc-15328).
+            supports_lora: true,
+            supports_lokr: true,
             // Q4/Q8 tiers are sc-14046; `&[]` means dense-only, which is what the scaffold is.
             supported_quants: &[Quant::Q4, Quant::Q8],
             min_size: MIN_SIZE,
@@ -220,10 +367,14 @@ pub fn descriptor_for(variant: MageVariant) -> ModelDescriptor {
 
 /// Construct a Mage-Flow generator from a [`LoadSpec`].
 ///
+/// `spec.adapters` carries LoRA/LoKr adapters to install on the DiT (sc-15328). They are applied
+/// during assembly, AFTER the per-component tier quantization, through the strict shared seam
+/// [`crate::adapters::apply_mage_adapters`] — stacked and mixed LoRA/LoKr, erroring rather than
+/// silently dropping an unmatched target. An empty `adapters` is the unchanged no-adapter load.
 pub fn load(variant: MageVariant, spec: &LoadSpec) -> Result<Box<dyn Generator>> {
-    if spec.precision != Precision::Bf16 || !spec.adapters.is_empty() {
+    if spec.precision != Precision::Bf16 {
         return Err(Error::Unsupported(
-            "mage_flow variants support bf16/Q4/Q8 checkpoints without adapters".into(),
+            "mage_flow variants support bf16/Q4/Q8 checkpoints".into(),
         ));
     }
     let root = match &spec.weights {
@@ -313,9 +464,23 @@ pub fn load(variant: MageVariant, spec: &LoadSpec) -> Result<Box<dyn Generator>>
 /// `load_from_native_dit_file`): a fine-tune is a caller-owned artifact at an arbitrary path, not
 /// a published id, so it is reached through this explicit API rather than by resolving an id.
 pub fn load_finetuned(variant: MageVariant, spec: &LoadSpec) -> Result<Box<dyn Generator>> {
-    if spec.precision != Precision::Bf16 || !spec.adapters.is_empty() {
+    if spec.precision != Precision::Bf16 {
         return Err(Error::Unsupported(
-            "mage_flow fine-tuned checkpoints load as bf16/Q4/Q8 without adapters".into(),
+            "mage_flow fine-tuned checkpoints load as bf16/Q4/Q8".into(),
+        ));
+    }
+    // Unlike [`load`], a fine-tuned checkpoint keeps refusing adapters (sc-15328). A Mage adapter is
+    // trained against, and its residual is calibrated for, the *published* base weights; a full
+    // fine-tune moves every DiT weight (sc-15277 measured ~96% of `img_in.weight` changed), so
+    // stacking one on top composes two independent deltas the pair was never fit for. Refused here,
+    // loudly and terminally, rather than silently honoured — and the router must not queue the
+    // combination in the first place.
+    if !spec.adapters.is_empty() {
+        return Err(Error::Unsupported(
+            "mage_flow fine-tuned checkpoints cannot take LoRA/LoKr adapters: the adapter is fit \
+             against the published base weights, which a full fine-tune has moved. Render the \
+             adapter on the base model, or use the fine-tune without adapters."
+                .into(),
         ));
     }
     let transformer = match &spec.weights {
@@ -366,11 +531,18 @@ fn assemble(
     } else {
         crate::vae::VaePart::Decode
     };
-    let pipeline = MageFlowPipeline::load_components(&dirs, spec.quantize.map(Quant::bits), part)?;
+    let mut pipeline =
+        MageFlowPipeline::load_components(&dirs, spec.quantize.map(Quant::bits), part)?;
+    // Install LoRA/LoKr adapters AFTER the per-component tier quantization (sc-15328), matching the
+    // Chroma/FLUX composition: the adapter is a forward-time residual over the quantized base, so a
+    // Q4/Q8 tier and a bf16 tier take the same path. No-op when `spec.adapters` is empty; any
+    // unmatched target errors loudly rather than being silently dropped (`apply_adapters_strict`).
+    crate::adapters::apply_mage_adapters(&mut pipeline.transformer, &spec.adapters)?;
     Ok(Box::new(MageFlow {
         variant,
         descriptor: descriptor_for(variant),
         tier: spec.quantize,
+        image_memory_contract: image_memory_contract(variant.id(), spec.quantize),
         pipeline,
     }))
 }
@@ -507,12 +679,142 @@ pub struct MageFlow {
     variant: MageVariant,
     descriptor: ModelDescriptor,
     tier: Option<Quant>,
+    image_memory_contract: ImageMemoryProviderContract,
     pipeline: MageFlowPipeline,
+}
+
+fn request_context_error(
+    provider_id: &str,
+    variant: MageVariant,
+    tier: Option<Quant>,
+    contract: &ImageMemoryProviderContract,
+    context: &ImageMemoryRunContext,
+) -> Option<String> {
+    if context.selection.tier.precision != Precision::Bf16 || context.selection.tier.quant != tier {
+        return Some(format!(
+            "{provider_id}: request tier {:?} does not match loaded BF16/{tier:?}",
+            context.selection.tier
+        ));
+    }
+    let expected_mode = if variant.is_edit() {
+        ImageMemoryMode::Edit
+    } else {
+        ImageMemoryMode::TextToImage
+    };
+    if context.mode != expected_mode {
+        return Some(format!(
+            "{provider_id}: request mode {:?} does not match {expected_mode:?}",
+            context.mode
+        ));
+    }
+    if context.calibration_abi != mlx_gen::gen_core::IMAGE_MEMORY_CALIBRATION_ABI
+        || context.calibration_fingerprint != IMAGE_MEMORY_CALIBRATION_FINGERPRINT
+    {
+        return Some(format!(
+            "{provider_id}: request calibration identity {}/{:?} does not match provider {}/{:?}",
+            context.calibration_abi,
+            context.calibration_fingerprint,
+            mlx_gen::gen_core::IMAGE_MEMORY_CALIBRATION_ABI,
+            IMAGE_MEMORY_CALIBRATION_FINGERPRINT
+        ));
+    }
+    if let Err(error) = contract.validate_selection(&context.selection) {
+        return Some(error.to_string());
+    }
+    if context.budget.total_bytes == 0 {
+        return Some(format!("{provider_id}: request budget is unavailable"));
+    }
+    let required_total_peak_bytes = (crate::memory::generation_peak_gb(
+        tier,
+        context.geometry.width,
+        context.geometry.height,
+        context.geometry.batch,
+    ) * 1_000_000_000.0)
+        .round() as u64;
+    let maximum_resident_credit = contract.asset_facts.base_bytes;
+    let credited_resident_bytes =
+        required_total_peak_bytes.saturating_sub(context.predicted_peak_bytes);
+    if context.predicted_peak_bytes > required_total_peak_bytes
+        || credited_resident_bytes > maximum_resident_credit
+        || credited_resident_bytes > context.budget.committed_bytes
+    {
+        return Some(format!(
+            "{provider_id}: caller peak {} is inconsistent with provider total {}, resident \
+             envelope {}, and committed bytes {}",
+            context.predicted_peak_bytes,
+            required_total_peak_bytes,
+            maximum_resident_credit,
+            context.budget.committed_bytes
+        ));
+    }
+    if !context.budget.fits(context.predicted_peak_bytes) {
+        return Some(format!(
+            "{provider_id}: predicted incremental peak {} exceeds effective budget {}",
+            context.predicted_peak_bytes,
+            context.budget.effective_bytes()
+        ));
+    }
+    None
 }
 
 impl Generator for MageFlow {
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
+    }
+
+    fn image_memory_contract(&self) -> Option<&ImageMemoryProviderContract> {
+        Some(&self.image_memory_contract)
+    }
+
+    fn image_memory_safety_check(
+        &self,
+        context: &ImageMemoryRunContext,
+    ) -> ImageMemorySafetyDecision {
+        if let Some(reason) = request_context_error(
+            self.descriptor.id,
+            self.variant,
+            self.tier,
+            &self.image_memory_contract,
+            context,
+        ) {
+            return ImageMemorySafetyDecision::Reject { reason };
+        }
+        let safe_gb = match crate::memory::production_safe_budget_gb() {
+            Ok(safe_gb) => safe_gb,
+            Err(error) => {
+                return ImageMemorySafetyDecision::Reject {
+                    reason: error.to_string(),
+                }
+            }
+        };
+        match crate::memory::ensure_generation_fits(
+            self.tier,
+            context.geometry.width,
+            context.geometry.height,
+            context.geometry.batch,
+            safe_gb,
+        ) {
+            Ok(()) => ImageMemorySafetyDecision::Accept,
+            Err(error) => ImageMemorySafetyDecision::Reject {
+                reason: error.to_string(),
+            },
+        }
+    }
+
+    fn begin_image_memory_request(
+        &self,
+        context: &ImageMemoryRunContext,
+    ) -> CoreResult<Option<Box<dyn ImageMemoryRequestScope + '_>>> {
+        if let ImageMemorySafetyDecision::Reject { reason } =
+            self.image_memory_safety_check(context)
+        {
+            return Err(CoreError::Unsupported(reason));
+        }
+        Ok(Some(Box::new(MageImageMemoryScope {
+            selection: context.selection,
+            geometry: context.geometry,
+            finished: false,
+        })))
     }
 
     fn validate(&self, req: &GenerationRequest) -> mlx_gen::gen_core::Result<()> {
@@ -557,6 +859,9 @@ impl Generator for MageFlow {
                     false,
                     on_progress,
                 )?;
+                if req.cancel.is_cancelled() {
+                    return Err(CoreError::Canceled);
+                }
                 mlx_rs::transforms::eval([&trace.image_u8]).map_err(Error::from)?;
                 images.push(Image {
                     width: req.width,
@@ -587,6 +892,9 @@ impl Generator for MageFlow {
             .pipeline
             .generate_batch_trace(&samples, steps as usize, cfg, &key, false, on_progress)?
             .samples;
+        if req.cancel.is_cancelled() {
+            return Err(CoreError::Canceled);
+        }
         let mut images = Vec::with_capacity(traces.len());
         for trace in traces {
             mlx_rs::transforms::eval([&trace.image_u8]).map_err(Error::from)?;
@@ -723,6 +1031,207 @@ mage_registrations! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_memory_contract_is_truthful_resident_only_mlx_adoption() {
+        use mlx_gen::gen_core::{ImageMemoryStrategySupport, IMAGE_MEMORY_CALIBRATION_ABI};
+
+        let contract = image_memory_contract("mage_flow", Some(Quant::Q4));
+        assert!(contract.conformance_errors().is_empty());
+        assert_eq!(contract.provider_id, "mage_flow");
+        assert_eq!(
+            contract
+                .calibration
+                .as_ref()
+                .map(|identity| (identity.abi, identity.fingerprint.as_str())),
+            Some((
+                IMAGE_MEMORY_CALIBRATION_ABI,
+                IMAGE_MEMORY_CALIBRATION_FINGERPRINT
+            ))
+        );
+        assert!(matches!(
+            contract
+                .capability(ImageMemoryStrategy::Resident)
+                .map(|capability| &capability.support),
+            Some(ImageMemoryStrategySupport::Implemented)
+        ));
+        for strategy in ImageMemoryStrategy::ALL
+            .into_iter()
+            .filter(|strategy| *strategy != ImageMemoryStrategy::Resident)
+        {
+            assert!(matches!(
+                contract
+                    .capability(strategy)
+                    .map(|capability| &capability.support),
+                Some(ImageMemoryStrategySupport::Missing)
+            ));
+        }
+        assert!(matches!(
+            contract.backend,
+            ImageMemoryBackendRealization::MlxMetal {
+                bounded_wired_residency: true,
+                lazy_or_mmap_materialization: true,
+                explicit_evaluation_and_synchronization: true,
+                cache_eviction: true,
+            }
+        ));
+    }
+
+    #[test]
+    fn resident_safety_recomputes_peak_and_binds_calibration_identity() {
+        use mlx_gen::gen_core::{
+            ImageMemoryBudget, ImageMemoryCacheState, ImageMemoryNumericTier,
+            ImageMemoryStrategyParameters, IMAGE_MEMORY_CALIBRATION_ABI,
+        };
+
+        let contract = image_memory_contract("mage_flow", Some(Quant::Q4));
+        let required = (crate::memory::generation_peak_gb(Some(Quant::Q4), 512, 512, 1)
+            * 1_000_000_000.0)
+            .round() as u64;
+        let valid = ImageMemoryRunContext {
+            selection: ImageMemorySelection {
+                strategy: ImageMemoryStrategy::Resident,
+                parameters: ImageMemoryStrategyParameters::default(),
+                tier: ImageMemoryNumericTier {
+                    precision: Precision::Bf16,
+                    quant: Some(Quant::Q4),
+                },
+            },
+            calibration_abi: IMAGE_MEMORY_CALIBRATION_ABI,
+            calibration_fingerprint: IMAGE_MEMORY_CALIBRATION_FINGERPRINT.to_owned(),
+            mode: ImageMemoryMode::TextToImage,
+            has_reference: false,
+            use_pid: false,
+            has_phases: false,
+            geometry: ImageMemoryGeometry {
+                width: 512,
+                height: 512,
+                batch: 1,
+                frames: 1,
+            },
+            overlay: None,
+            budget: ImageMemoryBudget {
+                total_bytes: required + 1_000_000_000,
+                committed_bytes: contract.asset_facts.base_bytes,
+                reclaimable_bytes: 0,
+                reserved_headroom_bytes: 0,
+            },
+            predicted_peak_bytes: required - contract.asset_facts.base_bytes,
+            cache_state: ImageMemoryCacheState::Warm,
+            evidence_revision: "test".to_owned(),
+        };
+        assert!(request_context_error(
+            "mage_flow",
+            MageVariant::Rl,
+            Some(Quant::Q4),
+            &contract,
+            &valid
+        )
+        .is_none());
+
+        let mut wrong_identity = valid.clone();
+        wrong_identity.calibration_fingerprint = "stale".to_owned();
+        assert!(request_context_error(
+            "mage_flow",
+            MageVariant::Rl,
+            Some(Quant::Q4),
+            &contract,
+            &wrong_identity
+        )
+        .unwrap()
+        .contains("calibration identity"));
+
+        let mut zero_zero = valid.clone();
+        zero_zero.budget.total_bytes = 0;
+        zero_zero.budget.committed_bytes = 0;
+        zero_zero.predicted_peak_bytes = 0;
+        assert!(request_context_error(
+            "mage_flow",
+            MageVariant::Rl,
+            Some(Quant::Q4),
+            &contract,
+            &zero_zero
+        )
+        .unwrap()
+        .contains("budget is unavailable"));
+
+        let mut underreported = valid;
+        underreported.predicted_peak_bytes = 0;
+        assert!(request_context_error(
+            "mage_flow",
+            MageVariant::Rl,
+            Some(Quant::Q4),
+            &contract,
+            &underreported
+        )
+        .unwrap()
+        .contains("inconsistent"));
+
+        let mut uncharged_resident_credit = underreported;
+        uncharged_resident_credit.predicted_peak_bytes = required - contract.asset_facts.base_bytes;
+        uncharged_resident_credit.budget.committed_bytes = 0;
+        uncharged_resident_credit.budget.total_bytes =
+            uncharged_resident_credit.predicted_peak_bytes;
+        assert!(request_context_error(
+            "mage_flow",
+            MageVariant::Rl,
+            Some(Quant::Q4),
+            &contract,
+            &uncharged_resident_credit
+        )
+        .unwrap()
+        .contains("committed bytes"));
+    }
+
+    #[test]
+    fn resident_scope_reapplies_request_state_after_cancel_cleanup() {
+        let selection = ImageMemorySelection {
+            strategy: ImageMemoryStrategy::Resident,
+            parameters: Default::default(),
+            tier: mlx_gen::gen_core::ImageMemoryNumericTier {
+                precision: Precision::Bf16,
+                quant: Some(Quant::Q4),
+            },
+        };
+        let geometry = ImageMemoryGeometry {
+            width: 1024,
+            height: 768,
+            batch: 3,
+            frames: 1,
+        };
+        let mut canceled = MageImageMemoryScope {
+            selection,
+            geometry,
+            finished: false,
+        };
+        let mut first = GenerationRequest {
+            prompt: "first".to_owned(),
+            width: 1024,
+            height: 768,
+            count: 1,
+            ..Default::default()
+        };
+        canceled.configure_request(&mut first).unwrap();
+        assert_eq!(first.memory, Some(GenerationMemory::default()));
+        canceled.finish(ImageMemoryRunOutcome::Canceled).unwrap();
+        assert!(canceled.finished);
+
+        let mut warm = MageImageMemoryScope {
+            selection,
+            geometry,
+            finished: false,
+        };
+        let mut follow_up = GenerationRequest {
+            prompt: "follow-up".to_owned(),
+            width: 1024,
+            height: 768,
+            count: 1,
+            ..Default::default()
+        };
+        warm.configure_request(&mut follow_up).unwrap();
+        warm.finish(ImageMemoryRunOutcome::Complete).unwrap();
+        assert!(warm.finished, "a warm follow-up owns fresh terminal state");
+    }
 
     /// sc-15154 — the footprint must follow the SPLIT layout's staged components, not the tier dir.
     ///
@@ -867,6 +1376,91 @@ mod tests {
         );
 
         std::fs::remove_dir_all(root).ok();
+    }
+
+    /// sc-15328 — `load` must ACCEPT `spec.adapters` (they install in [`assemble`] via
+    /// [`crate::adapters::apply_mage_adapters`]), while [`load_finetuned`] must keep refusing them
+    /// with a message that says why.
+    ///
+    /// Discriminating in both directions on one fixture, so neither half can pass vacuously:
+    ///
+    ///   * `load` carrying an adapter must get PAST the entry guard and fail on the *next* thing it
+    ///     checks — the published-checkpoint fingerprint. Restore `|| !spec.adapters.is_empty()` to
+    ///     `load`'s guard and this half fails, because the error becomes the `Unsupported` one.
+    ///   * `load_finetuned` carrying the same adapter must fail on the adapter refusal
+    ///     SPECIFICALLY — not on the missing components it would otherwise hit. Drop that guard and
+    ///     this half fails.
+    ///
+    /// The adapter path is deliberately nonexistent: neither call may get far enough to read it,
+    /// which is what makes the first half about the *guard* rather than about adapter loading.
+    #[test]
+    fn load_takes_adapters_while_a_fine_tuned_checkpoint_still_refuses_them() {
+        let root = std::env::temp_dir().join(format!(
+            "mage-adapters-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+        ));
+        write_identity_only_checkpoint(
+            &root
+                .join("transformer")
+                .join("diffusion_pytorch_model.safetensors"),
+            0x5a,
+        );
+        let adapters = vec![mlx_gen::runtime::AdapterSpec::new(
+            std::env::temp_dir().join("mage-adapter-never-read.safetensors"),
+            0.8,
+            mlx_gen::runtime::AdapterKind::Lora,
+        )];
+
+        let published = load_error(
+            load(
+                MageVariant::Base,
+                &LoadSpec::new(WeightsSource::Dir(root.clone())).with_adapters(adapters.clone()),
+            ),
+            "the fabricated checkpoint is not the pinned Base, so this must still fail",
+        );
+        assert!(
+            published.contains("checkpoint fingerprint mismatch"),
+            "an adapter must no longer be refused at `load`'s entry guard — it should reach the \
+             identity check like any other load, got: {published}"
+        );
+
+        let staged = std::env::temp_dir().join("mage-adapters-nonexistent-component");
+        let finetuned = load_error(
+            load_finetuned(
+                MageVariant::Base,
+                &LoadSpec::new(WeightsSource::Dir(root.clone()))
+                    .with_component(COMPONENT_TEXT_ENCODER, WeightsSource::Dir(staged.clone()))
+                    .with_component(COMPONENT_VAE, WeightsSource::Dir(staged))
+                    .with_adapters(adapters),
+            ),
+            "a fine-tuned checkpoint must not accept adapters",
+        );
+        assert!(
+            finetuned.contains("cannot take LoRA/LoKr adapters"),
+            "a fine-tune + adapter must be refused explicitly, and BEFORE the component staging it \
+             would otherwise trip over, got: {finetuned}"
+        );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// sc-15328 — the descriptor is the engine's capability statement, and every Mage variant hosts
+    /// adapters through the same `MageTransformer`. A variant that advertised neither would leave
+    /// the app's `supports_adapters()` reading `false` for a model that demonstrably takes them.
+    #[test]
+    fn every_variant_advertises_lora_and_lokr() {
+        for registration in REGISTRATIONS {
+            let descriptor = (registration.descriptor)();
+            assert!(
+                descriptor.capabilities.supports_lora && descriptor.capabilities.supports_lokr,
+                "{} must advertise supports_lora + supports_lokr: `assemble` installs both through \
+                 `apply_mage_adapters` for every variant",
+                descriptor.id
+            );
+        }
     }
 
     /// sc-15036 — the shared components are REQUIRED for a fine-tune and there is deliberately no

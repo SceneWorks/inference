@@ -1,0 +1,21 @@
+   Compiling mlx-gen-wan v0.0.0 (/private/tmp/codex-sc-15445-inference/crates/media/mlx-gen/mlx-gen-wan)
+    Finished `release` profile [optimized] target(s) in 0.46s
+     Running tests/wan_overlap_ab.rs (target/release/deps/wan_overlap_ab-16ee93cde914ccb6)
+
+running 1 test
+test wan_overlap_wall_time_and_quality_ab ...
+=== sc-15445 Wan overlap A/B ===
+family=Z48 weights=/Users/michael/.cache/huggingface/hub/models--SceneWorks--wan2.2-ti2v-5b-mlx/snapshots/bb1b055249614cf9d7cf4373fbdbc184b77dee88/vae.safetensors stimulus=normal(seed=15445)
+product=832x480x121 decoded=832x480x121 latent=[48, 31, 30, 52]
+spatial=192/64 old=48/16 current=48/24 reference=96/48
+iterations temporal/all: old=4/96 current=5/120 reference=2/48 repeats=3
+memory before VAE load: limit=121.600 GiB active=0.009 GiB cache=0.000 GiB
+memory after VAE load: limit=121.600 GiB active=0.009 GiB cache=0.000 GiB
+progress quality-only mode: skipping warm-up and repeated timing
+progress quality reference=206.870s
+progress quality old materialized
+progress quality current materialized
+RESULT family=Z48 bucket=832x480 product_frames=121 decoded_frames=121 tile=48 old_overlap=16 current_overlap=24 temporal_iterations=4=>5 all_iterations=96=>120 old_seconds_median=NaN old_seconds_range=NaN..NaN current_seconds_median=NaN current_seconds_range=NaN..NaN wall_ratio=NaN old_peak_gib=0.000 current_peak_gib=0.000 old_mae255=0.5729 current_mae255=0.4760 reference_clip_mean=0.1458 reference_clip_worst=2.7236 old_clip_mean=0.1504 old_clip_worst=2.7236 current_clip_mean=0.1488 current_clip_worst=2.7236 reference_seconds=206.870 reference_peak_gib=11.255
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 688.11s

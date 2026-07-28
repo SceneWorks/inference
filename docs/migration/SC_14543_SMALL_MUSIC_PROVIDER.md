@@ -42,7 +42,11 @@ the base-model pretraining path.
 
 Request validation rejects empty prompts, unsupported BPM/key/lyrics or other
 conditioning, duration/step/guidance values outside the descriptor, nonzero APG
-momentum, and guidance fields attached to the wrong method. Cancellation is
+momentum, and guidance fields attached to the wrong method. (Superseded in part
+by sc-14547: `Conditioning::ReferenceAudio` is now advertised and accepted on
+this and every other Stable Audio 3 id — see
+[`SC_14547_REFERENCE_AUDIO_RESTYLE.md`](SC_14547_REFERENCE_AUDIO_RESTYLE.md).)
+Cancellation is
 checked through text layers, DiT blocks, sampling steps, and every outer SAME
 chunk. Progress emits each sampling step followed by one decoding event.
 

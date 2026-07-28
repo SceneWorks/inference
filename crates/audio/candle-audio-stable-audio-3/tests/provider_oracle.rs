@@ -65,6 +65,26 @@ fn metrics(actual: &[f32], expected: &[f32]) -> (f64, f32, f64) {
     )
 }
 
+/// Deliberately CPU-pinned, in the same sense as `dit_oracle.rs`'s
+/// `all_six_cpu_f32_predictions_match_p0`, and **not** switched to the three-way `SA3_TEST_*`
+/// selector the rest of the crate's real-weight targets use.
+///
+/// This gate is bit-reproduction against a frozen Torch CPU-f32 artifact, not backend
+/// certification, and its design says so throughout: the noise is a portable host LCG
+/// ([`portable`]) precisely so no device RNG can enter, and the seed and step count are fixed. Its
+/// bounds are exact-reproduction-grade — latent cosine `>= 0.99999`, exact-latent decode
+/// `max_abs <= 1e-3` and `mean_abs <= 1e-4`, and `deltas_gt_0.1 == 0` across 1,323,000 stereo
+/// frames — measured on CPU f32 against a CPU f32 reference. A reduced-precision accelerator
+/// matmul contributes on the order of 1e-3 relative per op, compounded across eight sampler steps
+/// and a full VAE decode, so those bounds are calibrated on *this* device and would not hold on
+/// Metal or CUDA. Running this under the selector would convert a parity oracle into a flake.
+///
+/// The consequence is stated rather than hidden: `sa3-small-music-metal` selects this target while
+/// setting `SA3_TEST_METAL`, and this step alone does **not** certify Metal. The Metal small-music
+/// path is certified by that job's other steps — `conformance`'s registered-provider and
+/// concurrent-RNG cases, the stereo-width calibration sweep, and the 30 s render — every one of
+/// which resolves its device through `candle_audio::default_device()`. There is deliberately no
+/// CUDA counterpart of this step, for the same reason.
 #[test]
 #[ignore = "requires the pinned 3.45 GB small-music snapshot"]
 fn thirty_second_eight_step_provider_matches_frozen_torch() {

@@ -20,6 +20,7 @@ pub mod face;
 pub mod generator;
 pub mod guidance;
 pub mod image_embed;
+pub mod image_memory;
 pub mod imageops;
 pub mod json_constraint;
 pub mod license;
@@ -61,24 +62,38 @@ pub use face::{DetectedFace, FaceEmbedder, FaceEmbedderDescriptor};
 pub use generator::{
     default_seed, AudioEditMode, AudioEditRef, AudioParams, Capabilities, Conditioning,
     ConditioningKind, ControlClipRef, ControlKind, ConversationRole, ConversationSession,
-    ConversationTurn, GenerationOutput, GenerationPhase, GenerationRequest, Generator, KeyframeRef,
-    Modality, ModelDescriptor, PhaseAdapter, ReplacementMode, SpeechSegment, TimeRegion,
-    VideoClipRef,
+    ConversationTurn, GenerationMemory, GenerationOutput, GenerationPhase, GenerationRequest,
+    Generator, KeyframeRef, Modality, ModelDescriptor, PhaseAdapter, ReplacementMode,
+    SpeechSegment, TimeRegion, VideoClipRef,
 };
 pub use image_embed::{ImageEmbedder, ImageEmbedderDescriptor};
+pub use image_memory::{
+    ImageMemoryAssetFacts, ImageMemoryBackendRealization, ImageMemoryBudget,
+    ImageMemoryCacheSemantics, ImageMemoryCacheState, ImageMemoryCalibrationIdentity,
+    ImageMemoryCleanupSemantics, ImageMemoryConformanceState, ImageMemoryEvidence,
+    ImageMemoryEvidenceDimension, ImageMemoryEvidenceDimensions, ImageMemoryEvidenceKey,
+    ImageMemoryEvidenceVerdict, ImageMemoryFormulaKind, ImageMemoryFormulaVariable,
+    ImageMemoryGeometry, ImageMemoryLifecycleCapabilities, ImageMemoryMode, ImageMemoryNumericTier,
+    ImageMemoryParameterRanges, ImageMemoryParityContract, ImageMemoryParityResult,
+    ImageMemoryPhase, ImageMemoryProviderContract, ImageMemoryRejection, ImageMemoryRequestScope,
+    ImageMemoryRunContext, ImageMemoryRunOutcome, ImageMemoryRuntimeSemantics,
+    ImageMemorySafetyDecision, ImageMemorySelection, ImageMemoryStrategy,
+    ImageMemoryStrategyCapability, ImageMemoryStrategyParameters, ImageMemoryStrategySupport,
+    ImageMemoryWarmRunSemantics, IMAGE_MEMORY_CALIBRATION_ABI,
+};
 pub use json_constraint::JsonState;
 pub use license::{weight_licenses_manifest_json, WeightLicense, WeightLicenseEntry};
 pub use media::{AudioChunk, AudioStem, AudioTrack, Image};
 pub use mempolicy::{plan_memory_adaptation, LaneLevers, Lever, MemoryPlan, StagePeaks};
 pub use registry::{
     AudioEmbedderRegistration, AudioTransformRegistration, CaptionerRegistration,
-    ImageEmbedderRegistration, ModelRegistration, PerComponentBytes, ProviderRegistry,
-    ProviderRegistryBuilder, TextEmbedderRegistration, TrainerRegistration,
+    ImageEmbedderRegistration, ImageMemoryRegistration, ModelRegistration, PerComponentBytes,
+    ProviderRegistry, ProviderRegistryBuilder, TextEmbedderRegistration, TrainerRegistration,
     TranscriberRegistration, TransformRegistration, VoiceEmbedderRegistration,
 };
 pub use runtime::{
-    AdapterKind, AdapterSpec, CancelFlag, IdentityWeights, LoadPhase, LoadSpec, MoeExpert,
-    OffloadPolicy, PidWeights, Precision, Progress, Quant, WeightsSource,
+    AdapterApplyReport, AdapterKind, AdapterSpec, CancelFlag, IdentityWeights, LoadPhase, LoadSpec,
+    MoeExpert, OffloadPolicy, PidWeights, Precision, Progress, Quant, WeightsSource,
 };
 pub use text_embed::{TextEmbedder, TextEmbedderDescriptor};
 pub use tiling::{TilingConfig, VaeTiling};

@@ -259,6 +259,7 @@ pub fn plan_control_decode_tiling(
         spatial_px: &QWEN_DECODE_SPATIAL_PX,
         spatial_overlap_px: 64,
         temporal: &[], // still image — no temporal axis to tile
+        temporal_overlap_policy: mlx_gen::tiling::TemporalOverlapPolicy::HalfTile,
     };
     budgeted_plan(
         VaeTiling::QWEN_IMAGE,

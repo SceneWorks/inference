@@ -229,29 +229,183 @@ jobs:
         # links the seven real-weight-only binaries, which costs the lld budget above nothing but
         # time for zero executed cases.
         #
-        # The named seven and what they execute on a PR (measured, `cargo test -p
-        # candle-audio-stable-audio-3 --tests`): `sampler_oracle` 17, `dtype_policy` 2, `provider`
-        # 2, `conformance` 1, `primitive_oracle` 1, `same_oracle` 1, `variant_quality` 1 — 25
-        # weight-free cases. sc-14545 review found `sampler_oracle`, `same_oracle` and
-        # `primitive_oracle` running in no automatic lane at all (19 dark gates, pre-existing since
-        # sc-14543) and added them here.
+        # The named eleven and what they execute on a PR (measured, by running this step's exact
+        # command on the merged tree): `adapters` 36, `audio_edit` 20, `sampler_oracle` 17,
+        # `reference_audio` 7, `provider` 3, `listening_stimuli` 3, `dtype_policy` 2,
+        # `conformance` 1, `primitive_oracle` 1, `same_oracle` 1, `variant_quality` 1 — 92
+        # weight-free cases.
+        # sc-14545 review found
+        # `sampler_oracle`, `same_oracle` and `primitive_oracle` running in no automatic lane at all
+        # (19 dark gates, pre-existing since sc-14543) and added them here. sc-14546 adds
+        # `provider`'s third case, which asserts each `-base` side-ratio floor sits below the sweep
+        # minimum it was calibrated from. sc-15178 adds `listening_stimuli`'s three weight-free
+        # controls behind the listening protocol: one measures that an RMS-matched pair sits
+        # 6.71 LU apart under BS.1770-4 and that LUFS matching closes the gap (the evidence for the
+        # protocol specifying LUFS rather than RMS), the second replays the observed +0.031 dBTP
+        # inter-sample over that forced the loudness target to be peak-constrained, and the third
+        # (round-2 review) generates and digest-pins the screening practice contrast, which is the
+        # material behind the protocol's only performance-based inclusion criterion and was
+        # otherwise chosen per session. That target's two `#[ignore]`d cases — the stimulus
+        # generator itself, and the check of the committed `demo_cond` pool against the six pinned
+        # `model_config.json` files — run in no lane by design; the generator is a generator, not a
+        # gate, and everything derived from the pool is checked weight-free in
+        # `scripts/tests/test_sa3_listening_blind.py`.
+        #
+        # sc-14547 adds `reference_audio`, the audio→audio restyle target. Its seven weight-free
+        # cases carry the **sign gates** for that feature: the contract's
+        # `Conditioning::ReferenceAudio.strength` is retention-oriented and the sampler's is
+        # `init_noise_level`-oriented, so a silent inversion between them ships a feature that runs,
+        # emits plausible audio, and does the opposite of what was asked. There are three gates
+        # because there are three seams the value crosses and each is blind to the other two — three
+        # successive adversarial reviews each found the next one uncovered:
+        # `contract_strength_is_retention_and_a_flipped_sign_fails_here` catches a wrong
+        # *conversion*; `the_request_surface_hands_the_pipeline_the_converted_noise_level` catches a
+        # correct conversion whose value never travels — the provider building its `ReferenceAudio`
+        # from the retention `strength` instead of the converted `noise_level`; and
+        # `the_pipeline_hands_the_sampler_the_converted_noise_level_as_strength` catches the pipeline
+        # then handing the sampler `1.0 - noise_level`. That third one was silent to *both* the
+        # weight-free suite (the decision lived in a weights-only synthesis path) and the sampler's
+        # own `schedule[0] == strength` check, because `build_schedule` and the DiT sample call read
+        # one shared expression — first a forwarded `strength` argument, then a `let strength` local
+        # inside `sample` — so inverting it moved both sides of that comparison together. `sample`
+        # now calls `sampler_strength_for` inline at each of the two sites with no binding shared
+        # between them. All three gates are verified to fail under their own single-token mutation,
+        # not merely to pass under the correct code.
+        #
+        # sc-14550 adds `adapters`, the load-time adapter target, with 36 weight-free cases (four
+        # further cases are `#[ignore]`d and run on `sa3-base-identity-{metal,cuda}`). This target
+        # carries the whole eight-type family — `lora`, `dora-rows`, `dora-cols`, `bora` and their
+        # four `-xs` siblings, plus the legacy `dora` alias — because **no Stable Audio 3 adapter
+        # artifact exists on this machine or in any cache** (sc-15347), so every adapter it uses is
+        # synthesized by the suite in the on-disk format `src/adapters.rs` declares. That is a real
+        # exercise of the load -> validate -> plan -> fold path and explicitly NOT a real-weight
+        # claim.
+        #
+        # The two gates that carry the sign are the exact ones. `scale == 0.0` must resolve to an
+        # EMPTY plan, so the wrapper is never installed and the weights are byte-identical to an
+        # un-adapted load — the case additionally proves the hazard is real by showing the same
+        # adapter overflows to `inf` at scale 1.0, i.e. that a multiply-by-zero implementation would
+        # poison the checkpoint with NaN. And two adapters with different factors must render
+        # different weights. "The adapted weight differs from the base" is deliberately never a
+        # gate: a *misapplied* adapter differs too, usually by more, which is exactly the wrong-sign
+        # trap sc-14548 hit.
+        #
+        # `dora_stacks_do_not_commute_and_classic_lora_stacks_do` asserts BOTH directions, four
+        # orders of magnitude apart: classic LoRA's two orderings agree to F32 rounding (`< 1e-5`)
+        # because its delta is linear, while DoRA/BoRA disagree macroscopically (`> 1e-3`) because
+        # the strength sits inside the normalization. One direction alone would not prove the
+        # harness measures order rather than noise.
+        #
+        # sc-14549's start-late/stop-early finding is applied to the stack:
+        # `the_plan_preserves_request_order_at_both_ends` asserts the FIRST op's index is 0 and the
+        # LAST op's index is n-1 over a three-deep stack, so neither a loop that stops early nor one
+        # that starts late is invisible.
+        #
+        # sc-14549 adds eight cases to `audio_edit` (twelve -> twenty) for multi-region editing —
+        # several non-contiguous spans regenerated in ONE pass. The defect they exist to catch is
+        # "honours regions[0], silently drops the rest", which renders completely plausibly: one
+        # span genuinely regenerated, the rest of the clip preserved, right length, non-silent,
+        # finite, reproducible. Every well-formedness and divergence measurement passes.
+        #
+        # So the shape is sc-14548's carry-forward applied up front: hold everything constant except
+        # the thing under test, so a broken implementation collapses to IDENTITY rather than
+        # diverging. `relocating_region_two_relocates_its_mask_and_nothing_else` moves only
+        # regions[1] and requires the geometry and mask to change — a geometry derived from
+        # regions[0] alone is byte-identical between the two, so it fails by equality, not by a
+        # threshold. `merge_edit_regions_is_an_order_independent_disjoint_union` pins the union
+        # (order-independence over every permutation, touching-merges-too, sorted/disjoint output);
+        # `the_multi_region_geometry_and_keep_mask_cover_every_span` asserts the mask over the whole
+        # 1,146,880-sample buffer rather than at spot points, so a loop that zeroed only the first
+        # span fails on the second span's frames; `the_stitch_preserves_every_span_outside_the_union`
+        # covers the MIDDLE preserved span, which a stitch written against spans[0] destroys;
+        # `the_retained_latent_count_unions_overlapping_latent_ranges` pins that ceil(x/4096) is not
+        # injective so the count must union rather than sum — a count that wrongly reached zero
+        # would disarm `edit_local_conditioning_is_present` on exactly the geometry that needed it;
+        # `one_region_on_the_new_carrier_is_the_legacy_shape_exactly` is the "single-region callers
+        # are unchanged" acceptance criterion.
+        #
+        # The gen-core half rides the `contracts` job, not this one, and its headline case is
+        # `every_region_is_floored_not_just_the_first`: `first_nonfinite_float` destructures without
+        # `..` so a new *field* breaks the build, but a `Vec` defeats that mechanism entirely — a
+        # guard reaching only regions[0] compiles, passes every pre-existing test, and lets a NaN in
+        # region two poison the mask. Every malformed value in that case, and in the testkit's
+        # `check_multi_region_audio_edit`, sits in region TWO.
+        #
+        # sc-14548 adds `audio_edit`, the inpaint/repaint/extend target. Its twelve weight-free cases
+        # are the **whole** of the PR-time evidence for that feature: the DiT side was already
+        # landed and the story is the producer — mask construction, the 257-channel local
+        # conditioning, region resolution, and the PCM stitch — every part of which fails silently.
+        # A wrong mask polarity edits the complement of what was asked; a swapped concat order has
+        # the identical shape; a mask built at the un-adapted size or against the caller's own
+        # sample rate moves the edit window while every preservation assertion still passes; latent
+        # indices computed by rounding rather than derived from the resized mask are off by one
+        # frame at some boundaries and right at others. None of that changes an output's length,
+        # rate or finiteness.
+        #
+        # Two design decisions are what make this gateable in the PR lane at all, and both are the
+        # sc-14547 carry-forward applied up front rather than after three review rounds:
+        # `pipeline::edit_local_conditioning` takes the encoded source as a plain **tensor** instead
+        # of encoding it, so the entire mask -> resize -> multiply -> concat chain runs with
+        # synthetic latents and no weights; and `model::audio_edit_for` was written outside
+        # `generate` (which needs multi-gigabyte weights), so the mode + region -> `[start, end)`
+        # resolution is reachable here. `conditioning_is_forwarded` then makes a dropped forward
+        # fail closed at runtime rather than degrade silently to text-to-audio.
+        #
+        # Round-2 review added the last two cases, and they carry a seam that had no gate at all:
+        # `local = edit_local_conditioning(...)` -> `let _ = ...` inside `synthesize_traced` leaves
+        # the DiT's local conditioner as the zero tensor the text-only path allocates, so every
+        # inpaint/repaint/extend *interior* degrades to plain text-to-audio while the outside stays
+        # bit-exact and both real-weight divergence floors get **larger** — an unconditioned interior
+        # wanders further from the source and further between seeds, so those floors are
+        # wrong-signed against it and tightening them cannot help.
+        # `pipeline::edit_local_conditioning_is_present` now cross-checks the handoff where it
+        # crosses into `sample`, and `edit_geometry_matches_request` does the same for the
+        # weights-only `duration_secs` argument that sets the padding boundary. Both call sites need
+        # weights, exactly like `conditioning_is_forwarded`'s, so what runs here is the **rule**; the
+        # real-weight lane is where a zeroed handoff is refused, before sampling rather than after a
+        # plausible render.
+        #
+        # What these cases do **not** cover, stated rather than implied: every call site inside
+        # `StableAudio3Pipeline::synthesize_traced`, and the conditioning receipt built in
+        # `generate`. Those need weights; `real-weights.yml`'s `sa3-base-identity-{metal,cuda}` jobs
+        # are what catch them, and `docs/migration/SC_14548_AUDIO_EDIT_INPAINT.md` carries the
+        # per-site table — every row of which names a mechanism verified by running the mutation
+        # rather than by reading the code.
+        #
+        # Scope, stated precisely rather than as "the sign is gated at the contract endpoint": these
+        # three cases make the chain continuous from `GenerationRequest` to `sampler_strength_for` —
+        # conversion, field selection into `pipeline::ReferenceAudio`, and the strength decision
+        # itself, plus `pipeline::reference_halves_agree`, the rule that stops the encoded source and
+        # the reference from being forwarded apart. What they do **not** cover is the two
+        # `sampler_strength_for` call sites inside `StableAudio3Pipeline::sample`: that method needs
+        # weights, so no case here evaluates them. Editing one of them alone is rejected at runtime
+        # by `initialized_start`; editing both in the same way agrees with itself and is caught only
+        # by `real-weights.yml`. `docs/migration/SC_14547_REFERENCE_AUDIO_RESTYLE.md` carries the
+        # per-site mutation table.
         #
         # Deliberately **not** named, because every case in them is `#[ignore]`d behind a pinned
-        # multi-GB snapshot and the target would link for zero executed tests: `chunked_oracle`,
-        # `dit_oracle`, `provider_oracle`, `real_snapshots`, `text_oracle`, `variant_binding`,
-        # `variant_divergence`. Only four of those seven are selected by any `real-weights.yml`
-        # lane: `chunked_oracle`, `provider_oracle`, `variant_binding` and `variant_divergence`.
-        # `dit_oracle` (6 cases), `real_snapshots` (2) and `text_oracle` (2) are named by no
-        # `--test` flag and matched by no name filter in any workflow, so those 10 real-weight
-        # gates currently execute in **no** lane at all. That is pre-existing debt from
-        # sc-14537/sc-14543, unchanged by sc-14545; sc-15235 tracks wiring the three targets into
-        # `real-weights.yml`. Adding a non-ignored case to any of these seven means adding that
-        # target to the list above.
+        # multi-GB snapshot and the target would link for zero executed tests: `base_guidance`,
+        # `chunked_oracle`, `dit_oracle`, `provider_oracle`, `real_snapshots`, `text_oracle`,
+        # `variant_binding`, `variant_divergence`. Five of those eight are selected by a
+        # `real-weights.yml` lane: `chunked_oracle`, `provider_oracle`, `variant_divergence`, and —
+        # new in sc-14546 — `variant_binding` and `base_guidance`, both on the
+        # `sa3-base-identity-{metal,cuda}` jobs, which are the only lanes that provision all six
+        # pinned snapshots. `dit_oracle` (6 cases), `real_snapshots` (2) and `text_oracle` (2) are
+        # named by no `--test` flag and matched by no name filter in any workflow, so those 10
+        # real-weight gates still execute in **no** lane at all. That is pre-existing debt from
+        # sc-14537/sc-14543; sc-15235 tracks wiring the three targets into `real-weights.yml`.
+        # sc-14546 did clear two adjacent items of that debt: `sampler_oracle`'s
+        # `all_six_real_p0_pingpong_trajectories_match_stepwise` and
+        # `real_sampler_cfg_apg_scale_phi_matches_frozen_upstream` also ran in no lane and are now
+        # named on the same two jobs. Adding a non-ignored case to any of these eight means adding
+        # that target to the list above.
         run: >-
           cargo test --locked -j 1
           -p candle-audio-stable-audio-3
           --test provider --test dtype_policy --test variant_quality --test conformance
           --test sampler_oracle --test same_oracle --test primitive_oracle
+          --test listening_stimuli --test reference_audio --test audio_edit
+          --test adapters
           -- --nocapture
       - name: Test LLM-only CPU bundle
         run: cargo test --locked --no-default-features --lib -p runtime-cpu

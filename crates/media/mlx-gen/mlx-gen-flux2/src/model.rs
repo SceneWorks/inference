@@ -648,6 +648,37 @@ mlx_gen::impl_generator!(Flux2 {
     generate: generate_impl,
 });
 
+/// Resolve the classifier-free negative branch for a request.
+///
+/// All Klein variants share this path (txt2img, edit, and KV edit): an explicit guidance scale above
+/// one enables the second forward and must encode the caller's negative prompt verbatim. An unset
+/// prompt preserves the historical single-space unconditional condition. Dev uses embedded guidance
+/// and therefore never creates this branch.
+fn cfg_negative_prompt(
+    variant: Flux2Variant,
+    guidance: f32,
+    req: &GenerationRequest,
+) -> Option<&str> {
+    if !variant.uses_embedded_guidance() && guidance > 1.0 {
+        Some(req.negative_prompt.as_deref().unwrap_or(" "))
+    } else {
+        None
+    }
+}
+
+/// Apply [`cfg_negative_prompt`] to the text-encoding seam. This stays generic so the request-to-text
+/// handoff (including exact empty/unset semantics) is testable without loading a tokenizer or weights.
+fn encode_cfg_negative_with<T, E>(
+    variant: Flux2Variant,
+    guidance: f32,
+    req: &GenerationRequest,
+    mut encode: impl FnMut(&str) -> std::result::Result<T, E>,
+) -> std::result::Result<Option<T>, E> {
+    cfg_negative_prompt(variant, guidance, req)
+        .map(&mut encode)
+        .transpose()
+}
+
 impl Flux2 {
     /// The rich-`Result` body behind [`Generator::generate`]. Kept on the crate's own
     /// [`mlx_gen::Error`] so the `?` operator lifts both `mlx_rs` device exceptions and the family
@@ -696,14 +727,12 @@ impl Flux2 {
                 }
                 let (prompt_embeds, text_ids) =
                     self.encode(tokenizer, &text.text_encoder, &prompt)?;
-                // True-CFG dual-forward only for the (non-embedded-guidance) base path at guidance >1;
+                // Classifier-free dual-forward only for the non-embedded-guidance path at guidance >1;
                 // dev routes its scale through the embedded guidance embedder instead, so it never takes
                 // a negative pass, and distilled klein runs at guidance 1.0 (also no negative).
-                let negative = if !self.variant.uses_embedded_guidance() && guidance > 1.0 {
-                    Some(self.encode(tokenizer, &text.text_encoder, " ")?)
-                } else {
-                    None
-                };
+                let negative = encode_cfg_negative_with(self.variant, guidance, req, |negative| {
+                    self.encode(tokenizer, &text.text_encoder, negative)
+                })?;
                 Ok((prompt_embeds, text_ids, negative))
             },
             // Materialize the (TE-dependent) embeds while the encoder is still alive (Sequential only) —
@@ -1139,6 +1168,114 @@ mod tests {
             ..Default::default()
         };
         model.validate(&req).unwrap();
+    }
+
+    #[test]
+    fn klein_variants_advertise_the_negative_branch_they_render() {
+        for variant in [
+            Flux2Variant::Klein9b,
+            Flux2Variant::Klein9bEdit,
+            Flux2Variant::Klein9bKvEdit,
+        ] {
+            let descriptor = variant.descriptor();
+            assert!(
+                descriptor.capabilities.supports_negative_prompt,
+                "{} runs a negative forward at guidance > 1",
+                variant.id()
+            );
+            assert!(descriptor.capabilities.supports_guidance);
+            assert!(
+                !descriptor.capabilities.supports_true_cfg,
+                "{} does not consume the separate request.true_cfg knob",
+                variant.id()
+            );
+            descriptor
+                .capabilities
+                .validate_request(
+                    variant.id(),
+                    &GenerationRequest {
+                        prompt: "a portrait".into(),
+                        guidance: Some(2.5),
+                        negative_prompt: Some("watermark, blur".into()),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn klein_cfg_branch_encodes_the_supplied_negative_verbatim() {
+        let supplied = GenerationRequest {
+            negative_prompt: Some("watermark, blur".into()),
+            ..Default::default()
+        };
+        let empty = GenerationRequest {
+            negative_prompt: Some(String::new()),
+            ..Default::default()
+        };
+        let unset = GenerationRequest::default();
+
+        for variant in [
+            Flux2Variant::Klein9b,
+            Flux2Variant::Klein9bEdit,
+            Flux2Variant::Klein9bKvEdit,
+        ] {
+            assert_eq!(
+                cfg_negative_prompt(variant, 2.0, &supplied),
+                Some("watermark, blur"),
+                "{} must not replace the user's negative prompt with a hardcoded blank",
+                variant.id()
+            );
+            assert_eq!(
+                cfg_negative_prompt(variant, 2.0, &empty),
+                Some(""),
+                "{} must preserve an explicitly empty negative prompt",
+                variant.id()
+            );
+            assert_eq!(
+                cfg_negative_prompt(variant, 2.0, &unset),
+                Some(" "),
+                "{} preserves the historical unconditional prompt when unset",
+                variant.id()
+            );
+            assert_eq!(cfg_negative_prompt(variant, 1.0, &supplied), None);
+
+            let mut encoded = Vec::new();
+            let branch = encode_cfg_negative_with(variant, 2.0, &supplied, |prompt| {
+                encoded.push(prompt.to_owned());
+                Ok::<_, ()>(prompt.len())
+            })
+            .unwrap();
+            assert_eq!(encoded, ["watermark, blur"]);
+            assert_eq!(
+                branch,
+                Some("watermark, blur".len()),
+                "{} must create a conditional branch from the supplied text",
+                variant.id()
+            );
+        }
+
+        for variant in [Flux2Variant::Dev, Flux2Variant::DevEdit] {
+            assert_eq!(
+                cfg_negative_prompt(variant, 4.0, &supplied),
+                None,
+                "{} uses embedded guidance and must remain single-forward",
+                variant.id()
+            );
+            let mut called = false;
+            let branch = encode_cfg_negative_with(variant, 4.0, &supplied, |_| {
+                called = true;
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+            assert_eq!(branch, None);
+            assert!(
+                !called,
+                "{} must not invoke the negative encoder",
+                variant.id()
+            );
+        }
     }
 
     // ---- sc-2365 FLUX.2-dev T2I wiring ---------------------------------------------------------

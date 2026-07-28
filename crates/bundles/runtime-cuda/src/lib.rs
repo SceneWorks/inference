@@ -5,7 +5,9 @@ pub use candle_audio_catalog::audio;
 #[cfg(feature = "media")]
 pub use candle_gen_catalog::media;
 pub use candle_llm as llm;
-pub use runtime_catalog::{core_llm, gen_core, RuntimeCatalog, RuntimeCatalogSnapshot};
+pub use runtime_catalog::{
+    core_llm, gen_core, image_memory, RuntimeCatalog, RuntimeCatalogSnapshot,
+};
 
 /// The Candle backend crates this platform owns, re-exported from the media catalog
 /// (available under the default `media` feature).
@@ -111,7 +113,9 @@ mod tests {
         // mmaudio_large_44k (44.1 kHz, sc-13441), stable_audio_3_small_music (text-to-music,
         // sc-14543) + stable_audio_3_small_sfx (text-to-SFX/Foley, sc-14544 — 44.1 kHz stereo,
         // distinct from the 48 kHz mono moss_sfx_v2) + stable_audio_3_medium (sc-14545 — 1.45B
-        // differential DiT over SAME-L, both domains, 380 s), and moss_ttsd_v05
+        // differential DiT over SAME-L, both domains, 380 s) + the three pre-trained -base
+        // siblings stable_audio_3_{small_music,small_sfx,medium}_base (sc-14546 —
+        // rectified_flow, Euler/50/7.0 defaults), and moss_ttsd_v05
         // (multi-speaker dialogue TTS, sc-13518), plus the
         // voice-cloning identity embedder chatterbox_ve (sc-12844); later stories extend these exact
         // assertions in catalog order. The lane carries its own composed candle preparer
@@ -131,6 +135,9 @@ mod tests {
                     "stable_audio_3_small_music",
                     "stable_audio_3_small_sfx",
                     "stable_audio_3_medium",
+                    "stable_audio_3_small_music_base",
+                    "stable_audio_3_small_sfx_base",
+                    "stable_audio_3_medium_base",
                     "moss_tts_realtime",
                     "chatterbox_tts",
                     "mmaudio_small_16k",
@@ -232,6 +239,9 @@ mod tests {
                 "stable_audio_3_small_music",
                 "stable_audio_3_small_sfx",
                 "stable_audio_3_medium",
+                "stable_audio_3_small_music_base",
+                "stable_audio_3_small_sfx_base",
+                "stable_audio_3_medium_base",
                 "moss_tts_realtime",
                 "chatterbox_tts",
                 "mmaudio_small_16k",

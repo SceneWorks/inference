@@ -93,14 +93,18 @@ fn medium_variant_descriptor_and_schedule() {
     assert_eq!(v.id(), SD3_5_MEDIUM_ID);
     assert_eq!(v.hf_model(), "stabilityai/stable-diffusion-3.5-medium");
     assert_eq!(v.arch(), Sd3Arch::medium());
-    // Medium is true-CFG (negative prompt + guidance), unlike Turbo.
-    assert!(v.supports_true_cfg());
+    // Medium uses classifier-free guidance (negative prompt + guidance), unlike Turbo.
+    assert!(v.uses_classifier_free_guidance());
     assert!(v.default_guidance() > 1.0);
     assert!(v.default_steps() >= 20);
     let d = v.descriptor();
     assert_eq!(d.id, SD3_5_MEDIUM_ID);
     assert!(d.capabilities.supports_negative_prompt);
     assert!(d.capabilities.supports_guidance);
+    assert!(
+        !d.capabilities.supports_true_cfg,
+        "request.true_cfg is not consumed"
+    );
     // pos_embed_max 384 → 1440²-capable; descriptor advertises max_size 1440.
     assert!(d.capabilities.max_size >= 1440);
 }

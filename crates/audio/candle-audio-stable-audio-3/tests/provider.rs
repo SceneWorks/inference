@@ -41,6 +41,29 @@ const CASES: &[Case] = &[
         prompt: "Meditative lo-fi ambient piano jazz, soft acoustic drum kit",
         wav_out: "SA3_MEDIUM_WAV_OUT",
     },
+    // sc-14546. Prompt sourcing deliberately breaks the "use the checkpoint's own `demo_cond`"
+    // convention on two of the three: `small-sfx-base` ships the *music-base* prompt list unchanged
+    // (a copy-paste in the shipped config), and `medium-base` ships no `demo_cond` at all. Both
+    // therefore take their post-trained sibling's shipped prompt — same domain, same lineage — while
+    // `small-music-base` uses its own first `demo_cond` entry. See `tests/conformance.rs`.
+    Case {
+        variant: Variant::SmallMusicBase,
+        env: "SA3_SMALL_MUSIC_BASE_SNAPSHOT",
+        prompt: "A beautiful piano arpeggio grows into a grand cinematic climax",
+        wav_out: "SA3_SMALL_MUSIC_BASE_WAV_OUT",
+    },
+    Case {
+        variant: Variant::SmallSfxBase,
+        env: "SA3_SMALL_SFX_BASE_SNAPSHOT",
+        prompt: "Futuristic laser blast, sharp energy pulse, stereo movement, arcade style",
+        wav_out: "SA3_SMALL_SFX_BASE_WAV_OUT",
+    },
+    Case {
+        variant: Variant::MediumBase,
+        env: "SA3_MEDIUM_BASE_SNAPSHOT",
+        prompt: "Meditative lo-fi ambient piano jazz, soft acoustic drum kit",
+        wav_out: "SA3_MEDIUM_BASE_WAV_OUT",
+    },
 ];
 
 fn snapshot(env: &str) -> WeightsSource {
@@ -55,6 +78,25 @@ fn request(prompt: &str, duration: f32, steps: u32, seed: u64) -> GenerationRequ
         seed: Some(seed),
         steps: Some(steps),
         sampler: Some("pingpong".into()),
+        audio: Some(AudioParams {
+            target_duration: Some(duration),
+            sample_rate: Some(44_100),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+/// A request that omits `steps`, `sampler` and `guidance` entirely.
+///
+/// This is the only shape that exercises what sc-14546 actually changed: the provider resolves the
+/// variant's own operating point — Pingpong / 8 / 1.0 on a post-trained id, Euler / 50 / 7.0 on a
+/// `-base` id. `request` above pins all three explicitly and would therefore pass unchanged if the
+/// per-variant defaults were reverted.
+fn default_request(prompt: &str, duration: f32, seed: u64) -> GenerationRequest {
+    GenerationRequest {
+        prompt: prompt.into(),
+        seed: Some(seed),
         audio: Some(AudioParams {
             target_duration: Some(duration),
             sample_rate: Some(44_100),
@@ -211,14 +253,30 @@ const fn minimum_side_ratio(variant: Variant) -> f64 {
         Variant::SmallMusic => MUSIC_SIDE_RATIO_FLOOR,
         Variant::SmallSfx => SFX_SIDE_RATIO_FLOOR,
         Variant::Medium => MEDIUM_SIDE_RATIO_FLOOR,
+        Variant::SmallMusicBase => MUSIC_BASE_SIDE_RATIO_FLOOR,
+        Variant::SmallSfxBase => SFX_BASE_SIDE_RATIO_FLOOR,
+        Variant::MediumBase => MEDIUM_BASE_SIDE_RATIO_FLOOR,
     }
 }
 
-/// The one configuration every side-ratio number in this file is measured at, and the one the CI
-/// render steps enforce at. Kept as constants so the sweep's default and the workflow's render
-/// cannot drift apart silently.
+/// The one configuration every post-trained side-ratio number in this file is measured at, and the
+/// one the CI render steps enforce at. Kept as constants so the sweep's default and the workflow's
+/// render cannot drift apart silently.
 const CALIBRATION_DURATION_SECS: f32 = 30.0;
 const CALIBRATION_STEPS: u32 = 8;
+
+/// The duration the three `-base` floors are both calibrated and enforced at (sc-14546).
+///
+/// Shorter than [`CALIBRATION_DURATION_SECS`] on purpose, and the reason is arithmetic rather than
+/// convenience: a base render resolves to 50 Euler steps at guidance 7, which is a **batch-2** CFG
+/// forward per step, so it is 100 DiT forwards against the post-trained gate's 8. At 30 s a
+/// 25-sample medium-base sweep would run for hours on the self-hosted Mac. 10 s keeps the same
+/// 25-sample structure, and — the part that matters — the render gate enforces at exactly this
+/// duration, so calibration and enforcement still cannot drift apart.
+///
+/// Steps, sampler and guidance are deliberately **not** constants here: the base gates omit all
+/// three so the provider resolves them, which is the behaviour under test.
+const BASE_CALIBRATION_DURATION_SECS: f32 = 10.0;
 
 /// Set from the 25-sample SFX sweep (five prompts x five seeds) in
 /// [`sfx_stereo_width_floor_is_calibrated_across_prompts_and_seeds`], run at the enforced
@@ -312,6 +370,63 @@ const MEDIUM_SIDE_RATIO_FLOOR: f64 = 5e-5;
 /// Kept as a constant so the relationship between the measurement and
 /// [`MEDIUM_SIDE_RATIO_FLOOR`] is an executed assertion rather than a number repeated in prose.
 const MEDIUM_MEASURED_MINIMUM: f64 = 1.02879e-4;
+
+/// Set from the 25-sample `small-music-base` sweep in
+/// [`music_base_stereo_width_floor_is_calibrated_across_prompts_and_seeds`], run at the enforced
+/// [`BASE_CALIBRATION_DURATION_SECS`] with the variant's own resolved defaults (Euler / 50 / 7.0)
+/// on Metal:
+///
+/// | backend | min global | min median-window |
+/// |---|---:|---:|
+/// | Metal | 1.08094e-1 | 9.48902e-2 |
+///
+/// Like the post-trained music checkpoint, the base renders a genuinely wide image across its own
+/// prompt space — 24 of the 25 samples land between 2.4e-1 and 1.31, and only `"lofi house loop"`
+/// at two seeds drops to ~1e-1. The floor is left at the same shipped `1e-2` the post-trained music
+/// variant uses, 9.49x below the measured minimum, because this is a **duplicated-mono** gate and
+/// not a stereo-width bar: raising it into the measured distribution would gate honest output.
+const MUSIC_BASE_SIDE_RATIO_FLOOR: f64 = 1e-2;
+
+/// Set from the 25-sample `small-sfx-base` sweep, same configuration:
+///
+/// | backend | min global | min median-window |
+/// |---|---:|---:|
+/// | Metal | 4.84982e-4 | 4.28519e-4 |
+///
+/// Almost exactly the post-trained SFX distribution (Metal minimum 4.78244e-4 there), which is
+/// itself worth knowing: adversarial post-training did not change this checkpoint's stereo
+/// behaviour on its own prompt space. The floor is therefore the same `2e-4`, sitting 2.14x below
+/// the measured minimum — the same margin the specialist uses, and strong enough to reject the
+/// sc-14544 `near_mono` control.
+const SFX_BASE_SIDE_RATIO_FLOOR: f64 = 2e-4;
+
+/// Set from the 25-sample `medium-base` sweep, same configuration:
+///
+/// | backend | min global | min median-window |
+/// |---|---:|---:|
+/// | Metal | 8.9760e-5 | 8.6704e-5 |
+///
+/// Medium-base reproduces post-trained medium's two-domain split even more sharply: the three music
+/// prompts and the `"warm cinematic post-rock"` prompt all land between 2.3e-1 and 2.12, while
+/// `"Dog barking next to a waterfall"` collapses to ~1.2e-4 at three of five seeds and `"Running
+/// footsteps on pavement"` to ~9e-5 at three of five. So this floor carries the same honest caveat
+/// [`MEDIUM_SIDE_RATIO_FLOOR`] does and no more: at `5e-5` it is a **near-mono detector**, strictly
+/// stronger than "the side signal is not exactly zero" but weaker than
+/// [`SFX_SIDE_RATIO_FLOOR`] — the sc-14544 `near_mono` control at ~1.4e-4 passes it. Raising it to
+/// SFX strength would reject this checkpoint's own honest sparse-SFX output at six of 25 samples.
+/// The bracketing controls in [`the_medium_side_ratio_floor_is_a_near_mono_detector_not_a_width_bar`]
+/// apply verbatim, because the constant is the same value.
+const MEDIUM_BASE_SIDE_RATIO_FLOOR: f64 = 5e-5;
+
+/// The lowest per-window median each base sweep produced (Metal, 10 s at the variant defaults).
+///
+/// Kept as constants so the relationship between the measurement and the enforced floor is an
+/// executed assertion — [`base_side_ratio_floors_sit_below_their_measured_minima`] — rather than a
+/// number repeated in prose. The sweeps re-check them against a live run and fail on >25% drift, so
+/// they cannot rot into decoration either.
+const MUSIC_BASE_MEASURED_MINIMUM: f64 = 9.48902e-2;
+const SFX_BASE_MEASURED_MINIMUM: f64 = 4.28519e-4;
+const MEDIUM_BASE_MEASURED_MINIMUM: f64 = 8.67040e-5;
 
 /// Every shape/quality gate a registered SA3 small variant must satisfy on real weights.
 fn assert_real_audio(variant: Variant, track: &AudioTrack, duration: f32) {
@@ -438,6 +553,122 @@ fn run_case(case: &Case) {
 
     if let Some(path) = std::env::var_os(case.wav_out) {
         candle_audio::wav::write_wav_pcm16(&PathBuf::from(path), &track).expect("write WAV");
+    }
+}
+
+/// The `-base` render gate: everything the provider is allowed to default is left unset.
+///
+/// What this proves that [`run_case`] cannot:
+///
+/// * the resolved step count is the variant's own — asserted against the `Progress::Step` totals the
+///   pipeline reports, which come from the resolved `SynthesisParameters` and not from the request;
+/// * omitting `sampler` reaches Euler rather than Pingpong — proved by rendering the *same* seed
+///   with `sampler: Some("euler")` and with `sampler: Some("pingpong")` and requiring the defaulted
+///   render to be byte-identical to the first and different from the second. Pingpong draws one
+///   full-latent random tensor per step off the same request-local stream, so the two solvers cannot
+///   produce the same PCM by accident;
+/// * omitting `guidance` reaches the base default rather than `1.0` — proved by an explicit
+///   `guidance: Some(1.0)` render differing from the defaulted one.
+///
+/// Then the ordinary `assert_real_audio` shape/quality gate runs on the defaulted output.
+fn run_default_case(case: &Case) {
+    let variant = case.variant;
+    let generator = candle_audio_stable_audio_3::provider_registry()
+        .expect("provider registry")
+        .load(variant.model_id(), &LoadSpec::new(snapshot(case.env)))
+        .expect("strict registered variant-bound load");
+    assert_eq!(generator.descriptor().id, variant.model_id());
+
+    let duration = env_f32("SA3_TEST_DURATION", BASE_CALIBRATION_DURATION_SECS);
+    let prompt = std::env::var("SA3_TEST_PROMPT").unwrap_or_else(|_| case.prompt.to_owned());
+    let seed = std::env::var("SA3_TEST_SEED")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(42u64);
+    let expected_steps = variant.default_steps() as u32;
+
+    let mut seen_steps = Vec::new();
+    let mut decoding = 0usize;
+    let started = std::time::Instant::now();
+    let output = generator
+        .generate(
+            &default_request(&prompt, duration, seed),
+            &mut |progress| match progress {
+                Progress::Step { current, total } => seen_steps.push((current, total)),
+                Progress::Decoding => decoding += 1,
+                Progress::Loading(_) => {}
+            },
+        )
+        .expect("connected generation at the variant's own defaults");
+    let elapsed = started.elapsed();
+    assert_eq!(
+        seen_steps,
+        (1..=expected_steps)
+            .map(|current| (current, expected_steps))
+            .collect::<Vec<_>>(),
+        "{}: an omitted `steps` must resolve to this variant's own default",
+        variant.model_id()
+    );
+    assert_eq!(decoding, 1);
+    let defaulted = match output {
+        GenerationOutput::Audio(track) => track,
+        other => panic!("expected audio, got {other:?}"),
+    };
+    eprintln!(
+        "{}: defaults steps={expected_steps} guidance={} sampler={:?} seconds={duration} \
+         wall_clock_s={:.3}",
+        variant.model_id(),
+        variant.default_guidance(),
+        variant.recommended_sampler(),
+        elapsed.as_secs_f64()
+    );
+    assert_real_audio(variant, &defaulted, duration);
+
+    // The omitted-sampler proof. Both controls run at the resolved step count and guidance so the
+    // *only* thing that varies is the solver.
+    let with = |sampler: Option<&str>, guidance: Option<f32>| {
+        let mut request = default_request(&prompt, duration, seed);
+        request.steps = Some(expected_steps);
+        request.sampler = sampler.map(str::to_owned);
+        request.guidance = Some(guidance.unwrap_or(variant.default_guidance() as f32));
+        match generator
+            .generate(&request, &mut |_| {})
+            .expect("control render")
+        {
+            GenerationOutput::Audio(track) => track.samples,
+            other => panic!("expected audio, got {other:?}"),
+        }
+    };
+    let euler = with(Some("euler"), None);
+    let pingpong = with(Some("pingpong"), None);
+    assert_eq!(
+        defaulted.samples,
+        euler,
+        "{}: an omitted `sampler` must resolve to Euler — the defaulted render is not byte-identical \
+         to the explicit-Euler render at the same seed",
+        variant.model_id()
+    );
+    assert_ne!(
+        euler,
+        pingpong,
+        "{}: Euler and Pingpong produced identical PCM at the same seed, so the assertion above \
+         proves nothing about which solver ran",
+        variant.model_id()
+    );
+
+    // The omitted-guidance proof: `1.0` is the one value at which the DiT takes its batch-1 branch,
+    // so a base render that silently fell back to it is a materially different computation.
+    let unguided = with(Some("euler"), Some(1.0));
+    assert_ne!(
+        defaulted.samples,
+        unguided,
+        "{}: an omitted `guidance` must resolve to {} rather than 1.0",
+        variant.model_id(),
+        variant.default_guidance()
+    );
+
+    if let Some(path) = std::env::var_os(case.wav_out) {
+        candle_audio::wav::write_wav_pcm16(&PathBuf::from(path), &defaulted).expect("write WAV");
     }
 }
 
@@ -726,15 +957,28 @@ const MUSIC_SWEEP_PROMPTS: &[&str] = &[
     "warm cinematic post-rock with bowed strings and restrained drums",
 ];
 
-/// The medium sweep deliberately spans **both** domains: two shipped music `demo_cond` prompts from
-/// medium's own `model_config.json`, two shipped SFX `demo_cond` prompts from `small-sfx`, and the
-/// prompt medium's per-run gate renders. Medium is the only SA3 checkpoint tagged for both domains,
-/// so a floor calibrated on music alone would not cover what this id is registered to serve.
+/// The medium sweep deliberately spans **both** domains: **both** shipped music `demo_cond` prompts
+/// from medium's own `model_config.json` — it ships exactly two, so this is the entire list and not
+/// a selection from it — two shipped SFX `demo_cond` prompts from `small-sfx`, and the prompt
+/// medium's per-run gate renders. Medium is the only SA3 checkpoint tagged for both domains, so a
+/// floor calibrated on music alone would not cover what this id is registered to serve.
 const MEDIUM_SWEEP_PROMPTS: &[&str] = &[
     "Meditative lo-fi ambient piano jazz, soft acoustic drum kit",
     "A tropical house track with upbeat melodies, a driving bassline, and cheery vibes",
     "Dog barking next to a waterfall",
     "Running footsteps on pavement, fast pace, urban street environment, energetic motion sound",
+    "warm cinematic post-rock with bowed strings and restrained drums",
+];
+
+/// `small-music-base`'s own four shipped `demo_cond` prompts, plus one shared music prompt.
+///
+/// The first entry is `CASES[3].prompt` verbatim, so the sweep calibrates the configuration the
+/// per-run gate operates at. This is the one base checkpoint whose shipped prompts are usable.
+const MUSIC_BASE_SWEEP_PROMPTS: &[&str] = &[
+    "A beautiful piano arpeggio grows into a grand cinematic climax",
+    "Elegant and sophisticated Latin jazz piece with a Cuban base and a whispered melodic female voice",
+    "Amen break 174 BPM",
+    "lofi house loop",
     "warm cinematic post-rock with bowed strings and restrained drums",
 ];
 
@@ -941,4 +1185,192 @@ fn connected_short_generation_is_stereo_finite_and_exact_length() {
 #[ignore = "real 3.45 GB weights; set SA3_SMALL_SFX_SNAPSHOT"]
 fn connected_sfx_generation_is_stereo_finite_and_exact_length() {
     run_case(&CASES[1]);
+}
+
+/// Drive one `-base` variant over its prompt space **at its own resolved defaults** and calibrate
+/// the floor the per-run gate enforces.
+///
+/// Identical in structure to [`calibrate_side_ratio_floor`], with one deliberate difference: the
+/// request omits `steps`, `sampler` and `guidance`, so every sample is rendered by the same
+/// Euler / 50 / 7.0 path the render gate enforces at. A floor measured with an explicit
+/// `pingpong` / 8 / 1.0 request and enforced on a defaulted render would not be a calibrated gate.
+fn calibrate_base_side_ratio_floor(
+    variant: Variant,
+    env: &str,
+    prompts: &[&str],
+    measured_minimum: f64,
+    maximum_margin: f64,
+) {
+    let label = variant.model_id();
+    let generator = candle_audio_stable_audio_3::provider_registry()
+        .expect("provider registry")
+        .load(variant.model_id(), &LoadSpec::new(snapshot(env)))
+        .expect("strict registered variant-bound load");
+    let duration = env_f32("SA3_TEST_DURATION", BASE_CALIBRATION_DURATION_SECS);
+
+    let mut minimum_global = f64::INFINITY;
+    let mut minimum_median = f64::INFINITY;
+    let started = std::time::Instant::now();
+    for prompt in prompts {
+        for &seed in SWEEP_SEEDS {
+            let track = match generator
+                .generate(&default_request(prompt, duration, seed), &mut |_| {})
+                .expect("connected generation")
+            {
+                GenerationOutput::Audio(track) => track,
+                other => panic!("expected audio, got {other:?}"),
+            };
+            let left = track
+                .samples
+                .chunks_exact(2)
+                .map(|frame| frame[0])
+                .collect::<Vec<_>>();
+            let right = track
+                .samples
+                .chunks_exact(2)
+                .map(|frame| frame[1])
+                .collect::<Vec<_>>();
+            let width = stereo_width(&left, &right);
+            eprintln!(
+                "sweep {label} seed={seed:<6} global={:.9} median_window={:.9} windows={:<4} prompt={prompt}",
+                width.global, width.median_window, width.windows
+            );
+            minimum_global = minimum_global.min(width.global);
+            minimum_median = minimum_median.min(width.median_window);
+        }
+    }
+
+    let floor = minimum_side_ratio(variant);
+    let measured = minimum_global.min(minimum_median);
+    eprintln!(
+        "{label} side-ratio sweep over {} prompts x {} seeds at {duration}s / defaults \
+         (Euler / {} / {}): min_global={minimum_global:.9} min_median_window={minimum_median:.9} \
+         floor={floor:e} margin={:.2}x (max {maximum_margin:.0}x) wall_clock_s={:.1}",
+        prompts.len(),
+        SWEEP_SEEDS.len(),
+        variant.default_steps(),
+        variant.default_guidance(),
+        measured / floor,
+        started.elapsed().as_secs_f64(),
+    );
+    assert!(
+        measured > floor,
+        "the {label} side-ratio floor {floor:e} is above the measured minimum {measured} — the \
+         per-run gate would flake on honest output"
+    );
+    assert!(
+        measured / floor <= maximum_margin,
+        "the {label} side-ratio floor {floor:e} sits {:.1}x below the measured minimum {measured}, \
+         past the {maximum_margin:.0}x this variant allows",
+        measured / floor
+    );
+    // The committed minimum must still be the sweep's minimum, or the weight-free relation between
+    // the two constants is describing a measurement nobody took.
+    let drift = (measured - measured_minimum).abs() / measured_minimum;
+    assert!(
+        drift < 0.25,
+        "{label}: the committed measured minimum {measured_minimum:e} is {:.1}% away from this \
+         run's {measured:e}; re-record it",
+        drift * 100.0
+    );
+}
+
+/// Each base floor sits below the sweep minimum it was calibrated from, by a stated margin.
+///
+/// Weight-free, so the relationship between the two committed numbers is checked on every PR rather
+/// than only when a real-weight lane runs. Without it the `*_MEASURED_MINIMUM` constants would be
+/// documentation.
+#[test]
+fn base_side_ratio_floors_sit_below_their_measured_minima() {
+    for (variant, measured, maximum_margin) in [
+        (Variant::SmallMusicBase, MUSIC_BASE_MEASURED_MINIMUM, 50.0),
+        (Variant::SmallSfxBase, SFX_BASE_MEASURED_MINIMUM, 10.0),
+        (Variant::MediumBase, MEDIUM_BASE_MEASURED_MINIMUM, 10.0),
+    ] {
+        let floor = minimum_side_ratio(variant);
+        assert!(
+            floor < measured,
+            "{}: floor {floor:e} is above its measured minimum {measured:e}",
+            variant.model_id()
+        );
+        let margin = measured / floor;
+        assert!(
+            margin <= maximum_margin,
+            "{}: floor {floor:e} sits {margin:.1}x below the measured minimum {measured:e}",
+            variant.model_id()
+        );
+        // A floor at or below the sc-14544 `near_mono` control's level is only a near-mono
+        // detector, not a width bar — the same honest caveat medium already carries. Asserted so the
+        // classification cannot silently change.
+        let is_near_mono_detector_only = floor <= PREVIOUS_SFX_SIDE_RATIO_FLOOR;
+        assert_eq!(
+            is_near_mono_detector_only,
+            variant == Variant::MediumBase,
+            "{}: only medium-base's floor is documented as a bare near-mono detector",
+            variant.model_id()
+        );
+    }
+}
+
+#[test]
+#[ignore = "real 3.45 GB weights; set SA3_SMALL_MUSIC_BASE_SNAPSHOT"]
+fn music_base_stereo_width_floor_is_calibrated_across_prompts_and_seeds() {
+    calibrate_base_side_ratio_floor(
+        Variant::SmallMusicBase,
+        "SA3_SMALL_MUSIC_BASE_SNAPSHOT",
+        MUSIC_BASE_SWEEP_PROMPTS,
+        MUSIC_BASE_MEASURED_MINIMUM,
+        50.0,
+    );
+}
+
+/// The SFX-base sweep borrows the **post-trained** SFX prompt space on purpose.
+///
+/// `small-sfx-base`'s shipped `demo_cond` is the music-base prompt list, unchanged. Calibrating a
+/// Foley checkpoint's stereo floor on "Amen break 174 BPM" would measure the wrong distribution
+/// entirely, so the sweep uses the prompts the SFX lineage was actually demoed on — the same list
+/// the post-trained SFX floor is calibrated from, which also contains this variant's per-run prompt.
+#[test]
+#[ignore = "real 3.45 GB weights; set SA3_SMALL_SFX_BASE_SNAPSHOT"]
+fn sfx_base_stereo_width_floor_is_calibrated_across_prompts_and_seeds() {
+    calibrate_base_side_ratio_floor(
+        Variant::SmallSfxBase,
+        "SA3_SMALL_SFX_BASE_SNAPSHOT",
+        SFX_SWEEP_PROMPTS,
+        SFX_BASE_MEASURED_MINIMUM,
+        10.0,
+    );
+}
+
+/// `medium-base` ships no `demo_cond` at all, so it borrows the post-trained medium's two-domain
+/// sweep — the same list, for the same reason: medium is the only SA3 lineage registered for both
+/// music and sound effects.
+#[test]
+#[ignore = "real 10.4 GB weights; set SA3_MEDIUM_BASE_SNAPSHOT"]
+fn medium_base_stereo_width_floor_is_calibrated_across_prompts_and_seeds() {
+    calibrate_base_side_ratio_floor(
+        Variant::MediumBase,
+        "SA3_MEDIUM_BASE_SNAPSHOT",
+        MEDIUM_SWEEP_PROMPTS,
+        MEDIUM_BASE_MEASURED_MINIMUM,
+        10.0,
+    );
+}
+
+#[test]
+#[ignore = "real 3.45 GB weights; set SA3_SMALL_MUSIC_BASE_SNAPSHOT"]
+fn connected_music_base_generation_at_its_own_defaults_is_stereo_finite_and_exact_length() {
+    run_default_case(&CASES[3]);
+}
+
+#[test]
+#[ignore = "real 3.45 GB weights; set SA3_SMALL_SFX_BASE_SNAPSHOT"]
+fn connected_sfx_base_generation_at_its_own_defaults_is_stereo_finite_and_exact_length() {
+    run_default_case(&CASES[4]);
+}
+
+#[test]
+#[ignore = "real 10.4 GB weights; set SA3_MEDIUM_BASE_SNAPSHOT"]
+fn connected_medium_base_generation_at_its_own_defaults_is_stereo_finite_and_exact_length() {
+    run_default_case(&CASES[5]);
 }
