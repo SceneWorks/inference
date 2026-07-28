@@ -10,7 +10,7 @@ on:
         type: choice
         required: true
         default: all
-        options: [all, llm, media, krea-realtime, audio, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base]
+        options: [all, llm, media, request-memory-scope, krea-realtime, audio, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base]
 
 permissions:
   contents: read
@@ -20,6 +20,37 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # SC-15507: a narrow, independently dispatchable acceptance lane for the request-scoped
+  # MLX lifecycle. The broader `media` profile also runs this test, but it requires the complete
+  # frozen-Torch Mage oracle bundle before reaching it. This lane intentionally needs only the
+  # immutable Mage snapshot consumed by the lifecycle test itself, so an unrelated oracle-cache
+  # miss cannot suppress the real-Apple seam gate.
+  mlx-request-memory-scope:
+    name: MLX request-memory scope real weights
+    if: inputs.profile == 'request-memory-scope'
+    runs-on: [self-hosted, macOS, ARM64, real-weights]
+    env:
+      MAGE_REQUEST_SCOPE_SNAPSHOT: ${{ vars.MAGE_SNAPSHOT }}
+      MAGE_REQUEST_SCOPE_QUANT: bf16
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Toolchain versions
+        run: rustc --version && cargo --version
+      - name: Materialize and verify immutable Mage snapshot
+        run: |
+          if [[ -z "$MAGE_REQUEST_SCOPE_SNAPSHOT" || "$MAGE_REQUEST_SCOPE_SNAPSHOT" != /* ]]; then
+            echo "MAGE_SNAPSHOT must be an operator-provided absolute path" >&2
+            exit 1
+          fi
+          python3 -m pip install --disable-pip-version-check --target "$RUNNER_TEMP/huggingface-hub" "huggingface_hub==1.20.1"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py \
+            --model mage-flow \
+            --snapshot "$MAGE_REQUEST_SCOPE_SNAPSHOT"
+      - name: Run Mage request-memory lifecycle
+        run: >-
+          cargo test --locked --release -p mlx-gen-mage
+          --test request_memory_scope_real_weights -- --ignored --nocapture
+
   mlx-llm:
     name: MLX LLM real weights
     if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'llm'
@@ -228,6 +259,17 @@ jobs:
         run: >-
           cargo test --locked --release -p mlx-gen-mage --test vae_decode_real_weights
           -- --ignored --nocapture
+      # SC-15507: one loaded provider executes A -> B -> A request scopes, observes cancellation at
+      # Mage's terminal post-trace check, injects an error outcome after real work, and proves both
+      # cleanup paths permit follow-ups. SceneWorks owns selector/cache-state coverage; this workflow
+      # has the Apple MLX hardware and complete snapshot needed for the provider half.
+      - name: Run Mage request-memory lifecycle
+        env:
+          MAGE_REQUEST_SCOPE_SNAPSHOT: ${{ env.MAGE_SNAPSHOT }}
+          MAGE_REQUEST_SCOPE_QUANT: bf16
+        run: >-
+          cargo test --locked --release -p mlx-gen-mage
+          --test request_memory_scope_real_weights -- --ignored --nocapture
       - name: Run Mage-Flow instruction-edit parity
         run: |
           status=0
@@ -1001,6 +1043,33 @@ jobs:
           # `docs/migration/SC_14548_AUDIO_EDIT_INPAINT.md`.
           cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
             --test audio_edit -- --ignored --nocapture
+      - name: Prove the load-time adapter fold on all six checkpoints
+        run: |
+          # sc-14550. This job and its CUDA twin are the only lanes provisioning all six snapshots.
+          #
+          # ⚠ These cases do NOT validate a real adapter artifact. **None exists** — there is no
+          # Stable Audio 3 adapter of any type in any cache, and no published community one
+          # (sc-15347). Every adapter here is synthesized by the test against the real checkpoint's
+          # own safetensors header, in the format `src/adapters.rs` declares. What they prove is
+          # that the resolved plan reaches the real backend — including Metal's packed-buffer
+          # `SimpleBackend`, which is a different object from CPU/CUDA's mmap and is exercised in no
+          # other lane — and that the fold changes the rendered audio.
+          #
+          # The gates are the two exactly-signed ones, never a threshold:
+          #   * a `scale == 0.0` request renders **byte-identical** audio to a request with no
+          #     adapters at all. Exactly zero difference; a fold that ran at all breaks it.
+          #   * two adapters differing only in their factor values render **different** audio.
+          # "Adapted differs from un-adapted" appears only as a liveness check, because a
+          # *misapplied* adapter differs too — that is sc-14548's wrong-sign lesson applied up front.
+          #
+          # `real_lora_xs_folds_through_the_host_svd` is deliberately scoped to the conditioner's
+          # single [768, 256] Linear. Candle has no `linalg.svd`, so the `-xs` family computes one on
+          # the host in f64 (never on the accelerator, which is what makes it cross-platform
+          # deterministic by construction). Measured: ~1.9 s for [768, 256], ~113 s for
+          # [1024, 1024]. Covering the DiT's attention stack would be a multi-hour cold start; the
+          # math is identical at either scale and only the wall clock is not.
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
+            --test adapters -- --ignored --nocapture
 
   sa3-small-base-metal:
     name: Stable Audio 3 small base providers (Metal)
@@ -1675,6 +1744,21 @@ jobs:
           rem reaches the three weights-only edit sites named in
           rem docs/migration/SC_14548_AUDIO_EDIT_INPAINT.md.
           cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --test audio_edit -- --ignored --nocapture || exit /b 1
+      - name: Prove the load-time adapter fold on all six checkpoints
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          rem sc-14550. This job and its Metal twin are the only lanes provisioning all six
+          rem snapshots. These cases do NOT validate a real adapter artifact -- none exists
+          rem (sc-15347); every adapter is synthesized by the test against the real checkpoint's own
+          rem safetensors header. What they prove is that the resolved plan reaches the real backend
+          rem and that the fold changes the rendered audio. The two gates are exactly signed: a
+          rem scale-0.0 request renders byte-identical audio to a request with no adapters, and two
+          rem adapters differing only in their factors render different audio. "Adapted differs from
+          rem un-adapted" is liveness only, because a misapplied adapter differs too.
+          rem The -xs case is scoped to the conditioner's [768, 256] Linear: the deterministic host
+          rem f64 SVD costs ~1.9 s there and ~113 s at [1024, 1024].
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --test adapters -- --ignored --nocapture || exit /b 1
 
   sa3-small-base-cuda:
     name: Stable Audio 3 small base providers (CUDA)

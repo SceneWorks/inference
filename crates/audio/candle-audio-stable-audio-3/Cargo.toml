@@ -25,6 +25,10 @@ sha2 = { workspace = true }
 tokenizers = { workspace = true }
 
 [dev-dependencies]
+# Test adapters are *written* by the suite, in the on-disk format `crate::adapters` declares, so
+# the format is exercised through a real file rather than through an in-memory shortcut. Candle's
+# own `save` cannot emit `__metadata__`, which the native format requires.
+safetensors = { workspace = true }
 sceneworks-gen-core-testkit = { workspace = true }
 
 [features]

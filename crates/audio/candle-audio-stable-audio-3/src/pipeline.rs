@@ -1104,12 +1104,55 @@ impl StableAudio3Pipeline {
         device: &Device,
         dtypes: ComputeDTypes,
     ) -> Result<Self> {
+        Self::from_layout_with_dtypes_and_adapters(
+            layout,
+            geometry,
+            device,
+            dtypes,
+            &crate::adapters::AdapterPlan::default(),
+        )
+    }
+
+    /// Build the connected graph with a resolved adapter stack folded into the root weights.
+    ///
+    /// An **empty** plan is not merely a no-op fold — the wrapper is never installed, so this is the
+    /// same object graph, byte for byte, as [`Self::from_layout`]. That is what a `scale == 0.0`
+    /// request resolves to, and it is why bit identity is a structural property here rather than a
+    /// numeric bound.
+    pub fn from_layout_with_adapters(
+        layout: &SnapshotLayout,
+        geometry: VariantGeometry,
+        device: &Device,
+        adapters: &crate::adapters::AdapterPlan,
+    ) -> Result<Self> {
+        Self::from_layout_with_dtypes_and_adapters(
+            layout,
+            geometry,
+            device,
+            ComputeDTypes::for_device(device),
+            adapters,
+        )
+    }
+
+    /// [`Self::from_layout_with_dtypes`] plus an adapter stack.
+    pub fn from_layout_with_dtypes_and_adapters(
+        layout: &SnapshotLayout,
+        geometry: VariantGeometry,
+        device: &Device,
+        dtypes: ComputeDTypes,
+        adapters: &crate::adapters::AdapterPlan,
+    ) -> Result<Self> {
         validate_layout(layout, geometry)?;
         let diffusion = match &layout.config.model {
             ModelConfig::Diffusion(model) => model,
             ModelConfig::Autoencoder(_) => unreachable!("validated full snapshot"),
         };
-        let builders = layout.full_pipeline_builders(dtypes.root, dtypes.text, device)?;
+        let builders = layout.full_pipeline_builders_with_adapters(
+            dtypes.root,
+            dtypes.text,
+            device,
+            Some(adapters),
+        )?;
         let conditioner =
             T5GemmaConditioner::from_layout_with_builders(layout, device, builders.clone())?;
         let dit = StableAudio3Dit::load(diffusion, builders.clone())
