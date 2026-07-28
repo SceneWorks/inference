@@ -26,11 +26,12 @@
 //! The reference's **first-frame VAE re-anchor** (`release_server.py::get_clean_context_frames`,
 //! re-encoding the first *decoded* output frame as a persistent clean-context anchor) re-encodes decoded
 //! pixels *mid-generation*, so that specific **mechanism** is streaming-coupled and correctly out of this
-//! single-terminal-decode batch path. It does **not** follow that a long batch clip is anchored: the Mac
-//! path runs the bounded ~6-frame window ([`mac_ar_config`]) for *every* clip and the shipped 14B config
-//! sets `sink_size = 0`, so a long clip slides its window with **no** persistent anchor — a real
-//! long-range coherence risk **tracked as sc-15127 (S18)**, to be measured/addressed on the gated
-//! real-weight run. See [`generate_t2v_from_components`] for the full reasoning.
+//! single-terminal-decode batch path. A long batch clip is therefore genuinely unanchored: the Mac path
+//! runs the bounded ~6-frame window ([`mac_ar_config`]) for *every* clip and the shipped 14B config sets
+//! `sink_size = 0`. **sc-15127 (S18) measured what that costs on real weights over 13 window rolls and
+//! the answer is: nothing.** Against the checkpoint's global window as a zero-roll control, the bounded
+//! window drifts *less* (17.54 vs 34.06/255) and clips far fewer highlights (1.82% vs 11.61%), with no
+//! freeze. No sink anchor is wired. See [`generate_t2v_from_components`] for the table and reasoning.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -83,9 +84,17 @@ pub struct KreaRealtimeJob<'a> {
 /// `kv_cache_num_frames + num_frames_per_block`) instead of the shipped global `local_attn_size = -1`
 /// (the checkpoint's ~27 GB-of-KV global window). The crate/default config stays faithful to the
 /// checkpoint (global); this Mac bound is selected **only** in the pipeline path (sc-8438 S5 follow-up).
+///
+/// **`sink_size` is deliberately left at the checkpoint's `0` (sc-15127, S18).** The bound is not paired
+/// with an anchor because the gated real-weight sweep measured that it does not need one: over 13 window
+/// rolls the unanchored bounded window drifts *less* than the global window it replaces, and adding a
+/// sink costs permanently-resident KV for no measured coherence gain. Full table and controls on
+/// [`generate_t2v_from_components`]. The 27 GB figure is not rhetorical — the global window at
+/// 45 latent frames × 832×480 was measured to get SIGKILLed on a 128 GiB host.
 pub fn mac_ar_config(base: &KreaRealtimeConfig) -> KreaRealtimeConfig {
     let mut cfg = base.clone();
     cfg.ar.local_attn_size = cfg.ar.streaming_local_attn_frames() as i64;
+    // sink_size intentionally untouched — see the doc comment (sc-15127).
     cfg
 }
 
@@ -295,17 +304,41 @@ pub fn decode_latents_to_video(
 /// latents are still being produced. Wiring the pixel re-encode into the batch path would add a VAE
 /// round-trip with nothing to anchor against on a single terminal decode.
 ///
-/// **This does *not* mean a long batch clip is anchored.** The Mac path runs the bounded ~6-frame
-/// streaming window ([`mac_ar_config`]) for *every* clip, and the shipped 14B config sets
-/// `sink_size = 0` (`config.rs`, asserted there), so the always-attended sink prefix is **empty** and
-/// anchors nothing. A long batch clip therefore slides that window with **no persistent clean anchor** —
-/// a real long-range coherence risk. The reference deliberately *pairs* the bounded window with the
-/// first-frame re-anchor to hold such an anchor; the batch path currently has neither the re-anchor nor a
-/// non-zero sink. That gap is **tracked as sc-15127 (S18)**: it must be measured — and a batch-compatible
-/// anchor chosen (a non-zero `sink_size` latent-space pin is the likely fix, needing no incremental
-/// decode) — on the gated real-weight run (S6(b) / S13). It is not addressable on the tiny random-weight
-/// fixtures here. Confidence: high that `sink_size = 0` leaves the sliding window unanchored; the
-/// coherence *impact* on a long clip is unmeasured until real weights.
+/// **The long batch clip is unanchored — and sc-15127 (S18) measured that this does not cost
+/// coherence.** The Mac path runs the bounded ~6-frame streaming window ([`mac_ar_config`]) for *every*
+/// clip and the shipped 14B config sets `sink_size = 0` (`config.rs`, asserted there), so the
+/// always-attended sink prefix is empty and a long clip slides its window with no persistent clean
+/// anchor. The worry was that this drifts. It does not.
+///
+/// The gated real-weight sweep (`tests/generate_smoke.rs::long_clip_coherence_under_the_bounded_window`,
+/// 45 latent frames = 180 output frames = **13 window rolls**, 640×384, q4, one clip generated five
+/// times varying only the window and the sink) measured, against the **checkpoint-faithful global
+/// window** as the zero-roll control:
+///
+/// ```text
+/// row                          rolls  one-way trend  peak GiB  clipping
+/// shipped (window  6, sink 0)     13     17.54/255      14.55     1.82%
+/// anchor  (window  6, sink 1)     13     10.68/255      15.56     0.58%
+/// anchor  (window  6, sink 3)     13     17.65/255      17.02     0.82%
+/// wider   (window 15, sink 0)     10     19.51/255      21.64     4.98%
+/// GLOBAL  (no eviction, sink 0)    0     34.06/255      42.34    11.61%
+/// ```
+///
+/// The dose-response runs the **wrong way for the drift hypothesis**: the *fully anchored* global
+/// window has the largest one-way trend and by far the worst highlight clipping, and both metrics
+/// improve monotonically as the window gets *tighter*. No row froze (tail motion 6.9–9.2/255 per
+/// frame), so the bounded rows are calm, not dead. So the bounded window is not merely survivable, it is
+/// the healthier operating point — consistent with the reference server itself overriding the
+/// checkpoint's global `local_attn_size` to `kv_cache_num_frames + num_frames_per_block`
+/// (`release_server.py:543`).
+///
+/// **A `sink_size` anchor is therefore deliberately NOT wired.** It is permanently-resident KV
+/// (measured +1.0 GiB for one latent frame, +2.5 GiB for three at 640×384; +1.5 / +4.1 GiB at 832×480)
+/// bought against a defect that the controlled measurement does not show. At the controlled bucket the
+/// three-frame sink (17.65) is indistinguishable from no sink (17.54). The knob remains fully plumbed
+/// ([`crate::KreaArConfig::sink_size`] → `sink_tokens()` → `CausalKvCache`, and readable from
+/// `config.json`), so a future checkpoint that ships a non-zero sink is honoured without code changes.
+/// The reference's *pixel* re-anchor stays out for the structural reason above.
 #[allow(clippy::too_many_arguments)]
 pub fn generate_t2v_from_components(
     transformer: &CausalKreaTransformer,
@@ -892,6 +925,50 @@ mod tests {
         assert!(mac.ar.max_attention_size() < base.ar.seq_length);
         // The crate default is untouched — the bound lives in the pipeline, not the config default.
         assert_eq!(KreaRealtimeConfig::default().ar.local_attn_size, -1);
+    }
+
+    /// **sc-15127 (S18): the Mac bound ships with NO sink anchor, and that is a measured decision.**
+    ///
+    /// The gated real-weight sweep found the unanchored bounded window drifts *less* than the global
+    /// window it replaces (17.54 vs 34.06/255 over 13 rolls) and clips far fewer highlights (1.82% vs
+    /// 11.61%), so a permanently-resident sink buys nothing. This pins that outcome: `mac_ar_config`
+    /// must not start manufacturing a sink the measurement did not justify, and — the other half — the
+    /// `sink_size` knob must stay a real, honoured knob so a checkpoint that ships one is respected
+    /// without a code change.
+    #[test]
+    fn mac_ar_config_ships_no_sink_anchor_but_honours_one_from_the_checkpoint() {
+        let base = KreaRealtimeConfig::krea_realtime_14b();
+        assert_eq!(
+            base.ar.sink_size, 0,
+            "the shipped 14B checkpoint has no sink"
+        );
+        let mac = mac_ar_config(&base);
+        assert_eq!(
+            mac.ar.sink_size, 0,
+            "the Mac bound must not invent a sink anchor — sc-15127 measured that the bounded window \
+             does not need one, and a sink is permanently-resident KV"
+        );
+        assert_eq!(
+            mac.ar.sink_tokens(),
+            0,
+            "an empty sink prefix must cost zero tokens"
+        );
+        // ...but the knob is not dead: a checkpoint (or `config.json`) that declares a sink is carried
+        // through the Mac bound untouched and turns into real always-attended tokens.
+        let mut anchored = base.clone();
+        anchored.ar.sink_size = 2;
+        let mac_anchored = mac_ar_config(&anchored);
+        assert_eq!(
+            mac_anchored.ar.sink_size, 2,
+            "a checkpoint-declared sink must survive the Mac bound"
+        );
+        assert_eq!(
+            mac_anchored.ar.sink_tokens(),
+            2 * base.ar.frame_seq_length,
+            "sink frames × frame_seq_length (the reference's sink_tokens)"
+        );
+        // And the bound itself is unchanged by the sink — the two knobs are independent.
+        assert_eq!(mac_anchored.ar.local_attn_size, mac.ar.local_attn_size);
     }
 
     /// The per-request config derives `frame_seq_length` from the actual latent geometry (not the baked
