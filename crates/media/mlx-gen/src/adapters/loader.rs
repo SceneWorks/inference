@@ -1734,8 +1734,23 @@ pub fn apply_adapter_specs_autoprefix(
     host: &mut impl AdaptableHost,
     specs: &[AdapterSpec],
 ) -> Result<ApplyReport> {
-    let mut tables = HostTables::default();
     let mut combined = ApplyReport::default();
+    for report in apply_adapter_specs_autoprefix_reported(host, specs)? {
+        combined.applied += report.applied;
+        combined.unmatched_paths.extend(report.unmatched_paths);
+    }
+    Ok(combined)
+}
+
+/// Per-spec form of [`apply_adapter_specs_autoprefix`]. The host is mutated in the same input order
+/// and the expensive host lookup tables are still shared across the batch; only the report reduction
+/// is deferred so a strict batch caller can retain file attribution.
+fn apply_adapter_specs_autoprefix_reported(
+    host: &mut impl AdaptableHost,
+    specs: &[AdapterSpec],
+) -> Result<Vec<ApplyReport>> {
+    let mut tables = HostTables::default();
+    let mut reports = Vec::with_capacity(specs.len());
     for spec in specs {
         // Load + classify the file once per spec (F-004); `classify_adapter_format` is the single
         // source of routing truth (F-069) — the arms below only fetch the table the applier needs
@@ -1776,10 +1791,9 @@ pub fn apply_adapter_specs_autoprefix(
                 .into());
             }
         };
-        combined.applied += report.applied;
-        combined.unmatched_paths.extend(report.unmatched_paths);
+        reports.push(report);
     }
-    Ok(combined)
+    Ok(reports)
 }
 
 // ---- ComfyUI / lightx2v diff-patch (full-weight/bias deltas), fold-after-build (sc-13825) --------
@@ -1901,8 +1915,26 @@ pub fn fold_diff_patch_adapters(
     host: &mut impl AdaptableHost,
     specs: &[AdapterSpec],
 ) -> Result<DiffPatchReport> {
-    let mut report = DiffPatchReport::default();
+    let mut combined = DiffPatchReport::default();
+    for report in fold_diff_patch_adapters_reported(host, specs)? {
+        combined.folded += report.folded;
+        combined.disabled += report.disabled;
+        combined.skipped.extend(report.skipped);
+        combined.unmatched.extend(report.unmatched);
+    }
+    Ok(combined)
+}
+
+/// Per-spec form of [`fold_diff_patch_adapters`]. All diff-patch specs are still folded in one
+/// ordered pass before the low-rank pass; retaining the individual reports does not alter mutation
+/// order.
+fn fold_diff_patch_adapters_reported(
+    host: &mut impl AdaptableHost,
+    specs: &[AdapterSpec],
+) -> Result<Vec<DiffPatchReport>> {
+    let mut reports = Vec::with_capacity(specs.len());
     for spec in specs {
+        let mut report = DiffPatchReport::default();
         let w = Weights::from_file(&spec.path)?;
         // Group each module's `.diff`/`.diff_b` by its resolved (prefix-stripped) dotted stem.
         let mut groups: BTreeMap<String, DiffParts> = BTreeMap::new();
@@ -1922,8 +1954,9 @@ pub fn fold_diff_patch_adapters(
         for (stem, parts) in groups {
             fold_one_diff_module(host, &stem, &parts, spec.scale, &mut report)?;
         }
+        reports.push(report);
     }
-    Ok(report)
+    Ok(reports)
 }
 
 /// Scale a delta by `scale` in f32 (the fold math runs in f32; `merge_dense_delta`/`_bias_delta` cast
@@ -2121,31 +2154,92 @@ pub fn apply_adapters_strict_with_diff_patch(
     specs: &[AdapterSpec],
     model: &str,
 ) -> Result<ApplyReport> {
-    let dp = fold_diff_patch_adapters(host, specs)?;
-    if !dp.skipped.is_empty() {
+    let mut combined = ApplyReport::default();
+    for report in apply_adapters_strict_with_diff_patch_reported(host, specs, model)? {
+        combined.applied += report.applied;
+        combined.unmatched_paths.extend(report.unmatched_paths);
+        combined
+            .diff_patch_unapplied
+            .extend(report.diff_patch_unapplied);
+    }
+    Ok(combined)
+}
+
+/// Per-spec report form of [`apply_adapters_strict_with_diff_patch`].
+///
+/// This preserves the batch install contract exactly: every spec's diff-patch deltas fold in input
+/// order first, then every spec's low-rank residuals install in input order, and the strict guards
+/// evaluate the batch totals. In particular, a wholly unsupported diff-patch file is reported as
+/// unapplied without failing the load when another file in the same batch applies; the batch only
+/// fails the zero-match guard when nothing across the entire batch lands.
+pub fn apply_adapters_strict_with_diff_patch_reported(
+    host: &mut impl AdaptableHost,
+    specs: &[AdapterSpec],
+    model: &str,
+) -> Result<Vec<ApplyReport>> {
+    let diff_reports = fold_diff_patch_adapters_reported(host, specs)?;
+    let skipped: Vec<&str> = diff_reports
+        .iter()
+        .flat_map(|report| report.skipped.iter().map(String::as_str))
+        .collect();
+    if !skipped.is_empty() {
         eprintln!(
             "{model} adapters: {} diff-patch target(s) skipped (shape-incompatible / a weight `.diff` \
              on a packed Linear / no base bias — coupled parts dropped, never half-applied): {:?}",
-            dp.skipped.len(),
-            dp.skipped
+            skipped.len(),
+            skipped
         );
     }
-    if !dp.unmatched.is_empty() {
+    let unmatched: Vec<&str> = diff_reports
+        .iter()
+        .flat_map(|report| report.unmatched.iter().map(String::as_str))
+        .collect();
+    if !unmatched.is_empty() {
         eprintln!(
             "{model} adapters: {} diff-patch target(s) matched no module, skipped: {:?}",
-            dp.unmatched.len(),
-            dp.unmatched
+            unmatched.len(),
+            unmatched
         );
     }
-    let mut report = apply_adapters_strict_inner(host, specs, model, dp.folded + dp.disabled)?;
-    // Diff-patch deltas that resolved count toward the total install, so the returned report is
-    // truthful. A scale-0 delta is included for the same reason the low-rank pass counts a scale-0
-    // adapter as applied: the target matched and was accepted, it is simply inert.
-    report.applied += dp.folded + dp.disabled;
-    // Everything that did NOT land, carried to the provider so a partial install can reach the user.
-    report.diff_patch_unapplied = dp.skipped;
-    report.diff_patch_unapplied.extend(dp.unmatched);
-    Ok(report)
+
+    let mut reports = apply_adapter_specs_autoprefix_reported(host, specs)?;
+    debug_assert_eq!(reports.len(), diff_reports.len());
+    for (report, diff) in reports.iter_mut().zip(diff_reports) {
+        // Diff-patch deltas that resolved count toward the total install, so the returned report is
+        // truthful. A scale-0 delta is included for the same reason the low-rank pass counts a scale-0
+        // adapter as applied: the target matched and was accepted, it is simply inert.
+        report.applied += diff.folded + diff.disabled;
+        // Everything that did NOT land, carried to the provider so a partial install can reach the
+        // user with its originating file intact.
+        report.diff_patch_unapplied = diff.skipped;
+        report.diff_patch_unapplied.extend(diff.unmatched);
+    }
+
+    let applied: usize = reports.iter().map(|report| report.applied).sum();
+    if !specs.is_empty() && applied == 0 {
+        return Err(format!(
+            "{model} adapters: no target modules matched across {} adapter file(s) — check the \
+             format/prefix (expected diffusers/peft LoRA, kohya `lora_unet_` LoRA, BFL/ComfyUI \
+             fused→split LoRA — for a host with a BFL surface — LoKr keys, or a ComfyUI/lightx2v \
+             `<module>.diff`/`.diff_b` diff-patch)",
+            specs.len()
+        )
+        .into());
+    }
+    let low_rank_unmatched: Vec<&str> = reports
+        .iter()
+        .flat_map(|report| report.unmatched_paths.iter().map(String::as_str))
+        .collect();
+    if !low_rank_unmatched.is_empty() {
+        return Err(format!(
+            "{model} adapters: {} adapter target(s) matched no module (surfaced, not silently \
+             dropped): {:?}",
+            low_rank_unmatched.len(),
+            low_rank_unmatched
+        )
+        .into());
+    }
+    Ok(reports)
 }
 
 /// Core of [`apply_adapters_strict`]: `pre_applied` is the count of diff-patch targets a prior pass
