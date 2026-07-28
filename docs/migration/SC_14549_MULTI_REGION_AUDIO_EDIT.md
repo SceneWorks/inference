@@ -154,11 +154,8 @@ place for the geometry to drift.
 - `stitch_outside_region` preserves everything outside **every** span, walking the sorted union once
   so no frame is visited twice. Any future crossfade therefore lands wholly inside one merged span
   and no frame can receive two fades — structural, not a rule to remember.
-- `edit_retained_latent_count` takes a **union** in latent space rather than a sum. `ceil(x/4096)` is
-  not injective, so audio-disjoint spans can quantize onto overlapping latent ranges; summing would
-  over-count the zeroed positions and under-report what survives. A count that wrongly reached zero
-  would put `edit_local_conditioning_is_present` into its "an all-zero local conditioning is correct
-  here" branch and **disarm the presence guard** on exactly the geometry that needed it.
+- `edit_retained_latent_count` takes a **union** in latent space rather than a sum — see the
+  correction below for what that does and does not buy.
 - Latent-collapse is checked per **requested** region, not per merged span, so a caller who names one
   usable window and one degenerate one is told about the degenerate one instead of having it silently
   vanish into the union.
@@ -188,7 +185,7 @@ Stated, not claimed closed.
 | `merge_edit_regions` `start <= last.1` → `<` (touching no longer merges) | RED | `merge_edit_regions_is_an_order_independent_disjoint_union` |
 | the keep-mask loop → `spans.iter().take(1)` | RED | `the_multi_region_geometry_and_keep_mask_cover_every_span` |
 | the stitch loop → `spans[0]` only | RED | `the_stitch_preserves_every_span_outside_the_union` (middle preserved span) |
-| `edit_retained_latent_count` union → sum | RED | `the_retained_latent_count_unions_overlapping_latent_ranges` |
+| `edit_retained_latent_count` union → sum | RED *(only after the correction below)* | `the_retained_latent_count_unions_overlapping_latent_ranges` |
 | gen-core floor → `regions[0]` | RED | `every_region_is_floored_not_just_the_first` |
 | latent-collapse check → first region only | RED | `multi_region_validation_rejects_every_malformed_request_on_every_variant` |
 | carrier arity counted per-kind | RED | the mixed-carrier case in the same test |
@@ -198,3 +195,33 @@ Stated, not claimed closed.
 
 The last two are honestly green in the PR lane and named rather than papered over, exactly as
 sc-14548 recorded its own residue.
+
+
+## A vacuous test, found by running the mutation rather than trusting the reasoning
+
+The `edit_retained_latent_count` case shipped in an earlier revision of this branch **passed under
+the very mutation it was credited with catching**, and the mutation run is what exposed it.
+
+The claim was: `ceil(x/4096)` is not injective, so audio-disjoint spans can land on overlapping
+latent ranges, and summing their widths would double-count. The first half is true and the
+conclusion does not follow. `merge_edit_regions` leaves the audio spans **disjoint and
+non-touching**, `ceil` is monotonic, and a region narrower than one latent frame is already refused —
+so for consecutive spans `a2 > b1` gives `ceil(a2/4096) >= ceil(b1/4096)`, i.e.
+`start_latent[i+1] >= end_latent[i]`. Latent ranges can touch; they can never overlap.
+
+**Normalized input is exactly the input on which union and sum agree**, so a test that reaches the
+function only through `edit_geometry` cannot discriminate between the two formulas, however many
+overlapping *requests* it feeds in. All three of the original cases went through the normalizer, and
+two of them merged into a single span before the count ever ran.
+
+What the union actually buys is independence from an invariant established in a **different
+function**. Delete the merge, or weaken it, and `[2,6)` + `[4,8)` becomes latent `[22,65)` +
+`[44,87)`, whose 21 shared positions a sum double-counts — reporting 130 retained where 151 is
+correct. So the case now constructs an overlapping-span `EditGeometry` **by hand**, bypassing
+normalization, and separately pins the invariant (`spans[i].end_latent <= spans[i+1].start_latent`)
+where it is actually established. Re-verified: the sum mutation now fails with
+`a sum reports 130 here`.
+
+The general shape, which is the reusable part: **a test that can only construct inputs satisfying an
+invariant cannot gate code whose purpose is to survive that invariant breaking.** Reaching the
+discriminating input required bypassing the constructor.

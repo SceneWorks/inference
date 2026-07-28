@@ -2120,13 +2120,25 @@ fn relocating_region_two_relocates_its_mask_and_nothing_else() {
     }
 }
 
-/// The retained-latent count is a **union**, not a sum.
+/// The retained-latent count is a **union**, not a sum — gated on input `edit_geometry` cannot
+/// produce, because that is the only input on which the two formulas differ.
 ///
-/// `ceil(x/4096)` is not injective, so two spans that are disjoint and non-touching in audio samples
-/// can quantize onto overlapping latent ranges. Summing their widths would over-count the zeroed
-/// positions and under-report what survives — and a count that wrongly reached zero would put
+/// # This case was vacuous once, and the reason is worth keeping
+///
+/// It originally drove `edit_geometry` with overlapping and touching *requests* and compared the
+/// result against a brute-force union. That passes whether the implementation unions or sums, and
+/// was verified GREEN under the sum mutation. `merge_edit_regions` leaves the audio spans disjoint
+/// and non-touching, `ceil(x/4096)` is monotonic, and a sub-latent-frame region is already refused —
+/// so `start_latent[i+1] >= end_latent[i]` always holds and the latent ranges can touch but never
+/// overlap. Normalized input is exactly the input on which union and sum agree, so a test that can
+/// only reach normalized input cannot discriminate between them.
+///
+/// The discriminating input is an `EditGeometry` built **by hand**, with spans that overlap in
+/// latent space — which is what the geometry becomes if the merge is ever removed or weakened. That
+/// is the property the union actually buys: correctness that does not depend on an invariant
+/// established in a different function. A count that wrongly reached zero would put
 /// `edit_local_conditioning_is_present` into its "an all-zero local conditioning is correct here"
-/// branch, disarming the presence guard on exactly the geometry that needed it.
+/// branch and disarm the presence guard on exactly the geometry that needed it.
 #[test]
 fn the_retained_latent_count_unions_overlapping_latent_ranges() {
     let source = source_clip(20.0, SAMPLE_RATE, 2);
@@ -2140,6 +2152,80 @@ fn the_retained_latent_count_unions_overlapping_latent_ranges() {
     // Derived independently of the function under test: 216 effective latents, minus [22,65) and
     // [151,194) — two disjoint latent ranges, 43 positions each.
     assert_eq!(edit_retained_latent_count(&resolved), 216 - 43 - 43);
+
+    // --- the discriminating case: overlapping latent ranges, constructed directly ---------------
+    // `edit_geometry` cannot produce this; the merge is what prevents it. Building it by hand is
+    // what makes the union/sum distinction reachable at all.
+    let overlapping = EditGeometry {
+        adapted_size: 1_146_880,
+        latent_length: 280,
+        effective_samples: 882_000,
+        spans: vec![
+            EditSpan {
+                start_sample: 88_200,
+                end_sample: 264_600,
+                start_latent: 22,
+                end_latent: 65,
+            },
+            EditSpan {
+                start_sample: 180_224,
+                end_sample: 356_352,
+                start_latent: 44,
+                end_latent: 87,
+            },
+        ],
+    };
+    // Union of [22,65) and [44,87) is [22,87) — 65 positions. A sum would say 43 + 43 = 86 and
+    // report 216 - 86 = 130, double-counting the 21 shared positions.
+    assert_eq!(
+        edit_retained_latent_count(&overlapping),
+        216 - 65,
+        "overlapping latent ranges must be unioned; a sum reports {} here",
+        216 - 86
+    );
+    // Fully contained, and duplicated — the other two ways a sum over-counts.
+    let contained = EditGeometry {
+        spans: vec![
+            EditSpan {
+                start_sample: 88_200,
+                end_sample: 264_600,
+                start_latent: 22,
+                end_latent: 65,
+            },
+            EditSpan {
+                start_sample: 122_880,
+                end_sample: 163_840,
+                start_latent: 30,
+                end_latent: 40,
+            },
+        ],
+        ..overlapping.clone()
+    };
+    assert_eq!(edit_retained_latent_count(&contained), 216 - 43);
+    let duplicated = EditGeometry {
+        spans: vec![overlapping.spans[0], overlapping.spans[0]],
+        ..overlapping.clone()
+    };
+    assert_eq!(edit_retained_latent_count(&duplicated), 216 - 43);
+
+    // The invariant the equality above depends on, pinned where it is established: every geometry
+    // `edit_geometry` produces has non-overlapping latent ranges. If this ever stops holding, the
+    // cases above are what keep the count correct anyway.
+    for regions in [
+        &[(2.0f32, 6.0f32), (4.0, 8.0)][..],
+        &[(2.0, 6.0), (6.0, 10.0)][..],
+        &[(1.0, 1.2), (1.2, 1.4), (1.4, 1.6)][..],
+    ] {
+        let normalized = edit_geometry(&multi_edit(&source.samples, regions), &geometry, 20.0)
+            .unwrap_or_else(|error| panic!("{regions:?}: {error}"));
+        for pair in normalized.spans.windows(2) {
+            assert!(
+                pair[0].end_latent <= pair[1].start_latent,
+                "{regions:?}: normalization must leave latent ranges non-overlapping, got                  {:?}",
+                normalized.spans
+            );
+        }
+    }
 
     // Two audio spans one sample apart quantize onto ranges that touch or coincide. The count must
     // not go negative, must not double-subtract, and must agree with a brute-force union.

@@ -871,13 +871,28 @@ pub fn tensor_has_nonzero(tensor: &Tensor) -> Result<bool> {
 /// Zero is a legitimate result, not a bug: an edit whose region covers the whole effective span
 /// hands the DiT an all-zero local conditioning on purpose (regenerate everything). Naming that is
 /// what keeps the guard below from having to pretend zero is impossible.
-/// **The union is taken in latent space, not summed.** Two spans that are disjoint and non-touching
-/// in audio samples can still quantize onto overlapping — or identical — latent ranges, because
-/// `ceil(x/4096)` is not injective. Subtracting each span's latent width independently would then
-/// double-count the shared frames and under-report what survives, which on a two-region edit
-/// covering most of the clip could report zero retained latents and take the presence guard below
-/// into its "an all-zero local conditioning is correct here" branch — disarming it. So the zeroed
-/// latent positions are unioned first and counted once.
+/// **The zeroed latent positions are unioned, not summed — and the reason is not the one it looks
+/// like.**
+///
+/// Stated precisely, because an earlier revision of this comment got it wrong and the test written
+/// against that claim was vacuous: for any [`EditGeometry`] that [`edit_geometry`] can actually
+/// produce, the union and the sum are **equal**. [`merge_edit_regions`] leaves the audio spans
+/// disjoint and non-touching, `x -> ceil(x/4096)` is monotonic, and every requested region is
+/// already refused unless it spans at least one latent frame — so consecutive spans satisfy
+/// `start_latent[i+1] >= end_latent[i]` and the latent ranges can touch but can never overlap.
+///
+/// What the union buys is therefore **independence from that invariant**, not a fix for a bug
+/// reachable today. The invariant lives in a different function: delete the merge, or weaken it to
+/// leave overlapping requests separate, and `[2,6)` + `[4,8)` becomes latent `[22,65)` + `[44,87)`,
+/// whose shared 21 positions a sum double-counts. On an edit covering most of the clip that
+/// under-report can reach zero retained latents, which would take
+/// [`edit_local_conditioning_is_present`] into its "an all-zero local conditioning is correct here"
+/// branch and **disarm the presence guard** on exactly the geometry that needed it.
+///
+/// So `the_retained_latent_count_unions_overlapping_latent_ranges` gates this by constructing an
+/// overlapping-span [`EditGeometry`] **directly**, bypassing [`edit_geometry`]'s normalization.
+/// Driving it only through the normalizer proves nothing, because the normalizer is what makes the
+/// two formulas agree.
 pub fn edit_retained_latent_count(geometry: &EditGeometry) -> usize {
     let effective_latents = geometry
         .effective_samples
