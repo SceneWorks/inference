@@ -24,7 +24,7 @@ Two constraints set the grain:
 
 | # | Epic | Failure mode it owns | Exit | ~wks |
 |---|---|---|---|---|
-| **E1** | iOS toolchain | Toolchain / upstream — *largely retired* | Green `aarch64-apple-ios` CI build, no local env vars | ~2 |
+| **E1** | iOS toolchain | Toolchain / upstream — **retired** | ~~Green `aarch64-apple-ios` CI build, no local env vars~~ **met** | ~~2~~ **done** |
 | **E2** | `runtime-ios` composition | Composition — low, well-trodden here | `RuntimeCatalog` validates; surface tests green both profiles | ~2 |
 | **E3** | On-device proof | **Device runtime** — metallib in sandbox, provisioning | `textllm_conformance` green on a physical iPhone | ~3–4 |
 | **E4** | Memory & performance | **Memory, thermals, threading** | G5 numbers published and enforced as thresholds | ~3 |
@@ -53,16 +53,19 @@ memory work depends on E3 and E4.
 review path from anything else here — and it is the one epic with an external dependency
 (upstream review latency) that we do not control.
 
-**Status: S1.1–S1.4 done; only the CI stories (S1.5, S1.6) remain.**
+**Status: COMPLETE** (S1.1's upstream PR is open but off the critical path — the fork carries it).
+
 `cargo build --locked --target aarch64-apple-ios -p mlx-llm-server` succeeds from a clean clone
 with **no environment variables set**, producing a Mach-O arm64 binary (`platform 2`,
-`minos 18.0`) whose metallib reports `apple-ios18.0.0` across all 15,660 kernels, and a packaging
-script places that metallib where the sandbox can find it. The macOS lane is unaffected
+`minos 18.0`) whose metallib reports `apple-ios18.0.0` across all 15,660 kernels; the simulator
+triple builds; a packaging script places the metallib where the sandbox can find it; and CI
+rebuilds and re-asserts all of it on every relevant change. The macOS lane is unaffected
 (`minos 26.2`, NAX floor intact).
 
-**Everything here is still build-time evidence.** No iOS artifact has executed. The metallib is
+**Everything here is build-time evidence.** No iOS artifact has executed. The metallib is
 correctly *targeted* and correctly *placed*, but whether those kernels are numerically right, and
-whether resolution actually succeeds inside a real sandbox, are E3's questions (R9, R11).
+whether resolution actually succeeds inside a real sandbox, are E3's questions (R9, R11). E1 has
+made those questions *answerable*; it has not answered them.
 
 | Story | Notes |
 |---|---|
@@ -70,8 +73,8 @@ whether resolution actually succeeds inside a real sandbox, are E3's questions (
 | S1.2 Home the iOS deployment target in `.cargo/config.toml` | **Done** — `IPHONEOS_DEPLOYMENT_TARGET = "18.0"`, unforced so CI can override. Both halves now covered: the fork's `build.rs` carries it to cmake/Metal, and this entry carries it to rustc's link step (which `env::set_var` cannot reach). Verified with a clean env-free build; macOS `minos 26.2` unchanged. |
 | S1.3 Bundle `mlx.metallib` into the `.app` | **Done.** Fork emits `DEP_MLX_METALLIB` (via `links = "mlx"`); `scripts/ios/bundle_metallib.py` copies it next to the executable as an Xcode Run Script phase, with `--expect-platform` refusing a macOS metallib in an iOS bundle and `--codesign-identity` re-signing the copy. **Not yet exercised on device** — that is E3/S3.3. |
 | S1.4 Repoint the workspace at the fork | **Done** — pinned at `zakkeown/mlx-rs` @ `b3c0e27e`. The gate now asserts the **git URL** too (it previously did not, so a same-rev pin from another remote passed silently). Touched four files beyond the manifests: `bump_pins.py` hardcodes the URL and regex-parses gate entries, plus its tests. Revert the URL when #23 merges. |
-| S1.5 Tier 1 CI | `cargo build --target aarch64-apple-ios` + `clippy -D warnings` on hosted runners. Build regressions only. |
-| S1.6 Simulator target builds | `aarch64-apple-ios-sim`, required by E3's Tier 2. |
+| S1.5 Tier 1 CI | **Done** — `ios-build` job on `macos-15`, gated by the new `ios_build` lane. Builds both triples and **asserts the artifacts target iOS** (`otool` `platform 2`; metallib must not carry `apple-macos`), then exercises `bundle_metallib.py`. No env overrides — it proves a clean clone builds unaided. |
+| S1.6 Simulator target builds | **Done**, and not a formality: the simulator triple did not build at all. mlx-c's example `.app` targets default ON and reference `_MTLIOErrorDomain`, absent from the simulator's Metal framework, failing the whole cmake build. Fixed in the fork with `MLX_C_BUILD_EXAMPLES=OFF`. |
 
 **Exit:** CI builds `aarch64-apple-ios` and `-sim` green, from a clean clone, with no environment
 variables set at the command line.
