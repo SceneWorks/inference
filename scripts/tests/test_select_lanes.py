@@ -31,6 +31,9 @@ class SelectLanesTests(unittest.TestCase):
                 "contracts",
                 "candle_cpu",
                 "macos_metal",
+                # The contract crates compile into the iOS binary too, so a change here must
+                # rebuild that target.
+                "ios_build",
                 "windows_cuda",
                 "real_weights",
             },
@@ -43,6 +46,26 @@ class SelectLanesTests(unittest.TestCase):
         self.assertTrue(lanes["real_weights"])
         self.assertFalse(lanes["candle_cpu"])
         self.assertFalse(lanes["windows_cuda"])
+
+    def test_mlx_change_also_rebuilds_the_ios_target(self) -> None:
+        # The mlx crates are the iOS lane's build surface as well as the macOS one: both triples
+        # compile the same sources against the same pinned mlx-sys, so an mlx change that only
+        # rebuilt macOS could land an iOS break unseen.
+        for path in (
+            "crates/llm/mlx-llm/src/lib.rs",
+            "crates/media/mlx-gen/mlx-gen-flux/src/lib.rs",
+        ):
+            self.assertTrue(select_lanes([path])["ios_build"], path)
+
+    def test_candle_only_change_skips_the_ios_lane(self) -> None:
+        # The iOS bundle is mlx; nothing candle-only reaches it. This is the negative half of the
+        # test above -- without it, "ios_build" could quietly become always-on and still pass.
+        for path in (
+            "crates/llm/candle-llm/src/lib.rs",
+            "crates/media/candle-gen/candle-gen-flux/src/lib.rs",
+            "crates/audio/candle-audio-kokoro/src/lib.rs",
+        ):
+            self.assertFalse(select_lanes([path])["ios_build"], path)
 
     def test_candle_change_includes_cpu_metal_and_cuda(self) -> None:
         lanes = select_lanes(["crates/media/candle-gen/candle-gen-flux/src/lib.rs"])

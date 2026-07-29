@@ -38,6 +38,7 @@ jobs:
       contracts: ${{ steps.select.outputs.contracts }}
       candle_cpu: ${{ steps.select.outputs.candle_cpu }}
       macos_metal: ${{ steps.select.outputs.macos_metal }}
+      ios_build: ${{ steps.select.outputs.ios_build }}
       windows_cuda: ${{ steps.select.outputs.windows_cuda }}
       supply_chain: ${{ steps.select.outputs.supply_chain }}
       docs: ${{ steps.select.outputs.docs }}
@@ -287,6 +288,74 @@ jobs:
           cargo clippy --locked
           -p candle-llm -p 'candle-gen*' -p 'candle-audio*'
           --all-targets --features metal -- -D warnings
+
+  ios-build:
+    name: iOS cross-compile (device + simulator)
+    needs: changes
+    if: needs.changes.outputs.ios_build == 'true'
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Toolchain versions
+        run: |
+          sw_vers
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+      - name: Ensure Metal compiler
+        run: |
+          if ! xcrun --find metal >/dev/null 2>&1; then
+            sudo xcodebuild -downloadComponent MetalToolchain
+          fi
+          xcrun metal --version || true
+      - name: Install pinned Rust toolchain and iOS targets
+        run: |
+          rustup show
+          rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+      - name: Cache Cargo and MLX native build
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: ios
+      # No MACOSX_DEPLOYMENT_TARGET / IPHONEOS_DEPLOYMENT_TARGET override here, deliberately:
+      # .cargo/config.toml pins the shipping iOS floor (18.0) and this lane must prove a clean
+      # clone builds with no environment help. The macOS 26.2 NAX floor is irrelevant to iOS --
+      # the NAX kernels gate on MACOS_SDK_VERSION, which is unset off macOS.
+      - name: Build for iOS device
+        run: cargo build --locked --target aarch64-apple-ios -p mlx-llm -p mlx-llm-server
+      - name: Build for iOS simulator
+        run: cargo build --locked --target aarch64-apple-ios-sim -p mlx-llm
+      # A green build is NOT evidence of an iOS artifact. Before ios-metal-sdk.patch, this lane
+      # would have passed while emitting a macOS metallib that links fine and dies at the first
+      # kernel dispatch on device. Assert the platform of what was actually produced.
+      - name: Assert artifacts target iOS
+        run: |
+          set -euo pipefail
+          binary=target/aarch64-apple-ios/debug/mlx-llm-server
+          echo "--- $binary"
+          otool -l "$binary" | grep -A3 LC_BUILD_VERSION | head -5
+          # platform 2 == iOS. platform 1 (macOS) here means the cross-compile silently regressed.
+          otool -l "$binary" | grep -A3 LC_BUILD_VERSION | grep -q 'platform 2' \
+            || { echo "::error::$binary is not an iOS binary"; exit 1; }
+
+          metallib=$(find target/aarch64-apple-ios -name mlx.metallib -print -quit)
+          test -n "$metallib" || { echo "::error::no mlx.metallib was built"; exit 1; }
+          echo "--- $metallib"
+          if strings "$metallib" | grep -qm1 'apple-macos'; then
+            echo "::error::$metallib carries macOS kernels (ios-metal-sdk.patch regressed)"
+            exit 1
+          fi
+          strings "$metallib" | grep -qm1 'apple-ios' \
+            || { echo "::error::$metallib has no iOS target triple"; exit 1; }
+          echo "metallib targets iOS"
+      - name: Bundle metallib into a staging directory
+        # Exercises scripts/ios/bundle_metallib.py, including its cross-platform guard. The real
+        # consumer is an Xcode Run Script phase; here a temp dir stands in for the .app.
+        run: |
+          set -euo pipefail
+          staging=$(mktemp -d)
+          python3 scripts/ios/bundle_metallib.py \
+            --target-dir target --triple aarch64-apple-ios --profile debug \
+            --dest "$staging" --expect-platform ios
+          test -f "$staging/mlx.metallib"
 
   macos-nax:
     name: runtime-macos NAX (macOS 26.2, manual)

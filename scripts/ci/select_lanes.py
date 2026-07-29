@@ -15,6 +15,11 @@ LANES = (
     "contracts",
     "candle_cpu",
     "macos_metal",
+    # Cross-compile-only: builds `aarch64-apple-ios` (+ the simulator triple) and asserts the
+    # artifacts really target iOS. It executes nothing -- there is no iOS runner -- so it is a
+    # cheap guard against the class of regression where a green build hides a macOS-targeted
+    # artifact. On-device testing is a separate, later tier.
+    "ios_build",
     "windows_cuda",
     "supply_chain",
     "docs",
@@ -89,6 +94,7 @@ def select_lanes(paths: Iterable[str], force_all: bool = False) -> dict[str, boo
                 contracts=True,
                 candle_cpu=True,
                 macos_metal=True,
+                ios_build=True,
                 windows_cuda=True,
                 real_weights=True,
             )
@@ -101,6 +107,7 @@ def select_lanes(paths: Iterable[str], force_all: bool = False) -> dict[str, boo
                 contracts=True,
                 candle_cpu=True,
                 macos_metal=True,
+                ios_build=True,
                 windows_cuda=True,
                 real_weights=True,
             )
@@ -150,8 +157,10 @@ def select_lanes(paths: Iterable[str], force_all: bool = False) -> dict[str, boo
             )
             continue
 
+        # The mlx packages are the iOS lane's build surface as well as the macOS one: both
+        # target triples compile the same crates against the same pinned mlx-sys.
         if _under(path, "crates/llm/mlx-llm") or _under(path, "crates/media/mlx-gen"):
-            lanes.update(macos_metal=True, real_weights=True)
+            lanes.update(macos_metal=True, ios_build=True, real_weights=True)
             continue
 
         if _under(path, "scripts"):

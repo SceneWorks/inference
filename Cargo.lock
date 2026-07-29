@@ -2435,7 +2435,7 @@ dependencies = [
 [[package]]
 name = "mlx-internal-macros"
 version = "0.25.3"
-source = "git+https://github.com/zakkeown/mlx-rs?rev=62cc804e920b96f6df382b7b6e93d90da1c9ecc2#62cc804e920b96f6df382b7b6e93d90da1c9ecc2"
+source = "git+https://github.com/zakkeown/mlx-rs?rev=c0e5c4a4350ec4989e5dc130158dee7757eae785#c0e5c4a4350ec4989e5dc130158dee7757eae785"
 dependencies = [
  "darling 0.21.3",
  "itertools 0.14.0",
@@ -2469,7 +2469,7 @@ dependencies = [
 [[package]]
 name = "mlx-macros"
 version = "0.25.3"
-source = "git+https://github.com/zakkeown/mlx-rs?rev=62cc804e920b96f6df382b7b6e93d90da1c9ecc2#62cc804e920b96f6df382b7b6e93d90da1c9ecc2"
+source = "git+https://github.com/zakkeown/mlx-rs?rev=c0e5c4a4350ec4989e5dc130158dee7757eae785#c0e5c4a4350ec4989e5dc130158dee7757eae785"
 dependencies = [
  "darling 0.21.3",
  "proc-macro2",
@@ -2765,7 +2765,7 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 [[package]]
 name = "pmetal-mlx-rs"
 version = "0.25.8"
-source = "git+https://github.com/zakkeown/mlx-rs?rev=62cc804e920b96f6df382b7b6e93d90da1c9ecc2#62cc804e920b96f6df382b7b6e93d90da1c9ecc2"
+source = "git+https://github.com/zakkeown/mlx-rs?rev=c0e5c4a4350ec4989e5dc130158dee7757eae785#c0e5c4a4350ec4989e5dc130158dee7757eae785"
 dependencies = [
  "dyn-clone",
  "half",
@@ -2788,7 +2788,7 @@ dependencies = [
 [[package]]
 name = "pmetal-mlx-sys"
 version = "0.2.4"
-source = "git+https://github.com/zakkeown/mlx-rs?rev=62cc804e920b96f6df382b7b6e93d90da1c9ecc2#62cc804e920b96f6df382b7b6e93d90da1c9ecc2"
+source = "git+https://github.com/zakkeown/mlx-rs?rev=c0e5c4a4350ec4989e5dc130158dee7757eae785#c0e5c4a4350ec4989e5dc130158dee7757eae785"
 dependencies = [
  "bindgen",
  "cc",
