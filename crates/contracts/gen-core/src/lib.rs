@@ -10,6 +10,7 @@
 //! Numeric types here are restricted to `f32`/`f64`/`Vec<f32>`/`Vec<i32>`/`&[u8]` — never an
 //! `mlx_rs::Array` or candle tensor. See epic 3720 (the unified-contract roadmap, Phase 0).
 
+pub mod attention_budget;
 pub mod audio_dsp;
 pub mod audio_embed;
 pub mod audio_transform;
