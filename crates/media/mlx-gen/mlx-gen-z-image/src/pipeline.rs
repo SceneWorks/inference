@@ -11,6 +11,7 @@ use mlx_gen::array::host_i32;
 use mlx_gen::attention::{AttentionBudget, AttentionPlan};
 // The img2img leaves (start-step / init-image preprocess / noise-interp blend) are shared in core;
 // re-export so the crate's public surface (`mlx_gen_z_image::…`) and internal callers are unchanged.
+use mlx_gen::gen_core::TransformerComponent;
 pub use mlx_gen::img2img::{add_noise_by_interpolation, init_time_step, preprocess_init_image};
 use mlx_gen::tiling::TilingConfig;
 use mlx_gen::tokenizer::{TextTokenizer, TokenizerOutput};
@@ -440,6 +441,7 @@ pub(crate) fn encode_prompt(
     text_encoder: &TextEncoder,
     prompt: &str,
     id: &str,
+    encoder_window: Option<EncoderWindow<'_>>,
 ) -> Result<Array> {
     let t = tokenizer.tokenize(prompt)?;
     let (input_ids, attention_mask) = mlx_gen::tokenizer::to_arrays(&t);
@@ -450,7 +452,7 @@ pub(crate) fn encode_prompt(
     if num_valid == 0 {
         return Err(Error::Msg(format!("{id}: empty prompt")));
     }
-    let enc = text_encoder.forward(&input_ids, &attention_mask)?;
+    let enc = EncoderWindow::encode(encoder_window, text_encoder, &input_ids, &attention_mask)?;
     slice_valid(&enc, num_valid)
 }
 
@@ -478,6 +480,7 @@ pub(crate) fn encode_uncond(
     tokenizer: &TextTokenizer,
     text_encoder: &TextEncoder,
     negative: &str,
+    encoder_window: Option<EncoderWindow<'_>>,
 ) -> Result<Array> {
     let t = if negative.is_empty() {
         // `add_special_tokens = true` mirrors `tokenize`'s `encode(text, true)` (Qwen adds no BOS/EOS,
@@ -500,7 +503,7 @@ pub(crate) fn encode_uncond(
             "z_image: negative conditioning has no valid tokens".into(),
         ));
     }
-    let enc = text_encoder.forward(&input_ids, &attention_mask)?;
+    let enc = EncoderWindow::encode(encoder_window, text_encoder, &input_ids, &attention_mask)?;
     slice_valid(&enc, num_valid)
 }
 
@@ -596,6 +599,39 @@ pub(crate) fn resolve_block_window(
     is_sequential: bool,
     id: &str,
 ) -> Result<Option<usize>> {
+    Ok(resolve_window_for(req, is_sequential, id)?
+        .filter(|_| block_window_component(req).includes_dit()))
+}
+
+/// The rung-4 **component scope** for this request (SC-15794). `None` ⇒ [`TransformerComponent::Dit`],
+/// the by-convention scope every request had before the component existed.
+pub(crate) fn block_window_component(req: &GenerationRequest) -> TransformerComponent {
+    req.memory
+        .and_then(|m| m.transformer_window_component)
+        .unwrap_or_default()
+}
+
+/// [`resolve_block_window`]'s text-encoder twin (SC-15794): the window to apply to the **conditioning**
+/// stack, or `None` when this request's component scope excludes the encoder.
+///
+/// Shares the Sequential precondition for the same reason: under `Resident` the encoder is
+/// materialized once and reused across requests, so a window would be added on top of resident weights
+/// — more memory, not less.
+pub(crate) fn resolve_encoder_window(
+    req: &GenerationRequest,
+    is_sequential: bool,
+    id: &str,
+) -> Result<Option<usize>> {
+    Ok(resolve_window_for(req, is_sequential, id)?
+        .filter(|_| block_window_component(req).includes_text_encoder()))
+}
+
+/// The requested window plus the shared residency precondition, before the component scope narrows it.
+fn resolve_window_for(
+    req: &GenerationRequest,
+    is_sequential: bool,
+    id: &str,
+) -> Result<Option<usize>> {
     let window = block_window_size(req);
     if window.is_some() && !is_sequential {
         return Err(Error::Unsupported(format!(
@@ -605,6 +641,43 @@ pub(crate) fn resolve_block_window(
         )));
     }
     Ok(window)
+}
+
+/// One request's rung-4 text-encoder scope: the window, plus the cancel flag its boundaries are
+/// checked against. `Copy`, so it threads through the encode helpers as cheaply as the window alone.
+#[derive(Clone, Copy)]
+pub(crate) struct EncoderWindow<'a> {
+    pub(crate) window: usize,
+    pub(crate) cancel: &'a CancelFlag,
+}
+
+impl<'a> EncoderWindow<'a> {
+    /// The scope for this request, or `None` when the encoder is not in it.
+    pub(crate) fn resolve(
+        req: &'a GenerationRequest,
+        is_sequential: bool,
+        id: &str,
+    ) -> Result<Option<Self>> {
+        Ok(
+            resolve_encoder_window(req, is_sequential, id)?.map(|window| Self {
+                window,
+                cancel: &req.cancel,
+            }),
+        )
+    }
+
+    /// Run `text_encoder` under this scope, or resident when there is none.
+    fn encode(
+        scope: Option<Self>,
+        text_encoder: &TextEncoder,
+        input_ids: &Array,
+        attention_mask: &Array,
+    ) -> Result<Array> {
+        match scope {
+            Some(s) => text_encoder.forward_windowed(input_ids, attention_mask, s.window, s.cancel),
+            None => text_encoder.forward(input_ids, attention_mask),
+        }
+    }
 }
 
 /// Request-local, calibration-only fault injection at a physical phase boundary (SC-15449's

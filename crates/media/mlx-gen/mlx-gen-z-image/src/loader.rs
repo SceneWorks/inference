@@ -49,6 +49,32 @@ pub fn load_text_encoder(root: &Path) -> Result<TextEncoder> {
     load_text_encoder_from_weights(w)
 }
 
+/// The **streamable** encoder for rung 4's text-encoder scope (SC-15794): it records the re-openable
+/// directory so the layer stack can be materialized a window at a time.
+///
+/// **Only correct under `OffloadPolicy::Sequential`**, and [`crate::model`] gates it on exactly that.
+/// A streamable encoder holds no resident layers, so under `Resident` — where the same encoder is held
+/// across every request — it would re-materialize all 36 layers from disk on *every* encode and then
+/// release them, for no bound at all: the generator is long-lived, so there is nothing to bound.
+/// Measured on bf16 (warm page cache, so this is the optimistic bound): 250/148/165/209/301 ms
+/// resident versus 445/428/419/412/410 ms streamable, roughly 2x. The trainer's latent-caching loop
+/// pays that per dataset item, and the CFG generators pay it twice per generation.
+///
+/// Under `Sequential` the encoder is loaded and dropped per phase anyway, so the stream costs nothing
+/// extra and is what bounds the conditioning peak.
+pub fn load_text_encoder_streamable(root: &Path) -> Result<TextEncoder> {
+    let dir = root.join("text_encoder");
+    let w = Weights::from_dir(&dir)?;
+    TextEncoder::from_streamable_source(
+        &w,
+        mlx_gen::WeightsSource::Dir(dir),
+        "model",
+        &ZTextEncoderConfig::z_image(),
+    )
+}
+
+/// The in-memory / ComfyUI-normalized path: no re-openable source, so no stream. The contract declares
+/// the text-encoder component unavailable for such a load, exactly as it does for the DiT stream.
 pub(crate) fn load_text_encoder_from_weights(w: Weights) -> Result<TextEncoder> {
     TextEncoder::from_weights(&w, "model", &ZTextEncoderConfig::z_image())
 }

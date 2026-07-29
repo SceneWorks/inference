@@ -33,9 +33,16 @@
 //!
 //! **This is the MLX column, and it is not the Candle column.** As of SC-15754 the MLX lane carries
 //! all five rungs; `candle-gen-z-image` carries 0-3 and has no rung 4. Neither the presence nor the
-//! *magnitude* of a rung transfers between the two backends — rung 3 exists on both and is worth ~6×
+//! *magnitude* of a rung transfers between the two backends — rung 3 exists on both and is worth far
 //! more on Candle (see below), and rung 4 exists only here. Every per-backend saving in this file was
 //! measured on this backend.
+//!
+//! **Compare rung-3 magnitudes like-for-like.** An earlier revision of this note said rung 3 is worth
+//! "~6×" more on Candle. That was a scope error corrected in SC-15793: Candle's −32% is a **denoise-
+//! phase** delta while MLX's −5.0% is a **whole-request** one. On the denoise phase MLX measures
+//! **−1.7%**, so like-for-like the gap is −32% vs −1.7% — roughly an order of magnitude, not ~6×
+//! (and the two figures are published in different units, GB vs GiB). This file is calibration-facing,
+//! so the scope of every quoted number matters: see `gen_core::attention_budget` for the full table.
 //!
 //! **Rung 1 has no request-scoped lever.** Staging is gated on [`mlx_gen::Residency::is_sequential`],
 //! which comes from the *load-time* [`OffloadPolicy`](mlx_gen::OffloadPolicy), so selecting
@@ -134,6 +141,7 @@ use mlx_gen::gen_core::{
     ImageMemoryRuntimeSemantics, ImageMemorySafetyDecision, ImageMemorySelection,
     ImageMemoryStrategy, ImageMemoryStrategyCapability, ImageMemoryStrategyParameters,
     ImageMemoryStrategySupport, LoadSpec, PerComponentBytes, Result as CoreResult,
+    TransformerComponent,
 };
 
 /// The **default** decode tile edge for the native VAE — the 512 px parity sweet spot for this
@@ -293,6 +301,40 @@ pub const TRANSFORMER_WINDOW_SIZES: &[u32] = &[1];
 /// [`TRANSFORMER_WINDOW_SIZES`] for why the domain has one element.
 pub const TRANSFORMER_WINDOW_SIZE: u32 = 1;
 
+/// The rung-4 **component scopes** this provider implements (SC-15794).
+///
+/// All three are real: the DiT stream (SC-15754), the text-encoder stream, and both together. Each is
+/// measured on real weights — `text_encoder_window_real_weights` owns the encoder numbers and
+/// `block_residency_real_weights` the DiT ones.
+pub const TRANSFORMER_WINDOW_COMPONENTS: &[TransformerComponent] = &[
+    TransformerComponent::Dit,
+    TransformerComponent::TextEncoder,
+    TransformerComponent::Both,
+];
+
+/// The scope this provider declares as its **production selection**.
+///
+/// `Dit`, not `Both`, and that is a measured decision rather than caution.
+///
+/// The encoder scope does cut the conditioning phase hard (bf16 2.718 -> 1.455 GiB at window 1,
+/// -46.5%). But measured end-to-end through `generate()`, the z-image **request** peak is
+/// decode-bound at ~4.365 GiB on every tier, so the conditioning saving changes what the user pays by
+/// **0.0%** (`component_scope_real_weights`). The epic's rule is explicit: a win on a phase that does
+/// not move the request peak is not a win. Declaring `Both` here would make the selector pay the
+/// per-window re-materialization and write a rung-4-with-encoder-scope row into the calibration
+/// evidence for a run that saved nothing — the false green this epic keeps re-learning.
+///
+/// [`TRANSFORMER_WINDOW_COMPONENTS`] still publishes all three, because the capability is real and a
+/// caller may select it; this is only the default. The families where it should actually pay are the
+/// TE-dominant ones (Mage-Flow, lens, Kolors, flux2-klein, Sana), each of which owes its own
+/// measurement before flipping this — see `crate::text_encoder::stream`.
+///
+/// For the record, the large bf16 conditioning drop this story produced (8.489 -> 2.718 GiB, which is
+/// what took bf16 from conditioning-bound above an 8 GB budget to decode-bound inside it) comes from
+/// the encoder being *streamable at all* under `Sequential` — the per-layer view drain — and NOT from
+/// this component scope. Those are separate levers and only the first pays on z-image.
+pub const TRANSFORMER_WINDOW_COMPONENT: TransformerComponent = TransformerComponent::Dit;
+
 /// The one bounded-attention parameter this provider accepts: the shared
 /// [`mlx_gen::attention::CONSTRAINED_ATTN_SCORES_BUDGET`] (64 Mi score elements per attention call),
 /// the exact knob the Candle/CUDA Z-Image rung 3 measured in SC-15256 — reused verbatim so a
@@ -406,6 +448,7 @@ pub fn image_memory_contract(provider_id: &str, spec: &LoadSpec) -> ImageMemoryP
                     ImageMemoryStrategy::BoundedTransformerResidency if streamable => {
                         ImageMemoryParameterRanges {
                             transformer_window_sizes: TRANSFORMER_WINDOW_SIZES.to_vec(),
+                            transformer_window_components: TRANSFORMER_WINDOW_COMPONENTS.to_vec(),
                             ..Default::default()
                         }
                     }
@@ -506,6 +549,12 @@ pub(crate) fn z_image_generation_memory(
             chunk_attention: true,
             stream_transformer_blocks: true,
             transformer_window_size: parameters.transformer_window_size,
+            // SC-15794: carry the COMPONENT scope, not only the window size. Dropping it here would
+            // silently execute the DiT-only default while the evidence writer recorded whatever the
+            // selector chose — a rung-4-with-encoder-scope row for a run whose encoder never streamed.
+            // `window_component()` resolves `None` to the DiT default, so a pre-SC-15794 selection is
+            // unchanged.
+            transformer_window_component: Some(parameters.window_component()),
             ..decode
         }),
     }
@@ -818,6 +867,7 @@ pub fn declared_parameters() -> ImageMemoryStrategyParameters {
         decode_overlap: Some(DECODE_OVERLAP),
         attention_chunk_size: Some(ATTENTION_CHUNK_SIZE),
         transformer_window_size: Some(TRANSFORMER_WINDOW_SIZE),
+        transformer_window_component: Some(TRANSFORMER_WINDOW_COMPONENT),
     }
 }
 
@@ -871,6 +921,7 @@ mod tests {
                 ImageMemoryStrategy::BoundedTransformerResidency => ImageMemoryStrategyParameters {
                     attention_chunk_size: Some(ATTENTION_CHUNK_SIZE),
                     transformer_window_size: Some(TRANSFORMER_WINDOW_SIZE),
+                    transformer_window_component: Some(TRANSFORMER_WINDOW_COMPONENT),
                     ..decode
                 },
             },
@@ -1156,6 +1207,58 @@ mod tests {
         assert_eq!(contract.asset_facts, ImageMemoryAssetFacts::default());
     }
 
+    /// SC-15794: the rung-4 **component scope** must survive the selection -> `GenerationMemory`
+    /// mapping. This is the seam where it is easiest to lose: everything still compiles, the window
+    /// size still arrives, the run still succeeds — and the encoder silently never streams while the
+    /// evidence records that it did.
+    #[test]
+    fn the_rung_four_component_scope_reaches_the_request() {
+        for component in [
+            TransformerComponent::Dit,
+            TransformerComponent::TextEncoder,
+            TransformerComponent::Both,
+        ] {
+            let mut selection =
+                selection_for(ImageMemoryStrategy::BoundedTransformerResidency, false);
+            selection.parameters.transformer_window_component = Some(component);
+            let memory = z_image_generation_memory(&selection)
+                .expect("rung 4 maps to a request-scoped control set");
+            assert_eq!(
+                memory.transformer_window_component,
+                Some(component),
+                "the {component:?} scope was dropped between the selection and the request"
+            );
+        }
+
+        // A selection written before the component existed must keep its exact previous meaning: the
+        // DiT-only default, not "unset".
+        let selection = selection_for(ImageMemoryStrategy::BoundedTransformerResidency, false);
+        assert_eq!(
+            selection.parameters.transformer_window_component,
+            Some(TRANSFORMER_WINDOW_COMPONENT)
+        );
+        let memory = z_image_generation_memory(&selection).expect("rung 4 controls");
+        assert_eq!(
+            memory.transformer_window_component,
+            Some(TransformerComponent::Dit),
+            "the provider's declared production scope is Dit; the request must say so explicitly \
+             rather than relying on a None that a later reader could interpret differently"
+        );
+
+        // Below rung 4 the scope is meaningless and must not be smuggled in.
+        for lower in [
+            ImageMemoryStrategy::BoundedDecode,
+            ImageMemoryStrategy::BoundedAttention,
+        ] {
+            let memory = z_image_generation_memory(&selection_for(lower, false)).expect("controls");
+            assert!(
+                memory.transformer_window_component.is_none(),
+                "{lower:?} carried a rung-4 component scope"
+            );
+            assert!(!memory.stream_transformer_blocks);
+        }
+    }
+
     #[test]
     fn the_ladder_maps_to_cumulative_request_controls() {
         let decode = GenerationMemory {
@@ -1189,6 +1292,8 @@ mod tests {
                 chunk_attention: true,
                 stream_transformer_blocks: true,
                 transformer_window_size: Some(TRANSFORMER_WINDOW_SIZE),
+                // SC-15794: rung 4 now carries its component scope through to the request.
+                transformer_window_component: Some(TRANSFORMER_WINDOW_COMPONENT),
                 ..decode
             })
         );

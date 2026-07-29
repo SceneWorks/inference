@@ -1365,6 +1365,9 @@ mod tests {
             decode_overlap: Some(128),
             attention_chunk_size: Some(pipeline::CONSTRAINED_ATTN_SCORES_BUDGET as u32),
             transformer_window_size: Some(1),
+            // Krea streams only the DiT (SC-15794 scoped the encoder for z-image); None is the
+            // DiT-only default, so this declaration is unchanged in meaning.
+            transformer_window_component: None,
         };
         let selected = |strategy| gen_core::ImageMemorySelection {
             strategy,

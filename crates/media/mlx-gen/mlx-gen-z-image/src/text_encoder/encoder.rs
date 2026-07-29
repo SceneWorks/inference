@@ -12,6 +12,7 @@ use mlx_gen::Result;
 use super::{join, EncoderLayer, TextRope};
 
 /// Z-Image text-encoder dimensions (Qwen3-style decoder LM).
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ZTextEncoderConfig {
     pub vocab_size: i32,
     pub hidden_size: i32,
@@ -45,6 +46,16 @@ pub struct TextEncoder {
     embed_tokens: TokenEmbedding,
     layers: Vec<EncoderLayer>,
     rope: TextRope,
+    /// Rung-4 text-encoder scope (SC-15794). `Some` ⇒ [`TextEncoder::forward_windowed`] may
+    /// materialize the stack a window at a time **instead of** touching `layers`.
+    ///
+    /// `layers` stays populated either way, exactly as the DiT stream leaves its resident stack
+    /// populated. Under `Sequential` those are unevaluated lazy handles costing ~0 bytes
+    /// (SC-15744 measured 1073 DiT handles at 0.0 MiB), and a windowed forward never touches them, so
+    /// they stay that way — while a plain [`forward`](Self::forward) on the same encoder still runs the
+    /// full resident stack correctly. Emptying `layers` instead would make an unscoped `forward` return
+    /// the bare embedding: a silent, catastrophic conditioning bug rather than a memory saving.
+    stream: Option<super::stream::TextEncoderBlockStream>,
 }
 
 impl TextEncoder {
@@ -71,7 +82,49 @@ impl TextEncoder {
             embed_tokens,
             layers,
             rope: TextRope::new(cfg.head_dim, cfg.rope_theta),
+            stream: None,
         })
+    }
+
+    /// Rung 4, text-encoder scope (SC-15794): load **only** the token embedding and keep the 36 layers
+    /// in the re-openable snapshot, materializing them a window at a time in [`Self::forward_windowed`].
+    ///
+    /// `source` must be re-openable (a directory or a single `.safetensors`); an in-memory load has no
+    /// such source and must keep using [`Self::from_weights`].
+    ///
+    /// The embedding stays resident because it is not block-shaped and is a small share of the encoder
+    /// — measured 0.724 GiB of bf16's 7.440 GiB, 0.204 of q4's 2.132 (SC-15794). Streaming the layers
+    /// is what moves the number.
+    ///
+    /// The resident `layers` are deliberately **not** built. Holding them as lazy handles alongside
+    /// the stream was measured and costs most of the saving — q4 conditioning bounded to −38.3% with
+    /// them versus −88.7% without (SC-15794) — because the constructor clones refcounted handles out
+    /// of the view rather than leaving the tensors untouched.
+    ///
+    /// A plain [`forward`](Self::forward) on such an encoder is still correct: it detects the empty
+    /// stack and runs the stream as a single full-width window, which is the same arithmetic at the
+    /// same cost as resident. So this is a drop-in, and there is no state in which the encoder
+    /// silently conditions on the bare embedding.
+    pub fn from_streamable_source(
+        w: &Weights,
+        source: mlx_gen::WeightsSource,
+        prefix: &str,
+        cfg: &ZTextEncoderConfig,
+    ) -> Result<Self> {
+        let embed_tokens = crate::quant::embedding(w, &join(prefix, "embed_tokens"))?;
+        Ok(Self {
+            embed_tokens,
+            layers: Vec::new(),
+            rope: TextRope::new(cfg.head_dim, cfg.rope_theta),
+            stream: Some(super::stream::TextEncoderBlockStream::new(
+                source, prefix, *cfg,
+            )),
+        })
+    }
+
+    /// `true` when this encoder can run the rung-4 text-encoder scope.
+    pub fn is_streamable(&self) -> bool {
+        self.stream.is_some()
     }
 
     /// Quantize the encoder to Q4/Q8 (group_size 64): the token embedding + every layer's Linears
@@ -83,12 +136,36 @@ impl TextEncoder {
         for layer in &mut self.layers {
             layer.quantize(bits)?;
         }
+        // A streamed stack has no resident layers to quantize now, so record the bits and replay them
+        // on every materialized layer instead. Without this a streamed q4/q8 encoder would run dense
+        // layers against a packed embedding — correct-looking output at the wrong precision and the
+        // wrong memory, which is precisely the silent failure rung 4 keeps producing when the streamed
+        // and resident paths are not held byte-identical.
+        if let Some(stream) = self.stream.as_mut() {
+            stream.set_quant_bits(bits);
+        }
         Ok(())
     }
 
     /// `input_ids` / `attention_mask`: `[b, s]` int32. Returns `[b, s, hidden]` (f32) — the
     /// second-to-last layer's hidden states, matching the fork's `all_hidden_states[-2]`.
     pub fn forward(&self, input_ids: &Array, attention_mask: &Array) -> Result<Array> {
+        // A streamable encoder holds no resident layers (that is where its saving comes from), so an
+        // unscoped `forward` on one must run the stream rather than an empty stack — otherwise it
+        // would silently return the bare token embedding as `cap_feats`, which is a catastrophic
+        // conditioning bug that produces plausible-looking images. One full-width window is the same
+        // arithmetic at the same cost as the resident stack, so this stays a drop-in.
+        // `the_unscoped_forward_on_a_streamable_encoder_still_runs_every_layer` pins it.
+        if self.layers.is_empty() {
+            if let Some(stream) = self.stream.as_ref() {
+                return self.forward_windowed(
+                    input_ids,
+                    attention_mask,
+                    stream.n_blocks(),
+                    &mlx_gen::CancelFlag::default(),
+                );
+            }
+        }
         let sh = input_ids.shape();
         let (b, s) = (sh[0], sh[1]);
 
@@ -107,6 +184,40 @@ impl TextEncoder {
             second_to_last = std::mem::replace(&mut prev, cur);
         }
         Ok(second_to_last)
+    }
+
+    /// [`forward`](Self::forward) with rung 4's text-encoder scope applied (SC-15794): the layer stack
+    /// is materialized `window` layers at a time from the snapshot rather than held resident.
+    ///
+    /// Everything outside the stack — the token embedding, RoPE, the mask build, and the
+    /// second-to-last selection — is byte-for-byte the resident path, and each streamed layer is
+    /// quantized identically to its resident twin. So the two forwards compute the same arithmetic in
+    /// the same order; only *when the weights exist* differs.
+    ///
+    /// Errors when this encoder has no re-openable source, rather than silently running resident: a
+    /// caller that selected the rung must not be told it ran when it did not.
+    pub fn forward_windowed(
+        &self,
+        input_ids: &Array,
+        attention_mask: &Array,
+        window: usize,
+        cancel: &mlx_gen::CancelFlag,
+    ) -> Result<Array> {
+        let stream = self.stream.as_ref().ok_or_else(|| {
+            mlx_gen::Error::Msg(
+                "z-image: the rung-4 text-encoder scope was requested but this encoder has no \
+                 re-openable weights source (an in-memory / ComfyUI load); the contract declares the \
+                 text-encoder component unavailable for such a load"
+                    .to_owned(),
+            )
+        })?;
+        let sh = input_ids.shape();
+        let (b, s) = (sh[0], sh[1]);
+        let embed = self.embed_tokens.forward(input_ids)?;
+        let (cos, sin) = self.rope.forward(s)?;
+        let mask = build_mask(attention_mask, b, s)?;
+        let plan = mlx_gen::block_residency::BlockPlan::new(stream.n_blocks(), window)?;
+        super::stream::run_windowed_layers(stream, &plan, cancel, embed, &cos, &sin, &mask)
     }
 }
 

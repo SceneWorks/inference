@@ -369,6 +369,10 @@ impl ZImageTurboControl {
         // silently degraded (see `pipeline::resolve_block_window`).
         let block_window =
             pipeline::resolve_block_window(req, self.residency.is_sequential(), MODEL_ID)?;
+        // Rung 4, text-encoder scope (SC-15794): None unless the request names a component scope that
+        // includes the encoder, so an unscoped request conditions exactly as before.
+        let encoder_window =
+            pipeline::EncoderWindow::resolve(req, self.residency.is_sequential(), MODEL_ID)?;
         let images = self.residency.run_staged(
             &req.cancel,
             // No PiD overlay on the control path (sc-7846 is base-turbo-only); the heavy loader ignores
@@ -390,8 +394,13 @@ impl ZImageTurboControl {
                     mlx_gen::gen_core::ImageMemoryPhase::Conditioning,
                     MODEL_ID,
                 )?;
-                let cap =
-                    pipeline::encode_prompt(&self.tokenizer, text_encoder, &req.prompt, MODEL_ID)?;
+                let cap = pipeline::encode_prompt(
+                    &self.tokenizer,
+                    text_encoder,
+                    &req.prompt,
+                    MODEL_ID,
+                    encoder_window,
+                )?;
                 if is_img2img {
                     Ok(cap)
                 } else {

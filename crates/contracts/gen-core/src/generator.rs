@@ -479,6 +479,17 @@ pub struct GenerationMemory {
     /// Number of consecutive transformer trunk blocks held materialized at once when
     /// [`Self::stream_transformer_blocks`] is set. `None` ⇒ the provider's default window.
     pub transformer_window_size: Option<u32>,
+    /// Which transformer(s) [`Self::stream_transformer_blocks`] applies to (SC-15794). `None` ⇒
+    /// [`TransformerComponent::Dit`](crate::image_memory::TransformerComponent::Dit), the
+    /// by-convention scope every provider had before the component scope existed — so an untouched
+    /// request is byte-for-byte unaffected.
+    ///
+    /// The text-encoder scope exists because rung 4 cut the denoise far enough that **conditioning
+    /// became the binding phase** on the larger tiers. Measured on z_image_turbo at 1024²
+    /// (Apple/Metal, real weights, SC-15794): conditioning binds bf16 at 8.344 GiB against a 4.365
+    /// GiB decode floor, and the encoder's weights are 7.440 GiB of that — so the window has real
+    /// work to do there, while q4 is already decode-bound and gains nothing.
+    pub transformer_window_component: Option<crate::image_memory::TransformerComponent>,
 
     /// Calibration-only request-local fault injection. Adopting providers may return a deterministic
     /// error at the named physical phase boundary so a conformance harness can verify cleanup and a
@@ -2126,6 +2137,7 @@ mod tests {
                 decode_tile_edge: None,
                 decode_overlap: None,
                 transformer_window_size: None,
+                transformer_window_component: None,
                 calibration_error_phase: None,
             }
         );

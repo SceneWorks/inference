@@ -49,7 +49,8 @@ pub use control_transformer::{ZImageControlTransformer, CONTROL_IN_DIM};
 pub use control_transformer_block::ZImageControlBlock;
 pub use final_layer::FinalLayer;
 pub use loader::{
-    load_control_transformer, load_text_encoder, load_tokenizer, load_transformer, load_vae,
+    load_control_transformer, load_text_encoder, load_text_encoder_streamable, load_tokenizer,
+    load_transformer, load_vae,
 };
 pub use model::{
     descriptor, load, load_from_comfyui_checkpoint, load_from_comfyui_components, ZImageTurbo,
