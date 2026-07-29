@@ -1,233 +1,161 @@
-//! Rung 4 — **bounded transformer residency** (sc-15750, epic 15448).
+//! Rung 4 — **bounded transformer residency**, the MLX half (SC-15750, hoisted by SC-15790).
 //!
-//! The shared sibling of [`crate::residency`] (rung 1, phase-level shedding) and
-//! [`crate::vae_tiling`] (rung 2, decode tiling). Where rung 1 drops the whole DiT *between* phases,
-//! this bounds residency *within* the denoise phase: hold a WINDOW of consecutive transformer blocks
-//! materialized, run it, release it, advance. Peak transformer weight residency becomes
-//! `window_size × per-block bytes` instead of the whole stack.
+//! The schedule itself lives in [`gen_core::block_window`]: window arithmetic, loop order, release
+//! discipline and the cancellation contract are identical on every backend. This module supplies the
+//! two MLX-specific operations and keeps the call shape the providers already use.
 //!
-//! Both compose — rung 4 runs inside rung 1's `Heavy` phase, it does not replace it.
+//! MLX's half is small on purpose:
+//! - the view is [`Weights`] — `Array` handles from `load_safetensors`, which are **lazy per tensor**
+//!   (1073 handles cost 0.0 MiB until something is evaluated), so re-opening per window is nearly free;
+//! - the release is `mlx_rs::memory::clear_cache()`.
 //!
-//! ## Why this is a shared primitive and not per-family code
+//! ## Measured on MLX (SC-15744 / SC-15750, real z-image-turbo q4, Apple/Metal)
 //!
-//! The mechanism is identical for every block-stacked model (Z-Image, Mage-Flow, Qwen, FLUX). Rungs
-//! 1 and 2 already live here; rung 3 (`sdpa_budgeted_bhsd`) joined them. Leaving rung 4 to whichever
-//! family reached it first meant building it once and copying it nineteen times.
+//! These are MLX numbers and establish only that the shape works — they predict nothing about another
+//! backend, which is the rule rung 3 taught the hard way (~6x different value across backends).
 //!
-//! ## Measured basis (SC-15744, real z-image-turbo q4 weights, Apple/Metal)
-//!
-//! - `Array::load_safetensors_with_metadata` is **lazy per tensor** — 1073 handles cost 0.0 MiB until
-//!   something is evaluated. Re-opening the file per step is therefore nearly free.
-//! - One block materializes at **97.3 MiB** against a header-computed 97.1 MiB — no hidden copy.
-//! - Dropping returns the memory: active fell to 8.0 MiB and stayed flat across all 30 blocks.
-//! - Packed-quant survives it: `quantized_matmul` works on a per-block materialized
-//!   `weight`/`scales`/`biases` triple, because each is an independent file entry rather than a slice
-//!   of one packed buffer.
-//! - All 30 blocks resident: **2918.3 MiB**. Windowed sweep peak: **97.3 MiB** — a 30.0× reduction,
-//!   the theoretical ideal.
-//! - Re-materializing every block once per denoise step cost **~0.309 s/step** with a warm page
-//!   cache on a 128 GB machine. That is the OPTIMISTIC bound: the hosts that need this are small
-//!   Macs under pressure, where the page cache is the first thing evicted. Widen the window if a
-//!   constrained-host measurement is materially worse.
-//!
-//! ## The trap this module exists to prevent
-//!
-//! MLX is lazy. Block *n*'s output is an unevaluated graph node referencing block *n*'s weights, so
-//! **dropping the window before forcing evaluation frees nothing** — the graph still holds it. This
-//! is the block-level twin of the hazard [`crate::residency::Residency::run_staged`] documents for
-//! `materialize_mid`, and it is silent: you get correct images and no memory saving.
-//!
-//! [`run_windowed`] therefore materializes the carried state before releasing each window, and
-//! `block_window_without_materialize_frees_nothing` pins that the guard is load-bearing rather than
-//! decorative. Measured, same weights, window = 1:
-//!
-//! | | peak |
-//! |---|---:|
-//! | with the materialize guard | **8.0 MiB** |
-//! | without it | **238.4 MiB** — identical to fully resident |
-//!
-//! i.e. omitting it costs the entire saving while still producing correct output. That is the failure
-//! mode to design against: silent, not loud.
-//!
-//! ## Measured window sweep (`block_residency_real_weights`)
+//! One block materializes at **97.3 MiB** against a header-computed 97.1 MiB — no hidden copy.
+//! Dropping returns it: active falls to 8.0 MiB and stays flat across all 30 blocks. Packed-quant
+//! survives it — `quantized_matmul` works on a per-block materialized `weight`/`scales`/`biases`
+//! triple, because each is an independent file entry rather than a slice of one packed buffer.
 //!
 //! | window | peak | vs resident |
 //! |---:|---:|---:|
-//! | 1 | 8.0 MiB | 29.9× |
-//! | 2 | 15.9 MiB | 15.0× |
-//! | 4 | 31.8 MiB | 7.5× |
-//! | 8 | 63.6 MiB | 3.7× |
+//! | 1 | 8.0 MiB | 29.9x |
+//! | 2 | 15.9 MiB | 15.0x |
+//! | 4 | 31.8 MiB | 7.5x |
+//! | 8 | 63.6 MiB | 3.7x |
 //! | 30 (resident) | 238.4 MiB | — |
 //!
-//! Linear in window size, as the contract requires. (Absolute figures are below the 97.3 MiB/block of
-//! SC-15744 because that test walks one packed triple per block rather than all 31 tensors; the
-//! RATIOS are the invariant, and they are exact.)
+//! Linear in window size, which is the contract. Re-materializing every block once per denoise step
+//! cost ~0.309 s/step with a warm page cache on a 128 GB machine — the OPTIMISTIC bound, since the
+//! hosts this rung exists for are small Macs under pressure where the page cache is evicted first.
+//!
+//! ## The trap, and why it is MLX's reason and not a universal one
+//!
+//! MLX is lazy, so the carried activation is an unevaluated graph node still referencing the window's
+//! weights: **dropping before forcing evaluation frees nothing**. Measured at window = 1, **8.0 MiB
+//! with the guard vs 238.4 MiB without** — identical to fully resident, with correct output either
+//! way. Silent, not loud. `block_window_without_materialize_frees_nothing` pins it.
+//!
+//! An eager backend has no lazy graph to cut and may not need this at all — or may need it for an
+//! unrelated reason. [`gen_core::block_window`] carries the obligation's shape; the reason is per
+//! backend and must be measured there.
 
 use std::ops::Range;
 
+use gen_core::block_window::BlockWindowBackend;
 use gen_core::runtime::CancelFlag;
 
 use crate::weights::Weights;
-use crate::{Error, Result};
+use crate::Result;
 
-/// How the block stack is split into windows.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct BlockPlan {
-    n_blocks: usize,
-    window: usize,
+/// Re-exported so providers keep a single import path. The type is backend-neutral arithmetic.
+pub use gen_core::block_window::BlockPlan;
+
+/// Binds MLX's two operations to the shared driver: a fresh lazily-loaded [`Weights`] view per
+/// window, and `clear_cache()` to return the allocator's holdings after the window drops.
+struct MlxWindowBackend<F> {
+    open: F,
 }
 
-impl BlockPlan {
-    /// `window` is the number of consecutive blocks held materialized at once. `1` is the tightest
-    /// (lowest peak, most re-materialization); `n_blocks` degenerates to fully resident.
-    ///
-    /// Deliberately NOT defaulted to a constant: the right window is a measured trade between peak
-    /// residency and per-step re-materialization cost, and it differs per model and per host. It is
-    /// carried as `strategyParameters.streamedBlocks.transformerWindowSize` in the calibration
-    /// contract so the selected value travels with the evidence that justified it.
-    pub fn new(n_blocks: usize, window: usize) -> Result<Self> {
-        if n_blocks == 0 {
-            return Err(Error::Msg("block plan needs at least one block".to_owned()));
-        }
-        if window == 0 {
-            return Err(Error::Msg("block window must be >= 1".to_owned()));
-        }
-        Ok(Self {
-            n_blocks,
-            window: window.min(n_blocks),
-        })
+impl<F> BlockWindowBackend for MlxWindowBackend<F>
+where
+    F: FnMut() -> Result<Weights>,
+{
+    type View = Weights;
+
+    fn open_view(&mut self) -> gen_core::Result<Weights> {
+        (self.open)().map_err(Into::into)
     }
 
-    /// Fully-resident equivalent — one window covering every block. Useful as the A-side of a parity
-    /// test, so the windowed path is compared against the same code path rather than a second one.
-    pub fn resident(n_blocks: usize) -> Result<Self> {
-        Self::new(n_blocks, n_blocks)
-    }
-
-    pub fn n_blocks(&self) -> usize {
-        self.n_blocks
-    }
-
-    pub fn window(&self) -> usize {
-        self.window
-    }
-
-    /// Whether this plan actually bounds anything (a single all-covering window does not).
-    pub fn is_bounded(&self) -> bool {
-        self.window < self.n_blocks
-    }
-
-    /// The half-open block ranges, in order.
-    pub fn windows(&self) -> impl Iterator<Item = Range<usize>> + '_ {
-        (0..self.n_blocks)
-            .step_by(self.window)
-            .map(move |start| start..(start + self.window).min(self.n_blocks))
-    }
-
-    /// How many windows a single denoise step walks.
-    pub fn window_count(&self) -> usize {
-        self.n_blocks.div_ceil(self.window)
+    fn release(&self) {
+        mlx_rs::memory::clear_cache();
     }
 }
 
-/// Run one denoise step's worth of block windows, carrying `state` (the hidden activations) through.
+/// Run one denoise step's worth of block windows over MLX weights.
 ///
-/// Lifecycle per window: open a lazy weights view, hand it to `apply` (which takes the window's
-/// tensors OUT of it and runs the blocks), **force evaluation of the carried state**, then drop the
-/// window's weights and release the allocator cache.
+/// Thin adapter over [`gen_core::block_window::run_windowed`] — see there for the lifecycle and the
+/// ordering guarantees. The signature is unchanged from before the hoist, so provider code needs no
+/// edits.
 ///
-/// - `open` yields lazily-loaded weights. It is called once per window and must be cheap — a
-///   safetensors open is ~0 bytes until something is evaluated. It is a closure rather than a stored
-///   `Weights` on purpose: a `Weights` retained across windows would keep every materialized buffer
-///   alive through its own map, defeating the release.
-/// - `apply` MUST take ownership of the tensors it uses (`Weights::remove`), not clone them. `Array`
-///   is refcounted, so a clone left behind in the map keeps the materialized buffer resident.
-/// - `materialize` forces evaluation of the carried state. Without it the drop below frees nothing.
-///
-/// Cancellation is checked at every window boundary; the cache is released on every exit path,
-/// including the early return from a cancelled or failed window.
+/// `apply` MUST take its tensors out of the view (`Weights::remove`) rather than cloning them:
+/// `Array` is refcounted, so a clone left in the map keeps the materialized buffer resident and the
+/// bound silently does not hold.
 pub fn run_windowed<S>(
     plan: &BlockPlan,
     cancel: &CancelFlag,
     init: S,
-    mut open: impl FnMut() -> Result<Weights>,
+    open: impl FnMut() -> Result<Weights>,
     mut apply: impl FnMut(S, &mut Weights, Range<usize>) -> Result<S>,
     materialize: impl Fn(&S) -> Result<()>,
 ) -> Result<S> {
-    let mut state = init;
-    for range in plan.windows() {
-        if cancel.is_cancelled() {
-            mlx_rs::memory::clear_cache();
-            // The TYPED variant, not `Error::Msg("cancelled")`. `Error::Canceled` exists so the worker
-            // and the conformance harness can tell a user cancellation from a backend failure
-            // (sc-4481); a generic message here reports a cancelled render as a *failed* job. This was
-            // latent while nothing consumed the primitive — SC-15754 is its first production caller,
-            // so it would have shipped as a regression the moment rung 4 became selectable.
-            return Err(Error::Canceled);
-        }
-
-        let mut view = open()?;
-        // A window that fails must not leave its half-materialized weights behind for the next
-        // request to inherit, so the cache is released on the error path too.
-        state = match apply(state, &mut view, range.clone()) {
-            Ok(next) => next,
-            Err(e) => {
-                drop(view);
-                mlx_rs::memory::clear_cache();
-                return Err(e);
-            }
-        };
-
-        // LOAD-BEARING: the carried state is a lazy graph node still referencing this window's
-        // weights. Dropping before this call frees nothing and the bound silently does not hold.
-        if let Err(e) = materialize(&state) {
-            drop(view);
-            mlx_rs::memory::clear_cache();
-            return Err(e);
-        }
-
-        drop(view);
-        mlx_rs::memory::clear_cache();
-    }
-    Ok(state)
+    let mut backend = MlxWindowBackend { open };
+    gen_core::block_window::run_windowed(
+        &mut backend,
+        plan,
+        cancel,
+        init,
+        |state, view, range| apply(state, view, range).map_err(Into::into),
+        |state| materialize(state).map_err(Into::into),
+    )
+    .map_err(Into::into)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Error;
 
+    /// The cancellation path now crosses a crate boundary — `gen_core::Error::Canceled` has to come
+    /// back as `mlx_gen::Error::Canceled`, not collapse into `Error::Msg`.
+    ///
+    /// A real regression risk rather than a hypothetical: the pre-hoist driver returned
+    /// `Error::Msg("cancelled")` and SC-15754 had to fix it to the typed variant, because a
+    /// stringified cancellation reports a cancelled render as a FAILED job (sc-4481). The hoist
+    /// re-routes that path through two `From` conversions, either of which could silently flatten it.
     #[test]
-    fn windows_cover_every_block_exactly_once() {
-        let plan = BlockPlan::new(30, 4).unwrap();
-        let covered: Vec<usize> = plan.windows().flat_map(|r| r.collect::<Vec<_>>()).collect();
-        assert_eq!(covered, (0..30).collect::<Vec<_>>());
-        assert_eq!(plan.window_count(), 8); // 7 full + 1 partial
-    }
+    fn cancellation_survives_the_gen_core_boundary_as_the_typed_variant() {
+        let cancel = CancelFlag::default();
+        cancel.cancel();
 
-    #[test]
-    fn a_ragged_tail_is_not_dropped() {
-        // 30 blocks at window 7 leaves a 2-block tail; losing it would silently skip layers.
-        let plan = BlockPlan::new(30, 7).unwrap();
-        let last = plan.windows().last().unwrap();
-        assert_eq!(last, 28..30);
-        assert_eq!(
-            plan.windows().flat_map(|r| r.collect::<Vec<_>>()).count(),
-            30
+        let err = run_windowed(
+            &BlockPlan::new(4, 2).unwrap(),
+            &cancel,
+            0usize,
+            || Ok(Weights::empty()),
+            |s, _v: &mut Weights, _r| Ok(s),
+            |_| Ok(()),
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(err, Error::Canceled),
+            "cancellation must round-trip as Error::Canceled, not a message: {err:?}"
         );
     }
 
+    /// A provider error must arrive intact rather than being flattened by the round trip.
     #[test]
-    fn window_is_clamped_and_resident_is_unbounded() {
-        let plan = BlockPlan::new(30, 999).unwrap();
-        assert_eq!(plan.window(), 30);
-        assert!(!plan.is_bounded(), "one all-covering window bounds nothing");
-        assert!(BlockPlan::new(30, 4).unwrap().is_bounded());
-        assert_eq!(BlockPlan::resident(30).unwrap().window_count(), 1);
-    }
+    fn a_provider_error_survives_the_boundary() {
+        let err = run_windowed(
+            &BlockPlan::new(2, 1).unwrap(),
+            &CancelFlag::default(),
+            0usize,
+            || Ok(Weights::empty()),
+            |_s, _v: &mut Weights, _r| -> Result<usize> {
+                Err(Error::MissingTensor(
+                    "layers.0.attention.to_k.weight".into(),
+                ))
+            },
+            |_| Ok(()),
+        )
+        .unwrap_err();
 
-    #[test]
-    fn degenerate_plans_are_rejected() {
-        assert!(BlockPlan::new(0, 1).is_err());
-        assert!(BlockPlan::new(30, 0).is_err());
+        assert!(
+            matches!(err, Error::MissingTensor(ref k) if k.ends_with("to_k.weight")),
+            "expected the typed MissingTensor to survive, got {err:?}"
+        );
     }
 }

@@ -13,6 +13,7 @@
 pub mod audio_dsp;
 pub mod audio_embed;
 pub mod audio_transform;
+pub mod block_window;
 pub mod caption;
 pub mod control;
 pub mod error;
