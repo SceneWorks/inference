@@ -1,4 +1,4 @@
-//! Z-Image MLX adoption of the shared image-memory contract (SC-15449) — the **complete** ladder:
+//! Z-Image MLX adoption of the shared memory-strategy contract (SC-15449) — the **complete** ladder:
 //! rung 3 (bounded attention, SC-15615), rung 4 (bounded transformer residency, SC-15754), and the
 //! widened rung-2 decode domain plus the PiD reconciliation (SC-15510).
 //!
@@ -14,7 +14,7 @@
 //! `jobs_store::routing::mlx` maps `z_image_turbo | z_image_edit` to the same eligibility and engine,
 //! and the matrix generator's `backendScopes` inherits the entry's advertised backends from
 //! `z_image_turbo` (`z_image_edit inherits its backend scopes from the z_image_turbo provider`).
-//! Consequently `ImageMemoryMode::Edit` must be admissible on this contract — see
+//! Consequently `MemoryMode::Edit` must be admissible on this contract — see
 //! `the_edit_surface_z_image_edit_resolves_to_is_admissible`.
 //!
 //! ## Declared rungs
@@ -129,19 +129,17 @@
 //!
 //! This file declares *structure and parameter domains only*. Measured coefficients, envelopes, and
 //! per-tier peaks live in SceneWorks generated evidence keyed by
-//! [`IMAGE_MEMORY_CALIBRATION_FINGERPRINT`]; the worker owns live-budget accounting and least-cost
+//! [`MEMORY_CALIBRATION_FINGERPRINT`]; the worker owns live-budget accounting and least-cost
 //! selection. The scope below is defense in depth: it can reject a selection, never substitute one.
 
 use mlx_gen::gen_core::{
-    Error as CoreError, GenerationMemory, GenerationRequest, ImageMemoryAssetFacts,
-    ImageMemoryBackendRealization, ImageMemoryCalibrationIdentity, ImageMemoryFormulaKind,
-    ImageMemoryFormulaVariable, ImageMemoryGeometry, ImageMemoryLifecycleCapabilities,
-    ImageMemoryParameterRanges, ImageMemoryPhase, ImageMemoryProviderContract,
-    ImageMemoryRequestScope, ImageMemoryRunContext, ImageMemoryRunOutcome,
-    ImageMemoryRuntimeSemantics, ImageMemorySafetyDecision, ImageMemorySelection,
-    ImageMemoryStrategy, ImageMemoryStrategyCapability, ImageMemoryStrategyParameters,
-    ImageMemoryStrategySupport, LoadSpec, PerComponentBytes, Result as CoreResult,
-    TransformerComponent,
+    Error as CoreError, GenerationMemory, GenerationRequest, LoadSpec, MemoryAssetFacts,
+    MemoryBackendRealization, MemoryCalibrationIdentity, MemoryFormulaKind, MemoryFormulaVariable,
+    MemoryGeometry, MemoryLifecycleCapabilities, MemoryParameterRanges, MemoryPhase,
+    MemoryProviderContract, MemoryRequestScope, MemoryRunContext, MemoryRunOutcome,
+    MemoryRuntimeSemantics, MemorySafetyDecision, MemorySelection, MemoryStrategy,
+    MemoryStrategyCapability, MemoryStrategyParameters, MemoryStrategySupport, PerComponentBytes,
+    Result as CoreResult, TransformerComponent,
 };
 
 /// The **default** decode tile edge for the native VAE — the 512 px parity sweet spot for this
@@ -161,7 +159,7 @@ pub const DECODE_OVERLAP: u32 = 64;
 /// **The candidate set was measured, not inherited.** SC-15510's own note proposed adopting the
 /// current-pin-verified `768/640/512/448/384/320/256` ladder on the grounds that both families drive
 /// the same `mlx_gen::vae_tiling` machinery. That ladder is SceneWorks'
-/// `image-memory-mlx-adapter` probe sweep, and it was measured on the **Qwen** VAE — a different
+/// `memory-mlx-adapter` probe sweep, and it was measured on the **Qwen** VAE — a different
 /// decoder. Sharing the tiling machinery does not transfer a candidate set any more than sharing a
 /// rung's name transfers its magnitude between backends; what transfers is the mechanism, and the
 /// numbers have to be re-measured on the decoder that will run them. Swept against the **exact
@@ -348,7 +346,7 @@ pub const ATTENTION_CHUNK_SIZE: u32 = mlx_gen::attention::CONSTRAINED_ATTN_SCORE
 /// `-v2` retires the SC-15615 rung-3 declaration: rung 4 changes *when the trunk weights exist*
 /// during a denoise step, and the rung-2 decode domain is no longer a single point — both are
 /// execution-structure changes, so evidence taken against `-v1` must not be readable as covering this.
-pub const IMAGE_MEMORY_CALIBRATION_FINGERPRINT: &str =
+pub const MEMORY_CALIBRATION_FINGERPRINT: &str =
     "z-image-mlx-staged-tiled-decode-bounded-attention-block-window-v2";
 
 /// The decode candidates a route will accept, and the default it falls back to.
@@ -394,7 +392,7 @@ fn all_decode_overlaps() -> Vec<u32> {
 /// snapshot root, which is what the MLX loader actually materializes (the tier subdirectory is already
 /// the spec root for a pre-quantized turnkey). A single-file (ComfyUI) source has no component tree,
 /// so its asset facts stay zero rather than reporting a fabricated split.
-pub fn image_memory_contract(provider_id: &str, spec: &LoadSpec) -> ImageMemoryProviderContract {
+pub fn memory_strategy_contract(provider_id: &str, spec: &LoadSpec) -> MemoryProviderContract {
     // SC-15754: rung 4 is available only when this SPECIFIC load can execute it, and two load-time
     // facts decide that. Declaring it here rather than failing at generate time is what keeps the
     // selector from choosing a strategy the loaded generator cannot run — the contract is built per
@@ -414,9 +412,9 @@ pub fn image_memory_contract(provider_id: &str, spec: &LoadSpec) -> ImageMemoryP
     // actually express it.
     let streamable = matches!(spec.weights, mlx_gen::WeightsSource::Dir(_))
         && matches!(spec.offload_policy, mlx_gen::OffloadPolicy::Sequential);
-    ImageMemoryProviderContract {
+    MemoryProviderContract {
         provider_id: provider_id.to_owned(),
-        backend: ImageMemoryBackendRealization::MlxMetal {
+        backend: MemoryBackendRealization::MlxMetal {
             // Unified memory: the wired-residency budget is what the staged phases release, weights
             // are mmap-backed, and MLX's lazy graph needs explicit `eval` before a phase drop frees
             // anything (`Residency::run_staged` owns that discipline). No host↔device transfer.
@@ -425,84 +423,84 @@ pub fn image_memory_contract(provider_id: &str, spec: &LoadSpec) -> ImageMemoryP
             explicit_evaluation_and_synchronization: true,
             cache_eviction: true,
         },
-        strategies: ImageMemoryStrategy::ALL
+        strategies: MemoryStrategy::ALL
             .into_iter()
-            .map(|strategy| ImageMemoryStrategyCapability {
+            .map(|strategy| MemoryStrategyCapability {
                 strategy,
                 support: match strategy {
-                    ImageMemoryStrategy::BoundedTransformerResidency if !streamable => {
-                        ImageMemoryStrategySupport::Missing
+                    MemoryStrategy::BoundedTransformerResidency if !streamable => {
+                        MemoryStrategySupport::Missing
                     }
-                    _ => ImageMemoryStrategySupport::Implemented,
+                    _ => MemoryStrategySupport::Implemented,
                 },
                 parameters: match strategy {
-                    ImageMemoryStrategy::BoundedDecode => ImageMemoryParameterRanges {
+                    MemoryStrategy::BoundedDecode => MemoryParameterRanges {
                         decode_tile_edges: all_decode_tile_edges(),
                         decode_overlaps: all_decode_overlaps(),
                         ..Default::default()
                     },
-                    ImageMemoryStrategy::BoundedAttention => ImageMemoryParameterRanges {
+                    MemoryStrategy::BoundedAttention => MemoryParameterRanges {
                         attention_chunk_sizes: vec![ATTENTION_CHUNK_SIZE],
                         ..Default::default()
                     },
-                    ImageMemoryStrategy::BoundedTransformerResidency if streamable => {
-                        ImageMemoryParameterRanges {
+                    MemoryStrategy::BoundedTransformerResidency if streamable => {
+                        MemoryParameterRanges {
                             transformer_window_sizes: TRANSFORMER_WINDOW_SIZES.to_vec(),
                             transformer_window_components: TRANSFORMER_WINDOW_COMPONENTS.to_vec(),
                             ..Default::default()
                         }
                     }
-                    _ => ImageMemoryParameterRanges::default(),
+                    _ => MemoryParameterRanges::default(),
                 },
             })
             .collect(),
-        lifecycle: ImageMemoryLifecycleCapabilities {
+        lifecycle: MemoryLifecycleCapabilities {
             phases: vec![
-                ImageMemoryPhase::Conditioning,
-                ImageMemoryPhase::Denoise,
-                ImageMemoryPhase::Decode,
+                MemoryPhase::Conditioning,
+                MemoryPhase::Denoise,
+                MemoryPhase::Decode,
             ],
             synchronized_phase_release: true,
             decode_tiling: true,
             attention_chunking: true,
             transformer_window_materialization: streamable,
         },
-        formula: ImageMemoryFormulaKind::PhaseEnvelope {
+        formula: MemoryFormulaKind::PhaseEnvelope {
             phases: vec![
-                ImageMemoryPhase::Conditioning,
-                ImageMemoryPhase::Denoise,
-                ImageMemoryPhase::Decode,
+                MemoryPhase::Conditioning,
+                MemoryPhase::Denoise,
+                MemoryPhase::Decode,
             ],
             variables: vec![
-                ImageMemoryFormulaVariable::AssetBytes,
-                ImageMemoryFormulaVariable::PixelCount,
-                ImageMemoryFormulaVariable::BatchCount,
-                ImageMemoryFormulaVariable::ConditioningTokenCount,
-                ImageMemoryFormulaVariable::DecodeTileArea,
-                ImageMemoryFormulaVariable::AttentionChunkSize,
+                MemoryFormulaVariable::AssetBytes,
+                MemoryFormulaVariable::PixelCount,
+                MemoryFormulaVariable::BatchCount,
+                MemoryFormulaVariable::ConditioningTokenCount,
+                MemoryFormulaVariable::DecodeTileArea,
+                MemoryFormulaVariable::AttentionChunkSize,
                 // SC-15754: transformer weight residency is now a *variable* of the peak, not a
                 // constant folded into `AssetBytes` — at window 1 the trunk contributes one block
                 // instead of thirty.
-                ImageMemoryFormulaVariable::TransformerWindowSize,
+                MemoryFormulaVariable::TransformerWindowSize,
             ],
         },
-        calibration: Some(ImageMemoryCalibrationIdentity::new(
-            IMAGE_MEMORY_CALIBRATION_FINGERPRINT,
+        calibration: Some(MemoryCalibrationIdentity::new(
+            MEMORY_CALIBRATION_FINGERPRINT,
         )),
         asset_facts: asset_facts(spec),
-        runtime: ImageMemoryRuntimeSemantics::default(),
+        runtime: MemoryRuntimeSemantics::default(),
     }
 }
 
 /// Component `.safetensors` sums for the spec's snapshot root. A [`WeightsSource::File`] source has
 /// no component tree, so every field stays `0` (the truthful "unknown", not a guess).
-fn asset_facts(spec: &LoadSpec) -> ImageMemoryAssetFacts {
+fn asset_facts(spec: &LoadSpec) -> MemoryAssetFacts {
     let Ok(components) =
         PerComponentBytes::from_spec_subdirs(spec, &["text_encoder"], &["transformer"], &["vae"])
     else {
-        return ImageMemoryAssetFacts::default();
+        return MemoryAssetFacts::default();
     };
-    ImageMemoryAssetFacts {
+    MemoryAssetFacts {
         base_bytes: components
             .text_encoder
             .saturating_add(components.dit)
@@ -523,9 +521,7 @@ fn asset_facts(spec: &LoadSpec) -> ImageMemoryAssetFacts {
 /// The ladder is **cumulative**: every rung above `StagedResidency` also carries the levers below it,
 /// so a rung-3 selection tiles the decode as well. `Resident` returns `None`, which is the historical
 /// fast path (`GenerationRequest::memory` untouched).
-pub(crate) fn z_image_generation_memory(
-    selection: &ImageMemorySelection,
-) -> Option<GenerationMemory> {
+pub(crate) fn z_image_generation_memory(selection: &MemorySelection) -> Option<GenerationMemory> {
     // SC-15510: the selected *parameters* travel with the levers. `validate_selection` has already
     // established that a rung carries exactly the parameters it owns and no more, so copying them
     // wholesale cannot smuggle a decode edge into a staged-only selection: the fields below are only
@@ -538,14 +534,14 @@ pub(crate) fn z_image_generation_memory(
         ..Default::default()
     };
     match selection.strategy {
-        ImageMemoryStrategy::Resident => None,
-        ImageMemoryStrategy::StagedResidency => Some(GenerationMemory::default()),
-        ImageMemoryStrategy::BoundedDecode => Some(decode),
-        ImageMemoryStrategy::BoundedAttention => Some(GenerationMemory {
+        MemoryStrategy::Resident => None,
+        MemoryStrategy::StagedResidency => Some(GenerationMemory::default()),
+        MemoryStrategy::BoundedDecode => Some(decode),
+        MemoryStrategy::BoundedAttention => Some(GenerationMemory {
             chunk_attention: true,
             ..decode
         }),
-        ImageMemoryStrategy::BoundedTransformerResidency => Some(GenerationMemory {
+        MemoryStrategy::BoundedTransformerResidency => Some(GenerationMemory {
             chunk_attention: true,
             stream_transformer_blocks: true,
             transformer_window_size: parameters.transformer_window_size,
@@ -565,9 +561,9 @@ pub(crate) fn z_image_generation_memory(
 /// Holds no MLX arrays: its whole job is to translate the shared selection into
 /// [`GenerationRequest::memory`], reject parameters this provider does not implement, and guarantee
 /// the terminal synchronize-and-release on success, cancellation, **and** error.
-pub(crate) struct ZImageImageMemoryScope {
+pub(crate) struct ZImageMemoryScope {
     pub(crate) provider_id: &'static str,
-    pub(crate) geometry: ImageMemoryGeometry,
+    pub(crate) geometry: MemoryGeometry,
     pub(crate) memory: Option<GenerationMemory>,
     /// Which decode this request runs, so `configure_decode` validates the route's own candidate
     /// subset rather than the published union (see [`decode_domain`]).
@@ -579,11 +575,11 @@ pub(crate) struct ZImageImageMemoryScope {
     pub(crate) finished: bool,
 }
 
-impl ZImageImageMemoryScope {
+impl ZImageMemoryScope {
     fn ensure_active(&self) -> CoreResult<()> {
         if self.finished {
             Err(CoreError::Msg(format!(
-                "{}: image-memory request scope is already finished",
+                "{}: memory-strategy request scope is already finished",
                 self.provider_id
             )))
         } else {
@@ -608,7 +604,7 @@ impl ZImageImageMemoryScope {
     }
 }
 
-impl ImageMemoryRequestScope for ZImageImageMemoryScope {
+impl MemoryRequestScope for ZImageMemoryScope {
     fn configure_request(&mut self, request: &mut GenerationRequest) -> CoreResult<()> {
         self.ensure_active()?;
         // Route drift is as fatal as geometry drift, and for the same reason. The scope's decode
@@ -647,13 +643,13 @@ impl ImageMemoryRequestScope for ZImageImageMemoryScope {
         Ok(())
     }
 
-    fn enter_phase(&mut self, _phase: ImageMemoryPhase) -> CoreResult<()> {
+    fn enter_phase(&mut self, _phase: MemoryPhase) -> CoreResult<()> {
         // The phase boundaries themselves are owned by `Residency::run_staged`, which already
         // evaluates and drops between phases; the scope only has to stay live across them.
         self.ensure_active()
     }
 
-    fn leave_phase(&mut self, _phase: ImageMemoryPhase) -> CoreResult<()> {
+    fn leave_phase(&mut self, _phase: MemoryPhase) -> CoreResult<()> {
         self.ensure_active()
     }
 
@@ -661,7 +657,7 @@ impl ImageMemoryRequestScope for ZImageImageMemoryScope {
         &mut self,
         tile_edge: u32,
         overlap: u32,
-        _geometry: ImageMemoryGeometry,
+        _geometry: MemoryGeometry,
     ) -> CoreResult<()> {
         self.ensure_active()?;
         let (edges, expected_overlap) = decode_domain(self.use_pid);
@@ -736,7 +732,7 @@ impl ImageMemoryRequestScope for ZImageImageMemoryScope {
         Ok(())
     }
 
-    fn finish(&mut self, _outcome: ImageMemoryRunOutcome) -> CoreResult<()> {
+    fn finish(&mut self, _outcome: MemoryRunOutcome) -> CoreResult<()> {
         // Deliberately outcome-independent: cancellation and error need the barrier + eviction at
         // least as much as success does.
         self.ensure_active()?;
@@ -744,7 +740,7 @@ impl ImageMemoryRequestScope for ZImageImageMemoryScope {
     }
 }
 
-impl Drop for ZImageImageMemoryScope {
+impl Drop for ZImageMemoryScope {
     fn drop(&mut self) {
         if !self.finished {
             let _ = self.synchronize_and_release();
@@ -756,18 +752,18 @@ impl Drop for ZImageImageMemoryScope {
 /// contract's own selection validation, then the budget. Defense in depth only — it can reject, it can
 /// never swap in a different strategy or numeric tier.
 pub(crate) fn safety_check(
-    contract: &ImageMemoryProviderContract,
-    context: &ImageMemoryRunContext,
-) -> ImageMemorySafetyDecision {
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+) -> MemorySafetyDecision {
     let Some(calibration) = contract.calibration.as_ref() else {
-        return ImageMemorySafetyDecision::Reject {
+        return MemorySafetyDecision::Reject {
             reason: format!("{}: no calibration identity declared", contract.provider_id),
         };
     };
     if context.calibration_abi != calibration.abi
         || context.calibration_fingerprint != calibration.fingerprint
     {
-        return ImageMemorySafetyDecision::Reject {
+        return MemorySafetyDecision::Reject {
             reason: format!(
                 "{}: calibration handshake mismatch (admitted abi {} fingerprint {:?}, provider abi \
                  {} fingerprint {:?})",
@@ -780,7 +776,7 @@ pub(crate) fn safety_check(
         };
     }
     if let Err(error) = contract.validate_selection(&context.selection) {
-        return ImageMemorySafetyDecision::Reject {
+        return MemorySafetyDecision::Reject {
             reason: error.to_string(),
         };
     }
@@ -797,7 +793,7 @@ pub(crate) fn safety_check(
     // tiles a `scale×` super-resolved output at 2048 px — so a selection built for one route is
     // rejected on the other rather than silently re-planned. The static `validate_selection` above
     // sees only the published union, which is why this check exists.
-    if context.selection.strategy >= ImageMemoryStrategy::BoundedDecode {
+    if context.selection.strategy >= MemoryStrategy::BoundedDecode {
         let (edges, overlap) = decode_domain(context.use_pid);
         let route = if context.use_pid {
             "PiD overlay"
@@ -807,7 +803,7 @@ pub(crate) fn safety_check(
         match context.selection.parameters.decode_tile_edge {
             Some(edge) if edges.contains(&edge) => {}
             other => {
-                return ImageMemorySafetyDecision::Reject {
+                return MemorySafetyDecision::Reject {
                     reason: format!(
                         "{}: decode tile edge {other:?} is not a {route} candidate {edges:?}",
                         contract.provider_id
@@ -816,7 +812,7 @@ pub(crate) fn safety_check(
             }
         }
         if context.selection.parameters.decode_overlap != Some(overlap) {
-            return ImageMemorySafetyDecision::Reject {
+            return MemorySafetyDecision::Reject {
                 reason: format!(
                     "{}: the {route} decode overlap is {overlap}, got {:?}",
                     contract.provider_id, context.selection.parameters.decode_overlap
@@ -825,7 +821,7 @@ pub(crate) fn safety_check(
         }
     }
     if !context.budget.fits(context.predicted_peak_bytes) {
-        return ImageMemorySafetyDecision::Reject {
+        return MemorySafetyDecision::Reject {
             reason: format!(
                 "{}: predicted peak {} exceeds effective budget {}",
                 contract.provider_id,
@@ -834,25 +830,25 @@ pub(crate) fn safety_check(
             ),
         };
     }
-    ImageMemorySafetyDecision::Accept
+    MemorySafetyDecision::Accept
 }
 
 /// Open a request scope after `safety_check` accepted `context`.
 pub(crate) fn begin_request(
     provider_id: &'static str,
-    contract: &ImageMemoryProviderContract,
-    context: &ImageMemoryRunContext,
-) -> CoreResult<Option<Box<dyn ImageMemoryRequestScope + 'static>>> {
-    if let ImageMemorySafetyDecision::Reject { reason } = safety_check(contract, context) {
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+) -> CoreResult<Option<Box<dyn MemoryRequestScope + 'static>>> {
+    if let MemorySafetyDecision::Reject { reason } = safety_check(contract, context) {
         return Err(CoreError::Unsupported(reason));
     }
-    Ok(Some(Box::new(ZImageImageMemoryScope {
+    Ok(Some(Box::new(ZImageMemoryScope {
         provider_id,
         geometry: context.geometry,
         memory: z_image_generation_memory(&context.selection),
         use_pid: context.use_pid,
         transformer_window: (context.selection.strategy
-            == ImageMemoryStrategy::BoundedTransformerResidency)
+            == MemoryStrategy::BoundedTransformerResidency)
             .then_some(())
             .and(context.selection.parameters.transformer_window_size),
         finished: false,
@@ -861,8 +857,8 @@ pub(crate) fn begin_request(
 
 /// The strategy parameters this provider accepts, for a caller that wants the whole domain in one
 /// value (the conformance tests and the SceneWorks evidence writer both key off this).
-pub fn declared_parameters() -> ImageMemoryStrategyParameters {
-    ImageMemoryStrategyParameters {
+pub fn declared_parameters() -> MemoryStrategyParameters {
+    MemoryStrategyParameters {
         decode_tile_edge: Some(DECODE_TILE_EDGE),
         decode_overlap: Some(DECODE_OVERLAP),
         attention_chunk_size: Some(ATTENTION_CHUNK_SIZE),
@@ -877,8 +873,8 @@ mod tests {
     use mlx_gen::attention::AttentionBudget;
     use mlx_gen::gen_core::WeightsSource;
     use mlx_gen::gen_core::{
-        ImageMemoryBudget, ImageMemoryCacheState, ImageMemoryMode, ImageMemoryNumericTier,
-        Precision, Quant, IMAGE_MEMORY_CALIBRATION_ABI,
+        MemoryBudget, MemoryCacheState, MemoryMode, MemoryNumericTier, Precision, Quant,
+        MEMORY_CALIBRATION_ABI,
     };
 
     /// The load rung 4 is available on: a re-openable snapshot dir, loaded `Sequential`.
@@ -887,14 +883,14 @@ mod tests {
             .with_offload_policy(mlx_gen::OffloadPolicy::Sequential)
     }
 
-    fn contract() -> ImageMemoryProviderContract {
-        image_memory_contract(crate::model::MODEL_ID, &spec())
+    fn contract() -> MemoryProviderContract {
+        memory_strategy_contract(crate::model::MODEL_ID, &spec())
     }
 
     /// A selection carrying exactly the parameters the rungs up to and including `strategy` own —
     /// no more, no less, which is what the shared validator requires. `use_pid` picks the route's
     /// decode domain, since the two do not overlap.
-    fn selection_for(strategy: ImageMemoryStrategy, use_pid: bool) -> ImageMemorySelection {
+    fn selection_for(strategy: MemoryStrategy, use_pid: bool) -> MemorySelection {
         let (edges, overlap) = decode_domain(use_pid);
         let edge = if use_pid {
             // The largest PiD candidate, so the value is unambiguously from the PiD ladder.
@@ -902,69 +898,69 @@ mod tests {
         } else {
             DECODE_TILE_EDGE
         };
-        let decode = ImageMemoryStrategyParameters {
+        let decode = MemoryStrategyParameters {
             decode_tile_edge: Some(edge),
             decode_overlap: Some(overlap),
             ..Default::default()
         };
-        ImageMemorySelection {
+        MemorySelection {
             strategy,
             parameters: match strategy {
-                ImageMemoryStrategy::Resident | ImageMemoryStrategy::StagedResidency => {
-                    ImageMemoryStrategyParameters::default()
+                MemoryStrategy::Resident | MemoryStrategy::StagedResidency => {
+                    MemoryStrategyParameters::default()
                 }
-                ImageMemoryStrategy::BoundedDecode => decode,
-                ImageMemoryStrategy::BoundedAttention => ImageMemoryStrategyParameters {
+                MemoryStrategy::BoundedDecode => decode,
+                MemoryStrategy::BoundedAttention => MemoryStrategyParameters {
                     attention_chunk_size: Some(ATTENTION_CHUNK_SIZE),
                     ..decode
                 },
-                ImageMemoryStrategy::BoundedTransformerResidency => ImageMemoryStrategyParameters {
+                MemoryStrategy::BoundedTransformerResidency => MemoryStrategyParameters {
                     attention_chunk_size: Some(ATTENTION_CHUNK_SIZE),
                     transformer_window_size: Some(TRANSFORMER_WINDOW_SIZE),
                     transformer_window_component: Some(TRANSFORMER_WINDOW_COMPONENT),
                     ..decode
                 },
             },
-            tier: ImageMemoryNumericTier {
+            tier: MemoryNumericTier {
                 precision: Precision::Bf16,
                 quant: Some(Quant::Q4),
             },
         }
     }
 
-    fn selection(strategy: ImageMemoryStrategy) -> ImageMemorySelection {
+    fn selection(strategy: MemoryStrategy) -> MemorySelection {
         selection_for(strategy, false)
     }
 
-    fn context_for(strategy: ImageMemoryStrategy, use_pid: bool) -> ImageMemoryRunContext {
-        ImageMemoryRunContext {
+    fn context_for(strategy: MemoryStrategy, use_pid: bool) -> MemoryRunContext {
+        MemoryRunContext {
             selection: selection_for(strategy, use_pid),
-            calibration_abi: IMAGE_MEMORY_CALIBRATION_ABI,
-            calibration_fingerprint: IMAGE_MEMORY_CALIBRATION_FINGERPRINT.to_owned(),
-            mode: ImageMemoryMode::TextToImage,
+            calibration_abi: MEMORY_CALIBRATION_ABI,
+            calibration_fingerprint: MEMORY_CALIBRATION_FINGERPRINT.to_owned(),
+            mode: MemoryMode::TextToImage,
             has_reference: false,
             use_pid,
             has_phases: true,
-            geometry: ImageMemoryGeometry {
+            geometry: MemoryGeometry {
                 width: 1024,
                 height: 1024,
                 batch: 1,
                 frames: 1,
             },
             overlay: None,
-            budget: ImageMemoryBudget {
+            budget: MemoryBudget {
                 total_bytes: 8 * 1000 * 1000 * 1000,
                 committed_bytes: 0,
                 reclaimable_bytes: 0,
                 reserved_headroom_bytes: 2 * 1000 * 1000 * 1000,
             },
             predicted_peak_bytes: 4 * 1000 * 1000 * 1000,
-            cache_state: ImageMemoryCacheState::Cold,
+            cache_state: MemoryCacheState::Cold,
             evidence_revision: "test".to_owned(),
         }
     }
 
-    fn context(strategy: ImageMemoryStrategy) -> ImageMemoryRunContext {
+    fn context(strategy: MemoryStrategy) -> MemoryRunContext {
         context_for(strategy, false)
     }
 
@@ -972,7 +968,7 @@ mod tests {
     fn contract_is_internally_conformant() {
         let contract = contract();
         assert_eq!(contract.conformance_errors(), Vec::<String>::new());
-        gen_core_testkit::check_image_memory_contract(&contract).unwrap();
+        gen_core_testkit::check_memory_strategy_contract(&contract).unwrap();
         assert_eq!(
             contract.calibration.as_ref().unwrap().fingerprint,
             "z-image-mlx-staged-tiled-decode-bounded-attention-block-window-v2"
@@ -986,27 +982,27 @@ mod tests {
     #[test]
     fn the_fingerprint_retired_the_rung_three_generation() {
         assert_ne!(
-            IMAGE_MEMORY_CALIBRATION_FINGERPRINT,
+            MEMORY_CALIBRATION_FINGERPRINT,
             "z-image-mlx-staged-tiled-decode-bounded-attention-v1"
         );
         let contract = contract();
-        let mut ctx = context(ImageMemoryStrategy::BoundedAttention);
+        let mut ctx = context(MemoryStrategy::BoundedAttention);
         ctx.calibration_fingerprint =
             "z-image-mlx-staged-tiled-decode-bounded-attention-v1".to_owned();
         assert!(matches!(
             safety_check(&contract, &ctx),
-            ImageMemorySafetyDecision::Reject { .. }
+            MemorySafetyDecision::Reject { .. }
         ));
     }
 
     #[test]
     fn every_rung_is_implemented_and_selectable_on_a_snapshot_load() {
         let contract = contract();
-        for strategy in ImageMemoryStrategy::ALL {
+        for strategy in MemoryStrategy::ALL {
             assert!(
                 matches!(
                     contract.capability(strategy).map(|c| &c.support),
-                    Some(ImageMemoryStrategySupport::Implemented)
+                    Some(MemoryStrategySupport::Implemented)
                 ),
                 "{strategy:?} must be Implemented"
             );
@@ -1021,7 +1017,7 @@ mod tests {
     fn bounded_attention_records_exactly_one_chunk_parameter() {
         let contract = contract();
         let capability = contract
-            .capability(ImageMemoryStrategy::BoundedAttention)
+            .capability(MemoryStrategy::BoundedAttention)
             .unwrap();
         assert_eq!(
             capability.parameters.attention_chunk_sizes,
@@ -1030,12 +1026,12 @@ mod tests {
         assert_eq!(ATTENTION_CHUNK_SIZE, 64 * 1024 * 1024);
         assert!(contract.lifecycle.attention_chunking);
 
-        let mut sel = selection(ImageMemoryStrategy::BoundedAttention);
+        let mut sel = selection(MemoryStrategy::BoundedAttention);
         sel.parameters.attention_chunk_size = Some(ATTENTION_CHUNK_SIZE / 2);
         let err = contract.validate_selection(&sel).unwrap_err().to_string();
         assert!(err.contains("attention"), "{err}");
 
-        let mut sel = selection(ImageMemoryStrategy::BoundedAttention);
+        let mut sel = selection(MemoryStrategy::BoundedAttention);
         sel.parameters.attention_chunk_size = None;
         assert!(contract.validate_selection(&sel).is_err());
     }
@@ -1046,9 +1042,7 @@ mod tests {
     #[test]
     fn bounded_decode_publishes_a_candidate_ladder_with_the_historical_default_in_it() {
         let contract = contract();
-        let capability = contract
-            .capability(ImageMemoryStrategy::BoundedDecode)
-            .unwrap();
+        let capability = contract.capability(MemoryStrategy::BoundedDecode).unwrap();
         assert!(
             capability.parameters.decode_tile_edges.len() > 1,
             "a one-element domain cannot be swept"
@@ -1065,7 +1059,7 @@ mod tests {
         // from a doc comment.
         for &rejected in DECODE_TILE_EDGES_REJECTED {
             assert!(!DECODE_TILE_EDGES.contains(&rejected));
-            let mut ctx = context(ImageMemoryStrategy::BoundedDecode);
+            let mut ctx = context(MemoryStrategy::BoundedDecode);
             ctx.selection.parameters.decode_tile_edge = Some(rejected);
             assert!(
                 contract.validate_selection(&ctx.selection).is_err(),
@@ -1073,18 +1067,15 @@ mod tests {
             );
             assert!(matches!(
                 safety_check(&contract, &ctx),
-                ImageMemorySafetyDecision::Reject { .. }
+                MemorySafetyDecision::Reject { .. }
             ));
         }
         // Every native candidate is selectable end to end, not just advertised.
         for &edge in DECODE_TILE_EDGES {
-            let mut ctx = context(ImageMemoryStrategy::BoundedDecode);
+            let mut ctx = context(MemoryStrategy::BoundedDecode);
             ctx.selection.parameters.decode_tile_edge = Some(edge);
             assert!(
-                matches!(
-                    safety_check(&contract, &ctx),
-                    ImageMemorySafetyDecision::Accept
-                ),
+                matches!(safety_check(&contract, &ctx), MemorySafetyDecision::Accept),
                 "native candidate {edge} must be admissible"
             );
             let mut scope = begin_request(crate::model::MODEL_ID, &contract, &ctx)
@@ -1093,15 +1084,15 @@ mod tests {
             scope
                 .configure_decode(edge, DECODE_OVERLAP, ctx.geometry)
                 .unwrap();
-            scope.finish(ImageMemoryRunOutcome::Complete).unwrap();
+            scope.finish(MemoryRunOutcome::Complete).unwrap();
         }
         // An edge outside the ladder is refused at both layers.
-        let mut ctx = context(ImageMemoryStrategy::BoundedDecode);
+        let mut ctx = context(MemoryStrategy::BoundedDecode);
         ctx.selection.parameters.decode_tile_edge = Some(500);
         assert!(contract.validate_selection(&ctx.selection).is_err());
         assert!(matches!(
             safety_check(&contract, &ctx),
-            ImageMemorySafetyDecision::Reject { .. }
+            MemorySafetyDecision::Reject { .. }
         ));
     }
 
@@ -1112,11 +1103,11 @@ mod tests {
     fn bounded_transformer_residency_publishes_only_bounding_windows() {
         let contract = contract();
         let capability = contract
-            .capability(ImageMemoryStrategy::BoundedTransformerResidency)
+            .capability(MemoryStrategy::BoundedTransformerResidency)
             .unwrap();
         assert!(matches!(
             capability.support,
-            ImageMemoryStrategySupport::Implemented
+            MemoryStrategySupport::Implemented
         ));
         assert!(contract.lifecycle.transformer_window_materialization);
         assert_eq!(
@@ -1130,11 +1121,11 @@ mod tests {
         assert!(TRANSFORMER_WINDOW_SIZES.contains(&TRANSFORMER_WINDOW_SIZE));
 
         // A window outside the ladder is refused by the static validator.
-        let mut sel = selection(ImageMemoryStrategy::BoundedTransformerResidency);
+        let mut sel = selection(MemoryStrategy::BoundedTransformerResidency);
         sel.parameters.transformer_window_size = Some(7);
         assert!(contract.validate_selection(&sel).is_err());
         // As is one that omits the parameter entirely.
-        let mut sel = selection(ImageMemoryStrategy::BoundedTransformerResidency);
+        let mut sel = selection(MemoryStrategy::BoundedTransformerResidency);
         sel.parameters.transformer_window_size = None;
         assert!(contract.validate_selection(&sel).is_err());
     }
@@ -1151,35 +1142,35 @@ mod tests {
     fn a_resident_load_declares_rung_four_missing_so_the_selector_never_picks_it() {
         let resident = LoadSpec::new(WeightsSource::Dir("/nonexistent-z-image-snapshot".into()))
             .with_offload_policy(mlx_gen::OffloadPolicy::Resident);
-        let contract = image_memory_contract(crate::model::MODEL_ID, &resident);
+        let contract = memory_strategy_contract(crate::model::MODEL_ID, &resident);
         assert_eq!(contract.conformance_errors(), Vec::<String>::new());
         assert!(matches!(
             contract
-                .capability(ImageMemoryStrategy::BoundedTransformerResidency)
+                .capability(MemoryStrategy::BoundedTransformerResidency)
                 .map(|c| &c.support),
-            Some(ImageMemoryStrategySupport::Missing)
+            Some(MemoryStrategySupport::Missing)
         ));
         assert!(!contract.lifecycle.transformer_window_materialization);
         assert!(contract
-            .validate_selection(&selection(ImageMemoryStrategy::BoundedTransformerResidency))
+            .validate_selection(&selection(MemoryStrategy::BoundedTransformerResidency))
             .is_err());
         // Every rung below it stays available — this narrows one cell, not the ladder.
         for strategy in [
-            ImageMemoryStrategy::Resident,
-            ImageMemoryStrategy::StagedResidency,
-            ImageMemoryStrategy::BoundedDecode,
-            ImageMemoryStrategy::BoundedAttention,
+            MemoryStrategy::Resident,
+            MemoryStrategy::StagedResidency,
+            MemoryStrategy::BoundedDecode,
+            MemoryStrategy::BoundedAttention,
         ] {
             contract.validate_selection(&selection(strategy)).unwrap();
         }
         // ...and the Sequential load of the same snapshot does advertise it, so this is the policy
         // doing the work rather than the path.
-        let sequential = super::image_memory_contract(crate::model::MODEL_ID, &spec());
+        let sequential = super::memory_strategy_contract(crate::model::MODEL_ID, &spec());
         assert!(matches!(
             sequential
-                .capability(ImageMemoryStrategy::BoundedTransformerResidency)
+                .capability(MemoryStrategy::BoundedTransformerResidency)
                 .map(|c| &c.support),
-            Some(ImageMemoryStrategySupport::Implemented)
+            Some(MemoryStrategySupport::Implemented)
         ));
     }
 
@@ -1191,20 +1182,20 @@ mod tests {
             "/nonexistent/z-image.safetensors".into(),
         ))
         .with_offload_policy(mlx_gen::OffloadPolicy::Sequential);
-        let contract = image_memory_contract(crate::model::MODEL_ID, &spec);
+        let contract = memory_strategy_contract(crate::model::MODEL_ID, &spec);
         assert_eq!(contract.conformance_errors(), Vec::<String>::new());
         assert!(matches!(
             contract
-                .capability(ImageMemoryStrategy::BoundedTransformerResidency)
+                .capability(MemoryStrategy::BoundedTransformerResidency)
                 .map(|c| &c.support),
-            Some(ImageMemoryStrategySupport::Missing)
+            Some(MemoryStrategySupport::Missing)
         ));
         assert!(!contract.lifecycle.transformer_window_materialization);
         assert!(contract
-            .validate_selection(&selection(ImageMemoryStrategy::BoundedTransformerResidency))
+            .validate_selection(&selection(MemoryStrategy::BoundedTransformerResidency))
             .is_err());
         // ...and its asset facts stay the truthful zero (no component tree to sum).
-        assert_eq!(contract.asset_facts, ImageMemoryAssetFacts::default());
+        assert_eq!(contract.asset_facts, MemoryAssetFacts::default());
     }
 
     /// SC-15794: the rung-4 **component scope** must survive the selection -> `GenerationMemory`
@@ -1218,8 +1209,7 @@ mod tests {
             TransformerComponent::TextEncoder,
             TransformerComponent::Both,
         ] {
-            let mut selection =
-                selection_for(ImageMemoryStrategy::BoundedTransformerResidency, false);
+            let mut selection = selection_for(MemoryStrategy::BoundedTransformerResidency, false);
             selection.parameters.transformer_window_component = Some(component);
             let memory = z_image_generation_memory(&selection)
                 .expect("rung 4 maps to a request-scoped control set");
@@ -1232,7 +1222,7 @@ mod tests {
 
         // A selection written before the component existed must keep its exact previous meaning: the
         // DiT-only default, not "unset".
-        let selection = selection_for(ImageMemoryStrategy::BoundedTransformerResidency, false);
+        let selection = selection_for(MemoryStrategy::BoundedTransformerResidency, false);
         assert_eq!(
             selection.parameters.transformer_window_component,
             Some(TRANSFORMER_WINDOW_COMPONENT)
@@ -1247,8 +1237,8 @@ mod tests {
 
         // Below rung 4 the scope is meaningless and must not be smuggled in.
         for lower in [
-            ImageMemoryStrategy::BoundedDecode,
-            ImageMemoryStrategy::BoundedAttention,
+            MemoryStrategy::BoundedDecode,
+            MemoryStrategy::BoundedAttention,
         ] {
             let memory = z_image_generation_memory(&selection_for(lower, false)).expect("controls");
             assert!(
@@ -1268,26 +1258,26 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            z_image_generation_memory(&selection(ImageMemoryStrategy::Resident)),
+            z_image_generation_memory(&selection(MemoryStrategy::Resident)),
             None
         );
         assert_eq!(
-            z_image_generation_memory(&selection(ImageMemoryStrategy::StagedResidency)),
+            z_image_generation_memory(&selection(MemoryStrategy::StagedResidency)),
             Some(GenerationMemory::default())
         );
         assert_eq!(
-            z_image_generation_memory(&selection(ImageMemoryStrategy::BoundedDecode)),
+            z_image_generation_memory(&selection(MemoryStrategy::BoundedDecode)),
             Some(decode)
         );
         assert_eq!(
-            z_image_generation_memory(&selection(ImageMemoryStrategy::BoundedAttention)),
+            z_image_generation_memory(&selection(MemoryStrategy::BoundedAttention)),
             Some(GenerationMemory {
                 chunk_attention: true,
                 ..decode
             })
         );
         assert_eq!(
-            z_image_generation_memory(&selection(ImageMemoryStrategy::BoundedTransformerResidency)),
+            z_image_generation_memory(&selection(MemoryStrategy::BoundedTransformerResidency)),
             Some(GenerationMemory {
                 chunk_attention: true,
                 stream_transformer_blocks: true,
@@ -1321,7 +1311,7 @@ mod tests {
 
         let full = GenerationRequest {
             memory: z_image_generation_memory(&selection(
-                ImageMemoryStrategy::BoundedTransformerResidency,
+                MemoryStrategy::BoundedTransformerResidency,
             )),
             ..plain.clone()
         };
@@ -1335,7 +1325,7 @@ mod tests {
         );
 
         // A rung-2 selection at a non-default edge executes THAT edge.
-        let mut sel = selection(ImageMemoryStrategy::BoundedDecode);
+        let mut sel = selection(MemoryStrategy::BoundedDecode);
         // A published non-default candidate — 640, not one of the measured-and-rejected sub-512 edges.
         sel.parameters.decode_tile_edge = Some(640);
         let tiled = GenerationRequest {
@@ -1373,7 +1363,7 @@ mod tests {
         let req = GenerationRequest {
             prompt: "a fox".to_owned(),
             memory: z_image_generation_memory(&selection(
-                ImageMemoryStrategy::BoundedTransformerResidency,
+                MemoryStrategy::BoundedTransformerResidency,
             )),
             ..Default::default()
         };
@@ -1387,9 +1377,9 @@ mod tests {
         );
         // Every lower rung is unaffected by the residency policy.
         for strategy in [
-            ImageMemoryStrategy::StagedResidency,
-            ImageMemoryStrategy::BoundedDecode,
-            ImageMemoryStrategy::BoundedAttention,
+            MemoryStrategy::StagedResidency,
+            MemoryStrategy::BoundedDecode,
+            MemoryStrategy::BoundedAttention,
         ] {
             let req = GenerationRequest {
                 prompt: "a fox".to_owned(),
@@ -1418,16 +1408,13 @@ mod tests {
         );
 
         for strategy in [
-            ImageMemoryStrategy::BoundedDecode,
-            ImageMemoryStrategy::BoundedAttention,
-            ImageMemoryStrategy::BoundedTransformerResidency,
+            MemoryStrategy::BoundedDecode,
+            MemoryStrategy::BoundedAttention,
+            MemoryStrategy::BoundedTransformerResidency,
         ] {
             let ctx = context_for(strategy, true);
             assert!(
-                matches!(
-                    safety_check(&contract, &ctx),
-                    ImageMemorySafetyDecision::Accept
-                ),
+                matches!(safety_check(&contract, &ctx), MemorySafetyDecision::Accept),
                 "{strategy:?} must now be admissible on the PiD route"
             );
             let mut scope = begin_request(crate::model::MODEL_ID, &contract, &ctx)
@@ -1440,65 +1427,59 @@ mod tests {
             assert!(scope
                 .configure_decode(DECODE_TILE_EDGE, DECODE_OVERLAP, ctx.geometry)
                 .is_err());
-            scope.finish(ImageMemoryRunOutcome::Complete).unwrap();
+            scope.finish(MemoryRunOutcome::Complete).unwrap();
         }
 
         // A selection built for the native route is rejected when the request uses PiD...
-        let mut ctx = context_for(ImageMemoryStrategy::BoundedDecode, true);
+        let mut ctx = context_for(MemoryStrategy::BoundedDecode, true);
         ctx.selection.parameters.decode_tile_edge = Some(DECODE_TILE_EDGE);
         ctx.selection.parameters.decode_overlap = Some(DECODE_OVERLAP);
         match safety_check(&contract, &ctx) {
-            ImageMemorySafetyDecision::Reject { reason } => {
+            MemorySafetyDecision::Reject { reason } => {
                 assert!(reason.contains("PiD overlay"), "{reason}")
             }
             other => panic!("a native geometry under PiD must be rejected, got {other:?}"),
         }
         // ...and symmetrically, a PiD geometry without the overlay.
-        let mut ctx = context(ImageMemoryStrategy::BoundedDecode);
+        let mut ctx = context(MemoryStrategy::BoundedDecode);
         ctx.selection.parameters.decode_tile_edge = Some(pid_edges[0]);
         ctx.selection.parameters.decode_overlap = Some(PID_DECODE_OVERLAP);
         match safety_check(&contract, &ctx) {
-            ImageMemorySafetyDecision::Reject { reason } => {
+            MemorySafetyDecision::Reject { reason } => {
                 assert!(reason.contains("native VAE"), "{reason}")
             }
             other => panic!("a PiD geometry without PiD must be rejected, got {other:?}"),
         }
 
         // Rungs 0-1 stay available on both routes (they own no decode parameters).
-        for strategy in [
-            ImageMemoryStrategy::Resident,
-            ImageMemoryStrategy::StagedResidency,
-        ] {
+        for strategy in [MemoryStrategy::Resident, MemoryStrategy::StagedResidency] {
             assert!(matches!(
                 safety_check(&contract, &context_for(strategy, true)),
-                ImageMemorySafetyDecision::Accept
+                MemorySafetyDecision::Accept
             ));
         }
     }
 
     /// `z_image_edit` resolves to this provider in edit mode (see the module header), so the contract
-    /// must admit `ImageMemoryMode::Edit` across the whole ladder. Nothing else in this crate mentions
+    /// must admit `MemoryMode::Edit` across the whole ladder. Nothing else in this crate mentions
     /// that id — the alias itself is SceneWorks-side and pinned there — but if the edit *surface* were
     /// inadmissible here, the alias would resolve to a provider that refuses the mode it was aliased
     /// for, and the catalog entry would be unservable with no local test to say so.
     #[test]
     fn the_edit_surface_z_image_edit_resolves_to_is_admissible() {
         let contract = contract();
-        for strategy in ImageMemoryStrategy::ALL {
+        for strategy in MemoryStrategy::ALL {
             let mut ctx = context(strategy);
-            ctx.mode = ImageMemoryMode::Edit;
+            ctx.mode = MemoryMode::Edit;
             ctx.has_reference = true;
             assert!(
-                matches!(
-                    safety_check(&contract, &ctx),
-                    ImageMemorySafetyDecision::Accept
-                ),
+                matches!(safety_check(&contract, &ctx), MemorySafetyDecision::Accept),
                 "{strategy:?} must be admissible in edit mode"
             );
             let mut scope = begin_request(crate::model::MODEL_ID, &contract, &ctx)
                 .unwrap()
                 .expect("edit mode opens a scope");
-            scope.finish(ImageMemoryRunOutcome::Complete).unwrap();
+            scope.finish(MemoryRunOutcome::Complete).unwrap();
         }
     }
 
@@ -1511,7 +1492,7 @@ mod tests {
     fn the_scope_rejects_route_drift_the_way_it_rejects_geometry_drift() {
         let contract = contract();
         for admitted_pid in [false, true] {
-            let ctx = context_for(ImageMemoryStrategy::BoundedDecode, admitted_pid);
+            let ctx = context_for(MemoryStrategy::BoundedDecode, admitted_pid);
             let mut scope = begin_request(crate::model::MODEL_ID, &contract, &ctx)
                 .unwrap()
                 .unwrap();
@@ -1532,17 +1513,17 @@ mod tests {
                 .unwrap_err()
                 .to_string();
             assert!(err.contains("use_pid"), "{err}");
-            scope.finish(ImageMemoryRunOutcome::Complete).unwrap();
+            scope.finish(MemoryRunOutcome::Complete).unwrap();
         }
     }
 
     #[test]
     fn a_stale_calibration_fingerprint_never_admits_an_optimized_fit() {
         let contract = contract();
-        let mut ctx = context(ImageMemoryStrategy::BoundedDecode);
+        let mut ctx = context(MemoryStrategy::BoundedDecode);
         ctx.calibration_fingerprint = "z-image-mlx-something-older".to_owned();
         match safety_check(&contract, &ctx) {
-            ImageMemorySafetyDecision::Reject { reason } => {
+            MemorySafetyDecision::Reject { reason } => {
                 assert!(
                     reason.contains("calibration handshake mismatch"),
                     "{reason}"
@@ -1552,37 +1533,37 @@ mod tests {
         }
         assert!(begin_request(crate::model::MODEL_ID, &contract, &ctx).is_err());
 
-        let mut ctx = context(ImageMemoryStrategy::BoundedDecode);
-        ctx.calibration_abi = IMAGE_MEMORY_CALIBRATION_ABI + 1;
+        let mut ctx = context(MemoryStrategy::BoundedDecode);
+        ctx.calibration_abi = MEMORY_CALIBRATION_ABI + 1;
         assert!(matches!(
             safety_check(&contract, &ctx),
-            ImageMemorySafetyDecision::Reject { .. }
+            MemorySafetyDecision::Reject { .. }
         ));
     }
 
     #[test]
     fn an_over_budget_prediction_is_rejected_before_any_work() {
         let contract = contract();
-        let mut ctx = context(ImageMemoryStrategy::BoundedDecode);
+        let mut ctx = context(MemoryStrategy::BoundedDecode);
         ctx.predicted_peak_bytes = ctx.budget.effective_bytes() + 1;
         match safety_check(&contract, &ctx) {
-            ImageMemorySafetyDecision::Reject { reason } => {
+            MemorySafetyDecision::Reject { reason } => {
                 assert!(reason.contains("exceeds effective budget"), "{reason}")
             }
             other => panic!("over-budget must be rejected, got {other:?}"),
         }
-        let mut ctx = context(ImageMemoryStrategy::BoundedDecode);
+        let mut ctx = context(MemoryStrategy::BoundedDecode);
         ctx.predicted_peak_bytes = ctx.budget.effective_bytes();
         assert!(matches!(
             safety_check(&contract, &ctx),
-            ImageMemorySafetyDecision::Accept
+            MemorySafetyDecision::Accept
         ));
     }
 
     #[test]
     fn the_scope_overwrites_warm_request_state_and_finishes_once() {
         let contract = contract();
-        let ctx = context(ImageMemoryStrategy::BoundedDecode);
+        let ctx = context(MemoryStrategy::BoundedDecode);
         let mut scope = begin_request(crate::model::MODEL_ID, &contract, &ctx)
             .unwrap()
             .expect("an accepted context opens a scope");
@@ -1638,15 +1619,15 @@ mod tests {
         assert!(scope.configure_request(&mut request).is_err());
         request.count = 1;
 
-        scope.finish(ImageMemoryRunOutcome::Complete).unwrap();
-        assert!(scope.finish(ImageMemoryRunOutcome::Complete).is_err());
+        scope.finish(MemoryRunOutcome::Complete).unwrap();
+        assert!(scope.finish(MemoryRunOutcome::Complete).is_err());
         assert!(scope.configure_request(&mut request).is_err());
     }
 
     #[test]
     fn the_scope_accepts_only_its_declared_parameters() {
         let contract = contract();
-        let ctx = context(ImageMemoryStrategy::BoundedTransformerResidency);
+        let ctx = context(MemoryStrategy::BoundedTransformerResidency);
         let mut scope = begin_request(crate::model::MODEL_ID, &contract, &ctx)
             .unwrap()
             .unwrap();
@@ -1682,33 +1663,33 @@ mod tests {
             first += w;
         }
         assert!(scope.materialize_transformer_window(n, w).is_err());
-        scope.finish(ImageMemoryRunOutcome::Complete).unwrap();
+        scope.finish(MemoryRunOutcome::Complete).unwrap();
 
         // Below rung 4 there is no window at all, so the hook refuses everything.
-        let ctx = context(ImageMemoryStrategy::BoundedAttention);
+        let ctx = context(MemoryStrategy::BoundedAttention);
         let mut scope = begin_request(crate::model::MODEL_ID, &contract, &ctx)
             .unwrap()
             .unwrap();
         assert!(scope.materialize_transformer_window(0, 1).is_err());
-        scope.finish(ImageMemoryRunOutcome::Complete).unwrap();
+        scope.finish(MemoryRunOutcome::Complete).unwrap();
     }
 
     #[test]
     fn a_canceled_or_errored_run_still_releases() {
         let contract = contract();
         for outcome in [
-            ImageMemoryRunOutcome::Canceled,
-            ImageMemoryRunOutcome::Error {
+            MemoryRunOutcome::Canceled,
+            MemoryRunOutcome::Error {
                 message: "boom".to_owned(),
             },
         ] {
-            let ctx = context(ImageMemoryStrategy::BoundedDecode);
+            let ctx = context(MemoryStrategy::BoundedDecode);
             let mut scope = begin_request(crate::model::MODEL_ID, &contract, &ctx)
                 .unwrap()
                 .unwrap();
             scope.finish(outcome).unwrap();
         }
-        let ctx = context(ImageMemoryStrategy::BoundedDecode);
+        let ctx = context(MemoryStrategy::BoundedDecode);
         drop(begin_request(crate::model::MODEL_ID, &contract, &ctx).unwrap());
     }
 
@@ -1720,10 +1701,10 @@ mod tests {
             crate::model_control::MODEL_ID,
             crate::model_base_control::MODEL_ID,
         ] {
-            let contract = image_memory_contract(id, &spec());
+            let contract = memory_strategy_contract(id, &spec());
             assert_eq!(contract.provider_id, id);
             assert_eq!(contract.conformance_errors(), Vec::<String>::new(), "{id}");
-            gen_core_testkit::check_image_memory_contract(&contract).unwrap();
+            gen_core_testkit::check_memory_strategy_contract(&contract).unwrap();
         }
     }
 
@@ -1731,9 +1712,7 @@ mod tests {
     fn declared_parameters_are_the_defaults_and_all_live_in_the_published_ladders() {
         let contract = contract();
         let params = declared_parameters();
-        let decode = contract
-            .capability(ImageMemoryStrategy::BoundedDecode)
-            .unwrap();
+        let decode = contract.capability(MemoryStrategy::BoundedDecode).unwrap();
         assert!(decode
             .parameters
             .decode_tile_edges
@@ -1746,14 +1725,14 @@ mod tests {
         assert_eq!(params.decode_overlap, Some(DECODE_OVERLAP));
         assert_eq!(
             contract
-                .capability(ImageMemoryStrategy::BoundedAttention)
+                .capability(MemoryStrategy::BoundedAttention)
                 .unwrap()
                 .parameters
                 .attention_chunk_sizes,
             vec![params.attention_chunk_size.unwrap()]
         );
         assert!(contract
-            .capability(ImageMemoryStrategy::BoundedTransformerResidency)
+            .capability(MemoryStrategy::BoundedTransformerResidency)
             .unwrap()
             .parameters
             .transformer_window_sizes

@@ -34,7 +34,7 @@
 //! them — strictly more memory and strictly slower.
 //!
 //! Rung 1 has a load-time-vs-request-time seam of the same shape and resolves it by silently yielding
-//! resident behaviour (see [`crate::image_memory`]). Rung 4 does NOT: `generate` rejects a
+//! resident behaviour (see [`crate::memory_strategy`]). Rung 4 does NOT: `generate` rejects a
 //! `stream_transformer_blocks` request on a non-`Sequential` generator with a typed error. A silent
 //! degradation there would be a *false green* — the calibration harness would record a rung-4 run that
 //! saved nothing, which is exactly the failure mode SC-15750's mutation check exists to prevent, one

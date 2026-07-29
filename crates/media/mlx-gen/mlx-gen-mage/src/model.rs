@@ -27,11 +27,10 @@
 //! [`mlx_gen_catalog::provider_registry`]: https://docs.rs/mlx-gen-catalog
 
 use mlx_gen::gen_core::{
-    Error as CoreError, GenerationMemory, ImageMemoryBackendRealization,
-    ImageMemoryCalibrationIdentity, ImageMemoryFormulaKind, ImageMemoryFormulaVariable,
-    ImageMemoryGeometry, ImageMemoryMode, ImageMemoryPhase, ImageMemoryProviderContract,
-    ImageMemoryRequestScope, ImageMemoryRunContext, ImageMemoryRunOutcome,
-    ImageMemorySafetyDecision, ImageMemorySelection, ImageMemoryStrategy, Result as CoreResult,
+    Error as CoreError, GenerationMemory, MemoryBackendRealization, MemoryCalibrationIdentity,
+    MemoryFormulaKind, MemoryFormulaVariable, MemoryGeometry, MemoryMode, MemoryPhase,
+    MemoryProviderContract, MemoryRequestScope, MemoryRunContext, MemoryRunOutcome,
+    MemorySafetyDecision, MemorySelection, MemoryStrategy, Result as CoreResult,
 };
 use mlx_gen::{
     Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput, GenerationRequest,
@@ -46,50 +45,47 @@ use crate::config::{FAMILY, MAX_SIZE, MIN_SIZE, SIZE_MULTIPLE};
 use crate::pipeline::MageComponentDirs;
 use crate::{resolve_gs_key, GenerationSample, MageFlowPipeline};
 
-pub const IMAGE_MEMORY_CALIBRATION_FINGERPRINT: &str = "mage-flow-generation-peak-v1";
+pub const MEMORY_CALIBRATION_FINGERPRINT: &str = "mage-flow-generation-peak-v1";
 
 /// Mage's first shared-contract adoption is intentionally resident-only. The exact measured
 /// request estimator and fail-closed wired-memory boundary are exposed now; SC-15509 owns adding
 /// verified optimized rungs and their provider implementation.
-pub fn image_memory_contract(
-    provider_id: &str,
-    tier: Option<Quant>,
-) -> ImageMemoryProviderContract {
-    let mut contract = ImageMemoryProviderContract::compatibility_default(
+pub fn memory_strategy_contract(provider_id: &str, tier: Option<Quant>) -> MemoryProviderContract {
+    let mut contract = MemoryProviderContract::compatibility_default(
         provider_id,
-        ImageMemoryBackendRealization::MlxMetal {
+        MemoryBackendRealization::MlxMetal {
             bounded_wired_residency: true,
             lazy_or_mmap_materialization: true,
             explicit_evaluation_and_synchronization: true,
             cache_eviction: true,
         },
     );
-    contract.formula = ImageMemoryFormulaKind::PhaseEnvelope {
+    contract.formula = MemoryFormulaKind::PhaseEnvelope {
         phases: vec![
-            ImageMemoryPhase::Conditioning,
-            ImageMemoryPhase::Denoise,
-            ImageMemoryPhase::Decode,
+            MemoryPhase::Conditioning,
+            MemoryPhase::Denoise,
+            MemoryPhase::Decode,
         ],
         variables: vec![
-            ImageMemoryFormulaVariable::PixelCount,
-            ImageMemoryFormulaVariable::BatchCount,
+            MemoryFormulaVariable::PixelCount,
+            MemoryFormulaVariable::BatchCount,
         ],
     };
-    contract.calibration = Some(ImageMemoryCalibrationIdentity::new(
-        IMAGE_MEMORY_CALIBRATION_FINGERPRINT,
+    contract.calibration = Some(MemoryCalibrationIdentity::new(
+        MEMORY_CALIBRATION_FINGERPRINT,
     ));
     contract.asset_facts.base_bytes =
         (crate::memory::generation_resident_gb(tier) * 1_000_000_000.0).round() as u64;
     contract
 }
 
-struct MageImageMemoryScope {
-    selection: ImageMemorySelection,
-    geometry: ImageMemoryGeometry,
+struct MageMemoryScope {
+    selection: MemorySelection,
+    geometry: MemoryGeometry,
     finished: bool,
 }
 
-impl MageImageMemoryScope {
+impl MageMemoryScope {
     fn synchronize_and_release(&mut self) -> CoreResult<()> {
         // `mlx_eval` is synchronous. Evaluating a sentinel on MLX's ordered default stream is a
         // terminal barrier for work queued by this request, including an error/cancellation exit
@@ -104,11 +100,11 @@ impl MageImageMemoryScope {
     }
 }
 
-impl ImageMemoryRequestScope for MageImageMemoryScope {
+impl MemoryRequestScope for MageMemoryScope {
     fn configure_request(&mut self, request: &mut GenerationRequest) -> CoreResult<()> {
-        if self.selection.strategy != ImageMemoryStrategy::Resident {
+        if self.selection.strategy != MemoryStrategy::Resident {
             return Err(CoreError::Unsupported(
-                "mage_flow: optimized image-memory strategies are not implemented yet".into(),
+                "mage_flow: optimized memory strategies are not implemented yet".into(),
             ));
         }
         if request.width != self.geometry.width
@@ -130,11 +126,11 @@ impl ImageMemoryRequestScope for MageImageMemoryScope {
         Ok(())
     }
 
-    fn enter_phase(&mut self, _phase: ImageMemoryPhase) -> CoreResult<()> {
+    fn enter_phase(&mut self, _phase: MemoryPhase) -> CoreResult<()> {
         Ok(())
     }
 
-    fn leave_phase(&mut self, _phase: ImageMemoryPhase) -> CoreResult<()> {
+    fn leave_phase(&mut self, _phase: MemoryPhase) -> CoreResult<()> {
         Ok(())
     }
 
@@ -142,7 +138,7 @@ impl ImageMemoryRequestScope for MageImageMemoryScope {
         &mut self,
         _tile_edge: u32,
         _overlap: u32,
-        _geometry: ImageMemoryGeometry,
+        _geometry: MemoryGeometry,
     ) -> CoreResult<()> {
         Err(CoreError::Unsupported(
             "mage_flow: bounded decode is reserved for SC-15509".into(),
@@ -165,12 +161,12 @@ impl ImageMemoryRequestScope for MageImageMemoryScope {
         ))
     }
 
-    fn finish(&mut self, _outcome: ImageMemoryRunOutcome) -> CoreResult<()> {
+    fn finish(&mut self, _outcome: MemoryRunOutcome) -> CoreResult<()> {
         self.synchronize_and_release()
     }
 }
 
-impl Drop for MageImageMemoryScope {
+impl Drop for MageMemoryScope {
     fn drop(&mut self) {
         if !self.finished {
             let _ = self.synchronize_and_release();
@@ -542,7 +538,7 @@ fn assemble(
         variant,
         descriptor: descriptor_for(variant),
         tier: spec.quantize,
-        image_memory_contract: image_memory_contract(variant.id(), spec.quantize),
+        memory_strategy_contract: memory_strategy_contract(variant.id(), spec.quantize),
         pipeline,
     }))
 }
@@ -679,7 +675,7 @@ pub struct MageFlow {
     variant: MageVariant,
     descriptor: ModelDescriptor,
     tier: Option<Quant>,
-    image_memory_contract: ImageMemoryProviderContract,
+    memory_strategy_contract: MemoryProviderContract,
     pipeline: MageFlowPipeline,
 }
 
@@ -687,8 +683,8 @@ fn request_context_error(
     provider_id: &str,
     variant: MageVariant,
     tier: Option<Quant>,
-    contract: &ImageMemoryProviderContract,
-    context: &ImageMemoryRunContext,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
 ) -> Option<String> {
     if context.selection.tier.precision != Precision::Bf16 || context.selection.tier.quant != tier {
         return Some(format!(
@@ -697,9 +693,9 @@ fn request_context_error(
         ));
     }
     let expected_mode = if variant.is_edit() {
-        ImageMemoryMode::Edit
+        MemoryMode::Edit
     } else {
-        ImageMemoryMode::TextToImage
+        MemoryMode::TextToImage
     };
     if context.mode != expected_mode {
         return Some(format!(
@@ -707,15 +703,15 @@ fn request_context_error(
             context.mode
         ));
     }
-    if context.calibration_abi != mlx_gen::gen_core::IMAGE_MEMORY_CALIBRATION_ABI
-        || context.calibration_fingerprint != IMAGE_MEMORY_CALIBRATION_FINGERPRINT
+    if context.calibration_abi != mlx_gen::gen_core::MEMORY_CALIBRATION_ABI
+        || context.calibration_fingerprint != MEMORY_CALIBRATION_FINGERPRINT
     {
         return Some(format!(
             "{provider_id}: request calibration identity {}/{:?} does not match provider {}/{:?}",
             context.calibration_abi,
             context.calibration_fingerprint,
-            mlx_gen::gen_core::IMAGE_MEMORY_CALIBRATION_ABI,
-            IMAGE_MEMORY_CALIBRATION_FINGERPRINT
+            mlx_gen::gen_core::MEMORY_CALIBRATION_ABI,
+            MEMORY_CALIBRATION_FINGERPRINT
         ));
     }
     if let Err(error) = contract.validate_selection(&context.selection) {
@@ -762,27 +758,24 @@ impl Generator for MageFlow {
         &self.descriptor
     }
 
-    fn image_memory_contract(&self) -> Option<&ImageMemoryProviderContract> {
-        Some(&self.image_memory_contract)
+    fn memory_strategy_contract(&self) -> Option<&MemoryProviderContract> {
+        Some(&self.memory_strategy_contract)
     }
 
-    fn image_memory_safety_check(
-        &self,
-        context: &ImageMemoryRunContext,
-    ) -> ImageMemorySafetyDecision {
+    fn memory_strategy_safety_check(&self, context: &MemoryRunContext) -> MemorySafetyDecision {
         if let Some(reason) = request_context_error(
             self.descriptor.id,
             self.variant,
             self.tier,
-            &self.image_memory_contract,
+            &self.memory_strategy_contract,
             context,
         ) {
-            return ImageMemorySafetyDecision::Reject { reason };
+            return MemorySafetyDecision::Reject { reason };
         }
         let safe_gb = match crate::memory::production_safe_budget_gb() {
             Ok(safe_gb) => safe_gb,
             Err(error) => {
-                return ImageMemorySafetyDecision::Reject {
+                return MemorySafetyDecision::Reject {
                     reason: error.to_string(),
                 }
             }
@@ -794,23 +787,22 @@ impl Generator for MageFlow {
             context.geometry.batch,
             safe_gb,
         ) {
-            Ok(()) => ImageMemorySafetyDecision::Accept,
-            Err(error) => ImageMemorySafetyDecision::Reject {
+            Ok(()) => MemorySafetyDecision::Accept,
+            Err(error) => MemorySafetyDecision::Reject {
                 reason: error.to_string(),
             },
         }
     }
 
-    fn begin_image_memory_request(
+    fn begin_memory_strategy_request(
         &self,
-        context: &ImageMemoryRunContext,
-    ) -> CoreResult<Option<Box<dyn ImageMemoryRequestScope + '_>>> {
-        if let ImageMemorySafetyDecision::Reject { reason } =
-            self.image_memory_safety_check(context)
+        context: &MemoryRunContext,
+    ) -> CoreResult<Option<Box<dyn MemoryRequestScope + '_>>> {
+        if let MemorySafetyDecision::Reject { reason } = self.memory_strategy_safety_check(context)
         {
             return Err(CoreError::Unsupported(reason));
         }
-        Ok(Some(Box::new(MageImageMemoryScope {
+        Ok(Some(Box::new(MageMemoryScope {
             selection: context.selection,
             geometry: context.geometry,
             finished: false,
@@ -1033,10 +1025,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn image_memory_contract_is_truthful_resident_only_mlx_adoption() {
-        use mlx_gen::gen_core::{ImageMemoryStrategySupport, IMAGE_MEMORY_CALIBRATION_ABI};
+    fn memory_strategy_contract_is_truthful_resident_only_mlx_adoption() {
+        use mlx_gen::gen_core::{MemoryStrategySupport, MEMORY_CALIBRATION_ABI};
 
-        let contract = image_memory_contract("mage_flow", Some(Quant::Q4));
+        let contract = memory_strategy_contract("mage_flow", Some(Quant::Q4));
         assert!(contract.conformance_errors().is_empty());
         assert_eq!(contract.provider_id, "mage_flow");
         assert_eq!(
@@ -1044,31 +1036,28 @@ mod tests {
                 .calibration
                 .as_ref()
                 .map(|identity| (identity.abi, identity.fingerprint.as_str())),
-            Some((
-                IMAGE_MEMORY_CALIBRATION_ABI,
-                IMAGE_MEMORY_CALIBRATION_FINGERPRINT
-            ))
+            Some((MEMORY_CALIBRATION_ABI, MEMORY_CALIBRATION_FINGERPRINT))
         );
         assert!(matches!(
             contract
-                .capability(ImageMemoryStrategy::Resident)
+                .capability(MemoryStrategy::Resident)
                 .map(|capability| &capability.support),
-            Some(ImageMemoryStrategySupport::Implemented)
+            Some(MemoryStrategySupport::Implemented)
         ));
-        for strategy in ImageMemoryStrategy::ALL
+        for strategy in MemoryStrategy::ALL
             .into_iter()
-            .filter(|strategy| *strategy != ImageMemoryStrategy::Resident)
+            .filter(|strategy| *strategy != MemoryStrategy::Resident)
         {
             assert!(matches!(
                 contract
                     .capability(strategy)
                     .map(|capability| &capability.support),
-                Some(ImageMemoryStrategySupport::Missing)
+                Some(MemoryStrategySupport::Missing)
             ));
         }
         assert!(matches!(
             contract.backend,
-            ImageMemoryBackendRealization::MlxMetal {
+            MemoryBackendRealization::MlxMetal {
                 bounded_wired_residency: true,
                 lazy_or_mmap_materialization: true,
                 explicit_evaluation_and_synchronization: true,
@@ -1080,44 +1069,44 @@ mod tests {
     #[test]
     fn resident_safety_recomputes_peak_and_binds_calibration_identity() {
         use mlx_gen::gen_core::{
-            ImageMemoryBudget, ImageMemoryCacheState, ImageMemoryNumericTier,
-            ImageMemoryStrategyParameters, IMAGE_MEMORY_CALIBRATION_ABI,
+            MemoryBudget, MemoryCacheState, MemoryNumericTier, MemoryStrategyParameters,
+            MEMORY_CALIBRATION_ABI,
         };
 
-        let contract = image_memory_contract("mage_flow", Some(Quant::Q4));
+        let contract = memory_strategy_contract("mage_flow", Some(Quant::Q4));
         let required = (crate::memory::generation_peak_gb(Some(Quant::Q4), 512, 512, 1)
             * 1_000_000_000.0)
             .round() as u64;
-        let valid = ImageMemoryRunContext {
-            selection: ImageMemorySelection {
-                strategy: ImageMemoryStrategy::Resident,
-                parameters: ImageMemoryStrategyParameters::default(),
-                tier: ImageMemoryNumericTier {
+        let valid = MemoryRunContext {
+            selection: MemorySelection {
+                strategy: MemoryStrategy::Resident,
+                parameters: MemoryStrategyParameters::default(),
+                tier: MemoryNumericTier {
                     precision: Precision::Bf16,
                     quant: Some(Quant::Q4),
                 },
             },
-            calibration_abi: IMAGE_MEMORY_CALIBRATION_ABI,
-            calibration_fingerprint: IMAGE_MEMORY_CALIBRATION_FINGERPRINT.to_owned(),
-            mode: ImageMemoryMode::TextToImage,
+            calibration_abi: MEMORY_CALIBRATION_ABI,
+            calibration_fingerprint: MEMORY_CALIBRATION_FINGERPRINT.to_owned(),
+            mode: MemoryMode::TextToImage,
             has_reference: false,
             use_pid: false,
             has_phases: false,
-            geometry: ImageMemoryGeometry {
+            geometry: MemoryGeometry {
                 width: 512,
                 height: 512,
                 batch: 1,
                 frames: 1,
             },
             overlay: None,
-            budget: ImageMemoryBudget {
+            budget: MemoryBudget {
                 total_bytes: required + 1_000_000_000,
                 committed_bytes: contract.asset_facts.base_bytes,
                 reclaimable_bytes: 0,
                 reserved_headroom_bytes: 0,
             },
             predicted_peak_bytes: required - contract.asset_facts.base_bytes,
-            cache_state: ImageMemoryCacheState::Warm,
+            cache_state: MemoryCacheState::Warm,
             evidence_revision: "test".to_owned(),
         };
         assert!(request_context_error(
@@ -1185,21 +1174,21 @@ mod tests {
 
     #[test]
     fn resident_scope_reapplies_request_state_after_cancel_cleanup() {
-        let selection = ImageMemorySelection {
-            strategy: ImageMemoryStrategy::Resident,
+        let selection = MemorySelection {
+            strategy: MemoryStrategy::Resident,
             parameters: Default::default(),
-            tier: mlx_gen::gen_core::ImageMemoryNumericTier {
+            tier: mlx_gen::gen_core::MemoryNumericTier {
                 precision: Precision::Bf16,
                 quant: Some(Quant::Q4),
             },
         };
-        let geometry = ImageMemoryGeometry {
+        let geometry = MemoryGeometry {
             width: 1024,
             height: 768,
             batch: 3,
             frames: 1,
         };
-        let mut canceled = MageImageMemoryScope {
+        let mut canceled = MageMemoryScope {
             selection,
             geometry,
             finished: false,
@@ -1213,10 +1202,10 @@ mod tests {
         };
         canceled.configure_request(&mut first).unwrap();
         assert_eq!(first.memory, Some(GenerationMemory::default()));
-        canceled.finish(ImageMemoryRunOutcome::Canceled).unwrap();
+        canceled.finish(MemoryRunOutcome::Canceled).unwrap();
         assert!(canceled.finished);
 
-        let mut warm = MageImageMemoryScope {
+        let mut warm = MageMemoryScope {
             selection,
             geometry,
             finished: false,
@@ -1229,7 +1218,7 @@ mod tests {
             ..Default::default()
         };
         warm.configure_request(&mut follow_up).unwrap();
-        warm.finish(ImageMemoryRunOutcome::Complete).unwrap();
+        warm.finish(MemoryRunOutcome::Complete).unwrap();
         assert!(warm.finished, "a warm follow-up owns fresh terminal state");
     }
 

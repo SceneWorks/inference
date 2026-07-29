@@ -112,9 +112,9 @@ pub fn descriptor() -> ModelDescriptor {
 pub struct ZImageTurbo {
     descriptor: ModelDescriptor,
     tokenizer: TextTokenizer,
-    /// The provider's half of the shared image-memory handshake (SC-15449 / SC-15615), built from the
+    /// The provider's half of the shared memory-strategy handshake (SC-15449 / SC-15615), built from the
     /// `LoadSpec` at load so its asset facts describe the snapshot this generator actually loaded.
-    image_memory: mlx_gen::gen_core::ImageMemoryProviderContract,
+    memory_strategy: mlx_gen::gen_core::MemoryProviderContract,
     /// Component-residency strategy (epic 10834 Phase 1, sc-10839; hoisted to the shared seam in
     /// sc-11125), selected from [`LoadSpec::offload_policy`]. `Resident` (default) holds the Qwen
     /// text encoder + DiT + VAE warm for the whole job and across jobs; `Sequential` holds only the
@@ -197,7 +197,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         descriptor: descriptor(),
         tokenizer,
         residency,
-        image_memory: crate::image_memory::image_memory_contract(MODEL_ID, spec),
+        memory_strategy: crate::memory_strategy::memory_strategy_contract(MODEL_ID, spec),
     }))
 }
 
@@ -219,8 +219,8 @@ fn build_comfyui_generator(
         descriptor: descriptor(),
         tokenizer: loader::load_tokenizer(tokenizer_root)?,
         // A community single-file / three-file load has no snapshot component tree, so the contract's
-        // asset facts are the truthful zero (see `image_memory::asset_facts`).
-        image_memory: crate::image_memory::image_memory_contract(
+        // asset facts are the truthful zero (see `memory_strategy::asset_facts`).
+        memory_strategy: crate::memory_strategy::memory_strategy_contract(
             MODEL_ID,
             &LoadSpec::new(WeightsSource::File(std::path::PathBuf::from(
                 "comfyui-in-place",
@@ -447,7 +447,7 @@ fn load_heavy(
 }
 
 // Hand-written rather than `impl_generator!` because this provider also implements the shared
-// image-memory hooks (SC-15449 / SC-15615); `descriptor` / `validate` / `generate` are the identical
+// memory-strategy hooks (SC-15449 / SC-15615); `descriptor` / `validate` / `generate` are the identical
 // plain delegation the macro would have emitted.
 impl Generator for ZImageTurbo {
     fn descriptor(&self) -> &ModelDescriptor {
@@ -466,22 +466,22 @@ impl Generator for ZImageTurbo {
         self.generate_impl(req, on_progress).map_err(Into::into)
     }
 
-    fn image_memory_contract(&self) -> Option<&gen_core::ImageMemoryProviderContract> {
-        Some(&self.image_memory)
+    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        Some(&self.memory_strategy)
     }
 
-    fn image_memory_safety_check(
+    fn memory_strategy_safety_check(
         &self,
-        context: &gen_core::ImageMemoryRunContext,
-    ) -> gen_core::ImageMemorySafetyDecision {
-        crate::image_memory::safety_check(&self.image_memory, context)
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        crate::memory_strategy::safety_check(&self.memory_strategy, context)
     }
 
-    fn begin_image_memory_request(
+    fn begin_memory_strategy_request(
         &self,
-        context: &gen_core::ImageMemoryRunContext,
-    ) -> gen_core::Result<Option<Box<dyn gen_core::ImageMemoryRequestScope + '_>>> {
-        crate::image_memory::begin_request(MODEL_ID, &self.image_memory, context)
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        crate::memory_strategy::begin_request(MODEL_ID, &self.memory_strategy, context)
     }
 }
 
@@ -542,7 +542,7 @@ impl ZImageTurbo {
                 // `None` for every production request, so this is a `None` comparison.
                 pipeline::calibration_fault(
                     req,
-                    mlx_gen::gen_core::ImageMemoryPhase::Conditioning,
+                    mlx_gen::gen_core::MemoryPhase::Conditioning,
                     MODEL_ID,
                 )?;
                 let cap = pipeline::encode_prompt(
@@ -566,7 +566,7 @@ impl ZImageTurbo {
             |heavy: &ZImageHeavyOwned, cap, on_progress| {
                 pipeline::calibration_fault(
                     req,
-                    mlx_gen::gen_core::ImageMemoryPhase::Denoise,
+                    mlx_gen::gen_core::MemoryPhase::Denoise,
                     MODEL_ID,
                 )?;
                 // Static shift=3.0 schedule (the model's scheduler_config.json), resolution- and
@@ -636,11 +636,7 @@ impl ZImageTurbo {
             },
             // ── Phase C (decode): light (VAE) view + latents → images. Tiled under `Sequential`.
             |view, (latents, pid_decoder), on_progress| {
-                pipeline::calibration_fault(
-                    req,
-                    mlx_gen::gen_core::ImageMemoryPhase::Decode,
-                    MODEL_ID,
-                )?;
+                pipeline::calibration_fault(req, mlx_gen::gen_core::MemoryPhase::Decode, MODEL_ID)?;
                 let images = pipeline::decode_batch(
                     view.vae,
                     pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder),
@@ -717,12 +713,16 @@ mlx_gen::register_generators! {
     footprint = component_footprint
 }
 
-/// The shared image-memory contract registration (SC-15449) — resolvable before any weights load, so
+/// The shared memory-strategy contract registration (SC-15449) — resolvable before any weights load, so
 /// the worker can select a strategy from the static declaration plus its own measured evidence.
-pub const IMAGE_MEMORY_REGISTRATION: mlx_gen::gen_core::ImageMemoryRegistration =
-    mlx_gen::gen_core::ImageMemoryRegistration {
+pub const MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =
+    mlx_gen::gen_core::MemoryRegistration {
         provider_id: MODEL_ID,
-        contract: |spec| Ok(crate::image_memory::image_memory_contract(MODEL_ID, spec)),
+        contract: |spec| {
+            Ok(crate::memory_strategy::memory_strategy_contract(
+                MODEL_ID, spec,
+            ))
+        },
     };
 
 #[cfg(test)]

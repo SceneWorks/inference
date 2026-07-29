@@ -168,7 +168,7 @@ pub fn plan_tile_edge(
 /// [`MIN_TILE_EDGE`] up to the Metal watchdog-safe [`WATCHDOG_SAFE_EDGE`] — rather than re-spelled, so
 /// a consumer's advertised domain cannot drift from what [`validate_tile`] enforces.
 ///
-/// This exists because the shared image-memory contract (SC-15449) needs to publish *which* decode
+/// This exists because the shared memory-strategy contract (SC-15449) needs to publish *which* decode
 /// geometries a provider will honour. Before SC-15510 the PiD route had no answer: it planned its own
 /// tiling from [`plan_tile_edge`] and ignored any selection, so a contract-driven bounded-decode
 /// choice had to be refused outright rather than executed.

@@ -226,7 +226,7 @@ pub fn resolve_pid_decoder_at_sigma(
 /// [`GenerationMemory::decode_tile_edge`](mlx_gen::gen_core::GenerationMemory), so this returns `None`
 /// everywhere else and every other provider keeps the auto-plan byte-for-byte.
 ///
-/// That changes the moment a second provider's image-memory adoption starts emitting **its native VAE
+/// That changes the moment a second provider's memory-strategy adoption starts emitting **its native VAE
 /// ladder** into that field. Native VAE tiles (Z-Image's are 512-768 output px; Qwen's probe ladder
 /// runs 256-768) are **not legal PiD tiles** — the student decodes a `scale×` super-resolved output
 /// and its edges are [`TILE_ALIGN`](crate::budget::TILE_ALIGN)-aligned multiples from
@@ -238,7 +238,7 @@ pub fn resolve_pid_decoder_at_sigma(
 /// falling back to the auto-plan when the selected edge is not a legal PiD tile would execute a
 /// different strategy than the selector chose, which is the exact failure the shared contract forbids
 /// — so an out-of-domain edge must be loud. What an adopting provider has to do is refuse the
-/// combination at *admission*, where it has the route in hand: Z-Image's `image_memory::safety_check`
+/// combination at *admission*, where it has the route in hand: Z-Image's `memory_strategy::safety_check`
 /// validates the decode parameters against the route's own candidate domain and rejects a native
 /// geometry under `use_pid` (and vice versa) before a request ever reaches here. Copy that shape.
 pub fn selected_decode_tiling(req: &GenerationRequest) -> Option<(i32, i32)> {
@@ -296,7 +296,7 @@ pub fn mint_planned_decoder(
 }
 
 /// [`mint_planned_decoder`] with an optional **externally selected** `(tile_edge, overlap)` —
-/// SC-15510's reconciliation of the PiD planner with the shared image-memory contract.
+/// SC-15510's reconciliation of the PiD planner with the shared memory-strategy contract.
 ///
 /// `None` is the historical behaviour, unchanged: the auto-plan decides, and a whole-image decode
 /// stays whole. `Some((edge, overlap))` is a bounded-decode selection the worker made from the

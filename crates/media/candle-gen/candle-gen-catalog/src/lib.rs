@@ -345,7 +345,7 @@ mod tests {
             super::media::gen_core::WeightsSource::Dir("/nonexistent".into()),
         );
         let contract = registry
-            .image_memory_contract("krea_2_turbo", &spec)
+            .memory_strategy_contract("krea_2_turbo", &spec)
             .expect("known Krea generator");
         #[cfg(feature = "cuda")]
         assert!(

@@ -22,12 +22,12 @@ pub mod face;
 pub mod generator;
 pub mod guidance;
 pub mod image_embed;
-pub mod image_memory;
 pub mod imageops;
 pub mod json_constraint;
 pub mod license;
 mod macros;
 pub mod media;
+pub mod memory_strategy;
 pub mod mempolicy;
 pub mod registry;
 pub mod runtime;
@@ -69,27 +69,25 @@ pub use generator::{
     SpeechSegment, TimeRegion, VideoClipRef,
 };
 pub use image_embed::{ImageEmbedder, ImageEmbedderDescriptor};
-pub use image_memory::{
-    ImageMemoryAssetFacts, ImageMemoryBackendRealization, ImageMemoryBudget,
-    ImageMemoryCacheSemantics, ImageMemoryCacheState, ImageMemoryCalibrationIdentity,
-    ImageMemoryCleanupSemantics, ImageMemoryConformanceState, ImageMemoryEvidence,
-    ImageMemoryEvidenceDimension, ImageMemoryEvidenceDimensions, ImageMemoryEvidenceKey,
-    ImageMemoryEvidenceVerdict, ImageMemoryFormulaKind, ImageMemoryFormulaVariable,
-    ImageMemoryGeometry, ImageMemoryLifecycleCapabilities, ImageMemoryMode, ImageMemoryNumericTier,
-    ImageMemoryParameterRanges, ImageMemoryParityContract, ImageMemoryParityResult,
-    ImageMemoryPhase, ImageMemoryProviderContract, ImageMemoryRejection, ImageMemoryRequestScope,
-    ImageMemoryRunContext, ImageMemoryRunOutcome, ImageMemoryRuntimeSemantics,
-    ImageMemorySafetyDecision, ImageMemorySelection, ImageMemoryStrategy,
-    ImageMemoryStrategyCapability, ImageMemoryStrategyParameters, ImageMemoryStrategySupport,
-    ImageMemoryWarmRunSemantics, TransformerComponent, IMAGE_MEMORY_CALIBRATION_ABI,
-};
 pub use json_constraint::JsonState;
 pub use license::{weight_licenses_manifest_json, WeightLicense, WeightLicenseEntry};
 pub use media::{AudioChunk, AudioStem, AudioTrack, Image};
+pub use memory_strategy::{
+    MemoryAssetFacts, MemoryBackendRealization, MemoryBudget, MemoryCacheSemantics,
+    MemoryCacheState, MemoryCalibrationIdentity, MemoryCleanupSemantics, MemoryConformanceState,
+    MemoryEvidence, MemoryEvidenceDimension, MemoryEvidenceDimensions, MemoryEvidenceKey,
+    MemoryEvidenceVerdict, MemoryFormulaKind, MemoryFormulaVariable, MemoryGeometry,
+    MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier, MemoryParameterRanges,
+    MemoryParityContract, MemoryParityResult, MemoryPhase, MemoryProviderContract, MemoryRejection,
+    MemoryRequestScope, MemoryRunContext, MemoryRunOutcome, MemoryRuntimeSemantics,
+    MemorySafetyDecision, MemorySelection, MemoryStrategy, MemoryStrategyCapability,
+    MemoryStrategyParameters, MemoryStrategySupport, MemoryWarmRunSemantics, TransformerComponent,
+    MEMORY_CALIBRATION_ABI,
+};
 pub use mempolicy::{plan_memory_adaptation, LaneLevers, Lever, MemoryPlan, StagePeaks};
 pub use registry::{
     AudioEmbedderRegistration, AudioTransformRegistration, CaptionerRegistration,
-    ImageEmbedderRegistration, ImageMemoryRegistration, ModelRegistration, PerComponentBytes,
+    ImageEmbedderRegistration, MemoryRegistration, ModelRegistration, PerComponentBytes,
     ProviderRegistry, ProviderRegistryBuilder, TextEmbedderRegistration, TrainerRegistration,
     TranscriberRegistration, TransformRegistration, VoiceEmbedderRegistration,
 };

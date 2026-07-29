@@ -1,7 +1,7 @@
-//! Tensor-neutral image-memory strategy and provider contract (SC-15449).
+//! Tensor-neutral memory strategy and provider contract (SC-15449).
 //!
-//! This module is the inference-side authority for what an image provider can do. Providers
-//! describe structure, lifecycle hooks, formula shape, backend realization, asset facts, and the
+//! This module is the inference-side authority for what a provider can do. Providers describe
+//! structure, lifecycle hooks, formula shape, backend realization, asset facts, and the
 //! calibration ABI/fingerprint. Measured coefficients and envelopes remain external evidence, and
 //! the caller remains the sole owner of live-budget accounting and least-cost selection.
 //!
@@ -9,6 +9,25 @@
 //! return type cannot substitute a different strategy or numeric tier. Unknown, stale,
 //! fingerprint-mismatched, or out-of-envelope evidence is therefore never turned into a claimed
 //! optimized fit by provider-local policy.
+//!
+//! # Why `memory_strategy` and not `memory` (SC-15804)
+//!
+//! The contract carried an `Image*` prefix through SC-15449 because the image lane adopted it
+//! first. Nothing in the four-rung ladder is image-specific — rung 1 sheds a conditioning
+//! component, rung 2 bounds decoder scratch, rung 3 bounds attention, rung 4 bounds transformer
+//! residency, and video and audio have all four — so the vocabulary is lane-neutral here.
+//!
+//! It is deliberately **not** the bare name `memory`. Five crates in this workspace already have a
+//! `memory` module, meaning two different things: `mlx_gen::memory` is the MLX budget interface
+//! (`safe_budget_gib`, `clamp_budget_to_cap`, `apply_memory_cap_env`, `MEMORY_CAP_ENV`) that MLX
+//! provider files import directly, while `mlx-gen-sam2`'s `memory` is SAM2's *model* memory bank
+//! (`MemoryEncoder`, `MemoryAttention`). A third, `mlx_rs::memory`, is the allocator itself
+//! (`clear_cache`, `get_peak_memory`). A `gen_core::memory` would land in the same `use` block as
+//! the first and read as the second. `memory_strategy` collides with none of them.
+//!
+//! The **types** stay bare (`MemoryStrategy`, `MemoryProviderContract`, ...): the existing bare
+//! `Memory*` names in the workspace (`MemoryEncoder`, `MemoryAttention`, ...) are SAM2/model-bank
+//! concepts in other crates and never appear alongside these.
 
 use crate::{Error, GenerationRequest, Precision, Quant, Result};
 
@@ -18,12 +37,12 @@ use crate::{Error, GenerationRequest, Precision, Quant, Result};
 /// formula inputs or lifecycle semantics are interpreted; the fingerprint changes whenever one
 /// provider changes tensor layout, quantization floors, execution structure, or another detail that
 /// invalidates its measurements.
-pub const IMAGE_MEMORY_CALIBRATION_ABI: u32 = 1;
+pub const MEMORY_CALIBRATION_ABI: u32 = 1;
 
-/// The normative least-cost image-memory ladder, in selection order.
+/// The normative least-cost memory-strategy ladder, in selection order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u8)]
-pub enum ImageMemoryStrategy {
+pub enum MemoryStrategy {
     Resident = 0,
     StagedResidency = 1,
     BoundedDecode = 2,
@@ -31,7 +50,7 @@ pub enum ImageMemoryStrategy {
     BoundedTransformerResidency = 4,
 }
 
-impl ImageMemoryStrategy {
+impl MemoryStrategy {
     pub const ALL: [Self; 5] = [
         Self::Resident,
         Self::StagedResidency,
@@ -48,7 +67,7 @@ impl ImageMemoryStrategy {
 
 /// Static provider disposition for one rung. Dynamic verification never belongs here.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ImageMemoryStrategySupport {
+pub enum MemoryStrategySupport {
     Implemented,
     /// The architecture lacks the component or independent work the rung would optimize.
     StructurallyNotApplicable {
@@ -59,12 +78,12 @@ pub enum ImageMemoryStrategySupport {
 
 /// Provider-declared support and parameter domain for one ladder rung.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ImageMemoryStrategyCapability {
-    pub strategy: ImageMemoryStrategy,
-    pub support: ImageMemoryStrategySupport,
+pub struct MemoryStrategyCapability {
+    pub strategy: MemoryStrategy,
+    pub support: MemoryStrategySupport,
     /// Production parameter candidates accepted by the provider. Empty fields mean the strategy
     /// does not use that parameter; evidence covers only the exact values it exercised.
-    pub parameters: ImageMemoryParameterRanges,
+    pub parameters: MemoryParameterRanges,
 }
 
 /// Which transformer(s) rung 4's block window applies to (SC-15794).
@@ -105,7 +124,7 @@ impl TransformerComponent {
 
 /// Production parameter domains. The values are candidates, not calibration evidence.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ImageMemoryParameterRanges {
+pub struct MemoryParameterRanges {
     pub decode_tile_edges: Vec<u32>,
     pub decode_overlaps: Vec<u32>,
     pub attention_chunk_sizes: Vec<u32>,
@@ -117,7 +136,7 @@ pub struct ImageMemoryParameterRanges {
 
 /// Concrete parameters selected for one request.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ImageMemoryStrategyParameters {
+pub struct MemoryStrategyParameters {
     pub decode_tile_edge: Option<u32>,
     pub decode_overlap: Option<u32>,
     pub attention_chunk_size: Option<u32>,
@@ -127,7 +146,7 @@ pub struct ImageMemoryStrategyParameters {
     pub transformer_window_component: Option<TransformerComponent>,
 }
 
-impl ImageMemoryStrategyParameters {
+impl MemoryStrategyParameters {
     /// The effective rung-4 component scope: the declared one, or the DiT-only default.
     pub fn window_component(&self) -> TransformerComponent {
         self.transformer_window_component.unwrap_or_default()
@@ -136,7 +155,7 @@ impl ImageMemoryStrategyParameters {
 
 /// Provider lifecycle phases whose scarce backend residency may be separated.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum ImageMemoryPhase {
+pub enum MemoryPhase {
     Conditioning,
     Denoise,
     Decode,
@@ -144,8 +163,8 @@ pub enum ImageMemoryPhase {
 
 /// Lifecycle and bounded-work hooks implemented by a provider.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ImageMemoryLifecycleCapabilities {
-    pub phases: Vec<ImageMemoryPhase>,
+pub struct MemoryLifecycleCapabilities {
+    pub phases: Vec<MemoryPhase>,
     /// Completed phases are synchronized before their scarce residency is released.
     pub synchronized_phase_release: bool,
     pub decode_tiling: bool,
@@ -155,7 +174,7 @@ pub struct ImageMemoryLifecycleCapabilities {
 
 /// Formula inputs whose coefficients live in manifest/generated evidence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum ImageMemoryFormulaVariable {
+pub enum MemoryFormulaVariable {
     AssetBytes,
     PixelCount,
     LatentPixelCount,
@@ -170,24 +189,24 @@ pub enum ImageMemoryFormulaVariable {
 
 /// Provider-owned shape of the peak-memory formula. Coefficients do not live here.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ImageMemoryFormulaKind {
+pub enum MemoryFormulaKind {
     /// Generic MLX-compatible seam: materialized asset bytes plus calibrated headroom.
     AssetBytesPlusHeadroom,
     /// One affine expression over the declared request/strategy variables.
     Affine {
-        variables: Vec<ImageMemoryFormulaVariable>,
+        variables: Vec<MemoryFormulaVariable>,
     },
     /// Maximum of independently calibrated lifecycle phase expressions (the generalized Krea
     /// phase-curve shape, also suitable for request-aware provider estimators such as Mage).
     PhaseEnvelope {
-        phases: Vec<ImageMemoryPhase>,
-        variables: Vec<ImageMemoryFormulaVariable>,
+        phases: Vec<MemoryPhase>,
+        variables: Vec<MemoryFormulaVariable>,
     },
 }
 
 /// Backend-specific realization without imposing CUDA transfer language on unified memory.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ImageMemoryBackendRealization {
+pub enum MemoryBackendRealization {
     CandleCuda {
         device_residency: bool,
         host_backed_weights: bool,
@@ -201,7 +220,7 @@ pub enum ImageMemoryBackendRealization {
     },
 }
 
-impl ImageMemoryBackendRealization {
+impl MemoryBackendRealization {
     pub const fn backend_id(&self) -> &'static str {
         match self {
             Self::CandleCuda { .. } => "candle",
@@ -212,15 +231,15 @@ impl ImageMemoryBackendRealization {
 
 /// Provider-owned calibration identity.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ImageMemoryCalibrationIdentity {
+pub struct MemoryCalibrationIdentity {
     pub abi: u32,
     pub fingerprint: String,
 }
 
-impl ImageMemoryCalibrationIdentity {
+impl MemoryCalibrationIdentity {
     pub fn new(fingerprint: impl Into<String>) -> Self {
         Self {
-            abi: IMAGE_MEMORY_CALIBRATION_ABI,
+            abi: MEMORY_CALIBRATION_ABI,
             fingerprint: fingerprint.into(),
         }
     }
@@ -228,7 +247,7 @@ impl ImageMemoryCalibrationIdentity {
 
 /// Provider-owned, load-exact asset facts used as formula inputs.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ImageMemoryAssetFacts {
+pub struct MemoryAssetFacts {
     pub base_bytes: u64,
     pub conditioning_bytes: u64,
     pub transformer_bytes: u64,
@@ -238,91 +257,88 @@ pub struct ImageMemoryAssetFacts {
 
 /// Cache keys must include every axis that can change residency or execution.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ImageMemoryCacheSemantics {
+pub enum MemoryCacheSemantics {
     StrategyTierParametersGeometryAndOverlay,
 }
 
 /// Warm generators must not inherit a prior request's memory decision.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ImageMemoryWarmRunSemantics {
+pub enum MemoryWarmRunSemantics {
     RevalidateBudgetAndReapplyRequestState,
 }
 
 /// Cancellation and error cleanup must synchronize backend work before releasing active state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ImageMemoryCleanupSemantics {
+pub enum MemoryCleanupSemantics {
     SynchronizeAndReleaseActivePhasesAndWindows,
 }
 
 /// Runtime semantics required of every adopting provider.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ImageMemoryRuntimeSemantics {
-    pub cache: ImageMemoryCacheSemantics,
-    pub warm_run: ImageMemoryWarmRunSemantics,
-    pub cancellation: ImageMemoryCleanupSemantics,
-    pub error: ImageMemoryCleanupSemantics,
+pub struct MemoryRuntimeSemantics {
+    pub cache: MemoryCacheSemantics,
+    pub warm_run: MemoryWarmRunSemantics,
+    pub cancellation: MemoryCleanupSemantics,
+    pub error: MemoryCleanupSemantics,
 }
 
-impl Default for ImageMemoryRuntimeSemantics {
+impl Default for MemoryRuntimeSemantics {
     fn default() -> Self {
         Self {
-            cache: ImageMemoryCacheSemantics::StrategyTierParametersGeometryAndOverlay,
-            warm_run: ImageMemoryWarmRunSemantics::RevalidateBudgetAndReapplyRequestState,
-            cancellation: ImageMemoryCleanupSemantics::SynchronizeAndReleaseActivePhasesAndWindows,
-            error: ImageMemoryCleanupSemantics::SynchronizeAndReleaseActivePhasesAndWindows,
+            cache: MemoryCacheSemantics::StrategyTierParametersGeometryAndOverlay,
+            warm_run: MemoryWarmRunSemantics::RevalidateBudgetAndReapplyRequestState,
+            cancellation: MemoryCleanupSemantics::SynchronizeAndReleaseActivePhasesAndWindows,
+            error: MemoryCleanupSemantics::SynchronizeAndReleaseActivePhasesAndWindows,
         }
     }
 }
 
 /// Static provider contract returned before weights are loaded.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ImageMemoryProviderContract {
+pub struct MemoryProviderContract {
     pub provider_id: String,
-    pub backend: ImageMemoryBackendRealization,
-    pub strategies: Vec<ImageMemoryStrategyCapability>,
-    pub lifecycle: ImageMemoryLifecycleCapabilities,
-    pub formula: ImageMemoryFormulaKind,
+    pub backend: MemoryBackendRealization,
+    pub strategies: Vec<MemoryStrategyCapability>,
+    pub lifecycle: MemoryLifecycleCapabilities,
+    pub formula: MemoryFormulaKind,
     /// `None` is the compatibility default for a provider that has not adopted calibration yet.
     /// Such a provider can run its resident path but can never claim a verified optimized fit.
-    pub calibration: Option<ImageMemoryCalibrationIdentity>,
-    pub asset_facts: ImageMemoryAssetFacts,
-    pub runtime: ImageMemoryRuntimeSemantics,
+    pub calibration: Option<MemoryCalibrationIdentity>,
+    pub asset_facts: MemoryAssetFacts,
+    pub runtime: MemoryRuntimeSemantics,
 }
 
-impl ImageMemoryProviderContract {
+impl MemoryProviderContract {
     /// Safe compatibility view for an existing provider: resident only, optimized rungs missing,
     /// and no calibration identity. This preserves existing behavior without fabricating evidence.
     pub fn compatibility_default(
         provider_id: impl Into<String>,
-        backend: ImageMemoryBackendRealization,
+        backend: MemoryBackendRealization,
     ) -> Self {
         Self {
             provider_id: provider_id.into(),
             backend,
-            strategies: ImageMemoryStrategy::ALL
+            strategies: MemoryStrategy::ALL
                 .into_iter()
-                .map(|strategy| ImageMemoryStrategyCapability {
+                .map(|strategy| MemoryStrategyCapability {
                     strategy,
-                    support: if strategy == ImageMemoryStrategy::Resident {
-                        ImageMemoryStrategySupport::Implemented
+                    support: if strategy == MemoryStrategy::Resident {
+                        MemoryStrategySupport::Implemented
                     } else {
-                        ImageMemoryStrategySupport::Missing
+                        MemoryStrategySupport::Missing
                     },
-                    parameters: ImageMemoryParameterRanges::default(),
+                    parameters: MemoryParameterRanges::default(),
                 })
                 .collect(),
-            lifecycle: ImageMemoryLifecycleCapabilities::default(),
-            formula: ImageMemoryFormulaKind::AssetBytesPlusHeadroom,
+            lifecycle: MemoryLifecycleCapabilities::default(),
+            formula: MemoryFormulaKind::AssetBytesPlusHeadroom,
             calibration: None,
-            asset_facts: ImageMemoryAssetFacts::default(),
-            runtime: ImageMemoryRuntimeSemantics::default(),
+            asset_facts: MemoryAssetFacts::default(),
+            runtime: MemoryRuntimeSemantics::default(),
         }
     }
 
-    pub fn capability(
-        &self,
-        strategy: ImageMemoryStrategy,
-    ) -> Option<&ImageMemoryStrategyCapability> {
+    pub fn capability(&self, strategy: MemoryStrategy) -> Option<&MemoryStrategyCapability> {
         self.strategies
             .iter()
             .find(|capability| capability.strategy == strategy)
@@ -336,7 +352,7 @@ impl ImageMemoryProviderContract {
             errors.push("provider_id must be non-empty".to_owned());
         }
 
-        for strategy in ImageMemoryStrategy::ALL {
+        for strategy in MemoryStrategy::ALL {
             let count = self
                 .strategies
                 .iter()
@@ -348,7 +364,7 @@ impl ImageMemoryProviderContract {
                 ));
             }
         }
-        if self.strategies.len() != ImageMemoryStrategy::ALL.len() {
+        if self.strategies.len() != MemoryStrategy::ALL.len() {
             errors.push(format!(
                 "strategy table must contain exactly five entries (found {})",
                 self.strategies.len()
@@ -358,14 +374,14 @@ impl ImageMemoryProviderContract {
         let implemented = |strategy| {
             matches!(
                 self.capability(strategy).map(|c| &c.support),
-                Some(ImageMemoryStrategySupport::Implemented)
+                Some(MemoryStrategySupport::Implemented)
             )
         };
-        if implemented(ImageMemoryStrategy::StagedResidency) {
+        if implemented(MemoryStrategy::StagedResidency) {
             for phase in [
-                ImageMemoryPhase::Conditioning,
-                ImageMemoryPhase::Denoise,
-                ImageMemoryPhase::Decode,
+                MemoryPhase::Conditioning,
+                MemoryPhase::Denoise,
+                MemoryPhase::Decode,
             ] {
                 if !self.lifecycle.phases.contains(&phase) {
                     errors.push(format!(
@@ -379,14 +395,13 @@ impl ImageMemoryProviderContract {
                 );
             }
         }
-        if implemented(ImageMemoryStrategy::BoundedDecode) && !self.lifecycle.decode_tiling {
+        if implemented(MemoryStrategy::BoundedDecode) && !self.lifecycle.decode_tiling {
             errors.push("BoundedDecode requires the decode_tiling hook".to_owned());
         }
-        if implemented(ImageMemoryStrategy::BoundedAttention) && !self.lifecycle.attention_chunking
-        {
+        if implemented(MemoryStrategy::BoundedAttention) && !self.lifecycle.attention_chunking {
             errors.push("BoundedAttention requires the attention_chunking hook".to_owned());
         }
-        if implemented(ImageMemoryStrategy::BoundedTransformerResidency)
+        if implemented(MemoryStrategy::BoundedTransformerResidency)
             && !self.lifecycle.transformer_window_materialization
         {
             errors.push(
@@ -395,8 +410,7 @@ impl ImageMemoryProviderContract {
         }
 
         for capability in &self.strategies {
-            if let ImageMemoryStrategySupport::StructurallyNotApplicable { reason } =
-                &capability.support
+            if let MemoryStrategySupport::StructurallyNotApplicable { reason } = &capability.support
             {
                 if reason.trim().is_empty() {
                     errors.push(format!(
@@ -410,10 +424,10 @@ impl ImageMemoryProviderContract {
         }
 
         if let Some(calibration) = &self.calibration {
-            if calibration.abi != IMAGE_MEMORY_CALIBRATION_ABI {
+            if calibration.abi != MEMORY_CALIBRATION_ABI {
                 errors.push(format!(
                     "calibration ABI {} does not match contract ABI {}",
-                    calibration.abi, IMAGE_MEMORY_CALIBRATION_ABI
+                    calibration.abi, MEMORY_CALIBRATION_ABI
                 ));
             }
             if calibration.fingerprint.trim().is_empty() {
@@ -428,25 +442,25 @@ impl ImageMemoryProviderContract {
     }
 
     /// Validate a worker-owned selection against static provider capability and parameter ranges.
-    pub fn validate_selection(&self, selection: &ImageMemorySelection) -> Result<()> {
+    pub fn validate_selection(&self, selection: &MemorySelection) -> Result<()> {
         let capability = self.capability(selection.strategy).ok_or_else(|| {
             Error::Unsupported(format!(
                 "{} does not declare {:?}",
                 self.provider_id, selection.strategy
             ))
         })?;
-        if !matches!(capability.support, ImageMemoryStrategySupport::Implemented) {
+        if !matches!(capability.support, MemoryStrategySupport::Implemented) {
             return Err(Error::Unsupported(format!(
                 "{} cannot execute {:?}: {:?}",
                 self.provider_id, selection.strategy, capability.support
             )));
         }
-        for rung in ImageMemoryStrategy::ALL
+        for rung in MemoryStrategy::ALL
             .into_iter()
             .filter(|rung| *rung < selection.strategy)
         {
             let support = self.capability(rung).map(|capability| &capability.support);
-            if matches!(support, Some(ImageMemoryStrategySupport::Missing) | None) {
+            if matches!(support, Some(MemoryStrategySupport::Missing) | None) {
                 return Err(Error::Unsupported(format!(
                     "{} cannot execute cumulative {:?}: prerequisite rung {rung:?} is missing",
                     self.provider_id, selection.strategy
@@ -458,7 +472,7 @@ impl ImageMemoryProviderContract {
     }
 }
 
-fn validate_ranges(capability: &ImageMemoryStrategyCapability, errors: &mut Vec<String>) {
+fn validate_ranges(capability: &MemoryStrategyCapability, errors: &mut Vec<String>) {
     let ranges = &capability.parameters;
     for (name, values) in [
         ("decode_tile_edges", &ranges.decode_tile_edges),
@@ -482,20 +496,18 @@ fn validate_ranges(capability: &ImageMemoryStrategyCapability, errors: &mut Vec<
 }
 
 fn validate_owned_parameter_domain(
-    capability: &ImageMemoryStrategyCapability,
+    capability: &MemoryStrategyCapability,
     errors: &mut Vec<String>,
 ) {
-    if !matches!(capability.support, ImageMemoryStrategySupport::Implemented) {
+    if !matches!(capability.support, MemoryStrategySupport::Implemented) {
         return;
     }
     let ranges = &capability.parameters;
     let (decode, attention, transformer) = match capability.strategy {
-        ImageMemoryStrategy::Resident | ImageMemoryStrategy::StagedResidency => {
-            (false, false, false)
-        }
-        ImageMemoryStrategy::BoundedDecode => (true, false, false),
-        ImageMemoryStrategy::BoundedAttention => (false, true, false),
-        ImageMemoryStrategy::BoundedTransformerResidency => (false, false, true),
+        MemoryStrategy::Resident | MemoryStrategy::StagedResidency => (false, false, false),
+        MemoryStrategy::BoundedDecode => (true, false, false),
+        MemoryStrategy::BoundedAttention => (false, true, false),
+        MemoryStrategy::BoundedTransformerResidency => (false, false, true),
     };
     if decode && (ranges.decode_tile_edges.is_empty() || ranges.decode_overlaps.is_empty()) {
         errors.push(
@@ -552,8 +564,8 @@ fn validate_owned_parameter_domain(
 }
 
 fn validate_selected_parameters(
-    selection: &ImageMemorySelection,
-    contract: &ImageMemoryProviderContract,
+    selection: &MemorySelection,
+    contract: &MemoryProviderContract,
 ) -> std::result::Result<(), String> {
     let selected = selection.parameters;
     let implemented = |strategy| {
@@ -561,23 +573,22 @@ fn validate_selected_parameters(
             contract
                 .capability(strategy)
                 .map(|capability| &capability.support),
-            Some(ImageMemoryStrategySupport::Implemented)
+            Some(MemoryStrategySupport::Implemented)
         )
     };
-    let requires_decode = selection.strategy >= ImageMemoryStrategy::BoundedDecode
-        && implemented(ImageMemoryStrategy::BoundedDecode);
-    let requires_attention = selection.strategy >= ImageMemoryStrategy::BoundedAttention
-        && implemented(ImageMemoryStrategy::BoundedAttention);
-    let requires_transformer = selection.strategy
-        >= ImageMemoryStrategy::BoundedTransformerResidency
-        && implemented(ImageMemoryStrategy::BoundedTransformerResidency);
+    let requires_decode = selection.strategy >= MemoryStrategy::BoundedDecode
+        && implemented(MemoryStrategy::BoundedDecode);
+    let requires_attention = selection.strategy >= MemoryStrategy::BoundedAttention
+        && implemented(MemoryStrategy::BoundedAttention);
+    let requires_transformer = selection.strategy >= MemoryStrategy::BoundedTransformerResidency
+        && implemented(MemoryStrategy::BoundedTransformerResidency);
 
     validate_required_parameter(
         "decode_tile_edge",
         selected.decode_tile_edge,
         requires_decode,
         contract
-            .capability(ImageMemoryStrategy::BoundedDecode)
+            .capability(MemoryStrategy::BoundedDecode)
             .map(|capability| capability.parameters.decode_tile_edges.as_slice())
             .unwrap_or_default(),
     )?;
@@ -586,7 +597,7 @@ fn validate_selected_parameters(
         selected.decode_overlap,
         requires_decode,
         contract
-            .capability(ImageMemoryStrategy::BoundedDecode)
+            .capability(MemoryStrategy::BoundedDecode)
             .map(|capability| capability.parameters.decode_overlaps.as_slice())
             .unwrap_or_default(),
     )?;
@@ -595,7 +606,7 @@ fn validate_selected_parameters(
         selected.attention_chunk_size,
         requires_attention,
         contract
-            .capability(ImageMemoryStrategy::BoundedAttention)
+            .capability(MemoryStrategy::BoundedAttention)
             .map(|capability| capability.parameters.attention_chunk_sizes.as_slice())
             .unwrap_or_default(),
     )?;
@@ -604,7 +615,7 @@ fn validate_selected_parameters(
         selected.transformer_window_size,
         requires_transformer,
         contract
-            .capability(ImageMemoryStrategy::BoundedTransformerResidency)
+            .capability(MemoryStrategy::BoundedTransformerResidency)
             .map(|capability| capability.parameters.transformer_window_sizes.as_slice())
             .unwrap_or_default(),
     )?;
@@ -620,7 +631,7 @@ fn validate_selected_parameters(
             ));
         }
         let allowed = contract
-            .capability(ImageMemoryStrategy::BoundedTransformerResidency)
+            .capability(MemoryStrategy::BoundedTransformerResidency)
             .map(|capability| {
                 capability
                     .parameters
@@ -667,22 +678,22 @@ fn validate_required_parameter(
 
 /// Numeric tier is one immutable axis of a selection. Strategies cannot change it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ImageMemoryNumericTier {
+pub struct MemoryNumericTier {
     pub precision: Precision,
     pub quant: Option<Quant>,
 }
 
 /// Shared-worker selection presented to the provider.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ImageMemorySelection {
-    pub strategy: ImageMemoryStrategy,
-    pub parameters: ImageMemoryStrategyParameters,
-    pub tier: ImageMemoryNumericTier,
+pub struct MemorySelection {
+    pub strategy: MemoryStrategy,
+    pub parameters: MemoryStrategyParameters,
+    pub tier: MemoryNumericTier,
 }
 
 /// Request geometry used by evidence and cache identity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ImageMemoryGeometry {
+pub struct MemoryGeometry {
     pub width: u32,
     pub height: u32,
     pub batch: u32,
@@ -691,14 +702,14 @@ pub struct ImageMemoryGeometry {
 
 /// Canonical live-budget accounting owned by the caller.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ImageMemoryBudget {
+pub struct MemoryBudget {
     pub total_bytes: u64,
     pub committed_bytes: u64,
     pub reclaimable_bytes: u64,
     pub reserved_headroom_bytes: u64,
 }
 
-impl ImageMemoryBudget {
+impl MemoryBudget {
     /// Effective request budget. Reserved headroom is removed from the currently free plus
     /// reclaimable memory, while the total-minus-headroom ceiling prevents reclaimable accounting
     /// from exceeding physical capacity. All arithmetic is saturating.
@@ -721,14 +732,14 @@ impl ImageMemoryBudget {
 
 /// Cold/warm state is request-scoped and never implies reuse of a prior selection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ImageMemoryCacheState {
+pub enum MemoryCacheState {
     Cold,
     Warm,
 }
 
 /// Advertised request surface. Optimized evidence never transfers between these modes.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ImageMemoryMode {
+pub enum MemoryMode {
     TextToImage,
     ImageToImage,
     Edit,
@@ -737,62 +748,62 @@ pub enum ImageMemoryMode {
 
 /// Context for provider safety and lifecycle hooks.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ImageMemoryRunContext {
-    pub selection: ImageMemorySelection,
+pub struct MemoryRunContext {
+    pub selection: MemorySelection,
     /// Provider calibration identity that the caller used for admission. Resident requests carry
     /// this handshake too; optimized-only evidence validation is not sufficient.
     pub calibration_abi: u32,
     pub calibration_fingerprint: String,
-    pub mode: ImageMemoryMode,
+    pub mode: MemoryMode,
     pub has_reference: bool,
     pub use_pid: bool,
     pub has_phases: bool,
-    pub geometry: ImageMemoryGeometry,
+    pub geometry: MemoryGeometry,
     pub overlay: Option<String>,
-    pub budget: ImageMemoryBudget,
+    pub budget: MemoryBudget,
     pub predicted_peak_bytes: u64,
-    pub cache_state: ImageMemoryCacheState,
+    pub cache_state: MemoryCacheState,
     pub evidence_revision: String,
 }
 
 /// Defense-in-depth result. It can accept or reject; it cannot replace the worker's selection.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ImageMemorySafetyDecision {
+pub enum MemorySafetyDecision {
     Accept,
     Reject { reason: String },
 }
 
 /// Terminal cleanup reason supplied to a request scope.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ImageMemoryRunOutcome {
+pub enum MemoryRunOutcome {
     Complete,
     Canceled,
     Error { message: String },
 }
 
 /// Tensor-neutral lifecycle scope implemented by adopting providers.
-pub trait ImageMemoryRequestScope {
+pub trait MemoryRequestScope {
     /// Translate the selected strategy into the provider's existing request controls. This is the
     /// executable bridge for providers that predate the shared contract.
     fn configure_request(&mut self, request: &mut GenerationRequest) -> Result<()>;
-    fn enter_phase(&mut self, phase: ImageMemoryPhase) -> Result<()>;
-    fn leave_phase(&mut self, phase: ImageMemoryPhase) -> Result<()>;
+    fn enter_phase(&mut self, phase: MemoryPhase) -> Result<()>;
+    fn leave_phase(&mut self, phase: MemoryPhase) -> Result<()>;
     fn configure_decode(
         &mut self,
         tile_edge: u32,
         overlap: u32,
-        geometry: ImageMemoryGeometry,
+        geometry: MemoryGeometry,
     ) -> Result<()>;
     fn configure_attention(&mut self, chunk_size: u32) -> Result<()>;
     fn materialize_transformer_window(&mut self, first_block: u32, block_count: u32) -> Result<()>;
     /// Must be called exactly once on success, cancellation, or error. Providers synchronize and
-    /// release active phases/windows according to [`ImageMemoryRuntimeSemantics`].
-    fn finish(&mut self, outcome: ImageMemoryRunOutcome) -> Result<()>;
+    /// release active phases/windows according to [`MemoryRuntimeSemantics`].
+    fn finish(&mut self, outcome: MemoryRunOutcome) -> Result<()>;
 }
 
 /// Five catalog conformance states from epic SC-15448.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ImageMemoryConformanceState {
+pub enum MemoryConformanceState {
     Verified,
     ImplementedUnverified,
     StructurallyNotApplicable,
@@ -802,7 +813,7 @@ pub enum ImageMemoryConformanceState {
 
 /// Six independent evidence dimensions from epic SC-15448.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum ImageMemoryEvidenceDimension {
+pub enum MemoryEvidenceDimension {
     StaticImplementation,
     DeclaredCalibration,
     HistoricalVerification,
@@ -811,7 +822,7 @@ pub enum ImageMemoryEvidenceDimension {
     ExactStrategyParameters,
 }
 
-impl ImageMemoryEvidenceDimension {
+impl MemoryEvidenceDimension {
     pub const ALL: [Self; 6] = [
         Self::StaticImplementation,
         Self::DeclaredCalibration,
@@ -824,7 +835,7 @@ impl ImageMemoryEvidenceDimension {
 
 /// Why one evidence dimension does or does not cover a request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ImageMemoryEvidenceVerdict {
+pub enum MemoryEvidenceVerdict {
     Satisfied,
     Missing,
     Unverified,
@@ -836,63 +847,61 @@ pub enum ImageMemoryEvidenceVerdict {
 
 /// Explicit six-dimensional evidence result.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ImageMemoryEvidenceDimensions {
-    pub static_implementation: ImageMemoryEvidenceVerdict,
-    pub declared_calibration: ImageMemoryEvidenceVerdict,
-    pub historical_verification: ImageMemoryEvidenceVerdict,
-    pub current_environment_verification: ImageMemoryEvidenceVerdict,
-    pub canonical_route_loadability: ImageMemoryEvidenceVerdict,
-    pub exact_strategy_parameters: ImageMemoryEvidenceVerdict,
+pub struct MemoryEvidenceDimensions {
+    pub static_implementation: MemoryEvidenceVerdict,
+    pub declared_calibration: MemoryEvidenceVerdict,
+    pub historical_verification: MemoryEvidenceVerdict,
+    pub current_environment_verification: MemoryEvidenceVerdict,
+    pub canonical_route_loadability: MemoryEvidenceVerdict,
+    pub exact_strategy_parameters: MemoryEvidenceVerdict,
 }
 
-impl ImageMemoryEvidenceDimensions {
+impl MemoryEvidenceDimensions {
     pub const VERIFIED: Self = Self {
-        static_implementation: ImageMemoryEvidenceVerdict::Satisfied,
-        declared_calibration: ImageMemoryEvidenceVerdict::Satisfied,
-        historical_verification: ImageMemoryEvidenceVerdict::Satisfied,
-        current_environment_verification: ImageMemoryEvidenceVerdict::Satisfied,
-        canonical_route_loadability: ImageMemoryEvidenceVerdict::Satisfied,
-        exact_strategy_parameters: ImageMemoryEvidenceVerdict::Satisfied,
+        static_implementation: MemoryEvidenceVerdict::Satisfied,
+        declared_calibration: MemoryEvidenceVerdict::Satisfied,
+        historical_verification: MemoryEvidenceVerdict::Satisfied,
+        current_environment_verification: MemoryEvidenceVerdict::Satisfied,
+        canonical_route_loadability: MemoryEvidenceVerdict::Satisfied,
+        exact_strategy_parameters: MemoryEvidenceVerdict::Satisfied,
     };
 
-    pub fn verdict(self, dimension: ImageMemoryEvidenceDimension) -> ImageMemoryEvidenceVerdict {
+    pub fn verdict(self, dimension: MemoryEvidenceDimension) -> MemoryEvidenceVerdict {
         match dimension {
-            ImageMemoryEvidenceDimension::StaticImplementation => self.static_implementation,
-            ImageMemoryEvidenceDimension::DeclaredCalibration => self.declared_calibration,
-            ImageMemoryEvidenceDimension::HistoricalVerification => self.historical_verification,
-            ImageMemoryEvidenceDimension::CurrentEnvironmentVerification => {
+            MemoryEvidenceDimension::StaticImplementation => self.static_implementation,
+            MemoryEvidenceDimension::DeclaredCalibration => self.declared_calibration,
+            MemoryEvidenceDimension::HistoricalVerification => self.historical_verification,
+            MemoryEvidenceDimension::CurrentEnvironmentVerification => {
                 self.current_environment_verification
             }
-            ImageMemoryEvidenceDimension::CanonicalRouteLoadability => {
-                self.canonical_route_loadability
-            }
-            ImageMemoryEvidenceDimension::ExactStrategyParameters => self.exact_strategy_parameters,
+            MemoryEvidenceDimension::CanonicalRouteLoadability => self.canonical_route_loadability,
+            MemoryEvidenceDimension::ExactStrategyParameters => self.exact_strategy_parameters,
         }
     }
 
     pub fn all_satisfied(self) -> bool {
-        ImageMemoryEvidenceDimension::ALL
+        MemoryEvidenceDimension::ALL
             .into_iter()
-            .all(|dimension| self.verdict(dimension) == ImageMemoryEvidenceVerdict::Satisfied)
+            .all(|dimension| self.verdict(dimension) == MemoryEvidenceVerdict::Satisfied)
     }
 }
 
 /// Fully-qualified key for one evidence cell.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ImageMemoryEvidenceKey {
+pub struct MemoryEvidenceKey {
     pub resolved_route: String,
     pub backend: String,
-    pub tier: ImageMemoryNumericTier,
+    pub tier: MemoryNumericTier,
     pub mode: String,
     pub overlay: Option<String>,
-    pub geometry: ImageMemoryGeometry,
-    pub strategy: ImageMemoryStrategy,
-    pub parameters: ImageMemoryStrategyParameters,
+    pub geometry: MemoryGeometry,
+    pub strategy: MemoryStrategy,
+    pub parameters: MemoryStrategyParameters,
 }
 
 /// Numerical parity contract for an evidence record.
 #[derive(Clone, Debug, PartialEq)]
-pub enum ImageMemoryParityContract {
+pub enum MemoryParityContract {
     Exact,
     Tolerance {
         metric: String,
@@ -907,7 +916,7 @@ pub enum ImageMemoryParityContract {
 
 /// Result of executing the declared numerical contract.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ImageMemoryParityResult {
+pub enum MemoryParityResult {
     Passed,
     Failed { reason: String },
     NotRun,
@@ -915,10 +924,10 @@ pub enum ImageMemoryParityResult {
 
 /// Dynamic/static evidence handshake consumed by the shared selector.
 #[derive(Clone, Debug, PartialEq)]
-pub struct ImageMemoryEvidence {
-    pub key: ImageMemoryEvidenceKey,
-    pub conformance: ImageMemoryConformanceState,
-    pub dimensions: ImageMemoryEvidenceDimensions,
+pub struct MemoryEvidence {
+    pub key: MemoryEvidenceKey,
+    pub conformance: MemoryConformanceState,
+    pub dimensions: MemoryEvidenceDimensions,
     pub calibration_abi: u32,
     pub calibration_fingerprint: String,
     pub sceneworks_revision: String,
@@ -926,23 +935,23 @@ pub struct ImageMemoryEvidence {
     pub harness_version: String,
     pub predicted_peak_bytes: u64,
     pub observed_peak_bytes: Option<u64>,
-    pub parity: ImageMemoryParityContract,
-    pub parity_result: ImageMemoryParityResult,
+    pub parity: MemoryParityContract,
+    pub parity_result: MemoryParityResult,
 }
 
-impl ImageMemoryEvidence {
+impl MemoryEvidence {
     pub fn validation_errors(&self) -> Vec<String> {
         let mut errors = Vec::new();
         if self.observed_peak_bytes.is_none() {
             errors.push("verified evidence requires an observed peak".to_owned());
         }
         match &self.parity {
-            ImageMemoryParityContract::Exact => {}
-            ImageMemoryParityContract::Tolerance {
+            MemoryParityContract::Exact => {}
+            MemoryParityContract::Tolerance {
                 metric,
                 maximum_error,
             } => validate_parity_limit(metric, *maximum_error, &mut errors),
-            ImageMemoryParityContract::Golden {
+            MemoryParityContract::Golden {
                 fixture,
                 metric,
                 maximum_error,
@@ -954,11 +963,11 @@ impl ImageMemoryEvidence {
             }
         }
         match &self.parity_result {
-            ImageMemoryParityResult::Passed => {}
-            ImageMemoryParityResult::Failed { reason } if reason.trim().is_empty() => {
+            MemoryParityResult::Passed => {}
+            MemoryParityResult::Failed { reason } if reason.trim().is_empty() => {
                 errors.push("failed parity result requires a reason".to_owned());
             }
-            ImageMemoryParityResult::Failed { .. } | ImageMemoryParityResult::NotRun => {}
+            MemoryParityResult::Failed { .. } | MemoryParityResult::NotRun => {}
         }
         errors
     }
@@ -967,33 +976,33 @@ impl ImageMemoryEvidence {
     /// authorize an optimized fit.
     pub fn optimized_eligibility(
         &self,
-        contract: &ImageMemoryProviderContract,
-    ) -> std::result::Result<(), ImageMemoryEvidenceVerdict> {
+        contract: &MemoryProviderContract,
+    ) -> std::result::Result<(), MemoryEvidenceVerdict> {
         if !self.key.strategy.is_optimized() {
             return Ok(());
         }
-        if self.conformance != ImageMemoryConformanceState::Verified {
-            return Err(ImageMemoryEvidenceVerdict::Unverified);
+        if self.conformance != MemoryConformanceState::Verified {
+            return Err(MemoryEvidenceVerdict::Unverified);
         }
         if !self.validation_errors().is_empty() {
-            return Err(ImageMemoryEvidenceVerdict::Invalid);
+            return Err(MemoryEvidenceVerdict::Invalid);
         }
-        if self.parity_result != ImageMemoryParityResult::Passed {
-            return Err(ImageMemoryEvidenceVerdict::Unverified);
+        if self.parity_result != MemoryParityResult::Passed {
+            return Err(MemoryEvidenceVerdict::Unverified);
         }
-        for dimension in ImageMemoryEvidenceDimension::ALL {
+        for dimension in MemoryEvidenceDimension::ALL {
             let verdict = self.dimensions.verdict(dimension);
-            if verdict != ImageMemoryEvidenceVerdict::Satisfied {
+            if verdict != MemoryEvidenceVerdict::Satisfied {
                 return Err(verdict);
             }
         }
         let Some(identity) = &contract.calibration else {
-            return Err(ImageMemoryEvidenceVerdict::Unverified);
+            return Err(MemoryEvidenceVerdict::Unverified);
         };
         if self.calibration_abi != identity.abi
             || self.calibration_fingerprint != identity.fingerprint
         {
-            return Err(ImageMemoryEvidenceVerdict::FingerprintMismatch);
+            return Err(MemoryEvidenceVerdict::FingerprintMismatch);
         }
         Ok(())
     }
@@ -1011,19 +1020,19 @@ fn validate_parity_limit(metric: &str, maximum_error: f64, errors: &mut Vec<Stri
 /// Truthful pre-OOM rejection payload. The caller may populate a measured smaller geometry; it must
 /// not invent advice from unknown or unverified evidence.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ImageMemoryRejection {
+pub struct MemoryRejection {
     pub available_bytes: u64,
     pub minimum_verified_peak_bytes: Option<u64>,
-    pub smaller_verified_geometry: Option<ImageMemoryGeometry>,
-    pub exclusion_reason: ImageMemoryEvidenceVerdict,
+    pub smaller_verified_geometry: Option<MemoryGeometry>,
+    pub exclusion_reason: MemoryEvidenceVerdict,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn mlx_backend() -> ImageMemoryBackendRealization {
-        ImageMemoryBackendRealization::MlxMetal {
+    fn mlx_backend() -> MemoryBackendRealization {
+        MemoryBackendRealization::MlxMetal {
             bounded_wired_residency: true,
             lazy_or_mmap_materialization: true,
             explicit_evaluation_and_synchronization: true,
@@ -1031,66 +1040,63 @@ mod tests {
         }
     }
 
-    fn implemented(strategy: ImageMemoryStrategy) -> ImageMemoryStrategyCapability {
-        ImageMemoryStrategyCapability {
+    fn implemented(strategy: MemoryStrategy) -> MemoryStrategyCapability {
+        MemoryStrategyCapability {
             strategy,
-            support: ImageMemoryStrategySupport::Implemented,
-            parameters: ImageMemoryParameterRanges::default(),
+            support: MemoryStrategySupport::Implemented,
+            parameters: MemoryParameterRanges::default(),
         }
     }
 
-    fn adopted_contract() -> ImageMemoryProviderContract {
-        let mut strategies: Vec<_> = ImageMemoryStrategy::ALL
-            .into_iter()
-            .map(implemented)
-            .collect();
+    fn adopted_contract() -> MemoryProviderContract {
+        let mut strategies: Vec<_> = MemoryStrategy::ALL.into_iter().map(implemented).collect();
         strategies[2].parameters.decode_tile_edges = vec![512, 384];
         strategies[2].parameters.decode_overlaps = vec![64];
         strategies[3].parameters.attention_chunk_sizes = vec![256, 128];
         strategies[4].parameters.transformer_window_sizes = vec![2, 1];
-        ImageMemoryProviderContract {
+        MemoryProviderContract {
             provider_id: "test-provider".to_owned(),
             backend: mlx_backend(),
             strategies,
-            lifecycle: ImageMemoryLifecycleCapabilities {
+            lifecycle: MemoryLifecycleCapabilities {
                 phases: vec![
-                    ImageMemoryPhase::Conditioning,
-                    ImageMemoryPhase::Denoise,
-                    ImageMemoryPhase::Decode,
+                    MemoryPhase::Conditioning,
+                    MemoryPhase::Denoise,
+                    MemoryPhase::Decode,
                 ],
                 synchronized_phase_release: true,
                 decode_tiling: true,
                 attention_chunking: true,
                 transformer_window_materialization: true,
             },
-            formula: ImageMemoryFormulaKind::PhaseEnvelope {
+            formula: MemoryFormulaKind::PhaseEnvelope {
                 phases: vec![
-                    ImageMemoryPhase::Conditioning,
-                    ImageMemoryPhase::Denoise,
-                    ImageMemoryPhase::Decode,
+                    MemoryPhase::Conditioning,
+                    MemoryPhase::Denoise,
+                    MemoryPhase::Decode,
                 ],
                 variables: vec![
-                    ImageMemoryFormulaVariable::AssetBytes,
-                    ImageMemoryFormulaVariable::PixelCount,
+                    MemoryFormulaVariable::AssetBytes,
+                    MemoryFormulaVariable::PixelCount,
                 ],
             },
-            calibration: Some(ImageMemoryCalibrationIdentity::new("test-layout-v1")),
-            asset_facts: ImageMemoryAssetFacts::default(),
-            runtime: ImageMemoryRuntimeSemantics::default(),
+            calibration: Some(MemoryCalibrationIdentity::new("test-layout-v1")),
+            asset_facts: MemoryAssetFacts::default(),
+            runtime: MemoryRuntimeSemantics::default(),
         }
     }
 
     #[test]
     fn compatibility_default_never_advertises_an_optimized_rung() {
-        let contract = ImageMemoryProviderContract::compatibility_default("legacy", mlx_backend());
+        let contract = MemoryProviderContract::compatibility_default("legacy", mlx_backend());
         assert!(contract.conformance_errors().is_empty());
         assert!(contract.calibration.is_none());
-        for strategy in ImageMemoryStrategy::ALL {
+        for strategy in MemoryStrategy::ALL {
             let support = &contract.capability(strategy).unwrap().support;
-            if strategy == ImageMemoryStrategy::Resident {
-                assert_eq!(support, &ImageMemoryStrategySupport::Implemented);
+            if strategy == MemoryStrategy::Resident {
+                assert_eq!(support, &MemoryStrategySupport::Implemented);
             } else {
-                assert_eq!(support, &ImageMemoryStrategySupport::Missing);
+                assert_eq!(support, &MemoryStrategySupport::Missing);
             }
         }
     }
@@ -1098,59 +1104,59 @@ mod tests {
     #[test]
     fn optimized_evidence_requires_every_dimension_and_matching_fingerprint() {
         let contract = adopted_contract();
-        let mut evidence = ImageMemoryEvidence {
-            key: ImageMemoryEvidenceKey {
+        let mut evidence = MemoryEvidence {
+            key: MemoryEvidenceKey {
                 resolved_route: "test".to_owned(),
                 backend: "mlx".to_owned(),
-                tier: ImageMemoryNumericTier {
+                tier: MemoryNumericTier {
                     precision: Precision::Bf16,
                     quant: Some(Quant::Q4),
                 },
                 mode: "text_to_image".to_owned(),
                 overlay: None,
-                geometry: ImageMemoryGeometry {
+                geometry: MemoryGeometry {
                     width: 1024,
                     height: 1024,
                     batch: 1,
                     frames: 1,
                 },
-                strategy: ImageMemoryStrategy::BoundedDecode,
-                parameters: ImageMemoryStrategyParameters {
+                strategy: MemoryStrategy::BoundedDecode,
+                parameters: MemoryStrategyParameters {
                     decode_tile_edge: Some(512),
                     decode_overlap: Some(64),
                     ..Default::default()
                 },
             },
-            conformance: ImageMemoryConformanceState::Verified,
-            dimensions: ImageMemoryEvidenceDimensions::VERIFIED,
-            calibration_abi: IMAGE_MEMORY_CALIBRATION_ABI,
+            conformance: MemoryConformanceState::Verified,
+            dimensions: MemoryEvidenceDimensions::VERIFIED,
+            calibration_abi: MEMORY_CALIBRATION_ABI,
             calibration_fingerprint: "test-layout-v1".to_owned(),
             sceneworks_revision: "scene".to_owned(),
             inference_revision: "inference".to_owned(),
             harness_version: "v1".to_owned(),
             predicted_peak_bytes: 10,
             observed_peak_bytes: Some(9),
-            parity: ImageMemoryParityContract::Exact,
-            parity_result: ImageMemoryParityResult::Passed,
+            parity: MemoryParityContract::Exact,
+            parity_result: MemoryParityResult::Passed,
         };
         assert_eq!(evidence.optimized_eligibility(&contract), Ok(()));
 
-        evidence.dimensions.current_environment_verification = ImageMemoryEvidenceVerdict::Stale;
+        evidence.dimensions.current_environment_verification = MemoryEvidenceVerdict::Stale;
         assert_eq!(
             evidence.optimized_eligibility(&contract),
-            Err(ImageMemoryEvidenceVerdict::Stale)
+            Err(MemoryEvidenceVerdict::Stale)
         );
-        evidence.dimensions = ImageMemoryEvidenceDimensions::VERIFIED;
+        evidence.dimensions = MemoryEvidenceDimensions::VERIFIED;
         evidence.calibration_fingerprint = "old-layout".to_owned();
         assert_eq!(
             evidence.optimized_eligibility(&contract),
-            Err(ImageMemoryEvidenceVerdict::FingerprintMismatch)
+            Err(MemoryEvidenceVerdict::FingerprintMismatch)
         );
     }
 
     #[test]
     fn effective_budget_reserves_headroom_from_free_and_reclaimable_memory() {
-        let budget = ImageMemoryBudget {
+        let budget = MemoryBudget {
             total_bytes: 100,
             committed_bytes: 80,
             reclaimable_bytes: 50,
@@ -1161,7 +1167,7 @@ mod tests {
         assert!(!budget.fits(61));
 
         assert_eq!(
-            ImageMemoryBudget {
+            MemoryBudget {
                 reclaimable_bytes: 0,
                 ..budget
             }
@@ -1173,7 +1179,7 @@ mod tests {
     #[test]
     fn effective_budget_saturates_at_zero_and_total_minus_headroom() {
         assert_eq!(
-            ImageMemoryBudget {
+            MemoryBudget {
                 total_bytes: 100,
                 committed_bytes: 110,
                 reclaimable_bytes: 5,
@@ -1183,7 +1189,7 @@ mod tests {
             0
         );
         assert_eq!(
-            ImageMemoryBudget {
+            MemoryBudget {
                 total_bytes: 100,
                 committed_bytes: 0,
                 reclaimable_bytes: u64::MAX,
@@ -1193,7 +1199,7 @@ mod tests {
             90
         );
         assert_eq!(
-            ImageMemoryBudget {
+            MemoryBudget {
                 total_bytes: 100,
                 committed_bytes: 0,
                 reclaimable_bytes: u64::MAX,
@@ -1217,13 +1223,13 @@ mod tests {
     #[test]
     fn selection_preserves_tier_and_rejects_unknown_parameter_values() {
         let contract = adopted_contract();
-        let tier = ImageMemoryNumericTier {
+        let tier = MemoryNumericTier {
             precision: Precision::Bf16,
             quant: Some(Quant::Q4),
         };
-        let mut selection = ImageMemorySelection {
-            strategy: ImageMemoryStrategy::BoundedDecode,
-            parameters: ImageMemoryStrategyParameters {
+        let mut selection = MemorySelection {
+            strategy: MemoryStrategy::BoundedDecode,
+            parameters: MemoryStrategyParameters {
                 decode_tile_edge: Some(512),
                 decode_overlap: Some(64),
                 ..Default::default()
@@ -1243,13 +1249,13 @@ mod tests {
     #[test]
     fn cumulative_parameters_are_required_and_irrelevant_parameters_are_rejected() {
         let contract = adopted_contract();
-        let tier = ImageMemoryNumericTier {
+        let tier = MemoryNumericTier {
             precision: Precision::Bf16,
             quant: None,
         };
-        let mut selection = ImageMemorySelection {
-            strategy: ImageMemoryStrategy::BoundedAttention,
-            parameters: ImageMemoryStrategyParameters {
+        let mut selection = MemorySelection {
+            strategy: MemoryStrategy::BoundedAttention,
+            parameters: MemoryStrategyParameters {
                 decode_tile_edge: Some(512),
                 decode_overlap: Some(64),
                 attention_chunk_size: Some(128),
@@ -1267,8 +1273,8 @@ mod tests {
             .to_string()
             .contains("decode_overlap is required"));
 
-        selection.strategy = ImageMemoryStrategy::Resident;
-        selection.parameters = ImageMemoryStrategyParameters {
+        selection.strategy = MemoryStrategy::Resident;
+        selection.parameters = MemoryStrategyParameters {
             attention_chunk_size: Some(128),
             ..Default::default()
         };
@@ -1282,74 +1288,74 @@ mod tests {
     #[test]
     fn optimized_evidence_requires_valid_passing_parity_and_an_observed_peak() {
         let contract = adopted_contract();
-        let mut evidence = ImageMemoryEvidence {
-            key: ImageMemoryEvidenceKey {
+        let mut evidence = MemoryEvidence {
+            key: MemoryEvidenceKey {
                 resolved_route: "test".to_owned(),
                 backend: "mlx".to_owned(),
-                tier: ImageMemoryNumericTier {
+                tier: MemoryNumericTier {
                     precision: Precision::Bf16,
                     quant: None,
                 },
                 mode: "text_to_image".to_owned(),
                 overlay: None,
-                geometry: ImageMemoryGeometry {
+                geometry: MemoryGeometry {
                     width: 512,
                     height: 512,
                     batch: 1,
                     frames: 1,
                 },
-                strategy: ImageMemoryStrategy::BoundedDecode,
-                parameters: ImageMemoryStrategyParameters {
+                strategy: MemoryStrategy::BoundedDecode,
+                parameters: MemoryStrategyParameters {
                     decode_tile_edge: Some(512),
                     decode_overlap: Some(64),
                     ..Default::default()
                 },
             },
-            conformance: ImageMemoryConformanceState::Verified,
-            dimensions: ImageMemoryEvidenceDimensions::VERIFIED,
-            calibration_abi: IMAGE_MEMORY_CALIBRATION_ABI,
+            conformance: MemoryConformanceState::Verified,
+            dimensions: MemoryEvidenceDimensions::VERIFIED,
+            calibration_abi: MEMORY_CALIBRATION_ABI,
             calibration_fingerprint: "test-layout-v1".to_owned(),
             sceneworks_revision: "scene".to_owned(),
             inference_revision: "inference".to_owned(),
             harness_version: "v1".to_owned(),
             predicted_peak_bytes: 10,
             observed_peak_bytes: Some(9),
-            parity: ImageMemoryParityContract::Tolerance {
+            parity: MemoryParityContract::Tolerance {
                 metric: "max_abs".to_owned(),
                 maximum_error: 0.001,
             },
-            parity_result: ImageMemoryParityResult::Passed,
+            parity_result: MemoryParityResult::Passed,
         };
         assert_eq!(evidence.optimized_eligibility(&contract), Ok(()));
 
-        evidence.parity = ImageMemoryParityContract::Tolerance {
+        evidence.parity = MemoryParityContract::Tolerance {
             metric: String::new(),
             maximum_error: f64::NAN,
         };
         assert_eq!(
             evidence.optimized_eligibility(&contract),
-            Err(ImageMemoryEvidenceVerdict::Invalid)
+            Err(MemoryEvidenceVerdict::Invalid)
         );
-        evidence.parity = ImageMemoryParityContract::Golden {
+        evidence.parity = MemoryParityContract::Golden {
             fixture: String::new(),
             metric: "max_abs".to_owned(),
             maximum_error: -1.0,
         };
         assert_eq!(
             evidence.optimized_eligibility(&contract),
-            Err(ImageMemoryEvidenceVerdict::Invalid)
+            Err(MemoryEvidenceVerdict::Invalid)
         );
-        evidence.parity = ImageMemoryParityContract::Exact;
+        evidence.parity = MemoryParityContract::Exact;
         evidence.observed_peak_bytes = None;
         assert_eq!(
             evidence.optimized_eligibility(&contract),
-            Err(ImageMemoryEvidenceVerdict::Invalid)
+            Err(MemoryEvidenceVerdict::Invalid)
         );
         evidence.observed_peak_bytes = Some(9);
-        evidence.parity_result = ImageMemoryParityResult::NotRun;
+        evidence.parity_result = MemoryParityResult::NotRun;
         assert_eq!(
             evidence.optimized_eligibility(&contract),
-            Err(ImageMemoryEvidenceVerdict::Unverified)
+            Err(MemoryEvidenceVerdict::Unverified)
         );
     }
     /// SC-15794: the component scope's accessors and its DiT-only default.
@@ -1361,10 +1367,10 @@ mod tests {
     fn the_transformer_component_defaults_to_dit_and_reports_its_membership() {
         assert_eq!(TransformerComponent::default(), TransformerComponent::Dit);
         assert_eq!(
-            ImageMemoryStrategyParameters::default().window_component(),
+            MemoryStrategyParameters::default().window_component(),
             TransformerComponent::Dit
         );
-        let explicit = ImageMemoryStrategyParameters {
+        let explicit = MemoryStrategyParameters {
             transformer_window_component: Some(TransformerComponent::TextEncoder),
             ..Default::default()
         };
@@ -1391,15 +1397,15 @@ mod tests {
             let rung4 = c
                 .strategies
                 .iter_mut()
-                .find(|s| s.strategy == ImageMemoryStrategy::BoundedTransformerResidency)
+                .find(|s| s.strategy == MemoryStrategy::BoundedTransformerResidency)
                 .expect("rung 4 capability");
             rung4.parameters.transformer_window_sizes = vec![1];
             rung4.parameters.transformer_window_components = components;
             c
         };
-        let select = |component| ImageMemorySelection {
-            strategy: ImageMemoryStrategy::BoundedTransformerResidency,
-            parameters: ImageMemoryStrategyParameters {
+        let select = |component| MemorySelection {
+            strategy: MemoryStrategy::BoundedTransformerResidency,
+            parameters: MemoryStrategyParameters {
                 // Rung 4 is cumulative, so the lower rungs' parameters are required too; these are
                 // `adopted_contract`'s own declared candidates.
                 decode_tile_edge: Some(512),
@@ -1408,7 +1414,7 @@ mod tests {
                 transformer_window_size: Some(1),
                 transformer_window_component: Some(component),
             },
-            tier: ImageMemoryNumericTier {
+            tier: MemoryNumericTier {
                 precision: Precision::Bf16,
                 quant: None,
             },
@@ -1438,17 +1444,17 @@ mod tests {
     /// A provider may only own component candidates on the rung that owns the window they scope.
     #[test]
     fn only_rung_four_may_own_component_candidates() {
-        let with_components = |strategy| ImageMemoryStrategyCapability {
+        let with_components = |strategy| MemoryStrategyCapability {
             strategy,
-            support: ImageMemoryStrategySupport::Implemented,
-            parameters: ImageMemoryParameterRanges {
+            support: MemoryStrategySupport::Implemented,
+            parameters: MemoryParameterRanges {
                 transformer_window_components: vec![TransformerComponent::Both],
                 ..Default::default()
             },
         };
         let mut errors = Vec::new();
         validate_owned_parameter_domain(
-            &with_components(ImageMemoryStrategy::BoundedDecode),
+            &with_components(MemoryStrategy::BoundedDecode),
             &mut errors,
         );
         assert!(
@@ -1459,10 +1465,10 @@ mod tests {
         // Duplicates are a declaration bug the selector would silently tolerate.
         let mut errors = Vec::new();
         validate_owned_parameter_domain(
-            &ImageMemoryStrategyCapability {
-                strategy: ImageMemoryStrategy::BoundedTransformerResidency,
-                support: ImageMemoryStrategySupport::Implemented,
-                parameters: ImageMemoryParameterRanges {
+            &MemoryStrategyCapability {
+                strategy: MemoryStrategy::BoundedTransformerResidency,
+                support: MemoryStrategySupport::Implemented,
+                parameters: MemoryParameterRanges {
                     transformer_window_sizes: vec![1],
                     transformer_window_components: vec![
                         TransformerComponent::Dit,
@@ -1482,10 +1488,10 @@ mod tests {
         // provider valid rather than retroactively incomplete.
         let mut errors = Vec::new();
         validate_owned_parameter_domain(
-            &ImageMemoryStrategyCapability {
-                strategy: ImageMemoryStrategy::BoundedTransformerResidency,
-                support: ImageMemoryStrategySupport::Implemented,
-                parameters: ImageMemoryParameterRanges {
+            &MemoryStrategyCapability {
+                strategy: MemoryStrategy::BoundedTransformerResidency,
+                support: MemoryStrategySupport::Implemented,
+                parameters: MemoryParameterRanges {
                     transformer_window_sizes: vec![1],
                     ..Default::default()
                 },
