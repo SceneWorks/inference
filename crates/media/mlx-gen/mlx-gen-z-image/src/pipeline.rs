@@ -8,6 +8,7 @@
 //! small Mac.
 
 use mlx_gen::array::host_i32;
+use mlx_gen::attention::{AttentionBudget, AttentionPlan};
 // The img2img leaves (start-step / init-image preprocess / noise-interp blend) are shared in core;
 // re-export so the crate's public surface (`mlx_gen_z_image::…`) and internal callers are unchanged.
 pub use mlx_gen::img2img::{add_noise_by_interpolation, init_time_step, preprocess_init_image};
@@ -77,6 +78,8 @@ pub fn slice_valid(encoder_out: &Array, num_valid: i32) -> Result<Array> {
 ///
 /// Mirrors the fork's loop: `timestep = 1 - sigma[t]` (the transformer applies its own
 /// `t_scale`), `latents += (sigma[t+1] - sigma[t]) * velocity`.
+/// `block_window` is ladder rung 4 (SC-15754): `Some(n)` streams the unified stack `n` blocks at a
+/// time instead of running the resident one; `None` is the historical forward, untouched.
 #[allow(clippy::too_many_arguments)]
 pub fn denoise_with_progress(
     transformer: &ZImageTransformer,
@@ -86,6 +89,8 @@ pub fn denoise_with_progress(
     latents: Array,
     cap_feats: &Array,
     start_step: usize,
+    budget: AttentionBudget,
+    block_window: Option<usize>,
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
@@ -99,7 +104,14 @@ pub fn denoise_with_progress(
     // within the N1 tolerance, and the curated menu becomes selectable. Cancellation, the per-step
     // `eval` (sc-5522 / sc-5399), and progress live in `run_flow_sampler`. img2img slices the schedule
     // from `start_step` so the blended init latents are denoised from the matching sigma.
-    let predict = |x: &Array, timestep: f32| transformer.forward_with(&prep, x, timestep);
+    // The cancel flag joins the budget here so a bounded call can stop between chunks (SC-15615);
+    // the unbounded fast path has no boundary, so this is inert for every unselected request.
+    let plan = AttentionPlan::budgeted(budget).with_cancel(cancel);
+    // Rung 4 (SC-15754): the window is built once for the whole loop (it is loop-constant), and the
+    // per-window cancellation check inside `run_windowed` joins the per-step one below.
+    let window = transformer.block_window(block_window, cancel)?;
+    let predict =
+        |x: &Array, timestep: f32| transformer.forward_with_rungs(&prep, x, timestep, plan, window);
     let start = start_step.min(scheduler.sigmas.len().saturating_sub(1));
     run_flow_sampler(
         sampler_name,
@@ -130,6 +142,8 @@ pub fn denoise(
         latents,
         cap_feats,
         0,
+        AttentionBudget::UNBOUNDED,
+        None,
         &CancelFlag::default(),
         &mut |_| {},
     )
@@ -166,6 +180,8 @@ pub fn denoise_cfg_with_progress(
     neg_cap_feats: Option<&Array>,
     guidance: f32,
     start_step: usize,
+    budget: AttentionBudget,
+    block_window: Option<usize>,
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
@@ -179,13 +195,17 @@ pub fn denoise_cfg_with_progress(
         _ => None,
     };
     let g = Array::from_slice(&[guidance], &[1]);
+    let plan = AttentionPlan::budgeted(budget).with_cancel(cancel);
+    // Rung 4 covers BOTH CFG forwards — the uncond pass runs the same 30 blocks and would otherwise
+    // re-materialize the whole stack resident, leaving the bound half-applied.
+    let window = transformer.block_window(block_window, cancel)?;
     // Same FLOW / `1 - sigma` convention + unified curated-sampler routing as the base loop; the only
     // delta is the per-step CFG combine of two velocities.
     let predict = |x: &Array, timestep: f32| -> Result<Array> {
-        let v_cond = transformer.forward_with(&prep, x, timestep)?;
+        let v_cond = transformer.forward_with_rungs(&prep, x, timestep, plan, window)?;
         match &neg_prep {
             Some(np) => {
-                let v_uncond = transformer.forward_with(np, x, timestep)?;
+                let v_uncond = transformer.forward_with_rungs(np, x, timestep, plan, window)?;
                 // v = v_uncond + guidance·(v_cond − v_uncond).
                 let delta = v_cond.subtract(&v_uncond)?;
                 Ok(v_uncond.add(&delta.multiply(&g)?)?)
@@ -222,6 +242,8 @@ pub fn denoise_control_with_progress(
     control_context: &Array,
     control_context_scale: f32,
     start_step: usize,
+    budget: AttentionBudget,
+    block_window: Option<usize>,
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
@@ -232,8 +254,18 @@ pub fn denoise_control_with_progress(
         transformer.prepare_control((sh[0], sh[1], sh[2], sh[3]), cap_feats, control_context)?;
     // Same unified-framework routing as the base loop (epic 7114 P3), with the control branch in the
     // `predict` closure (the fork's `ZImageControl._control_predict`).
+    let plan = AttentionPlan::budgeted(budget).with_cancel(cancel);
+    let window = transformer.control_block_window(block_window, cancel)?;
     let predict = |x: &Array, timestep: f32| {
-        transformer.forward_with_control(&prep, x, timestep, control_context_scale, None)
+        transformer.forward_with_control_rungs(
+            &prep,
+            x,
+            timestep,
+            control_context_scale,
+            None,
+            plan,
+            window,
+        )
     };
     let start = start_step.min(scheduler.sigmas.len().saturating_sub(1));
     run_flow_sampler(
@@ -277,6 +309,8 @@ pub fn denoise_control_cfg_with_progress(
     control_context: &Array,
     control_context_scale: f32,
     start_step: usize,
+    budget: AttentionBudget,
+    block_window: Option<usize>,
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
@@ -294,20 +328,31 @@ pub fn denoise_control_cfg_with_progress(
         _ => None,
     };
     let g = Array::from_slice(&[guidance], &[1]);
+    let plan = AttentionPlan::budgeted(budget).with_cancel(cancel);
+    let window = transformer.control_block_window(block_window, cancel)?;
     // Same FLOW / `1 - sigma` convention + unified curated-sampler routing as the base CFG loop; the
     // delta vs `denoise_cfg_with_progress` is that each forward runs the control branch (constant
     // control context + scale threaded through every step, the fork's `ZImageControl._control_predict`).
     let predict = |x: &Array, timestep: f32| -> Result<Array> {
-        let v_cond =
-            transformer.forward_with_control(&prep, x, timestep, control_context_scale, None)?;
+        let v_cond = transformer.forward_with_control_rungs(
+            &prep,
+            x,
+            timestep,
+            control_context_scale,
+            None,
+            plan,
+            window,
+        )?;
         match &neg_prep {
             Some(np) => {
-                let v_uncond = transformer.forward_with_control(
+                let v_uncond = transformer.forward_with_control_rungs(
                     np,
                     x,
                     timestep,
                     control_context_scale,
                     None,
+                    plan,
+                    window,
                 )?;
                 // v = v_uncond + guidance·(v_cond − v_uncond).
                 let delta = v_cond.subtract(&v_uncond)?;
@@ -487,7 +532,114 @@ pub(crate) fn resolve_reference<'a>(
 /// parity sweet spot for this GroupNorm VAE — visually seam-free at 1024²/1280², where smaller tiles
 /// would drift the per-tile norm statistics.
 pub(crate) fn decode_tiling(req: &GenerationRequest, is_sequential: bool) -> Option<TilingConfig> {
-    (is_sequential || req.width.max(req.height) > 2048).then(|| TilingConfig::spatial_only(512, 64))
+    // SC-15615: the shared selector's explicit bounded-decode signal (`GenerationMemory::tile_vae_decode`)
+    // joins the two historical triggers. The ladder is cumulative — a selector that picks rung 3
+    // (bounded attention) also sets rung 2 — so without this a contract-driven rung-3 selection on a
+    // `Resident` load would silently decode untiled.
+    //
+    // SC-15510: the tile geometry is no longer hardcoded. A selection carries the exact edge/overlap
+    // it was calibrated at, from the ladder the contract publishes; the two historical triggers, and
+    // a selection that names no geometry, keep the 512/64 default this VAE was tuned at (sc-13571).
+    // Publishing a one-element candidate list was what blocked SC-15508's "a single-point pass cannot
+    // mark untested production parameters Verified".
+    let requested = req.memory.is_some_and(|m| m.tile_vae_decode);
+    (is_sequential || requested || req.width.max(req.height) > 2048).then(|| {
+        let (edge, overlap) = decode_tile_geometry(req);
+        TilingConfig::spatial_only(edge as i32, overlap as i32)
+    })
+}
+
+/// The (edge, overlap) a request decodes at: the selection's values when it names them, else the
+/// provider default. Pure, so the ladder's plumbing is unit-testable without a VAE.
+pub(crate) fn decode_tile_geometry(req: &GenerationRequest) -> (u32, u32) {
+    let memory = req.memory;
+    (
+        memory
+            .and_then(|m| m.decode_tile_edge)
+            .unwrap_or(crate::image_memory::DECODE_TILE_EDGE),
+        memory
+            .and_then(|m| m.decode_overlap)
+            .unwrap_or(crate::image_memory::DECODE_OVERLAP),
+    )
+}
+
+/// The transformer-residency window for one request (SC-15754, ladder rung 4).
+///
+/// [`GenerationMemory::stream_transformer_blocks`] is the shared selector's rung-4 signal and
+/// `transformer_window_size` its parameter; a selection that sets the flag without a size falls back
+/// to the provider's default window. `None` — every request that did not select rung 4 — is the
+/// historical resident stack, untouched.
+pub(crate) fn block_window_size(req: &GenerationRequest) -> Option<usize> {
+    let memory = req.memory?;
+    memory.stream_transformer_blocks.then(|| {
+        memory
+            .transformer_window_size
+            .unwrap_or(crate::image_memory::TRANSFORMER_WINDOW_SIZE) as usize
+    })
+}
+
+/// [`block_window_size`] plus the residency-policy precondition, shared by all four generators.
+///
+/// **Why this rejects instead of degrading.** Streaming bounds transformer residency only if the
+/// resident `layers` are *not* also materialized. Under `Sequential` they are not — the heavy bundle
+/// is rebuilt per generate, its blocks are unevaluated lazy handles (SC-15744 measured 1073 handles at
+/// 0.0 MiB), and a windowed forward never touches them, so they stay at ~0 bytes. Under `Resident` the
+/// same generator serves many requests, so after the first ordinary render the blocks ARE materialized
+/// and a window would be *added on top of* them: strictly more memory and strictly slower.
+///
+/// Rung 1 resolves the same load-time-vs-request-time seam by silently yielding resident behaviour.
+/// Rung 4 must not: a silent degradation here writes a rung-4 row into the calibration evidence for a
+/// run that saved nothing, which is the false green SC-15750's own mutation check exists to prevent —
+/// one layer up, and invisible to it.
+pub(crate) fn resolve_block_window(
+    req: &GenerationRequest,
+    is_sequential: bool,
+    id: &str,
+) -> Result<Option<usize>> {
+    let window = block_window_size(req);
+    if window.is_some() && !is_sequential {
+        return Err(Error::Unsupported(format!(
+            "{id}: bounded transformer residency needs a Sequential (staged) load — on a Resident \
+             generator the trunk blocks are already materialized, so a window would add memory \
+             rather than bound it. Load with OffloadPolicy::Sequential."
+        )));
+    }
+    Ok(window)
+}
+
+/// Request-local, calibration-only fault injection at a physical phase boundary (SC-15449's
+/// [`GenerationMemory::calibration_error_phase`](mlx_gen::gen_core::GenerationMemory), the MLX twin of
+/// `candle_gen_krea`'s `maybe_inject_calibration_error`).
+///
+/// This is what lets the cross-backend conformance harness verify the story's **cleanup on error**
+/// requirement the same way it verifies cancellation: fail deterministically at a named boundary, then
+/// assert the next request is unaffected. Production selectors leave the field `None` (the default),
+/// so every ordinary request is untouched — the check is a `None` comparison.
+pub(crate) fn calibration_fault(
+    req: &GenerationRequest,
+    phase: mlx_gen::gen_core::ImageMemoryPhase,
+    id: &str,
+) -> Result<()> {
+    match req.memory {
+        Some(memory) if memory.calibration_error_phase == Some(phase) => Err(Error::Msg(format!(
+            "{id}: injected image-memory calibration error at {phase:?}"
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// The attention rung for one request (SC-15615, ladder rung 3).
+///
+/// [`GenerationMemory::chunk_attention`] is the shared selector's rung-3 signal; the exact score
+/// budget is the single provider-declared [`mlx_gen::attention::CONSTRAINED_ATTN_SCORES_BUDGET`],
+/// which is also the value published in the provider contract's `attention_chunk_sizes` and
+/// re-validated by the request scope's `configure_attention`. Anything else — including a warm
+/// request that carried a rung last time — is the unbounded, byte-identical forward.
+pub(crate) fn attention_budget(req: &GenerationRequest) -> AttentionBudget {
+    match req.memory {
+        Some(memory) if memory.chunk_attention => AttentionBudget::CONSTRAINED,
+        _ => AttentionBudget::UNBOUNDED,
+    }
 }
 
 /// Phase 1 of the staged render (sc-13571): the per-image denoise count loop → `Vec` of **evaluated**
@@ -587,6 +739,9 @@ pub(crate) fn render_sample(
         noise,
         cap,
         0,
+        // Training previews never select a memory rung; keep the unbounded (byte-identical) forward.
+        AttentionBudget::UNBOUNDED,
+        None,
         cancel,
         &mut |_| {},
     )?;
@@ -612,6 +767,150 @@ mod tests {
             height: h,
             pixels: vec![0u8; (w * h * 3) as usize],
         }
+    }
+
+    fn req(
+        w: u32,
+        h: u32,
+        memory: Option<mlx_gen::gen_core::GenerationMemory>,
+    ) -> GenerationRequest {
+        GenerationRequest {
+            prompt: "a fox".into(),
+            width: w,
+            height: h,
+            memory,
+            ..Default::default()
+        }
+    }
+
+    /// SC-15615: the shared selector's explicit bounded-decode signal is a THIRD trigger alongside the
+    /// two historical ones, so a contract-driven rung-2/3 selection tiles even on a `Resident` load.
+    #[test]
+    fn decode_tiling_honors_the_selector_signal_as_well_as_the_legacy_triggers() {
+        use mlx_gen::gen_core::GenerationMemory;
+
+        // Historical triggers, unchanged: Sequential, or an output edge above 2048.
+        assert!(decode_tiling(&req(1024, 1024, None), true).is_some());
+        assert!(decode_tiling(&req(2560, 1024, None), false).is_some());
+        // The default resident 1024² render still decodes EXACTLY (untiled) — no behaviour change.
+        assert!(decode_tiling(&req(1024, 1024, None), false).is_none());
+        // A staged-only selection does not ask for tiling, so it must not get it.
+        assert!(
+            decode_tiling(&req(1024, 1024, Some(GenerationMemory::default())), false).is_none()
+        );
+        // The rung-2 signal does, on a Resident load.
+        let tiled = decode_tiling(
+            &req(
+                1024,
+                1024,
+                Some(GenerationMemory {
+                    tile_vae_decode: true,
+                    ..Default::default()
+                }),
+            ),
+            false,
+        )
+        .expect("the bounded-decode signal must engage tiling");
+        // And it is the same 512/64 spatial-only policy the contract advertises — not a new one.
+        let spatial = tiled.spatial.expect("spatial tiling");
+        assert_eq!(
+            (spatial.tile_px, spatial.overlap_px),
+            (
+                crate::image_memory::DECODE_TILE_EDGE as i32,
+                crate::image_memory::DECODE_OVERLAP as i32
+            ),
+            "the executed tile geometry must match the contract's advertised candidates"
+        );
+        assert!(tiled.temporal.is_none(), "z-image decode is spatial-only");
+    }
+
+    /// Calibration fault injection is inert unless a request explicitly names a phase, and fires at
+    /// exactly the named one. This is the hook the conformance harness uses to verify the story's
+    /// **cleanup on error** requirement.
+    #[test]
+    fn calibration_faults_fire_only_at_the_named_phase() {
+        use mlx_gen::gen_core::{GenerationMemory, ImageMemoryPhase};
+
+        const PHASES: [ImageMemoryPhase; 3] = [
+            ImageMemoryPhase::Conditioning,
+            ImageMemoryPhase::Denoise,
+            ImageMemoryPhase::Decode,
+        ];
+
+        // No memory block, and a memory block with no named phase: every boundary passes.
+        for memory in [None, Some(GenerationMemory::default())] {
+            let r = req(1024, 1024, memory);
+            for phase in PHASES {
+                calibration_fault(&r, phase, "z_image_turbo").unwrap();
+            }
+        }
+
+        // A named phase fails at that phase and only that phase.
+        for named in PHASES {
+            let r = req(
+                1024,
+                1024,
+                Some(GenerationMemory {
+                    calibration_error_phase: Some(named),
+                    ..Default::default()
+                }),
+            );
+            for phase in PHASES {
+                let result = calibration_fault(&r, phase, "z_image_turbo");
+                if phase == named {
+                    let err = result.unwrap_err().to_string();
+                    assert!(
+                        err.contains("injected image-memory calibration error"),
+                        "{err}"
+                    );
+                    assert!(err.contains(&format!("{named:?}")), "{err}");
+                    assert!(err.contains("z_image_turbo"), "{err}");
+                } else {
+                    result.unwrap_or_else(|e| {
+                        panic!("fault named at {named:?} must not fire at {phase:?}: {e}")
+                    });
+                }
+            }
+        }
+    }
+
+    /// The rung-3 request knob maps onto exactly one budget, and nothing else engages it.
+    #[test]
+    fn attention_budget_engages_only_on_the_rung_three_signal() {
+        use mlx_gen::attention::AttentionBudget;
+        use mlx_gen::gen_core::GenerationMemory;
+
+        assert_eq!(
+            attention_budget(&req(1024, 1024, None)),
+            AttentionBudget::UNBOUNDED
+        );
+        assert_eq!(
+            attention_budget(&req(1024, 1024, Some(GenerationMemory::default()))),
+            AttentionBudget::UNBOUNDED
+        );
+        assert_eq!(
+            attention_budget(&req(
+                1024,
+                1024,
+                Some(GenerationMemory {
+                    tile_vae_decode: true,
+                    ..Default::default()
+                })
+            )),
+            AttentionBudget::UNBOUNDED
+        );
+        assert_eq!(
+            attention_budget(&req(
+                1024,
+                1024,
+                Some(GenerationMemory {
+                    tile_vae_decode: true,
+                    chunk_attention: true,
+                    ..Default::default()
+                })
+            )),
+            AttentionBudget::CONSTRAINED
+        );
     }
 
     #[test]

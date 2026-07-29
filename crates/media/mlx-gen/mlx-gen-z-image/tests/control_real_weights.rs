@@ -36,7 +36,9 @@ const Q8_GOLDEN: &str = concat!(
 
 /// Locate the base Z-Image-Turbo snapshot dir (env override, else the HF cache).
 mod common;
+
 use common::snapshot;
+use mlx_gen::attention::AttentionBudget;
 
 /// Locate the Fun-Controlnet-Union checkpoint (env override `CONTROL_WEIGHTS`, else the golden's
 /// recorded path, else the HF cache). Returned as a single-file `WeightsSource`.
@@ -213,6 +215,8 @@ fn control_denoise_loop_matches_golden() {
         &cc,
         scale,
         0,
+        AttentionBudget::UNBOUNDED,
+        None,
         &Default::default(),
         &mut |_| {},
     )
@@ -274,6 +278,8 @@ fn control_dtype_compare() {
             &cc,
             scale,
             0,
+            AttentionBudget::UNBOUNDED,
+            None,
             &Default::default(),
             &mut |_| {},
         )
@@ -396,6 +402,8 @@ fn control_q8_transformer_matches_golden() {
         &cc,
         scale,
         0,
+        AttentionBudget::UNBOUNDED,
+        None,
         &Default::default(),
         &mut |_| {},
     )
@@ -610,6 +618,8 @@ fn control_q8_determinism() {
             &cc,
             scale,
             0,
+            AttentionBudget::UNBOUNDED,
+            None,
             &Default::default(),
             &mut |_| {},
         )

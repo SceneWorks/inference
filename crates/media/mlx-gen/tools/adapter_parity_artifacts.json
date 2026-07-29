@@ -1,0 +1,376 @@
+{
+  "schema": 1,
+  "story": "sc-15505",
+  "implementation_base": "39a11d363663924869ea51c7cc4a8a3a6d68a2e1",
+  "reference": {
+    "repository": "https://github.com/michaeltrefry/mflux.git",
+    "revision": "81106c833435d1a1f62ca04a8c01c1d380d39272",
+    "runtime": {
+      "python": "3.12.11",
+      "mlx": "0.32.0.dev20260718+7a1d4f5",
+      "mlx-metal": "0.31.2",
+      "diffusers": "0.37.1",
+      "transformers": "5.10.1",
+      "torch": "2.12.0",
+      "peft": "0.19.1"
+    }
+  },
+  "validation_models": {
+    "flux_dev": {
+      "repository": "black-forest-labs/FLUX.1-dev",
+      "revision": "3de623fc3c33e44ffbe2bad470d0f45bccf2eb21",
+      "reference": "main",
+      "subdirectory": ".",
+      "snapshot_path": "/Users/michael/.cache/huggingface/hub/models--black-forest-labs--FLUX.1-dev/snapshots/3de623fc3c33e44ffbe2bad470d0f45bccf2eb21",
+      "inventory_sha256": "413a16687377f7cf9322bf9d9b8bef0f73a461809bc89d8e99dc5bcd1eaecdc2",
+      "license": "FLUX.1-dev Non-Commercial License"
+    },
+    "z_image_turbo": {
+      "repository": "SceneWorks/z-image-turbo-mlx",
+      "revision": "bb2bc9893b3c49ae96c813350775f791a2e8bc80",
+      "reference": "main",
+      "subdirectory": "bf16",
+      "snapshot_path": "/Users/michael/.cache/huggingface/hub/models--SceneWorks--z-image-turbo-mlx/snapshots/bb2bc9893b3c49ae96c813350775f791a2e8bc80/bf16",
+      "inventory_sha256": "21c5a5a566300d42dcd2295065dc74cef3862880638e027e74f7921bfa3e0f3e",
+      "license": "Apache-2.0"
+    },
+    "qwen_image": {
+      "repository": "SceneWorks/qwen-image-mlx",
+      "revision": "8080a4171f1c8b7fca6c30491eafbe6ffab754bf",
+      "reference": "main",
+      "subdirectory": "bf16",
+      "snapshot_path": "/Users/michael/.cache/huggingface/hub/models--SceneWorks--qwen-image-mlx/snapshots/8080a4171f1c8b7fca6c30491eafbe6ffab754bf/bf16",
+      "inventory_sha256": "094c6a3b4ef5c509aaaa821f7a5aec360e839298f284d60b71166715f5ba2577",
+      "license": "Apache-2.0"
+    }
+  },
+  "results": {
+    "hyper_flux_scale_zero": {
+      "byte_differences": 0,
+      "rgb_samples": 786432
+    },
+    "fork_parity": {
+      "z_image_lora": {
+        "samples_gt8": 17919,
+        "base_floor": 15324,
+        "cap": 34580,
+        "residual_samples_gt8": 15692,
+        "zero_residual_samples_gt8": 26587,
+        "residual_cap": 21139,
+        "rgb_samples": 786432
+      },
+      "z_image_lokr": {
+        "samples_gt8": 13582,
+        "base_floor": 15324,
+        "cap": 34580,
+        "residual_samples_gt8": 15476,
+        "zero_residual_samples_gt8": 40120,
+        "residual_cap": 27798,
+        "rgb_samples": 786432
+      },
+      "qwen_lora": {
+        "samples_gt8": 40696,
+        "base_floor": 47293,
+        "cap": 98518,
+        "rgb_samples": 786432,
+        "effect_gate": {
+          "status": "locked",
+          "minimum_rule": "measured_effect_samples_gt8//2",
+          "expected_applied": 24,
+          "expected_unmatched": 0,
+          "expected_scale_zero_byte_differences": 0,
+          "effect_samples_gt8": 44799,
+          "minimum_samples_gt8": 22399
+        }
+      },
+      "qwen_lokr": {
+        "samples_gt8": 49765,
+        "base_floor": 47293,
+        "cap": 98518,
+        "rgb_samples": 786432,
+        "effect_gate": {
+          "status": "locked",
+          "minimum_rule": "measured_effect_samples_gt8//2",
+          "expected_applied": 21,
+          "expected_unmatched": 0,
+          "expected_scale_zero_byte_differences": 0,
+          "effect_samples_gt8": 39409,
+          "minimum_samples_gt8": 19704
+        }
+      }
+    },
+    "evidence": {
+      "status": "verified",
+      "transcript": {
+        "local_path": "${TOOLS}/golden/sc-15505-real-weight-transcript.json",
+        "bytes": 22672,
+        "sha256": "d5315a69ddbb53a0b8fd687fb80157421b08f47399a86e45372231f4420f31ce"
+      },
+      "receipt": {
+        "local_path": "${TOOLS}/adapter_parity_receipt.json",
+        "bytes": 23087,
+        "sha256": "a97cab1e8d6a60ec6f2583ddd7c93590b7e01f65d394c35f97abe2bf16f544a2"
+      },
+      "artifact_sha256": {
+        "hyper_flux_lora": "e0ab0fdf569cd01a382f19bd87681f628879dea7ad51fe5a3799b6c18c7b2d03",
+        "flux_hyper_golden": "051b13b638f4e4b94b7f7ad6fa0cd84f091f38883df80bab141e11225ab0de22",
+        "z_image_base_golden": "b850c9e4e3023575257b7a60d0de58b5eee62aac26d0f712ac3049c681f51537",
+        "z_image_lora_adapter": "ee8008a36fd5b4a7962e2b612f59a303c57cc1bb3a581058b97b7ee9ed37cb52",
+        "z_image_lora_golden": "8fedc026546cbfb75f0e9f29e76beac848e4f197a8480c9771bfce5f884426d0",
+        "z_image_lokr_adapter": "7d3342f81bdde685204f59bda1c43452b56d936671446a7e84e7925718c08e84",
+        "z_image_lokr_golden": "a5f17d16fca0e49fb9004c5e5ab5c4d824eb9146b06caec942f5fd0867f407e2",
+        "qwen_base_golden": "5f810691d0b2768cc2d3e42a5e14885c3c2832234dc3f15b89453e28d07cc7b4",
+        "qwen_lora_adapter": "af9ea08c4f98f273d7dcaeca1b75eb730a49da0efe345b3eaf80916ba87553f7",
+        "qwen_lora_golden": "8d70dbf738da177e015cfe92dc07ab47ad20b31ac809ec5c30bba850288de6f2",
+        "qwen_lokr_adapter": "1e13570724e75f926e9fb079f2ec336cc87f3932eada8415ab71b83a43e179cf",
+        "qwen_lokr_golden": "c652442623327fa63892ad5ad21ee1208707f47ebd83550d5b38555d498f2c9c"
+      }
+    }
+  },
+  "scripts": {
+    "_adapter_parity_provenance.py": "32fcff87d1140a4d53d03a66ab8b8678e1029d03e9a8886f50b242dd3bd23bed",
+    "dump_hyper_flux_golden.py": "d815cab334496223f53df450a3415c8a8a3088136c3ec04e362b392ac7dbc38c",
+    "dump_qwen_adapter_golden.py": "01dcc25673e4c491d617ccd07b7ae9b13f634de047fed4d85753b97b0704f5ba",
+    "dump_qwen_image_golden.py": "a08b4b8f1411b4401ccd461113928136741f35d14a6098ad8ac8d415fac7604f",
+    "dump_z_image_adapter_golden.py": "b8eae6ae0759129f9529e0d9f6d0da0cbfcc169fc41e4f7035dfa9a6aa0d6dc0",
+    "dump_z_image_golden.py": "8dce2bc4696abb54d4e6d6f81ce974b5b66df7971f7c19d2dba8fbd683d60060",
+    "record_adapter_parity_transcript.py": "1dee8c5f465766e825708feafee16c45c6530b429db7d90cba6a0c8c25ea2746",
+    "verify_adapter_parity_artifacts.py": "262048c9158b63c97b3bb4591066372e573b4bd014222a4a6eee8632968baf81"
+  },
+  "artifacts": {
+    "hyper_flux_lora": {
+      "committed": false,
+      "bytes": 1388026440,
+      "sha256": "e0ab0fdf569cd01a382f19bd87681f628879dea7ad51fe5a3799b6c18c7b2d03",
+      "license": "FLUX.1-dev Non-Commercial License",
+      "local_path": "/Users/michael/.cache/huggingface/hub/models--ByteDance--Hyper-SD/snapshots/bc08d970a87c74c71209491d64e3525845698863/Hyper-FLUX.1-dev-8steps-lora.safetensors",
+      "source": {
+        "kind": "huggingface",
+        "repository": "ByteDance/Hyper-SD",
+        "revision": "bc08d970a87c74c71209491d64e3525845698863",
+        "reference": "main",
+        "file": "Hyper-FLUX.1-dev-8steps-lora.safetensors"
+      }
+    },
+    "flux_hyper_golden": {
+      "committed": false,
+      "bytes": 10753068,
+      "sha256": "051b13b638f4e4b94b7f7ad6fa0cd84f091f38883df80bab141e11225ab0de22",
+      "license": "FLUX.1-dev output; binary retained locally under the source model license",
+      "local_path": "${TOOLS}/golden/flux1_dev_hyper_golden.safetensors",
+      "source": {
+        "kind": "generated",
+        "repository": "https://github.com/michaeltrefry/mflux.git",
+        "revision": "81106c833435d1a1f62ca04a8c01c1d380d39272",
+        "script": "dump_hyper_flux_golden.py",
+        "command": "FLUX_DEV=$HF_MODELS_ROOT/models--black-forest-labs--FLUX.1-dev/snapshots/3de623fc3c33e44ffbe2bad470d0f45bccf2eb21 HYPER_LORA=$HYPER_LORA $REF_PY $TOOLS/dump_hyper_flux_golden.py",
+        "model_repository": "black-forest-labs/FLUX.1-dev",
+        "model_revision": "3de623fc3c33e44ffbe2bad470d0f45bccf2eb21",
+        "model_reference": "main",
+        "model_subdirectory": ".",
+        "model_path": "/Users/michael/.cache/huggingface/hub/models--black-forest-labs--FLUX.1-dev/snapshots/3de623fc3c33e44ffbe2bad470d0f45bccf2eb21",
+        "model_inventory_sha256": "413a16687377f7cf9322bf9d9b8bef0f73a461809bc89d8e99dc5bcd1eaecdc2"
+      }
+    },
+    "z_image_base_golden": {
+      "committed": false,
+      "bytes": 4040526,
+      "sha256": "b850c9e4e3023575257b7a60d0de58b5eee62aac26d0f712ac3049c681f51537",
+      "license": "Apache-2.0",
+      "local_path": "${TOOLS}/golden/z_image_golden.safetensors",
+      "source": {
+        "kind": "generated",
+        "repository": "https://github.com/michaeltrefry/mflux.git",
+        "revision": "81106c833435d1a1f62ca04a8c01c1d380d39272",
+        "script": "dump_z_image_golden.py",
+        "command": "ZIMAGE_REFERENCE_MODEL=$HF_MODELS_ROOT/models--Tongyi-MAI--Z-Image-Turbo/snapshots/f332072aa78be7aecdf3ee76d5c247082da564a6 ZIMAGE_REFERENCE_REVISION=f332072aa78be7aecdf3ee76d5c247082da564a6 ZIMAGE_W=512 ZIMAGE_H=512 $REF_PY $TOOLS/dump_z_image_golden.py",
+        "model_repository": "Tongyi-MAI/Z-Image-Turbo",
+        "model_revision": "f332072aa78be7aecdf3ee76d5c247082da564a6",
+        "model_reference": "main",
+        "model_subdirectory": ".",
+        "model_path": "/Users/michael/.cache/huggingface/hub/models--Tongyi-MAI--Z-Image-Turbo/snapshots/f332072aa78be7aecdf3ee76d5c247082da564a6",
+        "model_inventory_sha256": "a116ca28d12e37e9a16b486948656a1b63e862223c2de18e0c808eb139b83d3e"
+      }
+    },
+    "z_image_lora_adapter": {
+      "committed": false,
+      "bytes": 2954397,
+      "sha256": "ee8008a36fd5b4a7962e2b612f59a303c57cc1bb3a581058b97b7ee9ed37cb52",
+      "license": "Synthetic deterministic fixture generated by Apache-2.0 repository code",
+      "local_path": "${TOOLS}/golden/z_image_lora_adapter.safetensors",
+      "source": {
+        "kind": "generated",
+        "repository": "https://github.com/michaeltrefry/mflux.git",
+        "revision": "81106c833435d1a1f62ca04a8c01c1d380d39272",
+        "script": "dump_z_image_adapter_golden.py",
+        "command": "ZIMAGE_REFERENCE_MODEL=$HF_MODELS_ROOT/models--Tongyi-MAI--Z-Image-Turbo/snapshots/f332072aa78be7aecdf3ee76d5c247082da564a6 ZIMAGE_REFERENCE_REVISION=f332072aa78be7aecdf3ee76d5c247082da564a6 BUILD_ADAPTERS_ONLY=1 $REF_PY $TOOLS/dump_z_image_adapter_golden.py",
+        "model_repository": "Tongyi-MAI/Z-Image-Turbo",
+        "model_revision": "f332072aa78be7aecdf3ee76d5c247082da564a6",
+        "model_reference": "main",
+        "model_subdirectory": ".",
+        "model_path": "/Users/michael/.cache/huggingface/hub/models--Tongyi-MAI--Z-Image-Turbo/snapshots/f332072aa78be7aecdf3ee76d5c247082da564a6",
+        "model_inventory_sha256": "a116ca28d12e37e9a16b486948656a1b63e862223c2de18e0c808eb139b83d3e"
+      }
+    },
+    "z_image_lora_golden": {
+      "committed": false,
+      "bytes": 3147070,
+      "sha256": "8fedc026546cbfb75f0e9f29e76beac848e4f197a8480c9771bfce5f884426d0",
+      "license": "Apache-2.0",
+      "local_path": "${TOOLS}/golden/z_image_lora_golden.safetensors",
+      "source": {
+        "kind": "generated",
+        "repository": "https://github.com/michaeltrefry/mflux.git",
+        "revision": "81106c833435d1a1f62ca04a8c01c1d380d39272",
+        "script": "dump_z_image_adapter_golden.py",
+        "command": "ZIMAGE_REFERENCE_MODEL=$HF_MODELS_ROOT/models--Tongyi-MAI--Z-Image-Turbo/snapshots/f332072aa78be7aecdf3ee76d5c247082da564a6 ZIMAGE_REFERENCE_REVISION=f332072aa78be7aecdf3ee76d5c247082da564a6 ZIMAGE_W=512 ZIMAGE_H=512 $REF_PY $TOOLS/dump_z_image_adapter_golden.py",
+        "model_repository": "Tongyi-MAI/Z-Image-Turbo",
+        "model_revision": "f332072aa78be7aecdf3ee76d5c247082da564a6",
+        "model_reference": "main",
+        "model_subdirectory": ".",
+        "model_path": "/Users/michael/.cache/huggingface/hub/models--Tongyi-MAI--Z-Image-Turbo/snapshots/f332072aa78be7aecdf3ee76d5c247082da564a6",
+        "model_inventory_sha256": "a116ca28d12e37e9a16b486948656a1b63e862223c2de18e0c808eb139b83d3e"
+      }
+    },
+    "z_image_lokr_adapter": {
+      "committed": false,
+      "bytes": 372928,
+      "sha256": "7d3342f81bdde685204f59bda1c43452b56d936671446a7e84e7925718c08e84",
+      "license": "Synthetic deterministic fixture generated by Apache-2.0 repository code",
+      "local_path": "${TOOLS}/golden/z_image_lokr_adapter.safetensors",
+      "source": {
+        "kind": "generated",
+        "repository": "https://github.com/michaeltrefry/mflux.git",
+        "revision": "81106c833435d1a1f62ca04a8c01c1d380d39272",
+        "script": "dump_z_image_adapter_golden.py",
+        "command": "ZIMAGE_REFERENCE_MODEL=$HF_MODELS_ROOT/models--Tongyi-MAI--Z-Image-Turbo/snapshots/f332072aa78be7aecdf3ee76d5c247082da564a6 ZIMAGE_REFERENCE_REVISION=f332072aa78be7aecdf3ee76d5c247082da564a6 BUILD_ADAPTERS_ONLY=1 $REF_PY $TOOLS/dump_z_image_adapter_golden.py",
+        "model_repository": "Tongyi-MAI/Z-Image-Turbo",
+        "model_revision": "f332072aa78be7aecdf3ee76d5c247082da564a6",
+        "model_reference": "main",
+        "model_subdirectory": ".",
+        "model_path": "/Users/michael/.cache/huggingface/hub/models--Tongyi-MAI--Z-Image-Turbo/snapshots/f332072aa78be7aecdf3ee76d5c247082da564a6",
+        "model_inventory_sha256": "a116ca28d12e37e9a16b486948656a1b63e862223c2de18e0c808eb139b83d3e"
+      }
+    },
+    "z_image_lokr_golden": {
+      "committed": false,
+      "bytes": 3147070,
+      "sha256": "a5f17d16fca0e49fb9004c5e5ab5c4d824eb9146b06caec942f5fd0867f407e2",
+      "license": "Apache-2.0",
+      "local_path": "${TOOLS}/golden/z_image_lokr_golden.safetensors",
+      "source": {
+        "kind": "generated",
+        "repository": "https://github.com/michaeltrefry/mflux.git",
+        "revision": "81106c833435d1a1f62ca04a8c01c1d380d39272",
+        "script": "dump_z_image_adapter_golden.py",
+        "command": "ZIMAGE_REFERENCE_MODEL=$HF_MODELS_ROOT/models--Tongyi-MAI--Z-Image-Turbo/snapshots/f332072aa78be7aecdf3ee76d5c247082da564a6 ZIMAGE_REFERENCE_REVISION=f332072aa78be7aecdf3ee76d5c247082da564a6 ZIMAGE_W=512 ZIMAGE_H=512 $REF_PY $TOOLS/dump_z_image_adapter_golden.py",
+        "model_repository": "Tongyi-MAI/Z-Image-Turbo",
+        "model_revision": "f332072aa78be7aecdf3ee76d5c247082da564a6",
+        "model_reference": "main",
+        "model_subdirectory": ".",
+        "model_path": "/Users/michael/.cache/huggingface/hub/models--Tongyi-MAI--Z-Image-Turbo/snapshots/f332072aa78be7aecdf3ee76d5c247082da564a6",
+        "model_inventory_sha256": "a116ca28d12e37e9a16b486948656a1b63e862223c2de18e0c808eb139b83d3e"
+      }
+    },
+    "qwen_base_golden": {
+      "committed": false,
+      "bytes": 4085460,
+      "sha256": "5f810691d0b2768cc2d3e42a5e14885c3c2832234dc3f15b89453e28d07cc7b4",
+      "license": "Apache-2.0",
+      "local_path": "${TOOLS}/golden/qwen_image_golden.safetensors",
+      "source": {
+        "kind": "generated",
+        "repository": "https://github.com/michaeltrefry/mflux.git",
+        "revision": "81106c833435d1a1f62ca04a8c01c1d380d39272",
+        "script": "dump_qwen_image_golden.py",
+        "command": "QWEN_REFERENCE_REPOSITORY=SceneWorks/qwen-image-mlx QWEN_REFERENCE_REVISION=8080a4171f1c8b7fca6c30491eafbe6ffab754bf QWEN_REFERENCE_MODEL=$HF_MODELS_ROOT/models--SceneWorks--qwen-image-mlx/snapshots/8080a4171f1c8b7fca6c30491eafbe6ffab754bf/bf16 QWEN_W=512 QWEN_H=512 $REF_PY $TOOLS/dump_qwen_image_golden.py",
+        "model_repository": "SceneWorks/qwen-image-mlx",
+        "model_revision": "8080a4171f1c8b7fca6c30491eafbe6ffab754bf",
+        "model_reference": "main",
+        "model_subdirectory": "bf16",
+        "model_path": "/Users/michael/.cache/huggingface/hub/models--SceneWorks--qwen-image-mlx/snapshots/8080a4171f1c8b7fca6c30491eafbe6ffab754bf/bf16",
+        "model_inventory_sha256": "094c6a3b4ef5c509aaaa821f7a5aec360e839298f284d60b71166715f5ba2577"
+      }
+    },
+    "qwen_lora_adapter": {
+      "committed": false,
+      "bytes": 4728679,
+      "sha256": "af9ea08c4f98f273d7dcaeca1b75eb730a49da0efe345b3eaf80916ba87553f7",
+      "license": "Synthetic deterministic fixture generated by Apache-2.0 repository code",
+      "local_path": "${TOOLS}/golden/qwen_lora_adapter.safetensors",
+      "source": {
+        "kind": "generated",
+        "repository": "https://github.com/michaeltrefry/mflux.git",
+        "revision": "81106c833435d1a1f62ca04a8c01c1d380d39272",
+        "script": "dump_qwen_adapter_golden.py",
+        "command": "QWEN_REFERENCE_REPOSITORY=SceneWorks/qwen-image-mlx QWEN_REFERENCE_REVISION=8080a4171f1c8b7fca6c30491eafbe6ffab754bf QWEN_REFERENCE_MODEL=$HF_MODELS_ROOT/models--SceneWorks--qwen-image-mlx/snapshots/8080a4171f1c8b7fca6c30491eafbe6ffab754bf/bf16 BUILD_ADAPTERS_ONLY=1 $REF_PY $TOOLS/dump_qwen_adapter_golden.py",
+        "model_repository": "SceneWorks/qwen-image-mlx",
+        "model_revision": "8080a4171f1c8b7fca6c30491eafbe6ffab754bf",
+        "model_reference": "main",
+        "model_subdirectory": "bf16",
+        "model_path": "/Users/michael/.cache/huggingface/hub/models--SceneWorks--qwen-image-mlx/snapshots/8080a4171f1c8b7fca6c30491eafbe6ffab754bf/bf16",
+        "model_inventory_sha256": "094c6a3b4ef5c509aaaa821f7a5aec360e839298f284d60b71166715f5ba2577"
+      }
+    },
+    "qwen_lora_golden": {
+      "committed": false,
+      "bytes": 3147111,
+      "sha256": "8d70dbf738da177e015cfe92dc07ab47ad20b31ac809ec5c30bba850288de6f2",
+      "license": "Apache-2.0",
+      "local_path": "${TOOLS}/golden/qwen_lora_golden.safetensors",
+      "source": {
+        "kind": "generated",
+        "repository": "https://github.com/michaeltrefry/mflux.git",
+        "revision": "81106c833435d1a1f62ca04a8c01c1d380d39272",
+        "script": "dump_qwen_adapter_golden.py",
+        "command": "QWEN_REFERENCE_REPOSITORY=SceneWorks/qwen-image-mlx QWEN_REFERENCE_REVISION=8080a4171f1c8b7fca6c30491eafbe6ffab754bf QWEN_REFERENCE_MODEL=$HF_MODELS_ROOT/models--SceneWorks--qwen-image-mlx/snapshots/8080a4171f1c8b7fca6c30491eafbe6ffab754bf/bf16 QWEN_W=512 QWEN_H=512 $REF_PY $TOOLS/dump_qwen_adapter_golden.py",
+        "model_repository": "SceneWorks/qwen-image-mlx",
+        "model_revision": "8080a4171f1c8b7fca6c30491eafbe6ffab754bf",
+        "model_reference": "main",
+        "model_subdirectory": "bf16",
+        "model_path": "/Users/michael/.cache/huggingface/hub/models--SceneWorks--qwen-image-mlx/snapshots/8080a4171f1c8b7fca6c30491eafbe6ffab754bf/bf16",
+        "model_inventory_sha256": "094c6a3b4ef5c509aaaa821f7a5aec360e839298f284d60b71166715f5ba2577"
+      }
+    },
+    "qwen_lokr_adapter": {
+      "committed": false,
+      "bytes": 543300,
+      "sha256": "1e13570724e75f926e9fb079f2ec336cc87f3932eada8415ab71b83a43e179cf",
+      "license": "Synthetic deterministic fixture generated by Apache-2.0 repository code",
+      "local_path": "${TOOLS}/golden/qwen_lokr_adapter.safetensors",
+      "source": {
+        "kind": "generated",
+        "repository": "https://github.com/michaeltrefry/mflux.git",
+        "revision": "81106c833435d1a1f62ca04a8c01c1d380d39272",
+        "script": "dump_qwen_adapter_golden.py",
+        "command": "QWEN_REFERENCE_REPOSITORY=SceneWorks/qwen-image-mlx QWEN_REFERENCE_REVISION=8080a4171f1c8b7fca6c30491eafbe6ffab754bf QWEN_REFERENCE_MODEL=$HF_MODELS_ROOT/models--SceneWorks--qwen-image-mlx/snapshots/8080a4171f1c8b7fca6c30491eafbe6ffab754bf/bf16 BUILD_ADAPTERS_ONLY=1 $REF_PY $TOOLS/dump_qwen_adapter_golden.py",
+        "model_repository": "SceneWorks/qwen-image-mlx",
+        "model_revision": "8080a4171f1c8b7fca6c30491eafbe6ffab754bf",
+        "model_reference": "main",
+        "model_subdirectory": "bf16",
+        "model_path": "/Users/michael/.cache/huggingface/hub/models--SceneWorks--qwen-image-mlx/snapshots/8080a4171f1c8b7fca6c30491eafbe6ffab754bf/bf16",
+        "model_inventory_sha256": "094c6a3b4ef5c509aaaa821f7a5aec360e839298f284d60b71166715f5ba2577"
+      }
+    },
+    "qwen_lokr_golden": {
+      "committed": false,
+      "bytes": 3147111,
+      "sha256": "c652442623327fa63892ad5ad21ee1208707f47ebd83550d5b38555d498f2c9c",
+      "license": "Apache-2.0",
+      "local_path": "${TOOLS}/golden/qwen_lokr_golden.safetensors",
+      "source": {
+        "kind": "generated",
+        "repository": "https://github.com/michaeltrefry/mflux.git",
+        "revision": "81106c833435d1a1f62ca04a8c01c1d380d39272",
+        "script": "dump_qwen_adapter_golden.py",
+        "command": "QWEN_REFERENCE_REPOSITORY=SceneWorks/qwen-image-mlx QWEN_REFERENCE_REVISION=8080a4171f1c8b7fca6c30491eafbe6ffab754bf QWEN_REFERENCE_MODEL=$HF_MODELS_ROOT/models--SceneWorks--qwen-image-mlx/snapshots/8080a4171f1c8b7fca6c30491eafbe6ffab754bf/bf16 QWEN_W=512 QWEN_H=512 $REF_PY $TOOLS/dump_qwen_adapter_golden.py",
+        "model_repository": "SceneWorks/qwen-image-mlx",
+        "model_revision": "8080a4171f1c8b7fca6c30491eafbe6ffab754bf",
+        "model_reference": "main",
+        "model_subdirectory": "bf16",
+        "model_path": "/Users/michael/.cache/huggingface/hub/models--SceneWorks--qwen-image-mlx/snapshots/8080a4171f1c8b7fca6c30491eafbe6ffab754bf/bf16",
+        "model_inventory_sha256": "094c6a3b4ef5c509aaaa821f7a5aec360e839298f284d60b71166715f5ba2577"
+      }
+    }
+  }
+}

@@ -22,6 +22,7 @@
 //! multi-component tree the Turbo loader consumes); the coordinator points the catalog entry + re-pin
 //! at that snapshot (a follow-up). Turbo and the control variant are untouched.
 
+use mlx_gen::gen_core;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, default_seed, resolve_flow_schedule,
@@ -114,6 +115,9 @@ pub fn descriptor() -> ModelDescriptor {
 pub struct ZImage {
     descriptor: ModelDescriptor,
     tokenizer: TextTokenizer,
+    /// The provider's half of the shared image-memory handshake (SC-15449 / SC-15615), built from the
+    /// `LoadSpec` at load so its asset facts describe the snapshot this generator actually loaded.
+    image_memory: mlx_gen::gen_core::ImageMemoryProviderContract,
     /// Component-residency strategy (sc-11124), selected from [`LoadSpec::offload_policy`] via the
     /// shared [`crate::model::load_residency`] builder. `Resident` holds the text encoder + DiT + VAE
     /// warm; `Sequential` holds only the per-phase loader closures and re-loads per generate in phase
@@ -143,16 +147,51 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
                  not a single .safetensors file",
     )?;
     Ok(Box::new(ZImage {
+        image_memory: crate::image_memory::image_memory_contract(MODEL_ID, spec),
         descriptor: descriptor(),
         tokenizer,
         residency,
     }))
 }
 
-mlx_gen::impl_generator!(ZImage {
-    validate: |s, req| validate_request(s.descriptor.id, &s.descriptor.capabilities, req),
-    generate: generate_impl,
-});
+// Hand-written rather than `impl_generator!` because this provider also implements the shared
+// image-memory hooks (SC-15449 / SC-15615); `descriptor` / `validate` / `generate` are the identical
+// plain delegation the macro would have emitted.
+impl Generator for ZImage {
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.descriptor
+    }
+
+    fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
+        validate_request(self.descriptor.id, &self.descriptor.capabilities, req).map_err(Into::into)
+    }
+
+    fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+
+    fn image_memory_contract(&self) -> Option<&gen_core::ImageMemoryProviderContract> {
+        Some(&self.image_memory)
+    }
+
+    fn image_memory_safety_check(
+        &self,
+        context: &gen_core::ImageMemoryRunContext,
+    ) -> gen_core::ImageMemorySafetyDecision {
+        crate::image_memory::safety_check(&self.image_memory, context)
+    }
+
+    fn begin_image_memory_request(
+        &self,
+        context: &gen_core::ImageMemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::ImageMemoryRequestScope + '_>>> {
+        crate::image_memory::begin_request(MODEL_ID, &self.image_memory, context)
+    }
+}
 
 impl ZImage {
     /// The rich-`Result` body behind [`Generator::generate`].
@@ -186,6 +225,14 @@ impl ZImage {
 
         // sc-13571 / GitHub #1658: DiT-dropping staged decode (see `crate::model` for the turbo path).
         let tiling = pipeline::decode_tiling(req, self.residency.is_sequential());
+        // SC-15615 ladder rung 3: the shared selector's request-scoped attention budget. Unbounded
+        // unless this request selected bounded attention, so the default forward is unchanged.
+        let attention_budget = pipeline::attention_budget(req);
+        // SC-15754 ladder rung 4: the request-scoped transformer-residency window. `None` unless this
+        // request selected it; a selection on a non-Sequential generator is rejected rather than
+        // silently degraded (see `pipeline::resolve_block_window`).
+        let block_window =
+            pipeline::resolve_block_window(req, self.residency.is_sequential(), MODEL_ID)?;
         let images = self.residency.run_staged(
             &req.cancel,
             req.use_pid,
@@ -194,6 +241,13 @@ impl ZImage {
             // Turbo there is no bf16 seed-parity golden to match, so keep the conditioning at the text
             // encoder's native precision and let the DiT promote per-op against the bf16 weights.
             |text_encoder: &TextEncoder| {
+                // Calibration-only fault injection at a physical phase boundary (SC-15449);
+                // `None` for every production request, so this is a `None` comparison.
+                pipeline::calibration_fault(
+                    req,
+                    mlx_gen::gen_core::ImageMemoryPhase::Conditioning,
+                    MODEL_ID,
+                )?;
                 let cap =
                     pipeline::encode_prompt(&self.tokenizer, text_encoder, &req.prompt, MODEL_ID)?;
                 // Uncond conditioning = the negative prompt (empty string when unset), encoded only
@@ -219,6 +273,11 @@ impl ZImage {
             },
             // ── Phase B (denoise): heavy bundle + (cap, neg_cap) → (evaluated latents, PiD decoder).
             |heavy: &ZImageHeavyOwned, (cap, neg_cap), on_progress| {
+                pipeline::calibration_fault(
+                    req,
+                    mlx_gen::gen_core::ImageMemoryPhase::Denoise,
+                    MODEL_ID,
+                )?;
                 // Static shift=6.0 schedule (the base model's scheduler_config.json) — build once. An
                 // unset `req.scheduler` keeps it byte-exact (epic 7114 N1); a curated name re-shapes σ
                 // over `shift=6.0`.
@@ -280,6 +339,8 @@ impl ZImage {
                             neg_cap_ref,
                             guidance,
                             start_step,
+                            attention_budget,
+                            block_window,
                             &req.cancel,
                             op,
                         )
@@ -291,6 +352,11 @@ impl ZImage {
             |mid| Ok(mlx_rs::transforms::eval(mid.0.iter())?),
             // ── Phase C (decode): light (VAE) view + latents → images. Tiled under `Sequential`.
             |view, (latents, pid_decoder), on_progress| {
+                pipeline::calibration_fault(
+                    req,
+                    mlx_gen::gen_core::ImageMemoryPhase::Decode,
+                    MODEL_ID,
+                )?;
                 let images = pipeline::decode_batch(
                     view.vae,
                     pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder),
@@ -312,6 +378,14 @@ mlx_gen::register_generators! {
     pub(crate) const REGISTRATION = descriptor => load;
     footprint = crate::model::component_footprint
 }
+
+/// The shared image-memory contract registration (SC-15449) — resolvable before any weights load, so
+/// the worker can select a strategy from the static declaration plus its own measured evidence.
+pub const IMAGE_MEMORY_REGISTRATION: mlx_gen::gen_core::ImageMemoryRegistration =
+    mlx_gen::gen_core::ImageMemoryRegistration {
+        provider_id: MODEL_ID,
+        contract: |spec| Ok(crate::image_memory::image_memory_contract(MODEL_ID, spec)),
+    };
 
 #[cfg(test)]
 mod tests {

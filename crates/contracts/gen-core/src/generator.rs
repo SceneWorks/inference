@@ -457,6 +457,29 @@ pub struct GenerationMemory {
     /// the accelerator. This is the last quality-preserving rung when complete weights plus bounded
     /// activations still exceed the live device budget.
     pub stream_transformer_blocks: bool,
+
+    // --- Selected strategy parameters (SC-15510) -------------------------------------------------
+    //
+    // The three booleans above say WHICH rungs run; these say with WHAT. Before SC-15510 a provider
+    // could only advertise the single hardcoded value its pipeline happened to use, which made
+    // `ImageMemoryParameterRanges` a one-element list and left SC-15508's "a single-point pass cannot
+    // mark untested production parameters Verified" unsatisfiable. Each is `Option`, and `None` (the
+    // `Default`) means "the provider's own historical constant", so every provider that does not read
+    // them — and every request that does not set them — is byte-for-byte unaffected.
+    //
+    // The values a provider will accept are exactly the candidates it publishes in its
+    // `ImageMemoryProviderContract`; its request scope re-validates them, so an out-of-domain value is
+    // a typed rejection rather than a silently different execution than the selector chose.
+    /// Decode tile edge in **output pixels** for the bounded (tiled) decode. `None` ⇒ the provider's
+    /// default tile edge.
+    pub decode_tile_edge: Option<u32>,
+    /// Feather/blend overlap in output pixels paired with [`Self::decode_tile_edge`]. `None` ⇒ the
+    /// provider's default overlap.
+    pub decode_overlap: Option<u32>,
+    /// Number of consecutive transformer trunk blocks held materialized at once when
+    /// [`Self::stream_transformer_blocks`] is set. `None` ⇒ the provider's default window.
+    pub transformer_window_size: Option<u32>,
+
     /// Calibration-only request-local fault injection. Adopting providers may return a deterministic
     /// error at the named physical phase boundary so a conformance harness can verify cleanup and a
     /// warm follow-up request. Production selectors must leave this at `None` (the default).
@@ -2100,9 +2123,34 @@ mod tests {
                 tile_vae_decode: false,
                 chunk_attention: false,
                 stream_transformer_blocks: false,
+                decode_tile_edge: None,
+                decode_overlap: None,
+                transformer_window_size: None,
                 calibration_error_phase: None,
             }
         );
+    }
+
+    /// SC-15510: the strategy-parameter carriers are additive and default-inert. This is deliberately
+    /// an exhaustive literal — adding a lever without deciding its default here fails to compile,
+    /// which is the point: a new field that defaults to anything but "the provider's own historical
+    /// constant" would silently change every existing render.
+    #[test]
+    fn strategy_parameters_default_to_the_providers_own_constants() {
+        let memory = GenerationMemory::default();
+        assert_eq!(memory.decode_tile_edge, None);
+        assert_eq!(memory.decode_overlap, None);
+        assert_eq!(memory.transformer_window_size, None);
+        // Setting a parameter does NOT turn its rung on: the boolean is the switch, the parameter is
+        // only the value. A selector that set an edge but not `tile_vae_decode` gets no tiling.
+        let parameterized = GenerationMemory {
+            decode_tile_edge: Some(384),
+            decode_overlap: Some(64),
+            transformer_window_size: Some(2),
+            ..Default::default()
+        };
+        assert!(!parameterized.tile_vae_decode);
+        assert!(!parameterized.stream_transformer_blocks);
     }
 
     fn img(w: u32, h: u32) -> Image {

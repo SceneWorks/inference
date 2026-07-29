@@ -50,6 +50,116 @@ cargo test -p mlx-gen-z-image --release --test e2e_real_weights -- --ignored --n
 Prerequisites: macOS + Metal; the frozen `mflux` fork at `~/repos/mflux`; the model weights in
 `~/.cache/huggingface/hub/` (auto-downloaded by the fork on first run).
 
+## Licensed adapter parity set (`sc-15505`)
+
+The FLUX Hyper, Z-Image LoRA/LoKr, and Qwen LoRA/LoKr gates use the
+provenance-locked inventory in `../adapter_parity_artifacts.json`. The manifest records every
+gitignored binary's source, license, size, checksum, producing script, and frozen reference
+revision. Before the real-weight transcript exists, the verifier deliberately exits nonzero with
+`results remain non-proof until transcript is verified`; mutation tests still validate the pending
+manifest's structure and pinned scripts:
+
+```sh
+python3 -m unittest scripts.tests.test_adapter_parity_artifacts -v
+```
+
+On the licensed Metal host used for `sc-15505`, the exact production commands are:
+
+```sh
+# Frozen reference checkout and version-matched runtime.
+export PYTHONPATH=/Users/michael/Repos/mflux/src
+export REF_PY=/Users/michael/Repos/mflux/.venv-0320/bin/python
+export REF_HF=/Users/michael/Repos/mflux/.venv-0320/bin/hf
+export TOOLS="$PWD/crates/media/mlx-gen/tools"
+export HF_MODELS_ROOT="${HF_HOME:-$HOME/.cache/huggingface}/hub"
+
+# Authoritative ByteDance Hyper-FLUX artifact. The dump script also refuses any
+# file whose cache repository, ref, revision, filename, or SHA-256 differs.
+export HYPER_LORA="$("$REF_HF" download ByteDance/Hyper-SD \
+  Hyper-FLUX.1-dev-8steps-lora.safetensors \
+  --revision bc08d970a87c74c71209491d64e3525845698863)"
+
+# Reference goldens. Keep the 512² base and adapter configurations identical.
+ZIMAGE_REFERENCE_MODEL="$HF_MODELS_ROOT/models--Tongyi-MAI--Z-Image-Turbo/snapshots/f332072aa78be7aecdf3ee76d5c247082da564a6" \
+  ZIMAGE_W=512 ZIMAGE_H=512 "$REF_PY" "$TOOLS/dump_z_image_golden.py"
+ZIMAGE_REFERENCE_MODEL="$HF_MODELS_ROOT/models--Tongyi-MAI--Z-Image-Turbo/snapshots/f332072aa78be7aecdf3ee76d5c247082da564a6" \
+  ZIMAGE_W=512 ZIMAGE_H=512 "$REF_PY" "$TOOLS/dump_z_image_adapter_golden.py"
+
+QWEN_REFERENCE_REPOSITORY=SceneWorks/qwen-image-mlx \
+  QWEN_REFERENCE_REVISION=8080a4171f1c8b7fca6c30491eafbe6ffab754bf \
+  QWEN_REFERENCE_MODEL="$HF_MODELS_ROOT/models--SceneWorks--qwen-image-mlx/snapshots/8080a4171f1c8b7fca6c30491eafbe6ffab754bf/bf16" \
+  QWEN_W=512 QWEN_H=512 "$REF_PY" "$TOOLS/dump_qwen_image_golden.py"
+QWEN_REFERENCE_REPOSITORY=SceneWorks/qwen-image-mlx \
+  QWEN_REFERENCE_REVISION=8080a4171f1c8b7fca6c30491eafbe6ffab754bf \
+  QWEN_REFERENCE_MODEL="$HF_MODELS_ROOT/models--SceneWorks--qwen-image-mlx/snapshots/8080a4171f1c8b7fca6c30491eafbe6ffab754bf/bf16" \
+  QWEN_W=512 QWEN_H=512 "$REF_PY" "$TOOLS/dump_qwen_adapter_golden.py"
+
+FLUX_DEV="$HF_MODELS_ROOT/models--black-forest-labs--FLUX.1-dev/snapshots/3de623fc3c33e44ffbe2bad470d0f45bccf2eb21" \
+  "$REF_PY" "$TOOLS/dump_hyper_flux_golden.py"
+
+# Before tightening, the exact tolerance-based diagnostic measured 0 differing
+# bytes across 786,432 RGB samples. The assertion is now byte equality and the
+# retained runner itself executes
+# five exact cargo invocations in a constructed environment (ambient variables
+# are not inherited), captures real argv/env, stdout/stderr/return codes plus
+# rustc/cargo/platform/hardware identity, and checks artifact/model/source
+# identities before and after. It rejects a zero-test cargo result because each
+# run must emit its one structured SC15505_RESULT line.
+python3 "$TOOLS/record_adapter_parity_transcript.py"
+```
+
+The scripts reject a dirty/index-modified or source-augmented frozen fork, the wrong Git remote,
+and a model path whose Hugging Face cache repository/revision/subdirectory does not match its
+claim. The retained runner computes a canonical digest from the exact executable source contents
+instead of Git's staging representation, and rejects every baseline-relative changed path outside
+the reviewed sc-15505 allowlist (including untracked files).
+
+If a direct-output no-adapter control is not worse than the adapted render, it cannot support a
+mutation-sensitive threshold and must not be widened into one. Run the pre-tightening residual
+diagnostic instead:
+
+```sh
+python3 "$TOOLS/record_adapter_parity_transcript.py" --residual-diagnostic
+```
+
+That exact, sanitized runner records `(Rust adapted - Rust base)` versus
+`(fork adapted - fork base)` and compares it with the dropped-adapter control (a zero Rust
+residual). It writes only the ignored diagnostic transcript and never the durable receipt. A final
+residual cap may be locked only after the adapted residual is measured below the zero-residual
+control; the reviewed rule is their integer midpoint. If there is no separation, the parity claim
+must be reframed instead of forcing a passing cap.
+
+The retained residual diagnostic separated Z LoRA (15,692 adapted vs 26,587 zero control) and
+Z LoKr (15,476 vs 40,120), but rejected Qwen LoRA (63,030 vs 43,903) and Qwen LoKr
+(69,111 vs 50,446): both Qwen adapted residual errors were worse than the dropped-adapter
+control. Qwen therefore keeps the original floor-relative fork gate
+`adapted_px_gt8 <= 2 * base_floor + rgb_samples / 200` and uses a separate same-runtime effect
+gate to prove the adapter is active. Measure that effect before locking its nonzero minimum:
+
+```sh
+python3 "$TOOLS/record_adapter_parity_transcript.py" --qwen-effect-diagnostic
+```
+
+This dedicated diagnostic records active-adapter-vs-base px>8, scale-zero byte differences, exact
+applied-module count (LoRA 24; LoKr 21), empty unmatched-path count, and RGB sample count. It has a
+fixed schema and output path and, like the residual diagnostic, cannot write the acceptance
+transcript or receipt. The retained measurement is LoRA effect 44,799 (minimum 22,399) and LoKr
+effect 39,409 (minimum 19,704), each over 786,432 RGB samples; both scale-zero counts are 0 and
+their apply reports are exactly 24/21 applied with no unmatched paths. The fixed minimum is
+`measured_effect_samples_gt8 / 2`, so dropping/inerting an adapter produces zero and turns the
+effect clause red while the separate floor-relative clause continues to constrain fork parity.
+
+After recording, update the manifest with the measured `SC15505_RESULT` values plus every
+artifact/transcript size and SHA-256, then run
+`python3 "$TOOLS/verify_adapter_parity_artifacts.py"`. That final verifier cross-checks the
+safetensors metadata, model inventories, exact artifact hashes, and retained cargo output. The
+binaries and raw transcript remain uncommitted. The recorder also emits the committed,
+path-redacted `../adapter_parity_receipt.json`; the manifest binds both its checksum and the
+ignored raw transcript checksum, and the verifier requires the receipt to be the exact redacted
+projection of that transcript. A deliberate reference refresh must update the manifest,
+receipt, and `CHECKSUMS.txt` in the same review as any changed acceptance number; silently
+accepting a new golden is not permitted.
+
 ## Manifest
 
 ### Z-Image (`mlx-gen-z-image`)

@@ -15,6 +15,10 @@
 
 pub mod adapters;
 pub mod attention;
+// Ladder rung 4 (SC-15754): the family half of bounded transformer residency — how a Z-Image block is
+// rebuilt from its snapshot, quantized and adapted like its resident twin. The window lifecycle itself
+// is the shared `mlx_gen::block_residency` (SC-15750), never re-implemented here.
+mod block_stream;
 mod comfyui;
 pub mod context_block;
 pub mod control_transformer;
@@ -22,6 +26,8 @@ pub mod control_transformer_block;
 pub mod convert;
 pub mod feed_forward;
 pub mod final_layer;
+// Shared image-memory contract adoption (SC-15449) + the SC-15615 rung-3 finding.
+pub mod image_memory;
 pub mod loader;
 pub mod model;
 pub mod model_base;
@@ -83,6 +89,10 @@ pub fn register_providers(
         .register_generator(model_base::REGISTRATION)
         .register_generator(model_base_control::REGISTRATION)
         .register_generator(model_control::REGISTRATION)
+        .register_image_memory(model::IMAGE_MEMORY_REGISTRATION)
+        .register_image_memory(model_base::IMAGE_MEMORY_REGISTRATION)
+        .register_image_memory(model_base_control::IMAGE_MEMORY_REGISTRATION)
+        .register_image_memory(model_control::IMAGE_MEMORY_REGISTRATION)
         .register_trainer(training::REGISTRATION)
 }
 
@@ -158,5 +168,78 @@ mod explicit_registry_tests {
             .map(|registration| (registration.descriptor)().id.to_string())
             .collect();
         assert_eq!(explicit_trainers, ["z_image_turbo"]);
+    }
+
+    /// The four `register_image_memory` calls are what makes the SC-15449 contract resolvable before
+    /// weights load. Without this test, dropping any one of them is green — every other contract test
+    /// builds the contract directly instead of going through the registry.
+    #[test]
+    fn every_variant_resolves_its_image_memory_contract_through_the_registry() {
+        use mlx_gen::gen_core::{
+            ImageMemoryStrategy, ImageMemoryStrategySupport, LoadSpec, WeightsSource,
+        };
+
+        let registry = super::provider_registry().unwrap();
+        // SC-15754: rung 4 is declared per LOAD — a re-openable snapshot dir loaded `Sequential`.
+        // The registry must hand back the same contract the direct builder produces for that load.
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()))
+            .with_offload_policy(mlx_gen::OffloadPolicy::Sequential);
+        for id in [
+            "z_image_turbo",
+            "z_image",
+            "z_image_turbo_control",
+            "z_image_control",
+        ] {
+            let contract = registry
+                .image_memory_contract(id, &spec)
+                .unwrap()
+                .unwrap_or_else(|| panic!("{id} must register an image-memory contract"));
+            assert_eq!(contract.provider_id, id);
+            assert_eq!(
+                contract.calibration.as_ref().unwrap().fingerprint,
+                super::image_memory::IMAGE_MEMORY_CALIBRATION_FINGERPRINT,
+                "{id}"
+            );
+            // The registry-resolved contract must be the same one the direct builder produces —
+            // every rung Implemented on a snapshot load (SC-15510 / SC-15754), each with its
+            // recorded parameter domain.
+            for strategy in ImageMemoryStrategy::ALL {
+                assert!(
+                    matches!(
+                        contract.capability(strategy).map(|c| &c.support),
+                        Some(ImageMemoryStrategySupport::Implemented)
+                    ),
+                    "{id}: {strategy:?}"
+                );
+            }
+            assert_eq!(
+                contract
+                    .capability(ImageMemoryStrategy::BoundedAttention)
+                    .unwrap()
+                    .parameters
+                    .attention_chunk_sizes,
+                vec![super::image_memory::ATTENTION_CHUNK_SIZE],
+                "{id}"
+            );
+            assert_eq!(
+                contract
+                    .capability(ImageMemoryStrategy::BoundedTransformerResidency)
+                    .unwrap()
+                    .parameters
+                    .transformer_window_sizes,
+                super::image_memory::TRANSFORMER_WINDOW_SIZES.to_vec(),
+                "{id}"
+            );
+            assert!(
+                contract
+                    .capability(ImageMemoryStrategy::BoundedDecode)
+                    .unwrap()
+                    .parameters
+                    .decode_tile_edges
+                    .len()
+                    > 1,
+                "{id}: the decode ladder must be sweepable, not a single point"
+            );
+        }
     }
 }
