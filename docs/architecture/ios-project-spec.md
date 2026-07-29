@@ -189,21 +189,47 @@ function is meaningless and should not be compiled. Small, obviously correct, an
 thing to send upstream to `pmetal-mlx-rs`** — it is a latent defect for any non-macOS,
 non-Linux target, not something iOS introduced.
 
-### 2.2 Phase 0 blocker list — current
+### 2.2 Phase 0 build result — **complete and green**
 
-| # | Blocker | Scope | Size |
-|---|---|---|---|
-| 1 | `qqmm_device`'s `cfg(not(target_os = "macos"))` catches iOS for a CUDA-only function | `mlx-rs` | **Trivial** — narrow the gate. Upstreamable. |
-| 2 | `find_clang_runtime_lib` unconditionally selects `libclang_rt.osx.a` | `mlx-sys/build.rs` | **Small** — target-aware selection. |
-| 3 | `mlx.metallib` cached to `~/.cache/pmetal/lib` instead of bundled into the `.app` | `mlx-sys/build.rs` + packaging | **Moderate** — the resolver seam (`$PMETAL_METALLIB_PATH`) already exists. |
+**It builds. All of it.** Worked through in one session on 2026-07-29:
 
-**None is architectural.** No missing Metal support, no unbuildable C++, no absent iOS
-capability. The static analysis over-estimated this: **R1's likelihood drops from Low to Very
-Low**, and A1's three-week estimate now looks conservative rather than optimistic.
+```
+$ IPHONEOS_DEPLOYMENT_TARGET=18.0 \
+    cargo build --target aarch64-apple-ios -p mlx-llm-server -p mlx-gen-sana
+    Finished `dev` profile in 11.60s
 
-The remaining unknown is no longer *whether* it builds, but what happens at runtime — the
-metallib resolution on a real device, and the memory/energy numbers. Those still need the
-device.
+$ file target/aarch64-apple-ios/debug/mlx-llm-server
+    Mach-O 64-bit executable arm64
+    LC_BUILD_VERSION: platform 2 (iOS), minos 18.0, sdk 26.5
+    links Metal.framework + Accelerate.framework
+```
+
+That artifact is the **OpenAI-compatible LLM server, fully linked for iPhone** — not an rlib, a
+real executable. `mlx-gen` core, `mlx-gen-pid` and `mlx-gen-sana` build alongside it, so the
+Track 2 gate is green too.
+
+| # | Blocker | Status |
+|---|---|---|
+| 1 | `qqmm_device`'s `cfg(not(target_os = "macos"))` catches iOS for a CUDA-only function, whose call site had also gone stale (8 of 10 args) | **Fixed** — [SceneWorks/mlx-rs#23](https://github.com/SceneWorks/mlx-rs/pull/23) |
+| 2 | `build.rs` links `libclang_rt.osx.a` unconditionally | **Fixed** — same PR. Skip the link off macOS entirely; it is a macOS-26+ `___isPlatformVersionAtLeast` workaround, and the `ios`/`iossim` archives are rejected identically *and* unneeded. |
+| 3 | **`IPHONEOS_DEPLOYMENT_TARGET` unset** — `rustc`'s default for `aarch64-apple-ios` is **10.0**, which drops `___chkstk_darwin` (libSystem, iOS 12+) at link time | **Diagnosed, needs a home** — see below |
+| 4 | `mlx.metallib` cached to `~/.cache/pmetal/lib` instead of bundled into the `.app` | **Open** — a *runtime* issue; it does not block the build. Resolver seam (`$PMETAL_METALLIB_PATH`) already exists. |
+
+**Blocker 3 is the interesting one**, because it is configuration rather than code and it has a
+second face. The MLX C++ objects came out with `minos 26.2` — `MACOSX_DEPLOYMENT_TARGET` from
+`.cargo/config.toml` silently leaking in as the *iOS* floor. It happened not to error (iOS 26.2
+exists), but it would have excluded every device below iOS 26.2 from a shipped app. Meanwhile the
+Rust side linked at 10.0. Both halves need an **intentional** iOS deployment target; A1 must set
+it in `.cargo/config.toml` (or in the build script's deployment-target logic) rather than relying
+on an env var at the command line.
+
+**Nothing architectural was found.** No missing Metal support, no unbuildable C++, no absent iOS
+capability — the fixes were two small patches and one env var.
+
+**R1 is retired as a build risk.** A1's three weeks was budgeted almost entirely for "can we make
+this build at all", and the answer arrived in a day. That time should be re-aimed at blockers 3
+and 4 (deployment target properly homed, metallib bundling), the `runtime-ios` bundle, and
+getting onto the device — where the real unknowns now live.
 
 ### 2.3 Fork strategy — decided
 
@@ -355,6 +381,42 @@ the runtime, not to be a product.
 
 **Budget 2–3 weeks for (a), 1–2 for (b).** Design (a) during Phase 0 — it needs no working build.
 
+### 5.2.1 The headless option already exists — and it changes the critical path
+
+The consumer for the week 9–11 milestone is undecided: either a test-harness app, or a headless
+engine driven remotely. **The headless shape is already built.**
+
+`crates/llm/mlx-llm/server` (`mlx-llm-server`) is an OpenAI-compatible HTTP server —
+`POST /v1/chat/completions` with SSE streaming, `GET /v1/models`, a health check — written
+directly on `std::net::TcpListener` with **no async runtime and no HTTP framework**, speaking only
+the `TextLlm` contract. It is deliberately minimal: one model, one request at a time (matching
+MLX's single-threaded Metal device), `Connection: close`, **no auth**.
+
+**Recommendation: make the week 9–11 milestone the headless server.** It is the cheapest path to
+a shippable milestone *and* the one that best fits an undecided consumer:
+
+- **It takes §5.2(a) off the critical path — roughly 2–3 weeks.** The app target becomes a shell
+  that starts the server on a background thread. No callback marshalling across FFI, no
+  `.xcframework` API design, no stable-ABI commitment.
+- **It resolves the §8.5 tension rather than deferring it.** With no named consumer, designing a
+  frozen C ABI would be guessing. An HTTP surface is already a stable, versioned, well-understood
+  contract, and it is trivially drivable for evaluation and regression work.
+- **The test-harness app is then nearly free** — the same shell satisfies the `xcodebuild test`
+  host requirement (§5.3), so the two candidate consumers stop being alternatives.
+
+Two caveats that must be handled, not assumed away:
+
+1. **iOS has no background daemons.** "Headless" here means *a foregrounded app exposing a local
+   port*. It stops serving when backgrounded, and using audio/location background modes to dodge
+   that is App Store abuse. Fine for development and evaluation; **not** a product architecture.
+2. **The server has no authentication.** Binding it to a LAN interface exposes an unauthenticated
+   LLM to the network. Bind to loopback and reach it over USB port forwarding, or add a bearer
+   token before it leaves the desk. Its own docs already call it a reference, not a production
+   gateway — respect that boundary.
+
+The full FFI layer (§5.2a) remains necessary for a genuine native consumer. This defers it to
+when one is named, which is the right time to design it.
+
 ### 5.3 CI — the part with no precedent
 
 All three existing bundles are desktop targets that `cargo test` natively. iOS is not. **Budget
@@ -434,7 +496,8 @@ precisely what a CoreML text lane would have broken.
 
 | # | Risk | L | I | Mitigation |
 |---|---|---|---|---|
-| R1 | **`mlx-sys` cannot be built for iOS** | **VL** | **Critical** | Largely retired by §2.1/§2.2: the build reaches the final link with three known, non-architectural blockers. Fallback §3 remains if a runtime blocker appears on device. |
+| R1 | ~~**`mlx-sys` cannot be built for iOS**~~ | — | — | **Retired 2026-07-29** (§2.2). A fully linked iOS arm64 binary exists, and `mlx-gen-sana` builds alongside it. Fallback §3 is now only reachable via a runtime blocker on device. |
+| R8 | Runtime failure on device (metallib not resolvable inside the sandbox) | M | H | Blocker 4 in §2.2. The `$PMETAL_METALLIB_PATH` seam exists; bundling is A1 work. **This is now the first real unknown**, and it needs the device. |
 | R2 | Per-app memory cap tighter than the reported ~6 GB | M | H | Measured in Phase 0. Conclusion holds at 4 GB: ~3–4B at 4-bit. |
 | R3 | mlx-sys iOS fork drifts from upstream | H | M | Keep the delta additive; attempt upstreaming in A1. |
 | R4 | Threading contract violated by the Swift host | M | H | Documented ownership rule + hostile-threading test in A2 (§4.1). |
@@ -512,10 +575,11 @@ memory tuning stops being guesswork — but it is not free, and the costs land e
   weeks later. Retrofitting a second callback shape into a shipped ABI is the expensive path.
 - **Tier 3 CI must exist by week 9**, not by T4 — a shipped artifact needs enforced regression
   baselines. Pull the runner setup (§5.3) forward into A3.
-- **The consumer is presumed to be the LLM-only product** (ChatWorks, per the workspace's
-  existing `--no-default-features` composition profile), not the SwiftUI host app, which stays a
-  test harness. **Confirm this** — if the milestone is instead an app ship, §5.2(b) needs a real
-  product scope and a different budget.
+- **The consumer is undecided** — not ChatWorks. The candidates are a test-harness app or a
+  headless engine driven remotely. **§5.2.1 recommends the headless server**, which resolves this
+  bullet rather than deferring it: an HTTP surface is already a stable contract, so the FFI ABI
+  commitment moves to whenever a genuine native consumer is named. The three constraints above
+  apply to the *server's* HTTP surface instead, where they are much cheaper to satisfy.
 
 ### 8.4 Development environment — verified ready
 
@@ -570,9 +634,13 @@ self-hosted runner host, which removes one dependency from §5.3 — it needs on
 | Text-only milestone | Ships independently at ~wk 9–11 | §8.5 |
 | mlx-rs fixes | Fork now, upstream three PRs in parallel | §2.3 |
 
-**Still open — both are actions, not decisions:**
+| Entitlement request | Being requested by the engineer | §8.2 |
+| Fork host | `zakkeown/mlx-rs` (pre-existing fork of `michaeltrefry/mlx-rs`; contains the pinned rev), branch `ios-support` | §2.3 |
 
-1. **Request the `com.apple.developer.kernel.increased-memory-limit` entitlement.** Gates A2 and
-   T2; the lead time is Apple's, not ours. **Start it now**, before it is needed (§8.2).
-2. **Confirm the week 9–11 consumer** is the LLM-only product rather than the host app (§8.5).
-   It changes whether §5.2(b) is a test harness or a product.
+**Still open — one decision:**
+
+1. **The week 9–11 consumer: headless server or test-harness app?** Not ChatWorks. §5.2.1
+   recommends the **headless server** — it already exists (`mlx-llm-server`), takes the FFI layer
+   off the critical path for ~2–3 weeks, and defers the ABI commitment to when a real native
+   consumer is named. The test-harness app comes nearly free alongside it, since the same shell
+   satisfies the `xcodebuild test` host requirement.
