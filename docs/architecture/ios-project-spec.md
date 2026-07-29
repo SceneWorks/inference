@@ -198,12 +198,17 @@ conformance-tested** on `mlx-llm`. On this lane they are inherited, not built.
 **No contract-crate changes.** `core-llm` and `gen-core` are untouched — that is a property of
 this lane, and a regression if it stops being true.
 
-### 5.2 The Swift/host FFI layer — unspecced work, budget it
+### 5.2 The Swift/host FFI layer and host app — building the first one
 
-There is no host app in this repo and no C ABI surface anywhere. `TextLlm::generate` takes
-`&mut dyn FnMut(StreamEvent)` — a Rust closure that **does not cross an FFI boundary**.
+**Confirmed: no Swift host app exists.** This project builds it, and it is **required
+infrastructure, not optional product work** — `xcodebuild test` needs an Xcode test host, so
+Tier 3 device CI (§5.3) cannot exist without at least a minimal app target. Treat the host app
+as a deliverable of A2/A3, not as something a consumer supplies later.
 
-Scope `crates/bundles/runtime-ios-ffi` covering:
+Two pieces:
+
+**(a) `crates/bundles/runtime-ios-ffi`** — the C boundary. `TextLlm::generate` takes
+`&mut dyn FnMut(StreamEvent)`, a Rust closure that **does not cross FFI**. Scope covers:
 
 - a C ABI or `swift-bridge`/UniFFI surface for load / generate / cancel, and for image generation
   (`gen_core::Generator` has the same callback problem via `on_progress`)
@@ -212,8 +217,12 @@ Scope `crates/bundles/runtime-ios-ffi` covering:
 - error mapping across the boundary
 - `.xcframework` packaging
 
-**Budget 2–3 weeks.** Design it during Phase 0 (it needs no working build); implement it after A2.
-Host-app integration can begin against the designed surface once it exists — not before.
+**(b) A minimal SwiftUI host app** (`ios-host/`, outside the Cargo workspace) — a chat view, an
+image-generation view, a model-picker over `WeightsSource::Dir` paths, and an XCTest target that
+drives the conformance harness on-device. Deliberately thin: it exists to exercise and measure
+the runtime, not to be a product.
+
+**Budget 2–3 weeks for (a), 1–2 for (b).** Design (a) during Phase 0 — it needs no working build.
 
 ### 5.3 CI — the part with no precedent
 
@@ -295,25 +304,71 @@ precisely what a CoreML text lane would have broken.
 
 ---
 
-## 8. Timeline and staffing
+## 8. Staffing and timeline
+
+**Team: one human engineer plus Claude.** That is not "two engineers", and modelling it that way
+would give a wrong schedule. The work splits by *what requires physical hardware and an Apple
+Developer account* — not by headcount.
+
+### 8.1 Division of labour
+
+| Work | Owner | Why |
+|---|---|---|
+| `mlx-sys` fork: cmake iOS toolchain, metallib bundling, patch verification | Claude | Pure build engineering, verified by `cargo build --target aarch64-apple-ios` |
+| `runtime-ios` + `runtime-ios-ffi` crates, catalog surface tests, conformance wiring | Claude | Rust, verified by the repo's existing gates |
+| CI config (`select_lanes.py`, workflows, Tier 1/2) | Claude | Config plus the repo's own Python gates |
+| SwiftUI host app + XCTest target (§5.2b) | Claude drafts, you build and run | Claude can write Swift; only you can drive Xcode's GUI and a device |
+| Signing, provisioning, `com.apple.developer.kernel.increased-memory-limit` entitlement | **You only** | Apple Developer account. The entitlement needs a request to Apple — **start it in Phase 0**, its lead time is not under our control |
+| Device measurement: Instruments energy/thermals, jetsam behaviour, the real per-app cap | **You only** | Physical iPhone |
+| Self-hosted runner + tethered device (Tier 3) | **You only** | Hardware and network access |
+
+### 8.2 The actual bottleneck
+
+**Code throughput is not the constraint; device time and Apple provisioning are.** Every phase
+with a measurement exit criterion — Phase 0's energy/thermal rows, A2's memory tuning, T2's
+residency work, all of §9's published numbers — is gated on your hands-on time, not on how fast
+the Rust lands. Plan the schedule around your availability for device sessions.
+
+Two consequences worth acting on now:
+
+1. **Request the increased-memory-limit entitlement during Phase 0**, before it is needed. It
+   gates A2 and T2, and its turnaround is Apple's, not ours.
+2. **Batch device work.** A2 and T2 are both "load it, watch RSS, tune, repeat" — running them as
+   scheduled sessions rather than ad-hoc interrupts is materially faster.
+
+### 8.3 Timeline
 
 ```
         wk  0    2         5      7      9        11     13      16     18
 Phase 0 [====]                                                            2
 Lane A       [========][====][====]                                       7
               A1(3)    A2(2) A3(2)
-FFI                          [~~~~~]                                      2-3
+FFI+host                     [~~~~~~~]                                    3-5
 Track 2                            [====][====][=======][====]            9
                                     T1(2) T2(2)  T3(3)   T4(2)
 ```
 
-- **One engineer: ~20–22 weeks** end to end (text + tools + thinking + JSON + both image tracks).
-- **Two engineers: ~14–16 weeks** — the FFI layer (§5.2) and Track 2's T1/T2 parallelize cleanly
-  against A2/A3 once A1 lands the build.
-- **Text-only milestone at ~week 9–11**, shippable independently behind
-  `--no-default-features`.
+- **~18–20 weeks** end to end, with the code-side phases compressed against the §7 estimates and
+  the device-dependent ones unchanged.
+- **Text-only milestone at ~week 9–11**, shippable independently behind `--no-default-features`.
+- A1 is the serialization point: nothing else starts until `aarch64-apple-ios` builds.
 
-A1 is the serialization point: nothing else starts until `aarch64-apple-ios` builds.
+### 8.4 Development environment — verified ready
+
+Checked on the primary development machine, 2026-07-29:
+
+| Component | Status |
+|---|---|
+| macOS | 26.5.2 (arm64) — **above the 26.2 NAX floor**, so this host can exercise the fast path |
+| Xcode | 26.6 (17F113) |
+| iOS SDK | 26.5, device and simulator |
+| `aarch64-apple-ios` | installed |
+| `aarch64-apple-ios-sim` | installed (added for Tier 2) |
+| rustc | 1.96.0 — matches `rust-toolchain.toml` |
+| cmake | 4.3.4 |
+
+**Nothing needs installing to begin Phase 0.** This machine is also a viable Tier 2/Tier 3
+self-hosted runner host, which removes one dependency from §5.3 — it needs only a tethered device.
 
 ---
 
@@ -339,8 +394,17 @@ A1 is the serialization point: nothing else starts until `aarch64-apple-ios` bui
 
 ## 10. Open questions
 
-1. **Is there an existing Swift host app** this plugs into, or is §5.2 building the first one?
-2. **Device CI:** self-hosted Mac + tethered iPhone, or a cloud device farm?
-3. **One engineer or two?** §8 — the difference is roughly 20–22 weeks vs 14–16.
-4. **Is the text-only milestone at ~week 9–11 worth shipping independently**, or does v1 wait for
+**Resolved 2026-07-29:** no existing Swift host app — this project builds it (§5.2b). Team is one
+engineer plus Claude (§8.1). Development environment verified ready (§8.4).
+
+Still open:
+
+1. **Which iPhone(s) are the test devices?** The per-app memory cap and thermal envelope differ
+   enough across generations to change the model-size target. At minimum: the oldest device v1
+   must support, plus a current Pro.
+2. **Device CI:** this machine can host Tier 2/Tier 3 (§8.4) — is tethering a dedicated device to
+   it acceptable, or is a cloud device farm preferred?
+3. **Is the text-only milestone at ~week 9–11 worth shipping independently**, or does v1 wait for
    the image tracks?
+4. **Has the `com.apple.developer.kernel.increased-memory-limit` entitlement been requested?**
+   §8.2 — it gates A2 and T2 and its lead time is Apple's.
