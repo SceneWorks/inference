@@ -29,6 +29,9 @@ Documentation for the SceneWorks inference workspace.
 - **[iOS Project Spec](architecture/ios-project-spec.md)** — *draft.* The plan: a Phase 0
   feasibility spike on the `mlx-sys` iOS build, the `runtime-ios` bundle and Swift FFI layer, and
   the image-generation track (`mlx-gen-sana`, `mlx-gen-sensenova`). No contract-crate changes.
+- **[iOS Epic Breakdown](ios-epics.md)** — *draft.* The same plan cut into five epics for
+  tracking, drawn on distinct failure modes: toolchain, composition, device runtime, memory and
+  performance, image generation. Includes the stories per epic and what would change the count.
 
 ## Migration records
 
