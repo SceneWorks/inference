@@ -57,10 +57,10 @@ review path from anything else here — and it is the one epic with an external 
 
 | Story | Notes |
 |---|---|
-| S1.1 Land the mlx-rs iOS fixes upstream | [SceneWorks/mlx-rs#23](https://github.com/SceneWorks/mlx-rs/pull/23) — **open**. Narrows `qqmm_device`'s cfg; skips the macOS clang-runtime link off macOS. |
-| S1.2 Home the iOS deployment target in `.cargo/config.toml` | **Both halves**: rustc links at 10.0 by default (drops `___chkstk_darwin`), and MLX's C++ inherits `minos 26.2` from `MACOSX_DEPLOYMENT_TARGET`. Neither may rely on a command-line env var. |
-| S1.3 Bundle `mlx.metallib` into the `.app` | Today it is cached to `~/.cache/pmetal/lib`, meaningless in a sandbox. The `$PMETAL_METALLIB_PATH` / `set_metallib_path()` seam already exists. |
-| S1.4 Repoint the workspace at the fork | Update `PINNED_WORKSPACE_DEPENDENCIES` revs in `check-workspace.py` (rev + package alias are asserted; the git URL is not). Drop the fork if #23 merges. |
+| S1.1 Land the mlx-rs iOS fixes upstream | [SceneWorks/mlx-rs#23](https://github.com/SceneWorks/mlx-rs/pull/23) — **open**, three commits: `qqmm_device` cfg, target-aware clang runtime + cmake cross-compile + cache gating, and `ios-metal-sdk.patch`. |
+| S1.2 Home the iOS deployment target in `.cargo/config.toml` | **Partly done.** The *build-script* half is fixed in the fork (iOS 18.0 floor reaches cmake and the Metal compiler). The **rustc link** half is not: `cargo build --target aarch64-apple-ios` still links at `arm64-apple-ios10.0.0` and drops `___chkstk_darwin` unless `IPHONEOS_DEPLOYMENT_TARGET=18.0` is set. `build.rs`'s `env::set_var` cannot reach rustc — this needs `[env]` in `.cargo/config.toml`. |
+| S1.3 Bundle `mlx.metallib` into the `.app` | Today it is cached to `~/.cache/pmetal/lib`, meaningless in a sandbox. The `$PMETAL_METALLIB_PATH` / `set_metallib_path()` seam already exists. **The cross-build no longer poisons the macOS cache** (fixed), but bundling itself is outstanding. |
+| S1.4 Repoint the workspace at the fork | **Done** — pinned at `zakkeown/mlx-rs` @ `b3c0e27e`. The gate now asserts the **git URL** too (it previously did not, so a same-rev pin from another remote passed silently). Touched four files beyond the manifests: `bump_pins.py` hardcodes the URL and regex-parses gate entries, plus its tests. Revert the URL when #23 merges. |
 | S1.5 Tier 1 CI | `cargo build --target aarch64-apple-ios` + `clippy -D warnings` on hosted runners. Build regressions only. |
 | S1.6 Simulator target builds | `aarch64-apple-ios-sim`, required by E3's Tier 2. |
 
