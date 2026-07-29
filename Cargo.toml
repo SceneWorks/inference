@@ -44,8 +44,9 @@ mlx-gen-catalog = { path = "crates/media/mlx-gen/mlx-gen-catalog" }
 candle-gen-catalog = { path = "crates/media/candle-gen/candle-gen-catalog" }
 candle-audio-catalog = { path = "crates/audio/candle-audio-catalog" }
 
-# MLX fork pinned by commit SHA. rev b3c0e27e = 932beb4e (MLX 0.32.0 bump + pad/concat >i32::MAX
-# copy-gate fix + regenerated patches, epic 12742) + iOS target support.
+# MLX fork pinned by commit SHA. rev 62cc804e = 932beb4e (MLX 0.32.0 bump + pad/concat >i32::MAX
+# copy-gate fix + regenerated patches, epic 12742) + iOS target support + the DEP_MLX_METALLIB
+# packaging hook.
 # See crates/media/mlx-gen/Cargo.toml for the full SHA lineage.
 #
 # TEMPORARY FORK HOST (docs/architecture/ios-project-spec.md §2.3). The three iOS commits are
@@ -54,8 +55,8 @@ candle-audio-catalog = { path = "crates/audio/candle-audio-catalog" }
 # 932beb4e. Revert the URL to michaeltrefry/mlx-rs the moment #23 lands.
 # Do NOT delete the fork's `ios-support` branch while this pin stands: cargo fetches by ref, and
 # an unreachable commit would break every clean build.
-mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/zakkeown/mlx-rs", rev = "b3c0e27ecd321e992749451fbe18bf614caadcef" }
-mlx-sys = { package = "pmetal-mlx-sys", git = "https://github.com/zakkeown/mlx-rs", rev = "b3c0e27ecd321e992749451fbe18bf614caadcef" }
+mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/zakkeown/mlx-rs", rev = "62cc804e920b96f6df382b7b6e93d90da1c9ecc2" }
+mlx-sys = { package = "pmetal-mlx-sys", git = "https://github.com/zakkeown/mlx-rs", rev = "62cc804e920b96f6df382b7b6e93d90da1c9ecc2" }
 
 # Candle pins are shared by media and LLM providers.
 # Upstream PR #3531 removes O(groups) launches from unit-stride depthwise convs (sc-12111).

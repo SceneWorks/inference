@@ -43,8 +43,8 @@ CANDLE_GIT_URL = "https://github.com/huggingface/candle"
 # Revisions stay inline literals, one per entry: scripts/bump_pins.py rewrites them in place with
 # a regex, so a shared constant would hide the SHA from the bump tool.
 PINNED_WORKSPACE_DEPENDENCIES = {
-    "mlx-rs": ("pmetal-mlx-rs", "b3c0e27ecd321e992749451fbe18bf614caadcef", MLX_GIT_URL),
-    "mlx-sys": ("pmetal-mlx-sys", "b3c0e27ecd321e992749451fbe18bf614caadcef", MLX_GIT_URL),
+    "mlx-rs": ("pmetal-mlx-rs", "62cc804e920b96f6df382b7b6e93d90da1c9ecc2", MLX_GIT_URL),
+    "mlx-sys": ("pmetal-mlx-sys", "62cc804e920b96f6df382b7b6e93d90da1c9ecc2", MLX_GIT_URL),
     "candle-core": ("candle-core", "1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d", CANDLE_GIT_URL),
     "candle-nn": ("candle-nn", "1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d", CANDLE_GIT_URL),
     "candle-transformers": (

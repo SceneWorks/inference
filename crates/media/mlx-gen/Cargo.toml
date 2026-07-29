@@ -67,12 +67,22 @@
 # guard __builtin_available(macOS 15, iOS 18, *)). NAX fails safe on iOS: it needs Metal >=400 AND
 # MACOS_SDK_VERSION >=26.2, unset off macOS. Verified: metallib air64-apple-ios18.0.0 across all
 # 15,660 kernels, C++ objects platform iOS/minos 18.0, mlx-llm-server links Mach-O arm64.
-mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/zakkeown/mlx-rs", rev = "b3c0e27ecd321e992749451fbe18bf614caadcef" }
+# SHA 62cc804e = b3c0e27e + `links = "mlx"` on pmetal-mlx-sys plus a `cargo:metallib=<path>`
+# directive, which cargo forwards to dependents as DEP_MLX_METALLIB. Needed to PACKAGE an iOS app:
+# inside the sandbox only two links of the resolver chain are reachable — $PMETAL_METALLIB_PATH, or
+# mlx.metallib colocated with the executable — while ~/.cache/pmetal/lib is unreadable there and the
+# compiled-in METAL_PATH points into target/, which is not shipped. Without the path published, a
+# packaging step would have to guess at target/<triple>/<profile>/build/pmetal-mlx-sys-<hash>/,
+# where the hash is not stable. Consumed by scripts/ios/bundle_metallib.py. Build-metadata only —
+# no code, no macOS behavior change. NB `links` makes this crate the declared sole owner of the
+# native MLX libs, so a second crate claiming `links = "mlx"` would now be a resolver error (it
+# would already have been a symbol clash).
+mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/zakkeown/mlx-rs", rev = "62cc804e920b96f6df382b7b6e93d90da1c9ecc2" }
 # The mlx-sys C-binding layer (pmetal-mlx-sys), same git rev as mlx-rs's path dep so cargo unifies on
 # ONE build (two distinct sources would yield two `mlx_sys` crates → link/symbol drift). Added as a
 # direct core dep so core can query MLX device properties not surfaced through mlx-rs (sc-8135: the
 # Metal per-single-buffer cap `maxBufferLength`, via the `device_info` C API).
-mlx-sys = { package = "pmetal-mlx-sys", git = "https://github.com/zakkeown/mlx-rs", rev = "b3c0e27ecd321e992749451fbe18bf614caadcef" }
+mlx-sys = { package = "pmetal-mlx-sys", git = "https://github.com/zakkeown/mlx-rs", rev = "62cc804e920b96f6df382b7b6e93d90da1c9ecc2" }
 # Backend-neutral contract layer (epic 3720). Workspace member; mlx-gen re-exports it so the old
 # `mlx_gen::…` paths keep resolving. Family crates depend on it for `gen_core::Result` at the
 # contract boundary.
