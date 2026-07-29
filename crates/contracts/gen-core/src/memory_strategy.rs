@@ -168,8 +168,63 @@ impl MemoryStrategy {
     /// `Implemented` is not engaged, and the validator then stops requiring that rung's parameters
     /// instead of refusing the selection. A provider can therefore publish a verified cheaper
     /// composition without fighting the validator.
+    ///
+    /// # Rung 1 is excluded from the cost-order default (SC-15805)
+    ///
+    /// [`Self::StagedResidency`] is engaged **only** when the selection *is* rung 1, or when the
+    /// selection's declared [`requires`](Self::requires) graph names it. It is deliberately **not**
+    /// dragged in by cost order the way rungs 2 and 3 are, because the three are not the same kind
+    /// of thing:
+    ///
+    /// - Rungs 2 and 3 bound **scratch** — activations born and dying inside one request. Turning
+    ///   them on costs nothing a caller would decline, which is what makes a cumulative default
+    ///   harmless there.
+    /// - Rung 1 bounds **residency**, and per the epic engaging it *"may evict the warm
+    ///   cross-request cache"*. That is a real cost paid by the *next* request, so applying it by
+    ///   default to a selection that never needed it is a straight loss for zero benefit.
+    ///
+    /// This is also what SC-15805's own root cause says — *"bounding scratch is correct whether or
+    /// not a residency rung engaged"* — read in the other direction, and it is what the story's AC
+    /// states: *"cost-order defaults still apply (rung 4 engages 2 and 3)"*. The AC never says rung
+    /// 1.
+    ///
+    /// **The rung-4 edge still resolves.** Rung 4 engages rung 1 because
+    /// `BoundedTransformerResidency::requires()` names it, not because `1 <= 4` — so
+    /// [`MemoryProviderContract::validate_selection`]'s prerequisite walk is satisfied exactly as
+    /// before and rung 4 stays selectable. Deriving this from `requires()` rather than hardcoding
+    /// "rung 4" is the point: a future edge added to the graph implies its own engagement, with no
+    /// second place to update.
+    ///
+    /// [`Self::Resident`] remains engaged by every selection — it is the baseline, not an
+    /// optimization, and nothing reads it as a lever.
     pub const fn engages(self, rung: Self) -> bool {
-        (rung as u8) <= (self as u8)
+        match rung {
+            // The baseline. Unchanged: `(0 <= anything)` was always true.
+            Self::Resident => true,
+            // Residency-bounding, and not free — declared prerequisite or explicit selection only.
+            Self::StagedResidency => {
+                matches!(self, Self::StagedResidency) || self.requires_rung(Self::StagedResidency)
+            }
+            // Scratch-bounding and free: the plain cost-order default.
+            Self::BoundedDecode | Self::BoundedAttention | Self::BoundedTransformerResidency => {
+                (rung as u8) <= (self as u8)
+            }
+        }
+    }
+
+    /// Whether `self`'s declared prerequisite graph names `rung`.
+    ///
+    /// Kept as a `const fn` slice walk (rather than an iterator) so [`Self::engages`] stays `const`.
+    const fn requires_rung(self, rung: Self) -> bool {
+        let edges = self.requires();
+        let mut index = 0;
+        while index < edges.len() {
+            if edges[index].rung as u8 == rung as u8 {
+                return true;
+            }
+            index += 1;
+        }
+        false
     }
 }
 
@@ -1894,6 +1949,80 @@ mod tests {
             .expect("a structurally inapplicable prerequisite is vacuous, not fatal");
     }
 
+    /// SC-15805: rung 1 is NOT part of the cost-order default, but rung 4's declared edge still
+    /// engages it.
+    ///
+    /// Rungs 2 and 3 bound scratch and are free, so a cumulative default costs the caller nothing.
+    /// Rung 1 bounds residency and *"may evict the warm cross-request cache"* — a real cost paid by
+    /// the next request. Dragging it into a rung-2 selection that never needed it is a straight loss.
+    ///
+    /// The regression this guards is severe and non-obvious: `engages` is what SATISFIES rung 4's
+    /// prerequisite in `validate_selection`, so the naive fix — excluding rung 1 from `engages`
+    /// outright — makes rung 4 **permanently unselectable**. Rung 1 is therefore engaged when the
+    /// selection IS rung 1, or when the selection's `requires()` graph names it (derived from the
+    /// graph, not hardcoded to rung 4, so a future edge implies its own engagement).
+    #[test]
+    fn rung_one_is_not_dragged_in_by_cost_order_but_the_rung_four_edge_still_engages_it() {
+        // 1. The behavior chosen here: a free scratch rung does not drag in the costly residency one.
+        assert!(
+            !MemoryStrategy::BoundedDecode.engages(MemoryStrategy::StagedResidency),
+            "rung 2 bounds scratch and must not evict the warm cache by engaging rung 1"
+        );
+        assert!(
+            !MemoryStrategy::BoundedAttention.engages(MemoryStrategy::StagedResidency),
+            "rung 3 bounds scratch and must not evict the warm cache by engaging rung 1"
+        );
+        assert!(!MemoryStrategy::Resident.engages(MemoryStrategy::StagedResidency));
+
+        // 2. THE REGRESSION GUARD. Rung 4 declares rung 1 as a prerequisite, so it engages it — and
+        //    `validate_selection` therefore still admits rung 4 on a provider that implements rung 1.
+        assert!(
+            MemoryStrategy::BoundedTransformerResidency.engages(MemoryStrategy::StagedResidency),
+            "rung 4's declared prerequisite must keep engaging rung 1, or rung 4 becomes \
+             permanently unselectable"
+        );
+        assert!(MemoryStrategy::StagedResidency.engages(MemoryStrategy::StagedResidency));
+        // Engagement follows the DECLARED graph, so the two agree by construction rather than by a
+        // hardcoded `BoundedTransformerResidency` arm that could drift away from `requires()`.
+        for strategy in MemoryStrategy::ALL {
+            let declared = strategy
+                .requires()
+                .iter()
+                .any(|edge| edge.rung == MemoryStrategy::StagedResidency);
+            assert_eq!(
+                strategy.engages(MemoryStrategy::StagedResidency),
+                declared || strategy == MemoryStrategy::StagedResidency,
+                "{strategy:?}'s rung-1 engagement drifted from its declared prerequisite graph"
+            );
+        }
+        // End to end: rung 4 is still selectable on a provider implementing every rung.
+        adopted_contract()
+            .validate_selection(&MemorySelection {
+                strategy: MemoryStrategy::BoundedTransformerResidency,
+                parameters: MemoryStrategyParameters {
+                    decode_tile_edge: Some(512),
+                    decode_overlap: Some(64),
+                    attention_chunk_size: Some(256),
+                    transformer_window_size: Some(1),
+                    transformer_window_component: None,
+                },
+                tier: bf16(),
+            })
+            .expect("rung 4 must remain selectable after rung 1 left the cost-order default");
+
+        // 3. The AC's stated cost-order default is untouched: rung 4 still engages 2 and 3.
+        assert!(MemoryStrategy::BoundedTransformerResidency.engages(MemoryStrategy::BoundedDecode));
+        assert!(
+            MemoryStrategy::BoundedTransformerResidency.engages(MemoryStrategy::BoundedAttention)
+        );
+        assert!(MemoryStrategy::BoundedAttention.engages(MemoryStrategy::BoundedDecode));
+        assert!(!MemoryStrategy::BoundedDecode.engages(MemoryStrategy::BoundedAttention));
+        // Rung 0 stays engaged by everything — baseline, not a lever.
+        for strategy in MemoryStrategy::ALL {
+            assert!(strategy.engages(MemoryStrategy::Resident), "{strategy:?}");
+        }
+    }
+
     /// The cost-order default is engagement, is defeasible, and is NOT the prerequisite graph.
     ///
     /// A provider that publishes a cheaper verified composition — rung 4 without rung 2 — must not
@@ -1901,7 +2030,9 @@ mod tests {
     /// become irrelevant rather than required.
     #[test]
     fn the_cost_order_default_is_defeasible_selector_policy_not_a_dependency() {
-        // Pure policy: a deeper selection engages every cheaper rung, and never the reverse.
+        // Pure policy: a deeper selection engages every cheaper SCRATCH rung, and never the reverse.
+        // (Rung 1 is deliberately outside this default — see
+        // `rung_one_is_not_dragged_in_by_cost_order_but_the_rung_four_edge_still_engages_it`.)
         assert!(MemoryStrategy::BoundedTransformerResidency.engages(MemoryStrategy::BoundedDecode));
         assert!(MemoryStrategy::BoundedTransformerResidency.engages(MemoryStrategy::Resident));
         assert!(MemoryStrategy::BoundedDecode.engages(MemoryStrategy::BoundedDecode));
