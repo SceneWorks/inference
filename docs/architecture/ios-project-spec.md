@@ -137,28 +137,49 @@ This also corrects a claim in an earlier draft: build scripts compile for the *h
 setup, they mis-configure it. The remedy is branching on `CARGO_CFG_TARGET_OS` / `TARGET`, not
 removing the gates.
 
-**(2) Possibly not iOS-specific at all — under investigation.**
+**(2) A latent bug in the fork's non-macOS path — diagnosed, and trivial.**
 
 ```
 error[E0061]: this function takes 10 arguments but 8 arguments were supplied
   mlx-rs/src/ops/quantization.rs:280   mlx_sys::mlx_qqmm(…)
 ```
 
-The generated bindings declare `mlx_qqmm` with ten parameters (including `global_scale_x` /
-`global_scale_w`); `mlx-rs`'s call site passes eight. **All ten cached host binding sets carry the
-identical ten-parameter signature**, so this is not an artefact of the iOS staging. The open
-question is whether a *clean* host build hits the same error — i.e. whether the pinned
-`pmetal-mlx-rs` rev is currently green only from cache. A clean
-`--target aarch64-apple-darwin` build is running to settle it.
+Diagnosed rather than guessed at, in three steps:
 
-- If the clean host build **fails identically**, this is a pre-existing defect in the pinned rev,
-  it blocks fresh clones and CI as much as iOS, and it is upstream work — not iOS scope.
-- If the clean host build **succeeds**, something in the iOS path regenerates different bindings,
-  and it belongs to A1.
+1. A clean `--target aarch64-apple-darwin` build in a fresh target directory **succeeds**
+   (2m59s), so the pinned rev is not broken in general and is not merely green from cache.
+2. The generated `mlx_qqmm` bindings are **byte-identical** between the darwin and iOS target
+   directories — ten parameters in both. So this is not a bindgen or staging difference.
+3. The call site sits inside `qqmm_device`, gated **`#[cfg(not(target_os = "macos"))]`**
+   (`quantization.rs:253`). Its own doc comment says: *"only supported on GPU with the CUDA
+   backend (Linux with NVIDIA GPU). It is not available on macOS."*
 
-**Read-through:** the headline is positive. The iOS blocker list is shorter and more mechanical
-than the static read suggested — no missing Metal support, no architectural obstacle, no
-unbuildable C++. R1's likelihood drops accordingly.
+So the function is **dead code on macOS and has silently rotted** — its call site was never
+updated when `mlx_qqmm` gained `global_scale_x` / `global_scale_w`. iOS is also
+`not(target_os = "macos")`, so the gate lets it compile on a platform that has no CUDA backend at
+all.
+
+**The correct fix is to narrow the cfg, not to add two arguments.** `not(macos)` was written to
+mean "Linux/CUDA"; it should say so (`target_os = "linux"`, or a CUDA feature gate). On iOS this
+function is meaningless and should not be compiled. Small, obviously correct, and **the first
+thing to send upstream to `pmetal-mlx-rs`** — it is a latent defect for any non-macOS,
+non-Linux target, not something iOS introduced.
+
+### 2.2 Phase 0 blocker list — current
+
+| # | Blocker | Scope | Size |
+|---|---|---|---|
+| 1 | `qqmm_device`'s `cfg(not(target_os = "macos"))` catches iOS for a CUDA-only function | `mlx-rs` | **Trivial** — narrow the gate. Upstreamable. |
+| 2 | `find_clang_runtime_lib` unconditionally selects `libclang_rt.osx.a` | `mlx-sys/build.rs` | **Small** — target-aware selection. |
+| 3 | `mlx.metallib` cached to `~/.cache/pmetal/lib` instead of bundled into the `.app` | `mlx-sys/build.rs` + packaging | **Moderate** — the resolver seam (`$PMETAL_METALLIB_PATH`) already exists. |
+
+**None is architectural.** No missing Metal support, no unbuildable C++, no absent iOS
+capability. The static analysis over-estimated this: **R1's likelihood drops from Low to Very
+Low**, and A1's three-week estimate now looks conservative rather than optimistic.
+
+The remaining unknown is no longer *whether* it builds, but what happens at runtime — the
+metallib resolution on a real device, and the memory/energy numbers. Those still need the
+device.
 
 ### If Phase 0 fails
 
@@ -351,7 +372,7 @@ precisely what a CoreML text lane would have broken.
 
 | # | Risk | L | I | Mitigation |
 |---|---|---|---|---|
-| R1 | **`mlx-sys` cannot be built for iOS** | L | **Critical** | The whole point of Phase 0. Fallback §3 — escalate, do not absorb. |
+| R1 | **`mlx-sys` cannot be built for iOS** | **VL** | **Critical** | Largely retired by §2.1/§2.2: the build reaches the final link with three known, non-architectural blockers. Fallback §3 remains if a runtime blocker appears on device. |
 | R2 | Per-app memory cap tighter than the reported ~6 GB | M | H | Measured in Phase 0. Conclusion holds at 4 GB: ~3–4B at 4-bit. |
 | R3 | mlx-sys iOS fork drifts from upstream | H | M | Keep the delta additive; attempt upstreaming in A1. |
 | R4 | Threading contract violated by the Swift host | M | H | Documented ownership rule + hostile-threading test in A2 (§4.1). |
