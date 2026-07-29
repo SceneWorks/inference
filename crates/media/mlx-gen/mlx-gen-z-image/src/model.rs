@@ -329,7 +329,10 @@ pub(crate) fn build_residency(
         spec.offload_policy,
         move || {
             let root = resolve_precision_and_root(&spec_text, precision_msg, file_msg)?;
-            load_text_encoder_only(root, spec_text.quantize)
+            // Rung 4's encoder stream only bounds anything when the encoder is loaded and dropped
+            // per phase; under `Resident` it would cost ~2x per encode and bound nothing.
+            let streamable = matches!(spec_text.offload_policy, OffloadPolicy::Sequential);
+            load_text_encoder_only(root, spec_text.quantize, streamable)
         },
         move |use_pid| {
             let root = resolve_precision_and_root(&spec_heavy, precision_msg, file_msg)?;
@@ -364,8 +367,20 @@ fn resolve_precision_and_root<'a>(
 /// Load the Qwen text encoder (+ optional whole-model Q4/Q8), the phase-A component dropped first
 /// under `Sequential`. Q4/Q8 is `group_size 64` over every quantizable Linear + the token Embedding
 /// (sc-2532); factored out so the `Resident` and `Sequential` paths build byte-identical encoders.
-fn load_text_encoder_only(root: &Path, quant: Option<Quant>) -> Result<TextEncoder> {
-    let mut text_encoder = loader::load_text_encoder(root)?;
+/// `streamable` builds the rung-4 text-encoder stream (SC-15794). It is passed `true` ONLY for the
+/// `Sequential` branch: under `Resident` the encoder is held across requests, so a streamed stack
+/// would re-materialize all 36 layers per encode and bound nothing (~2x slower — see
+/// [`loader::load_text_encoder_streamable`]).
+fn load_text_encoder_only(
+    root: &Path,
+    quant: Option<Quant>,
+    streamable: bool,
+) -> Result<TextEncoder> {
+    let mut text_encoder = if streamable {
+        loader::load_text_encoder_streamable(root)?
+    } else {
+        loader::load_text_encoder(root)?
+    };
     if let Some(q) = quant {
         text_encoder.quantize(q.bits())?;
     }
@@ -510,6 +525,10 @@ impl ZImageTurbo {
         // silently degraded (see `pipeline::resolve_block_window`).
         let block_window =
             pipeline::resolve_block_window(req, self.residency.is_sequential(), MODEL_ID)?;
+        // Rung 4, text-encoder scope (SC-15794): None unless the request names a component scope that
+        // includes the encoder, so an unscoped request conditions exactly as before.
+        let encoder_window =
+            pipeline::EncoderWindow::resolve(req, self.residency.is_sequential(), MODEL_ID)?;
         let images = self.residency.run_staged(
             &req.cancel,
             req.use_pid,
@@ -526,8 +545,13 @@ impl ZImageTurbo {
                     mlx_gen::gen_core::ImageMemoryPhase::Conditioning,
                     MODEL_ID,
                 )?;
-                let cap =
-                    pipeline::encode_prompt(&self.tokenizer, text_encoder, &req.prompt, MODEL_ID)?;
+                let cap = pipeline::encode_prompt(
+                    &self.tokenizer,
+                    text_encoder,
+                    &req.prompt,
+                    MODEL_ID,
+                    encoder_window,
+                )?;
                 if is_img2img {
                     Ok(cap)
                 } else {

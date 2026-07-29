@@ -32,7 +32,10 @@
 //! contract's SHAPE (there is a point at which the carried state must be made real before the window
 //! goes away), while whether a given backend needs it, and why, is that backend's question to answer
 //! by measurement. Carrying a twin backend's *mechanism* across is how rung 3 came to be assumed
-//! worth ~6× what it actually was on MLX.
+//! worth roughly an order of magnitude more on MLX than it actually is: measured like-for-like on the
+//! denoise phase it is −32% on Candle against −1.7% here (SC-15793 — an earlier note put the gap at
+//! "~6×" by comparing Candle's denoise-phase figure with MLX's whole-request one; see
+//! [`crate::attention_budget`] for the corrected table).
 //!
 //! Likewise the MLX figures above are MLX figures. They establish that the shape works; they say
 //! nothing about what any other backend will measure.

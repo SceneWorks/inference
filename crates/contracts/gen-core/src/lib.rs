@@ -81,7 +81,7 @@ pub use image_memory::{
     ImageMemoryRunContext, ImageMemoryRunOutcome, ImageMemoryRuntimeSemantics,
     ImageMemorySafetyDecision, ImageMemorySelection, ImageMemoryStrategy,
     ImageMemoryStrategyCapability, ImageMemoryStrategyParameters, ImageMemoryStrategySupport,
-    ImageMemoryWarmRunSemantics, IMAGE_MEMORY_CALIBRATION_ABI,
+    ImageMemoryWarmRunSemantics, TransformerComponent, IMAGE_MEMORY_CALIBRATION_ABI,
 };
 pub use json_constraint::JsonState;
 pub use license::{weight_licenses_manifest_json, WeightLicense, WeightLicenseEntry};

@@ -67,6 +67,42 @@ pub struct ImageMemoryStrategyCapability {
     pub parameters: ImageMemoryParameterRanges,
 }
 
+/// Which transformer(s) rung 4's block window applies to (SC-15794).
+///
+/// Rung 4 is defined as *"only an active transformer block or bounded block window is
+/// wired/materialized at once"* — which says nothing about **which** transformer. It was implemented
+/// for the DiT by convention, not by definition, and a text encoder is a transformer. This is a
+/// **scope on rung 4, not a new rung**: a fifth rung would cost new conformance cells across every
+/// catalog entry, new contract vocabulary, and an incoherent cost ordering (there is no sensible
+/// request that wants rung 5 without rung 4).
+///
+/// Ordered cheapest-scope-first so a selector can widen the scope monotonically.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum TransformerComponent {
+    /// The denoising transformer only — rung 4's original by-convention scope, and the default so an
+    /// existing provider's behaviour is unchanged until it declares otherwise.
+    #[default]
+    Dit,
+    /// The text encoder only. Worth scoping separately because the encoder re-materializes **once per
+    /// generation** while the DiT re-materializes once per step, so the two have very different
+    /// cost sides for the same mechanism.
+    TextEncoder,
+    /// Both transformers stream.
+    Both,
+}
+
+impl TransformerComponent {
+    /// Whether this scope streams the denoising transformer.
+    pub const fn includes_dit(self) -> bool {
+        matches!(self, Self::Dit | Self::Both)
+    }
+
+    /// Whether this scope streams the text encoder.
+    pub const fn includes_text_encoder(self) -> bool {
+        matches!(self, Self::TextEncoder | Self::Both)
+    }
+}
+
 /// Production parameter domains. The values are candidates, not calibration evidence.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ImageMemoryParameterRanges {
@@ -74,6 +110,9 @@ pub struct ImageMemoryParameterRanges {
     pub decode_overlaps: Vec<u32>,
     pub attention_chunk_sizes: Vec<u32>,
     pub transformer_window_sizes: Vec<u32>,
+    /// Component scopes the provider actually implements for rung 4 (SC-15794). Empty means the
+    /// provider streams only the DiT, which is how every pre-SC-15794 provider behaves.
+    pub transformer_window_components: Vec<TransformerComponent>,
 }
 
 /// Concrete parameters selected for one request.
@@ -83,6 +122,16 @@ pub struct ImageMemoryStrategyParameters {
     pub decode_overlap: Option<u32>,
     pub attention_chunk_size: Option<u32>,
     pub transformer_window_size: Option<u32>,
+    /// Which transformer(s) the window applies to. `None` ⇒ [`TransformerComponent::Dit`], so a
+    /// selection written before SC-15794 keeps its exact previous meaning.
+    pub transformer_window_component: Option<TransformerComponent>,
+}
+
+impl ImageMemoryStrategyParameters {
+    /// The effective rung-4 component scope: the declared one, or the DiT-only default.
+    pub fn window_component(&self) -> TransformerComponent {
+        self.transformer_window_component.unwrap_or_default()
+    }
 }
 
 /// Provider lifecycle phases whose scarce backend residency may be separated.
@@ -481,6 +530,25 @@ fn validate_owned_parameter_domain(
             capability.strategy
         ));
     }
+    // The component scope is owned by the same rung as the window it scopes (SC-15794). It is
+    // deliberately allowed to be empty on an implementing provider — that reads as the pre-SC-15794
+    // DiT-only behaviour rather than as an incomplete declaration, so existing providers stay valid.
+    if !transformer && !ranges.transformer_window_components.is_empty() {
+        errors.push(format!(
+            "{:?} must not own transformer-window component candidates",
+            capability.strategy
+        ));
+    }
+    let components = &ranges.transformer_window_components;
+    let mut unique = components.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    if unique.len() != components.len() {
+        errors.push(format!(
+            "{:?} transformer_window_components contains duplicate candidates",
+            capability.strategy
+        ));
+    }
 }
 
 fn validate_selected_parameters(
@@ -540,6 +608,40 @@ fn validate_selected_parameters(
             .map(|capability| capability.parameters.transformer_window_sizes.as_slice())
             .unwrap_or_default(),
     )?;
+    // The component scope (SC-15794) is validated separately from the numeric parameters: unlike a
+    // tile edge or a window size it has a meaningful DEFAULT (DiT-only), so `None` is legal at every
+    // rung and only an explicitly-declared scope is checked. That keeps a pre-SC-15794 selection —
+    // which cannot carry a component — valid rather than retroactively incomplete.
+    if let Some(component) = selected.transformer_window_component {
+        if !requires_transformer {
+            return Err(format!(
+                "transformer_window_component={component:?} is irrelevant below its owning strategy \
+                 rung"
+            ));
+        }
+        let allowed = contract
+            .capability(ImageMemoryStrategy::BoundedTransformerResidency)
+            .map(|capability| {
+                capability
+                    .parameters
+                    .transformer_window_components
+                    .as_slice()
+            })
+            .unwrap_or_default();
+        // An empty declaration means the provider implements the DiT-only default and nothing else,
+        // so that is the one scope a request may still name explicitly.
+        let permitted = if allowed.is_empty() {
+            component == TransformerComponent::Dit
+        } else {
+            allowed.contains(&component)
+        };
+        if !permitted {
+            return Err(format!(
+                "transformer_window_component={component:?} is outside the declared production \
+                 candidates {allowed:?}"
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -1152,6 +1254,7 @@ mod tests {
                 decode_overlap: Some(64),
                 attention_chunk_size: Some(128),
                 transformer_window_size: None,
+                transformer_window_component: None,
             },
             tier,
         };
@@ -1247,6 +1350,151 @@ mod tests {
         assert_eq!(
             evidence.optimized_eligibility(&contract),
             Err(ImageMemoryEvidenceVerdict::Unverified)
+        );
+    }
+    /// SC-15794: the component scope's accessors and its DiT-only default.
+    ///
+    /// The default is the whole backward-compatibility story — every provider and every selection
+    /// written before this type existed must keep meaning "stream the DiT", so `None` resolving to
+    /// anything else would silently re-scope work already in production.
+    #[test]
+    fn the_transformer_component_defaults_to_dit_and_reports_its_membership() {
+        assert_eq!(TransformerComponent::default(), TransformerComponent::Dit);
+        assert_eq!(
+            ImageMemoryStrategyParameters::default().window_component(),
+            TransformerComponent::Dit
+        );
+        let explicit = ImageMemoryStrategyParameters {
+            transformer_window_component: Some(TransformerComponent::TextEncoder),
+            ..Default::default()
+        };
+        assert_eq!(
+            explicit.window_component(),
+            TransformerComponent::TextEncoder
+        );
+
+        // Membership, asserted per variant rather than via a loop so a swapped pair cannot pass.
+        assert!(TransformerComponent::Dit.includes_dit());
+        assert!(!TransformerComponent::Dit.includes_text_encoder());
+        assert!(!TransformerComponent::TextEncoder.includes_dit());
+        assert!(TransformerComponent::TextEncoder.includes_text_encoder());
+        assert!(TransformerComponent::Both.includes_dit());
+        assert!(TransformerComponent::Both.includes_text_encoder());
+    }
+
+    /// The selected scope is validated against what the provider actually declared — the check that
+    /// stops a selector asking for an encoder stream from a provider that only implements the DiT.
+    #[test]
+    fn a_selected_component_must_be_one_the_provider_declared() {
+        let contract = |components: Vec<TransformerComponent>| {
+            let mut c = adopted_contract();
+            let rung4 = c
+                .strategies
+                .iter_mut()
+                .find(|s| s.strategy == ImageMemoryStrategy::BoundedTransformerResidency)
+                .expect("rung 4 capability");
+            rung4.parameters.transformer_window_sizes = vec![1];
+            rung4.parameters.transformer_window_components = components;
+            c
+        };
+        let select = |component| ImageMemorySelection {
+            strategy: ImageMemoryStrategy::BoundedTransformerResidency,
+            parameters: ImageMemoryStrategyParameters {
+                // Rung 4 is cumulative, so the lower rungs' parameters are required too; these are
+                // `adopted_contract`'s own declared candidates.
+                decode_tile_edge: Some(512),
+                decode_overlap: Some(64),
+                attention_chunk_size: Some(256),
+                transformer_window_size: Some(1),
+                transformer_window_component: Some(component),
+            },
+            tier: ImageMemoryNumericTier {
+                precision: Precision::Bf16,
+                quant: None,
+            },
+        };
+
+        let dit_only = contract(vec![TransformerComponent::Dit]);
+        assert!(
+            validate_selected_parameters(&select(TransformerComponent::Dit), &dit_only).is_ok()
+        );
+        let err =
+            validate_selected_parameters(&select(TransformerComponent::TextEncoder), &dit_only)
+                .expect_err(
+                    "a provider that declares only Dit must reject a TextEncoder selection",
+                );
+        assert!(err.contains("TextEncoder"), "{err}");
+
+        // An empty declaration means DiT-only, so DiT is still selectable and nothing else is.
+        let empty = contract(Vec::new());
+        assert!(validate_selected_parameters(&select(TransformerComponent::Dit), &empty).is_ok());
+        assert!(validate_selected_parameters(&select(TransformerComponent::Both), &empty).is_err());
+
+        // A provider that declares the encoder scope accepts it.
+        let both = contract(vec![TransformerComponent::Dit, TransformerComponent::Both]);
+        assert!(validate_selected_parameters(&select(TransformerComponent::Both), &both).is_ok());
+    }
+
+    /// A provider may only own component candidates on the rung that owns the window they scope.
+    #[test]
+    fn only_rung_four_may_own_component_candidates() {
+        let with_components = |strategy| ImageMemoryStrategyCapability {
+            strategy,
+            support: ImageMemoryStrategySupport::Implemented,
+            parameters: ImageMemoryParameterRanges {
+                transformer_window_components: vec![TransformerComponent::Both],
+                ..Default::default()
+            },
+        };
+        let mut errors = Vec::new();
+        validate_owned_parameter_domain(
+            &with_components(ImageMemoryStrategy::BoundedDecode),
+            &mut errors,
+        );
+        assert!(
+            errors.iter().any(|e| e.contains("component candidates")),
+            "a non-rung-4 strategy owning component candidates must be rejected, got {errors:?}"
+        );
+
+        // Duplicates are a declaration bug the selector would silently tolerate.
+        let mut errors = Vec::new();
+        validate_owned_parameter_domain(
+            &ImageMemoryStrategyCapability {
+                strategy: ImageMemoryStrategy::BoundedTransformerResidency,
+                support: ImageMemoryStrategySupport::Implemented,
+                parameters: ImageMemoryParameterRanges {
+                    transformer_window_sizes: vec![1],
+                    transformer_window_components: vec![
+                        TransformerComponent::Dit,
+                        TransformerComponent::Dit,
+                    ],
+                    ..Default::default()
+                },
+            },
+            &mut errors,
+        );
+        assert!(
+            errors.iter().any(|e| e.contains("duplicate")),
+            "duplicate component candidates must be rejected, got {errors:?}"
+        );
+
+        // An EMPTY declaration is legal and means DiT-only — that is what keeps every pre-SC-15794
+        // provider valid rather than retroactively incomplete.
+        let mut errors = Vec::new();
+        validate_owned_parameter_domain(
+            &ImageMemoryStrategyCapability {
+                strategy: ImageMemoryStrategy::BoundedTransformerResidency,
+                support: ImageMemoryStrategySupport::Implemented,
+                parameters: ImageMemoryParameterRanges {
+                    transformer_window_sizes: vec![1],
+                    ..Default::default()
+                },
+            },
+            &mut errors,
+        );
+        assert!(
+            errors.is_empty(),
+            "an empty component declaration must be legal, got {errors:?}"
         );
     }
 }

@@ -233,6 +233,10 @@ impl ZImage {
         // silently degraded (see `pipeline::resolve_block_window`).
         let block_window =
             pipeline::resolve_block_window(req, self.residency.is_sequential(), MODEL_ID)?;
+        // Rung 4, text-encoder scope (SC-15794): None unless the request names a component scope that
+        // includes the encoder, so an unscoped request conditions exactly as before.
+        let encoder_window =
+            pipeline::EncoderWindow::resolve(req, self.residency.is_sequential(), MODEL_ID)?;
         let images = self.residency.run_staged(
             &req.cancel,
             req.use_pid,
@@ -248,14 +252,24 @@ impl ZImage {
                     mlx_gen::gen_core::ImageMemoryPhase::Conditioning,
                     MODEL_ID,
                 )?;
-                let cap =
-                    pipeline::encode_prompt(&self.tokenizer, text_encoder, &req.prompt, MODEL_ID)?;
+                let cap = pipeline::encode_prompt(
+                    &self.tokenizer,
+                    text_encoder,
+                    &req.prompt,
+                    MODEL_ID,
+                    encoder_window,
+                )?;
                 // Uncond conditioning = the negative prompt (empty string when unset), encoded only
                 // when CFG is active. Empty prompt is valid for the negative branch (the
                 // unconditional embedding).
                 let neg_cap = if cfg_on {
                     let neg = req.negative_prompt.as_deref().unwrap_or("");
-                    Some(pipeline::encode_uncond(&self.tokenizer, text_encoder, neg)?)
+                    Some(pipeline::encode_uncond(
+                        &self.tokenizer,
+                        text_encoder,
+                        neg,
+                        encoder_window,
+                    )?)
                 } else {
                     None
                 };
