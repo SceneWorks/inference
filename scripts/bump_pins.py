@@ -62,7 +62,10 @@ class PinGroup:
 PIN_GROUPS = {
     "mlx": PinGroup(
         key="mlx",
-        git="https://github.com/michaeltrefry/mlx-rs",
+        # TEMPORARY fork host carrying iOS support (docs/architecture/ios-project-spec.md §2.3,
+        # upstream PR SceneWorks/mlx-rs#23). Revert to https://github.com/michaeltrefry/mlx-rs
+        # when that merges -- and keep this in step with MLX_GIT_URL in check-workspace.py.
+        git="https://github.com/zakkeown/mlx-rs",
         manifest_deps=("mlx-rs", "mlx-sys"),
         lock_packages=("pmetal-mlx-rs", "pmetal-mlx-sys"),
     ),
@@ -94,7 +97,9 @@ def _dep_rev_pattern(dep: str) -> re.Pattern[str]:
 
 
 def _gate_rev_pattern(dep: str) -> re.Pattern[str]:
-    # Match the gate's `"<dep>": ("<package>", "<40hex>"),` entry, capturing the SHA.
+    # Match the gate's `"<dep>": ("<package>", "<40hex>", <URL>),` entry, capturing the SHA.
+    # Since the URL column was added the entry may wrap across lines, so allow whitespace
+    # (including newlines) around the package alias -- `.` is not used, so no DOTALL needed.
     return re.compile(
         rf'(?P<head>"{re.escape(dep)}"\s*:\s*\(\s*"[^"]+"\s*,\s*")(?P<rev>{ANY_SHA})(?P<tail>")'
     )

@@ -45,12 +45,34 @@
 # mlx-c stays 0.6.0 with the fft-FFTNorm patch carried forward (0.32.0's fft.h still declares FFTNorm
 # before the stream arg). Parity re-baseline vs 0.31.2 = 1-2 ULP f32 bug-fix drift only (sc-12744/sc-12747);
 # RNG + softmax bit-identical. Guarded by mlx-gen-qwen-image/tests/{bf16_matmul_sweep,sdpa_nax_repro}.
-mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/michaeltrefry/mlx-rs", rev = "932beb4e60db44d378ffa1fe648defea59b5cbd0" }
+# SHA b3c0e27e = 932beb4e + iOS target support (epic: on-device inference for iPhone,
+# docs/architecture/ios-project-spec.md). Three commits, all inert on macOS — every change is
+# behind a target check, so the macOS build is byte-unaffected and no parity re-baseline is
+# needed. (a) qqmm_device was gated cfg(not(target_os = "macos")), which also matched iOS/tvOS/
+# watchOS — Apple targets with no CUDA backend, which the fn's own doc says it requires; narrowed
+# to linux, and its stale mlx_qqmm call (8 of 10 args since the 0.32.0 bump) fixed. (b) build.rs
+# resolves the deployment target per-platform (IPHONEOS_DEPLOYMENT_TARGET, floored at iOS 18.0 =
+# Metal 320) and passes CMAKE_SYSTEM_NAME/CMAKE_OSX_ARCHITECTURES when cross-compiling; the
+# libclang_rt.osx.a link is now macOS-only (an iOS binary rejects it), and the ~/.cache/pmetal/lib
+# metallib write is macOS-only so a cross-build can no longer overwrite the host's metallib with
+# another platform's kernels — that cache is the SOLE resolution for local cargo test/run binaries
+# (sc-7889), so poisoning it silently broke subsequent macOS runs. (c) NEW
+# mlx-sys/patches/ios-metal-sdk.patch (4th required patch): MLX's kernel rules hardcode
+# `xcrun -sdk macosx metal` + -mmacosx-version-min, so a CMAKE_SYSTEM_NAME=iOS build still emitted
+# a macOS metallib — it linked clean and would have failed on device. The patch selects SDK and
+# version-min by platform at all three sites and adds an iOS arm to the root MLX_METAL_VERSION
+# probe (falling through to 0 would drop every version-gated kernel). iOS floor is 18.0 because
+# iOS 16=Metal 300 / 17=310 / 18=320 and MLX's own macOS 14.0 floor IS 310, so 16 sits below the
+# baseline its kernels assume; 18.0 also keeps `fence` coherent (built only at >=320, runtime
+# guard __builtin_available(macOS 15, iOS 18, *)). NAX fails safe on iOS: it needs Metal >=400 AND
+# MACOS_SDK_VERSION >=26.2, unset off macOS. Verified: metallib air64-apple-ios18.0.0 across all
+# 15,660 kernels, C++ objects platform iOS/minos 18.0, mlx-llm-server links Mach-O arm64.
+mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/zakkeown/mlx-rs", rev = "b3c0e27ecd321e992749451fbe18bf614caadcef" }
 # The mlx-sys C-binding layer (pmetal-mlx-sys), same git rev as mlx-rs's path dep so cargo unifies on
 # ONE build (two distinct sources would yield two `mlx_sys` crates → link/symbol drift). Added as a
 # direct core dep so core can query MLX device properties not surfaced through mlx-rs (sc-8135: the
 # Metal per-single-buffer cap `maxBufferLength`, via the `device_info` C API).
-mlx-sys = { package = "pmetal-mlx-sys", git = "https://github.com/michaeltrefry/mlx-rs", rev = "932beb4e60db44d378ffa1fe648defea59b5cbd0" }
+mlx-sys = { package = "pmetal-mlx-sys", git = "https://github.com/zakkeown/mlx-rs", rev = "b3c0e27ecd321e992749451fbe18bf614caadcef" }
 # Backend-neutral contract layer (epic 3720). Workspace member; mlx-gen re-exports it so the old
 # `mlx_gen::…` paths keep resolving. Family crates depend on it for `gen_core::Result` at the
 # contract boundary.

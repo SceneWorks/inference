@@ -32,17 +32,35 @@ INTERNAL_PACKAGES = {
     "runtime-cpu",
     "runtime-cuda",
 }
+# (package alias, git rev, git url). The URL is asserted, not just the rev: the mlx pin
+# currently points at a TEMPORARY fork carrying iOS support
+# (docs/architecture/ios-project-spec.md §2.3, upstream PR SceneWorks/mlx-rs#23). Without a URL
+# assertion, a same-rev pin silently sourced from a different remote would pass — and the whole
+# point of pinning a fork is knowing exactly whose fork it is. Revert MLX_GIT_URL to
+# https://github.com/michaeltrefry/mlx-rs when #23 merges.
+MLX_GIT_URL = "https://github.com/zakkeown/mlx-rs"
+CANDLE_GIT_URL = "https://github.com/huggingface/candle"
+# Revisions stay inline literals, one per entry: scripts/bump_pins.py rewrites them in place with
+# a regex, so a shared constant would hide the SHA from the bump tool.
 PINNED_WORKSPACE_DEPENDENCIES = {
-    "mlx-rs": ("pmetal-mlx-rs", "932beb4e60db44d378ffa1fe648defea59b5cbd0"),
-    "mlx-sys": ("pmetal-mlx-sys", "932beb4e60db44d378ffa1fe648defea59b5cbd0"),
-    "candle-core": ("candle-core", "1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d"),
-    "candle-nn": ("candle-nn", "1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d"),
-    "candle-transformers": ("candle-transformers", "1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d"),
-    "candle-flash-attn": ("candle-flash-attn", "1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d"),
+    "mlx-rs": ("pmetal-mlx-rs", "b3c0e27ecd321e992749451fbe18bf614caadcef", MLX_GIT_URL),
+    "mlx-sys": ("pmetal-mlx-sys", "b3c0e27ecd321e992749451fbe18bf614caadcef", MLX_GIT_URL),
+    "candle-core": ("candle-core", "1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d", CANDLE_GIT_URL),
+    "candle-nn": ("candle-nn", "1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d", CANDLE_GIT_URL),
+    "candle-transformers": (
+        "candle-transformers",
+        "1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d",
+        CANDLE_GIT_URL,
+    ),
+    "candle-flash-attn": (
+        "candle-flash-attn",
+        "1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d",
+        CANDLE_GIT_URL,
+    ),
 }
 DEFAULT_GRAPH_PINNED_PACKAGES = {
     package_name: revision
-    for dependency_name, (package_name, revision) in PINNED_WORKSPACE_DEPENDENCIES.items()
+    for dependency_name, (package_name, revision, _url) in PINNED_WORKSPACE_DEPENDENCIES.items()
     if dependency_name != "candle-flash-attn"
 }
 FORBIDDEN_GRAPH_PACKAGES = {
@@ -192,7 +210,7 @@ def check_filesystem() -> None:
 
     root_manifest = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))
     dependencies = root_manifest["workspace"]["dependencies"]
-    for dependency_name, (package_name, revision) in PINNED_WORKSPACE_DEPENDENCIES.items():
+    for dependency_name, (package_name, revision, git_url) in PINNED_WORKSPACE_DEPENDENCIES.items():
         dependency = dependencies.get(dependency_name)
         if not isinstance(dependency, dict):
             fail(f"missing structured root pin for {dependency_name}")
@@ -200,6 +218,8 @@ def check_filesystem() -> None:
             fail(f"{dependency_name} is not declared at {revision}: {dependency}")
         if dependency.get("package", dependency_name) != package_name:
             fail(f"{dependency_name} no longer aliases package {package_name}: {dependency}")
+        if dependency.get("git") != git_url:
+            fail(f"{dependency_name} is not sourced from {git_url}: {dependency}")
 
 
 def check_graph(metadata: dict) -> None:

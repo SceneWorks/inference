@@ -120,7 +120,7 @@ class DriftGuardTests(unittest.TestCase):
         gate = load_gate_module()
         for group in PIN_GROUPS.values():
             for dep, package in zip(group.manifest_deps, group.lock_packages):
-                gate_package, _revision = gate.PINNED_WORKSPACE_DEPENDENCIES[dep]
+                gate_package, _revision, _git_url = gate.PINNED_WORKSPACE_DEPENDENCIES[dep]
                 self.assertEqual(gate_package, package, dep)
 
 
