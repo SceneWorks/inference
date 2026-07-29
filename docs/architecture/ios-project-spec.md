@@ -214,7 +214,7 @@ Track 2 gate is green too.
 | 2 | `build.rs` links `libclang_rt.osx.a` unconditionally | **Fixed** — same PR. Skip the link off macOS entirely; it is a macOS-26+ `___isPlatformVersionAtLeast` workaround, and the `ios`/`iossim` archives are rejected identically *and* unneeded. |
 | 3 | **`IPHONEOS_DEPLOYMENT_TARGET` unset** — `rustc`'s default for `aarch64-apple-ios` is **10.0**, which drops `___chkstk_darwin` (libSystem, iOS 12+) at link time | **Diagnosed, needs a home** — see below |
 | 4 | `mlx.metallib` cached to `~/.cache/pmetal/lib` instead of bundled into the `.app` | **Worse than "open" — it poisons the macOS cache.** See below. |
-| 5 | The iOS build's Metal kernels were compiled for **`macosx`**, not iOS | **Open** — found while investigating 4. |
+| 5 | The iOS build's Metal kernels were compiled for **`macosx`**, not iOS | **Fixed** — `patches/ios-metal-sdk.patch`. Metallib now `air64-apple-ios18.0.0`. |
 
 **Blocker 4 is a live hazard for macOS developers, not just an iOS gap.** Verified on this
 machine: an iOS cross-build **overwrote `~/.cache/pmetal/lib/mlx.metallib`** — the shared,
@@ -252,20 +252,48 @@ runtime on a device.** This is exactly the failure §2.2's earlier draft could n
 green build is not evidence of a working device artifact. The `otool`/`strings` platform checks
 above should be a **CI assertion in Tier 1**, not a manual step.
 
-**Scope:** this is a change to **upstream MLX's** kernel build, not to `mlx-rs` or the fork's
-patches. It is meaningfully larger than blockers 1–3 and is the first item that touches
-`ml-explore/mlx` itself. Options, in preference order:
+**Resolved — `patches/ios-metal-sdk.patch`, the fourth required `mlx-sys` patch.** Taken as a
+fork patch rather than an upstream-first PR so E1 does not block on review latency; the upstream
+PR follows.
 
-1. **A fourth `mlx-sys` patch** injecting an iOS branch into the kernel rules
-   (`xcrun -sdk iphoneos metal` + `-mios-version-min`). Consistent with the three patches the
-   fork already applies, and does not block on upstream.
-2. Upstream PR to `ml-explore/mlx` adding the iOS path. Right long-term home; unknown latency.
-3. Pre-build the metallib out-of-band and point at it via `$PMETAL_METALLIB_PATH`. Works, but
-   moves a build artifact into deployment configuration — avoid.
+The patch selects the SDK and version-min prefix by platform at all three sites (per-kernel
+compile, metallib link, root probe), and adds an iOS arm to the root `MLX_METAL_VERSION` probe —
+falling through to the existing `MLX_METAL_VERSION 0` would have silently dropped every
+version-gated kernel.
 
-**Estimate: 3–5 days**, most of it verifying the kernels are correct rather than merely
-compiling — the sc-2772 NAX miscompile is precedent for a metallib that builds and produces
-garbage. This is E1's remaining work and the reason A1's three weeks should not yet be cut.
+**The deployment floor moved 16.0 → 18.0, and the reason is not recency.** Metal versions map to
+OS versions:
+
+| iOS | Metal | |
+|---|---|---|
+| 16 | 300 | **below MLX's own baseline** |
+| 17 | 310 | = MLX's macOS 14.0 floor |
+| 18 | 320 | chosen |
+
+MLX's macOS floor of 14.0 *is* Metal 310, so an iOS 16 floor would have compiled its kernels
+below the baseline they assume. 18.0 also keeps `fence` coherent: the kernel is built only at
+`MLX_METAL_VERSION >= 320`, while `fence.cpp`'s runtime guard is
+`__builtin_available(macOS 15, iOS 18, *)` — so a 17.0 floor would satisfy the runtime check on
+an iOS 18 device with the kernel never compiled in. Latent today (`MLX_METAL_FAST_SYNCH` defaults
+off) but a real trap. The NAX gate fails safe on iOS: it needs Metal ≥ 400 **and**
+`MACOS_SDK_VERSION >= 26.2`, and the latter is unset off macOS.
+
+**Verified on a clean build**, all three layers agreeing:
+
+| Artifact | Before | After |
+|---|---|---|
+| `mlx.metallib` (15,660 kernels) | `apple-macos` | **`air64-apple-ios18.0.0`** |
+| MLX C++ objects | platform iOS, `minos` 26.2 | platform iOS, **`minos` 18.0** |
+| `mlx-llm-server` | linked, macOS kernels inside | **Mach-O arm64, platform 2, minos 18.0, sdk 26.5** |
+| `~/.cache/pmetal/lib` | overwritten by cross-build | **hash unchanged** |
+
+**Actual cost: under a day**, against the 3–5 day estimate — the work was diagnosis, not
+kernel-level porting, and the `strings`/`otool` checks made each step falsifiable. The estimate
+assumed a NAX-style correctness investigation that the fail-safe gate made unnecessary.
+
+**Still unproven: that these kernels are *correct*, not merely iOS-targeted.** The sc-2772 NAX
+miscompile is precedent for a metallib that builds and emits garbage. That needs the device, and
+it is E3's first real test.
 
 **Blocker 3 is the interesting one**, because it is configuration rather than code and it has a
 second face. The MLX C++ objects came out with `minos 26.2` — `MACOSX_DEPLOYMENT_TARGET` from
@@ -550,8 +578,9 @@ precisely what a CoreML text lane would have broken.
 
 | # | Risk | L | I | Mitigation |
 |---|---|---|---|---|
-| R1 | **`mlx-sys` cannot be built for iOS** | **L** | **Critical** | **Downgraded, not retired** (§2.2). A linked iOS arm64 binary exists and the C++ cross-compiles at `minos 16.0`, but the Metal kernels are still macOS — blocker 5. Fallback §3 stays live until a device runs real kernels. |
-| R8 | Metal kernels must be cross-compiled for iOS in **upstream MLX** | H | H | Blocker 5. A fourth `mlx-sys` patch is the preferred route (§2.2). Verification, not compilation, is the cost — cf. the sc-2772 NAX miscompile. |
+| R1 | **`mlx-sys` cannot be built for iOS** | **VL** | **Critical** | **Effectively retired** (§2.2). Metallib, C++ objects and the linked binary all target iOS 18. Fallback §3 stays formally live only until kernels are proven correct on device. |
+| R8 | ~~Metal kernels must be cross-compiled for iOS in upstream MLX~~ | — | — | **Fixed** — `patches/ios-metal-sdk.patch` (blocker 5). |
+| R11 | The iOS kernels compile but are **numerically wrong** | L | H | The residual of R8, and the one thing a build cannot prove. Precedent: sc-2772, where a metallib built cleanly and emitted garbage. First real test in E3, on device. |
 | R9 | A green build is mistaken for a working device artifact | M | H | **Already happened once.** Add `otool -l` / `strings` platform assertions to Tier 1 CI so the metallib and objects are checked for `platform 2` / `iphoneos`, not just for linking. |
 | R10 | Cross-builds poison the shared `~/.cache/pmetal/lib` metallib | — | H | **Fixed** — cache write gated to `CARGO_CFG_TARGET_OS = "macos"`. Verified: an iOS build now leaves the hash unchanged. Was silently breaking local macOS `cargo test`. |
 | R2 | Per-app memory cap tighter than the reported ~6 GB | M | H | Measured in Phase 0. Conclusion holds at 4 GB: ~3–4B at 4-bit. |
