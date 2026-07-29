@@ -104,7 +104,7 @@ pub use transformer::Krea2Transformer;
 pub use vae::{load_vae, QwenVae, QwenVaeEncoder};
 
 use std::path::PathBuf;
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", test))]
 use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 
@@ -344,31 +344,34 @@ impl Drop for KreaMemoryScope {
     }
 }
 
+/// The shared ladder → this provider's per-request execution controls.
+///
+/// SC-15805: the cumulative default is **contract-owned and defeasible**, so ask
+/// [`gen_core::MemoryProviderContract::engages`] which rungs the selection engages instead of
+/// hardcoding the cost order in a `match`. A hardcoded `tile_vae_decode: true` on the rung-3 and
+/// rung-4 arms is the same hazard as a `>=` comparison in different syntax — it turns a lever on
+/// underneath a provider that has not declared that rung `Implemented`. Krea Turbo's contract
+/// declares every rung `Implemented`, so the two agree exactly today; this is a consistency fix,
+/// not a behavior change.
 #[cfg(any(feature = "cuda", test))]
 fn krea_generation_memory(
+    contract: &gen_core::MemoryProviderContract,
     selection: gen_core::MemorySelection,
 ) -> Option<gen_core::GenerationMemory> {
     use gen_core::MemoryStrategy;
 
-    match selection.strategy {
-        MemoryStrategy::Resident => None,
-        MemoryStrategy::StagedResidency => Some(gen_core::GenerationMemory::default()),
-        MemoryStrategy::BoundedDecode => Some(gen_core::GenerationMemory {
-            tile_vae_decode: true,
-            ..Default::default()
-        }),
-        MemoryStrategy::BoundedAttention => Some(gen_core::GenerationMemory {
-            tile_vae_decode: true,
-            chunk_attention: true,
-            ..Default::default()
-        }),
-        MemoryStrategy::BoundedTransformerResidency => Some(gen_core::GenerationMemory {
-            tile_vae_decode: true,
-            chunk_attention: true,
-            stream_transformer_blocks: true,
-            ..Default::default()
-        }),
+    if selection.strategy == MemoryStrategy::Resident {
+        return None;
     }
+    Some(gen_core::GenerationMemory {
+        tile_vae_decode: contract.engages(selection.strategy, MemoryStrategy::BoundedDecode),
+        chunk_attention: contract.engages(selection.strategy, MemoryStrategy::BoundedAttention),
+        stream_transformer_blocks: contract.engages(
+            selection.strategy,
+            MemoryStrategy::BoundedTransformerResidency,
+        ),
+        ..Default::default()
+    })
 }
 
 impl Generator for KreaGenerator {
@@ -422,7 +425,10 @@ impl Generator for KreaGenerator {
             }
             Ok(Some(Box::new(KreaMemoryScope {
                 device: self.device.clone(),
-                memory: krea_generation_memory(context.selection),
+                memory: krea_generation_memory(
+                    krea_turbo_memory_strategy_contract(),
+                    context.selection,
+                ),
                 finished: false,
             })))
         }
@@ -1173,7 +1179,7 @@ candle_gen::register_generators! {
 /// Krea Turbo's provider-owned half of the shared memory-strategy handshake. The measured phase
 /// coefficients and exact fit boundaries stay in SceneWorks generated evidence; this declaration
 /// pins the executable structure that makes those measurements valid.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", test))]
 fn build_krea_turbo_memory_strategy_contract() -> gen_core::MemoryProviderContract {
     use gen_core::{
         MemoryBackendRealization, MemoryCalibrationIdentity, MemoryFormulaKind,
@@ -1249,7 +1255,7 @@ fn build_krea_turbo_memory_strategy_contract() -> gen_core::MemoryProviderContra
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", test))]
 fn krea_turbo_memory_strategy_contract() -> &'static gen_core::MemoryProviderContract {
     static CONTRACT: OnceLock<gen_core::MemoryProviderContract> = OnceLock::new();
     CONTRACT.get_or_init(build_krea_turbo_memory_strategy_contract)
@@ -1373,24 +1379,31 @@ mod tests {
             parameters,
             tier,
         };
+        let contract = krea_turbo_memory_strategy_contract();
 
         assert_eq!(
-            krea_generation_memory(selected(gen_core::MemoryStrategy::Resident)),
+            krea_generation_memory(contract, selected(gen_core::MemoryStrategy::Resident)),
             None
         );
         assert_eq!(
-            krea_generation_memory(selected(gen_core::MemoryStrategy::StagedResidency)),
+            krea_generation_memory(
+                contract,
+                selected(gen_core::MemoryStrategy::StagedResidency)
+            ),
             Some(gen_core::GenerationMemory::default())
         );
         assert_eq!(
-            krea_generation_memory(selected(gen_core::MemoryStrategy::BoundedDecode)),
+            krea_generation_memory(contract, selected(gen_core::MemoryStrategy::BoundedDecode)),
             Some(gen_core::GenerationMemory {
                 tile_vae_decode: true,
                 ..Default::default()
             })
         );
         assert_eq!(
-            krea_generation_memory(selected(gen_core::MemoryStrategy::BoundedAttention)),
+            krea_generation_memory(
+                contract,
+                selected(gen_core::MemoryStrategy::BoundedAttention)
+            ),
             Some(gen_core::GenerationMemory {
                 tile_vae_decode: true,
                 chunk_attention: true,
@@ -1398,9 +1411,10 @@ mod tests {
             })
         );
         assert_eq!(
-            krea_generation_memory(selected(
-                gen_core::MemoryStrategy::BoundedTransformerResidency
-            )),
+            krea_generation_memory(
+                contract,
+                selected(gen_core::MemoryStrategy::BoundedTransformerResidency)
+            ),
             Some(gen_core::GenerationMemory {
                 tile_vae_decode: true,
                 chunk_attention: true,
@@ -1408,6 +1422,50 @@ mod tests {
                 ..Default::default()
             })
         );
+    }
+
+    /// SC-15805: the cumulative default is DEFEASIBLE, and this provider now reads it from the
+    /// contract rather than from the ladder's numeric order. Pin that with a contract that declares
+    /// a cheaper rung unavailable: a deeper selection must leave that rung's lever OFF.
+    ///
+    /// Without this, reverting `krea_generation_memory` to its `match`-over-the-cost-order form is
+    /// invisible — every other test uses the production contract, where all five rungs are
+    /// `Implemented` and the two forms agree exactly.
+    #[test]
+    fn a_rung_the_provider_does_not_implement_is_not_engaged_by_a_deeper_selection() {
+        use gen_core::{MemoryStrategy, MemoryStrategySupport};
+
+        let mut contract = build_krea_turbo_memory_strategy_contract();
+        for capability in &mut contract.strategies {
+            if capability.strategy == MemoryStrategy::BoundedDecode {
+                capability.support = MemoryStrategySupport::Missing;
+            }
+        }
+
+        let memory = krea_generation_memory(
+            &contract,
+            gen_core::MemorySelection {
+                strategy: MemoryStrategy::BoundedTransformerResidency,
+                parameters: gen_core::MemoryStrategyParameters {
+                    transformer_window_size: Some(1),
+                    ..Default::default()
+                },
+                tier: gen_core::MemoryNumericTier {
+                    precision: gen_core::Precision::Bf16,
+                    quant: Some(Quant::Q4),
+                },
+            },
+        )
+        .expect("an optimized rung maps to a control set");
+
+        assert!(
+            !memory.tile_vae_decode,
+            "rung 2 is declared Missing, so a rung-4 selection must not tile the decode; the \
+             cost order is not a dependency"
+        );
+        // ...while the rungs the provider DOES declare stay on, so this is not a vacuous all-false.
+        assert!(memory.chunk_attention);
+        assert!(memory.stream_transformer_blocks);
     }
 
     #[test]

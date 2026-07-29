@@ -129,6 +129,23 @@ impl MemoryStrategy {
     /// may opt out of arithmetic. Providers still control the graph's *effect* through their support
     /// declarations: declaring rung 1 `Missing` makes rung 4 unselectable, which is exactly the
     /// honest outcome.
+    ///
+    /// # Seam asymmetry with `engages` (recorded, not a defect)
+    ///
+    /// [`MemoryStrategy::engages`] exists in two forms — the pure cost-order policy here and the
+    /// provider-intersected [`MemoryProviderContract::engages`] — so a provider can differentiate
+    /// engagement. `requires` deliberately has only the pure form: it is a `const fn` on the bare
+    /// enum taking `self` by value, with no contract in scope, so **there is no seam at which a
+    /// backend-differentiated prerequisite edge could be declared.** That is the intended shape
+    /// today (see the section above: the edge is arithmetic, and no provider may opt out of it), and
+    /// nothing in the current graph wants a per-backend edge.
+    ///
+    /// Should SC-15791 / SC-15792 surface a genuinely Candle-specific edge — one whose *arithmetic*
+    /// differs by backend rather than one a provider merely wishes away — the additive fix is a
+    /// `MemoryProviderContract::requires(strategy)` that defaults to this enum graph and is
+    /// overridden only where a backend realization changes the arithmetic. That keeps the
+    /// no-silent-opt-out property (the default is still contract-owned) while giving the edge set a
+    /// place to vary. It is deliberately not built ahead of that evidence.
     pub const fn requires(self) -> &'static [MemoryStrategyPrerequisite] {
         match self {
             Self::Resident
@@ -621,19 +638,47 @@ impl MemoryProviderContract {
                     ) {
                         continue;
                     }
-                    let why = match self.support(prerequisite.rung) {
-                        Some(MemoryStrategySupport::Implemented) => {
-                            "the selected composition does not engage it".to_owned()
-                        }
-                        Some(support) => format!("the provider declares it {support:?}"),
-                        None => "the provider does not declare it at all".to_owned(),
+                    // The caveat must match the case that actually produced the refusal, or the
+                    // message tells the reader that the one fix available to them will not work.
+                    //
+                    // Reachability (SC-15805 review): `engages` is
+                    // `rung <= strategy && support(rung) == Implemented`. EVERY edge in the current
+                    // graph points DOWN the cost ladder (rung 4 -> rung 1), so the ordering half is
+                    // always true here and `Some(Implemented)` short-circuits at the `continue`
+                    // above — that arm is **dead for the current graph**. It is retained rather than
+                    // unreachable-panicked because it is the correct answer the moment an edge
+                    // points sideways or up the ladder, and getting there is a one-line change to
+                    // `requires`. Only the `Missing` / undeclared arms are reachable today, and for
+                    // those "implement it" IS the fix — so that arm must not deny it.
+                    let (why, caveat) = match self.support(prerequisite.rung) {
+                        Some(MemoryStrategySupport::Implemented) => (
+                            "the selected composition does not engage it".to_owned(),
+                            format!(
+                                "This prerequisite is engagement, not availability — rung {:?} \
+                                 being implemented, or engaged by some other request, does not \
+                                 satisfy it.",
+                                prerequisite.rung
+                            ),
+                        ),
+                        support => (
+                            match support {
+                                Some(support) => format!("the provider declares it {support:?}"),
+                                None => "the provider does not declare it at all".to_owned(),
+                            },
+                            format!(
+                                "Declaring rung {:?} Implemented — or \
+                                 StructurallyNotApplicable, if this architecture has no such \
+                                 component to stage — is what makes {:?} selectable. Engagement is \
+                                 per request, so rung {:?} running on some other request, or \
+                                 engaged earlier on this warm generator, does not satisfy it.",
+                                prerequisite.rung, selection.strategy, prerequisite.rung
+                            ),
+                        ),
                     };
                     return Err(Error::Unsupported(format!(
                         "{} cannot execute {:?}: it requires rung {:?} to be ENGAGED IN THE SAME \
-                         REQUEST, and {why}. This prerequisite is engagement, not availability — \
-                         rung {:?} being implemented, or engaged by some other request, does not \
-                         satisfy it.",
-                        self.provider_id, selection.strategy, prerequisite.rung, prerequisite.rung
+                         REQUEST, and {why}. {caveat}",
+                        self.provider_id, selection.strategy, prerequisite.rung
                     )));
                 }
             }
