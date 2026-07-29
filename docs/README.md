@@ -21,13 +21,14 @@ Documentation for the SceneWorks inference workspace.
 - **[Audio Backend Strategy](architecture/audio-backend-strategy.md)** — why audio generation
   is Candle-native on every platform (no ONNX/third backend), and how the runtime catalog's
   dedicated audio section carries a `candle` audio lane inside the mlx macOS bundle.
-- **[iOS Strategy](architecture/ios-strategy.md)** — *proposed, not ratified.* CoreML/ANE vs
-  MLX-on-iOS for iPhone inference: what the tensor-free contract layer buys, what the pinned
-  `mlx-sys` fork does not support, and why Apple Foundation Models cannot be a registry
-  provider. Decision gated on the Phase 0 spike.
-- **[iOS Project Spec](architecture/ios-project-spec.md)** — *draft.* The plan behind the iOS
-  strategy: the Phase 0 de-risking gate, both candidate lanes, the image-generation track
-  (`mlx-gen-sana`, `mlx-gen-sensenova`), and the repo-side changes each lane requires.
+- **[iOS Strategy](architecture/ios-strategy.md)** — *recommended, pending sign-off.* Why iPhone
+  inference builds MLX for iOS rather than porting to CoreML/ANE: the on-device image-generation
+  requirement is structurally incompatible with a CoreML LLM lane, `mlx-gen-sensenova` consumes
+  `mlx-llm`'s primitives directly, and `gen-core`'s latent-manipulation traits get none of the
+  compiled-graph saving. Records the ANE as deferred, not rejected.
+- **[iOS Project Spec](architecture/ios-project-spec.md)** — *draft.* The plan: a Phase 0
+  feasibility spike on the `mlx-sys` iOS build, the `runtime-ios` bundle and Swift FFI layer, and
+  the image-generation track (`mlx-gen-sana`, `mlx-gen-sensenova`). No contract-crate changes.
 
 ## Migration records
 

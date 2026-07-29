@@ -1,40 +1,37 @@
-# iOS strategy — CoreML vs MLX, feasibility and LoE
+# iOS strategy — MLX on iOS, and why not CoreML
 
-**Status: proposed, not ratified.** This records the options, the evidence behind each, and a
-recommendation. The decision itself is gated on the Phase 0 spike defined in the
-[iOS project spec](ios-project-spec.md); this document must be updated with the gate outcome
-before any lane is committed to.
+**Status: recommended, pending sign-off.** This records the decision, the options considered, and
+the evidence for each. **The recommendation is Lane A — build MLX for iOS** — and it is *not*
+contingent on a comparison spike: the deciding input is a product requirement (on-device image
+generation), not a benchmark. §6 is the argument; §7 is the decision.
 
-Date: 2026-07-29. Basis: read of `core-llm`, `mlx-llm`, `candle-llm`, the bundles, the
-conformance testkit, and the pinned `mlx-sys` fork's `build.rs`.
+Date: 2026-07-29. Basis: read of `core-llm`, `mlx-llm`, `candle-llm`, `gen-core`, the media
+provider crates, the bundles, the conformance testkit, and the pinned `mlx-sys` fork's `build.rs`.
 
-> **Superseded in part.** §5.1's "keep conversion out of the repo, no contract edit needed"
-> conclusion was refined after further reading — a snapshot preparer is mandatory
-> (`runtime-catalog/src/lib.rs:358`) and `PrepareReport.input_format` requires a `ModelFormat`
-> value, so Lane B needs one additive `ModelFormat::CoreML` variant. See the project spec's §5.1
-> for the resolved position. This document is otherwise current.
+Implementation plan: [iOS project spec](ios-project-spec.md).
 
 ---
 
-## 0. The fork in the question
+## 0. The question, and what settles it
 
-"CoreML-compatible" collapses two different asks, and they differ by roughly an order of
-magnitude in cost:
+"CoreML-compatible" collapses two different asks that differ by roughly an order of magnitude:
 
 | Ask | Door | Cost |
 |---|---|---|
 | **Run on iPhone at all** | MLX already runs on iOS (Metal). Reuse `mlx-llm` nearly whole. | weeks |
 | **Run on the Neural Engine** (battery, thermals, leave the GPU free) | CoreML is the only door. New backend + an ahead-of-time conversion pipeline. | months |
 
-Both are answered below. The good news is that they are **not** exclusive — the composition
-architecture makes them two providers behind one contract, so Path A can ship first and Path B
-land later without rework of anything above the engine.
+An earlier draft proposed a spike to measure ANE energy and decide between them. **That gate is
+no longer the deciding factor.** On-device image generation is a launch requirement, and §6 shows
+that requirement is structurally incompatible with a CoreML LLM lane — for reasons that hold
+regardless of what an ANE benchmark returns. The decision is therefore made on architecture, and
+the remaining spike (project spec §2) is a *feasibility* check on the chosen lane, not a
+comparison.
 
-**Not a total reimplementation, and not a fork.** In both cases this is an **additional provider
-crate inside this same workspace** — a `coreml-llm` (or iOS-capable `mlx-llm`) engine plus a
-`runtime-ios` bundle, composed through the existing registry exactly as `candle-llm` and
-`mlx-llm` are today. No parallel library, no divergent history, one lockfile. The contract
-boundary is thin and genuinely tensor-free, which is the thing that usually kills ports like
+**Not a reimplementation, and not a fork of this repo.** Either lane is an **additional provider
+crate plus one bundle inside this workspace**, composed through the existing registry exactly as
+`candle-llm` and `mlx-llm` are today. No parallel library, no divergent history, one lockfile.
+The contract boundary is thin and genuinely tensor-free — the thing that usually kills ports like
 this. It holds here.
 
 ---
@@ -49,12 +46,12 @@ fn validate(&self, req: &TextLlmRequest) -> Result<()>;
 fn generate(&self, req: &TextLlmRequest, on_event: &mut dyn FnMut(StreamEvent)) -> Result<TextLlmOutput>;
 ```
 
-That is the entire surface a CoreML engine must satisfy. `candle-llm` already proves "add a
-second backend behind this contract" is a repeated, solved exercise here.
+That is the entire surface a new engine must satisfy. `candle-llm` already proves "add a second
+backend behind this contract" is a repeated, solved exercise here.
 
 ### Reused verbatim — ~6.6k lines, zero port cost
 
-All of `crates/contracts/core-llm/` is tensor-free by design and comes along free:
+All of `crates/contracts/core-llm/` is tensor-free by design:
 
 - `template.rs` (1058) — Jinja chat templates
 - `constraint.rs` (712) — the `JsonState` incremental-validity machine
@@ -62,45 +59,32 @@ All of `crates/contracts/core-llm/` is tensor-free by design and comes along fre
 - `prepare.rs` (477), `schedule.rs` (339), `prefix.rs` (315), `thinking.rs` (312),
   `message.rs` (302), `speculative.rs` (283), `stop.rs` (250), `paging.rs` (208),
   `detok.rs` (205), `tokenizer.rs` (200), `capabilities.rs`, `registry.rs`
-- The `core-llm-testkit` conformance suite — your definition of done, already written
+- The `core-llm-testkit` conformance suite — the definition of done, already written
 
 Tokenization, chat templating, stop matching, incremental detokenization, thinking/tool
-segmentation, capability gating, scheduling and prefix policy: **none of it is rewritten.**
+segmentation, capability gating, scheduling and prefix policy: **none of it is rewritten**, on
+either lane.
 
-### Reimplemented — new code, but small
+### What a CoreML lane would have had to replace
 
-These are MLX-`Array`-typed and do not cross the seam:
+Recorded because it sizes the rejected option, not because it is planned work:
 
-- `decode/` (~1.7k) — the streaming loop. Note `Decode::step(&self, input_ids: &Array,
-  cache: &mut dyn KvCache, offset) -> Result<Array>` is *shaped* like a stateful CoreML
-  prediction call, which is encouraging, but it is an mlx-llm-internal trait taking MLX arrays.
-- `primitives/sampler.rs` (455) — becomes plain CPU work over a logits buffer. Easy, but new.
-- `primitives/kv_cache.rs` + `paged_kv_cache.rs` (~1.2k) — on CoreML a KV cache is an `MLState`
-  handle, not owned tensors. Much of the paging sophistication becomes unavailable, not ported.
-
-### Deleted — but the work *moves*, it doesn't vanish
-
-The compiled `.mlpackage` absorbs these:
-
-- `models/*` (~5k: qwen35, llama, qwen35_vision, siglip, deepstack)
-- `primitives/{rope, attention, gated_delta}` (~1.9k)
-- `gguf/{dequant, iq_grids, convert}` (~2.7k)
-
-**This is the single biggest thing a line-count estimate gets wrong.** That ~9.6k lines of Rust
-doesn't disappear — it reappears as a `coremltools` conversion pipeline, per architecture
-family, in Python, which this repo has **no precedent for** (there is no Python beyond the
-`scripts/` gates, and the whole design assumes weights arrive as caller-provisioned local
-paths). Every new model family needs a conversion recipe, a numerical-parity check against the
-reference implementation, and a re-export whenever the architecture changes.
+- **Reimplemented:** `decode/` (~1.7k), `primitives/sampler.rs` (455),
+  `primitives/kv_cache.rs` + `paged_kv_cache.rs` (~1.2k) — all MLX-`Array`-typed.
+- **Deleted, but relocated:** `models/*` (~5k), `primitives/{rope, attention, gated_delta}`
+  (~1.9k), `gguf/{dequant, iq_grids, convert}` (~2.7k). The compiled `.mlpackage` absorbs these,
+  but that ~9.6k of Rust reappears as a `coremltools` conversion pipeline, per architecture
+  family, in Python — which this repo has **no precedent for**. That relocation is the single
+  biggest thing a line-count estimate of a CoreML port gets wrong.
 
 ---
 
-## 2. Path A — MLX on iOS
+## 2. Lane A — MLX on iOS **(recommended)**
 
-MLX itself supports iOS; `mlx-swift` runs LLMs on iPhone today. `mlx-llm` is Rust over
-`mlx-rs`, so in principle the engine compiles for `aarch64-apple-ios` unchanged.
+MLX supports iOS; `mlx-swift` runs LLMs on iPhone today. `mlx-llm` is Rust over `mlx-rs`, so the
+engine's own code compiles for `aarch64-apple-ios` essentially unchanged.
 
-**The blocker is the build, and I checked it rather than guessing.** The pinned fork
+**The blocker is the build, and it was checked rather than assumed.** The pinned fork
 (`pmetal-mlx-sys` @ `932beb4`) has no iOS story at all:
 
 - `build.rs` is `#[cfg(target_os = "macos")]`-gated in three places, including the entire
@@ -108,140 +92,211 @@ MLX itself supports iOS; `mlx-swift` runs LLMs on iPhone today. `mlx-llm` is Rus
 - It drives MLX's C++ via `cmake::Config` with **no iOS toolchain arguments** — no
   `CMAKE_SYSTEM_NAME=iOS`, no `IPHONEOS_DEPLOYMENT_TARGET`.
 - It caches `mlx.metallib` into `~/.cache/pmetal/lib/`. **That is meaningless in an iOS app
-  sandbox** — the metallib has to be bundled into the `.app`.
-- It applies **three `required = true` patches** to MLX core; all three would need to keep
-  applying on an iOS-capable base.
+  sandbox** — the metallib must be bundled into the `.app` (the patched resolver's
+  `$PMETAL_METALLIB_PATH` / `set_metallib_path()` is the seam).
+- It applies **three `required = true` patches** to MLX core; all three must keep applying on an
+  iOS-capable base.
 - `.cargo/config.toml`'s `MACOSX_DEPLOYMENT_TARGET = "26.2"` NAX-kernel setup is macOS-specific
   and does not carry over.
 
-So Path A is not "flip a target triple". It is **fork-the-fork build engineering** with a
-permanent maintenance tax — you'd own iOS support in a fork of a fork of mlx-rs.
+So Lane A is not "flip a target triple". It is **fork-the-fork build engineering** with a
+maintenance tax — the repo would own iOS support in a fork of a fork of `mlx-rs`. Mitigation:
+keep the delta additive and attempt upstreaming to `pmetal-mlx-rs` early; a merged iOS target
+erases most of that tax.
 
-**Effort: ~4–8 weeks** for one engineer to a running iPhone build, dominated by build/toolchain
-work, plus ongoing fork upkeep.
+**Effort: ~4–8 weeks** to a running iPhone build, dominated by build/toolchain work.
 
-**What you get:** the full existing engine — every model family, vision, GGUF ingest,
-speculative decode, the lot. **What you don't:** the ANE. MLX is Metal-only, so you're on the
-GPU, which on a phone means worse battery and thermals than the ANE path, and you're competing
-with the UI for the GPU.
+**What it gets:** the full existing engine — every model family, vision, GGUF ingest, speculative
+decode, paged KV — *and* a viable path to on-device image generation (§6).
 
-**Hard ceiling regardless of path:** iPhone enforces a flat per-app memory budget that does not
-scale with installed RAM. Reported as **~6 GB** even on a 12 GB iPhone 17 Pro Max and even with
-the increased-memory-limit entitlement — *treat that specific figure as single-source and
-measure it yourself before planning against it* (see Sources). The conclusion is insensitive to
-the exact number: at anywhere from 4 to 6 GB the practical target is a **~3–4B model at 4-bit**,
-with real care over KV cache and buffer sizing (one report recovered headroom only by cutting a
-GPU buffer cache from 512 MB to 64 MB).
+**What it does not:** the ANE. MLX is Metal-only, so decode runs on the GPU, competing with the
+UI and costing more battery than an ANE path would. This is a real and accepted cost; see §7.3
+for how it could be recovered later.
+
+**Zero contract changes.** Lane A registers `mlx_llm::text_registry()` and
+`mlx_llm::snapshot_preparer_registry()` exactly as `runtime-macos` does. No new `ModelFormat`
+variant, no widened `backend` tag, no catalog carve-out. That is a genuine and underrated
+advantage over Lane B, which needs all three (§5).
 
 ---
 
-## 3. Path B — a `coreml-llm` engine crate
+## 3. Lane B — a `coreml-llm` engine crate **(considered, not recommended)**
 
-The architecturally clean answer, and the only one that reaches the ANE.
+The only door to the ANE, and architecturally clean in isolation.
 
 **New Rust, roughly 4–6k lines** (against `mlx-llm`'s 22k, because the model layer is gone):
+`provider.rs` (800–1200), CoreML FFI via `objc2` (800–1200), prefill/stateful-step decode loop
+(600–900), CPU sampler over the logits buffer (400–600), config/load/errors/tests (900–1400).
 
-| Piece | Est. |
-|---|---|
-| `provider.rs` — the `TextLlm` impl | 800–1200 |
-| CoreML FFI (`MLModel`, `MLMultiArray`, `MLState`, compute-unit selection) via `objc2` | 800–1200 |
-| decode loop — prefill + stateful step | 600–900 |
-| CPU sampler over the logits buffer (temp/top-p/top-k, seeded, constraint masking) | 400–600 |
-| config/load/metadata, error mapping, tests | 900–1400 |
+**Plus the conversion pipeline, which is where the time actually goes:** per architecture family,
+`torch.export` → `coremltools` with `minimum_deployment_target=iOS18`, a stateful `slice_update`
+KV cache, 4-bit palettization, and chunking for large graphs. Apple's own Llama 3.1 CoreML work
+is the right comparison for how non-trivial that is.
 
-**Plus the conversion pipeline, which is where the time actually goes.** Per architecture
-family: `torch.export` → `coremltools` with `minimum_deployment_target=iOS18`, a stateful
-`slice_update` KV cache, 4-bit palettization, and model chunking for anything large. Apple's own
-Llama 3.1 CoreML work is the right comparison for how non-trivial this is.
+**Effort: ~8–14 weeks** to a first shipping *text-only* provider covering **one** architecture
+family, then **+2–4 weeks per additional family**. That per-family tail is the structural
+difference from today, where a new family is a Rust file every backend loads.
 
-**Effort: ~8–14 weeks** for one engineer to a first shipping text-only provider covering **one**
-architecture family, including conversion, the iOS bundle, and CI. Then **+2–4 weeks per
-additional family**. That per-family tail is the ongoing cost you're signing up for, and it's the
-main structural difference from today, where a new family is a Rust file that any backend loads.
+**Three further catches, independent of the §6 argument:**
 
-**The technical catch worth knowing up front:** the ANE is a fixed-shape accelerator designed for
-convolutions. Autoregressive decode — memory-bandwidth-bound, variable sequence length — is the
-one workload it handles badly, and CoreML adds meaningful per-op overhead on small operations.
-The emerging state of the art is **disaggregated**: ANE for prefill (compute-bound, big fixed
-matmuls) and GPU for decode. Worth noting that the registry/composition model accommodates
-exactly that — it's two providers, or one provider holding both handles.
+1. The ANE is a fixed-shape accelerator designed for convolutions. Autoregressive decode —
+   memory-bandwidth-bound, variable sequence length — is the one workload it handles badly, and
+   CoreML adds meaningful per-op overhead on small operations. The ANE win is therefore *assumed,
+   not established*.
+2. Fixed input shapes mean **context length is baked into the converted graph**. A longer context
+   is a re-conversion, not a config change.
+3. The graph must emit **full float logits** (no fused argmax/sampling), because
+   `check_seed_determinism`, JSON-constraint masking, and speculative decode all need host access
+   to the distribution. At Qwen3's ~151.9k vocab that is ~300 KB crossing ANE→CPU *every token* —
+   a plausible enough bottleneck that it would need measuring before committing.
 
 ---
 
-## 4. Path C — Apple Foundation Models — cheap, but wrong shape
+## 4. Lane C — Apple Foundation Models — cheap, but wrong shape
 
-Superficially the cheapest option: iOS 26 ships a ~3B on-device model with guided generation and
-tool calling, and the adapter is maybe 500–800 lines.
+Superficially cheapest: iOS 26 ships a ~3B on-device model with guided generation and tool
+calling, and the adapter is maybe 500–800 lines.
 
 **The disqualifier is the weights premise, not conformance.** An FM provider cannot load
 caller-provisioned weights at all — there is one Apple-supplied model and no `WeightsSource::Dir`
 to point at. That contradicts the premise of the entire epic-13657 self-fetch design, in which
 inference receives every model component as a local path the consumer provisioned. It also means
-no model choice, no quantization control, and no vision/video path of your choosing.
+no model choice, no quantization control, and no image generation.
 
-*(Correction to an earlier draft of this memo: I asserted FM would fail
-`check_seed_determinism`. It would not. `GenerationOptions` exposes `sampling: .greedy` for
-deterministic output and `SamplingMode.random(top:seed:)` for seeded sampling, which satisfies
-both legs of the check — same seed ⇒ same output, different seed ⇒ different output. The
-conformance objection doesn't hold; the weights objection is independent and stronger.)*
+*(An earlier draft asserted FM would fail `check_seed_determinism`. It would not.
+`GenerationOptions` exposes `sampling: .greedy` and `SamplingMode.random(top:seed:)`, satisfying
+both legs of the check. The conformance objection does not hold; the weights objection is
+independent and stronger.)*
 
-Recommend against as a main path. If wanted, scope it deliberately as a convenience provider
-outside the model-loading registry, where the `WeightsSource` contract doesn't apply.
-
----
-
-## 5. Repo-side costs common to A and B
-
-Cheap to fix, easy to discover late:
-
-1. **`ModelFormat` is a closed enum** — `{Gguf, Safetensors}`, with `detect_format` switching on
-   bytes/layout (`core-llm/src/prepare.rs`). A `.mlpackage`/`.mlmodelc` source means editing a
-   *tensor-free contract crate*, not just adding a backend. Decide deliberately: does conversion
-   live **outside** the repo (a pre-compiled `.mlmodelc` arriving via `WeightsSource::Dir`, which
-   is consistent with the self-fetch boundary — my recommendation), or does it become a third
-   `SnapshotPreparer`?
-2. **A `runtime-ios` bundle** — bump `EXPECTED_MEMBER_COUNT` (currently 90), add an ordered
-   catalog surface test, add an iOS lane to `scripts/ci/select_lanes.py`.
-3. **CI has no precedent for this.** All three existing bundles are desktop targets that
-   `cargo test` natively. On-device/simulator testing is new infrastructure, not a line item —
-   budget it separately.
+Not a main path. If wanted, scope it deliberately as a convenience provider outside the
+model-loading registry, where the `WeightsSource` contract does not apply.
 
 ---
 
-## 6. Media and audio — explicitly out of scope
+## 5. Repo-side costs, by lane
 
-Not because `mlx-gen` is 304k lines and `candle-gen` is 238k, but for a structural reason: the
-ratio is **worse** than those numbers suggest, not proportional to them. `sceneworks-gen-core`
-has a far wider contract surface than `TextLlm`'s three methods, and a large multi-provider
-diffusion graph gets **none** of the "compiled graph replaces the model code" saving that makes
-the LLM port cheap — every provider needs its own conversion, its own scheduler, its own
-parity check. Treat image/video/audio on iPhone as a separate program, not a phase of this one.
+| Cost | Lane A | Lane B |
+|---|---|---|
+| `runtime-ios` bundle, `EXPECTED_MEMBER_COUNT` bump, ordered surface test, CI lane | yes | yes |
+| On-device/simulator CI (no precedent — all three existing bundles are natively `cargo test`-able desktop targets) | yes | yes |
+| Swift/host FFI layer (`&mut dyn FnMut(StreamEvent)` does not cross FFI) | yes | yes |
+| **`ModelFormat::CoreML` variant** in the tensor-free contract crate | no | **yes** |
+| **Widened `TextLlmDescriptor.backend` doc** beyond `"mlx" \| "candle"` | no | **yes** |
+| **A second `runtime-catalog` backend carve-out** to mix CoreML text with MLX media | no | **yes** |
+| Per-architecture Python conversion pipeline, maintained per model release | no | **yes** |
+
+On the `ModelFormat` row: a snapshot preparer is **mandatory** —
+`runtime-catalog/src/lib.rs:358` fails validation with `"runtime has no snapshot preparer"` on an
+empty registry. `can_prepare` is a free `fn(&PrepareSpec) -> bool` and can sniff a `.mlmodelc`
+without touching the closed enum, but `PrepareReport.input_format` is a **required
+`ModelFormat`** field. A CoreML preparer must therefore either report a `.mlmodelc` as
+`Safetensors` — the kind of silent dishonesty this codebase rejects everywhere else — or the
+enum gains an additive `CoreML` variant. Lane A sidesteps this entirely by reusing
+`mlx_llm::snapshot_preparer_registry()`.
 
 ---
 
-## 7. Recommendation
+## 6. Image generation — the deciding argument
 
-1. **Decide the driver first** — "on iPhone" or "on the ANE". Everything downstream turns on it.
-2. If the answer is *ship something on iPhone soon*: **Path A**, eyes open about owning an
-   iOS-capable mlx-sys fork.
-3. If the answer is *battery/thermals matter, this is a product surface*: **Path B**, budget the
-   conversion pipeline as its own workstream with its own owner, and keep conversion out of this
-   repo behind `WeightsSource::Dir`.
-4. **Path A and Path B are not mutually exclusive** — the contract makes them two providers. A
-   plausible endgame is MLX for decode and CoreML/ANE for prefill in one bundle.
-5. **Path C only** as a deliberate non-conformant extra, never as the main path.
+On-device image generation is a launch requirement: a small image-only generator, and a unified
+model that generates both text and images. **Both already exist as crates in this workspace**,
+which reframes the question from "can we build this?" to "can we build *what we have*?".
 
-**Bottom line:** a text-LLM CoreML variant is a real but bounded project — **one engineer,
-roughly one quarter**, for a first shipping architecture family — and it is *not* a
-reimplementation and *not* a fork. The tensor-free contract layer is the reason, and it is the
-part of this codebase that most obviously pays off here.
+| Need | Crate | Size |
+|---|---|---|
+| Unified AR LLM + image | `mlx-gen-sensenova` — SenseNova-U1 (NEO-Unify), *"a unified AR LLM + flow-matching image generator"* | 9.6k lines |
+| Small image-only | `mlx-gen-sana` — SANA (NVlabs) 0.6B/1.6B + DC-AE deep-compression decoder | 6.4k lines |
+| Alternative | `mlx-gen-z-image` — Z-Image-Turbo, few-step but larger | 15.1k lines |
+
+Note that SANA's text conditioning **is Gemma-2-2B-it**, reused from `mlx-gen-pid`'s
+`CaptionEncoder` (epic 8485 / sc-8488). "A Gemma that generates images" is already the shipping
+architecture here, not a new direction. Rough budget at 4-bit: Gemma-2-2B encoder ~1.4 GB + SANA
+DiT ~0.35 GB + DC-AE decoder ≈ **~2 GB**, comfortably under the per-app cap with headroom to
+co-resident an LLM.
+
+### Why this rules out a CoreML LLM lane
+
+Three structural reasons, each verified against the source:
+
+1. **`mlx-gen-sensenova` depends on `mlx-llm` directly.** Its dual-path AR runtime and denoise
+   loop consume `ContiguousKvCache`, `sample`, and `Rope` from the LLM engine (sc-7159) rather
+   than hand-rolled copies. **Those are precisely the primitives a CoreML lane deletes.** A
+   CoreML LLM does not merely fail to help the unified model — it removes what the unified model
+   is built on.
+
+2. **`gen-core` has 19 public traits to `core-llm`'s one**, and several are *tensor-manipulation*
+   traits: `LatentOps`, `Sampler<L: LatentOps>`, `SamplerPolicy`, `GuidanceOps`, `ModelSampling`.
+   Diffusion does real latent arithmetic **between** every model call. `TextLlm` gets away with
+   handing back an opaque logits buffer the host samples on CPU; a media backend cannot. On
+   CoreML you would either read back full latents every step (slow) or compile the sampler into
+   the graph (destroying the pluggable-sampler architecture). **This is why image generation is
+   categorically harder to port than text, not merely bigger** — and why the "compiled graph
+   replaces the model code" saving that makes a CoreML LLM cheap does not apply here at all.
+
+3. **A mixed-backend bundle needs a new architectural carve-out.** `runtime-catalog` enforces one
+   tensor backend across the media, LLM, and preparer registries. The audio lane is the *single*
+   sanctioned exception (sc-12901), and it is a deliberate, documented decision with its own
+   backend field and preparer registry. CoreML-text-plus-MLX-images would need a second such
+   exception — an ADR-level change, not an implementation detail.
+
+### And the media crates are already portable
+
+`grep -rn 'target_os|cfg(unix)|cfg(windows)'` across `mlx-gen/src`, `mlx-gen-sana`,
+`mlx-gen-pid`, and `mlx-gen-sensenova` returns **zero** platform gates. The media Rust is
+platform-neutral; the only iOS blocker is `mlx-sys`'s `build.rs` — which is *already* Lane A's
+first phase. **The image-generation track's build risk collapses into Lane A's**, and is
+additional-cost-free on top of it.
+
+---
+
+## 7. Decision
+
+### 7.1 Recommendation: Lane A
+
+**Build MLX for iOS.** Reasons, in order of weight:
+
+1. **It is the only lane that satisfies the image-generation requirement** (§6). Lanes B and C
+   cannot, for structural reasons that no benchmark changes.
+2. **It reuses what exists.** `mlx-llm` (all ten architectures, vision, GGUF, speculative decode),
+   `mlx-gen-sana`, `mlx-gen-sensenova`, and the whole `mlx-gen` core come along once one
+   `build.rs` supports iOS.
+3. **It requires zero contract changes** (§5) — no `ModelFormat` variant, no widened backend tag,
+   no catalog carve-out.
+4. **It is 5–8 weeks cheaper on text alone**, before the image track is counted.
+
+**Accepted costs**, recorded so they are not rediscovered as surprises:
+
+- **No ANE.** Decode runs on the GPU: more battery, more heat, and contention with the UI.
+- **A fork of a fork.** The repo owns iOS support in `pmetal-mlx-sys` until it can be upstreamed.
+- **A threading contract.** `mlx-llm` engines are neither `Send` nor `Sync`, and MLX's shared
+  Metal device is not thread-safe. On macOS that reads as a test detail; on iOS it is host-app
+  correctness and must be specified, not left implicit.
+
+### 7.2 What would reopen this
+
+Record the trigger, so the decision is revisitable on evidence rather than by re-litigation:
+
+- The image-generation requirement is dropped or deferred indefinitely, **and** measured GPU
+  battery/thermal cost on device proves unacceptable for the product; or
+- `mlx-sys` proves genuinely un-buildable for `aarch64-apple-ios` (project spec §2 tests this
+  first, precisely because it is the one assumption Lane A rests on). In that case Lane B becomes
+  the text fallback and the image track needs re-planning from scratch.
+
+### 7.3 Not rejected — deferred
+
+The ANE is worth revisiting **after** v1 ships, in the form the state of the art actually favours:
+**disaggregated** inference — ANE for prefill (compute-bound, big fixed matmuls) and GPU for
+decode (which the ANE handles badly anyway). The registry/composition model accommodates this
+natively: it is two providers, or one provider holding both handles, added without disturbing
+anything above the engine. Choosing Lane A now does not foreclose it.
 
 ---
 
 ## Sources
 
-Repo-local findings (contract shape, line counts, `mlx-sys` `build.rs` gating, conformance
-check set, `EXPECTED_MEMBER_COUNT`) were read directly from this workspace and the pinned
+Repo-local findings (contract shape, line counts, `mlx-sys` `build.rs` gating, conformance check
+set, `runtime-catalog` validation, media-crate platform gates, `EXPECTED_MEMBER_COUNT`) were read
+directly from this workspace and the pinned
 `~/.cargo/git/checkouts/mlx-rs-.../932beb4/mlx-sys` checkout. External claims:
 
 - CoreML stateful models / `MLState` KV cache, `minimum_deployment_target=iOS18`, the ~1.6×
@@ -251,10 +306,10 @@ check set, `EXPECTED_MEMBER_COUNT`) were read directly from this workspace and t
 - ANE fixed-shape constraint, low-bit palettization vs. block-wise quantization, CoreML per-op
   overhead — [Apple ML Research: On-Device Llama 3.1 with Core ML](https://machinelearning.apple.com/research/core-ml-on-device-llama),
   [CoreML-LLM](https://github.com/john-rocky/CoreML-LLM)
-- Disaggregated NPU-prefill / GPU-decode direction —
+- Disaggregated NPU-prefill / GPU-decode direction (§7.3) —
   [SqueezeBits: Disaggregated Inference on Apple Silicon](https://blog.squeezebits.com/disaggregated-inference-on-apple-silicon-npu-prefill-and-gpu-decode-67176)
-- **iPhone ~6 GB per-app ceiling (single-source — verify before planning against it)** and the
-  GPU-buffer-cache/jetsam anecdote —
+- **iPhone ~6 GB per-app ceiling (single-source — verify on device before planning against it)**
+  and the GPU-buffer-cache/jetsam anecdote —
   [How Fast Are On-Device LLMs on iPhone 17 Pro and iPad Pro?](https://rickytakkar.com/blog_russet_mlx_benchmark.html)
 - MLX-on-iOS precedent —
   [Running an LLM on iPhone with MLX Swift (awni)](https://gist.github.com/awni/fe4f96c21ead68e60191190cbc1c129b),
