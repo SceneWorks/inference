@@ -78,11 +78,11 @@ pub use memory_strategy::{
     MemoryEvidence, MemoryEvidenceDimension, MemoryEvidenceDimensions, MemoryEvidenceKey,
     MemoryEvidenceVerdict, MemoryFormulaKind, MemoryFormulaVariable, MemoryGeometry,
     MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier, MemoryParameterRanges,
-    MemoryParityContract, MemoryParityResult, MemoryPhase, MemoryProviderContract, MemoryRejection,
-    MemoryRequestScope, MemoryRunContext, MemoryRunOutcome, MemoryRuntimeSemantics,
-    MemorySafetyDecision, MemorySelection, MemoryStrategy, MemoryStrategyCapability,
-    MemoryStrategyParameters, MemoryStrategySupport, MemoryWarmRunSemantics, TransformerComponent,
-    MEMORY_CALIBRATION_ABI,
+    MemoryParityContract, MemoryParityResult, MemoryPhase, MemoryPrerequisiteScope,
+    MemoryProviderContract, MemoryRejection, MemoryRequestScope, MemoryRunContext,
+    MemoryRunOutcome, MemoryRuntimeSemantics, MemorySafetyDecision, MemorySelection,
+    MemoryStrategy, MemoryStrategyCapability, MemoryStrategyParameters, MemoryStrategyPrerequisite,
+    MemoryStrategySupport, MemoryWarmRunSemantics, TransformerComponent, MEMORY_CALIBRATION_ABI,
 };
 pub use mempolicy::{plan_memory_adaptation, LaneLevers, Lever, MemoryPlan, StagePeaks};
 pub use registry::{

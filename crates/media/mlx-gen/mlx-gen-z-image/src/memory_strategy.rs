@@ -793,7 +793,10 @@ pub(crate) fn safety_check(
     // tiles a `scale×` super-resolved output at 2048 px — so a selection built for one route is
     // rejected on the other rather than silently re-planned. The static `validate_selection` above
     // sees only the published union, which is why this check exists.
-    if context.selection.strategy >= MemoryStrategy::BoundedDecode {
+    // SC-15805: ask the contract whether this selection ENGAGES rung 2 rather than re-deriving it
+    // from the enum's numeric order. Same answer for every shipping z-image load; the difference is
+    // that the cost-order default now lives in exactly one documented place.
+    if contract.engages(context.selection.strategy, MemoryStrategy::BoundedDecode) {
         let (edges, overlap) = decode_domain(context.use_pid);
         let route = if context.use_pid {
             "PiD overlay"
