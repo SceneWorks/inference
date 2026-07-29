@@ -34,3 +34,29 @@ RUST_TEST_THREADS = { value = "1", force = true }
 # rerun-if-env-changed, so a clean rebuild of pmetal-mlx-sys is required for a change here to
 # take effect. Requires macOS 26.2 at runtime for the fast path. See sc-2352 / sc-2772.
 MACOSX_DEPLOYMENT_TARGET = "26.2"
+
+# The iOS counterpart, and a SEPARATE knob — `MACOSX_DEPLOYMENT_TARGET` above does not apply to an
+# iOS target, and letting it leak across is a bug in both directions (it once set an iOS floor of
+# 26.2, excluding every shipping device). See docs/architecture/ios-project-spec.md.
+#
+# WHY THIS MUST LIVE HERE, not in mlx-sys's build.rs. Two different consumers need it and only one
+# is reachable from a build script:
+#   - the C++/Metal side — cmake and the metal compiler — is set by the fork's build.rs, which
+#     calls env::set_var on itself before invoking cmake;
+#   - **rustc's own link step** is NOT. A build script's env::set_var mutates only that script's
+#     process, so rustc never sees it. Without this entry rustc defaults `aarch64-apple-ios` to
+#     **10.0** and emits `-target arm64-apple-ios10.0.0`, which drops `___chkstk_darwin`
+#     (libSystem, iOS 12+) and fails the link with "Undefined symbols for architecture arm64".
+#
+# WHY 18.0 — chosen against Metal versions, not for recency: iOS 16 -> Metal 300, 17 -> 310,
+# 18 -> 320. MLX's own macOS floor (14.0) IS Metal 310, so iOS 16 would compile the kernels BELOW
+# the baseline they assume. 18.0 also keeps `fence` coherent: that kernel is built only at
+# MLX_METAL_VERSION >= 320, while fence.cpp's runtime guard is
+# `__builtin_available(macOS 15, iOS 18, *)` — a 17.0 floor would satisfy the runtime check on an
+# iOS 18 device with the kernel never compiled in. (Latent today: MLX_METAL_FAST_SYNCH defaults
+# off.) Keep this in step with the iOS floor in the fork's mlx-sys/build.rs; they must agree.
+#
+# NOT forced, matching MACOSX_DEPLOYMENT_TARGET above: cargo applies an unforced `[env]` entry only
+# when the variable is unset, so CI (or a consumer targeting a lower iOS) can still override it.
+# Inert on non-iOS targets — the Apple toolchain reads it only when the target is iOS.
+IPHONEOS_DEPLOYMENT_TARGET = "18.0"
