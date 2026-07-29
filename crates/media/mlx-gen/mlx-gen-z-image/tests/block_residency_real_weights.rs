@@ -221,7 +221,7 @@ fn host_banner() -> String {
 /// the block's own attention, so nothing in the lazy graph is still holding the block's weights.
 ///
 /// So the rung is real (4.653 → 1.795 GiB against the resident trunk) but the *parameter* is not, and
-/// [`TRANSFORMER_WINDOW_SIZES`](mlx_gen_z_image::image_memory::TRANSFORMER_WINDOW_SIZES) publishes the
+/// [`TRANSFORMER_WINDOW_SIZES`](mlx_gen_z_image::memory_strategy::TRANSFORMER_WINDOW_SIZES) publishes the
 /// single exact value rather than four rows that differ by noise.
 ///
 /// This test therefore has two jobs now: prove the saving against the resident baseline, and prove the
@@ -233,7 +233,7 @@ fn host_banner() -> String {
 fn the_window_sweep_bounds_the_denoise_peak() {
     /// The declaration under test: at most this many blocks are ever held. Anything the sweep shows
     /// to be indistinguishable from it is not a separate candidate.
-    const DECLARED: u32 = mlx_gen_z_image::image_memory::TRANSFORMER_WINDOW_SIZE;
+    const DECLARED: u32 = mlx_gen_z_image::memory_strategy::TRANSFORMER_WINDOW_SIZE;
     const N_BLOCKS: u32 = 30;
 
     println!(
@@ -459,7 +459,7 @@ fn the_windowed_render_matches_the_resident_render() {
 #[test]
 #[ignore = "needs a real Z-Image snapshot + Apple/Metal GPU"]
 fn a_canceled_or_errored_windowed_run_leaves_no_residual_cache() {
-    use mlx_gen::gen_core::ImageMemoryPhase;
+    use mlx_gen::gen_core::MemoryPhase;
     use mlx_rs::memory::get_active_memory;
     println!(
         "\n== rung-4 cleanup — tier {} — {}",
@@ -541,9 +541,9 @@ fn a_canceled_or_errored_windowed_run_leaves_no_residual_cache() {
 
     // ── Injected error at each physical phase boundary, through the shared calibration hook.
     for phase in [
-        ImageMemoryPhase::Conditioning,
-        ImageMemoryPhase::Denoise,
-        ImageMemoryPhase::Decode,
+        MemoryPhase::Conditioning,
+        MemoryPhase::Denoise,
+        MemoryPhase::Decode,
     ] {
         let retained_fault = retained_after(|| {
             let generator = mlx_gen_z_image::load(&spec()).expect("load");
@@ -719,7 +719,7 @@ fn the_eight_gb_verdict_with_the_full_ladder() {
 #[test]
 #[ignore = "needs a real Z-Image snapshot + Apple/Metal GPU"]
 fn every_declared_decode_candidate_runs_and_preserves_the_image() {
-    use mlx_gen_z_image::image_memory::{
+    use mlx_gen_z_image::memory_strategy::{
         DECODE_OVERLAP, DECODE_TILE_EDGE, DECODE_TILE_EDGES, DECODE_TILE_EDGES_REJECTED,
     };
 

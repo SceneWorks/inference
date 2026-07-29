@@ -559,10 +559,10 @@ pub(crate) fn decode_tile_geometry(req: &GenerationRequest) -> (u32, u32) {
     (
         memory
             .and_then(|m| m.decode_tile_edge)
-            .unwrap_or(crate::image_memory::DECODE_TILE_EDGE),
+            .unwrap_or(crate::memory_strategy::DECODE_TILE_EDGE),
         memory
             .and_then(|m| m.decode_overlap)
-            .unwrap_or(crate::image_memory::DECODE_OVERLAP),
+            .unwrap_or(crate::memory_strategy::DECODE_OVERLAP),
     )
 }
 
@@ -577,7 +577,7 @@ pub(crate) fn block_window_size(req: &GenerationRequest) -> Option<usize> {
     memory.stream_transformer_blocks.then(|| {
         memory
             .transformer_window_size
-            .unwrap_or(crate::image_memory::TRANSFORMER_WINDOW_SIZE) as usize
+            .unwrap_or(crate::memory_strategy::TRANSFORMER_WINDOW_SIZE) as usize
     })
 }
 
@@ -690,12 +690,12 @@ impl<'a> EncoderWindow<'a> {
 /// so every ordinary request is untouched — the check is a `None` comparison.
 pub(crate) fn calibration_fault(
     req: &GenerationRequest,
-    phase: mlx_gen::gen_core::ImageMemoryPhase,
+    phase: mlx_gen::gen_core::MemoryPhase,
     id: &str,
 ) -> Result<()> {
     match req.memory {
         Some(memory) if memory.calibration_error_phase == Some(phase) => Err(Error::Msg(format!(
-            "{id}: injected image-memory calibration error at {phase:?}"
+            "{id}: injected memory-strategy calibration error at {phase:?}"
         ))),
         _ => Ok(()),
     }
@@ -889,8 +889,8 @@ mod tests {
         assert_eq!(
             (spatial.tile_px, spatial.overlap_px),
             (
-                crate::image_memory::DECODE_TILE_EDGE as i32,
-                crate::image_memory::DECODE_OVERLAP as i32
+                crate::memory_strategy::DECODE_TILE_EDGE as i32,
+                crate::memory_strategy::DECODE_OVERLAP as i32
             ),
             "the executed tile geometry must match the contract's advertised candidates"
         );
@@ -902,12 +902,12 @@ mod tests {
     /// **cleanup on error** requirement.
     #[test]
     fn calibration_faults_fire_only_at_the_named_phase() {
-        use mlx_gen::gen_core::{GenerationMemory, ImageMemoryPhase};
+        use mlx_gen::gen_core::{GenerationMemory, MemoryPhase};
 
-        const PHASES: [ImageMemoryPhase; 3] = [
-            ImageMemoryPhase::Conditioning,
-            ImageMemoryPhase::Denoise,
-            ImageMemoryPhase::Decode,
+        const PHASES: [MemoryPhase; 3] = [
+            MemoryPhase::Conditioning,
+            MemoryPhase::Denoise,
+            MemoryPhase::Decode,
         ];
 
         // No memory block, and a memory block with no named phase: every boundary passes.
@@ -933,7 +933,7 @@ mod tests {
                 if phase == named {
                     let err = result.unwrap_err().to_string();
                     assert!(
-                        err.contains("injected image-memory calibration error"),
+                        err.contains("injected memory-strategy calibration error"),
                         "{err}"
                     );
                     assert!(err.contains(&format!("{named:?}")), "{err}");

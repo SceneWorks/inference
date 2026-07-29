@@ -1,4 +1,4 @@
-//! Rung 3 of the SC-15448 image-memory ladder: the backend-neutral **bounded-attention planner**.
+//! Rung 3 of the SC-15448 memory-strategy ladder: the backend-neutral **bounded-attention planner**.
 //!
 //! This is the third planner to move here, and it follows the same split the other two already use:
 //!

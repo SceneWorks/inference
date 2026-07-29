@@ -10,8 +10,8 @@ use crate::media::{AudioChunk, AudioTrack, Image};
 use crate::runtime::{CancelFlag, Progress, Quant};
 use crate::voice_embed::VoiceEmbedding;
 use crate::{
-    Error, ImageMemoryPhase, ImageMemoryProviderContract, ImageMemoryRequestScope,
-    ImageMemoryRunContext, ImageMemorySafetyDecision, ImageMemoryStrategy, Result,
+    Error, MemoryPhase, MemoryProviderContract, MemoryRequestScope, MemoryRunContext,
+    MemorySafetyDecision, MemoryStrategy, Result,
 };
 
 /// A prompt-conditioned media generator. `generate` is **synchronous** (long/blocking; the
@@ -31,25 +31,22 @@ pub trait Generator {
         Vec::new()
     }
 
-    /// The loaded provider's image-memory contract, when adopted. Existing providers inherit
+    /// The loaded provider's memory-strategy contract, when adopted. Existing providers inherit
     /// `None`, which is the compatibility-safe resident-only/unverified state.
-    fn image_memory_contract(&self) -> Option<&ImageMemoryProviderContract> {
+    fn memory_strategy_contract(&self) -> Option<&MemoryProviderContract> {
         None
     }
 
     /// Provider safety defense in depth. This can reject a shared worker selection but cannot
     /// replace its strategy, parameters, or numeric tier. Non-adopting providers accept only the
     /// resident baseline.
-    fn image_memory_safety_check(
-        &self,
-        context: &ImageMemoryRunContext,
-    ) -> ImageMemorySafetyDecision {
-        match self.image_memory_contract() {
+    fn memory_strategy_safety_check(&self, context: &MemoryRunContext) -> MemorySafetyDecision {
+        match self.memory_strategy_contract() {
             Some(contract) => match contract.validate_selection(&context.selection) {
                 Ok(()) if context.budget.fits(context.predicted_peak_bytes) => {
-                    ImageMemorySafetyDecision::Accept
+                    MemorySafetyDecision::Accept
                 }
-                Ok(()) => ImageMemorySafetyDecision::Reject {
+                Ok(()) => MemorySafetyDecision::Reject {
                     reason: format!(
                         "{}: predicted peak {} exceeds effective budget {}",
                         self.descriptor().id,
@@ -57,16 +54,16 @@ pub trait Generator {
                         context.budget.effective_bytes()
                     ),
                 },
-                Err(error) => ImageMemorySafetyDecision::Reject {
+                Err(error) => MemorySafetyDecision::Reject {
                     reason: error.to_string(),
                 },
             },
-            None if context.selection.strategy == ImageMemoryStrategy::Resident => {
-                ImageMemorySafetyDecision::Accept
+            None if context.selection.strategy == MemoryStrategy::Resident => {
+                MemorySafetyDecision::Accept
             }
-            None => ImageMemorySafetyDecision::Reject {
+            None => MemorySafetyDecision::Reject {
                 reason: format!(
-                    "{} has not adopted the shared image-memory contract",
+                    "{} has not adopted the shared memory-strategy contract",
                     self.descriptor().id
                 ),
             },
@@ -75,10 +72,10 @@ pub trait Generator {
 
     /// Open request-scoped lifecycle state after the shared selection passes the provider safety
     /// check. Existing providers return `Ok(None)` and therefore cannot execute optimized rungs.
-    fn begin_image_memory_request(
+    fn begin_memory_strategy_request(
         &self,
-        context: &ImageMemoryRunContext,
-    ) -> Result<Option<Box<dyn ImageMemoryRequestScope + '_>>> {
+        context: &MemoryRunContext,
+    ) -> Result<Option<Box<dyn MemoryRequestScope + '_>>> {
         let _ = context;
         Ok(None)
     }
@@ -462,13 +459,13 @@ pub struct GenerationMemory {
     //
     // The three booleans above say WHICH rungs run; these say with WHAT. Before SC-15510 a provider
     // could only advertise the single hardcoded value its pipeline happened to use, which made
-    // `ImageMemoryParameterRanges` a one-element list and left SC-15508's "a single-point pass cannot
+    // `MemoryParameterRanges` a one-element list and left SC-15508's "a single-point pass cannot
     // mark untested production parameters Verified" unsatisfiable. Each is `Option`, and `None` (the
     // `Default`) means "the provider's own historical constant", so every provider that does not read
     // them — and every request that does not set them — is byte-for-byte unaffected.
     //
     // The values a provider will accept are exactly the candidates it publishes in its
-    // `ImageMemoryProviderContract`; its request scope re-validates them, so an out-of-domain value is
+    // `MemoryProviderContract`; its request scope re-validates them, so an out-of-domain value is
     // a typed rejection rather than a silently different execution than the selector chose.
     /// Decode tile edge in **output pixels** for the bounded (tiled) decode. `None` ⇒ the provider's
     /// default tile edge.
@@ -480,7 +477,7 @@ pub struct GenerationMemory {
     /// [`Self::stream_transformer_blocks`] is set. `None` ⇒ the provider's default window.
     pub transformer_window_size: Option<u32>,
     /// Which transformer(s) [`Self::stream_transformer_blocks`] applies to (SC-15794). `None` ⇒
-    /// [`TransformerComponent::Dit`](crate::image_memory::TransformerComponent::Dit), the
+    /// [`TransformerComponent::Dit`](crate::memory_strategy::TransformerComponent::Dit), the
     /// by-convention scope every provider had before the component scope existed — so an untouched
     /// request is byte-for-byte unaffected.
     ///
@@ -489,13 +486,13 @@ pub struct GenerationMemory {
     /// (Apple/Metal, real weights, SC-15794): conditioning binds bf16 at 8.344 GiB against a 4.365
     /// GiB decode floor, and the encoder's weights are 7.440 GiB of that — so the window has real
     /// work to do there, while q4 is already decode-bound and gains nothing.
-    pub transformer_window_component: Option<crate::image_memory::TransformerComponent>,
+    pub transformer_window_component: Option<crate::memory_strategy::TransformerComponent>,
 
     /// Calibration-only request-local fault injection. Adopting providers may return a deterministic
     /// error at the named physical phase boundary so a conformance harness can verify cleanup and a
     /// warm follow-up request. Production selectors must leave this at `None` (the default).
     #[doc(hidden)]
-    pub calibration_error_phase: Option<ImageMemoryPhase>,
+    pub calibration_error_phase: Option<MemoryPhase>,
 }
 
 /// The typed audio request sub-block carried by [`GenerationRequest::audio`] (sc-12834). A single

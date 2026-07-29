@@ -272,7 +272,7 @@ fn bounded_attention_reduces_the_staged_denoise_peak() {
             bd <= wd * 0.99,
             "{order}: bounded attention no longer reduces the MLX staged denoise peak \
              ({:.3} -> {:.3} GiB). Rung 3's Implemented declaration in \
-             mlx_gen_z_image::image_memory rests on that saving — re-measure SC-15615.",
+             mlx_gen_z_image::memory_strategy rests on that saving — re-measure SC-15615.",
             wd / GIB,
             bd / GIB
         );
@@ -355,7 +355,7 @@ fn the_saving_comes_from_the_per_chunk_eval_barrier() {
     let (lazy, sum_lazy) = peak_for(
         "64Mi chunk, lazy",
         AttentionBudget::from_score_elements(
-            u64::from(mlx_gen_z_image::image_memory::ATTENTION_CHUNK_SIZE),
+            u64::from(mlx_gen_z_image::memory_strategy::ATTENTION_CHUNK_SIZE),
             false,
         ),
     );
@@ -588,10 +588,10 @@ fn a_canceled_run_leaves_no_resident_cache() {
 #[test]
 #[ignore = "needs a real Z-Image-Turbo snapshot + Apple/Metal GPU"]
 fn an_errored_run_at_any_phase_leaves_no_resident_cache() {
-    use mlx_gen::gen_core::ImageMemoryPhase;
+    use mlx_gen::gen_core::MemoryPhase;
 
     /// Peak of a warm second generation whose first generation either completed or failed at `fault`.
-    fn warm_second_run_peak(fault: Option<ImageMemoryPhase>) -> usize {
+    fn warm_second_run_peak(fault: Option<MemoryPhase>) -> usize {
         let generator = mlx_gen_z_image::load(&spec()).expect("load z_image_turbo");
 
         let mut first = request(bounded());
@@ -603,7 +603,7 @@ fn an_errored_run_at_any_phase_leaves_no_resident_cache() {
             (Some(phase), Err(err)) => {
                 let text = err.to_string();
                 assert!(
-                    text.contains("injected image-memory calibration error"),
+                    text.contains("injected memory-strategy calibration error"),
                     "{phase:?}: unexpected error {text}"
                 );
                 println!("  {phase:?} arm first run: {text}");
@@ -633,9 +633,9 @@ fn an_errored_run_at_any_phase_leaves_no_resident_cache() {
 
     let after_success = warm_second_run_peak(None);
     for phase in [
-        ImageMemoryPhase::Conditioning,
-        ImageMemoryPhase::Denoise,
-        ImageMemoryPhase::Decode,
+        MemoryPhase::Conditioning,
+        MemoryPhase::Denoise,
+        MemoryPhase::Decode,
     ] {
         let after_error = warm_second_run_peak(Some(phase));
         println!(

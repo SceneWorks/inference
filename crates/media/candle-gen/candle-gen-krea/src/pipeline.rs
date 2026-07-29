@@ -663,7 +663,7 @@ pub(crate) fn render_three_stage(
         req,
         memory,
         gen_core::LoadPhase::TextEncoder,
-        gen_core::ImageMemoryPhase::Conditioning,
+        gen_core::MemoryPhase::Conditioning,
         on_progress,
     )?;
     let text = load_text(root, device)?;
@@ -676,7 +676,7 @@ pub(crate) fn render_three_stage(
         req,
         memory,
         gen_core::LoadPhase::Renderer,
-        gen_core::ImageMemoryPhase::Denoise,
+        gen_core::MemoryPhase::Denoise,
         on_progress,
     )?;
     let dit = load_dit(root, device, adapters, memory.stream_transformer_blocks)?;
@@ -745,14 +745,14 @@ fn enter_decode_boundary(
     // The callback is the public decode boundary used by callers to request cancellation. Observe a
     // flag raised there before starting the expensive, otherwise non-interruptible VAE decode.
     candle_gen::check_cancel(&req.cancel)?;
-    maybe_inject_calibration_error(memory, gen_core::ImageMemoryPhase::Decode)
+    maybe_inject_calibration_error(memory, gen_core::MemoryPhase::Decode)
 }
 
 fn enter_loading_boundary(
     req: &GenerationRequest,
     memory: gen_core::GenerationMemory,
     load_phase: gen_core::LoadPhase,
-    memory_phase: gen_core::ImageMemoryPhase,
+    memory_phase: gen_core::MemoryPhase,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<()> {
     on_progress(Progress::Loading(load_phase));
@@ -764,11 +764,11 @@ fn enter_loading_boundary(
 
 fn maybe_inject_calibration_error(
     memory: gen_core::GenerationMemory,
-    phase: gen_core::ImageMemoryPhase,
+    phase: gen_core::MemoryPhase,
 ) -> Result<()> {
     if memory.calibration_error_phase == Some(phase) {
         Err(CandleError::Msg(format!(
-            "krea_2_turbo: injected image-memory calibration error at {phase:?}"
+            "krea_2_turbo: injected memory-strategy calibration error at {phase:?}"
         )))
     } else {
         Ok(())
@@ -1961,9 +1961,9 @@ mod tests {
     fn calibration_faults_are_request_local_and_default_path_is_inert() {
         let clean = gen_core::GenerationMemory::default();
         for phase in [
-            gen_core::ImageMemoryPhase::Conditioning,
-            gen_core::ImageMemoryPhase::Denoise,
-            gen_core::ImageMemoryPhase::Decode,
+            gen_core::MemoryPhase::Conditioning,
+            gen_core::MemoryPhase::Denoise,
+            gen_core::MemoryPhase::Decode,
         ] {
             assert!(maybe_inject_calibration_error(clean, phase).is_ok());
             let faulted = gen_core::GenerationMemory {
@@ -2004,11 +2004,11 @@ mod tests {
         for (load_phase, memory_phase) in [
             (
                 gen_core::LoadPhase::TextEncoder,
-                gen_core::ImageMemoryPhase::Conditioning,
+                gen_core::MemoryPhase::Conditioning,
             ),
             (
                 gen_core::LoadPhase::Renderer,
-                gen_core::ImageMemoryPhase::Denoise,
+                gen_core::MemoryPhase::Denoise,
             ),
         ] {
             let request = GenerationRequest {

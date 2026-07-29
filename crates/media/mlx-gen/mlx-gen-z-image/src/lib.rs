@@ -26,9 +26,9 @@ pub mod control_transformer_block;
 pub mod convert;
 pub mod feed_forward;
 pub mod final_layer;
-// Shared image-memory contract adoption (SC-15449) + the SC-15615 rung-3 finding.
-pub mod image_memory;
+// Shared memory-strategy contract adoption (SC-15449) + the SC-15615 rung-3 finding.
 pub mod loader;
+pub mod memory_strategy;
 pub mod model;
 pub mod model_base;
 pub mod model_base_control;
@@ -90,10 +90,10 @@ pub fn register_providers(
         .register_generator(model_base::REGISTRATION)
         .register_generator(model_base_control::REGISTRATION)
         .register_generator(model_control::REGISTRATION)
-        .register_image_memory(model::IMAGE_MEMORY_REGISTRATION)
-        .register_image_memory(model_base::IMAGE_MEMORY_REGISTRATION)
-        .register_image_memory(model_base_control::IMAGE_MEMORY_REGISTRATION)
-        .register_image_memory(model_control::IMAGE_MEMORY_REGISTRATION)
+        .register_memory_strategy(model::MEMORY_REGISTRATION)
+        .register_memory_strategy(model_base::MEMORY_REGISTRATION)
+        .register_memory_strategy(model_base_control::MEMORY_REGISTRATION)
+        .register_memory_strategy(model_control::MEMORY_REGISTRATION)
         .register_trainer(training::REGISTRATION)
 }
 
@@ -171,14 +171,12 @@ mod explicit_registry_tests {
         assert_eq!(explicit_trainers, ["z_image_turbo"]);
     }
 
-    /// The four `register_image_memory` calls are what makes the SC-15449 contract resolvable before
+    /// The four `register_memory_strategy` calls are what makes the SC-15449 contract resolvable before
     /// weights load. Without this test, dropping any one of them is green — every other contract test
     /// builds the contract directly instead of going through the registry.
     #[test]
-    fn every_variant_resolves_its_image_memory_contract_through_the_registry() {
-        use mlx_gen::gen_core::{
-            ImageMemoryStrategy, ImageMemoryStrategySupport, LoadSpec, WeightsSource,
-        };
+    fn every_variant_resolves_its_memory_strategy_contract_through_the_registry() {
+        use mlx_gen::gen_core::{LoadSpec, MemoryStrategy, MemoryStrategySupport, WeightsSource};
 
         let registry = super::provider_registry().unwrap();
         // SC-15754: rung 4 is declared per LOAD — a re-openable snapshot dir loaded `Sequential`.
@@ -192,48 +190,48 @@ mod explicit_registry_tests {
             "z_image_control",
         ] {
             let contract = registry
-                .image_memory_contract(id, &spec)
+                .memory_strategy_contract(id, &spec)
                 .unwrap()
-                .unwrap_or_else(|| panic!("{id} must register an image-memory contract"));
+                .unwrap_or_else(|| panic!("{id} must register a memory-strategy contract"));
             assert_eq!(contract.provider_id, id);
             assert_eq!(
                 contract.calibration.as_ref().unwrap().fingerprint,
-                super::image_memory::IMAGE_MEMORY_CALIBRATION_FINGERPRINT,
+                super::memory_strategy::MEMORY_CALIBRATION_FINGERPRINT,
                 "{id}"
             );
             // The registry-resolved contract must be the same one the direct builder produces —
             // every rung Implemented on a snapshot load (SC-15510 / SC-15754), each with its
             // recorded parameter domain.
-            for strategy in ImageMemoryStrategy::ALL {
+            for strategy in MemoryStrategy::ALL {
                 assert!(
                     matches!(
                         contract.capability(strategy).map(|c| &c.support),
-                        Some(ImageMemoryStrategySupport::Implemented)
+                        Some(MemoryStrategySupport::Implemented)
                     ),
                     "{id}: {strategy:?}"
                 );
             }
             assert_eq!(
                 contract
-                    .capability(ImageMemoryStrategy::BoundedAttention)
+                    .capability(MemoryStrategy::BoundedAttention)
                     .unwrap()
                     .parameters
                     .attention_chunk_sizes,
-                vec![super::image_memory::ATTENTION_CHUNK_SIZE],
+                vec![super::memory_strategy::ATTENTION_CHUNK_SIZE],
                 "{id}"
             );
             assert_eq!(
                 contract
-                    .capability(ImageMemoryStrategy::BoundedTransformerResidency)
+                    .capability(MemoryStrategy::BoundedTransformerResidency)
                     .unwrap()
                     .parameters
                     .transformer_window_sizes,
-                super::image_memory::TRANSFORMER_WINDOW_SIZES.to_vec(),
+                super::memory_strategy::TRANSFORMER_WINDOW_SIZES.to_vec(),
                 "{id}"
             );
             assert!(
                 contract
-                    .capability(ImageMemoryStrategy::BoundedDecode)
+                    .capability(MemoryStrategy::BoundedDecode)
                     .unwrap()
                     .parameters
                     .decode_tile_edges
