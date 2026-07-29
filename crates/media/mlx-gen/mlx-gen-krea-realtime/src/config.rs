@@ -53,8 +53,9 @@ pub struct KreaArConfig {
     /// Total DiT sequence length across the full generated clip at the canonical geometry (32760 =
     /// 21 latent frames × [`Self::frame_seq_length`]). Consumed by S4/S5.
     pub seq_length: usize,
-    /// The self-forcing denoising timestep schedule (descending; the terminal `0` is the clean step).
-    /// One AR block is denoised through these steps. Consumed by S5.
+    /// Offline self-forcing denoising timestep values. The product/release path uses this list's
+    /// length, not its integer values, to derive the shifted float schedule; the direct offline
+    /// scheduler API can still consume the values verbatim. One AR block runs that many forwards.
     pub denoising_step_list: Vec<u32>,
     /// Flow-match sigma shift applied to the schedule (5.0). Consumed by S5.
     pub timestep_shift: f32,

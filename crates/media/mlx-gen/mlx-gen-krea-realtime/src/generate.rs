@@ -35,8 +35,9 @@ use crate::scheduler::{euler_x0, renoise_step, FewStepSchedule};
 pub struct ArGenParams {
     /// Deterministic seed: fixes the per-clip init noise and the per-step renoise noise.
     pub seed: u64,
-    /// Denoising-steps override — `None` uses the config's `denoising_step_list` (5 forwards for the
-    /// shipped 14B), `Some(n)` rebuilds an `n`-forward schedule. See [`FewStepSchedule::new`].
+    /// Denoising-steps override — `None` uses the config list's length; `Some(n)` uses `n`. Product
+    /// generation follows the pinned release server and derives a strength-1 float schedule from that
+    /// count rather than executing the config's integer values.
     pub steps: Option<usize>,
     /// Number of **latent** frames to generate (the caller derives this from the requested duration ×
     /// [`fps`](Self::fps) via the VAE's temporal compression, which S6 owns).
@@ -49,6 +50,14 @@ pub struct ArGenParams {
     /// Output frames-per-second — carried onto the assembled clip at the pipeline level (S6); it does
     /// not affect the latent sequence produced here.
     pub fps: u32,
+}
+
+fn t2v_schedule(
+    cfg: &KreaRealtimeConfig,
+    steps_override: Option<usize>,
+) -> Result<FewStepSchedule> {
+    let steps = steps_override.unwrap_or(cfg.ar.denoising_step_list.len());
+    FewStepSchedule::for_strength(cfg.ar.timestep_shift as f64, 1.0, steps)
 }
 
 /// Per-chunk latent-frame counts for `num_frames` at `frames_per_block`: full blocks then a
@@ -140,12 +149,9 @@ pub fn generate_latents_into(
         ));
     }
 
-    // The Self-Forcing few-step schedule (shift + denoising_step_list from the config; caller override).
-    let schedule = FewStepSchedule::new(
-        cfg.ar.timestep_shift as f64,
-        &cfg.ar.denoising_step_list,
-        params.steps,
-    )?;
+    // The online release server ignores the YAML's integer values, uses only their count, and selects
+    // float timesteps from the shifted table.
+    let schedule = t2v_schedule(cfg, params.steps)?;
 
     // DiT text embedding + per-prompt cross-attention K/V (position-independent; built once).
     let ctx = transformer.inner().embed_text(context)?;
@@ -313,17 +319,14 @@ pub fn generate_latents_conditioned_into(
         ));
     }
 
-    // v2v uses the strength-scaled schedule (max timestep = strength·1000); i2v/t2v use the config list.
+    // v2v uses the strength-scaled release schedule (max timetable index = strength·1000); i2v/t2v
+    // use its strength-1 form.
     let schedule = match &cond.source {
         Some((_, strength)) => {
             let steps = params.steps.unwrap_or(cfg.ar.denoising_step_list.len());
             FewStepSchedule::for_strength(cfg.ar.timestep_shift as f64, *strength as f64, steps)?
         }
-        None => FewStepSchedule::new(
-            cfg.ar.timestep_shift as f64,
-            &cfg.ar.denoising_step_list,
-            params.steps,
-        )?,
+        None => t2v_schedule(cfg, params.steps)?,
     };
 
     // DiT text embedding + per-prompt cross-attention K/V (position-independent; built once).
@@ -618,6 +621,40 @@ mod tests {
             latent_width: 4,
             fps: 16,
         }
+    }
+
+    /// Product-path activation oracle: generation uses the config list's count while ignoring its
+    /// integer values, matching the pinned online release server.
+    #[test]
+    fn product_schedule_uses_count_and_ignores_config_values() {
+        let cfg = KreaRealtimeConfig::krea_realtime_14b();
+        let release = t2v_schedule(&cfg, None).unwrap();
+        let want = [1000.0, 937.5, 833.333_312_988_281_2, 625.0, 0.0];
+        for (got, want) in release.step_timesteps().iter().zip(want) {
+            assert!((got - want).abs() < 1e-12, "{got} != {want}");
+        }
+        let model_timesteps: Vec<f32> =
+            release.step_timesteps().iter().map(|&t| t as f32).collect();
+        assert_eq!(
+            model_timesteps,
+            [1000.0, 937.5, 833.333_3, 625.0, 0.0],
+            "product paths must pass the release values into the DiT"
+        );
+
+        let three = t2v_schedule(&cfg, Some(3)).unwrap();
+        assert_eq!(three.num_steps(), 3);
+        assert_eq!(three.step_timesteps()[1], 833.333_312_988_281_2);
+
+        let mut custom = cfg;
+        custom.ar.denoising_step_list = vec![900, 700, 0];
+        let from_custom_count = t2v_schedule(&custom, None).unwrap();
+        assert_eq!(from_custom_count.num_steps(), 3);
+        assert_eq!(from_custom_count.step_timesteps()[1], 833.333_312_988_281_2);
+        assert_ne!(
+            from_custom_count.step_timesteps(),
+            &[900.0, 700.0, 0.0],
+            "product paths must not execute YAML timestep values"
+        );
     }
 
     #[test]
