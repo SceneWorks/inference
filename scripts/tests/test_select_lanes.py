@@ -67,6 +67,17 @@ class SelectLanesTests(unittest.TestCase):
         ):
             self.assertFalse(select_lanes([path])["ios_build"], path)
 
+    def test_runtime_ios_bundle_stays_on_the_ios_lane(self) -> None:
+        # The iOS bundle is LLM-only and MLX-backed: it must not wake the candle or cuda lanes,
+        # and it must not wake macos_metal either -- the two bundles share an engine but are
+        # separate composition roots.
+        lanes = select_lanes(["crates/bundles/runtime-ios/src/lib.rs"])
+        self.assertTrue(lanes["ios_build"])
+        self.assertTrue(lanes["release"])
+        self.assertFalse(lanes["macos_metal"])
+        self.assertFalse(lanes["candle_cpu"])
+        self.assertFalse(lanes["windows_cuda"])
+
     def test_candle_change_includes_cpu_metal_and_cuda(self) -> None:
         lanes = select_lanes(["crates/media/candle-gen/candle-gen-flux/src/lib.rs"])
         self.assertTrue(lanes["candle_cpu"])

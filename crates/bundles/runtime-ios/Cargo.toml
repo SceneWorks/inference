@@ -1,0 +1,27 @@
+[package]
+name = "runtime-ios"
+version = "0.0.0"
+edition = "2021"
+description = "Supported SceneWorks MLX LLM runtime composition for iOS (iPhone/iPad)."
+license = "Apache-2.0"
+repository = "https://github.com/SceneWorks/inference"
+
+[dependencies]
+runtime-catalog = { workspace = true }
+mlx-llm = { workspace = true }
+
+# NOTE: no `media` or `audio` feature yet, and that is deliberate rather than an omission.
+#
+# `mlx-gen-catalog` composes 32 provider crates including the video families (wan, ltx, mochi,
+# svd) — the wrong shape for a device with a hard per-app memory cap, and none of it validated
+# on iOS. Adding the whole catalog to get one small image generator would compile a graph the
+# platform cannot run. The iOS image track (E5) instead composes a *narrow* media registry from
+# `mlx-gen-sana` (+ its `mlx-gen-pid` dependency) and `mlx-gen-sensenova`, which is a new
+# composition root rather than a feature flag on this crate.
+#
+# The Candle `audio` lane is likewise out of scope until an audio story exists for iOS; the
+# lane's cross-backend seam (sc-12835) is a deliberate architectural exception and should not be
+# extended to a new platform incidentally.
+#
+# Until then this bundle is LLM-only by construction, so it needs no feature gate: a consumer
+# gets the same surface with or without `--no-default-features`.

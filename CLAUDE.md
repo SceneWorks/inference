@@ -94,7 +94,8 @@ backend-neutral contracts  →  MLX/Candle engines  →  provider-family crates
   rides the catalog's dedicated audio lane beside the mlx media graph, the one sanctioned
   cross-backend seam (`docs/architecture/audio-backend-strategy.md`).
 - `crates/bundles/` — `runtime-macos`, `runtime-cuda`, `runtime-cpu` (each assembles one media +
-  one LLM + one snapshot-preparer registry, plus the candle audio lane) validated by
+  one LLM + one snapshot-preparer registry, plus the candle audio lane) and `runtime-ios`
+  (**LLM + preparer only** — no media, no audio lane; see its README), all validated by
   `runtime-catalog`.
 
 **Provider registration is explicit, not linker-discovered.** There is deliberately no

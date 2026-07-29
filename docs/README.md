@@ -47,7 +47,7 @@ Each layer has a README next to its source:
 | Layer | Crates |
 | --- | --- |
 | Contracts | [`gen-core`](../crates/contracts/gen-core/README.md), [`gen-core-testkit`](../crates/contracts/gen-core-testkit/README.md), [`core-llm`](../crates/contracts/core-llm/README.md) |
-| Bundles | [`runtime-catalog`](../crates/bundles/runtime-catalog/README.md), [`runtime-macos`](../crates/bundles/runtime-macos/README.md), [`runtime-cuda`](../crates/bundles/runtime-cuda/README.md), [`runtime-cpu`](../crates/bundles/runtime-cpu/README.md) |
+| Bundles | [`runtime-catalog`](../crates/bundles/runtime-catalog/README.md), [`runtime-macos`](../crates/bundles/runtime-macos/README.md), [`runtime-cuda`](../crates/bundles/runtime-cuda/README.md), [`runtime-cpu`](../crates/bundles/runtime-cpu/README.md), [`runtime-ios`](../crates/bundles/runtime-ios/README.md) |
 | LLM engines | [`mlx-llm`](../crates/llm/mlx-llm/README.md), [`candle-llm`](../crates/llm/candle-llm/README.md) |
 | Media engines | [`mlx-gen`](../crates/media/mlx-gen/README.md) (+ [`mlx-gen-catalog`](../crates/media/mlx-gen/mlx-gen-catalog/README.md)), [`candle-gen`](../crates/media/candle-gen/README.md) (+ [`candle-gen-catalog`](../crates/media/candle-gen/candle-gen-catalog/README.md)) |
 

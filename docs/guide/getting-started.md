@@ -17,7 +17,7 @@ named runtime bundle**, builds the bundle's **validated catalog**, and loads mod
 **by id** through ordinary registry values:
 
 ```text
-runtime-macos │ runtime-cuda │ runtime-cpu      ← one bundle per product target
+runtime-macos │ runtime-cuda │ runtime-cpu │ runtime-ios   ← one bundle per product target
         │
         ▼   catalog()  →  RuntimeCatalog         ← validated: every descriptor's backend
         │                                            matches the bundle, ids are unique,
@@ -37,6 +37,11 @@ Everything below flows from that: pick a bundle, call `catalog()`, then load by 
 | `runtime-macos` | MLX      | `macos`    | `aarch64-apple-darwin`                                             | macOS 26.2+, Xcode Metal toolchain         |
 | `runtime-cuda`  | Candle   | `cuda`     | `x86_64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`              | NVIDIA CUDA toolkit, supported NVIDIA driver |
 | `runtime-cpu`   | Candle   | `cpu`      | `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`, `x86_64-pc-windows-msvc` | none                                       |
+| `runtime-ios`   | MLX      | `ios`      | `aarch64-apple-ios`, `aarch64-apple-ios-sim`                        | iOS 18.0+, Xcode 16+ with the Metal toolchain |
+
+`runtime-ios` is **LLM-only**: it ships the same `mlx-llm` catalog as `runtime-macos` but no
+media or audio registry, and it requires a packaging step to bundle MLX's metallib into the
+`.app`. See [its README](../../crates/bundles/runtime-ios/README.md) for both.
 
 A bundle is a **composition profile of one platform release**, not a separately pinned
 set of backend crates. MLX, CUDA, and CPU are mutually exclusive targets — there is no
