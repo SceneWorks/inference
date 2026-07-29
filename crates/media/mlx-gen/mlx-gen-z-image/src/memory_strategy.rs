@@ -518,42 +518,57 @@ fn asset_facts(spec: &LoadSpec) -> MemoryAssetFacts {
 
 /// The shared ladder → this provider's existing per-request execution controls.
 ///
-/// The ladder is **cumulative**: every rung above `StagedResidency` also carries the levers below it,
-/// so a rung-3 selection tiles the decode as well. `Resident` returns `None`, which is the historical
-/// fast path (`GenerationRequest::memory` untouched).
-pub(crate) fn z_image_generation_memory(selection: &MemorySelection) -> Option<GenerationMemory> {
-    // SC-15510: the selected *parameters* travel with the levers. `validate_selection` has already
-    // established that a rung carries exactly the parameters it owns and no more, so copying them
-    // wholesale cannot smuggle a decode edge into a staged-only selection: the fields below are only
-    // read by a pipeline whose matching boolean is set.
-    let parameters = selection.parameters;
-    let decode = GenerationMemory {
-        tile_vae_decode: true,
-        decode_tile_edge: parameters.decode_tile_edge,
-        decode_overlap: parameters.decode_overlap,
-        ..Default::default()
-    };
-    match selection.strategy {
-        MemoryStrategy::Resident => None,
-        MemoryStrategy::StagedResidency => Some(GenerationMemory::default()),
-        MemoryStrategy::BoundedDecode => Some(decode),
-        MemoryStrategy::BoundedAttention => Some(GenerationMemory {
-            chunk_attention: true,
-            ..decode
-        }),
-        MemoryStrategy::BoundedTransformerResidency => Some(GenerationMemory {
-            chunk_attention: true,
-            stream_transformer_blocks: true,
-            transformer_window_size: parameters.transformer_window_size,
-            // SC-15794: carry the COMPONENT scope, not only the window size. Dropping it here would
-            // silently execute the DiT-only default while the evidence writer recorded whatever the
-            // selector chose — a rung-4-with-encoder-scope row for a run whose encoder never streamed.
-            // `window_component()` resolves `None` to the DiT default, so a pre-SC-15794 selection is
-            // unchanged.
-            transformer_window_component: Some(parameters.window_component()),
-            ..decode
-        }),
+/// The ladder is cumulative *by default*, so a rung-3 selection tiles the decode as well —
+/// but SC-15805: that default is **defeasible and contract-owned**, so ask
+/// [`MemoryProviderContract::engages`] which rungs this selection actually engages rather than
+/// re-deriving it from a `match` over the ladder's numeric order. A hardcoded `..decode` arm is the
+/// same hazard as a `>=` comparison wearing different syntax: it switches a rung's lever on
+/// underneath a provider that does not declare that rung `Implemented`. For this provider's
+/// current contract (rungs 1-3 always `Implemented`) the two agree exactly, which is why this is a
+/// consistency fix rather than a behavior change.
+///
+/// `Resident` returns `None`, which is the historical fast path (`GenerationRequest::memory`
+/// untouched).
+pub(crate) fn z_image_generation_memory(
+    contract: &MemoryProviderContract,
+    selection: &MemorySelection,
+) -> Option<GenerationMemory> {
+    if selection.strategy == MemoryStrategy::Resident {
+        return None;
     }
+    // SC-15510: the selected *parameters* travel with the levers. `validate_selection` has already
+    // established that a rung carries exactly the parameters it owns and no more. Each parameter is
+    // additionally gated on its OWN rung being engaged, so a lever that is off never ships the
+    // values it would have been driven with.
+    let parameters = selection.parameters;
+    let tile_vae_decode = contract.engages(selection.strategy, MemoryStrategy::BoundedDecode);
+    let chunk_attention = contract.engages(selection.strategy, MemoryStrategy::BoundedAttention);
+    let stream_transformer_blocks = contract.engages(
+        selection.strategy,
+        MemoryStrategy::BoundedTransformerResidency,
+    );
+    Some(GenerationMemory {
+        tile_vae_decode,
+        decode_tile_edge: tile_vae_decode
+            .then_some(parameters.decode_tile_edge)
+            .flatten(),
+        decode_overlap: tile_vae_decode
+            .then_some(parameters.decode_overlap)
+            .flatten(),
+        chunk_attention,
+        stream_transformer_blocks,
+        transformer_window_size: stream_transformer_blocks
+            .then_some(parameters.transformer_window_size)
+            .flatten(),
+        // SC-15794: carry the COMPONENT scope, not only the window size. Dropping it here would
+        // silently execute the DiT-only default while the evidence writer recorded whatever the
+        // selector chose — a rung-4-with-encoder-scope row for a run whose encoder never streamed.
+        // `window_component()` resolves `None` to the DiT default, so a pre-SC-15794 selection is
+        // unchanged.
+        transformer_window_component: stream_transformer_blocks
+            .then(|| parameters.window_component()),
+        ..Default::default()
+    })
 }
 
 /// Request-scoped lifecycle state for one admitted Z-Image generation.
@@ -793,7 +808,10 @@ pub(crate) fn safety_check(
     // tiles a `scale×` super-resolved output at 2048 px — so a selection built for one route is
     // rejected on the other rather than silently re-planned. The static `validate_selection` above
     // sees only the published union, which is why this check exists.
-    if context.selection.strategy >= MemoryStrategy::BoundedDecode {
+    // SC-15805: ask the contract whether this selection ENGAGES rung 2 rather than re-deriving it
+    // from the enum's numeric order. Same answer for every shipping z-image load; the difference is
+    // that the cost-order default now lives in exactly one documented place.
+    if contract.engages(context.selection.strategy, MemoryStrategy::BoundedDecode) {
         let (edges, overlap) = decode_domain(context.use_pid);
         let route = if context.use_pid {
             "PiD overlay"
@@ -845,7 +863,7 @@ pub(crate) fn begin_request(
     Ok(Some(Box::new(ZImageMemoryScope {
         provider_id,
         geometry: context.geometry,
-        memory: z_image_generation_memory(&context.selection),
+        memory: z_image_generation_memory(contract, &context.selection),
         use_pid: context.use_pid,
         transformer_window: (context.selection.strategy
             == MemoryStrategy::BoundedTransformerResidency)
@@ -1211,7 +1229,7 @@ mod tests {
         ] {
             let mut selection = selection_for(MemoryStrategy::BoundedTransformerResidency, false);
             selection.parameters.transformer_window_component = Some(component);
-            let memory = z_image_generation_memory(&selection)
+            let memory = z_image_generation_memory(&contract(), &selection)
                 .expect("rung 4 maps to a request-scoped control set");
             assert_eq!(
                 memory.transformer_window_component,
@@ -1227,7 +1245,7 @@ mod tests {
             selection.parameters.transformer_window_component,
             Some(TRANSFORMER_WINDOW_COMPONENT)
         );
-        let memory = z_image_generation_memory(&selection).expect("rung 4 controls");
+        let memory = z_image_generation_memory(&contract(), &selection).expect("rung 4 controls");
         assert_eq!(
             memory.transformer_window_component,
             Some(TransformerComponent::Dit),
@@ -1240,7 +1258,8 @@ mod tests {
             MemoryStrategy::BoundedDecode,
             MemoryStrategy::BoundedAttention,
         ] {
-            let memory = z_image_generation_memory(&selection_for(lower, false)).expect("controls");
+            let memory = z_image_generation_memory(&contract(), &selection_for(lower, false))
+                .expect("controls");
             assert!(
                 memory.transformer_window_component.is_none(),
                 "{lower:?} carried a rung-4 component scope"
@@ -1258,26 +1277,29 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            z_image_generation_memory(&selection(MemoryStrategy::Resident)),
+            z_image_generation_memory(&contract(), &selection(MemoryStrategy::Resident)),
             None
         );
         assert_eq!(
-            z_image_generation_memory(&selection(MemoryStrategy::StagedResidency)),
+            z_image_generation_memory(&contract(), &selection(MemoryStrategy::StagedResidency)),
             Some(GenerationMemory::default())
         );
         assert_eq!(
-            z_image_generation_memory(&selection(MemoryStrategy::BoundedDecode)),
+            z_image_generation_memory(&contract(), &selection(MemoryStrategy::BoundedDecode)),
             Some(decode)
         );
         assert_eq!(
-            z_image_generation_memory(&selection(MemoryStrategy::BoundedAttention)),
+            z_image_generation_memory(&contract(), &selection(MemoryStrategy::BoundedAttention)),
             Some(GenerationMemory {
                 chunk_attention: true,
                 ..decode
             })
         );
         assert_eq!(
-            z_image_generation_memory(&selection(MemoryStrategy::BoundedTransformerResidency)),
+            z_image_generation_memory(
+                &contract(),
+                &selection(MemoryStrategy::BoundedTransformerResidency)
+            ),
             Some(GenerationMemory {
                 chunk_attention: true,
                 stream_transformer_blocks: true,
@@ -1286,6 +1308,49 @@ mod tests {
                 transformer_window_component: Some(TRANSFORMER_WINDOW_COMPONENT),
                 ..decode
             })
+        );
+    }
+
+    /// SC-15805: "cumulative" is a DEFEASIBLE default owned by the contract, not a fact derived from
+    /// the ladder's numeric order. Pin that at this provider's selection -> controls mapping with a
+    /// contract that declares a cheaper rung unavailable: a deeper selection must leave that rung's
+    /// lever off, and must not ship the parameters that lever would have been driven with.
+    ///
+    /// Every other test here uses the production contract, where rungs 1-3 are always `Implemented`
+    /// and the contract-driven and cost-order forms agree exactly — so without this test, reverting
+    /// `z_image_generation_memory` to a `match` over the ladder is invisible.
+    #[test]
+    fn a_rung_the_provider_does_not_implement_is_not_engaged_by_a_deeper_selection() {
+        let mut contract = contract();
+        for capability in &mut contract.strategies {
+            if capability.strategy == MemoryStrategy::BoundedDecode {
+                capability.support = MemoryStrategySupport::Missing;
+                capability.parameters = MemoryParameterRanges::default();
+            }
+        }
+
+        let memory = z_image_generation_memory(
+            &contract,
+            &selection(MemoryStrategy::BoundedTransformerResidency),
+        )
+        .expect("an optimized rung maps to a request-scoped control set");
+
+        assert!(
+            !memory.tile_vae_decode,
+            "rung 2 is declared Missing, so a rung-4 selection must not tile the decode: the cost \
+             ordering is not a dependency"
+        );
+        assert_eq!(
+            (memory.decode_tile_edge, memory.decode_overlap),
+            (None, None),
+            "a lever that is off must not ship the parameters it would have executed"
+        );
+        // ...while the rungs the provider DOES declare stay on, so this is not a vacuous all-false.
+        assert!(memory.chunk_attention);
+        assert!(memory.stream_transformer_blocks);
+        assert_eq!(
+            memory.transformer_window_size,
+            Some(TRANSFORMER_WINDOW_SIZE)
         );
     }
 
@@ -1310,9 +1375,10 @@ mod tests {
         );
 
         let full = GenerationRequest {
-            memory: z_image_generation_memory(&selection(
-                MemoryStrategy::BoundedTransformerResidency,
-            )),
+            memory: z_image_generation_memory(
+                &contract(),
+                &selection(MemoryStrategy::BoundedTransformerResidency),
+            ),
             ..plain.clone()
         };
         assert_eq!(
@@ -1329,7 +1395,7 @@ mod tests {
         // A published non-default candidate — 640, not one of the measured-and-rejected sub-512 edges.
         sel.parameters.decode_tile_edge = Some(640);
         let tiled = GenerationRequest {
-            memory: z_image_generation_memory(&sel),
+            memory: z_image_generation_memory(&contract(), &sel),
             ..plain.clone()
         };
         assert_eq!(
@@ -1362,9 +1428,10 @@ mod tests {
     fn a_resident_load_refuses_rung_four_instead_of_degrading() {
         let req = GenerationRequest {
             prompt: "a fox".to_owned(),
-            memory: z_image_generation_memory(&selection(
-                MemoryStrategy::BoundedTransformerResidency,
-            )),
+            memory: z_image_generation_memory(
+                &contract(),
+                &selection(MemoryStrategy::BoundedTransformerResidency),
+            ),
             ..Default::default()
         };
         let err = crate::pipeline::resolve_block_window(&req, false, "z_image_turbo")
@@ -1383,7 +1450,7 @@ mod tests {
         ] {
             let req = GenerationRequest {
                 prompt: "a fox".to_owned(),
-                memory: z_image_generation_memory(&selection(strategy)),
+                memory: z_image_generation_memory(&contract(), &selection(strategy)),
                 ..Default::default()
             };
             assert_eq!(
