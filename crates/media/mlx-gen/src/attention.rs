@@ -1,5 +1,17 @@
-//! Shared **bounded attention** (rung 3 of the SC-15448 ladder) for the MLX backend — the MLX twin of
-//! `candle_gen::sdpa_budgeted_bhsd` (sc-9116 / sc-9570).
+//! **Bounded attention** (rung 3 of the SC-15448 ladder): the MLX **kernel**.
+//!
+//! The **planner** — [`AttentionBudget`], [`CONSTRAINED_ATTN_SCORES_BUDGET`] and the query-block
+//! arithmetic — lives in [`gen_core::attention_budget`] and is re-exported below, so this module keeps
+//! its public shape while the chunk boundaries come from the same place every backend's do (SC-15793).
+//! That is the shared-ladder split rungs 2 (`gen_core::tiling`) and 4 (`gen_core::block_window`)
+//! already use.
+//!
+//! What stays here is genuinely MLX's: [`sdpa_budgeted_bhsd`], the `slice_axis` helper, and the
+//! per-chunk `eval`. The kernels must NOT merge — measured like-for-like on the denoise phase, this
+//! rung is worth **−32% on candle and −1.7% here**, roughly an order of magnitude apart, precisely
+//! because the kernels differ; see the attribution table below and the [`gen_core::attention_budget`]
+//! module doc. (MLX's often-quoted −5.0% is the whole-request figure, not the denoise phase — the two
+//! are not interchangeable when comparing backends.)
 //!
 //! The lever is query-row chunking: every query row's softmax is over **all** keys and is independent
 //! of the other rows, so running the attention over blocks of query rows leaves each query's complete
@@ -18,7 +30,7 @@
 //! kernel that streams the scores. Measured in isolation on Apple M5 Max at the production Z-Image
 //! DiT shape (B=1, H=30, D=128, f32), the unbounded peak is exactly `4 · B·H·Sq·D · sizeof(dtype)` —
 //! q, k, v and the output, nothing else (241.9 MiB at Sq=4128, 961.9 MiB at Sq=16416; a materialized
-//! score tensor at Sq=16416 would alone be 30 GiB). `fused_sdpa_does_not_materialize_the_scores`
+//! score tensor at Sq=16416 would alone be 30 GiB). `at_the_production_shape_sdpa_streams_the_scores_and_chunking_is_exact`
 //! pins that. So there is **no score tensor for this helper to bound**, and in isolation — with q/k/v
 //! already materialized and pinned alive — chunking only *adds* transients (+50% peak).
 //!
@@ -64,137 +76,15 @@ use mlx_rs::fast::{scaled_dot_product_attention, ScaledDotProductAttentionMask};
 use mlx_rs::ops::concatenate_axis;
 use mlx_rs::Array;
 
-use crate::{CancelFlag, Error, Result};
+use crate::{Error, Result};
 
-/// The production constrained score budget: 64 Mi elements per attention call.
-///
-/// This is the exact parameter the Candle/CUDA Z-Image rung-3 port measured in SC-15256 ("a 64
-/// Mi-element query-row attention score budget"), reused verbatim so the two backends' bounded
-/// attention is the same lever with the same knob and a cross-backend comparison is meaningful.
-pub const CONSTRAINED_ATTN_SCORES_BUDGET: u64 = 64 * 1024 * 1024;
-
-/// How much attention scratch one call may build at once.
-///
-/// [`UNBOUNDED`](Self::UNBOUNDED) is the default everywhere and is a single
-/// [`scaled_dot_product_attention`] call — byte-identical to the pre-rung forward.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AttentionBudget {
-    /// Max elements in one chunk's `[B, H, chunk_rows, Sk]` score domain. `u64::MAX` ⇒ unbounded.
-    max_score_elements: u64,
-    /// Materialize each chunk's output before building the next (see the module doc). Ignored when
-    /// the budget is unbounded or the whole call already fits.
-    eval_per_chunk: bool,
-}
-
-impl AttentionBudget {
-    /// No bound — one fused call, byte-identical to the un-guarded forward. The default for every
-    /// path that has not selected the bounded-attention rung (including all training paths).
-    pub const UNBOUNDED: Self = Self {
-        max_score_elements: u64::MAX,
-        eval_per_chunk: false,
-    };
-
-    /// The production bounded rung: [`CONSTRAINED_ATTN_SCORES_BUDGET`] scores per chunk, each chunk
-    /// materialized before the next is built.
-    pub const CONSTRAINED: Self = Self {
-        max_score_elements: CONSTRAINED_ATTN_SCORES_BUDGET,
-        eval_per_chunk: true,
-    };
-
-    /// A budget of exactly `max_score_elements` scores per chunk. `0` is clamped to `1` (one query
-    /// row per chunk) rather than dividing by zero.
-    pub const fn from_score_elements(max_score_elements: u64, eval_per_chunk: bool) -> Self {
-        Self {
-            max_score_elements,
-            eval_per_chunk,
-        }
-    }
-
-    /// The declared score budget — the exact value recorded as the strategy parameter.
-    pub const fn max_score_elements(self) -> u64 {
-        self.max_score_elements
-    }
-
-    /// `true` when this budget can never chunk (the fast path).
-    pub const fn is_unbounded(self) -> bool {
-        self.max_score_elements == u64::MAX
-    }
-
-    /// The largest query-block length whose `[B, H, block, Sk]` score count stays within the budget.
-    /// Returns the whole `sq` (a single un-chunked call) when the full call already fits.
-    pub fn query_block(self, b: i32, h: i32, sq: i32, sk: i32) -> i32 {
-        if self.is_unbounded() || sq <= 1 {
-            return sq;
-        }
-        let rows_per_query = (b.max(1) as u64)
-            .saturating_mul(h.max(1) as u64)
-            .saturating_mul(sk.max(1) as u64);
-        if rows_per_query.saturating_mul(sq.max(0) as u64) <= self.max_score_elements {
-            return sq;
-        }
-        let block = self.max_score_elements / rows_per_query.max(1);
-        // `block` is bounded above by `sq` here (the whole call did not fit), so the cast is safe.
-        block.clamp(1, sq as u64) as i32
-    }
-}
-
-impl Default for AttentionBudget {
-    fn default() -> Self {
-        Self::UNBOUNDED
-    }
-}
-
-/// A budget plus the request's cancel flag — what one bounded attention call needs.
-///
-/// `Copy`, so it threads through a forward chain as cheaply as the budget alone did. The cancel flag
-/// is checked **between chunks**, mirroring the per-tile checks in
-/// [`crate::vae_tiling::tiled_decode`] (and the Candle Z-Image rung-3 port's per-tile work): a
-/// bounded attention call splits one previously atomic kernel launch into N, so those boundaries are
-/// the only place inside a DiT forward where a cancel can land at all. The unbounded fast path has no
-/// boundary and is therefore unaffected — cancellation there stays at step granularity, exactly as
-/// before.
-#[derive(Clone, Copy, Debug)]
-pub struct AttentionPlan<'a> {
-    pub budget: AttentionBudget,
-    pub cancel: Option<&'a CancelFlag>,
-}
-
-impl AttentionPlan<'_> {
-    /// The unbounded, uncancellable plan — the default for every path that has not selected the
-    /// bounded-attention rung, and byte-identical to the pre-SC-15615 forward.
-    pub const UNBOUNDED: Self = Self {
-        budget: AttentionBudget::UNBOUNDED,
-        cancel: None,
-    };
-
-    /// A plan at `budget` with no cancel flag (unit tests, and callers with no request scope).
-    pub const fn budgeted(budget: AttentionBudget) -> Self {
-        Self {
-            budget,
-            cancel: None,
-        }
-    }
-
-    /// This plan with `cancel` attached.
-    pub fn with_cancel(self, cancel: &CancelFlag) -> AttentionPlan<'_> {
-        AttentionPlan {
-            budget: self.budget,
-            cancel: Some(cancel),
-        }
-    }
-}
-
-impl Default for AttentionPlan<'_> {
-    fn default() -> Self {
-        Self::UNBOUNDED
-    }
-}
-
-impl From<AttentionBudget> for AttentionPlan<'_> {
-    fn from(budget: AttentionBudget) -> Self {
-        Self::budgeted(budget)
-    }
-}
+/// The rung-3 **planner**, re-exported from its shared home so MLX provider code, the SC-15615
+/// evidence and `mlx-gen-z-image`'s published `attention_chunk_sizes` all keep their current import
+/// paths. The arithmetic lives in [`gen_core::attention_budget`] (SC-15793) alongside the rung-2
+/// (`gen_core::tiling`) and rung-4 (`gen_core::block_window`) planners; only the kernel below is MLX's.
+pub use gen_core::attention_budget::{
+    AttentionBudget, AttentionPlan, CONSTRAINED_ATTN_SCORES_BUDGET,
+};
 
 /// Bounded scaled-dot-product attention over the 4-D DiT shape `q, k, v: [B, H, Sq, D]` (the key
 /// length `Sk` may differ from `Sq`), returning `[B, H, Sq, D]` — a drop-in around an existing
@@ -265,7 +155,7 @@ pub fn sdpa_budgeted_bhsd(
         // boundary to check at. Checked BEFORE the chunk so a cancel that arrived during the previous
         // chunk stops the next launch; the partial `outs` drop here and the caller's request scope
         // does the synchronize-and-release.
-        if plan.cancel.is_some_and(|c| c.is_cancelled()) {
+        if plan.is_cancelled() {
             return Err(Error::Canceled);
         }
         let len = block.min(sq - start);
@@ -287,7 +177,7 @@ pub fn sdpa_budgeted_bhsd(
                 .map(ScaledDotProductAttentionMask::Array),
             None,
         )?;
-        if plan.budget.eval_per_chunk {
+        if plan.budget.eval_per_chunk() {
             mlx_rs::transforms::eval([&out])?;
         }
         outs.push(out);
@@ -343,6 +233,7 @@ fn slice_axis(a: &Array, axis: i32, start: i32, len: i32) -> Result<Array> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::CancelFlag;
     use mlx_rs::Dtype;
 
     fn flat(a: &Array) -> Vec<f32> {
@@ -411,7 +302,7 @@ mod tests {
     /// parity class). So the agreement is **numerical, not bit-exact in general**: measured on
     /// Apple M5 Max it is exactly `0` for some block sizes and ~1e-3 peak-relative for others, with
     /// no monotonic relationship to block size. At the *production* shape and budget it is exactly
-    /// zero — see [`chunking_is_exact_at_the_production_shape_and_budget`].
+    /// zero — see `at_the_production_shape_sdpa_streams_the_scores_and_chunking_is_exact`.
     const PRODUCTION_TOLERANCE: f32 = 2e-3;
 
     #[test]
@@ -423,21 +314,88 @@ mod tests {
         assert_eq!(AttentionBudget::default(), AttentionBudget::UNBOUNDED);
     }
 
+    /// **The kernel-to-planner binding.** `mlx_gen` re-exports gen-core's `AttentionBudget`, so
+    /// re-asserting the planner's arithmetic here would be a tautology — it would pass with the MLX
+    /// kernel deleted. What is worth pinning, and what this pins, is that
+    /// [`sdpa_budgeted_bhsd`] *actually sizes its chunks from the shared planner*: for each shared
+    /// conformance case, the kernel must run exactly `ceil(Sq / shared_boundary)` chunks.
+    ///
+    /// A kernel that reintroduced local chunk arithmetic — the failure this story exists to prevent —
+    /// fails here even though the planner itself is untouched.
+    ///
+    /// The shared table's rows are production geometries (Sq up to 65536) and cannot be launched in a
+    /// unit test — an earlier version of this test iterated them and silently exercised only the one
+    /// row small enough to run, which happened to be a *non-chunking* row. So this sweeps runnable
+    /// shapes across the **whole range of block sizes** — a single row, ragged multi-row splits, and
+    /// the un-chunked call — and requires the kernel's chunk count to equal the planner's
+    /// `ceil(Sq / block)` at every one.
+    ///
+    /// The production 4128-row geometry is bound at real size by
+    /// [`at_the_production_shape_sdpa_streams_the_scores_and_chunking_is_exact`] (541 rows ⇒ 8 chunks);
+    /// the planner's agreement with the shared table is pinned by
+    /// [`the_production_geometry_plans_the_shared_boundary`].
     #[test]
-    fn query_block_derives_the_declared_chunk_rows() {
-        // The production Z-Image-turbo unified stack at 1024²: B=1, H=30, Sq=Sk=4128.
-        // 64 Mi / (1·30·4128) = 541 rows.
+    fn the_kernel_chunks_exactly_as_the_shared_planner_declares() {
+        // Sq = 37 is prime, so every block size below it leaves a ragged tail — a kernel that rounded
+        // the tail differently from `ceil` shows up here.
+        let (b, h, sq, d) = (1i32, 3i32, 37i32, 8i32);
+        let q = arange(&[b, h, sq, d], 0.017, 0.3);
+        let k = arange(&[b, h, sq, d], 0.013, -0.7);
+        let v = arange(&[b, h, sq, d], 0.011, 1.1);
+        let scale = (d as f32).powf(-0.5);
+        let rows_per_query = (b * h * sq) as u64;
+
+        let mut chunked_arms = 0;
+        for rows in [1i32, 2, 5, 18, 36, 37] {
+            let budget = AttentionBudget::from_score_elements(rows_per_query * rows as u64, false);
+            let block = budget.query_block(b, h, sq, sq);
+            assert_eq!(
+                block, rows,
+                "the planner did not produce the {rows}-row block this arm targets"
+            );
+            reset_chunk_count();
+            sdpa_budgeted_bhsd(&q, &k, &v, scale, None, AttentionPlan::budgeted(budget)).unwrap();
+            let expected = (sq as usize).div_ceil(block as usize);
+            assert_eq!(
+                last_chunk_count(),
+                expected,
+                "at a {block}-row block the kernel ran {} chunks, the shared planner implies \
+                 {expected}",
+                last_chunk_count()
+            );
+            if expected > 1 {
+                chunked_arms += 1;
+            }
+        }
+        assert!(
+            chunked_arms >= 5,
+            "only {chunked_arms} arms actually chunked — this test would pass with chunking gone"
+        );
+    }
+
+    /// The production geometry the MLX kernel ships at must be the boundary the shared table declares.
+    /// Pinned against the table by value (not by a name lookup) so a reworded case cannot silently
+    /// drop the assertion.
+    #[test]
+    fn the_production_geometry_plans_the_shared_boundary() {
+        // Z-Image-turbo unified stack at 1024²: B=1, H=30, Sq=Sk=4128 → 64 Mi / (30·4128) = 541 rows.
         let budget = AttentionBudget::CONSTRAINED;
         assert_eq!(budget.query_block(1, 30, 4128, 4128), 541);
+        let shared = gen_core::attention_budget::CROSS_BACKEND_CHUNK_CASES
+            .iter()
+            .find(|c| {
+                c.budget == CONSTRAINED_ATTN_SCORES_BUDGET
+                    && c.rows_per_query == 30 * 4128
+                    && c.sq == 4128
+            })
+            .expect("the shared table must carry the production z-image geometry");
+        assert_eq!(
+            budget.query_block(1, 30, 4128, 4128) as u64,
+            shared.expect_rows,
+            "the MLX 4-D adapter diverged from the shared table at the production geometry"
+        );
         // A call that already fits the budget is a single un-chunked pass.
         assert_eq!(budget.query_block(1, 30, 32, 32), 32);
-        // Degenerate rows-per-query never divides by zero, and one row is the floor.
-        let tiny = AttentionBudget::from_score_elements(1, false);
-        assert_eq!(tiny.query_block(1, 30, 4128, 4128), 1);
-        assert_eq!(tiny.query_block(1, 30, 1, 4128), 1);
-        // A zero budget clamps to one row rather than dividing by zero or returning zero.
-        let zero = AttentionBudget::from_score_elements(0, false);
-        assert_eq!(zero.query_block(1, 30, 4128, 4128), 1);
     }
 
     #[test]

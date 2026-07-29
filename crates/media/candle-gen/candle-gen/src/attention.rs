@@ -264,6 +264,59 @@ mod tests {
         assert_eq!(query_block(16384, 16384, b), 16384);
     }
 
+    /// **The cross-backend conformance gate (SC-15793).** Candle's chunk boundaries must match the
+    /// ones `gen_core::attention_budget` declares — the shared rung-3 planner the MLX backend also
+    /// plans through (`mlx_gen::attention`).
+    ///
+    /// This is the property that makes the epic's per-backend calibration evidence comparable. The two
+    /// backends' *savings* differ by an order of magnitude (−32% candle denoise vs −1.7% MLX denoise)
+    /// because their kernels genuinely differ, and that is expected and correct. But a declared budget
+    /// has to name the **same chunking** on both sides, or
+    /// `strategyParameters.chunkedAttention.attentionChunkSize` means two different things and the two
+    /// backends' numbers cannot be placed in one matrix.
+    ///
+    /// This crate deliberately keeps its own `query_block` for now (rung 3's candle refactor is its own
+    /// story); what this test guarantees is that the two implementations cannot silently drift apart
+    /// while that is true. Flip either side's arithmetic and this goes red.
+    #[test]
+    fn candle_chunk_boundaries_match_the_shared_cross_backend_table() {
+        for case in gen_core::attention_budget::CROSS_BACKEND_CHUNK_CASES {
+            let rows_per_query = case.rows_per_query as usize;
+            let sq = case.sq as usize;
+            let budget = case.budget as usize;
+            let candle = query_block(rows_per_query, sq, budget);
+            assert_eq!(
+                candle as u64, case.expect_rows,
+                "{}: candle plans {candle} rows, the shared table declares {}",
+                case.what, case.expect_rows
+            );
+            // And against the shared planner directly, so this compares implementations rather than
+            // two copies of the same literal.
+            let shared = gen_core::attention_budget::AttentionBudget::from_score_elements(
+                case.budget,
+                false,
+            )
+            .query_block_rows(case.rows_per_query, case.sq);
+            assert_eq!(
+                candle as u64, shared,
+                "{}: candle plans {candle} rows, gen-core's shared planner plans {shared}",
+                case.what
+            );
+        }
+    }
+
+    /// The shared table must cover the budget this crate actually ships as its i32-overflow guard,
+    /// otherwise the conformance above could pass while the production budget went unchecked.
+    #[test]
+    fn the_shared_table_covers_this_crates_guard_budget() {
+        assert!(
+            gen_core::attention_budget::CROSS_BACKEND_CHUNK_CASES
+                .iter()
+                .any(|c| c.budget == ATTN_SCORES_BUDGET as u64),
+            "the shared cross-backend table no longer covers ATTN_SCORES_BUDGET ({ATTN_SCORES_BUDGET})"
+        );
+    }
+
     #[test]
     fn flat_chunked_matches_single_pass() {
         // The 3-D (heads-folded / single-head VAE) shape, same invariant.
