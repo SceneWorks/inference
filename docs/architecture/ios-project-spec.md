@@ -18,7 +18,31 @@ Date: 2026-07-29. Target: `SceneWorks/inference` @ `main`.
 | **First architecture** | `Architecture::Qwen3` / `Architecture::Llama` |
 | **LLM surface** | text + streaming + cancel, **tool calling**, **thinking/reasoning**, **JSON constraint** |
 | **Image generation** | **launch requirement** — `mlx-gen-sana` (small, image-only) + `mlx-gen-sensenova` (unified AR LLM + image) |
+| **Target device** | iPhone 17 Pro (the only device available). Older devices are a *later* priority if the work gains traction — see §0.1 |
+| **Shipping** | Text-only milestone ships independently at ~wk 9–11; full v1 with image at ~wk 18–20 (§8.3) |
 | **Out of scope** | video, audio, training/LoRA on device, the remaining ~47 media providers |
+
+### 0.1 Device target, and the guardrail that goes with it
+
+v1 develops and validates on an **iPhone 17 Pro** (12 GB RAM, ~6 GB app cap) because that is the
+device we have. Broader support is explicitly wanted later if the work gains traction.
+
+**Therefore: do not bake a 12 GB device into the architecture.** The difference between "we
+tuned for 6 GB" and "we assumed 6 GB" is the difference between a later tuning exercise and a
+later rearchitecture. Concretely:
+
+- **Keep the staged load/unload seam even where v1 does not need it.** On a 17 Pro the text model
+  and the image stack can be co-resident (~3.1 GB + ~2.0 GB ≈ 5.1 GB, fits). On an 8 GB device
+  (~4 GB cap) they cannot. Build the load/unload boundary in T2 and simply leave it disabled —
+  retrofitting it into a pipeline that assumed co-residency is the expensive version.
+- **Record peak RSS against two lines, not one:** the ~6 GB cap we ship against, and a ~4 GB
+  reference line for the 8 GB class. The second number costs nothing to log and tells us, at any
+  moment, how far a broader-device release actually is.
+- **Treat any *hard* dependency on >4 GB as a design decision requiring a note**, not an
+  incidental outcome of tuning.
+
+This is the one place where the narrow device availability could quietly become an architectural
+commitment, so it is called out here rather than left to T2.
 
 ### What this is structurally
 
@@ -181,6 +205,32 @@ The remaining unknown is no longer *whether* it builds, but what happens at runt
 metallib resolution on a real device, and the memory/energy numbers. Those still need the
 device.
 
+### 2.3 Fork strategy — decided
+
+**Fork `pmetal-mlx-rs` now, open upstream PRs in parallel.** A1 is not blocked on someone else's
+review latency; the fork is dropped if and when the PRs merge.
+
+Mechanics, checked against the gate:
+
+- `scripts/check-workspace.py`'s `PINNED_WORKSPACE_DEPENDENCIES` (line 35) asserts the **`rev`**
+  and the **`package` alias** — it does **not** assert the git URL. So a fork that keeps the
+  package names `pmetal-mlx-rs` / `pmetal-mlx-sys` needs only the two revision strings updated
+  there, plus the matching `git`/`rev` in the root `Cargo.toml`. `DEFAULT_GRAPH_PINNED_PACKAGES`
+  derives from the same dict, so one edit covers both the manifest check and the resolved-graph
+  check.
+- Keep the fork's delta **additive and minimal** — three fixes, nothing else — so the upstream
+  PRs stay reviewable and the eventual rebase is cheap.
+- Record the fork's lineage in the root `Cargo.toml` comment block, matching the existing
+  convention there for SHA history.
+
+Three PRs, in ascending order of how much discussion they will need:
+
+| PR | Change | Note |
+|---|---|---|
+| 1 | Narrow `qqmm_device`'s `cfg(not(target_os = "macos"))` to the CUDA/Linux target it documents | Fixes a latent defect on **any** non-macOS/non-Linux target, not just iOS. Strongest standalone case. |
+| 2 | Target-aware clang runtime selection in `find_clang_runtime_lib` | `libclang_rt.ios.a` when `CARGO_CFG_TARGET_OS = "ios"`. |
+| 3 | iOS metallib resolution — bundle rather than `$HOME` cache | Touches the existing patched resolver; most likely to need discussion upstream. Carry longest in the fork. |
+
 ### If Phase 0 fails
 
 If `mlx-sys` proves genuinely un-buildable for `aarch64-apple-ios`, this plan does not survive
@@ -318,8 +368,20 @@ separately; this is infrastructure, not a line item.**
   media conformance suite on a physical device via `xcodebuild test`, plus the Phase 0 numbers as
   regression baselines.
 
-Tier 3 needs a device attached to a runner — self-hosted Mac mini with a tethered phone, or a
-cloud device farm. Decide early; it gates the A3 and T4 exits.
+**Decided: a self-hosted runner on the primary development machine (§8.4), with one dedicated
+iPhone 17 Pro tethered by USB.** Chosen over a cloud device farm specifically because farms
+typically restrict Instruments-level profiling, and the energy and thermal numbers in G5 are the
+whole point of Tier 3 — a farm that cannot produce them cannot enforce the baselines.
+
+Setup work, and its consequences:
+
+- Register the machine as a GitHub Actions self-hosted runner, labelled for the iOS lane.
+- Dedicate one iPhone 17 Pro to it. It cannot double as a daily-driver phone; unlock state and
+  storage pressure both break unattended runs.
+- The machine must stay online for nightly Tier 2 and pre-release Tier 3. If it sleeps, the lane
+  silently stops reporting — add a heartbeat check rather than trusting green-by-absence.
+- **Single point of failure, accepted.** One device, one runner, one machine. Tier 1 stays on
+  hosted runners so an outage never blocks PRs.
 
 ### 5.4 Conformance wiring
 
@@ -431,8 +493,29 @@ Track 2                            [====][====][=======][====]            9
 
 - **~18–20 weeks** end to end, with the code-side phases compressed against the §7 estimates and
   the device-dependent ones unchanged.
-- **Text-only milestone at ~week 9–11**, shippable independently behind `--no-default-features`.
 - A1 is the serialization point: nothing else starts until `aarch64-apple-ios` builds.
+
+### 8.5 The text-only milestone ships — what that commits us to
+
+**Decided: the ~week 9–11 text-only build ships independently**, behind
+`--no-default-features`, ahead of the image tracks.
+
+This is the right call — it puts real usage against the runtime ~10 weeks before full v1, and T2's
+memory tuning stops being guesswork — but it is not free, and the costs land early:
+
+- **The FFI surface becomes a compatibility boundary at week 9**, not at week 18. Once a consumer
+  builds against the `.xcframework`, changing its shape is a breaking change. §5.2(a) must be
+  designed as a stable API, not as a test harness, and reviewed with the same care as a public
+  crate surface (`CONTRIBUTING.md`'s rename rules apply in spirit).
+- **The image tracks must not require changing it.** Design the C boundary for `Generator` /
+  `on_progress` at the same time as the `TextLlm` one, even though image generation lands nine
+  weeks later. Retrofitting a second callback shape into a shipped ABI is the expensive path.
+- **Tier 3 CI must exist by week 9**, not by T4 — a shipped artifact needs enforced regression
+  baselines. Pull the runner setup (§5.3) forward into A3.
+- **The consumer is presumed to be the LLM-only product** (ChatWorks, per the workspace's
+  existing `--no-default-features` composition profile), not the SwiftUI host app, which stays a
+  test harness. **Confirm this** — if the milestone is instead an app ship, §5.2(b) needs a real
+  product scope and a different budget.
 
 ### 8.4 Development environment — verified ready
 
@@ -473,19 +556,23 @@ self-hosted runner host, which removes one dependency from §5.3 — it needs on
 
 ---
 
-## 10. Open questions
+## 10. Decisions and remaining questions
 
-**Resolved 2026-07-29:** no existing Swift host app — this project builds it (§5.2b). Team is one
-engineer plus Claude (§8.1). Development environment verified ready (§8.4).
+**Resolved 2026-07-29:**
 
-Still open:
+| Question | Answer | Where |
+|---|---|---|
+| Existing Swift host app? | None — this project builds it | §5.2b |
+| Team | One engineer plus Claude; device time is the bottleneck | §8.1–8.2 |
+| Development environment | Verified ready, nothing to install | §8.4 |
+| Target device | iPhone 17 Pro only for now; broaden later if it gains traction — with a portability guardrail so that stays a tuning job | §0.1 |
+| Device CI | Self-hosted runner on the dev machine, one tethered 17 Pro; chosen for Instruments access | §5.3 |
+| Text-only milestone | Ships independently at ~wk 9–11 | §8.5 |
+| mlx-rs fixes | Fork now, upstream three PRs in parallel | §2.3 |
 
-1. **Which iPhone(s) are the test devices?** The per-app memory cap and thermal envelope differ
-   enough across generations to change the model-size target. At minimum: the oldest device v1
-   must support, plus a current Pro.
-2. **Device CI:** this machine can host Tier 2/Tier 3 (§8.4) — is tethering a dedicated device to
-   it acceptable, or is a cloud device farm preferred?
-3. **Is the text-only milestone at ~week 9–11 worth shipping independently**, or does v1 wait for
-   the image tracks?
-4. **Has the `com.apple.developer.kernel.increased-memory-limit` entitlement been requested?**
-   §8.2 — it gates A2 and T2 and its lead time is Apple's.
+**Still open — both are actions, not decisions:**
+
+1. **Request the `com.apple.developer.kernel.increased-memory-limit` entitlement.** Gates A2 and
+   T2; the lead time is Apple's, not ours. **Start it now**, before it is needed (§8.2).
+2. **Confirm the week 9–11 consumer** is the LLM-only product rather than the host app (§8.5).
+   It changes whether §5.2(b) is a test harness or a product.
