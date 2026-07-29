@@ -100,6 +100,66 @@ into a measured fact. The Rust is known to be platform-neutral (zero `cfg(target
 regression baselines (G5), and they are the evidence that would reopen the ANE question later
 ([strategy §7.2](ios-strategy.md)).
 
+### 2.1 First results — 2026-07-29
+
+`cargo build --target aarch64-apple-ios -p mlx-llm` was run on the development machine (§8.4).
+**It gets much further than the static analysis predicted.**
+
+What worked:
+
+- The entire Rust dependency tree — `core-llm`, `tokenizers` 0.21, `minijinja`, `compact_str` and
+  the rest — compiles cleanly for `aarch64-apple-ios`. No source changes, no feature juggling.
+- `pmetal-mlx-sys`'s cmake build of MLX's C++ **ran to completion**, and produced a metallib.
+
+Two failures, and the distinction between them matters:
+
+**(1) iOS-specific, small, well-understood.**
+
+```
+error: failed to add native library …/lib/clang/21.0.0/lib/darwin/libclang_rt.osx.a:
+       Unsupported archive identifier
+```
+
+`build.rs`'s `find_clang_runtime_lib` resolves the clang runtime via `xcrun` and unconditionally
+takes the **`osx`** variant; linking a macOS archive into an iOS binary is rejected. The fix is
+target-aware selection (`libclang_rt.ios.a`) inside that one function.
+
+Alongside it, an observed — not inferred — confirmation of the sandbox problem:
+
+```
+warning: pmetal-mlx-sys@0.2.4: Cached mlx.metallib to /Users/…/.cache/pmetal/lib/mlx.metallib
+```
+
+The metallib was cached to `$HOME` **for the iOS target**, exactly as predicted.
+
+This also corrects a claim in an earlier draft: build scripts compile for the *host*, so the
+`#[cfg(target_os = "macos")]` branches **run** during an iOS cross-build. They do not skip iOS
+setup, they mis-configure it. The remedy is branching on `CARGO_CFG_TARGET_OS` / `TARGET`, not
+removing the gates.
+
+**(2) Possibly not iOS-specific at all — under investigation.**
+
+```
+error[E0061]: this function takes 10 arguments but 8 arguments were supplied
+  mlx-rs/src/ops/quantization.rs:280   mlx_sys::mlx_qqmm(…)
+```
+
+The generated bindings declare `mlx_qqmm` with ten parameters (including `global_scale_x` /
+`global_scale_w`); `mlx-rs`'s call site passes eight. **All ten cached host binding sets carry the
+identical ten-parameter signature**, so this is not an artefact of the iOS staging. The open
+question is whether a *clean* host build hits the same error — i.e. whether the pinned
+`pmetal-mlx-rs` rev is currently green only from cache. A clean
+`--target aarch64-apple-darwin` build is running to settle it.
+
+- If the clean host build **fails identically**, this is a pre-existing defect in the pinned rev,
+  it blocks fresh clones and CI as much as iOS, and it is upstream work — not iOS scope.
+- If the clean host build **succeeds**, something in the iOS path regenerates different bindings,
+  and it belongs to A1.
+
+**Read-through:** the headline is positive. The iOS blocker list is shorter and more mechanical
+than the static read suggested — no missing Metal support, no architectural obstacle, no
+unbuildable C++. R1's likelihood drops accordingly.
+
 ### If Phase 0 fails
 
 If `mlx-sys` proves genuinely un-buildable for `aarch64-apple-ios`, this plan does not survive

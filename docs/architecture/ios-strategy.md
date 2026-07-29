@@ -88,7 +88,11 @@ engine's own code compiles for `aarch64-apple-ios` essentially unchanged.
 (`pmetal-mlx-sys` @ `932beb4`) has no iOS story at all:
 
 - `build.rs` is `#[cfg(target_os = "macos")]`-gated in three places, including the entire
-  deployment-target setup.
+  deployment-target setup. **Note the subtlety:** build scripts compile for the *host*, so on a
+  macOS host those branches run even when cross-compiling to iOS. They do not skip the iOS
+  build — they **mis-configure** it (setting `MACOSX_DEPLOYMENT_TARGET`, resolving the macOS
+  clang runtime, caching the metallib to `$HOME`). The fix is target-aware branching on
+  `CARGO_CFG_TARGET_OS` / the `TARGET` env var, not un-gating.
 - It drives MLX's C++ via `cmake::Config` with **no iOS toolchain arguments** — no
   `CMAKE_SYSTEM_NAME=iOS`, no `IPHONEOS_DEPLOYMENT_TARGET`.
 - It caches `mlx.metallib` into `~/.cache/pmetal/lib/`. **That is meaningless in an iOS app
