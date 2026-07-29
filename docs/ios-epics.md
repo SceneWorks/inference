@@ -53,17 +53,22 @@ memory work depends on E3 and E4.
 review path from anything else here — and it is the one epic with an external dependency
 (upstream review latency) that we do not control.
 
-**Status: S1.1–S1.2 and S1.4 done; S1.3, S1.5, S1.6 remain.** `cargo build --locked --target
-aarch64-apple-ios -p mlx-llm-server` succeeds from a clean clone with **no environment variables
-set**, producing a Mach-O arm64 binary (`platform 2`, `minos 18.0`) whose metallib reports
-`apple-ios18.0.0` across all 15,660 kernels. The macOS lane is unaffected (`minos 26.2`, NAX floor
-intact).
+**Status: S1.1–S1.4 done; only the CI stories (S1.5, S1.6) remain.**
+`cargo build --locked --target aarch64-apple-ios -p mlx-llm-server` succeeds from a clean clone
+with **no environment variables set**, producing a Mach-O arm64 binary (`platform 2`,
+`minos 18.0`) whose metallib reports `apple-ios18.0.0` across all 15,660 kernels, and a packaging
+script places that metallib where the sandbox can find it. The macOS lane is unaffected
+(`minos 26.2`, NAX floor intact).
+
+**Everything here is still build-time evidence.** No iOS artifact has executed. The metallib is
+correctly *targeted* and correctly *placed*, but whether those kernels are numerically right, and
+whether resolution actually succeeds inside a real sandbox, are E3's questions (R9, R11).
 
 | Story | Notes |
 |---|---|
 | S1.1 Land the mlx-rs iOS fixes upstream | [SceneWorks/mlx-rs#23](https://github.com/SceneWorks/mlx-rs/pull/23) — **open**, three commits: `qqmm_device` cfg, target-aware clang runtime + cmake cross-compile + cache gating, and `ios-metal-sdk.patch`. |
 | S1.2 Home the iOS deployment target in `.cargo/config.toml` | **Done** — `IPHONEOS_DEPLOYMENT_TARGET = "18.0"`, unforced so CI can override. Both halves now covered: the fork's `build.rs` carries it to cmake/Metal, and this entry carries it to rustc's link step (which `env::set_var` cannot reach). Verified with a clean env-free build; macOS `minos 26.2` unchanged. |
-| S1.3 Bundle `mlx.metallib` into the `.app` | Today it is cached to `~/.cache/pmetal/lib`, meaningless in a sandbox. The `$PMETAL_METALLIB_PATH` / `set_metallib_path()` seam already exists. **The cross-build no longer poisons the macOS cache** (fixed), but bundling itself is outstanding. |
+| S1.3 Bundle `mlx.metallib` into the `.app` | **Done.** Fork emits `DEP_MLX_METALLIB` (via `links = "mlx"`); `scripts/ios/bundle_metallib.py` copies it next to the executable as an Xcode Run Script phase, with `--expect-platform` refusing a macOS metallib in an iOS bundle and `--codesign-identity` re-signing the copy. **Not yet exercised on device** — that is E3/S3.3. |
 | S1.4 Repoint the workspace at the fork | **Done** — pinned at `zakkeown/mlx-rs` @ `b3c0e27e`. The gate now asserts the **git URL** too (it previously did not, so a same-rev pin from another remote passed silently). Touched four files beyond the manifests: `bump_pins.py` hardcodes the URL and regex-parses gate entries, plus its tests. Revert the URL when #23 merges. |
 | S1.5 Tier 1 CI | `cargo build --target aarch64-apple-ios` + `clippy -D warnings` on hosted runners. Build regressions only. |
 | S1.6 Simulator target builds | `aarch64-apple-ios-sim`, required by E3's Tier 2. |
