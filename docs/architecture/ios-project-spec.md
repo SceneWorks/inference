@@ -213,7 +213,59 @@ Track 2 gate is green too.
 | 1 | `qqmm_device`'s `cfg(not(target_os = "macos"))` catches iOS for a CUDA-only function, whose call site had also gone stale (8 of 10 args) | **Fixed** — [SceneWorks/mlx-rs#23](https://github.com/SceneWorks/mlx-rs/pull/23) |
 | 2 | `build.rs` links `libclang_rt.osx.a` unconditionally | **Fixed** — same PR. Skip the link off macOS entirely; it is a macOS-26+ `___isPlatformVersionAtLeast` workaround, and the `ios`/`iossim` archives are rejected identically *and* unneeded. |
 | 3 | **`IPHONEOS_DEPLOYMENT_TARGET` unset** — `rustc`'s default for `aarch64-apple-ios` is **10.0**, which drops `___chkstk_darwin` (libSystem, iOS 12+) at link time | **Diagnosed, needs a home** — see below |
-| 4 | `mlx.metallib` cached to `~/.cache/pmetal/lib` instead of bundled into the `.app` | **Open** — a *runtime* issue; it does not block the build. Resolver seam (`$PMETAL_METALLIB_PATH`) already exists. |
+| 4 | `mlx.metallib` cached to `~/.cache/pmetal/lib` instead of bundled into the `.app` | **Worse than "open" — it poisons the macOS cache.** See below. |
+| 5 | The iOS build's Metal kernels were compiled for **`macosx`**, not iOS | **Open** — found while investigating 4. |
+
+**Blocker 4 is a live hazard for macOS developers, not just an iOS gap.** Verified on this
+machine: an iOS cross-build **overwrote `~/.cache/pmetal/lib/mlx.metallib`** — the shared,
+platform-agnostic cache path — with its own artifact.
+
+That cache is documented in the repo's own `CLAUDE.md` as load-bearing: local `cargo test` / `cargo run`
+binaries have **no compiled-in metallib**, so the user-cache copy is their *sole* working
+resolution. The existing sc-7889 hazard is a stale-but-valid macOS metallib shadowing a newer one;
+this is a *different platform's* metallib landing in the same slot, and the resolver has no way to
+tell them apart. The fix is to gate the cache write to `CARGO_CFG_TARGET_OS = "macos"`, which is
+correct regardless of iOS: an `.app` bundles its metallib and cannot read `$HOME` usefully anyway.
+
+**Blocker 5 was found by following blocker 4, and it is the one that matters.** `strings` on the
+iOS build's metallib reports `macosx`. Adding `CMAKE_SYSTEM_NAME=iOS` +
+`CMAKE_OSX_ARCHITECTURES=arm64` fixed the **C++** objects (`minos` 26.2 → 16.0, verified) but
+**not** the Metal kernels, because the metallib is compiled by rules that hardcode the SDK:
+
+```cmake
+# mlx/backend/metal/kernels/CMakeLists.txt — upstream MLX, not the fork
+"-mmacosx-version-min=${CMAKE_OSX_DEPLOYMENT_TARGET}")
+COMMAND xcrun -sdk macosx metal ${METAL_FLAGS} -c ${SRCFILE}
+...
+set(METAL_LINK_FLAGS "-mmacosx-version-min=${CMAKE_OSX_DEPLOYMENT_TARGET}")
+COMMAND xcrun -sdk macosx metal ${METAL_LINK_FLAGS} ${KERNEL_AIR} -o
+```
+
+`xcrun -sdk macosx metal` compiles Metal against the **macOS** SDK unconditionally, and
+`-mmacosx-version-min` is meaningless for an iOS target. MLX's root `CMakeLists.txt` *does* guard
+its SDK probe on `CMAKE_SYSTEM_NAME STREQUAL "Darwin"` and sets `MLX_METAL_VERSION 0` otherwise —
+so upstream anticipated non-macOS configuration — but the kernel rules were never given the
+matching iOS path.
+
+**So a binary that links cleanly still carries macOS Metal kernels and would fail at
+runtime on a device.** This is exactly the failure §2.2's earlier draft could not have caught: a
+green build is not evidence of a working device artifact. The `otool`/`strings` platform checks
+above should be a **CI assertion in Tier 1**, not a manual step.
+
+**Scope:** this is a change to **upstream MLX's** kernel build, not to `mlx-rs` or the fork's
+patches. It is meaningfully larger than blockers 1–3 and is the first item that touches
+`ml-explore/mlx` itself. Options, in preference order:
+
+1. **A fourth `mlx-sys` patch** injecting an iOS branch into the kernel rules
+   (`xcrun -sdk iphoneos metal` + `-mios-version-min`). Consistent with the three patches the
+   fork already applies, and does not block on upstream.
+2. Upstream PR to `ml-explore/mlx` adding the iOS path. Right long-term home; unknown latency.
+3. Pre-build the metallib out-of-band and point at it via `$PMETAL_METALLIB_PATH`. Works, but
+   moves a build artifact into deployment configuration — avoid.
+
+**Estimate: 3–5 days**, most of it verifying the kernels are correct rather than merely
+compiling — the sc-2772 NAX miscompile is precedent for a metallib that builds and produces
+garbage. This is E1's remaining work and the reason A1's three weeks should not yet be cut.
 
 **Blocker 3 is the interesting one**, because it is configuration rather than code and it has a
 second face. The MLX C++ objects came out with `minos 26.2` — `MACOSX_DEPLOYMENT_TARGET` from
@@ -223,13 +275,15 @@ Rust side linked at 10.0. Both halves need an **intentional** iOS deployment tar
 it in `.cargo/config.toml` (or in the build script's deployment-target logic) rather than relying
 on an env var at the command line.
 
-**Nothing architectural was found.** No missing Metal support, no unbuildable C++, no absent iOS
-capability — the fixes were two small patches and one env var.
+**Nothing architectural was found**, in the sense that matters: no missing Metal support on iOS,
+no unbuildable C++, no absent capability. But blocker 5 is a genuine porting task in upstream
+MLX, not a configuration fix — so the early read that "the blocker list is short and mechanical"
+was **half right**. Blockers 1–3 were mechanical; blocker 5 is not.
 
-**R1 is retired as a build risk.** A1's three weeks was budgeted almost entirely for "can we make
-this build at all", and the answer arrived in a day. That time should be re-aimed at blockers 3
-and 4 (deployment target properly homed, metallib bundling), the `runtime-ios` bundle, and
-getting onto the device — where the real unknowns now live.
+**R1 is downgraded, not retired.** The build reaches a linked binary and the C++ cross-compiles
+correctly, so the lane is sound. But "it builds" turned out not to mean "it runs", and A1's three
+weeks should stay budgeted: ~1 day of it is spent, blocker 5 needs 3–5 days, and metallib
+bundling plus the deployment-target homing follow. The device remains unproven.
 
 ### 2.3 Fork strategy — decided
 
@@ -496,8 +550,10 @@ precisely what a CoreML text lane would have broken.
 
 | # | Risk | L | I | Mitigation |
 |---|---|---|---|---|
-| R1 | ~~**`mlx-sys` cannot be built for iOS**~~ | — | — | **Retired 2026-07-29** (§2.2). A fully linked iOS arm64 binary exists, and `mlx-gen-sana` builds alongside it. Fallback §3 is now only reachable via a runtime blocker on device. |
-| R8 | Runtime failure on device (metallib not resolvable inside the sandbox) | M | H | Blocker 4 in §2.2. The `$PMETAL_METALLIB_PATH` seam exists; bundling is A1 work. **This is now the first real unknown**, and it needs the device. |
+| R1 | **`mlx-sys` cannot be built for iOS** | **L** | **Critical** | **Downgraded, not retired** (§2.2). A linked iOS arm64 binary exists and the C++ cross-compiles at `minos 16.0`, but the Metal kernels are still macOS — blocker 5. Fallback §3 stays live until a device runs real kernels. |
+| R8 | Metal kernels must be cross-compiled for iOS in **upstream MLX** | H | H | Blocker 5. A fourth `mlx-sys` patch is the preferred route (§2.2). Verification, not compilation, is the cost — cf. the sc-2772 NAX miscompile. |
+| R9 | A green build is mistaken for a working device artifact | M | H | **Already happened once.** Add `otool -l` / `strings` platform assertions to Tier 1 CI so the metallib and objects are checked for `platform 2` / `iphoneos`, not just for linking. |
+| R10 | Cross-builds poison the shared `~/.cache/pmetal/lib` metallib | — | H | **Fixed** — cache write gated to `CARGO_CFG_TARGET_OS = "macos"`. Verified: an iOS build now leaves the hash unchanged. Was silently breaking local macOS `cargo test`. |
 | R2 | Per-app memory cap tighter than the reported ~6 GB | M | H | Measured in Phase 0. Conclusion holds at 4 GB: ~3–4B at 4-bit. |
 | R3 | mlx-sys iOS fork drifts from upstream | H | M | Keep the delta additive; attempt upstreaming in A1. |
 | R4 | Threading contract violated by the Swift host | M | H | Documented ownership rule + hostile-threading test in A2 (§4.1). |
