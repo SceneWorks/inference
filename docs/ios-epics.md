@@ -25,7 +25,7 @@ Two constraints set the grain:
 | # | Epic | Failure mode it owns | Exit | ~wks |
 |---|---|---|---|---|
 | **E1** | iOS toolchain | Toolchain / upstream — **retired** | ~~Green `aarch64-apple-ios` CI build, no local env vars~~ **met** | ~~2~~ **done** |
-| **E2** | `runtime-ios` composition | Composition — low, well-trodden here | `RuntimeCatalog` validates; surface tests green both profiles | ~2 |
+| **E2** | `runtime-ios` composition | Composition — **retired** | ~~`RuntimeCatalog` validates; surface test green~~ **met** | ~~2~~ **done** |
 | **E3** | On-device proof | **Device runtime** — metallib in sandbox, provisioning | `textllm_conformance` green on a physical iPhone | ~3–4 |
 | **E4** | Memory & performance | **Memory, thermals, threading** | G5 numbers published and enforced as thresholds | ~3 |
 | **E5** | On-device image generation | **Model portability** | G6 + G7 | ~9 |
@@ -72,7 +72,7 @@ made those questions *answerable*; it has not answered them.
 | S1.1 Land the mlx-rs iOS fixes upstream | [SceneWorks/mlx-rs#23](https://github.com/SceneWorks/mlx-rs/pull/23) — **open**, three commits: `qqmm_device` cfg, target-aware clang runtime + cmake cross-compile + cache gating, and `ios-metal-sdk.patch`. |
 | S1.2 Home the iOS deployment target in `.cargo/config.toml` | **Done** — `IPHONEOS_DEPLOYMENT_TARGET = "18.0"`, unforced so CI can override. Both halves now covered: the fork's `build.rs` carries it to cmake/Metal, and this entry carries it to rustc's link step (which `env::set_var` cannot reach). Verified with a clean env-free build; macOS `minos 26.2` unchanged. |
 | S1.3 Bundle `mlx.metallib` into the `.app` | **Done.** Fork emits `DEP_MLX_METALLIB` (via `links = "mlx"`); `scripts/ios/bundle_metallib.py` copies it next to the executable as an Xcode Run Script phase, with `--expect-platform` refusing a macOS metallib in an iOS bundle and `--codesign-identity` re-signing the copy. **Not yet exercised on device** — that is E3/S3.3. |
-| S1.4 Repoint the workspace at the fork | **Done** — pinned at `zakkeown/mlx-rs` @ `b3c0e27e`. The gate now asserts the **git URL** too (it previously did not, so a same-rev pin from another remote passed silently). Touched four files beyond the manifests: `bump_pins.py` hardcodes the URL and regex-parses gate entries, plus its tests. Revert the URL when #23 merges. |
+| S1.4 Repoint the workspace at the fork | **Done** — pinned at `zakkeown/mlx-rs` (now @ `c0e5c4a4` after S1.3/S1.6). The gate now asserts the **git URL** too (it previously did not, so a same-rev pin from another remote passed silently). Touched four files beyond the manifests: `bump_pins.py` hardcodes the URL and regex-parses gate entries, plus its tests. Revert the URL when #23 merges. |
 | S1.5 Tier 1 CI | **Done** — `ios-build` job on `macos-15`, gated by the new `ios_build` lane. Builds both triples and **asserts the artifacts target iOS** (`otool` `platform 2`; metallib must not carry `apple-macos`), then exercises `bundle_metallib.py`. No env overrides — it proves a clean clone builds unaided. |
 | S1.6 Simulator target builds | **Done**, and not a formality: the simulator triple did not build at all. mlx-c's example `.app` targets default ON and reference `_MTLIOErrorDomain`, absent from the simulator's Metal framework, failing the whole cmake build. Fixed in the fork with `MLX_C_BUILD_EXAMPLES=OFF`. |
 
@@ -95,19 +95,23 @@ source of truth for what ships.
 
 | Story | Notes |
 |---|---|
-| S2.1 `crates/bundles/runtime-ios` | `PLATFORM = "ios"`, `BACKEND = "mlx"`, `SUPPORTED_TARGET_TRIPLES = ["aarch64-apple-ios"]`, `NATIVE_PREREQUISITES = ["iOS 18+", "Xcode 16+"]`, `catalog()` via `RuntimeCatalog::try_new`. Registers `mlx_llm::text_registry()` + `snapshot_preparer_registry()`. |
-| S2.2 Feature profiles | `default = ["media"]`; `--no-default-features` for the LLM-only profile. |
-| S2.3 Ordered catalog surface test | Both profiles. Mirrors the existing bundles'. |
-| S2.4 Repo gates | `EXPECTED_MEMBER_COUNT` 90 → 91/92; `select_lanes.py` `ios_device` lane + path rules; verify unclassified paths still fail safe. |
-| S2.5 Supply chain | `cargo deny check licenses` for any new deps. |
-| S2.6 Bundle README | Matches the other bundles'. |
+| S2.1 `crates/bundles/runtime-ios` | **Done** — `PLATFORM = "ios"`, `BACKEND = "mlx"`, both iOS triples, `catalog()` via `RuntimeCatalog::try_new` over `mlx_llm::text_registry()` + `snapshot_preparer_registry()`. |
+| S2.2 Feature profiles | **Done by removal.** No `media` feature: `mlx-gen-catalog` is 32 providers incl. video, wrong for a memory-capped device and unvalidated on iOS. The bundle is LLM-only *by construction*, so a feature gate would be decoration — `--no-default-features` yields the same surface. E5 adds a narrow media root instead. |
+| S2.3 Ordered catalog surface test | **Done** — asserts the ordered LLM ids match `runtime-macos` (shared engine; divergence = silent drift) **and** that every media/audio registry is empty, so an incidental `mlx-gen-catalog` dep fails here rather than shipping. |
+| S2.4 Repo gates | **Done** — `EXPECTED_MEMBER_COUNT` 90 → 91; `select_lanes.py` routes the bundle to `ios_build` + `release`; lane test pins that it does *not* wake `macos_metal`, `candle_cpu`, or `windows_cuda`. |
+| S2.5 Supply chain | **Done** — no new third-party deps (`runtime-catalog` + `mlx-llm`, both already in the graph), so `cargo deny` is unchanged. |
+| S2.6 Bundle README | **Done** — including the packaging step, which is not optional: an app without the bundled metallib fails at first Metal use with no build-time warning. |
 
-**Exit:** `RuntimeCatalog` validates the bundle; ordered surface tests green under both profiles;
-`check-workspace.py` and `cargo deny` pass.
+**Exit: MET.** `RuntimeCatalog` validates the bundle, the ordered surface test is green, and
+`check-workspace.py` (91 members), `check_docs.py`, clippy `-D warnings`, `fmt`, and 98 tooling
+tests all pass. The bundle cross-compiles for `aarch64-apple-ios`.
 
-**Invariant to protect:** this lane touches **no contract crate**. `core-llm` and `gen-core` stay
-unmodified — that is a property of choosing MLX over CoreML, and a regression if it stops being
-true.
+**Invariant held:** this epic touched **no contract crate**. `core-llm` and `gen-core` are
+unmodified — a property of choosing MLX over CoreML, and a regression if it stops being true.
+
+**Note on S2.2.** The planned `default = ["media"]` profile was dropped, not deferred: on this
+platform a media feature would have to gate a registry that does not and should not exist yet.
+The surface test now enforces its absence, which is the stronger guarantee.
 
 ---
 
