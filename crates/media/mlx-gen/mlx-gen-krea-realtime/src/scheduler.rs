@@ -4,9 +4,11 @@
 //! (the S1 audit): it is the bespoke few-step flow-matching renoise loop **adapted from** the reference
 //! (`krea-ai/realtime-video utils/scheduler.py` + `before_denoise.py::WanRTSetTimestepsStep` +
 //! `denoise.py`, mirrored by Self-Forcing's `FlowMatchScheduler`). A short `denoising_step_list`
-//! (`[1000, 937, 833, 625, 0]` for the shipped 14B) is run over one autoregressive chunk; each step
-//! takes an Euler `x0` estimate and renoises to the next step, with **CFG off** (a single batch-1
-//! forward per step).
+//! is run over one autoregressive chunk; each step takes an Euler `x0` estimate and renoises to the
+//! next step, with **CFG off** (a single batch-1 forward per step). The offline YAML names the
+//! integer list `[1000, 937, 833, 625, 0]`, but the pinned release server does not execute that list:
+//! `release_server.py` calls `v2v.py::get_denoising_schedule` over the shifted float timetable, which
+//! yields `[1000, 937.5, 833.333…, 625, 0]` at strength 1 / five steps.
 //!
 //! The schedule itself is the same **algebraic time-shift** the base Wan sampler uses
 //! ([`mlx_gen_wan::compute_sigmas`]), built here as the reference's full-resolution table so a
@@ -23,9 +25,9 @@
 //!
 //! Note the terminal `0` maps (via argmin over the `[:-1]`-truncated table) to the smallest tabled
 //! sigma `≈ 0.00498`, **not** exactly `0` — this is the reference's behaviour, not a bug: the final
-//! `x0` is `latents - 0.00498·noise_pred` (essentially the clean latent). The coefficient math runs
-//! in `f64` (the reference's Python-float / numpy path); only the final tensor combinations run in the
-//! latent dtype (f32), mirroring [`mlx_gen_wan::scheduler`].
+//! `x0` is `latents - 0.00498·noise_pred` (essentially the clean latent). The table algebra runs in
+//! source-precision `f32`; values are widened only for this API's scalar storage. Tensor
+//! combinations run in the latent dtype, matching [`mlx_gen_wan::scheduler`]'s scalar handling.
 //!
 //! The sigma schedule, the time-shift, and the Euler/renoise formulas are **re-derived** published
 //! flow-matching algebra (mathematical facts), written independently in Rust and validated against
@@ -63,20 +65,47 @@ pub fn renoise_step(x0: &Array, eps: &Array, sigma_next: f64) -> Result<Array> {
     Ok(add(&kept, &added)?)
 }
 
-/// Build the full shifted-sigma table for `shift` at `num_train` resolution: unshifted
-/// `linspace(1.0, 0.0, num_train + 1)[:-1]` (`u_i = 1 − i/num_train`, `i ∈ 0..num_train`), the algebraic
-/// time-shift `σ' = shift·σ / (1 + (shift − 1)·σ)`, and `timesteps = σ' · num_train`. Returns
-/// `(sigmas, timesteps)`, both length `num_train`, monotonically decreasing (`sigmas[0] = 1.0`,
-/// `timesteps[0] = num_train`).
+/// Reproduce `torch.linspace(..., dtype=torch.float32)`, including its start/end split that avoids
+/// accumulating error from only one endpoint.
+fn torch_f32_linspace(start: f32, end: f32, steps: usize) -> Vec<f32> {
+    match steps {
+        0 => Vec::new(),
+        1 => vec![start],
+        _ => {
+            let step = (end - start) / (steps - 1) as f32;
+            let halfway = steps / 2;
+            (0..steps)
+                .map(|i| {
+                    if i < halfway {
+                        start + step * i as f32
+                    } else {
+                        end - step * (steps - i - 1) as f32
+                    }
+                })
+                .collect()
+        }
+    }
+}
+
+/// Build the pinned source's full shifted-sigma table for `shift` at `num_train` resolution:
+/// float32 `linspace(1.0, 0.0, num_train + 1)[:-1]`, float32 algebraic time-shift
+/// `σ' = shift·σ / (1 + (shift − 1)·σ)`, and float32 `timesteps = σ' · num_train`. Values are widened
+/// to `f64` only for the public schedule's scalar storage. Returns `(sigmas, timesteps)`, both length
+/// `num_train`, monotonically decreasing (`sigmas[0] = 1.0`, `timesteps[0] = num_train`).
 fn full_shifted_table(shift: f64, num_train: usize) -> (Vec<f64>, Vec<f64>) {
-    let n = num_train as f64;
+    let shift = shift as f32;
+    let n = num_train as f32;
     let mut sigmas = Vec::with_capacity(num_train);
     let mut timesteps = Vec::with_capacity(num_train);
-    for i in 0..num_train {
-        let u = 1.0 - (i as f64) / n; // linspace(1.0, 0.0, num_train+1)[:-1][i]
-        let s = shift * u / (1.0 + (shift - 1.0) * u);
-        sigmas.push(s);
-        timesteps.push(s * n);
+    for u in torch_f32_linspace(1.0, 0.0, num_train + 1)
+        .into_iter()
+        .take(num_train)
+    {
+        let numerator = shift * u;
+        let denominator = 1.0 + (shift - 1.0) * u;
+        let sigma = numerator / denominator;
+        sigmas.push(sigma as f64);
+        timesteps.push((sigma * n) as f64);
     }
     (sigmas, timesteps)
 }
@@ -84,35 +113,44 @@ fn full_shifted_table(shift: f64, num_train: usize) -> (Vec<f64>, Vec<f64>) {
 /// The v2v **denoise-strength** step timesteps — the port of `v2v.py::get_denoising_schedule`:
 ///
 /// ```text
-/// raw  = linspace(strength·1000, 0, steps).to(int64)          # descending, ends at 0 (steps ≥ 2)
+/// raw  = linspace(strength·1000, 0, steps, dtype=float32).to(int64)
 /// list = zero_padded_timesteps[1000 − raw]                    # re-index the warped model-timestep table
 /// ```
 ///
 /// where `warped_timesteps` is the full shifted model-timestep table (`sigmas·1000`, length
 /// [`NUM_TRAIN_TIMESTEPS`], `timesteps[0] = 1000`) and `zero_padded_timesteps` is that table with a
 /// terminal `0` appended at index [`NUM_TRAIN_TIMESTEPS`] (the reference's
-/// `torch.cat((scheduler.timesteps, [0]))`). The returned per-step timesteps are truncated to integers
-/// (the reference stores `int64` timesteps), descending, with a terminal `0` for `steps ≥ 2`.
+/// `torch.cat((scheduler.timesteps, [0]))`). Only the indices are integer: the selected warped
+/// timesteps remain floats. In the release server the selected float scalar promotes the `int64`
+/// `ones` tensors used for the model timestep and the next-step sigma lookup, so truncating the
+/// selected values to `937` / `833` changes both the timestep embedding and the selected sigma row.
 ///
-/// `strength = 1` reproduces the shipped few-step list (`[1000, 937, 833, 625, 0]` at `steps = 5`);
+/// `strength = 1` reproduces the release-server list
+/// (`[1000, 937.5, 833.333…, 625, 0]` at `steps = 5`);
 /// `strength → 0` collapses the whole list toward `0` (keep the source clip — a 0-strength v2v renoises
 /// the source only to the smallest tabled sigma and denoises at `t = 0`, so the output tracks the
 /// source). Mirrors the reference so a lower strength preserves more of the VAE-encoded source.
-fn strength_step_timesteps(warped_timesteps: &[f64], strength: f64, steps: usize) -> Vec<f64> {
+fn strength_step_raw_indices(strength: f64, steps: usize) -> Vec<i64> {
     let n = steps.max(1);
-    let mut out = Vec::with_capacity(n);
-    for i in 0..n {
-        // linspace(strength·1000, 0, n)[i]: descending from strength·1000 to 0.
-        let frac = if n == 1 {
-            0.0
-        } else {
-            i as f64 / (n - 1) as f64
-        };
-        let raw = (strength * NUM_TRAIN_TIMESTEPS as f64 * (1.0 - frac)).trunc() as i64;
+    // PyTorch's CUDA float32 linspace casts the endpoints and step to the output scalar type, then
+    // evaluates from `start` in the first half and from `end` in the second half. Keep that precision
+    // and split here: truncating an f64 interpolation can choose a different integer index at a
+    // boundary (the arbitrary-strength oracle below pins one such case).
+    let start = (strength * NUM_TRAIN_TIMESTEPS as f64) as f32;
+    torch_f32_linspace(start, 0.0, n)
+        .into_iter()
+        .map(|raw| raw.trunc() as i64)
+        .collect()
+}
+
+fn strength_step_timesteps(warped_timesteps: &[f64], strength: f64, steps: usize) -> Vec<f64> {
+    let raw_indices = strength_step_raw_indices(strength, steps);
+    let mut out = Vec::with_capacity(raw_indices.len());
+    for raw in raw_indices {
         // 1000 − raw indexes the zero-padded warped table (index NUM_TRAIN_TIMESTEPS ⇒ the appended 0).
         let idx = (NUM_TRAIN_TIMESTEPS as i64 - raw).clamp(0, NUM_TRAIN_TIMESTEPS as i64) as usize;
         let t = warped_timesteps.get(idx).copied().unwrap_or(0.0); // idx == NUM_TRAIN_TIMESTEPS ⇒ 0
-        out.push(t.trunc());
+        out.push(t);
     }
     out
 }
@@ -120,10 +158,9 @@ fn strength_step_timesteps(warped_timesteps: &[f64], strength: f64, steps: usize
 /// Resolve the per-step denoising timesteps (descending, terminal `0`).
 ///
 /// * `None` → the config's `default_list` verbatim (`[1000, 937, 833, 625, 0]` for the shipped 14B).
-/// * `Some(n)` → an `n`-entry list rebuilt from the same shifted schedule: the first `n − 1`
-///   shifted timesteps of `linspace(1.0, 0.0, n)[:-1]` (truncated to integers, as the reference stores
-///   `int64` timesteps) followed by the terminal `0`. `Some(5)` reproduces the shipped list exactly
-///   (`linspace(1,0,5)[:-1] = [1, .75, .5, .25]` → `[1000, 937, 833, 625]` → `+ [0]`).
+/// * `Some(n)` → the pinned release server's strength-1 path: integer indices from
+///   `linspace(1000, 0, n).to(int64)` select the **float** shifted timetable, followed by its appended
+///   terminal `0`. `Some(5)` therefore yields `[1000, 937.5, 833.333…, 625, 0]`.
 fn resolve_step_timesteps(
     shift: f64,
     default_list: &[u32],
@@ -135,17 +172,8 @@ fn resolve_step_timesteps(
             "krea few-step: steps override must be >= 1".into(),
         )),
         Some(n) => {
-            let mut out = Vec::with_capacity(n);
-            if n >= 2 {
-                let denom = (n - 1) as f64; // linspace(1.0, 0.0, n) step base
-                for i in 0..(n - 1) {
-                    let u = 1.0 - (i as f64) / denom;
-                    let s = shift * u / (1.0 + (shift - 1.0) * u);
-                    out.push((s * NUM_TRAIN_TIMESTEPS as f64).trunc());
-                }
-            }
-            out.push(0.0); // terminal clean step
-            Ok(out)
+            let (_, warped_timesteps) = full_shifted_table(shift, NUM_TRAIN_TIMESTEPS);
+            Ok(strength_step_timesteps(&warped_timesteps, 1.0, n))
         }
     }
 }
@@ -169,9 +197,9 @@ pub struct FewStepSchedule {
 
 impl FewStepSchedule {
     /// Build the schedule for flow-match `shift` (5.0 for Krea Realtime) and resolve the per-step
-    /// denoising timesteps: `steps = None` uses `default_list` (the config's `denoising_step_list`)
-    /// verbatim; `steps = Some(n)` rebuilds an `n`-entry list from the same shifted schedule
-    /// (`Some(5)` reproduces the shipped `[1000, 937, 833, 625, 0]`). See
+    /// denoising timesteps: `steps = None` uses `default_list` (the offline config's
+    /// `denoising_step_list`) verbatim; `steps = Some(n)` rebuilds the pinned release server's
+    /// strength-1 float schedule (`Some(5)` yields `[1000, 937.5, 833.333…, 625, 0]`). See
     /// [`step_timesteps`](Self::step_timesteps).
     pub fn new(shift: f64, default_list: &[u32], steps: Option<usize>) -> Result<Self> {
         if shift <= 0.0 || shift.is_nan() {
@@ -192,8 +220,8 @@ impl FewStepSchedule {
     /// The v2v **denoise-strength** schedule (sc-8440 S7) — the reference `v2v.py::get_denoising_schedule`.
     /// Builds the same shifted-sigma table as [`new`](Self::new) but resolves the per-step timesteps so
     /// the schedule's **max** timestep is `strength·1000` (warped), descending to `0` over `steps`
-    /// forwards. `strength = 1` reproduces the shipped few-step list; `strength → 0` collapses the list
-    /// toward `0` (keep the source). The v2v init noise level is
+    /// forwards. `strength = 1` reproduces the release-server float schedule; `strength → 0`
+    /// collapses the list toward `0` (keep the source). The v2v init noise level is
     /// [`sigma_at_timestep`](Self::sigma_at_timestep) of the first (max) step timestep, so a lower
     /// strength renoises the VAE-encoded source less and preserves more of it. `strength` must be finite
     /// and in `[0, 1]`; `steps ≥ 1`.
@@ -268,44 +296,37 @@ mod tests {
     use super::*;
     use mlx_rs::Dtype;
 
-    /// The full table's endpoints + a hand-computed interior entry (independent literals — a wrong
-    /// shift formula fails). `timesteps[i] = sigmas[i]·1000`.
+    /// Fixed literals from the pinned torch.float32 source oracle. These pin both the linspace/shift
+    /// precision and the separately rounded `timesteps = sigmas * 1000` operation.
     #[test]
-    fn full_table_shift5_matches_hand_computed() {
+    fn full_table_shift5_matches_pinned_float32_literals() {
         let (sigmas, timesteps) = full_shifted_table(5.0, NUM_TRAIN_TIMESTEPS);
         assert_eq!(sigmas.len(), 1000);
         assert_eq!(timesteps.len(), 1000);
 
-        // i=0: u=1.0 → σ = 5·1/(1+4·1) = 1.0 → t = 1000.
-        assert!((sigmas[0] - 1.0).abs() < 1e-12, "sigma[0] = {}", sigmas[0]);
-        assert!((timesteps[0] - 1000.0).abs() < 1e-9);
+        assert_eq!(sigmas[0], 1.0);
+        assert_eq!(timesteps[0], 1000.0);
+        assert_eq!(sigmas[1], 0.999_799_787_998_199_5);
+        assert_eq!(timesteps[1], 999.799_804_687_5);
+        assert_eq!(sigmas[741], 0.636_051_118_373_870_8);
+        assert_eq!(timesteps[741], 636.051_147_460_937_5);
+        assert_eq!(sigmas[999], 0.004_980_080_295_354_128);
+        assert_eq!(timesteps[999], 4.980_080_127_716_064_5);
 
-        // i=1: u=0.999 → σ = 5·0.999/(1+4·0.999) = 4.995/4.996.
-        let want1 = 5.0 * 0.999 / (1.0 + 4.0 * 0.999);
-        assert!(
-            (sigmas[1] - want1).abs() < 1e-12,
-            "sigma[1] = {}",
-            sigmas[1]
-        );
-        assert!((timesteps[1] - want1 * 1000.0).abs() < 1e-9);
-
-        // i=999 (last): u=0.001 → σ = 5·0.001/(1+4·0.001) = 0.005/1.004 ≈ 0.00498.
-        let want_last = 5.0 * 0.001 / (1.0 + 4.0 * 0.001);
-        assert!(
-            (sigmas[999] - want_last).abs() < 1e-12,
-            "sigma[999] = {}",
-            sigmas[999]
-        );
-        assert!((want_last - 0.004_980_079_68).abs() < 1e-9); // pin the literal
+        // The former f64 reconstruction is observably different at row 741.
+        let old_f64_sigma = 5.0 * 0.259 / (1.0 + 4.0 * 0.259);
+        assert!((sigmas[741] - old_f64_sigma).abs() > 3.0e-8);
+        assert!((timesteps[741] - old_f64_sigma * 1000.0).abs() > 6.0e-5);
 
         // Strictly decreasing.
         assert!(sigmas.windows(2).all(|w| w[0] > w[1]));
         assert!(timesteps.windows(2).all(|w| w[0] > w[1]));
     }
 
-    /// `sigma_at_timestep` for the shipped `[1000, 937, 833, 625, 0]` schedule against hand-derived
-    /// table entries. The integer timesteps sit ≈ on tabled entries, so their sigma ≈ t/1000, except
-    /// the terminal `0` → the smallest tabled sigma. A wrong shift or a broken argmin fails.
+    /// `sigma_at_timestep` for the distinct offline/static `[1000, 937, 833, 625, 0]` schedule against
+    /// hand-derived table entries. The integer timesteps sit ≈ on tabled entries, so their sigma ≈
+    /// t/1000, except the terminal `0` → the smallest tabled sigma. A wrong shift or broken argmin
+    /// fails; the release-server float schedule is pinned separately below.
     #[test]
     fn sigma_at_timestep_shift5_matches_hand_computed() {
         let s = FewStepSchedule::new(5.0, &[1000, 937, 833, 625, 0], None).unwrap();
@@ -315,13 +336,7 @@ mod tests {
 
         // t=937: the closest unshifted linspace entry is u=0.748 (i=252, timestep 936.87 vs u=0.749's
         // 937.19). σ = 5·0.748/(1+4·0.748).
-        let want937 = 5.0 * 0.748 / (1.0 + 4.0 * 0.748);
-        assert!(
-            (s.sigma_at_timestep(937.0) - want937).abs() < 1e-9,
-            "σ(937) = {} want {}",
-            s.sigma_at_timestep(937.0),
-            want937
-        );
+        assert_eq!(s.sigma_at_timestep(937.0), 0.936_873_793_601_989_7);
         // …and it is within one table step of the naive t/1000.
         assert!((s.sigma_at_timestep(937.0) - 0.937).abs() < 1e-3);
 
@@ -329,14 +344,14 @@ mod tests {
         assert!((s.sigma_at_timestep(625.0) - 0.625).abs() < 1e-6);
 
         // Terminal t=0 → the smallest tabled sigma (u=0.001), NOT 0.
-        let want0 = 5.0 * 0.001 / (1.0 + 4.0 * 0.001);
-        assert!((s.sigma_at_timestep(0.0) - want0).abs() < 1e-9);
+        assert_eq!(s.sigma_at_timestep(0.0), 0.004_980_080_295_354_128);
         assert!(s.sigma_at_timestep(0.0) > 0.0);
     }
 
-    /// The default `denoising_step_list` (None) and the `Some(5)` rebuild both yield the shipped list.
+    /// `None` preserves the explicit offline list; an override follows the online release server's
+    /// float timetable instead of silently truncating selected entries.
     #[test]
-    fn step_timesteps_default_and_override_agree() {
+    fn static_list_is_verbatim_while_override_matches_release_server() {
         let default = FewStepSchedule::new(5.0, &[1000, 937, 833, 625, 0], None).unwrap();
         assert_eq!(
             default.step_timesteps(),
@@ -344,21 +359,20 @@ mod tests {
         );
         assert_eq!(default.num_steps(), 5);
 
-        // Some(5) reconstructs the schedule from scratch → identical to the shipped list.
+        // Some(5) reconstructs the pinned online schedule from the shifted float timetable.
         let rebuilt = FewStepSchedule::new(5.0, &[1000, 937, 833, 625, 0], Some(5)).unwrap();
-        assert_eq!(
-            rebuilt.step_timesteps(),
-            &[1000.0, 937.0, 833.0, 625.0, 0.0],
-            "Some(5) must reproduce the shipped few-step list"
-        );
+        let want = [1000.0, 937.5, 833.333_312_988_281_2, 625.0, 0.0];
+        for (got, want) in rebuilt.step_timesteps().iter().zip(want) {
+            assert!((got - want).abs() < 1e-12, "{got} != {want}");
+        }
 
         // A different override count → a different-length list, still descending with a terminal 0.
         let three = FewStepSchedule::new(5.0, &[1000, 937, 833, 625, 0], Some(3)).unwrap();
         assert_eq!(three.num_steps(), 3);
         assert_eq!(*three.step_timesteps().last().unwrap(), 0.0);
         assert!(three.step_timesteps()[0] > three.step_timesteps()[1]);
-        // Some(3): linspace(1,0,3)[:-1] = [1.0, 0.5] → [1000, 833] → + [0].
-        assert_eq!(three.step_timesteps(), &[1000.0, 833.0, 0.0]);
+        // Some(3): integer indices [1000,500,0] select [1000,833.333…,0] from the float table.
+        assert_eq!(three.step_timesteps()[1], 833.333_312_988_281_2);
 
         assert!(FewStepSchedule::new(5.0, &[1000, 0], Some(0)).is_err());
     }
@@ -393,17 +407,79 @@ mod tests {
         assert!((got[0] - 1.0).abs() > 1e-3);
     }
 
-    /// v2v strength schedule (`for_strength`): `strength = 1` reproduces the shipped few-step list
-    /// exactly (`get_denoising_schedule(warped, 1.0, 5) == [1000, 937, 833, 625, 0]`), so a full-strength
-    /// v2v is identical to the t2v denoise from max noise.
+    /// Source-literal + mutation oracle for the pinned release server:
+    /// `get_denoising_schedule(warped, 1.0, 5)` keeps selected timetable values fractional. It also
+    /// pins the values cast into the DiT timestep embedding and the exact sigma-table rows selected.
+    /// Reintroducing either `.trunc()` makes the 937.5 / 833.333 assertions fail.
     #[test]
-    fn strength_one_reproduces_shipped_list() {
+    fn strength_one_reproduces_release_float_schedule_without_truncation() {
         let s = FewStepSchedule::for_strength(5.0, 1.0, 5).unwrap();
+        let want = [1000.0, 937.5, 833.333_312_988_281_2, 625.0, 0.0];
+        for (got, want) in s.step_timesteps().iter().zip(want) {
+            assert!((got - want).abs() < 1e-12, "{got} != {want}");
+        }
+        assert_ne!(s.step_timesteps()[1], 937.0, "937.5 must not truncate");
+        assert_ne!(s.step_timesteps()[2], 833.0, "833.333… must not truncate");
+
+        let model_timesteps: Vec<f32> = s.step_timesteps().iter().map(|&t| t as f32).collect();
         assert_eq!(
-            s.step_timesteps(),
-            &[1000.0, 937.0, 833.0, 625.0, 0.0],
-            "strength=1 reproduces the shipped few-step list (get_denoising_schedule at strength 1)"
+            model_timesteps,
+            [1000.0, 937.5, 833.333_3, 625.0, 0.0],
+            "these are the exact f32 values passed to the DiT timestep embedding"
         );
+
+        assert!((s.sigma_at_timestep(s.step_timesteps()[1]) - 0.9375).abs() < 1e-12);
+        assert_eq!(
+            s.sigma_at_timestep(s.step_timesteps()[2]),
+            0.833_333_313_465_118_4
+        );
+        // The old truncation selected neighboring rows, not merely a differently printed scalar.
+        assert!((s.sigma_at_timestep(937.0) - s.sigma_at_timestep(937.5)).abs() > 6e-4);
+        assert!(
+            (s.sigma_at_timestep(833.0) - s.sigma_at_timestep(833.333_312_988_281_2)).abs() > 5e-4
+        );
+    }
+
+    /// Arbitrary-strength precision and mutation oracle for the pinned CUDA source. The raw
+    /// `float32` linspace is converted to integer indices first; only then do those indices select
+    /// fractional entries from the shifted timetable.
+    #[test]
+    fn arbitrary_strength_truncates_float32_indices_before_fractional_table_lookup() {
+        let strength = 0.2595_f32 as f64;
+        let raw = strength_step_raw_indices(strength, 4);
+        assert_eq!(raw, [259, 173, 86, 0]);
+
+        // Computing the inner point in f64 instead would land just below 173 and truncate to 172.
+        // This pins why the source's explicit `dtype=torch.float32` is semantically material.
+        let wrong_f64_inner = (strength * 1000.0 * (1.0 - 1.0 / 3.0)).trunc() as i64;
+        assert_eq!(wrong_f64_inner, 172);
+        assert_ne!(raw[1], wrong_f64_inner);
+
+        let schedule = FewStepSchedule::for_strength(5.0, strength, 4).unwrap();
+        assert_eq!(
+            schedule.step_timesteps(),
+            &[
+                636.051_147_460_937_5,
+                511.229_339_599_609_4,
+                319.940_490_722_656_25,
+                0.0,
+            ]
+        );
+        assert_eq!(schedule.sigmas()[741], 0.636_051_118_373_870_8);
+        assert_eq!(schedule.timesteps()[741], 636.051_147_460_937_5);
+        assert_eq!(
+            schedule.sigma_at_timestep(schedule.step_timesteps()[0]),
+            0.636_051_118_373_870_8
+        );
+
+        // Mutation sensitivity: the old f64 table construction misses the pinned row by one source
+        // float32 rounding step even though both APIs store the result as f64.
+        let old_f64_sigma = 5.0 * 0.259 / (1.0 + 4.0 * 0.259);
+        let old_f64_timestep = old_f64_sigma * 1000.0;
+        assert_ne!(schedule.sigmas()[741], old_f64_sigma);
+        assert_ne!(schedule.timesteps()[741], old_f64_timestep);
+        assert!((schedule.sigmas()[741] - old_f64_sigma).abs() > 3.0e-8);
+        assert!((schedule.timesteps()[741] - old_f64_timestep).abs() > 6.0e-5);
     }
 
     /// The strength lever moves the schedule's **max** timestep (and thus the init noise level): a lower
@@ -415,10 +491,11 @@ mod tests {
         let half = FewStepSchedule::for_strength(5.0, 0.5, 5).unwrap();
         let zero = FewStepSchedule::for_strength(5.0, 0.0, 5).unwrap();
 
-        // The first (max) step timestep tracks strength·1000 (warped): 1 → 1000, 0.5 → ~833, 0 → 0.
+        // The first (max) step timestep tracks strength·1000 (warped): 1 → 1000,
+        // 0.5 → 833.333…, 0 → 0.
         assert_eq!(full.step_timesteps()[0], 1000.0);
-        // strength 0.5: raw[0] = 500 → 1000−500 = 500 → warped timesteps[500] = 833.
-        assert_eq!(half.step_timesteps()[0], 833.0);
+        // strength 0.5: raw[0] = 500 → 1000−500 = 500 → warped timetable[500] = 833.333….
+        assert_eq!(half.step_timesteps()[0], 833.333_312_988_281_2);
         assert_eq!(zero.step_timesteps(), &[0.0, 0.0, 0.0, 0.0, 0.0]);
 
         // The init noise level (sigma at the max step) shrinks with strength.
@@ -434,8 +511,7 @@ mod tests {
             "strength 0.5 init sigma is intermediate"
         );
         // strength 0 ⇒ the smallest tabled sigma (source barely noised, near-clean denoise).
-        let want0 = 5.0 * 0.001 / (1.0 + 4.0 * 0.001);
-        assert!((sig_zero - want0).abs() < 1e-9);
+        assert_eq!(sig_zero, 0.004_980_080_295_354_128);
 
         // Every list is descending with a terminal 0 (for steps ≥ 2).
         for s in [&full, &half] {
