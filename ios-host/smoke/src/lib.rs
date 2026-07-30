@@ -18,9 +18,9 @@ use std::ffi::{c_char, CString};
 use std::path::Path;
 use std::time::Instant;
 
+use core_llm_testkit::{textllm_conformance, TextLlmProfile};
 use mlx_rs::ops::{matmul, ones, softmax_axis};
 use mlx_rs::{Array, Dtype};
-use core_llm_testkit::{textllm_conformance, TextLlmProfile};
 use runtime_ios::core_llm::{LoadSpec, Message, Sampling, TextLlmRequest};
 
 /// One check's outcome. `detail` carries the observed value, so a failure report is diagnosable
@@ -189,10 +189,9 @@ fn check_generation(model_dir: Option<&Path>) -> Check {
     let started = Instant::now();
 
     let run = || -> Result<(String, String, u32, f64, f64), String> {
-        let llm = runtime_ios::llm::load_for_model(&LoadSpec::dense(
-            dir.to_string_lossy().to_string(),
-        ))
-        .map_err(|e| format!("load failed: {e}"))?;
+        let llm =
+            runtime_ios::llm::load_for_model(&LoadSpec::dense(dir.to_string_lossy().to_string()))
+                .map_err(|e| format!("load failed: {e}"))?;
         let descriptor = llm.descriptor();
         let id = descriptor.id.clone();
         let tools = descriptor.capabilities.supports_tools;
@@ -202,7 +201,9 @@ fn check_generation(model_dir: Option<&Path>) -> Check {
         // Greedy + fixed seed: the answer is then a property of the weights, not of sampling luck,
         // so a wrong result means the kernels are wrong rather than the dice.
         let request = TextLlmRequest {
-            messages: vec![Message::user("What is the capital of France? Answer in one word.")],
+            messages: vec![Message::user(
+                "What is the capital of France? Answer in one word.",
+            )],
             sampling: Sampling::greedy(),
             max_new_tokens: 12,
             seed: Some(0),
@@ -298,10 +299,9 @@ fn check_sustained_decode(model_dir: Option<&Path>) -> Check {
     };
 
     let run = || -> Result<String, String> {
-        let llm = runtime_ios::llm::load_for_model(&LoadSpec::dense(
-            dir.to_string_lossy().to_string(),
-        ))
-        .map_err(|e| format!("load failed: {e}"))?;
+        let llm =
+            runtime_ios::llm::load_for_model(&LoadSpec::dense(dir.to_string_lossy().to_string()))
+                .map_err(|e| format!("load failed: {e}"))?;
 
         let baseline_rss = peak_rss_mib();
         let mut segments = Vec::with_capacity(SEGMENTS);
@@ -371,6 +371,114 @@ fn check_sustained_decode(model_dir: Option<&Path>) -> Check {
             name: NAME,
             passed: false,
             detail: e,
+        },
+    }
+}
+
+/// The staged load/unload seam: does dropping a provider actually give the memory back? (S4.5)
+///
+/// A 17 Pro Max does not need this — a 2.6 GiB model and the image stack are co-resident under
+/// its ~6 GB cap. An 8 GB device (~4 GB cap) cannot hold both, so it must unload one to load the
+/// other. The seam is built and measured **now, while it is not needed**, because retrofitting it
+/// into a pipeline that assumed co-residency is the expensive version
+/// (`docs/architecture/ios-project-spec.md` §0.1).
+///
+/// The question is not "does `drop` compile" but "does the memory come back". Measured on device:
+/// **`drop` alone returns everything** — active memory goes 2693 MiB → 0 *before* `clear_cache` is
+/// called, so MLX's buffer cache is not holding the weights after the provider dies. The
+/// `clear_cache` call is kept as belt-and-braces (free when the cache is already empty), but it is
+/// not what does the work.
+///
+/// This reads MLX's own accounting (`get_active_memory`), not RSS: `ru_maxrss` is a high-water
+/// mark that by definition never falls, so it cannot observe a release at all — measuring with it
+/// would have reported "nothing freed" and been entirely wrong.
+fn check_unload_seam(model_dir: Option<&Path>) -> Check {
+    const NAME: &str = "staged load/unload seam";
+    let Some(dir) = model_dir else {
+        return Check {
+            name: NAME,
+            passed: true,
+            detail: "skipped -- no snapshot in Documents/".to_string(),
+        };
+    };
+
+    let mib = |bytes: usize| bytes as f64 / (1024.0 * 1024.0);
+    let spec = LoadSpec::dense(dir.to_string_lossy().to_string());
+
+    // Baseline with nothing loaded, so the delta is attributable to the model.
+    mlx_rs::memory::clear_cache();
+    let idle = mlx_rs::memory::get_active_memory();
+
+    let loaded = {
+        let llm = match runtime_ios::llm::load_for_model(&spec) {
+            Ok(llm) => llm,
+            Err(e) => {
+                return Check {
+                    name: NAME,
+                    passed: false,
+                    detail: format!("load failed: {e}"),
+                }
+            }
+        };
+        // Weights fault in lazily, so a load alone touches little. Generate to force them
+        // resident — otherwise "unload" would be reclaiming memory never actually used.
+        let request = TextLlmRequest {
+            messages: vec![Message::user("Hello")],
+            sampling: Sampling::greedy(),
+            max_new_tokens: 4,
+            seed: Some(0),
+            ..Default::default()
+        };
+        if let Err(e) = llm.complete(&request) {
+            return Check {
+                name: NAME,
+                passed: false,
+                detail: format!("generate failed: {e}"),
+            };
+        }
+        let active = mlx_rs::memory::get_active_memory();
+        active
+        // `llm` drops here.
+    };
+
+    // Measured at ~0: `drop` returns the weights on its own, so the clear below is a guard
+    // rather than the mechanism.
+    let after_drop = mlx_rs::memory::get_active_memory();
+    mlx_rs::memory::clear_cache();
+    let after_clear = mlx_rs::memory::get_active_memory();
+
+    let held = loaded.saturating_sub(idle);
+    let reclaimed = loaded.saturating_sub(after_clear);
+    let fraction = if held > 0 {
+        reclaimed as f64 / held as f64
+    } else {
+        0.0
+    };
+
+    let detail = format!(
+        "idle {:.0} -> loaded {:.0} -> dropped {:.0} -> cleared {:.0} MiB | reclaimed {:.0} MiB \
+         ({:.0}% of {:.0} MiB held)",
+        mib(idle),
+        mib(loaded),
+        mib(after_drop),
+        mib(after_clear),
+        mib(reclaimed),
+        fraction * 100.0,
+        mib(held),
+    );
+
+    // 90%: the seam has to actually work for a smaller device to be viable. Anything less means
+    // a second model could not be loaded after unloading the first, which is the whole point.
+    Check {
+        name: NAME,
+        passed: fraction >= 0.9,
+        detail: if fraction >= 0.9 {
+            detail
+        } else {
+            format!(
+                "only {:.0}% reclaimed -- unload does not free the model | {detail}",
+                fraction * 100.0
+            )
         },
     }
 }
@@ -478,6 +586,7 @@ pub fn run_report() -> String {
         check_generation(snapshot.as_deref()),
         check_conformance(snapshot.as_deref()),
         check_sustained_decode(snapshot.as_deref()),
+        check_unload_seam(snapshot.as_deref()),
     ];
 
     let failed = checks.iter().filter(|c| !c.passed).count();

@@ -101,6 +101,11 @@ mod tests {
     /// rather than what this comment claims. If a future change made the trait object `Send`, the
     /// unsafe pattern would silently become legal and this test fails first.
     #[test]
+    // The explicit `&` on each call is the whole mechanism: it is what lets method resolution
+    // fall through to the trait impl when `T: !Send`. Removing the borrows, as
+    // clippy::needless_borrow suggests, would make both cases resolve identically and the check
+    // vacuous -- it would pass no matter what.
+    #[allow(clippy::needless_borrow)]
     fn provider_is_not_send_so_cross_thread_use_cannot_compile() {
         // Autoref specialization: the inherent method on `Wrap<T>` wins only when `T: Send`,
         // otherwise the blanket trait method on `&Wrap<T>` is selected. That makes "is this type

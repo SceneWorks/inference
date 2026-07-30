@@ -290,7 +290,7 @@ slowdown. The RSS ceiling is set at 4 GiB — the cap of an *8 GB* device, not t
 the lane fails **before** a broader-device release would, rather than after
 ([spec §0.1](architecture/ios-project-spec.md)).
 
-| S4.5 Staged load/unload **seam** | Built even though a 17 Pro does not need it, and left disabled. Retrofitting it into a pipeline that assumed co-residency is the expensive version. |
+| S4.5 Staged load/unload **seam** | **DONE and measured** — `idle 0 → loaded 2693 → dropped 0 → cleared 0 MiB, 100% reclaimed`. Built while the 17 Pro Max does not need it, because retrofitting it into a pipeline that assumed co-residency is the expensive version. **Finding: `drop` alone returns everything** — the buffer cache is not holding weights, so `clear_cache` is a guard, not the mechanism. Measured via MLX's `get_active_memory`, not RSS: `ru_maxrss` is a high-water mark that never falls, so it would have reported "nothing freed". |
 | S4.6 Regression thresholds | **DONE** — `run_smoke.sh` asserts throughput ≥ 12 tok/s, peak RSS ≤ 4096 MiB, and RSS growth ≤ 256 MiB, overridable by env var. Deliberately loose: these catch a lost fast path, a leak, or thermal collapse — not a warm phone. A check that fails on a slow afternoon teaches people to ignore it. Verified by a negative test (`THRESHOLD_MIN_TPS=999` → exit 1, naming the metric). |
 | S4.7 Integrate the increased-memory-limit entitlement | Once Apple grants it. Requested separately; lead time is not ours. |
 
