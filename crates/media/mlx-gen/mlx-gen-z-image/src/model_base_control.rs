@@ -129,7 +129,7 @@ const PRECISION_MSG: &str = "z_image_control: only dense bf16 is wired (the text
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     let (tokenizer, residency) = load_control_residency(spec, MODEL_ID, PRECISION_MSG)?;
     Ok(Box::new(ZImageControl {
-        memory_strategy: crate::memory_strategy::memory_strategy_contract(MODEL_ID, spec),
+        memory_strategy: crate::memory_strategy::memory_strategy_contract(MODEL_ID, spec)?,
         descriptor: descriptor(),
         tokenizer,
         residency,
@@ -406,11 +406,7 @@ mlx_gen::register_generators! {
 pub const MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =
     mlx_gen::gen_core::MemoryRegistration {
         provider_id: MODEL_ID,
-        contract: |spec| {
-            Ok(crate::memory_strategy::memory_strategy_contract(
-                MODEL_ID, spec,
-            ))
-        },
+        contract: |spec| crate::memory_strategy::memory_strategy_contract(MODEL_ID, spec),
     };
 
 #[cfg(test)]
