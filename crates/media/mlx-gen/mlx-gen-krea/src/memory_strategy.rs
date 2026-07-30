@@ -18,10 +18,20 @@ pub const DECODE_TILE_EDGE: u32 = 512;
 pub const DECODE_OVERLAP: u32 = 64;
 pub const DECODE_TILE_EDGES: [u32; 2] = [DECODE_TILE_EDGE, 384];
 
+fn decode_routes(provider_id: &str) -> CoreResult<mlx_gen_pid::DecodeRoutes> {
+    mlx_gen_pid::DecodeRoutes::new(
+        provider_id,
+        DECODE_TILE_EDGES.iter().copied(),
+        DECODE_OVERLAP,
+    )
+    .map_err(|errors| CoreError::Unsupported(errors.join("; ")))
+}
+
 pub fn memory_strategy_contract(
     provider_id: &str,
     spec: &LoadSpec,
 ) -> CoreResult<MemoryProviderContract> {
+    let routes = decode_routes(provider_id)?;
     Ok(MemoryProviderContract {
         provider_id: provider_id.to_owned(),
         backend: MemoryBackendRealization::MlxMetal {
@@ -43,7 +53,7 @@ pub fn memory_strategy_contract(
                 },
                 parameters: if strategy == MemoryStrategy::BoundedDecode {
                     MemoryParameterRanges {
-                        decode_tile_edges: DECODE_TILE_EDGES.to_vec(),
+                        decode_tile_edges: routes.native_edges().to_vec(),
                         decode_overlaps: vec![DECODE_OVERLAP],
                         ..Default::default()
                     }
@@ -147,10 +157,38 @@ pub fn safety_check(
             reason: format!("{}: calibration handshake mismatch", contract.provider_id),
         };
     }
+    // The Krea pose-control composition deliberately has no PiD decoder (its heavy bundle is the
+    // base VAE plus the pose branch). Reject the flag explicitly instead of letting the residency
+    // seam ignore it and execute a native decode under a PiD-labelled request.
+    if context.use_pid {
+        return MemorySafetyDecision::Reject {
+            reason: format!(
+                "{}: PiD decode is not implemented for pose control",
+                contract.provider_id
+            ),
+        };
+    }
     if let Err(error) = contract.validate_selection(&context.selection) {
         return MemorySafetyDecision::Reject {
             reason: error.to_string(),
         };
+    }
+    if contract.engages(context.selection.strategy, MemoryStrategy::BoundedDecode) {
+        let routes = match decode_routes(&contract.provider_id) {
+            Ok(routes) => routes,
+            Err(error) => {
+                return MemorySafetyDecision::Reject {
+                    reason: error.to_string(),
+                }
+            }
+        };
+        if let Err(reason) = routes.validate(
+            false,
+            context.selection.parameters.decode_tile_edge,
+            context.selection.parameters.decode_overlap,
+        ) {
+            return MemorySafetyDecision::Reject { reason };
+        }
     }
     if !context.budget.fits(context.predicted_peak_bytes) {
         return MemorySafetyDecision::Reject {
@@ -175,6 +213,7 @@ pub fn begin_request(
     }
     Ok(Some(Box::new(KreaControlMemoryScope {
         provider_id,
+        decode_routes: decode_routes(provider_id)?,
         geometry: context.geometry,
         memory: generation_memory(contract, &context.selection),
         finished: false,
@@ -183,6 +222,7 @@ pub fn begin_request(
 
 struct KreaControlMemoryScope {
     provider_id: &'static str,
+    decode_routes: mlx_gen_pid::DecodeRoutes,
     geometry: MemoryGeometry,
     memory: Option<GenerationMemory>,
     finished: bool,
@@ -248,14 +288,9 @@ impl MemoryRequestScope for KreaControlMemoryScope {
         _geometry: MemoryGeometry,
     ) -> CoreResult<()> {
         self.ensure_active()?;
-        if DECODE_TILE_EDGES.contains(&tile_edge) && overlap == DECODE_OVERLAP {
-            Ok(())
-        } else {
-            Err(CoreError::Unsupported(format!(
-                "{}: unsupported decode tile {tile_edge}/{overlap}",
-                self.provider_id
-            )))
-        }
+        self.decode_routes
+            .validate(false, Some(tile_edge), Some(overlap))
+            .map_err(CoreError::Unsupported)
     }
 
     fn configure_attention(&mut self, chunk_size: u32) -> CoreResult<()> {
