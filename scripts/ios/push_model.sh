@@ -36,12 +36,15 @@ done
 say() { printf '\n=== %s\n' "$1"; }
 
 if [ -z "$DEVICE" ]; then
-  # By UUID shape, not column position -- see the same note in run_smoke.sh. Counting fields from
-  # the end lands inside the Model column ("iPhone 17 Pro Max (iPhone18,2)") and yields "17".
+  # By UUID shape and by ANY usable state -- see the long note in run_smoke.sh. Two traps here:
+  # counting fields from the end lands inside the Model column ("iPhone 17 Pro Max (iPhone18,2)")
+  # and yields "17"; and filtering on "available (paired)" alone misses a device reporting
+  # "connected", which it does on its own schedule. The `|| true` matters because without it a
+  # non-matching grep kills the script under `set -euo pipefail` before it prints anything.
   DEVICE=$(xcrun devicectl list devices 2>/dev/null \
-    | awk '/available \(paired\)/ {print; exit}' \
+    | grep -Ei 'available|connected' \
     | grep -oE '[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}' \
-    | head -1)
+    | head -1 || true)
 fi
 [ -n "$DEVICE" ] || { echo "no paired device found" >&2; exit 1; }
 say "device $DEVICE"

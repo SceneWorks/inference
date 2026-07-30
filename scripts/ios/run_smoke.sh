@@ -33,16 +33,22 @@ say() { printf '\n=== %s\n' "$1"; }
 
 # --- device -----------------------------------------------------------------------------------
 if [ -z "$DEVICE" ]; then
-  # First device listed as available+paired. Explicit --device when more than one is attached.
-  #
   # Matched by UUID SHAPE, not by column position. The previous `$(NF-3)` counted back from the end
   # of the line, which put it inside the Model column as soon as that column had a different word
   # count -- "iPhone 17 Pro Max (iPhone18,2)" yields NF=11 and `$(NF-3)` is the literal "17". Every
   # subsequent devicectl call then failed with "The specified device was not found. (Name: 17)".
+  #
+  # Any usable STATE, not just "available (paired)". devicectl also reports "connected", and a
+  # device flips between the two on its own -- so a filter on one of them was a coin toss. Worse,
+  # it failed SILENTLY: `grep` exiting 1 made the pipeline fail, `set -o pipefail` propagated it,
+  # the assignment inherited it, and `set -e` killed the script BEFORE its first line of output.
+  # Twice that produced an empty log and a bare exit 1, which reads as "the script did nothing"
+  # rather than "no device matched". The `|| true` and the explicit check below are what make the
+  # failure legible.
   DEVICE=$(xcrun devicectl list devices 2>/dev/null \
-    | awk '/available \(paired\)/ {print; exit}' \
+    | grep -Ei 'available|connected' \
     | grep -oE '[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}' \
-    | head -1)
+    | head -1 || true)
 fi
 if [ -z "$DEVICE" ]; then
   echo "no paired device found; connect an iPhone with Developer Mode enabled" >&2
@@ -191,9 +197,15 @@ xcrun devicectl device process launch \
 POLL_TRIES=${POLL_TRIES:-60}
 # `if`, not `[ … ] && …`: under `set -e` a bare `test && assign` exits the script when the test is
 # false, which is the same trap as the unguarded `from_check` above.
-if [ -n "$CARGO_FEATURES" ]; then POLL_TRIES=${POLL_TRIES_MEDIA:-200}; fi
+# 100 tries ≈ 10 min of wall clock (see the note at the poll), which covers a 4.73 GB snapshot read
+# plus two tiled generations with room to spare. It was 200, which is 20 minutes of waiting for a
+# run that has already died.
+if [ -n "$CARGO_FEATURES" ]; then POLL_TRIES=${POLL_TRIES_MEDIA:-100}; fi
 
-say "waiting for the on-device report (up to $((POLL_TRIES * 3))s)"
+# Each iteration is `sleep 3` PLUS a devicectl copy that itself takes ~3s (tunnel + disk-image
+# services), so the wall-clock budget is roughly double the naive sleep total. Say so, rather than
+# advertising 600s and running for twenty minutes.
+say "waiting for the on-device report (up to ~$((POLL_TRIES * 6))s)"
 REPORT=/tmp/ios-smoke-report.txt
 rm -f "$REPORT"
 LAUNCHED_AT=$(date +%s)
