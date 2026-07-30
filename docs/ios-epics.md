@@ -988,6 +988,31 @@ The 8 GB case is tight enough that the device session decides it, not the host h
 > Once MLX's limits are bound to `os_proc_available_memory` rather than to device RAM, the cache is
 > capped and the identity closes. Re-measured device figures under that regime are the first ones
 > that can be compared to the cap directly.
+>
+> **And the host can now predict a device kill — a two-number test replaces the old rule.** The
+> harness reports `peak MLX footprint` = max(`active + cache`) on every platform. Measured on the
+> host against the 12 GB device's 6136 MiB cap:
+>
+> | config | host MLX peak | host peak footprint | vs cap | device |
+> |---|---:|---:|:--:|---|
+> | SANA 1024 tile128 | 3294 | **3749** | under | survived |
+> | SANA 512 tile256 | 3453 | **5995** | just under | survived |
+> | z-image 1024 tile256 | 3102 | **6488** | **over** | **died** |
+>
+> z-image has the **lowest** MLX peak of the three and was the only one killed. The metric this
+> document used throughout ranked it the safest of the three; the footprint ranks it fatal, and the
+> footprint is right.
+>
+> So, replacing "host ≫ cap is a valid NO; host < cap is never a YES":
+>
+> * **Peak active** (`get_peak_memory`) is the irreducible working set. It must fit under the cap —
+>   if it does not, no amount of tuning admits the configuration.
+> * **Peak footprint** (`active + cache`) is what MLX wants when unconstrained. Under the cap means
+>   it fits with no tuning; over the cap means it fits **only** with the cache bounded.
+>
+> z-image is active 3102 (fits) and footprint 6488 (requires bounding) — which is exactly the
+> behaviour the device showed across five runs. Both numbers are now printed by every host and device
+> run, so the comparison needs no reconstruction.
 
 **Found in passing — a progress-contract violation shared by every mlx-gen image provider.**
 `gen_core_testkit`'s progress contract requires `Progress::Decoding` **exactly once** per generation
