@@ -540,9 +540,14 @@ impl Sana {
             |view: SanaDecodeView<'_>,
              latents: Vec<mlx_rs::Array>,
              on_progress: &mut dyn FnMut(Progress)| {
+                // ONCE for the whole batch, not once per image. `gen_core_testkit`'s progress
+                // contract requires exactly one `Decoding` and names once-per-output as a failure
+                // (the restarting-bar class, F-136/F-162). The pre-staging code emitted it inside
+                // the per-image loop, so this was already wrong at `count > 1` — the testkit's
+                // request defaults to `count: 1` and never saw it.
+                on_progress(Progress::Decoding);
                 let mut images = Vec::with_capacity(latents.len());
                 for latent in &latents {
-                    on_progress(Progress::Decoding);
                     images.push(view.decode_one(latent, &req.cancel)?);
                 }
                 Ok(GenerationOutput::Images(images))

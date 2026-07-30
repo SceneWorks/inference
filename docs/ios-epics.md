@@ -773,6 +773,22 @@ device — so SANA does not need to be restricted to 12 GB hardware. The earlier
 recommendation is withdrawn; it was written against a peak that assumed the trunk stayed resident.
 The 8 GB case is tight enough that the device session decides it, not the host harness.
 
+**Found in passing — a progress-contract violation shared by every mlx-gen image provider.**
+`gen_core_testkit`'s progress contract requires `Progress::Decoding` **exactly once** per generation
+and names once-per-output as a failure ("the restarting-bar class", F-136/F-162). SANA emitted it
+inside the per-image loop, so it was wrong for any `count > 1`. The testkit never caught it because
+its request defaults to `count: 1`, where the two are indistinguishable.
+
+Fixed in SANA, where the staged reordering makes once-per-batch the natural shape — all denoise, then
+all decode, so a single `Decoding` marks the phase transition exactly.
+
+**`mlx-gen-z-image`'s `decode_batch` has the identical bug** and is not fixed here: it is a shipping
+provider on a different epic's critical path, and the change belongs with a testkit case that would
+actually catch it (a `count > 1` progress assertion) rather than as a drive-by on an iOS branch. The
+same `count > 1` blind spot also hides a **`Step` restart** — both providers run a fresh `1..=steps`
+counter per image where the contract wants a folded `total = N × steps` bar. That one is a real
+change to shared denoise-batch structure and is not attempted here.
+
 **Still open:** the `BoundedDecode` contract adoption. The mechanism now exists and is measured, but
 tiling is still selected by the `MLX_GEN_SANA_DECODE_TILE` env knob rather than by the contract's
 budget model. That work is now an optimization rather than the critical path, and it should be sized
