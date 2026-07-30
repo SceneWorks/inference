@@ -8,10 +8,11 @@
 //! (`SceneWorks/krea-2-turbo-mlx`, group size 64), each quantized projection is stored as the triple
 //! `{base}.weight` (u32 codes) + `{base}.scales` + `{base}.biases`, and the component `config.json`
 //! carries a `quantization: { bits, group_size }` block ([`candle_gen::quant::PackedConfig`]).
-//! [`Weights::from_dir`] reads that block; [`linear_detect`] / [`embedding_detect`] then packed-**detect**
-//! the `.scales` sibling and build the quantized module straight from the packed parts through the shared
-//! group-size-aware loaders (no dense staging — see [`crate::quant`]). Absent the block / `.scales`, the
-//! dense path is unchanged.
+//! [`Weights::from_dir`] reads that block and prepares content-addressed GGML sidecars once.
+//! [`linear_detect`] / [`embedding_detect`] then packed-**detect** the `.scales` sibling, map the
+//! device-format artifact, and transfer those bytes directly to the compute device (no dense staging
+//! and no repeated source conversion — see [`crate::quant`]). Absent the block / `.scales`, the dense
+//! path is unchanged.
 //!
 //! **Adapter compose (sc-9411).** The DiT's `set_overlay` (adapter merge, sc-7836) installs dense
 //! CPU-side weights that take priority over the mmap. [`linear_detect`] checks the **overlay first**: a
@@ -25,12 +26,13 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::OnceLock;
 
+use candle_gen::candle_core::quantized::QTensor;
 use candle_gen::candle_core::safetensors::MmapedSafetensors;
-use candle_gen::candle_core::{DType, Device, Result, Tensor};
+use candle_gen::candle_core::{DType, Device, Error, Result, Tensor};
 use candle_gen::candle_nn::{Embedding, Linear};
 use candle_gen::quant::{
     dequant_mlx_q4_reference_gs, dequant_mlx_q8_gs, mlx_packed_bits_gs, Int8Context, Nvfp4Linear,
-    PackedConfig,
+    PackedConfig, PackedWeightSidecars,
 };
 
 use crate::nvfp4_dit::{DitPlan, Nvfp4Proj, Nvfp4Quant, ProbedProj};
@@ -52,6 +54,9 @@ pub struct Weights {
     /// The component's `quantization` manifest, `Some` for a packed q4/q8 tier (carries the group size
     /// the packed shapes can't disambiguate), `None` for a dense bf16 tier.
     packed: Option<PackedConfig>,
+    /// Content-addressed GGML q4/q8 artifacts prepared once at component open. A materialization maps
+    /// these bytes and transfers them directly; it never re-reads or converts the MLX affine triple.
+    sidecars: Option<PackedWeightSidecars>,
     /// True for **any native-mmdit-keyed** checkpoint (sc-9300 INT8-ConvRot *and* sc-14022 dense-bf16
     /// single file): the file stores the *reference* tensor names, so every diffusers-key lookup is
     /// translated to its native counterpart ([`convrot_diffusers_to_native`], optionally under a
@@ -100,12 +105,17 @@ impl Weights {
             .map_err(|e| candle_gen::candle_core::Error::Msg(e.to_string()))?;
         // SAFETY: read-only mmap of weight files; the standard candle loading path.
         let st = unsafe { MmapedSafetensors::multi(&files)? };
+        let packed = read_packed_config(dir)?;
+        let sidecars = packed
+            .map(|cfg| PackedWeightSidecars::prepare(&st, dir, cfg, device))
+            .transpose()?;
         Ok(Self {
             st,
             device: device.clone(),
             dtype,
             overlay: HashMap::new(),
-            packed: read_packed_config(dir)?,
+            packed,
+            sidecars,
             native_keys: false,
             native_prefix: String::new(),
             convrot: false,
@@ -126,6 +136,7 @@ impl Weights {
             dtype,
             overlay: HashMap::new(),
             packed: None,
+            sidecars: None,
             native_keys: false,
             native_prefix: String::new(),
             convrot: false,
@@ -150,6 +161,7 @@ impl Weights {
             dtype,
             overlay: HashMap::new(),
             packed: None,
+            sidecars: None,
             native_keys: true,
             native_prefix,
             convrot: true,
@@ -183,6 +195,7 @@ impl Weights {
             dtype,
             overlay: HashMap::new(),
             packed: None,
+            sidecars: None,
             native_keys: true,
             native_prefix,
             convrot: false,
@@ -454,6 +467,24 @@ impl Weights {
     /// The MLX `quantization` block when this component is a packed q4/q8 tier, else `None`.
     pub fn packed(&self) -> Option<PackedConfig> {
         self.packed
+    }
+
+    /// Load one packed projection from its mapped device-format artifact. The source mmap is
+    /// intentionally not passed through this seam, making per-window format conversion impossible.
+    fn load_packed_device_format(&self, base: &str) -> Result<QTensor> {
+        self.sidecars
+            .as_ref()
+            .ok_or_else(|| {
+                Error::Msg(format!(
+                    "krea: packed projection `{base}` has no prepared device-format sidecar"
+                ))
+            })?
+            .load(base, &self.device)
+    }
+
+    /// Sidecar preparation diagnostics used by the real-weight evidence harness.
+    pub fn packed_sidecars(&self) -> Option<&PackedWeightSidecars> {
+        self.sidecars.as_ref()
     }
 
     /// Whether the [`overlay`](Weights::set_overlay) holds a (dense, adapter-merged) tensor for `name`.
@@ -873,8 +904,8 @@ pub fn linear(w: &Weights, base: &str, bias: bool) -> Result<Linear> {
 /// 1. **Overlay** (`{base}.weight` is adapter-merged): the merge already reconstructed a dense weight
 ///    (from the packed parts if the tier is packed, [`crate::adapters`]) and installed it, so load
 ///    that **dense** merged weight — a `Dense` `QLinear`. The packed base composes with the adapter.
-/// 2. **Packed** (a packed tier + `{base}.scales` present, no overlay): build a `Packed` projection
-///    straight from the MLX packed triple at the tier's group size — **no dense weight materialized**.
+/// 2. **Packed** (a packed tier + `{base}.scales` present, no overlay): map its prepared GGML sidecar
+///    and transfer device-format bytes — **no source conversion or dense weight materialized**.
 /// 3. **Dense** (otherwise): the exact [`linear`] behavior (`{base}.weight` [+ `{base}.bias`]).
 ///
 /// `base` is the full dotted key prefix (e.g. `attn.to_out.0`), so the `.scales`/`.biases` siblings
@@ -931,17 +962,15 @@ pub fn linear_detect(w: &Weights, base: &str, bias: bool) -> Result<QLinear> {
             }
         }
     }
-    // (2) A packed tier with a `.scales` sibling → build straight from the packed parts.
-    if let (Some(cfg), true) = (w.packed(), w.contains(&scales_key)) {
-        let wq = w.get_native(&weight_key)?;
-        let scales = w.get_f32(&scales_key)?;
-        let biases = w.get_f32(&format!("{base}.biases"))?;
+    // (2) A packed tier with a `.scales` sibling → transfer the prepared device-format artifact.
+    if let (Some(_cfg), true) = (w.packed(), w.contains(&scales_key)) {
         let dense_bias = if bias {
             Some(w.get(&format!("{base}.bias"))?)
         } else {
             None
         };
-        return QLinear::packed(&wq, &scales, &biases, dense_bias, cfg.group_size as usize);
+        let qtensor = w.load_packed_device_format(base)?;
+        return QLinear::packed_device_format(qtensor, dense_bias);
     }
     // (3) Dense path unchanged.
     Ok(QLinear::dense(linear(w, base, bias)?))
@@ -1015,24 +1044,22 @@ pub fn linear_detect_planned(
     Ok(QLinear::Nvfp4(Nvfp4Proj::new(lin, base, plan, act)))
 }
 
-/// **Packed-detecting** [`QEmbedding`] loader (sc-9411): packed straight from the MLX triple when the
-/// component is a packed tier and `{base}.scales` is present (dequantized to the component dtype — dtype
-/// parity with the dense table), else a dense [`Embedding`] from `{base}.weight` (`hidden` inferred from
-/// the stored `[vocab, hidden]` shape). The Krea Qwen3-VL TE keeps `embed_tokens` **dense** in the
+/// **Packed-detecting** [`QEmbedding`] loader (sc-9411): transfer its prepared device-format table when
+/// the component is a packed tier and `{base}.scales` is present (dequantized to the component dtype —
+/// dtype parity with the dense table), else a dense [`Embedding`] from `{base}.weight` (`hidden`
+/// inferred from the stored `[vocab, hidden]` shape). The Krea Qwen3-VL TE keeps `embed_tokens` **dense** in the
 /// hosted q4/q8 tiers, so today this takes the dense arm; the packed arm is the future-proof path (and
 /// guards against a silent dense read of u32 codes should a tier ever pack the table).
 pub fn embedding_detect(w: &Weights, base: &str) -> Result<QEmbedding> {
     let scales_key = format!("{base}.scales");
-    if let (Some(cfg), true) = (w.packed(), w.contains(&scales_key)) {
-        let wq = w.get_native(&format!("{base}.weight"))?;
-        let scales = w.get_f32(&scales_key)?;
-        let biases = w.get_f32(&format!("{base}.biases"))?;
+    if let (Some(_cfg), true) = (w.packed(), w.contains(&scales_key)) {
         // Dequantize the packed table to **f32** (the encoder's compute dtype), not `w.dtype()`
         // (sc-12828): the TE now stores its weights bf16, but the embedding is upcast to f32 in the
         // forward, so a packed embed must dequantize to f32 to stay bit-identical to the old f32 store
         // (a dequant to bf16 would round the rows before the widen). Uniform with the sibling
         // boogu/ideogram ports, which pack this table on their MLX tiers.
-        return QEmbedding::packed(&wq, &scales, &biases, DType::F32, cfg.group_size as usize);
+        let qtensor = w.load_packed_device_format(base)?;
+        return QEmbedding::packed_device_format(qtensor, DType::F32);
     }
     let weight = w.get(&format!("{base}.weight"))?;
     let hidden = weight.dim(1)?;
