@@ -387,6 +387,7 @@ What is left is genuinely SANA-specific: getting it resident and correct, and me
 | S5.1 SANA on device | **Mac-side done** — composition, surface tests, and the `aarch64-apple-ios` cross-compile all green. The device half is Session A. |
 | S5.2 Memory residency | **Mac-side DONE — fits 8 GB, tightly.** `Residency::run_staged` sheds the Q4 trunk before decode (−1905 MiB) and the now-working tiled decode bounds the DC-AE transient: 1024px at 3294 MiB, 512px at 3453, both inside a 4096 MiB budget at 80–85% (56–78% of a 12 GB device's). Peak verified count-independent; Resident/Sequential byte-parity and repeat-job bounding re-verified on real weights. Device confirmation is Session A, and at 8 GB it is the *deciding* measurement, not a formality. |
 | S5.3 `gen-core-testkit` conformance on device | The media contract's equivalent of E3's S3.5. |
+| S5.7 Device harness for image generation | **DONE.** `ios-smoke` gains a `media` feature carrying a SANA check (two configurations, loaded through `provider_registry()` rather than a direct loader), `scripts/ios/push_model.sh` provisions a snapshot into the app container, and `run_smoke.sh --media` drives both. Validated on the host first, where MLX peaks reproduce `image_budget`'s numbers exactly. |
 | S5.5 `media` feature in `runtime-ios` | **DONE** — `mlx-gen-ios-catalog` (a new, narrow composition root: SANA only, **not** `mlx-gen-catalog`'s 32 providers) behind an off-by-default `media` feature. Both profiles have ordered surface tests; the media one asserts exactly `["sana_1600m", "sana_sprint_1600m"]` and the LLM-only one asserts the registry is empty. Cross-compiles for `aarch64-apple-ios`. |
 | S5.6 Image-generation latency baselines | Sustained, not cold-start — few-step models only. Enforced like E4's thresholds. |
 
@@ -788,6 +789,53 @@ actually catch it (a `count > 1` progress assertion) rather than as a drive-by o
 same `count > 1` blind spot also hides a **`Step` restart** — both providers run a fresh `1..=steps`
 counter per image where the contract wants a folded `total = N × steps` bar. That one is a real
 change to shared denoise-batch structure and is not attempted here.
+
+### Device harness for image generation — three bugs the scripts had been hiding (2026-07-30)
+
+Building the device path for SANA turned up three defects, none of which could be found by reading
+the scripts. All were found by running them.
+
+**1. `run_smoke.sh` picked the device by column position.** `awk '{print $(NF-3)}'` counts back from
+the end of the `devicectl list devices` line, which lands inside the *Model* column the moment that
+column has a different word count. "iPhone 17 Pro Max (iPhone18,2)" gives `NF=11`, and `$(NF-3)` is
+the literal string `17` — after which every devicectl call fails with *"The specified device was not
+found. (Name: 17)"*. It had never fired because every previous device run passed `--device`
+explicitly. Now matched by UUID shape.
+
+**2. The first push script reported success after failing.** Its copy loop ended in `|| true` and its
+verification could not distinguish "the listing is empty" from "the listing command failed". Three
+copies errored with the device-not-found above and it still exited 0. Copies now fail on the spot,
+and the verification demands devicectl's `N files:` header before believing an empty result.
+
+**3. `devicectl copy to` copies a directory's CONTENTS, not the directory.** Confirmed against the
+device: pushing `inner/` (holding `probe.txt`) to `Documents/dirprobe` yields
+`Documents/dirprobe/probe.txt`, not `Documents/dirprobe/inner/probe.txt`. That is not a cosmetic
+difference here — SANA's `transformer/` and `vae/` each hold a file named
+`diffusion_pytorch_model.safetensors`, so pushing both to one destination silently **overwrote the
+1.99 GB trunk with the 1.25 GB decoder**. The push exits 0 and leaves a corrupt snapshot that fails
+at load with an error pointing at the code. Each component now names itself in the destination, and
+verification descends into every component comparing names *and* sizes — a top-level listing showed
+the right names while the bytes underneath were wrong.
+
+**A related trap avoided rather than hit:** `run_smoke.sh`'s threshold extraction scanned the whole
+report and took the last match, so it silently depended on which checks existed and in what order.
+The image check's detail carries `MLX peak N MiB` *and* `process RSS peak N MiB`, which would have
+repointed the LLM's RSS ceiling at SANA's number. Extraction is now anchored to the named check.
+
+**Jetsam-proofing.** The app has no `increased-memory-limit` entitlement (S4.7, still pending), so
+SANA's 4773 MiB configuration may be killed outright — and a jetsam kill takes the whole report with
+it, including the LLM checks that already passed, leaving "no report was produced", which is
+indistinguishable from a launch failure. Two mitigations: configurations run in **ascending measured
+peak** (1024-tiled at 3294 before 512-untiled at 4773), so a kill still leaves the cheaper one
+proven; and each completed configuration appends a breadcrumb to `Documents/sana-progress.txt`,
+which `run_smoke.sh` pulls when no report appears. The configuration *after* the last breadcrumb is
+the one that exceeded the cap.
+
+**Also note the RSS/MLX divergence.** On the host, `getrusage`'s peak RSS came back *below* MLX's own
+peak (2961 vs 4773 MiB) — it is not seeing Metal buffer allocations. On iOS those do count toward the
+footprint jetsam reads, so the divergence should not appear on device. The check prints both so that
+can be checked rather than assumed, and the image threshold is read off MLX's number, since a ceiling
+on RSS would be vacuous.
 
 **Still open:** the `BoundedDecode` contract adoption. The mechanism now exists and is measured, but
 tiling is still selected by the `MLX_GEN_SANA_DECODE_TILE` env knob rather than by the contract's

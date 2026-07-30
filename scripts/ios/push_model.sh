@@ -64,22 +64,32 @@ BYTES=$(find "$SRC" -type f -exec ls -l {} \; | awk '{s+=$5} END {print s+0}')
 say "pushing $(echo "$BYTES" | awk '{printf "%.2f GB", $1/1e9}') from $SRC"
 
 # --- push -------------------------------------------------------------------------------------
-# `copy to` with a directory source creates <destination>/<basename>. To land the CONTENTS at the
-# Documents root (the LLM layout) each entry is pushed individually; to land them in a subdirectory
-# the directory is pushed once and renamed by choosing the destination.
+# `copy to --source <dir> --destination <path>` makes <path> the directory and copies the source's
+# CONTENTS into it — it does NOT create <path>/<basename>. Verified against the device: pushing
+# `inner/` (holding probe.txt) to `Documents/dirprobe` yields `Documents/dirprobe/probe.txt`.
+#
+# So a component directory must name itself in the destination. Getting this wrong is not a
+# no-op: SANA's `transformer/` and `vae/` both hold a file called
+# `diffusion_pytorch_model.safetensors`, so pushing both to one destination silently OVERWROTE the
+# 1.99 GB trunk with the 1.25 GB decoder — a push that exits 0 and leaves a corrupt snapshot.
 DEST="Documents${REMOTE:+/$REMOTE}"
 say "destination $DEST/"
 for entry in "$SRC"/*; do
+  name=$(basename "$entry")
+  # A directory names itself in the destination; a loose file goes to the destination directly.
+  if [ -d "$entry" ]; then target="$DEST/$name"; else target="$DEST"; fi
   # NOT `|| true`. The first version swallowed every copy failure here and then reported success,
   # because the verification below could not distinguish "listing is empty" from "listing failed".
   # Three copies errored with "device not found" and the script still exited 0. Fail on the spot.
   if ! xcrun devicectl device copy to --device "$DEVICE" \
       --domain-type appDataContainer --domain-identifier "$BUNDLE_ID" \
-      --source "$entry" --destination "$DEST" 2>&1 \
-      | grep -vE '^[0-9]{2}:[0-9]{2}:[0-9]{2}'; then
-    : # grep exits 1 when it filtered every line, which is the quiet success case.
+      --source "$entry" --destination "$target" 2>&1 \
+      | grep -E 'Error|error:'; then
+    : # grep exits 1 when it matched nothing, which is the success case.
+  else
+    echo "copy failed for $name" >&2; exit 1
   fi
-  printf '  pushed %s\n' "$(basename "$entry")"
+  printf '  pushed %s -> %s\n' "$name" "$target"
 done
 
 # --- verify -----------------------------------------------------------------------------------
@@ -98,7 +108,34 @@ echo "$LISTING" | tail -n +4
 MISSING=0
 for entry in "$SRC"/*; do
   name=$(basename "$entry")
-  echo "$LISTING" | grep -qF -- "$name" || { echo "MISSING on device: $name" >&2; MISSING=1; }
+  echo "$LISTING" | grep -qF -- "$name" || { echo "MISSING on device: $name" >&2; MISSING=1; continue; }
+  [ -d "$entry" ] || continue
+
+  # Descend. A top-level check alone is not enough: the flattening bug produced a `sana/` that
+  # listed the right NAMES while the files inside were wrong (one component's weights overwritten
+  # by another's, because both are called diffusion_pytorch_model.safetensors). Compare each
+  # component's file names AND sizes against the local copy.
+  SUB=$(xcrun devicectl device info files --device "$DEVICE" \
+    --domain-type appDataContainer --domain-identifier "$BUNDLE_ID" \
+    --subdirectory "$DEST/$name" 2>&1)
+  echo "$SUB" | grep -qE '^[0-9]+ files?:' \
+    || { echo "MISSING on device: $name/ could not be listed" >&2; MISSING=1; continue; }
+  for f in "$entry"/*; do
+    fname=$(basename "$f")
+    local_gb=$(ls -l "$f" | awk '{printf "%.2f", $5/1e9}')
+    line=$(echo "$SUB" | grep -F -- "$fname" || true)
+    if [ -z "$line" ]; then
+      echo "MISSING on device: $name/$fname" >&2; MISSING=1; continue
+    fi
+    # devicectl reports GB for large files; compare to 0.1 GB tolerance (its rounding), which is
+    # loose on size but decisive against a whole component being substituted for another.
+    dev_gb=$(echo "$line" | grep -oE '[0-9.]+ GB' | grep -oE '[0-9.]+' || echo "")
+    if [ -n "$dev_gb" ]; then
+      awk -v a="$local_gb" -v b="$dev_gb" 'BEGIN { exit !((a-b < -0.1) || (a-b > 0.1)) }' \
+        && { echo "SIZE MISMATCH: $name/$fname local ${local_gb} GB vs device ${dev_gb} GB" >&2; MISSING=1; }
+    fi
+    printf '  ok %s/%s\n' "$name" "$fname"
+  done
 done
 [ "$MISSING" -eq 0 ] || { echo "push incomplete" >&2; exit 1; }
 say "OK"

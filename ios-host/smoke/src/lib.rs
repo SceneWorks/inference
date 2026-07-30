@@ -700,6 +700,24 @@ fn dirs_documents() -> Option<std::path::PathBuf> {
     docs.is_dir().then_some(docs)
 }
 
+/// Append one line to a file in Documents, flushing immediately.
+///
+/// Best-effort by design: this is diagnostic breadcrumbing for a process that may be killed without
+/// warning, so a failure to write it must never fail the check it is instrumenting.
+#[cfg(feature = "media")]
+fn append_breadcrumb(name: &str, line: &str) {
+    use std::io::Write;
+    let Some(docs) = dirs_documents() else { return };
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(docs.join(name))
+    {
+        let _ = writeln!(f, "{line}");
+        let _ = f.flush();
+    }
+}
+
 /// **E5: SANA image generation on device.** The deciding measurement for S5.2.
 ///
 /// The host harness (`mlx-gen-ios-catalog`'s `image_budget`) puts the sequential peak at 3294-4773
@@ -733,11 +751,21 @@ fn check_image_generation(media_dir: Option<&Path>) -> Check {
     /// registering it, this check must fail loudly rather than quietly pick whatever is first.
     const SANA_ID: &str = "sana_1600m";
 
-    // (label, edge, decode tile in output px). `None` decodes whole-image. 512 untiled is the
-    // cheapest configuration that fits; 1024 needs tiling, and 128px tiles is where the host
-    // measured the decode transient down to the denoise floor.
+    // (label, edge, decode tile in output px). `None` decodes whole-image.
+    //
+    // Ordered by ASCENDING measured peak, not by resolution: 1024-tiled is 3294 MiB on the host and
+    // 512-untiled is 4773. This app carries no `increased-memory-limit` entitlement (E5/S4.7 is
+    // still pending), so the larger configuration may be jetsam-killed — and running it first would
+    // mean learning nothing about the one that was going to work.
     let configs: &[(&str, u32, Option<u32>)] =
-        &[("512 untiled", 512, None), ("1024 tile128", 1024, Some(128))];
+        &[("1024 tile128", 1024, Some(128)), ("512 untiled", 512, None)];
+
+    // Truncate any breadcrumb from a previous run FIRST. A stale one would be read as this run's
+    // progress and point the blame at the wrong configuration — the same class of mistake as the
+    // stale `smoke-report.txt` that once made a fixed bug look like it persisted.
+    if let Some(docs) = dirs_documents() {
+        let _ = std::fs::remove_file(docs.join("sana-progress.txt"));
+    }
 
     let mut details: Vec<String> = Vec::new();
     for &(label, edge, tile) in configs {
@@ -822,9 +850,21 @@ fn check_image_generation(media_dir: Option<&Path>) -> Check {
         };
 
         match run() {
-            Ok(detail) => details.push(detail),
+            Ok(detail) => {
+                // Persisted BEFORE the next configuration starts.
+                //
+                // Jetsam is a kill, not an exception: if the next config exceeds the per-app limit
+                // the process dies where it stands and `run_report`'s string — every check in it,
+                // including the LLM ones that already passed — is lost with it. The device harness
+                // then reports "no report was produced", which is indistinguishable from a launch
+                // failure. This breadcrumb survives, so a kill is diagnosable as "died during the
+                // configuration after this one" rather than as a mystery.
+                append_breadcrumb("sana-progress.txt", &detail);
+                details.push(detail);
+            }
             Err(e) => {
                 std::env::remove_var("MLX_GEN_SANA_DECODE_TILE");
+                append_breadcrumb("sana-progress.txt", &format!("FAILED {e}"));
                 return Check {
                     name: NAME,
                     passed: false,

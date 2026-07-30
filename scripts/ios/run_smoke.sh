@@ -164,6 +164,21 @@ done
 
 if [ ! -f "$REPORT" ]; then
   echo "no report was produced; is the device unlocked?" >&2
+  # A jetsam kill and a launch failure look identical from here: in both cases nothing was written.
+  # The image check leaves a per-configuration breadcrumb precisely so the two can be told apart —
+  # if it exists, the app ran and died partway rather than never starting.
+  BREADCRUMB=/tmp/ios-sana-progress.txt
+  rm -f "$BREADCRUMB"
+  if xcrun devicectl device copy from --device "$DEVICE" \
+      --domain-type appDataContainer --domain-identifier com.idkplay.SceneWorksSmoke \
+      --source Documents/sana-progress.txt --destination "$BREADCRUMB" >/dev/null 2>&1; then
+    echo >&2
+    echo "the app DID run -- image-generation breadcrumbs found, so this is a mid-run death" >&2
+    echo "(most likely jetsam: no increased-memory-limit entitlement, see E5/S4.7):" >&2
+    sed 's/^/  /' "$BREADCRUMB" >&2
+    echo >&2
+    echo "the configuration AFTER the last line above is the one that exceeded the cap" >&2
+  fi
   exit 1
 fi
 
