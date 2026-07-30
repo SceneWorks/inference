@@ -384,8 +384,8 @@ What is left is genuinely SANA-specific: getting it resident and correct, and me
 
 | Story | Notes |
 |---|---|
-| S5.1 SANA on device | **Mac-side done** — composition, surface tests, and the `aarch64-apple-ios` cross-compile all green. The device half is Session A. |
-| S5.2 Memory residency | **Mac-side DONE — fits 8 GB, tightly.** `Residency::run_staged` sheds the Q4 trunk before decode (−1905 MiB) and the now-working tiled decode bounds the DC-AE transient: 1024px at 3294 MiB, 512px at 3453, both inside a 4096 MiB budget at 80–85% (56–78% of a 12 GB device's). Peak verified count-independent; Resident/Sequential byte-parity and repeat-job bounding re-verified on real weights. Device confirmation is Session A, and at 8 GB it is the *deciding* measurement, not a formality. |
+| S5.1 SANA on device | **DONE.** A 1024px image generated on an iPhone 17 Pro Max in 36.5 s at 2839 MiB, through `provider_registry()` and the `Generator` contract. See the device section below. |
+| S5.2 Memory residency | **DONE on a 12 GB device; 8 GB is now doubtful.** Confirmed on hardware at 2839 MiB against a measured 6136 MiB cap. But the host's 4773 MiB untiled configuration was jetsam-killed, so host numbers understate device demand and the earlier "fits 8 GB at 80–85%" claim cannot be trusted without 8 GB hardware. Mac-side detail follows. **Mac-side: fits 8 GB, tightly.** `Residency::run_staged` sheds the Q4 trunk before decode (−1905 MiB) and the now-working tiled decode bounds the DC-AE transient: 1024px at 3294 MiB, 512px at 3453, both inside a 4096 MiB budget at 80–85% (56–78% of a 12 GB device's). Peak verified count-independent; Resident/Sequential byte-parity and repeat-job bounding re-verified on real weights. Device confirmation is Session A, and at 8 GB it is the *deciding* measurement, not a formality. |
 | S5.3 `gen-core-testkit` conformance on device | The media contract's equivalent of E3's S3.5. |
 | S5.7 Device harness for image generation | **DONE.** `ios-smoke` gains a `media` feature carrying a SANA check (two configurations, loaded through `provider_registry()` rather than a direct loader), `scripts/ios/push_model.sh` provisions a snapshot into the app container, and `run_smoke.sh --media` drives both. Validated on the host first, where MLX peaks reproduce `image_budget`'s numbers exactly. |
 | S5.5 `media` feature in `runtime-ios` | **DONE** — `mlx-gen-ios-catalog` (a new, narrow composition root: SANA only, **not** `mlx-gen-catalog`'s 32 providers) behind an off-by-default `media` feature. Both profiles have ordered surface tests; the media one asserts exactly `["sana_1600m", "sana_sprint_1600m"]` and the LLM-only one asserts the registry is empty. Cross-compiles for `aarch64-apple-ios`. |
@@ -774,6 +774,14 @@ device — so SANA does not need to be restricted to 12 GB hardware. The earlier
 recommendation is withdrawn; it was written against a peak that assumed the trunk stayed resident.
 The 8 GB case is tight enough that the device session decides it, not the host harness.
 
+> **Superseded the same day by the device run below — read that first.** The device session did
+> decide it, and not in this claim's favour. A configuration this section calls comfortable
+> (512px untiled, 4773 MiB against a 6136 MiB cap) was **jetsam-killed** on hardware, because
+> `set_memory_limit` applies backpressure where the device applies a kill. Host numbers therefore
+> *understate* device demand, and every "fits 8 GB at N%" figure above is an underestimate of
+> unknown size. The 8 GB claim is not withdrawn — it is **unverified**, and cannot be verified
+> without 8 GB hardware. What *is* confirmed on a 12 GB device is 1024px tiled at 2839 MiB.
+
 **Found in passing — a progress-contract violation shared by every mlx-gen image provider.**
 `gen_core_testkit`'s progress contract requires `Progress::Decoding` **exactly once** per generation
 and names once-per-output as a failure ("the restarting-bar class", F-136/F-162). SANA emitted it
@@ -838,6 +846,41 @@ peak (2961 vs 4773 MiB) — it is not seeing Metal buffer allocations. On iOS th
 footprint jetsam reads, so the divergence should not appear on device. The check prints both so that
 can be checked rather than assumed, and the image threshold is read off MLX's number, since a ceiling
 on RSS would be vacuous.
+
+### On device: SANA generates 1024px on an iPhone, and tiling is why (2026-07-30)
+
+First image-generation run on the iPhone 17 Pro Max, iOS 26.5.2, with the memory entitlements
+claimed.
+
+| config | host (`image_budget`) | device | outcome |
+|---|---:|---:|---|
+| 1024px, 128px tiles | 3294 MiB | **2839 MiB**, 36.5 s | **works**, 4263 MiB still available |
+| 512px, untiled | 4773 MiB | — | **jetsam-killed** |
+
+**The per-app cap is 6136 MiB (5.99 GiB)**, read from `os_proc_available_memory()` rather than
+assumed. The branch's "~6 GB on a 12 GB device" folklore was right; it is now a measurement that
+prints on every run.
+
+**The host said untiled fits. The device killed it.** The reason is precise and worth keeping:
+`image_budget` measures under `set_memory_limit`, which is *backpressure* — MLX evicts rather than
+grows. The device has no limit, it has jetsam, which kills. An untiled decode is therefore free to
+allocate past whatever the host recorded. That is exactly the gap between "the working set fits" and
+"iOS lets the app live" that `image_budget`'s own module docs warn about, now measured instead of
+warned about.
+
+**So tiling is not an optimization for large images — it is what makes SANA viable on a phone.**
+That inverts what this doc said a few hours earlier, when the 512-untiled configuration was reported
+as the comfortable one. The device harness now runs only tiled configurations.
+
+**The jetsam diagnosis came from the breadcrumb**, which is what it was built for: `1024 tile128`
+left a line, the configuration after it did not, and `devicectl info processes` confirmed the app
+was gone. Ordering configurations by ascending measured peak meant the survivable one was proven
+before the fatal one ran — had they been ordered by resolution, the run would have died first and
+taught nothing.
+
+**MLX's accounting and process RSS agree on device** (2839 vs 2955 MiB) where they diverged sharply
+on macOS (4773 vs 2961). So `getrusage` missing Metal allocations is a host artifact, and iOS does
+count them toward the footprint jetsam reads — which is what makes the cap number meaningful.
 
 **Still open:** the `BoundedDecode` contract adoption. The mechanism now exists and is measured, but
 tiling is still selected by the `MLX_GEN_SANA_DECODE_TILE` env knob rather than by the contract's
