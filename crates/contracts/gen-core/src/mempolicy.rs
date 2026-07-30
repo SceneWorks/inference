@@ -7,8 +7,10 @@
 //! different amounts (a residency flip is nearly free; resolution reduction costs quality), and they
 //! target **different peaks** (the resident footprint, the denoise steady state, the decode spike). The
 //! requirement (sc-11750) is that a large-memory machine pays *zero* overhead — full res, `Resident`,
-//! bf16 branch, single-pass decode — while a constrained machine engages levers only as far as needed,
-//! in cost order, at the lightest sufficient setting.
+//! single-pass decode — while a constrained machine engages levers only as far as needed, in cost
+//! order, at the lightest sufficient setting. ("Zero overhead" is about the *levers*: a component's
+//! precision is not one of them, so a q8 selection carries a q8 control branch on a 96 GB card too —
+//! see [tier integrity](crate::tier_integrity).)
 //!
 //! [`plan_memory_adaptation`] is that decision. It is **pure** (the caller injects the budget and a
 //! shape-derived peak estimator, exactly like `budgeted_plan` injects `safe_gib` + `peak_cost`), so it
@@ -33,10 +35,12 @@
 //! control branch **to the base quant tier** at load time". That is not a lever, it is
 //! [tier integrity](crate::tier_integrity) — *no component is resident above the user's selected tier
 //! unless a declared, measured exception says otherwise* — implemented as an escalation step. Its q8
-//! setting is measured near-lossless and saves 8.4 GiB, so there was never a quality argument for
-//! defaulting to a bf16 branch when the user asked for q8; and because it sat LAST, a constrained
-//! machine engaged residency and decode tiling first, clawing back single-digit GiB while 8.4 GiB of
-//! unrequested precision sat in the branch the whole time. The branch's tier is now decided by
+//! setting is measured near-lossless and takes the branch from 6.6 GB bf16 to ~3.3 GB resident (a
+//! **shape** fact, not a peak measurement — see [`crate::tier_integrity`] for why the catalog's
+//! `branchPackSaveGb` 8.4/10.2 are retracted), so there was never a quality argument for defaulting to
+//! a bf16 branch when the user asked for q8; and because it sat LAST, a constrained machine engaged
+//! residency and decode tiling first, clawing back single-digit GiB while that ~3.3 GB of unrequested
+//! precision sat in the branch the whole time. The branch's tier is now decided by
 //! [`crate::tier_integrity::control_branch_tier`] from the base tier alone, so the peaks a lane
 //! reports to this policy already have the branch at its correct tier and there is nothing left to
 //! escalate.

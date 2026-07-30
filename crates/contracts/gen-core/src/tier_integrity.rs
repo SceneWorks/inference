@@ -14,18 +14,30 @@
 //!
 //! Packing the Krea pose-control branch to the base tier used to be the last rung of a per-lane
 //! escalation ladder (`Lever::BranchQuant`, sc-11748): a constrained machine engaged residency
-//! flips and decode tiling first, clawing back single-digit GiB, while ~8.4 GiB of *unrequested*
-//! precision sat in the control branch the entire time. That is the invariant above, implemented as
-//! an escalation step, and it is deleted. The branch's tier is now a pure function of the base
-//! tier — [`control_branch_tier`] — decided once at load with no reference to the device budget.
+//! flips and decode tiling first, clawing back single-digit GiB, while the branch sat resident at
+//! **bf16** the entire time. The size of that unrequested precision is a shape fact, not a
+//! measurement: the branch's projections are **3.30 B params ≈ 6.6 GB bf16**, and the packed
+//! resident footprint is **~3.3 GB at q8 / ~1.7 GB at q4**
+//! (`candle_gen_krea::control::ControlBranch::from_checkpoint_quantized`). So a q8 render that
+//! carried a bf16 branch held **~3.3 GB** it never asked for, and a q4 render **~4.9 GB**. That is
+//! the invariant above, implemented as an escalation step, and it is deleted. The branch's tier is
+//! now a pure function of the base tier — [`control_branch_tier`] — decided once at load with no
+//! reference to the device budget.
+//!
+//! Those weight-side deltas are the only branch figures this module will quote. The catalog's
+//! `candle.control.branchPackSaveGb` (q8 −8.4, q4 −10.2 GB) are **not** weight-side quantities —
+//! each exceeds the entire 6.6 GB branch — so they cannot be subtracted from a peak to price a
+//! packed branch. See the retraction on the `krea_2_turbo` catalog entry; sc-16013 owns the
+//! re-measure.
 //!
 //! ## The one declared exception
 //!
 //! Packing the branch to **q4** is measured *"pose-locked; non-pose details drift"* (candle-gen
-//! #483, sc-11743: q8 −8.4 GiB near-lossless, q4 −10.2 GiB with drift). The control residual is
-//! precision-sensitive and is the thing the user actually asked for, so a q4 base **floors** its
-//! branch at q8 rather than following it down. That is a declared, measured exception — not a hole
-//! in the rule, the rule working. It is declared in the catalog on the `krea_2_turbo` entry
+//! #483, sc-11743) — a **quality** finding, which is the whole basis of the exception. The control
+//! residual is precision-sensitive and is the thing the user actually asked for, so a q4 base
+//! **floors** its branch at q8 rather than following it down, forgoing the ~1.6 GB (3.3 → 1.7) a q4
+//! branch would have freed. That is a declared, measured exception — not a hole in the rule, the
+//! rule working. It is declared in the catalog on the `krea_2_turbo` entry
 //! (`candle.control.branchTierByBaseTier` plus its `tierIntegrity` exception row) and enforced here.
 
 use crate::runtime::Quant;

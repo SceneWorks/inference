@@ -79,7 +79,11 @@ pub struct Krea2ControlPaths {
     /// "the default".
     ///
     /// It was previously the last-resort rung of the worker's control fit ladder, which left a bf16
-    /// branch resident on every card with headroom — ~8.4 GiB of precision a q8 render never asked for.
+    /// branch resident on every card with headroom — the branch's projections are 3.30 B params ≈
+    /// **6.6 GB** bf16 against ~3.3 GB at q8 (see [`ControlBranch::from_checkpoint_quantized`]),
+    /// so that is **~3.3 GB** of precision a q8 render never asked for. (Not the 8.4 GB the catalog's
+    /// `branchPackSaveGb` once claimed for it: 8.4 exceeds the whole branch, so it was never a
+    /// weight-side quantity. sc-16013 owns the re-measure.)
     /// This provider cannot derive the value itself (it is never told a tier name; the base tier is
     /// implied by `root` and auto-detected from the packed weights), so the worker owns the derivation
     /// and this field is how it is delivered.
