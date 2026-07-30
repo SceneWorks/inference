@@ -14,7 +14,7 @@ use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, default_seed, AdapterSpec, Capabilities,
     Conditioning, ConditioningKind, Error, GenerationOutput, GenerationRequest, Generator,
     LatentDecoder, LoadSpec, Modality, ModelDescriptor, Precision, Progress, Quant, Residency,
-    Result, WeightsSource,
+    Result, SizeFloor, WeightsSource,
 };
 use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidEngine};
 use mlx_gen_qwen_image::pipeline::PID_BACKBONE;
@@ -142,6 +142,7 @@ pub fn descriptor() -> ModelDescriptor {
             audio_voices: vec![],
             audio_languages: vec![],
             audio_edit_modes: vec![],
+            size_floor: SizeFloor::RangeChecked,
         },
     }
 }
@@ -960,7 +961,20 @@ impl Krea {
 /// Layers Krea's model-specific constraints (non-empty prompt, size multiple-of-16, steps ≥ 1) on top
 /// of the shared [`Capabilities::validate_request`] floor (count/size range, negative/guidance/true_cfg
 /// flags, conditioning kinds).
-pub(crate) fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) -> Result<()> {
+/// # Callable without weights, and deliberately `pub`
+///
+/// Every rule in this function reads only `desc` and `req` — there is no `&self`,
+/// no loaded generator and no tensor. It was `pub(crate)`, which made it
+/// unreachable to a caller that wants to type-check a request *before* paying for
+/// a load, so such a caller had no option but to re-implement these rules and
+/// maintain a copy that drifts.
+///
+/// That is not hypothetical: SceneWorks' Aether Studio mirrors this function by
+/// hand for exactly that reason, and keeps a test that runs the engine's own
+/// [`Capabilities::validate_request`] over the same corpus to detect the drift it
+/// cannot prevent. Making this `pub` lets that mirror be deleted rather than
+/// maintained.
+pub fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) -> Result<()> {
     let id = desc.id;
     if req.prompt.is_empty() {
         return Err(Error::Msg(format!("{id}: prompt must not be empty")));

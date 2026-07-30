@@ -16,7 +16,7 @@ use mlx_rs::{random, Dtype};
 
 use mlx_gen::{
     default_seed, Capabilities, Error, GenerationOutput, GenerationRequest, Generator, Image,
-    LoadSpec, Modality, ModelDescriptor, Precision, Progress, Result, WeightsSource,
+    LoadSpec, Modality, ModelDescriptor, Precision, Progress, Result, SizeFloor, WeightsSource,
 };
 use mlx_gen_flux::T5TextEncoder;
 
@@ -97,6 +97,7 @@ pub fn descriptor() -> ModelDescriptor {
             audio_voices: vec![],
             audio_languages: vec![],
             audio_edit_modes: vec![],
+            size_floor: SizeFloor::RangeChecked,
         },
     }
 }

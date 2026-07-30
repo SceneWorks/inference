@@ -14,7 +14,8 @@ use std::path::Path;
 use mlx_gen::{
     default_seed, AdapterKind, AdapterSpec, Capabilities, Conditioning, ConditioningKind, Error,
     GenerationOutput, GenerationRequest, Generator, Image, LatentDecoder, LoadSpec, Modality,
-    ModelDescriptor, OffloadPolicy, Precision, Progress, Quant, Residency, Result, WeightsSource,
+    ModelDescriptor, OffloadPolicy, Precision, Progress, Quant, Residency, Result, SizeFloor,
+    WeightsSource,
 };
 use mlx_gen_flux2::model::PID_BACKBONE;
 use mlx_gen_pid::{resolve_pid_decoder_at_sigma, PidEngine};
@@ -102,6 +103,7 @@ pub fn descriptor() -> ModelDescriptor {
             audio_voices: vec![],
             audio_languages: vec![],
             audio_edit_modes: vec![],
+            size_floor: SizeFloor::RangeChecked,
         },
     }
 }

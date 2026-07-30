@@ -40,7 +40,7 @@ use candle_gen::gen_core::runtime::LoadPhase;
 use candle_gen::gen_core::{
     self, Capabilities, Conditioning, ConditioningKind, GenerationOutput, GenerationRequest,
     Generator, Image, LoadSpec, Modality, ModelDescriptor, OffloadPolicy, PerComponentBytes,
-    Progress, WeightsSource,
+    Progress, SizeFloor, WeightsSource,
 };
 use candle_gen::{
     check_cancel, effective_offload_policy, run_three_stage_sequential, CandleError,
@@ -292,6 +292,7 @@ pub fn descriptor() -> ModelDescriptor {
             audio_languages: vec![],
             audio_edit_modes: vec![],
             supported_quants: &[],
+            size_floor: SizeFloor::RangeChecked,
         },
     }
 }

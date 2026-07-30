@@ -49,7 +49,7 @@ use candle_gen::candle_core::{DType, Device};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::{
     self, reject_unknown_components, Capabilities, GenerationOutput, GenerationRequest, Generator,
-    LoadSpec, Modality, ModelDescriptor, Progress, Quant, WeightsSource,
+    LoadSpec, Modality, ModelDescriptor, Progress, Quant, SizeFloor, WeightsSource,
 };
 use candle_gen::{CandleError, Result};
 
@@ -152,6 +152,7 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
             audio_voices: vec![],
             audio_languages: vec![],
             audio_edit_modes: vec![],
+            size_floor: SizeFloor::RangeChecked,
         },
     }
 }
