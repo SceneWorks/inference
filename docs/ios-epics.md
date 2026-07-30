@@ -892,6 +892,26 @@ nothing.
 on macOS (4773 vs 2961). So `getrusage` missing Metal allocations is a host artifact, and iOS does
 count them toward the footprint jetsam reads — which is what makes the cap number meaningful.
 
+**Full green run** (both configs tiled, entitlements claimed):
+
+```
+per-app cap    6135 MiB (os_proc_available_memory, measured)
+1024 tile128   36.5 s, MLX peak 2751 MiB, 4515 MiB still available
+512  tile256   12.8 s, MLX peak 3093 MiB, 1649 MiB still available
+LLM            17.3 tok/s sustained, 0 MiB growth, 100% unload reclaim
+```
+
+**512px is a memory data point, not a quality one.** Its render looks wrong — tiny subject,
+washed-out sky, mushy texture — and the obvious suspicion was the tiled decode. It is not: rendering
+512 **whole-image on the host** produces the same collapse. This is the `Sana_1600M_1024px`
+checkpoint and 512 is outside its training resolution, so composition falls apart regardless of
+decode strategy. Tiling moves it by mean |Δ| 2.6, the same small amount it moves 1024, where the
+result is indistinguishable from the host's.
+
+The device harness keeps the 512 configuration (a second resolution exercises a different allocation
+shape) but labels it off-distribution, so nobody reads its PNG as a regression. **The shipping
+resolution for this checkpoint is 1024.**
+
 **Still open:** the `BoundedDecode` contract adoption. The mechanism now exists and is measured, but
 tiling is still selected by the `MLX_GEN_SANA_DECODE_TILE` env knob rather than by the contract's
 budget model. That work is now an optimization rather than the critical path, and it should be sized

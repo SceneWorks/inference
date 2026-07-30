@@ -815,8 +815,18 @@ fn check_image_generation(media_dir: Option<&Path>) -> Check {
     // and it is why this check exists.
     //
     // Still ordered by ASCENDING measured peak, so a kill leaves the cheaper configuration proven.
-    let configs: &[(&str, u32, Option<u32>)] =
-        &[("1024 tile128", 1024, Some(128)), ("512 tile256", 512, Some(256))];
+    //
+    // **512 is a MEMORY data point, not a quality one.** This is the `Sana_1600M_1024px`
+    // checkpoint, and 512 is outside its training resolution: the composition collapses (tiny
+    // subject, washed-out sky, mushy texture) whether or not the decode tiles. Verified by
+    // rendering 512 whole-image on the host, which looks equally wrong — so nothing here is
+    // evidence against the tiled decode. The second config stays because a second resolution
+    // exercises a different allocation shape, and it is labelled so nobody reads its PNG as a
+    // regression.
+    let configs: &[(&str, u32, Option<u32>)] = &[
+        ("1024 tile128", 1024, Some(128)),
+        ("512 tile256 (off-distribution: 1024px checkpoint)", 512, Some(256)),
+    ];
 
     // Truncate any breadcrumb from a previous run FIRST. A stale one would be read as this run's
     // progress and point the blame at the wrong configuration — the same class of mistake as the
