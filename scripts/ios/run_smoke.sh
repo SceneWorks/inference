@@ -131,7 +131,27 @@ test -f "$APP/mlx.metallib" \
 say "bundled metallib: $(du -h "$APP/mlx.metallib" | cut -f1)"
 
 say "installing"
-xcrun devicectl device install app --device "$DEVICE" "$APP" 2>&1 | tail -5
+INSTALL_LOG=$(xcrun devicectl device install app --device "$DEVICE" "$APP" 2>&1) || true
+echo "$INSTALL_LOG" | tail -5
+
+# A team change makes the install fail with MismatchedApplicationIdentifierEntitlement, because
+# iOS refuses to upgrade across app-identifier prefixes. The raw error names both prefixes but not
+# the remedy, and the remedy is destructive (uninstalling drops the app's Documents container, i.e.
+# every pushed snapshot), so say so explicitly rather than letting it read as a signing bug.
+if echo "$INSTALL_LOG" | grep -q "MismatchedApplicationIdentifierEntitlement"; then
+  INSTALLED_TEAM=$(echo "$INSTALL_LOG" \
+    | grep -oE "installed application's application-identifier string \([A-Z0-9]+\." \
+    | grep -oE '\([A-Z0-9]+' | tr -d '(' | head -1)
+  echo >&2
+  echo "the installed app was signed by team ${INSTALLED_TEAM:-<unknown>}; this build uses $DEVELOPMENT_TEAM." >&2
+  echo "iOS cannot upgrade across teams. Uninstall and reinstall:" >&2
+  echo >&2
+  echo "  xcrun devicectl device uninstall app --device $DEVICE com.idkplay.SceneWorksSmoke" >&2
+  echo >&2
+  echo "NOTE: that DELETES the app's Documents container, including every pushed snapshot." >&2
+  echo "Re-provision afterwards with scripts/ios/push_model.sh (see docs/ios-epics.md E5)." >&2
+  exit 1
+fi
 
 # The device must be UNLOCKED to launch an app: SpringBoard denies the request with
 # FBSOpenApplicationErrorDomain 7 otherwise, after a successful build and install. Say so plainly
@@ -147,11 +167,18 @@ xcrun devicectl device process launch \
 # Poll for a report written AFTER the launch. Accepting the first file that copies is wrong: a
 # previous run's report is still sitting in the container, so a crashed or slow app yields a
 # confident-looking stale result -- which is exactly how a fixed bug appeared to persist.
-say "waiting for the on-device report"
+# 180 s covers the LLM checks. The image checks add a 4.73 GB snapshot read from device storage
+# plus two generations, so --media gets considerably longer — a timeout here is indistinguishable
+# from a jetsam kill in the output, and mistaking "still working" for "died" would send the next
+# hour after the wrong problem.
+POLL_TRIES=${POLL_TRIES:-60}
+[ -n "$CARGO_FEATURES" ] && POLL_TRIES=${POLL_TRIES_MEDIA:-200}
+
+say "waiting for the on-device report (up to $((POLL_TRIES * 3))s)"
 REPORT=/tmp/ios-smoke-report.txt
 rm -f "$REPORT"
 LAUNCHED_AT=$(date +%s)
-for _ in $(seq 1 60); do
+for _ in $(seq 1 "$POLL_TRIES"); do
   sleep 3
   rm -f "$REPORT"
   xcrun devicectl device copy from --device "$DEVICE" \
