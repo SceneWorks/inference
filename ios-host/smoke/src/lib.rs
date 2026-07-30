@@ -823,10 +823,33 @@ fn check_image_generation(media_dir: Option<&Path>) -> Check {
     // evidence against the tiled decode. The second config stays because a second resolution
     // exercises a different allocation shape, and it is labelled so nobody reads its PNG as a
     // regression.
-    let configs: &[(&str, u32, Option<u32>)] = &[
+    const SHIPPING: &[(&str, u32, Option<u32>)] = &[
         ("1024 tile128", 1024, Some(128)),
         ("512 tile256 (off-distribution: 1024px checkpoint)", 512, Some(256)),
     ];
+
+    // Under `IOS_SMOKE_IMAGE_ONLY` the untiled configuration comes back — the one that died.
+    //
+    // It is deliberately NOT in the shipping list: running it is what killed the app, and a harness
+    // that routinely asks the phone for a fatal render is a bad harness. Here it IS the experiment.
+    // The LLM checks are skipped in this mode, so it runs against a cold process, which separates
+    // the two live explanations for that death: a decode genuinely too large, or ~2.9 GB of LLM-era
+    // memory still resident underneath it (MLX's own accounting cannot see the difference).
+    //
+    // Ordered last, after the two configurations known to survive, so a kill still leaves those
+    // proven and the breadcrumb names the fatal one unambiguously.
+    const DIAGNOSTIC: &[(&str, u32, Option<u32>)] = &[
+        ("1024 tile128", 1024, Some(128)),
+        ("512 tile256 (off-distribution: 1024px checkpoint)", 512, Some(256)),
+        ("512 UNTILED (diagnostic: the config that died)", 512, None),
+    ];
+
+    let configs: &[(&str, u32, Option<u32>)] =
+        if std::env::var_os("IOS_SMOKE_IMAGE_ONLY").is_some() {
+            DIAGNOSTIC
+        } else {
+            SHIPPING
+        };
 
     // Truncate any breadcrumb from a previous run FIRST. A stale one would be read as this run's
     // progress and point the blame at the wrong configuration — the same class of mistake as the
@@ -978,7 +1001,22 @@ fn check_image_generation(media_dir: Option<&Path>) -> Check {
 /// The first line is `SMOKE: PASS` or `SMOKE: FAIL` so an XCTest can assert on a prefix without
 /// parsing the body.
 pub fn run_report() -> String {
-    let snapshot = find_snapshot();
+    // `IOS_SMOKE_IMAGE_ONLY=1` skips every LLM check and runs the image lane against a cold
+    // process. This exists to settle one specific question, not as a convenience.
+    //
+    // The 512px untiled render died on device at a host-measured 4773 MiB, under a measured 6135
+    // MiB cap — which does not add up on its own. It DOES add up if the LLM checks that ran first
+    // left their memory in the process: they take RSS to ~2964 MiB, and 2.9 + 4.77 is over the cap
+    // while 2.9 + 2.75 (the tiled config, which survived) is not. Every peak this harness reports
+    // is MLX's own accounting, which cannot see memory MLX has already released to its cache or
+    // that the OS has not reclaimed, so the report cannot distinguish the two explanations.
+    //
+    // Running the image lane alone does. If the untiled config survives a cold process, the kill
+    // was residue and the decode is exonerated; if it dies anyway, the decode really is too large
+    // and the residue hypothesis is dead. Either answer is worth one device run.
+    let image_only = std::env::var_os("IOS_SMOKE_IMAGE_ONLY").is_some();
+
+    let snapshot = if image_only { None } else { find_snapshot() };
     #[allow(unused_mut)]
     let mut checks = vec![
         // First: it is the denominator for every memory number below, and it must be sampled
