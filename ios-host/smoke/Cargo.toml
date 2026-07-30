@@ -13,6 +13,11 @@ publish = false
 # staticlib for linking into the .app; rlib so `cargo test` can exercise the same code on macOS.
 crate-type = ["staticlib", "rlib"]
 
+[features]
+# E5's image-generation checks. Off by default so the LLM smoke stays the small, fast binary that
+# E3/E4 ship, and so a media compile break can never block the text lane's device runs.
+media = ["runtime-ios/media"]
+
 [dependencies]
 mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/zakkeown/mlx-rs", rev = "c0e5c4a4350ec4989e5dc130158dee7757eae785" }
 # Deliberately the BUNDLE, not mlx-llm directly: the point of an on-device test is to exercise the

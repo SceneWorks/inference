@@ -544,8 +544,9 @@ fn check_unload_seam(model_dir: Option<&Path>) -> Check {
                 detail: format!("generate failed: {e}"),
             };
         }
-        let active = mlx_rs::memory::get_active_memory();
-        active
+        // Sampled BEFORE the scope ends, so this is allocation with the provider still alive —
+        // which is the whole point of the comparison below.
+        mlx_rs::memory::get_active_memory()
         // `llm` drops here.
     };
 
@@ -616,7 +617,7 @@ fn check_conformance(model_dir: Option<&Path>) -> Check {
     let started = Instant::now();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         textllm_conformance(
-            &|| {
+            || {
                 runtime_ios::llm::load_for_model(&LoadSpec::dense(dir.clone()))
                     .expect("load provider for conformance")
             },
@@ -672,6 +673,25 @@ fn find_snapshot() -> Option<std::path::PathBuf> {
         .find(|p| p.is_dir() && p.join("config.json").is_file())
 }
 
+/// The SANA snapshot, if one was pushed. A diffusers multi-component tree, so it is identified by
+/// its component directories rather than by a root `config.json` — which it does not have, and which
+/// is also what keeps it from being mistaken for the LLM snapshot by [`find_snapshot`] above.
+#[cfg(feature = "media")]
+fn find_media_snapshot() -> Option<std::path::PathBuf> {
+    let docs = dirs_documents()?;
+    let is_sana = |p: &std::path::Path| {
+        p.join("transformer").is_dir() && p.join("vae").is_dir() && p.join("text_encoder").is_dir()
+    };
+    if is_sana(&docs) {
+        return Some(docs);
+    }
+    std::fs::read_dir(&docs)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.is_dir() && is_sana(p))
+}
+
 /// The app's Documents directory. `NSHomeDirectory` is the container root inside the sandbox; on
 /// the host (where the same checks run under `cargo test`) `HOME` serves the same role.
 fn dirs_documents() -> Option<std::path::PathBuf> {
@@ -680,13 +700,156 @@ fn dirs_documents() -> Option<std::path::PathBuf> {
     docs.is_dir().then_some(docs)
 }
 
+/// **E5: SANA image generation on device.** The deciding measurement for S5.2.
+///
+/// The host harness (`mlx-gen-ios-catalog`'s `image_budget`) puts the sequential peak at 3294-4773
+/// MiB depending on resolution and tiling, and it measures the *same* allocator with the *same*
+/// weights — but it measures it against `set_memory_limit`, which is backpressure. Jetsam is a kill.
+/// So the host number proves the working set fits; only this proves iOS lets the app keep it.
+///
+/// Reported per configuration rather than asserted against a single threshold: the peak that matters
+/// is device-class-specific (a 12 GB phone caps near 6 GB, an 8 GB one near 4), and a threshold set
+/// from one device would be noise. What *is* asserted is that an image comes back, at the requested
+/// size, and is not degenerate — a decode that silently produces a constant image would otherwise
+/// pass every shape and memory check while being worthless.
+#[cfg(feature = "media")]
+fn check_image_generation(media_dir: Option<&Path>) -> Check {
+    const NAME: &str = "SANA image generation (E5)";
+    let Some(dir) = media_dir else {
+        return Check {
+            name: NAME,
+            passed: true,
+            detail: "skipped -- no SANA snapshot in Documents/ (see docs/ios-epics.md E5)"
+                .to_string(),
+        };
+    };
+
+    use runtime_ios::gen_core::{
+        GenerationOutput, GenerationRequest, LoadSpec as GenLoadSpec, OffloadPolicy, Progress,
+        WeightsSource,
+    };
+
+    /// The base (non-Sprint) SANA id. Pinned as a literal on purpose: if the catalog ever stops
+    /// registering it, this check must fail loudly rather than quietly pick whatever is first.
+    const SANA_ID: &str = "sana_1600m";
+
+    // (label, edge, decode tile in output px). `None` decodes whole-image. 512 untiled is the
+    // cheapest configuration that fits; 1024 needs tiling, and 128px tiles is where the host
+    // measured the decode transient down to the denoise floor.
+    let configs: &[(&str, u32, Option<u32>)] =
+        &[("512 untiled", 512, None), ("1024 tile128", 1024, Some(128))];
+
+    let mut details: Vec<String> = Vec::new();
+    for &(label, edge, tile) in configs {
+        match tile {
+            Some(px) => std::env::set_var("MLX_GEN_SANA_DECODE_TILE", px.to_string()),
+            None => std::env::remove_var("MLX_GEN_SANA_DECODE_TILE"),
+        }
+
+        mlx_rs::memory::clear_cache();
+        mlx_rs::memory::reset_peak_memory();
+        let started = Instant::now();
+
+        let run = || -> Result<String, String> {
+            // Sequential is the whole point: it is what sheds the Gemma encoder after conditioning
+            // and (since the staged-decode change) the DiT before decode.
+            let spec = GenLoadSpec {
+                offload_policy: OffloadPolicy::Sequential,
+                ..GenLoadSpec::new(WeightsSource::Dir(dir.to_path_buf()))
+            };
+            // Through the REGISTRY, not a direct loader — the same reasoning as the LLM checks
+            // taking the bundle rather than `mlx-llm`. This is the path a product takes, so it
+            // exercises catalog composition and provider resolution, not just the engine.
+            let registry = runtime_ios::media::provider_registry()
+                .map_err(|e| format!("{label}: registry build failed: {e}"))?;
+            let generator = registry
+                .load(SANA_ID, &spec)
+                .map_err(|e| format!("{label}: load failed: {e}"))?;
+
+            let request = GenerationRequest {
+                prompt: "a lighthouse on a rocky coast at dawn".to_string(),
+                width: edge,
+                height: edge,
+                count: 1,
+                steps: Some(4),
+                seed: Some(0),
+                ..Default::default()
+            };
+            let mut noop = |_: Progress| {};
+            let out = generator
+                .generate(&request, &mut noop)
+                .map_err(|e| format!("{label}: generate failed: {e}"))?;
+
+            let image = match out {
+                GenerationOutput::Images(mut v) if !v.is_empty() => v.remove(0),
+                _ => return Err(format!("{label}: generator returned no image")),
+            };
+            if (image.width, image.height) != (edge, edge) {
+                return Err(format!(
+                    "{label}: got {}x{}, expected {edge}x{edge}",
+                    image.width, image.height
+                ));
+            }
+            // Degeneracy guard. A decode that returns a constant (black, grey, saturated) image has
+            // the right shape and the right memory profile and is still worthless, which is exactly
+            // the failure a shape check cannot see. Real content spans a wide range.
+            let (lo, hi) = image
+                .pixels
+                .iter()
+                .fold((255u8, 0u8), |(lo, hi), &p| (lo.min(p), hi.max(p)));
+            if hi - lo < 32 {
+                return Err(format!(
+                    "{label}: image is near-constant (range {lo}..{hi}) -- decode produced no content"
+                ));
+            }
+
+            let secs = started.elapsed().as_secs_f64();
+            // MLX's own accounting is the number to read, and it is reset per configuration above.
+            //
+            // RSS is reported alongside it but is NOT the gauge here, for two reasons. It is a
+            // process-lifetime high-water mark with no reset, so by the time this runs the LLM
+            // checks have already set it and the delta is meaningless. More importantly, on macOS
+            // it was measured *below* MLX's peak (2962 vs 4773 MiB) — `getrusage` is not capturing
+            // Metal buffer allocations. On iOS those allocations do count toward the footprint
+            // jetsam reads, so the divergence is a host artifact; it is printed so the two can be
+            // compared on device, where it should not appear.
+            let mlx_peak = mlx_rs::memory::get_peak_memory() as f64 / (1024.0 * 1024.0);
+            Ok(format!(
+                "{label}: {secs:.1}s, MLX peak {mlx_peak:.0} MiB, process RSS peak {:.0} MiB, \
+                 pixel range {lo}..{hi}",
+                peak_rss_mib(),
+            ))
+        };
+
+        match run() {
+            Ok(detail) => details.push(detail),
+            Err(e) => {
+                std::env::remove_var("MLX_GEN_SANA_DECODE_TILE");
+                return Check {
+                    name: NAME,
+                    passed: false,
+                    detail: e,
+                };
+            }
+        }
+    }
+    std::env::remove_var("MLX_GEN_SANA_DECODE_TILE");
+
+    Check {
+        name: NAME,
+        passed: true,
+        detail: details.join(" | "),
+    }
+}
+
 /// Run every check and render a human- and test-readable report.
 ///
 /// The first line is `SMOKE: PASS` or `SMOKE: FAIL` so an XCTest can assert on a prefix without
 /// parsing the body.
 pub fn run_report() -> String {
     let snapshot = find_snapshot();
-    let checks = vec![
+    #[allow(unused_mut)]
+    let mut checks = vec![
         check_metallib_resolves(),
         check_gemm(Dtype::Float32, "f32 GEMM (steel)"),
         check_gemm(Dtype::Bfloat16, "bf16 GEMM (steel)"),
@@ -697,6 +860,10 @@ pub fn run_report() -> String {
         check_unload_seam(snapshot.as_deref()),
         check_thermal_soak(snapshot.as_deref()),
     ];
+    // Last, deliberately: it is the largest allocation in the run, so putting it after the LLM
+    // checks means a jetsam kill during image generation cannot be mistaken for one during them.
+    #[cfg(feature = "media")]
+    checks.push(check_image_generation(find_media_snapshot().as_deref()));
 
     let failed = checks.iter().filter(|c| !c.passed).count();
     let mut out = String::new();
@@ -749,6 +916,11 @@ mod tests {
     #[test]
     fn smoke_passes_on_the_host() {
         let report = super::run_report();
+        // Printed, not just asserted. Most of these checks report measurements (throughput, peak
+        // RSS, MLX peak) whose VALUE is the output — a bare pass tells you the harness ran and
+        // nothing about what it found, and the host numbers are the baseline the device numbers
+        // are read against. Visible under `--nocapture`.
+        println!("{report}");
         assert!(report.starts_with("SMOKE: PASS"), "{report}");
     }
 }
