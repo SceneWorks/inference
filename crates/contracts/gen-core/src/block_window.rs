@@ -71,14 +71,15 @@
 //! transformer residency, including one that has not adopted this driver, so it must not be read as
 //! scoped to implementors of [`BlockWindowBackend`].
 //!
-//! `candle-gen-krea` is the worked example of why the two halves are separable. Its shipped streamed
-//! trunk used to fold its own block sequence and never touch this trait; SC-15792 moved it onto the
-//! driver, which settles the *forked-driver* half — a backend-local reimplementation is a review
-//! failure, because rung 4 fell through the cracks originally by primitives being less enforced than
-//! the selector. But it still rebuilds each block from the MLX affine triples inside the per-window
-//! path, so it still violates the materialization obligation above and declares itself
-//! `HostFormatConversion` accordingly. SC-16096 owns that half. Adopting the driver is necessary and
-//! not sufficient.
+//! `candle-gen-krea` is the worked example of why the two halves are separable, because they were
+//! fixed by two different stories. Its shipped streamed trunk used to fold its own block sequence and
+//! never touch this trait, AND rebuild each block from the MLX affine triples inside the per-window
+//! path. SC-15792 moved it onto the driver — a backend-local reimplementation is a review failure,
+//! because rung 4 fell through the cracks originally by primitives being less enforced than the
+//! selector. SC-16096 separately removed the per-window conversion, content-addressing each source
+//! triple into a device-format sidecar prepared once, which is what flipped its declaration from
+//! `HostFormatConversion` to `DeviceFormatTransfer`. Adopting the driver was necessary and not
+//! sufficient; neither story alone would have discharged both.
 
 use std::ops::Range;
 

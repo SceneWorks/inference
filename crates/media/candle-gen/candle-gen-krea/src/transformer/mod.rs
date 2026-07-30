@@ -71,11 +71,18 @@ enum TransformerBlocks {
 ///
 /// This deliberately contradicts MLX, where SC-15744 recommended 2–4 to amortize page-cache re-reads.
 /// SC-15791 measured the trade on CUDA and it has the opposite shape: per-step time is FLAT in window
-/// size while peak is LINEAR, because a window's cost is dominated by a per-block host format
-/// conversion that a larger window repeats rather than amortizes. SC-15792 re-measured it through
-/// this implementation and reproduced the slope exactly — **107.9 MiB per block of window** on both
-/// (the intercept differs, 153.4 vs 23.3 MiB, because the implementation's sweep includes the
-/// per-forward dequant transient the spike's materialization-only arm excluded).
+/// size while peak is LINEAR. SC-15792 re-measured it through this implementation and reproduced the
+/// slope exactly — **107.9 MiB per block of window** on both. (The intercepts differ, 153.4 vs
+/// 23.3 MiB, because SC-15792's sweep includes the per-forward dequant transient the spike's
+/// materialization-only arm excluded.)
+///
+/// **The REASON changed under SC-16096 and the conclusion did not.** The spike attributed the flat
+/// time to a per-block host format conversion that a larger window repeats rather than amortizes;
+/// SC-16096 removed that conversion (device-format sidecars, prepared once per component). What
+/// remains — a per-window mmap read plus an H2D transfer — is still linear in the window and still
+/// amortizes nothing across it, so a wider window still buys no time while costing proportionally
+/// more peak. Worth restating explicitly because "the reason for a measurement evaporated" is exactly
+/// when a carried-over constant becomes wrong, and this one was re-derived rather than inherited.
 ///
 /// Every larger window is therefore strictly worse — more peak for no time — which is why
 /// `krea_turbo_memory_strategy_contract` publishes `transformer_window_sizes: vec![1]` and does not
