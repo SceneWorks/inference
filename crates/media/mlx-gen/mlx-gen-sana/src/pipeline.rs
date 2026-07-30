@@ -395,6 +395,27 @@ pub struct SanaHeavy {
     guidance_embeds_scale: f32,
 }
 
+/// Materialize `latents` and release everything the denoise phase was still holding, before the
+/// DC-AE decode allocates.
+///
+/// MLX is lazy: until an array is evaluated it holds a reference to the graph that produced it, so
+/// at the decode boundary the *entire denoise history* — every step's intermediates, and through
+/// them the trunk's weights — is still live. Measured on SANA at 512px, decode therefore began
+/// with **~3.5 GB already resident**, against a first-stage output of 1 MiB
+/// (`docs/ios-epics.md`, E5).
+///
+/// Evaluating collapses the latents to a concrete buffer and drops that graph; `clear_cache` then
+/// returns the freed blocks rather than letting MLX hold them for reuse. Decode starts near the
+/// latents' own size instead of near the denoise peak.
+///
+/// This is the same load→use→drop discipline the residency seam already applies to the text
+/// encoder, applied at the phase boundary *inside* the render bundle.
+fn release_denoise_graph(latents: &Array) -> Result<()> {
+    mlx_rs::transforms::eval([latents])?;
+    mlx_rs::memory::clear_cache();
+    Ok(())
+}
+
 /// The composed SANA text-to-image pipeline: text encoder + heavy render bundle (trunk + DC-AE), with
 /// the DC-AE config (for the latent `scaling_factor`). A clean `generate` entrypoint mirroring the
 /// sibling flow-match pipelines (`mlx-gen-sd3`). The gen-core `Generator` adapter drives the
@@ -671,6 +692,7 @@ impl SanaHeavy {
             on_progress,
         )?;
         on_progress(Progress::Decoding);
+        release_denoise_graph(&latents)?;
         decode_to_image(&self.decoder, &self.dc_ae_cfg, &latents, cancel)
     }
 
@@ -750,6 +772,7 @@ impl SanaHeavy {
             on_progress,
         )?;
         on_progress(Progress::Decoding);
+        release_denoise_graph(&latents)?;
         decode_to_image(&self.decoder, &self.dc_ae_cfg, &latents, cancel)
     }
 }

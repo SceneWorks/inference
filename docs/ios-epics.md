@@ -610,6 +610,50 @@ That separates into **two independent problems**, which is why single levers kep
 
 **Neither is a weight problem, which is why −1.46 GB of weight savings moved the peak 0 MiB.**
 
+### Released the denoise graph — problem 1 solved, problem 2 is the wall (2026-07-30)
+
+Added `release_denoise_graph`: evaluate the latents and `clear_cache()` at the denoise→decode
+boundary, so the denoise graph (and through it the trunk) is dropped before the DC-AE decode
+allocates. Applied at both render tails (base and Sprint). 36 SANA tests pass.
+
+**It does what it was meant to.** Decode's starting `active` at 512px sequential:
+
+| | Before | After |
+|---|---|---|
+| active entering decode stage 1 | 3582 MiB | **2173 MiB** |
+
+~1.4 GB released, confirming the diagnosis: MLX's laziness was keeping the entire denoise history
+live through decode, because an un-evaluated array references the graph that produced it.
+
+**The reported peak did not move: 6678 MiB**, verified in isolation with `--sequential-only` (the
+two runs share a process and MLX's peak is a high-water mark, so a resident pass measured first
+was masking the sequential number — worth knowing for any future comparison).
+
+The stage trace says why. Post-release, sequential:
+
+```
+[1,16,16,1024]   active 2173   peak 3048
+[1,32,32,1024]   active 2422   peak 3132
+...
+final                          peak 6678
+```
+
+The last two stages — `[1,256,256,256]` and `[1,512,512,128]` — add **~3.5 GB of transients**
+while their outputs are 64 MiB and 128 MiB. At the final stage that is roughly **18× the tensor it
+produces**. This is problem 2 from the previous entry, and it is now the entire remaining gap.
+
+**Why it is a wall for the current approach:** the transients are *inside* one stage's
+convolutions at full spatial resolution. Nothing outside the decoder can release them, which is
+why stage-wise `eval` (6680 MiB) and every weight reduction (0 MiB) failed. The only lever that
+reaches inside is **spatial tiling** — decode the latent in tiles so a stage's internals are
+bounded by tile size rather than image size. That is standard practice for VAEs under memory
+pressure and is real, non-trivial work: overlapping tiles, seam blending, and a parity test
+proving tiled output matches whole-image output.
+
+**Keep `release_denoise_graph` regardless.** It does not lower this peak, but it lowers the floor
+decode starts from, which is what makes tiling viable rather than merely helpful — a tiled decode
+starting at 2.2 GB has room to work in; one starting at 3.6 GB does not.
+
 **What would actually move the number**, in order of expected effect:
 
 1. **A smaller text encoder.** At 2.3 GB the Gemma-2 CHI encoder is the single largest component

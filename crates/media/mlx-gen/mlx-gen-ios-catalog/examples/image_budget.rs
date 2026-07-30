@@ -150,6 +150,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut steps = 4u32; // SANA is few-step; 4 exercises the loop without dominating the runtime.
     let mut size = 1024u32;
     let mut resident_only = false;
+    let mut sequential_only = false;
     let mut no_cache = false;
     while let Some(flag) = args.next() {
         match flag.as_str() {
@@ -159,6 +160,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             "--steps" => steps = args.next().ok_or("--steps needs a value")?.parse()?,
             "--size" => size = args.next().ok_or("--size needs a value")?.parse()?,
             "--resident-only" => resident_only = true,
+            // Skip the resident pass. The two runs share a process, and MLX's peak is a
+            // high-water mark, so a resident peak measured first masks any sequential improvement.
+            "--sequential-only" => sequential_only = true,
             // Disable MLX's buffer cache entirely (freed blocks return to the system at once).
             // Diagnostic: a large drop here means the peak is retained-but-free memory, not live
             // allocation — a very different problem from "the model is too big".
@@ -183,13 +187,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         println!("  cache limit 0 (buffer cache disabled)");
     }
 
-    let (resident_peak, resident_secs) = measure(
-        dir,
-        OffloadPolicy::Resident,
-        size,
-        steps,
-        "RESIDENT (all components co-resident)",
-    )?;
+    let (resident_peak, resident_secs) = if sequential_only {
+        (0usize, 0.0f64)
+    } else {
+        measure(
+            dir,
+            OffloadPolicy::Resident,
+            size,
+            steps,
+            "RESIDENT (all components co-resident)",
+        )?
+    };
 
     let sequential = if resident_only {
         None
