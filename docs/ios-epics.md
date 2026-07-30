@@ -140,6 +140,30 @@ references, so agreement is evidence, not tautology; bf16 is the one that matter
 sc-2772's precedent of 16-bit kernels compiling at the wrong deployment target and emitting
 garbage.
 
+**A 4B LLM now generates on the device, through the `runtime-ios` bundle.** Same
+`scripts/ios/run_smoke.sh`, with the model pushed into the app container:
+
+```
+[ok] runtime-ios generation -- id=mlx-llama tools=true | load 0.1s, first answer 1 tok in 1.7s
+     | steady 64 tok in 3.1s (20.4 tok/s) | RSS after load 215 MiB, peak 2903 MiB | "Paris"
+```
+
+Read carefully, because two of those numbers are easy to misread:
+
+- **20.4 tok/s steady** on Qwen3-4B Q4. The *first* request reports ~0.6 tok/s, which is not
+  throughput: it stops at EOS after one word, and MLX faults weights in lazily so the real load
+  cost lands on the first forward pass rather than on `load` (which is why "load 0.1s" looks
+  impossibly fast). Correctness and throughput are therefore measured by two separate requests.
+- **Peak RSS 2903 MiB against a 2.63 GB model.** Only ~275 MiB over the weights, so there is no
+  large transient spike — but this is a *single short* generation. Sustained decode with a growing
+  KV cache is E4's question, not answered here.
+- `tools=true` confirms the `chat_template.jinja` fix survives the trip to the device.
+- The check runs through `runtime_ios::llm::load_for_model`, so it exercises E2's bundle —
+  registry, provider selection, capability descriptor — not just the engine.
+
+Correctness is greedy with a fixed seed and asserts the answer contains "Paris", so a wrong result
+means wrong kernels rather than unlucky sampling.
+
 **What remains is plumbing, not risk:** getting weights into the app container (S3.4), hosting
 `mlx-llm-server` instead of the smoke test (S3.1), running the real conformance suite (S3.5), and
 the runner (S3.6/S3.7).
@@ -149,7 +173,7 @@ the runner (S3.6/S3.7).
 | S3.1 iOS app target (`ios-host/`) | **Scaffolded** — `ios-host/` builds, signs, installs and launches on device via `scripts/ios/run_smoke.sh` (XcodeGen spec, SwiftUI shell, workspace-excluded Rust staticlib). Still to do: host `mlx-llm-server` rather than the smoke test. |
 | S3.2 Bind to loopback + USB forwarding | The server has **no auth**. It must not reach a LAN interface. Bearer token if remote access is ever needed. |
 | S3.3 Metallib resolution on device | **DONE — verified on an iPhone 17 Pro Max (iOS 26.5.2).** The 124 MB bundled metallib resolves inside the sandbox via `load_colocated_library`. Run it with `scripts/ios/run_smoke.sh`. |
-| S3.4 Model provisioning into the app container | How weights reach `WeightsSource::Dir` on a phone — Files app, iTunes file sharing, or a dev-time copy. Still unspecified. **A snapshot is now staged locally** at `~/models/ios-eval/Qwen3-4B-Instruct-2507-bf16` (verified generating on macOS). See the format constraint below before choosing one. |
+| S3.4 Model provisioning into the app container | **DONE.** `xcrun devicectl device copy to --domain-type appDataContainer --domain-identifier <bundle-id> --source <snapshot> --destination Documents/` pushes the 2.63 GB Q4 snapshot in ~80 s. Needs `UIFileSharingEnabled`. **Note it FLATTENS**: files land in `Documents/`, not `Documents/<dir>/`, so the loader accepts both layouts. |
 
 **Snapshot format constraint — found the hard way, worth knowing before picking a model.**
 `mlx-llm` cannot load the common `*-MLX-4bit` community snapshots. Those quantize the **embedding
@@ -192,7 +216,7 @@ Two halves, both fixed:
 
 Verified: source and prepared snapshot now both report `tools=true`, with three regression tests
 in `core-llm` (sidecar read, inline precedence, error when neither exists).
-| S3.5 XCTest target running `textllm_conformance` | All eight always-on checks, on device. |
+| S3.5 XCTest target running `textllm_conformance` | All eight always-on checks, on device. **Generation itself is already proven** (below); this is about running the full conformance suite rather than a bespoke check. |
 | S3.6 Self-hosted runner + tethered device | Register the dev machine (macOS 26.5.2 / Xcode 26.6 qualifies); dedicate one iPhone 17 Pro. Tier 2 (simulator) nightly, Tier 3 (device) pre-release. |
 | S3.7 Runner heartbeat | A sleeping runner must fail loudly, not report green-by-absence. |
 

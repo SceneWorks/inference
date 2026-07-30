@@ -15,3 +15,9 @@ crate-type = ["staticlib", "rlib"]
 
 [dependencies]
 mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/zakkeown/mlx-rs", rev = "c0e5c4a4350ec4989e5dc130158dee7757eae785" }
+# Deliberately the BUNDLE, not mlx-llm directly: the point of an on-device test is to exercise the
+# composition a product actually consumes (registry, capability descriptor, provider selection),
+# not just the engine underneath it.
+runtime-ios = { path = "../../crates/bundles/runtime-ios" }
+# getrusage for the peak-RSS number the memory story (E4) needs.
+libc = "0.2"
