@@ -28,6 +28,80 @@
 //! The **types** stay bare (`MemoryStrategy`, `MemoryProviderContract`, ...): the existing bare
 //! `Memory*` names in the workspace (`MemoryEncoder`, `MemoryAttention`, ...) are SAM2/model-bank
 //! concepts in other crates and never appear alongside these.
+//!
+//! # The cost order is ordinal, and it stays backend-neutral (SC-16090)
+//!
+//! SC-15791 measured rung 4 at ~8.0 s per denoise step on Candle against ~0.309 s on MLX — ~26× for
+//! the same rung on the same file — and asked whether the ladder's cost order must therefore become
+//! per-backend, or be replaced by a selector that consumes measured per-backend cost. **Neither. The
+//! order is unchanged, static, and shared.** Three independent reasons, each sufficient:
+//!
+//! 1. **The ladder never trades cost against cost.** The shared selector walks
+//!    [`MemoryStrategy::ALL`] and takes the *first* rung whose measured peak fits the live budget —
+//!    the cheapest sufficient rung, the same shape [`crate::mempolicy`] uses for its lever ladder.
+//!    Rung 4 is therefore reached only when no cheaper rung is *selectable*, so it never wins over a
+//!    cheaper rung that fits: a cost multiplier on it cannot flip that comparison in either
+//!    direction. Its alternative is no render — usually a rejection, or an `Unverified` verdict where
+//!    a cheaper rung's peak would have fit but its evidence was stale, out-of-envelope or
+//!    fingerprint-mismatched (that path exists and is separately tested; it does not restore a
+//!    cheaper *render*, only a cheaper non-answer). Nothing in the ladder consults a cost, which is
+//!    why [`MemoryStrategyCapability`] carries no cost field.
+//! 2. **A cost *order* is ordinal; 26× is a magnitude, and no consumer of the order reads one.** The
+//!    order's whole job is "try the cheaper mechanism first", and it discharges that on any backend
+//!    where rung 4 remains the most expensive rung. Per-backend *magnitudes* are already carried
+//!    where they belong: per cell, as calibration evidence, keyed by backend. (SC-15791 timed no
+//!    Candle rung other than 4, so that rung 4 is still last on Candle is the epic's premise and
+//!    remains unmeasured; it is not evidence this decision claims.)
+//! 3. **The 26× is not a backend cost.** It decomposes entirely into per-window work that is not
+//!    per-window work — see [`MemoryWindowMaterialization`]. Forking the shared order would encode a
+//!    fixable implementation defect into the contract 20 family stories then have to honour.
+//!
+//! ## Where the magnitude DOES reach a decision — and it is not here (SC-16104)
+//!
+//! Reason 1 is a statement about the *ladder*, and it must not be over-read into "the cost never
+//! matters anywhere". One layer up, a caller choosing a numeric **tier** can consume this ladder's
+//! verdict as a boolean: SceneWorks' capability-downtier collapses "fits, resident" and "fits, but
+//! only by engaging rung 4" into the same `Fits`, then keeps the highest-fidelity tier that fits. So
+//! a tier whose *only* fit is rung 4 is preferred over a lower tier that fits resident, and there the
+//! cost genuinely decides — a q8 rung-4 render measured at ~1466 ms/block (~44 s/step) can be chosen
+//! over a q4 resident one.
+//!
+//! That is a lossy boolean at the tier/strategy seam, not a defect in this order, and forking the
+//! order would not fix it. SC-16104 owns it. It is also why SC-15791's recommendation "do not enable
+//! rung 4 on q8 until the repack is hoisted" is not discharged by this decision.
+//!
+//! # A rung declares no non-VRAM resource cost (SC-16090)
+//!
+//! SC-15791 also asked how a rung declares a **host RAM** cost, because its recommended Candle fix
+//! (cache the repacked bytes host-side) holds ~3.16 GiB of host memory for the whole request — a
+//! derived figure for a *proposed* fix, not a measurement; nothing in the spike watched host RSS —
+//! while MLX's mmap realization pays nothing host-side. A rung whose resource cost changes *kind* per
+//! backend cannot be expressed as one cost order.
+//!
+//! **No such axis is added, because the cost belongs to that one candidate fix rather than to the
+//! rung.** A realization that materializes windows from device-format bytes on disk holds its host copy
+//! as the mapped file — reclaimable page cache, the same kind of resource MLX's mmap is — and makes no
+//! anonymous per-request allocation at all. Adding a resource-kind axis for an implementation nobody
+//! has to write would be the same mistake as (3) above, one layer down.
+//!
+//! ## What that leaves undeclared, stated rather than glossed
+//!
+//! A [`MemoryWindowMaterialization::HostFormatConversion`] realization — which ships today — does have
+//! a host cost, and this decision does **not** surface its size. Its per-window conversion allocates
+//! anonymous host memory per projection and frees it again: on the order of the block's unpacked codes
+//! for q4, and for q8 a **full dense f32 grid** (`repack::dequant_mlx_q8_gs`), which for a
+//! 3840 × 15360 projection is a few hundred MiB. Those are transients, not held for the request, and
+//! they are **not measured** — SC-15791 states plainly that q8 host memory is unverified. So on a
+//! low-RAM host a rung-4 Candle selection today carries an unquantified host transient that no gate
+//! sees. That is a consequence of the non-conforming realization, and SC-16096 both removes the
+//! conversion and owes the host measurement; it is recorded here so it is not mistaken for zero.
+//!
+//! **Revisit trigger — deliberately broad enough to catch that case.** The axis is owed if a
+//! realization is measured to need host memory proportional to the model that a fit gate would have to
+//! account for: whether it is held for the request or transient, reclaimable or not, and whether or not
+//! a device-format alternative exists. SC-16096 must raise it rather than absorb it. What is *not* owed
+//! is an axis built ahead of that measurement, on the strength of a figure derived for a fix nobody has
+//! written.
 
 use crate::{Error, GenerationRequest, Precision, Quant, Result};
 
@@ -140,12 +214,18 @@ impl MemoryStrategy {
     /// today (see the section above: the edge is arithmetic, and no provider may opt out of it), and
     /// nothing in the current graph wants a per-backend edge.
     ///
-    /// Should SC-15791 / SC-15792 surface a genuinely Candle-specific edge — one whose *arithmetic*
-    /// differs by backend rather than one a provider merely wishes away — the additive fix is a
+    /// Should a genuinely Candle-specific edge surface — one whose *arithmetic* differs by backend
+    /// rather than one a provider merely wishes away — the additive fix is a
     /// `MemoryProviderContract::requires(strategy)` that defaults to this enum graph and is
     /// overridden only where a backend realization changes the arithmetic. That keeps the
     /// no-silent-opt-out property (the default is still contract-owned) while giving the edge set a
     /// place to vary. It is deliberately not built ahead of that evidence.
+    ///
+    /// **SC-15791 has since reported, and it is not owed.** The Candle spike confirmed rung 4's single
+    /// edge holds there for the same arithmetic reason, needing no backend differentiation. What the
+    /// spike did surface was on the *cost* axis, and it is answered without differentiating anything:
+    /// see the module docs on why the cost order stays shared, and
+    /// [`MemoryWindowMaterialization`] for the per-realization obligation that keeps it true (SC-16090).
     pub const fn requires(self) -> &'static [MemoryStrategyPrerequisite] {
         match self {
             Self::Resident
@@ -160,7 +240,9 @@ impl MemoryStrategy {
     ///
     /// This is the one legitimate reading of the enum's numeric order — it is a least-cost ladder,
     /// so *if you needed the most expensive rung, you would have taken the cheaper ones on the way
-    /// up*. It is emphatically **not** a dependency: prerequisites live in
+    /// up*. The order is **ordinal and shared across backends**, and stays so even where one backend's
+    /// rung costs an order of magnitude more than another's: see the module docs (SC-16090). It is
+    /// emphatically **not** a dependency: prerequisites live in
     /// [`MemoryStrategy::requires`] and violating one is an error, whereas this default is
     /// **defeasible**. The epic words it as *"strategies are cumulative unless a provider documents
     /// and verifies a cheaper equivalent composition"*, and
@@ -405,6 +487,85 @@ pub enum MemoryFormulaKind {
     },
 }
 
+/// What one rung-4 window materialization physically does on a realization (SC-16090).
+///
+/// This is the invariant that makes the ladder's shared cost order *true* rather than assumed. Rung 4
+/// re-materializes the whole transformer once per **forward**, so a window's cost is multiplied by
+/// `n_blocks × forwards`: 240 times for a 30-block stack over an 8-step schedule, and 480 where true
+/// CFG runs a second forward per step. Whatever a window does is paid every one of those times, so only
+/// work that is *irreducibly* per-window belongs there.
+///
+/// # Why this is declared rather than assumed
+///
+/// SC-15791 measured Candle's rung 4 at ~8.0 s/step against MLX's ~0.309 s on the identical file, and
+/// ~100% of the ~26× is a host-side format conversion sitting in the per-window path. Per 97.1 MiB
+/// block, medians on a host whose run-to-run spread reaches ±38%:
+///
+/// - **~204 ms** for the leg the spike labels *host read + repack* — a mapped read plus the MLX affine
+///   triple → GGML `Q4_1` conversion. The read is inside that number and is not separated out; on a
+///   cold page cache it is the part that dominates, since Candle re-reads the tier every step.
+/// - **62.5 ms** attributable to a device→host round trip: the packed triple is loaded onto the CUDA
+///   device and `repack::q4_parts` pulls all three straight back with `to_device(&Cpu)`. This figure is
+///   a **residual** (266.8 production − 204.3 corrected), not an independently timed leg.
+/// - The PCIe transfer itself: **unresolvable against a ±34.9 ms noise floor.** The only irreducibly
+///   per-window part is a rounding error.
+///
+/// The conversion is a pure deterministic function of bytes that never change, recomputed once per
+/// block per forward for one answer.
+///
+/// So the difference between the two backends is not device residency, PCIe, or unified memory. It is
+/// that MLX's window materialization reads bytes the accelerator can consume as they sit on disk,
+/// and Candle's does not — yet. Nothing about Candle prevents it: the conversion is
+/// content-addressed by the source tensor and can be done once, ahead of the render, into a
+/// device-format artifact a window then maps and copies.
+///
+/// # The obligation
+///
+/// A rung-4 realization SHOULD be [`Self::DeviceFormatTransfer`]. [`Self::HostFormatConversion`] is
+/// admitted only as a **transitional** state that names the story removing it, because a rung whose
+/// per-window path recomputes model-proportional work is not the rung the ladder costs.
+///
+/// # Where this lives, and why not on `MemoryStrategy`
+///
+/// SC-16090's brief was to layer additively on [`MemoryProviderContract`] "rather than patching the
+/// bare enum". The prohibition is on [`MemoryStrategy`]: that enum is contract-owned precisely so no
+/// provider can opt out of arithmetic, and a rung-4 field there would change the rung for MLX too. This
+/// fact is the opposite kind — a property of one provider's loader — so it is declared on the
+/// realization and read through [`MemoryProviderContract::window_materialization`], mirroring how
+/// [`MemoryProviderContract::engages`] layers over [`MemoryStrategy::engages`].
+///
+/// It is a **required** field rather than an `Option` or a defaulted one, which does mean every existing
+/// construction site had to change. That is the intended cost: a default is an opt-out that reads as a
+/// declaration, and the whole point is that a Candle provider adopting rung 4 cannot stay silent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MemoryWindowMaterialization {
+    /// A window is a transfer of bytes **already in the form the accelerator consumes** — a mapped
+    /// read plus, where the memory is not unified, a host-to-device copy. No format conversion, no
+    /// device→host round trip, no re-derivation of anything. Cost is bounded by the transfer, so the
+    /// rung costs what the ladder says it costs.
+    ///
+    /// MLX/Metal realizations satisfy this structurally: the mmap *is* the residency.
+    DeviceFormatTransfer,
+    /// A window performs a **host-side format conversion** whose cost is proportional to the block's
+    /// weights, on every window of every step. Non-conforming, and admitted only transitionally.
+    ///
+    /// `converts` names the conversion in the terms the code uses, so a reviewer can find it.
+    /// `owner_story` names the story that removes it — required, and the reason this variant is not a
+    /// silent opt-out: an existing provider may keep shipping while a *new* one cannot quietly
+    /// reproduce the defect without pointing at its fix.
+    HostFormatConversion {
+        converts: String,
+        owner_story: String,
+    },
+}
+
+impl MemoryWindowMaterialization {
+    /// Whether this realization meets rung 4's per-window cost obligation.
+    pub const fn is_conforming(&self) -> bool {
+        matches!(self, Self::DeviceFormatTransfer)
+    }
+}
+
 /// Backend-specific realization without imposing CUDA transfer language on unified memory.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MemoryBackendRealization {
@@ -412,6 +573,17 @@ pub enum MemoryBackendRealization {
         device_residency: bool,
         host_backed_weights: bool,
         host_to_device_block_materialization: bool,
+        /// What one rung-4 window materialization does here (SC-16090). Stated per provider rather
+        /// than per backend: it is a property of the loader a provider's streamed path calls, and two
+        /// Candle providers can differ.
+        ///
+        /// Deliberately has **no default**. A defaulted or `Option` field would let a provider adopt
+        /// rung 4 without answering, which is the silent state this exists to remove — so a new Candle
+        /// provider cannot compile until it states one. What the contract cannot do is *verify* the
+        /// answer: a provider that types `DeviceFormatTransfer` over a converting loader has made a
+        /// false declaration, and nothing here catches that. The compile-forced choice buys a
+        /// deliberate statement a reviewer can check against the loader, not a proof.
+        block_materialization: MemoryWindowMaterialization,
     },
     MlxMetal {
         bounded_wired_residency: bool,
@@ -426,6 +598,36 @@ impl MemoryBackendRealization {
         match self {
             Self::CandleCuda { .. } => "candle",
             Self::MlxMetal { .. } => "mlx",
+        }
+    }
+
+    /// This realization's rung-4 window materialization (SC-16090) — the backend-neutral question,
+    /// with a per-realization answer. This is the shape the contract layers everything backend-varying
+    /// in: one shared question asked of every backend, not a forked ladder.
+    ///
+    /// `None` means **unstated**, which is a third condition and deliberately not folded into
+    /// [`MemoryWindowMaterialization::HostFormatConversion`]: an MLX realization that declares neither
+    /// lazy nor mmap materialization has not told us what its windows do, and encoding that as a
+    /// *declared host conversion* would both assert something unmeasured and demand an `owner_story`
+    /// field `MlxMetal` does not have — leaving the provider with an error whose only named fix is
+    /// impossible. Its actual fix is to declare `lazy_or_mmap_materialization`.
+    ///
+    /// An MLX/Metal realization that does declare it answers
+    /// [`MemoryWindowMaterialization::DeviceFormatTransfer`], because there the mapped file *is* the
+    /// residency and there is no conversion seam to violate the obligation.
+    pub fn window_materialization(&self) -> Option<&MemoryWindowMaterialization> {
+        const MAPPED: &MemoryWindowMaterialization =
+            &MemoryWindowMaterialization::DeviceFormatTransfer;
+        match self {
+            Self::CandleCuda {
+                block_materialization,
+                ..
+            } => Some(block_materialization),
+            Self::MlxMetal {
+                lazy_or_mmap_materialization: true,
+                ..
+            } => Some(MAPPED),
+            Self::MlxMetal { .. } => None,
         }
     }
 }
@@ -563,6 +765,21 @@ impl MemoryProviderContract {
             && matches!(self.support(rung), Some(MemoryStrategySupport::Implemented))
     }
 
+    /// What one rung-4 window materialization does for this provider (SC-16090), or `None` if the
+    /// realization has not stated it.
+    ///
+    /// Layered on [`MemoryBackendRealization::window_materialization`] the way
+    /// [`MemoryProviderContract::engages`] is layered on [`MemoryStrategy::engages`]: the contract is
+    /// where a caller asks, so a later per-provider override has a seam to land in without every caller
+    /// changing. It currently forwards unchanged — the fact is already per provider, since the
+    /// realization is declared per provider rather than per backend.
+    ///
+    /// **Not `Option<bool>`**: a caller that only wants "is this conforming" still has to distinguish
+    /// *declared non-conforming* from *never declared*, because the two have different fixes.
+    pub fn window_materialization(&self) -> Option<&MemoryWindowMaterialization> {
+        self.backend.window_materialization()
+    }
+
     /// Static conformance errors. An empty result means the provider declaration is internally
     /// coherent; it does not mean measurements are verified.
     pub fn conformance_errors(&self) -> Vec<String> {
@@ -620,12 +837,57 @@ impl MemoryProviderContract {
         if implemented(MemoryStrategy::BoundedAttention) && !self.lifecycle.attention_chunking {
             errors.push("BoundedAttention requires the attention_chunking hook".to_owned());
         }
-        if implemented(MemoryStrategy::BoundedTransformerResidency)
-            && !self.lifecycle.transformer_window_materialization
-        {
-            errors.push(
-                "BoundedTransformerResidency requires the transformer-window hook".to_owned(),
-            );
+        if implemented(MemoryStrategy::BoundedTransformerResidency) {
+            if !self.lifecycle.transformer_window_materialization {
+                errors.push(
+                    "BoundedTransformerResidency requires the transformer-window hook".to_owned(),
+                );
+            }
+            // SC-16090. What is refused here is an UNDECLARED window realization, never a slow one.
+            //
+            // A provider that honestly declares `HostFormatConversion` and names its owner story has no
+            // error and keeps every rung, including rung 4 — deliberately, because the selector reaches
+            // rung 4 only when nothing cheaper fits, so refusing it would trade a slow render for no
+            // render. Cost is not what this rule reads.
+            //
+            // Be clear about the blast radius, because it is wider than rung 4: like every other rule
+            // in this function, an error here is CONTRACT-level, and a caller that bails on a non-empty
+            // `conformance_errors` (the shared selector does) loses rungs 0-4, not just rung 4. That is
+            // the right severity for the case that produces it — a declaration this contract cannot
+            // interpret — and the wrong severity for a cost verdict, which is a second reason this rule
+            // does not attempt one.
+            match self.backend.window_materialization() {
+                Some(MemoryWindowMaterialization::HostFormatConversion {
+                    converts,
+                    owner_story,
+                }) => {
+                    // `owner_story` is the promise; `converts` is the pointer a reviewer follows to the
+                    // code. Both are load-bearing, so both are required to be present. Neither can be
+                    // checked for TRUTH here — a wrong pointer or a closed story still passes.
+                    if owner_story.trim().is_empty() {
+                        errors.push(format!(
+                            "BoundedTransformerResidency on a HostFormatConversion realization \
+                             ({converts}) must name the owner_story that removes it (SC-16090)"
+                        ));
+                    }
+                    if converts.trim().is_empty() {
+                        errors.push(
+                            "BoundedTransformerResidency on a HostFormatConversion realization must \
+                             say what it converts, so a reviewer can find it (SC-16090)"
+                                .to_owned(),
+                        );
+                    }
+                }
+                Some(MemoryWindowMaterialization::DeviceFormatTransfer) => {}
+                // Unstated. The actionable fix is naming the mechanism, not naming a story — see
+                // `MemoryBackendRealization::window_materialization`.
+                None => errors.push(
+                    "BoundedTransformerResidency requires the realization to state what a window \
+                     materialization does; an MLX realization does so by declaring \
+                     lazy_or_mmap_materialization (SC-16090)"
+                        .to_owned(),
+                ),
+            }
         }
 
         for capability in &self.strategies {
@@ -1486,6 +1748,143 @@ mod tests {
             .conformance_errors()
             .iter()
             .any(|error| error.contains("attention_chunking")));
+    }
+
+    /// **SC-16090.** A rung-4 realization that converts formats per window may ship, but not silently:
+    /// it must name the story that removes it, and say what it converts. The arms are asserted against
+    /// each other so the test cannot pass with the rule deleted (an unconditional error would fail the
+    /// declared arm, an absent one the undeclared arms), and the unrelated-rung arm pins that the rule
+    /// is scoped to rung 4.
+    #[test]
+    fn a_nonconforming_window_materialization_must_name_its_owner_story() {
+        let converting = |converts: &str, owner_story: &str| MemoryBackendRealization::CandleCuda {
+            device_residency: true,
+            host_backed_weights: true,
+            host_to_device_block_materialization: true,
+            block_materialization: MemoryWindowMaterialization::HostFormatConversion {
+                converts: converts.to_owned(),
+                owner_story: owner_story.to_owned(),
+            },
+        };
+        const CONVERTS: &str = "MLX affine triple -> GGML Q4_1 per projection per window";
+        let errors_matching = |contract: &MemoryProviderContract, needle: &str| {
+            contract
+                .conformance_errors()
+                .iter()
+                .any(|error| error.contains(needle))
+        };
+
+        let mut unnamed = adopted_contract();
+        unnamed.backend = converting(CONVERTS, "");
+        assert!(
+            errors_matching(&unnamed, "owner_story"),
+            "a per-window format conversion with no owner story must be a conformance error"
+        );
+        // Whitespace is not a name — otherwise the escape hatch is one space wide.
+        let mut blank = adopted_contract();
+        blank.backend = converting(CONVERTS, "   ");
+        assert!(
+            errors_matching(&blank, "owner_story"),
+            "a blank owner_story must not satisfy it"
+        );
+
+        // `converts` is the pointer a reviewer follows to the code, so it is required too. Asserted
+        // separately from `owner_story` so satisfying one cannot mask the other.
+        let mut unexplained = adopted_contract();
+        unexplained.backend = converting("", "sc-16096");
+        assert!(
+            errors_matching(&unexplained, "say what it converts"),
+            "an unexplained conversion must be an error even with an owner story named"
+        );
+
+        let mut named = adopted_contract();
+        named.backend = converting(CONVERTS, "sc-16096");
+        assert!(
+            named.conformance_errors().is_empty(),
+            "a fully declared conversion is the escape hatch, and must leave the contract clean — \
+             a contract-level error would cost the shared selector rungs 0-4, not just rung 4: {:?}",
+            named.conformance_errors()
+        );
+
+        // Scoped to rung 4: the same realization with rung 4 unimplemented is silent, because nothing
+        // is materializing windows.
+        let mut without_rung_four = adopted_contract();
+        without_rung_four.backend = converting("", "");
+        without_rung_four.strategies[4].support = MemoryStrategySupport::Missing;
+        without_rung_four.strategies[4].parameters = MemoryParameterRanges::default();
+        assert!(
+            without_rung_four.conformance_errors().is_empty(),
+            "the rule must not fire for a provider that does not implement rung 4: {:?}",
+            without_rung_four.conformance_errors()
+        );
+    }
+
+    /// **SC-16090.** The obligation is asked backend-neutrally and answered per realization: one shared
+    /// question, not a forked ladder. MLX's mapped materialization satisfies it structurally; an MLX
+    /// realization that declares neither lazy nor mmap materialization is **unstated** — refused, but
+    /// with the fix it can actually perform, since `MlxMetal` has no `owner_story` to name.
+    #[test]
+    fn window_materialization_is_asked_of_every_backend_and_not_granted_by_backend_identity() {
+        assert!(mlx_backend()
+            .window_materialization()
+            .is_some_and(MemoryWindowMaterialization::is_conforming));
+
+        let unstated = MemoryBackendRealization::MlxMetal {
+            bounded_wired_residency: true,
+            lazy_or_mmap_materialization: false,
+            explicit_evaluation_and_synchronization: true,
+            cache_eviction: true,
+        };
+        assert_eq!(
+            unstated.window_materialization(),
+            None,
+            "being MLX is not itself evidence that a window is a mapped read — but nor is it a \
+             declared host conversion, which would assert something unmeasured"
+        );
+
+        // Unstated is refused, and the message must name the fix that exists (declare the mechanism),
+        // not the one MlxMetal cannot perform (name an owner_story it has no field for).
+        let mut under_declared = adopted_contract();
+        under_declared.backend = unstated.clone();
+        let errors = under_declared.conformance_errors();
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("lazy_or_mmap_materialization")),
+            "the refusal must name the achievable fix: {errors:?}"
+        );
+        assert!(
+            !errors.iter().any(|error| error.contains("owner_story")),
+            "must not demand an owner_story from a realization with no such field: {errors:?}"
+        );
+
+        let candle_conforming = MemoryBackendRealization::CandleCuda {
+            device_residency: true,
+            host_backed_weights: true,
+            host_to_device_block_materialization: true,
+            block_materialization: MemoryWindowMaterialization::DeviceFormatTransfer,
+        };
+        assert!(
+            candle_conforming
+                .window_materialization()
+                .is_some_and(MemoryWindowMaterialization::is_conforming),
+            "a host-to-device copy of device-format bytes conforms — the rung is not MLX-only"
+        );
+        assert_eq!(candle_conforming.backend_id(), "candle");
+
+        // The contract-level accessor is the seam a caller uses (mirroring how `engages` is layered),
+        // so it must agree with the realization rather than being a second source of truth.
+        let mut contract = adopted_contract();
+        contract.backend = candle_conforming.clone();
+        assert_eq!(
+            contract.window_materialization(),
+            candle_conforming.window_materialization()
+        );
+        assert!(
+            contract.conformance_errors().is_empty(),
+            "a conforming candle realization needs no escape hatch: {:?}",
+            contract.conformance_errors()
+        );
     }
 
     #[test]
