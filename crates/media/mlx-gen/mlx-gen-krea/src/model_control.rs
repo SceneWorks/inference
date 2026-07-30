@@ -314,12 +314,22 @@ impl KreaTurboControl {
             req.use_pid,
             on_progress,
             |text: &KreaText| {
-                maybe_apply_style_gain(text.encode(&req.prompt)?, req.text_style_gain)
+                let context =
+                    maybe_apply_style_gain(text.encode(&req.prompt)?, req.text_style_gain)?;
+                // `Residency::run` materializes only under Sequential. For calibration fault
+                // injection, evaluate at the conditioning boundary here as well so Resident and
+                // Sequential exercise the same physical phase without changing ordinary renders.
+                if req.memory.is_some_and(|memory| {
+                    memory.calibration_error_phase == Some(gen_core::MemoryPhase::Conditioning)
+                }) {
+                    mlx_rs::transforms::eval([&context])?;
+                    self.calibration_fault(req, gen_core::MemoryPhase::Conditioning)?;
+                }
+                Ok(context)
             },
             // Materialize the context while the text phase is still alive (Sequential only).
             |ctx: &Array| {
                 mlx_rs::transforms::eval([ctx])?;
-                self.calibration_fault(req, gen_core::MemoryPhase::Conditioning)?;
                 Ok(())
             },
             // Phase B: heavy render components (DiT + VAE + the pose branch). The render loop below runs
