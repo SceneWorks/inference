@@ -27,7 +27,7 @@ Two constraints set the grain:
 | **E1** | iOS toolchain | Toolchain / upstream — **retired** | ~~Green `aarch64-apple-ios` CI build, no local env vars~~ **met** | ~~2~~ **done** |
 | **E2** | `runtime-ios` composition | Composition — **retired** | ~~`RuntimeCatalog` validates; surface test green~~ **met** | ~~2~~ **done** |
 | **E3** | On-device proof | Device runtime — **retired** | ~~`textllm_conformance` green on a physical iPhone~~ **met** | ~~3–4~~ **done** |
-| **E4** | Memory & performance | **Memory, thermals, threading** | G5 numbers published and enforced as thresholds | ~3 |
+| **E4** | Memory & performance | Memory, thermals, threading — **mostly retired** | G5 numbers published + enforced — **all but energy** | ~3 → **1 story left** |
 | **E5** | On-device image generation | **Model portability** | G6 + G7 | ~9 |
 
 ```
@@ -294,8 +294,26 @@ the lane fails **before** a broader-device release would, rather than after
 | S4.6 Regression thresholds | **DONE** — `run_smoke.sh` asserts throughput ≥ 12 tok/s, peak RSS ≤ 4096 MiB, and RSS growth ≤ 256 MiB, overridable by env var. Deliberately loose: these catch a lost fast path, a leak, or thermal collapse — not a warm phone. A check that fails on a slow afternoon teaches people to ignore it. Verified by a negative test (`THRESHOLD_MIN_TPS=999` → exit 1, naming the metric). |
 | S4.7 Integrate the increased-memory-limit entitlement | Once Apple grants it. Requested separately; lead time is not ours. |
 
-**Exit:** G5 numbers published — TTFT, steady tok/s, peak RSS, energy per 100 tokens — and
-enforced as regression thresholds.
+**Exit: substantially met.** Published and enforced: steady tok/s, peak RSS, sustained-decode
+memory growth, and the unload seam — all asserted by `run_smoke.sh`, all verified to fail when
+violated. **Not met: energy per 100 tokens** (S4.4), which needs an Instruments Energy Log capture
+and a 5-minute soak. That is the one G5 number still missing, and it is also the evidence that
+would reopen the ANE question ([strategy §7.2](architecture/ios-strategy.md)) — so it should not
+be quietly dropped.
+
+**Baselines** (iPhone 17 Pro Max / iOS 26.5.2, Qwen3-4B Q4, 2.64 GiB snapshot):
+
+| Metric | Measured | Threshold |
+|---|---|---|
+| Steady throughput | ~20.6 tok/s (short), ~18.3 tok/s (last of 4 segments) | ≥ 12 tok/s |
+| Peak RSS | 2892–2903 MiB | ≤ 4096 MiB |
+| RSS growth over 512 tok | 0 MiB | ≤ 256 MiB |
+| Unload reclaim | 100% (2693 MiB) | ≥ 90% |
+| Load → first token | ~1.7 s | not asserted |
+| Energy per 100 tok | **not measured** | — |
+
+The RSS ceiling is deliberately the ~4 GB cap of an *8 GB* device rather than this one's ~6 GB, so
+the lane fails before a broader-device release would rather than after.
 
 ---
 
