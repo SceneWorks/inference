@@ -369,6 +369,46 @@ jobs:
             --dest "$staging" --expect-platform ios
           test -f "$staging/mlx.metallib"
 
+  ios-device:
+    name: runtime-ios on a tethered iPhone (manual)
+    needs: changes
+    # Manual dispatch only, mirroring `macos-nax`: this tier needs a physical device attached to
+    # one specific runner, so it must not gate ordinary PRs. `ios-build` is the per-PR guard.
+    if: github.event_name == 'workflow_dispatch' && needs.changes.outputs.ios_build == 'true'
+    runs-on: [self-hosted, macOS, ARM64, ios-device]
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Toolchain and device
+        run: |
+          sw_vers
+          xcodebuild -version
+          xcrun devicectl list devices
+      - name: Install pinned Rust toolchain and iOS target
+        run: |
+          rustup show
+          rustup target add aarch64-apple-ios
+      - name: Cache Cargo and MLX native build
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: ios-device
+      # Builds, signs, installs, launches, and asserts on the report the app writes into its own
+      # container. The script fails on a stale staticlib or a stale report, so a green run here
+      # means the CURRENT tree ran on the CURRENT device -- not a cached artifact.
+      #
+      # Requires on the runner: a paired iPhone with Developer Mode on, a signing identity, and a
+      # prepared snapshot already pushed into the app container (see docs/ios-epics.md S3.4 --
+      # weights are provisioned, never fetched). Without a snapshot the model checks SKIP and the
+      # Metal kernel checks still run, so the lane degrades rather than lying.
+      - name: On-device smoke + conformance
+        run: ./scripts/ios/run_smoke.sh
+      - name: Publish the device report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ios-device-report
+          path: /tmp/ios-smoke-report.txt
+          if-no-files-found: warn
+
   macos-nax:
     name: runtime-macos NAX (macOS 26.2, manual)
     needs: changes

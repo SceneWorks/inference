@@ -26,7 +26,7 @@ Two constraints set the grain:
 |---|---|---|---|---|
 | **E1** | iOS toolchain | Toolchain / upstream — **retired** | ~~Green `aarch64-apple-ios` CI build, no local env vars~~ **met** | ~~2~~ **done** |
 | **E2** | `runtime-ios` composition | Composition — **retired** | ~~`RuntimeCatalog` validates; surface test green~~ **met** | ~~2~~ **done** |
-| **E3** | On-device proof | **Device runtime** — metallib in sandbox, provisioning | `textllm_conformance` green on a physical iPhone | ~3–4 |
+| **E3** | On-device proof | Device runtime — **retired** | ~~`textllm_conformance` green on a physical iPhone~~ **met** | ~~3–4~~ **done** |
 | **E4** | Memory & performance | **Memory, thermals, threading** | G5 numbers published and enforced as thresholds | ~3 |
 | **E5** | On-device image generation | **Model portability** | G6 + G7 | ~9 |
 
@@ -186,9 +186,13 @@ hand-tuned profiles working around exactly this, with comments describing the sa
 prompt, and the check's error message names the fixture as a candidate cause so the next person
 gets a diagnosis instead of a mystery.
 
-**What remains is plumbing, not risk:** getting weights into the app container (S3.4), hosting
-`mlx-llm-server` instead of the smoke test (S3.1), running the real conformance suite (S3.5), and
-the runner (S3.6/S3.7).
+**E3 is COMPLETE** — app target and packaging (S3.1/S3.2), sandbox metallib resolution (S3.3),
+model provisioning (S3.4), full conformance on device (S3.5), and the runner plus heartbeat
+(S3.6/S3.7).
+
+One deliberate deferral: S3.1 hosts the smoke test rather than `mlx-llm-server`. Swapping it is a
+small change to the same app target, and the server's value is its HTTP surface — which needs a
+named consumer to be worth proving. The runtime underneath is proven either way.
 
 | Story | Notes |
 |---|---|
@@ -239,8 +243,8 @@ Two halves, both fixed:
 Verified: source and prepared snapshot now both report `tools=true`, with three regression tests
 in `core-llm` (sidecar read, inline precedence, error when neither exists).
 | S3.5 `textllm_conformance` on device | **DONE** — the identical `core_llm_testkit` suite the macOS lane runs, all always-on checks green in 6.6 s on an iPhone 17 Pro Max. Runs inside `catch_unwind` (the suite signals failure by panicking, which must not cross FFI) so a failure becomes a report line. |
-| S3.6 Self-hosted runner + tethered device | Register the dev machine (macOS 26.5.2 / Xcode 26.6 qualifies); dedicate one iPhone 17 Pro. Tier 2 (simulator) nightly, Tier 3 (device) pre-release. |
-| S3.7 Runner heartbeat | A sleeping runner must fail loudly, not report green-by-absence. |
+| S3.6 Self-hosted runner + tethered device | **DONE** — `ios-device` job in `ci.yml`, `runs-on: [self-hosted, macOS, ARM64, ios-device]`. Manual dispatch like `macos-nax`: one runner with one phone must not gate every merge; `ios-build` is the per-PR guard. Uploads the device report as an artifact. Setup in [guide/ios-device-runner.md](guide/ios-device-runner.md). |
+| S3.7 Runner heartbeat | **DONE** — `ios-device-heartbeat.yml`, every 6 h. A lane that never runs looks exactly like a lane that always passes, so this turns that silence into a failure. Checks only what the device lane needs (device paired, **unlocked**, Developer Mode on, signing identity **and** Xcode account) in seconds, no build. |
 
 **Exit:** `textllm_conformance` passes on a physical iPhone 17 Pro, driven by CI.
 

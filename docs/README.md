@@ -7,6 +7,9 @@ Documentation for the SceneWorks inference workspace.
 - **[Getting Started](guide/getting-started.md)** — depend on a runtime bundle, build its
   validated registries, and load/run media generators, LLMs, and snapshot preparers. The
   consumer *how-to*.
+- **[iOS device runner setup](guide/ios-device-runner.md)** — how to stand up the self-hosted
+  macOS runner with a tethered iPhone that the `ios-device` lane and its heartbeat need, and the
+  failure modes worth recognising.
 - **[Model Catalog Reference](reference/model-catalog.md)** — every shipped provider id, per
   platform, with the MLX/Candle deltas. Built from the committed exact-surface tests.
 - **[Mochi 1 tier strategy](reference/mochi-1-tier-strategy.md)** — the accepted quantization

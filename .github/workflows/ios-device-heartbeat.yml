@@ -1,0 +1,88 @@
+name: iOS device heartbeat
+
+# The iOS device tier runs on ONE self-hosted runner with ONE tethered iPhone. That is a single
+# point of failure whose worst mode is silent: if the runner sleeps, loses the device, or drops
+# off the network, `ios-device` simply never runs — and a lane that never runs looks exactly like
+# a lane that always passes. Nothing goes red, so nobody notices.
+#
+# This job exists to convert that silence into a failure. It is deliberately cheap (no build, no
+# model load — a few seconds) so it can run often, and it asserts only what the device tier
+# actually needs: the runner is reachable, a device is paired and unlocked, Developer Mode is on,
+# and the signing identity is present.
+#
+# It does NOT verify inference; that is `ios-device` in ci.yml. This answers "could that lane run
+# right now?", which is the question a green-by-absence lane cannot answer for itself.
+
+on:
+  schedule:
+    # Every 6 hours. Frequent enough that a dead runner is noticed the same day, rare enough not
+    # to churn the Actions log.
+    - cron: "23 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # Never queue heartbeats behind each other: a late one tells us nothing a fresh one would not.
+  group: ios-device-heartbeat
+  cancel-in-progress: true
+
+jobs:
+  heartbeat:
+    name: device reachable and ready
+    runs-on: [self-hosted, macOS, ARM64, ios-device]
+    timeout-minutes: 10
+    steps:
+      - name: Toolchain present
+        run: |
+          set -euo pipefail
+          sw_vers
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: A device is paired and available
+        run: |
+          set -euo pipefail
+          xcrun devicectl list devices
+          if ! xcrun devicectl list devices 2>/dev/null | grep -q 'available (paired)'; then
+            echo "::error::no paired, available device — the ios-device lane cannot run"
+            exit 1
+          fi
+
+      - name: Developer Mode is enabled and the device is unlocked
+        run: |
+          set -euo pipefail
+          device=$(xcrun devicectl list devices 2>/dev/null \
+            | awk '/available \(paired\)/ {print $(NF-3); exit}')
+          echo "device: $device"
+
+          details=$(xcrun devicectl device info details --device "$device" 2>/dev/null)
+          echo "$details" | grep -E 'osVersionNumber|developerModeStatus' || true
+          if ! echo "$details" | grep -q 'developerModeStatus: enabled'; then
+            echo "::error::Developer Mode is not enabled — installs will fail"
+            exit 1
+          fi
+
+          # A locked device builds and installs fine and then refuses to LAUNCH, so the failure
+          # would otherwise appear deep in the device lane rather than here.
+          lock=$(xcrun devicectl device info lockState --device "$device" 2>/dev/null || true)
+          echo "$lock" | grep -E 'passcodeRequired|unlockedSinceBoot' || true
+          if echo "$lock" | grep -q 'passcodeRequired: true'; then
+            echo "::error::device is locked — app launches will be denied by SpringBoard"
+            exit 1
+          fi
+
+      - name: A signing identity is available
+        run: |
+          set -euo pipefail
+          security find-identity -v -p codesigning | tail -3
+          if ! security find-identity -v -p codesigning | grep -q 'Apple Development'; then
+            echo "::error::no Apple Development identity — signing will fail"
+            exit 1
+          fi
+          if ! defaults read com.apple.dt.Xcode IDEProvisioningTeamByIdentifier >/dev/null 2>&1; then
+            echo "::error::no Xcode developer account — automatic signing needs one, and a bare"
+            echo "::error::keychain certificate is not enough (its team may not match an account)"
+            exit 1
+          fi
