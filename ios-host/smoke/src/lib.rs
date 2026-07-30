@@ -272,11 +272,13 @@ fn bound_mlx_to_the_jetsam_limit() -> String {
 struct MemorySampler {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     min_available_kib: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    peak_footprint_kib: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// The footprint term, owned by `mlx-gen` rather than recomputed here. That definition is what
+    /// the host budget harness ranks configurations by; a second copy would agree on every passing
+    /// run and diverge only on the marginal ones, which are the only ones anybody consults.
+    probe: Option<mlx_gen::memory_probe::FootprintProbe>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
-#[cfg(any(feature = "media", feature = "zimage"))]
 impl MemorySampler {
     /// Start sampling. `trace` names a breadcrumb file to log each sample to, or `None` to record
     /// only the extrema (the SANA lane runs several configurations and does not want a per-sample
@@ -289,22 +291,14 @@ impl MemorySampler {
         // u64 KiB rather than f64: `AtomicF64` does not exist, and KiB keeps the resolution that
         // matters (the difference between 4 MiB of headroom and 0 is the whole finding).
         let min_available_kib = Arc::new(AtomicU64::new(u64::MAX));
-        let peak_footprint_kib = Arc::new(AtomicU64::new(0));
+        let probe = mlx_gen::memory_probe::FootprintProbe::start_default();
         mlx_gen::vae_tiling::reset_tiles_decoded();
 
         let handle = {
-            let (stop, min_a, peak_f) = (
-                Arc::clone(&stop),
-                Arc::clone(&min_available_kib),
-                Arc::clone(&peak_footprint_kib),
-            );
+            let (stop, min_a) = (Arc::clone(&stop), Arc::clone(&min_available_kib));
             std::thread::spawn(move || {
                 let t0 = Instant::now();
                 while !stop.load(Ordering::Relaxed) {
-                    let kib = |b: usize| (b / 1024) as u64;
-                    let active = mlx_rs::memory::get_active_memory();
-                    let cache = mlx_rs::memory::get_cache_memory();
-                    peak_f.fetch_max(kib(active + cache), Ordering::Relaxed);
                     if let Some(avail) = available_memory_mib() {
                         min_a.fetch_min((avail * 1024.0) as u64, Ordering::Relaxed);
                     }
@@ -319,8 +313,8 @@ impl MemorySampler {
                                 available_memory_mib()
                                     .map(|m| format!("{m:.0}"))
                                     .unwrap_or_else(|| "n/a".into()),
-                                mib(active),
-                                mib(cache),
+                                mib(mlx_rs::memory::get_active_memory()),
+                                mib(mlx_rs::memory::get_cache_memory()),
                                 mib(mlx_rs::memory::get_peak_memory()),
                                 mlx_gen::vae_tiling::tiles_decoded(),
                             ),
@@ -330,7 +324,7 @@ impl MemorySampler {
                 }
             })
         };
-        Self { stop, min_available_kib, peak_footprint_kib, handle: Some(handle) }
+        Self { stop, min_available_kib, probe: Some(probe), handle: Some(handle) }
     }
 
     /// Stop sampling and return the report fragment.
@@ -345,7 +339,7 @@ impl MemorySampler {
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
-        let peak = self.peak_footprint_kib.load(Ordering::Relaxed) as f64 / 1024.0;
+        let peak = self.probe.take().map(|p| p.finish()).unwrap_or(0) as f64 / (1024.0 * 1024.0);
         let headroom = match self.min_available_kib.load(Ordering::Relaxed) {
             u64::MAX => String::new(),
             kib => format!(", min headroom {:.0} MiB", kib as f64 / 1024.0),
@@ -357,7 +351,7 @@ impl MemorySampler {
 #[cfg(any(feature = "media", feature = "zimage"))]
 impl Drop for MemorySampler {
     /// Stops the thread even if `finish` was never reached — an error path must not leave a sampler
-    /// appending underneath the report that follows it.
+    /// appending underneath the report that follows it. The probe stops via its own `Drop`.
     fn drop(&mut self) {
         self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
         if let Some(h) = self.handle.take() {

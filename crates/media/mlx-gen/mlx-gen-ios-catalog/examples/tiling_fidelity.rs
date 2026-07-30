@@ -25,7 +25,9 @@
 
 use std::path::Path;
 
-use mlx_gen::gen_core::{GenerationOutput, GenerationRequest, Image, LoadSpec, OffloadPolicy, Progress, WeightsSource};
+use mlx_gen::gen_core::{
+    GenerationOutput, GenerationRequest, Image, LoadSpec, OffloadPolicy, Progress, WeightsSource,
+};
 
 fn main() {
     if let Err(e) = run() {
@@ -102,9 +104,9 @@ fn write_png(image: &Image, path: &Path) -> Result<(), Box<dyn std::error::Error
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
-    let dir = args
-        .next()
-        .ok_or("usage: tiling_fidelity <snapshot_dir> [--size N] [--steps N] [--tiles a,b,c] [--out DIR]")?;
+    let dir = args.next().ok_or(
+        "usage: tiling_fidelity <snapshot_dir> [--size N] [--steps N] [--tiles a,b,c] [--out DIR]",
+    )?;
 
     let mut size = 1024u32;
     let mut steps = 4u32;

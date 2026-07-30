@@ -33,8 +33,12 @@ fn main() {
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
-    let a_path = args.next().ok_or("usage: compare_renders <a.png> <b.png>")?;
-    let b_path = args.next().ok_or("usage: compare_renders <a.png> <b.png>")?;
+    let a_path = args
+        .next()
+        .ok_or("usage: compare_renders <a.png> <b.png>")?;
+    let b_path = args
+        .next()
+        .ok_or("usage: compare_renders <a.png> <b.png>")?;
 
     let a = image::open(Path::new(&a_path))?.to_rgb8();
     let b = image::open(Path::new(&b_path))?.to_rgb8();
@@ -67,12 +71,29 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("{}\n  vs\n{}\n", a_path, b_path);
     println!("  dimensions      {:?}", a.dimensions());
-    println!("  identical       {}", if differing == 0 { "YES — byte-for-byte" } else { "no" });
-    println!("  differing       {differing} / {} samples ({:.2}%)", total as u64, 100.0 * differing as f64 / total);
+    println!(
+        "  identical       {}",
+        if differing == 0 {
+            "YES — byte-for-byte"
+        } else {
+            "no"
+        }
+    );
+    println!(
+        "  differing       {differing} / {} samples ({:.2}%)",
+        total as u64,
+        100.0 * differing as f64 / total
+    );
     println!("  max |Δ|         {max} / 255");
     println!("  mean |Δ|        {:.4}", sum as f64 / total);
-    println!("  >8/255          {:.2}%  (roughly the threshold of visibility)", 100.0 * n8 as f64 / total);
-    println!("  >32/255         {:.2}%  (plainly visible)", 100.0 * n32 as f64 / total);
+    println!(
+        "  >8/255          {:.2}%  (roughly the threshold of visibility)",
+        100.0 * n8 as f64 / total
+    );
+    println!(
+        "  >32/255         {:.2}%  (plainly visible)",
+        100.0 * n32 as f64 / total
+    );
 
     Ok(())
 }

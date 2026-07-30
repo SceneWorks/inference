@@ -62,6 +62,16 @@ fn measure(
 
     memory::clear_cache();
     memory::reset_peak_memory();
+    // The number this harness exists to produce, and the one it was not producing.
+    //
+    // Every verdict below was decided on `get_peak_memory`, which is the high-water mark of LIVE
+    // allocation and excludes MLX's reuse cache. A memory kill does not make that distinction —
+    // Darwin's `phys_footprint`, which iOS jetsam reads, counts both. The two disagree in ORDER, not
+    // just in magnitude: of three configurations measured here, the one with the lowest
+    // `get_peak_memory` (Z-Image 1024/tile256, 3102 MiB) had the highest footprint (6488 MiB) and
+    // was the only one the device refused. A budget ladder built on the peak alone can therefore
+    // rank a fatal configuration as the safest of the set, which is exactly what happened.
+    let probe = mlx_gen::memory_probe::FootprintProbe::start_default();
 
     let spec = LoadSpec {
         offload_policy: policy,
@@ -125,6 +135,7 @@ fn measure(
     }
     let secs = started.elapsed().as_secs_f64();
     let peak = memory::get_peak_memory();
+    let footprint = probe.finish() as usize;
 
     println!(
         "  after generation  active {:>7.0} MiB   peak {:>7.0} MiB   ({} image(s) in {secs:.1}s)",
@@ -135,10 +146,18 @@ fn measure(
             _ => 0,
         }
     );
+    println!(
+        "  PEAK FOOTPRINT    {:>7.0} MiB   (active+cache; +{:.0} MiB over the reported peak)",
+        mib(footprint),
+        mib(footprint.saturating_sub(peak))
+    );
 
     drop(generator);
     memory::clear_cache();
-    Ok((peak, secs))
+    // The FOOTPRINT is returned as the verdict quantity, not the peak. A budget is a statement about
+    // what the OS will tolerate, and the OS tolerates footprint. Returning the peak here is what let
+    // every verdict below be decided on a number no allocator enforces.
+    Ok((footprint, secs))
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -195,17 +214,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         println!("  cache limit 0 (buffer cache disabled)");
     }
 
-    let (resident_peak, resident_secs) = if sequential_only {
-        (0usize, 0.0f64)
+    // `Option`, not a `(0, 0.0)` sentinel. Under `--sequential-only` the zero flowed into the
+    // verdict table and printed `resident peak 0 MiB (0%) FITS` — a PASS verdict for a
+    // configuration that was never run, and the strongest-looking row in the output. It also made
+    // the savings line divide by the zero, reporting "131461021% more time".
+    let resident = if sequential_only {
+        None
     } else {
-        measure(
+        Some(measure(
             dir,
             OffloadPolicy::Resident,
             size,
             steps,
             count,
             "RESIDENT (all components co-resident)",
-        )?
+        )?)
     };
 
     let sequential = if resident_only {
@@ -238,20 +261,25 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         peak <= budget_bytes
     };
 
-    let resident_ok = verdict("resident", resident_peak, resident_secs);
+    let resident_ok = resident.map(|(peak, secs)| verdict("resident", peak, secs));
     let sequential_ok = match sequential {
         Some((peak, secs)) => {
             let ok = verdict("sequential", peak, secs);
-            let saved = resident_peak.saturating_sub(peak);
-            println!(
-                "  sequential saves {:.0} MiB ({:.0}%) for {:.0}% more time",
-                mib(saved),
-                100.0 * saved as f64 / resident_peak.max(1) as f64,
-                100.0 * (secs / resident_secs.max(1e-6) - 1.0),
-            );
+            // Only when both were actually measured. A comparison against a configuration that did
+            // not run is not a weaker claim, it is a fabricated one.
+            if let Some((resident_peak, resident_secs)) = resident {
+                let saved = resident_peak.saturating_sub(peak);
+                println!(
+                    "  sequential saves {:.0} MiB ({:.0}%) for {:.0}% more time",
+                    mib(saved),
+                    100.0 * saved as f64 / resident_peak.max(1) as f64,
+                    100.0 * (secs / resident_secs.max(1e-6) - 1.0),
+                );
+            }
             ok
         }
-        None => resident_ok,
+        // Nothing to say about a lane that was not run; fall back to whatever WAS measured.
+        None => resident_ok.unwrap_or(false),
     };
 
     if !sequential_ok {
@@ -261,7 +289,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         );
         std::process::exit(1);
     }
-    if !resident_ok {
+    // `Some(false)` — measured and does not fit. `None` means resident was never run, and silence is
+    // the honest output for a lane with no measurement behind it.
+    if resident_ok == Some(false) {
         println!("\n  Requires OffloadPolicy::Sequential on iOS -- resident does not fit.");
     }
     Ok(())
