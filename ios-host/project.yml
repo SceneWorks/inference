@@ -52,7 +52,12 @@ targets:
         # Raises the per-app memory limit and the virtual-address ceiling. See the file itself for
         # why both, and why this is not an approval-gated capability. If automatic signing cannot
         # grant them the build fails here rather than the app being killed on device.
-        CODE_SIGN_ENTITLEMENTS: App/SceneWorksSmoke.entitlements
+        #
+        # Interpolated so the entitlements can be dropped for an A/B: the smoke report prints
+        # `os_proc_available_memory`, so building once with and once without measures what the
+        # entitlement is actually worth on a given device rather than assuming it does something.
+        #   SMOKE_ENTITLEMENTS= scripts/ios/run_smoke.sh    # unentitled control
+        CODE_SIGN_ENTITLEMENTS: ${SMOKE_ENTITLEMENTS}
         # The Rust staticlib and everything MLX links against.
         OTHER_LDFLAGS:
           - -lios_smoke

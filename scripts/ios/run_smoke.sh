@@ -70,6 +70,17 @@ fi
 export DEVELOPMENT_TEAM
 say "signing team $DEVELOPMENT_TEAM"
 
+# The memory entitlements, on by default. Set SMOKE_ENTITLEMENTS= (empty) to build the unentitled
+# control: the report prints `os_proc_available_memory`, so the pair of runs measures what the
+# entitlement is worth on this device instead of assuming it is worth something.
+SMOKE_ENTITLEMENTS=${SMOKE_ENTITLEMENTS-App/SceneWorksSmoke.entitlements}
+export SMOKE_ENTITLEMENTS
+if [ -n "$SMOKE_ENTITLEMENTS" ]; then
+  say "entitlements $SMOKE_ENTITLEMENTS"
+else
+  say "entitlements NONE (unentitled control build)"
+fi
+
 # --- rust staticlib ---------------------------------------------------------------------------
 # No IPHONEOS_DEPLOYMENT_TARGET here on purpose: .cargo/config.toml pins it, and this script is
 # also a check that a clean invocation needs no environment help.
