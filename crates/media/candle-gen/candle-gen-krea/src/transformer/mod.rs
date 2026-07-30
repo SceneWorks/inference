@@ -537,6 +537,40 @@ impl Krea2Transformer {
         context: &Tensor,
         refs: &[Tensor],
     ) -> Result<Tensor> {
+        self.forward_edit_with_memory(
+            latent,
+            timestep,
+            context,
+            refs,
+            candle_gen::ATTN_SCORES_BUDGET,
+            &candle_gen::gen_core::CancelFlag::default(),
+        )
+        .map_err(|error| match error {
+            candle_gen::CandleError::Candle(error) => error,
+            other => candle_gen::candle_core::Error::Msg(other.to_string()),
+        })
+    }
+
+    /// [`Self::forward_edit`] with the constrained-card attention budget and cancellation threaded
+    /// through the block loop — the edit twin of [`Self::forward_with_memory`].
+    ///
+    /// The cancel checkpoint is what makes a **long** step interruptible (sc-16003). The sampler's
+    /// between-steps poll reads the flag once per step, immediately before calling the model, which is
+    /// useless when one step runs for minutes: an edit's joint sequence is `cap_len + (n_refs + 1) ·
+    /// img_len`, so a 2048² edit runs ~37k tokens and ~45 s per step. With no checkpoint inside the
+    /// forward the consumer trips the flag, nothing reads it until the step ends, and the worker's
+    /// bounded wind-down exhausts its grace and abandons the join — `abort()` is inert on a
+    /// `spawn_blocking` task, so the GPU work keeps running unattributed while the UI shows
+    /// "Cancelling…". Per block bounds that to one block (~2 s at 2048²).
+    pub fn forward_edit_with_memory(
+        &self,
+        latent: &Tensor,
+        timestep: &Tensor,
+        context: &Tensor,
+        refs: &[Tensor],
+        attention_scores_budget: usize,
+        cancel: &candle_gen::gen_core::CancelFlag,
+    ) -> candle_gen::Result<Tensor> {
         let cfg = &self.cfg;
         let p = cfg.patch_size;
         let (_, _, h, w) = latent.dims4()?;
@@ -553,7 +587,7 @@ impl Krea2Transformer {
         for (i, r) in refs.iter().enumerate() {
             let (_, _, rh, rw) = r.dims4()?;
             if rh != h || rw != w {
-                return Err(candle_gen::candle_core::Error::Msg(format!(
+                return Err(candle_gen::CandleError::Msg(format!(
                     "krea edit: reference {i} is {rh}x{rw} but the target latent is {h}x{w}; \
                      references must be VAE-encoded at the target resolution"
                 )));
@@ -572,19 +606,25 @@ impl Krea2Transformer {
 
         let (rcos, rsin) = self.rope_tables(cap_len, ht, wt, n_refs)?;
         let TransformerBlocks::Resident(blocks) = &self.blocks else {
-            return Err(candle_gen::candle_core::Error::Msg(
+            return Err(candle_gen::CandleError::Msg(
                 "Krea block streaming is supported only for ordinary text-to-image denoise".into(),
             ));
         };
-        for blk in blocks {
-            combined = blk.forward(&combined, &tvec, &rcos, &rsin)?;
-        }
+        combined = fold_block_sequence(blocks.len(), cancel, combined, |i, combined| {
+            Ok(blocks[i].forward_with_attention_budget(
+                &combined,
+                &tvec,
+                &rcos,
+                &rsin,
+                attention_scores_budget,
+            )?)
+        })?;
 
         // Slice the TARGET tokens (they sit last, after the text + all reference blocks) + unpatchify.
         let out = self.final_layer(&combined, &t)?;
         let target_offset = cap_len + n_refs * img_len;
         let img_out = out.narrow(1, target_offset, img_len)?;
-        unpatchify(&img_out, ht, wt, p, latent_ch)
+        Ok(unpatchify(&img_out, ht, wt, p, latent_ch)?)
     }
 
     /// Reference `LastLayer`: `SimpleModulation(t) = t + scale_shift_table` → `(scale, shift)`;
@@ -851,5 +891,70 @@ mod tests {
         assert_eq!(builds.get(), 3);
         build(1); // 1 was evicted → rebuild
         assert_eq!(builds.get(), 4);
+    }
+
+    /// sc-16003: the **edit** forward must honor the request's cancel flag inside its block loop, and it
+    /// must be otherwise byte-identical to the plain wrapper.
+    ///
+    /// The sampler's between-steps poll is not enough on this path: an edit's joint sequence is
+    /// `cap_len + (n_refs + 1) · img_len`, so a 2048² edit step is ~45 s. A cancel tripped mid-step used
+    /// to go unread until the step ended — by which time the worker's bounded wind-down had exhausted its
+    /// grace and abandoned a `spawn_blocking` join `abort()` cannot stop, leaving live GPU work behind.
+    #[test]
+    fn edit_forward_honors_the_cancel_flag_per_block() {
+        use candle_gen::gen_core::CancelFlag;
+
+        let (dit, cfg, path) = crate::testfix::tiny_transformer();
+        let latent_ch = cfg.in_channels / (cfg.patch_size * cfg.patch_size);
+        let latent = crate::testfix::rnd(&[1, latent_ch, 4, 4]);
+        let timestep = Tensor::from_vec(vec![0.7f32], 1, &Device::Cpu).unwrap();
+        let context = crate::testfix::rnd(&[1, 3, cfg.num_text_layers, cfg.text_hidden_dim]);
+        let refs = [crate::testfix::rnd(&[1, latent_ch, 4, 4])];
+        let run = |cancel: &CancelFlag| {
+            dit.forward_edit_with_memory(
+                &latent,
+                &timestep,
+                &context,
+                &refs,
+                candle_gen::ATTN_SCORES_BUDGET,
+                cancel,
+            )
+        };
+
+        // An untripped flag is inert: identical to the plain `forward_edit` wrapper, value for value.
+        let live = run(&CancelFlag::default()).expect("an untripped flag must not cancel");
+        let plain = dit
+            .forward_edit(&latent, &timestep, &context, &refs)
+            .expect("the plain wrapper still works");
+        assert_eq!(live.dims(), plain.dims(), "edit output shape");
+        let diff = (&live - &plain)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_vec0::<f32>()
+            .unwrap();
+        assert_eq!(
+            diff, 0.0,
+            "threading the cancel flag must not change the math"
+        );
+
+        // Tripped: the TYPED `Canceled`, which bridges to `gen_core::Error::Canceled` — the worker and
+        // the gen-core conformance suite key off it (sc-4481), so a stringified `Msg` would read as a
+        // backend failure and surface as "generation failed" instead of a clean cancel.
+        let cancelled = CancelFlag::default();
+        cancelled.cancel();
+        let error = run(&cancelled).expect_err("a tripped flag must abort the edit forward");
+        assert!(
+            matches!(error, candle_gen::CandleError::Canceled),
+            "expected the typed Canceled, got {error:?}"
+        );
+        assert!(matches!(
+            candle_gen::gen_core::Error::from(error),
+            candle_gen::gen_core::Error::Canceled
+        ));
+
+        let _ = std::fs::remove_file(&path);
     }
 }
