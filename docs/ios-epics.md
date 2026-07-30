@@ -478,9 +478,25 @@ measured on device rather than reasoned from the host A/B.
 at equal output resolution, and attention is quadratic in the token count that follows from it.
 
 So 229 s is a model property, not a defect, and there is no configuration that fixes it at 1024px.
-The usable question is resolution — or the PiD super-resolving decode route, which z-image already
-carries (`mlx-gen-pid` is a dependency) and which is the one lever that changes the denoise cost
-rather than the decode.
+
+**The PiD route is not the escape hatch, and this is worth recording so it is not re-proposed.** It
+is the one lever that changes denoise cost rather than decode cost, z-image already links
+`mlx-gen-pid`, and it looks like the obvious answer. It is disqualified twice over by its own
+contract:
+
+* **It is not a same-resolution speedup.** `GenerationRequest::use_pid` — "turning PiD on also
+  changes the output resolution (native → 4×), so it is not a transparent decoder swap." Reaching
+  1024px means denoising a 256px-equivalent latent, which would indeed cost ~15 s — but it produces a
+  *different image*, not the same one faster.
+* **It cannot ship.** "PiD output is research/evaluation-only (NSCLv1), surfaced/labeled at the
+  worker/web layer." Licensing rules it out of a SceneWorks product independent of any performance
+  argument.
+
+It also needs a converted student checkpoint (`tools/convert_pid.py`) plus a Gemma-2-2b-it directory
+provisioned onto the device, neither of which exists in the current snapshot — a multi-hour detour to
+an evaluation-only number.
+
+That leaves resolution as the only real lever, and the model already sits at 4 steps and q4.
 
 **Resolution scaling confirms it, and shows the ladder did its job.** Device, rung 4 on, tile 256:
 
