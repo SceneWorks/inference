@@ -900,6 +900,11 @@ warned about.
 That inverts what this doc said a few hours earlier, when the 512-untiled configuration was reported
 as the comfortable one. The device harness now runs only tiled configurations.
 
+> **RESOLVED — the log was pulled and the kill is attributed. See "The kill, attributed" below.**
+> The inference recorded in this section turned out to be correct (it was jetsam), but it was
+> correct by luck: the reasoning that followed it was wrong three separate ways before the evidence
+> arrived. Kept as written so the sequence stays legible.
+
 **What is established, and what is inferred.** Established: `1024 tile128` completed and left a
 breadcrumb, the configuration after it did not, `devicectl info processes` showed the app gone, and
 no report was written. So the process died during the untiled decode. **Inferred, not confirmed:**
@@ -939,6 +944,51 @@ result is indistinguishable from the host's.
 The device harness keeps the 512 configuration (a second resolution exercises a different allocation
 shape) but labels it off-distribution, so nobody reads its PNG as a regression. **The shipping
 resolution for this checkpoint is 1024.**
+
+### The kill, attributed (2026-07-30, later)
+
+`sudo log collect --device-udid <udid>` off the device, then `log show --archive`. The record:
+
+```
+[app<com.idkplay.SceneWorksSmoke>:8196] Process exited:
+  <RBSProcessExitStatus| domain:jetsam(1) code:per-process-limit(7)>
+```
+
+**Jetsam, on the per-process footprint limit.** Not an MLX abort. The same line shows
+`com.apple.developer.kernel.increased-memory-limit` in the process's entitlements, so the raised cap
+was already in force and it died anyway. All three jetsam records in the window carry that same code;
+iOS exposes no "allocated too fast" reason here, so a rate-based kill is not the mechanism either.
+
+Four hypotheses then had to be killed by experiment, three of them mine, because the log gives the
+*reason* but not the *cause* — 4773 MiB against a 6135 MiB cap should not cross a footprint limit:
+
+| hypothesis | how it died |
+|---|---|
+| MLX single-buffer abort | kernel says jetsam; largest tensor in the decode is 134 MB |
+| host understates device demand | host reads ~16% **high** on tiled configs (3294 → 2751) |
+| LLM residue underneath the image lane | ran image-only on a cold process; died anyway (~960 MiB of residue confirmed present, but not the cause) |
+| accumulation across configs | reordered the fatal config first; died as config #1 at full headroom |
+| instantaneous spike from concurrent stages | `MLX_GEN_DCAE_EVAL_STAGES` serializes without tiling — worth 2 MiB on host — and the device outcome did not change |
+
+**What is left, and it is the simple answer:** a single DC-AE stage exceeds what the cap allows. The
+host stage trace shows the peak climbing **3718 → 4774 MiB across one stage**, the final
+`[1,512,512,128]` — ~1 GB inside one stage. A between-stages sync cannot break that up; only tiling
+reaches inside it. That is why tiling is the only lever that has ever moved this number, now
+understood rather than merely observed.
+
+**Unexplained, and deliberately left unexplained:** the host measures that exact config at 4773 MiB
+against a 6135 MiB cap and it dies, first, cold. The device charges **>1.4 GB more** for that stage
+than MLX's host accounting reports — while charging ~16% *less* for tiled shapes. Metal allocation
+granularity and wired-memory overhead are the obvious candidates; neither is confirmed. The practical
+consequence is that host numbers are unreliable in **both directions** and their error is
+shape-dependent, which is a stronger warning than the retracted "understates" doctrine, not a weaker
+one.
+
+**Method note worth keeping.** Three device runs each measured something other than what they
+claimed: one tiled while labelled untiled (an unset env var stopped meaning "whole image" the moment
+tiling became the default), one carried LLM residue, one ran third with 1223 MiB of headroom left.
+Ascending-peak ordering is right for the shipping list and wrong for a diagnostic — headroom does not
+survive a render, so the config under test must run first.
 
 **Still open:** the `BoundedDecode` contract adoption. The mechanism now exists and is measured, but
 tiling is still selected by the `MLX_GEN_SANA_DECODE_TILE` env knob rather than by the contract's
