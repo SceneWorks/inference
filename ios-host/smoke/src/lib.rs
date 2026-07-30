@@ -249,6 +249,123 @@ fn bound_mlx_to_the_jetsam_limit() -> String {
     }
 }
 
+/// A background memory sampler, and the two numbers that are actually load-bearing on iOS.
+///
+/// # Why `get_peak_memory` is not one of them
+///
+/// A Z-Image decode reported `MLX peak 2901 MiB` while the process was **4 MiB** from a jetsam kill
+/// against a 6136 MiB cap. Both numbers were correct. `get_peak_memory` tracks MLX's *live*
+/// allocation; jetsam reads `phys_footprint`, which also counts MLX's buffer reuse cache. Reading
+/// only the peak, the decode looked like it had 3 GB to spare while it was in fact pinned at the
+/// limit — and every device figure recorded before this was that same quantity.
+///
+/// So a sampler records, at 100 ms:
+///
+/// * **`min_available_mib`** — the smallest `os_proc_available_memory()` seen. Ground truth: how
+///   close the process actually came to being killed, whatever the allocator believed.
+/// * **`peak_footprint_mib`** — the largest `active + cache` seen. The MLX-side footprint, which is
+///   the term `get_peak_memory` omits.
+///
+/// It samples rather than reads at the end because the failure it exists to explain kills the
+/// process mid-phase; anything computed after the work is exactly the part that never runs.
+#[cfg(any(feature = "media", feature = "zimage"))]
+struct MemorySampler {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    min_available_kib: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    peak_footprint_kib: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(any(feature = "media", feature = "zimage"))]
+impl MemorySampler {
+    /// Start sampling. `trace` names a breadcrumb file to log each sample to, or `None` to record
+    /// only the extrema (the SANA lane runs several configurations and does not want a per-sample
+    /// trace for each).
+    fn start(trace: Option<&'static str>, label: String) -> Self {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::Arc;
+
+        let stop = Arc::new(AtomicBool::new(false));
+        // u64 KiB rather than f64: `AtomicF64` does not exist, and KiB keeps the resolution that
+        // matters (the difference between 4 MiB of headroom and 0 is the whole finding).
+        let min_available_kib = Arc::new(AtomicU64::new(u64::MAX));
+        let peak_footprint_kib = Arc::new(AtomicU64::new(0));
+        mlx_gen::vae_tiling::reset_tiles_decoded();
+
+        let handle = {
+            let (stop, min_a, peak_f) = (
+                Arc::clone(&stop),
+                Arc::clone(&min_available_kib),
+                Arc::clone(&peak_footprint_kib),
+            );
+            std::thread::spawn(move || {
+                let t0 = Instant::now();
+                while !stop.load(Ordering::Relaxed) {
+                    let kib = |b: usize| (b / 1024) as u64;
+                    let active = mlx_rs::memory::get_active_memory();
+                    let cache = mlx_rs::memory::get_cache_memory();
+                    peak_f.fetch_max(kib(active + cache), Ordering::Relaxed);
+                    if let Some(avail) = available_memory_mib() {
+                        min_a.fetch_min((avail * 1024.0) as u64, Ordering::Relaxed);
+                    }
+                    if let Some(file) = trace {
+                        let mib = |b: usize| b as f64 / (1024.0 * 1024.0);
+                        append_breadcrumb(
+                            file,
+                            &format!(
+                                "    {label} t={:>6.2}s avail={:>6} MiB active={:>6.0} \
+                                 cache={:>6.0} peak={:>6.0} MiB tiles={}",
+                                t0.elapsed().as_secs_f64(),
+                                available_memory_mib()
+                                    .map(|m| format!("{m:.0}"))
+                                    .unwrap_or_else(|| "n/a".into()),
+                                mib(active),
+                                mib(cache),
+                                mib(mlx_rs::memory::get_peak_memory()),
+                                mlx_gen::vae_tiling::tiles_decoded(),
+                            ),
+                        );
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            })
+        };
+        Self { stop, min_available_kib, peak_footprint_kib, handle: Some(handle) }
+    }
+
+    /// Stop sampling and return the report fragment.
+    ///
+    /// The peak footprint is reported on **every** platform, including the host. It is the quantity
+    /// that predicts a device kill, so a host run that omits it cannot be compared to a device run
+    /// that dies — which is the comparison the host lane exists to support. Only `min headroom` is
+    /// iOS-only, because only iOS has a per-process budget to have headroom against.
+    fn finish(mut self) -> String {
+        use std::sync::atomic::Ordering;
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+        let peak = self.peak_footprint_kib.load(Ordering::Relaxed) as f64 / 1024.0;
+        let headroom = match self.min_available_kib.load(Ordering::Relaxed) {
+            u64::MAX => String::new(),
+            kib => format!(", min headroom {:.0} MiB", kib as f64 / 1024.0),
+        };
+        format!(" | peak MLX footprint {peak:.0} MiB (active+cache){headroom}")
+    }
+}
+
+#[cfg(any(feature = "media", feature = "zimage"))]
+impl Drop for MemorySampler {
+    /// Stops the thread even if `finish` was never reached — an error path must not leave a sampler
+    /// appending underneath the report that follows it.
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
 /// Report the OS-enforced per-app memory limit, so every other number has a denominator.
 fn check_memory_headroom() -> Check {
     const NAME: &str = "per-app memory limit (OS-reported)";
@@ -975,6 +1092,12 @@ fn check_image_generation(media_dir: Option<&Path>) -> Check {
 
         mlx_rs::memory::clear_cache();
         mlx_rs::memory::reset_peak_memory();
+        // Sampled per configuration, not just read at the end. The `headroom` below is what was left
+        // AFTER the run finished — the same reading that made a killed z-image configuration look
+        // like it had 6 GB spare, because the excursion happened between two observations. No trace
+        // file: this lane runs several configurations and a per-sample log for each would bury the
+        // report it belongs to; only the extrema are wanted.
+        let sampler = MemorySampler::start(None, String::new());
         let started = Instant::now();
 
         let run = || -> Result<String, String> {
@@ -1066,8 +1189,9 @@ fn check_image_generation(media_dir: Option<&Path>) -> Check {
                 .unwrap_or_default();
             Ok(format!(
                 "{label}: {secs:.1}s, MLX peak {mlx_peak:.0} MiB, process RSS peak {:.0} MiB{headroom}, \
-                 pixel range {lo}..{hi}",
+                 pixel range {lo}..{hi}{}",
                 peak_rss_mib(),
+                sampler.finish(),
             ))
         };
 
@@ -1286,60 +1410,7 @@ fn check_zimage_generation(dir: Option<&Path>) -> Check {
         // trajectory that would explain the death is exactly the part never written. `Decoding` at
         // 6007 MiB free is not evidence the decode is cheap; it is the last thing observed before a
         // 6 GB excursion nobody sampled.
-        //
-        // 100 ms is chosen against the failure, not the runtime: the host decodes in ~3 s, so a kill
-        // partway leaves tens of samples, while the cost is a `writeln` + flush per sample against a
-        // phase doing full VAE forwards. Tiles-decoded rides along because footprint alone cannot
-        // separate "never tiled" from "tiled and never released" -- the count does.
-        mlx_gen::vae_tiling::reset_tiles_decoded();
-        let sampling = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let sampler = {
-            let sampling = std::sync::Arc::clone(&sampling);
-            std::thread::spawn(move || {
-                let t0 = Instant::now();
-                while sampling.load(std::sync::atomic::Ordering::Relaxed) {
-                    // `cache` is not decoration. The 1024px kill ran the decode with 4 MiB of
-                    // headroom while MLX reported a 2901 MiB peak — so ~3.2 GB of the process
-                    // footprint was invisible to `active`/`peak`. MLX retains freed buffers in a
-                    // reuse cache that those two metrics exclude but `phys_footprint` (and therefore
-                    // jetsam) counts in full. Without this column the trace shows a bounded decode
-                    // being killed for no reason.
-                    let mib = |b: usize| b as f64 / (1024.0 * 1024.0);
-                    append_breadcrumb(
-                        "zimage-progress.txt",
-                        &format!(
-                            "    t={:>6.2}s avail={:>6} MiB active={:>6.0} cache={:>6.0} peak={:>6.0} MiB tiles={}",
-                            t0.elapsed().as_secs_f64(),
-                            available_memory_mib()
-                                .map(|m| format!("{m:.0}"))
-                                .unwrap_or_else(|| "n/a".to_string()),
-                            mib(mlx_rs::memory::get_active_memory()),
-                            mib(mlx_rs::memory::get_cache_memory()),
-                            mib(mlx_rs::memory::get_peak_memory()),
-                            mlx_gen::vae_tiling::tiles_decoded(),
-                        ),
-                    );
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                }
-            })
-        };
-        // Stop AND join the sampler on EVERY exit from the generate, including the `?` paths below.
-        // Joining rather than detaching matters for the file: a detached sampler can append one more
-        // line after the render's own summary, and a breadcrumb file whose tail is out of order is
-        // the kind of artifact that gets read as evidence of a phase that never happened.
-        struct StopOnDrop(
-            std::sync::Arc<std::sync::atomic::AtomicBool>,
-            Option<std::thread::JoinHandle<()>>,
-        );
-        impl Drop for StopOnDrop {
-            fn drop(&mut self) {
-                self.0.store(false, std::sync::atomic::Ordering::Relaxed);
-                if let Some(h) = self.1.take() {
-                    let _ = h.join();
-                }
-            }
-        }
-        let _stop = StopOnDrop(std::sync::Arc::clone(&sampling), Some(sampler));
+        let sampler = MemorySampler::start(Some("zimage-progress.txt"), format!("[{edge}px]"));
 
         // Phase-level breadcrumbs, because the coarse one is not localizing the kill.
         //
@@ -1460,10 +1531,14 @@ fn check_zimage_generation(dir: Option<&Path>) -> Check {
             Some(None) => "rung 4 default w".to_string(),
             None => "rung 4 OFF".to_string(),
         };
+        // Ends the sampler and yields the two numbers `mlx_peak` cannot give: how close the process
+        // came to a kill, and the footprint including the cache. Placed before the line is built so
+        // the report carries them rather than a separate breadcrumb nobody correlates.
+        let sampled = sampler.finish();
         let line = format!(
             "{edge}px full ladder ({rung4}): {secs:.1}s, MLX peak {mlx_peak:.0} MiB, \
              process RSS peak {:.0} MiB{headroom}, pixel range {lo}..{hi} \
-             [host predicted 4468 MiB] | cache {cache_before:.0}->{cache_after:.0} MiB, \
+             [host predicted 4468 MiB]{sampled} | cache {cache_before:.0}->{cache_after:.0} MiB, \
              active {active_before:.0}->{active_after:.0} MiB after clear_cache",
             peak_rss_mib(),
         );

@@ -16,7 +16,7 @@ crate-type = ["staticlib", "rlib"]
 [features]
 # E5's image-generation checks. Off by default so the LLM smoke stays the small, fast binary that
 # E3/E4 ship, and so a media compile break can never block the text lane's device runs.
-media = ["runtime-ios/media", "dep:image"]
+media = ["runtime-ios/media", "dep:image", "dep:mlx-gen"]
 # E5 go/no-go for a SECOND image model. Deliberately a direct path dep rather than a catalog entry:
 # `mlx-gen-ios-catalog` is a deliberately narrow composition root (SANA only) and widening it is an
 # architectural decision, not a way to run an experiment. This crate is excluded from the workspace,
