@@ -118,6 +118,13 @@ fn open_tier() -> Option<(Tier, Device, Pool)> {
 /// all-covering window, which `BlockPlan::resident` produces and `is_bounded()` reports as bounding
 /// nothing). The resident arm is therefore the SAME code path, not a second implementation — a
 /// parity test against a different loader would be comparing two things that could both be wrong.
+///
+/// **The wall times printed here are NOT a timing measurement, and must not be read as one.** This is
+/// one sample per window, taken in ascending order, on a host SC-15791 measured at up to ±38% spread
+/// — so the first row is always the cold one and any apparent trend is confounded with sweep order.
+/// A timing claim needs medians of an interleaved sample, which is what SC-15791's `window_sweep_cost`
+/// does. They are printed because a wildly different figure is a useful smell, not as evidence.
+/// The assertions are all on memory, which is what this arm can actually establish.
 #[test]
 #[ignore = "real weights + CUDA; set SC15792_Q4"]
 fn window_peak_sweep_is_linear_and_output_is_identical() -> Result<()> {

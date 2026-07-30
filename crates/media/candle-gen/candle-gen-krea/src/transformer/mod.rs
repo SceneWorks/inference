@@ -76,13 +76,20 @@ enum TransformerBlocks {
 /// 23.3 MiB, because SC-15792's sweep includes the per-forward dequant transient the spike's
 /// materialization-only arm excluded.)
 ///
-/// **The REASON changed under SC-16096 and the conclusion did not.** The spike attributed the flat
-/// time to a per-block host format conversion that a larger window repeats rather than amortizes;
-/// SC-16096 removed that conversion (device-format sidecars, prepared once per component). What
-/// remains — a per-window mmap read plus an H2D transfer — is still linear in the window and still
-/// amortizes nothing across it, so a wider window still buys no time while costing proportionally
-/// more peak. Worth restating explicitly because "the reason for a measurement evaporated" is exactly
-/// when a carried-over constant becomes wrong, and this one was re-derived rather than inherited.
+/// **SC-16096 removed the reason, and the timing half is now UNMEASURED — stated rather than
+/// assumed.** The spike attributed the flat time to a per-block host format conversion that a larger
+/// window repeats rather than amortizes; SC-16096 replaced it with device-format sidecars prepared
+/// once per component. So SC-15791's *mechanism* for the flatness no longer exists, and nothing has
+/// re-swept window size against time since: SC-16096 measured the conversion, not the window, and
+/// SC-15792's sweep takes one sample per window in ascending order, which cannot discriminate a trend
+/// from warm-up on a host with this much spread. SC-16154 owns the re-measurement.
+///
+/// **The value stays 1 regardless, and not by inertia.** What IS re-measured through this
+/// implementation is the memory side: peak is linear in the window at 107.9 MiB/block, unchanged by
+/// the sidecars. Rung 4 is only ever reached when no cheaper rung fits, so its job at that point is
+/// to minimize peak; a window that costs proportionally more peak for an unquantified time saving is
+/// the wrong trade for the situation the rung exists to serve. If SC-16154 finds a real gradient,
+/// widening is a one-line change to `SUPPORTED_TRANSFORMER_WINDOWS` plus fresh evidence.
 ///
 /// Every larger window is therefore strictly worse — more peak for no time — which is why
 /// `krea_turbo_memory_strategy_contract` publishes `transformer_window_sizes: vec![1]` and does not
