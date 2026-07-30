@@ -88,8 +88,40 @@ fn measure(
     // Weights fault in lazily, so peak is only real after an actual generation — measuring at load
     // time reports a reassuring and useless number.
     // Cancellation rides `GenerationRequest::cancel`, not a separate argument.
-    let mut on_progress = |_: Progress| {};
+    // Sample allocation at every progress callback. `Progress` names the phase, so this
+    // localizes the peak to encode / denoise-step / decode rather than reporting one number for
+    // the whole generation — which is what two failed weight-reduction attempts needed and did
+    // not have.
+    let mut trace: Vec<(String, f64, f64)> = Vec::new();
+    let mut on_progress = |p: Progress| {
+        // Collapse Step{current,total} to just "Step" so consecutive denoise steps merge below.
+        let label = match p {
+            Progress::Step { .. } => "Step".to_string(),
+            other => format!("{other:?}"),
+        };
+        trace.push((
+            label,
+            mib(memory::get_active_memory()),
+            mib(memory::get_peak_memory()),
+        ));
+    };
     let out = generator.generate(&request, &mut on_progress)?;
+
+    // Collapse consecutive samples of the same phase to first/last, so a 4-step denoise is two
+    // lines rather than four.
+    let mut collapsed: Vec<(String, f64, f64)> = Vec::new();
+    for sample in &trace {
+        match collapsed.last_mut() {
+            Some(prev) if prev.0 == sample.0 => {
+                prev.1 = sample.1;
+                prev.2 = sample.2;
+            }
+            _ => collapsed.push(sample.clone()),
+        }
+    }
+    for (phase, active, peak) in &collapsed {
+        println!("    {phase:<28} active {active:>7.0} MiB   peak {peak:>7.0} MiB");
+    }
     let secs = started.elapsed().as_secs_f64();
     let peak = memory::get_peak_memory();
 
@@ -118,6 +150,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut steps = 4u32; // SANA is few-step; 4 exercises the loop without dominating the runtime.
     let mut size = 1024u32;
     let mut resident_only = false;
+    let mut no_cache = false;
     while let Some(flag) = args.next() {
         match flag.as_str() {
             "--budget-mib" => {
@@ -126,6 +159,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             "--steps" => steps = args.next().ok_or("--steps needs a value")?.parse()?,
             "--size" => size = args.next().ok_or("--size needs a value")?.parse()?,
             "--resident-only" => resident_only = true,
+            // Disable MLX's buffer cache entirely (freed blocks return to the system at once).
+            // Diagnostic: a large drop here means the peak is retained-but-free memory, not live
+            // allocation — a very different problem from "the model is too big".
+            "--no-cache" => no_cache = true,
+            // Diagnostic: force an eval between decoder stages. If the peak drops, the decode's
+            // monolithic lazy graph is the cause and stage-wise eval is the fix.
+            "--eval-stages" => std::env::set_var("MLX_GEN_DCAE_EVAL_STAGES", "1"),
             other => return Err(format!("unknown argument {other:?}").into()),
         }
     }
@@ -138,6 +178,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         budget_mib as f64 / 1024.0
     );
     memory::set_memory_limit(budget_bytes);
+    if no_cache {
+        memory::set_cache_limit(0);
+        println!("  cache limit 0 (buffer cache disabled)");
+    }
 
     let (resident_peak, resident_secs) = measure(
         dir,

@@ -458,12 +458,33 @@ impl DcAeDecoder {
         let latent = latent_nchw.transpose_axes(&[0, 2, 3, 1])?.as_dtype(F32)?; // → NHWC
         let shortcut = repeat_interleave_last(&latent, self.in_shortcut_repeats)?;
         let mut h = add(&self.conv_in.forward(&latent)?, &shortcut)?;
+        // The decode is ONE lazy graph by default: MLX records every stage and materializes them
+        // together, so every intermediate feature map is live at once. Measured on SANA at 512px
+        // that is ~3.6 GB — over half the peak, and ~1200x the 3 MB image it produces
+        // (docs/ios-epics.md, E5).
+        //
+        // Evaluating between stages caps live memory at roughly one stage's activations instead.
+        // Opt-in for now (`MLX_GEN_DCAE_EVAL_STAGES`) so the default stays byte-identical while the
+        // trade-off is measured; it costs a GPU sync per stage.
+        let eval_stages = std::env::var_os("MLX_GEN_DCAE_EVAL_STAGES").is_some();
         for stage in self.stages.iter().rev() {
             if let Some(up) = &stage.upsample {
                 h = up.forward(&h)?;
             }
             for block in &stage.blocks {
                 h = block.forward(&h)?;
+            }
+            if eval_stages {
+                h.eval()?;
+                if std::env::var_os("MLX_GEN_DCAE_TRACE").is_some() {
+                    let sh = h.shape();
+                    eprintln!(
+                        "  dc-ae stage out {:?} active {:.0} MiB peak {:.0} MiB",
+                        sh,
+                        mlx_rs::memory::get_active_memory() as f64 / 1048576.0,
+                        mlx_rs::memory::get_peak_memory() as f64 / 1048576.0,
+                    );
+                }
             }
         }
         let h = rms_norm(&h, &self.norm_out_w, &self.norm_out_b, self.cfg.norm_eps)?;

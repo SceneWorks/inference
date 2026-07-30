@@ -556,6 +556,60 @@ land. `256px sequential @ 4890 MiB (80% of a 12 GB device's cap)` is the shippin
 that exists today. Anything better needs either the unidentified 3.6 GB explained, or a smaller
 model — and the second is a product conversation, not an engineering one.
 
+### Localized the memory: per-phase tracing (2026-07-30)
+
+Stopped guessing and instrumented `image_budget` to sample MLX's allocator at every `Progress`
+callback, plus a per-stage trace inside the DC-AE decoder. Two prior levers failed because they
+targeted weights; the trace says weights were never the problem.
+
+**Buffer cache: ruled out.** `--no-cache` (`set_cache_limit(0)`) gives 6678 MiB vs 6679. The peak
+is live allocation, not retained-free blocks.
+
+**Sequential @ 512px, phase by phase:**
+
+```
+Loading(Renderer)     active     3 MiB   peak  2064 MiB
+Step (denoise)        active  1905 MiB   peak  3048 MiB
+Decoding (start)      active  2045 MiB   peak  3048 MiB
+final                 active     0 MiB   peak  6678 MiB    <- +3630 after the last callback
+```
+
+Denoise never exceeds ~3 GB. **The entire overage happens in the VAE decode**, after the last
+progress event — which is why every earlier measurement saw one opaque number.
+
+**Inside the decoder** (`MLX_GEN_DCAE_TRACE=1`, resident, 512px):
+
+| Stage output | Size | Active | Peak |
+|---|---|---|---|
+| `[1,16,16,1024]` | 1 MiB | 3582 | 4519 |
+| `[1,32,32,1024]` | 4 MiB | 3827 | 4537 |
+| `[1,64,64,512]` | 8 MiB | 3841 | 5277 |
+| `[1,128,128,512]` | 32 MiB | 3992 | 6116 |
+| `[1,256,256,256]` | 64 MiB | 4042 | 6519 |
+| `[1,512,512,128]` | 128 MiB | 4175 | 6865 |
+
+That separates into **two independent problems**, which is why single levers kept failing:
+
+1. **~3.5 GB already resident before the decoder runs one stage.** The first stage's output is
+   1 MiB, yet active is 3582 MiB. This is denoise-phase memory that was never released — under
+   `Resident` the trunk is still held, and the latents/graph from denoise are still alive.
+2. **+2.3 GB of transient decode work** (peak 4519 → 6865 across stages), against stage outputs
+   totalling only ~237 MiB. Each stage's *internal* convolutions allocate far more than the tensor
+   they hand on. Stage-wise `eval` does **not** fix this — tested, 6680 MiB — because the
+   transients are inside a stage, not between stages.
+
+**Leverage, now that both parts are separated:**
+
+- Problem 1 is the promising one: ~3.5 GB of *denoise-phase* memory held during decode. If the
+  trunk and denoise graph were released before decode — the same load→use→drop the text encoder
+  already gets — decode would start near zero rather than near 3.5 GB. That is a third residency
+  phase, and the seam (`Residency`) already has the shape for it.
+- Problem 2 needs DC-AE tiling: decode the latent in spatial tiles so a stage's internals are
+  bounded by tile size rather than full resolution. Real work, and standard practice for VAEs on
+  constrained memory.
+
+**Neither is a weight problem, which is why −1.46 GB of weight savings moved the peak 0 MiB.**
+
 **What would actually move the number**, in order of expected effect:
 
 1. **A smaller text encoder.** At 2.3 GB the Gemma-2 CHI encoder is the single largest component
