@@ -8,8 +8,9 @@
 //! ## Status
 //!
 //! The RL checkpoint is a complete registered text-to-image provider through the normal
-//! [`mlx_gen::Generator`] surface. Base, Turbo, and Edit checkpoints remain explicitly disabled
-//! until their owning stories land.
+//! [`mlx_gen::Generator`] surface. The separate full Base and Turbo checkpoints are also registered
+//! at `mage_flow_base` and `mage_flow_turbo`; all three instruction-editing checkpoints share the
+//! reviewed edit pipeline under distinct checkpoint-identified provider IDs.
 //!
 //! ## Reuse lineage
 //!
@@ -53,7 +54,14 @@
 // ---------------------------------------------------------------------------------------------
 
 pub mod config;
+pub mod memory;
 pub mod model;
+
+// --- Physical per-tier quant artifacts (sc-14980) --------------------------------------------
+// `quant` is the Group-B packed-load template (sc-8669); `convert` is the offline producer that
+// writes the `q4/`/`q8/`/`bf16/` artifacts the SceneWorks mirrors host.
+pub mod convert;
+pub(crate) mod quant;
 
 // --- NR-MMDiT (sc-14040) -------------------------------------------------------------------
 pub mod attention;
@@ -76,6 +84,10 @@ pub mod latent;
 // --- Rectified-flow sampler + native-resolution packing (sc-14041) ---------------------------
 pub mod pipeline;
 
+// --- LoRA/LoKr adapter reload (sc-14055) + rectified-flow LoRA trainer (sc-14055) -------------
+pub mod adapters;
+pub mod training;
+
 // ---------------------------------------------------------------------------------------------
 // Re-export surface.
 //
@@ -86,6 +98,8 @@ pub mod pipeline;
 // ---------------------------------------------------------------------------------------------
 pub use config::{MageFlowConfig, QwenVlTextConfig, FAMILY};
 pub use model::{descriptor_for, MageVariant, MODEL_IDS};
+// sc-15036: the fine-tuned-checkpoint entrypoint + the component ids a caller must stage for it.
+pub use model::{load_finetuned, COMPONENT_TEXT_ENCODER, COMPONENT_VAE, REQUIRED_COMPONENTS};
 pub use text_encoder::{Conditioning, MageTextEncoder, PromptKind, Qwen3VlTextEncoder};
 
 pub use vae::{MageVae, VaePart};
@@ -103,7 +117,14 @@ pub use latent::{
 }; // sc-14104 (Gaussian-Shading noise)
 
 // sc-14041 (pipeline + the loaded model) re-exports here:
-pub use pipeline::{mage_flow_sigmas, MageFlowPipeline, STATIC_SHIFT};
+pub use pipeline::{
+    mage_flow_sigmas, BatchGenerationTrace, EditTrace, GenerationPack, GenerationSample,
+    GenerationTrace, MageComponentDirs, MageFlowPipeline, MAX_PACKED_IMAGE_TOKENS, STATIC_SHIFT,
+};
+
+// sc-14055 (LoRA/LoKr reload + rectified-flow trainer):
+pub use adapters::apply_mage_adapters;
+pub use training::{MageFlowTrainer, MODEL_ID as TRAINER_MODEL_ID};
 
 // Later phases add their own modules rather than growing these: `quant` (Q4/Q8 tiers, sc-14046),
 // `convert` (offline pre-quantisation, sc-14046), `adapters` (LoRA/LoKr routing, sc-14057) and
@@ -115,7 +136,15 @@ pub use pipeline::{mage_flow_sigmas, MageFlowPipeline, STATIC_SHIFT};
 pub fn register_providers(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
-    registry.register_generator(model::REGISTRATION)
+    registry
+        .register_generator(model::REGISTRATION)
+        .register_generator(model::REGISTRATION_BASE)
+        .register_generator(model::REGISTRATION_TURBO)
+        .register_generator(model::REGISTRATION_EDIT)
+        .register_generator(model::REGISTRATION_EDIT_BASE)
+        .register_generator(model::REGISTRATION_EDIT_TURBO)
+        // The rectified-flow LoRA/LoKr trainer targets the Base checkpoint (sc-14055).
+        .register_trainer(training::REGISTRATION)
 }
 
 /// Build the explicit Mage-Flow MLX provider catalog (this crate only).
@@ -134,9 +163,24 @@ mod explicit_registry_tests {
             .generators()
             .map(|registration| (registration.descriptor)().id.to_string())
             .collect();
-        assert_eq!(generators, ["mage_flow"]);
-        // The scaffold ships no trainer (sc-14055/sc-14056) and no captioner/embedder surface.
-        assert_eq!(registry.trainers().count(), 0);
+        assert_eq!(
+            generators,
+            [
+                "mage_flow",
+                "mage_flow_base",
+                "mage_flow_turbo",
+                "mage_flow_edit",
+                "mage_flow_edit_base",
+                "mage_flow_edit_turbo"
+            ]
+        );
+        // The rectified-flow LoRA/LoKr trainer targets the Base checkpoint (sc-14055); no
+        // captioner/embedder surface.
+        let trainers: Vec<String> = registry
+            .trainers()
+            .map(|registration| (registration.descriptor)().id.to_string())
+            .collect();
+        assert_eq!(trainers, ["mage_flow_base"]);
         assert_eq!(
             registry.descriptor_conformance_errors(),
             Vec::<String>::new()

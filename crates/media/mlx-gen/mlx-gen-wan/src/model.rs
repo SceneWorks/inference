@@ -164,14 +164,14 @@ const TE_QUANT_BITS: i32 = 8;
 /// MLX-affine tier iff a pre-quantized snapshot manifest is present (`config.quantization`) **or** a
 /// load-time `Q4`/`Q8` `spec.quantize` was requested (`Nvfp4` is candle-only and never reaches the MLX
 /// Wan path — excluded so its `bits()` = 4 is not routed through `mlx quantize`). On such a tier the TE
-/// packs to [`TE_QUANT_BITS`] (Q8), retiring the residual ~12 GiB f32-TE-encode active peak (sc-12796)
+/// packs to `TE_QUANT_BITS` (Q8), retiring the residual ~12 GiB f32-TE-encode active peak (sc-12796)
 /// that no further component offload could lower — the epic's binding 5B constraint. On the bf16 tier
 /// this is `None` (the TE stays dense / bit-exact). Shared by the 5B [`Wan`], the A14B [`Wan14b`], and
-/// the VACE paths (`model_vace.rs`).
-pub(crate) fn effective_te_quant(
-    config: &WanModelConfig,
-    load_quant: Option<Quant>,
-) -> Option<WanQuant> {
+/// the VACE paths (`model_vace.rs`) — and, since sc-15203, by `mlx-gen-krea-realtime`, whose Krea
+/// Realtime 14B tiers reuse this same stock-Wan UMT5-XXL encoder and therefore this same Q8 floor.
+/// `pub` for that cross-crate reuse: the floor's rationale (and `TE_QUANT_BITS`) must live in exactly
+/// one place rather than being re-derived per Wan-family provider.
+pub fn effective_te_quant(config: &WanModelConfig, load_quant: Option<Quant>) -> Option<WanQuant> {
     let dit_affine_quantized =
         config.quantization.is_some() || matches!(load_quant, Some(Quant::Q4) | Some(Quant::Q8));
     dit_affine_quantized.then_some(WanQuant {
@@ -1962,11 +1962,15 @@ mod tests {
 
     // ---- sc-12459: `dit_resident_bytes` shard-dir sizing must match `Weights::from_dir` ----------
 
-    /// A fresh, empty scratch dir for one sizing test (recreated per run; RUST_TEST_THREADS=1 is
-    /// forced repo-wide, so no cross-test races on the shared temp root).
+    /// A fresh, empty scratch dir for one sizing test (recreated per run).
+    ///
+    /// Keyed by pid as well as `name`: `RUST_TEST_THREADS=1` only serializes tests *within* one
+    /// invocation, so it rules out cross-*test* races but not cross-*process* ones — two concurrent
+    /// `cargo test` runs on the same machine share `$TMPDIR`, and the `remove_dir_all` below would
+    /// then delete the other run's fixtures mid-test.
     fn sizing_dir(name: &str) -> PathBuf {
         let d = std::env::temp_dir()
-            .join("mlx_gen_wan_dit_sizing")
+            .join(format!("mlx_gen_wan_dit_sizing_{}", std::process::id()))
             .join(name);
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
@@ -2057,7 +2061,11 @@ mod tests {
     }
 
     fn tmp_dir() -> PathBuf {
-        let d = std::env::temp_dir().join("mlx_gen_wan_model_site_test");
+        // Per-process scratch dir — a fixed `$TMPDIR` name races a second concurrent `cargo test`.
+        let d = std::env::temp_dir().join(format!(
+            "mlx_gen_wan_model_site_test_{}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&d).unwrap();
         d
     }
@@ -2158,6 +2166,79 @@ mod tests {
         Array::save_safetensors(refs, None, &path).unwrap();
         let w = Weights::from_file(&path).unwrap();
         WanTransformer::from_weights(&w, cfg).unwrap()
+    }
+
+    use crate::transformer::WAN_BLOCK_NORM_DIFF_PATCH_TARGETS;
+
+    /// sc-15326 — the norm diff-patch surface routes each `(module, part)` to the **field the forward
+    /// actually reads**.
+    ///
+    /// A step-distill LoRA patches `norm3` on both halves (`norm3.diff` + `norm3.diff_b`), so an
+    /// aliased or swapped routing would fold the bias delta onto the LayerNorm *gain* — a wrong render
+    /// on all 40 blocks that still reports a clean, fully-applied install.
+    ///
+    /// **Written through the accessor, read back off the fields.** Stamping a marker through
+    /// `norm_param_mut` and reading it back through the same accessor is non-discriminating: any
+    /// consistent bijection over the six targets passes, including swapping `norm3`'s `Weight` and
+    /// `Bias` arms (the γ and β of `layer_norm(x, γ, β, eps)`) or `norm_q`↔`norm_k`. So the read-back
+    /// side uses `WanTransformer::block_norm_diff_patch_fields`, which names `norm_q` / `norm_k` /
+    /// `norm3_w` / `norm3_b` **directly** and shares no code with the routing match arms.
+    #[test]
+    fn wan_norm_diff_patch_targets_route_to_distinct_parameters() {
+        let cfg = tiny_cfg();
+        let mut dit = tiny_transformer(&cfg);
+        assert_eq!(
+            WAN_BLOCK_NORM_DIFF_PATCH_TARGETS.len(),
+            6,
+            "4 qk-RMSNorm gains + norm3 weight + norm3 bias"
+        );
+
+        // Stamp a unique constant into every target.
+        for (i, (suffix, part)) in WAN_BLOCK_NORM_DIFF_PATCH_TARGETS.iter().enumerate() {
+            let dotted = format!("blocks.0.{suffix}");
+            let segs: Vec<&str> = dotted.split('.').collect();
+            let p = dit.norm_param_mut(&segs, *part).unwrap_or_else(|| {
+                panic!("`{dotted}` / {part:?} is advertised but does not route")
+            });
+            let marker = 100.0 + i as f32;
+            *p = Array::full::<f32>(p.shape(), &Array::from_f32(marker)).unwrap();
+        }
+
+        // Read them back OFF THE FIELDS, in the advertised order. Target `i` must have landed on
+        // field `i` — the parameter the block's forward passes to `rms_norm` / `layer_norm`. An
+        // aliased, swapped, or wrong-part arm fails here even though it round-trips through the
+        // accessor cleanly.
+        let fields = dit.block_norm_diff_patch_fields(0);
+        for (i, (suffix, part)) in WAN_BLOCK_NORM_DIFF_PATCH_TARGETS.iter().enumerate() {
+            let got = mlx_rs::ops::max(fields[i].as_dtype(mlx_rs::Dtype::Float32).unwrap(), None)
+                .unwrap()
+                .item::<f32>();
+            assert_eq!(
+                got,
+                100.0 + i as f32,
+                "`blocks.0.{suffix}` / {part:?} did not land on the field the forward reads \
+                 (aliased, swapped, or routed to the wrong part)"
+            );
+        }
+
+        // The qk-RMSNorms are weight-only: a `.diff_b` on one has nowhere to land and must NOT be
+        // quietly absorbed by the gain.
+        for suffix in ["self_attn.norm_q", "cross_attn.norm_k"] {
+            let dotted = format!("blocks.0.{suffix}");
+            let segs: Vec<&str> = dotted.split('.').collect();
+            assert!(
+                dit.norm_param_mut(&segs, mlx_gen::adapters::DiffPatchPart::Bias)
+                    .is_none(),
+                "`{dotted}` is an RMSNorm and has no bias channel"
+            );
+        }
+        // An out-of-surface stem routes nowhere (reported unmatched by the fold, never dropped).
+        assert!(dit
+            .norm_param_mut(
+                &["blocks", "0", "cross_attn", "norm_k_img"],
+                mlx_gen::adapters::DiffPatchPart::Weight
+            )
+            .is_none());
     }
 
     /// A PEFT LoRA file targeting `blocks.0.self_attn.q` ([dim,dim]) — `diffusion_model.`-prefixed,

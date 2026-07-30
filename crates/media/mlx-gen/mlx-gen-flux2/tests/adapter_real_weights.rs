@@ -281,7 +281,10 @@ fn kohya_matches_peft_on_real_tree() {
         peft.push((format!("transformer.{p}.lora_B.weight"), b));
         peft.push((format!("transformer.{p}.alpha"), alpha));
     }
-    let dir = std::env::temp_dir().join("mlx_gen_flux2_kohya_rw_test");
+    let dir = std::env::temp_dir().join(format!(
+        "mlx_gen_flux2_kohya_rw_test_{}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&dir).unwrap();
     let (kpath, ppath) = (dir.join("kohya.safetensors"), dir.join("peft.safetensors"));
     Array::save_safetensors(
@@ -412,7 +415,8 @@ fn bfl_resolves_and_matches_diffusers_split_on_real_tree() {
     );
     let alpha = Array::from_slice(&[4.0f32], &[1]);
 
-    let dir = std::env::temp_dir().join("mlx_gen_flux2_bfl_rw_test");
+    let dir =
+        std::env::temp_dir().join(format!("mlx_gen_flux2_bfl_rw_test_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
 
     // Equivalent diffusers split-target file (per-head up, SHARED down, same alpha).

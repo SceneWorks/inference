@@ -104,6 +104,8 @@ pub use transformer::Krea2Transformer;
 pub use vae::{load_vae, QwenVae, QwenVaeEncoder};
 
 use std::path::PathBuf;
+#[cfg(any(feature = "cuda", test))]
+use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 
 use candle_gen::candle_core::{Device, Tensor};
@@ -207,6 +209,9 @@ pub struct KreaGenerator {
     descriptor: ModelDescriptor,
     device: Device,
     residency: candle_gen::Residency<KreaTextPhase, KreaHeavyPhase>,
+    /// Effective load policy retained so per-generation memory levers can select the physical
+    /// three-stage Turbo path only when the consumer actually requested sequential residency.
+    offload_policy: OffloadPolicy,
     /// The snapshot root — retained so the multi-phase render (epic 13879, sc-13887) can load its
     /// **job-local** base DiT from `transformer/` regardless of residency mode (the shared resident DiT
     /// is never mutated for per-phase adapter toggling — the concurrency-safety invariant).
@@ -227,9 +232,211 @@ pub struct KreaGenerator {
     has_diff_patch: bool,
 }
 
+#[cfg(any(feature = "cuda", test))]
+struct KreaMemoryScope {
+    device: Device,
+    memory: Option<gen_core::GenerationMemory>,
+    finished: bool,
+}
+
+#[cfg(any(feature = "cuda", test))]
+impl KreaMemoryScope {
+    fn ensure_active(&self) -> gen_core::Result<()> {
+        if self.finished {
+            Err(gen_core::Error::Msg(
+                "krea memory-strategy request scope is already finished".to_owned(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[cfg(any(feature = "cuda", test))]
+impl gen_core::MemoryRequestScope for KreaMemoryScope {
+    fn configure_request(&mut self, request: &mut GenerationRequest) -> gen_core::Result<()> {
+        self.ensure_active()?;
+        if img2img_reference(request).is_some()
+            || request.phases.is_some()
+            || request.use_pid
+            || !request.conditioning.is_empty()
+        {
+            return Err(gen_core::Error::Unsupported(
+                "krea_2_turbo: optimized memory strategies require ordinary text-to-image \
+                 without reference/edit conditioning, PiD, or multi-phase denoise"
+                    .to_owned(),
+            ));
+        }
+        // The shared selection is authoritative and request-scoped. Overwrite any state left on a
+        // reused warm request so a deeper prior rung cannot leak into the next run.
+        request.memory = self.memory;
+        Ok(())
+    }
+
+    fn enter_phase(&mut self, _phase: gen_core::MemoryPhase) -> gen_core::Result<()> {
+        self.ensure_active()
+    }
+
+    fn leave_phase(&mut self, _phase: gen_core::MemoryPhase) -> gen_core::Result<()> {
+        self.ensure_active()
+    }
+
+    fn configure_decode(
+        &mut self,
+        tile_edge: u32,
+        overlap: u32,
+        _geometry: gen_core::MemoryGeometry,
+    ) -> gen_core::Result<()> {
+        self.ensure_active()?;
+        if tile_edge == 512 && overlap == 128 {
+            Ok(())
+        } else {
+            Err(gen_core::Error::Unsupported(format!(
+                "krea_2_turbo: decode tiling is fixed at 512/128, got {tile_edge}/{overlap}"
+            )))
+        }
+    }
+
+    fn configure_attention(&mut self, chunk_size: u32) -> gen_core::Result<()> {
+        self.ensure_active()?;
+        if chunk_size == pipeline::CONSTRAINED_ATTN_SCORES_BUDGET as u32 {
+            Ok(())
+        } else {
+            Err(gen_core::Error::Unsupported(format!(
+                "krea_2_turbo: attention chunk size is fixed at {}, got {chunk_size}",
+                pipeline::CONSTRAINED_ATTN_SCORES_BUDGET
+            )))
+        }
+    }
+
+    fn materialize_transformer_window(
+        &mut self,
+        _first_block: u32,
+        block_count: u32,
+    ) -> gen_core::Result<()> {
+        self.ensure_active()?;
+        if block_count == 1 {
+            Ok(())
+        } else {
+            Err(gen_core::Error::Unsupported(format!(
+                "krea_2_turbo: transformer residency window is fixed at one block, got {block_count}"
+            )))
+        }
+    }
+
+    fn finish(&mut self, _outcome: gen_core::MemoryRunOutcome) -> gen_core::Result<()> {
+        self.ensure_active()?;
+        self.device
+            .synchronize()
+            .map_err(gen_core::Error::backend)?;
+        self.finished = true;
+        Ok(())
+    }
+}
+
+#[cfg(any(feature = "cuda", test))]
+impl Drop for KreaMemoryScope {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = self.device.synchronize();
+            self.finished = true;
+        }
+    }
+}
+
+/// The shared ladder → this provider's per-request execution controls.
+///
+/// SC-15805: the cumulative default is **contract-owned and defeasible**, so ask
+/// [`gen_core::MemoryProviderContract::engages`] which rungs the selection engages instead of
+/// hardcoding the cost order in a `match`. A hardcoded `tile_vae_decode: true` on the rung-3 and
+/// rung-4 arms is the same hazard as a `>=` comparison in different syntax — it turns a lever on
+/// underneath a provider that has not declared that rung `Implemented`. Krea Turbo's contract
+/// declares every rung `Implemented`, so the two agree exactly today; this is a consistency fix,
+/// not a behavior change.
+#[cfg(any(feature = "cuda", test))]
+fn krea_generation_memory(
+    contract: &gen_core::MemoryProviderContract,
+    selection: gen_core::MemorySelection,
+) -> Option<gen_core::GenerationMemory> {
+    use gen_core::MemoryStrategy;
+
+    if selection.strategy == MemoryStrategy::Resident {
+        return None;
+    }
+    Some(gen_core::GenerationMemory {
+        tile_vae_decode: contract.engages(selection.strategy, MemoryStrategy::BoundedDecode),
+        chunk_attention: contract.engages(selection.strategy, MemoryStrategy::BoundedAttention),
+        stream_transformer_blocks: contract.engages(
+            selection.strategy,
+            MemoryStrategy::BoundedTransformerResidency,
+        ),
+        ..Default::default()
+    })
+}
+
 impl Generator for KreaGenerator {
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        #[cfg(feature = "cuda")]
+        {
+            (self.descriptor.id == KREA_2_TURBO_ID).then(krea_turbo_memory_strategy_contract)
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            None
+        }
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        #[cfg(feature = "cuda")]
+        {
+            if self.descriptor.id != KREA_2_TURBO_ID {
+                return Ok(None);
+            }
+            if context.mode != gen_core::MemoryMode::TextToImage
+                || context.has_reference
+                || context.use_pid
+                || context.has_phases
+            {
+                return Err(gen_core::Error::Unsupported(
+                    "krea_2_turbo: optimized memory strategies cover ordinary text-to-image \
+                     only (no reference, PiD, or multi-phase request)"
+                        .to_owned(),
+                ));
+            }
+            if context.selection.strategy.is_optimized()
+                && self.offload_policy != OffloadPolicy::Sequential
+            {
+                return Err(gen_core::Error::Unsupported(
+                    "krea_2_turbo: optimized memory strategies require a sequential load"
+                        .to_owned(),
+                ));
+            }
+            if let gen_core::MemorySafetyDecision::Reject { reason } =
+                self.memory_strategy_safety_check(context)
+            {
+                return Err(gen_core::Error::Unsupported(reason));
+            }
+            Ok(Some(Box::new(KreaMemoryScope {
+                device: self.device.clone(),
+                memory: krea_generation_memory(
+                    krea_turbo_memory_strategy_contract(),
+                    context.selection,
+                ),
+                finished: false,
+            })))
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = context;
+            Ok(None)
+        }
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
@@ -279,6 +486,29 @@ impl Generator for KreaGenerator {
             Vec::new()
         };
         let reference = img2img_reference(req);
+
+        if req.memory.is_some() {
+            if self.descriptor.id != KREA_2_TURBO_ID
+                || self.offload_policy != OffloadPolicy::Sequential
+                || reference.is_some()
+                || req.phases.is_some()
+                || req.use_pid
+            {
+                return Err(gen_core::Error::Unsupported(format!(
+                    "{}: per-generation memory adaptation is supported only for sequential, \
+                     native-VAE, ordinary Turbo text-to-image requests",
+                    self.descriptor.id
+                )));
+            }
+            let images = pipeline::render_three_stage(
+                &self.root,
+                &self.device,
+                &self.adapters,
+                req,
+                on_progress,
+            )?;
+            return Ok(GenerationOutput::Images(images));
+        }
 
         // Multi-phase denoise (epic 13879, sc-13887): resolve the phase list ONCE up-front so both the
         // text-encode phase (whether the unconditional context is needed) and the render phase drive from
@@ -825,6 +1055,7 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
         descriptor,
         device,
         residency,
+        offload_policy: policy,
         root,
         // The multi-phase diff-patch guard input (sc-13887): read the adapter file keys at load. The
         // ConvRot path already rejected adapters above, so `spec.adapters` is empty there ⇒ `false`.
@@ -924,6 +1155,7 @@ pub fn load_from_native_dit_file(
         descriptor,
         device,
         residency,
+        offload_policy: OffloadPolicy::Resident,
         root,
         // The single-file entrypoint threads no load-time adapters (S0b scope), so no diff-patch guard.
         adapters: Vec::new(),
@@ -944,14 +1176,115 @@ candle_gen::register_generators! {
     pub(crate) const EDIT_REGISTRATION = edit_descriptor => load_edit
 }
 
+/// Krea Turbo's provider-owned half of the shared memory-strategy handshake. The measured phase
+/// coefficients and exact fit boundaries stay in SceneWorks generated evidence; this declaration
+/// pins the executable structure that makes those measurements valid.
+#[cfg(any(feature = "cuda", test))]
+fn build_krea_turbo_memory_strategy_contract() -> gen_core::MemoryProviderContract {
+    use gen_core::{
+        MemoryBackendRealization, MemoryCalibrationIdentity, MemoryFormulaKind,
+        MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryParameterRanges, MemoryPhase,
+        MemoryProviderContract, MemoryRuntimeSemantics, MemoryStrategy, MemoryStrategyCapability,
+        MemoryStrategySupport,
+    };
+
+    MemoryProviderContract {
+        provider_id: KREA_2_TURBO_ID.to_owned(),
+        backend: MemoryBackendRealization::CandleCuda {
+            device_residency: true,
+            host_backed_weights: true,
+            host_to_device_block_materialization: true,
+        },
+        strategies: MemoryStrategy::ALL
+            .into_iter()
+            .map(|strategy| MemoryStrategyCapability {
+                strategy,
+                support: MemoryStrategySupport::Implemented,
+                parameters: match strategy {
+                    MemoryStrategy::BoundedDecode => MemoryParameterRanges {
+                        decode_tile_edges: vec![512],
+                        decode_overlaps: vec![128],
+                        ..Default::default()
+                    },
+                    MemoryStrategy::BoundedAttention => MemoryParameterRanges {
+                        attention_chunk_sizes: vec![
+                            pipeline::CONSTRAINED_ATTN_SCORES_BUDGET as u32,
+                        ],
+                        ..Default::default()
+                    },
+                    MemoryStrategy::BoundedTransformerResidency => MemoryParameterRanges {
+                        transformer_window_sizes: vec![1],
+                        ..Default::default()
+                    },
+                    MemoryStrategy::Resident | MemoryStrategy::StagedResidency => {
+                        MemoryParameterRanges::default()
+                    }
+                },
+            })
+            .collect(),
+        lifecycle: MemoryLifecycleCapabilities {
+            phases: vec![
+                MemoryPhase::Conditioning,
+                MemoryPhase::Denoise,
+                MemoryPhase::Decode,
+            ],
+            synchronized_phase_release: true,
+            decode_tiling: true,
+            attention_chunking: true,
+            transformer_window_materialization: true,
+        },
+        formula: MemoryFormulaKind::PhaseEnvelope {
+            phases: vec![
+                MemoryPhase::Conditioning,
+                MemoryPhase::Denoise,
+                MemoryPhase::Decode,
+            ],
+            variables: vec![
+                MemoryFormulaVariable::PixelCount,
+                MemoryFormulaVariable::BatchCount,
+                MemoryFormulaVariable::OverlayBytes,
+            ],
+        },
+        calibration: Some(MemoryCalibrationIdentity::new(
+            "krea-turbo-cuda-phase-curves-v1",
+        )),
+        // The Krea manifest phase curves already contain the measured resident floors. Asset facts
+        // remain zero here rather than substituting on-disk shard sums for load-exact CUDA residency.
+        asset_facts: gen_core::MemoryAssetFacts::default(),
+        runtime: MemoryRuntimeSemantics::default(),
+    }
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn krea_turbo_memory_strategy_contract() -> &'static gen_core::MemoryProviderContract {
+    static CONTRACT: OnceLock<gen_core::MemoryProviderContract> = OnceLock::new();
+    CONTRACT.get_or_init(build_krea_turbo_memory_strategy_contract)
+}
+
+#[cfg(feature = "cuda")]
+fn registered_krea_turbo_memory_strategy_contract(
+    _spec: &LoadSpec,
+) -> gen_core::Result<gen_core::MemoryProviderContract> {
+    Ok(krea_turbo_memory_strategy_contract().clone())
+}
+
+#[cfg(feature = "cuda")]
+const TURBO_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
+    provider_id: KREA_2_TURBO_ID,
+    contract: registered_krea_turbo_memory_strategy_contract,
+};
+
 /// Add all Candle Krea generators and trainers to an explicit media registry builder.
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    registry
+    let registry = registry
         .register_generator(TURBO_REGISTRATION)
         .register_generator(RAW_REGISTRATION)
-        .register_generator(EDIT_REGISTRATION)
+        .register_generator(EDIT_REGISTRATION);
+    #[cfg(feature = "cuda")]
+    let registry = registry.register_memory_strategy(TURBO_MEMORY_REGISTRATION);
+    registry
         .register_trainer(training::TRAINER_REGISTRATION)
         .register_trainer(control_trainer::CONTROL_TRAINER_REGISTRATION)
 }
@@ -980,12 +1313,277 @@ mod explicit_registry_tests {
             ["krea_2_turbo", "krea_2_raw", "krea_2_edit"]
         );
         assert_eq!(explicit_trainers, ["krea_2_raw", "krea_2_control"]);
+
+        let spec = candle_gen::gen_core::LoadSpec::new(candle_gen::gen_core::WeightsSource::Dir(
+            "/nonexistent".into(),
+        ));
+        #[cfg(feature = "cuda")]
+        {
+            let contract = registry
+                .memory_strategy_contract(super::KREA_2_TURBO_ID, &spec)
+                .unwrap()
+                .expect("Krea Turbo must register its CUDA memory-strategy contract");
+            assert_eq!(
+                contract.calibration.as_ref().unwrap().fingerprint,
+                "krea-turbo-cuda-phase-curves-v1"
+            );
+            assert_eq!(contract.strategies.len(), 5);
+            assert!(contract.strategies.iter().all(|capability| matches!(
+                capability.support,
+                candle_gen::gen_core::MemoryStrategySupport::Implemented
+            )));
+            gen_core_testkit::check_memory_strategy_contract(&contract).unwrap();
+
+            let edit_default = candle_gen::gen_core::MemoryProviderContract::compatibility_default(
+                super::KREA_2_EDIT_ID,
+                contract.backend.clone(),
+            );
+            gen_core_testkit::check_memory_strategy_contract(&edit_default).unwrap();
+        }
+        #[cfg(not(feature = "cuda"))]
+        assert!(registry
+            .memory_strategy_contract(super::KREA_2_TURBO_ID, &spec)
+            .unwrap()
+            .is_none());
+
+        for id in [super::KREA_2_RAW_ID, super::KREA_2_EDIT_ID] {
+            assert!(registry
+                .memory_strategy_contract(id, &spec)
+                .unwrap()
+                .is_none());
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **Krea keeps its own 128 Mi budget while consuming the shared rung-3 planner (SC-15796).**
+    ///
+    /// SC-15796 hoisted candle's chunk arithmetic onto `gen_core::attention_budget`, which also carries
+    /// Z-Image's measured 64 Mi operating point. Krea's 128 Mi is a **legitimately different, measured**
+    /// family operating point — the GPU-validated ControlNet chunk size — published through the same
+    /// `attentionChunkSize` field, and `configure_attention` rejects anything else. Unifying the two
+    /// numbers would silently re-calibrate this family, so this pins the split explicitly:
+    ///
+    /// 1. Krea declares exactly 128 Mi, and it is **not** the shared Z-Image constant.
+    /// 2. The declared value is still interpreted by the *shared planner* — at the krea grounded-TE
+    ///    geometry (B·H = 1·32, Sq = Sk = 8192, the inclusive token cap) 128 Mi plans 512 query rows
+    ///    where 64 Mi would plan 256, so the number is load-bearing and the planner reads it.
+    /// 3. `configure_attention` accepts 128 Mi and rejects the shared 64 Mi.
+    #[test]
+    fn krea_keeps_its_own_128_mi_budget_on_the_shared_planner() {
+        use candle_gen::attention::{AttentionBudget, CONSTRAINED_ATTN_SCORES_BUDGET as SHARED};
+
+        // (1) The declared family operating point, and that it is not the shared one.
+        assert_eq!(pipeline::CONSTRAINED_ATTN_SCORES_BUDGET, 128 * 1024 * 1024);
+        assert_eq!(SHARED, 64 * 1024 * 1024);
+        assert_ne!(pipeline::CONSTRAINED_ATTN_SCORES_BUDGET as u64, SHARED);
+
+        // (2) Shared planner, krea's budget. The grounded TE at its 8192-token cap: 32·8192 score
+        // elements per query row.
+        let rows_per_query = 32u64 * 8192;
+        let krea = AttentionBudget::from_score_elements(
+            pipeline::CONSTRAINED_ATTN_SCORES_BUDGET as u64,
+            false,
+        );
+        assert_eq!(krea.query_block_rows(rows_per_query, 8192), 512);
+        let z_image = AttentionBudget::from_score_elements(SHARED, false);
+        assert_eq!(z_image.query_block_rows(rows_per_query, 8192), 256);
+
+        // (3) The published contract admits krea's value and only krea's value.
+        use gen_core::MemoryRequestScope;
+        let mut scope = KreaMemoryScope {
+            device: Device::Cpu,
+            memory: Some(gen_core::GenerationMemory {
+                chunk_attention: true,
+                ..Default::default()
+            }),
+            finished: false,
+        };
+        scope
+            .configure_attention(pipeline::CONSTRAINED_ATTN_SCORES_BUDGET as u32)
+            .expect("krea must accept its own declared budget");
+        let err = scope
+            .configure_attention(SHARED as u32)
+            .expect_err("krea must reject the shared z-image budget");
+        assert!(
+            err.to_string().contains("attention chunk size is fixed"),
+            "{err}"
+        );
+        scope.finish(gen_core::MemoryRunOutcome::Complete).unwrap();
+    }
+
+    #[test]
+    fn shared_memory_ladder_maps_to_cumulative_existing_controls() {
+        let tier = gen_core::MemoryNumericTier {
+            precision: gen_core::Precision::Bf16,
+            quant: Some(Quant::Q4),
+        };
+        let parameters = gen_core::MemoryStrategyParameters {
+            decode_tile_edge: Some(512),
+            decode_overlap: Some(128),
+            attention_chunk_size: Some(pipeline::CONSTRAINED_ATTN_SCORES_BUDGET as u32),
+            transformer_window_size: Some(1),
+            // Krea streams only the DiT (SC-15794 scoped the encoder for z-image); None is the
+            // DiT-only default, so this declaration is unchanged in meaning.
+            transformer_window_component: None,
+        };
+        let selected = |strategy| gen_core::MemorySelection {
+            strategy,
+            parameters,
+            tier,
+        };
+        let contract = krea_turbo_memory_strategy_contract();
+
+        assert_eq!(
+            krea_generation_memory(contract, selected(gen_core::MemoryStrategy::Resident)),
+            None
+        );
+        assert_eq!(
+            krea_generation_memory(
+                contract,
+                selected(gen_core::MemoryStrategy::StagedResidency)
+            ),
+            Some(gen_core::GenerationMemory::default())
+        );
+        assert_eq!(
+            krea_generation_memory(contract, selected(gen_core::MemoryStrategy::BoundedDecode)),
+            Some(gen_core::GenerationMemory {
+                tile_vae_decode: true,
+                ..Default::default()
+            })
+        );
+        assert_eq!(
+            krea_generation_memory(
+                contract,
+                selected(gen_core::MemoryStrategy::BoundedAttention)
+            ),
+            Some(gen_core::GenerationMemory {
+                tile_vae_decode: true,
+                chunk_attention: true,
+                ..Default::default()
+            })
+        );
+        assert_eq!(
+            krea_generation_memory(
+                contract,
+                selected(gen_core::MemoryStrategy::BoundedTransformerResidency)
+            ),
+            Some(gen_core::GenerationMemory {
+                tile_vae_decode: true,
+                chunk_attention: true,
+                stream_transformer_blocks: true,
+                ..Default::default()
+            })
+        );
+    }
+
+    /// SC-15805: the cumulative default is DEFEASIBLE, and this provider now reads it from the
+    /// contract rather than from the ladder's numeric order. Pin that with a contract that declares
+    /// a cheaper rung unavailable: a deeper selection must leave that rung's lever OFF.
+    ///
+    /// Without this, reverting `krea_generation_memory` to its `match`-over-the-cost-order form is
+    /// invisible — every other test uses the production contract, where all five rungs are
+    /// `Implemented` and the two forms agree exactly.
+    #[test]
+    fn a_rung_the_provider_does_not_implement_is_not_engaged_by_a_deeper_selection() {
+        use gen_core::{MemoryStrategy, MemoryStrategySupport};
+
+        let mut contract = build_krea_turbo_memory_strategy_contract();
+        for capability in &mut contract.strategies {
+            if capability.strategy == MemoryStrategy::BoundedDecode {
+                capability.support = MemoryStrategySupport::Missing;
+            }
+        }
+
+        let memory = krea_generation_memory(
+            &contract,
+            gen_core::MemorySelection {
+                strategy: MemoryStrategy::BoundedTransformerResidency,
+                parameters: gen_core::MemoryStrategyParameters {
+                    transformer_window_size: Some(1),
+                    ..Default::default()
+                },
+                tier: gen_core::MemoryNumericTier {
+                    precision: gen_core::Precision::Bf16,
+                    quant: Some(Quant::Q4),
+                },
+            },
+        )
+        .expect("an optimized rung maps to a control set");
+
+        assert!(
+            !memory.tile_vae_decode,
+            "rung 2 is declared Missing, so a rung-4 selection must not tile the decode; the \
+             cost order is not a dependency"
+        );
+        // ...while the rungs the provider DOES declare stay on, so this is not a vacuous all-false.
+        assert!(memory.chunk_attention);
+        assert!(memory.stream_transformer_blocks);
+    }
+
+    #[test]
+    fn request_scope_reapplies_warm_state_rejects_non_t2i_and_finishes_once() {
+        use gen_core::MemoryRequestScope;
+
+        let attention_memory = gen_core::GenerationMemory {
+            tile_vae_decode: true,
+            chunk_attention: true,
+            ..Default::default()
+        };
+        let mut scope = KreaMemoryScope {
+            device: Device::Cpu,
+            memory: Some(attention_memory),
+            finished: false,
+        };
+        let mut request = GenerationRequest {
+            prompt: "test".to_owned(),
+            memory: Some(gen_core::GenerationMemory {
+                stream_transformer_blocks: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        scope.configure_request(&mut request).unwrap();
+        assert_eq!(request.memory, Some(attention_memory));
+        request.memory.as_mut().unwrap().calibration_error_phase =
+            Some(gen_core::MemoryPhase::Denoise);
+        scope.configure_request(&mut request).unwrap();
+        assert_eq!(
+            request.memory,
+            Some(attention_memory),
+            "a warm follow-up request must not inherit a prior calibration fault"
+        );
+        scope.finish(gen_core::MemoryRunOutcome::Complete).unwrap();
+        assert!(scope.finish(gen_core::MemoryRunOutcome::Complete).is_err());
+
+        let mut rejected = KreaMemoryScope {
+            device: Device::Cpu,
+            memory: Some(attention_memory),
+            finished: false,
+        };
+        let mut img2img = GenerationRequest {
+            prompt: "test".to_owned(),
+            conditioning: vec![Conditioning::Reference {
+                image: Image {
+                    width: 16,
+                    height: 16,
+                    pixels: vec![0; 16 * 16 * 3],
+                },
+                strength: None,
+            }],
+            ..Default::default()
+        };
+        assert!(matches!(
+            rejected.configure_request(&mut img2img),
+            Err(gen_core::Error::Unsupported(_))
+        ));
+        rejected
+            .finish(gen_core::MemoryRunOutcome::Canceled)
+            .unwrap();
+    }
 
     #[test]
     fn registers_krea_2_turbo_as_candle() {
@@ -1629,10 +2227,56 @@ mod tests {
                     ))
                 },
             ),
+            offload_policy: OffloadPolicy::Sequential,
             root: "/snap".into(),
             adapters: Vec::new(),
             has_diff_patch: false,
         }
+    }
+
+    #[test]
+    fn constrained_memory_route_requires_sequential_plain_turbo_t2i() {
+        let mut generator = sequential_generator(descriptor());
+        generator.offload_policy = OffloadPolicy::Resident;
+        let req = GenerationRequest {
+            prompt: "test".into(),
+            memory: Some(gen_core::GenerationMemory::default()),
+            ..Default::default()
+        };
+        let error = generator.generate(&req, &mut |_| {}).unwrap_err();
+        assert!(
+            error.to_string().contains("only for sequential"),
+            "unexpected error: {error}"
+        );
+
+        let raw = sequential_generator(raw_descriptor());
+        let error = raw.generate(&req, &mut |_| {}).unwrap_err();
+        assert!(
+            error.to_string().contains("only for sequential"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn constrained_memory_route_honors_a_pre_cancel_before_loading() {
+        let generator = sequential_generator(descriptor());
+        let cancel = gen_core::CancelFlag::default();
+        cancel.cancel();
+        let req = GenerationRequest {
+            prompt: "test".into(),
+            memory: Some(gen_core::GenerationMemory {
+                tile_vae_decode: true,
+                chunk_attention: true,
+                stream_transformer_blocks: true,
+                ..Default::default()
+            }),
+            cancel,
+            ..Default::default()
+        };
+        assert!(matches!(
+            generator.generate(&req, &mut |_| {}),
+            Err(gen_core::Error::Canceled)
+        ));
     }
 
     /// F-173 (sc-12089): a request cancelled before `generate` returns `Canceled` without loading a
@@ -1845,7 +2489,8 @@ mod tests {
             spec.text_encoder = Some(WeightsSource::File(convrot.into()));
         }
         let spec_mode = std::env::var("KREA_OFFLOAD_MODE").unwrap_or_default();
-        if spec_mode == "spec-sequential" {
+        let memory_mode = std::env::var("KREA_MEMORY_RUNG").unwrap_or_default();
+        if spec_mode == "spec-sequential" || !memory_mode.is_empty() {
             spec = spec.with_offload_policy(OffloadPolicy::Sequential);
         }
         // Square edge (default 768, the sc-11101 MLX A/B's resolution so the two backends compare).
@@ -1857,6 +2502,10 @@ mod tests {
             .ok()
             .and_then(|v| v.trim().parse().ok())
             .unwrap_or(768);
+        let measured_steps: u32 = std::env::var("KREA_AB_STEPS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(8);
         let conditioning = if edit {
             let source = std::env::var("KREA_EDIT_SOURCE")
                 .expect("set KREA_EDIT_SOURCE for KREA_SEQ_EDIT=1");
@@ -1875,6 +2524,32 @@ mod tests {
         } else {
             Vec::new()
         };
+        let memory = match memory_mode.as_str() {
+            "" => None,
+            "three-stage" => Some(gen_core::GenerationMemory::default()),
+            "tiled-vae" => Some(gen_core::GenerationMemory {
+                tile_vae_decode: true,
+                ..Default::default()
+            }),
+            "chunked-attention" => Some(gen_core::GenerationMemory {
+                tile_vae_decode: true,
+                chunk_attention: true,
+                ..Default::default()
+            }),
+            "streamed-blocks" => Some(gen_core::GenerationMemory {
+                tile_vae_decode: true,
+                chunk_attention: true,
+                stream_transformer_blocks: true,
+                ..Default::default()
+            }),
+            other => panic!(
+                "unknown KREA_MEMORY_RUNG={other}; use three-stage/tiled-vae/chunked-attention/streamed-blocks"
+            ),
+        };
+        assert!(
+            memory.is_none() || (!raw && !edit),
+            "KREA_MEMORY_RUNG measures ordinary Turbo text-to-image only"
+        );
         let req = GenerationRequest {
             prompt: if edit {
                 "make the person smile warmly, keep their identity".into()
@@ -1885,18 +2560,53 @@ mod tests {
             height: res,
             // Turbo is the 8-step distilled student; Raw is undistilled, so hold it to a short schedule
             // (the A/B measures PEAK, which is step-count-independent — not sample quality).
-            steps: Some(8),
+            steps: Some(measured_steps),
             seed: Some(42),
             count: 1,
             conditioning,
+            memory,
             ..Default::default()
         };
+
+        let max_baseline_gb = std::env::var("KREA_PROBE_MAX_BASELINE_GB")
+            .ok()
+            .and_then(|value| value.trim().parse::<f64>().ok())
+            .unwrap_or(1.0);
+        let mut probe = candle_gen::testkit::VramProbe::start_rendered();
+
+        // Optional same-process model-swap probe (sc-15205). Exercise another complete Turbo
+        // snapshot first, drop it, then perform the measured target-tier run below. This catches
+        // allocator/host-map retention that isolated one-model processes cannot expose. The swap uses
+        // the same constrained route and fixed seed, but one step is sufficient because the working
+        // set is step-count invariant.
+        if let Ok(swap_dir) = std::env::var("KREA_SWAP_DIR") {
+            assert!(
+                !raw && !edit && memory.is_some(),
+                "KREA_SWAP_DIR is supported only by the constrained ordinary Turbo probe"
+            );
+            let swap_spec = LoadSpec::new(WeightsSource::Dir(swap_dir.into()))
+                .with_offload_policy(OffloadPolicy::Sequential);
+            let swap = load(&swap_spec).expect("load KREA_SWAP_DIR");
+            let mut swap_req = req.clone();
+            swap_req.steps = Some(1);
+            let swap_output = swap
+                .generate(&swap_req, &mut |_| {})
+                .expect("generate KREA_SWAP_DIR before measured target");
+            let swap_bytes = match swap_output {
+                GenerationOutput::Images(mut images) => images.remove(0).pixels.len(),
+                other => panic!("expected swap images, got {other:?}"),
+            };
+            drop(swap);
+            eprintln!(
+                "KREA_SWAP completed before target tier: {}x{} bytes={swap_bytes}",
+                swap_req.width, swap_req.height
+            );
+        }
 
         // Load and generate are sampled as SEPARATE phases so the report separates the load transient
         // (weights → device) from the denoise/decode activation spike — the epic's open question is which
         // dominates, and a single fused peak can't say (sc-11925 notes the transient was only calibrated
         // at 1024²).
-        let mut probe = candle_gen::testkit::VramProbe::start_rendered();
         let load_phase = probe.phase();
         let g = if edit {
             load_edit(&spec).expect("load krea_2_edit")
@@ -1907,18 +2617,92 @@ mod tests {
         };
         probe.end_load(load_phase);
         let gen_phase = probe.phase();
-        let output = g.generate(&req, &mut |_| {}).expect("generate");
+        if let Ok(delay_ms) = std::env::var("KREA_CANCEL_AFTER_MS") {
+            let delay_ms = delay_ms
+                .trim()
+                .parse::<u64>()
+                .expect("KREA_CANCEL_AFTER_MS must be an integer");
+            let cancel = req.cancel.clone();
+            let timer = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                cancel.cancel();
+            });
+            let cancel_started = std::time::Instant::now();
+            let error = match g.generate(&req, &mut |_| {}) {
+                Ok(_) => panic!("delayed cancellation unexpectedly produced an image"),
+                Err(error) => error,
+            };
+            timer.join().expect("join delayed cancellation timer");
+            let cancel_elapsed_s = cancel_started.elapsed().as_secs_f64();
+            assert!(
+                matches!(error, gen_core::Error::Canceled),
+                "expected delayed cancellation, got {error:?}"
+            );
+            probe.end_gen(gen_phase);
+            let report = probe.report();
+            eprintln!("KREA_CANCEL delay_ms={delay_ms} elapsed_s={cancel_elapsed_s:.3} | {report}");
+            report.assert_trustworthy(max_baseline_gb);
+            return;
+        }
+        let repeats: usize = std::env::var("KREA_AB_REPEATS")
+            .ok()
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or(1);
+        assert!(repeats > 0, "KREA_AB_REPEATS must be positive");
+        let mut phase_peaks = Vec::new();
+        let mut repeat_elapsed = Vec::with_capacity(repeats);
+        let mut first_pixels = None;
+        let mut img = None;
+        let started = std::time::Instant::now();
+        for repeat in 0..repeats {
+            let mut observed = None;
+            let mut phase_index = 0usize;
+            let repeat_started = std::time::Instant::now();
+            let output = g
+                .generate(&req, &mut |progress| {
+                    if matches!(progress, Progress::Loading(_)) {
+                        if let Some((name, phase)) = observed.take() {
+                            phase_peaks.push((repeat, name, probe.end_observed(phase)));
+                        }
+                        let name = match phase_index {
+                            0 => "text",
+                            1 => "denoise",
+                            _ => "decode",
+                        };
+                        phase_index += 1;
+                        observed = Some((name, probe.phase()));
+                    }
+                })
+                .expect("generate");
+            repeat_elapsed.push(repeat_started.elapsed().as_secs_f64());
+            if let Some((name, phase)) = observed.take() {
+                phase_peaks.push((repeat, name, probe.end_observed(phase)));
+            }
+            let current = match output {
+                GenerationOutput::Images(mut images) => images.remove(0),
+                other => panic!("expected images, got {other:?}"),
+            };
+            if let Some(expected) = &first_pixels {
+                assert_eq!(
+                    &current.pixels, expected,
+                    "repeat {repeat} changed the fixed-seed RGB output"
+                );
+            } else {
+                first_pixels = Some(current.pixels.clone());
+            }
+            img = Some(current);
+        }
+        let elapsed_s = started.elapsed().as_secs_f64();
         probe.end_gen(gen_phase);
         let report = probe.report();
 
-        let img = match output {
-            GenerationOutput::Images(mut v) => v.remove(0),
-            other => panic!("expected images, got {other:?}"),
-        };
+        let img = img.expect("at least one repeated image");
         std::fs::write(&out, &img.pixels).expect("write pixels");
 
         let env_mode = std::env::var("CANDLE_GEN_OFFLOAD").unwrap_or_default();
-        let mode = if spec_mode == "spec-sequential" {
+        let mode = if !memory_mode.is_empty() {
+            memory_mode.as_str()
+        } else if spec_mode == "spec-sequential" {
             "spec-sequential"
         } else if env_mode.eq_ignore_ascii_case("sequential") {
             "env-sequential"
@@ -1933,14 +2717,21 @@ mod tests {
             KREA_2_TURBO_ID
         };
         eprintln!(
-            "SEQ_AB id={id} mode={mode} gpu={} {}x{} steps={:?} | {report} | bytes={} out={out}",
+            "SEQ_AB id={id} mode={mode} gpu={} {}x{} steps={:?} repeats={repeats} \
+             elapsed_s={elapsed_s:.3} repeat_elapsed_s={repeat_elapsed:?} | {report} | bytes={} \
+             out={out}",
             candle_gen::testkit::probe_gpu(),
             req.width,
             req.height,
             req.steps,
             img.pixels.len(),
         );
-        report.assert_trustworthy(1.0);
+        for (repeat, phase, peak_gb) in phase_peaks {
+            eprintln!(
+                "KREA_PHASE rung={memory_mode} repeat={repeat} phase={phase} peak_gb={peak_gb:.3}"
+            );
+        }
+        report.assert_trustworthy(max_baseline_gb);
     }
 
     /// Test helper: attach a ConvRot DiT single-file selector on `text_encoder` (sc-9300).

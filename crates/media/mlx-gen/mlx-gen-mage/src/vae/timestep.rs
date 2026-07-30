@@ -32,6 +32,17 @@ pub struct TimestepEmbedder {
 }
 
 impl TimestepEmbedder {
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.fc1.quantize(bits)?;
+        self.fc2.quantize(bits)
+    }
+
+    pub(crate) fn quantization_count(&self) -> (usize, usize) {
+        let a = self.fc1.quantization_count();
+        let b = self.fc2.quantization_count();
+        (a.0 + b.0, a.1 + b.1)
+    }
+
     /// Load `{prefix}.mlp.0` and `{prefix}.mlp.2` (index 1 is the `SiLU`).
     pub fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
         Ok(Self {

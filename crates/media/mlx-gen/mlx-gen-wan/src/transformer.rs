@@ -24,7 +24,7 @@
 //! is **0.31.2** (which reworked the NAX bf16 kernels), so bf16 parity is exact only up to that
 //! cross-version kernel difference (f32 is bit-exact across the two) until the pin moves to 0.31.2.
 
-use mlx_gen::adapters::{AdaptableHost, AdaptableLinear, Adapter};
+use mlx_gen::adapters::{AdaptableHost, AdaptableLinear, Adapter, DiffPatchPart};
 use mlx_gen::array::scalar;
 use mlx_gen::train::lora::LoraParams;
 use mlx_gen::weights::Weights;
@@ -225,6 +225,30 @@ impl SelfAttention {
         }
     }
 
+    /// Route a ComfyUI/lightx2v diff-patch target to this attention's qk-RMSNorm gain (sc-15326).
+    /// RMSNorm here is weight-only, so a `.diff_b` on `norm_q`/`norm_k` resolves to nothing and is
+    /// surfaced as a skip rather than inventing an offset the reference module does not have. These
+    /// gains are dense on **every** quant tier (`_quantize_predicate` packs only the attn/FFN Linears),
+    /// which is what makes a fold through this surface tier-independent.
+    fn norm_param_mut(&mut self, path: &[&str], part: DiffPatchPart) -> Option<&mut Array> {
+        match (path, part) {
+            (["norm_q"], DiffPatchPart::Weight) => Some(&mut self.norm_q),
+            (["norm_k"], DiffPatchPart::Weight) => Some(&mut self.norm_k),
+            _ => None,
+        }
+    }
+
+    /// sc-15326 — test-only **field-level** view of this attention's qk-RMSNorm gains, in the
+    /// [`WAN_BLOCK_NORM_DIFF_PATCH_TARGETS`] order (`norm_q`, then `norm_k`). Names the two fields
+    /// **directly** rather than routing through [`norm_param_mut`](Self::norm_param_mut), which is
+    /// exactly the point: a routing test that both writes and reads through the accessor passes under
+    /// any consistent bijection (including a `norm_q`↔`norm_k` or weight↔bias swap), so the read-back
+    /// side has to name the fields.
+    #[cfg(test)]
+    pub(crate) fn norm_diff_patch_fields(&self) -> [&Array; 2] {
+        [&self.norm_q, &self.norm_k]
+    }
+
     /// `x_mod`: `[B, L, dim]` (f32). `cos`/`sin`: `[L, 1, half_d]` (bf16). Returns `[B, L, dim]` bf16.
     /// Batched over `B` (the CFG cond/uncond branches) — attention never mixes batch elements, so the
     /// `B=2` result is bit-identical to two `B=1` calls (the cos/sin broadcast across batch + heads).
@@ -260,6 +284,73 @@ impl SelfAttention {
         let out = sdpa_maybe_checkpoint(&q, &k, &v, self.scale, self.ckpt_sdpa)?;
         let out = out.transpose_axes(&[0, 2, 1, 3])?.reshape(&[b, s, n * d])?;
         self.o.forward(&out)
+    }
+
+    /// **Causal cached** self-attention — the Krea Realtime autoregressive delta (sc-8436, S3). Mirrors
+    /// `causal_model.py::CausalWanSelfAttention.forward` (the cached `else` branch): q/k/v are projected
+    /// and qk-RMSNorm'd exactly as [`forward`](Self::forward), the caller-supplied **offset** RoPE
+    /// `cos`/`sin` are applied to q and k (so this chunk's keys carry their global temporal position),
+    /// and this chunk's queries `[B, n, S, d]` attend over `[prev_k ‖ new_k]` / `[prev_v ‖ new_v]` under
+    /// the caller-built block-causal additive `mask` (`0` allowed, `-inf` masked; `None` = every key
+    /// allowed, the single-block AR step).
+    ///
+    /// `prev_k`/`prev_v` are the **already-windowed** cached post-RoPE keys / raw values
+    /// `[B, n, S_prev, d]` from earlier chunks (or `None` for the first chunk) — the cache append/read /
+    /// windowing policy is the caller's (`mlx_gen_krea_realtime`), so the reused Wan attention only
+    /// concatenates + scores. Returns `(out [B, S, dim] bf16, new_k [B, n, S, d] bf16,
+    /// new_v [B, n, S, d] bf16)`: `new_k`/`new_v` are **this chunk's** post-RoPE k / raw v for the
+    /// caller to append to its running cache. Inference-only (no SDPA checkpointing).
+    fn forward_causal(
+        &self,
+        x_mod: &Array,
+        cos: &Array,
+        sin: &Array,
+        prev_k: Option<&Array>,
+        prev_v: Option<&Array>,
+        mask: Option<&Array>,
+    ) -> Result<(Array, Array, Array)> {
+        // q/k/v projection + qk-RMSNorm + offset-RoPE + head split — byte-identical to `forward`.
+        let xw = bf16(x_mod)?;
+        let (n, d) = (self.num_heads as i32, self.head_dim as i32);
+        let b = x_mod.shape()[0];
+        let s = x_mod.shape()[1];
+
+        let q = rms_norm(&self.q.forward(&xw)?, &self.norm_q, self.eps)?;
+        let k = rms_norm(&self.k.forward(&xw)?, &self.norm_k, self.eps)?;
+        let q = bf16(&crate::rope::rope_apply(
+            &f32(&q.reshape(&[b, s, n, d])?)?,
+            cos,
+            sin,
+        )?)?
+        .transpose_axes(&[0, 2, 1, 3])?;
+        let k = bf16(&crate::rope::rope_apply(
+            &f32(&k.reshape(&[b, s, n, d])?)?,
+            cos,
+            sin,
+        )?)?
+        .transpose_axes(&[0, 2, 1, 3])?;
+        let v = self
+            .v
+            .forward(&xw)?
+            .reshape(&[b, s, n, d])?
+            .transpose_axes(&[0, 2, 1, 3])?;
+
+        // Prepend the cached window along the key/value time axis (axis 2) for the SDPA read; the
+        // returned k/v are THIS chunk's only, so the caller owns the running cache growth.
+        let (k_read, v_read) = match (prev_k, prev_v) {
+            (Some(pk), Some(pv)) => (
+                concatenate_axis(&[pk, &k], 2)?,
+                concatenate_axis(&[pv, &v], 2)?,
+            ),
+            _ => (k.clone(), v.clone()),
+        };
+
+        let out = match mask {
+            Some(m) => scaled_dot_product_attention(&q, &k_read, &v_read, self.scale, m, None)?,
+            None => scaled_dot_product_attention(&q, &k_read, &v_read, self.scale, None, None)?,
+        };
+        let out = out.transpose_axes(&[0, 2, 1, 3])?.reshape(&[b, s, n * d])?;
+        Ok((self.o.forward(&out)?, k, v))
     }
 
     /// Toggle SDPA-segment checkpointing (sc-4942). Training-only — see `ckpt_sdpa`.
@@ -355,6 +446,30 @@ impl CrossAttention {
         }
     }
 
+    /// Route a ComfyUI/lightx2v diff-patch target to this attention's qk-RMSNorm gain (sc-15326).
+    /// RMSNorm here is weight-only, so a `.diff_b` on `norm_q`/`norm_k` resolves to nothing and is
+    /// surfaced as a skip rather than inventing an offset the reference module does not have. These
+    /// gains are dense on **every** quant tier (`_quantize_predicate` packs only the attn/FFN Linears),
+    /// which is what makes a fold through this surface tier-independent.
+    fn norm_param_mut(&mut self, path: &[&str], part: DiffPatchPart) -> Option<&mut Array> {
+        match (path, part) {
+            (["norm_q"], DiffPatchPart::Weight) => Some(&mut self.norm_q),
+            (["norm_k"], DiffPatchPart::Weight) => Some(&mut self.norm_k),
+            _ => None,
+        }
+    }
+
+    /// sc-15326 — test-only **field-level** view of this attention's qk-RMSNorm gains, in the
+    /// [`WAN_BLOCK_NORM_DIFF_PATCH_TARGETS`] order (`norm_q`, then `norm_k`). Names the two fields
+    /// **directly** rather than routing through [`norm_param_mut`](Self::norm_param_mut), which is
+    /// exactly the point: a routing test that both writes and reads through the accessor passes under
+    /// any consistent bijection (including a `norm_q`↔`norm_k` or weight↔bias swap), so the read-back
+    /// side has to name the fields.
+    #[cfg(test)]
+    pub(crate) fn norm_diff_patch_fields(&self) -> [&Array; 2] {
+        [&self.norm_q, &self.norm_k]
+    }
+
     /// Cached K/V from the (bf16) text context `[B, L_ctx, dim]` — computed once, reused per step.
     /// `B` is the forward batch (2 for CFG cond+uncond, 1 otherwise); returns `(k, v)` each
     /// `[B, n, L_ctx, d]`.
@@ -444,6 +559,35 @@ impl Block {
         }
     }
 
+    /// Route a diff-patch target to this block's dense norm parameters (sc-15326): the two attentions'
+    /// qk-RMSNorm gains, and the affine cross-attention LayerNorm `norm3` (both halves). Every one of
+    /// them stays dense at Q4/Q8, so a lightx2v step-distill file's 200 `.diff` + 40 `norm3.diff_b`
+    /// deltas fold identically on every tier.
+    fn norm_param_mut(&mut self, path: &[&str], part: DiffPatchPart) -> Option<&mut Array> {
+        match (path, part) {
+            (["self_attn", rest @ ..], _) => self.self_attn.norm_param_mut(rest, part),
+            (["cross_attn", rest @ ..], _) => self.cross_attn.norm_param_mut(rest, part),
+            (["norm3"], DiffPatchPart::Weight) => Some(&mut self.norm3_w),
+            (["norm3"], DiffPatchPart::Bias) => Some(&mut self.norm3_b),
+            _ => None,
+        }
+    }
+
+    /// sc-15326 — test-only **field-level** view of this block's six diff-patch norm parameters, in
+    /// the exact order of [`WAN_BLOCK_NORM_DIFF_PATCH_TARGETS`]. Every entry names its struct field
+    /// directly (`norm3_w` is the LayerNorm **gain**, `norm3_b` its **bias** — the γ/β passed to
+    /// `layer_norm` in both [`forward`](Self::forward) and [`forward_causal`](Self::forward_causal)),
+    /// so the routing test can assert that a marker stamped through `norm_param_mut` landed on the
+    /// parameter the forward actually reads. Round-tripping through the accessor cannot do that: a
+    /// weight↔bias swap in the match arms above is self-consistent and would read back clean while
+    /// corrupting the render on all 40 blocks.
+    #[cfg(test)]
+    pub(crate) fn norm_diff_patch_fields(&self) -> [&Array; 6] {
+        let [sq, sk] = self.self_attn.norm_diff_patch_fields();
+        let [cq, ck] = self.cross_attn.norm_diff_patch_fields();
+        [sq, sk, cq, ck, &self.norm3_w, &self.norm3_b]
+    }
+
     fn prepare_kv(&self, context: &Array) -> Result<(Array, Array)> {
         self.cross_attn.prepare_kv(context)
     }
@@ -491,6 +635,51 @@ impl Block {
         let y = gelu_ffn(&self.ffn_fc1.forward(&bf16(&x_mod)?)?)?;
         let y = self.ffn_fc2.forward(&y)?;
         gated(&x, &y, &e5)
+    }
+
+    /// **Causal cached** block forward — the Krea Realtime AR delta (sc-8436, S3). Identical wiring to
+    /// [`forward`](Self::forward) — the same adaLN-6vec modulation, cross-attention over the cached text
+    /// K/V, and gated-GELU FFN are **reused verbatim** — except the self-attention runs
+    /// [`SelfAttention::forward_causal`] over the persistent KV cache under the block-causal `mask`, with
+    /// the caller's **offset** RoPE. Returns `(x_out [B, S, dim], new_k, new_v)` where `new_k`/`new_v`
+    /// are this chunk's post-RoPE k / raw v `[B, n, S, d]` for the caller to append to layer `i`'s cache.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_causal(
+        &self,
+        x: &Array,
+        e: &Array,
+        kv: &(Array, Array),
+        cos: &Array,
+        sin: &Array,
+        prev_k: Option<&Array>,
+        prev_v: Option<&Array>,
+        mask: Option<&Array>,
+    ) -> Result<(Array, Array, Array)> {
+        // adaLN-6vec modulation — identical to `forward`.
+        let dim = self.self_attn.num_heads as i32 * self.self_attn.head_dim as i32;
+        let m = add(&self.modulation, e)?;
+        let l_e = m.shape()[1];
+        let p = split(&m, 6, 2)?;
+        let v = |i: usize| -> Result<Array> { Ok(p[i].reshape(&[1, l_e, dim])?) };
+        let (e0, e1, e2) = (v(0)?, v(1)?, v(2)?);
+        let (e3, e4, e5) = (v(3)?, v(4)?, v(5)?);
+
+        // Self-attention — the causal cached delta.
+        let x_mod = modulate(&ln(x, self.eps)?, &e1, &e0)?;
+        let (y, new_k, new_v) = self
+            .self_attn
+            .forward_causal(&x_mod, cos, sin, prev_k, prev_v, mask)?;
+        let x = gated(x, &y, &e2)?;
+
+        // Cross-attention (reused verbatim — text context, position-independent).
+        let x_cross = layer_norm(&x, Some(&self.norm3_w), Some(&self.norm3_b), self.eps)?;
+        let x = add(&x, &self.cross_attn.forward(&x_cross, kv)?)?;
+
+        // Gated-GELU FFN (reused verbatim).
+        let x_mod = modulate(&ln(&x, self.eps)?, &e4, &e3)?;
+        let y = gelu_ffn(&self.ffn_fc1.forward(&bf16(&x_mod)?)?)?;
+        let y = self.ffn_fc2.forward(&y)?;
+        Ok((gated(&x, &y, &e5)?, new_k, new_v))
     }
 }
 
@@ -557,7 +746,90 @@ impl AdaptableHost for WanTransformer {
     }
 }
 
+/// The whole-model (non-block) adaptable Linears in **native converted** naming — the spellings
+/// [`normalize_wan_key`](crate::adapters::normalize_wan_key) produces for a Wan-family LoRA's global
+/// targets. Paired with [`WanTransformer::global_adaptable_mut`], which routes exactly these.
+///
+/// Deliberately **not** folded into [`AdaptableHost::adaptable_paths`] for [`WanTransformer`]: that
+/// surface is also the LoRA **trainer**'s target enumeration ([`crate::training`]), so widening it would
+/// change what a Wan fine-tune can be pointed at. This is an opt-in *inference* surface a host composes
+/// in — `mlx-gen-krea-realtime` does, so a real Wan-T2V step-distill LoRA (lightx2v / FastWan) installs
+/// instead of hard-erroring as an unmatched target (sc-8446, S13). Those files carry genuine low-rank
+/// factors for **six** of these seven — `patch_embedding` ships only a `.diff_b` bias delta — which is
+/// why a real install reports 406 targets against a 407-wide surface. The list stays seven wide because
+/// it describes the Linears the model HAS, not the ones a given file happens to populate.
+pub const WAN_GLOBAL_ADAPTABLE_PATHS: &[&str] = &[
+    "patch_embedding_proj",
+    "text_embedding_0",
+    "text_embedding_1",
+    "time_embedding_0",
+    "time_embedding_1",
+    "time_projection",
+    "head.head",
+];
+
+/// The per-block **norm** parameters a ComfyUI/lightx2v diff-patch can fold into, as
+/// `(module suffix, part)` pairs in native converted naming (sc-15326). Exactly the five norms a Wan
+/// step-distill / lightning file patches: the self- and cross-attention qk-RMSNorm gains (weight-only)
+/// and the affine cross-attention LayerNorm `norm3` (weight **and** bias).
+///
+/// Single source of truth for what [`WanTransformer::norm_param_mut`] routes, so a test can assert the
+/// two agree instead of trusting a hand-kept list. Deliberately **not** part of
+/// [`AdaptableHost::adaptable_paths`]: these are not `AdaptableLinear`s and are not LoRA-trainable
+/// targets — they are a diff-patch fold surface only.
+pub const WAN_BLOCK_NORM_DIFF_PATCH_TARGETS: &[(&str, DiffPatchPart)] = &[
+    ("self_attn.norm_q", DiffPatchPart::Weight),
+    ("self_attn.norm_k", DiffPatchPart::Weight),
+    ("cross_attn.norm_q", DiffPatchPart::Weight),
+    ("cross_attn.norm_k", DiffPatchPart::Weight),
+    ("norm3", DiffPatchPart::Weight),
+    ("norm3", DiffPatchPart::Bias),
+];
+
 impl WanTransformer {
+    /// Route a diff-patch delta to the dense **norm** parameter at `path` (native converted naming),
+    /// the norm analog of [`global_adaptable_mut`](Self::global_adaptable_mut) (sc-15326). Composed in
+    /// by a host's [`AdaptableHost::diff_patch_param_mut`]; `mlx-gen-krea-realtime` does, so a lightx2v
+    /// step-distill LoRA's 200 `.diff` + 40 `norm3.diff_b` norm deltas land instead of being dropped.
+    ///
+    /// Every parameter reachable here is dense on **every** quant tier — the reference
+    /// `_quantize_predicate` packs only the per-block attention/FFN Linears — so the fold is
+    /// tier-independent, unlike a weight `.diff` into a Linear.
+    pub fn norm_param_mut(&mut self, path: &[&str], part: DiffPatchPart) -> Option<&mut Array> {
+        match path {
+            ["blocks", i, rest @ ..] => self
+                .blocks
+                .get_mut(i.parse::<usize>().ok()?)?
+                .norm_param_mut(rest, part),
+            _ => None,
+        }
+    }
+
+    /// sc-15326 — test-only **field-level** view of block `i`'s six diff-patch norm parameters, in
+    /// [`WAN_BLOCK_NORM_DIFF_PATCH_TARGETS`] order. See `Block::norm_diff_patch_fields`: the routing
+    /// test reads back through *this* rather than through [`norm_param_mut`](Self::norm_param_mut), so
+    /// a swapped or aliased match arm cannot round-trip clean.
+    #[cfg(test)]
+    pub(crate) fn block_norm_diff_patch_fields(&self, i: usize) -> [&Array; 6] {
+        self.blocks[i].norm_diff_patch_fields()
+    }
+
+    /// Route one of the seven whole-model [`WAN_GLOBAL_ADAPTABLE_PATHS`] to its [`AdaptableLinear`], in
+    /// **native converted** naming. Returns `None` for anything else — including the per-block paths,
+    /// which [`AdaptableHost::adaptable_mut`] already routes; a host composes the two.
+    pub fn global_adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["patch_embedding_proj"] => Some(&mut self.patch_embedding),
+            ["text_embedding_0"] => Some(&mut self.text_embedding_0),
+            ["text_embedding_1"] => Some(&mut self.text_embedding_1),
+            ["time_embedding_0"] => Some(&mut self.time_embedding_0),
+            ["time_embedding_1"] => Some(&mut self.time_embedding_1),
+            ["time_projection"] => Some(&mut self.time_projection),
+            ["head", "head"] => Some(&mut self.head),
+            _ => None,
+        }
+    }
+
     pub fn from_weights(w: &Weights, cfg: &WanModelConfig) -> Result<Self> {
         let mut blocks = Vec::with_capacity(cfg.num_layers);
         for i in 0..cfg.num_layers {
@@ -723,7 +995,7 @@ impl WanTransformer {
                                 local.join(".")
                             ))
                         })?
-                        .set_adapters(vec![Adapter::Lora { a, b, scale: 1.0 }]);
+                        .set_training_adapters(vec![Adapter::Lora { a, b, scale: 1.0 }]);
                 }
                 let kv = blk
                     .prepare_kv(&context_c)
@@ -867,6 +1139,22 @@ impl WanTransformer {
     /// the grid (not the weights), so they are identical for both MoE experts.
     pub fn prepare_rope(&self, grid: (usize, usize, usize)) -> Result<(Array, Array)> {
         let (cos_t, sin_t) = self.rope.precompute_cos_sin(grid)?;
+        Ok((bf16(&cos_t)?, bf16(&sin_t)?))
+    }
+
+    /// Precompute the **bf16** RoPE `(cos, sin)` for a chunk grid `(f, h, w)` whose temporal band starts
+    /// at global latent frame `start_frame` — the Krea Realtime causal-AR offset (sc-8436, S3). Thin
+    /// bf16 wrapper over [`RopeTable::precompute_cos_sin_with_frame_offset`]; `start_frame = 0` equals
+    /// [`prepare_rope`](Self::prepare_rope). See that method for the tail-equivalence invariant that
+    /// makes a cached chunk's RoPE match its position in a full-sequence pass.
+    pub fn prepare_rope_with_frame_offset(
+        &self,
+        grid: (usize, usize, usize),
+        start_frame: usize,
+    ) -> Result<(Array, Array)> {
+        let (cos_t, sin_t) = self
+            .rope
+            .precompute_cos_sin_with_frame_offset(grid, start_frame)?;
         Ok((bf16(&cos_t)?, bf16(&sin_t)?))
     }
 
@@ -1019,6 +1307,55 @@ impl WanTransformer {
             x = block.forward(&x, &e0, kv, cos, sin)?;
         }
         self.apply_head(&x, &e)
+    }
+
+    /// **Causal autoregressive** chunk forward over a persistent per-layer KV cache — the Krea Realtime
+    /// S3 core (sc-8436). Runs the full block stack + output head over a **pre-embedded, pre-broadcast**
+    /// chunk `tokens` `[B, S, dim]` (bf16, from [`patch_embed_tokens`](Self::patch_embed_tokens)),
+    /// reusing every non-self-attention piece of the block verbatim while each block's self-attention
+    /// attends over `[prev_self_kv[i] ‖ this-chunk]` under the caller's block-causal `mask` and **offset**
+    /// RoPE `cos`/`sin` (from [`prepare_rope_with_frame_offset`](Self::prepare_rope_with_frame_offset)).
+    ///
+    /// This is the additive AR analogue of [`forward_packed`](Self::forward_packed): the caller
+    /// (`mlx_gen_krea_realtime`) owns the KV-cache append/read/windowing and mask construction and passes
+    /// the per-layer windowed cache in; `prev_self_kv` is either **empty** (first chunk / full recompute)
+    /// or exactly `num_layers` long. Returns `(velocity [B, S, out_dim·∏patch] f32, new_self_kv)` where
+    /// `new_self_kv[i]` is layer `i`'s **this-chunk** post-RoPE k / raw v `[B, n, S, d]` for the caller
+    /// to append. The scheduler / few-step renoise / AR chunk loop that drives this per block are S4.
+    ///
+    /// Mirrors `causal_model.py::CausalWanModel.forward`'s cached path: patch tokens in → block stack
+    /// with cached causal self-attention → modulated head → per-token velocity out.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_causal_chunk(
+        &self,
+        tokens: &Array,
+        t: f32,
+        cross_kv: &[(Array, Array)],
+        cos: &Array,
+        sin: &Array,
+        prev_self_kv: &[(Array, Array)],
+        mask: Option<&Array>,
+    ) -> Result<(Array, Vec<(Array, Array)>)> {
+        if !prev_self_kv.is_empty() && prev_self_kv.len() != self.blocks.len() {
+            return Err(Error::Msg(format!(
+                "wan causal: prev_self_kv must be empty or one (k,v) per layer ({}), got {}",
+                self.blocks.len(),
+                prev_self_kv.len()
+            )));
+        }
+        let (e, e0) = self.time_embed(t)?;
+        let mut x = tokens.clone();
+        let mut new_self_kv = Vec::with_capacity(self.blocks.len());
+        for (i, (block, kv)) in self.blocks.iter().zip(cross_kv.iter()).enumerate() {
+            let (pk, pv) = match prev_self_kv.get(i) {
+                Some((k, v)) => (Some(k), Some(v)),
+                None => (None, None),
+            };
+            let (xo, nk, nv) = block.forward_causal(&x, &e0, kv, cos, sin, pk, pv, mask)?;
+            x = xo;
+            new_self_kv.push((nk, nv));
+        }
+        Ok((self.apply_head(&x, &e)?, new_self_kv))
     }
 
     /// TI2V **per-token-timestep** batched DiT forward (sc-2680). Identical to [`forward_cached`](

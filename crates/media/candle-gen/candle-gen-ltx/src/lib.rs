@@ -15,7 +15,8 @@
 //! denoise → the temporal VAE decoder (frames) **plus** the `AudioDecoder`
 //! → `LtxVocoder` → a synchronized 48 kHz stereo `AudioTrack`. Registered under
 //! `"ltx_2_3_distilled"`; single-stage distilled denoise (no CFG). **Deferred** to follow-up stories:
-//! the 2-stage latent upsampler, I2V conditioning, prompt-enhance, LoRA/IC-LoRA, and fp8/quant.
+//! the 2-stage latent upsampler, I2V conditioning, prompt-enhance, IC-LoRA, and fp8/quant. Plain
+//! video-attention LoRA is supported on both dense and packed tiers.
 //!
 //! **Dtypes:** the DiT, connector, text projection, and Gemma encoder run **bf16** (the checkpoint's
 //! native dtype; 22B+12B does not fit f32 on a single 96 GB GPU); the VAE runs **f32**; attention and
@@ -28,16 +29,19 @@
 //! As of sc-13749 there is no environment side-channel or HF-cache scan — an absent encoder is a
 //! load-time, actionable error naming the slot (epic 13657; the candle sibling of sc-13664).
 
+pub mod adapters;
 pub mod audio_vae;
 pub mod config;
 pub mod connector;
 pub mod conv3d;
+pub mod dit_train;
 pub mod gemma;
 pub mod pipeline;
 pub mod quant;
 pub mod rope;
 pub mod text_encoder;
 pub mod tier;
+pub mod training;
 pub mod transformer;
 pub mod vae;
 pub mod vocoder;
@@ -47,8 +51,9 @@ use std::sync::{Arc, Mutex};
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::{
-    self, AudioTrack, Capabilities, GenerationOutput, GenerationRequest, Generator, Image,
-    LoadSpec, Modality, ModelDescriptor, PerComponentBytes, Progress, Quant, WeightsSource,
+    self, AdapterKind, AdapterSpec, AudioTrack, Capabilities, GenerationOutput, GenerationRequest,
+    Generator, Image, LoadSpec, Modality, ModelDescriptor, PerComponentBytes, Progress, Quant,
+    WeightsSource,
 };
 use candle_gen::{run_av_curated_sampler, AvLatents, CandleError, Result as CResult};
 
@@ -140,12 +145,12 @@ impl Pipeline {
         candle_gen::sorted_safetensors(dir, "ltx")
     }
 
-    fn load_components(&self) -> CResult<Components> {
+    fn load_components(&self, adapters: &[AdapterSpec]) -> CResult<Components> {
         // sc-9545: a packed MLX split-tier subdir (`.../q4` or `.../q8`) is ingested through the
         // remapping VarBuilders in `tier` so the sc-9417 packed-detect seam fires on the real tier
         // weights with no dense staging; the single-bundle dense checkpoint keeps the legacy path below.
         if let Some(paths) = tier::TierPaths::detect(&self.root, self.gemma_override.as_deref()) {
-            return self.load_components_tier(&paths);
+            return self.load_components_tier(&paths, adapters);
         }
 
         let ltx_file = self.ltx_checkpoint()?;
@@ -160,7 +165,8 @@ impl Pipeline {
             .pp("language_model.model");
 
         let dit_vb = vb_bf16.pp("model.diffusion_model");
-        let avdit = AvDiT::new(dit_vb.clone(), &self.av_cfg)?;
+        let mut avdit = AvDiT::new(dit_vb.clone(), &self.av_cfg)?;
+        adapters::install_ltx_adapters(&mut avdit, adapters)?;
         let te = LtxTextEncoder::new_av(
             gemma_vb,
             vb_bf16.clone(),
@@ -199,7 +205,11 @@ impl Pipeline {
     /// audio-VAE + vocoder are a separate ingestion slice (channels-last, differently-prefixed) tracked
     /// as a follow-up — the audio latent stream still flows through the joint AvDiT, only its final
     /// VAE→vocoder decode is skipped.
-    fn load_components_tier(&self, paths: &tier::TierPaths) -> CResult<Components> {
+    fn load_components_tier(
+        &self,
+        paths: &tier::TierPaths,
+        adapters: &[AdapterSpec],
+    ) -> CResult<Components> {
         // Read + validate the tier's group_size (AC): errors loudly if a tier ever ships a group the
         // packed loaders don't repack at, rather than mis-aligning the MLX→GGML repack.
         let _group = paths.validate_group_size()?;
@@ -214,7 +224,8 @@ impl Pipeline {
         // projection sits at the connector-file root (also reached through that builder).
         let dit_root = dit_vb.pp("model.diffusion_model");
         let conn_root = conn_vb.pp("model.diffusion_model");
-        let avdit = AvDiT::new(dit_root.clone(), &self.av_cfg)?;
+        let mut avdit = AvDiT::new(dit_root.clone(), &self.av_cfg)?;
+        adapters::install_ltx_adapters(&mut avdit, adapters)?;
         let te = LtxTextEncoder::new_av(
             gemma_vb,
             conn_root.clone(),
@@ -352,6 +363,7 @@ pub struct LtxGenerator {
     /// Optional Gemma-encoder snapshot dir from `LoadSpec::text_encoder` (sc-8827); wins over the
     /// co-located `<root>/text_encoder` fallback in [`Pipeline::gemma_dir`] (sc-13749 — no env / cache).
     gemma_override: Option<PathBuf>,
+    adapters: Vec<AdapterSpec>,
     components: Mutex<Option<Components>>,
 }
 
@@ -360,7 +372,7 @@ impl LtxGenerator {
         // `cached` recovers a poisoned lock (sc-9015) internally; `?` bridges the candle-side
         // `load_components` error into `gen_core::Error`.
         Ok(candle_gen::cached(&self.components, || {
-            pipe.load_components()
+            pipe.load_components(&self.adapters)
         })?)
     }
 }
@@ -443,7 +455,8 @@ impl Generator for LtxGenerator {
 /// guidance is distilled in). The denoise step count is FIXED at [`NATIVE_STEPS`] (the baked
 /// `STAGE1_SIGMAS` schedule); an explicit non-native `req.steps` is rejected in `validate` rather than
 /// silently ignored (sc-9027 / F-043). Synchronized audio is produced (sc-5495, the joint video+audio
-/// streams); I2V / upsampler / LoRA / quant remain deferred.
+/// streams); I2V / upsampler / IC-LoRA / quant remain deferred. Plain video-attention LoRA is
+/// supported through the shared additive adapter core.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
         required_components: &[],
@@ -456,7 +469,7 @@ pub fn descriptor() -> ModelDescriptor {
             supports_guidance: false,
             supports_true_cfg: false,
             conditioning: vec![],
-            supports_lora: false,
+            supports_lora: true,
             supports_lokr: false,
             // Unified curated SAMPLER menu (epic 7114 P4, sc-7125) over the joint video+audio streams +
             // the legacy `rectified-flow` alias (falls back to euler). Per decision 3b: sampler-only, NO
@@ -640,7 +653,8 @@ pub(crate) fn component_footprint(spec: &LoadSpec) -> gen_core::Result<PerCompon
 /// Construct a lazy candle LTX-2.3 generator. `spec.weights` is an LTX-2.3 snapshot dir (the
 /// `ltx-2.3-22b-distilled.safetensors` checkpoint); the Gemma encoder is provisioned by the caller via
 /// the `LoadSpec::text_encoder` slot (or co-located at `<root>/text_encoder`) — no env / HF-cache scan
-/// (sc-13749). Adapters / quantization / conditioning are rejected (not wired).
+/// (sc-13749). LoRA adapters apply to the canonical video attention surface; LoKr, on-the-fly
+/// quantization, and conditioning remain unsupported.
 pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     let root = match &spec.weights {
         WeightsSource::Dir(p) => p.clone(),
@@ -653,10 +667,15 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     // keys — its Gemma TE rides the typed `text_encoder` slot, and it has no uncensored/amoral enhancer
     // variant (the mlx-only `uncensored_enhancer`). Reject any component key up front as `Unsupported`.
     gen_core::reject_unknown_components(spec, &[], MODEL_ID)?;
-    if !spec.adapters.is_empty() {
-        return Err(gen_core::Error::Unsupported(
-            "candle ltx does not support LoRA/LoKr yet".into(),
-        ));
+    if let Some(adapter) = spec
+        .adapters
+        .iter()
+        .find(|adapter| adapter.kind == AdapterKind::Lokr)
+    {
+        return Err(gen_core::Error::Unsupported(format!(
+            "candle ltx supports LoRA adapters but not LoKr; offending file: {}",
+            adapter.path.display()
+        )));
     }
     if spec.quantize.is_some() {
         return Err(gen_core::Error::Unsupported(
@@ -679,6 +698,7 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         root,
         device,
         gemma_override,
+        adapters: spec.adapters.clone(),
         components: Mutex::new(None),
     }))
 }
@@ -688,11 +708,13 @@ candle_gen::register_generators! {
     footprint = component_footprint
 }
 
-/// Add the Candle LTX generator to an explicit media registry builder.
+/// Add the Candle LTX generator and trainer to an explicit media registry builder.
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    registry.register_generator(REGISTRATION)
+    registry
+        .register_generator(REGISTRATION)
+        .register_trainer(training::TRAINER_REGISTRATION)
 }
 
 /// Build the complete explicit Candle LTX provider catalog.
@@ -705,12 +727,17 @@ mod explicit_registry_tests {
     #[test]
     fn explicit_catalog_has_stable_surface() {
         let registry = super::provider_registry().unwrap();
-        let explicit: Vec<String> = registry
+        let generators: Vec<String> = registry
             .generators()
             .map(|registration| (registration.descriptor)().id.to_string())
             .collect();
+        let trainers: Vec<String> = registry
+            .trainers()
+            .map(|registration| (registration.descriptor)().id.to_string())
+            .collect();
 
-        assert_eq!(explicit, ["ltx_2_3_distilled"]);
+        assert_eq!(generators, ["ltx_2_3_distilled"]);
+        assert_eq!(trainers, ["ltx_2_3"]);
     }
 }
 
@@ -812,6 +839,34 @@ mod tests {
         ));
         let ok = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
         assert!(crate::load(&ok).is_ok());
+    }
+
+    #[test]
+    fn descriptor_and_load_advertise_lora_but_reject_lokr() {
+        assert!(descriptor().capabilities.supports_lora);
+        assert!(!descriptor().capabilities.supports_lokr);
+
+        let lora = LoadSpec::new(WeightsSource::Dir("/nonexistent".into())).with_adapters(vec![
+            AdapterSpec::new(
+                PathBuf::from("/nonexistent/adapter.safetensors"),
+                1.0,
+                AdapterKind::Lora,
+            ),
+        ]);
+        assert!(
+            crate::load(&lora).is_ok(),
+            "LTX load is lazy and must accept a LoRA spec"
+        );
+
+        let lokr = LoadSpec::new(WeightsSource::Dir("/nonexistent".into())).with_adapters(vec![
+            AdapterSpec::new(
+                PathBuf::from("/nonexistent/adapter.safetensors"),
+                1.0,
+                AdapterKind::Lokr,
+            ),
+        ]);
+        let err = crate::load(&lokr).err().expect("LoKr must be rejected");
+        assert!(err.to_string().contains("LoKr"), "{err}");
     }
 
     #[test]

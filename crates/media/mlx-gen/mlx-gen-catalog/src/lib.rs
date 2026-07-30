@@ -26,6 +26,7 @@ pub mod providers {
     pub use mlx_gen_joycaption as joycaption;
     pub use mlx_gen_kolors as kolors;
     pub use mlx_gen_krea as krea;
+    pub use mlx_gen_krea_realtime as krea_realtime;
     pub use mlx_gen_lens as lens;
     pub use mlx_gen_ltx as ltx;
     pub use mlx_gen_mage as mage;
@@ -71,6 +72,7 @@ pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistry
     let registry = mlx_gen_joycaption::register_providers(registry);
     let registry = mlx_gen_kolors::register_providers(registry);
     let registry = mlx_gen_krea::register_providers(registry);
+    let registry = mlx_gen_krea_realtime::register_providers(registry);
     let registry = mlx_gen_lens::register_providers(registry);
     let registry = mlx_gen_ltx::register_providers(registry);
     let registry = mlx_gen_mage::register_providers(registry);
@@ -116,6 +118,58 @@ pub fn provider_registry() -> mlx_gen::gen_core::Result<ProviderRegistry> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cfg_capability_matrix_matches_the_registered_mlx_render_paths() {
+        let registry = super::provider_registry().unwrap();
+        let descriptor = |id: &str| {
+            registry
+                .generators()
+                .find_map(|registration| {
+                    let descriptor = (registration.descriptor)();
+                    (descriptor.id == id).then_some(descriptor)
+                })
+                .unwrap_or_else(|| panic!("{id} missing from MLX catalog"))
+        };
+
+        for id in [
+            "flux2_klein_9b",
+            "flux2_klein_9b_edit",
+            "flux2_klein_9b_kv_edit",
+        ] {
+            let capabilities = descriptor(id).capabilities;
+            assert!(capabilities.supports_guidance, "{id}");
+            assert!(capabilities.supports_negative_prompt, "{id}");
+            assert!(!capabilities.supports_true_cfg, "{id}");
+        }
+        for id in ["sd3_5_large", "sd3_5_medium"] {
+            let capabilities = descriptor(id).capabilities;
+            assert!(capabilities.supports_guidance, "{id}");
+            assert!(capabilities.supports_negative_prompt, "{id}");
+            assert!(
+                !capabilities.supports_true_cfg,
+                "{id} does not consume request.true_cfg"
+            );
+        }
+        let turbo = descriptor("sd3_5_large_turbo").capabilities;
+        assert!(!turbo.supports_guidance);
+        assert!(!turbo.supports_negative_prompt);
+        assert!(!turbo.supports_true_cfg);
+
+        for id in ["sensenova_u1_8b", "sensenova_u1_8b_fast"] {
+            let capabilities = descriptor(id).capabilities;
+            assert!(capabilities.supports_guidance, "{id}");
+            assert!(!capabilities.supports_negative_prompt, "{id}");
+            assert!(
+                capabilities.supports_true_cfg,
+                "{id} consumes request.true_cfg as reference-image guidance"
+            );
+            assert!(
+                !capabilities.conditioning.is_empty(),
+                "{id} must retain its reference-conditioned it2i surface"
+            );
+        }
+    }
+
     #[test]
     fn complete_catalog_has_stable_conforming_surface() {
         let registry = super::provider_registry().unwrap();
@@ -182,10 +236,16 @@ mod tests {
                 "krea_2_edit",
                 "krea_2_turbo_edit",
                 "krea_2_turbo_control",
+                "krea_realtime_14b",
                 "lens_turbo",
                 "lens",
                 "ltx_2_3",
                 "mage_flow",
+                "mage_flow_base",
+                "mage_flow_turbo",
+                "mage_flow_edit",
+                "mage_flow_edit_base",
+                "mage_flow_edit_turbo",
                 "mochi_1",
                 "pulid_flux",
                 "qwen_image",
@@ -225,6 +285,7 @@ mod tests {
                 "krea_2_raw",
                 "lens",
                 "ltx_2_3",
+                "mage_flow_base",
                 "sd3_5_large",
                 "sd3_5_medium",
                 "sdxl",
@@ -254,7 +315,8 @@ mod tests {
             .map(|r| (r.descriptor)().id.to_string())
             .collect();
         assert!(shipped.contains(&"mage_flow".to_string()));
-        assert!(!shipped.contains(&"mage_flow_base".to_string()));
+        assert!(shipped.contains(&"mage_flow_base".to_string()));
+        assert!(shipped.contains(&"mage_flow_turbo".to_string()));
     }
 
     /// Defense in depth for epic 11037 SC#5: the MLX platform **rejects** the NVFP4 tier instead of

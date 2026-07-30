@@ -214,6 +214,7 @@ dependencies = [
  "candle-audio-moss-tts",
  "candle-audio-moss-tts-realtime",
  "candle-audio-openvoice",
+ "candle-audio-stable-audio-3",
  "candle-audio-whisper",
  "candle-llm",
 ]
@@ -343,6 +344,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "candle-audio-stable-audio-3"
+version = "0.0.0"
+dependencies = [
+ "candle-audio",
+ "candle-nn",
+ "core-llm",
+ "rand",
+ "rand_distr",
+ "safetensors 0.4.5",
+ "sceneworks-gen-core-testkit",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokenizers 0.22.2",
+]
+
+[[package]]
 name = "candle-audio-whisper"
 version = "0.0.0"
 dependencies = [
@@ -410,6 +428,7 @@ dependencies = [
  "safetensors 0.7.0",
  "sceneworks-gen-core",
  "serde_json",
+ "sha2",
  "thiserror 2.0.18",
 ]
 
@@ -472,6 +491,7 @@ dependencies = [
  "candle-gen-krea",
  "candle-gen-lens",
  "candle-gen-ltx",
+ "candle-gen-mage",
  "candle-gen-mochi",
  "candle-gen-pid",
  "candle-gen-pulid",
@@ -632,6 +652,7 @@ dependencies = [
  "rand",
  "rand_distr",
  "safetensors 0.7.0",
+ "sceneworks-gen-core-testkit",
  "serde_json",
 ]
 
@@ -660,6 +681,23 @@ dependencies = [
  "rand_distr",
  "sceneworks-gen-core-testkit",
  "serde_json",
+ "tokenizers 0.22.2",
+]
+
+[[package]]
+name = "candle-gen-mage"
+version = "0.0.0"
+dependencies = [
+ "candle-core",
+ "candle-gen",
+ "candle-gen-boogu",
+ "candle-nn",
+ "candle-transformers",
+ "image",
+ "rand",
+ "sceneworks-gen-core",
+ "serde_json",
+ "sha2",
  "tokenizers 0.22.2",
 ]
 
@@ -2100,6 +2138,7 @@ dependencies = [
  "mlx-gen-joycaption",
  "mlx-gen-kolors",
  "mlx-gen-krea",
+ "mlx-gen-krea-realtime",
  "mlx-gen-lens",
  "mlx-gen-ltx",
  "mlx-gen-mage",
@@ -2253,6 +2292,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "mlx-gen-krea-realtime"
+version = "0.0.0"
+dependencies = [
+ "mlx-gen",
+ "mlx-gen-wan",
+ "pmetal-mlx-rs",
+ "serde_json",
+]
+
+[[package]]
 name = "mlx-gen-lens"
 version = "0.0.0"
 dependencies = [
@@ -2278,7 +2327,9 @@ dependencies = [
 name = "mlx-gen-mage"
 version = "0.0.0"
 dependencies = [
+ "image",
  "mlx-gen",
+ "mlx-gen-boogu",
  "pmetal-mlx-rs",
  "serde_json",
  "sha2",

@@ -90,27 +90,6 @@ pub fn to_mono(samples: &[f32], channels: u16) -> Vec<f32> {
         .collect()
 }
 
-/// Linear-interpolation resample to the target rate (no-op when already at `dst`). The audio lane's
-/// standard host-side resample idiom.
-pub fn resample(samples: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32> {
-    if src_rate == dst_rate || samples.is_empty() {
-        return samples.to_vec();
-    }
-    let ratio = dst_rate as f64 / src_rate as f64;
-    let out_len = ((samples.len() as f64) * ratio).round().max(1.0) as usize;
-    let last = samples.len() - 1;
-    (0..out_len)
-        .map(|i| {
-            let src_pos = i as f64 / ratio;
-            let left = src_pos.floor() as usize;
-            let frac = (src_pos - left as f64) as f32;
-            let a = samples[left.min(last)];
-            let b = samples[(left + 1).min(last)];
-            a + (b - a) * frac
-        })
-        .collect()
-}
-
 /// Fit a mono waveform to exactly `target` samples: **repeat-pad** if short (CLAP's `padding=
 /// "repeatpad"` — tile the clip to fill, matching how the feature extractor handles sub-10 s audio),
 /// **center-crop** if long (the deterministic analogue of `rand_trunc`, so the same clip always
@@ -145,7 +124,7 @@ pub fn log_mel(
     filterbank: &[f32],
 ) -> Result<Vec<f32>> {
     let mono = to_mono(samples, channels);
-    let resampled = resample(&mono, sample_rate, config::SAMPLE_RATE);
+    let resampled = candle_audio::dsp::resample(&mono, sample_rate, config::SAMPLE_RATE, 1)?;
     let fitted = fit_to_length(&resampled, config::TARGET_SAMPLES);
 
     let window = hann_window(config::N_FFT);

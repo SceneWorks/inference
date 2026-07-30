@@ -10,6 +10,7 @@ pub mod attention;
 pub mod encoder;
 pub mod layer;
 pub mod mlp;
+pub(crate) mod stream;
 
 pub use attention::TextAttention;
 pub use encoder::{TextEncoder, ZTextEncoderConfig};

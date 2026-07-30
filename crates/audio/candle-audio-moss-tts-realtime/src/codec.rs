@@ -885,28 +885,6 @@ impl EncoderHalf {
     }
 }
 
-/// Minimal linear-interpolation resample to the codec's native rate. Reference-audio preprocessing is
-/// provider-owned (candle-audio's `wav` module notes the input path resamples here, not in the codec);
-/// exact-rate inputs bypass it. A higher-fidelity resampler can be swapped in without touching callers.
-fn resample_linear(samples: &[f32], from: u32, to: u32) -> Vec<f32> {
-    if from == to || samples.is_empty() {
-        return samples.to_vec();
-    }
-    let ratio = to as f64 / from as f64;
-    let out_len = ((samples.len() as f64) * ratio).round().max(1.0) as usize;
-    let last = samples.len() - 1;
-    (0..out_len)
-        .map(|i| {
-            let src = i as f64 / ratio;
-            let j = src.floor() as usize;
-            let frac = (src - j as f64) as f32;
-            let a = samples[j.min(last)];
-            let b = samples[(j + 1).min(last)];
-            a + (b - a) * frac
-        })
-        .collect()
-}
-
 // --------------------------------------------------------------------------------------------
 // The assembled decoder
 // --------------------------------------------------------------------------------------------
@@ -1124,7 +1102,8 @@ impl MossAudioCodec {
         if samples.is_empty() {
             return Ok(Vec::new());
         }
-        let wav = resample_linear(samples, sample_rate, self.config.sample_rate);
+        let wav = candle_audio::dsp::resample(samples, sample_rate, self.config.sample_rate, 1)
+            .map_err(|error| candle_audio::candle_core::Error::Msg(error.to_string()))?;
         let dr = self.config.downsample_rate;
         let valid_frames = wav.len() / dr; // ⌊T / downsample_rate⌋ — the reference valid length
         if valid_frames == 0 {
@@ -1345,31 +1324,6 @@ mod tests {
         assert!((n[0][0] - 0.6).abs() < 1e-5 && (n[0][1] - 0.8).abs() < 1e-5);
         assert!(n[1].iter().all(|v| v.is_finite()) && n[1] == vec![0.0, 0.0]);
         assert!((n[2][0] - 1.0).abs() < 1e-5 && n[2][1].abs() < 1e-5);
-    }
-
-    #[test]
-    fn resample_linear_identity_ratio_and_edges() {
-        let x = vec![0.0f32, 1.0, 2.0, 3.0];
-        assert_eq!(
-            resample_linear(&x, 24_000, 24_000),
-            x,
-            "identity at native rate"
-        );
-        assert_eq!(resample_linear(&x, 24_000, 48_000).len(), 8, "2× upsample");
-        assert_eq!(
-            resample_linear(&x, 48_000, 24_000).len(),
-            2,
-            "2× downsample"
-        );
-        assert!(
-            resample_linear(&[], 48_000, 24_000).is_empty(),
-            "empty stays empty"
-        );
-        assert_eq!(
-            resample_linear(&[5.0], 48_000, 24_000),
-            vec![5.0],
-            "single sample never panics"
-        );
     }
 
     #[test]

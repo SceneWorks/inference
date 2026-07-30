@@ -48,6 +48,10 @@ pub fn load_text_encoder(root: impl AsRef<Path>) -> Result<KreaTextEncoder> {
 /// subtree to f32 before building — mirroring boogu's `load_vision_tower` — and feeds the shared
 /// [`mlx_gen_boogu::VisionTower`] the Krea-4B [`krea_vision_config`]. Krea keys are `visual.*` (diffusers
 /// naming), unlike boogu's `model.visual.*`.
+///
+/// Krea's converter leaves `visual.*` **dense** (`quantize_map`'s TE predicate covers the language
+/// model only), so the group size passed here never selects a packed branch today — it is passed
+/// explicitly because the shared tower must not assume any one crate's constant (sc-15154).
 pub fn load_vision_tower(root: impl AsRef<Path>) -> Result<VisionTower> {
     let root = root.as_ref();
     let mut w = Weights::from_dir(root.join("text_encoder"))?;
@@ -60,7 +64,12 @@ pub fn load_vision_tower(root: impl AsRef<Path>) -> Result<VisionTower> {
         let t = w.require(&k)?.as_dtype(mlx_rs::Dtype::Float32)?;
         w.insert(k, t);
     }
-    VisionTower::from_weights(&w, krea_vision_config(), "visual")
+    VisionTower::from_weights(
+        &w,
+        krea_vision_config(),
+        "visual",
+        crate::convert::QUANT_GROUP_SIZE,
+    )
 }
 
 /// Load the single-stream DiT from a snapshot's `transformer/` dir: parse + validate the config, load

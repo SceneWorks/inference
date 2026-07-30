@@ -12,6 +12,11 @@
 use candle_gen::candle_core::{DType, Result, Tensor, D};
 use candle_gen::candle_nn::ops::softmax_last_dim;
 use candle_gen::candle_nn::{linear, Linear, Module, VarBuilder};
+use candle_gen::gen_core::tiling::{
+    TemporalOverlapPolicy, TileCandidates, TilingConfig, VaeTiling,
+};
+use candle_gen::gen_core::{CancelFlag, Progress};
+use candle_gen::{check_cancel, vae_tiling, Result as CResult};
 
 use crate::config::VaeConfig;
 use crate::conv3d::TemporalConv3d;
@@ -21,6 +26,88 @@ const GN_GROUPS: usize = 32;
 const EPS_SPATIAL: f64 = 1e-6;
 /// Temporal `TemporalResnetBlock` GroupNorm epsilon (the `SpatioTemporalResBlock` `temporal_eps`).
 const EPS_TEMPORAL: f64 = 1e-5;
+
+/// SVD's temporal VAE keeps the input frame count and upsamples spatially by 8. The penultimate up
+/// block materializes its 256-channel input after nearest-neighbor expansion and before the reducing
+/// convolution, so 256 is the conservative full-output-resolution write width.
+const SVD_VAE_TILING: VaeTiling = VaeTiling {
+    spatial_scale: 8,
+    temporal_scale: 1,
+    causal_temporal: false,
+    full_res_channels: 256,
+};
+
+const GIB_F64: f64 = 1024.0 * 1024.0 * 1024.0;
+const SVD_VAE_BUDGET_ENV: &str = "SVD_VAE_BUDGET_GIB";
+const SVD_VAE_BUDGET_SAFE_FRAC: f64 = 0.85;
+const SVD_VAE_DEFAULT_BUDGET_GIB: f64 = 16.0;
+/// Full-output blend buffers plus conservative decode/output temporaries, per output voxel.
+const SVD_VAE_ACCUM_BYTES_PER_VOXEL: f64 = 64.0;
+/// Conservative f32 temporal-decoder activation cost per output pixel and decoded frame.
+///
+/// This intentionally over-predicts the known 8-frame/chunk-1 32 GB control. It selects a 384 px
+/// tile for an 8-frame 1024×576 chunk with ~26 GiB available, while leaving chunk-1 decodes
+/// monolithic. Recalibrate from `CU_MEMPOOL_ATTR_USED_MEM_HIGH` whenever the decoder graph changes.
+const SVD_VAE_FRAME_BYTES_PER_OUT_PX: f64 = 18_000.0;
+const SVD_VAE_SPATIAL_PX: [i32; 7] = [768, 640, 512, 448, 384, 320, 256];
+const SVD_VAE_SPATIAL_OVERLAP_PX: i32 = 128;
+const SVD_VAE_TEMPORAL_FR: [(i32, i32); 0] = [];
+
+fn estimated_svd_decode_peak_gib(
+    out_f: i64,
+    out_h: i64,
+    out_w: i64,
+    tile_f: i64,
+    tile_h: i64,
+    tile_w: i64,
+) -> f64 {
+    let out_voxels = (out_f * out_h * out_w) as f64;
+    let tile_voxels = (tile_f * tile_h * tile_w) as f64;
+    (SVD_VAE_ACCUM_BYTES_PER_VOXEL * out_voxels + SVD_VAE_FRAME_BYTES_PER_OUT_PX * tile_voxels)
+        / GIB_F64
+}
+
+/// Resolve SVD decode headroom from the rendered GPU's live free VRAM, with an explicit override for
+/// hermetic tests and controlled hardware sweeps.
+pub fn svd_vae_safe_budget_gib() -> f64 {
+    vae_tiling::free_aware_safe_budget_gib(
+        SVD_VAE_BUDGET_ENV,
+        SVD_VAE_BUDGET_SAFE_FRAC,
+        SVD_VAE_DEFAULT_BUDGET_GIB,
+    )
+}
+
+fn plan_svd_tiling(
+    height: i32,
+    width: i32,
+    frames: i32,
+    safe_gib: f64,
+) -> Result<Option<TilingConfig>> {
+    vae_tiling::plan_tiling(
+        "svd temporal vae decode",
+        SVD_VAE_TILING,
+        height,
+        width,
+        frames,
+        safe_gib,
+        TileCandidates {
+            spatial_px: &SVD_VAE_SPATIAL_PX,
+            spatial_overlap_px: SVD_VAE_SPATIAL_OVERLAP_PX,
+            temporal: &SVD_VAE_TEMPORAL_FR,
+            temporal_overlap_policy: TemporalOverlapPolicy::HalfTile,
+        },
+        estimated_svd_decode_peak_gib,
+    )
+}
+
+/// Select the largest spatial SVD VAE tile that fits the rendered GPU's current free-VRAM budget.
+pub fn auto_tiling_budgeted_svd(
+    height: i32,
+    width: i32,
+    frames: i32,
+) -> Result<Option<TilingConfig>> {
+    plan_svd_tiling(height, width, frames, svd_vae_safe_budget_gib())
+}
 
 /// GroupNorm over the channel axis (dim 1) for an arbitrary-rank `[B, C, ...]` tensor — normalize per
 /// group over `(C/G)·spatial`, then affine. Hand-written (rather than `candle_nn::GroupNorm`) to pin
@@ -574,5 +661,165 @@ impl SvdVae {
     /// `[B·F, 3, H, W]`. Mirrors diffusers `vae.decode(z, num_frames)`.
     pub fn decode(&self, z: &Tensor, num_frames: usize) -> Result<Tensor> {
         self.decoder.forward(z, num_frames)
+    }
+
+    /// Decode one temporal chunk with a live-free-VRAM spatial plan. The shared Candle tiler owns the
+    /// overlap/stitch arithmetic; this adapter only maps SVD's `[F,C,H,W]` layout to its
+    /// `[B,C,F,H,W]` contract and keeps cancellation/progress responsive between spatial tiles.
+    pub fn decode_budgeted_with_progress(
+        &self,
+        z: &Tensor,
+        num_frames: usize,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> CResult<Tensor> {
+        let (f, c, h, w) = z.dims4()?;
+        if f != num_frames {
+            return Err(candle_gen::CandleError::Msg(format!(
+                "svd vae decode: latent frames {f} != requested chunk {num_frames}"
+            )));
+        }
+        let latent = z
+            .reshape((1, f, c, h, w))?
+            .permute((0, 2, 1, 3, 4))?
+            .contiguous()?;
+        let cfg = auto_tiling_budgeted_svd(
+            (h * SVD_VAE_TILING.spatial_scale as usize) as i32,
+            (w * SVD_VAE_TILING.spatial_scale as usize) as i32,
+            f as i32,
+        )?;
+
+        let mut decode_tile = |tile: &Tensor| -> CResult<Tensor> {
+            check_cancel(cancel)?;
+            on_progress(Progress::Decoding);
+            let (b, tc, tf, th, tw) = tile.dims5()?;
+            debug_assert_eq!(b, 1);
+            let flat = tile
+                .permute((0, 2, 1, 3, 4))?
+                .contiguous()?
+                .reshape((tf, tc, th, tw))?;
+            let decoded = self.decoder.forward(&flat, tf)?;
+            let (_, oc, oh, ow) = decoded.dims4()?;
+            Ok(decoded
+                .reshape((1, tf, oc, oh, ow))?
+                .permute((0, 2, 1, 3, 4))?
+                .contiguous()?)
+        };
+
+        let decoded = match cfg {
+            Some(cfg) => vae_tiling::decode_tiled(
+                SVD_VAE_TILING,
+                "svd temporal vae",
+                &latent,
+                &cfg,
+                &mut decode_tile,
+            )?,
+            None => decode_tile(&latent)?,
+        };
+        let (_, oc, _, oh, ow) = decoded.dims5()?;
+        Ok(decoded
+            .permute((0, 2, 1, 3, 4))?
+            .contiguous()?
+            .reshape((f, oc, oh, ow))?)
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+    use candle_gen::candle_core::Device;
+
+    #[test]
+    fn svd_plan_uses_chunk_frames_and_low_budget_selects_smaller_tiles() {
+        let ample = plan_svd_tiling(576, 1024, 8, 1_000.0).unwrap();
+        assert!(
+            ample.is_none(),
+            "ample live-free budget should stay monolithic"
+        );
+
+        let mid = plan_svd_tiling(576, 1024, 8, 24.0)
+            .unwrap()
+            .expect("32 GB-class budget should tile");
+        let low = plan_svd_tiling(576, 1024, 8, 10.0)
+            .unwrap()
+            .expect("low but viable budget should select the floor tile");
+        assert!(
+            low.spatial.unwrap().tile_px < mid.spatial.unwrap().tile_px,
+            "less live free VRAM must select a smaller tile"
+        );
+        assert!(
+            plan_svd_tiling(576, 1024, 8, 1.0).is_err(),
+            "impossible budgets must fail before an allocator OOM"
+        );
+    }
+
+    #[test]
+    fn svd_overlap_stitch_reconstructs_a_constant_field() {
+        let dev = Device::Cpu;
+        let latent = Tensor::full(0.25f32, (1, 4, 2, 16, 16), &dev).unwrap();
+        let cfg = TilingConfig::spatial_only(64, 32);
+        let out = vae_tiling::decode_tiled(
+            SVD_VAE_TILING,
+            "svd stitch test",
+            &latent,
+            &cfg,
+            |tile| -> Result<Tensor> {
+                let (b, _, f, h, w) = tile.dims5()?;
+                Tensor::full(0.25f32, (b, 3, f, h * 8, w * 8), tile.device())
+            },
+        )
+        .unwrap();
+        assert_eq!(out.dims(), &[1, 3, 2, 128, 128]);
+        let values = out.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert!(
+            values.iter().all(|v| (*v - 0.25).abs() < 1e-5),
+            "overlap weights must form a seam-free partition of unity"
+        );
+    }
+
+    #[test]
+    fn svd_overlap_stitch_preserves_position_dependent_spatial_content() {
+        let dev = Device::Cpu;
+        let mut values = Vec::with_capacity(4 * 2 * 16 * 16);
+        for c in 0..4 {
+            for f in 0..2 {
+                for y in 0..16 {
+                    for x in 0..16 {
+                        values.push((c * 10_000 + f * 1_000 + y * 16 + x) as f32);
+                    }
+                }
+            }
+        }
+        let latent = Tensor::from_vec(values, (1, 4, 2, 16, 16), &dev).unwrap();
+        let decode_nearest = |tile: &Tensor| -> Result<Tensor> {
+            let (b, c, f, h, w) = tile.dims5()?;
+            tile.permute((0, 2, 1, 3, 4))?
+                .contiguous()?
+                .reshape((b * f, c, h, w))?
+                .upsample_nearest2d(h * 8, w * 8)?
+                .reshape((b, f, c, h * 8, w * 8))?
+                .permute((0, 2, 1, 3, 4))
+        };
+        let expected = decode_nearest(&latent).unwrap();
+        let actual = vae_tiling::decode_tiled(
+            SVD_VAE_TILING,
+            "svd position-dependent stitch test",
+            &latent,
+            &TilingConfig::spatial_only(64, 32),
+            decode_nearest,
+        )
+        .unwrap();
+        let max_diff = (&actual - &expected)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(
+            max_diff < 1e-2,
+            "tile offsets/order/overlap must preserve spatially varying content; max diff {max_diff}"
+        );
     }
 }

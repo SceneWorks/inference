@@ -108,6 +108,229 @@ environment = ["KOKORO_SNAPSHOT"]
 expected_files = ["config.json", "kokoro-v1_0.pth", "voices/af_heart.pt"]
 
 [[models]]
+# Standalone 108M SAME-S autoencoder used by the Stable Audio 3 outer-chunking parity and
+# long-duration resource gates.
+key = "same-s"
+repository = "stabilityai/SAME-S"
+revision = "fbeb3dcf53a326e5682f38e22e7f740202d44232"
+license = "Stability AI Community License"
+size_class = "large"
+profiles = ["audio-macos"]
+environment = ["SA3_SAME_S_SNAPSHOT"]
+expected_files = [
+    "model_config.json",
+    "model.safetensors",
+    "LICENSE.md",
+    "LICENSE_GEMMA.md",
+    "NOTICE",
+]
+
+[[models]]
+# Standalone 852M SAME-L autoencoder used by the Stable Audio 3 sliding-window parity and
+# maximum-duration resource gates. This repository is ungated; the full SA3 checkpoints remain
+# caller-provisioned because they carry a separate click-through license.
+key = "same-l"
+repository = "stabilityai/SAME-L"
+revision = "41acf79dd242877d6499a1108ca5dba5d5eecfc5"
+license = "Stability AI Community License"
+size_class = "very-large"
+profiles = ["audio-macos", "audio-cuda"]
+environment = ["SA3_SAME_L_SNAPSHOT"]
+expected_files = [
+    "model_config.json",
+    "model.safetensors",
+    "LICENSE.md",
+    "LICENSE_GEMMA.md",
+    "NOTICE",
+]
+
+[[models]]
+# Exact registered Stable Audio 3 small-music graph: DiT, SAME-S, learned padding, and the bundled
+# encoder-only T5Gemma text stack. Used for 30-second CPU/Metal/CUDA provider execution.
+key = "stable-audio-3-small-music"
+repository = "stabilityai/stable-audio-3-small-music"
+revision = "0fef1392cd842149a2b6d445e181c97608faac06"
+requires_auth = true
+license = "Stability AI Community License"
+size_class = "very-large"
+profiles = ["audio-macos", "audio-cuda"]
+environment = ["SA3_SMALL_MUSIC_SNAPSHOT"]
+expected_files = [
+    "model_config.json",
+    "model.safetensors",
+    "t5gemma-b-b-ul2/config.json",
+    "t5gemma-b-b-ul2/model.safetensors",
+    "t5gemma-b-b-ul2/tokenizer.json",
+    "t5gemma-b-b-ul2/tokenizer.model",
+    "LICENSE.md",
+    "LICENSE_GEMMA.md",
+    "NOTICE",
+]
+
+[[models]]
+# Exact registered Stable Audio 3 small-sfx graph. Architecturally identical to small-music; only
+# the trained DiT/conditioner weights differ, which is exactly why the music-vs-SFX divergence gate
+# needs both snapshots materialized on the same runner.
+key = "stable-audio-3-small-sfx"
+repository = "stabilityai/stable-audio-3-small-sfx"
+revision = "ae12755283df9d62ca39a9b050a39a0b607b8c20"
+requires_auth = true
+license = "Stability AI Community License"
+size_class = "very-large"
+profiles = ["audio-macos", "audio-cuda"]
+environment = ["SA3_SMALL_SFX_SNAPSHOT"]
+expected_files = [
+    "model_config.json",
+    "model.safetensors",
+    "t5gemma-b-b-ul2/config.json",
+    "t5gemma-b-b-ul2/model.safetensors",
+    "t5gemma-b-b-ul2/tokenizer.json",
+    "t5gemma-b-b-ul2/tokenizer.model",
+    "LICENSE.md",
+    "LICENSE_GEMMA.md",
+    "NOTICE",
+]
+
+[[models]]
+# Exact registered Stable Audio 3 small-music-base graph (`stable_audio_3_small_music_base`,
+# sc-14546): the pre-trained flow-matching checkpoint behind `stable-audio-3-small-music`. Same
+# 433M 1024x20 DiT and same SAME-S autoencoder; `diffusion_objective` is `rectified_flow` and
+# `sample_size` is 5,324,800 rather than 5,292,032, which is what separates it from its post-trained
+# sibling in both directions.
+#
+# The `download_files` allow-list excludes `svd_bases.pt` (1.27 GB of training pickles). No shipped
+# config references it and `SnapshotLayout::from_dir` never scans the snapshot directory, so it is
+# unreachable from the loader.
+key = "stable-audio-3-small-music-base"
+repository = "stabilityai/stable-audio-3-small-music-base"
+revision = "eab5ceee5ad9c1ed38800aff30a8e49d1161c539"
+requires_auth = true
+license = "Stability AI Community License"
+size_class = "very-large"
+profiles = ["audio-macos", "audio-cuda"]
+environment = ["SA3_SMALL_MUSIC_BASE_SNAPSHOT"]
+expected_files = [
+    "model_config.json",
+    "model.safetensors",
+    "t5gemma-b-b-ul2/config.json",
+    "t5gemma-b-b-ul2/model.safetensors",
+    "t5gemma-b-b-ul2/tokenizer.json",
+    "t5gemma-b-b-ul2/tokenizer.model",
+    "LICENSE.md",
+    "LICENSE_GEMMA.md",
+    "NOTICE",
+]
+download_files = [
+    "model_config.json",
+    "model.safetensors",
+    "t5gemma-b-b-ul2/*",
+    "LICENSE.md",
+    "LICENSE_GEMMA.md",
+    "NOTICE",
+]
+
+[[models]]
+# Exact registered Stable Audio 3 small-sfx-base graph (`stable_audio_3_small_sfx_base`,
+# sc-14546). Architecturally identical to small-music-base; only the trained DiT/conditioner weights
+# and the declared conditioner `repo_id` differ, which is why the base identity gates need both
+# snapshots materialized on the same runner. Same `svd_bases.pt` exclusion.
+key = "stable-audio-3-small-sfx-base"
+repository = "stabilityai/stable-audio-3-small-sfx-base"
+revision = "cc5ddb990e30daa68336ac61c140c37c7033ab7c"
+requires_auth = true
+license = "Stability AI Community License"
+size_class = "very-large"
+profiles = ["audio-macos", "audio-cuda"]
+environment = ["SA3_SMALL_SFX_BASE_SNAPSHOT"]
+expected_files = [
+    "model_config.json",
+    "model.safetensors",
+    "t5gemma-b-b-ul2/config.json",
+    "t5gemma-b-b-ul2/model.safetensors",
+    "t5gemma-b-b-ul2/tokenizer.json",
+    "t5gemma-b-b-ul2/tokenizer.model",
+    "LICENSE.md",
+    "LICENSE_GEMMA.md",
+    "NOTICE",
+]
+download_files = [
+    "model_config.json",
+    "model.safetensors",
+    "t5gemma-b-b-ul2/*",
+    "LICENSE.md",
+    "LICENSE_GEMMA.md",
+    "NOTICE",
+]
+
+[[models]]
+# The exact registered Stable Audio 3 medium-base graph (`stable_audio_3_medium_base`, sc-14546):
+# the pre-trained flow-matching 1.45B DiT, before distillation and adversarial post-training. Also
+# the other half of the medium identity gate — it is the only snapshot that matches the post-trained
+# medium on tensor inventory, sample_size, root byte length AND conditioner repo_id, so
+# `diffusion_objective` plus the SHA-256 pin are the whole discriminator in both directions.
+#
+# `requires_auth` stays true even though this repository is ungated: the runner's credential is
+# harmless when unused, and flipping it would be a second change to verify for no benefit.
+#
+# The `download_files` allow-list is what stops CI pulling `svd_bases.pt` — 3.84 GB of training
+# pickles no inference component reads. `SnapshotLayout::from_dir` names every file it opens and
+# never scans the directory, so the artifact is unreachable from the loader (asserted in
+# `weights.rs`). Before sc-14546 this entry had no allow-list and downloaded it on every run.
+key = "stable-audio-3-medium-base"
+repository = "stabilityai/stable-audio-3-medium-base"
+revision = "b32993f73c3bdc3864043a72d8032606bba737c8"
+requires_auth = true
+license = "Stability AI Community License"
+size_class = "very-large"
+profiles = ["audio-macos", "audio-cuda"]
+environment = ["SA3_MEDIUM_BASE_SNAPSHOT"]
+expected_files = [
+    "model_config.json",
+    "model.safetensors",
+    "t5gemma-b-b-ul2/config.json",
+    "t5gemma-b-b-ul2/model.safetensors",
+    "t5gemma-b-b-ul2/tokenizer.json",
+    "t5gemma-b-b-ul2/tokenizer.model",
+    "LICENSE.md",
+    "LICENSE_GEMMA.md",
+    "NOTICE",
+]
+download_files = [
+    "model_config.json",
+    "model.safetensors",
+    "t5gemma-b-b-ul2/*",
+    "LICENSE.md",
+    "LICENSE_GEMMA.md",
+    "NOTICE",
+]
+
+[[models]]
+# Exact registered Stable Audio 3 medium graph: the 1.45B differential DiT, the embedded 852M
+# SAME-L autoencoder, and the same bundled encoder-only T5Gemma text stack the smalls carry. This is
+# the only checkpoint that exercises the differential-attention DiT and the embedded (rather than
+# standalone) SAME-L through a registered provider, and the only one whose 380-second ceiling
+# reaches a 43-chunk decode plan.
+key = "stable-audio-3-medium"
+repository = "stabilityai/stable-audio-3-medium"
+revision = "27b5a21b791b1b033d193a9e1e3ce78493f102f9"
+requires_auth = true
+license = "Stability AI Community License"
+size_class = "very-large"
+profiles = ["audio-macos", "audio-cuda"]
+environment = ["SA3_MEDIUM_SNAPSHOT"]
+expected_files = [
+    "model_config.json",
+    "model.safetensors",
+    "t5gemma-b-b-ul2/config.json",
+    "t5gemma-b-b-ul2/model.safetensors",
+    "t5gemma-b-b-ul2/tokenizer.json",
+    "t5gemma-b-b-ul2/tokenizer.model",
+    "LICENSE.md",
+    "LICENSE_GEMMA.md",
+    "NOTICE",
+]
+
+[[models]]
 key = "moss-soundeffect-v2"
 repository = "OpenMOSS-Team/MOSS-SoundEffect-v2.0"
 revision = "e35df4d82fbe87fcd5d14e5d100e349c0c3c076d"
@@ -578,6 +801,50 @@ expected_files = [
 ]
 
 [[models]]
+# Mage-Flow-Edit-Base 4B instruction-editing training target. The component geometry is identical
+# to Edit; the transformer weights and 30-step default are distinct.
+key = "mage-flow-edit-base"
+repository = "microsoft/Mage-Flow-Edit-Base"
+revision = "8654a7bc0283ab2946385230b5b2eb944e0b76ea"
+license = "MIT"
+size_class = "very-large"
+profiles = ["media-macos", "media-cuda"]
+environment = ["MAGE_EDIT_BASE_SNAPSHOT"]
+expected_files = [
+    "model_index.json",
+    "scheduler/scheduler_config.json",
+    "transformer/config.json",
+    "transformer/diffusion_pytorch_model.safetensors",
+    "vae/config.json",
+    "vae/diffusion_pytorch_model.safetensors",
+    "text_encoder/config.json",
+    "text_encoder/tokenizer.json",
+    "text_encoder/model.safetensors.index.json",
+]
+
+[[models]]
+# Mage-Flow-Edit-Turbo 4B distilled instruction editor. Full checkpoint, not a LoRA; four steps
+# with CFG disabled.
+key = "mage-flow-edit-turbo"
+repository = "microsoft/Mage-Flow-Edit-Turbo"
+revision = "14427bd7627d3a25436497a5939e1096f6a0d523"
+license = "MIT"
+size_class = "very-large"
+profiles = ["media-macos", "media-cuda"]
+environment = ["MAGE_EDIT_TURBO_SNAPSHOT"]
+expected_files = [
+    "model_index.json",
+    "scheduler/scheduler_config.json",
+    "transformer/config.json",
+    "transformer/diffusion_pytorch_model.safetensors",
+    "vae/config.json",
+    "vae/diffusion_pytorch_model.safetensors",
+    "text_encoder/config.json",
+    "text_encoder/tokenizer.json",
+    "text_encoder/model.safetensors.index.json",
+]
+
+[[models]]
 # Mage-Flow-Edit 4B instruction editing (sc-14036 / epic 14034): the edit-variant repo the same
 # oracle runs for the `mage_flow_edit` golden — the transformer config is byte-identical to the
 # gen repo, so only the weights and the input-sequence assembly differ. Pinned at the current
@@ -601,3 +868,57 @@ expected_files = [
     "text_encoder/tokenizer.json",
     "text_encoder/model.safetensors.index.json",
 ]
+
+[[models]]
+# Krea Realtime 14B (epic 8431, sc-8446 S13): the SceneWorks MLX rehost of `krea/krea-realtime-video`
+# (Wan-2.1-T2V-14B weight-for-weight, distilled Self-Forcing autoregressive). The repo ships three
+# self-contained tiers; the real-weight lane runs **q4/** only — `download_files` fetches ~20 GB of the
+# repo's ~88 GB, and Q4 is the tier the Mac product path actually serves for this dense-video engine.
+# Each tier dir is a complete snapshot (`dit` + the stock Wan `t5_encoder`/`vae`/`tokenizer`), so
+# `KREA_REALTIME_SNAPSHOT_DIR` points one level in, at `<snapshot>/q4`.
+key = "krea-realtime-14b-mlx"
+repository = "SceneWorks/krea-realtime-14b-mlx"
+revision = "e68e9a3d98187fdf6936838ffcf6df5aa48d6626"
+license = "Apache-2.0"
+size_class = "very-large"
+profiles = ["media-macos"]
+environment = ["KREA_REALTIME_SNAPSHOT"]
+download_files = ["q4/*"]
+expected_files = [
+    "q4/config.json",
+    "q4/dit.safetensors",
+    "q4/t5_encoder.safetensors",
+    "q4/tokenizer.json",
+    "q4/vae.safetensors",
+]
+
+[[models]]
+# A published, canonical Wan-2.1-14B **style** LoRA (sc-8446 S13): 400 per-block attention + FFN stems,
+# no globals, no I2V image cross-attention — the class the Krea Realtime adapter surface must accept and
+# measurably render with. Small (~307 MB); only the LoRA file is fetched, not the sample videos.
+key = "wan-origami-style-lora"
+repository = "shauray/Origami_WanLora"
+revision = "698ea6952da38438a55112ab51fea0f5a53556bc"
+license = "Apache-2.0"
+size_class = "small"
+profiles = ["media-macos"]
+environment = ["KREA_STYLE_LORA_SNAPSHOT"]
+download_files = ["origami_000000500.safetensors"]
+expected_files = ["origami_000000500.safetensors"]
+
+[[models]]
+# A published Wan-2.1-T2V-14B **step-distill** LoRA (sc-8446 S13): the class that settled the
+# globals-surface decision. It carries low-rank factors for 6 of the 7 whole-model globals
+# (`patch_embedding` ships a `.diff_b` bias delta only), so a real install resolves 406 targets against
+# the 407-wide surface — on the pre-sc-8446 per-block-only surface `apply_adapters_strict` rejected the
+# whole file. This is the only real-weight regression gate on that decision. Only the one LoRA file is
+# fetched, not the ~200 other checkpoints in the repo.
+key = "wan-lightx2v-step-distill-lora"
+repository = "Kijai/WanVideo_comfy"
+revision = "8260d429d19fd7a72304cad059160b95d843913f"
+license = "Apache-2.0"
+size_class = "medium"
+profiles = ["media-macos"]
+environment = ["KREA_DISTILL_LORA_SNAPSHOT"]
+download_files = ["Lightx2v/lightx2v_T2V_14B_cfg_step_distill_v2_lora_rank64_bf16.safetensors"]
+expected_files = ["Lightx2v/lightx2v_T2V_14B_cfg_step_distill_v2_lora_rank64_bf16.safetensors"]

@@ -24,10 +24,12 @@ use mlx_rs::fast::layer_norm;
 use mlx_rs::ops::split;
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
 use mlx_gen::weights::Weights;
 use mlx_gen::{nn, Error, Result};
 
 use crate::config::NORM_EPS;
+use crate::quant::{floor_bits, FINAL_MOD_BASE};
 use crate::rope_embedder::PackContext;
 use crate::transformer::Linear;
 use crate::transformer_block::check_conditioning;
@@ -41,6 +43,22 @@ pub struct MageFinalLayer {
 }
 
 impl MageFinalLayer {
+    /// Pack both head projections, holding `norm_linear` at its 8-bit floor (sc-15071).
+    ///
+    /// A uniformly-Q4 head is what made the Q4 tier render a repeating tiled texture instead of the
+    /// prompt; [`crate::convert::quant_floor_bits`] documents the mechanism and the per-group
+    /// measurements, and is the same seam the offline converter calls, so a pre-quantized tier
+    /// stays byte-identical to load-time quantization.
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.norm_linear
+            .quantize(floor_bits(FINAL_MOD_BASE, bits))?;
+        self.proj_out.quantize(bits)
+    }
+
+    pub(crate) fn quantized_linear_count(&self) -> usize {
+        usize::from(self.norm_linear.is_quantized()) + usize::from(self.proj_out.is_quantized())
+    }
+
     /// Load from `norm_out.linear.{weight,bias}` and `proj_out.{weight,bias}`. The LayerNorm inside
     /// `norm_out` is `elementwise_affine=False`, so it contributes no tensors.
     pub fn from_weights(w: &Weights, norm_prefix: &str, proj_prefix: &str) -> Result<Self> {
@@ -89,6 +107,28 @@ impl MageFinalLayer {
         let normed = layer_norm(img, None, None, self.eps)?;
         let modulated = nn::modulate(&normed, &scale, &shift, true)?;
         self.proj_out.forward(&modulated)
+    }
+}
+
+/// LoRA/LoKr targets on the output head (sc-14057).
+///
+/// Unlike every other sub-host in this crate, the paths here are **absolute** (rooted at the
+/// transformer), not relative: the head owns two *sibling* checkpoint roots — `norm_out.linear`
+/// (the `AdaLayerNormContinuous` projection) and `proj_out` — so there is no single prefix a parent
+/// could delegate under. [`MageTransformer`](crate::transformer::MageTransformer) therefore matches
+/// on `["norm_out", ..] | ["proj_out", ..]` and forwards the *whole* path, and splices this list in
+/// unprefixed. A PEFT `target_modules="all-linear"` community adapter trains both.
+impl AdaptableHost for MageFinalLayer {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["norm_out", "linear"] => Some(self.norm_linear.adaptable_mut()),
+            ["proj_out"] => Some(self.proj_out.adaptable_mut()),
+            _ => None,
+        }
+    }
+
+    fn adaptable_paths(&self) -> Vec<String> {
+        vec!["norm_out.linear".to_string(), "proj_out".to_string()]
     }
 }
 
@@ -144,5 +184,34 @@ mod tests {
                 got[i]
             );
         }
+    }
+
+    /// sc-14057: both head projections are adapter targets, addressed by their **absolute**
+    /// checkpoint paths. `norm_out` alone (the weightless non-affine LayerNorm) is not a target,
+    /// and the head must not answer for a path it does not own.
+    #[test]
+    fn the_head_projections_are_routable_adapter_targets() {
+        let mut w = Weights::empty();
+        for (prefix, out, inp) in [("n.linear", 4, 2), ("p", 2, 2)] {
+            w.insert(
+                format!("{prefix}.weight"),
+                Array::from_slice(&vec![0.0f32; out * inp], &[out as i32, inp as i32]),
+            );
+            w.insert(
+                format!("{prefix}.bias"),
+                Array::from_slice(&vec![0.0f32; out], &[out as i32]),
+            );
+        }
+        let mut head = MageFinalLayer::from_weights(&w, "n", "p").unwrap();
+        assert_eq!(head.adaptable_paths(), ["norm_out.linear", "proj_out"]);
+        for path in head.adaptable_paths() {
+            let segs: Vec<&str> = path.split('.').collect();
+            assert!(
+                head.adaptable_mut(&segs).is_some(),
+                "{path} is enumerated but does not resolve"
+            );
+        }
+        assert!(head.adaptable_mut(&["norm_out"]).is_none());
+        assert!(head.adaptable_mut(&["img_in"]).is_none());
     }
 }

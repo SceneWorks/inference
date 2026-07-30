@@ -13,6 +13,7 @@ members = [
     "crates/audio/candle-audio-moss-tts",
     "crates/audio/candle-audio-moss-tts-realtime",
     "crates/audio/candle-audio-openvoice",
+    "crates/audio/candle-audio-stable-audio-3",
     "crates/audio/candle-audio-whisper",
     "crates/contracts/core-llm",
     "crates/contracts/core-llm/core-llm-testkit",

@@ -67,7 +67,10 @@ fn i2v_14b_convert_matches_reference() {
         golden.display()
     );
 
-    let out = std::env::temp_dir().join("mlx_gen_wan_i2v_14b_parity_out");
+    let out = std::env::temp_dir().join(format!(
+        "mlx_gen_wan_i2v_14b_parity_out_{}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&out);
 
     // Honour a reference quant geometry if the golden carries one.
@@ -122,7 +125,10 @@ fn t2v_14b_convert_matches_reference() {
         golden.display()
     );
 
-    let out = std::env::temp_dir().join("mlx_gen_wan_t2v_14b_parity_out");
+    let out = std::env::temp_dir().join(format!(
+        "mlx_gen_wan_t2v_14b_parity_out_{}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&out);
 
     mlx_gen_wan::convert::convert_t2v_14b(&ckpt, &out, None).unwrap();

@@ -38,7 +38,7 @@ fn hf_file(repo: &str, file: &str) -> PathBuf {
 /// Stage the engine's `ip_adapter` dir contract: `ip_adapter.safetensors` + `image_encoder/
 /// model.safetensors`, symlinked from the HF caches (the layout SceneWorks stages in sc-3625).
 fn staged_ip_dir() -> PathBuf {
-    let dir = std::env::temp_dir().join("mlx_gen_flux_ip_e2e");
+    let dir = std::env::temp_dir().join(format!("mlx_gen_flux_ip_e2e_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("image_encoder")).unwrap();
     let ip = std::env::var("FLUX_IP_ADAPTER")

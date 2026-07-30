@@ -17,7 +17,7 @@ use candle_audio::{AudioError, Result};
 use crate::config;
 use crate::converter::VoiceConverter;
 use crate::reference_encoder::ReferenceEncoder;
-use crate::spectrogram::{resample_to_native, spectrogram};
+use crate::spectrogram::spectrogram;
 use crate::weights::state_var_builder;
 
 /// The converter checkpoint filename inside the `converter/` snapshot dir.
@@ -56,7 +56,7 @@ impl OpenVoicePipeline {
     /// Extract the tone-color embedding `[1, gin, 1]` from one reference clip (any rate, any channel
     /// count already down-mixed to mono by the caller) — the `extract_se` path.
     pub fn extract_tone_color(&self, mono: &[f32], src_rate: u32) -> Result<Tensor> {
-        let wav = resample_to_native(mono, src_rate);
+        let wav = candle_audio::dsp::resample(mono, src_rate, config::SAMPLE_RATE, 1)?;
         let spec = spectrogram(&wav).ok_or_else(|| {
             AudioError::Msg("openvoice_v2: reference clip too short for a spectrogram frame".into())
         })?;
@@ -77,7 +77,7 @@ impl OpenVoicePipeline {
         seed: u64,
         cancel: &dyn Fn() -> bool,
     ) -> Result<Vec<f32>> {
-        let wav = resample_to_native(source, src_rate);
+        let wav = candle_audio::dsp::resample(source, src_rate, config::SAMPLE_RATE, 1)?;
         let spec = spectrogram(&wav).ok_or_else(|| {
             AudioError::Msg("openvoice_v2: source clip too short for a spectrogram frame".into())
         })?;

@@ -19,27 +19,6 @@ use std::f32::consts::PI;
 
 use crate::config;
 
-/// Resample `samples` from `src_rate` to [`config::SAMPLE_RATE`] with linear interpolation.
-/// Speaker identity is a spectral-envelope property that survives linear resampling well enough
-/// for the encoder; exact soxr/resampy parity is not required for identity extraction.
-pub fn resample_to_16k(samples: &[f32], src_rate: u32) -> Vec<f32> {
-    if src_rate == config::SAMPLE_RATE || samples.is_empty() {
-        return samples.to_vec();
-    }
-    let ratio = config::SAMPLE_RATE as f64 / src_rate as f64;
-    let out_len = ((samples.len() as f64) * ratio).round() as usize;
-    let mut out = Vec::with_capacity(out_len);
-    for i in 0..out_len {
-        let src_pos = i as f64 / ratio;
-        let left = src_pos.floor() as usize;
-        let frac = (src_pos - left as f64) as f32;
-        let a = samples[left.min(samples.len() - 1)];
-        let b = samples[(left + 1).min(samples.len() - 1)];
-        out.push(a + (b - a) * frac);
-    }
-    out
-}
-
 /// Loudness-normalize to `AUDIO_NORM_TARGET_DBFS` (power dBFS), increase-only — Resemblyzer's
 /// `normalize_volume(..., increase_only=True)`.
 pub fn normalize_volume(samples: &mut [f32]) {
@@ -188,40 +167,27 @@ fn slaney_mel_filterbank() -> Vec<Vec<f32>> {
 /// Full reference-audio → mel frames pipeline: resample → loudness-normalize → power STFT →
 /// Slaney mel (raw power, no log). Returns frame-major mel `[n_frames][N_MELS]` — the exact shape
 /// the encoder consumes (`[T, 40]`).
-pub fn wav_to_mel_frames(samples: &[f32], src_rate: u32) -> Vec<Vec<f32>> {
-    let mut wav = resample_to_16k(samples, src_rate);
+pub fn wav_to_mel_frames(samples: &[f32], src_rate: u32) -> candle_audio::Result<Vec<Vec<f32>>> {
+    let mut wav = candle_audio::dsp::resample(samples, src_rate, config::SAMPLE_RATE, 1)?;
     normalize_volume(&mut wav);
     let power = power_stft(&wav);
     if power.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let fb = slaney_mel_filterbank();
-    power
+    Ok(power
         .iter()
         .map(|spec| {
             fb.iter()
                 .map(|filter| filter.iter().zip(spec).map(|(&w, &p)| w * p).sum::<f32>())
                 .collect::<Vec<f32>>()
         })
-        .collect()
+        .collect())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn resample_is_identity_at_native_rate() {
-        let s = vec![0.1, -0.2, 0.3, -0.4];
-        assert_eq!(resample_to_16k(&s, config::SAMPLE_RATE), s);
-    }
-
-    #[test]
-    fn resample_changes_length_by_ratio() {
-        let s = vec![0.0f32; 24_000];
-        let out = resample_to_16k(&s, 24_000);
-        assert_eq!(out.len(), 16_000);
-    }
 
     #[test]
     fn normalize_only_increases_quiet_signals() {
@@ -262,7 +228,7 @@ mod tests {
         let tone: Vec<f32> = (0..sr / 2)
             .map(|i| (2.0 * PI * 220.0 * i as f32 / sr as f32).sin() * 0.3)
             .collect();
-        let frames = wav_to_mel_frames(&tone, sr);
+        let frames = wav_to_mel_frames(&tone, sr).unwrap();
         assert!(!frames.is_empty());
         assert!(frames.iter().all(|f| f.len() == config::N_MELS));
         assert!(frames

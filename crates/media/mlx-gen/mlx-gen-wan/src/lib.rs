@@ -86,7 +86,7 @@ pub(crate) fn combined_conditioning_latents(
 
 pub use adapters::{
     apply_wan_adapters_additive, merge_vace_adapters, merge_vace_adapters_expert,
-    merge_wan_adapters, WanLoraReport,
+    merge_wan_adapters, normalize_wan_key, WanLoraReport,
 };
 pub use chunk::{map_seq_chunks, slice_axis0, DitMemoryConfig};
 pub use config::{GuideScale, WanModelConfig, WanQuant, WanVaceConfig, SAMPLE_NEG_PROMPT};
@@ -122,7 +122,9 @@ mod conditioning_budget_tests {
 pub use text_encoder::encode_text_staged_for_tier;
 pub use text_encoder::{clean_text, load_tokenizer, umt5_tokenizer_config, Umt5Encoder};
 pub use training::{load_trainer, WanMoeTrainer};
-pub use transformer::WanTransformer;
+pub use transformer::{
+    WanTransformer, WAN_BLOCK_NORM_DIFF_PATCH_TARGETS, WAN_GLOBAL_ADAPTABLE_PATHS,
+};
 pub use vace::{
     binarize_mask, build_vace_control, denoise_vace_moe, prepare_masks, prepare_video_latents,
     WanVaceTransformer,

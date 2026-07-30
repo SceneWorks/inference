@@ -5,7 +5,9 @@ pub use candle_audio_catalog::audio;
 #[cfg(feature = "media")]
 pub use candle_gen_catalog::media;
 pub use candle_llm as llm;
-pub use runtime_catalog::{core_llm, gen_core, RuntimeCatalog, RuntimeCatalogSnapshot};
+pub use runtime_catalog::{
+    core_llm, gen_core, memory_strategy, RuntimeCatalog, RuntimeCatalogSnapshot,
+};
 
 /// The Candle backend crates this platform owns, re-exported from the media catalog
 /// (available under the default `media` feature).
@@ -107,7 +109,14 @@ mod tests {
         // The audio lane is Candle-native (sc-12901) and matches this bundle's own backend. Its
         // ordered id surface is the audio catalog's — shipped generators kokoro_82m (sc-12836),
         // moss_sfx_v2 (sc-12841), acestep_v15_turbo (sc-12842), moss_tts_realtime (sc-13392),
-        // chatterbox_tts (sc-13239), mmaudio_small_16k (video->audio Foley, sc-12843) + mmaudio_large_44k (44.1 kHz, sc-13441) + moss_ttsd_v05 (multi-speaker dialogue TTS, sc-13518), plus the
+        // chatterbox_tts (sc-13239), mmaudio_small_16k (video->audio Foley, sc-12843) +
+        // mmaudio_large_44k (44.1 kHz, sc-13441), stable_audio_3_small_music (text-to-music,
+        // sc-14543) + stable_audio_3_small_sfx (text-to-SFX/Foley, sc-14544 — 44.1 kHz stereo,
+        // distinct from the 48 kHz mono moss_sfx_v2) + stable_audio_3_medium (sc-14545 — 1.45B
+        // differential DiT over SAME-L, both domains, 380 s) + the three pre-trained -base
+        // siblings stable_audio_3_{small_music,small_sfx,medium}_base (sc-14546 —
+        // rectified_flow, Euler/50/7.0 defaults), and moss_ttsd_v05
+        // (multi-speaker dialogue TTS, sc-13518), plus the
         // voice-cloning identity embedder chatterbox_ve (sc-12844); later stories extend these exact
         // assertions in catalog order. The lane carries its own composed candle preparer
         // (sc-12835/sc-12836).
@@ -123,6 +132,12 @@ mod tests {
                     "kokoro_82m",
                     "moss_sfx_v2",
                     "acestep_v15_turbo",
+                    "stable_audio_3_small_music",
+                    "stable_audio_3_small_sfx",
+                    "stable_audio_3_medium",
+                    "stable_audio_3_small_music_base",
+                    "stable_audio_3_small_sfx_base",
+                    "stable_audio_3_medium_base",
                     "moss_tts_realtime",
                     "chatterbox_tts",
                     "mmaudio_small_16k",
@@ -221,6 +236,12 @@ mod tests {
                 "kokoro_82m",
                 "moss_sfx_v2",
                 "acestep_v15_turbo",
+                "stable_audio_3_small_music",
+                "stable_audio_3_small_sfx",
+                "stable_audio_3_medium",
+                "stable_audio_3_small_music_base",
+                "stable_audio_3_small_sfx_base",
+                "stable_audio_3_medium_base",
                 "moss_tts_realtime",
                 "chatterbox_tts",
                 "mmaudio_small_16k",

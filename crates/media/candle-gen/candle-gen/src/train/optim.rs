@@ -12,7 +12,6 @@ use std::collections::HashMap;
 
 use candle_core::backprop::GradStore;
 use candle_core::{Tensor, Var, D};
-use candle_nn::{AdamW, Optimizer, ParamsAdamW};
 
 use crate::{CandleError, Result};
 
@@ -129,11 +128,9 @@ pub fn scale_grads(grads: &mut GradStore, vars: &[Var], factor: f64) -> Result<(
 
 /// One of the supported training optimizers, owning the factor `Var`s it steps.
 pub enum TrainOptimizer {
-    /// candle AdamW (also serves plain `adam` with `weight_decay = 0`).
-    Adam {
-        inner: AdamW,
-        base_lr: f64,
-    },
+    /// AdamW (also serves plain `adam` with `weight_decay = 0`). Kept locally rather than delegating
+    /// to candle-nn so the moments and update counter can be snapshotted for exact mid-run resume.
+    Adam(Adam),
     Rose(Rose),
     Prodigy(Prodigy),
 }
@@ -147,8 +144,8 @@ impl TrainOptimizer {
     /// `weight_decay`. Betas/eps follow the torch/diffusers defaults (0.9, 0.999, 1e-8).
     pub fn from_config(name: &str, vars: Vec<Var>, lr: f32, weight_decay: f32) -> Result<Self> {
         match normalize(name).as_str() {
-            "adamw" => Ok(Self::adam(vars, lr, weight_decay)?),
-            "adam" => Ok(Self::adam(vars, lr, 0.0)?),
+            "adamw" => Ok(Self::adam(vars, lr, weight_decay, "adamw")?),
+            "adam" => Ok(Self::adam(vars, lr, 0.0, "adam")?),
             "rose" => Ok(Self::Rose(Rose::new(vars, lr, weight_decay))),
             "prodigy" => Ok(Self::Prodigy(Prodigy::new(vars, lr, weight_decay))),
             other => Err(CandleError::Msg(format!(
@@ -158,25 +155,14 @@ impl TrainOptimizer {
         }
     }
 
-    fn adam(vars: Vec<Var>, lr: f32, weight_decay: f32) -> Result<Self> {
-        let params = ParamsAdamW {
-            lr: lr as f64,
-            beta1: 0.9,
-            beta2: 0.999,
-            eps: 1e-8,
-            weight_decay: weight_decay as f64,
-        };
-        let inner = AdamW::new(vars, params)?;
-        Ok(Self::Adam {
-            inner,
-            base_lr: lr as f64,
-        })
+    fn adam(vars: Vec<Var>, lr: f32, weight_decay: f32, kind: &'static str) -> Result<Self> {
+        Ok(Self::Adam(Adam::new(vars, lr, weight_decay, kind)?))
     }
 
     /// Scale the base learning rate by the schedule multiplier for the next update.
     pub fn set_lr_scaled(&mut self, mult: f32) {
         match self {
-            Self::Adam { inner, base_lr } => inner.set_learning_rate(*base_lr * mult as f64),
+            Self::Adam(a) => a.lr = a.base_lr * mult as f64,
             Self::Rose(r) => r.set_lr_scaled(mult),
             Self::Prodigy(p) => p.set_lr_scaled(mult),
         }
@@ -185,10 +171,221 @@ impl TrainOptimizer {
     /// Apply one optimizer step from the (already clipped) gradients.
     pub fn step(&mut self, grads: &GradStore) -> Result<()> {
         match self {
-            Self::Adam { inner, .. } => Ok(inner.step(grads)?),
+            Self::Adam(a) => a.step(grads),
             Self::Rose(r) => r.step(grads),
             Self::Prodigy(p) => p.step(grads),
         }
+    }
+
+    /// Stable optimizer tag stored in resume metadata.
+    pub fn kind_tag(&self) -> &'static str {
+        match self {
+            Self::Adam(a) => a.kind,
+            Self::Rose(_) => "rose",
+            Self::Prodigy(_) => "prodigy",
+        }
+    }
+
+    /// Export all mutable optimizer state. Tensor keys are positional because the caller separately
+    /// guards the exact named adapter surface before restore.
+    pub fn snapshot(&self) -> Result<(HashMap<String, Tensor>, HashMap<String, String>)> {
+        let mut tensors = HashMap::new();
+        let mut meta = HashMap::from([("optimizer".into(), self.kind_tag().into())]);
+        meta.insert("optimizer_config".into(), self.config_fingerprint());
+        match self {
+            Self::Adam(a) => {
+                meta.insert("optim.step".into(), a.step.to_string());
+                for (i, (m, v)) in a.first.iter().zip(&a.second).enumerate() {
+                    tensors.insert(format!("optim.{i}.m"), m.clone());
+                    tensors.insert(format!("optim.{i}.v"), v.clone());
+                }
+            }
+            Self::Rose(_) => {}
+            Self::Prodigy(p) => {
+                for (key, value) in [
+                    ("optim.d", p.d),
+                    ("optim.d_max", p.d_max),
+                    ("optim.d_numerator", p.d_numerator),
+                ] {
+                    meta.insert(key.into(), value.to_string());
+                }
+                for (i, st) in &p.state {
+                    tensors.insert(format!("optim.{i}.exp_avg"), st.exp_avg.clone());
+                    tensors.insert(format!("optim.{i}.exp_avg_sq"), st.exp_avg_sq.clone());
+                    tensors.insert(format!("optim.{i}.s"), st.s.clone());
+                    tensors.insert(format!("optim.{i}.p0"), st.p0.clone());
+                }
+            }
+        }
+        Ok((tensors, meta))
+    }
+
+    /// Restore a snapshot produced by [`Self::snapshot`].
+    pub fn restore(
+        &mut self,
+        tensors: &HashMap<String, Tensor>,
+        meta: &HashMap<String, String>,
+    ) -> Result<()> {
+        let saved = meta
+            .get("optimizer")
+            .ok_or_else(|| CandleError::Msg("resume: missing optimizer metadata".into()))?;
+        if saved != self.kind_tag() {
+            return Err(CandleError::Msg(format!(
+                "resume: snapshot optimizer {saved:?} does not match requested {:?}",
+                self.kind_tag()
+            )));
+        }
+        let saved_config = meta
+            .get("optimizer_config")
+            .ok_or_else(|| CandleError::Msg("resume: missing optimizer_config metadata".into()))?;
+        let expected_config = self.config_fingerprint();
+        if saved_config != &expected_config {
+            return Err(CandleError::Msg(format!(
+                "resume: optimizer configuration differs (saved {saved_config:?}, requested \
+                 {expected_config:?})"
+            )));
+        }
+        let parse = |key: &str| -> Result<f64> {
+            meta.get(key)
+                .ok_or_else(|| CandleError::Msg(format!("resume: missing metadata {key:?}")))?
+                .parse()
+                .map_err(|e| CandleError::Msg(format!("resume: invalid metadata {key:?}: {e}")))
+        };
+        let tensor = |key: &str, like: &Tensor| -> Result<Tensor> {
+            let t = tensors
+                .get(key)
+                .ok_or_else(|| CandleError::Msg(format!("resume: missing tensor {key:?}")))?;
+            if t.dims() != like.dims() {
+                return Err(CandleError::Msg(format!(
+                    "resume: tensor {key:?} shape {:?} does not match {:?}",
+                    t.dims(),
+                    like.dims()
+                )));
+            }
+            Ok(t.to_dtype(like.dtype())?.to_device(like.device())?)
+        };
+        match self {
+            Self::Adam(a) => {
+                a.step = parse("optim.step")? as usize;
+                for i in 0..a.vars.len() {
+                    a.first[i] = tensor(&format!("optim.{i}.m"), a.vars[i].as_tensor())?;
+                    a.second[i] = tensor(&format!("optim.{i}.v"), a.vars[i].as_tensor())?;
+                }
+            }
+            Self::Rose(_) => {}
+            Self::Prodigy(p) => {
+                p.d = parse("optim.d")?;
+                p.d_max = parse("optim.d_max")?;
+                p.d_numerator = parse("optim.d_numerator")?;
+                p.state.clear();
+                for (i, var) in p.vars.iter().enumerate() {
+                    let prefix = format!("optim.{i}");
+                    if !tensors.contains_key(&format!("{prefix}.exp_avg")) {
+                        continue;
+                    }
+                    let like = var.as_tensor();
+                    p.state.insert(
+                        i,
+                        ProdigyState {
+                            exp_avg: tensor(&format!("{prefix}.exp_avg"), like)?,
+                            exp_avg_sq: tensor(&format!("{prefix}.exp_avg_sq"), like)?,
+                            s: tensor(&format!("{prefix}.s"), like)?,
+                            p0: tensor(&format!("{prefix}.p0"), like)?,
+                        },
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn config_fingerprint(&self) -> String {
+        match self {
+            Self::Adam(a) => format!(
+                "{};lr={};wd={};b1={};b2={};eps={}",
+                a.kind, a.base_lr, a.weight_decay, a.beta1, a.beta2, a.eps
+            ),
+            Self::Rose(r) => format!(
+                "rose;lr={};wd={};centralize={};stabilize={}",
+                r.base_lr, r.weight_decay, r.centralize, r.stabilize
+            ),
+            Self::Prodigy(p) => format!(
+                "prodigy;lr={};wd={};b1={};b2={};b3={};eps={};d0={};dcoef={};growth={}",
+                p.base_lr,
+                p.weight_decay,
+                p.beta1,
+                p.beta2,
+                p.beta3,
+                p.eps,
+                p.d0,
+                p.d_coef,
+                p.growth_rate
+            ),
+        }
+    }
+}
+
+/// Serializable AdamW implementation matching candle-nn's update exactly.
+pub struct Adam {
+    vars: Vec<Var>,
+    first: Vec<Tensor>,
+    second: Vec<Tensor>,
+    step: usize,
+    base_lr: f64,
+    lr: f64,
+    beta1: f64,
+    beta2: f64,
+    eps: f64,
+    weight_decay: f64,
+    kind: &'static str,
+}
+
+impl Adam {
+    fn new(vars: Vec<Var>, lr: f32, weight_decay: f32, kind: &'static str) -> Result<Self> {
+        let vars: Vec<Var> = vars.into_iter().filter(|v| v.dtype().is_float()).collect();
+        let first = vars
+            .iter()
+            .map(|v| Tensor::zeros(v.shape(), v.dtype(), v.device()))
+            .collect::<candle_core::Result<_>>()?;
+        let second = vars
+            .iter()
+            .map(|v| Tensor::zeros(v.shape(), v.dtype(), v.device()))
+            .collect::<candle_core::Result<_>>()?;
+        Ok(Self {
+            vars,
+            first,
+            second,
+            step: 0,
+            base_lr: lr as f64,
+            lr: lr as f64,
+            beta1: 0.9,
+            beta2: 0.999,
+            eps: 1e-8,
+            weight_decay: weight_decay as f64,
+            kind,
+        })
+    }
+
+    fn step(&mut self, grads: &GradStore) -> Result<()> {
+        self.step += 1;
+        let scale_m = 1.0 / (1.0 - self.beta1.powi(self.step as i32));
+        let scale_v = 1.0 / (1.0 - self.beta2.powi(self.step as i32));
+        for i in 0..self.vars.len() {
+            let var = &self.vars[i];
+            let Some(g) = grads.get(var.as_tensor()) else {
+                continue;
+            };
+            let m = ((&self.first[i] * self.beta1)? + (g * (1.0 - self.beta1))?)?;
+            let v = ((&self.second[i] * self.beta2)? + (g.sqr()? * (1.0 - self.beta2))?)?;
+            let m_hat = (&m * scale_m)?;
+            let v_hat = (&v * scale_v)?;
+            let decayed = (var.as_tensor() * (1.0 - self.lr * self.weight_decay))?;
+            let adjusted = (m_hat / (v_hat.sqrt()? + self.eps)?)?;
+            var.set(&(decayed - (adjusted * self.lr)?)?)?;
+            self.first[i] = m;
+            self.second[i] = v;
+        }
+        Ok(())
     }
 }
 
@@ -460,6 +657,7 @@ impl Prodigy {
 mod tests {
     use super::*;
     use candle_core::Device;
+    use candle_nn::{AdamW as CandleAdamW, Optimizer, ParamsAdamW};
 
     fn var(data: &[f32], shape: (usize, usize)) -> Var {
         Var::from_tensor(&Tensor::from_vec(data.to_vec(), shape, &Device::Cpu).unwrap()).unwrap()
@@ -605,6 +803,138 @@ mod tests {
             out[0][0] < 1.0 && out[0][1] > -1.0,
             "should move opposite the grad"
         );
+    }
+
+    /// The serializable local AdamW is a numeric drop-in for the prior candle-nn implementation,
+    /// including bias correction and decoupled weight decay over multiple updates.
+    #[test]
+    fn serializable_adam_matches_candle_adamw_multistep_with_decay() {
+        let ours_var = var(&[1.0, -2.0, 0.5, 4.0], (2, 2));
+        let candle_var = var(&[1.0, -2.0, 0.5, 4.0], (2, 2));
+        let mut ours =
+            TrainOptimizer::from_config("adamw", vec![ours_var.clone()], 3e-3, 0.07).unwrap();
+        let mut candle = CandleAdamW::new(
+            vec![candle_var.clone()],
+            ParamsAdamW {
+                lr: 3e-3,
+                beta1: 0.9,
+                beta2: 0.999,
+                eps: 1e-8,
+                weight_decay: 0.07,
+            },
+        )
+        .unwrap();
+        for values in [
+            [0.2f32, -0.1, 0.4, -0.3],
+            [-0.7, 0.8, 0.05, -0.2],
+            [0.11, 0.13, -0.17, 0.19],
+            [1.0, -1.0, 0.5, -0.5],
+        ] {
+            let go = Tensor::from_vec(values.to_vec(), (2, 2), &Device::Cpu).unwrap();
+            let gc = go.clone();
+            let mut og = GradStore::default();
+            og.insert(ours_var.as_tensor(), go);
+            let mut cg = GradStore::default();
+            cg.insert(candle_var.as_tensor(), gc);
+            ours.step(&og).unwrap();
+            candle.step(&cg).unwrap();
+        }
+        let a = ours_var
+            .as_tensor()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let b = candle_var
+            .as_tensor()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+            assert!(
+                (x - y).abs() <= 1e-7,
+                "parameter {i}: local {x} != candle {y}"
+            );
+        }
+    }
+
+    /// Every supported optimizer's mutable state round-trips: one step, snapshot, restore into a
+    /// fresh optimizer over the current factors, then the next update matches uninterrupted.
+    #[test]
+    fn optimizer_snapshot_resume_matches_uninterrupted_for_every_kind() {
+        for name in SUPPORTED_OPTIMIZERS {
+            let live = var(&[0.5, -0.2, 1.0, -1.5], (2, 2));
+            let mut uninterrupted =
+                TrainOptimizer::from_config(name, vec![live.clone()], 1e-2, 0.01).unwrap();
+            let first =
+                Tensor::from_vec(vec![0.3f32, -0.4, 0.2, -0.1], (2, 2), &Device::Cpu).unwrap();
+            let mut g1 = GradStore::default();
+            g1.insert(live.as_tensor(), first);
+            uninterrupted.step(&g1).unwrap();
+            let (state, meta) = uninterrupted.snapshot().unwrap();
+
+            let restored = Var::from_tensor(&live.as_tensor().copy().unwrap()).unwrap();
+            let mut resumed =
+                TrainOptimizer::from_config(name, vec![restored.clone()], 1e-2, 0.01).unwrap();
+            resumed.restore(&state, &meta).unwrap();
+
+            let second = vec![-0.6f32, 0.1, 0.7, -0.25];
+            let mut gu = GradStore::default();
+            gu.insert(
+                live.as_tensor(),
+                Tensor::from_vec(second.clone(), (2, 2), &Device::Cpu).unwrap(),
+            );
+            let mut gr = GradStore::default();
+            gr.insert(
+                restored.as_tensor(),
+                Tensor::from_vec(second, (2, 2), &Device::Cpu).unwrap(),
+            );
+            uninterrupted.step(&gu).unwrap();
+            resumed.step(&gr).unwrap();
+            let a = live
+                .as_tensor()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let b = restored
+                .as_tensor()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+                assert!(
+                    (x - y).abs() <= 1e-7,
+                    "{name} parameter {i}: uninterrupted {x} != resumed {y}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn optimizer_restore_rejects_kind_and_hyperparameter_changes() {
+        let source_var = var(&[1.0, 2.0], (1, 2));
+        let source = TrainOptimizer::from_config("adamw", vec![source_var], 1e-3, 0.02).unwrap();
+        let (state, meta) = source.snapshot().unwrap();
+
+        let mut plain_adam =
+            TrainOptimizer::from_config("adam", vec![var(&[1.0, 2.0], (1, 2))], 1e-3, 0.0).unwrap();
+        assert!(plain_adam
+            .restore(&state, &meta)
+            .unwrap_err()
+            .to_string()
+            .contains("does not match"));
+
+        let mut changed_lr =
+            TrainOptimizer::from_config("adamw", vec![var(&[1.0, 2.0], (1, 2))], 2e-3, 0.02)
+                .unwrap();
+        assert!(changed_lr
+            .restore(&state, &meta)
+            .unwrap_err()
+            .to_string()
+            .contains("configuration differs"));
     }
 
     /// clip_grad_norm scales an over-large gradient down to exactly `max_norm` and reports the

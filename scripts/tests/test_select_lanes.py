@@ -91,6 +91,7 @@ class SelectLanesTests(unittest.TestCase):
         for path in (
             "crates/audio/candle-audio/src/lib.rs",
             "crates/audio/candle-audio-catalog/src/lib.rs",
+            "crates/audio/candle-audio-stable-audio-3/src/t5gemma.rs",
         ):
             with self.subTest(path=path):
                 lanes = select_lanes([path])

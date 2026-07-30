@@ -53,6 +53,7 @@
 pub mod cod_decoder;
 pub mod denoiser;
 pub mod dico;
+pub mod encoder;
 pub mod layers;
 pub mod timestep;
 
@@ -65,6 +66,8 @@ use mlx_gen::{Error, Result};
 use crate::config::{LATENT_CHANNELS, VAE_DOWNSAMPLE_FACTOR};
 use cod_decoder::CodDecoder;
 use denoiser::{DConvDenoiser, MageVaeShape};
+use encoder::DConvEncoder;
+pub use encoder::EncoderMoments;
 
 // The codec's own shape and the crate-wide latent contract are two descriptions of the same
 // thing; tie them together at compile time so they cannot drift apart silently.
@@ -92,6 +95,8 @@ pub const SKIPPED_DECODER_SUBTREES: &[&str] = &["y_embedder.encoder.", "y_embedd
 pub enum VaePart {
     /// The decode path only — `pipeline.*`. Everything sc-14039 ships.
     Decode,
+    /// Both encoder and decoder, for image-conditioning and round trips.
+    Both,
 }
 
 /// The Mage-VAE one-step codec.
@@ -101,6 +106,7 @@ pub enum VaePart {
 /// iterative sampling, and [no latent scale or shift](crate::config::LATENT_SCALE_SHIFT) is
 /// applied on either side.
 pub struct MageVae {
+    encoder: Option<DConvEncoder>,
     cod: CodDecoder,
     denoiser: DConvDenoiser,
     dtype: Dtype,
@@ -108,16 +114,40 @@ pub struct MageVae {
 }
 
 impl MageVae {
+    /// Quantize every live VAE Linear; convolutions and normalization remain dense like `nn.quantize`.
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        if let Some(encoder) = &mut self.encoder {
+            encoder.quantize(bits)?;
+        }
+        self.denoiser.quantize(bits)?;
+        let (expected, packed) = self.quantization_count();
+        if packed != expected {
+            return Err(Error::Msg(format!(
+                "mage_vae: quantization packed {packed}/{expected} required live Linear projections"
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn quantization_count(&self) -> (usize, usize) {
+        let mut count = self.denoiser.quantization_count();
+        if let Some(encoder) = &self.encoder {
+            let next = encoder.quantization_count();
+            count = (count.0 + next.0, count.1 + next.1);
+        }
+        count
+    }
+
     /// Build the decode path from a `vae/diffusion_pytorch_model.safetensors` weight map.
     ///
-    /// `fold_adaln` constant-folds the 21 DiCo blocks' adaLN MLPs at `t = 0` and frees them
-    /// (~18.6M parameters on this path). It is `true` in production; the parity suite builds an
-    /// unfolded copy to prove the two agree.
-    pub fn from_weights(w: &Weights, dtype: Dtype, fold_adaln: bool) -> Result<Self> {
+    /// `fold_decode` folds the 21 DiCo blocks' adaLN MLPs at `t = 0`, the fixed DCT contribution,
+    /// and the decode-only zero-RGB lanes. It is `true` in production; the parity suite builds an
+    /// unfolded copy to prove the paths agree.
+    pub fn from_weights(w: &Weights, dtype: Dtype, fold_decode: bool) -> Result<Self> {
         Self::from_weights_with_shape(
             w,
             dtype,
-            fold_adaln,
+            fold_decode,
             MageVaeShape::PUBLISHED,
             DECODER_PREFIX,
         )
@@ -128,22 +158,32 @@ impl MageVae {
     pub fn from_weights_with_shape(
         w: &Weights,
         dtype: Dtype,
-        fold_adaln: bool,
+        fold_decode: bool,
         shape: MageVaeShape,
         prefix: &str,
     ) -> Result<Self> {
         let cod =
             CodDecoder::from_weights(w, &format!("{prefix}.y_embedder.decoder"), shape.attn_tile)?;
         let mut denoiser = DConvDenoiser::from_weights(w, prefix, shape)?;
-        if fold_adaln {
+        if fold_decode {
             denoiser.fold_adaln_at_zero(dtype)?;
         }
         Ok(Self {
+            encoder: None,
             cod,
             denoiser,
             dtype,
             shape,
         })
+    }
+
+    /// Build both published codec halves from their shared checkpoint.
+    pub fn from_weights_full(w: &Weights, dtype: Dtype) -> Result<Self> {
+        let mut codec = Self::from_weights(w, dtype, true)?;
+        let mut encoder = DConvEncoder::from_weights(w, ENCODER_PREFIX, dtype)?;
+        encoder.fold_adaln_at_zero()?;
+        codec.encoder = Some(encoder);
+        Ok(codec)
     }
 
     /// The architectural dimensions this instance was built with.
@@ -153,12 +193,79 @@ impl MageVae {
 
     /// Whether the adaLN MLPs have been constant-folded away.
     pub fn is_adaln_folded(&self) -> bool {
-        self.denoiser.is_folded()
+        self.denoiser.is_adaln_folded()
+    }
+
+    /// Whether the fixed DCT contribution and zero-RGB lanes are folded out of decode.
+    pub fn is_decode_folded(&self) -> bool {
+        self.denoiser.is_decode_folded()
     }
 
     /// The dtype the codec runs in.
     pub fn dtype(&self) -> Dtype {
         self.dtype
+    }
+
+    /// Encode an image to its deterministic posterior mean and clamped log-variance.
+    pub fn encode_moments(&self, image_nchw: &Array) -> Result<EncoderMoments> {
+        self.encoder
+            .as_ref()
+            .ok_or_else(|| Error::Msg("mage-vae encoder was not loaded".into()))?
+            .moments(image_nchw)
+    }
+
+    /// Encode an image to the posterior mean (`sample_posterior = false`).
+    pub fn encode_mean(&self, image_nchw: &Array) -> Result<Array> {
+        Ok(self.encode_moments(image_nchw)?.mean)
+    }
+
+    /// Sample the edit-path posterior with a request seed.
+    pub fn encode_sample(&self, image_nchw: &Array, seed: u64) -> Result<Array> {
+        let moments = self.encode_moments(image_nchw)?;
+        let key = mlx_rs::random::key(seed)?;
+        let noise = mlx_rs::random::normal::<f32>(moments.mean.shape(), None, None, Some(&key))?
+            .as_dtype(moments.mean.dtype())?;
+        let std = moments
+            .logvar
+            .multiply(Array::from_slice(&[0.5f32], &[1]))?
+            .exp()?;
+        Ok(moments.mean.add(&std.multiply(&noise)?)?)
+    }
+
+    /// Test instrumentation for the real decode x-embedder activation. This deliberately calls
+    /// the same builder as [`Self::decode`]; it exists so allocator regression tests can measure
+    /// the folded 32-wide versus literal 99-wide boundary before a later MLP masks the saving.
+    #[doc(hidden)]
+    pub fn decode_conditioning_for_memory_test(&self, z_nchw: &Array) -> Result<Array> {
+        let sh = z_nchw.shape();
+        if sh.len() != 4 || sh[1] != self.shape.bottleneck {
+            return Err(Error::Msg(format!(
+                "mage-vae x-embedder probe: expected [B, {}, h, w], got {sh:?}",
+                self.shape.bottleneck
+            )));
+        }
+        let z = z_nchw.transpose_axes(&[0, 2, 3, 1])?.as_dtype(self.dtype)?;
+        self.cod.forward(&z)
+    }
+
+    #[doc(hidden)]
+    pub fn decode_x_embedder_input_for_memory_test(
+        &self,
+        cond: &Array,
+        height: i32,
+        width: i32,
+    ) -> Result<Array> {
+        let b = cond.shape()[0];
+        let noise = if self.denoiser.is_decode_folded() {
+            None
+        } else {
+            Some(zeros_dtype(
+                &[b, height, width, self.shape.in_channels],
+                self.dtype,
+            )?)
+        };
+        self.denoiser
+            .decode_x_embedder_input(noise.as_ref(), height, width, cond)
     }
 
     /// Decode a `[B, 128, h, w]` NCHW latent to `[B, 3, h·16, w·16]` NCHW RGB in `[-1, 1]`
@@ -185,12 +292,17 @@ impl MageVae {
         let z = z_nchw.transpose_axes(&[0, 2, 3, 1])?.as_dtype(self.dtype)?; // NHWC
         let cond = self.cod.forward(&z)?;
 
-        let noise = zeros_dtype(
-            &[b, hl * scale, wl * scale, self.shape.in_channels],
-            self.dtype,
-        )?;
         let t = zeros_dtype(&[b], self.dtype)?;
-        let out = self.denoiser.forward(&noise, &t, &cond)?;
+        let out = if self.denoiser.is_decode_folded() {
+            self.denoiser
+                .forward_zero_rgb(hl * scale, wl * scale, &t, &cond)?
+        } else {
+            let noise = zeros_dtype(
+                &[b, hl * scale, wl * scale, self.shape.in_channels],
+                self.dtype,
+            )?;
+            self.denoiser.forward(&noise, &t, &cond)?
+        };
 
         Ok(out.transpose_axes(&[0, 3, 1, 2])?) // NCHW
     }
@@ -212,7 +324,33 @@ pub fn load(dir: impl AsRef<std::path::Path>, part: VaePart, dtype: Dtype) -> Re
     };
     let mut w = Weights::from_dir(&vae_dir)?;
     w.cast_all(dtype)?;
-    match part {
-        VaePart::Decode => MageVae::from_weights(&w, dtype, true),
+    let model = match part {
+        VaePart::Decode => MageVae::from_weights(&w, dtype, true)?,
+        VaePart::Both => MageVae::from_weights_full(&w, dtype)?,
+    };
+    // Remove exactly the tensors constructors proved they read. Wholesale requested-prefix removal
+    // would hide a missing constructor field: with access tracking, one omitted read remains below
+    // and is a hard load error.
+    w.remove_accessed();
+    // Published VAE files also carry subtrees that belong to the discarded FLUX.2 VAE encoder.
+    // They are intentionally not modules in MageVae; release those checkpoint-only handles too.
+    for prefix in SKIPPED_DECODER_SUBTREES {
+        w.remove_prefix(&format!("{DECODER_PREFIX}.{prefix}"));
     }
+    let remaining_requested = w
+        .keys()
+        .filter(|key| {
+            key.starts_with(DECODER_PREFIX)
+                || (matches!(part, VaePart::Both) && key.starts_with(ENCODER_PREFIX))
+        })
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if !remaining_requested.is_empty() {
+        return Err(Error::Msg(format!(
+            "mage_vae: drain left {} requested source tensors resident (first: {:?})",
+            remaining_requested.len(),
+            &remaining_requested[..remaining_requested.len().min(5)]
+        )));
+    }
+    Ok(model)
 }

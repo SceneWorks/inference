@@ -1,0 +1,193 @@
+{
+  "computePolicy": {
+    "basis": "sc-14537 canonical CPU policy",
+    "root": "F32",
+    "textCompute": "F32",
+    "textWeightsOnDisk": "BF16"
+  },
+  "elapsedSeconds": 3.8190059999469668,
+  "noise": {
+    "algorithm": "portable-lcg-u32-affine",
+    "draws": [
+      {
+        "shape": [
+          1,
+          256,
+          388
+        ],
+        "stream": 0
+      },
+      {
+        "shape": [
+          1,
+          256,
+          388
+        ],
+        "stream": 1
+      },
+      {
+        "shape": [
+          1,
+          256,
+          388
+        ],
+        "stream": 2
+      },
+      {
+        "shape": [
+          1,
+          256,
+          388
+        ],
+        "stream": 3
+      },
+      {
+        "shape": [
+          1,
+          256,
+          388
+        ],
+        "stream": 4
+      },
+      {
+        "shape": [
+          1,
+          256,
+          388
+        ],
+        "stream": 5
+      },
+      {
+        "shape": [
+          1,
+          256,
+          388
+        ],
+        "stream": 6
+      },
+      {
+        "shape": [
+          1,
+          256,
+          388
+        ],
+        "stream": 7
+      },
+      {
+        "shape": [
+          1,
+          256,
+          388
+        ],
+        "stream": 8
+      },
+      {
+        "shape": [
+          1,
+          256,
+          128
+        ],
+        "stream": 9
+      },
+      {
+        "shape": [
+          128,
+          16,
+          768
+        ],
+        "stream": 10
+      },
+      {
+        "shape": [
+          1,
+          256,
+          128
+        ],
+        "stream": 11
+      },
+      {
+        "shape": [
+          128,
+          16,
+          768
+        ],
+        "stream": 12
+      },
+      {
+        "shape": [
+          1,
+          256,
+          128
+        ],
+        "stream": 13
+      },
+      {
+        "shape": [
+          128,
+          16,
+          768
+        ],
+        "stream": 14
+      },
+      {
+        "shape": [
+          1,
+          256,
+          128
+        ],
+        "stream": 15
+      },
+      {
+        "shape": [
+          128,
+          16,
+          768
+        ],
+        "stream": 16
+      }
+    ]
+  },
+  "output": {
+    "artifact": "provider-output.safetensors",
+    "artifactBytes": 9883912,
+    "artifactSha256": "0b217e13ba379c714697ac3f34443d0c89c1ad3b2302d885c1c3d7911dc0376f",
+    "channels": 2,
+    "frames": 1323000,
+    "sampleRate": 44100
+  },
+  "request": {
+    "apgScale": 1.0,
+    "chunkedDecode": true,
+    "durationSeconds": 30.0,
+    "guidance": 1.0,
+    "negativePrompt": null,
+    "prompt": "Warm analog synth pulses, crisp percussion, spacious stereo field",
+    "sampler": "pingpong",
+    "seed": 14543,
+    "steps": 8
+  },
+  "runtime": {
+    "python": "3.12.13",
+    "torch": "2.7.1",
+    "torchaudio": "2.7.1",
+    "transformers": "5.8.0"
+  },
+  "schemaVersion": 1,
+  "snapshot": {
+    "modelConfigSha256": "100776f25af5aa83f70e0c6b384de6690cb4e5ad01c24f7cfbb6524d18765f06",
+    "modelSha256": "da85866b11b01d0694d990785f6abbd79c8064df1b0e6f8aea52935e0ef84b64",
+    "repository": "stabilityai/stable-audio-3-small-music",
+    "revision": "0fef1392cd842149a2b6d445e181c97608faac06"
+  },
+  "story": "sc-14543",
+  "upstream": {
+    "commit": "124e8a799f57a1f665495ecb72e547d0a62867f1",
+    "repository": "https://github.com/Stability-AI/stable-audio-3.git",
+    "sourceSha256": {
+      "stable_audio_3/inference/sampling.py": "76e96bc3a0c1fb346d13038f09a227ec2f9c7f2e56fd64623e8bbe6ff722bf55",
+      "stable_audio_3/model.py": "8f3a18f1b8f02ffb1ce97f8e64dcb319eb2a6a864d8c405f89d40f6933f3a701",
+      "stable_audio_3/models/autoencoders.py": "44939e6b1c2a72690736757cec3f46cb7f8f6b9ccf9161b738daac320bdfa171",
+      "stable_audio_3/models/bottleneck.py": "1d19a7713dba78de6b87fc003f74a54c40c9ac1604917c827f730363e2214c88"
+    }
+  }
+}

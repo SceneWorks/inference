@@ -580,7 +580,10 @@ mod tests {
         assert_eq!(d.id, "sd3_5_large");
         assert_eq!(d.family, "sd3");
         assert_eq!(d.modality, Modality::Image);
-        assert!(d.capabilities.supports_true_cfg);
+        assert!(
+            !d.capabilities.supports_true_cfg,
+            "the MLX SD3.5 render path does not consume request.true_cfg"
+        );
         assert!(d.capabilities.supports_guidance);
         assert!(d.capabilities.supports_negative_prompt);
     }
@@ -628,7 +631,8 @@ mod tests {
 
     #[test]
     fn validate_accepts_guidance_and_negative_prompt() {
-        // Large is true-CFG: guidance + negative prompt are supported (unlike a distilled Turbo).
+        // Large uses classifier-free guidance: guidance + negative prompt are supported (unlike a
+        // distilled Turbo), while the separate request.true_cfg knob is rejected.
         let d = descriptor();
         let req = GenerationRequest {
             prompt: "a fox".into(),
@@ -637,6 +641,14 @@ mod tests {
             ..Default::default()
         };
         assert!(validate_request(&d, &req).is_ok());
+        let with_true_cfg = GenerationRequest {
+            true_cfg: Some(4.5),
+            ..req
+        };
+        let err = validate_request(&d, &with_true_cfg)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("true_cfg is not supported"), "got: {err}");
     }
 
     #[test]
@@ -752,14 +764,14 @@ mod tests {
     // --- M3 (sc-7869): SD3.5-Medium vertical -----------------------------------------------------
 
     #[test]
-    fn medium_descriptor_is_sd3_5_medium_true_cfg() {
-        // Medium registers its own engine id and is true-CFG (negative prompt + guidance), like Large
-        // (NOT a distilled Turbo).
+    fn medium_descriptor_is_sd3_5_medium_cfg() {
+        // Medium registers its own engine id and uses classifier-free guidance (negative prompt +
+        // guidance), like Large (NOT a distilled Turbo). It does not consume request.true_cfg.
         let d = medium_descriptor();
         assert_eq!(d.id, "sd3_5_medium");
         assert_eq!(d.family, "sd3");
         assert_eq!(d.modality, Modality::Image);
-        assert!(d.capabilities.supports_true_cfg);
+        assert!(!d.capabilities.supports_true_cfg);
         assert!(d.capabilities.supports_guidance);
         assert!(d.capabilities.supports_negative_prompt);
         // The higher-res ceiling: Medium's pos_embed_max_size (384) spans up to 1440² (patch grid
@@ -799,6 +811,17 @@ mod tests {
             ..Default::default()
         };
         assert!(validate_request(&d, &req).is_ok());
+        assert!(
+            validate_request(
+                &d,
+                &GenerationRequest {
+                    true_cfg: Some(5.0),
+                    ..req
+                },
+            )
+            .is_err(),
+            "Medium must reject request.true_cfg because the render path never consumes it"
+        );
     }
 
     #[test]

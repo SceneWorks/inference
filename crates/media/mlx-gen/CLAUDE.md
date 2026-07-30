@@ -34,6 +34,7 @@ cargo test -p mlx-gen-z-image some_test_name    # one test by name
 ```
 
 - **`RUST_TEST_THREADS=1` is forced** via `.cargo/config.toml` (`force = true`). MLX's shared default Metal device is **not thread-safe** and SIGSEGVs under cargo's parallel harness. Do not remove this or run tests with `--test-threads`.
+- **Temp fixtures must be process-unique** (`std::process::id()` in the path, as most sites already do). `RUST_TEST_THREADS=1` plus cargo's sequential test-binary execution means only one test runs at a time *within* an invocation — but it says nothing about two **concurrent `cargo test` processes** (two worktrees, two agents), which share one `$TMPDIR`. A hardcoded name there lets one run's copy of a test truncate, rewrite, or `remove_file` the other's fixture mid-test; the reader then fails `SafeTensors(NotFile)`. A worktree isolates the *build*, not `$TMPDIR` (sc-16057).
 - Workspace types are shared across crates — when changing a public type in `mlx-gen` core or a crate reused by others (e.g. SDXL types reused by kolors/instantid; FLUX types reused by pulid), lint/test with `--workspace`, not crate-scoped, or you'll discover the break in CI.
 - `mlx-sys` builds MLX from source via cmake (~5 min, cached) and needs full Xcode + the Metal Toolchain. Apple-Silicon only.
 
@@ -64,7 +65,7 @@ The split is deliberate — see `ARCHITECTURE.md`:
 
 ### Adapters & quantization
 
-- Every quantizable/adaptable projection is an `AdaptableLinear` (`src/adapters.rs`): base + a stack of forward-time residual adapters → `base(x) + Σ adapter.residual(x)`. The **base is never fused/mutated** (fusing would force re-quantization on adapter swap and break quant-safety; LoRA/LoKr compose with Q4/Q8 for free). Adapters install by **dotted path** (the Rust replacement for Python's dynamic `getattr`).
+- Every quantizable/adaptable projection is an `AdaptableLinear` (`src/adapters.rs`): base + a stack of forward-time residual adapters → `base(x) + Σ adapter.residual(x)`. The **base is never fused/mutated** (fusing would force re-quantization on adapter swap and break quant-safety; LoRA/LoKr compose with Q4/Q8 for free). Adapters install by **dotted path** (the Rust replacement for Python's dynamic `getattr`). The sum is taken in the **host's** output dtype and a `scale == 0` adapter is skipped entirely (sc-15265), so installing an adapter never widens a bf16 Linear — or the chain downstream of it — to f32, and "installed at scale 0" is byte-identical to "not installed". **Training** stacks (`set_training_adapters`) are exempt from both rules and keep their pre-sc-15265 numerics — the trainer's f32 master factors must not be rounded into a bf16 block stream. The narrowing is a bounded accuracy *loss* of the same order as the host's own bf16 rounding (seam-level 6.31e-4 → 7.43e-4 vs an f32 reference, base floor 6.30e-4), with a non-systematic e2e sign.
 - Quantization is group-wise affine Q4/Q8 at `group_size = 64`, verified **byte-identical** to the fork's packing.
 - Errors: one `thiserror` enum `error::Error` with `Result<T>` at the crate root. At the gen-core contract boundary, `?` on a raw `mlx_rs::Exception` will NOT bridge to `gen_core::Error` — provider `*_registered` adapters wrap `crate::Result` → `gen_core::Result` via `.map_err(Into::into)`.
 

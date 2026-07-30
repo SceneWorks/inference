@@ -21,6 +21,7 @@ mlx-gen-instantid = { path = "../mlx-gen-instantid" }
 mlx-gen-joycaption = { path = "../mlx-gen-joycaption" }
 mlx-gen-kolors = { path = "../mlx-gen-kolors" }
 mlx-gen-krea = { path = "../mlx-gen-krea" }
+mlx-gen-krea-realtime = { path = "../mlx-gen-krea-realtime" }
 mlx-gen-lens = { path = "../mlx-gen-lens" }
 mlx-gen-ltx = { path = "../mlx-gen-ltx" }
 # Scaffold only (sc-14037): compiled as part of the platform package, but deliberately NOT yet

@@ -18,10 +18,10 @@
 //! component selectively: in `edit-q4` only `model.language_model.*` (the TE, 252 `.scales`) is
 //! packed; all 351 `model.visual.*` (the Qwen3-VL vision tower) stay BF16 (verified against the hosted
 //! `SceneWorks/boogu-image-mlx/edit-q4/mllm/model.safetensors` header — 0 `model.visual.*.scales`).
-//! The vision tower therefore loads dense via [`linear_guard_dense`], but it *shares* the `mllm/` dir
-//! (and so the packed `config.json` flag) with the packed TE — so a bare dense read here would be a
-//! **silent** skip if a future tier ever packed the tower. [`linear_guard_dense`] errors loudly on a
-//! stray `.scales` sibling instead.
+//! The vision tower therefore loads dense in f32 through its guarded loader, but it *shares* the
+//! `mllm/` dir (and so the packed `config.json` flag) with the packed TE — so a bare dense read here
+//! would be a **silent** skip if a future tier ever packed the tower. [`linear_guard_dense`] exposes
+//! the same guard for other dense consumers and its focused tests.
 
 use std::path::Path;
 

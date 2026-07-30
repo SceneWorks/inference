@@ -94,6 +94,9 @@ pub fn descriptor() -> ModelDescriptor {
 pub struct ZImageTurboControl {
     descriptor: ModelDescriptor,
     tokenizer: TextTokenizer,
+    /// The provider's half of the shared memory-strategy handshake (SC-15449 / SC-15615), built from the
+    /// `LoadSpec` at load so its asset facts describe the snapshot this generator actually loaded.
+    memory_strategy: mlx_gen::gen_core::MemoryProviderContract,
     /// Component-residency strategy (sc-11124), selected from [`LoadSpec::offload_policy`] via the
     /// shared [`load_control_residency`] builder.
     residency: Residency<TextEncoder, ZImageControlHeavyOwned>,
@@ -209,6 +212,9 @@ pub(crate) fn load_control_heavy(
     if !spec.adapters.is_empty() {
         crate::adapters::apply_z_image_adapters(&mut transformer, &spec.adapters)?;
     }
+    // SC-15754: capture the base blocks' final adapter state for the rung-4 stream (see
+    // `model::load_heavy`). The control branch carries none by construction.
+    transformer.capture_block_adapters();
     Ok(ZImageControlHeavyOwned { transformer, vae })
 }
 
@@ -302,6 +308,7 @@ const PRECISION_MSG: &str =
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     let (tokenizer, residency) = load_control_residency(spec, MODEL_ID, PRECISION_MSG)?;
     Ok(Box::new(ZImageTurboControl {
+        memory_strategy: crate::memory_strategy::memory_strategy_contract(MODEL_ID, spec)?,
         descriptor: descriptor(),
         tokenizer,
         residency,
@@ -354,6 +361,18 @@ impl ZImageTurboControl {
         // single cond `cap`.
         // sc-13571 / GitHub #1658: DiT-dropping staged decode (see `crate::model` for the turbo path).
         let tiling = pipeline::decode_tiling(req, self.residency.is_sequential());
+        // SC-15615 ladder rung 3: the shared selector's request-scoped attention budget. Unbounded
+        // unless this request selected bounded attention, so the default forward is unchanged.
+        let attention_budget = pipeline::attention_budget(req);
+        // SC-15754 ladder rung 4: the request-scoped transformer-residency window. `None` unless this
+        // request selected it; a selection on a non-Sequential generator is rejected rather than
+        // silently degraded (see `pipeline::resolve_block_window`).
+        let block_window =
+            pipeline::resolve_block_window(req, self.residency.is_sequential(), MODEL_ID)?;
+        // Rung 4, text-encoder scope (SC-15794): None unless the request names a component scope that
+        // includes the encoder, so an unscoped request conditions exactly as before.
+        let encoder_window =
+            pipeline::EncoderWindow::resolve(req, self.residency.is_sequential(), MODEL_ID)?;
         let images = self.residency.run_staged(
             &req.cancel,
             // No PiD overlay on the control path (sc-7846 is base-turbo-only); the heavy loader ignores
@@ -368,8 +387,20 @@ impl ZImageTurboControl {
             // cap (txt2img) + f32 control_context below. (img2img keeps f32 cap, mirroring the base
             // img2img; the DiT promotes per-op either way.)
             |text_encoder: &TextEncoder| {
-                let cap =
-                    pipeline::encode_prompt(&self.tokenizer, text_encoder, &req.prompt, MODEL_ID)?;
+                // Calibration-only fault injection at a physical phase boundary (SC-15449);
+                // `None` for every production request, so this is a `None` comparison.
+                pipeline::calibration_fault(
+                    req,
+                    mlx_gen::gen_core::MemoryPhase::Conditioning,
+                    MODEL_ID,
+                )?;
+                let cap = pipeline::encode_prompt(
+                    &self.tokenizer,
+                    text_encoder,
+                    &req.prompt,
+                    MODEL_ID,
+                    encoder_window,
+                )?;
                 if is_img2img {
                     Ok(cap)
                 } else {
@@ -383,6 +414,11 @@ impl ZImageTurboControl {
             |cap| Ok(mlx_rs::transforms::eval([cap])?),
             // ── Phase B (denoise): heavy bundle + cap → evaluated latents.
             |heavy: &ZImageControlHeavyOwned, cap, on_progress| {
+                pipeline::calibration_fault(
+                    req,
+                    mlx_gen::gen_core::MemoryPhase::Denoise,
+                    MODEL_ID,
+                )?;
                 // Static shift=3.0 schedule (shared with the base turbo, sc-2536) — build once. An
                 // unset `req.scheduler` keeps it byte-exact (epic 7114 N1); a curated name re-shapes σ
                 // over the shift.
@@ -428,6 +464,8 @@ impl ZImageTurboControl {
                             &control_context,
                             control_scale,
                             start_step,
+                            attention_budget,
+                            block_window,
                             &req.cancel,
                             op,
                         )
@@ -440,6 +478,7 @@ impl ZImageTurboControl {
             // ── Phase C (decode): light (VAE) view + latents → images (no PiD on control). Tiled under
             // `Sequential`.
             |view, latents, on_progress| {
+                pipeline::calibration_fault(req, mlx_gen::gen_core::MemoryPhase::Decode, MODEL_ID)?;
                 let images = pipeline::decode_batch(
                     view.vae,
                     None,
@@ -475,6 +514,24 @@ impl Generator for ZImageTurboControl {
     ) -> gen_core::Result<GenerationOutput> {
         self.generate_impl(req, on_progress).map_err(Into::into)
     }
+
+    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        Some(&self.memory_strategy)
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        crate::memory_strategy::safety_check(&self.memory_strategy, context)
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        crate::memory_strategy::begin_request(MODEL_ID, &self.memory_strategy, context)
+    }
 }
 
 // The registration constant bridges the crate's rich `Result` into backend-neutral
@@ -485,6 +542,14 @@ mlx_gen::register_generators! {
     pub(crate) const REGISTRATION = descriptor => load;
     footprint = crate::model::component_footprint
 }
+
+/// The shared memory-strategy contract registration (SC-15449) — resolvable before any weights load, so
+/// the worker can select a strategy from the static declaration plus its own measured evidence.
+pub const MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =
+    mlx_gen::gen_core::MemoryRegistration {
+        provider_id: MODEL_ID,
+        contract: |spec| crate::memory_strategy::memory_strategy_contract(MODEL_ID, spec),
+    };
 
 #[cfg(test)]
 mod tests {

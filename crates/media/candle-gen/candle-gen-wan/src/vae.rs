@@ -15,7 +15,9 @@ use candle_gen::candle_core::{DType, Result, Tensor};
 use candle_gen::candle_nn::ops::softmax_last_dim;
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::runtime::CancelFlag;
-use candle_gen::gen_core::tiling::{TileCandidates, TilingConfig, VaeTiling};
+use candle_gen::gen_core::tiling::{
+    TemporalOverlapPolicy, TileCandidates, TilingConfig, VaeTiling,
+};
 use candle_gen::vae_tiling;
 use candle_gen::{CandleError, Result as CResult};
 
@@ -784,6 +786,7 @@ fn plan_wan22_tiling(
         spatial_px: &WAN22_VAE_SPATIAL_PX,
         spatial_overlap_px: 64,
         temporal: &WAN22_VAE_TEMPORAL_FR,
+        temporal_overlap_policy: TemporalOverlapPolicy::Candidate,
     };
     vae_tiling::plan_tiling(
         "wan z48 vae22 decode",

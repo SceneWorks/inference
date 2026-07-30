@@ -29,10 +29,8 @@
 //! `decoder.{slow,normal,fast}_layers.N.conv.{weight,bias}`); the `ap.*` STFT-window buffers are
 //! recomputed constants and are dropped by the converter. Magnitude normalization, the `magmask`
 //! threshold, the multi-scale linear/nearest resamples, and the softmax-attention combine are ported
-//! exactly. The reference resamples arbitrary input to/from the model's 32 kHz rate with librosa;
-//! this port uses linear resampling (the audio lane's convention — see
-//! `crate::s3tokenizer::resample_to_16k`), which the watermark's design tolerates (it is trained to
-//! survive an STFT/iSTFT cycle and resampling).
+//! exactly. Arbitrary-rate input is converted to/from the model's 32 kHz rate with the shared
+//! high-fidelity whole-buffer resampler, matching the reference's filtered-resampling semantics.
 //!
 //! ## Wiring status (sc-13240 → sc-13239 → sc-13443 → sc-13660)
 //!
@@ -194,7 +192,7 @@ impl PerthWatermarker {
                 path.display()
             )));
         }
-        let device = candle_audio::default_device_metal_incompatible()?;
+        let device = candle_audio::default_device()?;
         // SAFETY: mmap of a provider-resolved safetensors file — the shared audio-lane idiom.
         let vb = unsafe {
             VarBuilder::from_mmaped_safetensors(std::slice::from_ref(&path), DType::F32, &device)
@@ -232,7 +230,7 @@ impl PerthWatermarker {
     pub fn embed(&self, wav: &[f32], sample_rate: u32) -> Result<Vec<f32>> {
         let resample = sample_rate != PERTH_SR;
         let sig = if resample {
-            resample_linear(wav, sample_rate, PERTH_SR)
+            dsp::resample(wav, sample_rate, PERTH_SR, 1)?
         } else {
             wav.to_vec()
         };
@@ -263,7 +261,7 @@ impl PerthWatermarker {
 
         let wm = self.synthesize(&mag_norm, &phase, n_frames)?;
         Ok(if resample {
-            resample_linear(&wm, PERTH_SR, sample_rate)
+            dsp::resample(&wm, PERTH_SR, sample_rate, 1)?
         } else {
             wm
         })
@@ -274,7 +272,7 @@ impl PerthWatermarker {
     /// a high value; a clean signal a low one.
     pub fn get_watermark(&self, wav: &[f32], sample_rate: u32) -> Result<f32> {
         let sig = if sample_rate != PERTH_SR {
-            resample_linear(wav, sample_rate, PERTH_SR)
+            dsp::resample(wav, sample_rate, PERTH_SR, 1)?
         } else {
             wav.to_vec()
         };
@@ -410,26 +408,6 @@ fn nearest_resize(mask: &[f32], t_out: usize) -> Vec<f32> {
             mask[src.min(t_in - 1)]
         })
         .collect()
-}
-
-/// Linear-interpolation resample between arbitrary rates — the audio lane's convention
-/// (`crate::s3tokenizer::resample_to_16k`), used to move to/from the model's 32 kHz rate.
-fn resample_linear(samples: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32> {
-    if src_rate == dst_rate || samples.is_empty() {
-        return samples.to_vec();
-    }
-    let ratio = dst_rate as f64 / src_rate as f64;
-    let out_len = ((samples.len() as f64) * ratio).round() as usize;
-    let mut out = Vec::with_capacity(out_len);
-    for i in 0..out_len {
-        let src_pos = i as f64 / ratio;
-        let left = src_pos.floor() as usize;
-        let frac = (src_pos - left as f64) as f32;
-        let a = samples[left.min(samples.len() - 1)];
-        let b = samples[(left + 1).min(samples.len() - 1)];
-        out.push(a + (b - a) * frac);
-    }
-    out
 }
 
 /// Signal-to-noise ratio in dB between a reference and a modified signal (aligned to the shorter

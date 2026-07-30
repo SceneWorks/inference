@@ -13,7 +13,7 @@
 //!   packed under a fixed budget with per-sample cumulative offsets (`cu_seqlens`) instead of
 //!   block-diagonal masks. Sides must be multiples of
 //!   [`SIZE_MULTIPLE`]; the native range is
-//!   [`MIN_SIZE`](crate::config::MIN_SIZE)–[`MAX_SIZE`](crate::config::MAX_SIZE) per side.
+//!   [`MIN_SIZE`]–[`MAX_SIZE`] per side.
 //! - **CFG.** `use_neg = cfg > 1.0` (`:326`, `:535`): at cfg ≤ 1 the reference builds **no**
 //!   unconditional branch at all — one segment, one `cu_seqlens` pair, positive conditioning only.
 //!   Both Turbo variants default there, so the CFG-off path is a first-class case, not an edge one.
@@ -33,11 +33,12 @@
 //! (76 invariants at cfg > 1, 71 at cfg ≤ 1, with `--self-test`), live in
 //! `crates/media/mlx-gen/tools/`.
 
+use image::{imageops::FilterType, RgbImage};
 use mlx_gen::{Error, Progress, Result};
 use mlx_rs::ops::{concatenate_axis, maximum, minimum};
 use mlx_rs::{Array, Dtype};
 
-use crate::config::{LATENT_CHANNELS, SIZE_MULTIPLE, VAE_DOWNSAMPLE_FACTOR};
+use crate::config::{LATENT_CHANNELS, MAX_SIZE, MIN_SIZE, SIZE_MULTIPLE, VAE_DOWNSAMPLE_FACTOR};
 use crate::latent::{encode_noise, GsKey};
 use crate::rope_embedder::{ImgShape, PackLayout};
 use crate::text_encoder::{MageTextEncoder, PromptKind};
@@ -47,6 +48,41 @@ use std::path::Path;
 
 /// The published Mage-Flow scheduler shift.
 pub const STATIC_SHIFT: f32 = 6.0;
+
+/// The frozen pipeline constructs an unconditional branch only above guidance scale 1.
+pub const fn uses_cfg(cfg: f32) -> bool {
+    cfg > 1.0
+}
+
+/// Upstream's native-resolution image-token budget for one packed DiT invocation.
+///
+/// This budget is applied before the optional fused-CFG duplication, exactly like the reference's
+/// sample packer. It partitions samples; it never rounds or bucket-quantizes their dimensions.
+pub const MAX_PACKED_IMAGE_TOKENS: i32 = 50_000;
+
+/// One independently seeded, native-resolution generation request.
+#[derive(Debug, Clone, Copy)]
+pub struct GenerationSample<'a> {
+    pub prompt: &'a str,
+    pub negative_prompt: &'a str,
+    pub height: u32,
+    pub width: u32,
+    pub seed: i64,
+}
+
+/// A consecutive group of samples that fits one native-resolution DiT pack.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenerationPack {
+    pub sample_range: std::ops::Range<usize>,
+    pub grids: Vec<(i32, i32)>,
+    pub image_tokens: i32,
+}
+
+/// Per-sample observable outputs from variable-geometry generation.
+pub struct BatchGenerationTrace {
+    pub samples: Vec<GenerationTrace>,
+    pub packs: Vec<GenerationPack>,
+}
 
 /// The four loaded components needed for the Mage-Flow generation path.
 pub struct MageFlowPipeline {
@@ -64,19 +100,163 @@ pub struct GenerationTrace {
     pub image_u8: Array,
 }
 
+pub struct EditTrace {
+    pub final_tokens: Array,
+    pub reference_tokens: Array,
+    pub trajectories: Vec<Array>,
+    pub image_u8: Array,
+}
+
+/// Where each Mage-Flow component's weights live.
+///
+/// The published upstream snapshot is FLAT — one directory holding `transformer/`, `text_encoder/`
+/// and `vae/` — and [`MageComponentDirs::flat`] preserves exactly that. The SceneWorks mirrors add a
+/// SPLIT layout (sc-14980 / sc-14979): the per-tier DiT lives in the variant mirror's
+/// `<tier>/transformer/`, while the text encoder and VAE — **bit-identical across all six
+/// variants** — are hosted once in a shared components mirror and staged as caller-provisioned
+/// co-requisite paths. Carrying the three dirs explicitly is what lets one loader serve both.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MageComponentDirs {
+    /// The `transformer/` dir (its `config.json` + `diffusion_pytorch_model.safetensors`).
+    pub transformer: std::path::PathBuf,
+    /// The `text_encoder/` dir (Qwen3-VL weights, config, tokenizer/processor assets).
+    pub text_encoder: std::path::PathBuf,
+    /// The `vae/` dir.
+    pub vae: std::path::PathBuf,
+}
+
+impl MageComponentDirs {
+    /// The flat published layout: every component directly under `root`.
+    pub fn flat(root: impl AsRef<Path>) -> Self {
+        let root = root.as_ref();
+        Self {
+            transformer: root.join("transformer"),
+            text_encoder: root.join("text_encoder"),
+            vae: root.join("vae"),
+        }
+    }
+}
+
+/// Read a component dir's packed tier marker (`config.json` → `quantization.bits`).
+///
+/// [`mlx_gen::quant::packed_quant_bits`] is keyed by `(root, component)`; these paths are already
+/// full component dirs, so split the last segment back off rather than re-implementing the parse.
+fn component_packed_bits(dir: &Path) -> Result<Option<i32>> {
+    let (Some(parent), Some(name)) = (dir.parent(), dir.file_name().and_then(|n| n.to_str()))
+    else {
+        return Err(Error::Msg(format!(
+            "mage_flow: component path {} has no directory name",
+            dir.display()
+        )));
+    };
+    mlx_gen::quant::packed_quant_bits(parent, name)
+}
+
+/// Decide whether `dir` still needs load-time quantization to serve `requested` bits.
+///
+/// `Some(bits)` ⇒ run the load-time `quantize(bits)`; `None` ⇒ skip it, because the artifact is
+/// already packed at the requested tier (or a dense tier was requested and the artifact is dense).
+/// A tier mismatch in either direction is a hard error, never a silent downgrade: `quantize` is a
+/// no-op over packed weights, so serving a Q4 request from a Q8 artifact would quietly hand back Q8.
+fn load_time_quant_bits(dir: &Path, requested: Option<i32>, model_id: &str) -> Result<Option<i32>> {
+    let (Some(parent), Some(name)) = (dir.parent(), dir.file_name().and_then(|n| n.to_str()))
+    else {
+        return Err(Error::Msg(format!(
+            "mage_flow: component path {} has no directory name",
+            dir.display()
+        )));
+    };
+    match requested {
+        // A bf16 request must be served by dense weights: `quantize` is never called, so a packed
+        // artifact here would silently serve Q4/Q8 under a bf16 label.
+        None => match component_packed_bits(dir)? {
+            Some(packed) => Err(Error::Msg(format!(
+                "{model_id}: {} is a pre-quantized Q{packed} artifact but the bf16 (dense) tier was \
+                 requested; point at the bf16 tier or request Q{packed}",
+                dir.display()
+            ))),
+            None => Ok(None),
+        },
+        Some(bits) => Ok(mlx_gen::quant::needs_load_time_quant(parent, name, bits, model_id)?
+            .then_some(bits)),
+    }
+}
+
 impl MageFlowPipeline {
     /// Load a published diffusers snapshot (`text_encoder/`, `transformer/`, `vae/`).
     pub fn load(root: impl AsRef<Path>) -> Result<Self> {
-        let root = root.as_ref();
-        Ok(Self {
-            text_encoder: crate::text_encoder::load(root)?,
-            transformer: MageTransformer::load(root.join("transformer"))?,
-            vae: crate::vae::load(
-                root.join("vae"),
-                crate::vae::VaePart::Decode,
-                Dtype::Bfloat16,
-            )?,
-        })
+        Self::load_with_quant(root, None)
+    }
+
+    /// Load and optionally quantize all live Linears in the TE, DiT, and VAE, from a flat snapshot.
+    pub fn load_with_quant(root: impl AsRef<Path>, quant_bits: Option<i32>) -> Result<Self> {
+        Self::load_components(
+            &MageComponentDirs::flat(root),
+            quant_bits,
+            crate::vae::VaePart::Decode,
+        )
+    }
+
+    /// Load the full edit pipeline, including the Qwen3-VL vision tower and Mage-VAE encoder.
+    pub fn load_edit(root: impl AsRef<Path>, quant_bits: Option<i32>) -> Result<Self> {
+        Self::load_components(
+            &MageComponentDirs::flat(root),
+            quant_bits,
+            crate::vae::VaePart::Both,
+        )
+    }
+
+    /// Load from explicitly-addressed component dirs, quantizing **per component** only where the
+    /// artifact on disk is not already packed at the requested tier (sc-14980).
+    ///
+    /// This is the seam that makes a pre-quantized tier a drop-in for load-time quant: a packed
+    /// `transformer/` and `text_encoder/` skip the dense read + quantize entirely, while the VAE —
+    /// which ships dense in every tier because its quantizable weights are folded away at load (see
+    /// [`crate::convert`]) — still takes the load-time path. The `quantized_linear_count`
+    /// assertions run against the FINAL state either way, so a packed artifact that failed to
+    /// auto-detect is caught exactly as a failed load-time pack would be.
+    pub fn load_components(
+        dirs: &MageComponentDirs,
+        quant_bits: Option<i32>,
+        part: crate::vae::VaePart,
+    ) -> Result<Self> {
+        const MODEL_ID: &str = "mage_flow";
+        // Resolve every tier decision BEFORE loading, so a mismatched tier fails fast instead of
+        // after an 8 GB read.
+        let te_bits = load_time_quant_bits(&dirs.text_encoder, quant_bits, MODEL_ID)?;
+        let dit_bits = load_time_quant_bits(&dirs.transformer, quant_bits, MODEL_ID)?;
+        let vae_bits = load_time_quant_bits(&dirs.vae, quant_bits, MODEL_ID)?;
+
+        let multimodal = matches!(part, crate::vae::VaePart::Both);
+        let mut pipeline = Self {
+            text_encoder: if multimodal {
+                crate::text_encoder::load_multimodal_dir(&dirs.text_encoder)?
+            } else {
+                crate::text_encoder::load_dir(&dirs.text_encoder)?
+            },
+            transformer: MageTransformer::load(&dirs.transformer)?,
+            vae: crate::vae::load(&dirs.vae, part, Dtype::Bfloat16)?,
+        };
+        if let Some(bits) = te_bits {
+            pipeline.text_encoder.quantize(bits)?;
+        }
+        if let Some(bits) = dit_bits {
+            pipeline.transformer.quantize(bits)?;
+        }
+        if let Some(bits) = vae_bits {
+            pipeline.vae.quantize(bits)?;
+        }
+        if quant_bits.is_some() && !multimodal {
+            verify_quantized_counts(
+                "text encoder",
+                pipeline.text_encoder.quantized_linear_count(),
+                253,
+            )?;
+            verify_quantized_counts("DiT", pipeline.transformer.quantized_linear_count(), 174)?;
+            let (expected_vae, packed_vae) = pipeline.vae.quantization_count();
+            verify_quantized_counts("VAE", packed_vae, expected_vae)?;
+        }
+        Ok(pipeline)
     }
 
     /// Generate one decoded NCHW image in the reference's `[0,255]` float range.
@@ -124,61 +304,410 @@ impl MageFlowPipeline {
         renormalize: bool,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationTrace> {
-        let texts = if cfg > 1.0 {
-            vec![prompt, negative_prompt]
-        } else {
-            vec![prompt]
-        };
-        let conditioning = self.text_encoder.encode(&texts, PromptKind::Gen)?;
-        let cond = conditioning.segment(0)?.reshape(&[
-            1,
-            conditioning.seq_lens[0] as i32,
-            self.transformer.config().context_in_dim,
-        ])?;
-        let negative = if cfg > 1.0 {
-            let neg = conditioning.segment(1)?.reshape(&[
-                1,
-                conditioning.seq_lens[1] as i32,
-                self.transformer.config().context_in_dim,
-            ])?;
-            Some((neg, vec![conditioning.seq_lens[1] as i32]))
+        let mut batch = self.generate_batch_trace(
+            &[GenerationSample {
+                prompt,
+                negative_prompt,
+                height,
+                width,
+                seed,
+            }],
+            steps,
+            cfg,
+            gs_key,
+            renormalize,
+            on_progress,
+        )?;
+        Ok(batch.samples.swap_remove(0))
+    }
+
+    /// Instruction-edit one target from one or more references.
+    #[allow(clippy::too_many_arguments)]
+    pub fn edit_trace(
+        &self,
+        instruction: &str,
+        negative_instruction: &str,
+        references: &[RgbImage],
+        height: u32,
+        width: u32,
+        steps: usize,
+        cfg: f32,
+        seed: i64,
+        gs_key: &GsKey,
+        renormalize: bool,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<EditTrace> {
+        if references.is_empty() {
+            return Err(Error::Msg(
+                "mage_flow edit: at least one reference image is required".into(),
+            ));
+        }
+        let reference_tokens =
+            self.sample_reference_tokens(references, height, width, seed as u64)?;
+        self.edit_trace_from_reference_tokens(
+            instruction,
+            negative_instruction,
+            references,
+            &reference_tokens,
+            height,
+            width,
+            steps,
+            cfg,
+            seed,
+            gs_key,
+            renormalize,
+            on_progress,
+        )
+    }
+
+    /// Resize all references to the target and sample their VAE posteriors in one seeded batch.
+    pub fn sample_reference_tokens(
+        &self,
+        references: &[RgbImage],
+        height: u32,
+        width: u32,
+        seed: u64,
+    ) -> Result<Array> {
+        if references.is_empty() {
+            return Err(Error::Msg(
+                "mage_flow edit: at least one reference image is required".into(),
+            ));
+        }
+        let (gh, gw) = edit_latent_hw(height, width)?;
+        let resized = references
+            .iter()
+            .map(|image| reference_nchw(image, height, width))
+            .collect::<Result<Vec<_>>>()?;
+        let resized_refs = resized.iter().collect::<Vec<_>>();
+        let ref_batch = concatenate_axis(&resized_refs, 0)?;
+        // The reference seeds once before encoding the complete reference batch, then samples one
+        // posterior tensor. Keeping this as one call preserves that multi-reference RNG shape.
+        self.vae
+            .encode_sample(&ref_batch, seed)?
+            .transpose_axes(&[0, 2, 3, 1])?
+            .reshape(&[1, references.len() as i32 * gh * gw, LATENT_CHANNELS])?
+            .as_dtype(Dtype::Bfloat16)
+            .map_err(Into::into)
+    }
+
+    /// Run the instruction-edit algorithm from already sampled reference tokens.
+    ///
+    /// This boundary keeps the stochastic VAE posterior separate from denoise parity: a Torch
+    /// oracle can replay its recorded posterior through MLX without pretending the two runtimes'
+    /// seeded normal generators produce the same samples.
+    #[allow(clippy::too_many_arguments)]
+    pub fn edit_trace_from_reference_tokens(
+        &self,
+        instruction: &str,
+        negative_instruction: &str,
+        references: &[RgbImage],
+        reference_tokens: &Array,
+        height: u32,
+        width: u32,
+        steps: usize,
+        cfg: f32,
+        seed: i64,
+        gs_key: &GsKey,
+        renormalize: bool,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<EditTrace> {
+        if references.is_empty() {
+            return Err(Error::Msg(
+                "mage_flow edit: at least one reference image is required".into(),
+            ));
+        }
+        let (gh, gw) = edit_latent_hw(height, width)?;
+        let expected = [1, references.len() as i32 * gh * gw, LATENT_CHANNELS];
+        if reference_tokens.shape() != expected {
+            return Err(Error::Msg(format!(
+                "mage_flow edit: reference tokens must be {expected:?}, got {:?}",
+                reference_tokens.shape()
+            )));
+        }
+        let reference_tokens = reference_tokens.as_dtype(Dtype::Bfloat16)?;
+        let mut target = initial_tokens_for_grid(gh, gw, seed, gs_key, Dtype::Bfloat16)?;
+
+        let positive = self.text_encoder.encode_edit(instruction, references)?;
+        let cond = positive
+            .txt
+            .reshape(&[1, positive.seq_lens[0] as i32, -1])?;
+        let negative = if uses_cfg(cfg) {
+            let encoded = self
+                .text_encoder
+                .encode_edit(negative_instruction, references)?;
+            Some((
+                encoded.txt.reshape(&[1, encoded.seq_lens[0] as i32, -1])?,
+                encoded.seq_lens[0] as i32,
+            ))
         } else {
             None
         };
-        let (gh, gw) = latent_hw(height, width)?;
-        let layout = generation_layout(&[(gh, gw)], vec![conditioning.seq_lens[0] as i32])?;
-        let tokens = initial_tokens(height, width, seed, gs_key, Dtype::Bfloat16)?;
+        let shapes =
+            std::iter::repeat_n(ImgShape::latent(gh, gw), references.len() + 1).collect::<Vec<_>>();
+        let total_tokens = (references.len() as i32 + 1) * gh * gw;
+        let layout = PackLayout::new(
+            shapes,
+            vec![total_tokens],
+            vec![positive.seq_lens[0] as i32],
+        )?;
         let sigmas = mage_flow_sigmas(steps)?;
         let mut trajectories = Vec::with_capacity(2);
-        let out = denoise_capture(
-            &self.transformer,
-            tokens,
-            &cond,
-            layout,
-            negative.as_ref().map(|(txt, lens)| (txt, lens.clone())),
-            cfg,
-            renormalize,
-            &sigmas,
-            &mut |step, latent| {
-                if step < 2 {
-                    trajectories.push(latent.clone());
-                }
-                on_progress(Progress::Step {
-                    current: step as u32 + 1,
-                    total: steps as u32,
+        let cond_ctx = self.transformer.pack_context(layout.clone())?;
+        for (step, pair) in sigmas.windows(2).enumerate() {
+            let sequence = assemble_edit_sequence(&target, &reference_tokens)?;
+            if step < 2 {
+                trajectories.push(if negative.is_some() {
+                    concatenate_axis(&[&sequence, &sequence], 1)?
+                } else {
+                    sequence.clone()
                 });
-            },
-        )?;
-        let final_latent = unpack_tokens(&out, gh, gw)?;
-        on_progress(Progress::Decoding);
-        let image_u8 = decode(&self.vae, &out, gh, gw)?;
-        Ok(GenerationTrace {
-            final_tokens: out,
-            final_latent,
+            }
+            let velocity = if let Some((neg, neg_len)) = &negative {
+                let fused_layout = layout.fused_cfg(&[*neg_len])?;
+                let fused_ctx = self.transformer.pack_context(fused_layout)?;
+                let fused_img = concatenate_axis(&[&sequence, &sequence], 1)?;
+                let fused_txt = concatenate_axis(&[&cond, neg], 1)?;
+                let sigma = Array::from_slice(
+                    &vec![pair[0]; fused_ctx.segments()],
+                    &[fused_ctx.segments() as i32],
+                );
+                let output = self
+                    .transformer
+                    .forward(&fused_img, &fused_txt, &sigma, &fused_ctx)?;
+                let split = output.split_axis(&[total_tokens], 1)?;
+                cfg_velocity(&split[0], &split[1], cfg, renormalize)?
+            } else {
+                let sigma = Array::from_slice(&[pair[0]], &[1]);
+                self.transformer
+                    .forward(&sequence, &cond, &sigma, &cond_ctx)?
+            };
+            let target_velocity = velocity.split_axis(&[gh * gw], 1)?.swap_remove(0);
+            target = flow_euler_step(&target, &target_velocity, pair[1] - pair[0])?;
+            mlx_rs::transforms::eval([&target])?;
+            on_progress(Progress::Step {
+                current: (step + 1) as u32,
+                total: steps as u32,
+            });
+        }
+        let image_u8 = decode(&self.vae, &target, gh, gw)?;
+        Ok(EditTrace {
+            final_tokens: target,
+            reference_tokens,
             trajectories,
             image_u8,
         })
     }
+
+    /// Generate a variable-geometry batch without resizing or bucket quantization.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_batch(
+        &self,
+        samples: &[GenerationSample<'_>],
+        steps: usize,
+        cfg: f32,
+        gs_key: &GsKey,
+        renormalize: bool,
+    ) -> Result<Vec<Array>> {
+        Ok(self
+            .generate_batch_trace(samples, steps, cfg, gs_key, renormalize, &mut |_| {})?
+            .samples
+            .into_iter()
+            .map(|trace| trace.image_u8)
+            .collect())
+    }
+
+    /// Generate variable-length native-resolution packs while retaining per-sample boundaries.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_batch_trace(
+        &self,
+        samples: &[GenerationSample<'_>],
+        steps: usize,
+        cfg: f32,
+        gs_key: &GsKey,
+        renormalize: bool,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<BatchGenerationTrace> {
+        let packs = plan_generation_packs(samples)?;
+        let sigmas = mage_flow_sigmas(steps)?;
+        let total_steps = steps
+            .checked_mul(packs.len())
+            .ok_or_else(|| Error::Msg("mage_flow: progress step count overflow".into()))?;
+        let mut traces = Vec::with_capacity(samples.len());
+
+        for (pack_index, pack) in packs.iter().enumerate() {
+            let pack_samples = &samples[pack.sample_range.clone()];
+            let mut texts = pack_samples
+                .iter()
+                .map(|sample| sample.prompt)
+                .collect::<Vec<_>>();
+            if uses_cfg(cfg) {
+                texts.extend(pack_samples.iter().map(|sample| sample.negative_prompt));
+            }
+            let conditioning = self.text_encoder.encode(&texts, PromptKind::Gen)?;
+            let sample_count = pack_samples.len();
+            let positive_lens = conditioning.seq_lens[..sample_count]
+                .iter()
+                .map(|&len| len as i32)
+                .collect::<Vec<_>>();
+            let positive_tokens: i32 = positive_lens.iter().sum();
+            let hidden = self.transformer.config().context_in_dim;
+            let (cond_flat, neg_flat) = if uses_cfg(cfg) {
+                let parts = conditioning.txt.split_axis(&[positive_tokens], 0)?;
+                (parts[0].clone(), Some(parts[1].clone()))
+            } else {
+                (conditioning.txt.clone(), None)
+            };
+            let cond = cond_flat.reshape(&[1, positive_tokens, hidden])?;
+            let negative_lens = if uses_cfg(cfg) {
+                Some(
+                    conditioning.seq_lens[sample_count..]
+                        .iter()
+                        .map(|&len| len as i32)
+                        .collect::<Vec<_>>(),
+                )
+            } else {
+                None
+            };
+            let negative = match (neg_flat, negative_lens) {
+                (Some(txt), Some(lens)) => {
+                    let tokens = lens.iter().sum();
+                    Some((txt.reshape(&[1, tokens, hidden])?, lens))
+                }
+                _ => None,
+            };
+
+            let initial = pack_samples
+                .iter()
+                .map(|sample| {
+                    initial_tokens(
+                        sample.height,
+                        sample.width,
+                        sample.seed,
+                        gs_key,
+                        Dtype::Bfloat16,
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let initial_refs = initial.iter().collect::<Vec<_>>();
+            let tokens = concatenate_axis(&initial_refs, 1)?;
+            let layout = generation_layout(&pack.grids, positive_lens)?;
+            let mut trajectories = Vec::with_capacity(2);
+            let out = denoise_capture(
+                &self.transformer,
+                tokens,
+                &cond,
+                layout,
+                negative.as_ref().map(|(txt, lens)| (txt, lens.clone())),
+                cfg,
+                renormalize,
+                &sigmas,
+                &mut |step, latent| {
+                    if sample_count == 1 && step < 2 {
+                        trajectories.push(latent.clone());
+                    }
+                    on_progress(Progress::Step {
+                        current: (pack_index * steps + step + 1) as u32,
+                        total: total_steps as u32,
+                    });
+                },
+            )?;
+
+            let boundaries = pack
+                .grids
+                .iter()
+                .scan(0, |offset, &(gh, gw)| {
+                    *offset += gh * gw;
+                    Some(*offset)
+                })
+                .collect::<Vec<_>>();
+            let split_points = &boundaries[..boundaries.len().saturating_sub(1)];
+            let outputs = out.split_axis(split_points, 1)?;
+            for ((tokens, &(gh, gw)), sample) in
+                outputs.into_iter().zip(pack.grids.iter()).zip(pack_samples)
+            {
+                let final_latent = unpack_tokens(&tokens, gh, gw)?;
+                on_progress(Progress::Decoding);
+                let image_u8 = decode(&self.vae, &tokens, gh, gw)?;
+                debug_assert_eq!(
+                    image_u8.shape(),
+                    [sample.height as i32, sample.width as i32, 3]
+                );
+                traces.push(GenerationTrace {
+                    final_tokens: tokens,
+                    final_latent,
+                    trajectories: if sample_count == 1 {
+                        std::mem::take(&mut trajectories)
+                    } else {
+                        Vec::new()
+                    },
+                    image_u8,
+                });
+            }
+        }
+        Ok(BatchGenerationTrace {
+            samples: traces,
+            packs,
+        })
+    }
+}
+
+pub fn assemble_edit_sequence(target: &Array, references: &Array) -> Result<Array> {
+    if target.ndim() != 3
+        || references.ndim() != 3
+        || target.shape()[0] != 1
+        || references.shape()[0] != 1
+        || target.shape()[2] != references.shape()[2]
+    {
+        return Err(Error::Msg(format!(
+            "mage_flow edit: target/reference token shapes are incompatible: {:?} / {:?}",
+            target.shape(),
+            references.shape()
+        )));
+    }
+    concatenate_axis(&[target, references], 1).map_err(Into::into)
+}
+
+fn verify_quantized_counts(component: &str, packed: usize, expected: usize) -> Result<()> {
+    if packed != expected {
+        return Err(Error::Msg(format!(
+            "mage_flow: {component} quantization packed {packed}/{expected} required projections"
+        )));
+    }
+    Ok(())
+}
+
+/// Validate exact requested geometry and greedily preserve input order under the 50k-token budget.
+pub fn plan_generation_packs(samples: &[GenerationSample<'_>]) -> Result<Vec<GenerationPack>> {
+    if samples.is_empty() {
+        return Err(Error::Msg(
+            "mage_flow: generation batch must not be empty".into(),
+        ));
+    }
+    let mut packs = Vec::new();
+    let mut start = 0;
+    let mut grids = Vec::new();
+    let mut tokens = 0;
+    for (index, sample) in samples.iter().enumerate() {
+        let grid = latent_hw(sample.height, sample.width)?;
+        let sample_tokens = grid.0 * grid.1;
+        if !grids.is_empty() && tokens + sample_tokens > MAX_PACKED_IMAGE_TOKENS {
+            packs.push(GenerationPack {
+                sample_range: start..index,
+                grids: std::mem::take(&mut grids),
+                image_tokens: tokens,
+            });
+            start = index;
+            tokens = 0;
+        }
+        grids.push(grid);
+        tokens += sample_tokens;
+    }
+    packs.push(GenerationPack {
+        sample_range: start..samples.len(),
+        grids,
+        image_tokens: tokens,
+    });
+    Ok(packs)
 }
 
 /// Build the exact diffusers static-shift schedule used by Mage-Flow.
@@ -191,10 +720,26 @@ pub fn mage_flow_sigmas(steps: usize) -> Result<Vec<f32>> {
             "mage_flow: steps must be greater than zero".into(),
         ));
     }
+    // Match ATen's endpoint-aware f32 linspace fill before applying Diffusers' f32 static shift.
+    // A one-direction `start + i*step` accumulates several one-ULP errors late in the 20-step
+    // ladder, which feed back through every subsequent nonlinear DiT call.
     let n = steps as f32;
+    let start = 1.0f32;
+    let end = 1.0 / n;
+    let step = if steps > 1 {
+        (end - start) / (steps - 1) as f32
+    } else {
+        0.0
+    };
     let mut sigmas = (0..steps)
         .map(|i| {
-            let s = 1.0 - i as f32 * ((1.0 - 1.0 / n) / (n - 1.0).max(1.0));
+            // ATen fills from the nearer endpoint on each half, avoiding the extra endpoint error
+            // a one-direction `start + i*step` accumulates.
+            let s = if i < steps / 2 {
+                step.mul_add(i as f32, start)
+            } else {
+                (-step).mul_add((steps - i - 1) as f32, end)
+            };
             STATIC_SHIFT * s / (1.0 + (STATIC_SHIFT - 1.0) * s)
         })
         .collect::<Vec<_>>();
@@ -204,6 +749,11 @@ pub fn mage_flow_sigmas(steps: usize) -> Result<Vec<f32>> {
 
 /// Validate and convert output pixels to Mage's latent grid.
 pub fn latent_hw(height: u32, width: u32) -> Result<(i32, i32)> {
+    if !(MIN_SIZE..=MAX_SIZE).contains(&height) || !(MIN_SIZE..=MAX_SIZE).contains(&width) {
+        return Err(Error::Msg(format!(
+            "mage_flow: {width}x{height} must be within {MIN_SIZE}..={MAX_SIZE} per side"
+        )));
+    }
     if !height.is_multiple_of(SIZE_MULTIPLE) || !width.is_multiple_of(SIZE_MULTIPLE) {
         return Err(Error::Msg(format!(
             "mage_flow: {width}x{height} must be divisible by {SIZE_MULTIPLE}"
@@ -212,6 +762,49 @@ pub fn latent_hw(height: u32, width: u32) -> Result<(i32, i32)> {
     Ok((
         (height / VAE_DOWNSAMPLE_FACTOR) as i32,
         (width / VAE_DOWNSAMPLE_FACTOR) as i32,
+    ))
+}
+
+/// Convert edit pixels to the latent grid.
+///
+/// The public model descriptor still enforces the production 512..=2048 range. The reference
+/// parity oracle deliberately uses 256² to keep its 4.1B-parameter CPU run tractable, so the
+/// lower-level edit trace accepts that frozen test geometry as well.
+fn edit_latent_hw(height: u32, width: u32) -> Result<(i32, i32)> {
+    if height > MAX_SIZE || width > MAX_SIZE || height < 256 || width < 256 {
+        return Err(Error::Msg(format!(
+            "mage_flow edit: {width}x{height} must be within 256..={MAX_SIZE} per side"
+        )));
+    }
+    if !height.is_multiple_of(SIZE_MULTIPLE) || !width.is_multiple_of(SIZE_MULTIPLE) {
+        return Err(Error::Msg(format!(
+            "mage_flow edit: {width}x{height} must be divisible by {SIZE_MULTIPLE}"
+        )));
+    }
+    Ok((
+        (height / VAE_DOWNSAMPLE_FACTOR) as i32,
+        (width / VAE_DOWNSAMPLE_FACTOR) as i32,
+    ))
+}
+
+fn reference_nchw(image: &RgbImage, height: u32, width: u32) -> Result<Array> {
+    let resized = if image.dimensions() == (width, height) {
+        image.clone()
+    } else {
+        image::imageops::resize(image, width, height, FilterType::CatmullRom)
+    };
+    let mut values = vec![0f32; 3 * height as usize * width as usize];
+    for channel in 0..3usize {
+        for y in 0..height as usize {
+            for x in 0..width as usize {
+                let pixel = resized.get_pixel(x as u32, y as u32)[channel] as f32;
+                values[(channel * height as usize + y) * width as usize + x] = pixel / 127.5 - 1.0;
+            }
+        }
+    }
+    Ok(Array::from_slice(
+        &values,
+        &[1, 3, height as i32, width as i32],
     ))
 }
 
@@ -224,6 +817,16 @@ pub fn initial_tokens(
     dtype: Dtype,
 ) -> Result<Array> {
     let (gh, gw) = latent_hw(height, width)?;
+    initial_tokens_for_grid(gh, gw, seed, key, dtype)
+}
+
+fn initial_tokens_for_grid(
+    gh: i32,
+    gw: i32,
+    seed: i64,
+    key: &GsKey,
+    dtype: Dtype,
+) -> Result<Array> {
     encode_noise(
         (LATENT_CHANNELS as usize, gh as usize, gw as usize),
         key,
@@ -233,6 +836,19 @@ pub fn initial_tokens(
     .transpose_axes(&[0, 2, 3, 1])?
     .reshape(&[1, gh * gw, LATENT_CHANNELS])
     .map_err(Into::into)
+}
+
+/// Gaussian-Shading initial-latent tokens for an explicit latent grid, bypassing the production
+/// size-range check [`latent_hw`] enforces. Used by the LoRA trainer's preview render (sc-14055),
+/// which samples at the (possibly sub-512) training resolution rather than a production geometry.
+pub fn encode_noise_tokens(
+    gh: i32,
+    gw: i32,
+    seed: i64,
+    key: &GsKey,
+    dtype: Dtype,
+) -> Result<Array> {
+    initial_tokens_for_grid(gh, gw, seed, key, dtype)
 }
 
 /// Convert one packed token stream back to the NCHW latent consumed by Mage-VAE.
@@ -334,7 +950,7 @@ fn denoise_capture(
             "mage_flow: scheduler needs a terminal sigma".into(),
         ));
     }
-    let use_cfg = cfg > 1.0;
+    let use_cfg = uses_cfg(cfg);
     if use_cfg && negative.is_none() {
         return Err(Error::Msg(
             "mage_flow: cfg > 1 requires negative conditioning".into(),
@@ -419,14 +1035,89 @@ mod tests {
     }
 
     #[test]
+    fn edit_stream_is_target_first_and_references_remain_clean() {
+        let target = Array::from_slice(&[1f32, 2.0, 3.0, 4.0], &[1, 2, 2]);
+        let refs = Array::from_slice(&[10f32, 11.0, 20.0, 21.0], &[1, 2, 2]);
+        let first = assemble_edit_sequence(&target, &refs).unwrap();
+        assert_eq!(
+            first.as_slice::<f32>(),
+            &[1.0, 2.0, 3.0, 4.0, 10.0, 11.0, 20.0, 21.0]
+        );
+        let stepped_target = Array::from_slice(&[5f32, 6.0, 7.0, 8.0], &[1, 2, 2]);
+        let second = assemble_edit_sequence(&stepped_target, &refs).unwrap();
+        assert_eq!(
+            &second.as_slice::<f32>()[4..],
+            &first.as_slice::<f32>()[4..],
+            "clean references must be re-concatenated unchanged at every step"
+        );
+        assert_ne!(
+            &second.as_slice::<f32>()[..4],
+            &first.as_slice::<f32>()[..4],
+            "only target tokens advance"
+        );
+        assert!(
+            assemble_edit_sequence(&target, &Array::from_slice(&[0f32; 3], &[1, 1, 3])).is_err()
+        );
+    }
+
+    #[test]
+    fn edit_layout_has_n_plus_one_shapes_in_one_attention_window() {
+        let shape = ImgShape::latent(4, 3);
+        let layout = PackLayout::new(vec![shape, shape, shape], vec![36], vec![9]).unwrap();
+        assert_eq!(layout.segments(), 1);
+        assert_eq!(layout.img_shapes().len(), 3);
+        assert_eq!(layout.img_lens(), &[36]);
+        assert!(
+            PackLayout::new(vec![ImgShape::latent(4, 3); 3], vec![12, 24], vec![9],).is_err(),
+            "splitting one edit sample into per-image attention windows must fail"
+        );
+    }
+
+    #[test]
     fn exact_twenty_step_static_shift_schedule() {
         let s = mage_flow_sigmas(20).unwrap();
-        assert_eq!(s.len(), 21);
-        assert_eq!(s[0], 1.0);
-        assert!((s[1] - 0.99130434).abs() < 1e-6);
-        assert!((s[19] - 0.24).abs() < 1e-6);
-        assert_eq!(s[20], 0.0);
+        assert_eq!(
+            s,
+            vec![
+                1.0, 0.99130434, 0.98181814, 0.97142863, 0.96000004, 0.94736844, 0.9333333,
+                0.917647, 0.90000004, 0.88000005, 0.85714287, 0.83076924, 0.8, 0.76363635, 0.72,
+                0.6666667, 0.6, 0.51428574, 0.4, 0.24000001, 0.0,
+            ],
+            "every sigma must match the torch/diffusers CPU oracle bit-for-bit"
+        );
         assert!(s.windows(2).all(|w| w[0] > w[1]));
+    }
+
+    #[test]
+    fn exact_thirty_step_base_static_shift_schedule() {
+        let s = mage_flow_sigmas(30).unwrap();
+        assert_eq!(
+            s,
+            vec![
+                1.0, 0.9942857, 0.9882353, 0.98181814, 0.97499996, 0.96774185, 0.96000004,
+                0.9517242, 0.9428571, 0.9333334, 0.92307687, 0.912, 0.90000004, 0.8869566,
+                0.87272733, 0.85714287, 0.8399999, 0.8210527, 0.79999995, 0.77647054, 0.75,
+                0.71999997, 0.68571424, 0.6461538, 0.59999996, 0.54545456, 0.48, 0.39999998, 0.3,
+                0.17142859, 0.0,
+            ],
+            "all 31 Base sigmas must match the frozen Torch/Diffusers CPU oracle bit-for-bit"
+        );
+        assert!(s.windows(2).all(|w| w[0] > w[1]));
+    }
+
+    #[test]
+    fn turbo_uses_the_same_shifted_four_step_ladder_and_no_cfg_branch() {
+        let sigmas = mage_flow_sigmas(4).unwrap();
+        assert_eq!(sigmas.len(), 5);
+        let expected = [1.0, 0.94736844, 0.85714287, 0.6666667, 0.0];
+        for (index, (got, want)) in sigmas.iter().zip(expected).enumerate() {
+            assert!(
+                (got - want).abs() < 1e-6,
+                "Turbo sigma {index}: got {got}, want {want}"
+            );
+        }
+        assert!(!uses_cfg(1.0));
+        assert!(uses_cfg(1.0001));
     }
 
     #[test]
@@ -486,11 +1177,94 @@ mod tests {
     #[test]
     fn size_and_pack_round_trip_are_explicit() {
         assert_eq!(latent_hw(1024, 1024).unwrap(), (64, 64));
+        assert_eq!(latent_hw(512, 2048).unwrap(), (32, 128));
+        assert_eq!(latent_hw(2048, 512).unwrap(), (128, 32));
+        assert_eq!(latent_hw(688, 1232).unwrap(), (43, 77));
+        assert!(latent_hw(496, 512).is_err());
+        assert!(latent_hw(512, 2064).is_err());
         assert!(latent_hw(1023, 1024).is_err());
         let x = Array::from_slice(
             &vec![0.0f32; 2 * 3 * LATENT_CHANNELS as usize],
             &[1, 2 * 3, LATENT_CHANNELS],
         );
         assert_eq!(unpack_tokens(&x, 2, 3).unwrap().shape(), [1, 128, 2, 3]);
+    }
+
+    #[test]
+    fn native_geometry_packs_are_exact_and_budgeted() {
+        let samples = [
+            GenerationSample {
+                prompt: "a",
+                negative_prompt: "",
+                height: 2048,
+                width: 2048,
+                seed: 1,
+            },
+            GenerationSample {
+                prompt: "b",
+                negative_prompt: "",
+                height: 2048,
+                width: 2048,
+                seed: 2,
+            },
+            GenerationSample {
+                prompt: "c",
+                negative_prompt: "",
+                height: 2048,
+                width: 2048,
+                seed: 3,
+            },
+            GenerationSample {
+                prompt: "d",
+                negative_prompt: "",
+                height: 512,
+                width: 2048,
+                seed: 4,
+            },
+            GenerationSample {
+                prompt: "e",
+                negative_prompt: "",
+                height: 688,
+                width: 1232,
+                seed: 5,
+            },
+        ];
+        let packs = plan_generation_packs(&samples).unwrap();
+        assert_eq!(packs.len(), 2);
+        assert_eq!(packs[0].sample_range, 0..3);
+        assert_eq!(packs[0].image_tokens, 49_152);
+        assert_eq!(packs[0].grids, vec![(128, 128); 3]);
+        assert_eq!(packs[1].sample_range, 3..5);
+        assert_eq!(packs[1].grids, vec![(32, 128), (43, 77)]);
+        assert!(packs
+            .iter()
+            .all(|pack| pack.image_tokens <= MAX_PACKED_IMAGE_TOKENS));
+    }
+
+    #[test]
+    fn mixed_layout_carries_axes_boundaries_and_fused_cfg_segments() {
+        let layout = generation_layout(&[(32, 128), (128, 32), (43, 77)], vec![7, 11, 13]).unwrap();
+        // These image/text lens and cumulative boundaries are the frozen reference's concrete
+        // representation of the story's "axes_lens"; MSRoPE additionally consumes img_shapes.
+        assert_eq!(layout.img_lens(), &[4096, 4096, 3311]);
+        assert_eq!(layout.img_cu(), vec![0, 4096, 8192, 11503]);
+        assert_eq!(layout.txt_cu(), vec![0, 7, 18, 31]);
+        assert_eq!(layout.img_shapes().len(), 3);
+
+        let fused = layout.fused_cfg(&[5, 9, 15]).unwrap();
+        assert_eq!(fused.segments(), 6);
+        assert_eq!(fused.img_lens(), &[4096, 4096, 3311, 4096, 4096, 3311]);
+        assert_eq!(fused.txt_lens(), &[7, 11, 13, 5, 9, 15]);
+        assert_eq!(fused.img_tokens(), 23_006);
+    }
+
+    #[test]
+    fn quant_audit_rejects_one_omitted_small_projection() {
+        // Mutation discriminator: skipping even one small projection (for example a timestep
+        // `linear_2`) changes 253→252 and must fail, independent of total memory movement.
+        assert!(verify_quantized_counts("text encoder", 252, 253).is_err());
+        assert!(verify_quantized_counts("DiT", 173, 174).is_err());
+        assert!(verify_quantized_counts("VAE", 4, 5).is_err());
+        assert!(verify_quantized_counts("VAE", 5, 5).is_ok());
     }
 }

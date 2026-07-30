@@ -5,7 +5,7 @@
 //! binary uses every helper.
 #![allow(dead_code)]
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use mlx_rs::{Array, Dtype};
 
@@ -27,7 +27,10 @@ pub const STACK_GOLDEN: &str = "mage_flow_dit_golden.safetensors";
 
 /// Load a golden bundle, or `None` when the (gitignored) directory has not been populated.
 pub fn golden(name: &str) -> Option<Weights> {
-    let path = Path::new(GOLDEN_DIR).join(name);
+    let root = std::env::var_os("MAGE_GOLDEN_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(GOLDEN_DIR));
+    let path = root.join(name);
     if !path.exists() {
         return None;
     }

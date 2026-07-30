@@ -43,18 +43,43 @@ fn repeat_kv(x: &Tensor, groups: usize) -> Result<Tensor> {
 ///
 /// i32-overflow guard (sc-9116): the image-token scores `[b, h, s, s]` reach `~24·16384² ≈ 6.4e9 >
 /// i32::MAX` at a 2048² render, silently corrupting the tail rows on the candle CUDA kernels. The
-/// shared budgeted helper chunks over the query rows (byte-identical for the common sizes); the softmax
-/// closure preserves the exact fused `softmax_last_dim`.
-fn sdpa(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64) -> Result<Tensor> {
-    candle_gen::sdpa_budgeted_bhsd(
-        q,
-        k,
-        v,
-        scale,
-        None,
-        softmax_last_dim,
-        candle_gen::ATTN_SCORES_BUDGET,
-    )
+/// On the constrained-memory rung, complete heads are chunked first. Keeping the full query axis
+/// preserves the exact CUDA GEMM shape (and therefore byte identity) at 1024². If one head alone still
+/// exceeds the budget (the 2048² overflow case), the shared helper additionally chunks query rows.
+fn sdpa(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64, scores_budget: usize) -> Result<Tensor> {
+    let (b, h, sq, _d) = q.dims4()?;
+    let sk = k.dim(2)?;
+    let full_scores = b.saturating_mul(h).saturating_mul(sq).saturating_mul(sk);
+    if full_scores <= scores_budget || h == 1 {
+        return candle_gen::sdpa_budgeted_bhsd(
+            q,
+            k,
+            v,
+            scale,
+            None,
+            softmax_last_dim,
+            scores_budget,
+        );
+    }
+
+    let scores_per_head = b.saturating_mul(sq).saturating_mul(sk).max(1);
+    let heads_per_chunk = (scores_budget / scores_per_head).clamp(1, h);
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    while start < h {
+        let len = heads_per_chunk.min(h - start);
+        chunks.push(candle_gen::sdpa_budgeted_bhsd(
+            &q.narrow(1, start, len)?,
+            &k.narrow(1, start, len)?,
+            &v.narrow(1, start, len)?,
+            scale,
+            None,
+            softmax_last_dim,
+            scores_budget,
+        )?);
+        start += len;
+    }
+    Tensor::cat(&chunks, 1)
 }
 
 // ── `+1` RMSNorm ────────────────────────────────────────────────────────────────────────────
@@ -168,6 +193,17 @@ impl GatedAttention {
     /// `x`: `[b, s, hidden]`. `rope`: `Some((cos, sin))` (`[1, s, head_dim/2]`) for the single-stream
     /// blocks; `None` for the text-fusion blocks (no positional encoding). Unmasked (B=1 full sequence).
     pub fn forward(&self, x: &Tensor, rope: Option<(&Tensor, &Tensor)>) -> Result<Tensor> {
+        self.forward_with_attention_budget(x, rope, candle_gen::ATTN_SCORES_BUDGET)
+    }
+
+    /// [`Self::forward`] with an explicit score element budget. Lowering the budget chunks complete
+    /// heads first, preserving the full query/key axes and the exact attention result at 1024².
+    pub fn forward_with_attention_budget(
+        &self,
+        x: &Tensor,
+        rope: Option<(&Tensor, &Tensor)>,
+        scores_budget: usize,
+    ) -> Result<Tensor> {
         let (b, s, _) = x.dims3()?;
         let (nh, nkv, hd) = (self.heads, self.kv_heads, self.head_dim);
 
@@ -193,7 +229,7 @@ impl GatedAttention {
         let q = q.transpose(1, 2)?;
         let k = k.transpose(1, 2)?;
         let v = v.transpose(1, 2)?;
-        let o = sdpa(&q, &k, &v, self.scale)?;
+        let o = sdpa(&q, &k, &v, self.scale, scores_budget)?;
         let o = o.transpose(1, 2)?.contiguous()?.reshape((b, s, nh * hd))?;
 
         // Sigmoid gate the attention output, then the shared output projection.
@@ -461,6 +497,19 @@ impl SingleStreamBlock {
     /// `x`: `[b, s, hidden]`, `tvec`: `[b, 1, 6·hidden]` (shared `time_mod_proj` output), `cos`/`sin`:
     /// `[1, s, head_dim/2]`.
     pub fn forward(&self, x: &Tensor, tvec: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+        self.forward_with_attention_budget(x, tvec, cos, sin, candle_gen::ATTN_SCORES_BUDGET)
+    }
+
+    /// [`Self::forward`] with an explicit attention-score budget for the joint attention. All
+    /// modulation, residual, and MLP math remains on the existing path.
+    pub fn forward_with_attention_budget(
+        &self,
+        x: &Tensor,
+        tvec: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        scores_budget: usize,
+    ) -> Result<Tensor> {
         let m = tvec.broadcast_add(&self.scale_shift_table)?; // [b, 1, 6·hidden]
         let chunks = m.chunk(6, D::Minus1)?; // 6 × [b, 1, hidden]
         let (prescale, preshift, pregate) = (&chunks[0], &chunks[1], &chunks[2]);
@@ -471,7 +520,9 @@ impl SingleStreamBlock {
             .forward(x)?
             .broadcast_mul(&(prescale + 1.0)?)?
             .broadcast_add(preshift)?;
-        let attn = self.attn.forward(&pre, Some((cos, sin)))?;
+        let attn =
+            self.attn
+                .forward_with_attention_budget(&pre, Some((cos, sin)), scores_budget)?;
         let x = (x + attn.broadcast_mul(pregate)?)?;
 
         let post = self
@@ -623,5 +674,26 @@ impl TextFusionTransformer {
             blk.visit_adaptable_mut(&format!("text_fusion.refiner_blocks.{i}"), f)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_gen::candle_core::Device;
+
+    /// The constrained rung first chunks complete heads. The reconstructed tensor must reproduce the
+    /// ordinary attention result exactly; otherwise the memory ladder would change the render.
+    #[test]
+    fn explicit_attention_budget_matches_unchunked() {
+        let device = Device::Cpu;
+        let q = Tensor::randn(0f32, 1f32, (1, 2, 7, 4), &device).unwrap();
+        let k = Tensor::randn(0f32, 1f32, (1, 2, 7, 4), &device).unwrap();
+        let v = Tensor::randn(0f32, 1f32, (1, 2, 7, 4), &device).unwrap();
+        let full = sdpa(&q, &k, &v, 0.5, usize::MAX).unwrap();
+        let chunked = sdpa(&q, &k, &v, 0.5, 7 * 7).unwrap();
+        let full = full.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let chunked = chunked.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert_eq!(full, chunked);
     }
 }

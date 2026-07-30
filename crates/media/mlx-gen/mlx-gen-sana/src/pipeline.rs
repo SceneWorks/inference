@@ -59,6 +59,7 @@ use crate::dc_ae::{DcAeDecoder, DcAeEncoder};
 use crate::scm::ScmScheduler;
 use crate::text_encoder::SanaTextEncoder;
 use crate::transformer::SanaTransformer;
+use mlx_gen::tiling::{TilingConfig, VaeTiling};
 
 /// DC-AE f32c32 latent channel count (the SANA trunk's `out_channels`).
 pub const LATENT_CHANNELS: i32 = 32;
@@ -150,12 +151,81 @@ pub fn decode_to_image(
     cfg: &DcAeConfig,
     latents: &Array,
     cancel: &CancelFlag,
+    // `Some` decodes in overlapping spatial tiles (see `decode_tiled`); `None` is the whole-image
+    // path, byte-identical to before tiling existed.
+    tiling: Option<&TilingConfig>,
 ) -> Result<Image> {
     let scale = Array::from_slice(&[cfg.scaling_factor], &[1]);
     let unscaled = divide(latents, &scale)?; // diffusers: latents / scaling_factor
-    let decoded_nhwc = decoder.decode(&unscaled, cancel)?; // [1, H, W, 3] NHWC, f32
+    let decoded_nhwc = match tiling {
+        Some(tiling) => decode_tiled(decoder, &unscaled, tiling, cancel)?,
+        None => decoder.decode(&unscaled, cancel)?, // [1, H, W, 3] NHWC, f32
+    };
     let decoded_nchw = decoded_nhwc.transpose_axes(&[0, 3, 1, 2])?; // → NCHW for decoded_to_image
     decoded_to_image(&decoded_nchw)
+}
+
+/// The decode tiling to use, from `MLX_GEN_SANA_DECODE_TILE` (a latent-space tile edge in pixels,
+/// e.g. `256`); `None` decodes whole-image.
+///
+/// An env knob rather than a request field **for now**: the point of this step is to measure what
+/// tiling buys before deciding the policy. The eventual shape should follow Krea's
+/// budget-gated `auto_tiling_*` — estimate the decode peak from the render shape and tile only
+/// when it would exceed the budget — so tiling costs nothing when memory is plentiful.
+fn decode_tiling() -> Option<TilingConfig> {
+    let px: i32 = std::env::var("MLX_GEN_SANA_DECODE_TILE")
+        .ok()?
+        .parse()
+        .ok()?;
+    // A quarter-tile overlap: enough for the trapezoidal blend to hide seams without paying for
+    // large redundant borders.
+    Some(TilingConfig::spatial_only(px, px / 4))
+}
+
+/// DC-AE tiling parameters: the ×32 spatial compression, and the single stage that runs at full
+/// output resolution.
+///
+/// `full_res_channels: 3` — DC-AE's last stage emits `[1, H, W, 128]` at H/1, i.e. the widest
+/// full-resolution write is the 3-channel RGB output; the 128-channel stage is what tiling bounds.
+const DC_AE_TILING: VaeTiling = VaeTiling {
+    spatial_scale: 32,
+    temporal_scale: 1,
+    causal_temporal: false,
+    full_res_channels: 3,
+};
+
+/// Decode `latent` (`[1, 32, h, w]` NCHW, already unscaled) in overlapping spatial tiles.
+///
+/// # Why
+///
+/// The DC-AE decode's memory is dominated by *transients inside its late stages*, not by weights
+/// or by the tensors it hands between stages. Measured on SANA at 512px: the last two stages add
+/// ~3.5 GB while their outputs are 64 MiB and 128 MiB — roughly 18× the tensor produced. Nothing
+/// outside the decoder can release that, which is why weight reduction moved the peak 0 MiB and
+/// stage-wise `eval` moved it 2 MiB (`docs/ios-epics.md`, E5).
+///
+/// Tiling reaches inside: each stage's internals are then sized by the *tile*, not the image. The
+/// shared [`mlx_gen::vae_tiling::tiled_decode`] does the slicing, trapezoidal seam blending, and
+/// per-tile `eval` (the eval is essential — without it the whole tiled graph materializes at once
+/// and tiling achieves nothing).
+///
+/// The latent is NCHW and still-image, so the tiled axes are `[h, w] = [2, 3]` with the temporal
+/// axis pinned to a 1-length dummy at index 1.
+fn decode_tiled(
+    decoder: &DcAeDecoder,
+    latent: &Array,
+    tiling: &TilingConfig,
+    cancel: &CancelFlag,
+) -> Result<Array> {
+    let sh = latent.shape();
+    let (h, w) = (sh[2], sh[3]);
+    let plan = tiling.plan(DC_AE_TILING, 1, h, w);
+    // `tiled_decode` slices on three axes; a still image has no temporal extent, so axis 1 (the
+    // 32-channel axis) is given a full-length single "frame" and never actually split.
+    let out = mlx_gen::vae_tiling::tiled_decode(latent, &plan, [1, 2, 3], Some(cancel), |tile| {
+        decoder.decode(tile, cancel)
+    })?;
+    Ok(out)
 }
 
 // =================================================================================================
@@ -693,7 +763,13 @@ impl SanaHeavy {
         )?;
         on_progress(Progress::Decoding);
         release_denoise_graph(&latents)?;
-        decode_to_image(&self.decoder, &self.dc_ae_cfg, &latents, cancel)
+        decode_to_image(
+            &self.decoder,
+            &self.dc_ae_cfg,
+            &latents,
+            cancel,
+            decode_tiling().as_ref(),
+        )
     }
 
     /// The **SANA-Sprint** (CFG-free SCM/TrigFlow few-step) render for one image (the pre-seam
@@ -773,7 +849,13 @@ impl SanaHeavy {
         )?;
         on_progress(Progress::Decoding);
         release_denoise_graph(&latents)?;
-        decode_to_image(&self.decoder, &self.dc_ae_cfg, &latents, cancel)
+        decode_to_image(
+            &self.decoder,
+            &self.dc_ae_cfg,
+            &latents,
+            cancel,
+            decode_tiling().as_ref(),
+        )
     }
 }
 

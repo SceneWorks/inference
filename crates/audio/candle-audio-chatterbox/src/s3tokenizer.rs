@@ -213,26 +213,6 @@ fn reflect_pad(samples: &[f32], pad: usize) -> Vec<f32> {
     out
 }
 
-/// Linear-interpolation resample to [`S3_SR`] (16 kHz). Speaker/prosody content survives linear
-/// resampling well enough for tokenization; exact soxr parity is not required for discrete codes.
-pub fn resample_to_16k(samples: &[f32], src_rate: u32) -> Vec<f32> {
-    if src_rate == S3_SR || samples.is_empty() {
-        return samples.to_vec();
-    }
-    let ratio = S3_SR as f64 / src_rate as f64;
-    let out_len = ((samples.len() as f64) * ratio).round() as usize;
-    let mut out = Vec::with_capacity(out_len);
-    for i in 0..out_len {
-        let src_pos = i as f64 / ratio;
-        let left = src_pos.floor() as usize;
-        let frac = (src_pos - left as f64) as f32;
-        let a = samples[left.min(samples.len() - 1)];
-        let b = samples[(left + 1).min(samples.len() - 1)];
-        out.push(a + (b - a) * frac);
-    }
-    out
-}
-
 /// The loaded s3tokenizer: the checkpoint mel bank + the FSMN encoder + the FSQ projection.
 pub struct S3Tokenizer {
     cfg: S3TokenizerConfig,
@@ -257,7 +237,7 @@ impl S3Tokenizer {
                 path.display()
             )));
         }
-        let device = candle_audio::default_device_metal_incompatible()?;
+        let device = candle_audio::default_device()?;
         // SAFETY: mmap of a provider-resolved, pinned-SHA safetensors file — the shared idiom.
         let vb = unsafe {
             VarBuilder::from_mmaped_safetensors(std::slice::from_ref(&path), DType::F32, &device)?
@@ -305,7 +285,7 @@ impl S3Tokenizer {
     /// tokenized with the upstream sliding window (`encode_long_audio`) — the ≤30 s branch is
     /// byte-for-byte the original single-pass encode.
     pub fn encode(&self, samples: &[f32], sample_rate: u32) -> Result<Vec<i64>> {
-        let wav = resample_to_16k(samples, sample_rate);
+        let wav = candle_audio::dsp::resample(samples, sample_rate, S3_SR, 1)?;
         let mel = self.log_mel_spectrogram(&wav)?; // [1, n_mels, T_mel]
         let t_mel = mel.dim(2)?;
         if t_mel > MAX_MEL_FRAMES {
@@ -662,14 +642,6 @@ mod tests {
         // torch reflect pad of [10,20,30,40] by 2 → [30,20, 10,20,30,40, 30,20].
         let p = reflect_pad(&[10.0, 20.0, 30.0, 40.0], 2);
         assert_eq!(p, vec![30.0, 20.0, 10.0, 20.0, 30.0, 40.0, 30.0, 20.0]);
-    }
-
-    #[test]
-    fn resample_changes_length_by_ratio_and_is_identity_at_16k() {
-        let s = vec![0.1f32, -0.2, 0.3, -0.4];
-        assert_eq!(resample_to_16k(&s, S3_SR), s);
-        let out = resample_to_16k(&vec![0.0f32; 24_000], 24_000);
-        assert_eq!(out.len(), 16_000);
     }
 
     #[test]

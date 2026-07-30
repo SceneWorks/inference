@@ -10,7 +10,7 @@ on:
         type: choice
         required: true
         default: all
-        options: [all, llm, media, audio]
+        options: [all, llm, media, request-memory-scope, krea-realtime, audio, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base]
 
 permissions:
   contents: read
@@ -20,6 +20,37 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # SC-15507: a narrow, independently dispatchable acceptance lane for the request-scoped
+  # MLX lifecycle. The broader `media` profile also runs this test, but it requires the complete
+  # frozen-Torch Mage oracle bundle before reaching it. This lane intentionally needs only the
+  # immutable Mage snapshot consumed by the lifecycle test itself, so an unrelated oracle-cache
+  # miss cannot suppress the real-Apple seam gate.
+  mlx-request-memory-scope:
+    name: MLX request-memory scope real weights
+    if: inputs.profile == 'request-memory-scope'
+    runs-on: [self-hosted, macOS, ARM64, real-weights]
+    env:
+      MAGE_REQUEST_SCOPE_SNAPSHOT: ${{ vars.MAGE_SNAPSHOT }}
+      MAGE_REQUEST_SCOPE_QUANT: bf16
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Toolchain versions
+        run: rustc --version && cargo --version
+      - name: Materialize and verify immutable Mage snapshot
+        run: |
+          if [[ -z "$MAGE_REQUEST_SCOPE_SNAPSHOT" || "$MAGE_REQUEST_SCOPE_SNAPSHOT" != /* ]]; then
+            echo "MAGE_SNAPSHOT must be an operator-provided absolute path" >&2
+            exit 1
+          fi
+          python3 -m pip install --disable-pip-version-check --target "$RUNNER_TEMP/huggingface-hub" "huggingface_hub==1.20.1"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py \
+            --model mage-flow \
+            --snapshot "$MAGE_REQUEST_SCOPE_SNAPSHOT"
+      - name: Run Mage request-memory lifecycle
+        run: >-
+          cargo test --locked --release -p mlx-gen-mage
+          --test request_memory_scope_real_weights -- --ignored --nocapture
+
   mlx-llm:
     name: MLX LLM real weights
     if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'llm'
@@ -48,18 +79,34 @@ jobs:
     env:
       ZIMAGE_SNAPSHOT: ${{ vars.ZIMAGE_SNAPSHOT }}
       MAGE_SNAPSHOT: ${{ vars.MAGE_SNAPSHOT }}
+      MAGE_EDIT_SNAPSHOT: ${{ vars.MAGE_EDIT_SNAPSHOT }}
+      MAGE_EDIT_BASE_SNAPSHOT: ${{ vars.MAGE_EDIT_BASE_SNAPSHOT }}
+      MAGE_EDIT_TURBO_SNAPSHOT: ${{ vars.MAGE_EDIT_TURBO_SNAPSHOT }}
+      # Operator-provisioned, runner-local bundle required on an exact cache miss. This keeps the
+      # multi-hour frozen-Torch CPU producer out of the shared Actions queue; the normal fail-closed
+      # verification below must accept every file before the bundle can be cached or consumed.
+      MAGE_ORACLE_SEED_DIR: ${{ vars.MAGE_ORACLE_SEED_DIR }}
       # Explicit operator-provided models root for the mlx-gen real-weight resolvers that resolve a
       # repo-keyed snapshot (sc-13755); inference never self-fetches or derives a cache location.
       MLX_GEN_MODELS_ROOT: ${{ vars.MLX_GEN_MODELS_ROOT }}
-      MAGE_GOLDEN_DIR: ${{ runner.temp }}/mage-flow-oracles
       MAGE_REQUIRE_GOLDENS: "1"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: "3.12.11"
-          cache: pip
-          cache-dependency-path: crates/media/mlx-gen/_vendor/mage_flow/requirements-oracles.txt
+      # actions/setup-python's Darwin package hard-codes /Users/runner during installation, which is
+      # not writable on this self-hosted runner. uv installs the exact interpreter wholly in temp.
+      - name: Install pinned reference Python
+        env:
+          UV_CACHE_DIR: ${{ runner.temp }}/uv-cache
+          UV_PYTHON_BIN_DIR: ${{ runner.temp }}/python-bin
+          UV_PYTHON_INSTALL_DIR: ${{ runner.temp }}/python-install
+        run: |
+          command -v uv >/dev/null
+          uv python install 3.12.10
+          python_path="$(uv python find 3.12.10)"
+          dirname "$python_path" >> "$GITHUB_PATH"
+          "$python_path" --version
+      - name: Configure runner-local Mage oracle path
+        run: echo "MAGE_GOLDEN_DIR=$RUNNER_TEMP/mage-flow-oracles" >> "$GITHUB_ENV"
       - name: Toolchain versions
         run: rustc --version && cargo --version
       - name: Materialize and verify immutable snapshot
@@ -67,17 +114,134 @@ jobs:
           python3 -m pip install --disable-pip-version-check --target "$RUNNER_TEMP/huggingface-hub" "huggingface_hub==1.20.1"
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model z-image-turbo --snapshot "$ZIMAGE_SNAPSHOT"
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model mage-flow --snapshot "$MAGE_SNAPSHOT"
-      - name: Regenerate and verify shared CPU Mage oracles
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model mage-flow-edit --snapshot "$MAGE_EDIT_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model mage-flow-edit-base --snapshot "$MAGE_EDIT_BASE_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model mage-flow-edit-turbo --snapshot "$MAGE_EDIT_TURBO_SNAPSHOT"
+      - name: Derive immutable Mage oracle cache key
+        id: mage-oracle-key
         run: |
-          python -m venv "$RUNNER_TEMP/mage-reference"
-          "$RUNNER_TEMP/mage-reference/bin/python" -m pip install \
-            --disable-pip-version-check --only-binary=:all: --require-hashes \
-            -r crates/media/mlx-gen/_vendor/mage_flow/requirements-oracles.txt
-          MAGE_DEVICE=cpu "$RUNNER_TEMP/mage-reference/bin/python" \
+          snapshot_revision() {
+            local snapshot="$1"
+            local marker="$snapshot/.sceneworks-model-revision"
+            local revision
+            if [[ -f "$marker" ]]; then
+              revision="$(tr -d '\r\n' < "$marker")"
+            else
+              revision="$(basename "$(cd "$snapshot" && pwd -P)")"
+            fi
+            if [[ ! "$revision" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "Snapshot does not resolve to an immutable 40-hex revision: $snapshot" >&2
+              return 1
+            fi
+            printf '%s' "$revision"
+          }
+          producer="${{ hashFiles('.github/workflows/real-weights.yml', 'crates/media/mlx-gen/_vendor/mage_flow/**', 'crates/media/mlx-gen/_vendor/mage_flow/assets/dog.jpg', 'crates/media/mlx-gen/_vendor/mage_flow/requirements-oracles.txt', 'crates/media/mlx-gen/tools/_paths.py', 'crates/media/mlx-gen/tools/dump_mage_flow_golden.py', 'crates/media/mlx-gen/tools/dump_mage_vae_sizes.py', 'scripts/release/provision_mage_oracles.py', 'scripts/release/provision_mage_edit_variants.py', 'scripts/release/verify_mage_candle_oracles.py', 'scripts/release/verify_mage_candle_transfer.py') }}"
+          if [[ ! "$producer" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "Oracle producer fingerprint is missing or malformed: $producer" >&2
+            exit 1
+          fi
+          key="mage-oracles-v1-$(snapshot_revision "$MAGE_SNAPSHOT")-$(snapshot_revision "$MAGE_EDIT_SNAPSHOT")-$(snapshot_revision "$MAGE_EDIT_BASE_SNAPSHOT")-$(snapshot_revision "$MAGE_EDIT_TURBO_SNAPSHOT")-$producer"
+          echo "key=$key" >> "$GITHUB_OUTPUT"
+      - name: Restore verified Mage oracle cache
+        id: mage-oracle-cache
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ runner.temp }}/mage-flow-oracles
+          key: ${{ steps.mage-oracle-key.outputs.key }}
+      - name: Require operator-provisioned Mage oracle seed
+        id: mage-oracle-seed
+        if: steps.mage-oracle-cache.outputs.cache-hit != 'true'
+        run: |
+          if [[ -z "$MAGE_ORACLE_SEED_DIR" ]]; then
+            echo "Mage oracle cache missed and MAGE_ORACLE_SEED_DIR is unset; refusing to run the multi-hour CPU producer on the shared Actions runner" >&2
+            exit 1
+          fi
+          if [[ "$MAGE_ORACLE_SEED_DIR" != /* || ! -d "$MAGE_ORACLE_SEED_DIR" ]]; then
+            echo "MAGE_ORACLE_SEED_DIR must be an existing absolute directory" >&2
+            exit 1
+          fi
+          files=(
+            mage_flow_te_golden.safetensors
+            mage_flow_edit_golden.safetensors
+            mage_flow_edit_base_golden.safetensors
+            mage_flow_edit_turbo_golden.safetensors
+            mage_flow_vae_f32_256.safetensors
+            mage_flow_vae_f32_992.safetensors
+            mage_flow_vae_f32_1024.safetensors
+            mage_flow_vae_f32_2048.safetensors
+            mage_flow_vae_f32_512x2048.safetensors
+            mage_flow_vae_f32_768x1280.safetensors
+            mage_flow_vae_f32_768x1152.safetensors
+            mage_flow_dit_golden.safetensors
+            mage_flow_e2e_golden.safetensors
+            mage_oracles_manifest.json
+            mage_edit_oracle_manifest.json
+            mage_edit_variants_manifest.json
+            mage_candle_oracles_manifest.json
+            mage_candle_transfer_manifest.json
+          )
+          mkdir -p "$MAGE_GOLDEN_DIR"
+          for file in "${files[@]}"; do
+            source="$MAGE_ORACLE_SEED_DIR/$file"
+            if [[ ! -f "$source" || -L "$source" ]]; then
+              echo "Operator Mage oracle seed is missing a regular, non-symlink file: $source" >&2
+              exit 1
+            fi
+            install -m 0644 "$source" "$MAGE_GOLDEN_DIR/$file"
+          done
+          echo "imported=true" >> "$GITHUB_OUTPUT"
+      # sc-14051 Candle acceptance oracle: one frozen-Torch 1024²/20-step reference run emits
+      # both the step-zero full-DiT boundary and the final e2e image. It is generated on a
+      # different backend/process from the Candle implementation and transferred as an immutable
+      # workflow artifact; Candle never blesses its own output. Cache misses require that
+      # operator-generated bundle above instead of running the multi-hour producer in Actions.
+      - name: Verify restored or operator-provisioned Mage oracle cache
+        run: |
+          if [[ ! -x "$RUNNER_TEMP/mage-reference/bin/python" ]]; then
+            python -m venv "$RUNNER_TEMP/mage-reference"
+            "$RUNNER_TEMP/mage-reference/bin/python" -m pip install \
+              --disable-pip-version-check --only-binary=:all: --require-hashes \
+              -r crates/media/mlx-gen/_vendor/mage_flow/requirements-oracles.txt
+          fi
+          "$RUNNER_TEMP/mage-reference/bin/python" \
             scripts/release/provision_mage_oracles.py \
             --snapshot "$MAGE_SNAPSHOT" \
+            --edit-snapshot "$MAGE_EDIT_SNAPSHOT" \
+            --output "$MAGE_GOLDEN_DIR" \
+            --verify-only
+          "$RUNNER_TEMP/mage-reference/bin/python" \
+            scripts/release/provision_mage_oracles.py \
+            --snapshot "$MAGE_SNAPSHOT" \
+            --edit-snapshot "$MAGE_EDIT_SNAPSHOT" \
+            --output "$MAGE_GOLDEN_DIR" \
+            --verify-edit-artifact
+          "$RUNNER_TEMP/mage-reference/bin/python" \
+            scripts/release/provision_mage_edit_variants.py \
+            --gen "$MAGE_SNAPSHOT" \
+            --edit "$MAGE_EDIT_SNAPSHOT" \
+            --edit-base "$MAGE_EDIT_BASE_SNAPSHOT" \
+            --edit-turbo "$MAGE_EDIT_TURBO_SNAPSHOT" \
+            --output "$MAGE_GOLDEN_DIR" \
+            --verify-only
+          "$RUNNER_TEMP/mage-reference/bin/python" \
+            scripts/release/verify_mage_candle_oracles.py \
+            --snapshot "$MAGE_SNAPSHOT" \
+            --edit-snapshot "$MAGE_EDIT_SNAPSHOT" \
+            --output "$MAGE_GOLDEN_DIR"
+          "$RUNNER_TEMP/mage-reference/bin/python" \
+            scripts/release/verify_mage_candle_transfer.py \
+            --gen "$MAGE_SNAPSHOT" \
+            --edit "$MAGE_EDIT_SNAPSHOT" \
+            --edit-base "$MAGE_EDIT_BASE_SNAPSHOT" \
+            --edit-turbo "$MAGE_EDIT_TURBO_SNAPSHOT" \
             --output "$MAGE_GOLDEN_DIR"
           echo "MAGE_FLOW_TE_GOLDEN=$MAGE_GOLDEN_DIR/mage_flow_te_golden.safetensors" >> "$GITHUB_ENV"
+      - name: Save verified Mage oracle cache
+        if: steps.mage-oracle-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ runner.temp }}/mage-flow-oracles
+          key: ${{ steps.mage-oracle-key.outputs.key }}
       - name: Run provider conformance
         run: >-
           cargo test --locked -p mlx-gen-z-image --test conformance
@@ -95,6 +259,159 @@ jobs:
         run: >-
           cargo test --locked --release -p mlx-gen-mage --test vae_decode_real_weights
           -- --ignored --nocapture
+      # SC-15507: one loaded provider executes A -> B -> A request scopes, observes cancellation at
+      # Mage's terminal post-trace check, injects an error outcome after real work, and proves both
+      # cleanup paths permit follow-ups. SceneWorks owns selector/cache-state coverage; this workflow
+      # has the Apple MLX hardware and complete snapshot needed for the provider half.
+      - name: Run Mage request-memory lifecycle
+        env:
+          MAGE_REQUEST_SCOPE_SNAPSHOT: ${{ env.MAGE_SNAPSHOT }}
+          MAGE_REQUEST_SCOPE_QUANT: bf16
+        run: >-
+          cargo test --locked --release -p mlx-gen-mage
+          --test request_memory_scope_real_weights -- --ignored --nocapture
+      - name: Run Mage-Flow instruction-edit parity
+        run: |
+          status=0
+          MAGE_EDIT_GOLDEN_NAME=mage_flow_edit_golden.safetensors \
+            cargo test --locked --release -p mlx-gen-mage --test edit_real_weights \
+            -- --ignored --nocapture || status=$?
+          MAGE_EDIT_SNAPSHOT="$MAGE_EDIT_BASE_SNAPSHOT" \
+            MAGE_EDIT_GOLDEN_NAME=mage_flow_edit_base_golden.safetensors \
+            cargo test --locked --release -p mlx-gen-mage --test edit_real_weights \
+            fixed_instruction_edit_matches_the_torch_reference -- --ignored --nocapture || status=$?
+          MAGE_EDIT_SNAPSHOT="$MAGE_EDIT_TURBO_SNAPSHOT" \
+            MAGE_EDIT_GOLDEN_NAME=mage_flow_edit_turbo_golden.safetensors \
+            cargo test --locked --release -p mlx-gen-mage --test edit_real_weights \
+            fixed_instruction_edit_matches_the_torch_reference -- --ignored --nocapture || status=$?
+          exit "$status"
+      - name: Upload verified Mage edit oracle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: mage-flow-edit-oracle-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/mage-flow-oracles/mage_flow_edit_golden.safetensors
+            ${{ runner.temp }}/mage-flow-oracles/mage_flow_edit_base_golden.safetensors
+            ${{ runner.temp }}/mage-flow-oracles/mage_flow_edit_turbo_golden.safetensors
+            ${{ runner.temp }}/mage-flow-oracles/mage_edit_oracle_manifest.json
+            ${{ runner.temp }}/mage-flow-oracles/mage_edit_variants_manifest.json
+          if-no-files-found: error
+      - name: Upload Candle Mage acceptance oracles
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: mage-flow-candle-oracles-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/mage-flow-oracles/mage_flow_te_golden.safetensors
+            ${{ runner.temp }}/mage-flow-oracles/mage_flow_dit_golden.safetensors
+            ${{ runner.temp }}/mage-flow-oracles/mage_flow_vae_f32_1024.safetensors
+            ${{ runner.temp }}/mage-flow-oracles/mage_flow_e2e_golden.safetensors
+            ${{ runner.temp }}/mage-flow-oracles/mage_flow_edit_golden.safetensors
+            ${{ runner.temp }}/mage-flow-oracles/mage_flow_edit_base_golden.safetensors
+            ${{ runner.temp }}/mage-flow-oracles/mage_flow_edit_turbo_golden.safetensors
+            ${{ runner.temp }}/mage-flow-oracles/mage_edit_oracle_manifest.json
+            ${{ runner.temp }}/mage-flow-oracles/mage_edit_variants_manifest.json
+            ${{ runner.temp }}/mage-flow-oracles/mage_candle_oracles_manifest.json
+            ${{ runner.temp }}/mage-flow-oracles/mage_candle_transfer_manifest.json
+          if-no-files-found: error
+
+  # sc-8446 (epic 8431) — the FIRST real-weight video lane. Kept a separate job from `mlx-media`
+  # because that one is entirely Mage-Flow oracle machinery (a pinned reference Python, a
+  # multi-GB golden cache, an operator seed dir) that a video smoke needs none of, and because a 20 GB
+  # tier fetch should be able to fail without taking the image lane's oracle work with it.
+  mlx-krea-realtime:
+    name: MLX Krea Realtime video real weights
+    # `krea-realtime` is selectable on its own so the 20 GB tier fetch does not require running the
+    # Mage-oracle job that shares the `media` profile.
+    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'media' || inputs.profile == 'krea-realtime'
+    runs-on: [self-hosted, macOS, ARM64, real-weights]
+    env:
+      # The repo root of the pinned `SceneWorks/krea-realtime-14b-mlx` rehost. Each tier subdir is a
+      # complete snapshot, so the tests are pointed one level in (`/q4`).
+      KREA_REALTIME_SNAPSHOT: ${{ vars.KREA_REALTIME_SNAPSHOT }}
+      KREA_STYLE_LORA_SNAPSHOT: ${{ vars.KREA_STYLE_LORA_SNAPSHOT }}
+      KREA_DISTILL_LORA_SNAPSHOT: ${{ vars.KREA_DISTILL_LORA_SNAPSHOT }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Toolchain versions
+        run: rustc --version && cargo --version
+      # An unset repo variable would otherwise reach `ensure_model_snapshot.py` as an empty path and
+      # fail as a confusing "revision mismatch" rather than "you did not configure this lane".
+      - name: Require the operator-provisioned snapshot paths
+        run: |
+          for v in KREA_REALTIME_SNAPSHOT KREA_STYLE_LORA_SNAPSHOT KREA_DISTILL_LORA_SNAPSHOT; do
+            if [[ -z "${!v}" ]]; then
+              echo "Repository variable $v is unset; this lane cannot resolve its snapshot path" >&2
+              exit 1
+            fi
+            if [[ "${!v}" != /* ]]; then
+              echo "$v must be an absolute path, got: ${!v}" >&2
+              exit 1
+            fi
+          done
+      - name: Materialize and verify immutable snapshots
+        run: |
+          python3 -m pip install --disable-pip-version-check --target "$RUNNER_TEMP/huggingface-hub" "huggingface_hub==1.20.1"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model krea-realtime-14b-mlx --snapshot "$KREA_REALTIME_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model wan-origami-style-lora --snapshot "$KREA_STYLE_LORA_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model wan-lightx2v-step-distill-lora --snapshot "$KREA_DISTILL_LORA_SNAPSHOT"
+      # Coherence floor + per-chunk/whole-clip timing + the MLX memory ceiling, then the i2v
+      # single-frame anchor, the v2v strength=0 paths, and the sc-15325 decode-tiling characterization.
+      #
+      # 33 frames, not 81, and that is required rather than incidental: the sc-15325 sweep compares
+      # against a SINGLE-PASS decode, which is only valid below the z16 write cap of 56 output frames at
+      # 832x480 (the sweep asserts this itself and would fail at 81). `KREA_SMOKE_FRAMES` is set PER
+      # STEP so the one test that genuinely needs the production geometry -- the KV-cache residency,
+      # whose 6-latent-frame window must fill -- can run at 81 in its own step below.
+      - name: Run Krea Realtime real-weight e2e (Q4 tier)
+        env:
+          KREA_SMOKE_W: "832"
+          KREA_SMOKE_H: "480"
+          KREA_SMOKE_FRAMES: "33"
+        run: >-
+          KREA_REALTIME_SNAPSHOT_DIR="$KREA_REALTIME_SNAPSHOT/q4"
+          cargo test --locked --release -p mlx-gen-krea-realtime --test generate_smoke
+          -- --ignored --nocapture --test-threads 1
+          --skip kv_cache_residency_at_the_production_geometry
+      # The KV-cache residency IS a production-geometry measurement (the 6-latent-frame window must be
+      # full), so it runs at the real 81-frame clip.
+      - name: Run Krea Realtime KV-cache residency (production geometry)
+        env:
+          KREA_SMOKE_W: "832"
+          KREA_SMOKE_H: "480"
+          KREA_SMOKE_FRAMES: "81"
+        run: >-
+          KREA_REALTIME_SNAPSHOT_DIR="$KREA_REALTIME_SNAPSHOT/q4"
+          cargo test --locked --release -p mlx-gen-krea-realtime --test generate_smoke
+          kv_cache_residency_at_the_production_geometry --exact
+          -- --ignored --nocapture
+      # A published Wan style LoRA must load through `LoadSpec::adapters` and measurably change the
+      # render, with the scale-0 arm as the attribution control; and the step-distill file is the only
+      # real-weight regression gate on the sc-8446 globals-surface decision.
+      #
+      # `--exact` + a run-count assertion: selecting by bare name means a rename yields
+      # "0 passed; N filtered out" and a GREEN step, silently deleting the only coverage these have.
+      - name: Run Krea Realtime real Wan LoRA gates
+        env:
+          KREA_LORA_W: "832"
+          KREA_LORA_H: "480"
+          KREA_LORA_FRAMES: "13"
+        run: |
+          set -o pipefail
+          run_one() {
+            local name="$1"
+            local out
+            out="$(KREA_REALTIME_SNAPSHOT_DIR="$KREA_REALTIME_SNAPSHOT/q4" \
+              KREA_STYLE_LORA="$KREA_STYLE_LORA_SNAPSHOT/origami_000000500.safetensors" \
+              KREA_DISTILL_LORA="$KREA_DISTILL_LORA_SNAPSHOT/Lightx2v/lightx2v_T2V_14B_cfg_step_distill_v2_lora_rank64_bf16.safetensors" \
+              cargo test --locked --release -p mlx-gen-krea-realtime --test style_lora_real_weights \
+              "$name" --exact -- --ignored --nocapture 2>&1 | tee /dev/stderr)"
+            if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
+              echo "::error::'$name' did not run exactly one passing test — a rename would make this step vacuously green" >&2
+              return 1
+            fi
+          }
+          run_one real_wan_style_lora_loads_and_changes_the_render
+          run_one real_wan_step_distill_lora_installs_over_the_widened_globals
 
   candle-audio:
     name: Candle audio real weights
@@ -222,6 +539,1299 @@ jobs:
       - name: Run regression fixture
         run: cargo test --locked -p candle-audio-kokoro --test regression kokoro_regression_fixture -- --ignored --nocapture
 
+  same-l-metal:
+    name: SAME-L real weights (Metal)
+    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'same-l'
+    runs-on: [self-hosted, macOS, ARM64, real-weights]
+    env:
+      SA3_SAME_L_CASE: standalone
+      SA3_TEST_METAL: "1"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Configure immutable SAME-L snapshot path
+        run: echo "SA3_SAME_L_SNAPSHOT=$RUNNER_TEMP/sa3-same-l/41acf79dd242877d6499a1108ca5dba5d5eecfc5" >> "$GITHUB_ENV"
+      - name: Toolchain and hardware versions
+        run: |
+          sw_vers
+          system_profiler SPHardwareDataType SPDisplaysDataType |
+            grep -E 'Model Name|Model Identifier|Chip|Total Number of Cores|Memory|Chipset Model|Metal Support'
+          rustc --version
+          cargo --version
+      - name: Materialize and verify immutable SAME-L snapshot
+        run: |
+          python3 -m pip install --disable-pip-version-check --target "$RUNNER_TEMP/huggingface-hub" "huggingface_hub==1.20.1"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model same-l --snapshot "$SA3_SAME_L_SNAPSHOT"
+      - name: Verify SAME-L short and long band boundaries on Metal
+        run: |
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features metal same_l_short_standalone_and_embedded_match_every_band_layer -- --ignored --nocapture
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features metal same_l_long_durations_match_compact_band_boundaries -- --ignored --nocapture
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features metal same_l_variable_stride_padding_gather_and_noise_order_match_upstream -- --ignored --nocapture
+      - name: Measure literal 380-second and exact-max SAME-L roundtrips on Metal
+        run: |
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features metal same_l_long_duration_roundtrip_resource_probe -- --ignored --nocapture
+          SA3_SAME_L_RESOURCE_SAMPLES=16777216 cargo test --locked --release -p candle-audio-stable-audio-3 --features metal same_l_long_duration_roundtrip_resource_probe -- --ignored --nocapture
+
+  same-chunked-metal:
+    name: SAME outer chunking real weights (Metal)
+    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'same-chunked'
+    runs-on: [self-hosted, macOS, ARM64, real-weights]
+    env:
+      SA3_TEST_METAL: "1"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Configure immutable SAME snapshot paths
+        run: |
+          echo "SA3_SAME_S_SNAPSHOT=$RUNNER_TEMP/sa3-same-s/fbeb3dcf53a326e5682f38e22e7f740202d44232" >> "$GITHUB_ENV"
+          echo "SA3_SAME_L_SNAPSHOT=$RUNNER_TEMP/sa3-same-l/41acf79dd242877d6499a1108ca5dba5d5eecfc5" >> "$GITHUB_ENV"
+      - name: Toolchain and hardware versions
+        run: |
+          sw_vers
+          system_profiler SPHardwareDataType SPDisplaysDataType |
+            grep -E 'Model Name|Model Identifier|Chip|Total Number of Cores|Memory|Chipset Model|Metal Support'
+          rustc --version
+          cargo --version
+      - name: Materialize and verify immutable SAME snapshots
+        run: |
+          python3 -m pip install --disable-pip-version-check --target "$RUNNER_TEMP/huggingface-hub" "huggingface_hub==1.20.1"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model same-s --snapshot "$SA3_SAME_S_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model same-l --snapshot "$SA3_SAME_L_SNAPSHOT"
+      - name: Verify frozen SAME-S and SAME-L chunk ownership on Metal
+        run: |
+          SA3_CHUNKED_CASE=same_s cargo test --locked --release -p candle-audio-stable-audio-3 --features metal --test chunked_oracle chunked_same_s_and_same_l_match_frozen_torch_and_boundary_metrics -- --ignored --nocapture
+          SA3_CHUNKED_CASE=same_l cargo test --locked --release -p candle-audio-stable-audio-3 --features metal --test chunked_oracle chunked_same_s_and_same_l_match_frozen_torch_and_boundary_metrics -- --ignored --nocapture
+      - name: Measure and verify 120-second direct versus chunked resources
+        run: |
+          set -o pipefail
+          resource_log="$RUNNER_TEMP/sa3-chunked-resource.log"
+          : > "$resource_log"
+          for case in same_s same_l; do
+            for mode in direct chunked; do
+              for operation in encode decode; do
+                SA3_CHUNKED_CASE="$case" \
+                SA3_CHUNKED_RESOURCE_MODE="$mode" \
+                SA3_CHUNKED_RESOURCE_OPERATION="$operation" \
+                  cargo test --locked --release -p candle-audio-stable-audio-3 \
+                    --features metal --test chunked_oracle chunked_same_resource_probe \
+                    -- --ignored --nocapture 2>&1 | tee -a "$resource_log"
+              done
+            done
+          done
+          python3 scripts/reference/verify_sa3_chunked_resource_log.py \
+            "$resource_log" --json | tee "$RUNNER_TEMP/sa3-chunked-resource.json"
+
+  sa3-small-music-metal:
+    name: Stable Audio 3 small-music provider (Metal)
+    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'sa3-small-music'
+    runs-on: [self-hosted, macOS, ARM64, real-weights]
+    env:
+      SA3_TEST_METAL: "1"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Configure immutable small-music snapshot path
+        run: echo "SA3_SMALL_MUSIC_SNAPSHOT=$RUNNER_TEMP/sa3-small-music/0fef1392cd842149a2b6d445e181c97608faac06" >> "$GITHUB_ENV"
+      - name: Toolchain and hardware versions
+        run: |
+          sw_vers
+          system_profiler SPHardwareDataType SPDisplaysDataType |
+            grep -E 'Model Name|Model Identifier|Chip|Total Number of Cores|Memory|Chipset Model|Metal Support'
+          rustc --version
+          cargo --version
+      - name: Materialize and verify immutable small-music snapshot
+        run: |
+          python3 -m pip install --disable-pip-version-check --target "$RUNNER_TEMP/huggingface-hub" "huggingface_hub==1.20.1"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-music --snapshot "$SA3_SMALL_MUSIC_SNAPSHOT"
+      - name: Run registered provider conformance and concurrent RNG isolation on Metal
+        run: |
+          # Named tests: the shared `conformance` binary also carries the sc-14544 small-sfx cases,
+          # which need their own snapshot and run in the sa3-small-sfx job.
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
+            --test conformance registered_provider_passes_full_audio_conformance -- --ignored --nocapture
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
+            --test conformance concurrent_requests_are_deterministic_and_do_not_share_rng_state -- --ignored --nocapture
+      - name: Match the frozen-torch provider oracle end to end (CPU-pinned, does not certify Metal)
+        run: |
+          # sc-14543's end-to-end parity oracle against the vendored
+          # `docs/migration/sa3-small-music-provider-reference` artifact. It ran in no lane until
+          # sc-14545, which is how its `from_layout` call site could be re-pointed from a bare
+          # `HUB_REPO` string to `Variant::SmallMusic.geometry()` with nothing but a compile check
+          # behind it. `validate_layout` rejects a wrong variant before a tensor is read, so this is
+          # the executable proof that the rename kept the checkpoint binding. Deterministic
+          # (`Device::Cpu`, portable LCG noise, fixed seed) and measured at 20.6 s on an M-series
+          # Mac against this exact pinned snapshot.
+          #
+          # This job sets `SA3_TEST_METAL`, but this step deliberately ignores it and every other
+          # `SA3_TEST_*` selector: its bounds are exact-reproduction-grade against a frozen Torch
+          # CPU-f32 artifact and are calibrated on CPU, so this step certifies frozen-Torch parity
+          # and **not** the Metal backend. The reasoning is on the test itself
+          # (`tests/provider_oracle.rs`). Metal small-music coverage comes from this job's
+          # conformance, stereo-width and render steps, which resolve their device through
+          # `candle_audio::default_device()`. This is why there is no CUDA counterpart.
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
+            --test provider_oracle -- --ignored --nocapture
+      - name: Re-calibrate the music stereo-width floor across prompts and seeds
+        run: |
+          # sc-14544 added a per-window-median side-ratio assertion to the shared `assert_real_audio`
+          # helper, which the render step below enforces on this variant too. This sweep is the
+          # measurement behind it, at the render's own 30 s / 8 steps.
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
+            --test provider music_stereo_width_floor_is_calibrated_across_prompts_and_seeds \
+            -- --ignored --nocapture
+      - name: Render a real 30-second eight-step Metal WAV
+        run: |
+          SA3_TEST_DURATION=30 SA3_TEST_STEPS=8 \
+          SA3_SMALL_MUSIC_WAV_OUT="$RUNNER_TEMP/sa3-small-music-metal.wav" \
+            cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
+              --test provider connected_short_generation_is_stereo_finite_and_exact_length \
+              -- --ignored --nocapture
+          shasum -a 256 "$RUNNER_TEMP/sa3-small-music-metal.wav"
+
+  sa3-small-sfx-metal:
+    name: Stable Audio 3 small-sfx provider (Metal)
+    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'sa3-small-sfx'
+    runs-on: [self-hosted, macOS, ARM64, real-weights]
+    env:
+      SA3_TEST_METAL: "1"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Configure immutable small-sfx and small-music snapshot paths
+        run: |
+          # sc-14544's identity and divergence gates compare the two checkpoints against each other,
+          # so both snapshots are required on this runner.
+          echo "SA3_SMALL_SFX_SNAPSHOT=$RUNNER_TEMP/sa3-small-sfx/ae12755283df9d62ca39a9b050a39a0b607b8c20" >> "$GITHUB_ENV"
+          echo "SA3_SMALL_MUSIC_SNAPSHOT=$RUNNER_TEMP/sa3-small-music/0fef1392cd842149a2b6d445e181c97608faac06" >> "$GITHUB_ENV"
+      - name: Toolchain and hardware versions
+        run: |
+          sw_vers
+          system_profiler SPHardwareDataType SPDisplaysDataType |
+            grep -E 'Model Name|Model Identifier|Chip|Total Number of Cores|Memory|Chipset Model|Metal Support'
+          rustc --version
+          cargo --version
+      - name: Materialize and verify both immutable small snapshots
+        run: |
+          python3 -m pip install --disable-pip-version-check --target "$RUNNER_TEMP/huggingface-hub" "huggingface_hub==1.20.1"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-sfx --snapshot "$SA3_SMALL_SFX_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-music --snapshot "$SA3_SMALL_MUSIC_SNAPSHOT"
+      # sc-14546 moved `--test variant_binding` to the `sa3-base-identity-metal` job. Every gate in
+      # that target now needs all six pinned snapshots — `every_post_trained_base_pair_...` and
+      # `sibling_root_weights_under_the_other_config_...` compare each post-trained checkpoint
+      # against its `-base` sibling in both directions — and this job provisions two. Running the
+      # target here would fail on a missing snapshot rather than skip, which is the correct failure
+      # but the wrong job.
+      - name: Prove music and SFX actually diverge
+        run: |
+          # sc-14546: both cases in this target now run on the lane's device. The runtime half
+          # always did (it goes through `provider_registry().load(…)` ->
+          # `candle_audio::default_device()`); the single-step DiT half hardcoded `Device::Cpu` and
+          # now honours the shared `SA3_TEST_METAL`/`SA3_TEST_CUDA` selector. Its ±0.02 absolute
+          # cosine band sits far above accelerator reduced-precision noise, so nothing in it was
+          # CPU-calibrated.
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
+            --test variant_divergence -- --ignored --nocapture
+      - name: Run registered SFX provider conformance and concurrent RNG isolation on Metal
+        run: |
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
+            --test conformance registered_sfx_provider_passes_full_audio_conformance -- --ignored --nocapture
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
+            --test conformance concurrent_sfx_requests_are_deterministic_and_do_not_share_rng_state -- --ignored --nocapture
+      - name: Re-calibrate the SFX stereo-width floor across prompts and seeds
+        run: |
+          # The floor the render step below enforces is derived from this 25-sample sweep, so the
+          # calibration is re-checked rather than trusted. The sweep's own defaults are 30 s /
+          # 8 steps — the same duration and step count the render enforces at — so calibration and
+          # enforcement cannot drift apart. The CUDA job runs the identical sweep before its own
+          # render for the same reason: a floor measured on one backend and enforced on another is
+          # not a calibrated gate.
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
+            --test provider sfx_stereo_width_floor_is_calibrated_across_prompts_and_seeds \
+            -- --ignored --nocapture
+      - name: Render a real 30-second eight-step SFX Metal WAV
+        run: |
+          SA3_TEST_DURATION=30 SA3_TEST_STEPS=8 \
+          SA3_SMALL_SFX_WAV_OUT="$RUNNER_TEMP/sa3-small-sfx-metal.wav" \
+            cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
+              --test provider connected_sfx_generation_is_stereo_finite_and_exact_length \
+              -- --ignored --nocapture
+          shasum -a 256 "$RUNNER_TEMP/sa3-small-sfx-metal.wav"
+
+  sa3-medium-metal:
+    name: Stable Audio 3 medium provider (Metal)
+    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'sa3-medium'
+    runs-on: [self-hosted, macOS, ARM64, real-weights]
+    env:
+      SA3_TEST_METAL: "1"
+      # No SA3_REQUIRE_ALL_SNAPSHOTS here: `variant_binding` is the only target that reads it, and
+      # sc-14546 moved that target to `sa3-base-identity-metal`, the one job with all six snapshots.
+      # The embedded-SAME-L oracle case. `same-l-metal` pins `standalone`, so before sc-14545 the
+      # embedded branch of `same_l_short_standalone_and_embedded_match_every_band_layer` and
+      # `same_l_long_durations_match_compact_band_boundaries` had never executed in CI despite both
+      # tests reading SA3_MEDIUM_SNAPSHOT. Medium is the only registered provider that decodes
+      # through SAME-L, so this is where that case belongs.
+      SA3_SAME_L_CASE: embedded
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Configure immutable medium, medium-base and small snapshot paths
+        run: |
+          # The cross-variant mutation gates compare medium against both smalls and against its own
+          # base sibling, and the two-domain comparison renders medium beside each specialist, so
+          # every snapshot they read has to be on this runner.
+          echo "SA3_MEDIUM_SNAPSHOT=$RUNNER_TEMP/sa3-medium/27b5a21b791b1b033d193a9e1e3ce78493f102f9" >> "$GITHUB_ENV"
+          echo "SA3_MEDIUM_BASE_SNAPSHOT=$RUNNER_TEMP/sa3-medium-base/b32993f73c3bdc3864043a72d8032606bba737c8" >> "$GITHUB_ENV"
+          echo "SA3_SMALL_MUSIC_SNAPSHOT=$RUNNER_TEMP/sa3-small-music/0fef1392cd842149a2b6d445e181c97608faac06" >> "$GITHUB_ENV"
+          echo "SA3_SMALL_SFX_SNAPSHOT=$RUNNER_TEMP/sa3-small-sfx/ae12755283df9d62ca39a9b050a39a0b607b8c20" >> "$GITHUB_ENV"
+          echo "SA3_SAME_L_SNAPSHOT=$RUNNER_TEMP/sa3-same-l/41acf79dd242877d6499a1108ca5dba5d5eecfc5" >> "$GITHUB_ENV"
+      - name: Toolchain and hardware versions
+        run: |
+          sw_vers
+          system_profiler SPHardwareDataType SPDisplaysDataType |
+            grep -E 'Model Name|Model Identifier|Chip|Total Number of Cores|Memory|Chipset Model|Metal Support'
+          rustc --version
+          cargo --version
+      - name: Run the crate unit tests against real Metal
+        # Weight-free, seconds long, and the only lane where the device-dependent unit tests execute
+        # on an accelerator: `zero_element_tensors_load_on_the_target_device` is a no-op on the CPU
+        # lane but is the regression gate for the zero-byte `noise_scaling_factor` buffer that broke
+        # the embedded SAME-L case below. Runs before the 10.4 GB downloads so it fails fast.
+        run: cargo test --locked --release -p candle-audio-stable-audio-3 --features metal --lib
+      - name: Materialize and verify the immutable snapshots
+        run: |
+          python3 -m pip install --disable-pip-version-check --target "$RUNNER_TEMP/huggingface-hub" "huggingface_hub==1.20.1"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model stable-audio-3-medium --snapshot "$SA3_MEDIUM_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model stable-audio-3-medium-base --snapshot "$SA3_MEDIUM_BASE_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-music --snapshot "$SA3_SMALL_MUSIC_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-sfx --snapshot "$SA3_SMALL_SFX_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model same-l --snapshot "$SA3_SAME_L_SNAPSHOT"
+      - name: Verify the embedded SAME-L band boundaries on Metal
+        run: |
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
+            same_l_short_standalone_and_embedded_match_every_band_layer -- --ignored --nocapture
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
+            same_l_long_durations_match_compact_band_boundaries -- --ignored --nocapture
+      # sc-14546 moved `--test variant_binding` to `sa3-base-identity-metal`, which provisions all
+      # six pinned snapshots. This job carries five.
+      - name: Run registered medium conformance and concurrent RNG isolation on Metal
+        run: |
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
+            --test conformance registered_medium_provider_passes_full_audio_conformance -- --ignored --nocapture
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
+            --test conformance concurrent_medium_requests_are_deterministic_and_do_not_share_rng_state -- --ignored --nocapture
+      - name: Re-calibrate the medium stereo-width floor across both domains
+        run: |
+          # Medium's floor is derived from a 25-sample sweep that deliberately mixes music and SFX
+          # prompts, because medium is the only SA3 checkpoint registered for both. The sweep's
+          # defaults are the render's own 30 s / 8 steps.
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
+            --test provider medium_stereo_width_floor_is_calibrated_across_prompts_and_seeds \
+            -- --ignored --nocapture
+      - name: Run registered medium-base conformance and its calibrated render on Metal
+        run: |
+          # sc-14546. This job already provisions `stable-audio-3-medium-base` for the identity
+          # gates, so the registered `stable_audio_3_medium_base` provider is validated here rather
+          # than in a job that would have to download the same 10.4 GB again.
+          #
+          # The render deliberately omits `steps`, `sampler` and `guidance` so the provider resolves
+          # this variant's own operating point — Euler / 50 / 7.0 — which is ~12.5x the example-work
+          # of the post-trained 8-step Pingpong default at the same duration. The sweep behind the
+          # enforced side-ratio floor runs at the render's own 10 s, so calibration and enforcement
+          # cannot drift apart.
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
+            --test conformance registered_medium_base_provider_passes_full_audio_conformance -- --ignored --nocapture
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
+            --test conformance concurrent_medium_base_requests_are_deterministic_and_do_not_share_rng_state -- --ignored --nocapture
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
+            --test provider medium_base_stereo_width_floor_is_calibrated_across_prompts_and_seeds \
+            -- --ignored --nocapture
+          SA3_MEDIUM_BASE_WAV_OUT="$RUNNER_TEMP/sa3-medium-base-metal.wav" \
+            cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
+              --test provider connected_medium_base_generation_at_its_own_defaults_is_stereo_finite_and_exact_length \
+              -- --ignored --nocapture
+          shasum -a 256 "$RUNNER_TEMP/sa3-medium-base-metal.wav"
+      - name: Prove medium serves both domains and diverges from each specialist
+        run: |
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
+            --test variant_quality -- --ignored --nocapture
+      - name: Measure the F16-vs-F32 compute policy on real weights
+        run: |
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
+            --test dtype_policy -- --ignored --nocapture
+      - name: Measure the long-form 120 s, 300 s and 380 s renders with peak memory
+        run: |
+          # The 380 s published cap is included: it is the only configuration that exercises the
+          # full 4,096-latent adapted geometry and the 43-chunk SAME-L decode plan, which is the
+          # entire reason this variant is registered separately from the smalls.
+          #
+          # `/usr/bin/time -l` reports `ru_maxrss` over the timed process *and its whole reaped
+          # child tree*, so timing `cargo test` conflates the release build — rustc and the linker
+          # peak in the multi-GB range on their own — with the render. Build first with `--no-run`,
+          # resolve the target's own executable from the JSON artifact stream, then time only that
+          # binary. The reported peak is then the render's, and nothing else's.
+          cargo test --locked --release --no-run -p candle-audio-stable-audio-3 --features metal \
+            --test provider
+          binary="$(
+            cargo test --locked --release --no-run --message-format=json \
+              -p candle-audio-stable-audio-3 --features metal --test provider |
+              python3 -c "import json, sys; print([m['executable'] for m in map(json.loads, sys.stdin) if m.get('reason') == 'compiler-artifact' and m.get('executable') and m.get('target', {}).get('name') == 'provider'][-1])"
+          )"
+          test -x "$binary" || { echo "could not resolve the provider test binary"; exit 1; }
+          echo "timing $binary"
+          SA3_MEDIUM_LONG_SECONDS=120,300,380 \
+          SA3_MEDIUM_LONG_WAV_DIR="$RUNNER_TEMP" \
+            /usr/bin/time -l "$binary" medium_long_form_renders_are_exact_and_timed \
+              --exact --ignored --nocapture
+          for seconds in 120 300 380; do
+            shasum -a 256 "$RUNNER_TEMP/sa3-medium-${seconds}s.wav"
+          done
+      - name: Render a real 30-second eight-step medium Metal WAV
+        run: |
+          SA3_TEST_DURATION=30 SA3_TEST_STEPS=8 \
+          SA3_MEDIUM_WAV_OUT="$RUNNER_TEMP/sa3-medium-metal.wav" \
+            cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
+              --test provider connected_medium_generation_is_stereo_finite_and_exact_length \
+              -- --ignored --nocapture
+          shasum -a 256 "$RUNNER_TEMP/sa3-medium-metal.wav"
+
+  sa3-base-identity-metal:
+    name: Stable Audio 3 base/post-trained identity matrix (Metal)
+    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'sa3-base-identity'
+    runs-on: [self-hosted, macOS, ARM64, real-weights]
+    env:
+      SA3_TEST_METAL: "1"
+      # Every skip branch in `variant_binding` becomes a failure. That matters more here than
+      # anywhere: this job exists precisely to be the one place all six snapshots are present, so a
+      # silently skipped gate here is a gate that runs nowhere at all.
+      SA3_REQUIRE_ALL_SNAPSHOTS: "1"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Configure all six immutable Stable Audio 3 snapshot paths
+        run: |
+          # sc-14546 made `variant_binding` a six-way matrix: each post-trained checkpoint against
+          # its `-base` sibling in both directions, plus the two small bases against each other and
+          # against medium-base. Every one of those needs both sides materialized, so this job owns
+          # the full set and the per-variant jobs no longer run the target.
+          echo "SA3_SMALL_MUSIC_SNAPSHOT=$RUNNER_TEMP/sa3-small-music/0fef1392cd842149a2b6d445e181c97608faac06" >> "$GITHUB_ENV"
+          echo "SA3_SMALL_SFX_SNAPSHOT=$RUNNER_TEMP/sa3-small-sfx/ae12755283df9d62ca39a9b050a39a0b607b8c20" >> "$GITHUB_ENV"
+          echo "SA3_MEDIUM_SNAPSHOT=$RUNNER_TEMP/sa3-medium/27b5a21b791b1b033d193a9e1e3ce78493f102f9" >> "$GITHUB_ENV"
+          echo "SA3_SMALL_MUSIC_BASE_SNAPSHOT=$RUNNER_TEMP/sa3-small-music-base/eab5ceee5ad9c1ed38800aff30a8e49d1161c539" >> "$GITHUB_ENV"
+          echo "SA3_SMALL_SFX_BASE_SNAPSHOT=$RUNNER_TEMP/sa3-small-sfx-base/cc5ddb990e30daa68336ac61c140c37c7033ab7c" >> "$GITHUB_ENV"
+          echo "SA3_MEDIUM_BASE_SNAPSHOT=$RUNNER_TEMP/sa3-medium-base/b32993f73c3bdc3864043a72d8032606bba737c8" >> "$GITHUB_ENV"
+          echo "SA3_SAME_L_SNAPSHOT=$RUNNER_TEMP/sa3-same-l/41acf79dd242877d6499a1108ca5dba5d5eecfc5" >> "$GITHUB_ENV"
+      - name: Toolchain and hardware versions
+        run: |
+          sw_vers
+          rustc --version
+          cargo --version
+      - name: Materialize and verify all six immutable snapshots
+        run: |
+          # The three `-base` entries carry `download_files` allow-lists, so `svd_bases.pt` — 1.27 GB
+          # per small base and 3.84 GB for medium-base, 6.4 GB in total, and unreachable from
+          # `SnapshotLayout::from_dir` — is not fetched.
+          python3 -m pip install --disable-pip-version-check --target "$RUNNER_TEMP/huggingface-hub" "huggingface_hub==1.20.1"
+          for model in stable-audio-3-small-music stable-audio-3-small-sfx stable-audio-3-medium \
+                       stable-audio-3-small-music-base stable-audio-3-small-sfx-base \
+                       stable-audio-3-medium-base same-l; do
+            case "$model" in
+              stable-audio-3-small-music) path="$SA3_SMALL_MUSIC_SNAPSHOT" ;;
+              stable-audio-3-small-sfx) path="$SA3_SMALL_SFX_SNAPSHOT" ;;
+              stable-audio-3-medium) path="$SA3_MEDIUM_SNAPSHOT" ;;
+              stable-audio-3-small-music-base) path="$SA3_SMALL_MUSIC_BASE_SNAPSHOT" ;;
+              stable-audio-3-small-sfx-base) path="$SA3_SMALL_SFX_BASE_SNAPSHOT" ;;
+              stable-audio-3-medium-base) path="$SA3_MEDIUM_BASE_SNAPSHOT" ;;
+              same-l) path="$SA3_SAME_L_SNAPSHOT" ;;
+            esac
+            PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model "$model" --snapshot "$path"
+          done
+      - name: Reject every cross-variant weight path (full mutation matrix)
+        run: |
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
+            --test variant_binding -- --ignored --nocapture
+      - name: Match the frozen-Torch sampler oracles on all six checkpoints
+        run: |
+          # Both cases ran in **no** lane before sc-14546. `all_six_real_p0_pingpong_trajectories`
+          # needs every snapshot, and `real_sampler_cfg_apg_scale_phi` is the hard fixed-guidance
+          # parity gate this story's own CFG acceptance rests on — it replays vanilla CFG, APG and
+          # blended+rescaled guidance at `cfg_scale = 2.5` against
+          # `docs/migration/sa3-sampler-reference/guidance.safetensors` on `small-music` **and**
+          # `small-music-base`.
+          #
+          # Named rather than `--test sampler_oracle -- --ignored`: the third ignored case in that
+          # target, `real_default_sampler_resource_probe`, is an operator probe that requires
+          # SA3_RESOURCE_SNAPSHOT / SA3_RESOURCE_P0 / SA3_RESOURCE_SECONDS and fails without them.
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
+            --test sampler_oracle all_six_real_p0_pingpong_trajectories_match_stepwise -- --ignored --nocapture
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
+            --test sampler_oracle real_sampler_cfg_apg_scale_phi_matches_frozen_upstream -- --ignored --nocapture
+      - name: Prove real CFG and the negative prompt on a base checkpoint
+        run: |
+          # The divergence floor is not a chosen tolerance: the test measures this implementation's
+          # own largest per-element disagreement with the frozen-Torch guidance oracle on this exact
+          # checkpoint, device and dtype, and then requires the negative-prompt divergence to exceed
+          # it. It also asserts the honest control — at `cfg_scale = 1.0` the negative prompt must be
+          # a bit-for-bit no-op, because that is the one value at which the DiT skips the negative
+          # branch entirely. Also pins the shipped 50/7.0 defaults against each snapshot's own
+          # `training.demo` block.
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
+            --test base_guidance -- --ignored --nocapture
+      - name: Certify the explicit-negative conditioning path itself
+        run: |
+          # `base_guidance`'s divergence assertion proves the negative prompt reaches the model; it
+          # cannot prove the batch-2 path is wired *correctly*, because a swapped-halves or masked-
+          # wrong negative branch diverges from the no-negative render just as loudly. Two gates
+          # close that, and neither ran in any lane before sc-14546:
+          #
+          #   * `real_weights_detect_conditioning_mutations_and_exercise_cfg_apg` (dit_oracle) is
+          #     the only case that separates absent negative conditioning — which zeroes the whole
+          #     cross context — from an explicit all-invalid negative prompt, which keeps its
+          #     conditioned duration row. It is a pure self-comparison, so it runs on this backend.
+          #   * `the_guided_latents_are_exactly_the_cfg_recomposition_of_their_own_two_branches`
+          #     (base_guidance, above) pins the guided latents to `L(N) + g*(L(P) - L(N))` and
+          #     rejects three named mis-wirings of the same two branches.
+          #
+          # Named rather than `--test dit_oracle -- --ignored`: the other ignored cases in that
+          # target need all six snapshots on CPU (multi-gigabyte) or an explicit SA3_DIT_CASE_ENV /
+          # SA3_DIT_RESOURCE_LENGTH selection. Wiring the rest of `dit_oracle` is sc-15235.
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
+            --test dit_oracle real_weights_detect_conditioning_mutations_and_exercise_cfg_apg \
+            -- --ignored --nocapture
+      - name: Prove the audio-to-audio restyle path on all six checkpoints
+        run: |
+          # sc-14547. This job is the only lane that provisions all six snapshots, and the story's
+          # acceptance is explicitly "every registered variant", so the target lands here rather
+          # than on a per-variant job.
+          #
+          # Both ignored cases in the target run, and both are wanted:
+          #
+          #   * `real_reference_restyle_is_bounded_and_ordered_on_all_six_variants` asserts *both*
+          #     bounds the story requires — measurable retained structure at full retention and a
+          #     divergence floor at zero retention — and, in the same sweep, the strength
+          #     *direction* through the full graph. The weight-free sign gate named in `ci.yml`
+          #     proves the mapping; this proves the mapping is the one the model responds to.
+          #   * `real_initial_sampler_noise_precedes_the_source_encode` is the only observation that
+          #     separates "initial noise first, then the source encode" from the reverse. Encoding
+          #     first would move every later draw, so the same seed would sound different merely for
+          #     having a clip attached.
+          #
+          # `--nocapture` keeps the measured per-variant correlations in the log, so the floors are
+          # auditable from the run rather than only from the source.
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
+            --test reference_audio -- --ignored --nocapture
+      - name: Prove inpaint, repaint and extend on all six checkpoints
+        run: |
+          # sc-14548. Same reasoning as the restyle step above: this job and its CUDA twin are the
+          # only lanes provisioning all six snapshots, and the story's acceptance is every
+          # registered variant.
+          #
+          # All four ignored cases in the target run, and each covers something the others cannot:
+          #
+          #   * `real_inpaint_preserves_the_outside_exactly_and_changes_the_inside` asserts BOTH
+          #     halves. Preservation alone is satisfied by a no-op, so the interior divergence is
+          #     measured in the same pass, against the source's own energy rather than an absolute.
+          #     Outside the region the assertion is exact equality, not a bound — that span is
+          #     written by `stitch_outside_region` from a buffer the test prepares itself, so a
+          #     tolerance would pass a stitch that had slipped a frame.
+          #   * `real_repaint_is_byte_identical_to_inpaint` pins the alias. gen-core documents the
+          #     two modes as different (that text is written against ACE-Step); Stable Audio 3 has
+          #     one inpaint mechanism, so any divergence is a bug.
+          #   * `real_extend_keeps_the_source_prefix_and_bridges_the_seam` is the story's pinned
+          #     10 s -> 18 s case: exact 441_000-frame prefix, a non-silent tail, and a seam step
+          #     bounded by the material's own 99.9th-percentile step rather than by a chosen number.
+          #   * `real_edit_initial_sampler_noise_precedes_the_source_encode` pins the draw order.
+          #     Only `medium` / `medium_base` can falsify it — SAME-S consumes zero draws on encode
+          #     — which is why it runs all six and separately requires at least one drawing encode.
+          #
+          # These four are also the ONLY lane for three weights-only edit sites the PR lane cannot
+          # reach: the stitch invocation, the local-conditioning handoff into `sample`, and the
+          # `conditioning_is_forwarded` call in `generate`. See
+          # `docs/migration/SC_14548_AUDIO_EDIT_INPAINT.md`.
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
+            --test audio_edit -- --ignored --nocapture
+      - name: Prove the load-time adapter fold on all six checkpoints
+        run: |
+          # sc-14550. This job and its CUDA twin are the only lanes provisioning all six snapshots.
+          #
+          # ⚠ These cases do NOT validate a real adapter artifact. **None exists** — there is no
+          # Stable Audio 3 adapter of any type in any cache, and no published community one
+          # (sc-15347). Every adapter here is synthesized by the test against the real checkpoint's
+          # own safetensors header, in the format `src/adapters.rs` declares. What they prove is
+          # that the resolved plan reaches the real backend — including Metal's packed-buffer
+          # `SimpleBackend`, which is a different object from CPU/CUDA's mmap and is exercised in no
+          # other lane — and that the fold changes the rendered audio.
+          #
+          # The gates are the two exactly-signed ones, never a threshold:
+          #   * a `scale == 0.0` request renders **byte-identical** audio to a request with no
+          #     adapters at all. Exactly zero difference; a fold that ran at all breaks it.
+          #   * two adapters differing only in their factor values render **different** audio.
+          # "Adapted differs from un-adapted" appears only as a liveness check, because a
+          # *misapplied* adapter differs too — that is sc-14548's wrong-sign lesson applied up front.
+          #
+          # `real_lora_xs_folds_through_the_host_svd` is deliberately scoped to the conditioner's
+          # single [768, 256] Linear. Candle has no `linalg.svd`, so the `-xs` family computes one on
+          # the host in f64 (never on the accelerator, which is what makes it cross-platform
+          # deterministic by construction). Measured: ~1.9 s for [768, 256], ~113 s for
+          # [1024, 1024]. Covering the DiT's attention stack would be a multi-hour cold start; the
+          # math is identical at either scale and only the wall clock is not.
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
+            --test adapters -- --ignored --nocapture
+
+  sa3-small-base-metal:
+    name: Stable Audio 3 small base providers (Metal)
+    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'sa3-small-base'
+    runs-on: [self-hosted, macOS, ARM64, real-weights]
+    env:
+      SA3_TEST_METAL: "1"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Configure both immutable small-base snapshot paths
+        run: |
+          echo "SA3_SMALL_MUSIC_BASE_SNAPSHOT=$RUNNER_TEMP/sa3-small-music-base/eab5ceee5ad9c1ed38800aff30a8e49d1161c539" >> "$GITHUB_ENV"
+          echo "SA3_SMALL_SFX_BASE_SNAPSHOT=$RUNNER_TEMP/sa3-small-sfx-base/cc5ddb990e30daa68336ac61c140c37c7033ab7c" >> "$GITHUB_ENV"
+      - name: Toolchain and hardware versions
+        run: |
+          sw_vers
+          system_profiler SPHardwareDataType SPDisplaysDataType |
+            grep -E 'Model Name|Model Identifier|Chip|Total Number of Cores|Memory|Chipset Model|Metal Support'
+          rustc --version
+          cargo --version
+      - name: Materialize and verify both immutable small-base snapshots
+        run: |
+          python3 -m pip install --disable-pip-version-check --target "$RUNNER_TEMP/huggingface-hub" "huggingface_hub==1.20.1"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-music-base --snapshot "$SA3_SMALL_MUSIC_BASE_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3 scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-sfx-base --snapshot "$SA3_SMALL_SFX_BASE_SNAPSHOT"
+      - name: Run registered base provider conformance and concurrent RNG isolation on Metal
+        run: |
+          for test in registered_music_base_provider_passes_full_audio_conformance \
+                      concurrent_music_base_requests_are_deterministic_and_do_not_share_rng_state \
+                      registered_sfx_base_provider_passes_full_audio_conformance \
+                      concurrent_sfx_base_requests_are_deterministic_and_do_not_share_rng_state; do
+            cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
+              --test conformance "$test" -- --ignored --nocapture
+          done
+      - name: Re-calibrate both base stereo-width floors at the variant defaults
+        run: |
+          # The sweeps render at the variant's own resolved operating point — Euler / 50 / 7.0 — and
+          # at the same 10 s the render steps below enforce at, so calibration and enforcement cannot
+          # drift apart. `small-sfx-base` deliberately sweeps the *post-trained* SFX prompt list:
+          # its own shipped `demo_cond` is the music-base list, copy-pasted, and calibrating a Foley
+          # checkpoint on "Amen break 174 BPM" would measure the wrong distribution.
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
+            --test provider music_base_stereo_width_floor_is_calibrated_across_prompts_and_seeds \
+            -- --ignored --nocapture
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
+            --test provider sfx_base_stereo_width_floor_is_calibrated_across_prompts_and_seeds \
+            -- --ignored --nocapture
+      - name: Render both base WAVs at the variants' own defaults
+        run: |
+          # No `SA3_TEST_STEPS` and no sampler: the request omits `steps`, `sampler` and `guidance`
+          # so the provider resolves them, and the test asserts the resolved step count against the
+          # progress callbacks and proves the resolved sampler is Euler by rendering the same seed
+          # under both solvers.
+          SA3_SMALL_MUSIC_BASE_WAV_OUT="$RUNNER_TEMP/sa3-small-music-base-metal.wav" \
+            cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
+              --test provider connected_music_base_generation_at_its_own_defaults_is_stereo_finite_and_exact_length \
+              -- --ignored --nocapture
+          SA3_SMALL_SFX_BASE_WAV_OUT="$RUNNER_TEMP/sa3-small-sfx-base-metal.wav" \
+            cargo test --locked --release -p candle-audio-stable-audio-3 --features metal \
+              --test provider connected_sfx_base_generation_at_its_own_defaults_is_stereo_finite_and_exact_length \
+              -- --ignored --nocapture
+          shasum -a 256 "$RUNNER_TEMP/sa3-small-music-base-metal.wav" "$RUNNER_TEMP/sa3-small-sfx-base-metal.wav"
+
+  same-l-cuda:
+    name: SAME-L real weights (CUDA)
+    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'same-l'
+    runs-on: [self-hosted, windows, cuda, real-weights]
+    env:
+      SA3_SAME_L_CASE: standalone
+      SA3_TEST_CUDA: "1"
+      CUDA_COMPUTE_CAP: "80"
+      CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
+      VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Configure immutable SAME-L snapshot path
+        shell: cmd
+        run: echo SA3_SAME_L_SNAPSHOT=%RUNNER_TEMP%\sa3-same-l\41acf79dd242877d6499a1108ca5dba5d5eecfc5>>"%GITHUB_ENV%"
+      - name: Select Git Bash
+        shell: cmd
+        run: |
+          if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
+          echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+        with:
+          toolchain: 1.96.0
+          components: rustfmt, clippy
+      - name: Toolchain and hardware versions
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          rustc --version
+          cargo --version
+          nvidia-smi
+      - name: Materialize and verify immutable SAME-L snapshot
+        shell: cmd
+        run: |
+          python -m pip install --disable-pip-version-check --target "%RUNNER_TEMP%\huggingface-hub" "huggingface_hub==1.20.1"
+          set "PYTHONPATH=%RUNNER_TEMP%\huggingface-hub"
+          python scripts/release/ensure_model_snapshot.py --model same-l --snapshot "%SA3_SAME_L_SNAPSHOT%" || exit /b 1
+      - name: Verify SAME-L short and long band boundaries on CUDA
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda same_l_short_standalone_and_embedded_match_every_band_layer -- --ignored --nocapture || exit /b 1
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda same_l_long_durations_match_compact_band_boundaries -- --ignored --nocapture || exit /b 1
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda same_l_variable_stride_padding_gather_and_noise_order_match_upstream -- --ignored --nocapture || exit /b 1
+      - name: Measure literal 380-second and exact-max SAME-L roundtrips and peak CUDA allocation
+        shell: powershell
+        run: |
+          cmd /c "call `"$env:VCVARS`" && set" |
+            ForEach-Object {
+              if ($_ -match "^(.*?)=(.*)$") { Set-Item -Force "env:$($matches[1])" $matches[2] }
+            }
+          function Invoke-SameLProbe([string]$label, [string]$samples) {
+            if ($samples) {
+              $env:SA3_SAME_L_RESOURCE_SAMPLES = $samples
+            } else {
+              Remove-Item env:SA3_SAME_L_RESOURCE_SAMPLES -ErrorAction SilentlyContinue
+            }
+            $stdout = Join-Path $env:RUNNER_TEMP "same-l-resource-$label.stdout"
+            $stderr = Join-Path $env:RUNNER_TEMP "same-l-resource-$label.stderr"
+            $stop = Join-Path $env:RUNNER_TEMP "same-l-resource-$label.stop"
+            Remove-Item $stop -ErrorAction SilentlyContinue
+            $arguments = @(
+              "test", "--locked", "--release",
+              "-p", "candle-audio-stable-audio-3", "--features", "cuda",
+              "same_l_long_duration_roundtrip_resource_probe", "--", "--ignored", "--nocapture"
+            )
+            $baselineOutput = @(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits)
+            if ($LASTEXITCODE -ne 0) {
+              throw "nvidia-smi baseline query failed with exit code $LASTEXITCODE"
+            }
+            $baselineMiB = 0
+            $baselineText = [string]($baselineOutput | Select-Object -First 1)
+            if (-not [int]::TryParse($baselineText.Trim(), [ref]$baselineMiB)) {
+              throw "nvidia-smi baseline query returned an invalid value: '$baselineText'"
+            }
+            $sampler = Start-Job -ArgumentList $stop, $baselineMiB -ScriptBlock {
+              param([string]$stopPath, [int]$peakMiB)
+              while (-not (Test-Path $stopPath)) {
+                $sampleOutput = @(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits)
+                if ($LASTEXITCODE -ne 0) {
+                  throw "nvidia-smi sampler query failed with exit code $LASTEXITCODE"
+                }
+                $usedMiB = 0
+                $sampleText = [string]($sampleOutput | Select-Object -First 1)
+                if (-not [int]::TryParse($sampleText.Trim(), [ref]$usedMiB)) {
+                  throw "nvidia-smi sampler query returned an invalid value: '$sampleText'"
+                }
+                $peakMiB = [Math]::Max($peakMiB, $usedMiB)
+                Start-Sleep -Milliseconds 250
+              }
+              $peakMiB
+            }
+            try {
+              $process = Start-Process cargo -ArgumentList $arguments -Wait -PassThru `
+                -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+            } finally {
+              New-Item $stop -ItemType File -Force | Out-Null
+            }
+            Wait-Job $sampler | Out-Null
+            $samplerState = $sampler.State
+            try {
+              $samplerOutput = @(Receive-Job $sampler -ErrorAction Stop)
+            } finally {
+              Remove-Job $sampler -Force
+            }
+            if ($samplerState -ne "Completed") {
+              throw "nvidia-smi sampler job ended in state $samplerState"
+            }
+            if ($samplerOutput.Count -ne 1) {
+              throw "nvidia-smi sampler returned $($samplerOutput.Count) values; expected one"
+            }
+            $peakMiB = 0
+            if (-not [int]::TryParse(([string]$samplerOutput[0]).Trim(), [ref]$peakMiB)) {
+              throw "nvidia-smi sampler returned an invalid peak: '$($samplerOutput[0])'"
+            }
+            Get-Content $stdout
+            Get-Content $stderr
+            Write-Host "SA3_SAME_L_CUDA_MEMORY case=$label baseline_total_mib=$baselineMiB peak_total_mib=$peakMiB peak_delta_mib=$($peakMiB - $baselineMiB)"
+            if ($process.ExitCode -ne 0) { throw "SAME-L resource probe $label failed with exit code $($process.ExitCode)" }
+          }
+          Invoke-SameLProbe "literal-380s" ""
+          Invoke-SameLProbe "exact-max" "16777216"
+          # Start-Process does not update LASTEXITCODE. The vcvars bootstrap can
+          # leave it non-zero even after both foreground probes succeed, and
+          # GitHub's PowerShell wrapper propagates that stale value.
+          exit 0
+
+  sa3-small-music-cuda:
+    name: Stable Audio 3 small-music provider (CUDA)
+    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'sa3-small-music'
+    runs-on: [self-hosted, windows, cuda, real-weights]
+    env:
+      SA3_TEST_CUDA: "1"
+      CUDA_COMPUTE_CAP: "80"
+      CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
+      VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Configure immutable small-music snapshot path
+        shell: cmd
+        run: echo SA3_SMALL_MUSIC_SNAPSHOT=%RUNNER_TEMP%\sa3-small-music\0fef1392cd842149a2b6d445e181c97608faac06>>"%GITHUB_ENV%"
+      - name: Select Git Bash
+        shell: cmd
+        run: |
+          if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
+          echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+        with:
+          toolchain: 1.96.0
+          components: rustfmt, clippy
+      - name: Toolchain and hardware versions
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          rustc --version
+          cargo --version
+          nvidia-smi
+      - name: Materialize and verify immutable small-music snapshot
+        shell: cmd
+        run: |
+          python -m pip install --disable-pip-version-check --target "%RUNNER_TEMP%\huggingface-hub" "huggingface_hub==1.20.1"
+          set "PYTHONPATH=%RUNNER_TEMP%\huggingface-hub"
+          python scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-music --snapshot "%SA3_SMALL_MUSIC_SNAPSHOT%" || exit /b 1
+      - name: Run registered provider conformance and concurrent RNG isolation on CUDA
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --test conformance registered_provider_passes_full_audio_conformance -- --ignored --nocapture || exit /b 1
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --test conformance concurrent_requests_are_deterministic_and_do_not_share_rng_state -- --ignored --nocapture || exit /b 1
+      - name: Re-calibrate the music stereo-width floor on CUDA
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          REM Same reason as the SFX CUDA job: the render below enforces the per-window-median
+          REM side-ratio assertion on this backend, so the measurement behind it is taken on this
+          REM backend, at the render's own 30 s / 8 steps.
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --test provider music_stereo_width_floor_is_calibrated_across_prompts_and_seeds -- --ignored --nocapture || exit /b 1
+      - name: Render a real 30-second eight-step CUDA WAV
+        shell: powershell
+        run: |
+          cmd /c "call `"$env:VCVARS`" && set" |
+            ForEach-Object {
+              if ($_ -match "^(.*?)=(.*)$") { Set-Item -Force "env:$($matches[1])" $matches[2] }
+            }
+          $env:SA3_TEST_DURATION = "30"
+          $env:SA3_TEST_STEPS = "8"
+          $env:SA3_SMALL_MUSIC_WAV_OUT = Join-Path $env:RUNNER_TEMP "sa3-small-music-cuda.wav"
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda `
+            --test provider connected_short_generation_is_stereo_finite_and_exact_length `
+            -- --ignored --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-FileHash -Algorithm SHA256 $env:SA3_SMALL_MUSIC_WAV_OUT
+
+  sa3-small-sfx-cuda:
+    name: Stable Audio 3 small-sfx provider (CUDA)
+    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'sa3-small-sfx'
+    runs-on: [self-hosted, windows, cuda, real-weights]
+    env:
+      SA3_TEST_CUDA: "1"
+      CUDA_COMPUTE_CAP: "80"
+      CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
+      VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Configure immutable small-sfx and small-music snapshot paths
+        shell: cmd
+        run: |
+          echo SA3_SMALL_SFX_SNAPSHOT=%RUNNER_TEMP%\sa3-small-sfx\ae12755283df9d62ca39a9b050a39a0b607b8c20>>"%GITHUB_ENV%"
+          echo SA3_SMALL_MUSIC_SNAPSHOT=%RUNNER_TEMP%\sa3-small-music\0fef1392cd842149a2b6d445e181c97608faac06>>"%GITHUB_ENV%"
+      - name: Select Git Bash
+        shell: cmd
+        run: |
+          if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
+          echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+        with:
+          toolchain: 1.96.0
+          components: rustfmt, clippy
+      - name: Toolchain and hardware versions
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          rustc --version
+          cargo --version
+          nvidia-smi
+      - name: Materialize and verify both immutable small snapshots
+        shell: cmd
+        run: |
+          python -m pip install --disable-pip-version-check --target "%RUNNER_TEMP%\huggingface-hub" "huggingface_hub==1.20.1"
+          set "PYTHONPATH=%RUNNER_TEMP%\huggingface-hub"
+          python scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-sfx --snapshot "%SA3_SMALL_SFX_SNAPSHOT%" || exit /b 1
+          python scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-music --snapshot "%SA3_SMALL_MUSIC_SNAPSHOT%" || exit /b 1
+      - name: Prove music and SFX actually diverge on CUDA
+        shell: cmd
+        # sc-14546 moved `--test variant_binding` to `sa3-base-identity-cuda`, which provisions all
+        # six pinned snapshots; every gate in that target now needs them.
+        #
+        # sc-14546 also made `single_step_dit_divergence_matches_the_frozen_torch_reference` honour
+        # `SA3_TEST_CUDA`. It hardcoded `Device::Cpu`, so this step ran two real-weight 3.45 GB DiT
+        # forwards on the CPU of a CUDA runner and certified nothing about the GPU. Its ±0.02
+        # absolute cosine band is far above accelerator reduced-precision noise, so no bound in it
+        # was CPU-calibrated.
+        run: |
+          call "%VCVARS%"
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --test variant_divergence -- --ignored --nocapture || exit /b 1
+      - name: Run registered SFX provider conformance and concurrent RNG isolation on CUDA
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --test conformance registered_sfx_provider_passes_full_audio_conformance -- --ignored --nocapture || exit /b 1
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --test conformance concurrent_sfx_requests_are_deterministic_and_do_not_share_rng_state -- --ignored --nocapture || exit /b 1
+      - name: Re-calibrate the SFX stereo-width floor on CUDA
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          REM The render below enforces SFX_SIDE_RATIO_FLOOR on this backend, so the floor is
+          REM calibrated on this backend, at the render's own 30 s / 8 steps. Enforcing a
+          REM Metal-measured margin on CUDA is the "unverified envelope" the sweep exists to
+          REM prevent; running the sweep here is what makes the enforcement below honest.
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --test provider sfx_stereo_width_floor_is_calibrated_across_prompts_and_seeds -- --ignored --nocapture || exit /b 1
+      - name: Render a real 30-second eight-step SFX CUDA WAV
+        shell: powershell
+        run: |
+          cmd /c "call `"$env:VCVARS`" && set" |
+            ForEach-Object {
+              if ($_ -match "^(.*?)=(.*)$") { Set-Item -Force "env:$($matches[1])" $matches[2] }
+            }
+          $env:SA3_TEST_DURATION = "30"
+          $env:SA3_TEST_STEPS = "8"
+          $env:SA3_SMALL_SFX_WAV_OUT = Join-Path $env:RUNNER_TEMP "sa3-small-sfx-cuda.wav"
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda `
+            --test provider connected_sfx_generation_is_stereo_finite_and_exact_length `
+            -- --ignored --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-FileHash -Algorithm SHA256 $env:SA3_SMALL_SFX_WAV_OUT
+
+  sa3-medium-cuda:
+    name: Stable Audio 3 medium provider (CUDA)
+    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'sa3-medium'
+    runs-on: [self-hosted, windows, cuda, real-weights]
+    env:
+      SA3_TEST_CUDA: "1"
+      # No SA3_REQUIRE_ALL_SNAPSHOTS: only `variant_binding` reads it, and sc-14546 moved that
+      # target to `sa3-base-identity-cuda`, the one job with all six snapshots.
+      SA3_SAME_L_CASE: embedded
+      CUDA_COMPUTE_CAP: "80"
+      CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
+      VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Configure immutable medium and small snapshot paths
+        shell: cmd
+        run: |
+          echo SA3_MEDIUM_SNAPSHOT=%RUNNER_TEMP%\sa3-medium\27b5a21b791b1b033d193a9e1e3ce78493f102f9>>"%GITHUB_ENV%"
+          echo SA3_MEDIUM_BASE_SNAPSHOT=%RUNNER_TEMP%\sa3-medium-base\b32993f73c3bdc3864043a72d8032606bba737c8>>"%GITHUB_ENV%"
+          echo SA3_SMALL_MUSIC_SNAPSHOT=%RUNNER_TEMP%\sa3-small-music\0fef1392cd842149a2b6d445e181c97608faac06>>"%GITHUB_ENV%"
+          echo SA3_SMALL_SFX_SNAPSHOT=%RUNNER_TEMP%\sa3-small-sfx\ae12755283df9d62ca39a9b050a39a0b607b8c20>>"%GITHUB_ENV%"
+          echo SA3_SAME_L_SNAPSHOT=%RUNNER_TEMP%\sa3-same-l\41acf79dd242877d6499a1108ca5dba5d5eecfc5>>"%GITHUB_ENV%"
+      - name: Select Git Bash
+        shell: cmd
+        run: |
+          if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
+          echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+        with:
+          toolchain: 1.96.0
+          components: rustfmt, clippy
+      - name: Toolchain and hardware versions
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          rustc --version
+          cargo --version
+          nvidia-smi
+      - name: Run the crate unit tests against real CUDA
+        shell: cmd
+        # Weight-free and seconds long. `zero_element_tensors_load_on_the_target_device` is the
+        # regression gate for the zero-byte `noise_scaling_factor` buffer: on CUDA the F32 load
+        # succeeded but the F32-to-F16 cast launched a zero-sized grid, which is why medium loaded at
+        # F32 and failed at F16. This is the cheapest place that failure can be caught, and it runs
+        # before the 10.4 GB downloads.
+        run: |
+          call "%VCVARS%"
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --lib || exit /b 1
+      - name: Materialize and verify the immutable snapshots
+        shell: cmd
+        run: |
+          python -m pip install --disable-pip-version-check --target "%RUNNER_TEMP%\huggingface-hub" "huggingface_hub==1.20.1"
+          set "PYTHONPATH=%RUNNER_TEMP%\huggingface-hub"
+          python scripts/release/ensure_model_snapshot.py --model stable-audio-3-medium --snapshot "%SA3_MEDIUM_SNAPSHOT%" || exit /b 1
+          python scripts/release/ensure_model_snapshot.py --model stable-audio-3-medium-base --snapshot "%SA3_MEDIUM_BASE_SNAPSHOT%" || exit /b 1
+          python scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-music --snapshot "%SA3_SMALL_MUSIC_SNAPSHOT%" || exit /b 1
+          python scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-sfx --snapshot "%SA3_SMALL_SFX_SNAPSHOT%" || exit /b 1
+          python scripts/release/ensure_model_snapshot.py --model same-l --snapshot "%SA3_SAME_L_SNAPSHOT%" || exit /b 1
+      - name: Run medium conformance on CUDA
+        shell: cmd
+        # sc-14546 moved `--test variant_binding` to `sa3-base-identity-cuda` (all six snapshots).
+        run: |
+          call "%VCVARS%"
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --test conformance registered_medium_provider_passes_full_audio_conformance -- --ignored --nocapture || exit /b 1
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --test conformance concurrent_medium_requests_are_deterministic_and_do_not_share_rng_state -- --ignored --nocapture || exit /b 1
+      - name: Re-calibrate the medium stereo-width floor on CUDA
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          REM The render step below enforces the side-ratio floor on this backend, so the sweep
+          REM behind it runs on this backend at the render's own 30 s / 8 steps.
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --test provider medium_stereo_width_floor_is_calibrated_across_prompts_and_seeds -- --ignored --nocapture || exit /b 1
+      - name: Run registered medium-base conformance and its calibrated render on CUDA
+        shell: cmd
+        # sc-14546, mirroring the Metal job: this job already provisions
+        # `stable-audio-3-medium-base` for the identity gates, and the side-ratio floor the render
+        # enforces on this backend is re-calibrated on this backend first.
+        run: |
+          call "%VCVARS%"
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --test conformance registered_medium_base_provider_passes_full_audio_conformance -- --ignored --nocapture || exit /b 1
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --test conformance concurrent_medium_base_requests_are_deterministic_and_do_not_share_rng_state -- --ignored --nocapture || exit /b 1
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --test provider medium_base_stereo_width_floor_is_calibrated_across_prompts_and_seeds -- --ignored --nocapture || exit /b 1
+      - name: Render a real medium-base CUDA WAV at the variant defaults
+        shell: powershell
+        run: |
+          cmd /c "call `"$env:VCVARS`" && set" |
+            ForEach-Object {
+              if ($_ -match "^(.*?)=(.*)$") { Set-Item -Force "env:$($matches[1])" $matches[2] }
+            }
+          $env:SA3_MEDIUM_BASE_WAV_OUT = Join-Path $env:RUNNER_TEMP "sa3-medium-base-cuda.wav"
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda `
+            --test provider connected_medium_base_generation_at_its_own_defaults_is_stereo_finite_and_exact_length `
+            -- --ignored --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-FileHash -Algorithm SHA256 $env:SA3_MEDIUM_BASE_WAV_OUT
+      - name: Prove medium serves both domains and measure the compute policy on CUDA
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --test variant_quality -- --ignored --nocapture || exit /b 1
+          REM The F16-vs-F32 measurement behind the shipped F32 policy, taken on the backend
+          REM upstream would half-cast. sc-14545 could only measure it on Metal.
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --test dtype_policy -- --ignored --nocapture || exit /b 1
+      - name: Measure the long-form renders and peak CUDA allocation
+        shell: powershell
+        # A `nvidia-smi` sample taken *after* `cargo test` returns cannot observe a peak: the test
+        # process has already exited and the driver has freed its VRAM, so the "post-run" reading is
+        # the baseline again. Sample continuously for the whole render instead, which is the pattern
+        # `same-l-cuda`'s `Invoke-SameLProbe` already uses in this file. The release build is done
+        # first with `--no-run` so the sampled window contains the render and nothing else.
+        run: |
+          cmd /c "call `"$env:VCVARS`" && set" |
+            ForEach-Object {
+              if ($_ -match "^(.*?)=(.*)$") { Set-Item -Force "env:$($matches[1])" $matches[2] }
+            }
+          $env:SA3_MEDIUM_LONG_SECONDS = "120,300,380"
+          $env:SA3_MEDIUM_LONG_WAV_DIR = $env:RUNNER_TEMP
+          cargo test --locked --release --no-run -p candle-audio-stable-audio-3 --features cuda `
+            --test provider
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $stdout = Join-Path $env:RUNNER_TEMP "sa3-medium-long-form.stdout"
+          $stderr = Join-Path $env:RUNNER_TEMP "sa3-medium-long-form.stderr"
+          $stop = Join-Path $env:RUNNER_TEMP "sa3-medium-long-form.stop"
+          Remove-Item $stop -ErrorAction SilentlyContinue
+          $arguments = @(
+            "test", "--locked", "--release",
+            "-p", "candle-audio-stable-audio-3", "--features", "cuda",
+            "--test", "provider", "medium_long_form_renders_are_exact_and_timed",
+            "--", "--ignored", "--nocapture"
+          )
+          # Resolve an absolute path in the parent scope and hand it to the job. `Start-Job` runs the
+          # scriptblock in a separate runspace that resolves commands from its own `PATH`, which is
+          # not guaranteed to be the one the vcvars import above installed into this scope; a bare
+          # `nvidia-smi` inside the job would surface as a CommandNotFound terminating error rather
+          # than a measurement. The bare form does in fact work on this runner today — run
+          # 30196371019's `SAME-L real weights (CUDA)` job logged
+          # `SA3_SAME_L_CUDA_MEMORY case=literal-380s baseline_total_mib=12252 peak_total_mib=28069`
+          # from the identical `Invoke-SameLProbe` sampler, which is proof the job runspace both
+          # resolved the tool and observed a real in-render peak. This binds it explicitly anyway so
+          # the failure mode is a named throw in the parent rather than a dead sampler, and so the
+          # resolved path is in the log. `Invoke-SameLProbe` above is deliberately left as-is: it is
+          # already green in a recorded run and this PR does not re-open it.
+          $nvidiaSmi = (Get-Command nvidia-smi -CommandType Application -ErrorAction SilentlyContinue |
+            Select-Object -First 1)
+          if (-not $nvidiaSmi) {
+            throw "nvidia-smi is not resolvable on PATH; cannot measure peak CUDA allocation"
+          }
+          $nvidiaSmiPath = $nvidiaSmi.Source
+          Write-Host "nvidia-smi resolved to $nvidiaSmiPath"
+          $baselineOutput = @(& $nvidiaSmiPath --query-gpu=memory.used --format=csv,noheader,nounits)
+          if ($LASTEXITCODE -ne 0) {
+            throw "nvidia-smi baseline query failed with exit code $LASTEXITCODE"
+          }
+          $baselineMiB = 0
+          $baselineText = [string]($baselineOutput | Select-Object -First 1)
+          if (-not [int]::TryParse($baselineText.Trim(), [ref]$baselineMiB)) {
+            throw "nvidia-smi baseline query returned an invalid value: '$baselineText'"
+          }
+          $sampler = Start-Job -ArgumentList $nvidiaSmiPath, $stop, $baselineMiB -ScriptBlock {
+            param([string]$nvidiaSmiPath, [string]$stopPath, [int]$peakMiB)
+            while (-not (Test-Path $stopPath)) {
+              $sampleOutput = @(& $nvidiaSmiPath --query-gpu=memory.used --format=csv,noheader,nounits)
+              if ($LASTEXITCODE -ne 0) {
+                throw "nvidia-smi sampler query failed with exit code $LASTEXITCODE"
+              }
+              $usedMiB = 0
+              $sampleText = [string]($sampleOutput | Select-Object -First 1)
+              if (-not [int]::TryParse($sampleText.Trim(), [ref]$usedMiB)) {
+                throw "nvidia-smi sampler query returned an invalid value: '$sampleText'"
+              }
+              $peakMiB = [Math]::Max($peakMiB, $usedMiB)
+              Start-Sleep -Milliseconds 250
+            }
+            $peakMiB
+          }
+          try {
+            $process = Start-Process cargo -ArgumentList $arguments -Wait -PassThru `
+              -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+          } finally {
+            New-Item $stop -ItemType File -Force | Out-Null
+          }
+          Wait-Job $sampler | Out-Null
+          $samplerState = $sampler.State
+          try {
+            $samplerOutput = @(Receive-Job $sampler -ErrorAction Stop)
+          } finally {
+            Remove-Job $sampler -Force
+          }
+          if ($samplerState -ne "Completed") {
+            throw "nvidia-smi sampler job ended in state $samplerState"
+          }
+          if ($samplerOutput.Count -ne 1) {
+            throw "nvidia-smi sampler returned $($samplerOutput.Count) values; expected one"
+          }
+          $peakMiB = 0
+          if (-not [int]::TryParse(([string]$samplerOutput[0]).Trim(), [ref]$peakMiB)) {
+            throw "nvidia-smi sampler returned an invalid peak: '$($samplerOutput[0])'"
+          }
+          Get-Content $stdout
+          Get-Content $stderr
+          Write-Host "SA3_MEDIUM_CUDA_MEMORY baseline_total_mib=$baselineMiB peak_total_mib=$peakMiB peak_delta_mib=$($peakMiB - $baselineMiB)"
+          if ($process.ExitCode -ne 0) {
+            throw "medium long-form render failed with exit code $($process.ExitCode)"
+          }
+          # The sampler seeds its running peak with the baseline, so a sampler that observed nothing
+          # still returns the baseline and reports peak_delta_mib=0 — indistinguishable from "the
+          # render allocated no VRAM". A real medium render allocates gigabytes, so a zero delta
+          # means the probe is broken, not that the render was free.
+          if ($peakMiB -le $baselineMiB) {
+            throw ("nvidia-smi sampler observed no allocation above the $baselineMiB MiB baseline " +
+              "(peak $peakMiB MiB); the peak probe measured nothing")
+          }
+          foreach ($seconds in 120, 300, 380) {
+            Get-FileHash -Algorithm SHA256 (Join-Path $env:RUNNER_TEMP "sa3-medium-${seconds}s.wav")
+          }
+          # Start-Process does not update LASTEXITCODE, and the vcvars bootstrap above can leave a
+          # stale non-zero value that GitHub's PowerShell wrapper would propagate.
+          exit 0
+      - name: Render a real 30-second eight-step medium CUDA WAV
+        shell: powershell
+        run: |
+          cmd /c "call `"$env:VCVARS`" && set" |
+            ForEach-Object {
+              if ($_ -match "^(.*?)=(.*)$") { Set-Item -Force "env:$($matches[1])" $matches[2] }
+            }
+          $env:SA3_TEST_DURATION = "30"
+          $env:SA3_TEST_STEPS = "8"
+          $env:SA3_MEDIUM_WAV_OUT = Join-Path $env:RUNNER_TEMP "sa3-medium-cuda.wav"
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda `
+            --test provider connected_medium_generation_is_stereo_finite_and_exact_length `
+            -- --ignored --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-FileHash -Algorithm SHA256 $env:SA3_MEDIUM_WAV_OUT
+
+  sa3-base-identity-cuda:
+    name: Stable Audio 3 base/post-trained identity matrix (CUDA)
+    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'sa3-base-identity'
+    runs-on: [self-hosted, windows, cuda, real-weights]
+    env:
+      SA3_TEST_CUDA: "1"
+      SA3_REQUIRE_ALL_SNAPSHOTS: "1"
+      CUDA_COMPUTE_CAP: "80"
+      CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
+      VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Configure all six immutable Stable Audio 3 snapshot paths
+        shell: cmd
+        run: |
+          echo SA3_SMALL_MUSIC_SNAPSHOT=%RUNNER_TEMP%\sa3-small-music\0fef1392cd842149a2b6d445e181c97608faac06>>"%GITHUB_ENV%"
+          echo SA3_SMALL_SFX_SNAPSHOT=%RUNNER_TEMP%\sa3-small-sfx\ae12755283df9d62ca39a9b050a39a0b607b8c20>>"%GITHUB_ENV%"
+          echo SA3_MEDIUM_SNAPSHOT=%RUNNER_TEMP%\sa3-medium\27b5a21b791b1b033d193a9e1e3ce78493f102f9>>"%GITHUB_ENV%"
+          echo SA3_SMALL_MUSIC_BASE_SNAPSHOT=%RUNNER_TEMP%\sa3-small-music-base\eab5ceee5ad9c1ed38800aff30a8e49d1161c539>>"%GITHUB_ENV%"
+          echo SA3_SMALL_SFX_BASE_SNAPSHOT=%RUNNER_TEMP%\sa3-small-sfx-base\cc5ddb990e30daa68336ac61c140c37c7033ab7c>>"%GITHUB_ENV%"
+          echo SA3_MEDIUM_BASE_SNAPSHOT=%RUNNER_TEMP%\sa3-medium-base\b32993f73c3bdc3864043a72d8032606bba737c8>>"%GITHUB_ENV%"
+          echo SA3_SAME_L_SNAPSHOT=%RUNNER_TEMP%\sa3-same-l\41acf79dd242877d6499a1108ca5dba5d5eecfc5>>"%GITHUB_ENV%"
+      - name: Select Git Bash
+        shell: cmd
+        run: |
+          if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
+          echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+        with:
+          toolchain: 1.96.0
+          components: rustfmt, clippy
+      - name: Toolchain and hardware versions
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          rustc --version
+          cargo --version
+          nvidia-smi
+      - name: Materialize and verify all six immutable snapshots
+        shell: cmd
+        run: |
+          python -m pip install --disable-pip-version-check --target "%RUNNER_TEMP%\huggingface-hub" "huggingface_hub==1.20.1"
+          set "PYTHONPATH=%RUNNER_TEMP%\huggingface-hub"
+          rem The three `-base` entries carry `download_files` allow-lists, so the 6.4 GB of
+          rem `svd_bases.pt` training pickles across them are not fetched.
+          python scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-music --snapshot "%SA3_SMALL_MUSIC_SNAPSHOT%" || exit /b 1
+          python scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-sfx --snapshot "%SA3_SMALL_SFX_SNAPSHOT%" || exit /b 1
+          python scripts/release/ensure_model_snapshot.py --model stable-audio-3-medium --snapshot "%SA3_MEDIUM_SNAPSHOT%" || exit /b 1
+          python scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-music-base --snapshot "%SA3_SMALL_MUSIC_BASE_SNAPSHOT%" || exit /b 1
+          python scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-sfx-base --snapshot "%SA3_SMALL_SFX_BASE_SNAPSHOT%" || exit /b 1
+          python scripts/release/ensure_model_snapshot.py --model stable-audio-3-medium-base --snapshot "%SA3_MEDIUM_BASE_SNAPSHOT%" || exit /b 1
+          python scripts/release/ensure_model_snapshot.py --model same-l --snapshot "%SA3_SAME_L_SNAPSHOT%" || exit /b 1
+      - name: Reject every cross-variant weight path and match the frozen-Torch sampler oracles
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --test variant_binding -- --ignored --nocapture || exit /b 1
+          rem Named rather than `--test sampler_oracle -- --ignored`: the third ignored case in that
+          rem target is an operator resource probe that requires SA3_RESOURCE_* and fails without it.
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --test sampler_oracle all_six_real_p0_pingpong_trajectories_match_stepwise -- --ignored --nocapture || exit /b 1
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --test sampler_oracle real_sampler_cfg_apg_scale_phi_matches_frozen_upstream -- --ignored --nocapture || exit /b 1
+      - name: Prove real CFG and the negative prompt on a base checkpoint
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --test base_guidance -- --ignored --nocapture || exit /b 1
+      - name: Certify the explicit-negative conditioning path itself
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          rem `base_guidance`'s divergence assertion proves the negative prompt reaches the model,
+          rem not that the batch-2 path is wired correctly. This case is the only one that separates
+          rem absent negative conditioning — which zeroes the whole cross context — from an explicit
+          rem all-invalid negative prompt, which keeps its conditioned duration row. It ran in no
+          rem lane before sc-14546. Named rather than `--test dit_oracle -- --ignored`: the other
+          rem ignored cases need all six snapshots on CPU or an explicit SA3_DIT_CASE_ENV selection,
+          rem and wiring the rest of `dit_oracle` is sc-15235.
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --test dit_oracle real_weights_detect_conditioning_mutations_and_exercise_cfg_apg -- --ignored --nocapture || exit /b 1
+      - name: Prove the audio-to-audio restyle path on all six checkpoints
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          rem sc-14547. This job and its Metal twin are the only lanes provisioning all six
+          rem snapshots, and the story's acceptance is "every registered variant". Both ignored
+          rem cases run: the sweep asserts retained structure, a divergence floor, and the strength
+          rem direction through the full graph, and the draw-order case is the only observation that
+          rem separates "initial noise first, then the source encode" from the reverse.
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --test reference_audio -- --ignored --nocapture || exit /b 1
+      - name: Prove inpaint, repaint and extend on all six checkpoints
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          rem sc-14548. This job and its Metal twin are the only lanes provisioning all six
+          rem snapshots. All four ignored cases run: exact outside-region preservation plus a
+          rem measured interior divergence (preservation alone passes for a no-op), Repaint/Inpaint
+          rem byte equality, the pinned 10s -> 18s extend with an exact prefix and a seam bound
+          rem derived from the material, and the draw order — which only medium/medium-base can
+          rem falsify, since SAME-S consumes zero draws on encode. This is also the only lane that
+          rem reaches the three weights-only edit sites named in
+          rem docs/migration/SC_14548_AUDIO_EDIT_INPAINT.md.
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --test audio_edit -- --ignored --nocapture || exit /b 1
+      - name: Prove the load-time adapter fold on all six checkpoints
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          rem sc-14550. This job and its Metal twin are the only lanes provisioning all six
+          rem snapshots. These cases do NOT validate a real adapter artifact -- none exists
+          rem (sc-15347); every adapter is synthesized by the test against the real checkpoint's own
+          rem safetensors header. What they prove is that the resolved plan reaches the real backend
+          rem and that the fold changes the rendered audio. The two gates are exactly signed: a
+          rem scale-0.0 request renders byte-identical audio to a request with no adapters, and two
+          rem adapters differing only in their factors render different audio. "Adapted differs from
+          rem un-adapted" is liveness only, because a misapplied adapter differs too.
+          rem The -xs case is scoped to the conditioner's [768, 256] Linear: the deterministic host
+          rem f64 SVD costs ~1.9 s there and ~113 s at [1024, 1024].
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --test adapters -- --ignored --nocapture || exit /b 1
+
+  sa3-small-base-cuda:
+    name: Stable Audio 3 small base providers (CUDA)
+    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'sa3-small-base'
+    runs-on: [self-hosted, windows, cuda, real-weights]
+    env:
+      SA3_TEST_CUDA: "1"
+      CUDA_COMPUTE_CAP: "80"
+      CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
+      VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Configure both immutable small-base snapshot paths
+        shell: cmd
+        run: |
+          echo SA3_SMALL_MUSIC_BASE_SNAPSHOT=%RUNNER_TEMP%\sa3-small-music-base\eab5ceee5ad9c1ed38800aff30a8e49d1161c539>>"%GITHUB_ENV%"
+          echo SA3_SMALL_SFX_BASE_SNAPSHOT=%RUNNER_TEMP%\sa3-small-sfx-base\cc5ddb990e30daa68336ac61c140c37c7033ab7c>>"%GITHUB_ENV%"
+      - name: Select Git Bash
+        shell: cmd
+        run: |
+          if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
+          echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+        with:
+          toolchain: 1.96.0
+          components: rustfmt, clippy
+      - name: Toolchain and hardware versions
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          rustc --version
+          cargo --version
+          nvidia-smi
+      - name: Materialize and verify both immutable small-base snapshots
+        shell: cmd
+        run: |
+          python -m pip install --disable-pip-version-check --target "%RUNNER_TEMP%\huggingface-hub" "huggingface_hub==1.20.1"
+          set "PYTHONPATH=%RUNNER_TEMP%\huggingface-hub"
+          python scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-music-base --snapshot "%SA3_SMALL_MUSIC_BASE_SNAPSHOT%" || exit /b 1
+          python scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-sfx-base --snapshot "%SA3_SMALL_SFX_BASE_SNAPSHOT%" || exit /b 1
+      - name: Run registered base provider conformance and re-calibrate both floors on CUDA
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --test conformance registered_music_base_provider_passes_full_audio_conformance -- --ignored --nocapture || exit /b 1
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --test conformance concurrent_music_base_requests_are_deterministic_and_do_not_share_rng_state -- --ignored --nocapture || exit /b 1
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --test conformance registered_sfx_base_provider_passes_full_audio_conformance -- --ignored --nocapture || exit /b 1
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --test conformance concurrent_sfx_base_requests_are_deterministic_and_do_not_share_rng_state -- --ignored --nocapture || exit /b 1
+          rem The render step below enforces both base side-ratio floors on this backend, so the
+          rem sweeps behind them run on this backend, at the render's own 10 s and the variants' own
+          rem resolved Euler / 50 / 7.0 operating point.
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --test provider music_base_stereo_width_floor_is_calibrated_across_prompts_and_seeds -- --ignored --nocapture || exit /b 1
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --test provider sfx_base_stereo_width_floor_is_calibrated_across_prompts_and_seeds -- --ignored --nocapture || exit /b 1
+      - name: Render both base CUDA WAVs at the variants' own defaults
+        shell: powershell
+        run: |
+          cmd /c "call `"$env:VCVARS`" && set" |
+            ForEach-Object {
+              if ($_ -match "^(.*?)=(.*)$") { Set-Item -Force "env:$($matches[1])" $matches[2] }
+            }
+          $env:SA3_SMALL_MUSIC_BASE_WAV_OUT = Join-Path $env:RUNNER_TEMP "sa3-small-music-base-cuda.wav"
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda `
+            --test provider connected_music_base_generation_at_its_own_defaults_is_stereo_finite_and_exact_length `
+            -- --ignored --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:SA3_SMALL_SFX_BASE_WAV_OUT = Join-Path $env:RUNNER_TEMP "sa3-small-sfx-base-cuda.wav"
+          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda `
+            --test provider connected_sfx_base_generation_at_its_own_defaults_is_stereo_finite_and_exact_length `
+            -- --ignored --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-FileHash -Algorithm SHA256 $env:SA3_SMALL_MUSIC_BASE_WAV_OUT
+          Get-FileHash -Algorithm SHA256 $env:SA3_SMALL_SFX_BASE_WAV_OUT
+
   candle-llm:
     name: Candle LLM real weights (CUDA)
     if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'llm'
@@ -261,8 +1871,19 @@ jobs:
     name: Candle media real weights (CUDA)
     if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'media'
     runs-on: [self-hosted, windows, cuda, real-weights]
+    needs: mlx-media
     env:
       Z_IMAGE_SNAPSHOT: ${{ vars.Z_IMAGE_SNAPSHOT }}
+      # This is intentionally distinct from the macOS MAGE_SNAPSHOT path: repository variables
+      # contain runner-local absolute paths, so the Windows CUDA runner needs its own snapshot.
+      CANDLE_MAGE_SNAPSHOT: ${{ vars.CANDLE_MAGE_SNAPSHOT }}
+      MAGE_SNAPSHOT: ${{ vars.CANDLE_MAGE_SNAPSHOT }}
+      CANDLE_MAGE_EDIT_SNAPSHOT: ${{ vars.CANDLE_MAGE_EDIT_SNAPSHOT }}
+      CANDLE_MAGE_EDIT_BASE_SNAPSHOT: ${{ vars.CANDLE_MAGE_EDIT_BASE_SNAPSHOT }}
+      CANDLE_MAGE_EDIT_TURBO_SNAPSHOT: ${{ vars.CANDLE_MAGE_EDIT_TURBO_SNAPSHOT }}
+      MAGE_EDIT_SNAPSHOT: ${{ vars.CANDLE_MAGE_EDIT_SNAPSHOT }}
+      MAGE_EDIT_BASE_SNAPSHOT: ${{ vars.CANDLE_MAGE_EDIT_BASE_SNAPSHOT }}
+      MAGE_EDIT_TURBO_SNAPSHOT: ${{ vars.CANDLE_MAGE_EDIT_TURBO_SNAPSHOT }}
       # Explicit operator-provided models root for the candle-gen real-weight resolvers that resolve
       # a repo-keyed snapshot (sc-13755); inference never self-fetches or derives a cache location.
       CANDLE_GEN_MODELS_ROOT: ${{ vars.CANDLE_GEN_MODELS_ROOT }}
@@ -280,17 +1901,55 @@ jobs:
         with:
           toolchain: 1.96.0
           components: rustfmt, clippy
+      - name: Download independent Candle Mage acceptance oracles
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: mage-flow-candle-oracles-${{ github.sha }}
+          path: ${{ runner.temp }}\mage-flow-oracles
+      - name: Require operator-provided Candle Mage snapshot
+        shell: cmd
+        run: |
+          if "%CANDLE_MAGE_SNAPSHOT%"=="" (
+            echo Missing repository variable CANDLE_MAGE_SNAPSHOT for the Windows CUDA runner.
+            exit /b 1
+          )
+          if "%CANDLE_MAGE_EDIT_SNAPSHOT%"=="" exit /b 1
+          if "%CANDLE_MAGE_EDIT_BASE_SNAPSHOT%"=="" exit /b 1
+          if "%CANDLE_MAGE_EDIT_TURBO_SNAPSHOT%"=="" exit /b 1
+          echo MAGE_GOLDEN_DIR=%RUNNER_TEMP%\mage-flow-oracles>>"%GITHUB_ENV%"
       - name: Materialize and verify immutable snapshot
         shell: cmd
         run: |
           python -m pip install --disable-pip-version-check --target "%RUNNER_TEMP%\huggingface-hub" "huggingface_hub==1.20.1"
           set "PYTHONPATH=%RUNNER_TEMP%\huggingface-hub"
           python scripts/release/ensure_model_snapshot.py --model z-image-turbo --snapshot "%Z_IMAGE_SNAPSHOT%" || exit /b 1
+          python scripts/release/ensure_model_snapshot.py --model mage-flow --snapshot "%CANDLE_MAGE_SNAPSHOT%" || exit /b 1
+          python scripts/release/ensure_model_snapshot.py --model mage-flow-edit --snapshot "%CANDLE_MAGE_EDIT_SNAPSHOT%" || exit /b 1
+          python scripts/release/ensure_model_snapshot.py --model mage-flow-edit-base --snapshot "%CANDLE_MAGE_EDIT_BASE_SNAPSHOT%" || exit /b 1
+          python scripts/release/ensure_model_snapshot.py --model mage-flow-edit-turbo --snapshot "%CANDLE_MAGE_EDIT_TURBO_SNAPSHOT%" || exit /b 1
+      - name: Verify transferred Candle Mage acceptance oracles
+        shell: cmd
+        run: |
+          python scripts/release/verify_mage_candle_transfer.py --gen "%CANDLE_MAGE_SNAPSHOT%" --edit "%CANDLE_MAGE_EDIT_SNAPSHOT%" --edit-base "%CANDLE_MAGE_EDIT_BASE_SNAPSHOT%" --edit-turbo "%CANDLE_MAGE_EDIT_TURBO_SNAPSHOT%" --output "%MAGE_GOLDEN_DIR%" || exit /b 1
+          python -m pip install --disable-pip-version-check --only-binary=:all: --target "%RUNNER_TEMP%\mage-oracle-verify" "numpy==2.4.3" "safetensors==0.8.0" || exit /b 1
+          set "PYTHONPATH=%RUNNER_TEMP%\mage-oracle-verify"
+          python scripts/release/provision_mage_oracles.py --snapshot "%CANDLE_MAGE_SNAPSHOT%" --edit-snapshot "%CANDLE_MAGE_EDIT_SNAPSHOT%" --output "%MAGE_GOLDEN_DIR%" --verify-edit-artifact || exit /b 1
+          python scripts/release/provision_mage_edit_variants.py --gen "%CANDLE_MAGE_SNAPSHOT%" --edit "%CANDLE_MAGE_EDIT_SNAPSHOT%" --edit-base "%CANDLE_MAGE_EDIT_BASE_SNAPSHOT%" --edit-turbo "%CANDLE_MAGE_EDIT_TURBO_SNAPSHOT%" --output "%MAGE_GOLDEN_DIR%" --verify-only || exit /b 1
+          python scripts/release/verify_mage_candle_oracles.py --snapshot "%CANDLE_MAGE_SNAPSHOT%" --edit-snapshot "%CANDLE_MAGE_EDIT_SNAPSHOT%" --output "%MAGE_GOLDEN_DIR%" || exit /b 1
       - name: Run provider conformance
         shell: cmd
         run: |
           call "%VCVARS%"
-          cargo test --locked -p candle-gen-z-image --features cuda --test conformance z_image_conformance -- --ignored --nocapture || exit /b 1
+          set "MAGE_CONFORMANCE_FAILED=0"
+          cargo test --locked -p candle-gen-z-image --features cuda --test conformance z_image_conformance -- --ignored --nocapture || set "MAGE_CONFORMANCE_FAILED=1"
+          cargo test --locked --release -p candle-gen-mage --features cuda --test real_parity -- --ignored --nocapture || set "MAGE_CONFORMANCE_FAILED=1"
+          cargo test --locked --release -p candle-gen-mage --features cuda --test cuda_1024 -- --ignored --nocapture || set "MAGE_CONFORMANCE_FAILED=1"
+          cargo test --locked --release -p candle-gen-mage --features cuda --test edit_parity -- --ignored --nocapture || set "MAGE_CONFORMANCE_FAILED=1"
+          for %%T in (q4 q8 bf16) do (
+            set "MAGE_QUANT_TIER=%%T"
+            cargo test --locked --release -p candle-gen-mage --features cuda --test quant_real_weights registered_tier_matches_independent_oracle_and_vram_budget -- --ignored --nocapture || set "MAGE_CONFORMANCE_FAILED=1"
+          )
+          if not "%MAGE_CONFORMANCE_FAILED%"=="0" exit /b 1
 
   candle-sdxl:
     name: Candle SDXL real weights (CUDA)
@@ -311,11 +1970,6 @@ jobs:
       IP_SDXL_BASE: ${{ vars.REALVISXL_SNAPSHOT }}
       # h94/IP-Adapter snapshot dir; ip_validate derives IP_BUNDLE + IP_IMAGE_ENCODER from it (sc-13963).
       IP_ADAPTER_SNAPSHOT: ${{ vars.IP_ADAPTER_SNAPSHOT }}
-      # Synthetic P6-PPM source/reference images (staged below) + output dirs for the edit/IP harnesses.
-      EDIT_SRC: ${{ runner.temp }}\sdxl-edit-src.ppm
-      EDIT_OUT: ${{ runner.temp }}\sdxl-edit-out
-      IP_REF: ${{ runner.temp }}\sdxl-ip-ref.ppm
-      IP_OUT: ${{ runner.temp }}\sdxl-ip-out
       # 80 on the Ampere runner; set 120 on a Blackwell runner (matches the other CUDA jobs here).
       CUDA_COMPUTE_CAP: "80"
       CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
@@ -331,6 +1985,13 @@ jobs:
         with:
           toolchain: 1.96.0
           components: rustfmt, clippy
+      - name: Configure runner-local SDXL validation paths
+        shell: cmd
+        run: |
+          echo EDIT_SRC=%RUNNER_TEMP%\sdxl-edit-src.ppm>>"%GITHUB_ENV%"
+          echo EDIT_OUT=%RUNNER_TEMP%\sdxl-edit-out>>"%GITHUB_ENV%"
+          echo IP_REF=%RUNNER_TEMP%\sdxl-ip-ref.ppm>>"%GITHUB_ENV%"
+          echo IP_OUT=%RUNNER_TEMP%\sdxl-ip-out>>"%GITHUB_ENV%"
       - name: Materialize and verify immutable snapshots
         shell: cmd
         run: |
@@ -378,8 +2039,6 @@ jobs:
       # tower at <MMAUDIO_CLIP_SNAPSHOT>/open_clip_pytorch_model.bin (clip.rs::load).
       SYNCHFORMER_SNAPSHOT: ${{ vars.MMAUDIO_MMAUDIO_SNAPSHOT }}
       DFN_CLIP_SNAPSHOT: ${{ vars.MMAUDIO_CLIP_SNAPSHOT }}
-      MMAUDIO_WAV_OUT: ${{ runner.temp }}\mmaudio_foley_16k.wav
-      MMAUDIO_WAV_OUT_44K: ${{ runner.temp }}\mmaudio_foley_44k.wav
       # 80 on the Ampere runner; set 120 on a Blackwell runner (matches the other CUDA jobs here).
       CUDA_COMPUTE_CAP: "80"
       CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
@@ -395,6 +2054,11 @@ jobs:
         with:
           toolchain: 1.96.0
           components: rustfmt, clippy
+      - name: Configure runner-local MMAudio output paths
+        shell: cmd
+        run: |
+          echo MMAUDIO_WAV_OUT=%RUNNER_TEMP%\mmaudio_foley_16k.wav>>"%GITHUB_ENV%"
+          echo MMAUDIO_WAV_OUT_44K=%RUNNER_TEMP%\mmaudio_foley_44k.wav>>"%GITHUB_ENV%"
       - name: Materialize and verify immutable snapshots
         shell: cmd
         run: |

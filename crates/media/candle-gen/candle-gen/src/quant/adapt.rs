@@ -83,15 +83,54 @@ enum Adapter {
     LokrStructured { factors: LokrFactors },
 }
 
+/// Apply a **2-D** factor `w` `[in, out]` to an activation `x` whose last dim is `in`, folding every
+/// leading dim into the GEMM's `M`.
+///
+/// **Never `broadcast_matmul` here.** candle materializes a broadcast rhs through `.contiguous()`
+/// (`candle-core`'s own `broadcast_matmul` carries the `TODO: Avoid concretising the broadcasted
+/// matrixes` note), so a 2-D factor against a `[N, S, in]` activation is physically **copied `N`
+/// times** and then multiplied as `N` batched GEMMs with `M = S`. That is free where `N = 1` — every
+/// DiT trunk site — and pathological where a site folds a token count into the *batch* dim: the Krea
+/// text-fusion `layerwise_blocks` run `[n_tokens, num_layers, d]`, so a 2048² image **edit**
+/// (`n_tokens = 4107` vision+text tokens, `d = 2560`, rank 256) turned each rank-256 factor into a
+/// 2.7e9-element / **5.4 GB** copy and then a 4107-batch `M = 12` GEMM against it — 32 such legs per
+/// denoise step across the two layerwise blocks' eight adapted projections. The first denoise step
+/// never finished (hours), while the same render without an adapter took 55 s.
+///
+/// Flattening is mathematically identical (`matmul` contracts the last dim either way), allocates
+/// nothing beyond the result, and issues ONE large-`M` GEMM — the same lesson sc-11785 applied to the
+/// LoKr vec-trick's expensive leg, here for the plain-LoRA legs.
+fn apply_factor(x: &Tensor, w: &Tensor) -> candle_core::Result<Tensor> {
+    let dims = x.dims();
+    // A non-2-D factor has no flattened form; keep the general (broadcasting) path.
+    if w.rank() != 2 || dims.len() <= 2 {
+        return x.broadcast_matmul(w);
+    }
+    let (lead, k) = dims.split_at(dims.len() - 1);
+    let m: usize = lead.iter().product();
+    let mut out_dims = lead.to_vec();
+    out_dims.push(w.dim(1)?);
+    x.reshape((m, k[0]))?.matmul(w)?.reshape(out_dims)
+}
+
 impl Adapter {
+    /// A scalar-zero LoRA contributes exactly nothing. Detect it before reading either factor: this
+    /// keeps disabled adapters byte-identical to the bare host even when an unused factor contains a
+    /// non-finite value, and avoids two needless matmuls. Structured LoKr retains its pre-bake scale
+    /// solely for the same disabled check.
+    fn is_zero(&self) -> bool {
+        match self {
+            Adapter::Lora { scale, .. } => *scale == 0.0,
+            Adapter::LokrStructured { factors } => factors.scale == 0.0,
+        }
+    }
+
     /// The residual this adapter contributes, in the activation dtype of `x`.
     fn residual(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         match self {
             Adapter::Lora { a, b, scale } => {
                 let xd = x.dtype();
-                let r = x
-                    .broadcast_matmul(&a.to_dtype(xd)?)?
-                    .broadcast_matmul(&b.to_dtype(xd)?)?;
+                let r = apply_factor(&apply_factor(x, &a.to_dtype(xd)?)?, &b.to_dtype(xd)?)?;
                 r * *scale
             }
             // The `scale` is already baked into `factors.w2`, so the vec-trick returns directly.
@@ -146,6 +185,9 @@ pub struct LokrFactors {
     c: usize,
     /// `d` — col count of `w2`.
     d: usize,
+    /// Pre-bake scale retained solely so a disabled structured LoKr can be skipped before reading
+    /// factors. The residual math continues to use the scale already baked into `w2`.
+    pub(crate) scale: f64,
 }
 
 impl LokrFactors {
@@ -218,7 +260,15 @@ impl LokrFactors {
         // Bake the full scale into `w2` (keeps `w1` a clean copy); hold f32, contiguous for the matmuls.
         let w2 = (factor2 * scale)?.contiguous()?;
         let w1 = factor1.contiguous()?;
-        Ok(Some(Self { w1, w2, a, b, c, d }))
+        Ok(Some(Self {
+            w1,
+            w2,
+            a,
+            b,
+            c,
+            d,
+            scale,
+        }))
     }
 
     /// Move the (CPU-read) factors onto `device` — the base lives on the DiT's device, so the residual
@@ -231,6 +281,7 @@ impl LokrFactors {
             b: self.b,
             c: self.c,
             d: self.d,
+            scale: self.scale,
         })
     }
 
@@ -450,12 +501,18 @@ impl AdaptLinear {
         })
     }
 
-    /// `x·Wᵀ (+ b)` plus every attached additive residual, in push order. With no adapter this is
-    /// byte-identical to the bare base forward.
+    /// `x·Wᵀ (+ b)` plus every attached additive residual, in push order. A disabled residual is
+    /// skipped entirely; each live residual keeps `Adapter::residual`'s activation-dtype math and is
+    /// cast only at the hand-off to the host output dtype before addition. With no live adapter this
+    /// is byte-identical to the bare base forward.
     pub fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         let mut y = self.base.forward(x)?;
         for ad in &self.adapters {
-            y = (y + ad.residual(x)?)?;
+            if ad.is_zero() {
+                continue;
+            }
+            let residual = ad.residual(x)?.to_dtype(y.dtype())?;
+            y = (y + residual)?;
         }
         Ok(y)
     }
@@ -463,14 +520,19 @@ impl AdaptLinear {
     /// [`Self::forward`] for a **storage-dtype ≠ compute-dtype** site (sc-12828): the dense base weight
     /// is upcast to `x`'s dtype per call, so a bf16-resident projection runs against f32 activations
     /// without materializing the whole weight at f32 (only the one weight in flight is transient). The
-    /// additive residuals already cast their factors to `x`'s dtype (`Adapter::residual`), so they are
-    /// unchanged. Inert (byte-identical to [`Self::forward`], an `Arc` clone with no copy) when `x`
-    /// already matches the base dtype — the f32-store training/control paths. Used by the Qwen3-VL text
-    /// encoders (krea/boogu), whose bf16-stored projections run against an f32 hidden state.
+    /// additive residuals retain their `x`-dtype arithmetic (`Adapter::residual`) and narrow only to
+    /// the resulting host output dtype at the add. Inert (byte-identical to [`Self::forward`], an
+    /// `Arc` clone with no copy) when `x` already matches the base dtype — the f32-store
+    /// training/control paths. Used by the Qwen3-VL text encoders (krea/boogu), whose bf16-stored
+    /// projections run against an f32 hidden state.
     pub fn forward_upcast(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         let mut y = self.base.forward_upcast(x)?;
         for ad in &self.adapters {
-            y = (y + ad.residual(x)?)?;
+            if ad.is_zero() {
+                continue;
+            }
+            let residual = ad.residual(x)?.to_dtype(y.dtype())?;
+            y = (y + residual)?;
         }
         Ok(y)
     }
@@ -690,6 +752,312 @@ mod tests {
             lin,
             Tensor::from_vec(grid, (out_dim, in_dim), &dev).unwrap(),
         )
+    }
+
+    fn deterministic_weight(out_dim: usize, in_dim: usize, dtype: DType) -> Tensor {
+        let values: Vec<f32> = (0..out_dim * in_dim)
+            .map(|i| ((i % 17) as f32 - 8.0) / 16.0)
+            .collect();
+        Tensor::from_vec(values, (out_dim, in_dim), &Device::Cpu)
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap()
+    }
+
+    fn deterministic_input(rows: usize, in_dim: usize, dtype: DType) -> Tensor {
+        let values: Vec<f32> = (0..rows * in_dim)
+            .map(|i| ((i % 11) as f32 + 1.0) / 8.0)
+            .collect();
+        Tensor::from_vec(values, (rows, in_dim), &Device::Cpu)
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap()
+    }
+
+    fn dense_bf16_adapt(out_dim: usize, in_dim: usize) -> AdaptLinear {
+        AdaptLinear::from_dense(
+            Linear::new(deterministic_weight(out_dim, in_dim, DType::BF16), None),
+            in_dim,
+            out_dim,
+        )
+    }
+
+    fn int8_fast_adapt(quant: Quant, out_dim: usize, in_dim: usize) -> AdaptLinear {
+        let mut base = QLinear::from_dense(DenseLinear::Linear(Linear::new(
+            deterministic_weight(out_dim, in_dim, DType::F32),
+            None,
+        )));
+        // `cast_back=false` is the production SAM3-style host regime: a bf16 activation is promoted
+        // for QMatMul and the host result stays f32. This is the dtype boundary the residual must
+        // follow, rather than assuming the input dtype is also the host-output dtype.
+        base.quantize_int8_fast(quant, false, false, false).unwrap();
+        AdaptLinear::from_packed(base, in_dim, out_dim)
+    }
+
+    fn poison_lora(in_dim: usize, out_dim: usize) -> (Tensor, Tensor) {
+        let a =
+            Tensor::from_vec(vec![f32::INFINITY; in_dim * 2], (in_dim, 2), &Device::Cpu).unwrap();
+        let b = Tensor::ones((2, out_dim), DType::F32, &Device::Cpu).unwrap();
+        (a, b)
+    }
+
+    fn exact_values(t: &Tensor) -> Vec<Vec<f32>> {
+        t.to_dtype(DType::F32).unwrap().to_vec2::<f32>().unwrap()
+    }
+
+    fn assert_tensor_exact(actual: &Tensor, expected: &Tensor, context: &str) {
+        assert_eq!(actual.dtype(), expected.dtype(), "{context}: dtype differs");
+        assert_eq!(
+            exact_values(actual),
+            exact_values(expected),
+            "{context}: element values differ"
+        );
+    }
+
+    /// sc-15444: a strength-zero LoRA is not merely numerically close to disabled: its factors must
+    /// not be evaluated. Poisoned factors make the distinction observable (∞·0 would become NaN).
+    /// The ordinary dense forward and the bf16-store/f32-compute `forward_upcast` must return the
+    /// exact no-adapter values and dtype. Candle's CPU backend does not implement bf16 matmul, so the
+    /// ordinary-forward leg uses its production f32 regime; the bf16-resident leg is exercised through
+    /// the public upcast entry point used for that storage dtype.
+    #[test]
+    fn dense_scale_zero_skips_residual_exactly_in_forward_and_bf16_upcast() {
+        let (out_dim, in_dim) = (16usize, 32usize);
+        let x_f32 = deterministic_input(2, in_dim, DType::F32);
+        let bare_forward_host = AdaptLinear::from_dense(
+            Linear::new(deterministic_weight(out_dim, in_dim, DType::F32), None),
+            in_dim,
+            out_dim,
+        );
+        let bare_forward = bare_forward_host.forward(&x_f32).unwrap();
+
+        let mut zero_forward_host = AdaptLinear::from_dense(
+            Linear::new(deterministic_weight(out_dim, in_dim, DType::F32), None),
+            in_dim,
+            out_dim,
+        );
+        let (a, b) = poison_lora(in_dim, out_dim);
+        zero_forward_host.push_lora(a, b, 0.0);
+        let zero_forward = zero_forward_host.forward(&x_f32).unwrap();
+        assert_tensor_exact(&zero_forward, &bare_forward, "dense f32 forward scale=0");
+
+        let poison_w1 = Tensor::from_vec(vec![f32::INFINITY; 4 * 4], (4, 4), &Device::Cpu).unwrap();
+        let poison_w2 = Tensor::ones((4, 8), DType::F32, &Device::Cpu).unwrap();
+        let factors = LokrFactors::build(
+            0.0,
+            (out_dim, in_dim),
+            Some(&poison_w1),
+            None,
+            None,
+            Some(&poison_w2),
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        let mut zero_lokr_host = AdaptLinear::from_dense(
+            Linear::new(deterministic_weight(out_dim, in_dim, DType::F32), None),
+            in_dim,
+            out_dim,
+        );
+        zero_lokr_host.push_lokr_structured(factors);
+        assert_tensor_exact(
+            &zero_lokr_host.forward(&x_f32).unwrap(),
+            &bare_forward,
+            "dense structured LoKr scale=0",
+        );
+
+        let bare_bf16 = dense_bf16_adapt(out_dim, in_dim);
+        let bare_upcast = bare_bf16.forward_upcast(&x_f32).unwrap();
+        let mut zero_bf16 = dense_bf16_adapt(out_dim, in_dim);
+        let (a, b) = poison_lora(in_dim, out_dim);
+        zero_bf16.push_lora(a, b, 0.0);
+        let zero_upcast = zero_bf16.forward_upcast(&x_f32).unwrap();
+        assert_tensor_exact(
+            &zero_upcast,
+            &bare_upcast,
+            "dense bf16 forward_upcast scale=0",
+        );
+    }
+
+    /// sc-15444: Q8/Q4 int8-fast hosts can intentionally retain an f32 result for non-f32 inputs. A
+    /// live residual must be cast to that host-result dtype before addition; a zero residual must be
+    /// skipped. The expected output is constructed with the same explicit host-dtype seam, then
+    /// compared element-for-element for both public forward entry points. CPU Candle does not implement
+    /// bf16 matmul, so f64 is the executable CPU proxy for the same `input dtype != host output dtype`
+    /// boundary (the production bf16/CUDA path crosses that identical boundary).
+    #[test]
+    fn quantized_hosts_preserve_output_dtype_and_exact_adapter_semantics() {
+        let (out_dim, in_dim, rank) = (32usize, 32usize, 2usize);
+        let x = deterministic_input(2, in_dim, DType::F64);
+        let a = Tensor::ones((in_dim, rank), DType::F32, &Device::Cpu).unwrap();
+        let b = Tensor::ones((rank, out_dim), DType::F32, &Device::Cpu).unwrap();
+        let residual = ((x
+            .broadcast_matmul(&a.to_dtype(DType::F64).unwrap())
+            .unwrap()
+            .broadcast_matmul(&b.to_dtype(DType::F64).unwrap())
+            .unwrap())
+            * 0.5)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap();
+        assert_eq!(
+            exact_values(&residual),
+            vec![vec![23.375; out_dim], vec![23.5; out_dim]],
+            "the deterministic live adapter must inject the measured positive residual"
+        );
+
+        for quant in [Quant::Q8, Quant::Q4] {
+            let bare = int8_fast_adapt(quant, out_dim, in_dim);
+            let bare_forward = bare.forward(&x).unwrap();
+            assert_eq!(bare_forward.dtype(), DType::F32);
+
+            let mut zero = int8_fast_adapt(quant, out_dim, in_dim);
+            let (poison_a, poison_b) = poison_lora(in_dim, out_dim);
+            zero.push_lora(poison_a, poison_b, 0.0);
+            assert_tensor_exact(
+                &zero.forward(&x).unwrap(),
+                &bare_forward,
+                "quantized forward scale=0",
+            );
+            assert_tensor_exact(
+                &zero.forward_upcast(&x).unwrap(),
+                &bare_forward,
+                "quantized forward_upcast scale=0",
+            );
+
+            let mut live = int8_fast_adapt(quant, out_dim, in_dim);
+            live.push_lora(a.clone(), b.clone(), 0.5);
+            let expected = (&bare_forward + &residual).unwrap();
+            let got = live.forward(&x).unwrap();
+            assert_tensor_exact(&got, &expected, "quantized forward live adapter");
+            assert_tensor_exact(
+                &live.forward_upcast(&x).unwrap(),
+                &expected,
+                "quantized forward_upcast live adapter",
+            );
+            assert!(
+                exact_values(&got)
+                    .iter()
+                    .flatten()
+                    .zip(exact_values(&bare_forward).iter().flatten())
+                    .all(|(adapted, base)| adapted > base),
+                "positive live adapter must shift every host output upward"
+            );
+        }
+    }
+
+    /// The hardware counterpart to the CPU dtype-boundary test: Metal supports bf16 dense matmul, so
+    /// this runs the production activation dtype directly across dense, Q8, and Q4 hosts. It is gated
+    /// with the backend feature and is exercised by the macOS validation lane.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_bf16_dense_q8_q4_forwards_are_exact_at_the_adapter_seam() {
+        let dev = Device::new_metal(0).unwrap();
+        let (out_dim, in_dim, rank) = (32usize, 32usize, 2usize);
+        let x = deterministic_input(2, in_dim, DType::BF16)
+            .to_device(&dev)
+            .unwrap();
+        let dense_weight = deterministic_weight(out_dim, in_dim, DType::BF16)
+            .to_device(&dev)
+            .unwrap();
+        let bare_dense =
+            AdaptLinear::from_dense(Linear::new(dense_weight.clone(), None), in_dim, out_dim);
+        let bare_dense_y = bare_dense.forward(&x).unwrap();
+        assert_eq!(bare_dense_y.dtype(), DType::BF16);
+
+        let mut zero_dense =
+            AdaptLinear::from_dense(Linear::new(dense_weight, None), in_dim, out_dim);
+        let poison_a = Tensor::full(f32::INFINITY, (in_dim, rank), &dev).unwrap();
+        let poison_b = Tensor::ones((rank, out_dim), DType::F32, &dev).unwrap();
+        zero_dense.push_lora(poison_a, poison_b, 0.0);
+        assert_tensor_exact(
+            &zero_dense.forward(&x).unwrap(),
+            &bare_dense_y,
+            "Metal dense bf16 forward scale=0",
+        );
+        assert_tensor_exact(
+            &zero_dense.forward_upcast(&x).unwrap(),
+            &bare_dense_y,
+            "Metal dense bf16 forward_upcast scale=0",
+        );
+
+        let a = Tensor::ones((in_dim, rank), DType::F32, &dev).unwrap();
+        let b = Tensor::ones((rank, out_dim), DType::F32, &dev).unwrap();
+        let residual_bf16 = ((x
+            .broadcast_matmul(&a.to_dtype(DType::BF16).unwrap())
+            .unwrap()
+            .broadcast_matmul(&b.to_dtype(DType::BF16).unwrap())
+            .unwrap())
+            * 0.5)
+            .unwrap();
+        let mut live_dense = AdaptLinear::from_dense(
+            Linear::new(
+                deterministic_weight(out_dim, in_dim, DType::BF16)
+                    .to_device(&dev)
+                    .unwrap(),
+                None,
+            ),
+            in_dim,
+            out_dim,
+        );
+        live_dense.push_lora(a.clone(), b.clone(), 0.5);
+        let dense_expected = (&bare_dense_y + &residual_bf16).unwrap();
+        assert_tensor_exact(
+            &live_dense.forward(&x).unwrap(),
+            &dense_expected,
+            "Metal dense bf16 live adapter",
+        );
+        assert_tensor_exact(
+            &live_dense.forward_upcast(&x).unwrap(),
+            &dense_expected,
+            "Metal dense bf16 live adapter upcast entry",
+        );
+
+        for quant in [Quant::Q8, Quant::Q4] {
+            let build = || {
+                let weight = deterministic_weight(out_dim, in_dim, DType::F32)
+                    .to_device(&dev)
+                    .unwrap();
+                let mut base = QLinear::from_dense(DenseLinear::Linear(Linear::new(weight, None)));
+                base.quantize_int8_fast(quant, false, false, false).unwrap();
+                AdaptLinear::from_packed(base, in_dim, out_dim)
+            };
+
+            let bare = build();
+            let base_y = bare.forward(&x).unwrap();
+            assert_eq!(base_y.dtype(), DType::F32);
+
+            let mut zero = build();
+            let poison_a = Tensor::full(f32::INFINITY, (in_dim, rank), &dev).unwrap();
+            let poison_b = Tensor::ones((rank, out_dim), DType::F32, &dev).unwrap();
+            zero.push_lora(poison_a, poison_b, 0.0);
+            assert_tensor_exact(
+                &zero.forward(&x).unwrap(),
+                &base_y,
+                "Metal quantized bf16 forward scale=0",
+            );
+            assert_tensor_exact(
+                &zero.forward_upcast(&x).unwrap(),
+                &base_y,
+                "Metal quantized bf16 forward_upcast scale=0",
+            );
+
+            let mut live = build();
+            live.push_lora(a.clone(), b.clone(), 0.5);
+            let expected = (&base_y + residual_bf16.to_dtype(DType::F32).unwrap()).unwrap();
+            assert_tensor_exact(
+                &live.forward(&x).unwrap(),
+                &expected,
+                "Metal quantized bf16 live adapter",
+            );
+            assert_tensor_exact(
+                &live.forward_upcast(&x).unwrap(),
+                &expected,
+                "Metal quantized bf16 live adapter upcast entry",
+            );
+        }
     }
 
     /// `detect` recovers the logical dims from the packed `scales` shape and keeps the base packed.
@@ -1304,5 +1672,45 @@ mod tests {
         // A missing w2 leg (no full, no a/b) is a typed error, not a panic.
         let err = LokrFactors::build(1.0, (6, 20), Some(&w1), None, None, None, None, None, None);
         assert!(err.is_err(), "missing w2 must be a typed error");
+    }
+
+    /// A LoRA residual on an activation with a **non-1 leading (batch) dim** must fold those leading
+    /// dims into the GEMM's `M` — never `broadcast_matmul`, which physically copies the 2-D factor once
+    /// per batch element. The Krea text-fusion `layerwise_blocks` run `[n_tokens, num_layers, d]`, so at
+    /// a 2048² image edit (`n_tokens = 4107`, `d = 2560`, rank 256) the old broadcast path materialized a
+    /// 5.4 GB copy per residual leg and the first denoise step never finished. This pins the flattened
+    /// path's NUMERICS against a per-batch-slice reference, so the perf fix can't silently change the math.
+    #[test]
+    fn lora_residual_on_batched_activation_matches_per_slice_reference() {
+        let dev = Device::Cpu;
+        let (out_dim, in_dim, rank, scale) = (12usize, 16usize, 4usize, 0.7f64);
+        let w = Tensor::randn(0f32, 1f32, (out_dim, in_dim), &dev).unwrap();
+        let a = Tensor::randn(0f32, 1f32, (in_dim, rank), &dev).unwrap(); // [in, rank]
+        let b = Tensor::randn(0f32, 1f32, (rank, out_dim), &dev).unwrap(); // [rank, out]
+        let mut lin = AdaptLinear::from_dense(Linear::new(w.clone(), None), in_dim, out_dim);
+        lin.push_lora(a.clone(), b.clone(), scale);
+
+        // `[N, S, in]`: N is a BATCH of token stacks (the layerwise-block shape), S the stack length.
+        let (n, s) = (5usize, 3usize);
+        let x = Tensor::randn(0f32, 1f32, (n, s, in_dim), &dev).unwrap();
+        let got = lin.forward(&x).unwrap();
+        assert_eq!(got.dims(), &[n, s, out_dim]);
+
+        for i in 0..n {
+            let xi = x.narrow(0, i, 1).unwrap().reshape((s, in_dim)).unwrap();
+            let base = Linear::new(w.clone(), None).forward(&xi).unwrap();
+            let res = (xi.matmul(&a).unwrap().matmul(&b).unwrap() * scale).unwrap();
+            let want = (base + res).unwrap();
+            let mine = got.narrow(0, i, 1).unwrap().reshape((s, out_dim)).unwrap();
+            let d = (mine - want)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .max_all()
+                .unwrap()
+                .to_vec0::<f32>()
+                .unwrap();
+            assert!(d < 1e-5, "batch slice {i} diverged from the reference: {d}");
+        }
     }
 }

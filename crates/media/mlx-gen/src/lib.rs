@@ -27,6 +27,11 @@ pub use gen_core::{
 // Local MLX modules (tensor ops, weights, quant, samplers' tensor application, error w/ mlx variants).
 pub mod adapters;
 pub mod array;
+// Query-row bounded attention (SC-15615): the MLX half of ladder rung 3, shared so no family forks it.
+pub mod attention;
+// Bounded transformer residency (SC-15750): ladder rung 4, likewise shared — see the module docs for
+// the lazy-graph trap that makes a hand-rolled version silently save nothing.
+pub mod block_residency;
 pub mod error;
 pub mod img2img;
 pub mod memory;
@@ -74,6 +79,9 @@ pub mod transform {
 // ([`tiling::TilePlan`]); this carries the tensor loop.
 pub mod vae_tiling;
 
+pub use attention::{
+    sdpa_budgeted_bhsd, AttentionBudget, AttentionPlan, CONSTRAINED_ATTN_SCORES_BUDGET,
+};
 pub use caption::{
     CaptionCapabilities, CaptionFinishReason, CaptionOptions, CaptionOutput, CaptionRequest,
     CaptionSampling, Captioner, CaptionerDescriptor,
@@ -99,8 +107,8 @@ pub use registry::{
 };
 pub use residency::{Residency, StagedHeavy};
 pub use runtime::{
-    AdapterKind, AdapterSpec, CancelFlag, IdentityWeights, LoadPhase, LoadSpec, MoeExpert,
-    OffloadPolicy, PidWeights, Precision, Progress, Quant, WeightsSource,
+    AdapterApplyReport, AdapterKind, AdapterSpec, CancelFlag, IdentityWeights, LoadPhase, LoadSpec,
+    MoeExpert, OffloadPolicy, PidWeights, Precision, Progress, Quant, WeightsSource,
 };
 pub use sampler::{
     curated_sampler_names, curated_scheduler_names, resolve_flow_schedule, resolve_schedule,

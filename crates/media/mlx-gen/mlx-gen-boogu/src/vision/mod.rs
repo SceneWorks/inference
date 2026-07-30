@@ -16,6 +16,22 @@
 //! The grid-derived host-side math (rope table, bilinear pos-embed indices/weights) mirrors the
 //! reference `get_vision_position_ids` / `get_vision_bilinear_indices_and_weights` and is computed in
 //! `VisionTower::build_plan`. Linears are [`AdaptableLinear`]s so they quantize at load.
+//!
+//! ## The tower is shared across crates, so its quantization group size is a **parameter**
+//!
+//! Three crates build this tower — Boogu itself, `mlx-gen-krea` and `mlx-gen-mage` — and they do
+//! **not** agree on a group size: Boogu packs at 32 (its `3360 = 32·105` DiT hidden is not divisible
+//! by 64), Krea and Mage at the codebase-default 64. [`VisionTower::from_weights`] therefore takes
+//! the group size from its caller (sc-15154). It used to hard-code Boogu's `crate::quant::GROUP_SIZE`
+//! (32), which silently mis-derived the geometry of any tower packed at any other width:
+//!
+//! | Mage tier | `model.visual.blocks.*.attn.qkv.weight` | read at 64 (correct) | read at 32 |
+//! |---|---|---|---|
+//! | q4 | `[3072, 128]` u32, scales `[3072, 16]` | in 1024, bits 4 | in 512, bits **8** → `quantized_matmul` shape error |
+//! | q8 | `[3072, 256]` u32, scales `[3072, 16]` | in 1024, bits 8 | in 512, bits **16** → rejected as "corrupt" |
+//!
+//! Both are load/inference failures rather than silent quality loss, but only because 32 happens to
+//! halve the input dim here; a foreign constant baked into a shared loader is the defect either way.
 
 pub mod preprocess;
 
@@ -25,10 +41,9 @@ use mlx_rs::{Array, Dtype};
 
 use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::nn::{gelu_exact, gelu_tanh};
+use mlx_gen::quant::lin;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
-
-use crate::quant::lin;
 
 const LN_EPS: f32 = 1e-6;
 const ROPE_THETA: f32 = 10000.0;
@@ -107,25 +122,25 @@ struct Block {
 }
 
 impl Block {
-    fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
+    fn from_weights(w: &Weights, prefix: &str, group_size: i32) -> Result<Self> {
         let req = |s: &str| -> Result<Array> { Ok(w.require(&format!("{prefix}.{s}"))?.clone()) };
         Ok(Self {
             norm1_w: req("norm1.weight")?,
             norm1_b: req("norm1.bias")?,
             norm2_w: req("norm2.weight")?,
             norm2_b: req("norm2.bias")?,
-            qkv: lin(w, &format!("{prefix}.attn.qkv"), true)?,
-            proj: lin(w, &format!("{prefix}.attn.proj"), true)?,
-            fc1: lin(w, &format!("{prefix}.mlp.linear_fc1"), true)?,
-            fc2: lin(w, &format!("{prefix}.mlp.linear_fc2"), true)?,
+            qkv: lin(w, &format!("{prefix}.attn.qkv"), true, group_size)?,
+            proj: lin(w, &format!("{prefix}.attn.proj"), true, group_size)?,
+            fc1: lin(w, &format!("{prefix}.mlp.linear_fc1"), true, group_size)?,
+            fc2: lin(w, &format!("{prefix}.mlp.linear_fc2"), true, group_size)?,
         })
     }
 
-    fn quantize(&mut self, bits: i32) -> Result<()> {
-        self.qkv.quantize(bits, None)?;
-        self.proj.quantize(bits, None)?;
-        self.fc1.quantize(bits, None)?;
-        self.fc2.quantize(bits, None)
+    fn quantize(&mut self, bits: i32, group_size: i32) -> Result<()> {
+        self.qkv.quantize(bits, Some(group_size))?;
+        self.proj.quantize(bits, Some(group_size))?;
+        self.fc1.quantize(bits, Some(group_size))?;
+        self.fc2.quantize(bits, Some(group_size))
     }
 
     /// Full attention over `x` `[seq, dim]` with precomputed `cos`/`sin` `[seq, head_dim]` (f32).
@@ -193,20 +208,26 @@ struct Merger {
 }
 
 impl Merger {
-    fn from_weights(w: &Weights, prefix: &str, postshuffle: bool, merged_dim: i32) -> Result<Self> {
+    fn from_weights(
+        w: &Weights,
+        prefix: &str,
+        postshuffle: bool,
+        merged_dim: i32,
+        group_size: i32,
+    ) -> Result<Self> {
         Ok(Self {
             norm_w: w.require(&format!("{prefix}.norm.weight"))?.clone(),
             norm_b: w.require(&format!("{prefix}.norm.bias"))?.clone(),
-            fc1: lin(w, &format!("{prefix}.linear_fc1"), true)?,
-            fc2: lin(w, &format!("{prefix}.linear_fc2"), true)?,
+            fc1: lin(w, &format!("{prefix}.linear_fc1"), true, group_size)?,
+            fc2: lin(w, &format!("{prefix}.linear_fc2"), true, group_size)?,
             postshuffle,
             merged_dim,
         })
     }
 
-    fn quantize(&mut self, bits: i32) -> Result<()> {
-        self.fc1.quantize(bits, None)?;
-        self.fc2.quantize(bits, None)
+    fn quantize(&mut self, bits: i32, group_size: i32) -> Result<()> {
+        self.fc1.quantize(bits, Some(group_size))?;
+        self.fc2.quantize(bits, Some(group_size))
     }
 
     /// `x` `[seq, hidden]` → `[merged, out_hidden]` (`merged = seq / merge²`).
@@ -242,11 +263,23 @@ pub struct VisionTower {
     merger: Merger,
     deepstack_mergers: Vec<Merger>,
     cfg: VisionConfig,
+    group_size: i32,
 }
 
 impl VisionTower {
     /// Build from the mllm weight set (`{prefix}.*`, e.g. `"model.visual"`).
-    pub fn from_weights(w: &Weights, cfg: VisionConfig, prefix: &str) -> Result<Self> {
+    ///
+    /// `group_size` is the **caller's** quantization group size — the width its converter packed
+    /// `{prefix}.*` at, and the width [`Self::quantize`] will pack at when handed a dense snapshot.
+    /// Pass the owning crate's `quant::GROUP_SIZE` (Boogu 32, Krea 64, Mage 64); see the module
+    /// comment for why this cannot be a constant here. Ignored entirely for a dense snapshot, whose
+    /// weights carry no `{base}.scales`.
+    pub fn from_weights(
+        w: &Weights,
+        cfg: VisionConfig,
+        prefix: &str,
+        group_size: i32,
+    ) -> Result<Self> {
         // Fold the Conv3d patch-embed weight `[embed, in, t, ph, pw]` → `[embed, in·t·ph·pw]` so the
         // full-kernel conv runs as a per-patch matmul; keep its bias.
         let conv = w
@@ -260,11 +293,17 @@ impl VisionTower {
         let patch_embed = AdaptableLinear::dense(conv.reshape(&[embed, in_dim])?, Some(bias));
 
         let blocks = (0..cfg.depth)
-            .map(|i| Block::from_weights(w, &format!("{prefix}.blocks.{i}")))
+            .map(|i| Block::from_weights(w, &format!("{prefix}.blocks.{i}"), group_size))
             .collect::<Result<Vec<_>>>()?;
 
         let merged_dim = cfg.hidden_size * cfg.merge_unit();
-        let merger = Merger::from_weights(w, &format!("{prefix}.merger"), false, merged_dim)?;
+        let merger = Merger::from_weights(
+            w,
+            &format!("{prefix}.merger"),
+            false,
+            merged_dim,
+            group_size,
+        )?;
         let deepstack_mergers = (0..cfg.deepstack_visual_indexes.len())
             .map(|i| {
                 Merger::from_weights(
@@ -272,6 +311,7 @@ impl VisionTower {
                     &format!("{prefix}.deepstack_merger_list.{i}"),
                     true,
                     merged_dim,
+                    group_size,
                 )
             })
             .collect::<Result<Vec<_>>>()?;
@@ -283,6 +323,7 @@ impl VisionTower {
             merger,
             deepstack_mergers,
             cfg,
+            group_size,
         })
     }
 
@@ -290,14 +331,22 @@ impl VisionTower {
         &self.cfg
     }
 
-    /// Quantize every block + the (deepstack) mergers. LayerNorm / pos-embed weights stay dense.
+    /// The quantization group size this tower was built with — the width its packed weights were
+    /// read at, and the width [`Self::quantize`] packs a dense snapshot at.
+    pub fn group_size(&self) -> i32 {
+        self.group_size
+    }
+
+    /// Quantize every block + the (deepstack) mergers at [`Self::group_size`] — the same width the
+    /// caller's converter packs at, so load-time quantization and a pre-quantized snapshot agree.
+    /// LayerNorm / pos-embed weights stay dense.
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
         for b in &mut self.blocks {
-            b.quantize(bits)?;
+            b.quantize(bits, self.group_size)?;
         }
-        self.merger.quantize(bits)?;
+        self.merger.quantize(bits, self.group_size)?;
         for m in &mut self.deepstack_mergers {
-            m.quantize(bits)?;
+            m.quantize(bits, self.group_size)?;
         }
         Ok(())
     }

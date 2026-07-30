@@ -59,6 +59,13 @@ pub const CELL: u32 = 32;
 const REF_MIN_PIXELS: i64 = 512 * 512;
 const REF_MAX_PIXELS: i64 = 2048 * 2048;
 
+/// Resolve the request's image-guidance scale for the reference-conditioned it2i path. Keeping this
+/// seam explicit prevents `true_cfg` from being advertised while accidentally dropping it before
+/// [`T2iModel::it2i_generate`].
+fn image_cfg_scale(req: &GenerationRequest) -> f32 {
+    req.true_cfg.unwrap_or(1.0)
+}
+
 pub fn descriptor() -> ModelDescriptor {
     descriptor_for(MODEL_ID)
 }
@@ -283,7 +290,7 @@ impl SenseNova {
         };
         T2iOptions {
             cfg_scale: req.guidance.unwrap_or(def_guidance),
-            img_cfg_scale: req.true_cfg.unwrap_or(1.0),
+            img_cfg_scale: image_cfg_scale(req),
             num_steps: req.steps.unwrap_or(def_steps) as usize,
             timestep_shift: req.scheduler_shift.unwrap_or(DEFAULT_TIMESTEP_SHIFT),
             seed,
@@ -368,10 +375,26 @@ impl SenseNova {
     }
 }
 
-/// Request-boundary checks beyond the capability surface: 32-pixel alignment per side and a positive
-/// step count. Factored out so it can be unit-tested without loaded weights. `id` is the rejecting
-/// model's descriptor id (base or `_fast`) so the error attributes to the right variant (F-143).
+/// Request-boundary checks beyond the capability surface: reference-only image guidance, 32-pixel
+/// alignment per side, and a positive step count. Factored out so it can be unit-tested without
+/// loaded weights. `id` is the rejecting model's descriptor id (base or `_fast`) so the error
+/// attributes to the right variant (F-143).
 fn validate_dims_and_steps(id: &str, req: &GenerationRequest) -> Result<()> {
+    if req.true_cfg.is_some()
+        && !req
+            .conditioning
+            .iter()
+            .any(|conditioning| match conditioning {
+                Conditioning::Reference { .. } => true,
+                Conditioning::MultiReference { images } => !images.is_empty(),
+                _ => false,
+            })
+    {
+        return Err(Error::Unsupported(format!(
+            "{id}: true_cfg is image guidance and requires Reference or non-empty MultiReference \
+             conditioning"
+        )));
+    }
     if !req.width.is_multiple_of(CELL) || !req.height.is_multiple_of(CELL) {
         return Err(Error::Msg(format!(
             "{id}: {}x{} must be a multiple of {CELL} per side",
@@ -455,6 +478,51 @@ mod tests {
         assert!(d.capabilities.accepts(ConditioningKind::MultiReference));
         assert!(d.capabilities.supports_guidance);
         assert!(d.capabilities.supports_true_cfg);
+    }
+
+    #[test]
+    fn true_cfg_is_reference_image_guidance_not_text_cfg() {
+        let request = GenerationRequest {
+            prompt: "turn this into a watercolor".into(),
+            true_cfg: Some(1.75),
+            conditioning: vec![Conditioning::Reference {
+                image: Image::default(),
+                strength: None,
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            image_cfg_scale(&request),
+            1.75,
+            "request.true_cfg must reach T2iOptions.img_cfg_scale verbatim"
+        );
+        assert!(validate_dims_and_steps(MODEL_ID, &request).is_ok());
+
+        let no_reference = GenerationRequest {
+            conditioning: vec![],
+            ..request.clone()
+        };
+        let error = validate_dims_and_steps(MODEL_ID, &no_reference)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("requires Reference"),
+            "true_cfg on txt2img would otherwise be silently ignored: {error}"
+        );
+
+        let empty_multi = GenerationRequest {
+            conditioning: vec![Conditioning::MultiReference { images: vec![] }],
+            ..request
+        };
+        assert!(
+            validate_dims_and_steps(MODEL_ID, &empty_multi).is_err(),
+            "an empty MultiReference does not create the image-guidance branch"
+        );
+        assert_eq!(
+            image_cfg_scale(&GenerationRequest::default()),
+            1.0,
+            "unset true_cfg preserves the reference path's neutral image-guidance scale"
+        );
     }
 
     #[test]

@@ -60,38 +60,61 @@
 use candle_gen::candle_core::{DType, Result, Tensor};
 use candle_gen::candle_nn::{Embedding, Linear, Module, VarBuilder};
 use candle_gen::quant as shared;
+use candle_gen::train::lora::LoraLinear;
 
 /// The LTX MLX tier's quant group size (read from `quantize_config.json`'s `quantization.group_size`;
 /// the hosted q4/q8 tiers pack at 64, MLX's default). Threaded through the shared group-size-aware
 /// loaders so a future tier that packs at a different group is honoured, not silently mis-read.
 pub const GROUP_SIZE: usize = shared::MLX_GROUP_SIZE; // 64
 
-/// A Linear projection that is **dense** (the loaded bf16 weight, the legacy per-crate path) or
-/// **packed** (loaded straight from the MLX-packed tier via the shared [`candle_gen::quant::QLinear`],
-/// sc-9417). Built via [`qlinear`] (packed-detect); both forwards compute `x·Wᵀ + b`.
-pub enum QLinear {
-    Dense(Linear),
-    /// Loaded directly from the MLX-packed tier through the shared module — the resident `Q4_1`/`Q8_0`
-    /// weight **dequantizes-on-forward** into a dense matmul (sc-7702, *not* the int8 `QMatMul` fast
-    /// path).
-    Packed(shared::QLinear),
-}
+/// A Linear projection whose frozen base is **dense** (the loaded bf16 weight, the legacy per-crate
+/// path) or **packed** (loaded straight from the MLX-packed tier via the shared
+/// [`candle_gen::quant::QLinear`], sc-9417). The shared [`LoraLinear`] wrapper makes either base
+/// inference-adaptable without changing its adapter-free forward.
+pub struct QLinear(LoraLinear);
 
 impl QLinear {
-    /// `x·Wᵀ + b`. Dense delegates to `candle_nn::Linear`; packed delegates to the shared
-    /// dequant-on-forward `QLinear` (sc-7702).
+    /// `x·Wᵀ + b` plus any inference residuals. The frozen dense/packed base dispatch is owned by the
+    /// shared [`LoraLinear`].
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        match self {
-            Self::Dense(l) => l.forward(x),
-            Self::Packed(l) => l.forward(x),
-        }
+        self.0.forward(x)
     }
 
     /// Whether this projection loaded directly from the MLX-packed tier (the packed path) — used by the
     /// tests to assert a packed tier fired the packed path (not a silent dense fallback).
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_packed(&self) -> bool {
-        matches!(self, Self::Packed(_))
+        self.0.is_packed()
+    }
+
+    /// Canonical PEFT path captured from the projection's loading builder.
+    pub(crate) fn path(&self) -> &str {
+        self.0.path()
+    }
+
+    /// Logical `(out_features, in_features)` for adapter factor validation.
+    pub(crate) fn base_shape(&self) -> (usize, usize) {
+        (self.0.out_features(), self.0.in_features())
+    }
+
+    /// Attach a shared forward-time additive LoRA residual without changing the frozen base.
+    pub(crate) fn push_additive_lora(&mut self, a: Tensor, b: Tensor, scale: f64) {
+        self.0.push_additive_lora(a, b, scale);
+    }
+
+    /// Wrap this frozen projection in the shared training-time LoRA seam without changing its
+    /// forward. Dense bases remain dense; an MLX-packed base remains packed (and therefore
+    /// inference-only, as required by [`candle_gen::train::lora::LoraLinear`]).
+    pub(crate) fn into_lora(
+        self,
+        in_features: usize,
+        out_features: usize,
+        path: String,
+    ) -> LoraLinear {
+        debug_assert_eq!(self.0.in_features(), in_features);
+        debug_assert_eq!(self.0.out_features(), out_features);
+        debug_assert_eq!(self.0.path(), path);
+        self.0
     }
 }
 
@@ -102,7 +125,7 @@ impl Module for QLinear {
 }
 
 /// **Packed-detecting** Linear loader for `{key}` under `vb` (sc-9417). If `{key}.scales` is present (a
-/// pre-quantized MLX tier), build a [`QLinear::Packed`] straight from the packed parts on `vb`'s device
+/// pre-quantized MLX tier), build a packed frozen base straight from the parts on `vb`'s device
 /// via the shared [`candle_gen::quant::QLinear::from_packed_gs`] at [`GROUP_SIZE`] — **no dense weight is
 /// materialized**.
 /// Otherwise the **dense** path is taken unchanged: `{key}.weight` [+ `{key}.bias` when `bias`], cast to
@@ -113,6 +136,7 @@ impl Module for QLinear {
 /// The dense fallback reads the weight shape from the file (`get_unchecked`), not threaded config dims,
 /// so it drops in for the old `linear(vb, key) -> Linear` helpers without plumbing `in_dim`/`out_dim`.
 pub fn qlinear(vb: &VarBuilder, key: &str, bias: bool) -> Result<QLinear> {
+    let path = vb.pp(key).prefix();
     let scales_key = format!("{key}.scales");
     if vb.contains_tensor(&scales_key) {
         let device = vb.device().clone();
@@ -127,9 +151,14 @@ pub fn qlinear(vb: &VarBuilder, key: &str, bias: bool) -> Result<QLinear> {
         } else {
             None
         };
-        return Ok(QLinear::Packed(shared::QLinear::from_packed_gs(
-            &wq, &scales, &biases, bias, GROUP_SIZE, &device,
-        )?));
+        let out_features = scales.dim(0)?;
+        let in_features = scales.dim(1)? * GROUP_SIZE;
+        return Ok(QLinear(LoraLinear::from_qlinear(
+            shared::QLinear::from_packed_gs(&wq, &scales, &biases, bias, GROUP_SIZE, &device)?,
+            in_features,
+            out_features,
+            path,
+        )));
     }
     // Dense path, byte-identical to the legacy `linear`: read `{key}.weight` [+ `.bias`], cast to the
     // vb dtype (bf16). `get_unchecked` (no shape validation) matches the old helper's behavior.
@@ -144,7 +173,13 @@ pub fn qlinear(vb: &VarBuilder, key: &str, bias: bool) -> Result<QLinear> {
     } else {
         None
     };
-    Ok(QLinear::Dense(Linear::new(w, b)))
+    let (out_features, in_features) = w.dims2()?;
+    Ok(QLinear(LoraLinear::from_linear(
+        Linear::new(w, b),
+        in_features,
+        out_features,
+        path,
+    )))
 }
 
 /// A resolved token-embedding **table** (`[vocab, hidden]`), loaded either dense (`{key}.weight`, cast
@@ -327,7 +362,7 @@ mod tests {
         let vb = VarBuilder::from_backend(Box::new(st), DType::F32, dev.clone());
         let blk = vb.pp("transformer_blocks.0.attn1");
 
-        let packed = qlinear(&blk, "to_out", true)?;
+        let mut packed = qlinear(&blk, "to_out", true)?;
         assert!(
             packed.is_packed(),
             "`.scales` under to_out ⇒ packed load (not a silent dense fallback)"
@@ -339,13 +374,44 @@ mod tests {
         );
 
         // The packed forward reproduces the affine grid (+ the dense bias) bit-exactly.
-        let grid_lin = QLinear::Dense(Linear::new(
-            Tensor::from_vec(grid, (out_dim, in_dim), &dev)?,
-            Some(out_bias),
+        let grid_lin = QLinear(LoraLinear::from_linear(
+            Linear::new(
+                Tensor::from_vec(grid, (out_dim, in_dim), &dev)?,
+                Some(out_bias),
+            ),
+            in_dim,
+            out_dim,
+            "grid".into(),
         ));
         let x = Tensor::randn(0f32, 1f32, (4, in_dim), &dev)?;
-        let cos = cosine(&packed.forward(&x)?, &grid_lin.forward(&x)?);
+        let base = packed.forward(&x)?;
+        let cos = cosine(&base, &grid_lin.forward(&x)?);
         assert!(cos > 0.99999, "packed vs affine-grid cosine {cos:.6}");
+
+        // Inference LoRA rides through the shared additive core without unpacking the q4 base.
+        let rank = 4;
+        let a = Tensor::randn(0f32, 0.1f32, (in_dim, rank), &dev)?;
+        let bfac = Tensor::randn(0f32, 0.1f32, (rank, out_dim), &dev)?;
+        packed.push_additive_lora(a.clone(), bfac.clone(), 0.7);
+        assert!(
+            packed.is_packed(),
+            "adding LoRA must preserve packed residency"
+        );
+        let adapted = packed.forward(&x)?;
+        let effect = (adapted - &base)?.abs()?.max_all()?.to_scalar::<f32>()?;
+        assert!(effect > 1e-6, "nonzero LoRA must change packed output");
+
+        let mut zero = qlinear(&blk, "to_out", true)?;
+        zero.push_additive_lora(a, bfac, 0.0);
+        assert!(
+            zero.is_packed(),
+            "scale=0 LoRA must preserve packed residency"
+        );
+        let zero_diff = (zero.forward(&x)? - base)?
+            .abs()?
+            .max_all()?
+            .to_scalar::<f32>()?;
+        assert_eq!(zero_diff, 0.0, "scale=0 must equal the packed base");
 
         std::fs::remove_file(&tmp).ok();
         Ok(())

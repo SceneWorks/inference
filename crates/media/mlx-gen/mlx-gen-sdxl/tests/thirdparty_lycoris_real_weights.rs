@@ -39,7 +39,8 @@ fn thirdparty_loha_and_lokr_merge_on_real_unet() {
         .collect();
     println!("SDXL targets: {:?}", shapes);
 
-    let dir = std::env::temp_dir().join("mlx_gen_sdxl_thirdparty_rw");
+    let dir =
+        std::env::temp_dir().join(format!("mlx_gen_sdxl_thirdparty_rw_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let r = 2i32;
 

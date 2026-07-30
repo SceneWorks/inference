@@ -89,6 +89,20 @@ pub enum AdaLn {
 }
 
 impl AdaLn {
+    fn quantize(&mut self, bits: i32) -> Result<()> {
+        if let Self::Mlp(linear) = self {
+            linear.quantize(bits)?;
+        }
+        Ok(())
+    }
+
+    fn quantization_count(&self) -> (usize, usize) {
+        match self {
+            Self::Mlp(linear) => linear.quantization_count(),
+            Self::Folded(_) => (0, 0),
+        }
+    }
+
     /// Load `{prefix}.adaLN_modulation.1` (index 0 is the `SiLU`).
     pub fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
         Ok(Self::Mlp(Linear::from_weights(
@@ -176,6 +190,14 @@ pub struct DiCoBlock {
 }
 
 impl DiCoBlock {
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.adaln.quantize(bits)
+    }
+
+    pub(crate) fn quantization_count(&self) -> (usize, usize) {
+        self.adaln.quantization_count()
+    }
+
     /// Load one block under `{prefix}` (e.g. `blocks.7`).
     pub fn from_weights(w: &Weights, prefix: &str, hidden_size: i32) -> Result<Self> {
         Ok(Self {

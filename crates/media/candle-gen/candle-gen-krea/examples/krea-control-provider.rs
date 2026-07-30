@@ -37,11 +37,11 @@ struct Args {
     out: PathBuf,
     /// Quantize the control-branch overlay for the small-card load (sc-11743): `q4` / `q8` keep it
     /// packed in VRAM (dequant-on-forward), `bf16` (default) is the full-precision branch.
-    branch_quant: Option<Quant>,
+    branch_tier: Option<Quant>,
 }
 
 /// `q4` / `q8` → the packed branch load; `bf16` → dense. Any other value panics (example CLI).
-fn parse_branch_quant(v: &str) -> Option<Quant> {
+fn parse_branch_tier(v: &str) -> Option<Quant> {
     match v {
         "q4" | "Q4" => Some(Quant::Q4),
         "q8" | "Q8" => Some(Quant::Q8),
@@ -61,7 +61,7 @@ fn parse_args() -> Args {
         steps: 8,
         size: 1024,
         out: PathBuf::from("krea_control_provider.png"),
-        branch_quant: None,
+        branch_tier: None,
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -82,7 +82,7 @@ fn parse_args() -> Args {
             "--steps" => a.steps = val().parse().expect("--steps"),
             "--size" => a.size = val().parse().expect("--size"),
             "--out" => a.out = val().into(),
-            "--branch-quant" => a.branch_quant = parse_branch_quant(&val()),
+            "--branch-quant" => a.branch_tier = parse_branch_tier(&val()),
             other => panic!("unknown flag {other}"),
         }
         i += 2;
@@ -119,14 +119,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         root: a.snapshot,
         control: a.ckpt,
         adapters: Vec::new(),
-        branch_quant: a.branch_quant,
+        branch_tier: a.branch_tier,
         chunk_attention,
         // `CANDLE_GEN_OFFLOAD=sequential` overrides this resident default for the two-process peak A/B.
         offload_policy: OffloadPolicy::Resident,
     })?;
     eprintln!(
-        "loaded Krea2Control (branch_quant {:?}, chunk_attention {chunk_attention}); rendering {}x{} @ scale {}",
-        a.branch_quant, a.size, a.size, a.scale
+        "loaded Krea2Control (branch_tier {:?}, chunk_attention {chunk_attention}); rendering {}x{} @ scale {}",
+        a.branch_tier, a.size, a.size, a.scale
     );
 
     // `KREA_TILE_VAE=1` forces the seam-free tiled VAE decode below the im2col threshold (sc-11744) —

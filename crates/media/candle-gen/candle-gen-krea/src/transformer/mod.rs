@@ -42,7 +42,7 @@ pub struct Krea2Transformer {
     txt_in_l1: QLinear,
     txt_in_l2: QLinear,
     text_fusion: TextFusionTransformer,
-    blocks: Vec<SingleStreamBlock>,
+    blocks: TransformerBlocks,
     final_norm: RmsScale,
     final_linear: QLinear,
     final_sstable: Tensor, // [1, 2, hidden]
@@ -52,6 +52,30 @@ pub struct Krea2Transformer {
     /// geometry; hits Arc-clone the stored handles. Bounded to a few entries so the two true-CFG legs
     /// (cond + uncond, which usually differ in `cap_len`) stay resident and don't evict each other.
     rope_cache: RopeCache<(usize, usize, usize, usize), (Tensor, Tensor)>,
+}
+
+/// Trunk-block residency. The normal path keeps every block resident. The constrained-card path
+/// retains the read-only mmap/adapter overlay and materializes one block at a time on the compute
+/// device, synchronizing before each block is dropped so the allocator can reuse that working set.
+enum TransformerBlocks {
+    Resident(Vec<SingleStreamBlock>),
+    Streamed(std::sync::Arc<Weights>),
+}
+
+/// Fold a render state through a block sequence with a cancellation checkpoint before every block.
+/// Keeping the checkpoint in the same helper used by the streamed implementation makes the
+/// cancellation granularity independently testable without constructing the multi-gigabyte model.
+fn fold_block_sequence<T>(
+    num_blocks: usize,
+    cancel: &candle_gen::gen_core::CancelFlag,
+    mut state: T,
+    mut apply: impl FnMut(usize, T) -> candle_gen::Result<T>,
+) -> candle_gen::Result<T> {
+    for index in 0..num_blocks {
+        candle_gen::check_cancel(cancel)?;
+        state = apply(index, state)?;
+    }
+    Ok(state)
 }
 
 /// How many distinct RoPE geometries to keep cached per render. Under true CFG each denoise step
@@ -147,6 +171,48 @@ impl Krea2Transformer {
             cfg.attention_head_dim,
             cfg.norm_eps,
         );
+        let hidden = cfg.hidden_size;
+        let blocks = (0..cfg.num_layers)
+            .map(|i| {
+                SingleStreamBlock::load_planned(
+                    w,
+                    &format!("transformer_blocks.{i}"),
+                    heads,
+                    kv,
+                    hd,
+                    hidden,
+                    eps,
+                    plan,
+                )
+            })
+            .collect::<Result<_>>()?;
+        Self::load_front(w, cfg, plan, TransformerBlocks::Resident(blocks))
+    }
+
+    /// Build the DiT front-end/head resident while retaining the block checkpoint as a read-only mmap.
+    /// Each trunk block is loaded, evaluated, synchronized, and dropped in turn by
+    /// [`Self::forward_with_memory`]. This is deliberately limited to the baseline packed/dense path;
+    /// NVFP4 and ConvRot retain their existing resident implementations.
+    pub fn load_block_streamed(
+        weights: std::sync::Arc<Weights>,
+        cfg: &Krea2Config,
+    ) -> Result<Self> {
+        let plan = DitPlan::baseline().with_num_layers(cfg.num_layers);
+        Self::load_front(
+            weights.as_ref(),
+            cfg,
+            &plan,
+            TransformerBlocks::Streamed(weights.clone()),
+        )
+    }
+
+    fn load_front(
+        w: &Weights,
+        cfg: &Krea2Config,
+        plan: &DitPlan,
+        blocks: TransformerBlocks,
+    ) -> Result<Self> {
+        let (hd, eps) = (cfg.attention_head_dim, cfg.norm_eps);
         let (theads, tkv) = (cfg.text_num_attention_heads, cfg.text_num_kv_heads);
         let hidden = cfg.hidden_size;
 
@@ -176,20 +242,7 @@ impl Krea2Transformer {
                 eps,
                 plan,
             )?,
-            blocks: (0..cfg.num_layers)
-                .map(|i| {
-                    SingleStreamBlock::load_planned(
-                        w,
-                        &format!("transformer_blocks.{i}"),
-                        heads,
-                        kv,
-                        hd,
-                        hidden,
-                        eps,
-                        plan,
-                    )
-                })
-                .collect::<Result<_>>()?,
+            blocks,
             final_norm: RmsScale::load(w, "final_layer.norm.weight", eps)?,
             final_linear: linear_detect_planned(w, "final_layer.linear", true, plan)?,
             final_sstable,
@@ -212,8 +265,10 @@ impl Krea2Transformer {
             ("txt_in.linear_2".to_string(), &self.txt_in_l2),
         ];
         v.extend(self.text_fusion.projections());
-        for (i, b) in self.blocks.iter().enumerate() {
-            v.extend(b.projections(&format!("transformer_blocks.{i}")));
+        if let TransformerBlocks::Resident(blocks) = &self.blocks {
+            for (i, b) in blocks.iter().enumerate() {
+                v.extend(b.projections(&format!("transformer_blocks.{i}")));
+            }
         }
         v.push(("final_layer.linear".to_string(), &self.final_linear));
         v
@@ -258,7 +313,14 @@ impl Krea2Transformer {
         &mut self,
         f: &mut dyn FnMut(&str, &mut candle_gen::quant::AdaptLinear) -> candle_gen::Result<()>,
     ) -> candle_gen::Result<()> {
-        for (i, blk) in self.blocks.iter_mut().enumerate() {
+        let TransformerBlocks::Resident(blocks) = &mut self.blocks else {
+            return Err(candle_gen::CandleError::Msg(
+                "Krea streamed blocks cannot install job-local adapters; apply adapters before \
+                 selecting block streaming"
+                    .into(),
+            ));
+        };
+        for (i, blk) in blocks.iter_mut().enumerate() {
             blk.visit_adaptable_mut(&format!("transformer_blocks.{i}"), f)?;
         }
         self.text_fusion.visit_adaptable_mut(f)?;
@@ -366,6 +428,30 @@ impl Krea2Transformer {
     ///
     /// Returns the velocity `[b, 16, H, W]`.
     pub fn forward(&self, latent: &Tensor, timestep: &Tensor, context: &Tensor) -> Result<Tensor> {
+        self.forward_with_memory(
+            latent,
+            timestep,
+            context,
+            candle_gen::ATTN_SCORES_BUDGET,
+            &candle_gen::gen_core::CancelFlag::default(),
+        )
+        .map_err(|error| match error {
+            candle_gen::CandleError::Candle(error) => error,
+            other => candle_gen::candle_core::Error::Msg(other.to_string()),
+        })
+    }
+
+    /// [`Self::forward`] with the constrained-card attention budget and cancellation threaded through
+    /// the block loop. On a streamed trunk each block is the sole block-weight working set on the
+    /// accelerator; synchronization before drop makes that lifecycle physical rather than advisory.
+    pub fn forward_with_memory(
+        &self,
+        latent: &Tensor,
+        timestep: &Tensor,
+        context: &Tensor,
+        attention_scores_budget: usize,
+        cancel: &candle_gen::gen_core::CancelFlag,
+    ) -> candle_gen::Result<Tensor> {
         let cfg = &self.cfg;
         let p = cfg.patch_size;
         let (_, _, h, w) = latent.dims4()?;
@@ -383,14 +469,51 @@ impl Krea2Transformer {
 
         // The joint RoPE table is step-invariant (fixed geometry), so cache it per render (sc-8992).
         let (rcos, rsin) = self.rope_tables(cap_len, ht, wt, 0)?;
-        for blk in &self.blocks {
-            combined = blk.forward(&combined, &tvec, &rcos, &rsin)?;
+        match &self.blocks {
+            TransformerBlocks::Resident(blocks) => {
+                for blk in blocks {
+                    candle_gen::check_cancel(cancel)?;
+                    combined = blk.forward_with_attention_budget(
+                        &combined,
+                        &tvec,
+                        &rcos,
+                        &rsin,
+                        attention_scores_budget,
+                    )?;
+                }
+            }
+            TransformerBlocks::Streamed(weights) => {
+                let cfg = &self.cfg;
+                let plan = DitPlan::baseline().with_num_layers(cfg.num_layers);
+                combined = fold_block_sequence(cfg.num_layers, cancel, combined, |i, combined| {
+                    let block = SingleStreamBlock::load_planned(
+                        weights,
+                        &format!("transformer_blocks.{i}"),
+                        cfg.num_attention_heads,
+                        cfg.num_kv_heads,
+                        cfg.attention_head_dim,
+                        cfg.hidden_size,
+                        cfg.norm_eps,
+                        &plan,
+                    )?;
+                    let combined = block.forward_with_attention_budget(
+                        &combined,
+                        &tvec,
+                        &rcos,
+                        &rsin,
+                        attention_scores_budget,
+                    )?;
+                    self.device.synchronize()?;
+                    drop(block);
+                    Ok(combined)
+                })?;
+            }
         }
 
         // Continuous-AdaLN output (SimpleModulation on `t`), then slice the image tokens + unpatchify.
         let out = self.final_layer(&combined, &t)?; // [b, cap+img_len, in_channels]
         let img_out = out.narrow(1, cap_len, img_len)?;
-        unpatchify(&img_out, ht, wt, p, latent_ch)
+        Ok(unpatchify(&img_out, ht, wt, p, latent_ch)?)
     }
 
     /// **Kontext-style edit velocity prediction** (epic 10871 / sc-10877). Identical to
@@ -414,6 +537,40 @@ impl Krea2Transformer {
         context: &Tensor,
         refs: &[Tensor],
     ) -> Result<Tensor> {
+        self.forward_edit_with_memory(
+            latent,
+            timestep,
+            context,
+            refs,
+            candle_gen::ATTN_SCORES_BUDGET,
+            &candle_gen::gen_core::CancelFlag::default(),
+        )
+        .map_err(|error| match error {
+            candle_gen::CandleError::Candle(error) => error,
+            other => candle_gen::candle_core::Error::Msg(other.to_string()),
+        })
+    }
+
+    /// [`Self::forward_edit`] with the constrained-card attention budget and cancellation threaded
+    /// through the block loop — the edit twin of [`Self::forward_with_memory`].
+    ///
+    /// The cancel checkpoint is what makes a **long** step interruptible (sc-16003). The sampler's
+    /// between-steps poll reads the flag once per step, immediately before calling the model, which is
+    /// useless when one step runs for minutes: an edit's joint sequence is `cap_len + (n_refs + 1) ·
+    /// img_len`, so a 2048² edit runs ~37k tokens and ~45 s per step. With no checkpoint inside the
+    /// forward the consumer trips the flag, nothing reads it until the step ends, and the worker's
+    /// bounded wind-down exhausts its grace and abandons the join — `abort()` is inert on a
+    /// `spawn_blocking` task, so the GPU work keeps running unattributed while the UI shows
+    /// "Cancelling…". Per block bounds that to one block (~2 s at 2048²).
+    pub fn forward_edit_with_memory(
+        &self,
+        latent: &Tensor,
+        timestep: &Tensor,
+        context: &Tensor,
+        refs: &[Tensor],
+        attention_scores_budget: usize,
+        cancel: &candle_gen::gen_core::CancelFlag,
+    ) -> candle_gen::Result<Tensor> {
         let cfg = &self.cfg;
         let p = cfg.patch_size;
         let (_, _, h, w) = latent.dims4()?;
@@ -430,7 +587,7 @@ impl Krea2Transformer {
         for (i, r) in refs.iter().enumerate() {
             let (_, _, rh, rw) = r.dims4()?;
             if rh != h || rw != w {
-                return Err(candle_gen::candle_core::Error::Msg(format!(
+                return Err(candle_gen::CandleError::Msg(format!(
                     "krea edit: reference {i} is {rh}x{rw} but the target latent is {h}x{w}; \
                      references must be VAE-encoded at the target resolution"
                 )));
@@ -448,15 +605,26 @@ impl Krea2Transformer {
         let mut combined = Tensor::cat(&parts, 1)?;
 
         let (rcos, rsin) = self.rope_tables(cap_len, ht, wt, n_refs)?;
-        for blk in &self.blocks {
-            combined = blk.forward(&combined, &tvec, &rcos, &rsin)?;
-        }
+        let TransformerBlocks::Resident(blocks) = &self.blocks else {
+            return Err(candle_gen::CandleError::Msg(
+                "Krea block streaming is supported only for ordinary text-to-image denoise".into(),
+            ));
+        };
+        combined = fold_block_sequence(blocks.len(), cancel, combined, |i, combined| {
+            Ok(blocks[i].forward_with_attention_budget(
+                &combined,
+                &tvec,
+                &rcos,
+                &rsin,
+                attention_scores_budget,
+            )?)
+        })?;
 
         // Slice the TARGET tokens (they sit last, after the text + all reference blocks) + unpatchify.
         let out = self.final_layer(&combined, &t)?;
         let target_offset = cap_len + n_refs * img_len;
         let img_out = out.narrow(1, target_offset, img_len)?;
-        unpatchify(&img_out, ht, wt, p, latent_ch)
+        Ok(unpatchify(&img_out, ht, wt, p, latent_ch)?)
     }
 
     /// Reference `LastLayer`: `SimpleModulation(t) = t + scale_shift_table` → `(scale, shift)`;
@@ -567,6 +735,23 @@ pub(crate) fn unpatchify(
 mod tests {
     use super::*;
     use candle_gen::candle_core::Device;
+
+    #[test]
+    fn streamed_block_fold_stops_before_loading_the_next_block_after_cancel() {
+        let cancel = candle_gen::gen_core::CancelFlag::default();
+        let cancel_from_block = cancel.clone();
+        let mut visited = Vec::new();
+        let error = fold_block_sequence(4, &cancel, 0usize, |index, count| {
+            visited.push(index);
+            if index == 0 {
+                cancel_from_block.cancel();
+            }
+            Ok(count + 1)
+        })
+        .unwrap_err();
+        assert!(matches!(error, candle_gen::CandleError::Canceled));
+        assert_eq!(visited, vec![0]);
+    }
 
     #[test]
     fn patchify_roundtrips_channel_major() {
@@ -706,5 +891,70 @@ mod tests {
         assert_eq!(builds.get(), 3);
         build(1); // 1 was evicted → rebuild
         assert_eq!(builds.get(), 4);
+    }
+
+    /// sc-16003: the **edit** forward must honor the request's cancel flag inside its block loop, and it
+    /// must be otherwise byte-identical to the plain wrapper.
+    ///
+    /// The sampler's between-steps poll is not enough on this path: an edit's joint sequence is
+    /// `cap_len + (n_refs + 1) · img_len`, so a 2048² edit step is ~45 s. A cancel tripped mid-step used
+    /// to go unread until the step ended — by which time the worker's bounded wind-down had exhausted its
+    /// grace and abandoned a `spawn_blocking` join `abort()` cannot stop, leaving live GPU work behind.
+    #[test]
+    fn edit_forward_honors_the_cancel_flag_per_block() {
+        use candle_gen::gen_core::CancelFlag;
+
+        let (dit, cfg, path) = crate::testfix::tiny_transformer();
+        let latent_ch = cfg.in_channels / (cfg.patch_size * cfg.patch_size);
+        let latent = crate::testfix::rnd(&[1, latent_ch, 4, 4]);
+        let timestep = Tensor::from_vec(vec![0.7f32], 1, &Device::Cpu).unwrap();
+        let context = crate::testfix::rnd(&[1, 3, cfg.num_text_layers, cfg.text_hidden_dim]);
+        let refs = [crate::testfix::rnd(&[1, latent_ch, 4, 4])];
+        let run = |cancel: &CancelFlag| {
+            dit.forward_edit_with_memory(
+                &latent,
+                &timestep,
+                &context,
+                &refs,
+                candle_gen::ATTN_SCORES_BUDGET,
+                cancel,
+            )
+        };
+
+        // An untripped flag is inert: identical to the plain `forward_edit` wrapper, value for value.
+        let live = run(&CancelFlag::default()).expect("an untripped flag must not cancel");
+        let plain = dit
+            .forward_edit(&latent, &timestep, &context, &refs)
+            .expect("the plain wrapper still works");
+        assert_eq!(live.dims(), plain.dims(), "edit output shape");
+        let diff = (&live - &plain)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_vec0::<f32>()
+            .unwrap();
+        assert_eq!(
+            diff, 0.0,
+            "threading the cancel flag must not change the math"
+        );
+
+        // Tripped: the TYPED `Canceled`, which bridges to `gen_core::Error::Canceled` — the worker and
+        // the gen-core conformance suite key off it (sc-4481), so a stringified `Msg` would read as a
+        // backend failure and surface as "generation failed" instead of a clean cancel.
+        let cancelled = CancelFlag::default();
+        cancelled.cancel();
+        let error = run(&cancelled).expect_err("a tripped flag must abort the edit forward");
+        assert!(
+            matches!(error, candle_gen::CandleError::Canceled),
+            "expected the typed Canceled, got {error:?}"
+        );
+        assert!(matches!(
+            candle_gen::gen_core::Error::from(error),
+            candle_gen::gen_core::Error::Canceled
+        ));
+
+        let _ = std::fs::remove_file(&path);
     }
 }

@@ -1,0 +1,175 @@
+{
+  "artifact": "guidance.safetensors",
+  "artifactSha256": "2cd9225ee7a1e132eafd5f0dc0d12afb0e2a6e4879bb551f085feae4aca540f5",
+  "inputs": {
+    "negativeConditioning": "zero-cross-context",
+    "paddingLength": 16,
+    "paddingValid": 12,
+    "schedule": [
+      0.5,
+      0.0
+    ],
+    "timestep": 0.5,
+    "variants": {
+      "apg": {
+        "apg_scale": 1.0,
+        "cfg_scale": 2.5
+      },
+      "blended_rescaled": {
+        "apg_scale": 0.5,
+        "cfg_norm_threshold": 0.25,
+        "cfg_scale": 2.5,
+        "scale_phi": 0.3
+      },
+      "vanilla": {
+        "apg_scale": 0.0,
+        "cfg_scale": 2.5
+      }
+    }
+  },
+  "runtime": {
+    "python": "3.12.13",
+    "torch": "2.7.1",
+    "torchaudio": "2.7.1",
+    "transformers": "5.8.0"
+  },
+  "snapshots": {
+    "small-music": {
+      "modelConfigSha256": "100776f25af5aa83f70e0c6b384de6690cb4e5ad01c24f7cfbb6524d18765f06",
+      "modelSha256": "da85866b11b01d0694d990785f6abbd79c8064df1b0e6f8aea52935e0ef84b64",
+      "objective": "rf_denoiser",
+      "p0": "small-music-reference.safetensors",
+      "p0Sha256": "b0ac8d572840d1cd9e1046e4734c6c286a7f2664e388758e508b4aab89c25296",
+      "repository": "stabilityai/stable-audio-3-small-music",
+      "revision": "0fef1392cd842149a2b6d445e181c97608faac06"
+    },
+    "small-music-base": {
+      "modelConfigSha256": "e97f53a0882a99b0307cf7d87d63423f75925b5def5efc180d29740899c62486",
+      "modelSha256": "79691fac2a08a99a229b98963f8377ddc78c16f5c63f7e3a022375c311093ab4",
+      "objective": "rectified_flow",
+      "p0": "small-music-base-reference.safetensors",
+      "p0Sha256": "7d5dd8dd18c3c2cfd98d4e6ccc26383f797bc2e0b960c8abb4be6d12695a4189",
+      "repository": "stabilityai/stable-audio-3-small-music-base",
+      "revision": "eab5ceee5ad9c1ed38800aff30a8e49d1161c539"
+    }
+  },
+  "sourceSha256": {
+    "stable_audio_3/data/utils.py": "72740fc82eb9a2a54083ab9153769c63ab60ef29173d2d5f019a1dbfede757fe",
+    "stable_audio_3/inference/sampling.py": "76e96bc3a0c1fb346d13038f09a227ec2f9c7f2e56fd64623e8bbe6ff722bf55",
+    "stable_audio_3/model.py": "8f3a18f1b8f02ffb1ce97f8e64dcb319eb2a6a864d8c405f89d40f6933f3a701",
+    "stable_audio_3/models/diffusion.py": "b0eab27f7965b4a21a34bf009c932128217524c09cddbfd601bffe866e4b6732",
+    "stable_audio_3/models/dit.py": "4b28dcb74937cdcab9ab5f745221178304f998f53aa60d2ee9e74b8fa76fd4fb"
+  },
+  "story": "sc-14542",
+  "tensors": {
+    "small-music-base.apg.final": {
+      "dtype": "F32",
+      "sha256": "03a350946ea4865e778125b676f575d3eb67ccbfafe9e606edc40e86875670f3",
+      "shape": [
+        1,
+        256,
+        16
+      ]
+    },
+    "small-music-base.apg.velocity": {
+      "dtype": "F32",
+      "sha256": "5df7b30476dc5b4e5af4c4c05eeff2c5ca1fece40ae34f5d714df87475589fdb",
+      "shape": [
+        1,
+        256,
+        16
+      ]
+    },
+    "small-music-base.blended_rescaled.final": {
+      "dtype": "F32",
+      "sha256": "cf835470f7e2a08a91074165b68ac67b0e1b54c6af3eb006b30af263521ad110",
+      "shape": [
+        1,
+        256,
+        16
+      ]
+    },
+    "small-music-base.blended_rescaled.velocity": {
+      "dtype": "F32",
+      "sha256": "a912e55a6a0aaf76c5128cbdbff810e58992c4533abd05c4919e4fc4e73a1d20",
+      "shape": [
+        1,
+        256,
+        16
+      ]
+    },
+    "small-music-base.vanilla.final": {
+      "dtype": "F32",
+      "sha256": "b770c7c3e5df15c5ed8e098de8b0367009e584c9c115cf8514e9e210bef534bc",
+      "shape": [
+        1,
+        256,
+        16
+      ]
+    },
+    "small-music-base.vanilla.velocity": {
+      "dtype": "F32",
+      "sha256": "a63f23d9eef4ef1d8ca38e4095d48a2e3bd691c6bde1af9d710429265ecf572f",
+      "shape": [
+        1,
+        256,
+        16
+      ]
+    },
+    "small-music.apg.final": {
+      "dtype": "F32",
+      "sha256": "988b4a1c957d46e7419f895533f469a344fdf334f243e07e59ca6c098ea31b14",
+      "shape": [
+        1,
+        256,
+        16
+      ]
+    },
+    "small-music.apg.velocity": {
+      "dtype": "F32",
+      "sha256": "42d3247d75c8b29e8c7a36092014b77ff9b0b3a6a215e4bd723df1755c815855",
+      "shape": [
+        1,
+        256,
+        16
+      ]
+    },
+    "small-music.blended_rescaled.final": {
+      "dtype": "F32",
+      "sha256": "df62cffc6813fa7d9037808f5ce5d8829137bc7b622ebc727f595b4325222c1f",
+      "shape": [
+        1,
+        256,
+        16
+      ]
+    },
+    "small-music.blended_rescaled.velocity": {
+      "dtype": "F32",
+      "sha256": "135b510f4dd83f2b0a581b11b339b561ee2682137b9f6586f8186bc1d8680401",
+      "shape": [
+        1,
+        256,
+        16
+      ]
+    },
+    "small-music.vanilla.final": {
+      "dtype": "F32",
+      "sha256": "455c07c0a21cdd1d5928321a124baba886596f568117e0acafe206e3c84aed37",
+      "shape": [
+        1,
+        256,
+        16
+      ]
+    },
+    "small-music.vanilla.velocity": {
+      "dtype": "F32",
+      "sha256": "d8b41a7eeb677c108c4720f67f977810c1bc088072d3300d9cf7062fad45008a",
+      "shape": [
+        1,
+        256,
+        16
+      ]
+    }
+  },
+  "upstreamCommit": "124e8a799f57a1f665495ecb72e547d0a62867f1"
+}

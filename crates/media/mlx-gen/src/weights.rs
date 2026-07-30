@@ -1,6 +1,7 @@
 //! Weight loading — safetensors → MLX arrays by dotted key, plus file metadata, with a
 //! dtype helper. No torch dependency: reads safetensors directly via mlx-rs.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -14,6 +15,7 @@ use crate::{Error, Result};
 pub struct Weights {
     tensors: HashMap<String, Array>,
     metadata: HashMap<String, String>,
+    accessed: RefCell<std::collections::HashSet<String>>,
 }
 
 impl Weights {
@@ -22,6 +24,7 @@ impl Weights {
         Self {
             tensors,
             metadata: HashMap::new(),
+            accessed: RefCell::new(std::collections::HashSet::new()),
         }
     }
 
@@ -31,13 +34,18 @@ impl Weights {
         Self {
             tensors: HashMap::new(),
             metadata: HashMap::new(),
+            accessed: RefCell::new(std::collections::HashSet::new()),
         }
     }
 
     /// Load a single `.safetensors` file (tensors + metadata).
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
         let (tensors, metadata) = Array::load_safetensors_with_metadata(path.as_ref())?;
-        Ok(Self { tensors, metadata })
+        Ok(Self {
+            tensors,
+            metadata,
+            accessed: RefCell::new(std::collections::HashSet::new()),
+        })
     }
 
     /// Load a safetensors file while decoding `F8_E4M3` payloads to bf16.
@@ -123,6 +131,7 @@ impl Weights {
         Ok(Self {
             tensors,
             metadata: HashMap::new(),
+            accessed: RefCell::new(std::collections::HashSet::new()),
         })
     }
 
@@ -166,18 +175,27 @@ impl Weights {
             }
             metadata.extend(m);
         }
-        Ok(Self { tensors, metadata })
+        Ok(Self {
+            tensors,
+            metadata,
+            accessed: RefCell::new(std::collections::HashSet::new()),
+        })
     }
 
     pub fn get(&self, key: &str) -> Option<&Array> {
-        self.tensors.get(key)
+        let value = self.tensors.get(key)?;
+        self.accessed.borrow_mut().insert(key.to_owned());
+        Some(value)
     }
 
     /// Get a tensor by key, returning an error (not panicking) when it is absent.
     pub fn require(&self, key: &str) -> Result<&Array> {
-        self.tensors
+        let value = self
+            .tensors
             .get(key)
-            .ok_or_else(|| Error::MissingTensor(key.to_string()))
+            .ok_or_else(|| Error::MissingTensor(key.to_string()))?;
+        self.accessed.borrow_mut().insert(key.to_owned());
+        Ok(value)
     }
 
     pub fn metadata(&self, key: &str) -> Option<&str> {
@@ -211,6 +229,16 @@ impl Weights {
     /// built). The companion to [`remove`](Self::remove) for a whole sub-module's source tensors.
     pub fn remove_prefix(&mut self, prefix: &str) {
         self.tensors.retain(|k, _| !k.starts_with(prefix));
+    }
+
+    /// Remove every tensor successfully read through [`require`](Self::require) since the previous
+    /// call. A consuming loader can then reject any requested-prefix key left behind, which makes an
+    /// omitted constructor read observable instead of hiding it behind wholesale prefix deletion.
+    pub fn remove_accessed(&mut self) {
+        let accessed = std::mem::take(self.accessed.get_mut());
+        for key in accessed {
+            self.tensors.remove(&key);
+        }
     }
 
     pub fn keys(&self) -> impl Iterator<Item = &str> {
@@ -289,7 +317,9 @@ mod tests {
 
     #[test]
     fn round_trip_file_with_metadata() {
-        let dir = std::env::temp_dir().join("mlx_gen_weights_test");
+        // Per-process scratch dir (matching `mlx_gen_appledouble_{pid}` below) — a fixed `$TMPDIR`
+        // name races a second concurrent `cargo test`.
+        let dir = std::env::temp_dir().join(format!("mlx_gen_weights_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("w.safetensors");
 
@@ -389,5 +419,21 @@ mod tests {
         assert!(err.contains("model.safetensors"), "unexpected: {err}");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn remove_accessed_leaves_one_omitted_constructor_key_as_a_discriminator() {
+        let mut w = Weights::empty();
+        w.insert("vae.block.small.weight", Array::from_f32(1.0));
+        w.insert("vae.block.small.bias", Array::from_f32(0.0));
+        w.require("vae.block.small.weight").unwrap();
+        // Mutation: constructor forgot the bias read. Exact access-draining must leave it visible.
+        w.remove_accessed();
+        assert!(w.get("vae.block.small.weight").is_none());
+        assert!(w.get("vae.block.small.bias").is_some());
+        assert_eq!(
+            w.keys().filter(|key| key.starts_with("vae.block.")).count(),
+            1
+        );
     }
 }

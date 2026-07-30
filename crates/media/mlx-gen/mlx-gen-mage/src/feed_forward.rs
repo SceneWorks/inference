@@ -16,6 +16,7 @@
 
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
 use mlx_gen::weights::Weights;
 use mlx_gen::{nn, Result};
 
@@ -79,6 +80,15 @@ pub struct MageFeedForward {
 }
 
 impl MageFeedForward {
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.proj.quantize(bits)?;
+        self.out.quantize(bits)
+    }
+
+    pub(crate) fn quantized_linear_count(&self) -> usize {
+        usize::from(self.proj.is_quantized()) + usize::from(self.out.is_quantized())
+    }
+
     /// Load from `{prefix}.net.0.proj.{weight,bias}` and `{prefix}.net.2.{weight,bias}` — e.g.
     /// `transformer_blocks.0.img_mlp`. Both projections carry a bias (`bias=True` default).
     pub fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
@@ -122,6 +132,25 @@ impl MageFeedForward {
     }
 }
 
+/// LoRA/LoKr targets on the FFN (sc-14055): the two diffusers projections `net.0.proj` (the
+/// gelu-approximate expansion) and `net.2` (the contraction); `net.1` is the weightless dropout.
+impl AdaptableHost for MageFeedForward {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["net", "0", "proj"] => Some(self.proj.adaptable_mut()),
+            ["net", "2"] => Some(self.out.adaptable_mut()),
+            _ => None,
+        }
+    }
+
+    fn adaptable_paths(&self) -> Vec<String> {
+        ["net.0.proj", "net.2"]
+            .into_iter()
+            .map(String::from)
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,6 +171,18 @@ mod tests {
         let mut ffn = MageFeedForward::from_weights(&w, "f").unwrap();
         ffn.set_activation(activation);
         ffn
+    }
+
+    /// sc-14055 — the LoRA host reaches both diffusers FFN projections (`net.0.proj`, `net.2`) and
+    /// nothing else (the weightless `net.1` dropout is not a target).
+    #[test]
+    fn adaptable_routing_covers_both_projections() {
+        let mut ffn = ffn(FfnActivation::GeluApproximate);
+        assert_eq!(ffn.adaptable_paths(), ["net.0.proj", "net.2"]);
+        assert!(ffn.adaptable_mut(&["net", "0", "proj"]).is_some());
+        assert!(ffn.adaptable_mut(&["net", "2"]).is_some());
+        assert!(ffn.adaptable_mut(&["net", "1"]).is_none());
+        assert!(ffn.adaptable_mut(&["net", "0"]).is_none());
     }
 
     #[test]

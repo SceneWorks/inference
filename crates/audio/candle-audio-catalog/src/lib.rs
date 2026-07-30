@@ -52,11 +52,13 @@ pub mod providers {
     pub use candle_audio_moss_tts;
     pub use candle_audio_moss_tts_realtime;
     pub use candle_audio_openvoice;
+    pub use candle_audio_stable_audio_3;
     pub use candle_audio_whisper;
 }
 
 /// Add every provider shipped by the Candle audio lane to an explicit registry builder, in
-/// stable catalog order: the generators first (Kokoro TTS, MOSS SFX, ACE-Step music, MOSS-TTS-Realtime
+/// stable catalog order: the generators first (Kokoro TTS, MOSS SFX, ACE-Step music, Stable Audio 3
+/// small-music — sc-14543 and small-sfx — sc-14544, MOSS-TTS-Realtime
 /// streaming TTS — sc-13392, Chatterbox clone-TTS — sc-13239, MMAudio video→audio Foley 16k — sc-12843
 /// and 44.1 kHz — sc-13441), then the voice-cloning identity embedder (Chatterbox `ve`, sc-12844),
 /// then the audio transforms
@@ -68,6 +70,7 @@ pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistry
     let registry = candle_audio_kokoro::register_providers(registry);
     let registry = candle_audio_moss_sfx::register_providers(registry);
     let registry = candle_audio_acestep::register_providers(registry);
+    let registry = candle_audio_stable_audio_3::register_providers(registry);
     let registry = candle_audio_moss_tts_realtime::register_providers(registry);
     let registry = candle_audio_chatterbox::register_providers(registry);
     let registry = candle_audio_mmaudio::register_providers(registry);
@@ -107,6 +110,7 @@ pub fn weight_licenses() -> Vec<gen_core::WeightLicenseEntry> {
     entries.extend_from_slice(candle_audio_kokoro::WEIGHT_LICENSES);
     entries.extend_from_slice(candle_audio_moss_sfx::WEIGHT_LICENSES);
     entries.extend_from_slice(candle_audio_acestep::WEIGHT_LICENSES);
+    entries.extend_from_slice(candle_audio_stable_audio_3::WEIGHT_LICENSES);
     entries.extend_from_slice(candle_audio_moss_tts_realtime::WEIGHT_LICENSES);
     entries.extend_from_slice(candle_audio_chatterbox::WEIGHT_LICENSES);
     // MMAudio ships two registered providers (mmaudio_small_16k, mmaudio_large_44k), each assembled
@@ -201,6 +205,7 @@ fn lane_can_prepare(spec: &core_llm::PrepareSpec) -> bool {
     candle_audio_kokoro::prepare::can_prepare(spec)
         || candle_audio_moss_sfx::prepare::can_prepare(spec)
         || candle_audio_acestep::prepare::can_prepare(spec)
+        || candle_audio_stable_audio_3::prepare::can_prepare(spec)
         || candle_audio_moss_tts_realtime::prepare::can_prepare(spec)
         || candle_audio_moss_tts::prepare::can_prepare(spec)
         || candle_audio_chatterbox::prepare::can_prepare(spec)
@@ -217,6 +222,8 @@ fn lane_prepare(spec: &core_llm::PrepareSpec) -> core_llm::Result<core_llm::Prep
         candle_audio_moss_sfx::prepare::prepare(spec)
     } else if candle_audio_acestep::prepare::can_prepare(spec) {
         candle_audio_acestep::prepare::prepare(spec)
+    } else if candle_audio_stable_audio_3::prepare::can_prepare(spec) {
+        candle_audio_stable_audio_3::prepare::prepare(spec)
     } else if candle_audio_moss_tts_realtime::prepare::can_prepare(spec) {
         candle_audio_moss_tts_realtime::prepare::prepare(spec)
     } else if candle_audio_moss_tts::prepare::can_prepare(spec) {
@@ -274,6 +281,12 @@ mod tests {
                 "kokoro_82m",
                 "moss_sfx_v2",
                 "acestep_v15_turbo",
+                "stable_audio_3_small_music",
+                "stable_audio_3_small_sfx",
+                "stable_audio_3_medium",
+                "stable_audio_3_small_music_base",
+                "stable_audio_3_small_sfx_base",
+                "stable_audio_3_medium_base",
                 "moss_tts_realtime",
                 "chatterbox_tts",
                 "mmaudio_small_16k",
@@ -471,6 +484,121 @@ mod tests {
                     true,
                 ),
                 ("acestep_v15_turbo", Some("transformer"), "MIT", true),
+                (
+                    "stable_audio_3_small_music",
+                    None,
+                    "LicenseRef-Stability-AI-Community",
+                    false
+                ),
+                (
+                    "stable_audio_3_small_music",
+                    Some("root"),
+                    "LicenseRef-Stability-AI-Community",
+                    false
+                ),
+                (
+                    "stable_audio_3_small_music",
+                    Some("t5gemma"),
+                    "LicenseRef-Gemma-Terms",
+                    true
+                ),
+                (
+                    "stable_audio_3_small_sfx",
+                    None,
+                    "LicenseRef-Stability-AI-Community",
+                    false
+                ),
+                (
+                    "stable_audio_3_small_sfx",
+                    Some("root"),
+                    "LicenseRef-Stability-AI-Community",
+                    false
+                ),
+                (
+                    "stable_audio_3_small_sfx",
+                    Some("t5gemma"),
+                    "LicenseRef-Gemma-Terms",
+                    true
+                ),
+                // sc-14545: medium's SAME-L is a namespace inside the same single root
+                // safetensors, not a separate artifact, so it contributes the same three rows the
+                // smalls do — composite, root, bundled T5Gemma — and not a fourth.
+                (
+                    "stable_audio_3_medium",
+                    None,
+                    "LicenseRef-Stability-AI-Community",
+                    false
+                ),
+                (
+                    "stable_audio_3_medium",
+                    Some("root"),
+                    "LicenseRef-Stability-AI-Community",
+                    false
+                ),
+                (
+                    "stable_audio_3_medium",
+                    Some("t5gemma"),
+                    "LicenseRef-Gemma-Terms",
+                    true
+                ),
+                // sc-14546: the three `-base` registrations. Their Hub repositories are ungated,
+                // unlike the post-trained three, but they ship the same LICENSE.md and
+                // LICENSE_GEMMA.md — so the rows are identical in shape and in restriction, and the
+                // root rows stay `commercial_use: false`.
+                (
+                    "stable_audio_3_small_music_base",
+                    None,
+                    "LicenseRef-Stability-AI-Community",
+                    false
+                ),
+                (
+                    "stable_audio_3_small_music_base",
+                    Some("root"),
+                    "LicenseRef-Stability-AI-Community",
+                    false
+                ),
+                (
+                    "stable_audio_3_small_music_base",
+                    Some("t5gemma"),
+                    "LicenseRef-Gemma-Terms",
+                    true
+                ),
+                (
+                    "stable_audio_3_small_sfx_base",
+                    None,
+                    "LicenseRef-Stability-AI-Community",
+                    false
+                ),
+                (
+                    "stable_audio_3_small_sfx_base",
+                    Some("root"),
+                    "LicenseRef-Stability-AI-Community",
+                    false
+                ),
+                (
+                    "stable_audio_3_small_sfx_base",
+                    Some("t5gemma"),
+                    "LicenseRef-Gemma-Terms",
+                    true
+                ),
+                (
+                    "stable_audio_3_medium_base",
+                    None,
+                    "LicenseRef-Stability-AI-Community",
+                    false
+                ),
+                (
+                    "stable_audio_3_medium_base",
+                    Some("root"),
+                    "LicenseRef-Stability-AI-Community",
+                    false
+                ),
+                (
+                    "stable_audio_3_medium_base",
+                    Some("t5gemma"),
+                    "LicenseRef-Gemma-Terms",
+                    true
+                ),
                 ("moss_tts_realtime", None, "Apache-2.0", true),
                 ("chatterbox_tts", None, "MIT", true),
                 // -- mmaudio_small_16k: composite + 5 per-checkpoint rows --
@@ -681,5 +809,36 @@ mod tests {
         assert!(!(regs[0].can_prepare)(&spec));
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&empty);
+    }
+
+    fn assert_sa3_snapshot_prepares(env: &str) {
+        let snapshot = std::path::PathBuf::from(
+            std::env::var(env)
+                .unwrap_or_else(|_| panic!("set {env} to the pinned immutable snapshot")),
+        );
+        let registry = super::snapshot_preparer_registry().unwrap();
+        let registration = registry
+            .registrations()
+            .find(|registration| (registration.backend)() == "candle")
+            .expect("composed Candle audio preparer");
+        let spec =
+            super::core_llm::PrepareSpec::dense(&snapshot, snapshot.join("unused-prepared-output"));
+        assert!((registration.can_prepare)(&spec), "{env}");
+        let report = (registration.prepare)(&spec).expect("prepare exact SA3 snapshot");
+        assert!(report.passthrough, "{env}");
+        assert_eq!(report.out_dir, snapshot, "{env}");
+        assert_eq!(report.num_tensors, 1_025, "{env}");
+    }
+
+    #[test]
+    #[ignore = "requires the pinned Stable Audio 3 small-music snapshot"]
+    fn connected_sa3_snapshot_resolves_through_the_composed_lane_preparer() {
+        assert_sa3_snapshot_prepares("SA3_SMALL_MUSIC_SNAPSHOT");
+    }
+
+    #[test]
+    #[ignore = "requires the pinned Stable Audio 3 small-sfx snapshot"]
+    fn connected_sa3_sfx_snapshot_resolves_through_the_composed_lane_preparer() {
+        assert_sa3_snapshot_prepares("SA3_SMALL_SFX_SNAPSHOT");
     }
 }

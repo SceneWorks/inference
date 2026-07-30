@@ -23,6 +23,7 @@ use std::path::Path;
 use mlx_gen::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
+use mlx_gen_boogu::{VisionConfig, VisionTower};
 
 use crate::config::{
     max_prompt_tokens, QwenVlTextConfig, DROP_IDX_EDIT, TE_HIDDEN_ACT, TE_RMS_NORM_EPS,
@@ -53,7 +54,11 @@ const ROPE_TYPE_DEFAULT: &str = "default";
 /// input dim divisible by 64 (2560 hidden, 4096 q, 1024 kv, 9728 FFN), so one group size covers the
 /// whole encoder — the codebase default, matching the `mlx-gen-krea` / `mlx-gen-z-image` Qwen3
 /// encoders. sc-14046 owns the packer and must pack at the same size.
-pub(crate) const QUANT_GROUP_SIZE: i32 = 64;
+///
+/// **Public** (sc-15154) because it is also the width the *shared* `mlx_gen_boogu::VisionTower` must
+/// be built with for this crate's snapshots — a cross-crate contract, not a private detail — and the
+/// edit-path tier gate asserts against the name rather than a literal `64`.
+pub const QUANT_GROUP_SIZE: i32 = 64;
 
 /// Load the tokenizer from `<root>/text_encoder/tokenizer.json`.
 ///
@@ -70,8 +75,17 @@ pub(crate) const QUANT_GROUP_SIZE: i32 = 64;
 /// [`token_ids`](MageTextEncoder::token_ids) at the per-kind budget, so `max_length` here is only
 /// the ceiling for the unused padded path and is set to the larger of the two.
 pub fn load_tokenizer(root: impl AsRef<Path>) -> Result<TextTokenizer> {
+    load_tokenizer_dir(root.as_ref().join(COMPONENT_DIR))
+}
+
+/// As [`load_tokenizer`], but addressing the `text_encoder/` directory itself.
+///
+/// The `*_dir` twins (sc-14979) exist because the shared text encoder is hosted in its own mirror
+/// and staged as a caller-provisioned co-requisite path, so it is NOT under the variant snapshot
+/// root the `root`-taking wrappers assume.
+pub fn load_tokenizer_dir(dir: impl AsRef<Path>) -> Result<TextTokenizer> {
     TextTokenizer::from_file(
-        root.as_ref().join(COMPONENT_DIR).join("tokenizer.json"),
+        dir.as_ref().join("tokenizer.json"),
         TokenizerConfig {
             max_length: max_prompt_tokens(DROP_IDX_EDIT),
             pad_token_id: PAD_TOKEN_ID,
@@ -85,7 +99,12 @@ pub fn load_tokenizer(root: impl AsRef<Path>) -> Result<TextTokenizer> {
 /// Load the language model from `<root>/text_encoder/*.safetensors`, after verifying the
 /// snapshot's `config.json` describes the model this port implements.
 pub fn load_lm(root: impl AsRef<Path>) -> Result<Qwen3VlTextEncoder> {
-    let dir = root.as_ref().join(COMPONENT_DIR);
+    load_lm_dir(root.as_ref().join(COMPONENT_DIR))
+}
+
+/// As [`load_lm`], but addressing the `text_encoder/` directory itself.
+pub fn load_lm_dir(dir: impl AsRef<Path>) -> Result<Qwen3VlTextEncoder> {
+    let dir = dir.as_ref();
     let config_path = dir.join("config.json");
     let published = std::fs::read_to_string(&config_path).map_err(|e| {
         Error::Msg(format!(
@@ -94,14 +113,83 @@ pub fn load_lm(root: impl AsRef<Path>) -> Result<Qwen3VlTextEncoder> {
         ))
     })?;
     let cfg = verify_text_config(&published)?;
-    let w = Weights::from_dir(&dir)?;
-    Qwen3VlTextEncoder::from_weights(&w, LM_PREFIX, &cfg, TE_RMS_NORM_EPS, TE_ROPE_THETA)
+    let mut w = Weights::from_dir(dir)?;
+    let model = Qwen3VlTextEncoder::from_weights_draining(
+        &mut w,
+        LM_PREFIX,
+        &cfg,
+        TE_RMS_NORM_EPS,
+        TE_ROPE_THETA,
+    )?;
+    let remaining_lm = w
+        .keys()
+        .filter(|key| key.starts_with(&format!("{LM_PREFIX}.")))
+        .count();
+    if remaining_lm != 0 {
+        return Err(Error::Msg(format!(
+            "mage_flow text encoder: drain left {remaining_lm} language-model source tensors resident"
+        )));
+    }
+    Ok(model)
 }
 
 /// Load tokenizer + LM together.
 pub fn load(root: impl AsRef<Path>) -> Result<MageTextEncoder> {
-    let root = root.as_ref();
-    Ok(MageTextEncoder::new(load_tokenizer(root)?, load_lm(root)?))
+    load_dir(root.as_ref().join(COMPONENT_DIR))
+}
+
+/// As [`load`], but addressing the `text_encoder/` directory itself.
+pub fn load_dir(dir: impl AsRef<Path>) -> Result<MageTextEncoder> {
+    let dir = dir.as_ref();
+    Ok(MageTextEncoder::new(
+        load_tokenizer_dir(dir)?,
+        load_lm_dir(dir)?,
+    ))
+}
+
+pub fn mage_vision_config() -> VisionConfig {
+    VisionConfig {
+        hidden_size: 1024,
+        num_heads: 16,
+        intermediate_size: 4096,
+        depth: 24,
+        out_hidden_size: 2560,
+        patch_size: 16,
+        temporal_patch_size: 2,
+        spatial_merge_size: 2,
+        in_channels: 3,
+        num_position_embeddings: 2304,
+        deepstack_visual_indexes: vec![5, 11, 17],
+    }
+}
+
+/// Load tokenizer, language model, and the Qwen3-VL vision tower needed by Mage-Flow-Edit.
+pub fn load_multimodal(root: impl AsRef<Path>) -> Result<MageTextEncoder> {
+    load_multimodal_dir(root.as_ref().join(COMPONENT_DIR))
+}
+
+/// As [`load_multimodal`], but addressing the `text_encoder/` directory itself.
+///
+/// The vision tower is handed [`QUANT_GROUP_SIZE`] (64) — the width [`crate::convert`] packs
+/// `model.visual.*` at. Passing it is load-bearing here, unlike in Boogu/Krea whose towers stay
+/// dense: before sc-15154 the shared loader hard-coded Boogu's 32 and so mis-derived the geometry of
+/// every pre-quantized Mage tier — `q4` died on the first vision `quantized_matmul` (in 512 / bits 8
+/// against a 1024-wide input) and `q8` was rejected at load as "corrupt or mis-converted" (bits 16).
+/// Only the 17.5 GB `bf16` tier, whose tower is dense, could edit at all.
+pub fn load_multimodal_dir(dir: impl AsRef<Path>) -> Result<MageTextEncoder> {
+    let dir = dir.as_ref();
+    let weights = Weights::from_dir(dir)?;
+    let vision = VisionTower::from_weights(
+        &weights,
+        mage_vision_config(),
+        "model.visual",
+        QUANT_GROUP_SIZE,
+    )?;
+    Ok(MageTextEncoder::new_multimodal(
+        load_tokenizer_dir(dir)?,
+        load_lm_dir(dir)?,
+        vision,
+    ))
 }
 
 /// Check a `text_encoder/config.json` body against the pinned Qwen3-VL-4B shapes and return them.

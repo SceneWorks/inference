@@ -2,16 +2,16 @@
 //!
 //! `#[ignore]`d — needs the real `black-forest-labs/FLUX.1-dev` snapshot (env `MLX_GEN_FLUX_DEV_SNAPSHOT`
 //! or the HF cache), the real ByteDance Hyper-FLUX 8-step LoRA
-//! (`~/repos/test-files/Hyper-FLUX.1-dev-8steps-lora.safetensors`, env `HYPER_LORA`), and the diffusers
+//! (the pinned HF-cache file, env `HYPER_LORA`), and the diffusers
 //! golden from `tools/dump_hyper_flux_golden.py` (gitignored, local):
 //!   cd ~/Repos/mflux && .venv/bin/python ~/Repos/mlx-gen/tools/dump_hyper_flux_golden.py
-//!   cargo test -p mlx-gen-flux --test hyper_flux_real_weights -- --ignored --nocapture
+//!   python3 ~/Repos/mlx-gen/tools/verify_adapter_parity_artifacts.py
+//!   cargo test -p mlx-gen-flux --test hyper_flux_real_weights -- --ignored --nocapture --test-threads=1
 //!
 //! Gates the story's "acceleration-LoRA viability on that path":
 //! (1) the PEFT-format Hyper-FLUX LoRA — which targets the top-level GLOBAL projections the fork's
 //!     `FluxLoRAMapping` omits — resolves the FULL surface with ZERO unmatched keys (504 targets);
-//! (2) a scale-0 Hyper LoRA is a NEAR no-op (the residual is mathematically zero; only the fork-
-//!     faithful bf16→f32 conditioning-path promotion remains — not bit-exact, see the test doc);
+//! (2) a scale-0 Hyper LoRA is a bit-exact no-op;
 //! (3) injecting the diffusers golden's init + prompt embeds + sigmas, the Hyper LoRA pulls our
 //!     few-step render TOWARD the diffusers Hyper reference (and away from the base) with a large
 //!     effect — the directional gate, since there is no MLX Hyper-FLUX reference (the fork can't load
@@ -119,28 +119,21 @@ fn hyper_flux_lora_resolves_all_targets_no_unmatched() {
     );
 }
 
-/// (2) A scale-0 Hyper LoRA is a NEAR no-op — the residual `scale·x·A·B` is mathematically zero, so
-/// no LoRA energy flows. It is NOT bit-exact (unlike the f32-main-stream-only zhibi block LoRA):
-/// the Hyper LoRA also targets the bf16 conditioning-path globals (`time_text_embed.*`, `norm_out`),
-/// and its f32 factors make `matmul(x_bf16, A_f32)` promote those nodes' output to f32 — a fork-
-/// faithful dtype promotion (sc-2718) that the chaotic few-step path turns into sub-threshold
-/// per-pixel jitter. So the gate is "zero LoRA effect" (px>8 ≈ 0), not byte-equality.
+/// (2) A scale-0 Hyper LoRA is a bit-exact no-op. sc-15265 made `AdaptableLinear` skip a
+/// `scale == 0` adapter before factor casts or matmuls. The licensed sc-15505 diagnostic measured
+/// 0 differences across all 786,432 RGB bytes before this assertion was tightened.
 #[test]
 #[ignore = "needs real FLUX.1-dev weights + the Hyper-FLUX LoRA + golden"]
-fn hyper_flux_scale_zero_is_near_noop() {
+fn hyper_flux_scale_zero_is_bit_exact_noop() {
     let base = injected_render(None);
     let zero = injected_render(Some(0.0));
     let any = base.iter().zip(&zero).filter(|(a, b)| a != b).count();
-    let (px8, frac) = px_gt8(&base, &zero);
+    println!("Hyper-FLUX scale-0: {any} RGB bytes differ vs no-adapter");
     println!(
-        "Hyper-FLUX scale-0: {any} px any-diff, {px8} px>8 ({frac:.4}%) vs no-adapter (bf16→f32 promotion only)"
+        "SC15505_RESULT hyper_flux_scale_zero byte_differences={any} rgb_samples={}",
+        base.len()
     );
-    // Observed ~0.62% px>8 (deterministic — the injected loop has no RNG): the conditioning-path
-    // bf16→f32 promotion floor, ~100× below the LoRA's real ~80% effect. NOT the LoRA leaking energy.
-    assert!(
-        frac < 1.5,
-        "scale-0 Hyper LoRA changed the render beyond the dtype-promotion floor: {frac:.4}% px>8"
-    );
+    assert_eq!(base, zero, "scale-0 Hyper LoRA must be a bit-exact no-op");
 }
 
 /// Inject the diffusers golden's init + prompt embeds + sigmas, run our transformer (optionally with

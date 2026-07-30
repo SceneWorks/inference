@@ -1,0 +1,106 @@
+{
+  "schemaVersion": 1,
+  "story": "sc-14540",
+  "measuredCommit": "424e90166386d02bf95bdaa57e958e839693418a",
+  "metalWorkflow": {
+    "runId": 30194850972,
+    "url": "https://github.com/SceneWorks/inference/actions/runs/30194850972",
+    "result": "success"
+  },
+  "geometry": {
+    "latentLength": 1292,
+    "samples": 5292032,
+    "secondsAt44100Hz": 120.00072562358276,
+    "chunkSize": 128,
+    "overlap": 32,
+    "directProcessedLatents": 1292,
+    "chunkedProcessedLatents": 1792
+  },
+  "metal": {
+    "backend": "Metal(MetalDevice(DeviceId(1)))",
+    "hardware": {
+      "model": "MacBook Pro",
+      "modelIdentifier": "Mac17,6",
+      "chip": "Apple M5 Max",
+      "cpuCores": 18,
+      "gpuCores": 40,
+      "memoryBytes": 137438953472,
+      "metalSupport": "Metal 4"
+    },
+    "toolchain": {
+      "rustc": "1.96.0 (ac68faa20 2026-05-25)",
+      "cargo": "1.96.0 (30a34c682 2026-05-25)"
+    },
+    "same_s": {
+      "encode": {
+        "directPeakDeviceBytes": 3730702336,
+        "chunkedPeakDeviceBytes": 849215488,
+        "reductionBytes": 2881486848,
+        "reductionFraction": 0.7723711485085901,
+        "directSeconds": 1.392776,
+        "chunkedSeconds": 1.603738,
+        "wallTimeRatio": 1.1514687214598758
+      },
+      "decode": {
+        "directPeakDeviceBytes": 3695804416,
+        "chunkedPeakDeviceBytes": 907427840,
+        "reductionBytes": 2788376576,
+        "reductionFraction": 0.7544708166721342,
+        "directSeconds": 1.514319,
+        "chunkedSeconds": 1.618179,
+        "wallTimeRatio": 1.068585284870625
+      }
+    },
+    "same_l": {
+      "encode": {
+        "directPeakDeviceBytes": 5581832192,
+        "chunkedPeakDeviceBytes": 4176330752,
+        "reductionBytes": 1405501440,
+        "reductionFraction": 0.25179930023951536,
+        "directSeconds": 6.856184,
+        "chunkedSeconds": 9.514711,
+        "wallTimeRatio": 1.3877560753912088
+      },
+      "decode": {
+        "directPeakDeviceBytes": 5462081536,
+        "chunkedPeakDeviceBytes": 4193386496,
+        "reductionBytes": 1268695040,
+        "reductionFraction": 0.23227317857453533,
+        "directSeconds": 7.129386,
+        "chunkedSeconds": 9.834697,
+        "wallTimeRatio": 1.3794591848442488
+      }
+    }
+  },
+  "cpuDiagnostic": {
+    "note": "SAME-L process RSS is pinned by the F32 model-load high-water, so CPU RSS is diagnostic rather than the acceptance gate.",
+    "same_s": {
+      "encode": {
+        "directPeakRssBytes": 4715134976,
+        "chunkedPeakRssBytes": 917454848,
+        "directSeconds": 9.832835,
+        "chunkedSeconds": 13.867064
+      },
+      "decode": {
+        "directPeakRssBytes": 4547313664,
+        "chunkedPeakRssBytes": 954023936,
+        "directSeconds": 10.058877,
+        "chunkedSeconds": 16.5013
+      }
+    },
+    "same_l": {
+      "encode": {
+        "directPeakRssBytes": 6830129152,
+        "chunkedPeakRssBytes": 6830112768,
+        "directSeconds": 114.53461,
+        "chunkedSeconds": 141.165834
+      },
+      "decode": {
+        "directPeakRssBytes": 6830129152,
+        "chunkedPeakRssBytes": 6830129152,
+        "directSeconds": 103.493787,
+        "chunkedSeconds": 134.125552
+      }
+    }
+  }
+}

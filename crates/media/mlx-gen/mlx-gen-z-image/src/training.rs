@@ -111,6 +111,9 @@ fn trainer_descriptor() -> TrainerDescriptor {
         supports_lokr: true,
         // LoRA/LoKr only — no control-branch training path (F-006).
         supports_control: false,
+        // Adapter-only: no full base fine-tune path (sc-14056). The shared
+        // `validate_full_finetune_request` floor makes a `full_finetune` request a typed reject.
+        supports_full_finetune: false,
     }
 }
 
@@ -230,6 +233,9 @@ impl Trainer for ZImageTurboTrainer {
         // Shared control-training floor (F-006): a LoRA-only trainer must reject a control-branch
         // request (typed `Unsupported`) rather than silently training a plain adapter.
         gen_core::train::validate_control_request(self.descriptor(), req)?;
+        // Shared full-base-fine-tune floor (sc-14056): an adapter-only trainer must reject a
+        // `full_finetune` request (typed `Unsupported`) rather than silently training a LoRA.
+        gen_core::train::validate_full_finetune_request(self.descriptor(), req)?;
         validate_request(req)?;
         // Non-default `lora_target_modules` that match no adaptable module on the DiT would resolve
         // to an empty target set — a full-length run that trains zero parameters yet "succeeds"
@@ -328,6 +334,8 @@ impl ZImageTurboTrainer {
                 text_encoder,
                 &item.caption,
                 "z_image_turbo trainer",
+                // Trainers never select a memory rung: the resident encoder is the training path.
+                None,
             )?;
             eval([&x0, &cap])?;
             cache.push((x0, cap));
@@ -366,6 +374,8 @@ impl ZImageTurboTrainer {
                     text_encoder,
                     prompt,
                     "z_image_turbo trainer (sample)",
+                    // Trainers never select a memory rung: the resident encoder is the training path.
+                    None,
                 )?;
                 let cap = if compute_dtype == Dtype::Float32 {
                     cap
@@ -1029,6 +1039,7 @@ mod first_step_repro {
             trainer.text_encoder.as_ref().unwrap(),
             "a solid colour swatch",
             "sc-4874 repro",
+            None,
         )
         .unwrap();
         eval([&cap]).unwrap();

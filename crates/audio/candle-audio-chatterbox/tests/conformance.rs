@@ -929,7 +929,7 @@ fn perth_watermark_roundtrips_and_is_imperceptible() {
     // loss), so its raw SNR is modest by design — the reference's own test only requires SNR > 0.
     // These floors (well above that bar, ~3–4 dB below the deterministic measured values ≈16/15 dB)
     // catch a port that grossly corrupts the audio. The native-rate figure isolates the watermark
-    // from resample artifacts; the 24 kHz figure additionally carries the linear-resample roundtrip.
+    // from resample artifacts; the 24 kHz figure additionally carries the Kaiser-sinc roundtrip.
     assert!(
         snr32 > 12.0,
         "watermark not imperceptible @32k: SNR {snr32:.2} dB"

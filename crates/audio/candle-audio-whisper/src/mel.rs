@@ -43,29 +43,6 @@ pub fn mel_filters(num_mel_bins: usize) -> candle_audio::Result<Vec<f32>> {
         .collect())
 }
 
-/// Linear-interpolation resample of a mono `f32` clip to Whisper's 16 kHz. A no-op when already at
-/// 16 kHz. Mirrors the audio family's `resample_to_native` idiom (OpenVoice `spectrogram.rs`) — a
-/// polyphase resampler is unnecessary for the walking-skeleton ASR path (the model's own front-end
-/// tolerates the mild linear-interp artifacts on speech-band content).
-pub fn resample_to_16k(samples: &[f32], src_rate: u32) -> Vec<f32> {
-    if src_rate == SAMPLE_RATE || samples.is_empty() {
-        return samples.to_vec();
-    }
-    let ratio = SAMPLE_RATE as f64 / src_rate as f64;
-    let out_len = ((samples.len() as f64) * ratio).round() as usize;
-    let last = samples.len() - 1;
-    let mut out = Vec::with_capacity(out_len);
-    for i in 0..out_len {
-        let src_pos = i as f64 / ratio;
-        let left = src_pos.floor() as usize;
-        let frac = (src_pos - left as f64) as f32;
-        let a = samples[left.min(last)];
-        let b = samples[(left + 1).min(last)];
-        out.push(a + (b - a) * frac);
-    }
-    out
-}
-
 /// Down-mix interleaved `channels`-channel PCM to mono by averaging (a no-op for mono).
 pub fn to_mono(samples: &[f32], channels: u16) -> Vec<f32> {
     if channels <= 1 {
@@ -88,7 +65,7 @@ pub fn track_to_mel(
     config: &Config,
 ) -> candle_audio::Result<(Vec<f32>, usize)> {
     let mono = to_mono(samples, channels);
-    let pcm = resample_to_16k(&mono, sample_rate);
+    let pcm = candle_audio::dsp::resample(&mono, sample_rate, SAMPLE_RATE, 1)?;
     let filters = mel_filters(config.num_mel_bins)?;
     let mel = audio::pcm_to_mel(config, &pcm, &filters);
     let n_frames = mel.len() / config.num_mel_bins;
@@ -107,24 +84,6 @@ mod tests {
         assert!(f.iter().any(|&w| w > 0.0), "filterbank carries energy");
         // A non-80 width is refused rather than silently mismatched.
         assert!(mel_filters(128).is_err());
-    }
-
-    #[test]
-    fn resample_is_identity_at_native_rate() {
-        let s = vec![0.1, -0.2, 0.3, -0.4];
-        assert_eq!(resample_to_16k(&s, SAMPLE_RATE), s);
-    }
-
-    #[test]
-    fn resample_changes_length_by_the_rate_ratio() {
-        // 24 kHz → 16 kHz shrinks by 2/3.
-        let s = vec![0.0f32; 2400];
-        let out = resample_to_16k(&s, 24_000);
-        assert!(
-            (out.len() as i64 - 1600).abs() <= 1,
-            "expected ~1600 samples, got {}",
-            out.len()
-        );
     }
 
     #[test]

@@ -46,8 +46,9 @@ use std::path::Path;
 use mlx_rs::fast::rms_norm;
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear};
 use mlx_gen::weights::Weights;
-use mlx_gen::{nn, Error, Result};
+use mlx_gen::{Error, Result};
 
 use crate::attention::DualStream;
 use crate::config::{MageFlowConfig, NORM_EPS};
@@ -72,52 +73,93 @@ pub const TRANSFORMER_CONFIG_FILE: &str = "config.json";
 ///
 /// This lives in `transformer.rs` rather than a shared `loader.rs` because this file owns weight
 /// loading for the DiT (see the module note above and the `lib.rs` decision record).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Linear {
-    weight: Array,
-    bias: Array,
+    inner: mlx_gen::adapters::AdaptableLinear,
+    in_features: i32,
+    out_features: i32,
+    dtype: Dtype,
+}
+
+impl std::fmt::Debug for Linear {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Linear")
+            .field("in_features", &self.in_features)
+            .field("out_features", &self.out_features)
+            .field("dtype", &self.dtype)
+            .field("quantized", &self.inner.is_quantized())
+            .finish()
+    }
 }
 
 impl Linear {
+    /// Load `{prefix}` — **packed** (Q4/Q8) when `{prefix}.scales` is present, else **dense**.
+    ///
+    /// Auto-detection (sc-14980) is what lets one loader read both the flat dense snapshot and a
+    /// pre-quantized `<tier>/transformer/` artifact with no path branching on the load side. On the
+    /// packed path the on-disk `{prefix}.weight` is a `[out, in·bits/32]` u32 code tensor, so the
+    /// logical `in_features` must be derived from `scales` (`[out, in/group_size]`) rather than the
+    /// weight's own column count, and the compute dtype read off `scales` rather than the u32 codes
+    /// — otherwise `in_features()` reports `in/8` for Q4 and `dtype()` reports `Uint32`.
     pub fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
+        let inner = crate::quant::lin(w, prefix, true)?;
+        let weight = w.require(&format!("{prefix}.weight"))?;
+        let out_features = weight.shape()[0];
+        let (in_features, dtype) = match w.get(&format!("{prefix}.scales")) {
+            Some(scales) => (scales.shape()[1] * crate::quant::GROUP_SIZE, scales.dtype()),
+            None => (weight.shape()[1], weight.dtype()),
+        };
         Ok(Self {
-            weight: w.require(&format!("{prefix}.weight"))?.clone(),
-            bias: w.require(&format!("{prefix}.bias"))?.clone(),
+            in_features,
+            out_features,
+            dtype,
+            inner,
         })
     }
 
     pub fn out_features(&self) -> i32 {
-        self.weight.shape()[0]
+        self.out_features
     }
 
     pub fn in_features(&self) -> i32 {
-        self.weight.shape()[1]
+        self.in_features
     }
 
     pub fn dtype(&self) -> Dtype {
-        self.weight.dtype()
+        self.dtype
     }
 
     pub fn cast_weights(&mut self, dtype: Dtype) -> Result<()> {
-        if self.weight.dtype() != dtype {
-            self.weight = self.weight.as_dtype(dtype)?;
-        }
-        if self.bias.dtype() != dtype {
-            self.bias = self.bias.as_dtype(dtype)?;
-        }
+        self.inner.cast_weights(dtype)?;
+        self.dtype = dtype;
         Ok(())
+    }
+
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.inner.quantize(bits, None)
+    }
+
+    pub(crate) fn is_quantized(&self) -> bool {
+        self.inner.is_quantized()
     }
 
     /// `y = x · Wᵀ + b`, as the fused `addmm` MLX's own `nn.Linear` uses — a separate
     /// `matmul` + `add` double-rounds the bias in bf16, which compounds over 12 blocks.
     pub fn forward(&self, x: &Array) -> Result<Array> {
-        nn::linear(x, &self.weight, &self.bias)
+        self.inner.forward(x)
+    }
+
+    /// The wrapped [`AdaptableLinear`], so a LoRA/LoKr residual can be installed onto this
+    /// projection (sc-14055). Every DiT `Linear` is adapter-hostable — the base weight is never
+    /// mutated, so an adapter composes with a quantized base and clears back to the bare base.
+    pub(crate) fn adaptable_mut(&mut self) -> &mut AdaptableLinear {
+        &mut self.inner
     }
 }
 
 /// The 4B NR-MMDiT: `img_in` / `txt_norm` / `txt_in` / timestep embedder → `depth` dual-stream
 /// blocks → `norm_out` / `proj_out`.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MageTransformer {
     cfg: MageFlowConfig,
     rope: MsRope,
@@ -130,6 +172,37 @@ pub struct MageTransformer {
 }
 
 impl MageTransformer {
+    /// Quantize every DiT Linear to MLX group-wise Q4/Q8; norms and RoPE stay dense.
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.img_in.quantize(bits)?;
+        self.txt_in.quantize(bits)?;
+        self.time_embed.quantize(bits)?;
+        for block in &mut self.blocks {
+            block.quantize(bits)?;
+        }
+        self.final_layer.quantize(bits)?;
+        let got = self.quantized_linear_count();
+        let expected = 2 + 2 + self.blocks.len() * 14 + 2;
+        if got != expected {
+            return Err(Error::Msg(format!(
+                "mage_flow: DiT quantization packed {got}/{expected} required Linear projections"
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn quantized_linear_count(&self) -> usize {
+        usize::from(self.img_in.is_quantized())
+            + usize::from(self.txt_in.is_quantized())
+            + self.time_embed.quantized_linear_count()
+            + self
+                .blocks
+                .iter()
+                .map(MageTransformerBlock::quantized_linear_count)
+                .sum::<usize>()
+            + self.final_layer.quantized_linear_count()
+    }
+
     /// Load from a caller-provisioned `transformer/` directory: `config.json` for the nine consumed
     /// fields, `diffusion_pytorch_model.safetensors` for the weights.
     ///
@@ -139,8 +212,8 @@ impl MageTransformer {
         let dir = transformer_dir.as_ref();
         let json = std::fs::read_to_string(dir.join(TRANSFORMER_CONFIG_FILE))?;
         let cfg = MageFlowConfig::from_transformer_config_json(&json)?;
-        let weights = Weights::from_file(dir.join(TRANSFORMER_WEIGHTS_FILE))?;
-        Self::from_weights(&weights, cfg)
+        let mut weights = Weights::from_file(dir.join(TRANSFORMER_WEIGHTS_FILE))?;
+        Self::from_weights_draining(&mut weights, cfg)
     }
 
     /// Build from an already-loaded checkpoint. Keys follow the published diffusers layout
@@ -168,6 +241,50 @@ impl MageTransformer {
             cfg,
         };
         model.check_geometry()?;
+        Ok(model)
+    }
+
+    /// Production loader that releases each source block from the checkpoint map as soon as the
+    /// corresponding module owns it. `Array::clone` is a shallow MLX handle; removing the map's
+    /// handle therefore avoids retaining a second full-checkpoint reference while later Q4/Q8
+    /// packing materializes replacement buffers.
+    pub fn from_weights_draining(w: &mut Weights, cfg: MageFlowConfig) -> Result<Self> {
+        cfg.validate()?;
+        let rope = MsRope::from_config(&cfg)?;
+        let img_in = Linear::from_weights(w, "img_in")?;
+        w.remove_prefix("img_in.");
+        let txt_norm = w.require("txt_norm.weight")?.clone();
+        w.remove("txt_norm.weight");
+        let txt_in = Linear::from_weights(w, "txt_in")?;
+        w.remove_prefix("txt_in.");
+        let time_embed = MageTimestepEmbedder::from_weights(w, "time_text_embed")?;
+        w.remove_prefix("time_text_embed.");
+        let mut blocks = Vec::with_capacity(cfg.depth);
+        for i in 0..cfg.depth {
+            let prefix = format!("transformer_blocks.{i}");
+            blocks.push(MageTransformerBlock::from_weights(w, &prefix, &cfg)?);
+            w.remove_prefix(&format!("{prefix}."));
+        }
+        let final_layer = MageFinalLayer::from_weights(w, "norm_out", "proj_out")?;
+        w.remove_prefix("norm_out.");
+        w.remove_prefix("proj_out.");
+        let model = Self {
+            cfg,
+            rope,
+            img_in,
+            txt_norm,
+            txt_in,
+            time_embed,
+            blocks,
+            final_layer,
+        };
+        model.check_geometry()?;
+        if !w.is_empty() {
+            return Err(Error::Msg(format!(
+                "mage_flow: transformer drain left {} source tensors resident",
+                w.len()
+            )));
+        }
         Ok(model)
     }
 
@@ -342,6 +459,79 @@ impl MageTransformer {
         // (`mage_flow.py:116-118`) — an exact no-op, so the pooled text vector is not ported at all.
         Ok((DualStream { txt, img }, temb))
     }
+
+    /// Training forward (sc-14055): the [`forward`](Self::forward) computation WITHOUT the per-block
+    /// `eval`.
+    ///
+    /// The inference forward evals each block's streams to bound the lazy graph's peak memory. That
+    /// is illegal inside an autograd trace — `keyed_value_and_grad` builds one symbolic graph and
+    /// MLX forbids forcing an `eval` mid-transformation — so the LoRA trainer runs this variant,
+    /// which retains the whole forward graph for the backward. That retention is the trade the
+    /// backward needs; a LoRA overfit trains at a small resolution / tiny dataset where the dense
+    /// graph is cheap. High-resolution training would add gradient (activation) checkpointing to
+    /// bound the first-step working set (a follow-up mirroring z-image's sc-4874). The output is the
+    /// flow-matching velocity, exactly as [`forward`](Self::forward).
+    pub fn forward_train(
+        &self,
+        img: &Array,
+        txt: &Array,
+        sigma: &Array,
+        ctx: &PackContext,
+    ) -> Result<Array> {
+        let (mut stream, temb) = self.embed(img, txt, sigma, ctx)?;
+        for block in &self.blocks {
+            stream = block.forward(&stream, &temb, ctx)?;
+        }
+        self.final_layer.forward(&stream.img, &temb, ctx)
+    }
+}
+
+/// LoRA/LoKr host surface (sc-14055): the dotted-path → [`AdaptableLinear`] map the shared adapter
+/// core (`mlx_gen::adapters`, `mlx_gen::train::lora`) drives for both training injection and
+/// inference reload. Paths follow the published diffusers checkpoint naming so a trained adapter's
+/// PEFT keys (`transformer_blocks.{i}.attn.to_q.lora_A.weight`, …) round-trip: the same
+/// `adaptable_paths` that name a target at save time resolve it at load time.
+///
+/// **Every** `Linear` in the DiT is routable (sc-14057), not just the ones our own trainer targets
+/// by default. The block projections cover a SceneWorks-trained adapter; the four *global* leaves —
+/// `img_in`, `txt_in`, `time_text_embed.timestep_embedder.linear_{1,2}` and the output head's
+/// `norm_out.linear` / `proj_out` — exist for **community** adapters, where `target_modules
+/// = "all-linear"` (PEFT's most common preset) trains every one of them. Before sc-14057 the last
+/// three were unroutable: [`apply_adapters_strict`](mlx_gen::adapters::loader::apply_adapters_strict)
+/// would surface them in `unmatched_paths` and **fail the whole file** — loud, never a silent
+/// no-op, but it made an otherwise-valid third-party Mage adapter unusable rather than partially
+/// applied. Enumerating them here also makes them kohya-reachable (the `flattened → dotted` table
+/// is built from this list); Mage is a new family with no upstream `lora_unet_` convention to
+/// mirror, so — unlike the z-image sibling, which must match its fork's mapping — nothing is gained
+/// by withholding them, and the flattened forms stay collision-free (guarded by
+/// `tests/adapter_routing.rs`).
+impl AdaptableHost for MageTransformer {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["img_in"] => Some(self.img_in.adaptable_mut()),
+            ["txt_in"] => Some(self.txt_in.adaptable_mut()),
+            ["transformer_blocks", n, rest @ ..] => self
+                .blocks
+                .get_mut(n.parse::<usize>().ok()?)?
+                .adaptable_mut(rest),
+            ["time_text_embed", rest @ ..] => self.time_embed.adaptable_mut(rest),
+            // The output head straddles two checkpoint roots (`norm_out.linear` and `proj_out`), so
+            // it matches on the FULL path rather than a stripped remainder.
+            ["norm_out", ..] | ["proj_out", ..] => self.final_layer.adaptable_mut(path),
+            _ => None,
+        }
+    }
+
+    fn adaptable_paths(&self) -> Vec<String> {
+        let mut out = vec!["img_in".to_string(), "txt_in".to_string()];
+        for (i, block) in self.blocks.iter().enumerate() {
+            out.extend(prefixed_paths(&format!("transformer_blocks.{i}"), block));
+        }
+        out.extend(prefixed_paths("time_text_embed", &self.time_embed));
+        // Absolute, not prefixed — see the `MageFinalLayer` host impl.
+        out.extend(self.final_layer.adaptable_paths());
+        out
+    }
 }
 
 #[cfg(test)]
@@ -364,8 +554,11 @@ mod tests {
     #[test]
     fn missing_transformer_keys_are_a_load_error_not_a_silent_skip() {
         // torch's `strict=False` would leave these randomly initialised; the port refuses.
-        let err = MageTransformer::from_weights(&Weights::empty(), MageFlowConfig::mage_flow())
-            .unwrap_err();
+        let err =
+            match MageTransformer::from_weights(&Weights::empty(), MageFlowConfig::mage_flow()) {
+                Ok(_) => panic!("empty weights unexpectedly loaded"),
+                Err(err) => err,
+            };
         assert!(
             matches!(err, Error::MissingTensor(ref key) if key.starts_with("img_in")),
             "expected a missing-tensor error naming img_in, got {err:?}"
