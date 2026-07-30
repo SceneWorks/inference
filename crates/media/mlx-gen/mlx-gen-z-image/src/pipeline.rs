@@ -581,26 +581,33 @@ pub(crate) fn block_window_size(req: &GenerationRequest) -> Option<usize> {
     })
 }
 
-/// [`block_window_size`] plus the residency-policy precondition, shared by all four generators.
+/// [`block_window_size`] plus the load-shape precondition, shared by all four generators.
 ///
 /// **Why this rejects instead of degrading.** Streaming bounds transformer residency only if the
-/// resident `layers` are *not* also materialized. Under `Sequential` they are not — the heavy bundle
-/// is rebuilt per generate, its blocks are unevaluated lazy handles (SC-15744 measured 1073 handles at
-/// 0.0 MiB), and a windowed forward never touches them, so they stay at ~0 bytes. Under `Resident` the
-/// same generator serves many requests, so after the first ordinary render the blocks ARE materialized
-/// and a window would be *added on top of* them: strictly more memory and strictly slower.
+/// resident `layers` are *not* also materialized. SC-15998 makes that an explicit deferred-
+/// materialization load shape independent from phase-level [`mlx_gen::OffloadPolicy`]. Both a
+/// Resident+Deferred generator (warm across requests) and a Sequential+Deferred generator (released
+/// between phases) satisfy it; an eager load does not.
 ///
-/// Rung 1 resolves the same load-time-vs-request-time seam by silently yielding resident behaviour.
-/// Rung 4 must not: a silent degradation here writes a rung-4 row into the calibration evidence for a
-/// run that saved nothing, which is the false green SC-15750's own mutation check exists to prevent —
-/// one layer up, and invisible to it.
+/// A deferred generator must never fall back to its lazy resident stack merely because this request
+/// did not select DiT scope. Such a fallback would materialize and retain the stack, so a later
+/// rung-4 request on the same cached generator would stream blocks *in addition to* those retained
+/// weights. The all-covering window preserves the deferred load shape without claiming a memory
+/// bound; only the request-selected smaller window is rung 4.
 pub(crate) fn resolve_block_window(
     req: &GenerationRequest,
-    is_sequential: bool,
+    supports_deferred_materialization: bool,
     id: &str,
 ) -> Result<Option<usize>> {
-    Ok(resolve_window_for(req, is_sequential, id)?
-        .filter(|_| block_window_component(req).includes_dit()))
+    let requested = resolve_window_for(req, supports_deferred_materialization, id)?;
+    if !supports_deferred_materialization {
+        return Ok(None);
+    }
+    Ok(Some(
+        requested
+            .filter(|_| block_window_component(req).includes_dit())
+            .unwrap_or_else(|| crate::transformer::ZImageTransformerConfig::turbo().n_layers),
+    ))
 }
 
 /// The rung-4 **component scope** for this request (SC-15794). `None` ⇒ [`TransformerComponent::Dit`],
@@ -614,30 +621,31 @@ pub(crate) fn block_window_component(req: &GenerationRequest) -> TransformerComp
 /// [`resolve_block_window`]'s text-encoder twin (SC-15794): the window to apply to the **conditioning**
 /// stack, or `None` when this request's component scope excludes the encoder.
 ///
-/// Shares the Sequential precondition for the same reason: under `Resident` the encoder is
-/// materialized once and reused across requests, so a window would be added on top of resident weights
-/// — more memory, not less.
+/// Shares the deferred-load precondition for the same reason: an eager encoder already holds its
+/// layers, so adding a window would add memory rather than bound it.
 pub(crate) fn resolve_encoder_window(
     req: &GenerationRequest,
-    is_sequential: bool,
+    supports_deferred_materialization: bool,
     id: &str,
 ) -> Result<Option<usize>> {
-    Ok(resolve_window_for(req, is_sequential, id)?
-        .filter(|_| block_window_component(req).includes_text_encoder()))
+    Ok(
+        resolve_window_for(req, supports_deferred_materialization, id)?
+            .filter(|_| block_window_component(req).includes_text_encoder()),
+    )
 }
 
-/// The requested window plus the shared residency precondition, before the component scope narrows it.
+/// The requested window plus the shared load-shape precondition, before the component scope narrows it.
 fn resolve_window_for(
     req: &GenerationRequest,
-    is_sequential: bool,
+    supports_deferred_materialization: bool,
     id: &str,
 ) -> Result<Option<usize>> {
     let window = block_window_size(req);
-    if window.is_some() && !is_sequential {
+    if window.is_some() && !supports_deferred_materialization {
         return Err(Error::Unsupported(format!(
-            "{id}: bounded transformer residency needs a Sequential (staged) load — on a Resident \
-             generator the trunk blocks are already materialized, so a window would add memory \
-             rather than bound it. Load with OffloadPolicy::Sequential."
+            "{id}: bounded transformer residency needs a deferred-materialization load shape — this \
+             generator eagerly materializes the trunk, so a window would add memory rather than \
+             bound it. Load with LoadShape::DeferredMaterialization."
         )));
     }
     Ok(window)
@@ -655,13 +663,15 @@ impl<'a> EncoderWindow<'a> {
     /// The scope for this request, or `None` when the encoder is not in it.
     pub(crate) fn resolve(
         req: &'a GenerationRequest,
-        is_sequential: bool,
+        supports_deferred_materialization: bool,
         id: &str,
     ) -> Result<Option<Self>> {
         Ok(
-            resolve_encoder_window(req, is_sequential, id)?.map(|window| Self {
-                window,
-                cancel: &req.cancel,
+            resolve_encoder_window(req, supports_deferred_materialization, id)?.map(|window| {
+                Self {
+                    window,
+                    cancel: &req.cancel,
+                }
             }),
         )
     }

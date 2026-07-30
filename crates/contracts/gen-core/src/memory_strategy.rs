@@ -107,7 +107,7 @@
 //! is an axis built ahead of that measurement, on the strength of a figure derived for a fix nobody has
 //! written.
 
-use crate::{Error, GenerationRequest, Precision, Quant, Result};
+use crate::{Error, GenerationRequest, LoadShape, Precision, Quant, Result};
 
 /// Current ABI of the provider/evidence calibration handshake.
 ///
@@ -142,13 +142,13 @@ impl MemoryStrategy {
         !matches!(self, Self::Resident)
     }
 
-    /// The declared prerequisite graph for this rung (SC-15805).
+    /// The shared prerequisite graph for this rung (SC-15805, corrected by SC-15998).
     ///
     /// ```text
     /// rung 1  ->  (none)
     /// rung 2  ->  (none)
     /// rung 3  ->  (none)
-    /// rung 4  ->  requires rung 1 ENGAGED in the same request
+    /// rung 4  ->  requires a DeferredMaterialization load shape
     /// ```
     ///
     /// That is the entire graph, and it is **declared**, never derived from this enum's numeric
@@ -165,71 +165,19 @@ impl MemoryStrategy {
     ///
     /// # What the precondition physically is
     ///
-    /// The true physical precondition is not rung 1 *the strategy* — it is a **load shape that
-    /// permits deferred materialization** of the trunk. Rung 1 is the mechanism that produces that
-    /// shape, which is why the edge names it. The two facts are currently conflated inside one
-    /// provider's private condition: `mlx-gen-z-image` computes
-    /// `streamable = Dir(_) && OffloadPolicy::Sequential` and declares rung 4 `Missing` when it is
-    /// false. **SC-15806** converges them: once rung 1 is request-scoped, `streamable` is threaded
-    /// through the loader per request, after which "rung 1 engaged in this request" and "this
-    /// request has a deferred-materialization load" are the same statement. Until then the edge is
-    /// the contract-level expression of a fact a provider also enforces privately — the two
-    /// **coexist** and answer different questions:
-    ///
-    /// - *availability* (z-image's load-spec-conditional declaration, SC-15754): can this **load**
-    ///   execute the rung at all? Decided once, when the contract is built from the `LoadSpec`.
-    /// - *engagement* (this graph): is the prerequisite rung active in **this request**? Decided
-    ///   per selection, by [`MemoryProviderContract::validate_selection`].
-    ///
-    /// # The edge is unconditional
-    ///
-    /// It is deliberately **not** conditioned on
-    /// [`MemoryStrategyParameters::transformer_window_component`] (SC-15794). For the `Dit` and
-    /// `Both` scopes the arithmetic above applies directly, and `Dit` is both the published
-    /// production default and the only scope a Krea request may name. A `TextEncoder`-scoped window
-    /// bounds the encoder *during conditioning*, the phase rung 1 has not yet shed, so in theory a
-    /// TE-dominant model whose **conditioning sets the request peak** would want TE-scoped rung 4
-    /// with rung 1 not engaged. No such model is measured: z-image is the only measurement and it is
-    /// decisive the other way — TE scope cut conditioning 46.5% and moved the request peak 0.0%.
-    /// Encoding that exception now would build selector surface for exactly the case the epic's
-    /// non-negotiable tells the selector to ignore ("a strategy that bounds a phase but does not
-    /// move the REQUEST peak is not a saving").
-    ///
-    /// **Revisit trigger: SC-15800.** If it measures a TE-dominant family where conditioning sets
-    /// the request peak, this edge becomes scope-conditional *on that evidence*. Until then it does
-    /// not.
+    /// SC-15998 measured the four combinations independently on MLX/Metal. Resident phase policy
+    /// plus deferred block materialization cut Z-Image's request peak, retained the warm generator,
+    /// and performed no phase reloads. The previous rung-1 edge therefore encoded one provider's
+    /// coupled loader shape as universal arithmetic. [`LoadShape::DeferredMaterialization`] is the
+    /// actual prerequisite, independent from phase-level [`crate::OffloadPolicy`].
     ///
     /// # Why the graph is contract-owned rather than provider-declared
     ///
-    /// The whole point of the story is to move this fact "from a provider's private condition into
-    /// the contract". A per-provider `requires` field would let a provider silently drop the edge by
-    /// leaving it unset — the false-green shape this contract exists to prevent — and no provider
-    /// may opt out of arithmetic. Providers still control the graph's *effect* through their support
-    /// declarations: declaring rung 1 `Missing` makes rung 4 unselectable, which is exactly the
-    /// honest outcome.
+    /// Providers cannot replace this graph. They may only append realization-specific constraints
+    /// through [`MemoryProviderContract::additional_prerequisites`], which preserves the shared
+    /// deferred-materialization requirement while giving a backend-specific coupling a truthful
+    /// contract seam.
     ///
-    /// # Seam asymmetry with `engages` (recorded, not a defect)
-    ///
-    /// [`MemoryStrategy::engages`] exists in two forms — the pure cost-order policy here and the
-    /// provider-intersected [`MemoryProviderContract::engages`] — so a provider can differentiate
-    /// engagement. `requires` deliberately has only the pure form: it is a `const fn` on the bare
-    /// enum taking `self` by value, with no contract in scope, so **there is no seam at which a
-    /// backend-differentiated prerequisite edge could be declared.** That is the intended shape
-    /// today (see the section above: the edge is arithmetic, and no provider may opt out of it), and
-    /// nothing in the current graph wants a per-backend edge.
-    ///
-    /// Should a genuinely Candle-specific edge surface — one whose *arithmetic* differs by backend
-    /// rather than one a provider merely wishes away — the additive fix is a
-    /// `MemoryProviderContract::requires(strategy)` that defaults to this enum graph and is
-    /// overridden only where a backend realization changes the arithmetic. That keeps the
-    /// no-silent-opt-out property (the default is still contract-owned) while giving the edge set a
-    /// place to vary. It is deliberately not built ahead of that evidence.
-    ///
-    /// **SC-15791 has since reported, and it is not owed.** The Candle spike confirmed rung 4's single
-    /// edge holds there for the same arithmetic reason, needing no backend differentiation. What the
-    /// spike did surface was on the *cost* axis, and it is answered without differentiating anything:
-    /// see the module docs on why the cost order stays shared, and
-    /// [`MemoryWindowMaterialization`] for the per-realization obligation that keeps it true (SC-16090).
     pub const fn requires(self) -> &'static [MemoryStrategyPrerequisite] {
         match self {
             Self::Resident
@@ -274,12 +222,9 @@ impl MemoryStrategy {
     /// states: *"cost-order defaults still apply (rung 4 engages 2 and 3)"*. The AC never says rung
     /// 1.
     ///
-    /// **The rung-4 edge still resolves.** Rung 4 engages rung 1 because
-    /// `BoundedTransformerResidency::requires()` names it, not because `1 <= 4` — so
-    /// [`MemoryProviderContract::validate_selection`]'s prerequisite walk is satisfied exactly as
-    /// before and rung 4 stays selectable. Deriving this from `requires()` rather than hardcoding
-    /// "rung 4" is the point: a future edge added to the graph implies its own engagement, with no
-    /// second place to update.
+    /// **Rung 4 does not engage rung 1.** Its shared prerequisite is
+    /// [`LoadShape::DeferredMaterialization`], which can coexist with resident phase policy. A
+    /// provider-specific rung prerequisite is handled by [`MemoryProviderContract::engages`].
     ///
     /// [`Self::Resident`] remains engaged by every selection — it is the baseline, not an
     /// optimization, and nothing reads it as a lever.
@@ -287,30 +232,13 @@ impl MemoryStrategy {
         match rung {
             // The baseline. Unchanged: `(0 <= anything)` was always true.
             Self::Resident => true,
-            // Residency-bounding, and not free — declared prerequisite or explicit selection only.
-            Self::StagedResidency => {
-                matches!(self, Self::StagedResidency) || self.requires_rung(Self::StagedResidency)
-            }
+            // Residency-bounding, and not free — explicit selection only in the shared policy.
+            Self::StagedResidency => matches!(self, Self::StagedResidency),
             // Scratch-bounding and free: the plain cost-order default.
             Self::BoundedDecode | Self::BoundedAttention | Self::BoundedTransformerResidency => {
                 (rung as u8) <= (self as u8)
             }
         }
-    }
-
-    /// Whether `self`'s declared prerequisite graph names `rung`.
-    ///
-    /// Kept as a `const fn` slice walk (rather than an iterator) so [`Self::engages`] stays `const`.
-    const fn requires_rung(self, rung: Self) -> bool {
-        let edges = self.requires();
-        let mut index = 0;
-        while index < edges.len() {
-            if edges[index].rung as u8 == rung as u8 {
-                return true;
-            }
-            index += 1;
-        }
-        false
     }
 }
 
@@ -327,22 +255,24 @@ pub enum MemoryPrerequisiteScope {
     EngagedInSameRequest,
 }
 
-/// One edge of the declared prerequisite graph (SC-15805). See [`MemoryStrategy::requires`].
+/// One edge of the declared prerequisite graph. See [`MemoryStrategy::requires`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct MemoryStrategyPrerequisite {
-    /// The rung this edge points at.
-    pub rung: MemoryStrategy,
-    /// What is demanded of it.
-    pub scope: MemoryPrerequisiteScope,
+pub enum MemoryStrategyPrerequisite {
+    /// A strategy mechanism must engage in the stated scope.
+    Rung {
+        rung: MemoryStrategy,
+        scope: MemoryPrerequisiteScope,
+    },
+    /// The generator must have been loaded with this independent materialization shape.
+    LoadShape(LoadShape),
 }
 
 const NO_PREREQUISITES: &[MemoryStrategyPrerequisite] = &[];
 
 const BOUNDED_TRANSFORMER_RESIDENCY_REQUIRES: &[MemoryStrategyPrerequisite] =
-    &[MemoryStrategyPrerequisite {
-        rung: MemoryStrategy::StagedResidency,
-        scope: MemoryPrerequisiteScope::EngagedInSameRequest,
-    }];
+    &[MemoryStrategyPrerequisite::LoadShape(
+        LoadShape::DeferredMaterialization,
+    )];
 
 /// Static provider disposition for one rung. Dynamic verification never belongs here.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -366,8 +296,10 @@ pub struct MemoryStrategyCapability {
 }
 
 impl MemoryStrategyCapability {
-    /// This rung's declared prerequisites (SC-15805). Contract-owned, not provider-settable — see
-    /// [`MemoryStrategy::requires`] for why.
+    /// This rung's shared cross-provider prerequisites.
+    ///
+    /// Provider-specific additive edges are deliberately absent here. Consumers validating a
+    /// concrete provider must use [`MemoryProviderContract::requires`] so those edges are included.
     pub const fn requires(&self) -> &'static [MemoryStrategyPrerequisite] {
         self.strategy.requires()
     }
@@ -706,6 +638,11 @@ pub struct MemoryProviderContract {
     pub provider_id: String,
     pub backend: MemoryBackendRealization,
     pub strategies: Vec<MemoryStrategyCapability>,
+    /// The load-time materialization shape this concrete provider instance was built with.
+    pub load_shape: LoadShape,
+    /// Realization-specific constraints appended to the shared graph. Providers cannot remove or
+    /// replace [`MemoryStrategy::requires`].
+    pub additional_prerequisites: Vec<(MemoryStrategy, MemoryStrategyPrerequisite)>,
     pub lifecycle: MemoryLifecycleCapabilities,
     pub formula: MemoryFormulaKind,
     /// `None` is the compatibility default for a provider that has not adopted calibration yet.
@@ -737,6 +674,8 @@ impl MemoryProviderContract {
                     parameters: MemoryParameterRanges::default(),
                 })
                 .collect(),
+            load_shape: LoadShape::EagerMaterialization,
+            additional_prerequisites: Vec::new(),
             lifecycle: MemoryLifecycleCapabilities::default(),
             formula: MemoryFormulaKind::AssetBytesPlusHeadroom,
             calibration: None,
@@ -756,6 +695,20 @@ impl MemoryProviderContract {
             .map(|capability| &capability.support)
     }
 
+    /// Shared prerequisites followed by additive realization-specific constraints.
+    pub fn requires(
+        &self,
+        strategy: MemoryStrategy,
+    ) -> impl Iterator<Item = MemoryStrategyPrerequisite> + '_ {
+        strategy.requires().iter().copied().chain(
+            self.additional_prerequisites
+                .iter()
+                .filter_map(move |(owner, prerequisite)| {
+                    (*owner == strategy).then_some(*prerequisite)
+                }),
+        )
+    }
+
     /// Whether `rung`'s mechanism is active in a request that selected `strategy`.
     ///
     /// This is the **cost-order selector policy** ([`MemoryStrategy::engages`]) intersected with
@@ -765,7 +718,16 @@ impl MemoryProviderContract {
     /// rather than refusing the composition. It is deliberately separate from
     /// [`MemoryStrategy::requires`] — engagement is a default, a prerequisite is a constraint.
     pub fn engages(&self, strategy: MemoryStrategy, rung: MemoryStrategy) -> bool {
-        strategy.engages(rung)
+        let required_by_realization = self.requires(strategy).any(|prerequisite| {
+            matches!(
+                prerequisite,
+                MemoryStrategyPrerequisite::Rung {
+                    rung: required,
+                    ..
+                } if required == rung
+            )
+        });
+        (strategy.engages(rung) || required_by_realization)
             && matches!(self.support(rung), Some(MemoryStrategySupport::Implemented))
     }
 
@@ -943,63 +905,63 @@ impl MemoryProviderContract {
         // SC-15805: walk the DECLARED prerequisite graph, never `< selection.strategy`. The numeric
         // order is a cost ordering; reading it as a dependency refused compositions that are
         // perfectly correct (rungs 2 and 3 bound scratch and depend on nothing).
-        for prerequisite in selection.strategy.requires() {
-            match prerequisite.scope {
-                MemoryPrerequisiteScope::EngagedInSameRequest => {
-                    if self.engages(selection.strategy, prerequisite.rung) {
+        for prerequisite in self.requires(selection.strategy) {
+            match prerequisite {
+                MemoryStrategyPrerequisite::Rung { rung, scope } => match scope {
+                    MemoryPrerequisiteScope::EngagedInSameRequest => {
+                        if self.engages(selection.strategy, rung) {
+                            continue;
+                        }
+                        // `StructurallyNotApplicable` satisfies the edge vacuously: it asserts the
+                        // architecture has no such component to shed.
+                        if matches!(
+                            self.support(rung),
+                            Some(MemoryStrategySupport::StructurallyNotApplicable { .. })
+                        ) {
+                            continue;
+                        }
+                        let (why, caveat) = match self.support(rung) {
+                            Some(MemoryStrategySupport::Implemented) => (
+                                "the selected composition does not engage it".to_owned(),
+                                format!(
+                                    "This prerequisite is engagement, not availability — rung \
+                                     {rung:?} being implemented, or engaged by some other request, \
+                                     does not satisfy it."
+                                ),
+                            ),
+                            support => (
+                                match support {
+                                    Some(support) => {
+                                        format!("the provider declares it {support:?}")
+                                    }
+                                    None => {
+                                        "the provider does not declare it at all".to_owned()
+                                    }
+                                },
+                                format!(
+                                    "Declaring rung {rung:?} Implemented — or \
+                                     StructurallyNotApplicable, if this architecture has no such \
+                                     component to stage — is what makes {:?} selectable. Engagement \
+                                     is per request.",
+                                    selection.strategy
+                                ),
+                            ),
+                        };
+                        return Err(Error::Unsupported(format!(
+                            "{} cannot execute {:?}: it requires rung {rung:?} to be ENGAGED IN THE \
+                             SAME REQUEST, and {why}. {caveat}",
+                            self.provider_id, selection.strategy
+                        )));
+                    }
+                },
+                MemoryStrategyPrerequisite::LoadShape(required) => {
+                    if self.load_shape == required {
                         continue;
                     }
-                    // `StructurallyNotApplicable` satisfies the edge vacuously: it asserts the
-                    // architecture has no such component to shed, which is not evidence that the
-                    // trunk is eagerly materialized. Refusing here would invent an over-refusal for
-                    // an architecture that legitimately streams a trunk it never staged.
-                    if matches!(
-                        self.support(prerequisite.rung),
-                        Some(MemoryStrategySupport::StructurallyNotApplicable { .. })
-                    ) {
-                        continue;
-                    }
-                    // The caveat must match the case that actually produced the refusal, or the
-                    // message tells the reader that the one fix available to them will not work.
-                    //
-                    // Reachability (SC-15805 review): `engages` is
-                    // `rung <= strategy && support(rung) == Implemented`. EVERY edge in the current
-                    // graph points DOWN the cost ladder (rung 4 -> rung 1), so the ordering half is
-                    // always true here and `Some(Implemented)` short-circuits at the `continue`
-                    // above — that arm is **dead for the current graph**. It is retained rather than
-                    // unreachable-panicked because it is the correct answer the moment an edge
-                    // points sideways or up the ladder, and getting there is a one-line change to
-                    // `requires`. Only the `Missing` / undeclared arms are reachable today, and for
-                    // those "implement it" IS the fix — so that arm must not deny it.
-                    let (why, caveat) = match self.support(prerequisite.rung) {
-                        Some(MemoryStrategySupport::Implemented) => (
-                            "the selected composition does not engage it".to_owned(),
-                            format!(
-                                "This prerequisite is engagement, not availability — rung {:?} \
-                                 being implemented, or engaged by some other request, does not \
-                                 satisfy it.",
-                                prerequisite.rung
-                            ),
-                        ),
-                        support => (
-                            match support {
-                                Some(support) => format!("the provider declares it {support:?}"),
-                                None => "the provider does not declare it at all".to_owned(),
-                            },
-                            format!(
-                                "Declaring rung {:?} Implemented — or \
-                                 StructurallyNotApplicable, if this architecture has no such \
-                                 component to stage — is what makes {:?} selectable. Engagement is \
-                                 per request, so rung {:?} running on some other request, or \
-                                 engaged earlier on this warm generator, does not satisfy it.",
-                                prerequisite.rung, selection.strategy, prerequisite.rung
-                            ),
-                        ),
-                    };
                     return Err(Error::Unsupported(format!(
-                        "{} cannot execute {:?}: it requires rung {:?} to be ENGAGED IN THE SAME \
-                         REQUEST, and {why}. {caveat}",
-                        self.provider_id, selection.strategy, prerequisite.rung
+                        "{} cannot execute {:?}: it requires load shape {required:?}, but this \
+                         generator was loaded with {:?}",
+                        self.provider_id, selection.strategy, self.load_shape
                     )));
                 }
             }
@@ -1592,6 +1554,8 @@ mod tests {
             provider_id: "test-provider".to_owned(),
             backend: mlx_backend(),
             strategies,
+            load_shape: LoadShape::DeferredMaterialization,
+            additional_prerequisites: Vec::new(),
             lifecycle: MemoryLifecycleCapabilities {
                 phases: vec![
                     MemoryPhase::Conditioning,
@@ -2197,22 +2161,19 @@ mod tests {
         }
     }
 
-    /// SC-15805: the graph itself, asserted edge by edge rather than through a loop so that moving
-    /// the edge to a different rung — or dropping it — cannot pass.
+    /// SC-15998: the graph itself, asserted edge by edge so a regression to the old rung-1 edge
+    /// cannot pass.
     #[test]
-    fn the_declared_prerequisite_graph_is_one_engagement_edge_on_rung_four() {
+    fn rung_four_requires_deferred_materialization_not_rung_one() {
         assert_eq!(MemoryStrategy::Resident.requires(), &[]);
         assert_eq!(MemoryStrategy::StagedResidency.requires(), &[]);
         assert_eq!(MemoryStrategy::BoundedDecode.requires(), &[]);
         assert_eq!(MemoryStrategy::BoundedAttention.requires(), &[]);
         assert_eq!(
             MemoryStrategy::BoundedTransformerResidency.requires(),
-            &[MemoryStrategyPrerequisite {
-                rung: MemoryStrategy::StagedResidency,
-                // ENGAGEMENT, not availability. If this ever reads as an availability scope the
-                // rung-4 refusal below stops meaning what its test name says.
-                scope: MemoryPrerequisiteScope::EngagedInSameRequest,
-            }]
+            &[MemoryStrategyPrerequisite::LoadShape(
+                LoadShape::DeferredMaterialization
+            )]
         );
         // The per-rung accessor is the same declaration, so a provider cannot diverge from it.
         for capability in &adopted_contract().strategies {
@@ -2258,10 +2219,10 @@ mod tests {
             .expect("rung 3 depends on nothing and must stay selectable under a Missing rung 1");
     }
 
-    /// SC-15805 — rung 4 is refused when rung 1 is not engaged in the same request, and the refusal
-    /// says so. A window over an already-materialized trunk bounds nothing.
+    /// SC-15998 — rung 4 is refused for an eager load, and accepted for deferred materialization
+    /// even when rung 1 is unavailable.
     #[test]
-    fn rung_four_is_refused_when_rung_one_is_not_engaged() {
+    fn rung_four_is_gated_by_load_shape_not_staged_residency() {
         let rung_four = |contract: &MemoryProviderContract| {
             contract.validate_selection(&MemorySelection {
                 strategy: MemoryStrategy::BoundedTransformerResidency,
@@ -2276,31 +2237,24 @@ mod tests {
             })
         };
 
-        // Baseline: rung 1 implemented ⇒ engaged by the cost-order default ⇒ accepted.
-        rung_four(&adopted_contract()).expect("rung 4 is executable when rung 1 is engaged");
-
-        let missing = with_support(
+        let deferred_without_rung_one = with_support(
             adopted_contract(),
             MemoryStrategy::StagedResidency,
             MemoryStrategySupport::Missing,
         );
-        let error = rung_four(&missing)
-            .expect_err("rung 4 must be refused when its prerequisite rung is not engaged")
+        rung_four(&deferred_without_rung_one)
+            .expect("Resident+Deferred rung 4 must not require staged residency");
+
+        let mut eager = adopted_contract();
+        eager.load_shape = LoadShape::EagerMaterialization;
+        let error = rung_four(&eager)
+            .expect_err("a block window over an eagerly materialized trunk must be refused")
             .to_string();
-        assert!(error.contains("StagedResidency"), "{error}");
-        assert!(
-            error.contains("ENGAGED IN THE SAME REQUEST"),
-            "the refusal must name engagement, not availability: {error}"
-        );
+        assert!(error.contains("DeferredMaterialization"), "{error}");
+        assert!(error.contains("EagerMaterialization"), "{error}");
 
-        // The edge is UNCONDITIONAL: naming the encoder scope does not buy an exemption. (The
-        // parameter itself is rejected by `adopted_contract`'s empty component declaration, so this
-        // asserts the prerequisite fires FIRST and on its own terms.)
-        let mut encoder_scoped = with_support(
-            adopted_contract(),
-            MemoryStrategy::StagedResidency,
-            MemoryStrategySupport::Missing,
-        );
+        // Component scope does not change the physical prerequisite.
+        let mut encoder_scoped = eager;
         encoder_scoped
             .strategies
             .iter_mut()
@@ -2320,23 +2274,22 @@ mod tests {
                 },
                 tier: bf16(),
             })
-            .expect_err("a TextEncoder-scoped window does not escape the prerequisite")
+            .expect_err("a TextEncoder-scoped window does not escape the load-shape prerequisite")
             .to_string();
-        assert!(error.contains("ENGAGED IN THE SAME REQUEST"), "{error}");
+        assert!(error.contains("DeferredMaterialization"), "{error}");
     }
 
-    /// `StructurallyNotApplicable` satisfies the edge vacuously — it asserts the architecture has no
-    /// such component, which is not evidence that the trunk is eagerly materialized. Pinned so the
-    /// choice stays visible rather than accidental.
+    /// A backend can append its real implementation coupling without changing the shared graph.
     #[test]
-    fn a_structurally_inapplicable_rung_one_satisfies_the_edge_vacuously() {
-        let contract = with_support(
-            adopted_contract(),
-            MemoryStrategy::StagedResidency,
-            MemoryStrategySupport::StructurallyNotApplicable {
-                reason: "no separable conditioning component".to_owned(),
+    fn an_additive_backend_prerequisite_can_require_staged_residency() {
+        let mut contract = adopted_contract();
+        contract.additional_prerequisites.push((
+            MemoryStrategy::BoundedTransformerResidency,
+            MemoryStrategyPrerequisite::Rung {
+                rung: MemoryStrategy::StagedResidency,
+                scope: MemoryPrerequisiteScope::EngagedInSameRequest,
             },
-        );
+        ));
         contract
             .validate_selection(&MemorySelection {
                 strategy: MemoryStrategy::BoundedTransformerResidency,
@@ -2349,23 +2302,39 @@ mod tests {
                 },
                 tier: bf16(),
             })
-            .expect("a structurally inapplicable prerequisite is vacuous, not fatal");
+            .expect("the additive rung prerequisite engages staged residency");
+
+        let missing = with_support(
+            contract,
+            MemoryStrategy::StagedResidency,
+            MemoryStrategySupport::Missing,
+        );
+        let error = missing
+            .validate_selection(&MemorySelection {
+                strategy: MemoryStrategy::BoundedTransformerResidency,
+                parameters: MemoryStrategyParameters {
+                    decode_tile_edge: Some(512),
+                    decode_overlap: Some(64),
+                    attention_chunk_size: Some(256),
+                    transformer_window_size: Some(1),
+                    transformer_window_component: None,
+                },
+                tier: bf16(),
+            })
+            .expect_err("the backend-specific rung edge must be enforced")
+            .to_string();
+        assert!(error.contains("StagedResidency"), "{error}");
+        assert!(error.contains("ENGAGED IN THE SAME REQUEST"), "{error}");
     }
 
-    /// SC-15805: rung 1 is NOT part of the cost-order default, but rung 4's declared edge still
-    /// engages it.
+    /// SC-15998: rung 1 is neither part of the cost-order default nor rung 4's shared prerequisite.
     ///
     /// Rungs 2 and 3 bound scratch and are free, so a cumulative default costs the caller nothing.
     /// Rung 1 bounds residency and *"may evict the warm cross-request cache"* — a real cost paid by
     /// the next request. Dragging it into a rung-2 selection that never needed it is a straight loss.
     ///
-    /// The regression this guards is severe and non-obvious: `engages` is what SATISFIES rung 4's
-    /// prerequisite in `validate_selection`, so the naive fix — excluding rung 1 from `engages`
-    /// outright — makes rung 4 **permanently unselectable**. Rung 1 is therefore engaged when the
-    /// selection IS rung 1, or when the selection's `requires()` graph names it (derived from the
-    /// graph, not hardcoded to rung 4, so a future edge implies its own engagement).
     #[test]
-    fn rung_one_is_not_dragged_in_by_cost_order_but_the_rung_four_edge_still_engages_it() {
+    fn rung_four_keeps_phase_residency_warm_while_cost_order_still_engages_scratch_rungs() {
         // 1. The behavior chosen here: a free scratch rung does not drag in the costly residency one.
         assert!(
             !MemoryStrategy::BoundedDecode.engages(MemoryStrategy::StagedResidency),
@@ -2377,28 +2346,12 @@ mod tests {
         );
         assert!(!MemoryStrategy::Resident.engages(MemoryStrategy::StagedResidency));
 
-        // 2. THE REGRESSION GUARD. Rung 4 declares rung 1 as a prerequisite, so it engages it — and
-        //    `validate_selection` therefore still admits rung 4 on a provider that implements rung 1.
+        // THE REGRESSION GUARD: rung 4 alone does not evict the warm cross-request cache.
         assert!(
-            MemoryStrategy::BoundedTransformerResidency.engages(MemoryStrategy::StagedResidency),
-            "rung 4's declared prerequisite must keep engaging rung 1, or rung 4 becomes \
-             permanently unselectable"
+            !MemoryStrategy::BoundedTransformerResidency.engages(MemoryStrategy::StagedResidency)
         );
         assert!(MemoryStrategy::StagedResidency.engages(MemoryStrategy::StagedResidency));
-        // Engagement follows the DECLARED graph, so the two agree by construction rather than by a
-        // hardcoded `BoundedTransformerResidency` arm that could drift away from `requires()`.
-        for strategy in MemoryStrategy::ALL {
-            let declared = strategy
-                .requires()
-                .iter()
-                .any(|edge| edge.rung == MemoryStrategy::StagedResidency);
-            assert_eq!(
-                strategy.engages(MemoryStrategy::StagedResidency),
-                declared || strategy == MemoryStrategy::StagedResidency,
-                "{strategy:?}'s rung-1 engagement drifted from its declared prerequisite graph"
-            );
-        }
-        // End to end: rung 4 is still selectable on a provider implementing every rung.
+        // End to end: the independent deferred load shape keeps rung 4 selectable.
         adopted_contract()
             .validate_selection(&MemorySelection {
                 strategy: MemoryStrategy::BoundedTransformerResidency,
@@ -2411,9 +2364,9 @@ mod tests {
                 },
                 tier: bf16(),
             })
-            .expect("rung 4 must remain selectable after rung 1 left the cost-order default");
+            .expect("Deferred materialization satisfies rung 4 without engaging rung 1");
 
-        // 3. The AC's stated cost-order default is untouched: rung 4 still engages 2 and 3.
+        // The AC's stated cost-order default is untouched: rung 4 still engages 2 and 3.
         assert!(MemoryStrategy::BoundedTransformerResidency.engages(MemoryStrategy::BoundedDecode));
         assert!(
             MemoryStrategy::BoundedTransformerResidency.engages(MemoryStrategy::BoundedAttention)

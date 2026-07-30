@@ -387,8 +387,24 @@ fn krea_generation_memory(
 /// The rung-4 windows this provider will execute — the same list
 /// `krea_turbo_memory_strategy_contract` publishes as `transformer_window_sizes`.
 ///
-/// One entry, deliberately: SC-15791 measured per-step time FLAT in the window while peak is LINEAR
-/// on Candle, so a wider window is strictly worse. See
+/// One entry, deliberately. SC-16154 re-measured the post-SC-16096 sidecar path on CUDA with 12
+/// balanced interleaved samples per window (95.6 GiB RTX PRO 6000 Blackwell, device 0):
+///
+/// | window | median step | full min–max spread | paired mean delta vs 1 (95% CI) |
+/// |---:|---:|---:|---:|
+/// | 1 | 2.0423 s | 1.6311–2.3491 s | reference |
+/// | 2 | 2.0027 s | 1.6234–2.4844 s | +0.0416 s (-0.0984–+0.1817) |
+/// | 4 | 1.9914 s | 1.6957–2.4211 s | -0.0091 s (-0.1403–+0.1222) |
+/// | 8 | 1.8468 s | 1.7265–2.2018 s | -0.0651 s (-0.2120–+0.0818) |
+/// | 15 | 1.9286 s | 1.7662–2.4683 s | +0.0193 s (-0.1461–+0.1847) |
+/// | 30 | 2.0813 s | 1.7697–2.6964 s | +0.1911 s (+0.0298–+0.3524) |
+///
+/// Paired time is flat through window 15 (every interval includes zero) and increasing at window 30
+/// (+191 ms, interval excludes zero); the median-time fit is +2.0 ms/block. Even window 8's apparent
+/// -9.6% median is unresolved by its paired interval. Peak is linear at
+/// `107.9·window + 153.4 MiB`, so no wider window buys a demonstrated speedup while every one spends
+/// more VRAM. Rung 4 is selected only for a caller already short of VRAM; publish only the
+/// minimum-peak window. See
 /// [`crate::transformer::DEFAULT_TRANSFORMER_WINDOW`].
 ///
 /// NOT cfg-gated, unlike the contract that publishes it: `generate` re-validates the window on every
@@ -1219,10 +1235,11 @@ candle_gen::register_generators! {
 #[cfg(any(feature = "cuda", test))]
 fn build_krea_turbo_memory_strategy_contract() -> gen_core::MemoryProviderContract {
     use gen_core::{
-        MemoryBackendRealization, MemoryCalibrationIdentity, MemoryFormulaKind,
+        LoadShape, MemoryBackendRealization, MemoryCalibrationIdentity, MemoryFormulaKind,
         MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryParameterRanges, MemoryPhase,
-        MemoryProviderContract, MemoryRuntimeSemantics, MemoryStrategy, MemoryStrategyCapability,
-        MemoryStrategySupport, MemoryWindowMaterialization,
+        MemoryPrerequisiteScope, MemoryProviderContract, MemoryRuntimeSemantics, MemoryStrategy,
+        MemoryStrategyCapability, MemoryStrategyPrerequisite, MemoryStrategySupport,
+        MemoryWindowMaterialization,
     };
 
     MemoryProviderContract {
@@ -1266,6 +1283,17 @@ fn build_krea_turbo_memory_strategy_contract() -> gen_core::MemoryProviderContra
                 },
             })
             .collect(),
+        load_shape: LoadShape::DeferredMaterialization,
+        // Candle Krea's current streamed-block realization lives inside its three-stage loader.
+        // This additive edge records that backend coupling without making phase release a shared
+        // rung-4 prerequisite; MLX therefore remains free to use Resident+Deferred.
+        additional_prerequisites: vec![(
+            MemoryStrategy::BoundedTransformerResidency,
+            MemoryStrategyPrerequisite::Rung {
+                rung: MemoryStrategy::StagedResidency,
+                scope: MemoryPrerequisiteScope::EngagedInSameRequest,
+            },
+        )],
         lifecycle: MemoryLifecycleCapabilities {
             phases: vec![
                 MemoryPhase::Conditioning,
@@ -1480,6 +1508,18 @@ mod tests {
             tier,
         };
         let contract = krea_turbo_memory_strategy_contract();
+        assert!(
+            !gen_core::MemoryStrategy::BoundedTransformerResidency
+                .engages(gen_core::MemoryStrategy::StagedResidency),
+            "the shared rung-4 contract must not imply phase release"
+        );
+        assert!(
+            contract.engages(
+                gen_core::MemoryStrategy::BoundedTransformerResidency,
+                gen_core::MemoryStrategy::StagedResidency
+            ),
+            "Krea's additive backend prerequisite must preserve its current three-stage coupling"
+        );
 
         assert_eq!(
             krea_generation_memory(contract, selected(gen_core::MemoryStrategy::Resident)),
@@ -1596,6 +1636,11 @@ mod tests {
         assert!(
             !published.is_empty(),
             "an empty candidate list would make every window unsupported and rung 4 unselectable"
+        );
+        assert!(
+            SUPPORTED_TRANSFORMER_WINDOWS
+                .contains(&(crate::transformer::DEFAULT_TRANSFORMER_WINDOW as u32)),
+            "the shipped default must be one of the windows the contract publishes"
         );
     }
 

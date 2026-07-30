@@ -779,6 +779,7 @@ mod tests {
                 identity: None,
                 text_encoder: None,
                 offload_policy: Default::default(),
+                load_shape: Default::default(),
                 components: Default::default(),
             };
             let err = match crate::provider_registry().unwrap().load(id, &spec) {
@@ -806,6 +807,7 @@ mod tests {
             identity: None,
             text_encoder: None,
             offload_policy: Default::default(),
+            load_shape: Default::default(),
             components: Default::default(),
         };
         // A ControlNet overlay is rejected (not part of the Lens port) — the message names it, before
