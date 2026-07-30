@@ -172,7 +172,9 @@ xcrun devicectl device process launch \
 # from a jetsam kill in the output, and mistaking "still working" for "died" would send the next
 # hour after the wrong problem.
 POLL_TRIES=${POLL_TRIES:-60}
-[ -n "$CARGO_FEATURES" ] && POLL_TRIES=${POLL_TRIES_MEDIA:-200}
+# `if`, not `[ … ] && …`: under `set -e` a bare `test && assign` exits the script when the test is
+# false, which is the same trap as the unguarded `from_check` above.
+if [ -n "$CARGO_FEATURES" ]; then POLL_TRIES=${POLL_TRIES_MEDIA:-200}; fi
 
 say "waiting for the on-device report (up to $((POLL_TRIES * 3))s)"
 REPORT=/tmp/ios-smoke-report.txt
@@ -240,7 +242,10 @@ THRESHOLD_FAILED=0
 # carries "MLX peak ... MiB" and "process RSS peak ... MiB", so a bare `grep 'peak [0-9]* MiB' |
 # tail -1` began reading SANA's number under the LLM's threshold. Anchor to the check name.
 from_check() { # <check-name-fragment> <grep-pattern> <extract-pattern>
-  grep -- "$1" "$REPORT" | grep -o -- "$2" | grep -o -- "$3" | tail -1
+  # The trailing `|| true` is load-bearing under `set -e`. A skipped check (no snapshot pushed yet)
+  # matches nothing, grep exits 1, and `var=$(...)` takes that as the assignment's status — which
+  # killed the script AFTER it had printed "SMOKE: PASS", giving a green report and a red exit code.
+  grep -- "$1" "$REPORT" 2>/dev/null | grep -o -- "$2" | grep -o -- "$3" | tail -1 || true
 }
 
 # Steady-state throughput. Sustained decode's LAST segment is the honest figure: the first is
@@ -284,8 +289,8 @@ THRESHOLD_MAX_IMAGE_PEAK_MIB=${THRESHOLD_MAX_IMAGE_PEAK_MIB:-5120}
 # line carries one value, but the image check reports several (512 untiled, 1024 tiled) on one line
 # and the ceiling must be read against the worst of them — which is 512 untiled at 4773 MiB, while
 # the last is 1024 tiled at 3294. Taking the last would hide a regression in every earlier config.
-img_peak=$(grep -- 'SANA image generation' "$REPORT" \
-  | grep -o -- 'MLX peak [0-9]* MiB' | grep -o -- '[0-9]*' | sort -n | tail -1)
+img_peak=$(grep -- 'SANA image generation' "$REPORT" 2>/dev/null \
+  | grep -o -- 'MLX peak [0-9]* MiB' | grep -o -- '[0-9]*' | sort -n | tail -1 || true)
 if [ -n "$img_peak" ] && [ "$img_peak" -gt "$THRESHOLD_MAX_IMAGE_PEAK_MIB" ]; then
   fail_threshold "SANA MLX peak ${img_peak} MiB exceeds ${THRESHOLD_MAX_IMAGE_PEAK_MIB} MiB"
 elif [ -n "$img_peak" ]; then
