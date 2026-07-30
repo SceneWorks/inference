@@ -16,10 +16,11 @@
 //! conditioned surfaces (mirrors [`crate::control_train`]'s trainer and the FLUX.2 control provider).
 //! Krea 2 Turbo is CFG-free + distilled few-step: a single guidance-inert forward per step, no
 //! negative pass. The base DiT keeps a packed q4/q8 tier packed in VRAM (dequant-on-forward, sc-11727)
-//! and the control-branch overlay quantizes to a matching q4/q8 packed footprint on request
-//! (`branch_quant`, sc-11743) — the small-card path — while the studio-trained overlay is published
-//! bf16. `generate` takes `&self` so one load serves many poses; the residual clamp is a fixed recipe
-//! constant set at load, not a knob.
+//! and the control-branch overlay is packed to the tier the base tier implies (`branch_tier`, sc-11743
+//! mechanism / sc-15799 policy) — the studio-trained overlay is published bf16, so a packed base always
+//! repacks it at load rather than carrying precision the tier choice did not ask for. `generate` takes
+//! `&self` so one load serves many poses; the residual clamp is a fixed recipe constant set at load, not
+//! a knob.
 
 use std::path::{Path, PathBuf};
 
@@ -67,13 +68,22 @@ pub struct Krea2ControlPaths {
     /// style adapter reshapes the generated subject while the control branch keeps the pose lock. The
     /// control branch is never adapted. Empty ⇒ the stock control build.
     pub adapters: Vec<AdapterSpec>,
-    /// Quantize the control-branch overlay to q4/q8 and keep it packed in VRAM (dequant-on-forward,
-    /// sc-11743). **`None` (bf16) is the default and the norm** — branch quant is a *quality cost* (the
-    /// residual is precision-sensitive, RMS-clamped at τ), so it is the **last-resort rung** on the Krea
-    /// control VRAM fit ladder (sc-11754): the worker's fit-gate engages it only when the predicted peak
-    /// still exceeds free VRAM after the cheaper rungs (VAE-decode tiling, activation chunking). It is
-    /// **not** auto-mirrored to the base tier — a q4 base on a card with headroom keeps a bf16 branch.
-    pub branch_quant: Option<Quant>,
+    /// The tier the control-branch overlay is packed to and held at in VRAM (dequant-on-forward,
+    /// sc-11743 mechanism; sc-15799 policy).
+    ///
+    /// **Not a memory lever, and not the caller's free choice.** It MUST be
+    /// [`gen_core::tier_integrity::control_branch_tier`](candle_gen::gen_core::tier_integrity::control_branch_tier)
+    /// of the base tier `root` resolves to: a q8 base carries a q8 branch, a q4 base carries a q8 branch
+    /// (the declared, measured floor — a q4 control residual measures "pose-locked; non-pose details
+    /// drift"), and a dense base carries a dense branch. `None` therefore means *the base is dense*, not
+    /// "the default".
+    ///
+    /// It was previously the last-resort rung of the worker's control fit ladder, which left a bf16
+    /// branch resident on every card with headroom — ~8.4 GiB of precision a q8 render never asked for.
+    /// This provider cannot derive the value itself (it is never told a tier name; the base tier is
+    /// implied by `root` and auto-detected from the packed weights), so the worker owns the derivation
+    /// and this field is how it is delivered.
+    pub branch_tier: Option<Quant>,
     /// Engage sc-6217-style **query-row attention chunking** on the composable base stack + the control
     /// branch (sc-11745) — the fit-ladder rung **between** VAE-decode tiling (sc-11744) and branch-quant
     /// (sc-11743). `false` (the default and the norm) runs each single-stream block's joint `[ctx; img]`
@@ -179,7 +189,7 @@ impl Krea2Control {
         let heavy_root = paths.root.clone();
         let heavy_control = paths.control.clone();
         let heavy_adapters = paths.adapters.clone();
-        let heavy_branch_quant = paths.branch_quant;
+        let heavy_branch_tier = paths.branch_tier;
         let heavy_chunk_attention = paths.chunk_attention;
         let heavy_device = device.clone();
         let residency = candle_gen::Residency::from_policy(
@@ -190,7 +200,7 @@ impl Krea2Control {
                     &heavy_root,
                     &heavy_control,
                     &heavy_adapters,
-                    heavy_branch_quant,
+                    heavy_branch_tier,
                     heavy_chunk_attention,
                     &heavy_device,
                 )
@@ -236,7 +246,7 @@ fn load_control_heavy(
     root: &Path,
     control: &Path,
     adapters: &[AdapterSpec],
-    branch_quant: Option<Quant>,
+    branch_tier: Option<Quant>,
     chunk_attention: bool,
     device: &Device,
 ) -> Result<Krea2ControlHeavy> {
@@ -252,7 +262,7 @@ fn load_control_heavy(
         crate::adapters::install_additive(&mut dit, adapters, diff.merged)?;
     }
 
-    let mut branch = match branch_quant {
+    let mut branch = match branch_tier {
         Some(quant) => ControlBranch::from_checkpoint_quantized(control, &cfg, device, quant)?,
         None => ControlBranch::from_checkpoint(control, &cfg, device)?,
     };
@@ -420,7 +430,7 @@ mod tests {
             root: PathBuf::from("/nonexistent/krea-control-residency-test-snapshot"),
             control: PathBuf::from("/nonexistent/krea-control-residency-test-overlay.safetensors"),
             adapters: Vec::new(),
-            branch_quant: None,
+            branch_tier: None,
             chunk_attention: false,
             offload_policy,
         }
@@ -542,7 +552,7 @@ mod tests {
             .ok()
             .and_then(|value| value.trim().parse().ok())
             .unwrap_or(TURBO_STEPS);
-        let branch_quant = match std::env::var("KREA_CONTROL_BRANCH_QUANT")
+        let branch_tier = match std::env::var("KREA_CONTROL_BRANCH_QUANT")
             .unwrap_or_default()
             .trim()
             .to_ascii_lowercase()
@@ -571,7 +581,7 @@ mod tests {
             root,
             control,
             adapters: Vec::new(),
-            branch_quant,
+            branch_tier,
             chunk_attention: false,
             offload_policy,
         };
@@ -606,7 +616,7 @@ mod tests {
             "resident"
         };
         eprintln!(
-            "SEQ_AB id=krea_2_turbo_control mode={mode} gpu={} {}x{} steps={} branch_quant={branch_quant:?} | {report} | bytes={} out={out}",
+            "SEQ_AB id=krea_2_turbo_control mode={mode} gpu={} {}x{} steps={} branch_tier={branch_tier:?} | {report} | bytes={} out={out}",
             candle_gen::testkit::probe_gpu(),
             image.width,
             image.height,

@@ -23,11 +23,23 @@
 //! 2. [`Lever::VaeDecodeTiling`] — split the VAE decode into tiles so its spike drops toward the
 //!    un-tileable floor (resident VAE + output buffers). Reduces the **decode** peak only; the actual
 //!    tile is then sized by [`crate::tiling::budgeted_plan`].
-//! 3. [`Lever::BranchQuant`] — pack the control branch to the base tier at **load time** (it cannot be
-//!    re-packed mid-render). Reduces the **denoise** peak only.
-//! 4. [`Lever::ResolutionReduction`] — the last resort, because it is the only lever that costs image
-//!    quality. Re-estimates *both* peaks at a smaller resolution scale, engaged only when levers 1–3 at
+//! 3. [`Lever::ResolutionReduction`] — the last resort, because it is the only lever that costs image
+//!    quality. Re-estimates *both* peaks at a smaller resolution scale, engaged only when levers 1–2 at
 //!    full resolution still don't fit.
+//!
+//! ## What is NOT a lever here: the control branch's quant tier (sc-15799)
+//!
+//! A third lever used to sit between decode tiling and resolution reduction: `BranchQuant`, "pack the
+//! control branch **to the base quant tier** at load time". That is not a lever, it is
+//! [tier integrity](crate::tier_integrity) — *no component is resident above the user's selected tier
+//! unless a declared, measured exception says otherwise* — implemented as an escalation step. Its q8
+//! setting is measured near-lossless and saves 8.4 GiB, so there was never a quality argument for
+//! defaulting to a bf16 branch when the user asked for q8; and because it sat LAST, a constrained
+//! machine engaged residency and decode tiling first, clawing back single-digit GiB while 8.4 GiB of
+//! unrequested precision sat in the branch the whole time. The branch's tier is now decided by
+//! [`crate::tier_integrity::control_branch_tier`] from the base tier alone, so the peaks a lane
+//! reports to this policy already have the branch at its correct tier and there is nothing left to
+//! escalate.
 
 use crate::runtime::OffloadPolicy;
 
@@ -40,10 +52,12 @@ pub enum Lever {
     SequentialResidency = 0,
     /// Tile the VAE decode so its spike drops toward the resident-VAE + output-buffer floor.
     VaeDecodeTiling = 1,
-    /// Pack the control branch to the base quant tier at load time.
-    BranchQuant = 2,
     /// Reduce the render resolution (the only quality-costing lever) — last resort.
-    ResolutionReduction = 3,
+    ///
+    /// Discriminant `2`, not `3`: the old `BranchQuant = 2` is deleted (sc-15799 — see the module
+    /// docs). The values only encode the cost ORDER, so closing the gap keeps "ascending discriminant
+    /// == ascending cost" true with no hole a reader has to explain.
+    ResolutionReduction = 2,
 }
 
 /// The stage peaks of one generation at a given resolution scale, in GiB — all shape-derived estimates
@@ -66,9 +80,9 @@ pub struct StagePeaks {
 }
 
 /// Which levers a lane offers the policy, and how much each saves. A lever the lane cannot apply is
-/// signalled by its "unavailable" sentinel (`text_resident_gib == 0` / `!supports_sequential`,
-/// `branch_quant_saves_gib == 0`, an empty `resolution_scales`, or a `None`
-/// [`StagePeaks::decode_tiled_floor_ex_text_gib`]); the policy simply skips it.
+/// signalled by its "unavailable" sentinel (`text_resident_gib == 0` / `!supports_sequential`, an
+/// empty `resolution_scales`, or a `None` [`StagePeaks::decode_tiled_floor_ex_text_gib`]); the policy
+/// simply skips it.
 #[derive(Clone, Copy, Debug)]
 pub struct LaneLevers<'a> {
     /// The phase-A text/vision encoder's resident footprint (GiB) — the amount
@@ -79,11 +93,6 @@ pub struct LaneLevers<'a> {
     /// treats `Sequential` as `Resident`, so the lever would be inert). `false` ⇒ residency unavailable
     /// even if `text_resident_gib > 0`.
     pub supports_sequential: bool,
-    /// GiB [`Lever::BranchQuant`] removes from the peaks by packing the resident control branch bf16 →
-    /// base tier. The branch is resident through **both** stages (it injects during denoise, sits
-    /// allocated during decode), so this is subtracted from both the denoise and decode peaks — the
-    /// tiled decode floor included. `0.0` ⇒ no separable branch to pack (or it is already packed).
-    pub branch_quant_saves_gib: f64,
     /// Candidate resolution scales in `(0, 1)`, **largest first** (e.g. `[0.75, 0.5]`), tried only as
     /// the last resort. Empty ⇒ the lane will not reduce resolution. The policy re-estimates the stage
     /// peaks at each via the `peaks_at` closure.
@@ -108,8 +117,6 @@ pub struct MemoryPlan {
     /// actual tile with [`crate::tiling::budgeted_plan`] against `safe_gib`; when `false` it runs the
     /// single-pass decode.
     pub tile_decode: bool,
-    /// Whether to pack the control branch to the base tier at load ([`Lever::BranchQuant`]).
-    pub quantize_branch: bool,
     /// The resolution scale to render at — `1.0` unless [`Lever::ResolutionReduction`] engaged, then
     /// the largest candidate scale that fits.
     pub resolution_scale: f64,
@@ -118,7 +125,7 @@ pub struct MemoryPlan {
     /// `budgeted_plan` then picks the largest tile whose real peak stays ≤ `safe_gib`.
     pub projected_peak_gib: f64,
     /// The levers that engaged, in ascending cost order. Empty ⇒ the fast path (nothing engaged): full
-    /// res, `Resident`, bf16 branch, single-pass decode — the large-memory-machine case.
+    /// res, `Resident`, single-pass decode — the large-memory-machine case.
     pub engaged: Vec<Lever>,
     /// Whether the render fits the budget with the chosen settings. `false` ⇒ even the smallest scale
     /// with every lever engaged still peaks over `safe_gib`; the caller surfaces a catchable error
@@ -127,12 +134,11 @@ pub struct MemoryPlan {
 }
 
 impl MemoryPlan {
-    /// The zero-overhead plan: nothing engaged (full res, `Resident`, bf16 branch, single-pass decode).
+    /// The zero-overhead plan: nothing engaged (full res, `Resident`, single-pass decode).
     fn none(projected_peak_gib: f64) -> Self {
         Self {
             residency: OffloadPolicy::Resident,
             tile_decode: false,
-            quantize_branch: false,
             resolution_scale: 1.0,
             projected_peak_gib,
             engaged: Vec::new(),
@@ -141,7 +147,7 @@ impl MemoryPlan {
     }
 }
 
-/// The outcome of engaging levers 1–3 at one resolution scale: the resulting stage peaks and which
+/// The outcome of engaging levers 1–2 at one resolution scale: the resulting stage peaks and which
 /// levers were needed. Internal to the escalation.
 struct Attempt {
     denoise: f64,
@@ -158,9 +164,9 @@ impl Attempt {
     }
 }
 
-/// Engage the cost-ordered levers 1–3 (residency → decode tiling → branch quant) at a fixed resolution
-/// scale, each **only** when the peak it targets is over budget, and report the resulting peaks. This is
-/// the "lightest sufficient setting" core: a lever that isn't needed (or isn't available) is skipped.
+/// Engage the cost-ordered levers 1–2 (residency → decode tiling) at a fixed resolution scale, each
+/// **only** when the peak it targets is over budget, and report the resulting peaks. This is the
+/// "lightest sufficient setting" core: a lever that isn't needed (or isn't available) is skipped.
 fn engage_levers_at(peaks: StagePeaks, levers: &LaneLevers<'_>, safe_gib: f64) -> Attempt {
     let text = levers.text_resident_gib;
     let mut engaged = Vec::new();
@@ -190,19 +196,6 @@ fn engage_levers_at(peaks: StagePeaks, levers: &LaneLevers<'_>, safe_gib: f64) -
         }
     }
 
-    // Lever 3 — branch quant: pack the branch to the base tier at load. The branch is a **resident
-    // weight**, held through both the denoise (where it injects) and the decode (where it sits idle but
-    // still allocated) stages, so packing it lowers BOTH peaks — including the tiled decode floor, which
-    // carries the resident branch. Its primary trigger is the denoise steady state (sc-11750), but it
-    // also engages when the post-tiling decode is still over budget (tiling shrank the spike but the
-    // resident weights are still too heavy). Cost-ordered after tiling: a spike big enough to tile is
-    // handled by the free-quality tiling lever first.
-    if (denoise > safe_gib || decode > safe_gib) && levers.branch_quant_saves_gib > 0.0 {
-        denoise = (denoise - levers.branch_quant_saves_gib).max(0.0);
-        decode = (decode - levers.branch_quant_saves_gib).max(0.0);
-        engaged.push(Lever::BranchQuant);
-    }
-
     Attempt {
         denoise,
         decode,
@@ -217,7 +210,6 @@ fn plan_from_attempt(attempt: Attempt, scale: f64, feasible: bool) -> MemoryPlan
     let mut engaged = attempt.engaged;
     let sequential = engaged.contains(&Lever::SequentialResidency);
     let tile_decode = engaged.contains(&Lever::VaeDecodeTiling);
-    let quantize_branch = engaged.contains(&Lever::BranchQuant);
     if scale < 1.0 {
         engaged.push(Lever::ResolutionReduction);
     }
@@ -228,7 +220,6 @@ fn plan_from_attempt(attempt: Attempt, scale: f64, feasible: bool) -> MemoryPlan
             OffloadPolicy::Resident
         },
         tile_decode,
-        quantize_branch,
         resolution_scale: scale,
         projected_peak_gib,
         engaged,
@@ -244,10 +235,10 @@ fn plan_from_attempt(attempt: Attempt, scale: f64, feasible: bool) -> MemoryPlan
 /// The escalation:
 ///   1. **Fast path** — if full resolution fits `Resident` with no levers (the large-memory machine),
 ///      return [`MemoryPlan`] with `engaged` empty: zero overhead, full quality.
-///   2. Otherwise engage levers 1–3 (residency → decode tiling → branch quant) at **full resolution**,
-///      each only when the peak it targets is over budget. If that fits, done — no quality cost.
+///   2. Otherwise engage levers 1–2 (residency → decode tiling) at **full resolution**, each only when
+///      the peak it targets is over budget. If that fits, done — no quality cost.
 ///   3. Only if full-res-with-all-levers still doesn't fit, try each `resolution_scales` candidate
-///      (largest first), re-engaging levers 1–3 at that scale, and take the first that fits.
+///      (largest first), re-engaging levers 1–2 at that scale, and take the first that fits.
 ///   4. If nothing fits even at the smallest scale, return the smallest-scale attempt with
 ///      `feasible = false` so the caller errors *before* the render (with `projected_peak_gib`).
 ///
@@ -269,7 +260,7 @@ pub fn plan_memory_adaptation(
         return MemoryPlan::none(resident_denoise.max(resident_decode));
     }
 
-    // Escalate. Try full resolution with levers 1–3 first (no quality cost), then each smaller scale.
+    // Escalate. Try full resolution with levers 1–2 first (no quality cost), then each smaller scale.
     // `1.0` leads so a fit there never reduces resolution; the smaller scales are the last resort.
     let full_attempt = engage_levers_at(full, &levers, safe_gib);
     if full_attempt.fits(safe_gib) {
@@ -323,7 +314,9 @@ mod tests {
     }
 
     // A Krea-control-shaped model (candle #480 ballpark, ex-text): denoise ≈ base+branch (~9) + ~11
-    // activations = ~20; decode ≈ VAE (~1) + ~30 spike = ~31; tiled floor ≈ VAE + ~4 = ~5. Text ~8.
+    // activations = ~20; decode ≈ VAE (~1) + ~30 spike = ~31; tiled floor ≈ VAE + ~4 = ~5. Text ~8. The
+    // branch inside `dn_weight` is already at its tier-integrity tier (sc-15799) — this policy no longer
+    // repacks it, so the resident weight term is fixed for the whole escalation.
     fn krea_model() -> Model {
         Model {
             dn_weight: 9.0,
@@ -341,9 +334,17 @@ mod tests {
         LaneLevers {
             text_resident_gib: 8.0,
             supports_sequential: true,
-            branch_quant_saves_gib: 4.6, // bf16 branch ~6.6 → q4 ~2
             resolution_scales: &SCALES,
         }
+    }
+
+    /// The cost order is encoded in the discriminants, so `Ord` must agree with it. Guards the sc-15799
+    /// renumber (deleting `BranchQuant = 2` closed the gap) against a later reorder that would silently
+    /// let an expensive lever sort ahead of a cheap one.
+    #[test]
+    fn lever_order_is_cheapest_first() {
+        assert!(Lever::SequentialResidency < Lever::VaeDecodeTiling);
+        assert!(Lever::VaeDecodeTiling < Lever::ResolutionReduction);
     }
 
     /// Large-memory machine (128 GB → ~100 GiB safe): NOTHING engages. The fast-path regression guard.
@@ -354,12 +355,11 @@ mod tests {
         assert!(plan.engaged.is_empty(), "no lever should engage: {plan:?}");
         assert_eq!(plan.residency, OffloadPolicy::Resident);
         assert!(!plan.tile_decode);
-        assert!(!plan.quantize_branch);
         assert_eq!(plan.resolution_scale, 1.0);
         assert!(plan.feasible);
     }
 
-    /// The engaged levers always come out in ascending cost order (never quant before residency, etc.).
+    /// The engaged levers always come out in ascending cost order (never resolution before tiling).
     #[test]
     fn engaged_levers_are_cost_ordered() {
         let m = krea_model();
@@ -374,7 +374,7 @@ mod tests {
     }
 
     /// A budget just under the resident peak but above the Sequential peak: residency ALONE fixes it —
-    /// the cheapest lever, and no tiling/quant/res engaged.
+    /// the cheapest lever, and no tiling/res engaged.
     #[test]
     fn residency_alone_when_it_suffices() {
         let m = krea_model();
@@ -383,56 +383,41 @@ mod tests {
         let plan = plan_memory_adaptation(32.0, krea_levers(), |s| m.peaks_at(s));
         assert_eq!(plan.engaged, vec![Lever::SequentialResidency], "{plan:?}");
         assert_eq!(plan.residency, OffloadPolicy::Sequential);
-        assert!(!plan.tile_decode && !plan.quantize_branch);
+        assert!(!plan.tile_decode);
         assert_eq!(plan.resolution_scale, 1.0);
         assert!(plan.feasible && plan.projected_peak_gib <= 32.0);
     }
 
-    /// Decode over budget but denoise fine after residency: tiling engages, quant does NOT (denoise
-    /// already fits). Proves each lever targets its own peak.
+    /// Decode over budget but denoise fine after residency: tiling engages and resolution does NOT
+    /// (denoise already fits). Proves each lever targets its own peak — and, post-sc-15799, that an
+    /// over-budget decode never reaches for the quality-costing rung while tiling is sufficient.
     #[test]
-    fn tiles_decode_without_quantizing_when_denoise_fits() {
+    fn tiles_decode_without_reducing_resolution_when_denoise_fits() {
         let m = krea_model();
         // Sequential: denoise=20, decode=31, tiled floor=5. Budget 22: denoise(20)≤22 fits, decode(31)
-        // >22 → tile to floor(5). Quant should NOT engage (denoise already ≤22).
+        // >22 → tile to floor(5). Resolution should NOT engage (denoise already ≤22).
         let plan = plan_memory_adaptation(22.0, krea_levers(), |s| m.peaks_at(s));
         assert!(plan.tile_decode, "decode must tile: {plan:?}");
-        assert!(
-            !plan.quantize_branch,
-            "branch quant must NOT engage when denoise already fits: {plan:?}"
-        );
         assert_eq!(
             plan.engaged,
             vec![Lever::SequentialResidency, Lever::VaeDecodeTiling]
         );
-        assert!(plan.feasible);
-    }
-
-    /// A budget that forces residency + tiling + quant but NOT resolution (they fit at full res).
-    #[test]
-    fn quantizes_branch_before_touching_resolution() {
-        let m = krea_model();
-        // Sequential denoise=20, decode→floor 5. Budget 16: denoise(20)>16 → quant → 20-4.6=15.4≤16.
-        // decode floor(5)≤16. Fits at full res, so NO resolution reduction.
-        let plan = plan_memory_adaptation(16.0, krea_levers(), |s| m.peaks_at(s));
-        assert!(plan.quantize_branch, "branch must quantize: {plan:?}");
         assert_eq!(
             plan.resolution_scale, 1.0,
-            "must not reduce res yet: {plan:?}"
+            "tiling sufficed; resolution must not engage: {plan:?}"
         );
-        assert!(!plan.engaged.contains(&Lever::ResolutionReduction));
         assert!(plan.feasible);
     }
 
-    /// A budget that levers 1–3 can't reach at full res, but a smaller resolution can: resolution is the
-    /// LAST resort and only then engages.
+    /// A budget that levers 1–2 can't reach at full res, but a smaller resolution can: resolution is the
+    /// LAST resort, engages only then, and stops at the LARGEST sufficient scale.
     #[test]
     fn resolution_is_last_resort() {
         let m = krea_model();
-        // Full-res Sequential+quant denoise = 20-4.6 = 15.4; decode floor 5. Budget 13: denoise 15.4>13
-        // even quantized at full res → must drop resolution. At 0.75²: dn_act 11·0.5625=6.19 → denoise
-        // ex-text 9+6.19=15.19, -4.6 quant = 10.59 ≤13; decode floor 1+4·0.5625=3.25 ≤13. Fits at 0.75.
-        let plan = plan_memory_adaptation(13.0, krea_levers(), |s| m.peaks_at(s));
+        // Full-res Sequential denoise = 20 (un-tileable); decode floor 5. Budget 16: denoise 20>16 at
+        // full res → must drop resolution. At 0.75²: dn_act 11·0.5625=6.19 → denoise 9+6.19=15.19 ≤16;
+        // decode floor 1+4·0.5625=3.25 ≤16. Fits at 0.75, so it stops there.
+        let plan = plan_memory_adaptation(16.0, krea_levers(), |s| m.peaks_at(s));
         assert!(
             plan.engaged.contains(&Lever::ResolutionReduction),
             "resolution must engage: {plan:?}"
@@ -443,17 +428,17 @@ mod tests {
         );
         assert!(plan.feasible);
         // Everything cheaper than resolution was already spent.
-        assert!(plan.residency == OffloadPolicy::Sequential && plan.quantize_branch);
+        assert!(plan.residency == OffloadPolicy::Sequential && plan.tile_decode);
     }
 
-    /// The smallest sufficient scale is chosen: a budget that 0.75 can't reach but 0.5 can lands on 0.5,
-    /// not smaller — and never skips 0.75 if 0.75 would have worked.
+    /// The largest sufficient scale is chosen: a budget 0.75 can't reach but 0.5 can lands on 0.5, and
+    /// never skips 0.75 when 0.75 would have worked (the case above).
     #[test]
     fn picks_largest_sufficient_resolution() {
         let m = krea_model();
-        // Choose a budget where 0.75 fails but 0.5 works. At 0.5²=0.25: denoise 9+11·0.25=11.75, quant
-        // →7.15; decode floor 1+4·0.25=2. Budget 8: 0.5 denoise 7.15≤8 ✓. 0.75 denoise 10.59>8 ✗.
-        let plan = plan_memory_adaptation(8.0, krea_levers(), |s| m.peaks_at(s));
+        // At 0.75²: denoise 15.19. At 0.5²=0.25: denoise 9+11·0.25=11.75; decode floor 1+4·0.25=2.
+        // Budget 12: 0.75 denoise 15.19>12 ✗; 0.5 denoise 11.75≤12 ✓.
+        let plan = plan_memory_adaptation(12.0, krea_levers(), |s| m.peaks_at(s));
         assert_eq!(plan.resolution_scale, 0.5, "{plan:?}");
         assert!(plan.feasible);
     }
@@ -469,9 +454,9 @@ mod tests {
         assert!(plan.projected_peak_gib > 1.5);
     }
 
-    /// A lane with NO levers available (a plain lane: no text phase, no branch, no tiling, no res
-    /// candidates) either fits at full res with nothing, or reports infeasible — it never fabricates a
-    /// lever it doesn't have.
+    /// A lane with NO levers available (a plain lane: no text phase, no tiling, no res candidates)
+    /// either fits at full res with nothing, or reports infeasible — it never fabricates a lever it
+    /// doesn't have.
     #[test]
     fn lane_without_levers_never_fabricates_one() {
         let peaks = StagePeaks {
@@ -482,13 +467,12 @@ mod tests {
         let bare = LaneLevers {
             text_resident_gib: 0.0,
             supports_sequential: false,
-            branch_quant_saves_gib: 0.0,
             resolution_scales: &[],
         };
         // Fits: nothing engaged.
         let ok = plan_memory_adaptation(25.0, bare, |_| peaks);
         assert!(ok.engaged.is_empty() && ok.feasible);
-        // Over budget with no lever to pull: infeasible, not a phantom tiling/quant.
+        // Over budget with no lever to pull: infeasible, not a phantom tiling/resolution change.
         let no = plan_memory_adaptation(15.0, bare, |_| peaks);
         assert!(!no.feasible, "{no:?}");
         assert!(no.engaged.is_empty(), "no lever exists to engage: {no:?}");

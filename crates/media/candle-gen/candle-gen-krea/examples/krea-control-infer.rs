@@ -53,7 +53,7 @@ struct Args {
     /// Quantize the control-branch overlay (sc-11743): `q4` / `q8` keep it packed in VRAM
     /// (dequant-on-forward), `bf16` (default) is the full-precision branch — the A/B for the branch-quant
     /// pose-lock delta on a fixed base tier.
-    branch_quant: Option<Quant>,
+    branch_tier: Option<Quant>,
 }
 
 fn parse_args() -> Args {
@@ -68,7 +68,7 @@ fn parse_args() -> Args {
         size: 1024,
         out: PathBuf::from("krea_control_render.png"),
         residual_clamp: candle_gen_krea::control::DEFAULT_RESIDUAL_CLAMP,
-        branch_quant: None,
+        branch_tier: None,
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -91,7 +91,7 @@ fn parse_args() -> Args {
             "--out" => a.out = val().into(),
             "--residual-clamp" => a.residual_clamp = val().parse().expect("--residual-clamp"),
             "--branch-quant" => {
-                a.branch_quant = match val().as_str() {
+                a.branch_tier = match val().as_str() {
                     "q4" | "Q4" => Some(Quant::Q4),
                     "q8" | "Q8" => Some(Quant::Q8),
                     "bf16" | "none" => None,
@@ -147,7 +147,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (Some(p), true) => {
             // Small-card load (sc-11743): quantize each branch matmul leaf to a packed q4/q8 QLinear
             // (dequant-on-forward) so the ~6.6 GB dense branch never lands in VRAM; otherwise bf16.
-            let mut b = match a.branch_quant {
+            let mut b = match a.branch_tier {
                 Some(q) => ControlBranch::from_checkpoint_quantized(p, &cfg, &device, q)?,
                 None => ControlBranch::from_checkpoint(p, &cfg, &device)?,
             };
@@ -157,11 +157,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             b.set_residual_clamp(clamp);
             eprintln!("residual clamp tau: {clamp:?}");
             eprintln!(
-                "branch: {} blocks, {:.2}B params, control_scale {}, branch_quant {:?}",
+                "branch: {} blocks, {:.2}B params, control_scale {}, branch_tier {:?}",
                 b.num_blocks(),
                 b.num_params() as f64 / 1e9,
                 a.scale,
-                a.branch_quant,
+                a.branch_tier,
             );
             Some(b)
         }

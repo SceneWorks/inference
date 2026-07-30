@@ -34,6 +34,7 @@ pub mod runtime;
 pub mod sampling;
 pub mod sdxl_ldm;
 pub mod text_embed;
+pub mod tier_integrity;
 pub mod tiling;
 pub mod tokenizer;
 pub mod train;
@@ -96,6 +97,7 @@ pub use runtime::{
     MoeExpert, OffloadPolicy, PidWeights, Precision, Progress, Quant, WeightsSource,
 };
 pub use text_embed::{TextEmbedder, TextEmbedderDescriptor};
+pub use tier_integrity::{control_branch_tier, is_above_selected_tier};
 pub use tiling::{TilingConfig, VaeTiling};
 pub use voice_embed::{VoiceEmbedder, VoiceEmbedderDescriptor, VoiceEmbedding};
 pub use weightsmeta::{safetensors_dir_bytes, safetensors_path_bytes};
