@@ -164,6 +164,28 @@ Read carefully, because two of those numbers are easy to misread:
 Correctness is greedy with a fixed seed and asserts the answer contains "Paris", so a wrong result
 means wrong kernels rather than unlucky sampling.
 
+**Full conformance now passes on device**, so "conformant on iOS" means exactly what it means on
+every other platform:
+
+```
+[ok] core-llm conformance suite -- all always-on checks passed in 6.6s
+```
+
+**Getting there exposed a real testkit bug, fixed rather than worked around.**
+`check_seed_determinism` failed with *"a different seed produced identical output — the provider
+appears to ignore the seed"*. It reproduced **identically on macOS**, so it was never an iOS
+problem — and the provider was innocent. `TextLlmProfile::cheap()` prompted with `"Hello"`, which
+a well-tuned instruct model answers with a near-deterministic canned reply: verified on
+Qwen3-4B-Instruct, four different seeds all produced *"Hello! How can I assist you today? 😊"*,
+while an open-ended prompt produced four distinct outputs. The fixture had too little entropy to
+sample from, so a correct sampler looked broken.
+
+Two existing tests (`mlx-llm/tests/conformance.rs`, `candle-llm/tests/qwen35.rs`) already carried
+hand-tuned profiles working around exactly this, with comments describing the same false positive
+— so the flaw was known per-test but never fixed at the source. `cheap()` now uses an open-ended
+prompt, and the check's error message names the fixture as a candidate cause so the next person
+gets a diagnosis instead of a mystery.
+
 **What remains is plumbing, not risk:** getting weights into the app container (S3.4), hosting
 `mlx-llm-server` instead of the smoke test (S3.1), running the real conformance suite (S3.5), and
 the runner (S3.6/S3.7).
@@ -216,7 +238,7 @@ Two halves, both fixed:
 
 Verified: source and prepared snapshot now both report `tools=true`, with three regression tests
 in `core-llm` (sidecar read, inline precedence, error when neither exists).
-| S3.5 XCTest target running `textllm_conformance` | All eight always-on checks, on device. **Generation itself is already proven** (below); this is about running the full conformance suite rather than a bespoke check. |
+| S3.5 `textllm_conformance` on device | **DONE** — the identical `core_llm_testkit` suite the macOS lane runs, all always-on checks green in 6.6 s on an iPhone 17 Pro Max. Runs inside `catch_unwind` (the suite signals failure by panicking, which must not cross FFI) so a failure becomes a report line. |
 | S3.6 Self-hosted runner + tethered device | Register the dev machine (macOS 26.5.2 / Xcode 26.6 qualifies); dedicate one iPhone 17 Pro. Tier 2 (simulator) nightly, Tier 3 (device) pre-release. |
 | S3.7 Runner heartbeat | A sleeping runner must fail loudly, not report green-by-absence. |
 

@@ -61,13 +61,24 @@ say "signing team $DEVELOPMENT_TEAM"
 # --- rust staticlib ---------------------------------------------------------------------------
 # No IPHONEOS_DEPLOYMENT_TARGET here on purpose: .cargo/config.toml pins it, and this script is
 # also a check that a clean invocation needs no environment help.
-say "building ios-smoke for aarch64-apple-ios ($PROFILE)"
-( cd ios-host/smoke && cargo build --target aarch64-apple-ios $CARGO_PROFILE_FLAG )
-
 # ios-host/smoke is excluded from the workspace, so it has its OWN target directory rather than
 # the root one. The metallib it builds lives there too.
 SMOKE_TARGET="$ROOT/ios-host/smoke/target"
 LIB="$SMOKE_TARGET/aarch64-apple-ios/$PROFILE/libios_smoke.a"
+
+say "building ios-smoke for aarch64-apple-ios ($PROFILE)"
+( cd "$ROOT/ios-host/smoke" && cargo build --target aarch64-apple-ios $CARGO_PROFILE_FLAG )
+
+# Guard against a stale staticlib. Xcode links whatever .a is on disk, so a Rust source edit that
+# did not get rebuilt produces a green run reporting the PREVIOUS build's results -- which looks
+# like a passing test rather than a build mistake, and cost three confusing runs before it was
+# caught. Compare mtimes and fail loudly instead.
+NEWEST_SRC=$(find "$ROOT/ios-host/smoke/src" "$ROOT/crates" -name '*.rs' -newer "$LIB" -print -quit 2>/dev/null || true)
+if [ -n "$NEWEST_SRC" ]; then
+  echo "stale staticlib: $NEWEST_SRC is newer than $LIB" >&2
+  echo "(the build above should have caught this -- check for a cargo failure)" >&2
+  exit 1
+fi
 test -f "$LIB" || { echo "expected staticlib at $LIB" >&2; exit 1; }
 
 # Fail here rather than at first Metal op on the phone.
@@ -120,16 +131,22 @@ xcrun devicectl device process launch \
 # The app writes its report to Documents and keeps running (it is a GUI app). Poll for the file
 # rather than trying to capture stdout: --console does not reliably capture a GUI app's output,
 # and `log collect` needs root.
+# Poll for a report written AFTER the launch. Accepting the first file that copies is wrong: a
+# previous run's report is still sitting in the container, so a crashed or slow app yields a
+# confident-looking stale result -- which is exactly how a fixed bug appeared to persist.
 say "waiting for the on-device report"
 REPORT=/tmp/ios-smoke-report.txt
 rm -f "$REPORT"
-for _ in $(seq 1 30); do
-  if xcrun devicectl device copy from --device "$DEVICE" \
-       --domain-type appDataContainer --domain-identifier com.idkplay.SceneWorksSmoke \
-       --source Documents/smoke-report.txt --destination "$REPORT" >/dev/null 2>&1; then
-    break
-  fi
-  sleep 2
+LAUNCHED_AT=$(date +%s)
+for _ in $(seq 1 60); do
+  sleep 3
+  rm -f "$REPORT"
+  xcrun devicectl device copy from --device "$DEVICE" \
+    --domain-type appDataContainer --domain-identifier com.idkplay.SceneWorksSmoke \
+    --source Documents/smoke-report.txt --destination "$REPORT" >/dev/null 2>&1 || continue
+  # `copy from` preserves the device-side mtime, so this compares when the APP wrote it.
+  [ "$(stat -f%m "$REPORT" 2>/dev/null || echo 0)" -ge "$LAUNCHED_AT" ] && break
+  rm -f "$REPORT"
 done
 
 if [ ! -f "$REPORT" ]; then

@@ -54,9 +54,20 @@ pub struct TextLlmProfile {
 
 impl TextLlmProfile {
     /// A cheap default profile: short prompt, 16-token budget, a small synthetic image.
+    ///
+    /// The prompt is **open-ended on purpose**, and that is load-bearing for
+    /// [`check_seed_determinism`]. That check requires two different seeds to produce different
+    /// output, which only holds if the next-token distribution actually has entropy to sample
+    /// from. A greeting like `"Hello"` does not: a well-tuned instruct model answers it with a
+    /// near-deterministic canned reply (every seed yields *"Hello! How can I assist you today?"*),
+    /// so the check failed against a provider whose seed handling was in fact correct — a false
+    /// positive that looks exactly like a real bug. Verified on Qwen3-4B-Instruct: `"Hello"` gives
+    /// one output across four seeds, this prompt gives four.
+    ///
+    /// Keep any replacement genuinely open-ended for the same reason.
     pub fn cheap() -> Self {
         Self {
-            prompt: "Hello".to_string(),
+            prompt: "Write a surprising opening line for a novel.".to_string(),
             max_new_tokens: 16,
             determinism_seed: 7,
             determinism_sampling: Sampling {
@@ -413,8 +424,11 @@ pub fn check_seed_determinism(p: &dyn TextLlm, profile: &TextLlmProfile) -> Resu
         .map_err(|e| format!("check_seed_determinism[{id}]: generate() failed: {e}"))?;
     if key(&a) == key(&c) {
         return Err(format!(
-            "check_seed_determinism[{id}]: a different seed produced identical output — the provider \
-             appears to ignore the seed"
+            "check_seed_determinism[{id}]: a different seed produced identical output — either the \
+             provider ignores the seed, or the profile's prompt has too little entropy to sample \
+             from (a canned reply to a greeting is identical under every seed; see \
+             TextLlmProfile::cheap). Output was {:?}",
+            a.text.trim()
         ));
     }
     Ok(())

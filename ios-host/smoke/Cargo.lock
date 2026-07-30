@@ -144,6 +144,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "core-llm-testkit"
+version = "0.0.0"
+dependencies = [
+ "core-llm",
+ "serde_json",
+]
+
+[[package]]
 name = "crossbeam-deque"
 version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -387,6 +395,7 @@ dependencies = [
 name = "ios-smoke"
 version = "0.0.0"
 dependencies = [
+ "core-llm-testkit",
  "libc",
  "pmetal-mlx-rs",
  "runtime-ios",

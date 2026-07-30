@@ -20,6 +20,7 @@ use std::time::Instant;
 
 use mlx_rs::ops::{matmul, ones, softmax_axis};
 use mlx_rs::{Array, Dtype};
+use core_llm_testkit::{textllm_conformance, TextLlmProfile};
 use runtime_ios::core_llm::{LoadSpec, Message, Sampling, TextLlmRequest};
 
 /// One check's outcome. `detail` carries the observed value, so a failure report is diagnosable
@@ -264,6 +265,66 @@ fn check_generation(model_dir: Option<&Path>) -> Check {
     }
 }
 
+/// The full backend-neutral conformance suite, on device (S3.5).
+///
+/// This is the check that makes "conformant on iOS" mean the same thing it means on macOS: the
+/// identical `core_llm_testkit::textllm_conformance` the other lanes run, over all eight always-on
+/// checks — descriptor, validate, streaming, cancellation, mid-stream cancel, seed determinism,
+/// multimodal, video, thinking, tools.
+///
+/// The suite signals failure by panicking with an aggregated message, which is fine in a test
+/// harness but not across an FFI boundary, so it runs inside `catch_unwind` and the panic payload
+/// becomes the report detail. `AssertUnwindSafe` is sound here: on the failure path the provider
+/// is dropped and nothing observes it afterwards.
+fn check_conformance(model_dir: Option<&Path>) -> Check {
+    const NAME: &str = "core-llm conformance suite";
+    let Some(dir) = model_dir else {
+        return Check {
+            name: NAME,
+            passed: true,
+            detail: "skipped -- no snapshot in Documents/".to_string(),
+        };
+    };
+
+    let dir = dir.to_string_lossy().to_string();
+    let started = Instant::now();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        textllm_conformance(
+            &|| {
+                runtime_ios::llm::load_for_model(&LoadSpec::dense(dir.clone()))
+                    .expect("load provider for conformance")
+            },
+            &TextLlmProfile::cheap(),
+        );
+    }));
+
+    match result {
+        Ok(()) => Check {
+            name: NAME,
+            passed: true,
+            detail: format!(
+                "all always-on checks passed in {:.1}s",
+                started.elapsed().as_secs_f64()
+            ),
+        },
+        Err(payload) => {
+            // The suite aggregates every failure into one panic message, so this is the whole
+            // diagnostic rather than just the first failing check.
+            let message = payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_else(|| "conformance panicked with a non-string payload".to_string());
+            Check {
+                name: NAME,
+                passed: false,
+                // Collapse to one line: the report is read from a device console and a file.
+                detail: message.replace('\n', " | "),
+            }
+        }
+    }
+}
+
 /// Locate a prepared snapshot inside the app's Documents container.
 ///
 /// A snapshot is any directory holding `config.json`. Documents itself is checked first, because
@@ -305,6 +366,7 @@ pub fn run_report() -> String {
         check_gemm(Dtype::Bfloat16, "bf16 GEMM (steel)"),
         check_softmax(),
         check_generation(snapshot.as_deref()),
+        check_conformance(snapshot.as_deref()),
     ];
 
     let failed = checks.iter().filter(|c| !c.passed).count();
