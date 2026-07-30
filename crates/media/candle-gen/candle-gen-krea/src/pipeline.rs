@@ -694,6 +694,16 @@ pub(crate) fn render_three_stage(
     } else {
         candle_gen::ATTN_SCORES_BUDGET
     };
+    // SC-15510's rule: `None` means "the provider's own historical constant", so an untouched request
+    // is byte-for-byte unaffected. A value only ever arrives here after the request scope re-validated
+    // it against the published candidates, which for this realization is `[1]` alone — see
+    // `DEFAULT_TRANSFORMER_WINDOW` for the measurement that says a wider window is strictly worse on
+    // Candle. Reading it anyway rather than hardcoding 1: the selected value must be the executed one,
+    // or the calibration evidence describes a run that never happened.
+    let transformer_window = memory
+        .transformer_window_size
+        .map(|w| w as usize)
+        .unwrap_or(crate::transformer::DEFAULT_TRANSFORMER_WINDOW);
     let latents = candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
         let noise = init_noise(req.height, req.width, seed, device)?;
         candle_gen::run_flow_sampler(
@@ -706,7 +716,14 @@ pub(crate) fn render_three_stage(
             on_progress,
             |x, timestep| -> Result<Tensor> {
                 let t = Tensor::from_vec(vec![timestep], (1,), device)?;
-                let v = dit.forward_with_memory(x, &t, &context, attention_budget, &req.cancel)?;
+                let v = dit.forward_with_memory(
+                    x,
+                    &t,
+                    &context,
+                    attention_budget,
+                    transformer_window,
+                    &req.cancel,
+                )?;
                 Ok(v.to_dtype(DType::F32)?)
             },
         )

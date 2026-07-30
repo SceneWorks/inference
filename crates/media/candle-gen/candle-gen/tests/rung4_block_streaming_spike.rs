@@ -42,12 +42,13 @@
 //! `gen_core::block_window::run_windowed`: there is no candle `BlockWindowBackend` yet, and building
 //! one is SC-15792's job, not this spike's.
 //!
-//! The pool accessors below duplicate `candle_gen::testkit::cuda_mempool`'s `default_pool` because
-//! testkit exports only `USED_MEM_HIGH` and this spike needs the CURRENT/RESERVED/RELEASE_THRESHOLD
-//! set. Extending testkit instead would force this file behind the `testkit` feature, and CI compiles
-//! and Clippies candle-gen's cuda-gated tests with `--features cuda` only (ci.yml — a cuda-gated lint
-//! "sat red on main until found by hand", sc-12379), so gating it would drop it from that coverage.
-//! Hoisting these into testkit belongs in SC-15792, which will have a non-throwaway consumer.
+//! The forked pool accessors this file shipped with are **gone** (SC-15792). They duplicated
+//! `default_pool`'s driver calls because testkit exported only `USED_MEM_HIGH` and gating this file
+//! behind the `testkit` feature would have dropped it from CI's cuda compile/Clippy coverage
+//! (ci.yml enables `cuda` and not `testkit` — a cuda-gated lint "sat red on main until found by hand",
+//! sc-12379). The shared implementation now lives at `candle_gen::cuda_mempool`, gated on `cuda`
+//! alone, so both constraints hold at once. What remains below is a five-line unwrap policy, not a
+//! second copy of the driver knowledge.
 
 #![cfg(feature = "cuda")]
 
@@ -76,108 +77,69 @@ const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 // RESERVED is not a footnote: `nvidia-smi memory.used` reports driver-RESERVED bytes, so RESERVED is
 // the unit a VRAM gate consumes, and it exceeds USED by the pool's allocation granularity.
 // ---------------------------------------------------------------------------------------------------
+/// Panicking adapter over the shared [`candle_gen::cuda_mempool`] probe.
+///
+/// The only thing this adds is the unwrap policy: every accessor here **panics** on a driver error
+/// rather than returning `Option`, because in a measurement context a silent `unwrap_or(0)` lets a
+/// broken probe print a plausible report and bank a green. The driver calls, the counter semantics
+/// and the two traps are documented once, in the shared module.
 mod pool {
-    use candle_gen::candle_core::cuda::cudarc::driver::sys;
-    use std::ffi::c_void;
+    use candle_gen::cuda_mempool::MemPool;
 
-    pub struct Pool(sys::CUmemoryPool);
+    pub struct Pool(MemPool);
 
     impl Pool {
-        /// The default stream-ordered pool `cuMemAllocAsync` draws from for **logical** device
-        /// `ordinal` — the pool candle 0.10 allocates every tensor from.
+        /// The default pool candle allocates from. NOTE: under a custom *current* pool this is the
+        /// wrong handle and reports ~0 — see `candle_gen::cuda_mempool`'s trap 1. Nothing in this
+        /// file installs one.
         pub fn open(ordinal: i32) -> Option<Self> {
-            unsafe {
-                if sys::cuInit(0) != sys::CUresult::CUDA_SUCCESS {
-                    return None;
-                }
-                let mut dev: sys::CUdevice = 0;
-                if sys::cuDeviceGet(&mut dev, ordinal) != sys::CUresult::CUDA_SUCCESS {
-                    return None;
-                }
-                let mut pool: sys::CUmemoryPool = std::ptr::null_mut();
-                if sys::cuDeviceGetDefaultMemPool(&mut pool, dev) != sys::CUresult::CUDA_SUCCESS {
-                    return None;
-                }
-                Some(Self(pool))
-            }
+            MemPool::device_default(ordinal).map(Self)
         }
 
-        /// Read one attribute. Panics rather than returning 0 on a driver error: a silent zero would
-        /// let a broken probe print a plausible report and bank a green.
-        fn attr(&self, which: sys::CUmemPool_attribute) -> u64 {
-            let mut v: u64 = 0;
-            let ok = unsafe {
-                sys::cuMemPoolGetAttribute(self.0, which, (&mut v as *mut u64).cast::<c_void>())
-                    == sys::CUresult::CUDA_SUCCESS
-            };
-            assert!(ok, "cuMemPoolGetAttribute({which:?}) failed");
-            v
-        }
-
-        /// Bytes currently **live** in the pool — the MLX `get_active_memory` analogue.
         pub fn used(&self) -> u64 {
-            self.attr(sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_USED_MEM_CURRENT)
+            self.0.used().expect("CU_MEMPOOL_ATTR_USED_MEM_CURRENT")
         }
 
-        /// High-water of concurrently-live pool bytes — the MLX `get_peak_memory` analogue.
         pub fn used_high(&self) -> u64 {
-            self.attr(sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_USED_MEM_HIGH)
+            self.0.used_high().expect("CU_MEMPOOL_ATTR_USED_MEM_HIGH")
         }
 
-        /// Bytes the pool holds from the driver (live + cached-free).
         pub fn reserved(&self) -> u64 {
-            self.attr(sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT)
+            self.0
+                .reserved()
+                .expect("CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT")
         }
 
-        /// High-water of driver-reserved bytes — **the peak in the VRAM gate's own unit.**
         pub fn reserved_high(&self) -> u64 {
-            self.attr(sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_RESERVED_MEM_HIGH)
+            self.0
+                .reserved_high()
+                .expect("CU_MEMPOOL_ATTR_RESERVED_MEM_HIGH")
         }
 
-        /// Bytes the pool may retain across a synchronization before returning them to the driver.
-        ///
-        /// Load-bearing for any "does the memory come back?" claim: neither candle nor cudarc sets
-        /// this, so it sits at the driver default of **0** = release everything on every synchronize.
-        /// That is why a drop decrements USED immediately while driver-visible free only recovers at
-        /// the next synchronize, and why `trim` has nothing to do.
         pub fn release_threshold(&self) -> u64 {
-            self.attr(sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_RELEASE_THRESHOLD)
+            self.0
+                .release_threshold()
+                .expect("CU_MEMPOOL_ATTR_RELEASE_THRESHOLD")
         }
 
-        /// Reset both high-water marks (write-to-zero per the driver ABI).
+        /// Reset both high-water marks. Quiesce first — see the shared module's trap 2.
         pub fn reset_high(&self) {
-            for which in [
-                sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_USED_MEM_HIGH,
-                sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_RESERVED_MEM_HIGH,
-            ] {
-                let mut zero: u64 = 0;
-                let ok = unsafe {
-                    sys::cuMemPoolSetAttribute(
-                        self.0,
-                        which,
-                        (&mut zero as *mut u64).cast::<c_void>(),
-                    ) == sys::CUresult::CUDA_SUCCESS
-                };
-                assert!(ok, "resetting {which:?} failed — peaks would be stale");
-            }
+            assert!(
+                self.0.reset_high_water(),
+                "resetting the high-water marks failed — peaks would be stale"
+            );
         }
 
-        /// Return cached-free pool pages to the driver — the `clear_cache()` analogue. Success is NOT
-        /// the same as having freed anything: at a release threshold of 0 there is no retained cache.
+        /// A no-op at a release threshold of 0, which is where candle leaves it. Kept because the
+        /// spike's finding is precisely that it recovers nothing.
         pub fn trim(&self) {
-            let ok = unsafe { sys::cuMemPoolTrimTo(self.0, 0) == sys::CUresult::CUDA_SUCCESS };
-            assert!(ok, "cuMemPoolTrimTo failed");
+            assert!(self.0.trim(), "cuMemPoolTrimTo failed");
         }
     }
 
-    /// Driver-level `(free, total)` bytes — what `nvidia-smi` reports, i.e. what a smaller card's
-    /// VRAM gate would actually see. Panics on driver error rather than reporting `(0, 0)`.
+    /// Driver-level `(free, total)` bytes — what a smaller card's VRAM gate would see.
     pub fn mem_info() -> (u64, u64) {
-        let (mut free, mut total) = (0usize, 0usize);
-        let ok =
-            unsafe { sys::cuMemGetInfo_v2(&mut free, &mut total) == sys::CUresult::CUDA_SUCCESS };
-        assert!(ok, "cuMemGetInfo_v2 failed");
-        (free as u64, total as u64)
+        candle_gen::cuda_mempool::mem_info().expect("cuMemGetInfo_v2 (needs a current context)")
     }
 }
 
