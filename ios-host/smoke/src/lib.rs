@@ -728,8 +728,21 @@ fn find_snapshot() -> Option<std::path::PathBuf> {
 #[cfg(feature = "media")]
 fn find_media_snapshot() -> Option<std::path::PathBuf> {
     let docs = dirs_documents()?;
+    // The component tree ALONE is not enough to identify SANA any more. Z-Image's q4 tier has the
+    // identical diffusers shape (transformer/ vae/ text_encoder/), so once both are pushed this
+    // predicate matches both and `find` takes whichever readdir yields first — which handed SANA
+    // z-image's weights and failed with "Path must point to a local file", a load error that reads
+    // nothing like a snapshot mix-up.
+    //
+    // Both finders must be specific, not just one. The z-image finder was written to require
+    // "zimage" in the name precisely so it could not claim SANA's directory; leaving this one
+    // unqualified defended a single direction of a symmetric problem.
     let is_sana = |p: &std::path::Path| {
-        p.join("transformer").is_dir() && p.join("vae").is_dir() && p.join("text_encoder").is_dir()
+        p.file_name()
+            .is_some_and(|n| n.to_string_lossy().to_lowercase().contains("sana"))
+            && p.join("transformer").is_dir()
+            && p.join("vae").is_dir()
+            && p.join("text_encoder").is_dir()
     };
     if is_sana(&docs) {
         return Some(docs);

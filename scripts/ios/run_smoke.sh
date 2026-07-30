@@ -194,13 +194,22 @@ import json,sys
 d = json.loads(sys.argv[1]); d[sys.argv[2]] = sys.argv[3]; print(json.dumps(d))" "$LAUNCH_ENV" "$var" "$val")
   fi
 done
-[ "$LAUNCH_ENV" = "{}" ] || say "forwarding env: $LAUNCH_ENV"
-
 say "launching (unlock the device if prompted; console output follows)"
-xcrun devicectl device process launch \
-  --device "$DEVICE" --terminate-existing \
-  --environment-variables "$LAUNCH_ENV" \
-  com.idkplay.SceneWorksSmoke 2>&1 | tail -5
+# Two explicit invocations rather than an argument array. devicectl rejects an empty `{}` with
+# "Unable to decode environment variables" (which reads like a quoting bug and is not one), and
+# macOS ships bash 3.2, where expanding an EMPTY array under `set -u` is itself an error. Between
+# them those two cost two device runs; a branch has neither problem.
+if [ "$LAUNCH_ENV" = "{}" ]; then
+  xcrun devicectl device process launch \
+    --device "$DEVICE" --terminate-existing \
+    com.idkplay.SceneWorksSmoke 2>&1 | tail -5
+else
+  say "forwarding env: $LAUNCH_ENV"
+  xcrun devicectl device process launch \
+    --device "$DEVICE" --terminate-existing \
+    --environment-variables "$LAUNCH_ENV" \
+    com.idkplay.SceneWorksSmoke 2>&1 | tail -5
+fi
 
 # The app writes its report to Documents and keeps running (it is a GUI app). Poll for the file
 # rather than trying to capture stdout: --console does not reliably capture a GUI app's output,
