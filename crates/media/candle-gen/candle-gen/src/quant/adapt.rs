@@ -83,6 +83,36 @@ enum Adapter {
     LokrStructured { factors: LokrFactors },
 }
 
+/// Apply a **2-D** factor `w` `[in, out]` to an activation `x` whose last dim is `in`, folding every
+/// leading dim into the GEMM's `M`.
+///
+/// **Never `broadcast_matmul` here.** candle materializes a broadcast rhs through `.contiguous()`
+/// (`candle-core`'s own `broadcast_matmul` carries the `TODO: Avoid concretising the broadcasted
+/// matrixes` note), so a 2-D factor against a `[N, S, in]` activation is physically **copied `N`
+/// times** and then multiplied as `N` batched GEMMs with `M = S`. That is free where `N = 1` — every
+/// DiT trunk site — and pathological where a site folds a token count into the *batch* dim: the Krea
+/// text-fusion `layerwise_blocks` run `[n_tokens, num_layers, d]`, so a 2048² image **edit**
+/// (`n_tokens = 4107` vision+text tokens, `d = 2560`, rank 256) turned each rank-256 factor into a
+/// 2.7e9-element / **5.4 GB** copy and then a 4107-batch `M = 12` GEMM against it — 32 such legs per
+/// denoise step across the two layerwise blocks' eight adapted projections. The first denoise step
+/// never finished (hours), while the same render without an adapter took 55 s.
+///
+/// Flattening is mathematically identical (`matmul` contracts the last dim either way), allocates
+/// nothing beyond the result, and issues ONE large-`M` GEMM — the same lesson sc-11785 applied to the
+/// LoKr vec-trick's expensive leg, here for the plain-LoRA legs.
+fn apply_factor(x: &Tensor, w: &Tensor) -> candle_core::Result<Tensor> {
+    let dims = x.dims();
+    // A non-2-D factor has no flattened form; keep the general (broadcasting) path.
+    if w.rank() != 2 || dims.len() <= 2 {
+        return x.broadcast_matmul(w);
+    }
+    let (lead, k) = dims.split_at(dims.len() - 1);
+    let m: usize = lead.iter().product();
+    let mut out_dims = lead.to_vec();
+    out_dims.push(w.dim(1)?);
+    x.reshape((m, k[0]))?.matmul(w)?.reshape(out_dims)
+}
+
 impl Adapter {
     /// A scalar-zero LoRA contributes exactly nothing. Detect it before reading either factor: this
     /// keeps disabled adapters byte-identical to the bare host even when an unused factor contains a
@@ -100,9 +130,7 @@ impl Adapter {
         match self {
             Adapter::Lora { a, b, scale } => {
                 let xd = x.dtype();
-                let r = x
-                    .broadcast_matmul(&a.to_dtype(xd)?)?
-                    .broadcast_matmul(&b.to_dtype(xd)?)?;
+                let r = apply_factor(&apply_factor(x, &a.to_dtype(xd)?)?, &b.to_dtype(xd)?)?;
                 r * *scale
             }
             // The `scale` is already baked into `factors.w2`, so the vec-trick returns directly.
@@ -1644,5 +1672,45 @@ mod tests {
         // A missing w2 leg (no full, no a/b) is a typed error, not a panic.
         let err = LokrFactors::build(1.0, (6, 20), Some(&w1), None, None, None, None, None, None);
         assert!(err.is_err(), "missing w2 must be a typed error");
+    }
+
+    /// A LoRA residual on an activation with a **non-1 leading (batch) dim** must fold those leading
+    /// dims into the GEMM's `M` — never `broadcast_matmul`, which physically copies the 2-D factor once
+    /// per batch element. The Krea text-fusion `layerwise_blocks` run `[n_tokens, num_layers, d]`, so at
+    /// a 2048² image edit (`n_tokens = 4107`, `d = 2560`, rank 256) the old broadcast path materialized a
+    /// 5.4 GB copy per residual leg and the first denoise step never finished. This pins the flattened
+    /// path's NUMERICS against a per-batch-slice reference, so the perf fix can't silently change the math.
+    #[test]
+    fn lora_residual_on_batched_activation_matches_per_slice_reference() {
+        let dev = Device::Cpu;
+        let (out_dim, in_dim, rank, scale) = (12usize, 16usize, 4usize, 0.7f64);
+        let w = Tensor::randn(0f32, 1f32, (out_dim, in_dim), &dev).unwrap();
+        let a = Tensor::randn(0f32, 1f32, (in_dim, rank), &dev).unwrap(); // [in, rank]
+        let b = Tensor::randn(0f32, 1f32, (rank, out_dim), &dev).unwrap(); // [rank, out]
+        let mut lin = AdaptLinear::from_dense(Linear::new(w.clone(), None), in_dim, out_dim);
+        lin.push_lora(a.clone(), b.clone(), scale);
+
+        // `[N, S, in]`: N is a BATCH of token stacks (the layerwise-block shape), S the stack length.
+        let (n, s) = (5usize, 3usize);
+        let x = Tensor::randn(0f32, 1f32, (n, s, in_dim), &dev).unwrap();
+        let got = lin.forward(&x).unwrap();
+        assert_eq!(got.dims(), &[n, s, out_dim]);
+
+        for i in 0..n {
+            let xi = x.narrow(0, i, 1).unwrap().reshape((s, in_dim)).unwrap();
+            let base = Linear::new(w.clone(), None).forward(&xi).unwrap();
+            let res = (xi.matmul(&a).unwrap().matmul(&b).unwrap() * scale).unwrap();
+            let want = (base + res).unwrap();
+            let mine = got.narrow(0, i, 1).unwrap().reshape((s, out_dim)).unwrap();
+            let d = (mine - want)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .max_all()
+                .unwrap()
+                .to_vec0::<f32>()
+                .unwrap();
+            assert!(d < 1e-5, "batch slice {i} diverged from the reference: {d}");
+        }
     }
 }
