@@ -19,6 +19,8 @@
 //! SC16096_Q4=<...>/q4/transformer/model.safetensors     SC-16096 before/after (required together)
 //! SC16096_Q8=<...>/q8/transformer/model.safetensors     SC-16096 before/after (required together)
 //! SC16096_REPEATS=3                                     SC-16096 samples (minimum three)
+//! SC16154_Q4=<...>/q4/transformer/model.safetensors     SC-16154 post-sidecar window timing
+//! SC16154_REPEATS=12                                    SC-16154 samples per window (must be 12)
 //! cargo test -p candle-gen --features cuda --release --test rung4_block_streaming_spike \
 //!   -- --ignored --nocapture --test-threads=1
 //! ```
@@ -38,13 +40,13 @@
 //! | `packed_quant_per_block` | Q4 the packed-quant triple, per block, bit-exact |
 //! | `q8_tier_cost` | whether SC-15744's "q8 ≈ 2× q4" carries to Candle |
 //! | `device_format_sidecars_before_after` | SC-16096 q4/q8 cost, parity, host memory, and load-bearing window bound |
+//! | `device_format_window_time_interleaved` | SC-16154 post-sidecar time by window, with balanced interleaved samples |
 //! | `constrained_budget_sweep` | the small-card disclosure |
 //!
-//! Throwaway measurement code by the story's own terms — the answer is the deliverable. Kept as an
-//! `#[ignore]` real-weight test so SC-15792 can re-run it against its implementation. It drives the
-//! production packed loader but deliberately does **not** drive
-//! `gen_core::block_window::run_windowed`: there is no candle `BlockWindowBackend` yet, and building
-//! one is SC-15792's job, not this spike's.
+//! Throwaway measurement code by SC-15791's own terms — the answer is the deliverable. Kept as an
+//! `#[ignore]` real-weight test so later hardware stories can re-run the same evidence. The original
+//! spike arms predate `gen_core::block_window::run_windowed`; SC-16154's post-sidecar timing arm uses
+//! that shared driver so its window schedule is the one production executes.
 //!
 //! The pool accessors below duplicate `candle_gen::testkit::cuda_mempool`'s `default_pool` because
 //! testkit exports only `USED_MEM_HIGH` and this spike needs the CURRENT/RESERVED/RELEASE_THRESHOLD
@@ -59,9 +61,11 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::time::Instant;
 
+use candle_gen::block_window::{run_windowed, BlockPlan};
 use candle_gen::candle_core::safetensors::MmapedSafetensors;
 use candle_gen::candle_core::{DType, Device, Result, Tensor};
 use candle_gen::candle_nn::VarBuilder;
+use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::quant::{
     dequant_mlx_q4_reference, repack_packed_weight, PackedConfig, PackedWeightSidecars, QLinear,
     MLX_GROUP_SIZE,
@@ -69,8 +73,9 @@ use candle_gen::quant::{
 
 mod rung4_support;
 use rung4_support::{
-    compute, disclose_host as disclose, env_path_opt as env_opt, env_path_req, env_usize,
-    linear_fit, materialize, median, pool_open, quiesce_and_reset, windows, Block, Tier, GIB, MIB,
+    compute, compute_into, disclose_host as disclose, env_path_opt as env_opt, env_path_req,
+    env_usize, linear_fit, materialize, median, pool_open, quiesce_and_reset, windows, Block, Tier,
+    GIB, MIB,
 };
 
 // ---------------------------------------------------------------------------------------------------
@@ -314,6 +319,33 @@ fn materialize_sidecars(
         out.push(Block { lins, dense });
     }
     Ok(out)
+}
+
+/// One complete synthetic denoise step through SC-16096's sidecar-backed materializer and the shared
+/// rung-4 driver. Sidecars and the source mmap are retained outside the window loop, matching Krea's
+/// `Arc<Weights>` view: opening a window is cheap, while each packed projection maps its prepared
+/// artifact and transfers already-device-format bytes.
+fn sidecar_windowed_step(
+    tier: &Tier,
+    sidecars: &PackedWeightSidecars,
+    raw: &MmapedSafetensors,
+    dev: &Device,
+    window: usize,
+    cancel: &CancelFlag,
+) -> candle_gen::Result<Tensor> {
+    let plan = BlockPlan::new(tier.n_blocks(), window)?;
+    let init = Tensor::zeros((), DType::F32, dev)?;
+    run_windowed(
+        dev,
+        &plan,
+        cancel,
+        init,
+        || Ok(()),
+        |acc, _view: &mut (), range| {
+            let blocks = materialize_sidecars(tier, sidecars, raw, dev, range)?;
+            Ok(compute_into(&blocks, 64, dev, &acc)?)
+        },
+    )
 }
 
 #[test]
@@ -1334,6 +1366,159 @@ fn device_format_sidecars_before_after() -> Result<()> {
                 pair[1].1
             );
         }
+    }
+    Ok(())
+}
+
+/// **SC-16154: time by window after SC-16096 removed per-window format conversion.**
+///
+/// This is intentionally separate from `window_sweep_cost` (pre-sidecar) and SC-15792's
+/// `window_peak_sweep_is_linear_and_output_is_identical` (one ascending sample whose own docs say it
+/// is not timing evidence). Sidecar preparation happens once, before the clock. A full warm-up step
+/// faults the artifacts and loads the CUDA kernels before sampling.
+///
+/// Samples are interleaved in a position-balanced Latin-square order: over each six-round block
+/// every window occupies every measurement position once; the next block reverses the base direction
+/// so a monotonic within-round drift does not always favour the same neighbouring window. Reporting
+/// a grouped ascending sweep here would reintroduce the exact cold first-row/order confound this
+/// story exists to remove.
+#[test]
+#[ignore = "needs CUDA plus SC16154_Q4 real packed tier"]
+fn device_format_window_time_interleaved() -> candle_gen::Result<()> {
+    const WINDOWS: [usize; 6] = [1, 2, 4, 8, 15, 30];
+
+    let path = env_path_req("SC16154_Q4");
+    let rounds = env_usize("SC16154_REPEATS", 12);
+    assert_eq!(
+        rounds, 12,
+        "SC16154_REPEATS must be 12: the reported 95% t intervals use 11 degrees of freedom"
+    );
+    let dev = Device::new_cuda(0)?;
+    let pool = pool_open(0).expect("default mempool");
+    disclose("sc-16154", &pool);
+
+    let tier = Tier::open(&path, MLX_GROUP_SIZE)?;
+    assert_eq!(
+        tier.n_blocks(),
+        *WINDOWS.last().expect("the resident window"),
+        "SC-16154's balanced order is pinned to the 30-block calibration tier"
+    );
+    let raw = tier.open_raw()?;
+    let component_dir = path.parent().expect("tier file has a component directory");
+    let prepare_started = Instant::now();
+    let sidecars = PackedWeightSidecars::prepare(
+        &raw,
+        component_dir,
+        PackedConfig {
+            bits: 4,
+            group_size: MLX_GROUP_SIZE as i32,
+        },
+        &dev,
+    )?;
+    dev.synchronize()?;
+    println!(
+        "\n[sc-16154] TIER {}: {:.2} GiB, {} blocks, sidecars created {} / reused {} in {:.3} s \
+         (EXCLUDED from per-step timing)",
+        path.display(),
+        tier.file_bytes as f64 / GIB,
+        tier.n_blocks(),
+        sidecars.created_count(),
+        sidecars.reused_count(),
+        prepare_started.elapsed().as_secs_f64(),
+    );
+    let cancel = CancelFlag::default();
+    quiesce_and_reset(&dev, &pool)?;
+    let warm = sidecar_windowed_step(&tier, &sidecars, &raw, &dev, 30, &cancel)?;
+    let reference = warm.to_scalar::<f32>()?;
+    println!("[sc-16154] warm-up complete; balanced interleaved sampling begins");
+
+    let mut samples = vec![Vec::<f64>::with_capacity(rounds); WINDOWS.len()];
+    for round in 0..rounds {
+        let mut order = WINDOWS;
+        if (round / WINDOWS.len()).is_multiple_of(2) {
+            order.rotate_left(round % WINDOWS.len());
+        } else {
+            order.reverse();
+            order.rotate_left(round % WINDOWS.len());
+        }
+        println!("[sc-16154] round {}/{} order {order:?}", round + 1, rounds);
+        for window in order {
+            quiesce_and_reset(&dev, &pool)?;
+            let started = Instant::now();
+            let value = sidecar_windowed_step(&tier, &sidecars, &raw, &dev, window, &cancel)?
+                .to_scalar::<f32>()?;
+            let secs = started.elapsed().as_secs_f64();
+            assert_eq!(
+                value, reference,
+                "window {window} changed the arithmetic: {value} vs {reference}"
+            );
+            let index = WINDOWS
+                .iter()
+                .position(|candidate| *candidate == window)
+                .expect("sampled a declared window");
+            samples[index].push(secs);
+            println!("[sc-16154]   window {window:>2}: {secs:.4} s");
+        }
+    }
+
+    println!(
+        "\n[sc-16154] POST-SIDECAR TIME — medians of {rounds} position-balanced interleaved samples; \
+         spread is full min-max"
+    );
+    println!("  window  median s       range s     spread s   spread %   vs w1");
+    let mut medians = Vec::with_capacity(WINDOWS.len());
+    for (window, values) in WINDOWS.into_iter().zip(samples.iter()) {
+        let mut sorted = values.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).expect("no NaN timings"));
+        let median = if sorted.len().is_multiple_of(2) {
+            (sorted[sorted.len() / 2 - 1] + sorted[sorted.len() / 2]) / 2.0
+        } else {
+            sorted[sorted.len() / 2]
+        };
+        let lo = sorted[0];
+        let hi = *sorted.last().expect("at least one timing");
+        medians.push((window, median));
+        let w1 = medians[0].1;
+        println!(
+            "  {window:>6}  {median:>8.4}  {lo:>7.4}-{hi:<7.4}  {:>8.4}  {:>8.2}%  {:>7.3}x",
+            hi - lo,
+            (hi - lo) * 100.0 / median,
+            median / w1,
+        );
+    }
+
+    let (slope, intercept) = linear_fit(&medians);
+    println!(
+        "[sc-16154] median-time fit = {slope:.6} s/window + {intercept:.4} s; \
+         memory remains peak(w) ≈ 107.9·w + 153.4 MiB (SC-15792)"
+    );
+
+    println!(
+        "[sc-16154] PAIRED WITHIN-ROUND DELTAS VS WINDOW 1 — mean and two-sided 95% t interval"
+    );
+    println!("  window  mean delta s          95% CI s   positive rounds");
+    for (window, values) in WINDOWS.into_iter().zip(samples.iter()).skip(1) {
+        let deltas = values
+            .iter()
+            .zip(&samples[0])
+            .map(|(sample, baseline)| sample - baseline)
+            .collect::<Vec<_>>();
+        let mean = deltas.iter().sum::<f64>() / deltas.len() as f64;
+        let variance = deltas
+            .iter()
+            .map(|delta| (delta - mean).powi(2))
+            .sum::<f64>()
+            / (deltas.len() - 1) as f64;
+        // Student's t critical value for a two-sided 95% interval with 11 degrees of freedom.
+        let critical = 2.201;
+        let margin = critical * (variance / deltas.len() as f64).sqrt();
+        let positive = deltas.iter().filter(|delta| **delta > 0.0).count();
+        println!(
+            "  {window:>6}  {mean:>12.4}  {lo:>7.4}-{hi:<7.4}  {positive:>2}/{total:<2}",
+            lo = mean - margin,
+            hi = mean + margin,
+            total = deltas.len(),
+        );
     }
     Ok(())
 }
