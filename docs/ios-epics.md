@@ -855,7 +855,7 @@ claimed.
 | config | host (`image_budget`) | device | outcome |
 |---|---:|---:|---|
 | 1024px, 128px tiles | 3294 MiB | **2839 MiB**, 36.5 s | **works**, 4263 MiB still available |
-| 512px, untiled | 4773 MiB | — | **jetsam-killed** |
+| 512px, untiled | 4773 MiB | — | **process died mid-run** |
 
 **The per-app cap is 6136 MiB (5.99 GiB)**, read from `os_proc_available_memory()` rather than
 assumed. The branch's "~6 GB on a 12 GB device" folklore was right; it is now a measurement that
@@ -872,11 +872,21 @@ warned about.
 That inverts what this doc said a few hours earlier, when the 512-untiled configuration was reported
 as the comfortable one. The device harness now runs only tiled configurations.
 
-**The jetsam diagnosis came from the breadcrumb**, which is what it was built for: `1024 tile128`
-left a line, the configuration after it did not, and `devicectl info processes` confirmed the app
-was gone. Ordering configurations by ascending measured peak meant the survivable one was proven
-before the fatal one ran — had they been ordered by resolution, the run would have died first and
-taught nothing.
+**What is established, and what is inferred.** Established: `1024 tile128` completed and left a
+breadcrumb, the configuration after it did not, `devicectl info processes` showed the app gone, and
+no report was written. So the process died during the untiled decode. **Inferred, not confirmed:**
+that the killer was jetsam specifically. An MLX allocation abort would look identical from here —
+both are process death with no Rust panic, since `ios_smoke_run` catches unwinds and neither a
+`SIGKILL` nor a C++ `abort` unwinds. Telling them apart needs the device's JetsamEvent report,
+which lives behind Xcode's Devices GUI or a `sysdiagnose`, and is worth pulling before this is
+written up as a memory-limit result rather than an "untiled decode does not survive" result.
+
+The practical conclusion does not depend on which it was: the untiled path does not work on this
+device, and the tiled path does.
+
+Ordering configurations by ascending measured peak meant the survivable one was proven before the
+fatal one ran — had they been ordered by resolution, the run would have died first and taught
+nothing.
 
 **MLX's accounting and process RSS agree on device** (2839 vs 2955 MiB) where they diverged sharply
 on macOS (4773 vs 2961). So `getrusage` missing Metal allocations is a host artifact, and iOS does
