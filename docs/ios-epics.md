@@ -654,6 +654,46 @@ proving tiled output matches whole-image output.
 decode starts from, which is what makes tiling viable rather than merely helpful — a tiled decode
 starting at 2.2 GB has room to work in; one starting at 3.6 GB does not.
 
+### Merged main — the memory work already exists, done properly (2026-07-30)
+
+Pulled 181 commits from `main`. A large `memory-strategy` epic landed there while this branch was
+attacking the same problem by hand, and it supersedes most of what I was about to build.
+
+`gen_core::memory_strategy` is a tensor-neutral memory-planning contract with a five-rung ladder:
+
+```
+Resident → StagedResidency → BoundedDecode → BoundedAttention → BoundedTransformerResidency
+```
+
+Two of those rungs are precisely the levers this branch derived from measurement:
+
+- **`StagedResidency`** — "requires Conditioning, Denoise, and Decode hooks with synchronized phase
+  release". That is `release_denoise_graph` (the 1.4 GB floor drop), generalized into a lifecycle.
+- **`BoundedDecode`** — "decode owns tile edge and overlap". That is the tiling I had started,
+  with a calibrated budget model and a conformance suite around it.
+
+**`mlx-gen-z-image` is the reference adopter** (`memory_strategy.rs`, 1866 lines): capability
+declaration, parameter ranges per rung, evidence eligibility, and request-scoped lifecycle.
+**SANA has not adopted it** — which is why our number is unchanged at 6678 MiB post-merge.
+
+**This changes the plan for E5.** The hand-rolled tiling in `pipeline.rs` should be replaced by a
+proper `BoundedDecode` adoption following z-image, not finished. Reasons, in order:
+
+1. The contract carries a *budget model* — it tiles only when the predicted peak exceeds the
+   budget, so tiling costs nothing when memory is plentiful. My env-var knob has no such gate.
+2. Selection is worker-owned and evidence-gated: an optimized rung is eligible only when
+   conformance is Verified and the calibration fingerprint matches. A hand-rolled tile size has no
+   such guardrail and would silently drift from the numbers it was tuned against.
+3. `gen_core_testkit::memory_strategy_conformance` exists. A bespoke path is untested by it.
+
+**What this branch keeps regardless**, because it is measurement the contract does not supply:
+the per-phase and per-stage tracing in `image_budget`, the finding that the peak is decode
+transients rather than weights, and `release_denoise_graph` (which is the StagedResidency Decode
+hook in all but name — worth porting into the adoption rather than deleting).
+
+**Note the merge is not a free win.** The epic gives SANA the *machinery* to fix this, not the fix:
+adopting it is real work, and the 1866-line reference is the honest scale.
+
 **What would actually move the number**, in order of expected effect:
 
 1. **A smaller text encoder.** At 2.3 GB the Gemma-2 CHI encoder is the single largest component
