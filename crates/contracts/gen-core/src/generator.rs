@@ -1502,9 +1502,21 @@ pub enum SizeFloor {
     /// `width`/`height` must lie within `min_size..=max_size`. The common case.
     #[default]
     RangeChecked,
-    /// `width`/`height == 0` is a "resolve from the driving media" sentinel and
-    /// the range check does not apply to it; the provider range-checks its own
-    /// resolved size (F-158).
+    /// `width`/`height == 0` is a "resolve from the driving media" sentinel, and the shared range
+    /// check does not apply **to that pair of values** (F-158). Any other size — including a
+    /// half-sentinel like `0x512` — is still range-checked normally.
+    ///
+    /// # What this does not promise
+    ///
+    /// It says nothing about the size the provider *resolves* to. A consumer must not read this
+    /// variant as "the resolved geometry is bounded by `min_size..=max_size`": whether a provider
+    /// re-checks after resolving is per-provider and is **not advertised here**.
+    ///
+    /// Today none does. SCAIL-2, the only descriptor setting this variant, resolves from its
+    /// driving-video frames and renders that size unchecked — a 4K clip resolves to `3840x2160`
+    /// against declared bounds of `32..=1280` and is rendered (sc-16167). Bounding the resolved
+    /// size, and deciding whether an over-envelope clip is refused or resolved to a verified
+    /// alternative, is that story's work.
     ResolvedDownstream,
 }
 
