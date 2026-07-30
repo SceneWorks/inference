@@ -42,8 +42,8 @@ use mlx_gen::{
 use crate::config::{DcAeConfig, SanaTransformerConfig};
 use crate::dc_ae::{DcAeDecoder, DcAeEncoder};
 use crate::pipeline::{
-    encode_conditioning, SanaConditioning, SanaGenerateRequest, SanaHeavy, DEFAULT_GUIDANCE,
-    SPRINT_DEFAULT_GUIDANCE,
+    encode_conditioning, SanaConditioning, SanaDecodeView, SanaGenerateRequest, SanaHeavy,
+    DEFAULT_GUIDANCE, SPRINT_DEFAULT_GUIDANCE,
 };
 use crate::text_encoder::SanaTextEncoder;
 use crate::transformer::SanaTransformer;
@@ -450,7 +450,10 @@ impl Sana {
             DEFAULT_GUIDANCE
         });
 
-        self.residency.run(
+        // sc-13571: the DiT-dropping staged decode. Under `Sequential` `run_staged` frees the trunk
+        // after denoise and before the DC-AE decode, so the decode peak excludes it; under `Resident`
+        // nothing is shed and the decode borrows the still-warm bundle.
+        self.residency.run_staged(
             &req.cancel,
             // SANA has no PiD overlay, so this flag carries "needs the DC-AE encoder" instead: only
             // an img2img request (one with an init_image) reads it, and text-to-image would
@@ -489,10 +492,15 @@ impl Sana {
                 mlx_rs::transforms::eval(arrays)?;
                 Ok(())
             },
-            // ── Phase B: denoise/decode from the heavy bundle (trunk + DC-AE), one image per seed.
-            // Runs identically for both residencies. `on_progress` is threaded through the seam (F-179).
+            // ── Phase B (denoise): the heavy bundle (trunk + DC-AE) → one latent per seed. Runs
+            // identically for both residencies. `on_progress` is threaded through the seam (F-179).
+            //
+            // The whole count loop denoises BEFORE anything decodes, which is what lets the DiT be
+            // shed once for the whole batch rather than held across N decodes. The cost is holding N
+            // latents instead of one, and a latent is `[1, 32, H/32, W/32]` — 128 KiB at 1024²,
+            // against the ~2.0 GB (Q4) trunk the reordering sheds.
             |heavy: &SanaHeavy, cond, on_progress: &mut dyn FnMut(Progress)| {
-                let mut images = Vec::with_capacity(req.count as usize);
+                let mut latents = Vec::with_capacity(req.count as usize);
                 for n in 0..req.count {
                     let seed = base_seed.wrapping_add(n as u64);
                     let sana_req = SanaGenerateRequest {
@@ -508,9 +516,34 @@ impl Sana {
                         init_image,
                         strength,
                     };
-                    let img =
-                        heavy.render_one(&cond, &sana_req, guidance, &req.cancel, on_progress)?;
-                    images.push(img);
+                    latents.push(heavy.denoise_one(
+                        &cond,
+                        &sana_req,
+                        guidance,
+                        &req.cancel,
+                        on_progress,
+                    )?);
+                }
+                // Drop the denoise activation graph before the decode allocates. Deliberately here
+                // rather than only in `materialize_mid`: the seam runs that hook on the `Sequential`
+                // arm only, but this eval is worth ~1.4 GB under **either** policy (see
+                // `pipeline::release_denoise_graph`).
+                crate::pipeline::release_denoise_graph(&latents)?;
+                Ok(latents)
+            },
+            // The seam's contract hook: materialize every latent while the DiT is still alive, so
+            // `shed_dit` actually frees it rather than leaving it referenced through the lazy graph.
+            // Idempotent with the phase-B call above — the point of passing it is that the shed's
+            // correctness does not depend on the denoise closure's internals.
+            |latents: &Vec<mlx_rs::Array>| Ok(mlx_rs::transforms::eval(latents.iter())?),
+            // ── Phase C (decode): the light (DC-AE decoder) view + latents → images.
+            |view: SanaDecodeView<'_>,
+             latents: Vec<mlx_rs::Array>,
+             on_progress: &mut dyn FnMut(Progress)| {
+                let mut images = Vec::with_capacity(latents.len());
+                for latent in &latents {
+                    on_progress(Progress::Decoding);
+                    images.push(view.decode_one(latent, &req.cancel)?);
                 }
                 Ok(GenerationOutput::Images(images))
             },

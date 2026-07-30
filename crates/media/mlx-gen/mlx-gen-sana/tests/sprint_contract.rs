@@ -433,7 +433,14 @@ fn sprint_wires_guidance_trunk_scm_decode() {
     assert!(hi - lo > 1e-6, "SCM latent is constant — graph degenerate");
 
     let img =
-        mlx_gen_sana::pipeline::decode_to_image(&decoder, &dcfg, &denoised, &Default::default())
+        // `None` tiling: the whole-image decode this parity check has always exercised.
+        mlx_gen_sana::pipeline::decode_to_image(
+            &decoder,
+            &dcfg,
+            &denoised,
+            &Default::default(),
+            None,
+        )
             .expect("decode");
     let scale: i32 = 1 << (dcfg.num_stages() - 1);
     assert_eq!(img.width, (latent_w * scale) as u32);

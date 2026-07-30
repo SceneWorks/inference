@@ -455,7 +455,9 @@ fn pipeline_wires_trunk_scheduler_decode() {
 
     // Decode through the DC-AE (with the scaling_factor un-scale).
     let img =
-        pipeline::decode_to_image(&decoder, &dcfg, &denoised, &Default::default()).expect("decode");
+        // `None` tiling: the whole-image decode this parity check has always exercised.
+        pipeline::decode_to_image(&decoder, &dcfg, &denoised, &Default::default(), None)
+            .expect("decode");
     let exp_w = (latent_w * scale) as u32;
     let exp_h = (latent_h * scale) as u32;
     // NON-SQUARE: width and height differ, so an axis swap in the NHWC→NCHW transpose would land

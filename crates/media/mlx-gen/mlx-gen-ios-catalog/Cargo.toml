@@ -22,3 +22,6 @@ sceneworks-gen-core-testkit = { workspace = true }
 # The image_budget example reads MLX's allocator accounting directly (get_active_memory /
 # get_peak_memory), which the gen-core contract deliberately does not expose -- it is tensor-free.
 mlx-rs = { workspace = true }
+# The tiling_fidelity example writes the compared renders to PNG so a difference that survives the
+# numeric thresholds can still be looked at.
+image = { workspace = true }

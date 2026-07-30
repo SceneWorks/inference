@@ -60,6 +60,7 @@ use crate::scm::ScmScheduler;
 use crate::text_encoder::SanaTextEncoder;
 use crate::transformer::SanaTransformer;
 use mlx_gen::tiling::{TilingConfig, VaeTiling};
+use mlx_gen::StagedHeavy;
 
 /// DC-AE f32c32 latent channel count (the SANA trunk's `out_channels`).
 pub const LATENT_CHANNELS: i32 = 32;
@@ -209,8 +210,18 @@ const DC_AE_TILING: VaeTiling = VaeTiling {
 /// per-tile `eval` (the eval is essential — without it the whole tiled graph materializes at once
 /// and tiling achieves nothing).
 ///
-/// The latent is NCHW and still-image, so the tiled axes are `[h, w] = [2, 3]` with the temporal
-/// axis pinned to a 1-length dummy at index 1.
+/// # Layout
+///
+/// [`mlx_gen::vae_tiling::tiled_decode`] is **5-D** (its blend masks and pad specs are `[_; 5]`) and
+/// slices `denorm` and shapes the decoded tile through the *same* `[t, h, w]` axis indices — so the
+/// latent and the decoder's output must agree on where h and w live. SANA's do not: the latent is
+/// NCHW `[1, 32, h, w]` and [`DcAeDecoder::decode`] emits NHWC `[1, H, W, 3]`.
+///
+/// The reconciling layout is channels-last **NTHWC** with axes `[1, 2, 3]`: the latent is transposed
+/// to `[1, 1, h, w, 32]` and each decoded tile is lifted to `[1, 1, TH, TW, 3]`, which puts h and w at
+/// axes 2 and 3 on both sides. `T` is a 1-length dummy — a still image has no temporal extent, and
+/// [`DC_AE_TILING`]'s `temporal_scale: 1` plus a `spatial_only` config means the plan emits exactly
+/// one temporal tile that is never split.
 fn decode_tiled(
     decoder: &DcAeDecoder,
     latent: &Array,
@@ -220,12 +231,27 @@ fn decode_tiled(
     let sh = latent.shape();
     let (h, w) = (sh[2], sh[3]);
     let plan = tiling.plan(DC_AE_TILING, 1, h, w);
-    // `tiled_decode` slices on three axes; a still image has no temporal extent, so axis 1 (the
-    // 32-channel axis) is given a full-length single "frame" and never actually split.
-    let out = mlx_gen::vae_tiling::tiled_decode(latent, &plan, [1, 2, 3], Some(cancel), |tile| {
-        decoder.decode(tile, cancel)
+
+    // NCHW [1, 32, h, w] → NTHWC [1, 1, h, w, 32].
+    let denorm = latent
+        .transpose_axes(&[0, 2, 3, 1])?
+        .reshape(&[1, 1, h, w, LATENT_CHANNELS])?;
+
+    let out = mlx_gen::vae_tiling::tiled_decode(&denorm, &plan, [1, 2, 3], Some(cancel), |tile| {
+        let ts = tile.shape();
+        let (th, tw) = (ts[2], ts[3]);
+        // NTHWC tile → NCHW for the decoder, then its NHWC output back up to NTHWC.
+        let tile_nchw = tile
+            .reshape(&[1, th, tw, LATENT_CHANNELS])?
+            .transpose_axes(&[0, 3, 1, 2])?;
+        let dec = decoder.decode(&tile_nchw, cancel)?; // [1, TH, TW, 3] NHWC
+        let ds = dec.shape();
+        Ok(dec.reshape(&[1, 1, ds[1], ds[2], ds[3]])?)
     })?;
-    Ok(out)
+
+    // NTHWC [1, 1, H, W, 3] → NHWC [1, H, W, 3], the layout `decode_to_image` transposes from.
+    let os = out.shape();
+    Ok(out.reshape(&[1, os[2], os[3], os[4]])?)
 }
 
 // =================================================================================================
@@ -480,8 +506,18 @@ pub struct SanaHeavy {
 ///
 /// This is the same load→use→drop discipline the residency seam already applies to the text
 /// encoder, applied at the phase boundary *inside* the render bundle.
-fn release_denoise_graph(latents: &Array) -> Result<()> {
-    mlx_rs::transforms::eval([latents])?;
+///
+/// # Why this is still called under `Resident`, where nothing is shed
+///
+/// [`Residency::run_staged`] runs its `materialize_mid` hook on the `Sequential` arm only — correctly,
+/// since its job there is to make [`StagedHeavy::shed_dit`] actually free the trunk, and `Resident`
+/// sheds nothing. But the eval buys something *independent* of shedding: it drops the denoise
+/// **activation** graph, which is worth ~1.4 GB on SANA at 512² whichever policy is in force. So the
+/// staged call site invokes this at the tail of its denoise phase (both arms) *and* passes it as
+/// `materialize_mid` (the seam's contract hook, so the shed's correctness does not depend on the
+/// denoise closure's internals). The second call finds evaluated arrays and is a no-op.
+pub(crate) fn release_denoise_graph(latents: &[Array]) -> Result<()> {
+    mlx_rs::transforms::eval(latents.iter())?;
     mlx_rs::memory::clear_cache();
     Ok(())
 }
@@ -669,22 +705,43 @@ impl SanaHeavy {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
-        if self.sprint {
-            self.render_sprint(cond, req, guidance, cancel, on_progress)
-        } else {
-            self.render_cfg(cond, req, guidance, cancel, on_progress)
-        }
+        let latents = self.denoise_one(cond, req, guidance, cancel, on_progress)?;
+        on_progress(Progress::Decoding);
+        release_denoise_graph(std::slice::from_ref(&latents))?;
+        self.decode_view().decode_one(&latents, cancel)
     }
 
-    /// The base SANA-1.6B true-CFG flow-match render for one image (the pre-seam `generate_with` tail).
-    fn render_cfg(
+    /// **Denoise** one image from pre-encoded conditioning, stopping at the latents — the phase-B half
+    /// of [`render_one`](Self::render_one), split out so [`Residency::run_staged`] can shed the DiT
+    /// between denoise and decode (see the [`StagedHeavy`] impl below).
+    ///
+    /// The caller owns the `eval` of the returned latents: under the staged seam that is
+    /// `materialize_mid`, which must run while the DiT is still alive.
+    pub fn denoise_one(
         &self,
         cond: &SanaConditioning,
         req: &SanaGenerateRequest<'_>,
         guidance: f32,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
-    ) -> Result<Image> {
+    ) -> Result<Array> {
+        if self.sprint {
+            self.denoise_one_sprint(cond, req, guidance, cancel, on_progress)
+        } else {
+            self.denoise_one_cfg(cond, req, guidance, cancel, on_progress)
+        }
+    }
+
+    /// The base SANA-1.6B true-CFG flow-match denoise for one image (the pre-seam `generate_with` tail,
+    /// less the decode).
+    fn denoise_one_cfg(
+        &self,
+        cond: &SanaConditioning,
+        req: &SanaGenerateRequest<'_>,
+        guidance: f32,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Array> {
         let steps = req.steps.unwrap_or(DEFAULT_STEPS);
         let seed = req.seed.unwrap_or(0);
 
@@ -746,7 +803,7 @@ impl SanaHeavy {
         // The uncond twin is present only for base SANA with CFG active (`encode_conditioning`).
         let uncond = cond.uncond.as_ref().map(|(u, _)| u);
         let uncond_mask = cond.uncond.as_ref().map(|(_, um)| um);
-        let latents = denoise_cfg(
+        denoise_cfg(
             &self.transformer,
             &scheduler,
             req.sampler,
@@ -760,15 +817,6 @@ impl SanaHeavy {
             guidance,
             cancel,
             on_progress,
-        )?;
-        on_progress(Progress::Decoding);
-        release_denoise_graph(&latents)?;
-        decode_to_image(
-            &self.decoder,
-            &self.dc_ae_cfg,
-            &latents,
-            cancel,
-            decode_tiling().as_ref(),
         )
     }
 
@@ -781,14 +829,14 @@ impl SanaHeavy {
     /// DC-AE-encoded init to that angle: `x_t = cos(t)·x0 + sin(t)·noise·σ_data` with `x0 =
     /// encode·scaling_factor·σ_data` and `t = timesteps[start]`. Distilled/consistency, so the strength
     /// window is narrow — validate the band on-device. `start = 0` is the byte-identical txt2img path.
-    fn render_sprint(
+    fn denoise_one_sprint(
         &self,
         cond: &SanaConditioning,
         req: &SanaGenerateRequest<'_>,
         guidance: f32,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
-    ) -> Result<Image> {
+    ) -> Result<Array> {
         let steps = req.steps.unwrap_or(SPRINT_DEFAULT_STEPS);
         let seed = req.seed.unwrap_or(0);
 
@@ -834,7 +882,7 @@ impl SanaHeavy {
             // txt2img: the SCM prior is `noise · σ_data`.
             multiply(&noise, arr1(sd))?
         };
-        let latents = denoise_sprint_from(
+        denoise_sprint_from(
             &self.transformer,
             &scheduler,
             start_step,
@@ -846,16 +894,71 @@ impl SanaHeavy {
             self.guidance_embeds_scale,
             cancel,
             on_progress,
-        )?;
-        on_progress(Progress::Decoding);
-        release_denoise_graph(&latents)?;
+        )
+    }
+}
+
+/// The **light** (decode-only) SANA bundle that survives the DiT drop under `Sequential` staged
+/// decode: the DC-AE decoder and its config. [`StagedHeavy::shed_dit`] drops the ~2.0 GB (Q4)
+/// transformer — and the DC-AE *encoder*, when an img2img load carried one — so the decode-phase peak
+/// excludes both.
+///
+/// This is the lever `release_denoise_graph` alone could not reach. Releasing the denoise graph frees
+/// the *activations* the DiT produced; only shedding frees the DiT's **weights**, and on iOS those
+/// weights are the difference between fitting the per-app cap and not (`docs/ios-epics.md`, E5).
+pub struct SanaLight {
+    decoder: DcAeDecoder,
+    dc_ae_cfg: DcAeConfig,
+}
+
+/// A borrowed decode view — from the owned [`SanaLight`] under `Sequential` (post-shed) or from the
+/// still-warm [`SanaHeavy`] under `Resident` — so the decode body is written once for both policies.
+pub struct SanaDecodeView<'a> {
+    decoder: &'a DcAeDecoder,
+    dc_ae_cfg: &'a DcAeConfig,
+}
+
+impl SanaDecodeView<'_> {
+    /// DC-AE-decode one already-denoised, already-evaluated latent to an [`Image`].
+    ///
+    /// Tiling comes from [`decode_tiling`], which is where the bounded-decode policy lives; whole-image
+    /// decode is the default and is byte-identical to the pre-staging path.
+    pub fn decode_one(&self, latents: &Array, cancel: &CancelFlag) -> Result<Image> {
         decode_to_image(
-            &self.decoder,
-            &self.dc_ae_cfg,
-            &latents,
+            self.decoder,
+            self.dc_ae_cfg,
+            latents,
             cancel,
             decode_tiling().as_ref(),
         )
+    }
+}
+
+impl StagedHeavy for SanaHeavy {
+    type Light = SanaLight;
+    type DecodeView<'a> = SanaDecodeView<'a>;
+
+    fn shed_dit(self) -> SanaLight {
+        // `self.transformer` (and `self.encoder`, when present) drop here; only the DC-AE decoder and
+        // its config move into the light bundle.
+        SanaLight {
+            decoder: self.decoder,
+            dc_ae_cfg: self.dc_ae_cfg,
+        }
+    }
+
+    fn decode_view(&self) -> SanaDecodeView<'_> {
+        SanaDecodeView {
+            decoder: &self.decoder,
+            dc_ae_cfg: &self.dc_ae_cfg,
+        }
+    }
+
+    fn light_view(light: &SanaLight) -> SanaDecodeView<'_> {
+        SanaDecodeView {
+            decoder: &light.decoder,
+            dc_ae_cfg: &light.dc_ae_cfg,
+        }
     }
 }
 

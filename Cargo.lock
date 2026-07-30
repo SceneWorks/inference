@@ -2251,6 +2251,7 @@ dependencies = [
 name = "mlx-gen-ios-catalog"
 version = "0.0.0"
 dependencies = [
+ "image",
  "mlx-gen",
  "mlx-gen-sana",
  "pmetal-mlx-rs",
