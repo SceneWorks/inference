@@ -148,6 +148,7 @@ pub fn descriptor() -> ModelDescriptor {
             supports_conversation_history: false,
             supports_conversation_session: false,
             max_speakers: Some(MAX_SPEAKERS),
+            ..Default::default()
         },
     }
 }

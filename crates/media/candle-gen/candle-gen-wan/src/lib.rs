@@ -740,6 +740,7 @@ pub fn descriptor() -> ModelDescriptor {
             audio_voices: vec![],
             audio_languages: vec![],
             audio_edit_modes: vec![],
+            ..Default::default()
         },
     }
 }

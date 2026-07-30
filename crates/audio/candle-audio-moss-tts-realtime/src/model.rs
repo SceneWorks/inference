@@ -145,6 +145,7 @@ pub fn descriptor() -> ModelDescriptor {
             supports_conversation_history: true,
             supports_conversation_session: true,
             max_speakers: None,
+            ..Default::default()
         },
     }
 }

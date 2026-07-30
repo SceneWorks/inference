@@ -1171,6 +1171,7 @@ fn descriptor_for(variant: Variant) -> ModelDescriptor {
             audio_voices: vec![],
             audio_languages: vec![],
             audio_edit_modes: vec![],
+            ..Default::default()
         },
     }
 }
