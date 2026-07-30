@@ -515,6 +515,47 @@ alone could be the difference.
 4. ~~Embedding quantization~~ — **done, keep it** (it is free and real on disk), but it is not the
    lever.
 
+### Skipped the DC-AE encoder too — and found why none of it works (2026-07-30)
+
+Implemented the lever I recommended: `SanaHeavy::encoder` is now `Option`, `load_heavy` builds the
+`DcAeEncoder` only when the request carries a `Conditioning::Reference`, and the seam's spare
+`use_pid` flag carries that decision (the same mechanism F-177 uses to skip a wasted PiD load).
+All 46 SANA/PiD tests pass, img2img included.
+
+**Peak at 512px: 6679 MiB. Identical to before.** As with the embedding, the weights went away and
+the peak did not.
+
+Measuring resident peak across resolutions with both fixes applied explains why:
+
+| Resolution | Peak | Weights in the render phase |
+|---|---|---|
+| 1024px | 10257 MiB | ~2.6 GB |
+| 512px | 7042 MiB | ~2.6 GB |
+| 256px | 6239 MiB | ~2.6 GB |
+
+**~3.6 GB of the peak is not weights at all**, and it is present even at 256px where activations
+should be negligible. Weight reduction was never going to close a gap that weights do not
+account for.
+
+That is the real finding, and it retires the whole line of attack:
+
+- Embedding quantization: −0.85 GB of weights → **0 MiB** off peak.
+- DC-AE encoder skip: −0.61 GB of weights → **0 MiB** off peak.
+- Both are correct, both are worth keeping (smaller downloads, less I/O), and **neither is the
+  memory story**.
+
+**What the ~3.6 GB actually is remains unidentified.** Candidates, in the order worth testing:
+MLX's buffer cache retaining freed blocks (`set_cache_limit(0)` would show this immediately), the
+DC-AE decoder's intermediate feature maps at f32c32 (its latent is 32-channel, so decode
+activations are large even from a small latent), or a one-off allocator reservation. **Measure
+before optimizing** — that is the lesson from two failed predictions in a row.
+
+**Recommendation: stop optimizing SANA and re-scope.** Two failed levers with sound reasoning
+behind each is evidence the model is simply too large for the target, not that the next lever will
+land. `256px sequential @ 4890 MiB (80% of a 12 GB device's cap)` is the shipping configuration
+that exists today. Anything better needs either the unidentified 3.6 GB explained, or a smaller
+model — and the second is a product conversation, not an engineering one.
+
 **What would actually move the number**, in order of expected effect:
 
 1. **A smaller text encoder.** At 2.3 GB the Gemma-2 CHI encoder is the single largest component

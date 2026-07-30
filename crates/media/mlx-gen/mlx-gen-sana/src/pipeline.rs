@@ -382,7 +382,13 @@ pub struct SanaHeavy {
     transformer: SanaTransformer,
     /// DC-AE **encoder** — the img2img reference→latent path (sc-10190). Loaded from the SAME
     /// `vae/` snapshot as the decoder (the checkpoint ships both `encoder.*` and `decoder.*` keys).
-    encoder: DcAeEncoder,
+    ///
+    /// `None` for a **text-to-image-only** bundle. Text-to-image never encodes a reference image,
+    /// so eagerly building this held ~0.61 GB of weights through the render phase — the phase that
+    /// sets peak memory — to serve a path the request had already declined. That is affordable on a
+    /// Mac and decisive on a phone, where SANA is otherwise over the per-app cap
+    /// (`docs/ios-epics.md`, E5). See [`new_text_to_image`](Self::new_text_to_image).
+    encoder: Option<DcAeEncoder>,
     decoder: DcAeDecoder,
     dc_ae_cfg: DcAeConfig,
     sprint: bool,
@@ -476,7 +482,27 @@ impl SanaHeavy {
     ) -> Self {
         Self {
             transformer,
-            encoder,
+            encoder: Some(encoder),
+            decoder,
+            dc_ae_cfg,
+            sprint: false,
+            guidance_embeds_scale: 0.0,
+        }
+    }
+
+    /// Compose a **text-to-image-only** base bundle: identical to [`new`](Self::new) but without the
+    /// DC-AE encoder, which that path never uses.
+    ///
+    /// A `generate` carrying an `init_image` against this bundle is a caller error and returns
+    /// [`Error::Msg`] rather than silently ignoring the reference image.
+    pub fn new_text_to_image(
+        transformer: SanaTransformer,
+        decoder: DcAeDecoder,
+        dc_ae_cfg: DcAeConfig,
+    ) -> Self {
+        Self {
+            transformer,
+            encoder: None,
             decoder,
             dc_ae_cfg,
             sprint: false,
@@ -498,7 +524,24 @@ impl SanaHeavy {
     ) -> Self {
         Self {
             transformer,
-            encoder,
+            encoder: Some(encoder),
+            decoder,
+            dc_ae_cfg,
+            sprint: true,
+            guidance_embeds_scale,
+        }
+    }
+
+    /// The [`new_text_to_image`](Self::new_text_to_image) counterpart for SANA-Sprint.
+    pub fn new_sprint_text_to_image(
+        transformer: SanaTransformer,
+        decoder: DcAeDecoder,
+        dc_ae_cfg: DcAeConfig,
+        guidance_embeds_scale: f32,
+    ) -> Self {
+        Self {
+            transformer,
+            encoder: None,
             decoder,
             dc_ae_cfg,
             sprint: true,
@@ -575,8 +618,16 @@ impl SanaHeavy {
             let image = req
                 .init_image
                 .expect("start_step > 0 implies an init image");
+            let encoder = self.encoder.as_ref().ok_or_else(|| {
+                Error::Msg(
+                    "SANA: this bundle is text-to-image-only (no DC-AE encoder), so an init_image \
+                     cannot be encoded -- build it with `SanaHeavy::new` rather than \
+                     `new_text_to_image`"
+                        .to_string(),
+                )
+            })?;
             Some(encode_init_latents(
-                &self.encoder,
+                encoder,
                 &self.dc_ae_cfg,
                 image,
                 req.width,
@@ -657,8 +708,16 @@ impl SanaHeavy {
             let image = req
                 .init_image
                 .expect("start_step > 0 implies an init image");
+            let encoder = self.encoder.as_ref().ok_or_else(|| {
+                Error::Msg(
+                    "SANA: this bundle is text-to-image-only (no DC-AE encoder), so an init_image \
+                     cannot be encoded -- build it with `SanaHeavy::new` rather than \
+                     `new_text_to_image`"
+                        .to_string(),
+                )
+            })?;
             let clean = encode_init_latents(
-                &self.encoder,
+                encoder,
                 &self.dc_ae_cfg,
                 image,
                 req.width,

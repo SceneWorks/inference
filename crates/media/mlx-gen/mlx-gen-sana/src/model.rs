@@ -281,7 +281,10 @@ pub(crate) fn build_residency(
     Residency::from_policy(
         spec.offload_policy,
         move || load_text_encoder_component(load_components(&spec_text, id)?),
-        move |_use_pid| load_heavy(load_components(&spec_heavy, id)?, sprint),
+        // SANA has no PiD overlay, so the seam's `use_pid` flag is free — it is reused here as
+        // "this request needs the DC-AE encoder" (i.e. it carries an init_image). Same mechanism
+        // as F-177's wasted-PiD-load skip, applied to the wasted encoder load.
+        move |needs_encoder| load_heavy(load_components(&spec_heavy, id)?, sprint, needs_encoder),
     )
 }
 
@@ -297,27 +300,39 @@ fn load_text_encoder_component(root: &Path) -> Result<SanaTextEncoder> {
 /// path builds the same bundle up front. Components are independent of the text encoder (separate weight
 /// files, packed-detected quant — no RNG), so both residencies are byte-identical. The trunk is loaded
 /// first (mirroring the pre-seam `build_pipeline` order), then the DC-AE from the shared `vae/` source.
-fn load_heavy(root: &Path, sprint: bool) -> Result<SanaHeavy> {
+fn load_heavy(root: &Path, sprint: bool, needs_encoder: bool) -> Result<SanaHeavy> {
     let trunk_w = Weights::from_dir(root.join("transformer"))?;
     let dcfg = DcAeConfig::sana_f32c32();
     let vae_w = Weights::from_dir(root.join("vae"))?;
-    // The `vae/` snapshot ships BOTH `encoder.*` and `decoder.*` — build both from the one source.
-    let encoder = DcAeEncoder::from_weights(&vae_w, dcfg.clone())?;
+    // The `vae/` snapshot ships BOTH `encoder.*` and `decoder.*`, but only img2img reads the
+    // encoder — text-to-image goes noise → trunk → decoder and never encodes a reference. Building
+    // it unconditionally held ~0.61 GB through the RENDER phase, which is the phase that sets peak
+    // memory, so on a memory-capped device it was pure loss (docs/ios-epics.md, E5). Loaded only
+    // when the caller's request can actually reach it.
     let decoder = DcAeDecoder::from_weights(&vae_w, dcfg.clone())?;
+    let encoder = if needs_encoder {
+        Some(DcAeEncoder::from_weights(&vae_w, dcfg.clone())?)
+    } else {
+        None
+    };
     if sprint {
         let trunk_cfg = SanaTransformerConfig::sana_sprint_1600m();
         let guidance_embeds_scale = trunk_cfg.guidance_embeds_scale;
         let trunk = SanaTransformer::from_weights(&trunk_w, trunk_cfg)?;
-        Ok(SanaHeavy::new_sprint(
-            trunk,
-            encoder,
-            decoder,
-            dcfg,
-            guidance_embeds_scale,
-        ))
+        Ok(match encoder {
+            Some(encoder) => {
+                SanaHeavy::new_sprint(trunk, encoder, decoder, dcfg, guidance_embeds_scale)
+            }
+            None => {
+                SanaHeavy::new_sprint_text_to_image(trunk, decoder, dcfg, guidance_embeds_scale)
+            }
+        })
     } else {
         let trunk = SanaTransformer::from_weights(&trunk_w, SanaTransformerConfig::sana_1600m())?;
-        Ok(SanaHeavy::new(trunk, encoder, decoder, dcfg))
+        Ok(match encoder {
+            Some(encoder) => SanaHeavy::new(trunk, encoder, decoder, dcfg),
+            None => SanaHeavy::new_text_to_image(trunk, decoder, dcfg),
+        })
     }
 }
 
@@ -437,8 +452,16 @@ impl Sana {
 
         self.residency.run(
             &req.cancel,
-            // SANA has no PiD overlay; the heavy loader ignores `use_pid`.
-            false,
+            // SANA has no PiD overlay, so this flag carries "needs the DC-AE encoder" instead: only
+            // an img2img request (one with an init_image) reads it, and text-to-image would
+            // otherwise hold ~0.61 GB of unused encoder through the peak render phase.
+            //
+            // NOTE this is honoured under `Sequential` only. `Resident` loads the bundle once at
+            // construction, before any request exists, so it must stay conservative and build the
+            // encoder — a later img2img against the same warm bundle has to work.
+            // `resolve_reference` is the same predicate the render phase uses, so the loader's
+            // view of "is this img2img" cannot drift from the renderer's.
+            resolve_reference(req, self.descriptor.id)?.is_some(),
             on_progress,
             // ── Phase A: Gemma CHI conditioning. Seed-independent (no RNG) — encodes cond (+ uncond for
             // base SANA with CFG active; Sprint is CFG-free). Under `Sequential` the shared seam LOADS
