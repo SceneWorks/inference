@@ -692,22 +692,80 @@ transients rather than weights, and `release_denoise_graph` (which is the Staged
 hook in all but name — worth porting into the adoption rather than deleting).
 
 **Note the merge is not a free win.** The epic gives SANA the *machinery* to fix this, not the fix:
-adopting it is real work, and the 1866-line reference is the honest scale.
+adopting it is real work.
 
-**What would actually move the number**, in order of expected effect:
+*(Scoping correction, same day: the 1866-line figure overstates SANA's share. 874 of those lines are
+pre-test code and much of that is module doc; SANA needs a strict subset of it — no PiD decode
+routes, no rung 3, no rung 4 — declaring rungs 0/1/2 Implemented and 3/4 Missing. And the scoping
+pass turned up a larger, cheaper lever first: see below.)*
 
-1. **A smaller text encoder.** At 2.3 GB the Gemma-2 CHI encoder is the single largest component
-   and is dropped after the encode phase anyway. The crate docs reference a 2-bit Clark-Labs SANA
-   drop; `mlx-gen-sana` notes that quant is **not ported**. Porting it, or substituting a smaller
-   encoder, is the first real lever.
-2. **DC-AE tiling** — 1.25 GB of decoder held for the final phase only.
-3. **A 12 GB device only.** SANA fits a 17 Pro Max's ~6 GB cap sequentially at 512px (5065 MiB is
-   over 4 GB but under 6). That ships G6 on *one* device class and abandons the §0.1 guardrail —
-   a product decision, not an engineering one.
+### SANA fits — the lever was a seam we had never called (2026-07-30)
 
-Until one of these lands, S5.2 is blocked and the device session for E5 would only confirm a
-number already known on the host. **That is the harness working as intended**: this finding cost
-20 minutes on a Mac rather than a device session and a jetsam kill.
+Scoping the `BoundedDecode` adoption turned up something better first. SANA drove the shared
+residency seam through **`Residency::run`**, which holds the entire heavy bundle across denoise *and*
+decode. The same seam also offers **`run_staged`**, which frees the DiT between the two phases:
+
+```
+run:         encode → drop encoder → [ denoise → decode ]     ← trunk resident through decode
+run_staged:  encode → drop encoder →  denoise → drop DiT → decode
+```
+
+All four `z_image` variants use `run_staged`. SANA never adopted it. Its trunk is ~2.0 GB in Q4 and
+was live underneath the ~3.5 GB decode transient — which is the whole story of the 6678 MiB peak.
+
+`run_staged`'s `materialize_mid` hook is *literally* `release_denoise_graph`: this branch rebuilt one
+piece of a seam whose other half was already there.
+
+**Both levers, measured** (Q4 + Q4 embedding, sequential, 4 steps):
+
+| | before | after `run_staged` | + tiling | budget |
+|---|---:|---:|---:|---|
+| 512px | 6678 MiB | **4773 MiB** | — | 78% of 6 GB |
+| 1024px | — | 9177 MiB | **3465 MiB** (256px tiles) | 56% of 6 GB |
+| 1024px | — | — | **3294 MiB** (128px tiles) | 80% of 4 GB |
+
+The DiT drop is worth **1905 MiB**, almost exactly the trunk. `Decoding` now begins at **0 MiB
+active** where it began at 2173.
+
+**1024px at 128px tiles lands on 3294 MiB, which is the denoise peak.** SANA is now denoise-bound,
+not decode-bound: further decode tiling buys nothing. This inverts the §"two independent problems"
+diagnosis above — that was correct *before* the trunk was shed.
+
+**The tiled decode was broken and had never been run.** `vae_tiling::tiled_decode` is 5-D and slices
+the latent and shapes the decoded tile through one `[t, h, w]` axis triple, but SANA's latent is NCHW
+while DC-AE emits NHWC. Bridged through a channels-last NTHWC lift.
+
+**Tiling is not parity, and cannot be.** DC-AE's decoder is `EfficientViTBlock` =
+`SanaMultiscaleLinearAttention → GLUMBConv`, whose `1/(Σ + eps)` normalizer sums over every spatial
+position it is given. A tile sees only its own, so tiled output is a *different render* by
+construction. The sweep shows exactly that signature — doubling overlap at 512px moved the mean
+2.41 → 1.89 while *halving* the tile made it worse (4.29), the opposite of how a boundary artifact
+behaves. Overlap cannot repair a global operation.
+
+**The renders were looked at, not just measured.** At every tile size the image is seam-free and
+equally valid; the tone shifts smoothly because the trapezoidal blend spreads the per-tile
+difference out. Max |Δ| reaches 226/255 on a perfectly good render, which is why
+`decode_tiling_parity` prints it and does not assert it. What that test *does* gate is the layout
+bridge, where an error is silent: one tile covering the whole image must reproduce the whole-image
+decode exactly, and does (max |Δ| = 0).
+
+**§0.1's guardrail survives after all.** Every configuration above fits a 4096 MiB budget — an 8 GB
+device — so SANA does not need to be restricted to 12 GB hardware. The earlier "12 GB only"
+recommendation is withdrawn; it was written against a peak that assumed the trunk stayed resident.
+
+**Still open:** the `BoundedDecode` contract adoption. The mechanism now exists and is measured, but
+tiling is still selected by the `MLX_GEN_SANA_DECODE_TILE` env knob rather than by the contract's
+budget model. That work is now an optimization rather than the critical path, and it should be sized
+*after* on-device confirmation — the calibration fingerprint must not be minted before execution
+structure settles, and this change moved it.
+
+**Superseded by the above**, kept because the reasoning is still sound where it applies:
+
+1. ~~**A smaller text encoder.**~~ At 2.3 GB the Gemma-2 CHI encoder is the largest single component,
+   but it is dropped after the encode phase and the peak now lives elsewhere. Still the right lever
+   if the *conditioning* phase ever sets the peak; it does not today.
+2. ~~**DC-AE tiling**~~ — done, above.
+3. ~~**A 12 GB device only.**~~ Withdrawn: 8 GB fits.
 
 **Exit:** SANA generates a correct 1024px image within the memory cap, `gen-core-testkit`
 conformance green on device, media registry validated in the bundle.
