@@ -14,10 +14,17 @@
 //!
 //! F-003 (sc-8983) first fixed this for the flux2 / chroma / lens / qwen-image DiT transformers with a
 //! per-crate `attention_budgeted` helper that chunks over the **query rows** — each query row's softmax
-//! is over all keys and is independent of the other rows, so the chunked result is numerically identical
-//! to the single pass, and the chunking only ever engages on the over-budget buckets. This module hoists
-//! that pattern into the shared commons so the remaining audited sites (sc-9116) share one guarded copy
-//! instead of a growing pile of near-identical per-crate copies.
+//! is over all keys and is independent of the other rows, so the chunked result is *mathematically*
+//! equivalent to the single pass, and the chunking only ever engages on the over-budget buckets. This
+//! module hoists that pattern into the shared commons so the remaining audited sites (sc-9116) share one
+//! guarded copy instead of a growing pile of near-identical per-crate copies.
+//!
+//! **Mathematically equivalent is not bitwise equal.** Narrowing the query axis changes the GEMM `M`
+//! dimension, and both candle's CPU `gemm` and cuBLAS may select a different tiling / accumulation order
+//! for `M = 541` than for `M = 4128`. So chunked and un-chunked outputs agree only to a tolerance: this
+//! module's own equivalence helper compares to `1e-5`, and SC-15943 is a sibling crate
+//! (`candle-gen-wan`) that asserted *exact* equality and fails by 1–2 ULP on macOS-arm64. Treat
+//! per-row independence as an argument about the math, never as a bit-identity guarantee.
 //!
 //! Two shapes are covered:
 //! - [`sdpa_budgeted_bhsd`] — the 4-D DiT shape `[B, H, Sq, D]` (heads explicit), optional additive mask.
@@ -135,7 +142,11 @@ fn query_block(rows_per_query: usize, sq: usize, budget: usize) -> usize {
 /// When `budget` is large enough for the full `[B,H,Sq,Sk]` scores tensor this is a single pass,
 /// byte-identical to the un-guarded `(q·kᵀ·scale) → softmax → ·v`. Otherwise it chunks over the query
 /// rows; since each query row's softmax is over all keys and independent of the others, the chunked
-/// result is numerically identical (up to the associativity-free `cat`).
+/// result is *mathematically* equivalent — but **not** bitwise equal to the single pass. Narrowing the
+/// query axis changes the GEMM `M` dimension, so candle's CPU `gemm` and cuBLAS may accumulate in a
+/// different order at a different `M`; the two agree to a tolerance (~1 ULP in practice, `1e-5` in this
+/// crate's tests) rather than exactly. SC-15943 is the defect a sibling crate hit by asserting `== 0.0`
+/// on that difference. Do not build an exact-equality assertion on this path.
 pub fn sdpa_budgeted_bhsd(
     q: &Tensor,
     k: &Tensor,
@@ -485,10 +496,20 @@ mod tests {
 
     /// **AC 6 without a GPU: the delegation is boundary-for-boundary the pre-hoist arithmetic.**
     ///
-    /// Real-weight output can only change if a *boundary* changes — query-row chunking is otherwise
-    /// numerically identical by construction, since each row's softmax already spans the complete
-    /// key/value domain. So pinning the boundaries against the closed form this crate shipped from
-    /// sc-9116 until SC-15796 pins the output too, on hardware this can run on.
+    /// Why pinning boundaries also pins real-weight output. This refactor moved *only* `query_block`'s
+    /// body. This test asserts the delegation returns an **identical boundary for every input** the
+    /// pre-hoist closed form was given, and every downstream statement in both kernels is unchanged —
+    /// the same `narrow` / `matmul` / `broadcast_add` / `softmax` / `cat` sequence in the same order,
+    /// with `record_chunk_count` compiling to nothing outside `cfg(test)`. Identical boundary plus
+    /// identical downstream code means the *emitted instruction sequence* is the same as the pre-hoist
+    /// build's, and therefore so is the output, bit for bit.
+    ///
+    /// Note what that argument deliberately does **not** rely on: it never claims chunked and un-chunked
+    /// results agree bitwise. **They do not.** Chunking changes the GEMM `M` dimension, so candle's CPU
+    /// `gemm` and cuBLAS may choose a different tiling / accumulation order — which is why `approx_eq`
+    /// above compares to `1e-5`, and why SC-15943 is a sibling crate (`candle-gen-wan`) that asserted
+    /// exact equality on that difference and fails by 1–2 ULP on macOS-arm64. The bit-identity claimed
+    /// here is *pre-hoist vs post-hoist at the same boundary*, never *chunked vs single pass*.
     ///
     /// The oracle below is deliberately **not** a second planner: nothing derives a production boundary
     /// from it, and it exists permanently as the i32-overflow guard's own invariant — a correctness
@@ -513,11 +534,27 @@ mod tests {
             63,
             4096,
             CONSTRAINED_ATTN_SCORES_BUDGET as usize,
+            // Krea's own declared operating point (`candle_gen_krea::pipeline::
+            // CONSTRAINED_ATTN_SCORES_BUDGET`) — the second family consuming this kernel in production.
+            // Krea's crate-local pin checks 128 Mi against the *shared planner* only; without this row
+            // the budget it actually ships is never compared to the pre-hoist closed form.
+            128 * 1024 * 1024,
             ATTN_SCORES_BUDGET,
             usize::MAX,
         ];
-        let rows = [0usize, 1, 7, 16384, 30 * 4128, 2 * 10 * 16384, 65536];
-        let sqs = [0usize, 1, 2, 7, 32, 4128, 16384, 65536];
+        // `32 * 8192` and the `8192` sq are krea's grounded-TE geometry at its inclusive token cap
+        // (B·H = 1·32, Sq = Sk = 8192), where 128 Mi plans 512 query rows and 64 Mi plans 256.
+        let rows = [
+            0usize,
+            1,
+            7,
+            16384,
+            30 * 4128,
+            32 * 8192,
+            2 * 10 * 16384,
+            65536,
+        ];
+        let sqs = [0usize, 1, 2, 7, 32, 4128, 8192, 16384, 65536];
         let mut chunking_cases = 0;
         for &budget in &budgets {
             for &rows_per_query in &rows {
