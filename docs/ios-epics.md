@@ -448,11 +448,43 @@ admission test used throughout this document — see the S5.2 correction below. 
 first model whose working set was large enough to expose it. SANA passed despite the cache, not
 because of it.
 
-**Still open.** 229 s is ~14× the host's 15.9 s, with the 4-step denoise accounting for ~190 s.
-Bounding the cache did not cause it (the killed runs were also ~200 s), and it is a separate
-investigation — z-image on iOS is a *fit* result, not yet a *usable* one. Catalog inclusion
+#### The 229 s is the model, not the configuration (2026-07-30)
+
+z-image renders in 229.1 s on device against 15.9 s on an M5 Max — 14.4×. SANA through the same
+harness is 5.5× (6.2 s → 34.0 s at 1024/tile128) and 8.1× at 512/tile256, which is the honest
+iPhone-vs-M5-Max GPU ratio. So z-image carried an extra ~2.4× that needed explaining.
+
+**It is not rung 4, and rung 4 is not a cost on device — it is a win on both axes.** The hypothesis
+was that block streaming re-reads ~12.9 GB from the snapshot per render, free on a host with the
+file in page cache and real work on a device that cannot cache 3.23 GB against a 6 GB budget.
+Measured, it is backwards:
+
+| 1024px, tile 256 | rung 4 ON | rung 4 OFF |
+|---|---:|---:|
+| total | **229.1 s** | 322.6 s |
+| denoise | **214.9 s** | 303.5 s |
+| per step | **~53 s** | ~75 s |
+| MLX peak | **2901 MiB** | 4689 MiB |
+| min headroom | **2146 MiB** | 879 MiB |
+
+Keeping the 3.2 GB DiT resident on a 6 GB device costs *more* than re-materializing blocks, because
+the resident set is itself what creates the pressure. On the host, where nothing is scarce, rung 4
+reads the other way (14.7 s → 11.2 s when disabled, +1662 MiB) — which is exactly why this had to be
+measured on device rather than reasoned from the host A/B.
+
+**The real reason is latent size.** `SPATIAL_SCALE` is **8** for z-image and **32** for SANA. At
+1024px output that is a 128×128 latent against 32×32 — **16× more latent positions**, driving a
+3.75× larger DiT. z-image is not badly configured for the phone; it is a fundamentally heavier model
+at equal output resolution, and attention is quadratic in the token count that follows from it.
+
+So 229 s is a model property, not a defect, and there is no configuration that fixes it at 1024px.
+The usable question is resolution — or the PiD super-resolving decode route, which z-image already
+carries (`mlx-gen-pid` is a dependency) and which is the one lever that changes the denoise cost
+rather than the decode.
+
+**Status: a fit result, not yet a usable one at 1024px.** Catalog inclusion
 (`mlx-gen-ios-catalog` is deliberately SANA-only) remains a separate decision and is not implied by
-this.
+any of this.
 
 ### Measured: SANA does not fit an 8 GB device (2026-07-30)
 
