@@ -268,7 +268,7 @@ this split is designed to prevent.
 | S4.1 Threading contract | **DONE** — and better than planned: the **type system already enforces it**. `Box<dyn TextLlm>` is not `Send`, so cross-thread use does not compile; a test in `runtime-ios` pins that (with a Send control, so a false negative is caught). A hostile-threading *runtime* test is therefore unnecessary for Rust callers. The Swift side is a C ABI where marker traits are invisible, so the convention is documented in the bundle README instead. |
 | S4.2 Peak-RSS instrumentation | **DONE** — `getrusage(RUSAGE_SELF)` peak RSS reported by every on-device run. Measured on a 2.64 GiB Q4 Qwen3-4B: **215 MiB after load, 2903 MiB peak, ~2980 MiB under sustained work**. Against the ~6 GB cap that is roughly half; against the ~4 GB line of an 8 GB device it is comfortable but not spacious. |
 | S4.3 Sustained decode without jetsam | **DONE for repeated generations** — 512 tok over 4 segments, **RSS growth 0 MiB** (2980 → 2980), no jetsam. Note the scope: `generate` allocates a fresh KV cache per call, so this proves no leak across calls, *not* KV growth within one long context. That needs a prefix-cached or multi-turn path and remains open. |
-| S4.4 Energy + sustained thermal baselines | **Partly done.** Throughput holds across ~30 s of continuous GPU work — 16.7 → 20.7 → 20.3 → 18.8 tok/s, **no thermal decay** (the first segment is slowest because weights fault in lazily, so >100% retention is expected, not a speed-up). Still open: the Instruments **energy** number and a 5-minute soak, which are the evidence that would reopen the ANE question (strategy §7.2). |
+| S4.4 Energy + sustained thermal baselines | **Thermal DONE, energy partial.** A **5-minute soak — 4992 tokens — shows no throttling**: 16.6 → 16.2 → 15.9 → 16.5 → 16.8 tok/s per minute, retention 101%, peak RSS 2973 MiB (`scripts/ios/soak.sh`). Energy: Instruments' *Energy Log* template is **GUI-only**, so the script captures the headless **Power Profiler** instrument to a `.trace` instead. That gives CPU/GPU power counters and thermal state, **not** the mWh-per-100-tokens figure this story names — open the trace in Instruments for that. |
 **Measured on an iPhone 17 Pro Max (iOS 26.5.2), Qwen3-4B Q4:**
 
 ```
@@ -312,7 +312,8 @@ be quietly dropped.
 | RSS growth over 512 tok | 0 MiB | ≤ 256 MiB |
 | Unload reclaim | 100% (2693 MiB) | ≥ 90% |
 | Load → first token | ~1.7 s | not asserted |
-| Energy per 100 tok | **not measured** | — |
+| Sustained (5 min) | 4992 tok, 16.6 → 16.8 tok/s, **no throttling** | — |
+| Energy per 100 tok | **not measured** — needs Instruments GUI | — |
 
 The RSS ceiling is deliberately the ~4 GB cap of an *8 GB* device rather than this one's ~6 GB, so
 the lane fails before a broader-device release would rather than after.

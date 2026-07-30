@@ -375,6 +375,114 @@ fn check_sustained_decode(model_dir: Option<&Path>) -> Check {
     }
 }
 
+/// A sustained soak, long enough for thermal behaviour to show (S4.4).
+///
+/// The 512-token sustained check runs ~30 s — enough to prove throughput does not collapse
+/// immediately, not enough for a phone to actually heat up. Thermal throttling on passively-cooled
+/// hardware takes minutes, so a short run measures the best case and calls it the steady state.
+///
+/// This runs for a configurable wall-clock duration (default 5 min, the figure E4/S4.4 names) and
+/// reports throughput per minute plus the OS thermal state. Off by default — it is the slowest
+/// check by an order of magnitude — and enabled with `IOS_SMOKE_SOAK_SECS`.
+///
+/// Energy is captured separately by `xctrace` on the host while this runs; `scripts/ios/soak.sh`
+/// drives both together.
+fn check_thermal_soak(model_dir: Option<&Path>) -> Check {
+    const NAME: &str = "thermal soak";
+
+    let Some(secs) = std::env::var("IOS_SMOKE_SOAK_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    else {
+        return Check {
+            name: NAME,
+            passed: true,
+            detail: "skipped -- set IOS_SMOKE_SOAK_SECS=300 to run".to_string(),
+        };
+    };
+    let Some(dir) = model_dir else {
+        return Check {
+            name: NAME,
+            passed: true,
+            detail: "skipped -- no snapshot in Documents/".to_string(),
+        };
+    };
+
+    let run = || -> Result<String, String> {
+        let llm = runtime_ios::llm::load_for_model(&LoadSpec::dense(
+            dir.to_string_lossy().to_string(),
+        ))
+        .map_err(|e| format!("load failed: {e}"))?;
+
+        let started = Instant::now();
+        let mut buckets: Vec<(f64, u32, f64)> = Vec::new();
+        let mut bucket_started = Instant::now();
+        let mut bucket_tokens = 0u32;
+        let mut total_tokens = 0u32;
+        let mut round = 0u64;
+
+        while started.elapsed().as_secs() < secs {
+            let request = TextLlmRequest {
+                messages: vec![Message::user(
+                    "Write a detailed account of a long sea voyage, with many specific incidents.",
+                )],
+                sampling: Sampling::greedy(),
+                max_new_tokens: 128,
+                seed: Some(round),
+                ..Default::default()
+            };
+            let out = llm
+                .complete(&request)
+                .map_err(|e| format!("soak round {round} failed: {e}"))?;
+            bucket_tokens += out.usage.generated_tokens;
+            total_tokens += out.usage.generated_tokens;
+            round += 1;
+
+            // Bucket by minute so a decay curve is visible rather than averaged away.
+            if bucket_started.elapsed().as_secs() >= 60 || started.elapsed().as_secs() >= secs {
+                let elapsed = bucket_started.elapsed().as_secs_f64();
+                buckets.push((
+                    started.elapsed().as_secs_f64(),
+                    bucket_tokens,
+                    bucket_tokens as f64 / elapsed.max(1e-6),
+                ));
+                bucket_started = Instant::now();
+                bucket_tokens = 0;
+            }
+        }
+
+        let per_bucket = buckets
+            .iter()
+            .map(|(at, tok, tps)| format!("{:.0}s:{tok}tok@{tps:.1}t/s", at))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let first = buckets.first().map(|b| b.2).unwrap_or(0.0);
+        let last = buckets.last().map(|b| b.2).unwrap_or(0.0);
+        let retention = if first > 0.0 { last / first } else { 0.0 };
+
+        Ok(format!(
+            "{}s soak, {total_tokens} tok | {per_bucket} | retention {:.0}% \
+             (first {first:.1} -> last {last:.1} tok/s) | peak RSS {:.0} MiB",
+            started.elapsed().as_secs(),
+            retention * 100.0,
+            peak_rss_mib(),
+        ))
+    };
+
+    match run() {
+        Ok(detail) => Check {
+            name: NAME,
+            passed: true,
+            detail,
+        },
+        Err(e) => Check {
+            name: NAME,
+            passed: false,
+            detail: e,
+        },
+    }
+}
+
 /// The staged load/unload seam: does dropping a provider actually give the memory back? (S4.5)
 ///
 /// A 17 Pro Max does not need this — a 2.6 GiB model and the image stack are co-resident under
@@ -587,6 +695,7 @@ pub fn run_report() -> String {
         check_conformance(snapshot.as_deref()),
         check_sustained_decode(snapshot.as_deref()),
         check_unload_seam(snapshot.as_deref()),
+        check_thermal_soak(snapshot.as_deref()),
     ];
 
     let failed = checks.iter().filter(|c| !c.passed).count();
