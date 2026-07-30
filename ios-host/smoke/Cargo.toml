@@ -16,7 +16,7 @@ crate-type = ["staticlib", "rlib"]
 [features]
 # E5's image-generation checks. Off by default so the LLM smoke stays the small, fast binary that
 # E3/E4 ship, and so a media compile break can never block the text lane's device runs.
-media = ["runtime-ios/media"]
+media = ["runtime-ios/media", "dep:image"]
 
 [dependencies]
 mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/zakkeown/mlx-rs", rev = "c0e5c4a4350ec4989e5dc130158dee7757eae785" }
@@ -30,3 +30,7 @@ runtime-ios = { path = "../../crates/bundles/runtime-ios" }
 core-llm-testkit = { path = "../../crates/contracts/core-llm/core-llm-testkit" }
 # getrusage for the peak-RSS number the memory story (E4) needs.
 libc = "0.2"
+# PNG encoding for the E5 image check, so a device-generated render can be pulled off the phone and
+# LOOKED at. A pixel-range assertion proves the decode produced content; only the image proves it
+# produced the right content, and "SANA runs on iPhone" is a claim worth being able to see.
+image = { version = "0.25", default-features = false, features = ["png"], optional = true }

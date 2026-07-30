@@ -457,6 +457,7 @@ name = "ios-smoke"
 version = "0.0.0"
 dependencies = [
  "core-llm-testkit",
+ "image",
  "libc",
  "pmetal-mlx-rs",
  "runtime-ios",

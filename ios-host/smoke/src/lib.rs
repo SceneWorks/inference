@@ -880,6 +880,23 @@ fn check_image_generation(media_dir: Option<&Path>) -> Check {
                 ));
             }
 
+            // Save it. The checks above prove the decode produced *content* (a wide pixel range);
+            // only the image proves it produced the *right* content, and it is the artifact worth
+            // having — a render made on a phone. Written into Documents so `devicectl copy from`
+            // can pull it, named per configuration so neither overwrites the other. Best-effort:
+            // failing to encode a PNG must not fail the generation check.
+            if let Some(docs) = dirs_documents() {
+                let name = format!("sana-{}.png", label.replace(' ', "-"));
+                match image::RgbImage::from_raw(image.width, image.height, image.pixels.clone()) {
+                    Some(buf) => {
+                        if let Err(e) = buf.save(docs.join(&name)) {
+                            eprintln!("could not write {name}: {e}");
+                        }
+                    }
+                    None => eprintln!("{name}: pixel buffer does not match {edge}x{edge}"),
+                }
+            }
+
             let secs = started.elapsed().as_secs_f64();
             // MLX's own accounting is the number to read, and it is reset per configuration above.
             //
