@@ -1644,10 +1644,23 @@ fn render_edit_from_context(
             on_progress,
             |x, timestep| -> Result<Tensor> {
                 let t = Tensor::from_vec(vec![timestep], (1,), device)?;
-                let cond = heavy.dit.forward_edit(x, &t, &context, &ref_latents)?;
+                // Thread the request's cancel flag into the block loop (sc-16003): an edit step at
+                // 2048² is ~45 s (a ~37k-token joint sequence), far too long for the sampler's
+                // between-steps poll to be the only checkpoint. Both CFG legs honor it.
+                let forward_edit = |ctx: &Tensor| {
+                    heavy.dit.forward_edit_with_memory(
+                        x,
+                        &t,
+                        ctx,
+                        &ref_latents,
+                        candle_gen::ATTN_SCORES_BUDGET,
+                        &req.cancel,
+                    )
+                };
+                let cond = forward_edit(&context)?;
                 let v = match &neg_context {
                     Some(nc) => {
-                        let uncond = heavy.dit.forward_edit(x, &t, nc, &ref_latents)?;
+                        let uncond = forward_edit(nc)?;
                         krea_cfg_combine(&cond, &uncond, guidance)?
                     }
                     None => cond,
