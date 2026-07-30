@@ -241,13 +241,14 @@ pub fn resolve_pid_decoder_at_sigma(
 /// combination at *admission*, where it has the route in hand.
 ///
 /// That obligation is **enforced rather than described** (SC-15775): declare the routes with
-/// [`DecodeRoutes`](crate::decode_routes::DecodeRoutes), whose constructor cannot be handed a
-/// PiD-route ladder at all, gate admission on
-/// [`DecodeRoutes::validate`](crate::decode_routes::DecodeRoutes::validate), and run
-/// [`check_decode_routes`](crate::decode_routes::check_decode_routes) in the provider's test suite.
-/// A provider that bypasses all of that still trips the `debug_assert` below the first time any test
-/// drives a native geometry into a `use_pid` request, so the mis-wiring surfaces in CI instead of in a
-/// user's generate call.
+/// [`DecodeRoutes::new`](crate::decode_routes::DecodeRoutes::new), which cannot be handed a PiD-route
+/// ladder at all *and* refuses a native ladder that reaches into the PiD domain, so an overlapping
+/// declaration never becomes a value; gate admission on
+/// [`DecodeRoutes::validate`](crate::decode_routes::DecodeRoutes::validate); and run
+/// [`assert_decode_routes`](crate::decode_routes::assert_decode_routes) in the provider's test suite so
+/// a `const` ladder's defect lands in CI rather than at load. A provider that bypasses all of that
+/// still trips the `debug_assert` below the first time any test drives a native geometry into a
+/// `use_pid` request, so the mis-wiring surfaces in CI instead of in a user's generate call.
 pub fn selected_decode_tiling(req: &GenerationRequest) -> Option<(i32, i32)> {
     let memory = req.memory?;
     if !memory.tile_vae_decode {

@@ -197,7 +197,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         descriptor: descriptor(),
         tokenizer,
         residency,
-        memory_strategy: crate::memory_strategy::memory_strategy_contract(MODEL_ID, spec),
+        memory_strategy: crate::memory_strategy::memory_strategy_contract(MODEL_ID, spec)?,
     }))
 }
 
@@ -225,7 +225,7 @@ fn build_comfyui_generator(
             &LoadSpec::new(WeightsSource::File(std::path::PathBuf::from(
                 "comfyui-in-place",
             ))),
-        ),
+        )?,
         residency: Residency::resident(
             text,
             ZImageHeavyOwned {
@@ -718,11 +718,7 @@ mlx_gen::register_generators! {
 pub const MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =
     mlx_gen::gen_core::MemoryRegistration {
         provider_id: MODEL_ID,
-        contract: |spec| {
-            Ok(crate::memory_strategy::memory_strategy_contract(
-                MODEL_ID, spec,
-            ))
-        },
+        contract: |spec| crate::memory_strategy::memory_strategy_contract(MODEL_ID, spec),
     };
 
 #[cfg(test)]

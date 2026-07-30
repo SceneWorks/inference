@@ -128,8 +128,8 @@
 //! Both the split and its disjointness are the shared [`mlx_gen_pid::DecodeRoutes`]' (SC-15775), not
 //! this file's: this module's `decode_routes()` declares only the native ladder, the PiD half comes
 //! from the student, and
-//! [`check_decode_routes`](mlx_gen_pid::check_decode_routes) refuses a native ladder that reaches into
-//! the PiD domain. The
+//! [`DecodeRoutes::new`](mlx_gen_pid::DecodeRoutes::new) **refuses to construct** a native ladder that
+//! reaches into the PiD domain, so this file cannot publish one. The
 //! obligation used to be a doc comment on `mlx_gen_pid::engine::selected_decode_tiling` telling the
 //! next adopter to copy this file's shape; it is now an API that the next adopter cannot get wrong
 //! quietly.
@@ -362,11 +362,21 @@ pub const MEMORY_CALIBRATION_FINGERPRINT: &str =
 /// allows: narrower at admission, never broader.
 ///
 /// The split used to be hand-rolled here. It is now the shared type's, because the PiD half of it is
-/// not this provider's to state: `DecodeRoutes` takes only the native ladder, derives the PiD one from
-/// the student, and its `conformance_errors` refuses a native ladder that reaches into the PiD domain
-/// — the cross-provider hazard SC-15775 exists to close.
-fn decode_routes() -> mlx_gen_pid::DecodeRoutes {
-    mlx_gen_pid::DecodeRoutes::new(DECODE_TILE_EDGES.iter().copied(), DECODE_OVERLAP)
+/// not this provider's to state: `DecodeRoutes::new` takes only the native ladder, derives the PiD one
+/// from the student, and **refuses to construct** when the native ladder reaches into the PiD domain —
+/// the cross-provider hazard SC-15775 exists to close.
+///
+/// It is therefore fallible, and deliberately propagated rather than `expect`-ed: [`DECODE_TILE_EDGES`]
+/// is a `const` this provider owns, so the `Err` arm is unreachable for any shipping load — and
+/// `no_native_decode_candidate_is_a_legal_pid_tile_edge` proves it — but a future widening of the
+/// ladder into the student's range must fail typed at load rather than panic in a release build.
+fn decode_routes(provider_id: &str) -> CoreResult<mlx_gen_pid::DecodeRoutes> {
+    mlx_gen_pid::DecodeRoutes::new(
+        provider_id,
+        DECODE_TILE_EDGES.iter().copied(),
+        DECODE_OVERLAP,
+    )
+    .map_err(|errors| CoreError::Unsupported(errors.join("; ")))
 }
 
 /// Build the Z-Image MLX provider contract for `provider_id`.
@@ -375,7 +385,13 @@ fn decode_routes() -> mlx_gen_pid::DecodeRoutes {
 /// snapshot root, which is what the MLX loader actually materializes (the tier subdirectory is already
 /// the spec root for a pre-quantized turnkey). A single-file (ComfyUI) source has no component tree,
 /// so its asset facts stay zero rather than reporting a fabricated split.
-pub fn memory_strategy_contract(provider_id: &str, spec: &LoadSpec) -> MemoryProviderContract {
+///
+/// Fallible since SC-15775 only because the per-route decode declaration is: an overlapping native
+/// ladder cannot be constructed, so it cannot be published either. Nothing else here can fail.
+pub fn memory_strategy_contract(
+    provider_id: &str,
+    spec: &LoadSpec,
+) -> CoreResult<MemoryProviderContract> {
     // SC-15754: rung 4 is available only when this SPECIFIC load can execute it, and two load-time
     // facts decide that. Declaring it here rather than failing at generate time is what keeps the
     // selector from choosing a strategy the loaded generator cannot run — the contract is built per
@@ -395,7 +411,10 @@ pub fn memory_strategy_contract(provider_id: &str, spec: &LoadSpec) -> MemoryPro
     // actually express it.
     let streamable = matches!(spec.weights, mlx_gen::WeightsSource::Dir(_))
         && matches!(spec.offload_policy, mlx_gen::OffloadPolicy::Sequential);
-    MemoryProviderContract {
+    // Bound once: the declaration is checked at construction, so building it twice inside the
+    // capability map would re-run the check and re-allocate for no gain.
+    let routes = decode_routes(provider_id)?;
+    Ok(MemoryProviderContract {
         provider_id: provider_id.to_owned(),
         backend: MemoryBackendRealization::MlxMetal {
             // Unified memory: the wired-residency budget is what the staged phases release, weights
@@ -418,8 +437,8 @@ pub fn memory_strategy_contract(provider_id: &str, spec: &LoadSpec) -> MemoryPro
                 },
                 parameters: match strategy {
                     MemoryStrategy::BoundedDecode => MemoryParameterRanges {
-                        decode_tile_edges: decode_routes().published_edges(),
-                        decode_overlaps: decode_routes().published_overlaps(),
+                        decode_tile_edges: routes.published_edges(),
+                        decode_overlaps: routes.published_overlaps(),
                         ..Default::default()
                     },
                     MemoryStrategy::BoundedAttention => MemoryParameterRanges {
@@ -472,7 +491,7 @@ pub fn memory_strategy_contract(provider_id: &str, spec: &LoadSpec) -> MemoryPro
         )),
         asset_facts: asset_facts(spec),
         runtime: MemoryRuntimeSemantics::default(),
-    }
+    })
 }
 
 /// Component `.safetensors` sums for the spec's snapshot root. A [`WeightsSource::File`] source has
@@ -660,13 +679,8 @@ impl MemoryRequestScope for ZImageMemoryScope {
         self.ensure_active()?;
         // The same shared, route-aware gate `safety_check` uses (SC-15775) — one implementation, so
         // the scope cannot admit a geometry admission refused, or vice versa.
-        decode_routes()
-            .validate(
-                self.provider_id,
-                self.use_pid,
-                Some(tile_edge),
-                Some(overlap),
-            )
+        decode_routes(self.provider_id)?
+            .validate(self.use_pid, Some(tile_edge), Some(overlap))
             .map_err(CoreError::Unsupported)
     }
 
@@ -791,8 +805,18 @@ pub(crate) fn safety_check(
     // SC-15775: the check itself is the shared `DecodeRoutes` gate rather than a per-provider match,
     // so the next PiD-eligible adopter inherits it instead of re-deriving (or forgetting) it.
     if contract.engages(context.selection.strategy, MemoryStrategy::BoundedDecode) {
-        if let Err(reason) = decode_routes().validate(
-            contract.provider_id.as_str(),
+        let routes = match decode_routes(contract.provider_id.as_str()) {
+            Ok(routes) => routes,
+            // Unreachable for a shipping load (the ladder is a `const`, proven disjoint by
+            // `no_native_decode_candidate_is_a_legal_pid_tile_edge`); a rejection rather than a panic
+            // if a future widening ever makes it reachable.
+            Err(error) => {
+                return MemorySafetyDecision::Reject {
+                    reason: error.to_string(),
+                }
+            }
+        };
+        if let Err(reason) = routes.validate(
             context.use_pid,
             context.selection.parameters.decode_tile_edge,
             context.selection.parameters.decode_overlap,
@@ -864,14 +888,16 @@ mod tests {
     }
 
     fn contract() -> MemoryProviderContract {
-        memory_strategy_contract(crate::model::MODEL_ID, &spec())
+        memory_strategy_contract(crate::model::MODEL_ID, &spec()).unwrap()
     }
 
     /// A selection carrying exactly the parameters the rungs up to and including `strategy` own —
     /// no more, no less, which is what the shared validator requires. `use_pid` picks the route's
     /// decode domain, since the two do not overlap.
     fn selection_for(strategy: MemoryStrategy, use_pid: bool) -> MemorySelection {
-        let (edges, overlap) = decode_routes().domain(use_pid);
+        let (edges, overlap) = decode_routes(crate::model::MODEL_ID)
+            .unwrap()
+            .domain(use_pid);
         let edge = if use_pid {
             // The largest PiD candidate, so the value is unambiguously from the PiD ladder.
             edges[0]
@@ -949,11 +975,30 @@ mod tests {
         let contract = contract();
         assert_eq!(contract.conformance_errors(), Vec::<String>::new());
         gen_core_testkit::check_memory_strategy_contract(&contract).unwrap();
-        // SC-15775: the PiD-eligible half of the same conformance obligation. The shared check refuses
-        // a native ladder that reaches into the PiD student's tile domain, which is what keeps a
-        // `use_pid` + rung-2 request from carrying a geometry the shared seam would have to reject at
-        // generate time.
-        mlx_gen_pid::decode_routes::assert_decode_routes(crate::model::MODEL_ID, &decode_routes());
+        // SC-15775: the PiD-eligible half of the same conformance obligation, run on the DECLARATION
+        // INPUTS so the failure lands here with a named message rather than as a load-time `Err` from
+        // `decode_routes`. The shared check refuses a native ladder that reaches into the PiD student's
+        // tile domain, which is what keeps a `use_pid` + rung-2 request from carrying a geometry the
+        // shared seam would have to reject at generate time.
+        let routes = mlx_gen_pid::assert_decode_routes(
+            crate::model::MODEL_ID,
+            DECODE_TILE_EDGES.iter().copied(),
+            DECODE_OVERLAP,
+        );
+        // The contract really publishes that declaration's union, not a separately-maintained list.
+        let published = contract
+            .strategies
+            .iter()
+            .find(|capability| capability.strategy == MemoryStrategy::BoundedDecode)
+            .expect("rung 2 is declared");
+        assert_eq!(
+            published.parameters.decode_tile_edges,
+            routes.published_edges()
+        );
+        assert_eq!(
+            published.parameters.decode_overlaps,
+            routes.published_overlaps()
+        );
         assert_eq!(
             contract.calibration.as_ref().unwrap().fingerprint,
             "z-image-mlx-staged-tiled-decode-bounded-attention-block-window-v2"
@@ -970,8 +1015,24 @@ mod tests {
     /// widening of either side is caught here.
     #[test]
     fn no_native_decode_candidate_is_a_legal_pid_tile_edge() {
-        let routes = decode_routes();
-        mlx_gen_pid::check_decode_routes(crate::model::MODEL_ID, &routes).unwrap();
+        let routes = decode_routes(crate::model::MODEL_ID).unwrap();
+        // Not a vacuous pass: the same constructor REFUSES this provider's ladder widened by one
+        // PiD-legal edge, which is exactly the mutation (M1) this check exists to catch. So the `Ok`
+        // above is a property of these numbers, not of the check being toothless.
+        let widened: Vec<u32> = DECODE_TILE_EDGES
+            .iter()
+            .copied()
+            .chain([mlx_gen_pid::budget::MIN_TILE_EDGE as u32])
+            .collect();
+        let errors =
+            mlx_gen_pid::DecodeRoutes::new(crate::model::MODEL_ID, widened, DECODE_OVERLAP)
+                .unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("ALSO a legal PiD tile edge")),
+            "{errors:?}"
+        );
         for &edge in routes.native_edges() {
             assert!(
                 !mlx_gen_pid::budget::is_tile_edge_candidate(edge as i32),
@@ -1157,7 +1218,7 @@ mod tests {
     fn a_resident_load_declares_rung_four_missing_so_the_selector_never_picks_it() {
         let resident = LoadSpec::new(WeightsSource::Dir("/nonexistent-z-image-snapshot".into()))
             .with_offload_policy(mlx_gen::OffloadPolicy::Resident);
-        let contract = memory_strategy_contract(crate::model::MODEL_ID, &resident);
+        let contract = memory_strategy_contract(crate::model::MODEL_ID, &resident).unwrap();
         assert_eq!(contract.conformance_errors(), Vec::<String>::new());
         assert!(matches!(
             contract
@@ -1180,7 +1241,7 @@ mod tests {
         }
         // ...and the Sequential load of the same snapshot does advertise it, so this is the policy
         // doing the work rather than the path.
-        let sequential = super::memory_strategy_contract(crate::model::MODEL_ID, &spec());
+        let sequential = super::memory_strategy_contract(crate::model::MODEL_ID, &spec()).unwrap();
         assert!(matches!(
             sequential
                 .capability(MemoryStrategy::BoundedTransformerResidency)
@@ -1197,7 +1258,7 @@ mod tests {
             "/nonexistent/z-image.safetensors".into(),
         ))
         .with_offload_policy(mlx_gen::OffloadPolicy::Sequential);
-        let contract = memory_strategy_contract(crate::model::MODEL_ID, &spec);
+        let contract = memory_strategy_contract(crate::model::MODEL_ID, &spec).unwrap();
         assert_eq!(contract.conformance_errors(), Vec::<String>::new());
         assert!(matches!(
             contract
@@ -1765,7 +1826,7 @@ mod tests {
             crate::model_control::MODEL_ID,
             crate::model_base_control::MODEL_ID,
         ] {
-            let contract = memory_strategy_contract(id, &spec());
+            let contract = memory_strategy_contract(id, &spec()).unwrap();
             assert_eq!(contract.provider_id, id);
             assert_eq!(contract.conformance_errors(), Vec::<String>::new(), "{id}");
             gen_core_testkit::check_memory_strategy_contract(&contract).unwrap();

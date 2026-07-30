@@ -40,7 +40,7 @@ pub mod tiling;
 pub use backbone::PixDiT;
 pub use caption::CaptionEncoder;
 pub use config::{CaptionConfig, ConvPadding, PidConfig, RopeMode, SampleType, SamplerConfig};
-pub use decode_routes::{check_decode_routes, DecodeRoutes};
+pub use decode_routes::{assert_decode_routes, DecodeRoutes};
 pub use decoder::PidDecoder;
 pub use engine::{
     flow_capture_for_request, mint_planned_decoder, mint_planned_decoder_with_tiling,

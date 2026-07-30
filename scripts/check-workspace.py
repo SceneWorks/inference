@@ -132,11 +132,48 @@ DELETED_ENV_SIDE_CHANNELS = (
 # domain. A direct dependency on it is what makes a provider PiD-eligible.
 PID_SEAM_CRATE = "mlx-gen-pid"
 
-# Any one of these in a provider's sources means it declared its per-route decode domain through the
-# shared type rather than hand-rolling the split. Kept as a set of spellings (not one) because the
-# import style is the provider's choice: `mlx_gen_pid::DecodeRoutes`, a `use` of the module, or a
-# local `decode_routes()` helper built on it all satisfy the obligation.
-PID_DECODE_ROUTE_MARKERS = ("DecodeRoutes", "decode_routes")
+# Evidence that a provider actually CALLS the shared per-route decode API — not that it mentions it.
+#
+# The first revision of this gate matched the bare substrings "DecodeRoutes" / "decode_routes", which
+# the adversarial review defeated three ways: a `// TODO(sc-15775): should use DecodeRoutes one day.`
+# on an otherwise non-conforming adopter passed; so did `#[allow(unused)] use
+# mlx_gen_pid::decode_routes;`. A gate whose stated purpose is to replace doc-comment enforcement must
+# not be satisfiable by a doc comment, so matching now happens on COMMENT-STRIPPED source and requires
+# call syntax.
+#
+# `DecodeRoutes::new` is the *checked* constructor: since sc-15775 it returns `Result` and refuses a
+# native ladder that reaches into the PiD student's tile domain, so calling it (or
+# `assert_decode_routes`, its panicking test-suite form) is at once the construction evidence and the
+# conformance evidence. There is deliberately no third, separately-skippable conformance call to look
+# for — requiring one would be ceremony now that construction cannot be performed unchecked.
+PID_DECODE_ROUTE_CONSTRUCTION_MARKERS = ("DecodeRoutes::new", "assert_decode_routes")
+
+# The admission half. Declaring the routes and then not gating on them leaves the hazard wide open, so
+# a construction call alone is not adoption. Matched as a call on a route-named receiver rather than a
+# bare `.validate(` so an unrelated `foo.validate(...)` elsewhere in the crate cannot stand in for it.
+PID_DECODE_ROUTE_ADMISSION_CALL = re.compile(
+    r"(?:decode_routes|DecodeRoutes|routes)\b[^;{}]{0,200}?\.\s*validate\s*\(",
+    re.DOTALL,
+)
+
+# Any one of these in the crate's own sources means it implements rung 2 (bounded decode) and can
+# therefore reach the seam with a decode geometry.
+#
+# Broader than the `decode_tile_edges` field name alone, which the review defeated as attack (c): an
+# adopter that builds its `MemoryParameterRanges` through a shared helper never writes that literal.
+# What it cannot delegate is the executable half — its own `MemoryRequestScope::configure_decode`, the
+# hook the shared runtime drives to apply a bounded-decode selection — so that spelling is in the set
+# too. Deliberately fail-closed: over-triggering asks a provider for a three-line declaration, while
+# under-triggering ships the defect.
+PID_RUNG_TWO_MARKERS = (
+    "decode_tile_edges",
+    "decode_overlaps",
+    "MemoryParameterRanges",
+    "BoundedDecode",
+    "configure_decode",
+)
+
+_RAW_STRING_START = re.compile(r'(?:b?r)(#*)"')
 
 _CFG_TEST_ATTR = re.compile(r"#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]")
 _CFG_TEST_MOD = re.compile(r"\s*(?:#\s*\[[^\]]*\]\s*)*(?:pub(?:\s*\([^)]*\))?\s+)?mod\s+\w+\s*\{")
@@ -144,6 +181,89 @@ _CFG_TEST_MOD = re.compile(r"\s*(?:#\s*\[[^\]]*\]\s*)*(?:pub(?:\s*\([^)]*\))?\s+
 
 def fail(message: str) -> None:
     raise AssertionError(message)
+
+
+def strip_rust_comments(source: str) -> str:
+    """Blank out Rust comments so a source-text policy check cannot be satisfied by a comment.
+
+    Comments become runs of spaces (newlines preserved) rather than being deleted, so line and column
+    positions still line up with the original if a caller ever reports them.
+
+    String and character literals are honoured, because ``"// not a comment"`` and ``"/* nor this */"``
+    are real code — including raw strings (``r"..."``, ``r#"..."#``, ``br#"..."#``), whose whole purpose
+    is to contain otherwise-significant characters. Block comments nest, as they do in Rust. ``'a``
+    lifetimes are distinguished from ``'a'`` char literals.
+    """
+    out: list[str] = []
+    index = 0
+    length = len(source)
+    while index < length:
+        char = source[index]
+        if char == "/" and source.startswith("//", index):
+            end = source.find("\n", index)
+            end = length if end < 0 else end
+            out.append(" " * (end - index))
+            index = end
+            continue
+        if char == "/" and source.startswith("/*", index):
+            depth = 0
+            end = index
+            while end < length:
+                if source.startswith("/*", end):
+                    depth += 1
+                    end += 2
+                    continue
+                if source.startswith("*/", end):
+                    depth -= 1
+                    end += 2
+                    if depth == 0:
+                        break
+                    continue
+                end += 1
+            out.append("".join("\n" if c == "\n" else " " for c in source[index:end]))
+            index = end
+            continue
+        raw = _RAW_STRING_START.match(source, index)
+        if raw and not (index and (source[index - 1].isalnum() or source[index - 1] == "_")):
+            terminator = '"' + raw.group(1)
+            end = source.find(terminator, raw.end())
+            end = length if end < 0 else end + len(terminator)
+            out.append(source[index:end])
+            index = end
+            continue
+        if char == '"':
+            end = index + 1
+            while end < length:
+                if source[end] == "\\":
+                    end += 2
+                    continue
+                if source[end] == '"':
+                    end += 1
+                    break
+                end += 1
+            out.append(source[index:end])
+            index = end
+            continue
+        if char == "'":
+            # `'\n'` / `'\u{1f600}'`: an escape runs to the closing quote.
+            if source.startswith("'\\", index):
+                end = source.find("'", index + 2)
+                end = length if end < 0 else end + 1
+                out.append(source[index:end])
+                index = end
+                continue
+            # `'a'` is a char literal; `'a` (no closing quote) is a lifetime, so emit just the tick and
+            # let the identifier be scanned normally.
+            if index + 2 < length and source[index + 2] == "'":
+                out.append(source[index : index + 3])
+                index += 3
+                continue
+            out.append(char)
+            index += 1
+            continue
+        out.append(char)
+        index += 1
+    return "".join(out)
 
 
 def cargo_metadata(offline: bool) -> dict:
@@ -431,18 +551,38 @@ def check_pid_decode_route_adoption(metadata: dict, root: Path) -> None:
     time — and the seam must not paper over it, because silently re-planning would execute a different
     strategy than the selector chose.
 
-    ``DecodeRoutes`` makes the bad declaration unrepresentable (it accepts only the native ladder) and
-    ``check_decode_routes`` refuses a native ladder that reaches into the PiD domain. Those help only a
-    provider that *uses* them, so this is the tripwire for one that does not: it lives here, in a lane
-    that fires on any workspace change, so the next adopter cannot opt out by simply not calling the
-    shared type. The alternative — a conformance check the provider's own suite has to remember to
-    invoke — is exactly the "documented, not enforced" failure sc-15775 exists to close.
+    ``DecodeRoutes::new`` accepts only the native ladder and, since sc-15775, *refuses to construct* one
+    that reaches into the PiD domain — so an overlapping declaration never becomes a value. That helps
+    only a provider that calls it, so this is the tripwire for one that does not: it lives here, in a
+    lane that fires on any workspace change, so the next adopter cannot opt out by simply not reaching
+    for the shared type.
 
-    Scoped to the three facts that together mean "this provider can hit the seam with a selection":
-    a direct ``mlx-gen-pid`` dependency (PiD-eligible), a ``register_memory_strategy`` call (its
-    contract is resolvable, so a selector can choose a strategy for it), and a ``decode_tile_edges``
-    declaration (it publishes rung-2 candidates). A provider missing any one of them cannot reach the
-    hazard and is not asked to declare routes.
+    Armed by two facts: a direct ``mlx-gen-pid`` dependency (PiD-eligible) and a
+    ``register_memory_strategy`` call (its contract is resolvable, so a selector can choose a strategy
+    for it), plus any sign of rung-2 adoption in the crate's own sources
+    (``PID_RUNG_TWO_MARKERS``). A provider missing the first two cannot reach the hazard and is not
+    asked to declare routes.
+
+    What it verifies, precisely — and no more:
+
+    * the crate's comment-stripped sources contain a *call* to the checked constructor, and
+    * a *call* to ``validate`` on a route-named receiver.
+
+    Both are call-syntax matches on comment-stripped text, which is what closes the three defeats the
+    adversarial review found in the first revision (a ``// TODO`` mentioning ``DecodeRoutes``, an unused
+    ``use``, and a trigger set narrow enough to miss a helper-built ``MemoryParameterRanges``).
+
+    It remains a *static text* check, and two residual gaps are worth naming rather than implying away:
+
+    1. It cannot prove the ``validate`` call is reached on every admission path — only that one exists.
+       Wiring ``validate`` into ``safety_check`` is what a behavioural, registry-driven walk would
+       verify; that needs two new pieces of shared contract surface (a safety-check fn pointer on
+       ``MemoryRegistration``, and a way to declare PiD eligibility) and is tracked separately.
+    2. The rung-2 trigger is a *text* proxy for the semantic fact "this provider's contract publishes
+       non-empty ``decode_tile_edges``". A provider could in principle delegate every textual trace of
+       rung 2 — the ranges, the strategy name, and its ``configure_decode`` hook — to another crate. The
+       same behavioural walk is what covers that; the trigger set is deliberately wide (fail-closed) to
+       shrink the window in the meantime.
     """
     packages_by_id = {package["id"]: package for package in metadata["packages"]}
     violations: list[str] = []
@@ -457,28 +597,44 @@ def check_pid_decode_route_adoption(metadata: dict, root: Path) -> None:
         manifest_dir = Path(package["manifest_path"]).parent
         if not manifest_dir.is_dir():
             continue
-        sources = {
-            path: path.read_text(encoding="utf-8")
-            for path in sorted(manifest_dir.rglob("*.rs"))
-            if IGNORED_TREE_PARTS.isdisjoint(path.relative_to(root).parts)
-        }
-        joined = "\n".join(sources.values())
-        if "register_memory_strategy" not in joined or "decode_tile_edges" not in joined:
+        # Comments are stripped BEFORE any matching, on both the trigger conditions and the evidence:
+        # a commented-out `register_memory_strategy` must not arm the gate, and a `// TODO: use
+        # DecodeRoutes` must not disarm it.
+        joined = strip_rust_comments(
+            "\n".join(
+                path.read_text(encoding="utf-8")
+                for path in sorted(manifest_dir.rglob("*.rs"))
+                if IGNORED_TREE_PARTS.isdisjoint(path.relative_to(root).parts)
+            )
+        )
+        if "register_memory_strategy" not in joined:
             continue
-        if any(marker in joined for marker in PID_DECODE_ROUTE_MARKERS):
+        if not any(marker in joined for marker in PID_RUNG_TWO_MARKERS):
+            continue
+        missing: list[str] = []
+        if not any(marker in joined for marker in PID_DECODE_ROUTE_CONSTRUCTION_MARKERS):
+            spellings = " or ".join(
+                f"`{marker}`" for marker in PID_DECODE_ROUTE_CONSTRUCTION_MARKERS
+            )
+            missing.append(f"never calls the checked constructor ({spellings})")
+        if not PID_DECODE_ROUTE_ADMISSION_CALL.search(joined):
+            missing.append("never calls `validate` on a declared route set to gate admission")
+        if not missing:
             continue
         violations.append(
             f"{package['name']} depends on {PID_SEAM_CRATE}, registers a memory-strategy contract, "
-            "and publishes decode_tile_edges, but never declares its per-route decode domain"
+            f"and implements bounded decode, but {', and '.join(missing)}"
         )
 
     if violations:
         joined = "\n  ".join(violations)
         fail(
-            "a PiD-eligible provider that adopts bounded decode must declare BOTH decode routes "
-            "through the shared mlx_gen_pid::DecodeRoutes and gate admission on its `validate` "
-            "(sc-15775) — native VAE tile edges are not legal PiD tiles, so emitting the native "
-            "ladder into a use_pid request is refused at generate time rather than re-planned:\n  "
+            "a PiD-eligible provider that adopts bounded decode must construct its native ladder "
+            "through the checked mlx_gen_pid::DecodeRoutes::new (or assert_decode_routes) AND gate "
+            "admission on the resulting `validate` (sc-15775) — native VAE tile edges are not legal "
+            "PiD tiles, so emitting the native ladder into a use_pid request is refused at generate "
+            "time rather than re-planned. A mention in a comment or an unused import is not "
+            "adoption; this gate matches call syntax on comment-stripped source:\n  "
             f"{joined}"
         )
 

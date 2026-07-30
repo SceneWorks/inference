@@ -147,7 +147,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
                  not a single .safetensors file",
     )?;
     Ok(Box::new(ZImage {
-        memory_strategy: crate::memory_strategy::memory_strategy_contract(MODEL_ID, spec),
+        memory_strategy: crate::memory_strategy::memory_strategy_contract(MODEL_ID, spec)?,
         descriptor: descriptor(),
         tokenizer,
         residency,
@@ -394,11 +394,7 @@ mlx_gen::register_generators! {
 pub const MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =
     mlx_gen::gen_core::MemoryRegistration {
         provider_id: MODEL_ID,
-        contract: |spec| {
-            Ok(crate::memory_strategy::memory_strategy_contract(
-                MODEL_ID, spec,
-            ))
-        },
+        contract: |spec| crate::memory_strategy::memory_strategy_contract(MODEL_ID, spec),
     };
 
 #[cfg(test)]
