@@ -70,30 +70,34 @@ enum TransformerBlocks {
 /// The shipped rung-4 window for the Candle realization: **one block**.
 ///
 /// This deliberately contradicts MLX, where SC-15744 recommended 2–4 to amortize page-cache re-reads.
-/// SC-15791 measured the trade on CUDA and it has the opposite shape: per-step time is FLAT in window
-/// size while peak is LINEAR. SC-15792 re-measured it through this implementation and reproduced the
-/// slope exactly — **107.9 MiB per block of window** on both. (The intercepts differ, 153.4 vs
-/// 23.3 MiB, because SC-15792's sweep includes the per-forward dequant transient the spike's
-/// materialization-only arm excluded.)
+/// SC-16096 invalidated SC-15791's original timing mechanism by replacing per-window format
+/// conversion with device-format sidecars. SC-16154 therefore measured the new path rather than
+/// inheriting the old answer: release build, real q4 packed weights, 12 balanced interleaved samples
+/// per window on device 0 of a 2× RTX PRO 6000 Blackwell host (**95.6 GiB VRAM per GPU**), with
+/// sidecar preparation and a full warm-up excluded from the clock.
 ///
-/// **SC-16096 removed the reason, and the timing half is now UNMEASURED — stated rather than
-/// assumed.** The spike attributed the flat time to a per-block host format conversion that a larger
-/// window repeats rather than amortizes; SC-16096 replaced it with device-format sidecars prepared
-/// once per component. So SC-15791's *mechanism* for the flatness no longer exists, and nothing has
-/// re-swept window size against time since: SC-16096 measured the conversion, not the window, and
-/// SC-15792's sweep takes one sample per window in ascending order, which cannot discriminate a trend
-/// from warm-up on a host with this much spread. SC-16154 owns the re-measurement.
+/// | window | median step | full min–max spread | paired mean delta vs 1 (95% CI) |
+/// |---:|---:|---:|---:|
+/// | 1 | 2.0423 s | 1.6311–2.3491 s | reference |
+/// | 2 | 2.0027 s | 1.6234–2.4844 s | +0.0416 s (-0.0984–+0.1817) |
+/// | 4 | 1.9914 s | 1.6957–2.4211 s | -0.0091 s (-0.1403–+0.1222) |
+/// | 8 | 1.8468 s | 1.7265–2.2018 s | -0.0651 s (-0.2120–+0.0818) |
+/// | 15 | 1.9286 s | 1.7662–2.4683 s | +0.0193 s (-0.1461–+0.1847) |
+/// | 30 | 2.0813 s | 1.7697–2.6964 s | +0.1911 s (+0.0298–+0.3524) |
 ///
-/// **The value stays 1 regardless, and not by inertia.** What IS re-measured through this
-/// implementation is the memory side: peak is linear in the window at 107.9 MiB/block, unchanged by
-/// the sidecars. Rung 4 is only ever reached when no cheaper rung fits, so its job at that point is
-/// to minimize peak; a window that costs proportionally more peak for an unquantified time saving is
-/// the wrong trade for the situation the rung exists to serve. If SC-16154 finds a real gradient,
-/// widening is a one-line change to `SUPPORTED_TRANSFORMER_WINDOWS` plus fresh evidence.
+/// **Paired time is flat through window 15 and increasing at window 30.** Every window 2–15
+/// confidence interval includes zero. Window 30 is +191 ms slower within round and its interval
+/// excludes zero; the fitted median gradient across all windows is +2.0 ms per additional block.
+/// Window 8's apparent -9.6% median is not a demonstrated decrease because its paired interval spans
+/// -212 to +82 ms. There is no resolved speed case that favours a wider rung-4 window.
 ///
-/// Every larger window is therefore strictly worse — more peak for no time — which is why
-/// `krea_turbo_memory_strategy_contract` publishes `transformer_window_sizes: vec![1]` and does not
-/// offer the selector a wider one.
+/// The memory half remains linear through the shipped driver:
+/// `peak(window) ≈ 107.9·window + 153.4 MiB` (SC-15792), a 13.0× live reduction at window 1 against
+/// resident. A wider window therefore spends 107.9 MiB per additional block for no resolved time
+/// saving. Rung 4 is reached only after cheaper strategies cannot fit, so its caller is by
+/// construction VRAM-constrained; latency-sensitive callers with enough VRAM use a cheaper
+/// resident/staged rung instead. The explicit trade is therefore to keep window 1 as both the
+/// minimum-peak default and the only published candidate.
 ///
 /// The driver still takes the window as a parameter rather than baking this in: a bound that is only
 /// ever exercised at its tightest setting is a bound nothing has measured, and the peak-by-window
